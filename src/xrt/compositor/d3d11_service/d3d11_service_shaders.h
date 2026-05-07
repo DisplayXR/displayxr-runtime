@@ -511,6 +511,25 @@ struct BlitConstants
 	// aligned for HLSL.
 	float chrome_alpha;
 	float _pad_chrome[3];
+	// Phase 2.K Commit 8.D: HUD compose. When `hud_present > 0.5`, the content-
+	// blit pixel shader samples a HUD texture from t1 and composites it OVER
+	// the cube content sample (t0) BEFORE corner_alpha/feather_alpha apply, so
+	// the rounded-window mask covers HUD pixels at corners (e.g. the HUD's
+	// top-left corner clips to match the window's top-left rounding).
+	// `hud_dst_rect` is in window-local 0..1 UV (same as `quad_uv`), already
+	// per-eye disparity-shifted by CPU. `hud_src_rect` is the HUD swapchain
+	// sub-image in normalized UV (signed h supports `flip_y`). `hud_premul`
+	// distinguishes premultiplied (1.0) from unmultiplied (0.0) source alpha,
+	// matching the layer's XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA
+	// flag. Non-content-blit draws (chrome composite, taskbar, toast, ...)
+	// don't bind t1; for those paths an unbound t1 returns float4(0) on
+	// sample, so even if `hud_present` carries garbage the compose collapses
+	// to a no-op (`color * (1 - 0) + 0`).
+	float hud_dst_rect[4];
+	float hud_src_rect[4];
+	float hud_present;
+	float hud_premul;
+	float _hud_pad[2];
 };
 
 //! Vertex shader for projection blit - draws a quad at specified destination
@@ -536,6 +555,9 @@ cbuffer BlitCB : register(b0)
     float4 glow_color;      // RGB + unused alpha
     float4 corner_depth_ndc; // Phase 2.K: per-corner depth in [0,1] for SV_Position.z (TL,BL,TR,BR)
     float4 chrome_alpha;     // Phase 2.K Commit 8.C: x = alpha multiplier; yzw padding
+    float4 hud_dst_rect;     // Phase 2.K Commit 8.D: HUD placement in window UV (xy = origin, zw = size)
+    float4 hud_src_rect;     // HUD source UV (xy = origin, zw = size; signed w/h for flip)
+    float4 hud_flags;        // x = present (>0.5 enables compose), y = premul (>0.5 = premultiplied), zw pad
 };
 
 struct VS_OUTPUT
@@ -636,9 +658,19 @@ cbuffer BlitCB : register(b0)
     float4 glow_color;
     float4 corner_depth_ndc; // Phase 2.K: per-corner depth (unused in PS but keeps cb layout in sync)
     float4 chrome_alpha;     // Phase 2.K Commit 8.C: x = alpha multiplier
+    float4 hud_dst_rect;     // Phase 2.K Commit 8.D: HUD placement in window UV
+    float4 hud_src_rect;     // HUD source UV (signed zw for flip)
+    float4 hud_flags;        // x = present, y = premul
 };
 
 Texture2D src_tex : register(t0);
+// Phase 2.K Commit 8.D: optional HUD layer source. Bound by content-blit draws
+// in workspace mode when the slot has an active XR_EXT_window_space_layer; left
+// unbound for non-content paths (chrome composite, taskbar, toast, launcher) —
+// D3D11 returns float4(0) on sample from an unbound SRV, which makes the HUD
+// compose math collapse to a passthrough no-op even if `hud_flags.x` carries
+// stale data from a previous WRITE_DISCARD'd cbuffer.
+Texture2D hud_tex : register(t1);
 SamplerState src_samp : register(s0);
 
 struct VS_OUTPUT
@@ -799,6 +831,32 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
         return float4(src_rect.xyz, alpha * a_mul);
 
     float4 color = src_tex.Sample(src_samp, input.uv);
+
+    // --- Phase 2.K Commit 8.D: HUD compose (XR_EXT_window_space_layer). ---
+    // Run BEFORE the corner_alpha / feather_alpha apply at the end of this PS,
+    // so the rounded-window mask covers HUD pixels at the window's corners
+    // (e.g. the top-left of an icon-shaped HUD that extends to (0,0) clips
+    // along the same arc as the cube content). The HUD is placed in WINDOW-
+    // local UV (`hud_dst_rect`, same coordinate system as `quad_uv`), so
+    // `quad_uv` outside that rect skips the compose. Inside the rect we
+    // sample the HUD swapchain at the (possibly flip_y-signed) sub-image
+    // and porter-duff over the cube content.
+    if (hud_flags.x > 0.5)
+    {
+        float2 hud_q = (input.quad_uv - hud_dst_rect.xy) / max(hud_dst_rect.zw, float2(1e-6, 1e-6));
+        if (hud_q.x >= 0.0 && hud_q.x <= 1.0 && hud_q.y >= 0.0 && hud_q.y <= 1.0)
+        {
+            float2 hud_uv = hud_src_rect.xy + hud_q * hud_src_rect.zw;
+            float4 hud_color = hud_tex.Sample(src_samp, hud_uv);
+            float a = saturate(hud_color.a);
+            // Premultiplied: src already has (rgb * a). Unmultiplied: scale by a.
+            float3 hud_rgb_premul = (hud_flags.y > 0.5) ? hud_color.rgb : hud_color.rgb * a;
+            color.rgb = color.rgb * (1.0 - a) + hud_rgb_premul;
+            // Standard "src OVER dst" for the alpha channel keeps the window
+            // opaque where either layer is opaque.
+            color.a = saturate(color.a + a * (1.0 - color.a));
+        }
+    }
 
     // Phase 2.J / 3D cursor: shape-mask tint mode. When chrome_alpha.y > 0.5
     // the output uses glow_color.rgb as a SOLID color while preserving the
