@@ -395,6 +395,31 @@ create_pipelines(struct sim_display_processor_metal *sdp)
 
 
 /*
+ * sim_display Metal preserves alpha to the CAMetalLayer drawable — the
+ * blend / anaglyph / SBS shaders write atlas alpha straight through.
+ * Declare alpha-native so the runtime can rely on Cocoa-level NSWindow
+ * transparency without chroma-keying.
+ */
+static bool
+sim_dp_metal_is_alpha_native(struct xrt_display_processor_metal *xdp)
+{
+	(void)xdp;
+	return true;
+}
+
+static void
+sim_dp_metal_set_chroma_key(struct xrt_display_processor_metal *xdp,
+                            uint32_t key_color,
+                            bool transparent_bg_enabled)
+{
+	(void)xdp;
+	(void)key_color;
+	(void)transparent_bg_enabled;
+	// Alpha-native — no chroma-key fill/strip required.
+}
+
+
+/*
  *
  * Exported creation function.
  *
@@ -422,6 +447,8 @@ sim_display_processor_metal_create(enum sim_display_output_mode mode,
 	sdp->base.destroy = sim_dp_metal_destroy;
 	sdp->base.process_atlas = sim_dp_metal_process_atlas;
 	sdp->base.get_predicted_eye_positions = sim_dp_metal_get_predicted_eye_positions;
+	sdp->base.is_alpha_native = sim_dp_metal_is_alpha_native;
+	sdp->base.set_chroma_key = sim_dp_metal_set_chroma_key;
 
 	// Nominal viewer parameters (same defaults as sim_display_hmd_create)
 	sdp->ipd_m = 0.06f;

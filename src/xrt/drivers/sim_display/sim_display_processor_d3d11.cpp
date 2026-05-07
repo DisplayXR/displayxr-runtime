@@ -368,6 +368,31 @@ compile_shader(const char *source, const char *entry, const char *target, ID3DBl
 
 
 /*
+ * sim_display D3D11 passes atlas alpha through its blend/anaglyph/SBS
+ * pixel shaders to the back buffer — alpha-native by construction.
+ * Declared via the vtable so callers don't need to fall back on the
+ * chroma-key trick on this DP variant.
+ */
+static bool
+sim_dp_d3d11_is_alpha_native(struct xrt_display_processor_d3d11 *xdp)
+{
+	(void)xdp;
+	return true;
+}
+
+static void
+sim_dp_d3d11_set_chroma_key(struct xrt_display_processor_d3d11 *xdp,
+                            uint32_t key_color,
+                            bool transparent_bg_enabled)
+{
+	(void)xdp;
+	(void)key_color;
+	(void)transparent_bg_enabled;
+	// Alpha-native — no chroma-key fill/strip required.
+}
+
+
+/*
  *
  * Exported creation function.
  *
@@ -396,6 +421,8 @@ sim_display_processor_d3d11_create(enum sim_display_output_mode mode,
 	sdp->base.destroy = sim_dp_d3d11_destroy;
 	sdp->base.process_atlas = sim_dp_d3d11_process_atlas;
 	sdp->base.get_predicted_eye_positions = sim_dp_d3d11_get_predicted_eye_positions;
+	sdp->base.is_alpha_native = sim_dp_d3d11_is_alpha_native;
+	sdp->base.set_chroma_key = sim_dp_d3d11_set_chroma_key;
 
 	// Nominal viewer parameters (same defaults as sim_display_hmd_create)
 	sdp->ipd_m = 0.06f;
