@@ -27,6 +27,7 @@ if(WIN32 AND XRT_HAVE_D3D12)
 			aux_util
 			aux_os
 			aux_math
+			xrt-external-stb
 			d3d12
 			dxgi
 			d3dcompiler

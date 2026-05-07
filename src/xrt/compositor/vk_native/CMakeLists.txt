@@ -27,6 +27,7 @@ if((WIN32 OR APPLE) AND XRT_HAVE_VULKAN)
 			aux_util
 			aux_os
 			aux_math
+			xrt-external-stb
 		)
 
 	target_include_directories(comp_vk_native PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
