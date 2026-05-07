@@ -56,7 +56,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11_4.h>
-#include <d3dcompiler.h>
 #include <dxgi1_6.h>
 
 #include <stdint.h>
@@ -79,11 +78,6 @@ struct comp_settings
 	//! Nominal frame interval in nanoseconds.
 	int64_t nominal_frame_interval_ns;
 };
-
-// Forward declarations for chroma-key post-weave alpha-conversion pass (defined further down)
-struct comp_d3d11_compositor;
-static void d11_chroma_key_pass_execute(struct comp_d3d11_compositor *c);
-static void d11_chroma_key_destroy(struct comp_d3d11_compositor *c);
 
 /*!
  * The D3D11 native compositor structure.
@@ -119,21 +113,6 @@ struct comp_d3d11_compositor
 
 	//! Window handle for rendering (either from app or self-created).
 	HWND hwnd;
-
-	//! Optional chroma-key color (0x00BBGGRR / Win32 COLORREF) for the post-weave
-	//! alpha-conversion shader pass. Zero disables the pass. Only meaningful when
-	//! the compositor was created with transparent_background = true.
-	uint32_t chroma_key_color;
-	//! Lazy-initialized resources for the chroma-key shader pass; allocated on
-	//! the first frame the pass runs.
-	ID3D11VertexShader     *ck_vs;
-	ID3D11PixelShader      *ck_ps;
-	ID3D11Texture2D        *ck_intermediate;
-	ID3D11ShaderResourceView *ck_intermediate_srv;
-	ID3D11Buffer           *ck_constants;
-	ID3D11SamplerState     *ck_sampler;
-	UINT                    ck_intermediate_w;
-	UINT                    ck_intermediate_h;
 
 	//! App's window handle for position tracking in shared-texture mode.
 	//! When non-NULL, the hidden weaver window is repositioned each frame
@@ -1396,8 +1375,10 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// HUD overlay (post-processing, always readable)
 	d3d11_render_hud_overlay(c, weaving_done, &eye_pos);
 
-	// Post-weave chroma-key alpha conversion (no-op when chroma_key_color == 0).
-	d11_chroma_key_pass_execute(c);
+	// Note: post-weave chroma-key alpha conversion now lives inside the
+	// Leia D3D11 display processor (set_chroma_key + ck_run_post_weave_strip
+	// in leia_display_processor_d3d11.cpp). The compositor is vendor-agnostic
+	// for transparency.
 
 	// Copy composited output into shared texture if active (dual output: window + shared)
 	if (c->has_shared_texture && c->shared_texture != nullptr) {
@@ -1449,212 +1430,6 @@ d3d11_compositor_layer_commit_with_semaphore(struct xrt_compositor *xc,
 {
 	// Use the same implementation as layer_commit
 	return d3d11_compositor_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
-}
-
-/*
- *
- * Chroma-key post-weave alpha-conversion pass (D3D11)
- *
- * Same purpose as the D3D12 pass: rewrite back-buffer alpha based on chroma-key
- * RGB match so DComp's per-pixel alpha presentation can punch transparent regions
- * through to the desktop. Inserted between HUD overlay and Present.
- *
- */
-
-static const char *kChromaKeyD11VS = R"(
-struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
-VSOut main(uint vid : SV_VertexID) {
-    VSOut o;
-    o.uv = float2((vid << 1) & 2, vid & 2);
-    o.pos = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);
-    return o;
-}
-)";
-
-static const char *kChromaKeyD11PS = R"(
-struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
-Texture2D<float4> src : register(t0);
-SamplerState samp : register(s0);
-cbuffer Constants : register(b0) { float3 chroma_rgb; float pad; };
-float4 main(VSOut i) : SV_Target {
-    float3 c = src.Sample(samp, i.uv).rgb;
-    float3 d = abs(c - chroma_rgb);
-    bool match = max(max(d.r, d.g), d.b) < (1.0/512.0);
-    // Swapchain is DXGI_ALPHA_MODE_PREMULTIPLIED — RGB must already be * alpha.
-    // For transparent (alpha=0) pixels RGB MUST be (0,0,0); otherwise DWM's
-    // src.rgb + (1-alpha)*dst.rgb blend adds the matched chroma color to the
-    // desktop and saturates to white instead of showing through.
-    float a = match ? 0.0 : 1.0;
-    return float4(c * a, a);
-}
-)";
-
-struct ChromaKeyConstants {
-	float chroma_rgb[3];
-	float pad;
-};
-
-static bool
-d11_chroma_key_init_pipeline(struct comp_d3d11_compositor *c)
-{
-	if (c->ck_vs != nullptr) return true;
-	HRESULT hr;
-	ID3DBlob *vs_blob = nullptr;
-	ID3DBlob *ps_blob = nullptr;
-	ID3DBlob *err_blob = nullptr;
-
-	hr = D3DCompile(kChromaKeyD11VS, strlen(kChromaKeyD11VS), nullptr, nullptr, nullptr,
-	                "main", "vs_5_0", 0, 0, &vs_blob, &err_blob);
-	if (FAILED(hr)) {
-		U_LOG_E("Chroma-key VS compile failed: 0x%08x %s", hr,
-		        err_blob ? (const char *)err_blob->GetBufferPointer() : "");
-		if (err_blob) err_blob->Release();
-		return false;
-	}
-	if (err_blob) { err_blob->Release(); err_blob = nullptr; }
-
-	hr = D3DCompile(kChromaKeyD11PS, strlen(kChromaKeyD11PS), nullptr, nullptr, nullptr,
-	                "main", "ps_5_0", 0, 0, &ps_blob, &err_blob);
-	if (FAILED(hr)) {
-		U_LOG_E("Chroma-key PS compile failed: 0x%08x %s", hr,
-		        err_blob ? (const char *)err_blob->GetBufferPointer() : "");
-		vs_blob->Release();
-		if (err_blob) err_blob->Release();
-		return false;
-	}
-	if (err_blob) err_blob->Release();
-
-	hr = c->device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
-	                                    nullptr, &c->ck_vs);
-	if (SUCCEEDED(hr)) {
-		hr = c->device->CreatePixelShader(ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(),
-		                                   nullptr, &c->ck_ps);
-	}
-	vs_blob->Release();
-	ps_blob->Release();
-	if (FAILED(hr)) {
-		U_LOG_E("Chroma-key shader creation failed: 0x%08x", hr);
-		if (c->ck_vs) { c->ck_vs->Release(); c->ck_vs = nullptr; }
-		return false;
-	}
-
-	D3D11_BUFFER_DESC cb_desc = {};
-	cb_desc.ByteWidth = sizeof(ChromaKeyConstants);
-	cb_desc.Usage = D3D11_USAGE_DYNAMIC;
-	cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-	cb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-	hr = c->device->CreateBuffer(&cb_desc, nullptr, &c->ck_constants);
-	if (FAILED(hr)) {
-		U_LOG_E("Chroma-key constant buffer create failed: 0x%08x", hr);
-		return false;
-	}
-
-	D3D11_SAMPLER_DESC samp_desc = {};
-	samp_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
-	samp_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
-	samp_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
-	samp_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-	samp_desc.MaxLOD = D3D11_FLOAT32_MAX;
-	hr = c->device->CreateSamplerState(&samp_desc, &c->ck_sampler);
-	if (FAILED(hr)) {
-		U_LOG_E("Chroma-key sampler create failed: 0x%08x", hr);
-		return false;
-	}
-	U_LOG_W("Post-weave chroma-key conversion enabled: 0x%08X", c->chroma_key_color);
-	return true;
-}
-
-static bool
-d11_chroma_key_ensure_intermediate(struct comp_d3d11_compositor *c, UINT width, UINT height)
-{
-	if (c->ck_intermediate != nullptr &&
-	    c->ck_intermediate_w == width && c->ck_intermediate_h == height) {
-		return true;
-	}
-	if (c->ck_intermediate_srv) { c->ck_intermediate_srv->Release(); c->ck_intermediate_srv = nullptr; }
-	if (c->ck_intermediate)     { c->ck_intermediate->Release();     c->ck_intermediate = nullptr; }
-
-	D3D11_TEXTURE2D_DESC desc = {};
-	desc.Width = width;
-	desc.Height = height;
-	desc.MipLevels = 1;
-	desc.ArraySize = 1;
-	desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-	desc.SampleDesc.Count = 1;
-	desc.Usage = D3D11_USAGE_DEFAULT;
-	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-	HRESULT hr = c->device->CreateTexture2D(&desc, nullptr, &c->ck_intermediate);
-	if (FAILED(hr)) {
-		U_LOG_E("Chroma-key intermediate create failed: 0x%08x", hr);
-		return false;
-	}
-	hr = c->device->CreateShaderResourceView(c->ck_intermediate, nullptr, &c->ck_intermediate_srv);
-	if (FAILED(hr)) {
-		U_LOG_E("Chroma-key intermediate SRV create failed: 0x%08x", hr);
-		return false;
-	}
-	c->ck_intermediate_w = width;
-	c->ck_intermediate_h = height;
-	return true;
-}
-
-static void
-d11_chroma_key_pass_execute(struct comp_d3d11_compositor *c)
-{
-	if (c->chroma_key_color == 0) return;
-	if (!d11_chroma_key_init_pipeline(c)) return;
-
-	uint32_t target_w = 0, target_h = 0;
-	comp_d3d11_target_get_dimensions(c->target, &target_w, &target_h);
-	if (target_w == 0 || target_h == 0) return;
-	if (!d11_chroma_key_ensure_intermediate(c, target_w, target_h)) return;
-
-	ID3D11Texture2D *back_buffer = static_cast<ID3D11Texture2D *>(
-	    comp_d3d11_target_get_back_buffer(c->target));
-	if (back_buffer == nullptr) return;
-
-	// Copy current back buffer to intermediate (so we can sample it).
-	c->context->CopyResource(c->ck_intermediate, back_buffer);
-
-	// Update constant buffer with chroma RGB unpacked from 0x00BBGGRR.
-	D3D11_MAPPED_SUBRESOURCE mapped = {};
-	HRESULT hr = c->context->Map(c->ck_constants, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-	if (FAILED(hr)) return;
-	uint32_t k = c->chroma_key_color;
-	ChromaKeyConstants *cb = reinterpret_cast<ChromaKeyConstants *>(mapped.pData);
-	cb->chroma_rgb[0] = ((k >>  0) & 0xFF) / 255.0f;
-	cb->chroma_rgb[1] = ((k >>  8) & 0xFF) / 255.0f;
-	cb->chroma_rgb[2] = ((k >> 16) & 0xFF) / 255.0f;
-	cb->pad = 0.0f;
-	c->context->Unmap(c->ck_constants, 0);
-
-	// Re-bind the back-buffer RTV (target_bind handles viewport too).
-	comp_d3d11_target_bind(c->target);
-
-	// Set fullscreen-triangle pipeline state.
-	c->context->IASetInputLayout(nullptr);
-	c->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-	c->context->VSSetShader(c->ck_vs, nullptr, 0);
-	c->context->PSSetShader(c->ck_ps, nullptr, 0);
-	c->context->PSSetShaderResources(0, 1, &c->ck_intermediate_srv);
-	c->context->PSSetSamplers(0, 1, &c->ck_sampler);
-	c->context->PSSetConstantBuffers(0, 1, &c->ck_constants);
-	c->context->Draw(3, 0);
-
-	// Unbind the SRV so future passes that bind the same texture can use it.
-	ID3D11ShaderResourceView *null_srv = nullptr;
-	c->context->PSSetShaderResources(0, 1, &null_srv);
-}
-
-static void
-d11_chroma_key_destroy(struct comp_d3d11_compositor *c)
-{
-	if (c->ck_intermediate_srv) { c->ck_intermediate_srv->Release(); c->ck_intermediate_srv = nullptr; }
-	if (c->ck_intermediate)     { c->ck_intermediate->Release();     c->ck_intermediate = nullptr; }
-	if (c->ck_constants)        { c->ck_constants->Release();        c->ck_constants = nullptr; }
-	if (c->ck_sampler)          { c->ck_sampler->Release();          c->ck_sampler = nullptr; }
-	if (c->ck_ps)               { c->ck_ps->Release();               c->ck_ps = nullptr; }
-	if (c->ck_vs)               { c->ck_vs->Release();               c->ck_vs = nullptr; }
 }
 
 static void
@@ -1710,9 +1485,6 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 	if (c->renderer != nullptr) {
 		comp_d3d11_renderer_destroy(&c->renderer);
 	}
-
-	// Release chroma-key pass resources before the target/swapchain.
-	d11_chroma_key_destroy(c);
 
 	if (c->target != nullptr) {
 		comp_d3d11_target_destroy(&c->target);
@@ -1777,17 +1549,6 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	c->canvas = {};
 	c->hardware_display_3d = true;
 	c->last_3d_mode_index = 1;
-
-	// Chroma-key pass state (lazy-allocated on first use)
-	c->chroma_key_color = chroma_key_color;
-	c->ck_vs = nullptr;
-	c->ck_ps = nullptr;
-	c->ck_intermediate = nullptr;
-	c->ck_intermediate_srv = nullptr;
-	c->ck_constants = nullptr;
-	c->ck_sampler = nullptr;
-	c->ck_intermediate_w = 0;
-	c->ck_intermediate_h = 0;
 
 	// Handle window: use provided HWND, create our own, or go offscreen (shared texture)
 	if (shared_texture_handle != nullptr) {
@@ -2011,6 +1772,11 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			c->display_processor = nullptr;
 		} else {
 			U_LOG_W("D3D11 display processor created via factory");
+			// Forward session-level transparency config. The DP runs the
+			// chroma-key fill+strip internally when transparent_background
+			// is set; chroma_key_color=0 means the DP picks its own key.
+			xrt_display_processor_d3d11_set_chroma_key(
+			    c->display_processor, chroma_key_color, transparent_background);
 		}
 	} else {
 		U_LOG_W("No D3D11 display processor factory provided");
