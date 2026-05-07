@@ -211,7 +211,14 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
             state.fullscreenToggleRequested = true;
             break;
         case VK_TAB:
-            state.hudVisible = !state.hudVisible;
+            // Require SHIFT to avoid colliding with the workspace shell's
+            // bare TAB binding (cycle focus across windows). Bare TAB is
+            // the focus-cycle hotkey when the cube runs under
+            // displayxr-shell, so a non-modified TAB should fall through
+            // to the shell rather than toggle the HUD.
+            if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) {
+                state.hudVisible = !state.hudVisible;
+            }
             break;
         case 'V':
             // Cycle through all rendering modes
