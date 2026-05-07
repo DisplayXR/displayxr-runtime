@@ -805,14 +805,14 @@ comp_d3d12_renderer_destroy(struct comp_d3d12_renderer **renderer_ptr)
 
 
 extern "C" xrt_result_t
-comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
-                         void *cmd_list_ptr,
-                         struct comp_layer_accum *layers,
-                         struct xrt_vec3 *left_eye,
-                         struct xrt_vec3 *right_eye,
-                         uint32_t target_width,
-                         uint32_t target_height,
-                         bool hardware_display_3d)
+comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
+                                          void *cmd_list_ptr,
+                                          struct comp_layer_accum *layers,
+                                          struct xrt_vec3 *left_eye,
+                                          struct xrt_vec3 *right_eye,
+                                          uint32_t target_width,
+                                          uint32_t target_height,
+                                          bool hardware_display_3d)
 {
 	ID3D12GraphicsCommandList *cmd_list = static_cast<ID3D12GraphicsCommandList *>(cmd_list_ptr);
 
@@ -1030,6 +1030,26 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 		}
 	}
 
+	// Atlas left in RENDER_TARGET; window-space pass continues into the
+	// same cmd_list (or after a capture round-trip through PSR).
+	return XRT_SUCCESS;
+}
+
+extern "C" xrt_result_t
+comp_d3d12_renderer_draw_window_space_pass(struct comp_d3d12_renderer *renderer,
+                                            void *cmd_list_ptr,
+                                            struct comp_layer_accum *layers,
+                                            uint32_t target_width,
+                                            uint32_t target_height,
+                                            bool hardware_display_3d)
+{
+	ID3D12GraphicsCommandList *cmd_list = static_cast<ID3D12GraphicsCommandList *>(cmd_list_ptr);
+	if (cmd_list == nullptr || layers == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	uint32_t view_count = hardware_display_3d ? 2 : 1;
+
 	// Compute effective viewport for window-space layers (same clamp as projection)
 	uint32_t ws_vp_w = renderer->view_width;
 	uint32_t ws_vp_h = renderer->view_height;
@@ -1039,7 +1059,7 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 		if (target_height < renderer->texture_height) ws_vp_h = target_height;
 	}
 
-	// Draw window-space layers (atlas is already in RENDER_TARGET state)
+	// Draw window-space layers (atlas is in RENDER_TARGET state)
 	for (uint32_t vi = 0; vi < view_count; vi++) {
 		for (uint32_t li = 0; li < layers->layer_count; li++) {
 			struct comp_layer *layer = &layers->layers[li];
@@ -1050,12 +1070,37 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 		}
 	}
 
-	// Final transition: RENDER_TARGET → PIXEL_SHADER_RESOURCE
+	// Final transition: RENDER_TARGET → PIXEL_SHADER_RESOURCE for DP
+	D3D12_RESOURCE_BARRIER barrier = {};
+	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barrier.Transition.pResource = renderer->atlas_texture;
 	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
 	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 	cmd_list->ResourceBarrier(1, &barrier);
 
 	return XRT_SUCCESS;
+}
+
+extern "C" xrt_result_t
+comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
+                         void *cmd_list_ptr,
+                         struct comp_layer_accum *layers,
+                         struct xrt_vec3 *left_eye,
+                         struct xrt_vec3 *right_eye,
+                         uint32_t target_width,
+                         uint32_t target_height,
+                         bool hardware_display_3d)
+{
+	xrt_result_t xret = comp_d3d12_renderer_draw_projection_pass(
+	    renderer, cmd_list_ptr, layers, left_eye, right_eye,
+	    target_width, target_height, hardware_display_3d);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	return comp_d3d12_renderer_draw_window_space_pass(
+	    renderer, cmd_list_ptr, layers,
+	    target_width, target_height, hardware_display_3d);
 }
 
 

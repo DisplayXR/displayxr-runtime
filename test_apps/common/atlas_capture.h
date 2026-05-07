@@ -14,10 +14,21 @@
  * window-space overlays, no per-eye disparity, no compose-time blending.
  * Useful for debugging an app's own tile-aware rendering.
  *
- * **For "what the DP weaves" (post-compose, all layers)**: use the
- * runtime-side trigger-file at `${TMPDIR:-/tmp}/displayxr_atlas_trigger`
- * (POSIX) or `%TEMP%\displayxr_atlas_trigger` (Windows). See issue #210
- * and `comp_*_compositor.{c,cpp,m}::*_service_trigger_file`.
+ * **For runtime-side captures**, use the trigger files (or the MCP
+ * @c capture_frame tool with a @c mode parameter):
+ *   - `${TMPDIR:-/tmp}/displayxr_atlas_trigger` (POSIX) or
+ *     `%TEMP%\displayxr_atlas_trigger` (Windows) → @b post-compose
+ *     atlas the DP weaver receives — projection + window-space (HUD) +
+ *     quads, composed across every tile. Output PNG:
+ *     `displayxr_atlas.png`.
+ *   - `…\displayxr_atlas_trigger.projection` → @b projection-only:
+ *     atlas state before window-space layers are composed in (per-tile
+ *     projection content only). Output PNG:
+ *     `displayxr_atlas.projection.png`. Useful for verifying tile-aware
+ *     app rendering independent of chrome.
+ *
+ * See `u_capture_intent.h` and the per-compositor
+ * `*_compositor_dispatch_capture` plumbing.
  *
  * Each backend (D3D11/D3D12/GL/Metal/Vulkan) lives in its own `.cpp`/`.mm`
  * and is only compiled in by apps that need it. Filename helpers and the

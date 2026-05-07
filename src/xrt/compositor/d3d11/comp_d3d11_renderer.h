@@ -81,6 +81,47 @@ comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
                          bool hardware_display_3d);
 
 /*!
+ * Render the projection-class pass of the atlas (projection /
+ * projection-depth / quad / cylinder / equirect / cube layers). Window-
+ * space layers are skipped so the compositor can capture an
+ * intermediate "projection-only" atlas state between this call and
+ * @ref comp_d3d11_renderer_draw_window_space_pass for the runtime-side
+ * @c capture_frame projection-only mode (see u_capture_intent.h, #210).
+ *
+ * Clears the atlas RTV and depth buffer, sets common state, then runs
+ * the per-view loop with all non-window-space layer types. After this
+ * returns the atlas contains the projection-only composite.
+ *
+ * @ingroup comp_d3d11
+ */
+xrt_result_t
+comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
+                                          struct comp_layer_accum *layers,
+                                          struct xrt_vec3 *left_eye,
+                                          struct xrt_vec3 *right_eye,
+                                          uint32_t target_width,
+                                          uint32_t target_height,
+                                          bool hardware_display_3d);
+
+/*!
+ * Render only window-space layers into the atlas, on top of whatever
+ * the projection pass left behind. Does NOT clear the atlas. State
+ * (shaders, blend) is set per-layer inside @c render_window_space_layer.
+ *
+ * Pair with @ref comp_d3d11_renderer_draw_projection_pass when an
+ * intermediate capture point is needed; otherwise call
+ * @ref comp_d3d11_renderer_draw which runs both back-to-back.
+ *
+ * @ingroup comp_d3d11
+ */
+xrt_result_t
+comp_d3d11_renderer_draw_window_space_pass(struct comp_d3d11_renderer *renderer,
+                                            struct comp_layer_accum *layers,
+                                            uint32_t target_width,
+                                            uint32_t target_height,
+                                            bool hardware_display_3d);
+
+/*!
  * Get the atlas texture SRV for weaving.
  *
  * Returns the shader resource view of the tiled atlas texture

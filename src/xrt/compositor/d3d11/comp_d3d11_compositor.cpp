@@ -47,6 +47,7 @@
 #include "math/m_api.h"
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
+#include "util/u_capture_intent.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty_interface.h"
@@ -229,6 +230,10 @@ struct comp_d3d11_compositor
 
 	//! MCP capture_frame request box (serviced at end of layer_commit).
 	struct mcp_capture_request mcp_capture;
+
+	//! Per-frame capture intent populated at top of layer_commit. See
+	//! u_capture_intent.h.
+	struct u_capture_intent capture_intent;
 };
 
 /*
@@ -942,49 +947,23 @@ d3d11_compositor_capture_atlas_to_png(struct comp_d3d11_compositor *c, const cha
 }
 
 // Service a pending MCP capture_frame request — thin wrapper around
-// d3d11_compositor_capture_atlas_to_png that handles the cross-thread
-// hand-off with the MCP server.
+// Run the capture readback if the per-frame intent matches @p mode_filter.
+// Mirrors vk_native_dispatch_capture / gl_compositor_dispatch_capture.
 static void
-d3d11_compositor_service_mcp_capture(struct comp_d3d11_compositor *c)
+d3d11_compositor_dispatch_capture(struct comp_d3d11_compositor *c, uint32_t mode_filter)
 {
-	char path[MCP_CAPTURE_PATH_MAX];
-	if (!mcp_capture_poll(&c->mcp_capture, path)) {
+	if (!u_capture_intent_should_capture(&c->capture_intent, mode_filter)) {
 		return;
 	}
-	bool ok = d3d11_compositor_capture_atlas_to_png(c, path);
-	mcp_capture_complete(&c->mcp_capture, ok);
-}
-
-// Trigger-file capture path — same readback as the MCP path, driven by
-// the existence of %TEMP%\displayxr_atlas_trigger so devs can snapshot
-// the post-compose atlas without an MCP client. Mirrors the service-
-// mode `workspace_screenshot_trigger` path in comp_d3d11_service.cpp.
-// See issue #210.
-static void
-d3d11_compositor_service_trigger_file(struct comp_d3d11_compositor *c)
-{
-	static char trigger_path[MCP_CAPTURE_PATH_MAX] = {0};
-	static char out_path[MCP_CAPTURE_PATH_MAX] = {0};
-	if (trigger_path[0] == '\0') {
-		const char *tmp = getenv("TEMP");
-		if (tmp == nullptr || tmp[0] == '\0') {
-			tmp = "C:\\Temp";
-		}
-		snprintf(trigger_path, sizeof(trigger_path), "%s\\displayxr_atlas_trigger", tmp);
-		snprintf(out_path, sizeof(out_path), "%s\\displayxr_atlas.png", tmp);
-	}
-
-	if (GetFileAttributesA(trigger_path) == INVALID_FILE_ATTRIBUTES) {
-		return;
-	}
-	DeleteFileA(trigger_path);
-
-	bool ok = d3d11_compositor_capture_atlas_to_png(c, out_path);
+	bool ok = d3d11_compositor_capture_atlas_to_png(c, c->capture_intent.path);
 	if (ok) {
-		U_LOG_I("Atlas captured to %s", out_path);
+		U_LOG_I("Atlas captured (mode=%u) to %s",
+		        c->capture_intent.mode, c->capture_intent.path);
 	} else {
-		U_LOG_W("Atlas capture failed (trigger %s)", trigger_path);
+		U_LOG_W("Atlas capture failed (mode=%u path=%s)",
+		        c->capture_intent.mode, c->capture_intent.path);
 	}
+	u_capture_intent_complete(&c->capture_intent, &c->mcp_capture, ok);
 }
 
 static xrt_result_t
@@ -993,6 +972,11 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
+
+	// Capture-intent poll — see u_capture_intent.h. Consumed at the
+	// projection-done boundary (PROJECTION_ONLY, once renderer split
+	// lands) or end of frame (POST_COMPOSE).
+	u_capture_intent_poll(&c->capture_intent, &c->mcp_capture);
 
 	// Phase 1 diagnostic — env-gated per-client commit interval. Mirrors
 	// the same `[CLIENT_FRAME_NS]` line emitted by the SERVICE compositor's
@@ -1284,14 +1268,27 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// Render layers to atlas texture (skip if zero-copy).
-	// Pass hardware_display_3d so the renderer knows the current display mode.
+	// Render layers to atlas texture (skip if zero-copy). Split into a
+	// projection pass + window-space pass so a projection-only capture
+	// can read the atlas in between.
 	xrt_result_t xret = XRT_SUCCESS;
 	if (!zero_copy) {
-		xret = comp_d3d11_renderer_draw(
+		xret = comp_d3d11_renderer_draw_projection_pass(
 		    c->renderer, &c->layer_accum, &left_eye, &right_eye, tgt_width, tgt_height, c->hardware_display_3d);
 		if (xret != XRT_SUCCESS) {
-			U_LOG_E("Failed to render layers");
+			U_LOG_E("Failed to render projection pass");
+			return xret;
+		}
+
+		// Projection-only capture point — atlas now contains projection-
+		// class layers (projection, projection-depth, quad) for every
+		// tile; window-space layers haven't been composed yet.
+		d3d11_compositor_dispatch_capture(c, MCP_CAPTURE_MODE_PROJECTION_ONLY);
+
+		xret = comp_d3d11_renderer_draw_window_space_pass(
+		    c->renderer, &c->layer_accum, tgt_width, tgt_height, c->hardware_display_3d);
+		if (xret != XRT_SUCCESS) {
+			U_LOG_E("Failed to render window-space pass");
 			return xret;
 		}
 	}
@@ -1437,13 +1434,10 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		return xret;
 	}
 
-	// Service pending MCP capture_frame after Present so the atlas
-	// we stage-copy reflects exactly what the user just saw.
-	d3d11_compositor_service_mcp_capture(c);
-
-	// Same readback driven by a trigger file (no MCP client required).
-	// See issue #210.
-	d3d11_compositor_service_trigger_file(c);
+	// Post-compose capture (#210) — fully composed atlas as DP saw it.
+	// PROJECTION_ONLY intent is consumed earlier in this function once
+	// the renderer split lands; until then both modes hit this point.
+	d3d11_compositor_dispatch_capture(c, MCP_CAPTURE_MODE_POST_COMPOSE);
 
 	return XRT_SUCCESS;
 }

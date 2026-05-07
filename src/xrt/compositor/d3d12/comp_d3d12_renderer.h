@@ -80,6 +80,46 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
                          bool hardware_display_3d);
 
 /*!
+ * Project-pass half of @ref comp_d3d12_renderer_draw. Records into
+ * @p cmd_list:
+ *   - barrier atlas PIXEL_SHADER_RESOURCE → RENDER_TARGET
+ *   - clear atlas
+ *   - per-projection-layer stretch-blit into atlas tiles
+ * Atlas is left in RENDER_TARGET (uncommitted; cmd_list still open).
+ * Pair with @ref comp_d3d12_renderer_draw_window_space_pass; insert
+ * a capture call between them for the projection-only mode (#210).
+ *
+ * @ingroup comp_d3d12
+ */
+xrt_result_t
+comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
+                                          void *cmd_list,
+                                          struct comp_layer_accum *layers,
+                                          struct xrt_vec3 *left_eye,
+                                          struct xrt_vec3 *right_eye,
+                                          uint32_t target_width,
+                                          uint32_t target_height,
+                                          bool hardware_display_3d);
+
+/*!
+ * Window-space-pass half of @ref comp_d3d12_renderer_draw. Records:
+ *   - per-window-space-layer textured quad in each atlas tile
+ *   - final barrier atlas RENDER_TARGET → PIXEL_SHADER_RESOURCE for DP
+ * Expects atlas in RENDER_TARGET on entry (caller transitions back if
+ * a capture happened in between, since capture leaves atlas in
+ * PIXEL_SHADER_RESOURCE).
+ *
+ * @ingroup comp_d3d12
+ */
+xrt_result_t
+comp_d3d12_renderer_draw_window_space_pass(struct comp_d3d12_renderer *renderer,
+                                            void *cmd_list,
+                                            struct comp_layer_accum *layers,
+                                            uint32_t target_width,
+                                            uint32_t target_height,
+                                            bool hardware_display_3d);
+
+/*!
  * Get the atlas texture SRV GPU descriptor handle for weaving.
  *
  * @param renderer The renderer.

@@ -497,6 +497,50 @@ vk_hud_blend_draw(struct vk_hud_blend *blend,
 }
 
 void
+vk_hud_blend_draw_no_layout(struct vk_hud_blend *blend,
+                              struct vk_bundle *vk,
+                              VkCommandBuffer cmd,
+                              VkFramebuffer fb,
+                              uint32_t fb_w,
+                              uint32_t fb_h,
+                              VkImage hud_image,
+                              int32_t dst_x,
+                              int32_t dst_y,
+                              uint32_t dst_w,
+                              uint32_t dst_h)
+{
+	if (!blend->initialized || hud_image == VK_NULL_HANDLE || fb == VK_NULL_HANDLE ||
+	    dst_w == 0 || dst_h == 0) {
+		return;
+	}
+
+	VkDescriptorSet desc_set = get_or_create_image_desc(blend, vk, hud_image);
+	if (desc_set == VK_NULL_HANDLE) {
+		return;
+	}
+
+	VkRenderPassBeginInfo rp_bi = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+	    .renderPass = blend->render_pass,
+	    .framebuffer = fb,
+	    .renderArea = {{0, 0}, {fb_w, fb_h}},
+	};
+	vk->vkCmdBeginRenderPass(cmd, &rp_bi, VK_SUBPASS_CONTENTS_INLINE);
+
+	VkViewport vp = {(float)dst_x, (float)dst_y, (float)dst_w, (float)dst_h, 0.0f, 1.0f};
+	vk->vkCmdSetViewport(cmd, 0, 1, &vp);
+	VkRect2D scissor = {{dst_x, dst_y}, {dst_w, dst_h}};
+	vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, blend->pipeline);
+	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, blend->pipe_layout, 0, 1,
+	                             &desc_set, 0, NULL);
+	vk->vkCmdDraw(cmd, 3, 1, 0, 0);
+
+	vk->vkCmdEndRenderPass(cmd);
+}
+
+void
 vk_hud_blend_fini(struct vk_hud_blend *blend, struct vk_bundle *vk)
 {
 	if (!blend->initialized) {

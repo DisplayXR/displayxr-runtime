@@ -32,6 +32,7 @@
 #include "math/m_api.h"
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
+#include "util/u_capture_intent.h"
 #include "util/u_hud.h"
 #include <displayxr_mcp/mcp_capture.h>
 
@@ -225,6 +226,9 @@ struct comp_d3d12_compositor
 	//! MCP capture_frame request box (serviced at end of layer_commit).
 	//! Mirrors the pattern in comp_metal/gl/d3d11_compositor. See issue #210.
 	struct mcp_capture_request mcp_capture;
+
+	//! Per-frame capture intent. See u_capture_intent.h.
+	struct u_capture_intent capture_intent;
 };
 
 /*
@@ -1056,44 +1060,22 @@ d3d12_compositor_capture_atlas_to_png(struct comp_d3d12_compositor *c, const cha
 	return ok;
 }
 
-// Service a pending MCP capture_frame request — thin wrapper around
-// d3d12_compositor_capture_atlas_to_png.
+// Run the capture readback if the per-frame intent matches @p mode_filter.
 static void
-d3d12_compositor_service_mcp_capture(struct comp_d3d12_compositor *c)
+d3d12_compositor_dispatch_capture(struct comp_d3d12_compositor *c, uint32_t mode_filter)
 {
-	char path[MCP_CAPTURE_PATH_MAX];
-	if (!mcp_capture_poll(&c->mcp_capture, path)) {
+	if (!u_capture_intent_should_capture(&c->capture_intent, mode_filter)) {
 		return;
 	}
-	bool ok = d3d12_compositor_capture_atlas_to_png(c, path);
-	mcp_capture_complete(&c->mcp_capture, ok);
-}
-
-// Trigger-file capture path — mirrors the d3d11_service workspace_screenshot
-// pattern (comp_d3d11_service.cpp:9696-9716). See issue #210.
-static void
-d3d12_compositor_service_trigger_file(struct comp_d3d12_compositor *c)
-{
-	static char trigger_path[MCP_CAPTURE_PATH_MAX] = {0};
-	static char out_path[MCP_CAPTURE_PATH_MAX] = {0};
-	if (trigger_path[0] == '\0') {
-		const char *tmp = getenv("TEMP");
-		if (tmp == nullptr || tmp[0] == '\0') tmp = "C:\\Temp";
-		snprintf(trigger_path, sizeof(trigger_path), "%s\\displayxr_atlas_trigger", tmp);
-		snprintf(out_path, sizeof(out_path), "%s\\displayxr_atlas.png", tmp);
-	}
-
-	if (GetFileAttributesA(trigger_path) == INVALID_FILE_ATTRIBUTES) {
-		return;
-	}
-	DeleteFileA(trigger_path);
-
-	bool ok = d3d12_compositor_capture_atlas_to_png(c, out_path);
+	bool ok = d3d12_compositor_capture_atlas_to_png(c, c->capture_intent.path);
 	if (ok) {
-		U_LOG_I("Atlas captured to %s", out_path);
+		U_LOG_I("Atlas captured (mode=%u) to %s",
+		        c->capture_intent.mode, c->capture_intent.path);
 	} else {
-		U_LOG_W("Atlas capture failed (trigger %s)", trigger_path);
+		U_LOG_W("Atlas capture failed (mode=%u path=%s)",
+		        c->capture_intent.mode, c->capture_intent.path);
 	}
+	u_capture_intent_complete(&c->capture_intent, &c->mcp_capture, ok);
 }
 
 
@@ -1103,6 +1085,11 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
+
+	// Capture-intent poll — see u_capture_intent.h. Consumed at the
+	// projection-done boundary (PROJECTION_ONLY, once renderer split
+	// lands) or end of frame (POST_COMPOSE).
+	u_capture_intent_poll(&c->capture_intent, &c->mcp_capture);
 
 	// Get predicted eye positions
 	struct xrt_eye_positions eye_pos = {};
@@ -1327,13 +1314,56 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// Render layers to atlas texture (skip if zero-copy)
+	// Render layers to atlas texture (skip if zero-copy). Split into a
+	// projection pass + window-space pass so a projection-only capture
+	// can read the atlas in between.
 	xrt_result_t xret = XRT_SUCCESS;
 	if (!zero_copy) {
-		xret = comp_d3d12_renderer_draw(
+		xret = comp_d3d12_renderer_draw_projection_pass(
 		    c->renderer, c->cmd_list, &c->layer_accum, &left_eye, &right_eye, tgt_width, tgt_height, c->hardware_display_3d);
 		if (xret != XRT_SUCCESS) {
-			U_LOG_E("Failed to render layers");
+			U_LOG_E("Failed to render projection pass");
+			return xret;
+		}
+
+		// Projection-only capture point. Atlas is in RENDER_TARGET with
+		// uncommitted projection commands in the cmd_list. To read it back
+		// we need to commit those commands, transition the atlas to
+		// PIXEL_SHADER_RESOURCE, run the capture (which uses the cmd_list
+		// for its own copy + barriers), then transition back to
+		// RENDER_TARGET so the window-space pass can append draws.
+		if (c->capture_intent.pending && c->capture_intent.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY) {
+			ID3D12Resource *atlas_res = static_cast<ID3D12Resource *>(
+			    comp_d3d12_renderer_get_atlas_resource(c->renderer));
+
+			D3D12_RESOURCE_BARRIER ws_barrier = {};
+			ws_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			ws_barrier.Transition.pResource = atlas_res;
+			ws_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			ws_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			ws_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			c->cmd_list->ResourceBarrier(1, &ws_barrier);
+
+			c->cmd_list->Close();
+			ID3D12CommandList *flush_lists[] = {c->cmd_list};
+			c->command_queue->ExecuteCommandLists(1, flush_lists);
+			gpu_wait_idle(c);
+
+			// Capture handles its own cmd_list reset + barriers (PSR↔COPY_SOURCE).
+			d3d12_compositor_dispatch_capture(c, MCP_CAPTURE_MODE_PROJECTION_ONLY);
+
+			// Re-arm cmd_list and put atlas back in RENDER_TARGET.
+			c->cmd_allocator->Reset();
+			c->cmd_list->Reset(c->cmd_allocator, nullptr);
+			ws_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			ws_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			c->cmd_list->ResourceBarrier(1, &ws_barrier);
+		}
+
+		xret = comp_d3d12_renderer_draw_window_space_pass(
+		    c->renderer, c->cmd_list, &c->layer_accum, tgt_width, tgt_height, c->hardware_display_3d);
+		if (xret != XRT_SUCCESS) {
+			U_LOG_E("Failed to render window-space pass");
 			return xret;
 		}
 	}
@@ -1656,6 +1686,11 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// Wait for frame completion (frame pacing)
 		gpu_wait_idle(c);
 
+		// Post-compose capture (#210) — fully composed atlas as DP saw it.
+		// DP path returns early; mirror the fallback path's call site so the
+		// capture surface works regardless of which weave path ran.
+		d3d12_compositor_dispatch_capture(c, MCP_CAPTURE_MODE_POST_COMPOSE);
+
 		return XRT_SUCCESS;
 	}
 
@@ -1731,11 +1766,10 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// MCP capture_frame + trigger-file post-compose atlas capture (#210).
-	// Runs after the existing fence wait so the GPU is idle when we
-	// reset the compositor's command allocator/list for the readback.
-	d3d12_compositor_service_mcp_capture(c);
-	d3d12_compositor_service_trigger_file(c);
+	// Post-compose capture (#210) — runs after the existing fence wait so
+	// the GPU is idle when we reset the compositor's cmd allocator/list
+	// for the readback.
+	d3d12_compositor_dispatch_capture(c, MCP_CAPTURE_MODE_POST_COMPOSE);
 
 	return XRT_SUCCESS;
 }

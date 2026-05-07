@@ -31,6 +31,7 @@
 #include "util/u_misc.h"
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
+#include "util/u_capture_intent.h"
 #include "util/u_time.h"
 #include "util/u_hud.h"
 #include <displayxr_mcp/mcp_capture.h>
@@ -299,6 +300,9 @@ struct comp_gl_compositor
 
 	//! MCP capture_frame request box (serviced at end of layer_commit).
 	struct mcp_capture_request mcp_capture;
+
+	//! Per-frame capture intent. See u_capture_intent.h.
+	struct u_capture_intent capture_intent;
 };
 
 static inline struct comp_gl_compositor *
@@ -1003,11 +1007,10 @@ gl_compositor_capture_atlas_to_png(struct comp_gl_compositor *c, const char *pat
 	glGenFramebuffers(1, &fbo);
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
 	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, c->atlas_texture, 0);
-	// Atlas's lower-left origin means our content region sits in the
-	// upper-left of the texture, at (0, atlas_h - content_h).
-	GLint src_y = (GLint)c->atlas_tex_height - (GLint)content_h;
-	if (src_y < 0) src_y = 0;
-	glReadPixels(0, src_y, (GLsizei)content_w, (GLsizei)content_h, GL_RGBA, GL_UNSIGNED_BYTE, bottom_up);
+	// Renderer renders content into FBO viewport (0, 0, content_w, content_h),
+	// which in GL's lower-left origin lands at the bottom of the texture. Read
+	// from y=0; the bottom_up→top_down flip below produces a top-down PNG.
+	glReadPixels(0, 0, (GLsizei)content_w, (GLsizei)content_h, GL_RGBA, GL_UNSIGNED_BYTE, bottom_up);
 	glFinish();
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read_fbo);
 	glDeleteFramebuffers(1, &fbo);
@@ -1024,70 +1027,24 @@ gl_compositor_capture_atlas_to_png(struct comp_gl_compositor *c, const char *pat
 	return ok;
 }
 
-// Service a pending MCP capture_frame request — thin wrapper around
-// gl_compositor_capture_atlas_to_png that handles the cross-thread
-// hand-off with the MCP server.
+// Run the capture readback if the per-frame intent matches @p mode_filter.
+// GL atlas is sample-able after either the projection-only loop or the full
+// compose pass — same readback function for both modes.
 static void
-gl_compositor_service_mcp_capture(struct comp_gl_compositor *c)
+gl_compositor_dispatch_capture(struct comp_gl_compositor *c, uint32_t mode_filter)
 {
-	char path[MCP_CAPTURE_PATH_MAX];
-	if (!mcp_capture_poll(&c->mcp_capture, path)) {
+	if (!u_capture_intent_should_capture(&c->capture_intent, mode_filter)) {
 		return;
 	}
-	bool ok = gl_compositor_capture_atlas_to_png(c, path);
-	mcp_capture_complete(&c->mcp_capture, ok);
-}
-
-// Trigger-file capture path — same readback as the MCP path, driven
-// by the existence of a trigger file so devs can snapshot the post-
-// compose atlas without an MCP client. POSIX side uses
-// $TMPDIR/displayxr_atlas_trigger; Windows side (XRT_OS_WINDOWS) uses
-// %TEMP%\displayxr_atlas_trigger to mirror the d3d11_service path.
-// See issue #210.
-static void
-gl_compositor_service_trigger_file(struct comp_gl_compositor *c)
-{
-	static char trigger_path[MCP_CAPTURE_PATH_MAX] = {0};
-	static char out_path[MCP_CAPTURE_PATH_MAX] = {0};
-	if (trigger_path[0] == '\0') {
-#ifdef XRT_OS_WINDOWS
-		const char *tmp = getenv("TEMP");
-		if (tmp == NULL || tmp[0] == '\0') tmp = "C:\\Temp";
-		snprintf(trigger_path, sizeof(trigger_path), "%s\\displayxr_atlas_trigger", tmp);
-		snprintf(out_path, sizeof(out_path), "%s\\displayxr_atlas.png", tmp);
-#else
-		const char *tmp = getenv("TMPDIR");
-		if (tmp == NULL || tmp[0] == '\0') tmp = "/tmp";
-		size_t tlen = strlen(tmp);
-		if (tlen > 0 && tmp[tlen - 1] == '/') tlen = tlen - 1;
-		char tmp_clean[MCP_CAPTURE_PATH_MAX];
-		if (tlen >= sizeof(tmp_clean)) tlen = sizeof(tmp_clean) - 1;
-		memcpy(tmp_clean, tmp, tlen);
-		tmp_clean[tlen] = '\0';
-		snprintf(trigger_path, sizeof(trigger_path), "%s/displayxr_atlas_trigger", tmp_clean);
-		snprintf(out_path, sizeof(out_path), "%s/displayxr_atlas.png", tmp_clean);
-#endif
-	}
-
-#ifdef XRT_OS_WINDOWS
-	if (GetFileAttributesA(trigger_path) == INVALID_FILE_ATTRIBUTES) {
-		return;
-	}
-	DeleteFileA(trigger_path);
-#else
-	struct stat st;
-	if (stat(trigger_path, &st) != 0) {
-		return;
-	}
-	unlink(trigger_path);
-#endif
-
-	bool ok = gl_compositor_capture_atlas_to_png(c, out_path);
+	bool ok = gl_compositor_capture_atlas_to_png(c, c->capture_intent.path);
 	if (ok) {
-		U_LOG_I("Atlas captured to %s", out_path);
+		U_LOG_I("Atlas captured (mode=%u) to %s",
+		        c->capture_intent.mode, c->capture_intent.path);
 	} else {
-		U_LOG_W("Atlas capture failed (trigger %s)", trigger_path);
+		U_LOG_W("Atlas capture failed (mode=%u path=%s)",
+		        c->capture_intent.mode, c->capture_intent.path);
 	}
+	u_capture_intent_complete(&c->capture_intent, &c->mcp_capture, ok);
 }
 
 
@@ -1101,6 +1058,11 @@ static xrt_result_t
 gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
 	struct comp_gl_compositor *c = gl_comp(xc);
+
+	// Capture-intent poll — see u_capture_intent.h. Consumed at the
+	// projection-done boundary (PROJECTION_ONLY) or end of frame
+	// (POST_COMPOSE).
+	u_capture_intent_poll(&c->capture_intent, &c->mcp_capture);
 
 	// Frame timing
 	uint64_t now_ns = os_monotonic_get_ns();
@@ -1339,6 +1301,13 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			glDrawArrays(GL_TRIANGLES, 0, 3);
 		}
 	}
+
+	// Projection-only capture point — atlas now contains projection
+	// content for every tile; window-space layers haven't been rendered
+	// yet. Atlas is bound as the FBO color attachment; the capture
+	// readback temporarily attaches its own FBO and reads via
+	// glReadPixels (origin lower-left).
+	gl_compositor_dispatch_capture(c, MCP_CAPTURE_MODE_PROJECTION_ONLY);
 
 	// --- Step 1b: Render window-space layers (HUD overlays) ---
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
@@ -1609,14 +1578,10 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	if (prev_cull_face) glEnable(GL_CULL_FACE);
 	if (prev_scissor_test) glEnable(GL_SCISSOR_TEST);
 
-	// MCP capture_frame — runs while our GL context is still current so
-	// glReadPixels from atlas_texture is valid. Early-returns when no
-	// request is pending.
-	gl_compositor_service_mcp_capture(c);
-
-	// Same readback driven by a trigger file (no MCP client required).
-	// See issue #210.
-	gl_compositor_service_trigger_file(c);
+	// Post-compose capture (#210) — runs while our GL context is still
+	// current so glReadPixels from atlas_texture is valid. Skipped if the
+	// intent was projection-only (consumed earlier) or empty.
+	gl_compositor_dispatch_capture(c, MCP_CAPTURE_MODE_POST_COMPOSE);
 
 	// Restore previous GL context (critical for shared texture mode where
 	// app has its own context and needs it back after compositor work)

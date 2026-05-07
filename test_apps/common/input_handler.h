@@ -92,9 +92,11 @@ struct InputState {
     // / quad layers and per-eye disparity are NOT included. Skipped for 1×1
     // (mono) layouts. Filename auto-increments per (cols×rows).
     //
-    // For the runtime's full post-compose atlas (all layers + DP-bound
-    // pixels), use the trigger file `displayxr_atlas_trigger` instead;
-    // see issue #210.
+    // For runtime-side captures, use the trigger files (or MCP capture_frame):
+    //   `displayxr_atlas_trigger` → post-compose (all layers, what DP weaves)
+    //   `displayxr_atlas_trigger.projection` → projection-only (per-tile,
+    //                                          no window-space layers)
+    // See u_capture_intent.h and issue #210.
     bool captureAtlasRequested = false;
 
     // --- Gaussian-splat demo extensions (additive; unused by cube_* apps) ---
