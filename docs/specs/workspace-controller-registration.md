@@ -246,6 +246,29 @@ a runtime-crash mystery.
   the future, a separate signature verification step would gate
   enumeration; for now, registration is open.
 
+## Workspace output is opaque
+
+Workspace apps composite client tiles with per-pixel alpha against the
+workspace's own background. Each client's projection layer flags
+(`XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT`,
+`XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT`) are honored at the
+per-tile blit so transparent regions of one client tile reveal the
+workspace background, not the desktop.
+
+The workspace's **final atlas to the display processor is opaque** —
+the workspace itself cannot present a transparent window to the
+desktop. Standalone apps that want a transparent output window must
+run outside workspace mode (using the in-process D3D11 compositor
+with `XR_EXT_win32_window_binding::transparentBackgroundEnabled`).
+
+This is not a temporary limitation; it is a deliberate consequence of
+the multi-compositor pipeline. A transparent workspace output would
+require punching the chroma-key trick through the combined atlas, which
+would let any client paint an effective hole in the desktop — a
+trust-boundary regression. Per-tile alpha against an opaque workspace
+background covers the realistic use case (transparent window contents
+inside a workspace) without that risk.
+
 ## Future evolution
 
 If multiple workspace apps need to coexist (one user has the
