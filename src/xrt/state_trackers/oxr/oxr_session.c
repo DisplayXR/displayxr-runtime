@@ -2197,7 +2197,7 @@ oxr_session_create_impl(struct oxr_logger *log,
 					shared_iosurface = (void *)cocoa_binding->sharedIOSurface;
 				}
 			}
-			XrResult ret = oxr_session_populate_gl_macos(log, sys, opengl_macos, window_handle, shared_iosurface, *out_session);
+			XrResult ret = oxr_session_populate_gl_macos(log, sys, opengl_macos, window_handle, shared_iosurface, xsi->transparent_background_enabled, *out_session);
 			if (ret == XR_SUCCESS && window_handle != NULL) {
 				(*out_session)->has_external_window = true;
 				struct xrt_device *head = GET_XDEV_BY_ROLE((*out_session)->sys, head);
@@ -2280,7 +2280,8 @@ oxr_session_create_impl(struct oxr_logger *log,
 				                 "Failed to create xrt_session! '%i'", xret);
 			}
 			return oxr_session_populate_vk_native(
-			    log, sys, vulkan, window_handle, shared_texture_handle, *out_session);
+			    log, sys, vulkan, window_handle, shared_texture_handle,
+			    xsi->transparent_background_enabled, *out_session);
 		}
 #endif
 
@@ -2308,7 +2309,8 @@ oxr_session_create_impl(struct oxr_logger *log,
 				}
 			}
 			XrResult ret = oxr_session_populate_vk_with_metal_native(
-			    log, sys, vulkan, window_handle, shared_iosurface, *out_session);
+			    log, sys, vulkan, window_handle, shared_iosurface,
+			    xsi->transparent_background_enabled, *out_session);
 			if (ret == XR_SUCCESS && window_handle != NULL) {
 				(*out_session)->has_external_window = true;
 				struct xrt_device *head = GET_XDEV_BY_ROLE((*out_session)->sys, head);
@@ -2489,7 +2491,8 @@ oxr_session_create_impl(struct oxr_logger *log,
 			                 (xsi->readback_callback != NULL || xsi->shared_texture_handle != NULL);
 
 			return oxr_session_populate_metal_native(log, sys, metal, xsi->external_window_handle, offscreen,
-			                                        xsi->shared_texture_handle, *out_session);
+			                                        xsi->shared_texture_handle,
+			                                        xsi->transparent_background_enabled, *out_session);
 		}
 #else
 		U_LOG_IFL_I(U_LOGGING_INFO, "Metal native compositor NOT compiled in (XRT_HAVE_METAL_NATIVE_COMPOSITOR not defined)");
@@ -2628,6 +2631,9 @@ oxr_session_create(struct oxr_logger *log,
 		}
 		if (macos_target_info->sharedIOSurface) {
 			xsi.shared_texture_handle = macos_target_info->sharedIOSurface;
+		}
+		if (macos_target_info->transparentBackgroundEnabled) {
+			xsi.transparent_background_enabled = true;
 		}
 	} else {
 		U_LOG_W("No cocoa window binding found in session create chain");

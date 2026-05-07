@@ -1302,6 +1302,7 @@ oxr_session_populate_gl_macos(struct oxr_logger *log,
                                const void *next,
                                void *window_handle,
                                void *shared_iosurface,
+                               bool transparent_background,
                                struct oxr_session *sess);
 #endif
 
@@ -1394,6 +1395,7 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
                                 XrGraphicsBindingVulkanKHR const *next,
                                 void *window_handle,
                                 void *shared_texture_handle,
+                                bool transparent_background,
                                 struct oxr_session *sess);
 #endif
 
@@ -1552,6 +1554,7 @@ oxr_session_populate_metal_native(struct oxr_logger *log,
                                   void *window_handle,
                                   bool offscreen,
                                   void *shared_texture_handle,
+                                  bool transparent_background,
                                   struct oxr_session *sess);
 #endif
 
@@ -1567,6 +1570,7 @@ oxr_session_populate_vk_with_metal_native(struct oxr_logger *log,
                                            XrGraphicsBindingVulkanKHR const *next,
                                            void *window_handle,
                                            void *shared_iosurface,
+                                           bool transparent_background,
                                            struct oxr_session *sess);
 #endif
 

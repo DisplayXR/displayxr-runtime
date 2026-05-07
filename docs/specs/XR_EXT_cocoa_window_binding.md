@@ -3,7 +3,7 @@
 | Property | Value |
 |----------|-------|
 | Extension Name | `XR_EXT_cocoa_window_binding` |
-| Spec Version | 4 |
+| Spec Version | 5 |
 | Type Values | `XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT` (1000999004), `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT` (1000999002) |
 | Author | Leia Inc. |
 | Platform | macOS (Cocoa / AppKit). |
@@ -59,6 +59,7 @@ Chained to `XrSessionCreateInfo` (via the graphics binding's `next` pointer) to 
 | `readbackCallback` | `PFN_xrReadbackCallback` | Callback receiving composited RGBA pixels (offscreen mode), or `NULL`. |
 | `readbackUserdata` | `void*` | Opaque pointer passed to `readbackCallback`. |
 | `sharedIOSurface` | `void*` | `IOSurfaceRef` for zero-copy Metal texture sharing, or `NULL`. |
+| `transparentBackgroundEnabled` | `XrBool32` | When `XR_TRUE`, the runtime configures the (runtime-owned) `NSWindow` and the `CAMetalLayer` with `isOpaque=NO` so the desktop shows through alpha < 1 regions of the composited output. App-owned windows must set `setOpaque:NO` themselves; the runtime only configures the layer it presents into. *(Spec v5.)* |
 
 ```c
 typedef void (*PFN_xrReadbackCallback)(
@@ -71,8 +72,25 @@ typedef struct XrCocoaWindowBindingCreateInfoEXT {
     PFN_xrReadbackCallback   readbackCallback;
     void*                    readbackUserdata;
     void*                    sharedIOSurface;
+    XrBool32                 transparentBackgroundEnabled; // v5
 } XrCocoaWindowBindingCreateInfoEXT;
 ```
+
+### Transparent Background (v5)
+
+`transparentBackgroundEnabled = XR_TRUE` is the macOS analog of the Win32 binding's same-named field, but the implementation is much simpler:
+
+- **Mac is alpha-native.** sim_display preserves per-pixel alpha through its output stage to the `CAMetalLayer` drawable. There is no chroma-key trick (no need for the `chromaKeyColor` field on the Win32 binding).
+- App-supplied content with `alpha < 1` shows the desktop through. Antialiased edges look correct (true soft alpha — unlike Leia hardware on Windows which interlaces opaque RGB).
+- Per-layer `XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT` controls whether the per-tile pass blends or stamps; that's a separate per-frame decision.
+- For app-provided `viewHandle`, the app's `NSWindow` setup is the app's responsibility — the runtime only configures the `CAMetalLayer` it presents into. Apps embedding their own NSView should set `setOpaque:NO` and `setBackgroundColor:[NSColor clearColor]` on their NSWindow.
+
+| Layer of the system | Does what |
+|---|---|
+| App | Submits RGBA texture with alpha < 1 in transparent regions. Sets the per-layer alpha-blend bit on its projection layer. |
+| Runtime per-tile pass | Preserves alpha into the atlas (uses the alpha image view when the bit is set). |
+| sim_display DP | Passes alpha through to the Metal drawable (no fill, no strip). |
+| Cocoa | Composites the drawable against the desktop using the layer/window alpha settings. |
 
 **Three Modes:**
 

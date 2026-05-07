@@ -100,6 +100,7 @@ oxr_session_populate_metal_native(struct oxr_logger *log,
                                   void *window_handle,
                                   bool offscreen,
                                   void *shared_texture_handle,
+                                  bool transparent_background,
                                   struct oxr_session *sess)
 {
 	struct xrt_device *xdev = get_role_head(sess->sys);
@@ -114,7 +115,7 @@ oxr_session_populate_metal_native(struct oxr_logger *log,
 	// Create the Metal native compositor
 	xrt_result_t xret = comp_metal_compositor_create(
 	    xdev, window_handle, (void *)next->commandQueue, dp_factory_metal, offscreen,
-	    shared_texture_handle, &xcn);
+	    shared_texture_handle, transparent_background, &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
 		                 "Failed to create Metal native compositor: %d", xret);
