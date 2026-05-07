@@ -6503,24 +6503,24 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		goto after_key_shortcuts;
 	}
 
-	// TAB / Shift+TAB: cycle focus forward/backward. Never unfocuses when windows exist.
-	// Ignore ALT+TAB (system task switcher) — only process bare TAB.
-	if ((GetAsyncKeyState(VK_TAB) & 1) && !(GetAsyncKeyState(VK_MENU) & 0x8000)) {
+	// Bare TAB: cycle focus forward. Never unfocuses when windows exist.
+	// SHIFT+TAB is no longer reserved here — it falls through to wnd_proc's
+	// forward-to-app path so apps can use it (e.g. HUD toggle in cube tests).
+	// Ignore ALT+TAB (system task switcher).
+	if ((GetAsyncKeyState(VK_TAB) & 1) &&
+	    !(GetAsyncKeyState(VK_MENU) & 0x8000) &&
+	    !(GetAsyncKeyState(VK_SHIFT) & 0x8000)) {
 		if (mc->client_count > 0) {
-			bool reverse = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
 			int n = D3D11_MULTI_MAX_CLIENTS;
-			// base: for -1, forward searches from slot 0, reverse from last slot
-			int base = (mc->focused_slot >= 0) ? mc->focused_slot : (reverse ? n : -1);
+			int base = (mc->focused_slot >= 0) ? mc->focused_slot : -1;
 			for (int i = 1; i <= n; i++) {
-				int idx = reverse
-				        ? ((base - i) % n + n) % n
-				        : (base + i) % n;
+				int idx = (base + i) % n;
 				if (mc->clients[idx].active && !mc->clients[idx].minimized) {
 					mc->focused_slot = idx;
 					break;
 				}
 			}
-			U_LOG_W("Multi-comp: %sTAB → focused slot %d", reverse ? "Shift+" : "", mc->focused_slot);
+			U_LOG_W("Multi-comp: TAB → focused slot %d", mc->focused_slot);
 			multi_compositor_update_input_forward(mc);
 		}
 	}
