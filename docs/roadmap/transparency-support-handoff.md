@@ -4,6 +4,80 @@
 **Started:** 2026-05-07 on macOS by Claude / David
 **Plan:** `~/.claude/plans/ok-i-need-a-melodic-volcano.md` (kept locally; summarized below)
 
+## Prompt to give the Windows agent
+
+Copy-paste the block below into a fresh Claude Code session running on the Windows + Leia SR machine. The agent does not see prior conversation context; this prompt is self-contained and points it back at this file.
+
+```
+You are picking up PR #1 of a multi-PR transparency-support feature on
+displayxr-runtime. The work was done on macOS; you are validating it on
+Windows + a Leia SR display, since D3D11 + the SR weaver can only run
+there.
+
+START HERE:
+1. cd to the displayxr-runtime checkout.
+2. git fetch && git checkout feature/transparency-support
+3. Read docs/roadmap/transparency-support-handoff.md end-to-end. It
+   describes what changed, why, and what to verify. Do NOT skip it.
+4. Read CLAUDE.md for build/run conventions on this repo.
+
+WHAT YOU ARE DOING:
+PR #1 moved the D3D11 chroma-key fill+strip out of the standalone
+compositor and into the Leia D3D11 display processor, plus added a
+pre-weave fill pass so apps can submit true RGBA(0,0,0,0)-cleared
+swapchains instead of pre-filling with a magic color. Three commits
+on the branch — read them with `git log --oneline main..HEAD` to
+orient.
+
+YOUR JOB IS VALIDATION, NOT NEW IMPLEMENTATION:
+Run the four-step test plan in the "What needs Windows validation"
+section of the handoff doc:
+  Step 1 — `scripts\build_windows.bat all` (the build itself is the
+           first real test — macOS clangd can't see D3D11 headers).
+  Step 2 — Smoke-test backward compat with the existing
+           displayxr-unity-test-transparent (pinned to plugin v1.2.9,
+           gray chroma key 0x00817F80). It must behave identically
+           to before this branch — same rotating cube over Notepad,
+           same gray fringing, same click-through.
+  Step 3 — Manually verify the new "DP-picks magenta" flow by
+           patching cube_handle_d3d11_win as described. Magenta-tinted
+           hard edges around the cube confirm the pre-weave fill +
+           strip pipeline is live.
+  Step 4 — Optional: capture the post-DP atlas via the
+           workspace_screenshot_trigger described in CLAUDE.md to
+           visually inspect alpha=0 regions.
+
+The handoff doc lists the most likely failure modes and where to look
+for each. If you hit one, fix it (commit + push to the same branch),
+then re-run the affected step. Don't widen scope — PRs #2-#6 in the
+task list are out of scope for this validation pass.
+
+WHEN YOU'RE DONE:
+Report back with:
+  - Build result (clean / what fixes were needed)
+  - Step 2 result: backward compat preserved? Any visual diff vs main?
+  - Step 3 result: did the new flow light up? Magenta hard edges seen?
+  - Any blockers or follow-ups worth filing as issues.
+  - The git log of any commits you added.
+
+KEY INVARIANTS — don't violate these even if it would make a fix easier:
+  - Apps that pass non-zero chromaKeyColor (v1.2.9 Unity) MUST keep
+    working unchanged. set_chroma_key's "key != 0 means app override"
+    semantics are load-bearing.
+  - The DP owns the chroma-key trick. Don't sneak chroma-key code back
+    into comp_d3d11_compositor.cpp or comp_d3d11_service.cpp. The
+    compositor must stay vendor-agnostic.
+  - Workspace output stays opaque — that's PR #2's territory.
+  - Antialiased edges become hard mask on Leia hardware. This is a
+    fundamental lenticular weaver limitation, not a bug. Don't chase
+    soft edges.
+
+If you find this branch is fundamentally broken (e.g. DP doesn't get
+created, runtime won't start), STOP and report — don't try to "fix"
+by reverting commits. The architecture is intentional and the macOS
+build validates the cross-platform pieces.
+```
+
 ## Why this branch exists
 
 Today, transparent OpenXR surfaces work only on D3D11 standalone, only via a Win32-specific extension, and only because the **app pre-fills its swapchain with a chroma key color** that the runtime strips post-weave (was at `comp_d3d11_compositor.cpp:1431–1614`). Goals of this work:
