@@ -881,25 +881,18 @@ d3d11_crop_atlas_for_dp(struct comp_d3d11_compositor *c,
 	return c->dp_input_srv;
 }
 
-// Service a pending MCP capture_frame request. Copies the content
-// region of the renderer's atlas (tile_columns × view_width by
-// tile_rows × view_height — what the app actually wrote, same region
-// the compositor crops and sends to the DP) into a staging texture,
-// then writes a single PNG. D3D11 renderer uses
-// DXGI_FORMAT_R8G8B8A8_UNORM so no channel swap is needed.
-static void
-d3d11_compositor_service_mcp_capture(struct comp_d3d11_compositor *c)
+// Copy the content region of the renderer's atlas (tile_columns × view_width
+// by tile_rows × view_height — what the app actually wrote, same region the
+// compositor crops and sends to the DP) into a staging texture, then write
+// @p path as PNG. D3D11 renderer uses DXGI_FORMAT_R8G8B8A8_UNORM so no
+// channel swap is needed.
+static bool
+d3d11_compositor_capture_atlas_to_png(struct comp_d3d11_compositor *c, const char *path)
 {
-	char path[MCP_CAPTURE_PATH_MAX];
-	if (!mcp_capture_poll(&c->mcp_capture, path)) {
-		return;
-	}
-
 	ID3D11Texture2D *atlas_tex = static_cast<ID3D11Texture2D *>(
 	    comp_d3d11_renderer_get_atlas_texture(c->renderer));
 	if (atlas_tex == nullptr || c->renderer == nullptr) {
-		mcp_capture_complete(&c->mcp_capture, false);
-		return;
+		return false;
 	}
 
 	uint32_t tile_columns = 1, tile_rows = 1;
@@ -907,8 +900,7 @@ d3d11_compositor_service_mcp_capture(struct comp_d3d11_compositor *c)
 	uint32_t view_w = 0, view_h = 0;
 	comp_d3d11_renderer_get_view_dimensions(c->renderer, &view_w, &view_h);
 	if (tile_columns == 0 || tile_rows == 0 || view_w == 0 || view_h == 0) {
-		mcp_capture_complete(&c->mcp_capture, false);
-		return;
+		return false;
 	}
 
 	uint32_t content_w = tile_columns * view_w;
@@ -929,8 +921,7 @@ d3d11_compositor_service_mcp_capture(struct comp_d3d11_compositor *c)
 
 	ID3D11Texture2D *staging = nullptr;
 	if (FAILED(c->device->CreateTexture2D(&sd, nullptr, &staging)) || staging == nullptr) {
-		mcp_capture_complete(&c->mcp_capture, false);
-		return;
+		return false;
 	}
 
 	D3D11_BOX src_box = {0, 0, 0, content_w, content_h, 1};
@@ -939,8 +930,7 @@ d3d11_compositor_service_mcp_capture(struct comp_d3d11_compositor *c)
 	D3D11_MAPPED_SUBRESOURCE m = {};
 	if (FAILED(c->context->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
 		staging->Release();
-		mcp_capture_complete(&c->mcp_capture, false);
-		return;
+		return false;
 	}
 
 	bool ok = stbi_write_png(path, (int)content_w, (int)content_h, 4,
@@ -948,8 +938,53 @@ d3d11_compositor_service_mcp_capture(struct comp_d3d11_compositor *c)
 
 	c->context->Unmap(staging, 0);
 	staging->Release();
+	return ok;
+}
 
+// Service a pending MCP capture_frame request — thin wrapper around
+// d3d11_compositor_capture_atlas_to_png that handles the cross-thread
+// hand-off with the MCP server.
+static void
+d3d11_compositor_service_mcp_capture(struct comp_d3d11_compositor *c)
+{
+	char path[MCP_CAPTURE_PATH_MAX];
+	if (!mcp_capture_poll(&c->mcp_capture, path)) {
+		return;
+	}
+	bool ok = d3d11_compositor_capture_atlas_to_png(c, path);
 	mcp_capture_complete(&c->mcp_capture, ok);
+}
+
+// Trigger-file capture path — same readback as the MCP path, driven by
+// the existence of %TEMP%\displayxr_atlas_trigger so devs can snapshot
+// the post-compose atlas without an MCP client. Mirrors the service-
+// mode `workspace_screenshot_trigger` path in comp_d3d11_service.cpp.
+// See issue #210.
+static void
+d3d11_compositor_service_trigger_file(struct comp_d3d11_compositor *c)
+{
+	static char trigger_path[MCP_CAPTURE_PATH_MAX] = {0};
+	static char out_path[MCP_CAPTURE_PATH_MAX] = {0};
+	if (trigger_path[0] == '\0') {
+		const char *tmp = getenv("TEMP");
+		if (tmp == nullptr || tmp[0] == '\0') {
+			tmp = "C:\\Temp";
+		}
+		snprintf(trigger_path, sizeof(trigger_path), "%s\\displayxr_atlas_trigger", tmp);
+		snprintf(out_path, sizeof(out_path), "%s\\displayxr_atlas.png", tmp);
+	}
+
+	if (GetFileAttributesA(trigger_path) == INVALID_FILE_ATTRIBUTES) {
+		return;
+	}
+	DeleteFileA(trigger_path);
+
+	bool ok = d3d11_compositor_capture_atlas_to_png(c, out_path);
+	if (ok) {
+		U_LOG_I("Atlas captured to %s", out_path);
+	} else {
+		U_LOG_W("Atlas capture failed (trigger %s)", trigger_path);
+	}
 }
 
 static xrt_result_t
@@ -1405,6 +1440,10 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// Service pending MCP capture_frame after Present so the atlas
 	// we stage-copy reflects exactly what the user just saw.
 	d3d11_compositor_service_mcp_capture(c);
+
+	// Same readback driven by a trigger file (no MCP client required).
+	// See issue #210.
+	d3d11_compositor_service_trigger_file(c);
 
 	return XRT_SUCCESS;
 }
