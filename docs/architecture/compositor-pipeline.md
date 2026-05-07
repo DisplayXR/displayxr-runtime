@@ -46,6 +46,28 @@ The DP weaver expects linear input. App swapchains can be either UNORM (linear b
 
 This keeps the shell vs non-shell pipelines distinct downstream — a load-bearing invariant; do not refactor the swapchain → atlas blit into a shared shader path. The non-shell atlas remains UNORM-typed; only the shell-mode atlas is TYPELESS-with-dual-SRV.
 
+## Per-tile alpha (workspace mode)
+
+The multi-compositor's tile-blit phase respects each IPC client's
+projection layer flags when compositing tiles into the combined atlas:
+
+- `XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT` clear → tile is
+  treated as opaque and overwrites the workspace background.
+- Bit set + `UNPREMULTIPLIED_ALPHA_BIT` clear → straight-alpha source,
+  blended with `blend_premul`.
+- Bit set + `UNPREMULTIPLIED_ALPHA_BIT` set → unpremultiplied source,
+  blended with `blend_alpha`.
+
+Capture clients (2D window snapshots) and clients that submitted no
+projection layer this frame fall through to opaque blending.
+
+The combined atlas itself is presented opaquely to the display
+processor — per-tile alpha lets one client tile reveal the workspace
+background through its transparent regions, but the workspace's
+output to the desktop is always opaque. See
+[`workspace-controller-registration.md`](../specs/workspace-controller-registration.md#workspace-output-is-opaque)
+for why.
+
 ## Display Processor Interface
 
 The `process_atlas()` method exists in 5 API-specific variants:

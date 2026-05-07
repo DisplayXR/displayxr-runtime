@@ -777,6 +777,17 @@ struct d3d11_multi_client_slot
 	struct comp_layer ws_snapshot[XRT_MAX_LAYERS];
 	uint32_t ws_snapshot_count;
 
+	//! Projection-layer composition flags from the most recent client commit
+	//! (snapshot guarded by ws_snapshot_mutex, captured alongside ws_snapshot).
+	//! Multi-comp reads this when picking the per-tile blend mode — reading
+	//! cc->layer_accum directly races with the client's xrBeginFrame reset
+	//! and per-call adds (same root cause as the HUD-snapshot pattern above).
+	//! `projection_flags_valid == false` means no projection layer was seen
+	//! this frame; we keep the last-known flags rather than resetting so
+	//! the blend mode is stable across the begin→add gap.
+	enum xrt_layer_composition_flags projection_flags_snapshot;
+	bool projection_flags_valid;
+
 	//! Runtime-side cache of the WS layer's source texture, populated by
 	//! GPU `CopyResource` from the app's HUD swapchain whenever
 	//! multi_compositor_render successfully `AcquireSync`s the cross-process
@@ -1911,12 +1922,17 @@ get_color_scale_bias(const struct xrt_layer_data *data, float color_scale[4], fl
 static void
 set_blend_state(struct d3d11_service_system *sys, const struct xrt_layer_data *data)
 {
-	bool use_premul = (data->flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) == 0;
-
-	if (use_premul) {
-		sys->context->OMSetBlendState(sys->blend_premul.get(), nullptr, 0xFFFFFFFF);
-	} else {
+	// OpenXR semantics:
+	//   BLEND_TEXTURE_SOURCE_ALPHA_BIT clear  -> layer is opaque, no blend.
+	//   BLEND_TEXTURE_SOURCE_ALPHA_BIT set + UNPREMULTIPLIED_ALPHA_BIT clear -> premultiplied.
+	//   BLEND_TEXTURE_SOURCE_ALPHA_BIT set + UNPREMULTIPLIED_ALPHA_BIT set   -> straight alpha.
+	const enum xrt_layer_composition_flags f = data->flags;
+	if ((f & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) == 0) {
+		sys->context->OMSetBlendState(sys->blend_opaque.get(), nullptr, 0xFFFFFFFF);
+	} else if ((f & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0) {
 		sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
+	} else {
+		sys->context->OMSetBlendState(sys->blend_premul.get(), nullptr, 0xFFFFFFFF);
 	}
 }
 
@@ -7713,6 +7729,15 @@ after_key_shortcuts:
 		uint32_t slot_w_atlas = 0, slot_h_atlas = 0; // atlas-derived per-tile stride
 		bool slot_is_mono = false;
 		bool slot_flip_y = false;
+		// Per-client projection-layer composition flags, used to drive the
+		// tile-blit blend mode. Sourced from the snapshot populated under
+		// ws_snapshot_mutex in compositor_layer_commit (reading layer_accum
+		// directly races with the client's xrBeginFrame reset, identical to
+		// the WS-layer flicker that the snapshot pattern was introduced for).
+		// `slot_flags_valid == false` means we never observed a projection
+		// layer for this slot — fall through to opaque blend.
+		enum xrt_layer_composition_flags slot_layer_flags = (enum xrt_layer_composition_flags)0;
+		bool slot_flags_valid = false;
 
 		if (mc->clients[s].client_type == CLIENT_TYPE_CAPTURE) {
 			// Capture client: get latest captured texture
@@ -7773,6 +7798,18 @@ after_key_shortcuts:
 			assert(cvh <= slot_h_atlas);
 			if (cvw > slot_w_atlas) cvw = slot_w_atlas;
 			if (cvh > slot_h_atlas) cvh = slot_h_atlas;
+
+			// Read projection-layer flags from the slot's snapshot —
+			// snapshot is populated under ws_snapshot_mutex by
+			// compositor_layer_commit when the client commits a frame.
+			{
+				struct d3d11_multi_client_slot *slot = &mc->clients[s];
+				std::lock_guard<std::mutex> snap_lock(slot->ws_snapshot_mutex);
+				if (slot->projection_flags_valid) {
+					slot_layer_flags = slot->projection_flags_snapshot;
+					slot_flags_valid = true;
+				}
+			}
 		}
 
 		// Combined atlas dimensions.
@@ -8312,7 +8349,22 @@ after_key_shortcuts:
 				sys->context->IASetInputLayout(nullptr);
 				sys->context->RSSetState(sys->rasterizer_state.get());
 				sys->context->OMSetDepthStencilState(sys->depth_test_enabled.get(), 0);
-				sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
+				// Per-client tile blend respects the OpenXR
+				// BLEND_TEXTURE_SOURCE_ALPHA_BIT / UNPREMULTIPLIED_ALPHA_BIT
+				// flags from the client's projection layer. Workspace OUTPUT
+				// stays opaque (the workspace's combined atlas to the DP is
+				// always opaque); per-tile alpha only affects how each
+				// client tile composes against the workspace background.
+				if (slot_flags_valid) {
+					struct xrt_layer_data fake_data = {};
+					fake_data.flags = slot_layer_flags;
+					set_blend_state(sys, &fake_data);
+				} else {
+					// Capture clients (2D window snapshots) and clients
+					// with no projection layer this frame -> opaque blend.
+					sys->context->OMSetBlendState(
+					    sys->blend_opaque.get(), nullptr, 0xFFFFFFFF);
+				}
 
 				sys->context->Draw(4, 0);
 
@@ -11099,13 +11151,22 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			}
 			std::lock_guard<std::mutex> snap_lock(slot_snap->ws_snapshot_mutex);
 			uint32_t snap_n = 0;
+			bool saw_projection = false;
 			for (uint32_t i = 0;
 			     i < c->layer_accum.layer_count && snap_n < XRT_MAX_LAYERS;
 			     i++) {
-				if (c->layer_accum.layers[i].data.type != XRT_LAYER_WINDOW_SPACE) {
+				const struct comp_layer *l = &c->layer_accum.layers[i];
+				if ((l->data.type == XRT_LAYER_PROJECTION ||
+				     l->data.type == XRT_LAYER_PROJECTION_DEPTH) &&
+				    !saw_projection) {
+					slot_snap->projection_flags_snapshot = l->data.flags;
+					slot_snap->projection_flags_valid = true;
+					saw_projection = true;
+				}
+				if (l->data.type != XRT_LAYER_WINDOW_SPACE) {
 					continue;
 				}
-				slot_snap->ws_snapshot[snap_n] = c->layer_accum.layers[i];
+				slot_snap->ws_snapshot[snap_n] = *l;
 				snap_n++;
 			}
 			slot_snap->ws_snapshot_count = snap_n;
