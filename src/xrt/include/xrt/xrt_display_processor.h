@@ -205,6 +205,44 @@ struct xrt_display_processor
 	                               int32_t *out_screen_top);
 
 	/*!
+	 * Whether this display processor passes per-pixel alpha through to its
+	 * output stage. true for processors that sample atlas alpha and write it
+	 * to the framebuffer (sim_display); false (or NULL) for processors that
+	 * interlace into opaque RGB and need the chroma-key trick to recover
+	 * transparency post-weave (Leia).
+	 *
+	 * Optional — NULL means false.
+	 *
+	 * @param xdp Pointer to self.
+	 * @return true if alpha is preserved end-to-end through process_atlas.
+	 */
+	bool (*is_alpha_native)(struct xrt_display_processor *xdp);
+
+	/*!
+	 * Inform the DP of session-level transparency configuration.
+	 * Called once at session start when @p transparent_bg_enabled is set on
+	 * the corresponding window-binding extension. DPs that need the
+	 * chroma-key trick (Leia) use this to enable an internal pre-weave
+	 * fill (transparent atlas pixels → key color) and post-weave strip
+	 * (key color → alpha=0). DPs that are alpha_native may treat this as
+	 * a no-op.
+	 *
+	 * @p key_color is honored as an app-supplied override when non-zero
+	 * (matches today's XR_EXT_win32_window_binding.chromaKeyColor); when
+	 * zero, the DP picks its own internal color.
+	 *
+	 * Optional — NULL means the DP doesn't respect transparency requests.
+	 *
+	 * @param xdp                     Pointer to self.
+	 * @param key_color                App-supplied chroma key (0x00BBGGRR);
+	 *                                 0 means DP-picks (recommended).
+	 * @param transparent_bg_enabled  True when transparency was requested.
+	 */
+	void (*set_chroma_key)(struct xrt_display_processor *xdp,
+	                       uint32_t key_color,
+	                       bool transparent_bg_enabled);
+
+	/*!
 	 * Destroy this display processor and free all resources.
 	 *
 	 * @param xdp Pointer to self.
@@ -357,6 +395,36 @@ xrt_display_processor_get_display_pixel_info(struct xrt_display_processor *xdp,
 		return false;
 	}
 	return xdp->get_display_pixel_info(xdp, out_pixel_width, out_pixel_height, out_screen_left, out_screen_top);
+}
+
+/*!
+ * @copydoc xrt_display_processor::is_alpha_native
+ * Returns false if not supported (function pointer is NULL).
+ * @public @memberof xrt_display_processor
+ */
+static inline bool
+xrt_display_processor_is_alpha_native(struct xrt_display_processor *xdp)
+{
+	if (xdp == NULL || xdp->is_alpha_native == NULL) {
+		return false;
+	}
+	return xdp->is_alpha_native(xdp);
+}
+
+/*!
+ * @copydoc xrt_display_processor::set_chroma_key
+ * No-op if not supported (function pointer is NULL).
+ * @public @memberof xrt_display_processor
+ */
+static inline void
+xrt_display_processor_set_chroma_key(struct xrt_display_processor *xdp,
+                                     uint32_t key_color,
+                                     bool transparent_bg_enabled)
+{
+	if (xdp == NULL || xdp->set_chroma_key == NULL) {
+		return;
+	}
+	xdp->set_chroma_key(xdp, key_color, transparent_bg_enabled);
 }
 
 /*!

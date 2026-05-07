@@ -128,6 +128,26 @@ struct xrt_display_processor_gl
 	                               int32_t *out_screen_top);
 
 	/*!
+	 * Whether this display processor passes per-pixel alpha through to its
+	 * output stage. true for sim_display-style processors; false (or NULL)
+	 * for Leia-style weavers that need the chroma-key trick.
+	 * Optional — NULL means false.
+	 */
+	bool (*is_alpha_native)(struct xrt_display_processor_gl *xdp);
+
+	/*!
+	 * Inform the DP of session-level transparency configuration.
+	 * @p key_color is the app-supplied chroma key (0x00BBGGRR); 0 means
+	 * the DP picks its own internal color. @p transparent_bg_enabled
+	 * tells the DP whether to run its pre-weave fill / post-weave strip
+	 * pass.
+	 * Optional — NULL means the DP doesn't respect transparency requests.
+	 */
+	void (*set_chroma_key)(struct xrt_display_processor_gl *xdp,
+	                       uint32_t key_color,
+	                       bool transparent_bg_enabled);
+
+	/*!
 	 * Destroy this display processor and free all resources.
 	 *
 	 * @param xdp Pointer to self.
@@ -253,6 +273,36 @@ xrt_display_processor_gl_get_display_pixel_info(struct xrt_display_processor_gl 
 		return false;
 	}
 	return xdp->get_display_pixel_info(xdp, out_pixel_width, out_pixel_height, out_screen_left, out_screen_top);
+}
+
+/*!
+ * @copydoc xrt_display_processor_gl::is_alpha_native
+ * Returns false if not supported (function pointer is NULL).
+ * @public @memberof xrt_display_processor_gl
+ */
+static inline bool
+xrt_display_processor_gl_is_alpha_native(struct xrt_display_processor_gl *xdp)
+{
+	if (xdp == NULL || xdp->is_alpha_native == NULL) {
+		return false;
+	}
+	return xdp->is_alpha_native(xdp);
+}
+
+/*!
+ * @copydoc xrt_display_processor_gl::set_chroma_key
+ * No-op if not supported (function pointer is NULL).
+ * @public @memberof xrt_display_processor_gl
+ */
+static inline void
+xrt_display_processor_gl_set_chroma_key(struct xrt_display_processor_gl *xdp,
+                                         uint32_t key_color,
+                                         bool transparent_bg_enabled)
+{
+	if (xdp == NULL || xdp->set_chroma_key == NULL) {
+		return;
+	}
+	xdp->set_chroma_key(xdp, key_color, transparent_bg_enabled);
 }
 
 /*!
