@@ -76,14 +76,29 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 :: --- Leia SR SDK ---
-if not exist "%LEIASR_SDKROOT%\lib" (
+:: Marker file (cmake config installed by the SDK zip) — checking the bare
+:: lib/ dir wasn't enough: the Vulkan-extras download below creates lib/
+:: even when the main zip extract failed, which then made this idempotency
+:: check skip a re-extract on the next run, leaving CMake to die on missing
+:: simulatedreality_DIR / srDirectX_DIR.
+set SR_SDK_MARKER=%LEIASR_SDKROOT%\lib\cmake\srDirectX\srDirectXConfig.cmake
+:: %REPO% ends in '\', so "%REPO%" passes "...\.." to gh/PS where the
+:: trailing \" is parsed as an escaped quote. Strip the trailing slash for
+:: the download destination args.
+set REPO_NOSLASH=%REPO:~0,-1%
+if not exist "%SR_SDK_MARKER%" (
     echo === Downloading Leia SR SDK %SR_TAG% ===
-    gh release download sr-sdk-v%SR_TAG% -R DisplayXR/displayxr-runtime -p "LeiaSR-SDK-%SR_TAG%-win64.zip" -D "%REPO%"
+    gh release download sr-sdk-v%SR_TAG% -R DisplayXR/displayxr-runtime -p "LeiaSR-SDK-%SR_TAG%-win64.zip" -D "%REPO_NOSLASH%"
     if %ERRORLEVEL% NEQ 0 (
         echo ERROR: Failed to download SR SDK. Run: gh auth login
         exit /b 1
     )
-    powershell -Command "Expand-Archive -Path '%REPO%LeiaSR-SDK-%SR_TAG%-win64.zip' -DestinationPath '%REPO%' -Force"
+    powershell -Command "Expand-Archive -Path '%REPO%LeiaSR-SDK-%SR_TAG%-win64.zip' -DestinationPath '%REPO_NOSLASH%' -Force"
+    if not exist "%SR_SDK_MARKER%" (
+        echo ERROR: SR SDK extract did not produce %SR_SDK_MARKER%
+        echo Check the Expand-Archive output above.
+        exit /b 1
+    )
     del "%REPO%LeiaSR-SDK-%SR_TAG%-win64.zip" 2>nul
 
     echo === Downloading Vulkan weaver extras ===
