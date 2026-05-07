@@ -33,6 +33,12 @@
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
 #include "util/u_hud.h"
+#include <displayxr_mcp/mcp_capture.h>
+
+// STB_IMAGE_WRITE_STATIC scopes all stbi_write_* to this TU.
+#define STB_IMAGE_WRITE_STATIC
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty_interface.h"
@@ -215,6 +221,10 @@ struct comp_d3d12_compositor
 
 	//! Thread safety.
 	std::mutex mutex;
+
+	//! MCP capture_frame request box (serviced at end of layer_commit).
+	//! Mirrors the pattern in comp_metal/gl/d3d11_compositor. See issue #210.
+	struct mcp_capture_request mcp_capture;
 };
 
 /*
@@ -912,6 +922,181 @@ d3d12_crop_atlas_for_dp(struct comp_d3d12_compositor *c,
 	return c->dp_input_resource;
 }
 
+/*
+ *
+ * MCP capture helpers
+ *
+ */
+
+// Copy the content region of the renderer's atlas (tile_columns × view_width
+// by tile_rows × view_height — what the app actually wrote, same region the
+// compositor crops and sends to the DP) into a READBACK heap buffer, then
+// write @p path as PNG. D3D12 renderer uses DXGI_FORMAT_R8G8B8A8_UNORM so no
+// channel swap is needed.
+//
+// Caller must ensure the GPU is idle on entry (gpu_wait_idle has been called
+// or the existing layer_commit fence-waits before returning). On exit the
+// atlas is left in PIXEL_SHADER_RESOURCE state (matching the renderer's
+// expected steady state between frames).
+static bool
+d3d12_compositor_capture_atlas_to_png(struct comp_d3d12_compositor *c, const char *path)
+{
+	ID3D12Resource *atlas = static_cast<ID3D12Resource *>(
+	    comp_d3d12_renderer_get_atlas_resource(c->renderer));
+	if (atlas == nullptr || c->renderer == nullptr) {
+		return false;
+	}
+
+	uint32_t tile_columns = 1, tile_rows = 1;
+	comp_d3d12_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);
+	uint32_t view_w = 0, view_h = 0;
+	comp_d3d12_renderer_get_view_dimensions(c->renderer, &view_w, &view_h);
+	if (tile_columns == 0 || tile_rows == 0 || view_w == 0 || view_h == 0) {
+		return false;
+	}
+
+	D3D12_RESOURCE_DESC adesc = atlas->GetDesc();
+	uint32_t content_w = tile_columns * view_w;
+	uint32_t content_h = tile_rows * view_h;
+	if (content_w > adesc.Width)  content_w = (uint32_t)adesc.Width;
+	if (content_h > adesc.Height) content_h = adesc.Height;
+
+	// D3D12 readback row pitch must be aligned to 256.
+	const UINT64 align = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+	UINT64 row_pitch = ((UINT64)content_w * 4 + align - 1) & ~(align - 1);
+	UINT64 rb_bytes = row_pitch * content_h;
+
+	// Allocate a transient READBACK buffer. Lifetime = single capture.
+	D3D12_HEAP_PROPERTIES heap_props = {};
+	heap_props.Type = D3D12_HEAP_TYPE_READBACK;
+	D3D12_RESOURCE_DESC rb_desc = {};
+	rb_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	rb_desc.Width = rb_bytes;
+	rb_desc.Height = 1;
+	rb_desc.DepthOrArraySize = 1;
+	rb_desc.MipLevels = 1;
+	rb_desc.Format = DXGI_FORMAT_UNKNOWN;
+	rb_desc.SampleDesc.Count = 1;
+	rb_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	rb_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+	ID3D12Resource *readback = nullptr;
+	if (FAILED(c->device->CreateCommittedResource(
+	        &heap_props, D3D12_HEAP_FLAG_NONE, &rb_desc,
+	        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+	        IID_PPV_ARGS(&readback))) || readback == nullptr) {
+		return false;
+	}
+
+	// Re-arm the cmd_allocator + cmd_list for our private use. GPU is
+	// guaranteed idle at this point because layer_commit's existing
+	// fence wait runs before we get here.
+	c->cmd_allocator->Reset();
+	c->cmd_list->Reset(c->cmd_allocator, nullptr);
+
+	// Atlas: PIXEL_SHADER_RESOURCE → COPY_SOURCE.
+	D3D12_RESOURCE_BARRIER b = {};
+	b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	b.Transition.pResource = atlas;
+	b.Transition.Subresource = 0;
+	b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	c->cmd_list->ResourceBarrier(1, &b);
+
+	D3D12_TEXTURE_COPY_LOCATION src_loc = {};
+	src_loc.pResource = atlas;
+	src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	src_loc.SubresourceIndex = 0;
+
+	D3D12_TEXTURE_COPY_LOCATION dst_loc = {};
+	dst_loc.pResource = readback;
+	dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	dst_loc.PlacedFootprint.Offset = 0;
+	dst_loc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	dst_loc.PlacedFootprint.Footprint.Width = content_w;
+	dst_loc.PlacedFootprint.Footprint.Height = content_h;
+	dst_loc.PlacedFootprint.Footprint.Depth = 1;
+	dst_loc.PlacedFootprint.Footprint.RowPitch = (UINT)row_pitch;
+
+	D3D12_BOX src_box = {0, 0, 0, content_w, content_h, 1};
+	c->cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &src_box);
+
+	// Atlas: COPY_SOURCE → PIXEL_SHADER_RESOURCE (steady state).
+	std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+	c->cmd_list->ResourceBarrier(1, &b);
+
+	c->cmd_list->Close();
+	ID3D12CommandList *lists[] = {c->cmd_list};
+	c->command_queue->ExecuteCommandLists(1, lists);
+	gpu_wait_idle(c);
+
+	// Map readback, repack to tightly-packed rows, encode PNG.
+	bool ok = false;
+	void *mapped = nullptr;
+	D3D12_RANGE read_range = {0, (SIZE_T)rb_bytes};
+	if (SUCCEEDED(readback->Map(0, &read_range, &mapped)) && mapped != nullptr) {
+		size_t tight_pitch = (size_t)content_w * 4;
+		uint8_t *tight = (uint8_t *)malloc(tight_pitch * content_h);
+		if (tight != nullptr) {
+			const uint8_t *rb_pixels = (const uint8_t *)mapped;
+			for (uint32_t y = 0; y < content_h; y++) {
+				memcpy(tight + (size_t)y * tight_pitch,
+				       rb_pixels + (size_t)y * row_pitch,
+				       tight_pitch);
+			}
+			ok = stbi_write_png(path, (int)content_w, (int)content_h, 4,
+			                    tight, (int)tight_pitch) != 0;
+			free(tight);
+		}
+		D3D12_RANGE empty_range = {0, 0};
+		readback->Unmap(0, &empty_range);
+	}
+
+	readback->Release();
+	return ok;
+}
+
+// Service a pending MCP capture_frame request — thin wrapper around
+// d3d12_compositor_capture_atlas_to_png.
+static void
+d3d12_compositor_service_mcp_capture(struct comp_d3d12_compositor *c)
+{
+	char path[MCP_CAPTURE_PATH_MAX];
+	if (!mcp_capture_poll(&c->mcp_capture, path)) {
+		return;
+	}
+	bool ok = d3d12_compositor_capture_atlas_to_png(c, path);
+	mcp_capture_complete(&c->mcp_capture, ok);
+}
+
+// Trigger-file capture path — mirrors the d3d11_service workspace_screenshot
+// pattern (comp_d3d11_service.cpp:9696-9716). See issue #210.
+static void
+d3d12_compositor_service_trigger_file(struct comp_d3d12_compositor *c)
+{
+	static char trigger_path[MCP_CAPTURE_PATH_MAX] = {0};
+	static char out_path[MCP_CAPTURE_PATH_MAX] = {0};
+	if (trigger_path[0] == '\0') {
+		const char *tmp = getenv("TEMP");
+		if (tmp == nullptr || tmp[0] == '\0') tmp = "C:\\Temp";
+		snprintf(trigger_path, sizeof(trigger_path), "%s\\displayxr_atlas_trigger", tmp);
+		snprintf(out_path, sizeof(out_path), "%s\\displayxr_atlas.png", tmp);
+	}
+
+	if (GetFileAttributesA(trigger_path) == INVALID_FILE_ATTRIBUTES) {
+		return;
+	}
+	DeleteFileA(trigger_path);
+
+	bool ok = d3d12_compositor_capture_atlas_to_png(c, out_path);
+	if (ok) {
+		U_LOG_I("Atlas captured to %s", out_path);
+	} else {
+		U_LOG_W("Atlas capture failed (trigger %s)", trigger_path);
+	}
+}
+
+
 static xrt_result_t
 d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -1546,6 +1731,12 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
+	// MCP capture_frame + trigger-file post-compose atlas capture (#210).
+	// Runs after the existing fence wait so the GPU is idle when we
+	// reset the compositor's command allocator/list for the readback.
+	d3d12_compositor_service_mcp_capture(c);
+	d3d12_compositor_service_trigger_file(c);
+
 	return XRT_SUCCESS;
 }
 
@@ -1875,6 +2066,10 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);
 
 	U_LOG_I("Destroying D3D12 compositor");
+
+	// Uninstall MCP capture hook before the GPU resources go away.
+	mcp_capture_uninstall();
+	mcp_capture_fini(&c->mcp_capture);
 
 	// Wait for GPU idle
 	if (c->fence != nullptr && c->command_queue != nullptr) {
@@ -2319,6 +2514,10 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	c->base.base.layer_commit = d3d12_compositor_layer_commit;
 	c->base.base.layer_commit_with_semaphore = d3d12_compositor_layer_commit_with_semaphore;
 	c->base.base.destroy = d3d12_compositor_destroy;
+
+	// Install MCP capture_frame hook + arm the trigger-file path (#210).
+	mcp_capture_init(&c->mcp_capture);
+	mcp_capture_install(&c->mcp_capture);
 
 	*out_xc = &c->base;
 

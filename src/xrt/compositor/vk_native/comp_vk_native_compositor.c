@@ -36,6 +36,14 @@
 #include "math/m_api.h"
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
+#include <displayxr_mcp/mcp_capture.h>
+
+// STB_IMAGE_WRITE_STATIC scopes all stbi_write_* to this TU so linking
+// alongside other compositors that also implement stb doesn't produce
+// duplicate symbols.
+#define STB_IMAGE_WRITE_STATIC
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty_interface.h"
@@ -54,6 +62,13 @@
 
 #include <string.h>
 #include <math.h>
+
+#ifdef XRT_OS_WINDOWS
+#include <windows.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 /*!
  * Minimal settings struct for Vulkan compositor.
@@ -192,6 +207,10 @@ struct comp_vk_native_compositor
 	//! target format at compositor create time on all platforms).
 	struct vk_hud_blend window_space_blend;
 	bool window_space_blend_attempted;
+
+	//! MCP capture_frame request box (serviced at end of layer_commit).
+	//! Mirrors the pattern in comp_metal/gl/d3d11_compositor. See issue #210.
+	struct mcp_capture_request mcp_capture;
 };
 
 /*
@@ -1536,6 +1555,266 @@ vk_crop_atlas_for_dp(struct comp_vk_native_compositor *c,
 	*src_view_u64 = (uint64_t)(uintptr_t)c->dp_input_view;
 }
 
+/*
+ *
+ * MCP capture helpers
+ *
+ */
+
+// Helper: find a host-visible memory type.
+static bool
+vk_native_find_host_visible_memory_type(struct vk_bundle *vk, uint32_t type_bits, uint32_t *out_index)
+{
+	VkPhysicalDeviceMemoryProperties props;
+	vk->vkGetPhysicalDeviceMemoryProperties(vk->physical_device, &props);
+	const VkMemoryPropertyFlags want =
+	    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	for (uint32_t i = 0; i < props.memoryTypeCount; i++) {
+		if ((type_bits & (1u << i)) && (props.memoryTypes[i].propertyFlags & want) == want) {
+			*out_index = i;
+			return true;
+		}
+	}
+	return false;
+}
+
+// Read the content region of the renderer's atlas (tile_columns × view_width
+// by tile_rows × view_height — what actually got composited, matching what
+// the compositor crops and sends to the DP) into a host-visible staging
+// buffer, swap channels if format is BGRA, and write @p path as PNG. Uses
+// the renderer's command pool and the main queue.
+static bool
+vk_native_capture_atlas_to_png(struct comp_vk_native_compositor *c, const char *path)
+{
+	struct vk_bundle *vk = &c->vk;
+
+	uint64_t atlas_image_u64 = comp_vk_native_renderer_get_atlas_image(c->renderer);
+	VkImage atlas_image = (VkImage)(uintptr_t)atlas_image_u64;
+	if (atlas_image == VK_NULL_HANDLE) {
+		return false;
+	}
+
+	uint32_t tile_columns = 1, tile_rows = 1;
+	comp_vk_native_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);
+	uint32_t view_w = 0, view_h = 0;
+	comp_vk_native_renderer_get_view_dimensions(c->renderer, &view_w, &view_h);
+	if (tile_columns == 0 || tile_rows == 0 || view_w == 0 || view_h == 0) {
+		return false;
+	}
+	uint32_t atlas_w = 0, atlas_h = 0;
+	comp_vk_native_renderer_get_atlas_dimensions(c->renderer, &atlas_w, &atlas_h);
+
+	uint32_t content_w = tile_columns * view_w;
+	uint32_t content_h = tile_rows * view_h;
+	if (atlas_w > 0 && content_w > atlas_w) content_w = atlas_w;
+	if (atlas_h > 0 && content_h > atlas_h) content_h = atlas_h;
+
+	VkFormat atlas_format = (VkFormat)comp_vk_native_renderer_get_format(c->renderer);
+	bool swap_bgra =
+	    (atlas_format == VK_FORMAT_B8G8R8A8_UNORM || atlas_format == VK_FORMAT_B8G8R8A8_SRGB);
+
+	VkCommandPool cmd_pool = (VkCommandPool)(uintptr_t)comp_vk_native_renderer_get_cmd_pool(c->renderer);
+	if (cmd_pool == VK_NULL_HANDLE) {
+		return false;
+	}
+
+	// Allocate host-visible staging buffer (content_w × content_h × 4).
+	VkDeviceSize bytes = (VkDeviceSize)content_w * (VkDeviceSize)content_h * 4;
+	VkBuffer staging_buf = VK_NULL_HANDLE;
+	VkDeviceMemory staging_mem = VK_NULL_HANDLE;
+	uint8_t *mapped = NULL;
+
+	VkBufferCreateInfo bi = {
+	    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+	    .size = bytes,
+	    .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	};
+	if (vk->vkCreateBuffer(vk->device, &bi, NULL, &staging_buf) != VK_SUCCESS) {
+		return false;
+	}
+
+	VkMemoryRequirements mreq;
+	vk->vkGetBufferMemoryRequirements(vk->device, staging_buf, &mreq);
+	uint32_t mem_type = 0;
+	if (!vk_native_find_host_visible_memory_type(vk, mreq.memoryTypeBits, &mem_type)) {
+		vk->vkDestroyBuffer(vk->device, staging_buf, NULL);
+		return false;
+	}
+	VkMemoryAllocateInfo ai = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .allocationSize = mreq.size,
+	    .memoryTypeIndex = mem_type,
+	};
+	if (vk->vkAllocateMemory(vk->device, &ai, NULL, &staging_mem) != VK_SUCCESS ||
+	    vk->vkBindBufferMemory(vk->device, staging_buf, staging_mem, 0) != VK_SUCCESS) {
+		if (staging_mem != VK_NULL_HANDLE) vk->vkFreeMemory(vk->device, staging_mem, NULL);
+		vk->vkDestroyBuffer(vk->device, staging_buf, NULL);
+		return false;
+	}
+
+	// One-shot command buffer to copy atlas -> buffer.
+	VkCommandBufferAllocateInfo cbai = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+	    .commandPool = cmd_pool,
+	    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+	    .commandBufferCount = 1,
+	};
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	if (vk->vkAllocateCommandBuffers(vk->device, &cbai, &cmd) != VK_SUCCESS) {
+		vk->vkFreeMemory(vk->device, staging_mem, NULL);
+		vk->vkDestroyBuffer(vk->device, staging_buf, NULL);
+		return false;
+	}
+
+	VkCommandBufferBeginInfo cbi = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	vk->vkBeginCommandBuffer(cmd, &cbi);
+
+	// Atlas was sampled by the DP/weaver this frame, so its layout is
+	// SHADER_READ_ONLY_OPTIMAL by the time we're called from layer_commit.
+	// Transition: SHADER_READ_ONLY_OPTIMAL → TRANSFER_SRC_OPTIMAL → SHADER_READ_ONLY_OPTIMAL.
+	VkImageMemoryBarrier b = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = atlas_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	};
+	vk->vkCmdPipelineBarrier(cmd,
+	                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                         0, 0, NULL, 0, NULL, 1, &b);
+
+	VkBufferImageCopy region = {
+	    .bufferOffset = 0,
+	    .bufferRowLength = 0,
+	    .bufferImageHeight = 0,
+	    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .imageOffset = {0, 0, 0},
+	    .imageExtent = {content_w, content_h, 1},
+	};
+	vk->vkCmdCopyImageToBuffer(cmd, atlas_image,
+	                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                           staging_buf, 1, &region);
+
+	b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	vk->vkCmdPipelineBarrier(cmd,
+	                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	                         0, 0, NULL, 0, NULL, 1, &b);
+
+	vk->vkEndCommandBuffer(cmd);
+
+	VkSubmitInfo si = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .commandBufferCount = 1,
+	    .pCommandBuffers = &cmd,
+	};
+	vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, VK_NULL_HANDLE);
+	vk->vkQueueWaitIdle(vk->main_queue->queue);
+	vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+
+	// Read pixels and encode PNG.
+	bool ok = false;
+	if (vk->vkMapMemory(vk->device, staging_mem, 0, bytes, 0, (void **)&mapped) == VK_SUCCESS) {
+		uint8_t *pixels = mapped;
+		uint8_t *swapped = NULL;
+		if (swap_bgra) {
+			swapped = malloc((size_t)bytes);
+			if (swapped != NULL) {
+				for (VkDeviceSize i = 0; i < bytes; i += 4) {
+					swapped[i + 0] = mapped[i + 2];
+					swapped[i + 1] = mapped[i + 1];
+					swapped[i + 2] = mapped[i + 0];
+					swapped[i + 3] = mapped[i + 3];
+				}
+				pixels = swapped;
+			}
+		}
+		ok = stbi_write_png(path, (int)content_w, (int)content_h, 4,
+		                    pixels, (int)content_w * 4) != 0;
+		free(swapped);
+		vk->vkUnmapMemory(vk->device, staging_mem);
+	}
+
+	vk->vkFreeMemory(vk->device, staging_mem, NULL);
+	vk->vkDestroyBuffer(vk->device, staging_buf, NULL);
+	return ok;
+}
+
+// Service a pending MCP capture_frame request — thin wrapper around
+// vk_native_capture_atlas_to_png that handles the cross-thread hand-off
+// with the MCP server.
+static void
+vk_native_service_mcp_capture(struct comp_vk_native_compositor *c)
+{
+	char path[MCP_CAPTURE_PATH_MAX];
+	if (!mcp_capture_poll(&c->mcp_capture, path)) {
+		return;
+	}
+	bool ok = vk_native_capture_atlas_to_png(c, path);
+	mcp_capture_complete(&c->mcp_capture, ok);
+}
+
+// Trigger-file capture path — same readback driven by file existence so
+// devs can snapshot without an MCP client. See issue #210.
+static void
+vk_native_service_trigger_file(struct comp_vk_native_compositor *c)
+{
+	static char trigger_path[MCP_CAPTURE_PATH_MAX] = {0};
+	static char out_path[MCP_CAPTURE_PATH_MAX] = {0};
+	if (trigger_path[0] == '\0') {
+#ifdef XRT_OS_WINDOWS
+		const char *tmp = getenv("TEMP");
+		if (tmp == NULL || tmp[0] == '\0') tmp = "C:\\Temp";
+		snprintf(trigger_path, sizeof(trigger_path), "%s\\displayxr_atlas_trigger", tmp);
+		snprintf(out_path, sizeof(out_path), "%s\\displayxr_atlas.png", tmp);
+#else
+		const char *tmp = getenv("TMPDIR");
+		if (tmp == NULL || tmp[0] == '\0') tmp = "/tmp";
+		size_t tlen = strlen(tmp);
+		if (tlen > 0 && tmp[tlen - 1] == '/') tlen = tlen - 1;
+		char tmp_clean[MCP_CAPTURE_PATH_MAX];
+		if (tlen >= sizeof(tmp_clean)) tlen = sizeof(tmp_clean) - 1;
+		memcpy(tmp_clean, tmp, tlen);
+		tmp_clean[tlen] = '\0';
+		snprintf(trigger_path, sizeof(trigger_path), "%s/displayxr_atlas_trigger", tmp_clean);
+		snprintf(out_path, sizeof(out_path), "%s/displayxr_atlas.png", tmp_clean);
+#endif
+	}
+
+#ifdef XRT_OS_WINDOWS
+	if (GetFileAttributesA(trigger_path) == INVALID_FILE_ATTRIBUTES) {
+		return;
+	}
+	DeleteFileA(trigger_path);
+#else
+	struct stat st;
+	if (stat(trigger_path, &st) != 0) {
+		return;
+	}
+	unlink(trigger_path);
+#endif
+
+	bool ok = vk_native_capture_atlas_to_png(c, out_path);
+	if (ok) {
+		U_LOG_I("Atlas captured to %s", out_path);
+	} else {
+		U_LOG_W("Atlas capture failed (trigger %s)", trigger_path);
+	}
+}
+
+
 static xrt_result_t
 vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -2062,6 +2341,11 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		}
 	}
 
+	// MCP capture_frame + trigger-file post-compose atlas capture (#210).
+	// Both early-return when nothing's pending; pay only when capturing.
+	vk_native_service_mcp_capture(c);
+	vk_native_service_trigger_file(c);
+
 	return XRT_SUCCESS;
 }
 
@@ -2080,6 +2364,11 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	struct vk_bundle *vk = &c->vk;
 
 	U_LOG_I("Destroying VK native compositor");
+
+	// Uninstall MCP capture hook before any GPU resources go away — the
+	// MCP thread can no longer post requests against us after this returns.
+	mcp_capture_uninstall();
+	mcp_capture_fini(&c->mcp_capture);
 
 	vk->vkDeviceWaitIdle(vk->device);
 
@@ -2523,6 +2812,10 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	c->base.base.layer_commit = vk_compositor_layer_commit;
 	c->base.base.layer_commit_with_semaphore = vk_compositor_layer_commit_with_semaphore;
 	c->base.base.destroy = vk_compositor_destroy;
+
+	// Install MCP capture_frame hook + arm the trigger-file path (#210).
+	mcp_capture_init(&c->mcp_capture);
+	mcp_capture_install(&c->mcp_capture);
 
 	*out_xc = &c->base;
 
