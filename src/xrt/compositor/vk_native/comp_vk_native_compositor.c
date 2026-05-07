@@ -36,6 +36,7 @@
 #include "math/m_api.h"
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
+#include "util/u_capture_intent.h"
 #include <displayxr_mcp/mcp_capture.h>
 
 // STB_IMAGE_WRITE_STATIC scopes all stbi_write_* to this TU so linking
@@ -202,15 +203,26 @@ struct comp_vk_native_compositor
 	//! Canvas output rect for shared-texture apps.
 	struct u_canvas_rect canvas;
 
-	//! Alpha-blend pipeline for window-space (HUD) layers. Lazy-initialized
-	//! the first frame a window-space layer is submitted (we don't know the
-	//! target format at compositor create time on all platforms).
+	//! Alpha-blend pipeline for window-space (HUD) layers rendered per-tile
+	//! INTO the atlas pre-weave (matches d3d11/d3d12/metal/gl). Lazy-init
+	//! with the atlas format on first window-space submission. The DP weaver
+	//! then interlaces the layer along with the projection content, giving
+	//! HUD per-eye disparity / parallax (#210).
 	struct vk_hud_blend window_space_blend;
 	bool window_space_blend_attempted;
+	//! Cached framebuffer for atlas window-space pass (one per atlas view).
+	VkFramebuffer atlas_ws_fb;
+	VkImageView atlas_ws_fb_view;
 
 	//! MCP capture_frame request box (serviced at end of layer_commit).
 	//! Mirrors the pattern in comp_metal/gl/d3d11_compositor. See issue #210.
 	struct mcp_capture_request mcp_capture;
+
+	//! Per-frame capture intent (mode + path), populated by
+	//! u_capture_intent_poll at the top of layer_commit and consumed
+	//! at the projection-done boundary (PROJECTION_ONLY) or end of
+	//! frame (POST_COMPOSE).
+	struct u_capture_intent capture_intent;
 };
 
 /*
@@ -917,26 +929,39 @@ vk_compositor_layer_window_space(struct xrt_compositor *xc,
 }
 
 /*!
- * Composite window-space (HUD) layers onto the target image POST-WEAVE
- * with proper alpha blending — replaces the previous opaque vkCmdBlitImage
- * path so transparent texels actually disappear and semi-transparent
- * backdrops read as semi-transparent. HUD must not be interlaced; it
- * appears flat on screen.
+ * Composite window-space (HUD) layers per-tile INTO the atlas image,
+ * pre-weave, with proper alpha blending. Mirrors the per-tile rendering
+ * model used by d3d11 / d3d12 / metal / gl, so atlas-capture parity
+ * shows HUD on every tile and the DP weaver gives the layer per-eye
+ * disparity (parallax) just like a projection layer.
+ *
+ * Atlas must be in SHADER_READ_ONLY_OPTIMAL on entry (the renderer
+ * leaves it there after the projection-blit pass); on exit it is
+ * returned to SHADER_READ_ONLY_OPTIMAL for the DP. No-op when no
+ * window-space layers are present.
  *
  * @param c             The compositor.
  * @param cmd           Active command buffer to record into.
- * @param target_image  Target swapchain VkImage (in PRESENT_SRC_KHR).
- * @param target_view   Target swapchain VkImageView (for the framebuffer).
- * @param target_width  Target width.
- * @param target_height Target height.
+ * @param atlas_image   Atlas VkImage.
+ * @param atlas_view    Atlas VkImageView (framebuffer attachment).
+ * @param atlas_w       Allocated atlas width in pixels.
+ * @param atlas_h       Allocated atlas height in pixels.
+ * @param view_w        Per-tile view width.
+ * @param view_h        Per-tile view height.
+ * @param tile_columns  Atlas tile columns.
+ * @param tile_rows     Atlas tile rows.
  */
 static void
-vk_compositor_blit_window_space_layers(struct comp_vk_native_compositor *c,
-                                        VkCommandBuffer cmd,
-                                        VkImage target_image,
-                                        VkImageView target_view,
-                                        uint32_t target_width,
-                                        uint32_t target_height)
+vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c,
+                                               VkCommandBuffer cmd,
+                                               VkImage atlas_image,
+                                               VkImageView atlas_view,
+                                               uint32_t atlas_w,
+                                               uint32_t atlas_h,
+                                               uint32_t view_w,
+                                               uint32_t view_h,
+                                               uint32_t tile_columns,
+                                               uint32_t tile_rows)
 {
 	struct vk_bundle *vk = &c->vk;
 
@@ -947,16 +972,14 @@ vk_compositor_blit_window_space_layers(struct comp_vk_native_compositor *c,
 			break;
 		}
 	}
-	if (!has_ws) {
+	if (!has_ws || tile_columns == 0 || tile_rows == 0 || view_w == 0 || view_h == 0) {
 		return;
 	}
 
-	// Lazy-init the alpha-blend pipeline on first use (target format isn't
-	// available at compositor create time on all paths).
 	if (!c->window_space_blend.initialized && !c->window_space_blend_attempted) {
 		c->window_space_blend_attempted = true;
-		VkFormat target_fmt = comp_vk_native_target_get_format(c->target);
-		if (!vk_hud_blend_init(&c->window_space_blend, vk, target_fmt)) {
+		VkFormat atlas_fmt = (VkFormat)comp_vk_native_renderer_get_format(c->renderer);
+		if (!vk_hud_blend_init(&c->window_space_blend, vk, atlas_fmt)) {
 			U_LOG_E("[VK native] window-space alpha-blend init failed; "
 			        "layers will be skipped");
 		}
@@ -964,6 +987,45 @@ vk_compositor_blit_window_space_layers(struct comp_vk_native_compositor *c,
 	if (!c->window_space_blend.initialized) {
 		return;
 	}
+
+	if (c->atlas_ws_fb == VK_NULL_HANDLE || c->atlas_ws_fb_view != atlas_view) {
+		if (c->atlas_ws_fb != VK_NULL_HANDLE) {
+			vk->vkDestroyFramebuffer(vk->device, c->atlas_ws_fb, NULL);
+			c->atlas_ws_fb = VK_NULL_HANDLE;
+		}
+		VkFramebufferCreateInfo fb_ci = {
+		    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+		    .renderPass = c->window_space_blend.render_pass,
+		    .attachmentCount = 1,
+		    .pAttachments = &atlas_view,
+		    .width = atlas_w,
+		    .height = atlas_h,
+		    .layers = 1,
+		};
+		if (vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &c->atlas_ws_fb) != VK_SUCCESS) {
+			U_LOG_E("[VK native] atlas framebuffer creation failed (%ux%u); "
+			        "window-space layers will be skipped",
+			        atlas_w, atlas_h);
+			c->atlas_ws_fb = VK_NULL_HANDLE;
+			return;
+		}
+		c->atlas_ws_fb_view = atlas_view;
+	}
+
+	// Atlas: SHADER_READ_ONLY_OPTIMAL → COLOR_ATTACHMENT_OPTIMAL.
+	VkImageMemoryBarrier atlas_to_color = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .image = atlas_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd,
+	    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	    0, 0, NULL, 0, NULL, 1, &atlas_to_color);
 
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
@@ -984,19 +1046,7 @@ vk_compositor_blit_window_space_layers(struct comp_vk_native_compositor *c,
 			continue;
 		}
 
-		uint32_t src_w = ws->sub.rect.extent.w;
-		uint32_t src_h = ws->sub.rect.extent.h;
-
-		// Destination rect: window-fraction → swapchain pixels.
-		int32_t dx0 = (int32_t)(ws->x * (float)target_width);
-		int32_t dy0 = (int32_t)(ws->y * (float)target_height);
-		int32_t dw = (int32_t)(ws->width * (float)target_width);
-		int32_t dh = (int32_t)(ws->height * (float)target_height);
-		if (dw <= 0 || dh <= 0) {
-			continue;
-		}
-
-		// Transition source from COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL.
+		// Source: COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL.
 		VkImageMemoryBarrier src_to_sample = {
 		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 		    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
@@ -1012,15 +1062,30 @@ vk_compositor_blit_window_space_layers(struct comp_vk_native_compositor *c,
 		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 		    0, 0, NULL, 0, NULL, 1, &src_to_sample);
 
-		vk_hud_blend_draw(&c->window_space_blend, vk, cmd,
-		                   target_view, target_image,
-		                   target_width, target_height,
-		                   src_image, src_w, src_h,
-		                   dx0, dy0, (uint32_t)dw, (uint32_t)dh);
+		// Per-tile pass with disparity shift in tile-fraction → atlas px.
+		float half_disp = ws->disparity / 2.0f;
+		for (uint32_t row = 0; row < tile_rows; row++) {
+			for (uint32_t col = 0; col < tile_columns; col++) {
+				uint32_t tile_index = row * tile_columns + col;
+				float eye_shift = (tile_index == 0) ? -half_disp : half_disp;
 
-		// Transition source back to COLOR_ATTACHMENT_OPTIMAL so the app
-		// can render into it on the next frame (matches what callers
-		// expect after this function returns).
+				int32_t dx = (int32_t)((ws->x + eye_shift) * (float)view_w)
+				             + (int32_t)(col * view_w);
+				int32_t dy = (int32_t)(ws->y * (float)view_h)
+				             + (int32_t)(row * view_h);
+				int32_t dw_i = (int32_t)(ws->width * (float)view_w);
+				int32_t dh_i = (int32_t)(ws->height * (float)view_h);
+				if (dw_i <= 0 || dh_i <= 0) {
+					continue;
+				}
+
+				vk_hud_blend_draw_no_layout(&c->window_space_blend, vk, cmd,
+				    c->atlas_ws_fb, atlas_w, atlas_h,
+				    src_image, dx, dy, (uint32_t)dw_i, (uint32_t)dh_i);
+			}
+		}
+
+		// Source back to COLOR_ATTACHMENT_OPTIMAL so the app can rerender.
 		VkImageMemoryBarrier src_back = {
 		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 		    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
@@ -1036,6 +1101,21 @@ vk_compositor_blit_window_space_layers(struct comp_vk_native_compositor *c,
 		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 		    0, 0, NULL, 0, NULL, 1, &src_back);
 	}
+
+	// Atlas: COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL for DP.
+	VkImageMemoryBarrier atlas_back = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	    .image = atlas_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd,
+	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	    0, 0, NULL, 0, NULL, 1, &atlas_back);
 }
 
 /*
@@ -1752,66 +1832,23 @@ vk_native_capture_atlas_to_png(struct comp_vk_native_compositor *c, const char *
 	return ok;
 }
 
-// Service a pending MCP capture_frame request — thin wrapper around
-// vk_native_capture_atlas_to_png that handles the cross-thread hand-off
-// with the MCP server.
+// Run the capture readback if the per-frame intent matches @p mode_filter.
+// Caller polls intent at top of layer_commit; this fires at each boundary.
 static void
-vk_native_service_mcp_capture(struct comp_vk_native_compositor *c)
+vk_native_dispatch_capture(struct comp_vk_native_compositor *c, uint32_t mode_filter)
 {
-	char path[MCP_CAPTURE_PATH_MAX];
-	if (!mcp_capture_poll(&c->mcp_capture, path)) {
+	if (!u_capture_intent_should_capture(&c->capture_intent, mode_filter)) {
 		return;
 	}
-	bool ok = vk_native_capture_atlas_to_png(c, path);
-	mcp_capture_complete(&c->mcp_capture, ok);
-}
-
-// Trigger-file capture path — same readback driven by file existence so
-// devs can snapshot without an MCP client. See issue #210.
-static void
-vk_native_service_trigger_file(struct comp_vk_native_compositor *c)
-{
-	static char trigger_path[MCP_CAPTURE_PATH_MAX] = {0};
-	static char out_path[MCP_CAPTURE_PATH_MAX] = {0};
-	if (trigger_path[0] == '\0') {
-#ifdef XRT_OS_WINDOWS
-		const char *tmp = getenv("TEMP");
-		if (tmp == NULL || tmp[0] == '\0') tmp = "C:\\Temp";
-		snprintf(trigger_path, sizeof(trigger_path), "%s\\displayxr_atlas_trigger", tmp);
-		snprintf(out_path, sizeof(out_path), "%s\\displayxr_atlas.png", tmp);
-#else
-		const char *tmp = getenv("TMPDIR");
-		if (tmp == NULL || tmp[0] == '\0') tmp = "/tmp";
-		size_t tlen = strlen(tmp);
-		if (tlen > 0 && tmp[tlen - 1] == '/') tlen = tlen - 1;
-		char tmp_clean[MCP_CAPTURE_PATH_MAX];
-		if (tlen >= sizeof(tmp_clean)) tlen = sizeof(tmp_clean) - 1;
-		memcpy(tmp_clean, tmp, tlen);
-		tmp_clean[tlen] = '\0';
-		snprintf(trigger_path, sizeof(trigger_path), "%s/displayxr_atlas_trigger", tmp_clean);
-		snprintf(out_path, sizeof(out_path), "%s/displayxr_atlas.png", tmp_clean);
-#endif
-	}
-
-#ifdef XRT_OS_WINDOWS
-	if (GetFileAttributesA(trigger_path) == INVALID_FILE_ATTRIBUTES) {
-		return;
-	}
-	DeleteFileA(trigger_path);
-#else
-	struct stat st;
-	if (stat(trigger_path, &st) != 0) {
-		return;
-	}
-	unlink(trigger_path);
-#endif
-
-	bool ok = vk_native_capture_atlas_to_png(c, out_path);
+	bool ok = vk_native_capture_atlas_to_png(c, c->capture_intent.path);
 	if (ok) {
-		U_LOG_I("Atlas captured to %s", out_path);
+		U_LOG_I("Atlas captured (mode=%u) to %s",
+		        c->capture_intent.mode, c->capture_intent.path);
 	} else {
-		U_LOG_W("Atlas capture failed (trigger %s)", trigger_path);
+		U_LOG_W("Atlas capture failed (mode=%u path=%s)",
+		        c->capture_intent.mode, c->capture_intent.path);
 	}
+	u_capture_intent_complete(&c->capture_intent, &c->mcp_capture, ok);
 }
 
 
@@ -1820,6 +1857,11 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
 	struct vk_bundle *vk = &c->vk;
+
+	// Capture-intent poll — checks MCP request + trigger files once per
+	// frame; consumed at the projection-done boundary or end of frame
+	// depending on requested mode. See u_capture_intent.h.
+	u_capture_intent_poll(&c->capture_intent, &c->mcp_capture);
 
 	// Phase 1 diagnostic — env-gated per-client commit interval. Mirrors
 	// the same `[CLIENT_FRAME_NS]` line emitted by the D3D11 in-process and
@@ -2009,6 +2051,13 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			U_LOG_E("Failed to render layers");
 			return xret;
 		}
+
+		// Projection-only capture point — atlas now contains projection
+		// layers across all tiles; window-space layers haven't been
+		// composed in yet. Atlas is in SHADER_READ_ONLY_OPTIMAL after
+		// renderer's terminating barrier (see comp_vk_native_renderer.c).
+		// Skipped in zero-copy mode (no renderer atlas to read).
+		vk_native_dispatch_capture(c, MCP_CAPTURE_MODE_PROJECTION_ONLY);
 	}
 
 	// Shared texture output path — render to IOSurface-backed VkImage
@@ -2056,6 +2105,19 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 			comp_vk_native_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
 			comp_vk_native_renderer_get_tile_layout(c->renderer, &tc, &tr);
+
+			// Pre-weave: composite window-space layers per-tile INTO the atlas
+			// so the DP weaves them along with the projection content. Skipped
+			// in zero-copy (no atlas) and when no window-space layers exist.
+			if (!zero_copy) {
+				uint32_t atlas_w_pre, atlas_h_pre;
+				comp_vk_native_renderer_get_atlas_dimensions(c->renderer, &atlas_w_pre, &atlas_h_pre);
+				vk_compositor_render_window_space_into_atlas(c, cmd,
+				    (VkImage)(uintptr_t)src_image_u64,
+				    (VkImageView)(uintptr_t)src_view_u64,
+				    atlas_w_pre, atlas_h_pre,
+				    view_width, view_height, tc, tr);
+			}
 
 			// Crop atlas to content dimensions before passing to DP
 			{
@@ -2216,6 +2278,19 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				comp_vk_native_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
 				comp_vk_native_renderer_get_tile_layout(c->renderer, &tc, &tr);
 
+				// Pre-weave: composite window-space layers per-tile INTO the
+				// atlas. Skipped in zero-copy (no atlas) and when no
+				// window-space layers exist.
+				if (!zero_copy) {
+					uint32_t atlas_w_pre, atlas_h_pre;
+					comp_vk_native_renderer_get_atlas_dimensions(c->renderer, &atlas_w_pre, &atlas_h_pre);
+					vk_compositor_render_window_space_into_atlas(c, cmd,
+					    (VkImage)(uintptr_t)src_image_u64,
+					    (VkImageView)(uintptr_t)src_view_u64,
+					    atlas_w_pre, atlas_h_pre,
+					    view_width, view_height, tc, tr);
+				}
+
 				// Crop atlas to content dimensions before passing to DP
 				{
 					uint32_t content_w = tc * view_width;
@@ -2279,12 +2354,9 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				    c->canvas.valid ? c->canvas.h : 0);
 
 				// Render pass finalLayout handles transition to PRESENT_SRC_KHR
-
-				// Post-weave: composite HUD overlays onto target (alpha-blended, flat 2D)
-				vk_compositor_blit_window_space_layers(c, cmd,
-				    (VkImage)(uintptr_t)target_image,
-				    (VkImageView)(uintptr_t)target_view,
-				    tgt_width, tgt_height);
+				// Window-space layers are composed pre-weave into the atlas
+				// (see vk_compositor_render_window_space_into_atlas), so we
+				// only need the diagnostic HUD on the target post-weave.
 
 				// Diagnostic HUD overlay (TAB key toggle)
 				vk_compositor_render_hud(c, cmd,
@@ -2293,12 +2365,6 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				// No display processor (or mono/2D mode): blit atlas texture to target
 				comp_vk_native_renderer_blit_to_target(c->renderer, cmd,
 				                                        target_image, tgt_width, tgt_height);
-
-				// Post-blit: HUD overlays onto target (alpha-blended, flat 2D)
-				vk_compositor_blit_window_space_layers(c, cmd,
-				    (VkImage)(uintptr_t)target_image,
-				    (VkImageView)(uintptr_t)target_view,
-				    tgt_width, tgt_height);
 
 				// Diagnostic HUD overlay (TAB key toggle)
 				vk_compositor_render_hud(c, cmd,
@@ -2341,10 +2407,10 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		}
 	}
 
-	// MCP capture_frame + trigger-file post-compose atlas capture (#210).
-	// Both early-return when nothing's pending; pay only when capturing.
-	vk_native_service_mcp_capture(c);
-	vk_native_service_trigger_file(c);
+	// Post-compose capture (#210) — captures the fully composed atlas
+	// (projection + window-space + quads) the DP just received. Skipped
+	// when intent is for projection-only (consumed earlier) or empty.
+	vk_native_dispatch_capture(c, MCP_CAPTURE_MODE_POST_COMPOSE);
 
 	return XRT_SUCCESS;
 }
@@ -2381,7 +2447,11 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	}
 	u_hud_destroy(&c->hud);
 
-	// Destroy window-space (HUD) alpha-blend pipeline
+	// Destroy window-space (HUD) alpha-blend pipeline + cached atlas FB
+	if (c->atlas_ws_fb != VK_NULL_HANDLE) {
+		vk->vkDestroyFramebuffer(vk->device, c->atlas_ws_fb, NULL);
+		c->atlas_ws_fb = VK_NULL_HANDLE;
+	}
 	vk_hud_blend_fini(&c->window_space_blend, vk);
 
 	// Destroy DP input crop image

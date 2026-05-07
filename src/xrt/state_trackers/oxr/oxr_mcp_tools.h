@@ -63,14 +63,15 @@ oxr_mcp_tools_record_submitted(struct oxr_session *sess, const struct xrt_layer_
 
 /*!
  * Register a per-compositor capture handler. The handler is invoked on
- * the MCP server thread with a target path; it must write a PNG to
- * that path (synchronously or with its own synchronization) and return
- * true on success. The state tracker passes a stable path of the form
- * `/tmp/displayxr-mcp-capture-<pid>-<frame>.png`.
+ * the MCP server thread with a target path and a capture mode (see
+ * @ref mcp_capture_mode); it must write a PNG matching the requested
+ * mode to that path (synchronously or with its own synchronization)
+ * and return true on success. The state tracker passes a stable path
+ * of the form `/tmp/displayxr-mcp-capture-<pid>-<frame>{,.projection}.png`.
  *
  * Pass NULL to unregister.
  */
-typedef bool (*oxr_mcp_capture_fn)(const char *path, void *userdata);
+typedef bool (*oxr_mcp_capture_fn)(const char *path, uint32_t mode, void *userdata);
 
 void
 oxr_mcp_tools_set_capture_handler(oxr_mcp_capture_fn fn, void *userdata);

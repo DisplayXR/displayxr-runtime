@@ -14554,7 +14554,10 @@ comp_d3d11_service_poll_mcp_capture(struct xrt_system_compositor *xsysc)
 	}
 
 	char base[MCP_CAPTURE_PATH_MAX];
-	if (!mcp_capture_poll(&sys->mcp_capture, base)) {
+	// Workspace compositor only supports POST_COMPOSE today; ignore mode
+	// for now (the workspace already captures the combined atlas at the
+	// post-compose point regardless of any per-client window-space layers).
+	if (!mcp_capture_poll(&sys->mcp_capture, base, NULL)) {
 		return;
 	}
 

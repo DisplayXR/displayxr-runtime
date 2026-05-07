@@ -112,6 +112,39 @@ vk_hud_blend_draw(struct vk_hud_blend *blend,
                    uint32_t dst_h);
 
 /*!
+ * Draw without managing target image layout transitions or framebuffer
+ * caching. Use this when blending into a non-swapchain target (e.g. an
+ * atlas image) where the caller manages layout transitions outside the
+ * render pass and pre-creates the framebuffer.
+ *
+ * Target must be in COLOR_ATTACHMENT_OPTIMAL on entry; left in
+ * COLOR_ATTACHMENT_OPTIMAL on exit. The framebuffer's attachment must
+ * use the same format the blend was initialized with.
+ *
+ * @param blend         Initialized HUD blend resources.
+ * @param vk            Vulkan bundle.
+ * @param cmd           Open command buffer.
+ * @param fb            Caller-managed framebuffer (color attachment is the target).
+ * @param fb_w, fb_h    Framebuffer width/height in pixels.
+ * @param hud_image     HUD source image (in SHADER_READ_ONLY_OPTIMAL).
+ * @param dst_x, dst_y  Top-left of destination rect in target px.
+ * @param dst_w, dst_h  Size of destination rect in target px.
+ * @ingroup aux_vk
+ */
+void
+vk_hud_blend_draw_no_layout(struct vk_hud_blend *blend,
+                              struct vk_bundle *vk,
+                              VkCommandBuffer cmd,
+                              VkFramebuffer fb,
+                              uint32_t fb_w,
+                              uint32_t fb_h,
+                              VkImage hud_image,
+                              int32_t dst_x,
+                              int32_t dst_y,
+                              uint32_t dst_w,
+                              uint32_t dst_h);
+
+/*!
  * Destroy HUD blend resources.
  * @ingroup aux_vk
  */

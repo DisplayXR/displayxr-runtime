@@ -672,8 +672,31 @@ oxr_mcp_tools_set_capture_handler(oxr_mcp_capture_fn fn, void *userdata)
 static cJSON *
 tool_capture_frame(const cJSON *params, void *userdata)
 {
-	(void)params;
 	(void)userdata;
+
+	// Parse optional mode parameter. Default = post-compose (current
+	// behavior). "projection-only" returns the atlas state before
+	// window-space (HUD) layers are composed in.
+	uint32_t mode = MCP_CAPTURE_MODE_POST_COMPOSE;
+	const char *mode_label = "post-compose";
+	if (params != NULL) {
+		const cJSON *mode_node = cJSON_GetObjectItemCaseSensitive(params, "mode");
+		if (cJSON_IsString(mode_node) && mode_node->valuestring != NULL) {
+			if (strcmp(mode_node->valuestring, "projection-only") == 0) {
+				mode = MCP_CAPTURE_MODE_PROJECTION_ONLY;
+				mode_label = "projection-only";
+			} else if (strcmp(mode_node->valuestring, "post-compose") == 0) {
+				// explicit default — fall through
+			} else {
+				cJSON *o = cJSON_CreateObject();
+				cJSON_AddStringToObject(
+				    o, "error",
+				    "mode must be \"post-compose\" or \"projection-only\"");
+				return o;
+			}
+		}
+	}
+
 	pthread_mutex_lock(&g_capture_lock);
 	oxr_mcp_capture_fn fn = g_capture_fn;
 	void *ud = g_capture_userdata;
@@ -694,13 +717,34 @@ tool_capture_frame(const cJSON *params, void *userdata)
 	int64_t begun = sess ? sess->frame_id.begun : 0;
 	uint64_t seq = begun >= 0 ? (uint64_t)begun : 0;
 	unlock_session();
-	snprintf(path, sizeof(path), "/tmp/displayxr-mcp-capture-%ld-%llu.png", pid, (unsigned long long)seq);
+	const char *suffix = (mode == MCP_CAPTURE_MODE_PROJECTION_ONLY) ? ".projection" : "";
+#ifdef _WIN32
+	const char *tmp = getenv("TEMP");
+	if (tmp == NULL || tmp[0] == '\0') {
+		tmp = "C:\\Temp";
+	}
+	snprintf(path, sizeof(path), "%s\\displayxr-mcp-capture-%ld-%llu%s.png",
+	         tmp, pid, (unsigned long long)seq, suffix);
+#else
+	const char *tmp = getenv("TMPDIR");
+	if (tmp == NULL || tmp[0] == '\0') {
+		tmp = "/tmp";
+	}
+	// Strip trailing slash to keep the format stable.
+	size_t tlen = strlen(tmp);
+	while (tlen > 0 && tmp[tlen - 1] == '/') {
+		tlen--;
+	}
+	snprintf(path, sizeof(path), "%.*s/displayxr-mcp-capture-%ld-%llu%s.png",
+	         (int)tlen, tmp, pid, (unsigned long long)seq, suffix);
+#endif
 
-	bool ok = fn(path, ud);
+	bool ok = fn(path, mode, ud);
 
 	cJSON *r = cJSON_CreateObject();
 	cJSON_AddNumberToObject(r, "frame_id", (double)seq);
 	cJSON_AddStringToObject(r, "path", path);
+	cJSON_AddStringToObject(r, "mode", mode_label);
 	// Absorb any brief fclose→stat lag before reporting size.
 	struct stat st = {0};
 	for (int attempt = 0; attempt < 20; attempt++) {
@@ -719,10 +763,19 @@ tool_capture_frame(const cJSON *params, void *userdata)
 static const struct mcp_tool TOOL_CAPTURE_FRAME = {
     .name = "capture_frame",
     .description =
-        "Capture the compositor's most recent composited frame — the content region of the "
-        "atlas that the compositor crops and hands to the display processor (i.e. what the "
-        "app actually wrote to its swapchain). Returns the PNG path and byte size.",
-    .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
+        "Capture the compositor's atlas state and write it as a PNG. "
+        "Optional mode parameter selects what gets captured: "
+        "\"post-compose\" (default) returns the fully composed atlas the "
+        "display processor receives — projection layers + window-space "
+        "(HUD) + quads, across every tile. "
+        "\"projection-only\" returns the atlas before window-space layers "
+        "are composed in (projection-class layers only, per tile). "
+        "Returns the PNG path, requested mode, and byte size.",
+    .input_schema_json =
+        "{\"type\":\"object\",\"properties\":{"
+        "\"mode\":{\"type\":\"string\","
+        "\"enum\":[\"post-compose\",\"projection-only\"],"
+        "\"description\":\"Atlas state to capture; default post-compose.\"}}}",
     .fn = tool_capture_frame,
 };
 
