@@ -123,22 +123,32 @@ The two concepts are inseparable: window-space layers only make sense when there
 
 ```c
 #define XR_EXT_win32_window_binding                          1
-#define XR_EXT_win32_window_binding_SPEC_VERSION             1
+#define XR_EXT_win32_window_binding_SPEC_VERSION             5
 #define XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME           "XR_EXT_win32_window_binding"
 #define XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT         ((XrStructureType)1000999001)
 #define XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT     ((XrStructureType)1000999002)
 ```
 
+**Spec version history:**
+
+| Version | Added |
+|--------:|-------|
+| 1 | Initial: `windowHandle`, `readbackCallback`, `sharedTextureHandle`. |
+| 4 | `transparentBackgroundEnabled` — runtime configures DComp / DXGI for per-pixel desktop transparency. |
+| 5 | `chromaKeyColor` — optional app-supplied chroma-key override. `0` = runtime DP picks its own default. |
+
 ### 3.2 XrWin32WindowBindingCreateInfoEXT
 
 ```c
 typedef struct XrWin32WindowBindingCreateInfoEXT {
-    XrStructureType             type;                  // Must be XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT
-    const void* XR_MAY_ALIAS    next;                  // Pointer to next structure in chain
-    void*                       windowHandle;          // HWND of the app's window, or NULL
-    PFN_xrReadbackCallback      readbackCallback;      // Offscreen readback callback, or NULL
-    void*                       readbackUserdata;      // Passed to readbackCallback
-    void*                       sharedTextureHandle;   // Shared D3D11/D3D12 texture HANDLE, or NULL
+    XrStructureType             type;                          // Must be XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT
+    const void* XR_MAY_ALIAS    next;                          // Pointer to next structure in chain
+    void*                       windowHandle;                  // HWND of the app's window, or NULL
+    PFN_xrReadbackCallback      readbackCallback;              // Offscreen readback callback, or NULL
+    void*                       readbackUserdata;              // Passed to readbackCallback
+    void*                       sharedTextureHandle;           // Shared D3D11/D3D12 texture HANDLE, or NULL
+    XrBool32                    transparentBackgroundEnabled;  // SPEC v4: transparent desktop composition opt-in
+    uint32_t                    chromaKeyColor;                // SPEC v5: optional chroma-key override (0x00BBGGRR), 0 = DP picks
 } XrWin32WindowBindingCreateInfoEXT;
 ```
 
@@ -154,6 +164,8 @@ typedef struct XrWin32WindowBindingCreateInfoEXT {
 | `readbackCallback` | If non-NULL, the runtime delivers composited RGBA pixels via this callback each frame (CPU offscreen mode). |
 | `readbackUserdata` | Opaque pointer passed to `readbackCallback`. |
 | `sharedTextureHandle` | Shared D3D11/D3D12 texture `HANDLE` for zero-copy GPU texture sharing. If non-NULL, the runtime composites into this shared texture instead of rendering to a window. |
+| `transparentBackgroundEnabled` | (SPEC v4) When `XR_TRUE`, the runtime configures the bound HWND for per-pixel desktop transparency: app pixels written with `alpha = 1` appear opaque, `alpha = 0` regions composite through to the desktop. Per graphics API, the runtime picks the correct DXGI/DComp mechanism (apps shouldn't depend on which one). Only honored when `windowHandle` is non-NULL and the session is standalone (ignored in workspace/shell mode). **App-side HWND requirements** apply — see "Transparent-window contract" below. |
+| `chromaKeyColor` | (SPEC v5) Optional 0x00BBGGRR chroma-key override for the runtime's post-weave alpha-conversion pass. Only meaningful when `transparentBackgroundEnabled = XR_TRUE`. **`0` = the runtime's display processor picks its own default** (currently magenta `0x00FF00FF`). Non-zero overrides the default — useful for apps that need a content-safe key (e.g. v1.2.9 Unity plugin used gray to minimize fringing on dark scenes). The app should clear transparent regions of the swapchain to either `RGBA(0,0,0,0)` (preferred — DP fills with the key color internally) or `RGB = chromaKeyColor` with `alpha = 1` (legacy app-pre-fill flow, also supported). |
 
 **Three Modes:**
 
@@ -168,6 +180,32 @@ typedef struct XrWin32WindowBindingCreateInfoEXT {
 **Fallback when absent:**
 
 When this structure is not in the `next` chain, the runtime falls back to its default behavior: creating its own window (`_hosted` mode). Existing OpenXR applications work without modification.
+
+#### Transparent-window contract (`transparentBackgroundEnabled = XR_TRUE`)
+
+When the app opts into transparent backgrounds, **the bound HWND must be created without a DWM redirection surface**, otherwise the runtime's per-pixel alpha (delivered via `DXGI_ALPHA_MODE_PREMULTIPLIED` + `DirectComposition`) composites on top of the redirection surface (default-cleared opaque) instead of the desktop, and `alpha = 0` regions present as opaque black.
+
+The minimum app-side requirements are:
+
+```c
+// 1. NULL background brush — no GDI fill in the redirection surface.
+WNDCLASSEX wc = {};
+wc.hbrBackground = nullptr;
+RegisterClassEx(&wc);
+
+// 2. WS_EX_NOREDIRECTIONBITMAP — disables the redirection surface entirely.
+HWND hwnd = CreateWindowEx(
+    WS_EX_NOREDIRECTIONBITMAP,                     // ← required
+    wc.lpszClassName, title, WS_OVERLAPPEDWINDOW,
+    x, y, w, h,
+    parent, menu, hInstance, lparam);
+```
+
+Apps that already use a separate top-level overlay window for transparency (e.g. the displayxr-unity plugin's `displayxr_get_app_main_view`) just need to ensure that overlay HWND has `WS_EX_NOREDIRECTIONBITMAP` and a null background brush. Apps with a single-HWND design should add both flags to that HWND when transparent backgrounds are requested.
+
+**This is not optional.** The runtime cannot work around a redirection-surface-backed HWND because DWM compositing happens above the runtime's swapchain — the runtime's chroma-key strip writes correct alpha=0 pixels to the swapchain, but DWM blends them with the redirection surface before reaching the screen.
+
+The `_handle` and `_texture` modes both apply (any time `windowHandle` is non-NULL with transparency enabled). The `_offscreen` mode is unaffected — there's no HWND.
 
 ### 3.3 XrCompositionLayerWindowSpaceEXT
 
