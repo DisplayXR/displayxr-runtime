@@ -364,18 +364,7 @@ void RenderScene(
     glCullFace(GL_BACK);
     glFrontFace(GL_CCW);
 
-    {
-        // Transparent-background mode (DISPLAYXR_TRANSPARENT_BG=1): clear to
-        // RGBA(0,0,0,0) so the desktop shows through. Runtime's Leia GL DP
-        // recovers per-pixel alpha after the weaver and routes through DComp.
-        const char *e = getenv("DISPLAYXR_TRANSPARENT_BG");
-        bool transparent_bg = e != nullptr && *e != '\0' && *e != '0';
-        if (transparent_bg) {
-            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-        } else {
-            glClearColor(0.05f, 0.05f, 0.25f, 1.0f);
-        }
-    }
+    glClearColor(0.05f, 0.05f, 0.25f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     // Zoom in eye space: scale only x,y (not z) so perspective division doesn't
