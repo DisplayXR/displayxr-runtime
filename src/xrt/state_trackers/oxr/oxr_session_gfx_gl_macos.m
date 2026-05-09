@@ -64,6 +64,8 @@ oxr_session_populate_gl_macos(struct oxr_logger *log,
 	    NULL,                 // gl_display (not used on macOS)
 	    (sys->xsysc != NULL) ? sys->xsysc->info.dp_factory_gl : NULL,
 	    shared_iosurface,     // IOSurfaceRef for shared texture mode (or NULL for windowed)
+	    /*transparent_background*/ false,  // GL transparent present path is deferred (PR #3b §3b)
+	    /*chroma_key_color*/ 0,
 	    &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
