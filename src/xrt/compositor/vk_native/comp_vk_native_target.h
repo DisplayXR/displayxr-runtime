@@ -31,6 +31,8 @@ extern "C" {
  * @param hwnd The window handle to present to.
  * @param width Preferred width.
  * @param height Preferred height.
+ * @param transparent_background If true, request VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR
+ *        on the swapchain (falls back to INHERIT, then OPAQUE if neither is supported).
  * @param out_target Pointer to receive the created target.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
@@ -42,6 +44,7 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
                               void *hwnd,
                               uint32_t width,
                               uint32_t height,
+                              bool transparent_background,
                               struct comp_vk_native_target **out_target);
 
 /*!

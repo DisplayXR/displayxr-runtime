@@ -71,6 +71,9 @@ struct comp_vk_native_target
 
 	//! Queue family index for present support check.
 	uint32_t queue_family_index;
+
+	//! True if the swapchain was requested with a transparent compositeAlpha.
+	bool transparent_background;
 };
 
 static void
@@ -166,6 +169,29 @@ create_swapchain(struct comp_vk_native_target *target)
 	// Pick present mode: FIFO (VSync) is always available
 	VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
 
+	// Pick compositeAlpha. The DP's chroma-key strip pass writes premultiplied
+	// alpha into the swapchain image, so we want PRE_MULTIPLIED. INHERIT works
+	// on some Win32 WSI drivers where DWM still respects the alpha channel.
+	// Most Win32 ICDs only expose OPAQUE — in that case transparency silently
+	// no-ops at the WSI layer (the strip pass still runs but the alpha is
+	// dropped on present); we log a one-time warning so the failure mode is
+	// visible without spamming per-frame.
+	VkCompositeAlphaFlagBitsKHR composite_alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+	if (target->transparent_background) {
+		if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR) {
+			composite_alpha = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+			U_LOG_I("VK target: transparent_background using PRE_MULTIPLIED");
+		} else if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) {
+			composite_alpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+			U_LOG_I("VK target: transparent_background using INHERIT (PRE_MULTIPLIED unavailable)");
+		} else {
+			U_LOG_W("VK target: transparent_background requested but neither PRE_MULTIPLIED nor "
+			        "INHERIT compositeAlpha is supported (caps=0x%x); falling back to OPAQUE — "
+			        "alpha will be dropped at WSI present",
+			        (unsigned)caps.supportedCompositeAlpha);
+		}
+	}
+
 	VkSwapchainCreateInfoKHR ci = {
 	    .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
 	    .surface = target->surface,
@@ -174,10 +200,11 @@ create_swapchain(struct comp_vk_native_target *target)
 	    .imageColorSpace = color_space,
 	    .imageExtent = extent,
 	    .imageArrayLayers = 1,
-	    .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+	    .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+	                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
 	    .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
 	    .preTransform = caps.currentTransform,
-	    .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+	    .compositeAlpha = composite_alpha,
 	    .presentMode = present_mode,
 	    .clipped = VK_TRUE,
 	    .oldSwapchain = VK_NULL_HANDLE,
@@ -207,6 +234,7 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
                               void *hwnd,
                               uint32_t width,
                               uint32_t height,
+                              bool transparent_background,
                               struct comp_vk_native_target **out_target)
 {
 	struct vk_bundle *vk = comp_vk_native_compositor_get_vk(c);
@@ -222,6 +250,7 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 	target->width = width;
 	target->height = height;
 	target->queue_family_index = queue_family_index;
+	target->transparent_background = transparent_background;
 
 #ifdef XRT_OS_WINDOWS
 	// Create Win32 surface
