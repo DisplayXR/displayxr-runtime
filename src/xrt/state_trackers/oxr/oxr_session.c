@@ -2160,7 +2160,10 @@ oxr_session_create_impl(struct oxr_logger *log,
 			return oxr_session_populate_gl_native(log, sys, ext_window_handle,
 			                                       (void *)opengl_win32->hGLRC,
 			                                       (void *)opengl_win32->hDC,
-			                                       shared_texture_handle, *out_session);
+			                                       shared_texture_handle,
+			                                       xsi->transparent_background_enabled,
+			                                       xsi->chroma_key_color,
+			                                       *out_session);
 		}
 #endif
 		// Fall back to Vulkan-backed GL compositor
