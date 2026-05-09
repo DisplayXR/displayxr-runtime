@@ -104,26 +104,48 @@ App (any graphics API)
    Display
 ```
 
-## PR #3b — Leia OpenGL chroma-key (FULL)
+## PR #3b — Leia OpenGL chroma-key (PARTIAL — DComp present path deferred)
 
-### Status: SHIPPED
+### Status: DP-side chroma-key infra shipped; transparent present deferred
 
-The original handoff doc proposed a stub-only GL implementation, deferring real
-transparency. **The actual PR went FULL** (Option A: `WGL_NV_DX_interop2` +
-DComp present path). Implemented:
+The original handoff doc proposed a stub-only GL implementation. The user
+requested FULL implementation; PR #3b started with that scope (Option A:
+`WGL_NV_DX_interop2` + DComp present path). Mid-implementation testing
+revealed that `D3D11::CopyResource` from a WGL-interop'd transit texture
+into a FLIP_DISCARD + DComp swapchain back buffer doesn't produce visible
+content on the dev hardware (NVIDIA RTX 3080 + Win11) — even when the
+source was a fresh non-interop D3D11 texture cleared via
+`ClearRenderTargetView`. `ClearRenderTargetView` directly on the back
+buffer DID present visibly, so the present/DComp half works; the failure
+point is specifically `CopyResource` into the DComp surface.
 
-- Leia GL DP fill+strip chroma-key around the SR GL weaver (GLSL programs
-  compiled at runtime, fullscreen-triangle, `GL_NEAREST` sampler for the
-  strip's exact-equality test).
-- DComp + `CreateSwapChainForComposition` + per-back-buffer
-  `wglDXRegisterObjectNV` interop bridge in `comp_gl_compositor.cpp` (Windows
-  only). GL renders into per-back-buffer FBOs that wrap D3D11 textures.
-- `comp_gl_compositor.c` was renamed to `.cpp` so `dcomp.h` (C++-only) can be
-  included directly.
-- Graceful fallback to opaque `SwapBuffers` with a one-time warning when
-  `WGL_NV_DX_interop2` is unavailable (Intel iGPUs).
-- `cube_handle_gl_win` patched with `DISPLAYXR_TRANSPARENT_BG=1` opt-in
-  matching the cube_handle_vk_win pattern.
+**Shipped:**
+- Leia GL DP fill+strip chroma-key programs around the SR GL weaver
+  (runtime-compiled GLSL, fullscreen-triangle, `GL_NEAREST` sampler — the
+  strip's RGB exact-equality test must not see linear interpolation).
+  See `src/xrt/drivers/leia/leia_display_processor_gl.cpp`.
+- `comp_gl_compositor.c` renamed to `.cpp` (so future DComp work can include
+  `dcomp.h` without ceremony).
+
+**Reverted (deferred to future work):**
+- DComp + `CreateSwapChainForComposition` + `WGL_NV_DX_interop2` bridge in
+  `comp_gl_compositor.cpp`.
+- `comp_gl_compositor`'s call to `xrt_display_processor_gl_set_chroma_key`
+  (running the GL DP's chroma-key without a DComp present path produces
+  black-where-transparent under WSI alpha-drop, which would be a visible
+  regression).
+- `cube_handle_gl_win` transparent-window patch (would leave the HWND with
+  `WS_EX_NOREDIRECTIONBITMAP` but no DComp surface = invisible window).
+
+**Future work to land GL transparency end-to-end:**
+1. Replace `CopyResource transit -> back` with a fullscreen-quad shader
+   render in D3D11 that samples the transit and writes to the back buffer
+   RTV. ~50 LOC of D3D11 vertex/pixel shader scaffolding.
+2. Or: switch the bridge to D3D12-based texture sharing (the VK->D3D11
+   bridge in PR #3c-part-2 already proves D3D12-style cross-API sharing
+   works cleanly with DComp).
+3. Once a working compositor present path lands, re-add the
+   `set_chroma_key` call + the cube_handle_gl_win patch.
 
 ### Files
 
