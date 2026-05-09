@@ -104,19 +104,26 @@ App (any graphics API)
    Display
 ```
 
-## PR #3b — Leia OpenGL chroma-key STUB
+## PR #3b — Leia OpenGL chroma-key (FULL)
 
-### Scope agreed
+### Status: SHIPPED
 
-**Stub only.** Wire the vtable methods so the GL DP has the same surface as D3D11/D3D12,
-but the fill and strip are TODOs. Document GL transparency as "not yet supported" in
-`docs/specs/XR_EXT_win32_window_binding.md`.
+The original handoff doc proposed a stub-only GL implementation, deferring real
+transparency. **The actual PR went FULL** (Option A: `WGL_NV_DX_interop2` +
+DComp present path). Implemented:
 
-Why stub: WGL doesn't expose `DXGI_ALPHA_MODE_PREMULTIPLIED` directly. Three
-options were considered (`docs/roadmap/transparency-support-followup.md` §3b):
-A. WGL_NV_DX_interop2 (expensive); B. layered window with CPU readback (slow);
-C. defer. Option C is the agreed path for this PR — most apps that want
-transparency are D3D11/D3D12 anyway.
+- Leia GL DP fill+strip chroma-key around the SR GL weaver (GLSL programs
+  compiled at runtime, fullscreen-triangle, `GL_NEAREST` sampler for the
+  strip's exact-equality test).
+- DComp + `CreateSwapChainForComposition` + per-back-buffer
+  `wglDXRegisterObjectNV` interop bridge in `comp_gl_compositor.cpp` (Windows
+  only). GL renders into per-back-buffer FBOs that wrap D3D11 textures.
+- `comp_gl_compositor.c` was renamed to `.cpp` so `dcomp.h` (C++-only) can be
+  included directly.
+- Graceful fallback to opaque `SwapBuffers` with a one-time warning when
+  `WGL_NV_DX_interop2` is unavailable (Intel iGPUs).
+- `cube_handle_gl_win` patched with `DISPLAYXR_TRANSPARENT_BG=1` opt-in
+  matching the cube_handle_vk_win pattern.
 
 ### Files
 

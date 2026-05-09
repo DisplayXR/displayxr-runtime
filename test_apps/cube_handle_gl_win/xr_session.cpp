@@ -208,6 +208,19 @@ bool CreateSession(XrSessionManager& xr, HDC hDC, HGLRC hGLRC, HWND hwnd) {
     XrWin32WindowBindingCreateInfoEXT sessionTarget = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT};
     sessionTarget.windowHandle = hwnd;
 
+    // Optional transparent-background opt-in (DISPLAYXR_TRANSPARENT_BG=1).
+    // The runtime's Leia GL DP runs a chroma-key fill+strip pass after the SR
+    // weaver and presents through DComp+WGL_NV_DX_interop2 so per-pixel alpha
+    // composes against the desktop. chromaKeyColor=0 -> DP picks magenta.
+    {
+        const char *e = getenv("DISPLAYXR_TRANSPARENT_BG");
+        if (e != nullptr && *e != '\0' && *e != '0') {
+            sessionTarget.transparentBackgroundEnabled = XR_TRUE;
+            sessionTarget.chromaKeyColor = 0;
+            LOG_INFO("Transparent background ENABLED (DISPLAYXR_TRANSPARENT_BG=1)");
+        }
+    }
+
     if (xr.hasWin32WindowBindingExt && hwnd) {
         glBinding.next = &sessionTarget;
         LOG_INFO("Using XR_EXT_win32_window_binding with window handle");

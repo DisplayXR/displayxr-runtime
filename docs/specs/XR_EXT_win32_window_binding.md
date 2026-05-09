@@ -207,6 +207,16 @@ Apps that already use a separate top-level overlay window for transparency (e.g.
 
 The `_handle` and `_texture` modes both apply (any time `windowHandle` is non-NULL with transparency enabled). The `_offscreen` mode is unaffected — there's no HWND.
 
+#### Per-graphics-API support matrix
+
+| Graphics API | Mechanism | Status |
+|---|---|---|
+| D3D11 | `CreateSwapChainForComposition` + `DXGI_ALPHA_MODE_PREMULTIPLIED` + `IDCompositionTarget` bound to the app HWND. Leia D3D11 DP runs chroma-key fill+strip around the SR weaver. | Shipping (PR #213). |
+| D3D12 | Same as D3D11, plus the runtime explicitly passes the back-buffer RTV through to the strip pass (D3D12 has no `OMGetRenderTargets`). | Shipping (PR #213, PR #3a). |
+| Vulkan | Swapchain `compositeAlpha` runtime-selects `VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR` → `INHERIT` → `OPAQUE` based on `caps.supportedCompositeAlpha`. Most Win32 ICDs only expose `OPAQUE`, in which case alpha is dropped at the WSI present and a one-time warning is logged (the chroma-key strip still runs but its alpha output is invisible — the SR weaver's RGB on a black background is what reaches the screen). Leia VK DP runs chroma-key fill+strip via SPIR-V shaders compiled offline. | Shipping (PR #3c). |
+| OpenGL | DComp + `CreateSwapChainForComposition` + `WGL_NV_DX_interop2` bridge: GL renders into per-back-buffer interop FBOs that wrap D3D11 textures from a flip-model swapchain bound to the HWND through DComp. Leia GL DP runs chroma-key fill+strip via runtime-compiled GLSL programs. Falls back to opaque `SwapBuffers` on GPUs/drivers without `WGL_NV_DX_interop2` (Intel iGPUs typically don't expose it). | Shipping (PR #3b). |
+| Metal (macOS) | `CAMetalLayer.isOpaque = NO` + `NSWindow` non-opaque. App is responsible for the `NSWindow.opaque` flag. | Shipping (PR #4). |
+
 ### 3.3 XrCompositionLayerWindowSpaceEXT
 
 ```c

@@ -27,13 +27,20 @@ struct xrt_system_compositor_info;
 /*!
  * Create a native OpenGL compositor.
  *
- * @param xdev                  Head device.
- * @param window_handle         Platform window handle (HWND on Windows, NULL to create own).
- * @param gl_context            Platform GL context (HGLRC on Windows, EGLContext on Android, CGLContextObj on macOS).
- * @param gl_display            Platform display (HDC on Windows, EGLDisplay on Android, NULL on macOS).
- * @param dp_factory_gl         Display processor factory (may be NULL).
- * @param shared_texture_handle D3D11 shared texture HANDLE for offscreen mode (Windows only, may be NULL).
- * @param out_xcn               Output native compositor.
+ * @param xdev                   Head device.
+ * @param window_handle          Platform window handle (HWND on Windows, NULL to create own).
+ * @param gl_context             Platform GL context (HGLRC on Windows, EGLContext on Android, CGLContextObj on macOS).
+ * @param gl_display             Platform display (HDC on Windows, EGLDisplay on Android, NULL on macOS).
+ * @param dp_factory_gl          Display processor factory (may be NULL).
+ * @param shared_texture_handle  D3D11 shared texture HANDLE for offscreen mode (Windows only, may be NULL).
+ * @param transparent_background Request transparent desktop composition. On Windows the
+ *                               compositor switches to a DComp + WGL_NV_DX_interop2 present
+ *                               path; falls back to opaque WGL SwapBuffers if the GPU/driver
+ *                               doesn't expose interop.
+ * @param chroma_key_color       0x00BBGGRR. Forwarded to the display processor as the
+ *                               chroma-key color used by the post-weave alpha-recovery pass.
+ *                               Pass 0 to let the DP pick a default (magenta).
+ * @param out_xcn                Output native compositor.
  * @return XRT_SUCCESS or error.
  *
  * @ingroup comp_gl
@@ -45,6 +52,8 @@ comp_gl_compositor_create(struct xrt_device *xdev,
                           void *gl_display,
                           void *dp_factory_gl,
                           void *shared_texture_handle,
+                          bool transparent_background,
+                          uint32_t chroma_key_color,
                           struct xrt_compositor_native **out_xcn);
 
 /*!

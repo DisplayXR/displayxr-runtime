@@ -73,6 +73,8 @@
 #include "ogl/ogl_api.h"
 #include "ogl/wgl_api.h"
 #include <d3d11.h>
+#include <dxgi1_3.h>
+#include <dcomp.h>
 // GUID for ID3D11Texture2D (needed for OpenSharedResource in C)
 static const IID IID_ID3D11Texture2D_local = {
     0x6f15aaf2, 0xd208, 0x4e89,
@@ -313,6 +315,26 @@ struct comp_gl_compositor
 
 	//! Per-frame capture intent. See u_capture_intent.h.
 	struct u_capture_intent capture_intent;
+
+	// --- Transparent-background present (Windows DComp + WGL_NV_DX_interop2) ---
+	bool transparent_background;        //!< Set at create time from XR_EXT_win32_window_binding.
+	uint32_t chroma_key_color;          //!< Forwarded to DP set_chroma_key.
+#ifdef XRT_OS_WINDOWS
+	bool dcomp_active;                  //!< True if the DComp present path is wired up.
+	IDXGISwapChain1 *dcomp_swapchain;
+	IDCompositionDevice *dcomp_device;
+	IDCompositionTarget *dcomp_target;
+	IDCompositionVisual *dcomp_visual;
+	HANDLE dcomp_dx_interop_device;     //!< Per-DComp interop device (separate from shared-texture path).
+	ID3D11Device *dcomp_dx_device;
+	ID3D11DeviceContext *dcomp_dx_context;
+	// Per-back-buffer interop bridge: GL texture + interop handle + GL FBO.
+	GLuint dcomp_gl_textures[2];
+	GLuint dcomp_gl_fbos[2];
+	HANDLE dcomp_interop_objects[2];
+	uint32_t dcomp_present_w;
+	uint32_t dcomp_present_h;
+#endif
 };
 
 static inline struct comp_gl_compositor *
@@ -320,6 +342,232 @@ gl_comp(struct xrt_compositor *xc)
 {
 	return (struct comp_gl_compositor *)xc;
 }
+
+
+/*
+ *
+ * Transparent-background present path (Windows: DComp + WGL_NV_DX_interop2).
+ *
+ * The default WGL SwapBuffers path drops alpha at the DWM redirection bitmap.
+ * To make per-pixel alpha actually compose against the desktop we route the
+ * compositor's output through a DXGI flip-model swapchain (with PRE_MULTIPLIED
+ * alpha) bound to the user's HWND via DirectComposition. GL writes into the
+ * swapchain's back-buffers via WGL_NV_DX_interop2.
+ *
+ * Gated on (transparent_background && hwnd != NULL && !owns_window) — the
+ * runtime-owned HWND from comp_d3d11_window_create currently doesn't set
+ * WS_EX_NOREDIRECTIONBITMAP, so DComp on it would no-op visually.
+ *
+ * Falls back to opaque WGL SwapBuffers with a one-shot warning if any of the
+ * required APIs are unavailable (Intel iGPUs without WGL_NV_DX_interop2,
+ * legacy systems without DComp, etc.).
+ *
+ */
+
+#ifdef XRT_OS_WINDOWS
+
+static void
+gl_destroy_dcomp_present(struct comp_gl_compositor *c)
+{
+	if (!c->dcomp_active) return;
+
+	for (int i = 0; i < 2; i++) {
+		if (c->dcomp_gl_fbos[i] != 0) {
+			glDeleteFramebuffers(1, &c->dcomp_gl_fbos[i]);
+			c->dcomp_gl_fbos[i] = 0;
+		}
+		if (c->dcomp_interop_objects[i] != NULL && c->pfn_wglDXUnregisterObjectNV) {
+			c->pfn_wglDXUnregisterObjectNV(c->dcomp_dx_interop_device,
+			                                 c->dcomp_interop_objects[i]);
+			c->dcomp_interop_objects[i] = NULL;
+		}
+		if (c->dcomp_gl_textures[i] != 0) {
+			glDeleteTextures(1, &c->dcomp_gl_textures[i]);
+			c->dcomp_gl_textures[i] = 0;
+		}
+	}
+
+	if (c->dcomp_dx_interop_device != NULL && c->pfn_wglDXCloseDeviceNV) {
+		c->pfn_wglDXCloseDeviceNV(c->dcomp_dx_interop_device);
+		c->dcomp_dx_interop_device = NULL;
+	}
+	if (c->dcomp_visual)    { c->dcomp_visual->Release();    c->dcomp_visual = NULL; }
+	if (c->dcomp_target)    { c->dcomp_target->Release();    c->dcomp_target = NULL; }
+	if (c->dcomp_device)    { c->dcomp_device->Release();    c->dcomp_device = NULL; }
+	if (c->dcomp_swapchain) { c->dcomp_swapchain->Release(); c->dcomp_swapchain = NULL; }
+	if (c->dcomp_dx_context){ c->dcomp_dx_context->Release(); c->dcomp_dx_context = NULL; }
+	if (c->dcomp_dx_device) { c->dcomp_dx_device->Release(); c->dcomp_dx_device = NULL; }
+	c->dcomp_active = false;
+}
+
+// Acquire D3D11 back-buffer i, register it with WGL, create a GL FBO around
+// the resulting GL texture. Caller releases the ID3D11Texture2D once done.
+static bool
+gl_dcomp_register_back_buffer(struct comp_gl_compositor *c, uint32_t i)
+{
+	ID3D11Texture2D *bb = NULL;
+	HRESULT hr = c->dcomp_swapchain->GetBuffer(
+	    i, __uuidof(ID3D11Texture2D), (void **)&bb);
+	if (FAILED(hr) || bb == NULL) {
+		U_LOG_E("DComp present: GetBuffer(%u) failed: 0x%08x", i, hr);
+		return false;
+	}
+
+	GLuint gl_tex = 0;
+	glGenTextures(1, &gl_tex);
+
+	HANDLE iop = c->pfn_wglDXRegisterObjectNV(
+	    c->dcomp_dx_interop_device, bb,
+	    gl_tex, GL_TEXTURE_2D, WGL_ACCESS_READ_WRITE_NV);
+	if (iop == NULL) {
+		U_LOG_E("DComp present: wglDXRegisterObjectNV(%u) failed: %lu", i, GetLastError());
+		glDeleteTextures(1, &gl_tex);
+		bb->Release();
+		return false;
+	}
+	// We can release bb now — WGL holds its own reference for the lifetime
+	// of the registered object.
+	bb->Release();
+
+	GLuint fbo = 0;
+	glGenFramebuffers(1, &fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+	// We must Lock the interop object before attaching its GL texture to
+	// an FBO, since some drivers reject the framebuffer-completeness check
+	// while the texture is unmapped. Lock briefly, attach, then unlock.
+	c->pfn_wglDXLockObjectsNV(c->dcomp_dx_interop_device, 1, &iop);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+	                        GL_TEXTURE_2D, gl_tex, 0);
+	GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	c->pfn_wglDXUnlockObjectsNV(c->dcomp_dx_interop_device, 1, &iop);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	if (st != GL_FRAMEBUFFER_COMPLETE) {
+		U_LOG_E("DComp present: GL FBO %u not complete: 0x%x", i, (unsigned)st);
+		glDeleteFramebuffers(1, &fbo);
+		c->pfn_wglDXUnregisterObjectNV(c->dcomp_dx_interop_device, iop);
+		glDeleteTextures(1, &gl_tex);
+		return false;
+	}
+
+	c->dcomp_gl_textures[i] = gl_tex;
+	c->dcomp_interop_objects[i] = iop;
+	c->dcomp_gl_fbos[i] = fbo;
+	return true;
+}
+
+// Initialize DComp+WGL_NV_DX_interop2 present path. Returns false on failure;
+// caller falls back to opaque SwapBuffers.
+static bool
+gl_setup_dcomp_present(struct comp_gl_compositor *c, HWND hwnd, uint32_t w, uint32_t h)
+{
+	// Load wgl entry points if not already loaded by the shared-texture path.
+	if (c->pfn_wglDXOpenDeviceNV == NULL) {
+		c->pfn_wglDXOpenDeviceNV = (PFN_wglDXOpenDeviceNV)wglGetProcAddress("wglDXOpenDeviceNV");
+		c->pfn_wglDXCloseDeviceNV = (PFN_wglDXCloseDeviceNV)wglGetProcAddress("wglDXCloseDeviceNV");
+		c->pfn_wglDXRegisterObjectNV = (PFN_wglDXRegisterObjectNV)wglGetProcAddress("wglDXRegisterObjectNV");
+		c->pfn_wglDXUnregisterObjectNV = (PFN_wglDXUnregisterObjectNV)wglGetProcAddress("wglDXUnregisterObjectNV");
+		c->pfn_wglDXLockObjectsNV = (PFN_wglDXLockObjectsNV)wglGetProcAddress("wglDXLockObjectsNV");
+		c->pfn_wglDXUnlockObjectsNV = (PFN_wglDXUnlockObjectsNV)wglGetProcAddress("wglDXUnlockObjectsNV");
+	}
+	if (!c->pfn_wglDXOpenDeviceNV || !c->pfn_wglDXRegisterObjectNV ||
+	    !c->pfn_wglDXLockObjectsNV || !c->pfn_wglDXUnlockObjectsNV) {
+		U_LOG_W("Transparent GL: WGL_NV_DX_interop2 unavailable on this GPU/driver — "
+		        "falling back to opaque SwapBuffers (try NVIDIA or AMD)");
+		return false;
+	}
+
+	HRESULT hr = D3D11CreateDevice(
+	    NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+	    D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0, D3D11_SDK_VERSION,
+	    &c->dcomp_dx_device, NULL, &c->dcomp_dx_context);
+	if (FAILED(hr) || c->dcomp_dx_device == NULL) {
+		U_LOG_W("Transparent GL: D3D11CreateDevice failed: 0x%08x — falling back to opaque", hr);
+		return false;
+	}
+
+	IDXGIFactory2 *factory = NULL;
+	hr = CreateDXGIFactory2(0, __uuidof(IDXGIFactory2), (void **)&factory);
+	if (FAILED(hr) || factory == NULL) {
+		U_LOG_W("Transparent GL: CreateDXGIFactory2 failed: 0x%08x", hr);
+		c->dcomp_dx_context->Release(); c->dcomp_dx_context = NULL;
+		c->dcomp_dx_device->Release();  c->dcomp_dx_device = NULL;
+		return false;
+	}
+
+	DXGI_SWAP_CHAIN_DESC1 desc = {};
+	desc.Width = w;
+	desc.Height = h;
+	desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	desc.SampleDesc.Count = 1;
+	desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+	desc.BufferCount = 2;
+	desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+	desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+
+	IDXGISwapChain1 *sc1 = NULL;
+	hr = factory->CreateSwapChainForComposition(c->dcomp_dx_device, &desc, NULL, &sc1);
+	factory->Release();
+	if (FAILED(hr) || sc1 == NULL) {
+		U_LOG_W("Transparent GL: CreateSwapChainForComposition failed: 0x%08x", hr);
+		c->dcomp_dx_context->Release(); c->dcomp_dx_context = NULL;
+		c->dcomp_dx_device->Release();  c->dcomp_dx_device = NULL;
+		return false;
+	}
+	c->dcomp_swapchain = sc1;
+
+	hr = DCompositionCreateDevice2(
+	    NULL, __uuidof(IDCompositionDevice), (void **)&c->dcomp_device);
+	if (FAILED(hr) || c->dcomp_device == NULL) {
+		U_LOG_W("Transparent GL: DCompositionCreateDevice2 failed: 0x%08x", hr);
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+
+	hr = c->dcomp_device->CreateTargetForHwnd(hwnd, /*topmost*/ TRUE, &c->dcomp_target);
+	if (FAILED(hr) || c->dcomp_target == NULL) {
+		U_LOG_W("Transparent GL: CreateTargetForHwnd failed: 0x%08x", hr);
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+
+	hr = c->dcomp_device->CreateVisual(&c->dcomp_visual);
+	if (FAILED(hr) || c->dcomp_visual == NULL) {
+		U_LOG_W("Transparent GL: CreateVisual failed: 0x%08x", hr);
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+
+	if (FAILED(c->dcomp_visual->SetContent(c->dcomp_swapchain)) ||
+	    FAILED(c->dcomp_target->SetRoot(c->dcomp_visual)) ||
+	    FAILED(c->dcomp_device->Commit())) {
+		U_LOG_W("Transparent GL: DComp visual setup failed");
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+
+	c->dcomp_dx_interop_device = c->pfn_wglDXOpenDeviceNV(c->dcomp_dx_device);
+	if (c->dcomp_dx_interop_device == NULL) {
+		U_LOG_W("Transparent GL: wglDXOpenDeviceNV failed: %lu", GetLastError());
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+
+	for (uint32_t i = 0; i < 2; i++) {
+		if (!gl_dcomp_register_back_buffer(c, i)) {
+			gl_destroy_dcomp_present(c);
+			return false;
+		}
+	}
+
+	c->dcomp_present_w = w;
+	c->dcomp_present_h = h;
+	c->dcomp_active = true;
+	U_LOG_W("Transparent GL: DComp + WGL_NV_DX_interop2 present path active (%ux%u, bc=2)",
+	        w, h);
+	return true;
+}
+
+#endif // XRT_OS_WINDOWS
 
 
 /*
@@ -759,8 +1007,8 @@ gl_compositor_render_hud(struct comp_gl_compositor *c, float dt, uint32_t win_w,
 	}
 	if (!have_eyes) {
 		eye_pos.count = 2;
-		eye_pos.eyes[0] = (struct xrt_eye_position){-0.032f, nom_y / 1000.0f, nom_z / 1000.0f};
-		eye_pos.eyes[1] = (struct xrt_eye_position){ 0.032f, nom_y / 1000.0f, nom_z / 1000.0f};
+		eye_pos.eyes[0] = xrt_eye_position{-0.032f, nom_y / 1000.0f, nom_z / 1000.0f};
+		eye_pos.eyes[1] = xrt_eye_position{ 0.032f, nom_y / 1000.0f, nom_z / 1000.0f};
 	}
 
 	// Fill HUD data
@@ -1001,8 +1249,8 @@ gl_compositor_capture_atlas_to_png(struct comp_gl_compositor *c, const char *pat
 
 	size_t row_pitch = (size_t)content_w * 4;
 	size_t bytes = row_pitch * content_h;
-	uint8_t *bottom_up = malloc(bytes);
-	uint8_t *top_down = malloc(bytes);
+	uint8_t *bottom_up = (uint8_t *)malloc(bytes);
+	uint8_t *top_down = (uint8_t *)malloc(bytes);
 	if (bottom_up == NULL || top_down == NULL) {
 		free(bottom_up);
 		free(top_down);
@@ -1408,8 +1656,8 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			if (ch > c->atlas_tex_height) ch = c->atlas_tex_height;
 			size_t row_pitch = (size_t)cw * 4;
 			size_t bytes = row_pitch * ch;
-			uint8_t *bu = malloc(bytes);
-			uint8_t *td = malloc(bytes);
+			uint8_t *bu = (uint8_t *)malloc(bytes);
+			uint8_t *td = (uint8_t *)malloc(bytes);
 			if (bu != NULL && td != NULL) {
 				glReadBuffer(GL_COLOR_ATTACHMENT0);
 				GLint sy = (GLint)c->atlas_tex_height - (GLint)ch;
@@ -1528,8 +1776,6 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 #endif
 	{
 		// Normal window mode: present to screen
-		glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
 		// Use actual window backing dimensions
 		uint32_t present_w = c->tile_columns * c->view_width;
 		uint32_t present_h = c->tile_rows * c->view_height;
@@ -1548,6 +1794,47 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 #elif defined(__APPLE__)
 		comp_gl_window_macos_get_dimensions(c->macos_window, &present_w, &present_h);
 #endif
+
+		// Bind the present target. Default WGL path: FBO 0 (default
+		// framebuffer). Transparent path: per-back-buffer DComp interop FBO,
+		// locked for write before render and unlocked + presented after.
+#ifdef XRT_OS_WINDOWS
+		uint32_t dcomp_idx = 0;
+		if (c->dcomp_active) {
+			// Resize check — current GL compositor doesn't dynamically
+			// resize, so dimension changes are deferred (TODO).
+			if (present_w != c->dcomp_present_w || present_h != c->dcomp_present_h) {
+				static bool warned_resize = false;
+				if (!warned_resize) {
+					U_LOG_W("Transparent GL: window resized %ux%u -> %ux%u, "
+					        "DComp present path doesn't yet support resize "
+					        "(present staying at %ux%u)",
+					        c->dcomp_present_w, c->dcomp_present_h,
+					        present_w, present_h,
+					        c->dcomp_present_w, c->dcomp_present_h);
+					warned_resize = true;
+				}
+				present_w = c->dcomp_present_w;
+				present_h = c->dcomp_present_h;
+			}
+
+			IDXGISwapChain3 *sc3 = NULL;
+			HRESULT hr = c->dcomp_swapchain->QueryInterface(
+			    __uuidof(IDXGISwapChain3), (void **)&sc3);
+			if (SUCCEEDED(hr) && sc3 != NULL) {
+				dcomp_idx = sc3->GetCurrentBackBufferIndex();
+				sc3->Release();
+			}
+			if (dcomp_idx >= 2) dcomp_idx = 0;
+
+			c->pfn_wglDXLockObjectsNV(c->dcomp_dx_interop_device, 1,
+			                           &c->dcomp_interop_objects[dcomp_idx]);
+			glBindFramebuffer(GL_FRAMEBUFFER, c->dcomp_gl_fbos[dcomp_idx]);
+		} else
+#endif
+		{
+			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		}
 
 		if (c->display_processor != NULL) {
 			// Crop atlas to content dims, then pass to DP
@@ -1581,9 +1868,22 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 		// Platform-specific swap
 #ifdef XRT_OS_WINDOWS
-		SwapBuffers(c->hdc);
-		if (c->owns_window && c->own_window != NULL) {
-			comp_d3d11_window_signal_paint_done(c->own_window);
+		if (c->dcomp_active) {
+			glFlush();
+			c->pfn_wglDXUnlockObjectsNV(c->dcomp_dx_interop_device, 1,
+			                             &c->dcomp_interop_objects[dcomp_idx]);
+			HRESULT hr = c->dcomp_swapchain->Present(/*SyncInterval*/ 1, /*Flags*/ 0);
+			if (FAILED(hr)) {
+				U_LOG_W("Transparent GL: swapchain Present failed: 0x%08x", hr);
+			}
+			c->dcomp_device->Commit();
+			// Restore default FBO so other code paths see what they expect.
+			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		} else {
+			SwapBuffers(c->hdc);
+			if (c->owns_window && c->own_window != NULL) {
+				comp_d3d11_window_signal_paint_done(c->own_window);
+			}
 		}
 #elif defined(XRT_OS_ANDROID)
 		// eglSwapBuffers(c->egl_display, c->egl_surface);
@@ -1683,6 +1983,9 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	if (c->atlas_texture) glDeleteTextures(1, &c->atlas_texture);
 
 #ifdef XRT_OS_WINDOWS
+	// Tear down DComp present path (no-op if !dcomp_active).
+	gl_destroy_dcomp_present(c);
+
 	// Clean up D3D11 interop resources
 	if (c->has_shared_texture) {
 		if (c->dx_interop_object && c->pfn_wglDXUnregisterObjectNV) {
@@ -1695,13 +1998,13 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 			c->pfn_wglDXCloseDeviceNV(c->dx_interop_device);
 		}
 		if (c->dx_shared_texture) {
-			c->dx_shared_texture->lpVtbl->Release(c->dx_shared_texture);
+			c->dx_shared_texture->Release();
 		}
 		if (c->dx_context) {
-			c->dx_context->lpVtbl->Release(c->dx_context);
+			c->dx_context->Release();
 		}
 		if (c->dx_device) {
-			c->dx_device->lpVtbl->Release(c->dx_device);
+			c->dx_device->Release();
 		}
 	}
 
@@ -1986,7 +2289,11 @@ comp_gl_compositor_set_output_rect(struct xrt_compositor *xc,
                                     uint32_t w, uint32_t h)
 {
 	struct comp_gl_compositor *c = gl_comp(xc);
-	c->canvas = (struct u_canvas_rect){.valid = true, .x = x, .y = y, .w = w, .h = h};
+	c->canvas.valid = true;
+	c->canvas.x = x;
+	c->canvas.y = y;
+	c->canvas.w = w;
+	c->canvas.h = h;
 }
 
 bool
@@ -2151,10 +2458,14 @@ comp_gl_compositor_create(struct xrt_device *xdev,
                           void *gl_display,
                           void *dp_factory_gl,
                           void *shared_texture_handle,
+                          bool transparent_background,
+                          uint32_t chroma_key_color,
                           struct xrt_compositor_native **out_xcn)
 {
 	struct comp_gl_compositor *c = U_TYPED_CALLOC(struct comp_gl_compositor);
 	c->xdev = xdev;
+	c->transparent_background = transparent_background;
+	c->chroma_key_color = chroma_key_color;
 
 	mcp_capture_init(&c->mcp_capture);
 	mcp_capture_install(&c->mcp_capture);
@@ -2213,20 +2524,20 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		}
 
 		// Open the shared D3D11 texture
-		hr = c->dx_device->lpVtbl->OpenSharedResource(
-		    c->dx_device, (HANDLE)shared_texture_handle,
-		    &IID_ID3D11Texture2D_local, (void **)&c->dx_shared_texture);
+		hr = c->dx_device->OpenSharedResource(
+		    (HANDLE)shared_texture_handle,
+		    __uuidof(ID3D11Texture2D), (void **)&c->dx_shared_texture);
 		if (FAILED(hr)) {
 			U_LOG_E("Failed to open shared D3D11 texture: 0x%08x", hr);
-			c->dx_context->lpVtbl->Release(c->dx_context);
-			c->dx_device->lpVtbl->Release(c->dx_device);
+			c->dx_context->Release();
+			c->dx_device->Release();
 			free(c);
 			return XRT_ERROR_OPENGL;
 		}
 
 		// Get shared texture dimensions
 		D3D11_TEXTURE2D_DESC desc;
-		c->dx_shared_texture->lpVtbl->GetDesc(c->dx_shared_texture, &desc);
+		c->dx_shared_texture->GetDesc(&desc);
 		c->shared_width = desc.Width;
 		c->shared_height = desc.Height;
 
@@ -2234,9 +2545,9 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		c->dx_interop_device = c->pfn_wglDXOpenDeviceNV(c->dx_device);
 		if (!c->dx_interop_device) {
 			U_LOG_E("wglDXOpenDeviceNV failed: %lu", GetLastError());
-			c->dx_shared_texture->lpVtbl->Release(c->dx_shared_texture);
-			c->dx_context->lpVtbl->Release(c->dx_context);
-			c->dx_device->lpVtbl->Release(c->dx_device);
+			c->dx_shared_texture->Release();
+			c->dx_context->Release();
+			c->dx_device->Release();
 			free(c);
 			return XRT_ERROR_OPENGL;
 		}
@@ -2250,9 +2561,9 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 			U_LOG_E("wglDXRegisterObjectNV failed: %lu", GetLastError());
 			glDeleteTextures(1, &c->shared_gl_texture);
 			c->pfn_wglDXCloseDeviceNV(c->dx_interop_device);
-			c->dx_shared_texture->lpVtbl->Release(c->dx_shared_texture);
-			c->dx_context->lpVtbl->Release(c->dx_context);
-			c->dx_device->lpVtbl->Release(c->dx_device);
+			c->dx_shared_texture->Release();
+			c->dx_context->Release();
+			c->dx_device->Release();
 			free(c);
 			return XRT_ERROR_OPENGL;
 		}
@@ -2343,6 +2654,37 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 			c->display_processor = NULL;
 		}
 	}
+
+	// Forward transparent_background + chroma_key_color to the GL DP. Safe
+	// no-op if the DP doesn't implement set_chroma_key or display_processor
+	// is NULL.
+	if (c->display_processor != NULL) {
+		xrt_display_processor_gl_set_chroma_key(c->display_processor,
+		                                         c->chroma_key_color,
+		                                         c->transparent_background);
+	}
+
+#ifdef XRT_OS_WINDOWS
+	// Transparent-background present path. Only meaningful with an app-provided
+	// HWND that was created with WS_EX_NOREDIRECTIONBITMAP — the runtime-owned
+	// window from comp_d3d11_window_create doesn't satisfy that requirement
+	// (TODO: add comp_d3d11_window_create_transparent for owns_window+transparent).
+	if (transparent_background && c->hwnd != NULL && !c->owns_window &&
+	    !c->has_shared_texture) {
+		uint32_t init_w = width;
+		uint32_t init_h = height;
+		RECT rc;
+		if (GetClientRect(c->hwnd, &rc)) {
+			uint32_t ww = (uint32_t)(rc.right - rc.left);
+			uint32_t wh = (uint32_t)(rc.bottom - rc.top);
+			if (ww > 0 && wh > 0) { init_w = ww; init_h = wh; }
+		}
+		if (!gl_setup_dcomp_present(c, c->hwnd, init_w, init_h)) {
+			// Falls back to opaque SwapBuffers; warning already logged.
+			c->dcomp_active = false;
+		}
+	}
+#endif
 
 	// Initialize GL resources (atlas worst-case sized, crop before DP per-frame)
 	if (!gl_init_resources(c, width, height)) {
