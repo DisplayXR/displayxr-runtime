@@ -14,9 +14,15 @@ if((WIN32 OR APPLE) AND XRT_HAVE_VULKAN)
 		comp_vk_native_renderer.h
 		comp_vk_native_swapchain.c
 		comp_vk_native_swapchain.h
-		comp_vk_native_target.c
+		comp_vk_native_target.cpp
 		comp_vk_native_target.h
 		)
+
+	if(WIN32)
+		# DComp + WGL_NV_DX_interop2 dependencies for the VK->D3D11 transparent
+		# present bridge. dcomp.h is C++-only, hence the .cpp rename above.
+		target_link_libraries(comp_vk_native PRIVATE d3d11 dxgi dcomp)
+	endif()
 
 	target_link_libraries(
 		comp_vk_native

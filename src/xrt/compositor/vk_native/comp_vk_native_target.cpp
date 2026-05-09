@@ -19,11 +19,19 @@
 #ifdef XRT_OS_WINDOWS
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan_win32.h>
+// Transparent-background present path: VK -> D3D11 KMT shared textures ->
+// DComp + CreateSwapChainForComposition flip-model swapchain -> HWND.
+#include <d3d11.h>
+#include <d3d11_1.h>
+#include <dxgi1_3.h>
+#include <dcomp.h>
 #endif
 
 #ifdef XRT_OS_MACOS
 #include <vulkan/vulkan_metal.h>
 #endif
+
+#define DCOMP_RING 2 // Number of shared back-buffers in the bridge ring
 
 #define MAX_TARGET_IMAGES 4
 
@@ -74,6 +82,28 @@ struct comp_vk_native_target
 
 	//! True if the swapchain was requested with a transparent compositeAlpha.
 	bool transparent_background;
+
+#ifdef XRT_OS_WINDOWS
+	// VK -> D3D11 -> DComp transparent present bridge. Active when
+	// transparent_background is set AND the bridge initialized successfully.
+	// In this mode @ref swapchain stays VK_NULL_HANDLE — VK doesn't go through
+	// WSI at all. The compositor renders into @ref dcomp_vk_image[i]; present
+	// dispatches to the bridge, which copies to a flip-model DXGI swapchain
+	// back buffer that DComp targets the HWND.
+	bool dcomp_active;
+	ID3D11Device *dcomp_dx_device;
+	ID3D11DeviceContext *dcomp_dx_context;
+	IDXGISwapChain1 *dcomp_swapchain;
+	IDCompositionDevice *dcomp_dcomp_device;
+	IDCompositionTarget *dcomp_dcomp_target;
+	IDCompositionVisual *dcomp_dcomp_visual;
+	ID3D11Texture2D *dcomp_shared_dx[DCOMP_RING];
+	IDXGIKeyedMutex *dcomp_shared_mutex[DCOMP_RING];
+	VkImage dcomp_vk_image[DCOMP_RING];
+	VkImageView dcomp_vk_view[DCOMP_RING];
+	VkDeviceMemory dcomp_vk_memory[DCOMP_RING];
+	uint32_t dcomp_ring_idx;
+#endif
 };
 
 static void
@@ -229,6 +259,383 @@ create_swapchain(struct comp_vk_native_target *target)
 	return create_swapchain_views(target);
 }
 
+#ifdef XRT_OS_WINDOWS
+
+/*
+ *
+ * VK -> D3D11 -> DComp transparent present bridge.
+ *
+ * Win32 Vulkan WSI doesn't expose any path to alpha-correct desktop
+ * composition (most ICDs only advertise OPAQUE compositeAlpha). To get real
+ * desktop see-through under VK we side-step WSI entirely:
+ *   1. Create a D3D11 device (anyone — DXGI factory + DComp don't care which
+ *      adapter the VK GPU is on, we'll Copy across them via the system bus).
+ *   2. For each ring slot create an ID3D11Texture2D with KMT_BIT shared NT
+ *      handle + KEYEDMUTEX. Open the KMT handle in VK via
+ *      VK_KHR_external_memory_win32 (which the runtime already requires).
+ *   3. Create a flip-model DXGI swapchain via CreateSwapChainForComposition
+ *      with PRE_MULTIPLIED alpha. Bind to the HWND through DComp visual+target.
+ *   4. Each frame: VK renders into ring[i]'s VkImage. After vkQueueWaitIdle,
+ *      D3D11 IDXGIKeyedMutex::AcquireSync(0,0) flushes the writer caches
+ *      (per memory feedback_acquiresync_load_bearing.md), CopyResource into
+ *      the swapchain back buffer, ReleaseSync, swapchain->Present(1, 0),
+ *      dcomp_device->Commit().
+ *
+ * Ring index is bumped by acquire(); compositor renders into the slot
+ * returned by get_current_image(); present() copies that slot.
+ *
+ */
+
+static void
+dcomp_destroy(struct comp_vk_native_target *target)
+{
+	if (target == NULL) return;
+	struct vk_bundle *vk = target->vk;
+
+	for (uint32_t i = 0; i < DCOMP_RING; i++) {
+		if (target->dcomp_vk_view[i] != VK_NULL_HANDLE) {
+			vk->vkDestroyImageView(vk->device, target->dcomp_vk_view[i], NULL);
+			target->dcomp_vk_view[i] = VK_NULL_HANDLE;
+		}
+		if (target->dcomp_vk_image[i] != VK_NULL_HANDLE) {
+			vk->vkDestroyImage(vk->device, target->dcomp_vk_image[i], NULL);
+			target->dcomp_vk_image[i] = VK_NULL_HANDLE;
+		}
+		if (target->dcomp_vk_memory[i] != VK_NULL_HANDLE) {
+			vk->vkFreeMemory(vk->device, target->dcomp_vk_memory[i], NULL);
+			target->dcomp_vk_memory[i] = VK_NULL_HANDLE;
+		}
+		if (target->dcomp_shared_mutex[i]) {
+			target->dcomp_shared_mutex[i]->Release();
+			target->dcomp_shared_mutex[i] = NULL;
+		}
+		if (target->dcomp_shared_dx[i]) {
+			target->dcomp_shared_dx[i]->Release();
+			target->dcomp_shared_dx[i] = NULL;
+		}
+	}
+	if (target->dcomp_dcomp_visual) { target->dcomp_dcomp_visual->Release(); target->dcomp_dcomp_visual = NULL; }
+	if (target->dcomp_dcomp_target) { target->dcomp_dcomp_target->Release(); target->dcomp_dcomp_target = NULL; }
+	if (target->dcomp_dcomp_device) { target->dcomp_dcomp_device->Release(); target->dcomp_dcomp_device = NULL; }
+	if (target->dcomp_swapchain)    { target->dcomp_swapchain->Release();    target->dcomp_swapchain = NULL; }
+	if (target->dcomp_dx_context)   { target->dcomp_dx_context->Release();   target->dcomp_dx_context = NULL; }
+	if (target->dcomp_dx_device)    { target->dcomp_dx_device->Release();    target->dcomp_dx_device = NULL; }
+	target->dcomp_active = false;
+}
+
+// Import a single D3D11 KMT-shared texture as a VkImage in the ring.
+static bool
+dcomp_import_one(struct comp_vk_native_target *target,
+                 uint32_t i,
+                 ID3D11Texture2D *dx_tex,
+                 HANDLE shared_kmt,
+                 uint32_t w,
+                 uint32_t h,
+                 VkFormat vk_format)
+{
+	struct vk_bundle *vk = target->vk;
+
+	VkExternalMemoryImageCreateInfo external_ci = {
+	    .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+	    .pNext = NULL,
+	    .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT,
+	};
+
+	VkImageCreateInfo image_ci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+	    .pNext = &external_ci,
+	    .flags = 0,
+	    .imageType = VK_IMAGE_TYPE_2D,
+	    .format = vk_format,
+	    .extent = {w, h, 1},
+	    .mipLevels = 1,
+	    .arrayLayers = 1,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .tiling = VK_IMAGE_TILING_OPTIMAL,
+	    .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+	             VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+	             VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+	             VK_IMAGE_USAGE_SAMPLED_BIT,
+	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+
+	VkResult res = vk->vkCreateImage(vk->device, &image_ci, NULL, &target->dcomp_vk_image[i]);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("DComp bridge: vkCreateImage failed for ring[%u]: %d", i, res);
+		return false;
+	}
+
+	VkMemoryRequirements requirements = {};
+	vk->vkGetImageMemoryRequirements(vk->device, target->dcomp_vk_image[i], &requirements);
+
+	VkImportMemoryWin32HandleInfoKHR import_info = {
+	    .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
+	    .pNext = NULL,
+	    .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT,
+	    .handle = shared_kmt,
+	};
+	VkMemoryDedicatedAllocateInfoKHR dedicated_info = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO_KHR,
+	    .pNext = &import_info,
+	    .image = target->dcomp_vk_image[i],
+	    .buffer = VK_NULL_HANDLE,
+	};
+
+	VkPhysicalDeviceMemoryProperties mem_props = {};
+	vk->vkGetPhysicalDeviceMemoryProperties(vk->physical_device, &mem_props);
+	uint32_t memory_type_index = UINT32_MAX;
+	for (uint32_t k = 0; k < mem_props.memoryTypeCount; k++) {
+		if ((requirements.memoryTypeBits & (1u << k)) != 0) {
+			memory_type_index = k;
+			break;
+		}
+	}
+	if (memory_type_index == UINT32_MAX) {
+		U_LOG_E("DComp bridge: no compatible memory type for ring[%u]", i);
+		return false;
+	}
+
+	VkMemoryAllocateInfo alloc_info = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .pNext = &dedicated_info,
+	    .allocationSize = requirements.size,
+	    .memoryTypeIndex = memory_type_index,
+	};
+	res = vk->vkAllocateMemory(vk->device, &alloc_info, NULL, &target->dcomp_vk_memory[i]);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("DComp bridge: vkAllocateMemory failed for ring[%u]: %d", i, res);
+		return false;
+	}
+
+	res = vk->vkBindImageMemory(vk->device, target->dcomp_vk_image[i],
+	                            target->dcomp_vk_memory[i], 0);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("DComp bridge: vkBindImageMemory failed for ring[%u]: %d", i, res);
+		return false;
+	}
+
+	VkImageViewCreateInfo view_ci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+	    .image = target->dcomp_vk_image[i],
+	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+	    .format = vk_format,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	res = vk->vkCreateImageView(vk->device, &view_ci, NULL, &target->dcomp_vk_view[i]);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("DComp bridge: vkCreateImageView failed for ring[%u]: %d", i, res);
+		return false;
+	}
+
+	// Cache the IDXGIKeyedMutex for the cross-API sync.
+	HRESULT hr = dx_tex->QueryInterface(__uuidof(IDXGIKeyedMutex),
+	                                     (void **)&target->dcomp_shared_mutex[i]);
+	if (FAILED(hr) || target->dcomp_shared_mutex[i] == NULL) {
+		U_LOG_E("DComp bridge: QueryInterface(IDXGIKeyedMutex) failed for ring[%u]: 0x%08x", i, hr);
+		return false;
+	}
+
+	return true;
+}
+
+// Initialize the DComp bridge: D3D11 device, swapchain, DComp visual+target,
+// and the ring of KMT-shared textures imported as VkImages. Returns false
+// (with a U_LOG_W) if any prerequisite is missing — caller falls back to
+// opaque WSI.
+static bool
+dcomp_setup(struct comp_vk_native_target *target, HWND hwnd, uint32_t w, uint32_t h)
+{
+	struct vk_bundle *vk = target->vk;
+
+	HRESULT hr = D3D11CreateDevice(
+	    NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+	    D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0, D3D11_SDK_VERSION,
+	    &target->dcomp_dx_device, NULL, &target->dcomp_dx_context);
+	if (FAILED(hr) || target->dcomp_dx_device == NULL) {
+		U_LOG_W("DComp bridge: D3D11CreateDevice failed: 0x%08x — falling back to opaque WSI", hr);
+		return false;
+	}
+
+	// Create flip-model swapchain via DXGI factory bound to the D3D11 device.
+	IDXGIDevice *dxgi_device = NULL;
+	hr = target->dcomp_dx_device->QueryInterface(__uuidof(IDXGIDevice), (void **)&dxgi_device);
+	if (FAILED(hr) || dxgi_device == NULL) {
+		U_LOG_W("DComp bridge: QueryInterface(IDXGIDevice) failed: 0x%08x", hr);
+		return false;
+	}
+	IDXGIAdapter *dxgi_adapter = NULL;
+	dxgi_device->GetAdapter(&dxgi_adapter);
+	dxgi_device->Release();
+	if (dxgi_adapter == NULL) {
+		U_LOG_W("DComp bridge: GetAdapter failed");
+		return false;
+	}
+	IDXGIFactory2 *dxgi_factory = NULL;
+	hr = dxgi_adapter->GetParent(__uuidof(IDXGIFactory2), (void **)&dxgi_factory);
+	dxgi_adapter->Release();
+	if (FAILED(hr) || dxgi_factory == NULL) {
+		U_LOG_W("DComp bridge: GetParent(IDXGIFactory2) failed: 0x%08x", hr);
+		return false;
+	}
+
+	DXGI_SWAP_CHAIN_DESC1 desc = {};
+	desc.Width = w;
+	desc.Height = h;
+	desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+	desc.SampleDesc.Count = 1;
+	desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+	desc.BufferCount = DCOMP_RING;
+	desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+	desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+
+	hr = dxgi_factory->CreateSwapChainForComposition(target->dcomp_dx_device, &desc, NULL,
+	                                                  &target->dcomp_swapchain);
+	dxgi_factory->Release();
+	if (FAILED(hr) || target->dcomp_swapchain == NULL) {
+		U_LOG_W("DComp bridge: CreateSwapChainForComposition failed: 0x%08x", hr);
+		return false;
+	}
+
+	hr = DCompositionCreateDevice2(NULL, __uuidof(IDCompositionDevice),
+	                                (void **)&target->dcomp_dcomp_device);
+	if (FAILED(hr) || target->dcomp_dcomp_device == NULL) {
+		U_LOG_W("DComp bridge: DCompositionCreateDevice2 failed: 0x%08x", hr);
+		return false;
+	}
+	hr = target->dcomp_dcomp_device->CreateTargetForHwnd(hwnd, /*topmost*/ TRUE,
+	                                                      &target->dcomp_dcomp_target);
+	if (FAILED(hr) || target->dcomp_dcomp_target == NULL) {
+		U_LOG_W("DComp bridge: CreateTargetForHwnd failed: 0x%08x", hr);
+		return false;
+	}
+	hr = target->dcomp_dcomp_device->CreateVisual(&target->dcomp_dcomp_visual);
+	if (FAILED(hr) || target->dcomp_dcomp_visual == NULL) {
+		U_LOG_W("DComp bridge: CreateVisual failed: 0x%08x", hr);
+		return false;
+	}
+	if (FAILED(target->dcomp_dcomp_visual->SetContent(target->dcomp_swapchain)) ||
+	    FAILED(target->dcomp_dcomp_target->SetRoot(target->dcomp_dcomp_visual)) ||
+	    FAILED(target->dcomp_dcomp_device->Commit())) {
+		U_LOG_W("DComp bridge: visual setup failed");
+		return false;
+	}
+
+	// Create the ring of KMT-shared D3D11 textures and import each as a VkImage.
+	for (uint32_t i = 0; i < DCOMP_RING; i++) {
+		D3D11_TEXTURE2D_DESC tdesc = {};
+		tdesc.Width = w;
+		tdesc.Height = h;
+		tdesc.MipLevels = 1;
+		tdesc.ArraySize = 1;
+		tdesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+		tdesc.SampleDesc.Count = 1;
+		tdesc.Usage = D3D11_USAGE_DEFAULT;
+		tdesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+		// Use the legacy KMT path (NOT NTHANDLE) so we can call
+		// IDXGIResource::GetSharedHandle and import on the VK side via
+		// VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT — matching
+		// the existing import_shared_d3d11_texture pattern. NTHANDLE
+		// would require IDXGIResource1::CreateSharedHandle (returns
+		// E_INVALIDARG from the legacy GetSharedHandle path).
+		// SHARED_KEYEDMUTEX implies legacy SHARED — they're mutually
+		// exclusive at the D3D11 API surface (combining with NTHANDLE is
+		// also possible but requires CreateSharedHandle).
+		tdesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+
+		hr = target->dcomp_dx_device->CreateTexture2D(&tdesc, NULL, &target->dcomp_shared_dx[i]);
+		if (FAILED(hr)) {
+			U_LOG_W("DComp bridge: CreateTexture2D[%u] failed: 0x%08x", i, hr);
+			return false;
+		}
+
+		// Get the KMT-style legacy shared HANDLE for VK import.
+		IDXGIResource *dxgi_res = NULL;
+		hr = target->dcomp_shared_dx[i]->QueryInterface(__uuidof(IDXGIResource),
+		                                                 (void **)&dxgi_res);
+		if (FAILED(hr) || dxgi_res == NULL) {
+			U_LOG_W("DComp bridge: QueryInterface(IDXGIResource)[%u] failed: 0x%08x", i, hr);
+			return false;
+		}
+		HANDLE shared_kmt = NULL;
+		hr = dxgi_res->GetSharedHandle(&shared_kmt);
+		dxgi_res->Release();
+		if (FAILED(hr) || shared_kmt == NULL) {
+			U_LOG_W("DComp bridge: GetSharedHandle[%u] failed: 0x%08x", i, hr);
+			return false;
+		}
+
+		if (!dcomp_import_one(target, i, target->dcomp_shared_dx[i], shared_kmt,
+		                       w, h, VK_FORMAT_B8G8R8A8_UNORM)) {
+			return false;
+		}
+	}
+
+	// Match the public target fields so the rest of the compositor sees the
+	// imported VkImages as if they were swapchain images.
+	target->image_count = DCOMP_RING;
+	for (uint32_t i = 0; i < DCOMP_RING; i++) {
+		target->images[i] = target->dcomp_vk_image[i];
+		target->views[i] = target->dcomp_vk_view[i];
+	}
+	target->format = VK_FORMAT_B8G8R8A8_UNORM;
+	target->width = w;
+	target->height = h;
+	target->dcomp_ring_idx = 0;
+	target->current_index = 0;
+	target->dcomp_active = true;
+
+	U_LOG_W("DComp bridge active: %ux%u, %u-deep ring, KMT shared, "
+	        "PRE_MULTIPLIED + DComp -> HWND",
+	        w, h, (unsigned)DCOMP_RING);
+	return true;
+}
+
+// Submit the just-rendered ring slot to DComp: D3D11 acquires sync on the
+// shared texture (which flushes VK writer caches per
+// feedback_acquiresync_load_bearing.md), CopyResource into the next swapchain
+// back buffer, releases sync, Present, Commit.
+static xrt_result_t
+dcomp_present(struct comp_vk_native_target *target)
+{
+	uint32_t idx = target->current_index;
+	if (idx >= DCOMP_RING || target->dcomp_shared_mutex[idx] == NULL) {
+		U_LOG_E("DComp bridge: present called with invalid ring index %u", idx);
+		return XRT_ERROR_VULKAN;
+	}
+
+	// Acquire (key=0) — also flushes VK writer caches into the shared resource.
+	HRESULT hr = target->dcomp_shared_mutex[idx]->AcquireSync(0, INFINITE);
+	if (FAILED(hr)) {
+		U_LOG_E("DComp bridge: AcquireSync[%u] failed: 0x%08x", idx, hr);
+		return XRT_ERROR_VULKAN;
+	}
+
+	ID3D11Texture2D *back = NULL;
+	hr = target->dcomp_swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&back);
+	if (FAILED(hr) || back == NULL) {
+		U_LOG_E("DComp bridge: GetBuffer failed: 0x%08x", hr);
+		target->dcomp_shared_mutex[idx]->ReleaseSync(0);
+		return XRT_ERROR_VULKAN;
+	}
+
+	target->dcomp_dx_context->CopyResource(back, target->dcomp_shared_dx[idx]);
+	back->Release();
+
+	target->dcomp_shared_mutex[idx]->ReleaseSync(0);
+
+	hr = target->dcomp_swapchain->Present(/*SyncInterval*/ 1, /*Flags*/ 0);
+	if (FAILED(hr)) {
+		U_LOG_E("DComp bridge: Present failed: 0x%08x", hr);
+		return XRT_ERROR_VULKAN;
+	}
+	target->dcomp_dcomp_device->Commit();
+	return XRT_SUCCESS;
+}
+
+#endif // XRT_OS_WINDOWS
+
+
 xrt_result_t
 comp_vk_native_target_create(struct comp_vk_native_compositor *c,
                               void *hwnd,
@@ -253,6 +660,18 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 	target->transparent_background = transparent_background;
 
 #ifdef XRT_OS_WINDOWS
+	// Transparent-background path: VK -> D3D11 KMT shared -> DComp bridge,
+	// no WSI swapchain at all. Falls back to opaque WSI on failure.
+	if (transparent_background && hwnd != NULL) {
+		if (dcomp_setup(target, (HWND)hwnd, width, height)) {
+			*out_target = target;
+			return XRT_SUCCESS;
+		}
+		// Setup failed: tear down anything dcomp_setup partially created and
+		// fall through to the standard WSI path below (will end up OPAQUE).
+		dcomp_destroy(target);
+	}
+
 	// Create Win32 surface
 	// Note: vkCreateWin32SurfaceKHR is an instance-level function loaded
 	// into vk_bundle by vk_get_instance_functions(). Access via vk->vkCreateWin32SurfaceKHR.
@@ -386,6 +805,16 @@ comp_vk_native_target_destroy(struct comp_vk_native_target **target_ptr)
 
 	vk->vkDeviceWaitIdle(vk->device);
 
+#ifdef XRT_OS_WINDOWS
+	if (target->dcomp_active) {
+		dcomp_destroy(target);
+		// dcomp_active path doesn't allocate semaphores / surface / swapchain.
+		free(target);
+		*target_ptr = NULL;
+		return;
+	}
+#endif
+
 	destroy_swapchain_views(target);
 
 	if (target->swapchain != VK_NULL_HANDLE) {
@@ -409,6 +838,19 @@ xrt_result_t
 comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *out_index)
 {
 	struct vk_bundle *vk = target->vk;
+
+#ifdef XRT_OS_WINDOWS
+	if (target->dcomp_active) {
+		// Round-robin through the bridge ring. No WSI to acquire from.
+		// vkQueueWaitIdle in the compositor's render path covers the GPU
+		// fence; D3D11's IDXGIKeyedMutex::AcquireSync in dcomp_present
+		// flushes the writer caches before D3D11 reads the shared resource.
+		target->dcomp_ring_idx = (target->dcomp_ring_idx + 1) % DCOMP_RING;
+		target->current_index = target->dcomp_ring_idx;
+		*out_index = target->current_index;
+		return XRT_SUCCESS;
+	}
+#endif
 
 	// Use the semaphore for acquire, then do a dummy submit that waits on it
 	// to ensure the image is actually available before the compositor renders.
@@ -468,6 +910,12 @@ xrt_result_t
 comp_vk_native_target_present(struct comp_vk_native_target *target)
 {
 	struct vk_bundle *vk = target->vk;
+
+#ifdef XRT_OS_WINDOWS
+	if (target->dcomp_active) {
+		return dcomp_present(target);
+	}
+#endif
 
 	// No semaphore wait needed — the compositor calls vkQueueWaitIdle
 	// after all rendering commands before presenting.
