@@ -210,8 +210,12 @@ XrFovf ComputeKooimaFov(
     float screenWidthM, float screenHeightM);
 
 // End frame and submit layers (projection layer only)
-// viewCount defaults to 2 (stereo); pass 1 for mono submission in 2D mode
-bool EndFrame(XrSessionManager& xr, XrTime displayTime, const XrCompositionLayerProjectionView* views, uint32_t viewCount = 2);
+// viewCount defaults to 2 (stereo); pass 1 for mono submission in 2D mode.
+// projectionLayerFlags is OR-ed onto XrCompositionLayerProjection::layerFlags
+// (e.g. XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT for transparent
+// backgrounds).
+bool EndFrame(XrSessionManager& xr, XrTime displayTime, const XrCompositionLayerProjectionView* views,
+              uint32_t viewCount = 2, XrCompositionLayerFlags projectionLayerFlags = 0);
 
 // Create a HUD swapchain for window-space layer submission
 bool CreateHudSwapchain(XrSessionManager& xr, uint32_t width, uint32_t height);
@@ -235,7 +239,8 @@ bool EndFrameWithWindowSpaceHud(
     float hudDisparity,
     uint32_t viewCount = 2,
     int32_t srcX = 0, int32_t srcY = 0,
-    int32_t srcW = -1, int32_t srcH = -1
+    int32_t srcW = -1, int32_t srcH = -1,
+    XrCompositionLayerFlags projectionLayerFlags = 0
 );
 
 // [Commented out — will be reused for 3D-positioned HUD later]

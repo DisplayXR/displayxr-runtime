@@ -2281,7 +2281,8 @@ oxr_session_create_impl(struct oxr_logger *log,
 			}
 			return oxr_session_populate_vk_native(
 			    log, sys, vulkan, window_handle, shared_texture_handle,
-			    xsi->transparent_background_enabled, *out_session);
+			    xsi->transparent_background_enabled,
+			    xsi->chroma_key_color, *out_session);
 		}
 #endif
 

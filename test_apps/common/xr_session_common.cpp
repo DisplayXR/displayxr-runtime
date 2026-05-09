@@ -501,9 +501,11 @@ bool ReleaseSwapchainImage(XrSessionManager& xr) {
     return XR_SUCCEEDED(xrReleaseSwapchainImage(xr.swapchain.swapchain, &releaseInfo));
 }
 
-bool EndFrame(XrSessionManager& xr, XrTime displayTime, const XrCompositionLayerProjectionView* views, uint32_t viewCount) {
+bool EndFrame(XrSessionManager& xr, XrTime displayTime, const XrCompositionLayerProjectionView* views,
+              uint32_t viewCount, XrCompositionLayerFlags projectionLayerFlags) {
     XrCompositionLayerProjection projectionLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     projectionLayer.space = xr.localSpace;
+    projectionLayer.layerFlags = projectionLayerFlags;
     projectionLayer.viewCount = viewCount;
     projectionLayer.views = views;
 
@@ -607,10 +609,12 @@ bool EndFrameWithWindowSpaceHud(
     float hudDisparity,
     uint32_t viewCount,
     int32_t srcX, int32_t srcY,
-    int32_t srcW, int32_t srcH
+    int32_t srcW, int32_t srcH,
+    XrCompositionLayerFlags projectionLayerFlags
 ) {
     XrCompositionLayerProjection projectionLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     projectionLayer.space = xr.localSpace;
+    projectionLayer.layerFlags = projectionLayerFlags;
     projectionLayer.viewCount = viewCount;
     projectionLayer.views = projViews;
 

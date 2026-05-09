@@ -73,6 +73,18 @@ if(XRT_HAVE_LEIA_SR)
 		list(APPEND LEIA_SOURCES
 			leia/leia_sr.cpp leia/leia_sr.h
 			leia/leia_display_processor.cpp leia/leia_display_processor.h)
+
+		# Compile chroma-key shaders to SPIR-V headers (transparency support)
+		spirv_shaders(
+			LEIA_SHADER_HEADERS
+			SPIRV_VERSION
+			1.0
+			SOURCES
+			leia/shaders/fullscreen_tri.vert
+			leia/shaders/ck_fill.frag
+			leia/shaders/ck_strip.frag
+		)
+		list(APPEND LEIA_SOURCES ${LEIA_SHADER_HEADERS})
 		set(LEIA_SR_VULKAN_AVAILABLE TRUE)
 	else()
 		message(STATUS "SimulatedRealityVulkanBeta.lib not found - Vulkan weaver disabled")
@@ -140,6 +152,9 @@ if(XRT_HAVE_LEIA_SR)
 			target_link_libraries(drv_leia PRIVATE
 				${SR_PATH}/lib/SimulatedRealityVulkanBeta.lib)
 			target_compile_definitions(drv_leia PUBLIC XRT_HAVE_LEIA_SR_VULKAN)
+
+			# Generated SPIR-V chroma-key headers live in the build tree.
+			target_include_directories(drv_leia PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 			# Install the bundled VK weaver runtime DLL alongside the runtime
 			# binaries. Single source of truth for every VK app: the runtime

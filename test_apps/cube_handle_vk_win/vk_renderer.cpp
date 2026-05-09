@@ -1202,9 +1202,21 @@ void RenderScene(
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(renderer.commandBuffer, &beginInfo);
 
-    // Single render pass with CLEAR covering full framebuffer
+    // Single render pass with CLEAR covering full framebuffer.
+    // Transparent-background mode (DISPLAYXR_TRANSPARENT_BG=1): clear to
+    // RGBA(0,0,0,0) so the desktop shows through everywhere the cube isn't
+    // drawn. The runtime's Leia VK DP recovers per-pixel alpha after the
+    // weaver via chroma-key strip.
+    // (No lambda here — this function uses __try/__except, which forbids C++
+    // object unwinding; getenv() each frame is a cheap CRT call.)
+    const char *_dxbg = getenv("DISPLAYXR_TRANSPARENT_BG");
+    const bool transparent_bg = _dxbg != nullptr && *_dxbg != '\0' && *_dxbg != '0';
     VkClearValue clearValues[2] = {};
-    clearValues[0].color = {{0.05f, 0.05f, 0.25f, 1.0f}};
+    if (transparent_bg) {
+        clearValues[0].color = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    } else {
+        clearValues[0].color = {{0.05f, 0.05f, 0.25f, 1.0f}};
+    }
     clearValues[1].depthStencil = {1.0f, 0};
 
     VkRenderPassBeginInfo rpBegin = {};

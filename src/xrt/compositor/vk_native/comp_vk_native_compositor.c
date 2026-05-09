@@ -2526,6 +2526,8 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
                                  uint32_t queue_index,
                                  void *dp_factory_vk,
                                  void *shared_texture_handle,
+                                 bool transparent_background,
+                                 uint32_t chroma_key_color,
                                  struct xrt_compositor_native **out_xc)
 {
 	if (vk_device == NULL) {
@@ -2736,6 +2738,14 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		U_LOG_W("No VK display processor factory provided");
 	}
 
+	// Forward transparent_background + chroma_key_color to the display processor.
+	// The DP owns the chroma-key trick (compositor stays vendor-agnostic).
+	// Safe no-op if the DP doesn't implement set_chroma_key or display_processor is NULL.
+	if (c->display_processor != NULL) {
+		xrt_display_processor_set_chroma_key(
+		    c->display_processor, chroma_key_color, transparent_background);
+	}
+
 	// Create output target (VkSwapchainKHR) for presentation.
 	// The compositor owns the swapchain — the weaver (display processor)
 	// records interlacing commands into a caller-provided command buffer +
@@ -2757,6 +2767,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		xrt_result_t xret = comp_vk_native_target_create(c, target_hwnd,
 		                                                  c->settings.preferred.width,
 		                                                  c->settings.preferred.height,
+		                                                  transparent_background,
 		                                                  &c->target);
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to create VK target");

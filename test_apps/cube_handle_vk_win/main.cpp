@@ -50,6 +50,19 @@ static std::mutex g_inputMutex;
 static std::atomic<bool> g_running{true};
 static XrSessionManager* g_xr = nullptr;
 
+// Set DISPLAYXR_TRANSPARENT_BG=1 in the environment to opt into transparent
+// desktop composition: the HWND is created with WS_EX_NOREDIRECTIONBITMAP +
+// null background brush, the cube clears RGBA(0,0,0,0), and the win32 window
+// binding asks the runtime to chroma-key the woven output back to alpha.
+// Pairs with PR #3c (Leia VK chroma-key DP).
+static bool TransparentBackgroundEnabled() {
+    static const bool e = []() {
+        const char *v = getenv("DISPLAYXR_TRANSPARENT_BG");
+        return v != nullptr && *v != '\0' && *v != '0';
+    }();
+    return e;
+}
+
 // Vulkan handles needed for the 'I'-key atlas readback (single-writer in
 // main() before the render thread launches; render thread only reads).
 static VkPhysicalDevice                            g_vkPhysDevice = VK_NULL_HANDLE;
@@ -158,13 +171,19 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     LOG_INFO("Creating application window (%dx%d)", width, height);
 
+    const bool transparent = TransparentBackgroundEnabled();
+
     WNDCLASSEX wc = {};
     wc.cbSize = sizeof(WNDCLASSEX);
     wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    // For transparent backgrounds the HWND must NOT have a redirection bitmap
+    // and must NOT have a background brush — DComp's per-pixel alpha-out
+    // composes through to the desktop only when both are absent. See
+    // docs/specs/XR_EXT_win32_window_binding.md "Transparent-window contract".
+    wc.hbrBackground = transparent ? nullptr : (HBRUSH)GetStockObject(BLACK_BRUSH);
     wc.lpszClassName = WINDOW_CLASS;
 
     if (!RegisterClassEx(&wc)) {
@@ -178,7 +197,8 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     RECT rect = { 0, 0, width, height };
     AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
 
-    HWND hwnd = CreateWindowEx(0, WINDOW_CLASS, WINDOW_TITLE, WS_OVERLAPPEDWINDOW,
+    DWORD exStyle = transparent ? WS_EX_NOREDIRECTIONBITMAP : 0;
+    HWND hwnd = CreateWindowEx(exStyle, WINDOW_CLASS, WINDOW_TITLE, WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         rect.right - rect.left, rect.bottom - rect.top,
         nullptr, nullptr, hInstance, nullptr);
@@ -737,6 +757,13 @@ static void RenderThreadFunc(
 
                 // viewCount: 1 for mono (2D mode), 2 for stereo (3D mode)
                 uint32_t submitViewCount = (xr->renderingModeCount > 0 && inputSnapshot.currentRenderingMode < xr->renderingModeCount) ? xr->renderingModeViewCounts[inputSnapshot.currentRenderingMode] : 2;
+                // When transparent_bg is on, ask the runtime to honor the cube's
+                // per-pixel alpha when blending the projection layer. Pre-#213
+                // apps default to 0 (no source-alpha blend = treat as opaque).
+                XrCompositionLayerFlags projLayerFlags = TransparentBackgroundEnabled()
+                    ? XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
+                    : 0;
+
                 if (rendered && hudSubmitted) {
                     LOG_INFO("[FRAME] EndFrameWithWindowSpaceHud (rendered+hud)...");
                     float hudAR = (float)hudWidth / (float)hudHeight;
@@ -745,11 +772,13 @@ static void RenderThreadFunc(
                     float fracH = fracW * windowAR / hudAR;
                     if (fracH > 1.0f) { fracH = 1.0f; fracW = hudAR / windowAR; }
                     EndFrameWithWindowSpaceHud(*xr, frameState.predictedDisplayTime, projectionViews.data(),
-                        0.0f, 0.0f, fracW, fracH, 0.0f, submitViewCount);
+                        0.0f, 0.0f, fracW, fracH, 0.0f, submitViewCount,
+                        0, 0, -1, -1, projLayerFlags);
                     LOG_INFO("[FRAME] EndFrameWithWindowSpaceHud done");
                 } else if (rendered) {
                     LOG_INFO("[FRAME] EndFrame (rendered, no hud)...");
-                    EndFrame(*xr, frameState.predictedDisplayTime, projectionViews.data(), submitViewCount);
+                    EndFrame(*xr, frameState.predictedDisplayTime, projectionViews.data(),
+                             submitViewCount, projLayerFlags);
                     LOG_INFO("[FRAME] EndFrame done");
                 } else {
                     LOG_INFO("[FRAME] EndFrame (empty frame, rendered=%d shouldRender=%d)...",

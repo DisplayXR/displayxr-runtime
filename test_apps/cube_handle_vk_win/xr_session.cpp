@@ -403,6 +403,19 @@ bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice
     XrWin32WindowBindingCreateInfoEXT sessionTarget = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT};
     sessionTarget.windowHandle = hwnd;
 
+    // Optional transparent-background opt-in (DISPLAYXR_TRANSPARENT_BG=1).
+    // The runtime's Leia VK DP runs a chroma-key fill+strip pass that recovers
+    // alpha after the SR weaver — so RGBA(0,0,0,0) clears in the cube show
+    // through to the desktop. chromaKeyColor=0 means "DP picks default magenta".
+    {
+        const char *e = getenv("DISPLAYXR_TRANSPARENT_BG");
+        if (e != nullptr && *e != '\0' && *e != '0') {
+            sessionTarget.transparentBackgroundEnabled = XR_TRUE;
+            sessionTarget.chromaKeyColor = 0; // DP default
+            LOG_INFO("Transparent background ENABLED (DISPLAYXR_TRANSPARENT_BG=1)");
+        }
+    }
+
     if (xr.hasWin32WindowBindingExt && hwnd) {
         vkBinding.next = &sessionTarget;
         LOG_INFO("Using XR_EXT_win32_window_binding with window handle");
