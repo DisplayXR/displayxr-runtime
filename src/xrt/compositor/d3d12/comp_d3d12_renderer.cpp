@@ -211,6 +211,67 @@ compile_shader(const char *source, const char *entry, const char *target, ID3DBl
 }
 
 
+// Dump DRED auto-breadcrumbs + page-fault info to the log. Useful when the
+// D3D12 device gets removed and we need to know which GPU command was
+// executing at the time.
+//
+// DRED itself must be enabled BEFORE device creation; we don't own that step
+// (Unity / the app creates the device). Enable it via either:
+//
+//   - Per-process: ID3D12DeviceRemovedExtendedDataSettings::
+//                  SetAutoBreadcrumbsEnablement(FORCED_ON) before the first
+//                  D3D12CreateDevice call in the process.
+//   - Per-app:     HKLM\SOFTWARE\Microsoft\Direct3D\AppCompat\<exe>.exe with
+//                  REG_DWORD AutoBreadcrumbsEnablement=1 and PageFaultEnablement=1.
+//   - Globally:    Windows Development Build / DirectX Control Panel.
+//
+// When DRED isn't enabled, QueryInterface returns DXGI_ERROR_NOT_FOUND and we
+// log that fact (so users know how to turn it on) but don't error.
+static void
+log_dred_state(ID3D12Device *device, const char *context)
+{
+	if (device == nullptr) return;
+	ID3D12DeviceRemovedExtendedData *dred = nullptr;
+	HRESULT qr = device->QueryInterface(__uuidof(ID3D12DeviceRemovedExtendedData), (void**)&dred);
+	if (FAILED(qr) || dred == nullptr) {
+		U_LOG_E("%s: DRED not available (qr=0x%08x). Enable via HKLM\\SOFTWARE"
+		        "\\Microsoft\\Direct3D\\AppCompat\\<exe>\\AutoBreadcrumbsEnablement=1.",
+		        context, (unsigned)qr);
+		return;
+	}
+
+	D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT crumbs = {};
+	HRESULT cb = dred->GetAutoBreadcrumbsOutput(&crumbs);
+	if (SUCCEEDED(cb)) {
+		const D3D12_AUTO_BREADCRUMB_NODE *node = crumbs.pHeadAutoBreadcrumbNode;
+		int nidx = 0;
+		while (node != nullptr && nidx < 20) {
+			UINT last = node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0;
+			U_LOG_E("%s: DRED node[%d] count=%u last_completed=%u",
+			        context, nidx, node->BreadcrumbCount, last);
+			UINT start = (last > 16) ? last - 16 : 0;
+			UINT end = (last + 4 < node->BreadcrumbCount) ? last + 4 : node->BreadcrumbCount;
+			for (UINT i = start; i < end; i++) {
+				const char *marker = (i == last) ? " <-- KILLED HERE" : "";
+				U_LOG_E("%s:   op[%u] = %u%s",
+				        context, i, (unsigned)node->pCommandHistory[i], marker);
+			}
+			node = node->pNext;
+			nidx++;
+		}
+	} else {
+		U_LOG_E("%s: DRED GetAutoBreadcrumbsOutput failed: 0x%08x", context, (unsigned)cb);
+	}
+
+	D3D12_DRED_PAGE_FAULT_OUTPUT pf = {};
+	HRESULT pr = dred->GetPageFaultAllocationOutput(&pf);
+	if (SUCCEEDED(pr) && pf.PageFaultVA != 0) {
+		U_LOG_E("%s: DRED page fault VA=0x%llx", context, (unsigned long long)pf.PageFaultVA);
+	}
+
+	dred->Release();
+}
+
 static xrt_result_t
 create_atlas_texture(struct comp_d3d12_renderer *r, ID3D12Device *device, uint32_t width, uint32_t height)
 {
@@ -236,6 +297,11 @@ create_atlas_texture(struct comp_d3d12_renderer *r, ID3D12Device *device, uint32
 	    __uuidof(ID3D12Resource), reinterpret_cast<void **>(&r->atlas_texture));
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create atlas texture: 0x%08x", hr);
+		if (hr == DXGI_ERROR_DEVICE_REMOVED) {
+			HRESULT dr_hr = device->GetDeviceRemovedReason();
+			U_LOG_E("  GetDeviceRemovedReason: 0x%08x", (unsigned)dr_hr);
+			log_dred_state(device, "create_atlas_texture");
+		}
 		return XRT_ERROR_D3D;
 	}
 
