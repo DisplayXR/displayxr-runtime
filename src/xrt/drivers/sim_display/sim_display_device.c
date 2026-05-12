@@ -653,8 +653,15 @@ sim_display_hmd_create(void)
 	hmd->base.inputs[0].name = XRT_INPUT_GENERIC_HEAD_POSE;
 
 	// Manual display setup (replaces u_device_setup_split_side_by_side which only handles 2 views)
+	// Advertise both OPAQUE (default) and ALPHA_BLEND so apps that want
+	// per-pixel transparency (sim_display is alpha-native end-to-end on
+	// Metal/D3D11/D3D12/GL via the cocoa_window_binding/win32_window_binding
+	// transparentBackgroundEnabled bit) can opt-in via
+	// xrEndFrame's environmentBlendMode. OPAQUE stays first so it's the
+	// default for apps that don't pick.
 	hmd->base.hmd->blend_modes[0] = XRT_BLEND_MODE_OPAQUE;
-	hmd->base.hmd->blend_mode_count = 1;
+	hmd->base.hmd->blend_modes[1] = XRT_BLEND_MODE_ALPHA_BLEND;
+	hmd->base.hmd->blend_mode_count = 2;
 	hmd->base.hmd->distortion.models = XRT_DISTORTION_MODEL_NONE;
 	hmd->base.hmd->distortion.preferred = XRT_DISTORTION_MODEL_NONE;
 	hmd->base.hmd->screens[0].w_pixels = pixel_w;

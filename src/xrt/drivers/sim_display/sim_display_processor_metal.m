@@ -102,7 +102,7 @@ static NSString *const shader_source = @
     "                             (in.texCoord.y + row1) * tp.tile_rows_inv);\n"
     "    float4 left  = tex.sample(smp, left_uv);\n"
     "    float4 right = tex.sample(smp, right_uv);\n"
-    "    return float4(left.r, right.g, right.b, 1.0);\n"
+    "    return float4(left.r, right.g, right.b, max(left.a, right.a));\n"
     "}\n"
     "\n"
     "// Blend: 50/50 mix\n"
