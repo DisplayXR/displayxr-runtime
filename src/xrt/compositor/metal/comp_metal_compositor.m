@@ -163,6 +163,11 @@ struct comp_metal_compositor
 	//! True if running in offscreen mode (hidden window, no visible UI).
 	bool offscreen;
 
+	//! True if XR_EXT_cocoa_window_binding requested transparent background.
+	//! Drives atlas clear color (alpha=0 vs alpha=1) so per-pixel alpha from
+	//! projection layers reaches the CAMetalLayer + desktop composite.
+	bool transparent_background;
+
 	//! True if swapchain content comes from GL (needs Y-flip on sample).
 	bool source_is_gl;
 
@@ -455,16 +460,21 @@ compile_shaders(struct comp_metal_compositor *c)
 	}
 
 	// Projection pipeline (renders into atlas texture)
+	//
+	// Blending DISABLED — projection layer pixels are written straight to the
+	// atlas (including the source alpha channel). Mirrors D3D11 `blend_opaque`
+	// in comp_d3d11_renderer.cpp. Source-alpha blending here destroys Unity's
+	// alpha=0 in transparent regions (atlas dst.a=0 + src.a=0 with
+	// out.a = src.a*1 + dst.a*(1-src.a) collapses to 0/0, RGB to the dark
+	// atlas clear) so transparent-background mode never reaches the
+	// CAMetalLayer with alpha < 1. Disabling blending lets Unity's swapchain
+	// alpha pass through end-to-end (Phase 1 transparent overlay, #85).
 	{
 		MTLRenderPipelineDescriptor *proj_desc = [[MTLRenderPipelineDescriptor alloc] init];
 		proj_desc.vertexFunction = proj_vs;
 		proj_desc.fragmentFunction = proj_fs;
 		proj_desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-		proj_desc.colorAttachments[0].blendingEnabled = YES;
-		proj_desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
-		proj_desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-		proj_desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-		proj_desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+		proj_desc.colorAttachments[0].blendingEnabled = NO;
 		proj_desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 
 		c->projection_pipeline = [c->device newRenderPipelineStateWithDescriptor:proj_desc error:&error];
@@ -1575,7 +1585,13 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		pass.colorAttachments[0].texture = c->atlas_texture;
 		pass.colorAttachments[0].loadAction = MTLLoadActionClear;
 		pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-		pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+		// Clear to (0,0,0,0) when the app requested transparent background so
+		// projection-layer alpha=0 regions propagate through sim_display
+		// alpha-native to the CAMetalLayer (isOpaque=NO) → desktop composite.
+		// Otherwise clear to opaque black.
+		pass.colorAttachments[0].clearColor = c->transparent_background
+		    ? MTLClearColorMake(0.0, 0.0, 0.0, 0.0)
+		    : MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
 		pass.depthAttachment.texture = c->depth_texture;
 		pass.depthAttachment.loadAction = MTLLoadActionClear;
 		pass.depthAttachment.storeAction = MTLStoreActionDontCare;
@@ -2260,6 +2276,7 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	}
 	c->display_refresh_rate = 60.0f;
 	c->offscreen = offscreen;
+	c->transparent_background = transparent_background;
 
 	// Get display dimensions from device.
 	// screens[0] holds the logical (point) size — used for NSWindow creation.
