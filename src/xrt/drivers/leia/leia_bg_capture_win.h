@@ -86,6 +86,22 @@ long leia_bg_capture_open_fence_d3d12(struct leia_bg_capture *c,
                                       struct ID3D12Fence **out_fence);
 
 /*!
+ * Expose the shared NT handle of the staging texture so the caller can
+ * import it into Vulkan via @c VK_KHR_external_memory_win32 (handle type
+ * @c VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT). The handle is owned
+ * by the capture module; do NOT @c CloseHandle on it.
+ */
+HANDLE leia_bg_capture_get_shared_handle(struct leia_bg_capture *c);
+
+/*!
+ * Monitor dimensions used to size the staging texture (BGRA8). Use these
+ * for the imported VkImage extent.
+ */
+void leia_bg_capture_get_size(struct leia_bg_capture *c,
+                              uint32_t *out_width,
+                              uint32_t *out_height);
+
+/*!
  * Per-frame: pull the latest WGC frame into the shared staging tex, return
  * window-on-monitor region as normalized UVs and the fence value the caller
  * must Wait on before sampling.

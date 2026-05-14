@@ -424,6 +424,24 @@ leia_bg_capture_open_fence_d3d12(struct leia_bg_capture *c, ID3D12Device *dev, I
 	return dev->OpenSharedHandle(c->shared_fence_handle, IID_PPV_ARGS(out_fence));
 }
 
+extern "C" HANDLE
+leia_bg_capture_get_shared_handle(struct leia_bg_capture *c)
+{
+	return c != nullptr ? c->staging_shared_handle : nullptr;
+}
+
+extern "C" void
+leia_bg_capture_get_size(struct leia_bg_capture *c, uint32_t *out_w, uint32_t *out_h)
+{
+	if (c == nullptr) {
+		if (out_w) *out_w = 0;
+		if (out_h) *out_h = 0;
+		return;
+	}
+	if (out_w) *out_w = c->monitor_w;
+	if (out_h) *out_h = c->monitor_h;
+}
+
 extern "C" bool
 leia_bg_capture_poll(struct leia_bg_capture *c,
                      float out_bg_uv_origin[2],
