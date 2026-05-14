@@ -878,9 +878,20 @@ void RenderScene(
     // Set render targets
     cmdList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
 
-    // Clear only on first eye (clear==true)
+    // Clear only on first eye (clear==true). Transparent mode
+    // (DISPLAYXR_TRANSPARENT_BG=1): clear RGBA(0,0,0,0) so the Leia DP's
+    // compose-under-bg pass shows the desktop wherever the cube didn't draw.
     if (clear) {
-        float clearColor[4] = {0.05f, 0.05f, 0.25f, 1.0f};
+        const char *dxbg = getenv("DISPLAYXR_TRANSPARENT_BG");
+        const bool transparent_bg = dxbg != nullptr && *dxbg != '\0' && *dxbg != '0';
+        float clearColor[4];
+        if (transparent_bg) {
+            clearColor[0] = 0.0f; clearColor[1] = 0.0f;
+            clearColor[2] = 0.0f; clearColor[3] = 0.0f;
+        } else {
+            clearColor[0] = 0.05f; clearColor[1] = 0.05f;
+            clearColor[2] = 0.25f; clearColor[3] = 1.0f;
+        }
         cmdList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
         cmdList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
             1.0f, 0, 0, nullptr);

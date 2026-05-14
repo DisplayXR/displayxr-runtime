@@ -151,8 +151,21 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
+// DISPLAYXR_TRANSPARENT_BG=1 → cube clears RGBA(0,0,0,0), window uses
+// WS_EX_NOREDIRECTIONBITMAP + null brush so DComp can show the desktop
+// through the cube's transparent regions. Mirrors cube_handle_vk_win and
+// cube_handle_d3d11_win.
+static bool TransparentBackgroundEnabled() {
+    static const bool e = []() {
+        const char *v = getenv("DISPLAYXR_TRANSPARENT_BG");
+        return v != nullptr && *v != '\0' && *v != '0';
+    }();
+    return e;
+}
+
 static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
-    LOG_INFO("Creating application window (%dx%d)", width, height);
+    const bool transparent = TransparentBackgroundEnabled();
+    LOG_INFO("Creating application window (%dx%d, transparent=%d)", width, height, transparent);
 
     WNDCLASSEX wc = {};
     wc.cbSize = sizeof(WNDCLASSEX);
@@ -160,7 +173,7 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wc.hbrBackground = transparent ? nullptr : (HBRUSH)GetStockObject(BLACK_BRUSH);
     wc.lpszClassName = WINDOW_CLASS;
 
     if (!RegisterClassEx(&wc)) {
@@ -174,7 +187,8 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     RECT rect = { 0, 0, width, height };
     AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
 
-    HWND hwnd = CreateWindowEx(0, WINDOW_CLASS, WINDOW_TITLE, WS_OVERLAPPEDWINDOW,
+    DWORD exStyle = transparent ? WS_EX_NOREDIRECTIONBITMAP : 0;
+    HWND hwnd = CreateWindowEx(exStyle, WINDOW_CLASS, WINDOW_TITLE, WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         rect.right - rect.left, rect.bottom - rect.top,
         nullptr, nullptr, hInstance, nullptr);
