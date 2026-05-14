@@ -303,6 +303,13 @@ leia_bg_capture_create(HWND hwnd)
 	if (SUCCEEDED(capture_session.As(&session2))) {
 		session2->put_IsCursorCaptureEnabled(false);
 	}
+	// Suppress the yellow "this screen is being captured" border DWM draws
+	// around the captured region. Requires Windows 11 22H2+; on older Windows
+	// the QI fails or the put silently no-ops — fine, we just keep the border.
+	ComPtr<WGC::IGraphicsCaptureSession3> session3;
+	if (SUCCEEDED(capture_session.As(&session3))) {
+		session3->put_IsBorderRequired(false);
+	}
 
 	ComPtr<ID3D11Texture2D> staging_tex;
 	HANDLE staging_handle = nullptr;
