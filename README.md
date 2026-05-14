@@ -44,19 +44,29 @@ Every graphics API gets its own native compositor — no Vulkan intermediary, no
 
 ## Quick Start
 
+### Install (Windows)
+
+DisplayXR ships as three small, independent installers. Install in this order:
+
+1. **DisplayXR Runtime** — `DisplayXRSetup-*.exe` from [displayxr-runtime releases](https://github.com/DisplayXR/displayxr-runtime/releases). Required.
+2. **DisplayXR Shell** — `DisplayXRShellSetup-*.exe` from [displayxr-shell-releases](https://github.com/DisplayXR/displayxr-shell-releases/releases). Optional, adds the spatial-workspace UX. Hard-requires the runtime ([workspace controller contract](docs/specs/runtime/workspace-controller-registration.md)).
+3. **DisplayXR MCP Tools** — `DisplayXRMCPSetup-*.exe` from [displayxr-mcp releases](https://github.com/DisplayXR/displayxr-mcp/releases). Optional, enables AI-agent / voice control.
+
+The website's [Get Started](https://displayxr.org/getting-started) page walks through this end-to-end with verification steps.
+
+### Build from source
+
 ```bash
-# Windows — recommended (auto-fetches vcpkg, OpenXR loader, LeiaSR SDK)
+# Windows — auto-fetches vcpkg, OpenXR loader, LeiaSR SDK
 scripts\build_windows.bat all
 # Outputs: _package/DisplayXRSetup-*.exe (installer) + _package/bin/
 
-# macOS
+# macOS — source build only (no packaged installer yet)
 brew install cmake ninja eigen vulkan-sdk && ./scripts/build_macos.sh
 
-# Run without installing
+# Run a dev build without installing
 XR_RUNTIME_JSON=./build/Release/openxr_displayxr-dev.json ./your_openxr_app
 ```
-
-Pre-built installers from [GitHub Releases](https://github.com/DisplayXR/displayxr-runtime/releases). For the spatial-workspace experience, also install the [DisplayXR Shell](https://github.com/DisplayXR/displayxr-shell-releases/releases) (separate installer, registers with the runtime via the [workspace controller contract](docs/specs/runtime/workspace-controller-registration.md)).
 
 See [Building DisplayXR](docs/getting-started/building.md) for full instructions and CMake options.
 
