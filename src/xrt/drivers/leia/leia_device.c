@@ -255,6 +255,17 @@ leia_hmd_create(void)
 		return NULL;
 	}
 
+	// Advertise ALPHA_BLEND alongside the default OPAQUE that the device
+	// helper installed. The Leia DPs deliver alpha-correct output two ways:
+	//   - Standalone (XR_EXT_win32_window_binding + transparentBackgroundEnabled):
+	//     WGC compose-under-bg + post-weave alpha-gate on D3D11/D3D12/VK.
+	//   - Workspace (IPC): service compositor honours
+	//     XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT per layer.
+	// Advertising ALPHA_BLEND lets well-behaved apps discover transparency
+	// support via the standard xrEnumerateEnvironmentBlendModes path instead
+	// of relying on extension detection alone.
+	hmd->base.hmd->blend_modes[hmd->base.hmd->blend_mode_count++] = XRT_BLEND_MODE_ALPHA_BLEND;
+
 	// No distortion for Leia display.
 	u_distortion_mesh_set_none(&hmd->base);
 
