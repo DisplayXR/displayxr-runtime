@@ -434,7 +434,6 @@ endif()
 ###
 
 add_subdirectory(src)
-add_subdirectory(doc)
 
 if(BUILD_TESTING)
 	include(CTest)

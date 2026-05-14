@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Embedded DisplayXR white logo PNG (doc/displayxr_white.png).
+ * @brief  Embedded DisplayXR white logo PNG (assets/displayxr_white.png).
  *
  * The byte array is generated at build time from the source PNG via
  * embed_binary.cmake, so the binary artifact does not need to ship the image

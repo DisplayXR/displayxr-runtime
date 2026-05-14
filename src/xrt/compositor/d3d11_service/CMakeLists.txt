@@ -9,9 +9,9 @@
 # DXGI shared handles and uses KeyedMutex for synchronization.
 #
 
-# Embed doc/displayxr_white.png as a byte array so the compositor can draw the
+# Embed assets/displayxr_white.png as a byte array so the compositor can draw the
 # logo on the empty-state screen without shipping the PNG alongside the binary.
-set(DISPLAYXR_LOGO_SRC "${CMAKE_SOURCE_DIR}/doc/displayxr_white.png")
+set(DISPLAYXR_LOGO_SRC "${CMAKE_SOURCE_DIR}/assets/displayxr_white.png")
 set(DISPLAYXR_LOGO_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/displayxr_logo_data.c")
 add_custom_command(
 	OUTPUT "${DISPLAYXR_LOGO_GENERATED}"

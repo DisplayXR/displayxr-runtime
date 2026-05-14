@@ -14,9 +14,6 @@ CMakeDoxyfile.in
 CMakeDoxygenDefaults.cmake
 CTestTestfile.cmake
 DartConfiguration.tcl
-doc/Doxyfile
-doc/html/
-doc/latex/
 openxr_monado-dev.json
 openxr_monado.json
 src/xrt/auxiliary/bindings/b_generated_bindings.*

@@ -1,1 +1,0 @@
-xrt: xrt_device_get_hand_tracking return xrt_result_t

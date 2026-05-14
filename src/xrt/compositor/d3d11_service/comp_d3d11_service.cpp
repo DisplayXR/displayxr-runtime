@@ -1128,7 +1128,7 @@ struct d3d11_multi_compositor
 
 	//! Embedded DisplayXR logo PNG decoded to an SRV on first use. Rendered in
 	//! the empty state (no clients, no launcher). Source bytes come from
-	//! displayxr_white_png[] which is generated from doc/displayxr_white.png.
+	//! displayxr_white_png[] which is generated from assets/displayxr_white.png.
 	wil::com_ptr<ID3D11ShaderResourceView> logo_srv;
 	uint32_t logo_w;
 	uint32_t logo_h;
@@ -7551,7 +7551,7 @@ after_key_shortcuts:
 			uint32_t lw = 0, lh = 0;
 			if (d3d11_icon_load_from_memory(sys->device.get(), displayxr_white_png,
 			                                 displayxr_white_png_size,
-			                                 "doc/displayxr_white.png", &srv, &lw, &lh)) {
+			                                 "assets/displayxr_white.png", &srv, &lw, &lh)) {
 				mc->logo_srv.attach(srv);
 				mc->logo_w = lw;
 				mc->logo_h = lh;

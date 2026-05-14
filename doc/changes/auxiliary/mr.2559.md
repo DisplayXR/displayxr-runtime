@@ -1,1 +1,0 @@
-a/vk: Add environment variable for skipping memory size check, which is useful for renderdoc.
