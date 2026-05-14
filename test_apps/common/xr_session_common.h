@@ -112,6 +112,14 @@ struct XrSessionManager {
     // Canvas sub-rect (XR_EXT_win32_window_binding / XR_EXT_cocoa_window_binding)
     PFN_xrSetSharedTextureOutputRectEXT pfnSetSharedTextureOutputRectEXT = nullptr;
 
+    // Environment blend modes advertised by the runtime. Populated at session
+    // create time via xrEnumerateEnvironmentBlendModes. Used to pick the
+    // correct mode for xrEndFrame: ALPHA_BLEND when transparent_bg is desired
+    // AND the runtime advertises it; OPAQUE otherwise.
+    uint32_t envBlendModeCount = 0;
+    XrEnvironmentBlendMode envBlendModes[4] = {};
+    bool runtimeSupportsAlphaBlend = false;
+
     // Enumerated rendering mode info
     uint32_t currentModeIndex = 1;  // Default: mode 1 (first 3D mode, matches runtime default)
     uint32_t renderingModeCount = 0;

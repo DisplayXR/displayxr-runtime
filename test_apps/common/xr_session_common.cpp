@@ -10,9 +10,52 @@
 #include "logging.h"
 #include <cstring>
 #include <cmath>
+#include <cstdlib>
 // #include <chrono>  // [Commented out — was only used for convergence plane logging throttle]
 
 using namespace DirectX;
+
+// Pick the environment blend mode to submit at xrEndFrame.
+//
+// DisplayXR advertises both OPAQUE and ALPHA_BLEND through
+// xrEnumerateEnvironmentBlendModes when the runtime can deliver alpha-correct
+// output (standalone via XR_EXT_win32_window_binding.transparentBackgroundEnabled
+// on D3D11/D3D12/VK, or workspace via the projection-layer source-alpha bit).
+// Apps that want their alpha honored should submit ALPHA_BLEND; apps that
+// don't (or runtimes that only advertise OPAQUE) get OPAQUE.
+//
+// Lazy: enumerates once on first call, caches on the session-manager struct.
+static XrEnvironmentBlendMode SelectEnvBlendMode(XrSessionManager& xr) {
+    static const bool transparency_wanted = []() {
+        const char *e = getenv("DISPLAYXR_TRANSPARENT_BG");
+        return e != nullptr && *e != '\0' && *e != '0';
+    }();
+    if (!transparency_wanted) {
+        return XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    }
+    if (xr.envBlendModeCount == 0 && xr.instance != XR_NULL_HANDLE && xr.systemId != XR_NULL_SYSTEM_ID) {
+        uint32_t count = 0;
+        XrResult r = xrEnumerateEnvironmentBlendModes(
+            xr.instance, xr.systemId, xr.viewConfigType,
+            (uint32_t)(sizeof(xr.envBlendModes) / sizeof(xr.envBlendModes[0])),
+            &count, xr.envBlendModes);
+        if (XR_SUCCEEDED(r)) {
+            xr.envBlendModeCount = count;
+            for (uint32_t i = 0; i < count; i++) {
+                if (xr.envBlendModes[i] == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) {
+                    xr.runtimeSupportsAlphaBlend = true;
+                    LOG_INFO("Runtime advertises XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND — submitting it at xrEndFrame");
+                    break;
+                }
+            }
+            if (!xr.runtimeSupportsAlphaBlend) {
+                LOG_WARN("DISPLAYXR_TRANSPARENT_BG=1 but runtime does not advertise ALPHA_BLEND — submitting OPAQUE");
+            }
+        }
+    }
+    return xr.runtimeSupportsAlphaBlend ? XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
+                                        : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+}
 
 // Helper macro for XR error checking with logging
 #define XR_CHECK(call) \
@@ -515,7 +558,7 @@ bool EndFrame(XrSessionManager& xr, XrTime displayTime, const XrCompositionLayer
 
     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
     endInfo.displayTime = displayTime;
-    endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    endInfo.environmentBlendMode = SelectEnvBlendMode(xr);
     endInfo.layerCount = 1;
     endInfo.layers = layers;
 
@@ -644,7 +687,7 @@ bool EndFrameWithWindowSpaceHud(
 
     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
     endInfo.displayTime = displayTime;
-    endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    endInfo.environmentBlendMode = SelectEnvBlendMode(xr);
     endInfo.layerCount = xr.hasHudSwapchain ? 2 : 1;
     endInfo.layers = layers;
 
