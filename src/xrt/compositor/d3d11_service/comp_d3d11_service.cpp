@@ -12387,9 +12387,15 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 		sys->base.info.views[i].max.height_pixels = per_view_h * 2;
 	}
 
-	// Set supported blend modes (Chrome WebXR requires at least OPAQUE)
+	// Set supported blend modes. Chrome WebXR requires at least OPAQUE.
+	// ALPHA_BLEND is also advertised because the service compositor honours
+	// XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT per projection
+	// layer (see the per-tile blend-mode selection guarded by ws_snapshot
+	// elsewhere in this file), so workspace apps can opt into transparency
+	// without any extension chain.
 	sys->base.info.supported_blend_modes[0] = XRT_BLEND_MODE_OPAQUE;
-	sys->base.info.supported_blend_mode_count = 1;
+	sys->base.info.supported_blend_modes[1] = XRT_BLEND_MODE_ALPHA_BLEND;
+	sys->base.info.supported_blend_mode_count = 2;
 
 	// Populate display info for XR_EXT_display_info
 	// (display_width_m and display_height_m are already set above from the temporary display processor query)
