@@ -829,6 +829,25 @@ compose_init_pipeline(struct leia_display_processor_d3d12_impl *ldp)
 			return false;
 		}
 	}
+	// We reuse ck_fill_tex / ck_rtv_heap_fill as the intermediate target. In
+	// the chroma-key path those are created inside ck_init_pipeline; in the
+	// compose path we never call ck_init_pipeline, so the RTV heap must be
+	// created here. (Without this, ck_ensure_fill_target null-derefs
+	// ldp->ck_rtv_heap_fill on the first compose frame.)
+	if (ldp->ck_rtv_heap_fill == nullptr) {
+		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+		hd.NumDescriptors = 1;
+		hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+		HRESULT hr = ldp->device->CreateDescriptorHeap(
+		    &hd, __uuidof(ID3D12DescriptorHeap),
+		    reinterpret_cast<void **>(&ldp->ck_rtv_heap_fill));
+		if (FAILED(hr)) {
+			U_LOG_E("Leia D3D12 DP: compose fill RTV heap create failed: 0x%08x", (unsigned)hr);
+			return false;
+		}
+	}
+
 	if (ldp->compose_srv_heap == nullptr) {
 		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
 		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
