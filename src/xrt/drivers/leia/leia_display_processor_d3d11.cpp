@@ -152,9 +152,16 @@ cbuffer Constants : register(b0) {
 	float2 bg_uv_origin;  // window TL on monitor, normalized
 	float2 bg_uv_extent;  // window size on monitor, normalized
 	uint2  tile_count;    // (tile_columns, tile_rows)
-	uint2  pad_;
+	uint2  pad0;
+	float3 chroma_rgb;    // sentinel for fully-transparent atlas pixels
+	float  pad1;
 };
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+	// Plain compose-with-bg. Transparency holes are produced by the
+	// post-weave alpha-gate pass, NOT by any chroma sentinel — so this
+	// shader never emits a key color and the weaver only ever sees real
+	// captured-bg ↔ atlas-content data (no exact-match-miss fringe at
+	// silhouettes).
 	float4 a = atlas.Sample(samp, uv);
 	float2 tile_local = frac(uv * float2(tile_count));
 	float2 bg_uv = bg_uv_origin + tile_local * bg_uv_extent;
@@ -167,7 +174,53 @@ struct ComposeConstants {
 	float bg_uv_origin[2];
 	float bg_uv_extent[2];
 	uint32_t tile_count[2];
-	uint32_t pad_[2];
+	uint32_t pad0[2];
+	float chroma_rgb[3];
+	float pad1;
+};
+
+/*
+ * Post-weave alpha-gate pixel shader (compose-mode replacement for the
+ * legacy chroma-key strip).
+ *
+ * Samples the woven back-buffer and the original atlas. For each screen
+ * pixel, tests the "fully transparent in ALL views" condition by reading
+ * the atlas at the same tile-local UV across every tile. When all views
+ * agree the pixel is transparent → output (0,0,0,0) so DWM blends the
+ * live desktop (no captured-bg lag in large flat regions). Otherwise →
+ * output the woven RGB at α=1.
+ *
+ * Screen UV equals tile-local UV when target = (tile_columns × view_w,
+ * tile_rows × view_h), which is the canvas-fills-target case (default).
+ */
+static const char *alpha_gate_ps_source = R"(
+Texture2D<float4> backbuffer : register(t0);
+Texture2D<float4> atlas      : register(t1);
+SamplerState samp            : register(s0);
+cbuffer Constants : register(b0) {
+	uint2 tile_count;
+	uint2 pad;
+};
+struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+float4 main(VSOut i) : SV_Target {
+	bool all_transparent = true;
+	for (uint ty = 0; ty < tile_count.y; ty++) {
+		for (uint tx = 0; tx < tile_count.x; tx++) {
+			float2 uv_at_tile = (float2(tx, ty) + i.uv) / float2(tile_count);
+			if (atlas.SampleLevel(samp, uv_at_tile, 0).a > 0.0) {
+				all_transparent = false;
+			}
+		}
+	}
+	float3 rgb = backbuffer.Sample(samp, i.uv).rgb;
+	float m = all_transparent ? 0.0 : 1.0;
+	return float4(rgb * m, m);
+}
+)";
+
+struct AlphaGateConstants {
+	uint32_t tile_count[2];
+	uint32_t pad[2];
 };
 
 
@@ -238,6 +291,9 @@ struct leia_display_processor_d3d11_impl
 	ID3D11PixelShader *compose_ps;
 	ID3D11SamplerState *compose_sampler; //!< Linear sampler (atlas + bg both filtered).
 	ID3D11Buffer *compose_constants;     //!< sizeof(ComposeConstants).
+	// Post-weave alpha-gate (replaces ck_strip when compose is active).
+	ID3D11PixelShader *alpha_gate_ps;
+	ID3D11Buffer *alpha_gate_constants;  //!< sizeof(AlphaGateConstants).
 	//! @}
 };
 
@@ -668,7 +724,42 @@ compose_init_pipeline(struct leia_display_processor_d3d11_impl *ldp)
 		}
 	}
 
-	U_LOG_W("Leia D3D11 DP: compose-under-bg pipeline ready");
+	// Alpha-gate (post-weave) — pairs with the compose pass.
+	if (ldp->alpha_gate_ps == nullptr) {
+		ID3DBlob *blob = nullptr;
+		ID3DBlob *err = nullptr;
+		hr = D3DCompile(alpha_gate_ps_source, strlen(alpha_gate_ps_source),
+		                nullptr, nullptr, nullptr,
+		                "main", "ps_5_0", 0, 0, &blob, &err);
+		if (FAILED(hr)) {
+			U_LOG_E("Leia D3D11 DP: alpha-gate PS compile failed: 0x%08x %s",
+			        (unsigned)hr, err ? (const char *)err->GetBufferPointer() : "");
+			if (err) err->Release();
+			return false;
+		}
+		if (err) err->Release();
+		hr = ldp->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+		                                     nullptr, &ldp->alpha_gate_ps);
+		blob->Release();
+		if (FAILED(hr)) {
+			U_LOG_E("Leia D3D11 DP: alpha-gate PS create failed: 0x%08x", (unsigned)hr);
+			return false;
+		}
+	}
+	if (ldp->alpha_gate_constants == nullptr) {
+		D3D11_BUFFER_DESC cb = {};
+		cb.ByteWidth = sizeof(AlphaGateConstants);
+		cb.Usage = D3D11_USAGE_DYNAMIC;
+		cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		cb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		hr = ldp->device->CreateBuffer(&cb, nullptr, &ldp->alpha_gate_constants);
+		if (FAILED(hr)) {
+			U_LOG_E("Leia D3D11 DP: alpha-gate CB create failed: 0x%08x", (unsigned)hr);
+			return false;
+		}
+	}
+
+	U_LOG_W("Leia D3D11 DP: compose-under-bg + alpha-gate pipelines ready");
 	return true;
 }
 
@@ -716,8 +807,17 @@ compose_run_pre_weave(struct leia_display_processor_d3d11_impl *ldp,
 	cb->bg_uv_extent[1] = bg_extent[1];
 	cb->tile_count[0] = tile_columns;
 	cb->tile_count[1] = tile_rows;
-	cb->pad_[0] = 0;
-	cb->pad_[1] = 0;
+	cb->pad0[0] = 0;
+	cb->pad0[1] = 0;
+	{
+		// Same key as the chroma-key post-weave strip uses (ck_color stays
+		// set in compose mode — see set_chroma_key).
+		uint32_t k = ldp->ck_color;
+		cb->chroma_rgb[0] = ((k >>  0) & 0xFF) / 255.0f;
+		cb->chroma_rgb[1] = ((k >>  8) & 0xFF) / 255.0f;
+		cb->chroma_rgb[2] = ((k >> 16) & 0xFF) / 255.0f;
+		cb->pad1 = 0.0f;
+	}
 	ctx->Unmap(ldp->compose_constants, 0);
 
 	// Save state.
@@ -766,16 +866,108 @@ compose_run_pre_weave(struct leia_display_processor_d3d11_impl *ldp,
 	return ldp->ck_fill_srv;
 }
 
+/*
+ * Post-weave alpha-gate: copy current RTV → ck_strip_tex, then run the
+ * alpha_gate_ps over the back buffer with the atlas SRV bound. Pixels
+ * where ALL views' atlas α==0 at the same tile-local UV become α=0 in
+ * the output → DWM blends the live desktop. Other pixels keep α=1 with
+ * the woven composed-bg content. Replaces ck_run_post_weave_strip when
+ * compose-under-bg is the active path — no chroma keying involved.
+ */
+static void
+alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
+                          ID3D11DeviceContext *ctx,
+                          ID3D11ShaderResourceView *atlas_srv,
+                          uint32_t tile_columns,
+                          uint32_t tile_rows)
+{
+	if (atlas_srv == nullptr || ldp->alpha_gate_ps == nullptr) {
+		return;
+	}
+
+	ID3D11RenderTargetView *rtv = nullptr;
+	ID3D11DepthStencilView *dsv = nullptr;
+	ctx->OMGetRenderTargets(1, &rtv, &dsv);
+	if (rtv == nullptr) {
+		if (dsv) dsv->Release();
+		return;
+	}
+
+	ID3D11Resource *rtv_res = nullptr;
+	rtv->GetResource(&rtv_res);
+	ID3D11Texture2D *back_buffer = nullptr;
+	if (rtv_res) {
+		rtv_res->QueryInterface(__uuidof(ID3D11Texture2D),
+		                         reinterpret_cast<void **>(&back_buffer));
+	}
+	if (back_buffer == nullptr) {
+		if (rtv_res) rtv_res->Release();
+		rtv->Release();
+		if (dsv) dsv->Release();
+		return;
+	}
+
+	D3D11_TEXTURE2D_DESC bb_desc = {};
+	back_buffer->GetDesc(&bb_desc);
+	if (!ck_ensure_strip_source(ldp, bb_desc.Width, bb_desc.Height)) {
+		back_buffer->Release();
+		rtv_res->Release();
+		rtv->Release();
+		if (dsv) dsv->Release();
+		return;
+	}
+
+	ctx->CopyResource(ldp->ck_strip_tex, back_buffer);
+
+	// Update alpha-gate constants with tile_count.
+	D3D11_MAPPED_SUBRESOURCE m = {};
+	if (SUCCEEDED(ctx->Map(ldp->alpha_gate_constants, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+		AlphaGateConstants *cb = reinterpret_cast<AlphaGateConstants *>(m.pData);
+		cb->tile_count[0] = tile_columns;
+		cb->tile_count[1] = tile_rows;
+		cb->pad[0] = 0;
+		cb->pad[1] = 0;
+		ctx->Unmap(ldp->alpha_gate_constants, 0);
+	}
+
+	D3D11_VIEWPORT vp = {};
+	vp.Width = (float)bb_desc.Width;
+	vp.Height = (float)bb_desc.Height;
+	vp.MaxDepth = 1.0f;
+	ctx->RSSetViewports(1, &vp);
+	ctx->OMSetRenderTargets(1, &rtv, nullptr);
+
+	ctx->IASetInputLayout(nullptr);
+	ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	ctx->VSSetShader(ldp->blit_vs, nullptr, 0);
+	ctx->PSSetShader(ldp->alpha_gate_ps, nullptr, 0);
+	ID3D11ShaderResourceView *srvs[2] = {ldp->ck_strip_srv, atlas_srv};
+	ctx->PSSetShaderResources(0, 2, srvs);
+	ctx->PSSetSamplers(0, 1, &ldp->compose_sampler);
+	ctx->PSSetConstantBuffers(0, 1, &ldp->alpha_gate_constants);
+	ctx->Draw(4, 0);
+
+	ID3D11ShaderResourceView *null_srvs[2] = {nullptr, nullptr};
+	ctx->PSSetShaderResources(0, 2, null_srvs);
+
+	back_buffer->Release();
+	rtv_res->Release();
+	rtv->Release();
+	if (dsv) dsv->Release();
+}
+
 static void
 compose_release_resources(struct leia_display_processor_d3d11_impl *ldp)
 {
-	if (ldp->bg_fence)          { ldp->bg_fence->Release();          ldp->bg_fence = nullptr; }
-	if (ldp->bg_shared_srv)     { ldp->bg_shared_srv->Release();     ldp->bg_shared_srv = nullptr; }
-	if (ldp->bg_shared_tex)     { ldp->bg_shared_tex->Release();     ldp->bg_shared_tex = nullptr; }
-	if (ldp->compose_constants) { ldp->compose_constants->Release(); ldp->compose_constants = nullptr; }
-	if (ldp->compose_sampler)   { ldp->compose_sampler->Release();   ldp->compose_sampler = nullptr; }
-	if (ldp->compose_ps)        { ldp->compose_ps->Release();        ldp->compose_ps = nullptr; }
-	if (ldp->bg_capture)        { leia_bg_capture_destroy(ldp->bg_capture); ldp->bg_capture = nullptr; }
+	if (ldp->alpha_gate_constants) { ldp->alpha_gate_constants->Release(); ldp->alpha_gate_constants = nullptr; }
+	if (ldp->alpha_gate_ps)        { ldp->alpha_gate_ps->Release();        ldp->alpha_gate_ps = nullptr; }
+	if (ldp->bg_fence)             { ldp->bg_fence->Release();             ldp->bg_fence = nullptr; }
+	if (ldp->bg_shared_srv)        { ldp->bg_shared_srv->Release();        ldp->bg_shared_srv = nullptr; }
+	if (ldp->bg_shared_tex)        { ldp->bg_shared_tex->Release();        ldp->bg_shared_tex = nullptr; }
+	if (ldp->compose_constants)    { ldp->compose_constants->Release();    ldp->compose_constants = nullptr; }
+	if (ldp->compose_sampler)      { ldp->compose_sampler->Release();      ldp->compose_sampler = nullptr; }
+	if (ldp->compose_ps)           { ldp->compose_ps->Release();           ldp->compose_ps = nullptr; }
+	if (ldp->bg_capture)           { leia_bg_capture_destroy(ldp->bg_capture); ldp->bg_capture = nullptr; }
 	ldp->bg_compose_enabled = false;
 }
 
@@ -878,13 +1070,16 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 		ID3D11ShaderResourceView *null_srv = NULL;
 		ctx->PSSetShaderResources(0, 1, &null_srv);
 
-		// 2D mode has no weaver, but if chroma-key is enabled the legacy
-		// flow (app pre-fills with key RGB on opaque alpha=1 surface) still
-		// needs the strip pass to recover alpha=0 for DWM. The new flow
-		// (true alpha through blit) works without it; running strip in that
-		// case is a no-op for non-key pixels. The compose-under-bg path
-		// already produced opaque RGB, so the strip pass is unnecessary.
-		if (!compose_should_run(ldp) && ck_should_run(ldp)) {
+		// Post-weave transparency pass:
+		//   - compose path: alpha-gate samples the atlas to find "all views
+		//     α==0" screen pixels and zeroes their alpha — no chroma keying.
+		//   - chroma-key fallback: legacy strip pass on the magenta sentinel.
+		if (compose_should_run(ldp)) {
+			alpha_gate_run_post_weave(
+			    ldp, ctx,
+			    static_cast<ID3D11ShaderResourceView *>(atlas_srv),
+			    tile_columns, tile_rows);
+		} else if (ck_should_run(ldp)) {
 			ck_run_post_weave_strip(ldp, ctx);
 		}
 		return;
@@ -964,12 +1159,21 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 
 	leiasr_d3d11_weave(ldp->leiasr);
 
-	// Post-weave chroma-key strip: convert key-color RGB pixels in the
-	// woven back-buffer to alpha=0 (with RGB premultiplied for DWM's
-	// premultiplied alpha mode). No-op when chroma-key is disabled, and
-	// suppressed entirely when compose-under-bg ran (the weaver already
-	// consumed opaque pre-composited input; the back buffer is opaque RGB).
-	if (!compose_should_run(ldp) && ck_should_run(ldp)) {
+	// Post-weave transparency pass:
+	//   - compose path: alpha-gate samples the atlas directly to derive an
+	//     "all views α==0" mask in screen space, then zeroes alpha on those
+	//     pixels so DWM blends the LIVE desktop (no captured-bg lag in flat
+	//     regions). At silhouettes the mask says α=1 (one view is opaque),
+	//     so the user sees the weaver's smooth bg↔cube lenticular blend.
+	//     No chroma keying — no magenta enters the weaver, no exact-match
+	//     fringe artifact at silhouettes.
+	//   - chroma-key fallback: legacy strip pass.
+	if (compose_should_run(ldp)) {
+		alpha_gate_run_post_weave(
+		    ldp, ctx,
+		    static_cast<ID3D11ShaderResourceView *>(atlas_srv),
+		    tile_columns, tile_rows);
+	} else if (ck_should_run(ldp)) {
 		ck_run_post_weave_strip(ldp, ctx);
 	}
 }

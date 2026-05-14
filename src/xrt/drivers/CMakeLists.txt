@@ -84,6 +84,7 @@ if(XRT_HAVE_LEIA_SR)
 			leia/shaders/ck_fill.frag
 			leia/shaders/ck_strip.frag
 			leia/shaders/compose_under_bg.frag
+			leia/shaders/alpha_gate.frag
 		)
 		list(APPEND LEIA_SOURCES ${LEIA_SHADER_HEADERS})
 		set(LEIA_SR_VULKAN_AVAILABLE TRUE)

@@ -133,6 +133,41 @@ static constexpr uint32_t kDefaultChromaKey = 0x00FF00FF;
  *
  * Same VS as the ck pipeline (single fullscreen triangle).
  */
+/*
+ * Post-weave alpha-gate (compose-mode replacement for the chroma-key strip).
+ * Samples the woven back-buffer (in copy form via ck_strip_tex) and the
+ * original atlas, then for each screen pixel tests whether ALL tiles' atlas
+ * α==0 at the matching tile-local UV. Pixels passing the test get α=0 (DWM
+ * blends live desktop); others keep α=1.
+ *
+ * Screen UV == tile-local UV when target = (tile_columns × view_w,
+ * tile_rows × view_h), which is the canvas-fills-target case.
+ */
+static const char *alpha_gate_ps_source = R"(
+struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+Texture2D<float4> backbuffer : register(t0);
+Texture2D<float4> atlas      : register(t1);
+SamplerState samp            : register(s0);
+cbuffer Constants : register(b0) {
+    uint2 tile_count;
+    uint2 pad;
+};
+float4 main(VSOut i) : SV_Target {
+    bool all_transparent = true;
+    for (uint ty = 0; ty < tile_count.y; ty++) {
+        for (uint tx = 0; tx < tile_count.x; tx++) {
+            float2 uv_at_tile = (float2(tx, ty) + i.uv) / float2(tile_count);
+            if (atlas.SampleLevel(samp, uv_at_tile, 0).a > 0.0) {
+                all_transparent = false;
+            }
+        }
+    }
+    float3 rgb = backbuffer.Sample(samp, i.uv).rgb;
+    float m = all_transparent ? 0.0 : 1.0;
+    return float4(rgb * m, m);
+}
+)";
+
 static const char *compose_under_bg_ps_source = R"(
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 Texture2D<float4> atlas : register(t0);
@@ -142,9 +177,13 @@ cbuffer Constants : register(b0) {
     float2 bg_uv_origin;
     float2 bg_uv_extent;
     uint2  tile_count;
-    uint2  pad_;
+    uint2  pad0;
+    float3 chroma_rgb;    // sentinel for fully-transparent atlas pixels
+    float  pad1;
 };
 float4 main(VSOut i) : SV_Target {
+    // Plain compose-with-bg. Transparency holes are produced by the
+    // post-weave alpha-gate pass — this shader never emits a chroma sentinel.
     float4 a = atlas.Sample(samp, i.uv);
     float2 tile_local = frac(i.uv * float2(tile_count));
     float2 bg_uv = bg_uv_origin + tile_local * bg_uv_extent;
@@ -220,6 +259,11 @@ struct leia_display_processor_d3d12_impl
 	ID3D12PipelineState *compose_pso;
 	ID3D12DescriptorHeap *compose_srv_heap; //!< Shader-visible, 2 entries (atlas, bg).
 	UINT cbv_srv_desc_size;              //!< Cached for offset arithmetic in compose heap.
+
+	// Post-weave alpha-gate (replaces ck_strip when compose is active).
+	// Reuses compose_root_sig (12 32-bit constants, 2-SRV table, linear sampler).
+	ID3D12PipelineState *alpha_gate_pso;
+	ID3D12DescriptorHeap *alpha_gate_srv_heap; //!< Shader-visible, 2 entries (backbuffer, atlas).
 	//! @}
 };
 
@@ -729,9 +773,9 @@ compose_should_run(struct leia_display_processor_d3d12_impl *ldp)
 	return ldp->bg_compose_enabled && ldp->bg_capture != nullptr && ldp->bg_shared_tex != nullptr;
 }
 
-// Root signature: 8 32-bit constants (bg_uv_origin xy + bg_uv_extent xy +
-// tile_count xy + pad xy = 32 bytes) at b0 + 2-SRV descriptor table (t0,t1)
-// + static linear sampler at s0.
+// Root signature: 12 32-bit constants (bg_uv_origin xy + bg_uv_extent xy +
+// tile_count xy + pad xy + chroma_rgb + pad = 48 bytes) at b0 + 2-SRV
+// descriptor table (t0,t1) + static linear sampler at s0.
 static bool
 compose_build_root_sig(struct leia_display_processor_d3d12_impl *ldp)
 {
@@ -744,7 +788,7 @@ compose_build_root_sig(struct leia_display_processor_d3d12_impl *ldp)
 	D3D12_ROOT_PARAMETER params[2] = {};
 	params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 	params[0].Constants.ShaderRegister = 0;
-	params[0].Constants.Num32BitValues = 8;
+	params[0].Constants.Num32BitValues = 12;
 	params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 	params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 	params[1].DescriptorTable.NumDescriptorRanges = 1;
@@ -847,6 +891,23 @@ compose_init_pipeline(struct leia_display_processor_d3d12_impl *ldp)
 			return false;
 		}
 	}
+	// Same reason: ck_ensure_strip_source writes the strip SRV into
+	// ck_srv_heap_strip. The alpha-gate path uses its own srv heap but
+	// ck_ensure_strip_source still writes the legacy heap. Create it here
+	// so the ck path doesn't null-deref on the compose-mode first frame.
+	if (ldp->ck_srv_heap_strip == nullptr) {
+		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+		hd.NumDescriptors = 1;
+		hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+		HRESULT hr = ldp->device->CreateDescriptorHeap(
+		    &hd, __uuidof(ID3D12DescriptorHeap),
+		    reinterpret_cast<void **>(&ldp->ck_srv_heap_strip));
+		if (FAILED(hr)) {
+			U_LOG_E("Leia D3D12 DP: compose strip SRV heap create failed: 0x%08x", (unsigned)hr);
+			return false;
+		}
+	}
 
 	if (ldp->compose_srv_heap == nullptr) {
 		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
@@ -874,7 +935,59 @@ compose_init_pipeline(struct leia_display_processor_d3d12_impl *ldp)
 		bg_cpu.ptr += ldp->cbv_srv_desc_size;
 		ldp->device->CreateShaderResourceView(ldp->bg_shared_tex, &bg_srv, bg_cpu);
 	}
-	U_LOG_W("Leia D3D12 DP: compose-under-bg pipeline ready");
+
+	// Alpha-gate PSO (reuses compose_root_sig). Same fullscreen-tri VS,
+	// alpha_gate_ps_source for the PS. Different render-target — back buffer
+	// can be either DXGI_FORMAT_R8G8B8A8_UNORM or _B8G8R8A8_UNORM; we build
+	// the PSO for the swap-chain format the compositor set via set_output_format.
+	if (ldp->alpha_gate_pso == nullptr) {
+		ID3DBlob *vs_blob = ck_compile_shader(ck_vs_source, "main", "vs_5_0");
+		if (vs_blob == nullptr) return false;
+		ID3DBlob *ps_blob = ck_compile_shader(alpha_gate_ps_source, "main", "ps_5_0");
+		if (ps_blob == nullptr) { vs_blob->Release(); return false; }
+
+		D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+		pd.pRootSignature = ldp->compose_root_sig;
+		pd.VS = {vs_blob->GetBufferPointer(), vs_blob->GetBufferSize()};
+		pd.PS = {ps_blob->GetBufferPointer(), ps_blob->GetBufferSize()};
+		pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+		pd.SampleMask = UINT_MAX;
+		pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+		pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+		pd.RasterizerState.DepthClipEnable = TRUE;
+		pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+		pd.NumRenderTargets = 1;
+		// Use the swap-chain format the strip pipeline uses (ck_strip_target_format
+		// equivalent — set via set_output_format → blit_output_format).
+		pd.RTVFormats[0] = ldp->blit_output_format != DXGI_FORMAT_UNKNOWN
+		                       ? ldp->blit_output_format
+		                       : DXGI_FORMAT_R8G8B8A8_UNORM;
+		pd.SampleDesc.Count = 1;
+		HRESULT hr = ldp->device->CreateGraphicsPipelineState(
+		    &pd, __uuidof(ID3D12PipelineState),
+		    reinterpret_cast<void **>(&ldp->alpha_gate_pso));
+		vs_blob->Release();
+		ps_blob->Release();
+		if (FAILED(hr)) {
+			U_LOG_E("Leia D3D12 DP: alpha-gate PSO create failed: 0x%08x", (unsigned)hr);
+			return false;
+		}
+	}
+	if (ldp->alpha_gate_srv_heap == nullptr) {
+		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+		hd.NumDescriptors = 2;
+		hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+		HRESULT hr = ldp->device->CreateDescriptorHeap(
+		    &hd, __uuidof(ID3D12DescriptorHeap),
+		    reinterpret_cast<void **>(&ldp->alpha_gate_srv_heap));
+		if (FAILED(hr)) {
+			U_LOG_E("Leia D3D12 DP: alpha-gate SRV heap create failed: 0x%08x", (unsigned)hr);
+			return false;
+		}
+	}
+
+	U_LOG_W("Leia D3D12 DP: compose-under-bg + alpha-gate pipelines ready");
 	return true;
 }
 
@@ -937,7 +1050,7 @@ compose_run_pre_weave(struct leia_display_processor_d3d12_impl *ldp,
 	cmd->SetGraphicsRootSignature(ldp->compose_root_sig);
 	ID3D12DescriptorHeap *heaps[] = {ldp->compose_srv_heap};
 	cmd->SetDescriptorHeaps(1, heaps);
-	uint32_t consts[8];
+	uint32_t consts[12];
 	memcpy(&consts[0], &bg_origin[0], sizeof(float));
 	memcpy(&consts[1], &bg_origin[1], sizeof(float));
 	memcpy(&consts[2], &bg_extent[0], sizeof(float));
@@ -946,7 +1059,17 @@ compose_run_pre_weave(struct leia_display_processor_d3d12_impl *ldp,
 	consts[5] = tile_rows;
 	consts[6] = 0;
 	consts[7] = 0;
-	cmd->SetGraphicsRoot32BitConstants(0, 8, consts, 0);
+	// chroma_rgb (same key as the strip pass). ck_color stays set in compose
+	// mode — see set_chroma_key. Atlas α==0 pixels are emitted as this sentinel
+	// so the post-weave strip can rewrite them to α=0 → live desktop via DWM.
+	float chroma_r = ((ldp->ck_color >>  0) & 0xFF) / 255.0f;
+	float chroma_g = ((ldp->ck_color >>  8) & 0xFF) / 255.0f;
+	float chroma_b = ((ldp->ck_color >> 16) & 0xFF) / 255.0f;
+	memcpy(&consts[8],  &chroma_r, sizeof(float));
+	memcpy(&consts[9],  &chroma_g, sizeof(float));
+	memcpy(&consts[10], &chroma_b, sizeof(float));
+	consts[11] = 0;
+	cmd->SetGraphicsRoot32BitConstants(0, 12, consts, 0);
 	cmd->SetGraphicsRootDescriptorTable(
 	    1, ldp->compose_srv_heap->GetGPUDescriptorHandleForHeapStart());
 
@@ -973,15 +1096,114 @@ compose_run_pre_weave(struct leia_display_processor_d3d12_impl *ldp,
 	return ldp->ck_fill_tex;
 }
 
+/*
+ * Post-weave alpha-gate. Transitions back buffer through COPY_SOURCE to
+ * fill ck_strip_tex, then samples (ck_strip_tex, atlas) and writes back to
+ * the back buffer with per-pixel α derived from the "all views α==0" mask.
+ * Replaces ck_run_post_weave_strip when compose-under-bg is the active
+ * transparency path — no chroma keying involved.
+ */
+static void
+alpha_gate_run_post_weave(struct leia_display_processor_d3d12_impl *ldp,
+                          ID3D12GraphicsCommandList *cmd,
+                          ID3D12Resource *back_buffer,
+                          D3D12_CPU_DESCRIPTOR_HANDLE back_buffer_rtv,
+                          ID3D12Resource *atlas_resource,
+                          DXGI_FORMAT atlas_format,
+                          uint32_t bb_w, uint32_t bb_h,
+                          uint32_t tile_columns, uint32_t tile_rows)
+{
+	if (atlas_resource == nullptr || ldp->alpha_gate_pso == nullptr) {
+		return;
+	}
+	if (!ck_ensure_strip_source(ldp, bb_w, bb_h)) {
+		return;
+	}
+
+	// Refresh the alpha-gate SRV heap per-frame: slot 0 = back-buffer copy
+	// (ck_strip_tex), slot 1 = atlas. ck_strip_tex doesn't change, but its
+	// content does; SRV is stable. Atlas SRV must be (re)created since the
+	// resource may change per-frame.
+	D3D12_CPU_DESCRIPTOR_HANDLE cpu_base =
+	    ldp->alpha_gate_srv_heap->GetCPUDescriptorHandleForHeapStart();
+	{
+		D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+		sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		sd.Texture2D.MipLevels = 1;
+		ldp->device->CreateShaderResourceView(ldp->ck_strip_tex, &sd, cpu_base);
+	}
+	{
+		D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+		sd.Format = atlas_format;
+		sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		sd.Texture2D.MipLevels = 1;
+		D3D12_CPU_DESCRIPTOR_HANDLE atlas_cpu = cpu_base;
+		atlas_cpu.ptr += ldp->cbv_srv_desc_size;
+		ldp->device->CreateShaderResourceView(atlas_resource, &sd, atlas_cpu);
+	}
+
+	// back_buffer RENDER_TARGET → COPY_SOURCE; ck_strip_tex → COPY_DEST.
+	D3D12_RESOURCE_BARRIER barriers[2] = {};
+	barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barriers[0].Transition.pResource = back_buffer;
+	barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barriers[1].Transition.pResource = ldp->ck_strip_tex;
+	barriers[1].Transition.StateBefore = ldp->ck_strip_state;
+	barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+	barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	cmd->ResourceBarrier(2, barriers);
+	ldp->ck_strip_state = D3D12_RESOURCE_STATE_COPY_DEST;
+
+	cmd->CopyResource(ldp->ck_strip_tex, back_buffer);
+
+	barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+	barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	cmd->ResourceBarrier(2, barriers);
+	ldp->ck_strip_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+	cmd->SetPipelineState(ldp->alpha_gate_pso);
+	cmd->SetGraphicsRootSignature(ldp->compose_root_sig);
+	ID3D12DescriptorHeap *heaps[] = {ldp->alpha_gate_srv_heap};
+	cmd->SetDescriptorHeaps(1, heaps);
+	// Pack tile_count into the first 2 root-constant slots. Remaining 10
+	// slots in compose_root_sig (bg_uv_*, chroma_rgb, etc.) are unused by
+	// the alpha-gate shader — fine.
+	uint32_t consts[12] = {tile_columns, tile_rows};
+	cmd->SetGraphicsRoot32BitConstants(0, 12, consts, 0);
+	cmd->SetGraphicsRootDescriptorTable(
+	    1, ldp->alpha_gate_srv_heap->GetGPUDescriptorHandleForHeapStart());
+
+	D3D12_VIEWPORT vp = {0.0f, 0.0f, (float)bb_w, (float)bb_h, 0.0f, 1.0f};
+	D3D12_RECT scissor = {0, 0, (LONG)bb_w, (LONG)bb_h};
+	cmd->RSSetViewports(1, &vp);
+	cmd->RSSetScissorRects(1, &scissor);
+
+	cmd->OMSetRenderTargets(1, &back_buffer_rtv, FALSE, nullptr);
+	cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	cmd->IASetVertexBuffers(0, 0, nullptr);
+	cmd->IASetIndexBuffer(nullptr);
+	cmd->DrawInstanced(3, 1, 0, 0);
+}
+
 static void
 compose_release_resources(struct leia_display_processor_d3d12_impl *ldp)
 {
-	if (ldp->compose_srv_heap) { ldp->compose_srv_heap->Release(); ldp->compose_srv_heap = nullptr; }
-	if (ldp->compose_pso)      { ldp->compose_pso->Release();      ldp->compose_pso = nullptr; }
-	if (ldp->compose_root_sig) { ldp->compose_root_sig->Release(); ldp->compose_root_sig = nullptr; }
-	if (ldp->bg_fence)         { ldp->bg_fence->Release();         ldp->bg_fence = nullptr; }
-	if (ldp->bg_shared_tex)    { ldp->bg_shared_tex->Release();    ldp->bg_shared_tex = nullptr; }
-	if (ldp->bg_capture)       { leia_bg_capture_destroy(ldp->bg_capture); ldp->bg_capture = nullptr; }
+	if (ldp->alpha_gate_srv_heap) { ldp->alpha_gate_srv_heap->Release(); ldp->alpha_gate_srv_heap = nullptr; }
+	if (ldp->alpha_gate_pso)      { ldp->alpha_gate_pso->Release();      ldp->alpha_gate_pso = nullptr; }
+	if (ldp->compose_srv_heap)    { ldp->compose_srv_heap->Release();    ldp->compose_srv_heap = nullptr; }
+	if (ldp->compose_pso)         { ldp->compose_pso->Release();         ldp->compose_pso = nullptr; }
+	if (ldp->compose_root_sig)    { ldp->compose_root_sig->Release();    ldp->compose_root_sig = nullptr; }
+	if (ldp->bg_fence)            { ldp->bg_fence->Release();            ldp->bg_fence = nullptr; }
+	if (ldp->bg_shared_tex)       { ldp->bg_shared_tex->Release();       ldp->bg_shared_tex = nullptr; }
+	if (ldp->bg_capture)          { leia_bg_capture_destroy(ldp->bg_capture); ldp->bg_capture = nullptr; }
 	ldp->bg_compose_enabled = false;
 }
 
@@ -1036,7 +1258,8 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 		}
 
 		ID3D12GraphicsCommandList *cmd = static_cast<ID3D12GraphicsCommandList *>(d3d12_command_list);
-		ID3D12Resource *atlas_res = static_cast<ID3D12Resource *>(atlas_texture_resource);
+		ID3D12Resource *original_atlas_res = static_cast<ID3D12Resource *>(atlas_texture_resource);
+		ID3D12Resource *atlas_res = original_atlas_res;
 
 		// Compose-under-bg: pre-composite captured desktop under the atlas,
 		// then stretch-blit the opaque result. Replaces the post-weave strip
@@ -1118,19 +1341,28 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 		cmd->IASetVertexBuffers(0, 0, nullptr);
 		cmd->DrawInstanced(4, 1, 0, 0);
 
-		// 2D mode has no weaver, but if chroma-key is enabled the legacy
-		// flow (app pre-fills with key RGB on alpha=1 surface) still needs
-		// the strip pass to recover alpha=0 for DWM. The new flow (true
-		// alpha through the blit) works without it; running strip in that
-		// case is a no-op for non-key pixels (RGB=0 doesn't match magenta).
-		// Compose-under-bg path is fully opaque already — strip is unnecessary.
-		if (!compose_should_run(ldp) && ck_should_run(ldp) && target_resource != NULL) {
+		// Post-weave transparency pass:
+		//   - compose path: alpha-gate samples the ORIGINAL atlas (not the
+		//     composed result) to derive the screen-space "all views α==0"
+		//     mask and zeroes alpha on those pixels → DWM blends the LIVE
+		//     desktop (no captured-bg lag, no magenta fringe at silhouettes).
+		//   - chroma-key fallback: legacy strip.
+		if (target_resource != NULL) {
 			D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv;
 			bb_rtv.ptr = static_cast<SIZE_T>(target_rtv_cpu_handle);
-			ck_run_post_weave_strip(
-			    ldp, cmd,
-			    static_cast<ID3D12Resource *>(target_resource),
-			    bb_rtv, target_width, target_height);
+			if (compose_should_run(ldp)) {
+				alpha_gate_run_post_weave(
+				    ldp, cmd,
+				    static_cast<ID3D12Resource *>(target_resource), bb_rtv,
+				    original_atlas_res, static_cast<DXGI_FORMAT>(format),
+				    target_width, target_height,
+				    tile_columns, tile_rows);
+			} else if (ck_should_run(ldp)) {
+				ck_run_post_weave_strip(
+				    ldp, cmd,
+				    static_cast<ID3D12Resource *>(target_resource),
+				    bb_rtv, target_width, target_height);
+			}
 		}
 		return;
 	}
@@ -1151,7 +1383,8 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 	//   2. Chroma-key (fallback): replace alpha=0 with key color before
 	//      weaver, strip back to alpha=0 after. Hard edges, used when WGC
 	//      is unavailable.
-	ID3D12Resource *weaver_input = static_cast<ID3D12Resource *>(atlas_texture_resource);
+	ID3D12Resource *original_atlas_3d = static_cast<ID3D12Resource *>(atlas_texture_resource);
+	ID3D12Resource *weaver_input = original_atlas_3d;
 	uint32_t atlas_w = tile_columns * view_width;
 	uint32_t atlas_h = tile_rows * view_height;
 	D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv;
@@ -1177,17 +1410,28 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 	// See gotcha at leiasr_d3d12_weave().
 	leiasr_d3d12_weave(ldp->leiasr, d3d12_command_list, vp_x, vp_y, vp_w, vp_h);
 
-	// Post-weave chroma-key strip: convert key-color RGB pixels in the woven
-	// back buffer to alpha=0 with RGB premultiplied for DWM. No-op when
-	// disabled, suppressed entirely when compose-under-bg ran (the back
-	// buffer is already opaque from end-to-end compose pipeline).
-	if (!compose_should_run(ldp) && ck_should_run(ldp) && target_resource != NULL) {
-		D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv_strip;
-		bb_rtv_strip.ptr = static_cast<SIZE_T>(target_rtv_cpu_handle);
-		ck_run_post_weave_strip(
-		    ldp, cmd_3d,
-		    static_cast<ID3D12Resource *>(target_resource),
-		    bb_rtv_strip, target_width, target_height);
+	// Post-weave transparency pass:
+	//   - compose path: alpha-gate samples the ORIGINAL atlas (not the
+	//     composed result) to derive the screen-space "all views α==0" mask
+	//     and zeroes alpha on those pixels — DWM blends the LIVE desktop in
+	//     large flat transparent regions (no lag, no magenta fringe).
+	//   - chroma-key fallback: legacy strip.
+	if (target_resource != NULL) {
+		D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv_post;
+		bb_rtv_post.ptr = static_cast<SIZE_T>(target_rtv_cpu_handle);
+		if (compose_should_run(ldp) && original_atlas_3d != NULL) {
+			alpha_gate_run_post_weave(
+			    ldp, cmd_3d,
+			    static_cast<ID3D12Resource *>(target_resource), bb_rtv_post,
+			    original_atlas_3d, static_cast<DXGI_FORMAT>(format),
+			    target_width, target_height,
+			    tile_columns, tile_rows);
+		} else if (ck_should_run(ldp)) {
+			ck_run_post_weave_strip(
+			    ldp, cmd_3d,
+			    static_cast<ID3D12Resource *>(target_resource),
+			    bb_rtv_post, target_width, target_height);
+		}
 	}
 }
 
