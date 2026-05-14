@@ -20,7 +20,7 @@ layout(binding = 1) uniform sampler2D bg;
 layout(push_constant) uniform PC {
 	vec2  bg_uv_origin;   // window TL on monitor, normalized
 	vec2  bg_uv_extent;   // window size on monitor, normalized
-	uvec2 tile_count;     // (tile_columns, tile_rows)
+	uvec2 tile_count;     // (tile_columns, tile_rows) — unused here but kept for layout symmetry
 	uvec2 pad;
 } pc;
 
@@ -29,6 +29,8 @@ layout(location = 0) out vec4 out_color;
 
 void main()
 {
+	// Plain compose-with-bg. Transparency holes are produced by the
+	// post-weave alpha-gate pass — this shader never emits a chroma sentinel.
 	vec4 a = texture(atlas, in_uv);
 	vec2 tile_local = fract(in_uv * vec2(pc.tile_count));
 	vec2 bg_uv = pc.bg_uv_origin + tile_local * pc.bg_uv_extent;

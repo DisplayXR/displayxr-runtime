@@ -35,6 +35,7 @@
 #ifdef _WIN32
 #include "leia_bg_capture_win.h"
 #include "leia/shaders/compose_under_bg.frag.h"
+#include "leia/shaders/alpha_gate.frag.h"
 #endif
 
 
@@ -142,6 +143,16 @@ struct leia_display_processor
 	VkDescriptorSet compose_set;
 	VkPipeline compose_pipeline;
 	bool compose_inited;
+
+	// Post-weave alpha-gate (compose-mode replacement for ck_strip).
+	// 2-binding descriptor set (back-buffer copy + atlas), 16-byte push
+	// constants (tile_count). Uses ck_strip_rp as the output render pass
+	// (writes the swap-chain image, finalLayout = PRESENT_SRC_KHR).
+	VkDescriptorSetLayout alpha_gate_desc_layout;
+	VkPipelineLayout alpha_gate_pipeline_layout;
+	VkDescriptorPool alpha_gate_desc_pool;
+	VkDescriptorSet alpha_gate_set;
+	VkPipeline alpha_gate_pipeline;
 };
 
 static inline struct leia_display_processor *
@@ -1196,7 +1207,8 @@ compose_init_pipeline(struct leia_display_processor *ldp)
 		}
 	}
 
-	// Push constants: 2*vec2 + uvec2 + uvec2 pad = 32 bytes.
+	// Push constants: 2*vec2 + uvec2 + uvec2 pad = 32 bytes (no more chroma_rgb
+	// — alpha-gate handles transparency holes, not the compose shader).
 	{
 		VkPushConstantRange pc = {
 		    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -1357,8 +1369,155 @@ compose_init_pipeline(struct leia_display_processor *ldp)
 		return false;
 	}
 
+	// Alpha-gate pipeline — pairs with compose pass. Reuses ck_strip_rp as
+	// the output render pass (writes swap-chain image, finalLayout =
+	// PRESENT_SRC_KHR), and the ck_strip_image / ck_strip_view backbuffer
+	// copy plumbing. Distinct descriptor set (2 image samplers — backbuffer
+	// copy + atlas) and push constants (tile_count).
+	if (ldp->alpha_gate_pipeline == VK_NULL_HANDLE) {
+		// 2-binding descriptor set.
+		{
+			VkDescriptorSetLayoutBinding bs[2] = {
+			    {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			     .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT},
+			    {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			     .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT},
+			};
+			VkDescriptorSetLayoutCreateInfo ci = {
+			    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+			    .bindingCount = 2, .pBindings = bs,
+			};
+			res = vk->vkCreateDescriptorSetLayout(vk->device, &ci, NULL, &ldp->alpha_gate_desc_layout);
+			if (res != VK_SUCCESS) {
+				U_LOG_E("Leia VK DP: alpha-gate desc layout failed: %d", res);
+				return false;
+			}
+		}
+		// Push constants: uvec2 tile_count + uvec2 pad = 16 bytes.
+		{
+			VkPushConstantRange pc = {
+			    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+			    .offset = 0,
+			    .size = 16,
+			};
+			VkPipelineLayoutCreateInfo pli = {
+			    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+			    .setLayoutCount = 1, .pSetLayouts = &ldp->alpha_gate_desc_layout,
+			    .pushConstantRangeCount = 1, .pPushConstantRanges = &pc,
+			};
+			res = vk->vkCreatePipelineLayout(vk->device, &pli, NULL, &ldp->alpha_gate_pipeline_layout);
+			if (res != VK_SUCCESS) {
+				U_LOG_E("Leia VK DP: alpha-gate pipeline layout failed: %d", res);
+				return false;
+			}
+		}
+		// Descriptor pool + 1 set.
+		{
+			VkDescriptorPoolSize size = {
+			    .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			    .descriptorCount = 2,
+			};
+			VkDescriptorPoolCreateInfo dpi = {
+			    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+			    .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &size,
+			};
+			res = vk->vkCreateDescriptorPool(vk->device, &dpi, NULL, &ldp->alpha_gate_desc_pool);
+			if (res != VK_SUCCESS) {
+				U_LOG_E("Leia VK DP: alpha-gate desc pool failed: %d", res);
+				return false;
+			}
+			VkDescriptorSetAllocateInfo ai = {
+			    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+			    .descriptorPool = ldp->alpha_gate_desc_pool,
+			    .descriptorSetCount = 1,
+			    .pSetLayouts = &ldp->alpha_gate_desc_layout,
+			};
+			res = vk->vkAllocateDescriptorSets(vk->device, &ai, &ldp->alpha_gate_set);
+			if (res != VK_SUCCESS) {
+				U_LOG_E("Leia VK DP: alpha-gate desc set alloc failed: %d", res);
+				return false;
+			}
+		}
+		// Build pipeline against ck_strip_rp (writes swap-chain image).
+		VkShaderModule ag_vs = VK_NULL_HANDLE, ag_fs = VK_NULL_HANDLE;
+		res = ck_create_shader_module(vk, leia_shaders_fullscreen_tri_vert,
+		                              sizeof(leia_shaders_fullscreen_tri_vert), &ag_vs);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("Leia VK DP: alpha-gate vs create failed: %d", res);
+			return false;
+		}
+		res = ck_create_shader_module(vk, leia_shaders_alpha_gate_frag,
+		                              sizeof(leia_shaders_alpha_gate_frag), &ag_fs);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("Leia VK DP: alpha-gate fs create failed: %d", res);
+			vk->vkDestroyShaderModule(vk->device, ag_vs, NULL);
+			return false;
+		}
+
+		VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+		VkPipelineInputAssemblyStateCreateInfo ia = {
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+		    .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+		};
+		VkPipelineViewportStateCreateInfo vps = {
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+		    .viewportCount = 1, .scissorCount = 1,
+		};
+		VkPipelineRasterizationStateCreateInfo rs = {
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+		    .polygonMode = VK_POLYGON_MODE_FILL,
+		    .cullMode = VK_CULL_MODE_NONE,
+		    .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+		    .lineWidth = 1.0f,
+		};
+		VkPipelineMultisampleStateCreateInfo ms = {
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+		    .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+		};
+		VkPipelineColorBlendAttachmentState ba = {
+		    .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+		                      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+		};
+		VkPipelineColorBlendStateCreateInfo cb = {
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+		    .attachmentCount = 1, .pAttachments = &ba,
+		};
+		VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+		VkPipelineDynamicStateCreateInfo dynstate = {
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+		    .dynamicStateCount = 2, .pDynamicStates = dyn,
+		};
+		VkPipelineShaderStageCreateInfo stages[2] = {
+		    {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+		     .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = ag_vs, .pName = "main"},
+		    {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+		     .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = ag_fs, .pName = "main"},
+		};
+		VkGraphicsPipelineCreateInfo pi = {
+		    .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+		    .stageCount = 2, .pStages = stages,
+		    .pVertexInputState = &vi,
+		    .pInputAssemblyState = &ia,
+		    .pViewportState = &vps,
+		    .pRasterizationState = &rs,
+		    .pMultisampleState = &ms,
+		    .pColorBlendState = &cb,
+		    .pDynamicState = &dynstate,
+		    .layout = ldp->alpha_gate_pipeline_layout,
+		    .renderPass = ldp->ck_strip_rp,
+		    .subpass = 0,
+		};
+		res = vk->vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &pi, NULL, &ldp->alpha_gate_pipeline);
+		vk->vkDestroyShaderModule(vk->device, ag_fs, NULL);
+		vk->vkDestroyShaderModule(vk->device, ag_vs, NULL);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("Leia VK DP: alpha-gate pipeline create failed: %d", res);
+			return false;
+		}
+	}
+
 	ldp->compose_inited = true;
-	U_LOG_W("Leia VK DP: compose-under-bg pipeline ready");
+	U_LOG_W("Leia VK DP: compose-under-bg + alpha-gate pipelines ready");
 	return true;
 }
 
@@ -1487,11 +1646,152 @@ compose_run_pre_weave(struct leia_display_processor *ldp,
 	return ldp->ck_fill_view;
 }
 
+/*
+ * Post-weave alpha-gate. Mirrors ck_run_post_weave_strip's backbuffer copy
+ * dance but binds 2 SRVs (strip_view = back-buffer copy, atlas_view) and
+ * the alpha-gate pipeline. Output is premultiplied RGBA — pixels matching
+ * the "all views α==0" mask get (0,0,0,0); others get woven RGB at α=1.
+ *
+ * On entry: target_image is in PRESENT_SRC_KHR. On exit: same.
+ */
+static void
+alpha_gate_run_post_weave(struct leia_display_processor *ldp,
+                          VkCommandBuffer cmd,
+                          VkImage target_image,
+                          VkImageView atlas_view,
+                          uint32_t w, uint32_t h,
+                          uint32_t tile_columns, uint32_t tile_rows)
+{
+	struct vk_bundle *vk = ldp->vk;
+
+	if (!ck_ensure_strip_source(ldp, w, h)) return;
+	VkFramebuffer strip_fb = ck_get_strip_fb(ldp, target_image, w, h);
+	if (strip_fb == VK_NULL_HANDLE) return;
+
+	// Update alpha-gate descriptor set: slot 0 = strip_view (backbuffer copy),
+	// slot 1 = atlas_view.
+	VkDescriptorImageInfo infos[2] = {
+	    {.sampler = ldp->compose_sampler, .imageView = ldp->ck_strip_view,
+	     .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+	    {.sampler = ldp->compose_sampler, .imageView = atlas_view,
+	     .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+	};
+	VkWriteDescriptorSet writes[2] = {
+	    {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+	     .dstSet = ldp->alpha_gate_set, .dstBinding = 0, .descriptorCount = 1,
+	     .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	     .pImageInfo = &infos[0]},
+	    {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+	     .dstSet = ldp->alpha_gate_set, .dstBinding = 1, .descriptorCount = 1,
+	     .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	     .pImageInfo = &infos[1]},
+	};
+	vk->vkUpdateDescriptorSets(vk->device, 2, writes, 0, NULL);
+
+	// target PRESENT_SRC_KHR → TRANSFER_SRC; strip_image UNDEFINED/SR → TRANSFER_DST.
+	VkImageMemoryBarrier pre[2] = {
+	    {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	     .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	     .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	     .oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+	     .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	     .image = target_image,
+	     .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}},
+	    {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	     .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	     .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	     .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	     .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	     .image = ldp->ck_strip_image,
+	     .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}},
+	};
+	vk->vkCmdPipelineBarrier(cmd,
+	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	    VK_PIPELINE_STAGE_TRANSFER_BIT,
+	    0, 0, NULL, 0, NULL, 2, pre);
+
+	VkImageCopy region = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .extent = {w, h, 1},
+	};
+	vk->vkCmdCopyImage(cmd,
+	    target_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    ldp->ck_strip_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    1, &region);
+
+	// target TRANSFER_SRC → COLOR_ATTACHMENT (will be written by the gate
+	// draw via ck_strip_rp); strip_image TRANSFER_DST → SHADER_READ.
+	VkImageMemoryBarrier mid[2] = {
+	    {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	     .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	     .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	     .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	     .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	     .image = target_image,
+	     .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}},
+	    {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	     .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	     .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	     .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	     .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	     .image = ldp->ck_strip_image,
+	     .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}},
+	};
+	vk->vkCmdPipelineBarrier(cmd,
+	    VK_PIPELINE_STAGE_TRANSFER_BIT,
+	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	    0, 0, NULL, 0, NULL, 2, mid);
+
+	VkRenderPassBeginInfo rpbi = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+	    .renderPass = ldp->ck_strip_rp,
+	    .framebuffer = strip_fb,
+	    .renderArea = {{0, 0}, {w, h}},
+	};
+	vk->vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+
+	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ldp->alpha_gate_pipeline);
+	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+	                             ldp->alpha_gate_pipeline_layout, 0, 1, &ldp->alpha_gate_set, 0, NULL);
+
+	struct { uint32_t tile_count[2]; uint32_t pad[2]; } push = {};
+	push.tile_count[0] = tile_columns;
+	push.tile_count[1] = tile_rows;
+	vk->vkCmdPushConstants(cmd, ldp->alpha_gate_pipeline_layout,
+	                        VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+
+	VkViewport vp = {0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f};
+	VkRect2D sc = {{0, 0}, {w, h}};
+	vk->vkCmdSetViewport(cmd, 0, 1, &vp);
+	vk->vkCmdSetScissor(cmd, 0, 1, &sc);
+
+	vk->vkCmdDraw(cmd, 3, 1, 0, 0);
+	vk->vkCmdEndRenderPass(cmd);
+}
+
 static void
 compose_release_resources(struct leia_display_processor *ldp)
 {
 	if (ldp == NULL || ldp->vk == NULL) return;
 	struct vk_bundle *vk = ldp->vk;
+
+	if (ldp->alpha_gate_pipeline != VK_NULL_HANDLE) {
+		vk->vkDestroyPipeline(vk->device, ldp->alpha_gate_pipeline, NULL);
+		ldp->alpha_gate_pipeline = VK_NULL_HANDLE;
+	}
+	if (ldp->alpha_gate_desc_pool != VK_NULL_HANDLE) {
+		vk->vkDestroyDescriptorPool(vk->device, ldp->alpha_gate_desc_pool, NULL);
+		ldp->alpha_gate_desc_pool = VK_NULL_HANDLE;
+	}
+	if (ldp->alpha_gate_pipeline_layout != VK_NULL_HANDLE) {
+		vk->vkDestroyPipelineLayout(vk->device, ldp->alpha_gate_pipeline_layout, NULL);
+		ldp->alpha_gate_pipeline_layout = VK_NULL_HANDLE;
+	}
+	if (ldp->alpha_gate_desc_layout != VK_NULL_HANDLE) {
+		vk->vkDestroyDescriptorSetLayout(vk->device, ldp->alpha_gate_desc_layout, NULL);
+		ldp->alpha_gate_desc_layout = VK_NULL_HANDLE;
+	}
 
 	if (ldp->compose_pipeline != VK_NULL_HANDLE) {
 		vk->vkDestroyPipeline(vk->device, ldp->compose_pipeline, NULL);
@@ -1719,6 +2019,20 @@ leia_dp_process_atlas(struct xrt_display_processor *xdp,
 	             (int)target_height,
 	             (VkFormat)target_format);
 
+	// Post-weave transparency pass:
+	//   - compose path: alpha-gate samples the ORIGINAL atlas to derive
+	//     the screen-space "all views α==0" mask, zeroes alpha on those
+	//     pixels — DWM blends the LIVE desktop (no captured-bg lag, no
+	//     magenta fringe at silhouettes).
+	//   - chroma-key fallback: legacy strip.
+#ifdef _WIN32
+	if (compose_active && target_image != (VkImage_XDP)VK_NULL_HANDLE) {
+		alpha_gate_run_post_weave(ldp, cmd_buffer,
+		                          (VkImage)target_image, atlas_view,
+		                          target_width, target_height,
+		                          tile_columns, tile_rows);
+	} else
+#endif
 	if (ck_active) {
 		ck_run_post_weave_strip(ldp, cmd_buffer, (VkImage)target_image,
 		                         target_width, target_height);
