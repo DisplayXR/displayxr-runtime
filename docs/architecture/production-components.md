@@ -152,4 +152,4 @@ The reference **shell** and **bridge** do not auto-start.
 - [App Classes](../getting-started/app-classes.md) — the four app integration modes (handle, texture, hosted, IPC)
 - [Separation of Concerns](separation-of-concerns.md) — layer boundaries and what each layer owns
 - [Workspace/Runtime Contract](../roadmap/workspace-runtime-contract.md) — IPC protocol between a workspace controller and the service
-- [MCP Spec v0.2](../roadmap/mcp-spec-v0.2.md) — AI-native runtime control over Model Context Protocol
+- [MCP Spec](https://github.com/DisplayXR/displayxr-mcp/blob/main/docs/mcp-spec.md) — AI-native runtime control over Model Context Protocol (extracted to [`DisplayXR/displayxr-mcp`](https://github.com/DisplayXR/displayxr-mcp))

@@ -26,7 +26,7 @@ Legacy apps don't know about rendering modes, so the runtime provides a **compro
 
 The compromise scaling is computed in `oxr_system_fill_in()`. The `legacy_app_tile_scaling` flag on `xrt_system_compositor_info` disables 1/2/3 key mode selection for legacy apps (V toggle only).
 
-See [ADR-006](../adr/ADR-006-legacy-app-compromise-view-scale.md) for the design rationale and [Legacy App Support](../specs/legacy-app-support.md) for the full algorithm (Case A/B).
+See [ADR-006](../adr/ADR-006-legacy-app-compromise-view-scale.md) for the design rationale and [Legacy App Support](../specs/runtime/legacy-app-support.md) for the full algorithm (Case A/B).
 
 ## Runtime Behavior
 
@@ -39,6 +39,6 @@ The runtime detects which type of app it's dealing with at session creation time
 
 ## Further Reading
 
-- [Multiview Tiling](../specs/multiview-tiling.md) — atlas layout algorithm
-- [Legacy App Support](../specs/legacy-app-support.md) — full compromise scaling algorithm
-- [XR_EXT_display_info](../specs/XR_EXT_display_info.md) — the extension specification
+- [Multiview Tiling](../specs/runtime/multiview-tiling.md) — atlas layout algorithm
+- [Legacy App Support](../specs/runtime/legacy-app-support.md) — full compromise scaling algorithm
+- [XR_EXT_display_info](../specs/extensions/XR_EXT_display_info.md) — the extension specification

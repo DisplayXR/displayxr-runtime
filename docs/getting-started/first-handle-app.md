@@ -193,7 +193,7 @@ xrEnumerateSwapchainImages(xr.swapchain.swapchain, count, &count,
 // Each image has: swapchainImages[i].texture (ID3D11Texture2D*)
 ```
 
-The swapchain is worst-case sized — large enough for any rendering mode's atlas. Individual modes may use only a portion. See [Swapchain Model](../specs/swapchain-model.md) for details.
+The swapchain is worst-case sized — large enough for any rendering mode's atlas. Individual modes may use only a portion. See [Swapchain Model](../specs/runtime/swapchain-model.md) for details.
 
 ---
 
@@ -356,8 +356,8 @@ See the corresponding test apps for each API: `cube_handle_metal_macos`, `cube_h
 ## Further Reading
 
 - [App Classes](app-classes.md) — understand all four integration modes
-- [Swapchain Model](../specs/swapchain-model.md) — two-swapchain architecture and canvas concept
-- [Multiview Tiling](../specs/multiview-tiling.md) — atlas layout algorithm
+- [Swapchain Model](../specs/runtime/swapchain-model.md) — two-swapchain architecture and canvas concept
+- [Multiview Tiling](../specs/runtime/multiview-tiling.md) — atlas layout algorithm
 - [Kooima Projection](../architecture/kooima-projection.md) — stereo math for display-centric rendering
-- [XR_EXT_display_info](../specs/XR_EXT_display_info.md) — full extension specification
-- [XR_EXT_win32_window_binding](../specs/XR_EXT_win32_window_binding.md) — window binding specification
+- [XR_EXT_display_info](../specs/extensions/XR_EXT_display_info.md) — full extension specification
+- [XR_EXT_win32_window_binding](../specs/extensions/XR_EXT_win32_window_binding.md) — window binding specification

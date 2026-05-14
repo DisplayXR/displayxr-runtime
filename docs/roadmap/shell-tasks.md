@@ -169,8 +169,6 @@ Multi compositor window is always full-screen = physical display size:
 
 **Test:** Press Ctrl+Space → all open windows appear in spatial layout. Click Notepad → 2D mode. Click cube app → 3D mode. Press Ctrl+Space again → all windows back in original positions.
 
-**Full plan:** [shell-phase4-plan.md](shell-phase4-plan.md)
-
 | | Task | Size | Repo | Description |
 |---|------|------|------|-------------|
 | [x] | 4A.1 | L | runtime | `Windows.Graphics.Capture` integration — per-HWND capture delivering `ID3D11Texture2D` frames |
@@ -188,8 +186,6 @@ Multi compositor window is always full-screen = physical display size:
 **Completed:** 4A (capture compositor), 4B (window adoption + auto 2D/3D switch). Input forwarding parked.
 
 ### Phase 4C: Graceful Exit + App Launcher
-
-**Full plan:** [shell-phase4c-plan.md](shell-phase4c-plan.md) | **Status:** [shell-phase4c-status.md](shell-phase4c-status.md)
 
 | | Task | Size | Repo | Description |
 |---|------|------|------|-------------|

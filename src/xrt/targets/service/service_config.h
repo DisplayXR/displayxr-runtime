@@ -54,7 +54,7 @@ struct service_config
 	//!
 	//! The runtime owns no specific workspace app — workspace controllers
 	//! register themselves from their own installer. See
-	//! `docs/specs/workspace-controller-registration.md`.
+	//! `docs/specs/runtime/workspace-controller-registration.md`.
 	char workspace_binary[SERVICE_WORKSPACE_BINARY_MAX];
 };
 

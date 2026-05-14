@@ -43,7 +43,7 @@ Recommended manifest (this is the version that gets you featured):
 }
 ```
 
-That's the whole authoring surface. Full spec: [`docs/specs/displayxr-app-manifest.md`](../specs/displayxr-app-manifest.md).
+That's the whole authoring surface. Full spec: [`docs/specs/runtime/displayxr-app-manifest.md`](../specs/runtime/displayxr-app-manifest.md).
 
 ---
 
@@ -89,7 +89,7 @@ Authoring a 3D icon takes the same effort as the existing 2D icon, in any of the
 - **Unreal** — same flow, exposed via the [DisplayXR Unreal plugin](https://github.com/DisplayXR/displayxr-unreal) menu.
 - **Native apps** — render two offset views of your scene with asymmetric frustums, save side-by-side. ~20 lines of code, runs once.
 
-Convergence guidance and parallax budget: §4.2 of the [manifest spec](../specs/displayxr-app-manifest.md). Aim for a comfortable 40 cm convergence with ±2% of image width as the parallax range. Most authoring engines render this without issue — there is no "doing the stereo math wrong" failure mode that lands you in a malformed file.
+Convergence guidance and parallax budget: §4.2 of the [manifest spec](../specs/runtime/displayxr-app-manifest.md). Aim for a comfortable 40 cm convergence with ±2% of image width as the parallax range. Most authoring engines render this without issue — there is no "doing the stereo math wrong" failure mode that lands you in a malformed file.
 
 If you skip `icon_3d`, your tile falls back to the 2D `icon` rendered as a flat quad. You're not punished — but you're also not differentiated. The 3D logo is what makes the platform feel like a platform.
 
@@ -117,7 +117,7 @@ For in-tree development, you can also use sidecar mode — drop the manifest nex
 | Ship a minimum manifest in 30 seconds | Copy the two-line JSON above next to your `.exe`, name it `<exe_basename>.displayxr.json` |
 | Add a 3D icon | Use the Unity / Unreal plugin menu item, or render two offset views in your engine |
 | See a working example | The reference cube apps under `test_apps/cube_handle_*_win/` ship full manifests with 3D icons |
-| Read the full spec | [`docs/specs/displayxr-app-manifest.md`](../specs/displayxr-app-manifest.md) |
+| Read the full spec | [`docs/specs/runtime/displayxr-app-manifest.md`](../specs/runtime/displayxr-app-manifest.md) |
 | Submit your app to the public showcase | (Coming soon — manifested apps will be auto-eligible) |
 
 ---

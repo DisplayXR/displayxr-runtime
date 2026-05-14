@@ -272,7 +272,7 @@ The bridge talks to the compositor via Win32 HWND properties (named atoms). You 
 | `DXR_RequestMode` | bridge | compositor | App-requested rendering-mode index (encoded `index + 1`). |
 | `DXR_InSizeMove` | compositor window | bridge | Set during `WM_ENTERSIZEMOVE` / cleared `WM_EXITSIZEMOVE`. Bridge gates input forwarding on this. |
 
-See [`docs/roadmap/webxr-bridge-v2-phase5-status.md`](../docs/roadmap/webxr-bridge-v2-phase5-status.md) for the architectural rationale.
+See [`docs/roadmap/webxr-bridge-v2-plan.md`](../docs/roadmap/webxr-bridge-v2-plan.md) for the architectural rationale.
 
 ## Common pitfalls
 
@@ -295,5 +295,5 @@ See [`docs/roadmap/webxr-bridge-v2-phase5-status.md`](../docs/roadmap/webxr-brid
 | [`extension/src/main-world.js`](extension/src/main-world.js) | The shim that exposes `session.displayXR`. |
 | [`../test_apps/common/display3d_view.c`](../test_apps/common/display3d_view.c) | Canonical Kooima math (C). The JS ports mirror this. |
 | [`../test_apps/cube_handle_d3d11_win/main.cpp`](../test_apps/cube_handle_d3d11_win/main.cpp) | Native equivalent of the WebXR sample. Same conventions. |
-| [`../docs/specs/XR_EXT_display_info.md`](../docs/specs/XR_EXT_display_info.md) | Underlying OpenXR extension that the bridge surfaces over WS. |
+| [`../docs/specs/extensions/XR_EXT_display_info.md`](../docs/specs/extensions/XR_EXT_display_info.md) | Underlying OpenXR extension that the bridge surfaces over WS. |
 | [`../docs/roadmap/webxr-bridge-v2-plan.md`](../docs/roadmap/webxr-bridge-v2-plan.md) | Architecture rationale: why the bridge exists. |

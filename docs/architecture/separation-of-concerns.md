@@ -87,7 +87,7 @@ The spatial-workspace surface (`XR_EXT_spatial_workspace`, spec_version 7) split
 
 After Phase 2.C the runtime ships with **zero default chrome**. Workspace clients render as bare content quads unless a controller submits a chrome swapchain via `xrCreateWorkspaceClientChromeSwapchainEXT`. This means controllers (third-party shells, accessibility overlays, OEM skins) can change chrome appearance, geometry, and behavior without forking the runtime.
 
-**Reference**: `feedback_controllers_own_motion` for the architectural North Star; `docs/specs/XR_EXT_spatial_workspace.md` for the surface; `src/xrt/targets/shell/shell_chrome.cpp` for the reference chrome implementation.
+**Reference**: `feedback_controllers_own_motion` for the architectural North Star; `docs/specs/extensions/XR_EXT_spatial_workspace.md` for the surface; `src/xrt/targets/shell/shell_chrome.cpp` for the reference chrome implementation.
 
 ## Data Flow Examples
 

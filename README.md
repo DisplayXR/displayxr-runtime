@@ -56,7 +56,7 @@ brew install cmake ninja eigen vulkan-sdk && ./scripts/build_macos.sh
 XR_RUNTIME_JSON=./build/Release/openxr_displayxr-dev.json ./your_openxr_app
 ```
 
-Pre-built installers from [GitHub Releases](https://github.com/DisplayXR/displayxr-runtime/releases). For the spatial-workspace experience, also install the [DisplayXR Shell](https://github.com/DisplayXR/displayxr-shell-releases/releases) (separate installer, registers with the runtime via the [workspace controller contract](docs/specs/workspace-controller-registration.md)).
+Pre-built installers from [GitHub Releases](https://github.com/DisplayXR/displayxr-runtime/releases). For the spatial-workspace experience, also install the [DisplayXR Shell](https://github.com/DisplayXR/displayxr-shell-releases/releases) (separate installer, registers with the runtime via the [workspace controller contract](docs/specs/runtime/workspace-controller-registration.md)).
 
 See [Building DisplayXR](docs/getting-started/building.md) for full instructions and CMake options.
 
@@ -81,7 +81,7 @@ XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./build/test_apps/cube_handle_
 ### Key References
 
 - [App Classes](docs/getting-started/app-classes.md) — handle, texture, hosted, IPC
-- [XR_EXT_display_info](docs/specs/XR_EXT_display_info.md) — display properties and rendering mode extension
+- [XR_EXT_display_info](docs/specs/extensions/XR_EXT_display_info.md) — display properties and rendering mode extension
 - [Kooima Projection](docs/architecture/kooima-projection.md) — stereo math and projection pipelines
 - [Separation of Concerns](docs/architecture/separation-of-concerns.md) — layer boundaries
 - [displayxr-mcp](https://github.com/DisplayXR/displayxr-mcp) — embeddable MCP server framework. End users opt in to AI-agent / voice control by installing **DisplayXR MCP Tools** ([releases](https://github.com/DisplayXR/displayxr-mcp/releases)), which writes `HKLM\Software\DisplayXR\Capabilities\MCP\Enabled=1`; the runtime reads this at startup and spawns a per-app MCP server. `DISPLAYXR_MCP=1` (or `=0`) is still supported as a process-local override for CI / dev. Runtime registers Phase A handle-app introspection tools (`list_sessions`, `get_display_info`, `capture_frame`, `tail_log`, …) per app process; the reference shell hosts Phase B workspace tools. Spec at [`displayxr-mcp/docs/mcp-spec.md`](https://github.com/DisplayXR/displayxr-mcp/blob/main/docs/mcp-spec.md).

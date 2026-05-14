@@ -61,8 +61,8 @@ Key facts for AI context: `_handle` and `_texture` are always extension apps. `_
 - Compositor vtable has 56 methods — use `comp_base` helper for boilerplate
 - IPC/service mode (`ipc/`, `compositor/client/`, `compositor/multi/`) must be preserved for `_ipc` apps, WebXR, and multi-app spatial shell
 - `compositor/null/` — headless compositor for testing
-- **Two distinct swapchains** — see `docs/specs/swapchain-model.md`
-- **Canvas concept** — view dims and Kooima projection use canvas size, not display size. See `docs/specs/swapchain-model.md`.
+- **Two distinct swapchains** — see `docs/specs/runtime/swapchain-model.md`
+- **Canvas concept** — view dims and Kooima projection use canvas size, not display size. See `docs/specs/runtime/swapchain-model.md`.
 - **Compositor pipeline** — see `docs/architecture/compositor-pipeline.md`
 
 For the vendor isolation rule and layer "must NOT contain" constraints, see `docs/architecture/separation-of-concerns.md`.
@@ -100,7 +100,7 @@ runtime's tree, and registers itself at
 `HKLM\Software\DisplayXR\WorkspaceControllers\shell` for the service
 orchestrator to discover. The runtime owns no specific workspace app
 — third-party verticals follow the same registration contract. See
-`docs/specs/workspace-controller-registration.md`.
+`docs/specs/runtime/workspace-controller-registration.md`.
 
 **When on a Windows machine with a Leia SR display, prefer local builds over CI** — iterate faster with `scripts\build_windows.bat build` and test directly. Run scripts are generated in `_package/` (see Windows Test App section below).
 
@@ -195,7 +195,7 @@ The skill's auto-bump regex is intentionally strict (`^v[0-9]+\.[0-9]+\.[0-9]+$`
 | `DisplayXR/displayxr-extensions` | Public | OpenXR extension headers, auto-synced from this repo's `src/external/openxr_includes/` (consumed by shell-pvt + 3rd-party workspace apps) |
 | `DisplayXR/displayxr-demo-<name>` | Public | Standalone demo repos with independent evolution. Currently `displayxr-demo-gaussiansplat`. No source-mirror from this repo. |
 
-Shell source moved to `displayxr-shell-pvt` in 2026-05 (Phase 2.J Step 1). The runtime no longer carries any shell code; the discovery contract is documented at `docs/specs/workspace-controller-registration.md`.
+Shell source moved to `displayxr-shell-pvt` in 2026-05 (Phase 2.J Step 1). The runtime no longer carries any shell code; the discovery contract is documented at `docs/specs/runtime/workspace-controller-registration.md`.
 
 ### Issue Management
 
@@ -257,8 +257,8 @@ Compositor never weaves — that's the DP's job: `docs/adr/ADR-007-compositor-ne
 - `XR_EXT_display_info` — Display dimensions, eye tracking modes
 - `XR_EXT_android_surface_binding` — Android surface binding
 
-Full extension specs: `docs/specs/XR_EXT_display_info.md`, `docs/specs/XR_EXT_win32_window_binding.md`, `docs/specs/XR_EXT_cocoa_window_binding.md`.
-Eye tracking MANAGED vs MANUAL contract: `docs/specs/eye-tracking-modes.md`.
+Full extension specs: `docs/specs/extensions/XR_EXT_display_info.md`, `docs/specs/extensions/XR_EXT_win32_window_binding.md`, `docs/specs/extensions/XR_EXT_cocoa_window_binding.md`.
+Eye tracking MANAGED vs MANUAL contract: `docs/specs/vendor/eye-tracking-modes.md`.
 
 ## Development Notes
 
@@ -368,22 +368,23 @@ See `docs/README.md` for a complete index. Key docs by task:
 | When you need to... | Read |
 |---|---|
 | Understand layer boundaries (what goes where) | `docs/architecture/separation-of-concerns.md` |
-| Build a workspace app (shell-style controller) | `docs/specs/workspace-controller-registration.md` |
+| Build a workspace app (shell-style controller) | `docs/specs/runtime/workspace-controller-registration.md` |
 | Add a new display vendor | `docs/guides/vendor-integration.md` |
-| Understand multiview tiling / atlas layout | `docs/specs/multiview-tiling.md` |
-| Understand extension API (display_info, window bindings) | `docs/specs/XR_EXT_display_info.md` |
-| Know why an architectural decision was made | `docs/adr/` (10 ADRs) |
+| Understand multiview tiling / atlas layout | `docs/specs/runtime/multiview-tiling.md` |
+| Understand extension API (display_info, window bindings) | `docs/specs/extensions/XR_EXT_display_info.md` |
+| Know why an architectural decision was made | `docs/adr/` (16 ADRs) |
 | Understand legacy vs extension app differences | `docs/architecture/extension-vs-legacy.md` |
-| Understand eye tracking MANAGED/MANUAL contract | `docs/specs/eye-tracking-modes.md` |
+| Understand eye tracking MANAGED/MANUAL contract | `docs/specs/vendor/eye-tracking-modes.md` |
 | Add a new OpenXR extension | `docs/guides/implementing-extension.md` |
 | Write a device driver | `docs/guides/writing-driver.md` |
-| Understand Leia SR weaver internals (DX11, DX12, GL, Vulkan) | `docs/reference/LeiaWeaver.md` |
-| Understand Leia transparency model (compose-under-bg + chroma-key) | `docs/reference/leia-transparency.md` |
+| Understand Leia SR weaver internals (DX11, DX12, GL, Vulkan) | `docs/vendors/leia/weaver.md` |
+| Understand Leia transparency model (compose-under-bg + chroma-key) | `docs/vendors/leia/transparency.md` |
 | Understand Kooima projection math | `docs/architecture/kooima-projection.md` |
 | Understand the compositor pipeline | `docs/architecture/compositor-pipeline.md` |
-| Understand the swapchain model / canvas | `docs/specs/swapchain-model.md` |
+| Understand the swapchain model / canvas | `docs/specs/runtime/swapchain-model.md` |
 | Track shell implementation progress | `docs/roadmap/shell-tasks.md` |
-| Shell Phase 2 plan and status | `docs/roadmap/shell-phase2-plan.md`, `shell-phase2-status.md` |
+| Shell Phase 2 plan | `docs/roadmap/shell-phase2-plan.md` |
+| Find vendor-specific docs (Leia, sim_display) | `docs/vendors/<vendor>/README.md` |
 | Understand the 3D capture pipeline | `docs/roadmap/3d-capture.md` |
 | Understand workspace/runtime IPC contract | `docs/roadmap/workspace-runtime-contract.md` |
 | Understand the overall product vision | `docs/roadmap/spatial-desktop-prd.md` |

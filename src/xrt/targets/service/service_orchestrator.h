@@ -87,7 +87,7 @@ service_orchestrator_get_workspace_entry(void);
  * already running, the new process hands the action off to it and
  * exits). No-op if no controller is registered.
  *
- * See `docs/specs/workspace-controller-registration.md` for the
+ * See `docs/specs/runtime/workspace-controller-registration.md` for the
  * `--workspace-action` command-line contract.
  */
 void

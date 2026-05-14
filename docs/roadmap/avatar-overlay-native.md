@@ -2,7 +2,7 @@
 
 Tracker for follow-on work after the transparent-HWND overlay path shipped (#191) and the Unity prototype demonstrated the feature end-to-end (`displayxr-unity#57`).
 
-For the design and API of the shipped feature, see [Transparent HWND Overlay (Post-Weave Chroma-Key)](../reference/chroma-key-transparent-overlay.md).
+For the design and API of the shipped feature, see [Transparent HWND Overlay (Post-Weave Chroma-Key)](../vendors/leia/chroma-key-overlay.md).
 
 ## Shipped
 
@@ -68,8 +68,8 @@ Plugin / app concern, not a runtime concern. Tracked here for completeness.
 
 ## References
 
-- [Transparent HWND Overlay (Post-Weave Chroma-Key)](../reference/chroma-key-transparent-overlay.md)
-- [Leia SR Weaver](../reference/LeiaWeaver.md)
+- [Transparent HWND Overlay (Post-Weave Chroma-Key)](../vendors/leia/chroma-key-overlay.md)
+- [Leia SR Weaver](../vendors/leia/weaver.md)
 - `XR_EXT_win32_window_binding` — `src/external/openxr_includes/openxr/XR_EXT_win32_window_binding.h`
 - Issue #190 — alpha-respecting weaver vendor request
 - Issue #191 — runtime-side transparent HWND fix (closed)

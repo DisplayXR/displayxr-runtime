@@ -1,6 +1,0 @@
-label,count,p50_ns,p95_ns,p99_ns,fps_p50
-frame:standalone-cube-inst0,3190,17624000,24716000,32572900,56.7
-frame:standalone-cube-inst1,3237,17571300,24984900,32475900,56.9
-frame:standalone-cube-inst2,3288,17571300,25086500,32220300,56.9
-frame:standalone-cube-inst3,3355,17509600,25190600,32423900,57.1
-frame:standalone-cube-ALL,13070,17568800,25024400,32506200,56.9

@@ -193,7 +193,7 @@ The runtime sidecar manifest (`<binary>.controller.json`) is gone —
 in the registry subkey: `Binary`, `DisplayName`, `Vendor`, `Version`,
 `UninstallString`.
 
-See `docs/specs/workspace-controller-registration.md` for the full
+See `docs/specs/runtime/workspace-controller-registration.md` for the full
 contract; `src/xrt/targets/service/service_workspace_registry.{c,h}`
 for the enumerator API.
 

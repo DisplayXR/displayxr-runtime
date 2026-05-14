@@ -12,7 +12,7 @@
 #   icon_sbs.png                    (optional — side-by-side stereo tile image)
 #
 # The shell scanner looks for `<exe_basename>.displayxr.json` next to each
-# discovered executable. See docs/specs/displayxr-app-manifest.md.
+# discovered executable. See docs/specs/runtime/displayxr-app-manifest.md.
 
 function(displayxr_install_manifest target manifest_dir)
     if(NOT IS_DIRECTORY "${manifest_dir}")

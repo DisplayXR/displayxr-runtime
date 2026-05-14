@@ -76,7 +76,7 @@ static HHOOK s_kbd_hook = NULL;
 // Workspace controllers register themselves at
 // HKLM\Software\DisplayXR\WorkspaceControllers\<id>; the runtime never writes
 // these keys and has no compiled-in knowledge of any specific controller. See
-// docs/specs/workspace-controller-registration.md.
+// docs/specs/runtime/workspace-controller-registration.md.
 static bool s_workspace_available = false;
 static struct workspace_controller_entry s_workspace_active = {0};
 

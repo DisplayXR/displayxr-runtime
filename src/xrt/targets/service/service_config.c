@@ -40,7 +40,7 @@ config_defaults(struct service_config *cfg)
 	// Empty = orchestrator picks the first registered workspace controller
 	// from HKLM\Software\DisplayXR\WorkspaceControllers. The runtime owns no
 	// specific workspace app; controllers self-register from their own
-	// installer. See docs/specs/workspace-controller-registration.md.
+	// installer. See docs/specs/runtime/workspace-controller-registration.md.
 	cfg->workspace_binary[0] = '\0';
 }
 

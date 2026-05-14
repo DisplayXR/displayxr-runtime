@@ -182,7 +182,7 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     // For transparent backgrounds the HWND must NOT have a redirection bitmap
     // and must NOT have a background brush — DComp's per-pixel alpha-out
     // composes through to the desktop only when both are absent. See
-    // docs/specs/XR_EXT_win32_window_binding.md "Transparent-window contract".
+    // docs/specs/extensions/XR_EXT_win32_window_binding.md "Transparent-window contract".
     wc.hbrBackground = transparent ? nullptr : (HBRUSH)GetStockObject(BLACK_BRUSH);
     wc.lpszClassName = WINDOW_CLASS;
 

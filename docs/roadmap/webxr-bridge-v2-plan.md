@@ -65,7 +65,7 @@ Both sessions coexist in the same service (service is multi-client capable since
 
 | Component | Location | What exists |
 |-----------|----------|-------------|
-| `XR_EXT_display_info` | `src/xrt/state_trackers/oxr/` + `docs/specs/XR_EXT_display_info.md` | Fully shipped; display dims, eye pos, supported rendering modes. |
+| `XR_EXT_display_info` | `src/xrt/state_trackers/oxr/` + `docs/specs/extensions/XR_EXT_display_info.md` | Fully shipped; display dims, eye pos, supported rendering modes. |
 | Rendering mode events | `src/xrt/state_trackers/oxr/oxr_session.c:855-885` | `XrEventDataRenderingModeChangedEXT` already pushed to IPC client sessions on DP mode changes. |
 | Legacy compromise branch | `src/xrt/state_trackers/oxr/oxr_system.c:155-183` | Hardcodes 0.5 × 1.0 for clients without `XR_EXT_display_info`. This is the branch Chrome's WebXR currently hits. |
 | Window-relative Kooima | `src/xrt/compositor/d3d11_service/comp_d3d11_service.cpp:8943-8969` | `comp_d3d11_service_get_client_window_metrics()` — Chrome's `xrLocateViews` already returns Kooima-correct projection matrices. |

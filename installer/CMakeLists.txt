@@ -78,5 +78,5 @@ endif()
 # installer does not bundle them. The DisplayXR Shell ships from
 # DisplayXR/displayxr-shell-pvt with its own installer/CMakeLists.txt
 # (publishes to displayxr-shell-releases). See
-# docs/specs/workspace-controller-registration.md for the
+# docs/specs/runtime/workspace-controller-registration.md for the
 # self-registration contract any workspace app uses.

@@ -27,7 +27,7 @@ extern "C" {
  * Single tray-menu action published by a workspace controller.
  * Populated from
  * `HKLM\Software\DisplayXR\WorkspaceControllers\<id>\Actions\<ordering>\`.
- * See `docs/specs/workspace-controller-registration.md` for the schema.
+ * See `docs/specs/runtime/workspace-controller-registration.md` for the schema.
  */
 struct workspace_controller_action
 {

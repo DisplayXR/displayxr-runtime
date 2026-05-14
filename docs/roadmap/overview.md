@@ -69,4 +69,4 @@ All documents in `docs/roadmap/` describe planned features that are not yet impl
 - [Multi-Display Single Machine](multi-display-single-machine.md) — multiple displays, one machine
 - [Multi-Display Networked](multi-display-networked.md) — displays across the network
 - [XR_VIEW_CONFIGURATION_PRIMARY_MULTIVIEW](XR_VIEW_CONFIGURATION_PRIMARY_MULTIVIEW.md) — Khronos multiview proposal
-- [MCP Spec v0.2](mcp-spec-v0.2.md) — AI-native runtime: expose live spatial state and control to agents over Model Context Protocol
+- [MCP Spec](https://github.com/DisplayXR/displayxr-mcp/blob/main/docs/mcp-spec.md) — AI-native runtime: expose live spatial state and control to agents over Model Context Protocol (extracted to [`DisplayXR/displayxr-mcp`](https://github.com/DisplayXR/displayxr-mcp))

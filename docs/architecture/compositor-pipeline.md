@@ -65,7 +65,7 @@ The combined atlas itself is presented opaquely to the display
 processor — per-tile alpha lets one client tile reveal the workspace
 background through its transparent regions, but the workspace's
 output to the desktop is always opaque. See
-[`workspace-controller-registration.md`](../specs/workspace-controller-registration.md#workspace-output-is-opaque)
+[`workspace-controller-registration.md`](../specs/runtime/workspace-controller-registration.md#workspace-output-is-opaque)
 for why.
 
 ## Display Processor Interface
@@ -80,10 +80,10 @@ The `process_atlas()` method exists in 5 API-specific variants:
 | Metal | `xrt_display_processor_metal.h` |
 | OpenGL | `xrt_display_processor_gl.h` |
 
-See [Display Processor Interface](../specs/display-processor-interface.md) for the unified vtable design and [Vendor Integration Guide](../guides/vendor-integration.md) for implementation guidance.
+See [Display Processor Interface](../specs/vendor/display-processor-interface.md) for the unified vtable design and [Vendor Integration Guide](../guides/vendor-integration.md) for implementation guidance.
 
 ## Further Reading
 
-- [Swapchain Model](../specs/swapchain-model.md) — two-swapchain architecture and canvas concept
+- [Swapchain Model](../specs/runtime/swapchain-model.md) — two-swapchain architecture and canvas concept
 - [Separation of Concerns](separation-of-concerns.md) — layer boundaries
 - [ADR-003: Vendor Abstraction](../adr/ADR-003-vendor-abstraction-via-display-processor-vtable.md) — why vendor code is isolated behind the DP vtable
