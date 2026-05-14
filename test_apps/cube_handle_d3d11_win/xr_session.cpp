@@ -236,6 +236,19 @@ bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd) {
     XrWin32WindowBindingCreateInfoEXT sessionTarget = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT};
     sessionTarget.windowHandle = hwnd;
 
+    // Opt-in transparency. Pair with WS_EX_NOREDIRECTIONBITMAP + null brush
+    // (main.cpp) and the α=0 clear (render loop). chromaKeyColor=0 lets the
+    // Leia DP pick its default magenta (used only if WGC bg-capture fails
+    // and the DP falls back to the chroma-key trick).
+    {
+        const char *e = getenv("DISPLAYXR_TRANSPARENT_BG");
+        if (e != nullptr && *e != '\0' && *e != '0') {
+            sessionTarget.transparentBackgroundEnabled = XR_TRUE;
+            sessionTarget.chromaKeyColor = 0;
+            LOG_INFO("Transparent background ENABLED (DISPLAYXR_TRANSPARENT_BG=1)");
+        }
+    }
+
     if (xr.hasWin32WindowBindingExt && hwnd) {
         // Chain: sessionInfo -> d3d11Binding -> sessionTarget
         d3d11Binding.next = &sessionTarget;

@@ -176,9 +176,21 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
+// DISPLAYXR_TRANSPARENT_BG=1 → cube clears RGBA(0,0,0,0), window uses
+// WS_EX_NOREDIRECTIONBITMAP + null brush so DComp can show the desktop
+// through the cube's transparent regions. Mirrors cube_handle_vk_win.
+static bool TransparentBackgroundEnabled() {
+    static const bool e = []() {
+        const char *v = getenv("DISPLAYXR_TRANSPARENT_BG");
+        return v != nullptr && *v != '\0' && *v != '0';
+    }();
+    return e;
+}
+
 // Create the application window
 static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
-    LOG_INFO("Creating application window (%dx%d)", width, height);
+    const bool transparent = TransparentBackgroundEnabled();
+    LOG_INFO("Creating application window (%dx%d, transparent=%d)", width, height, transparent);
 
     WNDCLASSEX wc = {};
     wc.cbSize = sizeof(WNDCLASSEX);
@@ -186,7 +198,9 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    // Null brush in transparent mode so the redirection bitmap doesn't paint
+    // black under the DComp composition swap chain.
+    wc.hbrBackground = transparent ? nullptr : (HBRUSH)GetStockObject(BLACK_BRUSH);
     wc.lpszClassName = WINDOW_CLASS;
 
     if (!RegisterClassEx(&wc)) {
@@ -200,8 +214,9 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     RECT rect = { 0, 0, width, height };
     AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
 
+    DWORD exStyle = transparent ? WS_EX_NOREDIRECTIONBITMAP : 0;
     HWND hwnd = CreateWindowEx(
-        0,
+        exStyle,
         WINDOW_CLASS,
         WINDOW_TITLE,
         WS_OVERLAPPEDWINDOW,
@@ -597,8 +612,18 @@ static void RenderOneFrame(RenderState& rs) {
                         CreateRenderTargetView(renderer, swapchainTexture,
                             static_cast<DXGI_FORMAT>(xr.swapchain.format), &rtv);
 
-                        // Clear entire color+depth once before eye loop
-                        float clearColor[4] = {0.05f, 0.05f, 0.25f, 1.0f};
+                        // Clear entire color+depth once before eye loop.
+                        // Transparent mode (DISPLAYXR_TRANSPARENT_BG=1): clear to
+                        // RGBA(0,0,0,0) so the Leia DP's compose-under-bg pass
+                        // shows the desktop wherever the cube didn't draw.
+                        float clearColor[4];
+                        if (TransparentBackgroundEnabled()) {
+                            clearColor[0] = 0.0f; clearColor[1] = 0.0f;
+                            clearColor[2] = 0.0f; clearColor[3] = 0.0f;
+                        } else {
+                            clearColor[0] = 0.05f; clearColor[1] = 0.05f;
+                            clearColor[2] = 0.25f; clearColor[3] = 1.0f;
+                        }
                         renderer.context->ClearRenderTargetView(rtv, clearColor);
                         renderer.context->ClearDepthStencilView(rs.depthDSV.Get(),
                             D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);

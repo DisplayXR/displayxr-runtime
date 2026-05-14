@@ -19,11 +19,13 @@
 
 #include "leia_display_processor_d3d11.h"
 #include "leia_sr_d3d11.h"
+#include "leia_bg_capture_win.h"
 
 #include "xrt/xrt_display_metrics.h"
 #include "util/u_logging.h"
 
 #include <d3d11.h>
+#include <d3d11_4.h>  // ID3D11DeviceContext4 + ID3D11Fence — used by the bg-compose path.
 #include <d3dcompiler.h>
 #include <cstdlib>
 #include <cstring>
@@ -128,6 +130,46 @@ struct ChromaKeyConstants {
  */
 static constexpr uint32_t kDefaultChromaKey = 0x00FF00FF;
 
+/*
+ * Compose-under-bg pre-weave fill pixel shader.
+ *
+ * Per-tile composes the captured desktop region behind the window UNDER the
+ * app's RGBA atlas, outputting opaque RGB the SR weaver can consume. Replaces
+ * the chroma-key trick for sessions that have a working WGC capture.
+ *
+ *   out = lerp(bg, atlas.rgb, atlas.a),  out.a = 1
+ *
+ * The desktop sits at z=0 (display plane) so the same captured region is
+ * sampled into every tile; per-eye parallax comes from the atlas content,
+ * not the background. Each tile_local UV covers [0,1] within its tile, and
+ * we map it to the same window-on-monitor UV rect for all tiles.
+ */
+static const char *compose_under_bg_ps_source = R"(
+Texture2D<float4> atlas : register(t0);
+Texture2D<float4> bg    : register(t1);
+SamplerState samp       : register(s0);
+cbuffer Constants : register(b0) {
+	float2 bg_uv_origin;  // window TL on monitor, normalized
+	float2 bg_uv_extent;  // window size on monitor, normalized
+	uint2  tile_count;    // (tile_columns, tile_rows)
+	uint2  pad_;
+};
+float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+	float4 a = atlas.Sample(samp, uv);
+	float2 tile_local = frac(uv * float2(tile_count));
+	float2 bg_uv = bg_uv_origin + tile_local * bg_uv_extent;
+	float3 b = bg.SampleLevel(samp, bg_uv, 0).rgb;
+	return float4(lerp(b, a.rgb, a.a), 1.0);
+}
+)";
+
+struct ComposeConstants {
+	float bg_uv_origin[2];
+	float bg_uv_extent[2];
+	uint32_t tile_count[2];
+	uint32_t pad_[2];
+};
+
 
 /*!
  * Implementation struct wrapping leiasr_d3d11 as xrt_display_processor_d3d11.
@@ -138,6 +180,7 @@ struct leia_display_processor_d3d11_impl
 	struct leiasr_d3d11 *leiasr; //!< Owned — destroyed in leia_dp_d3d11_destroy.
 
 	ID3D11Device *device;              //!< Cached device reference (not owned, for blit init).
+	HWND hwnd;                         //!< Native window handle from factory, used by bg-capture for self-exclusion + window-on-monitor rect.
 
 	//! @name 2D blit shader resources (passthrough stretch-blit)
 	//! @{
@@ -175,6 +218,26 @@ struct leia_display_processor_d3d11_impl
 	ID3D11Texture2D *ck_strip_tex;
 	ID3D11ShaderResourceView *ck_strip_srv;
 	uint32_t ck_strip_w, ck_strip_h;
+	//! @}
+
+	//! @name Compose-under-bg transparency support (lazy-allocated on first frame)
+	//!
+	//! Preferred path when WGC is available: replaces ck_fill/ck_strip with a
+	//! single pre-weave pass that composites captured desktop pixels under the
+	//! app's RGBA atlas, producing opaque RGB the weaver consumes. No post-weave
+	//! pass needed (output is opaque all the way through).
+	//!
+	//! Reuses ck_fill_tex/ck_fill_rtv/ck_fill_srv as the intermediate target —
+	//! same size, same format. Independent shader + constant buffer.
+	//! @{
+	struct leia_bg_capture *bg_capture; //!< Owned; NULL if WGC init failed → fall back to ck.
+	bool bg_compose_enabled;            //!< True when the new path is active for this session.
+	ID3D11Texture2D *bg_shared_tex;     //!< Opened from bg_capture's shared NT handle.
+	ID3D11ShaderResourceView *bg_shared_srv;
+	ID3D11Fence *bg_fence;              //!< Opened from bg_capture's shared fence handle.
+	ID3D11PixelShader *compose_ps;
+	ID3D11SamplerState *compose_sampler; //!< Linear sampler (atlas + bg both filtered).
+	ID3D11Buffer *compose_constants;     //!< sizeof(ComposeConstants).
 	//! @}
 };
 
@@ -531,6 +594,194 @@ ck_release_resources(struct leia_display_processor_d3d11_impl *ldp)
 
 /*
  *
+ * Compose-under-bg pipeline (preferred path when WGC is available).
+ *
+ * Reuses ck_fill_tex/ck_fill_rtv/ck_fill_srv as the intermediate target
+ * (created lazily via ck_ensure_fill_target — same size & format as needed).
+ *
+ */
+
+static bool
+compose_should_run(struct leia_display_processor_d3d11_impl *ldp)
+{
+	return ldp->bg_compose_enabled && ldp->bg_capture != nullptr && ldp->bg_shared_srv != nullptr;
+}
+
+static bool
+compose_init_pipeline(struct leia_display_processor_d3d11_impl *ldp)
+{
+	if (ldp->compose_ps != nullptr && ldp->compose_sampler != nullptr && ldp->compose_constants != nullptr) {
+		return true;
+	}
+	if (ldp->device == nullptr) {
+		return false;
+	}
+
+	HRESULT hr;
+	if (ldp->compose_ps == nullptr) {
+		ID3DBlob *blob = nullptr;
+		ID3DBlob *err = nullptr;
+		hr = D3DCompile(compose_under_bg_ps_source,
+		                strlen(compose_under_bg_ps_source),
+		                nullptr, nullptr, nullptr,
+		                "main", "ps_5_0", 0, 0, &blob, &err);
+		if (FAILED(hr)) {
+			U_LOG_E("Leia D3D11 DP: compose PS compile failed: 0x%08x %s",
+			        (unsigned)hr, err ? (const char *)err->GetBufferPointer() : "");
+			if (err) err->Release();
+			return false;
+		}
+		if (err) err->Release();
+		hr = ldp->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+		                                     nullptr, &ldp->compose_ps);
+		blob->Release();
+		if (FAILED(hr)) {
+			U_LOG_E("Leia D3D11 DP: compose PS create failed: 0x%08x", (unsigned)hr);
+			return false;
+		}
+	}
+
+	if (ldp->compose_sampler == nullptr) {
+		D3D11_SAMPLER_DESC sd = {};
+		sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+		sd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+		sd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+		sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+		sd.MaxLOD = D3D11_FLOAT32_MAX;
+		hr = ldp->device->CreateSamplerState(&sd, &ldp->compose_sampler);
+		if (FAILED(hr)) {
+			U_LOG_E("Leia D3D11 DP: compose sampler create failed: 0x%08x", (unsigned)hr);
+			return false;
+		}
+	}
+
+	if (ldp->compose_constants == nullptr) {
+		D3D11_BUFFER_DESC cb = {};
+		cb.ByteWidth = sizeof(ComposeConstants);
+		cb.Usage = D3D11_USAGE_DYNAMIC;
+		cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		cb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		hr = ldp->device->CreateBuffer(&cb, nullptr, &ldp->compose_constants);
+		if (FAILED(hr)) {
+			U_LOG_E("Leia D3D11 DP: compose CB create failed: 0x%08x", (unsigned)hr);
+			return false;
+		}
+	}
+
+	U_LOG_W("Leia D3D11 DP: compose-under-bg pipeline ready");
+	return true;
+}
+
+/*
+ * Pre-weave compose-under-bg: poll WGC, composite captured desktop under
+ * the RGBA atlas tiles. Returns the SRV the weaver should sample (the
+ * ck_fill_srv, repurposed as the intermediate target). On any failure
+ * (no captured frame yet, monitor-cross, init failure) returns the
+ * original atlas_srv — weaver still runs, just without the desktop
+ * background composited in.
+ */
+static ID3D11ShaderResourceView *
+compose_run_pre_weave(struct leia_display_processor_d3d11_impl *ldp,
+                      ID3D11DeviceContext *ctx,
+                      ID3D11ShaderResourceView *atlas_srv,
+                      uint32_t atlas_w,
+                      uint32_t atlas_h,
+                      uint32_t tile_columns,
+                      uint32_t tile_rows)
+{
+	if (!compose_init_pipeline(ldp) || !ck_ensure_fill_target(ldp, atlas_w, atlas_h)) {
+		return atlas_srv;
+	}
+
+	float bg_origin[2] = {0.0f, 0.0f};
+	float bg_extent[2] = {0.0f, 0.0f};
+	uint64_t fence_wait_value = 0;
+	bool have_bg = leia_bg_capture_poll(ldp->bg_capture, bg_origin, bg_extent, &fence_wait_value);
+	if (!have_bg) {
+		// No captured frame yet (or window crossed monitors). Pass atlas
+		// straight to the weaver; transparent regions stay alpha=0 RGB=0
+		// — visually black but won't crash. The DP will recover next frame.
+		return atlas_srv;
+	}
+
+	// Update constants.
+	D3D11_MAPPED_SUBRESOURCE m = {};
+	if (FAILED(ctx->Map(ldp->compose_constants, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+		return atlas_srv;
+	}
+	ComposeConstants *cb = reinterpret_cast<ComposeConstants *>(m.pData);
+	cb->bg_uv_origin[0] = bg_origin[0];
+	cb->bg_uv_origin[1] = bg_origin[1];
+	cb->bg_uv_extent[0] = bg_extent[0];
+	cb->bg_uv_extent[1] = bg_extent[1];
+	cb->tile_count[0] = tile_columns;
+	cb->tile_count[1] = tile_rows;
+	cb->pad_[0] = 0;
+	cb->pad_[1] = 0;
+	ctx->Unmap(ldp->compose_constants, 0);
+
+	// Save state.
+	ID3D11RenderTargetView *prev_rtv = nullptr;
+	ID3D11DepthStencilView *prev_dsv = nullptr;
+	ctx->OMGetRenderTargets(1, &prev_rtv, &prev_dsv);
+	UINT prev_vp_count = 1;
+	D3D11_VIEWPORT prev_vp = {};
+	ctx->RSGetViewports(&prev_vp_count, &prev_vp);
+
+	D3D11_VIEWPORT vp = {};
+	vp.Width = (float)atlas_w;
+	vp.Height = (float)atlas_h;
+	vp.MaxDepth = 1.0f;
+	ctx->RSSetViewports(1, &vp);
+	ctx->OMSetRenderTargets(1, &ldp->ck_fill_rtv, nullptr);
+
+	// Wait on the producer's shared fence so our sample sees the latest
+	// captured frame. Requires ID3D11DeviceContext4 (Win10 1809+).
+	if (ldp->bg_fence != nullptr) {
+		ID3D11DeviceContext4 *ctx4 = nullptr;
+		if (SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), (void **)&ctx4))) {
+			ctx4->Wait(ldp->bg_fence, fence_wait_value);
+			ctx4->Release();
+		}
+	}
+
+	ctx->IASetInputLayout(nullptr);
+	ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	ctx->VSSetShader(ldp->blit_vs, nullptr, 0);
+	ctx->PSSetShader(ldp->compose_ps, nullptr, 0);
+	ID3D11ShaderResourceView *srvs[2] = {atlas_srv, ldp->bg_shared_srv};
+	ctx->PSSetShaderResources(0, 2, srvs);
+	ctx->PSSetSamplers(0, 1, &ldp->compose_sampler);
+	ctx->PSSetConstantBuffers(0, 1, &ldp->compose_constants);
+	ctx->Draw(4, 0);
+
+	ID3D11ShaderResourceView *null_srvs[2] = {nullptr, nullptr};
+	ctx->PSSetShaderResources(0, 2, null_srvs);
+
+	ctx->OMSetRenderTargets(1, &prev_rtv, prev_dsv);
+	ctx->RSSetViewports(prev_vp_count, &prev_vp);
+	if (prev_rtv) prev_rtv->Release();
+	if (prev_dsv) prev_dsv->Release();
+
+	return ldp->ck_fill_srv;
+}
+
+static void
+compose_release_resources(struct leia_display_processor_d3d11_impl *ldp)
+{
+	if (ldp->bg_fence)          { ldp->bg_fence->Release();          ldp->bg_fence = nullptr; }
+	if (ldp->bg_shared_srv)     { ldp->bg_shared_srv->Release();     ldp->bg_shared_srv = nullptr; }
+	if (ldp->bg_shared_tex)     { ldp->bg_shared_tex->Release();     ldp->bg_shared_tex = nullptr; }
+	if (ldp->compose_constants) { ldp->compose_constants->Release(); ldp->compose_constants = nullptr; }
+	if (ldp->compose_sampler)   { ldp->compose_sampler->Release();   ldp->compose_sampler = nullptr; }
+	if (ldp->compose_ps)        { ldp->compose_ps->Release();        ldp->compose_ps = nullptr; }
+	if (ldp->bg_capture)        { leia_bg_capture_destroy(ldp->bg_capture); ldp->bg_capture = nullptr; }
+	ldp->bg_compose_enabled = false;
+}
+
+
+/*
+ *
  * xrt_display_processor_d3d11 interface methods.
  *
  */
@@ -582,6 +833,17 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 		// In 2D mode, content occupies min(viewport, atlas) of the atlas.
 		uint32_t atlas_w = tile_columns * view_width;
 		uint32_t atlas_h = tile_rows * view_height;
+
+		// Compose-under-bg: pre-composite captured desktop under the atlas,
+		// then stretch-blit the opaque result. Replaces the post-weave strip
+		// path for 2D mode when WGC capture is active.
+		if (compose_should_run(ldp)) {
+			ID3D11ShaderResourceView *composed =
+			    compose_run_pre_weave(ldp, ctx, srv, atlas_w, atlas_h, tile_columns, tile_rows);
+			if (composed != nullptr) {
+				srv = composed;
+			}
+		}
 		uint32_t content_w = (vp_w < atlas_w) ? vp_w : atlas_w;
 		uint32_t content_h = (vp_h < atlas_h) ? vp_h : atlas_h;
 		struct { float u_scale; float v_scale; float pad0; float pad1; } cb_data;
@@ -620,8 +882,9 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 		// flow (app pre-fills with key RGB on opaque alpha=1 surface) still
 		// needs the strip pass to recover alpha=0 for DWM. The new flow
 		// (true alpha through blit) works without it; running strip in that
-		// case is a no-op for non-key pixels.
-		if (ck_should_run(ldp)) {
+		// case is a no-op for non-key pixels. The compose-under-bg path
+		// already produced opaque RGB, so the strip pass is unnecessary.
+		if (!compose_should_run(ldp) && ck_should_run(ldp)) {
 			ck_run_post_weave_strip(ldp, ctx);
 		}
 		return;
@@ -630,16 +893,32 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	// Atlas is guaranteed content-sized SBS (2*view_width x view_height)
 	// by compositor crop-blit.
 	//
-	// When chroma-key is enabled, run the pre-weave fill pass: replace
-	// alpha=0 atlas pixels with the key color so the SR weaver (which only
-	// consumes opaque RGB) can process them, then pass the filled SRV to
-	// the weaver instead of the original atlas. For legacy apps that
-	// pre-filled with the key color on an alpha=1 surface, the fill is
-	// a no-op (lerp(key, src.rgb, 1.0) == src.rgb) — backward-compatible.
+	// Two transparency paths feed the SR weaver opaque RGB:
+	//
+	//   1. Compose-under-bg (preferred): captures the desktop region behind
+	//      the window via WGC and composites it under each per-view tile in
+	//      the atlas. Output is genuinely opaque pixels — the user sees
+	//      desktop through transparent app regions, with no chroma-key
+	//      artifacts on antialiased edges.
+	//
+	//   2. Chroma-key (fallback): replace alpha=0 atlas pixels with the key
+	//      color so the opaque-only weaver runs, then post-weave strip
+	//      reconstructs alpha=0 holes for DWM. AA edges collapse to hard
+	//      masks. Used when WGC is unavailable (Win<2004, DRM, env-disabled).
+	//
+	// Legacy apps that pre-filled their swapchain with the key color on an
+	// alpha=1 surface stay backward-compatible under either path: chroma-key
+	// is a no-op (lerp(key, src.rgb, 1.0) == src.rgb); compose-under-bg
+	// overwrites their fill with the actual captured desktop (better!).
 	void *weaver_srv = atlas_srv;
-	if (ck_should_run(ldp)) {
-		uint32_t atlas_w = tile_columns * view_width;
-		uint32_t atlas_h = tile_rows * view_height;
+	uint32_t atlas_w = tile_columns * view_width;
+	uint32_t atlas_h = tile_rows * view_height;
+	if (compose_should_run(ldp)) {
+		weaver_srv = compose_run_pre_weave(
+		    ldp, ctx,
+		    static_cast<ID3D11ShaderResourceView *>(atlas_srv),
+		    atlas_w, atlas_h, tile_columns, tile_rows);
+	} else if (ck_should_run(ldp)) {
 		weaver_srv = ck_run_pre_weave_fill(
 		    ldp, ctx,
 		    static_cast<ID3D11ShaderResourceView *>(atlas_srv),
@@ -687,8 +966,10 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 
 	// Post-weave chroma-key strip: convert key-color RGB pixels in the
 	// woven back-buffer to alpha=0 (with RGB premultiplied for DWM's
-	// premultiplied alpha mode). No-op when chroma-key is disabled.
-	if (ck_should_run(ldp)) {
+	// premultiplied alpha mode). No-op when chroma-key is disabled, and
+	// suppressed entirely when compose-under-bg ran (the weaver already
+	// consumed opaque pre-composited input; the back buffer is opaque RGB).
+	if (!compose_should_run(ldp) && ck_should_run(ldp)) {
 		ck_run_post_weave_strip(ldp, ctx);
 	}
 }
@@ -795,16 +1076,43 @@ leia_dp_d3d11_set_chroma_key(struct xrt_display_processor_d3d11 *xdp,
                               bool transparent_bg_enabled)
 {
 	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
-	ldp->ck_enabled = transparent_bg_enabled;
-	// App-supplied override (non-zero) wins over DP-picked default. The
-	// override matches the legacy XR_EXT_win32_window_binding.chromaKeyColor
-	// behavior so v1.2.9 Unity plugins and any third-party app that
-	// integrated the v5 extension keep working unchanged.
+
+	// Preserve the ck_color/ck_enabled values regardless of path — they
+	// are the fallback if WGC fails or gets disabled mid-session.
 	ldp->ck_color = (key_color != 0) ? key_color : kDefaultChromaKey;
-	U_LOG_W("Leia D3D11 DP: chroma-key %s (key=0x%08X%s)",
-	        ldp->ck_enabled ? "ENABLED" : "disabled",
-	        ldp->ck_color,
-	        (key_color == 0) ? " — DP default" : " — app override");
+	ldp->ck_enabled = transparent_bg_enabled;
+
+	// Preferred path: try to initialize WGC-based desktop capture so we can
+	// pre-composite the desktop UNDER the atlas tiles instead of using the
+	// chroma-key trick. On any failure (older Windows, capture blocked,
+	// env-disabled), fall through to chroma-key.
+	if (transparent_bg_enabled && !ldp->bg_compose_enabled && ldp->hwnd != nullptr) {
+		ldp->bg_capture = leia_bg_capture_create(ldp->hwnd);
+		if (ldp->bg_capture != nullptr && ldp->device != nullptr) {
+			HRESULT hr = leia_bg_capture_open_d3d11(
+			    ldp->bg_capture, ldp->device, &ldp->bg_shared_tex, &ldp->bg_shared_srv);
+			if (SUCCEEDED(hr)) {
+				hr = leia_bg_capture_open_fence_d3d11(
+				    ldp->bg_capture, ldp->device, &ldp->bg_fence);
+			}
+			if (SUCCEEDED(hr)) {
+				ldp->bg_compose_enabled = true;
+				// Disable the chroma-key path so we don't run both.
+				ldp->ck_enabled = false;
+				U_LOG_W("Leia D3D11 DP: transparency = compose-under-bg (WGC)");
+			} else {
+				U_LOG_W("Leia D3D11 DP: WGC import failed (0x%08x) — falling back to chroma-key",
+				        (unsigned)hr);
+				compose_release_resources(ldp);
+			}
+		}
+	}
+	if (!ldp->bg_compose_enabled) {
+		U_LOG_W("Leia D3D11 DP: transparency = chroma-key %s (key=0x%08X%s)",
+		        ldp->ck_enabled ? "ENABLED" : "disabled",
+		        ldp->ck_color,
+		        (key_color == 0) ? " — DP default" : " — app override");
+	}
 }
 
 static void
@@ -825,6 +1133,7 @@ leia_dp_d3d11_destroy(struct xrt_display_processor_d3d11 *xdp)
 		ldp->blit_cb->Release();
 	}
 
+	compose_release_resources(ldp);
 	ck_release_resources(ldp);
 
 	if (ldp->leiasr != NULL) {
@@ -976,6 +1285,7 @@ leia_dp_factory_d3d11(void *d3d11_device,
 	leia_dp_d3d11_init_vtable(ldp);
 	ldp->leiasr = weaver;
 	ldp->device = static_cast<ID3D11Device *>(d3d11_device);
+	ldp->hwnd = static_cast<HWND>(window_handle);
 	ldp->view_count = 2;
 
 	// Compile blit shaders for 2D passthrough mode
