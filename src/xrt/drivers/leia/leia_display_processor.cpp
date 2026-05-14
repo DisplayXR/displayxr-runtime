@@ -32,6 +32,11 @@
 #include "leia/shaders/ck_fill.frag.h"
 #include "leia/shaders/ck_strip.frag.h"
 
+#ifdef _WIN32
+#include "leia_bg_capture_win.h"
+#include "leia/shaders/compose_under_bg.frag.h"
+#endif
+
 
 // Default chroma key when the app didn't supply one (set_chroma_key key=0).
 // Magenta — matches the D3D11/D3D12 DPs' kDefaultChromaKey for cross-API parity.
@@ -110,6 +115,33 @@ struct leia_display_processor
 		uint32_t w, h;
 	} ck_strip_fbs[kMaxStripFramebuffers];
 	uint32_t ck_strip_fbs_count;
+
+	//
+	// Compose-under-bg transparency support (preferred over chroma-key on
+	// Windows when WGC desktop capture is available). Reuses ck_fill_image
+	// /ck_fill_view / ck_fill_fb / ck_fill_rp as the intermediate target —
+	// same R8G8B8A8_UNORM format. Distinct pipeline (2 SRVs + 24-byte push
+	// constants for bg_uv + tile_count) and descriptor set.
+	//
+	// On non-Windows or WGC-init failure, bg_compose_enabled stays false and
+	// the chroma-key path runs unchanged.
+	//
+	void *hwnd_opaque;                       //!< HWND from factory (Win-only). void* so the struct stays cross-platform.
+	struct leia_bg_capture *bg_capture;      //!< Owned (Win-only). NULL → fall back to ck.
+	bool bg_compose_enabled;
+
+	VkImage bg_image;
+	VkImageView bg_view;
+	VkDeviceMemory bg_mem;
+	uint32_t bg_w, bg_h;
+
+	VkSampler compose_sampler;               //!< Linear/clamp (vs ck's NEAREST).
+	VkDescriptorSetLayout compose_desc_layout;
+	VkPipelineLayout compose_pipeline_layout;
+	VkDescriptorPool compose_desc_pool;
+	VkDescriptorSet compose_set;
+	VkPipeline compose_pipeline;
+	bool compose_inited;
 };
 
 static inline struct leia_display_processor *
@@ -991,6 +1023,526 @@ ck_release_resources(struct leia_display_processor *ldp)
 
 /*
  *
+ * Compose-under-bg pipeline (preferred over chroma-key on Windows).
+ *
+ * Reuses ck_fill_image / ck_fill_view / ck_fill_fb / ck_fill_rp as the
+ * intermediate target — ck_ensure_fill_target + ck_init_pipeline still
+ * create those. Distinct pipeline + descriptor set with 2 SRVs.
+ *
+ * Cross-API sync note: WGC capture (~60 Hz, sub-ms copy) is much slower
+ * than the consumer's render rate (~120 Hz). The producer's D3D11 context
+ * is Flushed after every Copy. Without a GPU-level semaphore wait, the
+ * consumer may very occasionally see a torn frame mid-copy; in practice
+ * the temporal gap dwarfs the copy duration. Proper VK_KHR_external_
+ * semaphore_win32 import via D3D12_FENCE handle type is a follow-up.
+ *
+ */
+
+#ifdef _WIN32
+
+static bool
+compose_should_run(struct leia_display_processor *ldp)
+{
+	return ldp->bg_compose_enabled && ldp->bg_capture != nullptr && ldp->bg_view != VK_NULL_HANDLE;
+}
+
+// Import the bg_capture's shared NT-handle texture as VkImage + VkImageView.
+// One-shot on session start; the imported memory's lifetime is tied to the DP.
+static bool
+compose_import_bg_image(struct leia_display_processor *ldp)
+{
+	struct vk_bundle *vk = ldp->vk;
+	HANDLE handle = leia_bg_capture_get_shared_handle(ldp->bg_capture);
+	if (handle == nullptr) {
+		U_LOG_W("Leia VK DP: bg_capture has no shared handle");
+		return false;
+	}
+	leia_bg_capture_get_size(ldp->bg_capture, &ldp->bg_w, &ldp->bg_h);
+	if (ldp->bg_w == 0 || ldp->bg_h == 0) {
+		U_LOG_W("Leia VK DP: bg_capture has zero size");
+		return false;
+	}
+
+	// NT-handle import path: VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT.
+	// Format must match the D3D11 staging tex (BGRA8).
+	VkExternalMemoryImageCreateInfo ext_ci = {
+	    .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+	    .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT,
+	};
+	VkImageCreateInfo image_ci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+	    .pNext = &ext_ci,
+	    .imageType = VK_IMAGE_TYPE_2D,
+	    .format = VK_FORMAT_B8G8R8A8_UNORM,
+	    .extent = {ldp->bg_w, ldp->bg_h, 1},
+	    .mipLevels = 1,
+	    .arrayLayers = 1,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .tiling = VK_IMAGE_TILING_OPTIMAL,
+	    .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
+	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+	VkResult res = vk->vkCreateImage(vk->device, &image_ci, NULL, &ldp->bg_image);
+	if (res != VK_SUCCESS) {
+		U_LOG_W("Leia VK DP: bg vkCreateImage failed: %d", res);
+		return false;
+	}
+
+	VkMemoryRequirements reqs = {};
+	vk->vkGetImageMemoryRequirements(vk->device, ldp->bg_image, &reqs);
+
+	VkImportMemoryWin32HandleInfoKHR import = {
+	    .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
+	    .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT,
+	    .handle = handle,
+	};
+	VkMemoryDedicatedAllocateInfoKHR dedicated = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO_KHR,
+	    .pNext = &import,
+	    .image = ldp->bg_image,
+	};
+	VkPhysicalDeviceMemoryProperties mp = {};
+	vk->vkGetPhysicalDeviceMemoryProperties(vk->physical_device, &mp);
+	uint32_t mti = UINT32_MAX;
+	for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+		if ((reqs.memoryTypeBits & (1u << i)) != 0) {
+			mti = i;
+			break;
+		}
+	}
+	if (mti == UINT32_MAX) {
+		U_LOG_W("Leia VK DP: no memory type for bg import");
+		vk->vkDestroyImage(vk->device, ldp->bg_image, NULL);
+		ldp->bg_image = VK_NULL_HANDLE;
+		return false;
+	}
+	VkMemoryAllocateInfo alloc = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .pNext = &dedicated,
+	    .allocationSize = reqs.size,
+	    .memoryTypeIndex = mti,
+	};
+	res = vk->vkAllocateMemory(vk->device, &alloc, NULL, &ldp->bg_mem);
+	if (res != VK_SUCCESS) {
+		U_LOG_W("Leia VK DP: bg vkAllocateMemory failed: %d", res);
+		vk->vkDestroyImage(vk->device, ldp->bg_image, NULL);
+		ldp->bg_image = VK_NULL_HANDLE;
+		return false;
+	}
+	res = vk->vkBindImageMemory(vk->device, ldp->bg_image, ldp->bg_mem, 0);
+	if (res != VK_SUCCESS) {
+		U_LOG_W("Leia VK DP: bg vkBindImageMemory failed: %d", res);
+		vk->vkFreeMemory(vk->device, ldp->bg_mem, NULL);
+		vk->vkDestroyImage(vk->device, ldp->bg_image, NULL);
+		ldp->bg_mem = VK_NULL_HANDLE;
+		ldp->bg_image = VK_NULL_HANDLE;
+		return false;
+	}
+
+	VkImageViewCreateInfo vi = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+	    .image = ldp->bg_image,
+	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+	    .format = VK_FORMAT_B8G8R8A8_UNORM,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	res = vk->vkCreateImageView(vk->device, &vi, NULL, &ldp->bg_view);
+	if (res != VK_SUCCESS) {
+		U_LOG_W("Leia VK DP: bg vkCreateImageView failed: %d", res);
+		vk->vkFreeMemory(vk->device, ldp->bg_mem, NULL);
+		vk->vkDestroyImage(vk->device, ldp->bg_image, NULL);
+		ldp->bg_mem = VK_NULL_HANDLE;
+		ldp->bg_image = VK_NULL_HANDLE;
+		return false;
+	}
+
+	U_LOG_W("Leia VK DP: bg D3D11 texture imported (%ux%u)", ldp->bg_w, ldp->bg_h);
+	return true;
+}
+
+// Build compose-specific descriptor layout / pipeline layout / sampler /
+// descriptor pool / pipeline. Reuses ck_fill_rp as the render pass (same
+// R8G8B8A8_UNORM attachment). Requires ck_init_pipeline to have run first
+// so ck_fill_rp exists. Idempotent.
+static bool
+compose_init_pipeline(struct leia_display_processor *ldp)
+{
+	if (ldp->compose_inited) return true;
+	if (ldp->ck_fill_rp == VK_NULL_HANDLE) {
+		U_LOG_W("Leia VK DP: compose_init_pipeline before ck_fill_rp exists");
+		return false;
+	}
+
+	struct vk_bundle *vk = ldp->vk;
+	VkResult res;
+
+	// 2-binding descriptor set: atlas (0) + bg (1).
+	{
+		VkDescriptorSetLayoutBinding bs[2] = {
+		    {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		     .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT},
+		    {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		     .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT},
+		};
+		VkDescriptorSetLayoutCreateInfo ci = {
+		    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		    .bindingCount = 2, .pBindings = bs,
+		};
+		res = vk->vkCreateDescriptorSetLayout(vk->device, &ci, NULL, &ldp->compose_desc_layout);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("Leia VK DP: compose desc layout failed: %d", res);
+			return false;
+		}
+	}
+
+	// Push constants: 2*vec2 + uvec2 + uvec2 pad = 32 bytes.
+	{
+		VkPushConstantRange pc = {
+		    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+		    .offset = 0,
+		    .size = 32,
+		};
+		VkPipelineLayoutCreateInfo pli = {
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+		    .setLayoutCount = 1, .pSetLayouts = &ldp->compose_desc_layout,
+		    .pushConstantRangeCount = 1, .pPushConstantRanges = &pc,
+		};
+		res = vk->vkCreatePipelineLayout(vk->device, &pli, NULL, &ldp->compose_pipeline_layout);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("Leia VK DP: compose pipeline layout failed: %d", res);
+			return false;
+		}
+	}
+
+	// Linear sampler.
+	{
+		VkSamplerCreateInfo si = {
+		    .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+		    .magFilter = VK_FILTER_LINEAR,
+		    .minFilter = VK_FILTER_LINEAR,
+		    .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+		    .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+		    .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+		    .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+		    .maxLod = 1.0f,
+		};
+		res = vk->vkCreateSampler(vk->device, &si, NULL, &ldp->compose_sampler);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("Leia VK DP: compose sampler failed: %d", res);
+			return false;
+		}
+	}
+
+	// Descriptor pool + 1 set.
+	{
+		VkDescriptorPoolSize size = {
+		    .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		    .descriptorCount = 2,
+		};
+		VkDescriptorPoolCreateInfo dpi = {
+		    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+		    .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &size,
+		};
+		res = vk->vkCreateDescriptorPool(vk->device, &dpi, NULL, &ldp->compose_desc_pool);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("Leia VK DP: compose desc pool failed: %d", res);
+			return false;
+		}
+		VkDescriptorSetAllocateInfo ai = {
+		    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+		    .descriptorPool = ldp->compose_desc_pool,
+		    .descriptorSetCount = 1,
+		    .pSetLayouts = &ldp->compose_desc_layout,
+		};
+		res = vk->vkAllocateDescriptorSets(vk->device, &ai, &ldp->compose_set);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("Leia VK DP: compose desc set alloc failed: %d", res);
+			return false;
+		}
+	}
+
+	// Bind the bg view to slot 1 once — it doesn't change across frames.
+	{
+		VkDescriptorImageInfo info = {
+		    .sampler = ldp->compose_sampler,
+		    .imageView = ldp->bg_view,
+		    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		};
+		VkWriteDescriptorSet w = {
+		    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		    .dstSet = ldp->compose_set,
+		    .dstBinding = 1,
+		    .descriptorCount = 1,
+		    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		    .pImageInfo = &info,
+		};
+		vk->vkUpdateDescriptorSets(vk->device, 1, &w, 0, NULL);
+	}
+
+	// Build pipeline.
+	VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
+	res = ck_create_shader_module(vk, leia_shaders_fullscreen_tri_vert,
+	                              sizeof(leia_shaders_fullscreen_tri_vert), &vs);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("Leia VK DP: compose vs create failed: %d", res);
+		return false;
+	}
+	res = ck_create_shader_module(vk, leia_shaders_compose_under_bg_frag,
+	                              sizeof(leia_shaders_compose_under_bg_frag), &fs);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("Leia VK DP: compose fs create failed: %d", res);
+		vk->vkDestroyShaderModule(vk->device, vs, NULL);
+		return false;
+	}
+
+	VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+	VkPipelineInputAssemblyStateCreateInfo ia = {
+	    .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+	    .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+	};
+	VkPipelineViewportStateCreateInfo vps = {
+	    .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+	    .viewportCount = 1, .scissorCount = 1,
+	};
+	VkPipelineRasterizationStateCreateInfo rs = {
+	    .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+	    .polygonMode = VK_POLYGON_MODE_FILL,
+	    .cullMode = VK_CULL_MODE_NONE,
+	    .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+	    .lineWidth = 1.0f,
+	};
+	VkPipelineMultisampleStateCreateInfo ms = {
+	    .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+	    .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+	};
+	VkPipelineColorBlendAttachmentState ba = {
+	    .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+	                      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+	};
+	VkPipelineColorBlendStateCreateInfo cb = {
+	    .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+	    .attachmentCount = 1, .pAttachments = &ba,
+	};
+	VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+	VkPipelineDynamicStateCreateInfo dynstate = {
+	    .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+	    .dynamicStateCount = 2, .pDynamicStates = dyn,
+	};
+	VkPipelineShaderStageCreateInfo stages[2] = {
+	    {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+	     .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "main"},
+	    {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+	     .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs, .pName = "main"},
+	};
+	VkGraphicsPipelineCreateInfo pi = {
+	    .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+	    .stageCount = 2, .pStages = stages,
+	    .pVertexInputState = &vi,
+	    .pInputAssemblyState = &ia,
+	    .pViewportState = &vps,
+	    .pRasterizationState = &rs,
+	    .pMultisampleState = &ms,
+	    .pColorBlendState = &cb,
+	    .pDynamicState = &dynstate,
+	    .layout = ldp->compose_pipeline_layout,
+	    .renderPass = ldp->ck_fill_rp,
+	    .subpass = 0,
+	};
+	res = vk->vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &pi, NULL, &ldp->compose_pipeline);
+	vk->vkDestroyShaderModule(vk->device, fs, NULL);
+	vk->vkDestroyShaderModule(vk->device, vs, NULL);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("Leia VK DP: compose pipeline create failed: %d", res);
+		return false;
+	}
+
+	ldp->compose_inited = true;
+	U_LOG_W("Leia VK DP: compose-under-bg pipeline ready");
+	return true;
+}
+
+// Pre-weave compose. Polls WGC, transitions bg → SHADER_READ once, renders the
+// compose pass into ck_fill_image. Returns ck_fill_view for the weaver.
+static VkImageView
+compose_run_pre_weave(struct leia_display_processor *ldp,
+                      VkCommandBuffer cmd,
+                      VkImageView atlas_view,
+                      uint32_t atlas_w,
+                      uint32_t atlas_h,
+                      uint32_t tile_columns,
+                      uint32_t tile_rows)
+{
+	struct vk_bundle *vk = ldp->vk;
+	if (!ck_ensure_fill_target(ldp, atlas_w, atlas_h)) return VK_NULL_HANDLE;
+	if (!compose_init_pipeline(ldp)) return VK_NULL_HANDLE;
+
+	float bg_origin[2] = {0.0f, 0.0f};
+	float bg_extent[2] = {0.0f, 0.0f};
+	uint64_t unused = 0;
+	bool have_bg = leia_bg_capture_poll(ldp->bg_capture, bg_origin, bg_extent, &unused);
+	if (!have_bg) {
+		return VK_NULL_HANDLE;
+	}
+
+	// First-use barrier on the imported bg image: UNDEFINED → SHADER_READ_ONLY.
+	// Subsequent frames keep it in SHADER_READ_ONLY (the D3D11 producer writes
+	// through the shared memory without going through VK layouts).
+	static thread_local bool bg_transitioned = false;
+	if (!bg_transitioned) {
+		VkImageMemoryBarrier b = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = 0,
+		    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		    .image = ldp->bg_image,
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		};
+		vk->vkCmdPipelineBarrier(cmd,
+		    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		    0, 0, NULL, 0, NULL, 1, &b);
+		bg_transitioned = true;
+	}
+
+	// Refresh atlas SRV in compose set (slot 0). bg SRV (slot 1) is stable.
+	VkDescriptorImageInfo atlas_info = {
+	    .sampler = ldp->compose_sampler,
+	    .imageView = atlas_view,
+	    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	};
+	VkWriteDescriptorSet w = {
+	    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+	    .dstSet = ldp->compose_set,
+	    .dstBinding = 0,
+	    .descriptorCount = 1,
+	    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	    .pImageInfo = &atlas_info,
+	};
+	vk->vkUpdateDescriptorSets(vk->device, 1, &w, 0, NULL);
+
+	// ck_fill_image UNDEFINED → COLOR_ATTACHMENT.
+	VkImageMemoryBarrier pre = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .image = ldp->ck_fill_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd,
+	    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	    0, 0, NULL, 0, NULL, 1, &pre);
+
+	VkRenderPassBeginInfo rpbi = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+	    .renderPass = ldp->ck_fill_rp,
+	    .framebuffer = ldp->ck_fill_fb,
+	    .renderArea = {{0, 0}, {atlas_w, atlas_h}},
+	};
+	vk->vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+
+	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ldp->compose_pipeline);
+	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+	                             ldp->compose_pipeline_layout, 0, 1, &ldp->compose_set, 0, NULL);
+
+	struct {
+		float bg_uv_origin[2];
+		float bg_uv_extent[2];
+		uint32_t tile_count[2];
+		uint32_t pad[2];
+	} push = {};
+	push.bg_uv_origin[0] = bg_origin[0]; push.bg_uv_origin[1] = bg_origin[1];
+	push.bg_uv_extent[0] = bg_extent[0]; push.bg_uv_extent[1] = bg_extent[1];
+	push.tile_count[0] = tile_columns;   push.tile_count[1] = tile_rows;
+	vk->vkCmdPushConstants(cmd, ldp->compose_pipeline_layout,
+	                        VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+
+	VkViewport vp = {0.0f, 0.0f, (float)atlas_w, (float)atlas_h, 0.0f, 1.0f};
+	VkRect2D sc = {{0, 0}, {atlas_w, atlas_h}};
+	vk->vkCmdSetViewport(cmd, 0, 1, &vp);
+	vk->vkCmdSetScissor(cmd, 0, 1, &sc);
+
+	vk->vkCmdDraw(cmd, 3, 1, 0, 0);
+	vk->vkCmdEndRenderPass(cmd);
+
+	// ck_fill_image COLOR_ATTACHMENT → SHADER_READ for weaver.
+	VkImageMemoryBarrier post = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	    .image = ldp->ck_fill_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd,
+	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	    0, 0, NULL, 0, NULL, 1, &post);
+
+	return ldp->ck_fill_view;
+}
+
+static void
+compose_release_resources(struct leia_display_processor *ldp)
+{
+	if (ldp == NULL || ldp->vk == NULL) return;
+	struct vk_bundle *vk = ldp->vk;
+
+	if (ldp->compose_pipeline != VK_NULL_HANDLE) {
+		vk->vkDestroyPipeline(vk->device, ldp->compose_pipeline, NULL);
+		ldp->compose_pipeline = VK_NULL_HANDLE;
+	}
+	if (ldp->compose_desc_pool != VK_NULL_HANDLE) {
+		vk->vkDestroyDescriptorPool(vk->device, ldp->compose_desc_pool, NULL);
+		ldp->compose_desc_pool = VK_NULL_HANDLE;
+	}
+	if (ldp->compose_pipeline_layout != VK_NULL_HANDLE) {
+		vk->vkDestroyPipelineLayout(vk->device, ldp->compose_pipeline_layout, NULL);
+		ldp->compose_pipeline_layout = VK_NULL_HANDLE;
+	}
+	if (ldp->compose_desc_layout != VK_NULL_HANDLE) {
+		vk->vkDestroyDescriptorSetLayout(vk->device, ldp->compose_desc_layout, NULL);
+		ldp->compose_desc_layout = VK_NULL_HANDLE;
+	}
+	if (ldp->compose_sampler != VK_NULL_HANDLE) {
+		vk->vkDestroySampler(vk->device, ldp->compose_sampler, NULL);
+		ldp->compose_sampler = VK_NULL_HANDLE;
+	}
+	if (ldp->bg_view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, ldp->bg_view, NULL);
+		ldp->bg_view = VK_NULL_HANDLE;
+	}
+	if (ldp->bg_image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, ldp->bg_image, NULL);
+		ldp->bg_image = VK_NULL_HANDLE;
+	}
+	if (ldp->bg_mem != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, ldp->bg_mem, NULL);
+		ldp->bg_mem = VK_NULL_HANDLE;
+	}
+	if (ldp->bg_capture != nullptr) {
+		leia_bg_capture_destroy(ldp->bg_capture);
+		ldp->bg_capture = nullptr;
+	}
+	ldp->bg_compose_enabled = false;
+	ldp->compose_inited = false;
+}
+
+#else // !_WIN32
+
+static inline bool compose_should_run(struct leia_display_processor *) { return false; }
+static inline void compose_release_resources(struct leia_display_processor *) {}
+
+#endif // _WIN32
+
+
+/*
+ *
  * xrt_display_processor interface methods.
  *
  */
@@ -1103,26 +1655,53 @@ leia_dp_process_atlas(struct xrt_display_processor *xdp,
 	viewport.extent.width = target_width;
 	viewport.extent.height = target_height;
 
-	// Chroma-key transparency support: pre-weave fill substitutes the atlas with
-	// an opaque-RGB version, then post-weave strip rewrites alpha=0 pixels.
-	// Lazy-init pipelines on first frame the trick runs.
+	// Transparency support — two paths:
+	//
+	//   1. Compose-under-bg (preferred, Windows + WGC): pre-composite the
+	//      captured desktop region UNDER each per-view atlas tile so the
+	//      weaver consumes opaque RGB with the desktop already integrated.
+	//      No post-weave strip needed. Activated by set_chroma_key when WGC
+	//      init succeeded. Correct on AA edges and semi-transparent pixels.
+	//
+	//   2. Chroma-key (fallback): replace alpha=0 with key color pre-weave,
+	//      strip back to alpha=0 post-weave. Hard mask on AA edges. Used
+	//      when WGC is unavailable.
 	VkImageView weaver_input = atlas_view;
-	bool ck_active = ck_should_run(ldp) && (target_image != (VkImage_XDP)VK_NULL_HANDLE);
+	bool ck_active = false;
 	uint32_t atlas_w = view_width * tile_columns;
 	uint32_t atlas_h = view_height * tile_rows;
-	if (ck_active) {
+#ifdef _WIN32
+	bool compose_active = compose_should_run(ldp) && (target_image != (VkImage_XDP)VK_NULL_HANDLE);
+	if (compose_active) {
+		// Compose needs the ck pipeline pieces too (ck_fill_rp + ck_fill_image).
+		// ck_init_pipeline is idempotent and self-contained.
 		if (ck_init_pipeline(ldp, (VkFormat)target_format)) {
-			VkImageView filled = ck_run_pre_weave_fill(ldp, cmd_buffer, atlas_view,
-			                                            atlas_w, atlas_h);
-			if (filled != VK_NULL_HANDLE) {
-				weaver_input = filled;
+			VkImageView composed = compose_run_pre_weave(ldp, cmd_buffer, atlas_view,
+			                                              atlas_w, atlas_h,
+			                                              tile_columns, tile_rows);
+			if (composed != VK_NULL_HANDLE) {
+				weaver_input = composed;
+			}
+			// On compose failure (e.g. no WGC frame yet) just pass through
+			// — atlas alpha=0 regions render as black RGB through the weaver,
+			// recovers next frame once WGC produces a frame.
+		}
+	} else
+#endif
+	{
+		ck_active = ck_should_run(ldp) && (target_image != (VkImage_XDP)VK_NULL_HANDLE);
+		if (ck_active) {
+			if (ck_init_pipeline(ldp, (VkFormat)target_format)) {
+				VkImageView filled = ck_run_pre_weave_fill(ldp, cmd_buffer, atlas_view,
+				                                            atlas_w, atlas_h);
+				if (filled != VK_NULL_HANDLE) {
+					weaver_input = filled;
+				} else {
+					ck_active = false;
+				}
 			} else {
-				// Fall back: weaver runs on original atlas; strip will produce
-				// hard mask but won't be a correctness regression.
 				ck_active = false;
 			}
-		} else {
-			ck_active = false;
 		}
 	}
 
@@ -1238,13 +1817,32 @@ leia_dp_set_chroma_key(struct xrt_display_processor *xdp,
                        bool transparent_bg_enabled)
 {
 	struct leia_display_processor *ldp = leia_display_processor(xdp);
-	ldp->ck_enabled = transparent_bg_enabled;
-	// 0 means "DP picks default" — use magenta to match D3D11/D3D12 DPs.
+	// Keep ck_color/ck_enabled current — chroma-key is the fallback.
 	ldp->ck_color = (key_color != 0) ? key_color : kDefaultChromaKey;
+	ldp->ck_enabled = transparent_bg_enabled;
+
+#ifdef _WIN32
+	// Preferred path: WGC desktop capture + per-tile compose-under-bg.
+	// On any failure (older Windows, capture blocked, env-disabled), fall
+	// through to chroma-key.
+	if (transparent_bg_enabled && !ldp->bg_compose_enabled && ldp->hwnd_opaque != nullptr) {
+		ldp->bg_capture = leia_bg_capture_create((HWND)ldp->hwnd_opaque);
+		if (ldp->bg_capture != nullptr) {
+			if (compose_import_bg_image(ldp)) {
+				ldp->bg_compose_enabled = true;
+				ldp->ck_enabled = false;
+				U_LOG_W("Leia VK DP: transparency = compose-under-bg (WGC)");
+				return;
+			}
+			U_LOG_W("Leia VK DP: bg image import failed — falling back to chroma-key");
+			leia_bg_capture_destroy(ldp->bg_capture);
+			ldp->bg_capture = nullptr;
+		}
+	}
+#endif
 
 	if (transparent_bg_enabled) {
-		U_LOG_W("Leia VK DP: chroma-key %s (key=0x%06x %s)",
-		        "ENABLED",
+		U_LOG_W("Leia VK DP: transparency = chroma-key (key=0x%06x %s)",
 		        ldp->ck_color & 0x00FFFFFFu,
 		        (key_color != 0) ? "— app override" : "— DP default magenta");
 	} else {
@@ -1259,6 +1857,7 @@ leia_dp_destroy(struct xrt_display_processor *xdp)
 	struct vk_bundle *vk = ldp->vk;
 
 	if (vk != NULL) {
+		compose_release_resources(ldp);
 		ck_release_resources(ldp);
 		if (ldp->render_pass != VK_NULL_HANDLE) {
 			vk->vkDestroyRenderPass(vk->device, ldp->render_pass, NULL);
@@ -1355,6 +1954,7 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
 	ldp->vk = vk;
 	ldp->render_pass = render_pass;
 	ldp->view_count = 2;
+	ldp->hwnd_opaque = window_handle;
 
 	*out_xdp = &ldp->base;
 
