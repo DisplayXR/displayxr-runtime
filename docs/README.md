@@ -111,7 +111,8 @@ Design docs, status trackers, and plans — some shipped, some in progress.
 - [Window Drag Rendering](reference/window-drag-rendering.md) — rendering during window drag
 - [Debug Logging](reference/debug-logging.md) — log level conventions
 - [Leia SR Weaver](reference/LeiaWeaver.md) — DX11, DX12, OpenGL & Vulkan weaver internals
-- [Transparent HWND Overlay](reference/chroma-key-transparent-overlay.md) — opt-in transparent presentation for desktop-overlay apps (DComp + post-weave chroma-key)
+- [Leia Transparency Model](reference/leia-transparency.md) — current primary path: WGC compose-under-bg on D3D11/D3D12/VK, chroma-key fallback
+- [Transparent HWND Overlay (legacy chroma-key)](reference/chroma-key-transparent-overlay.md) — fallback path + still the only path on the OpenGL Leia DP
 
 ## Archive
 

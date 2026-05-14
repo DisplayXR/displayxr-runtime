@@ -378,6 +378,7 @@ See `docs/README.md` for a complete index. Key docs by task:
 | Add a new OpenXR extension | `docs/guides/implementing-extension.md` |
 | Write a device driver | `docs/guides/writing-driver.md` |
 | Understand Leia SR weaver internals (DX11, DX12, GL, Vulkan) | `docs/reference/LeiaWeaver.md` |
+| Understand Leia transparency model (compose-under-bg + chroma-key) | `docs/reference/leia-transparency.md` |
 | Understand Kooima projection math | `docs/architecture/kooima-projection.md` |
 | Understand the compositor pipeline | `docs/architecture/compositor-pipeline.md` |
 | Understand the swapchain model / canvas | `docs/specs/swapchain-model.md` |

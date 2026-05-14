@@ -1,4 +1,6 @@
-# Transparent HWND Overlay (Post-Weave Chroma-Key)
+# Transparent HWND Overlay (Post-Weave Chroma-Key) — Fallback Path
+
+> **Note:** D3D11 / D3D12 / Vulkan Leia DPs now use **compose-under-bg** as the primary transparency path. See [`leia-transparency.md`](leia-transparency.md) for the current model. Chroma-key remains the documented fallback when Windows Graphics Capture is unavailable (older Windows, DRM, env-disabled), and is still the only path for the OpenGL Leia DP (blocked on the deferred DComp+`WGL_NV_DX_interop2` bridge).
 
 How DisplayXR makes a bound app HWND composite transparently against the Windows desktop on a Leia 3D display, and how an app opts in.
 
