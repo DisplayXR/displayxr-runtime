@@ -190,6 +190,17 @@ if(XRT_HAVE_LEIA_SR)
 			target_compile_definitions(drv_leia PUBLIC XRT_HAVE_LEIA_SR_D3D12)
 		endif()
 
+		# Windows Graphics Capture (WGC) background capture, used by D3D11 / D3D12
+		# Leia DPs to compose desktop pixels under transparent app tiles in place
+		# of the chroma-key trick. Win-only; consumes runtimeobject.lib for the
+		# WinRT activation factories.
+		if(WIN32 AND (LEIA_SR_D3D11_AVAILABLE OR LEIA_SR_D3D12_AVAILABLE))
+			target_sources(drv_leia PRIVATE
+				leia/leia_bg_capture_win.cpp
+				leia/leia_bg_capture_win.h)
+			target_link_libraries(drv_leia PRIVATE runtimeobject dxguid)
+		endif()
+
 		# GL weaver library (conditional)
 		if(LEIA_SR_GL_AVAILABLE)
 			target_link_libraries(drv_leia PRIVATE
