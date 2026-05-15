@@ -575,6 +575,11 @@ init_composite_resources(struct multi_compositor *mc, struct vk_bundle *vk, uint
 	    .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
 	};
 
+	// Porter-Duff "over" for both color and alpha so dst.a is preserved
+	// through layered composition (see issue #225). The previous
+	// (srcA=ONE_MINUS_SRC_ALPHA, dstA=ONE) was quadratic in src.a and
+	// clobbered opaque destinations when a semi-transparent layer landed
+	// on top — breaking compose-under-bg downstream.
 	VkPipelineColorBlendAttachmentState blend_att = {
 	    .blendEnable = VK_TRUE,
 	    .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
@@ -582,8 +587,8 @@ init_composite_resources(struct multi_compositor *mc, struct vk_bundle *vk, uint
 	    .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
 	    .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
 	    .colorBlendOp = VK_BLEND_OP_ADD,
-	    .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
-	    .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+	    .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+	    .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
 	    .alphaBlendOp = VK_BLEND_OP_ADD,
 	};
 

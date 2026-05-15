@@ -400,9 +400,19 @@ create_layer_pipeline(struct vk_bundle *vk,
 	    VK_COLOR_COMPONENT_A_BIT;                //
 
 	/*
-	 * We are using VK_BLEND_FACTOR_ONE for the dst alpha write
-	 * to make sure that there is a valid value there, makes
-	 * the debug UI work when inspecting the scratch images.
+	 * Porter-Duff "over" for both color and alpha so dst.a is preserved
+	 * through layered composition:
+	 *   out.a = src.a + dst.a * (1 - src.a)
+	 *
+	 * The previous (srcA=ONE_MINUS_SRC_ALPHA, dstA=ONE) yielded
+	 *   out.a = src.a * (1 - src.a) + dst.a
+	 * which is quadratic in src.a and clobbers opaque destinations when
+	 * a semi-transparent layer lands on top — breaking the Leia DP
+	 * compose-under-bg pass (see issue #225). The original comment
+	 * "use ONE for the dst alpha write to make sure that there is a
+	 * valid value there" is still satisfied by ONE_MINUS_SRC_ALPHA:
+	 * fully-opaque content still yields out.a=1, so the debug UI
+	 * inspecting scratch images still sees sensible alpha.
 	 */
 	const VkPipelineColorBlendAttachmentState blend_attachment_state = {
 	    .blendEnable = VK_TRUE,
@@ -410,8 +420,8 @@ create_layer_pipeline(struct vk_bundle *vk,
 	    .srcColorBlendFactor = src_blend_factor,
 	    .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
 	    .colorBlendOp = VK_BLEND_OP_ADD,
-	    .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
-	    .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+	    .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+	    .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
 	    .alphaBlendOp = VK_BLEND_OP_ADD,
 	};
 
