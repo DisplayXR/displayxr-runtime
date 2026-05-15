@@ -369,6 +369,8 @@ enum ipc_workspace_input_event_type
 	IPC_WORKSPACE_INPUT_EVENT_FRAME_TICK     = 5, //!< spec_version 6
 	IPC_WORKSPACE_INPUT_EVENT_FOCUS_CHANGED  = 6, //!< spec_version 6
 	IPC_WORKSPACE_INPUT_EVENT_WINDOW_POSE_CHANGED = 7, //!< spec_version 8: runtime-driven pose/size change
+	IPC_WORKSPACE_INPUT_EVENT_MODAL_OPEN          = 8, //!< spec_version 10: client opened a Win32 modal popup
+	IPC_WORKSPACE_INPUT_EVENT_MODAL_CLOSE         = 9, //!< spec_version 10: client's Win32 modal popup closed
 };
 
 struct ipc_workspace_input_event
@@ -451,6 +453,10 @@ struct ipc_workspace_input_event
 			float    width_m;
 			float    height_m;
 		} window_pose_changed;
+		struct                      //!< spec_version 10: Win32 modal popup state
+		{
+			uint32_t client_id;
+		} modal;
 	} u;
 };
 

@@ -299,6 +299,12 @@
 
 	"session_destroy": {},
 
+	"session_set_modal_state": {
+		"in": [
+			{"name": "is_open", "type": "bool"}
+		]
+	},
+
 	"space_create_semantic_ids": {
 		"out": [
 			{"name": "root_id", "type": "uint32_t"},

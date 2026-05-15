@@ -305,6 +305,19 @@ comp_ipc_client_compositor_workspace_deactivate(struct xrt_compositor *xc)
 }
 
 xrt_result_t
+comp_ipc_client_compositor_session_set_modal_state(struct xrt_compositor *xc, bool is_open)
+{
+	if (xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_session_set_modal_state(icc->ipc_c, is_open);
+}
+
+xrt_result_t
 comp_ipc_client_compositor_workspace_get_state(struct xrt_compositor *xc, bool *out_active)
 {
 	if (xc == NULL || out_active == NULL) {

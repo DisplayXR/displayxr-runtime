@@ -188,6 +188,18 @@ comp_ipc_client_compositor_workspace_activate(struct xrt_compositor *xc);
 xrt_result_t
 comp_ipc_client_compositor_workspace_deactivate(struct xrt_compositor *xc);
 
+/*!
+ * Tier 0 modal-dialog hook (GH #227, Win32 workspace shell only). Called
+ * from the in-app `WH_CBT` hook when an owned modal popup is created /
+ * destroyed against the (hidden) app HWND. Server-side, this updates the
+ * per-client `modal_open` flag used by the workspace input event drain
+ * (MODAL_OPEN / MODAL_CLOSE emission to the controller) and by the
+ * compositor's frame-starvation timeout extension. Same gating contract
+ * as the other bridges — only valid when @p xc is an ipc_client_compositor.
+ */
+xrt_result_t
+comp_ipc_client_compositor_session_set_modal_state(struct xrt_compositor *xc, bool is_open);
+
 xrt_result_t
 comp_ipc_client_compositor_workspace_get_state(struct xrt_compositor *xc, bool *out_active);
 

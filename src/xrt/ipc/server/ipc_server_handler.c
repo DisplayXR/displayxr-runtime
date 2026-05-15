@@ -935,6 +935,43 @@ ipc_handle_session_destroy(volatile struct ipc_client_state *ics)
 }
 
 xrt_result_t
+ipc_handle_session_set_modal_state(volatile struct ipc_client_state *ics, bool is_open)
+{
+	IPC_TRACE_MARKER();
+
+	// spec_version 10: app-side CBT hook (oxr_workspace_modal_win32) tells
+	// the runtime that this client just opened (true) or closed (false) a
+	// Win32 modal popup. The compositor records the bool on the per-client
+	// slot; the workspace-input-event drain emits MODAL_OPEN / MODAL_CLOSE
+	// to the controller so the shell can dim + drop swap-chain topmost +
+	// 3D→2D toggle, and the frame-starvation timeout extension keeps
+	// presenting the last-good frame for the duration. Any client may set
+	// its own modal state — no PID auth (unlike workspace_set_focused_client
+	// which is controller-only).
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	struct ipc_server *s = ics->server;
+	if (s->xsysc == NULL || ics->xc == NULL) {
+		// No D3D11 service compositor or this client has no compositor
+		// (headless relay etc.) — modal state is meaningless. Succeed
+		// silently so the client doesn't have to special-case.
+		return XRT_SUCCESS;
+	}
+	int slot = comp_d3d11_service_workspace_find_slot_by_xc(s->xsysc, (struct xrt_compositor *)ics->xc);
+	if (slot < 0) {
+		// Caller isn't a workspace participant (e.g., standalone in-
+		// process compositor that bypassed multi-comp). No-op success.
+		return XRT_SUCCESS;
+	}
+	comp_d3d11_service_set_client_modal_state(s->xsysc, slot, is_open);
+#else
+	(void)ics;
+	(void)is_open;
+#endif
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
 ipc_handle_space_create_semantic_ids(volatile struct ipc_client_state *ics,
                                      uint32_t *out_root_id,
                                      uint32_t *out_view_id,

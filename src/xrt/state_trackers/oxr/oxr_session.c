@@ -98,6 +98,16 @@ struct xrt_window_metrics;
 bool
 comp_ipc_client_compositor_get_window_metrics(struct xrt_compositor *xc, struct xrt_window_metrics *out_metrics);
 
+#ifdef XRT_OS_WINDOWS
+// GH #227 Tier 0: install / tear down the in-app CBT hook that re-parents
+// owned modal popups (file dialogs etc.) from the hidden app HWND onto a
+// visible offscreen owner. Implementation lives in oxr_workspace_modal_win32.c.
+void
+oxr_workspace_modal_win32_init(struct oxr_session *sess, void *app_hwnd);
+void
+oxr_workspace_modal_win32_fini(struct oxr_session *sess);
+#endif
+
 
 DEBUG_GET_ONCE_NUM_OPTION(ipd, "OXR_DEBUG_IPD_MM", 63)
 DEBUG_GET_ONCE_NUM_OPTION(wait_frame_sleep, "OXR_DEBUG_WAIT_FRAME_EXTRA_SLEEP_MS", 0)
@@ -1944,6 +1954,14 @@ oxr_session_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 	// MCP tool handler stops reading.
 	oxr_mcp_tools_detach_session(sess);
 
+#ifdef XRT_OS_WINDOWS
+	// GH #227 Tier 0: tear down the modal-dialog hook before sess->xcn is
+	// destroyed — the hook proc dereferences sess->xcn->base via its
+	// stashed bridge pointer. fini clears that pointer under the same
+	// critical section it uses for HCBT_CREATEWND, then unhooks.
+	oxr_workspace_modal_win32_fini(sess);
+#endif
+
 	XrResult ret = oxr_event_remove_session_events(log, sess);
 
 	oxr_session_binding_destroy_all(log, sess);
@@ -2705,6 +2723,22 @@ oxr_session_create(struct oxr_logger *log,
 	sess->has_external_window =
 	    (xsi.external_window_handle != NULL || xsi.readback_callback != NULL || xsi.shared_texture_handle != NULL);
 	sess->is_bridge_relay = xsi.is_bridge_relay;
+
+#ifdef XRT_OS_WINDOWS
+	// GH #227 Tier 0: when workspace mode hid the app HWND above (the
+	// ShowWindow(SW_HIDE) site at line ~2669), install the CBT hook that
+	// re-parents owned modal popups onto a visible offscreen owner so file
+	// dialogs / MessageBoxes display correctly over the spatial workspace.
+	// Same gate as the SW_HIDE block.
+	{
+		const char *workspace_session = getenv("DISPLAYXR_WORKSPACE_SESSION");
+		if (workspace_session != NULL && strcmp(workspace_session, "1") == 0 &&
+		    xsi.external_window_handle != NULL && sys->xsysc != NULL &&
+		    sys->xsysc->info.workspace_mode) {
+			oxr_workspace_modal_win32_init(sess, xsi.external_window_handle);
+		}
+	}
+#endif
 
 	// Tell the head device to return raw eye positions (no qwerty compose)
 	// and disable qwerty input processing for _ext/_shared apps

@@ -229,6 +229,29 @@ that version is unavailable, the workspace app fails at
 `xrCreateInstance` and the user sees a clean OpenXR error rather than
 a runtime-crash mystery.
 
+## Required runtime → controller event handling
+
+Beyond registration, controllers consume the existing
+`workspace_enumerate_input_events` poll for runtime → controller
+notifications (`POINTER`, `KEY`, `SCROLL`, `FRAME_TICK`,
+`FOCUS_CHANGED`, `POINTER_HOVER`, `WINDOW_POSE_CHANGED`). Two more
+event types were added with the GH #227 modal-dialog work:
+
+- `IPC_WORKSPACE_INPUT_EVENT_MODAL_OPEN` — a client just spawned a
+  Win32 modal popup (file dialog, MessageBox, …). The recommended
+  controller response is to drop the workspace swap chain from
+  topmost / fullscreen to windowed, trigger
+  `xrRequestDisplayModeEXT(XR_DISPLAY_MODE_2D_EXT)` for the focused
+  client, dim its focus glow, and suspend cursor raycast hit-tests
+  against it. Without these the dialog still works but z-order /
+  focus-stealing UX is degraded.
+- `IPC_WORKSPACE_INPUT_EVENT_MODAL_CLOSE` — the reverse transition.
+
+Controllers that ignore both events get reduced UX (flat dialog over
+a still-3D workspace) but the runtime side (re-parenting onto a
+visible owner HWND, focus restoration) works regardless. Mechanism
+spec: `docs/specs/runtime/modal-dialog-handling.md`.
+
 ## What this contract is NOT
 
 - **Not a plugin system.** The workspace app runs in its own process

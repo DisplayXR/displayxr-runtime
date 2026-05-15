@@ -916,6 +916,15 @@ struct d3d11_multi_client_slot
 	float                 window_w_last_emitted;
 	float                 window_h_last_emitted;
 
+	//! spec_version 10: a Win32 modal popup is open in this client. Set by
+	//! ipc_handle_session_set_modal_state when the in-app CBT hook
+	//! (oxr_workspace_modal_win32) detects a dialog. Read by the drain loop
+	//! to emit MODAL_OPEN / MODAL_CLOSE events to the workspace controller,
+	//! and by the frame-starvation timeout logic to keep presenting the
+	//! last-good frame while the user interacts with the dialog.
+	bool                  modal_open;
+	bool                  modal_open_last_emitted;
+
 	//! @name Capture-specific fields (only valid when client_type == CLIENT_TYPE_CAPTURE)
 	//! @{
 	struct d3d11_capture_context *capture_ctx;                //!< Opaque capture context
@@ -13708,6 +13717,32 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 		cs->window_h_last_emitted = cs->window_height_m;
 	}
 
+	// spec_version 10: MODAL_OPEN / MODAL_CLOSE on per-slot transition. Set
+	// by ipc_handle_session_set_modal_state when an in-app CBT hook detects
+	// a Win32 modal popup (file dialog, MessageBox, etc.) being created or
+	// destroyed. Same per-slot delta-vs-shadow pattern as FOCUS_CHANGED and
+	// WINDOW_POSE_CHANGED. Filtered to slots with workspace_client_id != 0
+	// because controllers without chrome bound to the slot have no UI to
+	// dim — the runtime side (frame-starvation timeout extension) still
+	// reads modal_open regardless.
+	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS &&
+	     out_batch->count < IPC_WORKSPACE_INPUT_EVENT_BATCH_MAX; s++) {
+		struct d3d11_multi_client_slot *cs = &mc->clients[s];
+		if (!cs->active || cs->client_type == CLIENT_TYPE_CAPTURE) continue;
+		if (cs->workspace_client_id == 0) continue;
+		if (cs->modal_open == cs->modal_open_last_emitted) continue;
+
+		struct ipc_workspace_input_event *ev = &out_batch->events[out_batch->count];
+		memset(ev, 0, sizeof(*ev));
+		ev->event_type = cs->modal_open ? IPC_WORKSPACE_INPUT_EVENT_MODAL_OPEN
+		                                : IPC_WORKSPACE_INPUT_EVENT_MODAL_CLOSE;
+		ev->timestamp_ms = (uint32_t)GetTickCount();
+		ev->u.modal.client_id = cs->workspace_client_id;
+		out_batch->count++;
+
+		cs->modal_open_last_emitted = cs->modal_open;
+	}
+
 	// FRAME_TICK: one per displayed frame since the last drain, capped at
 	// remaining batch capacity. If the controller drains faster than one
 	// frame this is a no-op; if it falls behind we cap and the timestamp on
@@ -14055,6 +14090,30 @@ comp_d3d11_service_set_focused_slot(struct xrt_system_compositor *xsysc, int slo
 	} else {
 		mc->focused_slot = slot;
 	}
+}
+
+extern "C" void
+comp_d3d11_service_set_client_modal_state(struct xrt_system_compositor *xsysc, int slot, bool is_open)
+{
+	// spec_version 10: simple bool toggle on the slot. The drain loop
+	// below picks up the transition vs modal_open_last_emitted and emits
+	// MODAL_OPEN / MODAL_CLOSE events to the workspace controller; the
+	// frame-starvation timeout extension (comp_d3d11_service_render path)
+	// reads the same field so the compositor keeps presenting the last-
+	// good frame while the user interacts with the dialog.
+	if (xsysc == nullptr) {
+		return;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr) {
+		return;
+	}
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || !mc->clients[slot].active) {
+		return;
+	}
+	mc->clients[slot].modal_open = is_open;
 }
 
 extern "C" void *

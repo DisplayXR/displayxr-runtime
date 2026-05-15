@@ -2145,6 +2145,26 @@ struct oxr_session
 	struct xrt_space_relation local_space_pure_relation;
 
 	bool has_lost;
+
+#ifdef XRT_OS_WINDOWS
+	/*!
+	 * Tier 0 modal-dialog hook (XR_OS_WINDOWS, workspace shell only).
+	 *
+	 * When `DISPLAYXR_WORKSPACE_SESSION=1` and the runtime hides the app's
+	 * HWND (`oxr_session.c` ShowWindow(SW_HIDE) site), we additionally
+	 * create an offscreen visible owner window and install a `WH_CBT` hook
+	 * on the app UI thread. The hook re-parents owned modal popups (file
+	 * dialogs, MessageBox) from the hidden HWND to this visible owner, so
+	 * the dialog's z-order / focus-restore / taskbar chain works. See
+	 * `oxr_workspace_modal_win32.c` for the implementation, GH #227 for
+	 * design context.
+	 *
+	 * Both fields are NULL when not in workspace mode (or on a platform
+	 * other than Windows).
+	 */
+	void *workspace_modal_dialog_owner; //!< HWND, opaque to portable code.
+	void *workspace_modal_cbt_hook;     //!< HHOOK, opaque to portable code.
+#endif
 };
 
 /*!
