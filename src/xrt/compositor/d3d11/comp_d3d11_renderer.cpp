@@ -461,14 +461,23 @@ create_resources(struct comp_d3d11_renderer *r)
 		return XRT_ERROR_D3D;
 	}
 
-	// Create blend states
+	// Create blend states.
+	//
+	// Alpha channel uses INV_SRC_ALPHA (proper Porter-Duff "over") so
+	// dst.a is preserved through layered composition:
+	//   out.a = src.a + dst.a * (1 - src.a)
+	// Using ZERO here would clobber dst.a with src.a, leaving the atlas
+	// alpha at the topmost layer's alpha — which breaks the Leia DP
+	// compose-under-bg pass (it lerps desktop under atlas.a, so a
+	// semi-transparent HUD over opaque content would bleed desktop
+	// through). See issue #225.
 	D3D11_BLEND_DESC blendDesc = {};
 	blendDesc.RenderTarget[0].BlendEnable = TRUE;
 	blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
 	blendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
 	blendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
 	blendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
-	blendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+	blendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
 	blendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
 	blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
 

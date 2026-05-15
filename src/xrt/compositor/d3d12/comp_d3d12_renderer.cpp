@@ -705,7 +705,11 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 		return XRT_ERROR_D3D;
 	}
 
-	// Standard alpha blend PSO
+	// Standard alpha blend PSO.
+	//
+	// Alpha channel uses INV_SRC_ALPHA (proper Porter-Duff "over") so
+	// dst.a is preserved through layered composition. See the matching
+	// comment in comp_d3d11_renderer.cpp and issue #225.
 	D3D12_GRAPHICS_PIPELINE_STATE_DESC quad_pso_desc = {};
 	quad_pso_desc.pRootSignature = r->quad_root_signature;
 	quad_pso_desc.VS.pShaderBytecode = quad_vs_blob->GetBufferPointer();
@@ -717,7 +721,7 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 	quad_pso_desc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
 	quad_pso_desc.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
 	quad_pso_desc.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
-	quad_pso_desc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
+	quad_pso_desc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
 	quad_pso_desc.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
 	quad_pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
 	quad_pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
