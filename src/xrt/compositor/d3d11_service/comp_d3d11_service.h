@@ -597,6 +597,20 @@ void
 comp_d3d11_service_set_focused_slot(struct xrt_system_compositor *xsysc, int slot);
 
 /*!
+ * spec_version 10: mark slot @p slot as having a Win32 modal popup open
+ * (@p is_open = true) or closed (false). Called from
+ * ipc_handle_session_set_modal_state when an app-side CBT hook
+ * (`oxr_workspace_modal_win32`) detects a dialog being created or
+ * destroyed. Drives MODAL_OPEN / MODAL_CLOSE event emission to the
+ * workspace controller (so the shell can dim + drop swap-chain topmost +
+ * 3D→2D toggle), and feeds the per-client frame-starvation timeout
+ * extension so the compositor keeps presenting the last-good frame while
+ * the user interacts with the dialog. @p slot out of range is a no-op.
+ */
+void
+comp_d3d11_service_set_client_modal_state(struct xrt_system_compositor *xsysc, int slot, bool is_open);
+
+/*!
  * Phase 2.C spec_version 9: set per-capture-client style. @p slot_index is
  * the same convention as comp_d3d11_service_set_capture_client_window_pose
  * (client_id - 1000 from the IPC layer).
