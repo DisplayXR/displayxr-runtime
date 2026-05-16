@@ -187,6 +187,12 @@ show_context_menu(HWND hwnd)
 	POINT pt;
 	GetCursorPos(&pt);
 
+	// Re-enumerate the workspace controller registry so a shell installed
+	// (or uninstalled) after the service started shows up immediately on
+	// the next right-click — no service restart required. One registry
+	// walk per menu open is cheap.
+	service_orchestrator_refresh_workspace_controller();
+
 	// Bridge submenu (radio group: Enable, Auto, Disable)
 	HMENU bridge_sub = CreatePopupMenu();
 	AppendMenuW(bridge_sub, MF_STRING, IDM_BRIDGE_ENABLE, L"Enable");

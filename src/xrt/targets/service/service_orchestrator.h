@@ -45,16 +45,27 @@ void
 service_orchestrator_shutdown(void);
 
 /*!
- * Whether a workspace controller binary was found next to the service exe at
- * init time. When false, the tray hides the Workspace submenu and the
- * Ctrl+Space hotkey is a no-op — the runtime is operating as a standalone
- * OpenXR + WebXR platform with no spatial-desktop features.
+ * Whether a workspace controller binary is currently registered. The tray
+ * code calls service_orchestrator_refresh_workspace_controller() before
+ * reading this so installing/uninstalling a controller while the service
+ * is running takes effect on the next menu open — no service restart
+ * required.
  *
- * Detection is one-time at init. Reinstalling a controller while the service
- * is running requires a service restart.
+ * When false, the tray hides the Workspace submenu and the Ctrl+Space
+ * hotkey is a no-op — the runtime is operating as a standalone OpenXR +
+ * WebXR platform with no spatial-desktop features.
  */
 bool
 service_orchestrator_is_workspace_available(void);
+
+/*!
+ * Re-enumerate HKLM\Software\DisplayXR\WorkspaceControllers\* and update
+ * the cached workspace-controller state. Cheap (one registry walk).
+ * Intended to be called by the tray before each menu open so a shell
+ * installed after service startup shows up without a service restart.
+ */
+void
+service_orchestrator_refresh_workspace_controller(void);
 
 /*!
  * Display name for the active workspace controller, suitable for tray UI.

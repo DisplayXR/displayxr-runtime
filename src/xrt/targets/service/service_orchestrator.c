@@ -904,6 +904,12 @@ service_orchestrator_is_workspace_available(void)
 	return s_workspace_available;
 }
 
+void
+service_orchestrator_refresh_workspace_controller(void)
+{
+	detect_workspace_controller(&s_cfg);
+}
+
 const char *
 service_orchestrator_get_workspace_display_name(void)
 {
@@ -1080,6 +1086,11 @@ bool
 service_orchestrator_is_workspace_available(void)
 {
 	return false;
+}
+
+void
+service_orchestrator_refresh_workspace_controller(void)
+{
 }
 
 const char *
