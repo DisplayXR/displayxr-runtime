@@ -149,26 +149,55 @@ Find the run with `headSha == $RELEASE_SHA` and event=push. Retry up to 6 times 
 
 ## PHASE 4: CREATE GITHUB RELEASE
 
-The build run produces the runtime installer as an artifact. The `gh release create` step at the end of the workflow may or may not auto-create a Release depending on whether the workflow is wired to. Check:
+The build run produces two artifacts the release should attach:
+- **Installer** — `DisplayXR-Installer` artifact (contains `DisplayXRSetup-X.Y.Z.BUILD.exe`).
+- **Test apps bundle** — `TestApps-<run_number>` artifact (~17 MB folder containing all cube test apps). Forced on every tag push by the `DetectChanges` job (`ref_type == 'tag'`). Builders, OEM integrators, and field testers use this to validate the runtime against the public extension contracts without rebuilding from source.
+
+Check whether the release already exists:
 
 ```bash
 gh release view [FULL_TAG] --repo DisplayXR/displayxr-runtime 2>/dev/null
 ```
 
-### Step 4.1a: If release already exists
-The workflow auto-created it. Skip to Phase 5 to verify and update notes.
-
-### Step 4.1b: If release does NOT exist
-Create it manually:
+### Step 4.1: Download artifacts (always runs)
+Regardless of whether the release exists, download both artifacts so we can verify or attach them:
 
 ```bash
-# Find the installer artifact in the build run
+# Installer artifact (matches DisplayXR-Installer + DisplayXR)
 gh run download $RUN_ID --repo DisplayXR/displayxr-runtime --pattern "DisplayXR*" --dir _release_assets/
 
-# The installer is typically named DisplayXRSetup-X.Y.Z[.BUILD].exe
+# Test apps bundle — separate pattern because TestApps-* doesn't match DisplayXR*
+gh run download $RUN_ID --repo DisplayXR/displayxr-runtime --pattern "TestApps-*" --dir _release_assets/
+
 INSTALLER=$(find _release_assets/ -name "DisplayXRSetup-*.exe" | head -1)
 [ -z "$INSTALLER" ] && STOP: "Could not find DisplayXRSetup-*.exe in build artifacts."
 
+# Zip the TestApps folder into a single asset. Pattern: DisplayXR-TestApps-<version>.zip.
+TESTAPPS_DIR=$(find _release_assets/ -maxdepth 2 -type d -name "TestApps-*" | head -1)
+TESTAPPS_ZIP=""
+if [ -n "$TESTAPPS_DIR" ]; then
+  TESTAPPS_ZIP="_release_assets/DisplayXR-TestApps-[VERSION].zip"  # [VERSION] without leading v
+  (cd "$TESTAPPS_DIR" && zip -rq "../../$TESTAPPS_ZIP" .)
+  ls -lh "$TESTAPPS_ZIP"
+else
+  echo "WARN: no TestApps-* artifact in run — test apps will not be attached. Check DetectChanges output."
+fi
+```
+
+The TestApps bundle is a soft requirement: if `DetectChanges` mis-detected and didn't produce it, log a warning and continue with installer-only. Don't STOP the release.
+
+### Step 4.2a: If release already exists
+The workflow auto-created it (rare path — currently `build-windows.yml` does not auto-create a release, so this branch is unusual). Upload any missing assets:
+
+```bash
+gh release upload [FULL_TAG] --repo DisplayXR/displayxr-runtime --clobber "$INSTALLER" ${TESTAPPS_ZIP:+"$TESTAPPS_ZIP"}
+```
+Then go to Phase 5.
+
+### Step 4.2b: If release does NOT exist
+Create it with both assets:
+
+```bash
 # Generate release notes
 NOTES=$(git log "$PREV_TAG".."[FULL_TAG]" --oneline --no-merges)
 # Group commits by prefix (Feature, Fix, CI, Docs, etc.) — see PHASE 5 notes template
@@ -177,7 +206,7 @@ gh release create [FULL_TAG] \
   --repo DisplayXR/displayxr-runtime \
   --title "DisplayXR Runtime [FULL_TAG]" \
   --notes "<grouped notes here>" \
-  "$INSTALLER"
+  "$INSTALLER" ${TESTAPPS_ZIP:+"$TESTAPPS_ZIP"}
 ```
 
 ---
@@ -190,14 +219,15 @@ gh release view [FULL_TAG] --repo DisplayXR/displayxr-runtime --json tagName,nam
 
 Verify:
 - Tag matches [FULL_TAG]
-- Asset list contains DisplayXRSetup-*.exe with non-zero size
+- Asset list contains `DisplayXRSetup-*.exe` with non-zero size
+- Asset list contains `DisplayXR-TestApps-*.zip` with non-zero size (warn but don't fail if `DetectChanges` skipped the test-app build — flag in final report so the user can investigate)
 
 ### Step 5.1: Cleanup staging dir
 Only after the verification above passes. If verification fails, leave the dir for inspection.
 ```bash
 rm -rf _release_assets/
 ```
-Phase 4.1a does not create this dir, so the `rm -rf` is a no-op there — safe to run unconditionally.
+Phase 4.2a always downloads into this dir before any upload, so the `rm -rf` is always meaningful — safe to run unconditionally.
 
 ### Notes template
 Group commits from `git log $PREV_TAG..[FULL_TAG] --oneline --no-merges` by prefix:
@@ -215,7 +245,8 @@ Release [FULL_TAG] published successfully!
 Build:     Windows CI run #RUN_ID — Runtime + cube test apps passed
            [list any pre-existing-broken jobs here, with note that they don't affect the artifact]
 Release:   https://github.com/DisplayXR/displayxr-runtime/releases/tag/[FULL_TAG]
-Asset:     DisplayXRSetup-X.Y.Z[.BUILD].exe (size MB)
+Assets:    DisplayXRSetup-X.Y.Z.BUILD.exe (~N MB)
+           DisplayXR-TestApps-X.Y.Z.zip (~17 MB)  [or "skipped — DetectChanges did not produce TestApps-*"]
 Commits:   N commits since $PREV_TAG
 
 Notable changes:
