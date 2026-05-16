@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_spatial_workspace 1
-#define XR_EXT_spatial_workspace_SPEC_VERSION 9
+#define XR_EXT_spatial_workspace_SPEC_VERSION 10
 #define XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_EXT_spatial_workspace"
 
 // Provisional XrStructureType values. The 1000999100..105 range is reserved for
@@ -305,6 +305,8 @@ typedef enum XrWorkspaceInputEventTypeEXT {
     XR_WORKSPACE_INPUT_EVENT_FRAME_TICK_EXT     = 5, // spec_version 6
     XR_WORKSPACE_INPUT_EVENT_FOCUS_CHANGED_EXT  = 6, // spec_version 6
     XR_WORKSPACE_INPUT_EVENT_WINDOW_POSE_CHANGED_EXT = 7, // spec_version 8: runtime-driven pose / size change (edge resize, etc.)
+    XR_WORKSPACE_INPUT_EVENT_MODAL_OPEN_EXT      = 8, // spec_version 10: client opened a Win32 modal popup (refcounted, fires on 0→1 only)
+    XR_WORKSPACE_INPUT_EVENT_MODAL_CLOSE_EXT     = 9, // spec_version 10: client's last Win32 modal popup closed (refcounted, fires on 1→0 only)
     XR_WORKSPACE_INPUT_EVENT_TYPE_MAX_ENUM_EXT  = 0x7FFFFFFF
 } XrWorkspaceInputEventTypeEXT;
 
@@ -406,6 +408,13 @@ typedef struct XrWorkspaceInputEventEXT {
             float                   widthMeters;
             float                   heightMeters;
         } windowPoseChanged;
+        struct {  // spec_version 10: Win32 modal popup state. Refcounted
+            // runtime-side across nested popups, so the controller sees
+            // exactly one MODAL_OPEN on 0→1 and one MODAL_CLOSE on 1→0
+            // per logical modal session, regardless of nesting depth.
+            // Companion to ADR-017 (Tier 0 modal-dialog strategy).
+            XrWorkspaceClientId     clientId;
+        } modal;
     };
 } XrWorkspaceInputEventEXT;
 

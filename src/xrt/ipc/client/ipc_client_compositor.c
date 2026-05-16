@@ -585,6 +585,10 @@ comp_ipc_client_compositor_workspace_enumerate_input_events(struct xrt_composito
 			out->windowPoseChanged.widthMeters = src->u.window_pose_changed.width_m;
 			out->windowPoseChanged.heightMeters = src->u.window_pose_changed.height_m;
 			break;
+		case IPC_WORKSPACE_INPUT_EVENT_MODAL_OPEN:
+		case IPC_WORKSPACE_INPUT_EVENT_MODAL_CLOSE:
+			out->modal.clientId = (XrWorkspaceClientId)src->u.modal.client_id;
+			break;
 		default:
 			break;
 		}
