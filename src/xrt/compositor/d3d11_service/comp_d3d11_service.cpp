@@ -4129,8 +4129,16 @@ multi_compositor_update_input_forward(struct d3d11_multi_compositor *mc)
 	HWND target = NULL;
 	int32_t rx = 0, ry = 0, rw = 0, rh = 0;
 	bool is_capture = false;
+	// Gate on modal_open (ADR-017, #232): while the focused client has a
+	// Win32 modal popup, suppress click forwarding to its (hidden) app
+	// HWND. Without this, the user clicking the dimmed app's content in
+	// the workspace view forwards LMB-down to the app HWND, which shifts
+	// the app's child-window focus and breaks the modal's modal-disable.
+	// Target stays NULL → comp_d3d11_window's WndProc forwards nothing for
+	// this frame, which is the right behavior while a modal is up.
 	if (mc->focused_slot >= 0 && mc->focused_slot < D3D11_MULTI_MAX_CLIENTS &&
-	    mc->clients[mc->focused_slot].active) {
+	    mc->clients[mc->focused_slot].active &&
+	    !mc->clients[mc->focused_slot].modal_open) {
 		target = mc->clients[mc->focused_slot].app_hwnd;
 		rx = (int32_t)mc->clients[mc->focused_slot].window_rect_x;
 		ry = (int32_t)mc->clients[mc->focused_slot].window_rect_y;
@@ -6956,8 +6964,14 @@ after_key_shortcuts:
 					// sub-control. When focus DID change we send DOWN only — the
 					// natural WndProc-forwarded UP arrives when the user releases
 					// LMB, which completes the drag.
+					//
+					// Modal gate (ADR-017, #232): skip when the hit slot has a Win32
+					// modal popup open. Forwarding the synthetic click to a sub-
+					// control would shift the app's focus out of the modal-disabled
+					// chain.
 					if (mc->clients[hit_slot].client_type == CLIENT_TYPE_CAPTURE &&
-					    mc->clients[hit_slot].app_hwnd != nullptr) {
+					    mc->clients[hit_slot].app_hwnd != nullptr &&
+					    !mc->clients[hit_slot].modal_open) {
 						float title_h_m = UI_TITLE_BAR_H_M;
 						float content_local_x = hit.local_x_m;
 						float content_local_y = hit.local_y_m - title_h_m;
@@ -6993,7 +7007,8 @@ after_key_shortcuts:
 							PostMessage(click_target, WM_LBUTTONUP, 0, lp);
 						}
 					} else if (focus_changed &&
-					           mc->clients[hit_slot].app_hwnd != nullptr) {
+					           mc->clients[hit_slot].app_hwnd != nullptr &&
+					           !mc->clients[hit_slot].modal_open) {
 						// IPC app: focus changed mid-click. WndProc had
 						// already forwarded the initial DOWN to the OLD
 						// fwd target (or nowhere if none); the NEW target
@@ -7003,6 +7018,10 @@ after_key_shortcuts:
 						// scaled if app HWND ≠ rect dims) so the app
 						// doesn't see a sudden jump between DOWN and the
 						// first natural MOVE.
+						//
+						// Modal gate (ADR-017, #232): suppress when the hit
+						// slot has a modal open — same reason as the capture
+						// path above.
 						HWND target = mc->clients[hit_slot].app_hwnd;
 						const int32_t inset = 20;
 						int32_t rx = (int32_t)mc->clients[hit_slot].window_rect_x + inset;
@@ -13741,6 +13760,35 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 		out_batch->count++;
 
 		cs->modal_open_last_emitted = cs->modal_open;
+
+		// Item 4 (#232): on MODAL_CLOSE, restore enough state that the
+		// next user input reaches the app's dialog activation path.
+		//
+		//   (a) Workspace-internal focus → this slot, so the runtime's
+		//       click-forward + chrome-emission paths point at the right
+		//       app HWND for subsequent input.
+		//   (b) Grant the app process foreground-set rights via
+		//       AllowSetForegroundWindow. The app's HWND is hidden in
+		//       workspace mode (SW_HIDE in oxr_session.c), so calling
+		//       SetForegroundWindow on it directly silently fails on a
+		//       hidden window AND can leave Windows' foreground lock in
+		//       a state that DENIES the next dialog activation from the
+		//       app — producing "subsequent dialogs open invisible". The
+		//       safer move: don't try to surface the hidden HWND; grant
+		//       the app process the right to activate its own dialog
+		//       windows on its next user-input edge. The grant is one-
+		//       shot per call and the runtime is the foreground process
+		//       at this point, so the grant is what Windows actually
+		//       needs to let the next dialog claim foreground.
+		if (!cs->modal_open && cs->app_hwnd != NULL) {
+			mc->focused_slot = s;
+			multi_compositor_update_input_forward(mc);
+			DWORD app_pid = 0;
+			GetWindowThreadProcessId(cs->app_hwnd, &app_pid);
+			if (app_pid != 0) {
+				(void)AllowSetForegroundWindow(app_pid);
+			}
+		}
 	}
 
 	// FRAME_TICK: one per displayed frame since the last drain, capped at
@@ -14114,6 +14162,42 @@ comp_d3d11_service_set_client_modal_state(struct xrt_system_compositor *xsysc, i
 		return;
 	}
 	mc->clients[slot].modal_open = is_open;
+
+	// Item 4 (#232) cont'd: when transitioning to modal-open, grant the
+	// app process foreground-activation rights so its in-flight dialog
+	// CreateWindow can claim foreground. The IPC RPC fires synchronously
+	// from the app's CBT hook, BEFORE the dialog HWND is materialized —
+	// so granting here lands in the gauss process foreground-lock state
+	// just in time for the dialog activation. Without this, the FIRST
+	// dialog ever still works (gauss inherits foreground from process
+	// startup), but subsequent ones after a CLOSE → OPEN cycle activate
+	// invisibly because the workspace compositor is foreground by then
+	// and Windows' lock denies cross-process activation. The MODAL_CLOSE
+	// emit path also grants, but the 5-second AllowSetForegroundWindow
+	// window can lapse between CLOSE and the next OPEN; granting on OPEN
+	// too closes the timing hole.
+	if (is_open && mc->clients[slot].app_hwnd != NULL) {
+		DWORD app_pid = 0;
+		GetWindowThreadProcessId(mc->clients[slot].app_hwnd, &app_pid);
+		if (app_pid != 0) {
+			(void)AllowSetForegroundWindow(app_pid);
+		}
+	}
+
+	// Item 3 (#232) cont'd: kick the input-forward refresh immediately so
+	// the cached input_forward_hwnd in the window goes to NULL while
+	// modal_open is true (preventing keystrokes and clicks from reaching
+	// the app HWND and spawning nested modals). Without this kick, the
+	// modal_open flag is set on this IPC thread but the window's cached
+	// forwarding target keeps pointing at the app until something else
+	// happens to call update_input_forward (e.g., a focus change or the
+	// next chrome layout push) — leaving a window where subsequent L-
+	// presses on a hidden gauss app open more dialogs.
+	//
+	// comp_d3d11_window_set_input_forward writes via InterlockedExchange,
+	// so calling from this IPC thread is safe even though the WndProc
+	// thread reads concurrently.
+	multi_compositor_update_input_forward(mc);
 }
 
 extern "C" void *
