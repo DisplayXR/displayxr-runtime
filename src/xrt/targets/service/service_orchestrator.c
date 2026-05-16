@@ -907,7 +907,20 @@ service_orchestrator_is_workspace_available(void)
 void
 service_orchestrator_refresh_workspace_controller(void)
 {
+	bool was_available = s_workspace_available;
 	detect_workspace_controller(&s_cfg);
+
+	// If availability just flipped (controller installed / uninstalled
+	// while the service was running), re-apply the current workspace
+	// mode so:
+	//   - mode=ENABLE → spawns the controller now that we know it exists
+	//   - mode=AUTO   → installs the Ctrl+Space hotkey
+	//   - mode=DISABLE → terminates any stray controller (no-op if none)
+	// apply_workspace_mode itself early-returns when !s_workspace_available,
+	// so the false→true and true→false transitions are both safe.
+	if (was_available != s_workspace_available) {
+		apply_workspace_mode(s_cfg.workspace);
+	}
 }
 
 const char *
