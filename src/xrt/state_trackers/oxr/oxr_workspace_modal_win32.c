@@ -139,6 +139,23 @@ cbt_hook_proc(int code, WPARAM wParam, LPARAM lParam)
 			// HWND) are left alone. No class allowlist needed.
 			cbt->lpcs->hwndParent = s_dialog_owner_hwnd;
 
+			// #232 item 2: also flag the dialog as WS_EX_TOPMOST so it
+			// sits visually above the workspace compositor's swap-chain
+			// window regardless of activation z-order swaps. Without
+			// this, the user clicking into the compositor raises the
+			// compositor in non-topmost z and obscures the dialog while
+			// the dialog still holds keyboard focus — keystrokes route
+			// to an invisible window, which reads as broken.
+			//
+			// Mutating dwExStyle here works the same way as the parent
+			// rewrite above: CreateWindowEx reads the modified lpcs
+			// value when it actually creates the window. No SetWindowPos
+			// is needed (and wouldn't work — the HWND doesn't exist yet
+			// at HCBT_CREATEWND). Nested modals each get the same flag
+			// individually; on close they're destroyed which discards
+			// the bit, so there's no cleanup pair.
+			cbt->lpcs->dwExStyle |= WS_EX_TOPMOST;
+
 			EnterCriticalSection(&s_lock);
 			bool was_first = (s_modal_open_depth == 0);
 			if (track_dialog(new_hwnd)) {
@@ -148,6 +165,34 @@ cbt_hook_proc(int code, WPARAM wParam, LPARAM lParam)
 				notify_modal_state_locked(true);
 			}
 			LeaveCriticalSection(&s_lock);
+		}
+	} else if (code == HCBT_ACTIVATE) {
+		// #232 follow-up: re-assert HWND_TOPMOST on every activation of a
+		// tracked dialog. The lpcs.dwExStyle |= WS_EX_TOPMOST mutation at
+		// HCBT_CREATEWND sets the initial state correctly for the FIRST
+		// dialog (which is why it appears in front the first time), but
+		// the dialog's own activation churn (modal-disable of the owner
+		// chain, focus-restore from the previous dialog's destroy, etc.)
+		// can drop the topmost bit on subsequent dialogs in the same
+		// process. The visible symptom is "second L-press dialog opens
+		// BEHIND the workspace compositor" — keyboard focus is correct
+		// (Alt+Tab brings it forward) but z-order is wrong. Forcing
+		// HWND_TOPMOST here, with NOMOVE | NOSIZE | NOACTIVATE so we
+		// don't perturb the dialog's own positioning or focus state,
+		// keeps every dialog in this session above non-topmost windows.
+		HWND hwnd = (HWND)wParam;
+		EnterCriticalSection(&s_lock);
+		bool is_tracked = false;
+		for (int i = 0; i < s_tracked_dialog_count; i++) {
+			if (s_tracked_dialogs[i] == hwnd) {
+				is_tracked = true;
+				break;
+			}
+		}
+		LeaveCriticalSection(&s_lock);
+		if (is_tracked) {
+			(void)SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+			                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 		}
 	} else if (code == HCBT_DESTROYWND) {
 		HWND hwnd = (HWND)wParam;
