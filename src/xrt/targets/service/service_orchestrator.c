@@ -18,6 +18,7 @@
 #include <ws2tcpip.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <tlhelp32.h>
 #include <string.h>
 #include <stdio.h>
 #endif
@@ -379,6 +380,16 @@ spawn_workspace(void)
 	s_workspace_running = true;
 	OW("Launched workspace controller (PID %lu)", (unsigned long)s_workspace_pi.dwProcessId);
 
+	// Grant the freshly-spawned controller the right to call
+	// SetForegroundWindow when it brings its main window up. Without
+	// this Windows can suppress the call (the controller's
+	// CreateProcess parent is us, a background service with no
+	// foreground rights to confer). Matches the AllowSetForegroundWindow
+	// in the Ctrl+Space pass-through path; same Windows rule.
+	if (s_workspace_pi.dwProcessId != 0) {
+		AllowSetForegroundWindow(s_workspace_pi.dwProcessId);
+	}
+
 	// Start watchdog thread
 	if (s_workspace_watch_thread) {
 		CloseHandle(s_workspace_watch_thread);
@@ -656,6 +667,43 @@ orchestrator_wnd_proc_hook(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 //! Original tray window proc — we subclass it to intercept our custom msg
 static WNDPROC s_original_wnd_proc = NULL;
 
+//! Find the running workspace controller's PID. Prefers the orchestrator-tracked
+//! PID (when launch_child spawned the controller); falls back to enumerating
+//! processes for the controller image name (covers the case where the user
+//! launched the controller directly outside our spawn path).
+//! Returns 0 if no instance found.
+static DWORD
+find_workspace_controller_pid(void)
+{
+	if (s_workspace_running && s_workspace_pi.dwProcessId != 0) {
+		return s_workspace_pi.dwProcessId;
+	}
+	if (!s_workspace_available || s_workspace_active.binary[0] == '\0') {
+		return 0;
+	}
+	const char *image = strrchr(s_workspace_active.binary, '\\');
+	image = image ? image + 1 : s_workspace_active.binary;
+
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snap == INVALID_HANDLE_VALUE) {
+		return 0;
+	}
+	PROCESSENTRY32 pe;
+	ZeroMemory(&pe, sizeof(pe));
+	pe.dwSize = sizeof(pe);
+	DWORD found = 0;
+	if (Process32First(snap, &pe)) {
+		do {
+			if (_stricmp(pe.szExeFile, image) == 0) {
+				found = pe.th32ProcessID;
+				break;
+			}
+		} while (Process32Next(snap, &pe));
+	}
+	CloseHandle(snap);
+	return found;
+}
+
 static LRESULT CALLBACK
 orchestrator_kbd_hook_proc(int nCode, WPARAM wParam, LPARAM lParam)
 {
@@ -670,24 +718,50 @@ orchestrator_kbd_hook_proc(int nCode, WPARAM wParam, LPARAM lParam)
 			OW("kbd hook: Space ctrl=%d shift=%d alt=%d win=%d workspace_running=%d",
 			   ctrl, shift, alt, win, (int)s_workspace_running);
 			// Plain Ctrl+Space only, no other modifiers.
-			if (ctrl && !shift && !alt && !win && !s_workspace_running) {
-				// Phase 2.K: a shell launched directly via command line
-				// (rather than through our launch_child path) doesn't
-				// flip s_workspace_running, so the naive check above
-				// would spawn a duplicate. The shell holds a named
-				// singleton mutex `Local\DisplayXR.Shell.Singleton`
-				// for its lifetime — if it exists, an instance is
-				// already running and we should let its RegisterHotKey
-				// handle Ctrl+Space (toggle / deactivate). Pass the
-				// keypress through.
+			if (ctrl && !shift && !alt && !win) {
+				// Check both orchestrator-tracked state and the named
+				// singleton mutex Local\DisplayXR.Shell.Singleton —
+				// the latter covers the case where the controller
+				// was launched directly outside our spawn path
+				// (Phase 2.K).
+				bool singleton_present = false;
 				HANDLE existing = OpenMutexW(SYNCHRONIZE, FALSE,
 				    L"Local\\DisplayXR.Shell.Singleton");
 				if (existing != NULL) {
 					CloseHandle(existing);
-					OW("kbd hook: shell singleton present — passing Ctrl+Space "
-					   "to existing instance");
+					singleton_present = true;
+				}
+
+				if (s_workspace_running || singleton_present) {
+					// Controller already running — let its
+					// RegisterHotKey handler take Ctrl+Space.
+					// We have to call AllowSetForegroundWindow
+					// first or Windows will silently drop the
+					// controller's SetForegroundWindow call
+					// (the controller isn't the foreground
+					// process and didn't just receive the
+					// input event — our hook did), and the
+					// user sees the taskbar entry flash
+					// without the window coming to front.
+					// Our hook owns "received the last input
+					// event", so AllowSetForegroundWindow
+					// succeeds from here.
+					DWORD pid = find_workspace_controller_pid();
+					if (pid != 0) {
+						AllowSetForegroundWindow(pid);
+					} else {
+						// Fall back to ASFW_ANY so even an
+						// orphaned process we couldn't
+						// identify can focus itself.
+						AllowSetForegroundWindow(ASFW_ANY);
+					}
+					OW("kbd hook: controller running (pid=%lu) — "
+					   "passing Ctrl+Space + AllowSetForegroundWindow",
+					   (unsigned long)pid);
 					return CallNextHookEx(s_kbd_hook, nCode, wParam, lParam);
 				}
+
+				// No controller running — spawn one.
 				HWND hwnd = (HWND)service_tray_get_hwnd();
 				if (hwnd) {
 					PostMessageW(hwnd, WM_ORCHESTRATOR_SPAWN_WORKSPACE, 0, 0);
