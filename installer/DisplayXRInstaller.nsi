@@ -197,93 +197,135 @@ FunctionEnd
 ; PATH manipulation functions
 ; Based on NSIS Wiki and SR Platform installer
 
-; AddToPath - Adds a directory to the system PATH
-; Uses System::Call to read REG_EXPAND_SZ properly (ReadRegStr can fail on
-; REG_EXPAND_SZ values, returning empty and causing PATH to be overwritten).
+; AddToPath — appends a directory to the system PATH if no segment of PATH
+; already names it. Walks segments (split on ';') and compares with
+; case-insensitive StrCmp ignoring a trailing backslash, so it's robust
+; against the casing/trailing-slash variations old installer versions wrote.
+;
+; Replaces an older implementation that used StrStr (case-sensitive
+; substring search) to dedupe, which mismatched whenever earlier installs
+; had written the entry with different casing, accumulating duplicates over
+; time. The previous implementation also used a REG_EXPAND_SZ-safe
+; System::Call read of the registry; that part is preserved here.
+;
 ; Usage: Push "C:\path\to\add"
 ;        Call AddToPath
 Function AddToPath
 	Exch $0  ; Path to add
 	Push $1  ; Current PATH
-	Push $2  ; Temp for search result
-	Push $3  ; Registry handle
-	Push $4  ; Data type / buffer pointer
-	Push $5  ; Data length
+	Push $2  ; Scratch (status / temp char)
+	Push $3  ; Current segment
+	Push $4  ; Target without trailing backslash
+	Push $5  ; Current segment without trailing backslash
+	Push $6  ; Scan index
+	Push $7  ; Temp char / strlen scratch
+	Push $8  ; System::Call buffer pointer
+	Push $9  ; Registry handle
 
-	; Open the Environment registry key
+	SetRegView 64
+
+	; Open the Environment registry key (KEY_READ).
 	; 0x80000002 = HKEY_LOCAL_MACHINE, 0x20019 = KEY_READ
-	System::Call 'Advapi32::RegOpenKeyExW(i 0x80000002, w "SYSTEM\CurrentControlSet\Control\Session Manager\Environment", i 0, i 0x20019, *i .r3) i .r2'
-	StrCmp $2 0 0 reg_failed
+	System::Call 'Advapi32::RegOpenKeyExW(i 0x80000002, w "SYSTEM\CurrentControlSet\Control\Session Manager\Environment", i 0, i 0x20019, *i .r9) i .r2'
+	StrCmp $2 0 0 atp_reg_fallback
 
-	; Query the size of the Path value first (pass null buffer to get size)
-	System::Call 'Advapi32::RegQueryValueExW(i r3, w "Path", i 0, i 0, i 0, *i .r5) i .r2'
-	StrCmp $2 0 0 reg_close_failed
+	System::Call 'Advapi32::RegQueryValueExW(i r9, w "Path", i 0, i 0, i 0, *i .r6) i .r2'
+	StrCmp $2 0 0 atp_reg_close_fallback
 
-	; Allocate buffer and read the value
-	System::Alloc $5
-	Pop $4  ; $4 = buffer pointer
-	System::Call 'Advapi32::RegQueryValueExW(i r3, w "Path", i 0, i 0, i r4, *i r5) i .r2'
-	StrCmp $2 0 0 reg_free_failed
+	System::Alloc $6
+	Pop $8
+	System::Call 'Advapi32::RegQueryValueExW(i r9, w "Path", i 0, i 0, i r8, *i r6) i .r2'
+	StrCmp $2 0 0 atp_reg_free_fallback
 
-	; Copy the buffer contents to $1 as a string
-	System::Call '*$4(&w${NSIS_MAX_STRLEN} .r1)'
+	System::Call '*$8(&w${NSIS_MAX_STRLEN} .r1)'
+	System::Free $8
+	System::Call 'Advapi32::RegCloseKey(i r9)'
+	Goto atp_got_path
 
-	; Free buffer and close key
-	System::Free $4
-	System::Call 'Advapi32::RegCloseKey(i r3)'
-
-	Goto got_path
-
-reg_free_failed:
-	System::Free $4
-reg_close_failed:
-	System::Call 'Advapi32::RegCloseKey(i r3)'
-reg_failed:
-	; Fall back to ReadRegStr if the System::Call approach fails
+atp_reg_free_fallback:
+	System::Free $8
+atp_reg_close_fallback:
+	System::Call 'Advapi32::RegCloseKey(i r9)'
+atp_reg_fallback:
 	ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
 
-got_path:
-	; Check if PATH is empty - if so, this is suspicious on a normal Windows system.
-	; Read from the expanded environment as a safety fallback to avoid wiping PATH.
-	StrCmp $1 "" try_expanded
-
-	Goto check_exists
-
-try_expanded:
-	; Last resort: read the current PATH from the process environment
-	; This won't have unexpanded %vars% but is better than losing PATH entirely
+atp_got_path:
+	; Defensive fallback: if PATH read returned empty (a real environment
+	; never has an empty PATH), try the process env so we don't overwrite
+	; PATH with just our entry. If that's also empty, treat as fresh-system
+	; and just write our path.
+	StrCmp $1 "" atp_try_expanded atp_normalize_target
+atp_try_expanded:
 	ReadEnvStr $1 PATH
-	StrCmp $1 "" empty_path
+	StrCmp $1 "" atp_empty_path atp_normalize_target
 
-check_exists:
-	; Check if path already exists in PATH (avoid duplicates)
-	; Extra Push $0: StrStr returns via Exch $0 which clobbers $0 and
-	; consumes one stack item below the args. This extra push provides
-	; the item for Exch $0 to restore $0 to path_to_add.
-	Push $0
-	Push $1
-	Push $0
-	Call StrStr
-	Pop $2
-	StrCmp $2 "" 0 already_exists
+atp_normalize_target:
+	; Strip a single trailing backslash from the target so we don't add
+	; "C:\foo" when PATH already has "C:\foo\" (or vice versa).
+	StrCpy $4 $0
+	StrLen $7 $4
+	IntOp $7 $7 - 1
+	StrCpy $6 $4 1 $7
+	StrCmp $6 "\" 0 +2
+		StrCpy $4 $4 $7
 
-	; Append to existing PATH
+	StrCmp $4 "" atp_done  ; refuse to append an empty target
+
+	; Walk PATH segments — if any matches the target (case-insensitive,
+	; ignoring trailing backslash), do not append.
+	StrCpy $2 $1  ; $2 = remaining unscanned PATH
+
+atp_loop:
+	StrCmp $2 "" atp_append  ; ran out of segments, no match — append
+	StrCpy $6 0
+	StrCpy $3 ""
+atp_find_semi:
+	StrCpy $7 $2 1 $6
+	StrCmp $7 "" atp_seg_end
+	StrCmp $7 ";" atp_seg_end
+	IntOp $6 $6 + 1
+	Goto atp_find_semi
+atp_seg_end:
+	StrCpy $3 $2 $6
+	IntOp $6 $6 + 1
+	StrCpy $2 $2 "" $6
+	StrCmp $3 "" atp_loop  ; skip empty segments
+
+	; Strip trailing backslash from the segment for comparison
+	StrCpy $5 $3
+	StrLen $7 $5
+	IntOp $7 $7 - 1
+	StrCpy $6 $5 1 $7
+	StrCmp $6 "\" 0 +2
+		StrCpy $5 $5 $7
+
+	StrCmp $5 $4 atp_already_present  ; case-insensitive
+	Goto atp_loop
+
+atp_already_present:
+	DetailPrint "Path already exists in system PATH, skipping"
+	Goto atp_done
+
+atp_empty_path:
+	; Truly empty PATH on a fresh system — write just our entry.
+	StrCpy $1 ""
+
+atp_append:
+	StrCmp $1 "" 0 +3
+		StrCpy $0 "$0"
+		Goto atp_write
 	StrCpy $0 "$1;$0"
-	Goto write_path
-
-empty_path:
-	; PATH is truly empty (fresh system?), just use our path (already in $0)
-
-write_path:
-	; Write new PATH
+atp_write:
 	WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$0"
 	DetailPrint "Added to system PATH"
-	Goto done
 
-already_exists:
-	DetailPrint "Path already exists in system PATH, skipping"
-
-done:
+atp_done:
+	SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+	SetRegView 32
+	Pop $9
+	Pop $8
+	Pop $7
+	Pop $6
 	Pop $5
 	Pop $4
 	Pop $3
@@ -292,124 +334,125 @@ done:
 	Pop $0
 FunctionEnd
 
-; RemoveFromPath - Removes a directory from the system PATH
-; Uses System::Call to read REG_EXPAND_SZ properly (ReadRegStr can fail on
-; REG_EXPAND_SZ values, returning empty and causing PATH to be overwritten).
-; Handles multiple occurrences, trailing backslashes, and case variations
-; Usage: Push "C:\path\to\remove" 
+; un.RemoveFromPath — removes every segment of the system PATH that matches
+; the target directory. Case-insensitive (NSIS StrCmp is case-insensitive by
+; default), trailing-backslash-tolerant, REG_EXPAND_SZ-safe. Replaces the
+; older implementation which called a broken un.StrLower helper that mangled
+; the normalized-target string via a misused CharLowerW system call.
+;
+; Usage: Push "C:\path\to\remove"
 ;        Call un.RemoveFromPath
-; RemoveFromPath - Removes a directory from the system PATH
-; Handles 64-bit registry, Unicode characters, and case-insensitive matching.
-; RemoveFromPath - Removes a directory from the system PATH
-; Handles 64-bit registry, Unicode characters, and case-insensitive matching.
 Function un.RemoveFromPath
   Exch $0 ; Target path
-  Push $1 ; Full PATH 
-  Push $2 ; Rebuilt PATH 
-  Push $3 ; Current Segment 
-  Push $4 ; Normalized Target 
-  Push $5 ; Normalized Segment 
-  Push $6 ; Loop Index 
-  Push $7 ; Temp Char 
-  Push $8 ; Log Handle (Unused but kept for stack balance)
+  Push $1 ; Full PATH
+  Push $2 ; Rebuilt PATH
+  Push $3 ; Current Segment
+  Push $4 ; Target without trailing backslash
+  Push $5 ; Current Segment without trailing backslash
+  Push $6 ; Scan index
+  Push $7 ; Temp char / strlen scratch
+  Push $8 ; System::Call buffer pointer
+  Push $9 ; Registry handle
 
   SetRegView 64
-  
-  ; Logging disabled for production
-  ; StrCpy $8 "$TEMP\RemoveFromPath.log"
-  ; FileOpen $8 $8 "w"
-  ; FileWrite $8 "=== RemoveFromPath started ===$\r$\n"
-  ; FileWrite $8 "Target to remove: '$0'$\r$\n"
 
-  ; 1. Read Registry
+  ; --- Read PATH via System::Call (REG_EXPAND_SZ-safe; mirrors AddToPath).
+  ; Plain ReadRegStr can return empty on REG_EXPAND_SZ values and truncates
+  ; PATHs longer than NSIS_MAX_STRLEN. Both leave $1 empty, the loop below
+  ; produces an empty rebuilt $2, and the safety guard then skips the write
+  ; so dupes accumulate forever. We do still fall back to ReadRegStr if the
+  ; System::Call path errors out, with the same safety guard catching the
+  ; truncated-string case.
+  ; 0x80000002 = HKEY_LOCAL_MACHINE, 0x20019 = KEY_READ
+  System::Call 'Advapi32::RegOpenKeyExW(i 0x80000002, w "SYSTEM\CurrentControlSet\Control\Session Manager\Environment", i 0, i 0x20019, *i .r9) i .r2'
+  StrCmp $2 0 0 rfp_reg_fallback
+
+  System::Call 'Advapi32::RegQueryValueExW(i r9, w "Path", i 0, i 0, i 0, *i .r6) i .r2'
+  StrCmp $2 0 0 rfp_reg_close_fallback
+
+  System::Alloc $6
+  Pop $8
+  System::Call 'Advapi32::RegQueryValueExW(i r9, w "Path", i 0, i 0, i r8, *i r6) i .r2'
+  StrCmp $2 0 0 rfp_reg_free_fallback
+
+  System::Call '*$8(&w${NSIS_MAX_STRLEN} .r1)'
+  System::Free $8
+  System::Call 'Advapi32::RegCloseKey(i r9)'
+  Goto rfp_got_path
+
+rfp_reg_free_fallback:
+  System::Free $8
+rfp_reg_close_fallback:
+  System::Call 'Advapi32::RegCloseKey(i r9)'
+rfp_reg_fallback:
   ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
-  ; FileWrite $8 "FULL REGISTRY PATH: '$1'$\r$\n"
 
-  ; 2. Normalize Target
+rfp_got_path:
+
+  ; Strip a single trailing backslash from the target so "C:\foo" matches
+  ; "C:\foo\" segments. StrCmp below is case-insensitive in NSIS — no
+  ; lowercasing required.
   StrCpy $4 $0
   StrLen $7 $4
   IntOp $7 $7 - 1
   StrCpy $6 $4 1 $7
   StrCmp $6 "\" 0 +2
-    StrCpy $4 $4 $7 
-  
-  Push $4
-  Call un.StrLower
-  Pop $4 
-  ; FileWrite $8 "Normalized Target: '$4'$\r$\n"
+    StrCpy $4 $4 $7
 
-  ; SAFETY GUARD: Do not proceed if target is empty!
-  StrCmp $4 "" 0 +2
-    ; FileWrite $8 "ERROR: Normalized target is empty. Aborting to save PATH.$\r$\n"
-    Goto done_cleanup
-
-  StrCpy $2 "" 
+  StrCmp $4 "" done_cleanup
+  StrCpy $2 ""
 
 loop_segments:
   StrCmp $1 "" done_loop
-  StrCpy $6 0 
-  StrCpy $3 "" 
+  StrCpy $6 0
+  StrCpy $3 ""
 
 find_semi:
-  StrCpy $7 $1 1 $6 
-  StrCmp $7 "" segment_found 
-  StrCmp $7 ";" segment_found 
+  StrCpy $7 $1 1 $6
+  StrCmp $7 "" segment_found
+  StrCmp $7 ";" segment_found
   IntOp $6 $6 + 1
   Goto find_semi
 
 segment_found:
-  StrCpy $3 $1 $6 
+  StrCpy $3 $1 $6
   IntOp $6 $6 + 1
-  StrCpy $1 $1 "" $6 
+  StrCpy $1 $1 "" $6
 
-  StrCmp $3 "" loop_segments ; Skip empty segments
+  StrCmp $3 "" loop_segments  ; Skip empty segments
 
-  ; Normalize Segment
+  ; Strip trailing backslash for the case-insensitive comparison
   StrCpy $5 $3
   StrLen $7 $5
   IntOp $7 $7 - 1
   StrCpy $6 $5 1 $7
   StrCmp $6 "\" 0 +2
     StrCpy $5 $5 $7
-  
-  Push $5
-  Call un.StrLower
-  Pop $5
-  
-  ; 3. Compare
-  StrCmp $5 $4 is_match
-    ; Result: NO MATCH - KEEPING
-    StrCmp $2 "" 0 +3
-      StrCpy $2 "$3" 
-      Goto loop_segments
-    StrCpy $2 "$2;$3" 
+
+  StrCmp $5 $4 is_match  ; case-insensitive
+
+  ; Keep
+  StrCmp $2 "" 0 +3
+    StrCpy $2 "$3"
     Goto loop_segments
+  StrCpy $2 "$2;$3"
+  Goto loop_segments
 
 is_match:
-  ; FileWrite $8 "MATCHED AND REMOVED: '$3'$\r$\n"
-  Goto loop_segments ; Go back to loop!
+  Goto loop_segments  ; Drop
 
 done_loop:
-  ; FileWrite $8 "FINAL REBUILT PATH: '$2'$\r$\n"
-
-  ; 4. Final Safety Check & Write
+  ; Re-read original PATH and only write if we actually changed it.
   ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
-  
-  ; Final sanity check: don't write an empty path if the original wasn't empty
-  StrCmp $2 "" done_write 
-  
-  StrCmp $2 $1 done_write
-    WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$2"
-    ; FileWrite $8 "Registry successfully updated.$\r$\n"
-  
-done_write:
-  ; FileWrite $8 "=== RemoveFromPath completed ===$\r$\n"
+  StrCmp $2 "" done_cleanup  ; rebuilt empty — refuse to wipe PATH
+  StrCmp $2 $1 done_cleanup  ; unchanged
+  WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$2"
 
 done_cleanup:
-  ; FileClose $8
   SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
   SetRegView 32
 
+  Pop $9
   Pop $8
   Pop $7
   Pop $6
@@ -775,7 +818,11 @@ Section "Uninstall"
 	; Also remove legacy scheduled task if it exists (from older installs)
 	nsExec::ExecToLog 'schtasks /delete /tn "DisplayXR Service" /f'
 
-	; Remove files
+	; Remove files. We name the high-value executables explicitly (so a
+	; failed Delete prints a clear log line), then wildcard-sweep the rest
+	; — including unowned bins that landed via cmake --install (cli, mcp,
+	; gui) that the NSI doesn't directly bundle but which accumulate in
+	; $INSTDIR across versions if we don't sweep them.
 	Delete "$INSTDIR\DisplayXRClient.dll"
 	Delete "$INSTDIR\displayxr-service.exe"
 	Delete "$INSTDIR\displayxr-webxr-bridge.exe"
@@ -783,8 +830,10 @@ Section "Uninstall"
 	Delete "$INSTDIR\DisplayXR_win64.json"
 	Delete "$INSTDIR\install.log"
 
-	; Remove any remaining DLLs
+	; Sweep remaining executables, DLLs, and manifests so RMDir can succeed
+	Delete "$INSTDIR\*.exe"
 	Delete "$INSTDIR\*.dll"
+	Delete "$INSTDIR\*.json"
 
 	; Save uninstall log to temp before removing directory
 	StrCpy $0 "$TEMP\DisplayXR_uninstall.log"
