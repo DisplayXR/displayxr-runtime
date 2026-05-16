@@ -135,6 +135,19 @@ jobs:
       - if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: ilammy/msvc-dev-cmd@v1
 
+      - name: Install OpenXR loader
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          # displayxr-webxr-bridge is an OpenXR client and links the loader.
+          # src/xrt/targets/webxr_bridge/CMakeLists.txt early-returns if the
+          # loader can't be found via find_package or OpenXR_ROOT — which
+          # drops both the bridge and the install(FILES openxr_loader.dll)
+          # rule from the build, leaving the installer without those files.
+          $openxrVersion = "1.1.38"
+          $openxrUrl = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$openxrVersion/openxr_loader_windows-$openxrVersion.zip"
+          Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
+          Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
+
       - name: Generate
         if: needs.DetectChanges.outputs.docs_only != 'true'
         env:
@@ -149,6 +162,7 @@ jobs:
             -DXRT_BUILD_INSTALLER=ON `
             -DXRT_FEATURE_SERVICE=ON `
             -DXRT_FEATURE_HYBRID_MODE=ON `
+            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk" `
             -DBUILD_NUM="${{ github.run_number }}"
 
       - name: Build
