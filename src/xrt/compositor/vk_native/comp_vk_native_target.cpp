@@ -975,6 +975,42 @@ comp_vk_native_target_resize(struct comp_vk_native_target *target,
 		return XRT_SUCCESS;
 	}
 
+#ifdef XRT_OS_WINDOWS
+	// Transparent path: DComp bridge has no WSI surface/swapchain — the
+	// dcomp DXGI swapchain and KMT-shared D3D11 textures (imported as
+	// VkImages) are size-bound. Tear down the bridge and re-run
+	// dcomp_setup at the new dimensions. target->views/images alias
+	// dcomp_vk_view/image, and dcomp_destroy frees the underlying handles,
+	// so we must NOT call destroy_swapchain_views here (would double-free)
+	// and must NOT fall through to create_swapchain (target->surface is
+	// VK_NULL_HANDLE in DComp mode → vkGetPhysicalDeviceSurfaceCapabilitiesKHR
+	// would crash).
+	if (target->dcomp_active) {
+		if (target->hwnd == NULL) {
+			U_LOG_E("DComp bridge resize: target->hwnd is NULL");
+			return XRT_ERROR_VULKAN;
+		}
+		vk->vkDeviceWaitIdle(vk->device);
+		dcomp_destroy(target);
+		// dcomp_vk_view/image were aliased into target->views/images;
+		// dcomp_destroy freed the underlying handles, so clear the
+		// public aliases too. Otherwise a subsequent
+		// destroy_swapchain_views would double-free.
+		for (uint32_t i = 0; i < DCOMP_RING; i++) {
+			target->views[i] = VK_NULL_HANDLE;
+			target->images[i] = VK_NULL_HANDLE;
+		}
+		target->image_count = 0;
+		if (!dcomp_setup(target, (HWND)target->hwnd, width, height)) {
+			dcomp_destroy(target);
+			U_LOG_E("DComp bridge resize: dcomp_setup(%ux%u) failed", width, height);
+			return XRT_ERROR_VULKAN;
+		}
+		// dcomp_setup re-publishes images/views/format/width/height/image_count.
+		return XRT_SUCCESS;
+	}
+#endif
+
 	vk->vkDeviceWaitIdle(vk->device);
 
 	destroy_swapchain_views(target);
