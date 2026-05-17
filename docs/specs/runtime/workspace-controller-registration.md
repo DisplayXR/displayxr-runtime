@@ -292,6 +292,41 @@ trust-boundary regression. Per-tile alpha against an opaque workspace
 background covers the realistic use case (transparent window contents
 inside a workspace) without that risk.
 
+## Display mode authority
+
+The workspace controller is the sole authority on display rendering mode
+(2D vs 3D, tile layout) for the clients it hosts. App-driven attempts
+to change mode from a workspace client are silently no-opped.
+
+**Enforcement (single point):** `oxr_api_session.c::oxr_xrRequestDisplayRenderingModeEXT`
+returns `XR_SUCCESS` without state change when the calling session is a
+workspace client (`sys->xsysc->info.is_service_mode && sess->compositor != NULL`).
+`xrRequestDisplayModeEXT` is a thin wrapper and inherits the gate.
+Headless bridge-relay sessions are exempt and may drive mode (they act
+as mode controller on behalf of an out-of-process WebXR page).
+
+**Non-enforcement (deliberate):** `xrEnumerateDisplayRenderingModesEXT`
+continues to return the FULL mode list to workspace clients. Apps index
+their local rendering-mode arrays by VENDOR-ASSIGNED `mode_index`
+delivered via `XrEventDataRenderingModeChangedEXT` — filtering the
+enumerator to `count=1` causes apps to read `renderingModeViewCounts[active_idx]=0`
+and submit `view[1]` with zero orientation, triggering `XR_ERROR_POSE_INVALID`
+at `xrEndFrame`. Authority is enforced by REQUEST-gating, not enumeration-filtering.
+
+**Transition protocol (#234):** When the workspace decides to flip mode
+(focus-adaptive, modal-open, qwerty V-toggle, vendor-initiated), the
+workspace D3D11 compositor (`comp_d3d11_service.cpp::multi_compositor_request_mode_flip`)
+broadcasts `XrEventDataRenderingModeChangedEXT` immediately and enters a
+WAITING_ACK phase with a "curtain" that flattens the per-tile blit pass
+to a uniform mono frame. Per-slot ack is detected at `compositor_layer_commit`
+when a slot submits a projection layer whose extent matches the target
+mode's `view_width_pixels` / `view_height_pixels`. Once all active IPC
+slots have acked (or a fairness timeout fires), the DP / device state /
+tile layout are flipped in lockstep; the curtain stays on through the
+vendor's hardware transition (bounded by `get_hardware_3d_state` polling
+plus a safety frame ceiling). Eliminates the historical raw-atlas glitch
+visible to users on every IPC-mode flip.
+
 ## Future evolution
 
 If multiple workspace apps need to coexist (one user has the
