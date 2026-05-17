@@ -2666,6 +2666,24 @@ struct xrt_system_compositor
 	 * The state tracker must make sure that no compositors are alive.
 	 */
 	void (*destroy)(struct xrt_system_compositor *xsc);
+
+	/*!
+	 * Optional. Issue #234: workspace controller's request to flip display
+	 * rendering mode via the acked-flip + curtain path on the multi-
+	 * compositor. NULL on backends without multi-compositor support — caller
+	 * should fall back to the legacy immediate mode update.
+	 *
+	 * Set by `comp_d3d11_service` during system compositor creation.
+	 * Called from `oxr_xrRequestDisplayRenderingModeEXT` when the calling
+	 * session is a workspace controller (compositor==NULL && service_mode);
+	 * the controller has legitimate mode authority but the immediate flip
+	 * would expose the raw-atlas glitch (#234) — routing through this hook
+	 * sequences the broadcast / per-slot ack / DP flip with curtain masking.
+	 *
+	 * Returns true if the request was accepted (caller must NOT also do the
+	 * legacy immediate flip); false to fall back.
+	 */
+	bool (*request_workspace_mode_flip)(struct xrt_system_compositor *xsc, uint32_t mode_index);
 };
 
 /*!

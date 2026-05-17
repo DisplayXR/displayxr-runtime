@@ -748,6 +748,41 @@ enum d3d11_client_type
 };
 
 /*!
+ * Acked-flip + curtain state machine for workspace display-mode transitions
+ * (issue #234). Replaces the historical "flip DP + sync_tile_layout
+ * immediately, hope apps catch up" pattern that exposed a raw-atlas glitch
+ * on every IPC-mode mode-flip (bridge V-toggle, workspace V-toggle / focus-
+ * adaptive, modal-open). State lives on d3d11_multi_compositor::mode_flip.
+ *
+ * IDLE         → no transition pending.
+ * WAITING_ACK  → event broadcast at request time; curtain ON; per-frame tick
+ *                waits for all active slots (less auto-acked capture/2D
+ *                slots) to submit a frame whose projection-layer extent
+ *                matches the target mode's per-view dims, OR for a fairness
+ *                timeout. Then advances to FLIPPING.
+ * FLIPPING     → DP request_display_mode + sync_tile_layout + active mode
+ *                index write have landed; curtain stays ON while the vendor
+ *                hardware transition completes (polled via
+ *                get_hardware_3d_state, bounded by a safety ceiling).
+ */
+enum mode_flip_phase
+{
+	MFP_IDLE = 0,
+	MFP_WAITING_ACK,
+	MFP_FLIPPING,
+};
+
+//! Frames to wait for all slots to ack the new layout before force-flipping
+//! the DP anyway (curtain still masks the un-acked slot's brief mismatch).
+//! ~500 ms at 60 Hz.
+#define MFP_ACK_TIMEOUT_FRAMES 30
+
+//! Frames to hold the curtain ON after DP request_display_mode lands before
+//! lifting it unconditionally — covers the vendor's hardware transition
+//! window when get_hardware_3d_state lies or hasn't converged. ~270 ms.
+#define MFP_HW_CEILING_FRAMES 16
+
+/*!
  * Per-client slot in the multi-compositor.
  */
 struct d3d11_multi_client_slot
@@ -764,6 +799,28 @@ struct d3d11_multi_client_slot
 	//! Actual rendered content dimensions per view (from last layer_commit).
 	uint32_t content_view_w;
 	uint32_t content_view_h;
+
+	//! Workspace acked-flip state (#234): true once this slot has submitted a
+	//! projection layer whose per-view dims differ from the snapshot taken at
+	//! request_mode_flip time. Workspace apps submit window-scaled extents
+	//! (not the canonical rendering_modes[i].view_width_pixels), so we detect
+	//! "app caught up to the broadcast event" by extent CHANGE rather than
+	//! by absolute match. Reset by multi_compositor_request_mode_flip; set by
+	//! the ack-detect block in compositor_layer_commit's workspace branch.
+	//! Read by multi_compositor_apply_pending_mode_flip to decide quorum.
+	bool acked_target_mode;
+
+	//! Per-slot extent snapshots used by the ack detector (#234).
+	//! `last_commit_view_w/h` are refreshed on every workspace-mode
+	//! compositor_layer_commit. `pre_flip_view_w/h` are snapshotted by
+	//! multi_compositor_request_mode_flip from the current last_commit
+	//! values; the ack fires when a subsequent commit's extent differs from
+	//! the pre_flip snapshot (meaning the app re-rendered after consuming
+	//! XrEventDataRenderingModeChangedEXT).
+	uint32_t last_commit_view_w;
+	uint32_t last_commit_view_h;
+	uint32_t pre_flip_view_w;
+	uint32_t pre_flip_view_h;
 
 	//! Window-space layer snapshot for `multi_compositor_render`'s WS pass.
 	//! Updated under `ws_snapshot_mutex` at the end of compositor_layer_commit
@@ -1161,6 +1218,22 @@ struct d3d11_multi_compositor
 	//! Tracks which capture HWND currently has foreground focus for SendInput.
 	//! NULL means no capture client is foreground (workspace window is foreground).
 	HWND current_foreground_capture;
+
+	//! Acked-flip + curtain state machine (#234). Replaces the historical
+	//! "flip DP + sync_tile_layout immediately, hope apps catch up" pattern.
+	//! See multi_compositor_request_mode_flip / multi_compositor_apply_pending_mode_flip.
+	struct
+	{
+		enum mode_flip_phase phase;   //!< IDLE / WAITING_ACK / FLIPPING (see enum).
+		uint32_t target_mode_index;   //!< Mode we're transitioning TO.
+		uint32_t source_mode_index;   //!< Mode we were in when transition started.
+		uint32_t ack_frame_counter;   //!< Frames spent in WAITING_ACK.
+		uint32_t flip_frame_counter;  //!< Frames spent in FLIPPING.
+		bool target_is_3d;            //!< Resolved at request time for vendor poll target.
+		int origin_slot;              //!< Slot that initiated (-1 = system: focus-adaptive, vendor poll).
+		uint32_t saved_mode_index;    //!< Pre-modal mode to restore on modal-close.
+		bool curtain_active;          //!< Per-tile blit pass collapses to eye-0 / tile-(0,0) when true.
+	} mode_flip;
 };
 
 
@@ -1363,6 +1436,199 @@ broadcast_rendering_mode_change(struct d3d11_service_system *sys,
 			xse2.hardware_display_state_change.type = XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE;
 			xse2.hardware_display_state_change.hardware_display_3d = new_3d;
 			u_system_broadcast_event(sys->usys, &xse2);
+		}
+	}
+}
+
+/*!
+ * Begin a workspace display-mode transition to @p target_mode_idx (#234).
+ *
+ * Single entry point for every IPC-mode mode flip — focus-adaptive, qwerty V,
+ * app-initiated XR_EXT, vendor SDK auto, modal-open/close. Replaces the
+ * previous "flip DP + sync_tile_layout + broadcast immediately, hope apps
+ * catch up" pattern that exposed a 1–N frame raw-atlas artifact while clients
+ * lagged the layout change.
+ *
+ * Caller is responsible for any pre-flip bookkeeping (e.g. saving
+ * sys->last_3d_mode_index before transitioning to 2D). This helper:
+ *   1. Broadcasts XrEventDataRenderingModeChangedEXT immediately so clients
+ *      can begin re-submitting at the new layout.
+ *   2. Marks the multi-comp as MFP_WAITING_ACK with the curtain ON.
+ *   3. Does NOT touch active_rendering_mode_index / sync_tile_layout / DP.
+ *      Those land in MFP_FLIPPING, triggered by
+ *      multi_compositor_apply_pending_mode_flip once the per-slot ack quorum
+ *      forms (or fairness timeout fires).
+ *
+ * No-op outside workspace/IPC mode (sys->multi_comp == nullptr).
+ */
+static void
+multi_compositor_request_mode_flip(struct d3d11_service_system *sys,
+                                   uint32_t target_mode_idx,
+                                   int origin_slot)
+{
+	if (sys == nullptr || sys->multi_comp == nullptr) {
+		return;
+	}
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	struct xrt_device *head = (sys->xsysd != nullptr) ? sys->xsysd->static_roles.head : nullptr;
+	if (head == nullptr || head->hmd == NULL) {
+		return;
+	}
+	if (target_mode_idx >= head->rendering_mode_count) {
+		return;
+	}
+
+	uint32_t source_mode_idx = head->hmd->active_rendering_mode_index;
+	bool target_is_3d = head->rendering_modes[target_mode_idx].hardware_display_3d;
+
+	// Toggle-back guard: user mashed V (or focus-bounced) and the target is
+	// the same mode we were in before the still-pending flip. Abort cleanly.
+	if (mc->mode_flip.phase != MFP_IDLE &&
+	    target_mode_idx == mc->mode_flip.source_mode_index) {
+		U_LOG_W("[mode_flip] toggle-back to source %u while pending — aborting",
+		        target_mode_idx);
+		mc->mode_flip.phase = MFP_IDLE;
+		mc->mode_flip.curtain_active = false;
+		return;
+	}
+
+	// No-op: already at target and nothing pending.
+	if (mc->mode_flip.phase == MFP_IDLE && target_mode_idx == source_mode_idx) {
+		return;
+	}
+
+	mc->mode_flip.phase = MFP_WAITING_ACK;
+	mc->mode_flip.target_mode_index = target_mode_idx;
+	mc->mode_flip.source_mode_index = source_mode_idx;
+	mc->mode_flip.ack_frame_counter = 0;
+	mc->mode_flip.flip_frame_counter = 0;
+	mc->mode_flip.target_is_3d = target_is_3d;
+	mc->mode_flip.origin_slot = origin_slot;
+	mc->mode_flip.curtain_active = true;
+
+	// Reset per-slot ack flags. Auto-ack capture / 2D-only slots — their
+	// per-slot atlas layout does not change across rendering modes, so they
+	// would never produce a "new layout" frame for the quorum. Snapshot the
+	// pre-flip per-view extent for IPC slots so the ack detector can detect
+	// "app has re-rendered after consuming XrEventDataRenderingModeChangedEXT"
+	// by extent change, not by absolute match against view_width_pixels
+	// (workspace apps submit window-scaled extents, not canonical mode dims).
+	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+		bool ipc_3d = mc->clients[s].active &&
+		              mc->clients[s].client_type == CLIENT_TYPE_IPC;
+		mc->clients[s].acked_target_mode = !ipc_3d;
+		mc->clients[s].pre_flip_view_w = mc->clients[s].last_commit_view_w;
+		mc->clients[s].pre_flip_view_h = mc->clients[s].last_commit_view_h;
+	}
+
+	// Broadcast event NOW so clients begin their re-submit cycle while the
+	// curtain masks the geometry mismatch. Device active index intentionally
+	// not yet written — apps consume the event payload, not the device state.
+	broadcast_rendering_mode_change(sys, head, source_mode_idx, target_mode_idx);
+
+	U_LOG_W("[mode_flip] request %u -> %u (target_is_3d=%d, origin_slot=%d) — broadcast, curtain ON",
+	        source_mode_idx, target_mode_idx, (int)target_is_3d, origin_slot);
+}
+
+/*!
+ * Per-frame tick for the workspace mode-flip state machine (#234).
+ *
+ * Called once near the top of multi_compositor_render, before the per-tile
+ * blit pass reads sys->tile_columns. Owns the WAITING_ACK -> FLIPPING and
+ * FLIPPING -> IDLE transitions; curtain_active stays true across both so the
+ * blit pass collapses to a uniform single-eye view until the DP and the
+ * hardware lens transition have both settled.
+ */
+static void
+multi_compositor_apply_pending_mode_flip(struct d3d11_service_system *sys)
+{
+	if (sys == nullptr || sys->multi_comp == nullptr) {
+		return;
+	}
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc->mode_flip.phase == MFP_IDLE) {
+		return;
+	}
+	struct xrt_device *head = (sys->xsysd != nullptr) ? sys->xsysd->static_roles.head : nullptr;
+	if (head == nullptr || head->hmd == NULL) {
+		return;
+	}
+
+	if (mc->mode_flip.phase == MFP_WAITING_ACK) {
+		mc->mode_flip.ack_frame_counter++;
+		// Teardown guard: if no active IPC slots remain (last app exited
+		// mid-flip) or the DP is gone, abort the pending flip rather than
+		// kicking a torn-down DP. Race vs slot-removal observed at session
+		// end on close-button click.
+		int active_ipc_count = 0;
+		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+			if (mc->clients[s].active &&
+			    mc->clients[s].client_type == CLIENT_TYPE_IPC) {
+				active_ipc_count++;
+			}
+		}
+		if (active_ipc_count == 0 || mc->display_processor == nullptr) {
+			U_LOG_W("[mode_flip] aborting pending flip — teardown (active_ipc=%d, dp=%p)",
+			        active_ipc_count, (void *)mc->display_processor);
+			mc->mode_flip.phase = MFP_IDLE;
+			mc->mode_flip.curtain_active = false;
+			return;
+		}
+		bool quorum = true;
+		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+			if (!mc->clients[s].active) continue;
+			if (mc->clients[s].client_type != CLIENT_TYPE_IPC) continue;
+			if (!mc->clients[s].acked_target_mode) {
+				quorum = false;
+				break;
+			}
+		}
+		bool timeout = mc->mode_flip.ack_frame_counter >= MFP_ACK_TIMEOUT_FRAMES;
+		if (!quorum && !timeout) {
+			return; // keep waiting, curtain stays on
+		}
+		if (timeout && !quorum) {
+			U_LOG_W("[mode_flip] WAITING_ACK timeout at %u frames — force-flipping (curtain still masks)",
+			        mc->mode_flip.ack_frame_counter);
+		}
+
+		// Land the flip: device state, DP, tile layout all in lockstep.
+		head->hmd->active_rendering_mode_index = mc->mode_flip.target_mode_index;
+		xrt_display_processor_d3d11_request_display_mode(
+		    mc->display_processor, mc->mode_flip.target_is_3d);
+		sync_tile_layout(sys);
+		sys->hardware_display_3d = mc->mode_flip.target_is_3d;
+
+		mc->mode_flip.phase = MFP_FLIPPING;
+		mc->mode_flip.flip_frame_counter = 0;
+		U_LOG_W("[mode_flip] FLIPPING: DP request_display_mode(%d), sync_tile_layout done",
+		        (int)mc->mode_flip.target_is_3d);
+		return;
+	}
+
+	if (mc->mode_flip.phase == MFP_FLIPPING) {
+		mc->mode_flip.flip_frame_counter++;
+		// Teardown guard: DP went away mid-FLIPPING. Bail without polling.
+		if (mc->display_processor == nullptr) {
+			U_LOG_W("[mode_flip] aborting FLIPPING — display_processor gone");
+			mc->mode_flip.curtain_active = false;
+			mc->mode_flip.phase = MFP_IDLE;
+			return;
+		}
+		bool hw_settled = false;
+		bool current_is_3d = false;
+		if (xrt_display_processor_d3d11_get_hardware_3d_state(
+		        mc->display_processor, &current_is_3d)) {
+			hw_settled = (current_is_3d == mc->mode_flip.target_is_3d);
+		}
+		bool ceiling = mc->mode_flip.flip_frame_counter >= MFP_HW_CEILING_FRAMES;
+		if (hw_settled || ceiling) {
+			if (ceiling && !hw_settled) {
+				U_LOG_W("[mode_flip] FLIPPING ceiling at %u frames — lifting curtain unconditionally",
+				        mc->mode_flip.flip_frame_counter);
+			}
+			mc->mode_flip.curtain_active = false;
+			mc->mode_flip.phase = MFP_IDLE;
 		}
 	}
 }
@@ -4516,6 +4782,27 @@ multi_compositor_unregister_client(struct d3d11_service_system *sys, struct d3d1
 
 	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
 		if (mc->clients[i].active && mc->clients[i].compositor == c) {
+			// Release strong swapchain refs the WS-layer snapshot holds
+			// (#234 follow-on). Once cleared, the IPC layer's swapchain
+			// ref drop (ipc_server_per_client_thread.c:510) will be the
+			// last ref, destroying the swapchain SAFELY because we run
+			// inside sys->render_mutex (caller's contract) so no render
+			// thread can be mid-snapshot-deref.
+			{
+				std::lock_guard<std::mutex> snap_lock(
+				    mc->clients[i].ws_snapshot_mutex);
+				for (uint32_t j = 0; j < mc->clients[i].ws_snapshot_count; j++) {
+					for (size_t k = 0;
+					     k < ARRAY_SIZE(mc->clients[i].ws_snapshot[j].sc_array);
+					     k++) {
+						xrt_swapchain_reference(
+						    &mc->clients[i].ws_snapshot[j].sc_array[k], NULL);
+					}
+				}
+				mc->clients[i].ws_snapshot_count = 0;
+				mc->clients[i].projection_flags_valid = false;
+			}
+
 			mc->clients[i].active = false;
 			mc->clients[i].compositor = nullptr;
 			mc->client_count--;
@@ -7447,13 +7734,20 @@ after_key_shortcuts:
 		}
 	}
 
+	// Per-frame tick for the workspace mode-flip state machine (#234). Owns
+	// the WAITING_ACK -> FLIPPING and FLIPPING -> IDLE transitions and the
+	// curtain on/off lifecycle. Must run BEFORE the per-tile blit pass reads
+	// sys->tile_columns so the read sees the just-landed (or still-pending)
+	// tile geometry consistently with the curtain state used by the blit.
+	multi_compositor_apply_pending_mode_flip(sys);
+
 	// 2D/3D display mode auto-switch based on focused client type.
 	// When a capture (2D) window gets focus → switch to 2D mode.
 	// When an IPC (3D) app gets focus → restore 3D mode.
-	// Uses the same mechanism as V-key toggle: changes active_rendering_mode_index,
-	// calls request_display_mode on DP, and sync_tile_layout. Extension apps
-	// receive XrEventDataRenderingModeChangedEXT + XrEventDataHardwareDisplayStateChangedEXT
-	// automatically via the OXR session's per-frame mode index polling.
+	// Routes through multi_compositor_request_mode_flip (#234) so the DP /
+	// sync_tile_layout / device-state writes are deferred to the apply step
+	// above once all active IPC slots have re-submitted at the new layout
+	// (or the fairness timeout fires). The curtain masks the catch-up window.
 	{
 		bool want_2d = false;
 		if (mc->focused_slot >= 0 && mc->focused_slot < D3D11_MULTI_MAX_CLIENTS &&
@@ -7469,31 +7763,19 @@ after_key_shortcuts:
 			    ? sys->xsysd->static_roles.head : nullptr;
 
 			if (head != nullptr && head->hmd != NULL) {
-				uint32_t prev_idx = head->hmd->active_rendering_mode_index;
+				uint32_t target_idx;
 				if (want_2d) {
-					// Save current 3D mode index before switching to 2D
 					uint32_t cur = head->hmd->active_rendering_mode_index;
 					if (cur < head->rendering_mode_count &&
 					    head->rendering_modes[cur].hardware_display_3d) {
 						sys->last_3d_mode_index = cur;
 					}
-					head->hmd->active_rendering_mode_index = 0; // Mode 0 = 2D mono
+					target_idx = 0; // mode 0 = 2D mono
 				} else {
-					// Restore 3D mode
-					head->hmd->active_rendering_mode_index = sys->last_3d_mode_index;
+					target_idx = sys->last_3d_mode_index;
 				}
-				broadcast_rendering_mode_change(sys, head, prev_idx,
-				                                head->hmd->active_rendering_mode_index);
+				multi_compositor_request_mode_flip(sys, target_idx, mc->focused_slot);
 			}
-
-			// Switch display HW mode
-			if (mc->display_processor != nullptr) {
-				xrt_display_processor_d3d11_request_display_mode(
-				    mc->display_processor, !want_2d);
-			}
-
-			sync_tile_layout(sys);
-			sys->hardware_display_3d = !want_2d;
 
 			U_LOG_W("Multi-comp: auto display mode → %s (focused slot %d, type=%s)",
 			        want_2d ? "2D" : "3D", mc->focused_slot,
@@ -8037,7 +8319,14 @@ after_key_shortcuts:
 			// `src_rect.zw = cvw,cvh` (set below) drives sampling, the
 			// per-tile origin sets `src_rect.xy`.
 			float src_px_x, src_px_y;
-			if (slot_is_mono) {
+			if (slot_is_mono || mc->mode_flip.curtain_active) {
+				// Curtain (#234): during a workspace mode flip, force every
+				// destination tile to sample source tile (0,0). Combined
+				// with the eye_idx=0 collapse below, this writes identical
+				// content to both halves of combined_atlas so the SR weaver
+				// sees a uniform mono frame regardless of which slots have
+				// caught up to the new layout. Avoids the "raw atlas
+				// visible" double-image artifact during the catch-up window.
 				src_px_x = 0.0f;
 				src_px_y = 0.0f;
 			} else {
@@ -8045,8 +8334,17 @@ after_key_shortcuts:
 				src_px_y = static_cast<float>(src_row * slot_h_atlas);
 			}
 
-			// Per-eye destination rect (parallax-shifted for Z != 0)
-			int eye_idx = (src_col < 2) ? (int)src_col : 0;
+			// Per-eye destination rect (parallax-shifted for Z != 0).
+			// Curtain (#234): force eye_idx=0 for both halves during a mode
+			// flip — without this, the per-eye parallax shift still produces
+			// column-by-column doubling under the SR weaver even with
+			// identical source content. Source AND destination must collapse.
+			int eye_idx;
+			if (mc->mode_flip.curtain_active) {
+				eye_idx = 0;
+			} else {
+				eye_idx = (src_col < 2) ? (int)src_col : 0;
+			}
 			float win_frac_x = (float)eye_rect_x[eye_idx] / (float)ca_w;
 			float win_frac_y = (float)eye_rect_y[eye_idx] / (float)ca_h;
 			float win_frac_w = (float)eye_rect_w[eye_idx] / (float)ca_w;
@@ -8063,8 +8361,13 @@ after_key_shortcuts:
 			scissor.bottom = (LONG)((src_row + 1) * half_h);
 			sys->context->RSSetScissorRects(1, &scissor);
 
-			// Check for rotated window → perspective quad mode
-			int ei_for_quad = (src_col < 2) ? (int)src_col : 0;
+			// Check for rotated window → perspective quad mode.
+			// Curtain (#234): use eye 0 for both halves so the projected quad
+			// is identical across the dual-write — same rationale as the
+			// eye_idx collapse above.
+			int ei_for_quad = mc->mode_flip.curtain_active
+			                      ? 0
+			                      : ((src_col < 2) ? (int)src_col : 0);
 			int ei_q = (ei_for_quad < (int)eye_pos.count) ? ei_for_quad : 0;
 			float quad_corners[8] = {};
 			float quad_w_vals[4] = {1, 1, 1, 1};
@@ -10110,8 +10413,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	}
 
 	// App-initiated mode change: bridge relays requestRenderingMode() from the
-	// WebXR sample via HWND property. Polls each frame, triggers same server-side
-	// path as qwerty V key (device update + DP toggle + broadcast).
+	// WebXR sample via HWND property. Polls each frame; when the multi-comp is
+	// active, routes through the acked-flip path (#234) so the broadcast →
+	// per-slot re-submit → DP flip sequence is masked by the curtain. Without
+	// multi-comp (legacy bridge with its own per-client DP), preserve the
+	// immediate-flip behavior.
 	if (bridge_live && c->render.hwnd != nullptr && sys->xsysd != NULL) {
 		uint32_t req = (uint32_t)(uintptr_t)GetPropW(c->render.hwnd, L"DXR_RequestMode");
 		if (req > 0) {
@@ -10121,30 +10427,34 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			if (head != nullptr && head->hmd != NULL &&
 			    modeIdx < head->rendering_mode_count &&
 			    modeIdx != head->hmd->active_rendering_mode_index) {
-				uint32_t prev_idx = head->hmd->active_rendering_mode_index;
-				head->hmd->active_rendering_mode_index = modeIdx;
-				broadcast_rendering_mode_change(sys, head, prev_idx, modeIdx);
+				if (sys->multi_comp != nullptr) {
+					multi_compositor_request_mode_flip(sys, modeIdx, /*origin=*/-1);
+					U_LOG_W("App-initiated mode change: request %u (via acked-flip)", modeIdx);
+				} else {
+					uint32_t prev_idx = head->hmd->active_rendering_mode_index;
+					head->hmd->active_rendering_mode_index = modeIdx;
+					broadcast_rendering_mode_change(sys, head, prev_idx, modeIdx);
 
-				// Toggle DP 2D/3D
-				bool want_3d = head->rendering_modes[modeIdx].hardware_display_3d;
-				struct xrt_display_processor_d3d11 *dp = nullptr;
-				if (sys->workspace_mode && sys->multi_comp != nullptr)
-					dp = sys->multi_comp->display_processor;
-				else if (c->render.display_processor != nullptr)
-					dp = c->render.display_processor;
-				if (dp != nullptr)
-					xrt_display_processor_d3d11_request_display_mode(dp, want_3d);
+					bool want_3d = head->rendering_modes[modeIdx].hardware_display_3d;
+					if (c->render.display_processor != nullptr) {
+						xrt_display_processor_d3d11_request_display_mode(
+						    c->render.display_processor, want_3d);
+					}
 
-				sync_tile_layout(sys);
-				sys->hardware_display_3d = want_3d;
-				U_LOG_W("App-initiated mode change: %u -> %u (3D=%d)", prev_idx, modeIdx, (int)want_3d);
+					sync_tile_layout(sys);
+					sys->hardware_display_3d = want_3d;
+					U_LOG_W("App-initiated mode change: %u -> %u (3D=%d, immediate)",
+					        prev_idx, modeIdx, (int)want_3d);
+				}
 			}
 		}
 	}
 
 	// Runtime-side 2D/3D toggle (V key) — polls qwerty driver each frame.
 	// Disabled when bridge is active: mode changes go through the HWND
-	// property relay above (app-initiated path).
+	// property relay above (app-initiated path). When the multi-comp is
+	// active, routes through the acked-flip path (#234); otherwise preserves
+	// the immediate-flip behavior on the per-client DP.
 #ifdef XRT_BUILD_DRIVER_QWERTY
 	if (sys->xsysd != NULL && !bridge_live) {
 		bool force_2d = false;
@@ -10153,35 +10463,32 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		if (toggled) {
 			struct xrt_device *head = sys->xsysd->static_roles.head;
 			if (head != nullptr && head->hmd != NULL) {
-				uint32_t prev_idx = head->hmd->active_rendering_mode_index;
+				uint32_t target_idx;
 				if (force_2d) {
-					// Save current 3D mode index before switching to 2D
 					uint32_t cur = head->hmd->active_rendering_mode_index;
 					if (cur < head->rendering_mode_count &&
 					    head->rendering_modes[cur].hardware_display_3d) {
 						sys->last_3d_mode_index = cur;
 					}
-					head->hmd->active_rendering_mode_index = 0;
+					target_idx = 0; // mode 0 = 2D mono
 				} else {
-					// Restore last 3D mode index
-					head->hmd->active_rendering_mode_index = sys->last_3d_mode_index;
+					target_idx = sys->last_3d_mode_index;
 				}
-				broadcast_rendering_mode_change(sys, head, prev_idx,
-				                                head->hmd->active_rendering_mode_index);
+
+				if (sys->multi_comp != nullptr) {
+					multi_compositor_request_mode_flip(sys, target_idx, /*origin=*/-1);
+				} else {
+					uint32_t prev_idx = head->hmd->active_rendering_mode_index;
+					head->hmd->active_rendering_mode_index = target_idx;
+					broadcast_rendering_mode_change(sys, head, prev_idx, target_idx);
+					if (c->render.display_processor != nullptr) {
+						xrt_display_processor_d3d11_request_display_mode(
+						    c->render.display_processor, !force_2d);
+					}
+					sync_tile_layout(sys);
+					sys->hardware_display_3d = !force_2d;
+				}
 			}
-			// Switch display mode on the active DP.
-			// In workspace mode, the multi-comp owns the DP (per-client has none).
-			struct xrt_display_processor_d3d11 *dp = nullptr;
-			if (sys->workspace_mode && sys->multi_comp != nullptr) {
-				dp = sys->multi_comp->display_processor;
-			} else if (c->render.display_processor != nullptr) {
-				dp = c->render.display_processor;
-			}
-			if (dp != nullptr) {
-				xrt_display_processor_d3d11_request_display_mode(dp, !force_2d);
-			}
-			sync_tile_layout(sys);
-			sys->hardware_display_3d = !force_2d;
 		}
 
 		// Rendering mode change from qwerty 1/2/3 keys (disabled for legacy apps).
@@ -10249,34 +10556,56 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 
 		if (got_state) {
-			if (vendor_is_3d != sys->hardware_display_3d) {
+			// Suppress vendor-poll detection while an acked-flip is in progress
+			// (#234). During WAITING_ACK / FLIPPING the workspace has written
+			// sys->hardware_display_3d to the TARGET state but the vendor
+			// hardware is still mid-transition — the poll would (re)trigger a
+			// flip in the OPPOSITE direction, creating a feedback loop. Let
+			// the in-flight flip land; the post-flip apply_pending tick polls
+			// get_hardware_3d_state itself and bounds the wait.
+			bool pending_flip = sys->multi_comp != nullptr &&
+			                    sys->multi_comp->mode_flip.phase != MFP_IDLE;
+			if (vendor_is_3d != sys->hardware_display_3d && !pending_flip) {
 				U_LOG_W("Vendor SDK hardware 3D state changed: %s → %s",
 				        sys->hardware_display_3d ? "3D" : "2D",
 				        vendor_is_3d ? "3D" : "2D");
-				sys->hardware_display_3d = vendor_is_3d;
 				// When bridge is active, don't force the rendering mode
 				// transition — let the app decide via requestRenderingMode().
 				// The app receives a hardwarestatechange event and can react.
 				// Forcing causes a brief glitch (2D content through 3D weaver).
 				if (!bridge_live) {
-				// Update the device's active rendering mode to match
 				struct xrt_device *head = sys->xsysd ? sys->xsysd->static_roles.head : nullptr;
 				if (head != nullptr && head->hmd != NULL) {
-					uint32_t prev_idx = head->hmd->active_rendering_mode_index;
+					uint32_t target_idx;
 					if (!vendor_is_3d) {
 						uint32_t cur = head->hmd->active_rendering_mode_index;
 						if (cur < head->rendering_mode_count &&
 						    head->rendering_modes[cur].hardware_display_3d) {
 							sys->last_3d_mode_index = cur;
 						}
-						head->hmd->active_rendering_mode_index = 0; // mode 0 = 2D
+						target_idx = 0; // mode 0 = 2D
 					} else {
-						head->hmd->active_rendering_mode_index = sys->last_3d_mode_index;
+						target_idx = sys->last_3d_mode_index;
 					}
-					broadcast_rendering_mode_change(sys, head, prev_idx,
-					                                head->hmd->active_rendering_mode_index);
+					if (sys->multi_comp != nullptr) {
+						// Vendor-initiated: hardware is ALREADY at vendor_is_3d
+						// (the poll just discovered it). We still route through
+						// the acked-flip path so apps re-submit at the new
+						// layout; FLIPPING-phase vendor poll will see the
+						// hardware already settled and lift the curtain quickly.
+						multi_compositor_request_mode_flip(sys, target_idx, /*origin=*/-1);
+					} else {
+						uint32_t prev_idx = head->hmd->active_rendering_mode_index;
+						head->hmd->active_rendering_mode_index = target_idx;
+						broadcast_rendering_mode_change(sys, head, prev_idx, target_idx);
+						sync_tile_layout(sys);
+						sys->hardware_display_3d = vendor_is_3d;
+					}
 				}
-				sync_tile_layout(sys);
+				} else {
+					// Bridge path: just mirror sys->hardware_display_3d so the
+					// app's hardwarestatechange event fires; don't touch mode.
+					sys->hardware_display_3d = vendor_is_3d;
 				}
 			}
 		}
@@ -11178,6 +11507,25 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				continue;
 			}
 			std::lock_guard<std::mutex> snap_lock(slot_snap->ws_snapshot_mutex);
+			// Release strong refs the previous snapshot held on its
+			// swapchains (#234 follow-on). comp_layer's sc_array is raw
+			// pointers; we take xrt_swapchain refs on snapshot write so
+			// the underlying swapchains stay alive while the render
+			// thread reads them. Otherwise the IPC per-client cleanup
+			// path (ipc_server_per_client_thread.c:510) drops xscs refs
+			// WITHOUT sys->render_mutex, freeing the swapchains while
+			// multi_compositor_render is still mid-HUD-pass — observed
+			// as a UAF on `sc->images[img_idx].texture->GetDesc(...)` at
+			// comp_d3d11_service.cpp:8213 (close-button crash).
+			for (uint32_t j = 0; j < slot_snap->ws_snapshot_count; j++) {
+				for (size_t k = 0;
+				     k < ARRAY_SIZE(slot_snap->ws_snapshot[j].sc_array);
+				     k++) {
+					xrt_swapchain_reference(
+					    &slot_snap->ws_snapshot[j].sc_array[k], NULL);
+				}
+			}
+			slot_snap->ws_snapshot_count = 0;
 			uint32_t snap_n = 0;
 			bool saw_projection = false;
 			for (uint32_t i = 0;
@@ -11190,11 +11538,52 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					slot_snap->projection_flags_snapshot = l->data.flags;
 					slot_snap->projection_flags_valid = true;
 					saw_projection = true;
+
+					// Acked-flip detection (#234): refresh the per-
+					// slot extent snapshot every commit; when a
+					// workspace mode-flip is pending, ack when the
+					// extent has CHANGED since the pre_flip snapshot
+					// (taken at request_mode_flip time). Workspace
+					// apps submit window-scaled extents not the
+					// canonical rendering_modes[].view_width_pixels,
+					// so an absolute match doesn't work — but the
+					// extent does change when the app re-renders at
+					// the new tile_columns after consuming
+					// XrEventDataRenderingModeChangedEXT.
+					uint32_t got_w = l->data.proj.v[0].sub.rect.extent.w;
+					uint32_t got_h = l->data.proj.v[0].sub.rect.extent.h;
+					slot_snap->last_commit_view_w = got_w;
+					slot_snap->last_commit_view_h = got_h;
+					struct d3d11_multi_compositor *mc_ack = sys->multi_comp;
+					if (mc_ack != nullptr &&
+					    mc_ack->mode_flip.phase == MFP_WAITING_ACK &&
+					    !slot_snap->acked_target_mode) {
+						if (slot_snap->pre_flip_view_w != got_w ||
+						    slot_snap->pre_flip_view_h != got_h) {
+							slot_snap->acked_target_mode = true;
+						}
+					}
 				}
 				if (l->data.type != XRT_LAYER_WINDOW_SPACE) {
 					continue;
 				}
+				// Copy non-pointer layer data, then take strong refs on
+				// the sc_array pointers (#234 follow-on, see comment
+				// above the snapshot-clear loop). The raw `*l` would
+				// dangle when IPC drops the swapchain ref unsynchronized.
 				slot_snap->ws_snapshot[snap_n] = *l;
+				for (size_t k = 0;
+				     k < ARRAY_SIZE(slot_snap->ws_snapshot[snap_n].sc_array);
+				     k++) {
+					struct xrt_swapchain *raw =
+					    slot_snap->ws_snapshot[snap_n].sc_array[k];
+					slot_snap->ws_snapshot[snap_n].sc_array[k] = NULL;
+					if (raw != NULL) {
+						xrt_swapchain_reference(
+						    &slot_snap->ws_snapshot[snap_n].sc_array[k],
+						    raw);
+					}
+				}
 				snap_n++;
 			}
 			slot_snap->ws_snapshot_count = snap_n;
@@ -11538,37 +11927,67 @@ compositor_destroy(struct xrt_compositor *xc)
 #endif
 	}
 
-	// Unregister from multi-compositor before cleanup.
+	// Unregister from multi-compositor AND tear down all per-client GPU
+	// resources under sys->render_mutex (#234 follow-on). Previously only
+	// the unregister was inside the lock; fini_client_render_resources and
+	// fence cleanup happened outside, leaving a window where the render
+	// thread (capture_render_thread_func acquires the same mutex) could
+	// iterate mc->clients[] AFTER unregister null'd the slot but BEFORE
+	// the per-client D3D11 resources were released — and a stale snapshot
+	// of slot->compositor taken in the per-tile blit pass could deref a
+	// just-freed COM interface (observed: vtable call on rcx=feeefeee at
+	// multi_compositor_render +0x4781 when user clicks the close button).
+	// Holding the render mutex through the full teardown serializes the
+	// destroy with any in-progress render so the slot is guaranteed both
+	// unregistered AND fully torn down before the render thread can next
+	// observe it.
+	//
 	// Always unregister if there's a multi_comp — the client may have been
-	// registered in workspace mode but is now closing in standalone mode (after
-	// hot-switch). Without this, the slot stays stale and shows a ghost
-	// remnant on workspace re-activate.
+	// registered in workspace mode but is now closing in standalone mode
+	// (after hot-switch). Without this, the slot stays stale and shows a
+	// ghost remnant on workspace re-activate.
 	if (sys->multi_comp != nullptr) {
 		std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
 		multi_compositor_unregister_client(sys, c);
-	}
 
-	// Clear active compositor if it's this one
-	{
-		std::lock_guard<std::mutex> lock(sys->active_compositor_mutex);
-		if (sys->active_compositor == c) {
-			sys->active_compositor = nullptr;
+		// Clear active compositor if it's this one (still under render mutex
+		// so the render thread can't snapshot a stale active_compositor).
+		{
+			std::lock_guard<std::mutex> aclock(sys->active_compositor_mutex);
+			if (sys->active_compositor == c) {
+				sys->active_compositor = nullptr;
+			}
 		}
-	}
 
-	// Clean up per-client render resources (window, swap chain, display processor)
-	fini_client_render_resources(&c->render);
+		// Tear down per-client render resources (window, swap chain, DP,
+		// atlas textures / SRVs / RTVs) while still holding render_mutex.
+		fini_client_render_resources(&c->render);
 
-	// Phase 2: workspace_sync_fence cleanup. The com_ptr release drops the
-	// fence object; the shared NT handle was DuplicateHandle'd into the
-	// client process by the IPC layer (each ipc_send_handles_* call mints a
-	// fresh dup), so closing the source handle here doesn't disturb the
-	// client's open fence.
-	if (c->workspace_sync_fence_handle != nullptr) {
-		CloseHandle(c->workspace_sync_fence_handle);
-		c->workspace_sync_fence_handle = nullptr;
+		// workspace_sync_fence: drop the shared D3D11 fence. com_ptr release
+		// drops the fence object; the shared NT handle was DuplicateHandle'd
+		// into the client process by the IPC layer, so closing the source
+		// handle here doesn't disturb the client's open fence.
+		if (c->workspace_sync_fence_handle != nullptr) {
+			CloseHandle(c->workspace_sync_fence_handle);
+			c->workspace_sync_fence_handle = nullptr;
+		}
+		c->workspace_sync_fence.reset();
+	} else {
+		// No multi_comp: legacy single-client teardown, no render-thread
+		// race to guard against.
+		{
+			std::lock_guard<std::mutex> aclock(sys->active_compositor_mutex);
+			if (sys->active_compositor == c) {
+				sys->active_compositor = nullptr;
+			}
+		}
+		fini_client_render_resources(&c->render);
+		if (c->workspace_sync_fence_handle != nullptr) {
+			CloseHandle(c->workspace_sync_fence_handle);
+			c->workspace_sync_fence_handle = nullptr;
+		}
+		c->workspace_sync_fence.reset();
 	}
-	c->workspace_sync_fence.reset();
 
 	delete c;
 }
@@ -11942,6 +12361,22 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 
 	*out_xcn = &c->base;
 	return XRT_SUCCESS;
+}
+
+/*!
+ * Hook for oxr_xrRequestDisplayRenderingModeEXT when called by a workspace
+ * controller session (#234). Routes through the acked-flip + curtain path
+ * on the multi-compositor; the OXR layer then SKIPS the legacy immediate
+ * device-mode-update path, avoiding the raw-atlas glitch that's otherwise
+ * visible whenever the controller drives a mode change (shell V-toggle,
+ * focus-adaptive 2D, etc.).
+ *
+ * Returns false if there's no multi_comp (caller falls back to legacy path).
+ */
+static bool
+system_request_workspace_mode_flip(struct xrt_system_compositor *xsysc, uint32_t mode_index)
+{
+	return comp_d3d11_service_workspace_request_mode_flip(xsysc, mode_index);
 }
 
 static void
@@ -12362,6 +12797,7 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	// Set up system compositor vtable
 	sys->base.create_native_compositor = system_create_native_compositor;
 	sys->base.destroy = system_destroy;
+	sys->base.request_workspace_mode_flip = system_request_workspace_mode_flip;
 
 	// Set up multi-compositor control for session state management
 	sys->xmcc.set_state = system_set_state;
@@ -14163,6 +14599,54 @@ comp_d3d11_service_set_client_modal_state(struct xrt_system_compositor *xsysc, i
 	}
 	mc->clients[slot].modal_open = is_open;
 
+	// Modal-driven 2D-flip (#234, ADR-017 §"Required response" item 2):
+	// when the FOCUSED slot opens a modal, present a flat workspace so the
+	// OS-native dialog reads cleanly. Routes through the acked-flip path so
+	// the catch-up artifact is masked by the curtain. On modal-close,
+	// restore the pre-modal mode unless the user has manually changed mode
+	// in the meantime (defensive: don't yank a user-initiated 3D toggle).
+	// Non-focused-slot modals do not drive mode.
+	if (slot == mc->focused_slot && sys->xsysd != NULL) {
+		struct xrt_device *head = sys->xsysd->static_roles.head;
+		if (head != nullptr && head->hmd != NULL && head->rendering_mode_count > 0) {
+			uint32_t cur_idx = head->hmd->active_rendering_mode_index;
+			// Resolve the 2D mode index (first mode with hardware_display_3d == false).
+			uint32_t idx_2d = UINT32_MAX;
+			for (uint32_t i = 0; i < head->rendering_mode_count; i++) {
+				if (!head->rendering_modes[i].hardware_display_3d) {
+					idx_2d = i;
+					break;
+				}
+			}
+			if (idx_2d != UINT32_MAX) {
+				if (is_open) {
+					// Only save the pre-modal mode when we actually transition
+					// FROM a 3D mode to 2D. If we're already in 2D (e.g., a
+					// second modal opens while the first is still up, or focus-
+					// adaptive already put us in 2D), preserve the existing
+					// saved_mode_index so the eventual modal-close still
+					// restores the original 3D mode.
+					if (cur_idx != idx_2d) {
+						mc->mode_flip.saved_mode_index = cur_idx;
+						multi_compositor_request_mode_flip(sys, idx_2d, slot);
+						U_LOG_W("[mode_flip] modal-open on focused slot %d: %u -> 2D (%u)",
+						        slot, cur_idx, idx_2d);
+					}
+				} else {
+					// Only restore if we're still in 2D (presumed to be the
+					// mode we forced on MODAL_OPEN); otherwise leave alone.
+					uint32_t want = mc->mode_flip.saved_mode_index;
+					if (cur_idx == idx_2d && want != idx_2d &&
+					    want < head->rendering_mode_count) {
+						multi_compositor_request_mode_flip(sys, want, slot);
+						U_LOG_W("[mode_flip] modal-close on focused slot %d: 2D -> %u (restore)",
+						        slot, want);
+					}
+				}
+			}
+		}
+	}
+
 	// Item 4 (#232) cont'd: when transitioning to modal-open, grant the
 	// app process foreground-activation rights so its in-flight dialog
 	// CreateWindow can claim foreground. The IPC RPC fires synchronously
@@ -14198,6 +14682,23 @@ comp_d3d11_service_set_client_modal_state(struct xrt_system_compositor *xsysc, i
 	// so calling from this IPC thread is safe even though the WndProc
 	// thread reads concurrently.
 	multi_compositor_update_input_forward(mc);
+}
+
+extern "C" bool
+comp_d3d11_service_workspace_request_mode_flip(struct xrt_system_compositor *xsysc, uint32_t mode_index)
+{
+	if (xsysc == nullptr) {
+		return false;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (sys == nullptr || sys->multi_comp == nullptr) {
+		return false;
+	}
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	// origin_slot = -1 (system origin) — the workspace controller is logically
+	// the system, not a renderable slot.
+	multi_compositor_request_mode_flip(sys, mode_index, /*origin=*/-1);
+	return true;
 }
 
 extern "C" void *

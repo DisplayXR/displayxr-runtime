@@ -611,6 +611,20 @@ void
 comp_d3d11_service_set_client_modal_state(struct xrt_system_compositor *xsysc, int slot, bool is_open);
 
 /*!
+ * Workspace controller request to flip display rendering mode (#234).
+ * Routes through the acked-flip + curtain path on the multi-compositor so
+ * the broadcast / per-slot ack / DP flip are properly sequenced with curtain
+ * masking. Returns true if the request was accepted; false if the system
+ * doesn't have a multi-compositor (caller should fall back to the legacy
+ * immediate path). Called from oxr_xrRequestDisplayRenderingModeEXT when
+ * the calling session is a workspace controller — keeps the controller's
+ * legitimate mode authority but ensures the catch-up window is masked.
+ */
+bool
+comp_d3d11_service_workspace_request_mode_flip(struct xrt_system_compositor *xsysc,
+                                               uint32_t mode_index);
+
+/*!
  * Phase 2.C spec_version 9: set per-capture-client style. @p slot_index is
  * the same convention as comp_d3d11_service_set_capture_client_window_pose
  * (client_id - 1000 from the IPC layer).

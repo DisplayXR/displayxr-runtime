@@ -1369,9 +1369,34 @@ oxr_xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex)
 	// (synced from server via IPC shared memory).
 	// Exception: headless sessions (bridge relay) ARE allowed to change modes —
 	// the bridge acts as the mode controller on behalf of the WebXR page.
+	//
+	// This is THE enforcement point for the "workspace owns display mode" rule
+	// (#233). DO NOT enforce by filtering xrEnumerateDisplayRenderingModesEXT
+	// to count=1 — apps index local rendering-mode arrays by VENDOR-ASSIGNED
+	// `mode_index` (not array index). Filtering causes
+	// `renderingModeViewCounts[active_idx]=0` reads and `XR_ERROR_POSE_INVALID`
+	// at xrEndFrame across cube/gauss/others. Apps need the full enumerator
+	// to interpret indices that arrive via XrEventDataRenderingModeChangedEXT.
 	if (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode &&
 	    sess->compositor != NULL) {
 		return XR_SUCCESS;
+	}
+
+	// Workspace controller path (#234): workspace controller sessions are
+	// headless (compositor == NULL) but legitimately own mode authority.
+	// Route through the compositor's acked-flip hook so the broadcast /
+	// per-slot ack / DP flip are properly sequenced with curtain masking,
+	// instead of doing the immediate device-mode-update below (which exposes
+	// the raw-atlas glitch every controller-driven mode change). Bridge-
+	// relay sessions also hit this branch and benefit equally.
+	if (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode &&
+	    sess->compositor == NULL &&
+	    sess->sys->xsysc->request_workspace_mode_flip != NULL) {
+		if (sess->sys->xsysc->request_workspace_mode_flip(sess->sys->xsysc, modeIndex)) {
+			return XR_SUCCESS;
+		}
+		// Fall through to legacy immediate path if the compositor declined
+		// (no multi_comp — non-workspace bridge mode, etc.).
 	}
 
 	struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
