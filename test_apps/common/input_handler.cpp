@@ -221,11 +221,10 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             break;
         case 'V':
-            // Cycle through all rendering modes
-            if (state.renderingModeCount > 0) {
-                state.currentRenderingMode = (state.currentRenderingMode + 1) % state.renderingModeCount;
-            }
-            state.renderingModeChangeRequested = true;
+            // Request a cycle to the next mode. Main loop reads the runtime's
+            // current mode index (xr.currentModeIndex) to compute the target
+            // and calls xrRequestDisplayRenderingModeEXT.
+            state.cycleRenderingModeRequested = true;
             break;
         case 'I':
             // Snapshot the multi-view atlas to a PNG. Render thread
@@ -233,40 +232,31 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
             state.captureAtlasRequested = true;
             break;
         case '0':
-            state.currentRenderingMode = 0; // 2D mode
-            state.renderingModeChangeRequested = true;
+            state.absoluteRenderingModeRequested = 0; // 2D mode
             break;
         case '1':
-            if (state.renderingModeCount > 1) state.currentRenderingMode = 1;
-            state.renderingModeChangeRequested = true;
+            if (state.renderingModeCount > 1) state.absoluteRenderingModeRequested = 1;
             break;
         case '2':
-            if (state.renderingModeCount > 2) state.currentRenderingMode = 2;
-            state.renderingModeChangeRequested = true;
+            if (state.renderingModeCount > 2) state.absoluteRenderingModeRequested = 2;
             break;
         case '3':
-            if (state.renderingModeCount > 3) state.currentRenderingMode = 3;
-            state.renderingModeChangeRequested = true;
+            if (state.renderingModeCount > 3) state.absoluteRenderingModeRequested = 3;
             break;
         case '4':
-            if (state.renderingModeCount > 4) state.currentRenderingMode = 4;
-            state.renderingModeChangeRequested = true;
+            if (state.renderingModeCount > 4) state.absoluteRenderingModeRequested = 4;
             break;
         case '5':
-            if (state.renderingModeCount > 5) state.currentRenderingMode = 5;
-            state.renderingModeChangeRequested = true;
+            if (state.renderingModeCount > 5) state.absoluteRenderingModeRequested = 5;
             break;
         case '6':
-            if (state.renderingModeCount > 6) state.currentRenderingMode = 6;
-            state.renderingModeChangeRequested = true;
+            if (state.renderingModeCount > 6) state.absoluteRenderingModeRequested = 6;
             break;
         case '7':
-            if (state.renderingModeCount > 7) state.currentRenderingMode = 7;
-            state.renderingModeChangeRequested = true;
+            if (state.renderingModeCount > 7) state.absoluteRenderingModeRequested = 7;
             break;
         case '8':
-            if (state.renderingModeCount > 8) state.currentRenderingMode = 8;
-            state.renderingModeChangeRequested = true;
+            if (state.renderingModeCount > 8) state.absoluteRenderingModeRequested = 8;
             break;
         case 'T':
             state.eyeTrackingModeToggleRequested = true;

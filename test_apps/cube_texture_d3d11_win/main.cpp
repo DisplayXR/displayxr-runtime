@@ -368,10 +368,22 @@ static void RenderOneFrame(RenderState& rs) {
         ToggleFullscreen(rs.hwnd);
         g_inputState.fullscreenToggleRequested = false;
     }
-    if (g_inputState.renderingModeChangeRequested) {
-        g_inputState.renderingModeChangeRequested = false;
-        if (xr.pfnRequestDisplayRenderingModeEXT && xr.session != XR_NULL_HANDLE) {
-            xr.pfnRequestDisplayRenderingModeEXT(xr.session, g_inputState.currentRenderingMode);
+    // Rendering mode requests (V=cycle, 0-8=absolute). Single source of
+    // truth: the runtime owns current mode via xr.currentModeIndex.
+    if (g_inputState.cycleRenderingModeRequested) {
+        g_inputState.cycleRenderingModeRequested = false;
+        if (xr.pfnRequestDisplayRenderingModeEXT && xr.session != XR_NULL_HANDLE &&
+            xr.renderingModeCount > 0) {
+            uint32_t next = (xr.currentModeIndex + 1) % xr.renderingModeCount;
+            xr.pfnRequestDisplayRenderingModeEXT(xr.session, next);
+        }
+    }
+    if (g_inputState.absoluteRenderingModeRequested >= 0) {
+        uint32_t target = (uint32_t)g_inputState.absoluteRenderingModeRequested;
+        g_inputState.absoluteRenderingModeRequested = -1;
+        if (xr.pfnRequestDisplayRenderingModeEXT && xr.session != XR_NULL_HANDLE &&
+            target < xr.renderingModeCount) {
+            xr.pfnRequestDisplayRenderingModeEXT(xr.session, target);
         }
     }
     if (g_inputState.eyeTrackingModeToggleRequested) {
@@ -394,16 +406,16 @@ static void RenderOneFrame(RenderState& rs) {
     if (xr.sessionRunning) {
         XrFrameState frameState;
         if (BeginFrame(xr, frameState)) {
-            uint32_t modeViewCount = (xr.renderingModeCount > 0 && g_inputState.currentRenderingMode < xr.renderingModeCount)
-                ? xr.renderingModeViewCounts[g_inputState.currentRenderingMode] : 2;
-            uint32_t tileColumns = (xr.renderingModeCount > 0 && g_inputState.currentRenderingMode < xr.renderingModeCount)
-                ? xr.renderingModeTileColumns[g_inputState.currentRenderingMode] : 2;
-            uint32_t tileRows = (xr.renderingModeCount > 0 && g_inputState.currentRenderingMode < xr.renderingModeCount)
-                ? xr.renderingModeTileRows[g_inputState.currentRenderingMode] : 1;
-            bool monoMode = (xr.renderingModeCount > 0 && !xr.renderingModeDisplay3D[g_inputState.currentRenderingMode]);
-            if (xr.renderingModeCount > 0 && g_inputState.currentRenderingMode < xr.renderingModeCount) {
-                xr.recommendedViewScaleX = xr.renderingModeScaleX[g_inputState.currentRenderingMode];
-                xr.recommendedViewScaleY = xr.renderingModeScaleY[g_inputState.currentRenderingMode];
+            uint32_t modeViewCount = (xr.renderingModeCount > 0 && xr.currentModeIndex < xr.renderingModeCount)
+                ? xr.renderingModeViewCounts[xr.currentModeIndex] : 2;
+            uint32_t tileColumns = (xr.renderingModeCount > 0 && xr.currentModeIndex < xr.renderingModeCount)
+                ? xr.renderingModeTileColumns[xr.currentModeIndex] : 2;
+            uint32_t tileRows = (xr.renderingModeCount > 0 && xr.currentModeIndex < xr.renderingModeCount)
+                ? xr.renderingModeTileRows[xr.currentModeIndex] : 1;
+            bool monoMode = (xr.renderingModeCount > 0 && !xr.renderingModeDisplay3D[xr.currentModeIndex]);
+            if (xr.renderingModeCount > 0 && xr.currentModeIndex < xr.renderingModeCount) {
+                xr.recommendedViewScaleX = xr.renderingModeScaleX[xr.currentModeIndex];
+                xr.recommendedViewScaleY = xr.renderingModeScaleY[xr.currentModeIndex];
             }
             int eyeCount = monoMode ? 1 : (int)modeViewCount;
             std::vector<XrCompositionLayerProjectionView> projectionViews(eyeCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
@@ -548,10 +560,10 @@ static void RenderOneFrame(RenderState& rs) {
                             std::wstring dispText = FormatDisplayInfo(xr.displayWidthM, xr.displayHeightM,
                                 xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ);
                             dispText += L"\n" + FormatScaleInfo(xr.recommendedViewScaleX, xr.recommendedViewScaleY);
-                            dispText += L"\n" + FormatMode(g_inputState.currentRenderingMode, xr.pfnRequestDisplayRenderingModeEXT != nullptr,
-                                (xr.renderingModeCount > 0 && g_inputState.currentRenderingMode < xr.renderingModeCount) ? xr.renderingModeNames[g_inputState.currentRenderingMode] : nullptr,
+                            dispText += L"\n" + FormatMode(xr.currentModeIndex, xr.pfnRequestDisplayRenderingModeEXT != nullptr,
+                                (xr.renderingModeCount > 0 && xr.currentModeIndex < xr.renderingModeCount) ? xr.renderingModeNames[xr.currentModeIndex] : nullptr,
                                 xr.renderingModeCount,
-                                xr.renderingModeCount > 0 ? xr.renderingModeDisplay3D[g_inputState.currentRenderingMode] : true);
+                                xr.renderingModeCount > 0 ? xr.renderingModeDisplay3D[xr.currentModeIndex] : true);
                             std::wstring eyeText = FormatEyeTrackingInfo(
                                 xr.eyePositions, (uint32_t)eyeCount,
                                 xr.eyeTrackingActive, xr.isEyeTracking,

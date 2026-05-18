@@ -322,7 +322,8 @@ static void RenderThreadFunc(
     while (g_running.load() && !xr->exitRequested) {
         InputState inputSnapshot;
         bool resetRequested = false;
-        bool outputModeChanged = false;
+        bool cycleModeRequested = false;
+        int32_t absoluteModeRequest = -1;
         uint32_t windowW, windowH;
         {
             std::lock_guard<std::mutex> lock(g_inputMutex);
@@ -331,14 +332,25 @@ static void RenderThreadFunc(
             g_inputState.resetViewRequested = false;
             g_inputState.fullscreenToggleRequested = false;
             g_inputState.eyeTrackingModeToggleRequested = false;
-            outputModeChanged = g_inputState.renderingModeChangeRequested;
-            g_inputState.renderingModeChangeRequested = false;
+            cycleModeRequested = g_inputState.cycleRenderingModeRequested;
+            g_inputState.cycleRenderingModeRequested = false;
+            absoluteModeRequest = g_inputState.absoluteRenderingModeRequested;
+            g_inputState.absoluteRenderingModeRequested = -1;
             windowW = g_windowWidth;
             windowH = g_windowHeight;
         }
 
-        if (outputModeChanged && xr->pfnRequestDisplayRenderingModeEXT && xr->session != XR_NULL_HANDLE) {
-            xr->pfnRequestDisplayRenderingModeEXT(xr->session, inputSnapshot.currentRenderingMode);
+        // Rendering mode requests (V=cycle, 0-8=absolute). Single source of
+        // truth: the runtime owns current mode via xr->currentModeIndex.
+        if (cycleModeRequested && xr->pfnRequestDisplayRenderingModeEXT &&
+            xr->session != XR_NULL_HANDLE && xr->renderingModeCount > 0) {
+            uint32_t next = (xr->currentModeIndex + 1) % xr->renderingModeCount;
+            xr->pfnRequestDisplayRenderingModeEXT(xr->session, next);
+        }
+        if (absoluteModeRequest >= 0 && xr->pfnRequestDisplayRenderingModeEXT &&
+            xr->session != XR_NULL_HANDLE &&
+            (uint32_t)absoluteModeRequest < xr->renderingModeCount) {
+            xr->pfnRequestDisplayRenderingModeEXT(xr->session, (uint32_t)absoluteModeRequest);
         }
 
         UpdatePerformanceStats(perfStats);
@@ -377,16 +389,16 @@ static void RenderThreadFunc(
                 bool hudSubmitted = false;
 
                 // Get N-view mode info from enumerated rendering modes
-                uint32_t modeViewCount = (xr->renderingModeCount > 0 && inputSnapshot.currentRenderingMode < xr->renderingModeCount)
-                    ? xr->renderingModeViewCounts[inputSnapshot.currentRenderingMode] : 2;
-                uint32_t tileColumns = (xr->renderingModeCount > 0 && inputSnapshot.currentRenderingMode < xr->renderingModeCount)
-                    ? xr->renderingModeTileColumns[inputSnapshot.currentRenderingMode] : 2;
-                uint32_t tileRows = (xr->renderingModeCount > 0 && inputSnapshot.currentRenderingMode < xr->renderingModeCount)
-                    ? xr->renderingModeTileRows[inputSnapshot.currentRenderingMode] : 1;
-                bool monoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode]);
-                if (xr->renderingModeCount > 0 && inputSnapshot.currentRenderingMode < xr->renderingModeCount) {
-                    xr->recommendedViewScaleX = xr->renderingModeScaleX[inputSnapshot.currentRenderingMode];
-                    xr->recommendedViewScaleY = xr->renderingModeScaleY[inputSnapshot.currentRenderingMode];
+                uint32_t modeViewCount = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount)
+                    ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2;
+                uint32_t tileColumns = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount)
+                    ? xr->renderingModeTileColumns[xr->currentModeIndex] : 2;
+                uint32_t tileRows = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount)
+                    ? xr->renderingModeTileRows[xr->currentModeIndex] : 1;
+                bool monoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[xr->currentModeIndex]);
+                if (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) {
+                    xr->recommendedViewScaleX = xr->renderingModeScaleX[xr->currentModeIndex];
+                    xr->recommendedViewScaleY = xr->renderingModeScaleY[xr->currentModeIndex];
                 }
                 int eyeCount = monoMode ? 1 : (int)modeViewCount;
                 std::vector<XrCompositionLayerProjectionView> projectionViews(eyeCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
@@ -656,10 +668,10 @@ static void RenderThreadFunc(
                                 std::wstring dispText = FormatDisplayInfo(xr->displayWidthM, xr->displayHeightM,
                                     xr->nominalViewerX, xr->nominalViewerY, xr->nominalViewerZ);
                                 dispText += L"\n" + FormatScaleInfo(xr->recommendedViewScaleX, xr->recommendedViewScaleY);
-                                dispText += L"\n" + FormatMode(inputSnapshot.currentRenderingMode, xr->pfnRequestDisplayRenderingModeEXT != nullptr,
-                                    (xr->renderingModeCount > 0 && inputSnapshot.currentRenderingMode < xr->renderingModeCount) ? xr->renderingModeNames[inputSnapshot.currentRenderingMode] : nullptr,
+                                dispText += L"\n" + FormatMode(xr->currentModeIndex, xr->pfnRequestDisplayRenderingModeEXT != nullptr,
+                                    (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) ? xr->renderingModeNames[xr->currentModeIndex] : nullptr,
                                     xr->renderingModeCount,
-                                    xr->renderingModeCount > 0 ? xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode] : true);
+                                    xr->renderingModeCount > 0 ? xr->renderingModeDisplay3D[xr->currentModeIndex] : true);
                                 std::wstring eyeText = FormatEyeTrackingInfo(
                                     xr->eyePositions, (uint32_t)eyeCount,
                                     xr->eyeTrackingActive, xr->isEyeTracking,
