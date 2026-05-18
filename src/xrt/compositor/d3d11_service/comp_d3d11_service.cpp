@@ -10610,7 +10610,33 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			const int64_t kPostFlipCooldownNs = 2000LL * 1000000LL;
 			int64_t last_landed = sys->last_flip_landed_ns.load(std::memory_order_acquire);
 			bool in_cooldown = last_landed > 0 && (now_ns - last_landed) < kPostFlipCooldownNs;
-			if (vendor_is_3d != sys->hardware_display_3d && !pending_flip && !in_cooldown) {
+			// Under workspace mode the controller is the sole mode authority.
+			// If the vendor SDK silently flips itself (SR auto-fallback,
+			// SR Dashboard external toggle), re-assert the runtime's desired
+			// state on the DP rather than counter-correcting the runtime.
+			// Observed at shell-with-apps launch: vendor reports 3D briefly,
+			// then drops to 2D ~2s later (right as the post-flip cooldown
+			// expires) — display would look 2D even though apps render 3D.
+			// Re-asserting via DP request keeps the hardware locked to what
+			// the workspace controller asked for. #234.
+			if (sys->workspace_mode && vendor_is_3d != sys->hardware_display_3d &&
+			    !pending_flip && !in_cooldown) {
+				if (sys->multi_comp != nullptr && sys->multi_comp->display_processor != nullptr) {
+					U_LOG_W("[force_3d] vendor drifted (vendor=%s runtime=%s) — re-asserting DP to runtime state",
+					        vendor_is_3d ? "3D" : "2D",
+					        sys->hardware_display_3d ? "3D" : "2D");
+					xrt_display_processor_d3d11_request_display_mode(
+					    sys->multi_comp->display_processor,
+					    sys->hardware_display_3d);
+					// Refresh cooldown so we don't hammer the DP on every poll
+					// while the vendor settles back.
+					sys->cached_3d_state.store(sys->hardware_display_3d, std::memory_order_relaxed);
+					sys->last_3d_state_poll_ns.store(now_ns, std::memory_order_release);
+					sys->last_flip_landed_ns.store(now_ns, std::memory_order_release);
+				}
+				got_state = false; // skip the legacy counter-correction below
+			}
+			if (vendor_is_3d != sys->hardware_display_3d && !pending_flip && !in_cooldown && got_state) {
 				U_LOG_W("Vendor SDK hardware 3D state changed: %s → %s",
 				        sys->hardware_display_3d ? "3D" : "2D",
 				        vendor_is_3d ? "3D" : "2D");
@@ -14748,6 +14774,85 @@ comp_d3d11_service_workspace_request_mode_flip(struct xrt_system_compositor *xsy
 	// origin_slot = -1 (system origin) — the workspace controller is logically
 	// the system, not a renderable slot.
 	multi_compositor_request_mode_flip(sys, mode_index, /*origin=*/-1);
+	return true;
+}
+
+extern "C" bool
+comp_d3d11_service_force_display_3d(struct xrt_system_compositor *xsysc)
+{
+	if (xsysc == nullptr) {
+		return false;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (sys == nullptr || sys->multi_comp == nullptr) {
+		return false;
+	}
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	struct xrt_device *head = (sys->xsysd != nullptr) ? sys->xsysd->static_roles.head : nullptr;
+	if (head == nullptr || head->hmd == NULL) {
+		return false;
+	}
+	uint32_t target_idx = 1;
+	if (target_idx >= head->rendering_mode_count) {
+		return false;
+	}
+	uint32_t source_idx = head->hmd->active_rendering_mode_index;
+	bool was_3d = sys->hardware_display_3d;
+
+	// Route through the acked-flip state machine so the DP write happens
+	// with curtain ON and the FLIPPING handler waits for hardware settle.
+	// Calling xrt_display_processor_d3d11_request_display_mode() directly
+	// on a freshly-created DP isn't reliable (Phase 6.1 #140 — the SR
+	// SDK's recalibration cycle can swallow the request), so we mimic the
+	// state machine's WAITING_ACK→FLIPPING transition and let apply_pending
+	// drop the curtain once `get_hardware_3d_state` confirms.
+	if (source_idx != target_idx) {
+		// Normal case: source mode != target. Engage WAITING_ACK; the
+		// state machine broadcasts the event, waits for app ack /
+		// timeout, then transitions to FLIPPING.
+		multi_compositor_request_mode_flip(sys, target_idx, /*origin=*/-1);
+		U_LOG_W("[force_3d] engaged via state machine (was idx=%u 3d=%d → target=1)",
+		        source_idx, (int)was_3d);
+		return true;
+	}
+
+	// source_idx == target_idx case: the no-op guard in
+	// multi_compositor_request_mode_flip would skip the DP write. But the
+	// runtime's view can disagree with actual hardware (e.g. service just
+	// started, sys->hardware_display_3d=false because of struct zero-init;
+	// or SR Dashboard external toggle). We need the DP write to land
+	// regardless. Skip WAITING_ACK (no apps need to re-render) and set up
+	// FLIPPING directly, replicating the WAITING_ACK→FLIPPING transition
+	// (DP request, sync_tile_layout, hardware_display_3d update); the
+	// apply_pending FLIPPING handler then waits for the hardware to
+	// actually settle before dropping the curtain.
+	if (mc->display_processor == nullptr) {
+		U_LOG_W("[force_3d] no DP yet — caller should retry after DP attach");
+		return false;
+	}
+
+	mc->mode_flip.phase = MFP_FLIPPING;
+	mc->mode_flip.target_mode_index = target_idx;
+	mc->mode_flip.source_mode_index = source_idx;
+	mc->mode_flip.target_is_3d = true;
+	mc->mode_flip.origin_slot = -1;
+	mc->mode_flip.ack_frame_counter = 0;
+	mc->mode_flip.flip_frame_counter = 0;
+	mc->mode_flip.curtain_active = true;
+	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+		mc->clients[s].acked_target_mode = true;
+		mc->clients[s].pre_flip_view_w = mc->clients[s].last_commit_view_w;
+		mc->clients[s].pre_flip_view_h = mc->clients[s].last_commit_view_h;
+	}
+
+	xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)target_idx);
+	xrt_display_processor_d3d11_request_display_mode(mc->display_processor, /*hardware_display_3d=*/true);
+	sync_tile_layout(sys);
+	sys->hardware_display_3d = true;
+
+	U_LOG_W("[force_3d] same-target fast path (idx=%u, was 3d=%d) — FLIPPING engaged, curtain ON",
+	        target_idx, (int)was_3d);
 	return true;
 }
 
