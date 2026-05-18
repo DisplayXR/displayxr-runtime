@@ -2014,6 +2014,17 @@ struct oxr_session
 	//! view poses like a handle app (display-local, no world_head_pos offset).
 	bool is_bridge_relay;
 
+	//! True if this session has successfully called xrActivateSpatialWorkspaceEXT
+	//! and is currently the active workspace controller (#234).
+	//! Workspace controllers are graphics-bound IPC sessions (typically the
+	//! shell process rendering its own chrome), so `compositor != NULL`.
+	//! The original `xrRequestDisplayRenderingModeEXT` gate exempts headless
+	//! sessions via `compositor == NULL` — that misses graphics-bound
+	//! controllers like the shell. This flag distinguishes them so they keep
+	//! their legitimate mode authority. Set in oxr_xrActivateSpatialWorkspaceEXT;
+	//! cleared in oxr_xrDeactivateSpatialWorkspaceEXT.
+	bool is_active_workspace_controller;
+
 	//! True if display hardware is currently in 3D mode.
 	bool hardware_display_3d;
 

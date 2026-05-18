@@ -2285,6 +2285,21 @@ ipc_handle_workspace_activate(volatile struct ipc_client_state *_ics)
 		// Eagerly create the workspace window so Ctrl+O works even with no apps.
 		comp_d3d11_service_ensure_workspace_window(s->xsysc);
 #endif
+
+#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+		// Reset to mode 1 (first hardwareDisplay3D mode) on every workspace
+		// activate (#234). The active rendering mode index persists on the
+		// head device across shell launches (service doesn't restart), so
+		// if a previous session left the runtime in 2D (mode 0) and the
+		// shell relaunches, the new shell's own chrome AND any client that
+		// connects defaults to mode 1's stereo layout — but the runtime is
+		// still in mode 0's mono layout. Result: tile-stride mismatch
+		// rendered as "wild disparity" from the very first frame. Forcing
+		// mode 1 here gives the user a deterministic clean-3D start;
+		// they can V-toggle to 2D from there if they want. Routes through
+		// the acked-flip path so the transition (if any) is curtain-masked.
+		(void)comp_d3d11_service_workspace_request_mode_flip(s->xsysc, 1);
+#endif
 	}
 
 	return XRT_SUCCESS;
@@ -2311,6 +2326,41 @@ ipc_handle_workspace_deactivate(volatile struct ipc_client_state *_ics)
 		comp_d3d11_service_deactivate_workspace(s->xsysc);
 #endif
 	}
+
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_workspace_request_display_mode(volatile struct ipc_client_state *_ics, uint32_t mode_index)
+{
+	struct ipc_server *s = _ics->server;
+
+	// PID-match auth: only the registered workspace controller can drive a
+	// mode flip via this RPC. The shell typically owns this; bridge-relay
+	// uses a different (legacy) path.
+	unsigned long expected_pid = s->workspace_controller_pid;
+	unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
+	if (expected_pid == 0 || caller_pid != expected_pid) {
+		IPC_WARN(s,
+		         "workspace_request_display_mode: PID mismatch (caller=%lu, controller=%lu) — denied",
+		         caller_pid, expected_pid);
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (!comp_d3d11_service_workspace_request_mode_flip(s->xsysc, mode_index)) {
+		// No multi_comp (workspace not active / non-d3d11 backend) —
+		// caller falls back to legacy device-property path on the client.
+		return XRT_ERROR_NOT_IMPLEMENTED;
+	}
+#else
+	(void)mode_index;
+	return XRT_ERROR_NOT_IMPLEMENTED;
+#endif
 
 	return XRT_SUCCESS;
 }

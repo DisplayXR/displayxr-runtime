@@ -13,6 +13,8 @@
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_config_os.h"
 
+#include <stdbool.h>
+
 
 #include "os/os_time.h"
 
@@ -1871,7 +1873,27 @@ ipc_syscomp_create_native_compositor(struct xrt_system_compositor *xsc,
 	return XRT_ERROR_IPC_FAILURE;
 }
 
-void
+/*!
+ * Workspace controller mode-flip hook (#234). Marshals to the server-side
+ * comp_d3d11_service_workspace_request_mode_flip via the workspace_request_
+ * display_mode IPC RPC. Returns true on success so the OXR layer's
+ * xrRequestDisplayRenderingModeEXT skips its legacy immediate-flip path.
+ */
+static bool
+ipc_syscomp_request_workspace_mode_flip(struct xrt_system_compositor *xsc, uint32_t mode_index)
+{
+	if (xsc == NULL) {
+		return false;
+	}
+	struct ipc_client_compositor *icc = container_of(xsc, struct ipc_client_compositor, system);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return false;
+	}
+	xrt_result_t r = ipc_call_workspace_request_display_mode(icc->ipc_c, mode_index);
+	return r == XRT_SUCCESS;
+}
+
+static void
 ipc_syscomp_destroy(struct xrt_system_compositor *xsc)
 {
 	struct ipc_client_compositor *icc = container_of(xsc, struct ipc_client_compositor, system);
@@ -1946,6 +1968,11 @@ ipc_client_create_system_compositor(struct ipc_connection *ipc_c,
 
 	c->system.create_native_compositor = ipc_syscomp_create_native_compositor;
 	c->system.destroy = ipc_syscomp_destroy;
+	// #234: workspace controllers' xrRequestDisplayRenderingModeEXT hook.
+	// IPC clients (including the shell, which IS a workspace controller)
+	// marshal the request to the server-side comp_d3d11_service hook so
+	// it routes through the acked-flip + curtain path.
+	c->system.request_workspace_mode_flip = ipc_syscomp_request_workspace_mode_flip;
 	c->ipc_c = ipc_c;
 	c->xina = xina;
 

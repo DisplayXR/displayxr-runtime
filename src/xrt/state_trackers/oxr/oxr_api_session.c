@@ -1369,6 +1369,10 @@ oxr_xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex)
 	// (synced from server via IPC shared memory).
 	// Exception: headless sessions (bridge relay) ARE allowed to change modes —
 	// the bridge acts as the mode controller on behalf of the WebXR page.
+	// Exception: graphics-bound workspace controllers (the shell, after
+	// xrActivateSpatialWorkspaceEXT) also retain mode authority. They have
+	// `compositor != NULL` because they render chrome, so the original
+	// headless-only exemption misses them (#234).
 	//
 	// This is THE enforcement point for the "workspace owns display mode" rule
 	// (#233). DO NOT enforce by filtering xrEnumerateDisplayRenderingModesEXT
@@ -1378,19 +1382,20 @@ oxr_xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex)
 	// at xrEndFrame across cube/gauss/others. Apps need the full enumerator
 	// to interpret indices that arrive via XrEventDataRenderingModeChangedEXT.
 	if (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode &&
-	    sess->compositor != NULL) {
+	    sess->compositor != NULL &&
+	    !sess->is_active_workspace_controller) {
 		return XR_SUCCESS;
 	}
 
-	// Workspace controller path (#234): workspace controller sessions are
-	// headless (compositor == NULL) but legitimately own mode authority.
-	// Route through the compositor's acked-flip hook so the broadcast /
-	// per-slot ack / DP flip are properly sequenced with curtain masking,
-	// instead of doing the immediate device-mode-update below (which exposes
-	// the raw-atlas glitch every controller-driven mode change). Bridge-
-	// relay sessions also hit this branch and benefit equally.
+	// Workspace controller path (#234): controllers legitimately own mode
+	// authority. Route through the compositor's acked-flip hook so the
+	// broadcast / per-slot ack / DP flip are properly sequenced with curtain
+	// masking, instead of doing the immediate device-mode-update below
+	// (which exposes the raw-atlas glitch every controller-driven mode
+	// change). Both headless controllers (bridge relay, compositor==NULL)
+	// and graphics-bound controllers (shell with active workspace) hit this.
 	if (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode &&
-	    sess->compositor == NULL &&
+	    (sess->compositor == NULL || sess->is_active_workspace_controller) &&
 	    sess->sys->xsysc->request_workspace_mode_flip != NULL) {
 		if (sess->sys->xsysc->request_workspace_mode_flip(sess->sys->xsysc, modeIndex)) {
 			return XR_SUCCESS;

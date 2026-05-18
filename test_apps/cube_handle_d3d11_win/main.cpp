@@ -305,6 +305,20 @@ static void RenderOneFrame(RenderState& rs) {
         }
     }
 
+    // Mirror runtime-driven mode changes (workspace controller's V hotkey,
+    // focus-adaptive auto-switch, etc.) into the cube's local input state so
+    // the rendering logic and HUD pick up the change. PollEvents() updates
+    // xr.currentModeIndex from XrEventDataRenderingModeChangedEXT, but the
+    // cube's render paths read g_inputState.currentRenderingMode (set only
+    // by local 'V' / 0–8 keys). Without this mirror, an externally-driven
+    // mode change leaves the cube rendering at its old mode while the
+    // runtime is at the new one — visible as the workspace tile-stride
+    // mismatch (#234).
+    if (xr.currentModeIndex != g_inputState.currentRenderingMode &&
+        xr.currentModeIndex < xr.renderingModeCount) {
+        g_inputState.currentRenderingMode = xr.currentModeIndex;
+    }
+
     // Handle eye tracking mode toggle (T key)
     if (g_inputState.eyeTrackingModeToggleRequested) {
         g_inputState.eyeTrackingModeToggleRequested = false;

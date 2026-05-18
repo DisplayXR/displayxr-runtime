@@ -69,6 +69,12 @@
 
 	"workspace_deactivate": {},
 
+	"workspace_request_display_mode": {
+		"in": [
+			{"name": "mode_index", "type": "uint32_t"}
+		]
+	},
+
 	"workspace_get_state": {
 		"out": [
 			{"name": "active", "type": "bool"}

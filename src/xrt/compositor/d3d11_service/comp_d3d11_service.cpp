@@ -779,8 +779,11 @@ enum mode_flip_phase
 
 //! Frames to hold the curtain ON after DP request_display_mode lands before
 //! lifting it unconditionally — covers the vendor's hardware transition
-//! window when get_hardware_3d_state lies or hasn't converged. ~270 ms.
-#define MFP_HW_CEILING_FRAMES 16
+//! window when get_hardware_3d_state lies or hasn't converged, AND gives
+//! poorly-behaved apps (test apps that don't process
+//! XrEventDataRenderingModeChangedEXT) time to re-render at the new layout
+//! before the curtain drops. ~1 second at 60 Hz.
+#define MFP_HW_CEILING_FRAMES 60
 
 /*!
  * Per-client slot in the multi-compositor.
@@ -1494,6 +1497,7 @@ multi_compositor_request_mode_flip(struct d3d11_service_system *sys,
 
 	// No-op: already at target and nothing pending.
 	if (mc->mode_flip.phase == MFP_IDLE && target_mode_idx == source_mode_idx) {
+		U_LOG_W("[mode_flip] no-op: already at target %u (IDLE)", target_mode_idx);
 		return;
 	}
 
@@ -1593,7 +1597,14 @@ multi_compositor_apply_pending_mode_flip(struct d3d11_service_system *sys)
 		}
 
 		// Land the flip: device state, DP, tile layout all in lockstep.
+		// Mirror the legacy xrRequestDisplayRenderingModeEXT path's
+		// xrt_device_set_property() call so apps that poll the device
+		// OUTPUT_MODE property (instead of consuming the event) also see
+		// the change. Apps that DO consume the event still get it via the
+		// broadcast in request_mode_flip.
 		head->hmd->active_rendering_mode_index = mc->mode_flip.target_mode_index;
+		xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE,
+		                        (int32_t)mc->mode_flip.target_mode_index);
 		xrt_display_processor_d3d11_request_display_mode(
 		    mc->display_processor, mc->mode_flip.target_is_3d);
 		sync_tile_layout(sys);
@@ -14688,12 +14699,17 @@ extern "C" bool
 comp_d3d11_service_workspace_request_mode_flip(struct xrt_system_compositor *xsysc, uint32_t mode_index)
 {
 	if (xsysc == nullptr) {
+		U_LOG_W("[mode_flip] hook: xsysc=NULL — returning false (caller falls back to legacy)");
 		return false;
 	}
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 	if (sys == nullptr || sys->multi_comp == nullptr) {
+		U_LOG_W("[mode_flip] hook: target=%u — sys=%p multi_comp=%p — returning false",
+		        mode_index, (void *)sys, (void *)(sys ? sys->multi_comp : nullptr));
 		return false;
 	}
+	U_LOG_W("[mode_flip] hook: entering request_mode_flip(target=%u) from controller session",
+	        mode_index);
 	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
 	// origin_slot = -1 (system origin) — the workspace controller is logically
 	// the system, not a renderable slot.

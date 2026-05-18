@@ -230,6 +230,14 @@ oxr_xrActivateSpatialWorkspaceEXT(XrSession session)
 	}
 
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_activate(&sess->xcn->base);
+	if (xret == XRT_SUCCESS) {
+		// Mark this session as the active workspace controller (#234) so
+		// xrRequestDisplayRenderingModeEXT exempts it from the workspace-
+		// client gate. Graphics-bound controllers (like the shell rendering
+		// its own chrome) have `compositor != NULL` and would otherwise be
+		// gated alongside actual workspace apps.
+		sess->is_active_workspace_controller = true;
+	}
 	return xret_to_xr_result(&log, xret, "workspace_activate");
 }
 
@@ -250,6 +258,9 @@ oxr_xrDeactivateSpatialWorkspaceEXT(XrSession session)
 	}
 
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_deactivate(&sess->xcn->base);
+	if (xret == XRT_SUCCESS) {
+		sess->is_active_workspace_controller = false;
+	}
 	return xret_to_xr_result(&log, xret, "workspace_deactivate");
 }
 
