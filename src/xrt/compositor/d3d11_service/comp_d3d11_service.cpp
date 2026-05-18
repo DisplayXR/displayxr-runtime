@@ -10922,7 +10922,25 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			}
 
 			if (view_scs[eye]->service_created && view_scs[eye]->images[view_img_indices[eye]].keyed_mutex) {
-				if (c->workspace_sync_fence) {
+				// Phase 2 fence path is opt-in per client. The service
+				// always creates a workspace_sync_fence at session-create,
+				// but only clients that import + signal it
+				// (comp_d3d11_client, comp_vk_client) participate. The
+				// remaining clients (comp_d3d12_client, comp_gl_*_client)
+				// never call get_workspace_sync_fence and never signal,
+				// so `last_signaled_fence_value` stays 0 for the session.
+				// Treat that 0 as the "no fence in use" sentinel the
+				// original Phase 2 commit message described and fall
+				// through to the legacy KeyedMutex path — without this
+				// gate, every d3d12/gl projection-view blit is marked
+				// stale and skipped, leaving the per-client atlas empty
+				// (chrome panel shows through; HUD WS-layers still work
+				// because they bypass this loop).
+				uint64_t fence_signaled = c->workspace_sync_fence
+				    ? c->last_signaled_fence_value.load(std::memory_order_acquire)
+				    : 0;
+				bool use_fence_path = c->workspace_sync_fence && fence_signaled != 0;
+				if (use_fence_path) {
 					// Phase 2 — GPU-side fence path. No CPU
 					// wait, no IDXGIKeyedMutex acquire. The
 					// client signals `last_signaled_fence_value`
@@ -10936,10 +10954,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					// timeout handler uses, but driven by the
 					// fence rather than a 4 ms wall-clock
 					// timeout).
-					uint64_t signaled = c->last_signaled_fence_value.load(
-					    std::memory_order_acquire);
-					if (signaled == 0 ||
-					    signaled == c->last_composed_fence_value[eye]) {
+					uint64_t signaled = fence_signaled;
+					if (signaled == c->last_composed_fence_value[eye]) {
 						// Client hasn't produced a new frame
 						// since we last composed this view —
 						// reuse persistent atlas slot content.
