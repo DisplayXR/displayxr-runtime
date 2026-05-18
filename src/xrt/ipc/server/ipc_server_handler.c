@@ -2269,6 +2269,16 @@ ipc_handle_workspace_activate(volatile struct ipc_client_state *_ics)
 #ifdef XRT_OS_WINDOWS
 			comp_d3d11_service_ensure_workspace_window(s->xsysc);
 #endif
+#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+			// Force-reset to 3D on EVERY activate, including this
+			// already-in-workspace-mode path. The service is normally
+			// started with --shell which sets s->workspace_mode=true
+			// from boot, so every shell's activate call lands here
+			// (not the "not yet in workspace mode" branch below). If
+			// we don't force_3d here too, the shell inherits whatever
+			// state the previous session / DP defaults left behind.
+			(void)comp_d3d11_service_force_display_3d(s->xsysc);
+#endif
 		}
 		return XRT_SUCCESS;
 	}
@@ -2287,18 +2297,16 @@ ipc_handle_workspace_activate(volatile struct ipc_client_state *_ics)
 #endif
 
 #if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-		// Reset to mode 1 (first hardwareDisplay3D mode) on every workspace
-		// activate (#234). The active rendering mode index persists on the
-		// head device across shell launches (service doesn't restart), so
-		// if a previous session left the runtime in 2D (mode 0) and the
-		// shell relaunches, the new shell's own chrome AND any client that
-		// connects defaults to mode 1's stereo layout — but the runtime is
-		// still in mode 0's mono layout. Result: tile-stride mismatch
-		// rendered as "wild disparity" from the very first frame. Forcing
-		// mode 1 here gives the user a deterministic clean-3D start;
-		// they can V-toggle to 2D from there if they want. Routes through
-		// the acked-flip path so the transition (if any) is curtain-masked.
-		(void)comp_d3d11_service_workspace_request_mode_flip(s->xsysc, 1);
+		// Force-reset to 3D (mode 1) on every workspace activate (#234).
+		// Use the direct DP-force helper instead of routing through the
+		// acked-flip state machine: the state machine's no-op guard skips
+		// when active_rendering_mode_index already says mode 1, but the
+		// runtime's view can disagree with the actual hardware (zero-init
+		// at service start leaves sys->hardware_display_3d=false; external
+		// SR Dashboard toggles aren't tracked by the runtime). Force-3D
+		// unconditionally guarantees "shell always opens in 3D" regardless
+		// of what the previous session, or external state, left behind.
+		(void)comp_d3d11_service_force_display_3d(s->xsysc);
 #endif
 	}
 

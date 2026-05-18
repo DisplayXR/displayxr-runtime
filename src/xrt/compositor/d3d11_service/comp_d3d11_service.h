@@ -625,6 +625,21 @@ comp_d3d11_service_workspace_request_mode_flip(struct xrt_system_compositor *xsy
                                                uint32_t mode_index);
 
 /*!
+ * Force-reset the display to 3D on workspace activate (#234).
+ *
+ * Bypasses the acked-flip state machine's no-op guard so the DP gets
+ * `request_display_mode(true)` even if `active_rendering_mode_index` already
+ * says mode 1. The runtime's view of the index can disagree with the actual
+ * hardware state across service restarts (struct zero-init leaves
+ * sys->hardware_display_3d=false while device defaults to mode 1) or after
+ * external vendor-SDK toggles. This guarantees a clean 3D start.
+ *
+ * Returns true if the force-reset ran, false if no multi_comp or no DP.
+ */
+bool
+comp_d3d11_service_force_display_3d(struct xrt_system_compositor *xsysc);
+
+/*!
  * Phase 2.C spec_version 9: set per-capture-client style. @p slot_index is
  * the same convention as comp_d3d11_service_set_capture_client_window_pose
  * (client_id - 1000 from the IPC layer).
