@@ -737,9 +737,13 @@ struct InputState {
     bool resetViewRequested = false;
     ViewParams viewParams;
     bool hudVisible = true;
-    uint32_t currentRenderingMode = 1;
-    uint32_t renderingModeCount = 0;
-    bool renderingModeChangeRequested = false;
+    // Rendering mode REQUESTS — single source of truth lives on the runtime
+    // side (read back as app.currentModeIndex after the runtime's
+    // XrEventDataRenderingModeChangedEXT lands). Keys emit transient requests;
+    // the actual current mode is never mirrored here.
+    uint32_t renderingModeCount = 0;             // mirror of app.renderingModeCount for keypress bounds
+    bool cycleRenderingModeRequested = false;    // V key
+    int32_t absoluteRenderingModeRequested = -1; // 0-8 keys; -1 = none
     bool cameraMode = false;
     float nominalViewerZ = 0.5f;
     // 'I' key: snapshot the **app's projection-layer atlas only** (cols ×
@@ -958,10 +962,7 @@ static void PumpMacOSEvents()
                         g_input.hudVisible = !g_input.hudVisible;
                     }
                     else if (ch == 'v' && !isRepeat) {
-                        if (g_input.renderingModeCount > 0) {
-                            g_input.currentRenderingMode = (g_input.currentRenderingMode + 1) % g_input.renderingModeCount;
-                        }
-                        g_input.renderingModeChangeRequested = true;
+                        g_input.cycleRenderingModeRequested = true;
                     }
                     else if ((ch == 'i' || ch == 'I') && !isRepeat) {
                         g_input.captureAtlasRequested = true;
@@ -983,11 +984,7 @@ static void PumpMacOSEvents()
                         }
                     }
                     else if (ch >= '0' && ch <= '8' && !isRepeat) {
-                        uint32_t idx = ch - '0';
-                        if (idx < g_input.renderingModeCount) {
-                            g_input.currentRenderingMode = idx;
-                            g_input.renderingModeChangeRequested = true;
-                        }
+                        g_input.absoluteRenderingModeRequested = (int32_t)(ch - '0');
                     }
                 }
             } else if (type == NSEventTypeKeyUp) {
@@ -1101,7 +1098,10 @@ struct AppXrSession {
     PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingModeEXT;
     PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT;
 
-    // Enumerated rendering mode info
+    // Enumerated rendering mode info. currentModeIndex is initialized to mode 1
+    // as a fallback for runtimes that don't expose isActive; v13+ runtimes
+    // replace it via the enumerate step (initial-mode-sync, #234/#239).
+    uint32_t currentModeIndex = 1;
     uint32_t renderingModeCount;
     char renderingModeNames[8][XR_MAX_SYSTEM_NAME_SIZE];
     uint32_t renderingModeViewCounts[8] = {};
@@ -1110,6 +1110,7 @@ struct AppXrSession {
     float renderingModeScaleX[8] = {};
     float renderingModeScaleY[8] = {};
     bool renderingModeDisplay3D[8] = {};
+    bool renderingModeIsRequestable[8] = {};  // v13: false when workspace-locked
 
     // Eye tracking
     float eyePositions[8][3] = {};  // [view][x,y,z] — raw per-eye positions in display space
@@ -1319,6 +1320,11 @@ static bool CreateSession(AppXrSession &app, MetalRenderer &r)
                     app.renderingModeScaleX[i] = modes[i].viewScaleX;
                     app.renderingModeScaleY[i] = modes[i].viewScaleY;
                     app.renderingModeDisplay3D[i] = modes[i].hardwareDisplay3D ? true : false;
+                    app.renderingModeIsRequestable[i] = modes[i].isRequestable ? true : false;
+                    // v13 initial-mode-sync: trust runtime-reported active mode.
+                    if (modes[i].isActive) {
+                        app.currentModeIndex = modes[i].modeIndex;
+                    }
                     LOG_INFO("  [%u] %s (views=%u, tiles=%ux%u, scale=%.2fx%.2f, 3D=%s)",
                         modes[i].modeIndex, modes[i].modeName,
                         modes[i].viewCount, modes[i].tileColumns, modes[i].tileRows,
@@ -1449,6 +1455,13 @@ static void PollEvents(AppXrSession &app)
             }
             break;
         }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT: {
+            auto* modeEvent = (XrEventDataRenderingModeChangedEXT*)&event;
+            LOG_INFO("Rendering mode changed: %u -> %u",
+                modeEvent->previousModeIndex, modeEvent->currentModeIndex);
+            app.currentModeIndex = modeEvent->currentModeIndex;
+            break;
+        }
         default: break;
         }
         event = {XR_TYPE_EVENT_DATA_BUFFER};
@@ -1537,23 +1550,10 @@ int main(int argc, char **argv)
         LOG_WARN("Failed to create HUD swapchain - HUD disabled");
     }
 
-    // Initialize output mode from env var (0=2D, 1=Anaglyph, 2=SBS, 3=Blend)
-    {
-        const char *mode_str = getenv("SIM_DISPLAY_OUTPUT");
-        if (mode_str) {
-            if (strcmp(mode_str, "anaglyph") == 0)
-                g_input.currentRenderingMode = 1;
-            else if (strcmp(mode_str, "sbs") == 0)
-                g_input.currentRenderingMode = 2;
-            else if (strcmp(mode_str, "blend") == 0)
-                g_input.currentRenderingMode = 3;
-            else
-                g_input.currentRenderingMode = 1; // default to anaglyph
-        }
-    }
-
-    // Request initial rendering mode on first frame
-    g_input.renderingModeChangeRequested = true;
+    // Initial rendering mode is sourced from the runtime via v13 `isActive`
+    // (set during xrEnumerateDisplayRenderingModesEXT above). Fallback is
+    // mode 1 (default of app.currentModeIndex). No env-var override here —
+    // SIM_DISPLAY_OUTPUT is a runtime-side construct.
 
     g_input.viewParams.virtualDisplayHeight = 0.24f;
     g_input.nominalViewerZ = app.nominalViewerZ;
@@ -1571,16 +1571,25 @@ int main(int argc, char **argv)
         PumpMacOSEvents();
         PollEvents(app);
 
-        // Handle rendering mode change (V=cycle, 0-8=direct)
-        if (g_input.renderingModeChangeRequested) {
-            g_input.renderingModeChangeRequested = false;
-            if (app.pfnRequestDisplayRenderingModeEXT && app.session != XR_NULL_HANDLE) {
-                const char *modeName = (g_input.currentRenderingMode < app.renderingModeCount)
-                    ? app.renderingModeNames[g_input.currentRenderingMode] : "?";
-                XrResult res = app.pfnRequestDisplayRenderingModeEXT(app.session, g_input.currentRenderingMode);
-                LOG_INFO("Rendering mode -> %s (%s)",
-                    modeName,
-                    XR_SUCCEEDED(res) ? "OK" : "failed");
+        // Handle rendering mode requests (V=cycle next, 0-8=jump absolute).
+        // Single source of truth: the runtime owns the current mode. Keypresses
+        // are REQUESTS — we call xrRequestDisplayRenderingModeEXT and let the
+        // XrEventDataRenderingModeChangedEXT event update app.currentModeIndex.
+        // Render paths and HUD read app.currentModeIndex directly.
+        if (g_input.cycleRenderingModeRequested) {
+            g_input.cycleRenderingModeRequested = false;
+            if (app.pfnRequestDisplayRenderingModeEXT && app.session != XR_NULL_HANDLE &&
+                app.renderingModeCount > 0) {
+                uint32_t next = (app.currentModeIndex + 1) % app.renderingModeCount;
+                app.pfnRequestDisplayRenderingModeEXT(app.session, next);
+            }
+        }
+        if (g_input.absoluteRenderingModeRequested >= 0) {
+            uint32_t target = (uint32_t)g_input.absoluteRenderingModeRequested;
+            g_input.absoluteRenderingModeRequested = -1;
+            if (app.pfnRequestDisplayRenderingModeEXT && app.session != XR_NULL_HANDLE &&
+                target < app.renderingModeCount) {
+                app.pfnRequestDisplayRenderingModeEXT(app.session, target);
             }
         }
 
@@ -1633,16 +1642,16 @@ int main(int argc, char **argv)
         xrWaitSwapchainImage(app.swapchain.swapchain, &waitImgInfo);
 
         bool rendered = false;
-        bool display3D = (g_input.currentRenderingMode < app.renderingModeCount)
-            ? app.renderingModeDisplay3D[g_input.currentRenderingMode] : true;
+        bool display3D = (app.currentModeIndex < app.renderingModeCount)
+            ? app.renderingModeDisplay3D[app.currentModeIndex] : true;
 
         // Get N-view mode info from enumerated rendering modes
-        uint32_t modeViewCount = (g_input.currentRenderingMode < app.renderingModeCount)
-            ? app.renderingModeViewCounts[g_input.currentRenderingMode] : 2;
-        uint32_t tileColumns = (g_input.currentRenderingMode < app.renderingModeCount)
-            ? app.renderingModeTileColumns[g_input.currentRenderingMode] : 2;
-        uint32_t tileRows = (g_input.currentRenderingMode < app.renderingModeCount)
-            ? app.renderingModeTileRows[g_input.currentRenderingMode] : 1;
+        uint32_t modeViewCount = (app.currentModeIndex < app.renderingModeCount)
+            ? app.renderingModeViewCounts[app.currentModeIndex] : 2;
+        uint32_t tileColumns = (app.currentModeIndex < app.renderingModeCount)
+            ? app.renderingModeTileColumns[app.currentModeIndex] : 2;
+        uint32_t tileRows = (app.currentModeIndex < app.renderingModeCount)
+            ? app.renderingModeTileRows[app.currentModeIndex] : 1;
         int eyeCount = display3D ? (int)modeViewCount : 1;
 
         // Dynamic arrays for N-view rendering
@@ -1684,10 +1693,10 @@ int main(int argc, char **argv)
             XrVector3f nominalViewer = {app.nominalViewerX, app.nominalViewerY, app.nominalViewerZ};
 
             // Compute render dims from enumerated mode info
-            float scaleX = (g_input.currentRenderingMode < app.renderingModeCount)
-                ? app.renderingModeScaleX[g_input.currentRenderingMode] : 0.5f;
-            float scaleY = (g_input.currentRenderingMode < app.renderingModeCount)
-                ? app.renderingModeScaleY[g_input.currentRenderingMode] : 0.5f;
+            float scaleX = (app.currentModeIndex < app.renderingModeCount)
+                ? app.renderingModeScaleX[app.currentModeIndex] : 0.5f;
+            float scaleY = (app.currentModeIndex < app.renderingModeCount)
+                ? app.renderingModeScaleY[app.currentModeIndex] : 0.5f;
             app.recommendedViewScaleX = scaleX;
             app.recommendedViewScaleY = scaleY;
             uint32_t maxTileW = tileColumns > 0 ? app.swapchain.width / tileColumns : app.swapchain.width;
@@ -1938,14 +1947,17 @@ int main(int argc, char **argv)
                 app.systemName, sessionStateName);
             g_hudSessionText = utf8ToW(buf);
 
-            const char* outputModeName = (g_input.currentRenderingMode < app.renderingModeCount)
-                ? app.renderingModeNames[g_input.currentRenderingMode] : "?";
+            const char* outputModeName = (app.currentModeIndex < app.renderingModeCount)
+                ? app.renderingModeNames[app.currentModeIndex] : "?";
+            bool isReq = (app.currentModeIndex < app.renderingModeCount)
+                ? app.renderingModeIsRequestable[app.currentModeIndex] : true;
+            const char* lockSuffix = isReq ? "" : " [locked by workspace]";
             const char* kooimaMode = g_input.cameraMode
                 ? "Camera-Centric [C=Toggle]" : "Display-Centric [C=Toggle]";
             snprintf(buf, sizeof(buf),
-                "XR_EXT_cocoa_window_binding: %s (Metal)\nMode: %s (%s)\nKooima: %s",
+                "XR_EXT_cocoa_window_binding: %s (Metal)\nMode: %s (%s)%s\nKooima: %s",
                 app.hasCocoaWindowBinding ? "ACTIVE" : "NOT AVAILABLE",
-                outputModeName, display3D ? "3D" : "2D", kooimaMode);
+                outputModeName, display3D ? "3D" : "2D", lockSuffix, kooimaMode);
             g_hudModeText = utf8ToW(buf);
 
             double fps = (g_avgFrameTime > 0) ? 1.0 / g_avgFrameTime : 0;
