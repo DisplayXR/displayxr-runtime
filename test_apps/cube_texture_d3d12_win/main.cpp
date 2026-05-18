@@ -979,19 +979,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    // Add DisplayXR to DLL search path
-    {
-        HKEY hKey;
-        char installPath[MAX_PATH] = {0};
-        DWORD pathSize = sizeof(installPath);
-        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "Software\\DisplayXR\\Runtime", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-            if (RegQueryValueExA(hKey, "InstallPath", nullptr, nullptr, (LPBYTE)installPath, &pathSize) == ERROR_SUCCESS) {
-                SetDllDirectoryA(installPath);
-            }
-            RegCloseKey(hKey);
-        }
-    }
-
     // Initialize OpenXR
     XrSessionManager xr = {};
     g_xr = &xr;

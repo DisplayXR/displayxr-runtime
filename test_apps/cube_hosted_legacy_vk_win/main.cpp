@@ -1405,20 +1405,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("OpenXR standard mode (DisplayXR creates window)");
     LOG_INFO("Input handled by DisplayXR's qwerty driver");
 
-    // Add DisplayXR to DLL search path
-    {
-        HKEY hKey;
-        char installPath[MAX_PATH] = {0};
-        DWORD pathSize = sizeof(installPath);
-        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "Software\\DisplayXR\\Runtime", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-            if (RegQueryValueExA(hKey, "InstallPath", nullptr, nullptr, (LPBYTE)installPath, &pathSize) == ERROR_SUCCESS) {
-                LOG_INFO("Adding DisplayXR install path to DLL search: %s", installPath);
-                SetDllDirectoryA(installPath);
-            }
-            RegCloseKey(hKey);
-        }
-    }
-
     // Initialize OpenXR
     XrSessionManager xr = {};
     if (!InitializeOpenXR(xr)) {
