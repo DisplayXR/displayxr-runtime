@@ -266,9 +266,22 @@ Eye tracking MANAGED vs MANUAL contract: `docs/specs/vendor/eye-tracking-modes.m
 - C11 for core code, C++17 where needed, Python 3.6+ for build scripts
 
 ### Running Without Installing
+
 ```bash
+# Linux / macOS
 XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./your_openxr_app
 ```
+
+```cmd
+:: Windows — run from a non-elevated terminal (see caveat below).
+_package\run_cube_handle_d3d11_win.bat   :: sets XR_RUNTIME_JSON to dev manifest
+```
+
+**Elevated terminal caveat (Windows):** the bundled Khronos `openxr_loader.dll` (both 1.1.38 and 1.1.43) silently refuses `XR_RUNTIME_JSON` when the calling process is elevated (admin / UAC) and falls back to `HKLM\Software\Khronos\OpenXR\1\ActiveRuntime` → Program Files. No env-var override exists. Use a non-elevated terminal for dev iteration, or push the rebuilt DLL to Program Files.
+
+**Verifying which DLL is loaded:** every `xrCreateInstance` logs one WARN line near the top of `%LOCALAPPDATA%\DisplayXR\DisplayXR_<exe>.<pid>_<ts>.log` with the absolute path of the actually-loaded `DisplayXRClient.dll` plus the value of `XR_RUNTIME_JSON`. Search for `loaded from:` — the path is authoritative.
+
+Full reference: [`docs/getting-started/building.md` § Local Dev Iteration](docs/getting-started/building.md#local-dev-iteration).
 
 ### Key CMake Options
 - `XRT_HAVE_LEIA_SR` — LeiaSR SDK support

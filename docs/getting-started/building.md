@@ -93,13 +93,78 @@ The SDK provides display-specific weavers (D3D11, D3D12, Vulkan) and eye trackin
 - `LEIASR_SDKROOT` — Environment variable pointing to Leia SR SDK path
 - `SR_PATH` — Internal, auto-set from `LEIASR_SDKROOT`
 
-## Running Without Installing
+## Local Dev Iteration
 
-Point `XR_RUNTIME_JSON` at the build output:
+The recommended workflow for iterating on the runtime — without ever installing it system-wide and without copying anything into `C:\Program Files\DisplayXR\Runtime\`.
 
-```bash
-XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./your_openxr_app
+### How the OpenXR loader picks a runtime
+
+When an OpenXR app calls `xrCreateInstance`, the bundled Khronos `openxr_loader.dll` selects which runtime DLL to load using this precedence (Windows):
+
+1. **`XR_RUNTIME_JSON` environment variable** — if set to the path of a valid manifest file, that manifest's `library_path` is the runtime DLL the loader maps. This is the primary dev-iteration knob.
+2. **Registry fallback** — `HKLM\Software\Khronos\OpenXR\1\ActiveRuntime`. The DisplayXR installer writes this to point at `C:\Program Files\DisplayXR\Runtime\DisplayXR_win64.json`, which in turn points at the installed `DisplayXRClient.dll`. End-user installations land here; `XR_RUNTIME_JSON` is not needed for them.
+
+`scripts\build_windows.bat` auto-generates a dev manifest at `build\Release\openxr_displayxr-dev.json` with an absolute `library_path` to the worktree's freshly-built `DisplayXRClient.dll`. Every `_package\run_*_win.bat` script sets `XR_RUNTIME_JSON` to that dev manifest before launching the test app.
+
+### Recommended workflow
+
+Run dev test apps from a **non-elevated** terminal. From an admin terminal the Khronos loader silently refuses `XR_RUNTIME_JSON` (see [Elevated terminal caveat](#elevated-terminal-caveat) below).
+
+```cmd
+:: From a non-elevated terminal (cmd or PowerShell):
+scripts\build_windows.bat build              :: rebuild runtime only (fast)
+_package\run_cube_handle_d3d11_win.bat       :: launch cube against worktree's runtime
 ```
+
+`scripts\build_windows.bat` doesn't itself need elevation. The only operations that do — writing to Program Files, modifying `HKLM\Software\...`, running the NSIS installer — are exactly the ones the dev-iteration workflow is built to avoid.
+
+### Verifying which DLL was actually loaded
+
+Every `xrCreateInstance` writes one WARN line near the top of the per-process runtime log at `%LOCALAPPDATA%\DisplayXR\DisplayXR_<exe>.<pid>_<timestamp>.log`:
+
+```
+[oxr_instance_create] DisplayXR runtime v1.3.3 'v1.3.3' loaded from:
+  <absolute path to loaded DLL>
+  (XR_RUNTIME_JSON=<env var value, or "<unset>">)
+```
+
+The path is authoritative — it's `GetModuleFileNameW` on the live DLL handle, so it reflects what was actually mapped into the process regardless of what the loader claims. If you see your worktree's `build\…\DisplayXRClient.dll`, you're iterating against the dev build. If you see `C:\Program Files\DisplayXR\Runtime\DisplayXRClient.dll` while `XR_RUNTIME_JSON` was set, the env var was refused — either you're running elevated, or the manifest path is invalid.
+
+### Parallel worktrees
+
+Each worktree's `XR_RUNTIME_JSON` and `_package\run_*_win.bat` resolve to that worktree's own dev manifest and runtime DLL, so multiple worktrees iterate independently — no Program Files conflict, no DLL-stomping between simultaneously-running agents.
+
+### Elevated terminal caveat
+
+The Khronos `openxr_loader.dll` (confirmed in **both 1.1.38 and 1.1.43**) silently refuses `XR_RUNTIME_JSON` when the calling process token has high integrity (admin / UAC-elevated). The loader prints to stderr:
+
+```
+Error [GENERAL | platform_utils | OpenXR-Loader] : !!! WARNING !!!
+Environment variable XR_RUNTIME_JSON is being ignored due to running
+from an elevated context. The value '...' will NOT be used.
+```
+
+and falls through to the registry → Program Files runtime. There is no env-var or registry-side override; this is a Khronos loader security mitigation.
+
+If you must run dev test apps from an elevated context, the legacy workaround is:
+
+```cmd
+copy /Y build\src\xrt\targets\openxr\Release\DisplayXRClient.dll ^
+       "C:\Program Files\DisplayXR\Runtime\DisplayXRClient.dll"
+```
+
+…after each build. The signature log will then show the Program Files path. This breaks parallel-worktree iteration (one shared Program Files DLL), which is the original motivation for keeping the terminal non-elevated.
+
+### Installing the runtime for end-user testing
+
+For exercising the *installed* code paths (installer, registry, `ActiveRuntime`-driven discovery), build and run the installer instead:
+
+```cmd
+scripts\build_windows.bat installer
+_package\DisplayXRSetup-*.exe                :: UAC prompt, one-click install
+```
+
+This writes `HKLM\Software\Khronos\OpenXR\1\ActiveRuntime` and `HKLM\Software\DisplayXR\*`, adds Program Files to system PATH, and registers the runtime as discoverable. After install, OpenXR apps with no `XR_RUNTIME_JSON` set will resolve through the registry to the installed runtime.
 
 ## Running Tests
 
