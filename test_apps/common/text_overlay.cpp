@@ -347,7 +347,7 @@ std::wstring FormatParallaxInfo(bool parallaxEnabled, float eyePosX, float eyePo
     return oss.str();
 }
 
-std::wstring FormatMode(int outputMode, bool simDisplayAvailable, const char* modeName, uint32_t modeCount, bool display3D) {
+std::wstring FormatMode(int outputMode, bool simDisplayAvailable, const char* modeName, uint32_t modeCount, bool display3D, bool isRequestable) {
     if (!simDisplayAvailable) {
         return L"Mode: Weaved";
     }
@@ -363,6 +363,11 @@ std::wstring FormatMode(int outputMode, bool simDisplayAvailable, const char* mo
     oss << L" (" << (display3D ? L"3D" : L"2D") << L")";
     if (modeCount > 1) {
         oss << L" [1-" << modeCount << L"]";
+    }
+    // XR_EXT_display_info v13: surface workspace mode lock so the user knows
+    // local V / 0-8 keypresses are no-ops under a workspace controller.
+    if (!isRequestable) {
+        oss << L" [locked by workspace]";
     }
     return oss.str();
 }
