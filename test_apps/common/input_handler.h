@@ -74,10 +74,15 @@ struct InputState {
     // HUD visibility toggle (TAB key)
     bool hudVisible = true;
 
-    // Unified rendering mode (V key cycles, 0-8 keys select directly)
-    uint32_t currentRenderingMode = 1;   // Default: mode 1 (first 3D mode)
-    uint32_t renderingModeCount = 0;     // Set from xrEnumerateDisplayRenderingModesEXT
-    bool renderingModeChangeRequested = false;
+    // Rendering mode REQUESTS (single source of truth lives on the runtime
+    // side — read back as `xr.currentModeIndex` after the runtime's
+    // XrEventDataRenderingModeChangedEXT lands). The keyboard handler emits
+    // transient requests that the main loop translates into
+    // xrRequestDisplayRenderingModeEXT calls; the actual current mode is
+    // never mirrored here.
+    uint32_t renderingModeCount = 0;            // Set from xrEnumerateDisplayRenderingModesEXT
+    bool cycleRenderingModeRequested = false;   // V key: cycle to next mode
+    int32_t absoluteRenderingModeRequested = -1; // 0-8 keys: jump to this mode (-1 = none)
 
     // Camera vs display mode toggle (C key)
     bool cameraMode = false;
