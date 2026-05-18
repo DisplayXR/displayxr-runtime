@@ -501,6 +501,28 @@ client_loop(volatile struct ipc_client_state *ics)
 void
 ipc_server_client_destroy_session_and_compositor(volatile struct ipc_client_state *ics)
 {
+	// Destroy the compositor BEFORE dropping our xscs swapchain
+	// references (#238). The compositor's destroy path runs under its
+	// own render_mutex (close-button fix in commit 30e5648a1) and
+	// releases any strong refs the multi-compositor held on our
+	// swapchains via its ws_snapshot.sc_array. Until then, our xscs
+	// refs keep the swapchains alive. Doing it the other way around
+	// (drop xscs first, then destroy compositor) left a window where:
+	//   - our xscs drop took the strong ref count from 2 → 1,
+	//   - the snapshot's lingering strong ref kept the swapchain alive,
+	//   - the render thread could be mid-snapshot-deref on a slot
+	//     that's already partially torn down (Ctrl+Space deactivate
+	//     hits this because the workspace controller's compositor
+	//     destroy runs in a different order than per-client destroys).
+	// Reversing the order means the snapshot's strong refs are gone
+	// before we touch xscs — the only ref left at the xscs drop is
+	// ours, and the render thread cannot reach the freed swapchain
+	// because the slot was already unregistered under render_mutex
+	// during xrt_comp_destroy.
+
+	// Cast away volatile.
+	xrt_comp_destroy((struct xrt_compositor **)&ics->xc);
+
 	// Multiple threads might be looking at these fields.
 	os_mutex_lock(&ics->server->global_state.lock);
 
@@ -521,9 +543,6 @@ ipc_server_client_destroy_session_and_compositor(volatile struct ipc_client_stat
 	}
 
 	os_mutex_unlock(&ics->server->global_state.lock);
-
-	// Cast away volatile.
-	xrt_comp_destroy((struct xrt_compositor **)&ics->xc);
 
 	// Cast away volatile.
 	xrt_session_destroy((struct xrt_session **)&ics->xs);
