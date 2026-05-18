@@ -787,11 +787,12 @@ enum mode_flip_phase
 
 //! Frames to hold the curtain ON after DP request_display_mode lands before
 //! lifting it unconditionally — covers the vendor's hardware transition
-//! window when get_hardware_3d_state lies or hasn't converged, AND gives
-//! poorly-behaved apps (test apps that don't process
-//! XrEventDataRenderingModeChangedEXT) time to re-render at the new layout
-//! before the curtain drops. ~1 second at 60 Hz.
-#define MFP_HW_CEILING_FRAMES 60
+//! window when get_hardware_3d_state lies or hasn't converged. The 60-frame
+//! bump was a band-aid for Issue 3 (per-slot stride mismatch during the
+//! catch-up window). Now that the workspace per-tile blit uses each slot's
+//! OWN stride snapshot (write/read stay coupled per-slot), the curtain
+//! only needs to mask SR SDK hardware settle (~250 ms ≈ 16 frames).
+#define MFP_HW_CEILING_FRAMES 16
 
 /*!
  * Per-client slot in the multi-compositor.
@@ -832,6 +833,20 @@ struct d3d11_multi_client_slot
 	uint32_t last_commit_view_h;
 	uint32_t pre_flip_view_w;
 	uint32_t pre_flip_view_h;
+
+	//! Per-slot stride snapshot (#234, Issue 3). Captured at content-clamp
+	//! time in compositor_layer_commit using `atlas_w / sys->tile_columns`
+	//! AT THE TIME OF WRITE — same formula the clamp itself uses, so write
+	//! and read stay coupled through the slot's own snapshot even when the
+	//! global sys->tile_columns flips ahead of an unacked slot. Without
+	//! this, multi_compositor_render reads with the NEW global stride while
+	//! the slot's atlas still holds OLD-stride content; visible as L/R
+	//! mashing during the post-flip curtain drop. Set to 0 pre-first-commit
+	//! so the blit can fall back to the global formula.
+	uint32_t blit_slot_w;
+	uint32_t blit_slot_h;
+	uint32_t blit_tile_columns;
+	uint32_t blit_tile_rows;
 
 	//! Window-space layer snapshot for `multi_compositor_render`'s WS pass.
 	//! Updated under `ws_snapshot_mutex` at the end of compositor_layer_commit
@@ -8128,17 +8143,22 @@ after_key_shortcuts:
 			src_tex_h = client_atlas_desc.Height;
 			slot_flip_y = cc->atlas_flip_y;
 
-			// Tile-overflow guard. The per-tile source origin below is
-			// `src_col * slot_w_atlas` where `slot_w_atlas = atlas_w /
-			// tile_columns` — same stride compositor_layer_commit writes
-			// at. cvw > slot_w_atlas would make multi-comp read past the
-			// slot boundary into the neighbouring tile's content
-			// (`feedback_atlas_stride_invariant`: stride and clamp must
-			// use the SAME atlas-derived slot width).
-			slot_w_atlas = src_tex_w / sys->tile_columns;
-			slot_h_atlas = src_tex_h / sys->tile_rows;
-			assert(cvw <= slot_w_atlas);
-			assert(cvh <= slot_h_atlas);
+			// Per-slot stride (#234, Issue 3): use the slot's OWN
+			// snapshot of atlas/tile_columns captured at commit time,
+			// not the current global sys->tile_columns. The two diverge
+			// during the curtain window of a workspace mode flip — the
+			// slot's atlas was WRITTEN at the snapshotted stride, so
+			// reading at the global stride would mash L/R together.
+			// Fallback to the atlas-derived global formula for the very
+			// first commit (snapshot is zero until then).
+			slot_w_atlas = mc->clients[s].blit_slot_w;
+			slot_h_atlas = mc->clients[s].blit_slot_h;
+			if (slot_w_atlas == 0 || slot_h_atlas == 0) {
+				uint32_t tc_fb = sys->tile_columns > 0 ? sys->tile_columns : 1;
+				uint32_t tr_fb = sys->tile_rows > 0 ? sys->tile_rows : 1;
+				slot_w_atlas = src_tex_w / tc_fb;
+				slot_h_atlas = src_tex_h / tr_fb;
+			}
 			if (cvw > slot_w_atlas) cvw = slot_w_atlas;
 			if (cvh > slot_h_atlas) cvh = slot_h_atlas;
 
@@ -8335,22 +8355,27 @@ after_key_shortcuts:
 
 		// Shader blit each view → combined atlas.
 		uint32_t num_views = sys->tile_columns * sys->tile_rows;
+		// Per-slot tile layout (#234, Issue 3): captured at commit time so
+		// the source coord stays aligned with the slot's actual atlas
+		// contents even when sys->tile_columns is ahead of an unacked slot.
+		uint32_t slot_tc = mc->clients[s].blit_tile_columns;
+		uint32_t slot_tr = mc->clients[s].blit_tile_rows;
+		if (slot_tc == 0) slot_tc = sys->tile_columns > 0 ? sys->tile_columns : 1;
+		if (slot_tr == 0) slot_tr = sys->tile_rows > 0 ? sys->tile_rows : 1;
 		for (uint32_t v = 0; v < num_views && v < XRT_MAX_VIEWS; v++) {
 			uint32_t src_col = v % sys->tile_columns;
 			uint32_t src_row = v / sys->tile_columns;
 
-			// Per-tile source origin in the per-client atlas.
-			// Mono clients use (0,0) for all views; IPC clients place
-			// each tile at `slot_w_atlas × slot_h_atlas` stride — same
-			// stride compositor_layer_commit writes at, derived from
-			// atlas/tile_columns NOT sys->view_width
-			// (`feedback_atlas_stride_invariant`: in workspace mode the
-			// per-client atlas is created at native pixel dims while
-			// sys->view_width tracks the SCALED view dim; they diverge).
-			// Content within each tile may be smaller than the slot
-			// (top-left), and its extent is cvw × cvh; the shader's
-			// `src_rect.zw = cvw,cvh` (set below) drives sampling, the
-			// per-tile origin sets `src_rect.xy`.
+			// Map destination tile → slot's source tile. If the slot
+			// last wrote with FEWER tiles than the global expects (slot
+			// is behind a mode flip), replicate view 0 into the extra
+			// dest tiles — still valid content from the slot, just at a
+			// smaller layout. Reverse case (slot has more views than
+			// global) drops the extras naturally because num_views is
+			// the global count.
+			uint32_t slot_col = (src_col < slot_tc) ? src_col : 0;
+			uint32_t slot_row = (src_row < slot_tr) ? src_row : 0;
+
 			float src_px_x, src_px_y;
 			if (slot_is_mono || mc->mode_flip.curtain_active) {
 				// Curtain (#234): during a workspace mode flip, force every
@@ -8358,13 +8383,15 @@ after_key_shortcuts:
 				// with the eye_idx=0 collapse below, this writes identical
 				// content to both halves of combined_atlas so the SR weaver
 				// sees a uniform mono frame regardless of which slots have
-				// caught up to the new layout. Avoids the "raw atlas
-				// visible" double-image artifact during the catch-up window.
+				// caught up to the new layout.
 				src_px_x = 0.0f;
 				src_px_y = 0.0f;
 			} else {
-				src_px_x = static_cast<float>(src_col * slot_w_atlas);
-				src_px_y = static_cast<float>(src_row * slot_h_atlas);
+				// Use slot's OWN stride snapshot — same value the slot's
+				// commit-time clamp computed, guaranteeing write/read stay
+				// coupled regardless of the global tile_columns state.
+				src_px_x = static_cast<float>(slot_col * slot_w_atlas);
+				src_px_y = static_cast<float>(slot_row * slot_h_atlas);
 			}
 
 			// Per-eye destination rect (parallax-shifted for Z != 0).
@@ -11414,6 +11441,24 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					    &sys->multi_comp->clients[s];
 					slot->content_view_w = content_view_w;
 					slot->content_view_h = content_view_h;
+
+					// Snapshot per-slot stride for the workspace
+					// per-tile blit (#234, Issue 3). Same formula
+					// the clamp at L11385 uses — write/clamp/read
+					// must agree, and capturing here keeps the slot
+					// self-consistent even when sys->tile_columns
+					// flips ahead of this slot's next commit.
+					if (c->render.atlas_texture) {
+						D3D11_TEXTURE2D_DESC sc_desc = {};
+						c->render.atlas_texture->GetDesc(&sc_desc);
+						uint32_t tc = sys->tile_columns > 0 ? sys->tile_columns : 1;
+						uint32_t tr = sys->tile_rows > 0 ? sys->tile_rows : 1;
+						slot->blit_slot_w = sc_desc.Width / tc;
+						slot->blit_slot_h = sc_desc.Height / tr;
+						slot->blit_tile_columns = tc;
+						slot->blit_tile_rows = tr;
+					}
+
 					if (!slot->has_first_frame_committed) {
 						slot->has_first_frame_committed = true;
 						slot->first_frame_ns =
