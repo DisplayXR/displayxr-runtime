@@ -299,24 +299,25 @@ echo === Generating run scripts ===
 set "RT_JSON=%REPO%build\Release\openxr_displayxr-dev.json"
 set "PKG=%REPO%_package"
 
-:: Run scripts for standalone test apps (each sets XR_RUNTIME_JSON to dev build)
+:: Run scripts for standalone test apps (each sets XR_RUNTIME_JSON to dev build).
 :: Non-Vulkan apps also disable Vulkan implicit layers to prevent crashes from
 :: buggy third-party layers (e.g., FPS Monitor). See issue #105.
+:: All scripts prepend _package\bin to PATH so the runtime DLL's delay-loaded
+:: SR SDK deps (SimulatedRealityVulkanBeta.dll, etc.) resolve without requiring
+:: the installer to have run — important for third-party devs cloning the repo
+:: and iterating against the dev-build runtime via XR_RUNTIME_JSON.
 for %%A in (cube_handle_d3d11_win cube_hosted_d3d11_win cube_handle_d3d12_win cube_handle_gl_win cube_texture_d3d11_win cube_texture_d3d12_win workspace_minimal_d3d11_win) do (
     if exist "%REPO%test_apps\%%A\build\%%A.exe" (
         > "%PKG%\run_%%A.bat" (
             echo @echo off
             echo set "XR_RUNTIME_JSON=%RT_JSON%"
             echo set "VK_LOADER_LAYERS_DISABLE=*"
+            echo set "PATH=%PKG%\bin;%%PATH%%"
             echo "%REPO%test_apps\%%A\build\%%A.exe" %%*
         )
     )
 )
 :: Vulkan app — don't disable implicit layers (app needs them for its own VkInstance).
-:: Prepend _package/bin to PATH so SimulatedRealityVulkanBeta.dll
-:: (delay-loaded by the runtime DLL when the VK weaver path fires) is
-:: discoverable. The runtime installer adds its install dir to system
-:: PATH for installed users; this run-script mirrors that for dev.
 for %%A in (cube_handle_vk_win) do (
     if exist "%REPO%test_apps\%%A\build\%%A.exe" (
         > "%PKG%\run_%%A.bat" (
