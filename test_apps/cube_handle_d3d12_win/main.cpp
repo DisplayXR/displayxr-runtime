@@ -598,7 +598,8 @@ static void RenderThreadFunc(
                                 dispText += L"\n" + FormatMode(xr->currentModeIndex, xr->pfnRequestDisplayRenderingModeEXT != nullptr,
                                     (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) ? xr->renderingModeNames[xr->currentModeIndex] : nullptr,
                                     xr->renderingModeCount,
-                                    xr->renderingModeCount > 0 ? xr->renderingModeDisplay3D[xr->currentModeIndex] : true);
+                                    xr->renderingModeCount > 0 ? xr->renderingModeDisplay3D[xr->currentModeIndex] : true,
+                                    xr->renderingModeCount > 0 ? xr->renderingModeIsRequestable[xr->currentModeIndex] : true);
                                 std::wstring eyeText = FormatEyeTrackingInfo(
                                     xr->eyePositions, (uint32_t)eyeCount,
                                     xr->eyeTrackingActive, xr->isEyeTracking,
