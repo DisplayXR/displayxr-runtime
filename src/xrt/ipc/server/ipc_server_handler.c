@@ -935,6 +935,46 @@ ipc_handle_session_destroy(volatile struct ipc_client_state *ics)
 }
 
 xrt_result_t
+ipc_handle_session_request_file_picker(volatile struct ipc_client_state *ics,
+                                       const struct ipc_file_picker_info *info,
+                                       uint64_t *out_request_id)
+{
+	IPC_TRACE_MARKER();
+
+	if (out_request_id != NULL) {
+		*out_request_id = 0;
+	}
+
+	// XR_EXT_workspace_file_dialog Tier 1: app-side xrRequestFilePickerEXT.
+	// The runtime allocates a monotonic request_id, stores (request_id ->
+	// requesting slot, info) on the multi-compositor, and emits a
+	// FILE_PICKER_REQUEST event into the workspace input drain so the
+	// controller can spawn its picker exe. Any workspace client may call
+	// this — no PID auth (the OXR layer's recursion guard already rejects
+	// calls from the active workspace controller's own session).
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	struct ipc_server *s = ics->server;
+	if (s->xsysc == NULL || ics->xc == NULL || info == NULL || out_request_id == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	int slot = comp_d3d11_service_workspace_find_slot_by_xc(s->xsysc, (struct xrt_compositor *)ics->xc);
+	if (slot < 0) {
+		// Caller isn't a workspace participant (standalone in-process
+		// compositor) — there's no controller to forward to. Surface
+		// as IPC failure so the OXR layer can return the fallback
+		// result code to the app.
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return comp_d3d11_service_workspace_post_file_picker_request(s->xsysc, slot, info, out_request_id);
+#else
+	(void)ics;
+	(void)info;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
 ipc_handle_session_set_modal_state(volatile struct ipc_client_state *ics, bool is_open)
 {
 	IPC_TRACE_MARKER();
@@ -3215,6 +3255,71 @@ ipc_handle_workspace_set_chrome_layout(volatile struct ipc_client_state *_ics,
 	(void)s;
 	(void)client_id;
 	(void)layout;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
+ipc_handle_workspace_get_file_picker_request(volatile struct ipc_client_state *_ics,
+                                             uint64_t request_id,
+                                             uint32_t *out_found,
+                                             uint32_t *out_client_id,
+                                             struct ipc_file_picker_info *out_info)
+{
+	struct ipc_server *s = _ics->server;
+
+	if (out_found != NULL) *out_found = 0;
+	if (out_client_id != NULL) *out_client_id = 0;
+	if (out_info != NULL) memset(out_info, 0, sizeof(*out_info));
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	// Auth: only the workspace controller may read the full picker info.
+	unsigned long expected_pid = get_orchestrator_workspace_pid();
+	unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
+	if (expected_pid != 0 && caller_pid != expected_pid) {
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+
+	return comp_d3d11_service_workspace_get_file_picker_request(s->xsysc, request_id,
+	                                                            out_found, out_client_id, out_info);
+#else
+	(void)s;
+	(void)request_id;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
+ipc_handle_workspace_file_dialog_result(volatile struct ipc_client_state *_ics,
+                                        uint64_t request_id,
+                                        uint32_t result_code,
+                                        const struct ipc_file_picker_result_path *path)
+{
+	struct ipc_server *s = _ics->server;
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	// Auth: only the workspace controller may post a picker result. Without
+	// this, a malicious workspace client could complete another client's
+	// pending picker with an arbitrary path.
+	unsigned long expected_pid = get_orchestrator_workspace_pid();
+	unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
+	if (expected_pid != 0 && caller_pid != expected_pid) {
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+
+	return comp_d3d11_service_workspace_file_picker_result(s->xsysc, request_id, result_code, path);
+#else
+	(void)s;
+	(void)request_id;
+	(void)result_code;
+	(void)path;
 	return XRT_ERROR_IPC_FAILURE;
 #endif
 }

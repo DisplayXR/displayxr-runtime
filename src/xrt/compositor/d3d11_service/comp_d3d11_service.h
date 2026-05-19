@@ -31,6 +31,8 @@ struct u_system;
 struct ipc_launcher_app;
 struct ipc_capture_result;
 struct ipc_workspace_chrome_layout;
+struct ipc_file_picker_info;
+struct ipc_file_picker_result_path;
 
 
 /*!
@@ -609,6 +611,56 @@ comp_d3d11_service_set_focused_slot(struct xrt_system_compositor *xsysc, int slo
  */
 void
 comp_d3d11_service_set_client_modal_state(struct xrt_system_compositor *xsysc, int slot, bool is_open);
+
+/*!
+ * XR_EXT_workspace_file_dialog (Tier 1): app-side
+ * `xrRequestFilePickerEXT` arrived as `session_request_file_picker`.
+ * The compositor allocates a monotonic request_id, stores a record
+ * keyed by (request_id → slot, info), and emits an
+ * IPC_WORKSPACE_INPUT_EVENT_FILE_PICKER_REQUEST event for the controller
+ * to drain. Returns XRT_SUCCESS and writes the allocated id to
+ * @p out_request_id; the controller fetches the full info via
+ * comp_d3d11_service_workspace_get_file_picker_request.
+ *
+ * Returns XRT_ERROR_IPC_FAILURE if no slot is bound (the call should
+ * not have reached the runtime in that case) or if the pending-request
+ * table is full.
+ */
+xrt_result_t
+comp_d3d11_service_workspace_post_file_picker_request(struct xrt_system_compositor *xsysc,
+                                                       int slot,
+                                                       const struct ipc_file_picker_info *info,
+                                                       uint64_t *out_request_id);
+
+/*!
+ * Controller-side fetch: resolve a request_id back to (client_id,
+ * info). Returns XRT_SUCCESS regardless of hit/miss; @p *out_found is
+ * set to 1 on hit, 0 on miss. The IPC layer returns the same struct on
+ * miss with a zeroed info, so the controller doesn't have to special-
+ * case error paths.
+ */
+xrt_result_t
+comp_d3d11_service_workspace_get_file_picker_request(struct xrt_system_compositor *xsysc,
+                                                      uint64_t request_id,
+                                                      uint32_t *out_found,
+                                                      uint32_t *out_client_id,
+                                                      struct ipc_file_picker_info *out_info);
+
+/*!
+ * Controller-side: deliver a file-picker result. The runtime looks up
+ * the requesting slot, pushes XRT_SESSION_EVENT_FILE_PICKER_COMPLETE on
+ * its session-event sink, and drops the pending entry. Late results
+ * for a slot that no longer exists (requester crashed / session
+ * destroyed) are logged once and discarded.
+ *
+ * `result_code` is an `XrFilePickerResultEXT` value; `path` is
+ * NUL-terminated UTF-8 (empty for non-SUCCESS outcomes).
+ */
+xrt_result_t
+comp_d3d11_service_workspace_file_picker_result(struct xrt_system_compositor *xsysc,
+                                                 uint64_t request_id,
+                                                 uint32_t result_code,
+                                                 const struct ipc_file_picker_result_path *path);
 
 /*!
  * Workspace controller request to flip display rendering mode (#234).

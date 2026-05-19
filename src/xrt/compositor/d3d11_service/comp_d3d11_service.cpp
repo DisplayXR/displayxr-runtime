@@ -1260,6 +1260,22 @@ struct d3d11_multi_compositor
 		uint32_t saved_mode_index;    //!< Pre-modal mode to restore on modal-close.
 		bool curtain_active;          //!< Per-tile blit pass collapses to eye-0 / tile-(0,0) when true.
 	} mode_flip;
+
+	//! XR_EXT_workspace_file_dialog: pending Tier 1 picker requests. Bounded
+	//! buffer keyed by request_id. Allocated in
+	//! comp_d3d11_service_workspace_post_file_picker_request and consumed by
+	//! comp_d3d11_service_workspace_file_picker_result. The drain loop emits
+	//! IPC_WORKSPACE_INPUT_EVENT_FILE_PICKER_REQUEST for entries whose
+	//! `needs_emit` flag is set. All access is guarded by `sys->render_mutex`.
+	struct
+	{
+		bool                         in_use;       //!< Slot occupied.
+		bool                         needs_emit;   //!< Drain loop should emit a request event.
+		int                          owner_slot;   //!< Workspace slot that issued the request.
+		uint64_t                     request_id;
+		struct ipc_file_picker_info  info;
+	} file_picker[8];
+	uint64_t next_file_picker_request_id;
 };
 
 
@@ -14381,6 +14397,33 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 		mc->frame_tick_last_ns = now_ns;
 	}
 
+	// XR_EXT_workspace_file_dialog: drain pending picker requests one at a
+	// time. Payload is tiny (client_id + request_id) so it fits comfortably
+	// in IPC_WORKSPACE_INPUT_EVENT_BATCH_MAX; the controller fetches the
+	// full XrFilePickerInfoEXT-equivalent via
+	// workspace_get_file_picker_request once it sees the event.
+	for (size_t i = 0; i < sizeof(mc->file_picker) / sizeof(mc->file_picker[0]) &&
+	     out_batch->count < IPC_WORKSPACE_INPUT_EVENT_BATCH_MAX; i++) {
+		if (!mc->file_picker[i].in_use || !mc->file_picker[i].needs_emit) continue;
+		int s = mc->file_picker[i].owner_slot;
+		if (s < 0 || s >= D3D11_MULTI_MAX_CLIENTS || !mc->clients[s].active) {
+			// Slot disappeared between post and drain — drop the
+			// pending entry; a late workspace_file_dialog_result
+			// will hit the same active-slot check and be discarded.
+			mc->file_picker[i].in_use = false;
+			mc->file_picker[i].needs_emit = false;
+			continue;
+		}
+		struct ipc_workspace_input_event *ev = &out_batch->events[out_batch->count];
+		memset(ev, 0, sizeof(*ev));
+		ev->event_type = IPC_WORKSPACE_INPUT_EVENT_FILE_PICKER_REQUEST;
+		ev->timestamp_ms = (uint32_t)GetTickCount();
+		ev->u.file_picker_request.client_id = mc->clients[s].workspace_client_id;
+		ev->u.file_picker_request.request_id = mc->file_picker[i].request_id;
+		out_batch->count++;
+		mc->file_picker[i].needs_emit = false;
+	}
+
 	return true;
 }
 
@@ -14814,6 +14857,144 @@ comp_d3d11_service_set_client_modal_state(struct xrt_system_compositor *xsysc, i
 	// so calling from this IPC thread is safe even though the WndProc
 	// thread reads concurrently.
 	multi_compositor_update_input_forward(mc);
+}
+
+extern "C" xrt_result_t
+comp_d3d11_service_workspace_post_file_picker_request(struct xrt_system_compositor *xsysc,
+                                                      int slot,
+                                                      const struct ipc_file_picker_info *info,
+                                                      uint64_t *out_request_id)
+{
+	if (xsysc == nullptr || info == nullptr || out_request_id == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || !mc->clients[slot].active) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	size_t entry_count = sizeof(mc->file_picker) / sizeof(mc->file_picker[0]);
+	for (size_t i = 0; i < entry_count; i++) {
+		if (mc->file_picker[i].in_use) continue;
+		mc->next_file_picker_request_id++;
+		if (mc->next_file_picker_request_id == 0) {
+			mc->next_file_picker_request_id = 1; // never hand out 0 (XR_NULL_ASYNC_REQUEST_ID_EXT).
+		}
+		mc->file_picker[i].in_use = true;
+		mc->file_picker[i].needs_emit = true;
+		mc->file_picker[i].owner_slot = slot;
+		mc->file_picker[i].request_id = mc->next_file_picker_request_id;
+		mc->file_picker[i].info = *info;
+		*out_request_id = mc->file_picker[i].request_id;
+		U_LOG_W("file_picker: queued request_id=%llu (slot=%d, mode=%u, filters=%u)",
+		        (unsigned long long)mc->file_picker[i].request_id, slot,
+		        info->mode, info->filter_count);
+		return XRT_SUCCESS;
+	}
+
+	U_LOG_W("file_picker: pending table full (%zu entries); rejecting request",
+	        entry_count);
+	*out_request_id = 0;
+	return XRT_ERROR_IPC_FAILURE;
+}
+
+extern "C" xrt_result_t
+comp_d3d11_service_workspace_get_file_picker_request(struct xrt_system_compositor *xsysc,
+                                                     uint64_t request_id,
+                                                     uint32_t *out_found,
+                                                     uint32_t *out_client_id,
+                                                     struct ipc_file_picker_info *out_info)
+{
+	if (out_found != nullptr) *out_found = 0;
+	if (out_client_id != nullptr) *out_client_id = 0;
+	if (out_info != nullptr) memset(out_info, 0, sizeof(*out_info));
+
+	if (xsysc == nullptr || request_id == 0) {
+		return XRT_SUCCESS; // not-found semantics, not an error.
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr) {
+		return XRT_SUCCESS;
+	}
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	size_t entry_count = sizeof(mc->file_picker) / sizeof(mc->file_picker[0]);
+	for (size_t i = 0; i < entry_count; i++) {
+		if (!mc->file_picker[i].in_use) continue;
+		if (mc->file_picker[i].request_id != request_id) continue;
+		int s = mc->file_picker[i].owner_slot;
+		if (s < 0 || s >= D3D11_MULTI_MAX_CLIENTS) continue;
+		if (out_found != nullptr) *out_found = 1;
+		if (out_client_id != nullptr) *out_client_id = mc->clients[s].workspace_client_id;
+		if (out_info != nullptr) *out_info = mc->file_picker[i].info;
+		return XRT_SUCCESS;
+	}
+	return XRT_SUCCESS;
+}
+
+extern "C" xrt_result_t
+comp_d3d11_service_workspace_file_picker_result(struct xrt_system_compositor *xsysc,
+                                                uint64_t request_id,
+                                                uint32_t result_code,
+                                                const struct ipc_file_picker_result_path *path)
+{
+	if (xsysc == nullptr || request_id == 0) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	size_t entry_count = sizeof(mc->file_picker) / sizeof(mc->file_picker[0]);
+	for (size_t i = 0; i < entry_count; i++) {
+		if (!mc->file_picker[i].in_use) continue;
+		if (mc->file_picker[i].request_id != request_id) continue;
+
+		int s = mc->file_picker[i].owner_slot;
+		mc->file_picker[i].in_use = false;
+		mc->file_picker[i].needs_emit = false;
+
+		if (s < 0 || s >= D3D11_MULTI_MAX_CLIENTS || !mc->clients[s].active ||
+		    mc->clients[s].compositor == nullptr) {
+			U_LOG_W("file_picker: dropping result for request_id=%llu (requesting slot %d is gone)",
+			        (unsigned long long)request_id, s);
+			return XRT_SUCCESS; // not an error path — late result is expected on requester crash.
+		}
+
+		struct xrt_session_event_sink *xses = mc->clients[s].compositor->xses;
+		if (xses == nullptr) {
+			U_LOG_W("file_picker: slot %d has no event sink — dropping result for %llu",
+			        s, (unsigned long long)request_id);
+			return XRT_SUCCESS;
+		}
+
+		union xrt_session_event xse = {};
+		xse.file_picker_complete.type = XRT_SESSION_EVENT_FILE_PICKER_COMPLETE;
+		xse.file_picker_complete.request_id = request_id;
+		xse.file_picker_complete.result = result_code;
+		if (path != nullptr) {
+			static_assert(sizeof(xse.file_picker_complete.path) >= IPC_FILE_PICKER_PATH_MAX,
+			              "session-event path buffer must hold a full IPC path");
+			memcpy(xse.file_picker_complete.path, path->path,
+			       sizeof(xse.file_picker_complete.path) - 1);
+			xse.file_picker_complete.path[sizeof(xse.file_picker_complete.path) - 1] = '\0';
+		}
+		xrt_session_event_sink_push(xses, &xse);
+		U_LOG_W("file_picker: delivered result_code=%u to slot %d (request_id=%llu)",
+		        result_code, s, (unsigned long long)request_id);
+		return XRT_SUCCESS;
+	}
+
+	U_LOG_W("file_picker: result for unknown request_id=%llu (already delivered or stale)",
+	        (unsigned long long)request_id);
+	return XRT_SUCCESS;
 }
 
 extern "C" bool

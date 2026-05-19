@@ -200,6 +200,19 @@ comp_ipc_client_compositor_workspace_deactivate(struct xrt_compositor *xc);
 xrt_result_t
 comp_ipc_client_compositor_session_set_modal_state(struct xrt_compositor *xc, bool is_open);
 
+/*!
+ * XR_EXT_workspace_file_dialog Tier 1: app-side `xrRequestFilePickerEXT`
+ * dispatches here. The runtime forwards the (info) struct to the active
+ * workspace controller and returns a monotonic 64-bit request_id; the
+ * eventual completion is delivered through the session event channel as
+ * @ref XRT_SESSION_EVENT_FILE_PICKER_COMPLETE.
+ */
+struct ipc_file_picker_info;
+xrt_result_t
+comp_ipc_client_compositor_session_request_file_picker(struct xrt_compositor *xc,
+                                                       const struct ipc_file_picker_info *info,
+                                                       uint64_t *out_request_id);
+
 xrt_result_t
 comp_ipc_client_compositor_workspace_get_state(struct xrt_compositor *xc, bool *out_active);
 

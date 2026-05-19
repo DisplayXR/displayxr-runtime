@@ -980,6 +980,15 @@ skip_macos_pump:
 			    xse.hardware_display_state_change.hardware_display_3d ? XR_TRUE : XR_FALSE);
 #endif // OXR_HAVE_EXT_display_info
 			break;
+		case XRT_SESSION_EVENT_FILE_PICKER_COMPLETE:
+#ifdef OXR_HAVE_EXT_workspace_file_dialog
+			oxr_event_push_XrEventDataFilePickerComplete(
+			    log, sess,
+			    (XrAsyncRequestIdEXT)xse.file_picker_complete.request_id,
+			    (XrFilePickerResultEXT)xse.file_picker_complete.result,
+			    xse.file_picker_complete.path);
+#endif // OXR_HAVE_EXT_workspace_file_dialog
+			break;
 		case XRT_SESSION_EVENT_EXIT_REQUEST:
 			// Runtime-initiated session exit (e.g. own window was closed).
 			// Drive the state machine to STOPPING so the app calls xrEndSession.

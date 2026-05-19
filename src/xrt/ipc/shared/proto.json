@@ -258,6 +258,25 @@
 		]
 	},
 
+	"workspace_get_file_picker_request": {
+		"in": [
+			{"name": "request_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "found", "type": "uint32_t"},
+			{"name": "client_id", "type": "uint32_t"},
+			{"name": "info", "type": "struct ipc_file_picker_info"}
+		]
+	},
+
+	"workspace_file_dialog_result": {
+		"in": [
+			{"name": "request_id", "type": "uint64_t"},
+			{"name": "result_code", "type": "uint32_t"},
+			{"name": "path", "type": "struct ipc_file_picker_result_path"}
+		]
+	},
+
 	"system_devices_get_roles": {
 		"out": [
 			{"name": "system_roles", "type": "struct xrt_system_roles"}
@@ -308,6 +327,15 @@
 	"session_set_modal_state": {
 		"in": [
 			{"name": "is_open", "type": "bool"}
+		]
+	},
+
+	"session_request_file_picker": {
+		"in": [
+			{"name": "info", "type": "struct ipc_file_picker_info"}
+		],
+		"out": [
+			{"name": "request_id", "type": "uint64_t"}
 		]
 	},
 

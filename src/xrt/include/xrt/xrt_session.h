@@ -78,6 +78,10 @@ enum xrt_session_event_type
 
 	//! The hardware display 3D state has changed (XR_EXT_display_info).
 	XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE = 13,
+
+	//! XR_EXT_workspace_file_dialog: pending xrRequestFilePickerEXT
+	//! completed (success / cancel / picker-failed).
+	XRT_SESSION_EVENT_FILE_PICKER_COMPLETE = 14,
 };
 
 /*!
@@ -220,6 +224,23 @@ struct xrt_session_event_hardware_display_state_change
 };
 
 /*!
+ * Spatial file-picker completion event, type @ref XRT_SESSION_EVENT_FILE_PICKER_COMPLETE.
+ *
+ * `path` is plain UTF-8, NUL-terminated within
+ * `XRT_FILE_PICKER_PATH_MAX_BYTES`. The OXR state tracker copies it
+ * into `XrEventDataFilePickerCompleteEXT.path` on
+ * receipt and pushes the OpenXR event to the requesting session.
+ */
+#define XRT_FILE_PICKER_PATH_MAX_BYTES 512  // Matches IPC_FILE_PICKER_PATH_MAX.
+struct xrt_session_event_file_picker_complete
+{
+	enum xrt_session_event_type type;
+	uint32_t result;                          //!< XrFilePickerResultEXT
+	XRT_ALIGNAS(8) uint64_t request_id;       //!< xrRequestFilePickerEXT out-param
+	char path[XRT_FILE_PICKER_PATH_MAX_BYTES];
+};
+
+/*!
  * Union of all session events, used to return multiple events through one call.
  * Each event struct must start with a @ref xrt_session_event_type field.
  *
@@ -240,6 +261,7 @@ union xrt_session_event {
 	struct xrt_session_event_user_presence_change presence_change;
 	struct xrt_session_event_rendering_mode_change rendering_mode_change;
 	struct xrt_session_event_hardware_display_state_change hardware_display_state_change;
+	struct xrt_session_event_file_picker_complete file_picker_complete;
 };
 
 /*!
