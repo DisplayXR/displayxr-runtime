@@ -319,6 +319,30 @@ static void RenderOneFrame(RenderState& rs) {
         }
     }
 
+    // #228 Tier 1 smoke test: 'B' fires xrRequestFilePickerEXT and prints
+    // the immediate return code. The completion event (success/cancel +
+    // path) lands later through PollEvents -> XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_EXT.
+    if (g_inputState.filePickerRequestRequested) {
+        g_inputState.filePickerRequestRequested = false;
+        if (xr.pfnRequestFilePickerEXT && xr.session != XR_NULL_HANDLE) {
+            XrFilePickerInfoEXT info = {XR_TYPE_FILE_PICKER_INFO_EXT};
+            info.next = nullptr;
+            info.mode = XR_FILE_PICKER_MODE_OPEN_EXT;
+            info.flags = XR_FILE_PICKER_FLAG_NONE_EXT;
+            strncpy_s(info.title, "Smoke test (#228)", _TRUNCATE);
+            strncpy_s(info.defaultPath, "C:\\", _TRUNCATE);
+            info.filterCount = 1;
+            strncpy_s(info.filters[0].description, "Images", _TRUNCATE);
+            strncpy_s(info.filters[0].extensions, "*.png;*.jpg", _TRUNCATE);
+            XrAsyncRequestIdEXT rid = XR_NULL_ASYNC_REQUEST_ID_EXT;
+            XrResult fr = xr.pfnRequestFilePickerEXT(xr.session, &info, &rid);
+            LOG_INFO("[#228] xrRequestFilePickerEXT -> rc=0x%x requestId=%llu",
+                (unsigned)fr, (unsigned long long)rid);
+        } else {
+            LOG_INFO("[#228] xrRequestFilePickerEXT not available (ext missing or PFN NULL)");
+        }
+    }
+
     // Handle eye tracking mode toggle (T key)
     if (g_inputState.eyeTrackingModeToggleRequested) {
         g_inputState.eyeTrackingModeToggleRequested = false;

@@ -231,6 +231,12 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
             // consumes the flag after xrEndFrame.
             state.captureAtlasRequested = true;
             break;
+        case 'B':
+            // #228 smoke test: ask the runtime for a Tier 1 spatial file
+            // picker. Main loop consumes the flag, calls
+            // xrRequestFilePickerEXT, polls events for the completion.
+            state.filePickerRequestRequested = true;
+            break;
         case '0':
             state.absoluteRenderingModeRequested = 0; // 2D mode
             break;

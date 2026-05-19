@@ -379,6 +379,14 @@ bool PollEvents(XrSessionManager& xr) {
             xr.currentModeIndex = modeEvent->currentModeIndex;
             break;
         }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_EXT: {
+            auto* pickEvent = (XrEventDataFilePickerCompleteEXT*)&event;
+            LOG_INFO("[#228] File picker complete: requestId=%llu result=%d path=\"%s\"",
+                (unsigned long long)pickEvent->requestId,
+                (int)pickEvent->result,
+                pickEvent->path);
+            break;
+        }
         default:
             LOG_DEBUG("Received event type: %d", event.type);
             break;

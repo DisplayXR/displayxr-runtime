@@ -27,6 +27,7 @@
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_EXT_win32_window_binding.h>
 #include <openxr/XR_EXT_display_info.h>
+#include <openxr/XR_EXT_workspace_file_dialog.h>
 #include <DirectXMath.h>
 #include <vector>
 #include <string>
@@ -81,6 +82,10 @@ struct XrSessionManager {
     // Extension support (used by ext app, ignored by non-ext app)
     bool hasWin32WindowBindingExt = false;
     bool hasDisplayInfoExt = false;
+    bool hasFileDialogExt = false;
+    // PFN resolved when XR_EXT_workspace_file_dialog is enabled. nullptr if
+    // the runtime didn't expose the extension. #228 Tier 1.
+    PFN_xrRequestFilePickerEXT pfnRequestFilePickerEXT = nullptr;
 
     // Display info from XR_EXT_display_info (static display properties)
     float recommendedViewScaleX = 1.0f;

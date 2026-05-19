@@ -104,6 +104,12 @@ struct InputState {
     // See u_capture_intent.h and issue #210.
     bool captureAtlasRequested = false;
 
+    // 'B' key: smoke-test xrRequestFilePickerEXT (#228 Tier 1 spatial picker).
+    // Main loop sees the flag, resolves the PFN, makes the call, polls events
+    // for completion, and logs both. Falls through silently when the extension
+    // is not enabled / not available.
+    bool filePickerRequestRequested = false;
+
     // --- Gaussian-splat demo extensions (additive; unused by cube_* apps) ---
 
     // Smooth display-pose transition (double-click focus). When active,
