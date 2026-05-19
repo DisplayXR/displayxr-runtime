@@ -919,6 +919,14 @@ XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetLauncherRunningTileMaskEXT(XrSession session, uint64_t mask);
 #endif
 
+#ifdef OXR_HAVE_EXT_workspace_file_dialog
+//! OpenXR API function @ep{xrRequestFilePickerEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrRequestFilePickerEXT(XrSession session,
+                           const XrFilePickerInfoEXT *info,
+                           XrAsyncRequestIdEXT *requestId);
+#endif
+
 // xrSetSharedTextureOutputRectEXT — canvas sub-rect, part of window binding extensions
 #if defined(OXR_HAVE_EXT_win32_window_binding) || defined(OXR_HAVE_EXT_cocoa_window_binding)
 //! OpenXR API function @ep{xrSetSharedTextureOutputRectEXT}

@@ -1149,6 +1149,26 @@ oxr_event_push_XrEventDataHardwareDisplayStateChanged(struct oxr_logger *log,
                                                        struct oxr_session *sess,
                                                        XrBool32 hardwareDisplay3D);
 
+#ifdef OXR_HAVE_EXT_workspace_file_dialog
+/*!
+ * Push an `XrEventDataFilePickerCompleteEXT` onto the instance event queue.
+ *
+ * Caller passes the originating session (used by `is_session_link_to_event`
+ * to route the event back to the requester on xrPollEvent), the
+ * monotonic request ID the runtime returned from `xrRequestFilePickerEXT`,
+ * the completion outcome, and the picked path (UTF-8, NUL-terminated).
+ *
+ * `path` may be NULL or empty for non-SUCCESS outcomes; in those cases
+ * the embedded buffer is zero-filled.
+ */
+XrResult
+oxr_event_push_XrEventDataFilePickerComplete(struct oxr_logger *log,
+                                              struct oxr_session *sess,
+                                              XrAsyncRequestIdEXT requestId,
+                                              XrFilePickerResultEXT result,
+                                              const char *path);
+#endif // OXR_HAVE_EXT_workspace_file_dialog
+
 #ifdef OXR_HAVE_FB_display_refresh_rate
 XrResult
 oxr_event_push_XrEventDataDisplayRefreshRateChangedFB(struct oxr_logger *log,

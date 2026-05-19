@@ -144,6 +144,12 @@ is_session_link_to_event(struct oxr_event *event, XrSession session)
 		XrEventDataHardwareDisplayStateChangedEXT *changed = (XrEventDataHardwareDisplayStateChangedEXT *)type;
 		return changed->session == session;
 	}
+#ifdef OXR_HAVE_EXT_workspace_file_dialog
+	case XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_EXT: {
+		XrEventDataFilePickerCompleteEXT *complete = (XrEventDataFilePickerCompleteEXT *)type;
+		return complete->session == session;
+	}
+#endif
 	default: return false;
 	}
 }
@@ -430,6 +436,44 @@ oxr_event_push_XrEventDataHardwareDisplayStateChanged(struct oxr_logger *log,
 
 	return XR_SUCCESS;
 }
+
+#ifdef OXR_HAVE_EXT_workspace_file_dialog
+XrResult
+oxr_event_push_XrEventDataFilePickerComplete(struct oxr_logger *log,
+                                              struct oxr_session *sess,
+                                              XrAsyncRequestIdEXT requestId,
+                                              XrFilePickerResultEXT result,
+                                              const char *path)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataFilePickerCompleteEXT *complete;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &complete);
+
+	complete->type = XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_EXT;
+	complete->next = NULL;
+	complete->session = oxr_session_to_openxr(sess);
+	complete->requestId = requestId;
+	complete->result = result;
+	// path[] was already zero-initialised by ALLOC (U_CALLOC_WITH_CAST).
+	if (result == XR_FILE_PICKER_RESULT_SUCCESS_EXT && path != NULL && path[0] != '\0') {
+		size_t len = strnlen(path, XR_MAX_FILE_PICKER_PATH_LENGTH_EXT - 1);
+		memcpy(complete->path, path, len);
+		complete->path[len] = '\0';
+	}
+	event->result = XR_SUCCESS;
+
+	U_LOG_I("OXR EVENT: File picker complete (requestId=%llu, result=%d)",
+	        (unsigned long long)requestId, (int)result);
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_EXT_workspace_file_dialog
 
 XrResult
 oxr_event_remove_session_events(struct oxr_logger *log, struct oxr_session *sess)
