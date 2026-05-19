@@ -37,7 +37,7 @@ The app polls `xrPollEvent` for `XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_EXT`. T
 |---|---|---|
 | `requestId` | `XrAsyncRequestIdEXT` | Correlates with the `xrRequestFilePickerEXT` out-param. |
 | `result` | `XrFilePickerResultEXT` | `SUCCESS_EXT` (path valid), `CANCELLED_EXT`, `PICKER_FAILED_EXT` (process crashed / synthesised by the workspace controller on child-exit without completion), `INVALID_PATH_EXT` (selection did not fit in the path buffer). |
-| `path` | `char[2048]` | UTF-8. Empty unless `result == SUCCESS_EXT`. |
+| `path` | `char[512]` | UTF-8. Empty unless `result == SUCCESS_EXT`. Sized to comfortably hold Windows `MAX_PATH`; long-path picks (`\\?\…` style) return `INVALID_PATH_EXT` and the app should fall back to Tier 0. |
 
 Async / event-based on purpose: a blocking entrypoint would deadlock single-threaded render loops and stall `xrWaitFrame`.
 
@@ -51,7 +51,7 @@ Async / event-based on purpose: a blocking entrypoint would deadlock single-thre
 | `flags` | `XR_FILE_PICKER_FLAG_MULTI_SELECT_BIT_EXT` is reserved for spec_version 2. spec_version 1 implementations may return `XR_ERROR_FEATURE_UNSUPPORTED` if the bit is set. |
 | `title` | Window title; empty = picker chooses. |
 | `defaultPath` | Starting directory; empty = picker chooses. |
-| `filterCount` / `filters[]` | Up to 8 filter rows. Each row carries a user-visible `description` and a semicolon-delimited extension list (e.g. `"*.png;*.jpg;*.jpeg"`). |
+| `filterCount` / `filters[]` | Up to 4 filter rows. Each row carries a user-visible `description` (`char[64]`) and a semicolon-delimited extension list (e.g. `"*.png;*.jpg;*.jpeg"`, `char[64]`). Tightening these vs. the proposal in #228 keeps the IPC payload inside the runtime's 1024-byte RPC budget — bumping it is a future change, not v1. |
 
 ### Fallback semantics
 

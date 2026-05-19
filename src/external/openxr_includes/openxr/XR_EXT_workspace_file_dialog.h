@@ -58,21 +58,29 @@ extern "C" {
 /*!
  * @brief Maximum path length carried in the completion event (UTF-8 bytes).
  *
- * Sized for Windows long paths plus UTF-8 worst case. The picker truncates
- * results past this length and returns XR_ERROR_PATH_FORMAT_INVALID.
+ * Sized to comfortably hold Windows `MAX_PATH` plus UTF-8 worst case.
+ * Apps that need long-path support (`\\?\…` style) should call the
+ * Tier 0 path directly; the completion event returns
+ * `XR_FILE_PICKER_RESULT_INVALID_PATH_EXT` if the user picks a path
+ * that does not fit in this buffer.
  */
-#define XR_MAX_FILE_PICKER_PATH_LENGTH_EXT 2048
+#define XR_MAX_FILE_PICKER_PATH_LENGTH_EXT 512
 
 /*!
  * @brief Maximum length of a single filter description / extension list
  * field in XrFilePickerInfoEXT.
  */
-#define XR_MAX_FILE_PICKER_FILTER_LENGTH_EXT 128
+#define XR_MAX_FILE_PICKER_FILTER_LENGTH_EXT 64
+
+/*!
+ * @brief Maximum length of the optional picker title.
+ */
+#define XR_MAX_FILE_PICKER_TITLE_LENGTH_EXT 128
 
 /*!
  * @brief Maximum number of filter entries the picker UI displays.
  */
-#define XR_MAX_FILE_PICKER_FILTERS_EXT 8
+#define XR_MAX_FILE_PICKER_FILTERS_EXT 4
 
 /*!
  * @brief Async-request handle returned by xrRequestFilePickerEXT.
@@ -131,7 +139,7 @@ typedef struct XrFilePickerInfoEXT {
     const void* XR_MAY_ALIAS   next;       //!< Reserved; must be NULL in spec_version 1
     XrFilePickerModeEXT        mode;       //!< Open / Save / Folder
     XrFilePickerFlagsEXT       flags;      //!< See XR_FILE_PICKER_FLAG_*
-    char                       title[XR_MAX_FILE_PICKER_FILTER_LENGTH_EXT]; //!< Window title; empty = picker chooses
+    char                       title[XR_MAX_FILE_PICKER_TITLE_LENGTH_EXT]; //!< Window title; empty = picker chooses
     char                       defaultPath[XR_MAX_FILE_PICKER_PATH_LENGTH_EXT]; //!< Starting directory; empty = picker chooses
     uint32_t                   filterCount; //!< Number of valid entries in filters[]
     XrFilePickerFilterEXT      filters[XR_MAX_FILE_PICKER_FILTERS_EXT];

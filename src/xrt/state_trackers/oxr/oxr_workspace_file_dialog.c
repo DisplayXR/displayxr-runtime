@@ -26,12 +26,24 @@
 #include "oxr_api_funcs.h"
 #include "oxr_api_verify.h"
 
+#include "shared/ipc_protocol.h"
+
 #include <openxr/XR_EXT_workspace_file_dialog.h>
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #ifdef OXR_HAVE_EXT_workspace_file_dialog
+
+// Forward declaration of the IPC client bridge — implementation lives in
+// ipc/client/ipc_client_compositor.c; we forward-declare here so the state
+// tracker doesn't have to pull the full ipc_client include path.
+struct xrt_compositor;
+xrt_result_t
+comp_ipc_client_compositor_session_request_file_picker(struct xrt_compositor *xc,
+                                                       const struct ipc_file_picker_info *info,
+                                                       uint64_t *out_request_id);
 
 static bool
 session_is_ipc_client(struct oxr_session *sess)
@@ -45,6 +57,58 @@ session_is_ipc_client(struct oxr_session *sess)
 		return false;
 	}
 	return true;
+}
+
+/*!
+ * Translate the public XrFilePickerInfoEXT to the wire-format
+ * ipc_file_picker_info. The wire format is intentionally tighter than the
+ * public ABI so the IPC payload fits inside IPC_BUF_SIZE — caller-supplied
+ * strings longer than the wire budget are rejected with
+ * XR_ERROR_PATH_FORMAT_INVALID so the picker never sees a truncated path.
+ */
+static XrResult
+translate_info(struct oxr_logger *log,
+               const XrFilePickerInfoEXT *in,
+               struct ipc_file_picker_info *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->mode = (uint32_t)in->mode;
+	out->flags = (uint64_t)in->flags;
+
+	size_t title_len = strnlen(in->title, XR_MAX_FILE_PICKER_TITLE_LENGTH_EXT);
+	if (title_len >= sizeof(out->title)) {
+		return oxr_error(log, XR_ERROR_PATH_FORMAT_INVALID,
+		                 "(info->title) length %zu exceeds wire budget %zu",
+		                 title_len, sizeof(out->title) - 1);
+	}
+	memcpy(out->title, in->title, title_len);
+
+	size_t path_len = strnlen(in->defaultPath, XR_MAX_FILE_PICKER_PATH_LENGTH_EXT);
+	if (path_len >= sizeof(out->default_path)) {
+		return oxr_error(log, XR_ERROR_PATH_FORMAT_INVALID,
+		                 "(info->defaultPath) length %zu exceeds wire budget %zu",
+		                 path_len, sizeof(out->default_path) - 1);
+	}
+	memcpy(out->default_path, in->defaultPath, path_len);
+
+	if (in->filterCount > IPC_FILE_PICKER_FILTERS_MAX) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+		                 "(info->filterCount) %u exceeds wire budget %u",
+		                 in->filterCount, IPC_FILE_PICKER_FILTERS_MAX);
+	}
+	out->filter_count = in->filterCount;
+	for (uint32_t i = 0; i < in->filterCount; i++) {
+		size_t d = strnlen(in->filters[i].description, XR_MAX_FILE_PICKER_FILTER_LENGTH_EXT);
+		size_t e = strnlen(in->filters[i].extensions, XR_MAX_FILE_PICKER_FILTER_LENGTH_EXT);
+		if (d >= sizeof(out->filters[i].description) ||
+		    e >= sizeof(out->filters[i].extensions)) {
+			return oxr_error(log, XR_ERROR_PATH_FORMAT_INVALID,
+			                 "(info->filters[%u]) field exceeds wire budget", i);
+		}
+		memcpy(out->filters[i].description, in->filters[i].description, d);
+		memcpy(out->filters[i].extensions, in->filters[i].extensions, e);
+	}
+	return XR_SUCCESS;
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
@@ -115,21 +179,33 @@ oxr_xrRequestFilePickerEXT(XrSession session,
 		                 "xrRequestFilePickerEXT is not callable from a workspace controller session");
 	}
 
-	// PR C boundary: input is validated and we are in a position where the
-	// IPC dispatch SHOULD happen. The IPC RPC + capability lookup + Tier 0
-	// vs Tier 1 routing lands in PR B (workspace_request_file_dialog).
-	// Until then, any caller gets the documented success-class fallback
-	// signal so apps can be written and tested against the final ABI; once
-	// PR B lands, sessions whose controller advertises
-	// `SupportsFileDialog = 1` will instead receive a real request id and a
-	// later completion event.
-	static bool s_logged_stub = false;
-	if (!s_logged_stub) {
-		s_logged_stub = true;
-		U_LOG_W("xrRequestFilePickerEXT: returning XR_FILE_PICKER_FALLBACK_TIER0_EXT "
-		        "(IPC dispatch not yet implemented — see PR B for #228)");
+	// Translate to the wire format. Length-validation rejects user paths
+	// that wouldn't survive the IPC budget — the app can fall back to
+	// Tier 0 (flat OS dialog) if it needs long-path support.
+	struct ipc_file_picker_info ipc_info;
+	XrResult tr = translate_info(&log, info, &ipc_info);
+	if (tr != XR_SUCCESS) {
+		return tr;
 	}
-	return XR_FILE_PICKER_FALLBACK_TIER0_EXT;
+
+	// Dispatch through the IPC bridge. The runtime allocates a monotonic
+	// request_id, queues a FILE_PICKER_REQUEST event for the controller's
+	// drain channel, and returns. If the bridge fails (no workspace
+	// controller online, controller has not advertised file-dialog
+	// support, table full, …) we surface XR_FILE_PICKER_FALLBACK_TIER0_EXT
+	// so the app falls through to a flat OS dialog — Tier 0's CBT hook
+	// will handle z-order / focus on its own.
+	uint64_t allocated_id = 0;
+	xrt_result_t xret = comp_ipc_client_compositor_session_request_file_picker(
+	    &sess->xcn->base, &ipc_info, &allocated_id);
+	if (xret != XRT_SUCCESS || allocated_id == 0) {
+		U_LOG_I("xrRequestFilePickerEXT: bridge=%d, allocated_id=%llu — falling back to Tier 0",
+		        (int)xret, (unsigned long long)allocated_id);
+		return XR_FILE_PICKER_FALLBACK_TIER0_EXT;
+	}
+
+	*requestId = (XrAsyncRequestIdEXT)allocated_id;
+	return XR_SUCCESS;
 }
 
 #endif // OXR_HAVE_EXT_workspace_file_dialog

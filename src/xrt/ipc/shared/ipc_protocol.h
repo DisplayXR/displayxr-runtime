@@ -343,6 +343,56 @@ struct ipc_launcher_app
 };
 
 /*!
+ * XR_EXT_workspace_file_dialog wire format. Flat IPC translation of
+ * XrFilePickerInfoEXT — no OpenXR-type dependency in IPC headers, no
+ * pointer chasing (the proto generator copies by value).
+ *
+ * Wire-side budgets are tighter than the public XR_MAX_FILE_PICKER_*_EXT
+ * limits so the whole struct fits inside a single IPC_BUF_SIZE
+ * (1024 byte) RPC message. The OXR translation truncates user-supplied
+ * paths/titles that exceed the wire budget and returns
+ * XR_ERROR_PATH_FORMAT_INVALID to the caller. Apps that need long-path
+ * support fall back to Tier 0.
+ *
+ * Field meanings match the public extension; see
+ * `docs/specs/extensions/XR_EXT_workspace_file_dialog.md`.
+ *
+ * @ingroup ipc
+ */
+#define IPC_FILE_PICKER_PATH_MAX     512   //!< Wire-format max; tighter than XR_MAX_FILE_PICKER_PATH_LENGTH_EXT.
+#define IPC_FILE_PICKER_TITLE_MAX    128   //!< Wire-format title size.
+#define IPC_FILE_PICKER_FILTER_MAX   64    //!< Wire-format filter description / extensions size.
+#define IPC_FILE_PICKER_FILTERS_MAX  4     //!< Wire-format filter rows.
+
+struct ipc_file_picker_filter
+{
+	char description[IPC_FILE_PICKER_FILTER_MAX];
+	char extensions[IPC_FILE_PICKER_FILTER_MAX];
+};
+
+struct ipc_file_picker_info
+{
+	uint32_t mode;                                            //!< XrFilePickerModeEXT cast to uint32_t
+	uint32_t filter_count;
+	uint64_t flags;                                           //!< XrFilePickerFlagsEXT
+	char     title[IPC_FILE_PICKER_TITLE_MAX];
+	char     default_path[IPC_FILE_PICKER_PATH_MAX];
+	struct ipc_file_picker_filter filters[IPC_FILE_PICKER_FILTERS_MAX];
+};
+
+/*!
+ * Wrapper struct so the proto generator (which only marshals named
+ * struct types) can carry the picked path as a single argument to
+ * `workspace_file_dialog_result`.
+ *
+ * @ingroup ipc
+ */
+struct ipc_file_picker_result_path
+{
+	char path[IPC_FILE_PICKER_PATH_MAX];
+};
+
+/*!
  * Phase 2.D: workspace input event wire format. Tagged union with
  * event_type as the discriminator. Mirrors the public XrWorkspaceInputEventEXT
  * but uses plain C types (no XR enum dependency in IPC headers). The state
@@ -371,6 +421,7 @@ enum ipc_workspace_input_event_type
 	IPC_WORKSPACE_INPUT_EVENT_WINDOW_POSE_CHANGED = 7, //!< spec_version 8: runtime-driven pose/size change
 	IPC_WORKSPACE_INPUT_EVENT_MODAL_OPEN          = 8, //!< spec_version 10: client opened a Win32 modal popup
 	IPC_WORKSPACE_INPUT_EVENT_MODAL_CLOSE         = 9, //!< spec_version 10: client's Win32 modal popup closed
+	IPC_WORKSPACE_INPUT_EVENT_FILE_PICKER_REQUEST = 10, //!< spec_version 11: client called xrRequestFilePickerEXT
 };
 
 struct ipc_workspace_input_event
@@ -457,6 +508,16 @@ struct ipc_workspace_input_event
 		{
 			uint32_t client_id;
 		} modal;
+		struct                      //!< spec_version 11: spatial file-picker request
+		{
+			// Payload is intentionally minimal so the event batch stays
+			// under IPC_BUF_SIZE. The controller fetches the full
+			// XrFilePickerInfoEXT-equivalent via
+			// `workspace_get_file_picker_request(request_id)`.
+			uint32_t client_id;
+			uint32_t _pad;
+			uint64_t request_id;
+		} file_picker_request;
 	} u;
 };
 

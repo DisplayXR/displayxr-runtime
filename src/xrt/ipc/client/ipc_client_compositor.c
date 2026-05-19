@@ -320,6 +320,22 @@ comp_ipc_client_compositor_session_set_modal_state(struct xrt_compositor *xc, bo
 }
 
 xrt_result_t
+comp_ipc_client_compositor_session_request_file_picker(struct xrt_compositor *xc,
+                                                       const struct ipc_file_picker_info *info,
+                                                       uint64_t *out_request_id)
+{
+	if (xc == NULL || info == NULL || out_request_id == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_request_id = 0;
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_session_request_file_picker(icc->ipc_c, info, out_request_id);
+}
+
+xrt_result_t
 comp_ipc_client_compositor_workspace_get_state(struct xrt_compositor *xc, bool *out_active)
 {
 	if (xc == NULL || out_active == NULL) {
