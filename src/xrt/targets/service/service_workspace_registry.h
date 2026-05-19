@@ -10,6 +10,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -51,6 +52,33 @@ struct workspace_controller_action
 #define WORKSPACE_REGISTRY_MAX_ACTIONS 16
 
 /*!
+ * Optional capability bits a controller may advertise.
+ *
+ * Each bit corresponds to a separate `REG_DWORD` value name under the
+ * controller's `HKLM\Software\DisplayXR\WorkspaceControllers\<id>` key.
+ * A value of `1` (any non-zero) enables the bit; missing values default
+ * to 0. The runtime tests these bits when deciding whether to dispatch
+ * a feature to the controller or fall back.
+ *
+ * Forward-compatible: unknown registry values are ignored; controllers
+ * never need to declare bits they don't implement.
+ */
+enum workspace_controller_capability
+{
+	/*!
+	 * Controller hosts a spatial file picker
+	 * (XR_EXT_workspace_file_dialog Tier 1).
+	 *
+	 * Registry value: `SupportsFileDialog = REG_DWORD 1`.
+	 *
+	 * Without this bit set, `xrRequestFilePickerEXT` returns
+	 * `XR_FILE_PICKER_FALLBACK_TIER0_EXT` and the app is expected to
+	 * fall back to a flat OS dialog (Tier 0 handles z-order / focus).
+	 */
+	WORKSPACE_CAPABILITY_FILE_DIALOG = 1u << 0,
+};
+
+/*!
  * Registered workspace controller. Populated from a subkey of
  * `HKLM\Software\DisplayXR\WorkspaceControllers\<id>`. Workspace apps
  * (the DisplayXR shell, third-party verticals, etc.) write these keys
@@ -64,6 +92,10 @@ struct workspace_controller_entry
 	char vendor[64];                   //!< Optional publisher.
 	char version[32];                  //!< Optional free-form version.
 	char uninstall_string[MAX_PATH];   //!< Used by runtime uninstaller for cascade.
+
+	//! Bitwise OR of `workspace_controller_capability` flags.
+	//! Zero means the controller publishes no optional capabilities.
+	uint32_t capabilities;
 
 	//! Optional published tray menu actions. `n_actions == 0` means
 	//! the tray falls back to its hardcoded Enable/Auto/Disable

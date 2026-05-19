@@ -26,6 +26,21 @@ file_exists(const char *path)
 	return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+//! Read a REG_DWORD value. Returns 0 on miss or wrong type.
+static uint32_t
+read_reg_dword(HKEY key, const char *value_name)
+{
+	DWORD type = 0;
+	DWORD value = 0;
+	DWORD size = sizeof(value);
+	LSTATUS rc = RegQueryValueExA(key, value_name, NULL, &type,
+	                              (LPBYTE)&value, &size);
+	if (rc != ERROR_SUCCESS || type != REG_DWORD) {
+		return 0;
+	}
+	return (uint32_t)value;
+}
+
 //! Read a REG_SZ value into a fixed-size buffer. Returns false on miss
 //! or oversize. On false, the buffer is zeroed.
 static bool
@@ -146,6 +161,10 @@ populate_from_subkey(const char *id, HKEY subkey,
 	read_reg_string(subkey, "Version", entry->version, sizeof(entry->version));
 	read_reg_string(subkey, "UninstallString", entry->uninstall_string,
 	                sizeof(entry->uninstall_string));
+
+	if (read_reg_dword(subkey, "SupportsFileDialog") != 0) {
+		entry->capabilities |= WORKSPACE_CAPABILITY_FILE_DIALOG;
+	}
 
 	populate_actions(subkey, entry);
 

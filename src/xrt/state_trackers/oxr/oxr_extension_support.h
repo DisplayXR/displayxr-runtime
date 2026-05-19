@@ -586,6 +586,18 @@
 
 
 /*
+ * XR_EXT_workspace_file_dialog
+ */
+#if defined(XR_EXT_workspace_file_dialog) && defined(XR_USE_PLATFORM_WIN32)
+#define OXR_HAVE_EXT_workspace_file_dialog
+#define OXR_EXTENSION_SUPPORT_EXT_workspace_file_dialog(_) \
+    _(EXT_workspace_file_dialog, EXT_WORKSPACE_FILE_DIALOG)
+#else
+#define OXR_EXTENSION_SUPPORT_EXT_workspace_file_dialog(_)
+#endif
+
+
+/*
  * XR_BD_controller_interaction
  */
 #if defined(XR_BD_controller_interaction) && defined(XRT_FEATURE_OPENXR_INTERACTION_BYTEDANCE)
@@ -1063,6 +1075,7 @@
     OXR_EXTENSION_SUPPORT_EXT_display_info(_) \
     OXR_EXTENSION_SUPPORT_EXT_spatial_workspace(_) \
     OXR_EXTENSION_SUPPORT_EXT_app_launcher(_) \
+    OXR_EXTENSION_SUPPORT_EXT_workspace_file_dialog(_) \
     OXR_EXTENSION_SUPPORT_BD_controller_interaction(_) \
     OXR_EXTENSION_SUPPORT_FB_body_tracking(_) \
     OXR_EXTENSION_SUPPORT_FB_composition_layer_alpha_blend(_) \

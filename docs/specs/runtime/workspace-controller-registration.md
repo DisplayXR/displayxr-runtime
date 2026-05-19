@@ -40,6 +40,9 @@ A workspace app's installer:
    | `Version` | REG_SZ | no | Free-form version string (logged at spawn). |
    | `IconPath` | REG_SZ | no | Tray submenu icon (reserved). |
    | `UninstallString` | REG_SZ | yes | Used by the runtime uninstaller for cascade uninstall. **Must honor `/S` (silent).** |
+   | `SupportsFileDialog` | REG_DWORD | no | Optional capability bit. `1` means this controller hosts `XR_EXT_workspace_file_dialog` Tier 1 (spawns a spatial picker exe on `xrRequestFilePickerEXT`). Missing or `0` means the runtime returns `XR_FILE_PICKER_FALLBACK_TIER0_EXT` and the app falls back to a flat OS dialog. |
+
+   Capability flags are forward-compatible: future bits (`SupportsColorDialog`, …) are added as additional `REG_DWORD` values under this same subkey. Unknown values are ignored. Controllers never need to declare bits they don't implement.
 
 4. **Writes its own Add/Remove Programs entry under
    `HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\<ProductId>`.**
