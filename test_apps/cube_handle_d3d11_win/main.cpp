@@ -321,11 +321,27 @@ static void RenderOneFrame(RenderState& rs) {
 
     // #228 Tier 1 smoke test: 'B' fires xrRequestFilePickerEXT and prints
     // the immediate return code. The completion event (success/cancel +
-    // path) lands later through PollEvents -> XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_EXT.
+    // path) lands later through PollEvents → XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_EXT.
     //
-    // Temporary auto-fire for headless smoke tests: when env var
-    // DISPLAYXR_AUTOFIRE_FILE_PICKER=1 is set, fire one request ~300
-    // frames after the session is running so a keypress isn't required.
+    // ------------------------------------------------------------------
+    // CI / headless smoke-test hook for #228.
+    // ------------------------------------------------------------------
+    // Setting `DISPLAYXR_AUTOFIRE_FILE_PICKER=1` in this app's
+    // environment causes ONE xrRequestFilePickerEXT call to fire
+    // automatically ~300 frames after the session enters running
+    // state (≈5 s at 60 Hz), without any keypress. The flag is reset
+    // after the first fire — there is no per-frame call cost.
+    //
+    // Why this exists: PostMessage(WM_KEYDOWN, 'B') from an external
+    // PowerShell test driver against the cube's hidden-under-workspace
+    // HWND has been flaky in practice (the keypress can arrive at the
+    // exact instant the IPC pipe transitions to broken on some runs,
+    // racing a session-lost teardown). The auto-fire path bypasses
+    // Win32 input entirely so headless CI can verify the end-to-end
+    // OpenXR contract regardless of input plumbing.
+    //
+    // Off-by-default, gated on an env var so a normal user double-
+    // clicking the cube never gets a spurious picker request.
     {
         static int s_autofire_frames = 0;
         static bool s_autofire_done = false;
