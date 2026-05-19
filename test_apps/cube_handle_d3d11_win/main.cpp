@@ -322,6 +322,25 @@ static void RenderOneFrame(RenderState& rs) {
     // #228 Tier 1 smoke test: 'B' fires xrRequestFilePickerEXT and prints
     // the immediate return code. The completion event (success/cancel +
     // path) lands later through PollEvents -> XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_EXT.
+    //
+    // Temporary auto-fire for headless smoke tests: when env var
+    // DISPLAYXR_AUTOFIRE_FILE_PICKER=1 is set, fire one request ~300
+    // frames after the session is running so a keypress isn't required.
+    {
+        static int s_autofire_frames = 0;
+        static bool s_autofire_done = false;
+        if (!s_autofire_done && xr.sessionRunning) {
+            s_autofire_frames++;
+            if (s_autofire_frames > 300) {
+                const char *autofire = getenv("DISPLAYXR_AUTOFIRE_FILE_PICKER");
+                if (autofire && autofire[0] == '1') {
+                    LOG_INFO("[#228] AUTO-FIRE: setting filePickerRequestRequested");
+                    g_inputState.filePickerRequestRequested = true;
+                }
+                s_autofire_done = true;
+            }
+        }
+    }
     if (g_inputState.filePickerRequestRequested) {
         g_inputState.filePickerRequestRequested = false;
         if (xr.pfnRequestFilePickerEXT && xr.session != XR_NULL_HANDLE) {

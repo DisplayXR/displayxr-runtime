@@ -14894,6 +14894,11 @@ comp_d3d11_service_workspace_post_file_picker_request(struct xrt_system_composit
 		U_LOG_W("file_picker: queued request_id=%llu (slot=%d, mode=%u, filters=%u)",
 		        (unsigned long long)mc->file_picker[i].request_id, slot,
 		        info->mode, info->filter_count);
+		// Wake the workspace controller so it drains the new event in
+		// the same frame the request arrives, instead of waiting for
+		// its next periodic input poll (the shell sleeps on the
+		// wakeup-event handle when nothing else is happening).
+		service_signal_workspace_wakeup(sys);
 		return XRT_SUCCESS;
 	}
 

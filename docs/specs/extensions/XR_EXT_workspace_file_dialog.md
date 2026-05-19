@@ -37,7 +37,7 @@ The app polls `xrPollEvent` for `XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_EXT`. T
 |---|---|---|
 | `requestId` | `XrAsyncRequestIdEXT` | Correlates with the `xrRequestFilePickerEXT` out-param. |
 | `result` | `XrFilePickerResultEXT` | `SUCCESS_EXT` (path valid), `CANCELLED_EXT`, `PICKER_FAILED_EXT` (process crashed / synthesised by the workspace controller on child-exit without completion), `INVALID_PATH_EXT` (selection did not fit in the path buffer). |
-| `path` | `char[512]` | UTF-8. Empty unless `result == SUCCESS_EXT`. Sized to comfortably hold Windows `MAX_PATH`; long-path picks (`\\?\…` style) return `INVALID_PATH_EXT` and the app should fall back to Tier 0. |
+| `path` | `char[256]` | UTF-8. Empty unless `result == SUCCESS_EXT`. Sized to fit Windows `MAX_PATH` (260) inside the runtime's per-message IPC budget; long-path picks (`\\?\…` style) return `INVALID_PATH_EXT` and the app should fall back to Tier 0. |
 
 Async / event-based on purpose: a blocking entrypoint would deadlock single-threaded render loops and stall `xrWaitFrame`.
 

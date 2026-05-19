@@ -58,13 +58,14 @@ extern "C" {
 /*!
  * @brief Maximum path length carried in the completion event (UTF-8 bytes).
  *
- * Sized to comfortably hold Windows `MAX_PATH` plus UTF-8 worst case.
- * Apps that need long-path support (`\\?\…` style) should call the
- * Tier 0 path directly; the completion event returns
- * `XR_FILE_PICKER_RESULT_INVALID_PATH_EXT` if the user picks a path
- * that does not fit in this buffer.
+ * Sized to Windows `MAX_PATH` (260) rounded down to a power-of-two-ish
+ * value so the encompassing IPC request message stays comfortably inside
+ * the runtime's per-message wire budget. Apps that need long-path
+ * support (`\\?\…` style) should call the Tier 0 path directly; the
+ * completion event returns `XR_FILE_PICKER_RESULT_INVALID_PATH_EXT` if
+ * the user picks a path that does not fit in this buffer.
  */
-#define XR_MAX_FILE_PICKER_PATH_LENGTH_EXT 512
+#define XR_MAX_FILE_PICKER_PATH_LENGTH_EXT 256
 
 /*!
  * @brief Maximum length of a single filter description / extension list

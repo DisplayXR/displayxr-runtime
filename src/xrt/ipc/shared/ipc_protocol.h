@@ -359,7 +359,7 @@ struct ipc_launcher_app
  *
  * @ingroup ipc
  */
-#define IPC_FILE_PICKER_PATH_MAX     512   //!< Wire-format max; tighter than XR_MAX_FILE_PICKER_PATH_LENGTH_EXT.
+#define IPC_FILE_PICKER_PATH_MAX     256   //!< Matches XR_MAX_FILE_PICKER_PATH_LENGTH_EXT. Sized so the encompassing IPC msg fits IPC_BUF_SIZE.
 #define IPC_FILE_PICKER_TITLE_MAX    128   //!< Wire-format title size.
 #define IPC_FILE_PICKER_FILTER_MAX   64    //!< Wire-format filter description / extensions size.
 #define IPC_FILE_PICKER_FILTERS_MAX  4     //!< Wire-format filter rows.

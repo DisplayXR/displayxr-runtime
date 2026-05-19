@@ -231,7 +231,7 @@ struct xrt_session_event_hardware_display_state_change
  * into `XrEventDataFilePickerCompleteEXT.path` on
  * receipt and pushes the OpenXR event to the requesting session.
  */
-#define XRT_FILE_PICKER_PATH_MAX_BYTES 512  // Matches IPC_FILE_PICKER_PATH_MAX.
+#define XRT_FILE_PICKER_PATH_MAX_BYTES 256  // Matches IPC_FILE_PICKER_PATH_MAX.
 struct xrt_session_event_file_picker_complete
 {
 	enum xrt_session_event_type type;
