@@ -26,6 +26,7 @@
 #include "util/u_misc.h"
 #include "util/u_system.h"
 #include "util/u_time.h"
+#include "util/u_wait.h"
 #include "os/os_time.h"
 
 #include "util/comp_layer_accum.h"
@@ -315,6 +316,11 @@ struct d3d11_service_compositor
 
 	//! Thread safety
 	std::mutex mutex;
+
+	//! Precise sleeper used by compositor_wait_frame to throttle unfocused /
+	//! hidden workspace clients (Hook B render-budget layer). Held by the
+	//! per-client wait_frame path only; not contended with the render thread.
+	struct os_precise_sleeper frame_sleeper;
 
 	//! Phase 1 diagnostic — last logged zero-copy decision per client.
 	//! Drives the one-shot `[ZC]` breadcrumb in compositor_layer_commit:
@@ -3635,6 +3641,10 @@ compositor_end_session(struct xrt_compositor *xc)
 	return XRT_SUCCESS;
 }
 
+// Forward declaration — helper defined below wait_frame.
+static int
+compositor_wait_frame_budget_multiplier(struct d3d11_service_compositor *c);
+
 static xrt_result_t
 compositor_predict_frame(struct xrt_compositor *xc,
                           int64_t *out_frame_id,
@@ -3666,12 +3676,90 @@ compositor_predict_frame(struct xrt_compositor *xc,
 	int64_t now_ns = static_cast<int64_t>(os_monotonic_get_ns());
 	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->sys->refresh_rate);
 
-	*out_predicted_display_time_ns = now_ns + period_ns * 2;
-	*out_predicted_display_period_ns = period_ns;
-	*out_wake_time_ns = now_ns;
+	// Hook B render-budget: the IPC path drives client xrWaitFrame via
+	// predict_frame's out_wake_time_ns (client waits client-side until that
+	// timestamp). Pushing wake_time into the future throttles the client
+	// without parking a server thread. Same multipliers as wait_frame.
+	int multiplier = compositor_wait_frame_budget_multiplier(c);
+	int64_t adjusted_period_ns = period_ns * multiplier;
+
+	*out_predicted_display_period_ns = adjusted_period_ns;
+	*out_predicted_display_time_ns = now_ns + adjusted_period_ns * 2;
+	*out_wake_time_ns = now_ns + period_ns * (multiplier - 1);
 	*out_predicted_gpu_time_ns = period_ns;
 
 	return XRT_SUCCESS;
+}
+
+// Hook B — workspace render-budget multiplier.
+//
+// In workspace mode, clients whose tiles are guaranteed-discarded (minimized
+// or fullscreen-hidden by another window's maximize) and clients that don't
+// have focus waste GPU+power rendering frames the user never sees. This helper
+// returns the multiplier we apply to the native frame period to throttle each
+// client's xrWaitFrame return cadence:
+//
+// TODO(render-budget #2): hidden clients are still doing the full
+// compositor_layer_commit atlas blit each (now ~1 Hz) frame — Hook A drops
+// the result, so the texture copy is wasted work on sys->context. Wrap the
+// per-eye blit block (the `CopySubresourceRegion` / `blit_to_atlas_texture`
+// calls inside the projection-layer loop, around lines 11460–11525) with a
+// `mc->clients[slot].fullscreen_minimized` gate to skip the copy. Keep the
+// fence-acknowledge + slot bookkeeping running so unmaximize wakes up with
+// a consistent (last-frame-stale) atlas; Hook A guarantees nobody samples
+// it while the gate holds. Measured ceiling for the win: ~17 atlas copies/s
+// across 3 hidden clients at 1 Hz throttle — modest, but free on top of
+// what's already shipped.
+//
+//   focused       → 1× (60 Hz native)
+//   unfocused     → 2× (~30 Hz floor — safe for animation/physics)
+//   minimized/hidden → 60× (~1 Hz — guaranteed-discarded; just enough heartbeat
+//                            to keep IPC + session alive)
+//
+// Standalone (non-workspace) clients always return 1.
+//
+// Kill switch: DISPLAYXR_WORKSPACE_FRAME_BUDGET=off disables throttling.
+//
+// Read of mc->clients[*] is intentionally unprotected — the values we care
+// about (active, compositor pointer, focused_slot, minimized) are single-word
+// fields and a torn read at worst applies last-frame's multiplier for one
+// wait_frame call. Taking sys->render_mutex here would contend with the
+// render thread on every client wait, defeating the savings.
+static int
+compositor_wait_frame_budget_multiplier(struct d3d11_service_compositor *c)
+{
+	static int budget_enabled = -1;
+	if (budget_enabled < 0) {
+		const char *e = getenv("DISPLAYXR_WORKSPACE_FRAME_BUDGET");
+		budget_enabled = (e != nullptr && (e[0] == 'o' || e[0] == 'O') &&
+		                  (e[1] == 'f' || e[1] == 'F'))
+		                     ? 0
+		                     : 1;
+	}
+	if (!budget_enabled) {
+		return 1;
+	}
+
+	struct d3d11_service_system *sys = c->sys;
+	if (!sys->workspace_mode || sys->multi_comp == nullptr) {
+		return 1;
+	}
+
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+		if (mc->clients[s].active && mc->clients[s].compositor == c) {
+			if (mc->clients[s].minimized) {
+				return 60;
+			}
+			if (mc->focused_slot != s) {
+				return 2;
+			}
+			return 1;
+		}
+	}
+	// Slot not yet registered (very first wait_frame before workspace
+	// connect lands) — run at native rate so registration isn't delayed.
+	return 1;
 }
 
 static xrt_result_t
@@ -3682,33 +3770,60 @@ compositor_wait_frame(struct xrt_compositor *xc,
 {
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 
-	std::lock_guard<std::mutex> lock(c->mutex);
+	int64_t now_ns = 0;
+	int64_t period_ns = 0;
+	int64_t adjusted_period_ns = 0;
+	int64_t wake_target_ns = 0;
+	bool need_wait = false;
 
-	// If window was closed, push exit request and return dummy frame data
-	if (c->window_closed) {
-		if (!c->exit_request_sent && c->xses != nullptr) {
-			union xrt_session_event xse = XRT_STRUCT_INIT;
-			xse.type = XRT_SESSION_EVENT_EXIT_REQUEST;
-			xrt_session_event_sink_push(c->xses, &xse);
-			c->exit_request_sent = true;
+	{
+		std::lock_guard<std::mutex> lock(c->mutex);
+
+		// If window was closed, push exit request and return dummy frame data
+		if (c->window_closed) {
+			if (!c->exit_request_sent && c->xses != nullptr) {
+				union xrt_session_event xse = XRT_STRUCT_INIT;
+				xse.type = XRT_SESSION_EVENT_EXIT_REQUEST;
+				xrt_session_event_sink_push(c->xses, &xse);
+				c->exit_request_sent = true;
+			}
+			c->frame_id++;
+			*out_frame_id = c->frame_id;
+			now_ns = static_cast<int64_t>(os_monotonic_get_ns());
+			period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->sys->refresh_rate);
+			*out_predicted_display_time_ns = now_ns + period_ns * 2;
+			*out_predicted_display_period_ns = period_ns;
+			return XRT_SUCCESS;
 		}
+
 		c->frame_id++;
 		*out_frame_id = c->frame_id;
-		int64_t now_ns = static_cast<int64_t>(os_monotonic_get_ns());
-		int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->sys->refresh_rate);
-		*out_predicted_display_time_ns = now_ns + period_ns * 2;
-		*out_predicted_display_period_ns = period_ns;
-		return XRT_SUCCESS;
+
+		now_ns = static_cast<int64_t>(os_monotonic_get_ns());
+		period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->sys->refresh_rate);
+
+		int multiplier = compositor_wait_frame_budget_multiplier(c);
+		adjusted_period_ns = period_ns * multiplier;
+
+		*out_predicted_display_time_ns = now_ns + adjusted_period_ns * 2;
+		*out_predicted_display_period_ns = adjusted_period_ns;
+
+		if (multiplier > 1) {
+			// Wait an extra (multiplier-1) periods past the next native
+			// vblank. Apps still see a sane predicted_display_period so
+			// their interpolation math stays consistent.
+			wake_target_ns = now_ns + period_ns * (multiplier - 1);
+			need_wait = true;
+		}
 	}
 
-	c->frame_id++;
-	*out_frame_id = c->frame_id;
-
-	int64_t now_ns = static_cast<int64_t>(os_monotonic_get_ns());
-	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->sys->refresh_rate);
-
-	*out_predicted_display_time_ns = now_ns + period_ns * 2;
-	*out_predicted_display_period_ns = period_ns;
+	// Drop the per-client mutex before sleeping. Worst-case ~150 ms when
+	// multiplier=10 on a 60Hz display — we must not block other RPCs from
+	// this client (it shouldn't issue any during wait_frame, but holding
+	// the lock through a long sleep is bad hygiene either way).
+	if (need_wait) {
+		u_wait_until(&c->frame_sleeper, static_cast<uint64_t>(wake_target_ns));
+	}
 
 	return XRT_SUCCESS;
 }
@@ -12137,6 +12252,8 @@ compositor_destroy(struct xrt_compositor *xc)
 		c->workspace_sync_fence.reset();
 	}
 
+	os_precise_sleeper_deinit(&c->frame_sleeper);
+
 	delete c;
 }
 
@@ -12241,6 +12358,9 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	c->exit_request_sent = false;
 	c->window_closed_frame_count = 0;
 	c->is_bridge_relay = false;
+
+	// Hook B render-budget: per-client precise sleeper for wait_frame throttle.
+	os_precise_sleeper_init(&c->frame_sleeper);
 
 	// Initialize layer accumulator
 	std::memset(&c->layer_accum, 0, sizeof(c->layer_accum));
