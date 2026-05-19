@@ -1061,6 +1061,13 @@ service_orchestrator_get_workspace_pid(void)
 	return 0;
 }
 
+bool
+service_orchestrator_get_workspace_supports_file_dialog(void)
+{
+	return s_workspace_available &&
+	       (s_workspace_active.capabilities & WORKSPACE_CAPABILITY_FILE_DIALOG) != 0;
+}
+
 void
 service_orchestrator_apply_config(const struct service_config *cfg)
 {
@@ -1202,6 +1209,12 @@ unsigned long
 service_orchestrator_get_workspace_pid(void)
 {
 	return 0;
+}
+
+bool
+service_orchestrator_get_workspace_supports_file_dialog(void)
+{
+	return false;
 }
 
 #endif // XRT_OS_WINDOWS

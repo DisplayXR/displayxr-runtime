@@ -69,6 +69,20 @@ get_orchestrator_workspace_pid(void)
 	return s_workspace_pid_provider ? s_workspace_pid_provider() : 0;
 }
 
+static ipc_server_workspace_supports_file_dialog_fn s_workspace_file_dialog_provider = NULL;
+
+void
+ipc_server_set_workspace_supports_file_dialog_provider(ipc_server_workspace_supports_file_dialog_fn fn)
+{
+	s_workspace_file_dialog_provider = fn;
+}
+
+static bool
+orchestrator_workspace_supports_file_dialog(void)
+{
+	return s_workspace_file_dialog_provider ? s_workspace_file_dialog_provider() : false;
+}
+
 
 /*
  *
@@ -964,6 +978,15 @@ ipc_handle_session_request_file_picker(volatile struct ipc_client_state *ics,
 		// compositor) — there's no controller to forward to. Surface
 		// as IPC failure so the OXR layer can return the fallback
 		// result code to the app.
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (!orchestrator_workspace_supports_file_dialog()) {
+		// Controller is registered but did not advertise
+		// `SupportsFileDialog = 1`. Queuing the event would
+		// strand it on the drain channel forever; surface as
+		// failure so the OXR layer returns
+		// XR_FILE_PICKER_FALLBACK_TIER0_EXT and the app falls
+		// back to a flat OS dialog (Tier 0 hook handles z/focus).
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	return comp_d3d11_service_workspace_post_file_picker_request(s->xsysc, slot, info, out_request_id);

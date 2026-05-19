@@ -133,6 +133,12 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	// controller we spawned may transition the runtime into workspace mode.
 	ipc_server_set_workspace_pid_provider(service_orchestrator_get_workspace_pid);
 
+	// Same plumbing for the file-dialog capability bit so the IPC server can
+	// short-circuit `session_request_file_picker` when the active controller
+	// did not opt in to Tier 1 — apps then fall back to a flat OS dialog.
+	ipc_server_set_workspace_supports_file_dialog_provider(
+	    service_orchestrator_get_workspace_supports_file_dialog);
+
 	u_trace_marker_init();
 	u_metrics_init();
 

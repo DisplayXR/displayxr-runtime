@@ -572,6 +572,24 @@ typedef unsigned long (*ipc_server_workspace_pid_provider_fn)(void);
 void
 ipc_server_set_workspace_pid_provider(ipc_server_workspace_pid_provider_fn fn);
 
+/*!
+ * Function pointer the IPC server calls to learn whether the active
+ * workspace controller advertises Tier 1 file-dialog support (registry
+ * value `SupportsFileDialog = REG_DWORD 1` under its registration).
+ * Returns false if no orchestrator-managed workspace is running or
+ * the controller did not opt in. Drives the early fallback in
+ * `xrRequestFilePickerEXT` — without it, requests would queue for a
+ * controller that has no handler.
+ */
+typedef bool (*ipc_server_workspace_supports_file_dialog_fn)(void);
+
+/*!
+ * Register the file-dialog-capability provider. Same lifetime model
+ * as `ipc_server_set_workspace_pid_provider`. Pass NULL to clear.
+ */
+void
+ipc_server_set_workspace_supports_file_dialog_provider(ipc_server_workspace_supports_file_dialog_fn fn);
+
 /*
  *
  * Helpers

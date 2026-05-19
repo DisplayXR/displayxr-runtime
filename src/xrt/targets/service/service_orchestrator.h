@@ -118,6 +118,18 @@ service_orchestrator_dispatch_controller_action(const char *action_name);
 unsigned long
 service_orchestrator_get_workspace_pid(void);
 
+/*!
+ * Whether the active workspace controller advertises Tier 1 file-dialog
+ * support (registry value `SupportsFileDialog = REG_DWORD 1` under its
+ * `HKLM\Software\DisplayXR\WorkspaceControllers\<id>` key). Used by the
+ * IPC server to gate `session_request_file_picker` dispatch so apps
+ * fall back to a flat OS dialog when the controller has no picker.
+ *
+ * Returns false on non-Windows or when no controller is registered.
+ */
+bool
+service_orchestrator_get_workspace_supports_file_dialog(void);
+
 #ifdef __cplusplus
 }
 #endif
