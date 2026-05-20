@@ -4960,7 +4960,7 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
  */
 static void
 capture_render_thread_func(struct d3d11_service_system *sys)
-{
+try {
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
 	while (mc && mc->capture_render_running.load()) {
 		// Wait up to 14ms (~70fps). render_wakeup_event can be signaled
@@ -5002,6 +5002,17 @@ capture_render_thread_func(struct d3d11_service_system *sys)
 
 		emit_render_diag_if_window_elapsed(sys);
 	}
+} catch (std::exception const &e) {
+	// Defense-in-depth (runtime#248). The render thread runs in a
+	// std::thread; any uncaught C++ exception escaping this function
+	// triggers std::terminate() and silently kills the whole service.
+	// The known culprit was the SR SDK's eye-tracker throwing
+	// std::runtime_error through unguarded callers — now patched at the
+	// SDK call site — but keep this outer guard so any *future* stray
+	// throw downgrades a process kill to a logged graceful thread stop.
+	U_LOG_E("capture_render_thread_func: uncaught std::exception: %s — render thread dying gracefully", e.what());
+} catch (...) {
+	U_LOG_E("capture_render_thread_func: uncaught non-std exception — render thread dying gracefully");
 }
 
 /*!

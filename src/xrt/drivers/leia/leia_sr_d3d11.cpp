@@ -384,9 +384,21 @@ leiasr_d3d11_get_predicted_eye_positions(struct leiasr_d3d11 *leiasr,
 		return false;
 	}
 
-	// Get positions in millimeters from weaver
+	// Get positions in millimeters from weaver. The SR SDK's
+	// PredictingEyeTracker::predict throws std::runtime_error as routine
+	// control flow when no eye-tracking data is available — ~5×/frame at
+	// 60Hz during normal operation. The SDK normally catches its own
+	// throws one frame up; if one ever escapes (cold-start state, init
+	// race, future SDK version), the unguarded callers above will let it
+	// unwind through capture_render_thread_func → std::thread entry →
+	// std::terminate() and silently kill the service (runtime#248).
+	// Catch here so the throw never leaves our code.
 	float left_mm[3], right_mm[3];
-	leiasr->weaver->getPredictedEyePositions(left_mm, right_mm);
+	try {
+		leiasr->weaver->getPredictedEyePositions(left_mm, right_mm);
+	} catch (...) {
+		return false;
+	}
 
 	// Convert to meters
 	out_left_eye[0] = left_mm[0] / 1000.0f;
