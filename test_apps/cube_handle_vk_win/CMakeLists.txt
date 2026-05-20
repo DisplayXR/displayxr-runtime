@@ -128,10 +128,12 @@ if(TEXTURE_FILES)
     )
 endif()
 
-# SimulatedRealityVulkanBeta.dll: shipped with the runtime
-# (`Program Files\DisplayXR\Runtime\` post-install — added to system
-# PATH by the runtime installer; dev `_package/bin/` is added to
-# PATH by `_package/run_*.bat`). Apps no longer bundle a per-app copy.
+# SimulatedRealityVulkanBeta.dll: shipped with the runtime under
+# `Program Files\DisplayXR\Runtime\` post-install. Resolved by
+# DisplayXRClient.dll's delay-load notify hook (target_dll_init.c),
+# which loads it from the runtime's own install dir at first use.
+# Dev iteration: `_package/bin/` is added to PATH by `_package/run_*.bat`.
+# Apps don't bundle a per-app copy.
 
 # DisplayXR shell manifest sidecar
 include(${CMAKE_CURRENT_SOURCE_DIR}/../common/displayxr_manifest.cmake)

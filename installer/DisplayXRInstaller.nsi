@@ -662,16 +662,26 @@ Section "DisplayXR Runtime" SecRuntime
 	; SetRegView; explicit no-op kept for clarity).
 	WriteRegStr HKLM "Software\Khronos\OpenXR\1" "ActiveRuntime" "$INSTDIR\DisplayXR_win64.json"
 
-	; PATH is intentionally not modified. DisplayXRClient.dll has no static
-	; DLL imports that live in $INSTDIR — cjson is compiled in from bundled
-	; source, SDL2 is disabled in the production build, and pthreads is
-	; statically linked via the vcpkg overlay triplet at
-	; cmake/vcpkg-overlay-triplets/x64-windows.cmake. The only DLL co-located
-	; in $INSTDIR (SimulatedRealityVulkanBeta.dll) is /DELAYLOAD'd and only
-	; reached by the Vulkan compositor path, which is loaded via LoadLibrary
-	; from the service exe's own directory (already on the default search path).
-	; The uninstaller still runs un.RemoveFromPath to clean up entries written
-	; by older installer versions.
+	; PATH is intentionally not modified. DisplayXRClient.dll's third-party
+	; transitive deps that previously *required* $INSTDIR on PATH are gone:
+	; cjson is compiled in from bundled source, SDL2 is disabled in the
+	; production build, and pthreads is statically linked via the vcpkg
+	; overlay triplet at cmake/vcpkg-overlay-triplets/x64-windows.cmake.
+	;
+	; $INSTDIR still receives other files via the wildcard at the File line
+	; above (openxr_loader.dll, the five static-imported SimulatedReality*.dll
+	; shipped by drv_leia's import-lib link, etc.), but none of those need
+	; PATH to resolve:
+	;  - SimulatedReality{Core,Displays,FaceTrackers,DirectX,OpenGL}.dll are
+	;    also installed by the Leia SR Platform (a hard prereq of drv_leia),
+	;    which adds its own dir to system PATH independently — static imports
+	;    resolve through that.
+	;  - SimulatedRealityVulkanBeta.dll is /DELAYLOAD'd and resolved by
+	;    DisplayXRClient.dll's __pfnDliNotifyHook2 (target_dll_init.c), which
+	;    LoadLibraryEx's it from this $INSTDIR at first use.
+	;
+	; The uninstaller still runs un.RemoveFromPath to clean up entries
+	; written by older installer versions.
 
 	; Enable D3D11 native compositor by default
 	; This bypasses Vulkan and avoids D3D11<->Vulkan interop issues on Intel GPUs
