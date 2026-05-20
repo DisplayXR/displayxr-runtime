@@ -662,11 +662,16 @@ Section "DisplayXR Runtime" SecRuntime
 	; SetRegView; explicit no-op kept for clarity).
 	WriteRegStr HKLM "Software\Khronos\OpenXR\1" "ActiveRuntime" "$INSTDIR\DisplayXR_win64.json"
 
-	; Add install directory to system PATH
-	; This is needed so OpenXR apps can find DisplayXRClient.dll's dependencies
-	; (vulkan-1.dll, SDL2.dll, etc.) when loading the runtime
-	Push $INSTDIR
-	Call AddToPath
+	; PATH is intentionally not modified. DisplayXRClient.dll has no static
+	; DLL imports that live in $INSTDIR — cjson is compiled in from bundled
+	; source, SDL2 is disabled in the production build, and pthreads is
+	; statically linked via the vcpkg overlay triplet at
+	; cmake/vcpkg-overlay-triplets/x64-windows.cmake. The only DLL co-located
+	; in $INSTDIR (SimulatedRealityVulkanBeta.dll) is /DELAYLOAD'd and only
+	; reached by the Vulkan compositor path, which is loaded via LoadLibrary
+	; from the service exe's own directory (already on the default search path).
+	; The uninstaller still runs un.RemoveFromPath to clean up entries written
+	; by older installer versions.
 
 	; Enable D3D11 native compositor by default
 	; This bypasses Vulkan and avoids D3D11<->Vulkan interop issues on Intel GPUs

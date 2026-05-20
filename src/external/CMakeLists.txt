@@ -24,6 +24,16 @@ target_include_directories(
 add_library(xrt-external-cjson INTERFACE)
 if(XRT_HAVE_SYSTEM_CJSON)
 	target_link_libraries(xrt-external-cjson INTERFACE cJSON::cJSON)
+elseif(TARGET displayxr_mcp_vendored_cjson)
+	# Reuse the static cJSON lib already compiled by the displayxr_mcp
+	# FetchContent module. Linking the same static lib from both aux_util
+	# and displayxr_mcp::mcp gives the linker a single definition of every
+	# cJSON_* symbol, where compiling cJSON.c into u_json.c (via the
+	# bundled-source path below) would collide with the MCP copy.
+	target_link_libraries(
+		xrt-external-cjson INTERFACE displayxr_mcp_vendored_cjson
+		)
+	target_compile_definitions(xrt-external-cjson INTERFACE XRT_HAVE_LINKED_CJSON)
 else()
 	target_include_directories(
 		xrt-external-cjson SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/cjson

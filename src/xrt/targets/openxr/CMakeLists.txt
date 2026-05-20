@@ -20,6 +20,10 @@ add_library(${RUNTIME_TARGET} MODULE target.c libopenxr.def)
 if(WIN32)
 	set_target_properties(${RUNTIME_TARGET} PROPERTIES OUTPUT_NAME "DisplayXRClient")
 
+	# DllMain + delay-load notification hook: resolves /DELAYLOAD'd DLLs
+	# from the runtime's install dir without requiring $INSTDIR on PATH.
+	target_sources(${RUNTIME_TARGET} PRIVATE target_dll_init.c)
+
 	# Delay-load Vulkan and SR Vulkan DLLs so the runtime can load on systems
 	# where these are absent. The D3D11 native compositor path never calls into
 	# Vulkan weaver functions, so the delay-loaded DLLs are never triggered.

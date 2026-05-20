@@ -11,14 +11,12 @@
             "name": "pthreads",
             "platform": "windows"
         },
-        "cjson",
         "eigen3",
         "glslang",
         "vulkan"
     ],
     "default-features": [
-        "usb",
-        "gui"
+        "usb"
     ],
     "features": {
         "usb": {
