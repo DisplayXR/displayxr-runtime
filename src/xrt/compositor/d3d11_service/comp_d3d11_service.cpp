@@ -4477,16 +4477,28 @@ multi_compositor_update_input_forward(struct d3d11_multi_compositor *mc)
 		is_capture = (mc->clients[mc->focused_slot].client_type == CLIENT_TYPE_CAPTURE);
 	}
 
-	// Inset the forwarding rect by the resize zone width so clicks
-	// on the window edge (for resize) don't get forwarded to the app.
-	// UI_RESIZE_ZONE_M = 0.003m ≈ 17px on a 1920-wide tile. Use 20 for margin.
-	int32_t inset = 20;
-	if (rw > 2 * inset && rh > 2 * inset && !is_capture) {
-		rx += inset;
-		ry += inset;
-		rw -= 2 * inset;
-		rh -= 2 * inset;
-	}
+	// Forwarding-rect inset: HISTORICALLY 20 px to keep edge-of-tile
+	// clicks off the app (treated as resize-handle area instead).
+	// PROBLEM: the inset is subtracted from rel_x/y BEFORE scaling to
+	// HWND coords downstream (comp_d3d11_window.cpp:~828):
+	//   rel_x = workspace_x - rx_inset
+	//   app_x = rel_x * HWND_w / tile_w_inset
+	// That shift consistently pushes mapped HWND coords toward the
+	// HWND centre by ~inset px — so app UI rendered near the top-
+	// left or bottom-right of the tile becomes unreachable. Clicks
+	// that visually land ON the UI map to HWND coords ~20 px
+	// LEFT/UP of where the UI was rendered, missing the hit-test.
+	// The gauss demo's "Open…" button (#228 Tier 1 integration
+	// testing) was bitten by this on every tile size.
+	//
+	// FIX: edge-resize detection runs INDEPENDENTLY via
+	// workspace_raycast_hit_test → hit.edge_flags (see line ~7150
+	// where mc->resize.active gets set), so the inset here was
+	// vestigial. Setting it to 0 lets every cursor position inside
+	// the tile forward at the correct HWND coord. Resize-handle
+	// behaviour is unchanged because that path doesn't depend on
+	// this inset.
+	(void)is_capture; // (kept for the capture-path branch below)
 
 	comp_d3d11_window_set_input_forward(mc->window, (void *)target, rx, ry, rw, rh, is_capture);
 
@@ -7374,7 +7386,13 @@ after_key_shortcuts:
 						// slot has a modal open — same reason as the capture
 						// path above.
 						HWND target = mc->clients[hit_slot].app_hwnd;
-						const int32_t inset = 20;
+						// Inset = 0: see the rationale in
+						// multi_compositor_update_input_forward.
+						// Resize-edge hit-test is independent
+						// (workspace_raycast_hit_test.edge_flags),
+						// so keeping app coords aligned with the
+						// rendered content is the right trade.
+						const int32_t inset = 0;
 						int32_t rx = (int32_t)mc->clients[hit_slot].window_rect_x + inset;
 						int32_t ry = (int32_t)mc->clients[hit_slot].window_rect_y + inset;
 						int32_t rw = (int32_t)mc->clients[hit_slot].window_rect_w - 2 * inset;
@@ -13788,6 +13806,18 @@ comp_d3d11_service_set_client_window_pose(struct xrt_system_compositor *xsysc,
 	        mc->clients[slot].window_rect_x, mc->clients[slot].window_rect_y,
 	        mc->clients[slot].window_rect_w, mc->clients[slot].window_rect_h);
 
+	// Refresh the WindowProc's forwarding rect so the new pose's pixel
+	// rect is used to decide which clicks reach the app. Without this
+	// the forwarding rect goes stale at whatever the rect was at first
+	// register_client (or last layout-preset animation tick) — clicks
+	// on the now-larger / moved tile fall outside the stale rect and
+	// are silently dropped. Only matters for the focused slot, but
+	// recompute always since the call is cheap and the result is
+	// idempotent for non-focused slots.
+	if (slot == mc->focused_slot) {
+		multi_compositor_update_input_forward(mc);
+	}
+
 	return true;
 }
 
@@ -14749,6 +14779,18 @@ comp_d3d11_service_set_focused_slot(struct xrt_system_compositor *xsysc, int slo
 	} else {
 		mc->focused_slot = slot;
 	}
+
+	// Re-evaluate the WindowProc forwarding target so the freshly-
+	// focused slot's HWND becomes the new fwd HWND. Without this the
+	// fwd HWND stays at whatever the prior focused slot was (often a
+	// closed picker / dialog → a now-dead HWND that PostMessage
+	// silently swallows), so the user has to trigger another route
+	// (Ctrl+1 layout preset, mouse drag, etc.) before clicks reach
+	// the new focused app. Surfaced by #228 spatial picker dismissal
+	// returning focus to the requester (gauss demo) — without this
+	// refresh the gauss received no mouse input until a layout
+	// preset reset the fwd state.
+	multi_compositor_update_input_forward(mc);
 }
 
 extern "C" void
