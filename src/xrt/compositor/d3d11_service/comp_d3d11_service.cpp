@@ -1166,16 +1166,6 @@ struct d3d11_multi_compositor
 		float start_pos_y;   //!< Window pose.position.y at drag start (meters)
 	} drag;
 
-	//! Left-click title bar drag state (parallel to right-click drag).
-	struct
-	{
-		bool active;
-		int32_t slot;
-		POINT start_cursor;
-		float start_pos_x;
-		float start_pos_y;
-	} title_drag;
-
 	//! Edge/corner resize state (left-click-drag on window border).
 	struct
 	{
@@ -7013,8 +7003,6 @@ after_key_shortcuts:
 				cursor_id = 1; // sizewe
 			else if (e & (RESIZE_TOP | RESIZE_BOTTOM))
 				cursor_id = 2; // sizens
-		} else if (mc->title_drag.active) {
-			cursor_id = 5; // sizeall (move during title drag)
 		} else {
 			struct workspace_hit_result &hover = cursor_hover;
 
@@ -7118,7 +7106,7 @@ after_key_shortcuts:
 		bool lmb_just_pressed = lmb_held && !mc->prev_lmb_held;
 		mc->prev_lmb_held = lmb_held;
 
-		if (lmb_just_pressed && !mc->title_drag.active && !mc->resize.active) {
+		if (lmb_just_pressed && !mc->resize.active) {
 			POINT pt;
 			GetCursorPos(&pt);
 			ScreenToClient(mc->hwnd, &pt);
@@ -7245,44 +7233,15 @@ after_key_shortcuts:
 				if (is_double_click) {
 					toggle_fullscreen(sys, mc, hit_slot);
 				} else {
-					// Single click on title bar: focus + maybe start dragging.
-					// Phase 2.K: when a workspace controller has taken pointer
-					// capture, the runtime cedes drag policy to it (carousel
-					// rotation, custom drag affordances, etc.). Without this
-					// gate the runtime's title-bar drag fights the
-					// controller's set_pose every frame.
+					// Single click on title bar — focus the window. Drag
+					// is the workspace controller's job (ADR-018 / PR 2 of
+					// the runtime→controller migration). The controller
+					// observes the POINTER event, calls
+					// xrEnableWorkspacePointerCaptureEXT, snapshots pose
+					// via xrGetWorkspaceClientWindowPoseEXT, and drives
+					// per-frame xrSetWorkspaceClientWindowPoseEXT.
 					mc->focused_slot = hit_slot;
 					multi_compositor_update_input_forward(mc);
-
-					bool ctrl_owns_drag = (mc->window != nullptr) &&
-					                      comp_d3d11_window_is_workspace_pointer_capture_enabled(mc->window);
-					// Drag starts on any title-bar / chrome-quad click that
-					// ISN'T a close/min/max button. Includes the legacy in-
-					// runtime grip-dot hit AND controller-owned chrome quad
-					// hits. Lets the user click + drag from anywhere on the
-					// chrome pill in a single motion (typical OS title-bar
-					// behaviour) rather than requiring a second click on
-					// the grip dots after the first focuses the window.
-					// Region-id convention matches SHELL_CHROME_REGION_*:
-					// 2 = close, 3 = minimize, 4 = maximize.
-					bool on_chrome_button =
-					    (hit.chrome_region_id == 2 ||
-					     hit.chrome_region_id == 3 ||
-					     hit.chrome_region_id == 4);
-					bool drag_initiator =
-					    hit.in_grip_handle ||
-					    (hit.in_chrome_quad && !on_chrome_button);
-					if (!ctrl_owns_drag && drag_initiator) {
-						mc->title_drag.active = true;
-						mc->title_drag.slot = hit_slot;
-						// Suppress input forwarding during drag
-						if (mc->window != nullptr)
-							comp_d3d11_window_set_input_suppress(mc->window, true);
-						GetCursorPos(&mc->title_drag.start_cursor);
-						ScreenToClient(mc->hwnd, &mc->title_drag.start_cursor);
-						mc->title_drag.start_pos_x = mc->clients[hit_slot].window_pose.position.x;
-						mc->title_drag.start_pos_y = mc->clients[hit_slot].window_pose.position.y;
-					}
 				}
 			} else {
 				// Content area click or taskbar click
@@ -7521,50 +7480,6 @@ after_key_shortcuts:
 			{ POINT p; GetCursorPos(&p); SetCursorPos(p.x, p.y); }
 			// Restore mouse forwarding after resize
 			multi_compositor_update_input_forward(mc);
-		} else if (lmb_held && mc->title_drag.active) {
-			// Title bar dragging — update window position
-			POINT pt;
-			GetCursorPos(&pt);
-			ScreenToClient(mc->hwnd, &pt);
-
-			int s = mc->title_drag.slot;
-			if (s >= 0 && s < D3D11_MULTI_MAX_CLIENTS && mc->clients[s].active) {
-				float disp_w_m = sys->base.info.display_width_m;
-				float disp_h_m = sys->base.info.display_height_m;
-				uint32_t disp_px_w = sys->base.info.display_pixel_width;
-				uint32_t disp_px_h = sys->base.info.display_pixel_height;
-				if (disp_px_w > 0 && disp_px_h > 0 && disp_w_m > 0.0f && disp_h_m > 0.0f) {
-					float dx_px = (float)(pt.x - mc->title_drag.start_cursor.x);
-					float dy_px = (float)(pt.y - mc->title_drag.start_cursor.y);
-					float m_per_px_x = disp_w_m / (float)disp_px_w;
-					float m_per_px_y = disp_h_m / (float)disp_px_h;
-
-					mc->clients[s].window_pose.position.x = mc->title_drag.start_pos_x + dx_px * m_per_px_x;
-					mc->clients[s].window_pose.position.y = mc->title_drag.start_pos_y - dy_px * m_per_px_y;
-
-					slot_pose_to_pixel_rect(sys, &mc->clients[s],
-					                        &mc->clients[s].window_rect_x,
-					                        &mc->clients[s].window_rect_y,
-					                        &mc->clients[s].window_rect_w,
-					                        &mc->clients[s].window_rect_h);
-
-					if (s == mc->focused_slot) {
-						multi_compositor_update_input_forward(mc);
-					}
-				}
-			}
-		} else if (!lmb_held && mc->title_drag.active) {
-			// LMB released — end title drag.
-			mc->title_drag.active = false;
-			mc->title_drag.slot = -1;
-			// Resume input forwarding after drag
-			if (mc->window != nullptr)
-				comp_d3d11_window_set_input_suppress(mc->window, false);
-			{
-				POINT p;
-				GetCursorPos(&p);
-				SetCursorPos(p.x, p.y);
-			}
 		}
 	}
 	after_lmb_handling:
@@ -15554,7 +15469,6 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 		// Reset drag/focus state
 		mc->focused_slot = -1;
 		mc->drag.active = false;
-		mc->title_drag.active = false;
 		mc->resize.active = false;
 
 		// Set request flag for render thread to exit. Don't join here —
