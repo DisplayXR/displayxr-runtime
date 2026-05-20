@@ -113,6 +113,21 @@ struct xrt_hmd_parts
 
 	size_t view_count;
 
+	/*!
+	 * Per-view eye-box offsets in display-local space (origin = display
+	 * center, +X right, +Y up, +Z toward viewer). Drivers populate
+	 * @ref view_count entries (or up to XRT_MAX_VIEWS for max-across-modes).
+	 *
+	 * State tracker reads these in @ref oxr_session_locate_views to derive
+	 * per-tile viewer positions for modes whose @ref xrt_rendering_mode::view_count
+	 * exceeds the eye-tracker's count (typically 2). Each entry encodes the
+	 * "tile's role in the mode's optical layout" — e.g. 4-view quad has
+	 * 4 distinct positions across the eye-box, lenticular has N.
+	 *
+	 * For 2-view stereo modes, only entries 0 and 1 are referenced.
+	 */
+	struct xrt_vec3 view_eye_offsets[XRT_MAX_VIEWS];
+
 	//! Currently active rendering mode index
 	uint32_t active_rendering_mode_index;
 

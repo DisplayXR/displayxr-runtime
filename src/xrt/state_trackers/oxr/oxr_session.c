@@ -1343,6 +1343,23 @@ oxr_session_locate_views(struct oxr_logger *log,
 				const struct xrt_system_compositor_info *si = &sess->sys->xsysc->info;
 				struct xrt_vec3 nominal = {0, si->nominal_viewer_y_m, si->nominal_viewer_z_m};
 				struct xrt_vec3 raw_eyes[XRT_MAX_VIEWS];
+
+				// Extend adj_eyes[] to active_view_count when the tile mode wants more
+				// views than the tracker provides (e.g. Quad mode = 4 views, tracker = 2).
+				// Each synthesized eye = tracked-eye-0 + (per-view-offset[ei] - per-view-offset[0])
+				// — i.e. apply the tile's role in the mode's optical layout to the tracked
+				// reference eye. Entries [0, eye_count) stay as-is to preserve tracker IPD.
+				if (xdev->hmd != NULL && active_view_count > eye_count &&
+				    active_view_count <= XRT_MAX_VIEWS) {
+					const struct xrt_vec3 *off = xdev->hmd->view_eye_offsets;
+					for (uint32_t ei = eye_count; ei < active_view_count; ei++) {
+						adj_eyes[ei].x = adj_eyes[0].x + (off[ei].x - off[0].x);
+						adj_eyes[ei].y = adj_eyes[0].y + (off[ei].y - off[0].y);
+						adj_eyes[ei].z = adj_eyes[0].z + (off[ei].z - off[0].z);
+					}
+					eye_count = active_view_count;
+				}
+
 				for (uint32_t ei = 0; ei < eye_count; ei++) {
 					// Transform eye to window-local frame:
 					// 1. Subtract window position (eye relative to window center)
@@ -1448,11 +1465,15 @@ oxr_session_locate_views(struct oxr_logger *log,
 	}
 
 	// Always get view poses from device (provides T_xdev_head and poses[])
-	// Save Kooima fovs before xrt_device_get_view_poses overwrites them
+	// Save Kooima fovs before xrt_device_get_view_poses overwrites them.
+	// Save/restore is bounded by active_view_count: Kooima only populated
+	// fovs[0..active_view_count-1] (see #246). Entries beyond active are
+	// filled by the device's get_view_poses and must not be overwritten.
 	{
 		struct xrt_fov kooima_fovs[XRT_MAX_VIEWS];
+		uint32_t fov_save_count = (active_view_count < view_count) ? active_view_count : view_count;
 		if (have_kooima_fov && have_view_state) {
-			for (uint32_t ei = 0; ei < view_count; ei++) {
+			for (uint32_t ei = 0; ei < fov_save_count; ei++) {
 				kooima_fovs[ei] = fovs[ei];
 			}
 		}
@@ -1472,7 +1493,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 		// computes 3D-adjusted Kooima FOVs and returns them via
 		// get_view_poses — don't override those.
 		if (have_kooima_fov && have_view_state) {
-			for (uint32_t ei = 0; ei < view_count; ei++) {
+			for (uint32_t ei = 0; ei < fov_save_count; ei++) {
 				fovs[ei] = kooima_fovs[ei];
 			}
 		}
@@ -1703,6 +1724,16 @@ oxr_session_locate_views(struct oxr_logger *log,
 		} else {
 			viewState->viewStateFlags &= xrt_to_view_state_flags(result.relation_flags);
 		}
+	}
+
+	// Inactive views (active_view_count < view_count): duplicate view 0.
+	// `view_count` is max-across-modes so the array shape is stable across
+	// the session, but only `active_view_count` views are "live" in the
+	// current rendering mode. Apps that care read `active_view_count`
+	// from XR_EXT_display_info. See #246.
+	for (uint32_t i = active_view_count; i < view_count; i++) {
+		views[i].pose = views[0].pose;
+		views[i].fov = views[0].fov;
 	}
 
 #ifdef OXR_HAVE_EXT_display_info

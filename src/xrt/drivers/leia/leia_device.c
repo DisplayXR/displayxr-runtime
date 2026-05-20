@@ -237,8 +237,21 @@ leia_hmd_create(void)
 	info.display.h_pixels = pixel_h;
 	info.display.w_meters = display_w_m;
 	info.display.h_meters = display_h_m;
-	info.lens_horizontal_separation_meters = 0.063f; // ~63mm IPD
+	const float leia_ipd_m = 0.063f; // ~63mm IPD
+	info.lens_horizontal_separation_meters = leia_ipd_m;
 	info.lens_vertical_position_meters = display_h_m / 2.0f;
+
+	// Per-view eye-box offsets (display-local space). Leia is currently
+	// stereo (view_count=2); future N-view lenticular modes can extend this
+	// via the SR SDK lookaround filter — see #246 Phase 4.
+	{
+		const float half_ipd = leia_ipd_m / 2.0f;
+		hmd->base.hmd->view_eye_offsets[0] = (struct xrt_vec3){-half_ipd, 0.0f, nominal_z};
+		hmd->base.hmd->view_eye_offsets[1] = (struct xrt_vec3){ half_ipd, 0.0f, nominal_z};
+		for (uint32_t v = 2; v < XRT_MAX_VIEWS; v++) {
+			hmd->base.hmd->view_eye_offsets[v] = (struct xrt_vec3){0.0f, 0.0f, nominal_z};
+		}
+	}
 
 	// Compute FOV from display geometry and viewing distance.
 	float half_fov_h = atanf((display_w_m / 2.0f) / nominal_z);

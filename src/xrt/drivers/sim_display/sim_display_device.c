@@ -172,9 +172,6 @@ struct sim_display_hmd
 	//! scroll-wheel zoom support.
 	float zoom_scale;
 
-	//! Per-view eye position offsets for Kooima FOV computation.
-	struct xrt_vec3 view_eye_offsets[8]; // XRT_MAX_VIEWS
-
 	enum u_logging_level log_level;
 };
 
@@ -278,9 +275,9 @@ sim_display_get_view_poses(struct xrt_device *xdev,
 	for (uint32_t i = 0; i < view_count && i < ARRAY_SIZE(xdev->hmd->views); i++) {
 		out_poses[i].orientation = (struct xrt_quat){0, 0, 0, 1};
 		// View offset relative to head center
-		out_poses[i].position.x = hmd->view_eye_offsets[i].x;
-		out_poses[i].position.y = hmd->view_eye_offsets[i].y - hmd->pose.position.y;
-		out_poses[i].position.z = hmd->view_eye_offsets[i].z - hmd->pose.position.z;
+		out_poses[i].position.x = xdev->hmd->view_eye_offsets[i].x;
+		out_poses[i].position.y = xdev->hmd->view_eye_offsets[i].y - hmd->pose.position.y;
+		out_poses[i].position.z = xdev->hmd->view_eye_offsets[i].z - hmd->pose.position.z;
 	}
 
 	// Kooima projection: recompute FOV each frame from tracked eye position.
@@ -634,18 +631,21 @@ sim_display_hmd_create(void)
 		sim_display_set_view_count(hmd->base.rendering_modes[default_mode].view_count);
 	}
 
-	// Initialize per-view eye offsets based on max view_count
+	// Initialize per-view eye offsets based on max view_count.
+	// Stored on xrt_hmd_parts so the state tracker can read them generically
+	// to synthesize per-tile viewer positions for Quad/N-view modes.
 	{
 		float half_ipd = ipd / 2.0f;
+		struct xrt_vec3 *off = hmd->base.hmd->view_eye_offsets;
 		// Views 0-1: standard stereo layout
-		hmd->view_eye_offsets[0] = (struct xrt_vec3){-half_ipd, eye_y, eye_z};
-		hmd->view_eye_offsets[1] = (struct xrt_vec3){ half_ipd, eye_y, eye_z};
+		off[0] = (struct xrt_vec3){-half_ipd, eye_y, eye_z};
+		off[1] = (struct xrt_vec3){ half_ipd, eye_y, eye_z};
 		// Views 2-3: quad mode upper row (offset Y positions)
-		hmd->view_eye_offsets[2] = (struct xrt_vec3){-half_ipd, eye_y + ipd, eye_z};
-		hmd->view_eye_offsets[3] = (struct xrt_vec3){ half_ipd, eye_y + ipd, eye_z};
+		off[2] = (struct xrt_vec3){-half_ipd, eye_y + ipd, eye_z};
+		off[3] = (struct xrt_vec3){ half_ipd, eye_y + ipd, eye_z};
 		// Pad remaining with center position
-		for (uint32_t v = 4; v < 8; v++) {
-			hmd->view_eye_offsets[v] = (struct xrt_vec3){0, eye_y, eye_z};
+		for (uint32_t v = 4; v < XRT_MAX_VIEWS; v++) {
+			off[v] = (struct xrt_vec3){0, eye_y, eye_z};
 		}
 	}
 
@@ -687,9 +687,9 @@ sim_display_hmd_create(void)
 		const float half_h = display_h_m / 2.0f;
 
 		for (uint32_t i = 0; i < hmd->base.hmd->view_count; i++) {
-			float eye_x = hmd->view_eye_offsets[i].x;
-			float eye_y_fov = hmd->view_eye_offsets[i].y;
-			float eye_z_fov = hmd->view_eye_offsets[i].z;
+			float eye_x = hmd->base.hmd->view_eye_offsets[i].x;
+			float eye_y_fov = hmd->base.hmd->view_eye_offsets[i].y;
+			float eye_z_fov = hmd->base.hmd->view_eye_offsets[i].z;
 			if (eye_z_fov <= 0.001f) eye_z_fov = nominal_z;
 
 			hmd->base.hmd->distortion.fov[i].angle_left = atanf((-half_w - eye_x) / eye_z_fov);
