@@ -561,6 +561,21 @@ comp_d3d11_service_workspace_set_chrome_layout_by_slot(struct xrt_system_composi
                                                        const struct ipc_workspace_chrome_layout *layout);
 
 /*!
+ * spec_version 12: per-frame pose-only update for a previously-laid-out chrome
+ * layer. Cheaper than set_chrome_layout (one ~32-byte XrPosef, no region
+ * array). Used for fast-moving chrome — cursor sprite, focus-ring animation,
+ * gaze-tracked tooltips. Overwrites only chrome_pose_in_client; all other
+ * cached layout fields stay as last set.
+ *
+ * Idempotent if the slot has no chrome layout yet — the pose is recorded and
+ * the controller's next set_chrome_layout_by_slot inherits it.
+ */
+xrt_result_t
+comp_d3d11_service_workspace_update_chrome_layer_pose_by_slot(struct xrt_system_compositor *xsysc,
+                                                              int slot,
+                                                              const struct xrt_pose *pose_in_client);
+
+/*!
  * Phase 2.C spec_version 8: lazy-create + return the workspace wakeup
  * event handle (Win32 HANDLE on Windows). The IPC handler then DuplicateHandle's
  * it into the controller process so the controller can wait on it instead

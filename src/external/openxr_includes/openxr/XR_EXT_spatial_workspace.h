@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_spatial_workspace 1
-#define XR_EXT_spatial_workspace_SPEC_VERSION 11
+#define XR_EXT_spatial_workspace_SPEC_VERSION 12
 #define XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_EXT_spatial_workspace"
 
 // Provisional XrStructureType values. The 1000999100..105 range is reserved for
@@ -775,6 +775,32 @@ typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceClientChromeLayoutEXT)(
     XrWorkspaceClientId                clientId,
     const XrWorkspaceChromeLayoutEXT  *layout);
 
+/*!
+ * @brief Per-frame pose update for a client's chrome quad (spec_version 12).
+ *
+ * @c xrSetWorkspaceClientChromeLayoutEXT is the cached-layout fast path: call
+ * it once on connect and whenever the chrome's *size*, hit regions, depth bias,
+ * or anchor flags change. It is documented as "per-frame IPC is not needed."
+ *
+ * This call is the pose-only complement, intended for fast-moving chrome: a
+ * cursor sprite whose Z depth tracks the per-frame hit-test, a focus-ring
+ * animation, a tooltip that follows the user's gaze, etc. Carries only the
+ * 3-vec + quaternion (~32 bytes on the wire) and overwrites the @c poseInClient
+ * field of the previously-cached layout. All other fields stay as last set.
+ *
+ * If no layout has been set for @p clientId yet, the call still records the
+ * pose; once the controller pushes a layout, the recorded pose is used as the
+ * starting value.
+ *
+ * @return XR_SUCCESS on success,
+ *         XR_ERROR_HANDLE_INVALID if @p clientId is unknown,
+ *         XR_ERROR_FEATURE_UNSUPPORTED if @p session is not the active workspace.
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrUpdateWorkspaceClientChromeLayerPoseEXT)(
+    XrSession            session,
+    XrWorkspaceClientId  clientId,
+    const XrPosef       *poseInClient);
+
 // ---- Event-driven wakeup (spec_version 8) ----
 
 /*!
@@ -1003,6 +1029,11 @@ XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceClientChromeLayoutEXT(
     XrSession                          session,
     XrWorkspaceClientId                clientId,
     const XrWorkspaceChromeLayoutEXT  *layout);
+
+XRAPI_ATTR XrResult XRAPI_CALL xrUpdateWorkspaceClientChromeLayerPoseEXT(
+    XrSession            session,
+    XrWorkspaceClientId  clientId,
+    const XrPosef       *poseInClient);
 
 XRAPI_ATTR XrResult XRAPI_CALL xrAcquireWorkspaceWakeupEventEXT(
     XrSession  session,

@@ -3283,6 +3283,51 @@ ipc_handle_workspace_set_chrome_layout(volatile struct ipc_client_state *_ics,
 }
 
 xrt_result_t
+ipc_handle_workspace_update_chrome_layer_pose(volatile struct ipc_client_state *_ics,
+                                              uint32_t client_id,
+                                              const struct xrt_pose *pose_in_client)
+{
+	struct ipc_server *s = _ics->server;
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL || pose_in_client == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	if (client_id >= 1000u) {
+		IPC_WARN(s, "Workspace: update_chrome_layer_pose - capture clients (id=%u) not supported", client_id);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	os_mutex_lock(&s->global_state.lock);
+	volatile struct ipc_client_state *target_ics = NULL;
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		volatile struct ipc_client_state *ics = &s->threads[i].ics;
+		if (ics->client_state.id == client_id && ics->server_thread_index >= 0) {
+			target_ics = ics;
+			break;
+		}
+	}
+	if (target_ics == NULL || target_ics->xc == NULL) {
+		os_mutex_unlock(&s->global_state.lock);
+		// Per-frame call — quieter log than set_chrome_layout (which warns).
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	int slot = comp_d3d11_service_workspace_find_slot_by_xc(s->xsysc, (struct xrt_compositor *)target_ics->xc);
+	os_mutex_unlock(&s->global_state.lock);
+	if (slot < 0) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	return comp_d3d11_service_workspace_update_chrome_layer_pose_by_slot(s->xsysc, slot, pose_in_client);
+#else
+	(void)s;
+	(void)client_id;
+	(void)pose_in_client;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
 ipc_handle_workspace_get_file_picker_request(volatile struct ipc_client_state *_ics,
                                              uint64_t request_id,
                                              uint32_t *out_found,

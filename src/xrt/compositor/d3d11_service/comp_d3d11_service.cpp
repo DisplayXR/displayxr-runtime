@@ -14481,6 +14481,30 @@ comp_d3d11_service_workspace_set_chrome_layout_by_slot(struct xrt_system_composi
 	return XRT_SUCCESS;
 }
 
+extern "C" xrt_result_t
+comp_d3d11_service_workspace_update_chrome_layer_pose_by_slot(struct xrt_system_compositor *xsysc,
+                                                              int slot,
+                                                              const struct xrt_pose *pose_in_client)
+{
+	if (xsysc == nullptr || pose_in_client == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr || slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	mc->clients[slot].chrome_pose_in_client = *pose_in_client;
+	// Note: chrome_layout_valid is NOT toggled here. A pose-only update on a
+	// slot whose layout hasn't been pushed yet just stages the pose for the
+	// controller's eventual set_chrome_layout_by_slot to inherit. If a
+	// layout has already been pushed (the common case for cursor + animated
+	// chrome), the flag is already true and stays that way.
+	return XRT_SUCCESS;
+}
+
 // Phase 2.C spec_version 9: shared body for both IPC and capture client style
 // pushes. Copies fields; does NOT validate (state tracker already validated).
 static void

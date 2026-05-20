@@ -247,6 +247,13 @@
 		]
 	},
 
+	"workspace_update_chrome_layer_pose": {
+		"in": [
+			{"name": "client_id", "type": "uint32_t"},
+			{"name": "pose_in_client", "type": "struct xrt_pose"}
+		]
+	},
+
 	"workspace_acquire_wakeup_event": {
 		"out_handles": {"type": "xrt_graphics_sync_handle_t"}
 	},
