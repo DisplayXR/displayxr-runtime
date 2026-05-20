@@ -87,7 +87,9 @@ The spatial-workspace surface (`XR_EXT_spatial_workspace`, spec_version 7) split
 
 After Phase 2.C the runtime ships with **zero default chrome**. Workspace clients render as bare content quads unless a controller submits a chrome swapchain via `xrCreateWorkspaceClientChromeSwapchainEXT`. This means controllers (third-party shells, accessibility overlays, OEM skins) can change chrome appearance, geometry, and behavior without forking the runtime.
 
-**Reference**: `feedback_controllers_own_motion` for the architectural North Star; `docs/specs/extensions/XR_EXT_spatial_workspace.md` for the surface; `src/xrt/targets/shell/shell_chrome.cpp` for the reference chrome implementation.
+**Outstanding policy still in the runtime (slated for migration to the controller):** the drag/resize/rotation state machines (`mc->title_drag`, `mc->resize`, `mc->title_rmb_drag` in `comp_d3d11_service.cpp`) and the 3D cursor sprite render policy. Hit-test computation stays in the runtime as plumbing because the runtime owns the source data (tile pixel layout, cursor, eye positions); the policy that *interprets* a hit (start a drag? snap to grid? change cursor shape?) belongs in the controller. See ADR-018 for the boundary and migration plan.
+
+**Reference**: `feedback_controllers_own_motion` for the architectural North Star; ADR-018 for the hit-test plumbing vs interactive policy split; `docs/specs/extensions/XR_EXT_spatial_workspace.md` for the surface; `src/xrt/targets/shell/shell_chrome.cpp` for the reference chrome implementation.
 
 ## Data Flow Examples
 
