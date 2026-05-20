@@ -149,6 +149,10 @@ comp_ipc_client_compositor_workspace_set_chrome_layout(struct xrt_compositor *xc
                                                        uint32_t client_id,
                                                        const struct ipc_workspace_chrome_layout *layout);
 xrt_result_t
+comp_ipc_client_compositor_workspace_update_chrome_layer_pose(struct xrt_compositor *xc,
+                                                              uint32_t client_id,
+                                                              const struct xrt_pose *pose_in_client);
+xrt_result_t
 comp_ipc_client_compositor_workspace_acquire_wakeup_event(struct xrt_compositor *xc,
                                                           xrt_graphics_sync_handle_t *out_handle);
 // Phase 2.C spec_version 9: per-client visual style.
@@ -1108,6 +1112,39 @@ oxr_xrSetWorkspaceClientChromeLayoutEXT(XrSession session,
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_chrome_layout(
 	    &sess->xcn->base, (uint32_t)clientId, &ipc_layout);
 	return xret_to_xr_result(&log, xret, "workspace_set_chrome_layout");
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrUpdateWorkspaceClientChromeLayerPoseEXT(XrSession session,
+                                              XrWorkspaceClientId clientId,
+                                              const XrPosef *poseInClient)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrUpdateWorkspaceClientChromeLayerPoseEXT");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_ARG_NOT_NULL(&log, poseInClient);
+
+	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrUpdateWorkspaceClientChromeLayerPoseEXT: clientId must not be "
+		                 "XR_NULL_WORKSPACE_CLIENT_ID");
+	}
+
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrUpdateWorkspaceClientChromeLayerPoseEXT requires an IPC-mode session");
+	}
+
+	struct xrt_pose xpose;
+	xr_pose_to_xrt_pose(poseInClient, &xpose);
+
+	xrt_result_t xret = comp_ipc_client_compositor_workspace_update_chrome_layer_pose(
+	    &sess->xcn->base, (uint32_t)clientId, &xpose);
+	return xret_to_xr_result(&log, xret, "workspace_update_chrome_layer_pose");
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
