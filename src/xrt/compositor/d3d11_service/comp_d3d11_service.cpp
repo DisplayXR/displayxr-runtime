@@ -1174,16 +1174,6 @@ struct d3d11_multi_compositor
 	HCURSOR cursor_sizenesw; // NE-SW diagonal
 	HCURSOR cursor_sizeall;  // move/grab (title drag, right-click drag)
 
-	//! Title bar right-click drag state for window rotation.
-	struct
-	{
-		bool active;
-		int32_t slot;
-		POINT start_cursor;
-		float start_yaw;   //!< Yaw (radians) at drag start
-		float start_pitch;  //!< Pitch (radians) at drag start
-	} title_rmb_drag;
-
 	//! Momentary toast notification (e.g. "how to restore after fullscreen").
 	char toast_text[256];
 	uint64_t toast_until_ns;
@@ -7402,76 +7392,14 @@ after_key_shortcuts:
 			goto after_rmb_handling;
 		}
 
-		if (rmb_held) {
-			// Phase 2.K: when the controller has pointer capture, suppress
-			// the runtime's RMB rotation drag — the controller owns interactive
-			// motion policy.
-			bool ctrl_owns_drag = (mc->window != nullptr) &&
-			                      comp_d3d11_window_is_workspace_pointer_capture_enabled(mc->window);
-			if (!mc->title_rmb_drag.active && rmb_just_pressed && !ctrl_owns_drag) {
-				// RMB just pressed — check if on title bar to start rotation drag
-				POINT pt;
-				GetCursorPos(&pt);
-				ScreenToClient(mc->hwnd, &pt);
-				struct workspace_hit_result rmb_hit = workspace_raycast_hit_test(sys, mc, pt);
-				if (rmb_hit.slot >= 0) {
-					if (rmb_hit.slot != mc->focused_slot) {
-						mc->focused_slot = rmb_hit.slot;
-						multi_compositor_update_input_forward(mc);
-					}
-					// Phase 2.K Commit 8 tweak: only start rotation drag
-					// when RMB lands on the grip dots (matches LMB drag).
-					if (rmb_hit.in_grip_handle) {
-						// Start rotation drag
-						mc->title_rmb_drag.active = true;
-						mc->title_rmb_drag.slot = rmb_hit.slot;
-						mc->title_rmb_drag.start_cursor = pt;
-						// Extract current yaw/pitch from quaternion. Note:
-						// math_quat_to_euler_angles uses Eigen's Z-Y-X
-						// decomposition and writes the result with .x = Z
-						// (roll), .y = Y (yaw), .z = X (pitch). Reading
-						// pitch from .x (the roll slot) was a long-standing
-						// bug — on every RMB-drag start it snapped pitch
-						// to 0, so any previously-accumulated pitch
-						// vanished the moment the user pressed RMB again.
-						struct xrt_vec3 euler;
-						math_quat_to_euler_angles(&mc->clients[rmb_hit.slot].window_pose.orientation, &euler);
-						mc->title_rmb_drag.start_yaw = euler.y;
-						mc->title_rmb_drag.start_pitch = euler.z;
-					}
-				}
-			} else if (mc->title_rmb_drag.active) {
-				// RMB held — update rotation during drag
-				POINT pt;
-				GetCursorPos(&pt);
-				ScreenToClient(mc->hwnd, &pt);
-				int s = mc->title_rmb_drag.slot;
-				if (s >= 0 && s < D3D11_MULTI_MAX_CLIENTS && mc->clients[s].active) {
-					float dx = (float)(pt.x - mc->title_rmb_drag.start_cursor.x);
-					float dy = (float)(pt.y - mc->title_rmb_drag.start_cursor.y);
-					// ~1 degree per 10 pixels
-					float deg_per_px = (float)(M_PI / 180.0) / 10.0f;
-					float yaw = mc->title_rmb_drag.start_yaw + dx * deg_per_px;
-					float pitch = mc->title_rmb_drag.start_pitch + dy * deg_per_px;
-					// Clamp: yaw ±30°, pitch ±15°
-					float max_yaw = (float)(30.0 * M_PI / 180.0);
-					float max_pitch = (float)(15.0 * M_PI / 180.0);
-					if (yaw < -max_yaw) yaw = -max_yaw;
-					if (yaw > max_yaw) yaw = max_yaw;
-					if (pitch < -max_pitch) pitch = -max_pitch;
-					if (pitch > max_pitch) pitch = max_pitch;
-
-					mc->clients[s].window_pose.orientation = quat_from_yaw_pitch(yaw, pitch);
-				}
-			}
-		} else {
-			if (mc->title_rmb_drag.active) {
-				mc->title_rmb_drag.active = false;
-				mc->title_rmb_drag.slot = -1;
-				// Nudge cursor to force WM_SETCURSOR update
-				POINT p; GetCursorPos(&p); SetCursorPos(p.x, p.y);
-			}
-		}
+		// RMB rotation drag and RMB-content focus are the workspace
+		// controller's job (ADR-018 / PR 4 of the runtime→controller
+		// migration). Controllers see POINTER(R,*) events with hit_region
+		// + chrome_region_id and decide what to do: rotation drag on
+		// grip-hit (capture + per-frame xrSetWorkspaceClientWindowPoseEXT
+		// with quaternion from yaw/pitch), focus via
+		// xrSetWorkspaceFocusedClientEXT on RMB-on-tile, or context menu.
+		(void)rmb_just_pressed;
 
 	after_rmb_handling:
 		(void)0; // label target for the launcher-visible fast-path above.
