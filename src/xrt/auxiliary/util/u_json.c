@@ -9,7 +9,7 @@
  */
 
 #include "util/u_json.h"
-#ifndef XRT_HAVE_SYSTEM_CJSON
+#if !defined(XRT_HAVE_SYSTEM_CJSON) && !defined(XRT_HAVE_LINKED_CJSON)
 #if defined(_MSC_VER) && !defined(_CRT_SECURE_NO_WARNINGS)
 #define _CRT_SECURE_NO_WARNINGS
 #endif
@@ -20,11 +20,13 @@
 #include <assert.h>
 #include <stdio.h>
 
-#ifndef XRT_HAVE_SYSTEM_CJSON
+#if !defined(XRT_HAVE_SYSTEM_CJSON) && !defined(XRT_HAVE_LINKED_CJSON)
 #if defined(_MSC_VER) && !defined(_CRT_SECURE_NO_WARNINGS)
 #define _CRT_SECURE_NO_WARNINGS
 #endif
-// This includes the c file completely.
+// This includes the c file completely. Skipped when cJSON comes from an
+// external static lib (system cJSON, or the MCP module's vendored copy
+// linked via xrt-external-cjson — XRT_HAVE_LINKED_CJSON gate).
 #include "cjson/cJSON.c"
 #endif
 
