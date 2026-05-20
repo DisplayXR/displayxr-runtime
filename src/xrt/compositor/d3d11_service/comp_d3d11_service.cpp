@@ -1166,17 +1166,6 @@ struct d3d11_multi_compositor
 		float start_pos_y;   //!< Window pose.position.y at drag start (meters)
 	} drag;
 
-	//! Edge/corner resize state (left-click-drag on window border).
-	struct
-	{
-		bool active;
-		int32_t slot;
-		int edges;           //!< Bitfield: RESIZE_LEFT|RIGHT|TOP|BOTTOM
-		POINT start_cursor;
-		float start_pos_x, start_pos_y;
-		float start_width_m, start_height_m;
-	} resize;
-
 	//! Cached cursor handles for resize.
 	HCURSOR cursor_arrow;
 	HCURSOR cursor_sizewe;   // left-right
@@ -4490,12 +4479,11 @@ multi_compositor_update_input_forward(struct d3d11_multi_compositor *mc)
 	// testing) was bitten by this on every tile size.
 	//
 	// FIX: edge-resize detection runs INDEPENDENTLY via
-	// workspace_raycast_hit_test → hit.edge_flags (see line ~7150
-	// where mc->resize.active gets set), so the inset here was
-	// vestigial. Setting it to 0 lets every cursor position inside
-	// the tile forward at the correct HWND coord. Resize-handle
-	// behaviour is unchanged because that path doesn't depend on
-	// this inset.
+	// workspace_raycast_hit_test → hit.edge_flags, surfaced to the
+	// workspace controller as XR_WORKSPACE_HIT_REGION_EDGE_RESIZE_*
+	// events, so the inset here was vestigial. Setting it to 0 lets
+	// every cursor position inside the tile forward at the correct
+	// HWND coord. Resize-handle behaviour is unchanged.
 	(void)is_capture; // (kept for the capture-path branch below)
 
 	comp_d3d11_window_set_input_forward(mc->window, (void *)target, rx, ry, rw, rh, is_capture);
@@ -6993,17 +6981,7 @@ after_key_shortcuts:
 		struct workspace_hit_result cursor_hover = workspace_raycast_hit_test(sys, mc, cpt);
 
 		int cursor_id = 0; // arrow
-		if (mc->resize.active) {
-			int e = mc->resize.edges;
-			if (e == (RESIZE_LEFT | RESIZE_TOP) || e == (RESIZE_RIGHT | RESIZE_BOTTOM))
-				cursor_id = 3; // sizenwse
-			else if (e == (RESIZE_RIGHT | RESIZE_TOP) || e == (RESIZE_LEFT | RESIZE_BOTTOM))
-				cursor_id = 4; // sizenesw
-			else if (e & (RESIZE_LEFT | RESIZE_RIGHT))
-				cursor_id = 1; // sizewe
-			else if (e & (RESIZE_TOP | RESIZE_BOTTOM))
-				cursor_id = 2; // sizens
-		} else {
+		{
 			struct workspace_hit_result &hover = cursor_hover;
 
 			// Phase 2.C C3.C-4: publish per-frame hovered slot so
@@ -7106,7 +7084,7 @@ after_key_shortcuts:
 		bool lmb_just_pressed = lmb_held && !mc->prev_lmb_held;
 		mc->prev_lmb_held = lmb_held;
 
-		if (lmb_just_pressed && !mc->resize.active) {
+		if (lmb_just_pressed) {
 			POINT pt;
 			GetCursorPos(&pt);
 			ScreenToClient(mc->hwnd, &pt);
@@ -7145,33 +7123,13 @@ after_key_shortcuts:
 			// Spatial raycast: cast ray from eye through cursor on display surface
 			struct workspace_hit_result hit = workspace_raycast_hit_test(sys, mc, pt);
 
-			// Phase 2.K: when controller has pointer capture, runtime cedes
-			// edge-resize too (the controller may want to interpret edges as
-			// something other than resize, e.g. carousel reflow).
-			bool ctrl_owns_drag = (mc->window != nullptr) &&
-			                      comp_d3d11_window_is_workspace_pointer_capture_enabled(mc->window);
-			// Edge/corner resize takes priority (unless clicking a title bar button)
-			if (hit.slot >= 0 && hit.edge_flags != RESIZE_NONE &&
-			    !hit.in_close_btn && !hit.in_minimize_btn && !hit.in_maximize_btn &&
-			    !ctrl_owns_drag) {
-				mc->resize.active = true;
-				mc->resize.slot = hit.slot;
-				mc->resize.edges = hit.edge_flags;
-				mc->resize.start_cursor = pt;
-				mc->resize.start_pos_x = mc->clients[hit.slot].window_pose.position.x;
-				mc->resize.start_pos_y = mc->clients[hit.slot].window_pose.position.y;
-				mc->resize.start_width_m = mc->clients[hit.slot].window_width_m;
-				mc->resize.start_height_m = mc->clients[hit.slot].window_height_m;
-				// Suppress input forwarding during resize
-				if (mc->window != nullptr)
-					comp_d3d11_window_set_input_suppress(mc->window, true);
-				if (hit.slot != mc->focused_slot) {
-					mc->focused_slot = hit.slot;
-				}
-				if (mc->window != nullptr) {
-					comp_d3d11_window_set_input_forward(mc->window, NULL, 0, 0, 0, 0, false);
-				}
-			} else {
+			// Edge resize is the workspace controller's job (ADR-018 /
+			// PR 3 of the runtime→controller migration). Controllers see
+			// POINTER events with hit_region == EDGE_RESIZE_*, enable
+			// pointer capture on LMB-down, and drive per-frame
+			// xrSetWorkspaceClientWindowPoseEXT (which sets
+			// hwnd_resize_pending so the app HWND keeps resizing).
+			{
 
 			int hit_slot = hit.slot;
 			bool in_title_bar = hit.in_title_bar;
@@ -7409,77 +7367,7 @@ after_key_shortcuts:
 					}
 				}
 			}
-			} // close: else from resize_slot check
-		} else if (lmb_held && mc->resize.active) {
-			// Edge/corner resize — update window dimensions
-			POINT pt;
-			GetCursorPos(&pt);
-			ScreenToClient(mc->hwnd, &pt);
-			int s = mc->resize.slot;
-			if (s >= 0 && s < D3D11_MULTI_MAX_CLIENTS && mc->clients[s].active) {
-				float disp_w_m = sys->base.info.display_width_m;
-				float disp_h_m = sys->base.info.display_height_m;
-				uint32_t disp_px_w = sys->base.info.display_pixel_width;
-				uint32_t disp_px_h = sys->base.info.display_pixel_height;
-				if (disp_px_w > 0 && disp_px_h > 0 && disp_w_m > 0.0f && disp_h_m > 0.0f) {
-					float dx_px = (float)(pt.x - mc->resize.start_cursor.x);
-					float dy_px = (float)(pt.y - mc->resize.start_cursor.y);
-					float m_per_px_x = disp_w_m / (float)disp_px_w;
-					float m_per_px_y = disp_h_m / (float)disp_px_h;
-					float dx_m = dx_px * m_per_px_x;
-					float dy_m = dy_px * m_per_px_y;
-
-					float new_w = mc->resize.start_width_m;
-					float new_h = mc->resize.start_height_m;
-
-					if (mc->resize.edges & RESIZE_RIGHT)  new_w += dx_m;
-					if (mc->resize.edges & RESIZE_LEFT)   new_w -= dx_m;
-					if (mc->resize.edges & RESIZE_BOTTOM) new_h += dy_m;
-					if (mc->resize.edges & RESIZE_TOP)    new_h -= dy_m;
-
-					if (new_w < UI_MIN_WIN_W_M) new_w = UI_MIN_WIN_W_M;
-					if (new_h < UI_MIN_WIN_H_M) new_h = UI_MIN_WIN_H_M;
-					if (new_w > disp_w_m * 0.95f) new_w = disp_w_m * 0.95f;
-					if (new_h > disp_h_m * 0.95f) new_h = disp_h_m * 0.95f;
-
-					// Anchor the opposite edge: derive position from the *clamped*
-					// width/height delta, not raw cursor delta. Otherwise once a
-					// dimension hits its min, continued dragging slides the window.
-					float new_x = mc->resize.start_pos_x;
-					float new_y = mc->resize.start_pos_y;
-					float dw = new_w - mc->resize.start_width_m;
-					float dh = new_h - mc->resize.start_height_m;
-					if (mc->resize.edges & RESIZE_RIGHT)  new_x += dw / 2.0f;
-					if (mc->resize.edges & RESIZE_LEFT)   new_x -= dw / 2.0f;
-					if (mc->resize.edges & RESIZE_BOTTOM) new_y -= dh / 2.0f;
-					if (mc->resize.edges & RESIZE_TOP)    new_y += dh / 2.0f;
-
-					mc->clients[s].window_width_m = new_w;
-					mc->clients[s].window_height_m = new_h;
-					mc->clients[s].window_pose.position.x = new_x;
-					mc->clients[s].window_pose.position.y = new_y;
-
-					slot_pose_to_pixel_rect(sys, &mc->clients[s],
-					                        &mc->clients[s].window_rect_x,
-					                        &mc->clients[s].window_rect_y,
-					                        &mc->clients[s].window_rect_w,
-					                        &mc->clients[s].window_rect_h);
-					// Resize HWND every frame so app content adapts continuously
-					mc->clients[s].hwnd_resize_pending = true;
-				}
-			}
-		} else if (!lmb_held && mc->resize.active) {
-			mc->clients[mc->resize.slot].hwnd_resize_pending = true;
-			mc->resize.active = false;
-			mc->resize.slot = -1;
-			mc->resize.edges = RESIZE_NONE;
-			// Resume input forwarding after resize
-			if (mc->window != nullptr)
-				comp_d3d11_window_set_input_suppress(mc->window, false);
-			// Nudge cursor to force WM_SETCURSOR update
-			{ POINT p; GetCursorPos(&p); SetCursorPos(p.x, p.y); }
-			// Restore mouse forwarding after resize
-			multi_compositor_update_input_forward(mc);
+			} // close unconditional block (post-migration: title-bar + edge resize delegated to controller)
 		}
 	}
 	after_lmb_handling:
@@ -15469,7 +15357,6 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 		// Reset drag/focus state
 		mc->focused_slot = -1;
 		mc->drag.active = false;
-		mc->resize.active = false;
 
 		// Set request flag for render thread to exit. Don't join here —
 		// joining while holding the mutex deadlocks if the render thread
