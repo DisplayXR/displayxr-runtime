@@ -14,6 +14,10 @@
 #include <sr/weaver/dx11weaver.h>
 #include <sr/world/display/display.h>
 #include <sr/sense/display/switchablehint.h>
+#include <sr/sense/eyetracker/eyetracker.h>
+#include <sr/sense/eyetracker/eyepair.h>
+#include <sr/sense/eyetracker/eyepairlistener.h>
+#include <sr/sense/eyetracker/eyepairstream.h>
 #include <sr/utility/exception.h>
 
 #include <d3d11.h>
@@ -22,6 +26,11 @@
 #include <sysinfoapi.h>
 
 #include <cmath>
+#include <memory>
+#include <mutex>
+
+// Forward decl — defined below so it can hold a back-pointer to leiasr_d3d11.
+class LeiaEyePairListener;
 
 /*!
  * D3D11 SR weaver instance.
@@ -32,6 +41,20 @@ struct leiasr_d3d11
 	SR::SRContext *context = nullptr;
 	SR::IDX11Weaver1 *weaver = nullptr;
 	SR::SwitchableLensHint *lens_hint = nullptr;
+
+	// Listener-driven eye-position cache (#248 Tier 2). Instead of polling
+	// the weaver per-frame (which throws std::runtime_error internally as
+	// routine control flow), we subscribe to SR::EyeTracker's EyePairStream
+	// once and let the SDK's internal thread push SR_eyePair frames into
+	// `cached_eye_pair` via the listener's accept() callback. All in-runtime
+	// eye-pos consumers then read this snapshot — zero SDK invocations from
+	// our side after subscription, zero per-frame throws.
+	SR::EyeTracker                       *eye_tracker = nullptr;  // owned by SRContext
+	std::shared_ptr<SR::EyePairStream>    eye_pair_stream;
+	std::unique_ptr<LeiaEyePairListener>  eye_listener;
+	std::mutex                            cached_eye_pair_mutex;
+	bool                                  cached_eye_pair_valid = false;
+	SR_eyePair                            cached_eye_pair = {};
 
 	// D3D11 resources (references, not owned)
 	ID3D11Device *device = nullptr;
@@ -63,6 +86,33 @@ struct leiasr_d3d11
 	// Configuration
 	bool srgb_read = false;
 	bool srgb_write = false;
+};
+
+/*!
+ * Listener that receives SR_eyePair updates from the SDK's internal
+ * eye-tracking thread and writes them into the owning leiasr_d3d11's
+ * snapshot under a mutex. No polling, no throws — the SDK calls accept()
+ * whenever a fresh frame is available. The eye_pair_stream owns a raw
+ * pointer to the listener instance, so the stream MUST be stopped (via
+ * stopListening()) before the listener is destroyed.
+ */
+class LeiaEyePairListener : public SR::EyePairListener
+{
+public:
+	explicit LeiaEyePairListener(leiasr_d3d11 *owner) : owner_(owner) {}
+
+	void accept(const SR_eyePair &frame) override
+	{
+		if (owner_ == nullptr) {
+			return;
+		}
+		std::lock_guard<std::mutex> lock(owner_->cached_eye_pair_mutex);
+		owner_->cached_eye_pair       = frame;
+		owner_->cached_eye_pair_valid = true;
+	}
+
+private:
+	leiasr_d3d11 *owner_;
 };
 
 namespace {
@@ -215,6 +265,34 @@ leiasr_d3d11_create(double max_time,
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
+	// Subscribe to SR::EyeTracker via listener pattern (#248 Tier 2)
+	// BEFORE creating the weaver and BEFORE context->initialize(). Match
+	// the dx11_weaving SDK sample's order — context->initialize() starts
+	// all senses that were registered to the context up to that point;
+	// any sense added afterwards never starts and the listener silently
+	// never fires. Best-effort: if subscription fails (older SDK,
+	// transient init race), the get_predicted_eye_positions path falls
+	// back to a guarded weaver poll.
+	try {
+		sr->eye_tracker = SR::EyeTracker::create(*sr->context);
+		if (sr->eye_tracker != nullptr) {
+			sr->eye_listener = std::make_unique<LeiaEyePairListener>(sr);
+			sr->eye_pair_stream =
+			    sr->eye_tracker->openEyePairStream(sr->eye_listener.get());
+			U_LOG_W("SR D3D11: subscribed to EyeTracker EyePairStream "
+			        "(listener-driven, no per-frame SDK polling)");
+		} else {
+			U_LOG_W("SR D3D11: EyeTracker::create returned null — "
+			        "falling back to weaver polling for eye positions");
+		}
+	} catch (...) {
+		U_LOG_W("SR D3D11: EyeTracker subscription threw — falling back "
+		        "to weaver polling for eye positions");
+		sr->eye_pair_stream.reset();
+		sr->eye_listener.reset();
+		sr->eye_tracker = nullptr;
+	}
+
 	// Create D3D11 weaver (SR SDK installs its WndProc via SetWindowLongPtr).
 	// Set DPI awareness so the SDK sees physical pixels when it queries the
 	// HWND. See LeiaInc/LeiaSR@a8a9fb9 for the pattern.
@@ -234,7 +312,8 @@ leiasr_d3d11_create(double max_time,
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
-	// Initialize the context after creating the weaver.
+	// Initialize the context AFTER all senses (EyeTracker above) and the
+	// weaver have been registered. initialize() starts the senses.
 	sr->context->initialize();
 
 	// Set default latency (1 frame)
@@ -255,6 +334,24 @@ leiasr_d3d11_destroy(struct leiasr_d3d11 **leiasr_ptr)
 	}
 
 	leiasr_d3d11 *sr = *leiasr_ptr;
+
+	// Stop the eye-pair stream BEFORE destroying the listener — the SDK's
+	// internal thread is calling listener->accept() concurrently and
+	// stopListening() blocks until any in-flight callback returns.
+	// Failing to do this risks a use-after-free if the SDK fires accept()
+	// after the listener has been freed.
+	if (sr->eye_pair_stream) {
+		try {
+			sr->eye_pair_stream->stopListening();
+		} catch (...) {
+			// Best-effort teardown; SDK shouldn't throw here but defend.
+		}
+		sr->eye_pair_stream.reset();
+	}
+	sr->eye_listener.reset();
+	// EyeTracker is a Sense owned by SRContext — do NOT delete manually
+	// (same contract as lens_hint below). Just drop our reference.
+	sr->eye_tracker = nullptr;
 
 	// SwitchableLensHint is managed by SRContext — do NOT delete it manually.
 	// SRContext::~SRContext() calls deleteAllSenses() which cleans it up.
@@ -380,34 +477,46 @@ leiasr_d3d11_get_predicted_eye_positions(struct leiasr_d3d11 *leiasr,
                                          float out_left_eye[3],
                                          float out_right_eye[3])
 {
-	if (leiasr == nullptr || leiasr->weaver == nullptr) {
+	if (leiasr == nullptr) {
 		return false;
 	}
 
-	// Get positions in millimeters from weaver. The SR SDK's
-	// PredictingEyeTracker::predict throws std::runtime_error as routine
-	// control flow when no eye-tracking data is available — ~5×/frame at
-	// 60Hz during normal operation. The SDK normally catches its own
-	// throws one frame up; if one ever escapes (cold-start state, init
-	// race, future SDK version), the unguarded callers above will let it
-	// unwind through capture_render_thread_func → std::thread entry →
-	// std::terminate() and silently kill the service (runtime#248).
-	// Catch here so the throw never leaves our code.
+	// Primary path: listener-driven cache (#248 Tier 2). The SDK's
+	// internal thread fills `cached_eye_pair` via LeiaEyePairListener::accept;
+	// no SDK calls from our code, no per-frame throws. SR_eyePair positions
+	// are in millimeters — convert to meters here.
+	{
+		std::lock_guard<std::mutex> lock(leiasr->cached_eye_pair_mutex);
+		if (leiasr->cached_eye_pair_valid) {
+			out_left_eye[0]  = leiasr->cached_eye_pair.left.x  / 1000.0f;
+			out_left_eye[1]  = leiasr->cached_eye_pair.left.y  / 1000.0f;
+			out_left_eye[2]  = leiasr->cached_eye_pair.left.z  / 1000.0f;
+			out_right_eye[0] = leiasr->cached_eye_pair.right.x / 1000.0f;
+			out_right_eye[1] = leiasr->cached_eye_pair.right.y / 1000.0f;
+			out_right_eye[2] = leiasr->cached_eye_pair.right.z / 1000.0f;
+			return true;
+		}
+	}
+
+	// Fallback: listener hasn't fired yet (cold-start, first few frames
+	// after subscription) or subscription failed at create. Poll the
+	// weaver, catching the SR SDK's std::runtime_error so it never leaves
+	// the DP. Once the listener warms up this path is never taken again.
+	if (leiasr->weaver == nullptr) {
+		return false;
+	}
 	float left_mm[3], right_mm[3];
 	try {
 		leiasr->weaver->getPredictedEyePositions(left_mm, right_mm);
 	} catch (...) {
 		return false;
 	}
-
-	// Convert to meters
-	out_left_eye[0] = left_mm[0] / 1000.0f;
-	out_left_eye[1] = left_mm[1] / 1000.0f;
-	out_left_eye[2] = left_mm[2] / 1000.0f;
+	out_left_eye[0]  = left_mm[0]  / 1000.0f;
+	out_left_eye[1]  = left_mm[1]  / 1000.0f;
+	out_left_eye[2]  = left_mm[2]  / 1000.0f;
 	out_right_eye[0] = right_mm[0] / 1000.0f;
 	out_right_eye[1] = right_mm[1] / 1000.0f;
 	out_right_eye[2] = right_mm[2] / 1000.0f;
-
 	return true;
 }
 
