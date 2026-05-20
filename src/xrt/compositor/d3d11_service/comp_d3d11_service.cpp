@@ -14198,6 +14198,18 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 			POINT pt = {(LONG)r->cursor_x, (LONG)r->cursor_y};
 			struct workspace_hit_result hit = workspace_raycast_hit_test(sys, mc, pt);
 			ev->u.pointer.hit_region = hit_result_to_region(hit);
+			// PR 1 (workspace controller migration): verify EDGE_RESIZE_*
+			// region values surface to the controller. One-shot — fires on
+			// the first POINTER event whose region is N/S/E/W/NE/NW/SE/SW.
+			if (ev->u.pointer.hit_region >= 10u && ev->u.pointer.hit_region <= 17u) {
+				static bool logged = false;
+				if (!logged) {
+					logged = true;
+					U_LOG_W("[ws-migrate] POINTER edge-resize emit: region=%u slot=%d edge_flags=0x%x button=%u down=%u",
+					        ev->u.pointer.hit_region, hit.slot, hit.edge_flags,
+					        ev->u.pointer.button, ev->u.pointer.is_down);
+				}
+			}
 			if (hit.slot >= 0) {
 				ev->u.pointer.hit_client_id = 1000u + (uint32_t)hit.slot;
 				if (hit.in_content) {
@@ -14239,6 +14251,19 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 			POINT pt = {(LONG)r->cursor_x, (LONG)r->cursor_y};
 			struct workspace_hit_result hit = workspace_raycast_hit_test(sys, mc, pt);
 			ev->u.pointer_motion.hit_region = hit_result_to_region(hit);
+			// PR 1 (workspace controller migration): see POINTER branch above.
+			// One-shot edge-resize verification on the MOTION path too —
+			// motion is what carries pose updates during a controller-owned
+			// resize drag, so we want both paths confirmed.
+			if (ev->u.pointer_motion.hit_region >= 10u && ev->u.pointer_motion.hit_region <= 17u) {
+				static bool logged = false;
+				if (!logged) {
+					logged = true;
+					U_LOG_W("[ws-migrate] MOTION edge-resize emit: region=%u slot=%d edge_flags=0x%x button_mask=0x%x",
+					        ev->u.pointer_motion.hit_region, hit.slot, hit.edge_flags,
+					        ev->u.pointer_motion.button_mask);
+				}
+			}
 			if (hit.slot >= 0) {
 				ev->u.pointer_motion.hit_client_id = 1000u + (uint32_t)hit.slot;
 				if (hit.in_content) {
