@@ -647,6 +647,24 @@ struct d3d11_service_system
 	//! within ~200 ms of the user's V keypress. Zero = no flip has landed yet.
 	std::atomic<int64_t> last_flip_landed_ns{0};
 
+	//! Phase 5c — per-frame cache of predicted eye positions (#248).
+	//! The render thread already calls `xrt_display_processor_d3d11_get_predicted_eye_positions`
+	//! once per frame from `multi_compositor_render`; cache the result so
+	//! per-frame callers (workspace_raycast_hit_test on every cursor hover,
+	//! IPC client eye-pos queries, chrome rendering, capture) reuse the
+	//! cached value instead of re-querying the DP. Each DP call indirects
+	//! into the SR SDK which throws `std::runtime_error` internally as
+	//! control flow (~5×/frame at 60Hz when uncached, ~1×/frame cached) —
+	//! caching cuts ~80% of those throws and the corresponding unwind cost.
+	//! TTL is generous (200 ms) so the cache stays useful even during
+	//! brief render-thread pauses (suspended workspace, post-dismiss
+	//! cleanup); eye position doesn't change meaningfully at sub-200 ms.
+	std::mutex                cached_eye_pos_mutex;
+	struct xrt_vec3           cached_eye_left{0, 0, 0};
+	struct xrt_vec3           cached_eye_right{0, 0, 0};
+	bool                      cached_eye_valid{false};
+	int64_t                   cached_eye_pos_ns{0};
+
 	//! Phase 2.C spec_version 8: auto-reset Win32 event signaled whenever an
 	//! async workspace state change occurs that the controller might want to
 	//! react to (input event pushed onto the public ring, focused-slot
@@ -5003,13 +5021,14 @@ try {
 		emit_render_diag_if_window_elapsed(sys);
 	}
 } catch (std::exception const &e) {
-	// Defense-in-depth (runtime#248). The render thread runs in a
-	// std::thread; any uncaught C++ exception escaping this function
-	// triggers std::terminate() and silently kills the whole service.
-	// The known culprit was the SR SDK's eye-tracker throwing
-	// std::runtime_error through unguarded callers — now patched at the
-	// SDK call site — but keep this outer guard so any *future* stray
-	// throw downgrades a process kill to a logged graceful thread stop.
+	// Defense-in-depth. The render thread runs in a std::thread; any
+	// uncaught C++ exception escaping this function triggers
+	// std::terminate() and silently kills the whole service (no log
+	// shutdown line, no WER dump). Catching here downgrades a process
+	// kill to a logged graceful thread stop — the service stays up,
+	// render thread exits, and we get a diagnostic. Same pattern is
+	// worth adding to any other long-running std::thread entry in the
+	// service.
 	U_LOG_E("capture_render_thread_func: uncaught std::exception: %s — render thread dying gracefully", e.what());
 } catch (...) {
 	U_LOG_E("capture_render_thread_func: uncaught non-std exception — render thread dying gracefully");
@@ -7782,6 +7801,24 @@ after_key_shortcuts:
 		eye_pos.eyes[0] = {-0.032f, 0.0f, 0.6f};
 		eye_pos.eyes[1] = { 0.032f, 0.0f, 0.6f};
 		eye_pos.valid = true;
+	}
+
+	// Populate the per-frame eye-pos cache (#248). All other in-process
+	// callers (workspace_raycast_hit_test, IPC client eye-pos queries,
+	// capture, chrome) read from this cache via
+	// comp_d3d11_service_get_predicted_eye_positions instead of re-calling
+	// into the DP — cuts the SR SDK's per-call std::runtime_error throws
+	// from ~5/frame to ~1/frame.
+	{
+		std::lock_guard<std::mutex> lock(sys->cached_eye_pos_mutex);
+		sys->cached_eye_left.x  = eye_pos.eyes[0].x;
+		sys->cached_eye_left.y  = eye_pos.eyes[0].y;
+		sys->cached_eye_left.z  = eye_pos.eyes[0].z;
+		sys->cached_eye_right.x = eye_pos.eyes[1].x;
+		sys->cached_eye_right.y = eye_pos.eyes[1].y;
+		sys->cached_eye_right.z = eye_pos.eyes[1].z;
+		sys->cached_eye_valid = true;
+		sys->cached_eye_pos_ns = (int64_t)os_monotonic_get_ns();
 	}
 
 
@@ -10756,13 +10793,31 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 	int64_t profile_s0b = os_monotonic_get_ns(); // Phase 5a — post vendor 3d-state poll.
 
-	// Get predicted eye positions (used for UI layers and HUD)
+	// Get predicted eye positions (used for UI layers and HUD).
+	// Use the per-frame cache populated by multi_compositor_render (#248)
+	// so each IPC client's per-frame layer_commit doesn't re-trigger the
+	// SR SDK's std::runtime_error throw inside getPredictedEyePositions.
+	// On a 3-client workspace this cuts ~180 SDK calls/sec to 0 from this
+	// call site (the render thread's once-per-frame call stays the only
+	// SDK invocation that hits the throw). The cache only stores L/R
+	// (eyes[0..1]); for views > 2 the renderer falls back to the
+	// interpolated baseline below.
 	struct xrt_eye_positions eye_pos = {};
 	bool weaving_done = false;
-
-	if (c->render.display_processor != nullptr) {
-		xrt_display_processor_d3d11_get_predicted_eye_positions(
-		    c->render.display_processor, &eye_pos);
+	{
+		std::lock_guard<std::mutex> lock(sys->cached_eye_pos_mutex);
+		if (sys->cached_eye_valid &&
+		    ((int64_t)os_monotonic_get_ns() - sys->cached_eye_pos_ns) <
+		        200LL * 1000LL * 1000LL) {
+			eye_pos.eyes[0].x = sys->cached_eye_left.x;
+			eye_pos.eyes[0].y = sys->cached_eye_left.y;
+			eye_pos.eyes[0].z = sys->cached_eye_left.z;
+			eye_pos.eyes[1].x = sys->cached_eye_right.x;
+			eye_pos.eyes[1].y = sys->cached_eye_right.y;
+			eye_pos.eyes[1].z = sys->cached_eye_right.z;
+			eye_pos.count = 2;
+			eye_pos.valid = true;
+		}
 	}
 
 	int64_t profile_s0c = os_monotonic_get_ns(); // Phase 5a — post vendor eye-pos poll.
@@ -13098,6 +13153,24 @@ comp_d3d11_service_get_predicted_eye_positions(struct xrt_system_compositor *xsy
 	}
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+
+	// Per-frame eye-pos cache served from `multi_compositor_render` (#248).
+	// Returns the most recent eye position computed during the current
+	// render cycle (TTL 200 ms) — avoids a redundant DP call (and the
+	// SR SDK's internal std::runtime_error throw) on every cursor hover,
+	// IPC client query, chrome render, and capture. Cache miss falls
+	// through to the DP path below (cold start, workspace suspended).
+	{
+		std::lock_guard<std::mutex> lock(sys->cached_eye_pos_mutex);
+		if (sys->cached_eye_valid) {
+			int64_t age_ns = (int64_t)os_monotonic_get_ns() - sys->cached_eye_pos_ns;
+			if (age_ns < 200LL * 1000LL * 1000LL) {
+				*out_left  = sys->cached_eye_left;
+				*out_right = sys->cached_eye_right;
+				return true;
+			}
+		}
+	}
 
 	// Get display processor for eye position prediction.
 	// In workspace mode, use the multi-comp's DP (per-client compositors have no DP).
