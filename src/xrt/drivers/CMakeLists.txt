@@ -142,10 +142,14 @@ if(XRT_HAVE_LEIA_SR)
 			${SR_PATH}/third_party/OpenCV/include)
 
 		# Core SR libraries (always needed)
+		# SimulatedRealityFaceTrackers.lib added for the EyeTracker /
+		# EyePairStream listener subscription used by the DP eye-pos
+		# snapshot cache (#248 Tier 2 — eliminates per-frame SDK polling).
 		target_link_libraries(drv_leia PRIVATE
 			xrt-interfaces aux_util aux_os aux_math
 			${SR_PATH}/lib/SimulatedRealityCore.lib
 			${SR_PATH}/lib/SimulatedRealityDisplays.lib
+			${SR_PATH}/lib/SimulatedRealityFaceTrackers.lib
 			${SR_PATH}/third_party/OpenCV/lib/x64/opencv_world343.lib
 			PUBLIC drv_includes)
 
