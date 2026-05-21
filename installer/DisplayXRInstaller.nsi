@@ -649,7 +649,44 @@ Section "DisplayXR Runtime" SecRuntime
 	; Install runtime DLL dependencies (exclude vulkan-1.dll — the system copy
 	; in SYSTEM32 is sufficient, and shipping our own risks version conflicts
 	; and interaction with third-party Vulkan implicit layers. See issue #105.)
+	;
+	; Note: the wildcard sweep is non-recursive. The plug-in DLLs that live
+	; under `_package\bin\plugins\` are installed explicitly below — the
+	; sim-display fallback is part of the runtime distribution, while the
+	; Leia plug-in ships in its own installer (see plan §4.6 / issue #256).
 	File /nonfatal /x "vulkan-1.dll" "${BIN_DIR}\*.dll"
+
+	; -----------------------------------------------------------------
+	; Vendor plug-in: sim-display (ADR-019 / issue #256).
+	;
+	; The sim-display plug-in is the vendor-neutral fallback (probe
+	; always succeeds; ProbeOrder=200 so it runs after all vendor
+	; plug-ins). It ships in the runtime installer because it's
+	; conceptually part of the runtime distribution.
+	;
+	; Vendor plug-ins (DisplayXR-LeiaSR.dll, future panels) are
+	; installed by their own installers, which register themselves
+	; under the same `HKLM\Software\DisplayXR\DisplayProcessors\*`
+	; root. The runtime uninstaller cascades over those keys (mirrors
+	; the workspace-controller cascade below).
+	; -----------------------------------------------------------------
+	SetOutPath "$INSTDIR\plugins"
+	File "${BIN_DIR}\plugins\DisplayXR-SimDisplay.dll"
+	SetOutPath "$INSTDIR"
+
+	WriteRegStr HKLM "Software\DisplayXR\DisplayProcessors\sim-display" \
+		"Binary" "$INSTDIR\plugins\DisplayXR-SimDisplay.dll"
+	WriteRegStr HKLM "Software\DisplayXR\DisplayProcessors\sim-display" \
+		"DisplayName" "DisplayXR Sim Display"
+	WriteRegStr HKLM "Software\DisplayXR\DisplayProcessors\sim-display" \
+		"Vendor" "DisplayXR"
+	WriteRegStr HKLM "Software\DisplayXR\DisplayProcessors\sim-display" \
+		"Version" "${VERSION}"
+	WriteRegDWORD HKLM "Software\DisplayXR\DisplayProcessors\sim-display" \
+		"ProbeOrder" 200
+	; No UninstallString — sim-display is owned by this runtime
+	; installer, so the cascade pass below skips it; the runtime
+	; uninstaller drops the subkey + plugins dir directly.
 
 	; Create AppData directories
 	CreateDirectory "$APPDATA\DisplayXR"
@@ -823,6 +860,59 @@ Section "Uninstall"
 	DeleteRegKey HKLM "Software\DisplayXR\WorkspaceControllers"
 	; -----------------------------------------------------------------
 
+	; -----------------------------------------------------------------
+	; Cascade-uninstall registered vendor display-processor plug-ins
+	; (issue #256 / ADR-019). Same shape as the workspace-controller
+	; cascade above:
+	;   - Each vendor plug-in registers under
+	;     HKLM\Software\DisplayXR\DisplayProcessors\<id> with an
+	;     UninstallString that honors /S.
+	;   - Sim-display lives under the same root but has no
+	;     UninstallString (its lifecycle belongs to this installer),
+	;     so the cascade silently skips it.
+	;   - Vendor plug-in installers own their own files + registry
+	;     entries; we run them before touching the runtime so they
+	;     can clean up while their dependency (DisplayXRClient.dll)
+	;     is still on disk.
+	; -----------------------------------------------------------------
+	DetailPrint "Discovering registered display processor plug-ins..."
+	StrCpy $R0 ""
+	StrCpy $9 0
+	dp_cascade_collect_loop:
+		EnumRegKey $1 HKLM "Software\DisplayXR\DisplayProcessors" $9
+		StrCmp $1 "" dp_cascade_collect_done
+		ReadRegStr $2 HKLM "Software\DisplayXR\DisplayProcessors\$1" "UninstallString"
+		${If} $2 != ""
+			${If} $R0 == ""
+				StrCpy $R0 "$2"
+			${Else}
+				StrCpy $R0 "$R0|$2"
+			${EndIf}
+		${EndIf}
+		IntOp $9 $9 + 1
+		Goto dp_cascade_collect_loop
+	dp_cascade_collect_done:
+
+	${If} $R0 != ""
+		${un.WordFind} "$R0" "|" "#" $R9
+		StrCpy $R8 1
+		dp_cascade_run_loop:
+			IntCmp $R8 $R9 0 0 dp_cascade_run_done
+			${un.WordFind} "$R0" "|" "+$R8" $R7
+			${If} $R7 != ""
+				DetailPrint "Uninstalling display processor plug-in: $R7"
+				nsExec::ExecToLog '"$R7" /S'
+				Pop $5
+			${EndIf}
+			IntOp $R8 $R8 + 1
+			Goto dp_cascade_run_loop
+		dp_cascade_run_done:
+	${EndIf}
+
+	; Drop the parent key (cleans the sim-display subkey + any orphans).
+	DeleteRegKey HKLM "Software\DisplayXR\DisplayProcessors"
+	; -----------------------------------------------------------------
+
 	; Stop the displayxr-service and remove auto-start registration (issue #68)
 	; Kill any running instance first so we can delete the exe
 	DetailPrint "Stopping DisplayXR Service..."
@@ -849,6 +939,11 @@ Section "Uninstall"
 	Delete "$INSTDIR\*.exe"
 	Delete "$INSTDIR\*.dll"
 	Delete "$INSTDIR\*.json"
+
+	; Plug-in DLLs (sim-display + any vendor plug-in whose installer
+	; failed to clean up). Issue #256.
+	Delete "$INSTDIR\plugins\*.dll"
+	RMDir "$INSTDIR\plugins"
 
 	; Save uninstall log to temp before removing directory
 	StrCpy $0 "$TEMP\DisplayXR_uninstall.log"

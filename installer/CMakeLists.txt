@@ -73,6 +73,12 @@ endif()
 if(TARGET DisplayXRSwitcher)
 	add_dependencies(installer DisplayXRSwitcher)
 endif()
+# Vendor plug-in: sim-display. The runtime installer ships this DLL as
+# the vendor-neutral fallback (ADR-019 / issue #256); vendor plug-ins
+# like DisplayXR-LeiaSR.dll come from their own installers.
+if(TARGET drv_sim_display_plugin)
+	add_dependencies(installer drv_sim_display_plugin)
+endif()
 # Workspace controllers (the DisplayXR shell, third-party verticals, …)
 # ship as their own products with their own installers — the runtime
 # installer does not bundle them. The DisplayXR Shell ships from
