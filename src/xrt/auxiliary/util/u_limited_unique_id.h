@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "xrt/xrt_api.h"
 #include "xrt/xrt_defines.h"
 
 
@@ -31,7 +32,7 @@ extern "C" {
  *
  * @ingroup aux_util
  */
-xrt_limited_unique_id_t
+XRT_API_FUNC xrt_limited_unique_id_t
 u_limited_unique_id_get(void);
 
 

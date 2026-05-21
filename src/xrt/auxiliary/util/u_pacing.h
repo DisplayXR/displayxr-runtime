@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "xrt/xrt_api.h"
 #include "xrt/xrt_compiler.h"
 #include "xrt/xrt_defines.h"
 
@@ -750,7 +751,7 @@ u_pc_fake_create(int64_t estimated_frame_period_ns, int64_t now_ns, struct u_pac
  * @ingroup aux_pacing
  * @see u_pacing_app
  */
-xrt_result_t
+XRT_API_FUNC xrt_result_t
 u_pa_factory_create(struct u_pacing_app_factory **out_upaf);
 
 

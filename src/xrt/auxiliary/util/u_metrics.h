@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include "xrt/xrt_api.h"
 #include "xrt/xrt_compiler.h"
 
 
@@ -80,28 +81,28 @@ struct u_metrics_system_present_info
 };
 
 
-void
+XRT_API_FUNC void
 u_metrics_init(void);
 
-void
+XRT_API_FUNC void
 u_metrics_close(void);
 
-bool
+XRT_API_FUNC bool
 u_metrics_is_active(void);
 
-void
+XRT_API_FUNC void
 u_metrics_write_session_frame(struct u_metrics_session_frame *umsf);
 
-void
+XRT_API_FUNC void
 u_metrics_write_used(struct u_metrics_used *umu);
 
-void
+XRT_API_FUNC void
 u_metrics_write_system_frame(struct u_metrics_system_frame *umsf);
 
-void
+XRT_API_FUNC void
 u_metrics_write_system_gpu_info(struct u_metrics_system_gpu_info *umgi);
 
-void
+XRT_API_FUNC void
 u_metrics_write_system_present_info(struct u_metrics_system_present_info *umpi);
 
 

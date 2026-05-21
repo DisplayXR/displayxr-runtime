@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "xrt/xrt_api.h"
 #include "xrt/xrt_compiler.h"
 #include "xrt/xrt_results.h"
 
@@ -266,7 +267,7 @@ typedef void (*u_log_sink_func_t)(const char *file,
 /*!
  * Returns the global logging level, subsystems own logging level take precedence.
  */
-enum u_logging_level
+XRT_API_FUNC enum u_logging_level
 u_log_get_global_level(void);
 
 /*!
@@ -281,7 +282,7 @@ u_log_get_global_level(void);
  * @param format Format string
  * @param ... Format parameters
  */
-void
+XRT_API_FUNC void
 u_log(const char *file, int line, const char *func, enum u_logging_level level, const char *format, ...)
     XRT_PRINTF_FORMAT(5, 6);
 
@@ -297,7 +298,7 @@ u_log(const char *file, int line, const char *func, enum u_logging_level level, 
  * @param format Format string
  * @param ... Format parameters
  */
-void
+XRT_API_FUNC void
 u_log_xdev(const char *file,
            int line,
            const char *func,
@@ -318,7 +319,7 @@ u_log_xdev(const char *file,
  * @param data Data buffer to dump
  * @param data_size Size of the data buffer in bytes
  */
-void
+XRT_API_FUNC void
 u_log_hex(const char *file,
           int line,
           const char *func,
@@ -339,7 +340,7 @@ u_log_hex(const char *file,
  * @param data Data buffer to dump
  * @param data_size Size of the data buffer in bytes
  */
-void
+XRT_API_FUNC void
 u_log_xdev_hex(const char *file,
                int line,
                const char *func,
@@ -355,7 +356,7 @@ u_log_xdev_hex(const char *file,
  * @param func Logging function for the calls to be sent to.
  * @param data User data to be passed into @p func.
  */
-void
+XRT_API_FUNC void
 u_log_set_sink(u_log_sink_func_t func, void *data);
 
 /*!
@@ -370,7 +371,7 @@ u_log_set_sink(u_log_sink_func_t func, void *data);
  * @param xret       Result from the called function.
  * @param called_fn  Which function that this return is from.
  */
-void
+XRT_API_FUNC void
 u_log_print_result(enum u_logging_level cond_level,
                    const char *file,
                    int line,

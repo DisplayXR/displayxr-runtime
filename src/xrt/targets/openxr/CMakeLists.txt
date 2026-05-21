@@ -14,9 +14,24 @@ set(RUNTIME_TARGET
 # OpenXR 1.0
 set(XR_API_MAJOR "1")
 
-add_library(${RUNTIME_TARGET} MODULE target.c libopenxr.def)
+## Library type: SHARED rather than MODULE.
+##
+## The OpenXR loader still resolves this DLL via LoadLibrary at runtime, which
+## works equally for SHARED and MODULE on Windows. We pick SHARED because, in
+## addition to producing the .dll the loader loads, vendor plug-in DLLs now
+## link against the runtime's exported aux surface (ADR-019) via the import
+## library (DisplayXRClient.lib). CMake's MODULE target type intentionally
+## hides the import library from $<TARGET_LINKER_FILE:> and from the ARCHIVE
+## install slot because MODULE communicates "loadable plug-in, do not link
+## against." SHARED tracks the import library as a first-class artifact and
+## makes it installable via the normal install(TARGETS ... ARCHIVE ...) path.
+add_library(${RUNTIME_TARGET} SHARED target.c libopenxr.def)
 
-# On Windows, output the runtime as DisplayXRClient.dll for the installer
+# On Windows, output the runtime as DisplayXRClient.dll for the installer.
+# On Linux/macOS, strip the default `lib` prefix that CMake adds to SHARED
+# libraries so the produced file matches the historical MODULE name
+# (`openxr_displayxr.so` / `.dylib`) and the existing OpenXR loader manifest.
+set_target_properties(${RUNTIME_TARGET} PROPERTIES PREFIX "")
 if(WIN32)
 	set_target_properties(${RUNTIME_TARGET} PROPERTIES OUTPUT_NAME "DisplayXRClient")
 
@@ -67,34 +82,30 @@ else()
 endif()
 
 if(APPLE)
-	# macOS: export the OpenXR negotiate symbol — and only that one when
-	# the runtime is built as an IPC client (drivers live in the service
-	# binary in that mode, so sim_display_set_output_mode isn't in this
-	# DLL and asking the linker to export it produces an undefined-symbol
-	# error). When drivers are linked in-process, also export
-	# sim_display_set_output_mode for test-app live-mode switching via
-	# dlsym (SBS/anaglyph/blend without restart).
-	# GNU ld version scripts are not supported by the macOS linker.
-	if(XRT_FEATURE_IPC_CLIENT AND NOT XRT_FEATURE_HYBRID_MODE)
-		set_property(
-			TARGET ${RUNTIME_TARGET}
-			APPEND_STRING
-			PROPERTY
-				LINK_FLAGS
-				" -Wl,-exported_symbol,_xrNegotiateLoaderRuntimeInterface"
-			)
-	else()
-		set_property(
-			TARGET ${RUNTIME_TARGET}
-			APPEND_STRING
-			PROPERTY
-				LINK_FLAGS
-				" -Wl,-exported_symbol,_xrNegotiateLoaderRuntimeInterface -Wl,-exported_symbol,_sim_display_set_output_mode"
-			)
-	endif()
+	# macOS: drive exports from exported_symbols.list (single source of
+	# truth shared with libopenxr.def on Windows and libopenxr.version on
+	# Linux). The list includes the Khronos negotiate symbol, the legacy
+	# in-process sim_display hook (for test apps that resolve it via
+	# dlsym), the aux export surface enumerated in
+	# docs/adr/ADR-019-vendor-plugin-aux-boundary.md, and the macOS-only
+	# oxr_macos_* window-closed accessors.
+	set_property(
+		TARGET ${RUNTIME_TARGET}
+		APPEND_STRING
+		PROPERTY
+			LINK_FLAGS
+			" -Wl,-exported_symbols_list,\"${CMAKE_CURRENT_SOURCE_DIR}/exported_symbols.list\""
+		)
+	set_property(
+		TARGET ${RUNTIME_TARGET}
+		APPEND
+		PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/exported_symbols.list"
+		)
 elseif(NOT WIN32)
 	# Force the main "negotiate" symbol's inclusion
-	# and use a version script to ensure that's the only one we expose.
+	# and use a version script to ensure only the gated symbols are
+	# exposed. The version script enumerates the aux export surface per
+	# ADR-019; only those + xrNegotiateLoaderRuntimeInterface are global.
 	set_property(
 		TARGET ${RUNTIME_TARGET}
 		APPEND_STRING
@@ -156,6 +167,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
 		TARGETS ${RUNTIME_TARGET}
 		LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT Runtime
 		RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT Runtime
+		# DisplayXRClient.lib — import library that vendor plug-in DLLs
+		# link against to resolve the aux export surface (ADR-019).
+		# The SHARED target type makes MSVC's auto-generated .lib a
+		# first-class CMake artifact promotable via the ARCHIVE slot.
+		ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT Development
 		)
 	if("${CMAKE_VERSION}" VERSION_GREATER_EQUAL 3.21)
 		# This generator expression is easier to control than install(RUNTIME_DEPENDENCY_SETS),

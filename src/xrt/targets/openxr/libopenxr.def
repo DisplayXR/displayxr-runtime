@@ -1,4 +1,99 @@
 ; Copyright 2019, Collabora, Ltd.
+; Copyright 2026, Leia Inc.
 ; SPDX-License-Identifier: BSL-1.0
+;
+; Exported symbols of DisplayXRClient.dll. The Khronos OpenXR loader
+; calls xrNegotiateLoaderRuntimeInterface. The remaining symbols are
+; the runtime DLL's aux export surface consumed by vendor plug-in DLLs
+; via the import library DisplayXRClient.lib. See
+; docs/adr/ADR-019-vendor-plugin-aux-boundary.md for the per-symbol
+; rationale; the headers under src/xrt/auxiliary/util/ carry the
+; XRT_API_FUNC decoration that mirrors this list on the import side.
+
 EXPORTS
+    ; --- Khronos OpenXR loader interface ---
     xrNegotiateLoaderRuntimeInterface
+
+    ; --- u_logging.h ---
+    u_log
+    u_log_xdev
+    u_log_hex
+    u_log_xdev_hex
+    u_log_print_result
+    u_log_set_sink
+    u_log_get_global_level
+
+    ; --- u_file_logging.h ---
+    u_file_logging_init
+    u_file_logging_write_raw
+    u_file_logging_shutdown
+
+    ; --- u_var.h ---
+    u_var_add_root
+    u_var_remove_root
+    u_var_visit
+    u_var_force_on
+    u_var_add_bool
+    u_var_add_rgb_u8
+    u_var_add_rgb_f32
+    u_var_add_u8
+    u_var_add_u16
+    u_var_add_u64
+    u_var_add_i32
+    u_var_add_i64
+    u_var_add_f32
+    u_var_add_f64
+    u_var_add_f32_arr
+    u_var_add_f32_timing
+    u_var_add_vec3_i32
+    u_var_add_vec3_f32
+    u_var_add_pose
+    u_var_add_sink_debug
+    u_var_add_native_images_debug
+    u_var_add_log_level
+    u_var_add_ro_text
+    u_var_add_ro_ftext
+    u_var_add_ro_i16
+    u_var_add_ro_i32
+    u_var_add_ro_u16
+    u_var_add_ro_u32
+    u_var_add_ro_f32
+    u_var_add_ro_i64
+    u_var_add_ro_u64
+    u_var_add_ro_f64
+    u_var_add_ro_i64_ns
+    u_var_add_ro_vec3_i32
+    u_var_add_ro_vec3_f32
+    u_var_add_ro_quat_f32
+    u_var_add_ro_ff_f64
+    u_var_add_ro_ff_vec3_f32
+    u_var_add_gui_header
+    u_var_add_gui_header_begin
+    u_var_add_gui_header_end
+    u_var_add_button
+    u_var_add_combo
+    u_var_add_draggable_f32
+    u_var_add_draggable_u16
+    u_var_add_histogram_f32
+    u_var_add_curve
+    u_var_add_curves
+
+    ; --- u_metrics.h ---
+    u_metrics_init
+    u_metrics_close
+    u_metrics_is_active
+    u_metrics_write_session_frame
+    u_metrics_write_used
+    u_metrics_write_system_frame
+    u_metrics_write_system_gpu_info
+    u_metrics_write_system_present_info
+
+    ; --- u_trace_marker.h ---
+    u_trace_marker_setup
+    u_trace_marker_init
+
+    ; --- u_limited_unique_id.h ---
+    u_limited_unique_id_get
+
+    ; --- u_pacing.h ---
+    u_pa_factory_create

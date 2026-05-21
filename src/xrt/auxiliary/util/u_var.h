@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include "xrt/xrt_api.h"
 #include "xrt/xrt_defines.h" // IWYU pragma: keep
 
 #include "util/u_logging.h"
@@ -342,7 +343,7 @@ typedef void (*u_var_elm_cb)(struct u_var_info *info, void *);
  *
  * @ingroup aux_util
  */
-void
+XRT_API_FUNC void
 u_var_add_root(void *root, const char *c_name, bool suffix_with_number);
 
 /*!
@@ -350,7 +351,7 @@ u_var_add_root(void *root, const char *c_name, bool suffix_with_number);
  *
  * @ingroup aux_util
  */
-void
+XRT_API_FUNC void
 u_var_remove_root(void *root);
 
 /*!
@@ -358,7 +359,7 @@ u_var_remove_root(void *root);
  *
  * @ingroup aux_util
  */
-void
+XRT_API_FUNC void
 u_var_visit(u_var_root_cb enter_cb, u_var_root_cb exit_cb, u_var_elm_cb elem_cb, void *priv);
 
 /*!
@@ -366,7 +367,7 @@ u_var_visit(u_var_root_cb enter_cb, u_var_root_cb exit_cb, u_var_elm_cb elem_cb,
  *
  * @ingroup aux_util
  */
-void
+XRT_API_FUNC void
 u_var_force_on(void);
 
 #define U_VAR_ADD_FUNCS()                                                                                              \
@@ -415,7 +416,7 @@ u_var_force_on(void);
 	ADD_FUNC(curve, struct u_var_curve, CURVE)                                                                     \
 	ADD_FUNC(curves, struct u_var_curves, CURVES)
 
-#define ADD_FUNC(SUFFIX, TYPE, ENUM) void u_var_add_##SUFFIX(void *, TYPE *, const char *);
+#define ADD_FUNC(SUFFIX, TYPE, ENUM) XRT_API_FUNC void u_var_add_##SUFFIX(void *, TYPE *, const char *);
 
 U_VAR_ADD_FUNCS()
 

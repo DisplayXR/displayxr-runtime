@@ -1,0 +1,106 @@
+# Copyright 2026, Leia Inc.
+# SPDX-License-Identifier: BSL-1.0
+#
+# Exported symbols of the runtime dynamic library (macOS). Mirrored on
+# Windows by libopenxr.def and on Linux by libopenxr.version. See
+# docs/adr/ADR-019-vendor-plugin-aux-boundary.md for the per-symbol
+# rationale.
+#
+# Mach-O exported_symbols_list format: one symbol per line, leading
+# underscore for C linkage (the Mach-O ABI prefixes external C symbols
+# with '_').
+
+# --- Khronos OpenXR loader interface ---
+_xrNegotiateLoaderRuntimeInterface
+
+# --- sim_display in-process driver hook (legacy, kept for compatibility) ---
+_sim_display_set_output_mode
+
+# --- u_logging.h ---
+_u_log
+_u_log_xdev
+_u_log_hex
+_u_log_xdev_hex
+_u_log_print_result
+_u_log_set_sink
+_u_log_get_global_level
+
+# --- u_file_logging.h (stub bodies on non-Windows) ---
+_u_file_logging_init
+_u_file_logging_write_raw
+_u_file_logging_shutdown
+
+# --- u_var.h ---
+_u_var_add_root
+_u_var_remove_root
+_u_var_visit
+_u_var_force_on
+_u_var_add_bool
+_u_var_add_rgb_u8
+_u_var_add_rgb_f32
+_u_var_add_u8
+_u_var_add_u16
+_u_var_add_u64
+_u_var_add_i32
+_u_var_add_i64
+_u_var_add_f32
+_u_var_add_f64
+_u_var_add_f32_arr
+_u_var_add_f32_timing
+_u_var_add_vec3_i32
+_u_var_add_vec3_f32
+_u_var_add_pose
+_u_var_add_sink_debug
+_u_var_add_native_images_debug
+_u_var_add_log_level
+_u_var_add_ro_text
+_u_var_add_ro_ftext
+_u_var_add_ro_i16
+_u_var_add_ro_i32
+_u_var_add_ro_u16
+_u_var_add_ro_u32
+_u_var_add_ro_f32
+_u_var_add_ro_i64
+_u_var_add_ro_u64
+_u_var_add_ro_f64
+_u_var_add_ro_i64_ns
+_u_var_add_ro_vec3_i32
+_u_var_add_ro_vec3_f32
+_u_var_add_ro_quat_f32
+_u_var_add_ro_ff_f64
+_u_var_add_ro_ff_vec3_f32
+_u_var_add_gui_header
+_u_var_add_gui_header_begin
+_u_var_add_gui_header_end
+_u_var_add_button
+_u_var_add_combo
+_u_var_add_draggable_f32
+_u_var_add_draggable_u16
+_u_var_add_histogram_f32
+_u_var_add_curve
+_u_var_add_curves
+
+# --- u_metrics.h ---
+_u_metrics_init
+_u_metrics_close
+_u_metrics_is_active
+_u_metrics_write_session_frame
+_u_metrics_write_used
+_u_metrics_write_system_frame
+_u_metrics_write_system_gpu_info
+_u_metrics_write_system_present_info
+
+# --- u_trace_marker.h ---
+_u_trace_marker_setup
+_u_trace_marker_init
+
+# --- u_limited_unique_id.h ---
+_u_limited_unique_id_get
+
+# --- u_pacing.h ---
+_u_pa_factory_create
+
+# --- macOS-only os_macos.c (window-closed atomic accessors) ---
+_oxr_macos_window_closed
+_oxr_macos_reset_window_closed
+_oxr_macos_set_window_closed
