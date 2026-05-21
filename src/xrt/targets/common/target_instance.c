@@ -50,6 +50,10 @@
 // sim_display display info for XR_EXT_display_info fallback
 #include "sim_display/sim_display_interface.h"
 
+#if defined(XRT_OS_ANDROID) && defined(XRT_HAVE_CNSDK)
+#include "leia/leia_display_processor_cnsdk.h"
+#endif
+
 #include "target_instance_parts.h"
 
 #include <assert.h>
@@ -362,6 +366,14 @@ out:
 				}
 			}
 		}
+
+#if defined(XRT_OS_ANDROID) && defined(XRT_HAVE_CNSDK)
+		// Android: CNSDK is the only vendor DP. No SR SDK on Android.
+		// POC stub today — process_atlas is a no-op until #126 lands.
+		if (xsysc->info.dp_factory_vk == NULL) {
+			xsysc->info.dp_factory_vk = (void *)leia_dp_factory_cnsdk;
+		}
+#endif
 
 		assert(out_xsysc != NULL);
 		*out_xsysc = xsysc;

@@ -247,7 +247,9 @@ if(XRT_HAVE_CNSDK AND NOT TARGET drv_leia)
 		leia/leia_types.h
 		leia/leia_sr_probe.cpp
 		leia/leia_cnsdk.cpp
-		leia/leia_cnsdk.h)
+		leia/leia_cnsdk.h
+		leia/leia_display_processor_cnsdk.cpp
+		leia/leia_display_processor_cnsdk.h)
 	target_link_libraries(drv_leia PRIVATE
 		xrt-interfaces aux_util aux_os aux_math
 		CNSDK::leiaSDK

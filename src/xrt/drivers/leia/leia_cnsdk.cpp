@@ -94,7 +94,8 @@ leia_cnsdk_destroy(struct leia_cnsdk **cnsdk_ptr)
 	}
 
 	if (cnsdk->core != NULL) {
-		leia_core_release(cnsdk->core);
+		// CNSDK 0.7.28 renamed leia_core_release → leia_core_shutdown.
+		leia_core_shutdown(cnsdk->core);
 		cnsdk->core = NULL;
 	}
 
@@ -144,8 +145,10 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 	}
 
 	leia_interlacer_set_flip_input_uv_vertical(cnsdk->interlacer, true);
-	leia_interlacer_vulkan_set_view_for_texture_array(cnsdk->interlacer, 0, left, 0);
-	leia_interlacer_vulkan_set_view_for_texture_array(cnsdk->interlacer, 1, right, 0);
+	// CNSDK 0.7.28: set_view_for_texture_array dropped its trailing arg
+	// (was used to disambiguate per-array-layer; now layer is implicit).
+	leia_interlacer_vulkan_set_view_for_texture_array(cnsdk->interlacer, 0, left);
+	leia_interlacer_vulkan_set_view_for_texture_array(cnsdk->interlacer, 1, right);
 	leia_interlacer_set_shader_debug_mode(cnsdk->interlacer, LEIA_SHADER_DEBUG_MODE_NONE);
 	leia_interlacer_vulkan_do_post_process(
 	    cnsdk->interlacer, w, h, false, fb, targetImage, NULL, NULL, NULL, 0);

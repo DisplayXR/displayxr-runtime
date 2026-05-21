@@ -80,6 +80,12 @@ if(XRT_MODULE_COMPOSITOR_MAIN OR XRT_MODULE_COMPOSITOR_NULL)
 		target_include_directories(target_instance PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../drivers)
 	endif()
 
+	# Android: drv_leia is built from CNSDK-only sources for the CNSDK DP factory.
+	if(ANDROID AND XRT_HAVE_CNSDK)
+		target_link_libraries(target_instance PRIVATE drv_leia)
+		target_include_directories(target_instance PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../drivers)
+	endif()
+
 	# Hybrid mode: create a separate library that exports native_instance_create
 	# instead of xrt_instance_create to avoid symbol conflict with IPC client
 	if(XRT_FEATURE_HYBRID_MODE)
