@@ -81,7 +81,7 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 	 * device shape, just an in-process construction. Issue #256.
 	 */
 	struct xrt_device *head = NULL;
-	const struct xrt_plugin_iface *plugin = target_plugin_get_sim_display();
+	const struct xrt_plugin_iface *plugin = target_plugin_get_active();
 	if (plugin != NULL && plugin->create_device != NULL) {
 		if (plugin->create_device(NULL, &head) != XRT_SUCCESS) {
 			head = NULL;
