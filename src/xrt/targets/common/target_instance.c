@@ -347,7 +347,7 @@ out:
 				// the in-tree statically-linked sim_display_dp_factory_*. NULL
 				// from the iface (per-API not supported on this platform) also
 				// falls through to the static path.
-				const struct xrt_plugin_iface *sd_plugin = target_plugin_get_sim_display();
+				const struct xrt_plugin_iface *sd_plugin = target_plugin_get_active();
 				if (xsysc->info.dp_factory_vk == NULL) {
 					xsysc->info.dp_factory_vk = (void *)((sd_plugin && sd_plugin->create_dp_vk)
 					                                         ? sd_plugin->create_dp_vk

@@ -5,18 +5,24 @@
  * @brief  Runtime-side loader for vendor plug-in DLLs.
  *
  * Implements the consumer side of the ABI defined in
- * `xrt/xrt_plugin.h`. At its first call, the loader tries to
- * `LoadLibraryExW` the sim_display plug-in DLL from
- * `<runtime DLL dir>/plugins/DisplayXR-SimDisplay.dll`, resolves
- * `xrtPluginNegotiate`, runs the version handshake, and caches the
- * returned @ref xrt_plugin_iface. Subsequent calls return the cached
- * iface (or NULL if the load failed).
+ * `xrt/xrt_plugin.h`. On first call, the loader enumerates
+ * `HKLM\Software\DisplayXR\DisplayProcessors\*` (Windows) — the
+ * registry schema documented in
+ * `docs/roadmap/vendor-plugin-architecture.md` §4.1 — sorts the
+ * registered plug-ins by their `ProbeOrder` value (ascending; missing
+ * = 100), and tries each in turn: `LoadLibraryExW` → `GetProcAddress`
+ * → `xrtPluginNegotiate` → `iface->probe()`. The first plug-in whose
+ * probe returns `XRT_SUCCESS` wins and is cached for the process's
+ * lifetime; subsequent registry entries are not attempted.
+ *
+ * The loader is intentionally per-process and one-shot. Multi-vendor
+ * heterogeneous setups (multiple active plug-ins concurrently) are a
+ * v2 problem per the plan's non-goals (§3).
  *
  * The plug-in DLL handle is intentionally leaked for the process
- * lifetime — the DP factories returned by the iface are stored in
+ * lifetime — the iface holds the DP factories that get stored in
  * `xrt_system_compositor_info` and must remain callable until session
- * teardown. Proper shutdown becomes meaningful when registry-driven
- * discovery + per-instance lifecycle land in the next step.
+ * teardown.
  *
  * Issue #256 — vendor plug-in re-architecture.
  *
@@ -33,22 +39,27 @@ extern "C" {
 #endif
 
 /*!
- * Returns the @ref xrt_plugin_iface for the sim_display plug-in DLL, or
- * NULL if the plug-in is unavailable. NULL is the signal for callers to
- * fall back to the statically-linked `sim_display_*` symbols.
+ * Returns the @ref xrt_plugin_iface for the active plug-in (whichever
+ * registered plug-in's probe succeeded first per `ProbeOrder`), or
+ * NULL if none claimed the system. NULL is the signal for callers to
+ * fall back to the statically-linked driver symbols.
  *
  * Reasons the loader returns NULL:
- *   - Non-Windows platform (v1 limitation; plug-in path is Windows-only).
- *   - Plug-in DLL not present at `<runtime>/plugins/DisplayXR-SimDisplay.dll`
- *     (typical for developer builds that don't `install`).
- *   - `xrtPluginNegotiate` missing or returns a non-`XRT_SUCCESS`
- *     result (e.g. ABI version mismatch).
+ *   - Non-Windows platform (v1 limitation; the manifest-driven Linux
+ *     and macOS discovery lands with the cross-platform port).
+ *   - `HKLM\Software\DisplayXR\DisplayProcessors` absent or empty
+ *     (typical for developer builds that haven't run the installer or
+ *     written the registry entry by hand).
+ *   - Every registered plug-in failed to load, declined at
+ *     `xrtPluginNegotiate`, or returned non-`XRT_SUCCESS` from
+ *     `iface->probe()`.
  *
- * Thread-safety: not safe under concurrent first-call. v1 assumes
- * single-threaded instance creation.
+ * Thread-safety: not safe under concurrent first-call. The runtime
+ * resolves this from `xrCreateInstance`, which is single-threaded
+ * per the OpenXR spec.
  */
 const struct xrt_plugin_iface *
-target_plugin_get_sim_display(void);
+target_plugin_get_active(void);
 
 #ifdef __cplusplus
 }
