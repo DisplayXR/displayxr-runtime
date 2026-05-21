@@ -169,10 +169,6 @@ struct comp_d3d11_window
 	volatile LONG input_forward_rect_w;
 	volatile LONG input_forward_rect_h;
 
-	//! Desired cursor ID (compositor thread writes, window thread reads in WM_SETCURSOR).
-	//! 0=arrow, 1=sizewe, 2=sizens, 3=sizenwse, 4=sizenesw, 5=sizeall
-	volatile LONG desired_cursor;
-
 	//! Accumulated scroll wheel delta for workspace window resize (positive = enlarge).
 	//! Written by WndProc, read+reset by render loop.
 	volatile LONG scroll_accum;
@@ -438,15 +434,13 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 	switch (message) {
 	case WM_SETCURSOR:
-		// Phase 2.J / 3D cursor: hide the OS cursor over the workspace
-		// window's client area. The runtime renders its own cursor sprite
-		// into the atlas at the per-frame raycast hit's z-depth (with
-		// per-eye disparity), so the OS cursor at z=0 would either fight
-		// with it or appear at a different perceived depth. SetCursor(NULL)
-		// hides the OS arrow but Win32 keeps tracking the cursor position
-		// for hit-test, drag operations, and event delivery — only the
-		// visual is suppressed. desired_cursor is still tracked (used by
-		// the runtime to pick which sprite to render).
+		// Hide the OS cursor over the workspace window's client area.
+		// The runtime renders its own 3D cursor sprite into the atlas at
+		// the per-frame raycast hit's z-depth with per-eye disparity
+		// (spec_version 13: sprite content is controller-pushed via
+		// xrSetWorkspaceCursorEXT). Win32 keeps tracking the cursor
+		// position for hit-test, drag operations, and event delivery —
+		// only the visual is suppressed.
 		if (LOWORD(lParam) == HTCLIENT) {
 			SetCursor(NULL);
 			return TRUE;
@@ -1553,13 +1547,6 @@ comp_d3d11_window_consume_scroll(struct comp_d3d11_window *window)
 		return 0;
 	}
 	return (int32_t)InterlockedExchange(&window->scroll_accum, 0);
-}
-
-extern "C" void
-comp_d3d11_window_set_cursor(struct comp_d3d11_window *window, int cursor_id)
-{
-	if (window == NULL) return;
-	InterlockedExchange(&window->desired_cursor, (LONG)cursor_id);
 }
 
 extern "C" void

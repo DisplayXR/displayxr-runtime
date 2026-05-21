@@ -896,6 +896,14 @@ XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrUpdateWorkspaceClientChromeLayerPoseEXT(XrSession session,
                                               XrWorkspaceClientId clientId,
                                               const XrPosef *poseInClient);
+//! OpenXR API function @ep{xrCreateWorkspaceCursorSwapchainEXT} (spec_version 13)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrCreateWorkspaceCursorSwapchainEXT(XrSession session,
+                                         const XrWorkspaceCursorSwapchainCreateInfoEXT *createInfo,
+                                         XrSwapchain *swapchain);
+//! OpenXR API function @ep{xrSetWorkspaceCursorEXT} (spec_version 13)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceCursorEXT(XrSession session, const XrWorkspaceCursorInfoEXT *info);
 //! OpenXR API function @ep{xrAcquireWorkspaceWakeupEventEXT}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrAcquireWorkspaceWakeupEventEXT(XrSession session, uint64_t *outNativeHandle);

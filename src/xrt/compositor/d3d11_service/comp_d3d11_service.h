@@ -576,6 +576,20 @@ comp_d3d11_service_workspace_update_chrome_layer_pose_by_slot(struct xrt_system_
                                                               const struct xrt_pose *pose_in_client);
 
 /*!
+ * spec_version 13: set the active controller-pushed cursor source. The
+ * caller (IPC handler) resolves the controller-side swapchain id to an
+ * xrt_swapchain*; this stashes the borrowed ref + cursor params on the
+ * service-system. The per-frame cursor render samples the swapchain's
+ * latest released image. Pass xsc=NULL to hide the cursor.
+ */
+xrt_result_t
+comp_d3d11_service_workspace_set_cursor(struct xrt_system_compositor *xsysc,
+                                         struct xrt_swapchain *xsc,
+                                         float hot_x, float hot_y,
+                                         float size_meters,
+                                         bool visible);
+
+/*!
  * Phase 2.C spec_version 8: lazy-create + return the workspace wakeup
  * event handle (Win32 HANDLE on Windows). The IPC handler then DuplicateHandle's
  * it into the controller process so the controller can wait on it instead

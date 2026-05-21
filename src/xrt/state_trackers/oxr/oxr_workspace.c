@@ -152,6 +152,11 @@ xrt_result_t
 comp_ipc_client_compositor_workspace_update_chrome_layer_pose(struct xrt_compositor *xc,
                                                               uint32_t client_id,
                                                               const struct xrt_pose *pose_in_client);
+// spec_version 13: cursor source.
+struct ipc_workspace_cursor_info;
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_cursor(struct xrt_compositor *xc,
+                                                 const struct ipc_workspace_cursor_info *info);
 xrt_result_t
 comp_ipc_client_compositor_workspace_acquire_wakeup_event(struct xrt_compositor *xc,
                                                           xrt_graphics_sync_handle_t *out_handle);
@@ -1145,6 +1150,113 @@ oxr_xrUpdateWorkspaceClientChromeLayerPoseEXT(XrSession session,
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_update_chrome_layer_pose(
 	    &sess->xcn->base, (uint32_t)clientId, &xpose);
 	return xret_to_xr_result(&log, xret, "workspace_update_chrome_layer_pose");
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrCreateWorkspaceCursorSwapchainEXT(XrSession session,
+                                         const XrWorkspaceCursorSwapchainCreateInfoEXT *createInfo,
+                                         XrSwapchain *swapchain)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrCreateWorkspaceCursorSwapchainEXT");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_ARG_NOT_NULL(&log, createInfo);
+	OXR_VERIFY_ARG_NOT_NULL(&log, swapchain);
+
+	if (createInfo->type != XR_TYPE_WORKSPACE_CURSOR_SWAPCHAIN_CREATE_INFO_EXT) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrCreateWorkspaceCursorSwapchainEXT: createInfo->type must be "
+		                 "XR_TYPE_WORKSPACE_CURSOR_SWAPCHAIN_CREATE_INFO_EXT");
+	}
+	if (createInfo->width == 0 || createInfo->height == 0) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrCreateWorkspaceCursorSwapchainEXT: width and height must be > 0");
+	}
+
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrCreateWorkspaceCursorSwapchainEXT requires an IPC-mode session");
+	}
+	if (sess->compositor == NULL) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrCreateWorkspaceCursorSwapchainEXT: session has no compositor");
+	}
+
+	// Mint a regular OpenXR swapchain — same flags as chrome (single-image
+	// color, controller-rendered, cross-process shareable). The runtime
+	// uses xrSetWorkspaceCursorEXT to associate it with the cursor render
+	// pass; the create itself doesn't bind to any role.
+	XrSwapchainCreateInfo sci = {0};
+	sci.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
+	sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+	                 XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
+	                 XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+	sci.format = createInfo->format;
+	sci.sampleCount = createInfo->sampleCount > 0 ? createInfo->sampleCount : 1;
+	sci.width = createInfo->width;
+	sci.height = createInfo->height;
+	sci.faceCount = 1;
+	sci.arraySize = 1;
+	sci.mipCount = createInfo->mipCount > 0 ? createInfo->mipCount : 1;
+
+	struct oxr_swapchain *sc = NULL;
+	XrResult ret = sess->create_swapchain(&log, sess, &sci, &sc);
+	if (ret != XR_SUCCESS) {
+		return ret;
+	}
+	*swapchain = oxr_swapchain_to_openxr(sc);
+	return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceCursorEXT(XrSession session, const XrWorkspaceCursorInfoEXT *info)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceCursorEXT");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_ARG_NOT_NULL(&log, info);
+
+	if (info->type != XR_TYPE_WORKSPACE_CURSOR_INFO_EXT) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrSetWorkspaceCursorEXT: info->type must be XR_TYPE_WORKSPACE_CURSOR_INFO_EXT");
+	}
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrSetWorkspaceCursorEXT requires an IPC-mode session");
+	}
+
+	// Resolve swapchain handle (if any) to the IPC swapchain id.
+	// XR_NULL_HANDLE = hide cursor; we pass UINT32_MAX as the sentinel.
+	struct ipc_workspace_cursor_info ipc_info;
+	ipc_info.swapchain_id = UINT32_MAX;
+	ipc_info.hot_x = info->hotSpot.x;
+	ipc_info.hot_y = info->hotSpot.y;
+	ipc_info.size_meters = info->sizeMeters;
+	ipc_info.visible = info->visible ? 1u : 0u;
+
+	if (info->swapchain != XR_NULL_HANDLE) {
+		struct oxr_swapchain *sc = NULL;
+		OXR_VERIFY_SWAPCHAIN_AND_INIT_LOG(&log, info->swapchain, sc, "xrSetWorkspaceCursorEXT");
+		struct xrt_swapchain *inner = sc->swapchain;
+#ifdef _WIN32
+		struct xrt_swapchain *unwrapped = comp_d3d11_client_get_inner_xrt_swapchain(inner);
+		if (unwrapped != NULL) {
+			inner = unwrapped;
+		}
+#endif
+		ipc_info.swapchain_id = comp_ipc_client_compositor_get_swapchain_id(inner);
+	}
+
+	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_cursor(&sess->xcn->base, &ipc_info);
+	return xret_to_xr_result(&log, xret, "workspace_set_cursor");
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL

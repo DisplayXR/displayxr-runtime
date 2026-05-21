@@ -3283,6 +3283,34 @@ ipc_handle_workspace_set_chrome_layout(volatile struct ipc_client_state *_ics,
 }
 
 xrt_result_t
+ipc_handle_workspace_set_cursor(volatile struct ipc_client_state *_ics,
+                                 const struct ipc_workspace_cursor_info *info)
+{
+	struct ipc_server *s = _ics->server;
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL || info == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	// UINT32_MAX (sentinel) or out-of-range = hide. Otherwise resolve to
+	// the controller's swapchain from its xscs[] table.
+	struct xrt_swapchain *xsc = NULL;
+	if (info->swapchain_id != UINT32_MAX && info->swapchain_id < IPC_MAX_CLIENT_SWAPCHAINS) {
+		xsc = (struct xrt_swapchain *)_ics->xscs[info->swapchain_id];
+	}
+
+	return comp_d3d11_service_workspace_set_cursor(s->xsysc, xsc,
+	                                                info->hot_x, info->hot_y,
+	                                                info->size_meters,
+	                                                info->visible != 0);
+#else
+	(void)s;
+	(void)info;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
 ipc_handle_workspace_update_chrome_layer_pose(volatile struct ipc_client_state *_ics,
                                               uint32_t client_id,
                                               const struct xrt_pose *pose_in_client)

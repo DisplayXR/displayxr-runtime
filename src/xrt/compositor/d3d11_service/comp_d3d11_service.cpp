@@ -449,20 +449,21 @@ struct d3d11_service_system
 	};
 	struct launcher_icon launcher_icons[IPC_LAUNCHER_MAX_APPS];
 
-	//! Phase 2.J / 3D cursor: Win32 system cursors (IDC_ARROW etc.) loaded
-	//! into D3D11 textures so the runtime can render them at the per-frame
-	//! ray-cast hit's z-depth with proper per-eye disparity. Indexed by the
-	//! same cursor_id 0..5 the OS-cursor-swap path uses (0=arrow, 1=sizewe,
-	//! 2=sizens, 3=sizenwse, 4=sizenesw, 5=sizeall). Hot spots stored too
-	//! so the rendered cursor's "click point" lands at the actual mouse
-	//! pixel instead of the bitmap's top-left.
-	struct cursor_image {
-		wil::com_ptr<ID3D11ShaderResourceView> srv;
-		uint32_t w = 0, h = 0;
-		int hot_x = 0, hot_y = 0;
-	};
-	struct cursor_image cursor_images[6];
-	bool cursor_images_loaded = false;
+	//! spec_version 13: controller-pushed cursor sprite source. The controller
+	//! creates a session-global swapchain (xrCreateWorkspaceCursorSwapchainEXT),
+	//! renders its sprite into it, and points the runtime at it via
+	//! xrSetWorkspaceCursorEXT. The runtime samples the swapchain's latest
+	//! released image in the cursor render pass. NULL = cursor hidden.
+	//!
+	//! cursor_xsc is a borrowed ref (the controller owns the lifetime via the
+	//! XrSwapchain handle). When the controller destroys the swapchain we
+	//! clear this on the runtime side via either an explicit set-cursor with
+	//! XR_NULL_HANDLE or implicitly when the IPC swapchain table releases.
+	struct xrt_swapchain *cursor_xsc;
+	float cursor_hot_x;            //!< Sprite UV X of click point [0,1]
+	float cursor_hot_y;            //!< Sprite UV Y of click point [0,1]
+	float cursor_size_m;           //!< Physical size (width = height)
+	bool  cursor_visible;          //!< Controller can hide without releasing swapchain
 
 	//! MCP capture_frame cross-thread hand-off (Phase B slice 7).
 	struct mcp_capture_request mcp_capture;
@@ -1112,6 +1113,15 @@ struct d3d11_multi_compositor
 	uint32_t hovered_chrome_region_id;
 	uint32_t hovered_chrome_region_id_last_emitted;
 
+	//! spec_version 13: per-frame hovered hit-region (CONTENT, TITLE_BAR,
+	//! EDGE_RESIZE_N, NE, …). Updated from workspace_raycast_hit_test's
+	//! edge_flags + chrome detection. POINTER_HOVER fires on any
+	//! transition so the controller can drive cursor-shape switching
+	//! (resize-arrow on edge hover, etc.) without enabling continuous
+	//! pointer capture. Values match XrWorkspaceHitRegionEXT.
+	uint32_t hovered_hit_region;
+	uint32_t hovered_hit_region_last_emitted;
+
 	//! spec_version 8: last value of focused_slot we signaled the wakeup event
 	//! for. The drain emits FOCUS_CHANGED based on focused_slot_last_emitted;
 	//! this separate snapshot lives in render_pass so we can wake the
@@ -1137,18 +1147,14 @@ struct d3d11_multi_compositor
 	//! Unlike window_dismissed, the multi-comp structure stays alive for re-activation.
 	bool suspended;
 
-	//! Phase 2.J / 3D cursor: render state published by render_pass and consumed
-	//! by the cursor render pass after all atlas content. The cursor is drawn
-	//! at (cursor_panel_x, cursor_panel_y) in panel pixels; per-eye disparity
-	//! is derived from cursor_hit_z_m so the cursor floats at the same depth
-	//! as whatever the user is pointing at (0 = panel plane, no disparity).
-	//! cursor_id 0..5 picks one of sys->cursor_images; cursor_visible gates
-	//! the entire pass (false during suspend/dismiss).
-	int32_t cursor_id;
+	//! spec_version 13: cursor screen position + hit-Z published by the
+	//! per-frame raycast in render_pass. The cursor render pass uses these
+	//! to draw the controller-pushed sprite (sys->cursor_xsc) at per-tile
+	//! per-eye disparity. Shape / visibility are NOT runtime-side — see
+	//! sys->cursor_xsc + sys->cursor_visible (controller-pushed).
 	int32_t cursor_panel_x;
 	int32_t cursor_panel_y;
 	float   cursor_hit_z_m;
-	bool    cursor_visible;
 
 	//! Phase 5.7: spatial launcher panel visible.
 	//! Toggled by Ctrl+L via ipc_call_launcher_set_visible. When true, the
@@ -1165,14 +1171,6 @@ struct d3d11_multi_compositor
 		float start_pos_x;   //!< Window pose.position.x at drag start (meters)
 		float start_pos_y;   //!< Window pose.position.y at drag start (meters)
 	} drag;
-
-	//! Cached cursor handles for resize.
-	HCURSOR cursor_arrow;
-	HCURSOR cursor_sizewe;   // left-right
-	HCURSOR cursor_sizens;   // up-down
-	HCURSOR cursor_sizenwse; // NW-SE diagonal
-	HCURSOR cursor_sizenesw; // NE-SW diagonal
-	HCURSOR cursor_sizeall;  // move/grab (title drag, right-click drag)
 
 	//! Momentary toast notification (e.g. "how to restore after fullscreen").
 	char toast_text[256];
@@ -4823,6 +4821,7 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
  * Unregister a per-client compositor from the multi-compositor.
  */
 static void multi_compositor_render(struct d3d11_service_system *sys); // forward decl
+static uint32_t hit_result_to_region(const struct workspace_hit_result &hit);   // forward decl
 
 static void
 multi_compositor_unregister_client(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
@@ -5736,14 +5735,6 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 		}
 	}
 
-	// Load cursor handles for resize feedback
-	mc->cursor_arrow = LoadCursor(NULL, IDC_ARROW);
-	mc->cursor_sizewe = LoadCursor(NULL, IDC_SIZEWE);
-	mc->cursor_sizens = LoadCursor(NULL, IDC_SIZENS);
-	mc->cursor_sizenwse = LoadCursor(NULL, IDC_SIZENWSE);
-	mc->cursor_sizenesw = LoadCursor(NULL, IDC_SIZENESW);
-	mc->cursor_sizeall = LoadCursor(NULL, IDC_SIZEALL);
-
 	U_LOG_W("Multi-comp: output ready (window=%p, swap_chain=%p)", mc->hwnd, mc->swap_chain.get());
 	return XRT_SUCCESS;
 }
@@ -5785,11 +5776,6 @@ struct workspace_hit_result
 
 static void launcher_set_visible(struct d3d11_service_system *sys,
                                  struct d3d11_multi_compositor *mc, bool visible);
-
-// Phase 2.J / 3D cursor: forward decl. Defined near the create_system block
-// further down. Lazy-loads Win32 cursor bitmaps into D3D11 textures the first
-// time the runtime needs to render a cursor sprite.
-static void ensure_cursor_images_loaded(struct d3d11_service_system *sys);
 
 // Phase 5.13: pop a Win32 context menu at the cursor for a launcher tile.
 // Launch fires the tile like a click; Remove sets hidden_tile_mask so the
@@ -6956,115 +6942,69 @@ multi_compositor_render(struct d3d11_service_system *sys)
 after_key_shortcuts:
 	(void)0; // label target for the launcher-visible fast-path above.
 
-	// Update cursor via window thread (compositor thread can't call SetCursor directly).
-	// Cursor IDs: 0=arrow, 1=sizewe, 2=sizens, 3=sizenwse, 4=sizenesw, 5=sizeall
-	//
-	// Phase 2.J / 3D cursor: also publishes (cursor_id, cursor_panel_x, cursor_panel_y,
-	// cursor_hit_z_m) onto mc so the cursor render pass can draw a 3D-disparity
-	// cursor sprite at the hit's z-depth. We hoist GetCursorPos + raycast to
-	// the top of the block so all branches (drag/resize/hover) feed the same
-	// publish step.
+	// Per-frame raycast: drives wakeup signaling AND publishes cursor
+	// position + hit-Z for the cursor render pass. spec_version 13: cursor
+	// SHAPE / SPRITE / VISIBILITY are the workspace controller's job (via
+	// xrSetWorkspaceCursorEXT — the controller pushes its own swapchain).
+	// The runtime still owns POSITION + HIT-Z + over-window dimming because
+	// those depend on the per-frame raycast that's plumbing, not policy.
 	if (mc->window != nullptr) {
 		POINT cpt = {0, 0};
 		GetCursorPos(&cpt);
 		ScreenToClient(mc->hwnd, &cpt);
 		struct workspace_hit_result cursor_hover = workspace_raycast_hit_test(sys, mc, cpt);
 
-		int cursor_id = 0; // arrow
-		{
-			struct workspace_hit_result &hover = cursor_hover;
-
-			// Phase 2.C C3.C-4: publish per-frame hovered slot so
-			// workspace_drain_input_events can emit POINTER_HOVER on
-			// transitions. Lets the shell drive its controller-side
-			// chrome fade in modes where pointer capture is OFF
-			// (grid/immersive — most use). C5: the in-runtime chrome
-			// fade-seed loop that used to live here is gone with the
-			// chrome render block; this single line is the only state
-			// the per-frame hit-test still needs to publish.
-			//
-			// spec_version 8: signal the wakeup event on TRANSITIONS
-			// (not on every frame), so the controller's event-driven
-			// wait wakes only when there's actually something new to
-			// drain.
-			if (mc->hovered_slot != hover.slot) {
-				mc->hovered_slot = hover.slot;
+		// spec_version 8: signal wakeup on hover transitions (not per
+		// frame), so the controller's event-driven wait stays asleep
+		// unless there's something new to drain.
+		if (mc->hovered_slot != cursor_hover.slot) {
+			mc->hovered_slot = cursor_hover.slot;
+			service_signal_workspace_wakeup(sys);
+		}
+		// spec_version 9: same for chrome sub-region.
+		uint32_t new_chrome_region = (cursor_hover.slot >= 0) ? cursor_hover.chrome_region_id : 0;
+		if (mc->hovered_chrome_region_id != new_chrome_region) {
+			mc->hovered_chrome_region_id = new_chrome_region;
+			service_signal_workspace_wakeup(sys);
+		}
+		// spec_version 13: same for hit-region (CONTENT, TITLE_BAR,
+		// EDGE_RESIZE_*). Lets the controller drive cursor-shape on
+		// hover (resize-arrow at edges) without continuous pointer
+		// capture. Uses the same hit_result_to_region mapping as the
+		// POINTER event drain so the controller sees a consistent enum.
+		uint32_t new_hit_region = hit_result_to_region(cursor_hover);
+		if (mc->hovered_hit_region != new_hit_region) {
+			mc->hovered_hit_region = new_hit_region;
+			service_signal_workspace_wakeup(sys);
+		}
+		// Same for focused_slot.
+		if (mc->focused_slot != mc->focused_slot_signaled_value) {
+			mc->focused_slot_signaled_value = mc->focused_slot;
+			service_signal_workspace_wakeup(sys);
+		}
+		// Same for window pose / size — wakes the controller on edge
+		// resize, fullscreen toggle, layout-preset glide.
+		for (int sw = 0; sw < D3D11_MULTI_MAX_CLIENTS; sw++) {
+			struct d3d11_multi_client_slot *cs = &mc->clients[sw];
+			if (!cs->active || cs->client_type == CLIENT_TYPE_CAPTURE) continue;
+			if (cs->workspace_client_id == 0) continue;
+			const float kEps = 1e-5f;
+			if (fabsf(cs->window_width_m  - cs->window_w_last_emitted) > kEps ||
+			    fabsf(cs->window_height_m - cs->window_h_last_emitted) > kEps ||
+			    fabsf(cs->window_pose.position.x - cs->window_pose_last_emitted.position.x) > kEps ||
+			    fabsf(cs->window_pose.position.y - cs->window_pose_last_emitted.position.y) > kEps ||
+			    fabsf(cs->window_pose.position.z - cs->window_pose_last_emitted.position.z) > kEps) {
 				service_signal_workspace_wakeup(sys);
-			}
-			// spec_version 9: same idea for the chrome sub-region. The
-			// per-frame raycast already resolves chrome_region_id from
-			// the hovered slot's chrome_regions[]; we just publish the
-			// transition so the drain can emit POINTER_HOVER and the
-			// controller's wait wakes promptly when the cursor moves
-			// between buttons inside a chrome bar (grip → close, etc.).
-			uint32_t new_chrome_region = (hover.slot >= 0) ? hover.chrome_region_id : 0;
-			if (mc->hovered_chrome_region_id != new_chrome_region) {
-				mc->hovered_chrome_region_id = new_chrome_region;
-				service_signal_workspace_wakeup(sys);
-			}
-			// Same idea for focused_slot — wakes the controller's wait
-			// when focus shifts via TAB / click / controller-set / disc
-			// onnect, so FOCUS_CHANGED reaches the shell promptly. The
-			// many write sites scattered across the file all converge
-			// here once per frame; comparing against the last per-frame
-			// snapshot catches them all without instrumenting each
-			// callsite individually.
-			if (mc->focused_slot != mc->focused_slot_signaled_value) {
-				mc->focused_slot_signaled_value = mc->focused_slot;
-				service_signal_workspace_wakeup(sys);
-			}
-			// Same idea for window pose / size — wakes the controller's
-			// wait when any chromed slot's pose or dims drift from the
-			// last value the drain emitted, so WINDOW_POSE_CHANGED
-			// reaches the shell promptly when the runtime resizes a
-			// window via edge drag. Bounded per-frame cost (~5 floats
-			// compared per active chromed slot, ≤ D3D11_MULTI_MAX_CLIENTS).
-			for (int sw = 0; sw < D3D11_MULTI_MAX_CLIENTS; sw++) {
-				struct d3d11_multi_client_slot *cs = &mc->clients[sw];
-				if (!cs->active || cs->client_type == CLIENT_TYPE_CAPTURE) continue;
-				if (cs->workspace_client_id == 0) continue;
-				const float kEps = 1e-5f;
-				if (fabsf(cs->window_width_m  - cs->window_w_last_emitted) > kEps ||
-				    fabsf(cs->window_height_m - cs->window_h_last_emitted) > kEps ||
-				    fabsf(cs->window_pose.position.x - cs->window_pose_last_emitted.position.x) > kEps ||
-				    fabsf(cs->window_pose.position.y - cs->window_pose_last_emitted.position.y) > kEps ||
-				    fabsf(cs->window_pose.position.z - cs->window_pose_last_emitted.position.z) > kEps) {
-					service_signal_workspace_wakeup(sys);
-					break; // one signal per frame is enough — drain emits per-slot
-				}
-			}
-
-			// Buttons get arrow cursor (no resize/drag cursor on buttons)
-			if (hover.in_close_btn || hover.in_minimize_btn || hover.in_maximize_btn) {
-				cursor_id = 0; // arrow
-			} else {
-				int ef = hover.edge_flags;
-				if (ef == (RESIZE_LEFT | RESIZE_TOP) || ef == (RESIZE_RIGHT | RESIZE_BOTTOM))
-					cursor_id = 3;
-				else if (ef == (RESIZE_RIGHT | RESIZE_TOP) || ef == (RESIZE_LEFT | RESIZE_BOTTOM))
-					cursor_id = 4;
-				else if (ef & (RESIZE_LEFT | RESIZE_RIGHT))
-					cursor_id = 1;
-				else if (ef & (RESIZE_TOP | RESIZE_BOTTOM))
-					cursor_id = 2;
-				else if (hover.in_grip_handle)
-					cursor_id = 5; // move cursor only on the grip dots
+				break;
 			}
 		}
-		comp_d3d11_window_set_cursor(mc->window, cursor_id);
 
-		// Phase 2.J / 3D cursor: publish state for the runtime-rendered
-		// cursor sprite (drawn after all atlas content with per-eye
-		// disparity). cursor_hit_z_m = 0 when the ray missed all slots,
-		// so the cursor falls back to the panel plane (zero disparity).
-		mc->cursor_id = cursor_id;
+		// Publish cursor screen position + hit Z for the runtime's
+		// cursor render pass to consume. hit_z = 0 when off-window so
+		// the cursor falls back to the panel plane (zero disparity).
 		mc->cursor_panel_x = cpt.x;
 		mc->cursor_panel_y = cpt.y;
 		mc->cursor_hit_z_m = (cursor_hover.slot >= 0) ? cursor_hover.hit_z_m : 0.0f;
-		mc->cursor_visible = true;
-	} else {
-		// No window — no cursor to render.
-		mc->cursor_visible = false;
 	}
 
 	// Left-click: focus window, close button, title bar drag, or content click.
@@ -9626,16 +9566,39 @@ after_key_shortcuts:
 	// DP weaves all tiles into the final display so the cursor reads as a
 	// single 3D-positioned point regardless of how the panel multiplexes
 	// views. Per-tile X disparity is keyed off col % 2 (eye index).
-	if (mc->cursor_visible) {
+	// spec_version 13: cursor sprite source is controller-pushed (a chrome-
+	// style swapchain on sys->cursor_xsc). Runtime keeps the per-tile per-
+	// eye-disparity rendering with hit-Z math + over-window dimming;
+	// controller owns the sprite content (shape, color, animation,
+	// branding) via xrCreateWorkspaceCursorSwapchainEXT + xrSetWorkspaceCursorEXT.
+	if (sys->cursor_visible && sys->cursor_xsc != nullptr) {
 		uint32_t ca_w = sys->base.info.display_pixel_width;
 		uint32_t ca_h = sys->base.info.display_pixel_height;
 		if (ca_w == 0) ca_w = 3840;
 		if (ca_h == 0) ca_h = 2160;
-		ensure_cursor_images_loaded(sys);
-		int cid = mc->cursor_id;
-		if (cid < 0 || cid >= 6) cid = 0; // fallback to arrow
-		auto &ci = sys->cursor_images[cid];
-		if (ci.srv && ci.w > 0 && ci.h > 0) {
+
+		// Resolve controller swapchain → SRV + texture dims. Acquire the
+		// keyed-mutex once per cursor render pass (KEYEDMUTEX semantics
+		// flush controller-side writes into the runtime's D3D11 device).
+		struct d3d11_service_swapchain *cur_sc = d3d11_service_swapchain_from_xrt(sys->cursor_xsc);
+		ID3D11ShaderResourceView *cursor_srv = nullptr;
+		uint32_t sprite_w_px = 0, sprite_h_px = 0;
+		IDXGIKeyedMutex *cursor_mutex = nullptr;
+		bool cursor_mutex_held = false;
+		if (cur_sc != nullptr && cur_sc->image_count > 0 && cur_sc->images[0].srv) {
+			cursor_srv = cur_sc->images[0].srv.get();
+			D3D11_TEXTURE2D_DESC sdesc = {};
+			cur_sc->images[0].texture->GetDesc(&sdesc);
+			sprite_w_px = sdesc.Width;
+			sprite_h_px = sdesc.Height;
+			cursor_mutex = cur_sc->images[0].keyed_mutex.get();
+			if (cursor_mutex != nullptr) {
+				if (SUCCEEDED(cursor_mutex->AcquireSync(0, 4 /* ms */))) {
+					cursor_mutex_held = true;
+				}
+			}
+		}
+		if (cursor_srv != nullptr && sprite_w_px > 0 && sprite_h_px > 0) {
 			// Eye positions: prefer the runtime's predicted eye positions
 			// (Leia SR provides head-tracked values); fall back to fixed
 			// 64 mm IPD at 60 cm if unavailable.
@@ -9692,24 +9655,18 @@ after_key_shortcuts:
 			float base_tile_x = (float)mc->cursor_panel_x * scale_x;
 			float base_tile_y = (float)mc->cursor_panel_y * scale_y;
 
-			// Cursor sprite size + hot spot. Scaled by the active-region
-			// fraction of the panel so the visible cursor lands at OS-
-			// cursor-equivalent visual size after the DP upscale. We
-			// use the smaller of the two axis ratios as a uniform
-			// scale so the cursor always renders square-aspect, even
-			// in asymmetric active regions (e.g. half-width × full-
-			// height) where applying per-axis ratios would visibly
-			// stretch the cursor.
-			const float size_ratio_x =
-			    (float)(tile_w * n_cols) / (float)panel_w;
-			const float size_ratio_y =
-			    (float)(tile_h * n_rows) / (float)panel_h;
-			const float size_ratio =
-			    (size_ratio_x < size_ratio_y) ? size_ratio_x : size_ratio_y;
-			float cursor_w_atlas = (float)ci.w * size_ratio;
-			float cursor_h_atlas = (float)ci.h * size_ratio;
-			float hot_x_atlas    = (float)ci.hot_x * size_ratio;
-			float hot_y_atlas    = (float)ci.hot_y * size_ratio;
+			// Cursor sprite size + hot spot. spec_version 13: physical
+			// size comes from the controller (sys->cursor_size_m), hot
+			// spot from the controller (sys->cursor_hot_x/y in sprite UV).
+			// Map physical meters → atlas pixels through the per-mode
+			// tile width: cursor_w_atlas = (size_m / display_w_m) *
+			// tile_w. After the DP weaver upscales the tile to the
+			// panel, the cursor appears at the requested physical size.
+			(void)n_cols; (void)n_rows; (void)panel_w; (void)panel_h; // size ratio no longer needed
+			float cursor_w_atlas = sys->cursor_size_m / disp_w_m * (float)tile_w;
+			float cursor_h_atlas = cursor_w_atlas; // square aspect for v1
+			float hot_x_atlas    = sys->cursor_hot_x * cursor_w_atlas;
+			float hot_y_atlas    = sys->cursor_hot_y * cursor_h_atlas;
 
 			// Over-window cosmetic: render the cursor at 30 % alpha so
 			// it doesn't fight content behind it (reduces lenticular
@@ -9741,8 +9698,7 @@ after_key_shortcuts:
 			sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 			sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 
-			ID3D11ShaderResourceView *srv = ci.srv.get();
-			sys->context->PSSetShaderResources(0, 1, &srv);
+			sys->context->PSSetShaderResources(0, 1, &cursor_srv);
 			sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
 
 			// Iterate every (col, row) tile in the atlas. Each tile gets
@@ -9770,10 +9726,10 @@ after_key_shortcuts:
 					memset(cb, 0, sizeof(*cb));
 					cb->src_rect[0] = 0;
 					cb->src_rect[1] = 0;
-					cb->src_rect[2] = (float)ci.w;
-					cb->src_rect[3] = (float)ci.h;
-					cb->src_size[0] = (float)ci.w;
-					cb->src_size[1] = (float)ci.h;
+					cb->src_rect[2] = (float)sprite_w_px;
+					cb->src_rect[3] = (float)sprite_h_px;
+					cb->src_size[0] = (float)sprite_w_px;
+					cb->src_size[1] = (float)sprite_h_px;
 					cb->dst_size[0] = (float)ca_w;
 					cb->dst_size[1] = (float)ca_h;
 					cb->dst_offset[0] = dest_x;
@@ -9819,6 +9775,9 @@ after_key_shortcuts:
 			// Restore full-atlas scissor for downstream passes (DP, etc.).
 			D3D11_RECT cfull = {0, 0, (LONG)ca_w, (LONG)ca_h};
 			sys->context->RSSetScissorRects(1, &cfull);
+		}
+		if (cursor_mutex_held) {
+			cursor_mutex->ReleaseSync(0);
 		}
 	}
 
@@ -12368,187 +12327,6 @@ system_destroy(struct xrt_system_compositor *xsysc)
 
 
 /*
- * Phase 2.J / 3D cursor: load a Win32 OS cursor (HCURSOR from
- * LoadCursor(NULL, IDC_*)) into a D3D11 R8G8B8A8_UNORM SRV.
- *
- * Modern Win11 cursors are color cursors with proper alpha; older mono
- * cursors use a 1-bit AND/XOR mask. We handle the color case via
- * GetDIBits on hbmColor; transparency comes from hbmMask (mask bit set
- * = transparent pixel). Mono cursors fall back to the AND/XOR pattern.
- *
- * Hot spot is read from ICONINFO so the cursor's "click point" lands
- * at the actual mouse pixel when rendered.
- */
-static bool
-load_win32_cursor_to_srv(ID3D11Device *device,
-                         HCURSOR hcur,
-                         wil::com_ptr<ID3D11ShaderResourceView> &out_srv,
-                         uint32_t &out_w, uint32_t &out_h,
-                         int &out_hot_x, int &out_hot_y)
-{
-	if (device == nullptr || hcur == NULL) return false;
-
-	ICONINFO ii = {};
-	if (!GetIconInfo(hcur, &ii)) return false;
-
-	BITMAP bm_color = {};
-	BITMAP bm_mask = {};
-	if (ii.hbmColor != NULL) GetObject(ii.hbmColor, sizeof(bm_color), &bm_color);
-	if (ii.hbmMask != NULL)  GetObject(ii.hbmMask,  sizeof(bm_mask),  &bm_mask);
-
-	int width = (bm_color.bmWidth > 0) ? bm_color.bmWidth : bm_mask.bmWidth;
-	// Mono cursor (no color bitmap): mask is 2× height (top half AND, bottom half XOR).
-	int height = (bm_color.bmHeight > 0) ? bm_color.bmHeight : (bm_mask.bmHeight / 2);
-	if (width <= 0 || height <= 0) {
-		if (ii.hbmColor) DeleteObject(ii.hbmColor);
-		if (ii.hbmMask)  DeleteObject(ii.hbmMask);
-		return false;
-	}
-
-	HDC hdc_screen = GetDC(NULL);
-	HDC hdc_mem = CreateCompatibleDC(hdc_screen);
-
-	BITMAPINFO bmi = {};
-	bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-	bmi.bmiHeader.biWidth = width;
-	bmi.bmiHeader.biHeight = -height; // top-down
-	bmi.bmiHeader.biPlanes = 1;
-	bmi.bmiHeader.biBitCount = 32;
-	bmi.bmiHeader.biCompression = BI_RGB;
-
-	std::vector<uint8_t> pixels((size_t)width * height * 4, 0);
-
-	if (ii.hbmColor != NULL) {
-		// Color cursor: extract BGRA color and combine with mask.
-		std::vector<uint8_t> color_px((size_t)width * height * 4, 0);
-		std::vector<uint8_t> mask_px((size_t)width * height * 4, 0);
-		GetDIBits(hdc_mem, ii.hbmColor, 0, (UINT)height, color_px.data(), &bmi, DIB_RGB_COLORS);
-		GetDIBits(hdc_mem, ii.hbmMask,  0, (UINT)height, mask_px.data(),  &bmi, DIB_RGB_COLORS);
-
-		bool color_has_alpha = false;
-		for (int i = 0; i < width * height; i++) {
-			if (color_px[i * 4 + 3] != 0) { color_has_alpha = true; break; }
-		}
-
-		for (int i = 0; i < width * height; i++) {
-			uint8_t b = color_px[i * 4 + 0];
-			uint8_t g = color_px[i * 4 + 1];
-			uint8_t r = color_px[i * 4 + 2];
-			uint8_t a = color_px[i * 4 + 3];
-			if (!color_has_alpha) {
-				// Color bitmap is RGB-only; derive alpha from mask
-				// (mask bit set = transparent in cursor convention).
-				uint8_t m = mask_px[i * 4 + 0];
-				a = (m == 0) ? 255 : 0;
-			}
-			// Output is R8G8B8A8 (R first), so swap R/B from BGRA.
-			pixels[i * 4 + 0] = r;
-			pixels[i * 4 + 1] = g;
-			pixels[i * 4 + 2] = b;
-			pixels[i * 4 + 3] = a;
-		}
-	} else {
-		// Mono cursor: extract AND mask (top half) + XOR mask (bottom).
-		// AND=1 → transparent; AND=0 XOR=0 → black; AND=0 XOR=1 → white;
-		// AND=1 XOR=1 → invert (rare; treat as white).
-		bmi.bmiHeader.biHeight = -(height * 2);
-		std::vector<uint8_t> mask_px((size_t)width * height * 2 * 4, 0);
-		GetDIBits(hdc_mem, ii.hbmMask, 0, (UINT)(height * 2), mask_px.data(), &bmi, DIB_RGB_COLORS);
-		for (int y = 0; y < height; y++) {
-			for (int x = 0; x < width; x++) {
-				int and_idx = (y * width + x) * 4;
-				int xor_idx = ((height + y) * width + x) * 4;
-				uint8_t and_v = mask_px[and_idx + 0];
-				uint8_t xor_v = mask_px[xor_idx + 0];
-				int dst = (y * width + x) * 4;
-				if (and_v != 0) {
-					pixels[dst + 0] = 0;
-					pixels[dst + 1] = 0;
-					pixels[dst + 2] = 0;
-					pixels[dst + 3] = 0;
-				} else {
-					uint8_t c = (xor_v != 0) ? 255 : 0;
-					pixels[dst + 0] = c;
-					pixels[dst + 1] = c;
-					pixels[dst + 2] = c;
-					pixels[dst + 3] = 255;
-				}
-			}
-		}
-	}
-
-	DeleteDC(hdc_mem);
-	ReleaseDC(NULL, hdc_screen);
-
-	D3D11_TEXTURE2D_DESC td = {};
-	td.Width = (UINT)width;
-	td.Height = (UINT)height;
-	td.MipLevels = 1;
-	td.ArraySize = 1;
-	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-	td.SampleDesc.Count = 1;
-	td.Usage = D3D11_USAGE_IMMUTABLE;
-	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-
-	D3D11_SUBRESOURCE_DATA sd = {};
-	sd.pSysMem = pixels.data();
-	sd.SysMemPitch = (UINT)(width * 4);
-
-	wil::com_ptr<ID3D11Texture2D> tex;
-	HRESULT hr = device->CreateTexture2D(&td, &sd, tex.put());
-	if (SUCCEEDED(hr)) {
-		hr = device->CreateShaderResourceView(tex.get(), nullptr, out_srv.put());
-	}
-
-	out_w = (uint32_t)width;
-	out_h = (uint32_t)height;
-	out_hot_x = (int)ii.xHotspot;
-	out_hot_y = (int)ii.yHotspot;
-
-	if (ii.hbmColor) DeleteObject(ii.hbmColor);
-	if (ii.hbmMask)  DeleteObject(ii.hbmMask);
-
-	return SUCCEEDED(hr);
-}
-
-// Phase 2.J / 3D cursor: lazily load all 6 cursor types on first render.
-// Idempotent — returns immediately once cursor_images_loaded is set.
-static void
-ensure_cursor_images_loaded(struct d3d11_service_system *sys)
-{
-	if (sys->cursor_images_loaded) return;
-
-	struct {
-		LPCSTR id;
-	} cursor_specs[6] = {
-		{IDC_ARROW},     // 0 = arrow (default)
-		{IDC_SIZEWE},    // 1 = horizontal resize
-		{IDC_SIZENS},    // 2 = vertical resize
-		{IDC_SIZENWSE},  // 3 = NW-SE diagonal resize
-		{IDC_SIZENESW},  // 4 = NE-SW diagonal resize
-		{IDC_SIZEALL},   // 5 = move (4-way arrow)
-	};
-
-	const char *names[6] = {"arrow", "sizewe", "sizens", "sizenwse", "sizenesw", "sizeall"};
-	for (int i = 0; i < 6; i++) {
-		HCURSOR hcur = LoadCursorA(NULL, cursor_specs[i].id);
-		if (hcur == NULL) continue;
-		auto &ci = sys->cursor_images[i];
-		bool ok = load_win32_cursor_to_srv(sys->device.get(), hcur,
-		                                   ci.srv, ci.w, ci.h,
-		                                   ci.hot_x, ci.hot_y);
-		if (!ok) {
-			U_LOG_W("3D cursor: failed to load cursor id=%d", i);
-		} else {
-			U_LOG_W("3D cursor: %s w=%u h=%u hot=(%d,%d)",
-			        names[i], ci.w, ci.h, ci.hot_x, ci.hot_y);
-		}
-	}
-	sys->cursor_images_loaded = true;
-}
-
-
-/*
  *
  * Exported functions
  *
@@ -14059,7 +13837,11 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 	// pointer capture.
 	bool slot_changed = (mc->hovered_slot != mc->hovered_slot_last_emitted);
 	bool region_changed = (mc->hovered_chrome_region_id != mc->hovered_chrome_region_id_last_emitted);
-	if ((slot_changed || region_changed) &&
+	// spec_version 13: also emit on hit-region transitions (CONTENT →
+	// EDGE_RESIZE_E, etc.) so the controller can drive cursor-shape
+	// switching on hover.
+	bool hit_region_changed = (mc->hovered_hit_region != mc->hovered_hit_region_last_emitted);
+	if ((slot_changed || region_changed || hit_region_changed) &&
 	    out_batch->count < IPC_WORKSPACE_INPUT_EVENT_BATCH_MAX) {
 		struct ipc_workspace_input_event *ev = &out_batch->events[out_batch->count];
 		memset(ev, 0, sizeof(*ev));
@@ -14069,16 +13851,17 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 		    (mc->hovered_slot_last_emitted >= 0)
 		        ? mc->clients[mc->hovered_slot_last_emitted].workspace_client_id
 		        : 0;
-		ev->u.pointer_hover.prev_region = 0;
+		ev->u.pointer_hover.prev_region = mc->hovered_hit_region_last_emitted;
 		ev->u.pointer_hover.curr_client_id =
 		    (mc->hovered_slot >= 0)
 		        ? mc->clients[mc->hovered_slot].workspace_client_id
 		        : 0;
-		ev->u.pointer_hover.curr_region = 0;
+		ev->u.pointer_hover.curr_region = mc->hovered_hit_region;
 		ev->u.pointer_hover.prev_chrome_region_id = mc->hovered_chrome_region_id_last_emitted;
 		ev->u.pointer_hover.curr_chrome_region_id = mc->hovered_chrome_region_id;
 		mc->hovered_slot_last_emitted = mc->hovered_slot;
 		mc->hovered_chrome_region_id_last_emitted = mc->hovered_chrome_region_id;
+		mc->hovered_hit_region_last_emitted = mc->hovered_hit_region;
 		out_batch->count++;
 	}
 
@@ -14502,6 +14285,30 @@ comp_d3d11_service_workspace_update_chrome_layer_pose_by_slot(struct xrt_system_
 	// controller's eventual set_chrome_layout_by_slot to inherit. If a
 	// layout has already been pushed (the common case for cursor + animated
 	// chrome), the flag is already true and stays that way.
+	return XRT_SUCCESS;
+}
+
+// spec_version 13: store the controller-pushed cursor source. xsc may be
+// NULL (caller passed XR_NULL_HANDLE / invalid swapchain) — that hides the
+// cursor without tearing anything down. The runtime samples this swapchain
+// in its per-tile cursor render pass.
+extern "C" xrt_result_t
+comp_d3d11_service_workspace_set_cursor(struct xrt_system_compositor *xsysc,
+                                         struct xrt_swapchain *xsc,
+                                         float hot_x, float hot_y,
+                                         float size_meters,
+                                         bool visible)
+{
+	if (xsysc == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	sys->cursor_xsc = xsc; // borrowed; controller owns lifetime
+	sys->cursor_hot_x = hot_x;
+	sys->cursor_hot_y = hot_y;
+	sys->cursor_size_m = size_meters > 0.0f ? size_meters : 0.012f;
+	sys->cursor_visible = visible;
 	return XRT_SUCCESS;
 }
 
