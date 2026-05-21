@@ -235,10 +235,27 @@ C interfaces with vtable-style polymorphism:
 For the full interface catalog including display processor vtables (5 API variants), see `docs/guides/vendor-integration.md`.
 
 ### LeiaSR SDK Integration
-- `XRT_HAVE_LEIA_SR` CMake option (auto-enabled if SDK found)
-- D3D11 weaver: `compositor/d3d11/` via `drivers/leia/leiasr_d3d11.cpp`
-- Eye tracking via SR SDK's LookaroundFilter
-- Display dimensions from SR::Display for Kooima asymmetric frustum projection
+
+Vendor display drivers now ship as **plug-in DLLs** (ADR-019 / issue
+#256). `DisplayXR-LeiaSR.dll` (built from `drivers/leia/` + the
+`xrtPluginNegotiate` entry point in `leia_plugin.c`) loads at
+`xrCreateInstance` time via the registry-driven discovery in
+`target_plugin_loader.c`. The runtime DLL itself has zero SR
+identifiers in its link line — see ADR-019 §2.1 and the CI assertion
+in `.github/workflows/build-windows.yml`.
+
+- `XRT_HAVE_LEIA_SR` CMake option (auto-enabled if SDK found) now
+  drives the plug-in DLL build, not a static link of `drv_leia` into
+  the runtime.
+- `XRT_PLUGIN_BUILD_INPROC_FALLBACK` (default OFF) re-enables the
+  legacy static-link path for developer debugging.
+- D3D11 weaver: `drivers/leia/leia_sr_d3d11.cpp` (now inside the
+  plug-in DLL, called via `iface->create_dp_d3d11`).
+- Eye tracking via SR SDK's LookaroundFilter (inside the plug-in DLL).
+- Display dimensions via `iface->get_display_info` →
+  `xrt_plugin_display_info` (no direct runtime → `leiasr_*` call).
+- Plug-in discovery / registration contract:
+  `docs/specs/runtime/plugin-discovery.md`.
 
 ### Native Compositors
 Each bypasses Vulkan entirely for its graphics API:
@@ -284,8 +301,13 @@ _package\run_cube_handle_d3d11_win.bat   :: sets XR_RUNTIME_JSON to dev manifest
 Full reference: [`docs/getting-started/building.md` § Local Dev Iteration](docs/getting-started/building.md#local-dev-iteration).
 
 ### Key CMake Options
-- `XRT_HAVE_LEIA_SR` — LeiaSR SDK support
+- `XRT_HAVE_LEIA_SR` — LeiaSR SDK support (drives the Leia plug-in
+  DLL build; the runtime DLL no longer static-links drv_leia)
 - `XRT_HAVE_LEIA_SR_VULKAN` / `XRT_HAVE_LEIA_SR_D3D11` — API-specific weavers
+- `XRT_PLUGIN_BUILD_INPROC_FALLBACK` (default OFF) — developer flag
+  that also static-links drv_leia into the runtime DLL for in-proc
+  debugging. Production builds leave this off and route everything
+  through the plug-in DLL.
 - `XRT_FEATURE_SERVICE` — Out-of-process service mode
 - `BUILD_TESTING` — Test suite
 
@@ -382,7 +404,7 @@ See `docs/README.md` for a complete index. Key docs by task:
 |---|---|
 | Understand layer boundaries (what goes where) | `docs/architecture/separation-of-concerns.md` |
 | Build a workspace app (shell-style controller) | `docs/specs/runtime/workspace-controller-registration.md` |
-| Add a new display vendor | `docs/guides/vendor-integration.md` |
+| Add a new display vendor | `docs/guides/vendor-integration.md` § 1.2 ("Plug-in distribution model") then `docs/specs/runtime/plugin-discovery.md` |
 | Understand multiview tiling / atlas layout | `docs/specs/runtime/multiview-tiling.md` |
 | Understand extension API (display_info, window bindings) | `docs/specs/extensions/XR_EXT_display_info.md` |
 | Know why an architectural decision was made | `docs/adr/` (16 ADRs) |
