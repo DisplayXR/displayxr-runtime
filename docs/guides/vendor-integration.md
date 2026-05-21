@@ -113,13 +113,99 @@ SDK types.
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-**Why this matters for new vendors:**  A new vendor integration adds files
-**only** under `src/xrt/drivers/<vendor>/` and `src/xrt/targets/common/`.
-No modifications to `oxr_session.c`, `comp_multi_compositor.c`, or any
-compositor code are needed.  The runtime discovers your driver through the
-builder system, reads your display specs from `xrt_system_compositor_info`,
-calls your display processor through the generic vtable, and queries eye
-positions through vendor-neutral interfaces.
+**Why this matters for new vendors:**  Vendor-specific code never lands
+in the runtime DLL or the compositor.  Your driver ships as a separate
+plug-in DLL (§1.2 below) that the runtime discovers at `xrCreateInstance`
+time, populates `xrt_system_compositor_info` from your iface, and calls
+your display processor through the generic vtable each frame.
+
+### 1.2 Plug-in distribution model (ADR-019 / issue #256)
+
+A vendor display driver is **shipped as a separate dynamically-loaded
+DLL** (`DisplayXR-<vendor>.dll` on Windows, `.dylib` on macOS,
+`.so` on Linux) — **not** as in-tree code linked into the runtime DLL.
+The runtime knows nothing about your vendor at build time; you do not
+fork the runtime build system.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Process running an OpenXR app                                      │
+│                                                                     │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │  DisplayXRClient.dll  (runtime)                              │   │
+│  │  - xrCreateInstance reads HKLM\Software\DisplayXR\           │   │
+│  │    DisplayProcessors\* (Windows registry) or                 │   │
+│  │    ~/Library/.../DisplayProcessors/*.json (POSIX manifests)  │   │
+│  │  - For each entry in ProbeOrder asc:                         │   │
+│  │      LoadLibrary → GetProcAddress("xrtPluginNegotiate")      │   │
+│  │      → iface->probe() — first XRT_SUCCESS wins               │   │
+│  │  - The winning iface's DP factory drives this session        │   │
+│  └──────────────────────┬───────────────────────────────────────┘   │
+│                         │ exports aux (u_log, u_var, …)             │
+│                         │ via DisplayXRClient.lib import library    │
+│                         ▼                                            │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │  DisplayXR-<YourVendor>.dll  (your plug-in)                  │   │
+│  │  - One exported symbol: xrtPluginNegotiate                   │   │
+│  │  - Static-links your vendor SDK (SR SDK / CNSDK / …)         │   │
+│  │  - Implements xrt_plugin_iface: probe, create_device,        │   │
+│  │    per-API DP factories, get_display_info                    │   │
+│  │  - Calls u_log / u_var through DisplayXRClient.dll's exports │   │
+│  │    so logging, debug-var tracking, etc. share a single       │   │
+│  │    process-wide state (one log file, one debug GUI registry) │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Concrete consequences for your build:**
+
+1. Your DLL exports exactly **one** symbol: `xrtPluginNegotiate` (see
+   `xrt/xrt_plugin.h`).
+2. Link against `DisplayXRClient.lib` (the runtime's import library,
+   installed at `$INSTDIR\lib\` by the runtime installer) for the
+   aux export surface. Define `XRT_USING_RUNTIME_DLL` so the
+   `XRT_API_FUNC` decorations in aux headers expand to
+   `__declspec(dllimport)`.
+3. Static-link your vendor SDK *into the plug-in DLL only*. The
+   runtime DLL has zero vendor identifiers in its link line — CI
+   asserts this via `dumpbin /imports DisplayXRClient.dll | findstr
+   /i SimulatedReality && exit 1 || exit 0` (substitute your
+   vendor's library name pattern).
+4. Ship a separate installer that drops your DLL into a vendor
+   directory and registers it under `HKLM\Software\DisplayXR\DisplayProcessors\<id>`
+   with `ProbeOrder=50` (sim-display sits at 200 and always loses
+   the probe race against any real hardware). The installer MUST
+   write `UninstallString` so the runtime's cascade-uninstall
+   triggers your cleanup before the runtime DLL goes away.
+
+**Reference implementations:**
+
+- `src/xrt/drivers/sim_display/sim_display_plugin.c` (~150 lines) —
+  the vendor-neutral fallback plug-in.
+- `src/xrt/drivers/leia/leia_plugin.c` (~150 lines) — the Leia SR
+  vendor plug-in.
+- `src/xrt/drivers/CMakeLists.txt` — the `drv_sim_display_plugin`
+  and `drv_leia_plugin` `add_library(... SHARED ...)` targets.
+- `installer/DisplayXRInstaller.nsi` — sim-display registration +
+  cascade-uninstall pattern.
+
+**Required reading:**
+
+- `xrt/xrt_plugin.h` — the C ABI (`xrt_plugin_iface`,
+  `xrtPluginNegotiate`, `xrt_plugin_display_info`,
+  `XRT_PLUGIN_EXPORT`).
+- `docs/specs/runtime/plugin-discovery.md` — the discovery contract:
+  registry schema, manifest shape, ProbeOrder semantics, cascade
+  uninstall.
+- `docs/adr/ADR-019-vendor-plugin-aux-boundary.md` — why aux gets
+  exported and how the import library boundary works.
+
+The rest of this guide (§2 onward) describes the DP vtable, OpenXR
+extension surface, and reference implementation details that are
+unchanged by the plug-in restructure. The display processor contract
+that your plug-in's iface returns is exactly the same vtable the old
+in-tree drivers used — only the discovery / linking / distribution
+model changed.
 
 ---
 
@@ -127,10 +213,12 @@ positions through vendor-neutral interfaces.
 
 | # | Component | Description | Required? |
 |---|-----------|-------------|-----------|
-| 1 | **Display Processor** | Unified vtable: stereo→display conversion (weaving) **and** eye tracking, window metrics, display mode control | Yes (at least one API) |
-| 2 | **Device Driver** | `xrt_device` with display specs (resolution, physical size, refresh rate, FOV) | Yes |
-| 3 | **SDK Wrapper** | Opaque C wrapper isolating vendor headers from the codebase | Recommended |
-| 4 | **Target Builder** | Builder .c file + registration in 5 build system files (see §8.1) | Yes |
+| 1 | **Plug-in entry point** | `xrtPluginNegotiate` C entry (`xrt/xrt_plugin.h`) returning a populated `xrt_plugin_iface` — probe, create_device, per-API DP factories, get_display_info, destroy. See `sim_display/sim_display_plugin.c` for the reference shape. | Yes |
+| 2 | **Display Processor** | Unified vtable: stereo→display conversion (weaving) **and** eye tracking, window metrics, display mode control | Yes (at least one API) |
+| 3 | **Device Driver** | `xrt_device` with display specs (resolution, physical size, refresh rate, FOV) | Yes |
+| 4 | **SDK Wrapper** | Opaque C wrapper isolating vendor headers from the codebase | Recommended |
+| 5 | **Plug-in DLL build target** | `add_library(... SHARED ...)` that compiles your sources with `XRT_USING_RUNTIME_DLL`, links `DisplayXRClient.lib` for aux exports + your vendor SDK libraries, and exports only `xrtPluginNegotiate`. See `src/xrt/drivers/CMakeLists.txt`'s `drv_leia_plugin` block. | Yes |
+| 6 | **Installer + registry registration** | Ships your DLL outside the runtime tree + writes `HKLM\Software\DisplayXR\DisplayProcessors\<id>` (Windows) or the JSON manifest (POSIX). See `docs/specs/runtime/plugin-discovery.md`. | Yes |
 
 > **Note:** Eye tracking is **not** a separate component.  It is an optional method
 > on the display processor vtable (`get_predicted_eye_positions`).  Even if a
@@ -1375,6 +1463,42 @@ my_vendor_sdk_weave(struct my_vendor_sdk *sdk, /* ... */)
 ---
 
 ## 8. Component 5: Target Builder and Build System Registration
+
+> **Note (ADR-019 / issue #256):** This section describes the **legacy
+> in-tree** registration shape, kept around for developer debugging
+> behind the CMake option `XRT_PLUGIN_BUILD_INPROC_FALLBACK` (default
+> OFF). **New vendor integrations should NOT follow this section.**
+> Vendors ship a plug-in DLL with its own build target (`add_library(...
+> SHARED ...)` per §1.2) and an installer that registers it under
+> `HKLM\Software\DisplayXR\DisplayProcessors\<id>` per
+> `docs/specs/runtime/plugin-discovery.md`. The five-file in-tree
+> registration described below applies only when
+> `XRT_PLUGIN_BUILD_INPROC_FALLBACK=ON`.
+>
+> The plug-in build target itself is much smaller — see the
+> `drv_leia_plugin` block in `src/xrt/drivers/CMakeLists.txt` for the
+> reference shape:
+>
+> ```cmake
+> add_library(drv_your_vendor_plugin SHARED ${YOUR_SOURCES} your_plugin.c)
+> target_compile_definitions(drv_your_vendor_plugin PRIVATE XRT_USING_RUNTIME_DLL)
+> target_link_libraries(drv_your_vendor_plugin PRIVATE
+>     $<TARGET_LINKER_FILE:${RUNTIME_TARGET}>  # DisplayXRClient.lib
+>     xrt-interfaces aux_util aux_os aux_math aux_vk
+>     # ... your vendor SDK libs ...
+> )
+> set_target_properties(drv_your_vendor_plugin PROPERTIES
+>     OUTPUT_NAME "DisplayXR-YourVendor"
+>     PREFIX ""
+>     C_VISIBILITY_PRESET hidden
+>     CXX_VISIBILITY_PRESET hidden)
+> ```
+>
+> No `T_BUILDER_*` guards, no `target_lists.c` entries, no fifth file
+> elsewhere — the runtime discovers your plug-in entirely through the
+> registry/manifest mechanism. The legacy section below is retained
+> only for `XRT_PLUGIN_BUILD_INPROC_FALLBACK=ON` developer builds
+> where the runtime DLL is allowed to static-link drv_<vendor> directly.
 
 The target builder registers the vendor's driver with the runtime.  When the
 runtime starts, it iterates the builder list, calls `estimate_system()` on
