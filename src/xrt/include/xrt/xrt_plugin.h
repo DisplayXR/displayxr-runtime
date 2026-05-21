@@ -42,6 +42,7 @@
 #include "xrt/xrt_display_processor_gl.h"
 #include "xrt/xrt_display_processor_metal.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -54,6 +55,65 @@ extern "C" {
  * by pointer, so a forward decl is sufficient at this layer.
  */
 struct xrt_device;
+
+
+/*!
+ * Vendor-neutral physical-display info populated by
+ * `xrt_plugin_iface::get_display_info`. Lets the runtime drop direct
+ * vendor calls (`leiasr_*`, `sim_display_get_display_info`) from its
+ * own translation units, satisfying ADR-019/plan goal §2.1 ("runtime
+ * DLL has zero vendor identifiers in its link line").
+ *
+ * Forward-compat: the runtime sets `struct_size` to its own
+ * `sizeof(struct xrt_plugin_display_info)` before calling
+ * `get_display_info`; plug-ins MUST NOT write past that offset.
+ * Field additions append at the end with no API version bump.
+ */
+struct xrt_plugin_display_info
+{
+	/*! `sizeof(struct xrt_plugin_display_info)` at the runtime's
+	 *  compile time. The plug-in clamps its writes to this offset. */
+	uint32_t struct_size;
+	uint32_t reserved_0;
+
+	/*! Physical display dimensions in meters. */
+	float display_width_m;
+	float display_height_m;
+
+	/*! Nominal viewer position relative to display center, in meters.
+	 *  Drives Kooima projection defaults when the app has no
+	 *  external head tracking. */
+	float nominal_viewer_x_m;
+	float nominal_viewer_y_m;
+	float nominal_viewer_z_m;
+
+	/*! Native panel resolution in pixels. */
+	uint32_t display_pixel_width;
+	uint32_t display_pixel_height;
+
+	/*! Vendor-recommended per-view scaling. 1.0 means "render at the
+	 *  native panel resolution per view"; <1.0 means downscale. The
+	 *  compositor reads this into `xrt_system_compositor_info::recommended_view_scale_*`. */
+	float recommended_view_scale_x;
+	float recommended_view_scale_y;
+
+	/*! Display top-left in virtual-screen coordinates (Windows-style).
+	 *  Used to position workspace windows over the 3D panel. Both
+	 *  fields 0 means "no preference" / "display origin is the
+	 *  desktop origin" — the sim_display path picks this. */
+	int32_t display_screen_left;
+	int32_t display_screen_top;
+
+	/*! Eye-tracking mode bits supported by this display, as
+	 *  understood by `XR_EXT_display_info`. Bit 0 = MANAGED, bit 1 =
+	 *  MANUAL. Leia is MANAGED-only (bit 0); sim_display is
+	 *  MANUAL-only (bit 1). */
+	uint32_t supported_eye_tracking_modes;
+
+	/*! Default eye-tracking mode for sessions that don't override.
+	 *  0 = MANAGED, 1 = MANUAL. */
+	uint32_t default_eye_tracking_mode;
+};
 
 
 /*
@@ -295,6 +355,33 @@ struct xrt_plugin_iface
 	 * the runtime stops dereferencing `inst` and the vtable.
 	 */
 	void (*destroy)(struct xrt_plugin_instance *inst);
+
+	/*!
+	 * Fill in vendor-neutral physical-display info for `xdev` (the
+	 * device the plug-in returned from `create_device`). Lets the
+	 * runtime populate `xrt_system_compositor_info` without calling
+	 * any vendor-specific symbol directly — the headline ADR-019
+	 * goal.
+	 *
+	 * The runtime sets `out_info->struct_size` to its own
+	 * `sizeof(struct xrt_plugin_display_info)` before the call; the
+	 * plug-in MUST NOT write past that offset.
+	 *
+	 * Returns `true` if the struct was populated, `false` if the
+	 * plug-in could not produce info for this device (e.g. the
+	 * vendor SDK declined). On `false`, the runtime keeps the
+	 * defaults already in `xsysc->info`.
+	 *
+	 * Optional. NULL means "no display info available" — the runtime
+	 * treats it as if the call returned `false`. Required to be
+	 * non-NULL for plug-ins that ship a `create_device`
+	 * implementation in v2; required already today for plug-ins
+	 * loaded by a runtime built without the legacy in-proc
+	 * fallback path.
+	 */
+	bool (*get_display_info)(struct xrt_plugin_instance *inst,
+	                         struct xrt_device *xdev,
+	                         struct xrt_plugin_display_info *out_info);
 };
 
 

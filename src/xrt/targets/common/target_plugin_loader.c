@@ -84,47 +84,18 @@ struct plugin_entry
  *
  */
 
-/*!
- * Add the runtime DLL's own directory to the loader search path so
- * plug-ins' transitive deps (cjson.dll, pthread, future vulkan-1.dll)
- * resolve from the runtime's bin/. One-shot — repeated calls are
- * silently no-op'd.
- *
- * Pair with LOAD_LIBRARY_SEARCH_USER_DIRS on the LoadLibraryExW call.
+/*
+ * (Earlier revisions of this loader called AddDllDirectory(runtime dir)
+ * before LoadLibraryExW with LOAD_LIBRARY_SEARCH_USER_DIRS, but that flag
+ * is mutually exclusive with LOAD_WITH_ALTERED_SEARCH_PATH per MSDN —
+ * combining them returns ERROR_INVALID_PARAMETER for plug-ins that have
+ * transitive deps the loader had to actually walk. We rely on
+ * LOAD_WITH_ALTERED_SEARCH_PATH alone now: it puts the plug-in DLL's
+ * own directory first in the search, and the legacy strategy continues
+ * to PATH, so SR DLLs at `C:\Program Files\LeiaSR\Platform\bin` and
+ * cjson.dll / vulkan-1.dll alongside the runtime resolve through their
+ * existing PATH entries.)
  */
-static void
-add_runtime_dll_directory(void)
-{
-	static int added = 0;
-	if (added) {
-		return;
-	}
-	added = 1;
-
-	HMODULE self = NULL;
-	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-	                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-	                        (LPCWSTR)(void *)&add_runtime_dll_directory, &self)) {
-		U_LOG_W("plugin loader: GetModuleHandleEx failed (%lu); transitive deps may not resolve.",
-		        GetLastError());
-		return;
-	}
-
-	wchar_t runtime_path[MAX_PATH];
-	DWORD n = GetModuleFileNameW(self, runtime_path, MAX_PATH);
-	if (n == 0 || n >= MAX_PATH) {
-		U_LOG_W("plugin loader: GetModuleFileName failed; transitive deps may not resolve.");
-		return;
-	}
-
-	wchar_t *last_slash = wcsrchr(runtime_path, L'\\');
-	if (last_slash == NULL) {
-		return;
-	}
-	*last_slash = L'\0';
-
-	(void)AddDllDirectory(runtime_path);
-}
 
 /*!
  * UTF-16 wchar_t string → UTF-8 char buffer. Returns true on success.
@@ -269,9 +240,7 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 {
 	*out_inst = NULL;
 
-	HMODULE dll = LoadLibraryExW(e->binary_path, NULL,
-	                             LOAD_WITH_ALTERED_SEARCH_PATH | LOAD_LIBRARY_SEARCH_USER_DIRS |
-	                                 LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+	HMODULE dll = LoadLibraryExW(e->binary_path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
 	if (dll == NULL) {
 		U_LOG_W("plugin loader:   %s: LoadLibrary(%ls) failed (err=%lu).", e->id, e->binary_path,
 		        GetLastError());
@@ -338,8 +307,6 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst)
 
 	qsort(entries, (size_t)n, sizeof(entries[0]), compare_by_probe_order);
 
-	add_runtime_dll_directory();
-
 	U_LOG_I("plugin loader: %d registered plug-in(s); attempting in ProbeOrder ascending.", n);
 	for (int i = 0; i < n; i++) {
 		U_LOG_I("plugin loader:   [%d/%d] %s (ProbeOrder=%u, %ls)", i + 1, n, entries[i].id,
@@ -388,4 +355,16 @@ target_plugin_get_active(void)
 	g_load_attempted = 1;
 	g_active_iface = discover_active_plugin(&g_active_instance);
 	return g_active_iface;
+}
+
+struct xrt_plugin_instance *
+target_plugin_get_active_instance(void)
+{
+	/*
+	 * Force a discovery pass if the caller hits this before
+	 * target_plugin_get_active(). Order-independent at the cost of
+	 * one extra branch.
+	 */
+	(void)target_plugin_get_active();
+	return g_active_instance;
 }

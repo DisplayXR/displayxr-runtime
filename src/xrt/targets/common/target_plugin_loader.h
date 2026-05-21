@@ -61,6 +61,18 @@ extern "C" {
 const struct xrt_plugin_iface *
 target_plugin_get_active(void);
 
+/*!
+ * Returns the @ref xrt_plugin_instance handle returned by the active
+ * plug-in's `iface->probe()`, or NULL if no plug-in is active or the
+ * plug-in's probe yielded a NULL instance (the v1 sim_display and
+ * leia plug-ins both do — they store driver state in file-scope
+ * statics inside the plug-in DLL). Pair with
+ * `target_plugin_get_active()` when calling iface vtable methods
+ * that take the instance handle.
+ */
+struct xrt_plugin_instance *
+target_plugin_get_active_instance(void);
+
 #ifdef __cplusplus
 }
 #endif

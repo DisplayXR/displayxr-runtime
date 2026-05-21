@@ -39,14 +39,19 @@ if(WIN32)
 	# from the runtime's install dir without requiring $INSTDIR on PATH.
 	target_sources(${RUNTIME_TARGET} PRIVATE target_dll_init.c)
 
-	# Delay-load Vulkan and SR Vulkan DLLs so the runtime can load on systems
-	# where these are absent. The D3D11 native compositor path never calls into
-	# Vulkan weaver functions, so the delay-loaded DLLs are never triggered.
-	target_link_options(${RUNTIME_TARGET} PRIVATE
-		"/DELAYLOAD:vulkan-1.dll"
-		"/DELAYLOAD:SimulatedRealityVulkanBeta.dll"
-	)
+	# Delay-load Vulkan so the runtime can load on systems where it's
+	# absent. The D3D11 native compositor path never calls into Vulkan
+	# weaver functions, so the delay-loaded DLL is never triggered.
+	target_link_options(${RUNTIME_TARGET} PRIVATE "/DELAYLOAD:vulkan-1.dll")
 	target_link_libraries(${RUNTIME_TARGET} PRIVATE delayimp)
+	# SR Vulkan beta delay-load only matters when drv_leia is statically
+	# linked into the runtime DLL — i.e. when the in-proc fallback path
+	# is on (ADR-019 / issue #256). Production builds have no SR
+	# imports at all; the same DELAYLOAD pair lives in the LeiaSR
+	# plug-in DLL's link line instead.
+	if(XRT_HAVE_LEIA_SR AND XRT_PLUGIN_BUILD_INPROC_FALLBACK)
+		target_link_options(${RUNTIME_TARGET} PRIVATE "/DELAYLOAD:SimulatedRealityVulkanBeta.dll")
+	endif()
 endif()
 
 # Note: Order may matter in these lists!

@@ -32,8 +32,11 @@
 #include "d3d11_service/comp_d3d11_service.h"
 #endif
 
-// SR display dimension query for proper swapchain dimensions
-#ifdef XRT_HAVE_LEIA_SR
+// SR display dimension query for proper swapchain dimensions.
+// Only compiled in the in-proc fallback build (issue #256 / ADR-019);
+// production builds query through the plug-in iface and have no
+// drv_leia symbols available at link time.
+#if defined(XRT_HAVE_LEIA_SR) && defined(XRT_PLUGIN_BUILD_INPROC_FALLBACK)
 #include "xrt/xrt_compositor.h"
 #include "leia/leia_interface.h"
 #include "leia/leia_sr_d3d11.h"
@@ -145,8 +148,12 @@ t_instance_create_system(struct xrt_instance *xinst,
 	if (use_null) {
 		float sr_refresh_rate_hz = 0.0f;
 
-#ifdef XRT_HAVE_LEIA_SR
-		// Query SR display for refresh rate only; dims come from device native resolution
+#if defined(XRT_HAVE_LEIA_SR) && defined(XRT_PLUGIN_BUILD_INPROC_FALLBACK)
+		// Query SR display for refresh rate only; dims come from device
+		// native resolution. Only available in the in-proc fallback
+		// build — production builds get the SR refresh rate through the
+		// plug-in iface (TODO: add to xrt_plugin_display_info if it
+		// becomes load-bearing for the null compositor path).
 		if (strstr(head->str, "Sim 3D Display") == NULL)
 		{
 			uint32_t sr_rec_width = 0, sr_rec_height = 0;
@@ -218,11 +225,109 @@ out:
 		// Tell the system about the system compositor.
 		u_system_set_system_compositor(usys, xsysc);
 
-#ifdef XRT_HAVE_LEIA_SR
-		// Populate display info for XR_EXT_display_info extension.
-		// Scale factors are static: sr_recommended / display_pixels.
-		// Skip if sim_display was explicitly selected (FORCE_SIM_DISPLAY=1).
-		if (strstr(head->str, "Sim 3D Display") == NULL)
+		// Vendor-neutral display-info population through the plug-in
+		// iface (issue #256 / ADR-019). Runs FIRST regardless of whether
+		// the active plug-in is leia-sr or sim-display — the
+		// iface->get_display_info call returns the same shape of struct
+		// for either. After this, dp_factory_* + xsysc->info are
+		// populated and the legacy in-proc branches below see the
+		// "already filled in" guards and skip themselves.
+		bool plugin_filled_display_info = false;
+		const struct xrt_plugin_iface *plugin = target_plugin_get_active();
+		if (plugin != NULL && plugin->struct_size >
+		                          offsetof(struct xrt_plugin_iface, get_display_info) &&
+		    plugin->get_display_info != NULL) {
+			struct xrt_plugin_display_info pdi = {0};
+			pdi.struct_size = (uint32_t)sizeof(pdi);
+			if (plugin->get_display_info(target_plugin_get_active_instance(), head, &pdi)) {
+				xsysc->info.display_width_m = pdi.display_width_m;
+				xsysc->info.display_height_m = pdi.display_height_m;
+				xsysc->info.nominal_viewer_x_m = pdi.nominal_viewer_x_m;
+				xsysc->info.nominal_viewer_y_m = pdi.nominal_viewer_y_m;
+				xsysc->info.nominal_viewer_z_m = pdi.nominal_viewer_z_m;
+				xsysc->info.display_pixel_width = pdi.display_pixel_width;
+				xsysc->info.display_pixel_height = pdi.display_pixel_height;
+				xsysc->info.display_screen_left = pdi.display_screen_left;
+				xsysc->info.display_screen_top = pdi.display_screen_top;
+				xsysc->info.supported_eye_tracking_modes = pdi.supported_eye_tracking_modes;
+				xsysc->info.default_eye_tracking_mode = pdi.default_eye_tracking_mode;
+
+				// Compute tiling once we have native pixel dims.
+				if (pdi.display_pixel_width > 0 && pdi.display_pixel_height > 0) {
+					for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
+						u_tiling_compute_mode(&head->rendering_modes[mi],
+						                      pdi.display_pixel_width,
+						                      pdi.display_pixel_height);
+					}
+					u_tiling_compute_system_atlas(
+					    head->rendering_modes, head->rendering_mode_count,
+					    &xsysc->info.atlas_width_pixels,
+					    &xsysc->info.atlas_height_pixels);
+				}
+
+				// Recommended view scale: prefer iface-supplied (Leia SR
+				// gives this from its weaver); otherwise derive worst-case
+				// from rendering modes (the sim_display path).
+				if (pdi.recommended_view_scale_x > 0.0f && pdi.recommended_view_scale_y > 0.0f) {
+					xsysc->info.recommended_view_scale_x = pdi.recommended_view_scale_x;
+					xsysc->info.recommended_view_scale_y = pdi.recommended_view_scale_y;
+				} else {
+					float min_scale_x = 1.0f, min_scale_y = 1.0f;
+					for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
+						if (head->rendering_modes[mi].view_scale_x > 0.0f &&
+						    head->rendering_modes[mi].view_scale_x < min_scale_x)
+							min_scale_x = head->rendering_modes[mi].view_scale_x;
+						if (head->rendering_modes[mi].view_scale_y > 0.0f &&
+						    head->rendering_modes[mi].view_scale_y < min_scale_y)
+							min_scale_y = head->rendering_modes[mi].view_scale_y;
+					}
+					xsysc->info.recommended_view_scale_x = min_scale_x;
+					xsysc->info.recommended_view_scale_y = min_scale_y;
+				}
+
+				// Per-API DP factories from the iface.
+				if (plugin->create_dp_vk != NULL) {
+					xsysc->info.dp_factory_vk = (void *)plugin->create_dp_vk;
+				}
+#ifdef XRT_OS_WINDOWS
+				if (plugin->create_dp_d3d11 != NULL) {
+					xsysc->info.dp_factory_d3d11 = (void *)plugin->create_dp_d3d11;
+				}
+				if (plugin->create_dp_d3d12 != NULL) {
+					xsysc->info.dp_factory_d3d12 = (void *)plugin->create_dp_d3d12;
+				}
+#endif
+				if (plugin->create_dp_gl != NULL) {
+					xsysc->info.dp_factory_gl = (void *)plugin->create_dp_gl;
+				}
+#ifdef __APPLE__
+				if (plugin->create_dp_metal != NULL) {
+					xsysc->info.dp_factory_metal = (void *)plugin->create_dp_metal;
+				}
+#endif
+
+				U_LOG_W("XR_EXT_display_info (iface=%s): display=%.4f x %.4f m, "
+				        "nominal=(%.4f, %.4f, %.4f) m, scale=%.4f x %.4f, "
+				        "pixels=%ux%u, atlas=%ux%u",
+				        plugin->id ? plugin->id : "?",
+				        pdi.display_width_m, pdi.display_height_m,
+				        pdi.nominal_viewer_x_m, pdi.nominal_viewer_y_m, pdi.nominal_viewer_z_m,
+				        xsysc->info.recommended_view_scale_x,
+				        xsysc->info.recommended_view_scale_y, pdi.display_pixel_width,
+				        pdi.display_pixel_height, xsysc->info.atlas_width_pixels,
+				        xsysc->info.atlas_height_pixels);
+
+				plugin_filled_display_info = true;
+			}
+		}
+
+#if defined(XRT_HAVE_LEIA_SR) && defined(XRT_PLUGIN_BUILD_INPROC_FALLBACK)
+		// Legacy in-proc Leia path — only compiled when
+		// XRT_PLUGIN_BUILD_INPROC_FALLBACK is on (developer fallback for
+		// debugging without the plug-in DLL). Production runtime uses
+		// the iface-populated values above and never touches these
+		// vendor symbols.
+		if (!plugin_filled_display_info && strstr(head->str, "Sim 3D Display") == NULL)
 		{
 			uint32_t di_sr_w = 0, di_sr_h = 0, di_nat_w = 0, di_nat_h = 0;
 			float di_refresh = 0.0f;
@@ -233,7 +338,7 @@ out:
 				xsysc->info.recommended_view_scale_y = (float)di_sr_h / (float)di_nat_h;
 				xsysc->info.display_pixel_width = di_nat_w;
 				xsysc->info.display_pixel_height = di_nat_h;
-				U_LOG_W("XR_EXT_display_info: scale=%.4f x %.4f (sr=%ux%u, native=%ux%u)",
+				U_LOG_W("XR_EXT_display_info (in-proc): scale=%.4f x %.4f (sr=%ux%u, native=%ux%u)",
 				        xsysc->info.recommended_view_scale_x,
 				        xsysc->info.recommended_view_scale_y, di_sr_w, di_sr_h, di_nat_w, di_nat_h);
 			}
@@ -245,25 +350,17 @@ out:
 				xsysc->info.nominal_viewer_x_m = dims.nominal_x_m;
 				xsysc->info.nominal_viewer_y_m = dims.nominal_y_m;
 				xsysc->info.nominal_viewer_z_m = dims.nominal_z_m;
-				// Leia SR: managed eye tracking only (SDK handles grace period + transitions)
-				xsysc->info.supported_eye_tracking_modes = 1; // MANAGED_BIT
-				xsysc->info.default_eye_tracking_mode = 0;    // MANAGED
-				U_LOG_W("XR_EXT_display_info: display=%.4f x %.4f m, nominal=(%.4f, %.4f, %.4f) m",
-				        dims.width_m, dims.height_m,
-				        dims.nominal_x_m, dims.nominal_y_m, dims.nominal_z_m);
+				xsysc->info.supported_eye_tracking_modes = 1; /* MANAGED_BIT */
+				xsysc->info.default_eye_tracking_mode = 0;    /* MANAGED */
 			}
-			// Populate display screen position from EDID probe (fast, cached)
 			{
 				struct leia_display_probe_result edid;
 				if (leia_edid_get_cached_result(&edid) && edid.hw_found) {
 					xsysc->info.display_screen_left = edid.screen_left;
 					xsysc->info.display_screen_top = edid.screen_top;
-					U_LOG_I("Display screen position from EDID: %d,%d",
-					        edid.screen_left, edid.screen_top);
 				}
 			}
 
-			// Compute tiling for all modes (Leia SR path)
 			if (xsysc->info.display_pixel_width > 0 && xsysc->info.display_pixel_height > 0) {
 				for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
 					u_tiling_compute_mode(&head->rendering_modes[mi],
@@ -276,35 +373,26 @@ out:
 				                              &xsysc->info.atlas_height_pixels);
 			}
 
-			// Set Leia display processor factories for vendor-agnostic compositor use.
-			//
-			// Prefer the leia-sr plug-in DLL's factories when its probe won
-			// (issue #256 / ADR-019); otherwise fall back to the in-tree
-			// statically-linked leia_dp_factory_*. The plug-in's iface returns
-			// NULL for per-API factories that weren't compiled with the
-			// corresponding weaver (matches the runtime's
-			// XRT_HAVE_LEIA_SR_* compile-time gating).
-			const struct xrt_plugin_iface *leia_plugin = target_plugin_get_active();
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
-			xsysc->info.dp_factory_vk = (void *)((leia_plugin && leia_plugin->create_dp_vk)
-			                                         ? leia_plugin->create_dp_vk
-			                                         : leia_dp_factory_vk);
+			if (xsysc->info.dp_factory_vk == NULL) {
+				xsysc->info.dp_factory_vk = (void *)leia_dp_factory_vk;
+			}
 #endif
-			xsysc->info.dp_factory_d3d11 = (void *)((leia_plugin && leia_plugin->create_dp_d3d11)
-			                                            ? leia_plugin->create_dp_d3d11
-			                                            : leia_dp_factory_d3d11);
+			if (xsysc->info.dp_factory_d3d11 == NULL) {
+				xsysc->info.dp_factory_d3d11 = (void *)leia_dp_factory_d3d11;
+			}
 #ifdef XRT_HAVE_LEIA_SR_D3D12
-			xsysc->info.dp_factory_d3d12 = (void *)((leia_plugin && leia_plugin->create_dp_d3d12)
-			                                            ? leia_plugin->create_dp_d3d12
-			                                            : leia_dp_factory_d3d12);
+			if (xsysc->info.dp_factory_d3d12 == NULL) {
+				xsysc->info.dp_factory_d3d12 = (void *)leia_dp_factory_d3d12;
+			}
 #endif
 #ifdef XRT_HAVE_LEIA_SR_GL
-			xsysc->info.dp_factory_gl = (void *)((leia_plugin && leia_plugin->create_dp_gl)
-			                                         ? leia_plugin->create_dp_gl
-			                                         : leia_dp_factory_gl);
+			if (xsysc->info.dp_factory_gl == NULL) {
+				xsysc->info.dp_factory_gl = (void *)leia_dp_factory_gl;
+			}
 #endif
 		}
-#endif
+#endif /* XRT_HAVE_LEIA_SR && XRT_PLUGIN_BUILD_INPROC_FALLBACK */
 
 		// sim_display fallback: populate display info and factory if not already set by SR SDK
 		{

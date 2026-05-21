@@ -24,7 +24,14 @@
 #define T_BUILDER_QWERTY
 #endif
 
-#if defined(XRT_HAVE_LEIA_SR) || defined(XRT_DOXYGEN)
+/*
+ * The Leia builder only exists when both XRT_HAVE_LEIA_SR is on AND
+ * the in-proc fallback path is enabled — production builds get the
+ * Leia code path through the plug-in DLL via the sim_display builder's
+ * iface-aware fallback, so target_builder_leia.c isn't compiled and
+ * t_builder_leia_create isn't defined. Per ADR-019 / issue #256.
+ */
+#if (defined(XRT_HAVE_LEIA_SR) && defined(XRT_PLUGIN_BUILD_INPROC_FALLBACK)) || defined(XRT_DOXYGEN)
 #define T_BUILDER_LEIA
 #endif
 

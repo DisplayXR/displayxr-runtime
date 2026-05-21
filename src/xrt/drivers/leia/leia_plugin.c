@@ -31,6 +31,7 @@
 #include "leia_display_processor.h"
 #ifdef XRT_HAVE_LEIA_SR_D3D11
 #include "leia_display_processor_d3d11.h"
+#include "leia_sr_d3d11.h" /* leiasr_query_recommended_view_dimensions + leiasr_static_get_display_dimensions */
 #endif
 #ifdef XRT_HAVE_LEIA_SR_D3D12
 #include "leia_display_processor_d3d12.h"
@@ -99,6 +100,60 @@ leia_plugin_destroy(struct xrt_plugin_instance *inst)
 	/* No instance state — nothing to free. */
 }
 
+static bool
+leia_plugin_get_display_info(struct xrt_plugin_instance *inst,
+                             struct xrt_device *xdev,
+                             struct xrt_plugin_display_info *out_info)
+{
+	(void)inst;
+	(void)xdev;
+
+	(void)out_info->struct_size; /* v1: see sim_display plug-in's note. */
+
+	bool any_populated = false;
+
+	/*
+	 * SR-recommended view dimensions + native panel resolution. Both
+	 * are needed by the compositor for atlas sizing + the per-view
+	 * scale factor stored in xrt_system_compositor_info.
+	 */
+	uint32_t sr_w = 0, sr_h = 0, nat_w = 0, nat_h = 0;
+	float refresh = 0.0f;
+	if (leiasr_query_recommended_view_dimensions(5.0, &sr_w, &sr_h, &refresh, &nat_w, &nat_h) && nat_w > 0 &&
+	    nat_h > 0) {
+		out_info->display_pixel_width = nat_w;
+		out_info->display_pixel_height = nat_h;
+		out_info->recommended_view_scale_x = (float)sr_w / (float)nat_w;
+		out_info->recommended_view_scale_y = (float)sr_h / (float)nat_h;
+		any_populated = true;
+	}
+
+	/* Physical dimensions + nominal viewer position from SR SDK. */
+	struct leiasr_display_dimensions dims = {0};
+	if (leiasr_static_get_display_dimensions(&dims) && dims.valid) {
+		out_info->display_width_m = dims.width_m;
+		out_info->display_height_m = dims.height_m;
+		out_info->nominal_viewer_x_m = dims.nominal_x_m;
+		out_info->nominal_viewer_y_m = dims.nominal_y_m;
+		out_info->nominal_viewer_z_m = dims.nominal_z_m;
+		any_populated = true;
+	}
+
+	/* EDID screen position — cached by probe(), zero if not available. */
+	struct leia_display_probe_result edid;
+	if (leia_edid_get_cached_result(&edid) && edid.hw_found) {
+		out_info->display_screen_left = edid.screen_left;
+		out_info->display_screen_top = edid.screen_top;
+	}
+
+	/* Leia: MANAGED eye tracking only — the SR SDK owns the grace
+	 * period + transition handling. */
+	out_info->supported_eye_tracking_modes = 1u; /* MANAGED_BIT */
+	out_info->default_eye_tracking_mode = 0u;    /* MANAGED */
+
+	return any_populated;
+}
+
 
 /*
  *
@@ -155,6 +210,8 @@ static struct xrt_plugin_iface g_leia_iface = {
     .create_dp_metal = NULL,
 
     .destroy = leia_plugin_destroy,
+
+    .get_display_info = leia_plugin_get_display_info,
 };
 
 
