@@ -277,15 +277,31 @@ out:
 			}
 
 			// Set Leia display processor factories for vendor-agnostic compositor use.
+			//
+			// Prefer the leia-sr plug-in DLL's factories when its probe won
+			// (issue #256 / ADR-019); otherwise fall back to the in-tree
+			// statically-linked leia_dp_factory_*. The plug-in's iface returns
+			// NULL for per-API factories that weren't compiled with the
+			// corresponding weaver (matches the runtime's
+			// XRT_HAVE_LEIA_SR_* compile-time gating).
+			const struct xrt_plugin_iface *leia_plugin = target_plugin_get_active();
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
-			xsysc->info.dp_factory_vk = (void *)leia_dp_factory_vk;
+			xsysc->info.dp_factory_vk = (void *)((leia_plugin && leia_plugin->create_dp_vk)
+			                                         ? leia_plugin->create_dp_vk
+			                                         : leia_dp_factory_vk);
 #endif
-			xsysc->info.dp_factory_d3d11 = (void *)leia_dp_factory_d3d11;
+			xsysc->info.dp_factory_d3d11 = (void *)((leia_plugin && leia_plugin->create_dp_d3d11)
+			                                            ? leia_plugin->create_dp_d3d11
+			                                            : leia_dp_factory_d3d11);
 #ifdef XRT_HAVE_LEIA_SR_D3D12
-			xsysc->info.dp_factory_d3d12 = (void *)leia_dp_factory_d3d12;
+			xsysc->info.dp_factory_d3d12 = (void *)((leia_plugin && leia_plugin->create_dp_d3d12)
+			                                            ? leia_plugin->create_dp_d3d12
+			                                            : leia_dp_factory_d3d12);
 #endif
 #ifdef XRT_HAVE_LEIA_SR_GL
-			xsysc->info.dp_factory_gl = (void *)leia_dp_factory_gl;
+			xsysc->info.dp_factory_gl = (void *)((leia_plugin && leia_plugin->create_dp_gl)
+			                                         ? leia_plugin->create_dp_gl
+			                                         : leia_dp_factory_gl);
 #endif
 		}
 #endif

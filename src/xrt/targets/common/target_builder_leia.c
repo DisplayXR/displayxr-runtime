@@ -17,6 +17,7 @@
 
 #include "target_builder_interface.h"
 #include "target_builder_qwerty_input.h"
+#include "target_plugin_loader.h"
 
 #include "leia/leia_interface.h"
 
@@ -97,7 +98,22 @@ leia_open_system_impl(struct xrt_builder *xb,
                       struct xrt_frame_context *xfctx,
                       struct u_builder_roles_helper *ubrh)
 {
-	struct xrt_device *head = leia_hmd_create();
+	/*
+	 * Prefer the leia-sr plug-in DLL when present (registry-driven
+	 * loader from Step 5 hands back its iface here). On failure or
+	 * absence, falls through to the in-tree leia_hmd_create()
+	 * — same device shape, just constructed in this DLL. Issue #256.
+	 */
+	struct xrt_device *head = NULL;
+	const struct xrt_plugin_iface *plugin = target_plugin_get_active();
+	if (plugin != NULL && plugin->create_device != NULL) {
+		if (plugin->create_device(NULL, &head) != XRT_SUCCESS) {
+			head = NULL;
+		}
+	}
+	if (head == NULL) {
+		head = leia_hmd_create();
+	}
 	if (head == NULL) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}

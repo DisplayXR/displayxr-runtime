@@ -243,6 +243,140 @@ if(WIN32 AND TARGET drv_leia)
 	target_sources(drv_leia PRIVATE leia/leia_edid_probe.c)
 endif()
 
+####
+# DisplayXR-LeiaSR plug-in DLL.
+#
+# Mirror of drv_sim_display_plugin (Step 4a) — rebuilds the same drv_leia
+# sources with XRT_USING_RUNTIME_DLL so the aux headers' XRT_API_FUNC
+# expansions become __declspec(dllimport). All u_log / u_var / u_metrics
+# calls from inside the plug-in resolve to DisplayXRClient.dll's exported
+# surface, giving one copy of g_log_sink_func / gTracker / etc. per
+# process. The SR SDK static imports (SimulatedRealityCore.dll etc.) move
+# to the plug-in DLL's link line — the headline goal of ADR-019.
+#
+# The plug-in entry point sources only leia_plugin.c plus the existing
+# LEIA_SOURCES (compiled with the same shader includes etc.). At runtime
+# the plug-in DLL is loaded via the registry-driven loader (Step 5) when
+# its leia-sr subkey wins the ProbeOrder=50 race.
+#
+# Static drv_leia stays in the tree for backward compatibility; ADR-019
+# Step 6c will gate it behind XRT_PLUGIN_BUILD_INPROC_FALLBACK.
+#
+# Issue #256.
+if(XRT_HAVE_LEIA_SR AND TARGET drv_leia)
+	# Mirror the conditional WGC bg-capture sources the static drv_leia
+	# target gets via target_sources(... PRIVATE) further down — the
+	# SHARED target needs all symbols resolved at the .dll link step, so
+	# they must be in the initial source list.
+	set(LEIA_PLUGIN_SOURCES ${LEIA_SOURCES} leia/leia_edid_probe.c leia/leia_plugin.c)
+	if(WIN32 AND (LEIA_SR_D3D11_AVAILABLE OR LEIA_SR_D3D12_AVAILABLE))
+		list(APPEND LEIA_PLUGIN_SOURCES leia/leia_bg_capture_win.cpp leia/leia_bg_capture_win.h)
+	endif()
+
+	add_library(drv_leia_plugin SHARED ${LEIA_PLUGIN_SOURCES})
+	target_compile_definitions(drv_leia_plugin PRIVATE XRT_USING_RUNTIME_DLL)
+	target_include_directories(drv_leia_plugin PRIVATE
+		${SR_PATH}/include
+		${SR_PATH}/third_party/OpenCV/include
+		${CMAKE_CURRENT_SOURCE_DIR}/leia
+		${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
+		${CMAKE_CURRENT_BINARY_DIR}
+		)
+	target_link_libraries(
+		drv_leia_plugin
+		PRIVATE
+			# DisplayXRClient.lib — import lib for the runtime DLL's
+			# aux export surface (ADR-019). Generator expression to
+			# pick up only the .lib, not the runtime's PUBLIC INTERFACE
+			# link deps (which would drag in every compositor + state
+			# tracker).
+			$<TARGET_LINKER_FILE:${RUNTIME_TARGET}>
+			# Non-exported aux helpers — linker pulls in only the .obj
+			# files satisfying unresolved symbols.
+			xrt-interfaces
+			aux_util
+			aux_os
+			aux_math
+			# aux_vk satisfies the vk_create_image_simple /
+			# vk_create_view / vkAllocate* calls from leia_sr.cpp +
+			# leia_display_processor.cpp. The static drv_leia target
+			# doesn't need this because its unresolved Vulkan symbols
+			# are deferred to the final runtime DLL link; SHARED has
+			# no such deferral.
+			aux_vk
+			drv_includes
+			# SR SDK static imports — same set the in-tree drv_leia
+			# target pulls in. After Step 6c removes the in-tree
+			# static-link path, this is the only place these libs
+			# appear on a link line.
+			${SR_PATH}/lib/SimulatedRealityCore.lib
+			${SR_PATH}/lib/SimulatedRealityDisplays.lib
+			${SR_PATH}/lib/SimulatedRealityFaceTrackers.lib
+			${SR_PATH}/third_party/OpenCV/lib/x64/opencv_world343.lib
+		)
+	add_dependencies(drv_leia_plugin ${RUNTIME_TARGET})
+
+	if(LEIA_SR_VULKAN_AVAILABLE)
+		target_link_libraries(drv_leia_plugin PRIVATE ${SR_PATH}/lib/SimulatedRealityVulkanBeta.lib)
+		target_compile_definitions(drv_leia_plugin PRIVATE XRT_HAVE_LEIA_SR_VULKAN)
+		# Mirror the runtime DLL's DELAYLOAD shape: SR Vulkan beta DLL
+		# isn't always present on every machine; the in-process Leia
+		# probe never hits the Vulkan weaver code on D3D11/D3D12 paths,
+		# so delay-loading keeps the plug-in loadable.
+		target_link_options(drv_leia_plugin PRIVATE
+			"/DELAYLOAD:SimulatedRealityVulkanBeta.dll"
+			"/DELAYLOAD:vulkan-1.dll"
+		)
+		target_link_libraries(drv_leia_plugin PRIVATE delayimp)
+	endif()
+
+	if(LEIA_SR_D3D11_AVAILABLE)
+		target_link_libraries(drv_leia_plugin PRIVATE
+			${SR_PATH}/lib/SimulatedRealityDirectX.lib
+			d3d11 d3dcompiler dxgi)
+		target_compile_definitions(drv_leia_plugin PRIVATE XRT_HAVE_LEIA_SR_D3D11)
+	endif()
+
+	if(LEIA_SR_D3D12_AVAILABLE)
+		if(NOT LEIA_SR_D3D11_AVAILABLE)
+			target_link_libraries(drv_leia_plugin PRIVATE
+				${SR_PATH}/lib/SimulatedRealityDirectX.lib)
+		endif()
+		target_link_libraries(drv_leia_plugin PRIVATE d3d12 d3dcompiler)
+		target_compile_definitions(drv_leia_plugin PRIVATE XRT_HAVE_LEIA_SR_D3D12)
+	endif()
+
+	# Windows Graphics Capture for D3D11/D3D12 transparency compose-under-bg.
+	if(WIN32 AND (LEIA_SR_D3D11_AVAILABLE OR LEIA_SR_D3D12_AVAILABLE))
+		target_link_libraries(drv_leia_plugin PRIVATE runtimeobject dxguid)
+	endif()
+
+	if(LEIA_SR_GL_AVAILABLE)
+		target_link_libraries(drv_leia_plugin PRIVATE
+			${SR_PATH}/lib/SimulatedRealityOpenGL.lib
+			opengl32
+			aux_ogl)
+		target_compile_definitions(drv_leia_plugin PRIVATE XRT_HAVE_LEIA_SR_GL)
+	endif()
+
+	# Same one-symbol export discipline as drv_sim_display_plugin.
+	set_target_properties(drv_leia_plugin PROPERTIES
+		OUTPUT_NAME "DisplayXR-LeiaSR"
+		PREFIX ""
+		C_VISIBILITY_PRESET hidden
+		CXX_VISIBILITY_PRESET hidden
+		VISIBILITY_INLINES_HIDDEN ON
+		)
+
+	if(WIN32)
+		install(
+			TARGETS drv_leia_plugin
+			RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+			LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+			)
+	endif()
+endif()
+
 # CNSDK-only build (Android) — create drv_leia if SR SDK is not available
 if(XRT_HAVE_CNSDK AND NOT TARGET drv_leia)
 	add_library(drv_leia STATIC
