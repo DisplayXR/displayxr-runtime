@@ -620,6 +620,24 @@ struct ipc_workspace_chrome_layout
 };
 
 /*!
+ * spec_version 13: session-global cursor source. The controller renders
+ * its cursor sprite into a swapchain (allocated via
+ * xrCreateWorkspaceCursorSwapchainEXT) and points the runtime at it via
+ * xrSetWorkspaceCursorEXT. The runtime samples that swapchain's latest
+ * released image in its per-frame cursor render pass.
+ *
+ * @ingroup ipc
+ */
+struct ipc_workspace_cursor_info
+{
+	uint32_t swapchain_id;    //!< IPC swapchain id, or UINT32_MAX = hide
+	float    hot_x;           //!< Sprite UV X [0,1] of the click point
+	float    hot_y;           //!< Sprite UV Y [0,1]
+	float    size_meters;     //!< Physical size (width = height)
+	uint32_t visible;         //!< XrBool32; 0 = hidden even if swapchain valid
+};
+
+/*!
  * Phase 2.C spec_version 9: per-client visual style applied at workspace
  * content blit time. POD mirror of XrWorkspaceClientStyleEXT — the wire
  * form for xrSetWorkspaceClientStyleEXT.

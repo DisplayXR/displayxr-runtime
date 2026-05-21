@@ -911,6 +911,20 @@ comp_ipc_client_compositor_workspace_update_chrome_layer_pose(struct xrt_composi
 }
 
 xrt_result_t
+comp_ipc_client_compositor_workspace_set_cursor(struct xrt_compositor *xc,
+                                                 const struct ipc_workspace_cursor_info *info)
+{
+	if (xc == NULL || info == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_set_cursor(icc->ipc_c, info);
+}
+
+xrt_result_t
 comp_ipc_client_compositor_workspace_acquire_wakeup_event(struct xrt_compositor *xc,
                                                           xrt_graphics_sync_handle_t *out_handle)
 {

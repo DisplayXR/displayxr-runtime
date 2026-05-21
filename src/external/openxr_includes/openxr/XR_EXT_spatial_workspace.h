@@ -25,10 +25,10 @@ extern "C" {
 #endif
 
 #define XR_EXT_spatial_workspace 1
-#define XR_EXT_spatial_workspace_SPEC_VERSION 12
+#define XR_EXT_spatial_workspace_SPEC_VERSION 13
 #define XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_EXT_spatial_workspace"
 
-// Provisional XrStructureType values. The 1000999100..105 range is reserved for
+// Provisional XrStructureType values. The 1000999100..107 range is reserved for
 // this extension; final values reconcile with the Khronos registry before spec
 // freeze.
 #define XR_TYPE_WORKSPACE_CLIENT_INFO_EXT                  ((XrStructureType)1000999100)
@@ -37,6 +37,8 @@ extern "C" {
 #define XR_TYPE_WORKSPACE_CHROME_SWAPCHAIN_CREATE_INFO_EXT ((XrStructureType)1000999103)
 #define XR_TYPE_WORKSPACE_CHROME_LAYOUT_EXT                ((XrStructureType)1000999104)
 #define XR_TYPE_WORKSPACE_CLIENT_STYLE_EXT                 ((XrStructureType)1000999105)
+#define XR_TYPE_WORKSPACE_CURSOR_SWAPCHAIN_CREATE_INFO_EXT ((XrStructureType)1000999106)  // spec_version 13
+#define XR_TYPE_WORKSPACE_CURSOR_INFO_EXT                  ((XrStructureType)1000999107)  // spec_version 13
 
 /*!
  * @brief Workspace-local identifier for a client.
@@ -801,6 +803,111 @@ typedef XrResult (XRAPI_PTR *PFN_xrUpdateWorkspaceClientChromeLayerPoseEXT)(
     XrWorkspaceClientId  clientId,
     const XrPosef       *poseInClient);
 
+// ---- Workspace cursor (spec_version 13) ----
+//
+// The runtime owns the per-tile per-eye cursor render path (hit-Z disparity,
+// over-window dimming, multi-view composition). The CONTROLLER owns the
+// sprite content (any cursor look the controller wants — animated, branded,
+// shape-by-state, etc.). The split: runtime is mechanism, controller is
+// content.
+//
+// Flow:
+//   1. Controller creates a session-global cursor swapchain via
+//      xrCreateWorkspaceCursorSwapchainEXT. This is a single-image color
+//      swapchain (acquire / wait / fill / release) like chrome swapchains
+//      but NOT bound to any specific client — it's owned by the session.
+//   2. Controller renders its sprite into the swapchain image once (or per
+//      frame for animation).
+//   3. Controller calls xrSetWorkspaceCursorEXT with the swapchain handle,
+//      hot spot (in sprite UV), physical size, and visibility flag. The
+//      runtime samples the swapchain texture in its existing per-tile
+//      cursor render pass.
+//   4. To hide the cursor without destroying the swapchain: call
+//      xrSetWorkspaceCursorEXT with visible=XR_FALSE (or swapchain=XR_NULL_HANDLE).
+//   5. To change cursor shape: render a new sprite into the swapchain
+//      (acquire/wait/UpdateSubresource/release). The runtime samples the
+//      latest released image automatically. Same swapchain — no re-set.
+//
+// Architectural memory: [[chrome-layers-not-for-globals]] — chrome layers
+// are per-client and tile-scissored in shell-mode atlases; not suitable
+// for cross-tile globals like cursor. This RPC pair is the right shape.
+
+/*!
+ * @brief Create-info for xrCreateWorkspaceCursorSwapchainEXT.
+ *
+ * Same shape as chrome swapchain create-info but the resulting swapchain is
+ * session-global, not bound to any workspace client.
+ */
+typedef struct XrWorkspaceCursorSwapchainCreateInfoEXT {
+    XrStructureType  type;        // XR_TYPE_WORKSPACE_CURSOR_SWAPCHAIN_CREATE_INFO_EXT
+    const void* XR_MAY_ALIAS next;
+    int64_t          format;      // Graphics-API format (DXGI_FORMAT, VK_FORMAT, etc.)
+    uint32_t         width;
+    uint32_t         height;
+    uint32_t         sampleCount; // 1 if 0
+    uint32_t         mipCount;    // 1 if 0
+} XrWorkspaceCursorSwapchainCreateInfoEXT;
+
+/*!
+ * @brief Create a session-global swapchain to source the cursor sprite from.
+ *
+ * The returned swapchain behaves like any other OpenXR swapchain: caller
+ * acquires images, fills them (CPU upload or render-target draw), and
+ * releases. The runtime composes the latest-released image as the cursor
+ * sprite, scaled to @ref XrWorkspaceCursorInfoEXT::sizeMeters with the
+ * specified hot spot.
+ *
+ * Sample format choices: DXGI_FORMAT_R8G8B8A8_UNORM (linear alpha-blend),
+ * DXGI_FORMAT_R8G8B8A8_UNORM_SRGB (gamma alpha-blend). The runtime sample
+ * path uses linear blending; pre-multiplied alpha sprites blend correctly
+ * in either format.
+ *
+ * @return XR_SUCCESS, XR_ERROR_VALIDATION_FAILURE (bad createInfo),
+ *         XR_ERROR_FEATURE_UNSUPPORTED (session not in workspace IPC mode).
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrCreateWorkspaceCursorSwapchainEXT)(
+    XrSession                                        session,
+    const XrWorkspaceCursorSwapchainCreateInfoEXT  *createInfo,
+    XrSwapchain                                    *swapchain);
+
+/*!
+ * @brief Active cursor parameters.
+ *
+ * Pushed via xrSetWorkspaceCursorEXT. The runtime uses these along with
+ * the per-frame raycast (hit slot + hit Z) it already performs to render
+ * the cursor sprite at the right world position with per-eye disparity.
+ */
+typedef struct XrWorkspaceCursorInfoEXT {
+    XrStructureType  type;        // XR_TYPE_WORKSPACE_CURSOR_INFO_EXT
+    const void* XR_MAY_ALIAS next;
+    XrSwapchain      swapchain;   // Source for cursor pixels; XR_NULL_HANDLE = hide
+    XrVector2f       hotSpot;     // Normalized UV [0,1] of the sprite's click point
+    float            sizeMeters;  // Physical size (width = height) in meters
+    XrBool32         visible;     // XR_FALSE hides without releasing the swapchain
+} XrWorkspaceCursorInfoEXT;
+
+/*!
+ * @brief Activate / update the workspace cursor.
+ *
+ * Call once on startup after creating the cursor swapchain and filling its
+ * first image. Call again whenever the controller wants to change hot spot,
+ * size, visibility, or swap to a different swapchain (e.g., for a different
+ * cursor shape). The runtime keeps the most recent info; per-frame rendering
+ * uses the cached state, so this is a low-frequency call (NOT per-frame).
+ *
+ * Setting @p info->visible to XR_FALSE OR @p info->swapchain to
+ * XR_NULL_HANDLE hides the cursor without tearing down anything; a
+ * subsequent call re-activates.
+ *
+ * @return XR_SUCCESS, XR_ERROR_VALIDATION_FAILURE (bad info type / size),
+ *         XR_ERROR_HANDLE_INVALID (swapchain not a workspace-mode swapchain
+ *         or already destroyed), XR_ERROR_FEATURE_UNSUPPORTED (session not
+ *         in workspace IPC mode).
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceCursorEXT)(
+    XrSession                       session,
+    const XrWorkspaceCursorInfoEXT *info);
+
 // ---- Event-driven wakeup (spec_version 8) ----
 
 /*!
@@ -1034,6 +1141,15 @@ XRAPI_ATTR XrResult XRAPI_CALL xrUpdateWorkspaceClientChromeLayerPoseEXT(
     XrSession            session,
     XrWorkspaceClientId  clientId,
     const XrPosef       *poseInClient);
+
+XRAPI_ATTR XrResult XRAPI_CALL xrCreateWorkspaceCursorSwapchainEXT(
+    XrSession                                        session,
+    const XrWorkspaceCursorSwapchainCreateInfoEXT  *createInfo,
+    XrSwapchain                                    *swapchain);
+
+XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceCursorEXT(
+    XrSession                       session,
+    const XrWorkspaceCursorInfoEXT *info);
 
 XRAPI_ATTR XrResult XRAPI_CALL xrAcquireWorkspaceWakeupEventEXT(
     XrSession  session,
