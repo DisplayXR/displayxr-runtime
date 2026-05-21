@@ -37,6 +37,7 @@ add_library(
 	oxr_mcp_tools.h
 	oxr_objects.h
 	oxr_path.c
+	oxr_plugin_stub.c
 	oxr_pretty_print.c
 	oxr_pretty_print.h
 	oxr_session.c
