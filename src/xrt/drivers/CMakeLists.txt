@@ -338,6 +338,96 @@ endif()
 
 list(APPEND ENABLED_DRIVERS drv_sim_display)
 
+####
+# DisplayXR-SimDisplay plug-in DLL.
+#
+# Same sources as the static drv_sim_display target above, but rebuilt
+# with XRT_USING_RUNTIME_DLL so that XRT_API_FUNC declarations in the
+# aux headers (see ADR-019) expand to __declspec(dllimport). All aux
+# symbols enumerated in libopenxr.def therefore resolve to
+# DisplayXRClient.dll at runtime — a single copy of u_log /
+# g_log_sink_func / gTracker / etc. per process. Non-exported aux
+# helpers (math, containers, instance-based factories) are still
+# statically linked from aux_util / aux_os / aux_ogl; the linker pulls
+# in only the .obj files satisfying unresolved symbols, so the
+# exported TUs (u_logging.o, u_var.o, …) are NOT duplicated into the
+# plug-in DLL.
+#
+# v1 ships this alongside the runtime — discovery + load wiring lands
+# in the next sequencing step.
+add_library(drv_sim_display_plugin SHARED ${SIM_DISPLAY_SOURCES} sim_display/sim_display_plugin.c)
+target_compile_definitions(drv_sim_display_plugin PRIVATE XRT_USING_RUNTIME_DLL)
+target_link_libraries(
+	drv_sim_display_plugin
+	PRIVATE
+		# DisplayXRClient.lib — import library for the runtime DLL's
+		# aux export surface. Generator expression to skip pulling in
+		# the runtime target's PUBLIC INTERFACE_LINK_LIBRARIES (which
+		# would drag in st_oxr, every compositor, etc.).
+		$<TARGET_LINKER_FILE:${RUNTIME_TARGET}>
+		# Non-exported aux helpers. The linker only pulls in .obj
+		# files that satisfy unresolved symbols, so this does not
+		# duplicate exported TUs into the plug-in DLL.
+		xrt-interfaces
+		aux_util
+		aux_os
+		aux_ogl
+		drv_includes
+	)
+add_dependencies(drv_sim_display_plugin ${RUNTIME_TARGET})
+target_include_directories(drv_sim_display_plugin PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR}/sim_display
+	${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
+	)
+
+if(XRT_HAVE_VULKAN)
+	target_link_libraries(drv_sim_display_plugin PRIVATE aux_vk)
+	target_include_directories(drv_sim_display_plugin PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+endif()
+
+if(WIN32)
+	target_link_libraries(drv_sim_display_plugin PRIVATE d3d11 d3dcompiler opengl32)
+	if(XRT_HAVE_D3D12)
+		target_link_libraries(drv_sim_display_plugin PRIVATE d3d12)
+	endif()
+endif()
+
+if(APPLE)
+	target_link_libraries(drv_sim_display_plugin PRIVATE "-framework CoreGraphics" "-framework AppKit" "-framework Metal" "-framework OpenGL")
+	target_compile_definitions(drv_sim_display_plugin PRIVATE GL_SILENCE_DEPRECATION)
+endif()
+
+# Honor the ADR-019 invariant that every plug-in DLL exports exactly
+# one symbol: xrtPluginNegotiate. The XRT_PLUGIN_EXPORT decoration in
+# sim_display_plugin.c does the heavy lifting on Windows (dllexport).
+# On Linux / macOS we apply visibility=hidden defaults below so any
+# accidentally-non-static symbols stay private.
+set_target_properties(drv_sim_display_plugin PROPERTIES
+	OUTPUT_NAME "DisplayXR-SimDisplay"
+	PREFIX ""
+	C_VISIBILITY_PRESET hidden
+	CXX_VISIBILITY_PRESET hidden
+	VISIBILITY_INLINES_HIDDEN ON
+	)
+
+# Install the plug-in DLL next to the runtime DLL. The plan defines
+# $INSTDIR\plugins\ as the home, but the runtime DLL's transitive
+# dependencies (cjson.dll, pthread, …) live in $INSTDIR\bin\; the
+# loader-side LoadLibraryExW(LOAD_WITH_ALTERED_SEARCH_PATH) + an
+# AddDllDirectory("…/bin") call lands with the discovery wiring.
+if(WIN32)
+	install(
+		TARGETS drv_sim_display_plugin
+		RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		)
+elseif(NOT ANDROID)
+	install(
+		TARGETS drv_sim_display_plugin
+		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
+		)
+endif()
+
 set(ENABLED_DRIVERS ${ENABLED_HEADSET_DRIVERS} ${ENABLED_DRIVERS})
 if(ENABLED_DRIVERS)
 	list(SORT ENABLED_DRIVERS)
