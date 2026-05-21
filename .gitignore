@@ -48,6 +48,11 @@ cmake-build-*/
 .claude/*
 !.claude/skills/
 
+# Local CNSDK drop for Android build (84 MB, fetched per-developer from
+# https://github.com/LeiaInc/leiainc.github.io/tree/master/CNSDK).
+# Path matches root build.gradle:92 cnsdkDir = new File(projectDir, "cnsdk").
+/cnsdk/
+
 # Ignore local settings
 .vscode
 *.autosave

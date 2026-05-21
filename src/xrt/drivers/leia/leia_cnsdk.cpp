@@ -87,7 +87,9 @@ leia_cnsdk_destroy(struct leia_cnsdk **cnsdk_ptr)
 	struct leia_cnsdk *cnsdk = *cnsdk_ptr;
 
 	if (cnsdk->interlacer != NULL) {
-		leia_interlacer_release(cnsdk->interlacer);
+		// CNSDK 0.7.28 renamed the per-interlacer release; the core owns the
+		// interlacer lifetime, so the shutdown call needs both handles.
+		leia_interlacer_shutdown(cnsdk->core, cnsdk->interlacer);
 		cnsdk->interlacer = NULL;
 	}
 
