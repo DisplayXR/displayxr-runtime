@@ -9,6 +9,8 @@
 
 #pragma once
 
+#include "xrt/xrt_api.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -21,7 +23,7 @@ extern "C" {
  * Safe to call multiple times - only initializes once.
  * Automatically called by u_log on first log message on Windows.
  */
-void
+XRT_API_FUNC void
 u_file_logging_init(void);
 
 /*!
@@ -29,14 +31,14 @@ u_file_logging_init(void);
  * Used by oxr_logger to route state tracker logs to the file.
  * Safe to call before init or after shutdown (will be a no-op).
  */
-void
+XRT_API_FUNC void
 u_file_logging_write_raw(const char *msg);
 
 /*!
  * Close the log file and clean up resources.
  * Called automatically at process exit.
  */
-void
+XRT_API_FUNC void
 u_file_logging_shutdown(void);
 
 #ifdef __cplusplus

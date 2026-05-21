@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "xrt/xrt_api.h"
 #include "xrt/xrt_compiler.h"
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_config_have.h"
@@ -68,7 +69,7 @@ enum u_trace_which
  *
  * @ingroup aux_util
  */
-void
+XRT_API_FUNC void
 u_trace_marker_setup(enum u_trace_which which);
 
 /*!
@@ -76,7 +77,7 @@ u_trace_marker_setup(enum u_trace_which which);
  *
  * @ingroup aux_util
  */
-void
+XRT_API_FUNC void
 u_trace_marker_init(void);
 
 #define COLOR_TRACE_MARKER(COLOR) U_TRACE_FUNC_COLOR(color, COLOR)
