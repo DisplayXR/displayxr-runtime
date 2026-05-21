@@ -16,6 +16,7 @@
 
 #include "target_builder_interface.h"
 #include "target_builder_qwerty_input.h"
+#include "target_plugin_loader.h"
 
 #include "sim_display/sim_display_interface.h"
 
@@ -73,7 +74,22 @@ sim_display_open_system_impl(struct xrt_builder *xb,
                              struct xrt_frame_context *xfctx,
                              struct u_builder_roles_helper *ubrh)
 {
-	struct xrt_device *head = sim_display_hmd_create();
+	/*
+	 * Prefer the sim_display plug-in DLL when present. The loader caches
+	 * the negotiated iface across calls; failure → NULL, which falls
+	 * through to the statically-linked sim_display_hmd_create() — same
+	 * device shape, just an in-process construction. Issue #256.
+	 */
+	struct xrt_device *head = NULL;
+	const struct xrt_plugin_iface *plugin = target_plugin_get_sim_display();
+	if (plugin != NULL && plugin->create_device != NULL) {
+		if (plugin->create_device(NULL, &head) != XRT_SUCCESS) {
+			head = NULL;
+		}
+	}
+	if (head == NULL) {
+		head = sim_display_hmd_create();
+	}
 	if (head == NULL) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
