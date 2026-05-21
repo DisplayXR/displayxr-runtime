@@ -50,6 +50,8 @@
 // sim_display display info for XR_EXT_display_info fallback
 #include "sim_display/sim_display_interface.h"
 
+#include "target_plugin_loader.h"
+
 #include "target_instance_parts.h"
 
 #include <assert.h>
@@ -338,27 +340,44 @@ out:
 				        xsysc->info.atlas_height_pixels,
 				        sd_info.display_pixel_width, sd_info.display_pixel_height);
 
-				// Set sim_display factories (only if Leia SR didn't already set them)
+				// Set sim_display factories (only if Leia SR didn't already set them).
+				//
+				// Prefer the sim_display plug-in DLL's factories when it loaded
+				// successfully (issue #256 / ADR-019); otherwise fall back to
+				// the in-tree statically-linked sim_display_dp_factory_*. NULL
+				// from the iface (per-API not supported on this platform) also
+				// falls through to the static path.
+				const struct xrt_plugin_iface *sd_plugin = target_plugin_get_sim_display();
 				if (xsysc->info.dp_factory_vk == NULL) {
-					xsysc->info.dp_factory_vk = (void *)sim_display_dp_factory_vk;
+					xsysc->info.dp_factory_vk = (void *)((sd_plugin && sd_plugin->create_dp_vk)
+					                                         ? sd_plugin->create_dp_vk
+					                                         : sim_display_dp_factory_vk);
 				}
 #ifdef XRT_OS_WINDOWS
 				if (xsysc->info.dp_factory_d3d11 == NULL) {
-					xsysc->info.dp_factory_d3d11 = (void *)sim_display_dp_factory_d3d11;
+					xsysc->info.dp_factory_d3d11 = (void *)((sd_plugin && sd_plugin->create_dp_d3d11)
+					                                            ? sd_plugin->create_dp_d3d11
+					                                            : sim_display_dp_factory_d3d11);
 				}
 #endif
 #if defined(XRT_OS_WINDOWS) && defined(XRT_HAVE_D3D12)
 				if (xsysc->info.dp_factory_d3d12 == NULL) {
-					xsysc->info.dp_factory_d3d12 = (void *)sim_display_dp_factory_d3d12;
+					xsysc->info.dp_factory_d3d12 = (void *)((sd_plugin && sd_plugin->create_dp_d3d12)
+					                                            ? sd_plugin->create_dp_d3d12
+					                                            : sim_display_dp_factory_d3d12);
 				}
 #endif
 #ifdef __APPLE__
 				if (xsysc->info.dp_factory_metal == NULL) {
-					xsysc->info.dp_factory_metal = (void *)sim_display_dp_factory_metal;
+					xsysc->info.dp_factory_metal = (void *)((sd_plugin && sd_plugin->create_dp_metal)
+					                                            ? sd_plugin->create_dp_metal
+					                                            : sim_display_dp_factory_metal);
 				}
 #endif
 				if (xsysc->info.dp_factory_gl == NULL) {
-					xsysc->info.dp_factory_gl = (void *)sim_display_dp_factory_gl;
+					xsysc->info.dp_factory_gl = (void *)((sd_plugin && sd_plugin->create_dp_gl)
+					                                         ? sd_plugin->create_dp_gl
+					                                         : sim_display_dp_factory_gl);
 				}
 			}
 		}
