@@ -31,6 +31,12 @@
 #include <vulkan/vulkan_metal.h>
 #endif
 
+#ifdef XRT_OS_ANDROID
+#define VK_USE_PLATFORM_ANDROID_KHR
+#include <vulkan/vulkan_android.h>
+#include <android/native_window.h>
+#endif
+
 #define DCOMP_RING 2 // Number of shared back-buffers in the bridge ring
 
 #define MAX_TARGET_IMAGES 4
@@ -744,6 +750,45 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 	                                          target->surface, &present_support);
 	if (!present_support) {
 		U_LOG_E("Queue family does not support presentation to Metal surface");
+		vk->vkDestroySurfaceKHR(vk->instance, target->surface, NULL);
+		free(target);
+		return XRT_ERROR_VULKAN;
+	}
+#elif defined(XRT_OS_ANDROID)
+	// Android: the hwnd void* parameter is an ANativeWindow* obtained from
+	// the SurfaceView / Surface the activity passes down (POC plumbing for
+	// #130 lands in a follow-up; for now the caller is responsible).
+	if (vk->vkCreateAndroidSurfaceKHR == NULL) {
+		U_LOG_E("vkCreateAndroidSurfaceKHR not loaded — VK_KHR_android_surface must be enabled");
+		free(target);
+		return XRT_ERROR_VULKAN;
+	}
+	if (hwnd == NULL) {
+		U_LOG_E("VK native target: ANativeWindow* is NULL on Android");
+		free(target);
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	VkAndroidSurfaceCreateInfoKHR surface_ci = {
+	    .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
+	    .pNext = NULL,
+	    .flags = 0,
+	    .window = (ANativeWindow *)hwnd,
+	};
+
+	VkResult res = vk->vkCreateAndroidSurfaceKHR(vk->instance, &surface_ci, NULL, &target->surface);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("Failed to create Android surface: %d", res);
+		free(target);
+		return XRT_ERROR_VULKAN;
+	}
+
+	VkBool32 present_support = VK_FALSE;
+	vk->vkGetPhysicalDeviceSurfaceSupportKHR(vk->physical_device,
+	                                          queue_family_index,
+	                                          target->surface, &present_support);
+	if (!present_support) {
+		U_LOG_E("Queue family does not support presentation to Android surface");
 		vk->vkDestroySurfaceKHR(vk->instance, target->surface, NULL);
 		free(target);
 		return XRT_ERROR_VULKAN;
