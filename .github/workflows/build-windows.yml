@@ -169,6 +169,49 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: cmake --build build --config Release --target install
 
+      # ADR-019 / issue #256 — the runtime DLL must hold zero vendor
+      # identifiers in its link line. After Step 6c moved drv_leia into
+      # the DisplayXR-LeiaSR.dll plug-in, DisplayXRClient.dll should
+      # import nothing matching `SimulatedReality*`. This step catches
+      # any regression — e.g. a future PR accidentally re-linking
+      # drv_leia into the runtime, or a new transitive dep dragging
+      # the SR libs back in — at PR time, before any artifact ships.
+      #
+      # Mirrors the plan §4.8 assertion. Runs even when the SR SDK is
+      # present at build time (which it always is on this job, because
+      # XRT_HAVE_LEIA_SR=ON drives the plug-in build); the test is
+      # purely about what the runtime DLL's import table looks like.
+      - name: Assert runtime DLL has zero vendor identifiers
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: |
+          $dll = "_package/bin/DisplayXRClient.dll"
+          if (-not (Test-Path $dll)) {
+            Write-Host "::error::$dll missing — runtime build did not produce expected artifact."
+            exit 1
+          }
+          $sr = & dumpbin /imports $dll 2>&1 | Select-String -Pattern "SimulatedReality"
+          if ($sr) {
+            Write-Host "::error::ADR-019 regression — DisplayXRClient.dll has SimulatedReality static imports:"
+            $sr | ForEach-Object { Write-Host "  $_" }
+            Write-Host "Fix: drop the offending drv_leia / SR library link from the runtime DLL's link line. Vendor code belongs in the DisplayXR-LeiaSR.dll plug-in (see docs/adr/ADR-019-vendor-plugin-aux-boundary.md)."
+            exit 1
+          }
+          Write-Host "PASS: runtime DLL has zero SimulatedReality imports (ADR-019 §2.1 holds)."
+          # Also assert that the plug-in DLL we expect IS shipped — guards
+          # against a CMake regression that silently drops the plug-in.
+          $plugin = "_package/bin/plugins/DisplayXR-SimDisplay.dll"
+          if (-not (Test-Path $plugin)) {
+            Write-Host "::error::$plugin missing — sim-display plug-in did not build."
+            exit 1
+          }
+          $exports = & dumpbin /exports $plugin 2>&1 | Select-String -Pattern "xrtPluginNegotiate"
+          if (-not $exports) {
+            Write-Host "::error::$plugin missing xrtPluginNegotiate export (ADR-019 contract — exactly one symbol)."
+            exit 1
+          }
+          Write-Host "PASS: sim-display plug-in built and exports xrtPluginNegotiate."
+
       - name: Build Installer
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: cmake --build build --config Release --target installer
