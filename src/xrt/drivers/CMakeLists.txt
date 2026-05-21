@@ -134,8 +134,14 @@ if(XRT_HAVE_LEIA_SR)
 		endif()
 	endif()
 
-	# Only create the driver if at least one weaver is available
-	if(LEIA_SOURCES)
+	# Only create the static drv_leia if at least one weaver is
+	# available AND we're building the in-proc fallback path. With
+	# XRT_PLUGIN_BUILD_INPROC_FALLBACK=OFF (default), only the plug-in
+	# DLL is built — the runtime DLL has no vendor identifiers in its
+	# link line (ADR-019/plan goal §2.1). LEIA_SOURCES is still
+	# populated unconditionally because drv_leia_plugin below consumes
+	# it regardless of the in-proc fallback option.
+	if(LEIA_SOURCES AND XRT_PLUGIN_BUILD_INPROC_FALLBACK)
 		add_library(drv_leia STATIC ${LEIA_SOURCES})
 		target_include_directories(drv_leia PRIVATE
 			${SR_PATH}/include
@@ -232,13 +238,15 @@ if(XRT_HAVE_LEIA_SR)
 		set(LEIA_SR_GL_AVAILABLE ${LEIA_SR_GL_AVAILABLE} CACHE INTERNAL "LeiaSR GL weaver available")
 
 		list(APPEND ENABLED_DRIVERS drv_leia)
-	else()
+	elseif(NOT LEIA_SOURCES)
 		message(WARNING "XRT_HAVE_LEIA_SR is set but no SR weaver libraries found - disabling Leia SR support")
 		set(XRT_HAVE_LEIA_SR OFF PARENT_SCOPE)
 	endif()
 endif(XRT_HAVE_LEIA_SR)
 
-# EDID-based Leia display identification (no SR SDK required, Windows only)
+# EDID-based Leia display identification (no SR SDK required, Windows only).
+# Only added to the in-proc static drv_leia (the plug-in target appends its
+# own copy below, gated independently of XRT_PLUGIN_BUILD_INPROC_FALLBACK).
 if(WIN32 AND TARGET drv_leia)
 	target_sources(drv_leia PRIVATE leia/leia_edid_probe.c)
 endif()
@@ -263,11 +271,16 @@ endif()
 # Step 6c will gate it behind XRT_PLUGIN_BUILD_INPROC_FALLBACK.
 #
 # Issue #256.
-if(XRT_HAVE_LEIA_SR AND TARGET drv_leia)
+if(XRT_HAVE_LEIA_SR AND LEIA_SOURCES)
 	# Mirror the conditional WGC bg-capture sources the static drv_leia
 	# target gets via target_sources(... PRIVATE) further down — the
 	# SHARED target needs all symbols resolved at the .dll link step, so
 	# they must be in the initial source list.
+	#
+	# Gated on LEIA_SOURCES (set in the SR-SDK detection above), not on
+	# TARGET drv_leia, because XRT_PLUGIN_BUILD_INPROC_FALLBACK=OFF
+	# suppresses the static drv_leia target — the plug-in DLL is the
+	# only Leia link line in production builds.
 	set(LEIA_PLUGIN_SOURCES ${LEIA_SOURCES} leia/leia_edid_probe.c leia/leia_plugin.c)
 	if(WIN32 AND (LEIA_SR_D3D11_AVAILABLE OR LEIA_SR_D3D12_AVAILABLE))
 		list(APPEND LEIA_PLUGIN_SOURCES leia/leia_bg_capture_win.cpp leia/leia_bg_capture_win.h)

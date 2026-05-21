@@ -75,3 +75,21 @@ _Static_assert(offsetof(struct xrt_plugin_iface, create_dp_gl) < offsetof(struct
                "xrt_plugin: create_dp_gl must precede destroy");
 _Static_assert(offsetof(struct xrt_plugin_iface, create_dp_metal) < offsetof(struct xrt_plugin_iface, destroy),
                "xrt_plugin: create_dp_metal must precede destroy");
+
+/*
+ * get_display_info is the first additive vtable field after the v1
+ * "core" methods. New extensions go after it; this assert keeps
+ * destroy as the boundary between the v1 core and the appended
+ * surface so plug-ins built against the bare v1 header keep working
+ * (their struct_size won't include get_display_info; the runtime
+ * checks via struct_size before dereferencing).
+ */
+_Static_assert(offsetof(struct xrt_plugin_iface, destroy) < offsetof(struct xrt_plugin_iface, get_display_info),
+               "xrt_plugin: get_display_info must follow destroy (additive-only growth)");
+
+/*
+ * Display-info struct's first field must be struct_size so plug-ins
+ * can detect host's compile-time sizeof and clamp writes accordingly.
+ */
+_Static_assert(offsetof(struct xrt_plugin_display_info, struct_size) == 0,
+               "xrt_plugin: display_info.struct_size must be the first field");

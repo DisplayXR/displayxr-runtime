@@ -214,6 +214,15 @@ option(XRT_HAVE_TRACY "Enable Tracy support for tracing, make sure to set XRT_FE
 option_with_deps(XRT_HAVE_CNSDK "Enable CNSDK support (Android)" DEPENDS CNSDK_FOUND)
 option_with_deps(XRT_HAVE_LEIA_SR "Enable Leia SR support" DEPENDS simulatedreality_FOUND srDirectX_FOUND)
 
+# Vendor plug-in architecture (ADR-019, issue #256) — when ON, the
+# runtime DLL also statically links drv_leia + target_builder_leia for
+# developer debugging without the plug-in DLL. Default OFF: the runtime
+# DLL holds zero vendor identifiers in its link line; vendor code lives
+# entirely in the plug-in DLLs loaded via the registry-driven discovery
+# at xrCreateInstance.
+option(XRT_PLUGIN_BUILD_INPROC_FALLBACK
+       "Also build the in-proc static drv_leia fallback for the runtime DLL (developer-only)" OFF)
+
 # Graphics deps to use (sorted in each group, groups thematic and ordered to handle internal deps: e.g. EGL and SDL2 need OpenGL/GLES)
 option_with_deps(XRT_HAVE_OPENGL "Enable OpenGL Graphics API support" DEPENDS OPENGL_WITHOUT_GLX_FOUND)
 # OpenGL GLX removed — lightweight runtime doesn't use X11 GLX

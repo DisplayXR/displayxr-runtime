@@ -69,6 +69,49 @@ sim_display_plugin_destroy(struct xrt_plugin_instance *inst)
 	/* No instance state — nothing to free. */
 }
 
+static bool
+sim_display_plugin_get_display_info(struct xrt_plugin_instance *inst,
+                                    struct xrt_device *xdev,
+                                    struct xrt_plugin_display_info *out_info)
+{
+	(void)inst;
+
+	struct sim_display_info sd_info;
+	if (!sim_display_get_display_info(xdev, &sd_info)) {
+		return false;
+	}
+
+	/*
+	 * v1: runtime + plug-in are built against the same xrt_plugin.h,
+	 * so out_info->struct_size always equals
+	 * sizeof(struct xrt_plugin_display_info). A future struct
+	 * extension will gate per-field writes on the reported
+	 * struct_size for forward compat.
+	 */
+	(void)out_info->struct_size;
+
+	out_info->display_width_m = sd_info.display_width_m;
+	out_info->display_height_m = sd_info.display_height_m;
+	out_info->nominal_viewer_x_m = 0.0f;
+	out_info->nominal_viewer_y_m = sd_info.nominal_y_m;
+	out_info->nominal_viewer_z_m = sd_info.nominal_z_m;
+	out_info->display_pixel_width = sd_info.display_pixel_width;
+	out_info->display_pixel_height = sd_info.display_pixel_height;
+	/* sim_display has no SR-style recommended scale; runtime derives
+	 * one from the worst-case rendering mode when these stay zero. */
+	out_info->recommended_view_scale_x = 0.0f;
+	out_info->recommended_view_scale_y = 0.0f;
+	/* No EDID screen position for the simulated display. */
+	out_info->display_screen_left = 0;
+	out_info->display_screen_top = 0;
+	/* MANUAL eye tracking only — the simulated device is always
+	 * "tracking" and eye positions come from app input. */
+	out_info->supported_eye_tracking_modes = 2u; /* MANUAL_BIT */
+	out_info->default_eye_tracking_mode = 1u;    /* MANUAL */
+
+	return true;
+}
+
 
 /*
  *
@@ -122,6 +165,8 @@ static struct xrt_plugin_iface g_sim_display_iface = {
 #endif
 
     .destroy = sim_display_plugin_destroy,
+
+    .get_display_info = sim_display_plugin_get_display_info,
 };
 
 
