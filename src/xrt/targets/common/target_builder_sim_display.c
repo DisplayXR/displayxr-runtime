@@ -105,20 +105,63 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 	t_builder_add_qwerty_input(xsysd, ubrh, U_LOGGING_INFO, &qwerty_hmd);
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
-	// sim_display-specific: configure qwerty HMD pose and delegate sim_display
-	// pose to qwerty for WASD/mouse camera control.
+	// Configure qwerty HMD pose and delegate head's pose to qwerty for
+	// WASD/mouse camera control. Vendor-agnostic via the plug-in iface
+	// (issue #256) — historically this code called
+	// `sim_display_hmd_set_pose_source(head, qwerty_hmd)` directly,
+	// which downcasts `head` to a sim_display container struct. With
+	// iface->create_device potentially returning a non-sim device
+	// (e.g. Leia), the direct call corrupted the head's vtable
+	// backing and broke shell rendering. Route through the iface
+	// instead; the plug-in owns the vendor-private cast.
 	if (qwerty_hmd != NULL) {
 		struct qwerty_device *qd = qwerty_device(qwerty_hmd);
 		qd->pose.position = (struct xrt_vec3){0, 1.6f, 0};
 		qd->pose.orientation = (struct xrt_quat){0, 0, 0, 1};
 
-		struct sim_display_info info;
-		if (sim_display_get_display_info(head, &info)) {
-			qd->sys->screen_height_m = info.display_height_m;
-			qd->sys->nominal_viewer_z = info.nominal_z_m;
+		// Dims for the qwerty system: screen height + nominal viewer
+		// Z drive the WASD camera scaling. Iface-provided when
+		// available; fall back to sim_display's typed query (only
+		// returns true for sim_display devices, so this is safe even
+		// when the head is some other vendor).
+		float screen_height_m = 0.0f;
+		float nominal_z_m = 0.0f;
+		if (plugin != NULL &&
+		    plugin->struct_size > offsetof(struct xrt_plugin_iface, get_display_info) &&
+		    plugin->get_display_info != NULL) {
+			struct xrt_plugin_display_info pdi = {0};
+			pdi.struct_size = (uint32_t)sizeof(pdi);
+			if (plugin->get_display_info(target_plugin_get_active_instance(), head, &pdi)) {
+				screen_height_m = pdi.display_height_m;
+				nominal_z_m = pdi.nominal_viewer_z_m;
+			}
+		}
+		if (screen_height_m == 0.0f) {
+			struct sim_display_info info;
+			if (sim_display_get_display_info(head, &info)) {
+				screen_height_m = info.display_height_m;
+				nominal_z_m = info.nominal_z_m;
+			}
+		}
+		if (screen_height_m > 0.0f) {
+			qd->sys->screen_height_m = screen_height_m;
+		}
+		if (nominal_z_m > 0.0f) {
+			qd->sys->nominal_viewer_z = nominal_z_m;
 		}
 
-		sim_display_hmd_set_pose_source(head, qwerty_hmd);
+		// Bind the qwerty HMD as the head's external pose source.
+		// Iface-routed (plug-in owns the vendor-private cast);
+		// falls back to the in-tree sim_display call when no
+		// iface is active (in-proc fallback build, or a developer
+		// configuration with no plug-ins).
+		if (plugin != NULL &&
+		    plugin->struct_size > offsetof(struct xrt_plugin_iface, set_pose_source) &&
+		    plugin->set_pose_source != NULL) {
+			plugin->set_pose_source(target_plugin_get_active_instance(), head, qwerty_hmd);
+		} else {
+			sim_display_hmd_set_pose_source(head, qwerty_hmd);
+		}
 	}
 #endif
 
