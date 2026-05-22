@@ -662,13 +662,26 @@ vk_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin_se
 	U_LOG_I("VK native compositor session begin - target=%p, renderer=%p",
 	        (void *)c->target, (void *)c->renderer);
 
+	// Notify the DP that the host activity is foregrounded. On Android
+	// this propagates to leia_core_on_resume so CNSDK re-enables the
+	// face-tracking camera + restores backlight after a pause.
+	xrt_display_processor_on_resume(c->display_processor);
+
 	return XRT_SUCCESS;
 }
 
 static xrt_result_t
 vk_compositor_end_session(struct xrt_compositor *xc)
 {
+	struct comp_vk_native_compositor *c = vk_comp(xc);
 	U_LOG_I("VK native compositor session end");
+
+	// Counterpart of begin_session: notify the DP we're backgrounding
+	// so CNSDK can stop the face-tracking camera + dim the backlight
+	// for power. Safe even if the DP doesn't implement on_pause (the
+	// helper NULL-checks).
+	xrt_display_processor_on_pause(c->display_processor);
+
 	return XRT_SUCCESS;
 }
 

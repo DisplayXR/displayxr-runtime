@@ -290,6 +290,34 @@ leia_cnsdk_is_initialized(struct leia_cnsdk *cnsdk)
 	return leia_core_is_initialized(cnsdk->core);
 }
 
+extern "C" void
+leia_cnsdk_on_pause(struct leia_cnsdk *cnsdk)
+{
+	if (cnsdk == NULL || cnsdk->core == NULL) {
+		return;
+	}
+	if (!leia_core_is_initialized(cnsdk->core)) {
+		DXR_HW_DBG("on_pause: skipped (core not initialized yet)");
+		return;
+	}
+	DXR_HW_DBG("on_pause: forwarding to leia_core_on_pause");
+	leia_core_on_pause(cnsdk->core);
+}
+
+extern "C" void
+leia_cnsdk_on_resume(struct leia_cnsdk *cnsdk)
+{
+	if (cnsdk == NULL || cnsdk->core == NULL) {
+		return;
+	}
+	if (!leia_core_is_initialized(cnsdk->core)) {
+		DXR_HW_DBG("on_resume: skipped (core not initialized yet)");
+		return;
+	}
+	DXR_HW_DBG("on_resume: forwarding to leia_core_on_resume");
+	leia_core_on_resume(cnsdk->core);
+}
+
 extern "C" bool
 leia_cnsdk_get_display_metrics(struct leia_cnsdk *cnsdk,
                                float *out_width_m,

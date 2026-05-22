@@ -232,6 +232,24 @@ get_display_pixel_info_default(struct xrt_display_processor *xdp,
 }
 
 void
+on_pause_cnsdk(struct xrt_display_processor *xdp)
+{
+	leia_dp_cnsdk *impl = as_impl(xdp);
+	if (impl->cnsdk != nullptr) {
+		leia_cnsdk_on_pause(impl->cnsdk);
+	}
+}
+
+void
+on_resume_cnsdk(struct xrt_display_processor *xdp)
+{
+	leia_dp_cnsdk *impl = as_impl(xdp);
+	if (impl->cnsdk != nullptr) {
+		leia_cnsdk_on_resume(impl->cnsdk);
+	}
+}
+
+void
 destroy_impl(struct xrt_display_processor *xdp)
 {
 	leia_dp_cnsdk *impl = as_impl(xdp);
@@ -280,6 +298,8 @@ leia_dp_factory_cnsdk(void *vk_bundle,
 	impl->vk = static_cast<struct vk_bundle *>(vk_bundle);
 
 	impl->base.process_atlas = process_atlas_weave;
+	impl->base.on_pause = on_pause_cnsdk;
+	impl->base.on_resume = on_resume_cnsdk;
 	impl->base.is_self_submitting = is_self_submitting_true;
 	impl->base.get_predicted_eye_positions = get_predicted_eye_positions_ipd;
 	impl->base.get_display_dimensions = get_display_dimensions_default;

@@ -266,6 +266,30 @@ struct xrt_display_processor
 	                       bool transparent_bg_enabled);
 
 	/*!
+	 * Notify the display processor that the host activity has paused
+	 * (backgrounded). Vendor SDKs use this to drop face-tracking
+	 * cameras, dim backlights, and otherwise save power.
+	 *
+	 * Idempotent. Safe to call before the vendor SDK is fully
+	 * initialized — the vendor wrapper should no-op in that case.
+	 *
+	 * Optional — NULL means the vendor doesn't need pause notifications.
+	 *
+	 * @param xdp Pointer to self.
+	 */
+	void (*on_pause)(struct xrt_display_processor *xdp);
+
+	/*!
+	 * Notify the display processor that the host activity has resumed
+	 * (foregrounded). Counterpart of @ref on_pause.
+	 *
+	 * Optional — NULL means no-op.
+	 *
+	 * @param xdp Pointer to self.
+	 */
+	void (*on_resume)(struct xrt_display_processor *xdp);
+
+	/*!
 	 * Destroy this display processor and free all resources.
 	 *
 	 * @param xdp Pointer to self.
@@ -432,6 +456,34 @@ xrt_display_processor_is_alpha_native(struct xrt_display_processor *xdp)
 		return false;
 	}
 	return xdp->is_alpha_native(xdp);
+}
+
+/*!
+ * @copydoc xrt_display_processor::on_pause
+ * No-op if not supported (function pointer is NULL).
+ * @public @memberof xrt_display_processor
+ */
+static inline void
+xrt_display_processor_on_pause(struct xrt_display_processor *xdp)
+{
+	if (xdp == NULL || xdp->on_pause == NULL) {
+		return;
+	}
+	xdp->on_pause(xdp);
+}
+
+/*!
+ * @copydoc xrt_display_processor::on_resume
+ * No-op if not supported (function pointer is NULL).
+ * @public @memberof xrt_display_processor
+ */
+static inline void
+xrt_display_processor_on_resume(struct xrt_display_processor *xdp)
+{
+	if (xdp == NULL || xdp->on_resume == NULL) {
+		return;
+	}
+	xdp->on_resume(xdp);
 }
 
 /*!

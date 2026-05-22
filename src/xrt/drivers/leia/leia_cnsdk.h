@@ -48,6 +48,31 @@ bool
 leia_cnsdk_is_initialized(struct leia_cnsdk *cnsdk);
 
 /*!
+ * Notify CNSDK that the host Activity has paused (backgrounded).
+ *
+ * Wraps leia_core_on_pause. Safe to call any time after
+ * @ref leia_cnsdk_create — CNSDK no-ops if the core isn't initialized
+ * yet. Stops face-tracking cameras + dims the backlight; idempotent
+ * across repeated calls.
+ *
+ * Intended caller: OpenXR session state machine in oxr_session.c on
+ * entering XR_SESSION_STATE_STOPPING.
+ */
+void
+leia_cnsdk_on_pause(struct leia_cnsdk *cnsdk);
+
+/*!
+ * Notify CNSDK that the host Activity has resumed (foregrounded).
+ *
+ * Wraps leia_core_on_resume. Counterpart of @ref leia_cnsdk_on_pause.
+ *
+ * Intended caller: OpenXR session state machine on entering
+ * XR_SESSION_STATE_READY after a pause.
+ */
+void
+leia_cnsdk_on_resume(struct leia_cnsdk *cnsdk);
+
+/*!
  * Fetch native display metrics from CNSDK's device config.
  *
  * The four values are snapshotted once by the face-tracking worker
