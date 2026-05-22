@@ -38,6 +38,22 @@
 
 #include <stdlib.h>
 
+
+// Hardware-bring-up debug logging. Gated by XRT_DEBUG_ANDROID_VERBOSE
+// (cppFlag from the Android Debug variant). Compiles to nothing in
+// release. Tag "HW_DBG_DP:" for greppable separation from CNSDK logs.
+#ifdef XRT_DEBUG_ANDROID_VERBOSE
+#define DXR_HW_DBG(...)       U_LOG_I("HW_DBG_DP: " __VA_ARGS__)
+#define DXR_HW_DBG_ONCE(...)  do {                                                                 \
+		static bool _logged = false;                                                                \
+		if (!_logged) { U_LOG_I("HW_DBG_DP[once]: " __VA_ARGS__); _logged = true; }                 \
+	} while (0)
+#else
+#define DXR_HW_DBG(...)       ((void)0)
+#define DXR_HW_DBG_ONCE(...)  ((void)0)
+#endif
+
+
 namespace {
 
 // Lume Pad 2-class defaults. Used until CNSDK reports the real device
@@ -312,9 +328,12 @@ blit_atlas_to_per_view(leia_dp_cnsdk *impl,
 	si.pSignalSemaphores = &impl->blit_done;
 	VkResult res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, impl->blit_fence);
 	if (res != VK_SUCCESS) {
+		DXR_HW_DBG("blit_atlas_to_per_view: vkQueueSubmit failed: %d", (int)res);
 		return false;
 	}
 	impl->blit_in_flight = true;
+	DXR_HW_DBG_ONCE("blit_atlas_to_per_view: first successful submit (sem=%p fence=%p)",
+	                (void *)impl->blit_done, (void *)impl->blit_fence);
 	return true;
 }
 
@@ -387,6 +406,16 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	                             view_width, view_height)) {
 		return;
 	}
+
+#ifdef XRT_DEBUG_ANDROID_VERBOSE
+	static int dp_dbg_frame = 0;
+	if ((dp_dbg_frame++ % 60) == 0) {
+		DXR_HW_DBG("process_atlas_weave[frame=%d, per-tile-blit]: view=%ux%u target=%ux%u fmt=%d",
+		           dp_dbg_frame, view_width, view_height, target_width, target_height,
+		           (int)target_format);
+	}
+#endif
+	DXR_HW_DBG_ONCE("process_atlas_weave: first frame with ready interlacer + blit");
 
 	leia_cnsdk_weave(impl->cnsdk,
 	                 impl->vk->device,
@@ -539,6 +568,8 @@ create_blit_resources(leia_dp_cnsdk *impl)
 		U_LOG_E("CNSDK DP: blit_fence create failed");
 		return false;
 	}
+	DXR_HW_DBG("create_blit_resources: cmd=%p sem=%p fence=%p",
+	           (void *)impl->blit_cmd, (void *)impl->blit_done, (void *)impl->blit_fence);
 	return true;
 }
 
@@ -610,5 +641,6 @@ leia_dp_factory_cnsdk(void *vk_bundle,
 	*out_xdp = &impl->base;
 
 	U_LOG_W("Leia CNSDK DP created (self-submitting, per-tile blit + CNSDK weave)");
+	DXR_HW_DBG("factory: impl=%p vk=%p cnsdk=%p", (void *)impl, (void *)impl->vk, (void *)impl->cnsdk);
 	return XRT_SUCCESS;
 }

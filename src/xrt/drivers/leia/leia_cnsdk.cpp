@@ -26,6 +26,22 @@
 #include <thread>
 
 
+// Hardware-bring-up debug logging. Gated by XRT_DEBUG_ANDROID_VERBOSE
+// which is passed via cppFlags from the Android Debug build variant
+// (src/xrt/targets/openxr_android/build.gradle::debug). Compiles to
+// nothing in release. Tag "HW_DBG_CNSDK:" is greppable in logcat.
+#ifdef XRT_DEBUG_ANDROID_VERBOSE
+#define DXR_HW_DBG(...)       U_LOG_I("HW_DBG_CNSDK: " __VA_ARGS__)
+#define DXR_HW_DBG_ONCE(...)  do {                                                                 \
+		static bool _logged = false;                                                                \
+		if (!_logged) { U_LOG_I("HW_DBG_CNSDK[once]: " __VA_ARGS__); _logged = true; }              \
+	} while (0)
+#else
+#define DXR_HW_DBG(...)       ((void)0)
+#define DXR_HW_DBG_ONCE(...)  ((void)0)
+#endif
+
+
 /*
  *
  * Internal struct.
@@ -95,17 +111,26 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 {
 	using namespace std::chrono_literals;
 
+	DXR_HW_DBG("worker: entered, waiting for leia_core_is_initialized");
+
 	// Phase 1: wait for the async core init to complete. Poll every 50 ms;
 	// honor shutdown promptly.
+	int poll_count = 0;
 	while (!cnsdk->shutting_down.load(std::memory_order_acquire)) {
 		if (cnsdk->core != nullptr && leia_core_is_initialized(cnsdk->core)) {
 			break;
 		}
+		if ((++poll_count % 20) == 0) {
+			DXR_HW_DBG("worker: still polling for core init (~%d s elapsed)",
+			           poll_count / 20);
+		}
 		std::this_thread::sleep_for(50ms);
 	}
 	if (cnsdk->shutting_down.load(std::memory_order_acquire)) {
+		DXR_HW_DBG("worker: shutdown requested before core ready, exiting");
 		return;
 	}
+	DXR_HW_DBG("worker: core initialized after %d polls", poll_count);
 
 	// Phase 2a: snapshot all device-config values we need on the render
 	// thread (camera center for face-position translation; display
@@ -125,6 +150,11 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 		cnsdk->display_pixel_h_cached = (uint32_t)cfg->panelResolution[1];
 		leia_core_release_device_config(cnsdk->core, cfg);
 		cnsdk->display_metrics_cached.store(true, std::memory_order_release);
+		DXR_HW_DBG("worker: cached metrics: %ux%u px, %.3fx%.3f m; cam=(%.3f, %.3f, %.3f) m",
+		           cnsdk->display_pixel_w_cached, cnsdk->display_pixel_h_cached,
+		           cnsdk->display_width_m_cached, cnsdk->display_height_m_cached,
+		           cnsdk->camera_center_x_m, cnsdk->camera_center_y_m,
+		           cnsdk->camera_center_z_m);
 	} else {
 		U_LOG_W("leia_core_get_device_config failed in worker; camera center + metrics stay default");
 	}
@@ -153,6 +183,7 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 extern "C" xrt_result_t
 leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 {
+	DXR_HW_DBG("leia_cnsdk_create: entering");
 	leia_platform_on_library_load();
 
 	struct leia_core_init_configuration *config = leia_core_init_configuration_alloc(CNSDK_VERSION);
@@ -181,6 +212,7 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 	cnsdk->core = core;
 	cnsdk->worker = std::thread(face_tracking_worker, cnsdk);
 
+	DXR_HW_DBG("leia_cnsdk_create: core=%p, worker thread spawned", (void *)core);
 	*out_cnsdk = cnsdk;
 	return XRT_SUCCESS;
 }
@@ -193,6 +225,7 @@ leia_cnsdk_destroy(struct leia_cnsdk **cnsdk_ptr)
 	}
 
 	struct leia_cnsdk *cnsdk = *cnsdk_ptr;
+	DXR_HW_DBG("leia_cnsdk_destroy: entering, core=%p", (void *)cnsdk->core);
 
 	// Signal the worker, then join with a watchdog: if it doesn't finish
 	// within kWorkerJoinTimeoutMs, detach instead so destroy can return.
@@ -336,6 +369,8 @@ leia_cnsdk_ensure_interlacer(struct leia_cnsdk *cnsdk,
 		cnsdk->interlacer_init_failed = true;
 		return false;
 	}
+	DXR_HW_DBG("ensure_interlacer: created interlacer=%p (per-view mode, targetFmt=%d)",
+	           (void *)cnsdk->interlacer, (int)targetFmt);
 	return true;
 }
 
@@ -362,6 +397,15 @@ leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
 	const float pos_x_m = position[0] / 1000.0f - cnsdk->camera_center_x_m;
 	const float pos_y_m = position[1] / 1000.0f - cnsdk->camera_center_y_m;
 	const float pos_z_m = position[2] / 1000.0f - cnsdk->camera_center_z_m;
+
+#ifdef XRT_DEBUG_ANDROID_VERBOSE
+	// Throttle to once per ~second at 60 Hz so logcat stays readable.
+	static int dbg_face_counter = 0;
+	if ((dbg_face_counter++ % 60) == 0) {
+		DXR_HW_DBG("face: raw_mm=(%.1f, %.1f, %.1f) → out_m=(%.4f, %.4f, %.4f)",
+		           position[0], position[1], position[2], pos_x_m, pos_y_m, pos_z_m);
+	}
+#endif
 
 	if (out_x != NULL) { *out_x = pos_x_m; }
 	if (out_y != NULL) { *out_y = pos_y_m; }
