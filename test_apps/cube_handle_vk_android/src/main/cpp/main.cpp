@@ -12,6 +12,11 @@
 #include <android_native_app_glue.h>
 
 #define XR_USE_PLATFORM_ANDROID
+#define XR_USE_GRAPHICS_API_VULKAN
+// openxr_platform.h references VkInstance / VkDevice / VkFormat under
+// XR_USE_GRAPHICS_API_VULKAN but does NOT include <vulkan/vulkan.h>
+// itself — the consumer must do that first.
+#include <vulkan/vulkan.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
@@ -57,6 +62,7 @@ log_xr_result(const char *what, XrResult r)
 }
 
 XrInstance g_instance = XR_NULL_HANDLE;
+XrSystemId g_system_id = XR_NULL_SYSTEM_ID;
 
 // Wire the Khronos OpenXR loader's Android-specific init. Required on
 // Android because the loader needs the JavaVM + Activity context to
@@ -88,6 +94,11 @@ create_instance(struct android_app *app)
 {
 	const char *extensions[] = {
 	    XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
+	    // _enable2 lets the runtime help create our VkInstance/VkDevice
+	    // (next step, B13c) and is the modern replacement for _enable.
+	    // The graphics-requirements query in this commit needs only this
+	    // extension to be enabled.
+	    XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
 	};
 
 	XrInstanceCreateInfoAndroidKHR android_info = {};
@@ -106,7 +117,8 @@ create_instance(struct android_app *app)
 	             XR_MAX_ENGINE_NAME_SIZE - 1);
 	create_info.applicationInfo.engineVersion = 1;
 	create_info.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
-	create_info.enabledExtensionCount = 1;
+	create_info.enabledExtensionCount =
+	    sizeof(extensions) / sizeof(extensions[0]);
 	create_info.enabledExtensionNames = extensions;
 
 	XrResult res = xrCreateInstance(&create_info, &g_instance);
@@ -130,6 +142,77 @@ create_instance(struct android_app *app)
 	return true;
 }
 
+// Query the runtime's XrSystemId for a Vulkan handheld/HMD form factor
+// and ask what Vulkan API version the runtime needs. Logs everything to
+// logcat — this is the last step we can do without actually creating a
+// VkInstance. B13c picks up here and uses these values to create one.
+bool
+query_system_and_graphics_reqs()
+{
+	if (g_instance == XR_NULL_HANDLE) {
+		return false;
+	}
+
+	// Try HMD first (runtime default — see u_system.c), then fall back
+	// to handheld for tablet-style displays.
+	XrSystemGetInfo sys_info = {};
+	sys_info.type = XR_TYPE_SYSTEM_GET_INFO;
+	sys_info.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+	XrResult res = xrGetSystem(g_instance, &sys_info, &g_system_id);
+	log_xr_result("xrGetSystem(HEAD_MOUNTED_DISPLAY)", res);
+	if (res != XR_SUCCESS) {
+		sys_info.formFactor = XR_FORM_FACTOR_HANDHELD_DISPLAY;
+		res = xrGetSystem(g_instance, &sys_info, &g_system_id);
+		log_xr_result("xrGetSystem(HANDHELD_DISPLAY)", res);
+		if (res != XR_SUCCESS) {
+			return false;
+		}
+	}
+
+	XrSystemProperties sys_props = {};
+	sys_props.type = XR_TYPE_SYSTEM_PROPERTIES;
+	res = xrGetSystemProperties(g_instance, g_system_id, &sys_props);
+	if (res == XR_SUCCESS) {
+		LOGI("System: \"%s\" vendor=0x%08x maxSwapchain=%ux%u maxLayers=%u",
+		     sys_props.systemName, sys_props.vendorId,
+		     sys_props.graphicsProperties.maxSwapchainImageWidth,
+		     sys_props.graphicsProperties.maxSwapchainImageHeight,
+		     sys_props.graphicsProperties.maxLayerCount);
+	} else {
+		LOGW("xrGetSystemProperties failed (%d)", (int)res);
+	}
+
+	// Resolve the extension entry point — it lives in libopenxr_loader.so
+	// but the loader exposes it only after the corresponding extension
+	// is enabled on the instance (which we did in create_instance).
+	PFN_xrGetVulkanGraphicsRequirements2KHR get_reqs = nullptr;
+	res = xrGetInstanceProcAddr(
+	    g_instance, "xrGetVulkanGraphicsRequirements2KHR",
+	    reinterpret_cast<PFN_xrVoidFunction *>(&get_reqs));
+	if (res != XR_SUCCESS || get_reqs == nullptr) {
+		LOGE("xrGetInstanceProcAddr(xrGetVulkanGraphicsRequirements2KHR) failed (%d)",
+		     (int)res);
+		return false;
+	}
+
+	XrGraphicsRequirementsVulkanKHR reqs = {};
+	reqs.type = XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR;
+	res = get_reqs(g_instance, g_system_id, &reqs);
+	log_xr_result("xrGetVulkanGraphicsRequirements2KHR", res);
+	if (res != XR_SUCCESS) {
+		return false;
+	}
+
+	LOGI("Vulkan API: min=%u.%u.%u max=%u.%u.%u",
+	     XR_VERSION_MAJOR(reqs.minApiVersionSupported),
+	     XR_VERSION_MINOR(reqs.minApiVersionSupported),
+	     XR_VERSION_PATCH(reqs.minApiVersionSupported),
+	     XR_VERSION_MAJOR(reqs.maxApiVersionSupported),
+	     XR_VERSION_MINOR(reqs.maxApiVersionSupported),
+	     XR_VERSION_PATCH(reqs.maxApiVersionSupported));
+	return true;
+}
+
 void
 destroy_instance()
 {
@@ -137,6 +220,7 @@ destroy_instance()
 		XrResult res = xrDestroyInstance(g_instance);
 		log_xr_result("xrDestroyInstance", res);
 		g_instance = XR_NULL_HANDLE;
+		g_system_id = XR_NULL_SYSTEM_ID;
 	}
 }
 
@@ -150,7 +234,9 @@ handle_cmd(struct android_app *app, int32_t cmd)
 		// some runtimes inspect the Activity surface state during create.
 		// Idempotent — guarded by g_instance.
 		if (g_instance == XR_NULL_HANDLE) {
-			create_instance(app);
+			if (create_instance(app)) {
+				query_system_and_graphics_reqs();
+			}
 		}
 		break;
 	case APP_CMD_TERM_WINDOW:
