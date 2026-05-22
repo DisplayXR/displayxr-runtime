@@ -29,6 +29,23 @@
 
 #include <stdlib.h>
 
+
+// Hardware-bring-up debug logging. Gated by XRT_DEBUG_ANDROID_VERBOSE
+// (cppFlag from the Android Debug variant). Compiles to nothing in
+// release. Tag "HW_DBG_DP:" greppable in logcat, separate from the
+// CNSDK wrapper's HW_DBG_CNSDK tag.
+#ifdef XRT_DEBUG_ANDROID_VERBOSE
+#define DXR_HW_DBG(...)       U_LOG_I("HW_DBG_DP: " __VA_ARGS__)
+#define DXR_HW_DBG_ONCE(...)  do {                                                                 \
+		static bool _logged = false;                                                                \
+		if (!_logged) { U_LOG_I("HW_DBG_DP[once]: " __VA_ARGS__); _logged = true; }                 \
+	} while (0)
+#else
+#define DXR_HW_DBG(...)       ((void)0)
+#define DXR_HW_DBG_ONCE(...)  ((void)0)
+#endif
+
+
 namespace {
 
 // Lume Pad 2-class defaults. Used until CNSDK reports the real device
@@ -108,9 +125,18 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	                                   (VkFormat)target_format)) {
 		return;
 	}
+	DXR_HW_DBG_ONCE("process_atlas_weave: first frame with ready interlacer");
 
 	const uint32_t atlas_w = view_width * tile_columns;
 	const uint32_t atlas_h = view_height * tile_rows;
+
+#ifdef XRT_DEBUG_ANDROID_VERBOSE
+	static int dp_dbg_frame = 0;
+	if ((dp_dbg_frame++ % 60) == 0) {
+		DXR_HW_DBG("process_atlas_weave[frame=%d]: atlas=%ux%u target=%ux%u fmt=%d",
+		           dp_dbg_frame, atlas_w, atlas_h, target_width, target_height, (int)target_format);
+	}
+#endif
 
 	leia_cnsdk_weave(impl->cnsdk,
 	                 impl->vk->device,
@@ -263,5 +289,6 @@ leia_dp_factory_cnsdk(void *vk_bundle,
 	*out_xdp = &impl->base;
 
 	U_LOG_W("Leia CNSDK DP created (atlas mode)");
+	DXR_HW_DBG("factory: impl=%p vk=%p cnsdk=%p", (void *)impl, (void *)impl->vk, (void *)impl->cnsdk);
 	return XRT_SUCCESS;
 }

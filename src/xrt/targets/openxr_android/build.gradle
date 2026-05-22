@@ -259,6 +259,17 @@ android {
             minifyEnabled false
             debuggable true
             jniDebuggable true
+
+            // Pass XRT_DEBUG_ANDROID_VERBOSE as a C/C++ preprocessor define
+            // for the Android Debug variant only. Macros like DXR_HW_DBG /
+            // DXR_HW_DBG_ONCE / DXR_HW_DBG_FRAME in the runtime sources are
+            // gated on this — release builds get them compiled to nothing.
+            externalNativeBuild {
+                cmake {
+                    cppFlags '-DXRT_DEBUG_ANDROID_VERBOSE'
+                    cFlags '-DXRT_DEBUG_ANDROID_VERBOSE'
+                }
+            }
         }
     }
 
