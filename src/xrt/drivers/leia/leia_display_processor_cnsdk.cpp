@@ -65,12 +65,124 @@ struct leia_dp_cnsdk
 	struct xrt_display_processor base;
 	struct leia_cnsdk *cnsdk;          //!< Owned.
 	struct vk_bundle *vk;              //!< Borrowed from compositor.
+	VkCommandPool cmd_pool;            //!< Borrowed from compositor; used by mono passthrough.
 };
 
 inline leia_dp_cnsdk *
 as_impl(struct xrt_display_processor *xdp)
 {
 	return reinterpret_cast<leia_dp_cnsdk *>(xdp);
+}
+
+// Mono / 2D-mode passthrough: blit the single-tile atlas directly to
+// the swapchain target. No CNSDK weave (would be wrong for 1x1). Same
+// barrier dance as the atlas-side host-stall path — drain via
+// vkQueueWaitIdle so xrEndFrame sees the target image ready.
+bool
+mono_passthrough_blit(leia_dp_cnsdk *impl,
+                      VkImage atlas_image,
+                      uint32_t atlas_width,
+                      uint32_t atlas_height,
+                      VkImage target_image,
+                      uint32_t target_width,
+                      uint32_t target_height)
+{
+	struct vk_bundle *vk = impl->vk;
+
+	VkCommandBufferAllocateInfo ai = {};
+	ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	ai.commandPool = impl->cmd_pool;
+	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	ai.commandBufferCount = 1;
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	if (vk->vkAllocateCommandBuffers(vk->device, &ai, &cmd) != VK_SUCCESS) {
+		return false;
+	}
+
+	VkCommandBufferBeginInfo bi = {};
+	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	vk->vkBeginCommandBuffer(cmd, &bi);
+
+	// Atlas: SHADER_READ_ONLY_OPTIMAL → TRANSFER_SRC_OPTIMAL.
+	VkImageMemoryBarrier atlas_to_src = {};
+	atlas_to_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	atlas_to_src.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	atlas_to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	atlas_to_src.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	atlas_to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	atlas_to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	atlas_to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	atlas_to_src.image = atlas_image;
+	atlas_to_src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+	// Target: assume COLOR_ATTACHMENT_OPTIMAL (the compositor's pre-DP
+	// barrier set this in the window-target path; for texture-mode the
+	// shared image's layout is caller-dependent — we use UNDEFINED→
+	// TRANSFER_DST which is always safe for clearing).
+	VkImageMemoryBarrier target_to_dst = {};
+	target_to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	target_to_dst.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	target_to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	target_to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	target_to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	target_to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	target_to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	target_to_dst.image = target_image;
+	target_to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+	VkImageMemoryBarrier pre[2] = {atlas_to_src, target_to_dst};
+	vk->vkCmdPipelineBarrier(cmd,
+	    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	    VK_PIPELINE_STAGE_TRANSFER_BIT,
+	    0, 0, nullptr, 0, nullptr, 2, pre);
+
+	// Stretch-blit the atlas to fill the target. Linear filter so a
+	// resolution mismatch doesn't go blocky.
+	VkImageBlit blit = {};
+	blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+	blit.srcOffsets[0] = {0, 0, 0};
+	blit.srcOffsets[1] = {(int32_t)atlas_width, (int32_t)atlas_height, 1};
+	blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+	blit.dstOffsets[0] = {0, 0, 0};
+	blit.dstOffsets[1] = {(int32_t)target_width, (int32_t)target_height, 1};
+	vk->vkCmdBlitImage(cmd,
+	    atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    target_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    1, &blit, VK_FILTER_LINEAR);
+
+	// Restore atlas to SHADER_READ for the compositor's invariant;
+	// leave target in COLOR_ATTACHMENT_OPTIMAL (xrEndFrame's contract).
+	VkImageMemoryBarrier atlas_back = atlas_to_src;
+	atlas_back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	atlas_back.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	atlas_back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	atlas_back.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	VkImageMemoryBarrier target_back = target_to_dst;
+	target_back.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	target_back.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	target_back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	target_back.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	VkImageMemoryBarrier post[2] = {atlas_back, target_back};
+	vk->vkCmdPipelineBarrier(cmd,
+	    VK_PIPELINE_STAGE_TRANSFER_BIT,
+	    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	    0, 0, nullptr, 0, nullptr, 2, post);
+
+	vk->vkEndCommandBuffer(cmd);
+
+	VkSubmitInfo si = {};
+	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	si.commandBufferCount = 1;
+	si.pCommandBuffers = &cmd;
+	VkResult res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, VK_NULL_HANDLE);
+	if (res == VK_SUCCESS) {
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+	}
+	vk->vkFreeCommandBuffers(vk->device, impl->cmd_pool, 1, &cmd);
+	DXR_HW_DBG_ONCE("mono_passthrough_blit: first frame (atlas %ux%u → target %ux%u)",
+	                atlas_width, atlas_height, target_width, target_height);
+	return res == VK_SUCCESS;
 }
 
 void
@@ -100,10 +212,28 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 
 	leia_dp_cnsdk *impl = as_impl(xdp);
 
+	if (tile_columns == 1 && tile_rows == 1) {
+		// Mono / 2D mode: no interlacing needed. Atlas IS the final
+		// image; blit it directly to the target so we still produce
+		// something visible. CNSDK doesn't weave here (would be wrong
+		// for 1x1) — only used in the runtime's 2D fallback or for
+		// non-3D-display vendors. Implementation moved below for
+		// readability.
+		if (impl->vk == nullptr || impl->cmd_pool == VK_NULL_HANDLE) {
+			return;
+		}
+		const uint32_t atlas_w_mono = view_width;
+		const uint32_t atlas_h_mono = view_height;
+		mono_passthrough_blit(impl, (VkImage)(uintptr_t)atlas_image,
+		                      atlas_w_mono, atlas_h_mono,
+		                      (VkImage)(uintptr_t)target_image,
+		                      target_width, target_height);
+		return;
+	}
 	if (tile_columns != 2 || tile_rows != 1) {
 		static bool warned = false;
 		if (!warned) {
-			U_LOG_W("CNSDK DP expects 2x1 SBS atlas, got %ux%u; skipping weave",
+			U_LOG_W("CNSDK DP expects 2x1 SBS atlas or 1x1 mono, got %ux%u; skipping",
 			        tile_columns, tile_rows);
 			warned = true;
 		}
@@ -278,7 +408,6 @@ leia_dp_factory_cnsdk(void *vk_bundle,
                       int32_t target_format,
                       struct xrt_display_processor **out_xdp)
 {
-	(void)vk_cmd_pool;     // atlas mode owns no cmd buffer — CNSDK records its own
 	(void)window_handle; (void)target_format;
 
 	struct leia_cnsdk *cnsdk = nullptr;
@@ -296,6 +425,7 @@ leia_dp_factory_cnsdk(void *vk_bundle,
 
 	impl->cnsdk = cnsdk;
 	impl->vk = static_cast<struct vk_bundle *>(vk_bundle);
+	impl->cmd_pool = (VkCommandPool)(uintptr_t)vk_cmd_pool;
 
 	impl->base.process_atlas = process_atlas_weave;
 	impl->base.on_pause = on_pause_cnsdk;
