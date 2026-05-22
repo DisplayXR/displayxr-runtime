@@ -20,6 +20,7 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstring>
 
@@ -121,18 +122,36 @@ struct PerView
 	VkImageView image_views[8]{};
 	VkFramebuffer framebuffers[8]{};
 	uint32_t image_count{0};
+
+	// Depth attachment for the cube renderer. One shared depth VkImage
+	// per view, re-used across all swapchain images (safe because we
+	// host-wait between frames via vkQueueWaitIdle in record_draw —
+	// nothing else races with us on this image).
+	VkImage depth_image{VK_NULL_HANDLE};
+	VkDeviceMemory depth_memory{VK_NULL_HANDLE};
+	VkImageView depth_view{VK_NULL_HANDLE};
 };
 PerView g_views[kViewCount];
 
 VkFormat g_swapchain_format = VK_FORMAT_UNDEFINED;
 VkCommandPool g_app_cmd_pool = VK_NULL_HANDLE;
 
-// Graphics pipeline state for the triangle renderer.
+// Graphics pipeline state for the cube renderer.
 VkRenderPass g_render_pass = VK_NULL_HANDLE;
 VkPipelineLayout g_pipeline_layout = VK_NULL_HANDLE;
 VkPipeline g_pipeline = VK_NULL_HANDLE;
 VkShaderModule g_vs_module = VK_NULL_HANDLE;
 VkShaderModule g_fs_module = VK_NULL_HANDLE;
+
+// Depth attachment format. D32_SFLOAT is widely supported on Android
+// (Adreno + Mali both list it). Could probe with
+// vkGetPhysicalDeviceFormatProperties for robustness; hardcoded for POC.
+constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
+
+// Animation time origin. Set on first record_draw so the cube starts
+// with rotation=0 instead of mid-spin.
+std::chrono::steady_clock::time_point g_anim_start{};
+bool g_anim_started = false;
 
 // Frame counter for throttled logging — log heartbeat every 60 frames.
 uint64_t g_frame_count = 0;
@@ -750,36 +769,72 @@ projection_matrix_from_fov(const XrFovf &fov, float near_z, float far_z)
 	return p;
 }
 
+// Build the cube's model matrix: T(0, 0, z) * R_y(angle) * S(scale).
+// Cube sits 1 m in front of the viewer along -Z, scaled to a 0.2 m
+// edge, rotating slowly around the Y axis.
+Mat4
+cube_model_matrix(float angle_rad, float scale, float z_meters)
+{
+	const float c = std::cos(angle_rad);
+	const float s = std::sin(angle_rad);
+
+	// Column-major: T * R * S. Compute fields directly.
+	Mat4 m{};
+	m.m[0]  = c * scale;    m.m[1]  = 0.0f;    m.m[2]  = -s * scale;  m.m[3]  = 0.0f;
+	m.m[4]  = 0.0f;         m.m[5]  = scale;   m.m[6]  = 0.0f;        m.m[7]  = 0.0f;
+	m.m[8]  = s * scale;    m.m[9]  = 0.0f;    m.m[10] = c * scale;   m.m[11] = 0.0f;
+	m.m[12] = 0.0f;         m.m[13] = 0.0f;    m.m[14] = z_meters;    m.m[15] = 1.0f;
+	return m;
+}
+
 // ─── render pass + pipeline ───────────────────────────────────────────
 
 bool
 create_render_pass()
 {
-	VkAttachmentDescription color = {};
-	color.format = g_swapchain_format;
-	color.samples = VK_SAMPLE_COUNT_1_BIT;
-	color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-	color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-	color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-	color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	VkAttachmentDescription attachments[2] = {};
+
+	// Attachment 0: color (swapchain image).
+	attachments[0].format = g_swapchain_format;
+	attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+	attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+	attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
 	// xrAcquireSwapchainImage delivers in COLOR_ATTACHMENT_OPTIMAL per
 	// OpenXR spec; xrReleaseSwapchainImage expects it to stay there.
-	color.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-	color.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	attachments[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	attachments[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+	// Attachment 1: depth (one shared image per view, layout-managed
+	// implicitly by the render pass). Clear on load, don't store after.
+	attachments[1].format = kDepthFormat;
+	attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
+	attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+	attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	attachments[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
 	VkAttachmentReference color_ref = {};
 	color_ref.attachment = 0;
 	color_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
+	VkAttachmentReference depth_ref = {};
+	depth_ref.attachment = 1;
+	depth_ref.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
 	VkSubpassDescription subpass = {};
 	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
 	subpass.colorAttachmentCount = 1;
 	subpass.pColorAttachments = &color_ref;
+	subpass.pDepthStencilAttachment = &depth_ref;
 
 	VkRenderPassCreateInfo rpci = {};
 	rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-	rpci.attachmentCount = 1;
-	rpci.pAttachments = &color;
+	rpci.attachmentCount = 2;
+	rpci.pAttachments = attachments;
 	rpci.subpassCount = 1;
 	rpci.pSubpasses = &subpass;
 
@@ -866,6 +921,17 @@ create_pipeline()
 	ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
 	ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
+	// Depth test on for the cube — without it the rotating faces draw
+	// in render-order instead of nearest-wins. Vulkan default depth
+	// range is [0, 1] (clear value below uses 1.0 = far plane).
+	VkPipelineDepthStencilStateCreateInfo ds = {};
+	ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+	ds.depthTestEnable = VK_TRUE;
+	ds.depthWriteEnable = VK_TRUE;
+	ds.depthCompareOp = VK_COMPARE_OP_LESS;
+	ds.depthBoundsTestEnable = VK_FALSE;
+	ds.stencilTestEnable = VK_FALSE;
+
 	VkPipelineColorBlendAttachmentState cba = {};
 	cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
 	                     VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
@@ -889,6 +955,7 @@ create_pipeline()
 	gpi.pViewportState = &vp;
 	gpi.pRasterizationState = &rs;
 	gpi.pMultisampleState = &ms;
+	gpi.pDepthStencilState = &ds;
 	gpi.pColorBlendState = &cb;
 	gpi.pDynamicState = &dyn;
 	gpi.layout = g_pipeline_layout;
@@ -904,9 +971,79 @@ create_pipeline()
 	return true;
 }
 
+// Find a memory type with the requested property flags. Linear scan
+// over the physical device's memory types — there are usually only a
+// handful, no need for fancier indexing.
+uint32_t
+find_memory_type(uint32_t type_filter, VkMemoryPropertyFlags want)
+{
+	VkPhysicalDeviceMemoryProperties props;
+	vkGetPhysicalDeviceMemoryProperties(g_vk_phys_device, &props);
+	for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
+		if ((type_filter & (1u << i)) &&
+		    (props.memoryTypes[i].propertyFlags & want) == want) {
+			return i;
+		}
+	}
+	return UINT32_MAX;
+}
+
 bool
 create_view_framebuffers(uint32_t view_idx)
 {
+	// One depth VkImage per view, shared across all swapchain images
+	// (safe because record_draw host-waits between frames via
+	// vkQueueWaitIdle — nothing else races on this image).
+	VkImageCreateInfo dici = {};
+	dici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	dici.imageType = VK_IMAGE_TYPE_2D;
+	dici.format = kDepthFormat;
+	dici.extent = {g_views[view_idx].width, g_views[view_idx].height, 1};
+	dici.mipLevels = 1;
+	dici.arrayLayers = 1;
+	dici.samples = VK_SAMPLE_COUNT_1_BIT;
+	dici.tiling = VK_IMAGE_TILING_OPTIMAL;
+	dici.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+	dici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	dici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	if (vkCreateImage(g_vk_device, &dici, nullptr,
+	                  &g_views[view_idx].depth_image) != VK_SUCCESS) {
+		LOGE("vkCreateImage(depth) view=%u failed", view_idx);
+		return false;
+	}
+
+	VkMemoryRequirements mreq;
+	vkGetImageMemoryRequirements(g_vk_device, g_views[view_idx].depth_image, &mreq);
+	const uint32_t mem_type = find_memory_type(mreq.memoryTypeBits,
+	                                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+	if (mem_type == UINT32_MAX) {
+		LOGE("find_memory_type(DEVICE_LOCAL) for depth view=%u failed", view_idx);
+		return false;
+	}
+	VkMemoryAllocateInfo mai = {};
+	mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	mai.allocationSize = mreq.size;
+	mai.memoryTypeIndex = mem_type;
+	if (vkAllocateMemory(g_vk_device, &mai, nullptr,
+	                     &g_views[view_idx].depth_memory) != VK_SUCCESS) {
+		LOGE("vkAllocateMemory(depth) view=%u failed", view_idx);
+		return false;
+	}
+	vkBindImageMemory(g_vk_device, g_views[view_idx].depth_image,
+	                  g_views[view_idx].depth_memory, 0);
+
+	VkImageViewCreateInfo dvci = {};
+	dvci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	dvci.image = g_views[view_idx].depth_image;
+	dvci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	dvci.format = kDepthFormat;
+	dvci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+	if (vkCreateImageView(g_vk_device, &dvci, nullptr,
+	                      &g_views[view_idx].depth_view) != VK_SUCCESS) {
+		LOGE("vkCreateImageView(depth) view=%u failed", view_idx);
+		return false;
+	}
+
 	for (uint32_t i = 0; i < g_views[view_idx].image_count; ++i) {
 		VkImageViewCreateInfo ivci = {};
 		ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -920,11 +1057,16 @@ create_view_framebuffers(uint32_t view_idx)
 			return false;
 		}
 
+		// Framebuffer = swapchain color view + shared depth view.
+		const VkImageView fb_attachments[2] = {
+		    g_views[view_idx].image_views[i],
+		    g_views[view_idx].depth_view,
+		};
 		VkFramebufferCreateInfo fbi = {};
 		fbi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
 		fbi.renderPass = g_render_pass;
-		fbi.attachmentCount = 1;
-		fbi.pAttachments = &g_views[view_idx].image_views[i];
+		fbi.attachmentCount = 2;
+		fbi.pAttachments = fb_attachments;
 		fbi.width = g_views[view_idx].width;
 		fbi.height = g_views[view_idx].height;
 		fbi.layers = 1;
@@ -949,6 +1091,19 @@ destroy_view_framebuffers(uint32_t view_idx)
 			vkDestroyImageView(g_vk_device, g_views[view_idx].image_views[i], nullptr);
 			g_views[view_idx].image_views[i] = VK_NULL_HANDLE;
 		}
+	}
+
+	if (g_views[view_idx].depth_view != VK_NULL_HANDLE) {
+		vkDestroyImageView(g_vk_device, g_views[view_idx].depth_view, nullptr);
+		g_views[view_idx].depth_view = VK_NULL_HANDLE;
+	}
+	if (g_views[view_idx].depth_image != VK_NULL_HANDLE) {
+		vkDestroyImage(g_vk_device, g_views[view_idx].depth_image, nullptr);
+		g_views[view_idx].depth_image = VK_NULL_HANDLE;
+	}
+	if (g_views[view_idx].depth_memory != VK_NULL_HANDLE) {
+		vkFreeMemory(g_vk_device, g_views[view_idx].depth_memory, nullptr);
+		g_views[view_idx].depth_memory = VK_NULL_HANDLE;
 	}
 }
 
@@ -1087,14 +1242,15 @@ record_draw(uint32_t view_idx, uint32_t image_idx, const XrView &view)
 	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	vkBeginCommandBuffer(cmd, &bi);
 
-	// LOAD_OP_CLEAR — per-eye background red/blue so calibration test 2
-	// (one-eye-covered tile mapping check) still works behind the
-	// triangle.
-	VkClearValue clear = {};
-	clear.color.float32[0] = (view_idx == 0) ? 0.6f : 0.1f;
-	clear.color.float32[1] = 0.1f;
-	clear.color.float32[2] = (view_idx == 0) ? 0.1f : 0.6f;
-	clear.color.float32[3] = 1.0f;
+	// Two clear values: per-eye background color (red/blue for the
+	// calibration tile-mapping check) + depth=1.0 (far plane).
+	VkClearValue clears[2] = {};
+	clears[0].color.float32[0] = (view_idx == 0) ? 0.6f : 0.1f;
+	clears[0].color.float32[1] = 0.1f;
+	clears[0].color.float32[2] = (view_idx == 0) ? 0.1f : 0.6f;
+	clears[0].color.float32[3] = 1.0f;
+	clears[1].depthStencil.depth = 1.0f;
+	clears[1].depthStencil.stencil = 0;
 
 	VkRenderPassBeginInfo rpbi = {};
 	rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -1102,8 +1258,8 @@ record_draw(uint32_t view_idx, uint32_t image_idx, const XrView &view)
 	rpbi.framebuffer = g_views[view_idx].framebuffers[image_idx];
 	rpbi.renderArea.offset = {0, 0};
 	rpbi.renderArea.extent = {g_views[view_idx].width, g_views[view_idx].height};
-	rpbi.clearValueCount = 1;
-	rpbi.pClearValues = &clear;
+	rpbi.clearValueCount = 2;
+	rpbi.pClearValues = clears;
 	vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
 	VkViewport vp = {};
@@ -1122,14 +1278,28 @@ record_draw(uint32_t view_idx, uint32_t image_idx, const XrView &view)
 
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline);
 
-	// proj * view for this eye.
+	// Compute model_view_proj = proj * view * model. View + proj come
+	// from xrLocateViews (per-eye, drives stereo parallax). Model is a
+	// world-space transform that places the cube 1 m in front of the
+	// viewer, scaled to 0.2 m, rotated around Y over time.
+	if (!g_anim_started) {
+		g_anim_start = std::chrono::steady_clock::now();
+		g_anim_started = true;
+	}
+	const auto elapsed = std::chrono::steady_clock::now() - g_anim_start;
+	const float t = std::chrono::duration<float>(elapsed).count();
+	const float angle = t * 0.6f; // ~6 sec per full revolution
+
+	const Mat4 model = cube_model_matrix(angle, /*scale=*/0.2f, /*z_meters=*/-1.0f);
 	const Mat4 view_mat = view_matrix_from_pose(view.pose);
 	const Mat4 proj_mat = projection_matrix_from_fov(view.fov, 0.05f, 100.0f);
-	const Mat4 view_proj = mat4_mul(proj_mat, view_mat);
+	const Mat4 mv = mat4_mul(view_mat, model);
+	const Mat4 mvp = mat4_mul(proj_mat, mv);
 	vkCmdPushConstants(cmd, g_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
-	                   0, sizeof(view_proj), &view_proj);
+	                   0, sizeof(mvp), &mvp);
 
-	vkCmdDraw(cmd, 3, 1, 0, 0);
+	// 36 vertices: 12 triangles, 2 per face, 6 faces.
+	vkCmdDraw(cmd, 36, 1, 0, 0);
 
 	vkCmdEndRenderPass(cmd);
 	vkEndCommandBuffer(cmd);
