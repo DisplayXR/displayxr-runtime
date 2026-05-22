@@ -27,6 +27,24 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+// Hardware-bring-up verbose debug. Gated on XRT_DEBUG_ANDROID_VERBOSE
+// passed from build.gradle's debug variant. Compiled out in release.
+// Tag "HW_DBG_APP:" greppable separation from runtime-side HW_DBG_CNSDK
+// / HW_DBG_DP logs.
+#ifdef XRT_DEBUG_ANDROID_VERBOSE
+#define DXR_HW_DBG(...)       __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "HW_DBG_APP: " __VA_ARGS__)
+#define DXR_HW_DBG_ONCE(...)  do {                                                                 \
+		static bool _logged = false;                                                                \
+		if (!_logged) {                                                                             \
+			__android_log_print(ANDROID_LOG_INFO, LOG_TAG, "HW_DBG_APP[once]: " __VA_ARGS__);       \
+			_logged = true;                                                                         \
+		}                                                                                           \
+	} while (0)
+#else
+#define DXR_HW_DBG(...)       ((void)0)
+#define DXR_HW_DBG_ONCE(...)  ((void)0)
+#endif
+
 namespace {
 
 const char *
@@ -790,6 +808,25 @@ render_frame()
 		res = xrLocateViews(g_session, &locate_info, &view_state,
 		                    kViewCount, &located_view_count, views);
 		if (res == XR_SUCCESS && located_view_count == kViewCount) {
+#ifdef XRT_DEBUG_ANDROID_VERBOSE
+			// Throttle ~1Hz: dump per-view pose + FOV so calibration tests
+			// (see android-bringup-checklist.md § B) can read them off
+			// directly without instrumenting further.
+			if ((g_frame_count % 60) == 0) {
+				DXR_HW_DBG("views[L]: pos=(%.3f, %.3f, %.3f) quat=(%.3f, %.3f, %.3f, %.3f) "
+				           "fov=(L=%.3f R=%.3f U=%.3f D=%.3f) rad",
+				           views[0].pose.position.x, views[0].pose.position.y, views[0].pose.position.z,
+				           views[0].pose.orientation.x, views[0].pose.orientation.y,
+				           views[0].pose.orientation.z, views[0].pose.orientation.w,
+				           views[0].fov.angleLeft, views[0].fov.angleRight,
+				           views[0].fov.angleUp, views[0].fov.angleDown);
+				DXR_HW_DBG("views[R]: pos=(%.3f, %.3f, %.3f) quat=(%.3f, %.3f, %.3f, %.3f)",
+				           views[1].pose.position.x, views[1].pose.position.y, views[1].pose.position.z,
+				           views[1].pose.orientation.x, views[1].pose.orientation.y,
+				           views[1].pose.orientation.z, views[1].pose.orientation.w);
+			}
+#endif
+			DXR_HW_DBG_ONCE("first xrLocateViews success");
 			for (uint32_t i = 0; i < kViewCount; ++i) {
 				XrSwapchainImageAcquireInfo acq = {};
 				acq.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
@@ -967,6 +1004,8 @@ extern "C" void
 android_main(struct android_app *app)
 {
 	LOGI("cube_handle_vk_android: android_main entered");
+	DXR_HW_DBG("android_main: activity=%p vm=%p", (void *)app->activity->clazz,
+	           (void *)app->activity->vm);
 	app->onAppCmd = handle_cmd;
 
 	if (!initialize_loader(app)) {
