@@ -368,20 +368,20 @@ Copy binaries to `_package/DisplayXR-macOS/bin/`. Run scripts exec from `$DIR/bi
 
 **Shell mode — single command (recommended):**
 
-`displayxr-shell.exe` auto-starts the service, activates shell mode via IPC, launches apps with correct env vars, and monitors clients.
+`displayxr-shell.exe` auto-starts the service, activates shell mode via IPC, launches apps with correct env vars, and monitors clients. The shell ships from [`displayxr-shell-pvt`](https://github.com/DisplayXR/displayxr-shell-pvt) via its own installer (`DisplayXRShellSetup-*.exe` from [`displayxr-shell-releases`](https://github.com/DisplayXR/displayxr-shell-releases)) — install it once and it lands at `C:\Program Files\DisplayXR\Runtime\displayxr-shell.exe`. **This repo does NOT build a shell binary anymore** (the `_package\bin\displayxr-shell.exe` from old builds is stale; ignore / delete).
 
 ```
-_package\bin\displayxr-shell.exe app1.exe app2.exe
+"C:\Program Files\DisplayXR\Runtime\displayxr-shell.exe" app1.exe app2.exe
 ```
 
 Example with two cube apps:
 ```
-_package\bin\displayxr-shell.exe test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe
+"C:\Program Files\DisplayXR\Runtime\displayxr-shell.exe" test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe
 ```
 
 Optional per-app window pose (`--pose x,y,z,width_m,height_m` before each app path):
 ```
-_package\bin\displayxr-shell.exe --pose -0.1,0.05,0,0.14,0.08 app1.exe --pose 0.1,0.05,0,0.14,0.08 app2.exe
+"C:\Program Files\DisplayXR\Runtime\displayxr-shell.exe" --pose -0.1,0.05,0,0.14,0.08 app1.exe --pose 0.1,0.05,0,0.14,0.08 app2.exe
 ```
 
 **Shell mode — legacy multi-terminal (still works):**

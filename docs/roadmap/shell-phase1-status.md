@@ -131,17 +131,17 @@ scripts\build_windows.bat test-apps   # Test apps + generates run scripts in _pa
 
 **Two apps (one command):**
 ```
-_package\bin\displayxr-shell.exe test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe
+"C:\Program Files\DisplayXR\Runtime\displayxr-shell.exe" test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe
 ```
 
 **Two apps with custom poses:**
 ```
-_package\bin\displayxr-shell.exe --pose -0.1,0.05,0,0.14,0.08 app1.exe --pose 0.1,0.05,0,0.14,0.08 app2.exe
+"C:\Program Files\DisplayXR\Runtime\displayxr-shell.exe" --pose -0.1,0.05,0,0.14,0.08 app1.exe --pose 0.1,0.05,0,0.14,0.08 app2.exe
 ```
 
 **Monitor only (no apps — connect to existing or auto-start service):**
 ```
-_package\bin\displayxr-shell.exe
+"C:\Program Files\DisplayXR\Runtime\displayxr-shell.exe"
 ```
 
 ### Run from generated scripts (legacy — multiple terminals)
@@ -170,7 +170,7 @@ taskkill //F //IM displayxr-shell.exe 2>&1 || true
 taskkill //F //IM cube_handle_d3d11_win.exe 2>&1 || true
 
 # Step 2: Launch shell + apps (run_in_background: true, timeout: 600000)
-cd "/c/Users/Sparks i7 3080/Documents/GitHub/openxr-3d-display" && _package/bin/displayxr-shell.exe test_apps/cube_handle_d3d11_win/build/cube_handle_d3d11_win.exe test_apps/cube_handle_d3d11_win/build/cube_handle_d3d11_win.exe 2>&1
+cd "/c/Users/Sparks i7 3080/Documents/GitHub/openxr-3d-display" && "/c/Program Files/DisplayXR/Runtime/displayxr-shell.exe" test_apps/cube_handle_d3d11_win/build/cube_handle_d3d11_win.exe test_apps/cube_handle_d3d11_win/build/cube_handle_d3d11_win.exe 2>&1
 ```
 
 **Notes:**

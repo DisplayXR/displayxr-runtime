@@ -119,10 +119,10 @@ scripts\build_windows.bat build
 scripts\build_windows.bat test-apps
 
 # Run (single command)
-_package\bin\displayxr-shell.exe test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe
+"C:\Program Files\DisplayXR\Runtime\displayxr-shell.exe" test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe
 
 # Or with custom poses
-_package\bin\displayxr-shell.exe --pose -0.1,0.05,0,0.14,0.08 app1.exe --pose 0.1,0.05,0,0.14,0.08 app2.exe
+"C:\Program Files\DisplayXR\Runtime\displayxr-shell.exe" --pose -0.1,0.05,0,0.14,0.08 app1.exe --pose 0.1,0.05,0,0.14,0.08 app2.exe
 ```
 
 **Shell controls (Phase 1, carried forward):**

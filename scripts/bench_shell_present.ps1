@@ -34,8 +34,10 @@
                                  timeout / acquire totals from [MUTEX].
       5. Prints a one-line summary.
 
-    The shell binary is expected at _package\bin\displayxr-shell.exe by
-    default (matches scripts\build_windows.bat output).
+    The shell binary is expected at the installed location under
+    C:\Program Files\DisplayXR\Runtime\displayxr-shell.exe by default
+    (the shell ships from DisplayXR/displayxr-shell-releases via
+    DisplayXRShellSetup-*.exe — it's NOT built by this repo anymore).
 
 .PARAMETER Seconds
     Run duration in seconds. Default: 60.
@@ -47,8 +49,10 @@
     Filename tag (e.g. "before", "after"). Default: timestamp.
 
 .PARAMETER Shell
-    Path to displayxr-shell.exe. Default: _package\bin\displayxr-shell.exe
-    relative to the repo root.
+    Path to displayxr-shell.exe. Default:
+    C:\Program Files\DisplayXR\Runtime\displayxr-shell.exe (the installed
+    location; install DisplayXRShellSetup-*.exe from
+    DisplayXR/displayxr-shell-releases first).
 
 .PARAMETER App
     One or more app paths to pass to displayxr-shell. Default: two
@@ -71,7 +75,7 @@ param(
     [int]    $Seconds = 60,
     [string] $OutDir  = "docs\roadmap\bench",
     [string] $Tag     = (Get-Date -Format "yyyyMMdd-HHmmss"),
-    [string] $Shell   = "_package\bin\displayxr-shell.exe",
+    [string] $Shell   = "C:\Program Files\DisplayXR\Runtime\displayxr-shell.exe",
     [string[]] $App = @(
         "test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe",
         "test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe"
@@ -85,7 +89,7 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
 
 if (-not (Test-Path $Shell)) {
-    throw "displayxr-shell not found at '$Shell'. Build via 'scripts\build_windows.bat build' first."
+    throw "displayxr-shell not found at '$Shell'. Install DisplayXRShellSetup-*.exe from DisplayXR/displayxr-shell-releases (gh release download), or pass -Shell <path> explicitly."
 }
 foreach ($a in $App) {
     if (-not (Test-Path $a)) {

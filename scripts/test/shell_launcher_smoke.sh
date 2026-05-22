@@ -17,7 +17,11 @@
 # Usage:
 #   bash scripts/test/shell_launcher_smoke.sh
 #
-# Requires a successful `scripts\build_windows.bat build` first.
+# Requires:
+#   - `scripts\build_windows.bat build` for the runtime + cube test app.
+#   - DisplayXRShellSetup-*.exe (from DisplayXR/displayxr-shell-releases)
+#     installed — the shell is NOT built by this repo, it ships from
+#     displayxr-shell-pvt via its own installer.
 
 set -u
 
@@ -27,7 +31,7 @@ cd "$REPO_ROOT"
 OUT_DIR="scripts/test/out"
 mkdir -p "$OUT_DIR"
 
-SHELL_EXE="_package\\bin\\displayxr-shell.exe"
+SHELL_EXE="C:\\Program Files\\DisplayXR\\Runtime\\displayxr-shell.exe"
 CUBE_EXE="test_apps\\cube_handle_d3d11_win\\build\\cube_handle_d3d11_win.exe"
 LOG="$OUT_DIR/shell_test.log"
 
