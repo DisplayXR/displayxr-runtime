@@ -31,3 +31,6 @@ project(':src:xrt:ipc').projectDir = new File(rootDir, 'src/xrt/ipc/android')
 
 include ':src:xrt:targets:android_common'
 include ':src:xrt:targets:openxr_android'
+
+include ':test_apps:cube_handle_vk_android'
+project(':test_apps:cube_handle_vk_android').projectDir = new File(rootDir, 'test_apps/cube_handle_vk_android')
