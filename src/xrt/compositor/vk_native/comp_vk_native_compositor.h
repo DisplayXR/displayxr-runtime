@@ -62,6 +62,8 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
                                  void *shared_texture_handle,
                                  bool transparent_background,
                                  uint32_t chroma_key_color,
+                                 int32_t display_screen_left,
+                                 int32_t display_screen_top,
                                  struct xrt_compositor_native **out_xc);
 
 /*!

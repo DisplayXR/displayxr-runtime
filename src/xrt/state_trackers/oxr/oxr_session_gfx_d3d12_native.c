@@ -99,17 +99,22 @@ oxr_session_populate_d3d12_native(struct oxr_logger *log,
 	struct xrt_device *xdev = get_role_head(sess->sys);
 	struct xrt_compositor_native *xcn = NULL;
 
-	// Get D3D12 display processor factory from system compositor info
+	// Get D3D12 display processor factory and display top-left from system compositor info
 	void *dp_factory_d3d12 = NULL;
+	int32_t display_screen_left = 0;
+	int32_t display_screen_top = 0;
 	if (sys->xsysc != NULL) {
 		dp_factory_d3d12 = sys->xsysc->info.dp_factory_d3d12;
+		display_screen_left = sys->xsysc->info.display_screen_left;
+		display_screen_top = sys->xsysc->info.display_screen_top;
 	}
 
 	// Create the D3D12 native compositor
 	xrt_result_t xret = comp_d3d12_compositor_create(
 	    xdev, window_handle, shared_texture_handle,
 	    (void *)next->device, (void *)next->queue,
-	    dp_factory_d3d12, transparent_background, chroma_key_color, &xcn);
+	    dp_factory_d3d12, transparent_background, chroma_key_color,
+	    display_screen_left, display_screen_top, &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
 		                 "Failed to create D3D12 native compositor: %d", xret);

@@ -35,11 +35,6 @@
 
 #include "xrt/xrt_device.h"
 
-// EDID-based display identification for window positioning
-#ifdef XRT_HAVE_LEIA_SR
-#include "leia/leia_interface.h"
-#endif
-
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <windowsx.h> // GET_X_LPARAM, GET_Y_LPARAM
@@ -105,6 +100,11 @@ struct comp_d3d11_window
 
 	//! Requested height (set before thread start, read by window thread)
 	uint32_t requested_height;
+
+	//! Display top-left in OS screen coords (from xsysc->info, plug-in iface).
+	//! (0, 0) = primary monitor (sim_display default or unknown panel).
+	int32_t display_screen_left;
+	int32_t display_screen_top;
 
 	//! Current width (window thread writes, compositor thread reads)
 	volatile LONG current_width;
@@ -337,35 +337,6 @@ is_workspace_reserved_key(WPARAM vk, bool shift)
 	case VK_DELETE: return true;    // Close focused app
 	default:        return false;
 	}
-}
-
-/*!
- * Resolve the top-left pixel coordinate of the 3D display on this machine.
- *
- * Does a fresh EDID probe every call (no stale cache) so monitor rearrangements
- * take effect without restarting the service. Falls back to primary (0, 0) when
- * no 3D display is identified — we do NOT guess "first non-primary monitor",
- * because on a setup where the 3D display IS primary, that guess would land
- * the compositor on a 2D monitor.
- */
-static bool
-get_3d_display_top_left(int *x, int *y)
-{
-#ifdef XRT_HAVE_LEIA_SR
-	int32_t left = 0;
-	int32_t top = 0;
-	if (leia_edid_find_3d_display_rect(&left, &top, NULL, NULL)) {
-		*x = (int)left;
-		*y = (int)top;
-		U_LOG_W("3D display resolved via EDID to (%d, %d)", *x, *y);
-		return true;
-	}
-	U_LOG_W("3D display EDID probe found no known panel — defaulting to primary monitor");
-#endif
-
-	*x = 0;
-	*y = 0;
-	return false;
 }
 
 /*!
@@ -1090,16 +1061,16 @@ window_thread_func(LPVOID param)
 		}
 	}
 
-	// Position on Leia/secondary monitor if available
-	RECT rc = {0, 0, (LONG)w->requested_width, (LONG)w->requested_height};
-	int monitor_x = 0;
-	int monitor_y = 0;
-	if (get_3d_display_top_left(&monitor_x, &monitor_y)) {
-		rc.left = monitor_x;
-		rc.top = monitor_y;
-		rc.right = monitor_x + (LONG)w->requested_width;
-		rc.bottom = monitor_y + (LONG)w->requested_height;
-	}
+	// Position on the 3D display. The vendor plug-in iface publishes the
+	// display top-left through xsysc->info.display_screen_left/top; the
+	// state tracker forwards those into comp_d3d11_window_create. (0, 0)
+	// means primary monitor (sim_display default or unknown panel).
+	RECT rc = {
+	    (LONG)w->display_screen_left,
+	    (LONG)w->display_screen_top,
+	    (LONG)w->display_screen_left + (LONG)w->requested_width,
+	    (LONG)w->display_screen_top + (LONG)w->requested_height,
+	};
 
 	// Hidden windows use WS_POPUP (borderless) so client rect = window rect = exact texture size.
 	// Visible windows use WS_OVERLAPPEDWINDOW for normal window chrome.
@@ -1194,7 +1165,11 @@ window_thread_func(LPVOID param)
  */
 
 extern "C" xrt_result_t
-comp_d3d11_window_create(uint32_t width, uint32_t height, struct comp_d3d11_window **out)
+comp_d3d11_window_create(uint32_t width,
+                         uint32_t height,
+                         int32_t screen_left,
+                         int32_t screen_top,
+                         struct comp_d3d11_window **out)
 {
 	struct comp_d3d11_window *w = U_TYPED_CALLOC(struct comp_d3d11_window);
 	if (w == NULL) {
@@ -1204,12 +1179,16 @@ comp_d3d11_window_create(uint32_t width, uint32_t height, struct comp_d3d11_wind
 	w->instance = GetModuleHandle(NULL);
 	w->requested_width = width > 0 ? width : 1920;
 	w->requested_height = height > 0 ? height : 1080;
+	w->display_screen_left = screen_left;
+	w->display_screen_top = screen_top;
 	w->xsysd = NULL;
 	w->qwerty_enabled = true;  // Always enabled for DisplayXR-owned windows
 
 	U_LOG_W("D3D11 window: QWERTY input ENABLED");
 
-	U_LOG_W("D3D11 window: Creating window on dedicated thread (%ux%u)", w->requested_width, w->requested_height);
+	U_LOG_W("D3D11 window: Creating window on dedicated thread (%ux%u) at (%d, %d)",
+	        w->requested_width, w->requested_height,
+	        (int)w->display_screen_left, (int)w->display_screen_top);
 
 	// Create manual-reset event for window-ready synchronization
 	w->window_ready_event = CreateEventW(NULL, TRUE, FALSE, NULL);

@@ -84,20 +84,28 @@ struct workspace_public_event_raw
  * caller does NOT need to pump messages — the compositor thread
  * continues rendering independently during modal drag/resize.
  *
- * The window is automatically positioned on the Leia display if found,
- * or on a secondary monitor, or on the primary display as fallback.
+ * The window is positioned at (@p screen_left, @p screen_top) in OS screen
+ * coordinates — the display top-left that the vendor plug-in iface published
+ * through `xrt_system_compositor_info.display_screen_left/top`. (0, 0) means
+ * the primary monitor (sim_display default, or unknown panel).
  *
  * By default, the window starts in fullscreen mode unless the environment
  * variable XRT_COMPOSITOR_START_WINDOWED=1 is set.
  *
- * @param width  Requested window width
- * @param height Requested window height
- * @param out    Pointer to receive the created window handle
+ * @param width        Requested window width
+ * @param height       Requested window height
+ * @param screen_left  Display top-left X in OS screen coords
+ * @param screen_top   Display top-left Y in OS screen coords
+ * @param out          Pointer to receive the created window handle
  *
  * @return XRT_SUCCESS on success, error code otherwise
  */
 xrt_result_t
-comp_d3d11_window_create(uint32_t width, uint32_t height, struct comp_d3d11_window **out);
+comp_d3d11_window_create(uint32_t width,
+                         uint32_t height,
+                         int32_t screen_left,
+                         int32_t screen_top,
+                         struct comp_d3d11_window **out);
 
 /*!
  * Destroy the self-owned window.

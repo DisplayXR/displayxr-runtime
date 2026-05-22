@@ -40,6 +40,10 @@ struct xrt_system_compositor_info;
  * @param chroma_key_color       0x00BBGGRR. Forwarded to the display processor as the
  *                               chroma-key color used by the post-weave alpha-recovery pass.
  *                               Pass 0 to let the DP pick a default (magenta).
+ * @param display_screen_left    Display top-left X in OS screen coords (from xsysc->info,
+ *                               populated by the vendor plug-in iface). 0 = primary.
+ *                               Used only on Windows for self-owned window positioning.
+ * @param display_screen_top     Display top-left Y in OS screen coords. 0 = primary.
  * @param out_xcn                Output native compositor.
  * @return XRT_SUCCESS or error.
  *
@@ -54,6 +58,8 @@ comp_gl_compositor_create(struct xrt_device *xdev,
                           void *shared_texture_handle,
                           bool transparent_background,
                           uint32_t chroma_key_color,
+                          int32_t display_screen_left,
+                          int32_t display_screen_top,
                           struct xrt_compositor_native **out_xcn);
 
 /*!

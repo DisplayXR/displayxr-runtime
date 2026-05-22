@@ -2716,7 +2716,11 @@ init_client_render_resources(struct d3d11_service_system *sys,
 		U_LOG_W("Using external window handle: %p", external_hwnd);
 	} else {
 		// Create our own window (IPC/WebXR path)
-		xrt_result_t wret = comp_d3d11_window_create(sys->output_width, sys->output_height, &res->window);
+		xrt_result_t wret = comp_d3d11_window_create(
+		    sys->output_width, sys->output_height,
+		    sys->base.info.display_screen_left,
+		    sys->base.info.display_screen_top,
+		    &res->window);
 		if (wret != XRT_SUCCESS || res->window == nullptr) {
 			U_LOG_E("Failed to create window for client");
 			return XRT_ERROR_VULKAN;
@@ -5370,7 +5374,11 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 		win_w = sys->output_width;
 		win_h = sys->output_height;
 	}
-	xrt_result_t wret = comp_d3d11_window_create(win_w, win_h, &mc->window);
+	xrt_result_t wret = comp_d3d11_window_create(
+	    win_w, win_h,
+	    sys->base.info.display_screen_left,
+	    sys->base.info.display_screen_top,
+	    &mc->window);
 	if (wret != XRT_SUCCESS || mc->window == nullptr) {
 		U_LOG_E("Multi-comp: failed to create window");
 		return XRT_ERROR_D3D11;
@@ -5667,7 +5675,11 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 				comp_d3d11_window_destroy(&mc->window);
 
 				// Recreate window at DP-reported size
-				wret = comp_d3d11_window_create(dp_px_w, dp_px_h, &mc->window);
+				wret = comp_d3d11_window_create(
+				    dp_px_w, dp_px_h,
+				    sys->base.info.display_screen_left,
+				    sys->base.info.display_screen_top,
+				    &mc->window);
 				if (wret != XRT_SUCCESS || mc->window == nullptr) {
 					U_LOG_E("Multi-comp: failed to recreate window at %ux%u", dp_px_w, dp_px_h);
 					return XRT_ERROR_D3D11;
