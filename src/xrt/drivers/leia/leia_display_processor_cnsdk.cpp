@@ -29,6 +29,10 @@
 
 #include <stdlib.h>
 
+#if defined(XRT_OS_ANDROID) && defined(XRT_DEBUG_ANDROID_VERBOSE)
+#include <android/trace.h>
+#endif
+
 
 // Hardware-bring-up debug logging. Gated by XRT_DEBUG_ANDROID_VERBOSE
 // (cppFlag from the Android Debug variant). Compiles to nothing in
@@ -40,9 +44,15 @@
 		static bool _logged = false;                                                                \
 		if (!_logged) { U_LOG_I("HW_DBG_DP[once]: " __VA_ARGS__); _logged = true; }                 \
 	} while (0)
+struct AtraceScopeDp {
+	AtraceScopeDp(const char *name) { ATrace_beginSection(name); }
+	~AtraceScopeDp() { ATrace_endSection(); }
+};
+#define DXR_ATRACE(name) AtraceScopeDp _atrace_##__LINE__(name)
 #else
 #define DXR_HW_DBG(...)       ((void)0)
 #define DXR_HW_DBG_ONCE(...)  ((void)0)
+#define DXR_ATRACE(name)      ((void)0)
 #endif
 
 
@@ -87,6 +97,7 @@ mono_passthrough_blit(leia_dp_cnsdk *impl,
                       uint32_t target_width,
                       uint32_t target_height)
 {
+	DXR_ATRACE("dxr_dp:mono_passthrough_blit");
 	struct vk_bundle *vk = impl->vk;
 
 	VkCommandBufferAllocateInfo ai = {};
@@ -205,6 +216,7 @@ process_atlas_weave(struct xrt_display_processor *xdp,
                     uint32_t canvas_width,
                     uint32_t canvas_height)
 {
+	DXR_ATRACE("dxr_dp:process_atlas_weave");
 	(void)cmd_buffer;     // self-submitting: compositor passes VK_NULL_HANDLE
 	(void)view_format;
 	(void)canvas_offset_x; (void)canvas_offset_y;

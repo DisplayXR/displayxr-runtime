@@ -19,6 +19,9 @@
 
 #ifdef XRT_OS_ANDROID
 #include "android/android_globals.h"
+#ifdef XRT_DEBUG_ANDROID_VERBOSE
+#include <android/trace.h>
+#endif
 #endif
 
 #include <atomic>
@@ -36,9 +39,18 @@
 		static bool _logged = false;                                                                \
 		if (!_logged) { U_LOG_I("HW_DBG_CNSDK[once]: " __VA_ARGS__); _logged = true; }              \
 	} while (0)
+
+// ATrace RAII scope — captures show up in Perfetto / Studio Profiler.
+// Same gate as DXR_HW_DBG; release builds compile to nothing.
+struct AtraceScopeCnsdk {
+	AtraceScopeCnsdk(const char *name) { ATrace_beginSection(name); }
+	~AtraceScopeCnsdk() { ATrace_endSection(); }
+};
+#define DXR_ATRACE(name) AtraceScopeCnsdk _atrace_##__LINE__(name)
 #else
 #define DXR_HW_DBG(...)       ((void)0)
 #define DXR_HW_DBG_ONCE(...)  ((void)0)
+#define DXR_ATRACE(name)      ((void)0)
 #endif
 
 
@@ -469,6 +481,7 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 		return;
 	}
 
+	DXR_ATRACE("dxr_cnsdk:weave");
 	leia_interlacer_set_flip_input_uv_vertical(cnsdk->interlacer, true);
 
 	// Atlas mode: hand CNSDK the SBS atlas VkImage+View each frame; it
