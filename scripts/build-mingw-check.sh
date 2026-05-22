@@ -52,7 +52,6 @@ if [[ ! -f "$BUILD/CMakeCache.txt" ]]; then
 	    -DXRT_HAVE_LIBUSB=OFF \
 	    -DXRT_HAVE_OPENGL=OFF \
 	    -DXRT_HAVE_VULKAN=OFF \
-	    -DXRT_HAVE_LEIA_SR=OFF \
 	    -DXRT_HAVE_SDL2=OFF \
 	    -DXRT_MODULE_AUX_VK=OFF \
 	    -DXRT_MODULE_COMPOSITOR=OFF \

@@ -20,7 +20,6 @@
 #cmakedefine XRT_HAVE_GST
 #cmakedefine XRT_HAVE_HIDAPI
 #cmakedefine XRT_HAVE_JPEG
-#cmakedefine XRT_HAVE_LEIA_SR
 #cmakedefine XRT_HAVE_LIBBSD
 #cmakedefine XRT_HAVE_METAL
 #cmakedefine XRT_HAVE_LIBUDEV

@@ -20,10 +20,6 @@ xrt_builder_create_func_t target_builder_list[] = {
     t_builder_qwerty_create,
 #endif // T_BUILDER_QWERTY
 
-#ifdef T_BUILDER_LEIA // Leia 3D display (SR SDK / CNSDK).
-    t_builder_leia_create,
-#endif // T_BUILDER_LEIA
-
 #ifdef T_BUILDER_SIM_DISPLAY // After overrides, before real hardware.
     t_builder_sim_display_create,
 #endif // T_BUILDER_SIM_DISPLAY

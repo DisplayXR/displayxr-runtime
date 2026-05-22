@@ -16,9 +16,7 @@ setlocal enabledelayedexpansion
 :: ============================================================
 
 set REPO=%~dp0..\
-set SR_TAG=1.35.0.2011
 set OPENXR_VERSION=1.1.43
-set LEIASR_SDKROOT=%REPO%LeiaSR-SDK-%SR_TAG%-win64
 set VULKAN_SDK=C:\VulkanSDK\1.4.341.1
 set OPENXR_SDK=%REPO%openxr_sdk
 set NINJA_DIR=%LOCALAPPDATA%\Microsoft\WinGet\Packages\Ninja-build.Ninja_Microsoft.Winget.Source_8wekyb3d8bbwe
@@ -63,49 +61,15 @@ if not exist "%VULKAN_SDK%\Include\vulkan\vulkan.h" (
     exit /b 1
 )
 
-:: --- GitHub CLI (needed for SR SDK download) ---
+:: --- GitHub CLI (needed for some workflows; not for the build itself) ---
 where gh >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     set "PATH=C:\Program Files\GitHub CLI;%PATH%"
 )
-where gh >nul 2>&1
-if %ERRORLEVEL% NEQ 0 (
-    echo ERROR: GitHub CLI not found. Install via: winget install GitHub.cli
-    echo Then run: gh auth login
-    exit /b 1
-)
 
-:: --- Leia SR SDK ---
-:: Marker file (cmake config installed by the SDK zip) — checking the bare
-:: lib/ dir wasn't enough: the Vulkan-extras download below creates lib/
-:: even when the main zip extract failed, which then made this idempotency
-:: check skip a re-extract on the next run, leaving CMake to die on missing
-:: simulatedreality_DIR / srDirectX_DIR.
-set SR_SDK_MARKER=%LEIASR_SDKROOT%\lib\cmake\srDirectX\srDirectXConfig.cmake
-:: %REPO% ends in '\', so "%REPO%" passes "...\.." to gh/PS where the
-:: trailing \" is parsed as an escaped quote. Strip the trailing slash for
-:: the download destination args.
-set REPO_NOSLASH=%REPO:~0,-1%
-if not exist "%SR_SDK_MARKER%" (
-    echo === Downloading Leia SR SDK %SR_TAG% ===
-    gh release download sr-sdk-v%SR_TAG% -R DisplayXR/displayxr-runtime -p "LeiaSR-SDK-%SR_TAG%-win64.zip" -D "%REPO_NOSLASH%"
-    if %ERRORLEVEL% NEQ 0 (
-        echo ERROR: Failed to download SR SDK. Run: gh auth login
-        exit /b 1
-    )
-    powershell -Command "Expand-Archive -Path '%REPO%LeiaSR-SDK-%SR_TAG%-win64.zip' -DestinationPath '%REPO_NOSLASH%' -Force"
-    if not exist "%SR_SDK_MARKER%" (
-        echo ERROR: SR SDK extract did not produce %SR_SDK_MARKER%
-        echo Check the Expand-Archive output above.
-        exit /b 1
-    )
-    del "%REPO%LeiaSR-SDK-%SR_TAG%-win64.zip" 2>nul
-
-    echo === Downloading Vulkan weaver extras ===
-    gh release download sr-sdk-v%SR_TAG% -R DisplayXR/displayxr-runtime -p "SimulatedRealityVulkanBeta.lib" -D "%LEIASR_SDKROOT%\lib"
-    gh release download sr-sdk-v%SR_TAG% -R DisplayXR/displayxr-runtime -p "vkweaver.h" -D "%LEIASR_SDKROOT%\include\sr\weaver"
-    echo SR SDK ready.
-)
+:: NOTE: Leia SR support is no longer built in-tree (ADR-019 / issues
+:: #256 & #263). To run on Leia hardware, install the runtime then the
+:: Leia plug-in installer from DisplayXR/displayxr-leia-plugin releases.
 
 :: --- vcpkg ---
 if not exist "%REPO%vcpkg\vcpkg.exe" (
@@ -139,7 +103,6 @@ if not exist "%OPENXR_SDK_SHORT%\x64\lib\openxr_loader.lib" (
 
 echo.
 echo === Dependencies ready ===
-echo   LEIASR_SDKROOT=%LEIASR_SDKROOT%
 echo   VULKAN_SDK=%VULKAN_SDK%
 echo   OPENXR_SDK=%OPENXR_SDK%
 echo   OPENXR_SDK_SHORT=%OPENXR_SDK_SHORT%
@@ -155,8 +118,6 @@ if "%TARGET%"=="test-apps" goto :do_test_apps
 
 echo === CMake Generate ===
 cmake -S "%REPO%." -B "%REPO%build" -G "Ninja Multi-Config" ^
-  -DXRT_HAVE_LEIA_SR=ON ^
-  -DCMAKE_PREFIX_PATH="%LEIASR_SDKROOT%" ^
   -DCMAKE_TOOLCHAIN_FILE="%REPO%vcpkg\scripts\buildsystems\vcpkg.cmake" ^
   -DX_VCPKG_APPLOCAL_DEPS_INSTALL=ON ^
   -DCMAKE_INSTALL_PREFIX="%REPO%_package" ^

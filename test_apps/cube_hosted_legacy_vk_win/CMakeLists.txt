@@ -121,6 +121,5 @@ if(TEXTURE_FILES)
     )
 endif()
 
-# SimulatedRealityVulkanBeta.dll: shipped with the runtime, not
-# bundled per-app. See test_apps/cube_handle_vk_win/CMakeLists.txt
-# for the rationale + runtime install rule location.
+# SimulatedRealityVulkanBeta.dll: shipped with the Leia plug-in installer
+# from DisplayXR/displayxr-leia-plugin. Apps don't bundle a per-app copy.

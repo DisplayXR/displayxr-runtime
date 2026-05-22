@@ -89,7 +89,6 @@ jobs:
     runs-on: windows-2022
 
     env:
-      SR_TAG: 1.35.0.2011
       GH_TOKEN: ${{ github.token }}
       DOCS_ONLY: ${{ needs.DetectChanges.outputs.docs_only }}
 
@@ -105,17 +104,10 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only == 'true'
         run: echo "DetectChanges flagged docs_only=true; the steps below skip and the Runtime job reports a success status without running the full Windows build."
 
-      - name: Download Simulated Reality SDK
-        if: needs.DetectChanges.outputs.docs_only != 'true'
-        run: |
-          gh release download -R DisplayXR/displayxr-runtime sr-sdk-v$env:SR_TAG -p LeiaSR-SDK-$env:SR_TAG-win64.zip -D .
-          tar -xf LeiaSR-SDK-$env:SR_TAG-win64.zip -C .
-          Get-ChildItem -Recurse LeiaSR-SDK-$env:SR_TAG-win64
-          gh release download -R DisplayXR/displayxr-runtime sr-sdk-v$env:SR_TAG -p SimulatedRealityVulkanBeta.lib -D LeiaSR-SDK-$env:SR_TAG-win64/lib
-          gh release download -R DisplayXR/displayxr-runtime sr-sdk-v$env:SR_TAG -p vkweaver.h -D LeiaSR-SDK-$env:SR_TAG-win64/include/sr/weaver
-          # GL weaver assets not yet available in SR SDK release - uncomment when uploaded:
-          # gh release download -R DisplayXR/displayxr-runtime sr-sdk-v$env:SR_TAG -p SimulatedRealityOpenGL.lib -D LeiaSR-SDK-$env:SR_TAG-win64/lib
-          # gh release download -R DisplayXR/displayxr-runtime sr-sdk-v$env:SR_TAG -p glweaver.h -D LeiaSR-SDK-$env:SR_TAG-win64/include/sr/weaver
+      # No vendor SDK fetch — the runtime DLL holds zero vendor identifiers
+      # in its link line (ADR-019). Vendor drv_* implementations ship from
+      # separate repos as plug-in DLLs (see DisplayXR/displayxr-leia-plugin
+      # and docs/guides/vendor-plugin-onboarding.md).
 
       - name: Restore from cache and setup vcpkg executable and data files.
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -150,12 +142,8 @@ jobs:
 
       - name: Generate
         if: needs.DetectChanges.outputs.docs_only != 'true'
-        env:
-          LEIASR_SDKROOT: ${{ github.workspace }}/LeiaSR-SDK-${{ env.SR_TAG }}-win64
         run: |
           cmake -S . -B build -G "Ninja Multi-Config" `
-            -DXRT_HAVE_LEIA_SR=ON `
-            -DCMAKE_PREFIX_PATH="${{ github.workspace }}/LeiaSR-SDK-$env:SR_TAG-win64" `
             -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" `
             -DX_VCPKG_APPLOCAL_DEPS_INSTALL=ON `
             -DCMAKE_INSTALL_PREFIX=_package `
@@ -169,18 +157,14 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: cmake --build build --config Release --target install
 
-      # ADR-019 / issue #256 — the runtime DLL must hold zero vendor
-      # identifiers in its link line. After Step 6c moved drv_leia into
-      # the DisplayXR-LeiaSR.dll plug-in, DisplayXRClient.dll should
-      # import nothing matching `SimulatedReality*`. This step catches
-      # any regression — e.g. a future PR accidentally re-linking
-      # drv_leia into the runtime, or a new transitive dep dragging
-      # the SR libs back in — at PR time, before any artifact ships.
-      #
-      # Mirrors the plan §4.8 assertion. Runs even when the SR SDK is
-      # present at build time (which it always is on this job, because
-      # XRT_HAVE_LEIA_SR=ON drives the plug-in build); the test is
-      # purely about what the runtime DLL's import table looks like.
+      # ADR-019 / issues #256 & #263 — the runtime DLL must hold zero
+      # vendor identifiers in its link line. drv_leia lives in its own
+      # repo (DisplayXR/displayxr-leia-plugin) post-#263 and the runtime
+      # tree has no SR source at all. DisplayXRClient.dll should
+      # import nothing matching `SimulatedReality*`. This step is a
+      # permanent tripwire: catches accidental re-introduction of a
+      # vendor static-link path or a new transitive dep dragging the
+      # SR libs back in — at PR time, before any artifact ships.
       - name: Assert runtime DLL has zero vendor identifiers
         if: needs.DetectChanges.outputs.docs_only != 'true'
         shell: pwsh

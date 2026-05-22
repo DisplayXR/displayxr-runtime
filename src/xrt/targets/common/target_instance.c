@@ -32,23 +32,9 @@
 #include "d3d11_service/comp_d3d11_service.h"
 #endif
 
-// SR display dimension query for proper swapchain dimensions.
-// Only compiled in the in-proc fallback build (issue #256 / ADR-019);
-// production builds query through the plug-in iface and have no
-// drv_leia symbols available at link time.
-#if defined(XRT_HAVE_LEIA_SR) && defined(XRT_PLUGIN_BUILD_INPROC_FALLBACK)
-#include "xrt/xrt_compositor.h"
-#include "leia/leia_interface.h"
-#include "leia/leia_sr_d3d11.h"
-#include "leia/leia_display_processor.h"
-#include "leia/leia_display_processor_d3d11.h"
-#ifdef XRT_HAVE_LEIA_SR_D3D12
-#include "leia/leia_display_processor_d3d12.h"
-#endif
-#ifdef XRT_HAVE_LEIA_SR_GL
-#include "leia/leia_display_processor_gl.h"
-#endif
-#endif
+// Vendor display-info (Leia SR, etc.) is sourced from the plug-in DLL's
+// xrt_plugin_iface — see target_plugin_loader. The runtime DLL no
+// longer link-includes any vendor drv_* code (ADR-019 / #256 / #263).
 
 // sim_display display info for XR_EXT_display_info fallback — only
 // compiled in the developer in-proc fallback build (ADR-019 / issue
@@ -150,34 +136,12 @@ t_instance_create_system(struct xrt_instance *xinst,
 
 #ifdef XRT_MODULE_COMPOSITOR_NULL
 	if (use_null) {
+		// Refresh rate sourcing: previously queried via leia_edid + SR SDK
+		// when the in-proc Leia fallback was linked. Post-#263 the SR
+		// path lives entirely in the plug-in DLL; the null compositor
+		// uses the default refresh rate. Add an entry to
+		// xrt_plugin_display_info if this becomes load-bearing.
 		float sr_refresh_rate_hz = 0.0f;
-
-#if defined(XRT_HAVE_LEIA_SR) && defined(XRT_PLUGIN_BUILD_INPROC_FALLBACK)
-		// Query SR display for refresh rate only; dims come from device
-		// native resolution. Only available in the in-proc fallback
-		// build — production builds get the SR refresh rate through the
-		// plug-in iface (TODO: add to xrt_plugin_display_info if it
-		// becomes load-bearing for the null compositor path).
-		//
-		// Gate on the cached EDID probe rather than on a device-name
-		// substring: leia_edid_get_cached_result() reports hw_found=true
-		// only when a known Leia/Dimenco panel is connected, so the slow
-		// 5s leiasr_query_* call is skipped cleanly on sim_display and
-		// any non-Leia HMD without depending on driver-name strings.
-		struct leia_display_probe_result probe = {0};
-		if (leia_edid_get_cached_result(&probe) && probe.hw_found) {
-			uint32_t sr_rec_width = 0, sr_rec_height = 0;
-			uint32_t sr_native_width = 0, sr_native_height = 0;
-			if (leiasr_query_recommended_view_dimensions(5.0, &sr_rec_width, &sr_rec_height,
-			                                             &sr_refresh_rate_hz, &sr_native_width,
-			                                             &sr_native_height)) {
-				U_LOG_I("Using SR display refresh rate: %.0f Hz", sr_refresh_rate_hz);
-			} else {
-				U_LOG_W("Could not query SR display, using default refresh rate");
-			}
-		}
-#endif
-
 		xret = null_compositor_create_system_with_dims(head, 0, 0,
 		                                               sr_refresh_rate_hz, &xsysc);
 	}
@@ -331,86 +295,8 @@ out:
 			}
 		}
 
-#if defined(XRT_HAVE_LEIA_SR) && defined(XRT_PLUGIN_BUILD_INPROC_FALLBACK)
-		// Legacy in-proc Leia path — only compiled when
-		// XRT_PLUGIN_BUILD_INPROC_FALLBACK is on (developer fallback for
-		// debugging without the plug-in DLL). Production runtime uses
-		// the iface-populated values above and never touches these
-		// vendor symbols.
-		//
-		// Gate on the cached EDID probe (non-blocking) rather than on a
-		// device-name substring: hw_found is true iff a known
-		// Leia/Dimenco panel is connected, so non-Leia setups skip the
-		// whole block cleanly without depending on driver-name strings.
-		struct leia_display_probe_result probe_edid = {0};
-		if (!plugin_filled_display_info &&
-		    leia_edid_get_cached_result(&probe_edid) && probe_edid.hw_found)
-		{
-			uint32_t di_sr_w = 0, di_sr_h = 0, di_nat_w = 0, di_nat_h = 0;
-			float di_refresh = 0.0f;
-			if (leiasr_query_recommended_view_dimensions(5.0, &di_sr_w, &di_sr_h, &di_refresh,
-			                                             &di_nat_w, &di_nat_h) &&
-			    di_nat_w > 0 && di_nat_h > 0) {
-				xsysc->info.recommended_view_scale_x = (float)di_sr_w / (float)di_nat_w;
-				xsysc->info.recommended_view_scale_y = (float)di_sr_h / (float)di_nat_h;
-				xsysc->info.display_pixel_width = di_nat_w;
-				xsysc->info.display_pixel_height = di_nat_h;
-				U_LOG_W("XR_EXT_display_info (in-proc): scale=%.4f x %.4f (sr=%ux%u, native=%ux%u)",
-				        xsysc->info.recommended_view_scale_x,
-				        xsysc->info.recommended_view_scale_y, di_sr_w, di_sr_h, di_nat_w, di_nat_h);
-			}
-
-			struct leiasr_display_dimensions dims = {0};
-			if (leiasr_static_get_display_dimensions(&dims) && dims.valid) {
-				xsysc->info.display_width_m = dims.width_m;
-				xsysc->info.display_height_m = dims.height_m;
-				xsysc->info.nominal_viewer_x_m = dims.nominal_x_m;
-				xsysc->info.nominal_viewer_y_m = dims.nominal_y_m;
-				xsysc->info.nominal_viewer_z_m = dims.nominal_z_m;
-				xsysc->info.supported_eye_tracking_modes = 1; /* MANAGED_BIT */
-				xsysc->info.default_eye_tracking_mode = 0;    /* MANAGED */
-			}
-
-			// Reuse the gating probe — hw_found guarantees screen
-			// coords are valid.
-			xsysc->info.display_screen_left = probe_edid.screen_left;
-			xsysc->info.display_screen_top = probe_edid.screen_top;
-
-			if (xsysc->info.display_pixel_width > 0 && xsysc->info.display_pixel_height > 0) {
-				for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
-					u_tiling_compute_mode(&head->rendering_modes[mi],
-					                      xsysc->info.display_pixel_width,
-					                      xsysc->info.display_pixel_height);
-				}
-				u_tiling_compute_system_atlas(head->rendering_modes,
-				                              head->rendering_mode_count,
-				                              &xsysc->info.atlas_width_pixels,
-				                              &xsysc->info.atlas_height_pixels);
-			}
-
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-			if (xsysc->info.dp_factory_vk == NULL) {
-				xsysc->info.dp_factory_vk = (void *)leia_dp_factory_vk;
-			}
-#endif
-			if (xsysc->info.dp_factory_d3d11 == NULL) {
-				xsysc->info.dp_factory_d3d11 = (void *)leia_dp_factory_d3d11;
-			}
-#ifdef XRT_HAVE_LEIA_SR_D3D12
-			if (xsysc->info.dp_factory_d3d12 == NULL) {
-				xsysc->info.dp_factory_d3d12 = (void *)leia_dp_factory_d3d12;
-			}
-#endif
-#ifdef XRT_HAVE_LEIA_SR_GL
-			if (xsysc->info.dp_factory_gl == NULL) {
-				xsysc->info.dp_factory_gl = (void *)leia_dp_factory_gl;
-			}
-#endif
-		}
-#endif /* XRT_HAVE_LEIA_SR && XRT_PLUGIN_BUILD_INPROC_FALLBACK */
-
-		/* Consumed by the gated fallback blocks (Leia in-proc + sim_display
-		 * in-proc). When neither fallback compiles in (production builds),
+		/* Consumed by the sim_display in-proc fallback block below.
+		 * When that fallback doesn't compile in (production builds),
 		 * silence -Wunused-but-set-variable. */
 		(void)plugin_filled_display_info;
 

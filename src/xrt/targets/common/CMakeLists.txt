@@ -30,29 +30,14 @@ if(XRT_BUILD_DRIVER_QWERTY)
 	target_link_libraries(target_lists PRIVATE drv_qwerty)
 endif()
 
-# Leia 3D display builder — only built when the in-proc fallback is on
-# (issue #256 / ADR-019). With XRT_PLUGIN_BUILD_INPROC_FALLBACK=OFF
-# (production default), the Leia code path runs entirely inside the
-# DisplayXR-LeiaSR.dll plug-in; the runtime DLL no longer links drv_leia.
-# The sim_display builder below still handles device + factory
-# delegation through the plug-in iface (see target_plugin_loader).
-if(XRT_HAVE_LEIA_SR AND XRT_PLUGIN_BUILD_INPROC_FALLBACK)
-	target_sources(target_lists PRIVATE target_builder_leia.c)
-	target_link_libraries(target_lists PRIVATE drv_leia)
-endif()
+# Vendor drivers (Leia SR, etc.) are no longer linked into the runtime
+# DLL — ADR-019 / issues #256 & #263. They ship as plug-in DLLs from
+# their own repos; target_plugin_loader discovers and loads them at
+# xrCreateInstance time. The sim_display builder below is the in-tree
+# vendor-neutral fallback example.
 
-# Sim display builder (always available — picks up the plug-in iface via
-# target_plugin_loader). The static drv_sim_display archive is now linked
-# only when XRT_PLUGIN_BUILD_INPROC_FALLBACK=ON (developer fallback),
-# mirroring the drv_leia gating above. Production builds resolve all
-# sim_display work — device creation, display-info, DP factories — through
-# the plug-in iface; the runtime DLL holds zero sim_display identifiers in
-# its link line (ADR-019/plan goal §2.1).
 target_sources(target_lists PRIVATE target_builder_sim_display.c)
 target_link_libraries(target_lists PRIVATE drv_sim_display_includes)
-if(XRT_PLUGIN_BUILD_INPROC_FALLBACK)
-	target_link_libraries(target_lists PRIVATE drv_sim_display)
-endif()
 if(XRT_BUILD_DRIVER_QWERTY)
 	# sim_display builder uses qwerty_device.h for pose delegation config
 	target_link_libraries(target_lists PRIVATE drv_qwerty drv_qwerty_includes)
@@ -96,12 +81,6 @@ if(XRT_MODULE_COMPOSITOR_MAIN OR XRT_MODULE_COMPOSITOR_NULL)
 		target_link_libraries(target_instance PRIVATE comp_null)
 	endif()
 
-	# Link SR driver for dimension query when available
-	if(XRT_HAVE_LEIA_SR AND XRT_PLUGIN_BUILD_INPROC_FALLBACK)
-		target_link_libraries(target_instance PRIVATE drv_leia)
-		target_include_directories(target_instance PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../drivers)
-	endif()
-
 	# Hybrid mode: create a separate library that exports native_instance_create
 	# instead of xrt_instance_create to avoid symbol conflict with IPC client
 	if(XRT_FEATURE_HYBRID_MODE)
@@ -125,14 +104,6 @@ if(XRT_MODULE_COMPOSITOR_MAIN OR XRT_MODULE_COMPOSITOR_NULL)
 		)
 		if(XRT_MODULE_COMPOSITOR_NULL)
 			target_link_libraries(target_instance_hybrid PRIVATE comp_null)
-		endif()
-
-		# Link SR driver for dimension query when available (hybrid mode).
-		# Production builds (XRT_PLUGIN_BUILD_INPROC_FALLBACK=OFF) skip
-		# this — dim queries come through the plug-in iface instead.
-		if(XRT_HAVE_LEIA_SR AND XRT_PLUGIN_BUILD_INPROC_FALLBACK)
-			target_link_libraries(target_instance_hybrid PRIVATE drv_leia)
-			target_include_directories(target_instance_hybrid PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../drivers)
 		endif()
 
 	endif()
