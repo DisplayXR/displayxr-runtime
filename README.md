@@ -61,8 +61,12 @@ The website's [Get Started](https://displayxr.org/getting-started) page walks th
 scripts\build_windows.bat all
 # Outputs: _package/DisplayXRSetup-*.exe (installer) + _package/bin/
 
-# macOS — source build only (no packaged installer yet)
-brew install cmake ninja eigen vulkan-sdk && ./scripts/build_macos.sh
+# macOS — runtime + sim-display plug-in + .pkg installer
+brew install cmake ninja eigen vulkan-sdk && ./scripts/build_macos.sh --installer
+# Outputs: _package/DisplayXR-Installer-*.pkg (installer) + _package/DisplayXR-macOS/
+# Install: sudo installer -pkg _package/DisplayXR-Installer-*.pkg -target /
+# (Gatekeeper warns on double-click — the .pkg is unsigned today; sudo installer
+#  from terminal bypasses Gatekeeper. Notarization tracked in issues #280/#281.)
 
 # Run a dev build without installing
 XR_RUNTIME_JSON=./build/Release/openxr_displayxr-dev.json ./your_openxr_app

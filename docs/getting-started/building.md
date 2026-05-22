@@ -157,7 +157,9 @@ copy /Y build\src\xrt\targets\openxr\Release\DisplayXRClient.dll ^
 
 ### Installing the runtime for end-user testing
 
-For exercising the *installed* code paths (installer, registry, `ActiveRuntime`-driven discovery), build and run the installer instead:
+For exercising the *installed* code paths (installer, registry, `ActiveRuntime`-driven discovery), build and run the installer instead.
+
+**Windows:**
 
 ```cmd
 scripts\build_windows.bat installer
@@ -165,6 +167,23 @@ _package\DisplayXRSetup-*.exe                :: UAC prompt, one-click install
 ```
 
 This writes `HKLM\Software\Khronos\OpenXR\1\ActiveRuntime` and `HKLM\Software\DisplayXR\*`, adds Program Files to system PATH, and registers the runtime as discoverable. After install, OpenXR apps with no `XR_RUNTIME_JSON` set will resolve through the registry to the installed runtime.
+
+**macOS:**
+
+```bash
+./scripts/build_macos.sh --installer
+sudo installer -pkg _package/DisplayXR-Installer-*.pkg -target /
+```
+
+This drops the runtime + sim-display plug-in tree into `/Library/Application Support/DisplayXR/`, symlinks `/etc/xdg/openxr/1/active_runtime.json` to the installed manifest, and registers the plug-in via the system-wide discovery root at `/Library/Application Support/DisplayXR/DisplayProcessors/`. After install, OpenXR apps with no `XR_RUNTIME_JSON` set will resolve through the symlink to the installed runtime.
+
+Uninstall: `sudo "/Library/Application Support/DisplayXR/uninstall.sh"` — removes the install tree, the active_runtime symlink, the bundled test .app, and the `pkgutil` receipts.
+
+> **Note on Gatekeeper (unsigned `.pkg`):** the installer is unsigned today, so double-clicking it in Finder triggers Gatekeeper's "DisplayXR cannot be verified" prompt. Two workarounds:
+> - `sudo installer -pkg ... -target /` from the terminal — works regardless of signing, recommended for developer use.
+> - Right-click the `.pkg` in Finder → Open → "Open" in the confirmation dialog — one-time bypass per file.
+>
+> Notarization is tracked in [#280](https://github.com/DisplayXR/displayxr-runtime/issues/280) (macOS) and [#281](https://github.com/DisplayXR/displayxr-runtime/issues/281) (Windows). Both ship today as unsigned-with-workaround.
 
 ## Running Tests
 
