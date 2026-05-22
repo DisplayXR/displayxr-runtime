@@ -63,6 +63,15 @@ log_xr_result(const char *what, XrResult r)
 
 XrInstance g_instance = XR_NULL_HANDLE;
 XrSystemId g_system_id = XR_NULL_SYSTEM_ID;
+XrVersion g_required_vk_version = XR_MAKE_VERSION(1, 1, 0);
+
+VkInstance g_vk_instance = VK_NULL_HANDLE;
+VkPhysicalDevice g_vk_phys_device = VK_NULL_HANDLE;
+VkDevice g_vk_device = VK_NULL_HANDLE;
+VkQueue g_vk_queue = VK_NULL_HANDLE;
+uint32_t g_vk_queue_family = UINT32_MAX;
+
+XrSession g_session = XR_NULL_HANDLE;
 
 // Wire the Khronos OpenXR loader's Android-specific init. Required on
 // Android because the loader needs the JavaVM + Activity context to
@@ -210,12 +219,225 @@ query_system_and_graphics_reqs()
 	     XR_VERSION_MAJOR(reqs.maxApiVersionSupported),
 	     XR_VERSION_MINOR(reqs.maxApiVersionSupported),
 	     XR_VERSION_PATCH(reqs.maxApiVersionSupported));
+
+	// Save the runtime's minimum for VkApplicationInfo::apiVersion. Going
+	// higher is also allowed (up to max), but min is the safest choice
+	// that the runtime promises to accept.
+	g_required_vk_version = reqs.minApiVersionSupported;
 	return true;
+}
+
+// Create a VkInstance via the runtime's xrCreateVulkanInstanceKHR — that
+// path lets the runtime inject any platform-specific extensions it needs
+// (e.g. swapchain-image-import KHRs) on top of our base
+// VkInstanceCreateInfo. No app-side extensions needed at this stage.
+bool
+create_vulkan_instance()
+{
+	PFN_xrCreateVulkanInstanceKHR xr_create_vk_instance = nullptr;
+	XrResult res = xrGetInstanceProcAddr(
+	    g_instance, "xrCreateVulkanInstanceKHR",
+	    reinterpret_cast<PFN_xrVoidFunction *>(&xr_create_vk_instance));
+	if (res != XR_SUCCESS || xr_create_vk_instance == nullptr) {
+		LOGE("xrGetInstanceProcAddr(xrCreateVulkanInstanceKHR) failed (%d)", (int)res);
+		return false;
+	}
+
+	VkApplicationInfo app_info = {};
+	app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+	app_info.pApplicationName = "cube_handle_vk_android";
+	app_info.applicationVersion = 1;
+	app_info.pEngineName = "displayxr";
+	app_info.engineVersion = 1;
+	app_info.apiVersion = VK_MAKE_VERSION(
+	    XR_VERSION_MAJOR(g_required_vk_version),
+	    XR_VERSION_MINOR(g_required_vk_version),
+	    0);
+
+	VkInstanceCreateInfo vk_ci = {};
+	vk_ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+	vk_ci.pApplicationInfo = &app_info;
+
+	XrVulkanInstanceCreateInfoKHR xr_ci = {};
+	xr_ci.type = XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR;
+	xr_ci.systemId = g_system_id;
+	xr_ci.pfnGetInstanceProcAddr = &vkGetInstanceProcAddr;
+	xr_ci.vulkanCreateInfo = &vk_ci;
+	xr_ci.vulkanAllocator = nullptr;
+
+	VkResult vk_result = VK_SUCCESS;
+	res = xr_create_vk_instance(g_instance, &xr_ci, &g_vk_instance, &vk_result);
+	log_xr_result("xrCreateVulkanInstanceKHR", res);
+	if (res != XR_SUCCESS || vk_result != VK_SUCCESS) {
+		LOGE("xrCreateVulkanInstanceKHR vk_result=%d", (int)vk_result);
+		return false;
+	}
+	return true;
+}
+
+// Ask the runtime which physical device backs our XrSystemId. On Android
+// this is typically the one and only GPU, but the API surface is the
+// same on multi-GPU desktop platforms.
+bool
+pick_physical_device()
+{
+	PFN_xrGetVulkanGraphicsDevice2KHR xr_get_phys = nullptr;
+	XrResult res = xrGetInstanceProcAddr(
+	    g_instance, "xrGetVulkanGraphicsDevice2KHR",
+	    reinterpret_cast<PFN_xrVoidFunction *>(&xr_get_phys));
+	if (res != XR_SUCCESS || xr_get_phys == nullptr) {
+		LOGE("xrGetInstanceProcAddr(xrGetVulkanGraphicsDevice2KHR) failed (%d)", (int)res);
+		return false;
+	}
+
+	XrVulkanGraphicsDeviceGetInfoKHR info = {};
+	info.type = XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR;
+	info.systemId = g_system_id;
+	info.vulkanInstance = g_vk_instance;
+
+	res = xr_get_phys(g_instance, &info, &g_vk_phys_device);
+	log_xr_result("xrGetVulkanGraphicsDevice2KHR", res);
+	return res == XR_SUCCESS;
+}
+
+// Create a VkDevice via xrCreateVulkanDeviceKHR — same pattern as the
+// instance, the runtime injects whatever device extensions it needs on
+// top of our base info. We supply one graphics queue.
+bool
+create_vulkan_device()
+{
+	// Find a queue family with graphics support. On Android there's
+	// usually exactly one, but the proper enumeration is cheap.
+	uint32_t qf_count = 0;
+	vkGetPhysicalDeviceQueueFamilyProperties(g_vk_phys_device, &qf_count, nullptr);
+	if (qf_count == 0) {
+		LOGE("No Vulkan queue families");
+		return false;
+	}
+	VkQueueFamilyProperties qf_props[16] = {};
+	const uint32_t qf_cap = sizeof(qf_props) / sizeof(qf_props[0]);
+	if (qf_count > qf_cap) {
+		qf_count = qf_cap;
+	}
+	vkGetPhysicalDeviceQueueFamilyProperties(g_vk_phys_device, &qf_count, qf_props);
+
+	g_vk_queue_family = UINT32_MAX;
+	for (uint32_t i = 0; i < qf_count; ++i) {
+		if (qf_props[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+			g_vk_queue_family = i;
+			break;
+		}
+	}
+	if (g_vk_queue_family == UINT32_MAX) {
+		LOGE("No graphics-capable Vulkan queue family");
+		return false;
+	}
+
+	const float priority = 1.0f;
+	VkDeviceQueueCreateInfo qci = {};
+	qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+	qci.queueFamilyIndex = g_vk_queue_family;
+	qci.queueCount = 1;
+	qci.pQueuePriorities = &priority;
+
+	VkPhysicalDeviceFeatures features = {};
+
+	VkDeviceCreateInfo dci = {};
+	dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+	dci.queueCreateInfoCount = 1;
+	dci.pQueueCreateInfos = &qci;
+	dci.pEnabledFeatures = &features;
+
+	PFN_xrCreateVulkanDeviceKHR xr_create_vk_device = nullptr;
+	XrResult res = xrGetInstanceProcAddr(
+	    g_instance, "xrCreateVulkanDeviceKHR",
+	    reinterpret_cast<PFN_xrVoidFunction *>(&xr_create_vk_device));
+	if (res != XR_SUCCESS || xr_create_vk_device == nullptr) {
+		LOGE("xrGetInstanceProcAddr(xrCreateVulkanDeviceKHR) failed (%d)", (int)res);
+		return false;
+	}
+
+	XrVulkanDeviceCreateInfoKHR xr_ci = {};
+	xr_ci.type = XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR;
+	xr_ci.systemId = g_system_id;
+	xr_ci.pfnGetInstanceProcAddr = &vkGetInstanceProcAddr;
+	xr_ci.vulkanPhysicalDevice = g_vk_phys_device;
+	xr_ci.vulkanCreateInfo = &dci;
+	xr_ci.vulkanAllocator = nullptr;
+
+	VkResult vk_result = VK_SUCCESS;
+	res = xr_create_vk_device(g_instance, &xr_ci, &g_vk_device, &vk_result);
+	log_xr_result("xrCreateVulkanDeviceKHR", res);
+	if (res != XR_SUCCESS || vk_result != VK_SUCCESS) {
+		LOGE("xrCreateVulkanDeviceKHR vk_result=%d", (int)vk_result);
+		return false;
+	}
+
+	vkGetDeviceQueue(g_vk_device, g_vk_queue_family, 0, &g_vk_queue);
+	LOGI("Vulkan device ready: queue_family=%u queue=%p", g_vk_queue_family, g_vk_queue);
+	return true;
+}
+
+bool
+create_session()
+{
+	// XR_KHR_vulkan_enable2 reuses XrGraphicsBindingVulkanKHR — there's
+	// no `2` suffix on the binding struct, only on the create/get fns.
+	XrGraphicsBindingVulkanKHR binding = {};
+	binding.type = XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR;
+	binding.instance = g_vk_instance;
+	binding.physicalDevice = g_vk_phys_device;
+	binding.device = g_vk_device;
+	binding.queueFamilyIndex = g_vk_queue_family;
+	binding.queueIndex = 0;
+
+	XrSessionCreateInfo ci = {};
+	ci.type = XR_TYPE_SESSION_CREATE_INFO;
+	ci.next = &binding;
+	ci.systemId = g_system_id;
+
+	XrResult res = xrCreateSession(g_instance, &ci, &g_session);
+	log_xr_result("xrCreateSession", res);
+	return res == XR_SUCCESS;
+}
+
+void
+destroy_session()
+{
+	if (g_session != XR_NULL_HANDLE) {
+		XrResult res = xrDestroySession(g_session);
+		log_xr_result("xrDestroySession", res);
+		g_session = XR_NULL_HANDLE;
+	}
+}
+
+void
+destroy_vulkan()
+{
+	if (g_vk_device != VK_NULL_HANDLE) {
+		// Drain the queue before tearing down — same defensive idiom as
+		// the runtime's DP destroy path (B6 audit fix).
+		vkDeviceWaitIdle(g_vk_device);
+		vkDestroyDevice(g_vk_device, nullptr);
+		g_vk_device = VK_NULL_HANDLE;
+		g_vk_queue = VK_NULL_HANDLE;
+		g_vk_queue_family = UINT32_MAX;
+	}
+	if (g_vk_instance != VK_NULL_HANDLE) {
+		vkDestroyInstance(g_vk_instance, nullptr);
+		g_vk_instance = VK_NULL_HANDLE;
+	}
+	g_vk_phys_device = VK_NULL_HANDLE;
 }
 
 void
 destroy_instance()
 {
+	// Tear down in reverse-creation order: session → Vulkan → instance.
+	// Doing it any other way invalidates handles still referenced by the
+	// runtime / loader.
+	destroy_session();
+	destroy_vulkan();
 	if (g_instance != XR_NULL_HANDLE) {
 		XrResult res = xrDestroyInstance(g_instance);
 		log_xr_result("xrDestroyInstance", res);
@@ -234,8 +456,17 @@ handle_cmd(struct android_app *app, int32_t cmd)
 		// some runtimes inspect the Activity surface state during create.
 		// Idempotent — guarded by g_instance.
 		if (g_instance == XR_NULL_HANDLE) {
-			if (create_instance(app)) {
-				query_system_and_graphics_reqs();
+			// Chain the bring-up steps — bail at the first failure
+			// because each step depends on the previous one's outputs.
+			if (create_instance(app) &&
+			    query_system_and_graphics_reqs() &&
+			    create_vulkan_instance() &&
+			    pick_physical_device() &&
+			    create_vulkan_device() &&
+			    create_session()) {
+				LOGI("Bring-up chain complete; XrSession created.");
+			} else {
+				LOGW("Bring-up chain failed; see logs above.");
 			}
 		}
 		break;

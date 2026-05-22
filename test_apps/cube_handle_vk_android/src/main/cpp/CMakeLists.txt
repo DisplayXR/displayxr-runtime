@@ -33,5 +33,6 @@ set_target_properties(cube_handle_vk_android PROPERTIES
 target_link_libraries(cube_handle_vk_android
     native_app_glue
     OpenXR::openxr_loader
+    vulkan
     android
     log)
