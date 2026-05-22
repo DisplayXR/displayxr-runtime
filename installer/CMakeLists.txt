@@ -80,53 +80,15 @@ if(TARGET drv_sim_display_plugin)
 	add_dependencies(installer drv_sim_display_plugin)
 endif()
 
-# ---------------------------------------------------------------------
-# Leia SR plug-in installer (separate product per plan §4.6).
+# Vendor plug-in installers (Leia SR, etc.) ship from their own repos
+# per ADR-019 / issues #256 & #263 — see
+# DisplayXR/displayxr-leia-plugin for the Leia plug-in's installer
+# (DisplayXRLeiaSRSetup-*.exe). The runtime installer hard-requires
+# the runtime registry key, then each vendor's installer self-registers
+# at HKLM\Software\DisplayXR\DisplayProcessors\<id> for the runtime's
+# registry-driven discovery to pick up. The runtime uninstaller
+# cascade-cleans any registered vendor plug-in via its UninstallString.
 #
-# Independent NSIS .exe that ships DisplayXR-LeiaSR.dll +
-# SimulatedRealityVulkanBeta.dll fallback. Prereq-checks the runtime
-# via HKLM\Software\DisplayXR\Runtime\InstallPath and registers itself
-# at HKLM\Software\DisplayXR\DisplayProcessors\leia-sr with
-# ProbeOrder=50.
-#
-# Gated on XRT_HAVE_LEIA_SR so a runtime build without the SR SDK
-# doesn't try to bundle a non-existent plug-in DLL.
-# ---------------------------------------------------------------------
-if(XRT_HAVE_LEIA_SR AND TARGET drv_leia_plugin)
-	# Path to the bundled SR Vulkan Beta DLL (test_apps/common/ has the
-	# canonical copy used by both the in-proc fallback and now the
-	# plug-in installer). Pass as a /D define to NSIS, with backslashes
-	# — NSIS's `File` command parses forward-slash paths inconsistently
-	# when the path contains spaces (the runtime installer's BIN_DIR
-	# avoids this only because the resolved File arg ends in
-	# `${BIN_DIR}\file.dll`, where the trailing backslash terminates
-	# the spaces-laden prefix).
-	set(SR_VK_BETA_DLL "${CMAKE_SOURCE_DIR}/test_apps/common/SimulatedRealityVulkanBeta.dll")
-	file(TO_NATIVE_PATH "${SR_VK_BETA_DLL}" SR_VK_BETA_DLL)
-
-	add_custom_target(installer-leia
-		COMMAND "${NSIS_EXECUTABLE}"
-			"/DVERSION=${DISPLAYXR_VERSION}"
-			"/DVERSION_MAJOR=${DISPLAYXR_VERSION_MAJOR}"
-			"/DVERSION_MINOR=${DISPLAYXR_VERSION_MINOR}"
-			"/DVERSION_PATCH=${DISPLAYXR_VERSION_PATCH}"
-			"/DBUILD_NUM=${BUILD_NUM}"
-			"/DBIN_DIR=${DISPLAYXR_BIN_DIR}"
-			"/DSR_VK_BETA_DLL=${SR_VK_BETA_DLL}"
-			"/DSOURCE_DIR=${CMAKE_SOURCE_DIR}"
-			"/DOUTPUT_DIR=${CMAKE_INSTALL_PREFIX}"
-			"${CMAKE_CURRENT_SOURCE_DIR}/DisplayXRLeiaSRInstaller.nsi"
-		WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-		COMMENT "Building DisplayXR Leia SR plug-in installer..."
-		VERBATIM
-	)
-	add_dependencies(installer-leia drv_leia_plugin)
-
-	# Make the umbrella `installer` target build both installers.
-	# `scripts\build_windows.bat installer` invokes `installer`, so this
-	# picks up the Leia installer for free in dev + CI flows.
-	add_dependencies(installer installer-leia)
-endif()
 # Workspace controllers (the DisplayXR shell, third-party verticals, …)
 # ship as their own products with their own installers — the runtime
 # installer does not bundle them. The DisplayXR Shell ships from

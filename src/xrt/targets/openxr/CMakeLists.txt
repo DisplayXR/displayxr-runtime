@@ -44,14 +44,9 @@ if(WIN32)
 	# weaver functions, so the delay-loaded DLL is never triggered.
 	target_link_options(${RUNTIME_TARGET} PRIVATE "/DELAYLOAD:vulkan-1.dll")
 	target_link_libraries(${RUNTIME_TARGET} PRIVATE delayimp)
-	# SR Vulkan beta delay-load only matters when drv_leia is statically
-	# linked into the runtime DLL — i.e. when the in-proc fallback path
-	# is on (ADR-019 / issue #256). Production builds have no SR
-	# imports at all; the same DELAYLOAD pair lives in the LeiaSR
-	# plug-in DLL's link line instead.
-	if(XRT_HAVE_LEIA_SR AND XRT_PLUGIN_BUILD_INPROC_FALLBACK)
-		target_link_options(${RUNTIME_TARGET} PRIVATE "/DELAYLOAD:SimulatedRealityVulkanBeta.dll")
-	endif()
+	# Vendor-SDK delay-loads (SR Vulkan beta, etc.) live in the vendor
+	# plug-in DLL's link line — see DisplayXR/displayxr-leia-plugin.
+	# The runtime DLL holds zero vendor identifiers (ADR-019/#263).
 endif()
 
 # Note: Order may matter in these lists!

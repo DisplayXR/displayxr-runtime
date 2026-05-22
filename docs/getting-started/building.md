@@ -45,53 +45,56 @@ Requires: VS 2022 with C++ workload, Ninja
 ### Windows (manual cmake fallback)
 For advanced users who want fine-grained control:
 ```bat
-:: Set vendor SDK path (optional but recommended for real hardware)
-set LEIASR_SDKROOT=C:\path\to\LeiaSR-SDK
-
-:: Build
 mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Debug -G Ninja -DCMAKE_PREFIX_PATH=%LEIASR_SDKROOT%
+cmake .. -DCMAKE_BUILD_TYPE=Debug -G Ninja
 cmake --build .
 ```
 
-### Standard CMake Build (no vendor SDK)
+### Standard CMake Build
 ```bash
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Debug -G Ninja
 cmake --build .
 ```
-Builds the runtime with sim_display only — useful for local dev
-without hardware.
+Builds the runtime with sim_display as the in-tree vendor-neutral
+display processor. No vendor SDK is needed at build time.
 
-## Vendor SDK
+## Vendor displays (Leia SR, etc.)
 
-DisplayXR builds and runs without any vendor SDK — the **sim_display** driver simulates a tracked 3D display for development. To enable support for a specific display, obtain the SDK from the vendor and point CMake at it.
+The runtime DLL holds zero vendor identifiers in its link line
+(ADR-019, issues #256/#263). To run on real vendor hardware:
+
+1. Install the runtime via `DisplayXRSetup-*.exe`.
+2. Install the matching vendor plug-in installer.
 
 ### Leia SR Displays
 
-1. Get the Leia SR SDK from [Leia Inc](https://www.leiainc.com/) (requires a developer account)
-2. Set the environment variable before building:
-   ```bash
-   set LEIASR_SDKROOT=C:\path\to\LeiaSR-SDK
-   ```
-3. CMake will auto-detect the SDK via `find_package(simulatedreality)` and enable `XRT_HAVE_LEIA_SR`
+Install `DisplayXRLeiaSRSetup-*.exe` from
+[DisplayXR/displayxr-leia-plugin](https://github.com/DisplayXR/displayxr-leia-plugin/releases).
+The plug-in installer hard-requires the runtime (reads
+`HKLM\Software\DisplayXR\Runtime\InstallPath`) and registers itself at
+`HKLM\Software\DisplayXR\DisplayProcessors\leia-sr` so the runtime's
+registry-driven discovery loads it at `xrCreateInstance` time.
 
-The SDK provides display-specific weavers (D3D11, D3D12, Vulkan) and eye tracking via LookaroundFilter. See the [Vendor Integration Guide](../guides/vendor-integration.md) for details on integrating other display hardware.
+The plug-in repo also vends the SR SDK fetched at build time (headers +
+import stubs only) — no end-user steps to install the SR SDK separately
+for runtime use. The SR Platform installer remains a hard prereq for
+the SR Service that hosts eye tracking and weaver instances on the
+hardware side.
+
+### Other vendors
+
+See [vendor plug-in onboarding guide](../guides/vendor-plugin-onboarding.md)
+(post-#263) for the contract a new vendor's plug-in repo must satisfy:
+implement `xrt_plugin_iface`, install to `$RuntimeInstall\Plugins\<id>\`,
+register at `HKLM\Software\DisplayXR\DisplayProcessors\<id>`.
 
 ## Key CMake Options
 
 | Option | Description |
 |--------|-------------|
-| `XRT_HAVE_LEIA_SR` | LeiaSR SDK support (auto-enabled if SDK found) |
-| `XRT_HAVE_LEIA_SR_VULKAN` | Vulkan-specific Leia weaver |
-| `XRT_HAVE_LEIA_SR_D3D11` | D3D11-specific Leia weaver |
 | `XRT_FEATURE_SERVICE` | Out-of-process service mode (IPC) |
 | `BUILD_TESTING` | Build test suite |
-
-### CMake Variables
-
-- `LEIASR_SDKROOT` — Environment variable pointing to Leia SR SDK path
-- `SR_PATH` — Internal, auto-set from `LEIASR_SDKROOT`
 
 ## Local Dev Iteration
 

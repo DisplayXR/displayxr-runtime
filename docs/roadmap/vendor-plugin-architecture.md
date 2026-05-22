@@ -1,6 +1,11 @@
 # Vendor Plug-in Architecture
 
-**Status:** Proposed. No code yet.
+**Status:** Shipped. Issue #256 (in-tree plug-in shape) landed 2026-04;
+issue #263 (full extraction of `drv_leia` to its own repo) landed
+2026-05. See § 11 "Post-#263 state" at the bottom of this doc for the
+current shape. The narrative below is preserved as historical context
+for the design decisions.
+
 **Authors:** dfattal, claude
 **Target:** Restructure `drv_leia` (and `drv_sim_display`) into separately-built plug-in DLLs that `DisplayXRClient.dll` discovers at LoadLibrary time, so the runtime DLL has zero vendor-specific identifiers in its link line.
 
@@ -250,3 +255,14 @@ Recommended order. Each step lands as its own PR.
 ## 10. Decision log
 
 - 2026-05-20 — Plan drafted, no decisions yet.
+- 2026-04 — Issue #256 landed: in-tree plug-in DLLs (`DisplayXR-LeiaSR.dll` from `src/xrt/drivers/leia/`, `DisplayXR-SimDisplay.dll` from `src/xrt/drivers/sim_display/`), discovered at `xrCreateInstance` via registry / JSON manifest. Runtime DLL has zero vendor static imports per ADR-019 §2.1; CI assertion in `.github/workflows/build-windows.yml` enforces.
+- 2026-05-22 — Issue #263 landed: `drv_leia` extracted entirely to its own repo at [`DisplayXR/displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin). Runtime tree is now vendor-source-clean; `drv_sim_display` remains in-tree as the vendor-neutral fallback example.
+
+## 11. Post-#263 state
+
+The end state of this work:
+
+- **Runtime tree (`DisplayXR/displayxr-runtime`)** — zero vendor source, zero vendor SDK fetches in CI. Builds with sim_display as the in-tree plug-in. The `XRT_PLUGIN_BUILD_INPROC_FALLBACK` option is retained as a guard against accidental re-introduction of in-tree static-link paths; it defaults OFF and is expected to be removed in a follow-up.
+- **Leia plug-in (`DisplayXR/displayxr-leia-plugin`)** — owns `src/drv_leia/` (formerly `src/xrt/drivers/leia/`), its NSIS installer (`DisplayXRLeiaSRSetup-*.exe`), its CI (fetches SR SDK from this repo's `sr-sdk-v*` release), and the sr-sdk re-host from runtime's old release surface.
+- **Plug-in ABI contract** — `xrt/xrt_plugin.h`, `xrt/xrt_api.h`, `target_plugin_loader.{h,c}`, `sim_display_plugin.c` stay in the runtime tree as the consumed surface for vendor plug-ins (FetchContent-pinned).
+- **Onboarding** — new vendors fork the Leia plug-in repo as a template (or follow [`docs/guides/vendor-plugin-onboarding.md`](../guides/vendor-plugin-onboarding.md) for the contract). The runtime owns no vendor-specific code paths.

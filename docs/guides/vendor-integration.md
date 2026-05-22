@@ -1,14 +1,26 @@
 # Vendor Integration Guide: Adding a 3D Display to the OpenXR Runtime
 
+> **Legacy in-tree integration model.** Since issues #256 / #263 (ADR-019),
+> new vendor integrations ship as plug-in DLLs from their own repos and
+> never modify this tree. See [`vendor-plugin-onboarding.md`](vendor-plugin-onboarding.md)
+> for the post-#263 contract. This document is retained for vendors who
+> fork the runtime, for historical context on how the in-tree
+> `src/xrt/drivers/leia/` (now extracted to
+> [DisplayXR/displayxr-leia-plugin](https://github.com/DisplayXR/displayxr-leia-plugin))
+> was wired, and for the vendor-neutral `sim_display` reference still
+> shipped in-tree.
+
 This guide tells a new 3D display vendor exactly what to implement to connect
 their hardware to this OpenXR runtime.  It covers every integration point:
 device description, eye tracking, display processing (weaving/interlacing),
 OpenXR extensions, and build system registration.
 
 **Reference implementations** are cited throughout:
-- **Leia** (`src/xrt/drivers/leia/`) — full hardware integration with SR SDK
-- **sim_display** (`src/xrt/drivers/sim_display/`) — minimal software-only
-  simulation (SBS, anaglyph, blend) that runs on any GPU
+- **Leia** (`DisplayXR/displayxr-leia-plugin`, `src/drv_leia/`) — full
+  hardware integration with SR SDK; canonical post-#263 example.
+- **sim_display** (`src/xrt/drivers/sim_display/`) — vendor-neutral
+  software-only simulation (SBS, anaglyph, blend) that runs on any GPU,
+  kept in-tree as the runtime's fallback display processor.
 
 ---
 

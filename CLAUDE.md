@@ -89,7 +89,7 @@ scripts\build_windows.bat installer  REM Runtime installer only
 scripts\build_windows.bat test-apps  REM Test apps only (uses existing runtime build)
 scripts\build_windows.bat generate   REM CMake generate only
 ```
-Downloads all dependencies on first run (SR SDK, vcpkg, OpenXR loader). Requires VS 2022 with C++ workload, Ninja, Vulkan SDK, and GitHub CLI. Outputs to `_package/` (runtime) and `test_apps/*/build/` (test apps).
+Downloads all dependencies on first run (vcpkg, OpenXR loader). Requires VS 2022 with C++ workload, Ninja, Vulkan SDK, and GitHub CLI. Outputs to `_package/` (runtime) and `test_apps/*/build/` (test apps). Leia SR support comes from a separate installer — see "Vendor Plug-in Integration" below.
 
 **The DisplayXR Shell ships from a separate repo
 ([displayxr-shell-pvt](https://github.com/DisplayXR/displayxr-shell-pvt))**
@@ -148,8 +148,9 @@ cmake .. -DCMAKE_BUILD_TYPE=Debug -G Ninja
 cmake --build .
 ```
 
-### With LeiaSR SDK Support
-Set `LEIASR_SDKROOT` environment variable. Found via `find_package(simulatedreality CONFIG)` and `find_package(srDirectX CONFIG)`.
+### Leia SR support
+
+Leia SR is no longer built in-tree (ADR-019, issues #256 & #263). To run on Leia hardware, install the runtime then install `DisplayXRLeiaSRSetup-*.exe` from [`DisplayXR/displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin/releases). The plug-in self-registers at `HKLM\Software\DisplayXR\DisplayProcessors\leia-sr` and the runtime's registry-driven discovery picks it up at `xrCreateInstance`.
 
 ### Running Tests
 ```bash
@@ -181,6 +182,7 @@ The skill's auto-bump regex is intentionally strict (`^v[0-9]+\.[0-9]+\.[0-9]+$`
 | Component | Repo | How it releases |
 |---|---|---|
 | Shell | `displayxr-shell-pvt` → `displayxr-shell-releases` | The shell repo's own publish pipeline on its own tag cadence. Authenticated via the `displayxr-publish-bot` GitHub App (org secrets `DISPLAYXR_APP_ID` + `DISPLAYXR_APP_PRIVATE_KEY`; local `.pem` backup at `.secrets/displayxr-publish-bot.pem`, see `.secrets/NOTE.md` for rotation). |
+| Leia SR plug-in | `displayxr-leia-plugin` | The plug-in repo's own CI on its own tag cadence. Publishes `DisplayXRLeiaSRSetup-*.exe` (hard prereq: runtime installed). |
 | Extension headers | `displayxr-extensions` | Auto-syncs from `src/external/openxr_includes/` on every push to main via `publish-extensions.yml`. No tag needed. |
 | Standalone demos | e.g. `displayxr-demo-gaussiansplat` | Each demo's own repo. Manual flow: bump installer's `build-installer.bat` version → tag `vX.Y.Z` → run `installer\build-installer.bat` → `gh release create` with the installer asset attached. |
 
@@ -192,6 +194,7 @@ The skill's auto-bump regex is intentionally strict (`^v[0-9]+\.[0-9]+\.[0-9]+$`
 | `DisplayXR/displayxr-runtime-legacy-mirror` | Public (archived) | Pre-deprivatize snapshot history; read-only. Old links auto-redirect from this repo. |
 | `DisplayXR/displayxr-shell-pvt` | **Private** (dev) | DisplayXR Shell source, dev issues, CI |
 | `DisplayXR/displayxr-shell-releases` | Public | DisplayXR Shell installer releases (auto-published from `displayxr-shell-pvt` on tags), user-facing bug reports |
+| `DisplayXR/displayxr-leia-plugin` | **Public** | Leia SR display-processor plug-in source + `DisplayXRLeiaSRSetup-*.exe` releases. Extracted from this repo per issue #263 (ADR-019). |
 | `DisplayXR/displayxr-extensions` | Public | OpenXR extension headers, auto-synced from this repo's `src/external/openxr_includes/` (consumed by shell-pvt + 3rd-party workspace apps) |
 | `DisplayXR/displayxr-demo-<name>` | Public | Standalone demo repos with independent evolution. Currently `displayxr-demo-gaussiansplat`. No source-mirror from this repo. |
 
@@ -220,7 +223,7 @@ Shell source moved to `displayxr-shell-pvt` in 2026-05 (Phase 2.J Step 1). The r
 - **include/xrt/** — Core interface headers (`xrt_device.h`, `xrt_compositor.h`, `xrt_instance.h`, etc.)
 - **auxiliary/** — Shared utilities: math (`m_*`), utilities (`u_*`), OS abstraction (`os_*`), Vulkan helpers (`vk_*`)
 - **compositor/** — Native compositors (D3D11, D3D12, Metal, GL, Vulkan, multi, client, null). See `docs/architecture/project-structure.md`.
-- **drivers/** — `leia/` (LeiaSR SDK), `sim_display/` (simulation), `qwerty/` (keyboard/mouse controllers)
+- **drivers/** — `sim_display/` (vendor-neutral simulation + plug-in), `qwerty/` (keyboard/mouse controllers). Vendor plug-ins (Leia SR etc.) ship from their own repos per ADR-019/#263.
 - **state_trackers/oxr/** — OpenXR API implementation
 - **ipc/** — Inter-process communication for service mode
 - **targets/** — Build targets (runtime library, displayxr-cli, displayxr-service, displayxr-shell)
@@ -234,30 +237,26 @@ C interfaces with vtable-style polymorphism:
 
 For the full interface catalog including display processor vtables (5 API variants), see `docs/guides/vendor-integration.md`.
 
-### LeiaSR SDK Integration
+### Vendor Plug-in Integration
 
-Vendor display drivers now ship as **plug-in DLLs** (ADR-019 / issue
-#256). `DisplayXR-LeiaSR.dll` (built from `drivers/leia/` + the
-`xrtPluginNegotiate` entry point in `leia_plugin.c`) loads at
-`xrCreateInstance` time via the registry-driven discovery on Windows
-(or the JSON-manifest discovery on POSIX, as of issue #267 — macOS
-also enforces vendor separation now via `DisplayXR-SimDisplay.dylib`)
-in `target_plugin_loader.c`. The runtime DLL itself has zero SR or
+Vendor display drivers ship as **plug-in DLLs** from their own repos
+(ADR-019 / issues #256 & #263). `DisplayXR-LeiaSR.dll`, built from
+[`DisplayXR/displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin)'s
+`src/drv_leia/` with its `xrtPluginNegotiate` entry point, loads at
+`xrCreateInstance` time via registry-driven discovery on Windows (or
+JSON-manifest discovery on POSIX, as of #267 — macOS enforces vendor
+separation via `DisplayXR-SimDisplay.dylib`) in
+`target_plugin_loader.c`. The runtime DLL itself has zero SR or
 `sim_display_*` identifiers in its link line — see ADR-019 §2.1 and
 the CI assertion in `.github/workflows/build-windows.yml`.
 
-- `XRT_HAVE_LEIA_SR` CMake option (auto-enabled if SDK found) now
-  drives the plug-in DLL build, not a static link of `drv_leia` into
-  the runtime.
-- `XRT_PLUGIN_BUILD_INPROC_FALLBACK` (default OFF) re-enables the
-  legacy static-link path for developer debugging.
-- D3D11 weaver: `drivers/leia/leia_sr_d3d11.cpp` (now inside the
-  plug-in DLL, called via `iface->create_dp_d3d11`).
-- Eye tracking via SR SDK's LookaroundFilter (inside the plug-in DLL).
+- Eye tracking via the vendor SDK (inside the plug-in DLL).
 - Display dimensions via `iface->get_display_info` →
-  `xrt_plugin_display_info` (no direct runtime → `leiasr_*` call).
+  `xrt_plugin_display_info` (no direct runtime → vendor call).
 - Plug-in discovery / registration contract:
   `docs/specs/runtime/plugin-discovery.md`.
+- Vendor onboarding contract:
+  `docs/guides/vendor-plugin-onboarding.md` (post-#263).
 
 ### Native Compositors
 Each bypasses Vulkan entirely for its graphics API:
@@ -303,24 +302,18 @@ _package\run_cube_handle_d3d11_win.bat   :: sets XR_RUNTIME_JSON to dev manifest
 Full reference: [`docs/getting-started/building.md` § Local Dev Iteration](docs/getting-started/building.md#local-dev-iteration).
 
 ### Key CMake Options
-- `XRT_HAVE_LEIA_SR` — LeiaSR SDK support (drives the Leia plug-in
-  DLL build; the runtime DLL no longer static-links drv_leia)
-- `XRT_HAVE_LEIA_SR_VULKAN` / `XRT_HAVE_LEIA_SR_D3D11` — API-specific weavers
-- `XRT_PLUGIN_BUILD_INPROC_FALLBACK` (default OFF) — developer flag
-  that also static-links `drv_leia` and `drv_sim_display` into the
-  runtime DLL for in-proc debugging. Production builds leave this off
-  and route everything through the plug-in DLL/dylib (`DisplayXR-LeiaSR`,
-  `DisplayXR-SimDisplay`) discovered at `xrCreateInstance` time.
+- `XRT_PLUGIN_BUILD_INPROC_FALLBACK` (default OFF) — reserved guard
+  against accidental re-introduction of in-tree vendor static-link
+  paths. Production builds leave this off; vendor code lives entirely
+  in plug-in DLLs (`DisplayXR-LeiaSR.dll` from `displayxr-leia-plugin`,
+  `DisplayXR-SimDisplay.dll` in-tree) discovered at `xrCreateInstance`.
 - `XRT_FEATURE_SERVICE` — Out-of-process service mode
 - `BUILD_TESTING` — Test suite
 
-### CMake Variable Notes
-- `LEIASR_SDKROOT` — Required env var for LeiaSR SDK path
-- `SR_PATH` — Internal, auto-set from `LEIASR_SDKROOT`
-
 ### GitHub Actions Build
 **Windows** (`.github/workflows/build-windows.yml`):
-- `LEIASR_SDKROOT` + `CMAKE_PREFIX_PATH` both needed
+- Builds without any vendor SDK (ADR-019/#263). Leia plug-in CI
+  lives in `DisplayXR/displayxr-leia-plugin`.
 - Artifact: `DisplayXR`
 
 **macOS** (`.github/workflows/build-macos.yml`):

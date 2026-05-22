@@ -24,16 +24,11 @@
 #define T_BUILDER_QWERTY
 #endif
 
-/*
- * The Leia builder only exists when both XRT_HAVE_LEIA_SR is on AND
- * the in-proc fallback path is enabled — production builds get the
- * Leia code path through the plug-in DLL via the sim_display builder's
- * iface-aware fallback, so target_builder_leia.c isn't compiled and
- * t_builder_leia_create isn't defined. Per ADR-019 / issue #256.
- */
-#if (defined(XRT_HAVE_LEIA_SR) && defined(XRT_PLUGIN_BUILD_INPROC_FALLBACK)) || defined(XRT_DOXYGEN)
-#define T_BUILDER_LEIA
-#endif
+// Vendor builders (Leia SR, etc.) are no longer compiled into the
+// runtime DLL. The Leia plug-in (DisplayXR-LeiaSR.dll, shipped from
+// DisplayXR/displayxr-leia-plugin) is loaded by target_plugin_loader.c
+// at xrCreateInstance time and resolved through the sim_display
+// builder's iface-aware fallback. See ADR-019 / issues #256 & #263.
 
 // Always enabled as fallback — use FORCE_SIM_DISPLAY=1 to override vendor drivers
 #define T_BUILDER_SIM_DISPLAY
@@ -59,14 +54,6 @@ t_builder_legacy_create(void);
  */
 struct xrt_builder *
 t_builder_qwerty_create(void);
-#endif
-
-#ifdef T_BUILDER_LEIA
-/*!
- * Builder for Leia 3D light field displays (SR SDK / CNSDK).
- */
-struct xrt_builder *
-t_builder_leia_create(void);
 #endif
 
 #ifdef T_BUILDER_SIM_DISPLAY

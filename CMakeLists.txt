@@ -168,19 +168,8 @@ if(WIN32 AND NOT MINGW)
 	set(WINDOWSAPP_LIBRARY WindowsApp)
 endif()
 
-if(WIN32)
-	set(LEIASR_SDKROOT "$ENV{LEIASR_SDKROOT}" CACHE PATH "Path to LEIASR SDK root")
-	list(APPEND CMAKE_PREFIX_PATH "${LEIASR_SDKROOT}/lib/cmake")
-endif()
-
 if(ANDROID)
     find_package(CNSDK CONFIG)
-endif()
-find_package(simulatedreality CONFIG GLOBAL)
-find_package(srDirectX CONFIG GLOBAL)
-
-if(simulatedreality_FOUND AND NOT TARGET simulatedreality::simulatedreality)
-	add_library(simulatedreality::simulatedreality ALIAS simulatedreality)
 endif()
 
 #https://github.com/arsenm/sanitizers-cmake
@@ -212,16 +201,19 @@ option_with_deps(CMAKE_INTERPROCEDURAL_OPTIMIZATION "Enable inter-procedural (li
 option(XRT_HAVE_TRACY "Enable Tracy support for tracing, make sure to set XRT_FEATURE_TRACING as well." OFF)
 
 option_with_deps(XRT_HAVE_CNSDK "Enable CNSDK support (Android)" DEPENDS CNSDK_FOUND)
-option_with_deps(XRT_HAVE_LEIA_SR "Enable Leia SR support" DEPENDS simulatedreality_FOUND srDirectX_FOUND)
 
-# Vendor plug-in architecture (ADR-019, issue #256) — when ON, the
-# runtime DLL also statically links drv_leia + target_builder_leia for
-# developer debugging without the plug-in DLL. Default OFF: the runtime
-# DLL holds zero vendor identifiers in its link line; vendor code lives
-# entirely in the plug-in DLLs loaded via the registry-driven discovery
-# at xrCreateInstance.
+# Vendor source isolation (ADR-019, issue #256/#263) — the runtime DLL
+# holds zero vendor identifiers in its link line. Vendor drv_*
+# implementations (Leia SR etc.) ship from separate repos as plug-in
+# DLLs loaded via registry-driven discovery at xrCreateInstance. See
+# DisplayXR/displayxr-leia-plugin and the post-#263 onboarding guide at
+# docs/guides/vendor-plugin-onboarding.md.
+#
+# This option is retained as a build-time guard against accidental
+# re-introduction of in-tree vendor static-link paths; defaults OFF and
+# is expected to be removed entirely in a follow-up.
 option(XRT_PLUGIN_BUILD_INPROC_FALLBACK
-       "Also build the in-proc static drv_leia fallback for the runtime DLL (developer-only)" OFF)
+       "(Deprecated) Reserved for any future in-proc fallback build of vendor drivers" OFF)
 
 # Graphics deps to use (sorted in each group, groups thematic and ordered to handle internal deps: e.g. EGL and SDL2 need OpenGL/GLES)
 option_with_deps(XRT_HAVE_OPENGL "Enable OpenGL Graphics API support" DEPENDS OPENGL_WITHOUT_GLX_FOUND)
@@ -486,7 +478,6 @@ message(STATUS "#####----- Config -----#####")
 message(STATUS "#    GIT_DESC:        ${GIT_DESC}")
 message(STATUS "#")
 message(STATUS "#    CNSDK:           ${XRT_HAVE_CNSDK}")
-message(STATUS "#    Leia SR:         ${XRT_HAVE_LEIA_SR}")
 message(STATUS "#    Metal:           ${XRT_HAVE_METAL}")
 message(STATUS "#    D3D11:           ${XRT_HAVE_D3D11}")
 message(STATUS "#    D3D12:           ${XRT_HAVE_D3D12}")
@@ -563,7 +554,6 @@ message(STATUS "#    FEATURE_TRACING:                               ${XRT_FEATUR
 message(STATUS "#    FEATURE_WINDOW_PEEK:                           ${XRT_FEATURE_WINDOW_PEEK}")
 message(STATUS "#")
 message(STATUS "#    DRIVER_QWERTY:               ${XRT_BUILD_DRIVER_QWERTY}")
-message(STATUS "#    DRIVER_LEIA_SR:              ${XRT_HAVE_LEIA_SR}")
 message(STATUS "#####----- Config -----#####")
 # cmake-format: on
 
