@@ -321,11 +321,14 @@ leia_cnsdk_ensure_interlacer(struct leia_cnsdk *cnsdk,
 	}
 
 	struct leia_interlacer_init_configuration *ic = leia_interlacer_init_configuration_alloc();
-	leia_interlacer_init_configuration_set_use_atlas_for_views(ic, false);
-	// Views format MUST match what the DP creates per-view images as
-	// (leia_display_processor_cnsdk.cpp::kPerViewFormat) — see audit B2.
-	// Both stay UNORM so CNSDK samples the atlas linearly and doesn't
-	// double-correct gamma on read.
+	// Atlas mode: CNSDK accepts the SBS atlas VkImage+View directly per
+	// frame via set_interlace_view_texture_atlas, and splits internally.
+	// No per-view image management on our side; the DP shrinks
+	// substantially. See feature/android-cnsdk-ci for the prior art
+	// (CNSDK 0.10.56 used a different API but same architectural idea).
+	leia_interlacer_init_configuration_set_use_atlas_for_views(ic, true);
+	// Views format = atlas format. Atlas is rendered to UNORM by
+	// comp_vk_native_renderer.c, so use UNORM here (audit B2).
 	cnsdk->interlacer = leia_interlacer_vulkan_initialize(
 	    cnsdk->core, ic, device, physDev, VK_FORMAT_B8G8R8A8_UNORM,
 	    targetFmt, VK_FORMAT_D32_SFLOAT, 3);
@@ -336,6 +339,11 @@ leia_cnsdk_ensure_interlacer(struct leia_cnsdk *cnsdk,
 		cnsdk->interlacer_init_failed = true;
 		return false;
 	}
+
+	// Tell CNSDK the atlas is laid out 2x1 SBS horizontal. This is the
+	// default but we set it explicitly so future layout changes
+	// (multi-view modes) only have to touch one place.
+	leia_interlacer_set_num_tiles(cnsdk->interlacer, 2, 1);
 	return true;
 }
 
@@ -373,40 +381,36 @@ extern "C" void
 leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
                  VkDevice device,
                  VkPhysicalDevice physDev,
-                 VkImageView left,
-                 VkImageView right,
+                 VkImage atlas_image,
+                 VkImageView atlas_view,
+                 uint32_t atlas_width,
+                 uint32_t atlas_height,
                  VkFormat targetFmt,
                  uint32_t w,
                  uint32_t h,
                  VkFramebuffer fb,
-                 VkImage targetImage,
-                 VkSemaphore waitSemaphore)
+                 VkImage targetImage)
 {
-	if (cnsdk == NULL) {
-		return;
-	}
+	(void)device; (void)physDev; (void)targetFmt;
 
-	// Lazy interlacer creation — wait until the core is ready.
-	if (cnsdk->interlacer == NULL && leia_core_is_initialized(cnsdk->core)) {
-		struct leia_interlacer_init_configuration *ic = leia_interlacer_init_configuration_alloc();
-		leia_interlacer_init_configuration_set_use_atlas_for_views(ic, false);
-		cnsdk->interlacer = leia_interlacer_vulkan_initialize(
-		    cnsdk->core, ic, device, physDev, VK_FORMAT_B8G8R8A8_SRGB,
-		    targetFmt, VK_FORMAT_D32_SFLOAT, 3);
-		leia_interlacer_init_configuration_free(ic);
-	}
-
-	if (cnsdk->interlacer == NULL) {
+	if (cnsdk == NULL || cnsdk->interlacer == NULL) {
 		return;
 	}
 
 	leia_interlacer_set_flip_input_uv_vertical(cnsdk->interlacer, true);
-	// CNSDK 0.7.28: set_view_for_texture_array dropped its trailing arg
-	// (was used to disambiguate per-array-layer; now layer is implicit).
-	leia_interlacer_vulkan_set_view_for_texture_array(cnsdk->interlacer, 0, left);
-	leia_interlacer_vulkan_set_view_for_texture_array(cnsdk->interlacer, 1, right);
+
+	// Atlas mode: hand CNSDK the SBS atlas VkImage+View each frame; it
+	// splits internally per the 2x1 layout set in ensure_interlacer.
+	// (Previously this function blitted tiles into per-view images and
+	// passed those — see git log for the per-tile-blit history.)
+	leia_interlacer_vulkan_set_interlace_view_texture_atlas(
+	    cnsdk->interlacer, atlas_image, atlas_view);
+	leia_interlacer_set_source_views_size(
+	    cnsdk->interlacer, (int32_t)atlas_width, (int32_t)atlas_height,
+	    /*isHorizontalViews=*/true);
+
 	leia_interlacer_set_shader_debug_mode(cnsdk->interlacer, LEIA_SHADER_DEBUG_MODE_NONE);
 	leia_interlacer_vulkan_do_post_process(
 	    cnsdk->interlacer, w, h, false, fb, targetImage, NULL,
-	    waitSemaphore, NULL, 0);
+	    NULL, NULL, 0);
 }

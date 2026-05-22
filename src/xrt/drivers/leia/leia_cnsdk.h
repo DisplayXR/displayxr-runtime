@@ -85,14 +85,11 @@ bool
 leia_cnsdk_ensure_face_tracking_started(struct leia_cnsdk *cnsdk);
 
 /*!
- * Idempotent: lazily create the CNSDK Vulkan interlacer once
- * @ref leia_core_is_initialized returns true. Safe to call every frame.
- *
- * The DP must call this before signaling its `blit_done` semaphore each
- * frame and only proceed with the blit submit if this returns true —
- * otherwise the semaphore would be signaled but never consumed by
- * @ref leia_cnsdk_weave (it returns early when the interlacer isn't
- * ready), causing a binary-semaphore double-signal on the next frame.
+ * Idempotent: lazily create the CNSDK Vulkan interlacer in atlas mode
+ * once @ref leia_core_is_initialized returns true. Safe to call every
+ * frame. Atlas mode means CNSDK accepts the SBS atlas VkImage+View
+ * directly via @ref leia_cnsdk_weave and does the L/R split internally;
+ * the DP doesn't have to manage per-view images or per-tile blits.
  *
  * @return true if the interlacer exists and is ready to weave.
  */
@@ -125,37 +122,46 @@ leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
                             float *out_z);
 
 /*!
- * Perform CNSDK Vulkan interlacing.
+ * Perform CNSDK Vulkan interlacing on an SBS atlas.
  *
- * Lazily creates the interlacer on first call after the core is ready.
+ * Atlas mode: pass the runtime's pre-composited SBS atlas image+view
+ * directly. CNSDK does the L/R split internally via
+ * @ref leia_interlacer_vulkan_set_interlace_view_texture_atlas. The DP
+ * does no per-view image management and no per-frame blits, so there's
+ * no GPU stall between us and CNSDK — its `do_post_process` records
+ * and submits its own cmd buffer when it's ready.
  *
- * @param cnsdk           Opaque CNSDK handle.
- * @param device          Vulkan logical device.
- * @param physDev         Vulkan physical device.
- * @param left            Image view for the left eye.
- * @param right           Image view for the right eye.
- * @param targetFmt       Format of the target / swapchain image.
- * @param w               Target width in pixels.
- * @param h               Target height in pixels.
- * @param fb              Target framebuffer.
- * @param targetImage     Target VkImage (for layout transitions).
- * @param waitSemaphore   Binary semaphore CNSDK should wait on before
- *                        sampling the input views (use to chain a prior
- *                        upload submit into the weave on the GPU side and
- *                        avoid a host stall). Pass VK_NULL_HANDLE to skip.
+ * Caller must have first invoked @ref leia_cnsdk_ensure_interlacer; if
+ * the interlacer isn't ready yet this function is a no-op (no submit,
+ * no GPU side effects), making it safe to call every frame during the
+ * async core-init window.
+ *
+ * @param cnsdk         Opaque CNSDK handle.
+ * @param device        Vulkan logical device.
+ * @param physDev       Vulkan physical device.
+ * @param atlas_image   SBS atlas VkImage.
+ * @param atlas_view    Matching VkImageView covering the full atlas.
+ * @param atlas_width   Atlas width in pixels (= view_w * tile_columns).
+ * @param atlas_height  Atlas height in pixels (= view_h * tile_rows).
+ * @param targetFmt     Format of the target / swapchain image.
+ * @param w             Target width in pixels.
+ * @param h             Target height in pixels.
+ * @param fb            Target framebuffer.
+ * @param targetImage   Target VkImage (for CNSDK-side layout transitions).
  */
 void
 leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
                  VkDevice device,
                  VkPhysicalDevice physDev,
-                 VkImageView left,
-                 VkImageView right,
+                 VkImage atlas_image,
+                 VkImageView atlas_view,
+                 uint32_t atlas_width,
+                 uint32_t atlas_height,
                  VkFormat targetFmt,
                  uint32_t w,
                  uint32_t h,
                  VkFramebuffer fb,
-                 VkImage targetImage,
-                 VkSemaphore waitSemaphore);
+                 VkImage targetImage);
 
 #ifdef __cplusplus
 }
