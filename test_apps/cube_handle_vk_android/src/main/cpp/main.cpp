@@ -9,6 +9,7 @@
 // org.khronos.openxr.OpenXRRuntimeService intent.
 
 #include <android/log.h>
+#include <android/trace.h>
 #include <android_native_app_glue.h>
 
 #define XR_USE_PLATFORM_ANDROID
@@ -48,9 +49,20 @@
 			_logged = true;                                                                         \
 		}                                                                                           \
 	} while (0)
+
+// ATrace scope helper — same XRT_DEBUG_ANDROID_VERBOSE gating so
+// Perfetto / Studio Profiler captures show our timing blocks in
+// debug builds only. RAII so begin/end stay balanced even with
+// early returns.
+struct AtraceScope {
+	AtraceScope(const char *name) { ATrace_beginSection(name); }
+	~AtraceScope() { ATrace_endSection(); }
+};
+#define DXR_ATRACE(name)      AtraceScope _atrace_##__LINE__(name)
 #else
 #define DXR_HW_DBG(...)       ((void)0)
 #define DXR_HW_DBG_ONCE(...)  ((void)0)
+#define DXR_ATRACE(name)      ((void)0)
 #endif
 
 namespace {
@@ -1227,6 +1239,7 @@ record_clear(uint32_t view_idx, uint32_t image_idx)
 bool
 record_draw(uint32_t view_idx, uint32_t image_idx, const XrView &view)
 {
+	DXR_ATRACE("dxr_app:record_draw");
 	VkCommandBufferAllocateInfo ai = {};
 	ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
 	ai.commandPool = g_app_cmd_pool;
@@ -1379,11 +1392,16 @@ poll_xr_events()
 bool
 render_frame()
 {
+	DXR_ATRACE("dxr_app:render_frame");
 	XrFrameWaitInfo wait_info = {};
 	wait_info.type = XR_TYPE_FRAME_WAIT_INFO;
 	XrFrameState frame_state = {};
 	frame_state.type = XR_TYPE_FRAME_STATE;
-	XrResult res = xrWaitFrame(g_session, &wait_info, &frame_state);
+	XrResult res;
+	{
+		DXR_ATRACE("dxr_app:xrWaitFrame");
+		res = xrWaitFrame(g_session, &wait_info, &frame_state);
+	}
 	if (res != XR_SUCCESS) {
 		log_xr_result("xrWaitFrame", res);
 		return false;
@@ -1496,7 +1514,10 @@ render_frame()
 	end_info.layerCount = rendered ? 1 : 0;
 	end_info.layers = rendered ? layers : nullptr;
 
-	res = xrEndFrame(g_session, &end_info);
+	{
+		DXR_ATRACE("dxr_app:xrEndFrame");
+		res = xrEndFrame(g_session, &end_info);
+	}
 	if (res != XR_SUCCESS) {
 		log_xr_result("xrEndFrame", res);
 		return false;
