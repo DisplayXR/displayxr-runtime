@@ -158,8 +158,14 @@ t_instance_create_system(struct xrt_instance *xinst,
 		// build — production builds get the SR refresh rate through the
 		// plug-in iface (TODO: add to xrt_plugin_display_info if it
 		// becomes load-bearing for the null compositor path).
-		if (strstr(head->str, "Sim 3D Display") == NULL)
-		{
+		//
+		// Gate on the cached EDID probe rather than on a device-name
+		// substring: leia_edid_get_cached_result() reports hw_found=true
+		// only when a known Leia/Dimenco panel is connected, so the slow
+		// 5s leiasr_query_* call is skipped cleanly on sim_display and
+		// any non-Leia HMD without depending on driver-name strings.
+		struct leia_display_probe_result probe = {0};
+		if (leia_edid_get_cached_result(&probe) && probe.hw_found) {
 			uint32_t sr_rec_width = 0, sr_rec_height = 0;
 			uint32_t sr_native_width = 0, sr_native_height = 0;
 			if (leiasr_query_recommended_view_dimensions(5.0, &sr_rec_width, &sr_rec_height,
@@ -331,7 +337,14 @@ out:
 		// debugging without the plug-in DLL). Production runtime uses
 		// the iface-populated values above and never touches these
 		// vendor symbols.
-		if (!plugin_filled_display_info && strstr(head->str, "Sim 3D Display") == NULL)
+		//
+		// Gate on the cached EDID probe (non-blocking) rather than on a
+		// device-name substring: hw_found is true iff a known
+		// Leia/Dimenco panel is connected, so non-Leia setups skip the
+		// whole block cleanly without depending on driver-name strings.
+		struct leia_display_probe_result probe_edid = {0};
+		if (!plugin_filled_display_info &&
+		    leia_edid_get_cached_result(&probe_edid) && probe_edid.hw_found)
 		{
 			uint32_t di_sr_w = 0, di_sr_h = 0, di_nat_w = 0, di_nat_h = 0;
 			float di_refresh = 0.0f;
@@ -357,13 +370,11 @@ out:
 				xsysc->info.supported_eye_tracking_modes = 1; /* MANAGED_BIT */
 				xsysc->info.default_eye_tracking_mode = 0;    /* MANAGED */
 			}
-			{
-				struct leia_display_probe_result edid;
-				if (leia_edid_get_cached_result(&edid) && edid.hw_found) {
-					xsysc->info.display_screen_left = edid.screen_left;
-					xsysc->info.display_screen_top = edid.screen_top;
-				}
-			}
+
+			// Reuse the gating probe — hw_found guarantees screen
+			// coords are valid.
+			xsysc->info.display_screen_left = probe_edid.screen_left;
+			xsysc->info.display_screen_top = probe_edid.screen_top;
 
 			if (xsysc->info.display_pixel_width > 0 && xsysc->info.display_pixel_height > 0) {
 				for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
