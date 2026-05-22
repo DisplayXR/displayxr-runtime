@@ -402,7 +402,8 @@ See `docs/README.md` for a complete index. Key docs by task:
 |---|---|
 | Understand layer boundaries (what goes where) | `docs/architecture/separation-of-concerns.md` |
 | Build a workspace app (shell-style controller) | `docs/specs/runtime/workspace-controller-registration.md` |
-| Add a new display vendor | `docs/guides/vendor-integration.md` § 1.2 ("Plug-in distribution model") then `docs/specs/runtime/plugin-discovery.md` |
+| Add a new display vendor | `docs/guides/vendor-plugin-onboarding.md` (post-#263 model — fork the Leia plug-in repo) then `docs/reference/xrt_plugin_iface.md` + `docs/specs/runtime/plugin-discovery.md` |
+| Understand the `xrt_plugin_iface` callbacks | `docs/reference/xrt_plugin_iface.md` |
 | Understand multiview tiling / atlas layout | `docs/specs/runtime/multiview-tiling.md` |
 | Understand extension API (display_info, window bindings) | `docs/specs/extensions/XR_EXT_display_info.md` |
 | Know why an architectural decision was made | `docs/adr/` (16 ADRs) |

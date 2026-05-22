@@ -59,14 +59,18 @@ Contribute to the DisplayXR runtime — compositors, state tracker, auxiliary co
 
 Integrate your 3D display hardware into DisplayXR.
 
-- **[Vendor Integration Guide](guides/vendor-integration.md)** — comprehensive walkthrough
-- **[Writing a Driver](guides/writing-driver.md)** — driver framework basics
+- **[Vendor Plug-in Onboarding](guides/vendor-plugin-onboarding.md)** — zero-to-shipping guide for a new vendor's external plug-in repo (post-#263 model)
+- **[`xrt_plugin_iface` reference](reference/xrt_plugin_iface.md)** — per-method contract for the plug-in vtable
+- **[Plug-in discovery spec](specs/runtime/plugin-discovery.md)** — registry / JSON manifest formats, env-var overrides
+- **[ADR-019: Vendor Plug-in / Aux Boundary](adr/ADR-019-vendor-plugin-aux-boundary.md)** — why the runtime DLL holds zero vendor identifiers
 - **[Display Processor Interface](specs/vendor/display-processor-interface.md)** — the DP vtable you'll implement
 - **[Eye Tracking Modes](specs/vendor/eye-tracking-modes.md)** — MANAGED vs MANUAL contract
 - **[ADR-003: Vendor Abstraction](adr/ADR-003-vendor-abstraction-via-display-processor-vtable.md)** — why vendor code is isolated
 - **[ADR-007: Compositor Never Weaves](adr/ADR-007-compositor-never-weaves.md)** — compositor / DP boundary
 - **[ADR-015: Multi-Display Routing](adr/ADR-015-displayxr-owns-multi-display-vendor-routing.md)** — how multiple vendors coexist
 - **[Separation of Concerns](architecture/separation-of-concerns.md)** — what goes where
+- [Legacy: in-tree integration model](guides/vendor-integration.md) — historical reference for pre-#263 vendors who forked the runtime
+- [Writing a Driver](guides/writing-driver.md) — driver framework basics
 
 ### Integrated vendors (`vendors/`)
 
