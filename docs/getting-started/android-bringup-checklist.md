@@ -10,10 +10,15 @@ Companion docs:
 
 | | Name | Runtime branch | Test app branch | Time |
 |---|---|---|---|---|
-| **A** | First light — atlas mode (primary) | `docs/android-bringup-checklist` (latest stack incl. atlas mode) | `feat/cube-handle-vk-android-frame-loop` | 5–10 min |
+| **A** | First light — atlas mode (primary) | `feat/android-hw-debug-logs` (atlas mode + audit fixes + HW debug logs) | `feat/cube-test-app-hw-debug-logs` (B13d + HW debug logs) | 5–10 min |
 | **B** | Calibration walkthrough | unchanged | unchanged | 3 × 1–2 min |
-| **C** *(optional)* | Per-tile-blit fallback | `fix/compositor-b7` | unchanged | 5 min |
+| **C** *(optional)* | Per-tile-blit fallback | `fix/compositor-b7-hw-debug-logs` (per-tile-blit + HW debug logs) | unchanged | 5 min |
 | **D** *(optional)* | Third-party OpenXR app | A or C | Khronos `hello_xr` or similar | 10 min |
+
+**Debug log tags in logcat:** `HW_DBG_APP` (test app), `HW_DBG_CNSDK` (runtime CNSDK wrapper), `HW_DBG_DP` (runtime display processor). Each has `[once]` variants for state transitions. All three are compiled in only when the Debug build variant is installed (release builds compile them to nothing). To filter:
+```bash
+adb logcat | grep -E "HW_DBG_(APP|CNSDK|DP)"
+```
 
 If A passes you can stop. B confirms the CNSDK convention assumptions. C is only needed if A fails (atlas mode regression). D is final independent validation.
 
@@ -26,14 +31,14 @@ If A passes you can stop. B confirms the CNSDK convention assumptions. C is only
 ### Build
 
 ```bash
-# Runtime APK — the bring-up-checklist branch is the tip of the stack
-# (atlas mode + audit fixes + TARGET guards + AAR fallback + build guide
-# + this checklist), so check that out for the runtime build.
-git checkout docs/android-bringup-checklist
+# Runtime APK — feat/android-hw-debug-logs is the tip of the runtime
+# stack: atlas mode + all audit fixes + CMake TARGET guards + AAR
+# fallback + build guide + this checklist + verbose HW debug logging.
+git checkout feat/android-hw-debug-logs
 ./gradlew :src:xrt:targets:openxr_android:assembleInProcessDebug
 
 # Test app APK
-git checkout feat/cube-handle-vk-android-frame-loop
+git checkout feat/cube-test-app-hw-debug-logs
 ./gradlew :test_apps:cube_handle_vk_android:assembleDebug
 ```
 
@@ -125,10 +130,10 @@ Each fix is a 1-line change in `leia_cnsdk.cpp`. Land as `fix/cnsdk-cal-<axis|vi
 
 **When to run:** Only if A failed in a way that points at atlas mode (e.g., display works but content is wrong, or validation errors that disappear under per-tile blit).
 
-**Branches:** runtime `fix/compositor-b7` · test app unchanged.
+**Branches:** runtime `fix/compositor-b7-hw-debug-logs` (per-tile-blit + audit fixes + HW debug logs) · test app unchanged.
 
 ```bash
-git checkout fix/compositor-b7
+git checkout fix/compositor-b7-hw-debug-logs
 ./gradlew :src:xrt:targets:openxr_android:assembleInProcessDebug
 
 adb uninstall org.freedesktop.monado.openxr_runtime.in_process
