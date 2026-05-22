@@ -1838,7 +1838,9 @@ gl_create_window_and_context(struct comp_gl_compositor *c,
                               void *window_handle,
                               void *app_gl_context,
                               uint32_t width,
-                              uint32_t height)
+                              uint32_t height,
+                              int32_t screen_left,
+                              int32_t screen_top)
 {
 	// Register window class
 	WNDCLASSEXW wc = {0};
@@ -1857,7 +1859,8 @@ gl_create_window_and_context(struct comp_gl_compositor *c,
 		// dedicated thread with message pump, QWERTY input support.
 		uint32_t win_w = width > 0 ? width : GL_DEFAULT_WIDTH;
 		uint32_t win_h = height > 0 ? height : GL_DEFAULT_HEIGHT;
-		xrt_result_t xret = comp_d3d11_window_create(win_w, win_h, &c->own_window);
+		xrt_result_t xret = comp_d3d11_window_create(
+		    win_w, win_h, screen_left, screen_top, &c->own_window);
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to create self-owned window for GL compositor");
 			return false;
@@ -2213,6 +2216,8 @@ comp_gl_compositor_create(struct xrt_device *xdev,
                           void *shared_texture_handle,
                           bool transparent_background,
                           uint32_t chroma_key_color,
+                          int32_t display_screen_left,
+                          int32_t display_screen_top,
                           struct xrt_compositor_native **out_xcn)
 {
 	struct comp_gl_compositor *c = U_TYPED_CALLOC(struct comp_gl_compositor);
@@ -2243,7 +2248,8 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 
 	// Platform-specific context/window setup
 #ifdef XRT_OS_WINDOWS
-	if (!gl_create_window_and_context(c, window_handle, gl_context, width, height)) {
+	if (!gl_create_window_and_context(c, window_handle, gl_context, width, height,
+	                                  display_screen_left, display_screen_top)) {
 		free(c);
 		return XRT_ERROR_OPENGL;
 	}

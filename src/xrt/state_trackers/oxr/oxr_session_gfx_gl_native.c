@@ -85,8 +85,10 @@ oxr_session_populate_gl_native(struct oxr_logger *log,
 	struct xrt_device *xdev = get_role_head(sess->sys);
 	struct xrt_compositor_native *xcn = NULL;
 
-	// Get GL display processor factory from system compositor info
+	// Get GL display processor factory and display top-left from system compositor info
 	void *dp_factory_gl = (sys->xsysc != NULL) ? sys->xsysc->info.dp_factory_gl : NULL;
+	int32_t display_screen_left = (sys->xsysc != NULL) ? sys->xsysc->info.display_screen_left : 0;
+	int32_t display_screen_top = (sys->xsysc != NULL) ? sys->xsysc->info.display_screen_top : 0;
 
 	// Create the GL native compositor
 	xrt_result_t xret = comp_gl_compositor_create(
@@ -98,6 +100,8 @@ oxr_session_populate_gl_native(struct oxr_logger *log,
 	    shared_texture_handle,
 	    transparent_background,
 	    chroma_key_color,
+	    display_screen_left,
+	    display_screen_top,
 	    &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,

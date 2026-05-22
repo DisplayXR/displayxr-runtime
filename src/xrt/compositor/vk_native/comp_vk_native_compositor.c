@@ -2528,6 +2528,8 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
                                  void *shared_texture_handle,
                                  bool transparent_background,
                                  uint32_t chroma_key_color,
+                                 int32_t display_screen_left,
+                                 int32_t display_screen_top,
                                  struct xrt_compositor_native **out_xc)
 {
 	if (vk_device == NULL) {
@@ -2605,7 +2607,8 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			win_h = 1080;
 		}
 		U_LOG_I("Creating self-owned window (%ux%u)", win_w, win_h);
-		xrt_result_t xret = comp_d3d11_window_create(win_w, win_h, &c->own_window);
+		xrt_result_t xret = comp_d3d11_window_create(
+		    win_w, win_h, display_screen_left, display_screen_top, &c->own_window);
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to create self-owned window");
 			free(c);

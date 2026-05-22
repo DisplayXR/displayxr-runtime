@@ -41,6 +41,9 @@ extern "C" {
  *                         a post-weave shader pass that converts pixels matching this
  *                         RGB (0x00BBGGRR / Win32 COLORREF) to alpha=0. Required when
  *                         the bound display processor strips alpha during weaving.
+ * @param display_screen_left Display top-left X in OS screen coords (from xsysc->info,
+ *                            populated by the vendor plug-in iface). 0 = primary.
+ * @param display_screen_top  Display top-left Y in OS screen coords. 0 = primary.
  * @param out_xc Pointer to receive the created compositor.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
@@ -56,6 +59,8 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
                              void *dp_factory_d3d12,
                              bool transparent_background,
                              uint32_t chroma_key_color,
+                             int32_t display_screen_left,
+                             int32_t display_screen_top,
                              struct xrt_compositor_native **out_xc);
 
 /*!
