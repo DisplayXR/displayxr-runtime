@@ -11,6 +11,10 @@
             "name": "pthreads",
             "platform": "windows"
         },
+        {
+            "name": "cjson",
+            "platform": "windows"
+        },
         "eigen3",
         "glslang",
         "vulkan"
