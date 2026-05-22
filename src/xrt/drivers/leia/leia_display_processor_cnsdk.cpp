@@ -53,10 +53,15 @@ constexpr uint32_t kDefaultDisplayPixelH = 1600;
 constexpr float kIpdHalfM       = 0.0325f;
 constexpr float kEyeViewerDistM = 0.5f;
 
-// CNSDK's leia_interlacer_vulkan_initialize is called in leia_cnsdk.cpp
-// with VK_FORMAT_B8G8R8A8_SRGB as the views format, so per-view images
-// must match.
-constexpr VkFormat kPerViewFormat = VK_FORMAT_B8G8R8A8_SRGB;
+// Per-view image format must match what CNSDK's interlacer is
+// initialized with (see leia_cnsdk.cpp::leia_cnsdk_ensure_interlacer)
+// AND what the compositor renders the atlas in. Today both are
+// VK_FORMAT_B8G8R8A8_UNORM (renderer hardcodes that in
+// comp_vk_native_renderer.c). Using SRGB here would cause CNSDK to
+// double-correct gamma — atlas bytes are linear UNORM, but an SRGB
+// view would tell the sampler to apply SRGB→linear conversion on
+// read, darkening mid-tones (audit B2).
+constexpr VkFormat kPerViewFormat = VK_FORMAT_B8G8R8A8_UNORM;
 
 struct leia_dp_cnsdk
 {

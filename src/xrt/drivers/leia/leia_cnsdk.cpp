@@ -194,11 +194,39 @@ leia_cnsdk_destroy(struct leia_cnsdk **cnsdk_ptr)
 
 	struct leia_cnsdk *cnsdk = *cnsdk_ptr;
 
-	// Signal the worker, then join. If the worker is mid-enable_face_tracking
-	// we have to wait it out — CNSDK provides no interruption hook.
+	// Signal the worker, then join with a watchdog: if it doesn't finish
+	// within kWorkerJoinTimeoutMs, detach instead so destroy can return.
+	// The worker might be mid-leia_core_enable_face_tracking with no
+	// interruption hook — without the timeout, destroy can hang
+	// indefinitely on a CNSDK deadlock (audit B10).
+	//
+	// Detaching leaks the std::thread but is the only option short of
+	// CNSDK exposing a cancel API.
 	cnsdk->shutting_down.store(true, std::memory_order_release);
 	if (cnsdk->worker.joinable()) {
-		cnsdk->worker.join();
+		constexpr auto kWorkerJoinTimeoutMs = std::chrono::milliseconds(2000);
+		// std::thread::join doesn't take a timeout, so use a side thread
+		// that does the join and a condition variable to wait on with a
+		// deadline. Cheap on the happy path (the worker is usually
+		// already finished by destroy time, so join returns instantly).
+		std::atomic<bool> joined{false};
+		std::thread joiner([&]() {
+			cnsdk->worker.join();
+			joined.store(true, std::memory_order_release);
+		});
+		const auto deadline = std::chrono::steady_clock::now() + kWorkerJoinTimeoutMs;
+		while (!joined.load(std::memory_order_acquire) &&
+		       std::chrono::steady_clock::now() < deadline) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+		if (joined.load(std::memory_order_acquire)) {
+			joiner.join();
+		} else {
+			U_LOG_W("CNSDK worker did not exit within %lld ms; detaching",
+			        (long long)kWorkerJoinTimeoutMs.count());
+			cnsdk->worker.detach();
+			joiner.detach();
+		}
 	}
 
 	if (cnsdk->interlacer != NULL) {
@@ -294,8 +322,12 @@ leia_cnsdk_ensure_interlacer(struct leia_cnsdk *cnsdk,
 
 	struct leia_interlacer_init_configuration *ic = leia_interlacer_init_configuration_alloc();
 	leia_interlacer_init_configuration_set_use_atlas_for_views(ic, false);
+	// Views format MUST match what the DP creates per-view images as
+	// (leia_display_processor_cnsdk.cpp::kPerViewFormat) — see audit B2.
+	// Both stay UNORM so CNSDK samples the atlas linearly and doesn't
+	// double-correct gamma on read.
 	cnsdk->interlacer = leia_interlacer_vulkan_initialize(
-	    cnsdk->core, ic, device, physDev, VK_FORMAT_B8G8R8A8_SRGB,
+	    cnsdk->core, ic, device, physDev, VK_FORMAT_B8G8R8A8_UNORM,
 	    targetFmt, VK_FORMAT_D32_SFLOAT, 3);
 	leia_interlacer_init_configuration_free(ic);
 
