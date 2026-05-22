@@ -31,8 +31,19 @@
 #include <math.h>
 #include <string.h>
 
-#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+/*
+ * Issue #256 / ADR-019: needed regardless of XRT_HAVE_LEIA_SR_D3D11 so the
+ * C call sites get prototypes (set_client_window_pose et al. take float args
+ * — without a prototype, C's default argument promotion sends them as double
+ * and the called function reads garbage from the low half of XMM3).
+ * Previously this was transitively pulled in via drv_leia's PUBLIC define
+ * propagation; production builds no longer link drv_leia.
+ */
 #include "d3d11_service/comp_d3d11_service.h"
+#endif
+
+#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 #include "math/m_display3d_view.h"
 #include "math/m_camera3d_view.h"
 #endif
