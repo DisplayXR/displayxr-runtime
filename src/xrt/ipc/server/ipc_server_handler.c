@@ -33,17 +33,13 @@
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 /*
- * Issue #256 / ADR-019: needed regardless of XRT_HAVE_LEIA_SR_D3D11 so the
- * C call sites get prototypes (set_client_window_pose et al. take float args
- * — without a prototype, C's default argument promotion sends them as double
- * and the called function reads garbage from the low half of XMM3).
- * Previously this was transitively pulled in via drv_leia's PUBLIC define
- * propagation; production builds no longer link drv_leia.
+ * The D3D11 service compositor exposes vendor-agnostic helpers used by the
+ * IPC handlers for per-client window metrics, predicted eye positions, and
+ * the Kooima view-pose compute path. The helpers themselves dispatch through
+ * the display-processor iface at runtime — no static dependency on any
+ * specific vendor (issue #256 / ADR-019).
  */
 #include "d3d11_service/comp_d3d11_service.h"
-#endif
-
-#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 #include "math/m_display3d_view.h"
 #include "math/m_camera3d_view.h"
 #endif
@@ -129,7 +125,7 @@ validate_device_id(volatile struct ipc_client_state *ics, int64_t device_id, str
 	} while (0)
 
 
-#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 /*!
  * Try to get SR-aware view poses for IPC clients.
  * Returns true if SR view poses were computed, false to fall back to device poses.
@@ -508,7 +504,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 
 	return true;
 }
-#endif // XRT_HAVE_LEIA_SR_D3D11 && XRT_HAVE_D3D11_SERVICE_COMPOSITOR
+#endif // XRT_HAVE_D3D11_SERVICE_COMPOSITOR
 
 
 static xrt_result_t
@@ -1500,7 +1496,7 @@ ipc_handle_compositor_get_window_metrics(volatile struct ipc_client_state *ics,
 
 	struct xrt_window_metrics wm = {0};
 
-#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	// Per-client window metrics are only meaningful when the D3D11 service
 	// compositor is in workspace mode and has assigned a slot to this client.
 	// `xc` is NULL for headless / pre-render sessions; comp_d3d11_service_*
@@ -1978,7 +1974,7 @@ ipc_handle_compositor_layer_sync(volatile struct ipc_client_state *ics,
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
 	}
 
-#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	// Phase 2 — relay the per-frame fence value to the d3d11 service
 	// compositor BEFORE dispatching the layer commit, so the per-view loop
 	// in compositor_layer_commit reads a fresh value. Legacy clients send 0
@@ -2048,7 +2044,7 @@ ipc_handle_compositor_layer_sync_with_semaphore(volatile struct ipc_client_state
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
 	}
 
-#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	// Phase 2 — see the matching comment in ipc_handle_compositor_layer_sync.
 	comp_d3d11_service_compositor_set_workspace_sync_fence_value(ics->xc, workspace_sync_fence_value);
 #else
@@ -2223,7 +2219,7 @@ ipc_handle_system_get_client_window_metrics(volatile struct ipc_client_state *_i
 
 	struct xrt_window_metrics wm = {0};
 
-#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	struct ipc_server *s = _ics->server;
 
 	// Per-client window metrics are only meaningful when the D3D11 service
@@ -2343,7 +2339,7 @@ ipc_handle_workspace_activate(volatile struct ipc_client_state *_ics)
 #ifdef XRT_OS_WINDOWS
 			comp_d3d11_service_ensure_workspace_window(s->xsysc);
 #endif
-#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 			// Force-reset to 3D on EVERY activate, including this
 			// already-in-workspace-mode path. The service is normally
 			// started with --shell which sets s->workspace_mode=true
@@ -2370,7 +2366,7 @@ ipc_handle_workspace_activate(volatile struct ipc_client_state *_ics)
 		comp_d3d11_service_ensure_workspace_window(s->xsysc);
 #endif
 
-#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 		// Force-reset to 3D (mode 1) on every workspace activate (#234).
 		// Use the direct DP-force helper instead of routing through the
 		// acked-flip state machine: the state machine's no-op guard skips
@@ -2433,7 +2429,7 @@ ipc_handle_workspace_request_display_mode(volatile struct ipc_client_state *_ics
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
-#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	if (!comp_d3d11_service_workspace_request_mode_flip(s->xsysc, mode_index)) {
 		// No multi_comp (workspace not active / non-d3d11 backend) —
 		// caller falls back to legacy device-property path on the client.
@@ -3811,7 +3807,7 @@ ipc_handle_compositor_get_workspace_sync_fence(volatile struct ipc_client_state 
 		return XRT_SUCCESS;
 	}
 
-#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	// Phase 2 — only the d3d11_service compositor exposes a per-client
 	// shared ID3D11Fence. The exporter does the type-tag check and returns
 	// false for any other backend (or when the fence creation failed at
@@ -4000,7 +3996,7 @@ ipc_handle_device_get_view_poses(volatile struct ipc_client_state *ics,
 	struct xrt_fov fovs[IPC_MAX_RAW_VIEWS];
 	struct xrt_pose poses[IPC_MAX_RAW_VIEWS];
 
-#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	// Try SR-aware view poses first (pass client compositor for per-client window metrics)
 	if (ipc_try_get_sr_view_poses(ics, (struct xrt_compositor *)ics->xc, xdev, fallback_eye_relation, at_timestamp_ns,
 	                               view_count, &reply.head_relation, fovs, poses)) {
@@ -4067,7 +4063,7 @@ ipc_handle_device_get_view_poses_2(volatile struct ipc_client_state *ics,
 	struct xrt_device *xdev = NULL;
 	GET_XDEV_OR_RETURN(ics, device_id, xdev);
 
-#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	// Try SR-aware view poses first (pass client compositor for per-client window metrics)
 	if (ipc_try_get_sr_view_poses(ics, (struct xrt_compositor *)ics->xc, xdev, default_eye_relation, at_timestamp_ns,
 	                               view_count, &out_info->head_relation, out_info->fovs, out_info->poses)) {

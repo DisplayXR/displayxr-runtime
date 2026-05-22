@@ -18,7 +18,7 @@
 #include "ipc_server_generated.h"
 #include "xrt/xrt_config_have.h"
 
-#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 #include "d3d11_service/comp_d3d11_service.h"
 #endif
 
