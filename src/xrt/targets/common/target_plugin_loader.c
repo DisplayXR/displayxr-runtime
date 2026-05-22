@@ -351,8 +351,9 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst)
  *   2. macOS: ~/Library/Application Support/DisplayXR/DisplayProcessors/
  *      Linux: $XDG_DATA_HOME/DisplayXR/DisplayProcessors/
  *             (defaults to ~/.local/share/DisplayXR/DisplayProcessors/)
- *   3. Linux only: /usr/local/share/displayxr/DisplayProcessors/
- *                  /usr/share/displayxr/DisplayProcessors/
+ *   3. macOS: /Library/Application Support/DisplayXR/DisplayProcessors/
+ *      Linux: /usr/local/share/displayxr/DisplayProcessors/
+ *             /usr/share/displayxr/DisplayProcessors/
  *
  * Per-user shadows system entries via lexicographic sort tie-break on
  * the absolute path (later inserts win — the loop inserts in priority
@@ -642,6 +643,13 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst)
 		         "%s/Library/Application Support/DisplayXR/DisplayProcessors", home);
 		append_roots(roots, (int)(sizeof(roots) / sizeof(roots[0])), &n_roots, user_root);
 	}
+	/* System-wide root for `.pkg`-style installs that run as root and
+	 * write to /Library/Application Support/ rather than ~. Per-user
+	 * entries above shadow system-wide entries via the already_have_id
+	 * dedup inside enumerate_dir. Mirrors the Linux system-root
+	 * convention below. Issue #274. */
+	append_roots(roots, (int)(sizeof(roots) / sizeof(roots[0])), &n_roots,
+	             "/Library/Application Support/DisplayXR/DisplayProcessors");
 #else
 	const char *xdg = getenv("XDG_DATA_HOME");
 	if (xdg != NULL && *xdg != '\0') {

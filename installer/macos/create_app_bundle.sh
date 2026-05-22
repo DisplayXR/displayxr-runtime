@@ -69,8 +69,20 @@ LAUNCHER
 chmod +x "$APP_BUNDLE/Contents/MacOS/$BUNDLE_DISPLAY_NAME"
 
 # --- Resources: binary and libraries ---
+# Match the same set of runtime-dylib name shapes that build_installer.sh
+# accepts (issue #256/ADR-019 moved this from MODULE → SHARED + PREFIX="",
+# producing `openxr_displayxr.dylib` instead of the historical
+# `libopenxr_displayxr.*`).
+RUNTIME_LIB=$(find "$ARTIFACT_DIR/lib" -maxdepth 1 \
+  \( -name "openxr_displayxr.dylib" -o -name "openxr_displayxr.so" -o -name "libopenxr_displayxr*" \) \
+  -type f | head -1)
+if [ -z "$RUNTIME_LIB" ] || [ ! -f "$RUNTIME_LIB" ]; then
+    echo "Error: runtime dylib not found in $ARTIFACT_DIR/lib/" >&2
+    exit 1
+fi
+RUNTIME_BASENAME=$(basename "$RUNTIME_LIB")
 cp "$ARTIFACT_DIR/bin/$BINARY_NAME" "$APP_BUNDLE/Contents/Resources/"
-cp "$ARTIFACT_DIR"/lib/libopenxr_displayxr* "$APP_BUNDLE/Contents/Resources/lib/"
+cp "$RUNTIME_LIB" "$APP_BUNDLE/Contents/Resources/lib/"
 cp "$ARTIFACT_DIR"/lib/libopenxr_loader* "$APP_BUNDLE/Contents/Resources/lib/"
 cp "$ARTIFACT_DIR/lib/libvulkan.1.dylib" "$APP_BUNDLE/Contents/Resources/lib/"
 cp "$ARTIFACT_DIR/lib/libMoltenVK.dylib" "$APP_BUNDLE/Contents/Resources/lib/"
@@ -81,7 +93,7 @@ cat > "$APP_BUNDLE/Contents/Resources/openxr_displayxr.json" <<EOF
     "file_format_version": "1.0.0",
     "runtime": {
         "name": "DisplayXR Runtime",
-        "library_path": "lib/$(basename "$ARTIFACT_DIR"/lib/libopenxr_displayxr*)"
+        "library_path": "lib/$RUNTIME_BASENAME"
     }
 }
 EOF
