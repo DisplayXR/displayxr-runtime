@@ -840,17 +840,30 @@ Section "Uninstall"
 	cascade_collect_done:
 
 	${If} $R0 != ""
-		${un.WordFind} "$R0" "|" "#" $R9
+		; WordFind's "#" (count) op returns the full string instead of an
+		; integer when the buffer has no delimiter — making IntCmp jump
+		; straight to "done" and never running the exec. Iterate until
+		; the +N position is out-of-range (IfErrors / empty result) instead.
 		StrCpy $R8 1
+		ClearErrors
 		cascade_run_loop:
-			IntCmp $R8 $R9 0 0 cascade_run_done
 			${un.WordFind} "$R0" "|" "+$R8" $R7
+			IfErrors cascade_run_done
 			${If} $R7 != ""
+				; $R7 has embedded quotes (the WriteRegStr in each
+				; controller's installer stores `"path"`); strip them
+				; then re-wrap so nsExec/cmd parses `"path" /S` cleanly.
+				StrCpy $R6 $R7 1
+				${If} $R6 == '$\"'
+					StrCpy $R7 $R7 "" 1
+					StrCpy $R7 $R7 -1
+				${EndIf}
 				DetailPrint "Uninstalling workspace controller: $R7"
-				nsExec::ExecToLog '"$R7" /S'
-				Pop $5
+				ExecWait '"$R7" /S' $5
+				DetailPrint "  exit code: $5"
 			${EndIf}
 			IntOp $R8 $R8 + 1
+			ClearErrors
 			Goto cascade_run_loop
 		cascade_run_done:
 	${EndIf}
@@ -894,17 +907,30 @@ Section "Uninstall"
 	dp_cascade_collect_done:
 
 	${If} $R0 != ""
-		${un.WordFind} "$R0" "|" "#" $R9
+		; WordFind's "#" (count) op returns the full string instead of an
+		; integer when the buffer has no delimiter — making IntCmp jump
+		; straight to "done" and never running the exec. Iterate until
+		; the +N position is out-of-range (IfErrors / empty result) instead.
 		StrCpy $R8 1
+		ClearErrors
 		dp_cascade_run_loop:
-			IntCmp $R8 $R9 0 0 dp_cascade_run_done
 			${un.WordFind} "$R0" "|" "+$R8" $R7
+			IfErrors dp_cascade_run_done
 			${If} $R7 != ""
+				; $R7 has embedded quotes (the WriteRegStr in each
+				; plug-in's installer stores `"path"`); strip them
+				; then re-wrap so nsExec/cmd parses `"path" /S` cleanly.
+				StrCpy $R6 $R7 1
+				${If} $R6 == '$\"'
+					StrCpy $R7 $R7 "" 1
+					StrCpy $R7 $R7 -1
+				${EndIf}
 				DetailPrint "Uninstalling display processor plug-in: $R7"
-				nsExec::ExecToLog '"$R7" /S'
-				Pop $5
+				ExecWait '"$R7" /S' $5
+				DetailPrint "  exit code: $5"
 			${EndIf}
 			IntOp $R8 $R8 + 1
+			ClearErrors
 			Goto dp_cascade_run_loop
 		dp_cascade_run_done:
 	${EndIf}
