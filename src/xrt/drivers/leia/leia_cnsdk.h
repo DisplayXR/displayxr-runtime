@@ -50,8 +50,11 @@ leia_cnsdk_is_initialized(struct leia_cnsdk *cnsdk);
 /*!
  * Fetch native display metrics from CNSDK's device config.
  *
- * Returns false (without touching outputs) until @ref leia_cnsdk_create
- * has finished async-initializing the underlying leia_core. Caller is
+ * The four values are snapshotted once by the face-tracking worker
+ * thread right after @ref leia_core_is_initialized first returns true
+ * and stored on the wrapper struct. Subsequent calls return the
+ * cached values without re-acquiring CNSDK's device config every
+ * frame. Returns false until that snapshot has happened; caller is
  * expected to poll across frames.
  *
  * @param[out] out_width_m   Display physical width in meters.

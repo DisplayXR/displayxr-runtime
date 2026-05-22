@@ -61,6 +61,24 @@ struct leia_cnsdk
 	float camera_center_x_m{0.0f};
 	float camera_center_y_m{0.0f};
 	float camera_center_z_m{0.0f};
+
+	// Cached display metrics. Populated by the worker thread alongside
+	// the camera-center snapshot; the atomic flag gives the render
+	// thread happens-before visibility on the float/int writes. Once
+	// set, leia_cnsdk_get_display_metrics returns the cached values
+	// instead of calling get_device_config / release_device_config per
+	// frame — eliminates a per-frame allocation churn AND the
+	// concurrent-device-config-access concern (audit B9).
+	std::atomic<bool> display_metrics_cached{false};
+	float display_width_m_cached{0.0f};
+	float display_height_m_cached{0.0f};
+	uint32_t display_pixel_w_cached{0};
+	uint32_t display_pixel_h_cached{0};
+
+	// One-shot flag: once leia_interlacer_vulkan_initialize fails, give
+	// up rather than retrying every frame. Read + written only by the
+	// render thread (no concurrent access; no atomic needed).
+	bool interlacer_init_failed{false};
 };
 
 
@@ -89,19 +107,26 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 		return;
 	}
 
-	// Phase 2a: snapshot the camera center from the device config so the
-	// main-thread fast path can translate face positions without
-	// re-acquiring the (probably non-thread-safe) device config every
-	// frame. CNSDK's coordinate system has the camera at the origin and
-	// uses millimeters — we cache the offset in meters.
+	// Phase 2a: snapshot all device-config values we need on the render
+	// thread (camera center for face-position translation; display
+	// metrics for Kooima projection). CNSDK doesn't annotate device
+	// config thread safety, so we keep it on this one worker thread and
+	// expose only cached values to the render thread via atomics. mm→m
+	// conversion happens at storage time so render-thread reads are
+	// branch-free.
 	struct leia_device_config *cfg = leia_core_get_device_config(cnsdk->core);
 	if (cfg != NULL) {
 		cnsdk->camera_center_x_m = cfg->cameraCenterX / 1000.0f;
 		cnsdk->camera_center_y_m = cfg->cameraCenterY / 1000.0f;
 		cnsdk->camera_center_z_m = cfg->cameraCenterZ / 1000.0f;
+		cnsdk->display_width_m_cached = (float)cfg->displaySizeInMm[0] / 1000.0f;
+		cnsdk->display_height_m_cached = (float)cfg->displaySizeInMm[1] / 1000.0f;
+		cnsdk->display_pixel_w_cached = (uint32_t)cfg->panelResolution[0];
+		cnsdk->display_pixel_h_cached = (uint32_t)cfg->panelResolution[1];
 		leia_core_release_device_config(cnsdk->core, cfg);
+		cnsdk->display_metrics_cached.store(true, std::memory_order_release);
 	} else {
-		U_LOG_W("leia_core_get_device_config failed in worker; camera center stays 0");
+		U_LOG_W("leia_core_get_device_config failed in worker; camera center + metrics stay default");
 	}
 
 	// Phase 2b: heavy enable + start. Single call, can't be interrupted —
@@ -211,32 +236,26 @@ leia_cnsdk_get_display_metrics(struct leia_cnsdk *cnsdk,
                                uint32_t *out_pixel_w,
                                uint32_t *out_pixel_h)
 {
-	if (cnsdk == NULL || cnsdk->core == NULL) {
-		return false;
-	}
-	if (!leia_core_is_initialized(cnsdk->core)) {
-		return false;
-	}
-
-	struct leia_device_config *cfg = leia_core_get_device_config(cnsdk->core);
-	if (cfg == NULL) {
+	// Worker thread snapshots all four values from the device config
+	// once, then sets the atomic. Render thread polls the atomic and
+	// reads the cached float/int fields. No per-frame get/release.
+	if (cnsdk == NULL ||
+	    !cnsdk->display_metrics_cached.load(std::memory_order_acquire)) {
 		return false;
 	}
 
 	if (out_width_m != NULL) {
-		*out_width_m = (float)cfg->displaySizeInMm[0] / 1000.0f;
+		*out_width_m = cnsdk->display_width_m_cached;
 	}
 	if (out_height_m != NULL) {
-		*out_height_m = (float)cfg->displaySizeInMm[1] / 1000.0f;
+		*out_height_m = cnsdk->display_height_m_cached;
 	}
 	if (out_pixel_w != NULL) {
-		*out_pixel_w = (uint32_t)cfg->panelResolution[0];
+		*out_pixel_w = cnsdk->display_pixel_w_cached;
 	}
 	if (out_pixel_h != NULL) {
-		*out_pixel_h = (uint32_t)cfg->panelResolution[1];
+		*out_pixel_h = cnsdk->display_pixel_h_cached;
 	}
-
-	leia_core_release_device_config(cnsdk->core, cfg);
 	return true;
 }
 
@@ -263,6 +282,12 @@ leia_cnsdk_ensure_interlacer(struct leia_cnsdk *cnsdk,
 	if (cnsdk->interlacer != NULL) {
 		return true;
 	}
+	// One-shot give-up: once leia_interlacer_vulkan_initialize fails
+	// (typically permanently — wrong VkDevice format, no GPU memory,
+	// CNSDK lib mismatch), don't keep retrying every frame.
+	if (cnsdk->interlacer_init_failed) {
+		return false;
+	}
 	if (!leia_core_is_initialized(cnsdk->core)) {
 		return false;
 	}
@@ -274,7 +299,12 @@ leia_cnsdk_ensure_interlacer(struct leia_cnsdk *cnsdk,
 	    targetFmt, VK_FORMAT_D32_SFLOAT, 3);
 	leia_interlacer_init_configuration_free(ic);
 
-	return cnsdk->interlacer != NULL;
+	if (cnsdk->interlacer == NULL) {
+		U_LOG_W("leia_interlacer_vulkan_initialize returned NULL; giving up (no retries)");
+		cnsdk->interlacer_init_failed = true;
+		return false;
+	}
+	return true;
 }
 
 extern "C" bool
