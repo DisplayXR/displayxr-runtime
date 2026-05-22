@@ -242,6 +242,45 @@ for lib in libvulkan.1.dylib libMoltenVK.dylib; do
   fi
 done
 
+# Rewrite the bundled Vulkan/MoltenVK install_names to @rpath. As shipped
+# by Homebrew, both carry hardcoded LC_ID_DYLIB of
+# `/opt/homebrew/opt/{vulkan-loader,molten-vk}/lib/...`, which means
+# anything linking them inherits the absolute Homebrew path as a direct
+# dependency — so the .pkg runtime would only load on machines that
+# happen to have Homebrew installed at that exact prefix. Retarget to
+# @rpath so dyld finds the bundled copy next to the runtime.
+#
+# Every install_name_tool invocation invalidates the dylib's code
+# signature; on modern macOS the loader SIGKILLs processes that try
+# to load a dylib with an invalidated signature. Re-sign ad-hoc with
+# `codesign --force --sign -` after each modification.
+chmod u+w "$PKG_DIR/lib/libvulkan.1.dylib" 2>/dev/null || true
+install_name_tool -id @rpath/libvulkan.1.dylib "$PKG_DIR/lib/libvulkan.1.dylib" 2>/dev/null || true
+codesign --force --sign - "$PKG_DIR/lib/libvulkan.1.dylib" 2>/dev/null || true
+
+chmod u+w "$PKG_DIR/lib/libMoltenVK.dylib" 2>/dev/null || true
+install_name_tool -id @rpath/libMoltenVK.dylib "$PKG_DIR/lib/libMoltenVK.dylib" 2>/dev/null || true
+codesign --force --sign - "$PKG_DIR/lib/libMoltenVK.dylib" 2>/dev/null || true
+
+# Retarget the runtime + sim-display plug-in's Vulkan dependency from
+# the Homebrew absolute path to @rpath/libvulkan.1.dylib. The @rpath
+# entries below give dyld the right hint:
+#   runtime  → @loader_path        (libvulkan.1.dylib lives next to it)
+#   plug-in  → @loader_path/../..  (libvulkan.1.dylib is two levels up)
+chmod u+w "$PKG_DIR/lib/$RUNTIME_BASENAME" 2>/dev/null || true
+install_name_tool -change /opt/homebrew/opt/vulkan-loader/lib/libvulkan.1.dylib \
+                          @rpath/libvulkan.1.dylib \
+                          "$PKG_DIR/lib/$RUNTIME_BASENAME" 2>/dev/null || true
+codesign --force --sign - "$PKG_DIR/lib/$RUNTIME_BASENAME" 2>/dev/null || true
+
+if [ -f "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimDisplay.dylib" ]; then
+  chmod u+w "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimDisplay.dylib"
+  install_name_tool -change /opt/homebrew/opt/vulkan-loader/lib/libvulkan.1.dylib \
+                            @rpath/libvulkan.1.dylib \
+                            "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimDisplay.dylib" 2>/dev/null || true
+  codesign --force --sign - "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimDisplay.dylib" 2>/dev/null || true
+fi
+
 # Fix rpaths
 install_name_tool -add_rpath @loader_path "$PKG_DIR/lib/$RUNTIME_BASENAME" 2>/dev/null || true
 install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_handle_vk_macos" 2>/dev/null || true
@@ -253,6 +292,20 @@ install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_hosted_l
 install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_hosted_legacy_gl_macos" 2>/dev/null || true
 install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_hosted_legacy_vk_macos" 2>/dev/null || true
 install_name_tool -add_rpath @loader_path "$PKG_DIR"/lib/libopenxr_loader*.dylib 2>/dev/null || true
+
+# Re-sign every artifact we touched with install_name_tool. The
+# add_rpath calls above invalidate signatures the same way -id and
+# -change do; without re-signing, modern macOS SIGKILLs the process
+# at dlopen with "Code Signature Invalid" before any of our logging
+# gets a chance to fire.
+codesign --force --sign - "$PKG_DIR/lib/$RUNTIME_BASENAME" 2>/dev/null || true
+codesign --force --sign - "$PKG_DIR"/lib/libopenxr_loader*.dylib 2>/dev/null || true
+for app in cube_handle_vk_macos cube_handle_metal_macos cube_handle_gl_macos \
+           cube_texture_metal_macos cube_hosted_metal_macos \
+           cube_hosted_legacy_metal_macos cube_hosted_legacy_gl_macos \
+           cube_hosted_legacy_vk_macos; do
+  [ -f "$PKG_DIR/bin/$app" ] && codesign --force --sign - "$PKG_DIR/bin/$app" 2>/dev/null || true
+done
 
 # Create MoltenVK ICD manifest
 cat > "$PKG_DIR/share/vulkan/icd.d/MoltenVK_icd.json" <<EOF
@@ -386,17 +439,31 @@ SCRIPT
 chmod +x "$PKG_DIR/run_cube_hosted_legacy_vk.sh"
 
 
-# Step 5: Build .pkg installer (optional)
+# Step 5: Build .pkg installer (optional). Versioned filename mirrors
+# Windows' `DisplayXRSetup-X.Y.Z.NNN.exe`; DISPLAYXR_VERSION is also
+# baked into the .pkg's internal version + the sim-display manifest,
+# so it's the single source of truth across the artifact.
+#
+# Falls back to a sha-suffixed dev string for local builds with no
+# explicit version set — matches build-macos.yml's BuildInstaller job.
 if [ "$BUILD_INSTALLER" = "ON" ]; then
-  echo "=== Building .pkg installer ==="
-  "$ROOT/installer/macos/build_installer.sh" "$PKG_DIR" "$ROOT/_package/DisplayXR-Installer.pkg"
+  if [ -z "${DISPLAYXR_VERSION:-}" ]; then
+    GIT_SHA=$(git -C "$ROOT" rev-parse --short=8 HEAD 2>/dev/null || echo "local")
+    INSTALLER_VERSION="0.0.0-dev.$GIT_SHA"
+  else
+    INSTALLER_VERSION="$DISPLAYXR_VERSION"
+  fi
+  INSTALLER_PKG="$ROOT/_package/DisplayXR-Installer-$INSTALLER_VERSION.pkg"
+  echo "=== Building .pkg installer (VERSION=$INSTALLER_VERSION) ==="
+  DISPLAYXR_VERSION="$INSTALLER_VERSION" \
+    "$ROOT/installer/macos/build_installer.sh" "$PKG_DIR" "$INSTALLER_PKG"
 fi
 
 echo ""
 echo "=== Build complete! ==="
 echo ""
 if [ "$BUILD_INSTALLER" = "ON" ]; then
-  echo "Installer: $ROOT/_package/DisplayXR-Installer.pkg"
+  echo "Installer: $INSTALLER_PKG"
   echo ""
 fi
 echo "Artifacts in _package/:"
