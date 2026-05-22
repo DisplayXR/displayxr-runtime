@@ -71,6 +71,26 @@ struct leia_dp_cnsdk
 	VkImageView view_iv[2];
 	uint32_t cached_view_w;
 	uint32_t cached_view_h;
+
+	// Cached per-frame blit resources. Created once at factory time, reused
+	// across frames to avoid per-frame Vulkan object churn.
+	//
+	//   blit_cmd     — one-shot atlas → per-view-image cmd buffer, reset
+	//                  + re-recorded each frame.
+	//   blit_done    — binary semaphore signaled by the blit submit and
+	//                  waited on by CNSDK's weave submit (chains the two
+	//                  submits on the GPU side; no host stall between).
+	//   blit_fence   — fence signaled by the blit submit; we wait on it
+	//                  the next time we want to reset the cmd buffer so we
+	//                  don't overwrite work the GPU is still consuming.
+	//   blit_in_flight — true once blit_fence has been submitted at least
+	//                    once; gates the wait-then-reset on subsequent
+	//                    frames so frame 0 doesn't wait on an unsignaled
+	//                    fence.
+	VkCommandBuffer blit_cmd;
+	VkSemaphore blit_done;
+	VkFence blit_fence;
+	bool blit_in_flight;
 };
 
 inline leia_dp_cnsdk *
@@ -163,9 +183,11 @@ create_per_view_images(leia_dp_cnsdk *impl, uint32_t w, uint32_t h)
 	return true;
 }
 
-// Records and submits a one-shot cmd buffer that blits the two atlas
-// tiles into the per-view images, leaving both in SHADER_READ_ONLY_OPTIMAL
-// so CNSDK can sample them.
+// Records and submits the cached blit cmd buffer that copies the two atlas
+// tiles into the per-view images, signaling impl->blit_done so CNSDK's
+// weave submit can wait for the blit on the GPU side instead of stalling
+// the host. Per-view images are left in SHADER_READ_ONLY_OPTIMAL so the
+// interlacer can sample them.
 bool
 blit_atlas_to_per_view(leia_dp_cnsdk *impl,
                        VkImage atlas_image,
@@ -173,17 +195,17 @@ blit_atlas_to_per_view(leia_dp_cnsdk *impl,
                        uint32_t view_h)
 {
 	struct vk_bundle *vk = impl->vk;
+	VkCommandBuffer cmd = impl->blit_cmd;
 
-	VkCommandBufferAllocateInfo ai = {};
-	ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-	ai.commandPool = impl->cmd_pool;
-	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-	ai.commandBufferCount = 1;
-
-	VkCommandBuffer cmd;
-	if (vk->vkAllocateCommandBuffers(vk->device, &ai, &cmd) != VK_SUCCESS) {
-		return false;
+	// Wait for the previous frame's blit to finish before we overwrite the
+	// cmd buffer. Frame 0 has nothing in flight.
+	if (impl->blit_in_flight) {
+		vk->vkWaitForFences(vk->device, 1, &impl->blit_fence, VK_TRUE, UINT64_MAX);
+		vk->vkResetFences(vk->device, 1, &impl->blit_fence);
+		impl->blit_in_flight = false;
 	}
+
+	vk->vkResetCommandBuffer(cmd, 0);
 
 	VkCommandBufferBeginInfo bi = {};
 	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -249,12 +271,14 @@ blit_atlas_to_per_view(leia_dp_cnsdk *impl,
 	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 	si.commandBufferCount = 1;
 	si.pCommandBuffers = &cmd;
-	VkResult res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, VK_NULL_HANDLE);
-	if (res == VK_SUCCESS) {
-		vk->vkQueueWaitIdle(vk->main_queue->queue);
+	si.signalSemaphoreCount = 1;
+	si.pSignalSemaphores = &impl->blit_done;
+	VkResult res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, impl->blit_fence);
+	if (res != VK_SUCCESS) {
+		return false;
 	}
-	vk->vkFreeCommandBuffers(vk->device, impl->cmd_pool, 1, &cmd);
-	return res == VK_SUCCESS;
+	impl->blit_in_flight = true;
+	return true;
 }
 
 void
@@ -322,7 +346,8 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	                 target_width,
 	                 target_height,
 	                 target_fb,
-	                 (VkImage)(uintptr_t)target_image);
+	                 (VkImage)(uintptr_t)target_image,
+	                 impl->blit_done);
 }
 
 bool
@@ -376,9 +401,70 @@ get_display_pixel_info_default(struct xrt_display_processor *xdp,
 }
 
 void
+destroy_blit_resources(leia_dp_cnsdk *impl)
+{
+	if (impl->vk == nullptr) {
+		return;
+	}
+	struct vk_bundle *vk = impl->vk;
+
+	// Make sure any in-flight blit has completed before we tear down the
+	// cmd buffer / fence / semaphore the GPU is still consuming.
+	if (impl->blit_in_flight && impl->blit_fence != VK_NULL_HANDLE) {
+		vk->vkWaitForFences(vk->device, 1, &impl->blit_fence, VK_TRUE, UINT64_MAX);
+		impl->blit_in_flight = false;
+	}
+	if (impl->blit_cmd != VK_NULL_HANDLE && impl->cmd_pool != VK_NULL_HANDLE) {
+		vk->vkFreeCommandBuffers(vk->device, impl->cmd_pool, 1, &impl->blit_cmd);
+		impl->blit_cmd = VK_NULL_HANDLE;
+	}
+	if (impl->blit_done != VK_NULL_HANDLE) {
+		vk->vkDestroySemaphore(vk->device, impl->blit_done, nullptr);
+		impl->blit_done = VK_NULL_HANDLE;
+	}
+	if (impl->blit_fence != VK_NULL_HANDLE) {
+		vk->vkDestroyFence(vk->device, impl->blit_fence, nullptr);
+		impl->blit_fence = VK_NULL_HANDLE;
+	}
+}
+
+bool
+create_blit_resources(leia_dp_cnsdk *impl)
+{
+	struct vk_bundle *vk = impl->vk;
+
+	VkCommandBufferAllocateInfo ai = {};
+	ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	ai.commandPool = impl->cmd_pool;
+	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	ai.commandBufferCount = 1;
+	if (vk->vkAllocateCommandBuffers(vk->device, &ai, &impl->blit_cmd) != VK_SUCCESS) {
+		U_LOG_E("CNSDK DP: blit cmd buffer alloc failed");
+		return false;
+	}
+
+	VkSemaphoreCreateInfo sci = {};
+	sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+	if (vk->vkCreateSemaphore(vk->device, &sci, nullptr, &impl->blit_done) != VK_SUCCESS) {
+		U_LOG_E("CNSDK DP: blit_done semaphore create failed");
+		return false;
+	}
+
+	VkFenceCreateInfo fci = {};
+	fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+	// Unsignaled: first frame sees blit_in_flight=false and skips wait.
+	if (vk->vkCreateFence(vk->device, &fci, nullptr, &impl->blit_fence) != VK_SUCCESS) {
+		U_LOG_E("CNSDK DP: blit_fence create failed");
+		return false;
+	}
+	return true;
+}
+
+void
 destroy_impl(struct xrt_display_processor *xdp)
 {
 	leia_dp_cnsdk *impl = as_impl(xdp);
+	destroy_blit_resources(impl);
 	destroy_per_view_images(impl);
 	if (impl->cnsdk != nullptr) {
 		leia_cnsdk_destroy(&impl->cnsdk);
@@ -413,6 +499,14 @@ leia_dp_factory_cnsdk(void *vk_bundle,
 	impl->cnsdk = cnsdk;
 	impl->vk = static_cast<struct vk_bundle *>(vk_bundle);
 	impl->cmd_pool = (VkCommandPool)(uintptr_t)vk_cmd_pool;
+
+	if (!create_blit_resources(impl)) {
+		destroy_blit_resources(impl);
+		leia_cnsdk_destroy(&impl->cnsdk);
+		free(impl);
+		return XRT_ERROR_VULKAN;
+	}
+
 	impl->base.process_atlas = process_atlas_weave;
 	impl->base.is_self_submitting = is_self_submitting_true;
 	impl->base.get_predicted_eye_positions = get_predicted_eye_positions_ipd;

@@ -52,16 +52,20 @@ leia_cnsdk_is_initialized(struct leia_cnsdk *cnsdk);
  *
  * Lazily creates the interlacer on first call after the core is ready.
  *
- * @param cnsdk        Opaque CNSDK handle.
- * @param device       Vulkan logical device.
- * @param physDev      Vulkan physical device.
- * @param left         Image view for the left eye.
- * @param right        Image view for the right eye.
- * @param targetFmt    Format of the target / swapchain image.
- * @param w            Target width in pixels.
- * @param h            Target height in pixels.
- * @param fb           Target framebuffer.
- * @param targetImage  Target VkImage (for layout transitions).
+ * @param cnsdk           Opaque CNSDK handle.
+ * @param device          Vulkan logical device.
+ * @param physDev         Vulkan physical device.
+ * @param left            Image view for the left eye.
+ * @param right           Image view for the right eye.
+ * @param targetFmt       Format of the target / swapchain image.
+ * @param w               Target width in pixels.
+ * @param h               Target height in pixels.
+ * @param fb              Target framebuffer.
+ * @param targetImage     Target VkImage (for layout transitions).
+ * @param waitSemaphore   Binary semaphore CNSDK should wait on before
+ *                        sampling the input views (use to chain a prior
+ *                        upload submit into the weave on the GPU side and
+ *                        avoid a host stall). Pass VK_NULL_HANDLE to skip.
  */
 void
 leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
@@ -73,7 +77,8 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
                  uint32_t w,
                  uint32_t h,
                  VkFramebuffer fb,
-                 VkImage targetImage);
+                 VkImage targetImage,
+                 VkSemaphore waitSemaphore);
 
 #ifdef __cplusplus
 }

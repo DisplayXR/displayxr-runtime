@@ -124,7 +124,8 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
                  uint32_t w,
                  uint32_t h,
                  VkFramebuffer fb,
-                 VkImage targetImage)
+                 VkImage targetImage,
+                 VkSemaphore waitSemaphore)
 {
 	if (cnsdk == NULL) {
 		return;
@@ -151,5 +152,6 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 	leia_interlacer_vulkan_set_view_for_texture_array(cnsdk->interlacer, 1, right);
 	leia_interlacer_set_shader_debug_mode(cnsdk->interlacer, LEIA_SHADER_DEBUG_MODE_NONE);
 	leia_interlacer_vulkan_do_post_process(
-	    cnsdk->interlacer, w, h, false, fb, targetImage, NULL, NULL, NULL, 0);
+	    cnsdk->interlacer, w, h, false, fb, targetImage, NULL,
+	    waitSemaphore, NULL, 0);
 }
