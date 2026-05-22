@@ -2,7 +2,7 @@ name: Build macOS
 
 # Verifies that the runtime + sim_display driver compile cleanly on
 # macOS, and (post-#277) also builds + publishes
-# `DisplayXR-Installer.pkg` so /release can attach it to GitHub Releases
+# `DisplayXR-Installer-${VERSION}.pkg` so /release can attach it to GitHub Releases
 # alongside the Windows `DisplayXRSetup-*.exe`. Two jobs:
 #
 #   - `Build` (kept minimal, intentionally) — fast compile check using
@@ -148,13 +148,20 @@ jobs:
 
       - name: Assert .pkg payload includes plug-in + manifest (#274 regression guard)
         if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          DISPLAYXR_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          PKG="_package/DisplayXR-Installer.pkg"
-          if [ ! -f "$PKG" ]; then
-            echo "::error::$PKG missing — installer build did not produce expected artifact."
+          # Filename is versioned post-PR #279
+          # (DisplayXR-Installer-${VERSION}.pkg). Match by glob to stay
+          # robust if the naming scheme evolves further.
+          PKG=$(find _package -maxdepth 1 -name "DisplayXR-Installer*.pkg" -type f | head -1)
+          if [ -z "$PKG" ] || [ ! -f "$PKG" ]; then
+            echo "::error::DisplayXR-Installer*.pkg missing from _package/ — installer build did not produce expected artifact."
+            ls -la _package/ || true
             exit 1
           fi
+          echo "Found installer: $PKG"
           EXPAND_DIR=$(mktemp -d)
           pkgutil --expand "$PKG" "$EXPAND_DIR/expand"
           PAYLOAD="$EXPAND_DIR/expand/runtime.pkg/Payload"
@@ -189,4 +196,7 @@ jobs:
           retention-days: 3
           name: DisplayXR-Installer-macOS
           if-no-files-found: error
-          path: _package/DisplayXR-Installer.pkg
+          # Glob — filename is `DisplayXR-Installer-${VERSION}.pkg`
+          # post-PR #279 (versioned filename, parallel to Windows'
+          # DisplayXRSetup-X.Y.Z.NNN.exe).
+          path: _package/DisplayXR-Installer-*.pkg
