@@ -187,6 +187,40 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
 			COMPONENT Runtime
 			)
 	endif()
+	# Ship openxr_loader.dll + pthreadVC3.dll inside $INSTDIR so
+	# downstream consumers (displayxr-shell.exe, third-party workspace
+	# apps) can resolve them via the standard exe-directory DLL search
+	# when they live in the same install tree. The runtime DLL itself
+	# does NOT link openxr_loader (the loader loads US) and (on this
+	# branch) no longer imports pthreadVC3; these install rules exist
+	# only for the downstream-consumer convenience surface.
+	if(DEFINED OpenXR_ROOT AND EXISTS "${OpenXR_ROOT}/x64/bin/openxr_loader.dll")
+		install(
+			FILES "${OpenXR_ROOT}/x64/bin/openxr_loader.dll"
+			DESTINATION ${CMAKE_INSTALL_BINDIR}
+			COMPONENT Runtime
+			)
+	endif()
+	# pthreadVC3 (C-only, no C++ exception unwind) and cjson are what
+	# displayxr-shell.exe v1.2.5 dynamically imports. Source from the
+	# vcpkg-installed bin dir; X_VCPKG_APPLOCAL_DEPS_INSTALL only copies
+	# what the runtime DLL itself transitively links, which on this
+	# branch is neither variant (pthread unused after plug-in extract;
+	# cjson routed to MCP's vendored static lib via XRT_HAVE_LINKED_CJSON).
+	if(EXISTS "${_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin/pthreadVC3.dll")
+		install(
+			FILES "${_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin/pthreadVC3.dll"
+			DESTINATION ${CMAKE_INSTALL_BINDIR}
+			COMPONENT Runtime
+			)
+	endif()
+	if(EXISTS "${_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin/cjson.dll")
+		install(
+			FILES "${_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin/cjson.dll"
+			DESTINATION ${CMAKE_INSTALL_BINDIR}
+			COMPONENT Runtime
+			)
+	endif()
 elseif(NOT ANDROID)
 	# Linux, BSD, etc.
 	set(MANIFEST_RELATIVE_DIR share/openxr/${XR_API_MAJOR}/)
