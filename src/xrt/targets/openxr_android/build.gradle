@@ -379,4 +379,20 @@ def addFileDependency(dependencies, depFile) {
     assert file(depFile).exists()
     dependencies.add('implementation', files(depFile))
 }
-addFileDependency(dependencies, "${project.cnsdkDir}/android/sdk-faceTrackingInApp-${project.cnsdkVersion}.aar")
+
+// CNSDK 0.7.28 ships sdk-faceTrackingInApp-<ver>.aar (in-process face
+// tracking, what we want for the in-process POC). Future CNSDK releases
+// may ship only sdk-<ver>.aar (no in-app variant) or drop the suffix.
+// Probe in order of preference and fall back gracefully.
+def cnsdkAarCandidates = [
+    "${project.cnsdkDir}/android/sdk-faceTrackingInApp-${project.cnsdkVersion}.aar",
+    "${project.cnsdkDir}/android/sdk-faceTrackingService-${project.cnsdkVersion}.aar",
+    "${project.cnsdkDir}/android/sdk-${project.cnsdkVersion}.aar",
+]
+def cnsdkAar = cnsdkAarCandidates.find { file(it).exists() }
+if (cnsdkAar == null) {
+    throw new GradleException("No CNSDK AAR found. Tried:\n  " +
+        cnsdkAarCandidates.join("\n  "))
+}
+println "Using CNSDK AAR: ${cnsdkAar}"
+addFileDependency(dependencies, cnsdkAar)
