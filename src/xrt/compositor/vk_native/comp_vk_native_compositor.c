@@ -2397,10 +2397,20 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				    c->canvas.valid ? c->canvas.h : 0);
 
 				if (dp_self_submits) {
-					// DP owned the post-weave submit. Allocate a fresh
-					// cmd buffer for any post-DP overlays (HUD), then
-					// fall through to the shared end+submit below by
-					// re-using `cmd`.
+					// DP owned the post-weave submit. The CNSDK
+					// interlacer's queue submit may still be in flight
+					// writing to target_image; the HUD cmd buffer we're
+					// about to record writes to the same image, so we
+					// have to drain the GPU before recording the HUD to
+					// avoid a target_image race (audit B7). On Android
+					// the HUD is c->hud==NULL and this overlay is a
+					// no-op, so the wait costs nothing in practice — but
+					// keep it for safety when HUD eventually wires up.
+					vk->vkDeviceWaitIdle(vk->device);
+
+					// Allocate a fresh cmd buffer for any post-DP
+					// overlays (HUD), then fall through to the shared
+					// end+submit below by re-using `cmd`.
 					VkCommandBufferAllocateInfo post_ai = {
 					    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
 					    .commandPool = cmd_pool,
