@@ -2157,9 +2157,27 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				dp_target_h = c->canvas.h;
 			}
 
+			bool dp_self_submits =
+			    xrt_display_processor_is_self_submitting(c->display_processor);
+
+			if (dp_self_submits) {
+				// Flush pre-DP work (window-space composite, atlas crop)
+				// so the DP's internal submit sees a coherent atlas.
+				vk->vkEndCommandBuffer(cmd);
+				VkSubmitInfo pre_si = {
+				    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+				    .commandBufferCount = 1,
+				    .pCommandBuffers = &cmd,
+				};
+				res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &pre_si, VK_NULL_HANDLE);
+				if (res == VK_SUCCESS) {
+					vk->vkQueueWaitIdle(vk->main_queue->queue);
+				}
+			}
+
 			xrt_display_processor_process_atlas(
 			    c->display_processor,
-			    cmd,
+			    dp_self_submits ? VK_NULL_HANDLE : cmd,
 			    (VkImage_XDP)(uintptr_t)src_image_u64,
 			    (VkImageView)(uintptr_t)src_view_u64,
 			    view_width, view_height,
@@ -2174,17 +2192,23 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			    c->canvas.valid ? c->canvas.w : 0,
 			    c->canvas.valid ? c->canvas.h : 0);
 
-			vk->vkEndCommandBuffer(cmd);
-
-			VkSubmitInfo submit_info = {
-			    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-			    .commandBufferCount = 1,
-			    .pCommandBuffers = &cmd,
-			};
-			res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
-			if (res == VK_SUCCESS) {
-				vk->vkQueueWaitIdle(vk->main_queue->queue);
+			if (dp_self_submits) {
+				// DP owns its own submit — nothing left for us to do this
+				// frame except mark woven and clean up.
 				weaving_done = true;
+			} else {
+				vk->vkEndCommandBuffer(cmd);
+
+				VkSubmitInfo submit_info = {
+				    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+				    .commandBufferCount = 1,
+				    .pCommandBuffers = &cmd,
+				};
+				res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
+				if (res == VK_SUCCESS) {
+					vk->vkQueueWaitIdle(vk->main_queue->queue);
+					weaving_done = true;
+				}
 			}
 
 			if (shared_fb != VK_NULL_HANDLE) {
@@ -2335,10 +2359,29 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 				    0, 0, NULL, 0, NULL, 1, &pre_weave);
 
+				bool dp_self_submits =
+				    xrt_display_processor_is_self_submitting(c->display_processor);
+
+				if (dp_self_submits) {
+					// Flush pre-DP work (WS-layer composite, atlas crop,
+					// target-image layout transition) so the DP's
+					// internal submit sees the right state on the GPU.
+					vk->vkEndCommandBuffer(cmd);
+					VkSubmitInfo pre_si = {
+					    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+					    .commandBufferCount = 1,
+					    .pCommandBuffers = &cmd,
+					};
+					res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &pre_si, VK_NULL_HANDLE);
+					if (res == VK_SUCCESS) {
+						vk->vkQueueWaitIdle(vk->main_queue->queue);
+					}
+				}
+
 				// Call display processor with atlas (or zero-copy swapchain) texture
 				xrt_display_processor_process_atlas(
 				    c->display_processor,
-				    cmd,
+				    dp_self_submits ? VK_NULL_HANDLE : cmd,
 				    (VkImage_XDP)(uintptr_t)src_image_u64,
 				    (VkImageView)(uintptr_t)src_view_u64,
 				    view_width, view_height,
@@ -2352,6 +2395,26 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				    c->canvas.valid ? c->canvas.y : 0,
 				    c->canvas.valid ? c->canvas.w : 0,
 				    c->canvas.valid ? c->canvas.h : 0);
+
+				if (dp_self_submits) {
+					// DP owned the post-weave submit. Allocate a fresh
+					// cmd buffer for any post-DP overlays (HUD), then
+					// fall through to the shared end+submit below by
+					// re-using `cmd`.
+					VkCommandBufferAllocateInfo post_ai = {
+					    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+					    .commandPool = cmd_pool,
+					    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+					    .commandBufferCount = 1,
+					};
+					vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+					vk->vkAllocateCommandBuffers(vk->device, &post_ai, &cmd);
+					VkCommandBufferBeginInfo post_bi = {
+					    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+					    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+					};
+					vk->vkBeginCommandBuffer(cmd, &post_bi);
+				}
 
 				// Render pass finalLayout handles transition to PRESENT_SRC_KHR
 				// Window-space layers are composed pre-weave into the atlas

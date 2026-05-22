@@ -2,23 +2,28 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Leia CNSDK display processor (Android) — POC stub.
+ * @brief  Leia CNSDK display processor (Android).
  *
- * Wraps leia_cnsdk as an xrt_display_processor so the runtime has a
- * vendor DP slot filled on Android. process_atlas is intentionally a
- * no-op for now: CNSDK's leia_interlacer_vulkan_do_post_process records
- * its own command buffer and submits internally, which doesn't fit the
- * compositor's "append to my cmd_buffer" contract. Wiring it up
- * properly is #126 (add a self_submitting DP flag) plus #125 followup
- * (per-tile image views over the SBS atlas).
+ * Wraps leia_cnsdk as an xrt_display_processor. Implements the real
+ * Vulkan weave by:
+ *   1. Lazily creating one VkImage + VkImageView per view (left/right)
+ *      of the atlas tile dimensions.
+ *   2. Blitting each tile out of the SBS atlas into its per-view image
+ *      via vkCmdBlitImage (CNSDK's `set_view_for_texture_array` takes
+ *      one VkImageView per view, which we cannot derive from a single
+ *      SBS atlas image — sub-rectangle image views aren't a thing in
+ *      Vulkan).
+ *   3. Calling leia_cnsdk_weave, which internally records and submits
+ *      its own VkCommandBuffer via leia_interlacer_vulkan_do_post_process.
  *
- * Until then this DP:
- *   - lets the factory call succeed (compositor no longer logs
- *     "No VK display processor factory provided")
- *   - returns hardcoded IPD-only eye positions (POC bypass for face
- *     tracking — see android-poc-state memory)
- *   - returns Lume Pad-class display metrics so XR_EXT_display_info
- *     reports something sensible to the test app
+ * The DP advertises `is_self_submitting = true`, which tells the
+ * vk_native compositor to:
+ *   - flush its pre-DP cmd buffer (window-space composite, atlas crop,
+ *     target-image layout transition) before calling process_atlas, and
+ *   - skip its own post-process_atlas submit, since CNSDK already did it.
+ *
+ * Eye positions are hardcoded IPD-only for the POC (CNSDK face tracking
+ * wiring TBD).
  *
  * @author David Fattal
  * @ingroup drv_leia
@@ -28,6 +33,7 @@
 #include "leia_cnsdk.h"
 
 #include "xrt/xrt_display_metrics.h"
+#include "vk/vk_helpers.h"
 #include "util/u_logging.h"
 
 #include <stdlib.h>
@@ -47,10 +53,24 @@ constexpr uint32_t kDefaultDisplayPixelH = 1600;
 constexpr float kIpdHalfM       = 0.0325f;
 constexpr float kEyeViewerDistM = 0.5f;
 
+// CNSDK's leia_interlacer_vulkan_initialize is called in leia_cnsdk.cpp
+// with VK_FORMAT_B8G8R8A8_SRGB as the views format, so per-view images
+// must match.
+constexpr VkFormat kPerViewFormat = VK_FORMAT_B8G8R8A8_SRGB;
+
 struct leia_dp_cnsdk
 {
 	struct xrt_display_processor base;
 	struct leia_cnsdk *cnsdk;          //!< Owned.
+	struct vk_bundle *vk;              //!< Borrowed from compositor.
+	VkCommandPool cmd_pool;            //!< Borrowed from compositor.
+
+	// Per-view images. Lazily created; resized if view dims change.
+	VkImage view_img[2];
+	VkDeviceMemory view_mem[2];
+	VkImageView view_iv[2];
+	uint32_t cached_view_w;
+	uint32_t cached_view_h;
 };
 
 inline leia_dp_cnsdk *
@@ -60,34 +80,256 @@ as_impl(struct xrt_display_processor *xdp)
 }
 
 void
-process_atlas_noop(struct xrt_display_processor *xdp,
-                   VkCommandBuffer cmd_buffer,
-                   VkImage_XDP atlas_image,
-                   VkImageView atlas_view,
-                   uint32_t view_width,
-                   uint32_t view_height,
-                   uint32_t tile_columns,
-                   uint32_t tile_rows,
-                   VkFormat_XDP view_format,
-                   VkFramebuffer target_fb,
-                   VkImage_XDP target_image,
-                   uint32_t target_width,
-                   uint32_t target_height,
-                   VkFormat_XDP target_format,
-                   int32_t canvas_offset_x,
-                   int32_t canvas_offset_y,
-                   uint32_t canvas_width,
-                   uint32_t canvas_height)
+destroy_per_view_images(leia_dp_cnsdk *impl)
 {
-	(void)xdp; (void)cmd_buffer; (void)atlas_image; (void)atlas_view;
-	(void)view_width; (void)view_height; (void)tile_columns; (void)tile_rows;
-	(void)view_format; (void)target_fb; (void)target_image;
-	(void)target_width; (void)target_height; (void)target_format;
+	if (impl->vk == nullptr) {
+		return;
+	}
+	struct vk_bundle *vk = impl->vk;
+	for (int i = 0; i < 2; ++i) {
+		if (impl->view_iv[i] != VK_NULL_HANDLE) {
+			vk->vkDestroyImageView(vk->device, impl->view_iv[i], nullptr);
+			impl->view_iv[i] = VK_NULL_HANDLE;
+		}
+		if (impl->view_img[i] != VK_NULL_HANDLE) {
+			vk->vkDestroyImage(vk->device, impl->view_img[i], nullptr);
+			impl->view_img[i] = VK_NULL_HANDLE;
+		}
+		if (impl->view_mem[i] != VK_NULL_HANDLE) {
+			vk->vkFreeMemory(vk->device, impl->view_mem[i], nullptr);
+			impl->view_mem[i] = VK_NULL_HANDLE;
+		}
+	}
+	impl->cached_view_w = 0;
+	impl->cached_view_h = 0;
+}
+
+bool
+create_per_view_images(leia_dp_cnsdk *impl, uint32_t w, uint32_t h)
+{
+	struct vk_bundle *vk = impl->vk;
+
+	VkImageCreateInfo ici = {};
+	ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	ici.imageType = VK_IMAGE_TYPE_2D;
+	ici.format = kPerViewFormat;
+	ici.extent = {w, h, 1};
+	ici.mipLevels = 1;
+	ici.arrayLayers = 1;
+	ici.samples = VK_SAMPLE_COUNT_1_BIT;
+	ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+	ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+	ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+	for (int i = 0; i < 2; ++i) {
+		VkResult res = vk->vkCreateImage(vk->device, &ici, nullptr, &impl->view_img[i]);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("CNSDK DP: vkCreateImage view %d failed: %d", i, res);
+			return false;
+		}
+
+		VkMemoryRequirements reqs;
+		vk->vkGetImageMemoryRequirements(vk->device, impl->view_img[i], &reqs);
+
+		res = vk_alloc_and_bind_image_memory(
+		    vk, impl->view_img[i], &reqs, nullptr,
+		    "leia_dp_cnsdk per-view", &impl->view_mem[i]);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("CNSDK DP: vk_alloc_and_bind_image_memory view %d failed: %d", i, res);
+			return false;
+		}
+
+		VkImageViewCreateInfo ivci = {};
+		ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		ivci.image = impl->view_img[i];
+		ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		ivci.format = kPerViewFormat;
+		ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		ivci.subresourceRange.baseMipLevel = 0;
+		ivci.subresourceRange.levelCount = 1;
+		ivci.subresourceRange.baseArrayLayer = 0;
+		ivci.subresourceRange.layerCount = 1;
+
+		res = vk->vkCreateImageView(vk->device, &ivci, nullptr, &impl->view_iv[i]);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("CNSDK DP: vkCreateImageView view %d failed: %d", i, res);
+			return false;
+		}
+	}
+
+	impl->cached_view_w = w;
+	impl->cached_view_h = h;
+	return true;
+}
+
+// Records and submits a one-shot cmd buffer that blits the two atlas
+// tiles into the per-view images, leaving both in SHADER_READ_ONLY_OPTIMAL
+// so CNSDK can sample them.
+bool
+blit_atlas_to_per_view(leia_dp_cnsdk *impl,
+                       VkImage atlas_image,
+                       uint32_t view_w,
+                       uint32_t view_h)
+{
+	struct vk_bundle *vk = impl->vk;
+
+	VkCommandBufferAllocateInfo ai = {};
+	ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	ai.commandPool = impl->cmd_pool;
+	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	ai.commandBufferCount = 1;
+
+	VkCommandBuffer cmd;
+	if (vk->vkAllocateCommandBuffers(vk->device, &ai, &cmd) != VK_SUCCESS) {
+		return false;
+	}
+
+	VkCommandBufferBeginInfo bi = {};
+	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	vk->vkBeginCommandBuffer(cmd, &bi);
+
+	// UNDEFINED → TRANSFER_DST_OPTIMAL on both view images.
+	VkImageMemoryBarrier to_dst[2] = {};
+	for (int i = 0; i < 2; ++i) {
+		to_dst[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		to_dst[i].srcAccessMask = 0;
+		to_dst[i].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		to_dst[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		to_dst[i].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		to_dst[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_dst[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_dst[i].image = impl->view_img[i];
+		to_dst[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	}
+	vk->vkCmdPipelineBarrier(cmd,
+	    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+	    VK_PIPELINE_STAGE_TRANSFER_BIT,
+	    0, 0, nullptr, 0, nullptr, 2, to_dst);
+
+	// Per-tile blit. Atlas layout is SBS: tile 0 = left half (x:0..w),
+	// tile 1 = right half (x:w..2w). Both fill the full atlas height.
+	for (int i = 0; i < 2; ++i) {
+		VkImageBlit blit = {};
+		blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+		blit.srcOffsets[0] = {(int32_t)(i * view_w), 0, 0};
+		blit.srcOffsets[1] = {(int32_t)((i + 1) * view_w), (int32_t)view_h, 1};
+		blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+		blit.dstOffsets[0] = {0, 0, 0};
+		blit.dstOffsets[1] = {(int32_t)view_w, (int32_t)view_h, 1};
+
+		vk->vkCmdBlitImage(cmd,
+		    atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		    impl->view_img[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		    1, &blit, VK_FILTER_LINEAR);
+	}
+
+	// TRANSFER_DST_OPTIMAL → SHADER_READ_ONLY_OPTIMAL so CNSDK can sample.
+	VkImageMemoryBarrier to_shr[2] = {};
+	for (int i = 0; i < 2; ++i) {
+		to_shr[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		to_shr[i].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		to_shr[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		to_shr[i].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		to_shr[i].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		to_shr[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_shr[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_shr[i].image = impl->view_img[i];
+		to_shr[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	}
+	vk->vkCmdPipelineBarrier(cmd,
+	    VK_PIPELINE_STAGE_TRANSFER_BIT,
+	    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	    0, 0, nullptr, 0, nullptr, 2, to_shr);
+
+	vk->vkEndCommandBuffer(cmd);
+
+	VkSubmitInfo si = {};
+	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	si.commandBufferCount = 1;
+	si.pCommandBuffers = &cmd;
+	VkResult res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, VK_NULL_HANDLE);
+	if (res == VK_SUCCESS) {
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+	}
+	vk->vkFreeCommandBuffers(vk->device, impl->cmd_pool, 1, &cmd);
+	return res == VK_SUCCESS;
+}
+
+void
+process_atlas_weave(struct xrt_display_processor *xdp,
+                    VkCommandBuffer cmd_buffer,
+                    VkImage_XDP atlas_image,
+                    VkImageView atlas_view,
+                    uint32_t view_width,
+                    uint32_t view_height,
+                    uint32_t tile_columns,
+                    uint32_t tile_rows,
+                    VkFormat_XDP view_format,
+                    VkFramebuffer target_fb,
+                    VkImage_XDP target_image,
+                    uint32_t target_width,
+                    uint32_t target_height,
+                    VkFormat_XDP target_format,
+                    int32_t canvas_offset_x,
+                    int32_t canvas_offset_y,
+                    uint32_t canvas_width,
+                    uint32_t canvas_height)
+{
+	(void)cmd_buffer;     // self-submitting: compositor passes VK_NULL_HANDLE
+	(void)atlas_view;     // CNSDK uses per-view image views we own
+	(void)view_format;
 	(void)canvas_offset_x; (void)canvas_offset_y;
 	(void)canvas_width; (void)canvas_height;
-	// TODO(#126 + #125): once the self_submitting flag exists and we have
-	// per-tile VkImageViews over the SBS atlas, call leia_cnsdk_weave()
-	// here with (left_view, right_view, target_fb, target_image).
+
+	leia_dp_cnsdk *impl = as_impl(xdp);
+
+	if (tile_columns != 2 || tile_rows != 1) {
+		static bool warned = false;
+		if (!warned) {
+			U_LOG_W("CNSDK DP expects 2x1 SBS atlas, got %ux%u; skipping weave",
+			        tile_columns, tile_rows);
+			warned = true;
+		}
+		return;
+	}
+
+	if (impl->vk == nullptr || impl->cmd_pool == VK_NULL_HANDLE) {
+		return;
+	}
+
+	// (Re)allocate per-view images if dims changed.
+	if (impl->cached_view_w != view_width || impl->cached_view_h != view_height) {
+		destroy_per_view_images(impl);
+		if (!create_per_view_images(impl, view_width, view_height)) {
+			destroy_per_view_images(impl);
+			return;
+		}
+	}
+
+	if (!blit_atlas_to_per_view(impl, (VkImage)(uintptr_t)atlas_image,
+	                             view_width, view_height)) {
+		return;
+	}
+
+	leia_cnsdk_weave(impl->cnsdk,
+	                 impl->vk->device,
+	                 impl->vk->physical_device,
+	                 impl->view_iv[0],
+	                 impl->view_iv[1],
+	                 (VkFormat)target_format,
+	                 target_width,
+	                 target_height,
+	                 target_fb,
+	                 (VkImage)(uintptr_t)target_image);
+}
+
+bool
+is_self_submitting_true(struct xrt_display_processor *xdp)
+{
+	(void)xdp;
+	return true;
 }
 
 bool
@@ -137,6 +379,7 @@ void
 destroy_impl(struct xrt_display_processor *xdp)
 {
 	leia_dp_cnsdk *impl = as_impl(xdp);
+	destroy_per_view_images(impl);
 	if (impl->cnsdk != nullptr) {
 		leia_cnsdk_destroy(&impl->cnsdk);
 	}
@@ -152,10 +395,7 @@ leia_dp_factory_cnsdk(void *vk_bundle,
                       int32_t target_format,
                       struct xrt_display_processor **out_xdp)
 {
-	// vk_bundle / vk_cmd_pool / window_handle / target_format are unused
-	// today — CNSDK looks up its own VkDevice via leia_core. They become
-	// relevant when process_atlas() actually calls leia_cnsdk_weave (#126).
-	(void)vk_bundle; (void)vk_cmd_pool; (void)window_handle; (void)target_format;
+	(void)window_handle; (void)target_format;
 
 	struct leia_cnsdk *cnsdk = nullptr;
 	xrt_result_t ret = leia_cnsdk_create(&cnsdk);
@@ -171,16 +411,17 @@ leia_dp_factory_cnsdk(void *vk_bundle,
 	}
 
 	impl->cnsdk = cnsdk;
-	impl->base.process_atlas = process_atlas_noop;
+	impl->vk = static_cast<struct vk_bundle *>(vk_bundle);
+	impl->cmd_pool = (VkCommandPool)(uintptr_t)vk_cmd_pool;
+	impl->base.process_atlas = process_atlas_weave;
+	impl->base.is_self_submitting = is_self_submitting_true;
 	impl->base.get_predicted_eye_positions = get_predicted_eye_positions_ipd;
 	impl->base.get_display_dimensions = get_display_dimensions_default;
 	impl->base.get_display_pixel_info = get_display_pixel_info_default;
 	impl->base.destroy = destroy_impl;
-	// All other vtable entries left NULL — inline helpers in
-	// xrt_display_processor.h NULL-check and return false / no-op.
 
 	*out_xdp = &impl->base;
 
-	U_LOG_W("Leia CNSDK DP created (POC: process_atlas is a no-op until #126)");
+	U_LOG_W("Leia CNSDK DP created (self-submitting, per-tile blit + CNSDK weave)");
 	return XRT_SUCCESS;
 }

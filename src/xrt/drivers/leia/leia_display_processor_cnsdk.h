@@ -5,11 +5,13 @@
  * @brief  Leia CNSDK display processor (Android): wraps the CNSDK
  *         Vulkan interlacer as an @ref xrt_display_processor.
  *
- * POC scope: factory + lifecycle + hardcoded display metrics + IPD-only
- * eye positions. process_atlas is a no-op until #126 (self_submitting
- * DP flag) lands — CNSDK's interlacer records and submits its own
- * command buffer, which doesn't fit the compositor's "record into my
- * cmd_buffer" contract.
+ * Advertises `is_self_submitting = true`. The compositor flushes its
+ * pre-DP cmd buffer before calling process_atlas, which blits the SBS
+ * atlas tiles into per-view VkImages and then calls leia_cnsdk_weave —
+ * CNSDK records and submits its own command buffer internally.
+ *
+ * POC scope: hardcoded Lume Pad display metrics + IPD-only eye
+ * positions (CNSDK face tracking wiring TBD).
  *
  * @author David Fattal
  * @ingroup drv_leia

@@ -219,6 +219,29 @@ struct xrt_display_processor
 	bool (*is_alpha_native)(struct xrt_display_processor *xdp);
 
 	/*!
+	 * Whether process_atlas records into its own VkCommandBuffer and submits
+	 * it to the queue internally, rather than recording into the cmd_buffer
+	 * passed by the compositor.
+	 *
+	 * When true, the compositor:
+	 *   - Ends and submits its pre-DP cmd_buffer (window-space layer
+	 *     composite, atlas crop) before calling process_atlas, so the GPU
+	 *     order matches the source order.
+	 *   - Passes VK_NULL_HANDLE for the cmd_buffer arg to process_atlas
+	 *     (the DP is expected to ignore it).
+	 *   - Skips its own post-process_atlas queue submit for the frame.
+	 *
+	 * Used by DPs that wrap a vendor SDK whose API records and submits
+	 * internally (e.g. CNSDK's leia_interlacer_vulkan_do_post_process).
+	 *
+	 * Optional — NULL means false (compositor records-and-submits as usual).
+	 *
+	 * @param xdp Pointer to self.
+	 * @return true if process_atlas submits its own cmd buffer.
+	 */
+	bool (*is_self_submitting)(struct xrt_display_processor *xdp);
+
+	/*!
 	 * Inform the DP of session-level transparency configuration.
 	 * Called once at session start when @p transparent_bg_enabled is set on
 	 * the corresponding window-binding extension. DPs that need the
@@ -409,6 +432,20 @@ xrt_display_processor_is_alpha_native(struct xrt_display_processor *xdp)
 		return false;
 	}
 	return xdp->is_alpha_native(xdp);
+}
+
+/*!
+ * @copydoc xrt_display_processor::is_self_submitting
+ * Returns false if not supported (function pointer is NULL).
+ * @public @memberof xrt_display_processor
+ */
+static inline bool
+xrt_display_processor_is_self_submitting(struct xrt_display_processor *xdp)
+{
+	if (xdp == NULL || xdp->is_self_submitting == NULL) {
+		return false;
+	}
+	return xdp->is_self_submitting(xdp);
 }
 
 /*!
