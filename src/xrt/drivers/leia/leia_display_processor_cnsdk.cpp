@@ -212,6 +212,26 @@ blit_atlas_to_per_view(leia_dp_cnsdk *impl,
 	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	vk->vkBeginCommandBuffer(cmd, &bi);
 
+	// Atlas arrives at process_atlas in SHADER_READ_ONLY_OPTIMAL (per the
+	// renderer's terminating barrier; see comp_vk_native_compositor.c
+	// around line 2057). vkCmdBlitImage requires TRANSFER_SRC_OPTIMAL on
+	// the source, so we transition here and restore at the bottom so the
+	// rest of the compositor's expectations stay valid.
+	VkImageMemoryBarrier atlas_to_src = {};
+	atlas_to_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	atlas_to_src.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	atlas_to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	atlas_to_src.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	atlas_to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	atlas_to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	atlas_to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	atlas_to_src.image = atlas_image;
+	atlas_to_src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	vk->vkCmdPipelineBarrier(cmd,
+	    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	    VK_PIPELINE_STAGE_TRANSFER_BIT,
+	    0, 0, nullptr, 0, nullptr, 1, &atlas_to_src);
+
 	// UNDEFINED → TRANSFER_DST_OPTIMAL on both view images.
 	VkImageMemoryBarrier to_dst[2] = {};
 	for (int i = 0; i < 2; ++i) {
@@ -248,7 +268,10 @@ blit_atlas_to_per_view(leia_dp_cnsdk *impl,
 	}
 
 	// TRANSFER_DST_OPTIMAL → SHADER_READ_ONLY_OPTIMAL so CNSDK can sample.
-	VkImageMemoryBarrier to_shr[2] = {};
+	// AND atlas TRANSFER_SRC_OPTIMAL → SHADER_READ_ONLY_OPTIMAL so the
+	// compositor's invariant ("atlas is shader-read-only when DP returns")
+	// is preserved (see top-of-function barrier comment).
+	VkImageMemoryBarrier to_shr[3] = {};
 	for (int i = 0; i < 2; ++i) {
 		to_shr[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
 		to_shr[i].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -260,10 +283,19 @@ blit_atlas_to_per_view(leia_dp_cnsdk *impl,
 		to_shr[i].image = impl->view_img[i];
 		to_shr[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 	}
+	to_shr[2].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	to_shr[2].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	to_shr[2].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	to_shr[2].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	to_shr[2].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	to_shr[2].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	to_shr[2].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	to_shr[2].image = atlas_image;
+	to_shr[2].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 	vk->vkCmdPipelineBarrier(cmd,
 	    VK_PIPELINE_STAGE_TRANSFER_BIT,
 	    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-	    0, 0, nullptr, 0, nullptr, 2, to_shr);
+	    0, 0, nullptr, 0, nullptr, 3, to_shr);
 
 	vk->vkEndCommandBuffer(cmd);
 
@@ -320,6 +352,20 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	}
 
 	if (impl->vk == nullptr || impl->cmd_pool == VK_NULL_HANDLE) {
+		return;
+	}
+
+	// Gate the entire blit+weave on CNSDK interlacer readiness. CNSDK
+	// init is async — until it completes, leia_cnsdk_weave returns early
+	// without calling do_post_process. If we still submitted the blit
+	// signaling blit_done, the binary semaphore would stay signaled with
+	// no consumer; the next frame's signal would be UB (double-signal).
+	// Skipping both blit and weave keeps blit_done quiescent and lets
+	// the next frame start cleanly once the interlacer is ready.
+	if (!leia_cnsdk_ensure_interlacer(impl->cnsdk,
+	                                   impl->vk->device,
+	                                   impl->vk->physical_device,
+	                                   (VkFormat)target_format)) {
 		return;
 	}
 
@@ -495,6 +541,17 @@ void
 destroy_impl(struct xrt_display_processor *xdp)
 {
 	leia_dp_cnsdk *impl = as_impl(xdp);
+
+	// Wait for all in-flight GPU work — both our blit submits AND CNSDK's
+	// own interlacer submits — to drain before touching any resources
+	// they might still be reading. blit_fence covers only the blit
+	// submit, not CNSDK's separate `do_post_process` submit, so a fence
+	// wait alone is insufficient and would let CNSDK read the per-view
+	// images and blit_done semaphore after we'd already freed them.
+	if (impl->vk != nullptr) {
+		impl->vk->vkDeviceWaitIdle(impl->vk->device);
+	}
+
 	destroy_blit_resources(impl);
 	destroy_per_view_images(impl);
 	if (impl->cnsdk != nullptr) {

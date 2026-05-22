@@ -82,15 +82,37 @@ bool
 leia_cnsdk_ensure_face_tracking_started(struct leia_cnsdk *cnsdk);
 
 /*!
+ * Idempotent: lazily create the CNSDK Vulkan interlacer once
+ * @ref leia_core_is_initialized returns true. Safe to call every frame.
+ *
+ * The DP must call this before signaling its `blit_done` semaphore each
+ * frame and only proceed with the blit submit if this returns true —
+ * otherwise the semaphore would be signaled but never consumed by
+ * @ref leia_cnsdk_weave (it returns early when the interlacer isn't
+ * ready), causing a binary-semaphore double-signal on the next frame.
+ *
+ * @return true if the interlacer exists and is ready to weave.
+ */
+bool
+leia_cnsdk_ensure_interlacer(struct leia_cnsdk *cnsdk,
+                              VkDevice device,
+                              VkPhysicalDevice physDev,
+                              VkFormat targetFmt);
+
+/*!
  * Fetch the latest predicted primary face position from CNSDK.
  *
  * Returns false until face tracking is running and CNSDK has a face
- * lock. Position is in meters; coordinate system matches xrt_eye_position
- * (x = right, y = up, z = toward viewer, origin = display center).
+ * lock. Position is returned in meters relative to the **display
+ * center** (matching `xrt_eye_position`'s convention), even though
+ * CNSDK natively returns millimeters relative to the camera. The
+ * wrapper does the unit conversion + camera-center translation using
+ * the cached `cameraCenterX/Y/Z` from `leia_device_config` populated
+ * once the core is initialized.
  *
- * @param[out] out_x  Face position X (meters).
- * @param[out] out_y  Face position Y (meters).
- * @param[out] out_z  Face position Z (meters, distance from display).
+ * @param[out] out_x  Face position X (meters, display-relative).
+ * @param[out] out_y  Face position Y (meters, display-relative).
+ * @param[out] out_z  Face position Z (meters, +toward viewer).
  * @return true if a valid face was returned.
  */
 bool

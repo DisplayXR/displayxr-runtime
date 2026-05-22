@@ -41,13 +41,26 @@ struct leia_cnsdk
 	// leia_core_enable_face_tracking is heavy (CNSDK docs explicitly warn
 	// against the main thread). Worker pattern:
 	//   - Spawn in leia_cnsdk_create.
-	//   - Worker polls leia_core_is_initialized until ready, then calls
-	//     enable + start, then sets face_tracking_started and exits.
+	//   - Worker polls leia_core_is_initialized until ready, then snapshots
+	//     the camera center from leia_device_config (needed to convert
+	//     CNSDK's camera-relative face positions into display-relative),
+	//     calls enable + start face tracking, then sets
+	//     face_tracking_started and exits.
 	//   - Destroy sets shutting_down to ask the worker to bail if it's
 	//     still in the polling phase, then joins.
+	//
+	// camera_center_{x,y,z}_m: cached at worker init. The `_m` suffix
+	// reminds the reader they're already mm→m converted before storage.
+	// These are read by leia_cnsdk_get_primary_face on the render thread
+	// only after face_tracking_started.load(acquire) returns true — the
+	// happens-before ordering of the atomic gives the read visibility on
+	// the worker's writes.
 	std::atomic<bool> face_tracking_started{false};
 	std::atomic<bool> shutting_down{false};
 	std::thread worker;
+	float camera_center_x_m{0.0f};
+	float camera_center_y_m{0.0f};
+	float camera_center_z_m{0.0f};
 };
 
 
@@ -76,7 +89,22 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 		return;
 	}
 
-	// Phase 2: heavy enable + start. Single call, can't be interrupted —
+	// Phase 2a: snapshot the camera center from the device config so the
+	// main-thread fast path can translate face positions without
+	// re-acquiring the (probably non-thread-safe) device config every
+	// frame. CNSDK's coordinate system has the camera at the origin and
+	// uses millimeters — we cache the offset in meters.
+	struct leia_device_config *cfg = leia_core_get_device_config(cnsdk->core);
+	if (cfg != NULL) {
+		cnsdk->camera_center_x_m = cfg->cameraCenterX / 1000.0f;
+		cnsdk->camera_center_y_m = cfg->cameraCenterY / 1000.0f;
+		cnsdk->camera_center_z_m = cfg->cameraCenterZ / 1000.0f;
+		leia_core_release_device_config(cnsdk->core, cfg);
+	} else {
+		U_LOG_W("leia_core_get_device_config failed in worker; camera center stays 0");
+	}
+
+	// Phase 2b: heavy enable + start. Single call, can't be interrupted —
 	// destroy will block on the join until this returns.
 	if (!leia_core_enable_face_tracking(cnsdk->core, true)) {
 		U_LOG_W("leia_core_enable_face_tracking failed (worker)");
@@ -224,6 +252,32 @@ leia_cnsdk_ensure_face_tracking_started(struct leia_cnsdk *cnsdk)
 }
 
 extern "C" bool
+leia_cnsdk_ensure_interlacer(struct leia_cnsdk *cnsdk,
+                              VkDevice device,
+                              VkPhysicalDevice physDev,
+                              VkFormat targetFmt)
+{
+	if (cnsdk == NULL || cnsdk->core == NULL) {
+		return false;
+	}
+	if (cnsdk->interlacer != NULL) {
+		return true;
+	}
+	if (!leia_core_is_initialized(cnsdk->core)) {
+		return false;
+	}
+
+	struct leia_interlacer_init_configuration *ic = leia_interlacer_init_configuration_alloc();
+	leia_interlacer_init_configuration_set_use_atlas_for_views(ic, false);
+	cnsdk->interlacer = leia_interlacer_vulkan_initialize(
+	    cnsdk->core, ic, device, physDev, VK_FORMAT_B8G8R8A8_SRGB,
+	    targetFmt, VK_FORMAT_D32_SFLOAT, 3);
+	leia_interlacer_init_configuration_free(ic);
+
+	return cnsdk->interlacer != NULL;
+}
+
+extern "C" bool
 leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
                             float *out_x,
                             float *out_y,
@@ -240,9 +294,16 @@ leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
 		return false;
 	}
 
-	if (out_x != NULL) { *out_x = position[0]; }
-	if (out_y != NULL) { *out_y = position[1]; }
-	if (out_z != NULL) { *out_z = position[2]; }
+	// CNSDK returns millimeters relative to the camera. xrt_eye_position
+	// wants meters relative to the display center, so divide by 1000 then
+	// subtract the cached camera center (also already in meters).
+	const float pos_x_m = position[0] / 1000.0f - cnsdk->camera_center_x_m;
+	const float pos_y_m = position[1] / 1000.0f - cnsdk->camera_center_y_m;
+	const float pos_z_m = position[2] / 1000.0f - cnsdk->camera_center_z_m;
+
+	if (out_x != NULL) { *out_x = pos_x_m; }
+	if (out_y != NULL) { *out_y = pos_y_m; }
+	if (out_z != NULL) { *out_z = pos_z_m; }
 	return true;
 }
 
