@@ -140,11 +140,19 @@ target_include_directories(target_instance_no_comp PUBLIC ${CMAKE_CURRENT_SOURCE
 # Platform
 
 if(ANDROID)
-	target_link_libraries(target_instance PRIVATE aux_android)
+	# TARGET guards: target_instance / target_instance_hybrid are only
+	# defined when XRT_FEATURE_SERVICE=ON (or HYBRID_MODE). The Android
+	# in-process build uses XRT_FEATURE_SERVICE=OFF and skips them; without
+	# the guard, CMake errors on "cannot specify link libraries for target
+	# which is not built by this project". (Borrowed from
+	# feature/android-cnsdk-ci 0a5c66047.)
+	if(TARGET target_instance)
+		target_link_libraries(target_instance PRIVATE aux_android)
+	endif()
 
 	target_link_libraries(target_instance_no_comp PRIVATE aux_android)
 
-	if(XRT_FEATURE_HYBRID_MODE)
+	if(XRT_FEATURE_HYBRID_MODE AND TARGET target_instance_hybrid)
 		target_link_libraries(target_instance_hybrid PRIVATE aux_android)
 	endif()
 endif()
