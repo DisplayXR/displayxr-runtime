@@ -10,8 +10,9 @@
  * atlas tiles into per-view VkImages and then calls leia_cnsdk_weave —
  * CNSDK records and submits its own command buffer internally.
  *
- * POC scope: hardcoded Lume Pad display metrics + IPD-only eye
- * positions (CNSDK face tracking wiring TBD).
+ * Display metrics + face-tracked eye positions come from CNSDK once the
+ * async core init completes (lazy on first query). Falls back to hardcoded
+ * Lume Pad 2 metrics and IPD-only eyes while the core is still booting.
  *
  * @author David Fattal
  * @ingroup drv_leia

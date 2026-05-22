@@ -15,6 +15,7 @@
 #include <leia/sdk/core.h>
 #include <leia/sdk/core.interlacer.vulkan.h>
 #include <leia/common/version.h>
+#include <leia/device/config.h>
 
 #ifdef XRT_OS_ANDROID
 #include "android/android_globals.h"
@@ -33,6 +34,11 @@ struct leia_cnsdk
 {
 	struct leia_core *core;
 	struct leia_interlacer *interlacer;
+
+	// Lazy face-tracking init. CNSDK's enable_face_tracking is heavy and
+	// must be called after the async core init completes; we do it once on
+	// first leia_cnsdk_ensure_face_tracking_started() call.
+	bool face_tracking_started;
 };
 
 
@@ -112,6 +118,90 @@ leia_cnsdk_is_initialized(struct leia_cnsdk *cnsdk)
 		return false;
 	}
 	return leia_core_is_initialized(cnsdk->core);
+}
+
+extern "C" bool
+leia_cnsdk_get_display_metrics(struct leia_cnsdk *cnsdk,
+                               float *out_width_m,
+                               float *out_height_m,
+                               uint32_t *out_pixel_w,
+                               uint32_t *out_pixel_h)
+{
+	if (cnsdk == NULL || cnsdk->core == NULL) {
+		return false;
+	}
+	if (!leia_core_is_initialized(cnsdk->core)) {
+		return false;
+	}
+
+	struct leia_device_config *cfg = leia_core_get_device_config(cnsdk->core);
+	if (cfg == NULL) {
+		return false;
+	}
+
+	if (out_width_m != NULL) {
+		*out_width_m = (float)cfg->displaySizeInMm[0] / 1000.0f;
+	}
+	if (out_height_m != NULL) {
+		*out_height_m = (float)cfg->displaySizeInMm[1] / 1000.0f;
+	}
+	if (out_pixel_w != NULL) {
+		*out_pixel_w = (uint32_t)cfg->panelResolution[0];
+	}
+	if (out_pixel_h != NULL) {
+		*out_pixel_h = (uint32_t)cfg->panelResolution[1];
+	}
+
+	leia_core_release_device_config(cnsdk->core, cfg);
+	return true;
+}
+
+extern "C" bool
+leia_cnsdk_ensure_face_tracking_started(struct leia_cnsdk *cnsdk)
+{
+	if (cnsdk == NULL || cnsdk->core == NULL) {
+		return false;
+	}
+	if (cnsdk->face_tracking_started) {
+		return true;
+	}
+	if (!leia_core_is_initialized(cnsdk->core)) {
+		return false;
+	}
+
+	// Heavy — CNSDK docs warn against the main thread. POC accepts the
+	// one-time stall; future work: kick this off a worker thread.
+	if (!leia_core_enable_face_tracking(cnsdk->core, true)) {
+		U_LOG_W("leia_core_enable_face_tracking failed");
+		return false;
+	}
+	leia_core_start_face_tracking(cnsdk->core, true);
+
+	cnsdk->face_tracking_started = true;
+	U_LOG_W("CNSDK face tracking started");
+	return true;
+}
+
+extern "C" bool
+leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
+                            float *out_x,
+                            float *out_y,
+                            float *out_z)
+{
+	if (cnsdk == NULL || cnsdk->core == NULL || !cnsdk->face_tracking_started) {
+		return false;
+	}
+
+	float position[3] = {0, 0, 0};
+	struct leia_float_slice slice = {position, 3};
+	if (!leia_core_get_primary_face(cnsdk->core, slice)) {
+		return false;
+	}
+
+	if (out_x != NULL) { *out_x = position[0]; }
+	if (out_y != NULL) { *out_y = position[1]; }
+	if (out_z != NULL) { *out_z = position[2]; }
+	return true;
 }
 
 extern "C" void

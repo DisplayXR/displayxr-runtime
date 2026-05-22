@@ -48,6 +48,56 @@ bool
 leia_cnsdk_is_initialized(struct leia_cnsdk *cnsdk);
 
 /*!
+ * Fetch native display metrics from CNSDK's device config.
+ *
+ * Returns false (without touching outputs) until @ref leia_cnsdk_create
+ * has finished async-initializing the underlying leia_core. Caller is
+ * expected to poll across frames.
+ *
+ * @param[out] out_width_m   Display physical width in meters.
+ * @param[out] out_height_m  Display physical height in meters.
+ * @param[out] out_pixel_w   Panel pixel width.
+ * @param[out] out_pixel_h   Panel pixel height.
+ * @return true if all outputs were populated.
+ */
+bool
+leia_cnsdk_get_display_metrics(struct leia_cnsdk *cnsdk,
+                               float *out_width_m,
+                               float *out_height_m,
+                               uint32_t *out_pixel_w,
+                               uint32_t *out_pixel_h);
+
+/*!
+ * Idempotent: enable + start CNSDK face tracking the first time it is
+ * called after the core is initialized. The CNSDK docs warn that
+ * leia_core_enable_face_tracking is heavyweight and should not be
+ * called on the main thread, but the POC accepts the one-time stall.
+ *
+ * @return true once face tracking is started; false until the core is
+ *         ready (or if enable failed).
+ */
+bool
+leia_cnsdk_ensure_face_tracking_started(struct leia_cnsdk *cnsdk);
+
+/*!
+ * Fetch the latest predicted primary face position from CNSDK.
+ *
+ * Returns false until face tracking is running and CNSDK has a face
+ * lock. Position is in meters; coordinate system matches xrt_eye_position
+ * (x = right, y = up, z = toward viewer, origin = display center).
+ *
+ * @param[out] out_x  Face position X (meters).
+ * @param[out] out_y  Face position Y (meters).
+ * @param[out] out_z  Face position Z (meters, distance from display).
+ * @return true if a valid face was returned.
+ */
+bool
+leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
+                            float *out_x,
+                            float *out_y,
+                            float *out_z);
+
+/*!
  * Perform CNSDK Vulkan interlacing.
  *
  * Lazily creates the interlacer on first call after the core is ready.

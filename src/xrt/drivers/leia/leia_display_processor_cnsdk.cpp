@@ -357,20 +357,36 @@ is_self_submitting_true(struct xrt_display_processor *xdp)
 	return true;
 }
 
+// Try to fetch CNSDK's predicted face position and derive L/R eyes from
+// it (face X ± IPD/2). Falls back to a hardcoded IPD-only stub if face
+// tracking isn't running yet (CNSDK core still async-initializing, or
+// no face lock).
 bool
 get_predicted_eye_positions_ipd(struct xrt_display_processor *xdp,
                                  struct xrt_eye_positions *out_eye_pos)
 {
-	(void)xdp;
-	out_eye_pos->eyes[0].x = -kIpdHalfM;
-	out_eye_pos->eyes[0].y = 0.0f;
-	out_eye_pos->eyes[0].z = kEyeViewerDistM;
-	out_eye_pos->eyes[1].x = +kIpdHalfM;
-	out_eye_pos->eyes[1].y = 0.0f;
-	out_eye_pos->eyes[1].z = kEyeViewerDistM;
+	leia_dp_cnsdk *impl = as_impl(xdp);
+
+	bool tracked = false;
+	float fx = 0.0f, fy = 0.0f, fz = kEyeViewerDistM;
+	if (impl->cnsdk != nullptr) {
+		// Lazy start; harmless if already running. The first successful
+		// call costs a CNSDK enable_face_tracking stall — POC accepts.
+		if (leia_cnsdk_ensure_face_tracking_started(impl->cnsdk) &&
+		    leia_cnsdk_get_primary_face(impl->cnsdk, &fx, &fy, &fz)) {
+			tracked = true;
+		}
+	}
+
+	out_eye_pos->eyes[0].x = fx - kIpdHalfM;
+	out_eye_pos->eyes[0].y = fy;
+	out_eye_pos->eyes[0].z = fz;
+	out_eye_pos->eyes[1].x = fx + kIpdHalfM;
+	out_eye_pos->eyes[1].y = fy;
+	out_eye_pos->eyes[1].z = fz;
 	out_eye_pos->count = 2;
 	out_eye_pos->valid = true;
-	out_eye_pos->is_tracking = false;
+	out_eye_pos->is_tracking = tracked;
 	return true;
 }
 
@@ -379,7 +395,14 @@ get_display_dimensions_default(struct xrt_display_processor *xdp,
                                 float *out_width_m,
                                 float *out_height_m)
 {
-	(void)xdp;
+	leia_dp_cnsdk *impl = as_impl(xdp);
+
+	if (impl->cnsdk != nullptr &&
+	    leia_cnsdk_get_display_metrics(impl->cnsdk, out_width_m, out_height_m,
+	                                    nullptr, nullptr)) {
+		return true;
+	}
+
 	*out_width_m = kDefaultDisplayWidthM;
 	*out_height_m = kDefaultDisplayHeightM;
 	return true;
@@ -392,11 +415,19 @@ get_display_pixel_info_default(struct xrt_display_processor *xdp,
                                 int32_t *out_screen_left,
                                 int32_t *out_screen_top)
 {
-	(void)xdp;
-	*out_pixel_width = kDefaultDisplayPixelW;
-	*out_pixel_height = kDefaultDisplayPixelH;
+	leia_dp_cnsdk *impl = as_impl(xdp);
+
 	*out_screen_left = 0;
 	*out_screen_top = 0;
+
+	if (impl->cnsdk != nullptr &&
+	    leia_cnsdk_get_display_metrics(impl->cnsdk, nullptr, nullptr,
+	                                    out_pixel_width, out_pixel_height)) {
+		return true;
+	}
+
+	*out_pixel_width = kDefaultDisplayPixelW;
+	*out_pixel_height = kDefaultDisplayPixelH;
 	return true;
 }
 
