@@ -1,0 +1,16 @@
+/*
+ * Single-symbol export filter for vendor plug-in dylibs on Linux/BSD.
+ * Mirrors the Mach-O `-exported_symbol _xrtPluginNegotiate` filter on
+ * macOS and the implicit dllexport-only contract on Windows.
+ *
+ * Every DisplayXR plug-in dylib MUST export exactly one symbol:
+ * `xrtPluginNegotiate`. The runtime's discovery loader resolves it via
+ * dlsym; all other symbols (including aux helpers pulled in from
+ * static archives) stay local.
+ */
+{
+	global:
+		xrtPluginNegotiate;
+	local:
+		*;
+};

@@ -13,8 +13,10 @@
 # --- Khronos OpenXR loader interface ---
 _xrNegotiateLoaderRuntimeInterface
 
-# --- sim_display in-process driver hook (legacy, kept for compatibility) ---
-_sim_display_set_output_mode
+# (Removed: _sim_display_set_output_mode — that symbol lives in the
+#  DisplayXR-SimDisplay.dylib plug-in since ADR-019 / issue #256. The
+#  runtime DLL no longer link-includes drv_sim_display in production
+#  builds, so the symbol isn't available to export here.)
 
 # --- u_logging.h ---
 _u_log

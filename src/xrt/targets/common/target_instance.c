@@ -50,8 +50,12 @@
 #endif
 #endif
 
-// sim_display display info for XR_EXT_display_info fallback
+// sim_display display info for XR_EXT_display_info fallback — only
+// compiled in the developer in-proc fallback build (ADR-019 / issue
+// #256). Production builds route everything through the plug-in iface.
+#ifdef XRT_PLUGIN_BUILD_INPROC_FALLBACK
 #include "sim_display/sim_display_interface.h"
+#endif
 
 #include "target_plugin_loader.h"
 
@@ -394,10 +398,25 @@ out:
 		}
 #endif /* XRT_HAVE_LEIA_SR && XRT_PLUGIN_BUILD_INPROC_FALLBACK */
 
-		// sim_display fallback: populate display info and factory if not already set by SR SDK
+		/* Consumed by the gated fallback blocks (Leia in-proc + sim_display
+		 * in-proc). When neither fallback compiles in (production builds),
+		 * silence -Wunused-but-set-variable. */
+		(void)plugin_filled_display_info;
+
+		// sim_display fallback. Production builds (ADR-019/issue #256)
+		// populate everything through the plug-in iface above and skip
+		// this block entirely — the runtime DLL no longer link-includes
+		// drv_sim_display, so its symbols aren't available.
+		//
+		// XRT_PLUGIN_BUILD_INPROC_FALLBACK keeps the static path
+		// compiled in for developer iteration without a registered
+		// plug-in dylib. Even in the fallback build, the iface path
+		// runs first; this block only fires when no plug-in loaded
+		// AND the static archive is on the link line.
+#ifdef XRT_PLUGIN_BUILD_INPROC_FALLBACK
 		{
 			struct sim_display_info sd_info;
-			if (xsysc->info.display_width_m == 0.0f &&
+			if (!plugin_filled_display_info && xsysc->info.display_width_m == 0.0f &&
 			    sim_display_get_display_info(head, &sd_info)) {
 				xsysc->info.display_width_m = sd_info.display_width_m;
 				xsysc->info.display_height_m = sd_info.display_height_m;
@@ -434,7 +453,7 @@ out:
 				// Sim display: manual eye tracking only (simulated device, always "tracking")
 				xsysc->info.supported_eye_tracking_modes = 2; // MANUAL_BIT
 				xsysc->info.default_eye_tracking_mode = 1;    // MANUAL
-				U_LOG_W("XR_EXT_display_info (sim_display): display=%.3fx%.3f m, "
+				U_LOG_W("XR_EXT_display_info (sim_display in-proc fallback): display=%.3fx%.3f m, "
 				        "nominal=(0, %.3f, %.3f) m, scale=%.2fx%.2f, atlas=%ux%u, pixels=%ux%u",
 				        sd_info.display_width_m, sd_info.display_height_m,
 				        sd_info.nominal_y_m, sd_info.nominal_z_m,
@@ -444,47 +463,30 @@ out:
 				        xsysc->info.atlas_height_pixels,
 				        sd_info.display_pixel_width, sd_info.display_pixel_height);
 
-				// Set sim_display factories (only if Leia SR didn't already set them).
-				//
-				// Prefer the sim_display plug-in DLL's factories when it loaded
-				// successfully (issue #256 / ADR-019); otherwise fall back to
-				// the in-tree statically-linked sim_display_dp_factory_*. NULL
-				// from the iface (per-API not supported on this platform) also
-				// falls through to the static path.
-				const struct xrt_plugin_iface *sd_plugin = target_plugin_get_active();
 				if (xsysc->info.dp_factory_vk == NULL) {
-					xsysc->info.dp_factory_vk = (void *)((sd_plugin && sd_plugin->create_dp_vk)
-					                                         ? sd_plugin->create_dp_vk
-					                                         : sim_display_dp_factory_vk);
+					xsysc->info.dp_factory_vk = (void *)sim_display_dp_factory_vk;
 				}
 #ifdef XRT_OS_WINDOWS
 				if (xsysc->info.dp_factory_d3d11 == NULL) {
-					xsysc->info.dp_factory_d3d11 = (void *)((sd_plugin && sd_plugin->create_dp_d3d11)
-					                                            ? sd_plugin->create_dp_d3d11
-					                                            : sim_display_dp_factory_d3d11);
+					xsysc->info.dp_factory_d3d11 = (void *)sim_display_dp_factory_d3d11;
 				}
 #endif
 #if defined(XRT_OS_WINDOWS) && defined(XRT_HAVE_D3D12)
 				if (xsysc->info.dp_factory_d3d12 == NULL) {
-					xsysc->info.dp_factory_d3d12 = (void *)((sd_plugin && sd_plugin->create_dp_d3d12)
-					                                            ? sd_plugin->create_dp_d3d12
-					                                            : sim_display_dp_factory_d3d12);
+					xsysc->info.dp_factory_d3d12 = (void *)sim_display_dp_factory_d3d12;
 				}
 #endif
 #ifdef __APPLE__
 				if (xsysc->info.dp_factory_metal == NULL) {
-					xsysc->info.dp_factory_metal = (void *)((sd_plugin && sd_plugin->create_dp_metal)
-					                                            ? sd_plugin->create_dp_metal
-					                                            : sim_display_dp_factory_metal);
+					xsysc->info.dp_factory_metal = (void *)sim_display_dp_factory_metal;
 				}
 #endif
 				if (xsysc->info.dp_factory_gl == NULL) {
-					xsysc->info.dp_factory_gl = (void *)((sd_plugin && sd_plugin->create_dp_gl)
-					                                         ? sd_plugin->create_dp_gl
-					                                         : sim_display_dp_factory_gl);
+					xsysc->info.dp_factory_gl = (void *)sim_display_dp_factory_gl;
 				}
 			}
 		}
+#endif /* XRT_PLUGIN_BUILD_INPROC_FALLBACK */
 
 		assert(out_xsysc != NULL);
 		*out_xsysc = xsysc;
