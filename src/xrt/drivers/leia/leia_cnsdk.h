@@ -68,13 +68,15 @@ leia_cnsdk_get_display_metrics(struct leia_cnsdk *cnsdk,
                                uint32_t *out_pixel_h);
 
 /*!
- * Idempotent: enable + start CNSDK face tracking the first time it is
- * called after the core is initialized. The CNSDK docs warn that
- * leia_core_enable_face_tracking is heavyweight and should not be
- * called on the main thread, but the POC accepts the one-time stall.
+ * Non-blocking check for whether CNSDK face tracking is running.
  *
- * @return true once face tracking is started; false until the core is
- *         ready (or if enable failed).
+ * Enable + start happens asynchronously on a worker thread spawned by
+ * @ref leia_cnsdk_create, so callers can poll this every frame from the
+ * render thread without stalling. Returns true once the worker has
+ * finished enabling + starting; false until then (or permanently if
+ * the enable call failed).
+ *
+ * @return true once face tracking is started.
  */
 bool
 leia_cnsdk_ensure_face_tracking_started(struct leia_cnsdk *cnsdk);

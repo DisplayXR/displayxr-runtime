@@ -21,7 +21,9 @@
 #include "android/android_globals.h"
 #endif
 
-#include <stdlib.h>
+#include <atomic>
+#include <chrono>
+#include <thread>
 
 
 /*
@@ -32,14 +34,61 @@
 
 struct leia_cnsdk
 {
-	struct leia_core *core;
-	struct leia_interlacer *interlacer;
+	struct leia_core *core{nullptr};
+	struct leia_interlacer *interlacer{nullptr};
 
-	// Lazy face-tracking init. CNSDK's enable_face_tracking is heavy and
-	// must be called after the async core init completes; we do it once on
-	// first leia_cnsdk_ensure_face_tracking_started() call.
-	bool face_tracking_started;
+	// Face-tracking startup is offloaded to a worker thread because
+	// leia_core_enable_face_tracking is heavy (CNSDK docs explicitly warn
+	// against the main thread). Worker pattern:
+	//   - Spawn in leia_cnsdk_create.
+	//   - Worker polls leia_core_is_initialized until ready, then calls
+	//     enable + start, then sets face_tracking_started and exits.
+	//   - Destroy sets shutting_down to ask the worker to bail if it's
+	//     still in the polling phase, then joins.
+	std::atomic<bool> face_tracking_started{false};
+	std::atomic<bool> shutting_down{false};
+	std::thread worker;
 };
+
+
+/*
+ *
+ * Private helpers.
+ *
+ */
+
+namespace {
+
+void
+face_tracking_worker(struct leia_cnsdk *cnsdk)
+{
+	using namespace std::chrono_literals;
+
+	// Phase 1: wait for the async core init to complete. Poll every 50 ms;
+	// honor shutdown promptly.
+	while (!cnsdk->shutting_down.load(std::memory_order_acquire)) {
+		if (cnsdk->core != nullptr && leia_core_is_initialized(cnsdk->core)) {
+			break;
+		}
+		std::this_thread::sleep_for(50ms);
+	}
+	if (cnsdk->shutting_down.load(std::memory_order_acquire)) {
+		return;
+	}
+
+	// Phase 2: heavy enable + start. Single call, can't be interrupted —
+	// destroy will block on the join until this returns.
+	if (!leia_core_enable_face_tracking(cnsdk->core, true)) {
+		U_LOG_W("leia_core_enable_face_tracking failed (worker)");
+		return;
+	}
+	leia_core_start_face_tracking(cnsdk->core, true);
+
+	cnsdk->face_tracking_started.store(true, std::memory_order_release);
+	U_LOG_W("CNSDK face tracking started (worker)");
+}
+
+} // namespace
 
 
 /*
@@ -75,9 +124,9 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 
 	leia_core_set_backlight(core, true);
 
-	struct leia_cnsdk *cnsdk = (struct leia_cnsdk *)calloc(1, sizeof(*cnsdk));
+	auto *cnsdk = new struct leia_cnsdk();
 	cnsdk->core = core;
-	cnsdk->interlacer = NULL;
+	cnsdk->worker = std::thread(face_tracking_worker, cnsdk);
 
 	*out_cnsdk = cnsdk;
 	return XRT_SUCCESS;
@@ -91,6 +140,13 @@ leia_cnsdk_destroy(struct leia_cnsdk **cnsdk_ptr)
 	}
 
 	struct leia_cnsdk *cnsdk = *cnsdk_ptr;
+
+	// Signal the worker, then join. If the worker is mid-enable_face_tracking
+	// we have to wait it out — CNSDK provides no interruption hook.
+	cnsdk->shutting_down.store(true, std::memory_order_release);
+	if (cnsdk->worker.joinable()) {
+		cnsdk->worker.join();
+	}
 
 	if (cnsdk->interlacer != NULL) {
 		// CNSDK 0.7.28 renamed the per-interlacer release; the core owns the
@@ -107,7 +163,7 @@ leia_cnsdk_destroy(struct leia_cnsdk **cnsdk_ptr)
 
 	leia_platform_on_library_unload();
 
-	free(cnsdk);
+	delete cnsdk;
 	*cnsdk_ptr = NULL;
 }
 
@@ -159,27 +215,12 @@ leia_cnsdk_get_display_metrics(struct leia_cnsdk *cnsdk,
 extern "C" bool
 leia_cnsdk_ensure_face_tracking_started(struct leia_cnsdk *cnsdk)
 {
-	if (cnsdk == NULL || cnsdk->core == NULL) {
+	// Worker thread handles enable + start; this is now a non-blocking
+	// status check.
+	if (cnsdk == NULL) {
 		return false;
 	}
-	if (cnsdk->face_tracking_started) {
-		return true;
-	}
-	if (!leia_core_is_initialized(cnsdk->core)) {
-		return false;
-	}
-
-	// Heavy — CNSDK docs warn against the main thread. POC accepts the
-	// one-time stall; future work: kick this off a worker thread.
-	if (!leia_core_enable_face_tracking(cnsdk->core, true)) {
-		U_LOG_W("leia_core_enable_face_tracking failed");
-		return false;
-	}
-	leia_core_start_face_tracking(cnsdk->core, true);
-
-	cnsdk->face_tracking_started = true;
-	U_LOG_W("CNSDK face tracking started");
-	return true;
+	return cnsdk->face_tracking_started.load(std::memory_order_acquire);
 }
 
 extern "C" bool
@@ -188,7 +229,8 @@ leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
                             float *out_y,
                             float *out_z)
 {
-	if (cnsdk == NULL || cnsdk->core == NULL || !cnsdk->face_tracking_started) {
+	if (cnsdk == NULL || cnsdk->core == NULL ||
+	    !cnsdk->face_tracking_started.load(std::memory_order_acquire)) {
 		return false;
 	}
 
