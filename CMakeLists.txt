@@ -304,6 +304,19 @@ set(XRT_IPC_MSG_SOCK_FILENAME displayxr_comp_ipc CACHE STRING "Service socket fi
 set(XRT_IPC_SERVICE_PID_FILENAME displayxr.pid CACHE STRING "Service pidfile filename")
 set(XRT_OXR_RUNTIME_SUFFIX displayxr CACHE STRING "OpenXR client library suffix")
 
+# RUNTIME_TARGET is the CMake target name of the runtime DLL. It is defined
+# canonically in `src/xrt/targets/openxr/CMakeLists.txt` with `CACHE INTERNAL
+# ... FORCE`, but that subdirectory is added AFTER `src/xrt/drivers/`, where
+# the plug-in DLLs (drv_leia_plugin, drv_sim_display_plugin) reference
+# `${RUNTIME_TARGET}` in `$<TARGET_LINKER_FILE:...>` generator expressions
+# and `add_dependencies(...)`. On a fresh-cache configure, `${RUNTIME_TARGET}`
+# is empty when drivers/ runs, and the generator expression `$<TARGET_LINKER_FILE:>`
+# is rejected as malformed (caught by macOS CI, latent on Windows because
+# the partial-cache second-pass populates it). Set it here so it's defined
+# before any add_subdirectory(...) reads it. The targets/openxr/CMakeLists.txt
+# `set(... CACHE INTERNAL "" FORCE)` overwrites with the same value later.
+set(RUNTIME_TARGET openxr_${XRT_OXR_RUNTIME_SUFFIX} CACHE INTERNAL "Runtime target name")
+
 # DisplayXR Windows installer options
 if(WIN32)
 	option(XRT_BUILD_INSTALLER "Build NSIS installer (Windows only)" OFF)
