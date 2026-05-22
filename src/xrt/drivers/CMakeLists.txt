@@ -381,6 +381,14 @@ if(XRT_HAVE_LEIA_SR AND LEIA_SOURCES)
 		VISIBILITY_INLINES_HIDDEN ON
 		)
 
+	if(APPLE)
+		target_link_options(drv_leia_plugin PRIVATE
+			"LINKER:-exported_symbol,_xrtPluginNegotiate")
+	elseif(NOT WIN32 AND NOT ANDROID)
+		target_link_options(drv_leia_plugin PRIVATE
+			"LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/plugin_exports.version")
+	endif()
+
 	if(WIN32)
 		install(
 			TARGETS drv_leia_plugin
@@ -547,8 +555,10 @@ endif()
 # Honor the ADR-019 invariant that every plug-in DLL exports exactly
 # one symbol: xrtPluginNegotiate. The XRT_PLUGIN_EXPORT decoration in
 # sim_display_plugin.c does the heavy lifting on Windows (dllexport).
-# On Linux / macOS we apply visibility=hidden defaults below so any
-# accidentally-non-static symbols stay private.
+# On Linux / macOS the visibility=hidden defaults only hide the
+# plug-in's own TUs; static archives pulled in from aux_util / aux_os
+# / aux_math carry their original (default-visible) symbols into the
+# plug-in dylib unless we explicitly filter at the link step.
 set_target_properties(drv_sim_display_plugin PROPERTIES
 	OUTPUT_NAME "DisplayXR-SimDisplay"
 	PREFIX ""
@@ -556,6 +566,18 @@ set_target_properties(drv_sim_display_plugin PROPERTIES
 	CXX_VISIBILITY_PRESET hidden
 	VISIBILITY_INLINES_HIDDEN ON
 	)
+
+# Single-symbol export filter for the plug-in dylib. Mirrors the
+# runtime's exported_symbols.list-driven Mach-O filter and Linux's
+# version-script approach. xrtPluginNegotiate is the only ABI symbol
+# the discovery loader resolves via dlsym.
+if(APPLE)
+	target_link_options(drv_sim_display_plugin PRIVATE
+		"LINKER:-exported_symbol,_xrtPluginNegotiate")
+elseif(NOT WIN32 AND NOT ANDROID)
+	target_link_options(drv_sim_display_plugin PRIVATE
+		"LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/plugin_exports.version")
+endif()
 
 # Install the plug-in DLL next to the runtime DLL. The plan defines
 # $INSTDIR\plugins\ as the home, but the runtime DLL's transitive

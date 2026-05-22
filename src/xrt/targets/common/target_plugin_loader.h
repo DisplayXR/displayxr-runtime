@@ -5,15 +5,18 @@
  * @brief  Runtime-side loader for vendor plug-in DLLs.
  *
  * Implements the consumer side of the ABI defined in
- * `xrt/xrt_plugin.h`. On first call, the loader enumerates
- * `HKLM\Software\DisplayXR\DisplayProcessors\*` (Windows) — the
- * registry schema documented in
- * `docs/roadmap/vendor-plugin-architecture.md` §4.1 — sorts the
- * registered plug-ins by their `ProbeOrder` value (ascending; missing
- * = 100), and tries each in turn: `LoadLibraryExW` → `GetProcAddress`
- * → `xrtPluginNegotiate` → `iface->probe()`. The first plug-in whose
- * probe returns `XRT_SUCCESS` wins and is cached for the process's
- * lifetime; subsequent registry entries are not attempted.
+ * `xrt/xrt_plugin.h`. On first call, the loader enumerates the
+ * platform's discovery root — `HKLM\Software\DisplayXR\DisplayProcessors\*`
+ * on Windows, JSON manifests under
+ * `~/Library/Application Support/DisplayXR/DisplayProcessors/` on macOS,
+ * or `${XDG_DATA_HOME:-~/.local/share}/DisplayXR/DisplayProcessors/`
+ * plus system roots on Linux — sorts the registered plug-ins by their
+ * `ProbeOrder` value (ascending; missing = 100), and tries each in
+ * turn: load the DLL/dylib → resolve `xrtPluginNegotiate` →
+ * `iface->probe()`. The first plug-in whose probe returns
+ * `XRT_SUCCESS` wins and is cached for the process's lifetime;
+ * subsequent entries are not attempted. The discovery contract lives
+ * at `docs/specs/runtime/plugin-discovery.md`.
  *
  * The loader is intentionally per-process and one-shot. Multi-vendor
  * heterogeneous setups (multiple active plug-ins concurrently) are a
@@ -45,11 +48,9 @@ extern "C" {
  * fall back to the statically-linked driver symbols.
  *
  * Reasons the loader returns NULL:
- *   - Non-Windows platform (v1 limitation; the manifest-driven Linux
- *     and macOS discovery lands with the cross-platform port).
- *   - `HKLM\Software\DisplayXR\DisplayProcessors` absent or empty
- *     (typical for developer builds that haven't run the installer or
- *     written the registry entry by hand).
+ *   - Discovery root is absent or empty (no Windows registry key, no
+ *     JSON manifests in any POSIX root — typical for developer builds
+ *     that haven't run an installer or set `XRT_PLUGIN_SEARCH_PATH`).
  *   - Every registered plug-in failed to load, declined at
  *     `xrtPluginNegotiate`, or returned non-`XRT_SUCCESS` from
  *     `iface->probe()`.

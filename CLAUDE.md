@@ -239,10 +239,12 @@ For the full interface catalog including display processor vtables (5 API varian
 Vendor display drivers now ship as **plug-in DLLs** (ADR-019 / issue
 #256). `DisplayXR-LeiaSR.dll` (built from `drivers/leia/` + the
 `xrtPluginNegotiate` entry point in `leia_plugin.c`) loads at
-`xrCreateInstance` time via the registry-driven discovery in
-`target_plugin_loader.c`. The runtime DLL itself has zero SR
-identifiers in its link line — see ADR-019 §2.1 and the CI assertion
-in `.github/workflows/build-windows.yml`.
+`xrCreateInstance` time via the registry-driven discovery on Windows
+(or the JSON-manifest discovery on POSIX, as of issue #267 — macOS
+also enforces vendor separation now via `DisplayXR-SimDisplay.dylib`)
+in `target_plugin_loader.c`. The runtime DLL itself has zero SR or
+`sim_display_*` identifiers in its link line — see ADR-019 §2.1 and
+the CI assertion in `.github/workflows/build-windows.yml`.
 
 - `XRT_HAVE_LEIA_SR` CMake option (auto-enabled if SDK found) now
   drives the plug-in DLL build, not a static link of `drv_leia` into
@@ -305,9 +307,10 @@ Full reference: [`docs/getting-started/building.md` § Local Dev Iteration](docs
   DLL build; the runtime DLL no longer static-links drv_leia)
 - `XRT_HAVE_LEIA_SR_VULKAN` / `XRT_HAVE_LEIA_SR_D3D11` — API-specific weavers
 - `XRT_PLUGIN_BUILD_INPROC_FALLBACK` (default OFF) — developer flag
-  that also static-links drv_leia into the runtime DLL for in-proc
-  debugging. Production builds leave this off and route everything
-  through the plug-in DLL.
+  that also static-links `drv_leia` and `drv_sim_display` into the
+  runtime DLL for in-proc debugging. Production builds leave this off
+  and route everything through the plug-in DLL/dylib (`DisplayXR-LeiaSR`,
+  `DisplayXR-SimDisplay`) discovered at `xrCreateInstance` time.
 - `XRT_FEATURE_SERVICE` — Out-of-process service mode
 - `BUILD_TESTING` — Test suite
 
@@ -341,7 +344,7 @@ Ask Gemini to analyze code and produce a read-only report. See `~/.claude/skills
 
 ## macOS Test App Local Builds
 
-Copy binaries to `_package/DisplayXR-macOS/bin/`. Run scripts exec from `$DIR/bin/`.
+Copy binaries to `_package/DisplayXR-macOS/bin/`. Run scripts exec from `$DIR/bin/`. As of issue #267, every generated `run_*.sh` also sets `XRT_PLUGIN_SEARCH_PATH=$DIR/lib/displayxr/plugins` so the dev tree's `DisplayXR-SimDisplay.dylib` (alongside its `200-sim-display.json` manifest) is discovered by the runtime's plug-in loader without touching `~/Library/Application Support/`.
 
 | Test App | Build Output | Package Binary | Run Script |
 |----------|-------------|---------------|------------|

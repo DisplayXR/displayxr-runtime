@@ -165,10 +165,51 @@ mkdir -p "$PKG_DIR/lib"
 mkdir -p "$PKG_DIR/share/vulkan/icd.d"
 mkdir -p "$PKG_DIR/bin"
 
-# Find and copy runtime
-RUNTIME_LIB=$(find "$BUILD_DIR/src/xrt/targets/openxr" -name "libopenxr_displayxr*" -type f | head -1)
+# Find and copy runtime.
+# The runtime is a SHARED dylib with PREFIX="" (issue #256 / ADR-019):
+# CMake produces `openxr_displayxr.dylib`, not `libopenxr_displayxr.*`.
+# Match both the new dylib name and legacy `.so`/`lib*` shapes in case an
+# in-flight build leaves one of those behind during transition.
+RUNTIME_LIB=$(find "$BUILD_DIR/src/xrt/targets/openxr" -maxdepth 1 \
+  \( -name "openxr_displayxr.dylib" -o -name "openxr_displayxr.so" -o -name "libopenxr_displayxr*" \) \
+  -type f | head -1)
+if [ -z "$RUNTIME_LIB" ] || [ ! -f "$RUNTIME_LIB" ]; then
+  echo "ERROR: runtime dylib not found in $BUILD_DIR/src/xrt/targets/openxr/" >&2
+  exit 1
+fi
 RUNTIME_BASENAME=$(basename "$RUNTIME_LIB")
 cp "$RUNTIME_LIB" "$PKG_DIR/lib/"
+
+# Ship the vendor plug-in dylibs (issue #267 / ADR-019). The runtime
+# dylib no longer link-includes drv_sim_display; everything routes
+# through DisplayXR-SimDisplay.dylib, discovered via the JSON manifest
+# placed alongside it. Run scripts point XRT_PLUGIN_SEARCH_PATH at this
+# dir so dev iteration doesn't require touching
+# ~/Library/Application Support/.
+mkdir -p "$PKG_DIR/lib/displayxr/plugins"
+SIMDISPLAY_PLUGIN=$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimDisplay.dylib" -type f | head -1)
+if [ -n "$SIMDISPLAY_PLUGIN" ] && [ -f "$SIMDISPLAY_PLUGIN" ]; then
+  cp "$SIMDISPLAY_PLUGIN" "$PKG_DIR/lib/displayxr/plugins/"
+  cat > "$PKG_DIR/lib/displayxr/plugins/200-sim-display.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "sim-display",
+        "display_name": "DisplayXR Sim Display",
+        "vendor":       "DisplayXR",
+        "version":      "dev",
+        "binary_path":  "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimDisplay.dylib",
+        "probe_order":  200
+    }
+}
+EOF
+  # Plug-in resolves aux symbols from the runtime dylib next to it via
+  # the @loader_path-relative rpath baked in at link time. Add an rpath
+  # to be safe for the dev tree layout (../.. from plugins/ → lib/).
+  install_name_tool -add_rpath @loader_path/../.. "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimDisplay.dylib" 2>/dev/null || true
+else
+  echo "Warning: DisplayXR-SimDisplay.dylib not found in build tree — runtime will have no display processor!"
+fi
 
 # Copy test app binaries
 cp "$ROOT/test_apps/cube_handle_vk_macos/build/cube_handle_vk_macos" "$PKG_DIR/bin/"
@@ -242,6 +283,7 @@ cat > "$PKG_DIR/run_cube_handle_vk.sh" <<'SCRIPT'
 DIR="$(cd "$(dirname "$0")" && pwd)"
 export XR_RUNTIME_JSON="$DIR/openxr_displayxr.json"
 export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
+export XRT_PLUGIN_SEARCH_PATH="$DIR/lib/displayxr/plugins"
 export VK_ICD_FILENAMES="$DIR/share/vulkan/icd.d/MoltenVK_icd.json"
 export VK_DRIVER_FILES="$DIR/share/vulkan/icd.d/MoltenVK_icd.json"
 export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
@@ -256,6 +298,7 @@ cat > "$PKG_DIR/run_cube_handle_metal.sh" <<'SCRIPT'
 DIR="$(cd "$(dirname "$0")" && pwd)"
 export XR_RUNTIME_JSON="$DIR/openxr_displayxr.json"
 export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
+export XRT_PLUGIN_SEARCH_PATH="$DIR/lib/displayxr/plugins"
 export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
 echo "Starting cube_handle_metal_macos (Metal, window handle) with $SIM_DISPLAY_OUTPUT output..."
 exec "$DIR/bin/cube_handle_metal_macos" "$@"
@@ -268,6 +311,7 @@ cat > "$PKG_DIR/run_cube_handle_gl.sh" <<'SCRIPT'
 DIR="$(cd "$(dirname "$0")" && pwd)"
 export XR_RUNTIME_JSON="$DIR/openxr_displayxr.json"
 export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
+export XRT_PLUGIN_SEARCH_PATH="$DIR/lib/displayxr/plugins"
 export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
 echo "Starting cube_handle_gl_macos (OpenGL, window handle) with $SIM_DISPLAY_OUTPUT output..."
 exec "$DIR/bin/cube_handle_gl_macos" "$@"
@@ -280,6 +324,7 @@ cat > "$PKG_DIR/run_cube_texture_metal.sh" <<'SCRIPT'
 DIR="$(cd "$(dirname "$0")" && pwd)"
 export XR_RUNTIME_JSON="$DIR/openxr_displayxr.json"
 export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
+export XRT_PLUGIN_SEARCH_PATH="$DIR/lib/displayxr/plugins"
 export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
 echo "Starting cube_texture_metal_macos (Metal, IOSurface shared texture) with $SIM_DISPLAY_OUTPUT output..."
 exec "$DIR/bin/cube_texture_metal_macos" "$@"
@@ -292,6 +337,7 @@ cat > "$PKG_DIR/run_cube_hosted_metal.sh" <<'SCRIPT'
 DIR="$(cd "$(dirname "$0")" && pwd)"
 export XR_RUNTIME_JSON="$DIR/openxr_displayxr.json"
 export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
+export XRT_PLUGIN_SEARCH_PATH="$DIR/lib/displayxr/plugins"
 export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
 echo "Starting cube_hosted_metal_macos (Metal, hosted) with $SIM_DISPLAY_OUTPUT output..."
 exec "$DIR/bin/cube_hosted_metal_macos" "$@"
@@ -304,6 +350,7 @@ cat > "$PKG_DIR/run_cube_hosted_legacy_metal.sh" <<'SCRIPT'
 DIR="$(cd "$(dirname "$0")" && pwd)"
 export XR_RUNTIME_JSON="$DIR/openxr_displayxr.json"
 export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
+export XRT_PLUGIN_SEARCH_PATH="$DIR/lib/displayxr/plugins"
 export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
 echo "Starting cube_hosted_legacy_metal_macos (Metal, legacy hosted) with $SIM_DISPLAY_OUTPUT output..."
 exec "$DIR/bin/cube_hosted_legacy_metal_macos" "$@"
@@ -316,6 +363,7 @@ cat > "$PKG_DIR/run_cube_hosted_legacy_gl.sh" <<'SCRIPT'
 DIR="$(cd "$(dirname "$0")" && pwd)"
 export XR_RUNTIME_JSON="$DIR/openxr_displayxr.json"
 export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
+export XRT_PLUGIN_SEARCH_PATH="$DIR/lib/displayxr/plugins"
 export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
 echo "Starting cube_hosted_legacy_gl_macos (OpenGL, legacy hosted) with $SIM_DISPLAY_OUTPUT output..."
 exec "$DIR/bin/cube_hosted_legacy_gl_macos" "$@"
@@ -328,6 +376,7 @@ cat > "$PKG_DIR/run_cube_hosted_legacy_vk.sh" <<'SCRIPT'
 DIR="$(cd "$(dirname "$0")" && pwd)"
 export XR_RUNTIME_JSON="$DIR/openxr_displayxr.json"
 export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
+export XRT_PLUGIN_SEARCH_PATH="$DIR/lib/displayxr/plugins"
 export VK_ICD_FILENAMES="$DIR/share/vulkan/icd.d/MoltenVK_icd.json"
 export VK_DRIVER_FILES="$DIR/share/vulkan/icd.d/MoltenVK_icd.json"
 export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"

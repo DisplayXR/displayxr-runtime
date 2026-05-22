@@ -3,10 +3,14 @@
 **Audience:** Vendor integrators shipping a display-processor plug-in DLL,
 and runtime engineers maintaining the discovery path.
 
-**Status:** v1. Windows shipping; Linux + macOS spec finalized but loader
-implementation pending Mac access (target_plugin_loader.c's non-Windows
-branch returns NULL today and the runtime falls back to the in-tree
-static drv_sim_display path).
+**Status:** v1. Windows shipping. macOS shipping as of issue #267 —
+runtime dylib has zero `sim_display_*` symbols in its link line, the
+`DisplayXR-SimDisplay.dylib` plug-in is discovered via the JSON
+manifest path described in §3, and `scripts/build_macos.sh` packages
++ wires up the plug-in for dev runs via `XRT_PLUGIN_SEARCH_PATH`.
+Linux uses the same loader code (POSIX branch in
+`target_plugin_loader.c`), but is untested end-to-end because no
+graphics-stack-complete Linux build target ships today.
 
 This document is the **runtime ↔ plug-in discovery contract**. The
 C-ABI side — the negotiation entry point, the `xrt_plugin_iface` vtable,
@@ -129,11 +133,13 @@ plug-in: sim-display".
 
 ## 3. POSIX: JSON-manifest discovery
 
-> **Implementation status:** spec finalized; `target_plugin_loader.c`'s
-> non-Windows branch returns NULL today. macOS/Linux loader work is
-> tracked separately from the Step 9 docs commit that landed this
-> spec; the runtime falls back to the in-tree static
-> `drv_sim_display` path until the loader is wired in.
+> **Implementation status:** shipping on macOS (issue #267). Linux uses
+> the same code path but is untested end-to-end. The `XRT_PLUGIN_SEARCH_PATH`
+> env var (colon-separated directory list) overrides the default
+> search roots — used by `scripts/build_macos.sh`-generated
+> `run_*.sh` scripts to point at the dev tree's
+> `_package/DisplayXR-macOS/lib/displayxr/plugins/` without polluting
+> `~/Library/Application Support/`.
 
 **Discovery root (macOS):**
 `~/Library/Application Support/DisplayXR/DisplayProcessors/`

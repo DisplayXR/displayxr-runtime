@@ -14,6 +14,13 @@ add_library(
 target_link_libraries(target_lists PRIVATE xrt-interfaces aux_util aux_util_sink drv_includes)
 target_include_directories(target_lists PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
+# target_plugin_loader.c uses dlopen/dlsym on non-Windows for the
+# manifest-driven discovery path. CMAKE_DL_LIBS is empty on Windows /
+# macOS (libSystem already provides dlopen) and `-ldl` on Linux.
+if(NOT WIN32)
+	target_link_libraries(target_lists PRIVATE ${CMAKE_DL_LIBS})
+endif()
+
 ###
 # Builders
 #
@@ -34,9 +41,18 @@ if(XRT_HAVE_LEIA_SR AND XRT_PLUGIN_BUILD_INPROC_FALLBACK)
 	target_link_libraries(target_lists PRIVATE drv_leia)
 endif()
 
-# Sim display builder (always available, guards itself via env var)
+# Sim display builder (always available — picks up the plug-in iface via
+# target_plugin_loader). The static drv_sim_display archive is now linked
+# only when XRT_PLUGIN_BUILD_INPROC_FALLBACK=ON (developer fallback),
+# mirroring the drv_leia gating above. Production builds resolve all
+# sim_display work — device creation, display-info, DP factories — through
+# the plug-in iface; the runtime DLL holds zero sim_display identifiers in
+# its link line (ADR-019/plan goal §2.1).
 target_sources(target_lists PRIVATE target_builder_sim_display.c)
-target_link_libraries(target_lists PRIVATE drv_sim_display)
+target_link_libraries(target_lists PRIVATE drv_sim_display_includes)
+if(XRT_PLUGIN_BUILD_INPROC_FALLBACK)
+	target_link_libraries(target_lists PRIVATE drv_sim_display)
+endif()
 if(XRT_BUILD_DRIVER_QWERTY)
 	# sim_display builder uses qwerty_device.h for pose delegation config
 	target_link_libraries(target_lists PRIVATE drv_qwerty drv_qwerty_includes)
