@@ -49,6 +49,15 @@ android {
             minifyEnabled false
             debuggable true
             jniDebuggable true
+
+            // Mirror the runtime APK: verbose XR/Vulkan-call logging for
+            // the test app's debug build only. Compiled out in release.
+            externalNativeBuild {
+                cmake {
+                    cppFlags '-DXRT_DEBUG_ANDROID_VERBOSE'
+                    cFlags '-DXRT_DEBUG_ANDROID_VERBOSE'
+                }
+            }
         }
         release {
             minifyEnabled false
