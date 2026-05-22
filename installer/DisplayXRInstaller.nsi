@@ -709,17 +709,13 @@ Section "DisplayXR Runtime" SecRuntime
 	; production build, and pthreads is statically linked via the vcpkg
 	; overlay triplet at cmake/vcpkg-overlay-triplets/x64-windows.cmake.
 	;
-	; $INSTDIR still receives other files via the wildcard at the File line
-	; above (openxr_loader.dll, the five static-imported SimulatedReality*.dll
-	; shipped by drv_leia's import-lib link, etc.), but none of those need
-	; PATH to resolve:
-	;  - SimulatedReality{Core,Displays,FaceTrackers,DirectX,OpenGL}.dll are
-	;    also installed by the Leia SR Platform (a hard prereq of drv_leia),
-	;    which adds its own dir to system PATH independently — static imports
-	;    resolve through that.
-	;  - SimulatedRealityVulkanBeta.dll is /DELAYLOAD'd and resolved by
-	;    DisplayXRClient.dll's __pfnDliNotifyHook2 (target_dll_init.c), which
-	;    LoadLibraryEx's it from this $INSTDIR at first use.
+	; Under the vendor plug-in architecture (ADR-019 / issue #256), the
+	; runtime DLL has zero vendor identifiers in its link line — no SR
+	; static or delay-load imports. The runtime installer therefore
+	; excludes SimulatedReality*.dll from the wildcard above; those ship
+	; with the DisplayXR-LeiaSR plug-in installer instead. The runtime
+	; ships only the in-tree sim_display plug-in (DisplayXR-SimDisplay.dll
+	; under plugins\), plus openxr_loader.dll and runtime/service exes.
 	;
 	; The uninstaller still runs un.RemoveFromPath to clean up entries
 	; written by older installer versions.
