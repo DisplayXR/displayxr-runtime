@@ -1,10 +1,11 @@
 // Copyright 2026, Leia Inc.
 // SPDX-License-Identifier: BSL-1.0
 //
-// Skeleton Android test app for the CNSDK POC. Day-8 ships only the
-// Gradle module + NativeActivity scaffolding — proves a separate APK
-// can be built alongside the runtime. OpenXR loader integration +
-// Vulkan cube renderer land in follow-up commits.
+// Android test app for the CNSDK POC. Links the Khronos OpenXR loader
+// (from the openxr_loader_for_android .aar) so the app can call
+// xrCreateInstance and bind to our runtime APK via the
+// org.khronos.openxr.OpenXRRuntimeService intent. Vulkan instance/device
+// + cube renderer + session land in follow-up commits.
 
 plugins {
     id 'com.android.application'
@@ -17,6 +18,13 @@ android {
 
     ndkVersion "${ndk_version}"
 
+    // prefab consumes native libs + headers from .aar dependencies;
+    // needed to pick up libopenxr_loader.so + the openxr/openxr.h
+    // headers from openxr_loader_for_android via find_package(OpenXR).
+    buildFeatures {
+        prefab true
+    }
+
     defaultConfig {
         applicationId 'com.displayxr.cube_handle_vk_android'
         minSdkVersion project.sharedMinSdk
@@ -27,7 +35,7 @@ android {
         externalNativeBuild {
             cmake {
                 arguments "-DANDROID_PLATFORM=${project.sharedMinSdk}",
-                    "-DANDROID_STL=c++_static",
+                    "-DANDROID_STL=c++_shared",
                     "-DANDROID_ARM_NEON=TRUE"
             }
         }
@@ -58,4 +66,19 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+
+    packagingOptions {
+        jniLibs {
+            // libopenxr_loader.so ships in the AAR; keep it as-is
+            useLegacyPackaging true
+        }
+    }
+}
+
+dependencies {
+    // Khronos OpenXR loader for Android — bundles libopenxr_loader.so +
+    // openxr/*.h headers via prefab. The loader discovers our runtime
+    // APK at runtime via the OpenXRRuntimeService intent declared in
+    // src/xrt/targets/openxr_android/src/main/AndroidManifest.xml.
+    implementation 'org.khronos.openxr:openxr_loader_for_android:1.1.41'
 }
