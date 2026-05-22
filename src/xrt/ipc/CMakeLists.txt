@@ -126,20 +126,14 @@ target_include_directories(
 	)
 target_link_libraries(ipc_server PRIVATE aux_util aux_util_process aux_util_debug_gui ipc_shared aux_math)
 
-# Link D3D11 service compositor for SR-aware view poses in IPC.
-#
-# drv_leia is only available in the in-proc fallback build (issue #256 /
-# ADR-019). The XRT_HAVE_LEIA_SR_D3D11 #define is what enables the SR
-# weaver-call code path inside the service compositor; production builds
-# now reach the weaver through the DisplayXR-LeiaSR.dll plug-in iface
-# and don't need the static drv_leia link here.
-if(XRT_HAVE_LEIA_SR AND WIN32)
+# Link the D3D11 service compositor — the IPC handlers call its
+# vendor-agnostic helpers for predicted eye positions, per-client window
+# metrics, and Kooima view-pose compute. The compositor's helpers dispatch
+# through the display-processor iface at runtime, so the IPC layer has no
+# static dependency on any specific vendor driver (issue #256 / ADR-019).
+if(WIN32 AND XRT_FEATURE_HYBRID_MODE)
 	target_link_libraries(ipc_server PRIVATE comp_d3d11_service)
 	target_compile_definitions(ipc_server PRIVATE XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	if(XRT_PLUGIN_BUILD_INPROC_FALLBACK)
-		target_link_libraries(ipc_server PRIVATE drv_leia)
-		target_compile_definitions(ipc_server PRIVATE XRT_HAVE_LEIA_SR_D3D11)
-	endif()
 endif()
 
 # Qwerty driver stereo state access for camera-centric controls
