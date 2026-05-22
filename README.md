@@ -68,6 +68,10 @@ brew install cmake ninja eigen vulkan-sdk && ./scripts/build_macos.sh --installe
 # (Gatekeeper warns on double-click — the .pkg is unsigned today; sudo installer
 #  from terminal bypasses Gatekeeper. Notarization tracked in issues #280/#281.)
 
+# Or all-in-one (macOS) — download + install the pinned release matrix
+./scripts/setup-displayxr.sh
+# See docs/getting-started/full-stack-install.md for flags (#283).
+
 # Run a dev build without installing
 XR_RUNTIME_JSON=./build/Release/openxr_displayxr-dev.json ./your_openxr_app
 ```
