@@ -1,0 +1,61 @@
+// Copyright 2026, Leia Inc.
+// SPDX-License-Identifier: BSL-1.0
+//
+// Skeleton Android test app for the CNSDK POC. Day-8 ships only the
+// Gradle module + NativeActivity scaffolding — proves a separate APK
+// can be built alongside the runtime. OpenXR loader integration +
+// Vulkan cube renderer land in follow-up commits.
+
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.displayxr.cube_handle_vk_android'
+    compileSdk project.sharedCompileSdk
+    buildToolsVersion = buildToolsVersion
+
+    ndkVersion "${ndk_version}"
+
+    defaultConfig {
+        applicationId 'com.displayxr.cube_handle_vk_android'
+        minSdkVersion project.sharedMinSdk
+        targetSdkVersion project.sharedTargetSdk
+        versionCode 1
+        versionName "0.1"
+
+        externalNativeBuild {
+            cmake {
+                arguments "-DANDROID_PLATFORM=${project.sharedMinSdk}",
+                    "-DANDROID_STL=c++_static",
+                    "-DANDROID_ARM_NEON=TRUE"
+            }
+        }
+
+        //noinspection ChromeOsAbiSupport
+        ndk { abiFilters 'arm64-v8a' }
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+            debuggable true
+            jniDebuggable true
+        }
+        release {
+            minifyEnabled false
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "${cmake_version}"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
