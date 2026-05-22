@@ -7,8 +7,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 ARTIFACT_DIR="${1:?Usage: $0 <artifact-dir> [output.pkg]}"
-OUTPUT_PKG="${2:-DisplayXR-Installer.pkg}"
 VERSION="${DISPLAYXR_VERSION:-1.0.0}"
+# Default to a versioned filename so the artifact carries its version
+# in its name (mirrors Windows' DisplayXRSetup-X.Y.Z.NNN.exe). The
+# explicit $2 form is still honored for callers that want a fixed
+# output path.
+OUTPUT_PKG="${2:-DisplayXR-Installer-$VERSION.pkg}"
 
 if [ ! -d "$ARTIFACT_DIR" ]; then
     echo "Error: artifact directory '$ARTIFACT_DIR' not found"
@@ -46,6 +50,37 @@ cp "$ARTIFACT_DIR/lib/libvulkan.1.dylib" "$RUNTIME_ROOT/lib/"
 cp "$ARTIFACT_DIR/lib/libMoltenVK.dylib" "$RUNTIME_ROOT/lib/"
 cp "$ARTIFACT_DIR/share/vulkan/icd.d/MoltenVK_icd.json" "$RUNTIME_ROOT/share/vulkan/icd.d/"
 
+# Defensive Vulkan rpath fixup. `scripts/build_macos.sh` already runs
+# the equivalent install_name_tool steps against the artifact dir, but
+# repeat here to be robust against external callers that hand us an
+# artifact dir built by something else (or by an older script). All
+# operations are idempotent — install_name_tool -change is a no-op
+# when the source path isn't present; install_name_tool -id always
+# writes (cheap).
+#
+# Each install_name_tool invocation invalidates the dylib's code
+# signature; on modern macOS, loading an invalidly-signed dylib via
+# dlopen results in immediate SIGKILL ("Code Signature Invalid").
+# Re-sign ad-hoc after every modification — `codesign --force --sign -`
+# is a no-op-equivalent for already-correctly-signed dylibs.
+chmod u+w "$RUNTIME_ROOT/lib/libvulkan.1.dylib"
+install_name_tool -id @rpath/libvulkan.1.dylib "$RUNTIME_ROOT/lib/libvulkan.1.dylib" 2>/dev/null || true
+codesign --force --sign - "$RUNTIME_ROOT/lib/libvulkan.1.dylib" 2>/dev/null || true
+
+chmod u+w "$RUNTIME_ROOT/lib/libMoltenVK.dylib"
+install_name_tool -id @rpath/libMoltenVK.dylib "$RUNTIME_ROOT/lib/libMoltenVK.dylib" 2>/dev/null || true
+codesign --force --sign - "$RUNTIME_ROOT/lib/libMoltenVK.dylib" 2>/dev/null || true
+
+chmod u+w "$RUNTIME_ROOT/lib/$RUNTIME_BASENAME"
+install_name_tool -change /opt/homebrew/opt/vulkan-loader/lib/libvulkan.1.dylib \
+                          @rpath/libvulkan.1.dylib \
+                          "$RUNTIME_ROOT/lib/$RUNTIME_BASENAME" 2>/dev/null || true
+# Runtime needs @loader_path so it can resolve @rpath/libvulkan.1.dylib
+# from its own directory. Idempotent: install_name_tool warns + exits 0
+# if the rpath is already there.
+install_name_tool -add_rpath @loader_path "$RUNTIME_ROOT/lib/$RUNTIME_BASENAME" 2>/dev/null || true
+codesign --force --sign - "$RUNTIME_ROOT/lib/$RUNTIME_BASENAME" 2>/dev/null || true
+
 # Ship the vendor plug-in dylib + JSON manifest (#267, #274). The
 # runtime no longer link-includes drv_sim_display in production
 # builds; without these the installed runtime has no display
@@ -82,7 +117,17 @@ for r in $(otool -l "$PAYLOAD_PLUGIN" 2>/dev/null \
            | grep -E '^/.*displayxr-runtime/.*build|@loader_path' || true); do
     install_name_tool -delete_rpath "$r" "$PAYLOAD_PLUGIN" 2>/dev/null || true
 done
-install_name_tool -add_rpath "@loader_path/../.." "$PAYLOAD_PLUGIN"
+install_name_tool -add_rpath "@loader_path/../.." "$PAYLOAD_PLUGIN" 2>/dev/null || true
+
+# Defensive Vulkan -change on the embedded plug-in (same idempotent
+# fixup applied to the runtime above). @loader_path/../.. above doubles
+# as the rpath that resolves @rpath/libvulkan.1.dylib to
+# .../lib/libvulkan.1.dylib at the install location.
+install_name_tool -change /opt/homebrew/opt/vulkan-loader/lib/libvulkan.1.dylib \
+                          @rpath/libvulkan.1.dylib \
+                          "$PAYLOAD_PLUGIN" 2>/dev/null || true
+# Re-sign after all install_name_tool ops to avoid SIGKILL at dlopen.
+codesign --force --sign - "$PAYLOAD_PLUGIN" 2>/dev/null || true
 
 cat > "$MANIFEST_PAYLOAD_DIR/200-sim-display.json" <<EOF
 {
