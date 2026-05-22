@@ -164,7 +164,7 @@ scripts/format-project.sh   # Format all
 
 ### Releasing the Runtime
 
-This repo IS the public runtime — there is no private→public mirror flow. A release is just a `vX.Y.Z` tag here, a Windows CI build, and a GitHub Release with the installer attached.
+This repo IS the public runtime — there is no private→public mirror flow. A release is just a `vX.Y.Z` tag here, parallel Windows + macOS CI builds, and a GitHub Release with both installers attached (`DisplayXRSetup-*.exe` and `DisplayXR-Installer-*.pkg`) plus the test-apps bundle. macOS publishing post-#277.
 
 ```bash
 # /release skill handles version bump, tagging, build monitoring, GH release create.
@@ -325,19 +325,21 @@ Full reference: [`docs/getting-started/building.md` § Local Dev Iteration](docs
 
 **macOS** (`.github/workflows/build-macos.yml`):
 - Vulkan SDK via MoltenVK, bundles libvulkan + OpenXR loader
-- Artifact: `DisplayXR-macOS`
+- Two jobs: `Build` (compile check) + `BuildInstaller` (full runtime + sim-display plug-in + .pkg, post-#277)
+- Artifacts: `DisplayXR-Installer-macOS` (contains `DisplayXR-Installer.pkg`)
+- BuildInstaller asserts the .pkg payload includes `DisplayProcessors/200-sim-display.json` + `lib/displayxr/plugins/DisplayXR-SimDisplay.dylib` (#274 regression guard)
 
 ## Claude Code Skills
 
 ### /release - Tagged Runtime Release
-Creates a tagged runtime release here, monitors `build-windows.yml`, and attaches the installer to the GitHub Release. See `.claude/skills/release/SKILL.md`.
+Creates a tagged runtime release here, monitors `build-windows.yml` + `build-macos.yml` in parallel, and attaches both installers (`DisplayXRSetup-*.exe` and `DisplayXR-Installer-*.pkg`) plus the test-apps bundle to the GitHub Release. See `.claude/skills/release/SKILL.md`.
 ```
 /release v1.2.1    # explicit version
 /release patch     # auto-bump from latest v[0-9]+.[0-9]+.[0-9]+
 /release minor
 /release major
 ```
-Updates `CMakeLists.txt` `VERSION`, creates the tag, monitors the Windows CI build, downloads the `DisplayXRSetup-*.exe` artifact, creates the GitHub Release with grouped notes. Only releases this repo — shell, demos, extensions each have their own flows (see "Releasing the Runtime" above).
+Updates `CMakeLists.txt` `VERSION`, creates the tag, watches Windows + macOS CI concurrently (wall time = `max(Windows, macOS)`), downloads each platform's installer artifact, creates the GitHub Release with grouped notes. macOS .pkg is a soft requirement — its absence warns but doesn't STOP the release. Only releases this repo — shell, demos, extensions each have their own flows (see "Releasing the Runtime" above).
 
 ### /ask-gemini - Code Analysis with Gemini
 Ask Gemini to analyze code and produce a read-only report. See `~/.claude/skills/ask-gemini/SKILL.md`.

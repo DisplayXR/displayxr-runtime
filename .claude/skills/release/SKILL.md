@@ -1,12 +1,12 @@
 ---
 name: release
-description: Create a tagged release of the displayxr-runtime repo, monitor the Windows CI build, and publish the GitHub Release with the installer asset attached. Syntax /release <version-spec>, where version-spec is vX.Y.Z or patch/minor/major.
+description: Create a tagged release of the displayxr-runtime repo, monitor the Windows + macOS CI builds, and publish the GitHub Release with the Windows installer + macOS .pkg attached. Syntax /release <version-spec>, where version-spec is vX.Y.Z or patch/minor/major.
 allowed-tools: Read, Grep, Glob, Bash, Agent, Edit, Write
 ---
 
 # Release Skill
 
-Creates a tagged release of the **displayxr-runtime** repo, monitors the Windows CI build, attaches the installer artifact to the GitHub Release, and reports.
+Creates a tagged release of the **displayxr-runtime** repo, monitors the Windows + macOS CI builds, and publishes the GitHub Release with both platform installers attached (`DisplayXRSetup-*.exe` and `DisplayXR-Installer.pkg`) plus the test-apps bundle.
 
 ## Scope
 
@@ -79,7 +79,9 @@ Execute the DisplayXR runtime release workflow for [VERSION] (tag: [FULL_TAG]).
 
 ## Configuration
 - Source repo: DisplayXR/displayxr-runtime (this is the public repo — there is no separate "publish" mirror)
-- Workflow to monitor: .github/workflows/build-windows.yml (the artifact producer)
+- Workflows to monitor (both produce artifacts the release attaches):
+  - `.github/workflows/build-windows.yml` — produces `DisplayXRSetup-*.exe` (artifact `DisplayXR-Installer`) + `TestApps-*` bundle
+  - `.github/workflows/build-macos.yml` — produces `DisplayXR-Installer.pkg` (artifact `DisplayXR-Installer-macOS`) (post-#277)
 - publish-extensions.yml fires automatically on every push to main; it does not need monitoring as part of a tagged release (header sync is independent of tags)
 - Shell, demos, displayxr-extensions are out of scope; each has its own flow
 
@@ -126,32 +128,49 @@ The runtime repo's `main` is protected. If `git push origin main` fails with "Ch
 
 ---
 
-## PHASE 3: MONITOR BUILD
+## PHASE 3: MONITOR BUILDS (Windows + macOS)
 
-### Step 3.1: Wait for build to register
+### Step 3.1: Wait for builds to register
 `sleep 15`
 
-### Step 3.2: Find the build run
+### Step 3.2: Find both build runs
 ```bash
 gh run list --workflow build-windows.yml --limit 10 --json databaseId,status,headSha,event
+gh run list --workflow build-macos.yml   --limit 10 --json databaseId,status,headSha,event
 ```
-Find the run with `headSha == $RELEASE_SHA` and event=push. Retry up to 6 times with 10s waits.
+For each workflow, find the run with `headSha == $RELEASE_SHA` and `event=push`. Retry up to 6 times with 10s waits per workflow. Store `WIN_RUN_ID` and `MAC_RUN_ID`.
 
-### Step 3.3: Watch build
-`gh run watch $RUN_ID --interval 30 --exit-status` (timeout 1800000ms — Windows CI can take up to 30 min with test apps).
+### Step 3.3: Watch both runs (in parallel)
+Use a background-poll pattern so both watches run concurrently — total wall time is `max(Windows, macOS)`, not sum.
 
-### Step 3.4: Check result
-- All required jobs succeed → Phase 4
-- Critical job (Runtime, Build) fails → Phase 6 (Rollback)
-- Pre-existing-broken jobs (e.g. demo jobs that reference paths moved to standalone repos) fail but artifact still produced → continue to Phase 4 with a flag in the final report
+```bash
+# Background Windows watch
+gh run watch $WIN_RUN_ID --interval 30 --exit-status > /tmp/win.log 2>&1 &
+WIN_PID=$!
+# Background macOS watch
+gh run watch $MAC_RUN_ID --interval 30 --exit-status > /tmp/mac.log 2>&1 &
+MAC_PID=$!
+
+wait $WIN_PID; WIN_RC=$?
+wait $MAC_PID; MAC_RC=$?
+```
+
+Windows CI can take up to 30 min with test apps; macOS is faster (~10-15 min including the installer build). Timeout each at 1800000 ms.
+
+### Step 3.4: Check both results
+- Both runs all-required-jobs succeed → Phase 4
+- Critical Windows job (`Runtime`, `Build`) fails OR macOS `Build` / `BuildInstaller` fails → Phase 6 (Rollback)
+- Pre-existing-broken jobs (e.g. demo jobs that reference paths moved to standalone repos) fail but the artifact-producing job still succeeded → continue to Phase 4 with a flag in the final report
+- macOS `BuildInstaller` infrastructure-fails (e.g. brew flake) but Windows is green and the run is rerunnable → STOP and ask the user whether to rerun macOS or release Windows-only (latter is degraded; flag clearly)
 
 ---
 
 ## PHASE 4: CREATE GITHUB RELEASE
 
-The build run produces two artifacts the release should attach:
-- **Installer** — `DisplayXR-Installer` artifact (contains `DisplayXRSetup-X.Y.Z.BUILD.exe`).
-- **Test apps bundle** — `TestApps-<run_number>` artifact (~17 MB folder containing all cube test apps). Forced on every tag push by the `DetectChanges` job (`ref_type == 'tag'`). Builders, OEM integrators, and field testers use this to validate the runtime against the public extension contracts without rebuilding from source.
+The build runs produce three artifacts the release should attach:
+- **Windows installer** — `DisplayXR-Installer` artifact from the Windows run (contains `DisplayXRSetup-X.Y.Z.BUILD.exe`).
+- **macOS installer** — `DisplayXR-Installer-macOS` artifact from the macOS run (contains `DisplayXR-Installer.pkg`). Post-#277.
+- **Test apps bundle** — `TestApps-<run_number>` artifact from the Windows run (~17 MB folder containing all cube test apps). Forced on every tag push by the `DetectChanges` job (`ref_type == 'tag'`). Builders, OEM integrators, and field testers use this to validate the runtime against the public extension contracts without rebuilding from source.
 
 Check whether the release already exists:
 
@@ -160,17 +179,33 @@ gh release view [FULL_TAG] --repo DisplayXR/displayxr-runtime 2>/dev/null
 ```
 
 ### Step 4.1: Download artifacts (always runs)
-Regardless of whether the release exists, download both artifacts so we can verify or attach them:
+Regardless of whether the release exists, download all artifacts from both runs so we can verify or attach them:
 
 ```bash
-# Installer artifact (matches DisplayXR-Installer + DisplayXR)
-gh run download $RUN_ID --repo DisplayXR/displayxr-runtime --pattern "DisplayXR*" --dir _release_assets/
+# Windows: DisplayXR* matches DisplayXR-Installer + DisplayXR (folder bundle)
+gh run download $WIN_RUN_ID --repo DisplayXR/displayxr-runtime --pattern "DisplayXR*" --dir _release_assets/
 
-# Test apps bundle — separate pattern because TestApps-* doesn't match DisplayXR*
-gh run download $RUN_ID --repo DisplayXR/displayxr-runtime --pattern "TestApps-*" --dir _release_assets/
+# Windows: TestApps-* is a separate pattern (doesn't match DisplayXR*)
+gh run download $WIN_RUN_ID --repo DisplayXR/displayxr-runtime --pattern "TestApps-*" --dir _release_assets/
+
+# macOS: DisplayXR-Installer-macOS contains DisplayXR-Installer.pkg (post-#277)
+gh run download $MAC_RUN_ID --repo DisplayXR/displayxr-runtime --pattern "DisplayXR-Installer-macOS" --dir _release_assets/
 
 INSTALLER=$(find _release_assets/ -name "DisplayXRSetup-*.exe" | head -1)
-[ -z "$INSTALLER" ] && STOP: "Could not find DisplayXRSetup-*.exe in build artifacts."
+[ -z "$INSTALLER" ] && STOP: "Could not find DisplayXRSetup-*.exe in Windows build artifacts."
+
+PKG_INSTALLER=$(find _release_assets/ -name "DisplayXR-Installer.pkg" | head -1)
+if [ -z "$PKG_INSTALLER" ]; then
+  echo "WARN: no DisplayXR-Installer.pkg in macOS run — macOS install asset will not be attached."
+  echo "Check macOS BuildInstaller job logs. Don't STOP — Windows release still ships."
+fi
+# Rename the .pkg to include the version so the asset filename matches the convention
+# (DisplayXR-Installer-X.Y.Z.pkg, parallel to DisplayXRSetup-X.Y.Z.BUILD.exe).
+if [ -n "$PKG_INSTALLER" ]; then
+  VERSIONED_PKG="_release_assets/DisplayXR-Installer-[VERSION].pkg"  # [VERSION] without leading v
+  cp "$PKG_INSTALLER" "$VERSIONED_PKG"
+  PKG_INSTALLER="$VERSIONED_PKG"
+fi
 
 # Zip the TestApps folder into a single asset. Pattern: DisplayXR-TestApps-<version>.zip.
 TESTAPPS_DIR=$(find _release_assets/ -maxdepth 2 -type d -name "TestApps-*" | head -1)
@@ -184,18 +219,21 @@ else
 fi
 ```
 
-The TestApps bundle is a soft requirement: if `DetectChanges` mis-detected and didn't produce it, log a warning and continue with installer-only. Don't STOP the release.
+The TestApps bundle and the macOS .pkg are both **soft requirements**: log a warning if missing and continue with the assets that are available. Only the Windows installer is hard-required (its absence STOPs the release).
 
 ### Step 4.2a: If release already exists
-The workflow auto-created it (rare path — currently `build-windows.yml` does not auto-create a release, so this branch is unusual). Upload any missing assets:
+The workflow auto-created it (rare path — currently neither `build-windows.yml` nor `build-macos.yml` auto-creates a release, so this branch is unusual). Upload any missing assets:
 
 ```bash
-gh release upload [FULL_TAG] --repo DisplayXR/displayxr-runtime --clobber "$INSTALLER" ${TESTAPPS_ZIP:+"$TESTAPPS_ZIP"}
+gh release upload [FULL_TAG] --repo DisplayXR/displayxr-runtime --clobber \
+  "$INSTALLER" \
+  ${PKG_INSTALLER:+"$PKG_INSTALLER"} \
+  ${TESTAPPS_ZIP:+"$TESTAPPS_ZIP"}
 ```
 Then go to Phase 5.
 
 ### Step 4.2b: If release does NOT exist
-Create it with both assets:
+Create it with all available assets:
 
 ```bash
 # Generate release notes
@@ -206,7 +244,9 @@ gh release create [FULL_TAG] \
   --repo DisplayXR/displayxr-runtime \
   --title "DisplayXR Runtime [FULL_TAG]" \
   --notes "<grouped notes here>" \
-  "$INSTALLER" ${TESTAPPS_ZIP:+"$TESTAPPS_ZIP"}
+  "$INSTALLER" \
+  ${PKG_INSTALLER:+"$PKG_INSTALLER"} \
+  ${TESTAPPS_ZIP:+"$TESTAPPS_ZIP"}
 ```
 
 ---
@@ -219,7 +259,8 @@ gh release view [FULL_TAG] --repo DisplayXR/displayxr-runtime --json tagName,nam
 
 Verify:
 - Tag matches [FULL_TAG]
-- Asset list contains `DisplayXRSetup-*.exe` with non-zero size
+- Asset list contains `DisplayXRSetup-*.exe` with non-zero size (Windows installer, hard requirement)
+- Asset list contains `DisplayXR-Installer-*.pkg` with non-zero size (macOS installer, post-#277; warn but don't fail if the macOS run skipped it — flag in final report so the user can investigate)
 - Asset list contains `DisplayXR-TestApps-*.zip` with non-zero size (warn but don't fail if `DetectChanges` skipped the test-app build — flag in final report so the user can investigate)
 
 ### Step 5.1: Cleanup staging dir

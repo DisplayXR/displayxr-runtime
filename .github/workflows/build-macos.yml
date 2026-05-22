@@ -1,12 +1,24 @@
 name: Build macOS
 
 # Verifies that the runtime + sim_display driver compile cleanly on
-# macOS. The historical workflow also built every test app + the macOS
-# installer + the 3DGS demo (which now lives in displayxr-demo-
-# gaussiansplat); those add a lot of surface area for breakage. Keep
-# this one minimal — building the runtime is the contract that matters
-# here. Test apps and installer can be added back later as separate
-# jobs once the build itself is reliable in CI again.
+# macOS, and (post-#277) also builds + publishes
+# `DisplayXR-Installer.pkg` so /release can attach it to GitHub Releases
+# alongside the Windows `DisplayXRSetup-*.exe`. Two jobs:
+#
+#   - `Build` (kept minimal, intentionally) — fast compile check using
+#     RelWithDebInfo + SERVICE/HYBRID flags. The historical workflow
+#     also built every test app + the macOS installer + the 3DGS demo;
+#     those add a lot of surface area for breakage. The compile check
+#     is the stable contract this repo depends on for branch
+#     protection. Test app builds beyond what the installer needs stay
+#     out of scope — they were trimmed for a reason.
+#
+#   - `BuildInstaller` (new) — builds the runtime + sim-display plug-in
+#     + at least one VK test app + the .pkg via
+#     `scripts/build_macos.sh --installer`, asserts the payload
+#     contains the plug-in registration (#274 regression guard), and
+#     uploads the .pkg as a workflow artifact. Gated on `Build` so
+#     compile failures fail fast.
 
 on:
   push:
@@ -84,3 +96,97 @@ jobs:
       - name: Build
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: cmake --build build
+
+  BuildInstaller:
+    # Sequential after Build so a compile failure fails fast and we
+    # don't waste a second macos-14 runner on broken code. Both jobs
+    # use macos-14; the duplicated configure/build is the cost of
+    # keeping `Build` as a stable RelWithDebInfo+SERVICE+HYBRID compile
+    # check while `BuildInstaller` exercises the Debug + plug-in path
+    # that ships in the .pkg.
+    needs: [DetectChanges, Build]
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Doc-only PR — skipping installer build
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Skipping; doc-only PRs don't change build inputs."
+
+      - name: Install dependencies
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          brew install cmake ninja eigen
+          brew install glslang molten-vk vulkan-headers vulkan-loader
+          BREW_PREFIX=$(brew --prefix)
+          echo "VULKAN_SDK=$BREW_PREFIX" >> $GITHUB_ENV
+
+      - name: Derive installer version
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            # `v1.2.3` → `1.2.3` for productbuild's --version arg
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            # Untagged builds get a sha-suffixed dev string so the
+            # manifest's `version` field is at least traceable to the
+            # commit that produced the .pkg.
+            VERSION="0.0.0-dev.${GITHUB_SHA::8}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building installer with VERSION=$VERSION"
+
+      - name: Build runtime + test app + installer
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          DISPLAYXR_VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/build_macos.sh --installer
+
+      - name: Assert .pkg payload includes plug-in + manifest (#274 regression guard)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          set -euo pipefail
+          PKG="_package/DisplayXR-Installer.pkg"
+          if [ ! -f "$PKG" ]; then
+            echo "::error::$PKG missing — installer build did not produce expected artifact."
+            exit 1
+          fi
+          EXPAND_DIR=$(mktemp -d)
+          pkgutil --expand "$PKG" "$EXPAND_DIR/expand"
+          PAYLOAD="$EXPAND_DIR/expand/runtime.pkg/Payload"
+          if [ ! -f "$PAYLOAD" ]; then
+            echo "::error::runtime.pkg/Payload not found inside .pkg"
+            exit 1
+          fi
+          # List the cpio.gz payload contents without extracting (faster
+          # and avoids any permission/symlink surprises on the runner).
+          gunzip -c "$PAYLOAD" | cpio -i -t > "$EXPAND_DIR/files" 2>/dev/null
+
+          MISSING=0
+          if ! grep -q 'DisplayProcessors/200-sim-display.json' "$EXPAND_DIR/files"; then
+            echo "::error::200-sim-display.json missing from .pkg payload — vendor plug-in discovery would not find sim-display on a clean install (#274)."
+            MISSING=1
+          fi
+          if ! grep -q 'lib/displayxr/plugins/DisplayXR-SimDisplay.dylib' "$EXPAND_DIR/files"; then
+            echo "::error::DisplayXR-SimDisplay.dylib missing from .pkg payload — runtime would have no display processor on a clean install (#274)."
+            MISSING=1
+          fi
+          if [ "$MISSING" -ne 0 ]; then
+            echo "Payload listing:"
+            cat "$EXPAND_DIR/files"
+            exit 1
+          fi
+          echo "PASS: .pkg payload contains plug-in + manifest."
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        if: needs.DetectChanges.outputs.docs_only != 'true' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        with:
+          retention-days: 3
+          name: DisplayXR-Installer-macOS
+          if-no-files-found: error
+          path: _package/DisplayXR-Installer.pkg
