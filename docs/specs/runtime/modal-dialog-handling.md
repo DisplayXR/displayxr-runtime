@@ -93,7 +93,7 @@ See ADR-017 §"T2 — REJECTED". Apps use Qt / wx / Imgui / raw listboxes, UAC r
 ## Verification
 
 - Local mac: `./scripts/build-mingw-check.sh` clean for the Win32 surface (the new TU compiles standalone via direct `x86_64-w64-mingw32-gcc`).
-- Windows: `_package\bin\displayxr-shell.exe` launches a `cube_handle_d3d11_win` instrumented with a `B`-key `GetOpenFileName(NULL, …)` smoke. Expected: dialog appears in front, focus returns to cube, 3D resumes.
+- Windows: `"C:\Program Files\DisplayXR\Runtime\displayxr-shell.exe"` (installed from `DisplayXRShellSetup-*.exe`) launches a `cube_handle_d3d11_win` instrumented with a `B`-key `GetOpenFileName(NULL, …)` smoke. Expected: dialog appears in front, focus returns to cube, 3D resumes.
 - `MessageBox(hWnd, "test", "test", MB_OK)` smoke: appears on top, modal disable works correctly.
 - 90s open-dialog soak: shell's compositor still presents the requester's last-good frame; no crashes.
 - Multi-app: open dialogs from two apps simultaneously. Each dims independently; closing one doesn't restore the other.

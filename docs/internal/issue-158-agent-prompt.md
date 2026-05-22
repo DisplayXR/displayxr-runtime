@@ -60,7 +60,7 @@ Driver side: confirm the Leia SR driver populates `view_scale_x/y` and that `u_t
 2. Stop any running service/shell and redeploy to `C:\Program Files\DisplayXR\Runtime\` (both `displayxr-service.exe` AND `DisplayXRClient.dll` per `feedback_dll_version_mismatch.md`).
 3. Launch the shell with the D3D11 cube app and press **Ctrl+Shift+C** to capture:
    ```
-   _package\bin\displayxr-shell.exe test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe
+   "C:\Program Files\DisplayXR\Runtime\displayxr-shell.exe" test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe
    ```
 4. Inspect `%USERPROFILE%\Pictures\DisplayXR\capture_*_sbs.png`:
    - Atlas should still be 3840×2160 (full swapchain)
