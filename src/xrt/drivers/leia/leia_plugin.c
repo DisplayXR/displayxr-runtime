@@ -100,6 +100,15 @@ leia_plugin_destroy(struct xrt_plugin_instance *inst)
 	/* No instance state — nothing to free. */
 }
 
+static void
+leia_plugin_set_pose_source(struct xrt_plugin_instance *inst,
+                            struct xrt_device *xdev,
+                            struct xrt_device *source)
+{
+	(void)inst;
+	leia_hmd_set_pose_source(xdev, source);
+}
+
 static bool
 leia_plugin_get_display_info(struct xrt_plugin_instance *inst,
                              struct xrt_device *xdev,
@@ -212,6 +221,8 @@ static struct xrt_plugin_iface g_leia_iface = {
     .destroy = leia_plugin_destroy,
 
     .get_display_info = leia_plugin_get_display_info,
+
+    .set_pose_source = leia_plugin_set_pose_source,
 };
 
 

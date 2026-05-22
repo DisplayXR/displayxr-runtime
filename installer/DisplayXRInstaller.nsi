@@ -648,13 +648,17 @@ Section "DisplayXR Runtime" SecRuntime
 
 	; Install runtime DLL dependencies (exclude vulkan-1.dll — the system copy
 	; in SYSTEM32 is sufficient, and shipping our own risks version conflicts
-	; and interaction with third-party Vulkan implicit layers. See issue #105.)
+	; and interaction with third-party Vulkan implicit layers. See issue #105.
+	; Also exclude SimulatedReality*.dll: those belong to the Leia plug-in
+	; installer per ADR-019 / issue #256; they can sit in _package/bin/ as
+	; build leftovers from older drv_leia static-link builds, but the
+	; runtime installer must NOT ship them.)
 	;
 	; Note: the wildcard sweep is non-recursive. The plug-in DLLs that live
 	; under `_package\bin\plugins\` are installed explicitly below — the
 	; sim-display fallback is part of the runtime distribution, while the
 	; Leia plug-in ships in its own installer (see plan §4.6 / issue #256).
-	File /nonfatal /x "vulkan-1.dll" "${BIN_DIR}\*.dll"
+	File /nonfatal /x "vulkan-1.dll" /x "SimulatedReality*.dll" "${BIN_DIR}\*.dll"
 
 	; -----------------------------------------------------------------
 	; Vendor plug-in: sim-display (ADR-019 / issue #256).

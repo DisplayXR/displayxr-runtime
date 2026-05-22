@@ -382,6 +382,32 @@ struct xrt_plugin_iface
 	bool (*get_display_info)(struct xrt_plugin_instance *inst,
 	                         struct xrt_device *xdev,
 	                         struct xrt_plugin_display_info *out_info);
+
+	/*!
+	 * Bind an external pose source (typically the qwerty HMD device
+	 * driving WASD/mouse camera controls) to the device returned by
+	 * `create_device`. Each vendor's driver owns a private cast from
+	 * `xrt_device *` back to its container struct; the iface here
+	 * lets the runtime invoke that vendor-private binding without
+	 * the runtime DLL knowing the vendor's struct layout.
+	 *
+	 * This was the regression that broke cube-in-shell rendering at
+	 * v1.3.4 + iface boundary: the sim-display builder used to call
+	 * `sim_display_hmd_set_pose_source` directly on the just-created
+	 * head; once `create_device` started returning Leia devices via
+	 * the iface, that call corrupted the head's vtable backing
+	 * struct. The iface method routes the bind through the plug-in
+	 * that owns the device.
+	 *
+	 * Passing `source = NULL` clears the binding (the device falls
+	 * back to its static pose).
+	 *
+	 * Optional. NULL means the plug-in doesn't support external pose
+	 * binding — the caller skips silently.
+	 */
+	void (*set_pose_source)(struct xrt_plugin_instance *inst,
+	                        struct xrt_device *xdev,
+	                        struct xrt_device *source);
 };
 
 

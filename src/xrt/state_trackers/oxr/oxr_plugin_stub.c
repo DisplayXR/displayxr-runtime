@@ -86,6 +86,8 @@ _Static_assert(offsetof(struct xrt_plugin_iface, create_dp_metal) < offsetof(str
  */
 _Static_assert(offsetof(struct xrt_plugin_iface, destroy) < offsetof(struct xrt_plugin_iface, get_display_info),
                "xrt_plugin: get_display_info must follow destroy (additive-only growth)");
+_Static_assert(offsetof(struct xrt_plugin_iface, get_display_info) < offsetof(struct xrt_plugin_iface, set_pose_source),
+               "xrt_plugin: set_pose_source must follow get_display_info (additive-only growth)");
 
 /*
  * Display-info struct's first field must be struct_size so plug-ins

@@ -69,6 +69,15 @@ sim_display_plugin_destroy(struct xrt_plugin_instance *inst)
 	/* No instance state — nothing to free. */
 }
 
+static void
+sim_display_plugin_set_pose_source(struct xrt_plugin_instance *inst,
+                                   struct xrt_device *xdev,
+                                   struct xrt_device *source)
+{
+	(void)inst;
+	sim_display_hmd_set_pose_source(xdev, source);
+}
+
 static bool
 sim_display_plugin_get_display_info(struct xrt_plugin_instance *inst,
                                     struct xrt_device *xdev,
@@ -167,6 +176,8 @@ static struct xrt_plugin_iface g_sim_display_iface = {
     .destroy = sim_display_plugin_destroy,
 
     .get_display_info = sim_display_plugin_get_display_info,
+
+    .set_pose_source = sim_display_plugin_set_pose_source,
 };
 
 
