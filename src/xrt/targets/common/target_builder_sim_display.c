@@ -20,10 +20,6 @@
 #include "target_builder_qwerty_input.h"
 #include "target_plugin_loader.h"
 
-#ifdef XRT_PLUGIN_BUILD_INPROC_FALLBACK
-#include "sim_display/sim_display_interface.h"
-#endif
-
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty/qwerty_device.h"
 #endif
@@ -79,11 +75,10 @@ sim_display_open_system_impl(struct xrt_builder *xb,
                              struct u_builder_roles_helper *ubrh)
 {
 	/*
-	 * Device creation always routes through the plug-in iface (issue #256
-	 * / ADR-019). The runtime DLL no longer link-includes drv_sim_display
-	 * in production builds; the static fallback only compiles in when
-	 * XRT_PLUGIN_BUILD_INPROC_FALLBACK is on (developer convenience for
-	 * running without the plug-in dylib registered).
+	 * Device creation routes exclusively through the plug-in iface
+	 * (ADR-019 / #256 / #263). The runtime DLL no longer link-includes
+	 * any drv_sim_display symbols — sim-display ships as a plug-in DLL
+	 * (DisplayXR-SimDisplay.dll) discovered at xrCreateInstance time.
 	 */
 	struct xrt_device *head = NULL;
 	const struct xrt_plugin_iface *plugin = target_plugin_get_active();
@@ -92,13 +87,8 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 			head = NULL;
 		}
 	}
-#ifdef XRT_PLUGIN_BUILD_INPROC_FALLBACK
 	if (head == NULL) {
-		head = sim_display_hmd_create();
-	}
-#endif
-	if (head == NULL) {
-		U_LOG_E("sim_display builder: no plug-in created a device and no static fallback compiled in.");
+		U_LOG_E("sim_display builder: no display-processor plug-in created a device. Verify a DisplayProcessor plug-in DLL is registered (HKLM\\Software\\DisplayXR\\DisplayProcessors\\* on Windows).");
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
@@ -127,11 +117,8 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 		qd->pose.position = (struct xrt_vec3){0, 1.6f, 0};
 		qd->pose.orientation = (struct xrt_quat){0, 0, 0, 1};
 
-		// Dims for the qwerty system: screen height + nominal viewer
-		// Z drive the WASD camera scaling. Iface-provided when
-		// available; fall back to sim_display's typed query (only
-		// returns true for sim_display devices, so this is safe even
-		// when the head is some other vendor).
+		// Dims for the qwerty system: screen height + nominal viewer Z
+		// drive the WASD camera scaling. Sourced from the plug-in iface.
 		float screen_height_m = 0.0f;
 		float nominal_z_m = 0.0f;
 		if (plugin != NULL &&
@@ -144,15 +131,6 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 				nominal_z_m = pdi.nominal_viewer_z_m;
 			}
 		}
-#ifdef XRT_PLUGIN_BUILD_INPROC_FALLBACK
-		if (screen_height_m == 0.0f) {
-			struct sim_display_info info;
-			if (sim_display_get_display_info(head, &info)) {
-				screen_height_m = info.display_height_m;
-				nominal_z_m = info.nominal_z_m;
-			}
-		}
-#endif
 		if (screen_height_m > 0.0f) {
 			qd->sys->screen_height_m = screen_height_m;
 		}
@@ -161,20 +139,12 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 		}
 
 		// Bind the qwerty HMD as the head's external pose source.
-		// Iface-routed (plug-in owns the vendor-private cast);
-		// falls back to the in-tree sim_display call only when the
-		// developer in-proc fallback is compiled in (no plug-in dylib
-		// available for the running build).
+		// Iface-routed; the plug-in owns the vendor-private cast.
 		if (plugin != NULL &&
 		    plugin->struct_size > offsetof(struct xrt_plugin_iface, set_pose_source) &&
 		    plugin->set_pose_source != NULL) {
 			plugin->set_pose_source(target_plugin_get_active_instance(), head, qwerty_hmd);
 		}
-#ifdef XRT_PLUGIN_BUILD_INPROC_FALLBACK
-		else {
-			sim_display_hmd_set_pose_source(head, qwerty_hmd);
-		}
-#endif
 	}
 #endif
 

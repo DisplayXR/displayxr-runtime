@@ -208,12 +208,6 @@ option_with_deps(XRT_HAVE_CNSDK "Enable CNSDK support (Android)" DEPENDS CNSDK_F
 # DLLs loaded via registry-driven discovery at xrCreateInstance. See
 # DisplayXR/displayxr-leia-plugin and the post-#263 onboarding guide at
 # docs/guides/vendor-plugin-onboarding.md.
-#
-# This option is retained as a build-time guard against accidental
-# re-introduction of in-tree vendor static-link paths; defaults OFF and
-# is expected to be removed entirely in a follow-up.
-option(XRT_PLUGIN_BUILD_INPROC_FALLBACK
-       "(Deprecated) Reserved for any future in-proc fallback build of vendor drivers" OFF)
 
 # Graphics deps to use (sorted in each group, groups thematic and ordered to handle internal deps: e.g. EGL and SDL2 need OpenGL/GLES)
 option_with_deps(XRT_HAVE_OPENGL "Enable OpenGL Graphics API support" DEPENDS OPENGL_WITHOUT_GLX_FOUND)

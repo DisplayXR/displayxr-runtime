@@ -50,7 +50,7 @@ In priority order:
 - **Hot-swap.** Plug-ins are discovered + loaded once during `xrCreateInstance`. No reload-without-restart.
 - **Android.** No DP plug-ins ship on Android today; the build system gains plug-in infrastructure but no plug-in is migrated there.
 - **Multiple plug-ins active simultaneously.** v1 picks one DP plug-in per session (first-match-wins by registration order). Multi-display heterogeneous setups (Leia panel + future-vendor panel in the same box) are a v2 problem.
-- **Replacing the existing in-process `XRT_HAVE_LEIA_SR` build path entirely.** v1 keeps it as a developer-build CMake option (`XRT_PLUGIN_BUILD_INPROC_FALLBACK`) so the runtime can still be statically built for debugging, but ships only the plug-in shape.
+- **Replacing the existing in-process `XRT_HAVE_LEIA_SR` build path entirely.** v1 kept it as a developer-build CMake option (`XRT_PLUGIN_BUILD_INPROC_FALLBACK`) so the runtime could still be statically built for debugging. (Removed entirely in #287 once it had no in-tree consumers; see §11 below.)
 
 ## 4. Design
 
@@ -225,7 +225,7 @@ Recommended order. Each step lands as its own PR.
 
 - The `XR_EXT_display_info`, `XR_EXT_win32_window_binding`, etc. extension headers don't change. App-facing ABI is unaffected.
 - The DP vtable (`xrt_display_processor*`) doesn't change. The plug-in restructure adds plumbing around it, not changes to it. Existing vendor integration docs stay accurate at the vtable layer.
-- The CMake option `XRT_HAVE_LEIA_SR` remains, but in v1 it controls whether the Leia *plug-in* gets built (not whether the runtime hard-links SR). A new option `XRT_PLUGIN_BUILD_INPROC_FALLBACK` lets developers still produce a statically-linked runtime for debugging (off by default in releases).
+- The CMake option `XRT_HAVE_LEIA_SR` was retained in v1 to control whether the Leia *plug-in* gets built (not whether the runtime hard-links SR). The companion `XRT_PLUGIN_BUILD_INPROC_FALLBACK` option let developers produce a statically-linked runtime for debugging; both options are gone post-#263/#287 — `XRT_HAVE_LEIA_SR` moved to the Leia plug-in repo with the rest of `drv_leia/`, and the in-proc fallback is no longer a buildable path.
 - The `FORCE_SIM_DISPLAY=1` runtime override stays. After the restructure it manifests as "skip leia-sr plug-in probe, fall through to sim-display."
 
 ## 7. Risks
@@ -257,12 +257,13 @@ Recommended order. Each step lands as its own PR.
 - 2026-05-20 — Plan drafted, no decisions yet.
 - 2026-04 — Issue #256 landed: in-tree plug-in DLLs (`DisplayXR-LeiaSR.dll` from `src/xrt/drivers/leia/`, `DisplayXR-SimDisplay.dll` from `src/xrt/drivers/sim_display/`), discovered at `xrCreateInstance` via registry / JSON manifest. Runtime DLL has zero vendor static imports per ADR-019 §2.1; CI assertion in `.github/workflows/build-windows.yml` enforces.
 - 2026-05-22 — Issue #263 landed: `drv_leia` extracted entirely to its own repo at [`DisplayXR/displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin). Runtime tree is now vendor-source-clean; `drv_sim_display` remains in-tree as the vendor-neutral fallback example.
+- 2026-05-23 — Issue #287 landed: `XRT_PLUGIN_BUILD_INPROC_FALLBACK` CMake option + all `#ifdef`-gated in-tree static-link paths removed. The runtime now has no static fallback for display processors at all; every DP comes from a plug-in DLL via registry/manifest discovery.
 
 ## 11. Post-#263 state
 
 The end state of this work:
 
-- **Runtime tree (`DisplayXR/displayxr-runtime`)** — zero vendor source, zero vendor SDK fetches in CI. Builds with sim_display as the in-tree plug-in. The `XRT_PLUGIN_BUILD_INPROC_FALLBACK` option is retained as a guard against accidental re-introduction of in-tree static-link paths; it defaults OFF and is expected to be removed in a follow-up.
+- **Runtime tree (`DisplayXR/displayxr-runtime`)** — zero vendor source, zero vendor SDK fetches in CI. Builds with sim_display as the in-tree plug-in. The `XRT_PLUGIN_BUILD_INPROC_FALLBACK` option was retained briefly post-#263 as a guard against accidental re-introduction of in-tree static-link paths; removed in #287 once no in-tree fallback code remained.
 - **Leia plug-in (`DisplayXR/displayxr-leia-plugin`)** — owns `src/drv_leia/` (formerly `src/xrt/drivers/leia/`), its NSIS installer (`DisplayXRLeiaSRSetup-*.exe`), its CI (fetches SR SDK from this repo's `sr-sdk-v*` release), and the sr-sdk re-host from runtime's old release surface.
 - **Plug-in ABI contract** — `xrt/xrt_plugin.h`, `xrt/xrt_api.h`, `target_plugin_loader.{h,c}`, `sim_display_plugin.c` stay in the runtime tree as the consumed surface for vendor plug-ins (FetchContent-pinned).
 - **Onboarding** — new vendors fork the Leia plug-in repo as a template (or follow [`docs/guides/vendor-plugin-onboarding.md`](../guides/vendor-plugin-onboarding.md) for the contract). The runtime owns no vendor-specific code paths.
