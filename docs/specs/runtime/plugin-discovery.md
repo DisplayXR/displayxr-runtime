@@ -54,9 +54,12 @@ DisplayXR shell, …):
    plug-in would invalidate those pointers; one process, one plug-in,
    for the process's lifetime.
 6. If no entries claim the system (registry empty, every probe declined),
-   `target_plugin_get_active()` returns `NULL` and the runtime falls back
-   to the statically-linked driver symbols (if any — see
-   `XRT_PLUGIN_BUILD_INPROC_FALLBACK` below).
+   `target_plugin_get_active()` returns `NULL` and the sim_display
+   builder fails `XRT_ERROR_DEVICE_CREATION_FAILED` — apps see
+   `xrCreateSession` fail. The runtime no longer has any in-tree
+   static-link fallback (removed in #287); install at least one
+   DisplayProcessor plug-in DLL (e.g. the in-tree
+   `DisplayXR-SimDisplay.dll`) for the runtime to be usable.
 
 ---
 
@@ -300,16 +303,15 @@ If the registry/manifest root is absent, or every registered plug-in
 declines `probe()`:
 
 - `target_plugin_get_active()` returns `NULL`.
-- The runtime falls back to the statically-linked driver symbols
-  available in this build (`drv_sim_display` is always linked;
-  `drv_leia` only when `XRT_PLUGIN_BUILD_INPROC_FALLBACK=ON`, a
-  developer-only CMake option per ADR-019).
-- Production builds without any plug-in installed (`-DXRT_PLUGIN_BUILD_INPROC_FALLBACK=OFF`,
-  no plug-in DLLs registered) still drive the simulated 3D display via
-  the in-tree static `drv_sim_display`.
-- A truly empty build — no plug-ins AND no static fallback — is
-  surfaced by `target_builder_sim_display`'s `XRT_ERROR_DEVICE_CREATION_FAILED`
-  return from `open_system_impl`. Apps see `xrCreateSession` fail.
+- The runtime has **no static-link fallback** (removed in #287 alongside
+  the now-defunct `XRT_PLUGIN_BUILD_INPROC_FALLBACK` CMake option).
+  Every display-processor implementation must come from a plug-in DLL.
+- `target_builder_sim_display.c::open_system_impl` returns
+  `XRT_ERROR_DEVICE_CREATION_FAILED` and apps see `xrCreateSession` fail.
+- The expected install state is at least one DisplayProcessor plug-in DLL
+  registered — typically the in-tree `DisplayXR-SimDisplay.dll` (shipped
+  by the runtime installer) plus optionally vendor plug-ins (e.g.
+  `DisplayXR-LeiaSR.dll` from `displayxr-leia-plugin`).
 
 ---
 

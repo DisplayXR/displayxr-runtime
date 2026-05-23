@@ -1476,41 +1476,21 @@ my_vendor_sdk_weave(struct my_vendor_sdk *sdk, /* ... */)
 
 ## 8. Component 5: Target Builder and Build System Registration
 
-> **Note (ADR-019 / issue #256):** This section describes the **legacy
-> in-tree** registration shape, kept around for developer debugging
-> behind the CMake option `XRT_PLUGIN_BUILD_INPROC_FALLBACK` (default
-> OFF). **New vendor integrations should NOT follow this section.**
-> Vendors ship a plug-in DLL with its own build target (`add_library(...
-> SHARED ...)` per §1.2) and an installer that registers it under
+> **Note (ADR-019 / issues #256 + #263 + #287):** This section
+> describes the **legacy in-tree** registration shape from before the
+> driver extraction. **New vendor integrations should NOT follow this
+> section** — see [`vendor-plugin-onboarding.md`](vendor-plugin-onboarding.md)
+> for the current contract. Vendors ship a plug-in DLL from their own
+> repo with an installer that registers it under
 > `HKLM\Software\DisplayXR\DisplayProcessors\<id>` per
-> `docs/specs/runtime/plugin-discovery.md`. The five-file in-tree
-> registration described below applies only when
-> `XRT_PLUGIN_BUILD_INPROC_FALLBACK=ON`.
+> [`plugin-discovery.md`](../specs/runtime/plugin-discovery.md). The
+> reference plug-in repo template is
+> [`DisplayXR/displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin).
 >
-> The plug-in build target itself is much smaller — see the
-> `drv_leia_plugin` block in `src/xrt/drivers/CMakeLists.txt` for the
-> reference shape:
->
-> ```cmake
-> add_library(drv_your_vendor_plugin SHARED ${YOUR_SOURCES} your_plugin.c)
-> target_compile_definitions(drv_your_vendor_plugin PRIVATE XRT_USING_RUNTIME_DLL)
-> target_link_libraries(drv_your_vendor_plugin PRIVATE
->     $<TARGET_LINKER_FILE:${RUNTIME_TARGET}>  # DisplayXRClient.lib
->     xrt-interfaces aux_util aux_os aux_math aux_vk
->     # ... your vendor SDK libs ...
-> )
-> set_target_properties(drv_your_vendor_plugin PROPERTIES
->     OUTPUT_NAME "DisplayXR-YourVendor"
->     PREFIX ""
->     C_VISIBILITY_PRESET hidden
->     CXX_VISIBILITY_PRESET hidden)
-> ```
->
-> No `T_BUILDER_*` guards, no `target_lists.c` entries, no fifth file
-> elsewhere — the runtime discovers your plug-in entirely through the
-> registry/manifest mechanism. The legacy section below is retained
-> only for `XRT_PLUGIN_BUILD_INPROC_FALLBACK=ON` developer builds
-> where the runtime DLL is allowed to static-link drv_<vendor> directly.
+> The in-tree path described below no longer exists in a buildable
+> form — the `XRT_PLUGIN_BUILD_INPROC_FALLBACK` CMake option that used
+> to gate it was removed in #287. This section is retained for
+> historical narrative only.
 
 The target builder registers the vendor's driver with the runtime.  When the
 runtime starts, it iterates the builder list, calls `estimate_system()` on

@@ -36,13 +36,6 @@
 // xrt_plugin_iface — see target_plugin_loader. The runtime DLL no
 // longer link-includes any vendor drv_* code (ADR-019 / #256 / #263).
 
-// sim_display display info for XR_EXT_display_info fallback — only
-// compiled in the developer in-proc fallback build (ADR-019 / issue
-// #256). Production builds route everything through the plug-in iface.
-#ifdef XRT_PLUGIN_BUILD_INPROC_FALLBACK
-#include "sim_display/sim_display_interface.h"
-#endif
-
 #include "target_plugin_loader.h"
 
 #include "target_instance_parts.h"
@@ -295,95 +288,10 @@ out:
 			}
 		}
 
-		/* Consumed by the sim_display in-proc fallback block below.
-		 * When that fallback doesn't compile in (production builds),
-		 * silence -Wunused-but-set-variable. */
+		// All display-info + DP factories are sourced from the plug-in
+		// iface above (ADR-019 / #256 / #263). The runtime DLL no longer
+		// link-includes any drv_sim_display symbols.
 		(void)plugin_filled_display_info;
-
-		// sim_display fallback. Production builds (ADR-019/issue #256)
-		// populate everything through the plug-in iface above and skip
-		// this block entirely — the runtime DLL no longer link-includes
-		// drv_sim_display, so its symbols aren't available.
-		//
-		// XRT_PLUGIN_BUILD_INPROC_FALLBACK keeps the static path
-		// compiled in for developer iteration without a registered
-		// plug-in dylib. Even in the fallback build, the iface path
-		// runs first; this block only fires when no plug-in loaded
-		// AND the static archive is on the link line.
-#ifdef XRT_PLUGIN_BUILD_INPROC_FALLBACK
-		{
-			struct sim_display_info sd_info;
-			if (!plugin_filled_display_info && xsysc->info.display_width_m == 0.0f &&
-			    sim_display_get_display_info(head, &sd_info)) {
-				xsysc->info.display_width_m = sd_info.display_width_m;
-				xsysc->info.display_height_m = sd_info.display_height_m;
-				xsysc->info.nominal_viewer_x_m = 0.0f;
-				xsysc->info.nominal_viewer_y_m = sd_info.nominal_y_m;
-				xsysc->info.nominal_viewer_z_m = sd_info.nominal_z_m;
-				xsysc->info.display_pixel_width = sd_info.display_pixel_width;
-				xsysc->info.display_pixel_height = sd_info.display_pixel_height;
-
-				// Compute tiling for all modes and derive system atlas
-				for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
-					u_tiling_compute_mode(&head->rendering_modes[mi],
-					                      sd_info.display_pixel_width,
-					                      sd_info.display_pixel_height);
-				}
-				u_tiling_compute_system_atlas(head->rendering_modes,
-				                              head->rendering_mode_count,
-				                              &xsysc->info.atlas_width_pixels,
-				                              &xsysc->info.atlas_height_pixels);
-
-				// Backward compat: recommended_view_scale from worst-case mode
-				float min_scale_x = 1.0f, min_scale_y = 1.0f;
-				for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
-					if (head->rendering_modes[mi].view_scale_x > 0.0f &&
-					    head->rendering_modes[mi].view_scale_x < min_scale_x)
-						min_scale_x = head->rendering_modes[mi].view_scale_x;
-					if (head->rendering_modes[mi].view_scale_y > 0.0f &&
-					    head->rendering_modes[mi].view_scale_y < min_scale_y)
-						min_scale_y = head->rendering_modes[mi].view_scale_y;
-				}
-				xsysc->info.recommended_view_scale_x = min_scale_x;
-				xsysc->info.recommended_view_scale_y = min_scale_y;
-
-				// Sim display: manual eye tracking only (simulated device, always "tracking")
-				xsysc->info.supported_eye_tracking_modes = 2; // MANUAL_BIT
-				xsysc->info.default_eye_tracking_mode = 1;    // MANUAL
-				U_LOG_W("XR_EXT_display_info (sim_display in-proc fallback): display=%.3fx%.3f m, "
-				        "nominal=(0, %.3f, %.3f) m, scale=%.2fx%.2f, atlas=%ux%u, pixels=%ux%u",
-				        sd_info.display_width_m, sd_info.display_height_m,
-				        sd_info.nominal_y_m, sd_info.nominal_z_m,
-				        xsysc->info.recommended_view_scale_x,
-				        xsysc->info.recommended_view_scale_y,
-				        xsysc->info.atlas_width_pixels,
-				        xsysc->info.atlas_height_pixels,
-				        sd_info.display_pixel_width, sd_info.display_pixel_height);
-
-				if (xsysc->info.dp_factory_vk == NULL) {
-					xsysc->info.dp_factory_vk = (void *)sim_display_dp_factory_vk;
-				}
-#ifdef XRT_OS_WINDOWS
-				if (xsysc->info.dp_factory_d3d11 == NULL) {
-					xsysc->info.dp_factory_d3d11 = (void *)sim_display_dp_factory_d3d11;
-				}
-#endif
-#if defined(XRT_OS_WINDOWS) && defined(XRT_HAVE_D3D12)
-				if (xsysc->info.dp_factory_d3d12 == NULL) {
-					xsysc->info.dp_factory_d3d12 = (void *)sim_display_dp_factory_d3d12;
-				}
-#endif
-#ifdef __APPLE__
-				if (xsysc->info.dp_factory_metal == NULL) {
-					xsysc->info.dp_factory_metal = (void *)sim_display_dp_factory_metal;
-				}
-#endif
-				if (xsysc->info.dp_factory_gl == NULL) {
-					xsysc->info.dp_factory_gl = (void *)sim_display_dp_factory_gl;
-				}
-			}
-		}
-#endif /* XRT_PLUGIN_BUILD_INPROC_FALLBACK */
 
 		assert(out_xsysc != NULL);
 		*out_xsysc = xsysc;

@@ -302,13 +302,14 @@ _package\run_cube_handle_d3d11_win.bat   :: sets XR_RUNTIME_JSON to dev manifest
 Full reference: [`docs/getting-started/building.md` § Local Dev Iteration](docs/getting-started/building.md#local-dev-iteration).
 
 ### Key CMake Options
-- `XRT_PLUGIN_BUILD_INPROC_FALLBACK` (default OFF) — reserved guard
-  against accidental re-introduction of in-tree vendor static-link
-  paths. Production builds leave this off; vendor code lives entirely
-  in plug-in DLLs (`DisplayXR-LeiaSR.dll` from `displayxr-leia-plugin`,
-  `DisplayXR-SimDisplay.dll` in-tree) discovered at `xrCreateInstance`.
 - `XRT_FEATURE_SERVICE` — Out-of-process service mode
 - `BUILD_TESTING` — Test suite
+
+Vendor display-processor code is **not** controlled by a CMake option
+— all vendor drv_* implementations ship as plug-in DLLs from their
+own repos (`DisplayXR-LeiaSR.dll` from `displayxr-leia-plugin`,
+`DisplayXR-SimDisplay.dll` in-tree at `src/xrt/drivers/sim_display/`)
+and are discovered at `xrCreateInstance` time per ADR-019/#263.
 
 ### GitHub Actions Build
 **Windows** (`.github/workflows/build-windows.yml`):
