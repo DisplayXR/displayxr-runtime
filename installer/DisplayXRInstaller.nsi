@@ -809,6 +809,21 @@ Section "Uninstall"
 	SetRegView 64
 
 	; -----------------------------------------------------------------
+	; Kill displayxr-service BEFORE the cascade so vendor plug-in DLLs
+	; aren't locked when their own uninstallers try to delete them
+	; (#286). The service loads every registered DisplayProcessor
+	; plug-in at xrCreateInstance time; if the cascade runs first, the
+	; plug-in's `Delete "$INSTDIR\DisplayXR-<vendor>.dll"` silently
+	; fails on file-in-use and the DLL orphans. Remove auto-start
+	; registration here too so the service doesn't get re-launched by
+	; a re-logon mid-uninstall.
+	; -----------------------------------------------------------------
+	DetailPrint "Stopping DisplayXR Service before cascade..."
+	nsExec::ExecToLog 'taskkill /f /im displayxr-service.exe'
+	DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "DisplayXR Service"
+	nsExec::ExecToLog 'schtasks /delete /tn "DisplayXR Service" /f'
+
+	; -----------------------------------------------------------------
 	; Cascade-uninstall registered workspace controllers FIRST.
 	;
 	; Each workspace app (the DisplayXR shell, third-party verticals, …)
@@ -824,6 +839,7 @@ Section "Uninstall"
 	DetailPrint "Discovering registered workspace controllers..."
 	StrCpy $R0 ""
 	StrCpy $9 0
+	StrCpy $R9 0    ; entry count for the run-loop's exit condition
 	cascade_collect_loop:
 		EnumRegKey $1 HKLM "Software\DisplayXR\WorkspaceControllers" $9
 		StrCmp $1 "" cascade_collect_done
@@ -834,21 +850,26 @@ Section "Uninstall"
 			${Else}
 				StrCpy $R0 "$R0|$2"
 			${EndIf}
+			IntOp $R9 $R9 + 1
 		${EndIf}
 		IntOp $9 $9 + 1
 		Goto cascade_collect_loop
 	cascade_collect_done:
 
 	${If} $R0 != ""
-		; WordFind's "#" (count) op returns the full string instead of an
-		; integer when the buffer has no delimiter — making IntCmp jump
-		; straight to "done" and never running the exec. Iterate until
-		; the +N position is out-of-range (IfErrors / empty result) instead.
+		; Use the count tracked during the collect phase as the exit
+		; condition. Earlier we tried IfErrors after `${un.WordFind} +N`
+		; (#286): WordFind doesn't reliably set the error flag past
+		; word-count in the un. variant, so the loop spun infinitely
+		; whenever the buffer had no `|` delimiter (single-entry case).
+		; The earlier attempt before that (`${un.WordFind} ... "#" $R9`)
+		; failed too because "#" returns the buffer string itself when
+		; there's no delimiter, sending IntCmp to "done" — see #263 PR
+		; comment. The count-during-collect approach sidesteps both.
 		StrCpy $R8 1
-		ClearErrors
 		cascade_run_loop:
+			IntCmp $R8 $R9 0 0 cascade_run_done
 			${un.WordFind} "$R0" "|" "+$R8" $R7
-			IfErrors cascade_run_done
 			${If} $R7 != ""
 				; $R7 has embedded quotes (the WriteRegStr in each
 				; controller's installer stores `"path"`); strip them
@@ -863,7 +884,6 @@ Section "Uninstall"
 				DetailPrint "  exit code: $5"
 			${EndIf}
 			IntOp $R8 $R8 + 1
-			ClearErrors
 			Goto cascade_run_loop
 		cascade_run_done:
 	${EndIf}
@@ -891,6 +911,7 @@ Section "Uninstall"
 	DetailPrint "Discovering registered display processor plug-ins..."
 	StrCpy $R0 ""
 	StrCpy $9 0
+	StrCpy $R9 0    ; entry count for the run-loop's exit condition
 	dp_cascade_collect_loop:
 		EnumRegKey $1 HKLM "Software\DisplayXR\DisplayProcessors" $9
 		StrCmp $1 "" dp_cascade_collect_done
@@ -901,21 +922,20 @@ Section "Uninstall"
 			${Else}
 				StrCpy $R0 "$R0|$2"
 			${EndIf}
+			IntOp $R9 $R9 + 1
 		${EndIf}
 		IntOp $9 $9 + 1
 		Goto dp_cascade_collect_loop
 	dp_cascade_collect_done:
 
 	${If} $R0 != ""
-		; WordFind's "#" (count) op returns the full string instead of an
-		; integer when the buffer has no delimiter — making IntCmp jump
-		; straight to "done" and never running the exec. Iterate until
-		; the +N position is out-of-range (IfErrors / empty result) instead.
+		; Use the count tracked during the collect phase (see comment in
+		; the workspace-controller cascade above for the IfErrors /
+		; WordFind-"#" pitfalls that this approach sidesteps — #286).
 		StrCpy $R8 1
-		ClearErrors
 		dp_cascade_run_loop:
+			IntCmp $R8 $R9 0 0 dp_cascade_run_done
 			${un.WordFind} "$R0" "|" "+$R8" $R7
-			IfErrors dp_cascade_run_done
 			${If} $R7 != ""
 				; $R7 has embedded quotes (the WriteRegStr in each
 				; plug-in's installer stores `"path"`); strip them
@@ -930,7 +950,6 @@ Section "Uninstall"
 				DetailPrint "  exit code: $5"
 			${EndIf}
 			IntOp $R8 $R8 + 1
-			ClearErrors
 			Goto dp_cascade_run_loop
 		dp_cascade_run_done:
 	${EndIf}
@@ -939,15 +958,9 @@ Section "Uninstall"
 	DeleteRegKey HKLM "Software\DisplayXR\DisplayProcessors"
 	; -----------------------------------------------------------------
 
-	; Stop the displayxr-service and remove auto-start registration (issue #68)
-	; Kill any running instance first so we can delete the exe
-	DetailPrint "Stopping DisplayXR Service..."
-	nsExec::ExecToLog 'taskkill /f /im displayxr-service.exe'
-	; Remove Run key auto-start
-	DetailPrint "Removing DisplayXR Service auto-start..."
-	DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "DisplayXR Service"
-	; Also remove legacy scheduled task if it exists (from older installs)
-	nsExec::ExecToLog 'schtasks /delete /tn "DisplayXR Service" /f'
+	; (Service was already killed + Run key cleaned at the top of the
+	; uninstall section, before the cascades, so plug-in DLLs unlocked
+	; in time for their own uninstallers — see #286.)
 
 	; Remove files. We name the high-value executables explicitly (so a
 	; failed Delete prints a clear log line), then wildcard-sweep the rest
