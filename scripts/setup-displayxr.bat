@@ -192,7 +192,7 @@ REM Nested keys use dot notation, e.g. "demos.gaussiansplat".
 :read_pin
 set "_RP_KEY=%~1"
 set "_RP_VAR=%~2"
-for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "$d=Get-Content -Raw '%VERSIONS_JSON%' ^| ConvertFrom-Json; $v=$d; foreach ($p in '%_RP_KEY%'.Split('.')) { $v = $v.$p }; Write-Output $v"`) do set "%_RP_VAR%=%%i"
+for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "$d = ConvertFrom-Json (Get-Content -Raw '%VERSIONS_JSON%'); $v=$d; foreach ($p in '%_RP_KEY%'.Split('.')) { $v = $v.$p }; Write-Output $v"`) do set "%_RP_VAR%=%%i"
 if not defined %_RP_VAR% (
     echo ERROR: versions.json has no pin for '%_RP_KEY%' 1>&2
     set "EXITCODE=1"
@@ -235,8 +235,8 @@ if errorlevel 1 (
 REM Confirm the Windows asset is attached.
 set "_IC_FOUND="
 for /f "usebackq delims=" %%i in (`gh release view "%_IC_TAG%" --repo "%_IC_REPO%" --json assets --jq ".assets[].name"`) do (
-    echo %%i | findstr /r /c:"^DisplayXR.*\.exe$" >nul
-    if !errorlevel! EQU 0 set "_IC_FOUND=1"
+    set "_IC_LINE=%%i"
+    if /i "!_IC_LINE:~-4!"==".exe" set "_IC_FOUND=1"
 )
 if not defined _IC_FOUND (
     echo WARN: %_IC_NAME% @ %_IC_TAG%: no Windows .exe asset attached to this release. 1>&2
@@ -324,11 +324,14 @@ REM registry. Uses Publisher=DisplayXR as the discovery key (set by each
 REM component's NSIS installer); QuietUninstallString runs silently with /S.
 :do_uninstall
 echo ==^> Discovering installed DisplayXR components...
+REM Match by DisplayName prefix as well — the Leia SR plug-in's installer
+REM sets Publisher='Leia Inc.', not 'DisplayXR', but every DisplayXR-shipped
+REM installer uses 'DisplayXR <component>' as the DisplayName.
 if "%DRY_RUN%"=="1" (
-    powershell -NoProfile -Command "Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.Publisher -eq 'DisplayXR' } | ForEach-Object { Write-Host ('  (dry-run) would uninstall: ' + $_.DisplayName + ' (' + $_.DisplayVersion + ')') }"
+    powershell -NoProfile -Command "Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.Publisher -eq 'DisplayXR' -or $_.DisplayName -like 'DisplayXR *' } | ForEach-Object { Write-Host ('  (dry-run) would uninstall: ' + $_.DisplayName + ' (' + $_.DisplayVersion + ')') }"
     exit /b 0
 )
-powershell -NoProfile -Command "$comps = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.Publisher -eq 'DisplayXR' }; if (-not $comps) { Write-Host 'WARN: No DisplayXR-published components are installed.'; exit 0 }; foreach ($c in $comps) { Write-Host ('==> Uninstalling ' + $c.DisplayName + ' (' + $c.DisplayVersion + ')'); $u = if ($c.QuietUninstallString) { $c.QuietUninstallString } else { $c.UninstallString + ' /S' }; cmd /c $u; if ($LASTEXITCODE -ne 0) { Write-Host ('WARN: uninstaller for ' + $c.DisplayName + ' exited ' + $LASTEXITCODE) } else { Write-Host (' OK  ' + $c.DisplayName + ' uninstalled.') } }"
+powershell -NoProfile -Command "$comps = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.Publisher -eq 'DisplayXR' -or $_.DisplayName -like 'DisplayXR *' }; if (-not $comps) { Write-Host 'WARN: No DisplayXR-published components are installed.'; exit 0 }; foreach ($c in $comps) { Write-Host ('==> Uninstalling ' + $c.DisplayName + ' (' + $c.DisplayVersion + ')'); $u = if ($c.QuietUninstallString) { $c.QuietUninstallString } else { $c.UninstallString + ' /S' }; cmd /c $u; if ($LASTEXITCODE -ne 0) { Write-Host ('WARN: uninstaller for ' + $c.DisplayName + ' exited ' + $LASTEXITCODE) } else { Write-Host (' OK  ' + $c.DisplayName + ' uninstalled.') } }"
 if exist "%REPO_ROOT%\demos" (
     echo WARN: %REPO_ROOT%\demos\ is present. Leaving it in place — remove 1>&2
     echo       manually if intended ^(it may contain local changes^). 1>&2
