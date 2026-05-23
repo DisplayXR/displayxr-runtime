@@ -38,13 +38,20 @@ version-spec:
   ├─ Pre-flight (clean tree, on main, tag not taken)
   ├─ Bump CMakeLists.txt VERSION
   ├─ Commit "Release vX.Y.Z" → push main → tag → push tag
-  ├─ Monitor build-windows.yml run for this commit
-  ├─ Download installer artifact from the build run
-  ├─ gh release create with the installer attached + grouped notes
+  │
+  │  (CI takes over here — both workflows attach their own artifacts
+  │   to the v* tag's release via softprops/action-gh-release@v2;
+  │   first job to complete creates the release, others append.)
+  │
+  ├─ Monitor build-windows.yml + build-macos.yml for this commit
+  ├─ gh release edit --title --notes (curated Highlights paragraph
+  │   layered on top of the empty body the action created)
   └─ Report
 ```
 
-CMakeLists.txt VERSION is always bumped to the new semver.
+CMakeLists.txt VERSION is always bumped to the new semver. The skill
+no longer downloads or re-uploads any artifacts — that moved into the
+workflows themselves per #290.
 
 ## CRITICAL: Launch Subagent
 
@@ -159,95 +166,65 @@ Windows CI can take up to 30 min with test apps; macOS is faster (~10-15 min inc
 
 ### Step 3.4: Check both results
 - Both runs all-required-jobs succeed → Phase 4
-- Critical Windows job (`Runtime`, `Build`) fails OR macOS `Build` / `BuildInstaller` fails → Phase 6 (Rollback)
+- Critical Windows job (`Runtime`, `Build`) fails AND macOS `Build` / `BuildInstaller` also fails → Phase 6 (Rollback) — no release was created
 - Pre-existing-broken jobs (e.g. demo jobs that reference paths moved to standalone repos) fail but the artifact-producing job still succeeded → continue to Phase 4 with a flag in the final report
-- macOS `BuildInstaller` infrastructure-fails (e.g. brew flake) but Windows is green and the run is rerunnable → STOP and ask the user whether to rerun macOS or release Windows-only (latter is degraded; flag clearly)
+- One side fails but the other succeeded → the release exists (the green side's `softprops/action-gh-release` step ran) but is missing assets. STOP and ask the user whether to rerun the failed workflow or ship degraded; flag clearly. The release tag can be left in place while the rerun happens.
 
 ---
 
-## PHASE 4: CREATE GITHUB RELEASE
+## PHASE 4: WRITE CURATED RELEASE NOTES
 
-The build runs produce three artifacts the release should attach:
-- **Windows installer** — `DisplayXR-Installer` artifact from the Windows run (contains `DisplayXRSetup-X.Y.Z.BUILD.exe`).
-- **macOS installer** — `DisplayXR-Installer-macOS` artifact from the macOS run (contains `DisplayXR-Installer.pkg`). Post-#277.
-- **Test apps bundle** — `TestApps-<run_number>` artifact from the Windows run (~17 MB folder containing all cube test apps). Forced on every tag push by the `DetectChanges` job (`ref_type == 'tag'`). Builders, OEM integrators, and field testers use this to validate the runtime against the public extension contracts without rebuilding from source.
+Since the CI workflows now attach artifacts to the release directly via
+`softprops/action-gh-release@v2` (per #290), the release exists by the
+time CI completes and already has the Windows installer, macOS .pkg,
+and test-apps zip attached. The skill's job is now just to write the
+curated Highlights paragraph on top of the auto-created (empty-body)
+release.
 
-Check whether the release already exists:
-
+### Step 4.1: Confirm the release exists
 ```bash
-gh release view [FULL_TAG] --repo DisplayXR/displayxr-runtime 2>/dev/null
+gh release view [FULL_TAG] --repo DisplayXR/displayxr-runtime --json tagName,assets --jq '{tag: .tagName, assets: [.assets[].name]}'
 ```
+If the release does NOT exist at this point, both CI workflows
+catastrophically failed before reaching their attach steps. Go to
+Phase 6.
 
-### Step 4.1: Download artifacts (always runs)
-Regardless of whether the release exists, download all artifacts from both runs so we can verify or attach them:
-
-```bash
-# Windows: DisplayXR* matches DisplayXR-Installer + DisplayXR (folder bundle)
-gh run download $WIN_RUN_ID --repo DisplayXR/displayxr-runtime --pattern "DisplayXR*" --dir _release_assets/
-
-# Windows: TestApps-* is a separate pattern (doesn't match DisplayXR*)
-gh run download $WIN_RUN_ID --repo DisplayXR/displayxr-runtime --pattern "TestApps-*" --dir _release_assets/
-
-# macOS: DisplayXR-Installer-macOS contains DisplayXR-Installer.pkg (post-#277)
-gh run download $MAC_RUN_ID --repo DisplayXR/displayxr-runtime --pattern "DisplayXR-Installer-macOS" --dir _release_assets/
-
-INSTALLER=$(find _release_assets/ -name "DisplayXRSetup-*.exe" | head -1)
-[ -z "$INSTALLER" ] && STOP: "Could not find DisplayXRSetup-*.exe in Windows build artifacts."
-
-PKG_INSTALLER=$(find _release_assets/ -name "DisplayXR-Installer.pkg" | head -1)
-if [ -z "$PKG_INSTALLER" ]; then
-  echo "WARN: no DisplayXR-Installer.pkg in macOS run — macOS install asset will not be attached."
-  echo "Check macOS BuildInstaller job logs. Don't STOP — Windows release still ships."
-fi
-# Rename the .pkg to include the version so the asset filename matches the convention
-# (DisplayXR-Installer-X.Y.Z.pkg, parallel to DisplayXRSetup-X.Y.Z.BUILD.exe).
-if [ -n "$PKG_INSTALLER" ]; then
-  VERSIONED_PKG="_release_assets/DisplayXR-Installer-[VERSION].pkg"  # [VERSION] without leading v
-  cp "$PKG_INSTALLER" "$VERSIONED_PKG"
-  PKG_INSTALLER="$VERSIONED_PKG"
-fi
-
-# Zip the TestApps folder into a single asset. Pattern: DisplayXR-TestApps-<version>.zip.
-TESTAPPS_DIR=$(find _release_assets/ -maxdepth 2 -type d -name "TestApps-*" | head -1)
-TESTAPPS_ZIP=""
-if [ -n "$TESTAPPS_DIR" ]; then
-  TESTAPPS_ZIP="_release_assets/DisplayXR-TestApps-[VERSION].zip"  # [VERSION] without leading v
-  (cd "$TESTAPPS_DIR" && zip -rq "../../$TESTAPPS_ZIP" .)
-  ls -lh "$TESTAPPS_ZIP"
-else
-  echo "WARN: no TestApps-* artifact in run — test apps will not be attached. Check DetectChanges output."
-fi
-```
-
-The TestApps bundle and the macOS .pkg are both **soft requirements**: log a warning if missing and continue with the assets that are available. Only the Windows installer is hard-required (its absence STOPs the release).
-
-### Step 4.2a: If release already exists
-The workflow auto-created it (rare path — currently neither `build-windows.yml` nor `build-macos.yml` auto-creates a release, so this branch is unusual). Upload any missing assets:
+### Step 4.2: Generate + write release notes
+Group commits from `git log $PREV_TAG..[FULL_TAG] --oneline --no-merges`
+by prefix (see "Notes template" below). Write a 1-3 line Highlights
+paragraph at the top describing what's notable for users.
 
 ```bash
-gh release upload [FULL_TAG] --repo DisplayXR/displayxr-runtime --clobber \
-  "$INSTALLER" \
-  ${PKG_INSTALLER:+"$PKG_INSTALLER"} \
-  ${TESTAPPS_ZIP:+"$TESTAPPS_ZIP"}
-```
-Then go to Phase 5.
+NOTES=$(cat <<'NOTES_EOF'
+## Highlights
+<manually written 1-3 line summary>
 
-### Step 4.2b: If release does NOT exist
-Create it with all available assets:
+## Features
+<auto-grouped feat: commits>
 
-```bash
-# Generate release notes
-NOTES=$(git log "$PREV_TAG".."[FULL_TAG]" --oneline --no-merges)
-# Group commits by prefix (Feature, Fix, CI, Docs, etc.) — see PHASE 5 notes template
+## Fixes
+<auto-grouped fix: commits>
 
-gh release create [FULL_TAG] \
+## Docs
+<auto-grouped docs: commits>
+
+## CI / Build
+<auto-grouped ci: / build: / cmake: commits>
+
+## Other
+<everything else>
+NOTES_EOF
+)
+
+gh release edit [FULL_TAG] \
   --repo DisplayXR/displayxr-runtime \
   --title "DisplayXR Runtime [FULL_TAG]" \
-  --notes "<grouped notes here>" \
-  "$INSTALLER" \
-  ${PKG_INSTALLER:+"$PKG_INSTALLER"} \
-  ${TESTAPPS_ZIP:+"$TESTAPPS_ZIP"}
+  --notes "$NOTES"
 ```
+
+`gh release edit --notes` overwrites whatever body the action created
+(`softprops/action-gh-release@v2` with no `body`/`body_path` defaults
+to an empty body, so there's nothing to merge — just overwrite).
 
 ---
 
@@ -260,15 +237,12 @@ gh release view [FULL_TAG] --repo DisplayXR/displayxr-runtime --json tagName,nam
 Verify:
 - Tag matches [FULL_TAG]
 - Asset list contains `DisplayXRSetup-*.exe` with non-zero size (Windows installer, hard requirement)
-- Asset list contains `DisplayXR-Installer-*.pkg` with non-zero size (macOS installer, post-#277; warn but don't fail if the macOS run skipped it — flag in final report so the user can investigate)
-- Asset list contains `DisplayXR-TestApps-*.zip` with non-zero size (warn but don't fail if `DetectChanges` skipped the test-app build — flag in final report so the user can investigate)
+- Asset list contains `DisplayXR-Installer-*.pkg` with non-zero size (macOS installer; warn but don't fail if the macOS run skipped it — flag in final report)
+- Asset list contains `DisplayXR-TestApps-*.zip` with non-zero size (warn but don't fail if the BundleTestApps job skipped it — flag in final report)
+- Title is `DisplayXR Runtime [FULL_TAG]`
+- Body starts with `## Highlights`
 
-### Step 5.1: Cleanup staging dir
-Only after the verification above passes. If verification fails, leave the dir for inspection.
-```bash
-rm -rf _release_assets/
-```
-Phase 4.2a always downloads into this dir before any upload, so the `rm -rf` is always meaningful — safe to run unconditionally.
+No local staging dir to clean up — the CI does all artifact handling.
 
 ### Notes template
 Group commits from `git log $PREV_TAG..[FULL_TAG] --oneline --no-merges` by prefix:

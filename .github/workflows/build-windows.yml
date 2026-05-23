@@ -220,6 +220,20 @@ jobs:
           if-no-files-found: error
           path: _package/DisplayXRSetup-*.exe
 
+      # Attach the Windows installer to the v* GitHub release (#290).
+      # First workflow to complete on the tag creates the release;
+      # subsequent ones (macOS BuildInstaller, BundleTestApps) append
+      # their artifacts. Filename is DisplayXRSetup-X.Y.Z.BUILD.exe
+      # from the NSI's OutFile.
+      - name: Attach Windows installer to GitHub release on tag
+        if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: _package/DisplayXRSetup-*.exe
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
+
       # OneDrive upload uses RCLONE_CONFIG, which is null on fork PRs. Skip
       # the whole rclone group on forks; the artifact-upload steps above
       # already give reviewers the installer.
@@ -1041,3 +1055,25 @@ jobs:
           echo "Uploading TestApps-${{ github.run_number }}.zip to OneDrive: $destPath"
           rclone copy TestApps-${{ github.run_number }}.zip "onedrive:$destPath" --progress
           echo "Upload complete!"
+
+      # Versioned re-zip for the v* GitHub release (#290). Asset name
+      # mirrors the convention from the /release skill — DisplayXR-
+      # TestApps-X.Y.Z.zip — so older skill-cut releases and CI-cut
+      # releases use identical naming.
+      - name: Zip test apps for release (versioned)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cd TestApps
+          zip -r "../DisplayXR-TestApps-${VERSION}.zip" .
+          cd ..
+          ls -lh "DisplayXR-TestApps-${VERSION}.zip"
+
+      - name: Attach test apps bundle to GitHub release on tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: DisplayXR-TestApps-*.zip
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
