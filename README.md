@@ -44,15 +44,38 @@ Every graphics API gets its own native compositor — no Vulkan intermediary, no
 
 ## Quick Start
 
-### Install (Windows)
+### One-command dev install
 
-DisplayXR ships as three small, independent installers. Install in this order:
+```bash
+# macOS
+git clone https://github.com/DisplayXR/displayxr-runtime
+cd displayxr-runtime
+./scripts/setup-displayxr.sh                  # runtime + sim-display
+./scripts/setup-displayxr.sh --with mcp       # also DisplayXR MCP Tools when published
+```
 
-1. **DisplayXR Runtime** — `DisplayXRSetup-*.exe` from [displayxr-runtime releases](https://github.com/DisplayXR/displayxr-runtime/releases). Required.
-2. **DisplayXR Shell** — `DisplayXRShellSetup-*.exe` from [displayxr-shell-releases](https://github.com/DisplayXR/displayxr-shell-releases/releases). Optional, adds the spatial-workspace UX. Hard-requires the runtime ([workspace controller contract](docs/specs/runtime/workspace-controller-registration.md)).
-3. **DisplayXR MCP Tools** — `DisplayXRMCPSetup-*.exe` from [displayxr-mcp releases](https://github.com/DisplayXR/displayxr-mcp/releases). Optional, enables AI-agent / voice control.
+```bat
+:: Windows — run from an ELEVATED command prompt
+git clone https://github.com/DisplayXR/displayxr-runtime
+cd displayxr-runtime
+scripts\setup-displayxr.bat                   :: runtime + Shell + Leia plug-in
+scripts\setup-displayxr.bat --with mcp        :: also DisplayXR MCP Tools
+```
 
-The website's [Get Started](https://displayxr.org/getting-started) page walks through this end-to-end with verification steps.
+Downloads each component's installer from its GitHub Releases page (versions pinned in [`versions.json`](versions.json)), runs it silently, verifies the install. See [`docs/getting-started/full-stack-install.md`](docs/getting-started/full-stack-install.md) for `--with-demos`, `--dry-run`, `--uninstall`, and the per-component platform availability matrix.
+
+### Manual install
+
+For full control, install each component directly from its release page. Order: runtime → Shell → Leia plug-in → MCP Tools.
+
+| Component | Windows | macOS |
+|---|---|---|
+| **DisplayXR Runtime** (required) | [`DisplayXRSetup-*.exe`](https://github.com/DisplayXR/displayxr-runtime/releases) | [`DisplayXR-Installer-*.pkg`](https://github.com/DisplayXR/displayxr-runtime/releases) |
+| **DisplayXR Shell** (optional, spatial workspace UX) | [`DisplayXRShellSetup-*.exe`](https://github.com/DisplayXR/displayxr-shell-releases/releases) | — (deferred) |
+| **Leia SR plug-in** (Leia hardware only) | [`DisplayXRLeiaSRSetup-*.exe`](https://github.com/DisplayXR/displayxr-leia-plugin/releases) | — (vendor SDK is Windows-only) |
+| **MCP Tools** (optional, AI-agent / voice control) | [`DisplayXRMCPSetup-*.exe`](https://github.com/DisplayXR/displayxr-mcp/releases) | — (future) |
+
+The website's [Get Started](https://displayxr.org/getting-started) page walks through the manual flow end-to-end with verification steps.
 
 ### Build from source
 
@@ -67,10 +90,6 @@ brew install cmake ninja eigen vulkan-sdk && ./scripts/build_macos.sh --installe
 # Install: sudo installer -pkg _package/DisplayXR-Installer-*.pkg -target /
 # (Gatekeeper warns on double-click — the .pkg is unsigned today; sudo installer
 #  from terminal bypasses Gatekeeper. Notarization tracked in issues #280/#281.)
-
-# Or all-in-one (macOS) — download + install the pinned release matrix
-./scripts/setup-displayxr.sh
-# See docs/getting-started/full-stack-install.md for flags (#283).
 
 # Run a dev build without installing
 XR_RUNTIME_JSON=./build/Release/openxr_displayxr-dev.json ./your_openxr_app
