@@ -111,6 +111,14 @@ jobs:
     # that ships in the .pkg.
     needs: [DetectChanges, Build]
     runs-on: macos-14
+    # GH_TOKEN exposes the workflow's GITHUB_TOKEN to the gh CLI AND to
+    # softprops/action-gh-release (which prefers $GH_TOKEN over the
+    # action's `token:` input when set). Without this, the action falls
+    # back to a token path that hits "Bad credentials" against the
+    # Releases API even with `permissions: contents: write` set at the
+    # workflow level. Mirrors the GH_TOKEN env set in build-windows.yml.
+    env:
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - uses: actions/checkout@v4
