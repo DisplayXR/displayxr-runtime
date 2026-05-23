@@ -94,7 +94,11 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if "%DRY_RUN%"=="0" if "%ACTION%"=="install" (
+REM Elevation is required for both install (NSIS installers write HKLM +
+REM Program Files) and uninstall (the QuietUninstallString cmds remove
+REM the same). Skip the check only on --dry-run, which does no
+REM privileged work.
+if "%DRY_RUN%"=="0" (
     net session >nul 2>&1
     if !errorlevel! NEQ 0 (
         echo ERROR: This script must be run from an elevated command prompt. 1>&2
