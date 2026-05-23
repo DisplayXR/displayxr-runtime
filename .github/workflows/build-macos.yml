@@ -31,6 +31,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+# `contents: write` is required for softprops/action-gh-release to
+# create-or-update the GitHub Release for v* tag pushes (#290).
+permissions:
+  contents: write
+
 jobs:
   DetectChanges:
     runs-on: ubuntu-latest
@@ -200,3 +205,17 @@ jobs:
           # post-PR #279 (versioned filename, parallel to Windows'
           # DisplayXRSetup-X.Y.Z.NNN.exe).
           path: _package/DisplayXR-Installer-*.pkg
+
+      # Attach the .pkg to the v* GitHub release (#290). The action
+      # create-or-updates the release: first workflow to complete on
+      # the tag creates it; subsequent ones append their artifacts. The
+      # filename is already versioned (DisplayXR-Installer-X.Y.Z.pkg)
+      # per PR #279.
+      - name: Attach macOS installer to GitHub release on tag
+        if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: _package/DisplayXR-Installer-*.pkg
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false

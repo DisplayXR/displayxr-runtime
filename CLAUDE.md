@@ -333,7 +333,7 @@ Creates a tagged runtime release here, monitors `build-windows.yml` + `build-mac
 /release minor
 /release major
 ```
-Updates `CMakeLists.txt` `VERSION`, creates the tag, watches Windows + macOS CI concurrently (wall time = `max(Windows, macOS)`), downloads each platform's installer artifact, creates the GitHub Release with grouped notes. macOS .pkg is a soft requirement — its absence warns but doesn't STOP the release. Only releases this repo — shell, demos, extensions each have their own flows (see "Releasing the Runtime" above).
+Updates `CMakeLists.txt` `VERSION`, creates the tag, watches Windows + macOS CI concurrently (wall time = `max(Windows, macOS)`). The CI workflows themselves attach the artifacts to the GitHub Release on `v*` tag push via `softprops/action-gh-release@v2` (post-#290); the skill writes curated release notes on top via `gh release edit --notes`. macOS .pkg is a soft requirement — its absence warns but doesn't STOP the release. Only releases this repo — shell, demos, extensions each have their own flows (see "Releasing the Runtime" above).
 
 ### /ask-gemini - Code Analysis with Gemini
 Ask Gemini to analyze code and produce a read-only report. See `~/.claude/skills/ask-gemini/SKILL.md`.
