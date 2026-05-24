@@ -15,14 +15,14 @@ target_link_libraries(
 		target_instance
 	)
 
-# Delay-load Vulkan and SR Vulkan DLLs so the service can start on systems
-# where these are absent. The D3D11 service compositor path never calls into
-# Vulkan or SR Vulkan weaver functions, so the delay-loaded DLLs are never triggered.
-# This mirrors the same pattern used by the in-process runtime (DisplayXRClient.dll).
+# Delay-load Vulkan so the service can start on systems where it is absent.
+# The D3D11 service compositor path never calls into Vulkan functions, so the
+# delay-loaded DLL is never triggered. This mirrors the same pattern used by
+# the in-process runtime (DisplayXRClient.dll). (No vendor SR DLL here: the SR
+# Vulkan weaver is a Leia plug-in concern, loaded by the plug-in itself.)
 if(WIN32)
 	target_link_options(displayxr-service PRIVATE
 		"/DELAYLOAD:vulkan-1.dll"
-		"/DELAYLOAD:SimulatedRealityVulkanBeta.dll"
 	)
 	target_link_libraries(displayxr-service PRIVATE delayimp)
 
