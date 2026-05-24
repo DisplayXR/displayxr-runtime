@@ -4,11 +4,12 @@
  * @file
  * @brief DllMain + delay-load hook for DisplayXRClient.dll on Windows.
  *
- * Resolves /DELAYLOAD'd dependencies (SimulatedRealityVulkanBeta.dll) from
- * the runtime's own install directory without requiring $INSTDIR to be on
- * the system PATH. We're loaded into the host app's process and must not
- * mutate process-wide DLL search behavior (no SetDefaultDllDirectories) —
- * the delay-load notification hook is the surgical option.
+ * Resolves /DELAYLOAD'd dependencies (e.g. vulkan-1.dll) from the runtime's
+ * own install directory without requiring $INSTDIR to be on the system PATH.
+ * We're loaded into the host app's process and must not mutate process-wide
+ * DLL search behavior (no SetDefaultDllDirectories) — the delay-load
+ * notification hook is the surgical option. (Vendor SR weaver DLLs are not
+ * delay-loaded by the runtime; the Leia plug-in loads its own.)
  */
 
 #ifdef _WIN32
