@@ -46,6 +46,10 @@ set "COMPONENT_REPO_mcp_tools=DisplayXR/displayxr-mcp"
 set "COMPONENT_EXE_mcp_tools=DisplayXRMCPSetup-*.exe"
 set "COMPONENT_MARKER_mcp_tools=HKLM\Software\DisplayXR\Capabilities\MCP"
 
+set "COMPONENT_REPO_gauss_demo=DisplayXR/displayxr-demo-gaussiansplat"
+set "COMPONENT_EXE_gauss_demo=DisplayXRGaussianSplatSetup-*.exe"
+set "COMPONENT_MARKER_gauss_demo=HKLM\Software\DisplayXR\Demos\GaussianSplat"
+
 REM --- Default flag state ---
 set "WITH_MCP=0"
 set "WITH_DEMOS=0"
