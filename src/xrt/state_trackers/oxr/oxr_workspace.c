@@ -87,6 +87,10 @@ comp_ipc_client_compositor_workspace_set_focused_client(struct xrt_compositor *x
 xrt_result_t
 comp_ipc_client_compositor_workspace_get_focused_client(struct xrt_compositor *xc, uint32_t *out_client_id);
 xrt_result_t
+comp_ipc_client_compositor_workspace_set_client_frame_rate_cap(struct xrt_compositor *xc,
+                                                               uint32_t client_id,
+                                                               float max_fps);
+xrt_result_t
 comp_ipc_client_compositor_workspace_enumerate_input_events(struct xrt_compositor *xc,
                                                             uint32_t requested_capacity,
                                                             uint32_t *out_count,
