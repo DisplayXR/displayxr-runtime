@@ -134,7 +134,12 @@ plug-in: sim-display".
 
 ---
 
-## 3. POSIX: JSON-manifest discovery
+## 3. Per-platform filesystem discovery
+
+POSIX (macOS / Linux) and Android both `dlopen` plug-in `.so`s from the
+filesystem but use different shapes for the per-entry metadata.
+
+### 3.1 POSIX: JSON-manifest discovery (macOS / Linux)
 
 > **Implementation status:** shipping on macOS (issue #267). Linux uses
 > the same code path but is untested end-to-end. The `XRT_PLUGIN_SEARCH_PATH`
@@ -192,6 +197,76 @@ Discovery roots are searched in priority order — the per-user root
 above first, then any system roots a platform packager adds (e.g.
 `/usr/share/displayxr/DisplayProcessors/` on Linux distributions). Per-user
 entries with the same `<id>` shadow system entries.
+
+### 3.2 Android: convention-driven discovery
+
+> **Implementation status:** shipping (initial Android branch landed
+> with the Android M7 milestone). Single-vendor case: the plug-in
+> ships in the runtime APK's `jniLibs/<ABI>/`. Multi-APK discovery
+> (separate vendor APKs each shipping plug-ins) is a v2 problem; see
+> "Non-goals" below.
+
+**Why convention, not JSON manifests:** Android's package installer
+extracts only `.so` files from a APK's `jniLibs/<ABI>/` into the
+on-disk `lib/<ABI>/`. Any `.json` shipped in `jniLibs/` stays trapped
+inside `base.apk` and would need `AAssetManager` + a `JNIEnv` to read —
+JNI plumbing the runtime loader has no access to at `xrCreateInstance`
+time. The `xrt_plugin_iface` returned by `xrtPluginNegotiate` already
+carries `id` / `display_name` / `vendor`; the only load-bearing field
+manifests add is `ProbeOrder`, which we encode in the filename.
+
+**Filename convention:** `libdxrp<NNN>_<id>.so` — `<NNN>` is the
+three-digit zero-padded ProbeOrder, `<id>` matches `iface->id` the
+plug-in returns at negotiate. Examples:
+
+```
+libdxrp050_leia_cnsdk.so   (vendor plug-in, ProbeOrder=50)
+libdxrp200_sim_display.so  (fallback, ProbeOrder=200)
+```
+
+Lexicographic sort on filename gives probe-order ascending for free —
+same trick the POSIX `050-leia-sr.json` filename convention uses (§3.1).
+`<id>` is an alphanumeric / underscore identifier; the loader strips
+`libdxrp<NNN>_` and `.so` from the basename to recover it. Plug-ins
+**must** match the iface's `id` to the filename's `<id>` segment for
+log correlation; mismatch is allowed but produces a confusing
+"id=foo path=libdxrp050_bar.so" log line.
+
+**Discovery root (priority order):**
+
+1. `$XRT_PLUGIN_SEARCH_PATH` — single dir, dev/emulator override
+   (no colon splitting on Android — single root is sufficient and
+   removes a footgun on a platform where `:` does appear in paths).
+2. `dirname(dladdr(&loader_internal_symbol))` — the runtime `.so`'s
+   own lib dir, which on a real device is
+   `/data/app/<runtime-pkg>-<hash>/lib/<ABI>/`. Plug-ins shipped in
+   the runtime APK's `jniLibs/<ABI>/` land here automatically.
+
+The loader uses `dladdr` on a static symbol inside itself to recover
+its loaded path, then takes the dirname — there is no
+hardcoded `/data/app/...` path and no dependency on a known package
+name.
+
+**Field source-of-truth:**
+
+| Field         | Source                                                                 |
+| ------------- | ---------------------------------------------------------------------- |
+| `id`          | filename `<id>` segment, surfaced via `iface->id` after negotiate.     |
+| `probe_order` | filename `<NNN>` segment.                                              |
+| `display_name`, `vendor` | `iface->display_name`, `iface->vendor` (post-negotiate).    |
+| `version`     | Not surfaced in v1 (no install record to compare against).             |
+
+**Non-goals (v1):**
+
+- Multi-APK discovery: scanning `PackageManager` for separate vendor
+  APKs that each ship a plug-in. Requires JNI plumbing
+  (`AAssetManager`, `getPackageInfo(GET_META_DATA)`) and likely a
+  metadata convention on `<service>`/`<receiver>` tags in
+  `AndroidManifest.xml`. Open question for when a second Android
+  vendor materializes.
+- Cascade-uninstall (§5): each plug-in `.so` shipped in the runtime
+  APK is uninstalled by the OS as part of the APK uninstall. Vendor
+  APK plug-ins (v2) will need a separate uninstall hook design.
 
 ---
 
