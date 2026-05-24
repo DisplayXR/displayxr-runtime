@@ -252,6 +252,17 @@ comp_d3d11_window_set_input_forward(struct comp_d3d11_window *window,
                                      bool is_capture);
 
 /*!
+ * Return the HWND the most recent button-DOWN was forwarded to, or NULL if it
+ * was not forwarded (a click on an unfocused window, where the cursor is
+ * outside the focused window's rect). Captured at WndProc time, before the
+ * workspace controller's async focus change can move the forward target — the
+ * render-loop click handler uses it to decide whether to synthesize a DOWN to
+ * the hit window for drag-in-one-click.
+ */
+void *
+comp_d3d11_window_get_last_pointer_down_target(struct comp_d3d11_window *window);
+
+/*!
  * Mark workspace mode as active/inactive on the window. While active, ESC on the
  * compositor window is swallowed instead of posting WM_CLOSE — an empty workspace
  * (no focused app) would otherwise take the service down with its own window.

@@ -531,6 +531,21 @@ int
 comp_d3d11_service_workspace_find_slot_by_xc(struct xrt_system_compositor *xsysc, struct xrt_compositor *xc);
 
 /*!
+ * Report the WORKSPACE visibility + focus state of the slot bound to @p xc.
+ * out_visible is !minimized (the compositor's workspace-minimize flag), NOT
+ * the IPC session-visible state. out_focused is (slot == focused_slot). Used
+ * by ipc_handle_workspace_get_client_info so the controller's
+ * XrWorkspaceClientInfoEXT.isVisible / isFocused reflect workspace state — the
+ * shell's auto-focus must skip minimized windows, which session_visible does
+ * not capture. Returns false on miss (unknown xc); outputs untouched then.
+ */
+bool
+comp_d3d11_service_workspace_get_client_state(struct xrt_system_compositor *xsysc,
+                                              struct xrt_compositor *xc,
+                                              bool *out_visible,
+                                              bool *out_focused);
+
+/*!
  * Phase 2.C: register a controller-minted swapchain as the chrome image for
  * a workspace slot. The runtime keeps a strong ref to @p chrome_xsc and
  * composites its first image every render at the pose previously set via

@@ -189,6 +189,15 @@ struct comp_d3d11_window
 	//! Set on button-down inside rect, cleared on button-up.
 	bool mouse_press_in_content;
 
+	//! The HWND the most recent button-DOWN was forwarded to, or NULL if it
+	//! was not forwarded (cursor outside the focused window's rect — i.e. a
+	//! click on an unfocused window). Captured at WndProc time, BEFORE the
+	//! workspace controller's async xrSetWorkspaceFocusedClientEXT can update
+	//! the forward target. The render-loop click handler reads this to decide
+	//! whether to synthesize a DOWN to the hit window for drag-in-one-click:
+	//! it must NOT rely on focused_slot, which the controller mutates async.
+	volatile HWND last_pointer_down_target;
+
 	//! Workspace display processor for ESC/close 2D mode switch (opaque, can be NULL).
 	volatile void *workspace_dp;
 
@@ -723,6 +732,11 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				}
 				workspace_public_ring_push(w, WORKSPACE_PUBLIC_EVENT_POINTER,
 				                           cx, cy, button, is_down, mods, 0.0f);
+				// Default: this DOWN was not forwarded. The forward site
+				// below overwrites with the actual target HWND if it is.
+				if (is_down) {
+					w->last_pointer_down_target = NULL;
+				}
 			}
 		}
 
@@ -868,6 +882,15 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 					}
 					// PostMessage: works for classic Win32 apps (test apps)
 					PostMessage(fwd, message, wParam, MAKELPARAM(app_x, app_y));
+
+					// Record where a button-DOWN was actually forwarded so
+					// the render-loop click handler can tell whether the hit
+					// window already received this DOWN (no synth needed) or
+					// not (synth a DOWN for drag-in-one-click). Independent of
+					// the controller's async focus update.
+					if (is_button_down) {
+						w->last_pointer_down_target = fwd;
+					}
 
 					// For mouse buttons: also inject via SendInput so apps
 					// using Raw Input (RIDEV_INPUTSINK) see the event in
@@ -1419,6 +1442,16 @@ comp_d3d11_window_set_input_forward(struct comp_d3d11_window *window,
 	} else {
 		U_LOG_W("D3D11 window: input forwarding disabled");
 	}
+}
+
+void *
+comp_d3d11_window_get_last_pointer_down_target(struct comp_d3d11_window *window)
+{
+	if (window == NULL) {
+		return NULL;
+	}
+	return (void *)InterlockedCompareExchangePointer(
+	    (volatile PVOID *)&window->last_pointer_down_target, NULL, NULL);
 }
 
 void
