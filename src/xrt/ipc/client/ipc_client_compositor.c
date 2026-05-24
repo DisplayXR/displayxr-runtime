@@ -506,6 +506,21 @@ comp_ipc_client_compositor_workspace_get_focused_client(struct xrt_compositor *x
 }
 
 xrt_result_t
+comp_ipc_client_compositor_workspace_set_client_frame_rate_cap(struct xrt_compositor *xc,
+                                                               uint32_t client_id,
+                                                               float max_fps)
+{
+	if (xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_set_client_frame_rate_cap(icc->ipc_c, client_id, max_fps);
+}
+
+xrt_result_t
 comp_ipc_client_compositor_workspace_enumerate_input_events(struct xrt_compositor *xc,
                                                             uint32_t requested_capacity,
                                                             uint32_t *out_count,

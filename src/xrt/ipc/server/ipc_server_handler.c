@@ -2912,6 +2912,58 @@ ipc_handle_workspace_get_focused_client(volatile struct ipc_client_state *_ics, 
 }
 
 xrt_result_t
+ipc_handle_workspace_set_client_frame_rate_cap(volatile struct ipc_client_state *_ics,
+                                               uint32_t client_id,
+                                               float max_fps)
+{
+	struct ipc_server *s = _ics->server;
+
+	// Policy is the workspace controller's; only it may cap clients.
+	unsigned long expected_pid = get_orchestrator_workspace_pid();
+	unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
+	if (expected_pid != 0 && caller_pid != expected_pid) {
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+
+	if (client_id == 0 || max_fps < 0.0f) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	os_mutex_lock(&s->global_state.lock);
+
+	volatile struct ipc_client_state *target_ics = NULL;
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		volatile struct ipc_client_state *ics = &s->threads[i].ics;
+		if (ics->client_state.id == client_id && ics->server_thread_index >= 0) {
+			target_ics = ics;
+			break;
+		}
+	}
+
+	if (target_ics == NULL || target_ics->xc == NULL) {
+		os_mutex_unlock(&s->global_state.lock);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	bool ok = comp_d3d11_service_set_client_frame_rate_cap(
+	    s->xsysc, (struct xrt_compositor *)target_ics->xc, max_fps);
+
+	os_mutex_unlock(&s->global_state.lock);
+	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
+#else
+	(void)s;
+	(void)client_id;
+	(void)max_fps;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
 ipc_handle_workspace_enumerate_input_events(volatile struct ipc_client_state *_ics,
                                             uint32_t capacity,
                                             struct ipc_workspace_input_event_batch *out_batch)

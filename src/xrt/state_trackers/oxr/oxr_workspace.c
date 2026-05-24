@@ -612,6 +612,42 @@ oxr_xrGetWorkspaceFocusedClientEXT(XrSession session, XrWorkspaceClientId *outCl
 
 
 /*
+ * Per-client frame-rate cap (spec_version 14)
+ */
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceClientFrameRateCapEXT(XrSession session, XrWorkspaceClientId clientId, float maxFps)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceClientFrameRateCapEXT");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+
+	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrSetWorkspaceClientFrameRateCapEXT: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
+	}
+
+	if (maxFps < 0.0f) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrSetWorkspaceClientFrameRateCapEXT: maxFps must be >= 0.0f (0 = uncapped)");
+	}
+
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrSetWorkspaceClientFrameRateCapEXT requires an IPC-mode session");
+	}
+
+	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_client_frame_rate_cap(
+	    &sess->xcn->base, (uint32_t)clientId, maxFps);
+	return xret_to_xr_result(&log, xret, "workspace_set_client_frame_rate_cap");
+}
+
+
+/*
  * Input event drain + pointer capture (spec_version 4)
  */
 

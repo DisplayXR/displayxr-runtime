@@ -281,6 +281,11 @@ comp_ipc_client_compositor_workspace_set_focused_client(struct xrt_compositor *x
 xrt_result_t
 comp_ipc_client_compositor_workspace_get_focused_client(struct xrt_compositor *xc, uint32_t *out_client_id);
 
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_client_frame_rate_cap(struct xrt_compositor *xc,
+                                                               uint32_t client_id,
+                                                               float max_fps);
+
 /*!
  * Phase 2.D: drain the workspace public-event ring.
  *

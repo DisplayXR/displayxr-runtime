@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_spatial_workspace 1
-#define XR_EXT_spatial_workspace_SPEC_VERSION 13
+#define XR_EXT_spatial_workspace_SPEC_VERSION 14
 #define XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_EXT_spatial_workspace"
 
 // Provisional XrStructureType values. The 1000999100..107 range is reserved for
@@ -227,6 +227,39 @@ typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceClientVisibilityEXT)(
     XrSession            session,
     XrWorkspaceClientId  clientId,
     XrBool32             visible);
+
+// ---- Per-client frame-rate cap (spec_version 14) ----
+
+/*!
+ * @brief Cap a workspace client's xrWaitFrame return cadence.
+ *
+ * Pure mechanism. The runtime stores @p maxFps per client and applies
+ * @c multiplier = max(1, round(refresh_rate_hz / maxFps)) to the
+ * out_wake_time_ns and out_predicted_display_period_ns returned by the
+ * IPC predict_frame path. The client sleeps client-side; no server
+ * thread is parked. Effective only for IPC-mode (workspace) clients —
+ * in-process compositor consumers (e.g. WebXR bridge) are not affected.
+ *
+ * Policy is the controller's. A typical workspace controller might call
+ *   xrSetWorkspaceClientFrameRateCapEXT(session, prev_focus, 30.0f);
+ *   xrSetWorkspaceClientFrameRateCapEXT(session, new_focus, 0.0f);
+ * on every focus change, and 1.0f for minimized clients. Different
+ * workspaces (picture-in-picture, live thumbnails, accessibility) can
+ * pick different cadences without runtime changes.
+ *
+ * @param session   A valid workspace session.
+ * @param clientId  The client to cap. XR_NULL_WORKSPACE_CLIENT_ID is invalid.
+ * @param maxFps    Maximum xrWaitFrame return rate in Hz. 0.0f means
+ *                  uncapped (native refresh). Negative values are
+ *                  rejected with XR_ERROR_VALIDATION_FAILURE.
+ *
+ * The cap auto-resets to 0.0f on client disconnect; controllers must
+ * re-apply on reconnect. The runtime never lowers the cap on its own.
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceClientFrameRateCapEXT)(
+    XrSession            session,
+    XrWorkspaceClientId  clientId,
+    float                maxFps);
 
 // ---- Hit-test (spec_version 3, region out added in spec_version 4) ----
 
