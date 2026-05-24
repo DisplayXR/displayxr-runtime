@@ -58,6 +58,18 @@ COMPONENT_EXE_WINDOWS_mcp_tools="DisplayXRMCPSetup-*.exe"
 COMPONENT_INSTALL_MARKER_MACOS_mcp_tools=""
 COMPONENT_INSTALL_MARKER_WINDOWS_mcp_tools="HKLM\\Software\\DisplayXR\\Capabilities\\MCP"
 
+# --- gauss_demo ---
+# Gaussian-splat viewer demo. macOS .pkg first shipped in
+# displayxr-demo-gaussiansplat v1.4.0 (2026-05-24, #311). Windows installer
+# is built locally today; CI for the .exe is tracked at the demo repo's
+# issue #14. Note: the macOS install marker has a space in the path —
+# consumers must quote when testing existence.
+COMPONENT_REPO_gauss_demo="DisplayXR/displayxr-demo-gaussiansplat"
+COMPONENT_PKG_MACOS_gauss_demo="DisplayXRGaussianSplat-*.pkg"
+COMPONENT_EXE_WINDOWS_gauss_demo="DisplayXRGaussianSplatSetup-*.exe"
+COMPONENT_INSTALL_MARKER_MACOS_gauss_demo="/Applications/Gaussian Splat Viewer.app"
+COMPONENT_INSTALL_MARKER_WINDOWS_gauss_demo="HKLM\\Software\\DisplayXR\\Demos\\GaussianSplat"
+
 # Helper: look up a per-component field for the current platform.
 #   $1 = component name (runtime, shell, leia_plugin, mcp_tools)
 #   $2 = field (REPO, PKG_MACOS, EXE_WINDOWS, INSTALL_MARKER_MACOS)
