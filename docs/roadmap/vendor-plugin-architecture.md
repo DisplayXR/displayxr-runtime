@@ -13,7 +13,7 @@ for the design decisions.
 
 ## 1. Problem
 
-The "vendor-agnostic" framing in `CLAUDE.md` and `docs/guides/vendor-integration.md` is aspirational on Windows. The shipped `DisplayXRClient.dll` has these static (load-time) imports baked in:
+The "vendor-agnostic" framing in `CLAUDE.md` and `docs/archive/vendor-integration-historical.md` is aspirational on Windows. The shipped `DisplayXRClient.dll` has these static (load-time) imports baked in:
 
 ```
 SimulatedRealityCore.dll
@@ -124,7 +124,7 @@ struct xrt_plugin_iface {
 };
 ```
 
-The DP vtable returned by `create_display_processor` is unchanged — it's the existing per-API `xrt_display_processor*` contract from `docs/guides/vendor-integration.md`. The plug-in restructure adds plumbing **around** that vtable, not changes to it.
+The DP vtable returned by `create_display_processor` is unchanged — it's the existing per-API `xrt_display_processor*` contract from `docs/archive/vendor-integration-historical.md`. The plug-in restructure adds plumbing **around** that vtable, not changes to it.
 
 **Header location:** `src/xrt/include/xrt/xrt_plugin.h`. Public, stable. Goes through the same ABI-bump discipline as other extension headers (memory: [[feedback_extension_struct_abi.md]] — add `struct_size` first field, never reorder existing fields, version every public struct).
 
@@ -215,7 +215,7 @@ Recommended order. Each step lands as its own PR.
 | 6 | **Migrate `drv_leia` to plug-in shape.** | `DisplayXR-LeiaSR.dll` built. SR SDK linkage entirely contained in plug-in. Cube apps render via Leia through the plug-in path. PR #253's DllMain hook moves here. | 3-5 |
 | 7 | **Installer split.** | Runtime installer drops SR DLLs + drv_leia bits. New Leia plug-in installer (or hand off to SR Platform). Cascade uninstall verified. | 2 |
 | 8 | **CI: vendor-agnostic build + assert.** | Workflow builds without SR SDK present, asserts zero vendor imports, smoke-tests sim_display path. | 1 |
-| 9 | **macOS port + docs.** | sim_display dylib + manifest discovery. `docs/guides/vendor-integration.md` rewrite for plug-in shape. | 2-3 |
+| 9 | **macOS port + docs.** | sim_display dylib + manifest discovery. `docs/archive/vendor-integration-historical.md` rewrite for plug-in shape. | 2-3 |
 
 **Total: ~3-4 weeks** for one focused engineer. Parallelizable to ~2 calendar weeks with two.
 
@@ -246,7 +246,7 @@ Recommended order. Each step lands as its own PR.
 
 ## 9. References
 
-- `docs/guides/vendor-integration.md` — existing DP vtable contract (unchanged by this work).
+- `docs/archive/vendor-integration-historical.md` — existing DP vtable contract (unchanged by this work).
 - `docs/specs/runtime/workspace-controller-registration.md` — the registration pattern this plug-in shape mirrors.
 - `docs/adr/ADR-003-vendor-abstraction-via-display-processor-vtable.md` — vtable rationale; this work is the natural follow-up.
 - `docs/architecture/separation-of-concerns.md` — layer boundaries that today are aspirational on Windows; this work makes them real.

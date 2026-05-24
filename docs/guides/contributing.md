@@ -53,7 +53,7 @@ Key principles:
 
 If you're integrating a new display into DisplayXR:
 
-1. Start with the [Vendor Integration Guide](vendor-integration.md) — comprehensive walkthrough
+1. Start with the [Vendor Plug-in Onboarding](vendor-plugin-onboarding.md) — comprehensive walkthrough
 2. Read [Writing a Driver](writing-driver.md) for the basics of the driver framework
 3. Review [ADR-003](../adr/ADR-003-vendor-abstraction-via-display-processor-vtable.md) and [Separation of Concerns](../architecture/separation-of-concerns.md) for the vendor isolation rules
 4. Use sim_display (`src/xrt/drivers/sim_display/`) as a reference implementation

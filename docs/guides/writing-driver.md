@@ -66,5 +66,5 @@ found in `src/xrt/targets`.
 
 If your driver provides a 3D display, you will also need to implement the
 **display processor** vtable for each graphics API your display supports. See
-[vendor-integration.md](vendor-integration.md) for the full display processor
+[vendor-plugin-onboarding.md](vendor-plugin-onboarding.md) for the full display processor
 contract, vtable design, and integration instructions.

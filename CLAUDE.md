@@ -66,7 +66,7 @@ Key facts for AI context: `_handle` and `_texture` are always extension apps. `_
 - **Compositor pipeline** — see `docs/architecture/compositor-pipeline.md`
 
 For the vendor isolation rule and layer "must NOT contain" constraints, see `docs/architecture/separation-of-concerns.md`.
-For display processor vtable design (all 5 API variants), see `docs/guides/vendor-integration.md`.
+For display processor vtable design (all 5 API variants), see `docs/archive/vendor-integration-historical.md`.
 
 ## Project Overview
 
@@ -235,7 +235,7 @@ C interfaces with vtable-style polymorphism:
 - `struct xrt_instance` — Runtime instance
 - `struct xrt_prober` — Device discovery
 
-For the full interface catalog including display processor vtables (5 API variants), see `docs/guides/vendor-integration.md`.
+For the full interface catalog including display processor vtables (5 API variants), see `docs/archive/vendor-integration-historical.md`.
 
 ### Vendor Plug-in Integration
 

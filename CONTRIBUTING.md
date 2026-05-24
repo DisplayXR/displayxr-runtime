@@ -26,7 +26,7 @@ Open issues at [github.com/DisplayXR/displayxr-runtime/issues](https://github.co
 
 ### For Display Vendors
 
-See the [vendor integration guide](docs/guides/vendor-integration.md). All vendor-specific code lives under `src/xrt/drivers/<vendor>/` — zero compositor changes required. The runtime is purposefully decoupled from any specific vendor SDK; the LeiaSR integration is one example, and adding a new vendor follows the same pattern.
+See the [vendor plug-in onboarding guide](docs/guides/vendor-plugin-onboarding.md). Vendors ship a plug-in DLL from their own repo — the runtime discovers it at `xrCreateInstance` and never carries vendor code or SDK identifiers in its link line (ADR-019). Zero compositor changes required. The [Leia SR plug-in](https://github.com/DisplayXR/displayxr-leia-plugin) is the canonical example; new vendors follow the same pattern.
 
 ### License
 

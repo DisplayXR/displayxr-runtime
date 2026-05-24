@@ -80,7 +80,7 @@ The `process_atlas()` method exists in 5 API-specific variants:
 | Metal | `xrt_display_processor_metal.h` |
 | OpenGL | `xrt_display_processor_gl.h` |
 
-See [Display Processor Interface](../specs/vendor/display-processor-interface.md) for the unified vtable design and [Vendor Integration Guide](../guides/vendor-integration.md) for implementation guidance.
+See [Display Processor Interface](../specs/vendor/display-processor-interface.md) for the unified vtable design and [Vendor Integration Guide](../guides/vendor-plugin-onboarding.md) for implementation guidance.
 
 ## Further Reading
 

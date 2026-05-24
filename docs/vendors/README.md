@@ -1,6 +1,6 @@
 # Vendor Integrations
 
-DisplayXR is vendor-agnostic — any 3D-display vendor can integrate their hardware by implementing the [display processor interface](../specs/vendor/display-processor-interface.md) and following the [vendor integration guide](../guides/vendor-integration.md).
+DisplayXR is vendor-agnostic — any 3D-display vendor can integrate their hardware by implementing the [display processor interface](../specs/vendor/display-processor-interface.md) and following the [vendor plug-in onboarding guide](../guides/vendor-plugin-onboarding.md).
 
 This directory holds **vendor-specific** documentation. Generic contracts that every vendor must follow live in `specs/vendor/` and `guides/`.
 
@@ -8,14 +8,14 @@ This directory holds **vendor-specific** documentation. Generic contracts that e
 
 | Vendor | Driver | Docs | APIs supported |
 |---|---|---|---|
-| **Leia SR** | `src/xrt/drivers/leia/` | [leia/](leia/) | D3D11, D3D12, OpenGL, Vulkan |
+| **Leia SR** | plug-in ([displayxr-leia-plugin](https://github.com/DisplayXR/displayxr-leia-plugin)) | [leia/](leia/) | D3D11, D3D12, OpenGL, Vulkan |
 | **sim_display** | `src/xrt/drivers/sim_display/` | [sim_display/](sim_display/) | D3D11, D3D12, OpenGL, Metal |
 
 `sim_display` is the reference simulation vendor — it ships with the runtime and renders side-by-side / anaglyph output to a normal 2D window so contributors can develop without 3D-display hardware.
 
 ## Adding a new vendor
 
-1. Read [guides/vendor-integration.md](../guides/vendor-integration.md) — the end-to-end walkthrough.
+1. Read [guides/vendor-plugin-onboarding.md](../guides/vendor-plugin-onboarding.md) — the end-to-end walkthrough.
 2. Implement the [display processor vtable](../specs/vendor/display-processor-interface.md) for each graphics API you support.
 3. Decide your [eye-tracking mode](../specs/vendor/eye-tracking-modes.md) (MANAGED or MANUAL).
 4. Add `docs/vendors/<your-vendor>/` with a `README.md` describing your integration; link any internals docs (weaver, transparency model, etc.) from there.

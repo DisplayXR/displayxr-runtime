@@ -28,10 +28,12 @@ scripts\build_windows.bat all
 ```
 
 The script auto-fetches everything needed: vcpkg (for cJSON +
-runtime deps), the OpenXR loader release zip, and the LeiaSR SDK
-release artifact (from this repo's `sr-sdk-v*` release). It then
-runs CMake (Ninja Multi-Config) and builds the runtime + installer
-in one go. Outputs land in `_package/`.
+runtime deps) and the OpenXR loader release zip. It then runs CMake
+(Ninja Multi-Config) and builds the runtime + installer in one go.
+Outputs land in `_package/`. No vendor SDK is fetched — the runtime
+DLL holds zero vendor identifiers (ADR-019); Leia SR ships as a
+separate plug-in (see [Vendor displays](#vendor-displays-leia-sr-etc)
+below).
 
 Available targets: `all` (default), `build` (runtime only,
 fastest iteration), `installer`, `test-apps`, `generate`. See

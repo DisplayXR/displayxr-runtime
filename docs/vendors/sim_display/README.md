@@ -38,4 +38,4 @@ sim_display reports **MANAGED** mode and feeds a fixed eye position (no actual t
 - CI builds and headless tests
 - Reference implementation when writing a new vendor — `sim_display_processor.c` is the smallest complete DP implementation in the tree.
 
-For the generic vendor contract, see [`docs/guides/vendor-integration.md`](../../guides/vendor-integration.md) and [`docs/specs/vendor/display-processor-interface.md`](../../specs/vendor/display-processor-interface.md).
+For the generic vendor contract, see [`docs/guides/vendor-plugin-onboarding.md`](../../guides/vendor-plugin-onboarding.md) and [`docs/specs/vendor/display-processor-interface.md`](../../specs/vendor/display-processor-interface.md).

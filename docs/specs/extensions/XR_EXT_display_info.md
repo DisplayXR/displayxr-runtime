@@ -1336,7 +1336,7 @@ installed runtime. The `XR_EXT_display_info` extension's capability reporting
 (`XrDisplayInfoEXT`, `XrEyeTrackingModeCapabilitiesEXT`) reflects only what the device
 actually supports, not the full SDK API surface.
 
-See the **Vendor Integration Guide** (`docs/guides/vendor-integration.md` §13)
+See the archived **Vendor Integration Guide** (`docs/archive/vendor-integration-historical.md` §13)
 for the complete deployment model, multi-vendor build strategy, and driver implementation
 guidelines.
 
@@ -1827,7 +1827,7 @@ A complete reference implementation is available in the [DisplayXR runtime](http
 | Metal test application (macOS) | `test_apps/cube_handle_metal_macos/` |
 | Common Kooima projection | `test_apps/common/xr_session_common.cpp` |
 
-The runtime is based on Monado (open-source OpenXR runtime) with native compositors per graphics API (D3D11, D3D12, Metal, OpenGL, Vulkan). Vendor display processing is abstracted via the `xrt_display_processor` interface — see `docs/guides/vendor-integration.md`.
+The runtime is based on Monado (open-source OpenXR runtime) with native compositors per graphics API (D3D11, D3D12, Metal, OpenGL, Vulkan). Vendor display processing is abstracted via the `xrt_display_processor` interface — see `docs/guides/vendor-plugin-onboarding.md`.
 
 ## Appendix B: Glossary
 
