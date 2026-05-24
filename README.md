@@ -51,7 +51,7 @@ Every graphics API gets its own native compositor — no Vulkan intermediary, no
 git clone https://github.com/DisplayXR/displayxr-runtime
 cd displayxr-runtime
 ./scripts/setup-displayxr.sh                  # runtime + sim-display
-./scripts/setup-displayxr.sh --with mcp       # also DisplayXR MCP Tools when published
+./scripts/setup-displayxr.sh --with mcp       # also DisplayXR MCP Tools (AI-agent / voice control)
 ```
 
 ```bat
@@ -59,7 +59,7 @@ cd displayxr-runtime
 git clone https://github.com/DisplayXR/displayxr-runtime
 cd displayxr-runtime
 scripts\setup-displayxr.bat                   :: runtime + Shell + Leia plug-in
-scripts\setup-displayxr.bat --with mcp        :: also DisplayXR MCP Tools
+scripts\setup-displayxr.bat --with mcp        :: also DisplayXR MCP Tools (AI-agent / voice control)
 ```
 
 Downloads each component's installer from its GitHub Releases page (versions pinned in [`versions.json`](versions.json)), runs it silently, verifies the install. See [`docs/getting-started/full-stack-install.md`](docs/getting-started/full-stack-install.md) for `--with-demos`, `--dry-run`, `--uninstall`, and the per-component platform availability matrix.
@@ -80,7 +80,7 @@ The website's [Get Started](https://displayxr.org/getting-started) page walks th
 ### Build from source
 
 ```bash
-# Windows — auto-fetches vcpkg, OpenXR loader, LeiaSR SDK
+# Windows — auto-fetches vcpkg + OpenXR loader (no vendor SDK; Leia ships as a separate plug-in)
 scripts\build_windows.bat all
 # Outputs: _package/DisplayXRSetup-*.exe (installer) + _package/bin/
 
@@ -111,7 +111,7 @@ XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./build/test_apps/cube_handle_
 |---|---|
 | **Build apps** for 3D displays | [Getting Started](docs/getting-started/overview.md) |
 | **Contribute** to DisplayXR | [Contributing Guide](docs/guides/contributing.md) |
-| **Integrate my display** hardware | [Vendor Integration Guide](docs/guides/vendor-integration.md) |
+| **Integrate my display** hardware | [Vendor Plug-in Onboarding](docs/guides/vendor-plugin-onboarding.md) |
 | See the full docs index | [Documentation Index](docs/README.md) |
 | See the project roadmap | [Roadmap](docs/roadmap/overview.md) |
 
@@ -127,7 +127,9 @@ XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./build/test_apps/cube_handle_
 
 | Repo | Description |
 |------|-------------|
+| [displayxr-installer](https://github.com/DisplayXR/displayxr-installer) | Meta-installer — one bundle that installs runtime + Shell + plug-ins |
 | [displayxr-shell-releases](https://github.com/DisplayXR/displayxr-shell-releases) | DisplayXR Shell — spatial workspace controller (installer + bug reports) |
+| [displayxr-leia-plugin](https://github.com/DisplayXR/displayxr-leia-plugin) | Leia SR display-processor plug-in (`DisplayXRLeiaSRSetup-*.exe`) |
 | [displayxr-extensions](https://github.com/DisplayXR/displayxr-extensions) | OpenXR extension specs and headers |
 | [displayxr-mcp](https://github.com/DisplayXR/displayxr-mcp) | Embeddable MCP server framework + **DisplayXR MCP Tools** installer (end-user opt-in for agent / voice control) |
 | [displayxr-demo-gaussiansplat](https://github.com/DisplayXR/displayxr-demo-gaussiansplat) | 3D Gaussian Splatting reference demo |

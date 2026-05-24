@@ -1,14 +1,21 @@
-# Vendor Integration Guide: Adding a 3D Display to the OpenXR Runtime
+# [ARCHIVED] Vendor Integration Guide: the in-tree integration model
 
-> **Legacy in-tree integration model.** Since issues #256 / #263 (ADR-019),
-> new vendor integrations ship as plug-in DLLs from their own repos and
-> never modify this tree. See [`vendor-plugin-onboarding.md`](vendor-plugin-onboarding.md)
-> for the post-#263 contract. This document is retained for vendors who
-> fork the runtime, for historical context on how the in-tree
-> `src/xrt/drivers/leia/` (now extracted to
+> **⚠️ Archived — do not use for new integrations.** This describes the
+> *pre-#263 in-tree* model, where a vendor driver lived in
+> `src/xrt/drivers/<vendor>/` and was linked into the runtime build.
+> Since ADR-019 (issues #256 / #263), vendors ship plug-in DLLs from
+> their own repos and never touch this tree.
+>
+> **For the current contract, start here instead:**
+> - [Vendor Plug-in Onboarding](../guides/vendor-plugin-onboarding.md) — the post-#263 model
+> - [Plug-in Discovery spec](../specs/runtime/plugin-discovery.md) — registry / JSON-manifest contract
+> - [ADR-019](../adr/ADR-019-vendor-plugin-aux-boundary.md) — why the extraction happened
+>
+> This file is retained only for runtime forks and for historical
+> context on how the in-tree `src/xrt/drivers/leia/` (now extracted to
 > [DisplayXR/displayxr-leia-plugin](https://github.com/DisplayXR/displayxr-leia-plugin))
-> was wired, and for the vendor-neutral `sim_display` reference still
-> shipped in-tree.
+> was wired. The vendor-neutral `sim_display` reference it cites still
+> ships in-tree.
 
 This guide tells a new 3D display vendor exactly what to implement to connect
 their hardware to this OpenXR runtime.  It covers every integration point:
@@ -1479,7 +1486,7 @@ my_vendor_sdk_weave(struct my_vendor_sdk *sdk, /* ... */)
 > **Note (ADR-019 / issues #256 + #263 + #287):** This section
 > describes the **legacy in-tree** registration shape from before the
 > driver extraction. **New vendor integrations should NOT follow this
-> section** — see [`vendor-plugin-onboarding.md`](vendor-plugin-onboarding.md)
+> section** — see [`vendor-plugin-onboarding.md`](../guides/vendor-plugin-onboarding.md)
 > for the current contract. Vendors ship a plug-in DLL from their own
 > repo with an installer that registers it under
 > `HKLM\Software\DisplayXR\DisplayProcessors\<id>` per

@@ -5,7 +5,7 @@
 | **App developer** | **OXR contributor** | **DXR core contributor** | **Vendor contributor** |
 |---|---|---|---|
 | Building apps that target DisplayXR | Working on the OpenXR state tracker / extensions | Working on compositors, IPC, shell contracts, build | Integrating a 3D-display vendor (driver + DP) |
-| → [`getting-started/`](getting-started/) | → [`architecture/`](architecture/) | → [`architecture/`](architecture/) | → [`guides/vendor-integration.md`](guides/vendor-integration.md) |
+| → [`getting-started/`](getting-started/) | → [`architecture/`](architecture/) | → [`architecture/`](architecture/) | → [`guides/vendor-plugin-onboarding.md`](guides/vendor-plugin-onboarding.md) |
 | → [`specs/extensions/`](specs/extensions/) | → [`specs/extensions/`](specs/extensions/) | → [`specs/runtime/`](specs/runtime/) | → [`specs/vendor/`](specs/vendor/) |
 | → [`reference/`](reference/) | → [`guides/implementing-extension.md`](guides/implementing-extension.md) | → [`adr/`](adr/), [`roadmap/`](roadmap/) | → [`vendors/`](vendors/) (your vendor's subfolder) |
 | | → [`adr/`](adr/) | | → [`adr/`](adr/) (003, 007, 015) |
@@ -69,7 +69,7 @@ Integrate your 3D display hardware into DisplayXR.
 - **[ADR-007: Compositor Never Weaves](adr/ADR-007-compositor-never-weaves.md)** — compositor / DP boundary
 - **[ADR-015: Multi-Display Routing](adr/ADR-015-displayxr-owns-multi-display-vendor-routing.md)** — how multiple vendors coexist
 - **[Separation of Concerns](architecture/separation-of-concerns.md)** — what goes where
-- [Legacy: in-tree integration model](guides/vendor-integration.md) — historical reference for pre-#263 vendors who forked the runtime
+- [Legacy: in-tree integration model](archive/vendor-integration-historical.md) — historical reference for pre-#263 vendors who forked the runtime
 - [Writing a Driver](guides/writing-driver.md) — driver framework basics
 
 ### Integrated vendors (`vendors/`)

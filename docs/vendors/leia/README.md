@@ -1,6 +1,6 @@
 # Leia SR Integration
 
-Leia is the first 3D-display vendor integrated into DisplayXR. This directory documents the Leia-specific implementation; the generic vendor contract lives in [`docs/specs/vendor/`](../../specs/vendor/) and [`docs/guides/vendor-integration.md`](../../guides/vendor-integration.md).
+Leia is the first 3D-display vendor integrated into DisplayXR. This directory documents the Leia-specific implementation; the generic vendor contract lives in [`docs/specs/vendor/`](../../specs/vendor/) and [`docs/guides/vendor-plugin-onboarding.md`](../../guides/vendor-plugin-onboarding.md).
 
 ## Source layout
 

@@ -2,7 +2,7 @@
 
 This guide walks a new 3D-display vendor from zero to a shipping DisplayXR-compatible plug-in. After ADR-019 / #263 (May 2026), every vendor integration is an **external project**: you don't touch this repo, you ship a plug-in DLL from your own repo and an installer that registers it with the runtime at install time.
 
-If you're maintaining a vendor integration that was historically in-tree (the way `drv_leia` was before #263), see the [legacy `vendor-integration.md`](vendor-integration.md) — kept for historical context. Everything below assumes the post-#263 model.
+If you're maintaining a vendor integration that was historically in-tree (the way `drv_leia` was before #263), see the [legacy in-tree guide](../archive/vendor-integration-historical.md) — kept for historical context. Everything below assumes the post-#263 model.
 
 > **Canonical examples**
 > - [`DisplayXR/displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin) — full vendor integration with SR SDK; the recommended starting point. Fork the repo, swap `drv_leia/` for `drv_<your-vendor>/`, point the installer at your `<id>`.
@@ -252,4 +252,4 @@ Add a short `docs/vendors/<your-vendor>.md` to the runtime repo via PR — a one
 - [ADR-019](../adr/ADR-019-vendor-plugin-aux-boundary.md) — why the runtime DLL holds zero vendor identifiers and how the aux import-library boundary works
 - [`XR_EXT_display_info` spec](../specs/extensions/XR_EXT_display_info.md) — display info + eye-tracking mode contract
 - [Eye tracking modes spec](../specs/vendor/eye-tracking-modes.md) — MANAGED vs MANUAL contract
-- [Legacy in-tree integration model](vendor-integration.md) — historical reference for the pre-#263 in-tree integration shape
+- [Legacy in-tree integration model](../archive/vendor-integration-historical.md) — historical reference for the pre-#263 in-tree integration shape

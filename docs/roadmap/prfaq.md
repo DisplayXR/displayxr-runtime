@@ -56,7 +56,7 @@ DisplayXR ships a WebXR bridge that connects Chrome's native WebXR implementatio
 ### For 3D display vendors
 
 **Q: I make a 3D display panel. How do I integrate with DisplayXR?**
-Implement the display-processor vtable for your weaving / depth-mapping / eye-tracking integration. The vtable has five API variants (D3D11, D3D12, Metal, Vulkan, OpenGL) so your weaver runs natively in whatever graphics API the application is using. See `docs/guides/vendor-integration.md` for the full contract. Leia SR is the first integration; it's a reference, not a precedent — there is no privileged path.
+Implement the display-processor vtable for your weaving / depth-mapping / eye-tracking integration. The vtable has five API variants (D3D11, D3D12, Metal, Vulkan, OpenGL) so your weaver runs natively in whatever graphics API the application is using. See `docs/guides/vendor-plugin-onboarding.md` for the full contract. Leia SR is the first integration; it's a reference, not a precedent — there is no privileged path.
 
 **Q: Once my display is integrated, who picks DisplayXR up?**
 Two distinct downstream audiences: OEMs who ship finished products built around your display panel, and vertical integrators who build a focused experience on it. Both groups consume the runtime via standard distribution channels (your driver bundles it, an OEM bundles it, or end users install it directly). Your DP integration enables both paths simultaneously.

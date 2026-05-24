@@ -293,7 +293,7 @@ Shell becomes one more client publishing a mask; multi-app per-window 3D in shel
 ## Cross-references
 
 - DP vtable (existing): `src/xrt/include/xrt/xrt_display_processor.h:152–164` — `get_hardware_3d_state`, `request_display_mode`, `process_atlas`. The local-zone methods sit alongside these.
-- Vendor integration guide: `docs/guides/vendor-integration.md` — to be extended with the local-zone vtable methods once this spec lands.
+- Vendor integration guide: `docs/guides/vendor-plugin-onboarding.md` — to be extended with the local-zone vtable methods once this spec lands.
 - Vendor-initiated state change events (today): `comp_d3d11_service.cpp:10180–10230`, `oxr_session.c:968` — the polling/event pattern that the new local-zone path coexists with, not replaces.
 - ADR-014 (shell owns rendering mode): generalizes in the zone world — the shell becomes one mask publisher among many rather than the sole policy holder.
 - `docs/specs/extensions/XR_EXT_display_info.md`: candidate place for `localZoneCapable` + grid dimensions to surface to apps that don't take the full `XR_EXT_local_3d_zone` extension.
