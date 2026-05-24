@@ -422,6 +422,7 @@ enum ipc_workspace_input_event_type
 	IPC_WORKSPACE_INPUT_EVENT_MODAL_OPEN          = 8, //!< spec_version 10: client opened a Win32 modal popup
 	IPC_WORKSPACE_INPUT_EVENT_MODAL_CLOSE         = 9, //!< spec_version 10: client's Win32 modal popup closed
 	IPC_WORKSPACE_INPUT_EVENT_FILE_PICKER_REQUEST = 10, //!< spec_version 11: client called xrRequestFilePickerEXT
+	IPC_WORKSPACE_INPUT_EVENT_FULLSCREEN_TOGGLED  = 11, //!< spec_version 15: client's fullscreen/maximize state transitioned
 };
 
 struct ipc_workspace_input_event
@@ -518,6 +519,11 @@ struct ipc_workspace_input_event
 			uint32_t _pad;
 			uint64_t request_id;
 		} file_picker_request;
+		struct                      //!< spec_version 15: fullscreen/maximize state transition
+		{
+			uint32_t client_id;
+			uint32_t is_fullscreen;     //!< XrBool32 semantics (1 = entered, 0 = restored)
+		} fullscreen_toggled;
 	} u;
 };
 
