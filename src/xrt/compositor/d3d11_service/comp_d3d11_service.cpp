@@ -918,6 +918,13 @@ struct d3d11_multi_client_slot
 	//! True when minimized (hidden from rendering but still connected).
 	bool minimized;
 
+	//! Per-client xrWaitFrame cap in Hz set by xrSetWorkspaceClientFrameRateCapEXT
+	//! (spec_version 14). 0.0f = uncapped (native refresh). Resets to 0.0f on
+	//! slot register/unregister; controllers re-apply on reconnect. Read
+	//! lock-free from compositor_predict_frame — single float, torn read at
+	//! worst applies last-frame's value for one call.
+	float frame_rate_cap_hz;
+
 	//! True when maximized (fills display, toggle restores pre_max state).
 	bool maximized;
 	struct xrt_pose pre_max_pose;
@@ -3614,6 +3621,57 @@ compositor_end_session(struct xrt_compositor *xc)
 	return XRT_SUCCESS;
 }
 
+// Per-client frame-rate cap (spec_version 14, xrSetWorkspaceClientFrameRateCapEXT).
+//
+// Reads the controller-supplied cap for this compositor's slot and converts it
+// to a period multiplier. Pure mechanism — the runtime makes no decision about
+// which clients get throttled; the workspace controller sets the cap per
+// xrSetWorkspaceClientFrameRateCapEXT and the runtime applies it.
+//
+// Standalone (non-workspace) clients always return 1. Unprotected read of
+// mc->clients[*] is intentional: worst-case torn read applies the previous
+// frame's cap for one wait_frame call. Taking sys->render_mutex on every
+// client wait would contend with the render thread and defeat the savings.
+//
+// Kill switch: DISPLAYXR_WORKSPACE_FRAME_BUDGET=off disables all throttling.
+static int
+compositor_predict_frame_cap_multiplier(struct d3d11_service_compositor *c)
+{
+	static int budget_enabled = -1;
+	if (budget_enabled < 0) {
+		const char *e = getenv("DISPLAYXR_WORKSPACE_FRAME_BUDGET");
+		budget_enabled = (e != nullptr && (e[0] == 'o' || e[0] == 'O') &&
+		                  (e[1] == 'f' || e[1] == 'F'))
+		                     ? 0
+		                     : 1;
+	}
+	if (!budget_enabled) {
+		return 1;
+	}
+
+	struct d3d11_service_system *sys = c->sys;
+	if (!sys->workspace_mode || sys->multi_comp == nullptr) {
+		return 1;
+	}
+
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+		if (mc->clients[s].active && mc->clients[s].compositor == c) {
+			float cap_hz = mc->clients[s].frame_rate_cap_hz;
+			if (cap_hz <= 0.0f) {
+				return 1;
+			}
+			float refresh_hz = sys->refresh_rate;
+			if (refresh_hz <= 0.0f || cap_hz >= refresh_hz) {
+				return 1;
+			}
+			int m = (int)lrintf(refresh_hz / cap_hz);
+			return m < 1 ? 1 : m;
+		}
+	}
+	return 1;
+}
+
 static xrt_result_t
 compositor_predict_frame(struct xrt_compositor *xc,
                           int64_t *out_frame_id,
@@ -3645,9 +3703,17 @@ compositor_predict_frame(struct xrt_compositor *xc,
 	int64_t now_ns = static_cast<int64_t>(os_monotonic_get_ns());
 	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->sys->refresh_rate);
 
-	*out_predicted_display_time_ns = now_ns + period_ns * 2;
-	*out_predicted_display_period_ns = period_ns;
-	*out_wake_time_ns = now_ns;
+	// IPC clients drive xrWaitFrame entirely via predict_frame's out_wake_time_ns
+	// (see ipc_client_compositor.c:ipc_compositor_wait_frame — client sleeps
+	// client-side via u_wait_until, server isn't parked). Apply the per-client
+	// cap here so the client waits client-side. In-process callers go through
+	// compositor_wait_frame, which is intentionally NOT throttled.
+	int multiplier = compositor_predict_frame_cap_multiplier(c);
+	int64_t adjusted_period_ns = period_ns * multiplier;
+
+	*out_predicted_display_time_ns = now_ns + adjusted_period_ns * 2;
+	*out_predicted_display_period_ns = adjusted_period_ns;
+	*out_wake_time_ns = now_ns + period_ns * (multiplier - 1);
 	*out_predicted_gpu_time_ns = period_ns;
 
 	return XRT_SUCCESS;
@@ -4741,6 +4807,7 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			mc->clients[i].active = true;
 			mc->clients[i].has_first_frame_committed = false;
 			mc->clients[i].first_frame_ns = 0;
+			mc->clients[i].frame_rate_cap_hz = 0.0f;
 			// Phase 2.C: drop any leftover chrome registration from a
 			// prior tenant so the new client starts with no chrome.
 			if (mc->clients[i].chrome_xsc != nullptr) {
@@ -5076,6 +5143,7 @@ multi_compositor_add_capture_client(struct d3d11_service_system *sys, HWND hwnd,
 			mc->clients[i].minimized = false;
 			mc->clients[i].maximized = false;
 			mc->clients[i].hwnd_resize_pending = false;
+			mc->clients[i].frame_rate_cap_hz = 0.0f;
 
 			// App name
 			if (name && name[0]) {
@@ -13365,6 +13433,33 @@ comp_d3d11_service_set_client_window_pose(struct xrt_system_compositor *xsysc,
 		multi_compositor_update_input_forward(mc);
 	}
 
+	return true;
+}
+
+bool
+comp_d3d11_service_set_client_frame_rate_cap(struct xrt_system_compositor *xsysc,
+                                              struct xrt_compositor *xc,
+                                              float max_fps)
+{
+	if (xsysc == nullptr || xc == nullptr) return false;
+	if (max_fps < 0.0f) return false;
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (!sys->workspace_mode || sys->multi_comp == nullptr) return false;
+
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+
+	int slot = multi_comp_find_slot(mc, c);
+	if (slot < 0) return false;
+
+	float prev = mc->clients[slot].frame_rate_cap_hz;
+	mc->clients[slot].frame_rate_cap_hz = max_fps;
+	if (prev != max_fps) {
+		U_LOG_W("Workspace: set_frame_rate_cap slot %d %.1f → %.1f Hz", slot, prev, max_fps);
+	}
 	return true;
 }
 

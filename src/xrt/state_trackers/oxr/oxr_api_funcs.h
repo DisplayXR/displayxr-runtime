@@ -843,6 +843,9 @@ oxr_xrSetWorkspaceFocusedClientEXT(XrSession session, XrWorkspaceClientId client
 //! OpenXR API function @ep{xrGetWorkspaceFocusedClientEXT}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrGetWorkspaceFocusedClientEXT(XrSession session, XrWorkspaceClientId *outClientId);
+//! OpenXR API function @ep{xrSetWorkspaceClientFrameRateCapEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceClientFrameRateCapEXT(XrSession session, XrWorkspaceClientId clientId, float maxFps);
 //! OpenXR API function @ep{xrEnumerateWorkspaceInputEventsEXT}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrEnumerateWorkspaceInputEventsEXT(XrSession session,

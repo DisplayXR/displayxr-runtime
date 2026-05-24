@@ -204,6 +204,19 @@ comp_d3d11_service_set_client_visibility(struct xrt_system_compositor *xsysc,
                                           bool visible);
 
 /*!
+ * Set per-client xrWaitFrame return-rate cap in Hz (spec_version 14,
+ * xrSetWorkspaceClientFrameRateCapEXT). 0.0f = uncapped (native refresh).
+ * Pure mechanism — the workspace controller decides which clients get
+ * which cadence. Applied by compositor_predict_frame via the IPC client's
+ * client-side u_wait_until; in-process callers (bridge/WebXR) are not
+ * affected.
+ */
+bool
+comp_d3d11_service_set_client_frame_rate_cap(struct xrt_system_compositor *xsysc,
+                                              struct xrt_compositor *xc,
+                                              float max_fps);
+
+/*!
  * Get the current window pose and dimensions for a client in the multi-compositor.
  */
 bool
