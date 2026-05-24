@@ -9,11 +9,12 @@
  * platform's discovery root — `HKLM\Software\DisplayXR\DisplayProcessors\*`
  * on Windows, JSON manifests under
  * `~/Library/Application Support/DisplayXR/DisplayProcessors/` on macOS,
- * or `${XDG_DATA_HOME:-~/.local/share}/DisplayXR/DisplayProcessors/`
- * plus system roots on Linux — sorts the registered plug-ins by their
- * `ProbeOrder` value (ascending; missing = 100), and tries each in
- * turn: load the DLL/dylib → resolve `xrtPluginNegotiate` →
- * `iface->probe()`. The first plug-in whose probe returns
+ * `${XDG_DATA_HOME:-~/.local/share}/DisplayXR/DisplayProcessors/` plus
+ * system roots on Linux, or sibling `libdxrp<NNN>_<id>.so` files in the
+ * runtime APK's own lib dir on Android — sorts the registered plug-ins
+ * by their `ProbeOrder` value (ascending; missing = 100), and tries
+ * each in turn: load the DLL/dylib/`.so` → resolve `xrtPluginNegotiate`
+ * → `iface->probe()`. The first plug-in whose probe returns
  * `XRT_SUCCESS` wins and is cached for the process's lifetime;
  * subsequent entries are not attempted. The discovery contract lives
  * at `docs/specs/runtime/plugin-discovery.md`.

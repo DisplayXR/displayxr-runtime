@@ -322,7 +322,275 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst)
 	return NULL;
 }
 
-#else /* !XRT_OS_WINDOWS */
+#elif defined(XRT_OS_ANDROID)
+
+#include <dirent.h>
+#include <dlfcn.h>
+#include <limits.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+
+/*
+ * Same upper bound as the other platforms — admits a vendor plug-in plus
+ * the sim_display fallback with plenty of headroom.
+ */
+#define MAX_PLUGIN_ENTRIES 16
+
+/*
+ * Discovery contract: see docs/specs/runtime/plugin-discovery.md §3.2.
+ *
+ * Android v1 uses **convention-driven** discovery rather than the JSON
+ * manifest scheme that POSIX (macOS / Linux) and the registry scheme
+ * that Windows use. Reason: Android's package installer extracts only
+ * `.so` files from an APK's `jniLibs/<abi>/` into the on-disk
+ * `lib/<abi>/`. Any `.json` shipped in `jniLibs/` stays trapped inside
+ * `base.apk` and would require AAssetManager + a JNIEnv to read — JNI
+ * plumbing the loader has no access to at xrCreateInstance time. The
+ * iface returned by `xrtPluginNegotiate` already carries id /
+ * display_name / vendor; the only load-bearing manifest field is
+ * ProbeOrder, which we encode in the filename.
+ *
+ * Filename convention: `libdxrp<NNN>_<id>.so` where `<NNN>` is the
+ * three-digit zero-padded ProbeOrder and `<id>` matches the
+ * iface->id the plug-in returns at negotiate. Examples:
+ *   libdxrp050_leia_cnsdk.so   (vendor)
+ *   libdxrp200_sim_display.so  (fallback)
+ *
+ * Lexicographic sort on filename gives probe-order ascending for free,
+ * same trick the POSIX `050-leia-sr.json` filename convention uses.
+ *
+ * Discovery root (priority order):
+ *   1. $XRT_PLUGIN_SEARCH_PATH — dev override, single dir (no colon
+ *      splitting — Android emulator iteration is the only use case)
+ *   2. dirname(dladdr(&get_runtime_lib_dir)) — the runtime `.so`'s
+ *      own lib dir, which is `/data/app/<runtime-pkg>-<hash>/lib/<abi>/`.
+ *      Plug-ins shipped in the runtime APK's `jniLibs/<abi>/` land here.
+ *
+ * Multi-APK discovery (separate vendor-APKs each shipping plug-ins) is
+ * a v2 problem requiring PackageManager queries via JNI — out of scope
+ * for v1.
+ */
+
+struct plugin_entry
+{
+	char binary_path[PATH_MAX];  /* absolute path to the .so */
+	char filename[NAME_MAX + 1]; /* basename, used for stable sort */
+	char id[64];                 /* parsed from filename: chars between `_` and `.so` */
+	uint32_t probe_order;        /* parsed from filename: 3 digits after `libdxrp` */
+};
+
+static int
+compare_by_filename(const void *a, const void *b)
+{
+	return strcmp(((const struct plugin_entry *)a)->filename,
+	              ((const struct plugin_entry *)b)->filename);
+}
+
+/*!
+ * Parse `libdxrp<NNN>_<id>.so` into probe_order and id. Returns true
+ * on a well-formed filename, false otherwise (caller skips it).
+ */
+static bool
+parse_plugin_filename(const char *name, uint32_t *out_order, char *out_id, size_t id_size)
+{
+	const char *prefix = "libdxrp";
+	const size_t prefix_len = 7; /* strlen("libdxrp") */
+	size_t n = strlen(name);
+
+	/* Min plausible: "libdxrpNNN_X.so" = 7 + 3 + 1 + 1 + 3 = 15 chars. */
+	if (n < 15 || strncmp(name, prefix, prefix_len) != 0) {
+		return false;
+	}
+	if (strcmp(name + n - 3, ".so") != 0) {
+		return false;
+	}
+	if (!(name[prefix_len + 0] >= '0' && name[prefix_len + 0] <= '9' &&
+	      name[prefix_len + 1] >= '0' && name[prefix_len + 1] <= '9' &&
+	      name[prefix_len + 2] >= '0' && name[prefix_len + 2] <= '9')) {
+		return false;
+	}
+	if (name[prefix_len + 3] != '_') {
+		return false;
+	}
+
+	*out_order = (uint32_t)((name[prefix_len + 0] - '0') * 100 +
+	                        (name[prefix_len + 1] - '0') * 10 +
+	                        (name[prefix_len + 2] - '0'));
+
+	size_t id_start = prefix_len + 4;
+	size_t id_len = n - 3 - id_start;
+	if (id_len == 0 || id_len >= id_size) {
+		return false;
+	}
+	memcpy(out_id, name + id_start, id_len);
+	out_id[id_len] = '\0';
+	return true;
+}
+
+static int
+enumerate_dir(const char *root, struct plugin_entry *entries, int start, int max)
+{
+	DIR *d = opendir(root);
+	if (d == NULL) {
+		return start;
+	}
+
+	int count = start;
+	struct dirent *de;
+	while ((de = readdir(d)) != NULL) {
+		if (count >= max) {
+			U_LOG_W("plugin loader: more than %d entries — truncating.", max);
+			break;
+		}
+		struct plugin_entry e;
+		memset(&e, 0, sizeof(e));
+		if (!parse_plugin_filename(de->d_name, &e.probe_order, e.id, sizeof(e.id))) {
+			continue;
+		}
+		snprintf(e.binary_path, sizeof(e.binary_path), "%s/%s", root, de->d_name);
+		snprintf(e.filename, sizeof(e.filename), "%s", de->d_name);
+		entries[count++] = e;
+	}
+	closedir(d);
+	return count;
+}
+
+/*!
+ * Locate the runtime `.so`'s own lib dir via `dladdr` so we can
+ * enumerate sibling plug-in `.so`s in the runtime APK's
+ * `/data/app/.../lib/<abi>/`. Writes the dirname into `out_dir`.
+ * Returns true on success.
+ */
+static bool
+get_runtime_lib_dir(char *out_dir, size_t out_size)
+{
+	Dl_info info;
+	memset(&info, 0, sizeof(info));
+	if (dladdr((const void *)&get_runtime_lib_dir, &info) == 0 || info.dli_fname == NULL) {
+		return false;
+	}
+
+	const char *slash = strrchr(info.dli_fname, '/');
+	if (slash == NULL) {
+		return false;
+	}
+	size_t dir_len = (size_t)(slash - info.dli_fname);
+	if (dir_len == 0 || dir_len >= out_size) {
+		return false;
+	}
+	memcpy(out_dir, info.dli_fname, dir_len);
+	out_dir[dir_len] = '\0';
+	return true;
+}
+
+static const struct xrt_plugin_iface *
+try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst)
+{
+	*out_inst = NULL;
+
+	/* RTLD_LOCAL keeps the plug-in's symbols private; aux symbols
+	 * resolve via the runtime .so already in the namespace. */
+	void *handle = dlopen(e->binary_path, RTLD_NOW | RTLD_LOCAL);
+	if (handle == NULL) {
+		U_LOG_W("plugin loader:   %s: dlopen(%s) failed: %s.", e->id, e->binary_path, dlerror());
+		return NULL;
+	}
+
+	dlerror();
+	xrt_plugin_negotiate_fn_t negotiate =
+	    (xrt_plugin_negotiate_fn_t)dlsym(handle, XRT_PLUGIN_ENTRYPOINT_NAME);
+	const char *err = dlerror();
+	if (negotiate == NULL || err != NULL) {
+		U_LOG_W("plugin loader:   %s: missing entry point '%s' (%s) — skipping.", e->id,
+		        XRT_PLUGIN_ENTRYPOINT_NAME, err ? err : "null");
+		dlclose(handle);
+		return NULL;
+	}
+
+	struct xrt_plugin_host_iface host = {0};
+	host.struct_size = (uint32_t)sizeof(struct xrt_plugin_host_iface);
+	host.host_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
+
+	struct xrt_plugin_iface *iface = NULL;
+	uint32_t plugin_version = 0;
+	xrt_result_t xret = negotiate(XRT_PLUGIN_API_VERSION_CURRENT, &host, &iface, &plugin_version);
+	if (xret != XRT_SUCCESS || iface == NULL) {
+		U_LOG_W("plugin loader:   %s: negotiate returned %d (iface=%p) — skipping.", e->id, (int)xret,
+		        (void *)iface);
+		dlclose(handle);
+		return NULL;
+	}
+
+	if (iface->probe != NULL) {
+		xret = iface->probe(out_inst);
+		if (xret == XRT_ERROR_PROBER_NOT_SUPPORTED) {
+			U_LOG_I("plugin loader:   %s: probe declined (no matching device).", e->id);
+			dlclose(handle);
+			return NULL;
+		}
+		if (xret != XRT_SUCCESS) {
+			U_LOG_W("plugin loader:   %s: probe returned %d — skipping.", e->id, (int)xret);
+			dlclose(handle);
+			return NULL;
+		}
+	}
+
+	U_LOG_W(
+	    "plugin loader: active plug-in: id=%s name='%s' vendor='%s' "
+	    "plugin_api=%u probe_order=%u path=%s",
+	    iface->id ? iface->id : e->id, iface->display_name ? iface->display_name : "",
+	    iface->vendor ? iface->vendor : "", plugin_version, e->probe_order, e->binary_path);
+
+	/* dlopen handle intentionally leaked: the iface's function pointers
+	 * remain reachable into the .so for the process's lifetime. */
+	return iface;
+}
+
+static const struct xrt_plugin_iface *
+discover_active_plugin(struct xrt_plugin_instance **out_inst)
+{
+	*out_inst = NULL;
+
+	char root[PATH_MAX] = {0};
+	const char *override = getenv("XRT_PLUGIN_SEARCH_PATH");
+	if (override != NULL && *override != '\0') {
+		snprintf(root, sizeof(root), "%s", override);
+	} else if (!get_runtime_lib_dir(root, sizeof(root))) {
+		U_LOG_W("plugin loader: dladdr could not locate runtime lib dir — no plug-ins to try.");
+		return NULL;
+	}
+
+	struct stat st;
+	if (stat(root, &st) != 0 || !S_ISDIR(st.st_mode)) {
+		U_LOG_I("plugin loader: discovery root '%s' absent — no plug-ins to try.", root);
+		return NULL;
+	}
+
+	struct plugin_entry entries[MAX_PLUGIN_ENTRIES];
+	int n = enumerate_dir(root, entries, 0, MAX_PLUGIN_ENTRIES);
+	if (n == 0) {
+		U_LOG_I("plugin loader: '%s' searched, no libdxrp*.so files found.", root);
+		return NULL;
+	}
+
+	qsort(entries, (size_t)n, sizeof(entries[0]), compare_by_filename);
+
+	U_LOG_I("plugin loader: %d registered plug-in(s) in %s; attempting in filename order.", n, root);
+	for (int i = 0; i < n; i++) {
+		U_LOG_I("plugin loader:   [%d/%d] %s (ProbeOrder=%u, %s)", i + 1, n, entries[i].id,
+		        entries[i].probe_order, entries[i].binary_path);
+		const struct xrt_plugin_iface *iface = try_load_one(&entries[i], out_inst);
+		if (iface != NULL) {
+			return iface;
+		}
+	}
+
+	U_LOG_W("plugin loader: no registered plug-in claimed the system — falling back to static drivers.");
+	return NULL;
+}
+
+#else /* !XRT_OS_WINDOWS && !XRT_OS_ANDROID — macOS / Linux */
 
 #include "util/u_json.h"
 
@@ -696,7 +964,7 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst)
 	return NULL;
 }
 
-#endif /* XRT_OS_WINDOWS */
+#endif /* platform-specific loader */
 
 
 /*
