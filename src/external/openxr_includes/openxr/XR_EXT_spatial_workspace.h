@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_spatial_workspace 1
-#define XR_EXT_spatial_workspace_SPEC_VERSION 14
+#define XR_EXT_spatial_workspace_SPEC_VERSION 15
 #define XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_EXT_spatial_workspace"
 
 // Provisional XrStructureType values. The 1000999100..107 range is reserved for
@@ -343,6 +343,7 @@ typedef enum XrWorkspaceInputEventTypeEXT {
     XR_WORKSPACE_INPUT_EVENT_MODAL_OPEN_EXT      = 8, // spec_version 10: client opened a Win32 modal popup (refcounted, fires on 0→1 only)
     XR_WORKSPACE_INPUT_EVENT_MODAL_CLOSE_EXT     = 9, // spec_version 10: client's last Win32 modal popup closed (refcounted, fires on 1→0 only)
     XR_WORKSPACE_INPUT_EVENT_FILE_PICKER_REQUEST_EXT = 10, // spec_version 11: a workspace client called xrRequestFilePickerEXT — fetch full info via xrGetFilePickerRequestEXT, deliver result via xrCompleteFilePickerEXT
+    XR_WORKSPACE_INPUT_EVENT_FULLSCREEN_TOGGLED_EXT  = 11, // spec_version 15: a workspace client's fullscreen/maximize state transitioned (runtime-driven, e.g. double-click title bar or F11)
     XR_WORKSPACE_INPUT_EVENT_TYPE_MAX_ENUM_EXT  = 0x7FFFFFFF
 } XrWorkspaceInputEventTypeEXT;
 
@@ -462,6 +463,16 @@ typedef struct XrWorkspaceInputEventEXT {
             XrWorkspaceClientId     clientId;
             uint64_t                requestId;
         } filePickerRequest;
+        struct {  // spec_version 15: a client's fullscreen/maximize state
+            // transitioned. Runtime-driven (double-click title bar, F11,
+            // xrRequestWorkspaceClientFullscreenEXT). The workspace
+            // controller typically wants to focus the toggled client when
+            // it enters fullscreen — focus policy lives in the controller
+            // (ADR-018), so the runtime emits the event and the controller
+            // calls xrSetWorkspaceFocusedClientEXT in response.
+            XrWorkspaceClientId     clientId;
+            XrBool32                isFullscreen;  // XR_TRUE on enter, XR_FALSE on restore
+        } fullscreenToggled;
     };
 } XrWorkspaceInputEventEXT;
 

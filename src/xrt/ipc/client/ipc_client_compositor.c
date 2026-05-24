@@ -659,6 +659,10 @@ comp_ipc_client_compositor_workspace_enumerate_input_events(struct xrt_composito
 			out->filePickerRequest.clientId = (XrWorkspaceClientId)src->u.file_picker_request.client_id;
 			out->filePickerRequest.requestId = src->u.file_picker_request.request_id;
 			break;
+		case IPC_WORKSPACE_INPUT_EVENT_FULLSCREEN_TOGGLED:
+			out->fullscreenToggled.clientId = (XrWorkspaceClientId)src->u.fullscreen_toggled.client_id;
+			out->fullscreenToggled.isFullscreen = src->u.fullscreen_toggled.is_fullscreen ? XR_TRUE : XR_FALSE;
+			break;
 		default:
 			break;
 		}

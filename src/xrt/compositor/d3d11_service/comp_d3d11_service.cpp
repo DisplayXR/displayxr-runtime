@@ -927,6 +927,11 @@ struct d3d11_multi_client_slot
 
 	//! True when maximized (fills display, toggle restores pre_max state).
 	bool maximized;
+	//! spec_version 15: last-emitted snapshot for the FULLSCREEN_TOGGLED drain.
+	//! Per-slot delta-vs-shadow: drain compares `maximized` to this and emits
+	//! IPC_WORKSPACE_INPUT_EVENT_FULLSCREEN_TOGGLED on every transition so the
+	//! workspace controller can update focus / chrome / layout in response.
+	bool maximized_last_emitted;
 	struct xrt_pose pre_max_pose;
 	float pre_max_width_m;
 	float pre_max_height_m;
@@ -4816,6 +4821,8 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			mc->clients[i].chrome_swapchain_id = 0;
 			mc->clients[i].chrome_layout_valid = false;
 			mc->clients[i].chrome_region_count = 0;
+			mc->clients[i].maximized = false;
+			mc->clients[i].maximized_last_emitted = false;
 
 			// Count active clients to determine grid position
 			int active_count = 0;
@@ -5142,6 +5149,7 @@ multi_compositor_add_capture_client(struct d3d11_service_system *sys, HWND hwnd,
 			mc->clients[i].active = true;
 			mc->clients[i].minimized = false;
 			mc->clients[i].maximized = false;
+			mc->clients[i].maximized_last_emitted = false;
 			mc->clients[i].hwnd_resize_pending = false;
 			mc->clients[i].frame_rate_cap_hz = 0.0f;
 
@@ -14075,6 +14083,31 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 				(void)AllowSetForegroundWindow(app_pid);
 			}
 		}
+	}
+
+	// spec_version 15: FULLSCREEN_TOGGLED on per-slot maximized transition.
+	// Runtime-driven (double-click title bar, F11, xrRequestWorkspaceClientFullscreenEXT).
+	// The workspace controller typically wants to focus the toggled client when
+	// it enters fullscreen — focus policy lives in the controller (ADR-018), so
+	// the runtime emits the event and the controller calls
+	// xrSetWorkspaceFocusedClientEXT in response. Includes capture clients (they
+	// can be maximized too); client_id uses the same `1000 + slot` slot-based id
+	// the pointer / focus_changed events use.
+	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS &&
+	     out_batch->count < IPC_WORKSPACE_INPUT_EVENT_BATCH_MAX; s++) {
+		struct d3d11_multi_client_slot *cs = &mc->clients[s];
+		if (!cs->active) continue;
+		if (cs->maximized == cs->maximized_last_emitted) continue;
+
+		struct ipc_workspace_input_event *ev = &out_batch->events[out_batch->count];
+		memset(ev, 0, sizeof(*ev));
+		ev->event_type = IPC_WORKSPACE_INPUT_EVENT_FULLSCREEN_TOGGLED;
+		ev->timestamp_ms = (uint32_t)GetTickCount();
+		ev->u.fullscreen_toggled.client_id = 1000u + (uint32_t)s;
+		ev->u.fullscreen_toggled.is_fullscreen = cs->maximized ? 1u : 0u;
+		out_batch->count++;
+
+		cs->maximized_last_emitted = cs->maximized;
 	}
 
 	// FRAME_TICK: one per displayed frame since the last drain, capped at
