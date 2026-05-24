@@ -4868,9 +4868,10 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			mc->clients[i].hwnd_resize_pending = true;
 
 			mc->client_count++;
-			if (mc->focused_slot < 0) {
-				mc->focused_slot = i;
-			}
+			// ADR-018: the runtime no longer auto-focuses the first
+			// client. The workspace controller owns focus — it sees the
+			// new client in xrEnumerateWorkspaceClientsEXT and calls
+			// xrSetWorkspaceFocusedClientEXT (shell auto-focus-first path).
 			U_LOG_W("Multi-comp: registered client in slot %d (total=%u)", i, mc->client_count);
 			U_LOG_W("  window: pose=(%.3f,%.3f,%.3f) size=%.3fx%.3fm rect=(%d,%d %dx%d px)",
 			        mc->clients[i].window_pose.position.x,
@@ -4936,13 +4937,12 @@ multi_compositor_unregister_client(struct d3d11_service_system *sys, struct d3d1
 			mc->clients[i].compositor = nullptr;
 			mc->client_count--;
 			if (mc->focused_slot == i) {
+				// ADR-018: the disconnecting client held focus. Clear it so
+				// keyboard forwarding never targets a freed slot, but DON'T
+				// pick the successor — that's the controller's call. The
+				// shell's client-list diff sees the disconnect and auto-
+				// focuses a survivor on its next tick.
 				mc->focused_slot = -1;
-				for (int j = 0; j < D3D11_MULTI_MAX_CLIENTS; j++) {
-					if (mc->clients[j].active && !mc->clients[j].minimized) {
-						mc->focused_slot = j;
-						break;
-					}
-				}
 				multi_compositor_update_input_forward(mc);
 			}
 			// Cancel any active drag on this slot
@@ -5262,9 +5262,8 @@ multi_compositor_add_capture_client(struct d3d11_service_system *sys, HWND hwnd,
 
 			mc->client_count++;
 			mc->capture_client_count++;
-			if (mc->focused_slot < 0) {
-				mc->focused_slot = i;
-			}
+			// ADR-018: no runtime auto-focus on register (see the IPC-client
+			// register path). The controller focuses via the workspace API.
 
 			U_LOG_W("Multi-comp: added capture client in slot %d HWND=%p '%s' "
 			         "(%ux%u px, %.3fx%.3f m, total=%u, captures=%u)",
@@ -5319,13 +5318,9 @@ multi_compositor_remove_capture_client(struct d3d11_service_system *sys, int slo
 	mc->capture_client_count--;
 
 	if (mc->focused_slot == slot_index) {
+		// ADR-018: clear focus for forwarding safety; controller picks the
+		// successor (shell auto-focus-next path on its client-list diff).
 		mc->focused_slot = -1;
-		for (int j = 0; j < D3D11_MULTI_MAX_CLIENTS; j++) {
-			if (mc->clients[j].active && !mc->clients[j].minimized) {
-				mc->focused_slot = j;
-				break;
-			}
-		}
 		multi_compositor_update_input_forward(mc);
 	}
 	if (mc->drag.active && mc->drag.slot == slot_index) {
@@ -6603,7 +6598,11 @@ toggle_fullscreen(struct d3d11_service_system *sys,
 		U_LOG_W("Multi-comp: fullscreen slot %d", slot);
 	}
 
-	mc->focused_slot = slot;
+	// ADR-018: the runtime no longer focuses the toggled client. PR A
+	// added the FULLSCREEN_TOGGLED workspace event (emitted from the
+	// drain on the maximized transition); the controller reacts by
+	// calling xrSetWorkspaceFocusedClientEXT. Input forwarding is
+	// re-applied here against the current (controller-set) focus.
 	multi_compositor_update_input_forward(mc);
 
 	// Update window layer's ESC-suppression flag
@@ -6961,27 +6960,11 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		goto after_key_shortcuts;
 	}
 
-	// Bare TAB: cycle focus forward. Never unfocuses when windows exist.
-	// SHIFT+TAB is no longer reserved here — it falls through to wnd_proc's
-	// forward-to-app path so apps can use it (e.g. HUD toggle in cube tests).
-	// Ignore ALT+TAB (system task switcher).
-	if ((GetAsyncKeyState(VK_TAB) & 1) &&
-	    !(GetAsyncKeyState(VK_MENU) & 0x8000) &&
-	    !(GetAsyncKeyState(VK_SHIFT) & 0x8000)) {
-		if (mc->client_count > 0) {
-			int n = D3D11_MULTI_MAX_CLIENTS;
-			int base = (mc->focused_slot >= 0) ? mc->focused_slot : -1;
-			for (int i = 1; i <= n; i++) {
-				int idx = (base + i) % n;
-				if (mc->clients[idx].active && !mc->clients[idx].minimized) {
-					mc->focused_slot = idx;
-					break;
-				}
-			}
-			U_LOG_W("Multi-comp: TAB → focused slot %d", mc->focused_slot);
-			multi_compositor_update_input_forward(mc);
-		}
-	}
+	// ADR-018: the runtime no longer consumes TAB to cycle focus. TAB is
+	// already emitted on the workspace input-event queue (comp_d3d11_window
+	// pushes WORKSPACE_PUBLIC_EVENT_KEY before any suppression), so the
+	// controller drains it and applies its own focus-cycle policy. ALT+TAB
+	// (system task switcher) and SHIFT+TAB (app HUD toggles) are unaffected.
 
 	// DELETE: close focused client
 	if (GetAsyncKeyState(VK_DELETE) & 1) {
@@ -7188,14 +7171,10 @@ after_key_shortcuts:
 				mc->clients[hit_slot].minimized = true;
 				U_LOG_W("Multi-comp: minimize slot %d", hit_slot);
 				if (hit_slot == mc->focused_slot) {
-					// Advance focus to next visible window
+					// ADR-018: minimizing the focused window clears focus
+					// for forwarding safety; the controller picks the
+					// successor (shell auto-focus-next path).
 					mc->focused_slot = -1;
-					for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
-						if (mc->clients[i].active && !mc->clients[i].minimized) {
-							mc->focused_slot = i;
-							break;
-						}
-					}
 					multi_compositor_update_input_forward(mc);
 				}
 			} else if (in_title_bar && hit_slot >= 0) {
@@ -7208,17 +7187,14 @@ after_key_shortcuts:
 
 				if (is_double_click) {
 					toggle_fullscreen(sys, mc, hit_slot);
-				} else {
-					// Single click on title bar — focus the window. Drag
-					// is the workspace controller's job (ADR-018 / PR 2 of
-					// the runtime→controller migration). The controller
-					// observes the POINTER event, calls
-					// xrEnableWorkspacePointerCaptureEXT, snapshots pose
-					// via xrGetWorkspaceClientWindowPoseEXT, and drives
-					// per-frame xrSetWorkspaceClientWindowPoseEXT.
-					mc->focused_slot = hit_slot;
-					multi_compositor_update_input_forward(mc);
 				}
+				// ADR-018: single-click title-bar focus is the controller's
+				// call now (it was the last runtime self-focus on the title
+				// bar; drag already moved in an earlier slice). The runtime
+				// emits the POINTER event and the shell calls
+				// xrSetWorkspaceFocusedClientEXT. Double-click → maximize
+				// stays here (fullscreen state machine is runtime-owned; PR A
+				// added the FULLSCREEN_TOGGLED event the controller focuses on).
 			} else {
 				// Content area click or taskbar click
 				if (hit_slot < 0) {
@@ -7244,9 +7220,11 @@ after_key_shortcuts:
 							float ind_left_m = -disp_w_tb / 2.0f + 0.002f + ind_idx * (pill_w_m + gap_m);
 							float ind_right_m = ind_left_m + pill_w_m;
 							if (cursor_x_m >= ind_left_m && cursor_x_m < ind_right_m) {
+								// ADR-018: un-minimize only; focus is the
+								// controller's call. The restored window's
+								// visibility change is observable to the
+								// shell, which focuses it per its policy.
 								mc->clients[i].minimized = false;
-								mc->focused_slot = i;
-								multi_compositor_update_input_forward(mc);
 								U_LOG_W("Multi-comp: taskbar → un-minimize slot %d", i);
 								break;
 							}
@@ -7267,13 +7245,33 @@ after_key_shortcuts:
 					// DOWN to the NEW target after the focus change so
 					// the app sees a full DOWN/MOVE/UP and the click+drag
 					// works in a single motion.
+					// ADR-018: the runtime no longer self-focuses on a
+					// content click — the controller owns focus and reacts
+					// to the POINTER event with xrSetWorkspaceFocusedClientEXT.
+					// We still compute focus_changed (clicked slot != current
+					// focus) to drive the synthetic-DOWN click routing below:
+					// that is input forwarding (translating a spatial click
+					// into a Win32 click on the target HWND), which is
+					// plumbing the runtime legitimately owns, not focus policy.
+					// The synthetic DOWN is posted directly to hit_slot's
+					// HWND, so drag-in-one-click + 2D-capture child-control
+					// routing keep working; the controller updates the input-
+					// forward target for the follow-up MOVE/UP when it focuses.
 					const bool focus_changed = (hit_slot != mc->focused_slot);
-					if (focus_changed) {
-						mc->focused_slot = hit_slot;
-						U_LOG_W("Multi-comp: click → focused slot %d%s", mc->focused_slot,
-						        mc->focused_slot < 0 ? " (unfocused)" : "");
-						multi_compositor_update_input_forward(mc);
-					}
+
+					// Drag-in-one-click signal. focus_changed is no longer a
+					// reliable "did the hit window receive this DOWN?" proxy:
+					// the controller sets focus asynchronously (ADR-018), so by
+					// the time this render-frame handler runs focused_slot may
+					// already point at the hit slot even though the WndProc
+					// forwarded the original DOWN elsewhere (or nowhere). Ask
+					// the window what it ACTUALLY forwarded the DOWN to,
+					// captured at WndProc time — independent of focus timing.
+					HWND last_down_tgt =
+					    (HWND)comp_d3d11_window_get_last_pointer_down_target(mc->window);
+					const bool down_reached_hit =
+					    (last_down_tgt != NULL &&
+					     last_down_tgt == mc->clients[hit_slot].app_hwnd);
 
 					// For capture clients, synthesize a click to route to the correct
 					// child control. When focus DIDN'T change (single click on the
@@ -7324,13 +7322,15 @@ after_key_shortcuts:
 						if (!focus_changed) {
 							PostMessage(click_target, WM_LBUTTONUP, 0, lp);
 						}
-					} else if (focus_changed &&
+					} else if (!down_reached_hit &&
 					           mc->clients[hit_slot].app_hwnd != nullptr &&
 					           !mc->clients[hit_slot].modal_open) {
-						// IPC app: focus changed mid-click. WndProc had
-						// already forwarded the initial DOWN to the OLD
-						// fwd target (or nowhere if none); the NEW target
-						// is missing it. Inject one — but use the SAME
+						// IPC app: the WndProc did NOT forward this DOWN to
+						// the hit window (the click landed on an unfocused
+						// window, so the cursor was outside the focused
+						// window's forward rect — or there was no focus).
+						// The hit window is missing its DOWN, so a drag can't
+						// start in one click. Inject one — using the SAME
 						// coord transform the WndProc applies to MOVE/UP
 						// (app-relative inside the inset content rect,
 						// scaled if app HWND ≠ rect dims) so the app
@@ -13493,13 +13493,9 @@ comp_d3d11_service_set_client_visibility(struct xrt_system_compositor *xsysc,
 	U_LOG_W("Workspace: set_visibility slot %d visible=%d", slot, visible);
 
 	if (!visible && slot == mc->focused_slot) {
+		// ADR-018: hiding the focused client clears focus for forwarding
+		// safety; the controller picks the successor (shell auto-focus-next).
 		mc->focused_slot = -1;
-		for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
-			if (mc->clients[i].active && !mc->clients[i].minimized) {
-				mc->focused_slot = i;
-				break;
-			}
-		}
 		multi_compositor_update_input_forward(mc);
 	}
 	return true;
@@ -14265,6 +14261,36 @@ comp_d3d11_service_workspace_find_slot_by_xc(struct xrt_system_compositor *xsysc
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
 	return multi_comp_find_slot(mc, c);
+}
+
+extern "C" bool
+comp_d3d11_service_workspace_get_client_state(struct xrt_system_compositor *xsysc,
+                                              struct xrt_compositor *xc,
+                                              bool *out_visible,
+                                              bool *out_focused)
+{
+	if (xsysc == nullptr || xc == nullptr) {
+		return false;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr) {
+		return false;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	int slot = multi_comp_find_slot(mc, c);
+	if (slot < 0) {
+		return false;
+	}
+	// WORKSPACE visibility = not minimized. Distinct from IPC session_visible.
+	if (out_visible != nullptr) {
+		*out_visible = !mc->clients[slot].minimized;
+	}
+	if (out_focused != nullptr) {
+		*out_focused = (slot == mc->focused_slot);
+	}
+	return true;
 }
 
 // IPC-facing wrappers (signatures from comp_d3d11_service.h). Resolve

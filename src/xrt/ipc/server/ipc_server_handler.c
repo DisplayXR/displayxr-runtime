@@ -2848,6 +2848,45 @@ ipc_handle_workspace_set_focused_client(volatile struct ipc_client_state *_ics, 
 		return XRT_SUCCESS;
 	}
 
+	// The workspace controller may pass EITHER form of client id:
+	//   - the canonical IPC client id (xrEnumerateWorkspaceClientsEXT form,
+	//     always < 1000 for OpenXR clients), or
+	//   - the legacy "1000 + slot" form that POINTER / POINTER_MOTION /
+	//     HOVER / FOCUS_CHANGED events report as hit_client_id.
+	// Click-to-focus (LMB/RMB), TAB cycle, and the FULLSCREEN_TOGGLED event
+	// all hand the controller the pointer hit id (1000 + slot), so accept
+	// that form here. We can't route it through ipc_server_set_active_client
+	// (which looks up by canonical id and would fail for 1000+slot); instead
+	// map it straight to the compositor slot for the glow + key forwarding,
+	// and resolve the slot's occupying IPC client to keep the active-client
+	// index — which drives session-focus events — in sync. Capture clients
+	// have no IPC session, so focused_slot alone is the whole story.
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (client_id >= 1000u && s->xsysc != NULL) {
+		int slot = (int)(client_id - 1000u);
+		uint32_t canonical_id = 0;
+		os_mutex_lock(&s->global_state.lock);
+		for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+			volatile struct ipc_client_state *ics = &s->threads[i].ics;
+			if (ics->server_thread_index < 0 || ics->xc == NULL) {
+				continue;
+			}
+			if (comp_d3d11_service_workspace_find_slot_by_xc(
+			        s->xsysc, (struct xrt_compositor *)ics->xc) == slot) {
+				canonical_id = ics->client_state.id;
+				break;
+			}
+		}
+		os_mutex_unlock(&s->global_state.lock);
+		if (canonical_id != 0) {
+			(void)ipc_server_set_active_client(s, canonical_id);
+		}
+		comp_d3d11_service_set_focused_slot(s->xsysc, slot);
+		return XRT_SUCCESS;
+	}
+#endif
+
+	// Canonical IPC client id path (xrEnumerateWorkspaceClientsEXT form).
 	xrt_result_t xret = ipc_server_set_active_client(s, client_id);
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
@@ -2857,27 +2896,22 @@ ipc_handle_workspace_set_focused_client(volatile struct ipc_client_state *_ics, 
 	// index in mc->clients[]. Map via find_slot_by_xc — same lookup
 	// the chrome layout setter uses.
 	if (xret == XRT_SUCCESS && s->xsysc != NULL) {
-		// Capture clients (id >= 1000) map straight to slot.
-		if (client_id >= 1000u) {
-			comp_d3d11_service_set_focused_slot(s->xsysc, (int)(client_id - 1000u));
-		} else {
-			os_mutex_lock(&s->global_state.lock);
-			volatile struct ipc_client_state *target_ics = NULL;
-			for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
-				volatile struct ipc_client_state *ics = &s->threads[i].ics;
-				if (ics->client_state.id == client_id && ics->server_thread_index >= 0) {
-					target_ics = ics;
-					break;
-				}
+		os_mutex_lock(&s->global_state.lock);
+		volatile struct ipc_client_state *target_ics = NULL;
+		for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+			volatile struct ipc_client_state *ics = &s->threads[i].ics;
+			if (ics->client_state.id == client_id && ics->server_thread_index >= 0) {
+				target_ics = ics;
+				break;
 			}
-			int mc_slot = -1;
-			if (target_ics != NULL && target_ics->xc != NULL) {
-				mc_slot = comp_d3d11_service_workspace_find_slot_by_xc(
-				    s->xsysc, (struct xrt_compositor *)target_ics->xc);
-			}
-			os_mutex_unlock(&s->global_state.lock);
-			comp_d3d11_service_set_focused_slot(s->xsysc, mc_slot);
 		}
+		int mc_slot = -1;
+		if (target_ics != NULL && target_ics->xc != NULL) {
+			mc_slot = comp_d3d11_service_workspace_find_slot_by_xc(
+			    s->xsysc, (struct xrt_compositor *)target_ics->xc);
+		}
+		os_mutex_unlock(&s->global_state.lock);
+		comp_d3d11_service_set_focused_slot(s->xsysc, mc_slot);
 	}
 #endif
 
@@ -2936,12 +2970,32 @@ ipc_handle_workspace_set_client_frame_rate_cap(volatile struct ipc_client_state 
 
 	os_mutex_lock(&s->global_state.lock);
 
+	// Accept both client-id forms (see ipc_handle_workspace_set_focused_client):
+	// the canonical IPC id (< 1000) from xrEnumerateWorkspaceClientsEXT, and the
+	// "1000 + slot" form the controller carries from POINTER / FOCUS_CHANGED
+	// events. The shell's focus-policy caps the previously/newly focused client
+	// using whatever id form it last saw, so both must resolve to the same xc.
 	volatile struct ipc_client_state *target_ics = NULL;
-	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
-		volatile struct ipc_client_state *ics = &s->threads[i].ics;
-		if (ics->client_state.id == client_id && ics->server_thread_index >= 0) {
-			target_ics = ics;
-			break;
+	if (client_id >= 1000u) {
+		int slot = (int)(client_id - 1000u);
+		for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+			volatile struct ipc_client_state *ics = &s->threads[i].ics;
+			if (ics->server_thread_index < 0 || ics->xc == NULL) {
+				continue;
+			}
+			if (comp_d3d11_service_workspace_find_slot_by_xc(
+			        s->xsysc, (struct xrt_compositor *)ics->xc) == slot) {
+				target_ics = ics;
+				break;
+			}
+		}
+	} else {
+		for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+			volatile struct ipc_client_state *ics = &s->threads[i].ics;
+			if (ics->client_state.id == client_id && ics->server_thread_index >= 0) {
+				target_ics = ics;
+				break;
+			}
 		}
 	}
 
@@ -3169,7 +3223,32 @@ ipc_handle_workspace_get_client_info(volatile struct ipc_client_state *_ics,
 	if (out_state == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	return ipc_server_get_client_app_state(s, client_id, out_state);
+	xrt_result_t xret = ipc_server_get_client_app_state(s, client_id, out_state);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// Override session_visible / session_focused with the WORKSPACE state
+	// (the compositor's minimized flag + focused_slot). The IPC session
+	// flags describe xrSession lifecycle, not workspace minimize/focus —
+	// the controller's auto-focus must skip minimized windows, which the
+	// session flags do not capture. Resolve client_id → xc → slot state.
+	if (s->xsysc != NULL) {
+		struct xrt_compositor *target_xc = NULL;
+		if (ipc_server_get_client_xc(s, client_id, &target_xc) == XRT_SUCCESS &&
+		    target_xc != NULL) {
+			bool ws_visible = false, ws_focused = false;
+			if (comp_d3d11_service_workspace_get_client_state(
+			        s->xsysc, target_xc, &ws_visible, &ws_focused)) {
+				out_state->session_visible = ws_visible;
+				out_state->session_focused = ws_focused;
+			}
+		}
+	}
+#endif
+
+	return XRT_SUCCESS;
 }
 
 xrt_result_t
