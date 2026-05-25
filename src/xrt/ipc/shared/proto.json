@@ -267,6 +267,12 @@
 		]
 	},
 
+	"workspace_set_overlay": {
+		"in": [
+			{"name": "info", "type": "struct ipc_workspace_overlay_info"}
+		]
+	},
+
 	"workspace_acquire_wakeup_event": {
 		"out_handles": {"type": "xrt_graphics_sync_handle_t"}
 	},

@@ -25,20 +25,22 @@ extern "C" {
 #endif
 
 #define XR_EXT_spatial_workspace 1
-#define XR_EXT_spatial_workspace_SPEC_VERSION 16
+#define XR_EXT_spatial_workspace_SPEC_VERSION 17
 #define XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_EXT_spatial_workspace"
 
-// Provisional XrStructureType values. The 1000999100..107 range is reserved for
+// Provisional XrStructureType values. The 1000999100..109 range is reserved for
 // this extension; final values reconcile with the Khronos registry before spec
 // freeze.
-#define XR_TYPE_WORKSPACE_CLIENT_INFO_EXT                  ((XrStructureType)1000999100)
-#define XR_TYPE_WORKSPACE_CAPTURE_REQUEST_EXT              ((XrStructureType)1000999101)
-#define XR_TYPE_WORKSPACE_CAPTURE_RESULT_EXT               ((XrStructureType)1000999102)
-#define XR_TYPE_WORKSPACE_CHROME_SWAPCHAIN_CREATE_INFO_EXT ((XrStructureType)1000999103)
-#define XR_TYPE_WORKSPACE_CHROME_LAYOUT_EXT                ((XrStructureType)1000999104)
-#define XR_TYPE_WORKSPACE_CLIENT_STYLE_EXT                 ((XrStructureType)1000999105)
-#define XR_TYPE_WORKSPACE_CURSOR_SWAPCHAIN_CREATE_INFO_EXT ((XrStructureType)1000999106)  // spec_version 13
-#define XR_TYPE_WORKSPACE_CURSOR_INFO_EXT                  ((XrStructureType)1000999107)  // spec_version 13
+#define XR_TYPE_WORKSPACE_CLIENT_INFO_EXT                   ((XrStructureType)1000999100)
+#define XR_TYPE_WORKSPACE_CAPTURE_REQUEST_EXT               ((XrStructureType)1000999101)
+#define XR_TYPE_WORKSPACE_CAPTURE_RESULT_EXT                ((XrStructureType)1000999102)
+#define XR_TYPE_WORKSPACE_CHROME_SWAPCHAIN_CREATE_INFO_EXT  ((XrStructureType)1000999103)
+#define XR_TYPE_WORKSPACE_CHROME_LAYOUT_EXT                 ((XrStructureType)1000999104)
+#define XR_TYPE_WORKSPACE_CLIENT_STYLE_EXT                  ((XrStructureType)1000999105)
+#define XR_TYPE_WORKSPACE_CURSOR_SWAPCHAIN_CREATE_INFO_EXT  ((XrStructureType)1000999106)  // spec_version 13
+#define XR_TYPE_WORKSPACE_CURSOR_INFO_EXT                   ((XrStructureType)1000999107)  // spec_version 13
+#define XR_TYPE_WORKSPACE_OVERLAY_SWAPCHAIN_CREATE_INFO_EXT ((XrStructureType)1000999108)  // spec_version 17
+#define XR_TYPE_WORKSPACE_OVERLAY_INFO_EXT                  ((XrStructureType)1000999109)  // spec_version 17
 
 /*!
  * @brief Workspace-local identifier for a client.
@@ -965,6 +967,95 @@ typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceCursorEXT)(
     XrSession                       session,
     const XrWorkspaceCursorInfoEXT *info);
 
+// ---- Workspace overlay (spec_version 17) ----
+//
+// A workspace overlay is a controller-pushed, non-client swapchain the runtime
+// composites at a controller-chosen docked position on the zero-disparity plane
+// (z = 0). It is the generic mechanism behind controller-owned display-spanning
+// UI such as a taskbar: the controller renders the UI into the swapchain and
+// tells the runtime where to dock it (normalized display anchor + sprite pivot)
+// and how big it is in physical meters. Unlike the cursor, the overlay has no
+// raycast depth and no per-eye disparity — at z = 0 the same sprite is drawn at
+// the same docked position in every atlas tile. Single global overlay slot per
+// session (mirrors the cursor); a subsequent set replaces the prior overlay.
+//
+// Architectural memory: [[chrome-layers-not-for-globals]] — chrome layers are
+// per-client and tile-scissored; not suitable for cross-tile globals. This RPC
+// pair (like the cursor's) is the right shape for display-spanning UI.
+
+/*!
+ * @brief Create-info for xrCreateWorkspaceOverlaySwapchainEXT.
+ *
+ * Same shape as the cursor swapchain create-info: the resulting swapchain is
+ * session-global, not bound to any workspace client.
+ */
+typedef struct XrWorkspaceOverlaySwapchainCreateInfoEXT {
+    XrStructureType  type;        // XR_TYPE_WORKSPACE_OVERLAY_SWAPCHAIN_CREATE_INFO_EXT
+    const void* XR_MAY_ALIAS next;
+    int64_t          format;      // Graphics-API format (DXGI_FORMAT, VK_FORMAT, etc.)
+    uint32_t         width;
+    uint32_t         height;
+    uint32_t         sampleCount; // 1 if 0
+    uint32_t         mipCount;    // 1 if 0
+} XrWorkspaceOverlaySwapchainCreateInfoEXT;
+
+/*!
+ * @brief Create a session-global swapchain to source overlay pixels from.
+ *
+ * Behaves like any other OpenXR swapchain: caller acquires images, fills them
+ * (CPU upload or render-target draw), and releases. The runtime composes the
+ * latest-released image as the overlay, scaled to @ref
+ * XrWorkspaceOverlayInfoEXT::sizeMeters and docked per its anchor/pivot.
+ *
+ * @return XR_SUCCESS, XR_ERROR_VALIDATION_FAILURE (bad createInfo),
+ *         XR_ERROR_FEATURE_UNSUPPORTED (session not in workspace IPC mode).
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrCreateWorkspaceOverlaySwapchainEXT)(
+    XrSession                                         session,
+    const XrWorkspaceOverlaySwapchainCreateInfoEXT  *createInfo,
+    XrSwapchain                                     *swapchain);
+
+/*!
+ * @brief Active overlay parameters.
+ *
+ * Pushed via xrSetWorkspaceOverlayEXT. The overlay is docked at z = 0 (zero
+ * disparity), so there is no per-eye disparity or raycast depth: @p anchor is a
+ * normalized position in display space ([0,1], origin top-left; e.g. {0.5,1.0}
+ * is bottom-center) and @p pivot is the normalized UV within the overlay sprite
+ * ([0,1]; e.g. {0.5,1.0} is the sprite's bottom-center) that lands on @p anchor.
+ * @p sizeMeters is the physical width/height of the overlay on the display.
+ */
+typedef struct XrWorkspaceOverlayInfoEXT {
+    XrStructureType  type;        // XR_TYPE_WORKSPACE_OVERLAY_INFO_EXT
+    const void* XR_MAY_ALIAS next;
+    XrSwapchain      swapchain;   // Source for overlay pixels; XR_NULL_HANDLE = hide
+    XrVector2f       anchor;      // Normalized display position [0,1] of the dock point
+    XrVector2f       pivot;       // Normalized sprite UV [0,1] mapped onto anchor
+    XrExtent2Df      sizeMeters;  // Physical width,height in meters
+    XrBool32         visible;     // XR_FALSE hides without releasing the swapchain
+} XrWorkspaceOverlayInfoEXT;
+
+/*!
+ * @brief Activate / update the workspace overlay.
+ *
+ * Call once on startup after creating the overlay swapchain and filling its
+ * first image, then again whenever the controller wants to change anchor,
+ * pivot, size, visibility, or swap to a different swapchain. The runtime keeps
+ * the most recent info; per-frame rendering uses the cached state, so this is a
+ * low-frequency call (NOT per-frame).
+ *
+ * Setting @p info->visible to XR_FALSE OR @p info->swapchain to XR_NULL_HANDLE
+ * hides the overlay without tearing down anything; a subsequent call re-activates.
+ *
+ * @return XR_SUCCESS, XR_ERROR_VALIDATION_FAILURE (bad info type / size),
+ *         XR_ERROR_HANDLE_INVALID (swapchain not a workspace-mode swapchain or
+ *         already destroyed), XR_ERROR_FEATURE_UNSUPPORTED (session not in
+ *         workspace IPC mode).
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceOverlayEXT)(
+    XrSession                        session,
+    const XrWorkspaceOverlayInfoEXT *info);
+
 // ---- Event-driven wakeup (spec_version 8) ----
 
 /*!
@@ -1207,6 +1298,15 @@ XRAPI_ATTR XrResult XRAPI_CALL xrCreateWorkspaceCursorSwapchainEXT(
 XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceCursorEXT(
     XrSession                       session,
     const XrWorkspaceCursorInfoEXT *info);
+
+XRAPI_ATTR XrResult XRAPI_CALL xrCreateWorkspaceOverlaySwapchainEXT(
+    XrSession                                         session,
+    const XrWorkspaceOverlaySwapchainCreateInfoEXT  *createInfo,
+    XrSwapchain                                     *swapchain);
+
+XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceOverlayEXT(
+    XrSession                        session,
+    const XrWorkspaceOverlayInfoEXT *info);
 
 XRAPI_ATTR XrResult XRAPI_CALL xrAcquireWorkspaceWakeupEventEXT(
     XrSession  session,

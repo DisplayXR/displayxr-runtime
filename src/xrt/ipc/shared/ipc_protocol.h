@@ -649,6 +649,27 @@ struct ipc_workspace_cursor_info
 };
 
 /*!
+ * spec_version 17: session-global overlay source. The controller renders a
+ * display-spanning UI (e.g. taskbar) into a swapchain (allocated via
+ * xrCreateWorkspaceOverlaySwapchainEXT) and docks it via xrSetWorkspaceOverlayEXT.
+ * The runtime composites that swapchain's latest released image at z = 0 (zero
+ * disparity) at the controller's anchor/pivot — no raycast, no per-eye disparity.
+ *
+ * @ingroup ipc
+ */
+struct ipc_workspace_overlay_info
+{
+	uint32_t swapchain_id;    //!< IPC swapchain id, or UINT32_MAX = hide
+	float    anchor_x;        //!< Normalized display position X [0,1] of dock point
+	float    anchor_y;        //!< Normalized display position Y [0,1] of dock point
+	float    pivot_x;         //!< Normalized sprite UV X [0,1] mapped onto anchor
+	float    pivot_y;         //!< Normalized sprite UV Y [0,1] mapped onto anchor
+	float    size_w_m;        //!< Physical overlay width in meters
+	float    size_h_m;        //!< Physical overlay height in meters
+	uint32_t visible;         //!< XrBool32; 0 = hidden even if swapchain valid
+};
+
+/*!
  * Phase 2.C spec_version 9: per-client visual style applied at workspace
  * content blit time. POD mirror of XrWorkspaceClientStyleEXT — the wire
  * form for xrSetWorkspaceClientStyleEXT.

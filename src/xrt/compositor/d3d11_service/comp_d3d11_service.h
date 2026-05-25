@@ -618,6 +618,23 @@ comp_d3d11_service_workspace_set_cursor(struct xrt_system_compositor *xsysc,
                                          bool visible);
 
 /*!
+ * spec_version 17: set the active controller-pushed overlay source (display-
+ * spanning UI such as a taskbar). The caller (IPC handler) resolves the
+ * controller-side swapchain id to an xrt_swapchain*; this stashes the borrowed
+ * ref + dock params on the service-system. The per-frame overlay render
+ * composites the swapchain's latest released image at z = 0 (zero disparity),
+ * docked at @p anchor (normalized display position) with @p pivot (normalized
+ * sprite UV) and physical size @p size_w_m × @p size_h_m. Pass xsc=NULL to hide.
+ */
+xrt_result_t
+comp_d3d11_service_workspace_set_overlay(struct xrt_system_compositor *xsysc,
+                                          struct xrt_swapchain *xsc,
+                                          float anchor_x, float anchor_y,
+                                          float pivot_x, float pivot_y,
+                                          float size_w_m, float size_h_m,
+                                          bool visible);
+
+/*!
  * Phase 2.C spec_version 8: lazy-create + return the workspace wakeup
  * event handle (Win32 HANDLE on Windows). The IPC handler then DuplicateHandle's
  * it into the controller process so the controller can wait on it instead

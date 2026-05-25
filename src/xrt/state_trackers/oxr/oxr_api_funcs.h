@@ -907,6 +907,14 @@ oxr_xrCreateWorkspaceCursorSwapchainEXT(XrSession session,
 //! OpenXR API function @ep{xrSetWorkspaceCursorEXT} (spec_version 13)
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceCursorEXT(XrSession session, const XrWorkspaceCursorInfoEXT *info);
+//! OpenXR API function @ep{xrCreateWorkspaceOverlaySwapchainEXT} (spec_version 17)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrCreateWorkspaceOverlaySwapchainEXT(XrSession session,
+                                          const XrWorkspaceOverlaySwapchainCreateInfoEXT *createInfo,
+                                          XrSwapchain *swapchain);
+//! OpenXR API function @ep{xrSetWorkspaceOverlayEXT} (spec_version 17)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceOverlayEXT(XrSession session, const XrWorkspaceOverlayInfoEXT *info);
 //! OpenXR API function @ep{xrAcquireWorkspaceWakeupEventEXT}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrAcquireWorkspaceWakeupEventEXT(XrSession session, uint64_t *outNativeHandle);

@@ -466,6 +466,8 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrUpdateWorkspaceClientChromeLayerPoseEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrCreateWorkspaceCursorSwapchainEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrSetWorkspaceCursorEXT, EXT_spatial_workspace);
+	ENTRY_IF_EXT(xrCreateWorkspaceOverlaySwapchainEXT, EXT_spatial_workspace);
+	ENTRY_IF_EXT(xrSetWorkspaceOverlayEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrAcquireWorkspaceWakeupEventEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrSetWorkspaceClientStyleEXT, EXT_spatial_workspace);
 #endif
