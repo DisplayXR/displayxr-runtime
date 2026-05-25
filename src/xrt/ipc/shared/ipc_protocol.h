@@ -423,6 +423,7 @@ enum ipc_workspace_input_event_type
 	IPC_WORKSPACE_INPUT_EVENT_MODAL_CLOSE         = 9, //!< spec_version 10: client's Win32 modal popup closed
 	IPC_WORKSPACE_INPUT_EVENT_FILE_PICKER_REQUEST = 10, //!< spec_version 11: client called xrRequestFilePickerEXT
 	IPC_WORKSPACE_INPUT_EVENT_FULLSCREEN_TOGGLED  = 11, //!< spec_version 15: client's fullscreen/maximize state transitioned
+	IPC_WORKSPACE_INPUT_EVENT_CLIENT_CONNECTED    = 12, //!< spec_version 16: client connected (slot bound); controller owns per-client setup
 };
 
 struct ipc_workspace_input_event
@@ -524,6 +525,10 @@ struct ipc_workspace_input_event
 			uint32_t client_id;
 			uint32_t is_fullscreen;     //!< XrBool32 semantics (1 = entered, 0 = restored)
 		} fullscreen_toggled;
+		struct                      //!< spec_version 16: client connected (slot bound)
+		{
+			uint32_t client_id;
+		} client_connected;
 	} u;
 };
 

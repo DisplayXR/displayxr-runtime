@@ -663,6 +663,9 @@ comp_ipc_client_compositor_workspace_enumerate_input_events(struct xrt_composito
 			out->fullscreenToggled.clientId = (XrWorkspaceClientId)src->u.fullscreen_toggled.client_id;
 			out->fullscreenToggled.isFullscreen = src->u.fullscreen_toggled.is_fullscreen ? XR_TRUE : XR_FALSE;
 			break;
+		case IPC_WORKSPACE_INPUT_EVENT_CLIENT_CONNECTED:
+			out->clientConnected.clientId = (XrWorkspaceClientId)src->u.client_connected.client_id;
+			break;
 		default:
 			break;
 		}

@@ -2566,7 +2566,12 @@ ipc_handle_workspace_set_window_pose(volatile struct ipc_client_state *_ics,
 	         client_id, pose->position.x, pose->position.y, pose->position.z,
 	         width_m, height_m);
 
-	// Capture clients use IDs >= 1000 (slot index = client_id - 1000)
+	// id >= 1000 is the slot-addressing form (slot = id - 1000). The setter
+	// is type-agnostic — it poses mc->clients[slot] regardless of client
+	// type — so this serves both capture clients (whose canonical id IS
+	// 1000+slot) and OpenXR clients addressed by slot (e.g. the
+	// CLIENT_NEEDS_POSE event carries 1000+slot). Canonical OpenXR ids
+	// (< 1000) take the find-by-id path below.
 	if (client_id >= 1000) {
 		int slot = (int)(client_id - 1000);
 		bool ok = comp_d3d11_service_set_capture_client_window_pose(
