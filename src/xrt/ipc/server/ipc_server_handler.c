@@ -2548,6 +2548,41 @@ ipc_handle_launcher_poll_click(volatile struct ipc_client_state *_ics,
 #endif
 }
 
+// #304 id-unification: workspace clients are addressed by the unified
+// "1000 + slot" id everywhere (enumerate / get_focused / events all use it).
+// Handlers whose bodies look a client up by the canonical IPC id call this
+// first to translate a 1000+slot id back to the canonical id. Pass-through
+// for ids that are already canonical (< 1000) or that don't resolve to a
+// live OpenXR slot (e.g. capture clients, which have no canonical id — those
+// handlers carry their own >= 1000 slot branch).
+static uint32_t
+ipc_workspace_normalize_client_id(struct ipc_server *s, uint32_t client_id)
+{
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (client_id >= 1000u && s != NULL && s->xsysc != NULL) {
+		int slot = (int)(client_id - 1000u);
+		os_mutex_lock(&s->global_state.lock);
+		uint32_t canon = 0;
+		for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+			volatile struct ipc_client_state *ics = &s->threads[i].ics;
+			if (ics->server_thread_index < 0 || ics->xc == NULL) {
+				continue;
+			}
+			if (comp_d3d11_service_workspace_find_slot_by_xc(
+			        s->xsysc, (struct xrt_compositor *)ics->xc) == slot) {
+				canon = ics->client_state.id;
+				break;
+			}
+		}
+		os_mutex_unlock(&s->global_state.lock);
+		if (canon != 0) {
+			return canon;
+		}
+	}
+#endif
+	return client_id;
+}
+
 xrt_result_t
 ipc_handle_workspace_set_window_pose(volatile struct ipc_client_state *_ics,
                                   uint32_t client_id,
@@ -2624,6 +2659,8 @@ ipc_handle_workspace_set_window_visibility(volatile struct ipc_client_state *_ic
 	if (s->xsysc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
+
+	client_id = ipc_workspace_normalize_client_id(s, client_id); // #304: accept 1000+slot
 
 	IPC_INFO(s, "Workspace: set_visibility client_id=%u visible=%d", client_id, visible);
 
@@ -2943,7 +2980,17 @@ ipc_handle_workspace_get_focused_client(volatile struct ipc_client_state *_ics, 
 	int idx = s->global_state.active_client_index;
 	if (idx >= 0 && idx < IPC_MAX_CLIENTS) {
 		volatile struct ipc_client_state *ics = &s->threads[idx].ics;
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+		// #304 id-unification: return the 1000+slot workspace id (matches
+		// enumerate + events), resolved from the active client's slot.
+		int slot = (s->xsysc != NULL && ics->xc != NULL)
+		    ? comp_d3d11_service_workspace_find_slot_by_xc(
+		          s->xsysc, (struct xrt_compositor *)ics->xc)
+		    : -1;
+		*out_client_id = (slot >= 0) ? (1000u + (uint32_t)slot) : 0;
+#else
 		*out_client_id = ics->client_state.id;
+#endif
 	}
 	os_mutex_unlock(&s->global_state.lock);
 
@@ -3204,6 +3251,22 @@ ipc_handle_workspace_enumerate_clients(volatile struct ipc_client_state *_ics, s
 		if (ics->server_thread_index < 0) {
 			continue;
 		}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+		// #304 id-unification: return the unified 1000+slot workspace id so
+		// it matches what the events report and what set_*/chrome accept.
+		// Clients not yet bound to a compositor slot (and the controller's
+		// own session, which has no slot) are skipped — they reappear once
+		// slotted, and they can't be posed/chromed/focused before that.
+		if (s->xsysc != NULL && ics->xc != NULL) {
+			int slot = comp_d3d11_service_workspace_find_slot_by_xc(
+			    s->xsysc, (struct xrt_compositor *)ics->xc);
+			if (slot < 0) {
+				continue;
+			}
+			list->ids[count++] = 1000u + (uint32_t)slot;
+			continue;
+		}
+#endif
 		list->ids[count++] = ics->client_state.id;
 	}
 	list->id_count = count;
@@ -3228,6 +3291,7 @@ ipc_handle_workspace_get_client_info(volatile struct ipc_client_state *_ics,
 	if (out_state == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
+	client_id = ipc_workspace_normalize_client_id(s, client_id); // #304: accept 1000+slot
 	xrt_result_t xret = ipc_server_get_client_app_state(s, client_id, out_state);
 	if (xret != XRT_SUCCESS) {
 		return xret;
@@ -3320,6 +3384,11 @@ ipc_handle_workspace_register_chrome_swapchain(volatile struct ipc_client_state 
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
+	// #304: accept the unified 1000+slot id. Normalize translates an OpenXR
+	// client's 1000+slot back to its canonical id (so the find-by-id below
+	// works); a capture client has no canonical id so it stays >= 1000 and
+	// hits the reject below (captures aren't decorated with chrome).
+	client_id = ipc_workspace_normalize_client_id(s, client_id);
 	int slot = -1;
 	if (client_id >= 1000u) {
 		// Capture clients aren't decorated with chrome — reject for now.
@@ -3390,6 +3459,7 @@ ipc_handle_workspace_set_chrome_layout(volatile struct ipc_client_state *_ics,
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
+	client_id = ipc_workspace_normalize_client_id(s, client_id); // #304: accept 1000+slot
 	int slot = -1;
 	if (client_id >= 1000u) {
 		IPC_WARN(s, "Workspace: set_chrome_layout - capture clients (id=%u) not supported", client_id);
@@ -3464,6 +3534,7 @@ ipc_handle_workspace_update_chrome_layer_pose(volatile struct ipc_client_state *
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
+	client_id = ipc_workspace_normalize_client_id(s, client_id); // #304: accept 1000+slot
 	if (client_id >= 1000u) {
 		IPC_WARN(s, "Workspace: update_chrome_layer_pose - capture clients (id=%u) not supported", client_id);
 		return XRT_ERROR_IPC_FAILURE;
