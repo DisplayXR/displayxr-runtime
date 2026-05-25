@@ -86,12 +86,12 @@ Top-level pin file. Bump a value here to roll the dev box forward:
 
 ```json
 {
-  "runtime":     "v1.4.0",
+  "runtime":     "v1.4.3",
   "shell":       "v1.2.5",
-  "leia_plugin": "v1.0.1",
-  "mcp_tools":   "v0.3.1",
+  "leia_plugin": "v1.0.3",
+  "mcp_tools":   "v0.3.2",
   "demos": {
-    "gaussiansplat": "v1.3.1"
+    "gaussiansplat": "v1.4.1"
   }
 }
 ```
@@ -116,7 +116,7 @@ cases.
 ### macOS
 
 ```bash
-gh release download v1.4.0 \
+gh release download v1.4.3 \
     --repo DisplayXR/displayxr-runtime \
     --pattern 'DisplayXR-Installer-*.pkg' \
     --dir /tmp/dxr
@@ -127,11 +127,11 @@ sudo installer -pkg /tmp/dxr/DisplayXR-Installer-*.pkg -target /
 
 ```bat
 :: From an elevated cmd
-gh release download v1.4.0 --repo DisplayXR/displayxr-runtime --pattern "DisplayXRSetup-*.exe" --dir %TEMP%\dxr
+gh release download v1.4.3 --repo DisplayXR/displayxr-runtime --pattern "DisplayXRSetup-*.exe" --dir %TEMP%\dxr
 %TEMP%\dxr\DisplayXRSetup-*.exe /S
 gh release download v1.2.5 --repo DisplayXR/displayxr-shell-releases --pattern "DisplayXRShellSetup-*.exe" --dir %TEMP%\dxr
 %TEMP%\dxr\DisplayXRShellSetup-*.exe /S
-gh release download v1.0.1 --repo DisplayXR/displayxr-leia-plugin --pattern "DisplayXRLeiaSRSetup-*.exe" --dir %TEMP%\dxr
+gh release download v1.0.3 --repo DisplayXR/displayxr-leia-plugin --pattern "DisplayXRLeiaSRSetup-*.exe" --dir %TEMP%\dxr
 %TEMP%\dxr\DisplayXRLeiaSRSetup-*.exe /S
 ```
 
