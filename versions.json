@@ -2,9 +2,9 @@
   "$schema": "https://json.schemastore.org/displayxr-versions.json",
   "runtime":     "v1.4.3",
   "shell":       "v1.2.5",
-  "leia_plugin": "v1.0.2",
+  "leia_plugin": "v1.0.3",
   "mcp_tools":   "v0.3.2",
   "demos": {
-    "gaussiansplat": "v1.3.1"
+    "gaussiansplat": "v1.4.1"
   }
 }

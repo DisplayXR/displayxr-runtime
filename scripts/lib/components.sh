@@ -60,9 +60,9 @@ COMPONENT_INSTALL_MARKER_WINDOWS_mcp_tools="HKLM\\Software\\DisplayXR\\Capabilit
 
 # --- gauss_demo ---
 # Gaussian-splat viewer demo. macOS .pkg first shipped in
-# displayxr-demo-gaussiansplat v1.4.0 (2026-05-24, #311). Windows installer
-# is built locally today; CI for the .exe is tracked at the demo repo's
-# issue #14. Note: the macOS install marker has a space in the path —
+# displayxr-demo-gaussiansplat v1.4.0 (2026-05-24, #311). Both installers
+# (macOS .pkg + Windows .exe) are now built + attached by CI on a v* tag
+# (demo #14). Note: the macOS install marker has a space in the path —
 # consumers must quote when testing existence.
 COMPONENT_REPO_gauss_demo="DisplayXR/displayxr-demo-gaussiansplat"
 COMPONENT_PKG_MACOS_gauss_demo="DisplayXRGaussianSplat-*.pkg"
