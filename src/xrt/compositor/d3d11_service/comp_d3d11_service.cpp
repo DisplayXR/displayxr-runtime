@@ -925,19 +925,13 @@ struct d3d11_multi_client_slot
 	//! worst applies last-frame's value for one call.
 	float frame_rate_cap_hz;
 
-	//! True when maximized (fills display, toggle restores pre_max state).
-	bool maximized;
-	//! spec_version 15: last-emitted snapshot for the FULLSCREEN_TOGGLED drain.
-	//! Per-slot delta-vs-shadow: drain compares `maximized` to this and emits
-	//! IPC_WORKSPACE_INPUT_EVENT_FULLSCREEN_TOGGLED on every transition so the
-	//! workspace controller can update focus / chrome / layout in response.
-	bool maximized_last_emitted;
-	struct xrt_pose pre_max_pose;
-	float pre_max_width_m;
-	float pre_max_height_m;
-
-	//! True when this window was auto-minimized by another window's fullscreen toggle.
-	bool fullscreen_minimized;
+	//! #307: True when this window was hidden by the controller via
+	//! xrSetWorkspaceClientVisibilityEXT (e.g. a maximize hiding the backdrop
+	//! windows), as opposed to user-minimized via the runtime MIN button. The
+	//! taskbar lists user-minimized windows only (`minimized && !controller_hidden`)
+	//! so controller-hidden windows don't pollute it. Maximize policy itself lives
+	//! in the controller (ADR-018) — the runtime only tracks the visibility bit.
+	bool controller_hidden;
 
 	//! spec_version 16 (#304): one-shot, set at register (slot-bind). The
 	//! drain emits one CLIENT_CONNECTED event per slot with this set, then
@@ -975,20 +969,6 @@ struct d3d11_multi_client_slot
 
 	//! App name for title bar display (from HWND title or fallback).
 	char app_name[128];
-
-	//! Animation state for smooth pose transitions.
-	struct
-	{
-		bool active;               //!< Animation in progress
-		struct xrt_pose start_pose; //!< Pose at animation start
-		struct xrt_pose target_pose; //!< Target pose
-		float start_width_m;       //!< Width at animation start
-		float start_height_m;      //!< Height at animation start
-		float target_width_m;      //!< Target width
-		float target_height_m;     //!< Target height
-		uint64_t start_ns;         //!< Monotonic timestamp at animation start
-		uint64_t duration_ns;      //!< Animation duration in nanoseconds
-	} anim;
 
 	//! Phase 2.C: controller-submitted chrome swapchain. The runtime composites
 	//! the swapchain image at the controller-specified pose every render, with
@@ -1198,17 +1178,9 @@ struct d3d11_multi_compositor
 		float start_pos_y;   //!< Window pose.position.y at drag start (meters)
 	} drag;
 
-	//! Momentary toast notification (e.g. "how to restore after fullscreen").
-	char toast_text[256];
-	uint64_t toast_until_ns;
-
 	//! Previous frame LMB/RMB state (for rising-edge detection).
 	bool prev_lmb_held;
 	bool prev_rmb_held;
-
-	//! Double-click detection for title bar maximize toggle.
-	DWORD last_title_click_time;
-	int32_t last_title_click_slot;
 
 	//! Font atlas for title bar text (DirectWrite-rendered, anti-aliased).
 	wil::com_ptr<ID3D11Texture2D> font_atlas;
@@ -1399,14 +1371,6 @@ bridge_relay_is_live_authoritative(struct d3d11_service_system *sys)
 	return false;
 }
 
-
-static void
-slot_animate_to(struct d3d11_multi_client_slot *slot,
-                const struct xrt_pose *target_pose,
-                float target_w, float target_h,
-                uint64_t now_ns, uint64_t duration_ns);
-
-#define ANIM_DURATION_NS (300ULL * 1000000ULL)
 
 /*!
  * Sync tile layout from the active rendering mode of the head device.
@@ -4829,8 +4793,7 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			mc->clients[i].chrome_swapchain_id = 0;
 			mc->clients[i].chrome_layout_valid = false;
 			mc->clients[i].chrome_region_count = 0;
-			mc->clients[i].maximized = false;
-			mc->clients[i].maximized_last_emitted = false;
+			mc->clients[i].controller_hidden = false;
 
 			// ADR-018 (#304): the runtime no longer picks an initial window
 			// layout (compute_grid_layout is gone). Register at a sentinel
@@ -4848,7 +4811,6 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			mc->clients[i].window_pose.position = {0, 0, 0};
 			mc->clients[i].window_width_m = disp_w_np * 0.30f;
 			mc->clients[i].window_height_m = disp_h_np * 0.30f;
-			mc->clients[i].anim.active = false;
 			mc->clients[i].announce_connected = true;
 			mc->clients[i].placed = false;
 			// #304 id-unification: the slot's permanent workspace client id is
@@ -5146,8 +5108,7 @@ multi_compositor_add_capture_client(struct d3d11_service_system *sys, HWND hwnd,
 			mc->clients[i].app_hwnd = hwnd;
 			mc->clients[i].active = true;
 			mc->clients[i].minimized = false;
-			mc->clients[i].maximized = false;
-			mc->clients[i].maximized_last_emitted = false;
+			mc->clients[i].controller_hidden = false;
 			mc->clients[i].hwnd_resize_pending = false;
 			mc->clients[i].frame_rate_cap_hz = 0.0f;
 
@@ -5211,7 +5172,6 @@ multi_compositor_add_capture_client(struct d3d11_service_system *sys, HWND hwnd,
 			mc->clients[i].window_pose.position = {0, 0, 0};
 			mc->clients[i].window_width_m = width_m;
 			mc->clients[i].window_height_m = height_m;
-			mc->clients[i].anim.active = false;
 			mc->clients[i].announce_connected = true;
 			// #304 id-unification: permanent workspace id = 1000 + slot. For
 			// capture clients this matches the id add_capture already returns.
@@ -6182,8 +6142,10 @@ workspace_raycast_hit_test(struct d3d11_service_system *sys,
 		// Pill is 75% of content width (centered) and floats above the
 		// content quad with a half-tb-height gap. Buttons live at the
 		// pill's right edge (not the content's right edge).
-		bool has_workspace_title_bar = (mc->clients[s].client_type != CLIENT_TYPE_CAPTURE &&
-		                            !mc->clients[s].maximized);
+		// #307: chrome (close/min/max) shows on a maximized window too, so the
+		// MAX button can restore it. Maximize is controller-owned now; the
+		// runtime no longer hides the title bar on maximize.
+		bool has_workspace_title_bar = (mc->clients[s].client_type != CLIENT_TYPE_CAPTURE);
 		const float PILL_W_FRAC_HT = 0.75f;
 		float pill_w_m = win_w * PILL_W_FRAC_HT;
 		float pill_left = win_x - pill_w_m / 2.0f;
@@ -6439,152 +6401,12 @@ quat_is_identity(const struct xrt_quat *q)
 #define M_PI 3.14159265358979323846
 #endif
 
-// ANIM_DURATION_NS defined earlier (forward declaration section).
-
-/*!
- * Ease-out cubic: fast start, smooth deceleration.
- * t in [0,1] → result in [0,1].
- */
-static inline float
-ease_out_cubic(float t)
-{
-	float f = 1.0f - t;
-	return 1.0f - f * f * f;
-}
-
-/*!
- * Start an animation on a slot toward a target pose + size.
- */
-static inline void
-slot_animate_to(struct d3d11_multi_client_slot *slot,
-                const struct xrt_pose *target_pose,
-                float target_w, float target_h,
-                uint64_t now_ns, uint64_t duration_ns)
-{
-	slot->anim.active = true;
-	slot->anim.start_pose = slot->window_pose;
-	slot->anim.target_pose = *target_pose;
-	slot->anim.start_width_m = slot->window_width_m;
-	slot->anim.start_height_m = slot->window_height_m;
-	slot->anim.target_width_m = target_w;
-	slot->anim.target_height_m = target_h;
-	slot->anim.start_ns = now_ns;
-	slot->anim.duration_ns = duration_ns;
-}
-
-/*!
- * Tick animation for a slot. Returns true if animation is still running.
- * Updates window_pose and window_width/height_m with interpolated values.
- */
-static inline bool
-slot_animate_tick(struct d3d11_multi_client_slot *slot, uint64_t now_ns)
-{
-	if (!slot->anim.active) return false;
-
-	uint64_t elapsed = now_ns - slot->anim.start_ns;
-	float t = (float)elapsed / (float)slot->anim.duration_ns;
-	if (t >= 1.0f) {
-		t = 1.0f;
-		slot->anim.active = false;
-	}
-	float eased = ease_out_cubic(t);
-
-	// Interpolate pose (lerp position, slerp orientation)
-	math_pose_interpolate(&slot->anim.start_pose, &slot->anim.target_pose,
-	                      eased, &slot->window_pose);
-
-	// Interpolate dimensions
-	slot->window_width_m = slot->anim.start_width_m +
-	    eased * (slot->anim.target_width_m - slot->anim.start_width_m);
-	slot->window_height_m = slot->anim.start_height_m +
-	    eased * (slot->anim.target_height_m - slot->anim.start_height_m);
-
-	return slot->anim.active; // true = still running
-}
-
-/*!
- * Toggle fullscreen for a given slot. On fullscreen: animate to fill entire
- * display (no title bar), hide all other windows. On restore: animate back,
- * unhide others.
- */
-static void
-toggle_fullscreen(struct d3d11_service_system *sys,
-                  struct d3d11_multi_compositor *mc,
-                  int slot)
-{
-	if (mc == nullptr || slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS ||
-	    !mc->clients[slot].active) {
-		return;
-	}
-
-	float disp_w_m = sys->base.info.display_width_m;
-	float disp_h_m = sys->base.info.display_height_m;
-	if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
-	if (disp_h_m <= 0.0f) disp_h_m = 0.394f;
-	uint64_t now_ns = os_monotonic_get_ns();
-
-	if (mc->clients[slot].maximized) {
-		// Restore from fullscreen (animated)
-		slot_animate_to(&mc->clients[slot],
-		                &mc->clients[slot].pre_max_pose,
-		                mc->clients[slot].pre_max_width_m,
-		                mc->clients[slot].pre_max_height_m,
-		                now_ns, ANIM_DURATION_NS);
-		mc->clients[slot].maximized = false;
-		mc->toast_until_ns = 0; // dismiss restore hint
-		// Un-hide windows that were hidden by fullscreen
-		for (int j = 0; j < D3D11_MULTI_MAX_CLIENTS; j++) {
-			if (mc->clients[j].fullscreen_minimized) {
-				mc->clients[j].minimized = false;
-				mc->clients[j].fullscreen_minimized = false;
-			}
-		}
-		U_LOG_W("Multi-comp: restore slot %d from fullscreen", slot);
-	} else {
-		// Save current state
-		mc->clients[slot].pre_max_pose = mc->clients[slot].window_pose;
-		mc->clients[slot].pre_max_width_m = mc->clients[slot].window_width_m;
-		mc->clients[slot].pre_max_height_m = mc->clients[slot].window_height_m;
-		// Animate to fill entire display (no margins, no title bar)
-		struct xrt_pose max_pose = {};
-		max_pose.orientation.w = 1.0f;
-		max_pose.position.x = 0;
-		max_pose.position.y = 0;
-		max_pose.position.z = 0;
-		slot_animate_to(&mc->clients[slot],
-		                &max_pose,
-		                disp_w_m,
-		                disp_h_m,
-		                now_ns, ANIM_DURATION_NS);
-		mc->clients[slot].maximized = true;
-		// Show restore hint toast for 3 seconds
-		snprintf(mc->toast_text, sizeof(mc->toast_text),
-		         "Press F11 or Esc to restore");
-		mc->toast_until_ns = os_monotonic_get_ns() + 3000000000ULL;
-		// Hide all other windows
-		for (int j = 0; j < D3D11_MULTI_MAX_CLIENTS; j++) {
-			if (j != slot && mc->clients[j].active && !mc->clients[j].minimized) {
-				mc->clients[j].minimized = true;
-				mc->clients[j].fullscreen_minimized = true;
-			}
-		}
-		U_LOG_W("Multi-comp: fullscreen slot %d", slot);
-	}
-
-	// ADR-018: the runtime no longer focuses the toggled client. PR A
-	// added the FULLSCREEN_TOGGLED workspace event (emitted from the
-	// drain on the maximized transition); the controller reacts by
-	// calling xrSetWorkspaceFocusedClientEXT. Input forwarding is
-	// re-applied here against the current (controller-set) focus.
-	multi_compositor_update_input_forward(mc);
-
-	// Update window layer's ESC-suppression flag
-	bool any_max = false;
-	for (int j = 0; j < D3D11_MULTI_MAX_CLIENTS; j++) {
-		if (mc->clients[j].active && mc->clients[j].maximized) { any_max = true; break; }
-	}
-	comp_d3d11_window_set_any_maximized(mc->window, any_max);
-}
+// #307: the maximize/fullscreen state machine (toggle_fullscreen) and its
+// ease helpers (ease_out_cubic / slot_animate_to / slot_animate_tick) moved to
+// the workspace controller (ADR-018). The controller drives maximize via
+// xrSetWorkspaceClientWindowPoseEXT (with its own ease) + xrSetWorkspaceClient-
+// VisibilityEXT (hide the backdrop windows). The runtime keeps only the
+// mechanism.
 
 /*!
  * Update the SRV for a capture client slot.
@@ -6915,27 +6737,11 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		}
 	}
 
-	// F11: toggle fullscreen for the focused window
-	if (GetAsyncKeyState(VK_F11) & 1) {
-		if (mc->focused_slot >= 0) {
-			// Phase 2.K: keyboard shortcut routes through the helper too.
-			// Pass !maximized to flip the current state (the helper
-			// no-ops if the requested state already matches).
-			bool current_max = mc->clients[mc->focused_slot].maximized;
-			comp_d3d11_service_workspace_request_fullscreen_by_slot(
-			    (struct xrt_system_compositor *)sys, mc->focused_slot, !current_max);
-		}
-	}
-
-	// ESC: restore maximized window (if any) before doing anything else
-	if (GetAsyncKeyState(VK_ESCAPE) & 1) {
-		for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
-			if (mc->clients[i].active && mc->clients[i].maximized) {
-				toggle_fullscreen(sys, mc, i);
-				break;
-			}
-		}
-	}
+	// #307: F11 (maximize toggle) and ESC (restore) are no longer intercepted
+	// here. Both flow to the controller as workspace KEY events (pushed by
+	// comp_d3d11_window before any forwarding), which owns the maximize policy
+	// (ADR-018) and drives it via set_pose / set_visibility. ESC for a
+	// non-maximized, no-focus workspace is still swallowed in comp_d3d11_window.
 
 	// Screenshot: triggered by F12 key (kept for interactive use).
 
@@ -7078,7 +6884,9 @@ after_key_shortcuts:
 			bool in_title_bar = hit.in_title_bar;
 			bool in_close_btn = hit.in_close_btn;
 			bool in_minimize_btn = hit.in_minimize_btn;
-			bool in_maximize_btn = hit.in_maximize_btn;
+			// #307: the maximize button is handled by the controller via the
+			// chrome-region POINTER event (SHELL_CHROME_REGION_MAX); the runtime
+			// no longer toggles maximize on the in_maximize_btn hit locally.
 
 			// Debug: log click coordinates and hit results
 			if (hit_slot >= 0 && in_title_bar) {
@@ -7106,8 +6914,6 @@ after_key_shortcuts:
 						U_LOG_W("Multi-comp: close button → exit request for slot %d", hit_slot);
 					}
 				}
-			} else if (in_maximize_btn && hit_slot >= 0) {
-				toggle_fullscreen(sys, mc, hit_slot);
 			} else if (in_minimize_btn && hit_slot >= 0) {
 				// Minimize button: hide window
 				mc->clients[hit_slot].minimized = true;
@@ -7120,23 +6926,13 @@ after_key_shortcuts:
 					multi_compositor_update_input_forward(mc);
 				}
 			} else if (in_title_bar && hit_slot >= 0) {
-				// Double-click title bar → toggle maximize
-				DWORD now = GetTickCount();
-				bool is_double_click = (hit_slot == mc->last_title_click_slot &&
-				                        (now - mc->last_title_click_time) < 400);
-				mc->last_title_click_time = now;
-				mc->last_title_click_slot = hit_slot;
-
-				if (is_double_click) {
-					toggle_fullscreen(sys, mc, hit_slot);
-				}
-				// ADR-018: single-click title-bar focus is the controller's
-				// call now (it was the last runtime self-focus on the title
-				// bar; drag already moved in an earlier slice). The runtime
-				// emits the POINTER event and the shell calls
-				// xrSetWorkspaceFocusedClientEXT. Double-click → maximize
-				// stays here (fullscreen state machine is runtime-owned; PR A
-				// added the FULLSCREEN_TOGGLED event the controller focuses on).
+				// #307: title-bar clicks are window-management chrome —
+				// focus, drag, and double-click→maximize are all the
+				// controller's job now (ADR-018). It reacts to the POINTER
+				// event (grip region) with its own focus / drag / maximize
+				// policy. The runtime keeps this branch only to NOT forward a
+				// title-bar click to the app as a content click (the `else`
+				// below).
 			} else {
 				// Content area click or taskbar click
 				if (hit_slot < 0) {
@@ -7506,39 +7302,11 @@ after_key_shortcuts:
 	(void)display_w_m;
 	(void)display_h_m;
 
-	// Tick per-slot animations. The entry grow-in moved to the controller
-	// (#306); what remains here is the maximize/restore ease (toggle_fullscreen,
-	// moves to the controller in #307). Phase 2.G: layout-preset state machine
-	// already moved to the controller, so this no longer skips on "dynamic".
-	{
-		uint64_t anim_now = os_monotonic_get_ns();
-		bool focused_rect_changed = false;
-		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
-			if (!mc->clients[s].active || !mc->clients[s].anim.active) continue;
-			bool still_running = slot_animate_tick(&mc->clients[s], anim_now);
-			slot_pose_to_pixel_rect(sys, &mc->clients[s],
-			                        &mc->clients[s].window_rect_x,
-			                        &mc->clients[s].window_rect_y,
-			                        &mc->clients[s].window_rect_w,
-			                        &mc->clients[s].window_rect_h);
-			mc->clients[s].hwnd_resize_pending = true;
-			if (s == mc->focused_slot) focused_rect_changed = true;
-			(void)still_running;
-		}
-		// Keep the window layer's input-forward rect in sync with the
-		// focused slot's current pose. Without this, the forwarder is
-		// pinned to the rect that was valid at register_client time
-		// (initial tiny spawn at (0,0,0)), so clicks inside the
-		// actually-rendered window fall outside the forward rect and
-		// never reach the app. First click misses, then MOUSEMOVE with
-		// the button held crosses into the stale rect and gets forwarded
-		// without a paired LBUTTONDOWN — the app sees a drag with no
-		// click. Title-bar drag masks the bug because it also calls
-		// update_input_forward at the end.
-		if (focused_rect_changed) {
-			multi_compositor_update_input_forward(mc);
-		}
-	}
+	// #307: the per-slot animation tick is gone. The only remaining animation
+	// was the maximize/restore ease, which moved to the controller (the entry
+	// grow-in moved in #306, layout presets in Phase 2.G). The controller now
+	// drives all window motion via per-frame xrSetWorkspaceClientWindowPoseEXT,
+	// which already refreshes the input-forward rect (set_client_window_pose).
 
 	// Per-frame tick for the workspace mode-flip state machine (#234). Owns
 	// the WAITING_ACK -> FLIPPING and FLIPPING -> IDLE transitions and the
@@ -8719,12 +8487,13 @@ after_key_shortcuts:
 		sys->context->RSSetScissorRects(1, &full_scissor);
 	}
 
-	// Draw taskbar at bottom if any windows are user-minimized (not fullscreen-hidden)
+	// Draw taskbar at bottom if any windows are user-minimized (not hidden by
+	// the controller, e.g. a maximize hiding the backdrop windows — #307).
 	{
 		bool has_minimized = false;
 		for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
 			if (mc->clients[i].active && mc->clients[i].minimized &&
-			    !mc->clients[i].fullscreen_minimized) {
+			    !mc->clients[i].controller_hidden) {
 				has_minimized = true;
 				break;
 			}
@@ -8883,121 +8652,11 @@ after_key_shortcuts:
 		}
 	}
 
-	// Toast notification overlay (momentary centered message).
-	if (mc->toast_until_ns > 0 && mc->font_atlas_srv && sys->blit_vs && sys->blit_ps) {
-		uint64_t now_ns = os_monotonic_get_ns();
-		if (now_ns < mc->toast_until_ns) {
-			uint32_t ca_w = sys->base.info.display_pixel_width;
-			uint32_t ca_h = sys->base.info.display_pixel_height;
-			if (ca_w == 0) ca_w = 3840;
-			if (ca_h == 0) ca_h = 2160;
-			uint32_t half_w, half_h;
-			resolve_active_view_dims(sys, ca_w, ca_h, &half_w, &half_h);
-			uint32_t num_views = sys->tile_columns * sys->tile_rows;
-
-			const float scale = 2.0f; // 2x glyph size for toast
-			float gh = (float)mc->font_glyph_h * scale;
-			float pad_px = 12.0f;
-			float toast_h = gh + pad_px * 2.0f;
-
-			// Measure total text width
-			const char *txt = mc->toast_text;
-			float total_w = 0;
-			for (int ci = 0; txt[ci] != '\0' && ci < 80; ci++) {
-				unsigned char ch = (unsigned char)txt[ci];
-				if (ch < 0x20 || ch > 0x7E) ch = '?';
-				total_w += mc->glyph_advances[ch - 0x20] * scale;
-			}
-			float toast_w = total_w + pad_px * 2.0f;
-
-			// Pipeline setup
-			sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
-			sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
-			sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-			sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-			ID3D11RenderTargetView *t_rtvs[] = {mc->combined_atlas_rtv.get()};
-			sys->context->OMSetRenderTargets(1, t_rtvs, nullptr);
-			sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-			sys->context->IASetInputLayout(nullptr);
-			sys->context->RSSetState(sys->rasterizer_state.get());
-			sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
-			D3D11_VIEWPORT t_vp = {};
-			t_vp.Width = (float)ca_w; t_vp.Height = (float)ca_h; t_vp.MaxDepth = 1.0f;
-			sys->context->RSSetViewports(1, &t_vp);
-
-			for (uint32_t v = 0; v < num_views && v < XRT_MAX_VIEWS; v++) {
-				uint32_t col = v % sys->tile_columns;
-				uint32_t row = v / sys->tile_columns;
-				float vx = (float)(col * half_w);
-				float vy = (float)(row * half_h);
-
-				float bg_x = vx + ((float)half_w - toast_w) * 0.5f;
-				float bg_y = vy + ((float)half_h - toast_h) * 0.5f;
-
-				// Semi-transparent dark background
-				sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
-				D3D11_MAPPED_SUBRESOURCE mapped;
-				if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
-				              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-					BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
-					cb->src_rect[0] = 0.08f; cb->src_rect[1] = 0.08f;
-					cb->src_rect[2] = 0.10f; cb->src_rect[3] = 0.82f;
-					cb->src_size[0] = 1; cb->src_size[1] = 1;
-					cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
-					cb->convert_srgb = 2.0f;
-					cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
-					cb->quad_mode = 0;
-					cb->dst_offset[0] = bg_x; cb->dst_offset[1] = bg_y;
-					cb->dst_rect_wh[0] = toast_w; cb->dst_rect_wh[1] = toast_h;
-					cb->corner_radius = 0.3f;
-					cb->corner_aspect = toast_w / toast_h;
-					cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
-					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-					sys->context->Draw(4, 0);
-				}
-
-				// Text glyphs
-				ID3D11ShaderResourceView *font_srv = mc->font_atlas_srv.get();
-				sys->context->PSSetShaderResources(0, 1, &font_srv);
-				sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
-
-				float cursor_x = bg_x + pad_px;
-				float text_y = bg_y + pad_px;
-				for (int ci = 0; txt[ci] != '\0' && ci < 80; ci++) {
-					unsigned char ch = (unsigned char)txt[ci];
-					if (ch < 0x20 || ch > 0x7E) ch = '?';
-					int gi = ch - 0x20;
-					float src_x = 0;
-					for (int p = 0; p < gi; p++) src_x += mc->glyph_advances[p];
-					float src_gw = mc->glyph_advances[gi];
-					float dst_gw = src_gw * scale;
-					if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
-					              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-						BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
-						cb->src_rect[0] = src_x; cb->src_rect[1] = 0;
-						cb->src_rect[2] = src_gw; cb->src_rect[3] = (float)mc->font_glyph_h;
-						cb->src_size[0] = (float)mc->font_atlas_w;
-						cb->src_size[1] = (float)mc->font_atlas_h;
-						cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
-						cb->convert_srgb = 0.0f;
-						cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
-						cb->quad_mode = 0;
-						cb->dst_offset[0] = cursor_x; cb->dst_offset[1] = text_y;
-						cb->dst_rect_wh[0] = dst_gw; cb->dst_rect_wh[1] = gh;
-						cb->corner_radius = 0; cb->corner_aspect = 0;
-						cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
-						sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-						sys->context->Draw(4, 0);
-					}
-					cursor_x += dst_gw;
-				}
-			}
-			sys->context->OMSetBlendState(sys->blend_opaque.get(), nullptr, 0xFFFFFFFF);
-			sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
-		} else {
-			mc->toast_until_ns = 0; // expired — clear
-		}
-	}
+	// #307: the "Press F11 or Esc to restore" toast was dropped. Maximize is
+	// controller-owned now (ADR-018); restore is discoverable via the MAX chrome
+	// button (a real toggle), ESC, F11, and double-click. Rendering a toast
+	// controller-side would need a display-spanning overlay swapchain — deferred
+	// to the slice that moves the taskbar.
 
 	// Phase 5.7 + 5.8: spatial launcher panel.
 	// Drawn at (0,0,0) in display coordinates — zero-disparity plane — so it
@@ -13355,13 +13014,6 @@ comp_d3d11_service_set_client_window_pose(struct xrt_system_compositor *xsysc,
 	// starts compositing it from here (gated with first-frame-committed).
 	mc->clients[slot].placed = true;
 
-	// Cancel any in-flight slot animation (e.g. an in-progress maximize/restore
-	// ease). Without this, slot_animate_tick keeps interpolating from the
-	// animation's original start→target every frame and overwrites the pose we
-	// just snapped, so the controller's set_pose appears to do nothing until
-	// the animation completes.
-	mc->clients[slot].anim.active = false;
-
 	// Recompute pixel rect from pose
 	slot_pose_to_pixel_rect(sys, &mc->clients[slot],
 	                        &mc->clients[slot].window_rect_x,
@@ -13438,6 +13090,12 @@ comp_d3d11_service_set_client_visibility(struct xrt_system_compositor *xsysc,
 	if (slot < 0) return false;
 
 	mc->clients[slot].minimized = !visible;
+	// #307: a controller-driven hide (e.g. maximize hiding the backdrop windows)
+	// is NOT a user-minimize, so the taskbar must ignore it. Tag it controller_hidden
+	// so the taskbar gate (minimized && !controller_hidden) excludes it; the
+	// runtime MIN button leaves this flag clear so user-minimized windows still
+	// show in the taskbar.
+	mc->clients[slot].controller_hidden = !visible;
 	U_LOG_W("Workspace: set_visibility slot %d visible=%d", slot, visible);
 
 	if (!visible && slot == mc->focused_slot) {
@@ -14029,30 +13687,9 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 		}
 	}
 
-	// spec_version 15: FULLSCREEN_TOGGLED on per-slot maximized transition.
-	// Runtime-driven (double-click title bar, F11, xrRequestWorkspaceClientFullscreenEXT).
-	// The workspace controller typically wants to focus the toggled client when
-	// it enters fullscreen — focus policy lives in the controller (ADR-018), so
-	// the runtime emits the event and the controller calls
-	// xrSetWorkspaceFocusedClientEXT in response. Includes capture clients (they
-	// can be maximized too); client_id uses the same `1000 + slot` slot-based id
-	// the pointer / focus_changed events use.
-	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS &&
-	     out_batch->count < IPC_WORKSPACE_INPUT_EVENT_BATCH_MAX; s++) {
-		struct d3d11_multi_client_slot *cs = &mc->clients[s];
-		if (!cs->active) continue;
-		if (cs->maximized == cs->maximized_last_emitted) continue;
-
-		struct ipc_workspace_input_event *ev = &out_batch->events[out_batch->count];
-		memset(ev, 0, sizeof(*ev));
-		ev->event_type = IPC_WORKSPACE_INPUT_EVENT_FULLSCREEN_TOGGLED;
-		ev->timestamp_ms = (uint32_t)GetTickCount();
-		ev->u.fullscreen_toggled.client_id = 1000u + (uint32_t)s;
-		ev->u.fullscreen_toggled.is_fullscreen = cs->maximized ? 1u : 0u;
-		out_batch->count++;
-
-		cs->maximized_last_emitted = cs->maximized;
-	}
+	// #307: FULLSCREEN_TOGGLED is no longer emitted — the maximize state machine
+	// moved to the controller (ADR-018), which drives maximize itself and focuses
+	// the client directly. The IPC/XR enum constant is retained for ABI stability.
 
 	// spec_version 16 (#304): CLIENT_CONNECTED, one-shot per slot set at
 	// register (slot-bind). The runtime no longer owns per-client policy —
@@ -14205,10 +13842,12 @@ comp_d3d11_service_workspace_request_fullscreen_by_slot(struct xrt_system_compos
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
-	bool currently_max = mc->clients[slot].maximized;
-	if (fullscreen != currently_max) {
-		toggle_fullscreen(sys, mc, slot);
-	}
+	// #307: maximize is owned by the workspace controller now (ADR-018), the
+	// same way display-mode is workspace-owned. xrRequestWorkspaceClientFullscreenEXT
+	// is a no-op for workspace clients — an app cannot self-maximize; the
+	// controller decides (MAX button / F11 / double-click) and drives it via
+	// set_pose + set_visibility. Kept as a successful no-op to preserve the API.
+	(void)fullscreen;
 	return XRT_SUCCESS;
 }
 
@@ -15038,13 +14677,11 @@ comp_d3d11_service_set_capture_client_window_pose(struct xrt_system_compositor *
 	// so it updates its window dims (Kooima physical screen size + render
 	// resolution). Without it the app keeps rendering at its launch size,
 	// scaled into a moved/resized tile, and its window-relative projection goes
-	// stale. Restore that for non-capture clients (also cancel any in-flight
-	// maximize/restore ease the controller is overriding, and refresh the
-	// focused slot's input-forward rect so clicks track the moved/resized
-	// tile). Capture clients resize their source HWND on their own edge-drag
-	// schedule, so leave them untouched here.
+	// stale. Restore that for non-capture clients (and refresh the focused
+	// slot's input-forward rect so clicks track the moved/resized tile).
+	// Capture clients resize their source HWND on their own edge-drag schedule,
+	// so leave them untouched here.
 	if (mc->clients[slot_index].client_type != CLIENT_TYPE_CAPTURE) {
-		mc->clients[slot_index].anim.active = false;
 		mc->clients[slot_index].hwnd_resize_pending = true;
 		if (slot_index == mc->focused_slot) {
 			multi_compositor_update_input_forward(mc);
