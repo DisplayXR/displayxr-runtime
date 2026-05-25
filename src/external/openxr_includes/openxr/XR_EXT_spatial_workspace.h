@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_spatial_workspace 1
-#define XR_EXT_spatial_workspace_SPEC_VERSION 15
+#define XR_EXT_spatial_workspace_SPEC_VERSION 16
 #define XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_EXT_spatial_workspace"
 
 // Provisional XrStructureType values. The 1000999100..107 range is reserved for
@@ -344,6 +344,7 @@ typedef enum XrWorkspaceInputEventTypeEXT {
     XR_WORKSPACE_INPUT_EVENT_MODAL_CLOSE_EXT     = 9, // spec_version 10: client's last Win32 modal popup closed (refcounted, fires on 1→0 only)
     XR_WORKSPACE_INPUT_EVENT_FILE_PICKER_REQUEST_EXT = 10, // spec_version 11: a workspace client called xrRequestFilePickerEXT — fetch full info via xrGetFilePickerRequestEXT, deliver result via xrCompleteFilePickerEXT
     XR_WORKSPACE_INPUT_EVENT_FULLSCREEN_TOGGLED_EXT  = 11, // spec_version 15: a workspace client's fullscreen/maximize state transitioned (runtime-driven, e.g. double-click title bar or F11)
+    XR_WORKSPACE_INPUT_EVENT_CLIENT_CONNECTED_EXT    = 12, // spec_version 16: a client connected (slot bound). The controller owns ALL per-client setup — initial pose (xrSetWorkspaceClientWindowPoseEXT), and over time chrome / style / focus / entry animation. The runtime does not draw the client until the controller has placed it (set_pose), so there is no flash regardless of controller latency.
     XR_WORKSPACE_INPUT_EVENT_TYPE_MAX_ENUM_EXT  = 0x7FFFFFFF
 } XrWorkspaceInputEventTypeEXT;
 
@@ -473,6 +474,18 @@ typedef struct XrWorkspaceInputEventEXT {
             XrWorkspaceClientId     clientId;
             XrBool32                isFullscreen;  // XR_TRUE on enter, XR_FALSE on restore
         } fullscreenToggled;
+        struct {  // spec_version 16: a client connected and its slot is
+            // bound. The runtime no longer owns per-client policy (ADR-018):
+            // the controller responds by placing the client
+            // (xrSetWorkspaceClientWindowPoseEXT) and, per its own design,
+            // creating chrome, pushing style, choosing focus, and driving the
+            // entry animation. The runtime will NOT composite the client
+            // until the controller has placed it (first set_pose) AND it has
+            // committed a frame — so the controller's latency never produces
+            // a flash, and set_pose on this event is race-free (the slot is
+            // already bound when the event fires).
+            XrWorkspaceClientId     clientId;
+        } clientConnected;
     };
 } XrWorkspaceInputEventEXT;
 

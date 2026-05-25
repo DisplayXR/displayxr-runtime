@@ -939,6 +939,21 @@ struct d3d11_multi_client_slot
 	//! True when this window was auto-minimized by another window's fullscreen toggle.
 	bool fullscreen_minimized;
 
+	//! spec_version 16 (#304): one-shot, set at register (slot-bind). The
+	//! drain emits one CLIENT_CONNECTED event per slot with this set, then
+	//! clears it; the controller responds with per-client setup (place via
+	//! xrSetWorkspaceClientWindowPoseEXT, chrome, style, focus). Race-free —
+	//! the slot is bound before the event fires.
+	bool announce_connected;
+
+	//! spec_version 16 (#304): the controller has placed this client (called
+	//! set_pose at least once). The runtime no longer picks an initial pose,
+	//! so it must NOT composite the slot until the controller has placed it —
+	//! multi_compositor_render gates drawing on placed && has_first_frame_
+	//! committed. Flips true on the first set_client_window_pose; structural
+	//! flash/race fix (controller latency can never show an unplaced client).
+	bool placed;
+
 	//! True after the IPC client has committed at least one projection layer
 	//! since slot registration. Until then, multi_compositor_render skips
 	//! drawing this slot entirely — the per-client atlas is uninitialized and
@@ -1385,12 +1400,6 @@ bridge_relay_is_live_authoritative(struct d3d11_service_system *sys)
 	return false;
 }
 
-// Forward declarations — defined later, used by client registration code.
-static void
-compute_grid_layout(const struct d3d11_service_system *sys,
-                    int n, int idx,
-                    float *out_x, float *out_y, float *out_z,
-                    float *out_w, float *out_h);
 
 static void
 slot_animate_to(struct d3d11_multi_client_slot *slot,
@@ -4824,42 +4833,27 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			mc->clients[i].maximized = false;
 			mc->clients[i].maximized_last_emitted = false;
 
-			// Count active clients to determine grid position
-			int active_count = 0;
-			for (int j = 0; j < D3D11_MULTI_MAX_CLIENTS; j++) {
-				if (mc->clients[j].active) active_count++;
-			}
-			// Include this new client in the count
-			active_count++;
-
-			float center_x_m, center_y_m, center_z_m, grid_w, grid_h;
-			compute_grid_layout(sys, active_count, active_count - 1,
-			                    &center_x_m, &center_y_m, &center_z_m, &grid_w, &grid_h);
-
-			// Entry animation: start from center (small), animate to target position.
+			// ADR-018 (#304): the runtime no longer picks an initial window
+			// layout (compute_grid_layout is gone). Register at a sentinel
+			// pose, mark the slot unplaced, and announce CLIENT_CONNECTED so
+			// the controller owns placement (grid / cascade / PIP / restored
+			// last-known) via xrSetWorkspaceClientWindowPoseEXT. The slot is
+			// NOT composited until placed && first-frame-committed, so the
+			// sentinel is never shown. The grow-in entry animation moves to
+			// the controller (#306).
+			float disp_w_np = sys->base.info.display_width_m;
+			float disp_h_np = sys->base.info.display_height_m;
+			if (disp_w_np <= 0.0f) disp_w_np = 0.700f;
+			if (disp_h_np <= 0.0f) disp_h_np = 0.394f;
 			mc->clients[i].window_pose.orientation = {0, 0, 0, 1};
 			mc->clients[i].window_pose.position = {0, 0, 0};
-			mc->clients[i].window_width_m = grid_w * 0.3f; // start small
-			mc->clients[i].window_height_m = grid_h * 0.3f;
+			mc->clients[i].window_width_m = disp_w_np * 0.30f;
+			mc->clients[i].window_height_m = disp_h_np * 0.30f;
+			mc->clients[i].anim.active = false;
+			mc->clients[i].announce_connected = true;
+			mc->clients[i].placed = false;
 
-			// Entry animation: grow from center to target position
-			struct xrt_pose target = {};
-			target.orientation.w = 1.0f;
-			target.position.x = center_x_m;
-			target.position.y = center_y_m;
-			target.position.z = center_z_m;
-			// Use inline animation setup (slot_animate_to is defined later in file)
-			mc->clients[i].anim.active = true;
-			mc->clients[i].anim.start_pose = mc->clients[i].window_pose;
-			mc->clients[i].anim.target_pose = target;
-			mc->clients[i].anim.start_width_m = grid_w * 0.3f;
-			mc->clients[i].anim.start_height_m = grid_h * 0.3f;
-			mc->clients[i].anim.target_width_m = grid_w;
-			mc->clients[i].anim.target_height_m = grid_h;
-			mc->clients[i].anim.start_ns = os_monotonic_get_ns();
-			mc->clients[i].anim.duration_ns = 400ULL * 1000000ULL; // 400ms
-
-			// Compute pixel rect from initial (small) pose
+			// Compute pixel rect from the sentinel pose.
 			slot_pose_to_pixel_rect(sys, &mc->clients[i],
 			                        &mc->clients[i].window_rect_x,
 			                        &mc->clients[i].window_rect_y,
@@ -5204,50 +5198,25 @@ multi_compositor_add_capture_client(struct d3d11_service_system *sys, HWND hwnd,
 			if (width_m < 0.04f) width_m = 0.04f;
 			if (height_m < 0.04f) height_m = 0.04f;
 
-			// Count active clients to determine grid position
-			int active_count = 0;
-			for (int j = 0; j < D3D11_MULTI_MAX_CLIENTS; j++) {
-				if (mc->clients[j].active) active_count++;
-			}
-			// Include this new client in the count
-			active_count++;
-
-			float center_x_m, center_y_m, center_z_m, grid_w, grid_h;
-			compute_grid_layout(sys, active_count, active_count - 1,
-			                    &center_x_m, &center_y_m, &center_z_m, &grid_w, &grid_h);
-
-			// Maintain aspect ratio: fit within grid cell
-			float aspect = (height_m > 0.001f) ? width_m / height_m : 1.0f;
-			if (grid_w / aspect > grid_h) {
-				// Height-limited: scale by height
-				width_m = grid_h * aspect;
-				height_m = grid_h;
-			} else {
-				// Width-limited: scale by width
-				height_m = grid_w / aspect;
-				width_m = grid_w;
-			}
-
-			// Entry animation: start from center (small), animate to target position
+			// ADR-018 (#304): no runtime grid placement. Register the capture
+			// client at a sentinel pose (centered, intrinsic aspect-correct
+			// size from the clamp above), mark it unplaced, and announce
+			// CLIENT_CONNECTED; the controller places it. Not composited until
+			// placed && first-frame-committed. No entry animation (→ #306).
 			mc->clients[i].window_pose.orientation = {0, 0, 0, 1};
 			mc->clients[i].window_pose.position = {0, 0, 0};
-			mc->clients[i].window_width_m = width_m * 0.3f;
-			mc->clients[i].window_height_m = height_m * 0.3f;
-
-			struct xrt_pose target = {};
-			target.orientation.w = 1.0f;
-			target.position.x = center_x_m;
-			target.position.y = center_y_m;
-			target.position.z = center_z_m;
-			mc->clients[i].anim.active = true;
-			mc->clients[i].anim.start_pose = mc->clients[i].window_pose;
-			mc->clients[i].anim.target_pose = target;
-			mc->clients[i].anim.start_width_m = width_m * 0.3f;
-			mc->clients[i].anim.start_height_m = height_m * 0.3f;
-			mc->clients[i].anim.target_width_m = width_m;
-			mc->clients[i].anim.target_height_m = height_m;
-			mc->clients[i].anim.start_ns = os_monotonic_get_ns();
-			mc->clients[i].anim.duration_ns = 400ULL * 1000000ULL;
+			mc->clients[i].window_width_m = width_m;
+			mc->clients[i].window_height_m = height_m;
+			mc->clients[i].anim.active = false;
+			mc->clients[i].announce_connected = true;
+			// Capture clients are controller-chosen (added via add_capture) and
+			// the controller already knows them; start them placed so the
+			// dormant 2D-capture path keeps drawing at the sentinel rather than
+			// vanishing behind the placed-gate. The placed-gate's flash-
+			// prevention targets auto-connecting OpenXR clients. (When 2D
+			// capture is re-enabled, the controller should pose captures on
+			// CLIENT_CONNECTED like any other client — follow-up.)
+			mc->clients[i].placed = true;
 
 			// Content view dimensions (will be updated on first capture frame)
 			mc->clients[i].content_view_w = px_w;
@@ -6614,40 +6583,6 @@ toggle_fullscreen(struct d3d11_service_system *sys,
 }
 
 /*!
- * Compute adaptive grid position for window `idx` out of `n` active windows.
- * Grid uses ceil(sqrt(N)) columns, fills row-first with 10% padding per cell.
- * All windows at Z=0.
- */
-static void
-compute_grid_layout(const struct d3d11_service_system *sys,
-                    int n, int idx,
-                    float *out_x, float *out_y, float *out_z,
-                    float *out_w, float *out_h)
-{
-	float disp_w = sys->base.info.display_width_m;
-	float disp_h = sys->base.info.display_height_m;
-	if (disp_w <= 0.0f) disp_w = 0.700f;
-	if (disp_h <= 0.0f) disp_h = 0.394f;
-
-	if (n <= 0) n = 1;
-	int cols = (int)ceilf(sqrtf((float)n));
-	int rows = (int)ceilf((float)n / (float)cols);
-
-	int col = idx % cols;
-	int row = idx / cols;
-
-	// 90% of display used, 10% is padding (5% each side per cell)
-	float cell_w = disp_w * 0.90f / (float)cols;
-	float cell_h = disp_h * 0.90f / (float)rows;
-
-	*out_w = cell_w * 0.90f;  // 90% of cell = 10% padding between windows
-	*out_h = cell_h * 0.90f;
-	*out_x = (col - (cols - 1) / 2.0f) * cell_w;
-	*out_y = ((rows - 1) / 2.0f - row) * cell_h;
-	*out_z = 0.0f;
-}
-
-/*!
  * Update the SRV for a capture client slot.
  *
  * Gets the latest captured texture and (re)creates the SRV if the
@@ -7867,7 +7802,12 @@ after_key_shortcuts:
 	int render_order[D3D11_MULTI_MAX_CLIENTS];
 	int render_count = 0;
 	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
-		if (mc->clients[s].active && !mc->clients[s].minimized) {
+		// ADR-018 (#304): never composite a client the controller has not
+		// placed yet (placed flips on its first set_pose). Combined with the
+		// register-time sentinel this guarantees no flash at an
+		// unplaced/default pose regardless of controller latency.
+		if (mc->clients[s].active && !mc->clients[s].minimized &&
+		    mc->clients[s].placed) {
 			render_order[render_count++] = s;
 		}
 	}
@@ -13406,6 +13346,9 @@ comp_d3d11_service_set_client_window_pose(struct xrt_system_compositor *xsysc,
 	mc->clients[slot].window_pose = *pose;
 	mc->clients[slot].window_width_m = width_m;
 	mc->clients[slot].window_height_m = height_m;
+	// ADR-018 (#304): first set_pose marks the client placed; the runtime
+	// starts compositing it from here (gated with first-frame-committed).
+	mc->clients[slot].placed = true;
 
 	// Cancel any in-flight slot animation (e.g. entry animation from
 	// register_client). Without this, slot_animate_tick keeps interpolating
@@ -14104,6 +14047,26 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 		out_batch->count++;
 
 		cs->maximized_last_emitted = cs->maximized;
+	}
+
+	// spec_version 16 (#304): CLIENT_CONNECTED, one-shot per slot set at
+	// register (slot-bind). The runtime no longer owns per-client policy —
+	// the controller responds with placement (xrSetWorkspaceClientWindowPoseEXT)
+	// and, per its design, chrome / style / focus. client_id is the unified
+	// "1000 + slot" workspace id every event + API uses. Includes captures.
+	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS &&
+	     out_batch->count < IPC_WORKSPACE_INPUT_EVENT_BATCH_MAX; s++) {
+		struct d3d11_multi_client_slot *cs = &mc->clients[s];
+		if (!cs->active || !cs->announce_connected) continue;
+
+		struct ipc_workspace_input_event *ev = &out_batch->events[out_batch->count];
+		memset(ev, 0, sizeof(*ev));
+		ev->event_type = IPC_WORKSPACE_INPUT_EVENT_CLIENT_CONNECTED;
+		ev->timestamp_ms = (uint32_t)GetTickCount();
+		ev->u.client_connected.client_id = 1000u + (uint32_t)s;
+		out_batch->count++;
+
+		cs->announce_connected = false;
 	}
 
 	// FRAME_TICK: one per displayed frame since the last drain, capped at
@@ -15052,6 +15015,9 @@ comp_d3d11_service_set_capture_client_window_pose(struct xrt_system_compositor *
 	mc->clients[slot_index].window_pose = *pose;
 	mc->clients[slot_index].window_width_m = width_m;
 	mc->clients[slot_index].window_height_m = height_m;
+	// ADR-018 (#304): first set_pose marks the client placed (slot-addressed
+	// path — serves both capture clients and OpenXR clients posed by 1000+slot).
+	mc->clients[slot_index].placed = true;
 
 	slot_pose_to_pixel_rect(sys, &mc->clients[slot_index],
 	    &mc->clients[slot_index].window_rect_x,
