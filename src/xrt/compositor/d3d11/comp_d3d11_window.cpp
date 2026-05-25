@@ -158,10 +158,6 @@ struct comp_d3d11_window
 	//! PostMessage(WM_CLOSE) and take the service down with it.
 	volatile LONG workspace_mode_active;
 
-	//! True while any workspace window is maximized (fullscreen). Gates ESC suppression
-	//! so ESC only restores fullscreen and doesn't reach apps when not maximized.
-	volatile LONG any_window_maximized;
-
 	//! Focused window rect in workspace-window client pixels (for mouse coord remapping).
 	//! When forwarding mouse events, workspace coords are remapped to app-local coords.
 	volatile LONG input_forward_rect_x;
@@ -344,6 +340,12 @@ is_workspace_reserved_key(WPARAM vk, bool shift)
 	switch (vk) {
 	case VK_TAB:    return !shift;  // bare TAB cycles focus; Shift+TAB → app
 	case VK_DELETE: return true;    // Close focused app
+	// #307: ESC is a workspace-management key — the controller restores a
+	// maximized window on ESC. Reserve it so it never reaches the focused app
+	// (which would otherwise treat ESC as quit). When nothing is maximized the
+	// controller ignores ESC, so it's a harmless no-op rather than killing the
+	// app. (The runtime itself holds no maximize state — ADR-018.)
+	case VK_ESCAPE: return true;
 	default:        return false;
 	}
 }
@@ -507,7 +509,8 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 	case WM_KEYDOWN:
 		// F11: toggle fullscreen for non-workspace (single app) windows.
-		// In workspace mode, F11 is handled in the multi-compositor render loop instead.
+		// In workspace mode, F11 flows to the controller as a workspace KEY
+		// event (#307) — the controller owns the maximize policy.
 		if (wParam == VK_F11) {
 			HWND fwd_check = (HWND)InterlockedCompareExchangePointer(
 			    (volatile PVOID *)&w->input_forward_hwnd, NULL, NULL);
@@ -588,12 +591,12 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				// SHIFT+TAB falls through and gets PostMessage'd below.
 				return 0;
 			}
-			// ESC: only suppress when a window is maximized (fullscreen restore).
-			// When not maximized, let ESC through so the app can handle it.
-			if (wParam == VK_ESCAPE &&
-			    InterlockedCompareExchange(&w->any_window_maximized, 0, 0)) {
-				return 0;
-			}
+			// #307: ESC is no longer suppressed here. The maximize state
+			// machine moved to the controller (ADR-018); ESC flows to the
+			// controller as a workspace KEY event (pushed above, before this
+			// forwarding) AND on to the focused app. The controller restores a
+			// maximized window on ESC; when nothing is maximized it ignores ESC
+			// and the app handles it as before.
 			// Phase 2.G: Ctrl+1..4 are no longer reserved by the runtime.
 			// They flow through the public input-event drain so a workspace
 			// controller can bind them to its own layout presets.
@@ -1489,15 +1492,6 @@ comp_d3d11_window_set_workspace_wakeup_event(struct comp_d3d11_window *window, v
 	// Window doesn't take ownership — runtime keeps the source HANDLE and
 	// closes it on workspace teardown. Set once at workspace activation.
 	InterlockedExchangePointer((volatile PVOID *)&window->workspace_wakeup_event, handle);
-}
-
-void
-comp_d3d11_window_set_any_maximized(struct comp_d3d11_window *window, bool maximized)
-{
-	if (window == NULL) {
-		return;
-	}
-	InterlockedExchange(&window->any_window_maximized, maximized ? 1 : 0);
 }
 
 // Returns true if input forwarding should currently be suppressed, considering

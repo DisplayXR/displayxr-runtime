@@ -280,14 +280,6 @@ void
 comp_d3d11_window_set_workspace_wakeup_event(struct comp_d3d11_window *window, void *handle);
 
 /*!
- * Tell the window layer whether any client is currently maximized/fullscreen.
- * When true, ESC is consumed by the workspace for fullscreen restore and not
- * forwarded to the focused app.
- */
-void
-comp_d3d11_window_set_any_maximized(struct comp_d3d11_window *window, bool maximized);
-
-/*!
  * Suppress or resume input forwarding (for workspace drag/resize operations).
  * When suppressed, the WndProc does not forward mouse or keyboard events to
  * the app.
