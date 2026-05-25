@@ -828,14 +828,6 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 					w->mouse_press_in_content = false;
 				}
 
-				// Phase 2.G followup #1: when xrEnableWorkspacePointerCaptureEXT
-				// is active for a button, that button's events bypass the
-				// in-rect / dragging gate so a controller-driven drag (move,
-				// resize) keeps receiving the up event even when the cursor
-				// has been pulled outside the content rect. Without this gate
-				// `buttons_held` is already false at WM_*BUTTONUP and
-				// `mouse_press_in_content` was just cleared, so the up
-				// vanishes whenever the press wasn't in content.
 				LONG cap_en = InterlockedCompareExchange(
 				    &w->workspace_pointer_capture_enabled, 0, 0);
 				LONG cap_btn = InterlockedCompareExchange(
@@ -850,15 +842,40 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				case WM_MBUTTONUP:   evt_button = 3; break;
 				default: break;
 				}
+
+				// The controller enables pointer capture ONLY for its own
+				// window-management drags (title-bar move, edge resize — see
+				// displayxr-shell's enable_pointer_capture call sites) and
+				// disables it on release. The captured button's DOWN/UP still
+				// forward (capture_active): the grip press lands inside the
+				// window's forward rect and is eagerly forwarded before the
+				// controller engages capture, so the app must still receive the
+				// matching UP or it sits with a stuck button (which then turns
+				// later hover-moves into a phantom drag and snaps the content at
+				// drag end). What must be swallowed are the MOVES in between —
+				// they carry no evt_button, so the old capture_active gate missed
+				// them and they leaked into the app via in_rect the moment the
+				// cursor crossed into content, mirroring the controller's drag.
 				bool capture_active =
 				    (cap_en != 0) && evt_button != 0 &&
 				    cap_btn == (LONG)evt_button;
+				uint32_t cap_mk = 0;
+				switch (cap_btn) {
+				case 1: cap_mk = MK_LBUTTON; break;
+				case 2: cap_mk = MK_RBUTTON; break;
+				case 3: cap_mk = MK_MBUTTON; break;
+				default: break;
+				}
+				bool capture_move_suppress =
+				    (cap_en != 0) && cap_mk != 0 && message == WM_MOUSEMOVE &&
+				    (((uint32_t)wParam & cap_mk) != 0);
 
-				// Forward if inside rect, or if dragging from an in-content press,
-				// or if pointer capture is held for this button.
+				// Forward if inside rect, dragging from an in-content press, or
+				// the captured button's up/down — but never a captured drag's
+				// moves.
 				bool buttons_held = (wParam & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON)) != 0;
 				bool dragging = buttons_held && w->mouse_press_in_content;
-				if (in_rect || dragging || capture_active) {
+				if (!capture_move_suppress && (in_rect || dragging || capture_active)) {
 					// Remap to app-window client coords.
 					// Scale if target HWND is a different size than the
 					// virtual rect (e.g., captured 2D windows).
