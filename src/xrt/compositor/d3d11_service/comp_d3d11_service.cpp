@@ -958,10 +958,9 @@ struct d3d11_multi_client_slot
 	//! since slot registration. Until then, multi_compositor_render skips
 	//! drawing this slot entirely — the per-client atlas is uninitialized and
 	//! `content_view_w/_h` are zero, so any draw shows undefined-memory black
-	//! at fallback dims. The entry animation start time is reset on the
-	//! false→true transition so the slot's grow-in animation plays once
-	//! content is actually available (mirrors the capture-client pattern of
-	//! gating on `capture_srv` non-null at the same render-loop site).
+	//! at fallback dims (mirrors the capture-client pattern of gating on
+	//! `capture_srv` non-null at the same render-loop site). The entry grow-in
+	//! animation is controller-owned now (#306); the runtime only gates drawing.
 	bool has_first_frame_committed;
 
 	//! Monotonic time the first projection-layer commit landed for this
@@ -6442,9 +6441,6 @@ quat_is_identity(const struct xrt_quat *q)
 
 // ANIM_DURATION_NS defined earlier (forward declaration section).
 
-//! Animation duration for initial window entry (400ms).
-#define ANIM_ENTRY_DURATION_NS (400ULL * 1000000ULL)
-
 /*!
  * Ease-out cubic: fast start, smooth deceleration.
  * t in [0,1] → result in [0,1].
@@ -7510,9 +7506,10 @@ after_key_shortcuts:
 	(void)display_w_m;
 	(void)display_h_m;
 
-	// Tick per-slot animations (for static layout transitions + entry animations).
-	// Phase 2.G: layout-preset state machine moved to the workspace controller,
-	// so this no longer needs to skip when a "dynamic" layout is active.
+	// Tick per-slot animations. The entry grow-in moved to the controller
+	// (#306); what remains here is the maximize/restore ease (toggle_fullscreen,
+	// moves to the controller in #307). Phase 2.G: layout-preset state machine
+	// already moved to the controller, so this no longer skips on "dynamic".
 	{
 		uint64_t anim_now = os_monotonic_get_ns();
 		bool focused_rect_changed = false;
@@ -11228,14 +11225,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 		// Store content dims on multi-comp slot for multi_compositor_render.
 		// Also flip `has_first_frame_committed` on the false→true transition
-		// and reset the entry animation's start time so the slot's grow-in
-		// animation plays once Chrome (or any IPC client) has actually
-		// submitted content. Without this, the multi-comp would draw the
-		// slot at intermediate animation sizes with uninitialized atlas
-		// content for the 2-3s while Chrome's WebGL is initializing —
-		// visible as a narrow black rectangle that jumps to full size when
-		// the first frame lands. Mirrors the capture-client `capture_srv`
-		// readiness gate.
+		// so the slot starts compositing only once Chrome (or any IPC client)
+		// has actually submitted content. Without this, the multi-comp would
+		// draw the slot with uninitialized atlas content for the 2-3s while
+		// Chrome's WebGL is initializing — visible as a black rectangle.
+		// Mirrors the capture-client `capture_srv` readiness gate.
 		if (sys->workspace_mode && sys->multi_comp != nullptr) {
 			for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
 				if (sys->multi_comp->clients[s].active &&
@@ -13361,11 +13355,11 @@ comp_d3d11_service_set_client_window_pose(struct xrt_system_compositor *xsysc,
 	// starts compositing it from here (gated with first-frame-committed).
 	mc->clients[slot].placed = true;
 
-	// Cancel any in-flight slot animation (e.g. entry animation from
-	// register_client). Without this, slot_animate_tick keeps interpolating
-	// from the animation's original start→target every frame and overwrites
-	// the pose we just snapped, so the controller's set_pose appears to do
-	// nothing for ~300ms after a fresh connect.
+	// Cancel any in-flight slot animation (e.g. an in-progress maximize/restore
+	// ease). Without this, slot_animate_tick keeps interpolating from the
+	// animation's original start→target every frame and overwrites the pose we
+	// just snapped, so the controller's set_pose appears to do nothing until
+	// the animation completes.
 	mc->clients[slot].anim.active = false;
 
 	// Recompute pixel rect from pose
@@ -15037,6 +15031,25 @@ comp_d3d11_service_set_capture_client_window_pose(struct xrt_system_compositor *
 	    &mc->clients[slot_index].window_rect_y,
 	    &mc->clients[slot_index].window_rect_w,
 	    &mc->clients[slot_index].window_rect_h);
+
+	// #320 regression fix: OpenXR clients are posed through this slot-addressed
+	// (1000+slot) path too. The canonical-id setter resizes the app HWND on
+	// every pose change — and that resize is what delivers WM_SIZE to the app
+	// so it updates its window dims (Kooima physical screen size + render
+	// resolution). Without it the app keeps rendering at its launch size,
+	// scaled into a moved/resized tile, and its window-relative projection goes
+	// stale. Restore that for non-capture clients (also cancel any in-flight
+	// maximize/restore ease the controller is overriding, and refresh the
+	// focused slot's input-forward rect so clicks track the moved/resized
+	// tile). Capture clients resize their source HWND on their own edge-drag
+	// schedule, so leave them untouched here.
+	if (mc->clients[slot_index].client_type != CLIENT_TYPE_CAPTURE) {
+		mc->clients[slot_index].anim.active = false;
+		mc->clients[slot_index].hwnd_resize_pending = true;
+		if (slot_index == mc->focused_slot) {
+			multi_compositor_update_input_forward(mc);
+		}
+	}
 
 	return true;
 }
