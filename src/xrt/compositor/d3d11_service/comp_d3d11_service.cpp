@@ -4852,6 +4852,11 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			mc->clients[i].anim.active = false;
 			mc->clients[i].announce_connected = true;
 			mc->clients[i].placed = false;
+			// #304 id-unification: the slot's permanent workspace client id is
+			// 1000 + slot, assigned here at register (NOT at chrome-create as
+			// before). Every event + API uses this one id. Chrome create/
+			// destroy no longer touches it; has-chrome gating uses chrome_xsc.
+			mc->clients[i].workspace_client_id = 1000u + (uint32_t)i;
 
 			// Compute pixel rect from the sentinel pose.
 			slot_pose_to_pixel_rect(sys, &mc->clients[i],
@@ -5209,6 +5214,9 @@ multi_compositor_add_capture_client(struct d3d11_service_system *sys, HWND hwnd,
 			mc->clients[i].window_height_m = height_m;
 			mc->clients[i].anim.active = false;
 			mc->clients[i].announce_connected = true;
+			// #304 id-unification: permanent workspace id = 1000 + slot. For
+			// capture clients this matches the id add_capture already returns.
+			mc->clients[i].workspace_client_id = 1000u + (uint32_t)i;
 			// Capture clients are controller-chosen (added via add_capture) and
 			// the controller already knows them; start them placed so the
 			// dormant 2D-capture path keeps drawing at the sentinel rather than
@@ -6993,7 +7001,10 @@ after_key_shortcuts:
 		for (int sw = 0; sw < D3D11_MULTI_MAX_CLIENTS; sw++) {
 			struct d3d11_multi_client_slot *cs = &mc->clients[sw];
 			if (!cs->active || cs->client_type == CLIENT_TYPE_CAPTURE) continue;
-			if (cs->workspace_client_id == 0) continue;
+			// #304: has-chrome gate (was the workspace_client_id==0 proxy,
+			// which is now always non-zero). Only chromed slots need the
+			// pose-change wakeup so the controller can re-anchor its pill.
+			if (cs->chrome_xsc == nullptr) continue;
 			const float kEps = 1e-5f;
 			if (fabsf(cs->window_width_m  - cs->window_w_last_emitted) > kEps ||
 			    fabsf(cs->window_height_m - cs->window_h_last_emitted) > kEps ||
@@ -13930,7 +13941,7 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 	     out_batch->count < IPC_WORKSPACE_INPUT_EVENT_BATCH_MAX; s++) {
 		struct d3d11_multi_client_slot *cs = &mc->clients[s];
 		if (!cs->active || cs->client_type == CLIENT_TYPE_CAPTURE) continue;
-		if (cs->workspace_client_id == 0) continue; // skip uninteresting (no chrome registered)
+		if (cs->chrome_xsc == nullptr) continue; // #304: has-chrome gate (was workspace_client_id==0 proxy)
 
 		const struct xrt_pose &p = cs->window_pose;
 		const struct xrt_pose &q = cs->window_pose_last_emitted;
@@ -13981,7 +13992,7 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 	     out_batch->count < IPC_WORKSPACE_INPUT_EVENT_BATCH_MAX; s++) {
 		struct d3d11_multi_client_slot *cs = &mc->clients[s];
 		if (!cs->active || cs->client_type == CLIENT_TYPE_CAPTURE) continue;
-		if (cs->workspace_client_id == 0) continue;
+		if (cs->chrome_xsc == nullptr) continue; // #304: has-chrome gate (was workspace_client_id==0 proxy)
 		if (cs->modal_open == cs->modal_open_last_emitted) continue;
 
 		struct ipc_workspace_input_event *ev = &out_batch->events[out_batch->count];
@@ -14317,12 +14328,13 @@ comp_d3d11_service_workspace_register_chrome_swapchain_by_slot(struct xrt_system
 	if (cs->chrome_xsc != nullptr) {
 		xrt_swapchain_reference(&cs->chrome_xsc, NULL);
 		cs->chrome_swapchain_id = 0;
-		cs->workspace_client_id = 0;
 	}
 
 	xrt_swapchain_reference(&cs->chrome_xsc, chrome_xsc);
 	cs->chrome_swapchain_id = swapchain_id;
-	cs->workspace_client_id = client_id;
+	// #304 id-unification: workspace_client_id is the permanent slot id set at
+	// register; chrome create/destroy no longer owns it. (client_id passed in
+	// equals 1000+slot post-unification — kept only for the log below.)
 
 	U_LOG_W("workspace: chrome swapchain registered for slot %d (client_id=%u, sc_id=%u)",
 	        slot, client_id, swapchain_id);
@@ -14352,7 +14364,8 @@ comp_d3d11_service_workspace_unregister_chrome_swapchain(struct xrt_system_compo
 			xrt_swapchain_reference(&cs->chrome_xsc, NULL);
 			cs->chrome_swapchain_id = 0;
 			cs->chrome_layout_valid = false;
-			cs->workspace_client_id = 0;
+			// #304: keep workspace_client_id (permanent slot id); only chrome
+			// state is torn down here.
 			U_LOG_W("workspace: chrome swapchain unregistered (slot=%d, id=%u)", s, swapchain_id);
 			return XRT_SUCCESS;
 		}
