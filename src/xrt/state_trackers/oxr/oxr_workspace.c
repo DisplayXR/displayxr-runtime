@@ -161,6 +161,11 @@ struct ipc_workspace_cursor_info;
 xrt_result_t
 comp_ipc_client_compositor_workspace_set_cursor(struct xrt_compositor *xc,
                                                  const struct ipc_workspace_cursor_info *info);
+// spec_version 17: overlay source.
+struct ipc_workspace_overlay_info;
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_overlay(struct xrt_compositor *xc,
+                                                  const struct ipc_workspace_overlay_info *info);
 xrt_result_t
 comp_ipc_client_compositor_workspace_acquire_wakeup_event(struct xrt_compositor *xc,
                                                           xrt_graphics_sync_handle_t *out_handle);
@@ -1297,6 +1302,116 @@ oxr_xrSetWorkspaceCursorEXT(XrSession session, const XrWorkspaceCursorInfoEXT *i
 
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_cursor(&sess->xcn->base, &ipc_info);
 	return xret_to_xr_result(&log, xret, "workspace_set_cursor");
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrCreateWorkspaceOverlaySwapchainEXT(XrSession session,
+                                          const XrWorkspaceOverlaySwapchainCreateInfoEXT *createInfo,
+                                          XrSwapchain *swapchain)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrCreateWorkspaceOverlaySwapchainEXT");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_ARG_NOT_NULL(&log, createInfo);
+	OXR_VERIFY_ARG_NOT_NULL(&log, swapchain);
+
+	if (createInfo->type != XR_TYPE_WORKSPACE_OVERLAY_SWAPCHAIN_CREATE_INFO_EXT) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrCreateWorkspaceOverlaySwapchainEXT: createInfo->type must be "
+		                 "XR_TYPE_WORKSPACE_OVERLAY_SWAPCHAIN_CREATE_INFO_EXT");
+	}
+	if (createInfo->width == 0 || createInfo->height == 0) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrCreateWorkspaceOverlaySwapchainEXT: width and height must be > 0");
+	}
+
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrCreateWorkspaceOverlaySwapchainEXT requires an IPC-mode session");
+	}
+	if (sess->compositor == NULL) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrCreateWorkspaceOverlaySwapchainEXT: session has no compositor");
+	}
+
+	// Mint a regular OpenXR swapchain — same flags as the cursor (single-image
+	// color, controller-rendered, cross-process shareable). The runtime uses
+	// xrSetWorkspaceOverlayEXT to associate it with the overlay render pass; the
+	// create itself doesn't bind to any role.
+	XrSwapchainCreateInfo sci = {0};
+	sci.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
+	sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+	                 XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
+	                 XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+	sci.format = createInfo->format;
+	sci.sampleCount = createInfo->sampleCount > 0 ? createInfo->sampleCount : 1;
+	sci.width = createInfo->width;
+	sci.height = createInfo->height;
+	sci.faceCount = 1;
+	sci.arraySize = 1;
+	sci.mipCount = createInfo->mipCount > 0 ? createInfo->mipCount : 1;
+
+	struct oxr_swapchain *sc = NULL;
+	XrResult ret = sess->create_swapchain(&log, sess, &sci, &sc);
+	if (ret != XR_SUCCESS) {
+		return ret;
+	}
+	*swapchain = oxr_swapchain_to_openxr(sc);
+	return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceOverlayEXT(XrSession session, const XrWorkspaceOverlayInfoEXT *info)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceOverlayEXT");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_ARG_NOT_NULL(&log, info);
+
+	if (info->type != XR_TYPE_WORKSPACE_OVERLAY_INFO_EXT) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrSetWorkspaceOverlayEXT: info->type must be XR_TYPE_WORKSPACE_OVERLAY_INFO_EXT");
+	}
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrSetWorkspaceOverlayEXT requires an IPC-mode session");
+	}
+
+	// Resolve swapchain handle (if any) to the IPC swapchain id.
+	// XR_NULL_HANDLE = hide overlay; we pass UINT32_MAX as the sentinel.
+	struct ipc_workspace_overlay_info ipc_info;
+	ipc_info.swapchain_id = UINT32_MAX;
+	ipc_info.anchor_x = info->anchor.x;
+	ipc_info.anchor_y = info->anchor.y;
+	ipc_info.pivot_x = info->pivot.x;
+	ipc_info.pivot_y = info->pivot.y;
+	ipc_info.size_w_m = info->sizeMeters.width;
+	ipc_info.size_h_m = info->sizeMeters.height;
+	ipc_info.visible = info->visible ? 1u : 0u;
+
+	if (info->swapchain != XR_NULL_HANDLE) {
+		struct oxr_swapchain *sc = NULL;
+		OXR_VERIFY_SWAPCHAIN_AND_INIT_LOG(&log, info->swapchain, sc, "xrSetWorkspaceOverlayEXT");
+		struct xrt_swapchain *inner = sc->swapchain;
+#ifdef _WIN32
+		struct xrt_swapchain *unwrapped = comp_d3d11_client_get_inner_xrt_swapchain(inner);
+		if (unwrapped != NULL) {
+			inner = unwrapped;
+		}
+#endif
+		ipc_info.swapchain_id = comp_ipc_client_compositor_get_swapchain_id(inner);
+	}
+
+	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_overlay(&sess->xcn->base, &ipc_info);
+	return xret_to_xr_result(&log, xret, "workspace_set_overlay");
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL

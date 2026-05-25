@@ -465,6 +465,21 @@ struct d3d11_service_system
 	float cursor_size_m;           //!< Physical size (width = height)
 	bool  cursor_visible;          //!< Controller can hide without releasing swapchain
 
+	//! spec_version 17: controller-pushed overlay source (display-spanning UI,
+	//! e.g. taskbar). Same borrowed-ref model as cursor_xsc, but docked at
+	//! z = 0 (zero disparity) — no raycast, no per-eye disparity. The controller
+	//! creates a session-global swapchain (xrCreateWorkspaceOverlaySwapchainEXT),
+	//! renders the UI into it, and docks it via xrSetWorkspaceOverlayEXT. NULL or
+	//! !overlay_visible = overlay hidden.
+	struct xrt_swapchain *overlay_xsc;
+	float overlay_anchor_x;        //!< Normalized display position X [0,1] of dock point
+	float overlay_anchor_y;        //!< Normalized display position Y [0,1] of dock point
+	float overlay_pivot_x;         //!< Normalized sprite UV X [0,1] mapped onto anchor
+	float overlay_pivot_y;         //!< Normalized sprite UV Y [0,1] mapped onto anchor
+	float overlay_size_w_m;        //!< Physical overlay width in meters
+	float overlay_size_h_m;        //!< Physical overlay height in meters
+	bool  overlay_visible;         //!< Controller can hide without releasing swapchain
+
 	//! MCP capture_frame cross-thread hand-off (Phase B slice 7).
 	struct mcp_capture_request mcp_capture;
 
@@ -684,7 +699,6 @@ struct d3d11_service_system
 #define UI_BTN_W_M          0.008f   //!< Close/minimize button width: 8mm
 #define UI_MIN_WIN_W_M      (4.0f * UI_BTN_W_M)  //!< Min window width = 3 title-bar buttons + slack so they don't overflow the left edge
 #define UI_MIN_WIN_H_M      0.02f    //!< Min window height: 20mm
-#define UI_TASKBAR_H_M      0.009f   //!< Taskbar height: 9mm
 #define UI_GLYPH_W_M        0.0035f  //!< Glyph width: 3.5mm (balanced aspect ratio)
 #define UI_GLYPH_H_M        0.005f   //!< Glyph height: 5mm
 #define UI_RESIZE_ZONE_M    0.003f   //!< Resize detection zone: 3mm
@@ -750,7 +764,6 @@ ui_m_to_tile_px_y(float meters, const struct d3d11_service_system *sys)
 //! Use inside functions where 'sys' is available.
 #define TITLE_BAR_HEIGHT_PX ((int)ui_m_to_tile_px_y(UI_TITLE_BAR_H_M, sys))
 #define CLOSE_BTN_WIDTH_PX  ((int)ui_m_to_tile_px_x(UI_BTN_W_M, sys))
-#define TASKBAR_HEIGHT_PX   ((int)ui_m_to_tile_px_y(UI_TASKBAR_H_M, sys))
 #define GLYPH_W             ((int)ui_m_to_tile_px_x(UI_GLYPH_W_M, sys))
 #define GLYPH_H             ((int)ui_m_to_tile_px_y(UI_GLYPH_H_M, sys))
 #define RESIZE_ZONE_PX      ((int)ui_m_to_tile_px_x(UI_RESIZE_ZONE_M, sys))
@@ -924,14 +937,6 @@ struct d3d11_multi_client_slot
 	//! lock-free from compositor_predict_frame — single float, torn read at
 	//! worst applies last-frame's value for one call.
 	float frame_rate_cap_hz;
-
-	//! #307: True when this window was hidden by the controller via
-	//! xrSetWorkspaceClientVisibilityEXT (e.g. a maximize hiding the backdrop
-	//! windows), as opposed to user-minimized via the runtime MIN button. The
-	//! taskbar lists user-minimized windows only (`minimized && !controller_hidden`)
-	//! so controller-hidden windows don't pollute it. Maximize policy itself lives
-	//! in the controller (ADR-018) — the runtime only tracks the visibility bit.
-	bool controller_hidden;
 
 	//! spec_version 16 (#304): one-shot, set at register (slot-bind). The
 	//! drain emits one CLIENT_CONNECTED event per slot with this set, then
@@ -4793,7 +4798,6 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			mc->clients[i].chrome_swapchain_id = 0;
 			mc->clients[i].chrome_layout_valid = false;
 			mc->clients[i].chrome_region_count = 0;
-			mc->clients[i].controller_hidden = false;
 
 			// ADR-018 (#304): the runtime no longer picks an initial window
 			// layout (compute_grid_layout is gone). Register at a sentinel
@@ -5108,7 +5112,6 @@ multi_compositor_add_capture_client(struct d3d11_service_system *sys, HWND hwnd,
 			mc->clients[i].app_hwnd = hwnd;
 			mc->clients[i].active = true;
 			mc->clients[i].minimized = false;
-			mc->clients[i].controller_hidden = false;
 			mc->clients[i].hwnd_resize_pending = false;
 			mc->clients[i].frame_rate_cap_hz = 0.0f;
 
@@ -6914,61 +6917,22 @@ after_key_shortcuts:
 						U_LOG_W("Multi-comp: close button → exit request for slot %d", hit_slot);
 					}
 				}
-			} else if (in_minimize_btn && hit_slot >= 0) {
-				// Minimize button: hide window
-				mc->clients[hit_slot].minimized = true;
-				U_LOG_W("Multi-comp: minimize slot %d", hit_slot);
-				if (hit_slot == mc->focused_slot) {
-					// ADR-018: minimizing the focused window clears focus
-					// for forwarding safety; the controller picks the
-					// successor (shell auto-focus-next path).
-					mc->focused_slot = -1;
-					multi_compositor_update_input_forward(mc);
-				}
 			} else if (in_title_bar && hit_slot >= 0) {
 				// #307: title-bar clicks are window-management chrome —
-				// focus, drag, and double-click→maximize are all the
-				// controller's job now (ADR-018). It reacts to the POINTER
-				// event (grip region) with its own focus / drag / maximize
-				// policy. The runtime keeps this branch only to NOT forward a
-				// title-bar click to the app as a content click (the `else`
-				// below).
+				// focus, drag, double-click→maximize, AND minimize are all
+				// the controller's job now (ADR-018). It reacts to the POINTER
+				// event (grip / chrome-region) with its own policy. The runtime
+				// keeps this branch only to NOT forward a title-bar click to
+				// the app as a content click (the `else` below). The minimize
+				// button lives inside the title-bar region, so its clicks land
+				// here and are correctly swallowed.
 			} else {
-				// Content area click or taskbar click
 				if (hit_slot < 0) {
-					// No visible window hit — check taskbar using spatial coords.
-					// Convert cursor to display-surface meters for comparison.
-					float disp_w_tb = sys->base.info.display_width_m;
-					float disp_h_tb = sys->base.info.display_height_m;
-					if (disp_w_tb <= 0) disp_w_tb = 0.700f;
-					if (disp_h_tb <= 0) disp_h_tb = 0.394f;
-					float cursor_y_m = ((float)sys->base.info.display_pixel_height / 2.0f - (float)pt.y) *
-					                   disp_h_tb / (float)sys->base.info.display_pixel_height;
-					float cursor_x_m = ((float)pt.x - (float)sys->base.info.display_pixel_width / 2.0f) *
-					                   disp_w_tb / (float)sys->base.info.display_pixel_width;
-					// Taskbar at bottom: y from -disp_h/2 to -disp_h/2 + taskbar_h
-					float tb_bottom_m = -disp_h_tb / 2.0f;
-					float tb_top_m = tb_bottom_m + UI_TASKBAR_H_M;
-					if (cursor_y_m >= tb_bottom_m && cursor_y_m < tb_top_m) {
-						float pill_w_m = 6.0f * UI_GLYPH_W_M + 0.001f;
-						float gap_m = 0.002f;
-						int ind_idx = 0;
-						for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
-							if (!mc->clients[i].active || !mc->clients[i].minimized) continue;
-							float ind_left_m = -disp_w_tb / 2.0f + 0.002f + ind_idx * (pill_w_m + gap_m);
-							float ind_right_m = ind_left_m + pill_w_m;
-							if (cursor_x_m >= ind_left_m && cursor_x_m < ind_right_m) {
-								// ADR-018: un-minimize only; focus is the
-								// controller's call. The restored window's
-								// visibility change is observable to the
-								// shell, which focuses it per its policy.
-								mc->clients[i].minimized = false;
-								U_LOG_W("Multi-comp: taskbar → un-minimize slot %d", i);
-								break;
-							}
-							ind_idx++;
-						}
-					}
+					// #307 slice B: background / empty-space click. The
+					// runtime no longer owns a taskbar — user-minimize and the
+					// restore-from-taskbar UI are the workspace controller's
+					// job now (ADR-018), driven off the POINTER event the
+					// controller already receives. Nothing to do runtime-side.
 				} else {
 					// Content area: focus + forward to app.
 					//
@@ -8477,7 +8441,7 @@ after_key_shortcuts:
 
 	// (Title bar + focus border rendering is inside the render_order loop for correct z-ordering)
 
-	// Reset scissor to full atlas for non-tiled draws (taskbar, DP processing)
+	// Reset scissor to full atlas for non-tiled draws (DP processing)
 	{
 		uint32_t full_w = sys->base.info.display_pixel_width;
 		uint32_t full_h = sys->base.info.display_pixel_height;
@@ -8487,176 +8451,19 @@ after_key_shortcuts:
 		sys->context->RSSetScissorRects(1, &full_scissor);
 	}
 
-	// Draw taskbar at bottom if any windows are user-minimized (not hidden by
-	// the controller, e.g. a maximize hiding the backdrop windows — #307).
-	{
-		bool has_minimized = false;
-		for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
-			if (mc->clients[i].active && mc->clients[i].minimized &&
-			    !mc->clients[i].controller_hidden) {
-				has_minimized = true;
-				break;
-			}
-		}
-		if (has_minimized && sys->blit_vs && sys->blit_ps) {
-			uint32_t ca_w = sys->base.info.display_pixel_width;
-			uint32_t ca_h = sys->base.info.display_pixel_height;
-			if (ca_w == 0) ca_w = 3840;
-			if (ca_h == 0) ca_h = 2160;
-			uint32_t half_w, half_h;
-			resolve_active_view_dims(sys, ca_w, ca_h, &half_w, &half_h);
-
-			float tb_y = (float)(ca_h - TASKBAR_HEIGHT_PX);
-
-			// Pipeline setup
-			sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
-			sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
-			sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-			sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-			ID3D11RenderTargetView *ca_rtvs[] = {mc->combined_atlas_rtv.get()};
-			sys->context->OMSetRenderTargets(1, ca_rtvs, nullptr);
-			sys->context->OMSetBlendState(sys->blend_opaque.get(), nullptr, 0xFFFFFFFF);
-			sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-			sys->context->IASetInputLayout(nullptr);
-			sys->context->RSSetState(sys->rasterizer_state.get());
-			sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
-
-			D3D11_VIEWPORT vp = {};
-			vp.Width = (float)ca_w;
-			vp.Height = (float)ca_h;
-			vp.MaxDepth = 1.0f;
-			sys->context->RSSetViewports(1, &vp);
-
-			// Draw taskbar background in each SBS half
-			uint32_t num_views = sys->tile_columns * sys->tile_rows;
-			for (uint32_t v = 0; v < num_views && v < XRT_MAX_VIEWS; v++) {
-				uint32_t col = v % sys->tile_columns;
-				uint32_t row = v / sys->tile_columns;
-				float bar_x = (float)(col * half_w);
-				float bar_y = (float)(row * half_h) + (float)half_h - TASKBAR_HEIGHT_PX;
-
-				D3D11_MAPPED_SUBRESOURCE mapped;
-				if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
-				              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-					BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
-					cb->src_rect[0] = 0.12f; cb->src_rect[1] = 0.12f;
-					cb->src_rect[2] = 0.14f; cb->src_rect[3] = 1.0f;
-					cb->dst_offset[0] = bar_x;
-					cb->dst_offset[1] = bar_y;
-					cb->src_size[0] = 1; cb->src_size[1] = 1;
-					cb->dst_size[0] = (float)ca_w;
-					cb->dst_size[1] = (float)ca_h;
-					cb->convert_srgb = 2.0f;
-					cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
-					cb->quad_mode = 0;
-					cb->dst_rect_wh[0] = (float)half_w;
-					cb->dst_rect_wh[1] = (float)TASKBAR_HEIGHT_PX;
-					cb->corner_radius = 0; cb->corner_aspect = 0;
-					cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
-					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-					sys->context->Draw(4, 0);
-				}
-
-				// Draw indicators for each minimized app
-				if (mc->font_atlas_srv) {
-					sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
-					ID3D11ShaderResourceView *font_srv = mc->font_atlas_srv.get();
-					sys->context->PSSetShaderResources(0, 1, &font_srv);
-					sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
-
-					int ind_idx = 0;
-					for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
-						if (!mc->clients[i].active || !mc->clients[i].minimized) continue;
-
-						// Draw indicator: colored bg + first letter
-						float tgw = (float)GLYPH_W;
-						float tgh = (float)GLYPH_H;
-						float pill_w = 6 * tgw + 4.0f;
-						float pill_h = tgh;
-						float ind_x = bar_x + 6.0f + ind_idx * (pill_w + 8.0f);
-						float ind_y = bar_y + ((float)TASKBAR_HEIGHT_PX - pill_h) / 2.0f;
-
-						// Background pill (solid color)
-						{
-							sys->context->OMSetBlendState(sys->blend_opaque.get(), nullptr, 0xFFFFFFFF);
-							D3D11_MAPPED_SUBRESOURCE mapped2;
-							if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
-							              D3D11_MAP_WRITE_DISCARD, 0, &mapped2))) {
-								BlitConstants *cb2 = static_cast<BlitConstants *>(mapped2.pData);
-								cb2->src_rect[0] = 0.25f; cb2->src_rect[1] = 0.30f;
-								cb2->src_rect[2] = 0.40f; cb2->src_rect[3] = 1.0f;
-								cb2->dst_offset[0] = ind_x;
-								cb2->dst_offset[1] = ind_y;
-								cb2->src_size[0] = 1; cb2->src_size[1] = 1;
-								cb2->dst_size[0] = (float)ca_w;
-								cb2->dst_size[1] = (float)ca_h;
-								cb2->convert_srgb = 2.0f;
-								cb2->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
-								cb2->quad_mode = 0;
-								cb2->dst_rect_wh[0] = pill_w;
-								cb2->dst_rect_wh[1] = pill_h;
-								cb2->corner_radius = 0; cb2->corner_aspect = 0;
-								cb2->edge_feather = 0.0f; cb2->glow_intensity = 0.0f;
-								sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-								sys->context->Draw(4, 0);
-							}
-							sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
-						}
-
-						// Draw first few chars of app name
-						const char *name = mc->clients[i].app_name;
-						int max_chars = 6;
-						float tb_scale = tgh / (float)mc->font_glyph_h;
-						float tb_px_cursor = 0;
-						for (int ci = 0; ci < max_chars && name[ci] != '\0'; ci++) {
-							unsigned char ch = (unsigned char)name[ci];
-							if (ch < 0x20 || ch > 0x7E) ch = '?';
-							int glyph_idx = ch - 0x20;
-							float src_gw = mc->glyph_advances[glyph_idx];
-							float src_x = 0;
-							for (int p = 0; p < glyph_idx; p++) src_x += mc->glyph_advances[p];
-							float dst_gw = src_gw * tb_scale;
-							D3D11_MAPPED_SUBRESOURCE mapped3;
-							if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
-							              D3D11_MAP_WRITE_DISCARD, 0, &mapped3))) {
-								BlitConstants *cb3 = static_cast<BlitConstants *>(mapped3.pData);
-								cb3->src_rect[0] = src_x;
-								cb3->src_rect[1] = 0;
-								cb3->src_rect[2] = src_gw;
-								cb3->src_rect[3] = (float)mc->font_glyph_h;
-								cb3->dst_offset[0] = ind_x + 2.0f + tb_px_cursor;
-								cb3->dst_offset[1] = ind_y;
-								cb3->src_size[0] = (float)mc->font_atlas_w;
-								cb3->src_size[1] = (float)mc->font_atlas_h;
-								cb3->dst_size[0] = (float)ca_w;
-								cb3->dst_size[1] = (float)ca_h;
-								cb3->convert_srgb = 0.0f;
-								cb3->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
-								cb3->quad_mode = 0;
-								cb3->dst_rect_wh[0] = dst_gw;
-								cb3->dst_rect_wh[1] = tgh;
-								cb3->corner_radius = 0; cb3->corner_aspect = 0;
-								cb3->edge_feather = 0.0f; cb3->glow_intensity = 0.0f;
-								sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-								sys->context->Draw(4, 0);
-							}
-							tb_px_cursor += dst_gw;
-						}
-						ind_idx++;
-					}
-
-					sys->context->OMSetBlendState(sys->blend_opaque.get(), nullptr, 0xFFFFFFFF);
-					sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
-				}
-			}
-		}
-	}
+	// #307 slice B: the taskbar moved to the workspace controller (ADR-018).
+	// The controller renders the user-minimize taskbar onto a display-spanning
+	// overlay swapchain (xrCreateWorkspaceOverlaySwapchainEXT +
+	// xrSetWorkspaceOverlayEXT) — composited by the overlay render pass above at
+	// z = 0. The runtime no longer draws a taskbar or tracks which windows are
+	// minimized for UI purposes; `minimized` is now purely the composite gate,
+	// set by the controller via xrSetWorkspaceClientVisibilityEXT.
 
 	// #307: the "Press F11 or Esc to restore" toast was dropped. Maximize is
 	// controller-owned now (ADR-018); restore is discoverable via the MAX chrome
-	// button (a real toggle), ESC, F11, and double-click. Rendering a toast
-	// controller-side would need a display-spanning overlay swapchain — deferred
-	// to the slice that moves the taskbar.
+	// button (a real toggle), ESC, F11, and double-click. A toast could be
+	// re-added controller-side on the new overlay swapchain mechanism — deferred
+	// to a follow-up.
 
 	// Phase 5.7 + 5.8: spatial launcher panel.
 	// Drawn at (0,0,0) in display coordinates — zero-disparity plane — so it
@@ -9250,6 +9057,141 @@ after_key_shortcuts:
 		// Clear scissor so downstream passes aren't affected.
 		D3D11_RECT full_scissor = {0, 0, (LONG)ca_w, (LONG)ca_h};
 		sys->context->RSSetScissorRects(1, &full_scissor);
+	}
+
+	// spec_version 17: workspace overlay (controller-pushed display-spanning UI,
+	// e.g. taskbar). Docked at z = 0 (zero disparity) → unlike the cursor below
+	// there is NO raycast, NO per-eye disparity: the same sprite is drawn at the
+	// same docked position in every atlas tile. Rendered AFTER windows + chrome
+	// and BEFORE the cursor, so the cursor stays on top. Controller owns all
+	// content + layout (sys->overlay_anchor/pivot/size) via
+	// xrCreateWorkspaceOverlaySwapchainEXT + xrSetWorkspaceOverlayEXT.
+	if (sys->overlay_visible && sys->overlay_xsc != nullptr) {
+		uint32_t ca_w = sys->base.info.display_pixel_width;
+		uint32_t ca_h = sys->base.info.display_pixel_height;
+		if (ca_w == 0) ca_w = 3840;
+		if (ca_h == 0) ca_h = 2160;
+
+		// Resolve controller swapchain → SRV + texture dims. Acquire the keyed
+		// mutex once (KEYEDMUTEX flushes controller-side writes into our device).
+		struct d3d11_service_swapchain *ov_sc = d3d11_service_swapchain_from_xrt(sys->overlay_xsc);
+		ID3D11ShaderResourceView *overlay_srv = nullptr;
+		uint32_t sprite_w_px = 0, sprite_h_px = 0;
+		IDXGIKeyedMutex *overlay_mutex = nullptr;
+		bool overlay_mutex_held = false;
+		if (ov_sc != nullptr && ov_sc->image_count > 0 && ov_sc->images[0].srv) {
+			overlay_srv = ov_sc->images[0].srv.get();
+			D3D11_TEXTURE2D_DESC sdesc = {};
+			ov_sc->images[0].texture->GetDesc(&sdesc);
+			sprite_w_px = sdesc.Width;
+			sprite_h_px = sdesc.Height;
+			overlay_mutex = ov_sc->images[0].keyed_mutex.get();
+			if (overlay_mutex != nullptr) {
+				if (SUCCEEDED(overlay_mutex->AcquireSync(0, 4 /* ms */))) {
+					overlay_mutex_held = true;
+				}
+			}
+		}
+		if (overlay_srv != nullptr && sprite_w_px > 0 && sprite_h_px > 0) {
+			float disp_w_m = sys->base.info.display_width_m;
+			if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
+			float disp_h_m = sys->base.info.display_height_m;
+			if (disp_h_m <= 0.0f) disp_h_m = 0.392f;
+
+			// Per-tile atlas region from the active rendering mode (matches the
+			// cursor pass; handles SBS 2×1, half-active LeiaSR 3D, etc.).
+			const uint32_t n_cols = sys->tile_columns > 0 ? sys->tile_columns : 1;
+			const uint32_t n_rows = sys->tile_rows > 0 ? sys->tile_rows : 1;
+			uint32_t tile_w_v = 0, tile_h_v = 0;
+			resolve_active_view_dims(sys, ca_w, ca_h, &tile_w_v, &tile_h_v);
+			const uint32_t tile_w = tile_w_v;
+			const uint32_t tile_h = tile_h_v;
+
+			// Physical meters → atlas pixels through the per-mode tile dims:
+			// tile_w spans disp_w_m of display width, tile_h spans disp_h_m.
+			float overlay_w_atlas = sys->overlay_size_w_m / disp_w_m * (float)tile_w;
+			float overlay_h_atlas = sys->overlay_size_h_m / disp_h_m * (float)tile_h;
+
+			// Dock point: normalized display anchor → in-tile atlas pixels, then
+			// subtract the sprite pivot (in atlas pixels) so the pivot lands on
+			// the anchor. z = 0 → identical in every tile (no disparity offset).
+			float anchor_px_x = sys->overlay_anchor_x * (float)tile_w;
+			float anchor_px_y = sys->overlay_anchor_y * (float)tile_h;
+			float base_tile_x = anchor_px_x - sys->overlay_pivot_x * overlay_w_atlas;
+			float base_tile_y = anchor_px_y - sys->overlay_pivot_y * overlay_h_atlas;
+
+			// Common pipeline state (same blit shader as cursor/windows).
+			// The controller renders the overlay with Direct2D, which outputs
+			// PREMULTIPLIED alpha — so composite with the premultiplied blend
+			// (ONE, INV_SRC_ALPHA), not the straight-alpha state the cursor uses.
+			ID3D11RenderTargetView *ortvs[] = {mc->combined_atlas_rtv.get()};
+			sys->context->OMSetRenderTargets(1, ortvs, nullptr);
+			sys->context->OMSetBlendState(sys->blend_premul.get(), nullptr, 0xFFFFFFFF);
+			sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
+			sys->context->RSSetState(sys->rasterizer_state.get());
+			sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+			sys->context->IASetInputLayout(nullptr);
+			D3D11_VIEWPORT ovp = {};
+			ovp.Width = (float)ca_w;
+			ovp.Height = (float)ca_h;
+			ovp.MaxDepth = 1.0f;
+			sys->context->RSSetViewports(1, &ovp);
+			sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
+			sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
+			sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+			sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+			sys->context->PSSetShaderResources(0, 1, &overlay_srv);
+			sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
+
+			for (uint32_t row = 0; row < n_rows; row++) {
+				for (uint32_t col = 0; col < n_cols; col++) {
+					float dest_x = (float)(col * tile_w) + base_tile_x;
+					float dest_y = (float)(row * tile_h) + base_tile_y;
+
+					D3D11_MAPPED_SUBRESOURCE m;
+					if (FAILED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+					                              D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+						continue;
+					}
+					BlitConstants *cb = static_cast<BlitConstants *>(m.pData);
+					memset(cb, 0, sizeof(*cb));
+					cb->src_rect[0] = 0;
+					cb->src_rect[1] = 0;
+					cb->src_rect[2] = (float)sprite_w_px;
+					cb->src_rect[3] = (float)sprite_h_px;
+					cb->src_size[0] = (float)sprite_w_px;
+					cb->src_size[1] = (float)sprite_h_px;
+					cb->dst_size[0] = (float)ca_w;
+					cb->dst_size[1] = (float)ca_h;
+					cb->dst_offset[0] = dest_x;
+					cb->dst_offset[1] = dest_y;
+					cb->dst_rect_wh[0] = overlay_w_atlas;
+					cb->dst_rect_wh[1] = overlay_h_atlas;
+					cb->convert_srgb = 0.0f;
+					cb->chrome_alpha = 0.0f;
+					cb->quad_mode = 0.0f;
+					cb->glow_intensity = 0.0f;
+					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+
+					// Tile-local scissor so a docked overlay can't bleed across tiles.
+					D3D11_RECT oscissor;
+					oscissor.left   = (LONG)(col * tile_w);
+					oscissor.top    = (LONG)(row * tile_h);
+					oscissor.right  = (LONG)((col + 1) * tile_w);
+					oscissor.bottom = (LONG)((row + 1) * tile_h);
+					sys->context->RSSetScissorRects(1, &oscissor);
+
+					sys->context->Draw(4, 0);
+				}
+			}
+
+			// Restore full-atlas scissor for downstream passes (cursor, DP, etc.).
+			D3D11_RECT ofull = {0, 0, (LONG)ca_w, (LONG)ca_h};
+			sys->context->RSSetScissorRects(1, &ofull);
+		}
+		if (overlay_mutex_held) {
+			overlay_mutex->ReleaseSync(0);
+		}
 	}
 
 	// Phase 2.J / 3D cursor: render the OS-style cursor sprite at the per-
@@ -13089,13 +13031,11 @@ comp_d3d11_service_set_client_visibility(struct xrt_system_compositor *xsysc,
 	int slot = multi_comp_find_slot(mc, c);
 	if (slot < 0) return false;
 
+	// #307 slice B: `minimized` is now purely the composite gate. The controller
+	// owns the distinction between user-minimize and maximize-hide (it renders
+	// its own taskbar on the overlay swapchain and tracks which windows it hid),
+	// so the runtime no longer needs a separate controller_hidden flag.
 	mc->clients[slot].minimized = !visible;
-	// #307: a controller-driven hide (e.g. maximize hiding the backdrop windows)
-	// is NOT a user-minimize, so the taskbar must ignore it. Tag it controller_hidden
-	// so the taskbar gate (minimized && !controller_hidden) excludes it; the
-	// runtime MIN button leaves this flag clear so user-minimized windows still
-	// show in the taskbar.
-	mc->clients[slot].controller_hidden = !visible;
 	U_LOG_W("Workspace: set_visibility slot %d visible=%d", slot, visible);
 
 	if (!visible && slot == mc->focused_slot) {
@@ -14084,6 +14024,34 @@ comp_d3d11_service_workspace_set_cursor(struct xrt_system_compositor *xsysc,
 	sys->cursor_hot_y = hot_y;
 	sys->cursor_size_m = size_meters > 0.0f ? size_meters : 0.012f;
 	sys->cursor_visible = visible;
+	return XRT_SUCCESS;
+}
+
+// spec_version 17: store the controller-pushed overlay source. xsc may be NULL
+// (caller passed XR_NULL_HANDLE / invalid swapchain) — that hides the overlay
+// without tearing anything down. The runtime composites this swapchain at z = 0
+// in its per-tile overlay render pass (docked per anchor/pivot, no disparity).
+extern "C" xrt_result_t
+comp_d3d11_service_workspace_set_overlay(struct xrt_system_compositor *xsysc,
+                                          struct xrt_swapchain *xsc,
+                                          float anchor_x, float anchor_y,
+                                          float pivot_x, float pivot_y,
+                                          float size_w_m, float size_h_m,
+                                          bool visible)
+{
+	if (xsysc == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	sys->overlay_xsc = xsc; // borrowed; controller owns lifetime
+	sys->overlay_anchor_x = anchor_x;
+	sys->overlay_anchor_y = anchor_y;
+	sys->overlay_pivot_x = pivot_x;
+	sys->overlay_pivot_y = pivot_y;
+	sys->overlay_size_w_m = size_w_m > 0.0f ? size_w_m : 0.10f;
+	sys->overlay_size_h_m = size_h_m > 0.0f ? size_h_m : 0.02f;
+	sys->overlay_visible = visible;
 	return XRT_SUCCESS;
 }
 
