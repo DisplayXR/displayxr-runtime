@@ -214,7 +214,6 @@ android {
                 cmake.arguments "-DPYTHON_EXECUTABLE=${project.pythonBinary}"
             }
 
-            cmake.arguments "-DCMAKE_PREFIX_PATH=${project.cnsdkDir}"
             cmake.arguments "-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH"
         }
 
@@ -372,8 +371,7 @@ if (keystorePropertiesFilename) {
     }
 }
 
-def addFileDependency(dependencies, depFile) {
-    assert file(depFile).exists()
-    dependencies.add('implementation', files(depFile))
-}
-addFileDependency(dependencies, "${project.cnsdkDir}/android/sdk-faceTrackingService-${project.cnsdkVersion}.aar")
+// CNSDK AAR is no longer included here — the Leia CNSDK plug-in repo
+// (displayxr-leia-plugin) builds libdxrp050_leia_cnsdk.so and bundles
+// the CNSDK runtime; that .so is dropped into this APK's jniLibs/<ABI>/
+// (POC mode) or shipped in a separate vendor APK (v2, runtime #310).
