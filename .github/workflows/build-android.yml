@@ -150,10 +150,13 @@ jobs:
             echo "::error::APK is missing lib/arm64-v8a/$MANIFEST_SO — manifest references it but it's not bundled"
             exit 1
           fi
-          # Sanity: post-restructure, no CNSDK .so should be packaged
-          # in the runtime APK (the plug-in repo handles that).
+          # ADR-019 guard: post-restructure, no CNSDK .so may be packaged
+          # in the runtime APK (the plug-in repo handles CNSDK delivery).
+          # Hard-fail to mirror build-windows.yml's vendor-symbol assertion —
+          # a warning would let a re-added CNSDK AAR dep slip through CI.
           if unzip -l "$APK" | grep -q 'libleiaSDK'; then
-            echo "::warning::CNSDK .so leaked into runtime APK — check that openxr_android/build.gradle didn't re-add a CNSDK AAR dep"
+            echo "::error::CNSDK .so leaked into runtime APK — openxr_android/build.gradle must not re-add a CNSDK AAR dep (ADR-019). CNSDK ships from displayxr-leia-plugin as libdxrp050_leia_cnsdk.so."
+            exit 1
           fi
 
       - name: Upload APK
