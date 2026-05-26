@@ -14,6 +14,7 @@ A→B→C→D test plan for the first hardware install of the Android POC. Each 
 Companion docs:
 - [`android-build-guide.md`](android-build-guide.md) — prerequisites, CNSDK setup, build commands.
 - [`android-bringup-logcat.md`](android-bringup-logcat.md) — pre-written `adb logcat` filters per test + expected line sequences + failure-shortcut table.
+- [`android-emulator-setup.md`](android-emulator-setup.md) — half-bringup on the Android emulator before Lume Pad arrives (catches build/install/loader-discovery bugs; can't render).
 - [`displayxr-leia-plugin/docs/cnsdk-android-calibration.md`](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/docs/cnsdk-android-calibration.md) — face axes / view mapping / UV flip calibration (Test B).
 
 ## What to test
