@@ -14,7 +14,7 @@
 #include "d3d11_icon_loader.h"
 #include "displayxr_logo_data.h"
 
-#include "shared/ipc_protocol.h" // struct ipc_launcher_app_list
+#include "shared/ipc_protocol.h" // workspace IPC structs
 
 #include "xrt/xrt_handles.h"
 #include "xrt/xrt_limits.h"
@@ -395,60 +395,6 @@ struct d3d11_service_system
 	//! Base system compositor - must be first!
 	struct xrt_system_compositor base;
 
-	//! Phase 5.8: spatial launcher app registry, pushed from the workspace
-	//! controller via clear+add IPC calls. Lives on the service (not the
-	//! multi-comp) so it survives multi-comp create/destroy cycles —
-	//! the workspace controller can push at any time, even before
-	//! workspace_activate.
-	struct ipc_launcher_app launcher_apps[IPC_LAUNCHER_MAX_APPS];
-	uint32_t launcher_app_count;
-
-	//! Phase 5.9/5.10: pending launcher tile click. Set by the WM_LBUTTONDOWN
-	//! handler when the user clicks a tile, consumed by the workspace
-	//! controller via ipc_call_launcher_poll_click() (or
-	//! xrPollLauncherClickEXT). -1 means no pending click.
-	//! Also carries IPC_LAUNCHER_ACTION_BROWSE for the Browse tile.
-	//! Phase 6.6: also carries IPC_LAUNCHER_ACTION_REMOVE + the removed
-	//! tile's full index in pending_launcher_remove_full_index.
-	int32_t pending_launcher_click_index = -1;
-
-	//! Phase 6.6: full-space index of the tile the user right-click-removed.
-	//! Set by launcher_show_context_menu, consumed by the workspace
-	//! controller's poll loop which deletes the entry from g_registered_apps
-	//! and re-pushes. -1 means no pending remove.
-	int32_t pending_launcher_remove_full_index = -1;
-
-	//! Phase 5.11: bitmask of running tiles (bit i = launcher_apps[i] has a
-	//! matching IPC client). Pushed by the workspace controller from its
-	//! client-poll loop. The render pass draws a glow border around set tiles.
-	uint64_t running_tile_mask = 0;
-
-	//! Phase 6.2: visible-space hover index — tile under the mouse cursor.
-	//! -1 = cursor not on any tile. Updated every frame from GetCursorPos.
-	int32_t launcher_hover_index = -1;
-
-	//! Phase 6.5: scroll offset for the launcher tile grid, in rows.
-	//! 0 = top. Incremented by mouse wheel or arrow-key overflow.
-	int32_t launcher_scroll_row = 0;
-
-	//! Phase 5.12: visible-space selection index for the launcher grid.
-	//! -1 = nothing selected. Reset to 0 when the launcher becomes visible.
-	int32_t launcher_selected_index = -1;
-
-	//! Phase 5.13: bitmask of tiles the user has hidden this session via
-	//! right-click → Remove. Bit i = launcher_apps[i] is hidden. Cleared on
-	//! every workspace registry re-push so the state is session-only.
-	uint64_t hidden_tile_mask = 0;
-
-	//! Phase 7.2: per-app icon textures loaded from sidecar icon paths.
-	struct launcher_icon {
-		wil::com_ptr<ID3D11ShaderResourceView> srv_2d;
-		wil::com_ptr<ID3D11ShaderResourceView> srv_3d;
-		uint32_t w_2d = 0, h_2d = 0, w_3d = 0, h_3d = 0;
-		char layout_3d[8] = {};
-	};
-	struct launcher_icon launcher_icons[IPC_LAUNCHER_MAX_APPS];
-
 	//! spec_version 13: controller-pushed cursor sprite source. The controller
 	//! creates a session-global swapchain (xrCreateWorkspaceCursorSwapchainEXT),
 	//! renders its sprite into it, and points the runtime at it via
@@ -479,6 +425,16 @@ struct d3d11_service_system
 	float overlay_size_w_m;        //!< Physical overlay width in meters
 	float overlay_size_h_m;        //!< Physical overlay height in meters
 	bool  overlay_visible;         //!< Controller can hide without releasing swapchain
+	//! spec_version 19: overlay swapchain image is side-by-side stereo (left
+	//! half = left eye, right half = right eye). The composite samples the
+	//! matching half per eye view; mono (false) samples the whole image in both.
+	bool  overlay_stereo_sbs;
+
+	//! #308 (spec_version 18): controller input grab is active (modal UI like the
+	//! launcher band is up). While set, the cursor renders at z = 0 (zero
+	//! disparity) instead of the per-frame window raycast depth, so it stays
+	//! aligned with the z=0 overlay the controller is showing.
+	bool  input_grabbed;
 
 	//! MCP capture_frame cross-thread hand-off (Phase B slice 7).
 	struct mcp_capture_request mcp_capture;
@@ -524,6 +480,10 @@ struct d3d11_service_system
 	//! Blit shaders for projection layer copy with SRGB conversion
 	wil::com_ptr<ID3D11VertexShader> blit_vs;
 	wil::com_ptr<ID3D11PixelShader> blit_ps;
+	//! #308: premultiplied box-blur variant of blit_ps. Used only for the
+	//! empty-state splash logo while it's pushed behind the launcher band, to
+	//! give it depth-of-field. Blur radius (UV) comes from glow_falloff.
+	wil::com_ptr<ID3D11PixelShader> blit_blur_ps;
 	wil::com_ptr<ID3D11Buffer> blit_constant_buffer;
 
 	//! Constant buffer for layer rendering
@@ -1167,12 +1127,6 @@ struct d3d11_multi_compositor
 	int32_t cursor_panel_y;
 	float   cursor_hit_z_m;
 
-	//! Phase 5.7: spatial launcher panel visible.
-	//! Toggled by Ctrl+L via ipc_call_launcher_set_visible. When true, the
-	//! render loop draws a rounded-corner panel at the zero-disparity plane.
-	//! The app list it renders lives on d3d11_service_system (sys->launcher_apps).
-	bool launcher_visible;
-
 	//! Right-click-drag state for window repositioning.
 	struct
 	{
@@ -1197,7 +1151,7 @@ struct d3d11_multi_compositor
 	uint32_t font_atlas_h;     //!< Total atlas height in pixels
 
 	//! Embedded DisplayXR logo PNG decoded to an SRV on first use. Rendered in
-	//! the empty state (no clients, no launcher). Source bytes come from
+	//! the empty state (no clients). Source bytes come from
 	//! displayxr_white_png[] which is generated from assets/displayxr_white.png.
 	wil::com_ptr<ID3D11ShaderResourceView> logo_srv;
 	uint32_t logo_w;
@@ -1902,6 +1856,19 @@ create_layer_shaders(struct d3d11_service_system *sys)
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create blit pixel shader: 0x%08lx", hr);
 		return false;
+	}
+
+	// #308: blur variant for the pushed-back empty-state splash (non-fatal).
+	hr = compile_shader(blit_blur_ps_hlsl, "PSMain", "ps_5_0", &blob);
+	if (SUCCEEDED(hr)) {
+		hr = sys->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+		                                     nullptr, sys->blit_blur_ps.put());
+		blob->Release();
+		if (FAILED(hr)) {
+			U_LOG_W("Failed to create blit blur pixel shader: 0x%08lx (splash blur disabled)", hr);
+		}
+	} else {
+		U_LOG_W("Failed to compile blit blur pixel shader (splash blur disabled)");
 	}
 
 	U_LOG_I("Created all layer shaders (including blit)");
@@ -5796,220 +5763,6 @@ struct workspace_hit_result
 	float    hit_z_m;
 };
 
-static void launcher_set_visible(struct d3d11_service_system *sys,
-                                 struct d3d11_multi_compositor *mc, bool visible);
-
-// Phase 5.13: pop a Win32 context menu at the cursor for a launcher tile.
-// Launch fires the tile like a click; Remove sets hidden_tile_mask so the
-// tile disappears from the grid until the workspace re-pushes its registry.
-//
-// TrackPopupMenu only runs on the thread that owns the target window, so
-// we dispatch via comp_d3d11_window_show_launcher_context_menu which
-// SendMessages across to the window thread. The render thread blocks
-// until the user picks or cancels.
-static void
-launcher_show_context_menu(struct d3d11_service_system *sys,
-                           struct d3d11_multi_compositor *mc,
-                           POINT client_pt, int full_idx)
-{
-	(void)client_pt;
-	if (mc == nullptr || mc->window == nullptr) return;
-
-	uint32_t result = comp_d3d11_window_show_launcher_context_menu(mc->window);
-	switch (result) {
-	case LAUNCHER_CTX_MENU_RESULT_LAUNCH:
-		sys->pending_launcher_click_index = full_idx;
-		launcher_set_visible(sys, mc, false);
-		U_LOG_W("Launcher: context menu launch full=%d", full_idx);
-		break;
-	case LAUNCHER_CTX_MENU_RESULT_REMOVE:
-		// Phase 6.6: signal the workspace to permanently remove this app from
-		// registered_apps.json. The workspace's poll loop picks up the index,
-		// deletes the entry, saves, and re-pushes the registry. The
-		// launcher hides so the re-pushed list renders cleanly.
-		sys->pending_launcher_remove_full_index = full_idx;
-		launcher_set_visible(sys, mc, false);
-		U_LOG_W("Launcher: context menu remove full=%d (permanent)", full_idx);
-		break;
-	default:
-		break;
-	}
-}
-
-// Phase 5.12: toggle launcher visibility AND the window's input-suppress
-// flag in one place. When the launcher is up we want keyboard input to
-// drive the launcher itself (arrows / Enter / Esc) rather than leaking
-// through to the focused app; mirror the existing resize/drag pattern
-// which uses `comp_d3d11_window_set_input_suppress` for the same purpose.
-static void
-launcher_set_visible(struct d3d11_service_system *sys,
-                     struct d3d11_multi_compositor *mc, bool visible)
-{
-	if (mc == nullptr) return;
-	if (mc->launcher_visible == visible) return;
-
-	mc->launcher_visible = visible;
-	if (mc->window != nullptr) {
-		if (visible) {
-			comp_d3d11_window_set_input_suppress(mc->window, true);
-		} else {
-			// Phase 5.12: set the grace-period timestamp BEFORE clearing
-			// the immediate flag. If we cleared the flag first and then
-			// set the grace, the window thread could sample between the
-			// two writes and see neither active → forward the Esc that
-			// triggered the close. 200ms covers any WM_KEYDOWN queued on
-			// the window thread before the render thread got here.
-			comp_d3d11_window_set_input_suppress_grace_ms(mc->window, 200);
-			comp_d3d11_window_set_input_suppress(mc->window, false);
-		}
-	}
-	// Phase 5.12: when opening, force keyboard focus onto the compositor
-	// window. Without this, keys still route to whichever app previously
-	// had focus (the cube) and never reach the WndProc that the launcher's
-	// input-suppress gate lives in. The workspace process grants us
-	// foreground-activation permission via AllowSetForegroundWindow before
-	// firing this IPC.
-	if (visible && mc->hwnd != nullptr) {
-		SetForegroundWindow(mc->hwnd);
-		SetFocus(mc->hwnd);
-	}
-	if (visible) {
-		sys->launcher_selected_index = 0;
-		sys->launcher_scroll_row = 0;
-	} else {
-		sys->launcher_selected_index = -1;
-	}
-}
-
-// Phase 5.12+5.13+5.14: build the compacted visible-tile remap for the
-// launcher. Walks sys->launcher_apps skipping any bit set in hidden_tile_mask
-// and writes the full-space indices into @p out. The render pass and hit
-// test share this so the grid positions agree across the frame.
-//
-// Returns the number of visible tiles written. Does NOT include the virtual
-// "Add app…" Browse tile — that gets slot [n_visible] in both the render and
-// hit-test code paths.
-static uint32_t
-launcher_build_visible_list(const struct d3d11_service_system *sys,
-                            int out_visible_to_full[IPC_LAUNCHER_MAX_APPS])
-{
-	uint32_t n_apps = sys->launcher_app_count;
-	if (n_apps > IPC_LAUNCHER_MAX_APPS) n_apps = IPC_LAUNCHER_MAX_APPS;
-	uint32_t n_visible = 0;
-	for (uint32_t i = 0; i < n_apps; i++) {
-		if ((sys->hidden_tile_mask & (1ULL << i)) != 0) continue;
-		out_visible_to_full[n_visible++] = (int)i;
-	}
-	return n_visible;
-}
-
-/*!
- * Phase 5.9 / 5.13 / 5.14: hit test the launcher grid against a cursor.
- *
- * The launcher panel sits at z=0 in display coordinates (zero-disparity plane),
- * so the cursor position on the workspace window converts directly to display
- * meters — no eye-projection raycast needed. Mirrors the layout math used by
- * the render pass so the visible tiles align with the hit boxes.
- *
- * Returns:
- *   - 0..n_visible-1      real tile hit (visible-space index, caller maps to full)
- *   - n_visible           the virtual "Add app…" Browse tile
- *   - -1                  inside panel but on a gap / title / header
- *   - -2                  outside panel entirely (caller treats as dismiss)
- */
-static int
-launcher_hit_test(struct d3d11_service_system *sys, POINT cursor_px, uint32_t n_visible)
-{
-	// Cursor is in compositor-window client pixels, which we map to
-	// display meters via the same formula the taskbar hit-test uses
-	// (pt.x and pt.y are assumed to span the full atlas pixel dimensions).
-	float disp_w_m = sys->base.info.display_width_m;
-	float disp_h_m = sys->base.info.display_height_m;
-	uint32_t disp_px_w = sys->base.info.display_pixel_width;
-	uint32_t disp_px_h = sys->base.info.display_pixel_height;
-	if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
-	if (disp_h_m <= 0.0f) disp_h_m = 0.394f;
-	if (disp_px_w == 0) disp_px_w = 3840;
-	if (disp_px_h == 0) disp_px_h = 2160;
-
-	float cursor_x_m = ((float)cursor_px.x - (float)disp_px_w / 2.0f) *
-	                   disp_w_m / (float)disp_px_w;
-	float cursor_y_m = ((float)disp_px_h / 2.0f - (float)cursor_px.y) *
-	                   disp_h_m / (float)disp_px_h;
-
-	// Panel geometry — the fractions below must match the render block.
-	const float panel_w_frac = 0.60f;
-	const float panel_h_frac = 0.55f;
-	float panel_w_m = disp_w_m * panel_w_frac;
-	float panel_h_m = disp_h_m * panel_h_frac;
-
-	// Outside panel → caller treats as dismiss.
-	if (cursor_x_m < -panel_w_m * 0.5f || cursor_x_m > panel_w_m * 0.5f ||
-	    cursor_y_m < -panel_h_m * 0.5f || cursor_y_m > panel_h_m * 0.5f) {
-		return -2;
-	}
-
-	// Panel-local meters, origin top-left.
-	float lx = cursor_x_m + panel_w_m * 0.5f;
-	float ly = panel_h_m * 0.5f - cursor_y_m;
-
-	const int LAUNCHER_GRID_COLS = 4;
-	float margin = panel_w_m * 0.04f;
-	float title_h = panel_h_m * 0.13f;
-	float section_h = panel_h_m * 0.07f;
-	float tile_w = (panel_w_m - (LAUNCHER_GRID_COLS + 1) * margin) /
-	               (float)LAUNCHER_GRID_COLS;
-
-	// Phase 5.14: the render computes tile_h in render-pixel terms
-	// (`tile_h_px = tile_w_px * 0.65`). Because ui_m_to_tile_px_x and
-	// ui_m_to_tile_px_y use different px-per-meter ratios (tile_px_w =
-	// display_pixel_width/tile_columns, but tile_px_h = display_pixel_height
-	// /tile_rows), converting that back to meters requires an aspect-ratio
-	// correction or the hit test and render disagree on row positions.
-	float tile_px_w_eff = (float)(disp_px_w / (sys->tile_columns ? sys->tile_columns : 1));
-	float tile_px_h_eff = (float)(disp_px_h / (sys->tile_rows    ? sys->tile_rows    : 1));
-	float px_per_m_x = tile_px_w_eff / disp_w_m;
-	float px_per_m_y = tile_px_h_eff / disp_h_m;
-	float y_ratio = (px_per_m_y > 0.0f) ? (px_per_m_x / px_per_m_y) : 1.0f;
-	float tile_h = tile_w * y_ratio;
-
-	// Section header + label heights: render uses
-	// `font_glyph_h * section_scale` where section_scale = (section_h_px * 0.65)
-	// / font_glyph_h. In meters that's section_h_m * 0.65, unaffected by the
-	// X/Y ratio (section_h is panel_h-derived, so y-based).
-	float section_text_h = section_h * 0.65f;
-	float label_h = section_text_h * 0.85f;
-
-	float section_y = title_h + margin * 0.5f;
-	float grid_top = section_y + section_text_h + margin * 0.5f;
-
-	// Phase 6.5: apply scroll offset to grid_top (in meters, matching the
-	// render's pixel-based scroll). row_h uses the same y_ratio-corrected
-	// tile_h so scroll offsets agree between render and hit test.
-	float row_h_m = tile_h + label_h + margin;
-	grid_top -= (float)sys->launcher_scroll_row * row_h_m;
-
-	// Walk the visible tile grid PLUS one virtual Browse tile at position n_visible.
-	uint32_t n_total = n_visible + 1;
-	if (n_total > IPC_LAUNCHER_MAX_APPS + 1) n_total = IPC_LAUNCHER_MAX_APPS + 1;
-	for (uint32_t i = 0; i < n_total; i++) {
-		int tcol = (int)(i % LAUNCHER_GRID_COLS);
-		int trow = (int)(i / LAUNCHER_GRID_COLS);
-		float tx = margin + (float)tcol * (tile_w + margin);
-		float ty = grid_top + (float)trow * (tile_h + label_h + margin);
-		// Only match tiles that are in the visible panel area.
-		if (ty + tile_h < section_y + section_text_h) continue;
-		if (ty > panel_h_m) continue;
-		if (lx >= tx && lx <= tx + tile_w &&
-		    ly >= ty && ly <= ty + tile_h) {
-			return (int)i;
-		}
-	}
-
-	// Inside panel but not on a tile (e.g. title bar, gaps).
-	return -1;
-}
-
 /*!
  * Spatial raycast hit-test: cast a ray from the user's eye through the mouse
  * cursor position on the display surface, and intersect with workspace window planes.
@@ -6596,134 +6349,6 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		return;
 	}
 
-	// Phase 5.12: launcher keyboard navigation.
-	// When the launcher is visible the arrow keys move selection, Enter
-	// fires the selected tile (or the Browse tile), and Esc dismisses the
-	// launcher. The normal TAB/DELETE/F11/Ctrl+1-3 shortcuts are gated
-	// out so e.g. Enter while launcher is open doesn't also toggle layout.
-	if (mc->launcher_visible) {
-		const int LAUNCHER_GRID_COLS = 4;
-		int visible_to_full[IPC_LAUNCHER_MAX_APPS];
-		uint32_t n_visible = launcher_build_visible_list(sys, visible_to_full);
-		// Addressable range includes the Browse tile at index n_visible.
-		int n_selectable = (int)n_visible + 1;
-
-		if (sys->launcher_selected_index < 0) sys->launcher_selected_index = 0;
-		if (sys->launcher_selected_index >= n_selectable) {
-			sys->launcher_selected_index = n_selectable - 1;
-		}
-
-		if (GetAsyncKeyState(VK_RIGHT) & 1) {
-			sys->launcher_selected_index =
-			    (sys->launcher_selected_index + 1) % n_selectable;
-		}
-		if (GetAsyncKeyState(VK_LEFT) & 1) {
-			sys->launcher_selected_index =
-			    (sys->launcher_selected_index - 1 + n_selectable) % n_selectable;
-		}
-		if (GetAsyncKeyState(VK_DOWN) & 1) {
-			int next = sys->launcher_selected_index + LAUNCHER_GRID_COLS;
-			if (next < n_selectable) {
-				sys->launcher_selected_index = next;
-			}
-		}
-		if (GetAsyncKeyState(VK_UP) & 1) {
-			int prev = sys->launcher_selected_index - LAUNCHER_GRID_COLS;
-			if (prev >= 0) {
-				sys->launcher_selected_index = prev;
-			}
-		}
-		if (GetAsyncKeyState(VK_RETURN) & 1) {
-			int sel = sys->launcher_selected_index;
-			if (sel == (int)n_visible) {
-				sys->pending_launcher_click_index = IPC_LAUNCHER_ACTION_BROWSE;
-				launcher_set_visible(sys, mc, false);
-				// Phase 5.14: see corresponding AllowSetForegroundWindow
-				// call in the LMB click path — grants the workspace's file
-				// dialog permission to pop to the front.
-				AllowSetForegroundWindow(ASFW_ANY);
-				U_LOG_W("Launcher: Enter on Browse tile");
-			} else if (sel >= 0 && sel < (int)n_visible) {
-				sys->pending_launcher_click_index = visible_to_full[sel];
-				launcher_set_visible(sys, mc, false);
-				U_LOG_W("Launcher: Enter on tile vis=%d full=%d",
-				        sel, visible_to_full[sel]);
-			}
-		}
-		if (GetAsyncKeyState(VK_ESCAPE) & 1) {
-			launcher_set_visible(sys, mc, false);
-			U_LOG_W("Launcher: Esc dismissed");
-		}
-		// Phase 6.6: Ctrl+R = refresh app list (re-scan sidecars).
-		if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState('R') & 1)) {
-			sys->pending_launcher_click_index = IPC_LAUNCHER_ACTION_REFRESH;
-			launcher_set_visible(sys, mc, false);
-			U_LOG_W("Launcher: Ctrl+R refresh");
-		}
-
-		// Phase 6.5: mouse wheel scrolls the grid. Consume scroll before
-		// the normal window-resize scroll handler below.
-		if (mc->window != nullptr) {
-			int32_t scroll = comp_d3d11_window_consume_scroll(mc->window);
-			if (scroll != 0) {
-				int total_rows = (n_selectable + LAUNCHER_GRID_COLS - 1) / LAUNCHER_GRID_COLS;
-				if (scroll < 0) {
-					sys->launcher_scroll_row++;
-				} else if (scroll > 0 && sys->launcher_scroll_row > 0) {
-					sys->launcher_scroll_row--;
-				}
-				if (sys->launcher_scroll_row > total_rows - 1) {
-					sys->launcher_scroll_row = total_rows - 1;
-				}
-				if (sys->launcher_scroll_row < 0) {
-					sys->launcher_scroll_row = 0;
-				}
-			}
-		}
-
-		// Auto-scroll to keep selected tile in view.
-		{
-			int sel_row = sys->launcher_selected_index / LAUNCHER_GRID_COLS;
-			if (sel_row < sys->launcher_scroll_row) {
-				sys->launcher_scroll_row = sel_row;
-			}
-			// Compute how many rows fit in the visible grid area (estimated).
-			// This uses pixel math matching the render block.
-			float est_panel_h = ui_m_to_tile_px_y(
-			    sys->base.info.display_height_m > 0 ? sys->base.info.display_height_m * 0.55f : 0.217f, sys);
-			float est_margin = ui_m_to_tile_px_x(
-			    (sys->base.info.display_width_m > 0 ? sys->base.info.display_width_m * 0.60f : 0.42f) * 0.04f, sys);
-			float est_title = est_panel_h * 0.13f;
-			float est_section = est_panel_h * 0.07f;
-			float est_tile_w = (ui_m_to_tile_px_x(
-			    sys->base.info.display_width_m > 0 ? sys->base.info.display_width_m * 0.60f : 0.42f, sys)
-			    - 5.0f * est_margin) / 4.0f;
-			uint32_t etpw = sys->base.info.display_pixel_width / sys->tile_columns;
-			uint32_t etph = sys->base.info.display_pixel_height / sys->tile_rows;
-			float edwm = sys->base.info.display_width_m > 0 ? sys->base.info.display_width_m : 0.700f;
-			float edhm = sys->base.info.display_height_m > 0 ? sys->base.info.display_height_m : 0.394f;
-			float epr = (etpw > 0 && etph > 0) ? ((edwm/(float)etpw) / (edhm/(float)etph)) : 1.0f;
-			float est_tile_h = est_tile_w * epr;
-			float est_section_scale = (est_section * 0.65f) /
-			    (mc->font_glyph_h > 0 ? (float)mc->font_glyph_h : 16.0f);
-			float est_label_h = (float)(mc->font_glyph_h > 0 ? mc->font_glyph_h : 16) *
-			    est_section_scale * 0.85f;
-			float est_grid_top = est_title + est_margin +
-			    (float)(mc->font_glyph_h > 0 ? mc->font_glyph_h : 16) * est_section_scale +
-			    est_margin * 0.5f;
-			float est_row_h = est_tile_h + est_label_h + est_margin;
-			float est_avail = est_panel_h - est_grid_top - est_margin;
-			int max_vis_rows = (est_avail > 0 && est_row_h > 0) ? (int)(est_avail / est_row_h) : 3;
-			if (max_vis_rows < 1) max_vis_rows = 1;
-
-			if (sel_row >= sys->launcher_scroll_row + max_vis_rows) {
-				sys->launcher_scroll_row = sel_row - max_vis_rows + 1;
-			}
-		}
-
-		goto after_key_shortcuts;
-	}
-
 	// ADR-018: the runtime no longer consumes TAB to cycle focus. TAB is
 	// already emitted on the workspace input-event queue (comp_d3d11_window
 	// pushes WORKSPACE_PUBLIC_EVENT_KEY before any suppression), so the
@@ -6731,7 +6356,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// (system task switcher) and SHIFT+TAB (app HUD toggles) are unaffected.
 
 	// DELETE: close focused client
-	if (GetAsyncKeyState(VK_DELETE) & 1) {
+	// #308: don't close the focused app on DELETE while the controller has
+	// grabbed input for a modal UI (the launcher band owns the keyboard then).
+	if ((GetAsyncKeyState(VK_DELETE) & 1) && !sys->input_grabbed) {
 		// Phase 2.K: keyboard shortcut now routes through the same helper
 		// the public API uses. Behaviour is unchanged for users.
 		if (mc->focused_slot >= 0) {
@@ -6757,9 +6384,6 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// controller now; the runtime no longer intercepts them. Keys flow
 	// through xrEnumerateWorkspaceInputEventsEXT and the controller
 	// pushes per-client poses via xrSetWorkspaceClientWindowPoseEXT.
-
-after_key_shortcuts:
-	(void)0; // label target for the launcher-visible fast-path above.
 
 	// Per-frame raycast: drives wakeup signaling AND publishes cursor
 	// position + hit-Z for the cursor render pass. spec_version 13: cursor
@@ -6824,9 +6448,14 @@ after_key_shortcuts:
 		// Publish cursor screen position + hit Z for the runtime's
 		// cursor render pass to consume. hit_z = 0 when off-window so
 		// the cursor falls back to the panel plane (zero disparity).
+		// #308: while the controller has grabbed input for a z=0 modal UI
+		// (the launcher band), pin the cursor to z=0 too — otherwise it floats
+		// at the pushed-back window depth and the per-eye disparity makes it
+		// misalign with the band (clicks land off-tile, resize affordances show).
 		mc->cursor_panel_x = cpt.x;
 		mc->cursor_panel_y = cpt.y;
-		mc->cursor_hit_z_m = (cursor_hover.slot >= 0) ? cursor_hover.hit_z_m : 0.0f;
+		mc->cursor_hit_z_m =
+		    (!sys->input_grabbed && cursor_hover.slot >= 0) ? cursor_hover.hit_z_m : 0.0f;
 	}
 
 	// Left-click: focus window, close button, title bar drag, or content click.
@@ -6836,41 +6465,17 @@ after_key_shortcuts:
 		bool lmb_just_pressed = lmb_held && !mc->prev_lmb_held;
 		mc->prev_lmb_held = lmb_held;
 
-		if (lmb_just_pressed) {
+		// #308: while the controller has grabbed input for a modal UI (the
+		// launcher band), the runtime must NOT run its own per-frame click
+		// policy (close-button, content-click forward / synthetic-click). The
+		// band owns every click; the WndProc already suppresses app-forwarding,
+		// but this render-thread handler synthesizes clicks to the focused app's
+		// HWND directly, which otherwise leaks a band click through to the
+		// window behind it. Gate the whole block off while grabbed.
+		if (lmb_just_pressed && !sys->input_grabbed) {
 			POINT pt;
 			GetCursorPos(&pt);
 			ScreenToClient(mc->hwnd, &pt);
-
-			// Phase 5.9/5.10/5.14: launcher takes click priority when visible.
-			// - vis_tile in [0, n_visible-1]  → real tile, store full index
-			// - vis_tile == n_visible         → Browse-for-app virtual tile
-			// - vis_tile == -1                → gap/title/header, swallow
-			// - vis_tile == -2                → outside panel, dismiss
-			if (mc->launcher_visible) {
-				int visible_to_full[IPC_LAUNCHER_MAX_APPS];
-				uint32_t n_visible = launcher_build_visible_list(sys, visible_to_full);
-				int vis_tile = launcher_hit_test(sys, pt, n_visible);
-				if (vis_tile >= 0 && vis_tile < (int)n_visible) {
-					sys->pending_launcher_click_index = visible_to_full[vis_tile];
-					launcher_set_visible(sys, mc, false);
-					U_LOG_W("Launcher: tile vis=%d full=%d clicked",
-					        vis_tile, visible_to_full[vis_tile]);
-				} else if (vis_tile == (int)n_visible) {
-					sys->pending_launcher_click_index = IPC_LAUNCHER_ACTION_BROWSE;
-					launcher_set_visible(sys, mc, false);
-					// Phase 5.14: grant any process foreground-activation
-					// permission so the workspace's GetOpenFileNameA dialog can
-					// pop to the front. The service currently has foreground
-					// from the click, so it has the right to grant this.
-					AllowSetForegroundWindow(ASFW_ANY);
-					U_LOG_W("Launcher: Browse tile clicked");
-				} else if (vis_tile == -2) {
-					launcher_set_visible(sys, mc, false);
-					U_LOG_W("Launcher: dismissed by click outside panel");
-				}
-				// Either way, do not propagate this click to window logic.
-				goto after_lmb_handling;
-			}
 
 			// Spatial raycast: cast ray from eye through cursor on display surface
 			struct workspace_hit_result hit = workspace_raycast_hit_test(sys, mc, pt);
@@ -7090,8 +6695,6 @@ after_key_shortcuts:
 			} // close unconditional block (post-migration: title-bar + edge resize delegated to controller)
 		}
 	}
-	after_lmb_handling:
-
 	// Right-click: title bar RMB drag = rotation, content RMB = focus + forward to app.
 	// Call GetAsyncKeyState ONCE to avoid consuming the & 1 press bit (Phase 2 lesson #4).
 	{
@@ -7099,28 +6702,6 @@ after_key_shortcuts:
 		bool rmb_held = (rmb_state & 0x8000) != 0;
 		bool rmb_just_pressed = rmb_held && !mc->prev_rmb_held;
 		mc->prev_rmb_held = rmb_held;
-
-		// Phase 5.13: launcher RMB context menu. When the launcher is
-		// visible, right-click on a tile pops a Win32 menu with Launch +
-		// Remove (session-only) + Cancel. Branch before the existing
-		// window-drag handling so it doesn't try to start a rotation drag
-		// on a tile. Suppress Launch/Remove visual hit routing to the
-		// window below.
-		if (mc->launcher_visible && rmb_just_pressed) {
-			POINT pt;
-			GetCursorPos(&pt);
-			ScreenToClient(mc->hwnd, &pt);
-			int visible_to_full[IPC_LAUNCHER_MAX_APPS];
-			uint32_t n_visible = launcher_build_visible_list(sys, visible_to_full);
-			int vis_tile = launcher_hit_test(sys, pt, n_visible);
-			if (vis_tile >= 0 && vis_tile < (int)n_visible) {
-				int full_idx = visible_to_full[vis_tile];
-				launcher_show_context_menu(sys, mc, pt, full_idx);
-			}
-			// Eat the RMB regardless of hit so it doesn't start a drag
-			// on a window that might be peeking through the panel.
-			goto after_rmb_handling;
-		}
 
 		// RMB rotation drag and RMB-content focus are the workspace
 		// controller's job (ADR-018 / PR 4 of the runtime→controller
@@ -7130,17 +6711,12 @@ after_key_shortcuts:
 		// with quaternion from yaw/pitch), focus via
 		// xrSetWorkspaceFocusedClientEXT on RMB-on-tile, or context menu.
 		(void)rmb_just_pressed;
-
-	after_rmb_handling:
-		(void)0; // label target for the launcher-visible fast-path above.
 	}
 
 	// #305: scroll-to-resize, Shift+Scroll Z-depth, and [ / ] Z-step are now
 	// owned by the workspace controller (ADR-018 — controller owns interactive
 	// policy). The runtime emits SCROLL_EXT / KEY_EXT on the public event
 	// surface; the controller drives size/Z via xrSetWorkspaceClientWindowPoseEXT.
-	// (The launcher grid still consumes scroll via comp_d3d11_window_consume_scroll
-	// above — that path stays until the launcher itself moves out per #308.)
 
 	// Handle swap chain resize
 	if (mc->hwnd != nullptr && mc->swap_chain) {
@@ -7314,9 +6890,11 @@ after_key_shortcuts:
 		}
 	}
 
-	// Empty state: DisplayXR logo + "Press Ctrl+L" hint when no clients are visible
-	// and the launcher isn't open.
-	if (mc->client_count == 0 && !mc->launcher_visible && mc->font_atlas_srv) {
+	// Empty state: DisplayXR logo + a neutral hint when no clients are visible.
+	// The runtime no longer owns the launcher (migrated to the workspace
+	// controller in #308), so the hint doesn't reference any controller-specific
+	// hotkey.
+	if (mc->client_count == 0 && mc->font_atlas_srv) {
 		// Lazy-load the embedded logo PNG on first entry.
 		if (!mc->logo_load_tried) {
 			mc->logo_load_tried = true;
@@ -7340,7 +6918,7 @@ after_key_shortcuts:
 		resolve_active_view_dims(sys, ca_w, ca_h, &half_w, &half_h);
 		const float scale = 3.0f;
 		const float gh = (float)mc->font_glyph_h * scale;
-		const char *hint = "Press Ctrl+L to open launcher";
+		const char *hint = "No windows open";
 
 		// Logo target height: 35% of view height, preserving aspect ratio.
 		float logo_dst_h = (float)half_h * 0.35f;
@@ -7377,10 +6955,39 @@ after_key_shortcuts:
 			float logo_y = cy - block_h * 0.5f;
 			float hint_y = logo_y + (mc->logo_srv ? logo_dst_h + gap : 0.0f);
 
+			// #308: when the launcher band is up (controller grabbed input), push
+			// this empty-state splash BEHIND the display plane so it recedes like
+			// the pushed-back windows rather than fighting the band at z = 0. Add
+			// uncrossed per-eye disparity of ~5% of the splash width (±2.5%/eye).
+			// Sign is the inverse of the cursor's front (crossed) convention:
+			// behind → LEFT eye shifts left, RIGHT eye shifts right.
+			float splash_disp = 0.0f;
+			float blur_screen_px = 0.0f; // depth-of-field blur radius, in destination px
+			if (sys->input_grabbed) {
+				float disp_base = (logo_dst_w > 0.0f) ? logo_dst_w : (float)half_w * 0.5f;
+				float half = 0.025f * disp_base; // 5% total separation
+				int eye_idx = (int)(col % 2);
+				splash_disp = (eye_idx == 0) ? -half : +half;
+				// Screen-space blur radius applied uniformly to the logo AND the
+				// hint text below it (matched depth-of-field). ~3% of the splash
+				// width (the logo's 6% read as too strong).
+				blur_screen_px = 0.03f * disp_base;
+			}
+
 			// --- Logo quad ---
 			if (mc->logo_srv) {
 				ID3D11ShaderResourceView *logo_srv = mc->logo_srv.get();
 				sys->context->PSSetShaderResources(0, 1, &logo_srv);
+
+				// #308: when pushed behind the band, render the logo through the
+				// box-blur pixel shader (depth-of-field) at a UV radius of ~2% of
+				// the image width. Single draw — the blur is computed in-shader, so
+				// it doesn't depend on blend-state accumulation. Falls back to the
+				// sharp blit_ps when not pushed back (or if the blur PS is missing).
+				bool blurred = sys->input_grabbed && sys->blit_blur_ps;
+				if (blurred) {
+					sys->context->PSSetShader(sys->blit_blur_ps.get(), nullptr, 0);
+				}
 				D3D11_MAPPED_SUBRESOURCE m;
 				if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
 				              D3D11_MAP_WRITE_DISCARD, 0, &m))) {
@@ -7390,11 +6997,17 @@ after_key_shortcuts:
 					cb->src_size[0] = (float)mc->logo_w; cb->src_size[1] = (float)mc->logo_h;
 					cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 					cb->convert_srgb = 0.0f;
-					cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
+					cb->chrome_alpha = 0.0f;
+					cb->_pad_chrome[0] = 0.0f; // chrome_alpha.y: keep out of solid-color mode
 					cb->corner_radius = 0; cb->corner_aspect = 0;
 					cb->edge_feather = 0; cb->glow_intensity = 0;
+					// Blur PS reads glow_falloff/glow_extent as the X/Y UV radius.
+					// Convert the screen-space radius to this quad's UV scale so the
+					// logo blurs by the same screen amount as the hint text below.
+					cb->glow_falloff = blurred ? (blur_screen_px / logo_dst_w) : 0.0f;
+					cb->glow_extent  = blurred ? (blur_screen_px / logo_dst_h) : 0.0f;
 					cb->quad_mode = 0;
-					cb->dst_offset[0] = cx - logo_dst_w * 0.5f;
+					cb->dst_offset[0] = cx - logo_dst_w * 0.5f + splash_disp;
 					cb->dst_offset[1] = logo_y;
 					cb->dst_rect_wh[0] = logo_dst_w;
 					cb->dst_rect_wh[1] = logo_dst_h;
@@ -7403,11 +7016,23 @@ after_key_shortcuts:
 					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 					sys->context->Draw(4, 0);
 				}
+				if (blurred) {
+					sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0); // restore for hint text
+				}
 			}
 
 			// --- Hint text ---
 			ID3D11ShaderResourceView *font_srv = mc->font_atlas_srv.get();
 			sys->context->PSSetShaderResources(0, 1, &font_srv);
+			// Match the logo's screen-space blur on the hint text (depth-of-field).
+			// The per-glyph UV radius reduces to a constant because the glyph width
+			// cancels (dst_gw = src_gw * scale): rx = blur_px / (atlas_w * scale).
+			bool hint_blur = sys->input_grabbed && sys->blit_blur_ps;
+			float hint_rx = hint_blur ? (blur_screen_px / ((float)mc->font_atlas_w * scale)) : 0.0f;
+			float hint_ry = hint_blur ? (blur_screen_px / ((float)mc->font_atlas_h * scale)) : 0.0f;
+			if (hint_blur) {
+				sys->context->PSSetShader(sys->blit_blur_ps.get(), nullptr, 0);
+			}
 			// Measure text width
 			float tw = 0;
 			for (const char *p = hint; *p; p++) {
@@ -7415,7 +7040,7 @@ after_key_shortcuts:
 				if (ch < 0x20 || ch > 0x7E) ch = '?';
 				tw += mc->glyph_advances[ch - 0x20] * scale;
 			}
-			float tx = cx - tw * 0.5f;
+			float tx = cx - tw * 0.5f + splash_disp;
 			float cursor = 0;
 			for (const char *p = hint; *p; p++) {
 				unsigned char ch = (unsigned char)*p;
@@ -7438,6 +7063,8 @@ after_key_shortcuts:
 					cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
 					cb->corner_radius = 0; cb->corner_aspect = 0;
 					cb->edge_feather = 0; cb->glow_intensity = 0;
+					cb->glow_falloff = hint_rx; // blur PS X/Y UV radius (0 when sharp)
+					cb->glow_extent = hint_ry;
 					cb->quad_mode = 0;
 					cb->dst_offset[0] = tx + cursor; cb->dst_offset[1] = hint_y;
 					cb->dst_rect_wh[0] = dst_gw; cb->dst_rect_wh[1] = gh;
@@ -7447,6 +7074,9 @@ after_key_shortcuts:
 					sys->context->Draw(4, 0);
 				}
 				cursor += dst_gw;
+			}
+			if (hint_blur) {
+				sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0); // restore sharp PS
 			}
 		}
 	}
@@ -8390,599 +8020,6 @@ after_key_shortcuts:
 	// re-added controller-side on the new overlay swapchain mechanism — deferred
 	// to a follow-up.
 
-	// Phase 5.7 + 5.8: spatial launcher panel.
-	// Drawn at (0,0,0) in display coordinates — zero-disparity plane — so it
-	// appears on the physical display surface, which maximizes viewing comfort.
-	// At z=0 there is no parallax, so the panel lands at the same pixel
-	// position for every eye; we just center-draw into each tile.
-	//
-	// Layout (5.8): title bar text "DisplayXR Launcher" → "Installed" header
-	// → tile grid (4-column, wraps to additional rows). Hard-coded placeholder
-	// app names for now; real apps come over IPC in a follow-up task.
-	if (mc->launcher_visible) {
-		uint32_t ca_w = sys->base.info.display_pixel_width;
-		uint32_t ca_h = sys->base.info.display_pixel_height;
-		if (ca_w == 0) ca_w = 3840;
-		if (ca_h == 0) ca_h = 2160;
-		uint32_t half_w, half_h;
-		resolve_active_view_dims(sys, ca_w, ca_h, &half_w, &half_h);
-		uint32_t num_views = sys->tile_columns * sys->tile_rows;
-
-		// Panel size as a fraction of the physical display — resolution-
-		// and aspect-independent. Using fractions of display_{width,height}_m
-		// instead of absolute meters ensures the panel scales correctly across
-		// laptop, tablet, and desktop displays.
-		float disp_w_m = sys->base.info.display_width_m;
-		float disp_h_m = sys->base.info.display_height_m;
-		if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
-		if (disp_h_m <= 0.0f) disp_h_m = 0.394f;
-
-		const float panel_w_frac = 0.60f;
-		const float panel_h_frac = 0.85f;
-		float panel_w_m = disp_w_m * panel_w_frac;
-		float panel_h_m = disp_h_m * panel_h_frac;
-
-		float panel_w_px = ui_m_to_tile_px_x(panel_w_m, sys);
-		float panel_h_px = ui_m_to_tile_px_y(panel_h_m, sys);
-
-		// Tile grid layout (panel-relative). 4 columns wraps to additional
-		// rows when more apps are present. All sizes derived from panel
-		// dimensions so the layout scales with display size.
-		const int LAUNCHER_GRID_COLS = 4;
-		float margin = panel_w_px * 0.04f;
-		float title_h = panel_h_px * 0.13f;
-		float section_h = panel_h_px * 0.07f;
-		float tile_w = (panel_w_px - (LAUNCHER_GRID_COLS + 1) * margin) /
-		               (float)LAUNCHER_GRID_COLS;
-		// Physically square tiles: X pixels are wider than Y pixels in
-		// SBS mode (1920 pixels span 0.700m but 2160 span 0.394m).
-		// Scale tile_h so each tile is the same physical width and height.
-		uint32_t tpw, tph;
-		resolve_active_view_dims(sys,
-		                         sys->base.info.display_pixel_width,
-		                         sys->base.info.display_pixel_height,
-		                         &tpw, &tph);
-		float pix_ratio = (tpw > 0 && tph > 0 && disp_w_m > 0 && disp_h_m > 0)
-		    ? ((disp_w_m / (float)tpw) / (disp_h_m / (float)tph))
-		    : 1.0f;
-		float tile_h = tile_w * pix_ratio;
-
-		// App list pushed from the workspace controller via clear+add IPC calls.
-		// Stored on sys so it survives multi-comp create/destroy. Empty until
-		// the controller completes its first registered_apps_load + push;
-		// empty-state branch below handles that.
-		const struct ipc_launcher_app *apps = sys->launcher_apps;
-		int visible_to_full[IPC_LAUNCHER_MAX_APPS];
-		uint32_t n_visible = launcher_build_visible_list(sys, visible_to_full);
-		uint32_t n_apps = n_visible; // rest of this block treats the list as compacted
-
-		// Phase 6.2: per-frame hover detection for mouse-over highlight.
-		// Hit-test the cursor against the tile grid so the render can draw
-		// a subtle highlight on the tile under the pointer.
-		if (mc->hwnd != nullptr) {
-			POINT cpt;
-			GetCursorPos(&cpt);
-			ScreenToClient(mc->hwnd, &cpt);
-			sys->launcher_hover_index = launcher_hit_test(sys, cpt, n_visible);
-		} else {
-			sys->launcher_hover_index = -1;
-		}
-
-		// Pipeline setup once — then per-eye scissor + draw. Bind the font
-		// atlas SRV for text glyph sampling; solid-color draws ignore it.
-		sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
-		sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
-		sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-		sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-		ID3D11RenderTargetView *launcher_rtvs[] = {mc->combined_atlas_rtv.get()};
-		sys->context->OMSetRenderTargets(1, launcher_rtvs, nullptr);
-		sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
-		sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-		sys->context->IASetInputLayout(nullptr);
-		sys->context->RSSetState(sys->rasterizer_state.get());
-		sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
-		D3D11_VIEWPORT launcher_vp = {};
-		launcher_vp.Width = (float)ca_w;
-		launcher_vp.Height = (float)ca_h;
-		launcher_vp.MaxDepth = 1.0f;
-		sys->context->RSSetViewports(1, &launcher_vp);
-		if (mc->font_atlas_srv) {
-			ID3D11ShaderResourceView *font_srv = mc->font_atlas_srv.get();
-			sys->context->PSSetShaderResources(0, 1, &font_srv);
-			sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
-		}
-
-		// Helper: draw a solid-color rounded rect at (dx,dy,dw,dh) in atlas
-		// pixels with the given RGBA. Used for the panel background and tile
-		// backgrounds. Updates the constant buffer and issues a single Draw.
-		auto draw_solid_rect = [&](float dx, float dy, float dw, float dh,
-		                           float r, float g, float b, float a,
-		                           float corner_radius, float glow_intensity) {
-			D3D11_MAPPED_SUBRESOURCE m;
-			if (FAILED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
-			                             D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-				return;
-			}
-			BlitConstants *cb = static_cast<BlitConstants *>(m.pData);
-			cb->src_rect[0] = r;
-			cb->src_rect[1] = g;
-			cb->src_rect[2] = b;
-			cb->src_rect[3] = a;
-			cb->src_size[0] = 1;
-			cb->src_size[1] = 1;
-			cb->dst_size[0] = (float)ca_w;
-			cb->dst_size[1] = (float)ca_h;
-			cb->convert_srgb = 2.0f; // solid-color mode
-			cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
-			// Negative radius + negative aspect = all four corners rounded.
-			cb->corner_radius = -fabsf(corner_radius);
-			cb->corner_aspect = (dh > 0.0f) ? -(dw / dh) : -1.0f;
-			cb->edge_feather = (dh > 0.0f) ? (2.0f / dh) : 0.0f;
-			cb->glow_intensity = glow_intensity;
-			cb->quad_mode = 0;
-			cb->dst_offset[0] = dx;
-			cb->dst_offset[1] = dy;
-			cb->dst_rect_wh[0] = dw;
-			cb->dst_rect_wh[1] = dh;
-			memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
-			memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
-			sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-			sys->context->Draw(4, 0);
-		};
-
-		// Helper: width of a string in atlas pixels at the given scale.
-		auto measure_text = [&](const char *text, float scale) -> float {
-			float w = 0.0f;
-			for (const char *p = text; *p != '\0'; p++) {
-				unsigned char ch = (unsigned char)*p;
-				if (ch < 0x20 || ch > 0x7E) ch = '?';
-				int gi = ch - 0x20;
-				w += mc->glyph_advances[gi] * scale;
-			}
-			return w;
-		};
-
-		// Helper: draw a label centered horizontally within a (tx, tile_w)
-		// box, ellipsis-truncated if it doesn't fit. Used for tile labels
-		// where long sidecar names like "Cube D3D11 (Handle)" would
-		// otherwise overflow into adjacent tiles.
-		auto draw_label_centered = [&](const char *text, float tx, float ty,
-		                               float box_w, float scale) {
-			float full_w = 0.0f;
-			for (const char *p = text; *p != '\0'; p++) {
-				unsigned char ch = (unsigned char)*p;
-				if (ch < 0x20 || ch > 0x7E) ch = '?';
-				full_w += mc->glyph_advances[ch - 0x20] * scale;
-			}
-			if (full_w <= box_w) {
-				float cx = tx + (box_w - full_w) * 0.5f;
-				// Inline draw to avoid the lambda forward-decl problem.
-				float cursor = 0.0f;
-				float dst_gh = (float)mc->font_glyph_h * scale;
-				for (const char *p = text; *p != '\0'; p++) {
-					unsigned char ch = (unsigned char)*p;
-					if (ch < 0x20 || ch > 0x7E) ch = '?';
-					int gi = ch - 0x20;
-					float src_gw = mc->glyph_advances[gi];
-					float src_x = 0.0f;
-					for (int j = 0; j < gi; j++) src_x += mc->glyph_advances[j];
-					float dst_gw = src_gw * scale;
-					D3D11_MAPPED_SUBRESOURCE mm;
-					if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
-					                                D3D11_MAP_WRITE_DISCARD, 0, &mm))) {
-						BlitConstants *cb = static_cast<BlitConstants *>(mm.pData);
-						cb->src_rect[0] = src_x; cb->src_rect[1] = 0.0f;
-						cb->src_rect[2] = src_gw; cb->src_rect[3] = (float)mc->font_glyph_h;
-						cb->src_size[0] = (float)mc->font_atlas_w;
-						cb->src_size[1] = (float)mc->font_atlas_h;
-						cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
-						cb->convert_srgb = 0.0f;
-						cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
-						cb->corner_radius = 0.0f; cb->corner_aspect = 0.0f;
-						cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
-						cb->quad_mode = 0;
-						cb->dst_offset[0] = cx + cursor; cb->dst_offset[1] = ty;
-						cb->dst_rect_wh[0] = dst_gw; cb->dst_rect_wh[1] = dst_gh;
-						memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
-						memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
-						sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-						sys->context->Draw(4, 0);
-					}
-					cursor += dst_gw;
-				}
-				return;
-			}
-
-			// Doesn't fit — build a truncated version with trailing "..".
-			// Greedy: walk chars while (width + ".."_width) <= box_w.
-			float dot_w = mc->glyph_advances['.' - 0x20] * scale;
-			float ellipsis_w = dot_w * 2.0f;
-			char buf[160];
-			int n = 0;
-			float w = 0.0f;
-			for (const char *p = text; *p != '\0' && n < (int)sizeof(buf) - 3; p++) {
-				unsigned char ch = (unsigned char)*p;
-				if (ch < 0x20 || ch > 0x7E) ch = '?';
-				float gw = mc->glyph_advances[ch - 0x20] * scale;
-				if (w + gw + ellipsis_w > box_w) break;
-				buf[n++] = (char)ch;
-				w += gw;
-			}
-			buf[n++] = '.'; buf[n++] = '.';
-			buf[n] = '\0';
-			float total_w = w + ellipsis_w;
-			float cx = tx + (box_w - total_w) * 0.5f;
-			if (cx < tx) cx = tx;
-
-			// Draw the truncated buffer (same inline glyph loop).
-			float cursor = 0.0f;
-			float dst_gh = (float)mc->font_glyph_h * scale;
-			for (int i = 0; i < n; i++) {
-				int gi = (unsigned char)buf[i] - 0x20;
-				float src_gw = mc->glyph_advances[gi];
-				float src_x = 0.0f;
-				for (int j = 0; j < gi; j++) src_x += mc->glyph_advances[j];
-				float dst_gw = src_gw * scale;
-				D3D11_MAPPED_SUBRESOURCE mm;
-				if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
-				                                D3D11_MAP_WRITE_DISCARD, 0, &mm))) {
-					BlitConstants *cb = static_cast<BlitConstants *>(mm.pData);
-					cb->src_rect[0] = src_x; cb->src_rect[1] = 0.0f;
-					cb->src_rect[2] = src_gw; cb->src_rect[3] = (float)mc->font_glyph_h;
-					cb->src_size[0] = (float)mc->font_atlas_w;
-					cb->src_size[1] = (float)mc->font_atlas_h;
-					cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
-					cb->convert_srgb = 0.0f;
-					cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
-					cb->corner_radius = 0.0f; cb->corner_aspect = 0.0f;
-					cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
-					cb->quad_mode = 0;
-					cb->dst_offset[0] = cx + cursor; cb->dst_offset[1] = ty;
-					cb->dst_rect_wh[0] = dst_gw; cb->dst_rect_wh[1] = dst_gh;
-					memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
-					memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
-					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-					sys->context->Draw(4, 0);
-				}
-				cursor += dst_gw;
-			}
-		};
-
-		// Helper: draw a string starting at (dx, dy) (top-left, atlas px) at
-		// the given scale, sampling the font atlas. One Draw call per glyph.
-		auto draw_text = [&](const char *text, float dx, float dy, float scale) {
-			float cursor = 0.0f;
-			float dst_gh = (float)mc->font_glyph_h * scale;
-			for (const char *p = text; *p != '\0'; p++) {
-				unsigned char ch = (unsigned char)*p;
-				if (ch < 0x20 || ch > 0x7E) ch = '?';
-				int gi = ch - 0x20;
-				float src_gw = mc->glyph_advances[gi];
-				float src_x = 0.0f;
-				for (int i = 0; i < gi; i++) {
-					src_x += mc->glyph_advances[i];
-				}
-				float dst_gw = src_gw * scale;
-
-				D3D11_MAPPED_SUBRESOURCE m;
-				if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
-				                                D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-					BlitConstants *cb = static_cast<BlitConstants *>(m.pData);
-					cb->src_rect[0] = src_x;
-					cb->src_rect[1] = 0.0f;
-					cb->src_rect[2] = src_gw;
-					cb->src_rect[3] = (float)mc->font_glyph_h;
-					cb->src_size[0] = (float)mc->font_atlas_w;
-					cb->src_size[1] = (float)mc->font_atlas_h;
-					cb->dst_size[0] = (float)ca_w;
-					cb->dst_size[1] = (float)ca_h;
-					cb->convert_srgb = 0.0f; // textured (font atlas is linear)
-					cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
-					cb->corner_radius = 0.0f;
-					cb->corner_aspect = 0.0f;
-					cb->edge_feather = 0.0f;
-					cb->glow_intensity = 0.0f;
-					cb->quad_mode = 0;
-					cb->dst_offset[0] = dx + cursor;
-					cb->dst_offset[1] = dy;
-					cb->dst_rect_wh[0] = dst_gw;
-					cb->dst_rect_wh[1] = dst_gh;
-					memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
-					memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
-					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-					sys->context->Draw(4, 0);
-				}
-				cursor += dst_gw;
-			}
-		};
-
-		for (uint32_t v = 0; v < num_views && v < XRT_MAX_VIEWS; v++) {
-			uint32_t col = v % sys->tile_columns;
-			uint32_t row = v / sys->tile_columns;
-
-			// Scissor clips to this tile's bounds so the solid quad cannot
-			// bleed into neighbouring eyes.
-			D3D11_RECT scissor;
-			scissor.left = (LONG)(col * half_w);
-			scissor.top = (LONG)(row * half_h);
-			scissor.right = (LONG)((col + 1) * half_w);
-			scissor.bottom = (LONG)((row + 1) * half_h);
-			sys->context->RSSetScissorRects(1, &scissor);
-
-			// Tile-local center — z=0 means no parallax, identical for both eyes.
-			float tile_cx = (float)(col * half_w) + (float)half_w * 0.5f;
-			float tile_cy = (float)(row * half_h) + (float)half_h * 0.5f;
-			float panel_x = tile_cx - panel_w_px * 0.5f;
-			float panel_y = tile_cy - panel_h_px * 0.5f;
-
-			// 1) Panel background — dark slate with ~92% alpha.
-			draw_solid_rect(panel_x, panel_y, panel_w_px, panel_h_px,
-			                0.08f, 0.10f, 0.14f, 0.92f, 0.08f, 0.0f);
-
-			// 2) Title bar text "DisplayXR Launcher", centered horizontally
-			// in the title strip.
-			const char *title_text = "DisplayXR Launcher";
-			float title_scale = (title_h * 0.55f) / (float)mc->font_glyph_h;
-			float title_w = measure_text(title_text, title_scale);
-			float title_x = panel_x + (panel_w_px - title_w) * 0.5f;
-			float title_y = panel_y + (title_h - mc->font_glyph_h * title_scale) * 0.5f;
-			draw_text(title_text, title_x, title_y, title_scale);
-
-			// 3) "Installed" section header, left-aligned with grid margin.
-			const char *installed_text = "Installed";
-			float section_scale = (section_h * 0.65f) / (float)mc->font_glyph_h;
-			float section_x = panel_x + margin;
-			float section_y = panel_y + title_h + margin * 0.5f;
-			draw_text(installed_text, section_x, section_y, section_scale);
-
-			// 4) Tile grid — 4-column wrapping. Each row also reserves space
-			// below the tile for its label. If the registry is empty (e.g.
-			// scanner found no sidecars and workspace hasn't pushed yet), show
-			// an empty-state hint instead of a blank grid.
-			float label_scale = section_scale * 0.425f;
-			float label_h = (float)mc->font_glyph_h * label_scale;
-			float grid_top = section_y + (float)mc->font_glyph_h * section_scale + margin * 0.5f;
-
-			// Phase 6.5: apply scroll offset to grid_top. Each scroll
-			// row shifts the grid up by one row height in pixels.
-			float row_h_px = tile_h + label_h + margin;
-			float scroll_offset_px = (float)sys->launcher_scroll_row * row_h_px;
-			grid_top -= scroll_offset_px;
-
-			// Visible grid bounds (panel-local) for culling off-screen tiles.
-			float grid_visible_top = section_y + (float)mc->font_glyph_h * section_scale + margin * 0.5f;
-			float grid_visible_bottom = panel_y + panel_h_px - margin;
-
-			// Render real tiles (compacted via visible_to_full) + the virtual
-			// "Add app…" Browse tile at position n_visible. When there are no
-			// real tiles we still draw the Browse tile plus the empty-state
-			// hint above it so the launcher is never completely blank.
-			if (n_apps == 0) {
-				const char *empty_line1 = "No apps discovered";
-				const char *empty_line2 = "Add a .displayxr.json sidecar next to your exe, or use the tile below.";
-				float empty_scale_1 = section_scale * 0.95f;
-				float empty_scale_2 = section_scale * 0.60f;
-				float w1 = measure_text(empty_line1, empty_scale_1);
-				float w2 = measure_text(empty_line2, empty_scale_2);
-				float ex1 = panel_x + (panel_w_px - w1) * 0.5f;
-				float ex2 = panel_x + (panel_w_px - w2) * 0.5f;
-				float ey1 = grid_top + tile_h * 0.15f;
-				float ey2 = ey1 + (float)mc->font_glyph_h * empty_scale_1 + margin * 0.4f;
-				draw_text(empty_line1, ex1, ey1, empty_scale_1);
-				draw_text(empty_line2, ex2, ey2, empty_scale_2);
-			}
-
-			for (uint32_t vi = 0; vi < n_apps; vi++) {
-				int full_idx = visible_to_full[vi];
-				int tcol = (int)(vi % LAUNCHER_GRID_COLS);
-				int trow = (int)(vi / LAUNCHER_GRID_COLS);
-				float tx = panel_x + margin + (float)tcol * (tile_w + margin);
-				float ty = grid_top + (float)trow * (tile_h + label_h + margin);
-
-				// Phase 6.5: cull tiles that scrolled out of the visible grid area.
-				if (ty + tile_h + label_h < grid_visible_top || ty > grid_visible_bottom) {
-					continue;
-				}
-
-				bool tile_running = (sys->running_tile_mask & (1ULL << full_idx)) != 0;
-				bool tile_selected = (sys->launcher_selected_index == (int32_t)vi);
-				bool tile_hovered = (sys->launcher_hover_index == (int32_t)vi);
-
-				// Phase 5.11: glow border for running tiles. Draw an
-				// oversized quad in glow mode (convert_srgb=3.0) so the
-				// shader fades the inner rect into the surrounding margin.
-				// Glow halo: follows keyboard selection only.
-				if (tile_selected) {
-					float glow_margin = tile_h * 0.18f;
-					float gx = tx - glow_margin;
-					float gy = ty - glow_margin;
-					float gw = tile_w + 2.0f * glow_margin;
-					float gh = tile_h + 2.0f * glow_margin;
-					// Separate X/Y extents: glow_extent = X, edge_feather = Y.
-					// Inset by corner radius so glow fills under rounded corners.
-					float cr_inset = 0.06f * tile_h;
-					float glow_ext_x = (glow_margin + cr_inset) / gw;
-					float glow_ext_y = (glow_margin + cr_inset) / gh;
-
-					D3D11_MAPPED_SUBRESOURCE gm;
-					if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
-					                                D3D11_MAP_WRITE_DISCARD, 0, &gm))) {
-						BlitConstants *cb = static_cast<BlitConstants *>(gm.pData);
-						cb->src_rect[0] = 0; cb->src_rect[1] = 0;
-						cb->src_rect[2] = 1; cb->src_rect[3] = 1;
-						cb->src_size[0] = 1; cb->src_size[1] = 1;
-						cb->dst_size[0] = (float)ca_w;
-						cb->dst_size[1] = (float)ca_h;
-						cb->convert_srgb = 3.0f; // glow mode
-						cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
-						cb->corner_radius = 0.0f;
-						cb->corner_aspect = 0.0f;
-						cb->edge_feather = glow_ext_y; // Y extent (repurposed)
-						cb->glow_intensity = 0.85f;
-						cb->glow_extent = glow_ext_x;  // X extent
-						cb->glow_falloff = 6.0f;
-						cb->glow_color[0] = 0.30f;
-						cb->glow_color[1] = 0.85f;
-						cb->glow_color[2] = 1.00f;
-						cb->glow_color[3] = 1.0f;
-						cb->quad_mode = 0;
-						cb->dst_offset[0] = gx;
-						cb->dst_offset[1] = gy;
-						cb->dst_rect_wh[0] = gw;
-						cb->dst_rect_wh[1] = gh;
-						memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
-						memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
-						sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-						sys->context->OMSetBlendState(sys->blend_premul.get(), nullptr, 0xFFFFFFFF);
-						sys->context->Draw(4, 0);
-						sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
-					}
-				}
-
-				// Tile background — slightly lighter than panel, rounded.
-				// Running tiles get a brighter background; hovered tiles
-				// get a subtle extra lift for mouse-over feedback.
-				float bg_r = tile_running ? 0.20f : 0.16f;
-				float bg_g = tile_running ? 0.27f : 0.19f;
-				float bg_b = tile_running ? 0.36f : 0.26f;
-				if (tile_hovered) {
-					bg_r += 0.06f;
-					bg_g += 0.06f;
-					bg_b += 0.06f;
-				}
-				draw_solid_rect(tx, ty, tile_w, tile_h,
-				                bg_r, bg_g, bg_b, 0.95f, 0.06f, 0.0f);
-
-				// Phase 7.3 + 7.4: icon texture over tile background.
-				{
-					const auto &ic = sys->launcher_icons[full_idx];
-					bool use_3d = ic.srv_3d && sys->tile_columns > 1;
-					ID3D11ShaderResourceView *icon_srv = use_3d
-						? ic.srv_3d.get()
-						: ic.srv_2d.get();
-
-					if (icon_srv != nullptr) {
-						uint32_t tex_w = use_3d ? ic.w_3d : ic.w_2d;
-						uint32_t tex_h = use_3d ? ic.h_3d : ic.h_2d;
-
-						// Compute the sub-rect of the icon texture to sample.
-						float sx = 0, sy = 0, sw = (float)tex_w, sh = (float)tex_h;
-						if (use_3d) {
-							const char *lay = ic.layout_3d;
-							bool is_sbs = (lay[0] == 's'); // sbs-lr or sbs-rl
-							bool is_lr  = is_sbs && (lay[4] == 'l');
-							bool is_tb  = (lay[0] == 't'); // tb
-							// col=0 → left eye, col=1 → right eye
-							bool right_eye = (col == 1);
-							if (is_sbs) {
-								sw = (float)(tex_w / 2);
-								sx = (is_lr == right_eye) ? sw : 0;
-							} else {
-								// tb or bt
-								sh = (float)(tex_h / 2);
-								sy = (is_tb == right_eye) ? sh : 0;
-							}
-						}
-
-						// Icons are physically square, tiles are physically square
-						// (but non-square in pixels due to SBS). Fill the tile.
-						float draw_w = tile_w;
-						float draw_h = tile_h;
-						float draw_x = tx;
-						float draw_y = ty;
-
-						D3D11_MAPPED_SUBRESOURCE im;
-						if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
-						                                D3D11_MAP_WRITE_DISCARD, 0, &im))) {
-							BlitConstants *cb = static_cast<BlitConstants *>(im.pData);
-							cb->src_rect[0] = sx;
-							cb->src_rect[1] = sy;
-							cb->src_rect[2] = sw;
-							cb->src_rect[3] = sh;
-							cb->src_size[0] = (float)tex_w;
-							cb->src_size[1] = (float)tex_h;
-							cb->dst_size[0] = (float)ca_w;
-							cb->dst_size[1] = (float)ca_h;
-							cb->convert_srgb = 0.0f;
-							cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
-							// Negative radius + negative aspect = all four corners.
-							cb->corner_radius = -0.06f;
-							cb->corner_aspect = (draw_h > 0.0f) ? -(draw_w / draw_h) : -1.0f;
-							cb->edge_feather = (draw_h > 0.0f) ? (2.0f / draw_h) : 0.0f;
-							cb->glow_intensity = 0.0f;
-							cb->quad_mode = 0;
-							cb->dst_offset[0] = draw_x;
-							cb->dst_offset[1] = draw_y;
-							cb->dst_rect_wh[0] = draw_w;
-							cb->dst_rect_wh[1] = draw_h;
-							memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
-							memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
-							sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-
-							sys->context->PSSetShaderResources(0, 1, &icon_srv);
-							sys->context->Draw(4, 0);
-
-							// Re-bind font atlas for subsequent text draws.
-							if (mc->font_atlas_srv) {
-								ID3D11ShaderResourceView *font_srv = mc->font_atlas_srv.get();
-								sys->context->PSSetShaderResources(0, 1, &font_srv);
-							}
-						}
-					}
-				}
-
-				// Label centered horizontally below tile, ellipsis-truncated
-				// if it would overflow into the neighbouring tile.
-				const char *label = apps[full_idx].name;
-				float label_y = ty + tile_h + margin * 0.15f;
-				draw_label_centered(label, tx, label_y, tile_w, label_scale);
-			}
-
-			// Phase 5.14: virtual "Add app…" Browse tile at position n_apps.
-			// Distinct styling (lighter, more translucent) + "+" glyph +
-			// "Add app…" label. Click here → IPC_LAUNCHER_ACTION_BROWSE.
-			{
-				uint32_t vi = n_apps;
-				int tcol = (int)(vi % LAUNCHER_GRID_COLS);
-				int trow = (int)(vi / LAUNCHER_GRID_COLS);
-				float tx = panel_x + margin + (float)tcol * (tile_w + margin);
-				float ty = grid_top + (float)trow * (tile_h + label_h + margin);
-
-				// Phase 6.5: cull Browse tile if scrolled out of view.
-				if (ty + tile_h + label_h >= grid_visible_top && ty <= grid_visible_bottom) {
-
-				bool browse_selected = (sys->launcher_selected_index == (int32_t)vi);
-				bool browse_hovered = (sys->launcher_hover_index == (int32_t)vi);
-
-				if (browse_selected) {
-					float sm = tile_h * 0.045f;
-					draw_solid_rect(tx - sm, ty - sm,
-					                tile_w + 2.0f * sm, tile_h + 2.0f * sm,
-					                1.00f, 1.00f, 1.00f, 0.90f, 0.06f, 0.0f);
-				}
-
-				float br_r = 0.20f, br_g = 0.22f, br_b = 0.28f;
-				if (browse_hovered) { br_r += 0.06f; br_g += 0.06f; br_b += 0.06f; }
-				draw_solid_rect(tx, ty, tile_w, tile_h,
-				                br_r, br_g, br_b, 0.75f, 0.06f, 0.0f);
-
-				float plus_scale = section_scale * 1.6f;
-				float plus_h = (float)mc->font_glyph_h * plus_scale;
-				draw_label_centered("+", tx, ty + (tile_h - plus_h) * 0.5f,
-				                    tile_w, plus_scale);
-
-				float browse_label_y = ty + tile_h + margin * 0.15f;
-				draw_label_centered("Add app...", tx, browse_label_y,
-				                    tile_w, label_scale);
-
-				} // end cull check for Browse tile
-			}
-		}
-
-		// Clear scissor so downstream passes aren't affected.
-		D3D11_RECT full_scissor = {0, 0, (LONG)ca_w, (LONG)ca_h};
-		sys->context->RSSetScissorRects(1, &full_scissor);
-	}
 
 	// spec_version 17: workspace overlay (controller-pushed display-spanning UI,
 	// e.g. taskbar). Docked at z = 0 (zero disparity) → unlike the cursor below
@@ -9080,9 +8117,16 @@ after_key_shortcuts:
 					}
 					BlitConstants *cb = static_cast<BlitConstants *>(m.pData);
 					memset(cb, 0, sizeof(*cb));
-					cb->src_rect[0] = 0;
+					// spec_version 19: side-by-side stereo overlay → sample the
+					// matching half per eye (col%2: 0 = left, 1 = right), stretched
+					// to the full overlay footprint. Mono = whole image both eyes.
+					float src_w = sys->overlay_stereo_sbs
+					                  ? (float)(sprite_w_px / 2u)
+					                  : (float)sprite_w_px;
+					int eye_idx = (int)(col % 2);
+					cb->src_rect[0] = sys->overlay_stereo_sbs ? (float)eye_idx * src_w : 0.0f;
 					cb->src_rect[1] = 0;
-					cb->src_rect[2] = (float)sprite_w_px;
+					cb->src_rect[2] = src_w;
 					cb->src_rect[3] = (float)sprite_h_px;
 					cb->src_size[0] = (float)sprite_w_px;
 					cb->src_size[1] = (float)sprite_h_px;
@@ -11558,7 +10602,7 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	}
 
 	// Phase 2.I-followup: workspace controllers (no graphics binding) talk
-	// to the service to dispatch workspace + launcher extensions but render
+	// to the service to dispatch workspace extensions but render
 	// nothing. Skip render resource init AND multi-compositor slot
 	// registration; otherwise the controller appears as a renderable tile
 	// inside its own workspace (titled with the controller's xrInstance
@@ -11651,8 +10695,7 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	// Register with multi-compositor in workspace mode. Skip bridge-relay
 	// AND workspace-controller sessions — neither has anything to render,
 	// and a phantom slot would (a) keep mc->client_count > 0 after the
-	// session ends, suppressing the empty-workspace launcher hint and
-	// occluding the launcher when summoned, and (b) for the controller
+	// session ends, suppressing the empty-workspace hint, and (b) for the controller
 	// specifically, surface its own xrInstance applicationName as a tile
 	// title inside the workspace it is supposed to be controlling.
 	// compositor_destroy's unregister call is already a no-op on a
@@ -13968,7 +13011,7 @@ comp_d3d11_service_workspace_set_overlay(struct xrt_system_compositor *xsysc,
                                           float anchor_x, float anchor_y,
                                           float pivot_x, float pivot_y,
                                           float size_w_m, float size_h_m,
-                                          bool visible)
+                                          bool visible, bool stereo_sbs)
 {
 	if (xsysc == nullptr) {
 		return XRT_ERROR_IPC_FAILURE;
@@ -13976,6 +13019,7 @@ comp_d3d11_service_workspace_set_overlay(struct xrt_system_compositor *xsysc,
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
 	sys->overlay_xsc = xsc; // borrowed; controller owns lifetime
+	sys->overlay_stereo_sbs = stereo_sbs;
 	sys->overlay_anchor_x = anchor_x;
 	sys->overlay_anchor_y = anchor_y;
 	sys->overlay_pivot_x = pivot_x;
@@ -14843,140 +13887,14 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 	        "IPC clients will lazy-switch to standalone on next frame");
 }
 
-// Phase 5.8: empty the launcher's app list. The workspace controller calls this
-// before pushing a fresh registry so the tile grid never carries stale entries.
-// Stored on the system (not the multi-comp) so it survives across activations.
+// Modal input grab (XR_EXT_spatial_workspace spec_version 18). Drives the
+// window's input-suppress flag: while grabbed the WndProc stops forwarding
+// keyboard / mouse-button / scroll input to the focused app and routes it all
+// to the controller via the public event ring. The controller sets this while
+// a modal UI it owns (e.g. the launcher band) is up, and clears it on dismiss.
+// No-op if there's no multi-comp yet (workspace not active).
 void
-comp_d3d11_service_clear_launcher_apps(struct xrt_system_compositor *xsysc)
-{
-	if (xsysc == nullptr) {
-		return;
-	}
-
-	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
-
-	sys->launcher_app_count = 0;
-	// Phase 5.13: the hidden-tile state is session-only and indices refer
-	// to positions in launcher_apps, so it only makes sense while that list
-	// is stable. Wipe it whenever a fresh push starts.
-	sys->hidden_tile_mask = 0;
-	sys->launcher_selected_index = -1;
-
-	// Phase 7.2: release all icon textures.
-	for (uint32_t i = 0; i < IPC_LAUNCHER_MAX_APPS; i++) {
-		sys->launcher_icons[i].srv_2d.reset();
-		sys->launcher_icons[i].srv_3d.reset();
-		sys->launcher_icons[i].w_2d = sys->launcher_icons[i].h_2d = 0;
-		sys->launcher_icons[i].w_3d = sys->launcher_icons[i].h_3d = 0;
-		sys->launcher_icons[i].layout_3d[0] = '\0';
-	}
-}
-
-// Phase 5.8: append one app to the launcher's tile grid. Silently dropped if
-// the array is already full. The workspace controller loops over its registry
-// calling this once per entry after a clear. Lives on the system, not the
-// multi-comp.
-void
-comp_d3d11_service_add_launcher_app(struct xrt_system_compositor *xsysc,
-                                    const struct ipc_launcher_app *app)
-{
-	if (xsysc == nullptr || app == nullptr) {
-		return;
-	}
-
-	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
-
-	if (sys->launcher_app_count >= IPC_LAUNCHER_MAX_APPS) {
-		return;
-	}
-
-	sys->launcher_apps[sys->launcher_app_count] = *app;
-	sys->launcher_app_count++;
-
-	// Phase 7.2: load icon textures from paths carried in the IPC message.
-	uint32_t idx = sys->launcher_app_count - 1;
-	struct d3d11_service_system::launcher_icon &icon = sys->launcher_icons[idx];
-	if (app->icon_path[0]) {
-		d3d11_icon_load_from_file(sys->device.get(), app->icon_path,
-		                          icon.srv_2d.put(), &icon.w_2d, &icon.h_2d);
-	}
-	if (app->icon_3d_path[0]) {
-		d3d11_icon_load_from_file(sys->device.get(), app->icon_3d_path,
-		                          icon.srv_3d.put(), &icon.w_3d, &icon.h_3d);
-		snprintf(icon.layout_3d, sizeof(icon.layout_3d), "%s", app->icon_3d_layout);
-	}
-
-	// Wake the compositor window if it exists and the launcher is on-screen,
-	// so the next frame picks up the new tile.
-	struct d3d11_multi_compositor *mc = sys->multi_comp;
-	if (mc != nullptr && mc->hwnd != nullptr && mc->launcher_visible) {
-		InvalidateRect(mc->hwnd, nullptr, FALSE);
-	}
-}
-
-// Phase 5.11: set the running-tile bitmask. Bit i set means launcher_apps[i]
-// has at least one matching IPC client connected. The render pass draws a
-// glow border around any tile whose bit is set. Pushed by the workspace
-// controller from its client-poll loop whenever the running set changes.
-void
-comp_d3d11_service_set_running_tile_mask(struct xrt_system_compositor *xsysc, uint64_t mask)
-{
-	if (xsysc == nullptr) {
-		return;
-	}
-
-	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
-
-	if (sys->running_tile_mask == mask) {
-		return;
-	}
-	sys->running_tile_mask = mask;
-
-	// Wake the compositor if the launcher is on-screen so the new glow
-	// state shows up immediately.
-	struct d3d11_multi_compositor *mc = sys->multi_comp;
-	if (mc != nullptr && mc->hwnd != nullptr && mc->launcher_visible) {
-		InvalidateRect(mc->hwnd, nullptr, FALSE);
-	}
-}
-
-// Phase 5.9/5.10: poll-and-clear the pending launcher tile click. The
-// WM_LBUTTONDOWN handler stores the tile index when the user clicks; the
-// workspace controller calls this from its poll loop, gets the index, and
-// dispatches a CreateProcess on its end (the runtime never executes binaries
-// on the controller's behalf).
-int32_t
-comp_d3d11_service_poll_launcher_click(struct xrt_system_compositor *xsysc)
-{
-	if (xsysc == nullptr) {
-		return -1;
-	}
-
-	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
-
-	// Phase 6.6: check remove first — it takes priority because the
-	// launcher was hidden on remove, so no click can follow.
-	if (sys->pending_launcher_remove_full_index >= 0) {
-		int32_t full = sys->pending_launcher_remove_full_index;
-		sys->pending_launcher_remove_full_index = -1;
-		return -(IPC_LAUNCHER_ACTION_REMOVE_BASE + full);
-	}
-
-	int32_t idx = sys->pending_launcher_click_index;
-	sys->pending_launcher_click_index = -1;
-	return idx;
-}
-
-// Phase 5.7: spatial launcher visibility toggle. Just flips the render-thread
-// bool; the render loop picks it up on the next frame and draws (or skips) the
-// launcher panel overlay. No-op if there's no multi-comp yet (workspace not
-// active).
-void
-comp_d3d11_service_set_launcher_visible(struct xrt_system_compositor *xsysc, bool visible)
+comp_d3d11_service_set_input_grab(struct xrt_system_compositor *xsysc, bool grab)
 {
 	if (xsysc == nullptr) {
 		return;
@@ -14987,19 +13905,27 @@ comp_d3d11_service_set_launcher_visible(struct xrt_system_compositor *xsysc, boo
 
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
 	if (mc == nullptr || mc->suspended) {
-		U_LOG_W("Launcher: set_visible %s ignored — multi-comp not active",
-		        visible ? "true" : "false");
+		U_LOG_W("Workspace: set_input_grab %s ignored — multi-comp not active",
+		        grab ? "true" : "false");
 		return;
 	}
 
-	launcher_set_visible(sys, mc, visible);
-	U_LOG_W("Launcher: %s", visible ? "shown" : "hidden");
-
-	// Wake the render thread so the next frame reflects the new state even
-	// if the render loop is idling on a timer.
-	if (mc->hwnd != nullptr) {
-		InvalidateRect(mc->hwnd, nullptr, FALSE);
+	if (mc->window != nullptr) {
+		comp_d3d11_window_set_input_suppress(mc->window, grab);
 	}
+	sys->input_grabbed = grab; // cursor render reads this to pin to z=0
+
+	// On grab, pull the compositor window to the foreground + give it keyboard
+	// focus. WM_MOUSEWHEEL (and WM_KEYDOWN) are delivered to the focus window —
+	// without this the controller's modal UI (launcher band) wouldn't receive
+	// wheel events to forward as SCROLL_EXT. The controller grants us
+	// foreground rights via AllowSetForegroundWindow before this IPC. (Mirrors
+	// the focus grab the old runtime launcher did on open.)
+	if (grab && mc->hwnd != nullptr) {
+		SetForegroundWindow(mc->hwnd);
+		SetFocus(mc->hwnd);
+	}
+	U_LOG_W("Workspace: input grab %s", grab ? "on" : "off");
 }
 
 void

@@ -49,7 +49,6 @@ add_library(
 	oxr_verify.c
 	oxr_workspace.c
 	oxr_workspace_modal_win32.c
-	oxr_app_launcher.c
 	oxr_workspace_file_dialog.c
 	oxr_xdev.c
 	${CMAKE_CURRENT_BINARY_DIR}/oxr_bindings/b_oxr_generated_bindings.c

@@ -165,20 +165,13 @@ struct comp_d3d11_window
 	volatile LONG input_forward_rect_w;
 	volatile LONG input_forward_rect_h;
 
-	//! Accumulated scroll wheel delta for workspace window resize (positive = enlarge).
-	//! Written by WndProc, read+reset by render loop.
-	volatile LONG scroll_accum;
-
-	//! When true, mouse input forwarding is suppressed (workspace drag/resize active).
-	//! Set by compositor thread, read by WndProc thread.
+	//! Modal input grab (XR_EXT_spatial_workspace spec_version 18): when set, the
+	//! WndProc stops forwarding keyboard / mouse-button / scroll input to the
+	//! focused app and routes everything to the controller via the public event
+	//! ring. Set by the compositor thread (driven by xrSetWorkspaceInputGrabEXT)
+	//! and by the controller-owned drag/resize gestures; read by the WndProc
+	//! thread.
 	volatile LONG input_suppress;
-
-	//! Phase 5.12: grace period for input_suppress after the launcher closes.
-	//! Holds a GetTickCount() value; while GetTickCount() < input_suppress_until_tick
-	//! the WndProc treats input as suppressed even when input_suppress=0. Prevents
-	//! the Esc-that-closes-the-launcher from leaking into the focused app on the
-	//! next message-queue drain (render thread vs window thread race).
-	volatile LONG input_suppress_until_tick;
 
 	//! True when a mouse button press originated inside the app content rect.
 	//! Used to prevent title bar clicks from being forwarded as app drags.
@@ -395,13 +388,6 @@ set_fullscreen(HWND hWnd, bool fullscreen)
 // and mouse forwarding.
 static bool input_is_suppressed(struct comp_d3d11_window *w);
 
-// Phase 5.13: private message ID for "show launcher context menu". Sent by
-// the render thread via comp_d3d11_window_show_launcher_context_menu so the
-// window thread actually runs TrackPopupMenu — that API only works on the
-// thread that owns the target window. Defined up here so both wnd_proc and
-// the exported helper can reference it.
-#define WM_LAUNCHER_CTX_MENU (WM_USER + 110)
-
 /*!
  * Window procedure — runs on the window thread.
  *
@@ -482,35 +468,6 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		PostQuitMessage(0);
 		break;
 
-	case WM_LAUNCHER_CTX_MENU: {
-		// Phase 5.13: synchronously show the launcher tile context menu
-		// on THIS thread (the window thread). TrackPopupMenu only works
-		// from the thread that owns the target window — calling it from
-		// the render thread silently returns 0. Caller (render thread)
-		// uses SendMessage so we block until the user picks / cancels.
-		HMENU menu = CreatePopupMenu();
-		if (menu == NULL) {
-			return 0;
-		}
-		AppendMenuW(menu, MF_STRING, 1, L"Launch");
-		AppendMenuW(menu, MF_STRING, 2, L"Remove from launcher");
-		AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-		AppendMenuW(menu, MF_STRING, 3, L"Cancel");
-
-		POINT pt;
-		GetCursorPos(&pt);
-		SetForegroundWindow(hWnd);
-		UINT cmd = TrackPopupMenu(menu,
-		                          TPM_RETURNCMD | TPM_NONOTIFY,
-		                          pt.x, pt.y, 0, hWnd, NULL);
-		DestroyMenu(menu);
-		PostMessageW(hWnd, WM_NULL, 0, 0);
-		// Map to public result codes (1=launch, 2=remove, 0=cancel).
-		if (cmd == 1) return LAUNCHER_CTX_MENU_RESULT_LAUNCH;
-		if (cmd == 2) return LAUNCHER_CTX_MENU_RESULT_REMOVE;
-		return 0;
-	}
-
 	case WM_KEYDOWN:
 		// F11: toggle fullscreen for non-workspace (single app) windows.
 		// In workspace mode, F11 flows to the controller as a workspace KEY
@@ -549,10 +506,11 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			                           (uint32_t)wParam, 0, workspace_compute_modifiers(), 0.0f);
 		}
 
-		// Phase 5.12: when the workspace is suppressing input (launcher visible,
-		// resize drag, or within the post-launcher grace period) we eat the
-		// key entirely — don't forward, don't run qwerty. Otherwise the
-		// launcher's Esc / arrows / Enter leak through and close the app.
+		// When input is grabbed by the controller (modal UI like the launcher
+		// band) or a workspace drag/resize is active, eat the key entirely —
+		// don't forward, don't run qwerty. The KEY event was already pushed to
+		// the public ring above, so the controller still sees arrows / Enter /
+		// Esc; they just never reach the focused app.
 		if (input_is_suppressed(w)) {
 			return 0;
 		}
@@ -743,9 +701,24 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			}
 		}
 
-		// Skip forwarding when workspace drag/resize is active or within the
-		// launcher grace period.
+		// Skip forwarding when input is grabbed by the controller (modal UI like
+		// the launcher band) or a workspace drag/resize is active. Wheel events
+		// still reach the controller: the POINTER/MOTION push above runs before
+		// this gate, but SCROLL is emitted lower in the fwd!=NULL block — so under
+		// a grab (where fwd may be a focused app) we emit SCROLL_EXT here, then
+		// swallow the wheel so it never also forwards to the app.
 		if (input_is_suppressed(w)) {
+			if (message == WM_MOUSEWHEEL &&
+			    GetMessageExtraInfo() != (LPARAM)WORKSPACE_SENDINPUT_MARKER) {
+				POINT pt;
+				pt.x = GET_X_LPARAM(lParam);
+				pt.y = GET_Y_LPARAM(lParam);
+				ScreenToClient(hWnd, &pt);
+				short delta = GET_WHEEL_DELTA_WPARAM(wParam);
+				workspace_public_ring_push(w, WORKSPACE_PUBLIC_EVENT_SCROLL, pt.x, pt.y, 0, 0,
+				                           workspace_compute_modifiers(),
+				                           (float)delta / (float)WHEEL_DELTA);
+			}
 			break; // fall through to qwerty/default handling
 		}
 
@@ -791,8 +764,6 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 					PostMessage(fwd, message, wParam, lParam);
 				} else {
 					short delta = GET_WHEEL_DELTA_WPARAM(wParam);
-					// Launcher grid still drains this (#308 will move it out).
-					InterlockedExchangeAdd(&w->scroll_accum, (LONG)delta);
 					// Controller-bound scroll: resize / Z-depth policy lives
 					// in the workspace controller (ADR-018, #305).
 					workspace_public_ring_push(w, WORKSPACE_PUBLIC_EVENT_SCROLL,
@@ -1504,33 +1475,13 @@ comp_d3d11_window_set_workspace_wakeup_event(struct comp_d3d11_window *window, v
 	InterlockedExchangePointer((volatile PVOID *)&window->workspace_wakeup_event, handle);
 }
 
-// Returns true if input forwarding should currently be suppressed, considering
-// both the immediate flag and the tick-count grace period (Phase 5.12).
+// Returns true if input forwarding should currently be suppressed — i.e. the
+// controller has grabbed input (modal UI like the launcher band, via
+// xrSetWorkspaceInputGrabEXT) or a workspace drag/resize gesture is active.
 static bool
 input_is_suppressed(struct comp_d3d11_window *w)
 {
-	if (InterlockedCompareExchange(&w->input_suppress, 0, 0)) return true;
-	LONG until = InterlockedCompareExchange(&w->input_suppress_until_tick, 0, 0);
-	if (until == 0) return false;
-	// GetTickCount() wraps every ~49 days; use signed diff for wrap-safety.
-	LONG now = (LONG)GetTickCount();
-	return (LONG)(until - now) > 0;
-}
-
-extern "C" void
-comp_d3d11_window_set_input_suppress_grace_ms(struct comp_d3d11_window *window, uint32_t ms)
-{
-	if (window == NULL) return;
-	LONG until = (LONG)(GetTickCount() + ms);
-	InterlockedExchange(&window->input_suppress_until_tick, until);
-}
-
-extern "C" uint32_t
-comp_d3d11_window_show_launcher_context_menu(struct comp_d3d11_window *window)
-{
-	if (window == NULL || window->hwnd == NULL) return 0;
-	LRESULT r = SendMessageW(window->hwnd, WM_LAUNCHER_CTX_MENU, 0, 0);
-	return (uint32_t)r;
+	return InterlockedCompareExchange(&w->input_suppress, 0, 0) != 0;
 }
 
 extern "C" void
@@ -1542,8 +1493,8 @@ comp_d3d11_window_set_input_suppress(struct comp_d3d11_window *window, bool supp
 	// Publish the suppress state to the compositor HWND so cross-process
 	// consumers can mirror it. The WebXR bridge's low-level mouse hook
 	// reads DXR_InSizeMove to skip forwarding — without this extension,
-	// title-bar drags, edge resizes, and launcher-open suppress input for
-	// in-process handle apps (via input_suppress) but still forward mouse
+	// title-bar drags, edge resizes, and controller input-grab suppress input
+	// for in-process handle apps (via input_suppress) but still forward mouse
 	// events to bridge-aware pages (Chrome interprets them as in-scene
 	// drag/rotate), so moving a WebXR window drags its content instead
 	// of the window itself. The native WM_ENTERSIZEMOVE path also sets
@@ -1571,15 +1522,6 @@ comp_d3d11_window_set_input_suppress(struct comp_d3d11_window *window, bool supp
 			PostMessage(fwd, WM_LBUTTONUP, 0, 0);
 		}
 	}
-}
-
-extern "C" int32_t
-comp_d3d11_window_consume_scroll(struct comp_d3d11_window *window)
-{
-	if (window == NULL) {
-		return 0;
-	}
-	return (int32_t)InterlockedExchange(&window->scroll_accum, 0);
 }
 
 extern "C" void

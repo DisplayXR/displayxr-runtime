@@ -895,3 +895,80 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
     return float4(color.rgb, color.a * alpha * a_mul);
 }
 )";
+
+//! #308: premultiplied box-blur variant of the blit pixel shader. Shares the
+//! BlitCB layout + blit VS, so it's bound for a single quad draw (no blend
+//! accumulation). Averages a (2N+1)² grid of texture taps within ±glow_falloff
+//! (UV radius); premultiplied weighting keeps transparent-edge halos clean.
+//! Only the empty-state splash logo uses it (while pushed behind the band).
+static const char *blit_blur_ps_hlsl = R"(
+cbuffer BlitCB : register(b0)
+{
+    float4 src_rect;
+    float2 dst_offset;
+    float2 src_size;
+    float2 dst_size;
+    float convert_srgb;
+    float quad_mode;
+    float2 dst_rect_wh;
+    float corner_radius;
+    float corner_aspect;
+    float4 quad_corners_01;
+    float4 quad_corners_23;
+    float4 quad_w;
+    float edge_feather;
+    float glow_intensity;
+    float glow_extent;
+    float glow_falloff;   // blur radius in UV (set by the splash; 0 = passthrough)
+    float4 glow_color;
+    float4 corner_depth_ndc;
+    float4 chrome_alpha;
+    float4 hud_dst_rect;
+    float4 hud_src_rect;
+    float4 hud_flags;
+};
+
+Texture2D src_tex : register(t0);
+SamplerState src_samp : register(s0);
+
+struct VS_OUTPUT
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+    float2 quad_uv : TEXCOORD1;
+};
+
+float4 PSMain(VS_OUTPUT input) : SV_Target
+{
+    // Separate X/Y UV radii (glow_falloff = rx, glow_extent = ry). Separate axes
+    // matter because callers sample non-square regions (e.g. a glyph in the wide
+    // font atlas) yet want a uniform SCREEN-space blur.
+    float2 r = float2(glow_falloff, glow_extent);
+    if (r.x <= 0.0 && r.y <= 0.0)
+        return src_tex.Sample(src_samp, input.uv);
+
+    // Clamp taps to the source sub-rect so the blur can't bleed past it (e.g.
+    // into neighbouring glyphs packed in the font atlas).
+    float2 uv_min = src_rect.xy / src_size;
+    float2 uv_max = (src_rect.xy + src_rect.zw) / src_size;
+
+    // (2N+1)² premultiplied box blur.
+    const int N = 4;
+    float3 acc_rgb = float3(0, 0, 0);
+    float acc_a = 0.0;
+    float count = 0.0;
+    [unroll] for (int dy = -N; dy <= N; dy++) {
+        [unroll] for (int dx = -N; dx <= N; dx++) {
+            float2 off = float2((float)dx, (float)dy) / (float)N * r;
+            float2 uv = clamp(input.uv + off, uv_min, uv_max);
+            float4 c = src_tex.Sample(src_samp, uv);
+            acc_rgb += c.rgb * c.a; // premultiply before averaging
+            acc_a += c.a;
+            count += 1.0;
+        }
+    }
+    float out_a = acc_a / count;
+    float3 out_rgb = (acc_a > 1e-4) ? (acc_rgb / acc_a) : float3(0, 0, 0);
+    return float4(out_rgb, out_a);
+}
+)";

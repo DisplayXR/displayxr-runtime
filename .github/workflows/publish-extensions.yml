@@ -39,6 +39,11 @@ jobs:
       - name: Copy headers
         run: |
           mkdir -p extensions-repo/include/openxr
+          # Prune stale XR_EXT_*.h so header DELETIONS in the runtime propagate
+          # to the mirror (cp alone only adds/overwrites). Only touches the
+          # auto-synced XR_EXT_* set; hand-maintained headers in the mirror
+          # (openxr.h, XR_MNDX_*.h, …) are left alone.
+          rm -f extensions-repo/include/openxr/XR_EXT_*.h
           cp src/external/openxr_includes/openxr/XR_EXT_*.h extensions-repo/include/openxr/
           echo "Copied headers:"
           ls -la extensions-repo/include/openxr/
@@ -72,8 +77,7 @@ jobs:
 
           | Header | Extension | Description |
           |--------|-----------|-------------|
-          | [`XR_EXT_spatial_workspace.h`](include/openxr/XR_EXT_spatial_workspace.h) | `XR_EXT_spatial_workspace` | Multi-app composition: window pose, hit-test, capture |
-          | [`XR_EXT_app_launcher.h`](include/openxr/XR_EXT_app_launcher.h) | `XR_EXT_app_launcher` | Launcher tile registration and lifecycle |
+          | [`XR_EXT_spatial_workspace.h`](include/openxr/XR_EXT_spatial_workspace.h) | `XR_EXT_spatial_workspace` | Multi-app composition: window pose, hit-test, capture, overlay, modal input grab |
 
           ## Usage
 

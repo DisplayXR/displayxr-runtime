@@ -997,14 +997,14 @@ comp_ipc_client_compositor_workspace_set_client_style(struct xrt_compositor *xc,
 }
 
 /*
- * Launcher bridges (XR_EXT_app_launcher).
+ * Modal input grab bridge (XR_EXT_spatial_workspace, spec_version 18).
  *
  * Same gating contract as the workspace_* family: only valid when `xc` is
- * an ipc_client_compositor. The OpenXR state tracker forward-declares
- * these and the runtime DLL resolves them at link time.
+ * an ipc_client_compositor. The OpenXR state tracker forward-declares this
+ * and the runtime DLL resolves it at link time.
  */
 xrt_result_t
-comp_ipc_client_compositor_launcher_clear_apps(struct xrt_compositor *xc)
+comp_ipc_client_compositor_workspace_set_input_grab(struct xrt_compositor *xc, bool grab)
 {
 	if (xc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
@@ -1013,81 +1013,7 @@ comp_ipc_client_compositor_launcher_clear_apps(struct xrt_compositor *xc)
 	if (icc == NULL || icc->ipc_c == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	return ipc_call_launcher_clear_apps(icc->ipc_c);
-}
-
-xrt_result_t
-comp_ipc_client_compositor_launcher_add_app(struct xrt_compositor *xc,
-                                            const char *name,
-                                            const char *icon_path,
-                                            const char *app_type,
-                                            const char *icon_3d_path,
-                                            const char *icon_3d_layout)
-{
-	if (xc == NULL || name == NULL) {
-		return XRT_ERROR_IPC_FAILURE;
-	}
-	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
-	if (icc == NULL || icc->ipc_c == NULL) {
-		return XRT_ERROR_IPC_FAILURE;
-	}
-	// State tracker stays free of ipc_launcher_app — bridge fills the wire
-	// struct from the primitive parameters. exe_path is intentionally not
-	// exposed at the public surface; the runtime never launches binaries.
-	struct ipc_launcher_app app = {0};
-	snprintf(app.name, sizeof(app.name), "%s", name);
-	if (icon_path != NULL) {
-		snprintf(app.icon_path, sizeof(app.icon_path), "%s", icon_path);
-	}
-	if (app_type != NULL) {
-		snprintf(app.type, sizeof(app.type), "%s", app_type);
-	}
-	if (icon_3d_path != NULL) {
-		snprintf(app.icon_3d_path, sizeof(app.icon_3d_path), "%s", icon_3d_path);
-	}
-	if (icon_3d_layout != NULL) {
-		snprintf(app.icon_3d_layout, sizeof(app.icon_3d_layout), "%s", icon_3d_layout);
-	}
-	return ipc_call_launcher_add_app(icc->ipc_c, &app);
-}
-
-xrt_result_t
-comp_ipc_client_compositor_launcher_set_visible(struct xrt_compositor *xc, bool visible)
-{
-	if (xc == NULL) {
-		return XRT_ERROR_IPC_FAILURE;
-	}
-	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
-	if (icc == NULL || icc->ipc_c == NULL) {
-		return XRT_ERROR_IPC_FAILURE;
-	}
-	return ipc_call_launcher_set_visible(icc->ipc_c, visible);
-}
-
-xrt_result_t
-comp_ipc_client_compositor_launcher_poll_click(struct xrt_compositor *xc, int64_t *out_tile_index)
-{
-	if (xc == NULL || out_tile_index == NULL) {
-		return XRT_ERROR_IPC_FAILURE;
-	}
-	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
-	if (icc == NULL || icc->ipc_c == NULL) {
-		return XRT_ERROR_IPC_FAILURE;
-	}
-	return ipc_call_launcher_poll_click(icc->ipc_c, out_tile_index);
-}
-
-xrt_result_t
-comp_ipc_client_compositor_launcher_set_running_tile_mask(struct xrt_compositor *xc, uint64_t mask)
-{
-	if (xc == NULL) {
-		return XRT_ERROR_IPC_FAILURE;
-	}
-	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
-	if (icc == NULL || icc->ipc_c == NULL) {
-		return XRT_ERROR_IPC_FAILURE;
-	}
-	return ipc_call_launcher_set_running_tile_mask(icc->ipc_c, mask);
+	return ipc_call_workspace_set_input_grab(icc->ipc_c, grab);
 }
 
 

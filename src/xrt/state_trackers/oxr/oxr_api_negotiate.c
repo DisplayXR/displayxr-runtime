@@ -470,14 +470,7 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrSetWorkspaceOverlayEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrAcquireWorkspaceWakeupEventEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrSetWorkspaceClientStyleEXT, EXT_spatial_workspace);
-#endif
-
-#ifdef OXR_HAVE_EXT_app_launcher
-	ENTRY_IF_EXT(xrClearLauncherAppsEXT, EXT_app_launcher);
-	ENTRY_IF_EXT(xrAddLauncherAppEXT, EXT_app_launcher);
-	ENTRY_IF_EXT(xrSetLauncherVisibleEXT, EXT_app_launcher);
-	ENTRY_IF_EXT(xrPollLauncherClickEXT, EXT_app_launcher);
-	ENTRY_IF_EXT(xrSetLauncherRunningTileMaskEXT, EXT_app_launcher);
+	ENTRY_IF_EXT(xrSetWorkspaceInputGrabEXT, EXT_spatial_workspace);
 #endif
 
 #ifdef OXR_HAVE_EXT_workspace_file_dialog

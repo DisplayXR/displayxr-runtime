@@ -915,6 +915,9 @@ oxr_xrCreateWorkspaceOverlaySwapchainEXT(XrSession session,
 //! OpenXR API function @ep{xrSetWorkspaceOverlayEXT} (spec_version 17)
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceOverlayEXT(XrSession session, const XrWorkspaceOverlayInfoEXT *info);
+//! OpenXR API function @ep{xrSetWorkspaceInputGrabEXT} (spec_version 18)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceInputGrabEXT(XrSession session, XrBool32 grab);
 //! OpenXR API function @ep{xrAcquireWorkspaceWakeupEventEXT}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrAcquireWorkspaceWakeupEventEXT(XrSession session, uint64_t *outNativeHandle);
@@ -923,24 +926,6 @@ XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceClientStyleEXT(XrSession session,
                                  XrWorkspaceClientId clientId,
                                  const XrWorkspaceClientStyleEXT *style);
-#endif
-
-#ifdef OXR_HAVE_EXT_app_launcher
-//! OpenXR API function @ep{xrClearLauncherAppsEXT}
-XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrClearLauncherAppsEXT(XrSession session);
-//! OpenXR API function @ep{xrAddLauncherAppEXT}
-XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrAddLauncherAppEXT(XrSession session, const XrLauncherAppInfoEXT *info);
-//! OpenXR API function @ep{xrSetLauncherVisibleEXT}
-XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetLauncherVisibleEXT(XrSession session, XrBool32 visible);
-//! OpenXR API function @ep{xrPollLauncherClickEXT}
-XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrPollLauncherClickEXT(XrSession session, int32_t *outAppIndex);
-//! OpenXR API function @ep{xrSetLauncherRunningTileMaskEXT}
-XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetLauncherRunningTileMaskEXT(XrSession session, uint64_t mask);
 #endif
 
 #ifdef OXR_HAVE_EXT_workspace_file_dialog
