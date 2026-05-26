@@ -41,9 +41,15 @@ adb devices
 # Should show your device as "device" (not "unauthorized")
 ```
 
-## Step 1: CNSDK setup
+## Step 1: CNSDK setup (plug-in repo only)
 
-The Gradle build expects CNSDK as an extracted release tree at the repo root in `cnsdk/`. We currently pin **CNSDK 0.7.28**.
+> This step happens in your [`displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin)
+> checkout, **not** the runtime repo — the runtime APK builds without
+> CNSDK in scope (see the plug-in-split note at the top). If you only
+> need the runtime APK, skip to Step 2; CNSDK is pulled in when you
+> build the plug-in's `libdxrp050_leia_cnsdk.so`.
+
+The plug-in's Gradle build expects CNSDK as an extracted release tree at the plug-in repo root in `cnsdk/`. We currently pin **CNSDK 0.7.28**.
 
 ### Fetch CNSDK 0.7.28
 
@@ -72,7 +78,7 @@ The `.gitignore` already excludes `/cnsdk/`, so don't commit it.
 
 ### Other CNSDK versions
 
-The Gradle build is version-agnostic — it reads `cnsdk/VERSION.txt` and substitutes into AAR paths. The AAR lookup falls back through `sdk-faceTrackingInApp-<ver>.aar` → `sdk-faceTrackingService-<ver>.aar` → `sdk-<ver>.aar` so newer CNSDK packagings work without code changes. Note that 0.10+ may also require updating the CNSDK link target from `CNSDK::leiaSDK` to `CNSDK::leiaCore` in `src/xrt/drivers/CMakeLists.txt`.
+The Gradle build is version-agnostic — it reads `cnsdk/VERSION.txt` and substitutes into AAR paths. The AAR lookup falls back through `sdk-faceTrackingInApp-<ver>.aar` → `sdk-faceTrackingService-<ver>.aar` → `sdk-<ver>.aar` so newer CNSDK packagings work without code changes. Note that 0.10+ may also require updating the CNSDK link target from `CNSDK::leiaSDK` to `CNSDK::leiaCore` in the plug-in's `drv_leia_android` CMakeLists (in `displayxr-leia-plugin`).
 
 ## Step 2: Configure `local.properties`
 
