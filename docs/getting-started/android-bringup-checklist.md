@@ -13,6 +13,7 @@ A→B→C→D test plan for the first hardware install of the Android POC. Each 
 
 Companion docs:
 - [`android-build-guide.md`](android-build-guide.md) — prerequisites, CNSDK setup, build commands.
+- [`android-emulator-setup.md`](android-emulator-setup.md) — half-bringup on the Android emulator before Lume Pad arrives (catches build/install/loader-discovery bugs; can't render).
 - [`docs/vendors/leia/cnsdk-android-calibration.md`](../vendors/leia/cnsdk-android-calibration.md) — face axes / view mapping / UV flip calibration (Test C).
 
 ## What to test
