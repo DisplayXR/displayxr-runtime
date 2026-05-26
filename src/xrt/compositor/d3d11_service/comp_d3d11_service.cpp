@@ -9893,13 +9893,19 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 	}
 
-	// Runtime-side 2D/3D toggle (V key) — polls qwerty driver each frame.
+	// Runtime-side 2D/3D toggle (V key) + 1/2/3 mode-select — polls qwerty
+	// driver each frame.
 	// Disabled when bridge is active: mode changes go through the HWND
 	// property relay above (app-initiated path). When the multi-comp is
 	// active, routes through the acked-flip path (#234); otherwise preserves
 	// the immediate-flip behavior on the per-client DP.
+	// #303: also disabled under workspace mode — the workspace controller
+	// owns these keys and drives mode via xrRequestDisplayRenderingModeEXT
+	// (ADR-018 "controller owns input"). qwerty is already suppressed at the
+	// window WM_KEYDOWN gate under workspace mode, but gate the apply site too
+	// so an activation/deactivation race can't sneak a flip through here.
 #ifdef XRT_BUILD_DRIVER_QWERTY
-	if (sys->xsysd != NULL && !bridge_live) {
+	if (sys->xsysd != NULL && !bridge_live && !sys->workspace_mode) {
 		bool force_2d = false;
 		bool toggled = qwerty_check_display_mode_toggle(
 		    sys->xsysd->xdevs, sys->xsysd->xdev_count, &force_2d);
