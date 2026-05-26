@@ -97,29 +97,9 @@
 		]
 	},
 
-	"launcher_set_visible": {
+	"workspace_set_input_grab": {
 		"in": [
-			{"name": "visible", "type": "bool"}
-		]
-	},
-
-	"launcher_clear_apps": {},
-
-	"launcher_add_app": {
-		"in": [
-			{"name": "app", "type": "struct ipc_launcher_app"}
-		]
-	},
-
-	"launcher_poll_click": {
-		"out": [
-			{"name": "tile_index", "type": "int64_t"}
-		]
-	},
-
-	"launcher_set_running_tile_mask": {
-		"in": [
-			{"name": "mask", "type": "uint64_t"}
+			{"name": "grab", "type": "bool"}
 		]
 	},
 

@@ -359,28 +359,11 @@ comp_ipc_client_compositor_workspace_get_client_info(struct xrt_compositor *xc,
                                                      bool *out_is_visible);
 
 /*!
- * Launcher bridges (XR_EXT_app_launcher).
+ * Modal input grab bridge (XR_EXT_spatial_workspace, spec_version 18).
  *
  * Same gating contract as the workspace_* family — only valid when `xc` is
- * an ipc_client_compositor. The state tracker forward-declares these and
- * the runtime DLL links ipc_client so symbols resolve at link time.
+ * an ipc_client_compositor. The state tracker forward-declares this and
+ * the runtime DLL links ipc_client so the symbol resolves at link time.
  */
 xrt_result_t
-comp_ipc_client_compositor_launcher_clear_apps(struct xrt_compositor *xc);
-
-xrt_result_t
-comp_ipc_client_compositor_launcher_add_app(struct xrt_compositor *xc,
-                                            const char *name,
-                                            const char *icon_path,
-                                            const char *app_type,
-                                            const char *icon_3d_path,
-                                            const char *icon_3d_layout);
-
-xrt_result_t
-comp_ipc_client_compositor_launcher_set_visible(struct xrt_compositor *xc, bool visible);
-
-xrt_result_t
-comp_ipc_client_compositor_launcher_poll_click(struct xrt_compositor *xc, int64_t *out_tile_index);
-
-xrt_result_t
-comp_ipc_client_compositor_launcher_set_running_tile_mask(struct xrt_compositor *xc, uint64_t mask);
+comp_ipc_client_compositor_workspace_set_input_grab(struct xrt_compositor *xc, bool grab);

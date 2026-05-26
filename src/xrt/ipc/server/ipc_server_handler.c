@@ -2452,7 +2452,7 @@ ipc_handle_workspace_get_state(volatile struct ipc_client_state *_ics, bool *out
 }
 
 xrt_result_t
-ipc_handle_launcher_set_visible(volatile struct ipc_client_state *_ics, bool visible)
+ipc_handle_workspace_set_input_grab(volatile struct ipc_client_state *_ics, bool grab)
 {
 	struct ipc_server *s = _ics->server;
 
@@ -2461,89 +2461,12 @@ ipc_handle_launcher_set_visible(volatile struct ipc_client_state *_ics, bool vis
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
-	IPC_INFO(s, "Workspace: set_launcher_visible %s", visible ? "true" : "false");
-	comp_d3d11_service_set_launcher_visible(s->xsysc, visible);
+	IPC_INFO(s, "Workspace: set_input_grab %s", grab ? "true" : "false");
+	comp_d3d11_service_set_input_grab(s->xsysc, grab);
 	return XRT_SUCCESS;
 #else
 	(void)s;
-	(void)visible;
-	return XRT_ERROR_IPC_FAILURE;
-#endif
-}
-
-xrt_result_t
-ipc_handle_launcher_clear_apps(volatile struct ipc_client_state *_ics)
-{
-	struct ipc_server *s = _ics->server;
-
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	if (s->xsysc == NULL) {
-		return XRT_ERROR_IPC_FAILURE;
-	}
-
-	comp_d3d11_service_clear_launcher_apps(s->xsysc);
-	return XRT_SUCCESS;
-#else
-	(void)s;
-	return XRT_ERROR_IPC_FAILURE;
-#endif
-}
-
-xrt_result_t
-ipc_handle_launcher_add_app(volatile struct ipc_client_state *_ics,
-                                   const struct ipc_launcher_app *app)
-{
-	struct ipc_server *s = _ics->server;
-
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	if (s->xsysc == NULL || app == NULL) {
-		return XRT_ERROR_IPC_FAILURE;
-	}
-
-	comp_d3d11_service_add_launcher_app(s->xsysc, app);
-	return XRT_SUCCESS;
-#else
-	(void)s;
-	(void)app;
-	return XRT_ERROR_IPC_FAILURE;
-#endif
-}
-
-xrt_result_t
-ipc_handle_launcher_set_running_tile_mask(volatile struct ipc_client_state *_ics, uint64_t mask)
-{
-	struct ipc_server *s = _ics->server;
-
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	if (s->xsysc == NULL) {
-		return XRT_ERROR_IPC_FAILURE;
-	}
-
-	comp_d3d11_service_set_running_tile_mask(s->xsysc, mask);
-	return XRT_SUCCESS;
-#else
-	(void)s;
-	(void)mask;
-	return XRT_ERROR_IPC_FAILURE;
-#endif
-}
-
-xrt_result_t
-ipc_handle_launcher_poll_click(volatile struct ipc_client_state *_ics,
-                                      int64_t *out_tile_index)
-{
-	struct ipc_server *s = _ics->server;
-
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	if (s->xsysc == NULL || out_tile_index == NULL) {
-		return XRT_ERROR_IPC_FAILURE;
-	}
-
-	*out_tile_index = (int64_t)comp_d3d11_service_poll_launcher_click(s->xsysc);
-	return XRT_SUCCESS;
-#else
-	(void)s;
-	if (out_tile_index != NULL) *out_tile_index = -1;
+	(void)grab;
 	return XRT_ERROR_IPC_FAILURE;
 #endif
 }
@@ -3544,7 +3467,8 @@ ipc_handle_workspace_set_overlay(volatile struct ipc_client_state *_ics,
 	                                                 info->anchor_x, info->anchor_y,
 	                                                 info->pivot_x, info->pivot_y,
 	                                                 info->size_w_m, info->size_h_m,
-	                                                 info->visible != 0);
+	                                                 info->visible != 0,
+	                                                 info->stereo_sbs != 0);
 #else
 	(void)s;
 	(void)info;

@@ -13,7 +13,7 @@
  * the new workspace_request_file_dialog / workspace_file_dialog_result
  * RPCs.
  *
- * Pattern mirrors oxr_app_launcher.c (IPC-bridge forward declarations,
+ * Pattern mirrors oxr_workspace.c (IPC-bridge forward declarations,
  * session_is_ipc_client gate, xrt_result_t translation).
  */
 

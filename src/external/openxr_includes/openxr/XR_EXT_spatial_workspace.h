@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_spatial_workspace 1
-#define XR_EXT_spatial_workspace_SPEC_VERSION 17
+#define XR_EXT_spatial_workspace_SPEC_VERSION 19
 #define XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_EXT_spatial_workspace"
 
 // Provisional XrStructureType values. The 1000999100..109 range is reserved for
@@ -1033,6 +1033,15 @@ typedef struct XrWorkspaceOverlayInfoEXT {
     XrVector2f       pivot;       // Normalized sprite UV [0,1] mapped onto anchor
     XrExtent2Df      sizeMeters;  // Physical width,height in meters
     XrBool32         visible;     // XR_FALSE hides without releasing the swapchain
+    // spec_version 19: side-by-side stereo overlay. When XR_TRUE the swapchain
+    // image is treated as two halves — left half = left-eye content, right half
+    // = right-eye content — and the runtime samples the matching half per eye
+    // view (stretched to the full overlay footprint). The controller renders the
+    // SAME z=0 content into both halves except for elements it wants to appear
+    // stereoscopic (e.g. 3D app-icon SBS images), which differ between halves.
+    // XR_FALSE (default) = mono: the whole image is composited identically in
+    // every eye (zero disparity).
+    XrBool32         stereoSideBySide;
 } XrWorkspaceOverlayInfoEXT;
 
 /*!
@@ -1055,6 +1064,36 @@ typedef struct XrWorkspaceOverlayInfoEXT {
 typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceOverlayEXT)(
     XrSession                        session,
     const XrWorkspaceOverlayInfoEXT *info);
+
+// ---- Modal input grab (spec_version 18) ----
+
+/*!
+ * @brief Grab / release all user input for the workspace controller.
+ *
+ * While grabbed (@p grab == XR_TRUE) the runtime stops forwarding keyboard,
+ * mouse-button, and scroll-wheel input to the focused workspace client and
+ * routes every event to the controller through the public input-event ring
+ * (xrEnumerateWorkspaceInputEventsEXT): KEY, POINTER, and SCROLL events are
+ * delivered regardless of which client is focused or whether the cursor is
+ * over app content. This is the mechanism a controller uses to drive a modal
+ * UI it composites onto a workspace overlay (e.g. an app launcher band): the
+ * controller owns the input while its UI is up and releases the grab when the
+ * UI dismisses, restoring normal app forwarding.
+ *
+ * The grab is session-global (mirrors the cursor / overlay slots) and does NOT
+ * change focus — the previously focused client stays focused and simply stops
+ * receiving forwarded input until the grab is released. Idempotent: setting the
+ * same state twice is a no-op.
+ *
+ * @param session A valid workspace session (controller side).
+ * @param grab    XR_TRUE to grab input for the controller; XR_FALSE to release.
+ *
+ * @return XR_SUCCESS, XR_ERROR_FEATURE_UNSUPPORTED (session not in workspace
+ *         IPC mode).
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceInputGrabEXT)(
+    XrSession session,
+    XrBool32  grab);
 
 // ---- Event-driven wakeup (spec_version 8) ----
 
@@ -1316,6 +1355,10 @@ XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceClientStyleEXT(
     XrSession                              session,
     XrWorkspaceClientId                    clientId,
     const XrWorkspaceClientStyleEXT       *style);
+
+XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceInputGrabEXT(
+    XrSession session,
+    XrBool32  grab);
 #endif
 
 #ifdef __cplusplus

@@ -85,6 +85,8 @@ comp_ipc_client_compositor_workspace_hit_test(struct xrt_compositor *xc,
 xrt_result_t
 comp_ipc_client_compositor_workspace_set_focused_client(struct xrt_compositor *xc, uint32_t client_id);
 xrt_result_t
+comp_ipc_client_compositor_workspace_set_input_grab(struct xrt_compositor *xc, bool grab);
+xrt_result_t
 comp_ipc_client_compositor_workspace_get_focused_client(struct xrt_compositor *xc, uint32_t *out_client_id);
 xrt_result_t
 comp_ipc_client_compositor_workspace_set_client_frame_rate_cap(struct xrt_compositor *xc,
@@ -591,6 +593,31 @@ oxr_xrSetWorkspaceFocusedClientEXT(XrSession session, XrWorkspaceClientId client
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_focused_client(&sess->xcn->base,
 	                                                                            (uint32_t)clientId);
 	return xret_to_xr_result(&log, xret, "workspace_set_focused_client");
+}
+
+/*
+ * Modal input grab (spec_version 18)
+ */
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceInputGrabEXT(XrSession session, XrBool32 grab)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceInputGrabEXT");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrSetWorkspaceInputGrabEXT requires an IPC-mode session");
+	}
+
+	xrt_result_t xret =
+	    comp_ipc_client_compositor_workspace_set_input_grab(&sess->xcn->base, grab != XR_FALSE);
+	return xret_to_xr_result(&log, xret, "workspace_set_input_grab");
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
@@ -1396,6 +1423,7 @@ oxr_xrSetWorkspaceOverlayEXT(XrSession session, const XrWorkspaceOverlayInfoEXT 
 	ipc_info.size_w_m = info->sizeMeters.width;
 	ipc_info.size_h_m = info->sizeMeters.height;
 	ipc_info.visible = info->visible ? 1u : 0u;
+	ipc_info.stereo_sbs = info->stereoSideBySide ? 1u : 0u; // spec_version 19
 
 	if (info->swapchain != XR_NULL_HANDLE) {
 		struct oxr_swapchain *sc = NULL;

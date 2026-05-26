@@ -305,44 +305,6 @@ struct ipc_client_list
 };
 
 /*!
- * Phase 5.8: registered-app record shipped one-at-a-time from the workspace
- * controller to the service for the spatial launcher panel. Sized to fit a
- * single ipc message under IPC_BUF_SIZE — the workspace controller calls
- * ipc_call_launcher_clear_apps then loops over its registry calling
- * ipc_call_launcher_add_app per entry whenever the registry changes.
- *
- * @ingroup ipc
- */
-
-#define IPC_LAUNCHER_MAX_APPS 32
-#define IPC_LAUNCHER_NAME_MAX 96
-#define IPC_LAUNCHER_PATH_MAX 256
-#define IPC_LAUNCHER_TYPE_MAX 8
-
-// Phase 5.14: sentinel returned via ipc_call_launcher_poll_click to mean
-// "the user clicked the Browse-for-app virtual tile" rather than a real tile.
-// Real tile indices are >= 0; -1 means no pending action.
-#define IPC_LAUNCHER_ACTION_BROWSE (-100)
-
-// Phase 6.6: sentinel base for permanent remove. Returned as
-// -(IPC_LAUNCHER_ACTION_REMOVE_BASE + full_index). Workspace controller decodes via
-// full_index = -(value) - IPC_LAUNCHER_ACTION_REMOVE_BASE.
-#define IPC_LAUNCHER_ACTION_REMOVE_BASE 200
-
-// Phase 6.6: sentinel for "refresh app list" (re-scan sidecars).
-#define IPC_LAUNCHER_ACTION_REFRESH (-300)
-
-struct ipc_launcher_app
-{
-	char name[IPC_LAUNCHER_NAME_MAX];
-	char exe_path[IPC_LAUNCHER_PATH_MAX];
-	char type[IPC_LAUNCHER_TYPE_MAX]; // "3d" or "2d"
-	char icon_path[IPC_LAUNCHER_PATH_MAX];
-	char icon_3d_path[IPC_LAUNCHER_PATH_MAX];
-	char icon_3d_layout[IPC_LAUNCHER_TYPE_MAX]; // "sbs-lr" etc
-};
-
-/*!
  * XR_EXT_workspace_file_dialog wire format. Flat IPC translation of
  * XrFilePickerInfoEXT — no OpenXR-type dependency in IPC headers, no
  * pointer chasing (the proto generator copies by value).
@@ -667,6 +629,7 @@ struct ipc_workspace_overlay_info
 	float    size_w_m;        //!< Physical overlay width in meters
 	float    size_h_m;        //!< Physical overlay height in meters
 	uint32_t visible;         //!< XrBool32; 0 = hidden even if swapchain valid
+	uint32_t stereo_sbs;      //!< spec_version 19: XrBool32; 1 = side-by-side stereo overlay
 };
 
 /*!
