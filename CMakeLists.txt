@@ -168,10 +168,6 @@ if(WIN32 AND NOT MINGW)
 	set(WINDOWSAPP_LIBRARY WindowsApp)
 endif()
 
-if(ANDROID)
-    find_package(CNSDK CONFIG)
-endif()
-
 #https://github.com/arsenm/sanitizers-cmake
 find_package(Sanitizers MODULE)
 
@@ -199,8 +195,6 @@ option(BUILD_TESTING "Enable building of the test suite?" ON)
 # cmake-format: off
 option_with_deps(CMAKE_INTERPROCEDURAL_OPTIMIZATION "Enable inter-procedural (link-time) optimization" DEFAULT OFF DEPENDS HAS_IPO)
 option(XRT_HAVE_TRACY "Enable Tracy support for tracing, make sure to set XRT_FEATURE_TRACING as well." OFF)
-
-option_with_deps(XRT_HAVE_CNSDK "Enable CNSDK support (Android)" DEPENDS CNSDK_FOUND)
 
 # Vendor source isolation (ADR-019, issue #256/#263) — the runtime DLL
 # holds zero vendor identifiers in its link line. Vendor drv_*
@@ -471,7 +465,6 @@ endif()
 message(STATUS "#####----- Config -----#####")
 message(STATUS "#    GIT_DESC:        ${GIT_DESC}")
 message(STATUS "#")
-message(STATUS "#    CNSDK:           ${XRT_HAVE_CNSDK}")
 message(STATUS "#    Metal:           ${XRT_HAVE_METAL}")
 message(STATUS "#    D3D11:           ${XRT_HAVE_D3D11}")
 message(STATUS "#    D3D12:           ${XRT_HAVE_D3D12}")

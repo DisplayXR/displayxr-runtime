@@ -87,10 +87,4 @@ ext {
     // If you're having trouble with a "can't find python" CMake error, you can specify the path to
     // Python 3 explicitly in local.properties with a property named "pythonBinary"
     pythonBinary = project.findProperty('pythonBinary')
-
-    // TODO: Download release
-    cnsdkDir = new File(project.projectDir, "cnsdk")
-    println "CNSDK directory: $cnsdkDir"
-
-    cnsdkVersion = rootProject.file(new File(rootProject.cnsdkDir, "VERSION.txt")).text
 }
