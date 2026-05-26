@@ -188,6 +188,11 @@ oxr_session_populate_vk_with_metal_native(struct oxr_logger *log,
 #include "vk_native/comp_vk_native_compositor.h"
 #endif
 
+#ifdef XRT_OS_ANDROID
+#include "android/android_custom_surface.h"
+#include "android/android_globals.h"
+#endif
+
 /*
  * Environment variable to enable/disable VK native compositor.
  * Default is TRUE — VK native compositor is enabled by default for in-process mode.
@@ -264,6 +269,41 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 		display_screen_left = sys->xsysc->info.display_screen_left;
 		display_screen_top = sys->xsysc->info.display_screen_top;
 	}
+
+#ifdef XRT_OS_ANDROID
+	// POC plumbing for XR_EXT_android_surface_binding. Apps don't pass an
+	// ANativeWindow* yet, so spawn a SurfaceView on the activity via
+	// android_custom_surface (existing Monado machinery) and block briefly
+	// for its ANativeWindow. Leaks the handle for now — process scope,
+	// single-app POC.
+	if (window_handle == NULL) {
+		struct _JavaVM *vm = (struct _JavaVM *)android_globals_get_vm();
+		void *activity = android_globals_get_activity();
+		if (vm == NULL || activity == NULL) {
+			return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
+			                 "Android: VM=%p activity=%p — both must be set "
+			                 "before xrCreateSession (call android_globals_store_vm_and_activity "
+			                 "from JNI_OnLoad / Activity onCreate)",
+			                 (void *)vm, activity);
+		}
+		struct android_custom_surface *cs = android_custom_surface_async_start(
+		    vm, activity, /*display_id*/ 0, "DisplayXR", /*preferred_display_mode_id*/ 0);
+		if (cs == NULL) {
+			return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
+			                 "Android: android_custom_surface_async_start failed");
+		}
+		ANativeWindow *win = android_custom_surface_wait_get_surface(cs, /*timeout_ms*/ 5000);
+		if (win == NULL) {
+			android_custom_surface_destroy(&cs);
+			return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
+			                 "Android: surfaceCreated callback never fired within 5 s");
+		}
+		android_globals_store_window((struct _ANativeWindow *)win);
+		window_handle = (void *)win;
+		U_LOG_IFL_I(U_LOGGING_INFO,
+		            "Android: ANativeWindow %p obtained via android_custom_surface", (void *)win);
+	}
+#endif
 
 	// Create the VK native compositor
 	xrt_result_t xret = comp_vk_native_compositor_create(

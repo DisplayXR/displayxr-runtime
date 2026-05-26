@@ -161,6 +161,15 @@ if(APPLE)
 	endif()
 endif()
 
+if(ANDROID)
+	# VK native compositor on Android (vendor DP weaves via plug-in DLL)
+	if(XRT_HAVE_VULKAN AND TARGET comp_vk_native)
+		target_sources(st_oxr PRIVATE oxr_session_gfx_vk_native.c)
+		target_link_libraries(st_oxr PRIVATE comp_vk_native)
+		target_compile_definitions(st_oxr PRIVATE XRT_HAVE_VK_NATIVE_COMPOSITOR)
+	endif()
+endif()
+
 # Qwerty driver: needed on all platforms for camera-centric view controls
 # (oxr_session.c calls qwerty_get_view_state behind #ifdef XRT_BUILD_DRIVER_QWERTY)
 if(XRT_BUILD_DRIVER_QWERTY AND TARGET drv_qwerty)
