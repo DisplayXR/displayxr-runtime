@@ -56,6 +56,7 @@ static struct xrt_plugin_instance *g_active_instance = NULL;
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdio.h>
+#include <wchar.h>
 
 /*!
  * Maximum number of plug-ins we enumerate from the registry. 16 is
@@ -295,10 +296,95 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 	return iface;
 }
 
+/*!
+ * Pin the runtime core DLL (DisplayXRClient.dll) into the process by
+ * absolute path before any plug-in is loaded. Runs once.
+ *
+ * Vendor plug-in DLLs statically import DisplayXRClient.dll, which ships
+ * in the runtime install dir. That dir is intentionally NOT on PATH
+ * (issue #104), and the per-plug-in LOAD_WITH_ALTERED_SEARCH_PATH below
+ * searches only the plug-in's own dir + System32 + cwd + PATH — none of
+ * which hold DisplayXRClient.dll except cwd when it happens to equal the
+ * runtime dir. So at logon (Run-key launches with cwd=System32) and when
+ * the workspace controller spawns the service, that import fails with
+ * ERROR_MOD_NOT_FOUND (126) and every plug-in load aborts → no display
+ * processor → the service exits (issue #328).
+ *
+ * Pre-loading DisplayXRClient.dll by absolute path here pins it into the
+ * process by base name; the loader then satisfies each plug-in's import
+ * from the already-resident module with no disk search, independent of
+ * cwd/PATH. The per-plug-in load deliberately keeps
+ * LOAD_WITH_ALTERED_SEARCH_PATH so vendor side DLLs (e.g. the SR platform
+ * at C:\Program Files\LeiaSR\Platform\bin) still resolve via PATH.
+ *
+ * No process-wide search-order mutation (cf. target_dll_init.c) — this is
+ * the surgical option and leaves PATH resolution intact for vendors.
+ */
+static void
+preload_runtime_core_dll(void)
+{
+	static int done = 0;
+	if (done) {
+		return;
+	}
+	done = 1;
+
+	// Directory of whatever module this loader code lives in — the
+	// service exe or DisplayXRClient.dll, both of which sit in the
+	// runtime install dir. UNCHANGED_REFCOUNT: we only want its path.
+	HMODULE self = NULL;
+	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+	                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                        (LPCWSTR)(void *)&preload_runtime_core_dll, &self)) {
+		U_LOG_W("plugin loader: GetModuleHandleEx(self) failed (err=%lu) — cannot locate runtime dir to "
+		        "pre-load DisplayXRClient.dll.",
+		        GetLastError());
+		return;
+	}
+
+	wchar_t modpath[MAX_PATH];
+	DWORD len = GetModuleFileNameW(self, modpath, MAX_PATH);
+	if (len == 0 || len >= MAX_PATH) {
+		U_LOG_W("plugin loader: GetModuleFileName(self) failed/truncated — skipping DisplayXRClient.dll "
+		        "pre-load.");
+		return;
+	}
+
+	// Strip the module filename to leave the runtime dir.
+	wchar_t *slash = wcsrchr(modpath, L'\\');
+	if (slash == NULL) {
+		return;
+	}
+	*slash = L'\0';
+
+	wchar_t corepath[MAX_PATH];
+	if (swprintf_s(corepath, MAX_PATH, L"%s\\DisplayXRClient.dll", modpath) <= 0) {
+		return;
+	}
+
+	// If it is already resident (in-process app target, where the host
+	// loaded it via the OpenXR loader) this just bumps the refcount and
+	// the plug-in import binds to it. Otherwise it loads now so the
+	// import resolves. LOAD_WITH_ALTERED_SEARCH_PATH so the core DLL's
+	// own siblings (cjson.dll, pthreadVC3.dll) resolve from the runtime
+	// dir rather than the host exe dir.
+	if (LoadLibraryExW(corepath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH) == NULL) {
+		U_LOG_W("plugin loader: pre-load of %ls failed (err=%lu); plug-in loads may fail when cwd is not "
+		        "the runtime dir.",
+		        corepath, GetLastError());
+	} else {
+		U_LOG_I("plugin loader: pinned runtime core DLL for plug-in import resolution: %ls", corepath);
+	}
+}
+
 static const struct xrt_plugin_iface *
 discover_active_plugin(struct xrt_plugin_instance **out_inst)
 {
 	*out_inst = NULL;
+
+	// Ensure DisplayXRClient.dll is resident before any plug-in import
+	// of it has to resolve (issue #328).
+	preload_runtime_core_dll();
 
 	struct plugin_entry entries[MAX_PLUGIN_ENTRIES];
 	int n = enumerate_registry(entries, MAX_PLUGIN_ENTRIES);
