@@ -13,7 +13,8 @@ A→B→C→D test plan for the first hardware install of the Android POC. Each 
 
 Companion docs:
 - [`android-build-guide.md`](android-build-guide.md) — prerequisites, CNSDK setup, build commands.
-- [`docs/vendors/leia/cnsdk-android-calibration.md`](../vendors/leia/cnsdk-android-calibration.md) — face axes / view mapping / UV flip calibration (Test C).
+- [`android-bringup-logcat.md`](android-bringup-logcat.md) — pre-written `adb logcat` filters per test + expected line sequences + failure-shortcut table.
+- [`displayxr-leia-plugin/docs/cnsdk-android-calibration.md`](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/docs/cnsdk-android-calibration.md) — face axes / view mapping / UV flip calibration (Test B).
 
 ## What to test
 
