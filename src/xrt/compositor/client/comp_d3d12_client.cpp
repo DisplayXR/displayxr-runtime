@@ -49,6 +49,20 @@
 using namespace std::chrono_literals;
 using namespace std::chrono;
 
+// Phase 2 (#184) — forward decls of the IPC client compositor bridges defined
+// in src/xrt/ipc/client/ipc_client_compositor.c. Resolved at link time so this
+// TU does not pull the IPC client headers. Mirrors comp_d3d11_client.cpp /
+// comp_vk_client.c — wires the D3D12 client into the service's GPU-side
+// workspace_sync_fence wait path so workspace-mode reads are ordered after the
+// app's render (the legacy KeyedMutex path the D3D12 client never holds raced
+// ahead → black slots for Unity/Unreal).
+extern "C" xrt_result_t
+comp_ipc_client_compositor_get_workspace_sync_fence(struct xrt_compositor *xc,
+                                                    bool *out_have_fence,
+                                                    xrt_graphics_sync_handle_t *out_handle);
+extern "C" void
+comp_ipc_client_compositor_set_workspace_sync_fence_value(struct xrt_compositor *xc, uint64_t value);
+
 DEBUG_GET_ONCE_LOG_OPTION(log, "D3D_COMPOSITOR_LOG", U_LOGGING_INFO)
 
 DEBUG_GET_ONCE_BOOL_OPTION(barriers, "D3D12_COMPOSITOR_BARRIERS", false);
@@ -158,6 +172,20 @@ struct client_d3d12_compositor
 	 * The value most recently signaled on the timeline semaphore
 	 */
 	uint64_t timeline_semaphore_value = 0;
+
+	/*!
+	 * Phase 2 (#184) — per-IPC-client `ID3D12Fence` shared with the d3d11
+	 * service's per-client `workspace_sync_fence`. Imported once at create
+	 * via the `compositor_get_workspace_sync_fence` RPC. Signal a
+	 * monotonically increasing value on @ref app_queue once per
+	 * `layer_commit` AFTER the app's render submit, then ship the value to
+	 * the service via `comp_ipc_client_compositor_set_workspace_sync_fence_value`
+	 * so its per-view loop queues an `ID3D11DeviceContext4::Wait` instead of
+	 * the legacy KeyedMutex acquire (which the D3D12 client never holds).
+	 * Null when the import failed — legacy KeyedMutex path stays in effect.
+	 */
+	wil::com_ptr<ID3D12Fence> workspace_sync_fence;
+	uint64_t workspace_sync_fence_value = 0;
 };
 
 static_assert(std::is_standard_layout<client_d3d12_compositor>::value);
@@ -944,6 +972,31 @@ client_d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_syn
 			return xrt_comp_layer_commit(&c->xcn->base, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
 		}
 	}
+
+	// Phase 2 (#184) — signal the workspace_sync_fence on the app queue, AFTER
+	// the per-session fence signal above so it rides the same command stream as
+	// the just-submitted render commands. Cache the value on the IPC client so
+	// the next layer-sync RPC ships it to the service, whose per-view loop then
+	// queues an `ID3D11DeviceContext4::Wait` on it and skips the legacy
+	// KeyedMutex acquire. Placed BEFORE the timeline-semaphore early return so
+	// it runs on every commit regardless of which session-sync path is active.
+	// No-op when the import failed (legacy KeyedMutex path stays in effect).
+	if (c->workspace_sync_fence) {
+		c->workspace_sync_fence_value++;
+		HRESULT hr = c->app_queue->Signal(c->workspace_sync_fence.get(), c->workspace_sync_fence_value);
+		if (!SUCCEEDED(hr)) {
+			char buf[kErrorBufSize];
+			formatMessage(hr, buf);
+			D3D_WARN(c, "Phase 2 (#184): Signal(workspace_sync_fence) failed: %s; "
+			            "service will treat this frame as stale.",
+			         buf);
+			c->workspace_sync_fence_value--;
+		} else {
+			comp_ipc_client_compositor_set_workspace_sync_fence_value(&c->xcn->base,
+			                                                          c->workspace_sync_fence_value);
+		}
+	}
+
 	if (c->timeline_semaphore) {
 		// We got this from the native compositor, so we can pass it back
 		return xrt_comp_layer_commit_with_semaphore( //
@@ -1135,6 +1188,54 @@ try {
 	if (!c->fence) {
 		D3D_WARN(c, "No sync mechanism for D3D12 was successful!");
 	}
+
+	// Phase 2 (#184) — fetch the per-IPC-client workspace_sync_fence from the
+	// service and import it as an ID3D12Fence. This is a separate fence from
+	// the per-session timeline semaphore above; it lets the d3d11 service's
+	// per-view compose loop queue a GPU-side wait on this client's render
+	// instead of falling back to the legacy KeyedMutex (which the D3D12 client
+	// never acquires/releases, so the service read raced ahead of the app's
+	// GPU work → black slots for non-trivial Unity/Unreal scenes). Failure is
+	// non-fatal — `workspace_sync_fence` stays null and the legacy path runs
+	// unchanged for this client. Mirrors comp_d3d11_client / comp_vk_client.
+	{
+		bool have = false;
+		xrt_graphics_sync_handle_t handle = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+		xrt_result_t fxret = comp_ipc_client_compositor_get_workspace_sync_fence(&xcn->base, &have, &handle);
+		if (fxret == XRT_SUCCESS && have && xrt_graphics_sync_handle_is_valid(handle)) {
+			try {
+				wil::com_ptr<ID3D12Fence1> wsf =
+				    xrt::auxiliary::d3d::d3d12::importFence(*(c->device), (HANDLE)handle);
+				if (wsf) {
+					c->workspace_sync_fence = wsf.query<ID3D12Fence>();
+					c->workspace_sync_fence_value = 0;
+					U_LOG_W("[FENCE] client=%p workspace_sync_fence imported "
+					        "(D3D12 GPU-side wait path active)",
+					        (void *)c.get());
+				} else {
+					U_LOG_W("Phase 2 (D3D12): importFence returned null; "
+					        "falling back to legacy KeyedMutex path.");
+				}
+			} catch (wil::ResultException const &e) {
+				U_LOG_W("Phase 2 (D3D12): importFence threw (%s); falling back "
+				        "to legacy KeyedMutex path.",
+				        e.what());
+			}
+			// importFence dups/owns its own ref to the underlying fence; the
+			// handle the IPC layer duped into our process is ours to close.
+			CloseHandle((HANDLE)handle);
+		} else if (fxret != XRT_SUCCESS) {
+			D3D_WARN(c,
+			         "Phase 2 (D3D12): get_workspace_sync_fence RPC failed "
+			         "(xret=%d); legacy KeyedMutex path stays in effect.",
+			         (int)fxret);
+		} else {
+			U_LOG_W("Phase 2 (D3D12): server reported no workspace_sync_fence "
+			        "(non-D3D11 backend or fence creation failed); legacy "
+			        "KeyedMutex path stays in effect.");
+		}
+	}
+
 	c->base.base.get_swapchain_create_properties = client_d3d12_compositor_get_swapchain_create_properties;
 	c->base.base.create_swapchain = client_d3d12_create_swapchain;
 	c->base.base.create_passthrough = client_d3d12_compositor_passthrough_create;
