@@ -151,6 +151,15 @@ list(APPEND ENABLED_DRIVERS drv_sim_display)
 #
 # v1 ships this alongside the runtime — discovery + load wiring lands
 # in the next sequencing step.
+#
+# Gated on the runtime DLL target existing: the plug-in links against
+# $<TARGET_LINKER_FILE:${RUNTIME_TARGET}> and add_dependencies()es it, so it
+# cannot be configured when the runtime is not built — e.g. the MinGW-w64
+# compile-check, which sets XRT_FEATURE_OPENXR=OFF and so never creates the
+# openxr_displayxr target. Skipping the plug-in there avoids a generate-time
+# "target openxr_displayxr does not exist" error; real Windows/macOS builds
+# always have the runtime target so the plug-in builds as before.
+if(TARGET ${RUNTIME_TARGET})
 add_library(drv_sim_display_plugin SHARED ${SIM_DISPLAY_SOURCES} sim_display/sim_display_plugin.c)
 target_compile_definitions(drv_sim_display_plugin PRIVATE XRT_USING_RUNTIME_DLL)
 target_link_libraries(
@@ -237,6 +246,7 @@ elseif(NOT ANDROID)
 		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
 		)
 endif()
+endif() # TARGET ${RUNTIME_TARGET} — DisplayXR-SimDisplay plug-in block
 
 set(ENABLED_DRIVERS ${ENABLED_HEADSET_DRIVERS} ${ENABLED_DRIVERS})
 if(ENABLED_DRIVERS)

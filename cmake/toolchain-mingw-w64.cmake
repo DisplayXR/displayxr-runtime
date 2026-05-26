@@ -25,6 +25,23 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 
+# Do NOT restrict PACKAGE discovery to the find-root (i.e. no
+# CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY): the build does
+# `find_package(Eigen3 REQUIRED NO_MODULE)`, and Eigen is a header-only host
+# package (e.g. Homebrew) we legitimately want to find for the cross-compile.
+# Restricting PACKAGE mode would make that REQUIRED find fail.
+#
+# But that openness lets CONFIG-mode `find_package(cJSON)` (via the project's
+# cmake/FindcJSON.cmake) pick up a *host* cJSON config — e.g. Homebrew's
+# /opt/homebrew/.../lib/cmake/cJSON, which ships only a Release-config imported
+# target. A Debug cross-build then dies at generate with "IMPORTED_IMPLIB not
+# set for imported target cjson configuration Debug". The cross-check never
+# wants system cJSON anyway (it builds the bundled / displayxr_mcp-vendored
+# cJSON, and build-mingw-check.sh forces XRT_HAVE_SYSTEM_CJSON=OFF), so disable
+# cJSON package discovery outright. find_package(cJSON MODULE) is not REQUIRED,
+# so this cleanly yields cJSON_FOUND=FALSE → bundled cJSON path.
+set(CMAKE_DISABLE_FIND_PACKAGE_cJSON ON)
+
 # Mark MinGW-w64 cross builds so CMakeLists can guard out incompatible
 # pieces (WIL, vcpkg-only deps) without affecting native MSVC builds.
 set(XRT_CROSS_MINGW_CHECK ON CACHE BOOL "Cross-compile compile-check via MinGW-w64" FORCE)
