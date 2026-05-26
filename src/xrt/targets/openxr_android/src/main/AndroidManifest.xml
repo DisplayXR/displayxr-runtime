@@ -84,6 +84,21 @@
                 <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
             </intent-filter>
         </service>
+
+        <!--
+            Khronos OpenXR loader runtime-broker ContentProvider.
+            The loader's Android discovery path queries this authority
+            on first xrCreateInstance to find out which runtime .so to
+            dlopen — without it the loader fails with
+            XR_ERROR_RUNTIME_UNAVAILABLE even when the RuntimeService
+            above is installed (the loader doesn't fall back to the
+            service-intent discovery on its own — broker is the
+            primary mechanism on Android-12+).
+        -->
+        <provider
+            android:name="org.freedesktop.monado.openxr_runtime.OpenXRRuntimeBroker"
+            android:authorities="org.khronos.openxr.runtime_broker"
+            android:exported="true" />
     </application>
 
 </manifest>
