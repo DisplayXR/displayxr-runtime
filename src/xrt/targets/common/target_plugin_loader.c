@@ -570,6 +570,80 @@ get_runtime_lib_dir(char *out_dir, size_t out_size)
 	return true;
 }
 
+/*!
+ * Preload sibling `.so` files from the runtime's lib dir by absolute
+ * path before the plug-in's `dlopen` triggers DT_NEEDED resolution.
+ *
+ * Why: the Android linker namespace (`clns-<n>`) where the plug-in
+ * is loaded is the *calling app's* namespace — not the runtime APK's.
+ * That namespace's `default_library_paths` only includes the calling
+ * app's own `/data/app/<app-pkg>/lib/<ABI>/`. So a plug-in shipped in
+ * the runtime APK's lib dir, whose DT_NEEDED references vendor .so
+ * files in the SAME runtime APK's lib dir, cannot resolve those
+ * names — the linker doesn't know to look there.
+ *
+ * Workaround: explicitly `dlopen` each sibling `.so` by absolute path
+ * before the main plug-in load. `dlopen` with an absolute path
+ * bypasses path search and loads the library directly into the
+ * current namespace's soinfo table. When the linker subsequently
+ * resolves the plug-in's DT_NEEDED references, it finds the
+ * already-loaded library by soname and skips path search entirely.
+ *
+ * Skips:
+ *   - the runtime DLL itself (already loaded by the OpenXR loader);
+ *   - other plug-in candidates (`libdxrp*_*.so`) — those go through
+ *     the normal discovery + probe flow.
+ *
+ * Idempotent: dlopen of an already-loaded library returns the
+ * existing handle without reloading.
+ *
+ * Long-term fix: the Android linker exposes `android_create_namespace`
+ * + `android_dlopen_ext` to create custom namespaces with explicit
+ * `library_search_paths`. That API is NDK-private though
+ * (`<android/dlext.h>` flags are public but `android_create_namespace`
+ * isn't), so we use the preload approach until a public NDK API
+ * surfaces or until the OpenXR loader itself sets up a permissive
+ * runtime namespace.
+ */
+static void
+preload_runtime_lib_dir(const char *lib_dir)
+{
+	DIR *d = opendir(lib_dir);
+	if (d == NULL) {
+		return;
+	}
+	struct dirent *de;
+	while ((de = readdir(d)) != NULL) {
+		if (de->d_type != DT_REG) {
+			continue;
+		}
+		const char *name = de->d_name;
+		size_t n = strlen(name);
+		if (n < 4 || strcmp(name + n - 3, ".so") != 0) {
+			continue;
+		}
+		/* Skip plug-in candidates — they go through try_load_one. */
+		if (strncmp(name, "libdxrp", 7) == 0) {
+			continue;
+		}
+		/* Skip the runtime DLL: already loaded, dlopen of it is
+		 * harmless but the log line is noise. */
+		if (strncmp(name, "openxr_displayxr.so", 19) == 0 ||
+		    strncmp(name, "libopenxr_displayxr.so", 22) == 0) {
+			continue;
+		}
+		char path[PATH_MAX];
+		(void)snprintf(path, sizeof(path), "%s/%s", lib_dir, name);
+		void *h = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+		if (h == NULL) {
+			U_LOG_I("plugin loader: preload %s skipped: %s", name, dlerror());
+		} else {
+			U_LOG_I("plugin loader: preloaded %s", name);
+		}
+	}
+	closedir(d);
+}
+
 static const struct xrt_plugin_iface *
 try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst)
 {
@@ -661,6 +735,11 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst)
 	}
 
 	qsort(entries, (size_t)n, sizeof(entries[0]), compare_by_filename);
+
+	/* Bring sibling vendor `.so` files into the current namespace's
+	 * loaded-soinfo table before any plug-in dlopen so DT_NEEDED can
+	 * resolve them. See preload_runtime_lib_dir's docstring. */
+	preload_runtime_lib_dir(root);
 
 	U_LOG_I("plugin loader: %d registered plug-in(s) in %s; attempting in filename order.", n, root);
 	for (int i = 0; i < n; i++) {
