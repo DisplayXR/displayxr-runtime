@@ -219,6 +219,29 @@ struct xrt_display_processor
 	bool (*is_alpha_native)(struct xrt_display_processor *xdp);
 
 	/*!
+	 * Whether process_atlas records into its own VkCommandBuffer and submits
+	 * it to the queue internally, rather than recording into the cmd_buffer
+	 * passed by the compositor.
+	 *
+	 * When true, the compositor:
+	 *   - Ends and submits its pre-DP cmd_buffer (window-space layer
+	 *     composite, atlas crop) before calling process_atlas, so the GPU
+	 *     order matches the source order.
+	 *   - Passes VK_NULL_HANDLE for the cmd_buffer arg to process_atlas
+	 *     (the DP is expected to ignore it).
+	 *   - Skips its own post-process_atlas queue submit for the frame.
+	 *
+	 * Used by DPs that wrap a vendor SDK whose API records and submits
+	 * internally (e.g. CNSDK's leia_interlacer_vulkan_do_post_process).
+	 *
+	 * Optional — NULL means false (compositor records-and-submits as usual).
+	 *
+	 * @param xdp Pointer to self.
+	 * @return true if process_atlas submits its own cmd buffer.
+	 */
+	bool (*is_self_submitting)(struct xrt_display_processor *xdp);
+
+	/*!
 	 * Inform the DP of session-level transparency configuration.
 	 * Called once at session start when @p transparent_bg_enabled is set on
 	 * the corresponding window-binding extension. DPs that need the
@@ -241,6 +264,30 @@ struct xrt_display_processor
 	void (*set_chroma_key)(struct xrt_display_processor *xdp,
 	                       uint32_t key_color,
 	                       bool transparent_bg_enabled);
+
+	/*!
+	 * Notify the display processor that the host activity has paused
+	 * (backgrounded). Vendor SDKs use this to drop face-tracking
+	 * cameras, dim backlights, and otherwise save power.
+	 *
+	 * Idempotent. Safe to call before the vendor SDK is fully
+	 * initialized — the vendor wrapper should no-op in that case.
+	 *
+	 * Optional — NULL means the vendor doesn't need pause notifications.
+	 *
+	 * @param xdp Pointer to self.
+	 */
+	void (*on_pause)(struct xrt_display_processor *xdp);
+
+	/*!
+	 * Notify the display processor that the host activity has resumed
+	 * (foregrounded). Counterpart of @ref on_pause.
+	 *
+	 * Optional — NULL means no-op.
+	 *
+	 * @param xdp Pointer to self.
+	 */
+	void (*on_resume)(struct xrt_display_processor *xdp);
 
 	/*!
 	 * Destroy this display processor and free all resources.
@@ -412,6 +459,20 @@ xrt_display_processor_is_alpha_native(struct xrt_display_processor *xdp)
 }
 
 /*!
+ * @copydoc xrt_display_processor::is_self_submitting
+ * Returns false if not supported (function pointer is NULL).
+ * @public @memberof xrt_display_processor
+ */
+static inline bool
+xrt_display_processor_is_self_submitting(struct xrt_display_processor *xdp)
+{
+	if (xdp == NULL || xdp->is_self_submitting == NULL) {
+		return false;
+	}
+	return xdp->is_self_submitting(xdp);
+}
+
+/*!
  * @copydoc xrt_display_processor::set_chroma_key
  * No-op if not supported (function pointer is NULL).
  * @public @memberof xrt_display_processor
@@ -425,6 +486,34 @@ xrt_display_processor_set_chroma_key(struct xrt_display_processor *xdp,
 		return;
 	}
 	xdp->set_chroma_key(xdp, key_color, transparent_bg_enabled);
+}
+
+/*!
+ * @copydoc xrt_display_processor::on_pause
+ * No-op if not supported (function pointer is NULL).
+ * @public @memberof xrt_display_processor
+ */
+static inline void
+xrt_display_processor_on_pause(struct xrt_display_processor *xdp)
+{
+	if (xdp == NULL || xdp->on_pause == NULL) {
+		return;
+	}
+	xdp->on_pause(xdp);
+}
+
+/*!
+ * @copydoc xrt_display_processor::on_resume
+ * No-op if not supported (function pointer is NULL).
+ * @public @memberof xrt_display_processor
+ */
+static inline void
+xrt_display_processor_on_resume(struct xrt_display_processor *xdp)
+{
+	if (xdp == NULL || xdp->on_resume == NULL) {
+		return;
+	}
+	xdp->on_resume(xdp);
 }
 
 /*!
