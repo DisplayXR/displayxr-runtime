@@ -5,6 +5,22 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!--
+        Android 12+ package-visibility restriction: cross-package
+        intent queries return empty unless the caller declares what
+        it wants to see in <queries>. Without this, the Khronos
+        OpenXR loader's PackageManager scan for
+        org.khronos.openxr.OpenXRRuntimeService returns zero matches
+        and xrCreateInstance fails with XR_ERROR_RUNTIME_UNAVAILABLE
+        — even on a device that has the DisplayXR runtime installed.
+        See https://developer.android.com/training/package-visibility
+    -->
+    <queries>
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
+        </intent>
+    </queries>
+
     <uses-feature
         android:glEsVersion="0x00030002"
         android:required="false" />
