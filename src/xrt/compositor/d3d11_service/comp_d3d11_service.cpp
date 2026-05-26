@@ -7135,87 +7135,12 @@ after_key_shortcuts:
 		(void)0; // label target for the launcher-visible fast-path above.
 	}
 
-	// Scroll wheel (workspace consumes only when modifier held; plain scroll is
-	// forwarded to the focused app by the WndProc):
-	//   Shift+Scroll → Z-depth
-	//   Ctrl+Scroll  → resize
-	if (mc->window != nullptr && mc->focused_slot >= 0) {
-		int32_t scroll = comp_d3d11_window_consume_scroll(mc->window);
-		if (scroll != 0) {
-			int s = mc->focused_slot;
-			if (s >= 0 && s < D3D11_MULTI_MAX_CLIENTS && mc->clients[s].active) {
-				bool shift_held = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-				if (shift_held) {
-					// Shift+Scroll: move window in Z (~2mm per notch)
-					float dz = (float)scroll / (120.0f * 500.0f); // ~0.002m per notch
-					float new_z = mc->clients[s].window_pose.position.z + dz;
-					if (new_z < -0.05f) new_z = -0.05f;
-					if (new_z >  0.05f) new_z =  0.05f;
-					mc->clients[s].window_pose.position.z = new_z;
-
-					slot_pose_to_pixel_rect(sys, &mc->clients[s],
-					                        &mc->clients[s].window_rect_x,
-					                        &mc->clients[s].window_rect_y,
-					                        &mc->clients[s].window_rect_w,
-					                        &mc->clients[s].window_rect_h);
-					U_LOG_I("Multi-comp: Shift+Scroll Z depth slot %d → Z=%.3fm", s, new_z);
-				} else {
-				// Plain scroll: resize (~5% per notch)
-				float factor = 1.0f + (float)scroll / (120.0f * 20.0f); // 5% per notch
-				if (factor < 0.5f) factor = 0.5f;
-				if (factor > 2.0f) factor = 2.0f;
-
-				float new_w = mc->clients[s].window_width_m * factor;
-				float new_h = mc->clients[s].window_height_m * factor;
-
-				// Clamp width to fit title bar buttons; height to 2cm; max 80% of display.
-				float max_w = sys->base.info.display_width_m * 0.8f;
-				float max_h = sys->base.info.display_height_m * 0.8f;
-				if (max_w <= 0.0f) max_w = 0.560f;
-				if (max_h <= 0.0f) max_h = 0.315f;
-
-				if (new_w < UI_MIN_WIN_W_M) new_w = UI_MIN_WIN_W_M;
-				if (new_h < UI_MIN_WIN_H_M) new_h = UI_MIN_WIN_H_M;
-				if (new_w > max_w) new_w = max_w;
-				if (new_h > max_h) new_h = max_h;
-
-				mc->clients[s].window_width_m = new_w;
-				mc->clients[s].window_height_m = new_h;
-
-				slot_pose_to_pixel_rect(sys, &mc->clients[s],
-				                        &mc->clients[s].window_rect_x,
-				                        &mc->clients[s].window_rect_y,
-				                        &mc->clients[s].window_rect_w,
-				                        &mc->clients[s].window_rect_h);
-
-				mc->clients[s].hwnd_resize_pending = true;
-				multi_compositor_update_input_forward(mc);
-				} // end else (plain scroll resize)
-			}
-		}
-	}
-
-	// [ / ] keys: step Z depth ±5mm for focused window.
-	if (mc->focused_slot >= 0 && mc->focused_slot < D3D11_MULTI_MAX_CLIENTS &&
-	    mc->clients[mc->focused_slot].active) {
-		float z_step = 0.0f;
-		if (GetAsyncKeyState(VK_OEM_4) & 1) z_step = -0.005f;  // [ = back
-		if (GetAsyncKeyState(VK_OEM_6) & 1) z_step =  0.005f;  // ] = forward
-		if (z_step != 0.0f) {
-			int s = mc->focused_slot;
-			float new_z = mc->clients[s].window_pose.position.z + z_step;
-			if (new_z < -0.05f) new_z = -0.05f;
-			if (new_z >  0.05f) new_z =  0.05f;
-			mc->clients[s].window_pose.position.z = new_z;
-
-			slot_pose_to_pixel_rect(sys, &mc->clients[s],
-			                        &mc->clients[s].window_rect_x,
-			                        &mc->clients[s].window_rect_y,
-			                        &mc->clients[s].window_rect_w,
-			                        &mc->clients[s].window_rect_h);
-			U_LOG_I("Multi-comp: [/] Z depth slot %d → Z=%.3fm", s, new_z);
-		}
-	}
+	// #305: scroll-to-resize, Shift+Scroll Z-depth, and [ / ] Z-step are now
+	// owned by the workspace controller (ADR-018 — controller owns interactive
+	// policy). The runtime emits SCROLL_EXT / KEY_EXT on the public event
+	// surface; the controller drives size/Z via xrSetWorkspaceClientWindowPoseEXT.
+	// (The launcher grid still consumes scroll via comp_d3d11_window_consume_scroll
+	// above — that path stays until the launcher itself moves out per #308.)
 
 	// Handle swap chain resize
 	if (mc->hwnd != nullptr && mc->swap_chain) {

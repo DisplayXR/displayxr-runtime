@@ -346,6 +346,10 @@ is_workspace_reserved_key(WPARAM vk, bool shift)
 	// controller ignores ESC, so it's a harmless no-op rather than killing the
 	// app. (The runtime itself holds no maximize state — ADR-018.)
 	case VK_ESCAPE: return true;
+	// #305: [ and ] step the focused window's Z-depth — a workspace control
+	// owned by the controller. Reserve them so they don't also reach the app.
+	case VK_OEM_4:  return true;    // [ = window Z back
+	case VK_OEM_6:  return true;    // ] = window Z forward
 	default:        return false;
 	}
 }
@@ -699,15 +703,11 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			int32_t cx = GET_X_LPARAM(lParam);
 			int32_t cy = GET_Y_LPARAM(lParam);
 			uint32_t mods = workspace_compute_modifiers();
-			if (message == WM_MOUSEWHEEL) {
-				int16_t delta_int = GET_WHEEL_DELTA_WPARAM(wParam);
-				float delta = (float)delta_int / (float)WHEEL_DELTA;
-				// WM_MOUSEWHEEL coords are screen-space; convert to client.
-				POINT clip = {cx, cy};
-				ScreenToClient(hWnd, &clip);
-				workspace_public_ring_push(w, WORKSPACE_PUBLIC_EVENT_SCROLL,
-				                           clip.x, clip.y, 0, 0, mods, delta);
-			} else if (message == WM_MOUSEMOVE) {
+			// #305: SCROLL is emitted later in the wheel-routing block so that
+			// only workspace (non-app-forwarded) scrolls reach the controller —
+			// a plain scroll over app content is forwarded to the app and must
+			// NOT also drive a controller resize.
+			if (message == WM_MOUSEMOVE) {
 				// Gate motion on pointer capture so idle hover doesn't
 				// flood the public ring. wParam carries the held-button
 				// state (MK_LBUTTON / MK_RBUTTON / MK_MBUTTON) — pack
@@ -722,7 +722,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 					workspace_public_ring_push(w, WORKSPACE_PUBLIC_EVENT_MOTION,
 					                           cx, cy, mask, 0, mods, 0.0f);
 				}
-			} else {
+			} else if (message != WM_MOUSEWHEEL) {
 				uint32_t button = 0;
 				uint32_t is_down = 0;
 				switch (message) {
@@ -760,10 +760,13 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		if (fwd != NULL) {
 			// Workspace mode wheel routing:
 			//   cursor over app content + no modifier → forward to app (e.g. 3DGS zoom)
-			//   cursor outside app content            → workspace resize (no modifier needed)
-			//   Ctrl + scroll                         → workspace resize (force, even over app)
-			//   Shift + scroll                        → window Z-depth
-			// Capture clients don't take wheel input, so always consume their delta.
+			//   cursor outside app content            → workspace scroll (emitted to controller)
+			//   Ctrl / Shift + scroll                 → workspace scroll (emitted to controller)
+			// Capture clients don't take wheel input, so always treat as workspace.
+			// #305: the runtime no longer interprets workspace scrolls — it emits
+			// SCROLL_EXT and the controller owns resize/Z policy. Emission happens
+			// only on this (non-forwarded) path so a plain scroll over app content
+			// goes to the app alone, never also resizing.
 			if (message == WM_MOUSEWHEEL) {
 				bool ctrl  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
 				bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -788,7 +791,14 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 					PostMessage(fwd, message, wParam, lParam);
 				} else {
 					short delta = GET_WHEEL_DELTA_WPARAM(wParam);
+					// Launcher grid still drains this (#308 will move it out).
 					InterlockedExchangeAdd(&w->scroll_accum, (LONG)delta);
+					// Controller-bound scroll: resize / Z-depth policy lives
+					// in the workspace controller (ADR-018, #305).
+					workspace_public_ring_push(w, WORKSPACE_PUBLIC_EVENT_SCROLL,
+					                           pt.x, pt.y, 0, 0,
+					                           workspace_compute_modifiers(),
+					                           (float)delta / (float)WHEEL_DELTA);
 				}
 				return 0;
 			}
