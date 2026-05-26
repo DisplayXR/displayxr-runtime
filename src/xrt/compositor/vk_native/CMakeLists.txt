@@ -5,7 +5,7 @@
 # Native Vulkan compositor library
 #
 
-if((WIN32 OR APPLE) AND XRT_HAVE_VULKAN)
+if((WIN32 OR APPLE OR ANDROID) AND XRT_HAVE_VULKAN)
 	add_library(
 		comp_vk_native STATIC
 		comp_vk_native_compositor.c
