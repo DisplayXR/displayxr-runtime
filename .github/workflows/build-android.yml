@@ -1,0 +1,166 @@
+name: Build Android
+
+on:
+  # Public-repo CI policy: fire freely. CI is free for public repos on
+  # GitHub-hosted runners, so we optimize for contributor experience
+  # rather than minute-burn. Same policy as build-windows.yml /
+  # build-macos.yml — see those files for the full rationale.
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+  pull_request: {}
+
+# Cancel any in-progress run for the same PR (or branch) when a new
+# push comes in. Only the latest commit's CI completes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  DetectChanges:
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.filter.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full clone — the diff below uses pull_request.base.sha,
+          # which can be older than the merge commit's first parent
+          # (PR base lags main after a main push). Shallow clones miss
+          # those refs and the diff fails with "fatal: bad object".
+          fetch-depth: 0
+      - id: filter
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "Detected tag push — forcing docs_only=false"
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=${{ github.event.pull_request.base.sha }}
+          else
+            BASE=${{ github.event.before }}
+          fi
+          CHANGED=$(git diff --name-only "$BASE" HEAD)
+          # docs_only: every changed file matches doc / boilerplate patterns.
+          # When true, Runtime still RUNS — to report a status for branch
+          # protection — but skips its heavy steps via per-step `if:`.
+          NON_DOC=$(echo "$CHANGED" | grep -vE '^(docs/|.*\.md$|LICENSE$|\.github/ISSUE_TEMPLATE/)' || true)
+          if [ -n "$CHANGED" ] && [ -z "$NON_DOC" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Detected docs_only=$(grep ^docs_only= "$GITHUB_OUTPUT" | cut -d= -f2)"
+
+  Runtime:
+    # Always runs on PRs (drafts included) and main pushes so it can
+    # report a status check; heavy steps below skip when DetectChanges
+    # flagged the PR as docs_only.
+    needs: DetectChanges
+    runs-on: ubuntu-latest
+
+    env:
+      DOCS_ONLY: ${{ needs.DetectChanges.outputs.docs_only }}
+      # Pin NDK to the version openxr_android/build.gradle reads from
+      # gradle.properties. Bump together.
+      ANDROID_NDK_VERSION: '26.3.11579264'
+
+    steps:
+
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: true
+
+      - name: Doc-only PR — skipping heavy build steps
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "DetectChanges flagged docs_only=true; the steps below skip and the Runtime job reports a success status without running the full Android build."
+
+      - name: Install glslangValidator (SPIR-V shader compiler)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          # The runtime CMake's spirv_shaders() helper needs
+          # glslangValidator on PATH. Ubuntu's glslang-tools package
+          # ships a recent-enough version (1.3.x) for our SPIR-V 1.0
+          # targets. Cheaper + faster than installing the full Vulkan
+          # SDK like the Windows workflow does.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq glslang-tools
+          glslangValidator --version | head -1
+
+      - name: Set up JDK 17
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Android NDK
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: false
+
+      - name: Cache Gradle dependencies
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-android-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-android-${{ runner.os }}-
+
+      - name: Build runtime APK
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          # Gradle wrapper reads sdk.dir from local.properties OR
+          # ANDROID_HOME/ANDROID_SDK_ROOT env vars. nttld/setup-ndk
+          # leaves ANDROID_HOME pointing at the runner's bundled SDK
+          # (the action only installs the NDK into a custom dir, which
+          # we pass via ANDROID_NDK_HOME above). The build.gradle's
+          # externalNativeBuild block uses ANDROID_NDK_HOME to resolve
+          # the toolchain.
+          chmod +x ./gradlew
+          ./gradlew :src:xrt:targets:openxr_android:assembleInProcessDebug --no-daemon --stacktrace
+
+      - name: Inspect APK contents
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          APK=src/xrt/targets/openxr_android/build/outputs/apk/inProcess/debug/openxr_android-inProcess-debug.apk
+          echo "APK size: $(du -h "$APK" | cut -f1)"
+          echo "Native libs:"
+          unzip -l "$APK" | grep '\.so$' || echo "(none)"
+          # Sanity: confirm the .so name in the APK matches what the
+          # AndroidManifest expects. Mismatch silently fails on device.
+          MANIFEST_SO=openxr_displayxr.so
+          if ! unzip -l "$APK" | grep -q "lib/arm64-v8a/$MANIFEST_SO"; then
+            echo "::error::APK is missing lib/arm64-v8a/$MANIFEST_SO — manifest references it but it's not bundled"
+            exit 1
+          fi
+          # Sanity: post-restructure, no CNSDK .so should be packaged
+          # in the runtime APK (the plug-in repo handles that).
+          if unzip -l "$APK" | grep -q 'libleiaSDK'; then
+            echo "::warning::CNSDK .so leaked into runtime APK — check that openxr_android/build.gradle didn't re-add a CNSDK AAR dep"
+          fi
+
+      - name: Upload APK
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: DisplayXR-Android-inProcess-debug
+          path: src/xrt/targets/openxr_android/build/outputs/apk/inProcess/debug/openxr_android-inProcess-debug.apk
+          if-no-files-found: error
+          retention-days: 14
