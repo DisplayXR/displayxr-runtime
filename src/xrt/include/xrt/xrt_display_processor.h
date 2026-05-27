@@ -19,6 +19,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h> // offsetof — used by the ABI tripwire at the end of this header
 
 #ifdef __cplusplus
 extern "C" {
@@ -298,6 +299,57 @@ struct xrt_display_processor
 
 	/*! @} */
 };
+
+/*
+ * ── Plug-in ABI tripwire (ADR-020) ─────────────────────────────────────────
+ *
+ * `xrt_display_processor` is a FIXED-OFFSET vtable shared across the runtime ↔
+ * vendor-plug-in DLL boundary (ADR-019). The runtime calls these slots at the
+ * compile-time slot indices below; a plug-in built against an older copy of
+ * this header that disagrees on a single slot makes the runtime call the WRONG
+ * function — exactly what broke standalone-VK weaving (the runtime's
+ * set_chroma_key call hit leia's destroy after on_pause/on_resume were inserted
+ * mid-struct without a version bump). See ADR-020.
+ *
+ * If you change anything that trips an assert below, you are making a BREAKING
+ * ABI change. In the SAME change you MUST:
+ *   1. Bump XRT_PLUGIN_API_VERSION_CURRENT in xrt_plugin.h,
+ *   2. Update the slot indices / count here,
+ *   3. Re-pin + rebuild every vendor plug-in (e.g. leia-plugin's
+ *      DXR_RUNTIME_GIT_TAG and its CI runtime-checkout ref) and the bundle,
+ *   4. Follow the append-only + struct_size plan in ADR-020.
+ * Until struct_size negotiation (ADR-020 rule 1) lands, even APPENDING a method
+ * is breaking — old plug-ins still read fixed offsets. New methods go at the
+ * END only.
+ *
+ * Offsets are asserted as (slot index) * sizeof(void *) so the check holds on
+ * both 64-bit and 32-bit (Android) builds — the slot index is the invariant
+ * that decides which function the runtime dispatches to.
+ */
+#if defined(__cplusplus)
+#define XRT_DP_ABI_ASSERT(cond, msg) static_assert(cond, msg)
+#else
+#define XRT_DP_ABI_ASSERT(cond, msg) _Static_assert(cond, msg)
+#endif
+#define XRT_DP_ABI_MSG                                                                                                  \
+	"xrt_display_processor ABI changed — see ADR-020: bump XRT_PLUGIN_API_VERSION_CURRENT and re-pin every plug-in."
+// clang-format off
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, process_atlas)                ==  0 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_predicted_eye_positions)  ==  1 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_window_metrics)           ==  2 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, request_display_mode)         ==  3 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_hardware_3d_state)        ==  4 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_render_pass)              ==  5 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_display_dimensions)       ==  6 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_display_pixel_info)       ==  7 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, is_alpha_native)              ==  8 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, is_self_submitting)           ==  9 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_chroma_key)               == 10 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, on_pause)                     == 11 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, on_resume)                    == 12 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, destroy)                      == 13 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor)                                 == 14 * sizeof(void *), XRT_DP_ABI_MSG);
+// clang-format on
 
 /*!
  * @copydoc xrt_display_processor::process_atlas

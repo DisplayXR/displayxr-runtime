@@ -123,14 +123,24 @@ struct xrt_plugin_display_info
  */
 
 /*!
- * Plug-in ABI version. Bumped only on a non-additive layout change in
- * the structs declared in this header. Pure-additive changes (new fields
- * appended at the end of a struct, covered by the struct's `struct_size`
- * field) are NOT version bumps and remain backward-compatible.
+ * Plug-in ABI version (major). Bumped on a non-additive layout change in the
+ * structs declared in this header **OR** in the display-processor vtables
+ * (`xrt_display_processor` + the per-API factory contracts in
+ * `xrt_display_processor_<api>.h`), which are part of this ABI even though they
+ * live in their own headers and are handed back by `create_dp_<api>`.
  *
- * Numbers grow forward; the runtime + each plug-in declare which they
- * implement, the runtime compares, and either side can decline cleanly
- * if the other is too old or too new.
+ * For the `struct_size`-carrying structs here, pure-additive changes (fields
+ * appended at the end, covered by `struct_size`) are NOT version bumps.
+ *
+ * For the DP vtables: until they gain `struct_size` negotiation (ADR-020 rule
+ * 1), they are read at FIXED offsets, so even an append is breaking — any
+ * layout change there is a major bump. The compile-time tripwire at the end of
+ * `xrt_display_processor.h` fails the build if that vtable changes without
+ * bumping this macro. See ADR-020 for the full policy.
+ *
+ * Compatibility rule (ADR-020 rule 2/3): same major == compatible; a different
+ * major is rejected by the loader (it must not call through a mismatched
+ * vtable). Numbers grow forward.
  */
 #define XRT_PLUGIN_API_VERSION_1 1
 
