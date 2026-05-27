@@ -200,6 +200,13 @@ create_instance(struct android_app *app)
 		return false;
 	}
 
+	/* Stable sentinel for CI emulator smoke test (build-android.yml).
+	 * Tag intentionally distinctive so a single grep over logcat
+	 * confirms the full broker → runtime → plug-in chain reached
+	 * xrCreateInstance success. Do NOT rename without updating the
+	 * CI workflow. */
+	LOGI("ANDROID_POC_SENTINEL xrCreateInstance=XR_SUCCESS");
+
 	XrInstanceProperties props = {};
 	props.type = XR_TYPE_INSTANCE_PROPERTIES;
 	res = xrGetInstanceProperties(g_instance, &props);
