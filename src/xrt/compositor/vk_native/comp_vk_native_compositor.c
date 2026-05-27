@@ -2596,6 +2596,52 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	free(c);
 }
 
+/*!
+ * Sanity-check a display-processor's C vtable before the compositor trusts it.
+ *
+ * The DP is a plug-in-owned struct of function pointers. On Windows we have
+ * observed (standalone VK + Leia SR) the DP's small heap block being reused by
+ * the GPU driver's Vulkan shader compiler during pipeline creation, leaving the
+ * vtable holding garbage (non-code) pointers — a subsequent call through it is a
+ * hard ACCESS_VIOLATION. This validates that the load-bearing slots point into
+ * committed, executable pages; NULL is left alone (it's a valid "unsupported"
+ * sentinel that every xrt_display_processor_* wrapper already tolerates).
+ *
+ * Returns true if the vtable looks usable. On non-Windows this is a no-op
+ * (returns true) — the failure mode is Windows-driver-specific.
+ */
+static bool
+dp_vtable_looks_sane(struct xrt_display_processor *dp)
+{
+	if (dp == NULL) {
+		return false;
+	}
+#ifdef XRT_OS_WINDOWS
+	// Load-bearing slots the compositor calls. process_atlas + destroy are
+	// mandatory; the rest are optional (may legitimately be NULL).
+	void *fns[] = {
+	    (void *)dp->process_atlas,        (void *)dp->destroy,
+	    (void *)dp->get_display_pixel_info, (void *)dp->get_render_pass,
+	    (void *)dp->get_display_dimensions, (void *)dp->set_chroma_key,
+	};
+	if (dp->process_atlas == NULL || dp->destroy == NULL) {
+		return false; // mandatory slots
+	}
+	const DWORD exec = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+	for (size_t i = 0; i < sizeof(fns) / sizeof(fns[0]); i++) {
+		if (fns[i] == NULL) {
+			continue; // valid "unsupported" sentinel
+		}
+		MEMORY_BASIC_INFORMATION mbi;
+		if (VirtualQuery(fns[i], &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT ||
+		    (mbi.Protect & exec) == 0) {
+			return false;
+		}
+	}
+#endif
+	return true;
+}
+
 /*
  *
  * Exported functions
@@ -2866,6 +2912,20 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	} else {
 		c->target = NULL;
 		U_LOG_I("No VK target — offscreen shared texture mode");
+	}
+
+	// Guard: target/swapchain creation above can trigger GPU-driver Vulkan
+	// shader-compiler heap churn that, on some configs (Windows + Leia SR),
+	// reuses the display-processor's heap block and corrupts its vtable. A
+	// call through a garbage vtable slot (e.g. get_display_pixel_info just
+	// below) is a hard crash. Validate here and degrade to passthrough
+	// (no weaving) instead of crashing. Do NOT call the DP's destroy — that
+	// pointer may itself be garbage; leak the corrupt object on this path.
+	if (c->display_processor != NULL && !dp_vtable_looks_sane(c->display_processor)) {
+		U_LOG_E("VK display processor vtable corrupt after target creation — "
+		        "disabling DP (output will not be woven). Likely a driver "
+		        "heap-reuse collision.");
+		c->display_processor = NULL;
 	}
 
 	// Determine view dimensions
