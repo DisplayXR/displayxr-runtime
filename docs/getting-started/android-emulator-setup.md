@@ -1,10 +1,12 @@
 # Android emulator pre-bring-up
 
 How far the Android emulator gets you on the way to a real Lume Pad
-bring-up. Short version: **build + install + most of the OpenXR loader
-discovery surface — but xrCreateInstance fails at the broker step.**
-Useful for catching half the bring-up bugs early; not a full
-replacement for hardware.
+bring-up. Short version: **build + install + the full OpenXR
+loader / broker / plug-in handshake all work — and
+`xrCreateInstance` succeeds.** The wall is at the runtime's own
+Vulkan-device creation, where the emulator's software-Vulkan is
+missing extensions the runtime asks for. Useful for catching every
+build / loader / linker bug before hardware.
 
 ## What works on the emulator
 
@@ -14,59 +16,24 @@ replacement for hardware.
 | `adb install` of arm64-v8a APKs | ✅ | Android-36 emulator's `cpu.abilist` includes `arm64-v8a` (binary translation via libnativebridge); no x86_64 rebuild required. |
 | Test app launches as a NativeActivity | ✅ | `am start -n com.displayxr.cube_handle_vk_android/android.app.NativeActivity`. |
 | `xrInitializeLoaderKHR` succeeds | ✅ | Khronos loader picks up the JavaVM + Activity refs. |
-| Vulkan 1.0+ available | ✅ | `pm list features` reports `vulkan.level=1`, `vulkan.version=4206592` (0x402080 = 1.0.131). |
+| Vulkan 1.0+ available | ✅ | `pm list features` reports `vulkan.level=1`, `vulkan.version=0x402080` (1.0.131). |
+| Runtime broker ContentProvider | ✅ | `OpenXRRuntimeBroker.kt` in the runtime APK responds at `org.khronos.openxr.runtime_broker` (#332). |
+| Loader → runtime DLL handshake | ✅ | `xrNegotiateLoaderRuntimeInterface` succeeds. |
+| Plug-in `.so` dlopen + CNSDK transitive deps | ✅ | `preload_runtime_lib_dir` in `target_plugin_loader.c` (#333) brings sibling .so files into the namespace by absolute path so DT_NEEDED resolves. |
+| Plug-in `xrtPluginNegotiate` + `probe` | ✅ | Returns `iface={id="leia-cnsdk", ...}`. |
+| `xrCreateInstance` | ✅ | Full handshake completes. |
+| `xrCreateVulkanInstanceKHR` | ✅ | Software Vulkan accepts the instance create. |
 
 ## What doesn't work on the emulator
 
-`xrCreateInstance` fails with `XR_ERROR_RUNTIME_UNAVAILABLE`. Logcat:
-
-```
-OpenXR-Loader: Error: RuntimeManifestFile::FindManifestFiles -
-    failed to determine active runtime file path for this environment
-OpenXR-Loader: Error: RuntimeInterface::LoadRuntimes - unknown error
-OpenXR-Loader: Error: xrCreateInstance failed
-cube_handle_vk_android: xrCreateInstance -> XR_ERROR_RUNTIME_UNAVAILABLE
-```
-
-The Khronos OpenXR loader on Android uses a **runtime broker** model:
-the test app queries PackageManager for an installed
-ContentProvider at the authority `org.khronos.openxr.runtime_broker`
-(or `org.khronos.openxr.system_runtime_broker`), and that broker
-tells the loader which `.so` to dlopen. The DisplayXR runtime APK
-ships only the runtime `.so` + `RuntimeService` — not the broker
-ContentProvider — so even with the APK installed, the loader has no
-way to discover it.
-
-Two related issues fall out of this:
-
-1. **`<queries>` element**: Android 12+ blocks cross-package
-   PackageManager queries by default. Fixed in PR #269 — the test
-   app's manifest now declares `<queries><intent>... OpenXRRuntimeService ...</intent></queries>`.
-   Without this, the loader's PackageManager query returns empty on
-   any Android-12+ device, emulator or Lume Pad.
-
-2. **Active runtime broker**: real hardware (Lume Pad) presumably
-   ships a vendor broker APK pointing at the installed runtime,
-   OR a system-level setting that the loader consults. On the
-   stock Android emulator neither exists, so the runtime is
-   invisible to the loader.
-
-### What to do about the broker on the emulator
-
-Three options if you really need to exercise `xrCreateInstance` →
-`xrCreateSession` on the emulator:
-
-| Option | Effort | Caveats |
+| Step | Why | Where it works |
 |---|---|---|
-| **Install Khronos's sample broker APK** | Medium — build from <https://github.com/KhronosGroup/OpenXR-SDK-Source/tree/main/specification/sources/scripts/openxr-android-broker> | Sample isn't published as an APK; need to build it yourself. |
-| **Add a broker ContentProvider to the runtime APK** | Small (~50 lines Kotlin) | Probably the right long-term answer for the runtime — a broker is needed on any Android device where the runtime is the only one installed. Tracked as a follow-up. |
-| **Set the active runtime via Settings provider** | OS-dependent | Lume Pad may expose this; stock emulator doesn't. |
+| `xrCreateVulkanDeviceKHR` | Software Vulkan returns `VK_ERROR_EXTENSION_NOT_PRESENT` for one of the device extensions the runtime requests. Emulator's swiftshader vulkan implements a minimal extension set. | Lume Pad (real arm Vulkan + Mali / Adreno drivers should have what's missing). |
+| Anything past xrCreateSession | Blocked on the above. | Lume Pad. |
+| CNSDK face-tracking init | Needs Leia hardware (camera + system service). | Lume Pad. |
+| Display weave / calibration | No lenticular optics. | Lume Pad. |
 
-For first-light bring-up on Lume Pad, **skip the emulator** and go
-straight to hardware — Lume Pad's preinstalled OS likely handles the
-broker. If you hit `XR_ERROR_RUNTIME_UNAVAILABLE` on the Lume Pad too,
-swap to one of the three options above (likely option 2 — bake the
-broker into the runtime APK).
+For first-light hardware bring-up the emulator already validates everything except hardware Vulkan + CNSDK init — which is a meaningful slice of what can go wrong.
 
 ## Step-by-step emulator workflow
 
@@ -107,28 +74,38 @@ done
 ### 2. Build the three APKs
 
 See [`android-build-guide.md`](android-build-guide.md) for the
-build steps. The condensed version:
+prerequisites. The condensed build sequence — order matters:
 
 ```bash
-# Plug-in .so (arm64-v8a)
-cd /c/displayxr-leia-plugin && scripts/build-android.sh
+# (A) Runtime APK first. This downloads and unpacks Eigen into
+# the runtime's build/intermediates/ tree, which the plug-in
+# CMake then consumes via Eigen3_DIR.
+cd /c/openxr-3d-display
+./gradlew.bat :src:xrt:targets:openxr_android:assembleInProcessDebug
 
-# Drop into runtime APK's jniLibs/<ABI>/
-mkdir -p /c/openxr-3d-display/src/xrt/targets/openxr_android/src/main/jniLibs/arm64-v8a
-cp build-android/src/drv_leia_android/libdxrp050_leia_cnsdk.so \
-   /c/openxr-3d-display/src/xrt/targets/openxr_android/src/main/jniLibs/arm64-v8a/
+# (B) Plug-in .so + CNSDK transitive .so deps, dropped into
+# the runtime APK's jniLibs/<ABI>/ in one command. The
+# `install-runtime-jnilibs` target builds libdxrp050_leia_cnsdk.so,
+# extracts sdk-faceTrackingInApp-<ver>.aar + snpe-release.aar, and
+# copies all 16 .so files (plug-in + 4 CNSDK + 11 SNPE) into the
+# runtime's jniLibs. Without these the runtime fails at first
+# xrCreateInstance with "dlopen libleiaSDK-faceTrackingInApp.so
+# not found".
+cd /c/displayxr-leia-plugin
+scripts/build-android.sh install-runtime-jnilibs
 
-# Runtime + test app
+# (C) Re-build runtime APK so it picks up the new jniLibs/
+# contents. The `--rerun-tasks` flag is load-bearing — gradle's
+# incremental builder can miss a newly-created jniLibs/<ABI>/
+# directory and ship the runtime APK without the .so files.
 cd /c/openxr-3d-display
 ./gradlew.bat :src:xrt:targets:openxr_android:assembleInProcessDebug --rerun-tasks
+
+# (D) Test app.
 ./gradlew.bat :test_apps:cube_handle_vk_android:assembleDebug
 ```
 
-The `--rerun-tasks` flag on the runtime build is load-bearing the first
-time — gradle's incremental builder can miss a newly-created
-`jniLibs/<ABI>/` directory and ship the runtime APK without the
-plug-in `.so`. Always sanity-check `unzip -l <runtime.apk> | grep '.so$'`
-shows both `openxr_displayxr.so` and `libdxrp050_leia_cnsdk.so`.
+**Sanity check:** `unzip -l <runtime.apk> | grep '\.so$'` should list 16 entries (1 runtime + 1 plug-in + 3 CNSDK + 11 SNPE). If it shows only 1 or 2, the install-runtime-jnilibs step didn't run or the runtime rebuild didn't pick up the new jniLibs.
 
 ### 3. Install on emulator
 
@@ -147,42 +124,45 @@ ADB="$LOCALAPPDATA/Android/Sdk/platform-tools/adb.exe"
 
 # Capture logcat (filter strings from android-bringup-logcat.md)
 "$ADB" logcat -v threadtime -s cube_handle_vk_android:V OpenXR-Loader:V \
-    target_plugin_loader:V leia_cnsdk:V
+    target_plugin_loader:V leia_cnsdk:V DisplayXR-Broker:V
 ```
 
-**Expected log on the emulator (without a broker):**
+**Expected log on the emulator:**
 
 ```
 xrInitializeLoaderKHR -> XR_SUCCESS
-OpenXR-Loader: Entering loader trampoline (xrCreateInstance)
-OpenXR-Loader: Error: RuntimeManifestFile::FindManifestFiles - failed to determine active runtime file path
-xrCreateInstance -> XR_ERROR_RUNTIME_UNAVAILABLE
+OpenXR-Loader: getActiveRuntimeCursor: Querying URI: content://org.khronos.openxr.runtime_broker/openxr/1/abi/arm64-v8a/runtimes/active
+DisplayXR-Broker: Active runtime resolved: ...openxr_displayxr.so in /data/app/.../lib/arm64
+OpenXR-Loader: RuntimeInterface::LoadRuntime succeeded
+plugin loader: preloaded libblink.so
+plugin loader: preloaded libleiaSDK-faceTrackingInApp.so
+plugin loader: preloaded liblicense_utils.so
+plugin loader: preloaded libSNPE.so
+(... 11 more SNPE deps preloaded ...)
+plugin loader: active plug-in: id=leia-cnsdk name='DisplayXR Leia CNSDK (Android)' ...
+xrCreateInstance -> XR_SUCCESS
+xrCreateVulkanInstanceKHR -> XR_SUCCESS
+xrCreateVulkanDeviceKHR vk_result=-7  ← VK_ERROR_EXTENSION_NOT_PRESENT (emulator stops here)
 ```
 
-If you see this exact sequence, the emulator confirms:
-- Build pipeline produced a valid APK that installs.
-- Manifest's `<queries>` block lets the loader's PackageManager calls run (no platform-level visibility errors).
-- Vulkan is available.
-
-The error at `xrCreateInstance` is the **expected emulator stopping
-point** — the next step requires a broker.
+This is the **expected emulator stopping point**. Everything up to xrCreateInstance is real validation; the device-create failure is the emulator's Vulkan limit, not our code. Lume Pad's hardware Vulkan should clear this and reach `xrCreateSession`.
 
 ## What this catches before Lume Pad
 
-Half-dozen bug classes you can hit and fix without leaving the host:
+| Bug class | Caught? |
+|---|---|
+| APK build / `.so`-name / manifest mismatch | ✅ |
+| `jniLibs/` plumbing (gradle's incremental-cache miss) | ✅ |
+| Android-12+ `<queries>` regressions | ✅ |
+| OpenXR loader binding | ✅ |
+| Runtime broker discovery | ✅ |
+| Plug-in `dlopen` + Android linker namespaces | ✅ |
+| Plug-in `probe`/`negotiate` contract | ✅ |
+| Vulkan-extension availability mismatches | Partial (only the ones swiftshader does support) |
+| CNSDK init / display weave / calibration | ❌ — need hardware |
+| `xrCreateVulkanDeviceKHR` extension set | ❌ — need hardware |
 
-| Bug class | Caught? | Example |
-|---|---|---|
-| APK build failures | ✅ | The `.so`-name / manifest-name mismatch fixed in PR #268. |
-| `jniLibs/` plumbing | ✅ | Plug-in `.so` not bundled into the runtime APK (gradle incremental cache bug). |
-| Android-12+ `<queries>` regressions | ✅ | PR #269's manifest fix. |
-| OpenXR loader binding (instance create entry point) | ✅ | `xrInitializeLoaderKHR` succeeds. |
-| Native-lib JNI plumbing (NativeActivity, ALooper, etc.) | ✅ | Test app boots into android_main without crashing. |
-| Vulkan-extension availability mismatches | Partial | Emulator's Vulkan 1.0.131 is older than Lume Pad's; some extension queries we'd want to make won't exercise. |
-| CNSDK init | ❌ | Needs Leia hardware (no lenticular optics, no face-tracking camera). |
-| Display weave correctness | ❌ | Same — needs hardware. |
-| Face-axis / view-mapping / UV-flip calibration | ❌ | Same. |
-| Active-runtime broker resolution | ❌ | Needs a broker installed (deferred). |
+Pre-bring-up, the emulator covers everything except the last three. That's a real majority of what would otherwise burn the first Lume Pad session.
 
 ## Tear-down
 
