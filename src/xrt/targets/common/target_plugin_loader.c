@@ -709,6 +709,7 @@ target_plugin_clear_preferred(void)
 #include <dirent.h>
 #include <dlfcn.h>
 #include <limits.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -904,12 +905,18 @@ get_runtime_lib_dir(char *out_dir, size_t out_size)
 static void
 preload_runtime_lib_dir(const char *lib_dir)
 {
+#define MAX_PRELOAD_CANDIDATES 64
+	char *names[MAX_PRELOAD_CANDIDATES];
+	int loaded[MAX_PRELOAD_CANDIDATES] = {0};
+	char *last_err[MAX_PRELOAD_CANDIDATES] = {0};
+	int n_candidates = 0;
+
 	DIR *d = opendir(lib_dir);
 	if (d == NULL) {
 		return;
 	}
 	struct dirent *de;
-	while ((de = readdir(d)) != NULL) {
+	while ((de = readdir(d)) != NULL && n_candidates < MAX_PRELOAD_CANDIDATES) {
 		if (de->d_type != DT_REG) {
 			continue;
 		}
@@ -928,16 +935,59 @@ preload_runtime_lib_dir(const char *lib_dir)
 		    strncmp(name, "libopenxr_displayxr.so", 22) == 0) {
 			continue;
 		}
-		char path[PATH_MAX];
-		(void)snprintf(path, sizeof(path), "%s/%s", lib_dir, name);
-		void *h = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
-		if (h == NULL) {
-			U_LOG_I("plugin loader: preload %s skipped: %s", name, dlerror());
-		} else {
-			U_LOG_I("plugin loader: preloaded %s", name);
+		names[n_candidates] = strdup(name);
+		if (names[n_candidates] == NULL) {
+			break;
 		}
+		n_candidates++;
 	}
 	closedir(d);
+
+	/* Fixed-point iteration: a vendor .so often has DT_NEEDED entries
+	 * pointing at sibling .so files (e.g. CNSDK's libleiaSDK depends on
+	 * libblink, which depends on libSNPE + liblicense_utils). readdir
+	 * order is filesystem-dependent and may visit a dependent before
+	 * its deps, so a single pass would fail to load it. Loop until a
+	 * full pass produces no new successful loads. Worst case O(N²)
+	 * dlopen attempts for N libs, but N is small (≤20) and dlopen of
+	 * an already-loaded soinfo is essentially free. */
+	int total_loaded = 0;
+	bool progress = true;
+	while (progress) {
+		progress = false;
+		for (int i = 0; i < n_candidates; i++) {
+			if (loaded[i]) {
+				continue;
+			}
+			char path[PATH_MAX];
+			(void)snprintf(path, sizeof(path), "%s/%s", lib_dir, names[i]);
+			void *h = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+			if (h != NULL) {
+				U_LOG_I("plugin loader: preloaded %s", names[i]);
+				loaded[i] = 1;
+				total_loaded++;
+				progress = true;
+				free(last_err[i]);
+				last_err[i] = NULL;
+			} else {
+				/* Cache for final report; another pass might succeed. */
+				const char *err = dlerror();
+				free(last_err[i]);
+				last_err[i] = err ? strdup(err) : NULL;
+			}
+		}
+	}
+
+	for (int i = 0; i < n_candidates; i++) {
+		if (!loaded[i]) {
+			U_LOG_W("plugin loader: preload %s failed after fixed-point: %s", names[i],
+			        last_err[i] ? last_err[i] : "(no dlerror)");
+		}
+		free(names[i]);
+		free(last_err[i]);
+	}
+	U_LOG_I("plugin loader: preload complete (%d/%d loaded)", total_loaded, n_candidates);
+#undef MAX_PRELOAD_CANDIDATES
 }
 
 static const struct xrt_plugin_iface *
