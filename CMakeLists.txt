@@ -2,6 +2,13 @@
 # SPDX-License-Identifier: BSL-1.0
 
 cmake_minimum_required(VERSION 3.22)
+# VERSION below is patched at build time by CI from the latest vX.Y.Z tag —
+# see .github/workflows/build-windows.yml ("Sync CMake VERSION from latest
+# vX.Y.Z tag" step) and build-macos.yml ("steps.version"). The /release skill
+# no longer touches this value; what's committed here is a historical
+# placeholder and may be stale on `main` between releases. Installer artifact
+# names and the runtime's reported version always come from the tag, not from
+# this line. Local-dev builds embed whatever was last committed.
 project(
 	XRT
 	VERSION 1.6.0
