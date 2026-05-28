@@ -18,7 +18,6 @@
 #include <ws2tcpip.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <tlhelp32.h>
 #include <string.h>
 #include <stdio.h>
 #endif
@@ -101,6 +100,12 @@ static bool s_wsa_started = false;
  * Helpers
  *
  */
+
+// Forward decls — hook (un)install live below the watchdog (they depend on
+// the tray HWND and our custom WM_ messages, both defined later in this
+// file), but the watchdog and spawn_workspace need to call them per #344.
+static bool install_workspace_hotkey(void);
+static void uninstall_workspace_hotkey(void);
 
 //! Build the path to a sibling executable next to displayxr-service.exe.
 static bool
@@ -345,9 +350,15 @@ workspace_watch_thread_func(LPVOID param)
 
 	OW("Workspace controller process exited");
 
-	// In Auto mode, nothing to re-register: the low-level keyboard hook
-	// stays installed across workspace sessions, it's gated by s_workspace_running
-	// in the hook proc.
+	// #344: in Auto mode the hook is uninstalled while the controller is
+	// running (see spawn_workspace). Re-install it now so the next
+	// Ctrl+Space re-spawns the workspace. install_workspace_hotkey is
+	// a PostMessage to the tray thread — safe from this watchdog thread.
+	if (s_cfg.workspace == SERVICE_CHILD_AUTO && s_workspace_available) {
+		if (install_workspace_hotkey()) {
+			s_hotkey_registered = true;
+		}
+	}
 
 	// In Enable mode, restart the workspace controller
 	if (s_cfg.workspace == SERVICE_CHILD_ENABLE && s_workspace_available) {
@@ -384,10 +395,19 @@ spawn_workspace(void)
 	// SetForegroundWindow when it brings its main window up. Without
 	// this Windows can suppress the call (the controller's
 	// CreateProcess parent is us, a background service with no
-	// foreground rights to confer). Matches the AllowSetForegroundWindow
-	// in the Ctrl+Space pass-through path; same Windows rule.
+	// foreground rights to confer).
 	if (s_workspace_pi.dwProcessId != 0) {
 		AllowSetForegroundWindow(s_workspace_pi.dwProcessId);
+	}
+
+	// #344: in Auto mode, the controller now owns Ctrl+Space via its own
+	// RegisterHotKey. Pull our LL keyboard hook out of the input pipeline
+	// for the duration — no chance of throttling other chords, and the
+	// shell's hotkey works without going through CallNextHookEx. The
+	// watchdog re-installs the hook when the controller exits.
+	if (s_cfg.workspace == SERVICE_CHILD_AUTO && s_hotkey_registered) {
+		uninstall_workspace_hotkey();
+		s_hotkey_registered = false;
 	}
 
 	// Start watchdog thread
@@ -657,7 +677,16 @@ stop_bridge_trampoline(void)
  * The hook proc runs on the thread that installed it (the tray thread,
  * which has a GetMessage pump). From there we PostMessage a custom
  * message to the subclassed tray HWND and let spawn_workspace run on a
- * normal stack — hook procs should do minimal work.
+ * normal stack — hook procs should do minimal work, because Windows
+ * silently skips LL hooks that exceed LowLevelHooksTimeout (#344).
+ *
+ * #344: the hook is *uninstalled* while the controller is running (see
+ * spawn_workspace + workspace_watch_thread_func). The shell owns
+ * Ctrl+Space via its own RegisterHotKey while it's up; we only need the
+ * LL hook to handle the "no controller running → spawn one" case. This
+ * keeps the runtime entirely out of the keyboard pipeline whenever the
+ * workspace is alive — no chance of throttling/disabling other chords
+ * via LL-hook timeout.
  *
  */
 
@@ -667,109 +696,52 @@ orchestrator_wnd_proc_hook(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 //! Original tray window proc — we subclass it to intercept our custom msg
 static WNDPROC s_original_wnd_proc = NULL;
 
-//! Find the running workspace controller's PID. Prefers the orchestrator-tracked
-//! PID (when launch_child spawned the controller); falls back to enumerating
-//! processes for the controller image name (covers the case where the user
-//! launched the controller directly outside our spawn path).
-//! Returns 0 if no instance found.
-static DWORD
-find_workspace_controller_pid(void)
-{
-	if (s_workspace_running && s_workspace_pi.dwProcessId != 0) {
-		return s_workspace_pi.dwProcessId;
-	}
-	if (!s_workspace_available || s_workspace_active.binary[0] == '\0') {
-		return 0;
-	}
-	const char *image = strrchr(s_workspace_active.binary, '\\');
-	image = image ? image + 1 : s_workspace_active.binary;
-
-	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-	if (snap == INVALID_HANDLE_VALUE) {
-		return 0;
-	}
-	PROCESSENTRY32 pe;
-	ZeroMemory(&pe, sizeof(pe));
-	pe.dwSize = sizeof(pe);
-	DWORD found = 0;
-	if (Process32First(snap, &pe)) {
-		do {
-			if (_stricmp(pe.szExeFile, image) == 0) {
-				found = pe.th32ProcessID;
-				break;
-			}
-		} while (Process32Next(snap, &pe));
-	}
-	CloseHandle(snap);
-	return found;
-}
-
 static LRESULT CALLBACK
 orchestrator_kbd_hook_proc(int nCode, WPARAM wParam, LPARAM lParam)
 {
-	if (nCode == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
-		KBDLLHOOKSTRUCT *kbd = (KBDLLHOOKSTRUCT *)lParam;
-		if (kbd->vkCode == VK_SPACE) {
-			bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-			bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-			bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-			bool win = (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
-			           (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
-			OW("kbd hook: Space ctrl=%d shift=%d alt=%d win=%d workspace_running=%d",
-			   ctrl, shift, alt, win, (int)s_workspace_running);
-			// Plain Ctrl+Space only, no other modifiers.
-			if (ctrl && !shift && !alt && !win) {
-				// Check both orchestrator-tracked state and the named
-				// singleton mutex Local\DisplayXR.Shell.Singleton —
-				// the latter covers the case where the controller
-				// was launched directly outside our spawn path
-				// (Phase 2.K).
-				bool singleton_present = false;
-				HANDLE existing = OpenMutexW(SYNCHRONIZE, FALSE,
-				    L"Local\\DisplayXR.Shell.Singleton");
-				if (existing != NULL) {
-					CloseHandle(existing);
-					singleton_present = true;
-				}
+	// #344: keep this proc trivially cheap. Anything beyond a few compares
+	// and a single OpenMutexW risks the LowLevelHooksTimeout, which would
+	// have Windows skip the hook (or in newer builds, unhook it entirely).
+	// All heavy work happens on the tray thread via PostMessage.
+	if (nCode != HC_ACTION) goto pass;
+	if (wParam != WM_KEYDOWN && wParam != WM_SYSKEYDOWN) goto pass;
 
-				if (s_workspace_running || singleton_present) {
-					// Controller already running — let its
-					// RegisterHotKey handler take Ctrl+Space.
-					// We have to call AllowSetForegroundWindow
-					// first or Windows will silently drop the
-					// controller's SetForegroundWindow call
-					// (the controller isn't the foreground
-					// process and didn't just receive the
-					// input event — our hook did), and the
-					// user sees the taskbar entry flash
-					// without the window coming to front.
-					// Our hook owns "received the last input
-					// event", so AllowSetForegroundWindow
-					// succeeds from here.
-					DWORD pid = find_workspace_controller_pid();
-					if (pid != 0) {
-						AllowSetForegroundWindow(pid);
-					} else {
-						// Fall back to ASFW_ANY so even an
-						// orphaned process we couldn't
-						// identify can focus itself.
-						AllowSetForegroundWindow(ASFW_ANY);
-					}
-					OW("kbd hook: controller running (pid=%lu) — "
-					   "passing Ctrl+Space + AllowSetForegroundWindow",
-					   (unsigned long)pid);
-					return CallNextHookEx(s_kbd_hook, nCode, wParam, lParam);
-				}
+	KBDLLHOOKSTRUCT *kbd = (KBDLLHOOKSTRUCT *)lParam;
+	if (kbd->vkCode != VK_SPACE) goto pass;
 
-				// No controller running — spawn one.
-				HWND hwnd = (HWND)service_tray_get_hwnd();
-				if (hwnd) {
-					PostMessageW(hwnd, WM_ORCHESTRATOR_SPAWN_WORKSPACE, 0, 0);
-				}
-				return 1; // swallow — don't let other handlers see Ctrl+Space
-			}
+	// Ctrl-only — anything else (Ctrl+Shift+Space, Win+Space IME switch, …)
+	// passes through. GetAsyncKeyState is a register read; sub-microsecond.
+	if (!(GetAsyncKeyState(VK_CONTROL) & 0x8000)) goto pass;
+	if (  GetAsyncKeyState(VK_SHIFT)   & 0x8000)  goto pass;
+	if (  GetAsyncKeyState(VK_MENU)    & 0x8000)  goto pass;
+	if ( (GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000) goto pass;
+
+	// Controller already up? In the normal AUTO path the hook is
+	// uninstalled while running (see spawn_workspace), so this check is
+	// mostly belt-and-suspenders — it catches (a) the brief race between
+	// spawn and uninstall, and (b) a user-launched shell that bypassed
+	// the orchestrator entirely (direct CLI invocation; covered by the
+	// Local\DisplayXR.Shell.Singleton named mutex). When the controller
+	// is up, fall through so its RegisterHotKey handler exits the shell.
+	if (s_workspace_running) goto pass;
+	{
+		HANDLE existing = OpenMutexW(SYNCHRONIZE, FALSE,
+		    L"Local\\DisplayXR.Shell.Singleton");
+		if (existing != NULL) {
+			CloseHandle(existing);
+			goto pass;
 		}
 	}
+
+	// No controller — defer the spawn to the tray thread. spawn_workspace
+	// reads PROCESS_INFORMATION etc.; never call it from the hook stack.
+	{
+		HWND hwnd = (HWND)service_tray_get_hwnd();
+		if (hwnd) PostMessageW(hwnd, WM_ORCHESTRATOR_SPAWN_WORKSPACE, 0, 0);
+	}
+	return 1; // swallow — don't let other handlers see Ctrl+Space
+
+pass:
 	return CallNextHookEx(s_kbd_hook, nCode, wParam, lParam);
 }
 
@@ -893,10 +865,16 @@ apply_workspace_mode(enum service_child_mode mode)
 		break;
 
 	case SERVICE_CHILD_AUTO:
-		// Install low-level keyboard hook so Ctrl+Space summons the workspace controller.
-		// The hook's proc checks s_workspace_running per-keypress and passes
-		// through if the workspace is already up. The actual install happens
-		// on the tray thread via PostMessage; log only on failure here.
+		// Install low-level keyboard hook so Ctrl+Space summons the workspace
+		// controller. #344: the hook is only active when the controller is
+		// NOT running — spawn_workspace uninstalls it on a successful launch
+		// (the shell's own RegisterHotKey owns Ctrl+Space while up), and the
+		// watchdog re-installs it on controller exit. This keeps the runtime
+		// out of the keyboard pipeline whenever the workspace is alive, so
+		// even an LL-hook timeout couldn't throttle other chords.
+		//
+		// Actual install happens on the tray thread via PostMessage; log only
+		// on failure here.
 		if (!s_hotkey_registered) {
 			if (install_workspace_hotkey()) {
 				s_hotkey_registered = true;
