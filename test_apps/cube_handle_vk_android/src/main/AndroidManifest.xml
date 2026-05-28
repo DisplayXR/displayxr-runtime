@@ -58,11 +58,18 @@
 
     <application
         android:allowBackup="false"
-        android:label="DisplayXR Cube VK"
-        android:hasCode="false">
+        android:label="DisplayXR Cube VK">
 
+        <!--
+            MainActivity is a thin Kotlin wrapper around NativeActivity
+            that requests CAMERA at onCreate so CNSDK's face tracker
+            can open the front camera at xrCreateSession. The
+            android.app.lib_name meta-data is still required so the
+            wrapper inherits the native lib load path from
+            NativeActivity.
+        -->
         <activity
-            android:name="android.app.NativeActivity"
+            android:name=".MainActivity"
             android:exported="true"
             android:configChanges="orientation|keyboardHidden|screenSize"
             android:launchMode="singleTask">
