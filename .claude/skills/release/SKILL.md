@@ -36,12 +36,13 @@ version-spec:
 /release patch
   │   (bumps from latest v[0-9]+.[0-9]+.[0-9]+ tag)
   ├─ Pre-flight (clean tree, on main, tag not taken)
-  ├─ Bump CMakeLists.txt VERSION
-  ├─ Commit "Release vX.Y.Z" → push main → tag → push tag
+  ├─ Tag HEAD → push tag
   │
-  │  (CI takes over here — both workflows attach their own artifacts
-  │   to the v* tag's release via softprops/action-gh-release@v2;
-  │   first job to complete creates the release, others append.)
+  │  (CI takes over here — build-windows.yml patches CMakeLists.txt
+  │   VERSION from the tag at build time per PR #353, then both
+  │   workflows attach their artifacts to the v* tag's release via
+  │   softprops/action-gh-release@v2; first job to complete creates
+  │   the release, others append.)
   │
   ├─ Monitor build-windows.yml + build-macos.yml for this commit
   ├─ gh release edit --title --notes (curated Highlights paragraph
@@ -49,9 +50,17 @@ version-spec:
   └─ Report
 ```
 
-CMakeLists.txt VERSION is always bumped to the new semver. The skill
-no longer downloads or re-uploads any artifacts — that moved into the
-workflows themselves per #290.
+The skill no longer touches CMakeLists.txt — CI is authoritative for
+the source-tree VERSION (synced from `git describe --tags --abbrev=0`
+on every Windows build per PR #353; macOS derives version directly
+from `GITHUB_REF` in build-macos.yml). The previous flow's "Release
+X.Y.Z" version-bump commit was both redundant (CI overrode it anyway)
+and a drift vector if the bump was forgotten — that's exactly what
+landed PR #353 (after the in-tree value pinned at 1.2.3 silently
+drifted for three releases past v1.3.0 in displayxr-shell-pvt).
+
+The skill also no longer downloads or re-uploads any artifacts — that
+moved into the workflows themselves per #290.
 
 ## CRITICAL: Launch Subagent
 
@@ -115,23 +124,25 @@ If empty, PREV_TAG=<empty> → use "Initial release" in notes.
 
 ---
 
-## PHASE 2: UPDATE VERSION AND TAG
+## PHASE 2: TAG
 
-### Step 2.1: Bump CMakeLists.txt VERSION
-Extract X.Y.Z from [VERSION]. Find the top-level CMakeLists.txt `VERSION X.Y.Z` line (typically line 7) and update it via Edit tool.
+### Step 2.1: Tag HEAD and push the tag
+The skill no longer commits anything to `main` — CI patches
+CMakeLists.txt VERSION from the tag at build time (PR #353). Just tag
+the current `main` HEAD and push the tag.
 
-### Step 2.2: Commit and tag
 ```bash
-git add CMakeLists.txt
-git commit -m "Release [FULL_TAG]"
 git tag [FULL_TAG]
-git push origin main
 git push origin [FULL_TAG]
 ```
-Store the release commit SHA: `RELEASE_SHA=$(git rev-parse HEAD)`.
 
-### Step 2.3: Branch protection note
-The runtime repo's `main` is protected. If `git push origin main` fails with "Changes must be made through a pull request", retry with `--no-verify` is NOT acceptable — instead, surface the error to the user and ask whether to use admin override (the user has the authority; you do not). For tag pushes, branch protection does not apply.
+Store the tagged commit SHA for later monitoring: `RELEASE_SHA=$(git rev-parse [FULL_TAG]^{commit})`.
+
+### Step 2.2: Branch protection note
+Branch protection on `main` does not apply to tag pushes, so no
+admin override is needed. (Earlier versions of this skill committed a
+"Release vX.Y.Z" version-bump to `main`; that step is gone — see the
+Architecture diagram.)
 
 ---
 
@@ -142,10 +153,10 @@ The runtime repo's `main` is protected. If `git push origin main` fails with "Ch
 
 ### Step 3.2: Find both build runs
 ```bash
-gh run list --workflow build-windows.yml --limit 10 --json databaseId,status,headSha,event
-gh run list --workflow build-macos.yml   --limit 10 --json databaseId,status,headSha,event
+gh run list --workflow build-windows.yml --limit 10 --json databaseId,status,headSha,event,headBranch
+gh run list --workflow build-macos.yml   --limit 10 --json databaseId,status,headSha,event,headBranch
 ```
-For each workflow, find the run with `headSha == $RELEASE_SHA` and `event=push`. Retry up to 6 times with 10s waits per workflow. Store `WIN_RUN_ID` and `MAC_RUN_ID`.
+For each workflow, find the run where `headSha == $RELEASE_SHA`, `event=push`, AND `headBranch == [FULL_TAG]` (i.e. the run fired by the tag push, not any other push that happens to share the SHA). Retry up to 6 times with 10s waits per workflow. Store `WIN_RUN_ID` and `MAC_RUN_ID`.
 
 ### Step 3.3: Watch both runs (in parallel)
 Use a background-poll pattern so both watches run concurrently — total wall time is `max(Windows, macOS)`, not sum.
@@ -282,18 +293,14 @@ git tag -d [FULL_TAG]
 git push --delete origin [FULL_TAG]
 ```
 
-### Step 6.2: Revert the version-bump commit
-```bash
-git revert HEAD --no-edit
-git push origin main
-```
-If main is protected, surface to the user.
+There's nothing else to revert — Phase 2 no longer commits anything to
+`main`, so deleting the tag fully rolls back the release.
 
-### Step 6.3: Error summary + report
+### Step 6.2: Error summary + report
 ```bash
 gh run view $RUN_ID --log-failed | tail -200
 ```
-Report the error and that the tag + commit have been reverted. STOP.
+Report the error and that the tag has been deleted. STOP.
 
 ---
 
@@ -302,9 +309,9 @@ Report the error and that the tag + commit have been reverted. STOP.
 ```
 /release v1.2.1
     → explicit version
-    → bumps CMakeLists VERSION to 1.2.1
-    → tags v1.2.1, runs build-windows.yml
-    → creates GH release with installer
+    → tags current main HEAD as v1.2.1 (no source-tree commit)
+    → push v1.2.1 → CI patches CMakeLists VERSION → builds installer
+    → workflows attach installer to the GH release
 
 /release patch
     → auto-bumps from latest v[0-9]+.[0-9]+.[0-9]+ tag
