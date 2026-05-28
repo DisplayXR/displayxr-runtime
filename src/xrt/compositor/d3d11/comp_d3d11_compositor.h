@@ -84,6 +84,32 @@ comp_d3d11_compositor_set_output_rect(struct xrt_compositor *xc,
                                        uint32_t w, uint32_t h);
 
 /*!
+ * Register a full-window 2D shared texture for the surround region (Spec v6).
+ *
+ * Pairs with comp_d3d11_compositor_set_output_rect: the canvas rect tells
+ * the runtime where to weave 3D content, this call tells it where to find
+ * 2D pixels for the rest of the target swapchain. The compositor blits
+ * non-canvas pixels from this texture into the target each frame.
+ *
+ * Pass shared_handle == NULL to clear the surround (falls back to undefined
+ * non-canvas pixels — the pre-v6 behavior).
+ *
+ * Texture format: DXGI_FORMAT_R8G8B8A8_UNORM or *_UNORM_SRGB. Synchronization
+ * uses IDXGIKeyedMutex on key 0. Dimensions must equal the HWND client area.
+ *
+ * @param xc            The compositor.
+ * @param shared_handle D3D11 shared NT HANDLE, or NULL to clear.
+ * @param w             Texture width in pixels.
+ * @param h             Texture height in pixels.
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_compositor_set_surround_2d(struct xrt_compositor *xc,
+                                       void *shared_handle,
+                                       uint32_t w, uint32_t h);
+
+/*!
  * Get the predicted eye positions from the display processor.
  *
  * @param xc The compositor.

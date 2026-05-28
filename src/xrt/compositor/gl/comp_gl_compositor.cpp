@@ -308,6 +308,9 @@ struct comp_gl_compositor
 	//! Canvas output rect for shared-texture apps.
 	struct u_canvas_rect canvas;
 
+	//! 2D surround texture handle (Spec v6).
+	struct u_surround_2d_handle surround_2d;
+
 	//! MCP capture_frame request box (serviced at end of layer_commit).
 	struct mcp_capture_request mcp_capture;
 
@@ -2050,6 +2053,27 @@ comp_gl_compositor_set_output_rect(struct xrt_compositor *xc,
 	c->canvas.y = y;
 	c->canvas.w = w;
 	c->canvas.h = h;
+}
+
+void
+comp_gl_compositor_set_surround_2d(struct xrt_compositor *xc,
+                                    void *shared_handle,
+                                    uint32_t w, uint32_t h)
+{
+	struct comp_gl_compositor *c = gl_comp(xc);
+	if (shared_handle == nullptr) {
+		c->surround_2d = {};
+		U_LOG_I("GL surround 2D cleared");
+		return;
+	}
+	c->surround_2d.valid = true;
+	c->surround_2d.shared_handle = shared_handle;
+	c->surround_2d.w = w;
+	c->surround_2d.h = h;
+	// Phase (post-Phase-C) TODO: WGL_NV_DX_interop2 share / EGL image
+	// import for the per-frame surround blit pass.
+	U_LOG_I("GL surround 2D registered: handle=%p %ux%u (open + blit pending)",
+	        shared_handle, w, h);
 }
 
 bool

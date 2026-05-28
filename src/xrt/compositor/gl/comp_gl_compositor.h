@@ -96,6 +96,20 @@ comp_gl_compositor_set_output_rect(struct xrt_compositor *xc,
                                     uint32_t w, uint32_t h);
 
 /*!
+ * Register a full-window 2D shared texture for the surround region (Spec v6).
+ *
+ * On Windows the handle is an NT HANDLE bridged via WGL_NV_DX_interop2;
+ * on POSIX, an EGL image / dma-buf fd. Pass shared_handle == NULL to clear.
+ * See comp_d3d11_compositor_set_surround_2d for the cross-platform semantics.
+ *
+ * @ingroup comp_gl
+ */
+void
+comp_gl_compositor_set_surround_2d(struct xrt_compositor *xc,
+                                    void *shared_handle,
+                                    uint32_t w, uint32_t h);
+
+/*!
  * Request display mode switch (2D/3D) via the GL display processor.
  *
  * @param xc        GL compositor base.

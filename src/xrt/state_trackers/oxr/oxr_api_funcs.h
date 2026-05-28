@@ -955,6 +955,14 @@ XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetSharedTextureOutputRectEXT(XrSession session,
                                      int32_t x, int32_t y,
                                      uint32_t width, uint32_t height);
+
+//! OpenXR API function @ep{xrSetSharedTextureSurround2DEXT}
+//! Spec v6 addition: registers a full-window 2D shared texture whose pixels
+//! outside the canvas sub-rect are blitted into the target swapchain.
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetSharedTextureSurround2DEXT(XrSession session,
+                                     void *sharedTextureHandle,
+                                     uint32_t width, uint32_t height);
 #endif
 
 /*!

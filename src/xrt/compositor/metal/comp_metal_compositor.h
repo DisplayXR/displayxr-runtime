@@ -104,6 +104,19 @@ comp_metal_compositor_set_output_rect(struct xrt_compositor *xc,
                                        uint32_t w, uint32_t h);
 
 /*!
+ * Register a full-view 2D IOSurface for the surround region (Spec v6).
+ *
+ * Pass shared_handle == NULL to clear. The handle is an IOSurfaceRef cast
+ * to void*; synchronization uses Metal fences + IOSurface use-count rather
+ * than a KeyedMutex. See comp_d3d11_compositor_set_surround_2d for the
+ * cross-platform semantics.
+ */
+void
+comp_metal_compositor_set_surround_2d(struct xrt_compositor *xc,
+                                       void *shared_handle,
+                                       uint32_t w, uint32_t h);
+
+/*!
  * Request a display mode switch (2D/3D).
  * Returns false if not supported.
  */

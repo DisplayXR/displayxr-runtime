@@ -203,6 +203,9 @@ struct comp_vk_native_compositor
 	//! Canvas output rect for shared-texture apps.
 	struct u_canvas_rect canvas;
 
+	//! 2D surround texture handle (Spec v6).
+	struct u_surround_2d_handle surround_2d;
+
 	//! Alpha-blend pipeline for window-space (HUD) layers rendered per-tile
 	//! INTO the atlas pre-weave (matches d3d11/d3d12/metal/gl). Lazy-init
 	//! with the atlas format on first window-space submission. The DP weaver
@@ -3308,6 +3311,29 @@ comp_vk_native_compositor_set_output_rect(struct xrt_compositor *xc,
 	if (xc == NULL) return;
 	struct comp_vk_native_compositor *c = vk_comp(xc);
 	c->canvas = (struct u_canvas_rect){.valid = true, .x = x, .y = y, .w = w, .h = h};
+}
+
+void
+comp_vk_native_compositor_set_surround_2d(struct xrt_compositor *xc,
+                                           void *shared_handle,
+                                           uint32_t w, uint32_t h)
+{
+	if (xc == NULL) return;
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	if (shared_handle == NULL) {
+		c->surround_2d = (struct u_surround_2d_handle){0};
+		U_LOG_I("VK surround 2D cleared");
+		return;
+	}
+	c->surround_2d.valid = true;
+	c->surround_2d.shared_handle = shared_handle;
+	c->surround_2d.w = w;
+	c->surround_2d.h = h;
+	// Phase (post-Phase-C) TODO: VK_KHR_external_memory_win32 import on
+	// Windows / VK_KHR_external_memory_fd on POSIX; create a VkImage view
+	// for the per-frame surround blit pass.
+	U_LOG_I("VK surround 2D registered: handle=%p %ux%u (open + blit pending)",
+	        shared_handle, w, h);
 }
 
 struct vk_bundle *

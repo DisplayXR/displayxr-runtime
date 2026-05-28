@@ -139,6 +139,12 @@ struct comp_d3d11_compositor
 	//! sub-rect instead of the full client rect.
 	struct u_canvas_rect canvas;
 
+	//! 2D surround texture handle (Spec v6).
+	//! When valid, the compositor blits non-canvas pixels from this texture
+	//! into the target swapchain each frame. See comp_d3d11_compositor.h for
+	//! the full contract.
+	struct u_surround_2d_handle surround_2d;
+
 	//! Generic D3D11 display processor (vendor-agnostic weaving).
 	struct xrt_display_processor_d3d11 *display_processor;
 
@@ -1935,6 +1941,30 @@ comp_d3d11_compositor_set_output_rect(struct xrt_compositor *xc,
 	c->canvas.y = y;
 	c->canvas.w = w;
 	c->canvas.h = h;
+}
+
+extern "C" void
+comp_d3d11_compositor_set_surround_2d(struct xrt_compositor *xc,
+                                       void *shared_handle,
+                                       uint32_t w, uint32_t h)
+{
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+	if (shared_handle == nullptr) {
+		// Clear — falls back to undefined non-canvas pixels.
+		// Phase C TODO: release the opened ID3D11Texture2D + KeyedMutex here.
+		c->surround_2d = {};
+		U_LOG_IFL_I(U_LOGGING_INFO, "D3D11 surround 2D cleared");
+		return;
+	}
+	c->surround_2d.valid = true;
+	c->surround_2d.shared_handle = shared_handle;
+	c->surround_2d.w = w;
+	c->surround_2d.h = h;
+	// Phase C TODO: ID3D11Device::OpenSharedResource1 here, cache the
+	// ID3D11Texture2D* + IDXGIKeyedMutex* + UNORM/SRGB SRVs on the
+	// compositor for the per-frame surround blit pass to consume.
+	U_LOG_IFL_I(U_LOGGING_INFO, "D3D11 surround 2D registered: handle=%p %ux%u (open + blit pending Phase C)",
+	            shared_handle, w, h);
 }
 
 extern "C" bool

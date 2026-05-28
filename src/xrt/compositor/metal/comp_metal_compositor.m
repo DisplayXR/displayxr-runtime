@@ -227,6 +227,9 @@ struct comp_metal_compositor
 	//! Canvas output rect for shared-texture apps.
 	struct u_canvas_rect canvas;
 
+	//! 2D surround IOSurface handle (Spec v6).
+	struct u_surround_2d_handle surround_2d;
+
 	//! Thread safety.
 	struct os_mutex mutex;
 
@@ -2573,6 +2576,29 @@ comp_metal_compositor_set_output_rect(struct xrt_compositor *xc,
 {
 	struct comp_metal_compositor *c = metal_comp(xc);
 	c->canvas = (struct u_canvas_rect){.valid = true, .x = x, .y = y, .w = w, .h = h};
+}
+
+void
+comp_metal_compositor_set_surround_2d(struct xrt_compositor *xc,
+                                       void *shared_handle,
+                                       uint32_t w, uint32_t h)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	if (shared_handle == NULL) {
+		// Phase F-late TODO: release IOSurface use-count + Metal texture cache.
+		c->surround_2d = (struct u_surround_2d_handle){0};
+		U_LOG_I("Metal surround 2D cleared");
+		return;
+	}
+	c->surround_2d.valid = true;
+	c->surround_2d.shared_handle = shared_handle;
+	c->surround_2d.w = w;
+	c->surround_2d.h = h;
+	// Phase F-late TODO: IOSurfaceIncrementUseCount + MTLDevice
+	// newTextureWithDescriptor:iosurface:plane: + cache Metal texture
+	// for the per-frame surround blit pass.
+	U_LOG_I("Metal surround 2D registered: handle=%p %ux%u (open + blit pending Phase F-late)",
+	        shared_handle, w, h);
 }
 
 bool

@@ -162,6 +162,21 @@ comp_vk_native_compositor_set_output_rect(struct xrt_compositor *xc,
                                            uint32_t w, uint32_t h);
 
 /*!
+ * Register a full-window 2D shared texture for the surround region (Spec v6).
+ *
+ * On Windows the handle is an NT HANDLE imported via VK_KHR_external_memory_win32;
+ * on POSIX, an fd via VK_KHR_external_memory_fd. Pass shared_handle == NULL to
+ * clear. See comp_d3d11_compositor_set_surround_2d for the cross-platform
+ * semantics.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_compositor_set_surround_2d(struct xrt_compositor *xc,
+                                           void *shared_handle,
+                                           uint32_t w, uint32_t h);
+
+/*!
  * Get the vk_bundle from a VK native compositor (for sub-modules).
  *
  * @ingroup comp_vk_native

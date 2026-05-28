@@ -170,6 +170,11 @@ struct comp_d3d12_compositor
 	//! Canvas output rect for shared-texture apps.
 	struct u_canvas_rect canvas;
 
+	//! 2D surround texture handle (Spec v6). Phase C/D: open via
+	//! ID3D12Device::OpenSharedHandle on first use, cache resource +
+	//! KeyedMutex for the per-frame surround blit pass.
+	struct u_surround_2d_handle surround_2d;
+
 	//! Lazily allocated intermediate resource for cropping atlas to content dims.
 	ID3D12Resource *dp_input_resource;
 
@@ -2317,4 +2322,26 @@ comp_d3d12_compositor_set_output_rect(struct xrt_compositor *xc,
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);
 	struct u_canvas_rect rect = {true, x, y, w, h};
 	c->canvas = rect;
+}
+
+extern "C" void
+comp_d3d12_compositor_set_surround_2d(struct xrt_compositor *xc,
+                                       void *shared_handle,
+                                       uint32_t w, uint32_t h)
+{
+	if (xc == nullptr) return;
+	struct comp_d3d12_compositor *c = d3d12_comp(xc);
+	if (shared_handle == nullptr) {
+		// Phase D TODO: release the opened ID3D12Resource + KeyedMutex here.
+		c->surround_2d = {};
+		U_LOG_IFL_I(U_LOGGING_INFO, "D3D12 surround 2D cleared");
+		return;
+	}
+	c->surround_2d.valid = true;
+	c->surround_2d.shared_handle = shared_handle;
+	c->surround_2d.w = w;
+	c->surround_2d.h = h;
+	// Phase D TODO: ID3D12Device::OpenSharedHandle + cache for blit.
+	U_LOG_IFL_I(U_LOGGING_INFO, "D3D12 surround 2D registered: handle=%p %ux%u (open + blit pending Phase D)",
+	            shared_handle, w, h);
 }
