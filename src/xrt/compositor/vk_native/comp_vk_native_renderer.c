@@ -369,10 +369,14 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	(void)right_eye;
 
 	// Wait for the previous frame's submit to finish so we can safely
-	// free its cmd buffer and reuse the per-frame fence. Fence starts
-	// signaled at create time, so the first call returns immediately.
+	// free its cmd buffer and (later) reuse the per-frame fence. Fence
+	// starts signaled at create time so the first call returns
+	// immediately. We DON'T reset the fence here — that's deferred
+	// until just before the main vkQueueSubmit so any early-return
+	// failure (cmd-buffer alloc fails, drain fails, etc.) leaves the
+	// fence in its signaled state. Otherwise the next draw() would
+	// vkWaitForFences forever on a fence nothing ever signals.
 	vk->vkWaitForFences(vk->device, 1, &r->frame_done_fence, VK_TRUE, UINT64_MAX);
-	vk->vkResetFences(vk->device, 1, &r->frame_done_fence);
 
 	if (r->pending_cmd != VK_NULL_HANDLE) {
 		vk->vkFreeCommandBuffers(vk->device, r->cmd_pool, 1, &r->pending_cmd);
@@ -385,6 +389,8 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	// the compositor's frame loop), drain it now via a no-op
 	// wait-submit so we don't double-signal a binary semaphore on the
 	// vkQueueSubmit below — that's undefined behavior per Vulkan spec.
+	// Only clear signal_pending if the drain actually went through;
+	// otherwise the next signaling submit would risk the double-signal UB.
 	if (r->signal_pending) {
 		VkPipelineStageFlags drain_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
 		VkSubmitInfo drain = {
@@ -393,8 +399,13 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 		    .pWaitSemaphores = &r->frame_done_sem,
 		    .pWaitDstStageMask = &drain_stage,
 		};
-		vk->vkQueueSubmit(vk->main_queue->queue, 1, &drain, VK_NULL_HANDLE);
-		r->signal_pending = false;
+		VkResult drain_res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &drain, VK_NULL_HANDLE);
+		if (drain_res == VK_SUCCESS) {
+			r->signal_pending = false;
+		} else {
+			U_LOG_E("Failed to drain stuck frame-done semaphore: %d", drain_res);
+			return XRT_ERROR_VULKAN;
+		}
 	}
 
 	VkCommandBufferAllocateInfo alloc_info = {
@@ -555,6 +566,12 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	// pre-DP submit (which reads from atlas_image) can chain after us
 	// without a CPU vkQueueWaitIdle. The fence catches the same event
 	// CPU-side so the next draw() can safely free this cmd buffer.
+	//
+	// Reset the fence here (not at the top of draw) so any early-return
+	// failure above leaves the fence in its previous signaled state
+	// rather than deadlocking the next draw() on a fence nothing signals.
+	vk->vkResetFences(vk->device, 1, &r->frame_done_fence);
+
 	VkSubmitInfo submit_info = {
 	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
 	    .commandBufferCount = 1,
@@ -567,9 +584,9 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	if (res != VK_SUCCESS) {
 		U_LOG_E("Failed to submit renderer commands: %d", res);
 		vk->vkFreeCommandBuffers(vk->device, r->cmd_pool, 1, &cmd);
-		// Re-signal the fence so the next draw() doesn't deadlock waiting
-		// on a fence that vkQueueSubmit refused to associate with a batch.
-		vk->vkResetFences(vk->device, 1, &r->frame_done_fence);
+		// Re-signal the fence with a no-op submit so the next draw()
+		// doesn't deadlock waiting on a fence that vkQueueSubmit
+		// refused to associate with a batch.
 		VkSubmitInfo signal_only = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
 		vk->vkQueueSubmit(vk->main_queue->queue, 1, &signal_only, r->frame_done_fence);
 		return XRT_ERROR_VULKAN;
