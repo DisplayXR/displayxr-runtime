@@ -35,7 +35,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_cocoa_window_binding 1
-#define XR_EXT_cocoa_window_binding_SPEC_VERSION 5
+#define XR_EXT_cocoa_window_binding_SPEC_VERSION 6
 #define XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME "XR_EXT_cocoa_window_binding"
 
 // Use a value in the vendor extension range (1000000000+)
@@ -141,6 +141,52 @@ XRAPI_ATTR XrResult XRAPI_CALL xrSetSharedTextureOutputRectEXT(
     XrSession                           session,
     int32_t                             x,
     int32_t                             y,
+    uint32_t                            width,
+    uint32_t                            height);
+#endif
+
+// ---- 2D Surround Texture (Spec v6) ----
+
+/*!
+ * @brief Register a full-view 2D IOSurface whose pixels OUTSIDE the canvas
+ *        sub-rect are blitted into the target swapchain each frame.
+ *
+ * macOS counterpart to the Win32 version. Signature, lifecycle, and semantics
+ * are identical except: sharedTextureHandle is an IOSurfaceRef (cast to void*),
+ * synchronization uses Metal fences + IOSurface use-count rather than
+ * IDXGIKeyedMutex, and pixel format must be MTLPixelFormatRGBA8Unorm or
+ * MTLPixelFormatRGBA8Unorm_sRGB.
+ *
+ * See XR_EXT_win32_window_binding.h for the full semantic description.
+ *
+ * @param session             The session (must have been created with a
+ *                            window binding).
+ * @param sharedTextureHandle IOSurfaceRef for the 2D surround texture, or NULL
+ *                            to clear.
+ * @param width               Texture width in physical (post-Retina) pixels.
+ *                            Must equal the NSView backing-store width.
+ * @param height              Texture height in physical pixels. Must equal
+ *                            the NSView backing-store height.
+ *
+ * @return XR_SUCCESS on success.
+ *         XR_ERROR_FUNCTION_UNSUPPORTED if the extension is not enabled.
+ *         XR_ERROR_VALIDATION_FAILURE if the dimensions do not match the
+ *         current NSView backing size.
+ *         XR_ERROR_HANDLE_INVALID if the IOSurface cannot be referenced.
+ */
+#ifndef PFN_xrSetSharedTextureSurround2DEXT_DEFINED
+#define PFN_xrSetSharedTextureSurround2DEXT_DEFINED
+typedef XrResult (XRAPI_PTR *PFN_xrSetSharedTextureSurround2DEXT)(
+    XrSession session,
+    void*     sharedTextureHandle,
+    uint32_t  width,
+    uint32_t  height);
+#endif
+
+#ifndef XR_NO_PROTOTYPES
+XRAPI_ATTR XrResult XRAPI_CALL xrSetSharedTextureSurround2DEXT(
+    XrSession                           session,
+    void*                               sharedTextureHandle,
     uint32_t                            width,
     uint32_t                            height);
 #endif

@@ -3,7 +3,7 @@
 | Property | Value |
 |----------|-------|
 | Extension Name | `XR_EXT_cocoa_window_binding` |
-| Spec Version | 5 |
+| Spec Version | 6 |
 | Type Values | `XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT` (1000999004), `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT` (1000999002) |
 | Author | Leia Inc. |
 | Platform | macOS (Cocoa / AppKit). |
@@ -116,6 +116,19 @@ Shared with `XR_EXT_win32_window_binding`. See that extension's spec for the ful
 ### xrSetSharedTextureOutputRectEXT
 
 Sets the canvas sub-rect within the NSView where 3D content appears. Coordinates are relative to the view bounds. See [`XR_EXT_win32_window_binding` §3.5](XR_EXT_win32_window_binding.md) for the full API reference — the function signature and semantics are identical across platforms.
+
+### xrSetSharedTextureSurround2DEXT (Spec v6)
+
+Registers a full-view 2D shared texture (`IOSurfaceRef`) whose pixels outside the canvas sub-rect are blitted into the target swapchain each frame. The Metal-side mechanism differs from D3D11/D3D12 (`IOSurfaceRef` instead of an NT `HANDLE`, no `IDXGIKeyedMutex` — IOSurface use_count + Metal fence instead) but the function signature, lifecycle, and semantics are otherwise identical to the Win32 form. See [`XR_EXT_win32_window_binding` §3.6](XR_EXT_win32_window_binding.md#36-xrsetsharedtexturesurround2dext) for the full API reference.
+
+**Cocoa-specific deltas:**
+
+- `sharedTextureHandle` is an `IOSurfaceRef` cast to `void*` (matching how the multiview `sharedIOSurface` field is handled in `XrCocoaWindowBindingCreateInfoEXT`).
+- Synchronization uses Metal fences and the IOSurface use-count protocol rather than `IDXGIKeyedMutex`. The runtime increments use-count on register, drops it on clear / replace.
+- Pixel format must be `MTLPixelFormatRGBA8Unorm` or `MTLPixelFormatRGBA8Unorm_sRGB`.
+- Texture dimensions must match the NSView's `convertRectToBacking:` size in physical pixels (i.e. post-Retina scale).
+
+The Vulkan-via-MoltenVK and native-Metal compositor paths both honor the surround texture — the surround blit pass lives in `compositor/metal/` and `compositor/vk_native/` mirroring the Win32 paths.
 
 ---
 
@@ -230,3 +243,4 @@ The Cocoa binding tracks `XR_EXT_win32_window_binding` for forward-compatibility
 | 2 | 2025-09-20 | David Fattal | Added readbackCallback for offscreen mode |
 | 3 | 2026-01-10 | David Fattal | Added sharedIOSurface for zero-copy Metal texture sharing. Fixed type value collision (1000999003 → 1000999004). |
 | 4 | 2026-04-24 | David Fattal | Read-back contract clarified: runtime writes the canvas region at `(x, y)` (not origin) in the shared IOSurface, matching `xrSetSharedTextureOutputRectEXT` args. Apps must sample at `uvOffset + uv * uvScale`. See ADR-010. |
+| 6 | 2026-05-28 | David Fattal | Added `xrSetSharedTextureSurround2DEXT` (parity with `XR_EXT_win32_window_binding` v6). Lets `_texture` apps register a full-view 2D IOSurface whose pixels outside the canvas sub-rect are blitted into the target swapchain each frame. Enables apps on fixed-3D-zone displays to fill the surround region with full-resolution 2D content. |
