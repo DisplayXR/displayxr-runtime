@@ -75,6 +75,27 @@ struct comp_vk_native_renderer
 	//! When true, clear the atlas to alpha=0 (transparent) instead of
 	//! opaque black, so app alpha<1 regions survive to the present (issue #392).
 	bool transparent_background;
+
+	//! Binary semaphore signaled at end of draw()'s queue submit so the
+	//! compositor's downstream pre-DP submit can chain without a CPU
+	//! waitIdle between them. Single-use per draw — take_frame_done_semaphore()
+	//! returns this handle and clears @ref signal_pending so subsequent
+	//! submits in the same frame don't double-wait.
+	VkSemaphore frame_done_sem;
+
+	//! Fence signaled alongside @ref frame_done_sem. Waited at the start of
+	//! the next draw() to enforce CPU-side back-pressure and to know when
+	//! @ref pending_cmd is safe to free.
+	VkFence frame_done_fence;
+
+	//! Cmd buffer in flight from the previous draw(). NULL on first call.
+	//! Freed at the start of the next draw() once @ref frame_done_fence
+	//! signals, or at destroy() time after vkDeviceWaitIdle.
+	VkCommandBuffer pending_cmd;
+
+	//! True after draw() signals @ref frame_done_sem and until a downstream
+	//! submit takes it via take_frame_done_semaphore().
+	bool signal_pending;
 };
 
 static void
@@ -234,6 +255,35 @@ comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
 		return xret;
 	}
 
+	// Per-frame sync primitives for the combined-submit chain
+	// (renderer.draw() signals → compositor's pre-DP submit waits, no
+	// vkQueueWaitIdle between them). The fence starts signaled so the
+	// first draw() can free a (non-existent) previous cmd buffer and
+	// vkResetFences without an initial wait stall.
+	VkSemaphoreCreateInfo sem_ci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+	res = vk->vkCreateSemaphore(vk->device, &sem_ci, NULL, &r->frame_done_sem);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("Failed to create renderer frame-done semaphore: %d", res);
+		destroy_atlas_resources(r);
+		vk->vkDestroyCommandPool(vk->device, r->cmd_pool, NULL);
+		free(r);
+		return XRT_ERROR_VULKAN;
+	}
+
+	VkFenceCreateInfo fence_ci = {
+	    .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+	    .flags = VK_FENCE_CREATE_SIGNALED_BIT,
+	};
+	res = vk->vkCreateFence(vk->device, &fence_ci, NULL, &r->frame_done_fence);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("Failed to create renderer frame-done fence: %d", res);
+		vk->vkDestroySemaphore(vk->device, r->frame_done_sem, NULL);
+		destroy_atlas_resources(r);
+		vk->vkDestroyCommandPool(vk->device, r->cmd_pool, NULL);
+		free(r);
+		return XRT_ERROR_VULKAN;
+	}
+
 	*out_renderer = r;
 	return XRT_SUCCESS;
 }
@@ -249,6 +299,18 @@ comp_vk_native_renderer_destroy(struct comp_vk_native_renderer **renderer_ptr)
 	struct vk_bundle *vk = r->vk;
 
 	vk->vkDeviceWaitIdle(vk->device);
+
+	if (r->pending_cmd != VK_NULL_HANDLE) {
+		vk->vkFreeCommandBuffers(vk->device, r->cmd_pool, 1, &r->pending_cmd);
+		r->pending_cmd = VK_NULL_HANDLE;
+	}
+
+	if (r->frame_done_fence != VK_NULL_HANDLE) {
+		vk->vkDestroyFence(vk->device, r->frame_done_fence, NULL);
+	}
+	if (r->frame_done_sem != VK_NULL_HANDLE) {
+		vk->vkDestroySemaphore(vk->device, r->frame_done_sem, NULL);
+	}
 
 	destroy_atlas_resources(r);
 
@@ -305,6 +367,35 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	struct vk_bundle *vk = r->vk;
 	(void)left_eye;
 	(void)right_eye;
+
+	// Wait for the previous frame's submit to finish so we can safely
+	// free its cmd buffer and reuse the per-frame fence. Fence starts
+	// signaled at create time, so the first call returns immediately.
+	vk->vkWaitForFences(vk->device, 1, &r->frame_done_fence, VK_TRUE, UINT64_MAX);
+	vk->vkResetFences(vk->device, 1, &r->frame_done_fence);
+
+	if (r->pending_cmd != VK_NULL_HANDLE) {
+		vk->vkFreeCommandBuffers(vk->device, r->cmd_pool, 1, &r->pending_cmd);
+		r->pending_cmd = VK_NULL_HANDLE;
+	}
+
+	// Defensive: if the previous frame's frame-done semaphore was
+	// signaled but never consumed by a downstream submit (e.g. that
+	// submit failed, or resize() drained the GPU without going through
+	// the compositor's frame loop), drain it now via a no-op
+	// wait-submit so we don't double-signal a binary semaphore on the
+	// vkQueueSubmit below — that's undefined behavior per Vulkan spec.
+	if (r->signal_pending) {
+		VkPipelineStageFlags drain_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+		VkSubmitInfo drain = {
+		    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+		    .waitSemaphoreCount = 1,
+		    .pWaitSemaphores = &r->frame_done_sem,
+		    .pWaitDstStageMask = &drain_stage,
+		};
+		vk->vkQueueSubmit(vk->main_queue->queue, 1, &drain, VK_NULL_HANDLE);
+		r->signal_pending = false;
+	}
 
 	VkCommandBufferAllocateInfo alloc_info = {
 	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -460,21 +551,32 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 
 	vk->vkEndCommandBuffer(cmd);
 
+	// Signal the frame-done semaphore on submit so the compositor's
+	// pre-DP submit (which reads from atlas_image) can chain after us
+	// without a CPU vkQueueWaitIdle. The fence catches the same event
+	// CPU-side so the next draw() can safely free this cmd buffer.
 	VkSubmitInfo submit_info = {
 	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
 	    .commandBufferCount = 1,
 	    .pCommandBuffers = &cmd,
+	    .signalSemaphoreCount = 1,
+	    .pSignalSemaphores = &r->frame_done_sem,
 	};
 
-	res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
+	res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, r->frame_done_fence);
 	if (res != VK_SUCCESS) {
 		U_LOG_E("Failed to submit renderer commands: %d", res);
 		vk->vkFreeCommandBuffers(vk->device, r->cmd_pool, 1, &cmd);
+		// Re-signal the fence so the next draw() doesn't deadlock waiting
+		// on a fence that vkQueueSubmit refused to associate with a batch.
+		vk->vkResetFences(vk->device, 1, &r->frame_done_fence);
+		VkSubmitInfo signal_only = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
+		vk->vkQueueSubmit(vk->main_queue->queue, 1, &signal_only, r->frame_done_fence);
 		return XRT_ERROR_VULKAN;
 	}
 
-	vk->vkQueueWaitIdle(vk->main_queue->queue);
-	vk->vkFreeCommandBuffers(vk->device, r->cmd_pool, 1, &cmd);
+	r->pending_cmd = cmd;
+	r->signal_pending = true;
 
 	return XRT_SUCCESS;
 }
@@ -699,4 +801,14 @@ void
 comp_vk_native_renderer_set_transparent(struct comp_vk_native_renderer *r, bool transparent_background)
 {
 	r->transparent_background = transparent_background;
+}
+
+uint64_t
+comp_vk_native_renderer_take_frame_done_semaphore(struct comp_vk_native_renderer *r)
+{
+	if (!r->signal_pending) {
+		return 0;
+	}
+	r->signal_pending = false;
+	return (uint64_t)(uintptr_t)r->frame_done_sem;
 }

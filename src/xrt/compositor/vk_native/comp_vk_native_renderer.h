@@ -251,6 +251,27 @@ void
 comp_vk_native_renderer_set_transparent(struct comp_vk_native_renderer *renderer,
                                          bool transparent_background);
 
+/*!
+ * Take ownership of the binary semaphore signaled by the most recent
+ * @ref comp_vk_native_renderer_draw submit. The compositor passes this
+ * as a wait semaphore on its downstream pre-DP submit, replacing the
+ * previous vkQueueWaitIdle between renderer and compositor submits.
+ *
+ * Returns VK_NULL_HANDLE (cast to uint64_t) when there is no pending
+ * signal — e.g. on the zero-copy path where draw() was skipped, or when
+ * a previous caller in the same frame already consumed it.
+ *
+ * Single-consumer per draw() call. Caller is responsible for waiting on
+ * the returned handle at an appropriate pipeline stage.
+ *
+ * @param renderer The renderer.
+ * @return VkSemaphore as uint64_t, or 0 (VK_NULL_HANDLE) when none pending.
+ *
+ * @ingroup comp_vk_native
+ */
+uint64_t
+comp_vk_native_renderer_take_frame_done_semaphore(struct comp_vk_native_renderer *renderer);
+
 #ifdef __cplusplus
 }
 #endif

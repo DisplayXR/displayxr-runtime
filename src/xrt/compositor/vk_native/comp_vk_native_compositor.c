@@ -607,6 +607,41 @@ vk_comp(struct xrt_compositor *xc)
 }
 
 /*
+ * If the renderer signaled a frame-done semaphore on its most recent draw()
+ * submit and no consumer has taken it yet this frame, wire it into the given
+ * VkSubmitInfo so this submit waits on it instead of the caller issuing a
+ * vkQueueWaitIdle between submits. The semaphore handle and wait-stage mask
+ * are written to the caller-owned storage (must outlive vkQueueSubmit).
+ *
+ * When the renderer didn't submit this frame (zero-copy path) or a prior
+ * caller already consumed it, leaves waitSemaphoreCount at 0 — safe no-op.
+ */
+static inline void
+vk_native_wire_renderer_wait(struct comp_vk_native_compositor *c,
+                              VkSubmitInfo *si,
+                              VkSemaphore *out_sem_storage,
+                              VkPipelineStageFlags *out_stage_storage)
+{
+	uint64_t sem_u64 = comp_vk_native_renderer_take_frame_done_semaphore(c->renderer);
+	if (sem_u64 == 0) {
+		return;
+	}
+	*out_sem_storage = (VkSemaphore)(uintptr_t)sem_u64;
+	// Renderer's atlas is read by every downstream pre-DP / DP / fallback
+	// path either as a sampled texture (FRAGMENT_SHADER), a copy/blit
+	// source (TRANSFER), or sampled into a render pass (COLOR_ATTACHMENT
+	// indirectly). Waiting at the union of those stages is correct and
+	// only costs scheduling — not a CPU stall.
+	*out_stage_storage =
+	    VK_PIPELINE_STAGE_TRANSFER_BIT |
+	    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	si->waitSemaphoreCount = 1;
+	si->pWaitSemaphores = out_sem_storage;
+	si->pWaitDstStageMask = out_stage_storage;
+}
+
+/*
  *
  * xrt_compositor member functions
  *
@@ -2185,6 +2220,9 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				    .commandBufferCount = 1,
 				    .pCommandBuffers = &cmd,
 				};
+				VkSemaphore pre_wait_sem = VK_NULL_HANDLE;
+				VkPipelineStageFlags pre_wait_stage = 0;
+				vk_native_wire_renderer_wait(c, &pre_si, &pre_wait_sem, &pre_wait_stage);
 				res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &pre_si, VK_NULL_HANDLE);
 				if (res == VK_SUCCESS) {
 					vk->vkQueueWaitIdle(vk->main_queue->queue);
@@ -2220,6 +2258,9 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				    .commandBufferCount = 1,
 				    .pCommandBuffers = &cmd,
 				};
+				VkSemaphore post_wait_sem = VK_NULL_HANDLE;
+				VkPipelineStageFlags post_wait_stage = 0;
+				vk_native_wire_renderer_wait(c, &submit_info, &post_wait_sem, &post_wait_stage);
 				res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
 				if (res == VK_SUCCESS) {
 					vk->vkQueueWaitIdle(vk->main_queue->queue);
@@ -2244,6 +2285,9 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			    .commandBufferCount = 1,
 			    .pCommandBuffers = &cmd,
 			};
+			VkSemaphore fb_wait_sem = VK_NULL_HANDLE;
+			VkPipelineStageFlags fb_wait_stage = 0;
+			vk_native_wire_renderer_wait(c, &submit_info, &fb_wait_sem, &fb_wait_stage);
 			res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
 			if (res == VK_SUCCESS) {
 				vk->vkQueueWaitIdle(vk->main_queue->queue);
@@ -2388,6 +2432,9 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 					    .commandBufferCount = 1,
 					    .pCommandBuffers = &cmd,
 					};
+					VkSemaphore tgt_pre_wait_sem = VK_NULL_HANDLE;
+					VkPipelineStageFlags tgt_pre_wait_stage = 0;
+					vk_native_wire_renderer_wait(c, &pre_si, &tgt_pre_wait_sem, &tgt_pre_wait_stage);
 					res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &pre_si, VK_NULL_HANDLE);
 					if (res == VK_SUCCESS) {
 						vk->vkQueueWaitIdle(vk->main_queue->queue);
@@ -2467,6 +2514,9 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			    .commandBufferCount = 1,
 			    .pCommandBuffers = &cmd,
 			};
+			VkSemaphore tgt_wait_sem = VK_NULL_HANDLE;
+			VkPipelineStageFlags tgt_wait_stage = 0;
+			vk_native_wire_renderer_wait(c, &submit_info, &tgt_wait_sem, &tgt_wait_stage);
 
 			res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
 			if (res == VK_SUCCESS) {
