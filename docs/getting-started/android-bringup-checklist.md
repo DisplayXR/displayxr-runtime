@@ -39,15 +39,12 @@ If A passes you can stop. B confirms the CNSDK convention assumptions. C is only
 
 The test app's `AndroidManifest.xml` declares `android.permission.CAMERA` (CNSDK front-camera face tracking) and `android.permission.WAKE_LOCK` (keep screen on during XR sessions). On Android 6+ `CAMERA` is a "dangerous" permission that requires either a user dialog OR an `adb pm grant`.
 
-The test app is a thin `NativeActivity` with no Java/Kotlin wrapper to surface the runtime permission dialog. Two options for day-1:
+The test app's `MainActivity` is a thin Kotlin wrapper around `NativeActivity` whose only job is to call `requestPermissions(CAMERA)` from `onCreate`. Day-1 path on Lume Pad: launch the app, tap **Allow** when the system permission dialog appears. The wrapper hands off to `NativeActivity` immediately, so the native init / `xrCreateInstance` runs in parallel — by the time CNSDK's face tracker opens the camera at session start, the grant is in place.
+
+For non-interactive bring-up (CI, scripted soak tests, no human at the device), pre-grant via adb:
 
 ```bash
-# Option 1: pre-grant via adb (works on emulator + device-with-developer-mode)
 adb shell pm grant com.displayxr.cube_handle_vk_android android.permission.CAMERA
-
-# Option 2: tap "Allow" on the system permission dialog the first time
-# face tracking tries to open the camera (CNSDK throws the dialog itself
-# on first leia_core_enable_face_tracking call — confirm at A1).
 ```
 
 **Missing CAMERA on Lume Pad symptom:** session reaches FOCUSED, app renders, but `xrLocateViews` always returns the default centered eye position regardless of head motion. No crash, no log error from CNSDK — just silently no face tracking. Check `adb shell dumpsys package com.displayxr.cube_handle_vk_android | grep CAMERA` to confirm grant.
