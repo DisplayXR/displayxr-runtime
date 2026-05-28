@@ -1566,4 +1566,54 @@ oxr_xrSetSharedTextureOutputRectEXT(XrSession session,
 	                 "Output rect not supported for this compositor");
 }
 
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetSharedTextureSurround2DEXT(XrSession session,
+                                     void *sharedTextureHandle,
+                                     uint32_t width, uint32_t height)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetSharedTextureSurround2DEXT");
+
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+	if (sess->is_d3d11_native_compositor && sess->xcn != NULL) {
+		comp_d3d11_compositor_set_surround_2d(&sess->xcn->base, sharedTextureHandle, width, height);
+		return XR_SUCCESS;
+	}
+#endif
+
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+	if (sess->is_metal_native_compositor && sess->xcn != NULL) {
+		comp_metal_compositor_set_surround_2d(&sess->xcn->base, sharedTextureHandle, width, height);
+		return XR_SUCCESS;
+	}
+#endif
+
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+	if (sess->is_gl_native_compositor && sess->xcn != NULL) {
+		comp_gl_compositor_set_surround_2d(&sess->xcn->base, sharedTextureHandle, width, height);
+		return XR_SUCCESS;
+	}
+#endif
+
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->is_vk_native_compositor && sess->xcn != NULL) {
+		comp_vk_native_compositor_set_surround_2d(&sess->xcn->base, sharedTextureHandle, width, height);
+		return XR_SUCCESS;
+	}
+#endif
+
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+	if (sess->is_d3d12_native_compositor && sess->xcn != NULL) {
+		comp_d3d12_compositor_set_surround_2d(&sess->xcn->base, sharedTextureHandle, width, height);
+		return XR_SUCCESS;
+	}
+#endif
+
+	return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+	                 "Surround 2D not supported for this compositor");
+}
+
 #endif // OXR_HAVE_EXT_display_info

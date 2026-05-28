@@ -42,6 +42,29 @@ struct u_canvas_rect
 };
 
 /*!
+ * 2D surround shared texture — full-window mono buffer whose pixels OUTSIDE
+ * the canvas sub-rect are blitted into the target swapchain each frame.
+ *
+ * Set via xrSetSharedTextureSurround2DEXT (spec v6 addition to
+ * XR_EXT_win32_window_binding / XR_EXT_cocoa_window_binding). Pairs with
+ * struct u_canvas_rect — the canvas is "where 3D goes," the surround is
+ * "what fills the rest." See docs/specs/extensions/XR_EXT_win32_window_binding.md §3.6.
+ *
+ * The handle is a D3D11/D3D12 NT HANDLE on Windows, an IOSurfaceRef cast
+ * to void* on macOS. The compositor opens it lazily on first use and
+ * releases on clear / replace / session teardown. Dimensions MUST equal
+ * the HWND/NSView client-area dimensions — the runtime does a 1:1 blit
+ * with scissor-rects around the canvas hole, no scaling.
+ */
+struct u_surround_2d_handle
+{
+	bool valid;             //!< True if a surround texture has been registered
+	void *shared_handle;    //!< NT HANDLE (Win) / IOSurfaceRef (Mac), or NULL
+	uint32_t w;             //!< Texture width in pixels (== HWND client width)
+	uint32_t h;             //!< Texture height in pixels (== HWND client height)
+};
+
+/*!
  * Apply canvas output rect to window metrics.
  *
  * When a shared-texture app has set an output rect, the "window" fields in

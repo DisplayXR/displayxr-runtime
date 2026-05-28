@@ -163,6 +163,21 @@ comp_d3d12_compositor_set_output_rect(struct xrt_compositor *xc,
                                        int32_t x, int32_t y,
                                        uint32_t w, uint32_t h);
 
+/*!
+ * Register a full-window 2D shared texture for the surround region (Spec v6).
+ *
+ * Pass shared_handle == NULL to clear. See
+ * comp_d3d11_compositor_set_surround_2d for the full contract — D3D12 form
+ * is symmetric (NT HANDLE via ID3D12Device::OpenSharedHandle, KeyedMutex
+ * on key 0).
+ *
+ * @ingroup comp_d3d12
+ */
+void
+comp_d3d12_compositor_set_surround_2d(struct xrt_compositor *xc,
+                                       void *shared_handle,
+                                       uint32_t w, uint32_t h);
+
 #ifdef __cplusplus
 }
 #endif
