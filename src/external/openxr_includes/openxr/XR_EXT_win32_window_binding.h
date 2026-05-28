@@ -30,7 +30,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_win32_window_binding 1
-#define XR_EXT_win32_window_binding_SPEC_VERSION 5
+#define XR_EXT_win32_window_binding_SPEC_VERSION 6
 #define XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME "XR_EXT_win32_window_binding"
 
 // Use a value in the vendor extension range (1000000000+)
@@ -167,6 +167,70 @@ XRAPI_ATTR XrResult XRAPI_CALL xrSetSharedTextureOutputRectEXT(
     XrSession                           session,
     int32_t                             x,
     int32_t                             y,
+    uint32_t                            width,
+    uint32_t                            height);
+#endif
+
+// ---- 2D Surround Texture (Spec v6) ----
+
+/*!
+ * @brief Register a full-window 2D shared texture whose pixels OUTSIDE the
+ *        canvas sub-rect are blitted into the target swapchain each frame.
+ *
+ * Pairs with xrSetSharedTextureOutputRectEXT for _texture apps that want to
+ * fill the non-3D part of their window with full-resolution 2D content (UI,
+ * chrome, toolbars, status bars). The runtime samples this texture each frame
+ * and copies the pixels OUTSIDE the active canvas rect into the corresponding
+ * region of the target swapchain. Pixels INSIDE the canvas rect are ignored —
+ * that region is owned by the display processor's weaved output.
+ *
+ * The texture must be a D3D11 or D3D12 shared texture (NT HANDLE), sized to
+ * match the target swapchain dimensions (HWND client area in physical pixels).
+ * The runtime opens the handle once and re-uses it across frames; the app
+ * writes into the texture asynchronously and the runtime samples at frame
+ * submit time. Synchronization follows the same IDXGIKeyedMutex pattern as
+ * the multiview shared texture registered via XrWin32WindowBindingCreateInfoEXT
+ * (key 0 = "app done writing, runtime may read").
+ *
+ * Lifecycle:
+ * - Call with a non-NULL handle to register or replace the surround texture.
+ * - Call with NULL handle to clear — runtime falls back to undefined non-canvas
+ *   pixels (the spec v5 behavior).
+ * - If the window is resized, the app must allocate a new shared texture at
+ *   the new size and call this function again.
+ *
+ * Texture format: DXGI_FORMAT_R8G8B8A8_UNORM or DXGI_FORMAT_R8G8B8A8_UNORM_SRGB.
+ * The runtime selects the matching SRV at sample time so linearization is
+ * correct regardless of which format the app chose.
+ *
+ * @param session             The session (must have been created with a
+ *                            window binding).
+ * @param sharedTextureHandle Shared D3D11/D3D12 texture HANDLE for the 2D
+ *                            surround content, or NULL to clear.
+ * @param width               Texture width in pixels. Must equal the HWND
+ *                            client-area width.
+ * @param height              Texture height in pixels. Must equal the HWND
+ *                            client-area height.
+ *
+ * @return XR_SUCCESS on success.
+ *         XR_ERROR_FUNCTION_UNSUPPORTED if the extension is not enabled.
+ *         XR_ERROR_VALIDATION_FAILURE if the dimensions do not match the
+ *         current HWND client area.
+ *         XR_ERROR_HANDLE_INVALID if the shared handle cannot be opened.
+ */
+#ifndef PFN_xrSetSharedTextureSurround2DEXT_DEFINED
+#define PFN_xrSetSharedTextureSurround2DEXT_DEFINED
+typedef XrResult (XRAPI_PTR *PFN_xrSetSharedTextureSurround2DEXT)(
+    XrSession session,
+    void*     sharedTextureHandle,
+    uint32_t  width,
+    uint32_t  height);
+#endif
+
+#ifndef XR_NO_PROTOTYPES
+XRAPI_ATTR XrResult XRAPI_CALL xrSetSharedTextureSurround2DEXT(
+    XrSession                           session,
+    void*                               sharedTextureHandle,
     uint32_t                            width,
     uint32_t                            height);
 #endif
