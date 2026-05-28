@@ -611,6 +611,9 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 		return XRT_ERROR_ALLOCATION;
 	}
 
+	// ADR-020 rule 1: advertise the vtable size so the runtime knows which
+	// slots this plug-in actually built (calloc already zeroed reserved_0).
+	sdp->base.struct_size = (uint32_t)sizeof(struct xrt_display_processor);
 	sdp->base.destroy = sim_dp_destroy;
 	sdp->base.get_render_pass = sim_dp_get_render_pass;
 	sdp->base.get_predicted_eye_positions = sim_dp_get_predicted_eye_positions;

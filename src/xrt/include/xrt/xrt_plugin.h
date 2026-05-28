@@ -125,32 +125,42 @@ struct xrt_plugin_display_info
 /*!
  * Plug-in ABI version (major). Bumped on a non-additive layout change in the
  * structs declared in this header **OR** in the display-processor vtables
- * (`xrt_display_processor` + the per-API factory contracts in
+ * (`xrt_display_processor` + the per-API vtables/factory contracts in
  * `xrt_display_processor_<api>.h`), which are part of this ABI even though they
  * live in their own headers and are handed back by `create_dp_<api>`.
  *
- * For the `struct_size`-carrying structs here, pure-additive changes (fields
- * appended at the end, covered by `struct_size`) are NOT version bumps.
- *
- * For the DP vtables: until they gain `struct_size` negotiation (ADR-020 rule
- * 1), they are read at FIXED offsets, so even an append is breaking — any
- * layout change there is a major bump. The compile-time tripwire at the end of
- * `xrt_display_processor.h` fails the build if that vtable changes without
- * bumping this macro. See ADR-020 for the full policy.
+ * As of major **v2** (ADR-020 rules 1–3), the DP vtables ALSO carry a
+ * `struct_size` header — exactly like the structs in this file. So a
+ * pure-additive change to a DP vtable (a method appended at the END, covered by
+ * `struct_size`) is NOT a version bump: a newer runtime treats slots past an
+ * older plug-in's `struct_size` as absent, and an older runtime ignores slots
+ * it doesn't know about. Reordering, removing, or signature-changing a slot —
+ * or inserting anywhere but the end — IS a major bump. The compile-time
+ * tripwires at the end of each `xrt_display_processor*.h` fail the build if a
+ * vtable's layout changes without updating the asserts, forcing a conscious
+ * version bump. See ADR-020 for the full policy.
  *
  * Compatibility rule (ADR-020 rule 2/3): same major == compatible; a different
- * major is rejected by the loader (it must not call through a mismatched
- * vtable). Numbers grow forward.
+ * major is **rejected by the loader** (`target_plugin_loader.c`) — it must not
+ * call through a mismatched vtable. Numbers grow forward.
+ *
+ * v1 → v2 history: v1 DP vtables had no `struct_size` and were read at fixed
+ * offsets, so any layout change silently broke older plug-ins (the
+ * standalone-VK weave regression). v2 is the one-time break that introduces the
+ * `struct_size` header on the DP vtables and turns the loader's version *log*
+ * into an enforced *reject*. ABI-v1 plug-ins (≤ leia v1.0.5) are rejected and
+ * must rebuild against v2 headers.
  */
 #define XRT_PLUGIN_API_VERSION_1 1
+#define XRT_PLUGIN_API_VERSION_2 2
 
 /*!
  * The version the runtime / plug-in is built against at compile time.
  * Plug-in DLLs returning a different value from `xrtPluginNegotiate`'s
- * `*out_plugin_api_version` are skipped by the runtime with a logged
- * mismatch warning.
+ * `*out_plugin_api_version` are rejected by the runtime (ADR-020 rule 3) with a
+ * logged error, and the loader falls back to the next plug-in / sim_display.
  */
-#define XRT_PLUGIN_API_VERSION_CURRENT XRT_PLUGIN_API_VERSION_1
+#define XRT_PLUGIN_API_VERSION_CURRENT XRT_PLUGIN_API_VERSION_2
 
 /*!
  * The single exported symbol every plug-in DLL must provide. C linkage,
@@ -432,13 +442,17 @@ struct xrt_plugin_iface
  * @ref XRT_PLUGIN_ENTRYPOINT_NAME (`"xrtPluginNegotiate"`). Exported with
  * C linkage; no name mangling.
  *
- * @param      runtime_api_version       The @ref XRT_PLUGIN_API_VERSION_1
- *                                       (or newer) the runtime speaks.
- *                                       Plug-ins compare this against the
- *                                       version they implement and may
- *                                       return `XRT_ERROR_PROBER_NOT_SUPPORTED`
- *                                       to bail cleanly if the runtime
- *                                       is too old or too new.
+ * @param      runtime_api_version       The @ref XRT_PLUGIN_API_VERSION_CURRENT
+ *                                       (currently @ref XRT_PLUGIN_API_VERSION_2)
+ *                                       the runtime speaks. Plug-ins compare
+ *                                       this against the version they implement
+ *                                       and may return
+ *                                       `XRT_ERROR_PROBER_NOT_SUPPORTED` to
+ *                                       bail cleanly if the runtime is too old
+ *                                       or too new. The runtime also enforces
+ *                                       the major match by rejecting any plug-in
+ *                                       whose @p out_plugin_api_version differs
+ *                                       (ADR-020 rule 3).
  * @param      host                      Pointer to the host's iface.
  *                                       `host->struct_size` tells the
  *                                       plug-in how much of the struct
@@ -453,8 +467,10 @@ struct xrt_plugin_iface
  *                                       so the runtime can detect
  *                                       forward-version fields and clamp
  *                                       its reads.
- * @param[out] out_plugin_api_version    The @ref XRT_PLUGIN_API_VERSION_1
- *                                       the plug-in implements.
+ * @param[out] out_plugin_api_version    The @ref XRT_PLUGIN_API_VERSION_CURRENT
+ *                                       (i.e. the major) the plug-in implements.
+ *                                       Must equal the runtime's major or the
+ *                                       loader rejects the plug-in.
  *
  * @return `XRT_SUCCESS` on negotiation success — the runtime proceeds to
  *         call `(*out_iface)->probe()`. `XRT_ERROR_PROBER_NOT_SUPPORTED`

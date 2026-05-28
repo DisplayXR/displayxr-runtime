@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.22)
 project(
 	XRT
-	VERSION 1.5.2
+	VERSION 1.6.0
 	LANGUAGES C CXX
 	DESCRIPTION "DisplayXR Runtime (based on Monado/XRT)"
 	)

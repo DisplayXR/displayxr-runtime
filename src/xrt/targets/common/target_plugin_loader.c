@@ -26,10 +26,12 @@
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_config_os.h"
 
+#include "os/os_threading.h"
 #include "util/u_logging.h"
 
 #include <errno.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -43,6 +45,26 @@
 static int g_load_attempted = 0;
 static const struct xrt_plugin_iface *g_active_iface = NULL;
 static struct xrt_plugin_instance *g_active_instance = NULL;
+
+/*!
+ * Winning ProbeOrder from the most recent successful discovery, or UINT32_MAX
+ * when no plug-in is active (first-call path or empty discovery root).
+ * @ref target_plugin_refresh_active uses it as a strict upper bound: a refresh
+ * only adopts a plug-in whose ProbeOrder is STRICTLY LESS than this — meaning
+ * we never re-probe the already-active plug-in, only ones that legitimately
+ * out-rank it.
+ */
+static uint32_t g_active_probe_order = 0xFFFFFFFFu;
+
+/*!
+ * Guards @ref target_plugin_refresh_active against concurrent IPC-client
+ * compositor creates in service mode. Initialized lazily on the
+ * (single-threaded) first call to @ref target_plugin_get_active, which always
+ * precedes any compositor-create-time refresh. Using os_mutex (not C11 atomics)
+ * per the MinGW caveat in CLAUDE.md.
+ */
+static struct os_mutex g_refresh_mutex;
+static int g_refresh_mutex_initialized = 0;
 
 
 /*
@@ -272,6 +294,19 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 		return NULL;
 	}
 
+	/* ADR-020 rule 3: reject a major-version mismatch before touching the
+	 * vtable. A plug-in built against a different ABI major lays its vtable
+	 * out at offsets the runtime doesn't agree on — calling through it is
+	 * exactly the corruption this guards against. Skip it (the caller falls
+	 * back to the next plug-in / sim_display); never dispatch. */
+	if (plugin_version != XRT_PLUGIN_API_VERSION_CURRENT) {
+		U_LOG_E("plugin loader:   %s: ABI major mismatch — plugin_api=%u, runtime expects %u; "
+		        "the plug-in must be rebuilt against this runtime's headers — skipping (ADR-020 rule 3).",
+		        e->id, plugin_version, (unsigned)XRT_PLUGIN_API_VERSION_CURRENT);
+		FreeLibrary(dll);
+		return NULL;
+	}
+
 	if (iface->probe != NULL) {
 		xret = iface->probe(out_inst);
 		if (xret == XRT_ERROR_PROBER_NOT_SUPPORTED) {
@@ -378,7 +413,7 @@ preload_runtime_core_dll(void)
 }
 
 static const struct xrt_plugin_iface *
-discover_active_plugin(struct xrt_plugin_instance **out_inst)
+discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe_order)
 {
 	*out_inst = NULL;
 
@@ -396,10 +431,18 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst)
 
 	U_LOG_I("plugin loader: %d registered plug-in(s); attempting in ProbeOrder ascending.", n);
 	for (int i = 0; i < n; i++) {
+		// Refresh path (#342) passes the active plug-in's ProbeOrder as
+		// max so we only re-attempt strictly-better candidates and never
+		// re-probe the already-active one. First-call path passes
+		// UINT32_MAX, so no entry is skipped.
+		if (entries[i].probe_order >= max_probe_order) {
+			continue;
+		}
 		U_LOG_I("plugin loader:   [%d/%d] %s (ProbeOrder=%u, %ls)", i + 1, n, entries[i].id,
 		        entries[i].probe_order, entries[i].binary_path);
 		const struct xrt_plugin_iface *iface = try_load_one(&entries[i], out_inst);
 		if (iface != NULL) {
+			g_active_probe_order = entries[i].probe_order;
 			return iface;
 		}
 	}
@@ -682,6 +725,19 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 		return NULL;
 	}
 
+	/* ADR-020 rule 3: reject a major-version mismatch before touching the
+	 * vtable. A plug-in built against a different ABI major lays its vtable
+	 * out at offsets the runtime doesn't agree on — calling through it is
+	 * exactly the corruption this guards against. Skip it (the caller falls
+	 * back to the next plug-in / sim_display); never dispatch. */
+	if (plugin_version != XRT_PLUGIN_API_VERSION_CURRENT) {
+		U_LOG_E("plugin loader:   %s: ABI major mismatch — plugin_api=%u, runtime expects %u; "
+		        "the plug-in must be rebuilt against this runtime's headers — skipping (ADR-020 rule 3).",
+		        e->id, plugin_version, (unsigned)XRT_PLUGIN_API_VERSION_CURRENT);
+		dlclose(handle);
+		return NULL;
+	}
+
 	if (iface->probe != NULL) {
 		xret = iface->probe(out_inst);
 		if (xret == XRT_ERROR_PROBER_NOT_SUPPORTED) {
@@ -708,7 +764,7 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 }
 
 static const struct xrt_plugin_iface *
-discover_active_plugin(struct xrt_plugin_instance **out_inst)
+discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe_order)
 {
 	*out_inst = NULL;
 
@@ -743,10 +799,16 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst)
 
 	U_LOG_I("plugin loader: %d registered plug-in(s) in %s; attempting in filename order.", n, root);
 	for (int i = 0; i < n; i++) {
+		// Refresh path (#342): only attempt strictly-better candidates.
+		// First-call path passes UINT32_MAX so no entry is skipped.
+		if (entries[i].probe_order >= max_probe_order) {
+			continue;
+		}
 		U_LOG_I("plugin loader:   [%d/%d] %s (ProbeOrder=%u, %s)", i + 1, n, entries[i].id,
 		        entries[i].probe_order, entries[i].binary_path);
 		const struct xrt_plugin_iface *iface = try_load_one(&entries[i], out_inst);
 		if (iface != NULL) {
+			g_active_probe_order = entries[i].probe_order;
 			return iface;
 		}
 	}
@@ -1015,6 +1077,19 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 		return NULL;
 	}
 
+	/* ADR-020 rule 3: reject a major-version mismatch before touching the
+	 * vtable. A plug-in built against a different ABI major lays its vtable
+	 * out at offsets the runtime doesn't agree on — calling through it is
+	 * exactly the corruption this guards against. Skip it (the caller falls
+	 * back to the next plug-in / sim_display); never dispatch. */
+	if (plugin_version != XRT_PLUGIN_API_VERSION_CURRENT) {
+		U_LOG_E("plugin loader:   %s: ABI major mismatch — plugin_api=%u, runtime expects %u; "
+		        "the plug-in must be rebuilt against this runtime's headers — skipping (ADR-020 rule 3).",
+		        e->id, plugin_version, (unsigned)XRT_PLUGIN_API_VERSION_CURRENT);
+		dlclose(handle);
+		return NULL;
+	}
+
 	if (iface->probe != NULL) {
 		xret = iface->probe(out_inst);
 		if (xret == XRT_ERROR_PROBER_NOT_SUPPORTED) {
@@ -1041,7 +1116,7 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 }
 
 static const struct xrt_plugin_iface *
-discover_active_plugin(struct xrt_plugin_instance **out_inst)
+discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe_order)
 {
 	*out_inst = NULL;
 
@@ -1117,10 +1192,16 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst)
 
 	U_LOG_I("plugin loader: %d registered plug-in(s); attempting in filename order.", n);
 	for (int i = 0; i < n; i++) {
+		// Refresh path (#342): only attempt strictly-better candidates.
+		// First-call path passes UINT32_MAX so no entry is skipped.
+		if (entries[i].probe_order >= max_probe_order) {
+			continue;
+		}
 		U_LOG_I("plugin loader:   [%d/%d] %s (ProbeOrder=%u, %s)", i + 1, n, entries[i].id,
 		        entries[i].probe_order, entries[i].binary_path);
 		const struct xrt_plugin_iface *iface = try_load_one(&entries[i], out_inst);
 		if (iface != NULL) {
+			g_active_probe_order = entries[i].probe_order;
 			return iface;
 		}
 	}
@@ -1145,7 +1226,19 @@ target_plugin_get_active(void)
 		return g_active_iface;
 	}
 	g_load_attempted = 1;
-	g_active_iface = discover_active_plugin(&g_active_instance);
+
+	// Init the refresh mutex here, while we're still single-threaded
+	// (xrCreateInstance is per the OpenXR spec). Subsequent compositor-
+	// create-time refreshes can then lock it from multiple IPC clients.
+	if (!g_refresh_mutex_initialized) {
+		if (os_mutex_init(&g_refresh_mutex) == 0) {
+			g_refresh_mutex_initialized = 1;
+		} else {
+			U_LOG_W("plugin loader: os_mutex_init failed — refresh path will skip locking.");
+		}
+	}
+
+	g_active_iface = discover_active_plugin(&g_active_instance, 0xFFFFFFFFu /* try all */);
 	return g_active_iface;
 }
 
@@ -1159,4 +1252,39 @@ target_plugin_get_active_instance(void)
 	 */
 	(void)target_plugin_get_active();
 	return g_active_instance;
+}
+
+const struct xrt_plugin_iface *
+target_plugin_refresh_active(void)
+{
+	// Force the one-shot discovery (also inits the mutex) if the caller
+	// hits this before the runtime's xrCreateInstance — defensive only;
+	// in practice instance-create always precedes session-create.
+	(void)target_plugin_get_active();
+
+	if (g_refresh_mutex_initialized) {
+		os_mutex_lock(&g_refresh_mutex);
+	}
+
+	uint32_t prev_order = g_active_probe_order;
+	struct xrt_plugin_instance *new_inst = NULL;
+	const struct xrt_plugin_iface *cand = discover_active_plugin(&new_inst, prev_order);
+	if (cand != NULL) {
+		// `g_active_probe_order` was already updated by discover to the
+		// new (lower) winner. The previous plug-in's DLL is intentionally
+		// leaked — its vtable may still be reachable from existing live
+		// DPs the compositor hasn't recreated yet.
+		U_LOG_W("plugin loader: refresh adopted better plug-in id=%s (ProbeOrder %u → %u) — "
+		        "re-scan after mid-install (#342).",
+		        cand->id ? cand->id : "?", prev_order, g_active_probe_order);
+		g_active_iface = cand;
+		g_active_instance = new_inst;
+	}
+
+	const struct xrt_plugin_iface *result = g_active_iface;
+
+	if (g_refresh_mutex_initialized) {
+		os_mutex_unlock(&g_refresh_mutex);
+	}
+	return result;
 }

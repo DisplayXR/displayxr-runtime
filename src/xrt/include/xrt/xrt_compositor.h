@@ -2558,6 +2558,18 @@ struct xrt_system_compositor_info
 	//! Signature: xrt_dp_factory_gl_fn_t (see xrt_display_processor_gl.h).
 	void *dp_factory_gl;
 
+	/*!
+	 * Optional callback: re-derive the dp_factory_* pointers above from the
+	 * runtime's plug-in loader. Long-lived service-mode compositors invoke
+	 * this once at per-client compositor create, so a vendor plug-in
+	 * installed AFTER the service started (#342) is picked up on the first
+	 * app launch without a service restart. NULL on the in-process / handle
+	 * path — those create a fresh instance per app launch and never need it.
+	 * The callee may swap in a strictly-better (lower ProbeOrder) plug-in
+	 * and leak the old DLL; see ADR-020 and `target_plugin_loader.c`.
+	 */
+	void (*refresh_display_processors)(struct xrt_system_compositor_info *info);
+
 	/*! @} */
 };
 

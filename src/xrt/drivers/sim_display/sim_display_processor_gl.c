@@ -424,6 +424,8 @@ sim_display_processor_gl_create(enum sim_display_output_mode mode,
 		return XRT_ERROR_ALLOCATION;
 	}
 
+	// ADR-020 rule 1: advertise the vtable size (calloc zeroed reserved_0).
+	sdp->base.struct_size = (uint32_t)sizeof(struct xrt_display_processor_gl);
 	sdp->base.destroy = sim_dp_gl_destroy;
 	sdp->base.process_atlas = sim_dp_gl_process_atlas;
 	sdp->base.get_predicted_eye_positions = sim_dp_gl_get_predicted_eye_positions;

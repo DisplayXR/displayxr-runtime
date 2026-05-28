@@ -23,6 +23,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h> // offsetof — used by the ABI tripwire at the end of this header
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,6 +47,17 @@ struct xrt_window_metrics;
  */
 struct xrt_display_processor_d3d11
 {
+	/*!
+	 * `sizeof(struct xrt_display_processor_d3d11)` at the plug-in's compile
+	 * time. Set by the plug-in factory; the runtime treats any slot at/past
+	 * this offset as absent (NULL). 8-byte header (with @ref reserved_0) so
+	 * @ref process_atlas lands at offset 8 on 64- and 32-bit. See ADR-020.
+	 */
+	uint32_t struct_size;
+
+	/*! Reserved for alignment / future flags. Must be 0. */
+	uint32_t reserved_0;
+
 	/*!
 	 * Process an atlas texture into the final display output.
 	 *
@@ -161,6 +173,50 @@ struct xrt_display_processor_d3d11
 	void (*destroy)(struct xrt_display_processor_d3d11 *xdp);
 };
 
+/*
+ * ── Plug-in ABI tripwire (ADR-020) ─────────────────────────────────────────
+ *
+ * The per-API DP vtable is part of the same versioned plug-in ABI as the base
+ * @ref xrt_display_processor (the compositor calls it directly; the plug-in
+ * factory fills it). As of ABI major v2 it carries the same 8-byte struct_size
+ * header, so appending a method at the END is compatible within a major; any
+ * other layout change is breaking and must bump XRT_PLUGIN_API_VERSION_CURRENT
+ * (xrt_plugin.h) + re-pin every plug-in. The asserts pin each slot at
+ * base-offset + index*sizeof(void *) so they hold on 64- and 32-bit.
+ */
+#ifndef XRT_DP_ABI_ASSERT
+#if defined(__cplusplus)
+#define XRT_DP_ABI_ASSERT(cond, msg) static_assert(cond, msg)
+#else
+#define XRT_DP_ABI_ASSERT(cond, msg) _Static_assert(cond, msg)
+#endif
+#endif
+#ifndef XRT_DP_ABI_MSG
+#define XRT_DP_ABI_MSG                                                                                                  \
+	"xrt_display_processor ABI changed — see ADR-020: bump XRT_PLUGIN_API_VERSION_CURRENT and re-pin every plug-in."
+#endif
+#ifndef XRT_DP_HAS_SLOT
+#define XRT_DP_HAS_SLOT(xdp, field)                                                                                    \
+	((xdp) != NULL && ((const char *)&(xdp)->field + sizeof((xdp)->field)) <=                                       \
+	                      ((const char *)(xdp) + (xdp)->struct_size))
+#endif
+
+#define XRT_DP_D3D11_BASE_OFF offsetof(struct xrt_display_processor_d3d11, process_atlas)
+// clang-format off
+XRT_DP_ABI_ASSERT(XRT_DP_D3D11_BASE_OFF == 8, XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, process_atlas)               == XRT_DP_D3D11_BASE_OFF + 0 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, get_predicted_eye_positions) == XRT_DP_D3D11_BASE_OFF + 1 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, get_window_metrics)          == XRT_DP_D3D11_BASE_OFF + 2 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, request_display_mode)        == XRT_DP_D3D11_BASE_OFF + 3 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, get_hardware_3d_state)       == XRT_DP_D3D11_BASE_OFF + 4 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, get_display_dimensions)      == XRT_DP_D3D11_BASE_OFF + 5 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, get_display_pixel_info)      == XRT_DP_D3D11_BASE_OFF + 6 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, is_alpha_native)             == XRT_DP_D3D11_BASE_OFF + 7 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_chroma_key)              == XRT_DP_D3D11_BASE_OFF + 8 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, destroy)                     == XRT_DP_D3D11_BASE_OFF + 9 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 10 * sizeof(void *), XRT_DP_ABI_MSG);
+// clang-format on
+
 /*!
  * @copydoc xrt_display_processor_d3d11::process_atlas
  *
@@ -198,7 +254,7 @@ static inline bool
 xrt_display_processor_d3d11_get_predicted_eye_positions(struct xrt_display_processor_d3d11 *xdp,
                                                         struct xrt_eye_positions *out_eye_pos)
 {
-	if (xdp == NULL || xdp->get_predicted_eye_positions == NULL) {
+	if (!XRT_DP_HAS_SLOT(xdp, get_predicted_eye_positions) || xdp->get_predicted_eye_positions == NULL) {
 		return false;
 	}
 	return xdp->get_predicted_eye_positions(xdp, out_eye_pos);
@@ -213,7 +269,7 @@ static inline bool
 xrt_display_processor_d3d11_get_window_metrics(struct xrt_display_processor_d3d11 *xdp,
                                                struct xrt_window_metrics *out_metrics)
 {
-	if (xdp == NULL || xdp->get_window_metrics == NULL) {
+	if (!XRT_DP_HAS_SLOT(xdp, get_window_metrics) || xdp->get_window_metrics == NULL) {
 		return false;
 	}
 	return xdp->get_window_metrics(xdp, out_metrics);
@@ -227,7 +283,7 @@ xrt_display_processor_d3d11_get_window_metrics(struct xrt_display_processor_d3d1
 static inline bool
 xrt_display_processor_d3d11_request_display_mode(struct xrt_display_processor_d3d11 *xdp, bool enable_3d)
 {
-	if (xdp == NULL || xdp->request_display_mode == NULL) {
+	if (!XRT_DP_HAS_SLOT(xdp, request_display_mode) || xdp->request_display_mode == NULL) {
 		return false;
 	}
 	return xdp->request_display_mode(xdp, enable_3d);
@@ -242,7 +298,7 @@ static inline bool
 xrt_display_processor_d3d11_get_hardware_3d_state(struct xrt_display_processor_d3d11 *xdp,
                                                   bool *out_is_3d)
 {
-	if (xdp == NULL || xdp->get_hardware_3d_state == NULL) {
+	if (!XRT_DP_HAS_SLOT(xdp, get_hardware_3d_state) || xdp->get_hardware_3d_state == NULL) {
 		return false;
 	}
 	return xdp->get_hardware_3d_state(xdp, out_is_3d);
@@ -258,7 +314,7 @@ xrt_display_processor_d3d11_get_display_dimensions(struct xrt_display_processor_
                                                    float *out_width_m,
                                                    float *out_height_m)
 {
-	if (xdp == NULL || xdp->get_display_dimensions == NULL) {
+	if (!XRT_DP_HAS_SLOT(xdp, get_display_dimensions) || xdp->get_display_dimensions == NULL) {
 		return false;
 	}
 	return xdp->get_display_dimensions(xdp, out_width_m, out_height_m);
@@ -276,7 +332,7 @@ xrt_display_processor_d3d11_get_display_pixel_info(struct xrt_display_processor_
                                                    int32_t *out_screen_left,
                                                    int32_t *out_screen_top)
 {
-	if (xdp == NULL || xdp->get_display_pixel_info == NULL) {
+	if (!XRT_DP_HAS_SLOT(xdp, get_display_pixel_info) || xdp->get_display_pixel_info == NULL) {
 		return false;
 	}
 	return xdp->get_display_pixel_info(xdp, out_pixel_width, out_pixel_height, out_screen_left, out_screen_top);
@@ -290,7 +346,7 @@ xrt_display_processor_d3d11_get_display_pixel_info(struct xrt_display_processor_
 static inline bool
 xrt_display_processor_d3d11_is_alpha_native(struct xrt_display_processor_d3d11 *xdp)
 {
-	if (xdp == NULL || xdp->is_alpha_native == NULL) {
+	if (!XRT_DP_HAS_SLOT(xdp, is_alpha_native) || xdp->is_alpha_native == NULL) {
 		return false;
 	}
 	return xdp->is_alpha_native(xdp);
@@ -306,7 +362,7 @@ xrt_display_processor_d3d11_set_chroma_key(struct xrt_display_processor_d3d11 *x
                                             uint32_t key_color,
                                             bool transparent_bg_enabled)
 {
-	if (xdp == NULL || xdp->set_chroma_key == NULL) {
+	if (!XRT_DP_HAS_SLOT(xdp, set_chroma_key) || xdp->set_chroma_key == NULL) {
 		return;
 	}
 	xdp->set_chroma_key(xdp, key_color, transparent_bg_enabled);

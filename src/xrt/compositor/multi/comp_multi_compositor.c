@@ -1904,6 +1904,14 @@ multi_compositor_create(struct multi_system_compositor *msc,
 {
 	COMP_TRACE_MARKER();
 
+	// #342 / ADR-020: re-derive dp_factory_* from the plug-in loader before
+	// this client's session_render reads them. Picks up a vendor plug-in
+	// registered after the service started (mid-install case) without
+	// requiring a service restart. NULL on builds without the loader hook.
+	if (msc->base.info.refresh_display_processors != NULL) {
+		msc->base.info.refresh_display_processors(&msc->base.info);
+	}
+
 	struct multi_compositor *mc = U_TYPED_CALLOC(struct multi_compositor);
 
 	mc->base.base.get_swapchain_create_properties = multi_compositor_get_swapchain_create_properties;

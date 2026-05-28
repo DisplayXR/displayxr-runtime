@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Accepted
 date: 2026-05-27
 ---
 # ADR-020: Plug-in ABI Compatibility Policy (versioning, `struct_size` negotiation, drift guards)
@@ -61,14 +61,19 @@ versioned contract governed by these rules:
 
 ### 1. `struct_size` + append-only on the DP vtable
 
-`struct xrt_display_processor` (and each `xrt_display_processor_<api>` factory's
-returned vtable) gains a `uint32_t struct_size` as its **first field**, set by
-the plug-in factory to `sizeof` at the plug-in's compile time. The runtime
-treats any vtable slot whose offset is `>= struct_size` as **absent** (NULL /
-unsupported), exactly as it already does for the optional `xrt_plugin_iface`
-methods. New methods are **only ever appended at the end** — never inserted or
-reordered. This makes additive evolution forward- *and* backward-compatible
-**within a major version**, which is what enables independent updates:
+`struct xrt_display_processor` (and each `xrt_display_processor_<api>` —
+`_d3d11`, `_d3d12`, `_gl`, `_metal` — factory's returned vtable) gains an 8-byte
+header (`uint32_t struct_size; uint32_t reserved_0;`) as its **first fields**,
+set by the plug-in factory to `sizeof` at the plug-in's compile time. The
+8-byte header (mirroring `xrt_plugin_display_info`) makes the first vtable slot
+land at offset 8 on both 64-bit and 32-bit/Android, so the compile-time asserts
+anchor at a base offset rather than brittle absolute math. The runtime treats
+any vtable slot whose bytes fall at/past `struct_size` as **absent** (NULL /
+unsupported) via the `XRT_DP_HAS_SLOT` coverage check on every optional-method
+wrapper, exactly as it already does for the optional `xrt_plugin_iface` methods.
+New methods are **only ever appended at the end** — never inserted or reordered.
+This makes additive evolution forward- *and* backward-compatible **within a
+major version**, which is what enables independent updates:
 
 | scenario | behavior |
 |---|---|
@@ -144,8 +149,15 @@ becomes a check). This catches "bumped one, forgot the other."
 
 ## Status / rollout
 
-- **Now (this change set):** rule 4 (compile-time tripwire) + this ADR.
-- **Next runtime release (coordinated):** rules 1–3 (`struct_size` + append-only
-  + loader major-version enforcement), with the major bumped, all first-party
-  plug-ins rebuilt and re-pinned, validated on the Leia box.
-- **Plug-in repos:** rule 5 (pin self-consistency CI assert).
+- **Landed in the v1.5.x line:** rule 4 (compile-time tripwire) + this ADR
+  (runtime PR #348).
+- **Done (runtime v1.6.0, ABI major 2):** rules 1–3 — `struct_size` + append-only
+  on `xrt_display_processor` *and* the per-API vtables (`_d3d11`, `_d3d12`,
+  `_gl`, `_metal`), plus loader major-version enforcement in all three
+  `target_plugin_loader.c` `try_load_one` variants (Windows registry, POSIX/JSON,
+  Android). `XRT_PLUGIN_API_VERSION_CURRENT` bumped `1 → 2`; the tripwire asserts
+  rewritten to the `XRT_DP_BASE_OFF`-anchored, struct_size-aware scheme; all
+  first-party plug-ins (in-tree sim_display, and leia v1.0.6 out-of-tree) set
+  `struct_size` and re-pin to v1.6.0.
+- **Plug-in repos:** rule 5 (pin self-consistency CI assert) — leia v1.0.6's CI
+  asserts `DXR_RUNTIME_GIT_TAG` == the workflow's runtime checkout `ref`.
