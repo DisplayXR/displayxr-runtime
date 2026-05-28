@@ -140,6 +140,53 @@ jobs:
           Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
           Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
 
+      # Sync CMakeLists.txt VERSION to the most recent vX.Y.Z tag on every
+      # run. The installer's OutFile name comes from CMake's project(VERSION),
+      # which is wired through installer/CMakeLists.txt → NSIS as
+      # `DisplayXRSetup-${VERSION}.${BUILD_NUM}.exe`. Without this, the
+      # source-tree VERSION drives the filename on PR / main builds — easy
+      # to drift if /release ever forgets to bump it before tagging
+      # (cf. displayxr-shell-pvt#33, where source pinned at 1.2.3 while the
+      # latest tag was v1.3.0, producing `DisplayXRShellSetup-1.2.3.<run>.exe`
+      # in every PR artifact).
+      #
+      # `git describe --tags --abbrev=0 --match 'v[0-9]*'` resolves to the
+      # exact tag on tag pushes and the most recent matching tag on every
+      # other commit, so the same step covers PRs, main pushes, and tag
+      # pushes. /release can stop manually bumping CMakeLists.txt — CI is
+      # authoritative.
+      - name: Sync CMake VERSION from latest vX.Y.Z tag
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: |
+          # actions/checkout's default fetch-depth is 1 and skips tags; pull
+          # in just the tag refs (no extra commit history) so describe works.
+          git fetch --depth=1 origin '+refs/tags/*:refs/tags/*' 2>$null
+
+          $tag = (git describe --tags --abbrev=0 --match 'v[0-9]*' 2>$null)
+          if (-not $tag) {
+            Write-Host "No vX.Y.Z tag reachable — leaving CMakeLists.txt unchanged"
+            exit 0
+          }
+          if ($tag -notmatch '^v(\d+\.\d+\.\d+)$') {
+            Write-Host "Latest tag '$tag' is not vX.Y.Z — leaving CMakeLists.txt unchanged"
+            exit 0
+          }
+          $ver = $Matches[1]
+          Write-Host "Patching CMakeLists.txt VERSION to $ver (from tag $tag, ref=$env:GITHUB_REF)"
+          # Line-by-line rewrite avoids .NET regex's `$1`-followed-by-digit
+          # parser ambiguity (e.g. `$1.2.4` → it tries `$11` first); see the
+          # shell-pvt sibling step for the original encounter.
+          $out = Get-Content CMakeLists.txt | ForEach-Object {
+            if ($_ -match '^(\s*)VERSION\s+\d+\.\d+\.\d+(\s*)$') {
+              "$($Matches[1])VERSION $ver$($Matches[2])"
+            } else {
+              $_
+            }
+          }
+          Set-Content -Path CMakeLists.txt -Value $out -Encoding UTF8
+          Select-String -Path CMakeLists.txt -Pattern '^\s*VERSION\s+\d+\.\d+\.\d+\s*$' | Select-Object -First 1
+
       - name: Generate
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
