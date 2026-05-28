@@ -70,6 +70,20 @@ struct xrt_window_metrics;
 struct xrt_display_processor
 {
 	/*!
+	 * `sizeof(struct xrt_display_processor)` as known at the *plug-in's*
+	 * compile time. Set by the plug-in factory before handing the vtable
+	 * back. The runtime treats any vtable slot whose bytes fall at or past
+	 * this offset as absent (NULL / unsupported) — see @ref XRT_DP_HAS_SLOT
+	 * and ADR-020 rule 1. Together with @ref reserved_0 this is an 8-byte
+	 * header (mirroring @ref xrt_plugin_display_info) so @ref process_atlas
+	 * lands at offset 8 on both 64-bit and 32-bit/Android targets.
+	 */
+	uint32_t struct_size;
+
+	/*! Reserved for alignment / future flags. Must be 0. */
+	uint32_t reserved_0;
+
+	/*!
 	 * @name Interface Methods
 	 * @{
 	 */
@@ -303,53 +317,93 @@ struct xrt_display_processor
 /*
  * ── Plug-in ABI tripwire (ADR-020) ─────────────────────────────────────────
  *
- * `xrt_display_processor` is a FIXED-OFFSET vtable shared across the runtime ↔
- * vendor-plug-in DLL boundary (ADR-019). The runtime calls these slots at the
- * compile-time slot indices below; a plug-in built against an older copy of
- * this header that disagrees on a single slot makes the runtime call the WRONG
- * function — exactly what broke standalone-VK weaving (the runtime's
- * set_chroma_key call hit leia's destroy after on_pause/on_resume were inserted
- * mid-struct without a version bump). See ADR-020.
+ * `xrt_display_processor` is a vtable shared across the runtime ↔ vendor-plug-in
+ * DLL boundary (ADR-019). As of ABI major v2 it carries a `struct_size` header
+ * (see the struct above): the plug-in reports how many slots it built, and the
+ * runtime treats any slot at/past that offset as absent (NULL) via
+ * @ref XRT_DP_HAS_SLOT. That makes *appending* a new method at the END
+ * backward- and forward-compatible WITHIN a major — no version bump needed.
+ *
+ * What is STILL breaking (and trips an assert below): reordering an existing
+ * slot, removing one, changing a signature, or inserting anywhere but the end.
+ * That is exactly what broke standalone-VK weaving — on_pause/on_resume were
+ * inserted mid-struct (before destroy) without a version bump, so the runtime's
+ * set_chroma_key call hit a plug-in's destroy. See ADR-020.
  *
  * If you change anything that trips an assert below, you are making a BREAKING
  * ABI change. In the SAME change you MUST:
- *   1. Bump XRT_PLUGIN_API_VERSION_CURRENT in xrt_plugin.h,
+ *   1. Bump XRT_PLUGIN_API_VERSION_CURRENT in xrt_plugin.h (major),
  *   2. Update the slot indices / count here,
  *   3. Re-pin + rebuild every vendor plug-in (e.g. leia-plugin's
- *      DXR_RUNTIME_GIT_TAG and its CI runtime-checkout ref) and the bundle,
- *   4. Follow the append-only + struct_size plan in ADR-020.
- * Until struct_size negotiation (ADR-020 rule 1) lands, even APPENDING a method
- * is breaking — old plug-ins still read fixed offsets. New methods go at the
- * END only.
+ *      DXR_RUNTIME_GIT_TAG and its CI runtime-checkout ref) and the bundle.
+ * To add a method WITHOUT a major bump: append it at the very END (after the
+ * last slot below), add its assert, bump the size assert, and gate its wrapper
+ * on @ref XRT_DP_HAS_SLOT — old plug-ins (smaller struct_size) see it as absent.
  *
- * Offsets are asserted as (slot index) * sizeof(void *) so the check holds on
- * both 64-bit and 32-bit (Android) builds — the slot index is the invariant
- * that decides which function the runtime dispatches to.
+ * Offsets are anchored at XRT_DP_BASE_OFF (the offset of the first slot, after
+ * the 8-byte struct_size header) plus (slot index) * sizeof(void *), so the
+ * check holds on both 64-bit and 32-bit (Android) builds.
  */
+// Guarded so the per-API xrt_display_processor_<api>.h headers can define the
+// same helpers regardless of include order (no MSVC C4005 redefinition).
+#ifndef XRT_DP_ABI_ASSERT
 #if defined(__cplusplus)
 #define XRT_DP_ABI_ASSERT(cond, msg) static_assert(cond, msg)
 #else
 #define XRT_DP_ABI_ASSERT(cond, msg) _Static_assert(cond, msg)
 #endif
+#endif
+#ifndef XRT_DP_ABI_MSG
 #define XRT_DP_ABI_MSG                                                                                                  \
 	"xrt_display_processor ABI changed — see ADR-020: bump XRT_PLUGIN_API_VERSION_CURRENT and re-pin every plug-in."
+#endif
+
+/*!
+ * Offset of the first vtable slot (`process_atlas`), i.e. the size of the
+ * struct_size header. Asserted == 8 below so it holds identically on 64-bit
+ * (8 = one pointer slot) and 32-bit/Android (8 = two pointer slots).
+ */
+#define XRT_DP_BASE_OFF offsetof(struct xrt_display_processor, process_atlas)
+
 // clang-format off
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, process_atlas)                ==  0 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_predicted_eye_positions)  ==  1 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_window_metrics)           ==  2 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, request_display_mode)         ==  3 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_hardware_3d_state)        ==  4 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_render_pass)              ==  5 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_display_dimensions)       ==  6 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_display_pixel_info)       ==  7 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, is_alpha_native)              ==  8 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, is_self_submitting)           ==  9 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_chroma_key)               == 10 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, on_pause)                     == 11 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, on_resume)                    == 12 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, destroy)                      == 13 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor)                                 == 14 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(XRT_DP_BASE_OFF == 8, XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, process_atlas)                == XRT_DP_BASE_OFF +  0 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_predicted_eye_positions)  == XRT_DP_BASE_OFF +  1 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_window_metrics)           == XRT_DP_BASE_OFF +  2 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, request_display_mode)         == XRT_DP_BASE_OFF +  3 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_hardware_3d_state)        == XRT_DP_BASE_OFF +  4 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_render_pass)              == XRT_DP_BASE_OFF +  5 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_display_dimensions)       == XRT_DP_BASE_OFF +  6 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_display_pixel_info)       == XRT_DP_BASE_OFF +  7 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, is_alpha_native)              == XRT_DP_BASE_OFF +  8 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, is_self_submitting)           == XRT_DP_BASE_OFF +  9 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_chroma_key)               == XRT_DP_BASE_OFF + 10 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, on_pause)                     == XRT_DP_BASE_OFF + 11 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, on_resume)                    == XRT_DP_BASE_OFF + 12 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, destroy)                      == XRT_DP_BASE_OFF + 13 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor)                                 == XRT_DP_BASE_OFF + 14 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
+
+/*!
+ * True when the vtable @p xdp actually carries the slot @p field — i.e. the
+ * plug-in that built it reported a `struct_size` large enough to include that
+ * field's bytes. The runtime treats appended-but-unknown-to-this-plug-in slots
+ * as absent (ADR-020 rule 1). Optional-method wrappers below gate on this in
+ * addition to the per-pointer NULL check, so a runtime built against a newer
+ * header never reads a slot an older plug-in never allocated.
+ *
+ * Evaluates @p xdp once would require a statement-expr; the macro instead
+ * tolerates re-evaluation — callers always pass a plain local pointer.
+ *
+ * The body is type-generic (it only needs `field` and `struct_size` members),
+ * so the per-API `xrt_display_processor_<api>.h` headers reuse the same macro;
+ * the `#ifndef` guard lets whichever header is included first define it.
+ */
+#ifndef XRT_DP_HAS_SLOT
+#define XRT_DP_HAS_SLOT(xdp, field)                                                                                    \
+	((xdp) != NULL && ((const char *)&(xdp)->field + sizeof((xdp)->field)) <=                                       \
+	                      ((const char *)(xdp) + (xdp)->struct_size))
+#endif
 
 /*!
  * @copydoc xrt_display_processor::process_atlas
@@ -378,6 +432,8 @@ xrt_display_processor_process_atlas(struct xrt_display_processor *xdp,
                                     uint32_t canvas_width,
                                     uint32_t canvas_height)
 {
+	// Mandatory slot (offset XRT_DP_BASE_OFF): every plug-in's struct_size
+	// covers it, so no XRT_DP_HAS_SLOT gate — see ADR-020.
 	xdp->process_atlas(xdp, cmd_buffer, atlas_image, atlas_view,
 	                   view_width, view_height,
 	                   tile_columns, tile_rows,
@@ -398,7 +454,7 @@ static inline bool
 xrt_display_processor_get_predicted_eye_positions(struct xrt_display_processor *xdp,
                                                   struct xrt_eye_positions *out_eye_pos)
 {
-	if (xdp == NULL || xdp->get_predicted_eye_positions == NULL) {
+	if (!XRT_DP_HAS_SLOT(xdp, get_predicted_eye_positions) || xdp->get_predicted_eye_positions == NULL) {
 		return false;
 	}
 	return xdp->get_predicted_eye_positions(xdp, out_eye_pos);
@@ -413,7 +469,7 @@ static inline bool
 xrt_display_processor_get_window_metrics(struct xrt_display_processor *xdp,
                                          struct xrt_window_metrics *out_metrics)
 {
-	if (xdp == NULL || xdp->get_window_metrics == NULL) {
+	if (!XRT_DP_HAS_SLOT(xdp, get_window_metrics) || xdp->get_window_metrics == NULL) {
 		return false;
 	}
 	return xdp->get_window_metrics(xdp, out_metrics);
@@ -427,7 +483,7 @@ xrt_display_processor_get_window_metrics(struct xrt_display_processor *xdp,
 static inline bool
 xrt_display_processor_request_display_mode(struct xrt_display_processor *xdp, bool enable_3d)
 {
-	if (xdp == NULL || xdp->request_display_mode == NULL) {
+	if (!XRT_DP_HAS_SLOT(xdp, request_display_mode) || xdp->request_display_mode == NULL) {
 		return false;
 	}
 	return xdp->request_display_mode(xdp, enable_3d);
@@ -442,7 +498,7 @@ static inline bool
 xrt_display_processor_get_hardware_3d_state(struct xrt_display_processor *xdp,
                                             bool *out_is_3d)
 {
-	if (xdp == NULL || xdp->get_hardware_3d_state == NULL) {
+	if (!XRT_DP_HAS_SLOT(xdp, get_hardware_3d_state) || xdp->get_hardware_3d_state == NULL) {
 		return false;
 	}
 	return xdp->get_hardware_3d_state(xdp, out_is_3d);
@@ -456,7 +512,7 @@ xrt_display_processor_get_hardware_3d_state(struct xrt_display_processor *xdp,
 static inline VkRenderPass
 xrt_display_processor_get_render_pass(struct xrt_display_processor *xdp)
 {
-	if (xdp == NULL || xdp->get_render_pass == NULL) {
+	if (!XRT_DP_HAS_SLOT(xdp, get_render_pass) || xdp->get_render_pass == NULL) {
 		return (VkRenderPass)0;
 	}
 	return xdp->get_render_pass(xdp);
@@ -472,7 +528,7 @@ xrt_display_processor_get_display_dimensions(struct xrt_display_processor *xdp,
                                              float *out_width_m,
                                              float *out_height_m)
 {
-	if (xdp == NULL || xdp->get_display_dimensions == NULL) {
+	if (!XRT_DP_HAS_SLOT(xdp, get_display_dimensions) || xdp->get_display_dimensions == NULL) {
 		return false;
 	}
 	return xdp->get_display_dimensions(xdp, out_width_m, out_height_m);
@@ -490,7 +546,7 @@ xrt_display_processor_get_display_pixel_info(struct xrt_display_processor *xdp,
                                              int32_t *out_screen_left,
                                              int32_t *out_screen_top)
 {
-	if (xdp == NULL || xdp->get_display_pixel_info == NULL) {
+	if (!XRT_DP_HAS_SLOT(xdp, get_display_pixel_info) || xdp->get_display_pixel_info == NULL) {
 		return false;
 	}
 	return xdp->get_display_pixel_info(xdp, out_pixel_width, out_pixel_height, out_screen_left, out_screen_top);
@@ -504,7 +560,7 @@ xrt_display_processor_get_display_pixel_info(struct xrt_display_processor *xdp,
 static inline bool
 xrt_display_processor_is_alpha_native(struct xrt_display_processor *xdp)
 {
-	if (xdp == NULL || xdp->is_alpha_native == NULL) {
+	if (!XRT_DP_HAS_SLOT(xdp, is_alpha_native) || xdp->is_alpha_native == NULL) {
 		return false;
 	}
 	return xdp->is_alpha_native(xdp);
@@ -518,7 +574,7 @@ xrt_display_processor_is_alpha_native(struct xrt_display_processor *xdp)
 static inline bool
 xrt_display_processor_is_self_submitting(struct xrt_display_processor *xdp)
 {
-	if (xdp == NULL || xdp->is_self_submitting == NULL) {
+	if (!XRT_DP_HAS_SLOT(xdp, is_self_submitting) || xdp->is_self_submitting == NULL) {
 		return false;
 	}
 	return xdp->is_self_submitting(xdp);
@@ -534,7 +590,7 @@ xrt_display_processor_set_chroma_key(struct xrt_display_processor *xdp,
                                      uint32_t key_color,
                                      bool transparent_bg_enabled)
 {
-	if (xdp == NULL || xdp->set_chroma_key == NULL) {
+	if (!XRT_DP_HAS_SLOT(xdp, set_chroma_key) || xdp->set_chroma_key == NULL) {
 		return;
 	}
 	xdp->set_chroma_key(xdp, key_color, transparent_bg_enabled);
@@ -548,7 +604,7 @@ xrt_display_processor_set_chroma_key(struct xrt_display_processor *xdp,
 static inline void
 xrt_display_processor_on_pause(struct xrt_display_processor *xdp)
 {
-	if (xdp == NULL || xdp->on_pause == NULL) {
+	if (!XRT_DP_HAS_SLOT(xdp, on_pause) || xdp->on_pause == NULL) {
 		return;
 	}
 	xdp->on_pause(xdp);
@@ -562,7 +618,7 @@ xrt_display_processor_on_pause(struct xrt_display_processor *xdp)
 static inline void
 xrt_display_processor_on_resume(struct xrt_display_processor *xdp)
 {
-	if (xdp == NULL || xdp->on_resume == NULL) {
+	if (!XRT_DP_HAS_SLOT(xdp, on_resume) || xdp->on_resume == NULL) {
 		return;
 	}
 	xdp->on_resume(xdp);
@@ -607,6 +663,7 @@ xrt_display_processor_destroy(struct xrt_display_processor **xdp_ptr)
 		return;
 	}
 
+	// Mandatory slot: covered by every plug-in's struct_size, so un-gated.
 	xdp->destroy(xdp);
 	*xdp_ptr = NULL;
 }

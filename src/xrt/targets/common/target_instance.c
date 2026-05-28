@@ -81,6 +81,54 @@ null_compositor_create_system_with_dims(struct xrt_device *xdev,
  *
  */
 
+/*!
+ * Copy the per-graphics-API DP factories from a plug-in iface into the system
+ * compositor info. Used both at instance create (after `get_display_info`
+ * succeeded) and from the @ref refresh_display_processors_cb callback at
+ * per-client compositor create. NULL plug-in is a no-op so the callback path
+ * survives an empty-discovery-root start.
+ */
+static void
+fill_dp_factories_from_plugin(struct xrt_system_compositor_info *info, const struct xrt_plugin_iface *plugin)
+{
+	if (info == NULL || plugin == NULL) {
+		return;
+	}
+	if (plugin->create_dp_vk != NULL) {
+		info->dp_factory_vk = (void *)plugin->create_dp_vk;
+	}
+#ifdef XRT_OS_WINDOWS
+	if (plugin->create_dp_d3d11 != NULL) {
+		info->dp_factory_d3d11 = (void *)plugin->create_dp_d3d11;
+	}
+	if (plugin->create_dp_d3d12 != NULL) {
+		info->dp_factory_d3d12 = (void *)plugin->create_dp_d3d12;
+	}
+#endif
+	if (plugin->create_dp_gl != NULL) {
+		info->dp_factory_gl = (void *)plugin->create_dp_gl;
+	}
+#ifdef __APPLE__
+	if (plugin->create_dp_metal != NULL) {
+		info->dp_factory_metal = (void *)plugin->create_dp_metal;
+	}
+#endif
+}
+
+/*!
+ * Installed on @ref xrt_system_compositor_info::refresh_display_processors so a
+ * long-lived service-mode compositor can pick up a vendor plug-in registered
+ * AFTER the service started (issue #342). Each per-client compositor-create
+ * path invokes it once, before any DP-factory read; the call is cheap when no
+ * better plug-in has appeared. See ADR-020 / `target_plugin_refresh_active`.
+ */
+static void
+refresh_display_processors_cb(struct xrt_system_compositor_info *info)
+{
+	const struct xrt_plugin_iface *plugin = target_plugin_refresh_active();
+	fill_dp_factories_from_plugin(info, plugin);
+}
+
 static xrt_result_t
 t_instance_create_system(struct xrt_instance *xinst,
                          struct xrt_system **out_xsys,
@@ -192,6 +240,16 @@ out:
 		// Tell the system about the system compositor.
 		u_system_set_system_compositor(usys, xsysc);
 
+		// Install the durable-DP-refresh callback (#342, ADR-020): long-
+		// lived service compositors invoke this at per-client compositor
+		// create so a plug-in registered AFTER the service started is
+		// picked up on the first app launch without a service restart.
+		// In-process / handle apps never call it — they create a fresh
+		// instance per launch, so their initial discovery is already
+		// post-install. Install unconditionally so the path works even
+		// when the initial `get_display_info` below failed / had no plug-in.
+		xsysc->info.refresh_display_processors = refresh_display_processors_cb;
+
 		// Vendor-neutral display-info population through the plug-in
 		// iface (issue #256 / ADR-019). Runs FIRST regardless of whether
 		// the active plug-in is leia-sr or sim-display — the
@@ -252,26 +310,10 @@ out:
 					xsysc->info.recommended_view_scale_y = min_scale_y;
 				}
 
-				// Per-API DP factories from the iface.
-				if (plugin->create_dp_vk != NULL) {
-					xsysc->info.dp_factory_vk = (void *)plugin->create_dp_vk;
-				}
-#ifdef XRT_OS_WINDOWS
-				if (plugin->create_dp_d3d11 != NULL) {
-					xsysc->info.dp_factory_d3d11 = (void *)plugin->create_dp_d3d11;
-				}
-				if (plugin->create_dp_d3d12 != NULL) {
-					xsysc->info.dp_factory_d3d12 = (void *)plugin->create_dp_d3d12;
-				}
-#endif
-				if (plugin->create_dp_gl != NULL) {
-					xsysc->info.dp_factory_gl = (void *)plugin->create_dp_gl;
-				}
-#ifdef __APPLE__
-				if (plugin->create_dp_metal != NULL) {
-					xsysc->info.dp_factory_metal = (void *)plugin->create_dp_metal;
-				}
-#endif
+				// Per-API DP factories from the iface — factored into
+				// a helper so the refresh callback below uses the same
+				// per-platform mask. See @ref fill_dp_factories_from_plugin.
+				fill_dp_factories_from_plugin(&xsysc->info, plugin);
 
 				U_LOG_W("XR_EXT_display_info (iface=%s): display=%.4f x %.4f m, "
 				        "nominal=(%.4f, %.4f, %.4f) m, scale=%.4f x %.4f, "

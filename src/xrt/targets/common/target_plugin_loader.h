@@ -75,6 +75,32 @@ target_plugin_get_active(void);
 struct xrt_plugin_instance *
 target_plugin_get_active_instance(void);
 
+/*!
+ * Re-enumerate the platform's discovery root and, if a STRICTLY-BETTER
+ * (lower ProbeOrder) plug-in than the currently active one is now
+ * registered (or no plug-in was active before), swap it in and return
+ * its iface. Otherwise returns the unchanged current iface.
+ *
+ * Concretely: addresses issue #342 — the service starts mid-install
+ * with only `sim-display` registered (ProbeOrder 200) and bakes its
+ * factory pointers into `xrt_system_compositor_info`; the vendor
+ * plug-in (e.g. `leia-sr` at ProbeOrder 50) registers a moment later.
+ * Service-mode compositors invoke
+ * `xrt_system_compositor_info::refresh_display_processors` at
+ * per-client compositor create, which calls this and then re-derives
+ * the factory pointers, so the first app launch picks up the better
+ * plug-in without a service restart.
+ *
+ * Thread-safety: mutex-guarded internally. Idempotent — repeated calls
+ * with no new registration are cheap (re-enumerate + skip every entry
+ * whose ProbeOrder is not strictly better than the active one). The
+ * previously-active plug-in's DLL is intentionally LEAKED on swap,
+ * consistent with the load path: the runtime never destroys a vtable
+ * the compositor might still hold pointers into.
+ */
+const struct xrt_plugin_iface *
+target_plugin_refresh_active(void);
+
 #ifdef __cplusplus
 }
 #endif

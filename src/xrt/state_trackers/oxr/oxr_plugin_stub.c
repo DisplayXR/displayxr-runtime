@@ -34,9 +34,10 @@
 _Static_assert(sizeof(XRT_PLUGIN_ENTRYPOINT_NAME) == sizeof("xrtPluginNegotiate"),
                "xrt_plugin: entry-point symbol name changed; coordinate with all plug-in builds");
 
-/* Current API version is the v1 line — bump deliberately, not by accident. */
-_Static_assert(XRT_PLUGIN_API_VERSION_CURRENT == XRT_PLUGIN_API_VERSION_1,
-               "xrt_plugin: API version current/v1 drift");
+/* Current API version is the v2 line (ADR-020 rules 1–3 landed) — bump
+ * deliberately, not by accident. */
+_Static_assert(XRT_PLUGIN_API_VERSION_CURRENT == XRT_PLUGIN_API_VERSION_2,
+               "xrt_plugin: API version current/v2 drift");
 
 /*
  * Host iface layout. struct_size must be the first field so plug-ins can

@@ -2923,7 +2923,8 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	// pointer may itself be garbage; leak the corrupt object on this path.
 	if (c->display_processor != NULL && !dp_vtable_looks_sane(c->display_processor)) {
 		U_LOG_E("VK display processor vtable corrupt after target creation — "
-		        "disabling DP (output will not be woven). Likely a driver "
+		        "disabling DP (output will not be woven). Likely a plug-in built "
+		        "against a different runtime ABI major (ADR-020), or a driver "
 		        "heap-reuse collision.");
 		c->display_processor = NULL;
 	}

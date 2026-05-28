@@ -348,27 +348,36 @@ manifest + binary, leaves the runtime alone.
 
 ## 6. Version negotiation
 
-`XRT_PLUGIN_API_VERSION_CURRENT` is defined in `xrt/xrt_plugin.h`. v1
-is the only released line.
+`XRT_PLUGIN_API_VERSION_CURRENT` is defined in `xrt/xrt_plugin.h`. As of
+runtime v1.6.0 the current major is `XRT_PLUGIN_API_VERSION_2`
+(ADR-020). v1 → v2 is the one-time break that introduced the
+`struct_size` header on the display-processor vtables; ABI-v1 plug-ins
+(≤ leia v1.0.5) are rejected by the loader and must be rebuilt against
+v2 headers.
 
 Both the runtime and the plug-in pass their own version through
-`xrtPluginNegotiate`. Either side can decline (return
-`XRT_ERROR_PROBER_NOT_SUPPORTED`) on a mismatch. The runtime logs the
-mismatch and skips to the next plug-in in the probe order.
+`xrtPluginNegotiate`. The runtime enforces a strict major match — a
+plug-in reporting any version other than the runtime's
+`XRT_PLUGIN_API_VERSION_CURRENT` is rejected at the loader (`ABI major
+mismatch — plugin_api=%u, runtime expects %u`) and discovery falls back
+to the next plug-in / `sim_display`. ADR-020 rule 3.
 
-**Forward-compat for vtable additions:** new methods on
-`xrt_plugin_iface` and new fields on `xrt_plugin_display_info` MUST be
-appended at the end. Plug-ins built against an older header report
-`struct_size = sizeof(struct xrt_plugin_iface)` at their compile time;
-the runtime guards each new vtable call on
+**Forward-compat for vtable additions within a major:** new methods on
+`xrt_plugin_iface`, the DP vtables (`xrt_display_processor`,
+`xrt_display_processor_<api>`), and new fields on
+`xrt_plugin_display_info` MUST be appended at the end. Plug-ins built
+against an older header report `struct_size = sizeof(struct …)` at
+their compile time; the runtime guards each new vtable call on
+`XRT_DP_HAS_SLOT(xdp, <new field>)` (DP vtables) or
 `iface->struct_size > offsetof(struct xrt_plugin_iface, <new field>)`
-before dereferencing. See `oxr_plugin_stub.c` for the structural
-asserts that enforce the append-only rule at compile time.
+(plug-in iface / display info) before dereferencing. See
+`oxr_plugin_stub.c` for the structural asserts that enforce the
+append-only rule at compile time.
 
-Versioned struct bumps (`XRT_PLUGIN_API_VERSION_2`) are reserved for
-non-additive changes (reordering, renaming, signature changes on
-existing fields). v1 commits to the field order documented in the
-header.
+Versioned struct bumps (the next would be `XRT_PLUGIN_API_VERSION_3`)
+are reserved for non-additive changes (reordering, renaming, signature
+changes on existing fields). v2 commits to the field order documented
+in the header.
 
 ---
 

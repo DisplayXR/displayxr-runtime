@@ -10566,6 +10566,15 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 {
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 
+	// #342 / ADR-020: re-derive dp_factory_* from the plug-in loader before
+	// any per-client DP-factory read in this function (and downstream
+	// `multi_compositor_ensure_output` calls). Picks up a vendor plug-in
+	// registered after the service started without requiring a service
+	// restart. NULL on builds without the loader hook.
+	if (sys->base.info.refresh_display_processors != NULL) {
+		sys->base.info.refresh_display_processors(&sys->base.info);
+	}
+
 	// Create per-client native compositor
 	struct d3d11_service_compositor *c = new d3d11_service_compositor();
 	std::memset(&c->base, 0, sizeof(c->base));

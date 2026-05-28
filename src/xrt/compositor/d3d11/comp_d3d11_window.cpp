@@ -995,10 +995,14 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		ofn.lpstrTitle = "Launch App in Workspace";
 		ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
 		if (GetOpenFileNameA(&ofn)) {
-			// Set workspace session env var and ensure XR_RUNTIME_JSON points to
-			// the dev build runtime (matching the running service).
+			// Set workspace session env var.
 			SetEnvironmentVariableA("DISPLAYXR_WORKSPACE_SESSION", "1");
-			if (getenv("XR_RUNTIME_JSON") == NULL) {
+			// #345 (ADR-020): only auto-resolve the sibling dev manifest onto
+			// child apps under an explicit dev opt-in (DISPLAYXR_DEV=1) and only
+			// when the launcher itself hasn't already chosen a runtime. In a
+			// normal install there is no build/Release/ tree; forcing a stale
+			// XR_RUNTIME_JSON there made child apps load the wrong runtime.
+			if (getenv("DISPLAYXR_DEV") != NULL && getenv("XR_RUNTIME_JSON") == NULL) {
 				// Use dev build manifest (has absolute path to DLL).
 				// Service is at _package/bin/, dev manifest is at build/Release/.
 				char module_dir[MAX_PATH] = {0};
