@@ -34,6 +34,10 @@
 
 #include "xrt/xrt_display_processor_d3d11.h"
 
+// D3D11.1 for ID3D11Device1::OpenSharedResource1 (NT-handle path required for
+// IDXGIKeyedMutex sync — used by xrSetSharedTextureSurround2DEXT, spec v6).
+#include <d3d11_1.h>
+
 #include "util/u_hud.h"
 #include <displayxr_mcp/mcp_capture.h>
 
@@ -145,6 +149,15 @@ struct comp_d3d11_compositor
 	//! the full contract.
 	struct u_surround_2d_handle surround_2d;
 
+	//! Opened surround texture (lazily allocated via OpenSharedResource1
+	//! the first time surround_2d.shared_handle is non-NULL). NULL when no
+	//! surround is registered, or when the open failed.
+	ID3D11Texture2D *surround_texture;
+	//! IDXGIKeyedMutex on surround_texture for cross-process sync (key 0
+	//! protocol: app writes between Acquire(0)/Release(0), runtime samples
+	//! between Acquire(0)/Release(0)).
+	IDXGIKeyedMutex *surround_mutex;
+
 	//! Generic D3D11 display processor (vendor-agnostic weaving).
 	struct xrt_display_processor_d3d11 *display_processor;
 
@@ -232,6 +245,17 @@ d3d11_comp(struct xrt_compositor *xc)
 {
 	return reinterpret_cast<struct comp_d3d11_compositor *>(xc);
 }
+
+// Spec v6 surround-2D helpers. Defined near the bottom of the file
+// alongside comp_d3d11_compositor_set_surround_2d, forward-declared here
+// because they're called from d3d11_compositor_layer_commit and
+// d3d11_compositor_destroy (both defined above the definitions).
+static void d3d11_release_surround(struct comp_d3d11_compositor *c);
+static void d3d11_blit_surround_strips(struct comp_d3d11_compositor *c,
+                                        ID3D11Texture2D *dst,
+                                        uint32_t dst_w, uint32_t dst_h,
+                                        int32_t cx, int32_t cy,
+                                        uint32_t cw, uint32_t ch);
 
 /*
  *
@@ -1325,6 +1349,16 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			    c->canvas.valid ? c->canvas.w : 0,
 			    c->canvas.valid ? c->canvas.h : 0);
 
+			// Spec v6 surround blit: fill non-canvas pixels of the shared
+			// texture from the app-supplied 2D surround texture (no-op if
+			// xrSetSharedTextureSurround2DEXT was never called).
+			d3d11_blit_surround_strips(
+			    c, c->shared_texture, dp_target_w, dp_target_h,
+			    c->canvas.valid ? c->canvas.x : 0,
+			    c->canvas.valid ? c->canvas.y : 0,
+			    c->canvas.valid ? c->canvas.w : dp_target_w,
+			    c->canvas.valid ? c->canvas.h : dp_target_h);
+
 			weaving_done = true;
 		}
 
@@ -1375,6 +1409,20 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		    c->canvas.valid ? c->canvas.y : 0,
 		    c->canvas.valid ? c->canvas.w : 0,
 		    c->canvas.valid ? c->canvas.h : 0);
+
+		// Spec v6 surround blit: fill non-canvas pixels of the DXGI back
+		// buffer from the app-supplied 2D surround texture. The downstream
+		// CopyResource/CopySubresourceRegion (line ~1500) propagates the
+		// composite into c->shared_texture for _texture-mode read-back.
+		ID3D11Texture2D *back_buffer_for_surround = static_cast<ID3D11Texture2D *>(
+		    comp_d3d11_target_get_back_buffer(c->target));
+		d3d11_blit_surround_strips(
+		    c, back_buffer_for_surround, target_width, target_height,
+		    c->canvas.valid ? c->canvas.x : 0,
+		    c->canvas.valid ? c->canvas.y : 0,
+		    c->canvas.valid ? c->canvas.w : target_width,
+		    c->canvas.valid ? c->canvas.h : target_height);
+
 		weaving_done = true;
 	}
 
@@ -1467,6 +1515,10 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 		c->shared_texture->Release();
 		c->shared_texture = nullptr;
 	}
+
+	// Spec v6: release the 2D surround texture + keyed mutex if registered.
+	d3d11_release_surround(c);
+	c->surround_2d = {};
 
 	// Destroy HUD
 	if (c->hud_texture != nullptr) {
@@ -1943,28 +1995,203 @@ comp_d3d11_compositor_set_output_rect(struct xrt_compositor *xc,
 	c->canvas.h = h;
 }
 
+// Release any cached surround resources. Idempotent; safe on a freshly
+// zeroed compositor. Used by set_surround_2d (re-register / clear) and
+// the destroy path.
+static void
+d3d11_release_surround(struct comp_d3d11_compositor *c)
+{
+	if (c->surround_mutex != nullptr) {
+		c->surround_mutex->Release();
+		c->surround_mutex = nullptr;
+	}
+	if (c->surround_texture != nullptr) {
+		c->surround_texture->Release();
+		c->surround_texture = nullptr;
+	}
+}
+
+// Blit non-canvas pixels of the surround texture into the dst texture
+// (typically c->shared_texture for _texture apps). Called after the DP
+// has weaved into dst's canvas sub-rect. Acquires the surround
+// KeyedMutex on key 0 around the copies.
+//
+// Strip layout:
+//
+//   +---------------------------------+
+//   |              TOP                |   (0, 0) -> (W, cy)
+//   +------+--------------------+-----+
+//   | LEFT |   <canvas-region>  | RGT |   LEFT  (0, cy) -> (cx, cy+ch)
+//   |      |    (untouched —    |     |   RIGHT (cx+cw, cy) -> (W, cy+ch)
+//   |      |     DP wrote here) |     |
+//   +------+--------------------+-----+
+//   |             BOTTOM              |   (0, cy+ch) -> (W, H)
+//   +---------------------------------+
+//
+// Skips any zero-area strip (canvas flush against an edge). Format
+// match between surround and dst is required for CopySubresourceRegion
+// to succeed — logs a warning and skips the blit on mismatch.
+static void
+d3d11_blit_surround_strips(struct comp_d3d11_compositor *c,
+                            ID3D11Texture2D *dst,
+                            uint32_t dst_w, uint32_t dst_h,
+                            int32_t cx, int32_t cy,
+                            uint32_t cw, uint32_t ch)
+{
+	if (!c->surround_2d.valid || c->surround_texture == nullptr || c->surround_mutex == nullptr) {
+		return;
+	}
+	if (dst == nullptr) {
+		return;
+	}
+
+	// Dimensional contract — surround texture must match the dst the DP
+	// wrote into. The OutputRect canvas may live inside this rect.
+	if (c->surround_2d.w != dst_w || c->surround_2d.h != dst_h) {
+		static bool dims_logged = false;
+		if (!dims_logged) {
+			U_LOG_W("D3D11 surround 2D: dim mismatch — surround %ux%u, target %ux%u. "
+			        "Surround blit skipped. Re-register surround on window resize.",
+			        c->surround_2d.w, c->surround_2d.h, dst_w, dst_h);
+			dims_logged = true;
+		}
+		return;
+	}
+
+	// Format compatibility for CopySubresourceRegion — require equality
+	// for v6. Cross-format (UNORM <-> UNORM_SRGB) would need a shader
+	// blit; deferred to a follow-up if a real workload asks.
+	D3D11_TEXTURE2D_DESC src_desc, dst_desc;
+	c->surround_texture->GetDesc(&src_desc);
+	dst->GetDesc(&dst_desc);
+	if (src_desc.Format != dst_desc.Format) {
+		static bool fmt_logged = false;
+		if (!fmt_logged) {
+			U_LOG_W("D3D11 surround 2D: format mismatch — surround=%u, target=%u. "
+			        "Surround blit skipped. v6 requires matching DXGI formats; "
+			        "cross-format SRGB<->UNORM blit not yet supported.",
+			        src_desc.Format, dst_desc.Format);
+			fmt_logged = true;
+		}
+		return;
+	}
+
+	// Acquire surround for read. Short timeout — if the app's writer is
+	// stuck, we'd rather skip a frame than block presentation.
+	HRESULT hr = c->surround_mutex->AcquireSync(0, 16);
+	if (FAILED(hr)) {
+		// WAIT_TIMEOUT or WAIT_ABANDONED — skip this frame's surround.
+		// Pixels stay as whatever the last successful blit left.
+		return;
+	}
+
+	// Clamp canvas to dst bounds in case the app submitted a degenerate rect.
+	uint32_t cx_u = (cx < 0) ? 0u : (uint32_t)cx;
+	uint32_t cy_u = (cy < 0) ? 0u : (uint32_t)cy;
+	if (cx_u > dst_w) cx_u = dst_w;
+	if (cy_u > dst_h) cy_u = dst_h;
+	uint32_t cright  = (cx_u + cw > dst_w) ? dst_w : cx_u + cw;
+	uint32_t cbottom = (cy_u + ch > dst_h) ? dst_h : cy_u + ch;
+
+	// Top strip: full width, y in [0, cy_u).
+	if (cy_u > 0) {
+		D3D11_BOX box = {0, 0, 0, dst_w, cy_u, 1};
+		c->context->CopySubresourceRegion(dst, 0, 0, 0, 0, c->surround_texture, 0, &box);
+	}
+	// Bottom strip: full width, y in [cbottom, dst_h).
+	if (cbottom < dst_h) {
+		D3D11_BOX box = {0, cbottom, 0, dst_w, dst_h, 1};
+		c->context->CopySubresourceRegion(dst, 0, 0, cbottom, 0, c->surround_texture, 0, &box);
+	}
+	// Left strip: x in [0, cx_u), y in [cy_u, cbottom).
+	if (cx_u > 0 && cbottom > cy_u) {
+		D3D11_BOX box = {0, cy_u, 0, cx_u, cbottom, 1};
+		c->context->CopySubresourceRegion(dst, 0, 0, cy_u, 0, c->surround_texture, 0, &box);
+	}
+	// Right strip: x in [cright, dst_w), y in [cy_u, cbottom).
+	if (cright < dst_w && cbottom > cy_u) {
+		D3D11_BOX box = {cright, cy_u, 0, dst_w, cbottom, 1};
+		c->context->CopySubresourceRegion(dst, 0, cright, cy_u, 0, c->surround_texture, 0, &box);
+	}
+
+	c->surround_mutex->ReleaseSync(0);
+}
+
 extern "C" void
 comp_d3d11_compositor_set_surround_2d(struct xrt_compositor *xc,
                                        void *shared_handle,
                                        uint32_t w, uint32_t h)
 {
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+
+	// Release previous registration (no-op on first call). This also covers
+	// the NULL-handle clear path — caller passes NULL, we release and zero
+	// the struct.
+	d3d11_release_surround(c);
+
 	if (shared_handle == nullptr) {
-		// Clear — falls back to undefined non-canvas pixels.
-		// Phase C TODO: release the opened ID3D11Texture2D + KeyedMutex here.
 		c->surround_2d = {};
 		U_LOG_IFL_I(U_LOGGING_INFO, "D3D11 surround 2D cleared");
 		return;
 	}
+
+	// Open the NT shared handle. The OpenSharedResource1 path (vs legacy
+	// OpenSharedResource) is required by spec v6 because we need
+	// IDXGIKeyedMutex on the resource. Cast to ID3D11Device1 — D3D11 native
+	// compositor always creates a D3D11.1+ device.
+	ID3D11Device1 *device1 = nullptr;
+	HRESULT hr = c->device->QueryInterface(__uuidof(ID3D11Device1),
+	                                        reinterpret_cast<void **>(&device1));
+	if (FAILED(hr) || device1 == nullptr) {
+		U_LOG_E("D3D11 surround 2D: device does not implement ID3D11Device1 (hr=0x%08x)", hr);
+		c->surround_2d = {};
+		return;
+	}
+
+	HANDLE h = static_cast<HANDLE>(shared_handle);
+	hr = device1->OpenSharedResource1(h, __uuidof(ID3D11Texture2D),
+	                                   reinterpret_cast<void **>(&c->surround_texture));
+	device1->Release();
+	device1 = nullptr;
+	if (FAILED(hr) || c->surround_texture == nullptr) {
+		U_LOG_E("D3D11 surround 2D: OpenSharedResource1 failed for handle=%p (hr=0x%08x). "
+		        "Ensure the texture was created with D3D11_RESOURCE_MISC_SHARED_NTHANDLE | "
+		        "D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.", shared_handle, hr);
+		c->surround_2d = {};
+		c->surround_texture = nullptr;
+		return;
+	}
+
+	// Validate dims against the app's promise (the spec requires it equal
+	// the HWND client area, but we can only check that the registration
+	// dims match the texture's own dims here — the HWND match is enforced
+	// at frame time when we compare against c->shared_texture's dims).
+	D3D11_TEXTURE2D_DESC sd;
+	c->surround_texture->GetDesc(&sd);
+	if (sd.Width != w || sd.Height != h) {
+		U_LOG_E("D3D11 surround 2D: registration dims (%ux%u) do not match opened "
+		        "texture dims (%ux%u)", w, h, sd.Width, sd.Height);
+		d3d11_release_surround(c);
+		c->surround_2d = {};
+		return;
+	}
+
+	hr = c->surround_texture->QueryInterface(__uuidof(IDXGIKeyedMutex),
+	                                          reinterpret_cast<void **>(&c->surround_mutex));
+	if (FAILED(hr) || c->surround_mutex == nullptr) {
+		U_LOG_E("D3D11 surround 2D: opened texture has no IDXGIKeyedMutex "
+		        "(hr=0x%08x). Required for cross-process sync.", hr);
+		d3d11_release_surround(c);
+		c->surround_2d = {};
+		return;
+	}
+
 	c->surround_2d.valid = true;
 	c->surround_2d.shared_handle = shared_handle;
 	c->surround_2d.w = w;
 	c->surround_2d.h = h;
-	// Phase C TODO: ID3D11Device::OpenSharedResource1 here, cache the
-	// ID3D11Texture2D* + IDXGIKeyedMutex* + UNORM/SRGB SRVs on the
-	// compositor for the per-frame surround blit pass to consume.
-	U_LOG_IFL_I(U_LOGGING_INFO, "D3D11 surround 2D registered: handle=%p %ux%u (open + blit pending Phase C)",
-	            shared_handle, w, h);
+	U_LOG_IFL_I(U_LOGGING_INFO, "D3D11 surround 2D registered: handle=%p %ux%u format=%u",
+	            shared_handle, w, h, sd.Format);
 }
 
 extern "C" bool
