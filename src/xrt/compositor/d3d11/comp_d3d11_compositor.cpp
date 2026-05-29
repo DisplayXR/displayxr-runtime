@@ -2148,8 +2148,11 @@ comp_d3d11_compositor_set_surround_2d(struct xrt_compositor *xc,
 		return;
 	}
 
-	HANDLE h = static_cast<HANDLE>(shared_handle);
-	hr = device1->OpenSharedResource1(h, __uuidof(ID3D11Texture2D),
+	// Name the local 'nt_handle' (not 'h') to avoid shadowing the
+	// formal parameter 'h' (the height) — MSVC's stricter parameter
+	// scoping flagged this; clang/gcc let it slide.
+	HANDLE nt_handle = static_cast<HANDLE>(shared_handle);
+	hr = device1->OpenSharedResource1(nt_handle, __uuidof(ID3D11Texture2D),
 	                                   reinterpret_cast<void **>(&c->surround_texture));
 	device1->Release();
 	device1 = nullptr;
