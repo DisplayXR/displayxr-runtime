@@ -963,6 +963,18 @@ XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetSharedTextureSurround2DEXT(XrSession session,
                                      void *sharedTextureHandle,
                                      uint32_t width, uint32_t height);
+
+//! OpenXR API function @ep{xrSetSharedTextureSurround2DFenceEXT}
+//! Spec v7 addition: D3D12 variant of surround registration using an
+//! ID3D12Fence (shared NT handle) for producer→consumer sync, since
+//! IDXGIKeyedMutex is not reliably available on D3D12-native shared
+//! resources. Called per-frame to update the await fence value.
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetSharedTextureSurround2DFenceEXT(XrSession session,
+                                          void *sharedTextureHandle,
+                                          uint32_t width, uint32_t height,
+                                          void *sharedFenceHandle,
+                                          uint64_t awaitFenceValue);
 #endif
 
 /*!

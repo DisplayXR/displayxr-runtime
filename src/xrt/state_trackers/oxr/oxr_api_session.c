@@ -1616,4 +1616,33 @@ oxr_xrSetSharedTextureSurround2DEXT(XrSession session,
 	                 "Surround 2D not supported for this compositor");
 }
 
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetSharedTextureSurround2DFenceEXT(XrSession session,
+                                          void *sharedTextureHandle,
+                                          uint32_t width, uint32_t height,
+                                          void *sharedFenceHandle,
+                                          uint64_t awaitFenceValue)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetSharedTextureSurround2DFenceEXT");
+
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+	if (sess->is_d3d12_native_compositor && sess->xcn != NULL) {
+		comp_d3d12_compositor_set_surround_2d_fence(&sess->xcn->base,
+		                                              sharedTextureHandle, width, height,
+		                                              sharedFenceHandle, awaitFenceValue);
+		return XR_SUCCESS;
+	}
+#endif
+
+	// Fence-based surround is D3D12-only by design — D3D11 has KeyedMutex,
+	// Metal has IOSurface lock primitives. Apps on other backends should call
+	// xrSetSharedTextureSurround2DEXT instead.
+	return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+	                 "Surround 2D fence path only supported on D3D12 native compositor");
+}
+
 #endif // OXR_HAVE_EXT_display_info
