@@ -170,10 +170,19 @@ struct comp_d3d12_compositor
 	//! Canvas output rect for shared-texture apps.
 	struct u_canvas_rect canvas;
 
-	//! 2D surround texture handle (Spec v6). Phase C/D: open via
-	//! ID3D12Device::OpenSharedHandle on first use, cache resource +
-	//! KeyedMutex for the per-frame surround blit pass.
+	//! 2D surround texture handle (Spec v6).
 	struct u_surround_2d_handle surround_2d;
+
+	//! Opened surround resource (ID3D12Device::OpenSharedHandle on first
+	//! valid set_surround_2d). NULL when no surround is registered or open
+	//! failed. State after open is D3D12_RESOURCE_STATE_COMMON; we
+	//! transition COMMON <-> COPY_SOURCE around the per-frame strip blit
+	//! and leave it in COMMON at the boundaries.
+	ID3D12Resource *surround_texture;
+	//! IDXGIKeyedMutex on surround_texture for cross-process sync (key 0
+	//! protocol: app writes between Acquire(0)/Release(0), runtime samples
+	//! between Acquire(0)/Release(0)).
+	IDXGIKeyedMutex *surround_mutex;
 
 	//! Lazily allocated intermediate resource for cropping atlas to content dims.
 	ID3D12Resource *dp_input_resource;
@@ -222,6 +231,20 @@ d3d12_comp(struct xrt_compositor *xc)
 {
 	return reinterpret_cast<struct comp_d3d12_compositor *>(xc);
 }
+
+// Spec v6 surround-2D helpers. Defined near the bottom of the file
+// alongside comp_d3d12_compositor_set_surround_2d; forward-declared here
+// because they're called from d3d12_compositor_layer_commit and
+// d3d12_compositor_destroy (defined above the definitions). Matches the
+// file's existing helper-before-use pattern for d3d12_crop_atlas_for_dp.
+static void d3d12_release_surround(struct comp_d3d12_compositor *c);
+static void d3d12_blit_surround_strips(struct comp_d3d12_compositor *c,
+                                        ID3D12Resource *dst,
+                                        D3D12_RESOURCE_STATES dst_pre_state,
+                                        D3D12_RESOURCE_STATES dst_post_state,
+                                        uint32_t dst_w, uint32_t dst_h,
+                                        int32_t cx, int32_t cy,
+                                        uint32_t cw, uint32_t ch);
 
 /*!
  * Wait for GPU to finish all submitted work.
@@ -1445,6 +1468,18 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 			c->cmd_list->ResourceBarrier(2, barriers);
 
+			// Spec v6 surround blit: fill non-canvas pixels of the shared
+			// texture from the app-supplied 2D surround texture. dst is in
+			// COMMON (just transitioned above); leave it in COMMON after.
+			d3d12_blit_surround_strips(
+			    c, c->shared_texture,
+			    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON,
+			    dp_target_w, dp_target_h,
+			    c->canvas.valid ? c->canvas.x : 0,
+			    c->canvas.valid ? c->canvas.y : 0,
+			    c->canvas.valid ? c->canvas.w : dp_target_w,
+			    c->canvas.valid ? c->canvas.h : dp_target_h);
+
 		} else if (atlas_resource != nullptr) {
 			// No DP: raw copy atlas to shared texture (2D mode fallback)
 			D3D12_RESOURCE_BARRIER barriers[2] = {};
@@ -1618,6 +1653,20 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			    c->canvas.valid ? c->canvas.w : 0,
 			    c->canvas.valid ? c->canvas.h : 0);
 
+			// Spec v6 surround blit: fill non-canvas pixels of the back
+			// buffer from the app-supplied 2D surround texture. Back
+			// buffer is still in RENDER_TARGET from the DP; leave it
+			// in RENDER_TARGET so HUD's existing RT→COPY_DEST transition
+			// (below) proceeds unchanged.
+			d3d12_blit_surround_strips(
+			    c, back_buffer,
+			    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET,
+			    tgt_width, tgt_height,
+			    c->canvas.valid ? c->canvas.x : 0,
+			    c->canvas.valid ? c->canvas.y : 0,
+			    c->canvas.valid ? c->canvas.w : tgt_width,
+			    c->canvas.valid ? c->canvas.h : tgt_height);
+
 			// Transition atlas back: COMMON → PIXEL_SHADER_RESOURCE
 			atlas_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
 			atlas_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -1788,6 +1837,10 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 		c->shared_texture_rtv_heap->Release();
 		c->shared_texture_rtv_heap = nullptr;
 	}
+
+	// Spec v6: release the 2D surround texture + keyed mutex if registered.
+	d3d12_release_surround(c);
+	c->surround_2d = {};
 
 	if (c->shared_texture != nullptr) {
 		c->shared_texture->Release();
@@ -2324,6 +2377,193 @@ comp_d3d12_compositor_set_output_rect(struct xrt_compositor *xc,
 	c->canvas = rect;
 }
 
+// Release any cached surround resources. Idempotent; safe on a freshly
+// zeroed compositor. Used by set_surround_2d (re-register / clear) and
+// the destroy path.
+static void
+d3d12_release_surround(struct comp_d3d12_compositor *c)
+{
+	if (c->surround_mutex != nullptr) {
+		c->surround_mutex->Release();
+		c->surround_mutex = nullptr;
+	}
+	if (c->surround_texture != nullptr) {
+		c->surround_texture->Release();
+		c->surround_texture = nullptr;
+	}
+}
+
+// Record a CopyTextureRegion for one strip from surround->dst.
+// Skips zero-area strips. Caller has already verified format match,
+// surround_texture is in COPY_SOURCE state, and dst is in COPY_DEST state.
+static void
+d3d12_record_surround_strip(ID3D12GraphicsCommandList *cmd_list,
+                             ID3D12Resource *dst, ID3D12Resource *src,
+                             uint32_t dst_x, uint32_t dst_y,
+                             uint32_t src_x, uint32_t src_y,
+                             uint32_t w, uint32_t h)
+{
+	if (w == 0 || h == 0) return;
+
+	D3D12_TEXTURE_COPY_LOCATION dst_loc = {};
+	dst_loc.pResource = dst;
+	dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	dst_loc.SubresourceIndex = 0;
+
+	D3D12_TEXTURE_COPY_LOCATION src_loc = {};
+	src_loc.pResource = src;
+	src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	src_loc.SubresourceIndex = 0;
+
+	D3D12_BOX src_box = {};
+	src_box.left = src_x;
+	src_box.top = src_y;
+	src_box.front = 0;
+	src_box.right = src_x + w;
+	src_box.bottom = src_y + h;
+	src_box.back = 1;
+
+	cmd_list->CopyTextureRegion(&dst_loc, dst_x, dst_y, 0, &src_loc, &src_box);
+}
+
+// Blit non-canvas pixels of the surround texture into the dst resource.
+// Records barriers + 4× CopyTextureRegion + barriers into c->cmd_list,
+// bracketed by AcquireSync(0)/ReleaseSync(0) on the surround keyed mutex.
+//
+// Caller-supplied dst_pre_state/dst_post_state lets us drop the helper
+// into either the shared-texture path (COMMON before, COMMON after) or
+// the window-DP path (RENDER_TARGET before, RENDER_TARGET after — HUD's
+// existing transition handles the move to COPY_DEST).
+//
+// Surround texture is assumed to be in COMMON state at entry — that's
+// the cross-process-shared invariant: both sides leave it in COMMON
+// before ReleaseSync, so the next AcquireSync sees it ready for
+// transition.
+//
+// Strip layout matches the D3D11 helper. Skips any zero-area strip
+// (canvas flush against an edge). Format mismatch logs once and skips
+// the entire blit (no barriers / no mutex AcquireSync) — caller's
+// command list is unaffected.
+static void
+d3d12_blit_surround_strips(struct comp_d3d12_compositor *c,
+                            ID3D12Resource *dst,
+                            D3D12_RESOURCE_STATES dst_pre_state,
+                            D3D12_RESOURCE_STATES dst_post_state,
+                            uint32_t dst_w, uint32_t dst_h,
+                            int32_t cx, int32_t cy,
+                            uint32_t cw, uint32_t ch)
+{
+	if (!c->surround_2d.valid || c->surround_texture == nullptr || c->surround_mutex == nullptr) {
+		return;
+	}
+	if (dst == nullptr) {
+		return;
+	}
+
+	if (c->surround_2d.w != dst_w || c->surround_2d.h != dst_h) {
+		static bool dims_logged = false;
+		if (!dims_logged) {
+			U_LOG_W("D3D12 surround 2D: dim mismatch — surround %ux%u, target %ux%u. "
+			        "Surround blit skipped. Re-register surround on window resize.",
+			        c->surround_2d.w, c->surround_2d.h, dst_w, dst_h);
+			dims_logged = true;
+		}
+		return;
+	}
+
+	D3D12_RESOURCE_DESC src_desc = c->surround_texture->GetDesc();
+	D3D12_RESOURCE_DESC dst_desc = dst->GetDesc();
+	if (src_desc.Format != dst_desc.Format) {
+		static bool fmt_logged = false;
+		if (!fmt_logged) {
+			U_LOG_W("D3D12 surround 2D: format mismatch — surround=%u, target=%u. "
+			        "Surround blit skipped. v6 requires matching DXGI formats; "
+			        "cross-format SRGB<->UNORM blit not yet supported.",
+			        (unsigned)src_desc.Format, (unsigned)dst_desc.Format);
+			fmt_logged = true;
+		}
+		return;
+	}
+
+	HRESULT hr = c->surround_mutex->AcquireSync(0, 16);
+	if (FAILED(hr)) {
+		// Timeout / abandoned — skip this frame.
+		return;
+	}
+
+	// Clamp canvas to dst bounds in case the app submitted a degenerate rect.
+	uint32_t cx_u = (cx < 0) ? 0u : (uint32_t)cx;
+	uint32_t cy_u = (cy < 0) ? 0u : (uint32_t)cy;
+	if (cx_u > dst_w) cx_u = dst_w;
+	if (cy_u > dst_h) cy_u = dst_h;
+	uint32_t cright  = (cx_u + cw > dst_w) ? dst_w : cx_u + cw;
+	uint32_t cbottom = (cy_u + ch > dst_h) ? dst_h : cy_u + ch;
+
+	// Enter copy state.
+	D3D12_RESOURCE_BARRIER enter[2] = {};
+	enter[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	enter[0].Transition.pResource = dst;
+	enter[0].Transition.StateBefore = dst_pre_state;
+	enter[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+	enter[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+	enter[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	enter[1].Transition.pResource = c->surround_texture;
+	enter[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+	enter[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	enter[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+	// If pre-state already equals COPY_DEST, skip the dst transition by
+	// collapsing the surround barrier into slot 0.
+	uint32_t num_enter = (dst_pre_state == D3D12_RESOURCE_STATE_COPY_DEST) ? 1 : 2;
+	if (num_enter == 1) {
+		enter[0] = enter[1];
+	}
+	c->cmd_list->ResourceBarrier(num_enter, enter);
+
+	// Strips. Source and dest coords match (1:1 blit by spec).
+	// Top strip: y in [0, cy_u).
+	d3d12_record_surround_strip(c->cmd_list, dst, c->surround_texture,
+	                             0, 0, 0, 0, dst_w, cy_u);
+	// Bottom strip: y in [cbottom, dst_h).
+	if (cbottom < dst_h) {
+		d3d12_record_surround_strip(c->cmd_list, dst, c->surround_texture,
+		                             0, cbottom, 0, cbottom, dst_w, dst_h - cbottom);
+	}
+	// Left strip: x in [0, cx_u), y in [cy_u, cbottom).
+	if (cx_u > 0 && cbottom > cy_u) {
+		d3d12_record_surround_strip(c->cmd_list, dst, c->surround_texture,
+		                             0, cy_u, 0, cy_u, cx_u, cbottom - cy_u);
+	}
+	// Right strip: x in [cright, dst_w), y in [cy_u, cbottom).
+	if (cright < dst_w && cbottom > cy_u) {
+		d3d12_record_surround_strip(c->cmd_list, dst, c->surround_texture,
+		                             cright, cy_u, cright, cy_u, dst_w - cright, cbottom - cy_u);
+	}
+
+	// Exit copy state.
+	D3D12_RESOURCE_BARRIER exit[2] = {};
+	exit[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	exit[0].Transition.pResource = dst;
+	exit[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+	exit[0].Transition.StateAfter = dst_post_state;
+	exit[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+	exit[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	exit[1].Transition.pResource = c->surround_texture;
+	exit[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	exit[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+	exit[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+	uint32_t num_exit = (dst_post_state == D3D12_RESOURCE_STATE_COPY_DEST) ? 1 : 2;
+	if (num_exit == 1) {
+		exit[0] = exit[1];
+	}
+	c->cmd_list->ResourceBarrier(num_exit, exit);
+
+	c->surround_mutex->ReleaseSync(0);
+}
+
 extern "C" void
 comp_d3d12_compositor_set_surround_2d(struct xrt_compositor *xc,
                                        void *shared_handle,
@@ -2331,17 +2571,62 @@ comp_d3d12_compositor_set_surround_2d(struct xrt_compositor *xc,
 {
 	if (xc == nullptr) return;
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);
+
+	// Release previous registration (no-op on first call). Also covers
+	// the NULL-handle clear path.
+	d3d12_release_surround(c);
+
 	if (shared_handle == nullptr) {
-		// Phase D TODO: release the opened ID3D12Resource + KeyedMutex here.
 		c->surround_2d = {};
 		U_LOG_IFL_I(U_LOGGING_INFO, "D3D12 surround 2D cleared");
 		return;
 	}
+
+	// D3D12::OpenSharedHandle handles NT handles natively (no "1" suffix
+	// like D3D11). Spec v6 requires the source texture be created with
+	// D3D11_RESOURCE_MISC_SHARED_NTHANDLE | _SHARED_KEYEDMUTEX (or D3D12
+	// equivalents) so the IDXGIKeyedMutex QueryInterface succeeds below.
+	HANDLE h = static_cast<HANDLE>(shared_handle);
+	HRESULT hr = c->device->OpenSharedHandle(h, __uuidof(ID3D12Resource),
+	                                          reinterpret_cast<void **>(&c->surround_texture));
+	if (FAILED(hr) || c->surround_texture == nullptr) {
+		U_LOG_E("D3D12 surround 2D: OpenSharedHandle failed for handle=%p (hr=0x%08x). "
+		        "Ensure the texture was created with NT-handle + keyed-mutex sharing.",
+		        shared_handle, hr);
+		c->surround_2d = {};
+		c->surround_texture = nullptr;
+		return;
+	}
+
+	// Validate dims against the app's promise. The HWND-equality check
+	// happens at frame time when we compare against c->shared_texture's
+	// (or back buffer's) dims.
+	D3D12_RESOURCE_DESC sd = c->surround_texture->GetDesc();
+	if (sd.Width != w || sd.Height != h) {
+		U_LOG_E("D3D12 surround 2D: registration dims (%ux%u) do not match opened "
+		        "texture dims (%llux%u)", w, h,
+		        (unsigned long long)sd.Width, (unsigned)sd.Height);
+		d3d12_release_surround(c);
+		c->surround_2d = {};
+		return;
+	}
+
+	hr = c->surround_texture->QueryInterface(__uuidof(IDXGIKeyedMutex),
+	                                          reinterpret_cast<void **>(&c->surround_mutex));
+	if (FAILED(hr) || c->surround_mutex == nullptr) {
+		U_LOG_E("D3D12 surround 2D: opened texture has no IDXGIKeyedMutex "
+		        "(hr=0x%08x). Required for cross-process sync.", hr);
+		d3d12_release_surround(c);
+		c->surround_2d = {};
+		return;
+	}
+
 	c->surround_2d.valid = true;
 	c->surround_2d.shared_handle = shared_handle;
 	c->surround_2d.w = w;
 	c->surround_2d.h = h;
-	// Phase D TODO: ID3D12Device::OpenSharedHandle + cache for blit.
-	U_LOG_IFL_I(U_LOGGING_INFO, "D3D12 surround 2D registered: handle=%p %ux%u (open + blit pending Phase D)",
-	            shared_handle, w, h);
+	U_LOG_IFL_I(U_LOGGING_INFO, "D3D12 surround 2D registered: handle=%p %llux%u format=%u",
+	            shared_handle,
+	            (unsigned long long)sd.Width, (unsigned)sd.Height,
+	            (unsigned)sd.Format);
 }
