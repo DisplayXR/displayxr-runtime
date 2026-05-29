@@ -2586,8 +2586,11 @@ comp_d3d12_compositor_set_surround_2d(struct xrt_compositor *xc,
 	// like D3D11). Spec v6 requires the source texture be created with
 	// D3D11_RESOURCE_MISC_SHARED_NTHANDLE | _SHARED_KEYEDMUTEX (or D3D12
 	// equivalents) so the IDXGIKeyedMutex QueryInterface succeeds below.
-	HANDLE h = static_cast<HANDLE>(shared_handle);
-	HRESULT hr = c->device->OpenSharedHandle(h, __uuidof(ID3D12Resource),
+	// Name the local 'nt_handle' (not 'h') to avoid shadowing the
+	// formal parameter 'h' (the height) — MSVC's stricter parameter
+	// scoping flagged this; clang/gcc let it slide.
+	HANDLE nt_handle = static_cast<HANDLE>(shared_handle);
+	HRESULT hr = c->device->OpenSharedHandle(nt_handle, __uuidof(ID3D12Resource),
 	                                          reinterpret_cast<void **>(&c->surround_texture));
 	if (FAILED(hr) || c->surround_texture == nullptr) {
 		U_LOG_E("D3D12 surround 2D: OpenSharedHandle failed for handle=%p (hr=0x%08x). "
