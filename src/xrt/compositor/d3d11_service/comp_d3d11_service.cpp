@@ -11259,6 +11259,16 @@ comp_d3d11_service_get_predicted_eye_positions(struct xrt_system_compositor *xsy
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 
+	// #363: hold render_mutex across the DP pointer read AND the call into the
+	// DP. compositor_destroy holds render_mutex through its entire teardown
+	// (unregister -> null active_compositor -> fini_client_render_resources,
+	// which frees render.display_processor). Without this lock an IPC client
+	// thread could latch `dp` here, the teardown thread frees it, and the call
+	// below derefs freed memory — the use-after-free seen on last-client
+	// (total->0) churn. render_mutex is recursive, so callers that already
+	// hold it (multi_compositor_render, capture_frame) are unaffected.
+	std::lock_guard<std::recursive_mutex> render_lock(sys->render_mutex);
+
 	// Caching now lives inside the DP itself (vendor-internal, populated
 	// by SR's EyePairStream listener). This is just a thin pass-through.
 	// Get display processor for eye position prediction.
@@ -11437,6 +11447,12 @@ comp_d3d11_service_get_display_dimensions(struct xrt_system_compositor *xsysc,
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 
+	// #363: hold render_mutex across the DP pointer read AND the call into the
+	// DP, to serialize with compositor_destroy's full teardown (which frees
+	// render.display_processor). Same read-then-use-after-unlock UAF as
+	// get_predicted_eye_positions. render_mutex is recursive.
+	std::lock_guard<std::recursive_mutex> render_lock(sys->render_mutex);
+
 	// Try to get display dimensions from display processor.
 	// In workspace mode, use multi-comp's DP; in normal mode, use active compositor's DP.
 	struct xrt_display_processor_d3d11 *dp = nullptr;
@@ -11479,6 +11495,12 @@ comp_d3d11_service_get_window_metrics(struct xrt_system_compositor *xsysc,
 	}
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+
+	// #363: hold render_mutex across the DP pointer read AND every call into
+	// the DP below, to serialize with compositor_destroy's full teardown
+	// (which frees render.display_processor). Same read-then-use-after-unlock
+	// UAF as get_predicted_eye_positions. render_mutex is recursive.
+	std::lock_guard<std::recursive_mutex> render_lock(sys->render_mutex);
 
 	// In workspace mode, use multi-comp's window and DP.
 	// In normal mode, use the active compositor's.
