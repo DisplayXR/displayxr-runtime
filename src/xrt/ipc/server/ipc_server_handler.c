@@ -3861,7 +3861,7 @@ ipc_handle_swapchain_acquire_image(volatile struct ipc_client_state *ics, uint32
 	}
 
 	xrt_result_t xret = xrt_swapchain_acquire_image(xsc, out_index);
-	U_LOG_W("[#151] ipc server acquire_image: sc_id=%u xret=%d out_index=%u",
+	U_LOG_D("[#151] ipc server acquire_image: sc_id=%u xret=%d out_index=%u",
 	        sc_index, (int)xret, *out_index);
 
 	return XRT_SUCCESS;

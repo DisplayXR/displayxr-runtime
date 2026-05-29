@@ -3016,7 +3016,7 @@ swapchain_acquire_image(struct xrt_swapchain *xsc, uint32_t *out_index)
 	*out_index = next_index % sc->image_count;
 	next_index++;
 
-	U_LOG_W("[#151] d3d11_service swapchain_acquire_image: index=%u image_count=%u "
+	U_LOG_D("[#151] d3d11_service swapchain_acquire_image: index=%u image_count=%u "
 	        "(w=%u h=%u format=%lld bits=0x%x service_created=%d)",
 	        *out_index, sc->image_count, sc->info.width, sc->info.height,
 	        (long long)sc->info.format, (unsigned)sc->info.bits, (int)sc->service_created);
@@ -9493,14 +9493,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		static uint32_t proj_log_count = 0;
 		if (proj_log_count == 0 || proj_log_count % 60 == 0) {
 			for (uint32_t eye = 0; eye < proj_view_count; eye++) {
-				U_LOG_W("Projection layer %u view %u/%u: rect=(%d,%d %dx%d) array=%u fmt=%u(srgb=%d)",
+				U_LOG_D("Projection layer %u view %u/%u: rect=(%d,%d %dx%d) array=%u fmt=%u(srgb=%d)",
 				        i, eye, proj_view_count,
 				        layer->data.proj.v[eye].sub.rect.offset.w, layer->data.proj.v[eye].sub.rect.offset.h,
 				        layer->data.proj.v[eye].sub.rect.extent.w, layer->data.proj.v[eye].sub.rect.extent.h,
 				        layer->data.proj.v[eye].sub.array_index,
 				        view_descs[eye].Format, view_is_srgb[eye]);
 			}
-			U_LOG_W("  atlas_texture=%ux%u, view_width=%u, view_height=%u",
+			U_LOG_D("  atlas_texture=%ux%u, view_width=%u, view_height=%u",
 			        sys->display_width, sys->display_height, sys->view_width, sys->view_height);
 		}
 		proj_log_count++;
@@ -11290,7 +11290,7 @@ comp_d3d11_service_get_predicted_eye_positions(struct xrt_system_compositor *xsy
 			static int log_counter = 0;
 			if (++log_counter >= 60) {
 				log_counter = 0;
-				U_LOG_W("IPC eye positions (from display processor): L=(%.3f,%.3f,%.3f) R=(%.3f,%.3f,%.3f)",
+				U_LOG_D("IPC eye positions (from display processor): L=(%.3f,%.3f,%.3f) R=(%.3f,%.3f,%.3f)",
 				        out_left->x, out_left->y, out_left->z,
 				        out_right->x, out_right->y, out_right->z);
 			}
