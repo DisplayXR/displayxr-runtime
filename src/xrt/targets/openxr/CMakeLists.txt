@@ -176,8 +176,17 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
 	if("${CMAKE_VERSION}" VERSION_GREATER_EQUAL 3.21)
 		# This generator expression is easier to control than install(RUNTIME_DEPENDENCY_SETS),
 		# which is prone to trying to distribute system DLLs.
+		#
+		# Exclude vulkan-1.dll: the runtime delay-loads it, so it shows up here,
+		# but shipping our own copy next to DisplayXRClient.dll creates a SECOND
+		# Vulkan loader in the app process (the app's VkInstance is built by the
+		# system loader, the runtime resolves vkEnumeratePhysicalDevices from our
+		# local copy → mismatched ICD/terminator state → NVIDIA ICD null-deref).
+		# The installed runtime dir must rely on the system vulkan-1.dll. The NSIS
+		# installer already excludes it; this filter closes the same gap for the
+		# _package/ tree used by local dev deploys. See issue #105.
 		install(
-			FILES $<TARGET_RUNTIME_DLLS:${RUNTIME_TARGET}>
+			FILES $<FILTER:$<TARGET_RUNTIME_DLLS:${RUNTIME_TARGET}>,EXCLUDE,vulkan-1\\.dll>
 			DESTINATION ${CMAKE_INSTALL_BINDIR}
 			COMPONENT Runtime
 			)
