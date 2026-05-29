@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_spatial_workspace 1
-#define XR_EXT_spatial_workspace_SPEC_VERSION 19
+#define XR_EXT_spatial_workspace_SPEC_VERSION 20
 #define XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_EXT_spatial_workspace"
 
 // Provisional XrStructureType values. The 1000999100..109 range is reserved for
@@ -432,6 +432,8 @@ typedef struct XrWorkspaceInputEventEXT {
         } pointerMotion;
         struct {  // spec_version 6: vsync-aligned compositor frame tick
             uint64_t                timestampNs;     // host monotonic ns at frame compose
+            XrVector3f              viewerPosInDisplaySpace; // spec_version 20: viewer eye-midpoint, display space (m)
+            XrBool32                viewerTracked;   // spec_version 20: 1 if viewerPos is populated this frame
         } frameTick;
         struct {  // spec_version 6: workspace focused-client transition
             XrWorkspaceClientId     prevClientId;

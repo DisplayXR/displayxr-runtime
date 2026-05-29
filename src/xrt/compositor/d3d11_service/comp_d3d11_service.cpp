@@ -1107,6 +1107,13 @@ struct d3d11_multi_compositor
 	volatile LONG frame_tick_count;
 	LONG frame_tick_last_emitted;
 	uint64_t frame_tick_last_ns;
+	//! spec_version 20: viewer eye-midpoint (display space, meters), cached once
+	//! per displayed frame on the render thread and copied into the FRAME_TICK
+	//! event so the workspace controller can billboard windows toward the live
+	//! (head-tracked) viewer. Plain floats: written render-side, read drain-side;
+	//! a torn read just yields a 1-frame-stale viewer, which is harmless.
+	float frame_tick_viewer_x, frame_tick_viewer_y, frame_tick_viewer_z;
+	volatile LONG frame_tick_viewer_valid;
 
 	//! Window dismissed by user (ESC).
 	bool window_dismissed;
@@ -8546,6 +8553,20 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		comp_d3d11_window_signal_paint_done(mc->window);
 	}
 
+	// spec_version 20: cache the live viewer eye-midpoint for the FRAME_TICK
+	// event (head-tracked billboarding in the controller). On the render thread
+	// here, so the display processor is stable — same call the cursor path makes
+	// above. Falls back silently (valid stays as last) if no DP is available.
+	{
+		struct xrt_vec3 vl, vr;
+		if (comp_d3d11_service_get_predicted_eye_positions(&sys->base, &vl, &vr)) {
+			mc->frame_tick_viewer_x = 0.5f * (vl.x + vr.x);
+			mc->frame_tick_viewer_y = 0.5f * (vl.y + vr.y);
+			mc->frame_tick_viewer_z = 0.5f * (vl.z + vr.z);
+			mc->frame_tick_viewer_valid = 1;
+		}
+	}
+
 	// Phase 2.K: bump the frame-tick counter once per displayed frame so the
 	// public-API drain can emit FRAME_TICK events to the workspace controller
 	// without polling. The drain reads the counter delta and synthesises one
@@ -12649,6 +12670,11 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 			ev->event_type = IPC_WORKSPACE_INPUT_EVENT_FRAME_TICK;
 			ev->timestamp_ms = (uint32_t)GetTickCount();
 			ev->u.frame_tick.timestamp_ns = now_ns;
+			// spec_version 20: live viewer eye-midpoint for billboarding.
+			ev->u.frame_tick.viewer_x = mc->frame_tick_viewer_x;
+			ev->u.frame_tick.viewer_y = mc->frame_tick_viewer_y;
+			ev->u.frame_tick.viewer_z = mc->frame_tick_viewer_z;
+			ev->u.frame_tick.viewer_valid = (uint32_t)mc->frame_tick_viewer_valid;
 			out_batch->count++;
 			missed--;
 		}

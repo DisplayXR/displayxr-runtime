@@ -449,6 +449,10 @@ struct ipc_workspace_input_event
 		struct                      //!< spec_version 6: vsync-aligned frame tick
 		{
 			uint64_t timestamp_ns;
+			float    viewer_x;     //!< spec_version 20: viewer eye-midpoint, display space (m)
+			float    viewer_y;
+			float    viewer_z;
+			uint32_t viewer_valid; //!< 1 if viewer_* is populated, 0 otherwise
 		} frame_tick;
 		struct                      //!< spec_version 6: focused-client transition
 		{

@@ -632,6 +632,11 @@ comp_ipc_client_compositor_workspace_enumerate_input_events(struct xrt_composito
 			break;
 		case IPC_WORKSPACE_INPUT_EVENT_FRAME_TICK:
 			out->frameTick.timestampNs = src->u.frame_tick.timestamp_ns;
+			// spec_version 20: live viewer eye-midpoint for billboarding.
+			out->frameTick.viewerPosInDisplaySpace.x = src->u.frame_tick.viewer_x;
+			out->frameTick.viewerPosInDisplaySpace.y = src->u.frame_tick.viewer_y;
+			out->frameTick.viewerPosInDisplaySpace.z = src->u.frame_tick.viewer_z;
+			out->frameTick.viewerTracked = (XrBool32)src->u.frame_tick.viewer_valid;
 			break;
 		case IPC_WORKSPACE_INPUT_EVENT_FOCUS_CHANGED:
 			out->focusChanged.prevClientId =
