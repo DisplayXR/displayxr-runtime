@@ -771,10 +771,19 @@ Section "DisplayXR Runtime" SecRuntime
 		nsExec::ExecToLog 'schtasks /delete /tn "DisplayXR Service" /f'
 		Pop $0
 
-		; Register in HKLM Run key (starts in user session with GPU/tray access)
+		; Register in HKLM Run key (starts in user session with GPU/tray access).
+		; This section runs in the 64-bit view (SetRegView 64 at section start).
 		DetailPrint "Registering DisplayXR Service for auto-start..."
 		WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Run" \
 			"DisplayXR Service" "$\"$INSTDIR\displayxr-service.exe$\""
+		; Drop any stale 32-bit (WOW6432Node) Run entry from an interim installer
+		; that wrote it before this section used SetRegView 64. Windows fires both
+		; views at logon, so a leftover 32-bit copy double-launches the service.
+		; Doing this on install (not just uninstall) fixes affected machines on a
+		; plain upgrade, without requiring a full uninstall/reinstall.
+		SetRegView 32
+		DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "DisplayXR Service"
+		SetRegView 64
 
 		; Start the service immediately so it's available without relogon
 		DetailPrint "Starting DisplayXR Service..."
@@ -821,6 +830,15 @@ Section "Uninstall"
 	DetailPrint "Stopping DisplayXR Service before cascade..."
 	nsExec::ExecToLog 'taskkill /f /im displayxr-service.exe'
 	DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "DisplayXR Service"
+	; Also clear the stale 32-bit (WOW6432Node) Run entry left by interim
+	; installers that wrote it before this section moved to SetRegView 64.
+	; Windows fires BOTH the 64-bit and 32-bit Run views at logon, so an
+	; orphaned 32-bit copy double-launches the service (the second instance
+	; bails on the single-instance pipe guard, but it's noise). Clean both
+	; views, then restore the 64-bit view for the rest of the section.
+	SetRegView 32
+	DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "DisplayXR Service"
+	SetRegView 64
 	nsExec::ExecToLog 'schtasks /delete /tn "DisplayXR Service" /f'
 
 	; -----------------------------------------------------------------
