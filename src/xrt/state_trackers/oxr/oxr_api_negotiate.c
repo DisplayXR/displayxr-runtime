@@ -483,6 +483,7 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 #ifdef OXR_HAVE_EXT_win32_window_binding
 	ENTRY_IF_EXT(xrSetSharedTextureOutputRectEXT, EXT_win32_window_binding);
 	ENTRY_IF_EXT(xrSetSharedTextureSurround2DEXT, EXT_win32_window_binding);
+	ENTRY_IF_EXT(xrSetSharedTextureSurround2DFenceEXT, EXT_win32_window_binding);
 #endif
 #ifdef OXR_HAVE_EXT_cocoa_window_binding
 	ENTRY_IF_EXT(xrSetSharedTextureOutputRectEXT, EXT_cocoa_window_binding);

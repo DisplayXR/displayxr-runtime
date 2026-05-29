@@ -117,6 +117,12 @@ struct XrSessionManager {
     // Canvas sub-rect (XR_EXT_win32_window_binding / XR_EXT_cocoa_window_binding)
     PFN_xrSetSharedTextureOutputRectEXT pfnSetSharedTextureOutputRectEXT = nullptr;
 
+    // Full-window 2D surround texture (XR_EXT_win32_window_binding spec v6 §3.6)
+    PFN_xrSetSharedTextureSurround2DEXT pfnSetSharedTextureSurround2DEXT = nullptr;
+
+    // Full-window 2D surround texture, fence sync (spec v7 §3.7) — D3D12 only
+    PFN_xrSetSharedTextureSurround2DFenceEXT pfnSetSharedTextureSurround2DFenceEXT = nullptr;
+
     // Environment blend modes advertised by the runtime. Populated at session
     // create time via xrEnumerateEnvironmentBlendModes. Used to pick the
     // correct mode for xrEndFrame: ALPHA_BLEND when transparent_bg is desired

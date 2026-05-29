@@ -181,8 +181,17 @@ struct comp_d3d12_compositor
 	ID3D12Resource *surround_texture;
 	//! IDXGIKeyedMutex on surround_texture for cross-process sync (key 0
 	//! protocol: app writes between Acquire(0)/Release(0), runtime samples
-	//! between Acquire(0)/Release(0)).
+	//! between Acquire(0)/Release(0)). NULL in the spec-v7 fence path.
 	IDXGIKeyedMutex *surround_mutex;
+
+	//! Spec v7 fence-sync state. Mutually exclusive with surround_mutex:
+	//! when surround_fence is non-NULL we use commandQueue->Wait(fence, value)
+	//! instead of AcquireSync(0). The handles below mirror what the app
+	//! registered so subsequent calls with the same handles skip re-opens.
+	ID3D12Fence *surround_fence;
+	void *surround_fence_cached_handle;
+	void *surround_texture_cached_handle;
+	uint64_t surround_await_fence_value;
 
 	//! Lazily allocated intermediate resource for cropping atlas to content dims.
 	ID3D12Resource *dp_input_resource;
@@ -2379,7 +2388,8 @@ comp_d3d12_compositor_set_output_rect(struct xrt_compositor *xc,
 
 // Release any cached surround resources. Idempotent; safe on a freshly
 // zeroed compositor. Used by set_surround_2d (re-register / clear) and
-// the destroy path.
+// the destroy path. Releases both keyed-mutex (spec v6) and fence (spec
+// v7) state regardless of which path the app was using.
 static void
 d3d12_release_surround(struct comp_d3d12_compositor *c)
 {
@@ -2387,6 +2397,13 @@ d3d12_release_surround(struct comp_d3d12_compositor *c)
 		c->surround_mutex->Release();
 		c->surround_mutex = nullptr;
 	}
+	if (c->surround_fence != nullptr) {
+		c->surround_fence->Release();
+		c->surround_fence = nullptr;
+	}
+	c->surround_fence_cached_handle = nullptr;
+	c->surround_texture_cached_handle = nullptr;
+	c->surround_await_fence_value = 0;
 	if (c->surround_texture != nullptr) {
 		c->surround_texture->Release();
 		c->surround_texture = nullptr;
@@ -2453,7 +2470,11 @@ d3d12_blit_surround_strips(struct comp_d3d12_compositor *c,
                             int32_t cx, int32_t cy,
                             uint32_t cw, uint32_t ch)
 {
-	if (!c->surround_2d.valid || c->surround_texture == nullptr || c->surround_mutex == nullptr) {
+	if (!c->surround_2d.valid || c->surround_texture == nullptr) {
+		return;
+	}
+	const bool use_fence = (c->surround_fence != nullptr);
+	if (!use_fence && c->surround_mutex == nullptr) {
 		return;
 	}
 	if (dst == nullptr) {
@@ -2485,10 +2506,29 @@ d3d12_blit_surround_strips(struct comp_d3d12_compositor *c,
 		return;
 	}
 
-	HRESULT hr = c->surround_mutex->AcquireSync(0, 16);
-	if (FAILED(hr)) {
-		// Timeout / abandoned — skip this frame.
-		return;
+	if (use_fence) {
+		// Spec v7: queue a wait on our command queue. The wait gates the
+		// next ExecuteCommandLists (the caller's submission of c->cmd_list
+		// happens later) on the app's Signal(fence, await_value). Read-only
+		// access — no Release counterpart is needed.
+		HRESULT hr = c->command_queue->Wait(c->surround_fence, c->surround_await_fence_value);
+		if (FAILED(hr)) {
+			static bool wait_logged = false;
+			if (!wait_logged) {
+				U_LOG_W("D3D12 surround 2D: queue->Wait(fence=%p, value=%llu) failed (hr=0x%08x). "
+				        "Surround blit skipped.",
+				        c->surround_fence,
+				        (unsigned long long)c->surround_await_fence_value, hr);
+				wait_logged = true;
+			}
+			return;
+		}
+	} else {
+		HRESULT hr = c->surround_mutex->AcquireSync(0, 16);
+		if (FAILED(hr)) {
+			// Timeout / abandoned — skip this frame.
+			return;
+		}
 	}
 
 	// Clamp canvas to dst bounds in case the app submitted a degenerate rect.
@@ -2561,7 +2601,11 @@ d3d12_blit_surround_strips(struct comp_d3d12_compositor *c,
 	}
 	c->cmd_list->ResourceBarrier(num_exit, exit);
 
-	c->surround_mutex->ReleaseSync(0);
+	if (!use_fence) {
+		c->surround_mutex->ReleaseSync(0);
+	}
+	// Fence path: read-only, no signal-back. The app guarantees the
+	// texture is stable until it bumps the fence on the next frame.
 }
 
 extern "C" void
@@ -2628,8 +2672,111 @@ comp_d3d12_compositor_set_surround_2d(struct xrt_compositor *xc,
 	c->surround_2d.shared_handle = shared_handle;
 	c->surround_2d.w = w;
 	c->surround_2d.h = h;
+	c->surround_texture_cached_handle = shared_handle;
 	U_LOG_IFL_I(U_LOGGING_INFO, "D3D12 surround 2D registered: handle=%p %llux%u format=%u",
 	            shared_handle,
 	            (unsigned long long)sd.Width, (unsigned)sd.Height,
 	            (unsigned)sd.Format);
+}
+
+extern "C" void
+comp_d3d12_compositor_set_surround_2d_fence(struct xrt_compositor *xc,
+                                              void *shared_texture_handle,
+                                              uint32_t w, uint32_t h,
+                                              void *shared_fence_handle,
+                                              uint64_t await_fence_value)
+{
+	if (xc == nullptr) return;
+	struct comp_d3d12_compositor *c = d3d12_comp(xc);
+
+	// NULL handle = clear (matches the spec v6 fn).
+	if (shared_texture_handle == nullptr) {
+		d3d12_release_surround(c);
+		c->surround_2d = {};
+		U_LOG_IFL_I(U_LOGGING_INFO, "D3D12 surround 2D (fence path) cleared");
+		return;
+	}
+
+	if (shared_fence_handle == nullptr) {
+		U_LOG_E("D3D12 surround 2D (fence path): shared_fence_handle is NULL "
+		        "but shared_texture_handle is non-NULL — fence handle is required.");
+		return;
+	}
+
+	// Hot path: same handles as last registration. Just update the await
+	// fence value. This is the steady-state per-frame call.
+	if (c->surround_texture != nullptr &&
+	    c->surround_texture_cached_handle == shared_texture_handle &&
+	    c->surround_fence != nullptr &&
+	    c->surround_fence_cached_handle == shared_fence_handle) {
+
+		// Spec v7 §3.7: awaitFenceValue must be strictly monotonic in
+		// steady-state. The very first non-zero value is accepted from any
+		// prior state. We log + ignore (don't queue a backwards wait) but
+		// don't return XR_ERROR_VALIDATION_FAILURE from the deeper layer —
+		// the state tracker doesn't surface compositor errors today.
+		if (await_fence_value < c->surround_await_fence_value) {
+			static bool nonmono_logged = false;
+			if (!nonmono_logged) {
+				U_LOG_W("D3D12 surround 2D (fence path): non-monotonic await value "
+				        "%llu < cached %llu — ignoring this frame.",
+				        (unsigned long long)await_fence_value,
+				        (unsigned long long)c->surround_await_fence_value);
+				nonmono_logged = true;
+			}
+			return;
+		}
+		c->surround_await_fence_value = await_fence_value;
+		return;
+	}
+
+	// Cold path: first registration, or handles changed. Reopen both and
+	// re-validate. Clears any prior spec-v6 keyed-mutex registration too.
+	d3d12_release_surround(c);
+	c->surround_2d = {};
+
+	HANDLE tex_nt = static_cast<HANDLE>(shared_texture_handle);
+	HRESULT hr = c->device->OpenSharedHandle(tex_nt, __uuidof(ID3D12Resource),
+	                                          reinterpret_cast<void **>(&c->surround_texture));
+	if (FAILED(hr) || c->surround_texture == nullptr) {
+		U_LOG_E("D3D12 surround 2D (fence path): OpenSharedHandle(texture=%p) failed "
+		        "(hr=0x%08x).", shared_texture_handle, hr);
+		c->surround_texture = nullptr;
+		return;
+	}
+
+	D3D12_RESOURCE_DESC sd = c->surround_texture->GetDesc();
+	if (sd.Width != w || sd.Height != h) {
+		U_LOG_E("D3D12 surround 2D (fence path): registration dims (%ux%u) do not "
+		        "match opened texture dims (%llux%u)",
+		        w, h, (unsigned long long)sd.Width, (unsigned)sd.Height);
+		d3d12_release_surround(c);
+		return;
+	}
+
+	HANDLE fence_nt = static_cast<HANDLE>(shared_fence_handle);
+	hr = c->device->OpenSharedHandle(fence_nt, __uuidof(ID3D12Fence),
+	                                  reinterpret_cast<void **>(&c->surround_fence));
+	if (FAILED(hr) || c->surround_fence == nullptr) {
+		U_LOG_E("D3D12 surround 2D (fence path): OpenSharedHandle(fence=%p) failed "
+		        "(hr=0x%08x). Ensure the fence was created with shared NT handle.",
+		        shared_fence_handle, hr);
+		d3d12_release_surround(c);
+		return;
+	}
+
+	c->surround_2d.valid = true;
+	c->surround_2d.shared_handle = shared_texture_handle;
+	c->surround_2d.w = w;
+	c->surround_2d.h = h;
+	c->surround_texture_cached_handle = shared_texture_handle;
+	c->surround_fence_cached_handle = shared_fence_handle;
+	c->surround_await_fence_value = await_fence_value;
+	U_LOG_IFL_I(U_LOGGING_INFO,
+	            "D3D12 surround 2D (fence path) registered: tex=%p fence=%p %llux%u "
+	            "format=%u initial_await=%llu",
+	            shared_texture_handle, shared_fence_handle,
+	            (unsigned long long)sd.Width, (unsigned)sd.Height,
+	            (unsigned)sd.Format,
+	            (unsigned long long)await_fence_value);
 }

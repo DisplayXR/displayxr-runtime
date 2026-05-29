@@ -1,8 +1,8 @@
 # Surround 2D Rollout — `xrSetSharedTextureSurround2DEXT`
 
-**Status:** design + spec draft (2026-05-28). Pre-implementation.
+**Status:** D3D11 shipping; D3D12 fence path shipping (post spec-v7 bump on 2026-05-28).
 **Branch:** `feature/surround-2d-spec`.
-**Spec:** [`XR_EXT_win32_window_binding` §3.6](../specs/extensions/XR_EXT_win32_window_binding.md#36-xrsetsharedtexturesurround2dext), [`XR_EXT_cocoa_window_binding` §4](../specs/extensions/XR_EXT_cocoa_window_binding.md). Both bumped to spec version 6.
+**Spec:** Win32 [§3.6](../specs/extensions/XR_EXT_win32_window_binding.md#36-xrsetsharedtexturesurround2dext) (D3D11 keyed-mutex, v6) + [§3.7](../specs/extensions/XR_EXT_win32_window_binding.md#37-xrsetsharedtexturesurround2dfenceext) (D3D12 fence, v7); Cocoa [§4](../specs/extensions/XR_EXT_cocoa_window_binding.md) (IOSurface, v6). Win32 at spec version 7; Cocoa at 6.
 **Related:** [#224 local-3d-zones](../roadmap/local-3d-zones.md) (deliberately *not* the same path — see §6).
 
 ## TL;DR
@@ -52,18 +52,19 @@ End goal: ship the capability through Unity's plugin so Unity editors and runtim
 
 ### Phase E — Test-app updates
 
-- [ ] **`test_apps/cube_texture_d3d11_win/`**:
-  - In `xr_session.cpp`, after the existing `xrGetInstanceProcAddr("xrSetSharedTextureOutputRectEXT", ...)` line, add the analogous proc-address lookup for `xrSetSharedTextureSurround2DEXT` and stash the PFN.
-  - In `main.cpp` (or wherever the shared multiview texture is created), allocate a *second* D3D11 shared texture at HWND client dimensions with `D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX`, `DXGI_FORMAT_R8G8B8A8_UNORM_SRGB`.
-  - Per frame: render a deliberately-2D pattern into it — a colored gradient with crisp text overlay reading e.g. "FULL-RES 2D — `<window_w>×<window_h>`", a checkerboard at panel-pixel scale, and a thin border around the canvas hole. Acquire/release the KeyedMutex on key 0.
-  - Set the canvas rect to a centered ~60% sub-rect (simulating the fixed hardware 3D zone). The cube still weaves inside the canvas; the surround shows the 2D pattern.
-  - Bump the build version comment and add a HUD line indicating the surround texture is active.
-- [ ] **`test_apps/cube_texture_d3d12_win/`**: same pattern, D3D12 idioms.
+- [x] **`test_apps/cube_texture_d3d11_win/`** (commit pending on `feature/surround-2d-spec`):
+  - `xr_session.cpp` resolves `xrSetSharedTextureSurround2DEXT` next to `xrSetSharedTextureOutputRectEXT` and stashes it on `XrSessionManager::pfnSetSharedTextureSurround2DEXT` (lives in `test_apps/common/xr_session_common.h`).
+  - `main.cpp` allocates a second D3D11 NT-shared + keyed-mutex texture at the shared multiview texture's worst-case atlas dims (which the compositor requires for dim + format match — `DXGI_FORMAT_B8G8R8A8_UNORM`, not the spec's R8G8B8A8, because the compositor's `CopySubresourceRegion` enforces exact format equality with `c->shared_texture`). NT handle is obtained via `IDXGIResource1::CreateSharedHandle`.
+  - Per frame the app acquires keyed mutex key 0, renders a procedural pattern (gradient + 24-pixel checkerboard + red 4-pixel border just outside the canvas + slow diagonal sweep so motion is visible) over the current `(winW × winH)` region, releases key 0. Inside-canvas pixels are written black — never sampled.
+  - Canvas stays at the existing center-50% rect set in `BlitSharedTextureToBackBuffer` / `WM_SIZE`. The DP still weaves inside it; the surround fills the rest.
+  - `BlitSharedTextureToBackBuffer` gained a surround-aware branch: when registered, viewport widens to the full window and UV samples the `(0..winW, 0..winH)` region of the shared texture (so the strip pixels written by the compositor are visible); when surround is inactive, it falls back to the legacy canvas-only blit.
+  - HUD `modeText` adds a "Surround 2D: ACTIVE (spec v6)" / "inactive" line.
+- [x] **`test_apps/cube_texture_d3d12_win/`** (commit pending on `feature/surround-2d-spec`): same shape with D3D12 idioms. Surround texture is `D3D12_HEAP_FLAG_SHARED` + `D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET`; NT handle from `ID3D12Device::CreateSharedHandle`. **Uses the spec-v7 fence path** (`xrSetSharedTextureSurround2DFenceEXT`) — the v6 keyed-mutex contract does *not* work on D3D12-native shared resources because `IDXGIKeyedMutex` is `E_NOINTERFACE` on common drivers (verified 2026-05-28 on RTX 3080 / Win11 26200). Test app allocates a paired `ID3D12Fence` with `D3D12_FENCE_FLAG_SHARED`, exports it via `CreateSharedHandle`. Per frame: record surround pattern → `ExecuteCommandLists` → `commandQueue->Signal(fence, ++value)` → `xrSetSharedTextureSurround2DFenceEXT(...)` to push the new await value. Runtime compositor queue-waits on the fence before the strip blit. Same procedural shader + 12-DWORD root-constants param block as the D3D11 app.
 - [ ] (Optional, Phase F-late) `test_apps/cube_texture_metal_macos/`: mirror with IOSurface, gated on Metal compositor surround-blit support landing first.
 
 ### Phase F — Local validation
 
-- [ ] Build runtime + test apps locally on Windows (`scripts\build_windows.bat all`), run `cube_texture_d3d11_win` against the Leia SR plugin or sim_display. Expected visual: 3D cube weaves inside the centered canvas; outside, the 2D pattern is crisp at full panel res; no ghosting, no leakage across the boundary.
+- [x] Build runtime + test apps locally on Windows (`scripts\build_windows.bat all`), run `cube_texture_d3d11_win` against the Leia SR plugin. **Confirmed 2026-05-28**: cube weaves inside the centered canvas; checkerboard + gradient + red 4-pixel border fill the surround at full panel res; boundary is pixel-crisp with no leakage. App log shows `Created surround D3D11 texture: 3840x2160 format=87` and `Registered surround 2D texture with runtime (3840x2160)`.
 - [ ] Capture a compositor screenshot via `%TEMP%\workspace_screenshot_trigger` (path documented in `CLAUDE.md` § Capturing Compositor Screenshots) to inline-verify pixel-perfect canvas/surround boundary.
 - [ ] Run the MinGW compile-check on macOS (`./scripts/build-mingw-check.sh aux_util displayxr_mcp`) to catch any obvious Win32 platform-guard regressions before pushing.
 

@@ -160,6 +160,10 @@ bool InitializeOpenXR(XrSessionManager& xr) {
             (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
         xrGetInstanceProcAddr(xr.instance, "xrSetSharedTextureOutputRectEXT",
             (PFN_xrVoidFunction*)&xr.pfnSetSharedTextureOutputRectEXT);
+        xrGetInstanceProcAddr(xr.instance, "xrSetSharedTextureSurround2DEXT",
+            (PFN_xrVoidFunction*)&xr.pfnSetSharedTextureSurround2DEXT);
+        xrGetInstanceProcAddr(xr.instance, "xrSetSharedTextureSurround2DFenceEXT",
+            (PFN_xrVoidFunction*)&xr.pfnSetSharedTextureSurround2DFenceEXT);
     }
 
     // Get view configuration views

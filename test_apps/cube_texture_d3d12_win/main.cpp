@@ -73,6 +73,21 @@ static uint32_t g_sharedHeight = 0;
 static uint32_t g_canvasW = 0;
 static uint32_t g_canvasH = 0;
 
+// Surround 2D texture (spec v7 §3.7). Same dims + format as g_sharedTexture
+// because the D3D12 compositor strip-blit uses CopyTextureRegion and
+// enforces format equality. Uses an ID3D12Fence (shared NT handle) for
+// producer→consumer sync since IDXGIKeyedMutex is not reliably available
+// on D3D12-native shared resources (E_NOINTERFACE on common drivers).
+static ComPtr<ID3D12Resource> g_surroundTexture;
+static HANDLE g_surroundHandle = nullptr;
+static ComPtr<ID3D12Fence> g_surroundFence;
+static HANDLE g_surroundFenceHandle = nullptr;
+static uint64_t g_surroundFenceValue = 0;  // app-side monotonic counter
+static ComPtr<ID3D12DescriptorHeap> g_surroundRtvHeap;
+static ComPtr<ID3D12RootSignature> g_surroundRootSig;
+static ComPtr<ID3D12PipelineState> g_surroundPSO;
+static bool g_surroundRegistered = false;
+
 // App-side DXGI swapchain for window presentation
 static const UINT APP_BACK_BUFFER_COUNT = 2;
 static ComPtr<IDXGISwapChain3> g_appSwapchain;
@@ -325,6 +340,251 @@ static bool CreateBlitPipeline(ID3D12Device* device) {
     return true;
 }
 
+// ---- Surround 2D pipeline (spec v6 §3.6) ----
+
+// Identical procedural pattern to cube_texture_d3d11_win: gradient +
+// checkerboard everywhere outside the canvas, red highlight on the canvas
+// border, slow diagonal sweep. Inside the canvas it writes black — the
+// compositor copy doesn't read those pixels (the canvas region is the DP's
+// weave), so the value is cosmetic only.
+static const char* g_surroundPSSource = R"(
+cbuffer SurroundParams : register(b0) {
+    float2 windowSize;
+    float2 _pad0;
+    int4   canvas;
+    float  time;
+    float3 _pad1;
+};
+float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    float2 p = pos.xy;
+    if (p.x >= windowSize.x || p.y >= windowSize.y) {
+        return float4(0, 0, 0, 1);
+    }
+    float bx0 = (float)canvas.x;
+    float by0 = (float)canvas.y;
+    float bx1 = (float)(canvas.x + canvas.z);
+    float by1 = (float)(canvas.y + canvas.w);
+    float dx = max(bx0 - p.x, p.x - bx1);
+    float dy = max(by0 - p.y, p.y - by1);
+    float d  = max(dx, dy);
+    if (d <= 0) {
+        return float4(0, 0, 0, 1);
+    }
+    if (d <= 4.0) {
+        return float4(1.0, 0.25, 0.25, 1.0);
+    }
+    int2 cell = int2(p / 24.0);
+    bool light = ((cell.x + cell.y) & 1) == 0;
+    float3 base = light ? float3(0.82, 0.84, 0.92) : float3(0.50, 0.55, 0.80);
+    float2 g = saturate(p / windowSize);
+    base.r += g.x * 0.18;
+    base.g += g.y * 0.10;
+    base.b += (1.0 - g.x) * 0.10;
+    float sweep = frac((p.x + p.y) / 256.0 - time * 0.10);
+    base += (smoothstep(0.45, 0.5, sweep) - smoothstep(0.5, 0.55, sweep)) * 0.10;
+    return float4(saturate(base), 1.0);
+}
+)";
+
+static bool CreateSurroundPipeline(ID3D12Device* device) {
+    // Root signature: one root-constants param (12 × uint32 = 48 bytes).
+    D3D12_ROOT_PARAMETER param = {};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    param.Constants.ShaderRegister = 0;
+    param.Constants.RegisterSpace = 0;
+    param.Constants.Num32BitValues = 12;
+    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_ROOT_SIGNATURE_DESC rsDesc = {};
+    rsDesc.NumParameters = 1;
+    rsDesc.pParameters = &param;
+    rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+    ComPtr<ID3DBlob> serialized, error;
+    HRESULT hr = D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+        &serialized, &error);
+    if (FAILED(hr)) {
+        LOG_ERROR("Surround root signature serialize failed: %s",
+            error ? (char*)error->GetBufferPointer() : "unknown");
+        return false;
+    }
+    hr = device->CreateRootSignature(0, serialized->GetBufferPointer(),
+        serialized->GetBufferSize(), IID_PPV_ARGS(&g_surroundRootSig));
+    if (FAILED(hr)) return false;
+
+    // Reuse the blit fullscreen-triangle VS.
+    ComPtr<ID3DBlob> vsBlob, psBlob, errBlob;
+    hr = D3DCompile(g_blitVSSource, strlen(g_blitVSSource), "blitVS",
+        nullptr, nullptr, "main", "vs_5_0", 0, 0, &vsBlob, &errBlob);
+    if (FAILED(hr)) {
+        LOG_ERROR("Surround VS compile failed: %s",
+            errBlob ? (char*)errBlob->GetBufferPointer() : "unknown");
+        return false;
+    }
+    hr = D3DCompile(g_surroundPSSource, strlen(g_surroundPSSource), "surroundPS",
+        nullptr, nullptr, "main", "ps_5_0", 0, 0, &psBlob, &errBlob);
+    if (FAILED(hr)) {
+        LOG_ERROR("Surround PS compile failed: %s",
+            errBlob ? (char*)errBlob->GetBufferPointer() : "unknown");
+        return false;
+    }
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
+    psoDesc.pRootSignature = g_surroundRootSig.Get();
+    psoDesc.VS = {vsBlob->GetBufferPointer(), vsBlob->GetBufferSize()};
+    psoDesc.PS = {psBlob->GetBufferPointer(), psBlob->GetBufferSize()};
+    psoDesc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    psoDesc.SampleMask = UINT_MAX;
+    psoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    psoDesc.NumRenderTargets = 1;
+    psoDesc.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+    psoDesc.SampleDesc.Count = 1;
+
+    hr = device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&g_surroundPSO));
+    if (FAILED(hr)) {
+        LOG_ERROR("Surround PSO creation failed: 0x%08X", hr);
+        return false;
+    }
+
+    // One RTV for the surround texture.
+    D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
+    rtvHeapDesc.NumDescriptors = 1;
+    rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    hr = device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&g_surroundRtvHeap));
+    return SUCCEEDED(hr);
+}
+
+// Creates the surround texture (D3D12_HEAP_FLAG_SHARED, no KeyedMutex needed)
+// AND a paired shared ID3D12Fence (D3D12_FENCE_FLAG_SHARED). Both NT handles
+// are exported via ID3D12Device::CreateSharedHandle. The fence drives the
+// runtime's `commandQueue->Wait` before its strip-blit each frame.
+static bool CreateSurroundTextureD3D12(ID3D12Device* device,
+                                        uint32_t width, uint32_t height,
+                                        DXGI_FORMAT format) {
+    D3D12_HEAP_PROPERTIES heapProps = {};
+    heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC texDesc = {};
+    texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texDesc.Width = width;
+    texDesc.Height = height;
+    texDesc.DepthOrArraySize = 1;
+    texDesc.MipLevels = 1;
+    texDesc.Format = format;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    texDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    HRESULT hr = device->CreateCommittedResource(
+        &heapProps, D3D12_HEAP_FLAG_SHARED, &texDesc,
+        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_surroundTexture));
+    if (FAILED(hr)) {
+        LOG_ERROR("Surround texture create failed: 0x%08x", hr);
+        return false;
+    }
+
+    hr = device->CreateSharedHandle(g_surroundTexture.Get(), nullptr, GENERIC_ALL,
+        nullptr, &g_surroundHandle);
+    if (FAILED(hr)) {
+        LOG_ERROR("Surround texture CreateSharedHandle failed: 0x%08x", hr);
+        g_surroundTexture.Reset();
+        return false;
+    }
+
+    hr = device->CreateFence(0,
+        D3D12_FENCE_FLAG_SHARED,
+        IID_PPV_ARGS(&g_surroundFence));
+    if (FAILED(hr)) {
+        LOG_ERROR("Surround fence create failed: 0x%08x", hr);
+        CloseHandle(g_surroundHandle);
+        g_surroundHandle = nullptr;
+        g_surroundTexture.Reset();
+        return false;
+    }
+
+    hr = device->CreateSharedHandle(g_surroundFence.Get(), nullptr, GENERIC_ALL,
+        nullptr, &g_surroundFenceHandle);
+    if (FAILED(hr)) {
+        LOG_ERROR("Surround fence CreateSharedHandle failed: 0x%08x", hr);
+        g_surroundFence.Reset();
+        CloseHandle(g_surroundHandle);
+        g_surroundHandle = nullptr;
+        g_surroundTexture.Reset();
+        return false;
+    }
+
+    D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+    rtvDesc.Format = format;
+    rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    device->CreateRenderTargetView(g_surroundTexture.Get(), &rtvDesc,
+        g_surroundRtvHeap->GetCPUDescriptorHandleForHeapStart());
+
+    LOG_INFO("Created surround D3D12 texture: %ux%u format=%u tex_handle=%p fence_handle=%p",
+        width, height, (unsigned)format, g_surroundHandle, g_surroundFenceHandle);
+    return true;
+}
+
+// Record (into an already-Reset cmd list) the surround render pass: barrier
+// COMMON→RENDER_TARGET, fullscreen triangle, barrier back. Caller acquires
+// the keyed mutex on key 0 before this and releases after ExecuteCommandLists.
+static void RecordSurroundPattern(ID3D12GraphicsCommandList* cmdList,
+                                    uint32_t winW, uint32_t winH,
+                                    int32_t canvasX, int32_t canvasY,
+                                    uint32_t canvasW, uint32_t canvasH,
+                                    float timeSeconds) {
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = g_surroundTexture.Get();
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    cmdList->ResourceBarrier(1, &barrier);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_surroundRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    cmdList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+
+    D3D12_VIEWPORT vp = {};
+    vp.TopLeftX = 0.0f;
+    vp.TopLeftY = 0.0f;
+    vp.Width = (FLOAT)winW;
+    vp.Height = (FLOAT)winH;
+    vp.MaxDepth = 1.0f;
+    cmdList->RSSetViewports(1, &vp);
+
+    D3D12_RECT scissor = {0, 0, (LONG)winW, (LONG)winH};
+    cmdList->RSSetScissorRects(1, &scissor);
+
+    cmdList->SetPipelineState(g_surroundPSO.Get());
+    cmdList->SetGraphicsRootSignature(g_surroundRootSig.Get());
+
+    // Match the cbuffer SurroundParams layout (48 bytes, 12 × uint32).
+    struct ParamsLayout {
+        float windowSize[2];
+        float _pad0[2];
+        int32_t canvas[4];
+        float time;
+        float _pad1[3];
+    } params = {};
+    params.windowSize[0] = (float)winW;
+    params.windowSize[1] = (float)winH;
+    params.canvas[0] = canvasX;
+    params.canvas[1] = canvasY;
+    params.canvas[2] = (int32_t)canvasW;
+    params.canvas[3] = (int32_t)canvasH;
+    params.time = timeSeconds;
+    cmdList->SetGraphicsRoot32BitConstants(0, 12, &params, 0);
+
+    cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cmdList->DrawInstanced(3, 1, 0, 0);
+
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    cmdList->ResourceBarrier(1, &barrier);
+}
+
 static void CreateSharedTextureSRV(ID3D12Device* device) {
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
     srvDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -335,8 +595,14 @@ static void CreateSharedTextureSRV(ID3D12Device* device) {
         g_blitSrvHeap->GetCPUDescriptorHandleForHeapStart());
 }
 
-// Blit shared texture to back buffer with canvas letterboxing
-static void BlitSharedTextureToBackBuffer(D3D12Renderer& renderer, XrSessionManager& xr) {
+// Blit shared texture to back buffer with canvas letterboxing.
+// When the surround texture is registered, this also (1) records a per-frame
+// surround pattern render at the top of the cmd list (covered by a keyed
+// mutex on key 0) and (2) widens the blit viewport + UV range to read back
+// the full window region of the shared texture so the surround strips
+// (filled by the compositor at submit time) are visible in the window.
+static void BlitSharedTextureToBackBuffer(D3D12Renderer& renderer, XrSessionManager& xr,
+                                           float surroundTimeSeconds) {
     if (!g_sharedTexture || !g_appSwapchain) return;
 
     UINT bbIndex = g_appSwapchain->GetCurrentBackBufferIndex();
@@ -345,7 +611,37 @@ static void BlitSharedTextureToBackBuffer(D3D12Renderer& renderer, XrSessionMana
     g_blitCmdAllocator->Reset();
     g_blitCmdList->Reset(g_blitCmdAllocator.Get(), g_blitPSO.Get());
 
-    // Barriers: shared texture COMMON→SRV, back buffer PRESENT→RENDER_TARGET
+    // Canvas = center 50% of window
+    float canvasX = (FLOAT)g_windowWidth * 0.25f;
+    float canvasY = (FLOAT)g_windowHeight * 0.25f;
+    float canvasW = (FLOAT)g_windowWidth * 0.5f;
+    float canvasH = (FLOAT)g_windowHeight * 0.5f;
+
+    // Tell runtime where the canvas is. The compositor uses this to drive
+    // DP weave region + surround strip layout — call every frame.
+    if (xr.pfnSetSharedTextureOutputRectEXT && xr.session != XR_NULL_HANDLE) {
+        xr.pfnSetSharedTextureOutputRectEXT(xr.session,
+            (int32_t)canvasX, (int32_t)canvasY,
+            (uint32_t)canvasW, (uint32_t)canvasH);
+    }
+
+    // (1) Surround render — sync is fence-based (spec v7). We record the
+    // surround draw into the same cmd list as the blit; the GPU executes
+    // them in order. After ExecuteCommandLists below we Signal(fence, N)
+    // and tell the runtime to Wait(fence, N) via the OpenXR call. The
+    // runtime's own command queue will block on the next ExecuteCommandLists
+    // until our signal lands, so its strip-blit reads stable pixels.
+    bool surroundRecorded = false;
+    if (g_surroundRegistered && g_surroundFence && g_surroundPSO) {
+        RecordSurroundPattern(g_blitCmdList.Get(),
+            g_windowWidth, g_windowHeight,
+            (int32_t)canvasX, (int32_t)canvasY,
+            (uint32_t)canvasW, (uint32_t)canvasH,
+            surroundTimeSeconds);
+        surroundRecorded = true;
+    }
+
+    // (2) Blit setup — barriers, RTV, viewport.
     D3D12_RESOURCE_BARRIER barriers[2] = {};
     barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barriers[0].Transition.pResource = g_sharedTexture.Get();
@@ -361,49 +657,49 @@ static void BlitSharedTextureToBackBuffer(D3D12Renderer& renderer, XrSessionMana
 
     g_blitCmdList->ResourceBarrier(2, barriers);
 
-    // Clear back buffer to black
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = g_appRtvHeap->GetCPUDescriptorHandleForHeapStart();
     rtvHandle.ptr += bbIndex * g_appRtvDescriptorSize;
     float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     g_blitCmdList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
 
-    // Set render target
     g_blitCmdList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
-    // Canvas = center 50% of window
+    // Viewport + UV sampling: full-window when surround is active so the
+    // strip pixels become visible; canvas-only otherwise.
     D3D12_VIEWPORT vp = {};
-    vp.Width = (FLOAT)g_windowWidth * 0.5f;
-    vp.Height = (FLOAT)g_windowHeight * 0.5f;
-    vp.TopLeftX = (FLOAT)g_windowWidth * 0.25f;
-    vp.TopLeftY = (FLOAT)g_windowHeight * 0.25f;
+    float uvParams[4];
+    if (g_surroundRegistered) {
+        vp.TopLeftX = 0.0f;
+        vp.TopLeftY = 0.0f;
+        vp.Width = (FLOAT)g_windowWidth;
+        vp.Height = (FLOAT)g_windowHeight;
+        uvParams[0] = g_sharedWidth  > 0 ? (float)g_windowWidth  / (float)g_sharedWidth  : 1.0f;
+        uvParams[1] = g_sharedHeight > 0 ? (float)g_windowHeight / (float)g_sharedHeight : 1.0f;
+        uvParams[2] = 0.0f;
+        uvParams[3] = 0.0f;
+    } else {
+        vp.TopLeftX = canvasX;
+        vp.TopLeftY = canvasY;
+        vp.Width = canvasW;
+        vp.Height = canvasH;
+        uvParams[0] = g_sharedWidth  > 0 ? canvasW / (float)g_sharedWidth  : 1.0f;
+        uvParams[1] = g_sharedHeight > 0 ? canvasH / (float)g_sharedHeight : 1.0f;
+        uvParams[2] = g_sharedWidth  > 0 ? canvasX / (float)g_sharedWidth  : 0.0f;
+        uvParams[3] = g_sharedHeight > 0 ? canvasY / (float)g_sharedHeight : 0.0f;
+    }
     vp.MaxDepth = 1.0f;
     g_blitCmdList->RSSetViewports(1, &vp);
 
     D3D12_RECT scissor = {0, 0, (LONG)g_windowWidth, (LONG)g_windowHeight};
     g_blitCmdList->RSSetScissorRects(1, &scissor);
 
-    // Tell runtime where canvas is in the window (weaver alignment)
-    if (xr.pfnSetSharedTextureOutputRectEXT && xr.session != XR_NULL_HANDLE) {
-        xr.pfnSetSharedTextureOutputRectEXT(xr.session,
-            (int32_t)vp.TopLeftX, (int32_t)vp.TopLeftY,
-            (uint32_t)vp.Width, (uint32_t)vp.Height);
-    }
-
-    // Set blit pipeline
+    // The surround pass above changed the PSO. Re-set blit PSO and root sig.
+    g_blitCmdList->SetPipelineState(g_blitPSO.Get());
     g_blitCmdList->SetGraphicsRootSignature(g_blitRootSig.Get());
     ID3D12DescriptorHeap* heaps[] = {g_blitSrvHeap.Get()};
     g_blitCmdList->SetDescriptorHeaps(1, heaps);
     g_blitCmdList->SetGraphicsRootDescriptorTable(0, g_blitSrvHeap->GetGPUDescriptorHandleForHeapStart());
 
-    // UV scale + offset: content is at (canvasX, canvasY) in the shared texture
-    // per ADR-010 — compositor writes the weaved canvas region at that offset.
-    // Sample at uvOffset + uv * uvScale.
-    float uvParams[4] = {
-        g_sharedWidth > 0 ? (float)g_canvasW / (float)g_sharedWidth : 1.0f,
-        g_sharedHeight > 0 ? (float)g_canvasH / (float)g_sharedHeight : 1.0f,
-        g_sharedWidth > 0 ? vp.TopLeftX / (float)g_sharedWidth : 0.0f,
-        g_sharedHeight > 0 ? vp.TopLeftY / (float)g_sharedHeight : 0.0f,
-    };
     g_blitCmdList->SetGraphicsRoot32BitConstants(1, 4, uvParams, 0);
 
     g_blitCmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -420,6 +716,20 @@ static void BlitSharedTextureToBackBuffer(D3D12Renderer& renderer, XrSessionMana
 
     ID3D12CommandList* lists[] = {g_blitCmdList.Get()};
     renderer.commandQueue->ExecuteCommandLists(1, lists);
+
+    if (surroundRecorded) {
+        // Spec v7 producer signal: bump fence on our queue, then push the
+        // new await value to the runtime so its next per-frame strip-blit
+        // queue-waits on it. The OpenXR call also keeps the registration
+        // alive (clearing it would require passing NULL handle).
+        g_surroundFenceValue++;
+        renderer.commandQueue->Signal(g_surroundFence.Get(), g_surroundFenceValue);
+        if (xr.pfnSetSharedTextureSurround2DFenceEXT && xr.session != XR_NULL_HANDLE) {
+            xr.pfnSetSharedTextureSurround2DFenceEXT(xr.session,
+                g_surroundHandle, g_sharedWidth, g_sharedHeight,
+                g_surroundFenceHandle, g_surroundFenceValue);
+        }
+    }
 
     g_appSwapchain->Present(1, 0);
 
@@ -759,6 +1069,9 @@ static void RenderOneFrame(RenderState& rs) {
                             sessionText += L"\nSession: ";
                             sessionText += FormatSessionState((int)xr.sessionState);
                             std::wstring modeText = L"Shared Texture D3D12 (offscreen)";
+                            modeText += g_surroundRegistered ?
+                                L"\nSurround 2D: ACTIVE (spec v6)" :
+                                L"\nSurround 2D: inactive";
                             modeText += g_inputState.cameraMode ?
                                 L"\nKooima: Camera-Centric [C=Toggle]" :
                                 L"\nKooima: Display-Centric [C=Toggle]";
@@ -952,9 +1265,13 @@ static void RenderOneFrame(RenderState& rs) {
                 ResizeAppSwapchain(renderer);
             }
 
-            // After xrEndFrame: blit shared texture to app window
+            // After xrEndFrame: blit shared texture to app window. We also
+            // render the surround pattern inline (under keyed mutex) when
+            // surround is registered.
             if (frameState.shouldRender) {
-                BlitSharedTextureToBackBuffer(renderer, xr);
+                static auto surroundStartTime = std::chrono::steady_clock::now();
+                float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - surroundStartTime).count();
+                BlitSharedTextureToBackBuffer(renderer, xr, t);
             }
         }
     } else {
@@ -1115,6 +1432,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Create SRV for shared texture (for blit)
     CreateSharedTextureSRV(renderer.device.Get());
 
+    // Spec v7 §3.7: full-window 2D surround texture with fence-based sync
+    // (the only path that works on D3D12-native shared resources). On a
+    // pre-v7 runtime the PFN lookup returns null and surround stays off —
+    // the cube still weaves correctly via the canvas-only blit.
+    bool surroundSetupOk = false;
+    if (xr.pfnSetSharedTextureSurround2DFenceEXT) {
+        surroundSetupOk = CreateSurroundPipeline(renderer.device.Get()) &&
+                          CreateSurroundTextureD3D12(renderer.device.Get(),
+                                                     g_sharedWidth, g_sharedHeight,
+                                                     DXGI_FORMAT_B8G8R8A8_UNORM);
+        if (!surroundSetupOk) {
+            LOG_WARN("Surround 2D (fence) setup failed — continuing without surround");
+        }
+    } else {
+        LOG_WARN("Runtime does not expose xrSetSharedTextureSurround2DFenceEXT (pre-spec-v7) — surround disabled");
+    }
+
     // HUD renderer
     HudRenderer hudRenderer = {};
     bool hudOk = InitializeHudRenderer(hudRenderer, HUD_PIXEL_WIDTH, HUD_PIXEL_HEIGHT);
@@ -1127,6 +1461,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         CleanupOpenXR(xr);
         ShutdownLogging();
         return 1;
+    }
+
+    // Seed the runtime with handle opens + initial await value of 0. The
+    // fence's completed value is 0 at creation, so the first frame's
+    // queue->Wait(fence, 0) returns immediately; subsequent per-frame
+    // calls bump the await value.
+    if (surroundSetupOk && xr.pfnSetSharedTextureSurround2DFenceEXT && g_surroundHandle) {
+        XrResult sres = xr.pfnSetSharedTextureSurround2DFenceEXT(xr.session,
+            g_surroundHandle, g_sharedWidth, g_sharedHeight,
+            g_surroundFenceHandle, 0);
+        if (XR_SUCCEEDED(sres)) {
+            g_surroundRegistered = true;
+            LOG_INFO("Registered surround 2D (fence) with runtime (%ux%u)",
+                g_sharedWidth, g_sharedHeight);
+        } else {
+            LogXrResult("xrSetSharedTextureSurround2DFenceEXT", sres);
+        }
     }
 
     if (!CreateSpaces(xr)) {
@@ -1307,6 +1658,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     g_blitPSO.Reset();
     g_blitRootSig.Reset();
     g_blitSrvHeap.Reset();
+
+    // Clear surround registration before dropping our refs so the runtime
+    // releases its opened ID3D12Resource + ID3D12Fence views of the shared
+    // handles. Fence handle argument is ignored on the clear path.
+    if (g_surroundRegistered && xr.pfnSetSharedTextureSurround2DFenceEXT && xr.session != XR_NULL_HANDLE) {
+        xr.pfnSetSharedTextureSurround2DFenceEXT(xr.session, nullptr, 0, 0, nullptr, 0);
+        g_surroundRegistered = false;
+    }
+    if (g_surroundHandle) {
+        CloseHandle(g_surroundHandle);
+        g_surroundHandle = nullptr;
+    }
+    if (g_surroundFenceHandle) {
+        CloseHandle(g_surroundFenceHandle);
+        g_surroundFenceHandle = nullptr;
+    }
+    g_surroundFence.Reset();
+    g_surroundRtvHeap.Reset();
+    g_surroundPSO.Reset();
+    g_surroundRootSig.Reset();
+    g_surroundTexture.Reset();
 
     // Cleanup shared texture
     if (g_sharedHandle) {

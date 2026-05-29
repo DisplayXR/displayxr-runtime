@@ -137,6 +137,7 @@ The two concepts are inseparable: window-space layers only make sense when there
 | 4 | `transparentBackgroundEnabled` — runtime configures DComp / DXGI for per-pixel desktop transparency. |
 | 5 | `chromaKeyColor` — optional app-supplied chroma-key override. `0` = runtime DP picks its own default. |
 | 6 | `xrSetSharedTextureSurround2DEXT` — register a full-window 2D shared texture for the non-canvas region. Enables apps with a fixed 3D zone (sub-rect canvas) to deliver full-resolution 2D content for the surrounding area. See [§3.6](#36-xrsetsharedtexturesurround2dext). |
+| 7 | `xrSetSharedTextureSurround2DFenceEXT` — D3D12 variant of §3.6 that uses `ID3D12Fence` for producer→consumer sync. D3D12-native shared resources do not reliably expose `IDXGIKeyedMutex`, so the spec-v6 API does not work for D3D12 apps. See [§3.7](#37-xrsetsharedtexturesurround2dfenceext). |
 
 ### 3.2 XrWin32WindowBindingCreateInfoEXT
 
@@ -443,6 +444,112 @@ If `xrSetSharedTextureOutputRectEXT` is never called, the canvas defaults to the
 **Fallback when not called:**
 
 If the app never calls this function, the runtime preserves the spec v5 behavior: non-canvas pixels of the target swapchain are undefined. Apps with `canvas == window` (most handle apps) are unaffected and need not call this function.
+
+### 3.7 xrSetSharedTextureSurround2DFenceEXT
+
+D3D12-only variant of [§3.6](#36-xrsetsharedtexturesurround2dext) that uses an `ID3D12Fence` (shared NT handle) for producer→consumer synchronization instead of `IDXGIKeyedMutex`.
+
+**Motivation.** D3D12-native shared resources — those created via `D3D12_HEAP_FLAG_SHARED` + `ID3D12Device::CreateSharedHandle` — do not reliably expose `IDXGIKeyedMutex` when re-opened via `ID3D12Device::OpenSharedHandle`. `QueryInterface(__uuidof(IDXGIKeyedMutex))` returns `E_NOINTERFACE` on common Windows/driver combinations (verified on NVIDIA RTX, default Windows 11 drivers, 2026-05). Spec v6's keyed-mutex contract therefore fails for D3D12 apps that allocate the surround texture on their own D3D12 device.
+
+`ID3D12Fence` is the canonical D3D12 cross-process sync primitive, is shareable via `CreateSharedHandle`, and integrates cleanly with `ID3D12CommandQueue::Wait` / `Signal`. No keyed-mutex semantics are needed: the runtime only reads from the surround texture, so a producer-signal + consumer-wait pair is sufficient.
+
+```c
+typedef XrResult (XRAPI_PTR *PFN_xrSetSharedTextureSurround2DFenceEXT)(
+    XrSession session,
+    void*     sharedTextureHandle,
+    uint32_t  width,
+    uint32_t  height,
+    void*     sharedFenceHandle,
+    uint64_t  awaitFenceValue);
+```
+
+**Parameters:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `session` | The session. Must have been created with `XrWin32WindowBindingCreateInfoEXT`. |
+| `sharedTextureHandle` | Shared D3D12 texture NT `HANDLE`, or `NULL` to clear. |
+| `width` | Texture width in pixels. Must equal the dst-swapchain width seen by the strip blit. |
+| `height` | Texture height in pixels. |
+| `sharedFenceHandle` | Shared `ID3D12Fence` NT `HANDLE`. Ignored when `sharedTextureHandle == NULL`. |
+| `awaitFenceValue` | Fence value the runtime should wait on before reading the surround texture this frame. Must monotonically increase across calls. |
+
+**Returns:**
+
+| Result | Meaning |
+|---|---|
+| `XR_SUCCESS` | Registered (or cleared if `sharedTextureHandle == NULL`). |
+| `XR_ERROR_FUNCTION_UNSUPPORTED` | Runtime predates spec v7 or current compositor is not D3D12 native. |
+| `XR_ERROR_HANDLE_INVALID` | Either handle could not be opened. |
+| `XR_ERROR_VALIDATION_FAILURE` | Dimension mismatch with the opened texture. |
+
+**Valid usage:**
+- Session must have been created with `XrWin32WindowBindingCreateInfoEXT` and the graphics binding must be D3D12.
+- The texture must be created with `D3D12_HEAP_FLAG_SHARED` + a render-target-capable resource flag; NT handle is obtained via `ID3D12Device::CreateSharedHandle`.
+- The fence must be created with `D3D12_FENCE_FLAG_SHARED`; NT handle is obtained via the same `CreateSharedHandle` call.
+- Texture format must match the dst the strip blit writes into (for `_texture` apps this is the multiview shared texture's format; `DXGI_FORMAT_B8G8R8A8_UNORM` is the canonical choice).
+- `awaitFenceValue` must be strictly greater than the previous frame's value once steady state begins. The first call may use any value (the fence's `GetCompletedValue()` starts at 0, so the runtime's queue wait returns immediately for the seed call).
+- The app must `ID3D12CommandQueue::Signal(fence, awaitFenceValue)` **after** the frame's surround render submission and **before** the matching `xrEndFrame`, so the runtime's wait can resolve.
+- Mutually exclusive with [§3.6](#36-xrsetsharedtexturesurround2dext) on the same session — calling one clears the other's registration.
+
+**Pipeline integration:**
+
+Per frame:
+```
+app:                                  runtime (at xrEndFrame):
+  Reset() + Record(surround render)
+  ExecuteCommandLists(cmdList)
+  commandQueue->Signal(fence, N)
+  xrSetSharedTextureSurround2DFenceEXT(
+      session, texH, w, h, fenceH, N)
+                                      commandQueue->Wait(fence, N)
+                                      Record(strip blit) into c->cmd_list
+                                      ExecuteCommandLists(c->cmd_list)
+                                      // blit waits for app's Signal(fence,N)
+                                      // before reading surround texture
+```
+
+The runtime caches `(textureHandle, fenceHandle)` by pointer equality on first call. Subsequent calls with the same handles only update `awaitFenceValue` (no re-open, no extra `OpenSharedHandle` cost). Passing different handle values triggers a re-registration cycle and clears the cached opens.
+
+**Worked example (D3D12 app with 60% canvas + animated 2D surround):**
+
+```c
+// At session start:
+PFN_xrSetSharedTextureSurround2DFenceEXT pfnSetSurround2DFence = NULL;
+xrGetInstanceProcAddr(instance, "xrSetSharedTextureSurround2DFenceEXT",
+    (PFN_xrVoidFunction*)&pfnSetSurround2DFence);
+
+ID3D12Resource* surroundTex = NULL;
+device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_SHARED, &texDesc,
+    D3D12_RESOURCE_STATE_COMMON, NULL, IID_PPV_ARGS(&surroundTex));
+HANDLE surroundTexH;
+device->CreateSharedHandle(surroundTex, NULL, GENERIC_ALL, NULL, &surroundTexH);
+
+ID3D12Fence* surroundFence = NULL;
+device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&surroundFence));
+HANDLE surroundFenceH;
+device->CreateSharedHandle(surroundFence, NULL, GENERIC_ALL, NULL, &surroundFenceH);
+
+uint64_t fenceValue = 0;
+pfnSetSurround2DFence(session, surroundTexH, w, h, surroundFenceH, fenceValue);
+                                                 // seed: await=0, GetCompletedValue()==0,
+                                                 // first wait returns immediately
+xrSetSharedTextureOutputRectEXT(session, cx, cy, cw, ch);  // canvas 60%
+
+// Per frame:
+//   1. Record surround pattern into cmdList (RENDER_TARGET barrier, draw, COMMON barrier)
+//   2. cmdList->Close(); commandQueue->ExecuteCommandLists(1, &cmdList);
+//   3. fenceValue++; commandQueue->Signal(surroundFence, fenceValue);
+//   4. pfnSetSurround2DFence(session, surroundTexH, w, h, surroundFenceH, fenceValue);
+//   5. xrEndFrame(...);   // runtime queue-waits for surroundFence >= fenceValue,
+                              // then runs the strip blit
+```
+
+**Read-back contract:** identical to §3.6 — the surround texture is input only.
+
+**Interaction with the canvas rect:** identical to §3.6.
+
+**Fallback when not called:** identical to §3.6.
 
 ---
 
