@@ -67,6 +67,26 @@ End goal: ship the capability through Unity's plugin so Unity editors and runtim
 - [ ] Capture a compositor screenshot via `%TEMP%\workspace_screenshot_trigger` (path documented in `CLAUDE.md` § Capturing Compositor Screenshots) to inline-verify pixel-perfect canvas/surround boundary.
 - [ ] Run the MinGW compile-check on macOS (`./scripts/build-mingw-check.sh aux_util displayxr_mcp`) to catch any obvious Win32 platform-guard regressions before pushing.
 
+#### Local Windows handoff (Phase C/D validation only — pre Phase E)
+
+Branch: `feature/surround-2d-spec` (PR [#361](https://github.com/DisplayXR/displayxr-runtime/pull/361)). Current head should include the MSVC `HANDLE`-shadow fix (`0db22fd7` or later).
+
+What you can validate locally today (Phase C/D):
+
+```bat
+git fetch origin feature/surround-2d-spec
+git checkout feature/surround-2d-spec
+scripts\build_windows.bat build
+```
+
+- ✅ **Compile-clean MSVC build of `comp_d3d11.lib` and `comp_d3d12.lib`** is the canonical Phase C/D check. The first Windows CI run on this branch failed on a `HANDLE h` local that shadowed the `uint32_t h` (height) parameter — clang let it slide, MSVC didn't. Anything similar would surface here.
+- ✅ **Runtime loads + an existing `_handle` app runs unchanged** (e.g. `_package\run_cube_handle_d3d11_win.bat`). The new surround code path is dormant unless `xrSetSharedTextureSurround2DEXT` is called — handle apps don't call it, so they exercise the unchanged code paths and prove no regression.
+- ⚠️ **The new path is NOT exercised end-to-end yet.** None of the shipping test apps call `xrSetSharedTextureSurround2DEXT`. That's Phase E — `cube_texture_d3d11_win` / `cube_texture_d3d12_win` need updates to (a) allocate a second NT-shared + keyed-mutex D3D11/D3D12 texture at HWND client dims, (b) `xrGetInstanceProcAddr` the new PFN, (c) call it, (d) render a 2D pattern into it each frame.
+
+If you want to smoke-test the entry point before Phase E lands, the minimal addition to `test_apps/cube_texture_d3d11_win/xr_session.cpp` is one `xrGetInstanceProcAddr` lookup + one call with `nullptr` to confirm the runtime accepts the registration cycle without crashing. Watch the log for `D3D11 surround 2D cleared` / `D3D11 surround 2D registered: handle=... WxH format=...`.
+
+Phase E is the natural next step — it's where the visual validation actually becomes meaningful.
+
 ### Phase G — Unity plugin integration
 
 Lives in [`DisplayXR/displayxr-unity`](https://github.com/DisplayXR/displayxr-unity), not this repo. Tracked separately, but the surface shape is fixed by spec v6 above.
