@@ -177,14 +177,45 @@ This repo IS the public runtime — there is no private→public mirror flow. A 
 
 The skill's auto-bump regex is intentionally strict (`^v[0-9]+\.[0-9]+\.[0-9]+$`) so non-canonical tags (`v25.x` Monado-era leftovers cleaned 2026-05-04, `*-rc*`, `demo-x/v*`, `sr-sdk-*`) don't get picked up.
 
-**Sibling release flows (NOT driven by /release):**
+**Sibling release flows (NOT driven by /release in this repo):**
 
 | Component | Repo | How it releases |
 |---|---|---|
-| Shell | `displayxr-shell-pvt` → `displayxr-shell-releases` | The shell repo's own publish pipeline on its own tag cadence. Authenticated via the `displayxr-publish-bot` GitHub App (org secrets `DISPLAYXR_APP_ID` + `DISPLAYXR_APP_PRIVATE_KEY`; local `.pem` backup at `.secrets/displayxr-publish-bot.pem`, see `.secrets/NOTE.md` for rotation). |
-| Leia SR plug-in | `displayxr-leia-plugin` | The plug-in repo's own CI on its own tag cadence. Publishes `DisplayXRLeiaSRSetup-*.exe` (hard prereq: runtime installed). |
+| Shell | `displayxr-shell-pvt` → `displayxr-shell-releases` | `/dxr-release` (user-level skill) or `git tag` → `publish-shell-releases.yml` builds + cross-publishes the installer + dispatches `versions-bump`. Authenticated via the `displayxr-publish-bot` GitHub App (org secrets `DISPLAYXR_APP_ID` + `DISPLAYXR_APP_PRIVATE_KEY`; local `.pem` backup at `.secrets/displayxr-publish-bot.pem`, see `.secrets/NOTE.md` for rotation). |
+| Leia SR plug-in | `displayxr-leia-plugin` | `/dxr-release` or `git tag` → `build-windows.yml` builds DLL + installer + dispatches `versions-bump` with an ABI gate (ADR-020). Publishes `DisplayXRLeiaSRSetup-*.exe` (hard prereq: runtime installed). |
+| MCP framework | `displayxr-mcp` | `/dxr-release` or `git tag` → matrix `build.yml` + adapter installer + dispatches `versions-bump`. Publishes `DisplayXRMCPSetup-*.exe`. |
 | Extension headers | `displayxr-extensions` | Auto-syncs from `src/external/openxr_includes/` on every push to main via `publish-extensions.yml`. No tag needed. |
-| Standalone demos | e.g. `displayxr-demo-gaussiansplat` | Each demo's own repo. Manual flow: bump installer's `build-installer.bat` version → tag `vX.Y.Z` → run `installer\build-installer.bat` → `gh release create` with the installer asset attached. |
+| Standalone demos | e.g. `displayxr-demo-gaussiansplat` | `/dxr-release` or `git tag` → `build-windows.yml` builds installer + dispatches `versions-bump`. Each demo's own repo + own tag cadence. |
+| Meta-installer bundle | `displayxr-installer` | `/installer-release` (user-level skill) or `workflow_dispatch` on `publish-bundle.yml` — NOT auto-fired on component releases. Cuts a single `.exe`/`.pkg` that chains every component installer. |
+
+### versions.json — single source of truth for the dev orchestrator + bundle
+
+`versions.json` at the runtime repo root is the canonical pin matrix
+that `scripts/setup-displayxr.{sh,bat}` consumes (and that
+`displayxr-installer` mirrors byte-for-byte for its meta-installer
+bundle composition).
+
+**Auto-bumped on every component release** — the dispatch flow above
+keeps it in lockstep with reality at no human cost. Tagging any
+component (`/release` in runtime; `/dxr-release` in any sibling)
+auto-updates the matching `versions.json` field on `main` AND
+mirrors to `displayxr-installer/main` within ~30 s, via the
+`displayxr-publish-bot` App.
+
+Two structural safety nets:
+- **ABI gate** (`scripts/check_plugin_abi.py`) — runs on any
+  `field=leia_plugin` bump AND on every runtime self-bump. If the
+  plug-in's reported ABI doesn't match the runtime's
+  `XRT_PLUGIN_API_VERSION_CURRENT`, the bump is **skipped** and a
+  tracking issue is auto-opened on `displayxr-leia-plugin`. Dev
+  orchestrator stays on the last known-good bundle.
+- **Drift guard** in `displayxr-installer/.github/workflows/publish-bundle.yml`
+  — `assert-versions-in-sync` diffs the local `versions.json`
+  against `runtime/main` via the GitHub Contents API (uncached)
+  before any bundle build. Hand-edits to the installer's mirror
+  copy are caught before users see them.
+
+Full spec: [`docs/specs/runtime/versions-json-autobump.md`](docs/specs/runtime/versions-json-autobump.md).
 
 ### Repository Structure
 
@@ -325,7 +356,7 @@ and are discovered at `xrCreateInstance` time per ADR-019/#263.
 
 ## Claude Code Skills
 
-### /release - Tagged Runtime Release
+### /release - Tagged Runtime Release (this repo only)
 Creates a tagged runtime release here, monitors `build-windows.yml` + `build-macos.yml` in parallel, and attaches both installers (`DisplayXRSetup-*.exe` and `DisplayXR-Installer-*.pkg`) plus the test-apps bundle to the GitHub Release. See `.claude/skills/release/SKILL.md`.
 ```
 /release v1.2.1    # explicit version
@@ -333,7 +364,26 @@ Creates a tagged runtime release here, monitors `build-windows.yml` + `build-mac
 /release minor
 /release major
 ```
-Tags `main` HEAD and pushes the tag (no longer commits a "Release vX.Y.Z" bump to `main` — `build-windows.yml` patches `CMakeLists.txt` `VERSION` from `git describe --tags --abbrev=0 --match 'v[0-9]*'` at build time per PR #353, and `build-macos.yml` derives the version from `GITHUB_REF` directly, so the source-tree value would just drift). Watches Windows + macOS CI concurrently (wall time = `max(Windows, macOS)`). The CI workflows themselves attach the artifacts to the GitHub Release on `v*` tag push via `softprops/action-gh-release@v2` (post-#290); the skill writes curated release notes on top via `gh release edit --notes`. macOS .pkg is a soft requirement — its absence warns but doesn't STOP the release. Only releases this repo — shell, demos, extensions each have their own flows (see "Releasing the Runtime" above).
+Tags `main` HEAD and pushes the tag (no longer commits a "Release vX.Y.Z" bump to `main` — `build-windows.yml` patches `CMakeLists.txt` `VERSION` from `git describe --tags --abbrev=0 --match 'v[0-9]*'` at build time per PR #353, and `build-macos.yml` derives the version from `GITHUB_REF` directly, so the source-tree value would just drift). Watches Windows + macOS CI concurrently. The CI workflows attach artifacts to the GitHub Release on `v*` tag push via `softprops/action-gh-release@v2` (#290); the skill writes curated release notes on top via `gh release edit --notes`.
+
+Post-CI, the skill also waits for `BumpVersionsJsonOnTag` (which runs the ABI gate against the currently-pinned leia plug-in, bumps `versions.json[runtime]` on `main`, and mirrors the file to `displayxr-installer/main`). Final report includes both bot-commit SHAs + any ABI-mismatch issue link if leia needs a rebuild.
+
+macOS .pkg is a soft requirement — its absence warns but doesn't STOP the release. Only releases this repo — siblings use `/dxr-release` or `/installer-release` (below).
+
+### /dxr-release - Sibling component release (user-level)
+For every other DisplayXR component repo (`shell-pvt`, `leia-plugin`, `mcp`, `demo-*`). Detects the repo from `git remote`, tags HEAD, watches the repo's CI, watches the dispatched `versions-bump.yml` run in `displayxr-runtime`, reports the bump + installer-mirror outcome. Lives at `~/.claude/skills/dxr-release/SKILL.md`.
+```
+/dxr-release v1.2.3
+/dxr-release patch
+```
+Does NOT apply to this repo (use `/release`) or to `displayxr-installer` (use `/installer-release`).
+
+### /installer-release - Meta-installer bundle release (user-level)
+For `displayxr-installer` only. `publish-bundle.yml` is `workflow_dispatch`-only (NOT auto-fired on component releases — bundle releases are deliberate). Skill pre-checks the versions.json drift guard locally, fires the dispatch, watches `assert-versions-in-sync` + `build-macos` + `build-windows` + `release`, reports. Lives at `~/.claude/skills/installer-release/SKILL.md`.
+```
+/installer-release v1.2.3
+/installer-release v1.2.3 --prerelease
+```
 
 ### /ask-gemini - Code Analysis with Gemini
 Ask Gemini to analyze code and produce a read-only report. See `~/.claude/skills/ask-gemini/SKILL.md`.
