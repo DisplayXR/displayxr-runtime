@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_spatial_workspace 1
-#define XR_EXT_spatial_workspace_SPEC_VERSION 20
+#define XR_EXT_spatial_workspace_SPEC_VERSION 21
 #define XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_EXT_spatial_workspace"
 
 // Provisional XrStructureType values. The 1000999100..109 range is reserved for
@@ -1044,10 +1044,21 @@ typedef struct XrWorkspaceOverlayInfoEXT {
     // XR_FALSE (default) = mono: the whole image is composited identically in
     // every eye (zero disparity).
     XrBool32         stereoSideBySide;
+    // spec_version 21: keyed multi-overlay support. The runtime keeps a small
+    // map of overlays keyed by overlayId and composites ALL live ids each frame
+    // in ascending-id z-order (lower id behind, higher id in front), so the
+    // taskbar, launcher, and a toast can show simultaneously. Each call targets
+    // exactly the slot named by overlayId: it creates the slot if new, replaces
+    // its parameters if it already exists, and — when visible is XR_FALSE OR
+    // swapchain is XR_NULL_HANDLE — removes that id from the map (the other
+    // overlays are untouched). overlayId 0 is the default slot: a controller
+    // that never sets the field sees exactly the pre-v21 single-overlay
+    // behavior (one slot, overwritten on every call).
+    uint32_t         overlayId;
 } XrWorkspaceOverlayInfoEXT;
 
 /*!
- * @brief Activate / update the workspace overlay.
+ * @brief Activate / update a workspace overlay.
  *
  * Call once on startup after creating the overlay swapchain and filling its
  * first image, then again whenever the controller wants to change anchor,
@@ -1055,8 +1066,17 @@ typedef struct XrWorkspaceOverlayInfoEXT {
  * the most recent info; per-frame rendering uses the cached state, so this is a
  * low-frequency call (NOT per-frame).
  *
+ * spec_version 21: each call targets the slot named by @p info->overlayId. The
+ * runtime keeps a small map of overlays keyed by id and composites all live ids
+ * each frame in ascending-id z-order, so multiple overlays (taskbar, launcher,
+ * toast, ...) coexist. Use distinct ids for overlays that must show at once;
+ * reuse an id to replace that overlay's parameters. overlayId 0 is the default
+ * slot, so a controller that never sets the field keeps the pre-v21 behavior of
+ * a single overlay overwritten on every call.
+ *
  * Setting @p info->visible to XR_FALSE OR @p info->swapchain to XR_NULL_HANDLE
- * hides the overlay without tearing down anything; a subsequent call re-activates.
+ * removes the overlay named by @p info->overlayId without tearing down anything
+ * (other ids are untouched); a subsequent call re-activates that id.
  *
  * @return XR_SUCCESS, XR_ERROR_VALIDATION_FAILURE (bad info type / size),
  *         XR_ERROR_HANDLE_INVALID (swapchain not a workspace-mode swapchain or

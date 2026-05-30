@@ -634,6 +634,7 @@ struct ipc_workspace_overlay_info
 	float    size_h_m;        //!< Physical overlay height in meters
 	uint32_t visible;         //!< XrBool32; 0 = hidden even if swapchain valid
 	uint32_t stereo_sbs;      //!< spec_version 19: XrBool32; 1 = side-by-side stereo overlay
+	uint32_t overlay_id;      //!< spec_version 21: keyed-map slot; 0 = default slot. !visible or hidden swapchain removes this id.
 };
 
 /*!
