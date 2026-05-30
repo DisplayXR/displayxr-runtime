@@ -1151,6 +1151,7 @@ jobs:
           owner: DisplayXR
           repositories: |
             displayxr-runtime
+            displayxr-installer
             displayxr-leia-plugin
 
       - name: Checkout main
@@ -1232,5 +1233,29 @@ jobs:
           git commit -m "chore(versions): bump runtime → ${GITHUB_REF_NAME}
 
           Auto-bumped by build-windows.yml on tag push.
+          [skip ci]"
+          git push origin HEAD:main || (git pull --rebase origin main && git push origin HEAD:main)
+
+      # Mirror versions.json to displayxr-installer so the meta-installer
+      # bundle composition tracks the runtime self-bump. Schema is identical
+      # (see versions-bump.yml's mirror step for rationale).
+      - name: Mirror versions.json to displayxr-installer
+        if: steps.abi.outputs.rc == '0' && hashFiles('.bump-noop') == ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/DisplayXR/displayxr-installer.git" /tmp/installer
+          cp versions.json /tmp/installer/versions.json
+          cd /tmp/installer
+          if git diff --quiet versions.json; then
+            echo "displayxr-installer/versions.json already matches; no mirror commit needed"
+            exit 0
+          fi
+          git config user.name  "displayxr-publish-bot[bot]"
+          git config user.email "displayxr-publish-bot@users.noreply.github.com"
+          git add versions.json
+          git commit -m "chore(versions): mirror runtime → ${GITHUB_REF_NAME} from displayxr-runtime
+
+          Auto-synced from displayxr-runtime/versions.json by build-windows.yml on tag push.
           [skip ci]"
           git push origin HEAD:main || (git pull --rebase origin main && git push origin HEAD:main)

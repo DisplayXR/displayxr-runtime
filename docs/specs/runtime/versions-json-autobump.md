@@ -13,9 +13,7 @@ tag per DisplayXR component:
   "shell":       "v1.3.1",
   "leia_plugin": "v1.0.7",
   "mcp_tools":   "v0.3.2",
-  "demos": {
-    "gaussiansplat": "v1.4.3"
-  }
+  "gauss_demo":  "v1.4.3"
 }
 ```
 
@@ -136,13 +134,15 @@ Same snippet, with `field: "mcp_tools"`.
 
 ### `displayxr-demo-*`
 
-Same snippet, with `field: "demos.<name>"`. Nested fields are
-supported by the handler. Example for the gaussiansplat demo:
+Same snippet, with `field: "<demo_name>"`. The schema is flat — each
+demo gets its own top-level key matching the asset table in runtime's
+`scripts/lib/components.sh` (e.g. `gauss_demo` →
+`COMPONENT_*_gauss_demo`). Example for the gaussiansplat demo:
 
 ```yaml
           client-payload: |
             {
-              "field":       "demos.gaussiansplat",
+              "field":       "gauss_demo",
               "tag":         "${{ github.ref_name }}",
               "source_repo": "${{ github.repository }}"
             }

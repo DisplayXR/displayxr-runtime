@@ -88,9 +88,11 @@ jobs:
           app-id: ${{ secrets.DISPLAYXR_APP_ID }}
           private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
           owner: DisplayXR
-          # Bumping versions.json here; issue-opening on ABI fail there.
+          # Bumping versions.json here + mirror there; issue-opening on
+          # ABI fail in leia repo.
           repositories: |
             displayxr-runtime
+            displayxr-installer
             displayxr-leia-plugin
 
       - name: Checkout main
@@ -196,4 +198,34 @@ jobs:
           [skip ci]"
           # Retry once if main moved underneath us — concurrency group serializes
           # event-handler races, but a human push to main during the run is still possible.
+          git push origin HEAD:main || (git pull --rebase origin main && git push origin HEAD:main)
+
+      # Mirror versions.json byte-for-byte into displayxr-installer so the
+      # meta-installer's bundle composition stays in lockstep with the dev
+      # orchestrator's pin matrix. The two files share an identical schema
+      # (flat field names matching runtime's components.sh asset table); this
+      # is just a `cp` followed by commit, no schema translation needed.
+      # Installer's main is unprotected (no ruleset), so the bot's push lands
+      # directly. publish-bundle.yml asserts the two files stay in sync as a
+      # belt-and-braces drift guard.
+      - name: Mirror versions.json to displayxr-installer
+        if: hashFiles('.bump-noop') == '' && (steps.inputs.outputs.field != 'leia_plugin' || steps.abi.outputs.rc == '0')
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/DisplayXR/displayxr-installer.git" /tmp/installer
+          cp versions.json /tmp/installer/versions.json
+          cd /tmp/installer
+          if git diff --quiet versions.json; then
+            echo "displayxr-installer/versions.json already matches; no mirror commit needed"
+            exit 0
+          fi
+          git config user.name  "displayxr-publish-bot[bot]"
+          git config user.email "displayxr-publish-bot@users.noreply.github.com"
+          git add versions.json
+          git commit -m "chore(versions): mirror ${{ steps.inputs.outputs.field }} → ${{ steps.inputs.outputs.tag }} from displayxr-runtime
+
+          Auto-synced from displayxr-runtime/versions.json by versions-bump.yml.
+          See displayxr-runtime/docs/specs/runtime/versions-json-autobump.md.
+          [skip ci]"
           git push origin HEAD:main || (git pull --rebase origin main && git push origin HEAD:main)

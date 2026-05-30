@@ -4,7 +4,5 @@
   "shell":       "v1.3.1",
   "leia_plugin": "v1.0.7",
   "mcp_tools":   "v0.3.3",
-  "demos": {
-    "gaussiansplat": "v1.4.3"
-  }
+  "gauss_demo":  "v1.4.3"
 }
