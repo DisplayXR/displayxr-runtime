@@ -45,9 +45,11 @@ version-spec:
   │   the release, others append.)
   │
   ├─ Monitor build-windows.yml + build-macos.yml for this commit
+  ├─ Verify BumpVersionsJsonOnTag (ABI gate + commit to runtime/main)
+  ├─ Verify installer mirror commit (versions.json synced to installer)
   ├─ gh release edit --title --notes (curated Highlights paragraph
   │   layered on top of the empty body the action created)
-  └─ Report
+  └─ Report (includes auto-bump SHAs + any ABI-mismatch issue link)
 ```
 
 The skill no longer touches CMakeLists.txt — CI is authoritative for
@@ -177,13 +179,110 @@ Windows CI can take up to 30 min with test apps; macOS is faster (~10-15 min inc
 
 ### Step 3.4: Check both results
 - Both runs all-required-jobs succeed → Phase 4
-- Critical Windows job (`Runtime`, `Build`) fails AND macOS `Build` / `BuildInstaller` also fails → Phase 6 (Rollback) — no release was created
+- Critical Windows job (`Runtime`, `Build`) fails AND macOS `Build` / `BuildInstaller` also fails → Phase 7 (Rollback) — no release was created
 - Pre-existing-broken jobs (e.g. demo jobs that reference paths moved to standalone repos) fail but the artifact-producing job still succeeded → continue to Phase 4 with a flag in the final report
 - One side fails but the other succeeded → the release exists (the green side's `softprops/action-gh-release` step ran) but is missing assets. STOP and ask the user whether to rerun the failed workflow or ship degraded; flag clearly. The release tag can be left in place while the rerun happens.
 
 ---
 
-## PHASE 4: WRITE CURATED RELEASE NOTES
+## PHASE 4: VERIFY AUTO-BUMP + INSTALLER MIRROR
+
+The Windows build pipeline contains a `BumpVersionsJsonOnTag` job
+that runs after `Runtime` + `BundleTestApps` succeed. It bumps
+`versions.json[runtime]` to the new tag on `displayxr-runtime/main`
+and mirrors the file to `displayxr-installer/main` so the
+dev-orchestrator (`scripts/setup-displayxr.{sh,bat}`) and the
+meta-installer bundle both pick up the new pin without any manual
+edit. Spec: `docs/specs/runtime/versions-json-autobump.md`.
+
+This phase confirms the bump actually landed before declaring the
+release complete. If we skip it and silently lose the bump, the
+dev orchestrator stays on the old runtime tag indefinitely — exactly
+the drift class this whole system exists to prevent.
+
+### Step 4.1: Locate the BumpVersionsJsonOnTag job
+
+```bash
+BUMP_JOB=$(gh run view $WIN_RUN_ID --repo DisplayXR/displayxr-runtime \
+            --json jobs --jq '.jobs[] | select(.name=="BumpVersionsJsonOnTag")')
+echo "$BUMP_JOB" | jq -r '.status + "/" + (.conclusion // "running")'
+```
+
+It runs in parallel with the test-app jobs once `Runtime` + `BundleTestApps`
+finish, so it usually lands within 1-2 minutes of those completing.
+If it hasn't started by the time Phase 3 returned, poll the parent
+run every 25s with `gh run view ... --json jobs --jq '.jobs[] | select(.name=="BumpVersionsJsonOnTag")'`
+until it has a non-empty `status`.
+
+### Step 4.2: Wait for completion and interpret
+
+Three terminal outcomes:
+
+**A. `completed/success`** — the happy path. The ABI gate passed
+(or didn't apply), `versions.json[runtime]` bumped, mirror landed.
+Continue to Step 4.3.
+
+**B. `completed/success` but the bump was skipped because the ABI
+gate detected a leia mismatch.** The job exits 0 in that case — it
+posts a tracking issue on `displayxr-leia-plugin` and warns rather
+than failing. Detect this by checking the job log for the
+`::warning::Skipped versions.json[runtime] bump` line, OR by
+verifying that `versions.json[runtime]` on `main` did NOT update to
+`[FULL_TAG]`:
+
+```bash
+PINNED=$(gh api repos/DisplayXR/displayxr-runtime/contents/versions.json \
+          --jq '.content' | base64 -d | jq -r '.runtime')
+if [ "$PINNED" != "[FULL_TAG]" ]; then
+  # ABI gate skipped the bump. Find the issue it opened.
+  ISSUE=$(gh issue list --repo DisplayXR/displayxr-leia-plugin \
+            --state open --label abi-mismatch --search "[FULL_TAG]" \
+            --json number,url --jq '.[0]')
+  # Flag in the final report; release itself is still good.
+fi
+```
+
+The GitHub Release was still published. FetchContent consumers can
+still build against the new tag. Only the dev-orchestrator bundle
+pin is held back until leia ships a compatible release.
+
+**C. `completed/failure`** — rare; usually means the bot's
+`displayxr-publish-bot` token expired, or `displayxr-runtime/main`
+or `displayxr-installer/main` moved underneath the run after the
+rebase-retry already used its one attempt. The release is good but
+the bump did not land. Flag in the final report, recommend the user
+run `workflow_dispatch` on `.github/workflows/versions-bump.yml`
+with `field=runtime tag=[FULL_TAG]` to retry.
+
+### Step 4.3: Verify mirror landed on installer
+
+The same job's last step (`Mirror versions.json to displayxr-installer`)
+clones the installer repo, copies `versions.json` byte-for-byte, and
+pushes. Confirm via the Contents API (uncached):
+
+```bash
+diff <(gh api repos/DisplayXR/displayxr-runtime/contents/versions.json   --jq '.content' | base64 -d) \
+     <(gh api repos/DisplayXR/displayxr-installer/contents/versions.json --jq '.content' | base64 -d)
+```
+
+Files should be identical. If they diverge, the mirror step failed
+(rare — same auth/race causes as 4.2.C). Flag in the final report.
+
+### Step 4.4: Capture commit SHAs for the report
+
+```bash
+RT_BUMP_SHA=$(gh api repos/DisplayXR/displayxr-runtime/commits/main \
+                --jq '.sha[0:8]')
+IN_MIRROR_SHA=$(gh api repos/DisplayXR/displayxr-installer/commits/main \
+                  --jq '.sha[0:8]')
+```
+
+These two SHAs go into the final report's "Auto-bump" section so the
+user can audit at a glance.
+
+---
+
+## PHASE 5: WRITE CURATED RELEASE NOTES
 
 Since the CI workflows now attach artifacts to the release directly via
 `softprops/action-gh-release@v2` (per #290), the release exists by the
@@ -192,15 +291,15 @@ and test-apps zip attached. The skill's job is now just to write the
 curated Highlights paragraph on top of the auto-created (empty-body)
 release.
 
-### Step 4.1: Confirm the release exists
+### Step 5.1: Confirm the release exists
 ```bash
 gh release view [FULL_TAG] --repo DisplayXR/displayxr-runtime --json tagName,assets --jq '{tag: .tagName, assets: [.assets[].name]}'
 ```
 If the release does NOT exist at this point, both CI workflows
 catastrophically failed before reaching their attach steps. Go to
-Phase 6.
+Phase 7.
 
-### Step 4.2: Generate + write release notes
+### Step 5.2: Generate + write release notes
 Group commits from `git log $PREV_TAG..[FULL_TAG] --oneline --no-merges`
 by prefix (see "Notes template" below). Write a 1-3 line Highlights
 paragraph at the top describing what's notable for users.
@@ -239,7 +338,7 @@ to an empty body, so there's nothing to merge — just overwrite).
 
 ---
 
-## PHASE 5: VERIFY AND REPORT
+## PHASE 6: VERIFY AND REPORT
 
 ```bash
 gh release view [FULL_TAG] --repo DisplayXR/displayxr-runtime --json tagName,name,assets
@@ -272,8 +371,16 @@ Build:     Windows CI run #RUN_ID — Runtime + cube test apps passed
            [list any pre-existing-broken jobs here, with note that they don't affect the artifact]
 Release:   https://github.com/DisplayXR/displayxr-runtime/releases/tag/[FULL_TAG]
 Assets:    DisplayXRSetup-X.Y.Z.BUILD.exe (~N MB)
+           DisplayXR-Installer-X.Y.Z.pkg (~N MB)  [or "skipped — macOS run did not produce .pkg"]
            DisplayXR-TestApps-X.Y.Z.zip (~17 MB)  [or "skipped — DetectChanges did not produce TestApps-*"]
 Commits:   N commits since $PREV_TAG
+
+Auto-bump:
+  versions.json[runtime] = [FULL_TAG]  via $RT_BUMP_SHA on displayxr-runtime/main
+  versions.json mirror               via $IN_MIRROR_SHA on displayxr-installer/main
+  [OR: "ABI gate skipped the bump — leia $LEIA_PIN cannot load this runtime.
+       Tracking issue: displayxr-leia-plugin#NN. Dev orchestrator stays on
+       the previous runtime pin until leia ships a compatible release."]
 
 Notable changes:
   [grouped bullet summary]
@@ -283,11 +390,11 @@ STOP.
 
 ---
 
-## PHASE 6: ROLLBACK (on critical BUILD failure only)
+## PHASE 7: ROLLBACK (on critical BUILD failure only)
 
 Only roll back if a CRITICAL job (Runtime, Build) failed. Pre-existing-broken jobs that produce no artifact change are NOT a rollback condition — flag in the report instead.
 
-### Step 6.1: Delete tag (local + remote)
+### Step 7.1: Delete tag (local + remote)
 ```bash
 git tag -d [FULL_TAG]
 git push --delete origin [FULL_TAG]
@@ -296,7 +403,7 @@ git push --delete origin [FULL_TAG]
 There's nothing else to revert — Phase 2 no longer commits anything to
 `main`, so deleting the tag fully rolls back the release.
 
-### Step 6.2: Error summary + report
+### Step 7.2: Error summary + report
 ```bash
 gh run view $RUN_ID --log-failed | tail -200
 ```
