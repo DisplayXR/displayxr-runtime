@@ -140,13 +140,15 @@ jobs:
         if: steps.inputs.outputs.field != 'leia_plugin' || steps.abi.outputs.rc == '0'
         run: |
           python3 - <<'PY'
-          import json, os, sys
+          import json, os, re, sys
           field = os.environ["FIELD"]
           tag   = os.environ["TAG"]
           path  = "versions.json"
-          with open(path) as f:
-              d = json.load(f)
-          # Support nested fields like "demos.gaussiansplat".
+          text  = open(path).read()
+
+          # Sanity-check the field exists in the parsed structure (catches
+          # typos in the dispatched payload before we touch the file).
+          d = json.loads(text)
           parts = field.split(".")
           cur = d
           for p in parts[:-1]:
@@ -156,16 +158,27 @@ jobs:
           leaf = parts[-1]
           if leaf not in cur:
               sys.exit(f"versions.json has no field '{field}'")
-          if cur[leaf] == tag:
+
+          # Rewrite the file via a regex on the value-between-quotes so the
+          # bot's commits preserve whatever formatting (column alignment,
+          # whitespace, key order) the file already had. json.dump would
+          # normalize everything to its canonical style and churn the diff
+          # on every bump — fixed once, this stays stable across bumps.
+          # The leaf-name match is unambiguous in the current schema (no two
+          # scalar keys at different nesting levels share a name); if a future
+          # field collision appears, switch to a (\n + indent + leaf) anchor.
+          pat = re.compile(r'(?m)^(\s*"' + re.escape(leaf) + r'":\s*")[^"]*(")')
+          hits = pat.findall(text)
+          if len(hits) != 1:
+              sys.exit(f"expected exactly 1 occurrence of leaf '{leaf}' in versions.json, found {len(hits)}")
+          new_text = pat.sub(lambda m: m.group(1) + tag + m.group(2), text, count=1)
+          if new_text == text:
               print(f"versions.json[{field}] already == {tag}; nothing to do")
               # Touch a sentinel so the next step skips the commit.
               open(".bump-noop", "w").close()
           else:
               print(f"versions.json[{field}]: {cur[leaf]} → {tag}")
-              cur[leaf] = tag
-              with open(path, "w") as f:
-                  json.dump(d, f, indent=2)
-                  f.write("\n")
+              open(path, "w").write(new_text)
           PY
         env:
           FIELD: ${{ steps.inputs.outputs.field }}

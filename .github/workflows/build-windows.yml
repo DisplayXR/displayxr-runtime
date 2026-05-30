@@ -1203,19 +1203,24 @@ jobs:
         if: steps.abi.outputs.rc == '0'
         run: |
           python3 - <<'PY'
-          import json, os
+          import os, re, sys
           path = "versions.json"
           tag  = os.environ["GITHUB_REF_NAME"]
-          d = json.load(open(path))
-          if d["runtime"] == tag:
+          text = open(path).read()
+          # Regex-on-value rewrite preserves the file's existing column
+          # alignment / whitespace so the bot's commits don't churn the diff
+          # (see versions-bump.yml for the matching rationale).
+          pat = re.compile(r'(?m)^(\s*"runtime":\s*")[^"]*(")')
+          hits = pat.findall(text)
+          if len(hits) != 1:
+              sys.exit(f"expected 1 'runtime' occurrence in versions.json, found {len(hits)}")
+          new_text = pat.sub(lambda m: m.group(1) + tag + m.group(2), text, count=1)
+          if new_text == text:
               print(f"versions.json[runtime] already == {tag}; nothing to do")
               open(".bump-noop", "w").close()
           else:
-              print(f"versions.json[runtime]: {d['runtime']} → {tag}")
-              d["runtime"] = tag
-              with open(path, "w") as f:
-                  json.dump(d, f, indent=2)
-                  f.write("\n")
+              print(f"versions.json[runtime] → {tag}")
+              open(path, "w").write(new_text)
           PY
 
       - name: Commit and push
