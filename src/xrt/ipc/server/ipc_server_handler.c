@@ -3463,7 +3463,7 @@ ipc_handle_workspace_set_overlay(volatile struct ipc_client_state *_ics,
 		xsc = (struct xrt_swapchain *)_ics->xscs[info->swapchain_id];
 	}
 
-	return comp_d3d11_service_workspace_set_overlay(s->xsysc, xsc,
+	return comp_d3d11_service_workspace_set_overlay(s->xsysc, info->overlay_id, xsc,
 	                                                 info->anchor_x, info->anchor_y,
 	                                                 info->pivot_x, info->pivot_y,
 	                                                 info->size_w_m, info->size_h_m,

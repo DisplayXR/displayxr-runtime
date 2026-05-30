@@ -1424,6 +1424,7 @@ oxr_xrSetWorkspaceOverlayEXT(XrSession session, const XrWorkspaceOverlayInfoEXT 
 	ipc_info.size_h_m = info->sizeMeters.height;
 	ipc_info.visible = info->visible ? 1u : 0u;
 	ipc_info.stereo_sbs = info->stereoSideBySide ? 1u : 0u; // spec_version 19
+	ipc_info.overlay_id = info->overlayId;                  // spec_version 21: keyed-map slot
 
 	if (info->swapchain != XR_NULL_HANDLE) {
 		struct oxr_swapchain *sc = NULL;

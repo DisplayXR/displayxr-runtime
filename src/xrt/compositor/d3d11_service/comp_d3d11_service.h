@@ -581,9 +581,15 @@ comp_d3d11_service_workspace_set_cursor(struct xrt_system_compositor *xsysc,
  * composites the swapchain's latest released image at z = 0 (zero disparity),
  * docked at @p anchor (normalized display position) with @p pivot (normalized
  * sprite UV) and physical size @p size_w_m × @p size_h_m. Pass xsc=NULL to hide.
+ *
+ * spec_version 21: @p overlay_id keys a small map of overlays; the runtime
+ * composites all live ids each frame in ascending-id z-order. This call
+ * creates/replaces the slot named by @p overlay_id; !visible or xsc=NULL
+ * removes that id (other ids untouched). id 0 is the default slot.
  */
 xrt_result_t
 comp_d3d11_service_workspace_set_overlay(struct xrt_system_compositor *xsysc,
+                                          uint32_t overlay_id,
                                           struct xrt_swapchain *xsc,
                                           float anchor_x, float anchor_y,
                                           float pivot_x, float pivot_y,

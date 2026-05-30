@@ -71,6 +71,7 @@
 #include <cstring>
 #include <cmath>
 #include <mutex>
+#include <map>
 #include <sddl.h>
 
 
@@ -384,6 +385,26 @@ struct d3d11_service_semaphore
 };
 
 
+//! spec_version 21: one entry in the keyed overlay map (see d3d11_service_system::overlays).
+//! Presence in the map == visible; the controller removes an overlay by pushing
+//! !visible / NULL swapchain for its id (erases the entry). z = 0, no disparity.
+struct overlay_slot
+{
+	struct xrt_swapchain *xsc; //!< borrowed; controller owns lifetime
+	float anchor_x;            //!< Normalized display position X [0,1] of dock point
+	float anchor_y;            //!< Normalized display position Y [0,1] of dock point
+	float pivot_x;             //!< Normalized sprite UV X [0,1] mapped onto anchor
+	float pivot_y;             //!< Normalized sprite UV Y [0,1] mapped onto anchor
+	float size_w_m;            //!< Physical overlay width in meters
+	float size_h_m;            //!< Physical overlay height in meters
+	bool  stereo_sbs;          //!< spec_version 19: image is side-by-side stereo
+};
+
+//! Cap on simultaneously-composited overlays — a buggy controller can't grow the
+//! map unbounded. The shell needs ~3 (taskbar/launcher/toast); 16 is ample.
+#define D3D11_SERVICE_MAX_OVERLAYS 16
+
+
 /*!
  * D3D11 service system compositor.
  *
@@ -411,24 +432,15 @@ struct d3d11_service_system
 	float cursor_size_m;           //!< Physical size (width = height)
 	bool  cursor_visible;          //!< Controller can hide without releasing swapchain
 
-	//! spec_version 17: controller-pushed overlay source (display-spanning UI,
-	//! e.g. taskbar). Same borrowed-ref model as cursor_xsc, but docked at
-	//! z = 0 (zero disparity) — no raycast, no per-eye disparity. The controller
-	//! creates a session-global swapchain (xrCreateWorkspaceOverlaySwapchainEXT),
-	//! renders the UI into it, and docks it via xrSetWorkspaceOverlayEXT. NULL or
-	//! !overlay_visible = overlay hidden.
-	struct xrt_swapchain *overlay_xsc;
-	float overlay_anchor_x;        //!< Normalized display position X [0,1] of dock point
-	float overlay_anchor_y;        //!< Normalized display position Y [0,1] of dock point
-	float overlay_pivot_x;         //!< Normalized sprite UV X [0,1] mapped onto anchor
-	float overlay_pivot_y;         //!< Normalized sprite UV Y [0,1] mapped onto anchor
-	float overlay_size_w_m;        //!< Physical overlay width in meters
-	float overlay_size_h_m;        //!< Physical overlay height in meters
-	bool  overlay_visible;         //!< Controller can hide without releasing swapchain
-	//! spec_version 19: overlay swapchain image is side-by-side stereo (left
-	//! half = left eye, right half = right eye). The composite samples the
-	//! matching half per eye view; mono (false) samples the whole image in both.
-	bool  overlay_stereo_sbs;
+	//! spec_version 17/21: controller-pushed overlay sources (display-spanning UI,
+	//! e.g. taskbar + launcher + toast). Same borrowed-ref model as cursor_xsc, but
+	//! docked at z = 0 (zero disparity) — no raycast, no per-eye disparity. The
+	//! controller creates session-global swapchains (xrCreateWorkspaceOverlaySwapchainEXT),
+	//! renders UI into them, and docks each via xrSetWorkspaceOverlayEXT with an
+	//! overlayId. The map is keyed by that id; std::map iterates ascending so the
+	//! composite draws low ids behind high ids (z-order). An entry's presence == it
+	//! is visible — !visible / NULL swapchain erases its id. Guarded by render_mutex.
+	std::map<uint32_t, overlay_slot> overlays;
 
 	//! #308 (spec_version 18): controller input grab is active (modal UI like the
 	//! launcher band is up). While set, the cursor renders at z = 0 (zero
@@ -8028,14 +8040,20 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// to a follow-up.
 
 
-	// spec_version 17: workspace overlay (controller-pushed display-spanning UI,
-	// e.g. taskbar). Docked at z = 0 (zero disparity) → unlike the cursor below
-	// there is NO raycast, NO per-eye disparity: the same sprite is drawn at the
-	// same docked position in every atlas tile. Rendered AFTER windows + chrome
-	// and BEFORE the cursor, so the cursor stays on top. Controller owns all
-	// content + layout (sys->overlay_anchor/pivot/size) via
-	// xrCreateWorkspaceOverlaySwapchainEXT + xrSetWorkspaceOverlayEXT.
-	if (sys->overlay_visible && sys->overlay_xsc != nullptr) {
+	// spec_version 17/21: workspace overlays (controller-pushed display-spanning
+	// UI, e.g. taskbar + launcher + toast). Docked at z = 0 (zero disparity) →
+	// unlike the cursor below there is NO raycast, NO per-eye disparity: the same
+	// sprite is drawn at the same docked position in every atlas tile. Rendered
+	// AFTER windows + chrome and BEFORE the cursor, so the cursor stays on top.
+	// Controller owns all content + layout (overlay_slot anchor/pivot/size) via
+	// xrCreateWorkspaceOverlaySwapchainEXT + xrSetWorkspaceOverlayEXT. The map is
+	// keyed by overlayId; std::map iterates ascending so lower ids composite
+	// behind higher ids (the shell picks ids to control z-order).
+	for (const auto &ov_kv : sys->overlays) {
+		const overlay_slot &ov = ov_kv.second;
+		if (ov.xsc == nullptr) {
+			continue;
+		}
 		uint32_t ca_w = sys->base.info.display_pixel_width;
 		uint32_t ca_h = sys->base.info.display_pixel_height;
 		if (ca_w == 0) ca_w = 3840;
@@ -8043,7 +8061,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 		// Resolve controller swapchain → SRV + texture dims. Acquire the keyed
 		// mutex once (KEYEDMUTEX flushes controller-side writes into our device).
-		struct d3d11_service_swapchain *ov_sc = d3d11_service_swapchain_from_xrt(sys->overlay_xsc);
+		struct d3d11_service_swapchain *ov_sc = d3d11_service_swapchain_from_xrt(ov.xsc);
 		ID3D11ShaderResourceView *overlay_srv = nullptr;
 		uint32_t sprite_w_px = 0, sprite_h_px = 0;
 		IDXGIKeyedMutex *overlay_mutex = nullptr;
@@ -8078,16 +8096,16 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 			// Physical meters → atlas pixels through the per-mode tile dims:
 			// tile_w spans disp_w_m of display width, tile_h spans disp_h_m.
-			float overlay_w_atlas = sys->overlay_size_w_m / disp_w_m * (float)tile_w;
-			float overlay_h_atlas = sys->overlay_size_h_m / disp_h_m * (float)tile_h;
+			float overlay_w_atlas = ov.size_w_m / disp_w_m * (float)tile_w;
+			float overlay_h_atlas = ov.size_h_m / disp_h_m * (float)tile_h;
 
 			// Dock point: normalized display anchor → in-tile atlas pixels, then
 			// subtract the sprite pivot (in atlas pixels) so the pivot lands on
 			// the anchor. z = 0 → identical in every tile (no disparity offset).
-			float anchor_px_x = sys->overlay_anchor_x * (float)tile_w;
-			float anchor_px_y = sys->overlay_anchor_y * (float)tile_h;
-			float base_tile_x = anchor_px_x - sys->overlay_pivot_x * overlay_w_atlas;
-			float base_tile_y = anchor_px_y - sys->overlay_pivot_y * overlay_h_atlas;
+			float anchor_px_x = ov.anchor_x * (float)tile_w;
+			float anchor_px_y = ov.anchor_y * (float)tile_h;
+			float base_tile_x = anchor_px_x - ov.pivot_x * overlay_w_atlas;
+			float base_tile_y = anchor_px_y - ov.pivot_y * overlay_h_atlas;
 
 			// Common pipeline state (same blit shader as cursor/windows).
 			// The controller renders the overlay with Direct2D, which outputs
@@ -8127,11 +8145,11 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					// spec_version 19: side-by-side stereo overlay → sample the
 					// matching half per eye (col%2: 0 = left, 1 = right), stretched
 					// to the full overlay footprint. Mono = whole image both eyes.
-					float src_w = sys->overlay_stereo_sbs
+					float src_w = ov.stereo_sbs
 					                  ? (float)(sprite_w_px / 2u)
 					                  : (float)sprite_w_px;
 					int eye_idx = (int)(col % 2);
-					cb->src_rect[0] = sys->overlay_stereo_sbs ? (float)eye_idx * src_w : 0.0f;
+					cb->src_rect[0] = ov.stereo_sbs ? (float)eye_idx * src_w : 0.0f;
 					cb->src_rect[1] = 0;
 					cb->src_rect[2] = src_w;
 					cb->src_rect[3] = (float)sprite_h_px;
@@ -13064,6 +13082,7 @@ comp_d3d11_service_workspace_set_cursor(struct xrt_system_compositor *xsysc,
 // in its per-tile overlay render pass (docked per anchor/pivot, no disparity).
 extern "C" xrt_result_t
 comp_d3d11_service_workspace_set_overlay(struct xrt_system_compositor *xsysc,
+                                          uint32_t overlay_id,
                                           struct xrt_swapchain *xsc,
                                           float anchor_x, float anchor_y,
                                           float pivot_x, float pivot_y,
@@ -13075,15 +13094,32 @@ comp_d3d11_service_workspace_set_overlay(struct xrt_system_compositor *xsysc,
 	}
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
-	sys->overlay_xsc = xsc; // borrowed; controller owns lifetime
-	sys->overlay_stereo_sbs = stereo_sbs;
-	sys->overlay_anchor_x = anchor_x;
-	sys->overlay_anchor_y = anchor_y;
-	sys->overlay_pivot_x = pivot_x;
-	sys->overlay_pivot_y = pivot_y;
-	sys->overlay_size_w_m = size_w_m > 0.0f ? size_w_m : 0.10f;
-	sys->overlay_size_h_m = size_h_m > 0.0f ? size_h_m : 0.02f;
-	sys->overlay_visible = visible;
+
+	// spec_version 21: !visible OR NULL swapchain = remove this id; other ids
+	// are untouched. Hides the overlay without tearing anything down.
+	if (!visible || xsc == nullptr) {
+		sys->overlays.erase(overlay_id);
+		return XRT_SUCCESS;
+	}
+
+	// Reject a brand-new id beyond the cap (updates to existing ids always
+	// proceed). Bounds a buggy controller without dropping live overlays.
+	if (sys->overlays.find(overlay_id) == sys->overlays.end() &&
+	    sys->overlays.size() >= D3D11_SERVICE_MAX_OVERLAYS) {
+		U_LOG_W("workspace overlay map full (%u); ignoring new overlay id %u",
+		        (unsigned)D3D11_SERVICE_MAX_OVERLAYS, overlay_id);
+		return XRT_SUCCESS;
+	}
+
+	overlay_slot &slot = sys->overlays[overlay_id];
+	slot.xsc = xsc; // borrowed; controller owns lifetime
+	slot.stereo_sbs = stereo_sbs;
+	slot.anchor_x = anchor_x;
+	slot.anchor_y = anchor_y;
+	slot.pivot_x = pivot_x;
+	slot.pivot_y = pivot_y;
+	slot.size_w_m = size_w_m > 0.0f ? size_w_m : 0.10f;
+	slot.size_h_m = size_h_m > 0.0f ? size_h_m : 0.02f;
 	return XRT_SUCCESS;
 }
 
