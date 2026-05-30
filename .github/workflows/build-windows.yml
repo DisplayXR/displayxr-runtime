@@ -1124,3 +1124,108 @@ jobs:
           fail_on_unmatched_files: true
           draft: false
           prerelease: false
+
+  # On a v* tag push, after Runtime + BundleTestApps prove the build
+  # works end-to-end, observe the new tag in versions.json so the dev
+  # orchestrator (scripts/setup-displayxr.{sh,bat}) starts installing
+  # this release. Sibling repos use .github/workflows/versions-bump.yml
+  # via repository_dispatch for their fields; this job is the runtime's
+  # own field-self-bump. See docs/specs/runtime/versions-json-autobump.md.
+  #
+  # The ABI gate prevents shipping a runtime that breaks the currently-
+  # pinned leia_plugin (same class of incident as v1.5.2 vs leia v1.0.5
+  # → ADR-020). If ABIs mismatch, we skip the runtime bump and open a
+  # tracking issue in the leia repo — the next compatible leia tag will
+  # come in via versions-bump.yml and clear the path.
+  BumpVersionsJsonOnTag:
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && github.repository == 'DisplayXR/displayxr-runtime' }}
+    needs: [Runtime, BundleTestApps]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint App installation token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DISPLAYXR_APP_ID }}
+          private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
+          owner: DisplayXR
+          repositories: |
+            displayxr-runtime
+            displayxr-leia-plugin
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: true
+
+      - name: Read current leia_plugin pin
+        id: leia
+        run: |
+          PIN=$(python3 -c 'import json; print(json.load(open("versions.json"))["leia_plugin"])')
+          echo "pin=$PIN" >> "$GITHUB_OUTPUT"
+
+      - name: ABI assertion against currently-pinned leia_plugin
+        id: abi
+        run: |
+          set +e
+          python3 scripts/check_plugin_abi.py --leia-tag "${{ steps.leia.outputs.pin }}"
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Open ABI-mismatch issue on leia repo
+        if: steps.abi.outputs.rc != '0'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          TITLE="ABI mismatch: leia ${{ steps.leia.outputs.pin }} cannot load runtime ${{ github.ref_name }}"
+          BODY=$(cat <<EOF
+          Auto-opened by [\`build-windows.yml\`](https://github.com/DisplayXR/displayxr-runtime/actions/runs/${{ github.run_id }}) when runtime tagged \`${{ github.ref_name }}\`.
+
+          The new runtime's \`XRT_PLUGIN_API_VERSION_CURRENT\` (in \`src/xrt/include/xrt/xrt_plugin.h\`) does not match the ABI version the currently-pinned leia plug-in (\`${{ steps.leia.outputs.pin }}\`) was built against.
+
+          The loader would reject this combination at \`xrCreateInstance\` (ADR-020 rule 3), so the runtime's \`versions.json[runtime]\` was **not** bumped. Dev-orchestrator users stay on the previous known-good bundle.
+
+          **To unblock:** rebuild the leia plug-in against runtime \`${{ github.ref_name }}\` (bump \`DXR_RUNTIME_GIT_TAG\` in this repo's \`CMakeLists.txt\`), tag a new release. The leia release's \`versions-bump\` dispatch will then bump leia first; the next runtime tag (or a manual workflow_dispatch on \`versions-bump.yml\` with \`field=runtime\`) will catch up the runtime field.
+          EOF
+          )
+          EXISTING=$(gh issue list --repo DisplayXR/displayxr-leia-plugin \
+                       --state open --search "$TITLE in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo DisplayXR/displayxr-leia-plugin --body "$BODY"
+          else
+            gh issue create --repo DisplayXR/displayxr-leia-plugin \
+              --title "$TITLE" --body "$BODY" --label "abi-mismatch,automated"
+          fi
+          echo "::warning::Skipped versions.json[runtime] bump — opened tracking issue in displayxr-leia-plugin."
+
+      - name: Bump versions.json[runtime]
+        if: steps.abi.outputs.rc == '0'
+        run: |
+          python3 - <<'PY'
+          import json, os
+          path = "versions.json"
+          tag  = os.environ["GITHUB_REF_NAME"]
+          d = json.load(open(path))
+          if d["runtime"] == tag:
+              print(f"versions.json[runtime] already == {tag}; nothing to do")
+              open(".bump-noop", "w").close()
+          else:
+              print(f"versions.json[runtime]: {d['runtime']} → {tag}")
+              d["runtime"] = tag
+              with open(path, "w") as f:
+                  json.dump(d, f, indent=2)
+                  f.write("\n")
+          PY
+
+      - name: Commit and push
+        if: steps.abi.outputs.rc == '0' && hashFiles('.bump-noop') == ''
+        run: |
+          git config user.name  "displayxr-publish-bot[bot]"
+          git config user.email "displayxr-publish-bot@users.noreply.github.com"
+          git add versions.json
+          git commit -m "chore(versions): bump runtime → ${GITHUB_REF_NAME}
+
+          Auto-bumped by build-windows.yml on tag push.
+          [skip ci]"
+          git push origin HEAD:main || (git pull --rebase origin main && git push origin HEAD:main)

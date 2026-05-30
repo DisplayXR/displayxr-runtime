@@ -1,0 +1,186 @@
+name: Bump versions.json
+
+# Receives repository_dispatch events from sibling repos when they ship a
+# new release. The sender (shell-pvt, leia-plugin, mcp, demo-*) calls
+# this workflow with `event_type=versions-bump` and a client_payload of:
+#
+#   {
+#     "field":       "shell" | "leia_plugin" | "mcp_tools" | "demos.<name>",
+#     "tag":         "v1.2.3",
+#     "source_repo": "DisplayXR/displayxr-<repo>"
+#   }
+#
+# This workflow:
+#   1. Reads versions.json from main.
+#   2. For leia_plugin only: runs scripts/check_plugin_abi.py first. If
+#      the sibling's ABI doesn't match the runtime's, the bump is skipped
+#      and a tracking issue is opened in displayxr-leia-plugin asking for
+#      a rebuild. Other fields skip the ABI gate entirely.
+#   3. Writes the new tag into versions.json.
+#   4. Direct-commits to main via the displayxr-publish-bot GitHub App.
+#
+# Why direct commit (not PR): "released = tested" is the working
+# contract — a tagged sibling release is treated as compat-validated.
+# The ABI gate above is the one structural exception that component CI
+# provably can't check (see ADR-020 + the v1.0.5 vs v1.5.2 incident).
+#
+# Manual override / re-run: `workflow_dispatch` accepts the same inputs
+# so you can bump fields by hand without a sibling release event.
+
+on:
+  repository_dispatch:
+    types: [versions-bump]
+  workflow_dispatch:
+    inputs:
+      field:
+        description: 'versions.json field (e.g. shell, leia_plugin, mcp_tools, demos.gaussiansplat)'
+        required: true
+      tag:
+        description: 'Tag to pin (e.g. v1.2.3)'
+        required: true
+      source_repo:
+        description: 'Source repo (e.g. DisplayXR/displayxr-shell-pvt)'
+        required: false
+        default: 'manual-dispatch'
+
+permissions:
+  contents: read
+
+concurrency:
+  # Serialize bumps so two siblings racing the same minute don't
+  # clobber each other on versions.json.
+  group: versions-bump
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    if: github.repository == 'DisplayXR/displayxr-runtime'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve inputs
+        id: inputs
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            FIELD="${{ github.event.client_payload.field }}"
+            TAG="${{ github.event.client_payload.tag }}"
+            SRC="${{ github.event.client_payload.source_repo }}"
+          else
+            FIELD="${{ inputs.field }}"
+            TAG="${{ inputs.tag }}"
+            SRC="${{ inputs.source_repo }}"
+          fi
+          if [ -z "$FIELD" ] || [ -z "$TAG" ]; then
+            echo "::error::field and tag are required (got field='$FIELD' tag='$TAG')"
+            exit 1
+          fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag '$TAG' is not vX.Y.Z"
+            exit 1
+          fi
+          echo "field=$FIELD" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"     >> "$GITHUB_OUTPUT"
+          echo "src=$SRC"     >> "$GITHUB_OUTPUT"
+
+      - name: Mint App installation token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DISPLAYXR_APP_ID }}
+          private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
+          owner: DisplayXR
+          # Bumping versions.json here; issue-opening on ABI fail there.
+          repositories: |
+            displayxr-runtime
+            displayxr-leia-plugin
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: true
+
+      - name: ABI assertion (leia_plugin only)
+        id: abi
+        if: steps.inputs.outputs.field == 'leia_plugin'
+        run: |
+          set +e
+          python3 scripts/check_plugin_abi.py --leia-tag "${{ steps.inputs.outputs.tag }}"
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Open ABI-mismatch issue on leia repo
+        if: steps.inputs.outputs.field == 'leia_plugin' && steps.abi.outputs.rc != '0'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          TITLE="ABI mismatch: leia ${{ steps.inputs.outputs.tag }} cannot load current runtime"
+          BODY=$(cat <<EOF
+          Auto-opened by [\`versions-bump.yml\`](https://github.com/DisplayXR/displayxr-runtime/actions/runs/${{ github.run_id }}) when ${{ steps.inputs.outputs.src }} fired a \`versions-bump\` event for tag \`${{ steps.inputs.outputs.tag }}\`.
+
+          The runtime's \`XRT_PLUGIN_API_VERSION_CURRENT\` (in \`src/xrt/include/xrt/xrt_plugin.h\` on \`displayxr-runtime@main\`) does not match the ABI version the leia plug-in at this tag was built against (\`DXR_RUNTIME_GIT_TAG\` in this repo's \`CMakeLists.txt\`).
+
+          The loader would reject this combination at \`xrCreateInstance\` (ADR-020 rule 3), so the runtime's \`versions.json\` was **not** bumped. Dev-orchestrator users stay on the previous known-good bundle.
+
+          **To unblock:** rebuild against the current runtime headers (bump \`DXR_RUNTIME_GIT_TAG\` in \`CMakeLists.txt\` to the current runtime \`versions.json[runtime]\`), tag a new release. The next tag's auto-dispatch will retry the bump.
+          EOF
+          )
+          # If an open issue with this title already exists, comment instead of duplicating.
+          EXISTING=$(gh issue list --repo DisplayXR/displayxr-leia-plugin \
+                       --state open --search "$TITLE in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo DisplayXR/displayxr-leia-plugin --body "$BODY"
+          else
+            gh issue create --repo DisplayXR/displayxr-leia-plugin \
+              --title "$TITLE" --body "$BODY" --label "abi-mismatch,automated"
+          fi
+          echo "::warning::Skipped versions.json bump — opened tracking issue in displayxr-leia-plugin."
+          exit 0
+
+      - name: Apply bump
+        if: steps.inputs.outputs.field != 'leia_plugin' || steps.abi.outputs.rc == '0'
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          field = os.environ["FIELD"]
+          tag   = os.environ["TAG"]
+          path  = "versions.json"
+          with open(path) as f:
+              d = json.load(f)
+          # Support nested fields like "demos.gaussiansplat".
+          parts = field.split(".")
+          cur = d
+          for p in parts[:-1]:
+              if p not in cur or not isinstance(cur[p], dict):
+                  sys.exit(f"versions.json has no nested key path '{field}'")
+              cur = cur[p]
+          leaf = parts[-1]
+          if leaf not in cur:
+              sys.exit(f"versions.json has no field '{field}'")
+          if cur[leaf] == tag:
+              print(f"versions.json[{field}] already == {tag}; nothing to do")
+              # Touch a sentinel so the next step skips the commit.
+              open(".bump-noop", "w").close()
+          else:
+              print(f"versions.json[{field}]: {cur[leaf]} → {tag}")
+              cur[leaf] = tag
+              with open(path, "w") as f:
+                  json.dump(d, f, indent=2)
+                  f.write("\n")
+          PY
+        env:
+          FIELD: ${{ steps.inputs.outputs.field }}
+          TAG:   ${{ steps.inputs.outputs.tag }}
+
+      - name: Commit and push
+        if: hashFiles('.bump-noop') == '' && (steps.inputs.outputs.field != 'leia_plugin' || steps.abi.outputs.rc == '0')
+        run: |
+          git config user.name  "displayxr-publish-bot[bot]"
+          git config user.email "displayxr-publish-bot@users.noreply.github.com"
+          git add versions.json
+          git commit -m "chore(versions): bump ${{ steps.inputs.outputs.field }} → ${{ steps.inputs.outputs.tag }}
+
+          Auto-bumped by versions-bump.yml in response to ${{ steps.inputs.outputs.src }}.
+          [skip ci]"
+          # Retry once if main moved underneath us — concurrency group serializes
+          # event-handler races, but a human push to main during the run is still possible.
+          git push origin HEAD:main || (git pull --rebase origin main && git push origin HEAD:main)
