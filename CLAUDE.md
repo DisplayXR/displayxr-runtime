@@ -333,7 +333,7 @@ Creates a tagged runtime release here, monitors `build-windows.yml` + `build-mac
 /release minor
 /release major
 ```
-Updates `CMakeLists.txt` `VERSION`, creates the tag, watches Windows + macOS CI concurrently (wall time = `max(Windows, macOS)`). The CI workflows themselves attach the artifacts to the GitHub Release on `v*` tag push via `softprops/action-gh-release@v2` (post-#290); the skill writes curated release notes on top via `gh release edit --notes`. macOS .pkg is a soft requirement — its absence warns but doesn't STOP the release. Only releases this repo — shell, demos, extensions each have their own flows (see "Releasing the Runtime" above).
+Tags `main` HEAD and pushes the tag (no longer commits a "Release vX.Y.Z" bump to `main` — `build-windows.yml` patches `CMakeLists.txt` `VERSION` from `git describe --tags --abbrev=0 --match 'v[0-9]*'` at build time per PR #353, and `build-macos.yml` derives the version from `GITHUB_REF` directly, so the source-tree value would just drift). Watches Windows + macOS CI concurrently (wall time = `max(Windows, macOS)`). The CI workflows themselves attach the artifacts to the GitHub Release on `v*` tag push via `softprops/action-gh-release@v2` (post-#290); the skill writes curated release notes on top via `gh release edit --notes`. macOS .pkg is a soft requirement — its absence warns but doesn't STOP the release. Only releases this repo — shell, demos, extensions each have their own flows (see "Releasing the Runtime" above).
 
 ### /ask-gemini - Code Analysis with Gemini
 Ask Gemini to analyze code and produce a read-only report. See `~/.claude/skills/ask-gemini/SKILL.md`.
