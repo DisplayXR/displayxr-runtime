@@ -31,8 +31,8 @@ This doc extends multi-display compositing **across networked machines**. It ass
 
 | Doc | Relationship |
 |-----|-------------|
-| [spatial-os.md](spatial-os.md) (#43) | **Single-display compositing.** Foundation pipeline. |
-| [3d-shell.md](3d-shell.md) (#44) | **Window manager.** Owns window placement and interaction. |
+| [multi-compositor.md](../architecture/multi-compositor.md) (#43) | **Single-display compositing.** Foundation pipeline. |
+| [separation-of-concerns.md](../architecture/separation-of-concerns.md) (#44) | **Window manager (controller).** Owns window placement and interaction. |
 | [multi-display-single-machine.md](multi-display-single-machine.md) (#69) | **Local multi-display.** This doc generalizes its routing over the network. Prerequisite. |
 
 ## Design: Hub with Remote Compositor Targets

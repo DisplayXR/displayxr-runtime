@@ -53,4 +53,4 @@ Test apps follow the pattern `cube_{class}_{api}_{platform}`:
 - [In-Process vs Service](../architecture/in-process-vs-service.md) — detailed comparison of the two compositor deployment modes
 - [XR_EXT_win32_window_binding](../specs/extensions/XR_EXT_win32_window_binding.md) — Win32 window binding spec
 - [XR_EXT_cocoa_window_binding](../specs/extensions/XR_EXT_cocoa_window_binding.md) — macOS window binding spec
-- [Spatial OS](../roadmap/spatial-os.md) — multi-compositor architecture for the IPC path
+- [Service-Mode Multi-Compositor](../architecture/multi-compositor.md) — multi-compositor architecture for the IPC path

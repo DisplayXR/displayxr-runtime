@@ -42,7 +42,8 @@ Contribute to the DisplayXR runtime — compositors, state tracker, auxiliary co
 - **[Contributing Guide](guides/contributing.md)** — workflow, code style, CI expectations
 - **[Separation of Concerns](architecture/separation-of-concerns.md)** — layer boundaries (authoritative)
 - **[Project Structure](architecture/project-structure.md)** — source tree organization
-- **[Compositor Pipeline](architecture/compositor-pipeline.md)** — end-to-end rendering pipeline
+- **[Compositor Pipeline](architecture/compositor-pipeline.md)** — end-to-end rendering pipeline (single-app)
+- **[Service-Mode Multi-Compositor](architecture/multi-compositor.md)** — server-side N-client compositor (workspace + IPC apps + bridge)
 - **[Extension vs Legacy Apps](architecture/extension-vs-legacy.md)** — how the runtime handles both app types
 - **[In-Process vs Service](architecture/in-process-vs-service.md)** — compositor deployment modes
 - **[Implementing an Extension](guides/implementing-extension.md)** — how to add OpenXR extensions
@@ -109,8 +110,6 @@ Design docs, status trackers, and plans — some shipped, some in progress. Afte
 
 ### Shipped
 
-- [Spatial OS](roadmap/spatial-os.md) — multi-compositor architecture (#43)
-- [3D Shell](roadmap/3d-shell.md) — spatial window manager (#44)
 - [3D Capture](roadmap/3d-capture.md) — capture pipeline (shipped in Shell Phase 8)
 - [Workspace/Runtime Contract](roadmap/workspace-runtime-contract.md) — IPC between a workspace controller and the runtime
 - **MCP** — framework extracted to [`DisplayXR/displayxr-mcp`](https://github.com/DisplayXR/displayxr-mcp). See the [MCP spec](https://github.com/DisplayXR/displayxr-mcp/blob/main/docs/mcp-spec.md) for the protocol; Phase A (handle-app introspection) and Phase B (workspace tools, hosted in `displayxr-shell-pvt`) both shipped.

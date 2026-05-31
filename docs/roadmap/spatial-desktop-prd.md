@@ -129,8 +129,8 @@ Physical 3D Display
 
 | Component | Doc |
 |-----------|-----|
-| Multi-compositor pipeline | [spatial-os.md](spatial-os.md) |
-| Window manager / shell | [3d-shell.md](3d-shell.md) |
+| Multi-compositor pipeline | [multi-compositor.md](../architecture/multi-compositor.md) |
+| Window manager / shell | [separation-of-concerns.md](../architecture/separation-of-concerns.md) + the DisplayXR Shell (`displayxr-shell-pvt`) |
 | Shell/runtime IPC contract | [workspace-runtime-contract.md](workspace-runtime-contract.md) |
 | 3D capture pipeline | [3d-capture.md](3d-capture.md) |
 | Multi-display (local) | [multi-display-single-machine.md](multi-display-single-machine.md) |
@@ -213,7 +213,7 @@ Issues are never dual-created. After shell migration, shell dev issues move to `
 
 Cross-app spatial compositing allows multiple applications to coexist in a shared 3D scene on a tracked display, with correct spatial placement and coherent viewing behavior. This is the central runtime capability that makes the rest of the platform possible — and the v1 differentiator.
 
-**Full specification:** [spatial-os.md](spatial-os.md)
+**Full specification:** [multi-compositor.md](../architecture/multi-compositor.md)
 
 ---
 
@@ -239,7 +239,7 @@ The shell/runtime contract defines the IPC message set and boundary rules betwee
 
 The 3D shell provides mouse/keyboard interaction, gaze-based hover, shell chrome manipulation, and app launcher/task switching. Each managed window exposes title bar, move/resize handles, depth control, and close/minimize affordances.
 
-**Full specification:** [3d-shell.md](3d-shell.md)
+**Full specification:** [separation-of-concerns.md](../architecture/separation-of-concerns.md) (controller boundary) + the DisplayXR Shell repo (`displayxr-shell-pvt`)
 
 ---
 

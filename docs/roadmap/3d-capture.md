@@ -16,8 +16,8 @@ This doc covers the **3D capture pipeline** — how the runtime captures spatial
 
 | Doc | Relationship |
 |-----|-------------|
-| [spatial-os.md](spatial-os.md) (#43) | **Compositing mechanism.** Capture taps into the multi-compositor pipeline defined here. |
-| [3d-shell.md](3d-shell.md) (#44) | **Shell layer.** Owns capture UX (hotkeys, browse, share). |
+| [multi-compositor.md](../architecture/multi-compositor.md) (#43) | **Compositing mechanism.** Capture taps into the multi-compositor pipeline defined here. |
+| [separation-of-concerns.md](../architecture/separation-of-concerns.md) (#44) | **Controller layer.** The workspace controller owns capture UX (hotkeys, browse, share). |
 | [workspace-runtime-contract.md](workspace-runtime-contract.md) | **IPC contract.** Defines capture command/completion messages between shell and runtime. |
 
 ## Vision
