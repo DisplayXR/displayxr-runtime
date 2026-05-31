@@ -242,6 +242,9 @@ option(XRT_MODULE_COMPOSITOR "Enable the compositor at all" ON)
 set(XRT_MODULE_COMPOSITOR_MAIN OFF CACHE BOOL "Build main compositor (DISABLED — lightweight runtime)" FORCE)
 option_with_deps(XRT_MODULE_COMPOSITOR_NULL "Build testing null compositor" DEPENDS XRT_MODULE_COMPOSITOR XRT_HAVE_VULKAN)
 option(XRT_MODULE_CLI "Build displayxr-cli" ON)
+option_with_deps(
+	XRT_MODULE_CONTROL_PANEL "Build the DisplayXR Control Panel GUI (ImGui+SDL2)" DEPENDS XRT_HAVE_SDL2
+	)
 option(XRT_MODULE_OPENXR_STATE_TRACKER "Build OpenXR State Tracker" ON)
 
 # Feature configuration (sorted)
@@ -489,6 +492,7 @@ message(STATUS "#    MODULE_COMPOSITOR_MAIN:      ${XRT_MODULE_COMPOSITOR_MAIN}"
 message(STATUS "#    MODULE_COMPOSITOR_NULL:      ${XRT_MODULE_COMPOSITOR_NULL}")
 message(STATUS "#    MODULE_IPC:                  ${XRT_MODULE_IPC}")
 message(STATUS "#    MODULE_CLI:                  ${XRT_MODULE_CLI}")
+message(STATUS "#    MODULE_CONTROL_PANEL:        ${XRT_MODULE_CONTROL_PANEL}")
 message(STATUS "#    MODULE_OPENXR_STATE_TRACKER: ${XRT_MODULE_OPENXR_STATE_TRACKER}")
 message(STATUS "#")
 message(STATUS "#    FEATURE_AHARDWARE_BUFFER:                      ${XRT_FEATURE_AHARDWARE_BUFFER}")
