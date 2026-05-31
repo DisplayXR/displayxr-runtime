@@ -192,6 +192,7 @@ jobs:
         run: |
           cmake -S . -B build -G "Ninja Multi-Config" `
             -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_MANIFEST_FEATURES=gui `
             -DX_VCPKG_APPLOCAL_DEPS_INSTALL=ON `
             -DCMAKE_INSTALL_PREFIX=_package `
             -DXRT_BUILD_INSTALLER=ON `
