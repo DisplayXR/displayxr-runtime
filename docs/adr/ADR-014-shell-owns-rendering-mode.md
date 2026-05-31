@@ -47,8 +47,8 @@ In workspace mode the runtime delivers input twice, with the controller owning a
 - Same app binary works in standalone (app controls mode) and shell (shell controls mode) without code changes
 
 ### Negative
-- Apps cannot programmatically switch modes in shell (e.g., a media player switching to 2D for menus)
-- Slight latency (~50ms) for mode change notification via shared memory polling
+- Apps cannot programmatically switch modes in a workspace (e.g., a media player switching to 2D for menus)
+- Small notification latency — the app sees the new mode on its next frame (it reads the published `active_rendering_mode_index` per-frame and receives `XrEventDataRenderingModeChangedEXT`), not instantly the way an in-process standalone switch takes effect
 
 ### Future Considerations
 - If apps need to request mode changes in shell, add an advisory API (shell can accept or reject)
