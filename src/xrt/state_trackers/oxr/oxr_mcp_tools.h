@@ -77,9 +77,14 @@ void
 oxr_mcp_tools_set_capture_handler(oxr_mcp_capture_fn fn, void *userdata);
 
 /*!
- * Read the @c HKLM\Software\DisplayXR\Capabilities\MCP\Enabled DWORD on
- * Windows. Returns @c true iff the key exists and the value is 1. On
- * non-Windows platforms (no installer infrastructure) returns @c false.
+ * Read the MCP capability marker written by the displayxr-mcp installer.
+ * Returns @c true iff the marker is present AND set to enabled.
+ *
+ *   Windows: @c HKLM\Software\DisplayXR\Capabilities\MCP\Enabled
+ *            (REG_DWORD == 1), 64-bit registry view.
+ *   macOS:   @c /Library/Application Support/DisplayXR/Capabilities/MCP/Enabled
+ *            (first byte == @c '1', written root:wheel 0644 by the
+ *            postinstall script in DisplayXRMCP-*.pkg).
  *
  * Combine with @ref mcp_check_env_or so the @c DISPLAYXR_MCP env var
  * still wins as an explicit override:
@@ -88,7 +93,7 @@ oxr_mcp_tools_set_capture_handler(oxr_mcp_capture_fn fn, void *userdata);
  *       mcp_server_start();
  *   }
  *
- * Caller-side helper rather than framework-side because the registry
+ * Caller-side helper rather than framework-side because the marker
  * path is DisplayXR-specific; the framework stays consumer-agnostic.
  */
 bool
