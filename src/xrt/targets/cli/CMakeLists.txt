@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: BSL-1.0
 
 ######
-# Create a cli interface for Monado.
+# Create the displayxr-cli diagnostics / headless self-test tool.
 
 add_executable(
 	cli
-	cli_cmd_calibration_dump.c
 	cli_cmd_info.c
+	cli_cmd_selftest.c
 	cli_cmd_probe.c
 	cli_cmd_test.c
 	cli_common.h
@@ -15,25 +15,18 @@ add_executable(
 	)
 add_sanitizers(cli)
 
-if(NOT WIN32)
-	# No getline on Windows, so until we have a portable impl
-	target_sources(cli PRIVATE cli_cmd_calibrate.c)
-endif()
-
-if(XRT_HAVE_OPENCV)
-	target_link_libraries(cli PRIVATE aux_tracking)
-endif()
-
 set_target_properties(cli PROPERTIES OUTPUT_NAME displayxr-cli PREFIX "")
 
 target_link_libraries(
 	cli
 	PRIVATE
+		xrt-interfaces
 		aux_os
 		aux_os_ble
 		aux_util
 		aux_math
 		target_instance_no_comp
+		target_lists
 		drv_includes
 	)
 

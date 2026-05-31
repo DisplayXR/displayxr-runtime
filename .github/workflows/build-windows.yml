@@ -243,6 +243,43 @@ jobs:
           }
           Write-Host "PASS: sim-display plug-in built and exports xrtPluginNegotiate."
 
+      # First runtime EXECUTION smoke test in CI. Every other job only builds.
+      # `displayxr-cli selftest` creates an instance + system devices headlessly
+      # (no compositor, no GPU, no window), discovers the display processor via
+      # the REAL registry path, and validates the display info the plug-in
+      # reports. Its exit code is the gate. This isolates plug-in discovery /
+      # ABI / display-info failures from compositor+GPU ones and catches the
+      # ABI-drift class of bugs (cf. ADR-020) at PR time.
+      - name: Headless self-test (displayxr-cli selftest)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: |
+          $cli = "_package/bin/displayxr-cli.exe"
+          if (-not (Test-Path $cli)) {
+            Write-Host "::error::$cli missing — CLI did not build."
+            exit 1
+          }
+          $plugin = (Resolve-Path "_package/bin/plugins/DisplayXR-SimDisplay.dll").Path
+          # Windows plug-in discovery is registry-only (no env override), so
+          # register the just-built sim-display plug-in exactly as the runtime
+          # installer would. GitHub runners run as admin — the HKLM write needs
+          # no elevation prompt. Cleaned up in the finally block.
+          $key = "HKLM\Software\DisplayXR\DisplayProcessors\sim-display"
+          reg add $key /v Binary /t REG_SZ /d "$plugin" /f | Out-Null
+          reg add $key /v ProbeOrder /t REG_DWORD /d 200 /f | Out-Null
+          reg add $key /v DisplayName /t REG_SZ /d "Simulated 3D Display" /f | Out-Null
+          try {
+            & $cli selftest
+            $code = $LASTEXITCODE
+          } finally {
+            reg delete $key /f | Out-Null
+          }
+          if ($code -ne 0) {
+            Write-Host "::error::displayxr-cli selftest failed (exit $code) — the runtime could not discover a display processor or the display info it reported was invalid. See the selftest output above."
+            exit $code
+          }
+          Write-Host "PASS: headless self-test succeeded — display processor discovered and display info valid."
+
       - name: Build Installer
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: cmake --build build --config Release --target installer

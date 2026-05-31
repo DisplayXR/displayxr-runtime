@@ -15,22 +15,16 @@ extern "C" {
 
 
 int
-cli_cmd_calibrate(int argc, const char **argv);
-
-int
-cli_cmd_calibration_dump(int argc, const char **argv);
-
-int
 cli_cmd_info(int argc, const char **argv);
+
+int
+cli_cmd_selftest(int argc, const char **argv);
 
 int
 cli_cmd_probe(int argc, const char **argv);
 
 int
 cli_cmd_test(int argc, const char **argv);
-
-int
-cli_cmd_trace(int argc, const char **argv);
 
 
 #ifdef __cplusplus
