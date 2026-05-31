@@ -25,10 +25,10 @@ extern "C" {
 #endif
 
 #define XR_EXT_spatial_workspace 1
-#define XR_EXT_spatial_workspace_SPEC_VERSION 21
+#define XR_EXT_spatial_workspace_SPEC_VERSION 22
 #define XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_EXT_spatial_workspace"
 
-// Provisional XrStructureType values. The 1000999100..109 range is reserved for
+// Provisional XrStructureType values. The 1000999100..110 range is reserved for
 // this extension; final values reconcile with the Khronos registry before spec
 // freeze.
 #define XR_TYPE_WORKSPACE_CLIENT_INFO_EXT                   ((XrStructureType)1000999100)
@@ -41,6 +41,7 @@ extern "C" {
 #define XR_TYPE_WORKSPACE_CURSOR_INFO_EXT                   ((XrStructureType)1000999107)  // spec_version 13
 #define XR_TYPE_WORKSPACE_OVERLAY_SWAPCHAIN_CREATE_INFO_EXT ((XrStructureType)1000999108)  // spec_version 17
 #define XR_TYPE_WORKSPACE_OVERLAY_INFO_EXT                  ((XrStructureType)1000999109)  // spec_version 17
+#define XR_TYPE_WORKSPACE_CURSOR_DEPTH_EXT                  ((XrStructureType)1000999110)  // spec_version 22
 
 /*!
  * @brief Workspace-local identifier for a client.
@@ -263,44 +264,14 @@ typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceClientFrameRateCapEXT)(
     XrWorkspaceClientId  clientId,
     float                maxFps);
 
-// ---- Hit-test (spec_version 3, region out added in spec_version 4) ----
-
-/*!
- * @brief Spatial raycast hit-test against workspace windows.
- *
- * Translates a screen-space cursor (display pixels, origin top-left) to a
- * client window hit. The runtime intersects an eye→cursor ray with each
- * workspace client's window quad and reports both the hit clientId and a
- * region classification (XrWorkspaceHitRegionEXT). The runtime classifies
- * geometry; the controller decides what each region means (focus on
- * CONTENT, drag on TITLE_BAR, close on CLOSE_BUTTON, resize on the
- * EDGE_RESIZE_* values, etc.).
- *
- * @param session       A valid workspace session.
- * @param cursorX       Cursor X in display pixels (origin top-left).
- * @param cursorY       Cursor Y in display pixels.
- * @param outClientId   Output: clientId of the hit window, or
- *                      XR_NULL_WORKSPACE_CLIENT_ID on background miss.
- * @param outLocalUV    Output: U,V on the content quad in [0,1] range,
- *                      origin top-left. Meaningful only when
- *                      *outHitRegion == CONTENT_EXT; 0,0 otherwise.
- * @param outHitRegion  Output: classification of the hit. May be
- *                      BACKGROUND_EXT (miss), CONTENT_EXT, TITLE_BAR_EXT,
- *                      a button, an EDGE_RESIZE_* value, TASKBAR_EXT, or
- *                      LAUNCHER_TILE_EXT.
- *
- * NOTE — hardcoded MVP key policy (consumed by xrEnumerateWorkspaceInputEventsEXT
- * documentation): TAB and DELETE are consumed by the runtime; ESC is
- * consumed when any window is maximized; everything else is delivered via
- * input event AND forwarded to the focused HWND.
- */
-typedef XrResult (XRAPI_PTR *PFN_xrWorkspaceHitTestEXT)(
-    XrSession                session,
-    int32_t                  cursorX,
-    int32_t                  cursorY,
-    XrWorkspaceClientId     *outClientId,
-    XrVector2f              *outLocalUV,
-    XrWorkspaceHitRegionEXT *outHitRegion);
+// ---- Hit-test (removed in spec_version 22) ----
+//
+// xrWorkspaceHitTestEXT and its per-frame raycast were removed in spec_version 22.
+// The workspace controller now owns hit-testing entirely (eye→cursor ray vs.
+// window quads, region classification) and feeds the runtime only the resulting
+// cursor depth via xrSetWorkspaceCursorDepthEXT (see below). XrWorkspaceHitRegionEXT
+// is retained because POINTER / POINTER_MOTION events still carry a hitRegion the
+// controller fills in.
 
 // ---- Focus control (spec_version 4) ----
 
@@ -354,9 +325,10 @@ typedef enum XrWorkspaceInputEventTypeEXT {
  * @brief One input event drained from the workspace input queue.
  *
  * Tagged C union — `eventType` selects the meaningful union member. Pointer
- * events carry the workspace hit-test result (clientId / region / UV) the
- * runtime computed at drain time, so the controller does not need to call
- * xrWorkspaceHitTestEXT in the common case.
+ * events carry the cursor position (cursorX / cursorY in display pixels); as of
+ * spec_version 22 the controller owns hit-testing and fills in the
+ * clientId / region / UV fields itself from its own eye→cursor raycast (the
+ * runtime no longer computes them at drain time).
  *
  * Hardcoded MVP key policy (see xrEnumerateWorkspaceInputEventsEXT):
  *   - TAB and DELETE are consumed by the runtime (never delivered to the
@@ -368,7 +340,7 @@ typedef enum XrWorkspaceInputEventTypeEXT {
  * Pointer motion events (spec_version 6) deliver per-frame WM_MOUSEMOVE while
  * pointer capture is enabled. Controllers wanting hover feedback without
  * holding a button can opt in via xrEnableWorkspacePointerCaptureEXT (any
- * button), or poll xrWorkspaceHitTestEXT directly when capture is unset.
+ * button) and run their own hit-test over the per-frame cursor positions.
  *
  * Frame-tick events (spec_version 6) fire once per compositor frame so a
  * controller can pace per-frame work (animation interpolation, hover effects)
@@ -434,6 +406,8 @@ typedef struct XrWorkspaceInputEventEXT {
             uint64_t                timestampNs;     // host monotonic ns at frame compose
             XrVector3f              viewerPosInDisplaySpace; // spec_version 20: viewer eye-midpoint, display space (m)
             XrBool32                viewerTracked;   // spec_version 20: 1 if viewerPos is populated this frame
+            int32_t                 cursorX;         // spec_version 22: OS cursor X, display pixels, top-left origin
+            int32_t                 cursorY;         // spec_version 22: OS cursor Y. Controller runs its own hit-test over this per frame.
         } frameTick;
         struct {  // spec_version 6: workspace focused-client transition
             XrWorkspaceClientId     prevClientId;
@@ -934,9 +908,9 @@ typedef XrResult (XRAPI_PTR *PFN_xrCreateWorkspaceCursorSwapchainEXT)(
 /*!
  * @brief Active cursor parameters.
  *
- * Pushed via xrSetWorkspaceCursorEXT. The runtime uses these along with
- * the per-frame raycast (hit slot + hit Z) it already performs to render
- * the cursor sprite at the right world position with per-eye disparity.
+ * Pushed via xrSetWorkspaceCursorEXT. The runtime composes the sprite at the
+ * OS cursor position with per-eye disparity derived from the depth the
+ * controller pushes each frame via xrSetWorkspaceCursorDepthEXT.
  */
 typedef struct XrWorkspaceCursorInfoEXT {
     XrStructureType  type;        // XR_TYPE_WORKSPACE_CURSOR_INFO_EXT
@@ -968,6 +942,42 @@ typedef struct XrWorkspaceCursorInfoEXT {
 typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceCursorEXT)(
     XrSession                       session,
     const XrWorkspaceCursorInfoEXT *info);
+
+// ---- Cursor depth (spec_version 22) ----
+
+/*!
+ * @brief Per-frame cursor depth, supplied by the workspace controller.
+ *
+ * In spec_version 22 the runtime no longer raycasts to find the depth of the
+ * window under the cursor. The controller — which owns window placement and
+ * already runs its own eye→cursor hit-test — pushes the resulting depth here
+ * each frame. The runtime feeds @ref hitZMeters into its existing per-eye
+ * disparity math so the cursor sprite floats at the depth of what it points
+ * at, and uses @ref overWindow to dim the cursor over windows (crosstalk
+ * mitigation). When a modal grab pins the cursor to the zero-disparity plane,
+ * the controller pushes hitZMeters = 0.
+ */
+typedef struct XrWorkspaceCursorDepthEXT {
+    XrStructureType  type;        // XR_TYPE_WORKSPACE_CURSOR_DEPTH_EXT
+    const void* XR_MAY_ALIAS next;
+    float            hitZMeters;  // Ray-plane depth under cursor (meters); 0 = panel plane
+    XrBool32         overWindow;  // XR_TRUE when the cursor is over a window
+} XrWorkspaceCursorDepthEXT;
+
+/*!
+ * @brief Push the current cursor depth to the runtime.
+ *
+ * Call once per frame while the workspace cursor is visible (this IS a
+ * per-frame call, unlike xrSetWorkspaceCursorEXT). The runtime caches the
+ * most recent value and applies it to the next composited frame; cursor
+ * screen position itself is still owned by the runtime (OS cursor).
+ *
+ * @return XR_SUCCESS, XR_ERROR_VALIDATION_FAILURE (bad info type),
+ *         XR_ERROR_FEATURE_UNSUPPORTED (session not in workspace IPC mode).
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceCursorDepthEXT)(
+    XrSession                        session,
+    const XrWorkspaceCursorDepthEXT *info);
 
 // ---- Workspace overlay (spec_version 17) ----
 //
@@ -1278,14 +1288,6 @@ XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceClientVisibilityEXT(
     XrWorkspaceClientId  clientId,
     XrBool32             visible);
 
-XRAPI_ATTR XrResult XRAPI_CALL xrWorkspaceHitTestEXT(
-    XrSession                session,
-    int32_t                  cursorX,
-    int32_t                  cursorY,
-    XrWorkspaceClientId     *outClientId,
-    XrVector2f              *outLocalUV,
-    XrWorkspaceHitRegionEXT *outHitRegion);
-
 XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceFocusedClientEXT(
     XrSession           session,
     XrWorkspaceClientId clientId);
@@ -1359,6 +1361,10 @@ XRAPI_ATTR XrResult XRAPI_CALL xrCreateWorkspaceCursorSwapchainEXT(
 XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceCursorEXT(
     XrSession                       session,
     const XrWorkspaceCursorInfoEXT *info);
+
+XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceCursorDepthEXT(
+    XrSession                        session,
+    const XrWorkspaceCursorDepthEXT *info);
 
 XRAPI_ATTR XrResult XRAPI_CALL xrCreateWorkspaceOverlaySwapchainEXT(
     XrSession                                         session,

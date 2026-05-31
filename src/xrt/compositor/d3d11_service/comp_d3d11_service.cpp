@@ -1078,33 +1078,6 @@ struct d3d11_multi_compositor
 	//! the first drain after any non-empty focus emits a transition.
 	int32_t focused_slot_last_emitted;
 
-	//! Phase 2.C C3.C-4: per-frame hovered slot from workspace_raycast_hit_test
-	//! (the in-runtime chrome-fade hit-test). Used to emit POINTER_HOVER
-	//! events when the hovered slot changes so controllers can drive their
-	//! own chrome fade in grid/immersive modes (where pointer capture is OFF
-	//! and per-frame MOTION events aren't published). -1 = no hover.
-	//! Updated by render_pass; consumed by drain.
-	int32_t hovered_slot;
-	int32_t hovered_slot_last_emitted;
-
-	//! spec_version 9: per-frame hovered chromeRegionId — the controller-defined
-	//! sub-region within the hovered slot's chrome quad (0 = none). Updated by
-	//! render_pass alongside hovered_slot from the same workspace_hit_result.
-	//! POINTER_HOVER fires when EITHER slot OR chromeRegionId transitions, so
-	//! the controller can drive per-region UI (button hover-lighten) without
-	//! enabling continuous pointer capture.
-	uint32_t hovered_chrome_region_id;
-	uint32_t hovered_chrome_region_id_last_emitted;
-
-	//! spec_version 13: per-frame hovered hit-region (CONTENT, TITLE_BAR,
-	//! EDGE_RESIZE_N, NE, …). Updated from workspace_raycast_hit_test's
-	//! edge_flags + chrome detection. POINTER_HOVER fires on any
-	//! transition so the controller can drive cursor-shape switching
-	//! (resize-arrow on edge hover, etc.) without enabling continuous
-	//! pointer capture. Values match XrWorkspaceHitRegionEXT.
-	uint32_t hovered_hit_region;
-	uint32_t hovered_hit_region_last_emitted;
-
 	//! spec_version 8: last value of focused_slot we signaled the wakeup event
 	//! for. The drain emits FOCUS_CHANGED based on focused_slot_last_emitted;
 	//! this separate snapshot lives in render_pass so we can wake the
@@ -1137,14 +1110,18 @@ struct d3d11_multi_compositor
 	//! Unlike window_dismissed, the multi-comp structure stays alive for re-activation.
 	bool suspended;
 
-	//! spec_version 13: cursor screen position + hit-Z published by the
-	//! per-frame raycast in render_pass. The cursor render pass uses these
-	//! to draw the controller-pushed sprite (sys->cursor_xsc) at per-tile
-	//! per-eye disparity. Shape / visibility are NOT runtime-side — see
-	//! sys->cursor_xsc + sys->cursor_visible (controller-pushed).
+	//! Cursor render inputs for the controller-pushed sprite (sys->cursor_xsc).
+	//! cursor_panel_x/y is the OS cursor position sampled per frame in
+	//! render_pass (runtime-owned). cursor_hit_z_m + cursor_over_window are
+	//! pushed per frame by the workspace controller via
+	//! xrSetWorkspaceCursorDepthEXT (spec_version 22) — the controller owns the
+	//! hit-test. The cursor render pass uses cursor_hit_z_m for per-eye
+	//! disparity and cursor_over_window for the over-window dim. Shape /
+	//! visibility are also controller-pushed (sys->cursor_xsc + cursor_visible).
 	int32_t cursor_panel_x;
 	int32_t cursor_panel_y;
 	float   cursor_hit_z_m;
+	bool    cursor_over_window;
 
 	//! Right-click-drag state for window repositioning.
 	struct
@@ -4504,10 +4481,9 @@ multi_compositor_update_input_forward(struct d3d11_multi_compositor *mc)
 	// The gauss demo's "Open…" button (#228 Tier 1 integration
 	// testing) was bitten by this on every tile size.
 	//
-	// FIX: edge-resize detection runs INDEPENDENTLY via
-	// workspace_raycast_hit_test → hit.edge_flags, surfaced to the
-	// workspace controller as XR_WORKSPACE_HIT_REGION_EDGE_RESIZE_*
-	// events, so the inset here was vestigial. Setting it to 0 lets
+		// FIX: edge-resize detection is owned by the workspace controller
+		// (it runs its own hit-test and drives resize via window-pose RPCs),
+		// so the inset here was vestigial. Setting it to 0 lets
 	// every cursor position inside the tile forward at the correct
 	// HWND coord. Resize-handle behaviour is unchanged.
 	(void)is_capture; // (kept for the capture-path branch below)
@@ -4850,7 +4826,6 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
  * Unregister a per-client compositor from the multi-compositor.
  */
 static void multi_compositor_render(struct d3d11_service_system *sys); // forward decl
-static uint32_t hit_result_to_region(const struct workspace_hit_result &hit);   // forward decl
 
 static void
 multi_compositor_unregister_client(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
@@ -5348,8 +5323,6 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 		sys->multi_comp->focused_slot = -1;
 		sys->multi_comp->focused_slot_last_emitted = -1;
 		sys->multi_comp->focused_slot_signaled_value = -1;
-		sys->multi_comp->hovered_slot = -1;
-		sys->multi_comp->hovered_slot_last_emitted = -1;
 	}
 
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
@@ -5747,388 +5720,6 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 	return XRT_SUCCESS;
 }
 
-/*!
- * Result of spatial raycasting hit-test against workspace windows.
- */
-struct workspace_hit_result
-{
-	int slot;            //!< Hit window slot (-1 = no hit)
-	bool in_title_bar;   //!< Hit is in the title bar region (pill bg)
-	bool in_grip_handle; //!< Hit is on the 8-dot grip in the pill center (drag/rotate region)
-	bool in_close_btn;    //!< Hit is on the close button
-	bool in_minimize_btn; //!< Hit is on the minimize button
-	bool in_maximize_btn; //!< Hit is on the maximize/fullscreen button
-	bool in_content;     //!< Hit is in the content area
-	float local_x_m;    //!< Hit point in window-local meters (0 = left edge)
-	float local_y_m;    //!< Hit point in window-local meters (0 = top of title bar, positive down)
-	int edge_flags;      //!< RESIZE_LEFT|RIGHT|TOP|BOTTOM if near edge
-
-	// Phase 2.C C4: controller-submitted chrome quad. Populated additively
-	// alongside the in-runtime chrome fields above so the runtime's existing
-	// cursor + drag logic keeps working until C5 deletes the in-runtime
-	// chrome render block. The shell reads chrome_region_id off POINTER /
-	// POINTER_MOTION events to dispatch close/min/max/grip semantics.
-	bool     in_chrome_quad;     //!< Hit fell inside the controller-submitted chrome quad
-	uint32_t chrome_region_id;   //!< Matched region id from slot->chrome_regions[]; 0 if no region or no hit
-	float    chrome_local_u;     //!< Hit point in chrome-UV [0,1] (0 = left edge of chrome image)
-	float    chrome_local_v;     //!< Hit point in chrome-UV [0,1] (0 = top of chrome image)
-
-	//! Phase 2.J / 3D cursor: world-space z of the ray-plane intersection on
-	//! the hit window (display-space meters; 0 = panel plane, positive = in
-	//! front of panel toward viewer). Populated for any slot hit (content,
-	//! chrome, edges); 0 when no slot hit. Drives the runtime-rendered
-	//! cursor's per-eye disparity so it floats at the same depth as the
-	//! window the user is pointing at.
-	float    hit_z_m;
-};
-
-/*!
- * Spatial raycast hit-test: cast a ray from the user's eye through the mouse
- * cursor position on the display surface, and intersect with workspace window planes.
- *
- * Each window is a 3D rectangle defined by (pose, width_m, height_m).
- * The display is at Z=0 with known physical dimensions.
- * The eye position comes from the display processor's face tracking.
- *
- * This approach is tiling-independent and future-proofs for angled 3D windows.
- */
-static struct workspace_hit_result
-workspace_raycast_hit_test(struct d3d11_service_system *sys,
-                       struct d3d11_multi_compositor *mc,
-                       POINT cursor_px)
-{
-	struct workspace_hit_result result = {};
-	result.slot = -1;
-	// Pill click priority: in a multi-window grid the pill (chrome quad)
-	// of one slot can extend over a NEIGHBOR slot's content area. Without
-	// this fallback, the per-slot iteration's first content hit wins —
-	// even if that pixel actually shows a different slot's pill on top.
-	// Save content-only hits here while we keep iterating for a pill hit
-	// on any other slot; commit at the end if no pill was found.
-	struct workspace_hit_result pending = {};
-	pending.slot = -1;
-
-	float disp_w_m = sys->base.info.display_width_m;
-	float disp_h_m = sys->base.info.display_height_m;
-	uint32_t disp_px_w = sys->base.info.display_pixel_width;
-	uint32_t disp_px_h = sys->base.info.display_pixel_height;
-	if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
-	if (disp_h_m <= 0.0f) disp_h_m = 0.394f;
-	if (disp_px_w == 0) disp_px_w = 3840;
-	if (disp_px_h == 0) disp_px_h = 2160;
-
-	float m_per_px_x = disp_w_m / (float)disp_px_w;
-	float m_per_px_y = disp_h_m / (float)disp_px_h;
-
-	// Step 1: Convert mouse pixel to 3D point on display surface (Z=0 plane)
-	float point_x = ((float)cursor_px.x - (float)disp_px_w / 2.0f) * m_per_px_x;
-	float point_y = ((float)disp_px_h / 2.0f - (float)cursor_px.y) * m_per_px_y;
-	float point_z = 0.0f;
-
-	// Step 2: Get eye position for ray origin
-	struct xrt_vec3 eye_left = {0, 0, 0.6f}; // Fallback: 60cm from display
-	struct xrt_vec3 eye_right = {0, 0, 0.6f};
-	comp_d3d11_service_get_predicted_eye_positions(&sys->base, &eye_left, &eye_right);
-	// Use center eye
-	float eye_x = (eye_left.x + eye_right.x) / 2.0f;
-	float eye_y = (eye_left.y + eye_right.y) / 2.0f;
-	float eye_z = (eye_left.z + eye_right.z) / 2.0f;
-	if (eye_z <= 0.001f) eye_z = 0.6f; // Safety: eye must be in front of display
-
-	// Ray: origin = eye, direction = (display_point - eye)
-	float ray_dx = point_x - eye_x;
-	float ray_dy = point_y - eye_y;
-	float ray_dz = point_z - eye_z; // Negative (toward display)
-
-	// UI dimensions in meters (spatial constants — single source of truth)
-	float title_bar_h_m = UI_TITLE_BAR_H_M;
-	float btn_w_m = UI_BTN_W_M;
-	float resize_zone_m = UI_RESIZE_ZONE_M;
-
-	// Step 3: Test each window (focused last = highest z-priority, test first)
-	// Build reverse render order: focused first, then others
-	int test_order[D3D11_MULTI_MAX_CLIENTS];
-	int test_count = 0;
-	if (mc->focused_slot >= 0 && mc->focused_slot < D3D11_MULTI_MAX_CLIENTS &&
-	    mc->clients[mc->focused_slot].active && !mc->clients[mc->focused_slot].minimized) {
-		test_order[test_count++] = mc->focused_slot;
-	}
-	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
-		if (i == mc->focused_slot) continue;
-		if (mc->clients[i].active && !mc->clients[i].minimized) {
-			test_order[test_count++] = i;
-		}
-	}
-
-	for (int ti = 0; ti < test_count; ti++) {
-		int s = test_order[ti];
-		float win_x = mc->clients[s].window_pose.position.x;
-		float win_y = mc->clients[s].window_pose.position.y;
-		float win_z = mc->clients[s].window_pose.position.z;
-		float win_w = mc->clients[s].window_width_m;
-		float win_h = mc->clients[s].window_height_m;
-		const struct xrt_quat *win_q = &mc->clients[s].window_pose.orientation;
-		bool rotated = !quat_is_identity(win_q);
-
-		// Ray-plane intersection
-		float t, hit_x, hit_y;
-		float world_hit_z; // 3D cursor uses this for per-eye disparity
-		if (rotated) {
-			// Rotated window: compute plane normal from orientation
-			struct xrt_vec3 normal_local = {0, 0, 1};
-			struct xrt_vec3 normal;
-			math_quat_rotate_vec3(win_q, &normal_local, &normal);
-			// Plane equation: dot(normal, point - win_pos) = 0
-			float ray_dot_n = ray_dx * normal.x + ray_dy * normal.y + ray_dz * normal.z;
-			if (fabsf(ray_dot_n) < 1e-6f) continue; // Parallel
-			float d = (win_x - eye_x) * normal.x + (win_y - eye_y) * normal.y + (win_z - eye_z) * normal.z;
-			t = d / ray_dot_n;
-			if (t < 0.0f) continue; // Behind eye
-			float world_hit_x = eye_x + t * ray_dx;
-			float world_hit_y = eye_y + t * ray_dy;
-			world_hit_z = eye_z + t * ray_dz;
-			// Convert world hit to window-local coords via inverse rotation
-			struct xrt_vec3 delta = {world_hit_x - win_x, world_hit_y - win_y, world_hit_z - win_z};
-			struct xrt_quat inv_q;
-			math_quat_invert(win_q, &inv_q);
-			struct xrt_vec3 local_hit;
-			math_quat_rotate_vec3(&inv_q, &delta, &local_hit);
-			// local_hit.x/y are window-local coords centered at window center
-			hit_x = win_x + local_hit.x; // project back to flat coords for bounds check
-			hit_y = win_y + local_hit.y;
-		} else {
-			// Flat window: simple Z-plane intersection
-			if (fabsf(ray_dz) < 1e-6f) continue;
-			t = (win_z - eye_z) / ray_dz;
-			if (t < 0.0f) continue;
-			hit_x = eye_x + t * ray_dx;
-			hit_y = eye_y + t * ray_dy;
-			world_hit_z = win_z;
-		}
-
-		// Window bounds (content area)
-		float win_left = win_x - win_w / 2.0f;
-		float win_right = win_x + win_w / 2.0f;
-		float win_bottom = win_y - win_h / 2.0f;
-		float win_top = win_y + win_h / 2.0f;
-
-		// Phase 2.K Commit 8.B: floating-pill geometry — must mirror the
-		// render code so click-targets line up with what the user sees.
-		// Pill is 75% of content width (centered) and floats above the
-		// content quad with a half-tb-height gap. Buttons live at the
-		// pill's right edge (not the content's right edge).
-		// #307: chrome (close/min/max) shows on a maximized window too, so the
-		// MAX button can restore it. Maximize is controller-owned now; the
-		// runtime no longer hides the title bar on maximize.
-		bool has_workspace_title_bar = (mc->clients[s].client_type != CLIENT_TYPE_CAPTURE);
-		const float PILL_W_FRAC_HT = 0.75f;
-		float pill_w_m = win_w * PILL_W_FRAC_HT;
-		float pill_left = win_x - pill_w_m / 2.0f;
-		float pill_right = win_x + pill_w_m / 2.0f;
-		float pill_gap_m = title_bar_h_m * 0.5f;
-		float pill_bot = win_top + (has_workspace_title_bar ? pill_gap_m : 0.0f);
-		float pill_top = pill_bot + (has_workspace_title_bar ? title_bar_h_m : 0.0f);
-
-		// Outer hover bounds (content + gap + pill). Resize zones extend
-		// outward from the content rect on all four sides.
-		float ext_top = has_workspace_title_bar ? pill_top : win_top;
-		float ext_left = win_left;
-		float ext_right = win_right;
-		float ext_bottom = win_bottom;
-
-		// Phase 2.C C4: include the controller-submitted chrome quad in the
-		// outer bounds so hits inside chrome — even if the chrome is wider
-		// than or positioned outside the in-runtime pill — still reach the
-		// chrome detection block below.
-		if (mc->clients[s].chrome_xsc != nullptr && mc->clients[s].chrome_layout_valid) {
-			float ch_cx = mc->clients[s].chrome_pose_in_client.position.x;
-			float ch_cy = mc->clients[s].chrome_pose_in_client.position.y;
-			float ch_w = mc->clients[s].chrome_size_w_m;
-			if (mc->clients[s].chrome_width_fraction > 0.0f) {
-				ch_w = mc->clients[s].window_width_m * mc->clients[s].chrome_width_fraction;
-			}
-			if (mc->clients[s].chrome_anchor_top_edge) {
-				ch_cy = mc->clients[s].window_height_m * 0.5f +
-				        mc->clients[s].chrome_pose_in_client.position.y;
-			}
-			float ch_hw = ch_w * 0.5f;
-			float ch_hh = mc->clients[s].chrome_size_h_m * 0.5f;
-			if (win_x + ch_cx - ch_hw < ext_left)   ext_left   = win_x + ch_cx - ch_hw;
-			if (win_x + ch_cx + ch_hw > ext_right)  ext_right  = win_x + ch_cx + ch_hw;
-			if (win_y + ch_cy - ch_hh < ext_bottom) ext_bottom = win_y + ch_cy - ch_hh;
-			if (win_y + ch_cy + ch_hh > ext_top)    ext_top    = win_y + ch_cy + ch_hh;
-		}
-
-		// Check if hit is within extended window bounds (including resize zone)
-		if (hit_x >= ext_left - resize_zone_m && hit_x < ext_right + resize_zone_m &&
-		    hit_y >= ext_bottom - resize_zone_m && hit_y < ext_top + resize_zone_m) {
-
-			// Window-local coordinates relative to top of the pill (or
-			// content for capture clients), positive down/right.
-			float local_x = hit_x - win_left;
-			float local_y = ext_top - hit_y;
-
-			result.slot = s;
-			result.local_x_m = local_x;
-			result.local_y_m = local_y;
-			// 3D cursor: ray-plane intersection's z (rotated window) or
-			// the slot's z (flat window). The cursor render pass uses
-			// this for per-eye disparity so the cursor floats at the
-			// same depth as whatever the user is pointing at.
-			result.hit_z_m = world_hit_z;
-
-			// Classify hit region.
-			if (has_workspace_title_bar) {
-				bool in_pill = (hit_x >= pill_left && hit_x < pill_right &&
-				                hit_y >= pill_bot && hit_y < pill_top);
-				bool in_content = (hit_x >= win_left && hit_x < win_right &&
-				                   hit_y >= win_bottom && hit_y < win_top);
-				result.in_title_bar = in_pill;
-				result.in_content = in_content;
-			} else {
-				// Capture clients: top strip of content acts as drag zone.
-				bool in_window = (hit_x >= win_left && hit_x < win_right &&
-				                  hit_y >= win_bottom && hit_y < win_top);
-				result.in_title_bar = in_window && (local_y < title_bar_h_m);
-				result.in_content = in_window && (local_y >= title_bar_h_m);
-			}
-
-			if (result.in_title_bar && has_workspace_title_bar) {
-				// Buttons live at the pill's right edge — local-x is
-				// measured relative to the pill, not the window.
-				float pill_local_x = hit_x - pill_left;
-				result.in_close_btn = (pill_local_x >= pill_w_m - btn_w_m);
-				result.in_minimize_btn = !result.in_close_btn &&
-				                         (pill_local_x >= pill_w_m - 2.0f * btn_w_m);
-				result.in_maximize_btn = !result.in_close_btn && !result.in_minimize_btn &&
-				                         (pill_local_x >= pill_w_m - 3.0f * btn_w_m);
-
-				// Grip handle: 8-dot grid centered in the pill (4 cols × 2
-				// rows, 1 mm dots with 1 mm gaps → 7 mm × 3 mm). Mirrors
-				// chrome-render geometry — drag/rotate is only valid here.
-				const float DOT_SIZE_M = 0.001f;
-				const float DOT_GAP_M  = 0.001f;
-				const int   GRIP_COLS  = 4;
-				const int   GRIP_ROWS  = 2;
-				float grip_w_m = (float)GRIP_COLS * DOT_SIZE_M +
-				                 (float)(GRIP_COLS - 1) * DOT_GAP_M;
-				float grip_h_m = (float)GRIP_ROWS * DOT_SIZE_M +
-				                 (float)(GRIP_ROWS - 1) * DOT_GAP_M;
-				float grip_cx = (pill_left + pill_right) * 0.5f;
-				float grip_cy = (pill_bot + pill_top) * 0.5f;
-				float grip_left = grip_cx - grip_w_m * 0.5f;
-				float grip_right = grip_cx + grip_w_m * 0.5f;
-				float grip_bot = grip_cy - grip_h_m * 0.5f;
-				float grip_top = grip_cy + grip_h_m * 0.5f;
-				if (!result.in_close_btn && !result.in_minimize_btn && !result.in_maximize_btn &&
-				    hit_x >= grip_left && hit_x < grip_right &&
-				    hit_y >= grip_bot && hit_y < grip_top) {
-					result.in_grip_handle = true;
-				}
-			} else if (result.in_title_bar) {
-				// Capture-client compatibility (buttons relative to window).
-				result.in_close_btn = (local_x >= win_w - btn_w_m);
-				result.in_minimize_btn = !result.in_close_btn &&
-				                         (local_x >= win_w - 2.0f * btn_w_m);
-				result.in_maximize_btn = !result.in_close_btn && !result.in_minimize_btn &&
-				                         (local_x >= win_w - 3.0f * btn_w_m);
-			}
-
-			// Phase 2.C C4: ALSO test the controller-submitted chrome quad
-			// (additive to the in-runtime chrome hit-test fields above). The
-			// chrome quad bounds come from slot->chrome_pose_in_client +
-			// chrome_size_w/h_m and live in window-local space, so we compute
-			// them in flat coords using the same hit_x/hit_y the in-runtime
-			// path already projected into.
-			//
-			// Chrome-UV [0,1]^2 has UV(0,0) at the chrome image's TOP-LEFT —
-			// i.e. high-Y corner of the chrome quad in world coords. We set
-			// chrome_region_id from the first matching hit_regions[] entry;
-			// no match leaves it 0 (still in_chrome_quad — caller can treat
-			// region 0 as "chrome bg" if useful). Region 0 is reserved as
-			// XR_NULL_WORKSPACE_CHROME_REGION_ID per the public spec.
-			if (mc->clients[s].chrome_xsc != nullptr && mc->clients[s].chrome_layout_valid) {
-				float ch_cx = mc->clients[s].chrome_pose_in_client.position.x;
-				float ch_cy = mc->clients[s].chrome_pose_in_client.position.y;
-				float ch_w = mc->clients[s].chrome_size_w_m;
-				if (mc->clients[s].chrome_width_fraction > 0.0f) {
-					ch_w = mc->clients[s].window_width_m * mc->clients[s].chrome_width_fraction;
-				}
-				if (mc->clients[s].chrome_anchor_top_edge) {
-					ch_cy = mc->clients[s].window_height_m * 0.5f +
-					        mc->clients[s].chrome_pose_in_client.position.y;
-				}
-				float ch_hw = ch_w * 0.5f;
-				float ch_hh = mc->clients[s].chrome_size_h_m * 0.5f;
-				float ch_left  = win_x + ch_cx - ch_hw;
-				float ch_right = win_x + ch_cx + ch_hw;
-				float ch_bot   = win_y + ch_cy - ch_hh;
-				float ch_top   = win_y + ch_cy + ch_hh;
-				if (hit_x >= ch_left && hit_x < ch_right &&
-				    hit_y >= ch_bot  && hit_y < ch_top) {
-					result.in_chrome_quad = true;
-					float u = (hit_x - ch_left) / (ch_right - ch_left);
-					float v = 1.0f - (hit_y - ch_bot) / (ch_top - ch_bot); // Y-flip: UV(0,0) = top-left
-					result.chrome_local_u = u;
-					result.chrome_local_v = v;
-					for (uint32_t ri = 0; ri < mc->clients[s].chrome_region_count; ri++) {
-						const struct ipc_workspace_chrome_hit_region *reg = &mc->clients[s].chrome_regions[ri];
-						if (reg->id == 0) continue; // 0 is the null sentinel
-						if (u >= reg->bounds_x && u < reg->bounds_x + reg->bounds_w &&
-						    v >= reg->bounds_y && v < reg->bounds_y + reg->bounds_h) {
-							result.chrome_region_id = reg->id;
-							break;
-						}
-					}
-				}
-			}
-
-			// Edge detection (resize zones). Phase 2.C C5 follow-up:
-			// resize handles compute from CONTENT bounds, not from the
-			// extended-with-chrome bounds — users expect to grab the
-			// content top edge for top-resize, not the imaginary chrome
-			// top above it. ext_left/right/bottom/top stay used for
-			// hit-test reach (so chrome clicks register), but the
-			// edge-handle math uses the original win_top/etc.
-			result.edge_flags = RESIZE_NONE;
-			if (hit_x < win_left + resize_zone_m) result.edge_flags |= RESIZE_LEFT;
-			if (hit_x >= win_right - resize_zone_m) result.edge_flags |= RESIZE_RIGHT;
-			if (hit_y < win_bottom + resize_zone_m) result.edge_flags |= RESIZE_BOTTOM;
-			if (hit_y >= win_top - resize_zone_m && hit_y < win_top + resize_zone_m) result.edge_flags |= RESIZE_TOP;
-
-			// If we're inside the window (not just in resize zone), clear edge flags
-			// unless we're actually on the edge.
-			bool inside_outer = (hit_x >= win_left && hit_x < win_right &&
-			                     hit_y >= win_bottom && hit_y < ext_top);
-			if (inside_outer && result.edge_flags == RESIZE_NONE) {
-				result.edge_flags = RESIZE_NONE;
-			}
-
-			// Pill priority: a hit on this slot's pill (in_title_bar) or
-			// its controller-submitted chrome quad always wins over any
-			// neighbor's content hit, even if a neighbor was tested
-			// first. Content-only hits get saved as a fallback so we can
-			// keep iterating for a pill hit; if none arrives, commit the
-			// fallback after the loop.
-			const bool is_pill_hit =
-			    result.in_title_bar || result.in_chrome_quad;
-			if (is_pill_hit) {
-				break;
-			}
-			if (pending.slot < 0) {
-				pending = result;
-			}
-			result = {};
-			result.slot = -1;
-			// fall through — continue iterating to look for a pill hit
-		}
-	}
-
-	if (result.slot < 0 && pending.slot >= 0) {
-		result = pending;
-	}
-	return result;
-}
 
 /*!
  * Helper: create a quaternion from yaw (Y-axis rotation) in radians.
@@ -6404,42 +5995,21 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// through xrEnumerateWorkspaceInputEventsEXT and the controller
 	// pushes per-client poses via xrSetWorkspaceClientWindowPoseEXT.
 
-	// Per-frame raycast: drives wakeup signaling AND publishes cursor
-	// position + hit-Z for the cursor render pass. spec_version 13: cursor
-	// SHAPE / SPRITE / VISIBILITY are the workspace controller's job (via
-	// xrSetWorkspaceCursorEXT — the controller pushes its own swapchain).
-	// The runtime still owns POSITION + HIT-Z + over-window dimming because
-	// those depend on the per-frame raycast that's plumbing, not policy.
+	// Per-frame: sample the OS cursor position for the cursor render pass and
+	// signal the controller's event-driven wakeup on focus / window-pose
+	// transitions. spec_version 13: cursor SHAPE / SPRITE / VISIBILITY are the
+	// workspace controller's job (xrSetWorkspaceCursorEXT). spec_version 22:
+	// cursor DEPTH (hit_z) + over-window dimming are also controller-owned —
+	// pushed via xrSetWorkspaceCursorDepthEXT — because they depend on the
+	// hit-test the controller now owns. The runtime keeps only POSITION here
+	// (it owns the HWND / OS cursor).
 	if (mc->window != nullptr) {
 		POINT cpt = {0, 0};
 		GetCursorPos(&cpt);
 		ScreenToClient(mc->hwnd, &cpt);
-		struct workspace_hit_result cursor_hover = workspace_raycast_hit_test(sys, mc, cpt);
 
-		// spec_version 8: signal wakeup on hover transitions (not per
-		// frame), so the controller's event-driven wait stays asleep
-		// unless there's something new to drain.
-		if (mc->hovered_slot != cursor_hover.slot) {
-			mc->hovered_slot = cursor_hover.slot;
-			service_signal_workspace_wakeup(sys);
-		}
-		// spec_version 9: same for chrome sub-region.
-		uint32_t new_chrome_region = (cursor_hover.slot >= 0) ? cursor_hover.chrome_region_id : 0;
-		if (mc->hovered_chrome_region_id != new_chrome_region) {
-			mc->hovered_chrome_region_id = new_chrome_region;
-			service_signal_workspace_wakeup(sys);
-		}
-		// spec_version 13: same for hit-region (CONTENT, TITLE_BAR,
-		// EDGE_RESIZE_*). Lets the controller drive cursor-shape on
-		// hover (resize-arrow at edges) without continuous pointer
-		// capture. Uses the same hit_result_to_region mapping as the
-		// POINTER event drain so the controller sees a consistent enum.
-		uint32_t new_hit_region = hit_result_to_region(cursor_hover);
-		if (mc->hovered_hit_region != new_hit_region) {
-			mc->hovered_hit_region = new_hit_region;
-			service_signal_workspace_wakeup(sys);
-		}
-		// Same for focused_slot.
+		// spec_version 8: wake the controller on focused_slot transitions so
+		// its event-driven wait stays asleep unless there's something to drain.
 		if (mc->focused_slot != mc->focused_slot_signaled_value) {
 			mc->focused_slot_signaled_value = mc->focused_slot;
 			service_signal_workspace_wakeup(sys);
@@ -6464,256 +6034,27 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			}
 		}
 
-		// Publish cursor screen position + hit Z for the runtime's
-		// cursor render pass to consume. hit_z = 0 when off-window so
-		// the cursor falls back to the panel plane (zero disparity).
-		// #308: while the controller has grabbed input for a z=0 modal UI
-		// (the launcher band), pin the cursor to z=0 too — otherwise it floats
-		// at the pushed-back window depth and the per-eye disparity makes it
-		// misalign with the band (clicks land off-tile, resize affordances show).
+		// Publish OS cursor screen position for the cursor render pass. Depth
+		// (cursor_hit_z_m) + over-window flag come from the controller via
+		// comp_d3d11_service_workspace_set_cursor_depth(). Wake the controller
+		// on cursor movement so its event-driven wait drains the FRAME_TICK
+		// (which carries this position) promptly and re-runs its hit-test —
+		// this replaces the hover-transition wakeup the raycast used to emit.
+		if (mc->cursor_panel_x != cpt.x || mc->cursor_panel_y != cpt.y) {
+			service_signal_workspace_wakeup(sys);
+		}
 		mc->cursor_panel_x = cpt.x;
 		mc->cursor_panel_y = cpt.y;
-		mc->cursor_hit_z_m =
-		    (!sys->input_grabbed && cursor_hover.slot >= 0) ? cursor_hover.hit_z_m : 0.0f;
 	}
 
-	// Left-click: focus window, close button, title bar drag, or content click.
-	// Title bar extends TITLE_BAR_HEIGHT_PX above the content rect.
-	{
-		bool lmb_held = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-		bool lmb_just_pressed = lmb_held && !mc->prev_lmb_held;
-		mc->prev_lmb_held = lmb_held;
+	// The render-thread LMB handler was removed in spec_version 22 along with
+	// the raycast. Click policy (focus, close, drag, resize, chrome buttons)
+	// is the workspace controller's job (ADR-018): it reacts to the POINTER
+	// events it drains. Content-click forwarding to app HWNDs is driven by the
+	// focused-slot input-forward rect (multi_compositor_update_input_forward +
+	// WndProc); the old synthetic-DOWN "drag-in-one-click" shim only mattered
+	// for handle apps rendering in their own window, which do not appear here.
 
-		// #308: while the controller has grabbed input for a modal UI (the
-		// launcher band), the runtime must NOT run its own per-frame click
-		// policy (close-button, content-click forward / synthetic-click). The
-		// band owns every click; the WndProc already suppresses app-forwarding,
-		// but this render-thread handler synthesizes clicks to the focused app's
-		// HWND directly, which otherwise leaks a band click through to the
-		// window behind it. Gate the whole block off while grabbed.
-		if (lmb_just_pressed && !sys->input_grabbed) {
-			POINT pt;
-			GetCursorPos(&pt);
-			ScreenToClient(mc->hwnd, &pt);
-
-			// Spatial raycast: cast ray from eye through cursor on display surface
-			struct workspace_hit_result hit = workspace_raycast_hit_test(sys, mc, pt);
-
-			// Edge resize is the workspace controller's job (ADR-018 /
-			// PR 3 of the runtime→controller migration). Controllers see
-			// POINTER events with hit_region == EDGE_RESIZE_*, enable
-			// pointer capture on LMB-down, and drive per-frame
-			// xrSetWorkspaceClientWindowPoseEXT (which sets
-			// hwnd_resize_pending so the app HWND keeps resizing).
-			{
-
-			int hit_slot = hit.slot;
-			bool in_title_bar = hit.in_title_bar;
-			bool in_close_btn = hit.in_close_btn;
-			bool in_minimize_btn = hit.in_minimize_btn;
-			// #307: the maximize button is handled by the controller via the
-			// chrome-region POINTER event (SHELL_CHROME_REGION_MAX); the runtime
-			// no longer toggles maximize on the in_maximize_btn hit locally.
-
-			// Debug: log click coordinates and hit results
-			if (hit_slot >= 0 && in_title_bar) {
-				int32_t rx = (int32_t)mc->clients[hit_slot].window_rect_x;
-				int32_t rw = (int32_t)mc->clients[hit_slot].window_rect_w;
-				U_LOG_W("Title click: pt=(%ld,%ld) slot=%d close_at=%d min_at=%d close=%d min=%d",
-				        pt.x, pt.y, hit_slot,
-				        rx + rw - CLOSE_BTN_WIDTH_PX,
-				        rx + rw - 2 * CLOSE_BTN_WIDTH_PX,
-				        in_close_btn, in_minimize_btn);
-			}
-
-			if (in_close_btn && hit_slot >= 0) {
-				if (mc->clients[hit_slot].client_type == CLIENT_TYPE_CAPTURE) {
-					// Capture client: remove directly
-					multi_compositor_remove_capture_client(sys, hit_slot);
-					U_LOG_W("Multi-comp: close button → removed capture slot %d", hit_slot);
-				} else {
-					// IPC client: send EXIT_REQUEST
-					struct d3d11_service_compositor *fc = mc->clients[hit_slot].compositor;
-					if (fc != nullptr && fc->xses != nullptr) {
-						union xrt_session_event xse = XRT_STRUCT_INIT;
-						xse.type = XRT_SESSION_EVENT_EXIT_REQUEST;
-						xrt_session_event_sink_push(fc->xses, &xse);
-						U_LOG_W("Multi-comp: close button → exit request for slot %d", hit_slot);
-					}
-				}
-			} else if (in_title_bar && hit_slot >= 0) {
-				// #307: title-bar clicks are window-management chrome —
-				// focus, drag, double-click→maximize, AND minimize are all
-				// the controller's job now (ADR-018). It reacts to the POINTER
-				// event (grip / chrome-region) with its own policy. The runtime
-				// keeps this branch only to NOT forward a title-bar click to
-				// the app as a content click (the `else` below). The minimize
-				// button lives inside the title-bar region, so its clicks land
-				// here and are correctly swallowed.
-			} else {
-				if (hit_slot < 0) {
-					// #307 slice B: background / empty-space click. The
-					// runtime no longer owns a taskbar — user-minimize and the
-					// restore-from-taskbar UI are the workspace controller's
-					// job now (ADR-018), driven off the POINTER event the
-					// controller already receives. Nothing to do runtime-side.
-				} else {
-					// Content area: focus + forward to app.
-					//
-					// Click ordering issue: WM_LBUTTONDOWN arrives at the
-					// workspace WndProc and gets forwarded to the CURRENT
-					// input_forward target BEFORE this handler runs. When
-					// the user clicks an UNFOCUSED window, that means the
-					// DOWN goes to the OLD fwd target (or nowhere), and
-					// the NEW target only sees subsequent MOVE + UP — so
-					// it can't start a drag from the first click and the
-					// user has to release + click again. Synthesize a
-					// DOWN to the NEW target after the focus change so
-					// the app sees a full DOWN/MOVE/UP and the click+drag
-					// works in a single motion.
-					// ADR-018: the runtime no longer self-focuses on a
-					// content click — the controller owns focus and reacts
-					// to the POINTER event with xrSetWorkspaceFocusedClientEXT.
-					// We still compute focus_changed (clicked slot != current
-					// focus) to drive the synthetic-DOWN click routing below:
-					// that is input forwarding (translating a spatial click
-					// into a Win32 click on the target HWND), which is
-					// plumbing the runtime legitimately owns, not focus policy.
-					// The synthetic DOWN is posted directly to hit_slot's
-					// HWND, so drag-in-one-click + 2D-capture child-control
-					// routing keep working; the controller updates the input-
-					// forward target for the follow-up MOVE/UP when it focuses.
-					const bool focus_changed = (hit_slot != mc->focused_slot);
-
-					// Drag-in-one-click signal. focus_changed is no longer a
-					// reliable "did the hit window receive this DOWN?" proxy:
-					// the controller sets focus asynchronously (ADR-018), so by
-					// the time this render-frame handler runs focused_slot may
-					// already point at the hit slot even though the WndProc
-					// forwarded the original DOWN elsewhere (or nowhere). Ask
-					// the window what it ACTUALLY forwarded the DOWN to,
-					// captured at WndProc time — independent of focus timing.
-					HWND last_down_tgt =
-					    (HWND)comp_d3d11_window_get_last_pointer_down_target(mc->window);
-					const bool down_reached_hit =
-					    (last_down_tgt != NULL &&
-					     last_down_tgt == mc->clients[hit_slot].app_hwnd);
-
-					// For capture clients, synthesize a click to route to the correct
-					// child control. When focus DIDN'T change (single click on the
-					// already-focused capture's content) we send the full DOWN+UP so
-					// it reads as a discrete click for setting internal focus on a
-					// sub-control. When focus DID change we send DOWN only — the
-					// natural WndProc-forwarded UP arrives when the user releases
-					// LMB, which completes the drag.
-					//
-					// Modal gate (ADR-017, #232): skip when the hit slot has a Win32
-					// modal popup open. Forwarding the synthetic click to a sub-
-					// control would shift the app's focus out of the modal-disabled
-					// chain.
-					if (mc->clients[hit_slot].client_type == CLIENT_TYPE_CAPTURE &&
-					    mc->clients[hit_slot].app_hwnd != nullptr &&
-					    !mc->clients[hit_slot].modal_open) {
-						float title_h_m = UI_TITLE_BAR_H_M;
-						float content_local_x = hit.local_x_m;
-						float content_local_y = hit.local_y_m - title_h_m;
-						float win_w = mc->clients[hit_slot].window_width_m;
-						float win_h = mc->clients[hit_slot].window_height_m;
-
-						RECT target_cr;
-						GetClientRect(mc->clients[hit_slot].app_hwnd, &target_cr);
-						int target_w = target_cr.right - target_cr.left;
-						int target_h = target_cr.bottom - target_cr.top;
-						if (target_w <= 0) target_w = (int)mc->clients[hit_slot].window_rect_w;
-						if (target_h <= 0) target_h = (int)mc->clients[hit_slot].window_rect_h;
-
-						int app_x = (int)(content_local_x / win_w * (float)target_w);
-						int app_y = (int)(content_local_y / win_h * (float)target_h);
-
-						HWND click_target = mc->clients[hit_slot].app_hwnd;
-						POINT child_pt = {app_x, app_y};
-						HWND child = ChildWindowFromPointEx(
-						    click_target, child_pt,
-						    CWP_SKIPINVISIBLE | CWP_SKIPDISABLED);
-						if (child != NULL && child != click_target) {
-							MapWindowPoints(click_target, child, &child_pt, 1);
-							click_target = child;
-							app_x = child_pt.x;
-							app_y = child_pt.y;
-						}
-
-						LPARAM lp = MAKELPARAM(app_x, app_y);
-						PostMessage(click_target, WM_MOUSEMOVE, 0, lp);
-						PostMessage(click_target, WM_LBUTTONDOWN, MK_LBUTTON, lp);
-						if (!focus_changed) {
-							PostMessage(click_target, WM_LBUTTONUP, 0, lp);
-						}
-					} else if (!down_reached_hit &&
-					           mc->clients[hit_slot].app_hwnd != nullptr &&
-					           !mc->clients[hit_slot].modal_open) {
-						// IPC app: the WndProc did NOT forward this DOWN to
-						// the hit window (the click landed on an unfocused
-						// window, so the cursor was outside the focused
-						// window's forward rect — or there was no focus).
-						// The hit window is missing its DOWN, so a drag can't
-						// start in one click. Inject one — using the SAME
-						// coord transform the WndProc applies to MOVE/UP
-						// (app-relative inside the inset content rect,
-						// scaled if app HWND ≠ rect dims) so the app
-						// doesn't see a sudden jump between DOWN and the
-						// first natural MOVE.
-						//
-						// Modal gate (ADR-017, #232): suppress when the hit
-						// slot has a modal open — same reason as the capture
-						// path above.
-						HWND target = mc->clients[hit_slot].app_hwnd;
-						// Inset = 0: see the rationale in
-						// multi_compositor_update_input_forward.
-						// Resize-edge hit-test is independent
-						// (workspace_raycast_hit_test.edge_flags),
-						// so keeping app coords aligned with the
-						// rendered content is the right trade.
-						const int32_t inset = 0;
-						int32_t rx = (int32_t)mc->clients[hit_slot].window_rect_x + inset;
-						int32_t ry = (int32_t)mc->clients[hit_slot].window_rect_y + inset;
-						int32_t rw = (int32_t)mc->clients[hit_slot].window_rect_w - 2 * inset;
-						int32_t rh = (int32_t)mc->clients[hit_slot].window_rect_h - 2 * inset;
-						if (rw > 0 && rh > 0 &&
-						    pt.x >= rx && pt.x < rx + rw &&
-						    pt.y >= ry && pt.y < ry + rh) {
-							RECT target_cr;
-							GetClientRect(target, &target_cr);
-							int target_w = target_cr.right - target_cr.left;
-							int target_h = target_cr.bottom - target_cr.top;
-							int rel_x = pt.x - rx;
-							int rel_y = pt.y - ry;
-							int app_x, app_y;
-							if (target_w > 0 && target_h > 0 &&
-							    (target_w != rw || target_h != rh)) {
-								app_x = (int)((float)rel_x * (float)target_w / (float)rw);
-								app_y = (int)((float)rel_y * (float)target_h / (float)rh);
-							} else {
-								app_x = rel_x;
-								app_y = rel_y;
-							}
-							LPARAM lp = MAKELPARAM(app_x, app_y);
-							// Seed a MOUSEMOVE first so the app's stored
-							// last-known mouseX/Y matches the click pos.
-							// Without this, apps that compute drag deltas
-							// from "current mouseX - last_move_mouseX"
-							// (cube test apps' input_handler.cpp does
-							// exactly that) end up using a stale mouseX
-							// from an earlier move event and produce a
-							// huge first-frame delta = visible jump.
-							PostMessage(target, WM_MOUSEMOVE, 0, lp);
-							PostMessage(target, WM_LBUTTONDOWN, MK_LBUTTON, lp);
-						}
-					}
-				}
-			}
-			} // close unconditional block (post-migration: title-bar + edge resize delegated to controller)
-		}
-	}
 	// Right-click: title bar RMB drag = rotation, content RMB = focus + forward to app.
 	// Call GetAsyncKeyState ONCE to avoid consuming the & 1 press bit (Phase 2 lesson #4).
 	{
@@ -8301,14 +7642,14 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 			// Over-window cosmetic: render the cursor at 30 % alpha so
 			// it doesn't fight content behind it (reduces lenticular
-			// crosstalk on the cursor's bright pixels). Trigger is
-			// keyed off mc->hovered_slot — the same per-frame raycast
-			// signal that drives the chrome pill's hover fade — so
-			// the cursor's translucency syncs with chrome appearance.
-			// hit_z alone wouldn't work for windows at z = 0 (panel
-			// plane), where hit_z is 0 even though the cursor IS over
-			// a workspace client.
-			const bool over_window = (mc->hovered_slot >= 0);
+			// crosstalk on the cursor's bright pixels). spec_version 22:
+			// the flag is pushed by the controller (which owns the
+			// hit-test) via xrSetWorkspaceCursorDepthEXT, rather than
+			// derived from a runtime raycast. An explicit flag is needed
+			// because hit_z alone wouldn't work for windows at z = 0
+			// (panel plane), where hit_z is 0 even though the cursor IS
+			// over a workspace client.
+			const bool over_window = mc->cursor_over_window;
 			const float body_tint[4]  = {1.00f, 1.00f, 1.00f, 0.30f};
 
 			// Common pipeline state
@@ -12306,60 +11647,6 @@ comp_d3d11_service_remove_capture_client(struct xrt_system_compositor *xsysc,
 	return multi_compositor_remove_capture_client(sys, slot_index);
 }
 
-// Map the internal workspace_hit_result flag set onto the public
-// XrWorkspaceHitRegionEXT enum. Chrome buttons take precedence over the
-// title-bar bit (the WndProc geometry computes both for chrome hits).
-// Compound edge flags collapse to the diagonal corners.
-static uint32_t
-hit_result_to_region(const struct workspace_hit_result &hit)
-{
-	// XrWorkspaceHitRegionEXT values — kept in sync with the public header.
-	// Using literal ints here because comp_d3d11_service does not include
-	// the OpenXR extension header (different layer).
-	enum {
-		REGION_BACKGROUND       = 0,
-		REGION_CONTENT          = 1,
-		REGION_TITLE_BAR        = 2,
-		REGION_CLOSE_BUTTON     = 3,
-		REGION_MINIMIZE_BUTTON  = 4,
-		REGION_MAXIMIZE_BUTTON  = 5,
-		REGION_EDGE_RESIZE_N    = 10,
-		REGION_EDGE_RESIZE_S    = 11,
-		REGION_EDGE_RESIZE_E    = 12,
-		REGION_EDGE_RESIZE_W    = 13,
-		REGION_EDGE_RESIZE_NE   = 14,
-		REGION_EDGE_RESIZE_NW   = 15,
-		REGION_EDGE_RESIZE_SE   = 16,
-		REGION_EDGE_RESIZE_SW   = 17,
-	};
-
-	if (hit.slot < 0) {
-		return REGION_BACKGROUND;
-	}
-	if (hit.in_close_btn)    return REGION_CLOSE_BUTTON;
-	if (hit.in_minimize_btn) return REGION_MINIMIZE_BUTTON;
-	if (hit.in_maximize_btn) return REGION_MAXIMIZE_BUTTON;
-
-	const int e = hit.edge_flags;
-	if (e != RESIZE_NONE) {
-		// Diagonals first (compound).
-		if ((e & RESIZE_TOP)    && (e & RESIZE_LEFT))  return REGION_EDGE_RESIZE_NW;
-		if ((e & RESIZE_TOP)    && (e & RESIZE_RIGHT)) return REGION_EDGE_RESIZE_NE;
-		if ((e & RESIZE_BOTTOM) && (e & RESIZE_LEFT))  return REGION_EDGE_RESIZE_SW;
-		if ((e & RESIZE_BOTTOM) && (e & RESIZE_RIGHT)) return REGION_EDGE_RESIZE_SE;
-		if (e & RESIZE_TOP)    return REGION_EDGE_RESIZE_N;
-		if (e & RESIZE_BOTTOM) return REGION_EDGE_RESIZE_S;
-		if (e & RESIZE_LEFT)   return REGION_EDGE_RESIZE_W;
-		if (e & RESIZE_RIGHT)  return REGION_EDGE_RESIZE_E;
-	}
-	if (hit.in_title_bar) return REGION_TITLE_BAR;
-	if (hit.in_content)   return REGION_CONTENT;
-
-	// In-window but no specific region matched — treat as background-equivalent
-	// rather than fabricate a category.
-	return REGION_BACKGROUND;
-}
-
 extern "C" bool
 comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xsysc,
                                                  uint32_t capacity,
@@ -12410,40 +11697,10 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 			ev->u.pointer.modifiers = r->modifiers;
 			ev->u.pointer.cursor_x = (int64_t)r->cursor_x;
 			ev->u.pointer.cursor_y = (int64_t)r->cursor_y;
-
-			// Enrich with hit-test (run inside the same render-mutex
-			// region so geometry is stable across the batch).
-			POINT pt = {(LONG)r->cursor_x, (LONG)r->cursor_y};
-			struct workspace_hit_result hit = workspace_raycast_hit_test(sys, mc, pt);
-			ev->u.pointer.hit_region = hit_result_to_region(hit);
-			// PR 1 (workspace controller migration): verify EDGE_RESIZE_*
-			// region values surface to the controller. One-shot — fires on
-			// the first POINTER event whose region is N/S/E/W/NE/NW/SE/SW.
-			if (ev->u.pointer.hit_region >= 10u && ev->u.pointer.hit_region <= 17u) {
-				static bool logged = false;
-				if (!logged) {
-					logged = true;
-					U_LOG_W("[ws-migrate] POINTER edge-resize emit: region=%u slot=%d edge_flags=0x%x button=%u down=%u",
-					        ev->u.pointer.hit_region, hit.slot, hit.edge_flags,
-					        ev->u.pointer.button, ev->u.pointer.is_down);
-				}
-			}
-			if (hit.slot >= 0) {
-				ev->u.pointer.hit_client_id = 1000u + (uint32_t)hit.slot;
-				if (hit.in_content) {
-					float win_w = mc->clients[hit.slot].window_width_m;
-					float win_h = mc->clients[hit.slot].window_height_m;
-					if (win_w > 0.0f) ev->u.pointer.local_u = hit.local_x_m / win_w;
-					if (win_h > 0.0f) ev->u.pointer.local_v = hit.local_y_m / win_h;
-				}
-				// Phase 2.C C4: controller-defined chrome region. 0 if no
-				// chrome hit OR if hit fell outside the controller's
-				// declared hit_regions[]. Set additively alongside the
-				// legacy in_close_btn etc. — the runtime's existing in-
-				// runtime cursor + drag logic still uses the legacy bits
-				// until C5 deletes the in-runtime chrome render block.
-				ev->u.pointer.chrome_region_id = hit.chrome_region_id;
-			}
+			// spec_version 22: the runtime no longer raycasts. The controller
+			// owns the eye→cursor hit-test and fills hit_client_id / hit_region /
+			// local_u/v / chrome_region_id itself from cursor_x/y (left zeroed by
+			// the memset above).
 			break;
 		}
 		case WORKSPACE_PUBLIC_EVENT_KEY:
@@ -12459,42 +11716,12 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 			break;
 		case WORKSPACE_PUBLIC_EVENT_MOTION: {
 			// Phase 2.K: per-frame WM_MOUSEMOVE while pointer capture is
-			// enabled. Same hit-test enrichment as POINTER (within the
-			// same render_mutex region so geometry is stable across the
-			// batch).
+			// enabled. spec_version 22: the runtime no longer raycasts; the
+			// controller fills the hit fields itself from cursor_x/y.
 			ev->u.pointer_motion.button_mask = r->button_or_vk;
 			ev->u.pointer_motion.modifiers = r->modifiers;
 			ev->u.pointer_motion.cursor_x = (int64_t)r->cursor_x;
 			ev->u.pointer_motion.cursor_y = (int64_t)r->cursor_y;
-			POINT pt = {(LONG)r->cursor_x, (LONG)r->cursor_y};
-			struct workspace_hit_result hit = workspace_raycast_hit_test(sys, mc, pt);
-			ev->u.pointer_motion.hit_region = hit_result_to_region(hit);
-			// PR 1 (workspace controller migration): see POINTER branch above.
-			// One-shot edge-resize verification on the MOTION path too —
-			// motion is what carries pose updates during a controller-owned
-			// resize drag, so we want both paths confirmed.
-			if (ev->u.pointer_motion.hit_region >= 10u && ev->u.pointer_motion.hit_region <= 17u) {
-				static bool logged = false;
-				if (!logged) {
-					logged = true;
-					U_LOG_W("[ws-migrate] MOTION edge-resize emit: region=%u slot=%d edge_flags=0x%x button_mask=0x%x",
-					        ev->u.pointer_motion.hit_region, hit.slot, hit.edge_flags,
-					        ev->u.pointer_motion.button_mask);
-				}
-			}
-			if (hit.slot >= 0) {
-				ev->u.pointer_motion.hit_client_id = 1000u + (uint32_t)hit.slot;
-				if (hit.in_content) {
-					float win_w = mc->clients[hit.slot].window_width_m;
-					float win_h = mc->clients[hit.slot].window_height_m;
-					if (win_w > 0.0f)
-						ev->u.pointer_motion.local_u = hit.local_x_m / win_w;
-					if (win_h > 0.0f)
-						ev->u.pointer_motion.local_v = hit.local_y_m / win_h;
-				}
-				// Phase 2.C C4: see POINTER comment above.
-				ev->u.pointer_motion.chrome_region_id = hit.chrome_region_id;
-			}
 			break;
 		}
 		default:
@@ -12526,53 +11753,11 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 		out_batch->count++;
 	}
 
-	// Phase 2.C C3.C-4: POINTER_HOVER on hovered-slot transition. Lets
-	// controllers drive a chrome fade in modes where pointer capture is
-	// OFF (grid/immersive), so per-frame MOTION events aren't published
-	// but the runtime's per-frame hit-test still tracks which slot the
-	// cursor is over.
-	//
-	// Uses the slot's stored workspace_client_id (the OpenXR client id
-	// the controller used at xrCreateWorkspaceClientChromeSwapchainEXT
-	// time) so controllers can match the hover signal to their own
-	// per-client chrome bookkeeping. Falls back to 0 for slots without
-	// chrome registered.
-	//
-	// spec_version 9: also fires on chromeRegionId transitions WITHIN
-	// the hovered slot (e.g., cursor moves grip → close inside the same
-	// chrome bar). Stamps prev/curr_chrome_region_id from the per-frame
-	// hit-test so the controller can drive per-region UI feedback (button
-	// hover-lighten, region-tooltip popovers) without enabling continuous
-	// pointer capture.
-	bool slot_changed = (mc->hovered_slot != mc->hovered_slot_last_emitted);
-	bool region_changed = (mc->hovered_chrome_region_id != mc->hovered_chrome_region_id_last_emitted);
-	// spec_version 13: also emit on hit-region transitions (CONTENT →
-	// EDGE_RESIZE_E, etc.) so the controller can drive cursor-shape
-	// switching on hover.
-	bool hit_region_changed = (mc->hovered_hit_region != mc->hovered_hit_region_last_emitted);
-	if ((slot_changed || region_changed || hit_region_changed) &&
-	    out_batch->count < IPC_WORKSPACE_INPUT_EVENT_BATCH_MAX) {
-		struct ipc_workspace_input_event *ev = &out_batch->events[out_batch->count];
-		memset(ev, 0, sizeof(*ev));
-		ev->event_type = IPC_WORKSPACE_INPUT_EVENT_POINTER_HOVER;
-		ev->timestamp_ms = (uint32_t)GetTickCount();
-		ev->u.pointer_hover.prev_client_id =
-		    (mc->hovered_slot_last_emitted >= 0)
-		        ? mc->clients[mc->hovered_slot_last_emitted].workspace_client_id
-		        : 0;
-		ev->u.pointer_hover.prev_region = mc->hovered_hit_region_last_emitted;
-		ev->u.pointer_hover.curr_client_id =
-		    (mc->hovered_slot >= 0)
-		        ? mc->clients[mc->hovered_slot].workspace_client_id
-		        : 0;
-		ev->u.pointer_hover.curr_region = mc->hovered_hit_region;
-		ev->u.pointer_hover.prev_chrome_region_id = mc->hovered_chrome_region_id_last_emitted;
-		ev->u.pointer_hover.curr_chrome_region_id = mc->hovered_chrome_region_id;
-		mc->hovered_slot_last_emitted = mc->hovered_slot;
-		mc->hovered_chrome_region_id_last_emitted = mc->hovered_chrome_region_id;
-		mc->hovered_hit_region_last_emitted = mc->hovered_hit_region;
-		out_batch->count++;
-	}
+	// POINTER_HOVER was removed in spec_version 22. The runtime no longer
+	// raycasts, so it cannot detect hovered-slot / region transitions. The
+	// workspace controller now generates its own hover transitions from the
+	// per-frame cursor feed (POINTER_MOTION + its own hit-test) and drives
+	// chrome fade / cursor-shape switching itself.
 
 	// spec_version 8: WINDOW_POSE_CHANGED for any slot whose stored pose /
 	// dims have drifted since the last drain. Catches runtime-driven changes
@@ -12723,6 +11908,12 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 			ev->u.frame_tick.viewer_y = mc->frame_tick_viewer_y;
 			ev->u.frame_tick.viewer_z = mc->frame_tick_viewer_z;
 			ev->u.frame_tick.viewer_valid = (uint32_t)mc->frame_tick_viewer_valid;
+			// spec_version 22: OS cursor position (workspace-window client px,
+			// top-left). The controller runs its own hit-test over this each
+			// frame to generate hover transitions + push cursor depth, now that
+			// the runtime no longer raycasts.
+			ev->u.frame_tick.cursor_x = mc->cursor_panel_x;
+			ev->u.frame_tick.cursor_y = mc->cursor_panel_y;
 			out_batch->count++;
 			missed--;
 		}
@@ -13188,6 +12379,89 @@ comp_d3d11_service_set_capture_client_style(struct xrt_system_compositor *xsysc,
 	return true;
 }
 
+// One-click-drag helper (#370 Phase 2). When the controller moves focus to a
+// previously-unfocused window while the primary mouse button is held, the
+// original WM_LBUTTONDOWN was forwarded to the OLD focus (or nowhere) by the
+// WndProc — so the newly focused app never saw the DOWN and a click+drag can't
+// start in one motion. The runtime owns the app HWNDs, so it re-delivers that
+// DOWN here. This is input-forwarding plumbing (translating a spatial click to
+// a Win32 click on the target HWND), not focus/click POLICY — the controller
+// already decided the focus. No raycast: we map the current OS cursor through
+// the focused slot's content rect, exactly as the WndProc maps MOVE/UP.
+static void
+synthesize_focus_click_down(struct d3d11_multi_compositor *mc, int slot)
+{
+	if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS) {
+		return;
+	}
+	struct d3d11_multi_client_slot *cs = &mc->clients[slot];
+	HWND target = cs->app_hwnd;
+	// Modal gate (ADR-017, #232): never forward a synthetic click to a slot
+	// whose Win32 modal popup is up — it could shift focus out of the modal chain.
+	if (target == nullptr || !IsWindow(target) || cs->modal_open) {
+		return;
+	}
+	// Only when the primary button is actually held (a drag-in-progress). RMB
+	// focus changes (rotation) must not inject an LBUTTONDOWN.
+	if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
+		return;
+	}
+	// If the WndProc already delivered the DOWN to this HWND, don't double it.
+	if ((HWND)comp_d3d11_window_get_last_pointer_down_target(mc->window) == target) {
+		return;
+	}
+
+	POINT pt = {0, 0};
+	GetCursorPos(&pt);
+	ScreenToClient(mc->hwnd, &pt);
+
+	int32_t rx = cs->window_rect_x;
+	int32_t ry = cs->window_rect_y;
+	int32_t rw = cs->window_rect_w;
+	int32_t rh = cs->window_rect_h;
+	if (rw <= 0 || rh <= 0 || pt.x < rx || pt.x >= rx + rw || pt.y < ry || pt.y >= ry + rh) {
+		return; // cursor not over this slot's content rect
+	}
+
+	// Map workspace-window pixels → app-client pixels (scale if the app HWND
+	// client size differs from the rendered rect), matching the WndProc.
+	RECT cr;
+	GetClientRect(target, &cr);
+	int tw = cr.right - cr.left;
+	int th = cr.bottom - cr.top;
+	int rel_x = pt.x - rx;
+	int rel_y = pt.y - ry;
+	int app_x, app_y;
+	if (tw > 0 && th > 0 && (tw != rw || th != rh)) {
+		app_x = (int)((float)rel_x * (float)tw / (float)rw);
+		app_y = (int)((float)rel_y * (float)th / (float)rh);
+	} else {
+		app_x = rel_x;
+		app_y = rel_y;
+	}
+
+	// Capture clients (adopted 2D windows): route to the child control under
+	// the point so the DOWN lands on the right widget.
+	HWND click_target = target;
+	if (cs->client_type == CLIENT_TYPE_CAPTURE) {
+		POINT child_pt = {app_x, app_y};
+		HWND child = ChildWindowFromPointEx(click_target, child_pt,
+		                                    CWP_SKIPINVISIBLE | CWP_SKIPDISABLED);
+		if (child != nullptr && child != click_target) {
+			MapWindowPoints(click_target, child, &child_pt, 1);
+			click_target = child;
+			app_x = child_pt.x;
+			app_y = child_pt.y;
+		}
+	}
+
+	// Seed a MOUSEMOVE first so the app's stored last-known cursor matches the
+	// click position (apps computing drag deltas from last-move avoid a jump).
+	LPARAM lp = MAKELPARAM(app_x, app_y);
+	PostMessage(click_target, WM_MOUSEMOVE, 0, lp);
+	PostMessage(click_target, WM_LBUTTONDOWN, MK_LBUTTON, lp);
+}
+
 extern "C" void
 comp_d3d11_service_set_focused_slot(struct xrt_system_compositor *xsysc, int slot)
 {
@@ -13206,6 +12480,7 @@ comp_d3d11_service_set_focused_slot(struct xrt_system_compositor *xsysc, int slo
 		return;
 	}
 	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	int prev_focused = mc->focused_slot;
 	if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || !mc->clients[slot].active) {
 		mc->focused_slot = -1;
 	} else {
@@ -13223,6 +12498,13 @@ comp_d3d11_service_set_focused_slot(struct xrt_system_compositor *xsysc, int slo
 	// refresh the gauss received no mouse input until a layout
 	// preset reset the fwd state.
 	multi_compositor_update_input_forward(mc);
+
+	// #370 Phase 2: if focus just moved to a new window while LMB is held,
+	// re-deliver the lost WM_LBUTTONDOWN so a click-to-focus drag starts in one
+	// motion (the WndProc forwarded the original DOWN to the prior focus).
+	if (mc->focused_slot >= 0 && mc->focused_slot != prev_focused) {
+		synthesize_focus_click_down(mc, mc->focused_slot);
+	}
 }
 
 extern "C" void
@@ -13613,62 +12895,24 @@ comp_d3d11_service_workspace_get_wakeup_event(struct xrt_system_compositor *xsys
 #endif
 }
 
-extern "C" bool
-comp_d3d11_service_workspace_hit_test(struct xrt_system_compositor *xsysc,
-                                       int32_t cursor_x,
-                                       int32_t cursor_y,
-                                       uint32_t *out_client_id,
-                                       float *out_local_u,
-                                       float *out_local_v,
-                                       uint32_t *out_hit_region)
+extern "C" void
+comp_d3d11_service_workspace_set_cursor_depth(struct xrt_system_compositor *xsysc,
+                                              float hit_z_m,
+                                              bool over_window)
 {
-	if (xsysc == nullptr || out_client_id == nullptr || out_local_u == nullptr ||
-	    out_local_v == nullptr || out_hit_region == nullptr) {
-		return false;
+	if (xsysc == nullptr) {
+		return;
 	}
-	*out_client_id = 0;
-	*out_local_u = 0.0f;
-	*out_local_v = 0.0f;
-	*out_hit_region = 0; // BACKGROUND
-
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
 	if (!sys->workspace_mode || mc == nullptr) {
-		// Workspace not active — return success with miss output.
-		return true;
+		return; // Workspace not active — drop.
 	}
-
-	POINT pt = {(LONG)cursor_x, (LONG)cursor_y};
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
-
-	struct workspace_hit_result hit = workspace_raycast_hit_test(sys, mc, pt);
-	*out_hit_region = hit_result_to_region(hit);
-
-	if (hit.slot < 0) {
-		// Background miss — out_client_id stays 0.
-		return true;
-	}
-
-	// Slot index is the workspace's view of the client. Capture clients
-	// already use slot+1000 in xrAddWorkspaceCaptureClientEXT; reuse the
-	// same scheme uniformly so XrWorkspaceClientId values are consistent
-	// regardless of client type.
-	*out_client_id = 1000u + (uint32_t)hit.slot;
-
-	// UV only meaningful for CONTENT hits; chrome/edge use a different
-	// coordinate frame the public surface does not expose.
-	if (hit.in_content) {
-		float win_w = mc->clients[hit.slot].window_width_m;
-		float win_h = mc->clients[hit.slot].window_height_m;
-		if (win_w > 0.0f) {
-			*out_local_u = hit.local_x_m / win_w;
-		}
-		if (win_h > 0.0f) {
-			*out_local_v = hit.local_y_m / win_h;
-		}
-	}
-
-	return true;
+	// Cached for the next composited frame; the cursor render block applies
+	// hit_z_m to the per-eye disparity and over_window to the dim alpha.
+	mc->cursor_hit_z_m = hit_z_m;
+	mc->cursor_over_window = over_window;
 }
 
 bool

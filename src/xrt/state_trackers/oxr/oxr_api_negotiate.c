@@ -448,7 +448,6 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrSetWorkspaceClientWindowPoseEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrGetWorkspaceClientWindowPoseEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrSetWorkspaceClientVisibilityEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrWorkspaceHitTestEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrSetWorkspaceFocusedClientEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrGetWorkspaceFocusedClientEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrSetWorkspaceClientFrameRateCapEXT, EXT_spatial_workspace);
@@ -466,6 +465,7 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrUpdateWorkspaceClientChromeLayerPoseEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrCreateWorkspaceCursorSwapchainEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrSetWorkspaceCursorEXT, EXT_spatial_workspace);
+	ENTRY_IF_EXT(xrSetWorkspaceCursorDepthEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrCreateWorkspaceOverlaySwapchainEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrSetWorkspaceOverlayEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrAcquireWorkspaceWakeupEventEXT, EXT_spatial_workspace);

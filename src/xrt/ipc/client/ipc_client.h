@@ -267,15 +267,6 @@ comp_ipc_client_compositor_workspace_set_window_visibility(struct xrt_compositor
                                                            bool visible);
 
 xrt_result_t
-comp_ipc_client_compositor_workspace_hit_test(struct xrt_compositor *xc,
-                                              int32_t cursor_x,
-                                              int32_t cursor_y,
-                                              uint32_t *out_client_id,
-                                              float *out_local_u,
-                                              float *out_local_v,
-                                              uint32_t *out_hit_region);
-
-xrt_result_t
 comp_ipc_client_compositor_workspace_set_focused_client(struct xrt_compositor *xc, uint32_t client_id);
 
 xrt_result_t
@@ -367,3 +358,16 @@ comp_ipc_client_compositor_workspace_get_client_info(struct xrt_compositor *xc,
  */
 xrt_result_t
 comp_ipc_client_compositor_workspace_set_input_grab(struct xrt_compositor *xc, bool grab);
+
+/*!
+ * Per-frame cursor depth bridge (XR_EXT_spatial_workspace, spec_version 22).
+ *
+ * Same gating contract as the workspace_* family. The controller owns the
+ * eye→cursor hit-test and pushes the resulting depth (and an over-window
+ * flag) each frame; the runtime applies it to the cursor sprite's per-eye
+ * disparity. Cursor screen position stays runtime-owned.
+ */
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_cursor_depth(struct xrt_compositor *xc,
+                                                      float hit_z_m,
+                                                      bool over_window);

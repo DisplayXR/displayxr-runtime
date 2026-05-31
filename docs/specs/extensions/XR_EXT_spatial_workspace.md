@@ -42,6 +42,11 @@ A spatial workspace is the OS-level shell for a 3D display: the privileged proce
 ### Hit-test
 
 - `xrWorkspaceHitTestEXT(session, cursorX, cursorY, &outClientId, &outLocalUV, &outHitRegion)` — translate a screen-space cursor into a hit on a client window. The runtime intersects an eye→cursor ray with each client's window quad and reports the hit `clientId`, an interpolated UV on the content rect, and a `XrWorkspaceHitRegionEXT` classification (CONTENT, TITLE_BAR, CLOSE_BUTTON, EDGE_RESIZE_*, TASKBAR, LAUNCHER_TILE, BACKGROUND).
+  - **Removed in spec_version 22.** The workspace controller now owns hit-testing end to end (it already ran the same eye→cursor raycast for click policy) and the runtime no longer raycasts. The controller fills the hit fields on the pointer events it drains, and feeds the runtime only the cursor depth it needs to render the sprite at the right disparity via `xrSetWorkspaceCursorDepthEXT` (see Cursor depth below). `XrWorkspaceHitRegionEXT` is retained as the type of the controller-filled `hitRegion` field.
+
+### Cursor depth *(spec_version 22)*
+
+- `xrSetWorkspaceCursorDepthEXT(session, &XrWorkspaceCursorDepthEXT{ hitZMeters, overWindow })` — per-frame push of the cursor's ray-plane depth (and an "over a window" flag) so the runtime can render the cursor sprite with the correct per-eye disparity. Cursor screen position stays runtime-owned (OS cursor); only depth + the over-window dim flag come from the controller. When a modal input grab pins the cursor to the zero-disparity plane, the controller pushes `hitZMeters = 0`. This completes the migration of cursor policy to the controller: the runtime's raycast and `xrWorkspaceHitTestEXT` are gone, and `POINTER_HOVER` transitions are generated controller-side from the per-frame cursor feed.
 
 ### Focus
 

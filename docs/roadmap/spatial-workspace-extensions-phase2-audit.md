@@ -118,6 +118,8 @@ Below: the original 8 sub-steps, lowest-blast-radius first.
 
 ### Phase 2.F — Hit-test extension promotion
 
+> **Outcome (spec_version 22, issue #370):** the opposite of "promote and keep in the runtime" was chosen. `xrWorkspaceHitTestEXT` was implemented (spec_version 4) and later **deleted** along with `workspace_raycast_hit_test`; hit-testing moved entirely to the controller, which already duplicated the geometry for click policy (shell #40 Phase 1) and now also runs it per-frame off the OS cursor position the runtime delivers on FRAME_TICK. The runtime keeps only cursor-sprite compositing at the controller-pushed depth (`xrSetWorkspaceCursorDepthEXT`). See ADR-018's superseded note.
+
 **Touches:** 4660-4904 (function definition), 6003, 6046, 6154, 6497 (callers). Plus `xrWorkspaceHitTestEXT` entry point in the extension dispatch.
 
 **Why sixth:** The function and its callers stay in the runtime — they're mechanism. The work is exposing `shell_raycast_hit_test()` as a public extension function so the workspace controller can call it directly instead of duplicating the geometry. Independent of the chrome migration; could move earlier if needed.

@@ -33,8 +33,8 @@ Define a clean boundary so:
 
 ## Boundary Rule
 
-- **Runtime implements rendering truth** — compositing, projection, weaving, capture, hit testing
-- **Workspace controller implements desktop behavior** — placement policy, chrome, focus, persistence, launcher
+- **Runtime implements rendering truth** — compositing, projection, weaving, capture, cursor-sprite compositing at controller-supplied depth
+- **Workspace controller implements desktop behavior** — placement policy, chrome, focus, persistence, launcher, **and hit-testing** (eye→cursor raycast; moved out of the runtime in spec_version 22, issue #370)
 - **Apps require no SDK** — a normal OpenXR handle app works inside any workspace with zero code changes (Level 0 universal app, see [spatial-desktop-prd.md § 5.1](spatial-desktop-prd.md)). Workspace-aware extensions (Level 1) and spatial UI toolkits (Level 2) are optional enhancements, never requirements.
 
 ## Controller → Runtime (Control Path)
@@ -61,7 +61,7 @@ The runtime must be able to expose:
 |---------|-------------|--------|
 | **`system_get_clients`** | List of connected IPC apps (id, name, state) | Implemented |
 | **`workspace_get_client_type`** | Returns `CLIENT_TYPE_OPENXR_3D` or `CLIENT_TYPE_CAPTURED_2D` | Phase 4A |
-| **Hit-test results** | Which window a mouse ray intersects, and where on the surface | Implemented (server-side) |
+| **Hit-test results** | ~~Which window a mouse ray intersects, and where on the surface~~ | **Removed (spec_version 22, #370)** — hit-test is now controller-owned; the runtime instead delivers the OS cursor position on FRAME_TICK and accepts cursor depth via `workspace_set_cursor_depth` |
 | **App presence** | App connected/disconnected, session created/destroyed | Implemented (poll-based) |
 | **Display state** | Display resolution, refresh rate, capabilities | Implemented (shared memory) |
 | **Tracking state** | Eye tracking active/lost, quality metrics | Implemented (shared memory) |

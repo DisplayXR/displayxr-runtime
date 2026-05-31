@@ -151,7 +151,7 @@ run_workspace_test()
 	PFN_xrSetWorkspaceClientWindowPoseEXT pfnSetClientPose = nullptr;
 	PFN_xrGetWorkspaceClientWindowPoseEXT pfnGetClientPose = nullptr;
 	PFN_xrSetWorkspaceClientVisibilityEXT pfnSetClientVisibility = nullptr;
-	PFN_xrWorkspaceHitTestEXT pfnHitTest = nullptr;
+	PFN_xrSetWorkspaceCursorDepthEXT pfnSetCursorDepth = nullptr; // spec_version 22
 	PFN_xrSetWorkspaceFocusedClientEXT pfnSetFocused = nullptr;
 	PFN_xrGetWorkspaceFocusedClientEXT pfnGetFocused = nullptr;
 	PFN_xrEnumerateWorkspaceInputEventsEXT pfnEnumInputEvents = nullptr;
@@ -191,7 +191,7 @@ run_workspace_test()
 	    {"xrGetWorkspaceClientWindowPoseEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnGetClientPose)},
 	    {"xrSetWorkspaceClientVisibilityEXT",
 	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetClientVisibility)},
-	    {"xrWorkspaceHitTestEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnHitTest)},
+	    {"xrSetWorkspaceCursorDepthEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetCursorDepth)},
 	    {"xrSetWorkspaceFocusedClientEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetFocused)},
 	    {"xrGetWorkspaceFocusedClientEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnGetFocused)},
 	    {"xrEnumerateWorkspaceInputEventsEXT",
@@ -355,31 +355,16 @@ run_workspace_test()
 		vr = pfnSetClientVisibility(session, clientId, XR_TRUE);
 		std::printf("[xrSetWorkspaceClientVisibilityEXT(TRUE)    ] %s\n", xr_result_str(vr));
 
-		// Hit-test smoke (Phase 2.F + 2.D): probe two cursor positions — one
-		// near display center (likely to hit a window if any are positioned
-		// there) and one far off-screen (guaranteed miss). Region output
-		// added in Phase 2.D. Off-screen probe MUST report BACKGROUND_EXT.
-		XrWorkspaceClientId hitId = XR_NULL_WORKSPACE_CLIENT_ID;
-		XrVector2f hitUV = {};
-		XrWorkspaceHitRegionEXT hitRegion = XR_WORKSPACE_HIT_REGION_BACKGROUND_EXT;
-		XrResult hr = pfnHitTest(session, 1920, 1080, &hitId, &hitUV, &hitRegion);
-		std::printf("[xrWorkspaceHitTestEXT(1920,1080)           ] %s clientId=%u uv=(%.3f,%.3f) region=%d\n",
-		            xr_result_str(hr), (unsigned)hitId, hitUV.x, hitUV.y, (int)hitRegion);
-
-		hitId = 0xFFFFFFFFu;
-		hitUV = {0.5f, 0.5f}; // sentinel; should be overwritten to (0,0) on miss
-		hitRegion = (XrWorkspaceHitRegionEXT)0x7F; // sentinel
-		hr = pfnHitTest(session, -1, -1, &hitId, &hitUV, &hitRegion);
-		std::printf("[xrWorkspaceHitTestEXT(-1,-1)               ] %s clientId=%u uv=(%.3f,%.3f) region=%d\n",
-		            xr_result_str(hr), (unsigned)hitId, hitUV.x, hitUV.y, (int)hitRegion);
-		if (hr == XR_SUCCESS && hitId != XR_NULL_WORKSPACE_CLIENT_ID) {
-			std::printf("FAIL: off-screen hit-test reported a hit (clientId=%u)\n",
-			            (unsigned)hitId);
-		}
-		if (hr == XR_SUCCESS && hitRegion != XR_WORKSPACE_HIT_REGION_BACKGROUND_EXT) {
-			std::printf("FAIL: off-screen hit-test region=%d, expected BACKGROUND_EXT(0)\n",
-			            (int)hitRegion);
-		}
+		// Cursor-depth smoke (spec_version 22): the runtime raycast +
+		// xrWorkspaceHitTestEXT were removed; the controller now owns the
+		// hit-test and pushes cursor depth each frame. Push one sample and
+		// confirm the entrypoint resolves + accepts a well-formed struct.
+		XrWorkspaceCursorDepthEXT depth = {};
+		depth.type = XR_TYPE_WORKSPACE_CURSOR_DEPTH_EXT;
+		depth.hitZMeters = 0.05f;
+		depth.overWindow = XR_TRUE;
+		XrResult hr = pfnSetCursorDepth(session, &depth);
+		std::printf("[xrSetWorkspaceCursorDepthEXT(0.05,over)    ] %s\n", xr_result_str(hr));
 
 		// Phase 2.D: focus + drain + pointer-capture smoke.
 		// Set focus to the captured client, then read it back and assert.
