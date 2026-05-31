@@ -891,6 +891,229 @@ oxr_mcp_capability_enabled(void)
 #endif
 }
 
+// ---------- session-free diagnostics (shell out to displayxr-cli) ----------
+//
+// Unlike the tools above (which introspect a live oxr_session), these report
+// install/config health with NO app running — the first thing an agent wants
+// when triaging "cube is black": rule out DP/ABI/discovery before launching
+// anything. They shell out to the sibling `displayxr-cli` and return its
+// `--json` output, so there is ONE query core (shared with the CLI + Control
+// Panel), and — because the CLI is a separate process — zero vendor symbols
+// enter this TU (ADR-019). The CLI ships next to DisplayXRClient.dll.
+
+//! Run `displayxr-cli <args>` (located next to DisplayXRClient.dll) and
+//! capture stdout into @p out. stderr is discarded so stdout stays clean JSON.
+static bool
+run_displayxr_cli(const char *args, char *out, size_t cap)
+{
+	if (cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+
+#ifdef _WIN32
+	char dir[MAX_PATH];
+	// The runtime lives in DisplayXRClient.dll; displayxr-cli.exe sits beside
+	// it in the install dir, regardless of which host exe loaded the runtime.
+	HMODULE h = GetModuleHandleA("DisplayXRClient.dll");
+	DWORD n = GetModuleFileNameA(h, dir, (DWORD)sizeof(dir));
+	if (n == 0 || n >= sizeof(dir)) {
+		return false;
+	}
+	char *slash = strrchr(dir, '\\');
+	if (slash != NULL) {
+		*(slash + 1) = '\0';
+	} else {
+		dir[0] = '\0';
+	}
+
+	char cmd[2048];
+	snprintf(cmd, sizeof(cmd), "\"%sdisplayxr-cli.exe\" %s", dir, args);
+
+	SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+	HANDLE rd = NULL, wr = NULL;
+	if (!CreatePipe(&rd, &wr, &sa, 0)) {
+		return false;
+	}
+	SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+	HANDLE nul = CreateFileA("NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+	                         OPEN_EXISTING, 0, NULL);
+
+	STARTUPINFOA si;
+	memset(&si, 0, sizeof(si));
+	si.cb = sizeof(si);
+	si.dwFlags = STARTF_USESTDHANDLES;
+	si.hStdOutput = wr;
+	si.hStdError = nul;
+	si.hStdInput = nul;
+	PROCESS_INFORMATION pi;
+	memset(&pi, 0, sizeof(pi));
+
+	BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+	CloseHandle(wr);
+	if (!ok) {
+		CloseHandle(rd);
+		if (nul != INVALID_HANDLE_VALUE) {
+			CloseHandle(nul);
+		}
+		return false;
+	}
+
+	size_t total = 0;
+	char buf[1024];
+	DWORD rn = 0;
+	while (ReadFile(rd, buf, (DWORD)sizeof(buf), &rn, NULL) && rn > 0) {
+		size_t room = (total < cap - 1) ? (cap - 1 - total) : 0;
+		size_t take = (rn < room) ? rn : room;
+		if (take > 0) {
+			memcpy(out + total, buf, take);
+			total += take;
+		}
+		if (take < (size_t)rn) {
+			break;
+		}
+	}
+	out[total] = '\0';
+	WaitForSingleObject(pi.hProcess, INFINITE);
+	CloseHandle(rd);
+	CloseHandle(pi.hProcess);
+	CloseHandle(pi.hThread);
+	if (nul != INVALID_HANDLE_VALUE) {
+		CloseHandle(nul);
+	}
+	return true;
+#else
+	char cmd[2048];
+	snprintf(cmd, sizeof(cmd), "displayxr-cli %s 2>/dev/null", args);
+	FILE *f = popen(cmd, "r");
+	if (f == NULL) {
+		return false;
+	}
+	size_t total = fread(out, 1, cap - 1, f);
+	out[total] = '\0';
+	pclose(f);
+	return true;
+#endif
+}
+
+//! Run a `displayxr-cli ... --json` command and return its parsed JSON object.
+static cJSON *
+cli_json_tool(const char *args)
+{
+	char out[16384];
+	if (!run_displayxr_cli(args, out, sizeof(out)) || out[0] == '\0') {
+		return error_object("failed to run displayxr-cli (is it installed next to the runtime?)");
+	}
+	cJSON *j = cJSON_Parse(out);
+	if (j == NULL) {
+		return error_object("displayxr-cli returned unparseable JSON");
+	}
+	return j;
+}
+
+static cJSON *
+tool_get_runtime_status(const cJSON *params, void *userdata)
+{
+	(void)params;
+	(void)userdata;
+	return cli_json_tool("info --json");
+}
+static const struct mcp_tool TOOL_GET_RUNTIME_STATUS = {
+    .name = "get_runtime_status",
+    .description = "Session-free runtime health: runtime version/git-tag, active vendor plug-in "
+                   "(id/name/vendor/version) + ABI match verdict, display info (dims, viewer, "
+                   "eye-tracking), and the Windows ActiveRuntime. Mirrors `displayxr-cli info --json`; "
+                   "works with NO app/session running.",
+    .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
+    .fn = tool_get_runtime_status,
+};
+
+static cJSON *
+tool_run_selftest(const cJSON *params, void *userdata)
+{
+	(void)params;
+	(void)userdata;
+	return cli_json_tool("selftest --json");
+}
+static const struct mcp_tool TOOL_RUN_SELFTEST = {
+    .name = "run_selftest",
+    .description = "Session-free headless self-test: per-check PASS/FAIL (instance, system, head device, "
+                   "active plug-in, display info, dims) + overall verdict + result_code. Mirrors "
+                   "`displayxr-cli selftest --json`.",
+    .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
+    .fn = tool_run_selftest,
+};
+
+static cJSON *
+tool_list_display_processors(const cJSON *params, void *userdata)
+{
+	(void)params;
+	(void)userdata;
+	return cli_json_tool("dp list --json");
+}
+static const struct mcp_tool TOOL_LIST_DISPLAY_PROCESSORS = {
+    .name = "list_display_processors",
+    .description = "Session-free: list registered display-processor plug-ins with ProbeOrder + which one "
+                   "the loader would select + the PreferredPlugin override. Mirrors `displayxr-cli dp "
+                   "list --json`.",
+    .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
+    .fn = tool_list_display_processors,
+};
+
+static cJSON *
+tool_set_preferred_dp(const cJSON *params, void *userdata)
+{
+	(void)userdata;
+	// Guarded: an agent must not flip the machine-wide DP override casually.
+	const cJSON *confirm = cJSON_GetObjectItemCaseSensitive(params, "confirm");
+	if (!cJSON_IsTrue(confirm)) {
+		return error_object("set_preferred_dp is guarded: pass {\"confirm\":true} to apply. It writes a "
+		                    "machine-wide registry override (needs admin) and only takes effect after a "
+		                    "service restart.");
+	}
+
+	char args[160];
+	const cJSON *id = cJSON_GetObjectItemCaseSensitive(params, "id");
+	if (cJSON_IsString(id) && id->valuestring != NULL && id->valuestring[0] != '\0') {
+		// Plug-in ids are kebab-case ASCII; reject anything else so the id
+		// cannot inject into the spawned command line.
+		for (const char *c = id->valuestring; *c != '\0'; c++) {
+			bool okch = (*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') || *c == '-';
+			if (!okch) {
+				return error_object("invalid plug-in id (expected kebab-case ascii)");
+			}
+		}
+		snprintf(args, sizeof(args), "dp use %s", id->valuestring);
+	} else {
+		snprintf(args, sizeof(args), "dp reset");
+	}
+
+	char out[2048];
+	if (!run_displayxr_cli(args, out, sizeof(out))) {
+		return error_object("failed to run displayxr-cli");
+	}
+	// First line of the CLI output is the human-readable result.
+	char *nl = strchr(out, '\n');
+	if (nl != NULL) {
+		*nl = '\0';
+	}
+	cJSON *r = cJSON_CreateObject();
+	cJSON_AddStringToObject(r, "result", out[0] ? out : "(done)");
+	cJSON_AddBoolToObject(r, "requires_service_restart", 1);
+	return r;
+}
+static const struct mcp_tool TOOL_SET_PREFERRED_DP = {
+    .name = "set_preferred_dp",
+    .description = "MUTATING (guarded). Set or clear the PreferredPlugin display-processor override "
+                   "(machine-wide, needs admin; takes effect after a service restart). Pass "
+                   "{\"id\":\"sim-display\",\"confirm\":true} to set, or {\"confirm\":true} with no id to "
+                   "reset. Mirrors `displayxr-cli dp use/reset`.",
+    .input_schema_json =
+        "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"confirm\":{\"type\":\"boolean\"}},"
+        "\"required\":[\"confirm\"]}",
+    .fn = tool_set_preferred_dp,
+};
+
 void
 oxr_mcp_tools_register_all(void)
 {
@@ -901,6 +1124,11 @@ oxr_mcp_tools_register_all(void)
 	mcp_server_register_tool(&TOOL_GET_SUBMITTED_PROJECTION);
 	mcp_server_register_tool(&TOOL_DIFF_PROJECTION);
 	mcp_server_register_tool(&TOOL_CAPTURE_FRAME);
+	// Session-free diagnostics (#378) — usable with no app running.
+	mcp_server_register_tool(&TOOL_GET_RUNTIME_STATUS);
+	mcp_server_register_tool(&TOOL_RUN_SELFTEST);
+	mcp_server_register_tool(&TOOL_LIST_DISPLAY_PROCESSORS);
+	mcp_server_register_tool(&TOOL_SET_PREFERRED_DP);
 	mcp_capture_set_notify(notify_capture_install, notify_capture_uninstall);
 	// Only hijack the global log sink when MCP is actually enabled; otherwise
 	// leave whatever sink the runtime had already installed (typically
