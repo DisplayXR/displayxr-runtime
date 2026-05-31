@@ -27,11 +27,13 @@ cli_print_help(int argc, const char **argv)
 	P("Usage: %s command [options] [file]\n", argv[0]);
 	P("\n");
 	P("Commands:\n");
-	P("  info     - Print runtime, plug-in, and display info (for bug reporting).\n");
-	P("  selftest - Headless self-test: discover a display processor and validate\n");
-	P("             its display info. Exits 0 on success, non-zero on failure.\n");
-	P("  test     - List found devices and role assignments, for prober testing.\n");
-	P("  probe    - Just probe and then exit.\n");
+	P("  info [--json]     - Print runtime, plug-in, and display info (for bug reporting).\n");
+	P("  selftest [--json] - Headless self-test: discover a display processor and validate\n");
+	P("                      its display info. Exits 0 on success, non-zero on failure.\n");
+	P("  dp <...>          - List display processors / set the PreferredPlugin override.\n");
+	P("                      'dp list [--json]', 'dp use <id>', 'dp reset'.\n");
+	P("  test              - List found devices and role assignments, for prober testing.\n");
+	P("  probe             - Just probe and then exit.\n");
 
 	return 1;
 }
@@ -48,6 +50,9 @@ main(int argc, const char **argv)
 	}
 	if (strcmp(argv[1], "selftest") == 0) {
 		return cli_cmd_selftest(argc, argv);
+	}
+	if (strcmp(argv[1], "dp") == 0) {
+		return cli_cmd_dp(argc, argv);
 	}
 	if (strcmp(argv[1], "test") == 0) {
 		return cli_cmd_test(argc, argv);

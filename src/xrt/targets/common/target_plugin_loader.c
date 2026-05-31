@@ -451,6 +451,110 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 	return NULL;
 }
 
+/*
+ *
+ * Public enumeration + PreferredPlugin override (Windows).
+ *
+ */
+
+int
+target_plugin_enumerate(struct target_plugin_desc *out, int max)
+{
+	if (out == NULL || max <= 0) {
+		return 0;
+	}
+
+	struct plugin_entry entries[MAX_PLUGIN_ENTRIES];
+	int n = enumerate_registry(entries, MAX_PLUGIN_ENTRIES);
+	if (n > max) {
+		n = max;
+	}
+
+	for (int i = 0; i < n; i++) {
+		struct target_plugin_desc *d = &out[i];
+		memset(d, 0, sizeof(*d));
+		snprintf(d->id, sizeof(d->id), "%s", entries[i].id);
+		snprintf(d->display_name, sizeof(d->display_name), "%s", entries[i].display_name);
+		snprintf(d->vendor, sizeof(d->vendor), "%s", entries[i].vendor);
+		snprintf(d->version, sizeof(d->version), "%s", entries[i].version);
+		wide_to_utf8(entries[i].binary_path, d->binary_path, (int)sizeof(d->binary_path));
+		d->probe_order = entries[i].probe_order;
+	}
+
+	return n;
+}
+
+bool
+target_plugin_get_preferred(char *out, size_t cap)
+{
+	if (out == NULL || cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+
+	wchar_t wbuf[64];
+	DWORD wbuf_bytes = sizeof(wbuf);
+	LSTATUS rc = RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\DisplayProcessors", L"PreferredPlugin",
+	                          RRF_RT_REG_SZ, NULL, wbuf, &wbuf_bytes);
+	if (rc != ERROR_SUCCESS) {
+		return false;
+	}
+	wide_to_utf8(wbuf, out, (int)cap);
+	return out[0] != '\0';
+}
+
+xrt_result_t
+target_plugin_set_preferred(const char *id)
+{
+	if (id == NULL || id[0] == '\0') {
+		return target_plugin_clear_preferred();
+	}
+
+	wchar_t wid[64];
+	if (MultiByteToWideChar(CP_UTF8, 0, id, -1, wid, (int)(sizeof(wid) / sizeof(wid[0]))) <= 0) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	// 64-bit view: the runtime reader runs as a 64-bit process (no
+	// redirection), so we must write where it reads. Create the root key
+	// if a clean machine never installed a DisplayProcessor.
+	HKEY root;
+	LSTATUS rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\DisplayProcessors", 0, NULL, 0,
+	                             KEY_SET_VALUE | KEY_WOW64_64KEY, NULL, &root, NULL);
+	if (rc != ERROR_SUCCESS) {
+		return rc == ERROR_ACCESS_DENIED ? XRT_ERROR_NOT_AUTHORIZED : XRT_ERROR_IPC_FAILURE;
+	}
+
+	DWORD bytes = (DWORD)((wcslen(wid) + 1) * sizeof(wchar_t));
+	rc = RegSetValueExW(root, L"PreferredPlugin", 0, REG_SZ, (const BYTE *)wid, bytes);
+	RegCloseKey(root);
+	if (rc != ERROR_SUCCESS) {
+		return rc == ERROR_ACCESS_DENIED ? XRT_ERROR_NOT_AUTHORIZED : XRT_ERROR_IPC_FAILURE;
+	}
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+target_plugin_clear_preferred(void)
+{
+	HKEY root;
+	LSTATUS rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\DisplayProcessors", 0,
+	                           KEY_SET_VALUE | KEY_WOW64_64KEY, &root);
+	if (rc == ERROR_FILE_NOT_FOUND) {
+		return XRT_SUCCESS; // no root key → nothing to clear
+	}
+	if (rc != ERROR_SUCCESS) {
+		return rc == ERROR_ACCESS_DENIED ? XRT_ERROR_NOT_AUTHORIZED : XRT_ERROR_IPC_FAILURE;
+	}
+
+	rc = RegDeleteValueW(root, L"PreferredPlugin");
+	RegCloseKey(root);
+	if (rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND) {
+		return rc == ERROR_ACCESS_DENIED ? XRT_ERROR_NOT_AUTHORIZED : XRT_ERROR_IPC_FAILURE;
+	}
+	return XRT_SUCCESS;
+}
+
 #elif defined(XRT_OS_ANDROID)
 
 #include <dirent.h>
@@ -817,6 +921,53 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 	return NULL;
 }
 
+/*
+ *
+ * Public enumeration + PreferredPlugin override (Android — minimal).
+ *
+ * Android discovery is convention-driven (filename ProbeOrder) and the
+ * diagnostic CLI / Control Panel don't ship there in v1, so enumeration
+ * and the writable override are stubs; the read honors the env override
+ * so a dev/emulator can still pin a plug-in.
+ *
+ */
+
+int
+target_plugin_enumerate(struct target_plugin_desc *out, int max)
+{
+	(void)out;
+	(void)max;
+	return 0;
+}
+
+bool
+target_plugin_get_preferred(char *out, size_t cap)
+{
+	if (out == NULL || cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+	const char *env = getenv("XRT_PREFERRED_PLUGIN_ID");
+	if (env != NULL && *env != '\0') {
+		snprintf(out, cap, "%s", env);
+		return out[0] != '\0';
+	}
+	return false;
+}
+
+xrt_result_t
+target_plugin_set_preferred(const char *id)
+{
+	(void)id;
+	return XRT_ERROR_NOT_IMPLEMENTED;
+}
+
+xrt_result_t
+target_plugin_clear_preferred(void)
+{
+	return XRT_ERROR_NOT_IMPLEMENTED;
+}
+
 #else /* !XRT_OS_WINDOWS && !XRT_OS_ANDROID — macOS / Linux */
 
 #include "util/u_json.h"
@@ -1038,6 +1189,94 @@ append_roots(char roots[][PATH_MAX], int max_roots, int *n_roots, const char *pa
 	snprintf(roots[(*n_roots)++], PATH_MAX, "%s", path);
 }
 
+/*!
+ * Assemble the platform's plug-in discovery roots into @p roots (each a
+ * PATH_MAX buffer), in priority order, and return the count. Factored out
+ * so both discover_active_plugin() and target_plugin_enumerate() search
+ * exactly the same set. See docs/specs/runtime/plugin-discovery.md §3.
+ */
+static int
+build_discovery_roots(char roots[][PATH_MAX], int max_roots)
+{
+	int n_roots = 0;
+
+	const char *override = getenv("XRT_PLUGIN_SEARCH_PATH");
+	if (override != NULL && *override != '\0') {
+		/* Colon-separated list, like PATH. */
+		const char *p = override;
+		while (*p && n_roots < max_roots) {
+			const char *colon = strchr(p, ':');
+			size_t len = colon ? (size_t)(colon - p) : strlen(p);
+			if (len > 0 && len < PATH_MAX) {
+				char buf[PATH_MAX];
+				memcpy(buf, p, len);
+				buf[len] = '\0';
+				append_roots(roots, max_roots, &n_roots, buf);
+			}
+			if (!colon) {
+				break;
+			}
+			p = colon + 1;
+		}
+	}
+
+	const char *home = getenv("HOME");
+	char user_root[PATH_MAX];
+#ifdef __APPLE__
+	if (home != NULL && *home != '\0') {
+		snprintf(user_root, sizeof(user_root),
+		         "%s/Library/Application Support/DisplayXR/DisplayProcessors", home);
+		append_roots(roots, max_roots, &n_roots, user_root);
+	}
+	/* System-wide root for `.pkg`-style installs that run as root and
+	 * write to /Library/Application Support/ rather than ~. Per-user
+	 * entries above shadow system-wide entries via the already_have_id
+	 * dedup inside enumerate_dir. Issue #274. */
+	append_roots(roots, max_roots, &n_roots, "/Library/Application Support/DisplayXR/DisplayProcessors");
+#else
+	const char *xdg = getenv("XDG_DATA_HOME");
+	if (xdg != NULL && *xdg != '\0') {
+		snprintf(user_root, sizeof(user_root), "%s/DisplayXR/DisplayProcessors", xdg);
+		append_roots(roots, max_roots, &n_roots, user_root);
+	} else if (home != NULL && *home != '\0') {
+		snprintf(user_root, sizeof(user_root), "%s/.local/share/DisplayXR/DisplayProcessors", home);
+		append_roots(roots, max_roots, &n_roots, user_root);
+	}
+	append_roots(roots, max_roots, &n_roots, "/usr/local/share/displayxr/DisplayProcessors");
+	append_roots(roots, max_roots, &n_roots, "/usr/share/displayxr/DisplayProcessors");
+#endif
+
+	return n_roots;
+}
+
+/*!
+ * Per-user manifest dir — the writable root for the `preferred` override
+ * file. Returns false if HOME (and XDG) are unset.
+ */
+static bool
+user_manifest_dir(char *out, size_t cap)
+{
+	const char *home = getenv("HOME");
+#ifdef __APPLE__
+	if (home == NULL || *home == '\0') {
+		return false;
+	}
+	snprintf(out, cap, "%s/Library/Application Support/DisplayXR/DisplayProcessors", home);
+	return true;
+#else
+	const char *xdg = getenv("XDG_DATA_HOME");
+	if (xdg != NULL && *xdg != '\0') {
+		snprintf(out, cap, "%s/DisplayXR/DisplayProcessors", xdg);
+		return true;
+	}
+	if (home != NULL && *home != '\0') {
+		snprintf(out, cap, "%s/.local/share/DisplayXR/DisplayProcessors", home);
+		return true;
+	}
+	return false;
+#endif
+}
+
 static const struct xrt_plugin_iface *
 try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst)
 {
@@ -1121,57 +1360,7 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 	*out_inst = NULL;
 
 	char roots[8][PATH_MAX];
-	int n_roots = 0;
-
-	const char *override = getenv("XRT_PLUGIN_SEARCH_PATH");
-	if (override != NULL && *override != '\0') {
-		/* Colon-separated list, like PATH. */
-		const char *p = override;
-		while (*p && n_roots < (int)(sizeof(roots) / sizeof(roots[0]))) {
-			const char *colon = strchr(p, ':');
-			size_t len = colon ? (size_t)(colon - p) : strlen(p);
-			if (len > 0 && len < PATH_MAX) {
-				char buf[PATH_MAX];
-				memcpy(buf, p, len);
-				buf[len] = '\0';
-				append_roots(roots, (int)(sizeof(roots) / sizeof(roots[0])), &n_roots, buf);
-			}
-			if (!colon) {
-				break;
-			}
-			p = colon + 1;
-		}
-	}
-
-	const char *home = getenv("HOME");
-	char user_root[PATH_MAX];
-#ifdef __APPLE__
-	if (home != NULL && *home != '\0') {
-		snprintf(user_root, sizeof(user_root),
-		         "%s/Library/Application Support/DisplayXR/DisplayProcessors", home);
-		append_roots(roots, (int)(sizeof(roots) / sizeof(roots[0])), &n_roots, user_root);
-	}
-	/* System-wide root for `.pkg`-style installs that run as root and
-	 * write to /Library/Application Support/ rather than ~. Per-user
-	 * entries above shadow system-wide entries via the already_have_id
-	 * dedup inside enumerate_dir. Mirrors the Linux system-root
-	 * convention below. Issue #274. */
-	append_roots(roots, (int)(sizeof(roots) / sizeof(roots[0])), &n_roots,
-	             "/Library/Application Support/DisplayXR/DisplayProcessors");
-#else
-	const char *xdg = getenv("XDG_DATA_HOME");
-	if (xdg != NULL && *xdg != '\0') {
-		snprintf(user_root, sizeof(user_root), "%s/DisplayXR/DisplayProcessors", xdg);
-		append_roots(roots, (int)(sizeof(roots) / sizeof(roots[0])), &n_roots, user_root);
-	} else if (home != NULL && *home != '\0') {
-		snprintf(user_root, sizeof(user_root), "%s/.local/share/DisplayXR/DisplayProcessors", home);
-		append_roots(roots, (int)(sizeof(roots) / sizeof(roots[0])), &n_roots, user_root);
-	}
-	append_roots(roots, (int)(sizeof(roots) / sizeof(roots[0])), &n_roots,
-	             "/usr/local/share/displayxr/DisplayProcessors");
-	append_roots(roots, (int)(sizeof(roots) / sizeof(roots[0])), &n_roots,
-	             "/usr/share/displayxr/DisplayProcessors");
-#endif
+	int n_roots = build_discovery_roots(roots, (int)(sizeof(roots) / sizeof(roots[0])));
 
 	if (n_roots == 0) {
 		U_LOG_I("plugin loader: no discovery roots present — no plug-ins to try.");
@@ -1208,6 +1397,127 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 
 	U_LOG_W("plugin loader: no registered plug-in claimed the system — falling back to static drivers.");
 	return NULL;
+}
+
+/*
+ *
+ * Public enumeration + PreferredPlugin override (POSIX: macOS / Linux).
+ *
+ */
+
+int
+target_plugin_enumerate(struct target_plugin_desc *out, int max)
+{
+	if (out == NULL || max <= 0) {
+		return 0;
+	}
+
+	char roots[8][PATH_MAX];
+	int n_roots = build_discovery_roots(roots, (int)(sizeof(roots) / sizeof(roots[0])));
+	if (n_roots == 0) {
+		return 0;
+	}
+
+	struct plugin_entry entries[MAX_PLUGIN_ENTRIES];
+	int n = 0;
+	for (int r = 0; r < n_roots; r++) {
+		n = enumerate_dir(roots[r], entries, n, MAX_PLUGIN_ENTRIES);
+	}
+	if (n > max) {
+		n = max;
+	}
+
+	for (int i = 0; i < n; i++) {
+		struct target_plugin_desc *d = &out[i];
+		memset(d, 0, sizeof(*d));
+		snprintf(d->id, sizeof(d->id), "%s", entries[i].id);
+		snprintf(d->display_name, sizeof(d->display_name), "%s", entries[i].display_name);
+		snprintf(d->vendor, sizeof(d->vendor), "%s", entries[i].vendor);
+		snprintf(d->version, sizeof(d->version), "%s", entries[i].version);
+		snprintf(d->binary_path, sizeof(d->binary_path), "%s", entries[i].binary_path);
+		d->probe_order = entries[i].probe_order;
+	}
+
+	return n;
+}
+
+bool
+target_plugin_get_preferred(char *out, size_t cap)
+{
+	if (out == NULL || cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+
+	/* Env var wins — a dev/CI override that needs no writable filesystem. */
+	const char *env = getenv("XRT_PREFERRED_PLUGIN_ID");
+	if (env != NULL && *env != '\0') {
+		snprintf(out, cap, "%s", env);
+		return out[0] != '\0';
+	}
+
+	char dir[PATH_MAX];
+	if (!user_manifest_dir(dir, sizeof(dir))) {
+		return false;
+	}
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/preferred", dir);
+
+	FILE *f = fopen(path, "rb");
+	if (f == NULL) {
+		return false;
+	}
+	char buf[64] = {0};
+	size_t got = fread(buf, 1, sizeof(buf) - 1, f);
+	fclose(f);
+	buf[got] = '\0';
+	size_t len = strlen(buf);
+	while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r' || buf[len - 1] == ' ' ||
+	                   buf[len - 1] == '\t')) {
+		buf[--len] = '\0';
+	}
+	snprintf(out, cap, "%s", buf);
+	return out[0] != '\0';
+}
+
+xrt_result_t
+target_plugin_set_preferred(const char *id)
+{
+	if (id == NULL || id[0] == '\0') {
+		return target_plugin_clear_preferred();
+	}
+
+	char dir[PATH_MAX];
+	if (!user_manifest_dir(dir, sizeof(dir))) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	/* Best-effort: create the manifest dir if absent (single level). */
+	(void)mkdir(dir, 0755);
+
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/preferred", dir);
+	FILE *f = fopen(path, "wb");
+	if (f == NULL) {
+		return errno == EACCES ? XRT_ERROR_NOT_AUTHORIZED : XRT_ERROR_IPC_FAILURE;
+	}
+	fprintf(f, "%s\n", id);
+	fclose(f);
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+target_plugin_clear_preferred(void)
+{
+	char dir[PATH_MAX];
+	if (!user_manifest_dir(dir, sizeof(dir))) {
+		return XRT_SUCCESS; /* nowhere it could live → nothing to clear */
+	}
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/preferred", dir);
+	if (remove(path) != 0 && errno != ENOENT) {
+		return errno == EACCES ? XRT_ERROR_NOT_AUTHORIZED : XRT_ERROR_IPC_FAILURE;
+	}
+	return XRT_SUCCESS;
 }
 
 #endif /* platform-specific loader */

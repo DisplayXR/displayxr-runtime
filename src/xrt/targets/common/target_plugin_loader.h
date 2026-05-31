@@ -37,10 +37,78 @@
 
 #include "xrt/xrt_plugin.h"
 
+#include <stddef.h>
+
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/*!
+ * Vendor-neutral descriptor for one registered plug-in, as discovered
+ * from the platform's discovery root WITHOUT loading the DLL/dylib/`.so`.
+ *
+ * Used by diagnostic front-ends — `displayxr-cli dp list` and the Control
+ * Panel — to enumerate the choices the loader would consider, plus their
+ * `ProbeOrder`, without paying the cost (or the ADR-019 exposure) of
+ * actually loading a vendor plug-in. All fields are UTF-8.
+ */
+struct target_plugin_desc
+{
+	char id[64];           /* discovery id (Windows subkey / manifest <id>) */
+	char display_name[128];
+	char vendor[64];
+	char version[64];
+	char binary_path[512];
+	uint32_t probe_order; /* lower wins; missing defaults to 100 */
+};
+
+/*!
+ * Enumerate registered plug-ins from the platform's discovery root
+ * WITHOUT loading them. Writes up to @p max descriptors to @p out and
+ * returns the count (0 if the discovery root is absent / empty). The
+ * order is unspecified — callers that care sort by `probe_order`.
+ *
+ * This re-reads the discovery root every call (it is not cached like the
+ * active-plug-in path); cheap enough for an interactive `dp list`.
+ */
+int
+target_plugin_enumerate(struct target_plugin_desc *out, int max);
+
+/*!
+ * Read the `PreferredPlugin` override — the plug-in id the loader tries
+ * before the `ProbeOrder` sort. Writes the id (NUL-terminated) to @p out
+ * and returns true iff a non-empty override is configured; otherwise
+ * writes an empty string and returns false.
+ *
+ * Windows: `REG_SZ` `PreferredPlugin` at the discovery root key
+ * `HKLM\Software\DisplayXR\DisplayProcessors`. POSIX: the
+ * `XRT_PREFERRED_PLUGIN_ID` env var, else a `preferred` file in the
+ * per-user manifest dir.
+ */
+bool
+target_plugin_get_preferred(char *out, size_t cap);
+
+/*!
+ * Set the `PreferredPlugin` override to @p id (a plug-in discovery id).
+ * Takes effect for processes that begin discovery AFTER the write — the
+ * loader is one-shot per process, so a running service must be restarted.
+ *
+ * Windows writes HKLM and therefore requires administrator rights;
+ * returns @ref XRT_ERROR_NOT_AUTHORIZED on access-denied,
+ * @ref XRT_ERROR_IPC_FAILURE on other write failures, and
+ * @ref XRT_SUCCESS on success.
+ */
+xrt_result_t
+target_plugin_set_preferred(const char *id);
+
+/*!
+ * Clear the `PreferredPlugin` override (restore normal `ProbeOrder`
+ * discovery). Idempotent — clearing an unset override is @ref XRT_SUCCESS.
+ * Same elevation / restart caveats as @ref target_plugin_set_preferred.
+ */
+xrt_result_t
+target_plugin_clear_preferred(void);
 
 /*!
  * Returns the @ref xrt_plugin_iface for the active plug-in (whichever

@@ -8,8 +8,11 @@ add_executable(
 	cli
 	cli_cmd_info.c
 	cli_cmd_selftest.c
+	cli_cmd_dp.c
 	cli_cmd_probe.c
 	cli_cmd_test.c
+	cli_query.c
+	cli_query.h
 	cli_common.h
 	cli_main.c
 	)
