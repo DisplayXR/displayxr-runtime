@@ -50,12 +50,14 @@ COMPONENT_INSTALL_MARKER_MACOS_leia_plugin=""
 COMPONENT_INSTALL_MARKER_WINDOWS_leia_plugin="HKLM\\Software\\DisplayXR\\DisplayProcessors\\leia-sr"
 
 # --- mcp_tools ---
-# displayxr-mcp ships a Windows installer today; macOS artifact is a future
-# component. Empty macOS glob → warn+skip.
+# displayxr-mcp ships a Windows installer (NSIS) and a macOS .pkg
+# (productbuild). On macOS the postinstall flips the capability bit at
+# /Library/Application Support/DisplayXR/Capabilities/MCP/Enabled —
+# that's also the marker setup-displayxr.sh checks for installer success.
 COMPONENT_REPO_mcp_tools="DisplayXR/displayxr-mcp"
-COMPONENT_PKG_MACOS_mcp_tools=""
+COMPONENT_PKG_MACOS_mcp_tools="DisplayXRMCP-*.pkg"
 COMPONENT_EXE_WINDOWS_mcp_tools="DisplayXRMCPSetup-*.exe"
-COMPONENT_INSTALL_MARKER_MACOS_mcp_tools=""
+COMPONENT_INSTALL_MARKER_MACOS_mcp_tools="/Library/Application Support/DisplayXR/Capabilities/MCP/Enabled"
 COMPONENT_INSTALL_MARKER_WINDOWS_mcp_tools="HKLM\\Software\\DisplayXR\\Capabilities\\MCP"
 
 # --- gauss_demo ---

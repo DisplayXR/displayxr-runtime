@@ -130,7 +130,13 @@ rebuild.
 
 ### `displayxr-mcp`
 
-Same snippet, with `field: "mcp_tools"`.
+Same snippet, with `field: "mcp_tools"`. `mcp_tools` is a dual-platform
+field — `build.yml` builds both `DisplayXRMCPSetup-*.exe` (NSIS) and
+`DisplayXRMCP-*.pkg` (productbuild) and attaches both to the same GitHub
+Release. `components.sh` carries the macOS glob + install marker
+(`/Library/Application Support/DisplayXR/Capabilities/MCP/Enabled`, the
+POSIX mirror of the Windows REG_DWORD), so `setup-displayxr.sh --with
+mcp` works on a clean Mac.
 
 ### `displayxr-demo-*`
 

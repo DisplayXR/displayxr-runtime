@@ -30,6 +30,9 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 #include "os/os_time.h"
@@ -839,10 +842,19 @@ oxr_mcp_log_sink(const char *file,
 	mcp_log_ring_append(xlate_log_level(level), fmt, args);
 }
 
-// Reads HKLM\Software\DisplayXR\Capabilities\MCP\Enabled (DWORD) under
-// the 64-bit registry view. The MCP installer (DisplayXRMCPSetup-*.exe)
-// from displayxr-mcp writes this key. Non-Windows builds always return
-// false — there's no Capabilities key on POSIX; rely on the env var.
+// Reads the MCP capability marker written by the displayxr-mcp installer.
+//
+//   Windows: HKLM\Software\DisplayXR\Capabilities\MCP\Enabled (REG_DWORD == 1),
+//            64-bit registry view. Written by DisplayXRMCPSetup-*.exe.
+//   macOS:   /Library/Application Support/DisplayXR/Capabilities/MCP/Enabled,
+//            first byte == '1'. Written (as root:wheel 0644) by the
+//            postinstall script in DisplayXRMCP-*.pkg. See
+//            displayxr-mcp/installer/macos/scripts/postinstall.
+//
+// Returns true iff the marker is present AND set to enabled. The
+// DISPLAYXR_MCP env var still wins as a force-enable / force-disable
+// override via mcp_check_env_or() — see the call site in
+// oxr_instance.c.
 bool
 oxr_mcp_capability_enabled(void)
 {
@@ -864,7 +876,18 @@ oxr_mcp_capability_enabled(void)
 	RegCloseKey(key);
 	return rc == ERROR_SUCCESS && value_type == REG_DWORD && value == 1;
 #else
-	return false;
+	// POSIX mirror — file-existence + first-byte check. Equivalent
+	// semantics to the Win32 REG_DWORD == 1 above.
+	static const char path[] =
+	    "/Library/Application Support/DisplayXR/Capabilities/MCP/Enabled";
+	int fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		return false;
+	}
+	char b = 0;
+	ssize_t n = read(fd, &b, 1);
+	close(fd);
+	return n == 1 && b == '1';
 #endif
 }
 

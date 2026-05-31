@@ -144,7 +144,7 @@ This repo IS the public runtime (no private→public mirror). A release is a `vX
 |---|---|---|
 | Shell | `displayxr-shell-pvt` → `displayxr-shell-releases` | `/dxr-release` or `git tag` → `publish-shell-releases.yml` builds + cross-publishes + dispatches `versions-bump`. Auth via `displayxr-publish-bot` GitHub App (`.secrets/displayxr-publish-bot.pem` backup; see `.secrets/NOTE.md`). |
 | Leia SR plug-in | `displayxr-leia-plugin` | `/dxr-release` → builds DLL + installer + dispatches `versions-bump` with ABI gate (ADR-020). |
-| MCP framework | `displayxr-mcp` | `/dxr-release` → matrix build + adapter installer + dispatches `versions-bump`. |
+| MCP framework | `displayxr-mcp` | `/dxr-release` → matrix build + dual-platform installers (`DisplayXRMCPSetup-*.exe` NSIS + `DisplayXRMCP-*.pkg` productbuild) + dispatches `versions-bump`. |
 | Extension headers | `displayxr-extensions` | Auto-syncs from `src/external/openxr_includes/` on every push to main. No tag. |
 | Standalone demos | `displayxr-demo-*` | `/dxr-release` → builds installer + dispatches `versions-bump`. |
 | Meta-installer bundle | `displayxr-installer` | `/installer-release` or `workflow_dispatch` (NOT auto-fired). Chains every component installer. |
