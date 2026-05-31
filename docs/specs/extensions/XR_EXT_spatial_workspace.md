@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_EXT_spatial_workspace` |
-| **Spec Version** | 9 |
+| **Spec Version** | 23 |
 | **Authors** | David Fattal (DisplayXR / Leia Inc.) |
 | **Status** | Provisional — published with the DisplayXR runtime; subject to revision before Khronos registry submission. |
 | **Header** | `src/external/openxr_includes/openxr/XR_EXT_spatial_workspace.h` |
@@ -44,9 +44,10 @@ A spatial workspace is the OS-level shell for a 3D display: the privileged proce
 - `xrWorkspaceHitTestEXT(session, cursorX, cursorY, &outClientId, &outLocalUV, &outHitRegion)` — translate a screen-space cursor into a hit on a client window. The runtime intersects an eye→cursor ray with each client's window quad and reports the hit `clientId`, an interpolated UV on the content rect, and a `XrWorkspaceHitRegionEXT` classification (CONTENT, TITLE_BAR, CLOSE_BUTTON, EDGE_RESIZE_*, TASKBAR, LAUNCHER_TILE, BACKGROUND).
   - **Removed in spec_version 22.** The workspace controller now owns hit-testing end to end (it already ran the same eye→cursor raycast for click policy) and the runtime no longer raycasts. The controller fills the hit fields on the pointer events it drains, and feeds the runtime only the cursor depth it needs to render the sprite at the right disparity via `xrSetWorkspaceCursorDepthEXT` (see Cursor depth below). `XrWorkspaceHitRegionEXT` is retained as the type of the controller-filled `hitRegion` field.
 
-### Cursor depth *(spec_version 22)*
+### Cursor depth *(spec_version 22; `dimFactor` added in 23)*
 
-- `xrSetWorkspaceCursorDepthEXT(session, &XrWorkspaceCursorDepthEXT{ hitZMeters, overWindow })` — per-frame push of the cursor's ray-plane depth (and an "over a window" flag) so the runtime can render the cursor sprite with the correct per-eye disparity. Cursor screen position stays runtime-owned (OS cursor); only depth + the over-window dim flag come from the controller. When a modal input grab pins the cursor to the zero-disparity plane, the controller pushes `hitZMeters = 0`. This completes the migration of cursor policy to the controller: the runtime's raycast and `xrWorkspaceHitTestEXT` are gone, and `POINTER_HOVER` transitions are generated controller-side from the per-frame cursor feed.
+- `xrSetWorkspaceCursorDepthEXT(session, &XrWorkspaceCursorDepthEXT{ hitZMeters, overWindow, dimFactor })` — per-frame push of the cursor's ray-plane depth (and an "over a window" flag) so the runtime can render the cursor sprite with the correct per-eye disparity. Cursor screen position stays runtime-owned (OS cursor); only depth + the over-window dim flag + the dim amount come from the controller. When a modal input grab pins the cursor to the zero-disparity plane, the controller pushes `hitZMeters = 0`. This completes the migration of cursor policy to the controller: the runtime's raycast and `xrWorkspaceHitTestEXT` are gone, and `POINTER_HOVER` transitions are generated controller-side from the per-frame cursor feed.
+  - **`dimFactor` (spec_version 23, issue #376).** The over-window cursor body alpha, in `[0,1]` (1.0 = no dim; lower = more transparent — used to reduce lenticular crosstalk on the cursor's bright pixels over content). Applied only when `overWindow` is true. This was a hardcoded `0.30` runtime default; the controller now owns it as look-and-feel. The runtime clamps to `[0,1]` and falls back to `0.30` until the first push.
 
 ### Focus
 
@@ -57,7 +58,7 @@ A spatial workspace is the OS-level shell for a 3D display: the privileged proce
 
 - `xrEnumerateWorkspaceInputEventsEXT(session, capacityInput, &countOutput, events)` — drain pending workspace input events. Tagged-union `XrWorkspaceInputEventEXT` records carry one of:
   - **POINTER** (button down/up). Hit-test enriched at drain time so the controller does not need to call `xrWorkspaceHitTestEXT` per event.
-  - **KEY** (down/up + modifiers). MVP key policy: TAB and DELETE are consumed by the runtime; ESC is consumed when any window is maximised; everything else is delivered here AND forwarded to the focused HWND.
+  - **KEY** (down/up + modifiers). Key policy: ESC is consumed by the runtime when any window is maximised; everything else is delivered here AND forwarded to the focused HWND. TAB (focus cycle), DELETE (close focused — via `xrRequestWorkspaceClientExitEXT`), F11 (maximize), `[`/`]` (depth), and Ctrl+O (browse + launch) are all controller-owned policy driven off these KEY events — the runtime no longer intercepts them (TAB/F11/`[`/`]` since #305–#307, DELETE/Ctrl+O since #376).
   - **SCROLL** (mouse-wheel delta + cursor + modifiers).
   - **POINTER_MOTION** *(spec_version 6)* — per-frame `WM_MOUSEMOVE` while pointer capture is enabled. Hit-test enriched. Carries a `buttonMask` of currently-held buttons (bit0=L, bit1=R, bit2=M).
   - **FRAME_TICK** *(spec_version 6)* — fires once per displayed compositor frame with the host-monotonic ns at frame compose. Lets controllers pace per-frame work (animation interpolation, hover effects) to display refresh without polling.
@@ -72,7 +73,7 @@ A spatial workspace is the OS-level shell for a 3D display: the privileged proce
 
 ### Lifecycle requests *(spec_version 6)*
 
-- `xrRequestWorkspaceClientExitEXT(session, clientId)` — ask the runtime to close any client (not just the focused one). For OpenXR clients the runtime emits `XRT_SESSION_EVENT_EXIT_REQUEST`; for capture clients it tears down the capture immediately. Equivalent of the runtime's built-in DELETE shortcut, but targeted.
+- `xrRequestWorkspaceClientExitEXT(session, clientId)` — ask the runtime to close any client (not just the focused one). For OpenXR clients the runtime emits `XRT_SESSION_EVENT_EXIT_REQUEST`; for capture clients it tears down the capture immediately. This is the close *mechanism*; the controller decides when to call it — e.g. on a chrome close-button click or the DELETE key (the runtime's built-in DELETE intercept was removed in #376).
 - `xrRequestWorkspaceClientFullscreenEXT(session, clientId, fullscreen)` — toggle fullscreen for any client. Mirrors F11 behaviour: animates the target window to fill the display and hides others; XR_FALSE restores.
 
 ### Client enumeration
@@ -141,7 +142,9 @@ Implementation note: today the focus glow renders as an oversized pre-pass behin
 
 **Spec_version 9 makes the runtime a parameterized composite engine.** Adds `XrWorkspaceClientStyleEXT` + `xrSetWorkspaceClientStyleEXT` — the controller's surface for adjusting how the runtime samples / masks / shades each client's content (corner radius, edge alpha feather, focus-glow color/intensity/falloff). The architectural rationale: chrome (the decoration controllers paint via chrome swapchains) is fully controller-owned, but how the *content itself* composites — its corners, its edge softening, its focused-state appearance — is fundamentally a property of the compositor and only the runtime can express it. Rather than wire ad-hoc shader knobs through one-off APIs, the style struct is the canonical extension point: new visual treatments (drop shadow, vibrancy, dimming when unfocused, color tint) arrive as additive fields on this struct over time, with controllers that don't know about them seeing runtime-defined defaults. v8 controllers that don't resolve the new PFN see the runtime's prior default style.
 
-**Architectural endpoint.** Per the architectural North Star (`feedback_controllers_own_motion`), the runtime owns mechanism, the controller owns policy + appearance. After spec_version 9, this principle holds for chrome, for the wakeup pattern, and for the parameterized composite knobs: the runtime owns the cross-process texture-share mechanism, the depth-pipeline composite, the hit-test plumbing, the auto-anchor math, the wakeup-event source-of-truth, and the alpha-mask shader; the controller owns every pixel of chrome appearance, every region's hit-region geometry, every animation curve, the wait primitive that drives its idle behavior, AND the per-client style values that drive the runtime's compositor knobs.
+**Spec_version 22–23 finish moving input + cursor policy to the controller.** v22 (issue #370) deletes the runtime raycast + `xrWorkspaceHitTestEXT` and the drag / resize / rotation state machines; the controller hit-tests itself and pushes only cursor depth via `xrSetWorkspaceCursorDepthEXT`. v23 (issue #376) adds `dimFactor` to that struct — the controller owns the over-window cursor body alpha (was a hardcoded `0.30`) — and retires the last runtime key intercepts: DELETE (close, via `xrRequestWorkspaceClientExitEXT`) and Ctrl+O (browse + launch) are now controller policy driven off the KEY event stream, joining TAB / F11 / `[` / `]` (#305–#307). The runtime keeps the close / launch / cursor *mechanisms*; the controller decides when and how they fire.
+
+**Architectural endpoint.** Per the architectural North Star (`feedback_controllers_own_motion`), the runtime owns mechanism, the controller owns policy + appearance. After spec_version 23, this principle holds for chrome, for the wakeup pattern, for the parameterized composite knobs, and for all input / window / cursor policy: the runtime owns the cross-process texture-share mechanism, the depth-pipeline composite, the cursor-sprite composite, the auto-anchor math, the wakeup-event source-of-truth, and the alpha-mask shader; the controller owns every pixel of chrome appearance, every region's hit-region geometry (it runs its own hit-test), every animation curve, the wait primitive that drives its idle behavior, the per-client style values that drive the runtime's compositor knobs, AND every keyboard / window-behavior decision (close, launch, focus-cycle, maximize, depth-step, cursor depth + dim).
 
 ---
 

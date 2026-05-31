@@ -1,7 +1,7 @@
 ---
 status: Active
 owner: David Fattal
-updated: 2026-05-01
+updated: 2026-05-31
 ---
 # Separation of Concerns: App → OXR → Compositor → Driver/DP
 
@@ -82,12 +82,14 @@ Implementations live in `src/xrt/drivers/` (vendor-specific) or `src/xrt/composi
 
 The spatial-workspace surface (`XR_EXT_spatial_workspace`, spec_version 7) splits responsibility between the runtime and a separate **workspace controller** process (the DisplayXR Shell is the reference implementation):
 
-- **Runtime owns mechanism**: cross-process texture sharing, atlas composition at controller-specified poses, depth pipeline, cursor-sprite compositing (at the per-eye depth the controller pushes via `xrSetWorkspaceCursorDepthEXT`), input-event drain (POINTER / KEY / SCROLL / MOTION + FRAME_TICK carrying the OS cursor position), and lifecycle dispatch (close / fullscreen RPCs).
-- **Controller owns policy + appearance**: hit-testing (the eye→cursor raycast against window planes — which window / region / depth the cursor is over), every pixel of chrome (pill background, grip dots, buttons, icons, glyphs, focus glow), every region's hit-region geometry, every animation curve (hover-fade, slot-anim transitions, carousel rotation), every layout preset, and the drag / resize / rotation state machines (driven via `xrSetWorkspaceClientWindowPoseEXT`).
+- **Runtime owns mechanism**: cross-process texture sharing, atlas composition at controller-specified poses, depth pipeline, cursor-sprite compositing (at the per-eye depth — and over-window dim alpha — the controller pushes via `xrSetWorkspaceCursorDepthEXT`), input-event drain (POINTER / KEY / SCROLL / MOTION + FRAME_TICK carrying the OS cursor position), and lifecycle dispatch (close / fullscreen RPCs).
+- **Controller owns policy + appearance**: hit-testing (the eye→cursor raycast against window planes — which window / region / depth the cursor is over), every pixel of chrome (pill background, grip dots, buttons, icons, glyphs, focus glow), every region's hit-region geometry, every animation curve (hover-fade, slot-anim transitions, carousel rotation), every layout preset, the drag / resize / rotation state machines (driven via `xrSetWorkspaceClientWindowPoseEXT`), and every keyboard / window-behavior shortcut (close, launch, focus-cycle, maximize, depth-step) decided off the KEY event stream.
 
 After Phase 2.C the runtime ships with **zero default chrome**. Workspace clients render as bare content quads unless a controller submits a chrome swapchain via `xrCreateWorkspaceClientChromeSwapchainEXT`. This means controllers (third-party shells, accessibility overlays, OEM skins) can change chrome appearance, geometry, and behavior without forking the runtime.
 
 **Hit-test ownership (spec_version 22, issue #370):** the runtime no longer raycasts. `workspace_raycast_hit_test` and the public `xrWorkspaceHitTestEXT` were deleted; the runtime stopped enriching POINTER / POINTER_MOTION events and stopped emitting POINTER_HOVER. The controller runs the hit-test itself (it already owns the window poses it pushed, gets eye positions via its session, and receives the OS cursor position each frame on FRAME_TICK), generates its own hover transitions, and feeds the runtime only the resulting cursor **depth** so the sprite composites at the right per-eye disparity. The drag / resize / rotation state machines that ADR-018 flagged as the real layering violation have likewise moved to the controller. This reverses ADR-018's "hit-test stays in the runtime as plumbing" decision — see that ADR's superseded note.
+
+**Residual input + look-and-feel policy retired (spec_version 23, issue #376):** the last runtime-side workspace policies moved to the controller. The runtime's `DELETE` (close-focused-client) and `Ctrl+O` (browse + launch an arbitrary exe) key intercepts were deleted — both are now controller policy driven off the drained KEY events (DELETE → `xrRequestWorkspaceClientExitEXT`; Ctrl+O → the controller's own file picker + launch path), joining the TAB / F11 / `[` / `]` shortcuts the controller already owned (#305–#307). The over-window cursor body alpha — previously a hardcoded `0.30` in the compositor — is now controller-pushed as `dimFactor` on `xrSetWorkspaceCursorDepthEXT`. (The dead `mc->drag` field, a vestige of the migrated drag state machine, was also removed.) The runtime retains the close / launch / cursor *mechanisms*; the controller decides when and how they fire.
 
 **Reference**: `feedback_controllers_own_motion` for the architectural North Star; ADR-018 for the hit-test plumbing vs interactive policy split; `docs/specs/extensions/XR_EXT_spatial_workspace.md` for the surface; `src/xrt/targets/shell/shell_chrome.cpp` for the reference chrome implementation.
 
