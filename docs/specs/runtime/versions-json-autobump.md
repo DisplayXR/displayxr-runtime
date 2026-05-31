@@ -196,6 +196,46 @@ handlers so two siblings releasing in the same minute don't clobber
 each other on `versions.json`, and retries the push once with a
 rebase if `main` moves underneath the run.
 
+## Asset-table timing: declare a platform glob only AFTER a release carries it
+
+`scripts/lib/components.sh` is the asset table both the dev orchestrator
+and the meta-installer read. For each component it declares per-platform
+globs:
+
+```sh
+COMPONENT_PKG_MACOS_mcp_tools="DisplayXRMCP-*.pkg"     # macOS asset, or "" if none
+COMPONENT_EXE_WINDOWS_mcp_tools="DisplayXRMCPSetup-*.exe"
+```
+
+A **non-empty** glob is a hard promise: the meta-installer's per-platform
+build treats it as a required asset and does `gh release download … ||
+exit 1` (no warn-and-skip). An **empty** glob is the warn-and-skip signal
+("no asset for this platform today").
+
+**The trap — declare lazily, never eagerly.** Set a platform glob ONLY
+after a release that actually carries that asset is what `versions.json`
+pins. If you add `COMPONENT_PKG_MACOS_<name>` in the same change that
+*teaches the component's CI to build the .pkg*, you create a window where
+the table promises an asset that the currently-pinned (older) release
+doesn't have — and the next meta-installer build hard-fails on the
+missing download.
+
+This bit `mcp_tools` (2026-05-31): the macOS-`.pkg` work set
+`COMPONENT_PKG_MACOS_mcp_tools` while `versions.json` still pinned
+`v0.3.3` (Windows-`.exe`-only). The bundle's `build-macos` job failed
+downloading `DisplayXRMCP-*.pkg` until `v0.3.4` (the first release whose
+CI produced + attached the `.pkg`) was cut and auto-bumped in.
+
+**Correct order when a component gains a new-platform installer:**
+1. Land the CI change that builds + attaches the asset on tag push.
+2. Cut a release of that component (`/dxr-release <component> <ver>`) —
+   its CI produces the asset; the auto-bump moves `versions.json` to it.
+3. **Then** set the `COMPONENT_*_<platform>_<name>` glob in
+   `components.sh`. Now the pinned release and the table agree.
+
+(Empty-glob components — `shell`/`leia_plugin` on macOS today — are the
+steady-state of this rule: no asset, no glob, warn-and-skip.)
+
 ## Meta-installer bundle
 
 `DisplayXR/displayxr-installer` (the meta-installer bundle, per
@@ -217,3 +257,4 @@ known-good matrix that's been continuously curated by this flow.
 | ABI mismatch on runtime self-bump | Bump skipped, issue opened on leia repo | Rebuild leia + tag, *then* re-run `workflow_dispatch` on `versions-bump.yml` with `field=runtime, tag=<this runtime tag>` |
 | Sibling repo forgets the dispatch step | `versions.json` doesn't update | Manual `workflow_dispatch` on `versions-bump.yml` with the field + tag, then fix the sibling repo's release workflow |
 | `displayxr-publish-bot` token expires | All bumps fail with auth error | Rotate the GitHub App's private key per `.secrets/NOTE.md` |
+| Bundle build fails downloading a component asset (`gh release download … exit 1`) | `components.sh` declares a platform glob the pinned release doesn't carry (see "Asset-table timing" above) | Cut a component release whose CI produces the asset (`/dxr-release <component> <ver>`); the auto-bump re-pins, the bundle finds it. Or, as a stopgap, blank the glob in `components.sh` to restore warn-and-skip. |
