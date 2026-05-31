@@ -41,7 +41,7 @@ OpenXR runtime via `HKLM\Software\Khronos\OpenXR\1\ActiveRuntime`.
 | Flag | Effect |
 |---|---|
 | _(none)_ | macOS: runtime only. Windows: runtime + Shell + Leia plug-in. |
-| `--with mcp` | Also install DisplayXR MCP Tools (macOS: warn-and-skip until a `.pkg` is published). |
+| `--with mcp` | Also install DisplayXR MCP Tools (now dual-platform: `DisplayXRMCPSetup-*.exe` on Windows, `DisplayXRMCP-*.pkg` on macOS). |
 | `--with-demos` | Clone each `DisplayXR/displayxr-demo-*` repo into `./demos/<name>/`. Does not build them. |
 | `--dry-run` | Print every download / install command without running it. |
 | `--uninstall` | macOS: chain `/Library/Application Support/DisplayXR/uninstall.sh`. Windows: silent-uninstall every `Publisher=DisplayXR` component. |
@@ -75,7 +75,7 @@ repos ship an asset for your platform:
 | runtime     | `displayxr-runtime`                   | yes (`DisplayXR-Installer-*.pkg`)  | yes (`DisplayXRSetup-*.exe`)             |
 | shell       | `displayxr-shell-releases`            | — (macOS port deferred, M6)        | yes (`DisplayXRShellSetup-*.exe`)        |
 | leia_plugin | `displayxr-leia-plugin`               | — (vendor SDK is Windows-only)     | yes (`DisplayXRLeiaSRSetup-*.exe`)       |
-| mcp_tools   | `displayxr-mcp`                       | — (future)                         | yes (`DisplayXRMCPSetup-*.exe`)          |
+| mcp_tools   | `displayxr-mcp`                       | yes (`DisplayXRMCP-*.pkg`)         | yes (`DisplayXRMCPSetup-*.exe`)          |
 
 Empty cells warn-and-skip cleanly: the orchestrator does not abort when
 a component lacks an asset for the pinned tag.
@@ -209,6 +209,76 @@ Cloned demo directories under `./demos/` are left in place on both
 platforms — they may carry local changes and the orchestrator refuses
 to blindly remove them.
 
+## Updating an existing dev box
+
+You already have the repos cloned and the components installed — you
+just want to move to the latest pinned matrix and/or pick up tooling
+changes. There are two independent things you might mean by "update":
+
+### A. Refresh installed component binaries to the latest `versions.json`
+
+Pull `displayxr-runtime` (the orchestrator + the pin file live here)
+and re-run the orchestrator. It re-downloads each component at its
+currently-pinned tag and re-installs — a no-op for components already
+at that version, an upgrade for the rest.
+
+```bash
+# macOS
+cd <displayxr-runtime>
+git pull
+./scripts/setup-displayxr.sh                 # add --with mcp / --with-demos as before
+```
+```bat
+:: Windows — elevated cmd
+cd <displayxr-runtime>
+git pull
+scripts\setup-displayxr.bat
+```
+
+You do **not** need to pull the sibling repos for this — the
+orchestrator downloads released installers from each component's
+GitHub Releases page, it does not build from your local clones.
+
+### B. (Re)link the release skills only — no component reinstall
+
+The `/dxr-release` and `/installer-release` skills live git-tracked
+**only** in `displayxr-runtime/.claude/skills/` and are symlinked into
+your user-level skills dir so they're invocable from any directory.
+After pulling runtime, refresh the symlinks without touching installed
+components:
+
+```bash
+# macOS / Linux
+cd <displayxr-runtime>
+git pull
+./scripts/link-dxr-skills.sh                 # --check to inspect, --unlink to undo
+```
+```bat
+:: Windows — needs an elevated cmd OR Developer Mode (mklink /D requires it)
+cd <displayxr-runtime>
+git pull
+scripts\link-dxr-skills.bat                  :: --check to inspect, --unlink to undo
+```
+
+Path A already runs the linker as its last step, so a full refresh
+covers both. Use Path B when you only want the skills current.
+
+> **Why only `displayxr-runtime`?** The skills used to be copied into
+> each sibling repo; they were consolidated into the runtime hub
+> (parameterized: `/dxr-release <component> <version>`, e.g.
+> `/dxr-release mcp v0.3.4`). The skill clones the target repo to a
+> temp dir at release time, so your local sibling checkouts can be
+> arbitrarily stale and `/dxr-release` still works. Pull the sibling
+> repos only when you do hands-on source work in them. Full design:
+> [`docs/specs/runtime/versions-json-autobump.md`](../specs/runtime/versions-json-autobump.md).
+
+> **Windows symlink caveat:** `mklink /D` silently needs privilege. In a
+> plain (non-elevated) terminal without Developer Mode, `link-dxr-skills.bat`
+> reports `could not link … (needs admin or Developer Mode)` and creates
+> nothing. Run the terminal as Administrator, or enable Developer Mode
+> once (Settings → Privacy & security → For developers). Path A never
+> hits this — it already requires elevation for the NSIS installers.
+
 ## Follow-ups
 
 - `--from-source` flag — issue #283's power-user path (clone each repo
@@ -218,7 +288,8 @@ to blindly remove them.
   installers — tracked as issues
   [#280](https://github.com/DisplayXR/displayxr-runtime/issues/280) and
   [#281](https://github.com/DisplayXR/displayxr-runtime/issues/281).
-- Bundling MCP Tools on macOS — blocked on upstream `displayxr-mcp`
-  shipping a `.pkg`.
+- ~~Bundling MCP Tools on macOS — blocked on upstream `displayxr-mcp`
+  shipping a `.pkg`.~~ Done — `displayxr-mcp` ships `DisplayXRMCP-*.pkg`;
+  `--with mcp` installs it on macOS.
 - End-user meta-installer (single download for non-developers) —
   [#284](https://github.com/DisplayXR/displayxr-runtime/issues/284).
