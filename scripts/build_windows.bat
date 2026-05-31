@@ -119,6 +119,7 @@ if "%TARGET%"=="test-apps" goto :do_test_apps
 echo === CMake Generate ===
 cmake -S "%REPO%." -B "%REPO%build" -G "Ninja Multi-Config" ^
   -DCMAKE_TOOLCHAIN_FILE="%REPO%vcpkg\scripts\buildsystems\vcpkg.cmake" ^
+  -DVCPKG_MANIFEST_FEATURES=gui ^
   -DX_VCPKG_APPLOCAL_DEPS_INSTALL=ON ^
   -DCMAKE_INSTALL_PREFIX="%REPO%_package" ^
   -DXRT_BUILD_INSTALLER=ON ^

@@ -15,6 +15,10 @@ if(XRT_MODULE_CLI)
 	add_subdirectory(cli)
 endif()
 
+if(XRT_MODULE_CONTROL_PANEL)
+	add_subdirectory(control_panel)
+endif()
+
 if(XRT_FEATURE_SERVICE AND XRT_FEATURE_OPENXR)
 	if(ANDROID)
 		add_subdirectory(service-lib)
