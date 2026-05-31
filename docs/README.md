@@ -109,9 +109,6 @@ Design docs, status trackers, and plans — some shipped, some in progress. Afte
 
 ### Shipped
 
-- **[Shell Implementation Tasks](roadmap/shell-tasks.md)** — phased task tracker (Phase 0–8, all shipped on Windows)
-- **[Shell Phase 1 Status](roadmap/shell-phase1-status.md)** — kept as the test-procedure reference for shell-mode launches
-- **[Shell Phase 2 Plan](roadmap/shell-phase2-plan.md)** — kept as the spatial-workspace migration reference
 - [Spatial OS](roadmap/spatial-os.md) — multi-compositor architecture (#43)
 - [3D Shell](roadmap/3d-shell.md) — spatial window manager (#44)
 - [3D Capture](roadmap/3d-capture.md) — capture pipeline (shipped in Shell Phase 8)

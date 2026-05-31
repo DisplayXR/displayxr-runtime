@@ -1,37 +1,42 @@
 # ADR-014: Shell Owns Rendering Mode Control
 
 ## Status
-Accepted
+
+Accepted. **Mechanism revised 2026-05-31** (issue #376): keyboard handling moved off the
+runtime's server-side qwerty handler and onto the workspace controller, completing the
+ADR-018 controller migration (`XR_EXT_spatial_workspace` spec_version 22–23). The
+**decision below is unchanged** — the workspace owns rendering mode and an app cannot
+self-switch while sharing the display — only the *how* was updated to the current model.
+Current contract: `docs/architecture/separation-of-concerns.md`,
+`docs/specs/extensions/XR_EXT_spatial_workspace.md`.
 
 ## Context
 
 In standalone mode, apps control their own rendering mode (2D/3D/multiview) via the `xrRequestDisplayRenderingModeEXT` API, typically triggered by the V key or number keys (1-8). The app and runtime are in the same process, so mode changes take effect immediately.
 
-In shell mode (multi-app compositor), multiple apps share a single display. The display's physical state (lenticular lens on/off, interlacing pattern) is global — it cannot be different per app. If each app could independently change the rendering mode, they would fight over the display state.
+In workspace mode (multi-app compositor), multiple apps share a single display. The display's physical state (lenticular lens on/off, interlacing pattern) is global — it cannot be different per app. If each app could independently change the rendering mode, they would fight over the display state.
 
 ## Decision
 
-**The shell controls rendering mode changes, not the app.**
+**The workspace controller controls rendering mode changes, not the app** (the DisplayXR Shell is the reference controller).
 
-When an app runs inside the shell:
+When an app runs inside a workspace:
 
-1. **All keyboard input is forwarded to the app** — including V, P, and 0-9 keys. The app can use these keys for any purpose (game actions, UI shortcuts, etc.).
+1. **Input reaches the controller, and the focused app, as events** — the runtime drains keyboard/pointer input to the controller as `XR_EXT_spatial_workspace` KEY events (`xrEnumerateWorkspaceInputEventsEXT`) and also forwards them to the focused app's HWND. The runtime does **not** run a server-side qwerty handler for workspace input (those hooks are gated on `!workspace_mode_active`); the controller owns all shortcut policy.
 
-2. **`xrRequestDisplayRenderingModeEXT` is a no-op in shell/IPC mode** — returns `XR_SUCCESS` but does not change the mode. This prevents apps from overriding the shell's mode.
+2. **`xrRequestDisplayRenderingModeEXT` is a no-op for regular workspace clients** — returns `XR_SUCCESS` but does not change the mode, so apps can't fight over the global display state. Only the privileged workspace-controller session actually flips the mode through it.
 
-3. **The shell changes the mode via qwerty controls** — V toggles 2D/3D, number keys select specific modes. The qwerty handler runs server-side in the compositor process.
+3. **The controller owns mode policy** — it decides the binding (e.g. Ctrl+V toggles 2D/3D, number keys select specific modes) from the drained KEY events and calls `xrRequestDisplayRenderingModeEXT` on its session; the DP mode flip is acknowledged across all client slots.
 
-4. **The app is notified of mode changes via events** — the server writes `active_rendering_mode_index` to IPC shared memory. The client reads it per-frame, and the OXR session poll pushes `XrEventDataRenderingModeChanged` to the app's event queue. The app then adapts (1 view for 2D, 2 views for 3D, etc.).
+4. **The app is notified of mode changes via events** — the runtime publishes the current `active_rendering_mode_index` (readable per-frame and via `XR_EXT_display_info`) and the OXR session poll pushes `XrEventDataRenderingModeChangedEXT` to the app's event queue. The app tracks that single source of truth and adapts (1 view for 2D, 2+ views for 3D).
 
 ## Key Routing
 
-In the shell window's WndProc, **all keys go to both qwerty and the app**:
+In workspace mode the runtime delivers input twice, with the controller owning all policy:
 
-1. Qwerty processes first (V toggles mode, WASD moves camera, etc.)
-2. Shell-reserved keys (ESC, TAB, DELETE) stop here — not forwarded to app
-3. All other keys are forwarded to the focused app's HWND via `PostMessage`
-
-This ensures the shell's qwerty handler sees every keypress for mode/camera control, while apps still receive all non-shell keys for their own use.
+1. Each keypress is pushed to the controller as a workspace KEY event (drained via `xrEnumerateWorkspaceInputEventsEXT`).
+2. The same key is forwarded to the focused app's HWND via `PostMessage`, **except** runtime-reserved keys (e.g. ESC while a window is maximised).
+3. The controller decides every shortcut from its KEY-event stream — mode (Ctrl+V / number keys), focus-cycle (TAB), maximize (F11), depth-step (`[` / `]`), close (DELETE → `xrRequestWorkspaceClientExitEXT`), launch (Ctrl+O) — and acts via the appropriate extension call. The app still receives the keys for its own use.
 
 ## Consequences
 
