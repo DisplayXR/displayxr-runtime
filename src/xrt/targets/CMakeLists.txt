@@ -29,10 +29,9 @@ endif()
 
 # DisplayXR Windows components
 if(WIN32)
-	# DisplayXR runtime switcher
-	if(XRT_BUILD_SWITCHER)
-		add_subdirectory(switcher)
-	endif()
+	# (The standalone DisplayXRSwitcher was retired in #378 — its
+	# ActiveRuntime-switching function moved into `displayxr-cli runtime
+	# activate` and the Control Panel.)
 
 	# DisplayXR Shell (workspace controller) source has moved to
 	# DisplayXR/displayxr-shell-pvt and ships from there. The runtime
