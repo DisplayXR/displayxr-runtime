@@ -459,27 +459,6 @@ comp_ipc_client_compositor_workspace_set_window_visibility(struct xrt_compositor
 }
 
 xrt_result_t
-comp_ipc_client_compositor_workspace_hit_test(struct xrt_compositor *xc,
-                                              int32_t cursor_x,
-                                              int32_t cursor_y,
-                                              uint32_t *out_client_id,
-                                              float *out_local_u,
-                                              float *out_local_v,
-                                              uint32_t *out_hit_region)
-{
-	if (xc == NULL || out_client_id == NULL || out_local_u == NULL || out_local_v == NULL ||
-	    out_hit_region == NULL) {
-		return XRT_ERROR_IPC_FAILURE;
-	}
-	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
-	if (icc == NULL || icc->ipc_c == NULL) {
-		return XRT_ERROR_IPC_FAILURE;
-	}
-	return ipc_call_workspace_hit_test(icc->ipc_c, cursor_x, cursor_y, out_client_id, out_local_u,
-	                                   out_local_v, out_hit_region);
-}
-
-xrt_result_t
 comp_ipc_client_compositor_workspace_set_focused_client(struct xrt_compositor *xc, uint32_t client_id)
 {
 	if (xc == NULL) {
@@ -637,6 +616,9 @@ comp_ipc_client_compositor_workspace_enumerate_input_events(struct xrt_composito
 			out->frameTick.viewerPosInDisplaySpace.y = src->u.frame_tick.viewer_y;
 			out->frameTick.viewerPosInDisplaySpace.z = src->u.frame_tick.viewer_z;
 			out->frameTick.viewerTracked = (XrBool32)src->u.frame_tick.viewer_valid;
+			// spec_version 22: OS cursor position for the controller's per-frame hit-test.
+			out->frameTick.cursorX = src->u.frame_tick.cursor_x;
+			out->frameTick.cursorY = src->u.frame_tick.cursor_y;
 			break;
 		case IPC_WORKSPACE_INPUT_EVENT_FOCUS_CHANGED:
 			out->focusChanged.prevClientId =
@@ -1019,6 +1001,19 @@ comp_ipc_client_compositor_workspace_set_input_grab(struct xrt_compositor *xc, b
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	return ipc_call_workspace_set_input_grab(icc->ipc_c, grab);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_cursor_depth(struct xrt_compositor *xc, float hit_z_m, bool over_window)
+{
+	if (xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_set_cursor_depth(icc->ipc_c, hit_z_m, over_window ? 1u : 0u);
 }
 
 

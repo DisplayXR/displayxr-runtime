@@ -75,14 +75,6 @@ comp_ipc_client_compositor_workspace_set_window_visibility(struct xrt_compositor
                                                            uint32_t client_id,
                                                            bool visible);
 xrt_result_t
-comp_ipc_client_compositor_workspace_hit_test(struct xrt_compositor *xc,
-                                              int32_t cursor_x,
-                                              int32_t cursor_y,
-                                              uint32_t *out_client_id,
-                                              float *out_local_u,
-                                              float *out_local_v,
-                                              uint32_t *out_hit_region);
-xrt_result_t
 comp_ipc_client_compositor_workspace_set_focused_client(struct xrt_compositor *xc, uint32_t client_id);
 xrt_result_t
 comp_ipc_client_compositor_workspace_set_input_grab(struct xrt_compositor *xc, bool grab);
@@ -163,6 +155,11 @@ struct ipc_workspace_cursor_info;
 xrt_result_t
 comp_ipc_client_compositor_workspace_set_cursor(struct xrt_compositor *xc,
                                                  const struct ipc_workspace_cursor_info *info);
+// spec_version 22: per-frame cursor depth (controller owns the hit-test).
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_cursor_depth(struct xrt_compositor *xc,
+                                                      float hit_z_m,
+                                                      bool over_window);
 // spec_version 17: overlay source.
 struct ipc_workspace_overlay_info;
 xrt_result_t
@@ -521,50 +518,6 @@ oxr_xrSetWorkspaceClientVisibilityEXT(XrSession session, XrWorkspaceClientId cli
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_window_visibility(
 	    &sess->xcn->base, (uint32_t)clientId, visible == XR_TRUE);
 	return xret_to_xr_result(&log, xret, "workspace_set_window_visibility");
-}
-
-
-/*
- * Hit-test (spec_version 3)
- */
-
-XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrWorkspaceHitTestEXT(XrSession session,
-                          int32_t cursorX,
-                          int32_t cursorY,
-                          XrWorkspaceClientId *outClientId,
-                          XrVector2f *outLocalUV,
-                          XrWorkspaceHitRegionEXT *outHitRegion)
-{
-	OXR_TRACE_MARKER();
-
-	struct oxr_session *sess = NULL;
-	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrWorkspaceHitTestEXT");
-	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
-	OXR_VERIFY_ARG_NOT_NULL(&log, outClientId);
-	OXR_VERIFY_ARG_NOT_NULL(&log, outLocalUV);
-	OXR_VERIFY_ARG_NOT_NULL(&log, outHitRegion);
-
-	if (!session_is_ipc_client(sess)) {
-		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrWorkspaceHitTestEXT requires an IPC-mode session");
-	}
-
-	uint32_t client_id = 0;
-	float u = 0.0f, v = 0.0f;
-	uint32_t region = 0;
-	xrt_result_t xret = comp_ipc_client_compositor_workspace_hit_test(&sess->xcn->base, cursorX, cursorY,
-	                                                                  &client_id, &u, &v, &region);
-	if (xret != XRT_SUCCESS) {
-		return xret_to_xr_result(&log, xret, "workspace_hit_test");
-	}
-	*outClientId = (XrWorkspaceClientId)client_id;
-	outLocalUV->x = u;
-	outLocalUV->y = v;
-	*outHitRegion = (XrWorkspaceHitRegionEXT)region;
-	return XR_SUCCESS;
 }
 
 
@@ -1329,6 +1282,39 @@ oxr_xrSetWorkspaceCursorEXT(XrSession session, const XrWorkspaceCursorInfoEXT *i
 
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_cursor(&sess->xcn->base, &ipc_info);
 	return xret_to_xr_result(&log, xret, "workspace_set_cursor");
+}
+
+/*
+ * Cursor depth (spec_version 22)
+ *
+ * Per-frame push of the cursor's ray-plane depth. The controller owns the
+ * eye→cursor hit-test; the runtime applies this depth to the cursor sprite's
+ * per-eye disparity. Cursor screen position stays runtime-owned.
+ */
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceCursorDepthEXT(XrSession session, const XrWorkspaceCursorDepthEXT *info)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceCursorDepthEXT");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_ARG_NOT_NULL(&log, info);
+
+	if (info->type != XR_TYPE_WORKSPACE_CURSOR_DEPTH_EXT) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrSetWorkspaceCursorDepthEXT: info->type must be XR_TYPE_WORKSPACE_CURSOR_DEPTH_EXT");
+	}
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrSetWorkspaceCursorDepthEXT requires an IPC-mode session");
+	}
+
+	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_cursor_depth(
+	    &sess->xcn->base, info->hitZMeters, info->overWindow != XR_FALSE);
+	return xret_to_xr_result(&log, xret, "workspace_set_cursor_depth");
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL

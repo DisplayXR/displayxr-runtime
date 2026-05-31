@@ -377,33 +377,29 @@ void
 comp_d3d11_service_poll_mcp_capture(struct xrt_system_compositor *xsysc);
 
 /*!
- * Spatial raycast hit-test against workspace windows (Phase 2.F public surface).
+ * Per-frame cursor depth, pushed by the workspace controller
+ * (XR_EXT_spatial_workspace spec_version 22).
  *
- * Translates a screen-space cursor in display pixels (origin top-left) to a
- * client window hit. Internally calls workspace_raycast_hit_test and maps the
- * internal flag set onto the XrWorkspaceHitRegionEXT vocabulary the controller
- * speaks. UV is meaningful only for CONTENT hits; chrome/edge hits set UV to 0
- * since the chrome coordinate frame is not exposed at the public surface.
+ * As of spec_version 22 the runtime no longer raycasts to find the depth of
+ * the window under the cursor; the controller owns the eye→cursor hit-test and
+ * pushes the resulting depth here each frame. The compositor caches it and
+ * feeds @p hit_z_m into the cursor sprite's per-eye disparity, and uses
+ * @p over_window to dim the cursor over windows. Cursor screen position stays
+ * runtime-owned (OS cursor). Called by ipc_handle_workspace_set_cursor_depth()
+ * in response to xrSetWorkspaceCursorDepthEXT.
  *
- * @param xsysc           The system compositor (must be D3D11 service in workspace mode).
- * @param cursor_x        Cursor X in display pixels (origin top-left).
- * @param cursor_y        Cursor Y in display pixels.
- * @param[out] out_client_id  Client id of the hit window, or 0 for miss (background).
- * @param[out] out_local_u    U coordinate of content hit (0..1); 0 for non-content hits.
- * @param[out] out_local_v    V coordinate of content hit (0..1); 0 for non-content hits.
- * @param[out] out_hit_region Classification (XrWorkspaceHitRegionEXT cast to uint32_t).
- * @return true on success (including miss); false only on usage error.
+ * No-op if the workspace is not currently active.
+ *
+ * @param xsysc       The system compositor (must be D3D11 service).
+ * @param hit_z_m     Ray-plane depth under the cursor in meters (0 = panel plane).
+ * @param over_window true when the cursor is over a window.
  *
  * @ingroup comp_d3d11_service
  */
-bool
-comp_d3d11_service_workspace_hit_test(struct xrt_system_compositor *xsysc,
-                                       int32_t cursor_x,
-                                       int32_t cursor_y,
-                                       uint32_t *out_client_id,
-                                       float *out_local_u,
-                                       float *out_local_v,
-                                       uint32_t *out_hit_region);
+void
+comp_d3d11_service_workspace_set_cursor_depth(struct xrt_system_compositor *xsysc,
+                                              float hit_z_m,
+                                              bool over_window);
 
 /*!
  * Phase 2.D: drain the workspace public-event ring, enriching POINTER events

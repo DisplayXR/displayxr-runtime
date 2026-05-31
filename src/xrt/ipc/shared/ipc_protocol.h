@@ -453,6 +453,8 @@ struct ipc_workspace_input_event
 			float    viewer_y;
 			float    viewer_z;
 			uint32_t viewer_valid; //!< 1 if viewer_* is populated, 0 otherwise
+			int32_t  cursor_x;     //!< spec_version 22: OS cursor pos, workspace-window client px (top-left)
+			int32_t  cursor_y;
 		} frame_tick;
 		struct                      //!< spec_version 6: focused-client transition
 		{

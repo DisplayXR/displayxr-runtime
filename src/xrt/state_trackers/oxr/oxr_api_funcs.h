@@ -829,14 +829,6 @@ oxr_xrGetWorkspaceClientWindowPoseEXT(XrSession session,
 //! OpenXR API function @ep{xrSetWorkspaceClientVisibilityEXT}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceClientVisibilityEXT(XrSession session, XrWorkspaceClientId clientId, XrBool32 visible);
-//! OpenXR API function @ep{xrWorkspaceHitTestEXT}
-XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrWorkspaceHitTestEXT(XrSession session,
-                          int32_t cursorX,
-                          int32_t cursorY,
-                          XrWorkspaceClientId *outClientId,
-                          XrVector2f *outLocalUV,
-                          XrWorkspaceHitRegionEXT *outHitRegion);
 //! OpenXR API function @ep{xrSetWorkspaceFocusedClientEXT}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceFocusedClientEXT(XrSession session, XrWorkspaceClientId clientId);
@@ -907,6 +899,9 @@ oxr_xrCreateWorkspaceCursorSwapchainEXT(XrSession session,
 //! OpenXR API function @ep{xrSetWorkspaceCursorEXT} (spec_version 13)
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceCursorEXT(XrSession session, const XrWorkspaceCursorInfoEXT *info);
+//! OpenXR API function @ep{xrSetWorkspaceCursorDepthEXT} (spec_version 22)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceCursorDepthEXT(XrSession session, const XrWorkspaceCursorDepthEXT *info);
 //! OpenXR API function @ep{xrCreateWorkspaceOverlaySwapchainEXT} (spec_version 17)
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrCreateWorkspaceOverlaySwapchainEXT(XrSession session,

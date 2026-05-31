@@ -1,8 +1,27 @@
 ---
-status: Accepted
+status: Superseded
+superseded_by: "issue #370 (XR_EXT_spatial_workspace spec_version 22)"
 date: 2026-05-20
 ---
 # ADR-018: Workspace Hit-Test Is Plumbing; Drag/Resize/Cursor Policy Is the Controller's
+
+> **SUPERSEDED (2026-05-31, issue #370 / spec_version 22).** This ADR's core decision —
+> "hit-test computation stays in the runtime as plumbing" — has been **reversed**. The
+> runtime's `workspace_raycast_hit_test`, the public `xrWorkspaceHitTestEXT` API, the
+> POINTER/POINTER_MOTION hit enrichment, and runtime-side POINTER_HOVER emission were all
+> **deleted**. The workspace controller now owns hit-testing end to end: it runs the
+> eye→cursor raycast itself (it already has the window poses it pushed, eye positions via
+> its session, and now receives the OS cursor position each frame on FRAME_TICK), generates
+> its own hover transitions, and feeds the runtime only the cursor **depth** via the new
+> `xrSetWorkspaceCursorDepthEXT` so the runtime can composite the cursor sprite at the right
+> per-eye disparity. The drag / resize / rotation state machines named below as the "real
+> layering violation" have also migrated to the controller (driven via
+> `xrSetWorkspaceClientWindowPoseEXT`); the `mc->title_drag` / `mc->resize` /
+> `mc->title_rmb_drag` machines no longer exist in the runtime. The follow-up in
+> "Consequences → Once the policy migrates, revisit whether the public
+> `xrWorkspaceHitTestEXT` API is still useful" was resolved by removing it. The original
+> reasoning is retained below as the historical record. Current contract:
+> `docs/architecture/separation-of-concerns.md` + `docs/specs/extensions/XR_EXT_spatial_workspace.md`.
 
 ## Context
 

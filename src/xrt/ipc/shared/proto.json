@@ -129,19 +129,6 @@
 		]
 	},
 
-	"workspace_hit_test": {
-		"in": [
-			{"name": "cursor_x", "type": "int64_t"},
-			{"name": "cursor_y", "type": "int64_t"}
-		],
-		"out": [
-			{"name": "client_id", "type": "uint32_t"},
-			{"name": "local_u", "type": "float"},
-			{"name": "local_v", "type": "float"},
-			{"name": "hit_region", "type": "uint32_t"}
-		]
-	},
-
 	"workspace_set_focused_client": {
 		"in": [
 			{"name": "client_id", "type": "uint32_t"}
@@ -244,6 +231,13 @@
 	"workspace_set_cursor": {
 		"in": [
 			{"name": "info", "type": "struct ipc_workspace_cursor_info"}
+		]
+	},
+
+	"workspace_set_cursor_depth": {
+		"in": [
+			{"name": "hit_z_m", "type": "float"},
+			{"name": "over_window", "type": "uint32_t"}
 		]
 	},
 
