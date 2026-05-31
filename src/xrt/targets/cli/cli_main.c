@@ -32,6 +32,8 @@ cli_print_help(int argc, const char **argv)
 	P("                      its display info. Exits 0 on success, non-zero on failure.\n");
 	P("  dp <...>          - List display processors / set the PreferredPlugin override.\n");
 	P("                      'dp list [--json]', 'dp use <id>', 'dp reset'.\n");
+	P("  runtime <...>     - Show / set DisplayXR as the active OpenXR runtime.\n");
+	P("                      'runtime status', 'runtime activate'.\n");
 	P("  test              - List found devices and role assignments, for prober testing.\n");
 	P("  probe             - Just probe and then exit.\n");
 
@@ -53,6 +55,9 @@ main(int argc, const char **argv)
 	}
 	if (strcmp(argv[1], "dp") == 0) {
 		return cli_cmd_dp(argc, argv);
+	}
+	if (strcmp(argv[1], "runtime") == 0) {
+		return cli_cmd_runtime(argc, argv);
 	}
 	if (strcmp(argv[1], "test") == 0) {
 		return cli_cmd_test(argc, argv);

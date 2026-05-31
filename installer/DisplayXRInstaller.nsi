@@ -643,8 +643,11 @@ Section "DisplayXR Runtime" SecRuntime
 	; Install WebXR Bridge v2 host (metadata sideband for Chrome's native WebXR, issue #139)
 	File /nonfatal "${BIN_DIR}\displayxr-webxr-bridge.exe"
 
-	; Install switcher if available
-	File /nonfatal "${BIN_DIR}\DisplayXRSwitcher.exe"
+	; Diagnostics CLI + Control Panel GUI (the Control Panel shells out to the
+	; CLI; both replace the retired DisplayXRSwitcher — #378). SDL2.dll (the
+	; Control Panel's only extra dep) is picked up by the *.dll sweep below.
+	File /nonfatal "${BIN_DIR}\displayxr-cli.exe"
+	File /nonfatal "${BIN_DIR}\displayxr-control-panel.exe"
 
 	; Install runtime DLL dependencies (exclude vulkan-1.dll — the system copy
 	; in SYSTEM32 is sufficient, and shipping our own risks version conflicts
@@ -705,9 +708,12 @@ Section "DisplayXR Runtime" SecRuntime
 
 	; PATH is intentionally not modified. DisplayXRClient.dll's third-party
 	; transitive deps that previously *required* $INSTDIR on PATH are gone:
-	; cjson is compiled in from bundled source, SDL2 is disabled in the
-	; production build, and pthreads is statically linked via the vcpkg
-	; overlay triplet at cmake/vcpkg-overlay-triplets/x64-windows.cmake.
+	; cjson is compiled in from bundled source and pthreads is statically
+	; linked via the vcpkg overlay triplet at
+	; cmake/vcpkg-overlay-triplets/x64-windows.cmake. The runtime DLL itself
+	; does not use SDL2; SDL2.dll ships only for the Control Panel GUI and
+	; sits next to displayxr-control-panel.exe in $INSTDIR, so it resolves via
+	; the exe's own directory without PATH.
 	;
 	; Under the vendor plug-in architecture (ADR-019 / issue #256), the
 	; runtime DLL has zero vendor identifiers in its link line — no SR
@@ -803,9 +809,9 @@ Section "Start Menu Shortcuts" SecShortcuts
 	; Workspace controllers add their own Start Menu shortcuts from their
 	; respective installers.
 
-	; Add switcher shortcut if installed
-	IfFileExists "$INSTDIR\DisplayXRSwitcher.exe" 0 +2
-		CreateShortCut "$SMPROGRAMS\DisplayXR\DisplayXR Runtime Switcher.lnk" "$INSTDIR\DisplayXRSwitcher.exe"
+	; Control Panel shortcut (replaces the retired Runtime Switcher — #378)
+	IfFileExists "$INSTDIR\displayxr-control-panel.exe" 0 +2
+		CreateShortCut "$SMPROGRAMS\DisplayXR\DisplayXR Control Panel.lnk" "$INSTDIR\displayxr-control-panel.exe"
 
 	CreateShortCut "$SMPROGRAMS\DisplayXR\Uninstall DisplayXR.lnk" "$INSTDIR\Uninstall.exe"
 SectionEnd
@@ -988,7 +994,8 @@ Section "Uninstall"
 	Delete "$INSTDIR\DisplayXRClient.dll"
 	Delete "$INSTDIR\displayxr-service.exe"
 	Delete "$INSTDIR\displayxr-webxr-bridge.exe"
-	Delete "$INSTDIR\DisplayXRSwitcher.exe"
+	Delete "$INSTDIR\displayxr-cli.exe"
+	Delete "$INSTDIR\displayxr-control-panel.exe"
 	Delete "$INSTDIR\DisplayXR_win64.json"
 	Delete "$INSTDIR\install.log"
 
@@ -1019,6 +1026,7 @@ Section "Uninstall"
 
 	; Remove Start Menu shortcuts (workspace-controller shortcuts are
 	; removed by their own cascade-uninstaller; nothing left to clean here)
+	Delete "$SMPROGRAMS\DisplayXR\DisplayXR Control Panel.lnk"
 	Delete "$SMPROGRAMS\DisplayXR\DisplayXR Runtime Switcher.lnk"
 	Delete "$SMPROGRAMS\DisplayXR\Uninstall DisplayXR.lnk"
 	RMDir "$SMPROGRAMS\DisplayXR"

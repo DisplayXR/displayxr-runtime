@@ -438,7 +438,24 @@ draw_panel(struct panel_state *s)
 	igText("Git tag : %s", s->rt_tag);
 	igText("Plug-in ABI : v%d", s->rt_abi);
 	if (s->ar_queried) {
-		igText("Active OpenXR runtime : %s", s->ar_set ? s->ar_value : "<unset>");
+		bool is_dxr = s->ar_set && strstr(s->ar_value, "DisplayXR") != NULL;
+		igText("Active OpenXR runtime :");
+		igSameLine(0.0f, -1.0f);
+		igTextColored(is_dxr ? COL_GREEN : COL_RED, "%s", s->ar_set ? s->ar_value : "<unset>");
+		if (!is_dxr) {
+			if (igButton("Set DisplayXR as active OpenXR runtime", (ImVec2){0, 0})) {
+				char out[2048];
+				if (run_cli("runtime activate", out, sizeof(out))) {
+					char *nl = strchr(out, '\n');
+					if (nl != NULL) {
+						*nl = '\0';
+					}
+					snprintf(s->last_action, sizeof(s->last_action), "%s",
+					         out[0] ? out : "(done)");
+				}
+				refresh_info(s);
+			}
+		}
 	}
 
 	// ---- Display processor ----

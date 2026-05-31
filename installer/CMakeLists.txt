@@ -70,8 +70,11 @@ endif()
 if(TARGET displayxr-service)
 	add_dependencies(installer displayxr-service)
 endif()
-if(TARGET DisplayXRSwitcher)
-	add_dependencies(installer DisplayXRSwitcher)
+if(TARGET cli)
+	add_dependencies(installer cli)
+endif()
+if(TARGET control_panel)
+	add_dependencies(installer control_panel)
 endif()
 # Vendor plug-in: sim-display. The runtime installer ships this DLL as
 # the vendor-neutral fallback (ADR-019 / issue #256); vendor plug-ins

@@ -309,7 +309,6 @@ set(RUNTIME_TARGET openxr_${XRT_OXR_RUNTIME_SUFFIX} CACHE INTERNAL "Runtime targ
 # DisplayXR Windows installer options
 if(WIN32)
 	option(XRT_BUILD_INSTALLER "Build NSIS installer (Windows only)" OFF)
-	option(XRT_BUILD_SWITCHER "Build LeiaXR runtime switcher (Windows only)" ON)
 endif()
 
 # Most users won't touch these.
