@@ -18,8 +18,8 @@ The boundary exists so rendering machinery does not drift into workspace-control
 
 | Doc | Relationship |
 |-----|-------------|
-| [spatial-os.md](spatial-os.md) (#43) | **Compositing mechanism.** The runtime side of this contract — multi-compositor, shared textures, display processing. |
-| [3d-shell.md](3d-shell.md) (#44) | **Reference workspace controller.** The DisplayXR Shell side of this contract — window placement, chrome, interaction. |
+| [multi-compositor.md](../architecture/multi-compositor.md) (#43) | **Compositing mechanism.** The runtime side of this contract — multi-compositor, shared textures, display processing. |
+| [separation-of-concerns.md](../architecture/separation-of-concerns.md) (#44) | **Reference workspace controller.** The DisplayXR Shell (`displayxr-shell-pvt`) side of this contract — window placement, chrome, interaction. |
 | [3d-capture.md](3d-capture.md) | **Capture pipeline.** Capture commands and completion events flow through this contract. |
 | [spatial-workspace-extensions-plan.md](spatial-workspace-extensions-plan.md) | **Extension plan.** Roadmap for promoting this contract into the public `XR_DISPLAYXR_spatial_workspace` + `XR_DISPLAYXR_app_launcher` extensions. |
 

@@ -20,8 +20,8 @@ This doc extends the spatial OS compositor to **multiple physical displays on on
 
 | Doc | Relationship |
 |-----|-------------|
-| [spatial-os.md](spatial-os.md) (#43) | **Single-display compositing.** The multi-compositor pipeline this doc extends. Prerequisite. |
-| [3d-shell.md](3d-shell.md) (#44) | **Window manager.** Manages window placement; this doc adds display-routing beneath it. Prerequisite. |
+| [multi-compositor.md](../architecture/multi-compositor.md) (#43) | **Single-display compositing.** The multi-compositor pipeline this doc extends. Prerequisite. |
+| [separation-of-concerns.md](../architecture/separation-of-concerns.md) (#44) | **Window manager (controller).** Manages window placement; this doc adds display-routing beneath it. Prerequisite. |
 | [multi-display-networked.md](multi-display-networked.md) (#70) | **Networked extension.** Generalizes this doc's multi-display routing across machines. Depends on this doc. |
 
 ## Architecture
