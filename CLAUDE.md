@@ -149,7 +149,13 @@ This repo IS the public runtime (no private→public mirror). A release is a `vX
 | Standalone demos | `displayxr-demo-*` | `/dxr-release` → builds installer + dispatches `versions-bump`. |
 | Meta-installer bundle | `displayxr-installer` | `/installer-release` or `workflow_dispatch` (NOT auto-fired). Chains every component installer. |
 
-`/dxr-release` (user-level skill) handles every sibling repo; `/installer-release` handles the bundle. Neither applies to this repo.
+`/dxr-release` handles every sibling repo; `/installer-release` handles the bundle. Neither applies to this repo.
+
+**These two are repo-level (project) skills, not user-level.** `dxr-release` ships byte-identical in `.claude/skills/dxr-release/` of each sibling repo (shell-pvt, leia-plugin, mcp, demo-*); `installer-release` lives in `displayxr-installer/.claude/skills/installer-release/`. They arrive automatically when you clone those repos — but are only invocable *inside* the cloned repo. **On a new machine, mirror both to `~/.claude/skills/` so `/dxr-release` and `/installer-release` work from any directory:**
+- `dxr-release` is fully portable — copy as-is (it self-detects the repo from `git remote`, so still run it *from inside* the component repo you're releasing).
+- `installer-release` hardcodes a local checkout path in its "Launch Subagent" template — after copying, **correct that path** to the new machine's `displayxr-installer` clone.
+
+The canonical copies in the repos remain the source of truth; the `~/.claude/skills/` copies are convenience mirrors (and the installer-release mirror carries a machine-specific path edit).
 
 ### versions.json — single source of truth
 `versions.json` at the repo root is the canonical pin matrix consumed by `scripts/setup-displayxr.{sh,bat}` and mirrored byte-for-byte by `displayxr-installer`. **Auto-bumped on every component release** (the dispatch flow above updates the matching field on `main` and mirrors to `displayxr-installer/main` within ~30 s via the publish bot). Two safety nets:
