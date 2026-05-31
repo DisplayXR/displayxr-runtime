@@ -167,6 +167,14 @@ struct check_row
 	char detail[256];
 };
 
+struct disp_row
+{
+	char mfr[8];
+	char product[8];
+	int pw, ph, hz, left, top;
+	bool primary;
+};
+
 struct panel_state
 {
 	// info
@@ -198,6 +206,10 @@ struct panel_state
 	bool have_preferred;
 	char preferred[64];
 	struct dp_row dps[MAX_DPS];
+
+	// connected displays (EDID)
+	int n_displays;
+	struct disp_row displays[MAX_DPS];
 
 	// last dp use/reset feedback
 	char last_action[512];
@@ -368,10 +380,45 @@ refresh_dp(struct panel_state *s)
 }
 
 static void
+refresh_displays(struct panel_state *s)
+{
+	s->n_displays = 0;
+	char out[16384];
+	if (!run_cli("displays --json", out, sizeof(out)) || out[0] == '\0') {
+		return;
+	}
+	cJSON *root = cJSON_Parse(out);
+	if (root == NULL) {
+		return;
+	}
+	const cJSON *arr = cJSON_GetObjectItemCaseSensitive(root, "displays");
+	if (cJSON_IsArray(arr)) {
+		const cJSON *m = NULL;
+		cJSON_ArrayForEach(m, arr)
+		{
+			if (s->n_displays >= MAX_DPS) {
+				break;
+			}
+			struct disp_row *d = &s->displays[s->n_displays++];
+			cpy_str(d->mfr, sizeof(d->mfr), m, "manufacturer");
+			cpy_str(d->product, sizeof(d->product), m, "product");
+			d->pw = (int)get_num(m, "pixel_width");
+			d->ph = (int)get_num(m, "pixel_height");
+			d->hz = (int)get_num(m, "refresh_hz");
+			d->left = (int)get_num(m, "screen_left");
+			d->top = (int)get_num(m, "screen_top");
+			d->primary = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(m, "primary"));
+		}
+	}
+	cJSON_Delete(root);
+}
+
+static void
 refresh_all(struct panel_state *s)
 {
 	refresh_info(s);
 	refresh_dp(s);
+	refresh_displays(s);
 }
 
 static void
@@ -479,6 +526,17 @@ draw_panel(struct panel_state *s)
 		igText("Eye-tracking : %s (0x%x), default %s",
 		       s->et_supported_label[0] ? s->et_supported_label : "?", (unsigned)s->et_modes,
 		       s->et_default_label[0] ? s->et_default_label : "?");
+	}
+
+	// ---- Connected displays (EDID, vendor-neutral) ----
+	igSeparatorText("Connected displays (EDID)");
+	if (s->n_displays == 0) {
+		igTextDisabled("(none enumerated — Windows-only)");
+	}
+	for (int i = 0; i < s->n_displays; i++) {
+		struct disp_row *d = &s->displays[i];
+		igText("[%d] %s %s  %dx%d @ %dHz  pos (%d,%d)%s", i, d->mfr, d->product, d->pw, d->ph, d->hz,
+		       d->left, d->top, d->primary ? "  [primary]" : "");
 	}
 
 	// ---- Self-test ----
