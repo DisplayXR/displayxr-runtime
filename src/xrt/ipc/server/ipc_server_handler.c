@@ -127,6 +127,42 @@ validate_device_id(volatile struct ipc_client_state *ics, int64_t device_id, str
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 /*!
+ * Fill surplus view slots [from, view_count) with valid poses.
+ *
+ * xrLocateViews always reports the system MAX view count (e.g. 4 for a display
+ * whose Quad mode has 4 views), but the SR path below only computes poses for
+ * the active eye_count (<=2). The caller (`ipc_handle_device_get_view_poses`)
+ * sends ALL view_count poses to the client from an uninitialized stack array,
+ * so any unfilled slot carries garbage -> invalid quaternion ->
+ * xrLocateViews/xrEndFrame rejection (the app hangs on an infinite spinner
+ * under the workspace). Mirror the in-process oxr_session_locate_views
+ * extension: derive each surplus view from view 0 plus the device's per-view
+ * eye offset, with identity orientation. These views are located but not
+ * submitted (submit uses the active mode's view count).
+ */
+static void
+fill_surplus_view_poses(struct xrt_device *xdev,
+                        uint32_t from,
+                        uint32_t view_count,
+                        struct xrt_fov *out_fovs,
+                        struct xrt_pose *out_poses)
+{
+	for (uint32_t i = from; i < view_count && i < XRT_MAX_VIEWS; i++) {
+		out_poses[i].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+		out_poses[i].position = out_poses[0].position;
+		if (xdev != NULL && xdev->hmd != NULL) {
+			const struct xrt_vec3 *off = xdev->hmd->view_eye_offsets;
+			out_poses[i].position.x += off[i].x - off[0].x;
+			out_poses[i].position.y += off[i].y - off[0].y;
+			out_poses[i].position.z += off[i].z - off[0].z;
+			out_fovs[i] = xdev->hmd->distortion.fov[i];
+		} else {
+			out_fovs[i] = out_fovs[0];
+		}
+	}
+}
+
+/*!
  * Try to get SR-aware view poses for IPC clients.
  * Returns true if SR view poses were computed, false to fall back to device poses.
  */
@@ -394,6 +430,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 				out_fovs[i] = (struct xrt_fov){0};
 			}
 		}
+		fill_surplus_view_poses(xdev, eye_count, view_count, out_fovs, out_poses);
 		return true;
 	}
 
@@ -501,6 +538,8 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		         is_appcontainer_app, use_qwerty_head,
 		         (const char *)ics->client_state.info.application_name);
 	}
+
+	fill_surplus_view_poses(xdev, eye_count, view_count, out_fovs, out_poses);
 
 	return true;
 }
