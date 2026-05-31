@@ -237,7 +237,8 @@
 	"workspace_set_cursor_depth": {
 		"in": [
 			{"name": "hit_z_m", "type": "float"},
-			{"name": "over_window", "type": "uint32_t"}
+			{"name": "over_window", "type": "uint32_t"},
+			{"name": "dim_factor", "type": "float"}
 		]
 	},
 

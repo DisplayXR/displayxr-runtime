@@ -156,10 +156,12 @@ xrt_result_t
 comp_ipc_client_compositor_workspace_set_cursor(struct xrt_compositor *xc,
                                                  const struct ipc_workspace_cursor_info *info);
 // spec_version 22: per-frame cursor depth (controller owns the hit-test).
+// spec_version 23: + dim_factor (controller owns the over-window cursor alpha).
 xrt_result_t
 comp_ipc_client_compositor_workspace_set_cursor_depth(struct xrt_compositor *xc,
                                                       float hit_z_m,
-                                                      bool over_window);
+                                                      bool over_window,
+                                                      float dim_factor);
 // spec_version 17: overlay source.
 struct ipc_workspace_overlay_info;
 xrt_result_t
@@ -1312,8 +1314,17 @@ oxr_xrSetWorkspaceCursorDepthEXT(XrSession session, const XrWorkspaceCursorDepth
 		                 "xrSetWorkspaceCursorDepthEXT requires an IPC-mode session");
 	}
 
+	// spec_version 23: clamp the controller-pushed over-window dim alpha to a
+	// sane [0,1] before it reaches the cursor render path.
+	float dim_factor = info->dimFactor;
+	if (dim_factor < 0.0f) {
+		dim_factor = 0.0f;
+	} else if (dim_factor > 1.0f) {
+		dim_factor = 1.0f;
+	}
+
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_cursor_depth(
-	    &sess->xcn->base, info->hitZMeters, info->overWindow != XR_FALSE);
+	    &sess->xcn->base, info->hitZMeters, info->overWindow != XR_FALSE, dim_factor);
 	return xret_to_xr_result(&log, xret, "workspace_set_cursor_depth");
 }
 

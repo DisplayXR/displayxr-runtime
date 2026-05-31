@@ -360,14 +360,17 @@ xrt_result_t
 comp_ipc_client_compositor_workspace_set_input_grab(struct xrt_compositor *xc, bool grab);
 
 /*!
- * Per-frame cursor depth bridge (XR_EXT_spatial_workspace, spec_version 22).
+ * Per-frame cursor depth bridge (XR_EXT_spatial_workspace, spec_version 22;
+ * dim_factor added in spec_version 23).
  *
  * Same gating contract as the workspace_* family. The controller owns the
  * eye→cursor hit-test and pushes the resulting depth (and an over-window
  * flag) each frame; the runtime applies it to the cursor sprite's per-eye
- * disparity. Cursor screen position stays runtime-owned.
+ * disparity. Cursor screen position stays runtime-owned. @p dim_factor is the
+ * over-window cursor body alpha [0,1] (only applied when @p over_window).
  */
 xrt_result_t
 comp_ipc_client_compositor_workspace_set_cursor_depth(struct xrt_compositor *xc,
                                                       float hit_z_m,
-                                                      bool over_window);
+                                                      bool over_window,
+                                                      float dim_factor);
