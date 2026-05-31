@@ -214,22 +214,13 @@ if not defined %_RP_VAR% (
 )
 exit /b 0
 
-REM Symlink the git-tracked release skills into the user-level skills dir
-REM so /dxr-release + /installer-release are invocable from any directory.
-REM Idempotent. rmdir (no /s) on an existing entry removes a symlink safely
-REM and refuses to clobber a populated real directory.
+REM Delegate to the standalone linker (single source of truth for the
+REM mklink logic; also runnable on its own to relink skills without a
+REM full component reinstall).
 :link_skills
 echo.
 echo ==^> Linking DisplayXR release skills into %%USERPROFILE%%\.claude\skills
-set "_LS_USKILLS=%USERPROFILE%\.claude\skills"
-set "_LS_SRC=%REPO_ROOT%\.claude\skills"
-if not exist "%_LS_USKILLS%" mkdir "%_LS_USKILLS%"
-for %%S in (dxr-release installer-release) do (
-    if exist "%_LS_SRC%\%%S" (
-        if exist "%_LS_USKILLS%\%%S" rmdir "%_LS_USKILLS%\%%S" >nul 2>&1
-        mklink /D "%_LS_USKILLS%\%%S" "%_LS_SRC%\%%S" >nul 2>&1 && (echo  OK  linked %%S) || (echo WARN: could not link %%S ^(needs admin or Developer Mode^) 1>&2)
-    )
-)
+call "%SCRIPT_DIR%link-dxr-skills.bat"
 exit /b 0
 
 REM Install one component.
