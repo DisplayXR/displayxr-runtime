@@ -37,4 +37,21 @@ if(WIN32)
 
 	# DisplayXR WebXR bridge host (metadata sideband for Chrome's native WebXR)
 	add_subdirectory(webxr_bridge)
+
+	# Strip any bundled vulkan-1.dll from the install bin dir. The runtime +
+	# service /DELAYLOAD vulkan-1.dll, so vcpkg's applocal-deps install copies
+	# it next to the exes even though the runtime target's own dependency
+	# install filters it out (targets/openxr/CMakeLists.txt). A bundled loader
+	# next to the exe shadows the system C:\Windows\System32\vulkan-1.dll →
+	# two competing Vulkan loaders → NVIDIA ICD null-deref (issue #105). The
+	# NSIS installer already excludes it; this guaranteed-last cleanup closes
+	# the same gap for the _package/ dev tree (it runs after every target
+	# subdir above, so it removes whatever applocal re-staged). Idempotent.
+	install(CODE "
+		set(_vk \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/vulkan-1.dll\")
+		if(EXISTS \"\${_vk}\")
+			message(STATUS \"Removing bundled vulkan-1.dll (runtime uses the system loader): \${_vk}\")
+			file(REMOVE \"\${_vk}\")
+		endif()
+	")
 endif()
