@@ -37,6 +37,11 @@
 #include <CoreGraphics/CoreGraphics.h>
 #endif
 
+#ifdef XRT_OS_WINDOWS
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
 
 /*
  *
@@ -480,6 +485,32 @@ sim_display_hmd_create(void)
 		if (vis_w > 0 && vis_h > 0) {
 			pixel_w = (int)vis_w;
 			pixel_h = (int)vis_h;
+		}
+	}
+#endif
+
+#ifdef XRT_OS_WINDOWS
+	// Auto-detect the primary monitor's NATIVE pixel resolution so the
+	// simulated panel matches the real display the workspace window is
+	// created on. The compositor sizes the atlas to this reported
+	// resolution but assumes atlas == panel (true for real vendor plug-ins
+	// like Leia SR, which report the physical 4K size). Without this,
+	// sim_display's hardcoded 1920x1080 default makes the runtime compose a
+	// half-size atlas onto the full panel, leaving workspace content in the
+	// top-left quadrant (#369). EnumDisplaySettingsW returns true pixels
+	// regardless of this process's DPI-awareness. Explicit env overrides
+	// (SIM_DISPLAY_PIXEL_W/H) still win.
+	{
+		DEVMODEW dm = {0};
+		dm.dmSize = sizeof(dm);
+		if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm) && dm.dmPelsWidth > 0 &&
+		    dm.dmPelsHeight > 0) {
+			if (getenv("SIM_DISPLAY_PIXEL_W") == NULL) {
+				pixel_w = (int)dm.dmPelsWidth;
+			}
+			if (getenv("SIM_DISPLAY_PIXEL_H") == NULL) {
+				pixel_h = (int)dm.dmPelsHeight;
+			}
 		}
 	}
 #endif
