@@ -20,10 +20,6 @@ if(XRT_MODULE_MONADO_CLI)
 	add_subdirectory(cli)
 endif()
 
-if(XRT_MODULE_MONADO_GUI)
-	add_subdirectory(gui)
-endif()
-
 if(XRT_FEATURE_SERVICE AND NOT WIN32)
 	add_subdirectory(ctl)
 endif()

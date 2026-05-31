@@ -539,7 +539,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			// fire qwerty_toggle_display_mode behind the workspace's back
 			// (bypassing the acked-flip pipeline + cooldown). Bare V should
 			// fall through to the focused app's WindowProc / qwerty stays
-			// active only in standalone monado-gui / non-workspace paths.
+			// active only in non-workspace paths.
 			if (w->qwerty_enabled && w->xsysd != NULL && !bridge_page_attached(hWnd) &&
 			    !InterlockedCompareExchange(&w->workspace_mode_active, 0, 0)) {
 				bool handled = false;

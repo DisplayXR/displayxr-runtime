@@ -19,7 +19,6 @@ There are several targets included in the Monado source tree (in
 
 - `cli` - builds `monado-cli` executable
 - `openxr` - builds `libopenxr-monado.so` OpenXR runtime shared object
-- `gui` - builds `monado-gui` executable
 - `service` - builds `monado-service` executable (if `XRT_FEATURE_SERVICE` is
   enabled)
 
