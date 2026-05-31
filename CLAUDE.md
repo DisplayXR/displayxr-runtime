@@ -237,7 +237,7 @@ Optional per-app pose (`--pose x,y,z,width_m,height_m` before each app path):
 ```
 "...\displayxr-shell.exe" --pose -0.1,0.05,0,0.14,0.08 app1.exe --pose 0.1,0.05,0,0.14,0.08 app2.exe
 ```
-**Launching from Claude Code:** use `displayxr-shell.exe` with `run_in_background: true` and `timeout: 600000`. Full procedure: `docs/roadmap/shell-phase1-status.md`.
+**Launching from Claude Code:** use `displayxr-shell.exe` with `run_in_background: true` and `timeout: 600000` (see the shell-mode launch section above + `_package\run_shell_*.bat`).
 
 **Shell controls:** left-click=focus, title-bar drag=move, edge drag=resize, right-click=focus+forward to app, double-click title bar=maximize/restore, scroll=resize, Ctrl+1-4=layout presets, TAB=cycle focus, DELETE=close app, ESC=dismiss, V=toggle 2D/3D, WASD/left-drag=app input. Title-bar buttons: close (X), minimize (—).
 
@@ -319,7 +319,7 @@ See `docs/README.md` for the full index. By task:
 | Kooima projection math | `docs/architecture/kooima-projection.md` |
 | Compositor pipeline | `docs/architecture/compositor-pipeline.md` |
 | Swapchain model / canvas | `docs/specs/runtime/swapchain-model.md` |
-| Shell progress / Phase 2 plan | `docs/roadmap/shell-tasks.md`, `docs/roadmap/shell-phase2-plan.md` |
+| Workspace ↔ runtime contract / boundary | `docs/architecture/separation-of-concerns.md`, `docs/roadmap/workspace-runtime-contract.md` |
 | Vendor-specific docs | `docs/vendors/<vendor>/README.md` |
 | 3D capture pipeline | `docs/roadmap/3d-capture.md` |
 | Workspace/runtime IPC contract | `docs/roadmap/workspace-runtime-contract.md` |
