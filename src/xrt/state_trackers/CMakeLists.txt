@@ -10,7 +10,3 @@ if(XRT_MODULE_OPENXR_STATE_TRACKER)
 endif()
 
 add_subdirectory(prober)
-
-if(XRT_FEATURE_STEAMVR_PLUGIN)
-	add_subdirectory(steamvr_drv)
-endif()

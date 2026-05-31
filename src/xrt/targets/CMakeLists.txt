@@ -7,21 +7,12 @@
 
 add_subdirectory(common)
 
-# Monado management library
-if(XRT_FEATURE_SERVICE AND XRT_HAVE_LINUX)
-	add_subdirectory(libmonado)
-endif()
-
 if(XRT_FEATURE_OPENXR)
 	add_subdirectory(openxr)
 endif()
 
-if(XRT_MODULE_MONADO_CLI)
+if(XRT_MODULE_CLI)
 	add_subdirectory(cli)
-endif()
-
-if(XRT_FEATURE_SERVICE AND NOT WIN32)
-	add_subdirectory(ctl)
 endif()
 
 if(XRT_FEATURE_SERVICE AND XRT_FEATURE_OPENXR)
@@ -30,17 +21,6 @@ if(XRT_FEATURE_SERVICE AND XRT_FEATURE_OPENXR)
 	else()
 		add_subdirectory(service)
 	endif()
-endif()
-
-if(XRT_FEATURE_STEAMVR_PLUGIN)
-	add_subdirectory(steamvr_drv)
-endif()
-
-if(XRT_FEATURE_SERVICE
-   AND XRT_HAVE_SDL2
-   AND XRT_HAVE_VULKAN
-	)
-	add_subdirectory(sdl_test)
 endif()
 
 # DisplayXR Windows components

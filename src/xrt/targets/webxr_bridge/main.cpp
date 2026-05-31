@@ -1002,8 +1002,7 @@ static std::string build_eye_poses_json(const XrView *views, uint32_t count) {
 // The bridge is already an IPC client of the service through its XrInstance,
 // but that connection is private to the OpenXR loader. To resolve Chrome's
 // client_id and fetch per-client window metrics, we open a second, explicit
-// ipc_connection using the same init path the workspace controller and monado-ctl use
-// (src/xrt/targets/ctl/main.c:307-317).
+// ipc_connection using the same init path the workspace controller uses.
 //
 // Identity: application_name = "displayxr-webxr-bridge-ipc", distinct from
 // the OpenXR session's "displayxr-webxr-bridge", so the Chrome resolver can

@@ -679,7 +679,7 @@ update_server_state_locked(struct ipc_server *s)
 
 
 	// our active application has changed - this would typically be
-	// switched by the monado-ctl application or other app making a
+	// switched by an app making a
 	// 'set active application' ipc call, or it could be a
 	// connection loss resulting in us needing to 'fall through' to
 	// the first active application
