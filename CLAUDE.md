@@ -125,6 +125,7 @@ Public-repo CI is free, so `build-windows.yml` + `build-macos.yml` fire on every
 - **Doc-only short-circuit** — `DetectChanges.outputs.docs_only` lets `Runtime`/`Build`/`shell-path-guard` report success in ~30 s without building, so they can be required status checks without blocking doc PRs.
 - **Cancel-in-progress** — rapid pushes cancel earlier runs.
 - **`shell-path-guard`** — fails any push reintroducing `src/xrt/targets/shell/*` or `installer/DisplayXRShellInstaller.nsi` (those live in `displayxr-shell-pvt`).
+- **Headless self-test gate** — the `Runtime` job registers the freshly-built sim-display plug-in in `HKLM\Software\DisplayXR\DisplayProcessors` and runs `displayxr-cli selftest` (see below). This is the only CI step that *executes* the runtime (every other job just builds); it gates on plug-in discovery + ABI + display-info validity, hardware-free.
 
 For tagged releases use `/release` — don't tag manually.
 
@@ -194,6 +195,13 @@ _package\run_cube_handle_d3d11_win.bat
 **Which DLL loaded?** Every `xrCreateInstance` logs a WARN line near the top of `%LOCALAPPDATA%\DisplayXR\DisplayXR_<exe>.<pid>_<ts>.log` — search `loaded from:` for the authoritative path. Full dev-iteration reference: `docs/getting-started/building.md`.
 
 After a rebuild, copy runtime binaries into `C:\Program Files\DisplayXR\Runtime` (registry discovery finds it); only run the installer when the installer itself changed.
+
+### Headless diagnostics (`displayxr-cli`)
+`displayxr-cli` runs the runtime **without a compositor/GPU/window** — it exercises the real plug-in discovery + display-processor path in-process (`target_instance_no_comp`), so it's the fastest way to check "did the runtime start, find a DP, and get sane display info?" without launching an app.
+- `displayxr-cli selftest` — asserts a DP-backed head device exists, a vendor plug-in is active (the loader rejects ABI-mismatched plug-ins, so this *is* an ABI check), and display dims are valid. Strict exit code; this is what the CI gate runs.
+- `displayxr-cli info` — bug-report dump: runtime version/git-tag, plug-in ABI, active plug-in identity + display info (dims, viewer, eye-tracking modes), and the Windows `ActiveRuntime` value.
+
+Both use registry discovery on Windows (so they pick up whatever plug-in is installed — Leia SR or sim-display), `XRT_PLUGIN_SEARCH_PATH` on POSIX.
 
 ### Windows test apps
 `scripts\build_windows.bat test-apps` builds apps and generates run scripts in `_package/` that set `XR_RUNTIME_JSON` to the dev build.
