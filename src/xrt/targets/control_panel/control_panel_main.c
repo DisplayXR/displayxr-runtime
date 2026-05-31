@@ -184,6 +184,7 @@ struct panel_state
 	int px, py;
 	double vx, vy, vz;
 	int et_modes, et_def;
+	char et_supported_label[64], et_default_label[32];
 
 	// selftest
 	bool have_selftest;
@@ -283,6 +284,8 @@ refresh_info(struct panel_state *s)
 		if (et != NULL) {
 			s->et_modes = (int)get_num(et, "supported_modes");
 			s->et_def = (int)get_num(et, "default_mode");
+			cpy_str(s->et_supported_label, sizeof(s->et_supported_label), et, "supported_label");
+			cpy_str(s->et_default_label, sizeof(s->et_default_label), et, "default_label");
 		}
 	}
 
@@ -456,7 +459,9 @@ draw_panel(struct panel_state *s)
 		igText("Physical : %.4f m x %.4f m", s->w_m, s->h_m);
 		igText("Pixels   : %d x %d", s->px, s->py);
 		igText("Viewer   : (%.3f, %.3f, %.3f) m", s->vx, s->vy, s->vz);
-		igText("Eye-tracking : supported=0x%x default=%d", (unsigned)s->et_modes, s->et_def);
+		igText("Eye-tracking : %s (0x%x), default %s",
+		       s->et_supported_label[0] ? s->et_supported_label : "?", (unsigned)s->et_modes,
+		       s->et_default_label[0] ? s->et_default_label : "?");
 	}
 
 	// ---- Self-test ----

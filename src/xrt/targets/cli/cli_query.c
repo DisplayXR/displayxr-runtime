@@ -150,6 +150,40 @@ or_q(const char *s)
 	return (s != NULL && s[0] != '\0') ? s : "?";
 }
 
+/*!
+ * Decode the eye-tracking-mode bitmask into a human label. Bits per
+ * `xrt_plugin_display_info`: 0x1 = MANAGED, 0x2 = MANUAL.
+ */
+static const char *
+eye_modes_label(uint32_t mask, char *buf, size_t cap)
+{
+	buf[0] = '\0';
+	if (mask & 0x1u) {
+		snprintf(buf, cap, "MANAGED");
+	}
+	if (mask & 0x2u) {
+		size_t n = strlen(buf);
+		snprintf(buf + n, cap - n, "%sMANUAL", n ? "|" : "");
+	}
+	if (buf[0] == '\0') {
+		snprintf(buf, cap, "none");
+	}
+	return buf;
+}
+
+/*!
+ * Decode the default-eye-tracking-mode value (0 = MANAGED, 1 = MANUAL).
+ */
+static const char *
+eye_default_label(uint32_t def)
+{
+	switch (def) {
+	case 0: return "MANAGED";
+	case 1: return "MANUAL";
+	default: return "?";
+	}
+}
+
 void
 cli_query_print_info_text(const struct cli_query_result *r)
 {
@@ -189,7 +223,10 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	   (double)i->nominal_viewer_z_m);
 	PT("view scale:   (%.3f, %.3f)\n", (double)i->recommended_view_scale_x, (double)i->recommended_view_scale_y);
 	PT("screen pos:   (%d, %d)\n", i->display_screen_left, i->display_screen_top);
-	PT("eye-tracking: supported=0x%x default=%u\n", i->supported_eye_tracking_modes, i->default_eye_tracking_mode);
+	char et_buf[64];
+	PT("eye-tracking: supported=%s (0x%x) default=%s\n",
+	   eye_modes_label(i->supported_eye_tracking_modes, et_buf, sizeof(et_buf)),
+	   i->supported_eye_tracking_modes, eye_default_label(i->default_eye_tracking_mode));
 }
 
 void
@@ -249,6 +286,10 @@ cli_query_print_info_json(const struct cli_query_result *r)
 		cJSON *et = cJSON_AddObjectToObject(d, "eye_tracking");
 		cJSON_AddNumberToObject(et, "supported_modes", (double)i->supported_eye_tracking_modes);
 		cJSON_AddNumberToObject(et, "default_mode", (double)i->default_eye_tracking_mode);
+		char et_buf[64];
+		cJSON_AddStringToObject(et, "supported_label",
+		                        eye_modes_label(i->supported_eye_tracking_modes, et_buf, sizeof(et_buf)));
+		cJSON_AddStringToObject(et, "default_label", eye_default_label(i->default_eye_tracking_mode));
 	} else {
 		cJSON_AddNullToObject(root, "display");
 	}
