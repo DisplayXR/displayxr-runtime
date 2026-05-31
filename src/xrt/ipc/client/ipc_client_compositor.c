@@ -1004,7 +1004,10 @@ comp_ipc_client_compositor_workspace_set_input_grab(struct xrt_compositor *xc, b
 }
 
 xrt_result_t
-comp_ipc_client_compositor_workspace_set_cursor_depth(struct xrt_compositor *xc, float hit_z_m, bool over_window)
+comp_ipc_client_compositor_workspace_set_cursor_depth(struct xrt_compositor *xc,
+                                                       float hit_z_m,
+                                                       bool over_window,
+                                                       float dim_factor)
 {
 	if (xc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
@@ -1013,7 +1016,7 @@ comp_ipc_client_compositor_workspace_set_cursor_depth(struct xrt_compositor *xc,
 	if (icc == NULL || icc->ipc_c == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	return ipc_call_workspace_set_cursor_depth(icc->ipc_c, hit_z_m, over_window ? 1u : 0u);
+	return ipc_call_workspace_set_cursor_depth(icc->ipc_c, hit_z_m, over_window ? 1u : 0u, dim_factor);
 }
 
 

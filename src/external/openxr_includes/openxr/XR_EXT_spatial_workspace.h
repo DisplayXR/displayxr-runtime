@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_spatial_workspace 1
-#define XR_EXT_spatial_workspace_SPEC_VERSION 22
+#define XR_EXT_spatial_workspace_SPEC_VERSION 23
 #define XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_EXT_spatial_workspace"
 
 // Provisional XrStructureType values. The 1000999100..110 range is reserved for
@@ -943,7 +943,7 @@ typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceCursorEXT)(
     XrSession                       session,
     const XrWorkspaceCursorInfoEXT *info);
 
-// ---- Cursor depth (spec_version 22) ----
+// ---- Cursor depth (spec_version 22; dimFactor added in spec_version 23) ----
 
 /*!
  * @brief Per-frame cursor depth, supplied by the workspace controller.
@@ -956,12 +956,18 @@ typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceCursorEXT)(
  * at, and uses @ref overWindow to dim the cursor over windows (crosstalk
  * mitigation). When a modal grab pins the cursor to the zero-disparity plane,
  * the controller pushes hitZMeters = 0.
+ *
+ * spec_version 23 adds @ref dimFactor: the controller — which owns cursor
+ * look-and-feel — pushes the over-window cursor body alpha rather than the
+ * runtime hardcoding it. Only applied when @ref overWindow is XR_TRUE; 1.0 =
+ * no dim, lower = more transparent (the previous runtime default was 0.30).
  */
 typedef struct XrWorkspaceCursorDepthEXT {
     XrStructureType  type;        // XR_TYPE_WORKSPACE_CURSOR_DEPTH_EXT
     const void* XR_MAY_ALIAS next;
     float            hitZMeters;  // Ray-plane depth under cursor (meters); 0 = panel plane
     XrBool32         overWindow;  // XR_TRUE when the cursor is over a window
+    float            dimFactor;   // (spec 23) over-window cursor body alpha [0,1]; 1 = no dim
 } XrWorkspaceCursorDepthEXT;
 
 /*!

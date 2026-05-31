@@ -393,13 +393,15 @@ comp_d3d11_service_poll_mcp_capture(struct xrt_system_compositor *xsysc);
  * @param xsysc       The system compositor (must be D3D11 service).
  * @param hit_z_m     Ray-plane depth under the cursor in meters (0 = panel plane).
  * @param over_window true when the cursor is over a window.
+ * @param dim_factor  (spec 23) over-window cursor body alpha [0,1]; 1 = no dim.
  *
  * @ingroup comp_d3d11_service
  */
 void
 comp_d3d11_service_workspace_set_cursor_depth(struct xrt_system_compositor *xsysc,
                                               float hit_z_m,
-                                              bool over_window);
+                                              bool over_window,
+                                              float dim_factor);
 
 /*!
  * Phase 2.D: drain the workspace public-event ring, enriching POINTER events

@@ -2511,7 +2511,10 @@ ipc_handle_workspace_set_input_grab(volatile struct ipc_client_state *_ics, bool
 }
 
 xrt_result_t
-ipc_handle_workspace_set_cursor_depth(volatile struct ipc_client_state *_ics, float hit_z_m, uint32_t over_window)
+ipc_handle_workspace_set_cursor_depth(volatile struct ipc_client_state *_ics,
+                                      float hit_z_m,
+                                      uint32_t over_window,
+                                      float dim_factor)
 {
 	struct ipc_server *s = _ics->server;
 
@@ -2521,12 +2524,13 @@ ipc_handle_workspace_set_cursor_depth(volatile struct ipc_client_state *_ics, fl
 	}
 
 	// Per-frame; never log here (would flood the service log).
-	comp_d3d11_service_workspace_set_cursor_depth(s->xsysc, hit_z_m, over_window != 0);
+	comp_d3d11_service_workspace_set_cursor_depth(s->xsysc, hit_z_m, over_window != 0, dim_factor);
 	return XRT_SUCCESS;
 #else
 	(void)s;
 	(void)hit_z_m;
 	(void)over_window;
+	(void)dim_factor;
 	return XRT_ERROR_IPC_FAILURE;
 #endif
 }

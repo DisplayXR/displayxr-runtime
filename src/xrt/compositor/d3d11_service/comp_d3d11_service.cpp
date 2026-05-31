@@ -1112,26 +1112,19 @@ struct d3d11_multi_compositor
 
 	//! Cursor render inputs for the controller-pushed sprite (sys->cursor_xsc).
 	//! cursor_panel_x/y is the OS cursor position sampled per frame in
-	//! render_pass (runtime-owned). cursor_hit_z_m + cursor_over_window are
-	//! pushed per frame by the workspace controller via
-	//! xrSetWorkspaceCursorDepthEXT (spec_version 22) — the controller owns the
-	//! hit-test. The cursor render pass uses cursor_hit_z_m for per-eye
-	//! disparity and cursor_over_window for the over-window dim. Shape /
-	//! visibility are also controller-pushed (sys->cursor_xsc + cursor_visible).
+	//! render_pass (runtime-owned). cursor_hit_z_m + cursor_over_window +
+	//! cursor_dim_factor are pushed per frame by the workspace controller via
+	//! xrSetWorkspaceCursorDepthEXT (spec_version 22; dim factor added in 23) —
+	//! the controller owns the hit-test and the cursor look-and-feel. The cursor
+	//! render pass uses cursor_hit_z_m for per-eye disparity, cursor_over_window
+	//! for whether to dim, and cursor_dim_factor as the over-window body alpha.
+	//! Shape / visibility are also controller-pushed (sys->cursor_xsc +
+	//! cursor_visible).
 	int32_t cursor_panel_x;
 	int32_t cursor_panel_y;
 	float   cursor_hit_z_m;
 	bool    cursor_over_window;
-
-	//! Right-click-drag state for window repositioning.
-	struct
-	{
-		bool active;         //!< Currently dragging?
-		int32_t slot;        //!< Which slot is being dragged (-1 = none)
-		POINT start_cursor;  //!< Cursor position at drag start (workspace-window client pixels)
-		float start_pos_x;   //!< Window pose.position.x at drag start (meters)
-		float start_pos_y;   //!< Window pose.position.y at drag start (meters)
-	} drag;
+	float   cursor_dim_factor; //!< (#376) over-window cursor body alpha; default 0.30.
 
 	//! Previous frame LMB/RMB state (for rising-edge detection).
 	bool prev_lmb_held;
@@ -4870,11 +4863,6 @@ multi_compositor_unregister_client(struct d3d11_service_system *sys, struct d3d1
 				mc->focused_slot = -1;
 				multi_compositor_update_input_forward(mc);
 			}
-			// Cancel any active drag on this slot
-			if (mc->drag.active && mc->drag.slot == i) {
-				mc->drag.active = false;
-				mc->drag.slot = -1;
-			}
 			U_LOG_W("Multi-comp: unregistered client from slot %d (total=%u)", i, mc->client_count);
 
 			// Render one final frame to clear the stale content.
@@ -5223,10 +5211,6 @@ multi_compositor_remove_capture_client(struct d3d11_service_system *sys, int slo
 		mc->focused_slot = -1;
 		multi_compositor_update_input_forward(mc);
 	}
-	if (mc->drag.active && mc->drag.slot == slot_index) {
-		mc->drag.active = false;
-		mc->drag.slot = -1;
-	}
 
 	U_LOG_W("Multi-comp: removed capture client from slot %d (total=%u, captures=%u)",
 	         slot_index, mc->client_count, mc->capture_client_count);
@@ -5323,6 +5307,10 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 		sys->multi_comp->focused_slot = -1;
 		sys->multi_comp->focused_slot_last_emitted = -1;
 		sys->multi_comp->focused_slot_signaled_value = -1;
+		// #376: default the over-window cursor dim to the previous hardcoded
+		// value so the first frame (before the controller's first push) is
+		// unchanged. The controller overrides this per frame via spec_version 23.
+		sys->multi_comp->cursor_dim_factor = 0.30f;
 	}
 
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
@@ -5965,17 +5953,11 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// controller drains it and applies its own focus-cycle policy. ALT+TAB
 	// (system task switcher) and SHIFT+TAB (app HUD toggles) are unaffected.
 
-	// DELETE: close focused client
-	// #308: don't close the focused app on DELETE while the controller has
-	// grabbed input for a modal UI (the launcher band owns the keyboard then).
-	if ((GetAsyncKeyState(VK_DELETE) & 1) && !sys->input_grabbed) {
-		// Phase 2.K: keyboard shortcut now routes through the same helper
-		// the public API uses. Behaviour is unchanged for users.
-		if (mc->focused_slot >= 0) {
-			comp_d3d11_service_workspace_request_exit_by_slot(
-			    (struct xrt_system_compositor *)sys, mc->focused_slot);
-		}
-	}
+	// #376: DELETE (close focused client) is no longer intercepted here.
+	// Window-close is controller policy (ADR-018); DELETE flows to the
+	// controller as a workspace KEY event (pushed by comp_d3d11_window before
+	// any forwarding) and the controller drives the close via the public
+	// xrRequestWorkspaceClientExitEXT path.
 
 	// #307: F11 (maximize toggle) and ESC (restore) are no longer intercepted
 	// here. Both flow to the controller as workspace KEY events (pushed by
@@ -5985,10 +5967,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 	// Screenshot: triggered by F12 key (kept for interactive use).
 
-	// Ctrl+O: open file dialog to launch a new app
-	if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState('O') & 1)) {
-		comp_d3d11_window_request_app_launch(mc->window);
-	}
+	// #376: Ctrl+O (browse + launch an arbitrary exe) is no longer intercepted
+	// here. The "browse + launch" affordance moved to the controller, which
+	// owns its own launch path (DISPLAYXR_WORKSPACE_SESSION + XR_RUNTIME_JSON).
 
 	// Phase 2.G: Ctrl+1..3 layout presets are owned by the workspace
 	// controller now; the runtime no longer intercepts them. Keys flow
@@ -7650,7 +7631,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// (panel plane), where hit_z is 0 even though the cursor IS
 			// over a workspace client.
 			const bool over_window = mc->cursor_over_window;
-			const float body_tint[4]  = {1.00f, 1.00f, 1.00f, 0.30f};
+			// #376: the over-window body alpha is controller-owned (look-and-feel)
+			// — pushed via xrSetWorkspaceCursorDepthEXT (spec 23). Defaults to the
+			// previous hardcoded 0.30 until the first controller push.
+			const float body_tint[4]  = {1.00f, 1.00f, 1.00f, mc->cursor_dim_factor};
 
 			// Common pipeline state
 			ID3D11RenderTargetView *crtvs[] = {mc->combined_atlas_rtv.get()};
@@ -12898,7 +12882,8 @@ comp_d3d11_service_workspace_get_wakeup_event(struct xrt_system_compositor *xsys
 extern "C" void
 comp_d3d11_service_workspace_set_cursor_depth(struct xrt_system_compositor *xsysc,
                                               float hit_z_m,
-                                              bool over_window)
+                                              bool over_window,
+                                              float dim_factor)
 {
 	if (xsysc == nullptr) {
 		return;
@@ -12910,9 +12895,11 @@ comp_d3d11_service_workspace_set_cursor_depth(struct xrt_system_compositor *xsys
 		return; // Workspace not active — drop.
 	}
 	// Cached for the next composited frame; the cursor render block applies
-	// hit_z_m to the per-eye disparity and over_window to the dim alpha.
+	// hit_z_m to the per-eye disparity, over_window to whether to dim, and
+	// dim_factor (#376) as the over-window cursor body alpha.
 	mc->cursor_hit_z_m = hit_z_m;
 	mc->cursor_over_window = over_window;
+	mc->cursor_dim_factor = dim_factor;
 }
 
 bool
@@ -13196,9 +13183,8 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 	// Each app's next layer_commit detects workspace_mode=false and lazily creates
 	// its own swap chain + DP on its own thread (no cross-thread WM).
 
-		// Reset drag/focus state
+		// Reset focus state
 		mc->focused_slot = -1;
-		mc->drag.active = false;
 
 		// Set request flag for render thread to exit. Don't join here —
 		// joining while holding the mutex deadlocks if the render thread
