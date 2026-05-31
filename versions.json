@@ -3,6 +3,6 @@
   "runtime":     "v1.8.0",
   "shell":       "v1.5.0",
   "leia_plugin": "v1.1.0",
-  "mcp_tools":   "v0.3.3",
+  "mcp_tools":   "v0.3.4",
   "gauss_demo":  "v1.4.3"
 }
