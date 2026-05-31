@@ -11225,9 +11225,17 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 		sys->base.info.display_pixel_height = sys->output_height;
 	}
 
-	U_LOG_W("D3D11 service system compositor created: view=%ux%u, view_count=%u, "
-	        "display=%ux%u, output=%ux%u @ %.0fHz",
-	        sys->view_width, sys->view_height, view_count,
+	// These dims are the pre-DP placeholder defaults (set at struct init,
+	// search "output_width = 1920"). The real panel resolution is reported
+	// later by the active display processor — see the "XR_EXT_display_info"
+	// line (display_pixel_*) and the combined-atlas size, which are the
+	// authoritative values. Labelled here so this early line isn't mistaken
+	// for the actual display resolution.
+	U_LOG_W("D3D11 service system compositor created: view_count=%u, "
+	        "default/placeholder dims (pending display-processor query): "
+	        "view=%ux%u display=%ux%u output=%ux%u @ %.0fHz",
+	        view_count,
+	        sys->view_width, sys->view_height,
 	        sys->display_width, sys->display_height,
 	        sys->output_width, sys->output_height, sys->refresh_rate);
 
