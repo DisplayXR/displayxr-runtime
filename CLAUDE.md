@@ -149,13 +149,13 @@ This repo IS the public runtime (no private→public mirror). A release is a `vX
 | Standalone demos | `displayxr-demo-*` | `/dxr-release` → builds installer + dispatches `versions-bump`. |
 | Meta-installer bundle | `displayxr-installer` | `/installer-release` or `workflow_dispatch` (NOT auto-fired). Chains every component installer. |
 
-`/dxr-release` handles every sibling repo; `/installer-release` handles the bundle. Neither applies to this repo.
+`/dxr-release` handles every sibling repo; `/installer-release` handles the bundle. Neither applies to this repo (use `/release` here).
 
-**These two are repo-level (project) skills, not user-level.** `dxr-release` ships byte-identical in `.claude/skills/dxr-release/` of each sibling repo (shell-pvt, leia-plugin, mcp, demo-*); `installer-release` lives in `displayxr-installer/.claude/skills/installer-release/`. They arrive automatically when you clone those repos — but are only invocable *inside* the cloned repo. **On a new machine, mirror both to `~/.claude/skills/` so `/dxr-release` and `/installer-release` work from any directory:**
-- `dxr-release` is fully portable — copy as-is (it self-detects the repo from `git remote`, so still run it *from inside* the component repo you're releasing).
-- `installer-release` hardcodes a local checkout path in its "Launch Subagent" template — after copying, **correct that path** to the new machine's `displayxr-installer` clone.
+**Release skills are hub-homed and symlinked — one source of truth, globally invocable.** `dxr-release` + `installer-release` live git-tracked **only** in this repo at `.claude/skills/` (alongside `/release`). They are NOT copied into the sibling repos. Both are *parameterized*, not cwd-detecting, so they're driven from this runtime hub:
+- `/dxr-release <component> <version>` — e.g. `/dxr-release mcp v0.3.4`. Resolves component → repo, clones it to a temp dir, tags, watches CI + the dispatched `versions-bump.yml`, reports. Components: `shell`, `leia-plugin`, `mcp`, `gauss`.
+- `/installer-release <version>` — fires `publish-bundle.yml` via `gh workflow run` against `displayxr-installer`; no local checkout needed.
 
-The canonical copies in the repos remain the source of truth; the `~/.claude/skills/` copies are convenience mirrors (and the installer-release mirror carries a machine-specific path edit).
+To make them invocable from *any* directory (not just a runtime checkout), `scripts/link-dxr-skills.sh` symlinks `.claude/skills/{dxr-release,installer-release}` into `~/.claude/skills/`. **`setup-displayxr.{sh,bat}` runs this automatically**, so a fresh dev box gets it for free; on an existing box, run `./scripts/link-dxr-skills.sh` once (`--check` to inspect, `--unlink` to undo). The symlink means the bytes stay git-tracked here while being reachable globally — edit the canonical copy in this repo, never the symlink target. Windows: the `.bat` orchestrator uses `mklink /D` (needs the elevated terminal it already requires, or Developer Mode).
 
 ### versions.json — single source of truth
 `versions.json` at the repo root is the canonical pin matrix consumed by `scripts/setup-displayxr.{sh,bat}` and mirrored byte-for-byte by `displayxr-installer`. **Auto-bumped on every component release** (the dispatch flow above updates the matching field on `main` and mirrors to `displayxr-installer/main` within ~30 s via the publish bot). Two safety nets:

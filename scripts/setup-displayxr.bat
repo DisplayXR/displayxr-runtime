@@ -139,6 +139,13 @@ if "%WITH_MCP%"=="1" call :install_component mcp_tools "%MCP_TAG%"
 REM --- --with-demos ---
 if "%WITH_DEMOS%"=="1" call :clone_demos
 
+REM --- Link release skills into %USERPROFILE%\.claude\skills ---
+REM The /dxr-release + /installer-release skills live git-tracked in this
+REM repo's .claude\skills\; symlink them into the user-level skills dir so
+REM they're invocable from any working directory. The orchestrator already
+REM runs elevated (NSIS installers need admin), so mklink /D succeeds.
+if "%DRY_RUN%"=="0" (call :link_skills) else (echo   ^(dry-run^) would link release skills via mklink /D)
+
 REM --- Smoke verification ---
 if "%DRY_RUN%"=="0" if "%EXITCODE%"=="0" (
     echo.
@@ -204,6 +211,24 @@ for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "$d = ConvertF
 if not defined %_RP_VAR% (
     echo ERROR: versions.json has no pin for '%_RP_KEY%' 1>&2
     set "EXITCODE=1"
+)
+exit /b 0
+
+REM Symlink the git-tracked release skills into the user-level skills dir
+REM so /dxr-release + /installer-release are invocable from any directory.
+REM Idempotent. rmdir (no /s) on an existing entry removes a symlink safely
+REM and refuses to clobber a populated real directory.
+:link_skills
+echo.
+echo ==^> Linking DisplayXR release skills into %%USERPROFILE%%\.claude\skills
+set "_LS_USKILLS=%USERPROFILE%\.claude\skills"
+set "_LS_SRC=%REPO_ROOT%\.claude\skills"
+if not exist "%_LS_USKILLS%" mkdir "%_LS_USKILLS%"
+for %%S in (dxr-release installer-release) do (
+    if exist "%_LS_SRC%\%%S" (
+        if exist "%_LS_USKILLS%\%%S" rmdir "%_LS_USKILLS%\%%S" >nul 2>&1
+        mklink /D "%_LS_USKILLS%\%%S" "%_LS_SRC%\%%S" >nul 2>&1 && (echo  OK  linked %%S) || (echo WARN: could not link %%S ^(needs admin or Developer Mode^) 1>&2)
+    )
 )
 exit /b 0
 

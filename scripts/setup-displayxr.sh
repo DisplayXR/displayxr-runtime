@@ -275,6 +275,22 @@ if [ "$WITH_DEMOS" -eq 1 ]; then
     done <<< "$DEMO_REPOS"
 fi
 
+# --- link release skills into ~/.claude/skills (global invocation) ---
+# The /dxr-release + /installer-release skills live git-tracked in this
+# repo's .claude/skills/; symlink them into the user-level skills dir so
+# they're invocable from any working directory (Claude Code reads skills
+# from the launch repo + ~/.claude/skills). Idempotent; harmless to
+# re-run. Non-privileged, so it runs regardless of component-install
+# outcome — but is skipped on --dry-run.
+if [ "$DRY_RUN" -eq 0 ]; then
+    if [ -x "$SCRIPT_DIR/link-dxr-skills.sh" ]; then
+        info "Linking DisplayXR release skills into ~/.claude/skills"
+        "$SCRIPT_DIR/link-dxr-skills.sh" || warn "skill linking failed (non-fatal)."
+    fi
+else
+    log "  (dry-run) would link release skills via scripts/link-dxr-skills.sh"
+fi
+
 # --- smoke verification (skip on dry-run; nothing was installed) ---
 
 if [ "$DRY_RUN" -eq 0 ] && [ "$FAIL" -eq 0 ]; then
