@@ -33,6 +33,15 @@ DisplayXR shell, …):
 3. Entries are **sorted by `ProbeOrder` ascending** (lower runs first;
    missing defaults to 100). Vendors publish at **50**, the
    sim-display fallback at **200**.
+   - **`PreferredPlugin` override (§2.1 / §3.3):** if the user has pinned a
+     plug-in id, the loader tries that entry **first**, before the sorted
+     order. A stale or failed preference falls through to the normal order,
+     so it can never brick discovery. The override is **sticky for the
+     process** — the mid-install re-scan (step 5 below / `refresh_active`)
+     will not auto-adopt a different plug-in while a preference is set.
+     Because the loader is **one-shot per process**, changing the
+     preference takes effect on the **next** process: a running service must
+     be **restarted** for the switch to apply to live sessions.
 4. For each entry, in order:
    - `LoadLibraryExW` / `dlopen` the DLL/`.dylib`.
    - Resolve the single exported symbol `xrtPluginNegotiate`.
@@ -131,6 +140,35 @@ The runtime installer's reference implementation (sim-display, no
 `UninstallString`) lives in
 `installer/DisplayXRInstaller.nsi` — the section labeled "Vendor
 plug-in: sim-display".
+
+### 2.1 `PreferredPlugin` override
+
+A single **root-level** value selects a plug-in to try before the
+`ProbeOrder` sort. It is **not** a per-subkey value — it lives directly
+under the discovery root:
+
+| Location                                              | Value            | Type     | Purpose                                                                                   |
+| ----------------------------------------------------- | ---------------- | -------- | ----------------------------------------------------------------------------------------- |
+| `HKLM\Software\DisplayXR\DisplayProcessors` (root)    | `PreferredPlugin`| `REG_SZ` | The `<id>` of the plug-in to attempt first. Empty / absent = normal `ProbeOrder` discovery. |
+
+Semantics: if the named id is registered and its `probe()` succeeds, it
+wins regardless of `ProbeOrder`. If the id is unregistered or fails to
+load, discovery silently falls back to the normal `ProbeOrder` order. The
+override is **sticky** — the mid-install re-scan never swaps it out — and,
+because the loader is one-shot per process, a change takes effect only for
+processes started afterward (restart the service to switch a live session).
+
+This is the non-destructive replacement for the old "delete the vendor
+registry key to force sim-display" workaround. Manage it with
+`displayxr-cli dp use <id>` / `dp reset` (or the Control Panel); both write
+the 64-bit view (HKLM → administrator rights required). `FORCE_SIM_DISPLAY`
+is unrelated — it only nudges *builder* priority, not which *plug-in* loads.
+
+```powershell
+# Force sim-display, then restore normal discovery:
+New-ItemProperty -Path "HKLM:\Software\DisplayXR\DisplayProcessors" -Name "PreferredPlugin" -Value "sim-display" -PropertyType String -Force
+Remove-ItemProperty -Path "HKLM:\Software\DisplayXR\DisplayProcessors" -Name "PreferredPlugin"
+```
 
 ---
 
@@ -267,6 +305,22 @@ name.
 - Cascade-uninstall (§5): each plug-in `.so` shipped in the runtime
   APK is uninstalled by the OS as part of the APK uninstall. Vendor
   APK plug-ins (v2) will need a separate uninstall hook design.
+
+### 3.3 `PreferredPlugin` override (POSIX)
+
+The §2.1 override has a POSIX equivalent with the same "try this id first,
+fall through on miss/failure, sticky for the process" semantics:
+
+1. **`XRT_PREFERRED_PLUGIN_ID` env var** — wins when set; a dev/CI override
+   that needs no writable filesystem (mirrors `XRT_PLUGIN_SEARCH_PATH`).
+2. **A `preferred` file** in the per-user manifest dir
+   (`~/Library/Application Support/DisplayXR/DisplayProcessors/preferred`
+   on macOS; `${XDG_DATA_HOME:-~/.local/share}/DisplayXR/DisplayProcessors/preferred`
+   on Linux) — a single line containing the plug-in id. This is what
+   `displayxr-cli dp use <id>` / `dp reset` write.
+
+Android exposes only the env-var read (the writable override and `dp list`
+are not shipped there in v1; see Non-goals above).
 
 ---
 

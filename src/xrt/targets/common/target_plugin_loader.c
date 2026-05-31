@@ -429,6 +429,34 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 
 	qsort(entries, (size_t)n, sizeof(entries[0]), compare_by_probe_order);
 
+	// PreferredPlugin override (#378): try the user-pinned plug-in before
+	// the ProbeOrder sort. A stale or failed preference falls through to
+	// the normal order, so a bad value can never brick discovery.
+	char preferred[64];
+	if (target_plugin_get_preferred(preferred, sizeof(preferred))) {
+		for (int i = 0; i < n; i++) {
+			if (strcmp(entries[i].id, preferred) != 0) {
+				continue;
+			}
+			// Refresh path: only honor the preference if it is also
+			// strictly-better; the sticky-preference guard in
+			// target_plugin_refresh_active normally prevents reaching
+			// here on a refresh at all.
+			if (entries[i].probe_order >= max_probe_order) {
+				break;
+			}
+			U_LOG_W("plugin loader: PreferredPlugin override — attempting id='%s' first.", preferred);
+			const struct xrt_plugin_iface *iface = try_load_one(&entries[i], out_inst);
+			if (iface != NULL) {
+				g_active_probe_order = entries[i].probe_order;
+				return iface;
+			}
+			U_LOG_W("plugin loader: preferred plug-in '%s' failed — falling back to ProbeOrder.",
+			        preferred);
+			break;
+		}
+	}
+
 	U_LOG_I("plugin loader: %d registered plug-in(s); attempting in ProbeOrder ascending.", n);
 	for (int i = 0; i < n; i++) {
 		// Refresh path (#342) passes the active plug-in's ProbeOrder as
@@ -1379,6 +1407,30 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 
 	qsort(entries, (size_t)n, sizeof(entries[0]), compare_by_filename);
 
+	// PreferredPlugin override (#378): try the user-pinned plug-in before
+	// the filename/ProbeOrder order. A stale or failed preference falls
+	// through to the normal order, so it can never brick discovery.
+	char preferred[64];
+	if (target_plugin_get_preferred(preferred, sizeof(preferred))) {
+		for (int i = 0; i < n; i++) {
+			if (strcmp(entries[i].id, preferred) != 0) {
+				continue;
+			}
+			if (entries[i].probe_order >= max_probe_order) {
+				break; // refresh path: not strictly-better
+			}
+			U_LOG_W("plugin loader: PreferredPlugin override — attempting id='%s' first.", preferred);
+			const struct xrt_plugin_iface *iface = try_load_one(&entries[i], out_inst);
+			if (iface != NULL) {
+				g_active_probe_order = entries[i].probe_order;
+				return iface;
+			}
+			U_LOG_W("plugin loader: preferred plug-in '%s' failed — falling back to ProbeOrder.",
+			        preferred);
+			break;
+		}
+	}
+
 	U_LOG_I("plugin loader: %d registered plug-in(s); attempting in filename order.", n);
 	for (int i = 0; i < n; i++) {
 		// Refresh path (#342): only attempt strictly-better candidates.
@@ -1571,6 +1623,18 @@ target_plugin_refresh_active(void)
 	// hits this before the runtime's xrCreateInstance — defensive only;
 	// in practice instance-create always precedes session-create.
 	(void)target_plugin_get_active();
+
+	// PreferredPlugin override (#378): a pinned preference is sticky. The
+	// #342 refresh only ever adopts a strictly-better (lower ProbeOrder)
+	// plug-in, which would silently undo a preference for a higher-order
+	// plug-in (e.g. pinning sim-display=200 while leia-sr=50 is present).
+	// Switching the preference is a deliberate act that takes effect on the
+	// next process, not via a mid-session re-scan — so when a preference is
+	// set, never auto-adopt.
+	char preferred[64];
+	if (target_plugin_get_preferred(preferred, sizeof(preferred))) {
+		return g_active_iface;
+	}
 
 	if (g_refresh_mutex_initialized) {
 		os_mutex_lock(&g_refresh_mutex);
