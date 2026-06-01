@@ -1,5 +1,11 @@
 # Design sketch: `probe_displays()` — per-display vendor claims
 
+> **Status: SHIPPED — historical.** This sketch's ABI is now the real
+> `xrt_plugin_iface::probe_displays()` (runtime **v1.9.0**, leia **v1.2.0**). For current
+> state and the remaining compositor work see
+> [multi-display-single-machine.md → Phase 3 design decisions](multi-display-single-machine.md#phase-3-design-decisions).
+> Kept only for the original rationale; do not treat as a live proposal.
+
 **Status:** sketch / discussion. Refines [ADR-015](../adr/ADR-015-displayxr-owns-multi-display-vendor-routing.md)
 and the [multi-display roadmap](multi-display-single-machine.md) (#69) now that the
 vendor-neutral EDID enumerator and a vendor validator both exist in tree.

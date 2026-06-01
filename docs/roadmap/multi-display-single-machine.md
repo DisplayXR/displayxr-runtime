@@ -1,12 +1,12 @@
 ---
-status: Proposal
+status: In progress
 owner: David Fattal
-updated: 2026-04-02
+updated: 2026-05-31
 issues: [69]
-code-paths: [src/xrt/drivers/, src/xrt/compositor/multi/]
+code-paths: [src/xrt/drivers/, src/xrt/targets/common/, src/xrt/compositor/]
 ---
 
-> **Status: Proposal** — not yet implemented. Tracking issue: [#69](https://github.com/DisplayXR/displayxr-runtime/issues/69)
+> **Status: In progress.** Phases 1–2 (vendor-neutral enumeration + per-display `probe_displays()` claims + the `xrt_dp_factory_registry`) **shipped** — runtime **v1.9.0** (PR #382) + leia **v1.2.0** (PR #25). Phase 3 (compositors *consuming* the registry — per-display routing / split-weave) is the remaining work; see [Phase 3 design decisions](#phase-3-design-decisions) below. Tracking issue: [#69](https://github.com/DisplayXR/displayxr-runtime/issues/69)
 
 # Multi-Display Compositing on a Single Machine
 
@@ -75,10 +75,11 @@ App -> compositor --->|
 
 Each vendor driver must tell DisplayXR which OS monitors it recognizes. Vendors use proprietary detection — e.g., Leia uses EDID matching (hardcoded manufacturer+product ID table from the monitor's registry data) plus an FPC USB handshake (serial number via `Global\sharedDeviceSerialMemory`). DisplayXR doesn't need to understand these mechanisms; it only needs the result.
 
-- [ ] Define `xrt_display_vendor` interface with `probe_displays()` — returns list of `(os_monitor_id, confidence, serial)` claims
-- [ ] Implement `probe_displays()` for Leia driver (wraps `getKnownMonitors()` + FPC shared memory read)
-- [ ] Implement `probe_displays()` for sim_display (claims all unclaimed monitors, lowest confidence)
-- [ ] Conflict resolution: when multiple vendors claim same monitor, highest confidence wins (or user override)
+- [x] Define the vendor probe interface — shipped as `xrt_plugin_iface::probe_displays()` returning `xrt_display_claim` `{monitor_id, confidence, supported_apis, serial}` (runtime v1.9.0).
+- [x] Implement `probe_displays()` for Leia (EDID-table match per descriptor; EDID→`EDID`, +SDK+service→`VERIFIED`; serial deferred — see follow-up below) (leia v1.2.0).
+- [x] Implement `probe_displays()` for sim_display (claims every descriptor at `FALLBACK`) (runtime v1.9.0).
+- [x] Conflict resolution: highest confidence wins, ties by ProbeOrder — `target_plugin_resolve_displays` (runtime v1.9.0).
+- [ ] **Follow-up:** read the FPC serial from `Global\sharedDeviceSerialMemory` so same-vendor multi-display can pair each monitor with its camera/calibration (currently `serial=""`).
 
 **Eye tracking in multi-display setups:**
 
@@ -94,11 +95,11 @@ Camera-to-display pairing is vendor-internal (e.g., Leia's FPC bundles display +
 - [ ] Keep `SIM_DISPLAY_OUTPUT=sbs|anaglyph|blend` for dev/debug override
 
 **Registry & routing:**
-- [ ] Define `xrt_dp_factory_registry` struct (map from OS monitor ID to per-API factory set), built from vendor probe results
-- [ ] Populate registry at system init: run all vendor probes, resolve claims, assign factories
-- [ ] Modify compositor creation to look up DP factory from registry by monitor (instead of scalar `xsysc->info.dp_factory_*`)
-- [ ] Per-display override configuration (force sim_display on a specific monitor)
-- [ ] **External dep**: Vendor DPs must accept `window_handle = NULL` (no WndProc hook, phase from canvas_offset only) (#111)
+- [x] Define `xrt_dp_factory_registry` struct (monitor ID → per-API factory set + confidence + plugin id + serial), on `xrt_system_compositor_info` (runtime v1.9.0).
+- [x] Populate registry at system init: load all plug-ins, run `probe_displays`, resolve claims, assign factories — `target_instance.c::build_dp_registry` (runtime v1.9.0).
+- [ ] **(Phase 3)** Modify compositor creation to look up DP factory from registry by monitor (instead of scalar `xsysc->info.dp_factory_*`) — see [Phase 3 design decisions](#phase-3-design-decisions).
+- [ ] Per-display override configuration (force sim_display on a specific monitor) — generalize the global `PreferredPlugin` (#378) to `PreferredPlugin\<monitor-key>`.
+- [ ] **External dep (handle/texture only)**: Vendor DPs must accept `window_handle = NULL` (no WndProc hook, phase from canvas_offset only) (#111) — *not* needed for hosted; see design decisions.
 
 **HWND ownership and phase snapping:**
 
@@ -122,6 +123,41 @@ On Windows, DWM composites the last weaved frame at new positions during drag wi
 - [ ] Integration test: Leia on monitor A + sim_display on monitor B, verify correct DP routes to each
 - [ ] Test DP hot-swap: drag window fully from one monitor to another
 - [ ] Test phase snapping: drag window on primary display, verify 3D quality maintained
+
+## Phase 3 design decisions
+
+Phases 1–2 shipped enumeration + `probe_displays()` claims + the `xrt_dp_factory_registry` (the registry is currently *informational*; compositors still read the scalar `dp_factory_*`, which equal the primary registry entry → single-display behavior is byte-identical). Phase 3 makes compositors *consume* the registry and weave per display. The approach **splits by who owns the window**.
+
+### Hosted apps — per-display windows (no vendor dependency)
+
+The runtime owns window creation (`own_window` in `*_compositor_create`). When a hosted session's output spans displays, create **one runtime-owned overlay window per display, each with a real HWND**, each driving that display's DP in its normal single-window mode. No DP ever receives `window_handle = NULL`, so **#111 does not apply**. Cost: N-window create / position / composite / input management — but it's all runtime-side (single repo, no coupled vendor release).
+
+### Handle / texture apps — split-weave into the single app-owned surface (needs #111)
+
+The *app* owns one window (handle) or one shared texture + window (texture); the runtime cannot replace it with N OS windows. So one in-process native compositor holds **multiple DPs** and split-weaves:
+
+- Determine overlapped displays + each slice (window-client → screen coords; the registry gives monitor bounds + the owning DP).
+- Build the multiview atlas **once**; for each overlapped display call its DP's `process_atlas()` on that slice's sub-region with `canvas_offset_x/y` = the slice's **screen-space** position (the DP's lenticular-phase input); write into the single backbuffer / shared texture; present once.
+- **HWND / phase owner = the majority-area display's DP** — it gets the real HWND and owns WndProc phase-snapping. **Secondary DPs get `window_handle = NULL`** and weave their sub-rect from `canvas_offset` only. **This is #111**, and it is unavoidable for this class because the app owns the one window.
+- This is **not** the IPC / `comp_multi` path — that combines multiple *apps*. One app spanning monitors stays in its single native compositor; the multi-DP / split-weave logic belongs in a shared `comp_base` / new `comp_multi_display` helper (don't duplicate across the 5 APIs).
+- A *stationary* spanning window can be correctly phased on both displays simultaneously (phase is computed per-region from each slice's screen offset, not by moving the window). The transient problem is **drag**: DWM recomposites the last frame without re-running the weave → crosstalk until the move settles, then re-render from canvas offsets.
+
+> **Gating spike before committing to the handle/texture split-weave:** confirm with Leia whether the SR weaver can be externally driven to interlace an *arbitrary sub-rect* with a *supplied phase* and `window_handle = NULL`. If not, #111 is a hard vendor blocker for spanning handle/texture windows (hosted is unaffected).
+
+### Atlas tile sizing across mixed displays
+
+Per-view tile size = **drawing-surface size × scaleXY**, where the surface is the **window** (handle) or the **canvas sub-rect** (texture) — *not* the display's native pixels. (The current `u_tiling_compute_mode(display_w, …)` call is the fullscreen single-display case where window == display; Phase 3 keys tiling off the actual window/canvas size.) The surface size is **common** across the spanned monitors, so the **only** per-monitor variable is `recommended_view_scale_x/y`; each display's native panel resolution feeds only that display's DP *weave output*, never the shared atlas.
+
+Pick **max(scaleXY) over the engaged displays — never majority/min:**
+- **Oversampling is free** (the weaver downsamples a higher-res source); **undersampling is a visible regression** (blur/aliasing on the higher-demand slice). So `max` never hurts quality; majority undersamples the minority slice exactly when it's the *sharper* display.
+- This is a **different axis** from the HWND/phase owner, which *is* majority — two separate "which monitors" decisions that happen to share inputs.
+- **Sizing set:** currently-engaged displays, recomputed on overlap change, surfaced via the existing rendering-mode / recommended-dims change event (the app reallocates render targets exactly as it does on a `xrRequestDisplayRenderingModeEXT` mode switch) — realloc fires only on the rare first cross onto a *more-demanding* display. **Fallback:** static `max` over all connected DP displays (never reallocs; over-renders when parked on a low-demand monitor). Unlike view-*count* worst-casing (free per-frame — inactive tiles aren't rendered), tile-*resolution* worst-casing is paid **every frame**, so the engaged-set policy is preferred for GPU-bound apps.
+- **Mechanics:** generalize `u_tiling_compute_system_atlas` to also `max` the per-view `surface × scaleXY` over the engaged set (it already `max`es atlas dims over rendering modes — same philosophy, new axis). Per-monitor DPI folds in via effective density.
+
+### Suggested 3a / 3b sequencing
+
+- **3a (single-display, no regression, verifiable now):** introduce a `comp_dp_factory_for_window(info, monitor) → factory set` accessor that **degenerates to the scalar `dp_factory_*` for a single-entry registry**, and migrate the 12 compositor call sites to it one at a time. Single display → identical pointer → byte-identical weave. Verify: `cube_handle` on d3d11/d3d12/gl/vk + shell, before/after each migration, must be visually identical; `selftest` stays green.
+- **3b (needs a second 3D display + the #111 spike):** the actual multi-DP split-weave + per-display lifecycle + atlas-sizing-over-engaged-set above. Inherently unverifiable on one panel.
 
 ## Dependencies
 
