@@ -1033,22 +1033,91 @@ comp_vk_native_target_resize(struct comp_vk_native_target *target,
 			return XRT_ERROR_VULKAN;
 		}
 		vk->vkDeviceWaitIdle(vk->device);
-		dcomp_destroy(target);
-		// dcomp_vk_view/image were aliased into target->views/images;
-		// dcomp_destroy freed the underlying handles, so clear the
-		// public aliases too. Otherwise a subsequent
-		// destroy_swapchain_views would double-free.
+
+		// IN-PLACE resize. Keep the D3D11 device + DComp device/target/visual
+		// AND the composition swapchain object bound to the HWND — only the
+		// size-bound resources change (ResizeBuffers on the swapchain + rebuild
+		// the ring of KMT-shared textures / VkImage imports). The visual is
+		// never unbound, so the window keeps showing content.
+		//
+		// REGRESSION FIX: the previous version called dcomp_destroy()+
+		// dcomp_setup() here, which releases the visual/target (CreateTargetForHwnd
+		// binding) and rebuilds the whole bridge. begin_frame polls GetClientRect
+		// and calls this every frame the size changes, so during a live resize-drag
+		// the visual was unbound/rebound every frame → the window was fully
+		// transparent for the entire drag. ResizeBuffers preserves the binding.
+
+		// 1. Release only the size-bound ring (VkImages/views/memory + shared D3D11).
 		for (uint32_t i = 0; i < DCOMP_RING; i++) {
+			if (target->dcomp_vk_view[i]) { vk->vkDestroyImageView(vk->device, target->dcomp_vk_view[i], NULL); target->dcomp_vk_view[i] = VK_NULL_HANDLE; }
+			if (target->dcomp_vk_image[i]) { vk->vkDestroyImage(vk->device, target->dcomp_vk_image[i], NULL); target->dcomp_vk_image[i] = VK_NULL_HANDLE; }
+			if (target->dcomp_vk_memory[i]) { vk->vkFreeMemory(vk->device, target->dcomp_vk_memory[i], NULL); target->dcomp_vk_memory[i] = VK_NULL_HANDLE; }
+			if (target->dcomp_shared_mutex[i]) { target->dcomp_shared_mutex[i]->Release(); target->dcomp_shared_mutex[i] = NULL; }
+			if (target->dcomp_shared_dx[i]) { target->dcomp_shared_dx[i]->Release(); target->dcomp_shared_dx[i] = NULL; }
 			target->views[i] = VK_NULL_HANDLE;
 			target->images[i] = VK_NULL_HANDLE;
 		}
 		target->image_count = 0;
-		if (!dcomp_setup(target, (HWND)target->hwnd, width, height)) {
-			dcomp_destroy(target);
-			U_LOG_E("DComp bridge resize: dcomp_setup(%ux%u) failed", width, height);
+
+		// 2. Resize the composition swapchain in place. The swapchain object (and
+		// the visual->SetContent binding to it) survives ResizeBuffers; no back
+		// buffer is held (dcomp_present releases it each frame) so this succeeds.
+		HRESULT hr = target->dcomp_swapchain->ResizeBuffers(
+		    DCOMP_RING, width, height, DXGI_FORMAT_B8G8R8A8_UNORM, 0);
+		if (FAILED(hr)) {
+			U_LOG_E("DComp bridge resize: ResizeBuffers(%ux%u) failed: 0x%08x", width, height, hr);
 			return XRT_ERROR_VULKAN;
 		}
-		// dcomp_setup re-publishes images/views/format/width/height/image_count.
+
+		// 3. Rebuild the ring of KMT-shared textures + VkImage imports at the new size.
+		for (uint32_t i = 0; i < DCOMP_RING; i++) {
+			D3D11_TEXTURE2D_DESC tdesc = {};
+			tdesc.Width = width;
+			tdesc.Height = height;
+			tdesc.MipLevels = 1;
+			tdesc.ArraySize = 1;
+			tdesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+			tdesc.SampleDesc.Count = 1;
+			tdesc.Usage = D3D11_USAGE_DEFAULT;
+			tdesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+			tdesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+			hr = target->dcomp_dx_device->CreateTexture2D(&tdesc, NULL, &target->dcomp_shared_dx[i]);
+			if (FAILED(hr)) {
+				U_LOG_E("DComp bridge resize: CreateTexture2D[%u] failed: 0x%08x", i, hr);
+				return XRT_ERROR_VULKAN;
+			}
+			IDXGIResource *dxgi_res = NULL;
+			hr = target->dcomp_shared_dx[i]->QueryInterface(__uuidof(IDXGIResource), (void **)&dxgi_res);
+			if (FAILED(hr) || dxgi_res == NULL) {
+				U_LOG_E("DComp bridge resize: QueryInterface(IDXGIResource)[%u] failed: 0x%08x", i, hr);
+				return XRT_ERROR_VULKAN;
+			}
+			HANDLE shared_kmt = NULL;
+			hr = dxgi_res->GetSharedHandle(&shared_kmt);
+			dxgi_res->Release();
+			if (FAILED(hr) || shared_kmt == NULL) {
+				U_LOG_E("DComp bridge resize: GetSharedHandle[%u] failed: 0x%08x", i, hr);
+				return XRT_ERROR_VULKAN;
+			}
+			if (!dcomp_import_one(target, i, target->dcomp_shared_dx[i], shared_kmt,
+			                       width, height, VK_FORMAT_B8G8R8A8_UNORM)) {
+				U_LOG_E("DComp bridge resize: import ring[%u] failed", i);
+				return XRT_ERROR_VULKAN;
+			}
+		}
+
+		// 4. Republish the new images/views + dims. Visual/target/device untouched.
+		target->image_count = DCOMP_RING;
+		for (uint32_t i = 0; i < DCOMP_RING; i++) {
+			target->images[i] = target->dcomp_vk_image[i];
+			target->views[i] = target->dcomp_vk_view[i];
+		}
+		target->format = VK_FORMAT_B8G8R8A8_UNORM;
+		target->width = width;
+		target->height = height;
+		target->dcomp_ring_idx = 0;
+		target->current_index = 0;
+		target->dcomp_dcomp_device->Commit();
 		return XRT_SUCCESS;
 	}
 #endif
