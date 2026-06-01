@@ -35,6 +35,7 @@ cli_print_help(int argc, const char **argv)
 	P("  runtime <...>     - Show / set DisplayXR as the active OpenXR runtime.\n");
 	P("                      'runtime status', 'runtime activate'.\n");
 	P("  displays [--json] - Enumerate connected displays via EDID (vendor-neutral).\n");
+	P("           [--claims] - Also show which plug-in claims each display (loads plug-ins).\n");
 	P("  test              - List found devices and role assignments, for prober testing.\n");
 	P("  probe             - Just probe and then exit.\n");
 

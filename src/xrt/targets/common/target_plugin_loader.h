@@ -169,6 +169,51 @@ target_plugin_get_active_instance(void);
 const struct xrt_plugin_iface *
 target_plugin_refresh_active(void);
 
+/* Forward declarations — full defs in xrt/xrt_compositor.h and
+ * os/os_display_edid.h; the .c includes those, the header stays lean. */
+struct xrt_dp_factory_registry;
+struct os_display_edid_list;
+
+/*!
+ * Map an enumerated EDID monitor list (`os_display_edid_enumerate`) into the
+ * vendor-neutral @ref xrt_display_descriptor array handed to
+ * `probe_displays()`. Assigns each monitor a stable-for-this-boot
+ * `monitor_id` (hashed from EDID manufacturer/product + screen position),
+ * converts `refresh_hz`→`refresh_mhz`, and maps `is_primary`→`flags` bit 0.
+ * Writes up to @p max descriptors and returns the count.
+ *
+ * Issue #69 / ADR-015.
+ */
+uint32_t
+target_plugin_build_descriptors(const struct os_display_edid_list *list,
+                                struct xrt_display_descriptor *out,
+                                uint32_t max);
+
+/*!
+ * Build the per-monitor DP factory registry (issue #69 / ADR-015). Loads
+ * every registered plug-in (reusing the already-active one), asks each for
+ * its `probe_displays()` claims — or, for a plug-in without `probe_displays`
+ * whose binary `probe()` succeeded, synthesizes a single
+ * @ref XRT_DISPLAY_CLAIM_EDID claim on the primary monitor (single-display
+ * back-compat) — then resolves per monitor (highest confidence wins; ties by
+ * ascending ProbeOrder) into @p out_registry. A monitor no plug-in claims
+ * gets no entry.
+ *
+ * Vendor-blind: the registry stores only `void *` factory pointers, the
+ * winning `iface->id` string, and the claim serial — no vendor symbols enter
+ * the runtime link line (ADR-019). The loaded plug-in source set is cached
+ * for the process lifetime (rebuilt when @ref target_plugin_refresh_active
+ * swaps in a better plug-in). Mutex-guarded like the refresh path.
+ *
+ * Off-Windows the EDID enumerator yields no monitors, so a 0-length
+ * descriptor list resolves to an empty registry (`entry_count == 0`),
+ * signalling callers to use the scalar `dp_factory_*` fields.
+ */
+void
+target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
+                               uint32_t descriptor_count,
+                               struct xrt_dp_factory_registry *out_registry);
+
 #ifdef __cplusplus
 }
 #endif
