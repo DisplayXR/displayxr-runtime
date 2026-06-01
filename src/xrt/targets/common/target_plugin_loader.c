@@ -23,10 +23,12 @@
 #include "target_plugin_loader.h"
 
 #include "xrt/xrt_plugin.h"
+#include "xrt/xrt_compositor.h"
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_config_os.h"
 
 #include "os/os_threading.h"
+#include "os/os_display_edid.h"
 #include "util/u_logging.h"
 
 #include <errno.h>
@@ -65,6 +67,37 @@ static uint32_t g_active_probe_order = 0xFFFFFFFFu;
  */
 static struct os_mutex g_refresh_mutex;
 static int g_refresh_mutex_initialized = 0;
+
+/*!
+ * Max plug-in sources consulted when building the per-display registry
+ * (issue #69 / ADR-015). One per registered plug-in — a handful in practice.
+ */
+#define TARGET_PLUGIN_MAX_SOURCES 16
+
+/*!
+ * One loaded plug-in consulted for display claims. Distinct from the single
+ * "active" plug-in (which drives create_device / get_display_info): the
+ * display registry asks EVERY registered plug-in for its claims, so the
+ * lower-confidence fallback (sim_display) and a vendor plug-in can both
+ * contribute. The active plug-in is reused as one of these sources rather
+ * than loaded twice.
+ */
+struct plugin_display_source
+{
+	const struct xrt_plugin_iface *iface;
+	struct xrt_plugin_instance *inst;
+	uint32_t probe_order; /* ascending = higher priority on a confidence tie */
+};
+
+/*!
+ * Cached display-claim source set, built lazily on the first
+ * @ref target_plugin_resolve_displays and reused for the process lifetime.
+ * `< 0` means "not collected yet"; reset to -1 when
+ * @ref target_plugin_refresh_active adopts a better plug-in so the next
+ * resolve rebuilds. Guarded by @ref g_refresh_mutex.
+ */
+static struct plugin_display_source g_display_sources[TARGET_PLUGIN_MAX_SOURCES];
+static int g_display_source_count = -1;
 
 
 /*
@@ -259,10 +292,24 @@ compare_by_probe_order(const void *a, const void *b)
  * loads intentionally leak it for the process lifetime so the iface's
  * function pointers remain callable.
  */
+/*!
+ * Load + negotiate + ABI-check + probe one registered plug-in. Returns the
+ * iface (writing the instance to *out_inst and the negotiated ABI version to
+ * *out_version) on success, NULL (and closes the DLL) on any failure. No
+ * "active plug-in" logging — callers add their own role-specific line, so
+ * this can serve both the single-winner discovery and the load-all display
+ * probe (#69). Successful loads intentionally leak the HMODULE for the
+ * process lifetime so the iface's function pointers remain callable.
+ */
 static const struct xrt_plugin_iface *
-try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst)
+load_and_probe_one(const struct plugin_entry *e,
+                   struct xrt_plugin_instance **out_inst,
+                   uint32_t *out_version)
 {
 	*out_inst = NULL;
+	if (out_version != NULL) {
+		*out_version = 0;
+	}
 
 	HMODULE dll = LoadLibraryExW(e->binary_path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
 	if (dll == NULL) {
@@ -319,6 +366,26 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 			FreeLibrary(dll);
 			return NULL;
 		}
+	}
+
+	if (out_version != NULL) {
+		*out_version = plugin_version;
+	}
+	return iface;
+}
+
+/*!
+ * Try one registered plug-in as the single active winner. Thin wrapper over
+ * @ref load_and_probe_one that adds the canonical "active plug-in:" log line
+ * (parsed by diagnostics). Returns the iface on success, NULL on any failure.
+ */
+static const struct xrt_plugin_iface *
+try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst)
+{
+	uint32_t plugin_version = 0;
+	const struct xrt_plugin_iface *iface = load_and_probe_one(e, out_inst, &plugin_version);
+	if (iface == NULL) {
+		return NULL;
 	}
 
 	U_LOG_W(
@@ -477,6 +544,60 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 
 	U_LOG_W("plugin loader: no registered plug-in claimed the system — falling back to static drivers.");
 	return NULL;
+}
+
+/*!
+ * Load EVERY registered plug-in and return them as display-claim sources for
+ * the per-monitor registry (#69 / ADR-015). Unlike @ref discover_active_plugin
+ * (which stops at the first winner), this consults all of them so the
+ * fallback (sim_display) and a vendor plug-in can both contribute claims. The
+ * already-active plug-in is reused — not loaded twice — and the remainder are
+ * loaded via @ref load_and_probe_one (DLL handles leaked, consistent with the
+ * single-winner path). Plug-ins whose `probe()` declines contribute nothing.
+ * Returns the source count, sorted ascending by ProbeOrder (so a confidence
+ * tie resolves to the lower-ProbeOrder plug-in).
+ *
+ * Caller must hold @ref g_refresh_mutex and have already loaded the active
+ * plug-in (so `g_active_*` are set for the reuse path).
+ */
+static int
+collect_display_sources_platform(struct plugin_display_source *out, int max)
+{
+	struct plugin_entry entries[MAX_PLUGIN_ENTRIES];
+	int n = enumerate_registry(entries, MAX_PLUGIN_ENTRIES);
+	if (n == 0) {
+		return 0;
+	}
+	qsort(entries, (size_t)n, sizeof(entries[0]), compare_by_probe_order);
+
+	const char *active_id = (g_active_iface != NULL && g_active_iface->id != NULL) ? g_active_iface->id : NULL;
+
+	int count = 0;
+	for (int i = 0; i < n && count < max; i++) {
+		// Reuse the already-loaded active plug-in rather than loading a
+		// second instance of it.
+		if (active_id != NULL && strcmp(entries[i].id, active_id) == 0) {
+			out[count].iface = g_active_iface;
+			out[count].inst = g_active_instance;
+			out[count].probe_order = g_active_probe_order;
+			count++;
+			continue;
+		}
+
+		uint32_t ver = 0;
+		struct xrt_plugin_instance *inst = NULL;
+		const struct xrt_plugin_iface *iface = load_and_probe_one(&entries[i], &inst, &ver);
+		if (iface == NULL) {
+			continue; // declined / failed → contributes no claims
+		}
+		U_LOG_I("plugin loader: display-claim source id=%s (ProbeOrder=%u)", entries[i].id,
+		        entries[i].probe_order);
+		out[count].iface = iface;
+		out[count].inst = inst;
+		out[count].probe_order = entries[i].probe_order;
+		count++;
+	}
+	return count;
 }
 
 /*
@@ -1653,6 +1774,9 @@ target_plugin_refresh_active(void)
 		        cand->id ? cand->id : "?", prev_order, g_active_probe_order);
 		g_active_iface = cand;
 		g_active_instance = new_inst;
+		// Invalidate the display-claim source cache so the next
+		// target_plugin_resolve_displays rebuilds it against the new winner.
+		g_display_source_count = -1;
 	}
 
 	const struct xrt_plugin_iface *result = g_active_iface;
@@ -1661,4 +1785,261 @@ target_plugin_refresh_active(void)
 		os_mutex_unlock(&g_refresh_mutex);
 	}
 	return result;
+}
+
+
+/*
+ *
+ * Per-display resolution (issue #69 / ADR-015).
+ *
+ */
+
+/*!
+ * Stable-for-this-boot monitor id. FNV-1a-64 over the EDID identity fields
+ * that survive a mode/refresh change — manufacturer, product, and screen
+ * position (so two identical-model panels at different positions differ).
+ * Excludes pixel dims/refresh/HMONITOR (transient). Known limitation:
+ * repositioning a monitor changes its id within a boot — acceptable for
+ * Phase 1; EDID device-instance-path keying is the Phase 2/3 hardening.
+ */
+static uint64_t
+monitor_id_from_edid(uint16_t mfr, uint16_t product, int32_t left, int32_t top)
+{
+	uint64_t h = 1469598103934665603ULL; /* FNV-1a-64 offset basis */
+	const uint64_t prime = 1099511628211ULL;
+	uint8_t bytes[12];
+	memcpy(&bytes[0], &mfr, sizeof(mfr));
+	memcpy(&bytes[2], &product, sizeof(product));
+	memcpy(&bytes[4], &left, sizeof(left));
+	memcpy(&bytes[8], &top, sizeof(top));
+	for (size_t i = 0; i < sizeof(bytes); i++) {
+		h ^= (uint64_t)bytes[i];
+		h *= prime;
+	}
+	return h;
+}
+
+uint32_t
+target_plugin_build_descriptors(const struct os_display_edid_list *list,
+                                struct xrt_display_descriptor *out,
+                                uint32_t max)
+{
+	if (list == NULL || out == NULL || max == 0) {
+		return 0;
+	}
+	uint32_t n = list->count;
+	if (n > max) {
+		n = max;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		const struct os_display_edid_monitor *m = &list->monitors[i];
+		struct xrt_display_descriptor *d = &out[i];
+		memset(d, 0, sizeof(*d));
+		d->struct_size = (uint32_t)sizeof(*d);
+		d->monitor_id = monitor_id_from_edid(m->manufacturer_id, m->product_id, m->screen_left, m->screen_top);
+		d->edid_manufacturer = m->manufacturer_id;
+		d->edid_product = m->product_id;
+		d->pixel_width = m->pixel_width;
+		d->pixel_height = m->pixel_height;
+		d->refresh_mhz = m->refresh_hz * 1000u;
+		d->screen_left = m->screen_left;
+		d->screen_top = m->screen_top;
+		d->flags = m->is_primary ? 1u : 0u;
+	}
+	return n;
+}
+
+/*!
+ * Synthesize the back-compat claim for a loaded plug-in that has no
+ * `probe_displays` but whose binary `probe()` succeeded: one
+ * @ref XRT_DISPLAY_CLAIM_EDID claim on the primary monitor (or the first
+ * descriptor if none is flagged primary). `supported_apis` is set to all
+ * bits — the actual factory set is masked against the plug-in's non-NULL
+ * factory pointers at fill time.
+ */
+static uint32_t
+synth_primary_edid_claim(const struct xrt_display_descriptor *descs,
+                         uint32_t n,
+                         struct xrt_display_claim *out,
+                         uint32_t max)
+{
+	if (n == 0 || max == 0) {
+		return 0;
+	}
+	uint32_t pick = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		if (descs[i].flags & 1u) {
+			pick = i;
+			break;
+		}
+	}
+	out[0].monitor_id = descs[pick].monitor_id;
+	out[0].confidence = (uint32_t)XRT_DISPLAY_CLAIM_EDID;
+	out[0].supported_apis = 0xFFFFFFFFu;
+	out[0].serial[0] = '\0';
+	return 1;
+}
+
+/*!
+ * Get one source's claims for the supplied descriptors: call its
+ * `probe_displays()` if present (struct_size-guarded), else synthesize the
+ * back-compat primary-monitor claim.
+ */
+static uint32_t
+query_source_claims(const struct plugin_display_source *src,
+                    const struct xrt_display_descriptor *descs,
+                    uint32_t n,
+                    struct xrt_display_claim *out,
+                    uint32_t max)
+{
+	const struct xrt_plugin_iface *iface = src->iface;
+	if (iface == NULL) {
+		return 0;
+	}
+	if (iface->struct_size > offsetof(struct xrt_plugin_iface, probe_displays) &&
+	    iface->probe_displays != NULL) {
+		return iface->probe_displays(src->inst, descs, n, out, max);
+	}
+	return synth_primary_edid_claim(descs, n, out, max);
+}
+
+/*!
+ * Copy the winning source's per-API factory pointers (masked by the claim's
+ * supported_apis AND the plug-in's actually-non-NULL factory) plus identity
+ * into a registry entry. Mirrors the platform gating of
+ * `fill_dp_factories_from_plugin` in target_instance.c.
+ */
+static void
+fill_registry_entry(struct xrt_dp_registry_entry *e,
+                    const struct xrt_display_descriptor *desc,
+                    const struct plugin_display_source *src,
+                    const struct xrt_display_claim *claim)
+{
+	const struct xrt_plugin_iface *iface = src->iface;
+	memset(e, 0, sizeof(*e));
+	e->monitor_id = desc->monitor_id;
+	e->confidence = claim->confidence;
+	e->screen_left = desc->screen_left;
+	e->screen_top = desc->screen_top;
+	e->pixel_width = desc->pixel_width;
+	e->pixel_height = desc->pixel_height;
+	snprintf(e->plugin_id, sizeof(e->plugin_id), "%s", iface->id != NULL ? iface->id : "");
+	snprintf(e->serial, sizeof(e->serial), "%s", claim->serial);
+
+	if ((claim->supported_apis & XRT_DP_API_BIT_VK) && iface->create_dp_vk != NULL) {
+		e->dp_factory_vk = (void *)iface->create_dp_vk;
+	}
+#ifdef XRT_OS_WINDOWS
+	if ((claim->supported_apis & XRT_DP_API_BIT_D3D11) && iface->create_dp_d3d11 != NULL) {
+		e->dp_factory_d3d11 = (void *)iface->create_dp_d3d11;
+	}
+	if ((claim->supported_apis & XRT_DP_API_BIT_D3D12) && iface->create_dp_d3d12 != NULL) {
+		e->dp_factory_d3d12 = (void *)iface->create_dp_d3d12;
+	}
+#endif
+	if ((claim->supported_apis & XRT_DP_API_BIT_GL) && iface->create_dp_gl != NULL) {
+		e->dp_factory_gl = (void *)iface->create_dp_gl;
+	}
+#ifdef __APPLE__
+	if ((claim->supported_apis & XRT_DP_API_BIT_METAL) && iface->create_dp_metal != NULL) {
+		e->dp_factory_metal = (void *)iface->create_dp_metal;
+	}
+#endif
+	e->owning_iface = (const void *)iface;
+	e->owning_instance = src->inst;
+}
+
+/*!
+ * Build the cached display-claim source set if not already collected. Caller
+ * holds @ref g_refresh_mutex and has loaded the active plug-in.
+ */
+static void
+ensure_display_sources(void)
+{
+	if (g_display_source_count >= 0) {
+		return;
+	}
+	g_display_source_count = 0;
+#ifdef XRT_OS_WINDOWS
+	g_display_source_count = collect_display_sources_platform(g_display_sources, TARGET_PLUGIN_MAX_SOURCES);
+#else
+	// Off-Windows the EDID enumerator yields no monitors, so resolution is
+	// a no-op regardless; the single active plug-in suffices as the lone
+	// source for any caller that supplies its own descriptors.
+	if (g_active_iface != NULL) {
+		g_display_sources[0].iface = g_active_iface;
+		g_display_sources[0].inst = g_active_instance;
+		g_display_sources[0].probe_order = g_active_probe_order;
+		g_display_source_count = 1;
+	}
+#endif
+}
+
+void
+target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
+                               uint32_t descriptor_count,
+                               struct xrt_dp_factory_registry *out_registry)
+{
+	if (out_registry == NULL) {
+		return;
+	}
+	memset(out_registry, 0, sizeof(*out_registry));
+	if (descriptors == NULL || descriptor_count == 0) {
+		return;
+	}
+
+	// Ensure the active plug-in is loaded (and the refresh mutex initialized)
+	// before we lock — get_active() runs the one-shot discovery on first call.
+	(void)target_plugin_get_active();
+
+	if (g_refresh_mutex_initialized) {
+		os_mutex_lock(&g_refresh_mutex);
+	}
+
+	ensure_display_sources();
+
+	uint32_t dn = descriptor_count;
+	if (dn > XRT_DP_REGISTRY_MAX_ENTRIES) {
+		dn = XRT_DP_REGISTRY_MAX_ENTRIES;
+	}
+
+	// Query every source once for the full descriptor set.
+	static struct xrt_display_claim src_claims[TARGET_PLUGIN_MAX_SOURCES][XRT_DP_REGISTRY_MAX_ENTRIES];
+	uint32_t src_claim_count[TARGET_PLUGIN_MAX_SOURCES] = {0};
+	for (int s = 0; s < g_display_source_count; s++) {
+		src_claim_count[s] =
+		    query_source_claims(&g_display_sources[s], descriptors, dn, src_claims[s], XRT_DP_REGISTRY_MAX_ENTRIES);
+	}
+
+	// Resolve per monitor: highest confidence wins; ties → lower ProbeOrder.
+	// Sources are already in ascending ProbeOrder, so a strict `>` keeps the
+	// first (lowest-order) source at any given confidence.
+	for (uint32_t d = 0; d < dn; d++) {
+		const struct xrt_display_descriptor *desc = &descriptors[d];
+		const struct plugin_display_source *best_src = NULL;
+		const struct xrt_display_claim *best_claim = NULL;
+		for (int s = 0; s < g_display_source_count; s++) {
+			for (uint32_t c = 0; c < src_claim_count[s]; c++) {
+				const struct xrt_display_claim *cl = &src_claims[s][c];
+				if (cl->monitor_id != desc->monitor_id) {
+					continue;
+				}
+				if (best_claim == NULL || cl->confidence > best_claim->confidence) {
+					best_claim = cl;
+					best_src = &g_display_sources[s];
+				}
+			}
+		}
+		if (best_claim == NULL) {
+			continue; // no plug-in claimed this monitor
+		}
+		struct xrt_dp_registry_entry *e = &out_registry->entries[out_registry->entry_count++];
+		fill_registry_entry(e, desc, best_src, best_claim);
+		U_LOG_I("plugin loader: monitor 0x%016llx → plug-in '%s' (confidence=%u)",
+		        (unsigned long long)e->monitor_id, e->plugin_id, e->confidence);
+	}
+
+	if (g_refresh_mutex_initialized) {
+		os_mutex_unlock(&g_refresh_mutex);
+	}
 }

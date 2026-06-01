@@ -122,6 +122,47 @@ sim_display_plugin_get_display_info(struct xrt_plugin_instance *inst,
 }
 
 
+static uint32_t
+sim_display_plugin_probe_displays(struct xrt_plugin_instance *inst,
+                                  const struct xrt_display_descriptor *displays,
+                                  uint32_t display_count,
+                                  struct xrt_display_claim *out_claims,
+                                  uint32_t max_claims)
+{
+	(void)inst;
+
+	/*
+	 * sim_display is the vendor-neutral fallback (#69 / ADR-015): claim
+	 * EVERY descriptor at FALLBACK confidence so it backstops any monitor no
+	 * vendor plug-in recognized. A real vendor's EDID(50)/VERIFIED(100) claim
+	 * always outranks these, and a (future) per-display override can still
+	 * force sim onto a specific monitor.
+	 */
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < display_count && n < max_claims; i++) {
+		struct xrt_display_claim *c = &out_claims[n++];
+		c->monitor_id = displays[i].monitor_id;
+		c->confidence = (uint32_t)XRT_DISPLAY_CLAIM_FALLBACK;
+
+		/* Mirror the #ifdef gating of the DP factory fields below — sim
+		 * ships a factory for every API the platform supports. */
+		c->supported_apis = 0;
+#if defined(XRT_HAVE_VULKAN) || !defined(_WIN32)
+		c->supported_apis |= XRT_DP_API_BIT_VK;
+#endif
+#if defined(_WIN32)
+		c->supported_apis |= XRT_DP_API_BIT_D3D11 | XRT_DP_API_BIT_D3D12;
+#endif
+		c->supported_apis |= XRT_DP_API_BIT_GL;
+#if defined(__APPLE__)
+		c->supported_apis |= XRT_DP_API_BIT_METAL;
+#endif
+		c->serial[0] = '\0';
+	}
+	return n;
+}
+
+
 /*
  *
  * Vtable.
@@ -178,6 +219,8 @@ static struct xrt_plugin_iface g_sim_display_iface = {
     .get_display_info = sim_display_plugin_get_display_info,
 
     .set_pose_source = sim_display_plugin_set_pose_source,
+
+    .probe_displays = sim_display_plugin_probe_displays,
 };
 
 

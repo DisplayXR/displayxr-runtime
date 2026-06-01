@@ -118,6 +118,110 @@ struct xrt_plugin_display_info
 
 /*
  *
+ * Per-display vendor claims (issue #69 / ADR-015).
+ *
+ */
+
+/*!
+ * Vendor-neutral descriptor for one connected monitor, handed to the
+ * plug-in's `xrt_plugin_iface::probe_displays`. Built by the runtime from
+ * the vendor-neutral EDID enumerator (`os_display_edid`). The plug-in
+ * echoes back `monitor_id` for the monitors it claims.
+ *
+ * Forward-compat: the runtime sets `struct_size` to its own
+ * `sizeof(struct xrt_display_descriptor)` before the call; plug-ins MUST
+ * NOT read past that offset. Field additions append at the end with no
+ * API version bump.
+ */
+struct xrt_display_descriptor
+{
+	/*! `sizeof(struct xrt_display_descriptor)` at the runtime's compile
+	 *  time. The plug-in clamps its reads to this offset. */
+	uint32_t struct_size;
+
+	/*! Reserved for alignment. Must be 0. */
+	uint32_t reserved_0;
+
+	/*! Runtime-assigned monitor identifier, stable for this boot.
+	 *  Derived from stable EDID identity (manufacturer/product/screen
+	 *  position), not the transient HMONITOR. The plug-in echoes it back
+	 *  in the matching @ref xrt_display_claim. */
+	uint64_t monitor_id;
+
+	/*! EDID bytes 8-9 (raw, as stored in EDID) — mirrors
+	 *  `os_display_edid_monitor::manufacturer_id`. */
+	uint16_t edid_manufacturer;
+
+	/*! EDID bytes 10-11 (raw, as stored in EDID) — mirrors
+	 *  `os_display_edid_monitor::product_id`. */
+	uint16_t edid_product;
+
+	/*! Monitor width/height in pixels (current mode). */
+	uint32_t pixel_width;
+	uint32_t pixel_height;
+
+	/*! Current refresh rate in milli-Hz (e.g. 60000 = 60 Hz). Integer
+	 *  so no float crosses the ABI. */
+	uint32_t refresh_mhz;
+
+	/*! Monitor top-left in virtual-screen coordinates. */
+	int32_t screen_left;
+	int32_t screen_top;
+
+	/*! Bit 0 = primary monitor. Other bits reserved (must be 0). */
+	uint32_t flags;
+};
+
+/*!
+ * How sure a plug-in is that a monitor is its hardware. The runtime
+ * resolves competing claims for the same monitor by highest confidence
+ * (ties broken by registration ProbeOrder).
+ */
+enum xrt_display_claim_confidence
+{
+	XRT_DISPLAY_CLAIM_FALLBACK = 10,  //!< sim_display: "anything unclaimed".
+	XRT_DISPLAY_CLAIM_EDID = 50,      //!< matched my EDID table.
+	XRT_DISPLAY_CLAIM_VERIFIED = 100, //!< EDID + SDK/service/serial handshake.
+};
+
+/*!
+ * Per-API bits for @ref xrt_display_claim::supported_apis. A set bit means
+ * the plug-in's matching `create_dp_<api>` factory works for that monitor.
+ * @{
+ */
+#define XRT_DP_API_BIT_VK (1u << 0)
+#define XRT_DP_API_BIT_D3D11 (1u << 1)
+#define XRT_DP_API_BIT_D3D12 (1u << 2)
+#define XRT_DP_API_BIT_GL (1u << 3)
+#define XRT_DP_API_BIT_METAL (1u << 4)
+/*! @} */
+
+/*!
+ * One monitor a plug-in claims, returned from
+ * `xrt_plugin_iface::probe_displays`. Fixed layout (no `struct_size`): the
+ * plug-in fills a runtime-provided array and returns a count, so growth is
+ * via @ref xrt_display_descriptor (input) rather than this output struct.
+ */
+struct xrt_display_claim
+{
+	/*! Echoes the @ref xrt_display_descriptor::monitor_id being claimed. */
+	uint64_t monitor_id;
+
+	/*! @ref xrt_display_claim_confidence. */
+	uint32_t confidence;
+
+	/*! Bitmask of @ref XRT_DP_API_BIT_ values — which `create_dp_<api>`
+	 *  factories work for this monitor. */
+	uint32_t supported_apis;
+
+	/*! Vendor device serial (e.g. Leia FPC) tying this monitor to a
+	 *  specific camera/calibration unit; empty string if not applicable. */
+	char serial[64];
+};
+
+
+/*
+ *
  * API versioning.
  *
  */
@@ -428,6 +532,33 @@ struct xrt_plugin_iface
 	void (*set_pose_source)(struct xrt_plugin_instance *inst,
 	                        struct xrt_device *xdev,
 	                        struct xrt_device *source);
+
+	/*!
+	 * Report which of the supplied monitors this plug-in claims as its
+	 * hardware (issue #69 / ADR-015). Turns the binary, system-level
+	 * `probe()` into a per-monitor claim list so the runtime can route
+	 * monitor→DP for mixed-vendor / force-sim-on-one-monitor setups.
+	 *
+	 * The runtime passes `display_count` vendor-neutral descriptors (built
+	 * from `os_display_edid`) and a `max_claims`-sized output array. The
+	 * plug-in writes one @ref xrt_display_claim per monitor it recognizes
+	 * (using its own proprietary detection — EDID table match, USB
+	 * handshake, etc.) and returns the number written (<= `max_claims`).
+	 * Monitors the plug-in does not recognize are simply omitted.
+	 *
+	 * Each descriptor carries `struct_size`; the plug-in MUST NOT read past
+	 * that offset. Cheap — called once at system init, not per-frame.
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * means "no per-display claims": the runtime falls back to treating a
+	 * successful binary `probe()` as a single `XRT_DISPLAY_CLAIM_EDID` claim
+	 * on the primary monitor (back-compat for single-display plug-ins).
+	 */
+	uint32_t (*probe_displays)(struct xrt_plugin_instance *inst,
+	                           const struct xrt_display_descriptor *displays,
+	                           uint32_t display_count,
+	                           struct xrt_display_claim *out_claims,
+	                           uint32_t max_claims);
 };
 
 

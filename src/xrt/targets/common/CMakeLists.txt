@@ -62,6 +62,7 @@ if(XRT_MODULE_COMPOSITOR_MAIN OR XRT_MODULE_COMPOSITOR_NULL)
 		PRIVATE
 			xrt-interfaces
 			aux_util
+			aux_os
 			st_prober
 			target_lists
 			drv_includes
@@ -90,6 +91,7 @@ if(XRT_MODULE_COMPOSITOR_MAIN OR XRT_MODULE_COMPOSITOR_NULL)
 			PRIVATE
 				xrt-interfaces
 				aux_util
+				aux_os
 				st_prober
 				target_lists
 				drv_includes

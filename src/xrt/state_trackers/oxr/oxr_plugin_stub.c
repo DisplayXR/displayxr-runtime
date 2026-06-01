@@ -91,8 +91,23 @@ _Static_assert(offsetof(struct xrt_plugin_iface, get_display_info) < offsetof(st
                "xrt_plugin: set_pose_source must follow get_display_info (additive-only growth)");
 
 /*
+ * probe_displays (#69 / ADR-015) is the next additive vtable field after
+ * set_pose_source. Appended at the end, NULL-safe, struct_size-guarded —
+ * no API version bump.
+ */
+_Static_assert(offsetof(struct xrt_plugin_iface, set_pose_source) < offsetof(struct xrt_plugin_iface, probe_displays),
+               "xrt_plugin: probe_displays must follow set_pose_source (additive-only growth)");
+
+/*
  * Display-info struct's first field must be struct_size so plug-ins
  * can detect host's compile-time sizeof and clamp writes accordingly.
  */
 _Static_assert(offsetof(struct xrt_plugin_display_info, struct_size) == 0,
                "xrt_plugin: display_info.struct_size must be the first field");
+
+/*
+ * The display-descriptor the runtime hands probe_displays() is likewise
+ * struct_size-headed so plug-ins can clamp their reads for forward compat.
+ */
+_Static_assert(offsetof(struct xrt_display_descriptor, struct_size) == 0,
+               "xrt_plugin: display_descriptor.struct_size must be the first field");

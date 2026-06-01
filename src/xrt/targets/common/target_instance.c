@@ -17,6 +17,7 @@
 
 
 #include "os/os_time.h"
+#include "os/os_display_edid.h"
 
 #include "util/u_debug.h"
 #include "util/u_system.h"
@@ -116,6 +117,30 @@ fill_dp_factories_from_plugin(struct xrt_system_compositor_info *info, const str
 }
 
 /*!
+ * Enumerate connected monitors (vendor-neutral EDID), ask the registered
+ * plug-ins which they claim, and build the per-monitor DP factory registry
+ * (issue #69 / ADR-015). The scalar `dp_factory_*` fields are left as the
+ * authoritative compositor input in Phase 1 — the registry's primary-monitor
+ * winner is the same plug-in as the active one, so they stay consistent; the
+ * registry is built in parallel for the CLI and the future Phase 3 compositor
+ * migration. No-op (empty registry) off-Windows, where the EDID enumerator
+ * returns no monitors.
+ */
+static void
+build_dp_registry(struct xrt_system_compositor_info *info)
+{
+	if (info == NULL) {
+		return;
+	}
+	struct os_display_edid_list edid = {0};
+	os_display_edid_enumerate(&edid);
+
+	struct xrt_display_descriptor descs[XRT_DP_REGISTRY_MAX_ENTRIES];
+	uint32_t dn = target_plugin_build_descriptors(&edid, descs, XRT_DP_REGISTRY_MAX_ENTRIES);
+	target_plugin_resolve_displays(descs, dn, &info->dp_registry);
+}
+
+/*!
  * Installed on @ref xrt_system_compositor_info::refresh_display_processors so a
  * long-lived service-mode compositor can pick up a vendor plug-in registered
  * AFTER the service started (issue #342). Each per-client compositor-create
@@ -127,6 +152,10 @@ refresh_display_processors_cb(struct xrt_system_compositor_info *info)
 {
 	const struct xrt_plugin_iface *plugin = target_plugin_refresh_active();
 	fill_dp_factories_from_plugin(info, plugin);
+	// Rebuild the per-monitor registry too — refresh_active invalidates the
+	// loader's source cache on a swap, so this re-resolves against the new
+	// winner (#69 / ADR-015).
+	build_dp_registry(info);
 }
 
 static xrt_result_t
@@ -329,6 +358,12 @@ out:
 				plugin_filled_display_info = true;
 			}
 		}
+
+		// Build the per-monitor DP factory registry (#69 / ADR-015) from the
+		// vendor-neutral EDID enumeration + per-plug-in probe_displays claims.
+		// Independent of the active plug-in's get_display_info above; the
+		// scalar dp_factory_* set there stays the Phase-1 compositor input.
+		build_dp_registry(&xsysc->info);
 
 		// All display-info + DP factories are sourced from the plug-in
 		// iface above (ADR-019 / #256 / #263). The runtime DLL no longer

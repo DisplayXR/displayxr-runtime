@@ -2404,6 +2404,64 @@ xrt_comp_native_destroy(struct xrt_compositor_native **xcn_ptr)
  *
  */
 
+//! Max monitors in a @ref xrt_dp_factory_registry (mirrors OS_DISPLAY_EDID_MAX_MONITORS).
+#define XRT_DP_REGISTRY_MAX_ENTRIES 16
+
+/*!
+ * One resolved monitor→DP mapping in the @ref xrt_dp_factory_registry
+ * (issue #69 / ADR-015). Built at system init from the winning vendor
+ * claim for that monitor. Factory + owning-iface pointers are `void *` so
+ * this core header need not include `xrt/xrt_plugin.h`; the loader /
+ * target-instance TUs (which do include it) cast back.
+ */
+struct xrt_dp_registry_entry
+{
+	//! Runtime-assigned monitor id (see xrt_display_descriptor::monitor_id).
+	uint64_t monitor_id;
+
+	//! Winning claim confidence (enum xrt_display_claim_confidence).
+	uint32_t confidence;
+
+	//! Monitor geometry (for Phase 3 monitor↔window mapping).
+	int32_t screen_left;
+	int32_t screen_top;
+	uint32_t pixel_width;
+	uint32_t pixel_height;
+
+	//! Discovery id of the plug-in that won this monitor (iface->id).
+	char plugin_id[64];
+
+	//! Vendor serial from the winning claim ("" if n/a).
+	char serial[64];
+
+	//! Per-API factory pointers from the winning plug-in (NULL = API
+	//! unsupported on this monitor). Same casts as the scalar dp_factory_*.
+	void *dp_factory_vk;
+	void *dp_factory_d3d11;
+	void *dp_factory_d3d12;
+	void *dp_factory_gl;
+	void *dp_factory_metal;
+
+	//! Owning plug-in iface + instance (const struct xrt_plugin_iface * /
+	//! struct xrt_plugin_instance *), for a future per-display lifecycle.
+	const void *owning_iface;
+	void *owning_instance;
+};
+
+/*!
+ * Per-monitor resolved DP factory registry (issue #69 / ADR-015). Built by
+ * the plug-in loader from vendor `probe_displays()` claims. `entry_count ==
+ * 0` means "no per-display routing resolved — use the scalar dp_factory_*
+ * fields" (the single-display / off-Windows path). Phase 1 populates this
+ * in parallel with the scalar fields; Phase 3 migrates the compositors to
+ * consume it.
+ */
+struct xrt_dp_factory_registry
+{
+	uint32_t entry_count;
+	struct xrt_dp_registry_entry entries[XRT_DP_REGISTRY_MAX_ENTRIES];
+};
+
 /*!
  * Capabilities and information about the system compositor (and its wrapped native compositor, if any),
  * and device together.
@@ -2571,6 +2629,15 @@ struct xrt_system_compositor_info
 	void (*refresh_display_processors)(struct xrt_system_compositor_info *info);
 
 	/*! @} */
+
+	/*!
+	 * Per-monitor resolved DP factory registry (issue #69 / ADR-015), built
+	 * from vendor `probe_displays()` claims. `entry_count == 0` means "use
+	 * the scalar dp_factory_* above" (single-display / off-Windows). In
+	 * Phase 1 this is populated alongside — and the scalars re-derived from —
+	 * the primary entry, so existing compositors are unaffected.
+	 */
+	struct xrt_dp_factory_registry dp_registry;
 };
 
 struct xrt_system_compositor;
