@@ -50,6 +50,10 @@ set "COMPONENT_REPO_gauss_demo=DisplayXR/displayxr-demo-gaussiansplat"
 set "COMPONENT_EXE_gauss_demo=DisplayXRGaussianSplatSetup-*.exe"
 set "COMPONENT_MARKER_gauss_demo=HKLM\Software\DisplayXR\Demos\GaussianSplat"
 
+set "COMPONENT_REPO_modelviewer_demo=DisplayXR/displayxr-demo-modelviewer"
+set "COMPONENT_EXE_modelviewer_demo=DisplayXRModelViewerSetup-*.exe"
+set "COMPONENT_MARKER_modelviewer_demo=HKLM\Software\DisplayXR\Demos\ModelViewer"
+
 REM --- Default flag state ---
 set "WITH_MCP=0"
 set "WITH_DEMOS=0"

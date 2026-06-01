@@ -72,6 +72,16 @@ COMPONENT_EXE_WINDOWS_gauss_demo="DisplayXRGaussianSplatSetup-*.exe"
 COMPONENT_INSTALL_MARKER_MACOS_gauss_demo="/Applications/Gaussian Splat Viewer.app"
 COMPONENT_INSTALL_MARKER_WINDOWS_gauss_demo="HKLM\\Software\\DisplayXR\\Demos\\GaussianSplat"
 
+# --- modelviewer_demo ---
+# glTF 2.0 PBR model viewer demo (displayxr-demo-modelviewer). Windows-only
+# today — the macOS app is not yet ported, so the macOS glob/marker are empty
+# → warn+skip on macOS. First release v0.1.0 (2026-06-01).
+COMPONENT_REPO_modelviewer_demo="DisplayXR/displayxr-demo-modelviewer"
+COMPONENT_PKG_MACOS_modelviewer_demo=""
+COMPONENT_EXE_WINDOWS_modelviewer_demo="DisplayXRModelViewerSetup-*.exe"
+COMPONENT_INSTALL_MARKER_MACOS_modelviewer_demo=""
+COMPONENT_INSTALL_MARKER_WINDOWS_modelviewer_demo="HKLM\\Software\\DisplayXR\\Demos\\ModelViewer"
+
 # Helper: look up a per-component field for the current platform.
 #   $1 = component name (runtime, shell, leia_plugin, mcp_tools)
 #   $2 = field (REPO, PKG_MACOS, EXE_WINDOWS, INSTALL_MARKER_MACOS)
