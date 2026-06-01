@@ -7,15 +7,27 @@ DisplayXR supports four ways for an application to integrate with the runtime, d
 | Class | Suffix | Description | Compositor path |
 |-------|--------|-------------|----------------|
 | **Handle** | `_handle` | App provides its own window handle via `XR_EXT_*_window_binding` | Native compositor directly in-process |
-| **Texture** | `_texture` | App provides textures, runtime composites into its own window | Native compositor directly in-process |
+| **Texture** | `_texture` | App provides textures **and its own window handle**; runtime composites via a shared texture (HWND used for display-processor position tracking) | Native compositor directly in-process |
 | **Hosted** | `_hosted` | Runtime creates window and rendering targets (standard OpenXR/WebXR) | Native compositor directly in-process |
 | **IPC/Service** | _(internal)_ | Out-of-process via client compositor → IPC → server multi-compositor. Used internally by the shell and WebXR — apps don't need to target this directly. | Client compositor → IPC → multi-compositor → native compositor in server |
+
+## Who passes the window handle?
+
+A frequent point of confusion — the in-process classes differ in **who owns the window**, i.e. what `hwnd`/`NSView` (if any) the app passes to the runtime, and therefore what handle the native compositor hands the display processor for phase/position tracking:
+
+| Class | App passes to runtime | Compositor's window |
+|-------|-----------------------|---------------------|
+| **Handle** | the app's **real** window handle | uses the app's window |
+| **Texture** | the app's **real** window handle (+ a shared texture) | offscreen / shared texture; the HWND is only for DP position tracking |
+| **Hosted** | **NULL** | the runtime creates its **own** window at native resolution |
+
+So `NULL` is the **Hosted** path (not Handle) — that's the case that makes the runtime self-create a window. The display processor *always* receives a real handle: the app's for Handle/Texture, the runtime's self-created window for Hosted. Authoritative branch: the window-handling block in `*_compositor_create` (e.g. `src/xrt/compositor/d3d11/comp_d3d11_compositor.cpp`).
 
 ## Which Class Should I Use?
 
 - **Building a native app with your own window?** Use **Handle**. You create and manage the window, pass the handle (HWND, NSView) to the runtime via `XR_EXT_win32_window_binding` or `XR_EXT_cocoa_window_binding`. Most control, best for apps that need to own their window lifecycle.
 
-- **Building an app that renders to an offscreen texture?** Use **Texture**. You provide textures to the runtime, which composites them into its own window. Good for apps that want to render 3D content as part of a larger 2D UI.
+- **Building an app that renders to an offscreen texture?** Use **Texture**. You create and own the window (and pass its handle) and provide textures; the runtime composites into a shared texture and uses your HWND for display-processor position tracking. Good for apps that want to render 3D content as part of a larger 2D UI.
 
 - **Building a standard OpenXR app?** Use **Hosted**. The runtime creates everything — window, swapchains, rendering targets. This is the standard OpenXR path and the simplest integration. Also the path for WebXR content.
 
