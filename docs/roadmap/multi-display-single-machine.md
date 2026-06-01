@@ -99,7 +99,7 @@ Camera-to-display pairing is vendor-internal (e.g., Leia's FPC bundles display +
 - [x] Populate registry at system init: load all plug-ins, run `probe_displays`, resolve claims, assign factories — `target_instance.c::build_dp_registry` (runtime v1.9.0).
 - [ ] **(Phase 3)** Modify compositor creation to look up DP factory from registry by monitor (instead of scalar `xsysc->info.dp_factory_*`) — see [Phase 3 design decisions](#phase-3-design-decisions).
 - [ ] Per-display override configuration (force sim_display on a specific monitor) — generalize the global `PreferredPlugin` (#378) to `PreferredPlugin\<monitor-key>`.
-- [ ] **External dep (handle/texture only)**: Vendor DPs must accept `window_handle = NULL` (no WndProc hook, phase from canvas_offset only) (#111) — *not* needed for hosted; see design decisions.
+- [ ] **External dep (SR weaver)** — three tiers (see [Phase 3 design decisions](#phase-3-design-decisions)): **Tier 1** `EXTERNAL_ROUTING` flag (#111 §1–5; needed for *all* multi-display, incl. hosted/workspace); **Tier 2** per-display weaver binding (any 2+ Leia); **Tier 3** external phase origin for windowless sub-rects (standalone handle/texture spanning). Tier 1 is specced; Tiers 2–3 are the substantive asks.
 
 **HWND ownership and phase snapping:**
 
@@ -128,21 +128,38 @@ On Windows, DWM composites the last weaved frame at new positions during drag wi
 
 Phases 1–2 shipped enumeration + `probe_displays()` claims + the `xrt_dp_factory_registry` (the registry is currently *informational*; compositors still read the scalar `dp_factory_*`, which equal the primary registry entry → single-display behavior is byte-identical). Phase 3 makes compositors *consume* the registry and weave per display. The approach **splits by who owns the window**.
 
-### Hosted apps — per-display windows (no vendor dependency)
+### SR SDK interference & the three-tier vendor ask (#111)
 
-The runtime owns window creation (`own_window` in `*_compositor_create`). When a hosted session's output spans displays, create **one runtime-owned overlay window per display, each with a real HWND**, each driving that display's DP in its normal single-window mode. No DP ever receives `window_handle = NULL`, so **#111 does not apply**. Cost: N-window create / position / composite / input management — but it's all runtime-side (single repo, no coupled vendor release).
+Code review of the SR weaver (`modules/DimencoWeaving/sr/weaver/WeaverBaseImpl.ipp` + `dx11weaver.cpp` in `LeiaInc/sr_test`) shows it is architected as the **sole owner of one window on one primary SR display**, deriving lenticular phase from `primaryDisplayLocation + liveWindowPosition + viewportOffset`. Concretely it:
 
-### Handle / texture apps — split-weave into the single app-owned surface (needs #111)
+1. binds to a single `getPrimaryActiveSRDisplay()` (`.ipp:373`; `screenWidth/Height` + `SRMonitorRectangle` all derive from it) — no "weave for *this* display" input;
+2. self-splits the window per monitor in `getDrawRegions()` (`.ipp:47`) and only interlaces the region it deems on its SR monitor (`dx11weaver.cpp:1253–1258`);
+3. gates weaving on its own monitor/occlusion view in `canWeaveInternal()` (`.ipp:450–562`);
+4. subclasses the root window and ±2px phase-snaps it on `WM_WINDOWPOSCHANGING` via `installCustomWindowProc()` (`.ipp:165,314`);
+5. runs two background threads re-scanning monitors/FPCs and re-picking the primary display (`.ipp:344,351`);
+6. computes phase from the live window position vs the primary display (`window_WeavingX` via `getScreenRect`, `dx11weaver.cpp:1075,1089,1237`) — only the viewport sub-rect (`vpX/vpY`) is caller-controllable, **not** the window-vs-display term.
 
-The *app* owns one window (handle) or one shared texture + window (texture); the runtime cannot replace it with N OS windows. So one in-process native compositor holds **multiple DPs** and split-weaves:
+Items 2–6 are exactly the jobs ADR-015 gives DisplayXR. So the vendor ask has **three tiers**, of which #111's `EXTERNAL_ROUTING` flag is only the first:
+
+- **Tier 1 — `EXTERNAL_ROUTING` flag (#111 §1–5):** disable the polling threads, skip `installCustomWindowProc`, always-weave (skip `canWeave`), treat the window as one region (skip `getDrawRegions`). Silences items 2–5. **Necessary for every multi-display case; not sufficient for the two below.**
+- **Tier 2 — bind a weaver to a *specific* display (multi-FPC):** construct/bind each weaver to a caller-named SR display (serial/HMONITOR) with its own lens/calibration instead of the global primary. Fixes item 1. **Hard blocker for any 2+ Leia setup — in *both* the hosted and handle/texture models.** (= #111 comment 3's multi-FPC item.)
+- **Tier 3 — external phase origin:** accept a per-frame absolute screen-space phase origin from the caller, overriding the `window_WeavingX` + primary-display term, so a sub-rect with **no window of its own** (the secondary slice of a spanning handle/texture window) weaves with correct alignment. Fixes item 6. **Hard blocker for handle/texture spanning.** (#111 §4 collapses the region list but does *not* expose this phase input — it must be added.)
+
+### Runtime-owned window — hosted **and workspace/shell** (avoids Tier 3; still needs Tiers 1–2 for multi-Leia)
+
+The split is really by **who owns the output window**, and *both* the **hosted** app class **and the workspace/shell (IPC/service) path** fall on the runtime-owned side: hosted uses `own_window` in `*_compositor_create`; workspace/shell apps are `_ipc` clients that submit layers, while the **service** owns and presents the workspace output. Either way the runtime, not the app, owns the surface — so when output spans displays, create **one runtime-owned window per display, real HWND each** (this is exactly the roadmap's "one native compositor per display" arrangement for the multi-app/IPC path), each driving that display's DP in its normal single-window mode — so no DP is ever windowless and **Tier 3 (external phase origin) is not needed**. But this is **not** dependency-free (correcting an earlier note that said hosted "avoids #111"): the SDK's threads / WndProc / self-split still race DisplayXR's positioning, so **Tier 1 (`EXTERNAL_ROUTING`) is still wanted**, and **2+ Leia displays still hit the single-primary-display limit → Tier 2 (per-display binding) is still required**. The one case that works almost as-is today is **mixed-vendor hosted (1 Leia + 1 non-Leia)**: a single SR display, the Leia DP is a normal single-window weave, and Tier 1 just cleans up the nuisances. Cost otherwise: N-window create / position / composite / input — all runtime-side (single repo).
+
+### App-owned window — standalone handle / texture (split-weave; needs Tier 3)
+
+The *app* owns one window (handle) or one shared texture + window (texture) — this is the **standalone** (non-workspace) case; the runtime cannot replace it with N OS windows. So one in-process native compositor holds **multiple DPs** and split-weaves:
 
 - Determine overlapped displays + each slice (window-client → screen coords; the registry gives monitor bounds + the owning DP).
 - Build the multiview atlas **once**; for each overlapped display call its DP's `process_atlas()` on that slice's sub-region with `canvas_offset_x/y` = the slice's **screen-space** position (the DP's lenticular-phase input); write into the single backbuffer / shared texture; present once.
-- **HWND / phase owner = the majority-area display's DP** — it gets the real HWND and owns WndProc phase-snapping. **Secondary DPs get `window_handle = NULL`** and weave their sub-rect from `canvas_offset` only. **This is #111**, and it is unavoidable for this class because the app owns the one window.
+- **HWND / phase owner = the majority-area display's DP** — it gets the real HWND and owns WndProc phase-snapping. **Secondary DPs are windowless** and must weave their slice from an externally-supplied phase origin — **Tier 3 above** (plus **Tier 1**, plus **Tier 2** if that slice is a *second* Leia display). Unavoidable for this class because the app owns the one window.
 - This is **not** the IPC / `comp_multi` path — that combines multiple *apps*. One app spanning monitors stays in its single native compositor; the multi-DP / split-weave logic belongs in a shared `comp_base` / new `comp_multi_display` helper (don't duplicate across the 5 APIs).
 - A *stationary* spanning window can be correctly phased on both displays simultaneously (phase is computed per-region from each slice's screen offset, not by moving the window). The transient problem is **drag**: DWM recomposites the last frame without re-running the weave → crosstalk until the move settles, then re-render from canvas offsets.
 
-> **Gating spike before committing to the handle/texture split-weave:** confirm with Leia whether the SR weaver can be externally driven to interlace an *arbitrary sub-rect* with a *supplied phase* and `window_handle = NULL`. If not, #111 is a hard vendor blocker for spanning handle/texture windows (hosted is unaffected).
+> **Gating spike before committing to Phase 3b** — two questions for Leia beyond the already-specced Tier 1 `EXTERNAL_ROUTING`: **(a) Tier 2** — can a weaver be bound to a *caller-specified* SR display (serial/HMONITOR) with its own lens/calibration, instead of `getPrimaryActiveSRDisplay()`? **(b) Tier 3** — can the per-frame phase origin be supplied externally so a *windowless* sub-rect weaves with correct alignment? Tier 2 gates any 2+ Leia setup (hosted or spanning); Tier 3 gates spanning handle/texture. Mixed-vendor hosted (1 Leia + 1 non-Leia) needs neither — only Tier 1.
 
 ### Atlas tile sizing across mixed displays
 
