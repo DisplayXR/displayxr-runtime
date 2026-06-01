@@ -50,6 +50,7 @@ Four classes (handle, texture, hosted, IPC) — full reference: `docs/getting-st
 - `_handle` / `_texture` / `_hosted` → in-process `compositor/{d3d11,d3d12,metal,gl,vk_native}/`
 - `_ipc` → `compositor/client/` → `ipc/` → `compositor/multi/` → native compositor (out-of-process)
 - **Window handle:** `_handle` and `_texture` pass the app's **real** HWND (texture also passes a shared texture; its HWND is used for DP position tracking); `_hosted` passes **NULL** → the runtime self-creates a window at native res. The display processor always gets a real HWND — the app's, or the runtime's for hosted. (Branch: window-handling block in `*_compositor_create`.)
+- **Texture-app layout:** a `_texture` app confines weaved 3D to a **canvas sub-rect** via `xrSetSharedTextureOutputRectEXT` (defaults to full client area; flows to the DP as `canvas_offset/size`) and may fill the **2D surround** outside it via `xrSetSharedTextureSurround2DEXT` (D3D11) / `xrSetSharedTextureSurround2DFenceEXT` (D3D12). Spec: `XR_EXT_win32_window_binding` §3.5–3.7.
 - Test app naming: `cube_{class}_{api}_{platform}` (e.g. `cube_handle_metal_macos`, `cube_texture_d3d11_win`).
 
 ### Extension vs legacy apps

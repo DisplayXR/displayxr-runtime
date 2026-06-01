@@ -7,7 +7,7 @@ DisplayXR supports four ways for an application to integrate with the runtime, d
 | Class | Suffix | Description | Compositor path |
 |-------|--------|-------------|----------------|
 | **Handle** | `_handle` | App provides its own window handle via `XR_EXT_*_window_binding` | Native compositor directly in-process |
-| **Texture** | `_texture` | App provides textures **and its own window handle**; runtime composites via a shared texture (HWND used for display-processor position tracking) | Native compositor directly in-process |
+| **Texture** | `_texture` | App provides a shared texture **and its own window handle**; runtime weaves the 3D **canvas sub-rect** into the shared texture. App declares the sub-rect (`xrSetSharedTextureOutputRectEXT`) and may fill the surrounding 2D area (`xrSetSharedTextureSurround2DEXT`) | Native compositor directly in-process |
 | **Hosted** | `_hosted` | Runtime creates window and rendering targets (standard OpenXR/WebXR) | Native compositor directly in-process |
 | **IPC/Service** | _(internal)_ | Out-of-process via client compositor → IPC → server multi-compositor. Used internally by the shell and WebXR — apps don't need to target this directly. | Client compositor → IPC → multi-compositor → native compositor in server |
 
@@ -27,7 +27,11 @@ So `NULL` is the **Hosted** path (not Handle) — that's the case that makes the
 
 - **Building a native app with your own window?** Use **Handle**. You create and manage the window, pass the handle (HWND, NSView) to the runtime via `XR_EXT_win32_window_binding` or `XR_EXT_cocoa_window_binding`. Most control, best for apps that need to own their window lifecycle.
 
-- **Building an app that renders to an offscreen texture?** Use **Texture**. You create and own the window (and pass its handle) and provide textures; the runtime composites into a shared texture and uses your HWND for display-processor position tracking. Good for apps that want to render 3D content as part of a larger 2D UI.
+- **Building an app that renders to an offscreen texture?** Use **Texture**. You create and own the window (and pass its handle) and provide a shared texture; the runtime composites into it and uses your HWND for display-processor position tracking. Two pieces let the 3D content live inside a larger 2D UI:
+  - **3D-zone sub-rect** — by default the whole client area is the 3D canvas; call `xrSetSharedTextureOutputRectEXT(x, y, w, h)` to confine weaved 3D output to a sub-rect (e.g. a viewport surrounded by toolbars). The runtime feeds that rect to the DP as `canvas_offset/size` so interlacing phase and Kooima projection stay correct; you blit the same sub-rect of the shared texture into your window.
+  - **2D surround** — pixels *outside* the 3D sub-rect are undefined by default. Register a full-window 2D shared texture via `xrSetSharedTextureSurround2DEXT` (D3D11/keyed-mutex) or `xrSetSharedTextureSurround2DFenceEXT` (D3D12/fence) and the runtime blits its non-canvas pixels into the swapchain each frame — full-resolution UI/chrome around the 3D zone.
+
+  Full contract: [`XR_EXT_win32_window_binding`](../specs/extensions/XR_EXT_win32_window_binding.md) §3.5 (output rect), §3.6/§3.7 (2D surround).
 
 - **Building a standard OpenXR app?** Use **Hosted**. The runtime creates everything — window, swapchains, rendering targets. This is the standard OpenXR path and the simplest integration. Also the path for WebXR content.
 
