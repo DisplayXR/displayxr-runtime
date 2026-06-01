@@ -1,10 +1,30 @@
 #!/bin/bash
-# Post-install: register DisplayXR as the active OpenXR runtime (system-wide)
+# Post-install: register DisplayXR as the active OpenXR runtime (system-wide).
+#
+# The active_runtime.json must be written everywhere the macOS OpenXR loader
+# looks, otherwise default discovery (apps launched without XR_RUNTIME_JSON)
+# won't find the freshly-installed runtime:
+#   - /etc/xdg/openxr/1            XDG_CONFIG_DIRS default
+#   - /usr/local/share/openxr/1    the loader's datadir (<prefix>/share/openxr/N
+#                                   for prefix=/usr/local — the Khronos SDK
+#                                   loaders bundled with the demo .apps read
+#                                   here; mirrors MANIFEST_RELATIVE_DIR in
+#                                   src/xrt/targets/openxr/CMakeLists.txt)
+# Registering only /etc/xdg left default discovery resolving a stale symlink in
+# the datadir (left by a prior `make install`), or failing outright (#385).
+#
+# `ln -sfn` overwrites any pre-existing file/symlink at the target, so this also
+# self-heals a stale datadir symlink from an earlier dev `make install`.
 INSTALL_DIR="/Library/Application Support/DisplayXR"
 MANIFEST="$INSTALL_DIR/openxr_displayxr.json"
 
-# System-wide OpenXR runtime registration (same mechanism as active_runtime.cmake)
-mkdir -p /etc/xdg/openxr/1
-ln -sf "$MANIFEST" /etc/xdg/openxr/1/active_runtime.json
+register_active_runtime() {
+    local dir="$1"
+    mkdir -p "$dir"
+    ln -sfn "$MANIFEST" "$dir/active_runtime.json"
+}
+
+register_active_runtime /etc/xdg/openxr/1
+register_active_runtime /usr/local/share/openxr/1
 
 exit 0

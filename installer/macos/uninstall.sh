@@ -14,7 +14,16 @@ echo "Removing DisplayXR runtime..."
 sudo rm -rf "/Library/Application Support/DisplayXR"
 
 echo "Removing OpenXR runtime registration..."
-sudo rm -f /etc/xdg/openxr/1/active_runtime.json
+# The postinstall registers active_runtime.json in both the XDG config dir and
+# the loader datadir (#385). Remove each only when it points at our install, so
+# a third-party runtime registered there isn't clobbered. (readlink returns the
+# stored link text even after the target dir above is deleted.)
+for rt in /etc/xdg/openxr/1/active_runtime.json /usr/local/share/openxr/1/active_runtime.json; do
+    target="$(readlink "$rt" 2>/dev/null || true)"
+    case "$target" in
+        "/Library/Application Support/DisplayXR/"*) sudo rm -f "$rt" ;;
+    esac
+done
 
 echo "Removing test app..."
 rm -rf "/Applications/DisplayXRCube.app"
