@@ -29,6 +29,7 @@
 #include "os/os_time.h"
 
 #include "util/comp_layer_accum.h"
+#include "util/comp_dp_factory.h"
 
 #include "comp_d3d11_window.h"
 
@@ -2858,8 +2859,9 @@ init_client_render_resources(struct d3d11_service_system *sys,
 	// creating a SECOND DP instance causes the SR SDK to recalibrate its
 	// weaver, producing a multi-second stretched-left-eye artifact. The
 	// per-client DP is only needed for standalone (non-workspace) rendering.
-	if (sys->base.info.dp_factory_d3d11 != NULL && !sys->workspace_mode) {
-		auto factory = (xrt_dp_factory_d3d11_fn_t)sys->base.info.dp_factory_d3d11;
+	void *dp_fac = comp_dp_factory_for_window(&sys->base.info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_D3D11);
+	if (dp_fac != NULL && !sys->workspace_mode) {
+		auto factory = (xrt_dp_factory_d3d11_fn_t)dp_fac;
 		xrt_result_t dp_ret = factory(sys->device.get(), sys->context.get(), res->hwnd, &res->display_processor);
 		if (dp_ret != XRT_SUCCESS) {
 			U_LOG_W("D3D11 display processor factory failed (error %d), continuing without",
@@ -5601,8 +5603,9 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 	}
 
 	// Create display processor via factory
-	if (sys->base.info.dp_factory_d3d11 != NULL) {
-		auto factory = (xrt_dp_factory_d3d11_fn_t)sys->base.info.dp_factory_d3d11;
+	void *dp_fac = comp_dp_factory_for_window(&sys->base.info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_D3D11);
+	if (dp_fac != NULL) {
+		auto factory = (xrt_dp_factory_d3d11_fn_t)dp_fac;
 		xrt_result_t dp_ret = factory(
 		    sys->device.get(), sys->context.get(), mc->hwnd, &mc->display_processor);
 
@@ -5902,8 +5905,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 							    bb.get(), nullptr, res->back_buffer_rtv.put());
 						}
 
-						if (sys->base.info.dp_factory_d3d11 != NULL) {
-							auto factory = (xrt_dp_factory_d3d11_fn_t)sys->base.info.dp_factory_d3d11;
+						void *dp_fac_dismiss = comp_dp_factory_for_window(
+						    &sys->base.info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_D3D11);
+						if (dp_fac_dismiss != NULL) {
+							auto factory = (xrt_dp_factory_d3d11_fn_t)dp_fac_dismiss;
 							factory(sys->device.get(), sys->context.get(),
 							        app_hwnd, &res->display_processor);
 							// Phase 6.1 (#140): don't call request_display_mode
@@ -9586,8 +9591,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			U_LOG_E("Hot-switch: swap chain failed (hr=0x%08X)", hr);
 		}
 
-		if (sys->base.info.dp_factory_d3d11 != NULL) {
-			auto factory = (xrt_dp_factory_d3d11_fn_t)sys->base.info.dp_factory_d3d11;
+		void *dp_fac_hs = comp_dp_factory_for_window(&sys->base.info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_D3D11);
+		if (dp_fac_hs != NULL) {
+			auto factory = (xrt_dp_factory_d3d11_fn_t)dp_fac_hs;
 			factory(sys->device.get(), sys->context.get(),
 			        c->app_hwnd, &c->render.display_processor);
 			if (c->render.display_processor != nullptr) {
@@ -10457,7 +10463,7 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	// Query display dimensions from display processor (if factory is available).
 	// Create a temporary display processor with NULL window to query pixel info,
 	// then destroy it. Per-client display processors are created later with real windows.
-	if (sys->base.info.dp_factory_d3d11 != NULL) {
+	if (comp_dp_factory_for_window(&sys->base.info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_D3D11) != NULL) {
 	}
 
 	// Create layer shaders and resources for UI layer rendering
@@ -13047,8 +13053,9 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 		}
 
 		// Recreate display processor via factory (window + swap chain still alive)
-		if (mc->display_processor == nullptr && sys->base.info.dp_factory_d3d11 != NULL) {
-			auto factory = (xrt_dp_factory_d3d11_fn_t)sys->base.info.dp_factory_d3d11;
+		void *dp_fac_resume = comp_dp_factory_for_window(&sys->base.info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_D3D11);
+		if (mc->display_processor == nullptr && dp_fac_resume != NULL) {
+			auto factory = (xrt_dp_factory_d3d11_fn_t)dp_fac_resume;
 			xrt_result_t dp_ret = factory(
 			    sys->device.get(), sys->context.get(), mc->hwnd, &mc->display_processor);
 

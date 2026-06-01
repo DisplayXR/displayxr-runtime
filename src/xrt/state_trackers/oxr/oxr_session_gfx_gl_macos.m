@@ -17,6 +17,7 @@
 
 #include "util/u_misc.h"
 #include "util/u_logging.h"
+#include "util/comp_dp_factory.h"
 
 #include "xrt/xrt_instance.h"
 #include "xrt/xrt_config_have.h"
@@ -62,7 +63,9 @@ oxr_session_populate_gl_macos(struct oxr_logger *log,
 	    window_handle,        // NSView from cocoa_window_binding (or NULL for shared texture)
 	    next->cglContext,     // App's CGLContextObj for texture sharing
 	    NULL,                 // gl_display (not used on macOS)
-	    (sys->xsysc != NULL) ? sys->xsysc->info.dp_factory_gl : NULL,
+	    (sys->xsysc != NULL)
+	        ? comp_dp_factory_for_window(&sys->xsysc->info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_GL)
+	        : NULL,
 	    shared_iosurface,     // IOSurfaceRef for shared texture mode (or NULL for windowed)
 	    /*transparent_background*/ false,  // GL transparent present path is deferred (PR #3b §3b)
 	    /*chroma_key_color*/ 0,
