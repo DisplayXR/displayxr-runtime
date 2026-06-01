@@ -17,6 +17,7 @@
 #include "util/u_misc.h"
 #include "util/u_logging.h"
 #include "util/u_debug.h"
+#include "util/comp_dp_factory.h"
 
 #include "xrt/xrt_instance.h"
 #include "xrt/xrt_config_have.h"
@@ -86,7 +87,9 @@ oxr_session_populate_gl_native(struct oxr_logger *log,
 	struct xrt_compositor_native *xcn = NULL;
 
 	// Get GL display processor factory and display top-left from system compositor info
-	void *dp_factory_gl = (sys->xsysc != NULL) ? sys->xsysc->info.dp_factory_gl : NULL;
+	void *dp_factory_gl = (sys->xsysc != NULL)
+	    ? comp_dp_factory_for_window(&sys->xsysc->info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_GL)
+	    : NULL;
 	int32_t display_screen_left = (sys->xsysc != NULL) ? sys->xsysc->info.display_screen_left : 0;
 	int32_t display_screen_top = (sys->xsysc != NULL) ? sys->xsysc->info.display_screen_top : 0;
 

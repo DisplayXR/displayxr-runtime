@@ -22,6 +22,7 @@ set(tests
     tests_worker
     tests_pose
     tests_vec3_angle
+    tests_u_multi_display
 	)
 if(XRT_HAVE_D3D11)
 	list(APPEND tests tests_aux_d3d_d3d11 tests_comp_client_d3d11)
