@@ -25,15 +25,51 @@
         android:glEsVersion="0x00030002"
         android:required="false" />
 
+    <!--
+        CNSDK's face tracker uses the front-facing camera at runtime
+        (via libleiaSDK-faceTrackingInApp.so, loaded by the runtime
+        broker into this app's process). Without these declarations:
+          - CAMERA permission missing → camera open silently fails →
+            CNSDK never reports a face → all xrLocateViews calls use
+            the default centered eye position (no head tracking on
+            Lume Pad).
+          - uses-feature camera.front missing → Play Store filters
+            this app off devices that lack a front camera, AND
+            Android may not surface camera in the runtime permission
+            dialog.
+        Both required="false" so the same APK still installs on the
+        emulator (no camera hardware) — CNSDK is fine with no face.
+    -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.front" android:required="false" />
+
+    <!--
+        Long XR sessions don't generate user-input events; without
+        WAKE_LOCK the screen dims/sleeps and the session pauses.
+        FLAG_KEEP_SCREEN_ON would also work but requires the Activity
+        to set it programmatically — for a NativeActivity, easier to
+        request the permission and let the runtime keep the wake
+        lock for its session duration.
+    -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
     <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:allowBackup="false"
-        android:label="DisplayXR Cube VK"
-        android:hasCode="false">
+        android:label="DisplayXR Cube VK">
 
+        <!--
+            MainActivity is a thin Kotlin wrapper around NativeActivity
+            that requests CAMERA at onCreate so CNSDK's face tracker
+            can open the front camera at xrCreateSession. The
+            android.app.lib_name meta-data is still required so the
+            wrapper inherits the native lib load path from
+            NativeActivity.
+        -->
         <activity
-            android:name="android.app.NativeActivity"
+            android:name=".MainActivity"
             android:exported="true"
             android:configChanges="orientation|keyboardHidden|screenSize"
             android:launchMode="singleTask">
