@@ -2760,7 +2760,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	if (hwnd != NULL) {
 		// hwnd is an NSView* from cocoa_window_binding
 		xrt_result_t xret = comp_vk_native_window_macos_setup_external(
-		    hwnd, &c->macos_window);
+		    hwnd, transparent_background, &c->macos_window);
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to set up external view for VK native");
 			free(c);
@@ -2780,7 +2780,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		}
 		U_LOG_I("Creating self-owned macOS window (%ux%u)", win_w, win_h);
 		xrt_result_t xret = comp_vk_native_window_macos_create(
-		    win_w, win_h, &c->macos_window);
+		    win_w, win_h, transparent_background, &c->macos_window);
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to create self-owned macOS window");
 			free(c);

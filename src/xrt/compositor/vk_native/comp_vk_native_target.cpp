@@ -214,15 +214,33 @@ create_swapchain(struct comp_vk_native_target *target)
 	// visible without spamming per-frame.
 	VkCompositeAlphaFlagBitsKHR composite_alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
 	if (target->transparent_background) {
+		U_LOG_I("VK target: transparent_background requested, supportedCompositeAlpha=0x%x",
+		        (unsigned)caps.supportedCompositeAlpha);
 		if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR) {
 			composite_alpha = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
 			U_LOG_I("VK target: transparent_background using PRE_MULTIPLIED");
+#if defined(XRT_OS_MACOS)
+		} else if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR) {
+			// MoltenVK does not expose PRE_MULTIPLIED, but it honors
+			// POST_MULTIPLIED by forcing CAMetalLayer.opaque = NO. It does
+			// not premultiply/un-premultiply — Core Animation always
+			// composites premultiplied bytes, and our content is already
+			// premultiplied (renderer emits alpha = 1 - T premultiplied), so
+			// the present is correct. This is more reliable than INHERIT,
+			// which depends on the app's CAMetalLayer.opaque state surviving
+			// AppKit's layer-backed-view sync. macOS-only on purpose: on
+			// Win32 ICDs POST_MULTIPLIED would mean straight alpha and break
+			// the (premultiplied) content — Windows uses the DComp bridge or
+			// PRE_MULTIPLIED instead.
+			composite_alpha = VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
+			U_LOG_I("VK target: transparent_background using POST_MULTIPLIED (macOS/MoltenVK)");
+#endif
 		} else if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) {
 			composite_alpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
 			U_LOG_I("VK target: transparent_background using INHERIT (PRE_MULTIPLIED unavailable)");
 		} else {
-			U_LOG_W("VK target: transparent_background requested but neither PRE_MULTIPLIED nor "
-			        "INHERIT compositeAlpha is supported (caps=0x%x); falling back to OPAQUE — "
+			U_LOG_W("VK target: transparent_background requested but no transparent "
+			        "compositeAlpha is supported (caps=0x%x); falling back to OPAQUE — "
 			        "alpha will be dropped at WSI present",
 			        (unsigned)caps.supportedCompositeAlpha);
 		}
