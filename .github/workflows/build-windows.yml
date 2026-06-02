@@ -272,14 +272,47 @@ jobs:
           try {
             & $cli selftest
             $code = $LASTEXITCODE
+
+            # Phase 3a (#387): exercise the per-display claim/resolution path.
+            # `selftest` uses target_instance_no_comp, which does NOT build the
+            # registry; `displays --claims` loads the plug-in(s), enumerates EDID,
+            # and runs target_plugin_resolve_displays. With sim-display registered
+            # it claims every enumerated monitor at FALLBACK, so every monitor must
+            # resolve → claimed_count == monitor_count (trivially 0 == 0 on a
+            # headless runner with no EDID monitors; non-trivial on a real panel).
+            # Robust JSON extraction: drop stderr logs, slice first '{'..last '}'.
+            if ($code -eq 0) {
+              $raw = (& $cli displays --claims --json 2>$null | Out-String)
+              $claimsCode = $LASTEXITCODE
+              if ($claimsCode -ne 0) {
+                Write-Host "::error::displayxr-cli displays --claims exited $claimsCode."
+                $code = $claimsCode
+              } else {
+                $s = $raw.IndexOf('{'); $e = $raw.LastIndexOf('}')
+                if ($s -lt 0 -or $e -le $s) {
+                  Write-Host "::error::displays --claims emitted no JSON object. Output: $raw"
+                  $code = 1
+                } else {
+                  $obj = $raw.Substring($s, $e - $s + 1) | ConvertFrom-Json
+                  $mon = [int]$obj.monitor_count
+                  $clm = [int]$obj.claimed_count
+                  if ($clm -ne $mon) {
+                    Write-Host "::error::displays --claims: only $clm/$mon monitor(s) resolved to a plug-in — sim-display must claim every monitor (FALLBACK). Registry resolution path regression (#387/#69)."
+                    $code = 1
+                  } else {
+                    Write-Host "PASS: displays --claims resolved $clm/$mon monitor(s) (registry resolution path)."
+                  }
+                }
+              }
+            }
           } finally {
             reg delete $key /f | Out-Null
           }
           if ($code -ne 0) {
-            Write-Host "::error::displayxr-cli selftest failed (exit $code) — the runtime could not discover a display processor or the display info it reported was invalid. See the selftest output above."
+            Write-Host "::error::displayxr-cli headless gate failed (exit $code) — the runtime could not discover a display processor, reported invalid display info, or the per-display claim resolution was inconsistent. See the output above."
             exit $code
           }
-          Write-Host "PASS: headless self-test succeeded — display processor discovered and display info valid."
+          Write-Host "PASS: headless self-test + per-display claim resolution succeeded."
 
       - name: Build Installer
         if: needs.DetectChanges.outputs.docs_only != 'true'
