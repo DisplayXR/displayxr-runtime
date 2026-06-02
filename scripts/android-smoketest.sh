@@ -156,7 +156,11 @@ smoke_test() {
     "$ADB" shell setprop debug.dxr.hw.verbose 1 > /dev/null
     "$ADB" shell am force-stop "$TEST_PKG" > /dev/null
     "$ADB" logcat -c
-    "$ADB" shell am start -n "$TEST_PKG/android.app.NativeActivity" > /dev/null
+    # Launch via the LAUNCHER intent rather than a hard-coded activity class:
+    # the test app's entry point is a Kotlin .MainActivity wrapper (it requests
+    # CAMERA before handing off to NativeActivity), and the class name has moved
+    # before. Resolving the launcher activity keeps this rename-proof.
+    "$ADB" shell monkey -p "$TEST_PKG" -c android.intent.category.LAUNCHER 1 > /dev/null
 
     echo "[smoketest] watching logcat for sentinel (timeout ${SMOKE_TIMEOUT}s)"
     local end=$(( $(date +%s) + SMOKE_TIMEOUT ))
