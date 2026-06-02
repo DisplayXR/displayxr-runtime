@@ -61,3 +61,35 @@ bool SubmitWindowSpaceHudFrame(
     float disparity,
     int32_t srcX = 0, int32_t srcY = 0,
     int32_t srcW = -1, int32_t srcH = -1);
+
+/*!
+ * Placement for one window-space layer in a multi-layer submission.
+ * `x` / `y` / `width` / `height` are fractions of the window; `disparity` is a
+ * horizontal per-eye shift in fractions of window width (0 = screen depth).
+ * `srcW` / `srcH` < 0 mean "use the full swapchain image".
+ */
+struct WindowSpaceLayerDesc {
+    const XrHudSwapchain* sc = nullptr;
+    float x = 0.0f, y = 0.0f, width = 0.0f, height = 0.0f;
+    float disparity = 0.0f;
+    int32_t srcX = 0, srcY = 0, srcW = -1, srcH = -1;
+};
+
+/*!
+ * Submit one frame with a projection layer plus N XR_EXT_window_space_layer
+ * layers stacked on top (projection first, then layers[0..count-1] in order).
+ * Each layer honors its own x/y/width/height/disparity. This is the
+ * multi-layer generalization of SubmitWindowSpaceHudFrame() used by the
+ * windowspace_handle_* test apps to exercise issue #389.
+ *
+ * Layers whose swapchain is XR_NULL_HANDLE are skipped.
+ */
+bool SubmitWindowSpaceLayersFrame(
+    XrSession session,
+    XrSpace localSpace,
+    XrTime displayTime,
+    XrEnvironmentBlendMode envBlendMode,
+    const XrCompositionLayerProjectionView* projViews,
+    uint32_t viewCount,
+    const WindowSpaceLayerDesc* layers,
+    uint32_t count);

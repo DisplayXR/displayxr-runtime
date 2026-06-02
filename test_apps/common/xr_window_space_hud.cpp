@@ -123,3 +123,65 @@ bool SubmitWindowSpaceHudFrame(
 
     return XR_SUCCEEDED(xrEndFrame(session, &endInfo));
 }
+
+bool SubmitWindowSpaceLayersFrame(
+    XrSession session,
+    XrSpace localSpace,
+    XrTime displayTime,
+    XrEnvironmentBlendMode envBlendMode,
+    const XrCompositionLayerProjectionView* projViews,
+    uint32_t viewCount,
+    const WindowSpaceLayerDesc* layers,
+    uint32_t count)
+{
+    XrCompositionLayerProjection projLayer = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+    projLayer.space = localSpace;
+    projLayer.viewCount = viewCount;
+    projLayer.views = projViews;
+
+    // Storage must outlive the xrEndFrame call — the runtime reads these
+    // structs by pointer during submission.
+    std::vector<XrCompositionLayerWindowSpaceEXT> wsLayers;
+    wsLayers.reserve(count);
+    std::vector<const XrCompositionLayerBaseHeader*> headers;
+    headers.reserve(count + 1);
+    headers.push_back((const XrCompositionLayerBaseHeader*)&projLayer);
+
+    for (uint32_t i = 0; i < count; i++) {
+        const WindowSpaceLayerDesc& d = layers[i];
+        if (d.sc == nullptr || d.sc->swapchain == XR_NULL_HANDLE) {
+            continue;
+        }
+        int32_t srcW = (d.srcW < 0) ? (int32_t)d.sc->width : d.srcW;
+        int32_t srcH = (d.srcH < 0) ? (int32_t)d.sc->height : d.srcH;
+
+        XrCompositionLayerWindowSpaceEXT layer = {};
+        layer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT;
+        layer.next = nullptr;
+        layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+        layer.subImage.swapchain = d.sc->swapchain;
+        layer.subImage.imageRect.offset = { d.srcX, d.srcY };
+        layer.subImage.imageRect.extent = { srcW, srcH };
+        layer.subImage.imageArrayIndex = 0;
+        layer.x = d.x;
+        layer.y = d.y;
+        layer.width = d.width;
+        layer.height = d.height;
+        layer.disparity = d.disparity;
+
+        wsLayers.push_back(layer);
+    }
+    // Append header pointers after the vector is fully populated so a
+    // reallocation during push_back can't leave dangling pointers.
+    for (const auto& l : wsLayers) {
+        headers.push_back((const XrCompositionLayerBaseHeader*)&l);
+    }
+
+    XrFrameEndInfo endInfo = { XR_TYPE_FRAME_END_INFO };
+    endInfo.displayTime = displayTime;
+    endInfo.environmentBlendMode = envBlendMode;
+    endInfo.layerCount = (uint32_t)headers.size();
+    endInfo.layers = headers.data();
+
+    return XR_SUCCEEDED(xrEndFrame(session, &endInfo));
+}

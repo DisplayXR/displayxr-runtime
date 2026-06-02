@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "name": "Window-Space Layers (Vulkan, Handle)",
+  "type": "3d",
+  "category": "test",
+  "display_mode": "auto",
+  "description": "Submits N XR_CompositionLayerWindowSpaceEXT layers (no 3D scene) to verify #389 on Vulkan.",
+  "icon": "icon.png",
+  "icon_3d": "icon_sbs.png",
+  "icon_3d_layout": "sbs-lr"
+}
