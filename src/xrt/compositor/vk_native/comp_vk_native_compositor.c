@@ -2981,6 +2981,11 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		return xret;
 	}
 
+	// Clear the atlas transparent (alpha=0) instead of opaque black when a
+	// transparent background was requested, so app alpha<1 regions survive
+	// to the present (issue #392). Mirrors the DP weave-clear plumbing above.
+	comp_vk_native_renderer_set_transparent(c->renderer, transparent_background);
+
 	// Set tile layout from active rendering mode
 	if (c->xdev != NULL && c->xdev->hmd != NULL) {
 		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;

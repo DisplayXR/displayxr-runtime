@@ -59,6 +59,10 @@ struct sim_display_processor
 	float nominal_x_m;
 	float nominal_y_m;
 	float nominal_z_m;
+
+	//! When true, the app requested a transparent background — clear the
+	//! weave target to alpha=0 so alpha<1 regions stay see-through.
+	bool transparent_bg;
 };
 
 static inline struct sim_display_processor *
@@ -147,8 +151,10 @@ sim_dp_process_atlas(struct xrt_display_processor *xdp,
 
 	vk->vkUpdateDescriptorSets(vk->device, 1, &write, 0, NULL);
 
-	// Begin render pass
-	VkClearValue clear_value = {.color = {{0.0f, 0.0f, 0.0f, 1.0f}}};
+	// Begin render pass. Clear to alpha=0 when a transparent background was
+	// requested so any region the weave doesn't fully overwrite stays
+	// see-through instead of opaque black (issue #392).
+	VkClearValue clear_value = {.color = {{0.0f, 0.0f, 0.0f, sdp->transparent_bg ? 0.0f : 1.0f}}};
 	VkRenderPassBeginInfo rp_begin = {
 	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
 	    .renderPass = sdp->render_pass,
@@ -583,10 +589,11 @@ sim_dp_set_chroma_key(struct xrt_display_processor *xdp,
                       uint32_t key_color,
                       bool transparent_bg_enabled)
 {
-	(void)xdp;
 	(void)key_color;
-	(void)transparent_bg_enabled;
-	// Alpha-native — no chroma-key fill/strip required.
+	// Alpha-native — no chroma-key fill/strip required. We do honor the
+	// transparent-background bit so the weave render-pass clears the target
+	// to alpha=0 instead of opaque black (issue #392).
+	sim_display_processor(xdp)->transparent_bg = transparent_bg_enabled;
 }
 
 
