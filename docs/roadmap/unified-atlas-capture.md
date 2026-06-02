@@ -214,17 +214,59 @@ What collapses once apps call `xrCaptureAtlasEXT` + a ~10-line key handler.
   `atlas_capture_vk.cpp` (identical fork).
 - Replace the call site in `windows/main.cpp`.
 
-**`unity-3d-display`**:
-- DELETE / gut `native~/displayxr_readback.{cpp,h}` (the `AsyncGPUReadback`
-  path) and the readback half of `Runtime/DisplayXRScreenshot.cs`. The C# entry
-  point `DisplayXRScreenshot.Capture()` becomes a P/Invoke to `xrCaptureAtlasEXT`
-  via the plugin's existing extension-function dispatch. The flash overlay stays.
+**`unity-3d-display`** (see "Engine-plugin specifics" below — the engine case is
+materially different from native apps):
+- GUT the readback in `Runtime/DisplayXRScreenshot.cs` — for a **live OpenXR
+  session**, `BeginCapture` (`AsyncGPUReadback` + PNG encode) and the entire
+  on-demand re-render path (`CaptureOnDemand`, the hidden `s_CaptureCam` rig,
+  `GetStereoMatrices`, `FlipViewZ`) are replaced by a P/Invoke to
+  `xrCaptureAtlasEXT` via the plugin's existing extension dispatch. This deletes
+  the most fragile code in the file (manual Kooima re-render of L/R views).
+- KEEP: the flash overlay (`DisplayXRFlashOverlay`, `_DrawFlashGL`), filename
+  numbering (`NextSequenceNumber`), and the `I`-key binding (which lives in the
+  **sample** `Samples~/.../DisplayXRInputController.cs`, mirrored into the three
+  `displayxr-unity-test*` repos — repoint, don't delete).
+- DO **NOT** touch `native~/displayxr_readback.{cpp,h}` — that is the macOS
+  **offscreen-preview** readback buffer, unrelated to screenshots. (My first
+  draft wrongly listed it.)
+- OUT OF SCOPE: the **editor preview-session** capture path (`_OnAtlasReady`,
+  gated on `displayxr_standalone_is_running()`). That path renders in-editor
+  **without a DisplayXR OpenXR runtime session**, so there is no runtime
+  compositor to call `xrCaptureAtlasEXT` on. It keeps its own atlas-RT readback
+  (or we accept no capture in pure-editor preview).
 
-**`displayxr-unreal`** — `Source/DisplayXRCore/Private/` **and**
-`Packages/DisplayXR_5.7/Source/DisplayXRCore/Private/` (two copies):
-- DELETE the RHI `ReadSurfaceData` body of `DisplayXRAtlasCapture.cpp`; keep the
-  `I` key / `DisplayXR.CaptureAtlas` console / Blueprint wrappers, repointed at
-  `xrCaptureAtlasEXT`. The Win32 flash overlay stays.
+**`displayxr-unreal`** — canonical source is
+`Source/DisplayXRCore/Private/DisplayXRAtlasCapture.{cpp,h}`. The identical copy
+under `Packages/DisplayXR_5.7/Source/...` is the **packaged/zipped distributable**
+plugin (regenerated from `Source/`, also present as `DisplayXR_5.7.zip`) — don't
+hand-edit it; it falls out when `Source/` is repackaged.
+- DELETE the RHI `ReadSurfaceData` body of `ProcessRequest_RenderThread` and the
+  render-thread plumbing that feeds it the engine atlas RT. Keep `RequestCapture`
+  (the arm), the `I` key / `DisplayXR.CaptureAtlas` console / Blueprint wrappers,
+  the `NextSequenceNumber`/`MakeOutputPath` naming, and the Win32 flash overlay —
+  all repointed at `xrCaptureAtlasEXT`.
+
+### Engine-plugin specifics (Unity + Unreal)
+
+The engines differ from native test apps in three ways the migration must respect:
+
+1. **They capture an engine-side atlas RT, not the OpenXR swapchain.** Unity's
+   `CaptureOnDemand` re-renders the rig; Unreal's `ProcessRequest_RenderThread`
+   reads the engine's composed `AtlasSrc` on the render thread. Both read
+   **synchronously, this frame**. `xrCaptureAtlasEXT` instead captures what the
+   engine *submitted* to the runtime — equivalent pixels (`PROJECTION_ONLY` ==
+   the submitted projection atlas), but captured on the **next composed frame**
+   via the blocking handler. For a manual keypress this is invisible; a future
+   per-frame/recording use would need the async variant (see open questions).
+2. **They must opt into the extension.** The DisplayXR Unity `OpenXRFeature` and
+   the Unreal `IOpenXRExtensionPlugin` have to add `XR_EXT_atlas_capture` to
+   their requested-extensions list at instance creation and resolve
+   `xrCaptureAtlasEXT` through their existing `xrGetInstanceProcAddr` dispatch —
+   the same path they already use for `XR_EXT_display_info` / window binding.
+3. **Net effect is a simplification, not just a move.** Both lose their riskiest
+   code (Unity's hidden-camera Kooima re-render; Unreal's render-thread surface
+   readback) and gain the ability to capture the true post-compose atlas, which
+   neither can do today.
 
 **`displayxr-shell-pvt`**:
 - No deletion required. The shell keeps `xrCaptureWorkspaceFrameEXT` (privileged
