@@ -70,6 +70,7 @@ static void
 create_window_on_main_thread(struct comp_vk_native_window_macos *win,
                               uint32_t width,
                               uint32_t height,
+                              bool transparent_background,
                               bool *out_success)
 {
 	ensure_ns_app();
@@ -103,6 +104,15 @@ create_window_on_main_thread(struct comp_vk_native_window_macos *win,
 	win->metal_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
 	win->metal_layer.framebufferOnly = NO;
 
+	if (transparent_background) {
+		// Non-opaque window + layer so the desktop shows through alpha < 1
+		// regions of the composited output. Mirrors comp_metal_compositor.m.
+		[win->window setOpaque:NO];
+		[win->window setBackgroundColor:[NSColor clearColor]];
+		win->metal_layer.opaque = NO;
+		U_LOG_I("VK native macOS: transparent background — NSWindow + CAMetalLayer set isOpaque=NO");
+	}
+
 	CGFloat scale = win->window.backingScaleFactor;
 	win->metal_layer.contentsScale = scale;
 	win->metal_layer.drawableSize = CGSizeMake(width * scale, height * scale);
@@ -126,6 +136,7 @@ create_window_on_main_thread(struct comp_vk_native_window_macos *win,
 xrt_result_t
 comp_vk_native_window_macos_create(uint32_t width,
                                     uint32_t height,
+                                    bool transparent_background,
                                     struct comp_vk_native_window_macos **out_win)
 {
 	struct comp_vk_native_window_macos *win = U_TYPED_CALLOC(struct comp_vk_native_window_macos);
@@ -135,10 +146,10 @@ comp_vk_native_window_macos_create(uint32_t width,
 
 	__block bool success = false;
 	if ([NSThread isMainThread]) {
-		create_window_on_main_thread(win, width, height, &success);
+		create_window_on_main_thread(win, width, height, transparent_background, &success);
 	} else {
 		dispatch_sync(dispatch_get_main_queue(), ^{
-			create_window_on_main_thread(win, width, height, &success);
+			create_window_on_main_thread(win, width, height, transparent_background, &success);
 		});
 	}
 
@@ -154,6 +165,7 @@ comp_vk_native_window_macos_create(uint32_t width,
 
 xrt_result_t
 comp_vk_native_window_macos_setup_external(void *ns_view,
+                                            bool transparent_background,
                                             struct comp_vk_native_window_macos **out_win)
 {
 	if (ns_view == NULL) {
@@ -193,6 +205,21 @@ comp_vk_native_window_macos_setup_external(void *ns_view,
 			scale = [NSScreen mainScreen].backingScaleFactor;
 		}
 		win->metal_layer.contentsScale = scale;
+
+		if (transparent_background) {
+			// Enforce non-opaque on the app's layer + window right before
+			// VkSurface creation. A layer-backed NSView lets AppKit sync the
+			// backing layer's `opaque` to the view's state, so an opaque=NO set
+			// by the app at makeBackingLayer time may have been reverted by now.
+			// Setting it here (and on the host window) guarantees the desktop
+			// shows through alpha < 1 regions for the INHERIT compositeAlpha path.
+			win->metal_layer.opaque = NO;
+			if (view.window != nil) {
+				[view.window setOpaque:NO];
+				[view.window setBackgroundColor:[NSColor clearColor]];
+			}
+			U_LOG_I("VK native macOS (external view): transparent background — CAMetalLayer set isOpaque=NO");
+		}
 	};
 
 	if ([NSThread isMainThread]) {

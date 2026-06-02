@@ -28,8 +28,11 @@ struct comp_vk_native_window_macos;
 /*!
  * Create a self-owned NSWindow with a CAMetalLayer-backed view.
  *
- * @param width   Requested window width in points.
- * @param height  Requested window height in points.
+ * @param width                 Requested window width in points.
+ * @param height                Requested window height in points.
+ * @param transparent_background When true, the NSWindow + CAMetalLayer are
+ *                              configured non-opaque (clear background) so the
+ *                              desktop shows through alpha < 1 regions.
  * @param out_win Pointer to receive the created window handle.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
@@ -37,6 +40,7 @@ struct comp_vk_native_window_macos;
 xrt_result_t
 comp_vk_native_window_macos_create(uint32_t width,
                                     uint32_t height,
+                                    bool transparent_background,
                                     struct comp_vk_native_window_macos **out_win);
 
 /*!
@@ -46,12 +50,18 @@ comp_vk_native_window_macos_create(uint32_t width,
  * Otherwise, a CAMetalLayer is added as a sublayer.
  *
  * @param ns_view  The app's NSView (as void*).
+ * @param transparent_background When true, force the CAMetalLayer non-opaque
+ *                              so the desktop shows through alpha < 1 regions.
+ *                              Enforced runtime-side (not relying on the app's
+ *                              layer.opaque, which AppKit may reset on a
+ *                              layer-backed view) right before VkSurface creation.
  * @param out_win  Pointer to receive the window handle.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
  */
 xrt_result_t
 comp_vk_native_window_macos_setup_external(void *ns_view,
+                                            bool transparent_background,
                                             struct comp_vk_native_window_macos **out_win);
 
 /*!
