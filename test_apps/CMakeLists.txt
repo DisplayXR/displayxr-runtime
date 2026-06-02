@@ -40,6 +40,12 @@ if(OpenXR_FOUND OR DEFINED OpenXR_ROOT)
     add_subdirectory(cube_hosted_legacy_vk_win)
     add_subdirectory(cube_hosted_legacy_gl_win)
     add_subdirectory(workspace_minimal_d3d11_win)
+    # Window-space layer test apps (#389): submit N XrCompositionLayerWindowSpaceEXT
+    # layers, no 3D scene, to verify the multi-layer flicker/drop fix per API.
+    add_subdirectory(windowspace_handle_d3d11_win)
+    add_subdirectory(windowspace_handle_d3d12_win)
+    add_subdirectory(windowspace_handle_vk_win)
+    add_subdirectory(windowspace_handle_gl_win)
 else()
     message(STATUS "OpenXR not found, skipping OpenXR test apps")
     message(STATUS "To build them, set OpenXR_ROOT or install OpenXR SDK")

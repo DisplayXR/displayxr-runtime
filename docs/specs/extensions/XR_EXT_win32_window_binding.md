@@ -260,6 +260,27 @@ typedef struct XrCompositionLayerWindowSpaceEXT {
 
 **Use cases:** HUD overlays, debug text, UI panels, health bars, crosshairs — anything that should be anchored to the window rather than to 3D space.
 
+**Layering guidance — one layer per independent depth plane.** The reason to put UI on a
+*separate* window-space layer is to give it its own `disparity` (depth). Use **one layer per
+independently-depthed surface**, not one layer per widget:
+
+- **Static 2D UI at the zero-disparity plane (ZDP)** — a toolbar, a status bar, a cluster of
+  co-planar controls — should be composited by the app into a **single** window-space layer
+  (`disparity = 0.0`). Multiple controls that share a depth do **not** need multiple layers.
+- **Add a layer only when a surface needs a distinct depth** — e.g. a panel popped toward the
+  viewer, a floating popup, or a control that animates in depth. Then each such surface gets its
+  own layer with its own `disparity`.
+
+This keeps layer counts small (typically single digits). The runtime advertises a large layer
+budget (`XrSystemGraphicsProperties::maxLayerCount`, `XRT_MAX_LAYERS`) and supports many
+window-space layers, but small per-depth-plane counts are the idiomatic pattern and the cheapest
+(each layer is an app-owned swapchain the app must render every frame).
+
+> Note: putting every control on its own layer is **not** required for input/hit-testing. A
+> window-bound (handle/texture) app owns its real `HWND` and receives mouse events directly;
+> mapping window coordinates to UI element rects is done app-side regardless of how many layers
+> are submitted. Collapsing co-planar UI to one layer does not complicate hit-testing.
+
 ### 3.4 Internal Types
 
 These are internal runtime types that implement the extension. They are not part of the OpenXR API surface but are documented here for runtime developers.

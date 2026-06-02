@@ -27,8 +27,14 @@
 extern "C" {
 #endif
 
-#define VK_HUD_BLEND_MAX_FBS    8 //!< Cached framebuffers (per swapchain image).
-#define VK_HUD_BLEND_MAX_IMAGES 8 //!< Cached HUD source images (descriptor sets).
+// Each window-space layer is its own OpenXR swapchain, and swapchains rotate
+// through ~3 images; the image cache is keyed by VkImage and never evicts. So
+// the bound must cover (max concurrent window-space layers) × (images/swapchain),
+// not just the 1-2 layers an undersized cache happened to allow. 64 ≈ 21 layers ×
+// 3 images — generous headroom for realistic per-depth-plane 2D UI (see issue #389
+// and the layering guidance in docs/specs/extensions/XR_EXT_win32_window_binding.md).
+#define VK_HUD_BLEND_MAX_FBS    64 //!< Cached framebuffers (per swapchain image).
+#define VK_HUD_BLEND_MAX_IMAGES 64 //!< Cached HUD source images (descriptor sets).
 
 /*!
  * Vulkan resources for alpha-blended HUD overlay.
