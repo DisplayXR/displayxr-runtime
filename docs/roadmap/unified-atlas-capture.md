@@ -2,7 +2,7 @@
 status: Proposal
 owner: David Fattal
 updated: 2026-06-02
-issues: []
+issues: [396]
 code-paths:
   - src/xrt/state_trackers/oxr/oxr_workspace.c
   - src/xrt/auxiliary/util/u_capture_intent.h
@@ -11,7 +11,7 @@ code-paths:
 ---
 
 > **Status: Proposal** — not yet implemented. Promote the "Decision" section to
-> an ADR (next free number) once accepted.
+> an ADR (next free number) once accepted. Tracked as **W6 of [#396](https://github.com/DisplayXR/displayxr-runtime/issues/396)**.
 
 # Unified Atlas Capture API
 
