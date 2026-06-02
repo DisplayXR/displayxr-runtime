@@ -142,6 +142,20 @@ build_plugin_and_install_jnilibs() {
     echo "[smoketest] building plug-in + installing transitive jniLibs"
     (
         cd "$PLUGIN_DIR"
+        # Honor PLUGIN_BRANCH (documented in the header): check it out before
+        # building so the smoke test builds a known plug-in revision. Requires a
+        # clean plug-in working tree; abort loudly rather than build a stale tip.
+        if [[ -n "${PLUGIN_BRANCH:-}" ]]; then
+            if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+                echo "ERROR: PLUGIN_BRANCH set but $PLUGIN_DIR has uncommitted changes" >&2
+                exit 3
+            fi
+            echo "[smoketest] checking out plug-in branch: $PLUGIN_BRANCH"
+            git checkout "$PLUGIN_BRANCH" >/dev/null 2>&1 || {
+                echo "ERROR: failed to check out plug-in branch '$PLUGIN_BRANCH'" >&2
+                exit 3
+            }
+        fi
         CNSDK_ROOT="$CNSDK_ROOT" \
         DXR_RUNTIME_SOURCE_DIR="$RUNTIME_ROOT" \
         bash scripts/build-android.sh install-runtime-jnilibs
