@@ -29,6 +29,7 @@ void main()
 	vec4 right = texture(atlas_tex, right_uv);
 
 	// Red-cyan anaglyph: red channel from left eye,
-	// green+blue channels from right eye.
-	out_color = vec4(left.r, right.g, right.b, 1.0);
+	// green+blue channels from right eye. Preserve alpha (max of both eyes)
+	// so transparent-background regions survive the anaglyph mix (issue #392).
+	out_color = vec4(left.r, right.g, right.b, max(left.a, right.a));
 }

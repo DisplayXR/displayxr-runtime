@@ -71,6 +71,10 @@ struct comp_vk_native_renderer
 
 	//! Format of the atlas texture.
 	VkFormat format;
+
+	//! When true, clear the atlas to alpha=0 (transparent) instead of
+	//! opaque black, so app alpha<1 regions survive to the present (issue #392).
+	bool transparent_background;
 };
 
 static void
@@ -330,8 +334,9 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 	                   VK_PIPELINE_STAGE_TRANSFER_BIT);
 
-	// Clear atlas texture to black
-	VkClearColorValue clear_color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+	// Clear atlas texture to black. Use alpha=0 in transparent-background mode
+	// so atlas regions not overwritten by a tile blit stay see-through (issue #392).
+	VkClearColorValue clear_color = {{0.0f, 0.0f, 0.0f, r->transparent_background ? 0.0f : 1.0f}};
 	VkImageSubresourceRange range = {
 	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 	    .baseMipLevel = 0,
@@ -688,4 +693,10 @@ uint64_t
 comp_vk_native_renderer_get_cmd_pool(struct comp_vk_native_renderer *r)
 {
 	return (uint64_t)(uintptr_t)r->cmd_pool;
+}
+
+void
+comp_vk_native_renderer_set_transparent(struct comp_vk_native_renderer *r, bool transparent_background)
+{
+	r->transparent_background = transparent_background;
 }

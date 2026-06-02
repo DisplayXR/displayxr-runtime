@@ -238,6 +238,19 @@ comp_vk_native_renderer_set_tile_layout(struct comp_vk_native_renderer *renderer
 uint64_t
 comp_vk_native_renderer_get_cmd_pool(struct comp_vk_native_renderer *renderer);
 
+/*!
+ * Set whether the atlas should be cleared transparent (alpha=0) instead of
+ * opaque black. Used for the transparent-background present path (issue #392).
+ *
+ * @param renderer The renderer.
+ * @param transparent_background True to clear the atlas to alpha=0.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_renderer_set_transparent(struct comp_vk_native_renderer *renderer,
+                                         bool transparent_background);
+
 #ifdef __cplusplus
 }
 #endif

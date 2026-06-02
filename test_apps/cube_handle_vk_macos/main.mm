@@ -1379,8 +1379,16 @@ static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &beginInfo);
 
+    // Transparent-background mode (DISPLAYXR_TRANSPARENT_BG=1) clears RGBA(0,0,0,0)
+    // so the desktop shows through everywhere the cube isn't drawn. Pairs with
+    // XrCocoaWindowBindingCreateInfoEXT.transparentBackgroundEnabled = XR_TRUE.
+    static const bool transparent_bg = []() {
+        const char *e = getenv("DISPLAYXR_TRANSPARENT_BG");
+        return e != nullptr && *e != '\0' && *e != '0';
+    }();
     VkClearValue clearValues[2] = {};
-    clearValues[0].color = {{0.05f, 0.05f, 0.1f, 1.0f}};
+    clearValues[0].color = transparent_bg ? VkClearColorValue{{0.0f, 0.0f, 0.0f, 0.0f}}
+                                          : VkClearColorValue{{0.05f, 0.05f, 0.1f, 1.0f}};
     clearValues[1].depthStencil = {1.0f, 0};
 
     VkRenderPassBeginInfo rpBegin = {};
@@ -2213,6 +2221,22 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     macosBinding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT;
     macosBinding.next = nullptr;
     macosBinding.viewHandle = (__bridge void *)g_metalView;
+
+    // Optional transparent-background mode (spec v5). Pairs with the
+    // RGBA(0,0,0,0) clear above so alpha<1 regions show the desktop.
+    {
+        const char *e = getenv("DISPLAYXR_TRANSPARENT_BG");
+        if (e != nullptr && *e != '\0' && *e != '0') {
+            macosBinding.transparentBackgroundEnabled = XR_TRUE;
+            // Make our app-owned NSWindow non-opaque too — the runtime configures
+            // the CAMetalLayer it presents into, but the NSWindow alpha is ours.
+            if (g_window != nil) {
+                [g_window setOpaque:NO];
+                [g_window setBackgroundColor:[NSColor clearColor]];
+            }
+            LOG_INFO("Transparent background ENABLED (DISPLAYXR_TRANSPARENT_BG=1)");
+        }
+    }
 
     // Chain: sessionInfo -> vkBinding -> macosBinding
     if (xr.hasCocoaWindowBinding) {
