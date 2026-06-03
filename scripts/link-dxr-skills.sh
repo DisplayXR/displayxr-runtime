@@ -33,7 +33,7 @@ USER_SKILLS="$HOME/.claude/skills"
 # Skills to expose globally. Add a name here when a new hub-driven skill
 # lands in .claude/skills/. (The runtime's own /release is NOT listed —
 # it's only meaningful inside this repo, so it stays repo-scoped.)
-SKILLS=(dxr-release installer-release)
+SKILLS=(dxr-release installer-release sync-website)
 
 MODE="${1:-link}"
 
@@ -100,6 +100,6 @@ for name in "${SKILLS[@]}"; do
 done
 
 if [ "$MODE" = "link" ]; then
-    printf '\nDone. /dxr-release and /installer-release are now invocable from any directory.\n'
+    printf '\nDone. /dxr-release, /installer-release, and /sync-website are now invocable from any directory.\n'
     printf 'Canonical copies stay git-tracked in %s — edit there, never the symlink target.\n' "$SKILLS_SRC"
 fi
