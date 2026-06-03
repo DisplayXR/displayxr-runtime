@@ -672,6 +672,35 @@ oxr_mcp_tools_set_capture_handler(oxr_mcp_capture_fn fn, void *userdata)
 	pthread_mutex_unlock(&g_capture_lock);
 }
 
+bool
+oxr_mcp_tools_submit_capture(const char *path, uint32_t mode)
+{
+	if (path == NULL) {
+		return false;
+	}
+
+	// Latch directly onto the installed compositor request (the same one the
+	// trigger files and the MCP tool feed). We deliberately do NOT call the
+	// blocking handler: this runs on the app's xrEndFrame thread, which also
+	// drives the in-process compositor's layer_commit poll, so blocking here
+	// would deadlock. mcp_capture_get_installed() is the library's sanctioned
+	// "submit directly to the compositor handler" accessor.
+	struct mcp_capture_request *req = mcp_capture_get_installed();
+	if (req == NULL) {
+		return false;
+	}
+
+	pthread_mutex_lock(&req->lock);
+	strncpy(req->path, path, MCP_CAPTURE_PATH_MAX - 1);
+	req->path[MCP_CAPTURE_PATH_MAX - 1] = '\0';
+	req->mode = mode;
+	req->pending = true;
+	req->done = false;
+	req->success = false;
+	pthread_mutex_unlock(&req->lock);
+	return true;
+}
+
 static cJSON *
 tool_capture_frame(const cJSON *params, void *userdata)
 {
