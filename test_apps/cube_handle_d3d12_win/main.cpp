@@ -539,28 +539,8 @@ static void RenderThreadFunc(
                                     std::lock_guard<std::mutex> lk(g_inputMutex);
                                     g_inputState.captureAtlasRequested = false;
                                 }
-                                if (!monoMode && (tileColumns > 1 || tileRows > 1)) {
-                                    uint32_t atlasW = tileColumns * renderW;
-                                    uint32_t atlasH = tileRows * renderH;
-                                    if (atlasW <= xr->swapchain.width && atlasH <= xr->swapchain.height) {
-                                        std::string outPath = dxr_capture::MakeCapturePath(
-                                            APP_NAME, tileColumns, tileRows);
-                                        bool ok = dxr_capture::CaptureAtlasRegionD3D12(
-                                            renderer->device.Get(),
-                                            renderer->commandQueue.Get(),
-                                            swapchainTexture,
-                                            xr->swapchain.width, xr->swapchain.height,
-                                            (int)D3D12_RESOURCE_STATE_COMMON,
-                                            0, 0, atlasW, atlasH, outPath);
-                                        if (ok) {
-                                            LOG_INFO("Captured atlas %ux%u -> %s",
-                                                     atlasW, atlasH, outPath.c_str());
-                                            dxr_capture::PostFlashRequest(hwnd);
-                                        }
-                                    }
-                                } else {
-                                    LOG_INFO("Capture skipped: need 3D mode with cols/rows > 1");
-                                }
+                                dxr_capture::RequestRuntimeAtlasCapture(
+                                    *xr, APP_NAME, tileColumns, tileRows, hwnd);
                             }
 
                             ReleaseSwapchainImage(*xr);

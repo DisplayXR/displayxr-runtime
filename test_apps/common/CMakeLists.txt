@@ -76,9 +76,8 @@ target_link_libraries(sr_common PUBLIC
     dwrite
 )
 
-# D3D11 atlas readback. Pulled into sr_common (not sr_common_base) so
-# only D3D11-linking targets get it — the rest of the cube_handle apps
-# add their respective atlas_capture_<api>.cpp directly.
-target_sources(sr_common PRIVATE
-    atlas_capture_d3d11.cpp
-)
+# Atlas capture is runtime-owned now (XR_EXT_atlas_capture); the cube_handle
+# apps call dxr_capture::RequestRuntimeAtlasCapture (in sr_common_base) instead
+# of a per-API readback. The Windows-only D3D11/D3D12 readback TUs were deleted;
+# atlas_capture_{gl,vk}.cpp + atlas_capture_metal.mm remain for the macOS apps,
+# which haven't migrated yet.

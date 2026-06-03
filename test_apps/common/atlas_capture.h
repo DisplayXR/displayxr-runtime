@@ -70,6 +70,11 @@ typedef struct VkCommandPool_T*    VkCommandPool;
 typedef struct VkImage_T*          VkImage;
 #endif
 
+// Forward-declared (global scope) so the runtime-capture helper below can take
+// it without this header pulling in xr_session_common.h; atlas_capture.cpp
+// includes that header for the full definition.
+struct XrSessionManager;
+
 namespace dxr_capture {
 
 // ---------------------------------------------------------------------------
@@ -130,6 +135,23 @@ void TickCaptureFlash(HWND parent);
 inline void PostFlashRequest(HWND hwnd) {
     PostMessageW(hwnd, kFlashUserMsg, 0, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Runtime-owned atlas capture (XR_EXT_atlas_capture). The single, graphics-
+// API-agnostic capture path: the runtime does the GPU readback, so apps no
+// longer need a per-API CaptureAtlasRegion* helper. Handles the 3D-mode guard,
+// filename numbering (MakeCaptureAtlasPrefix), the xrCaptureAtlasEXT call
+// (PROJECTION_ONLY = the app's own projection atlas), the flash overlay, and
+// logging. Call from the render loop when the 'I' key flag is set.
+//
+// Returns true iff a capture was requested. No-ops (returns false) when the
+// runtime didn't expose the extension (pfn NULL) or for mono/1×1 layouts.
+// ---------------------------------------------------------------------------
+bool RequestRuntimeAtlasCapture(const ::XrSessionManager& xr,
+                                const char* appName,
+                                uint32_t tileColumns,
+                                uint32_t tileRows,
+                                HWND flashHwnd);
 #endif
 
 #ifdef __APPLE__
@@ -171,30 +193,10 @@ bool CaptureAtlasRegionVk(VkDevice device,
                           const std::string& outPath,
                           bool linearBytesInSrgbImage = false);
 
-#ifdef _WIN32
-bool CaptureAtlasRegionD3D11(ID3D11Device* device,
-                             ID3D11DeviceContext* context,
-                             ID3D11Texture2D* srcTex,
-                             uint32_t rectX,
-                             uint32_t rectY,
-                             uint32_t rectW,
-                             uint32_t rectH,
-                             const std::string& outPath);
-
-bool CaptureAtlasRegionD3D12(ID3D12Device* device,
-                             ID3D12CommandQueue* queue,
-                             ID3D12Resource* srcTex,
-                             uint32_t srcImageWidth,
-                             uint32_t srcImageHeight,
-                             // Resource state on entry; we transition back
-                             // to it before returning (caller's lifecycle).
-                             int /*D3D12_RESOURCE_STATES*/ entryState,
-                             uint32_t rectX,
-                             uint32_t rectY,
-                             uint32_t rectW,
-                             uint32_t rectH,
-                             const std::string& outPath);
-#endif
+// NB: the D3D11/D3D12 per-API readback helpers were removed — those apps use
+// the runtime-owned dxr_capture::RequestRuntimeAtlasCapture (XR_EXT_atlas_capture)
+// above. The VK / GL / Metal readbacks below remain for the macOS apps, which
+// have not migrated yet.
 
 // OpenGL helper. Available on both Windows and macOS — the caller must have
 // a current GL context bound. Loads its own FBO/blit function pointers

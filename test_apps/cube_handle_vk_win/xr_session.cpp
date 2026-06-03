@@ -50,6 +50,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) {
             xr.hasDisplayInfoExt = true;
         }
+        if (strcmp(ext.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0) {
+            xr.hasAtlasCaptureExt = true;
+        }
     }
 
     LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
@@ -68,6 +71,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (xr.hasDisplayInfoExt) {
         enabledExtensions.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+    }
+    if (xr.hasAtlasCaptureExt) {
+        enabledExtensions.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -140,6 +146,13 @@ bool InitializeOpenXR(XrSessionManager& xr) {
             (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
         xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesEXT",
             (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
+    }
+
+    // XR_EXT_atlas_capture (#396 W6): resolve the runtime-owned capture entry.
+    if (xr.hasAtlasCaptureExt) {
+        xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasEXT",
+            (PFN_xrVoidFunction*)&xr.pfnCaptureAtlasEXT);
+        LOG_INFO("xrCaptureAtlasEXT: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
     }
 
     uint32_t viewCount = 0;

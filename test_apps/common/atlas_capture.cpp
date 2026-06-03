@@ -22,6 +22,8 @@
 #include "stb_image_write.h"
 
 #include "atlas_capture.h"
+#include "xr_session_common.h"  // XrSessionManager + XR_EXT_atlas_capture
+#include "logging.h"
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
@@ -157,6 +159,41 @@ void TickCaptureFlash(HWND parent) {
         return;
     }
     SetLayeredWindowAttributes(g_flashHwnd, 0, (BYTE)g_flashAlpha, LWA_ALPHA);
+}
+
+// ---------------------------------------------------------------------------
+// Runtime-owned atlas capture (XR_EXT_atlas_capture) — the unified path.
+// ---------------------------------------------------------------------------
+
+bool RequestRuntimeAtlasCapture(const ::XrSessionManager& xr,
+                                const char* appName,
+                                uint32_t tileColumns,
+                                uint32_t tileRows,
+                                HWND flashHwnd) {
+    if (xr.pfnCaptureAtlasEXT == nullptr || xr.session == XR_NULL_HANDLE) {
+        LOG_WARN("Atlas capture unavailable: XR_EXT_atlas_capture not active");
+        return false;
+    }
+    // Captures the app's projection atlas; meaningless for a mono (1×1) layout.
+    if (tileColumns <= 1 && tileRows <= 1) {
+        LOG_INFO("Capture skipped: need 3D mode with cols/rows > 1");
+        return false;
+    }
+
+    std::string prefix = MakeCaptureAtlasPrefix(appName ? appName : "capture", tileColumns, tileRows);
+    XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
+    info.next = nullptr;
+    info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT;
+    strncpy_s(info.pathPrefix, prefix.c_str(), _TRUNCATE);
+
+    XrResult cr = xr.pfnCaptureAtlasEXT(xr.session, &info, nullptr);
+    if (XR_SUCCEEDED(cr)) {
+        LOG_INFO("Atlas capture requested -> %s_atlas.png", prefix.c_str());
+        PostFlashRequest(flashHwnd);
+        return true;
+    }
+    LOG_WARN("xrCaptureAtlasEXT failed: 0x%x", (unsigned)cr);
+    return false;
 }
 
 }  // namespace dxr_capture
