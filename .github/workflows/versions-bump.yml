@@ -89,11 +89,12 @@ jobs:
           private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
           owner: DisplayXR
           # Bumping versions.json here + mirror there; issue-opening on
-          # ABI fail in leia repo.
+          # ABI fail in leia repo; org-changed dispatch to the website.
           repositories: |
             displayxr-runtime
             displayxr-installer
             displayxr-leia-plugin
+            displayxr-website
 
       - name: Checkout main
         uses: actions/checkout@v4
@@ -229,3 +230,23 @@ jobs:
           See displayxr-runtime/docs/specs/runtime/versions-json-autobump.md.
           [skip ci]"
           git push origin HEAD:main || (git pull --rebase origin main && git push origin HEAD:main)
+
+      # Nudge the project website to re-pull org data (versions, demos, repos)
+      # so displayxr.org reflects the new release within ~1 min instead of
+      # waiting for its daily cron. The website's sync-org.yml regenerates and
+      # direct-commits to its main; it ignores the payload but we send it for
+      # log context. Non-fatal: a website hiccup must never fail a version bump.
+      - name: Notify website to resync
+        if: hashFiles('.bump-noop') == '' && (steps.inputs.outputs.field != 'leia_plugin' || steps.abi.outputs.rc == '0')
+        continue-on-error: true
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          repository: DisplayXR/displayxr-website
+          event-type: org-changed
+          client-payload: |
+            {
+              "field":       "${{ steps.inputs.outputs.field }}",
+              "tag":         "${{ steps.inputs.outputs.tag }}",
+              "source_repo": "${{ steps.inputs.outputs.src }}"
+            }
