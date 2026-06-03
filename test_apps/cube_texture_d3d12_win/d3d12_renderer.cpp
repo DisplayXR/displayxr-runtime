@@ -7,6 +7,7 @@
 
 #include "d3d12_renderer.h"
 #include "logging.h"
+#include "mip_chain.h"
 #include <d3d12sdklayers.h>
 #include <cmath>
 
@@ -468,6 +469,12 @@ static bool CreateResources(D3D12Renderer& renderer) {
                 LOG_INFO("Loaded texture: %s (%dx%d)", texFiles[i], w, h);
             }
 
+            // Full box-filtered mip chain so the texture stays smooth under
+            // minification (matches cube_handle_gl_win's glGenerateMipmap).
+            const unsigned char* srcData = pixels ? pixels : ((i == 1) ? normalPixel : whitePixel);
+            std::vector<dxr_mip::MipLevel> mips = dxr_mip::GenerateMipChainRGBA8(srcData, w, h);
+            const UINT mipLevels = (UINT)mips.size();
+
             // Create default heap texture
             D3D12_HEAP_PROPERTIES defaultHeapProps = {};
             defaultHeapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -477,7 +484,7 @@ static bool CreateResources(D3D12Renderer& renderer) {
             texDesc.Width = w;
             texDesc.Height = h;
             texDesc.DepthOrArraySize = 1;
-            texDesc.MipLevels = 1;
+            texDesc.MipLevels = (UINT16)mipLevels;
             texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
             texDesc.SampleDesc.Count = 1;
             texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
@@ -489,23 +496,25 @@ static bool CreateResources(D3D12Renderer& renderer) {
                 continue;
             }
 
-            // Upload via staging buffer
+            // Upload all mip levels via one staging buffer.
+            std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(mipLevels);
+            std::vector<UINT> numRows(mipLevels);
+            std::vector<UINT64> rowSizes(mipLevels);
             UINT64 uploadSize = 0;
-            D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
-            renderer.device->GetCopyableFootprints(&texDesc, 0, 1, 0, &footprint, nullptr, nullptr, &uploadSize);
-
-            const unsigned char* srcData = pixels ? pixels : ((i == 1) ? normalPixel : whitePixel);
-            UINT srcRowPitch = w * 4;
+            renderer.device->GetCopyableFootprints(&texDesc, 0, mipLevels, 0,
+                footprints.data(), numRows.data(), rowSizes.data(), &uploadSize);
 
             ComPtr<ID3D12Resource> uploadBuf = CreateUploadBuffer(renderer.device.Get(), nullptr, uploadSize);
             if (uploadBuf) {
-                void* mapped = nullptr;
+                uint8_t* mapped = nullptr;
                 D3D12_RANGE readRange = {0, 0};
-                uploadBuf->Map(0, &readRange, &mapped);
-                // Copy row by row respecting alignment
-                for (int row = 0; row < h; row++) {
-                    memcpy((uint8_t*)mapped + row * footprint.Footprint.RowPitch,
-                           srcData + row * srcRowPitch, srcRowPitch);
+                uploadBuf->Map(0, &readRange, reinterpret_cast<void**>(&mapped));
+                for (UINT m = 0; m < mipLevels; m++) {
+                    const UINT srcPitch = (UINT)mips[m].width * 4;
+                    for (UINT row = 0; row < numRows[m]; row++) {
+                        memcpy(mapped + footprints[m].Offset + (UINT64)row * footprints[m].Footprint.RowPitch,
+                               mips[m].pixels.data() + (size_t)row * srcPitch, srcPitch);
+                    }
                 }
                 uploadBuf->Unmap(0, nullptr);
 
@@ -513,17 +522,19 @@ static bool CreateResources(D3D12Renderer& renderer) {
                 renderer.commandAllocator->Reset();
                 renderer.commandList->Reset(renderer.commandAllocator.Get(), nullptr);
 
-                D3D12_TEXTURE_COPY_LOCATION dst = {};
-                dst.pResource = renderer.texResources[i].Get();
-                dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                dst.SubresourceIndex = 0;
+                for (UINT m = 0; m < mipLevels; m++) {
+                    D3D12_TEXTURE_COPY_LOCATION dst = {};
+                    dst.pResource = renderer.texResources[i].Get();
+                    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    dst.SubresourceIndex = m;
 
-                D3D12_TEXTURE_COPY_LOCATION src = {};
-                src.pResource = uploadBuf.Get();
-                src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                src.PlacedFootprint = footprint;
+                    D3D12_TEXTURE_COPY_LOCATION src = {};
+                    src.pResource = uploadBuf.Get();
+                    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    src.PlacedFootprint = footprints[m];
 
-                renderer.commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                    renderer.commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                }
 
                 // Transition to shader resource
                 D3D12_RESOURCE_BARRIER texBarrier = {};
@@ -554,7 +565,7 @@ static bool CreateResources(D3D12Renderer& renderer) {
             srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
             srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            srvDesc.Texture2D.MipLevels = 1;
+            srvDesc.Texture2D.MipLevels = mipLevels;
 
             renderer.device->CreateShaderResourceView(renderer.texResources[i].Get(), &srvDesc, srvHandle);
             srvHandle.ptr += srvDescSize;
