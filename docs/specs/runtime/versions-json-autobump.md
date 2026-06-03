@@ -154,6 +154,21 @@ demo gets its own top-level key matching the asset table in runtime's
             }
 ```
 
+## Website fan-out (low-latency org-sync)
+
+After a bump commits — in **both** `versions-bump.yml` (sibling releases)
+and `build-windows.yml`'s `BumpVersionsJsonOnTag` (runtime self-bump) — a
+final `repository_dispatch` step fires an `org-changed` event at
+`displayxr-website`. The website's `sync-org.yml` re-pulls org data
+(versions, demo cards, repo list) and direct-commits the refresh to its
+`main` (same no-review-theatre contract as this file), so `displayxr.org`
+reflects a release within ~1 min instead of waiting for its daily cron. The step is `continue-on-error: true` and runs *after*
+the push + installer mirror, so a website hiccup can never fail a real
+version bump. `displayxr-website` is added to the App token's
+`repositories:` list in both jobs. The website ignores the payload (it
+regenerates wholesale) but receives `{field, tag, source_repo}` for log
+context. Full design: `displayxr-website/docs/org-sync.md`.
+
 ## ABI gate (the one carve-out)
 
 The leia plug-in reports `XRT_PLUGIN_API_VERSION_CURRENT` from the

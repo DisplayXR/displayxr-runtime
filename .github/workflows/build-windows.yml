@@ -1224,6 +1224,7 @@ jobs:
             displayxr-runtime
             displayxr-installer
             displayxr-leia-plugin
+            displayxr-website
 
       - name: Checkout main
         uses: actions/checkout@v4
@@ -1330,3 +1331,22 @@ jobs:
           Auto-synced from displayxr-runtime/versions.json by build-windows.yml on tag push.
           [skip ci]"
           git push origin HEAD:main || (git pull --rebase origin main && git push origin HEAD:main)
+
+      # Nudge the project website to re-pull org data after a runtime release,
+      # mirroring the same step in versions-bump.yml. Non-fatal — a website
+      # hiccup must never fail the runtime's self-bump. See docs/org-sync.md
+      # in displayxr-website.
+      - name: Notify website to resync
+        if: steps.abi.outputs.rc == '0' && hashFiles('.bump-noop') == ''
+        continue-on-error: true
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          repository: DisplayXR/displayxr-website
+          event-type: org-changed
+          client-payload: |
+            {
+              "field":       "runtime",
+              "tag":         "${{ github.ref_name }}",
+              "source_repo": "DisplayXR/displayxr-runtime"
+            }
