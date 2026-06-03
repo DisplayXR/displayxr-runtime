@@ -1218,6 +1218,28 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 					u_tiling_compute_canvas_view(mode, c->canvas.w, c->canvas.h,
 					                             &c->view_width, &c->view_height);
 				}
+#if defined(XRT_OS_WINDOWS) || defined(__APPLE__)
+				else if (!c->owns_window) {
+					// Handle app: window may be smaller than the display,
+					// so scale view dims to the actual window client area
+					// (matches the D3D11/D3D12 path) — keeps the atlas content
+					// region, DP input, and atlas capture at window resolution.
+					uint32_t win_w = 0, win_h = 0;
+#ifdef XRT_OS_WINDOWS
+					RECT rc;
+					if (c->hwnd != NULL && GetClientRect(c->hwnd, &rc)) {
+						win_w = (uint32_t)(rc.right - rc.left);
+						win_h = (uint32_t)(rc.bottom - rc.top);
+					}
+#else
+					comp_gl_window_macos_get_dimensions(c->macos_window, &win_w, &win_h);
+#endif
+					if (win_w > 0 && win_h > 0) {
+						u_tiling_compute_canvas_view(mode, win_w, win_h,
+						                             &c->view_width, &c->view_height);
+					}
+				}
+#endif
 			}
 		}
 	}
