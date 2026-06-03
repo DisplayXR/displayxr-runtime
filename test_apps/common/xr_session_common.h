@@ -28,6 +28,7 @@
 #include <openxr/XR_EXT_win32_window_binding.h>
 #include <openxr/XR_EXT_display_info.h>
 #include <openxr/XR_EXT_workspace_file_dialog.h>
+#include <openxr/XR_EXT_atlas_capture.h>
 #include <DirectXMath.h>
 #include <vector>
 #include <string>
@@ -86,6 +87,11 @@ struct XrSessionManager {
     // PFN resolved when XR_EXT_workspace_file_dialog is enabled. nullptr if
     // the runtime didn't expose the extension. #228 Tier 1.
     PFN_xrRequestFilePickerEXT pfnRequestFilePickerEXT = nullptr;
+
+    // XR_EXT_atlas_capture (W6 of #396): the runtime owns the atlas readback,
+    // so the app drops its per-API CaptureAtlasRegion* glue for one call.
+    bool hasAtlasCaptureExt = false;
+    PFN_xrCaptureAtlasEXT pfnCaptureAtlasEXT = nullptr;
 
     // Display info from XR_EXT_display_info (static display properties)
     float recommendedViewScaleX = 1.0f;

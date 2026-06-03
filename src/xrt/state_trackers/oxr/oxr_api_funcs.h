@@ -923,6 +923,12 @@ oxr_xrSetWorkspaceClientStyleEXT(XrSession session,
                                  const XrWorkspaceClientStyleEXT *style);
 #endif
 
+#ifdef OXR_HAVE_EXT_atlas_capture
+//! OpenXR API function @ep{xrCaptureAtlasEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrCaptureAtlasEXT(XrSession session, const XrAtlasCaptureInfoEXT *info, XrAtlasCaptureResultEXT *result);
+#endif
+
 #ifdef OXR_HAVE_EXT_workspace_file_dialog
 //! OpenXR API function @ep{xrRequestFilePickerEXT}
 XRAPI_ATTR XrResult XRAPI_CALL

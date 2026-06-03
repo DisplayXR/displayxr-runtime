@@ -77,6 +77,23 @@ void
 oxr_mcp_tools_set_capture_handler(oxr_mcp_capture_fn fn, void *userdata);
 
 /*!
+ * Latch a capture request on the installed in-process compositor handler and
+ * return immediately — does NOT block. The compositor consumes the latch at
+ * its next layer_commit poll (the next xrEndFrame), does the GPU readback, and
+ * writes the PNG to @p path. This is the non-blocking sibling of the MCP
+ * @c capture_frame tool's blocking handler: it must NOT block here because
+ * @ref oxr_xrCaptureAtlasEXT runs on the app's own xrEndFrame thread, which is
+ * also the thread that drives the in-process compositor's layer_commit —
+ * blocking it would deadlock the very poll we are waiting on.
+ *
+ * @p mode is an @ref mcp_capture_mode value. Returns @c false if no in-process
+ * compositor handler is installed (e.g. an IPC/service session). The PNG
+ * exists shortly after the next composed frame, not when this call returns.
+ */
+bool
+oxr_mcp_tools_submit_capture(const char *path, uint32_t mode);
+
+/*!
  * Read the MCP capability marker written by the displayxr-mcp installer.
  * Returns @c true iff the marker is present AND set to enabled.
  *
