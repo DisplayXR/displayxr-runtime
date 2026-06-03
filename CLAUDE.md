@@ -92,7 +92,7 @@ First run downloads deps (vcpkg, OpenXR loader). Requires VS 2022 (C++ workload)
 # brew install cmake ninja eigen vulkan-sdk
 ./scripts/build_macos.sh
 ```
-Builds runtime, OpenXR loader, test apps. The Vulkan compositor fails at runtime with `VK_ERROR_EXTENSION_NOT_PRESENT` (MoltenVK limitation, not a build issue).
+Builds runtime, OpenXR loader, test apps. The macOS Vulkan native compositor runs via MoltenVK over a CAMetalLayer-backed surface (`cube_handle_vk_macos`); an earlier `VK_ERROR_EXTENSION_NOT_PRESENT` failure was a MoltenVK-era issue since resolved. The one dev gotcha is the two-`libvulkan` loader-image conflict (dev build vs installed runtime) — see `docs/getting-started/building.md` and pin `XR_RUNTIME_JSON` / share one loader image.
 
 ### Standard CMake
 ```bash
