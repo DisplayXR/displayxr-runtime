@@ -513,6 +513,11 @@ struct ipc_workspace_input_event_batch
  * @ingroup ipc
  */
 #define IPC_CAPTURE_FLAG_ATLAS (1u << 0)
+// Stage selector (W6 of #396): capture the projection-only atlas (no window-space
+// / chrome) instead of the post-compose ATLAS. The service-side projection-only
+// readback lands in a follow-up (Phase 2b); until then the service writes nothing
+// for this bit and the caller sees it absent from views_written.
+#define IPC_CAPTURE_FLAG_PROJECTION_ONLY (1u << 1)
 #define IPC_CAPTURE_FLAG_ALL (IPC_CAPTURE_FLAG_ATLAS)
 
 #define IPC_CAPTURE_PATH_MAX 256

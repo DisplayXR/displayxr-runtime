@@ -10688,21 +10688,63 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 	memset(out_result, 0, sizeof(*out_result));
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-	struct d3d11_multi_compositor *mc = sys ? sys->multi_comp : nullptr;
-	if (mc == nullptr || !mc->combined_atlas || sys->device == nullptr || sys->context == nullptr) {
-		U_LOG_W("capture_frame: no combined atlas / device / context available");
+	if (sys == nullptr || sys->device == nullptr || sys->context == nullptr) {
+		U_LOG_W("capture_frame: no service system / device / context available");
 		return false;
 	}
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
 
 	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
 
-	// Re-check under lock.
-	if (!mc->combined_atlas) {
+	// Select the source atlas by requested stage. We hold a com_ptr ref so the
+	// texture survives even if its owning compositor tears down (render_mutex
+	// already serializes against teardown; the ref is belt-and-suspenders).
+	//
+	//   PROJECTION_ONLY -> the active client's own per-session projection atlas
+	//     (render.atlas_texture). Window-space/HUD is composited only into
+	//     combined_atlas, so this buffer is projection-only by construction, and
+	//     it exists for a single (non-workspace) IPC client where combined_atlas
+	//     does not. This is what makes xrCaptureAtlasEXT work over IPC. (Captures
+	//     the active client; under multi-client workspace that is the focused
+	//     client, not necessarily an arbitrary caller — a known limitation.)
+	//   ATLAS (post-compose) -> the multi-compositor's combined atlas (the
+	//     workspace whole-composite). Null for a single non-workspace client, so
+	//     post-compose over IPC reports unsupported for those.
+	wil::com_ptr<ID3D11Texture2D> src_tex;
+	uint32_t want_flag = 0;
+	if (flags & IPC_CAPTURE_FLAG_PROJECTION_ONLY) {
+		std::lock_guard<std::mutex> alock(sys->active_compositor_mutex);
+		struct d3d11_service_compositor *ac = sys->active_compositor;
+		if (ac != nullptr) {
+			// Prefer the content-sized crop atlas — the actual DP input, tightly
+			// packed to (tile_columns·view_w)×(tile_rows·view_h) — so the PNG
+			// matches the in-process capture's content region instead of the
+			// full atlas with per-tile black padding. Fall back to the full
+			// per-client atlas when no crop was needed (content == atlas).
+			if (ac->render.crop_texture) {
+				src_tex = ac->render.crop_texture;
+			} else if (ac->render.atlas_texture) {
+				src_tex = ac->render.atlas_texture;
+			}
+			if (src_tex) {
+				want_flag = IPC_CAPTURE_FLAG_PROJECTION_ONLY;
+			}
+		}
+	} else if (flags & IPC_CAPTURE_FLAG_ATLAS) {
+		if (mc != nullptr && mc->combined_atlas) {
+			src_tex = mc->combined_atlas;
+			want_flag = IPC_CAPTURE_FLAG_ATLAS;
+		}
+	}
+	if (!src_tex) {
+		U_LOG_W("capture_frame: no source atlas for flags=0x%x (projection-only needs an "
+		        "active client; post-compose needs workspace mode)",
+		        flags);
 		return false;
 	}
 
 	D3D11_TEXTURE2D_DESC desc;
-	mc->combined_atlas->GetDesc(&desc);
+	src_tex->GetDesc(&desc);
 	const uint32_t atlas_w = desc.Width;
 	const uint32_t atlas_h = desc.Height;
 	const uint32_t tile_columns = sys->tile_columns > 0 ? sys->tile_columns : 1;
@@ -10715,8 +10757,17 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 	resolve_active_view_dims(sys, atlas_w, atlas_h, &eye_w_res, &eye_h_res);
 	const uint32_t eye_w = eye_w_res;
 	const uint32_t eye_h = eye_h_res;
-	const uint32_t used_w = eye_w * tile_columns;
-	const uint32_t used_h = eye_h * tile_rows;
+	uint32_t used_w = eye_w * tile_columns;
+	uint32_t used_h = eye_h * tile_rows;
+	// Clamp to the source texture: the per-client projection atlas can be smaller
+	// than the display-derived view grid, and over-reading the staging copy would
+	// read past its rows.
+	if (used_w > atlas_w) {
+		used_w = atlas_w;
+	}
+	if (used_h > atlas_h) {
+		used_h = atlas_h;
+	}
 
 	// Create CPU-readable staging texture and copy atlas into it.
 	D3D11_TEXTURE2D_DESC sd = desc;
@@ -10730,7 +10781,7 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 		U_LOG_W("capture_frame: CreateTexture2D(staging) failed 0x%08lx", hr);
 		return false;
 	}
-	sys->context->CopyResource(staging.get(), mc->combined_atlas.get());
+	sys->context->CopyResource(staging.get(), src_tex.get());
 
 	D3D11_MAPPED_SUBRESOURCE m;
 	hr = sys->context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &m);
@@ -10741,7 +10792,7 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 
 	uint32_t views_written = 0;
 
-	if (flags & IPC_CAPTURE_FLAG_ATLAS) {
+	if (want_flag != 0) {
 		// Tightly-pack the active top-left region (used_w × used_h) into a
 		// contiguous RGBA8 buffer. Drops the black padding outside the tile
 		// grid and also handles staging RowPitch > used_w*4.
@@ -10756,7 +10807,7 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 		snprintf(path, sizeof(path), "%s_atlas.png", path_prefix);
 		if (stbi_write_png(path, (int)used_w, (int)used_h, 4,
 		                   buf.data(), (int)(used_w * 4u)) != 0) {
-			views_written |= IPC_CAPTURE_FLAG_ATLAS;
+			views_written |= want_flag;
 		} else {
 			U_LOG_W("capture_frame: stbi_write_png failed for %s", path);
 		}
