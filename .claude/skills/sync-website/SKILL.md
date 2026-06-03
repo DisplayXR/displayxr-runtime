@@ -28,8 +28,19 @@ The DisplayXR website is kept in sync with the org by a **two-layer** system
 **Mechanical commit = facts (direct to main). Skill PR = narrative.** They never
 touch the same fields: the skill edits authored TSX (`lib/data/roadmap.ts`,
 `lib/data/ecosystem.ts`, `lib/constants.ts`, `app/architecture/page.tsx`,
-`app/extensions/page.tsx`, `lib/data/devices.ts`) and **never** the
-`lib/data/generated/*.json` files.
+`app/extensions/page.tsx`, `lib/data/devices.ts`, `app/contribute/page.tsx`) and
+**never** the `lib/data/generated/*.json` files.
+
+### Site IA note (persona-led, since the 2026-06 overhaul)
+The site is organized around three audiences. Two facts matter for editorial
+sync: (1) the **repo map and a headline-ADR list live on `app/contribute/page.tsx`**
+— the repo map renders `ecosystemRepos` from `lib/data/ecosystem.ts`, so adding a
+repo there surfaces it on both the homepage `EcosystemMap` *and* `/contribute`
+automatically; the ADR list is a short hand-curated array. (2) The device /
+compatibility tables and the version dashboard now render on **one merged
+`/platform-support` page** (old `/compatibility` + `/status` 308-redirect there) —
+but you still edit the **data** in `lib/data/devices.ts` / `lib/data/compatibility.ts`,
+never the page, so this doesn't change the authoring targets.
 
 ## Why hub-homed + parameterized
 
@@ -196,8 +207,8 @@ structure. Concrete mapping:
 
 | Gap | File | What to write |
 |---|---|---|
-| User-facing new ADR | `app/architecture/page.tsx` | A sentence/paragraph in the relevant section summarizing the decision in product terms (NOT the ADR's internal rationale). Skip internal-only ADRs. |
-| New featured repo | `lib/data/ecosystem.ts` (+ `lib/constants.ts` `REPO_URLS`) | An `EcosystemRepo` entry: name, repo, one-sentence description, `category`, optional `status`. |
+| User-facing new ADR | `app/architecture/page.tsx` (product-level) and/or the headline-ADR array in `app/contribute/page.tsx` (contributor-facing) | A sentence/paragraph summarizing the decision in product terms (NOT the ADR's internal rationale). Most ADRs are internal — skip them; a genuinely notable one belongs on /architecture, a contributor-relevant one in the /contribute headline list. |
+| New featured repo | `lib/data/ecosystem.ts` (+ `lib/constants.ts` `REPO_URLS`) | An `EcosystemRepo` entry: name, repo, one-sentence description, `category`, optional `status`. Surfaces automatically on the homepage `EcosystemMap` **and** `/contribute`'s repo map — no page edit needed. |
 | New extension | `app/extensions/page.tsx` | An `Extension` entry: `name`, human `title`, 1–2 sentence `description` derived from the header comment, `status`, `group`. |
 | New device | `lib/data/devices.ts` | A `Device` entry — only when the user supplies the hardware (not auto-discoverable). |
 | Closed milestone | `lib/data/roadmap.ts` | Move the matching item to the `done` phase, or add a `done` entry; trim the corresponding `now`/`next` item. |
