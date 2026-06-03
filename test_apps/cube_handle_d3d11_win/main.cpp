@@ -772,19 +772,14 @@ static void RenderOneFrame(RenderState& rs) {
                         if (g_inputState.captureAtlasRequested) {
                             g_inputState.captureAtlasRequested = false;
                             if (!monoMode && (tileColumns > 1 || tileRows > 1)) {
-                                std::string outPath = dxr_capture::MakeCapturePath(
-                                    APP_NAME, tileColumns, tileRows);
                                 if (xr.pfnCaptureAtlasEXT && xr.session != XR_NULL_HANDLE) {
                                     // XR_EXT_atlas_capture (W6 of #396): the runtime owns
                                     // the readback — no app-side staging texture. The latch
                                     // is consumed by this iteration's xrEndFrame below, so it
-                                    // captures the current frame. Pass a prefix without our
-                                    // ".png"; the runtime appends "_atlas.png".
-                                    std::string prefix = outPath;
-                                    if (prefix.size() > 4 &&
-                                        prefix.compare(prefix.size() - 4, 4, ".png") == 0) {
-                                        prefix.resize(prefix.size() - 4);
-                                    }
+                                    // captures the current frame. The prefix has no ".png";
+                                    // the runtime appends "_atlas.png".
+                                    std::string prefix = dxr_capture::MakeCaptureAtlasPrefix(
+                                        APP_NAME, tileColumns, tileRows);
                                     XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
                                     info.next = nullptr;
                                     info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT;
@@ -800,6 +795,8 @@ static void RenderOneFrame(RenderState& rs) {
                                 } else {
                                     // Fallback: legacy app-side readback when the runtime
                                     // does not expose XR_EXT_atlas_capture.
+                                    std::string outPath = dxr_capture::MakeCapturePath(
+                                        APP_NAME, tileColumns, tileRows);
                                     uint32_t atlasW = tileColumns * renderW;
                                     uint32_t atlasH = tileRows * renderH;
                                     if (atlasW <= xr.swapchain.width && atlasH <= xr.swapchain.height) {

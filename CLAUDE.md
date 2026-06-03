@@ -216,6 +216,22 @@ Both use registry discovery on Windows (so they pick up whatever plug-in is inst
 | cube_handle_gl_win | `_package\run_cube_handle_gl_win.bat` |
 | cube_handle_vk_win | `_package\run_cube_handle_vk_win.bat` |
 
+**Forcing the IPC/service path (easiest way to exercise IPC without the shell).**
+By default `handle`/`hosted` apps run **in-process** (local compositor, app- or
+runtime-owned window) — a running `displayxr-service.exe` does *not* by itself
+make an app an IPC client. To put **any** existing app on the IPC path, start the
+service and launch the app with `XRT_FORCE_MODE=ipc` (read by the runtime DLL;
+this is exactly what `webxr_bridge` sets via `force_ipc_mode_env()`):
+```cmd
+_package\bin\displayxr-service.exe                            REM D3D11 service compositor
+set XRT_FORCE_MODE=ipc && test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe
+```
+The app then creates a `client_d3d11_compositor` (`server-creates-swapchain`
+model), `is_service_mode` flips true, and `is_*_native_compositor` stays false —
+so e.g. `xrCaptureAtlasEXT` routes through the IPC branch, not the in-process
+one. (`XRT_FORCE_MODE=ipc` must be set process-level via the env, not the run
+script, since the DLL has its own static-CRT environment block.)
+
 ### macOS test apps
 Copy binaries to `_package/DisplayXR-macOS/bin/`. Generated `run_*.sh` set `XRT_PLUGIN_SEARCH_PATH=$DIR/lib/displayxr/plugins` so the dev tree's `DisplayXR-SimDisplay.dylib` (+ `200-sim-display.json`) is discovered without touching `~/Library/Application Support/`.
 
