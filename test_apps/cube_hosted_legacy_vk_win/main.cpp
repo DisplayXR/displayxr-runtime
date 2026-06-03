@@ -580,16 +580,25 @@ static bool CreateTextureFromFile(VkDevice device, VkPhysicalDevice physDevice,
     vkUnmapMemory(device, stagingMemory);
     if (!fallback) stbi_image_free(pixels);
 
+    // Full mip chain so the wood texture stays smooth under minification
+    // (matches cube_handle_gl_win's glGenerateMipmap).
+    uint32_t mipLevels = 1;
+    if (!fallback) {
+        uint32_t maxDim = (uint32_t)((w > h) ? w : h);
+        while (maxDim > 1) { maxDim >>= 1; mipLevels++; }
+    }
+
     VkImageCreateInfo imgInfo = {};
     imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     imgInfo.imageType = VK_IMAGE_TYPE_2D;
     imgInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
     imgInfo.extent = {(uint32_t)w, (uint32_t)h, 1};
-    imgInfo.mipLevels = 1;
+    imgInfo.mipLevels = mipLevels;
     imgInfo.arrayLayers = 1;
     imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
     imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    imgInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    // TRANSFER_SRC is needed to blit each mip level down to the next.
+    imgInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     vkCreateImage(device, &imgInfo, nullptr, &outImage);
 
@@ -620,7 +629,7 @@ static bool CreateTextureFromFile(VkDevice device, VkPhysicalDevice physDevice,
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = outImage;
-    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mipLevels, 0, 1};
     barrier.srcAccessMask = 0;
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -631,6 +640,44 @@ static bool CreateTextureFromFile(VkDevice device, VkPhysicalDevice physDevice,
     region.imageExtent = {(uint32_t)w, (uint32_t)h, 1};
     vkCmdCopyBufferToImage(cmd, stagingBuffer, outImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
+    // Generate the mip chain: blit each level down to the next, leaving every
+    // level in SHADER_READ_ONLY. All levels started in TRANSFER_DST.
+    barrier.subresourceRange.levelCount = 1;
+    int32_t mipW = w, mipH = h;
+    for (uint32_t level = 1; level < mipLevels; level++) {
+        barrier.subresourceRange.baseMipLevel = level - 1;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+        VkImageBlit blit = {};
+        blit.srcOffsets[1] = {mipW, mipH, 1};
+        blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.srcSubresource.mipLevel = level - 1;
+        blit.srcSubresource.layerCount = 1;
+        blit.dstOffsets[1] = {mipW > 1 ? mipW / 2 : 1, mipH > 1 ? mipH / 2 : 1, 1};
+        blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.dstSubresource.mipLevel = level;
+        blit.dstSubresource.layerCount = 1;
+        vkCmdBlitImage(cmd, outImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            outImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+        if (mipW > 1) mipW /= 2;
+        if (mipH > 1) mipH /= 2;
+    }
+
+    // Last level: TRANSFER_DST -> SHADER_READ.
+    barrier.subresourceRange.baseMipLevel = mipLevels - 1;
     barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -655,7 +702,7 @@ static bool CreateTextureFromFile(VkDevice device, VkPhysicalDevice physDevice,
     viewInfo.image = outImage;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
-    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mipLevels, 0, 1};
     vkCreateImageView(device, &viewInfo, nullptr, &outView);
 
     return !fallback;
@@ -1124,11 +1171,13 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
         samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
         samplerInfo.magFilter = VK_FILTER_LINEAR;
         samplerInfo.minFilter = VK_FILTER_LINEAR;
+        // Trilinear mip filtering — matches GL_LINEAR_MIPMAP_LINEAR.
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
         samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
         samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
         samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
         samplerInfo.maxAnisotropy = 1.0f;
-        samplerInfo.maxLod = 1.0f;
+        samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
         if (vkCreateSampler(device, &samplerInfo, nullptr, &renderer.texSampler) != VK_SUCCESS) return false;
 
         VkDescriptorPoolSize poolSize = {};
