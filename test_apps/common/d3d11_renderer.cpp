@@ -7,6 +7,7 @@
 
 #include "d3d11_renderer.h"
 #include "logging.h"
+#include "mip_chain.h"
 #include <d3dcompiler.h>
 #include <cmath>
 #include <vector>
@@ -520,23 +521,29 @@ bool CreateResources(D3D11Renderer& renderer) {
                 renderer.texturesLoaded = false;
             }
 
+            // Full box-filtered mip chain so the texture stays smooth under
+            // minification (matches cube_handle_gl_win's glGenerateMipmap).
+            std::vector<dxr_mip::MipLevel> mips = dxr_mip::GenerateMipChainRGBA8(pixels, w, h);
+            if (!fallback) stbi_image_free(pixels);
+
             D3D11_TEXTURE2D_DESC texDesc = {};
             texDesc.Width = w;
             texDesc.Height = h;
-            texDesc.MipLevels = 1;
+            texDesc.MipLevels = (UINT)mips.size();
             texDesc.ArraySize = 1;
             texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
             texDesc.SampleDesc.Count = 1;
             texDesc.Usage = D3D11_USAGE_IMMUTABLE;
             texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
-            D3D11_SUBRESOURCE_DATA texData = {};
-            texData.pSysMem = pixels;
-            texData.SysMemPitch = w * 4;
+            std::vector<D3D11_SUBRESOURCE_DATA> texData(mips.size());
+            for (size_t m = 0; m < mips.size(); m++) {
+                texData[m].pSysMem = mips[m].pixels.data();
+                texData[m].SysMemPitch = mips[m].width * 4;
+            }
 
             ComPtr<ID3D11Texture2D> tex;
-            hr = renderer.device->CreateTexture2D(&texDesc, &texData, &tex);
-            if (!fallback) stbi_image_free(pixels);
+            hr = renderer.device->CreateTexture2D(&texDesc, texData.data(), &tex);
             if (FAILED(hr)) continue;
 
             hr = renderer.device->CreateShaderResourceView(tex.Get(), nullptr, &renderer.textureSRVs[i]);
