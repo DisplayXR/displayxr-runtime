@@ -767,53 +767,12 @@ static void RenderOneFrame(RenderState& rs) {
 
                         if (rtv) rtv->Release();
 
-                        // 'I' key: snapshot the multi-view atlas to a PNG.
-                        // Skipped for mono (1×1) layouts.
+                        // 'I' key: snapshot the multi-view atlas to a PNG via the
+                        // runtime (XR_EXT_atlas_capture). Skipped for mono (1×1).
                         if (g_inputState.captureAtlasRequested) {
                             g_inputState.captureAtlasRequested = false;
-                            if (!monoMode && (tileColumns > 1 || tileRows > 1)) {
-                                if (xr.pfnCaptureAtlasEXT && xr.session != XR_NULL_HANDLE) {
-                                    // XR_EXT_atlas_capture (W6 of #396): the runtime owns
-                                    // the readback — no app-side staging texture. The latch
-                                    // is consumed by this iteration's xrEndFrame below, so it
-                                    // captures the current frame. The prefix has no ".png";
-                                    // the runtime appends "_atlas.png".
-                                    std::string prefix = dxr_capture::MakeCaptureAtlasPrefix(
-                                        APP_NAME, tileColumns, tileRows);
-                                    XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
-                                    info.next = nullptr;
-                                    info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT;
-                                    strncpy_s(info.pathPrefix, prefix.c_str(), _TRUNCATE);
-                                    XrResult cr = xr.pfnCaptureAtlasEXT(xr.session, &info, nullptr);
-                                    if (XR_SUCCEEDED(cr)) {
-                                        LOG_INFO("Atlas capture requested -> %s_atlas.png",
-                                                 prefix.c_str());
-                                        dxr_capture::PostFlashRequest(rs.hwnd);
-                                    } else {
-                                        LOG_WARN("xrCaptureAtlasEXT failed: 0x%x", (unsigned)cr);
-                                    }
-                                } else {
-                                    // Fallback: legacy app-side readback when the runtime
-                                    // does not expose XR_EXT_atlas_capture.
-                                    std::string outPath = dxr_capture::MakeCapturePath(
-                                        APP_NAME, tileColumns, tileRows);
-                                    uint32_t atlasW = tileColumns * renderW;
-                                    uint32_t atlasH = tileRows * renderH;
-                                    if (atlasW <= xr.swapchain.width && atlasH <= xr.swapchain.height) {
-                                        bool ok = dxr_capture::CaptureAtlasRegionD3D11(
-                                            renderer.device.Get(), renderer.context.Get(),
-                                            swapchainTexture,
-                                            0, 0, atlasW, atlasH, outPath);
-                                        if (ok) {
-                                            LOG_INFO("Captured atlas %ux%u -> %s",
-                                                     atlasW, atlasH, outPath.c_str());
-                                            dxr_capture::PostFlashRequest(rs.hwnd);
-                                        }
-                                    }
-                                }
-                            } else {
-                                LOG_INFO("Capture skipped: need 3D mode with cols/rows > 1");
-                            }
+                            dxr_capture::RequestRuntimeAtlasCapture(
+                                xr, APP_NAME, tileColumns, tileRows, rs.hwnd);
                         }
 
                         ReleaseSwapchainImage(xr);
