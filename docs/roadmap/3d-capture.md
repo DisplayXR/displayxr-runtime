@@ -3,7 +3,7 @@ status: Proposal
 owner: David Fattal
 updated: 2026-03-21
 issues: [43, 44]
-code-paths: [src/xrt/compositor/multi/]
+code-paths: [src/xrt/compositor/d3d11_service/]
 ---
 
 > **Status: Proposal** — not yet implemented. Tracking issue: [#43](https://github.com/DisplayXR/displayxr-runtime/issues/43), [#44](https://github.com/DisplayXR/displayxr-runtime/issues/44)

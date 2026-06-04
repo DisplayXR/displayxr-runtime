@@ -186,6 +186,36 @@ is the only class with no app window.
   `eyeCount = 1`, render at full window resolution, center-eye = average of the located eyes.
   The runtime accepts `viewCount == 1` only in a 2D/non-3D mode. Ref: `main.cpp:415,632-644,707-711`.
 
+- **INV-4.6 — Color space: request an sRGB swapchain.** The display panel is sRGB, and an
+  in-process native compositor is a **byte passthrough to the panel** — it does *not* color-manage
+  a linear-format swapchain. So the encoding of the bytes you store is what reaches the display.
+  - **Do this — request an sRGB swapchain format:** `..._UNORM_SRGB` (D3D11/D3D12),
+    `GL_SRGB8_ALPHA8` (GL), `..._SRGB` (Vulkan), `MTLPixelFormat*sRGB` (Metal). Then you are
+    correct **either way you render into it**:
+    - render in linear and let the GPU encode on write — `GL_FRAMEBUFFER_SRGB` on / an `_SRGB`
+      RTV / an sRGB color attachment, *or*
+    - write display-referred (already gamma-encoded) bytes directly with GPU sRGB-write off.
+    Don't do both (double-encode → washed out).
+  - **A linear / UNORM swapchain (`R8G8B8A8_UNORM`, `GL_RGBA8`, …) is NOT color-managed** on the
+    in-process path: the compositor passes the bytes straight through with no linear→sRGB encode.
+    It's only correct if you write display-referred bytes into it; writing genuinely-linear values
+    and expecting the runtime to encode → **too bright**. ("Submit a linear-format swapchain and
+    the runtime color-manages it" is a future runtime follow-up, not current behavior.)
+  - **Data textures (normal, AO, roughness, metalness) are ALWAYS linear — never sRGB.** Only
+    albedo/color is sRGB; sample those through an `_SRGB` texture view (or decode in-shader) so
+    lighting runs in linear, then write your result into the sRGB swapchain per above.
+  - **In-process vs service:** this is the in-process native-compositor contract. The D3D11
+    *service* (workspace) path color-manages differently (it linearizes app swapchains into a
+    linear atlas — see the canonical reference). As an app author you don't depend on which path
+    runs you: request an sRGB swapchain and write a correctly-encoded image, and both paths are
+    correct.
+  - Reference: PR [#407](https://github.com/DisplayXR/displayxr-runtime/pull/407) (the GL fix +
+    the cross-API contract) and
+    `docs/architecture/compositor-pipeline.md#color-space-handling-d3d11-service-compositor-shell-mode`.
+    Rollout: the GL in-process compositor passes sRGB swapchains through correctly as of #407;
+    D3D11/D3D12/Vulkan/Metal in-process are being aligned (their composited path currently applies
+    an unmatched sRGB decode — tracked in the #407 follow-up audit).
+
 ---
 
 ## 5. Texture apps: canvas sub-rect + 2D surround
@@ -445,6 +475,14 @@ launcher. The bare runtime ignores manifests — discovery is the workspace laye
   advertises `SupportsFileDialog=1`. Windows-only today. Spec:
   `docs/specs/extensions/XR_EXT_workspace_file_dialog.md`.
 
+- **INV-10.3 — Know which compositor you're talking to.** In-process (`_handle`/`_texture`/
+  `_hosted`) you drive a **native per-API compositor** in your own process. Under a workspace or
+  `XRT_FORCE_MODE=ipc` you drive a **client compositor → IPC → the D3D11 service multi-compositor**
+  (Metal on macOS), which imports each app's shared texture and composites N apps at their window
+  poses, then hands the atlas to the display processor. Every path is native to the graphics API —
+  there is no cross-API intermediary. Authoritative: `docs/architecture/multi-compositor.md`; live
+  code `src/xrt/compositor/d3d11_service/comp_d3d11_service.cpp` (`multi_compositor_render`).
+
 ---
 
 ## 11. Quick checklist (paste into a PR description)
@@ -454,6 +492,7 @@ launcher. The bare runtime ignores manifests — discovery is the workspace laye
 - [ ] Modes enumerated; active mode tracked via the *event*, not set locally (INV-2.4); per-mode state re-derived each frame (INV-2.6)
 - [ ] `xrLocateViews` into an 8-wide buffer; render/submit `eyeCount` from the active mode, not 2 (INV-3.1)
 - [ ] App swapchain sized once to worst-case atlas (INV-4.2); per-tile = window/canvas × scaleXY, never display (INV-4.3)
+- [ ] Color space: request an **sRGB swapchain** and write a correctly-encoded image (linear render + GPU sRGB-write, or display-referred bytes — not both); linear/UNORM swapchain is not color-managed; data textures always linear (INV-4.6)
 - [ ] (texture) canvas rect set; blit back from `(x,y,w,h)` sub-rect, not origin (INV-5.2); surround cleared on resize (INV-5.6)
 - [ ] (texture) shared surface sized once to worst-case (INV-5.7)
 - [ ] Window-relative Kooima; matrices transposed for DirectX (INV-6.3/6.4)
