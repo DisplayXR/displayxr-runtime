@@ -91,13 +91,13 @@ COMPONENT_INSTALL_MARKER_WINDOWS_gauss_demo="HKLM\\Software\\DisplayXR\\Demos\\G
 DEMO_COMPONENTS="gauss_demo modelviewer_demo mediaplayer_demo"
 
 # --- modelviewer_demo ---
-# glTF 2.0 PBR model viewer demo (displayxr-demo-modelviewer). Windows-only
-# today — the macOS app is not yet ported, so the macOS glob/marker are empty
-# → warn+skip on macOS. First release v0.1.0 (2026-06-01).
+# glTF 2.0 PBR model viewer demo (displayxr-demo-modelviewer). Dual-platform:
+# its build-macos.yml + Windows CI both attach installers on every v* tag
+# (macOS .pkg since v0.3.0; the macOS app installs to "3D Model Viewer.app").
 COMPONENT_REPO_modelviewer_demo="DisplayXR/displayxr-demo-modelviewer"
-COMPONENT_PKG_MACOS_modelviewer_demo=""
+COMPONENT_PKG_MACOS_modelviewer_demo="DisplayXRModelViewer-*.pkg"
 COMPONENT_EXE_WINDOWS_modelviewer_demo="DisplayXRModelViewerSetup-*.exe"
-COMPONENT_INSTALL_MARKER_MACOS_modelviewer_demo=""
+COMPONENT_INSTALL_MARKER_MACOS_modelviewer_demo="/Applications/3D Model Viewer.app"
 COMPONENT_INSTALL_MARKER_WINDOWS_modelviewer_demo="HKLM\\Software\\DisplayXR\\Demos\\ModelViewer"
 
 # --- mediaplayer_demo ---
