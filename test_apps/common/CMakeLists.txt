@@ -76,8 +76,8 @@ target_link_libraries(sr_common PUBLIC
     dwrite
 )
 
-# Atlas capture is runtime-owned now (XR_EXT_atlas_capture); the cube_handle
-# apps call dxr_capture::RequestRuntimeAtlasCapture (in sr_common_base) instead
-# of a per-API readback. The Windows-only D3D11/D3D12 readback TUs were deleted;
-# atlas_capture_{gl,vk}.cpp + atlas_capture_metal.mm remain for the macOS apps,
-# which haven't migrated yet.
+# Atlas capture is runtime-owned now (XR_EXT_atlas_capture); the Windows
+# cube_handle apps call dxr_capture::RequestRuntimeAtlasCapture (in
+# sr_common_base) and the macOS apps call xrCaptureAtlasEXT inline, instead of
+# a per-API readback. All per-API readback TUs (atlas_capture_{d3d11,d3d12,gl,
+# vk}.cpp + atlas_capture_metal.mm) have been deleted (#396 W6).

@@ -43,14 +43,14 @@ std::string PicturesDirectory() {
     return [dxrDir UTF8String];
 }
 
-int NextCaptureNum(const std::string& dir,
-                   const std::string& stem,
-                   uint32_t cols, uint32_t rows) {
+// Scan `dir` for files named "<stem>-<N><suffix>" with an all-digit <N> and
+// return max(N)+1 (1 if none). Shared by the legacy and the xrCaptureAtlasEXT
+// naming, which differ only in the trailing suffix.
+static int NextCaptureNumSuffix(const std::string& dir,
+                                const std::string& stem,
+                                const std::string& suffix) {
     if (dir.empty()) return 1;
-    char suffixBuf[64];
-    snprintf(suffixBuf, sizeof(suffixBuf), "_%ux%u.png", cols, rows);
     std::string prefix = stem + "-";
-    std::string suffix = suffixBuf;
     int maxNum = 0;
     NSError *err = nil;
     NSString *dirNs = [NSString stringWithUTF8String:dir.c_str()];
@@ -79,6 +79,14 @@ int NextCaptureNum(const std::string& dir,
     return maxNum + 1;
 }
 
+int NextCaptureNum(const std::string& dir,
+                   const std::string& stem,
+                   uint32_t cols, uint32_t rows) {
+    char suffixBuf[64];
+    snprintf(suffixBuf, sizeof(suffixBuf), "_%ux%u.png", cols, rows);
+    return NextCaptureNumSuffix(dir, stem, suffixBuf);
+}
+
 std::string MakeCapturePath(const std::string& stem,
                             uint32_t cols, uint32_t rows) {
     std::string dir = PicturesDirectory();
@@ -86,6 +94,20 @@ std::string MakeCapturePath(const std::string& stem,
     char tail[256];
     snprintf(tail, sizeof(tail), "%s-%d_%ux%u.png",
              stem.c_str(), n, cols, rows);
+    return dir.empty() ? std::string(tail) : (dir + "/" + tail);
+}
+
+std::string MakeCaptureAtlasPrefix(const std::string& stem,
+                                   uint32_t cols, uint32_t rows) {
+    std::string dir = PicturesDirectory();
+    // xrCaptureAtlasEXT appends "_atlas.png"; number against that final name so
+    // repeats accumulate rather than overwrite (the legacy "_CxR.png" name space
+    // is scanned separately, so the two never clobber each other's count).
+    char atlasSuffix[80];
+    snprintf(atlasSuffix, sizeof(atlasSuffix), "_%ux%u_atlas.png", cols, rows);
+    int n = NextCaptureNumSuffix(dir, stem, atlasSuffix);
+    char tail[256];
+    snprintf(tail, sizeof(tail), "%s-%d_%ux%u", stem.c_str(), n, cols, rows);
     return dir.empty() ? std::string(tail) : (dir + "/" + tail);
 }
 

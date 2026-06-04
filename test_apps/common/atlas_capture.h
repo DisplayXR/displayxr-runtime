@@ -162,69 +162,12 @@ void TriggerCaptureFlash(void* nsviewBridged);
 #endif
 
 // ---------------------------------------------------------------------------
-// API-specific readback. Each function copies the (rectX, rectY, rectW, rectH)
-// sub-rect of `srcImage` into a host-visible buffer, swaps BGRA → RGBA if
-// needed, and writes a PNG via stb_image_write. Blocks on queue idle for
-// simplicity (one-shot user action; not a per-frame path).
-//
-// Coordinates are top-left origin in image space. `srcImage{Width,Height}`
-// describe the full image; the rect must fit within it.
+// All per-API readback helpers (CaptureAtlasRegion{D3D11,D3D12,GL,VK,Metal})
+// have been removed (#396 W6). Atlas capture is runtime-owned now: the Windows
+// cube_handle apps call dxr_capture::RequestRuntimeAtlasCapture (above) and the
+// macOS cube_handle apps call xrCaptureAtlasEXT inline — no app does its own
+// GPU readback. (The D3D / Vulkan handle forward-declarations near the top are
+// now unused leftovers; harmless, kept to minimize churn.)
 // ---------------------------------------------------------------------------
-
-// `linearBytesInSrgbImage`: set true when the image was written via compute
-// `imageStore` to an sRGB-format swapchain. Compute writes skip Vulkan's
-// automatic linear→sRGB encoding even on sRGB images, so the raw bytes are
-// linear; the runtime's display chain effectively applies `srgbToLinear` to
-// them, and we mirror that here so the captured PNG matches what's on
-// screen. For render-pass-based callers (cube_handle_vk_*) the bytes are
-// already sRGB-encoded on store — leave this `false` (the default).
-bool CaptureAtlasRegionVk(VkDevice device,
-                          VkPhysicalDevice physDev,
-                          VkQueue queue,
-                          VkCommandPool cmdPool,
-                          VkImage srcImage,
-                          int srcFormat,  // VkFormat — cast at call site
-                          uint32_t srcImageWidth,
-                          uint32_t srcImageHeight,
-                          uint32_t rectX,
-                          uint32_t rectY,
-                          uint32_t rectW,
-                          uint32_t rectH,
-                          const std::string& outPath,
-                          bool linearBytesInSrgbImage = false);
-
-// NB: the D3D11/D3D12 per-API readback helpers were removed — those apps use
-// the runtime-owned dxr_capture::RequestRuntimeAtlasCapture (XR_EXT_atlas_capture)
-// above. The VK / GL / Metal readbacks below remain for the macOS apps, which
-// have not migrated yet.
-
-// OpenGL helper. Available on both Windows and macOS — the caller must have
-// a current GL context bound. Loads its own FBO/blit function pointers
-// internally (wglGetProcAddress on Windows; CGL on macOS — desktop GL has
-// these as core symbols).
-//
-// `srcTex` is a 2D color texture (typically the runtime's swapchain image).
-// `srcInternalFormat` is informational; the helper always reads as RGBA8.
-bool CaptureAtlasRegionGL(uint32_t srcTex,
-                          uint32_t srcImageWidth,
-                          uint32_t srcImageHeight,
-                          uint32_t rectX,
-                          uint32_t rectY,
-                          uint32_t rectW,
-                          uint32_t rectH,
-                          const std::string& outPath);
-
-#ifdef __APPLE__
-// Metal readback. `srcTex` is `id<MTLTexture>` (passed as void* to keep the
-// header Objective-C-free). `device` and `queue` likewise.
-bool CaptureAtlasRegionMetal(void* device,
-                             void* queue,
-                             void* srcTex,
-                             uint32_t rectX,
-                             uint32_t rectY,
-                             uint32_t rectW,
-                             uint32_t rectH,
-                             const std::string& outPath);
-#endif
 
 }  // namespace dxr_capture

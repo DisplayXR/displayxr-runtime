@@ -44,6 +44,7 @@
 #include "xr_window_space_hud.h"
 #include "hud_renderer_macos.h"
 #include <openxr/XR_EXT_display_info.h>
+#include <openxr/XR_EXT_atlas_capture.h>
 
 // ============================================================================
 // Logging
@@ -424,7 +425,6 @@ static id<MTLTexture> LoadTextureFromFile(id<MTLDevice> device,
                                            uint8_t fallbackR, uint8_t fallbackG,
                                            uint8_t fallbackB)
 {
-    (void)queue;
     int w, h, channels;
     stbi_uc *pixels = stbi_load(path, &w, &h, &channels, 4);
 
@@ -443,16 +443,34 @@ static id<MTLTexture> LoadTextureFromFile(id<MTLDevice> device,
         return tex;
     }
 
+    // Full mip chain so the wood texture stays smooth under minification
+    // (#396 W6 parity with cube_handle_gl_*'s glGenerateMipmap and the Win
+    // D3D11/D3D12/VK renderers). Metal can GPU-generate the chain, so no CPU
+    // box-filter (common/mip_chain.h) is needed here.
+    NSUInteger mipLevels = 1;
+    for (int d = (w > h ? w : h); d > 1; d >>= 1) mipLevels++;
+
     MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                                                                                     width:w
                                                                                    height:h
-                                                                                mipmapped:NO];
+                                                                                mipmapped:(mipLevels > 1)];
+    desc.mipmapLevelCount = mipLevels;
     desc.usage = MTLTextureUsageShaderRead;
     id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
     [tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:pixels bytesPerRow:w * 4];
 
+    if (mipLevels > 1) {
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        [blit generateMipmapsForTexture:tex];
+        [blit endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+
     stbi_image_free(pixels);
-    LOG_INFO("Loaded texture: %s (%dx%d)", path, w, h);
+    LOG_INFO("Loaded texture: %s (%dx%d, %lu mips)", path, w, h,
+             (unsigned long)mipLevels);
     return tex;
 }
 
@@ -551,6 +569,9 @@ static bool InitRenderer(MetalRenderer &r)
         MTLSamplerDescriptor *desc = [[MTLSamplerDescriptor alloc] init];
         desc.minFilter = MTLSamplerMinMagFilterLinear;
         desc.magFilter = MTLSamplerMinMagFilterLinear;
+        // Trilinear: sample the GPU-generated mip chain so the wood texture
+        // stays smooth under minification (#396 W6 parity with GL/Win).
+        desc.mipFilter = MTLSamplerMipFilterLinear;
         desc.sAddressMode = MTLSamplerAddressModeRepeat;
         desc.tAddressMode = MTLSamplerAddressModeRepeat;
         r.sampler = [r.device newSamplerStateWithDescriptor:desc];
@@ -1098,6 +1119,10 @@ struct AppXrSession {
     PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingModeEXT;
     PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT;
 
+    // XR_EXT_atlas_capture (W6 of #396): runtime-owned 'I'-key atlas capture.
+    bool hasAtlasCaptureExt = false;
+    PFN_xrCaptureAtlasEXT pfnCaptureAtlasEXT = nullptr;
+
     // Enumerated rendering mode info. currentModeIndex is initialized to mode 1
     // as a fallback for runtimes that don't expose isActive; v13+ runtimes
     // replace it via the enumerate step (initial-mode-sync, #234/#239).
@@ -1144,6 +1169,8 @@ static bool InitializeOpenXR(AppXrSession &app)
             app.hasCocoaWindowBinding = true;
         if (strcmp(e.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0)
             app.hasDisplayInfoExt = true;
+        if (strcmp(e.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0)
+            app.hasAtlasCaptureExt = true;
     }
 
     if (!hasMetalEnable) {
@@ -1154,6 +1181,7 @@ static bool InitializeOpenXR(AppXrSession &app)
         LOG_WARN("Runtime does not support XR_EXT_cocoa_window_binding — will create own window");
     }
     LOG_INFO("XR_EXT_display_info: %s", app.hasDisplayInfoExt ? "available" : "not available");
+    LOG_INFO("XR_EXT_atlas_capture: %s", app.hasAtlasCaptureExt ? "available" : "not available");
 
     // Enable extensions
     std::vector<const char *> enabledExts = {XR_KHR_METAL_ENABLE_EXTENSION_NAME};
@@ -1162,6 +1190,9 @@ static bool InitializeOpenXR(AppXrSession &app)
     }
     if (app.hasDisplayInfoExt) {
         enabledExts.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+    }
+    if (app.hasAtlasCaptureExt) {
+        enabledExts.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -1218,6 +1249,11 @@ static bool InitializeOpenXR(AppXrSession &app)
                 (PFN_xrVoidFunction*)&app.pfnRequestDisplayRenderingModeEXT);
             xrGetInstanceProcAddr(app.instance, "xrEnumerateDisplayRenderingModesEXT",
                 (PFN_xrVoidFunction*)&app.pfnEnumerateDisplayRenderingModesEXT);
+        }
+        if (app.hasAtlasCaptureExt) {
+            xrGetInstanceProcAddr(app.instance, "xrCaptureAtlasEXT",
+                (PFN_xrVoidFunction*)&app.pfnCaptureAtlasEXT);
+            LOG_INFO("xrCaptureAtlasEXT: %s", app.pfnCaptureAtlasEXT ? "resolved" : "NULL");
         }
     }
 
@@ -1830,30 +1866,36 @@ int main(int argc, char **argv)
 
             RenderScene(renderer, app.swapchain.images[imageIndex], eyeParams.data(), eyeCount);
 
-            // 'I' key: snapshot the multi-view atlas to a PNG. Skipped for
-            // mono (1×1) layouts. Filename auto-increments per (cols×rows)
-            // so existing captures aren't overwritten.
+            // 'I' key: snapshot the multi-view atlas via the runtime-owned
+            // XR_EXT_atlas_capture (W6 of #396) — the runtime does the readback
+            // from its own atlas image, so the app keeps no staging texture.
+            // PROJECTION_ONLY = the app's own projection atlas, pre-compose.
+            // Skipped for mono (1×1) layouts; the runtime appends "_atlas.png".
             if (g_input.captureAtlasRequested) {
                 g_input.captureAtlasRequested = false;
-                if (display3D && (tileColumns > 1 || tileRows > 1)) {
-                    uint32_t atlasW = tileColumns * renderW;
-                    uint32_t atlasH = tileRows * renderH;
-                    if (atlasW <= app.swapchain.width && atlasH <= app.swapchain.height) {
-                        std::string outPath = dxr_capture::MakeCapturePath(
+                if (app.pfnCaptureAtlasEXT && app.session != XR_NULL_HANDLE) {
+                    if (display3D && (tileColumns > 1 || tileRows > 1)) {
+                        std::string prefix = dxr_capture::MakeCaptureAtlasPrefix(
                             "cube_handle_metal_macos", tileColumns, tileRows);
-                        bool ok = dxr_capture::CaptureAtlasRegionMetal(
-                            (__bridge void*)renderer.device,
-                            (__bridge void*)renderer.commandQueue,
-                            (__bridge void*)app.swapchain.images[imageIndex],
-                            0, 0, atlasW, atlasH, outPath);
-                        if (ok) {
-                            LOG_INFO("Captured atlas %ux%u -> %s",
-                                     atlasW, atlasH, outPath.c_str());
+                        XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
+                        info.next = nullptr;
+                        info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT;
+                        strncpy(info.pathPrefix, prefix.c_str(),
+                                XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1);
+                        info.pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1] = '\0';
+                        XrResult cr = app.pfnCaptureAtlasEXT(app.session, &info, nullptr);
+                        if (XR_SUCCEEDED(cr)) {
+                            LOG_INFO("Atlas capture requested -> %s_atlas.png",
+                                     prefix.c_str());
                             dxr_capture::TriggerCaptureFlash((__bridge void*)g_metalView);
+                        } else {
+                            LOG_WARN("xrCaptureAtlasEXT failed: 0x%x", (unsigned)cr);
                         }
+                    } else {
+                        LOG_WARN("Capture skipped: need 3D mode with cols/rows > 1");
                     }
                 } else {
-                    LOG_WARN("Capture skipped: need 3D mode with cols/rows > 1");
+                    LOG_WARN("Atlas capture unavailable: XR_EXT_atlas_capture not active");
                 }
             }
         }
