@@ -6515,14 +6515,35 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// based on whether the client's most-recent swapchain was
 			// SRGB-encoded. Atlas storage is TYPELESS in workspace mode (see
 			// init_client_render_resources), so both views were created
-			// up-front. The SRGB-SRV path makes the GPU auto-linearize
-			// on sample — the multi-comp shader (passthrough at
-			// convert_srgb=0) then writes linear values to the combined
-			// atlas, which is what the DP weaver expects. Falls back to
-			// the UNORM SRV if the SRGB SRV isn't available (non-workspace
-			// atlas storage is UNORM and only atlas_srv exists; not
-			// expected to reach here in non-workspace mode but stays robust).
+			// up-front. The UNORM SRV is raw passthrough: a client that
+			// stored encoded bytes in a UNORM swapchain reaches the DP
+			// correctly. DisplayXR's handoff encoding is whatever the active
+			// DP accepts (not a fixed value); the runtime sends encoded today
+			// and the active DP accepts it, so passthrough is correct
+			// (see ADR-021).
+			//
+			// KNOWN LATENT HALF-CONVERSION (ADR-021 / #409): the SRGB-SRV
+			// branch makes the GPU decode sRGB->linear on sample, but
+			// NOTHING re-encodes before process_atlas() (the multi-comp
+			// shader is passthrough at convert_srgb=0; linear_to_srgb() in
+			// d3d11_service_shaders.h is defined but never called). So an
+			// sRGB-swapchain client would reach an ENCODED-declaring DP
+			// ~2.2x too dark -- the same unmatched decode #407/#408 fixed
+			// in-process. Dead in practice today: every workspace app stores
+			// encoded-into-UNORM, so atlas_holds_srgb_bytes is false and we
+			// take the UNORM SRV. Fix is the Model-A passthrough baseline
+			// (always use the UNORM SRV here); the eventual general fix is the
+			// declared compose->handoff conversion in ADR-021 §4. Do NOT
+			// "fix" by linearizing more.
 			if (cc->atlas_holds_srgb_bytes && cc->render.atlas_srv_srgb) {
+				static bool logged_srgb_halfconv = false;
+				if (!logged_srgb_halfconv) {
+					logged_srgb_halfconv = true;
+					U_LOG_W("Color: sRGB-SRV decode on per-client atlas with no "
+					        "re-encode before process_atlas() -- known latent "
+					        "half-conversion (ADR-021/#409); an ENCODED-declaring "
+					        "DP receives too-dark values for this sRGB client.");
+				}
 				slot_srv = cc->render.atlas_srv_srgb.get();
 			} else {
 				slot_srv = cc->render.atlas_srv.get();

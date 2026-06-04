@@ -37,7 +37,7 @@ End goal: ship the capability through Unity's plugin so Unity editors and runtim
 
 - [ ] In `src/xrt/compositor/d3d11/comp_d3d11_compositor.cpp` (or wherever the per-frame `process_atlas` is dispatched), add a surround-blit pass after the DP's weave finishes:
   1. `AcquireSync(0)` on the surround texture's KeyedMutex.
-  2. Bind two SRVs on the surround texture (UNORM + UNORM_SRGB, parallel to the shell-mode `atlas_holds_srgb_bytes` pattern in [`compositor-pipeline.md`](../architecture/compositor-pipeline.md#color-space-handling-d3d11-service-compositor-shell-mode)).
+  2. Bind two SRVs on the surround texture (UNORM + UNORM_SRGB, parallel to the workspace-mode `atlas_holds_srgb_bytes` pattern in [`compositor-pipeline.md`](../architecture/compositor-pipeline.md#color-space-handling-d3d11-service-compositor)).
   3. Run a fullscreen blit shader against the target swapchain with a scissor-rect strategy:
      - Path A: four scissor-rects (top/bottom/left/right strips around the canvas) → four `CopySubresourceRegion` or quad draws.
      - Path B: one fullscreen pass with a "skip if inside canvas rect" branch in the pixel shader.

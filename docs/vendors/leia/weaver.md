@@ -474,6 +474,32 @@ void setShaderSRGBConversion(bool read, bool write);
 - `write = true`: Shader converts output from linear to sRGB before writing to RT.
 - Set to `false` when hardware handles conversion (e.g., `_SRGB` format views) or when the pipeline is already in the desired color space.
 
+### Mapping to the DisplayXR encoding-state contract (ADR-021)
+
+This knob is exactly what lets this weaver satisfy the runtime's color contract
+([ADR-021](../../adr/ADR-021-color-management-encoding-state-invariant.md)): because the
+encoding is selected by API call (not inferred from the input format), this DP's
+capability is **`EITHER`**, and the weaver itself owns the matched output encode
+(`write`). The DP drives the knob from the atlas encoding the runtime declares per frame:
+
+| Runtime-declared atlas encoding | `setShaderSRGBConversion` | Result |
+|---|---|---|
+| Encoded (today's default) | `(false, false)` | weave as-is, output encoded |
+| Encoded, weave in linear | `(true, true)` | decode → weave linear → re-encode |
+| Linear (ADR-021 Model B) | `(false, true)` | weave linear → encode on output |
+
+Because the weaver does the output encode, the **runtime needs no encode shader** — the
+matched encode partner lives here, in the DP, which is the vendor-isolation-correct place
+for it.
+
+**Current plug-in gaps (tracked for `displayxr-leia-plugin`):**
+- The D3D11 wrapper exposes the setter (`leiasr_d3d11_set_srgb_conversion`) but the
+  display processor **never calls it**, so the weaver currently does no conversion. That
+  is fine while the runtime sends encoded (passthrough), but means feeding it linear
+  bytes would render too dark — wire the call to the declared atlas encoding.
+- The **D3D12 and GL** wrappers do not expose the setter at all, though the SDK provides
+  it for every API variant — expose it for parity before enabling a linear compose path.
+
 ---
 
 ## Phase Snapping
