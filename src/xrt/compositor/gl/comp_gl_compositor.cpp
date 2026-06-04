@@ -448,6 +448,35 @@ xrt_format_to_gl_internal(int64_t fmt)
 	}
 }
 
+// GL_EXT_texture_sRGB_decode — not in our GLAD spec, so define the enums.
+#ifndef GL_TEXTURE_SRGB_DECODE_EXT
+#define GL_TEXTURE_SRGB_DECODE_EXT 0x8A48
+#endif
+#ifndef GL_SKIP_DECODE_EXT
+#define GL_SKIP_DECODE_EXT 0x8A4A
+#endif
+
+// True if GL_EXT_texture_sRGB_decode is present (cached; needs a current context).
+static bool
+gl_has_srgb_decode_ext(void)
+{
+	static int cached = -1;
+	if (cached >= 0) {
+		return cached != 0;
+	}
+	cached = 0;
+	GLint n = 0;
+	glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+	for (GLint i = 0; i < n; i++) {
+		const GLubyte *e = glGetStringi(GL_EXTENSIONS, (GLuint)i);
+		if (e != NULL && strcmp((const char *)e, "GL_EXT_texture_sRGB_decode") == 0) {
+			cached = 1;
+			break;
+		}
+	}
+	return cached != 0;
+}
+
 
 /*
  *
@@ -579,6 +608,20 @@ gl_compositor_create_swapchain(struct xrt_compositor *xc,
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+		// sRGB passthrough: apps write display-referred bytes into the sRGB
+		// swapchain image (typically with GL_FRAMEBUFFER_SRGB off). When the
+		// compositor later samples it, a GL_SRGB8_ALPHA8 texture would auto
+		// decode sRGB->linear, and since compose writes to a non-sRGB atlas
+		// with no re-encode the DP receives ~2.2x-too-dark content. The Leia
+		// DP expects sRGB-encoded bytes, so skip the sample-time decode and
+		// pass the stored bytes through unchanged. This is correct for apps
+		// that DO enable GL_FRAMEBUFFER_SRGB too (their encoded bytes also
+		// pass through). Only the in-process native GL path samples these
+		// textures, so this never affects app-side rendering.
+		if (internal_format == GL_SRGB8_ALPHA8 && gl_has_srgb_decode_ext()) {
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SRGB_DECODE_EXT, GL_SKIP_DECODE_EXT);
+		}
 
 		// Store GL texture name in the swapchain_gl images array
 		// (this is what the state tracker reads via xrt_swapchain_gl)
