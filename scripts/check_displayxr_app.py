@@ -53,7 +53,7 @@ RULES = {
     "INV-9.2": "2D icon is 512x512 (`icon`); 3D icon is 1024x512 (`icon_3d`, requires `icon`); layout in {sbs-lr,sbs-rl,tb,bt}.",
 }
 
-ERROR, WARN = "ERROR", "WARN"
+ERROR, WARN, INFO = "ERROR", "WARN", "INFO"
 
 
 class Finding:
@@ -68,32 +68,34 @@ class Finding:
         self.fix = fix
 
 
-# --- compiled source patterns: (regex, level, rule, message, fix) ---
+# --- compiled source patterns: (regex, level, rule, message, fix, multiview_only) ---
+# multiview_only=True patterns apply only to N-view EXTENSION apps; they're skipped
+# for legacy / non-extension apps (which are legitimately fixed 2-view).
 SRC_PATTERNS = [
     (re.compile(r"\bXrView\s+\w+\s*\[\s*2\s*\]"),
      ERROR, "INV-3.1",
      "XrView array hardcoded to [2] — quad modes have 4 views.",
-     "Size it XrView views[8] (XRT_MAX_VIEWS) and locate with viewCapacityInput=8."),
+     "Size it XrView views[8] (XRT_MAX_VIEWS) and locate with viewCapacityInput=8.", True),
     (re.compile(r"\bXrCompositionLayerProjectionView\s+\w+\s*\[\s*2\s*\]"),
      ERROR, "INV-3.1",
      "Projection-view array hardcoded to [2].",
-     "Allocate eyeCount-sized (active mode's viewCount), e.g. std::vector<...>(eyeCount)."),
+     "Allocate eyeCount-sized (active mode's viewCount), e.g. std::vector<...>(eyeCount).", True),
     (re.compile(r"\bdisplay(?:Pixel)?(?:Width|Height)\s*/\s*2\b"),
      ERROR, "INV-4.3",
      "Swapchain/tile size derived from display dimensions (display/2).",
-     "Use window/canvas size x recommendedViewScaleX/Y, clamped to the swapchain tile capacity."),
+     "Use window/canvas size x recommendedViewScaleX/Y, clamped to the swapchain tile capacity.", False),
     (re.compile(r"\bCaptureAtlasRegion(?:D3D11|D3D12|GL|VK|Metal)?\b"),
      ERROR, "INV-7.x",
      "Deprecated app-side atlas readback (CaptureAtlasRegion*) — removed in the #396 W6 refactor.",
-     "Use xrCaptureAtlasEXT (Windows: dxr_capture::RequestRuntimeAtlasCapture; elsewhere call it inline)."),
+     "Use xrCaptureAtlasEXT (Windows: dxr_capture::RequestRuntimeAtlasCapture; elsewhere call it inline).", False),
     (re.compile(r"\bpathPrefix\b[^;\n]*\"[^\"]*\.png\""),
      WARN, "INV-7.2",
      "xrCaptureAtlasEXT pathPrefix contains a .png extension.",
-     "Pass a prefix with NO extension — the runtime appends _atlas.png."),
+     "Pass a prefix with NO extension — the runtime appends _atlas.png.", False),
     (re.compile(r"for\s*\([^;]*;[^;]*\b(?:eye|view|v|i)\s*<\s*2\b"),
      WARN, "INV-3.1",
      "Render/eye loop bounded by a literal 2.",
-     "Bound by the active mode's viewCount (eyeCount), not 2 — clamp array reads to viewCountOutput."),
+     "Bound by the active mode's viewCount (eyeCount), not 2 — clamp array reads to viewCountOutput.", True),
 ]
 
 # Tokens that indicate the app uses an sRGB swapchain somewhere (for INV-4.6).
@@ -102,7 +104,19 @@ SRGB_TOKENS = re.compile(
     re.IGNORECASE,
 )
 CREATES_SWAPCHAIN = re.compile(r"\bxrCreateSwapchain\b")
+# An N-view extension app drives the rendering-mode enumeration; a legacy / fixed-2-view
+# app does not. Used to gate the multiview-only checks (so legacy apps aren't false-flagged).
+N_VIEW_MARKER = re.compile(
+    r"xrEnumerateDisplayRenderingModesEXT|renderingModeCount|XrDisplayRenderingModeInfoEXT"
+)
 ICON_LAYOUTS = {"sbs-lr", "sbs-rl", "tb", "bt"}
+
+
+def strip_comments(text: str) -> str:
+    """Blank out // and /* */ comments so commented-out code isn't matched.
+    Newlines are preserved so reported line numbers stay accurate."""
+    text = re.sub(r"/\*.*?\*/", lambda m: "\n" * m.group(0).count("\n"), text, flags=re.DOTALL)
+    return re.sub(r"//[^\n]*", "", text)
 
 
 def iter_source_files(root: Path):
@@ -136,33 +150,48 @@ def png_dimensions(path: Path):
 
 
 def scan_sources(root: Path, findings: list):
-    any_swapchain = False
-    any_srgb = False
-    swapchain_loc = None
+    # First pass: read files once; detect whether this is an N-view extension app
+    # and whether an sRGB swapchain format appears anywhere.
+    files = []
     for path in iter_source_files(root):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        lines = text.splitlines()
-        if SRGB_TOKENS.search(text):
-            any_srgb = True
-        for regex, level, rule, msg, fix in SRC_PATTERNS:
+        files.append((path, strip_comments(text)))
+    is_extension_app = any(N_VIEW_MARKER.search(t) for _, t in files)
+    any_srgb = any(SRGB_TOKENS.search(t) for _, t in files)
+
+    if not is_extension_app and files:
+        findings.append(Finding(
+            INFO, "note", str(root.name or root), 1,
+            "Treated as a legacy / non-extension app (no rendering-mode enumeration) — "
+            "multiview view-count checks (INV-3.1) skipped; fixed 2-view is valid here.",
+            "If this is meant to be an N-view extension app, enumerate modes "
+            "(xrEnumerateDisplayRenderingModesEXT, INV-2.3) and size view arrays to XRT_MAX_VIEWS.",
+        ))
+
+    swapchain_loc = None
+    for path, text in files:
+        for regex, level, rule, msg, fix, multiview_only in SRC_PATTERNS:
+            if multiview_only and not is_extension_app:
+                continue
             for m in regex.finditer(text):
                 line_no = text.count("\n", 0, m.start()) + 1
                 findings.append(Finding(level, rule, rel(path, root), line_no, msg, fix))
-        if CREATES_SWAPCHAIN.search(text):
-            any_swapchain = True
-            if swapchain_loc is None:
-                m = CREATES_SWAPCHAIN.search(text)
+        if swapchain_loc is None:
+            m = CREATES_SWAPCHAIN.search(text)
+            if m:
                 swapchain_loc = (rel(path, root), text.count("\n", 0, m.start()) + 1)
-    # INV-4.6 advisory: creates a swapchain but no sRGB format token anywhere.
-    if any_swapchain and not any_srgb:
+
+    # INV-4.6 advisory: creates a swapchain but no sRGB format appears anywhere.
+    if swapchain_loc and not any_srgb:
         p, ln = swapchain_loc
         findings.append(Finding(
             WARN, "INV-4.6", p, ln,
-            "Creates a swapchain but no sRGB format appears anywhere in the app.",
-            "Request an sRGB swapchain (_UNORM_SRGB / GL_SRGB8_ALPHA8 / _SRGB / MTLPixelFormat*sRGB) and store an encoded image.",
+            "No sRGB swapchain format detected — INV-4.6 recommends an sRGB swapchain.",
+            "Request an sRGB swapchain (_UNORM_SRGB / GL_SRGB8_ALPHA8 / _SRGB / MTLPixelFormat*sRGB). "
+            "A UNORM swapchain is valid ONLY if you store display-referred (already-encoded) bytes.",
         ))
 
 
@@ -230,7 +259,7 @@ def print_findings(findings: list, root: Path) -> None:
     if not findings:
         print(f"✓ check_displayxr_app: no issues in {root}")
         return
-    order = {ERROR: 0, WARN: 1}
+    order = {ERROR: 0, WARN: 1, INFO: 2}
     findings.sort(key=lambda f: (order[f.level], f.rule, f.path, f.line))
     for f in findings:
         print(f"{f.level:5} {f.path}:{f.line}  [{f.rule}] {f.msg}")

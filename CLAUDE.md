@@ -314,7 +314,11 @@ Release builds lack PDBs — use `ub` to find the calling pattern (`mov rax,[rbx
 - **Never** add per-frame `U_LOG_W` — massive log bloat.
 
 ### Other skills
-`/ask-gemini` — read-only code analysis report via Gemini (`~/.claude/skills/ask-gemini/SKILL.md`).
+- `/ask-gemini` — read-only code analysis report via Gemini (`~/.claude/skills/ask-gemini/SKILL.md`).
+- `/new-displayxr-app <name> [class=] [api=] [platform=]` — scaffold a new app correct-by-construction (clones the nearest `cube_*` reference, drops manifest + per-app CLAUDE.md, wires CMake, lints). Backed by `docs/guides/displayxr-app-rules.md`.
+
+### Writing / checking a DisplayXR app
+The authoring invariants live in `docs/guides/displayxr-app-rules.md` (INV-* rules for views, swapchain tiling, color, capture, manifest/logos, workspace + the `F-*` OpenXR foundations). Lint any app against them with `python3 scripts/check_displayxr_app.py <app-dir>` (`--list-rules` for the catalog) — run it before calling an app done.
 
 ## Documentation index
 
@@ -329,6 +333,7 @@ See `docs/README.md` for the full index. By task:
 | Multiview tiling / atlas layout | `docs/specs/runtime/multiview-tiling.md` |
 | Extension API (display_info, window bindings) | `docs/specs/extensions/XR_EXT_display_info.md` |
 | Why an architectural decision was made | `docs/adr/` |
+| Write / scaffold / lint a DisplayXR app | `docs/guides/displayxr-app-rules.md` (+ `/new-displayxr-app`, `scripts/check_displayxr_app.py`) |
 | Legacy vs extension app differences | `docs/architecture/extension-vs-legacy.md` |
 | Eye-tracking MANAGED/MANUAL contract | `docs/specs/vendor/eye-tracking-modes.md` |
 | Add a new OpenXR extension | `docs/guides/implementing-extension.md` |
