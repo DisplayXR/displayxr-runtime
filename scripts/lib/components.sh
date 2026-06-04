@@ -14,9 +14,19 @@
 #                                             successful install on macOS. Empty = skip check.
 #   COMPONENT_INSTALL_MARKER_WINDOWS_<name>   Registry key whose existence proves a
 #                                             successful install on Windows. Empty = skip check.
+#   COMPONENT_PIN_KEY_<name>                  versions.json key holding this component's tag,
+#                                             when it differs from <name> (e.g. nested under
+#                                             "demos"). Empty = the pin key equals <name>.
 #
 # A blank platform glob means "warn-and-skip on this platform" — used today
 # for shell/leia/mcp on macOS.
+#
+# Demos are *installed from their prebuilt release asset*, exactly like
+# runtime/shell/leia/mcp — never built from source. So `--with-demos` is
+# insensitive to a contributor's build environment (Vulkan SDK, graphics
+# toolchains, …): the binary was already compiled by the demo's own CI.
+# Demos that ship no release installer are source-only and belong under
+# `--with-demo-sources` (clone), not in DEMO_COMPONENTS below.
 #
 # `scripts/setup-displayxr.bat` mirrors these tables inline at the top of the
 # file (Windows batch can't source bash). Keep both in sync when bumping
@@ -71,6 +81,14 @@ COMPONENT_PKG_MACOS_gauss_demo="DisplayXRGaussianSplat-*.pkg"
 COMPONENT_EXE_WINDOWS_gauss_demo="DisplayXRGaussianSplatSetup-*.exe"
 COMPONENT_INSTALL_MARKER_MACOS_gauss_demo="/Applications/Gaussian Splat Viewer.app"
 COMPONENT_INSTALL_MARKER_WINDOWS_gauss_demo="HKLM\\Software\\DisplayXR\\Demos\\GaussianSplat"
+# Pin key defaults to the component name (top-level "gauss_demo" in
+# versions.json) — no COMPONENT_PIN_KEY override needed for the flat schema.
+
+# Demo components installed by --with-demos (prebuilt release assets only).
+# Space-separated; add a demo here once it ships a release installer that CI
+# attaches on a v* tag. The `setup-displayxr.bat` mirror keeps its own copy of
+# this list — keep both in sync.
+DEMO_COMPONENTS="gauss_demo modelviewer_demo mediaplayer_demo"
 
 # --- modelviewer_demo ---
 # glTF 2.0 PBR model viewer demo (displayxr-demo-modelviewer). Windows-only
@@ -95,8 +113,8 @@ COMPONENT_INSTALL_MARKER_MACOS_mediaplayer_demo="/Applications/Stereo Media Play
 COMPONENT_INSTALL_MARKER_WINDOWS_mediaplayer_demo="HKLM\\Software\\DisplayXR\\Demos\\MediaPlayer"
 
 # Helper: look up a per-component field for the current platform.
-#   $1 = component name (runtime, shell, leia_plugin, mcp_tools)
-#   $2 = field (REPO, PKG_MACOS, EXE_WINDOWS, INSTALL_MARKER_MACOS)
+#   $1 = component name (runtime, shell, leia_plugin, mcp_tools, gauss_demo)
+#   $2 = field (REPO, PKG_MACOS, EXE_WINDOWS, INSTALL_MARKER_MACOS, PIN_KEY)
 # Prints the value (may be empty).
 component_field() {
     local var="COMPONENT_${2}_${1}"

@@ -42,13 +42,15 @@ OpenXR runtime via `HKLM\Software\Khronos\OpenXR\1\ActiveRuntime`.
 |---|---|
 | _(none)_ | macOS: runtime only. Windows: runtime + Shell + Leia plug-in. |
 | `--with mcp` | Also install DisplayXR MCP Tools (now dual-platform: `DisplayXRMCPSetup-*.exe` on Windows, `DisplayXRMCP-*.pkg` on macOS). |
-| `--with-demos` | Clone each `DisplayXR/displayxr-demo-*` repo into `./demos/<name>/`. Does not build them. |
+| `--with-demos` | Also **install** each demo's prebuilt release asset (same download → silent-install → marker-check path as the runtime — no source build, so a contributor's graphics toolchain / Vulkan SDK is irrelevant). A demo with no release asset for this OS warn-and-skips. |
+| `--with-demo-sources` | **Clone** each `DisplayXR/displayxr-demo-*` repo into `./demos/<name>/` for building from source. Does not build them — see each demo's README. Independent of `--with-demos`. |
 | `--dry-run` | Print every download / install command without running it. |
 | `--uninstall` | macOS: chain `/Library/Application Support/DisplayXR/uninstall.sh`. Windows: silent-uninstall every `Publisher=DisplayXR` component. |
 | `-h`, `--help` | Show usage. |
 
-`--with` and `--with-demos` combine freely. `--dry-run` works with all
-other flags.
+`--with`, `--with-demos`, and `--with-demo-sources` combine freely (pass
+both demo flags to install the released demos *and* clone their sources).
+`--dry-run` works with all other flags.
 
 ## Prerequisites
 
@@ -90,9 +92,9 @@ Top-level pin file. Bump a value here to roll the dev box forward:
   "shell":       "v1.2.5",
   "leia_plugin": "v1.0.3",
   "mcp_tools":   "v0.3.2",
-  "demos": {
-    "gaussiansplat": "v1.4.1"
-  }
+  "gauss_demo":  "v1.4.1",
+  "modelviewer_demo": "v0.7.0",
+  "mediaplayer_demo": "v1.0.0"
 }
 ```
 

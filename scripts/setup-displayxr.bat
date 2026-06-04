@@ -11,11 +11,12 @@ REM same default-install semantics, same warn-and-skip pattern for
 REM components whose pinned release has no Windows asset attached.
 REM
 REM Usage:
-REM   scripts\setup-displayxr.bat                   :: runtime + shell + leia
-REM   scripts\setup-displayxr.bat --with mcp        :: also DisplayXR MCP Tools
-REM   scripts\setup-displayxr.bat --with-demos      :: also clone demos\
-REM   scripts\setup-displayxr.bat --dry-run         :: print plan, install nothing
-REM   scripts\setup-displayxr.bat --uninstall       :: uninstall every DisplayXR-published component
+REM   scripts\setup-displayxr.bat                      :: runtime + shell + leia
+REM   scripts\setup-displayxr.bat --with mcp           :: also DisplayXR MCP Tools
+REM   scripts\setup-displayxr.bat --with-demos         :: also install each demo's prebuilt release
+REM   scripts\setup-displayxr.bat --with-demo-sources  :: also clone each demo's source into demos\
+REM   scripts\setup-displayxr.bat --dry-run            :: print plan, install nothing
+REM   scripts\setup-displayxr.bat --uninstall          :: uninstall every DisplayXR-published component
 REM   scripts\setup-displayxr.bat --help
 REM
 REM Must be run from an ELEVATED command prompt (Right-click cmd.exe ->
@@ -49,6 +50,12 @@ set "COMPONENT_MARKER_mcp_tools=HKLM\Software\DisplayXR\Capabilities\MCP"
 set "COMPONENT_REPO_gauss_demo=DisplayXR/displayxr-demo-gaussiansplat"
 set "COMPONENT_EXE_gauss_demo=DisplayXRGaussianSplatSetup-*.exe"
 set "COMPONENT_MARKER_gauss_demo=HKLM\Software\DisplayXR\Demos\GaussianSplat"
+REM Pin key defaults to the component name (top-level "gauss_demo" in
+REM versions.json) — no COMPONENT_PINKEY override needed for the flat schema.
+
+REM Demo components installed by --with-demos (prebuilt release assets only).
+REM Mirrors DEMO_COMPONENTS in scripts\lib\components.sh; keep in sync.
+set "DEMO_COMPONENTS=gauss_demo modelviewer_demo mediaplayer_demo"
 
 set "COMPONENT_REPO_modelviewer_demo=DisplayXR/displayxr-demo-modelviewer"
 set "COMPONENT_EXE_modelviewer_demo=DisplayXRModelViewerSetup-*.exe"
@@ -61,6 +68,7 @@ set "COMPONENT_MARKER_mediaplayer_demo=HKLM\Software\DisplayXR\Demos\MediaPlayer
 REM --- Default flag state ---
 set "WITH_MCP=0"
 set "WITH_DEMOS=0"
+set "WITH_DEMO_SOURCES=0"
 set "DRY_RUN=0"
 set "ACTION=install"
 set "EXITCODE=0"
@@ -73,6 +81,7 @@ if /i "%~1"=="--help"       goto :show_help
 if /i "%~1"=="--dry-run"    set "DRY_RUN=1" & shift & goto :argloop
 if /i "%~1"=="--uninstall"  set "ACTION=uninstall" & shift & goto :argloop
 if /i "%~1"=="--with-demos" set "WITH_DEMOS=1" & shift & goto :argloop
+if /i "%~1"=="--with-demo-sources" set "WITH_DEMO_SOURCES=1" & shift & goto :argloop
 if /i "%~1"=="--with" goto :arg_with
 echo ERROR: Unknown flag: %~1 1>&2
 call :usage 1>&2
@@ -144,8 +153,13 @@ call :install_component shell "%SHELL_TAG%"
 call :install_component leia_plugin "%LEIA_TAG%"
 if "%WITH_MCP%"=="1" call :install_component mcp_tools "%MCP_TAG%"
 
-REM --- --with-demos ---
-if "%WITH_DEMOS%"=="1" call :clone_demos
+REM --- --with-demos: install each demo's prebuilt release asset ---
+REM After the core components so demo installers that require the runtime
+REM (a hard prereq for some) find it already registered.
+if "%WITH_DEMOS%"=="1" call :install_demos
+
+REM --- --with-demo-sources: clone demo source trees (for building) ---
+if "%WITH_DEMO_SOURCES%"=="1" call :clone_demos
 
 REM --- Link release skills into %USERPROFILE%\.claude\skills ---
 REM The /dxr-release + /installer-release skills live git-tracked in this
@@ -190,9 +204,12 @@ echo.
 echo Usage: scripts\setup-displayxr.bat [flags]
 echo.
 echo   --with mcp        Also install DisplayXR MCP Tools.
-echo   --with-demos      Clone each DisplayXR/displayxr-demo-* repo into
-echo                     .\demos\^<name^>\ ^(does not build them; see each
-echo                     demo's README for build steps^).
+echo   --with-demos      Also install each demo's prebuilt release installer
+echo                     ^(no build needed; demos with no Windows asset skip^).
+echo   --with-demo-sources
+echo                     Also clone each DisplayXR/displayxr-demo-* repo into
+echo                     .\demos\^<name^>\ for building from source ^(does not
+echo                     build them^). Independent of --with-demos.
 echo   --dry-run         Print everything that would be downloaded and
 echo                     installed; perform no privileged operations.
 echo   --uninstall       Silent-uninstall every DisplayXR-published component
@@ -206,7 +223,7 @@ echo write to HKLM and Program Files.
 exit /b 0
 
 :usage
-echo Usage: scripts\setup-displayxr.bat [--with mcp] [--with-demos] [--dry-run] [--uninstall] [-h^|--help]
+echo Usage: scripts\setup-displayxr.bat [--with mcp] [--with-demos] [--with-demo-sources] [--dry-run] [--uninstall] [-h^|--help]
 exit /b 0
 
 REM Read a pinned tag from versions.json into the named env var.
@@ -326,6 +343,19 @@ if not "%_IC_MARKER%"=="" (
 )
 
 echo  OK  %_IC_NAME% installed.
+exit /b 0
+
+REM Install each demo in %DEMO_COMPONENTS% from its prebuilt release asset.
+REM Resolves each demo's versions.json pin key (COMPONENT_PINKEY_<name>,
+REM default <name>), reads the pin, and reuses :install_component — same
+REM download + silent-install + marker-check path as the core components.
+:install_demos
+for %%d in (%DEMO_COMPONENTS%) do (
+    set "_ID_PINKEY=!COMPONENT_PINKEY_%%d!"
+    if not defined _ID_PINKEY set "_ID_PINKEY=%%d"
+    call :read_pin "!_ID_PINKEY!" _ID_TAG
+    call :install_component %%d "!_ID_TAG!"
+)
 exit /b 0
 
 REM Discover and clone all DisplayXR/displayxr-demo-* repos into demos\<name>\.

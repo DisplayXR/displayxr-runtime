@@ -10,11 +10,12 @@
 # user-facing installer release.
 #
 # Usage:
-#   ./scripts/setup-displayxr.sh                # runtime (+ bundled sim-display)
-#   ./scripts/setup-displayxr.sh --with mcp     # also DisplayXR MCP Tools
-#   ./scripts/setup-displayxr.sh --with-demos   # also clone each demo into demos/
-#   ./scripts/setup-displayxr.sh --dry-run      # print plan, install nothing
-#   ./scripts/setup-displayxr.sh --uninstall    # chain known uninstallers
+#   ./scripts/setup-displayxr.sh                     # runtime (+ bundled sim-display)
+#   ./scripts/setup-displayxr.sh --with mcp          # also DisplayXR MCP Tools
+#   ./scripts/setup-displayxr.sh --with-demos        # also install each demo's prebuilt release
+#   ./scripts/setup-displayxr.sh --with-demo-sources # also clone each demo's source into demos/
+#   ./scripts/setup-displayxr.sh --dry-run           # print plan, install nothing
+#   ./scripts/setup-displayxr.sh --uninstall         # chain known uninstallers
 #   ./scripts/setup-displayxr.sh --help
 
 set -euo pipefail
@@ -42,6 +43,7 @@ ok()   { printf '%s OK %s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 # --- arg parsing ---
 WITH_MCP=0
 WITH_DEMOS=0
+WITH_DEMO_SOURCES=0
 DRY_RUN=0
 ACTION=install   # install | uninstall | help
 
@@ -53,9 +55,14 @@ Usage: $0 [flags]
 
   --with mcp        Also install DisplayXR MCP Tools (when a macOS
                     asset is available; warn+skip otherwise).
-  --with-demos      Clone each DisplayXR/displayxr-demo-* repo into
-                    ./demos/<name>/ (does not build them; see each
-                    demo's README for build steps).
+  --with-demos      Also install each demo's prebuilt release asset
+                    (no build needed — same install path as the runtime).
+                    Demos without a release asset for this OS are skipped.
+  --with-demo-sources
+                    Also clone each DisplayXR/displayxr-demo-* repo into
+                    ./demos/<name>/ for building from source (does not
+                    build them; see each demo's README). Independent of
+                    --with-demos; pass both to install and clone.
   --dry-run         Print everything that would be downloaded and
                     installed; perform no privileged operations.
   --uninstall       Chain known uninstallers (runtime + sim-display
@@ -77,7 +84,8 @@ while [ $# -gt 0 ]; do
                 *)  err "Unknown --with target: $1 (supported: mcp)"; exit 2 ;;
             esac
             ;;
-        --with-demos) WITH_DEMOS=1 ;;
+        --with-demos)        WITH_DEMOS=1 ;;
+        --with-demo-sources) WITH_DEMO_SOURCES=1 ;;
         --dry-run)    DRY_RUN=1 ;;
         --uninstall)  ACTION=uninstall ;;
         -h|--help)    ACTION=help ;;
@@ -173,11 +181,15 @@ COMPONENTS=(runtime)
 
 install_component() {
     local name="$1"
-    local repo tag glob marker
+    local repo tag glob marker pin_key
     repo="$(component_field "$name" REPO)"
     glob="$(component_field "$name" PKG_MACOS)"
     marker="$(component_field "$name" INSTALL_MARKER_MACOS)"
-    tag="$(pinned_tag "$name" 2>/dev/null || true)"
+    # Most components' versions.json pin key is the component name; demos and
+    # any future nested entries override it via COMPONENT_PIN_KEY_<name>.
+    pin_key="$(component_field "$name" PIN_KEY)"
+    [ -z "$pin_key" ] && pin_key="$name"
+    tag="$(pinned_tag "$pin_key" 2>/dev/null || true)"
 
     if [ -z "$tag" ]; then
         err "versions.json has no pin for component '$name'."
@@ -206,8 +218,13 @@ install_component() {
     # when a pre-#279 runtime tag is selected.
     local asset_count
     asset_count="$(gh release view "$tag" --repo "$repo" --json assets \
-        --jq "[.assets[].name | select(test(\"$(printf '%s' "$glob" | sed 's/\*/.*/g')\"))] | length")"
-    if [ "$asset_count" -eq 0 ]; then
+        --jq "[.assets[].name | select(test(\"$(printf '%s' "$glob" | sed 's/\*/.*/g')\"))] | length" 2>/dev/null || true)"
+    # A transient gh/network failure (e.g. a broken pipe) leaves asset_count
+    # empty or non-numeric — don't let the integer test below abort with
+    # "integer expected". Only warn-and-skip on a confirmed zero; otherwise
+    # fall through to the download, which is the real gate (it errors cleanly
+    # if the asset is genuinely absent).
+    if [[ "$asset_count" =~ ^[0-9]+$ ]] && [ "$asset_count" -eq 0 ]; then
         warn "$name @ $tag: no asset matching '$glob' is attached to this release."
         warn "       Pin a newer tag in versions.json once one is available."
         warn "       (Runtime macOS .pkg first appears in the release immediately after PR #279.)"
@@ -247,9 +264,21 @@ for c in "${COMPONENTS[@]}"; do
     install_component "$c" || FAIL=1
 done
 
-# --- --with-demos (always after binary installs) ---
+# --- --with-demos: install each demo's prebuilt release asset ---
+# Runs after the core components so demo installers that require the runtime
+# (a hard prereq for some) find it already in place. No source build — a
+# demo with no macOS asset on its pinned tag warn-and-skips (return 0).
 
 if [ "$WITH_DEMOS" -eq 1 ]; then
+    info "Installing demo release assets…"
+    for d in $DEMO_COMPONENTS; do
+        install_component "$d" || FAIL=1
+    done
+fi
+
+# --- --with-demo-sources: clone demo source trees (for building) ---
+
+if [ "$WITH_DEMO_SOURCES" -eq 1 ]; then
     info "Discovering DisplayXR demo repos…"
     DEMOS_DIR="$REPO_ROOT/demos"
     [ "$DRY_RUN" -eq 0 ] && mkdir -p "$DEMOS_DIR"
