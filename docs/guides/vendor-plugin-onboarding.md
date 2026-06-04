@@ -4,8 +4,8 @@ This guide walks a new 3D-display vendor from zero to a shipping DisplayXR-compa
 
 If you're maintaining a vendor integration that was historically in-tree (the way `drv_leia` was before #263), see the [legacy in-tree guide](../archive/vendor-integration-historical.md) — kept for historical context. Everything below assumes the post-#263 model.
 
-> **Canonical examples**
-> - [`DisplayXR/displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin) — full vendor integration with SR SDK; the recommended starting point. Fork the repo, swap `drv_leia/` for `drv_<your-vendor>/`, point the installer at your `<id>`.
+> **Canonical examples** (Leia SR is used throughout as the *example vendor* — substitute your own vendor name, SDK, and `<id>`)
+> - [`DisplayXR/displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin) — a full worked vendor integration (the first vendor on the platform); the recommended starting point. Fork the repo, swap `drv_leia/` for `drv_<your-vendor>/`, point the installer at your `<id>`.
 > - `src/xrt/drivers/sim_display/sim_display_plugin.c` (in this repo) — vendor-neutral software-only plug-in. Smaller, no vendor SDK, useful as a minimal-shape reference.
 
 ## 1. What you ship
@@ -82,7 +82,7 @@ Then:
 2. **Rewrite `src/drv_<vendor>/<vendor>_plugin.c`** against `xrt_plugin_iface` — see the [iface reference](../reference/xrt_plugin_iface.md) for which callbacks are required vs optional and what each one must produce.
 3. **Update `CMakeLists.txt`** — rename the `add_library(DisplayXR-LeiaSR SHARED …)` target to `DisplayXR-<YourVendor>`. The `XRT_USING_RUNTIME_DLL` + linker settings stay the same.
 4. **Update `installer/DisplayXR<YourVendor>Installer.nsi`** — change the registry `<id>` from `leia-sr` to your own, the install dir from `LeiaSR` to your vendor name, and the `DisplayName` / `Vendor` strings.
-5. **Update `scripts/build-windows.bat`** — point the SR SDK download URL at your vendor's SDK release artifact. Replace the `LEIASR_SDKROOT` env-var with `<VENDOR>_SDKROOT`.
+5. **Update `scripts/build-windows.bat`** — point the vendor SDK download URL at your vendor's SDK release artifact. Replace the `LEIASR_SDKROOT` env-var with `<VENDOR>_SDKROOT`.
 
 The runtime `FetchContent` setup at the top of the plug-in repo's `CMakeLists.txt` does NOT need editing — your plug-in still consumes the same runtime ABI.
 
@@ -188,7 +188,7 @@ The quoted form (with embedded double-quotes) is the convention the runtime's ca
 
 If your vendor SDK's license allows redistribution, bundle the runtime DLLs in your installer. The end-user's experience is one installer click.
 
-If it doesn't, document the SDK as a hard prereq in your installer's pre-install check (similar to how the Leia plug-in's installer requires the SR Platform installer to be run first, separately).
+If it doesn't, document the SDK as a hard prereq in your installer's pre-install check (similar to how the Leia plug-in's installer requires its vendor SDK platform installer to be run first, separately).
 
 ### Eye-tracking mode
 
@@ -196,7 +196,7 @@ If it doesn't, document the SDK as a hard prereq in your installer's pre-install
 - bit 0 (`0x1`) — `MANAGED` (vendor SDK predicts eye positions; the runtime queries them per frame)
 - bit 1 (`0x2`) — `MANUAL` (the app submits eye positions via `XR_EXT_display_info`)
 
-Declare both bits if your SDK supports both modes; declare just one if not. Leia is `MANAGED`-only; sim-display is `MANUAL`-only. The `default_eye_tracking_mode` field picks which mode the runtime uses for sessions that don't explicitly opt in.
+Declare both bits if your SDK supports both modes; declare just one if not. A typical hardware DP is `MANAGED`-only; sim-display is `MANUAL`-only. The `default_eye_tracking_mode` field picks which mode the runtime uses for sessions that don't explicitly opt in.
 
 ### Per-API DP factories
 

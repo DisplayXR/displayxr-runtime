@@ -16,9 +16,9 @@ src/xrt/
 │   ├── xrt_instance.h                  Runtime instance
 │   └── xrt_prober.h                    Device discovery
 │
-├── drivers/                   3 driver directories
-│   ├── leia/                  Leia SR SDK — real 3D display hardware
-│   ├── sim_display/           Simulation display — no hardware needed
+├── drivers/                   2 in-tree driver directories
+│   │                          (vendor display processors ship as plug-in DLLs — ADR-019)
+│   ├── sim_display/           Simulation display + vendor-neutral plug-in — no hardware
 │   └── qwerty/                Keyboard-based debugging device
 │
 ├── compositor/                Rendering pipeline
@@ -56,29 +56,21 @@ src/xrt/
 
 ## Supported Devices
 
-### Leia 3D Display (`src/xrt/drivers/leia/`)
+### Vendor 3D Displays (plug-in DLLs)
 
-Real lightfield display hardware with eye tracking.
+Real lightfield-display hardware is supported through **vendor plug-in DLLs**, not in-tree
+drivers. Per [ADR-019](../adr/ADR-019-vendor-plugin-aux-boundary.md), each vendor's display
+processor (eye-tracking + per-API weaving) ships from its own repo as a plug-in discovered at
+`xrCreateInstance`; the runtime DLL carries zero vendor identifiers in its link line. The
+runtime calls the plug-in only through the vendor-neutral `xrt_display_processor*` vtables and
+the `xrt_plugin_iface` discovery contract.
 
-| Platform | SDK | Graphics | Eye Tracking |
-|----------|-----|----------|--------------|
-| Windows  | SR SDK | DX11 + DX12 + GL + Vulkan weaving | LookaroundFilter |
-| Android  | CNSDK  | Vulkan interlacing     | Not yet |
-
-**Files:**
-- `leia_device.c` — `xrt_device` implementation (display specs, FOV, refresh rate)
-- `leia_sr.cpp/.h` — Vulkan SR SDK weaver wrapper
-- `leia_sr_d3d11.cpp/.h` — D3D11 SR SDK weaver wrapper
-- `leia_sr_d3d12.cpp/.h` — D3D12 SR SDK weaver wrapper
-- `leia_sr_gl.cpp/.h` — OpenGL SR SDK weaver wrapper
-- `leia_cnsdk.cpp/.h` — Android CNSDK integration
-- `leia_display_processor.cpp/.h` — Vulkan `xrt_display_processor` wrapping SR weaver
-- `leia_display_processor_d3d11.cpp/.h` — D3D11 `xrt_display_processor_d3d11` wrapping SR weaver
-- `leia_display_processor_d3d12.cpp/.h` — D3D12 `xrt_display_processor_d3d12` wrapping SR weaver
-- `leia_display_processor_gl.cpp/.h` — OpenGL `xrt_display_processor_gl` wrapping SR weaver
-- `leia_types.h`, `leia_interface.h`
-
-**Builder:** `target_builder_leia.c` (priority -15)
+- To add a vendor: [`docs/guides/vendor-plugin-onboarding.md`](../guides/vendor-plugin-onboarding.md)
+  → [`docs/reference/xrt_plugin_iface.md`](../reference/xrt_plugin_iface.md) +
+  [`docs/specs/runtime/plugin-discovery.md`](../specs/runtime/plugin-discovery.md).
+- The first vendor integration (Leia SR) ships from
+  [`displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin); its
+  implementation notes live under [`docs/vendors/leia/`](../vendors/leia/README.md).
 
 ### Simulation Display (`src/xrt/drivers/sim_display/`)
 
@@ -162,7 +154,7 @@ Used by: `comp_d3d11_compositor.cpp`
 
 | Vendor | Vulkan | D3D11 |
 |--------|--------|-------|
-| Leia (SR SDK) | `leia_display_processor.cpp` | `leia_display_processor_d3d11.cpp` |
+| Vendor DP (plug-in DLL) | per-vendor, e.g. [`displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin) | per-vendor |
 | Simulation | `sim_display_processor.c` | `sim_display_processor_d3d11.cpp` |
 
 ## Rendering Pipelines
@@ -195,9 +187,13 @@ Device builders are registered in `src/xrt/targets/common/target_lists.c` and tr
 |----------|---------|-------------|
 | override | `qwerty` | Keyboard debugging device |
 | override | `qwerty_input` | Keyboard input device |
-| -15 | **`leia`** | Leia 3D display (SR SDK / CNSDK) |
 | -20 | **`sim_display`** | Simulation display |
 | last | `legacy` | Legacy device fallback |
+
+Vendor 3D-display DPs are **not** in-tree builders — they ship as plug-in DLLs discovered at
+`xrCreateInstance` and register their DP factory via `xrt_plugin_iface` (ADR-019). Discovery
+order is governed by the plug-in's registered probe order, not this table. See
+[`docs/specs/runtime/plugin-discovery.md`](../specs/runtime/plugin-discovery.md).
 
 ## Design Patterns
 
@@ -209,7 +205,7 @@ All key interfaces (`xrt_device`, `xrt_display_processor`, `xrt_builder`, `xrt_c
 
 ### Conditional Compilation
 Platform-specific code is isolated via:
-- **CMake:** `if(WIN32)`, `if(XRT_HAVE_VULKAN)`, `if(XRT_HAVE_LEIA_SR)`
+- **CMake:** `if(WIN32)`, `if(XRT_HAVE_VULKAN)`, `if(XRT_HAVE_D3D11)`
 - **C/C++:** `#ifdef XRT_OS_WINDOWS`, `#ifdef XRT_OS_ANDROID`
 
 ### Environment Variable Gates
@@ -222,45 +218,17 @@ Runtime driver selection without recompilation:
 
 ### Adding a New Display Vendor
 
-A new vendor needs **3 components** and **zero changes to compositor code**:
+A vendor ships its integration as a **plug-in DLL from its own repo** (ADR-019) — there are
+**zero changes to compositor or runtime code**. The plug-in implements the
+`xrt_display_processor*` vtables (one per graphics API) plus an `xrt_device` with display specs,
+exposes the `xrtPluginNegotiate` entry point, and registers for discovery (registry on Windows /
+JSON manifest on POSIX). The compositor instantiates the discovered DP through the generic
+interface and never sees vendor code.
 
-1. **Display Processor** — implement the vtable interface:
-   ```
-   src/xrt/drivers/vendor/
-     vendor_display_processor.cpp      # xrt_display_processor implementation
-     vendor_display_processor_d3d11.cpp # xrt_display_processor_d3d11 (if Windows)
-   ```
-
-2. **Device** — implement `xrt_device` with display specs:
-   ```
-   src/xrt/drivers/vendor/
-     vendor_device.c                   # Resolution, FOV, refresh rate, physical size
-     vendor_interface.h                # Public API
-   ```
-
-3. **Builder** — register in `target_lists.c`:
-   ```
-   src/xrt/targets/common/
-     target_builder_vendor.c           # estimate_system() with priority + open_system()
-   ```
-
-   Then add to `target_builder_interface.h` and `target_lists.c`:
-   ```c
-   #ifdef T_BUILDER_VENDOR
-   struct xrt_builder *t_builder_vendor_create(void);
-   #endif
-   ```
-
-4. **CMake** — add to `src/xrt/drivers/CMakeLists.txt`:
-   ```cmake
-   if(XRT_HAVE_VENDOR_SDK)
-       add_library(drv_vendor STATIC vendor/vendor_device.c vendor/vendor_display_processor.cpp)
-       target_link_libraries(drv_vendor PRIVATE xrt-interfaces aux_util VENDOR::SDK)
-       list(APPEND ENABLED_DRIVERS drv_vendor)
-   endif()
-   ```
-
-The compositor discovers the display processor through the builder system and calls it through the generic interface. No vendor-specific code in the compositor.
+Full walkthrough: [`docs/guides/vendor-plugin-onboarding.md`](../guides/vendor-plugin-onboarding.md)
+→ [`docs/reference/xrt_plugin_iface.md`](../reference/xrt_plugin_iface.md) +
+[`docs/specs/runtime/plugin-discovery.md`](../specs/runtime/plugin-discovery.md). The
+`src/xrt/drivers/sim_display/` plug-in in this repo is the vendor-neutral reference to fork from.
 
 ### Adding a New OS Platform
 
@@ -272,10 +240,9 @@ Platform coupling by layer:
 | `xrt_display_processor_d3d11.h` | Windows only (void* for D3D types) |
 | `sim_display_device.c` | None — fully portable |
 | `sim_display_processor.c` | Vulkan only (any Vulkan-capable OS) |
-| `leia_device.c` | `#ifdef XRT_OS_WINDOWS` for SR SDK, fallback defaults otherwise |
-| `leia_cnsdk.cpp` | `#ifdef XRT_OS_ANDROID` for JNI init |
+| vendor plug-in device (per-vendor repo) | typically `#ifdef XRT_OS_WINDOWS` / `XRT_OS_ANDROID` for the vendor SDK, fallback defaults otherwise |
 
 To add Linux support for a new display:
 - The Vulkan display processor path works unchanged (Vulkan is cross-platform)
-- Only the driver needs platform-specific code for SDK integration
+- Only the vendor plug-in needs platform-specific code for SDK integration
 - `sim_display` already works on any Vulkan-capable OS for testing

@@ -88,12 +88,12 @@ The tiling algorithm uses `ceil` (not `round`) for the column count, which biase
 | sim_display (1920x1080) | Quad | 4 | 0.5x0.5 | 960x540 | 2x2 | 1920x1080 | 2x2 grid |
 | Looking Glass (2560x1600) | Multi | 45 | 0.1x0.1 | 256x160 | 6x8 | 1536x1280 | Near-square, well under 4096 |
 | Looking Glass (2560x1600) | 2D | 1 | 1.0x1.0 | 2560x1600 | 1x1 | 2560x1600 | |
-| Leia (3840x2160) | 2D | 1 | 1.0x1.0 | 3840x2160 | 1x1 | 3840x2160 | |
-| Leia (3840x2160) | Stereo | 2 | 0.5x0.5 | 1920x1080 | 2x1 | 3840x1080 | SBS (horizontal) |
+| 4K 3D display (3840x2160) | 2D | 1 | 1.0x1.0 | 3840x2160 | 1x1 | 3840x2160 | |
+| 4K 3D display (3840x2160) | Stereo | 2 | 0.5x0.5 | 1920x1080 | 2x1 | 3840x1080 | SBS (horizontal) |
 
 System swapchain for sim_display: max(1920,1920,1920) x max(1080,540,1080) = **1920x1080** (display res).
 System swapchain for Looking Glass: max(2560,1536) x max(1600,1280) = **2560x1600** (display res).
-System swapchain for Leia: max(3840,3840) x max(2160,1080) = **3840x2160** (display res).
+System swapchain for the 3840x2160 display: max(3840,3840) x max(2160,1080) = **3840x2160** (display res).
 
 In all cases, the 2D mode (1 view at full display) dominates. The N-view modes tile smaller views that fit within.
 
@@ -122,7 +122,7 @@ Commit `fc5f82ff1` + follow-up fixes (`febd2fd05`, `c4cd31b1e`, `735e6dfa8`, `91
 **All compositors updated** (32 files, +1668 -1405 lines):
 - Metal, GL, D3D11, D3D12, Vulkan native compositors: tile-aware viewport layout
 - Multi-compositor: passes tile info through
-- All sim_display and Leia display processor implementations: updated to `process_atlas` signature
+- All sim_display and vendor display processor implementations: updated to `process_atlas` signature
 
 ### Phase B: Swapchain sizing
 
@@ -265,7 +265,7 @@ Because the compositor crops before calling the DP, **the atlas texture dimensio
 
 ### Why the DP can't just be told the content region
 
-The DP's `process_atlas()` already receives `view_width`, `view_height`, `tile_columns`, `tile_rows` — but many DP implementations (e.g., LeiaSR weaver) use the **texture dimensions** to set up their internal rendering pipeline. If the texture is larger than the content, the DP samples padding/garbage from the unused region.
+The DP's `process_atlas()` already receives `view_width`, `view_height`, `tile_columns`, `tile_rows` — but many DP implementations (e.g., a vendor's weaver) use the **texture dimensions** to set up their internal rendering pipeline. If the texture is larger than the content, the DP samples padding/garbage from the unused region.
 
 ---
 
@@ -305,7 +305,7 @@ MUST use the SAME slot stride, derived the SAME way:
 In non-shell mode the per-client atlas equals `sys->display_width ×
 sys->display_height`, so atlas/tile_columns equals `sys->view_width`
 trivially. **In shell mode the atlas is created at NATIVE display
-pixel dims** (e.g. 3840×2160 for a Leia 4K) **while `sys->view_width`
+pixel dims** (e.g. 3840×2160 for a 4K 3D display) **while `sys->view_width`
 tracks the SCALED runtime view dim** (e.g. 960 for a 1920×1080 scaled
 mode). They DIVERGE. Using `sys->view_width` as the stride forces a
 downsample of any source larger than the scaled view but smaller than

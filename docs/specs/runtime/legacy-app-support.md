@@ -32,7 +32,7 @@ These are standard OpenXR apps (including WebXR apps on Windows) that:
 
 > **WebXR pages can escape the legacy limitation** without modifying the runtime or Chrome. The [WebXR Bridge v2](../../roadmap/webxr-bridge-v2-plan.md) ships a Chrome extension + a small native sideband that exposes display info and rendering-mode events to the JS page. The page can then override its `XRWebGLLayer` framebuffer dimensions to match the current mode, replacing the legacy compromise at runtime. The OpenXR session itself stays legacy — the override is purely at the WebXR layer.
 
-The problem: `recommendedImageRectWidth/Height` is computed once at `xrGetSystem` time using `recommended_view_scale_x/y`. Currently this is set to the **minimum scale across all modes** (0.5x0.5 for both Leia and sim_display), which means:
+The problem: `recommendedImageRectWidth/Height` is computed once at `xrGetSystem` time using `recommended_view_scale_x/y`. Currently this is set to the **minimum scale across all modes** (0.5x0.5 for both a typical hardware DP and sim_display), which means:
 - In 3D mode (SBS, 0.5x0.5): tiles fit correctly
 - In 2D mode (1.0x1.0): the app only rendered at half resolution in both dimensions -- significant quality loss
 
@@ -57,7 +57,7 @@ Instead of using `min(all modes)` for `recommended_view_scale`, use a compromise
 | 2 views, scaleX <= 0.5, scaleY <= 0.5 | **0.5 x 1.0** | Compromise: full height preserves 2D quality, half width is correct for SBS |
 | All other cases (>2 views, or scaleX/Y > 0.5) | **3D mode's actual scaleXY** | Already optimal or close to optimal |
 
-For the common case (Leia SR and sim_display SBS, both 0.5x0.5), this means the legacy app renders at 0.5x1.0 -- each view is half-width but full-height.
+For the common case (a hardware DP and sim_display SBS, both 0.5x0.5), this means the legacy app renders at 0.5x1.0 -- each view is half-width but full-height.
 
 ### 4. Compositor tile processing
 
@@ -76,10 +76,10 @@ The compositor adds a transform step between the app's submitted atlas and the d
 
 ## Examples
 
-### Leia SR (3840x2160 display, default 3D mode: 0.5x0.5)
+### Example: 4K 3D display (3840x2160, default 3D mode: 0.5x0.5)
 
 **Legacy app sees**: recommended 1920x2160 per view -> swapchain 3840x2160
-- 3D mode: compositor downscales each 1920x2160 tile to 1920x1080 for SR SDK
+- 3D mode: compositor downscales each 1920x2160 tile to 1920x1080 for the vendor DP
 - 2D mode: compositor stretches left 1920x2160 view to 3840x2160
 
 ### Sim display (1920x1080, default 3D SBS: 0.5x0.5)

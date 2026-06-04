@@ -79,7 +79,7 @@ A first-person application on a 3D display needs to combine two independent pose
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-**Locomotion** (moving through the world) is driven by app input. **Eye tracking** (stereoscopic parallax) is driven by the runtime's SR SDK. Both must compose correctly, which only works when the app receives input — which requires the app to own the window.
+**Locomotion** (moving through the world) is driven by app input. **Eye tracking** (stereoscopic parallax) is driven by the runtime via the vendor display processor. Both must compose correctly, which only works when the app receives input — which requires the app to own the window.
 
 ### 2.4 The Phase Alignment Problem
 
@@ -102,7 +102,7 @@ Display panel (simplified — 3 subpixels per lens pitch):
 This is why the extension requires the actual **window handle** (HWND), not just a texture or screen coordinates:
 
 - The display processor needs to query the window's screen-space position each frame to compute the correct interlacing origin
-- Some advanced vendor display processors, like Leia's, go further: they hook `WM_WINDOWPOSCHANGING` on the HWND to **snap** window drag positions to phase-aligned coordinates, preventing crosstalk jitter during drag. This is an optional vendor optimization — without it, 3D quality degrades during drag but is correct at rest.
+- Some advanced vendor display processors go further: they hook `WM_WINDOWPOSCHANGING` on the HWND to **snap** window drag positions to phase-aligned coordinates, preventing crosstalk jitter during drag. This is an optional vendor optimization — without it, 3D quality degrades during drag but is correct at rest. (For one vendor's implementation, see [Leia window phase snapping](../../vendors/leia/window-phase-snapping.md).)
 - For `_texture` apps where the 3D canvas is a sub-rect of the window (e.g., a 3D viewport surrounded by 2D UI), the canvas offset and size from `xrSetSharedTextureOutputRectEXT` flow through the compositor to the display processor's `process_atlas()` call as `canvas_offset_x/y` and `canvas_width/height`, enabling correct phase alignment without any hidden windows. The app's real HWND is passed directly to the display processor at init time.
 
 A texture handle or screen coordinate alone would not allow the display processor to track position changes or hook window messages.
@@ -215,9 +215,9 @@ The `_handle` and `_texture` modes both apply (any time `windowHandle` is non-NU
 
 | Graphics API | Mechanism | Status |
 |---|---|---|
-| D3D11 | `CreateSwapChainForComposition` + `DXGI_ALPHA_MODE_PREMULTIPLIED` + `IDCompositionTarget` bound to the app HWND. Leia D3D11 DP runs chroma-key fill+strip around the SR weaver. | Shipping (PR #213). |
+| D3D11 | `CreateSwapChainForComposition` + `DXGI_ALPHA_MODE_PREMULTIPLIED` + `IDCompositionTarget` bound to the app HWND. The vendor D3D11 DP runs chroma-key fill+strip around its weaving stage. | Shipping (PR #213). |
 | D3D12 | Same as D3D11, plus the runtime explicitly passes the back-buffer RTV through to the strip pass (D3D12 has no `OMGetRenderTargets`). | Shipping (PR #213, PR #3a). |
-| Vulkan | Swapchain `compositeAlpha` runtime-selects `VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR` → `INHERIT` → `OPAQUE` based on `caps.supportedCompositeAlpha`. Most Win32 ICDs only expose `OPAQUE`, in which case alpha is dropped at the WSI present and a one-time warning is logged (the chroma-key strip still runs but its alpha output is invisible — the SR weaver's RGB on a black background is what reaches the screen). Leia VK DP runs chroma-key fill+strip via SPIR-V shaders compiled offline. | Shipping (PR #3c). |
+| Vulkan | Swapchain `compositeAlpha` runtime-selects `VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR` → `INHERIT` → `OPAQUE` based on `caps.supportedCompositeAlpha`. Most Win32 ICDs only expose `OPAQUE`, in which case alpha is dropped at the WSI present and a one-time warning is logged (the chroma-key strip still runs but its alpha output is invisible — the vendor weaver's RGB on a black background is what reaches the screen). The vendor VK DP runs chroma-key fill+strip via SPIR-V shaders compiled offline. | Shipping (PR #3c). |
 | OpenGL | **Deferred.** PR #3b shipped the GL DP's chroma-key fill+strip programs (runtime-compiled GLSL, mirrors the D3D11/D3D12/VK DPs) but the compositor-side DComp + `CreateSwapChainForComposition` + `WGL_NV_DX_interop2` bridge that would wire them up to desktop transparency was reverted: `D3D11::CopyResource` from the WGL-interop'd transit texture into the FLIP_DISCARD + DComp swapchain's back buffer didn't produce visible content on the dev hardware (NVIDIA RTX 3080 + Win11), even when source was a fresh non-interop D3D11 texture cleared via `ClearRenderTargetView`. `ClearRenderTargetView` directly on the back buffer DID present visibly, so the failure point is `CopyResource` into the DComp surface specifically. Future work: render via fullscreen-quad shader instead of `CopyResource`, or use a D3D12-based bridge. | Not shipping. |
 | Metal (macOS) | `CAMetalLayer.isOpaque = NO` + `NSWindow` non-opaque. App is responsible for the `NSWindow.opaque` flag. | Shipping (PR #4). |
 
@@ -253,7 +253,7 @@ typedef struct XrCompositionLayerWindowSpaceEXT {
 
 **Rendering behavior:**
 
-- The layer is rendered **pre-interlace** — it passes through the SR weaver like any other layer, so it participates correctly in the lenticular 3D effect
+- The layer is rendered **pre-interlace** — it passes through the vendor weaver like any other layer, so it participates correctly in the lenticular 3D effect
 - The same texture is composited into both eye views with the per-eye horizontal shift controlled by `disparity`
 - When `layerFlags` includes `XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT`, the layer is alpha-blended over whatever is behind it (typically the projection layer)
 - Coordinates are fractional, so the layer automatically scales when the window is resized
@@ -363,7 +363,7 @@ sampled  = texture.Sample(smp, uvOffset + uv * uvScale)
 
 The contract is symmetric: the app sends `(x, y, w, h)`; the runtime writes `(w × h)` at `(x, y)`; the app reads `(w × h)` from `(x, y)`.
 
-This is required because vendor weavers (e.g. Leia SR) compute lenticular phase from the viewport's screen-space position. Writing at `(x, y)` keeps the on-display pixel position of the weaved output stable regardless of the shared texture's dimensions (which are typically worst-case display-sized and may differ from the HWND client area), and the symmetric read-back reproduces the same HWND coords. Apps that sample from origin will render in the wrong place and exhibit crosstalk on lenticular displays.
+This is required because vendor weavers compute lenticular phase from the viewport's screen-space position. Writing at `(x, y)` keeps the on-display pixel position of the weaved output stable regardless of the shared texture's dimensions (which are typically worst-case display-sized and may differ from the HWND client area), and the symmetric read-back reproduces the same HWND coords. Apps that sample from origin will render in the wrong place and exhibit crosstalk on lenticular displays.
 
 ### 3.6 xrSetSharedTextureSurround2DEXT
 
@@ -711,7 +711,7 @@ xrEndFrame(session, &endInfo);
 
 ### 4.3 Window Drag Handling (WM_PAINT Trick)
 
-When the user drags or resizes a Win32 window, Windows enters a modal message loop inside `DefWindowProc` that blocks the application's normal frame loop. To keep rendering during drag, applications should use the same pattern as the SR SDK's native examples:
+When the user drags or resizes a Win32 window, Windows enters a modal message loop inside `DefWindowProc` that blocks the application's normal frame loop. To keep rendering during drag, applications should use the same pattern as a vendor SDK's native examples:
 
 ```cpp
 static bool g_isMoving = false;
@@ -749,7 +749,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 }
 ```
 
-**Why not use a dedicated render thread?** The D3D11 immediate device context is not thread-safe. Both the render thread (calling `weave()`) and the main thread (via `DefWindowProc` and DXGI housekeeping) would touch the same context concurrently, causing crashes — particularly on mouse-up events where `ReleaseCapture()` triggers synchronous messages that re-enter the D3D11 context. Even with `ID3D11Multithread::SetMultithreadProtected(TRUE)`, the SR SDK's internal weaver state has no synchronization. The single-threaded WM_PAINT approach eliminates all data races by design.
+**Why not use a dedicated render thread?** The D3D11 immediate device context is not thread-safe. Both the render thread (calling `weave()`) and the main thread (via `DefWindowProc` and DXGI housekeeping) would touch the same context concurrently, causing crashes — particularly on mouse-up events where `ReleaseCapture()` triggers synchronous messages that re-enter the D3D11 context. Even with `ID3D11Multithread::SetMultithreadProtected(TRUE)`, some vendor weaver implementations do not synchronize their internal state for concurrent access. The single-threaded WM_PAINT approach eliminates all data races by design.
 
 ### 4.4 Fallback Behavior
 
@@ -791,7 +791,7 @@ End-to-end path from the application to the display:
 │    - Stores session info including external_window_handle             │
 │    - On first frame: multi_compositor_init_session_render()           │
 │      - Uses comp_target_service to create comp_target from HWND       │
-│      - Creates per-session SR weaver bound to HWND                    │
+│      - Creates per-session vendor weaver bound to HWND               │
 └────────────────────────────────┬─────────────────────────────────────┘
                                  |
                                  v
@@ -799,7 +799,7 @@ End-to-end path from the application to the display:
 │  comp_multi_system.c : render_per_session_clients_locked()            │
 │    - Extracts stereo views from projection layer                      │
 │    - Acquires swapchain image from per-session comp_target            │
-│    - Calls leiasr_weave() with left/right views                       │
+│    - Calls the vendor weaver with left/right views                    │
 │    - Renders window-space layers (if any)                             │
 │    - Presents to app window                                           │
 └────────────────────────────────┬─────────────────────────────────────┘
@@ -815,7 +815,7 @@ For the D3D11 native compositor path:
 oxr_session.c  -->  comp_d3d11_compositor.cpp  -->  comp_d3d11_renderer.cpp
                                                          |
                                                          v
-                                                    leiasr_d3d11.cpp (SR weaver)
+                                                    vendor D3D11 weaver
                                                          |
                                                          v
                                                     App's Window (HWND)
@@ -831,7 +831,7 @@ The multi-compositor system (`comp_multi_system.c`) splits the render pipeline b
 
 1. Extract stereo views from the first projection layer
 2. Acquire a swapchain image from the per-session `comp_target`
-3. Call `leiasr_weave()` using the per-session SR weaver
+3. Invoke the per-session vendor weaver's weave call
 4. Render any window-space layers
 5. Present to the session's window
 6. Retire the delivered frame
@@ -870,12 +870,12 @@ The service provides three operations:
 
 At compositor creation time, `comp_main` builds a `comp_target_service` struct with function pointers and passes it to `comp_multi`. When a session with an external window begins its first frame, `comp_multi` calls through the service to create the per-session target without any direct link to `comp_main`.
 
-### 5.4 Eye Tracking via LookaroundFilter
+### 5.4 Eye Tracking
 
-Each per-session SR weaver provides predicted eye positions through its internal `LookaroundFilter`:
+Each per-session vendor weaver provides predicted eye positions through its internal eye-tracking filter:
 
 ```
-weaver->getPredictedEyePositions(leftEye, rightEye)
+vendor weaver: predicted eye positions (left, right)
     |
     v
 oxr_session_locate_views()
@@ -884,13 +884,13 @@ oxr_session_locate_views()
     - Passes to xrt_device_get_view_poses() for FOV calculation
 ```
 
-The LookaroundFilter adapts its latency prediction to the application's actual update rate and monitor refresh rate. This is preferred over the deprecated `EyeTracker::openEyePairStream()` which cannot adapt to per-application latency.
+A good vendor eye-tracking filter adapts its latency prediction to the application's actual update rate and the monitor refresh rate, which is preferred over a fixed-rate stream that cannot adapt to per-application latency.
 
 **Fallback:** When no per-session weaver is available (no external window), the runtime falls back to static IPD (interpupillary distance).
 
 ### 5.5 Window-Adaptive FOV (Kooima Projection)
 
-The runtime uses the **Kooima generalized perspective projection** to compute asymmetric FOV based on eye position relative to the display. When the window is smaller than the full display, a viewport scale formula (derived from SRHydra's `Session.cpp`) adjusts the projection:
+The runtime uses the **Kooima generalized perspective projection** to compute asymmetric FOV based on eye position relative to the display. When the window is smaller than the full display, a viewport scale formula adjusts the projection:
 
 ```
 PixelSize      = DisplayPhysicalSize / DisplayPixelResolution
@@ -920,8 +920,8 @@ adjusted_eye.y -= offset_y
 ratio = min(window_width / display_px_width, window_height / display_px_height)
 ratio = clamp(ratio, 0.0, 1.0)
 
-new_view_width  = SR_recommended_width  * ratio
-new_view_height = SR_recommended_height * ratio
+new_view_width  = recommended_width  * ratio
+new_view_height = recommended_height * ratio
 ```
 
 Only size-dependent resources (stereo texture, SRV, RTV, depth texture, DSV) are recreated. Shaders, samplers, blend state, and rasterizer state are preserved. The minimum render texture size is clamped to 64x64.
@@ -939,17 +939,7 @@ Only size-dependent resources (stereo texture, SRV, RTV, depth texture, DSV) are
 
 On a lenticular display, each subpixel projects light at a specific angle determined by its absolute position relative to the lens array. When a window is dragged to an arbitrary pixel position, the phase relationship between content and lenses can break, causing crosstalk (left/right eye images bleeding into each other).
 
-**This is handled automatically by the SR weaver.** During initialization, the weaver **subclasses the application's window procedure** via `SetWindowLongPtr`. The subclassed `WndProc` intercepts:
-
-| Message | Action |
-|---------|--------|
-| `WM_ENTERSIZEMOVE` | Records initial window position |
-| `WM_WINDOWPOSCHANGING` | Snaps proposed position to nearest phase-aligned coordinate |
-| `WM_EXITSIZEMOVE` | Clears drag state |
-
-The window moves in small discrete steps (typically 1-2 pixels) that preserve the lenticular phase, so the 3D effect remains stable throughout a drag while motion feels smooth to the user.
-
-No runtime or application code is needed — any application using a weaver-bound window gets phase-aligned snapping automatically.
+Some vendor weavers handle this **automatically** by subclassing the application's window procedure and snapping drag positions to phase-aligned coordinates, so the 3D effect stays stable throughout a drag. This is an optional vendor optimization that needs no runtime or application code. For one vendor's concrete implementation (the messages it intercepts and how it snaps), see [Leia window phase snapping](../../vendors/leia/window-phase-snapping.md).
 
 ---
 
@@ -982,8 +972,8 @@ Hybrid mode provides two execution paths, selected automatically based on the ap
    ┌──────────────────┐   ┌───────────────────────┐
    │ In-Process Mode  │   │ IPC/Service Mode      │
    │ D3D11 native     │   │                       │
-   │ compositor       │   │ monado-service with   │
-   │ (in-process)     │   │ D3D11 service         │
+   │ compositor       │   │ displayxr-service     │
+   │ (in-process)     │   │ with D3D11 service    │
    └────────┬─────────┘   │ compositor            │
             |              │ - Own D3D11 device    │
             |              │ - Import via DXGI     │
@@ -992,14 +982,14 @@ Hybrid mode provides two execution paths, selected automatically based on the ap
             |                          |
             v                          v
    ┌──────────────────────────────────────────────┐
-   │             Leia SR Weaver                    │
+   │              Vendor Weaver                    │
    │        (Light field interlacing)              │
    └──────────────────────────────────────────────┘
 ```
 
 **In-process mode:** For native Win32/D3D11 apps. The D3D11 native compositor runs in the app's process, avoiding IPC overhead.
 
-**IPC/Service mode:** For sandboxed apps (WebXR, UWP). The app communicates over a named pipe to `monado-service`, which has its own D3D11 device. Textures are shared via DXGI shared handles with `IDXGIKeyedMutex` synchronization.
+**IPC/Service mode:** For sandboxed apps (WebXR, UWP). The app communicates over a named pipe to `displayxr-service`, which has its own D3D11 device. Textures are shared via DXGI shared handles with `IDXGIKeyedMutex` synchronization.
 
 Both paths avoid Vulkan-D3D11 interop entirely.
 
@@ -1020,8 +1010,8 @@ option(XRT_FEATURE_HYBRID_MODE "Enable hybrid in-process/IPC mode for Windows" O
 Requires: `WIN32`, `XRT_MODULE_IPC`, `XRT_FEATURE_OPENXR`, `XRT_HAVE_D3D11`.
 
 When enabled, the build produces:
-- `openxr_monado.dll` — Runtime with hybrid entry point
-- `monado-service.exe` — Service with D3D11 compositor
+- `openxr_displayxr.dll` — Runtime with hybrid entry point
+- `displayxr-service.exe` — Service with D3D11 compositor
 
 Key compile definitions:
 - `XRT_FEATURE_HYBRID_MODE` — Renames `xrt_instance_create` to `native_instance_create` in hybrid builds
@@ -1031,17 +1021,17 @@ Key compile definitions:
 
 ## 7. Known Issues
 
-### 7.1 SR SDK WndProcDispatcher Race Condition (Resolved)
+### 7.1 Vendor Weaver Window-Proc Threading
 
-Previous versions of the SR SDK had a **use-after-free race condition** in `WeaverBaseImpl.ipp` where `WndProcDispatcher` released the global map lock before calling `instance->weaverWndProc()`, allowing another thread to destroy the weaver between the lookup and the call.
-
-**Status: Fixed in SR SDK** (commit `54410d9f`). The fix introduces a per-instance `SRWLOCK` (`instanceLock`) inside a `WindowObjectData` struct. The dispatcher now acquires a shared instance lock before releasing the map lock and holds it for the entire `weaverWndProc` call. `restoreOriginalWindowProc` acquires the instance lock exclusively after removing the entry from the map, which blocks until all in-flight dispatcher calls complete. Re-entrancy is handled via an `inDispatcherCount` counter, and same-thread destruction (from within a WndProc callback) skips the exclusive-lock wait to avoid deadlock.
-
-The workaround in Monado's `leiasr_destroy()` (message pumping and delays) is no longer needed but remains as a defensive measure.
+A vendor weaver that subclasses the application's window procedure (see §5.7) must
+synchronize the dispatch path against weaver destruction, or a use-after-free race can occur
+when one thread destroys the weaver while another is inside the subclassed `WndProc`. For one
+vendor's historical race condition and its resolution, see
+[Leia window phase snapping](../../vendors/leia/window-phase-snapping.md#sr-sdk-wndprocdispatcher-race-condition-resolved).
 
 ### 7.2 D3D11 Thread Safety
 
-The D3D11 immediate device context is **single-threaded by design**. Applications must not use a dedicated render thread alongside the message pump when the SR weaver is active. Use the WM_PAINT trick (Section 4.3) for continuous rendering during window drag/resize.
+The D3D11 immediate device context is **single-threaded by design**. Applications must not use a dedicated render thread alongside the message pump when the vendor weaver is active. Use the WM_PAINT trick (Section 4.3) for continuous rendering during window drag/resize.
 
 ---
 
@@ -1083,7 +1073,7 @@ The D3D11 immediate device context is **single-threaded by design**. Application
 |------|---------|
 | `src/xrt/compositor/main/comp_compositor.h` | `external_window_handle` field, target service |
 | `src/xrt/compositor/main/comp_compositor.c` | Service callback implementation, external window handling in `compositor_begin_session()` |
-| `src/xrt/compositor/main/comp_renderer.c` | Passes window handle to `leiasr_create()` |
+| `src/xrt/compositor/main/comp_renderer.c` | Passes window handle to the vendor weaver create call |
 | `src/xrt/compositor/main/comp_window_mswin.c` | `comp_window_mswin_create_from_external()`, `owns_window` flag |
 
 ### Native Compositor (D3D11)
@@ -1103,15 +1093,13 @@ The D3D11 immediate device context is **single-threaded by design**. Application
 |------|---------|
 | `src/xrt/compositor/util/comp_target_service.h` | Service interface breaking `comp_main`/`comp_multi` circular dependency |
 
-### SR Driver
+### Vendor Weaver (plug-in DLL)
 
-| File | Purpose |
-|------|---------|
-| `src/xrt/drivers/leiasr/leiasr.h` | Vulkan weaver interface: `leiasr_create()`, `leiasr_weave()`, `leiasr_get_predicted_eye_positions()` |
-| `src/xrt/drivers/leiasr/leiasr.cpp` | Vulkan weaver implementation, `getPredictedEyePositions()` wrapper |
-| `src/xrt/drivers/leiasr/leiasr_d3d11.h` | D3D11 weaver interface, display pixel info |
-| `src/xrt/drivers/leiasr/leiasr_d3d11.cpp` | D3D11 weaver implementation |
-| `src/xrt/drivers/leiasr/leiasr_types.h` | `leiasr_window_metrics`, `leiasr_eye_position`, `leiasr_eye_pair` |
+The vendor weaver — the component the compositor binds to the HWND and calls per frame — ships
+as a plug-in DLL from its own repo (ADR-019), not from this tree. It exposes a create call, a
+per-frame weave call, and a predicted-eye-positions query. For the Leia weaver sources, see
+the [`displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin) repo and
+[`docs/vendors/leia/weaver.md`](../../vendors/leia/weaver.md).
 
 ### Hybrid Mode
 

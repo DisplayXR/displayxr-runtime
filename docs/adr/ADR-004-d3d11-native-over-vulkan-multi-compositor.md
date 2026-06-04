@@ -16,8 +16,8 @@ equivalent. See [`docs/architecture/multi-compositor.md`](../architecture/multi-
 
 ## Context
 
-On Windows with LeiaSR hardware, the D3D11 native compositor provides direct access to the SR
-D3D11 weaver.
+On Windows with a vendor whose SDK ships a D3D11 weaver, the D3D11 native compositor provides
+direct access to that weaver.
 
 ## Decision
 
@@ -26,5 +26,5 @@ service path is the D3D11 service multi-compositor (`compositor/d3d11_service/`)
 
 ## Consequences
 
-Best latency and simplest integration; direct SR weaver access. Multi-app works through the IPC
+Best latency and simplest integration; direct vendor-weaver access. Multi-app works through the IPC
 path into the D3D11 service multi-compositor.

@@ -31,8 +31,8 @@ The script auto-fetches everything needed: vcpkg (for cJSON +
 runtime deps) and the OpenXR loader release zip. It then runs CMake
 (Ninja Multi-Config) and builds the runtime + installer in one go.
 Outputs land in `_package/`. No vendor SDK is fetched — the runtime
-DLL holds zero vendor identifiers (ADR-019); Leia SR ships as a
-separate plug-in (see [Vendor displays](#vendor-displays-leia-sr-etc)
+DLL holds zero vendor identifiers (ADR-019); vendor display processors
+ship as separate plug-ins (see [Vendor displays](#vendor-displays)
 below).
 
 Available targets: `all` (default), `build` (runtime only,
@@ -61,7 +61,7 @@ cmake --build .
 Builds the runtime with sim_display as the in-tree vendor-neutral
 display processor. No vendor SDK is needed at build time.
 
-## Vendor displays (Leia SR, etc.)
+## Vendor displays
 
 The runtime DLL holds zero vendor identifiers in its link line
 (ADR-019, issues #256/#263). To run on real vendor hardware:
@@ -78,11 +78,11 @@ The plug-in installer hard-requires the runtime (reads
 `HKLM\Software\DisplayXR\DisplayProcessors\leia-sr` so the runtime's
 registry-driven discovery loads it at `xrCreateInstance` time.
 
-The plug-in repo also vends the SR SDK fetched at build time (headers +
-import stubs only) — no end-user steps to install the SR SDK separately
-for runtime use. The SR Platform installer remains a hard prereq for
-the SR Service that hosts eye tracking and weaver instances on the
-hardware side.
+The plug-in repo also vends the vendor SDK fetched at build time (headers +
+import stubs only) — no end-user steps to install the vendor SDK separately
+for runtime use. The vendor's platform/runtime installer (for Leia, the SR
+Platform installer) remains a hard prereq for the service that hosts eye
+tracking and weaver instances on the hardware side.
 
 ### Other vendors
 

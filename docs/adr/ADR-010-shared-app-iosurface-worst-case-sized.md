@@ -65,7 +65,7 @@ Letterbox using the **canvas** aspect ratio, not the IOSurface aspect ratio.
 
 **The app already knows the canvas rect** — it set it via `xrSetSharedTextureOutputRectEXT`. No runtime-to-app query API is needed. The contract is symmetric: the app sends `(x, y, w, h)`; the runtime writes `(w × h)` at `(x, y)`; the app reads `(w × h)` from `(x, y)`.
 
-**Why `(canvasX, canvasY)` and not origin:** Vendor weavers (e.g. Leia SR) rely on the viewport position inside the backbuffer matching the eventual screen-space position within the window to compute correct interlacing phase. Writing at `(canvasX, canvasY)` keeps the on-display pixel position of the weaved output stable across backbuffer-vs-HWND size differences, and the symmetric read-back means the app's blit re-aligns the content to the same HWND client coords it passed in. This eliminates the need for an HWND-sized intermediate texture on Windows and lets drag-resize be driven purely by changing `canvas.x/y/w/h` per frame while the shared texture stays fixed.
+**Why `(canvasX, canvasY)` and not origin:** Vendor weavers rely on the viewport position inside the backbuffer matching the eventual screen-space position within the window to compute correct interlacing phase. Writing at `(canvasX, canvasY)` keeps the on-display pixel position of the weaved output stable across backbuffer-vs-HWND size differences, and the symmetric read-back means the app's blit re-aligns the content to the same HWND client coords it passed in. This eliminates the need for an HWND-sized intermediate texture on Windows and lets drag-resize be driven purely by changing `canvas.x/y/w/h` per frame while the shared texture stays fixed.
 
 ## Consequences
 

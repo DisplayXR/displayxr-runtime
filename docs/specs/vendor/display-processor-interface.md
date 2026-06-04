@@ -50,7 +50,7 @@ We have 4 separate `xrt_display_processor` interface variants -- one per graphic
 1. **Method naming**: D3D11/D3D12/Metal use `process_stereo`, Vulkan uses `process_views`. Should standardize on **`process_views`** -- this is forward-looking: today it's stereo (2 views), but with multiview support (#5) it could be N views tiled into a single texture.
 
 2. **Vulkan input overloading**: The Vulkan interface is called two different ways depending on `prefers_sbs_input`:
-   - Leia SR: `process_views(cmd, sbs_view, VK_NULL_HANDLE, sbs_width*2, ...)` -- SBS packed into left_view, right=NULL
+   - A hardware vendor DP: `process_views(cmd, sbs_view, VK_NULL_HANDLE, sbs_width*2, ...)` -- SBS packed into left_view, right=NULL
    - sim_display: `process_views(cmd, left_view, right_view, eye_width, ...)` -- genuine separate views
 
    This should be standardized to SBS input everywhere. sim_display's Vulkan processor needs updating to accept SBS (trivial shader change -- sample left/right halves instead of two separate textures).
@@ -105,7 +105,7 @@ All APIs should use **`process_views`**, not `process_stereo`:
 
 | Vendor | Vulkan | D3D11 | D3D12 | Metal | GL |
 |---|---|---|---|---|---|
-| **Leia SR** | `leia_display_processor.cpp` | `leia_display_processor_d3d11.cpp` | `leia_display_processor_d3d12.cpp` | -- | `leia_display_processor_gl.cpp` |
+| **Vendor DP** (plug-in repo) | per-API `*_display_processor*` in the vendor's plug-in | per-vendor | per-vendor | per-vendor | per-vendor |
 | **sim_display** | `sim_display_processor.c` (needs SBS input) | `sim_display_processor_d3d11.cpp` | `sim_display_processor_d3d12.cpp` | `sim_display_processor_metal.m` | -- |
 
 ## Related

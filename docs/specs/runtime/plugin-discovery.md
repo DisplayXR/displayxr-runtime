@@ -350,11 +350,12 @@ Lifetime: it must remain valid until the runtime calls
 `iface->destroy(inst)`, which happens at process shutdown (or never,
 since the DLL is intentionally leaked).
 
-**See:** `src/xrt/drivers/sim_display/sim_display_plugin.c` and
-`src/xrt/drivers/leia/leia_plugin.c` — the two reference plug-in
-implementations. Both delegate to existing per-API DP factories and
-device-creation functions that already live in their respective driver
-trees; the entry-point TU is short (~150 lines).
+**See:** `src/xrt/drivers/sim_display/sim_display_plugin.c` (in-tree,
+vendor-neutral) and the Leia plug-in's entry point in
+[`displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin)
+(`src/drv_leia/`, ADR-019) — reference plug-in implementations. Each
+delegates to per-API DP factories and device-creation functions in its own
+tree; the entry-point TU is short (~150 lines).
 
 ---
 
@@ -492,6 +493,6 @@ the corresponding POSIX log directory.
   implementation.
 - `src/xrt/drivers/sim_display/sim_display_plugin.c` — reference
   fallback plug-in.
-- `src/xrt/drivers/leia/leia_plugin.c` — reference vendor plug-in.
+- [`displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin) (`src/drv_leia/`) — reference vendor plug-in (ships from its own repo, ADR-019).
 - `installer/DisplayXRInstaller.nsi` — reference installer flow
   (sim-display registration + cascade uninstall).

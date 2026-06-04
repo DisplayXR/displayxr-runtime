@@ -81,7 +81,7 @@ typedef struct XrCocoaWindowBindingCreateInfoEXT {
 `transparentBackgroundEnabled = XR_TRUE` is the macOS analog of the Win32 binding's same-named field, but the implementation is much simpler:
 
 - **Mac is alpha-native.** sim_display preserves per-pixel alpha through its output stage to the `CAMetalLayer` drawable. There is no chroma-key trick (no need for the `chromaKeyColor` field on the Win32 binding).
-- App-supplied content with `alpha < 1` shows the desktop through. Antialiased edges look correct (true soft alpha — unlike Leia hardware on Windows which interlaces opaque RGB).
+- App-supplied content with `alpha < 1` shows the desktop through. Antialiased edges look correct (true soft alpha — unlike typical lenticular hardware on Windows, which interlaces opaque RGB).
 - Per-layer `XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT` controls whether the per-tile pass blends or stamps; that's a separate per-frame decision.
 - For app-provided `viewHandle`, the app's `NSWindow` setup is the app's responsibility — the runtime only configures the `CAMetalLayer` it presents into. Apps embedding their own NSView should set `setOpaque:NO` and `setBackgroundColor:[NSColor clearColor]` on their NSWindow.
 

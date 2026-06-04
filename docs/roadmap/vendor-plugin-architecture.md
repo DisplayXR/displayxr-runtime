@@ -23,14 +23,14 @@ SimulatedRealityDirectX.dll
 SimulatedRealityOpenGL.dll
 ```
 
-These come from `drv_leia` import-lib-linking the matching SR SDK `.lib` files in `src/xrt/drivers/CMakeLists.txt:148-214`. The Windows DLL loader resolves all static imports before any code in `DisplayXRClient.dll` runs, so on a machine without SR Platform installed (i.e. without `C:\Program Files\LeiaSR\Platform\bin` on PATH), the runtime DLL **fails to load entirely** — the Khronos OpenXR loader reports no runtime available, and the app sees `xrCreateInstance` fail.
+These come from `drv_leia` import-lib-linking the matching vendor SDK `.lib` files in `src/xrt/drivers/CMakeLists.txt:148-214`. The Windows DLL loader resolves all static imports before any code in `DisplayXRClient.dll` runs, so on a machine without SR Platform installed (i.e. without `C:\Program Files\LeiaSR\Platform\bin` on PATH), the runtime DLL **fails to load entirely** — the Khronos OpenXR loader reports no runtime available, and the app sees `xrCreateInstance` fail.
 
 This silently invalidates two pieces of intended behavior:
 
 1. **`drv_sim_display` fallback.** `drv_sim_display` is unconditionally built into the runtime (`src/xrt/drivers/CMakeLists.txt:316-339`, no `XRT_HAVE_LEIA_SR` gate) precisely so the runtime works on any machine. The `FORCE_SIM_DISPLAY=1` env-var override is a runtime-policy lever. Neither helps when the DLL containing them can't load.
 2. **The vendor-agnostic claim.** A different display vendor cannot integrate without forking the runtime build system. Adding a second vendor today means either adding parallel `SimulatedReality*`-style static imports (which compounds the same coupling) or moving to runtime-`LoadLibrary` (which is this restructure).
 
-macOS already has the right shape by accident: there's no Leia SR SDK for macOS, `XRT_HAVE_LEIA_SR` resolves OFF at configure time (`CMakeLists.txt:215`), `drv_leia` isn't built, only `drv_sim_display` ships, and the runtime loads on any Mac. Windows should match.
+macOS already has the right shape by accident: there's no vendor SDK for macOS, `XRT_HAVE_LEIA_SR` resolves OFF at configure time (`CMakeLists.txt:215`), `drv_leia` isn't built, only `drv_sim_display` ships, and the runtime loads on any Mac. Windows should match.
 
 PR #253 surfaced this when removing `$INSTDIR` from system PATH. The five static SR imports happened to still resolve via SR Platform's *own* PATH entry (`C:\Program Files\LeiaSR\Platform\bin`, written by the SR Platform installer), so the PR doesn't regress. But that's load-bearing on SR Platform being a hard prereq — which on Windows it currently is, but only by accident of the link line, not by design.
 
@@ -79,7 +79,7 @@ Subkey schema:
 2. Sorts by `ProbeOrder` ascending.
 3. For each: `LoadLibraryExW(Binary, NULL, LOAD_WITH_ALTERED_SEARCH_PATH)`. Failure to load (missing vendor SDK on this box, version mismatch, etc.) → log warning, skip to next.
 4. `GetProcAddress("xrtPluginNegotiate")`. Missing or returns failure → log, skip.
-5. Plug-in's `xrtPluginNegotiate` runs its own probe (e.g. drv_leia checks for an SR display via the SR SDK). Negative probe → plug-in returns `XRT_PLUGIN_NO_DEVICE`, runtime skips.
+5. Plug-in's `xrtPluginNegotiate` runs its own probe (e.g. drv_leia checks for an SR display via the vendor SDK). Negative probe → plug-in returns `XRT_PLUGIN_NO_DEVICE`, runtime skips.
 6. First plug-in that returns success wins. Its returned `xrt_plugin_iface` is owned by the runtime for the session.
 
 Failure mode if nothing matches: runtime logs WARN, falls back to a built-in null DP (or refuses to create instance — TBD in §10).
@@ -212,9 +212,9 @@ Recommended order. Each step lands as its own PR.
 | 3 | **Export aux's stateful TUs from runtime DLL.** | `u_logging` + `u_var` + `os_thread` come out of `DisplayXRClient.dll`'s exports. `aux_imp.lib` generated. Existing in-tree consumers unchanged. | 2-3 |
 | 4 | **Migrate `drv_sim_display` to plug-in shape.** | `DisplayXR-SimDisplay.dll` built. Runtime can `LoadLibrary` it + negotiate. Cube apps render via sim_display through the plug-in path. | 3-5 |
 | 5 | **Runtime side: registry enumeration + probe loop.** | `DisplayXRClient.dll` actually discovers plug-ins from the registry, no longer hard-references either driver. | 2 |
-| 6 | **Migrate `drv_leia` to plug-in shape.** | `DisplayXR-LeiaSR.dll` built. SR SDK linkage entirely contained in plug-in. Cube apps render via Leia through the plug-in path. PR #253's DllMain hook moves here. | 3-5 |
+| 6 | **Migrate `drv_leia` to plug-in shape.** | `DisplayXR-LeiaSR.dll` built. vendor SDK linkage entirely contained in plug-in. Cube apps render via Leia through the plug-in path. PR #253's DllMain hook moves here. | 3-5 |
 | 7 | **Installer split.** | Runtime installer drops SR DLLs + drv_leia bits. New Leia plug-in installer (or hand off to SR Platform). Cascade uninstall verified. | 2 |
-| 8 | **CI: vendor-agnostic build + assert.** | Workflow builds without SR SDK present, asserts zero vendor imports, smoke-tests sim_display path. | 1 |
+| 8 | **CI: vendor-agnostic build + assert.** | Workflow builds without vendor SDK present, asserts zero vendor imports, smoke-tests sim_display path. | 1 |
 | 9 | **macOS port + docs.** | sim_display dylib + manifest discovery. `docs/archive/vendor-integration-historical.md` rewrite for plug-in shape. | 2-3 |
 
 **Total: ~3-4 weeks** for one focused engineer. Parallelizable to ~2 calendar weeks with two.
@@ -231,7 +231,7 @@ Recommended order. Each step lands as its own PR.
 ## 7. Risks
 
 1. **Aux state duplication (§4.3).** Picking wrong here is the most expensive mistake. Mitigation: dedicated ADR before any code lands. Verify with a stress test that creates instance, destroys, recreates, exercises logging from both DLLs.
-2. **Eye-tracking listener marshalling.** `drv_leia` subscribes to `EyeTracker`/`EyePairStream` listeners on SR SDK threads. Those callbacks now fire inside the plug-in DLL and need to reach the runtime's DP-snapshot cache (memory: [[feedback_compositor_eye_pos_layering.md]]). Today they're co-located; after the split, the host iface needs a thread-safe "publish eye position" callback. Validate during step 6.
+2. **Eye-tracking listener marshalling.** `drv_leia` subscribes to `EyeTracker`/`EyePairStream` listeners on vendor SDK threads. Those callbacks now fire inside the plug-in DLL and need to reach the runtime's DP-snapshot cache (memory: [[feedback_compositor_eye_pos_layering.md]]). Today they're co-located; after the split, the host iface needs a thread-safe "publish eye position" callback. Validate during step 6.
 3. **Symbol naming and exports.** Multiple plug-ins both linking the same static aux helpers, both exporting the same internal symbol names, can collide if a plug-in's helpers somehow get re-exported. Discipline: every plug-in DLL exports exactly `xrtPluginNegotiate` and nothing else. Use a `.def` file + `/EXPORT:xrtPluginNegotiate` link-line guard.
 4. **Probe latency.** Today drv_leia probe is in-process and fast. After: per-plug-in `LoadLibraryEx` + `GetProcAddress` + `probe()` on the `xrCreateInstance` hot path. Each plug-in's probe must stay sub-millisecond. SR-side already does — keep it that way. Logging instrumentation lands in step 5.
 5. **Vendor crash isolation.** In-process plug-in still crashes the host app on a vendor-side bug. Explicit non-goal for v1; doc the limitation. Worth a follow-up issue for an out-of-process variant if it ever bites.
@@ -264,6 +264,6 @@ Recommended order. Each step lands as its own PR.
 The end state of this work:
 
 - **Runtime tree (`DisplayXR/displayxr-runtime`)** — zero vendor source, zero vendor SDK fetches in CI. Builds with sim_display as the in-tree plug-in. The `XRT_PLUGIN_BUILD_INPROC_FALLBACK` option was retained briefly post-#263 as a guard against accidental re-introduction of in-tree static-link paths; removed in #287 once no in-tree fallback code remained.
-- **Leia plug-in (`DisplayXR/displayxr-leia-plugin`)** — owns `src/drv_leia/` (formerly `src/xrt/drivers/leia/`), its NSIS installer (`DisplayXRLeiaSRSetup-*.exe`), its CI (fetches SR SDK from this repo's `sr-sdk-v*` release), and the sr-sdk re-host from runtime's old release surface.
+- **Leia plug-in (`DisplayXR/displayxr-leia-plugin`)** — owns `src/drv_leia/` (formerly `src/xrt/drivers/leia/`), its NSIS installer (`DisplayXRLeiaSRSetup-*.exe`), its CI (fetches vendor SDK from this repo's `sr-sdk-v*` release), and the sr-sdk re-host from runtime's old release surface.
 - **Plug-in ABI contract** — `xrt/xrt_plugin.h`, `xrt/xrt_api.h`, `target_plugin_loader.{h,c}`, `sim_display_plugin.c` stay in the runtime tree as the consumed surface for vendor plug-ins (FetchContent-pinned).
 - **Onboarding** — new vendors fork the Leia plug-in repo as a template (or follow [`docs/guides/vendor-plugin-onboarding.md`](../guides/vendor-plugin-onboarding.md) for the contract). The runtime owns no vendor-specific code paths.

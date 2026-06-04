@@ -33,7 +33,7 @@ saga, fixed immediately by leia PR #16):
   runtime `v1.5.2`. So the runtime's `set_chroma_key` call (slot `0x50`) landed
   on the plug-in's `leia_dp_destroy` (which sits at `0x50` in the `v1.4.1`
   layout): **the runtime destroyed the DP immediately after creating it** —
-  freeing `ldp`, tearing down the SR weaver. Downstream that manifested as
+  freeing `ldp`, tearing down the vendor weaver. Downstream that manifested as
   "freed/corrupt vtable", a UAF crash, and no weave.
 - It reproduced only in CI/shipping because only the CI build uses the pinned
   tag; local/ASan builds point `DXR_RUNTIME_SOURCE_DIR` at the current runtime

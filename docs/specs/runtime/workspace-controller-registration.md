@@ -29,7 +29,7 @@ A workspace app's installer:
    it binds against. No PATH gymnastics are required.
 3. **Writes its registration at `HKLM\Software\DisplayXR\WorkspaceControllers\<id>`.**
    `<id>` is a short unique identifier; vendor-prefix it (e.g.
-   `leia-shell`, `lenovo-cockpit`) unless you are DisplayXR's own
+   `acme-shell`, `lenovo-cockpit`) unless you are DisplayXR's own
    shell. Subkey schema:
 
    | Value | Type | Required | Purpose |

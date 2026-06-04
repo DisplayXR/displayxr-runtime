@@ -6,7 +6,7 @@ source: "#23"
 # ADR-001: Native Compositors Per Graphics API
 
 ## Context
-The original Monado architecture used a Vulkan server compositor as the single rendering backend, with interop layers for D3D11/D3D12/OpenGL. For tracked 3D displays, the Vulkan interop path adds latency, complexity, and doesn't support vendor SDK weavers that require native API access (e.g., LeiaSR D3D11 weaver).
+The original Monado architecture used a Vulkan server compositor as the single rendering backend, with interop layers for D3D11/D3D12/OpenGL. For tracked 3D displays, the Vulkan interop path adds latency, complexity, and doesn't support vendor SDK weavers that require native API access (e.g., a vendor's D3D11 weaver).
 
 ## Decision
 Each graphics API gets its own native compositor implementation (D3D11, D3D12, Metal, OpenGL, Vulkan). No Vulkan intermediary. Each compositor directly manages swapchains and rendering in its native API.

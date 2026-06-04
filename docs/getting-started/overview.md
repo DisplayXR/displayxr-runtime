@@ -23,7 +23,7 @@ App (any graphics API)
    |    |     |        |        |
  D3D11 D3D12 Vulkan  Metal   OpenGL   <-- native compositors
    |    |     |        |        |
-   Display Processor (vendor-specific: LeiaSR / sim_display)
+   Display Processor (vendor-specific: vendor plug-in / sim_display)
         |
    Display
 ```

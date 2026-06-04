@@ -31,7 +31,7 @@ The post-weave pass does an exact-RGB match, so silhouette pixels with `L ≠ R`
 
 To do:
 
-- Quantify visible halo width vs. avatar parallax on a Leia SR display. Sweep avatar Z-offset from screen depth to maximum comfortable parallax; capture compositor screenshots and viewer-eye photos.
+- Quantify visible halo width vs. avatar parallax on a 3D display. Sweep avatar Z-offset from screen depth to maximum comfortable parallax; capture compositor screenshots and viewer-eye photos.
 - Prototype the silhouette-intersection mitigation (conservative chroma-color dilation in each view's clear). Measure how much silhouette fidelity is lost vs. how much fringe is suppressed.
 - If neither parallax-budget nor dilation is acceptable for product use, prototype `SetWindowRgn` clipping on top of the DComp path. Hard binary edges, region update cost per frame, but reliable.
 
@@ -39,7 +39,7 @@ These experiments inform the avatar product's acceptable parallax budget and sha
 
 ### Migration when the alpha-respecting weaver lands
 
-#190 tracks a vendor request to Leia for an opt-in alpha-aware weaver mode. When that lands:
+#190 tracks a vendor request for an opt-in alpha-aware weaver mode. When that lands:
 
 - Apps set `chromaKeyColor = 0`. The runtime skips the post-weave shader pass (already implemented; the pass is no-op when the color is zero).
 - The display processor preserves the swapchain's per-pixel alpha through interlacing. Edge pixels carry partial alpha and blend correctly in both eyes — disocclusion fringes go away.

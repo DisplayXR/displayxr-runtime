@@ -13,7 +13,7 @@
 
 The qwerty driver provides simulated HMD and controller devices that are controlled entirely via keyboard and mouse input. It allows developers to test OpenXR applications without physical VR hardware by moving a virtual headset and two virtual controllers through keyboard commands and mouse look.
 
-**Note:** The qwerty device is a pure input device — it captures keyboard/mouse input on the Monado-owned window and translates it into HMD pose + controller state. It does not produce any display output. The qwerty builder uses `maybe.head` (last-resort fallback), not `certain.head` — display builders (Leia, sim_display) always win via `certain.head`. Display builders get qwerty input devices via the shared helper `t_builder_add_qwerty_input()`.
+**Note:** The qwerty device is a pure input device — it captures keyboard/mouse input on the runtime-owned window and translates it into HMD pose + controller state. It does not produce any display output. The qwerty builder uses `maybe.head` (last-resort fallback), not `certain.head` — display builders (vendor DPs, sim_display) always win via `certain.head`. Display builders get qwerty input devices via the shared helper `t_builder_add_qwerty_input()`.
 
 The driver has three input backends:
 
@@ -237,7 +237,7 @@ The builder sets `nominal_viewer_z` and `screen_height_m` from the display devic
 
 ### 5.1 Shared Helper
 
-Display builders (Leia, sim_display, future vendors) add qwerty keyboard/mouse
+Display builders (vendor DPs, sim_display, future vendors) add qwerty keyboard/mouse
 input to their system by calling `t_builder_add_qwerty_input()`:
 
 ```c
@@ -260,7 +260,7 @@ fallback for development when no real display is available.
 
 | Builder | Head Claim | Priority | Use Case |
 |---------|-----------|----------|----------|
-| leia | `certain.head` | -15 | SR SDK hardware detected |
+| vendor DP (plug-in) | `certain.head` | -15 | vendor hardware detected |
 | sim_display | `certain.head` / `maybe.head` | -10 / -20 | `FORCE_SIM_DISPLAY=1` overrides vendors; otherwise auto-fallback |
 | qwerty | `maybe.head` | -19 | No display builder active (fallback) |
 | legacy | `maybe.head` | -20 | Upstream Monado catch-all |
@@ -274,9 +274,10 @@ camera control.
 
 - **sim_display** uses pose delegation: calls `sim_display_hmd_set_pose_source()`
   to make the sim_display HMD track the qwerty HMD's position/orientation.
-- **Leia** uses pose delegation: calls `leia_hmd_set_pose_source()` to make the
-  Leia HMD track the qwerty HMD's position/orientation. The initial qwerty pose
-  is set to the Leia display's nominal viewing position (0, 0, -nominal_z).
+- **A hardware vendor DP** uses pose delegation: it points its HMD device's pose
+  source at the qwerty HMD so the vendor HMD tracks the qwerty HMD's
+  position/orientation. The initial qwerty pose is set to the display's nominal
+  viewing position (0, 0, -nominal_z).
 
 ---
 
@@ -358,9 +359,9 @@ if (lmb_down != lmb_was_down) {
 
 The `lmb_was_down` / `mmb_was_down` trackers are also synced in the regular `WM_LBUTTONDOWN`/`UP` and `WM_MBUTTONDOWN`/`UP` handlers, so both code paths stay consistent.
 
-### 7.3 Why Not Use Regular Keys Like SRHydra?
+### 7.3 Why Not Use Regular Letter Keys?
 
-SRHydra uses regular letter keys (F/G) for controller focus instead of CTRL/ALT, avoiding the palm rejection issue entirely. However, regular letter keys would conflict with the existing WASD movement and controller button bindings. CTRL and ALT are conventional modifier keys that don't generate character input and are intuitively understood as "hold to modify behavior." The `wParam` fallback preserves this ergonomic choice while still working on touchpads.
+An alternative design uses regular letter keys (F/G) for controller focus instead of CTRL/ALT, avoiding the palm rejection issue entirely. However, regular letter keys would conflict with the existing WASD movement and controller button bindings. CTRL and ALT are conventional modifier keys that don't generate character input and are intuitively understood as "hold to modify behavior." The `wParam` fallback preserves this ergonomic choice while still working on touchpads.
 
 ---
 

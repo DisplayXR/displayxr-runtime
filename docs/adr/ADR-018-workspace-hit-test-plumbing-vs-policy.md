@@ -77,7 +77,7 @@ These are *policy* — they decide what the user's input *does*. Per ADR-016 the
 ### Constraints we are NOT relaxing
 
 - The runtime continues to do per-eye parallax tile rendering using DP-cached eye positions (the DP listener pattern landed in #251). That is unambiguously runtime work — it's composition, not interaction.
-- The DP continues to own SR SDK eye-tracking state internally. Per #251.
+- The DP continues to own vendor SDK eye-tracking state internally. Per #251.
 
 ## Related
 

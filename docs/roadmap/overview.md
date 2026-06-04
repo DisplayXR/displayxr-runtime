@@ -10,7 +10,7 @@ Stripped Monado from 500+ files to ~150. Removed 34 VR drivers and the Vulkan se
 
 **What you can build on today:**
 - Native compositors: D3D11, D3D12, Metal, OpenGL, Vulkan — all shipping
-- Three drivers: Leia (LeiaSR SDK), sim_display (simulation), qwerty (keyboard/mouse)
+- Drivers: vendor display-processor plug-ins (e.g. a lenticular hardware DP), plus in-tree sim_display (simulation) and qwerty (keyboard/mouse)
 - Four app classes: handle, texture, hosted, IPC
 - Custom OpenXR extensions: `XR_EXT_display_info`, `XR_EXT_win32_window_binding`, `XR_EXT_cocoa_window_binding`
 

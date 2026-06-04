@@ -137,7 +137,7 @@ Thread A (main / message pump):         Thread B (render):
 │ DefWindowProc()          │           │ xrWaitFrame()            │
 │   ↓                      │           │ xrBeginFrame()           │
 │ Windows internally       │           │ render scene             │
-│ touches DXGI / D3D11     │           │ leiasr_weave() ← uses   │
+│ touches DXGI / D3D11     │           │ vendor weave() ← uses   │
 │ (swapchain resize,       │           │   D3D11 device context   │
 │  DWM recomposition)      │           │ xrEndFrame()             │
 │          ↑               │           │          ↑               │
@@ -147,13 +147,13 @@ Thread A (main / message pump):         Thread B (render):
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**Thread B** calls `leiasr_weave()` which issues D3D11 draw calls through the immediate context. **Thread A** is inside `DefWindowProc`, which internally triggers DXGI operations (swapchain management, DWM recomposition) that also use the same D3D11 context.
+**Thread B** calls the vendor weaver, which issues D3D11 draw calls through the immediate context. **Thread A** is inside `DefWindowProc`, which internally triggers DXGI operations (swapchain management, DWM recomposition) that also use the same D3D11 context.
 
 The worst case: when the user **releases the mouse button**, Windows calls `ReleaseCapture()` which sends synchronous messages that re-enter the D3D11 context from thread A while thread B is mid-render.
 
 ### What about `ID3D11Multithread::SetMultithreadProtected(TRUE)`?
 
-D3D11's built-in thread-safety mutex does not help here. Even if D3D11 calls are serialized, the **SR SDK weaver's internal state** has no synchronization of its own. The weaver maintains render state (shader bindings, render targets, intermediate buffers) that would be corrupted by concurrent access from two threads.
+D3D11's built-in thread-safety mutex does not help here. Even if D3D11 calls are serialized, the **vendor weaver's internal state** has no synchronization of its own. The weaver maintains render state (shader bindings, render targets, intermediate buffers) that would be corrupted by concurrent access from two threads.
 
 ---
 
@@ -181,14 +181,14 @@ Window Thread                          Compositor Thread
 ────────────────                       ──────────────────
 HWND owner                             D3D11 rendering
 GetMessage loop                        xrWaitFrame/xrEndFrame
-WM_PAINT handler                       SR weaver + Present(1)
+WM_PAINT handler                       vendor weaver + Present(1)
 ```
 
 The window thread runs its own message loop, so the compositor thread is **not blocked** during drag — it continues calling `Present(1)`. However, this creates a **3D phase sync problem**.
 
 ### The Phase Sync Problem
 
-The SR SDK weaver reads the window position **at weave time** via `GetClientRect()` + `ClientToScreen()`. During drag, the window position changes rapidly. If the compositor renders at position P₁ but DWM composites the frame when the window has moved to P₂, the interlacing pattern is wrong — the 3D effect breaks.
+The vendor weaver reads the window position **at weave time** via `GetClientRect()` + `ClientToScreen()`. During drag, the window position changes rapidly. If the compositor renders at position P₁ but DWM composites the frame when the window has moved to P₂, the interlacing pattern is wrong — the 3D effect breaks.
 
 ```
 Timeline during drag (async rendering — BROKEN 3D):

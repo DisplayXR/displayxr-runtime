@@ -12,8 +12,8 @@ This document explains the architectural differences between the **in-process (n
 | **Process Model** | Single process | N+1 processes (one or more IPC clients — Chrome tab, shell-launched apps — plus `displayxr-service`) |
 | **D3D11 Device** | App's device (shared) | Service's own device |
 | **Swapchain Textures** | Local textures | Cross-process shared (NT handles + KeyedMutex) |
-| **View Poses** | Direct from compositor | Via IPC with SR-aware poses from server |
-| **Eye Tracking** | Compositor queries SR weaver | IPC server queries SR weaver |
+| **View Poses** | Direct from compositor | Via IPC with tracking-aware poses from server |
+| **Eye Tracking** | Compositor queries vendor weaver | IPC server queries vendor weaver |
 | **Session Events** | Direct callbacks | IPC message queue |
 
 ---
@@ -36,7 +36,7 @@ This document explains the architectural differences between the **in-process (n
 │              │     comp_d3d11_compositor                 │   │
 │              │  - Uses app's D3D11 device (AddRef)       │   │
 │              │  - Creates local swapchains               │   │
-│              │  - Owns SR weaver                         │   │
+│              │  - Owns vendor weaver                         │   │
 │              │  - Renders to output window               │   │
 │              └───────────────────────────────────────────┘   │
 └──────────────────────────────────────────────────────────────┘
@@ -47,7 +47,7 @@ This document explains the architectural differences between the **in-process (n
 - App provides D3D11 device via `XrGraphicsBindingD3D11KHR`
 - Compositor adds a reference to app's device
 - Swapchain textures are local (no cross-process sharing needed)
-- Direct access to SR weaver for eye tracking
+- Direct access to vendor weaver for eye tracking
 
 ### Service/IPC (WebXR or Shell)
 
@@ -66,7 +66,7 @@ The IPC plumbing is identical whether the client is a Chrome tab or an app launc
 │  │                              │   │     │   │                             │   │
 │  │ - Has Chrome's D3D11 device  │   │     │   │ - Owns service D3D11 device │   │
 │  │ - Imports swapchain textures │   │     │   │ - Creates shared swapchains │   │
-│  │ - Submits layers via IPC     │   │     │   │ - Owns SR weaver            │   │
+│  │ - Submits layers via IPC     │   │     │   │ - Owns vendor weaver            │   │
 │  └──────────────────────────────┘   │     │   │ - Renders to output window  │   │
 │                                     │     │   └─────────────────────────────┘   │
 │  Swapchain textures imported via    │     │   Swapchain textures created with   │
@@ -89,7 +89,7 @@ The IPC plumbing is identical whether the client is a Chrome tab or an app launc
 │  (privileged client)    │     │                                            │
 └─────────────────────────┘     │   d3d11_service_system                     │
 ┌─────────────────────────┐     │   - Multi-compositor (N clients → 1 out)   │
-│  3D App #1 (IPC client) │─IPC─│   - Owns SR weaver                         │
+│  3D App #1 (IPC client) │─IPC─│   - Owns vendor weaver                         │
 └─────────────────────────┘     │   - Renders combined output                │
 ┌─────────────────────────┐     │                                            │
 │  3D App #2 (IPC client) │─IPC─│                                            │
@@ -182,7 +182,7 @@ App calls xrLocateViews()
 oxr_session_locate_views()
         │
         ▼
-comp_d3d11_compositor → SR weaver → leiasr_d3d11_get_predicted_eye_positions()
+comp_d3d11_compositor → vendor weaver → leiasr_d3d11_get_predicted_eye_positions()
         │                                      │
         │                                      ▼
         │                          Eye positions with depth (z=0.6m)
@@ -193,7 +193,7 @@ View poses returned directly to app
 
 **Native compositor** (`comp_d3d11_compositor.cpp`, eye position query in `comp_d3d11_get_eye_positions()`):
 ```cpp
-// Get predicted eye positions from SR weaver
+// Get predicted eye positions from vendor weaver
 struct xrt_vec3 left_eye = {-0.032f, 0.0f, 0.6f};   // Default fallback
 struct xrt_vec3 right_eye = {0.032f, 0.0f, 0.6f};
 
@@ -208,7 +208,7 @@ if (c->weaver != nullptr) {
 #endif
 ```
 
-### Service/IPC (WebXR or Shell) — With SR Support
+### Service/IPC (WebXR or Shell) — With Eye Tracking
 
 ```
 Chrome calls xrLocateViews()
@@ -226,40 +226,40 @@ ipc_try_get_sr_view_poses() ─────────────────�
 comp_d3d11_service_get_predicted_eye_positions() + ipc_compute_kooima_fov()
         │                                         │
         ▼                                         ▼
-SR weaver eye tracking data            Kooima asymmetric FOV from eye positions
+vendor weaver eye tracking data            Kooima asymmetric FOV from eye positions
         │                                         │
         └────────────────┬────────────────────────┘
                          ▼
               + qwerty device pose (player transform)
                          │
                          ▼
-              SR-aware view poses with proper depth
+              tracking-aware view poses with proper depth
                          │
         ▼ (IPC response)
-Chrome receives SR-aware poses + Kooima FOV
+Chrome receives tracking-aware poses + Kooima FOV
         │
         ▼
 App renders with correct 3D perspective
 ```
 
-**IPC Server SR Integration** (`ipc_server_handler.c`):
+**IPC Server Eye-Tracking Integration** (`ipc_server_handler.c`):
 ```cpp
-// ipc_handle_device_get_view_poses_2() now tries SR-aware poses first
+// ipc_handle_device_get_view_poses_2() now tries tracking-aware poses first
 #if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 if (ipc_try_get_sr_view_poses(ics->server, xdev, default_eye_relation, at_timestamp_ns,
                                view_count, &out_info->head_relation, out_info->fovs, out_info->poses)) {
-    return XRT_SUCCESS;  // Used SR-aware poses
+    return XRT_SUCCESS;  // Used tracking-aware poses
 }
 #endif
-// Fall back to qwerty device if SR not available
+// Fall back to qwerty device if eye tracking not available
 ```
 
 The `ipc_try_get_sr_view_poses()` function:
-1. Gets eye positions from SR weaver via `comp_d3d11_service_get_predicted_eye_positions()`
+1. Gets eye positions from vendor weaver via `comp_d3d11_service_get_predicted_eye_positions()`
 2. Gets display dimensions via `comp_d3d11_service_get_display_dimensions()`
 3. Computes Kooima asymmetric FOV from eye positions
 4. Gets qwerty device pose as "player transform" (WASD movement)
-5. Combines everything into SR-aware view poses
+5. Combines everything into tracking-aware view poses
 
 ---
 
@@ -271,8 +271,8 @@ For proper 3D display convergence, eye positions need **depth (z value)**:
 
 | Component | Eye Position Format | Issue |
 |-----------|---------------------|-------|
-| SR Weaver | `{±0.032, 0, 0.6}` | Has depth (60cm from screen) |
-| Native compositor | Uses SR weaver values | Correct |
+| Vendor Weaver | `{±0.032, 0, 0.6}` | Has depth (60cm from screen) |
+| Native compositor | Uses vendor weaver values | Correct |
 | Service compositor (before fix) | `{±0.032, 0, 0}` | No depth! |
 | Qwerty device | Identity pose | No eye offset at all |
 
@@ -283,7 +283,7 @@ For proper 3D display convergence, eye positions need **depth (z value)**:
 Eye tracking now flows to Chrome via IPC:
 
 ```
-SR Weaver (eye tracking camera)
+Vendor Weaver (eye tracking camera)
         │
         ▼
 leiasr_d3d11_get_predicted_eye_positions()
@@ -301,7 +301,7 @@ Service Compositor                       IPC Server Handler
                                          (xrLocateViews result)
 ```
 
-Chrome now receives SR-aware poses with proper depth and Kooima FOV.
+Chrome now receives tracking-aware poses with proper depth and Kooima FOV.
 
 ---
 
@@ -365,13 +365,13 @@ D3D11CreateDevice(..., &device);  // New device
 
 **Why separate devices?**
 - Cross-process GPU work requires separate devices either way (the client's and the service's are in different processes)
-- The service needs a device in *its own* process to own the SR weaver and render the final composite
+- The service needs a device in *its own* process to own the vendor weaver and render the final composite
 - With multiple IPC clients (shell mode), a shared "app device" wouldn't make sense — there is no single app
 - Chrome adds an extra constraint: its device lives in an AppContainer with potentially different feature levels, so the service device must be independent
 
 ---
 
-## SR Weaver Integration
+## Vendor Weaver Integration
 
 ### In-Process (Native)
 
@@ -409,7 +409,7 @@ struct d3d11_service_system {
 |---------|------------|-------------|
 | Swapchain textures | Local | Shared (NT handles + KeyedMutex) |
 | D3D11 device | App's (shared) | Service's own |
-| View poses source | SR weaver via compositor | SR weaver via IPC server |
+| View poses source | vendor weaver via compositor | vendor weaver via IPC server |
 | Eye tracking | Direct compositor query | IPC server queries, sends to client |
 | FOV computation | `oxr_session_locate_views()` | `ipc_try_get_sr_view_poses()` |
 | Player transform | Qwerty device in-process | Qwerty device on server side (WebXR); shell-owned and forwarded to focused app (shell mode) |
@@ -435,10 +435,10 @@ struct d3d11_service_system {
 ## Implementation Files
 
 ### In-Process Path
-- `src/xrt/state_trackers/oxr/oxr_session.c` - `oxr_session_locate_views()` with SR eye tracking
+- `src/xrt/state_trackers/oxr/oxr_session.c` - `oxr_session_locate_views()` with vendor eye tracking
 - `src/xrt/compositor/d3d11/comp_d3d11_compositor.cpp` - Native D3D11 compositor
 
 ### Service/IPC Path
 - `src/xrt/ipc/server/ipc_server_handler.c` - `ipc_try_get_sr_view_poses()`, `ipc_compute_kooima_fov()`
-- `src/xrt/compositor/d3d11_service/comp_d3d11_service.cpp` - Service compositor with SR helper functions
+- `src/xrt/compositor/d3d11_service/comp_d3d11_service.cpp` - Service compositor with vendor eye-tracking helper functions
 - `src/xrt/ipc/client/ipc_client_hmd.c` - Client-side view pose IPC

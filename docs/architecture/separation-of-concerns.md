@@ -111,7 +111,7 @@ User presses V-key
 App calls xrLocateViews()
   → OXR state tracker calls compositor->get_eye_positions()
     → Compositor calls xdp->get_predicted_eye_positions()
-      → Display processor queries vendor SDK (e.g., LeiaSR LookaroundFilter)
+      → Display processor queries vendor SDK (e.g., a vendor's eye-tracking API)
         → Returns xrt_eye_positions (N eye positions)
     → OXR applies Kooima FOV math (RENDER_READY) or passes raw (RAW mode)
       → App receives XrView[] with poses and FOVs

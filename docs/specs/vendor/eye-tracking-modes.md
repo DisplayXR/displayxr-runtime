@@ -92,7 +92,7 @@ The app is responsible for its own strategy:
 
 ### SDK wrapper API surface
 
-The vendor SDK wrapper (e.g., `leia_sr.h`) must expose control over these behaviors. Suggested API pattern:
+The vendor SDK wrapper (e.g., the vendor's `*_sr.h`-style header) must expose control over these behaviors. Suggested API pattern:
 
 ```c
 // Grace period + animation control
@@ -143,7 +143,7 @@ Vendor sets capability bits in `xrt_system_compositor_info`:
 
 Ideally vendors support **both** modes (bits = 3), giving developers the choice.
 
-**Supporting one mode is valid.** Vendors are not required to implement both MANAGED and MANUAL. If a vendor's SDK only supports managed filtering (e.g., Leia SR), they advertise `supported_eye_tracking_modes = 1` (MANAGED_BIT only). The runtime returns `XR_ERROR_FEATURE_UNSUPPORTED` if an app requests MANUAL on a device that only supports MANAGED. Apps should query `XrEyeTrackingModeCapabilitiesEXT.supportedModes` and adapt accordingly — for example, if only MANAGED is available, the app knows the SDK handles grace periods and should not add its own redundant animations.
+**Supporting one mode is valid.** Vendors are not required to implement both MANAGED and MANUAL. If a vendor's SDK only supports managed filtering (as a typical hardware DP does), they advertise `supported_eye_tracking_modes = 1` (MANAGED_BIT only). The runtime returns `XR_ERROR_FEATURE_UNSUPPORTED` if an app requests MANUAL on a device that only supports MANAGED. Apps should query `XrEyeTrackingModeCapabilitiesEXT.supportedModes` and adapt accordingly — for example, if only MANAGED is available, the app knows the SDK handles grace periods and should not add its own redundant animations.
 
 ## Non-goals
 
@@ -155,6 +155,6 @@ Ideally vendors support **both** modes (bits = 3), giving developers the choice.
 
 - [ ] Vendor integration guide updated with MANAGED/MANUAL transition contract
 - [ ] `XR_EXT_display_info.h` comments updated to document auto-switch behavior per mode
-- [ ] Leia SR display processors pass eye tracking mode to SDK wrapper when `xrRequestEyeTrackingModeEXT` is called
+- [ ] Vendor display processors pass eye tracking mode to the SDK wrapper when `xrRequestEyeTrackingModeEXT` is called
 - [ ] Event propagation path exists for vendor-initiated 2D/3D switches (MANAGED mode auto-transitions fire `XrEventDataRenderingModeChangedEXT` + `XrEventDataHardwareDisplayStateChangedEXT`)
 - [ ] sim_display updated: MANUAL mode returns immediate `isTracking` transitions, MANAGED mode simulates grace period (optional, for testing)

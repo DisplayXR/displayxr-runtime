@@ -460,8 +460,8 @@ On Android, applications inherently own their Activity and rendering surface. Th
 extension formalizes the handoff: the application passes an `ANativeWindow*` (obtained
 from a `SurfaceView` or `SurfaceHolder` via the NDK) to the runtime, which uses it as the
 compositing and interlacing target. The application also provides the Java `Surface`
-`jobject`, which the runtime may need for platform SDK integration (e.g., CNSDK requires
-the Java Surface for interlacer initialization). Additionally, the application must provide
+`jobject`, which the runtime may need for platform SDK integration (some vendor Android
+SDKs require the Java Surface for interlacer initialization). Additionally, the application must provide
 the surface's screen-space position, since neither `ANativeWindow` nor `Surface` exposes
 where the surface is located on the physical display — information the runtime needs for
 correct light field interlacing.
@@ -498,7 +498,7 @@ an external native window for session rendering.
 | `type` | `XrStructureType` | Must be `XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_EXT`. |
 | `next` | `const void*` | Pointer to next structure in the chain, or `NULL`. |
 | `nativeWindow` | `ANativeWindow*` | The Android native window to render into. Must be a valid, active native window. |
-| `surface` | `jobject` | The Java `android.view.Surface` associated with the native window. The runtime may need this for platform SDK initialization (e.g., CNSDK interlacer). May be `NULL` if the runtime does not require it. |
+| `surface` | `jobject` | The Java `android.view.Surface` associated with the native window. The runtime may need this for platform SDK initialization (e.g., a vendor's interlacer). May be `NULL` if the runtime does not require it. |
 | `screenOffsetX` | `int32_t` | Horizontal offset of the surface's left edge on the physical display, in display pixels. |
 | `screenOffsetY` | `int32_t` | Vertical offset of the surface's top edge on the physical display, in display pixels. |
 
@@ -778,8 +778,9 @@ XrResult xrRequestDisplayModeEXT(
 **Semantics:**
 
 - This function is a **request**, not a guarantee. The runtime forwards the request to the
-  underlying platform SDK (e.g., SR SDK's `SwitchableLensHint`, CNSDK's backlight control).
-  The platform may aggregate requests from multiple applications or defer the switch.
+  underlying platform SDK via the display processor (some vendors implement it as a
+  preference-based hint, others as direct backlight control). The platform may aggregate
+  requests from multiple applications or defer the switch.
 - The function returns `XR_SUCCESS` when the request has been accepted, regardless of
   whether the display has physically completed the mode change.
 - The application **may** call this function at any time while the session is running.
@@ -845,12 +846,11 @@ significant quality improvement for 2D content.
 
 #### Implementation Notes
 
-The runtime translates `xrRequestDisplayModeEXT` into the appropriate vendor SDK call:
-
-| Platform | Runtime Implementation |
-|---|---|
-| Windows (SR SDK) | `SwitchableLensHint::enable()` / `SwitchableLensHint::disable()` — preference-based, aggregated across applications. |
-| Android (CNSDK) | `leia_core_set_backlight(core, true)` / `leia_core_set_backlight(core, false)` — direct backlight control. |
+The runtime translates `xrRequestDisplayModeEXT` into the appropriate vendor SDK call via the
+display processor's `set_property` method. Vendor implementations vary — a preference-based
+hint aggregated across applications, or direct hardware (backlight/optics) control. For the
+concrete per-platform mapping of the first vendor integration, see
+[Leia display mode switching](../../vendors/leia/display-mode-switching.md).
 
 This abstraction also operates through:
 - `XrDisplayInfoEXT` chaining to `xrGetSystemProperties`.
@@ -1420,7 +1420,7 @@ exposing scale factors to the application provides better separation of concern 
 mode: the application knows its own window dimensions (it owns the window via
 `XR_EXT_win32_window_binding`), so a simple multiply gives the optimal texture size without
 the runtime needing to track window resize events, recompute the ratio of window size to
-monitor native resolution, and re-scale the SR SDK's recommended render size. The app-side
+monitor native resolution, and re-scale the vendor SDK's recommended render size. The app-side
 formula `windowWidth * scaleX` is trivial, deterministic, and requires no runtime round-trip.
 This also lets the application intentionally deviate from the recommended resolution for
 performance scaling.
@@ -1539,7 +1539,7 @@ this capability, and if so, how?
   switching — some are always-3D — so the capability must be queryable.
 - `xrRequestDisplayModeEXT(session, mode)` allows explicit mode control. The function is
   a **request** (not a hard set) because the underlying platform may aggregate preferences
-  across applications (e.g., SR SDK's `SwitchableLensHint`) or may defer the switch.
+  across applications (some vendors implement it as a preference-based hint) or may defer the switch.
 - The runtime automatically requests 3D mode when the session becomes READY and 2D mode
   when the session is destroyed, providing correct default behavior for applications that
   never call the function explicitly.
@@ -1662,7 +1662,7 @@ existing OpenXR contract already handles this transparently:
 
 ### Problem Statement
 
-The Leia SR SDK has internal `grace_period_s` / `resume_period_s` that smoothly collapse
+A vendor SDK may have internal grace/resume periods that smoothly collapse
 eye positions to a rest position when tracking is lost. This is convenient for most apps,
 but some developers want raw tracking values plus an explicit `isTracking` flag to handle
 tracking loss themselves (e.g., custom transition animations, UI overlays).
@@ -1775,8 +1775,8 @@ See `docs/specs/vendor/eye-tracking-modes.md` for the full MANAGED/MANUAL contra
 
 | Vendor | `supportedModes` | `defaultMode` | `isTracking` source |
 |--------|-------------------|---------------|---------------------|
-| Leia SR (current) | `MANAGED_BIT` | `MANAGED` | Eye-distance heuristic (collapsed = not tracking) |
-| Leia SR (future) | `MANAGED_BIT \| MANUAL_BIT` | `MANAGED` | SDK native flag |
+| Hardware DP (typical) | `MANAGED_BIT` | `MANAGED` | Eye-distance heuristic (collapsed = not tracking) |
+| Hardware DP (future) | `MANAGED_BIT \| MANUAL_BIT` | `MANAGED` | SDK native flag |
 | Sim display | `MANUAL_BIT` | `MANUAL` | Always `XR_TRUE` (simulated) |
 | No-tracker display | `0` (NONE) | undefined | Always `XR_FALSE` |
 
@@ -1897,7 +1897,7 @@ the property) silently ignore the call — graceful degradation.
 | Vendor | Mode 0 | Mode 1 | Mode 2 |
 |--------|--------|--------|--------|
 | sim_display | SBS stereo | Anaglyph | Blend |
-| Leia SR | Standard | (future: vendor-specific) | — |
+| Hardware DP | Standard | (future: vendor-specific) | — |
 
 ### Backward Compatibility
 
@@ -1927,7 +1927,7 @@ the property) silently ignore the call — graceful degradation.
 |---|---|---|---|
 | 1 | 2025-01-15 | David Fattal | Initial version with absolute recommended view sizes. |
 | 2 | 2025-03-01 | David Fattal | Replaced absolute sizes with `recommendedViewScaleX/Y` scale factors. Added `XR_REFERENCE_SPACE_TYPE_DISPLAY_EXT`. Added nominal viewer pose. |
-| 3 | 2025-06-01 | David Fattal | Changed `nominalViewerPoseInDisplaySpace` from `XrPosef` to `XrVector3f nominalViewerPositionInDisplaySpace`. Orientation was always identity; position is now populated from the SR SDK's `getDefaultViewingPosition()`. |
+| 3 | 2025-06-01 | David Fattal | Changed `nominalViewerPoseInDisplaySpace` from `XrPosef` to `XrVector3f nominalViewerPositionInDisplaySpace`. Orientation was always identity; position is now populated from the vendor SDK's default-viewing-position query. |
 | 4 | 2026-02-13 | David Fattal | Added `supportsDisplayModeSwitch` capability flag, `XrDisplayModeEXT` enum, and `xrRequestDisplayModeEXT` function for 2D/3D mode control. Added automatic lifecycle behavior (3D on session READY, 2D on session STOPPING). |
 | 5 | 2026-02-20 | David Fattal | Added `displayPixelWidth` / `displayPixelHeight` to `XrDisplayInfoEXT`. |
 | 6 | 2026-02-27 | David Fattal | Eye tracking mode control: `XrEyeTrackingModeEXT` enum, `XrEyeTrackingModeCapabilitiesEXT` (chained to `XrSystemProperties`), `XrViewEyeTrackingStateEXT` (chained to `XrViewState`), and `xrRequestEyeTrackingModeEXT` function. Allows apps to choose between managed (SDK-filtered) and manual eye tracking, with explicit `isTracking` flag. |
@@ -1958,7 +1958,7 @@ A complete reference implementation is available in the [DisplayXR runtime](http
 | Runtime: events | `src/xrt/state_trackers/oxr/oxr_event.c` |
 | Runtime: Kooima math | `src/xrt/auxiliary/math/m_display3d_view.h` |
 | Display processor interface | `src/xrt/include/xrt/xrt_display_processor.h` |
-| LeiaSR vendor integration | `src/xrt/drivers/leia/` |
+| Vendor integration (plug-in DLL, ADR-019) | [`displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin) |
 | Simulator driver | `src/xrt/drivers/sim_display/` |
 | D3D11 test application (Win32) | `test_apps/cube_handle_d3d11_win/` |
 | Metal test application (macOS) | `test_apps/cube_handle_metal_macos/` |

@@ -56,7 +56,7 @@ struct xrt_display_claim {
     uint64_t monitor_id;     // which descriptor this claims
     uint32_t confidence;     // xrt_display_claim_confidence
     uint32_t supported_apis; // bitmask: which create_dp_<api> work for this monitor
-    char     serial[64];     // vendor device serial (e.g. Leia FPC); "" if n/a
+    char     serial[64];     // vendor device serial (e.g. a hardware serial); "" if n/a
 };
 
 // Returns the number of claims written to out_claims (<= max_claims).
@@ -99,19 +99,19 @@ device-path hash) pins a specific plug-in id to a specific display; the global
 value remains the default. `displayxr-cli dp` / the Control Panel "Displays" tab
 gain a per-row assignment.
 
-## Leia migration (minimal)
+## Vendor migration example (minimal)
 
-`probe_displays()` for Leia is a thin wrapper over the existing
-`leia_edid_probe_display()`: match each descriptor against the EDID table →
-`XRT_DISPLAY_CLAIM_EDID`; upgrade to `XRT_DISPLAY_CLAIM_VERIFIED` when SDK +
-service + FPC serial are present (fill `serial`). No new detection logic — just
-re-shape the already-collected result into per-monitor claims.
+`probe_displays()` for the example vendor plug-in is a thin wrapper over its
+existing `leia_edid_probe_display()`: match each descriptor against the EDID
+table → `XRT_DISPLAY_CLAIM_EDID`; upgrade to `XRT_DISPLAY_CLAIM_VERIFIED` when
+SDK + service + hardware serial are present (fill `serial`). No new detection
+logic — just re-shape the already-collected result into per-monitor claims.
 
 ## Open questions
 
 - `monitor_id` stability across hotplug/resolution change within a boot — key off
   the EDID device-instance path, not the transient HMONITOR.
-- Confidence for two *same-vendor* panels (two Leia displays): per-claim `serial`
+- Confidence for two *same-vendor* panels (two displays from one vendor): per-claim `serial`
   disambiguates which DP/camera-calibration pairs with which monitor (ADR-015 §6).
 - Whether to pass the raw EDID blob (some vendors need vendor-specific EDID
   extension blocks beyond mfr/product) — appendable later without an ABI bump.
