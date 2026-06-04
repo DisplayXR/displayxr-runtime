@@ -12,6 +12,20 @@ if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
+# Shared off-axis Kooima projection math (display3d_view / camera3d_view /
+# projection_depth) now lives in displayxr::math, pinned by tag instead of
+# vendored here (epic #396 W3). The OpenXR target each app establishes before
+# add_subdirectory(common) is reused — displayxr::math does not re-fetch OpenXR.
+include(FetchContent)
+set(DISPLAYXR_COMMON_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    displayxr_common
+    GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
+    GIT_TAG v0.1.1
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(displayxr_common)
+
 # API-agnostic base library: logging, input, window, xr_session_common
 # No D3D11 or other graphics API dependencies
 add_library(sr_common_base STATIC
@@ -24,10 +38,6 @@ add_library(sr_common_base STATIC
     leia_math.h
     xr_session_common.cpp
     xr_session_common.h
-    display3d_view.c
-    display3d_view.h
-    camera3d_view.c
-    camera3d_view.h
     # In-app atlas capture: cross-platform filename helpers + Windows flash
     # overlay + the single STB implementation TU for Windows-linked targets.
     # Per-API readback (atlas_capture_{vk,d3d11,d3d12,gl}.cpp) is added to
@@ -45,6 +55,10 @@ target_include_directories(sr_common_base PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/external/openxr_includes
 )
+
+# Shared off-axis Kooima projection math (display3d_view / camera3d_view +
+# projection_depth.h) — PUBLIC so the headers propagate to every consumer.
+target_link_libraries(sr_common_base PUBLIC displayxr::math)
 
 # Force the linker to pull optimus_dgpu_hint.c into every EXE that links
 # sr_common_base, even though nothing references its symbols. /INCLUDE on

@@ -50,10 +50,20 @@ if(NOT OPENXR_FOUND)
     message(FATAL_ERROR "OpenXR not found. Install via: brew install openxr-loader")
 endif()
 
+# Off-axis Kooima math via displayxr::math, pinned by tag instead of compiled
+# from ../common (epic #396 W3). OpenXR (set up above) is reused, not re-fetched.
+include(FetchContent)
+set(DISPLAYXR_COMMON_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    displayxr_common
+    GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
+    GIT_TAG v0.1.1
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(displayxr_common)
+
 add_executable(cube_handle_vk_macos
     main.mm
-    "${CMAKE_SOURCE_DIR}/../common/display3d_view.c"
-    "${CMAKE_SOURCE_DIR}/../common/camera3d_view.c"
     "${CMAKE_SOURCE_DIR}/../common/hud_renderer_macos.mm"
     "${CMAKE_SOURCE_DIR}/../common/xr_window_space_hud.cpp"
     # 'I' key atlas capture: filename + flash helpers (runtime-owned readback
@@ -67,6 +77,7 @@ target_include_directories(cube_handle_vk_macos PRIVATE
 )
 
 target_link_libraries(cube_handle_vk_macos PRIVATE
+    displayxr::math
     OpenXR::openxr_loader
     Vulkan::Vulkan
     "-framework Cocoa"
