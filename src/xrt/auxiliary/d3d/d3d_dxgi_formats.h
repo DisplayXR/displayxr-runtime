@@ -81,6 +81,53 @@ d3d_dxgi_format_to_typeless_dxgi(DXGI_FORMAT format)
 	}
 }
 
+/*!
+ * Map an sRGB DXGI format to its plain UNORM sibling (identity for non-sRGB).
+ *
+ * Used to build the runtime's *internal* sampling view of an app color
+ * swapchain so the GPU does NOT auto-decode sRGB->linear when the compositor
+ * samples it. The display processor expects display-referred (sRGB-encoded)
+ * bytes, so the compositor must pass the app's bytes through unchanged rather
+ * than linearizing them (which would arrive ~2.2x too dark). Mirrors the GL
+ * GL_TEXTURE_SRGB_DECODE_EXT=GL_SKIP_DECODE_EXT fix.
+ */
+static inline DXGI_FORMAT
+d3d_dxgi_format_srgb_to_unorm(DXGI_FORMAT format)
+{
+	switch (format) {
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM;
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM;
+	default: return format;
+	}
+}
+
+/*!
+ * Pick the format for the runtime's INTERNAL sampling SRV of an app color
+ * swapchain so the GPU does NOT auto-decode sRGB->linear. Maps the 8-bit
+ * BGRA/RGBA family — whether the resource is TYPELESS, sRGB, or already UNORM —
+ * to its plain UNORM form. Identity for everything else. Used by the D3D12
+ * compositor where the swapchain resource is promoted to TYPELESS so the
+ * runtime SRV can reinterpret it as UNORM (a concrete sRGB resource can't be
+ * SRV-cast in D3D12). See d3d_dxgi_format_srgb_to_unorm for the comment on why
+ * passthrough (no decode) is correct.
+ */
+static inline DXGI_FORMAT
+d3d_dxgi_format_to_unorm_sample(DXGI_FORMAT format)
+{
+	switch (format) {
+	case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+		return DXGI_FORMAT_R8G8B8A8_UNORM;
+	case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+		return DXGI_FORMAT_B8G8R8A8_UNORM;
+	default:
+		return format;
+	}
+}
+
 static inline int64_t
 d3d_dxgi_format_to_vk(DXGI_FORMAT format)
 {

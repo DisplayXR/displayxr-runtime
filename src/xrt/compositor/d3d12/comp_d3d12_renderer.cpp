@@ -13,6 +13,7 @@
 
 #include "util/comp_layer_accum.h"
 #include "util/u_logging.h"
+#include "d3d/d3d_dxgi_formats.h"
 #include "math/m_api.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -402,7 +403,11 @@ render_window_space_layer(struct comp_d3d12_renderer *r,
 
 	D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
 	D3D12_RESOURCE_DESC res_desc = src_resource->GetDesc();
-	srv_desc.Format = res_desc.Format;
+	// Sample app color swapchains as UNORM (not their sRGB sibling) so the GPU
+	// does NOT auto-decode sRGB->linear; the DP wants display-referred bytes, so
+	// pass them through. Resource is TYPELESS for 8-bit color (see swapchain),
+	// which this maps to UNORM; identity for other/non-color formats.
+	srv_desc.Format = d3d_dxgi_format_to_unorm_sample(res_desc.Format);
 	srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 	srv_desc.Texture2D.MipLevels = 1;
 	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -1016,7 +1021,9 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 			}
 
 			D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-			srv_desc.Format = src_desc.Format;
+			// UNORM sample (see the other SRV site): no sRGB auto-decode; the
+			// app's display-referred bytes pass through to the DP unchanged.
+			srv_desc.Format = d3d_dxgi_format_to_unorm_sample(src_desc.Format);
 			srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 			srv_desc.Texture2D.MipLevels = 1;
 			srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;

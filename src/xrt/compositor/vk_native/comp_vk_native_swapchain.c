@@ -258,10 +258,43 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 		usage |= VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 	}
 
+	// sRGB passthrough (mirrors the GL/D3D11/D3D12 fixes): the compose
+	// vkCmdBlitImage reads the source in the IMAGE's format, so an sRGB image
+	// would auto-decode sRGB->linear with no re-encode into the UNORM atlas,
+	// and the DP (which wants display-referred bytes) would get ~2.2x-too-dark
+	// content. There is no view to retag for a blit, so create the color image
+	// in the UNORM sibling — the blit then passes the app's stored bytes through
+	// unchanged. Expose the requested sRGB format via MUTABLE_FORMAT + a format
+	// list so the app can still create an sRGB view to render with encode.
+	VkFormat image_format = vk_format;
+	VkFormat srgb_view_format = VK_FORMAT_UNDEFINED;
+	if (!depth) {
+		switch (vk_format) {
+		case VK_FORMAT_R8G8B8A8_SRGB:
+			image_format = VK_FORMAT_R8G8B8A8_UNORM;
+			srgb_view_format = vk_format;
+			break;
+		case VK_FORMAT_B8G8R8A8_SRGB:
+			image_format = VK_FORMAT_B8G8R8A8_UNORM;
+			srgb_view_format = vk_format;
+			break;
+		default: break;
+		}
+	}
+	const bool mutable_srgb = (srgb_view_format != VK_FORMAT_UNDEFINED);
+	VkFormat view_format_list[2] = {image_format, srgb_view_format};
+	VkImageFormatListCreateInfo format_list_ci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+	    .viewFormatCount = 2,
+	    .pViewFormats = view_format_list,
+	};
+
 	VkImageCreateInfo image_ci = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+	    .pNext = mutable_srgb ? &format_list_ci : NULL,
+	    .flags = mutable_srgb ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0,
 	    .imageType = VK_IMAGE_TYPE_2D,
-	    .format = vk_format,
+	    .format = image_format,
 	    .extent = {info->width, info->height, 1},
 	    .mipLevels = info->mip_count > 0 ? info->mip_count : 1,
 	    .arrayLayers = info->array_size > 0 ? info->array_size : 1,
@@ -321,12 +354,13 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 			return XRT_ERROR_VULKAN;
 		}
 
-		// Create image view
+		// Create image view (UNORM base for sRGB swapchains — passthrough, no
+		// sample-time decode; see the image-format note above).
 		VkImageViewCreateInfo view_ci = {
 		    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
 		    .image = sc->images[i],
 		    .viewType = view_type,
-		    .format = vk_format,
+		    .format = image_format,
 		    .subresourceRange = {
 		        .aspectMask = aspect,
 		        .baseMipLevel = 0,
