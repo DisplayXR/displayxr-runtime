@@ -408,8 +408,17 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 		DXGI_FORMAT typeless = d3d_dxgi_format_to_typeless_dxgi(dxgi_format);
 		if (typeless != dxgi_format) {
 			texture_format = typeless;
-			// srv_format and rtv_format remain as the original concrete format
+			// rtv_format remains the original concrete format so the app's own
+			// render path (incl. any sRGB encode it relies on) is unchanged.
 		}
+		// The runtime's internal SRV samples this image to build the composited
+		// atlas handed to the display processor. Use the UNORM sibling of an
+		// sRGB format so the sample does NOT auto-decode sRGB->linear: the DP
+		// expects display-referred (sRGB-encoded) bytes, so pass the app's
+		// bytes through unchanged. No-op for already-UNORM formats. Mirrors the
+		// GL GL_SKIP_DECODE_EXT fix. (Only the composited path samples this SRV;
+		// the single-layer zero-copy path hands the texture straight to the DP.)
+		srv_format = d3d_dxgi_format_srgb_to_unorm(srv_format);
 	}
 
 	// Create textures

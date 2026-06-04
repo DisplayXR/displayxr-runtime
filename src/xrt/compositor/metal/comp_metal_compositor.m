@@ -324,6 +324,20 @@ static NSString *const metal_shader_source = @
  *
  */
 
+// Map an sRGB Metal pixel format to its plain UNORM sibling (identity
+// otherwise). Used to sample an app sRGB swapchain through a non-decoding view
+// so the compositor passes the app's display-referred bytes through to the DP
+// unchanged. Mirrors the GL/D3D/VK sRGB-passthrough fixes.
+static MTLPixelFormat
+metal_srgb_to_unorm(MTLPixelFormat format)
+{
+	switch (format) {
+	case MTLPixelFormatRGBA8Unorm_sRGB: return MTLPixelFormatRGBA8Unorm;
+	case MTLPixelFormatBGRA8Unorm_sRGB: return MTLPixelFormatBGRA8Unorm;
+	default: return format;
+	}
+}
+
 static MTLPixelFormat
 xrt_format_to_metal(int64_t format)
 {
@@ -912,7 +926,12 @@ metal_compositor_create_swapchain(struct xrt_compositor *xc,
 		                                width:info->width
 		                               height:info->height
 		                            mipmapped:(info->mip_count > 1) ? YES : NO];
-		desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+		// PixelFormatView lets the compositor sample an sRGB swapchain through a
+		// UNORM view (sRGB passthrough — see the compose pass) without the GPU
+		// auto-decoding sRGB->linear. The app's own render target keeps the sRGB
+		// format, so its encoding (if any) is unchanged.
+		desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
+		             MTLTextureUsagePixelFormatView;
 		desc.storageMode = MTLStorageModeShared;
 		if (info->array_size > 1) {
 			desc.textureType = MTLTextureType2DArray;
@@ -1657,6 +1676,18 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				if (src_tex == nil) {
 					continue;
 				}
+				// sRGB passthrough: sample an app sRGB swapchain through a UNORM
+				// view so the GPU does not auto-decode sRGB->linear; the DP wants
+				// display-referred bytes. No-op for UNORM. Mirrors GL/D3D/VK.
+				{
+					MTLPixelFormat unorm_fmt = metal_srgb_to_unorm(src_tex.pixelFormat);
+					if (unorm_fmt != src_tex.pixelFormat) {
+						id<MTLTexture> v = [src_tex newTextureViewWithPixelFormat:unorm_fmt];
+						if (v != nil) {
+							src_tex = v;
+						}
+					}
+				}
 
 				// Use sub-image norm_rect to sample correct region of source texture
 				struct xrt_normalized_rect nr = layer->data.proj.v[eye].sub.norm_rect;
@@ -1789,6 +1820,16 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			id<MTLTexture> src_tex = msc->images[img_idx];
 			if (src_tex == nil) {
 				continue;
+			}
+			// sRGB passthrough (see projection pass): sample through a UNORM view.
+			{
+				MTLPixelFormat unorm_fmt = metal_srgb_to_unorm(src_tex.pixelFormat);
+				if (unorm_fmt != src_tex.pixelFormat) {
+					id<MTLTexture> v = [src_tex newTextureViewWithPixelFormat:unorm_fmt];
+					if (v != nil) {
+						src_tex = v;
+					}
+				}
 			}
 
 			// Source UV sub-rect (default to full texture if not specified)

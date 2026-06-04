@@ -263,6 +263,27 @@ comp_d3d12_swapchain_create(struct comp_d3d12_compositor *c,
 		default:
 			break;
 		}
+	} else {
+		// For 8-bit color formats, create the resource TYPELESS so the runtime
+		// can build a UNORM sampling SRV that does NOT auto-decode sRGB->linear
+		// when compositing (the DP wants display-referred bytes; pass them
+		// through unchanged). The app still creates its own typed RTV from the
+		// format it requested. Bounded to the 8-bit BGRA/RGBA family where the
+		// TYPELESS->UNORM mapping is unambiguous; other formats stay concrete.
+		// (Unlike D3D11, D3D12 cannot SRV-cast a concrete sRGB resource, so the
+		// TYPELESS promotion is required here.) Mirrors the GL skip-decode fix.
+		switch (dxgi_format) {
+		case DXGI_FORMAT_R8G8B8A8_UNORM:
+		case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+			resource_format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+			break;
+		case DXGI_FORMAT_B8G8R8A8_UNORM:
+		case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+			resource_format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
+			break;
+		default:
+			break;
+		}
 	}
 
 	// Create committed resources
