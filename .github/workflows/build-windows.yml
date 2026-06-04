@@ -352,47 +352,11 @@ jobs:
           draft: false
           prerelease: false
 
-      # OneDrive upload uses RCLONE_CONFIG, which is null on fork PRs. Skip
-      # the whole rclone group on forks; the artifact-upload steps above
-      # already give reviewers the installer.
-      - name: Setup rclone config
-        if: needs.DetectChanges.outputs.docs_only != 'true' && github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-        shell: powershell
-        run: |
-          $rcloneDir = "$env:USERPROFILE\.config\rclone"
-          if (-not (Test-Path $rcloneDir)) {
-            New-Item -ItemType Directory -Path $rcloneDir -Force
-          }
-          $configContent = @"
-          ${{ secrets.RCLONE_CONFIG }}
-          "@
-          Set-Content -Path "$rcloneDir\rclone.conf" -Value $configContent
-          Write-Host "rclone config written to $rcloneDir\rclone.conf"
-
-      - name: Install rclone (if not present)
-        if: needs.DetectChanges.outputs.docs_only != 'true' && github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-        shell: powershell
-        run: |
-          if (-not (Get-Command rclone -ErrorAction SilentlyContinue)) {
-            Write-Host "Installing rclone..."
-            Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "rclone.zip"
-            Expand-Archive -Path "rclone.zip" -DestinationPath "rclone_temp" -Force
-            $rcloneExe = Get-ChildItem -Path "rclone_temp" -Recurse -Filter "rclone.exe" | Select-Object -First 1
-            Copy-Item $rcloneExe.FullName -Destination "C:\Windows\System32\rclone.exe"
-            Write-Host "rclone installed successfully"
-          } else {
-            Write-Host "rclone already installed"
-          }
-
-      - name: Upload installer to OneDrive
-        if: needs.DetectChanges.outputs.docs_only != 'true' && github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-        shell: powershell
-        run: |
-          $installer = Get-ChildItem -Path "_package/DisplayXRSetup-*.exe" | Select-Object -First 1
-          $destPath = "SANDBOX/RUNTIMES + SDK + PLUGINS/OpenXR"
-          Write-Host "Uploading $($installer.Name) to OneDrive: $destPath"
-          rclone copy $installer.FullName "onedrive:$destPath" --progress
-          Write-Host "Upload complete!"
+      # NOTE: per-CI OneDrive upload removed. Build artifacts are no longer
+      # pushed to OneDrive on every run — the *bundle* meta-installer
+      # (DisplayXR/displayxr-installer, publish-bundle.yml) uploads to
+      # OneDrive on release only. Reviewers use the upload-artifact steps
+      # above; release assets attach to the GitHub Release on tag.
 
   # D3D11 test app with XR_EXT_win32_window_binding (app provides window handle)
   TestAppCubeHandleD3D11:
@@ -1140,39 +1104,11 @@ jobs:
             CubeIpcLegacyD3D11
             CubeIpcD3D11
 
-      # OneDrive upload uses RCLONE_CONFIG; skip on forks (the bundled
-      # artifact upload above already exposes the test apps to reviewers).
-      - name: Install rclone
-        if: needs.DetectChanges.outputs.docs_only != 'true' && github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-        run: |
-          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.zip
-          unzip rclone-current-linux-amd64.zip
-          sudo cp rclone-*-linux-amd64/rclone /usr/local/bin/
-          rclone --version
-
-      - name: Setup rclone config
-        if: needs.DetectChanges.outputs.docs_only != 'true' && github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-        env:
-          RCLONE_CONFIG_CONTENTS: ${{ secrets.RCLONE_CONFIG }}
-        run: |
-          mkdir -p ~/.config/rclone
-          echo "$RCLONE_CONFIG_CONTENTS" > ~/.config/rclone/rclone.conf
-
-      - name: Zip test apps
-        if: needs.DetectChanges.outputs.docs_only != 'true' && github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-        run: |
-          cd TestApps
-          zip -r ../TestApps-${{ github.run_number }}.zip .
-          cd ..
-          ls -lh TestApps-${{ github.run_number }}.zip
-
-      - name: Upload test apps zip to OneDrive
-        if: needs.DetectChanges.outputs.docs_only != 'true' && github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-        run: |
-          destPath="SANDBOX/RUNTIMES + SDK + PLUGINS/OpenXR"
-          echo "Uploading TestApps-${{ github.run_number }}.zip to OneDrive: $destPath"
-          rclone copy TestApps-${{ github.run_number }}.zip "onedrive:$destPath" --progress
-          echo "Upload complete!"
+      # NOTE: per-CI OneDrive upload of the test-apps zip removed. OneDrive
+      # now receives release artifacts only, via the bundle meta-installer
+      # (DisplayXR/displayxr-installer, publish-bundle.yml). Reviewers use
+      # the bundled artifact-upload above; the versioned release zip below
+      # still attaches to the GitHub Release on tag.
 
       # Versioned re-zip for the v* GitHub release (#290). Asset name
       # mirrors the convention from the /release skill — DisplayXR-
