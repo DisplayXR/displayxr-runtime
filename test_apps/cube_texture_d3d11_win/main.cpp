@@ -759,7 +759,7 @@ static void RenderOneFrame(RenderState& rs) {
                             display3d_compute_views(
                                 rawEyes.data(), eyeCount, &nominalViewer,
                                 &screen, &tunables, &cameraPose,
-                                0.01f, 100.0f, stereoViews.data());
+                                tunables.virtual_display_height, 1000.0f * tunables.virtual_display_height, /*vulkan_flip_y=*/0, stereoViews.data());
                         }
                     }
 
