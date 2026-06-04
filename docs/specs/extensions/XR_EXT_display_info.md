@@ -637,21 +637,25 @@ No known IP claims.
 ### Name Strings
 
 - Extension name: `XR_EXT_display_info`
-- Spec version: 6
+- Spec version: 13
 - Extension name define: `XR_EXT_DISPLAY_INFO_EXTENSION_NAME`
 
 ### Overview
 
 This extension exposes the physical properties of a tracked 3D display to the application:
-the display's physical dimensions, its nominal viewer position, recommended render
-resolution scale factors, and whether the display supports switching between 2D and 3D
-modes, and provides a function to request display mode changes.
+the display's physical dimensions, its nominal viewer position, and recommended render
+resolution scale factors. It also lets the application **enumerate the available display
+rendering modes** (mono / stereo / multi-view tiled layouts and vendor-specific variations)
+and request a mode at runtime, and exposes eye-tracking mode control.
 
 With this information the application can:
 - Build its own camera model (Kooima off-axis projection) from raw tracked eye positions.
 - Compute render resolution dynamically as the window/surface resizes.
 - Locate views and submit layers using LOCAL space (RAW mode returns screen-relative positions).
-- Query whether the display supports 2D/3D mode switching and request mode changes.
+- Enumerate rendering modes (`xrEnumerateDisplayRenderingModesEXT`) — including each mode's view
+  count, tile layout, view scale, hardware-3D state, and (per session) which mode is active and
+  which are requestable — and request a mode via `xrRequestDisplayRenderingModeEXT`.
+- Choose between managed and manual eye tracking.
 
 This extension is **platform-independent**. It works on any platform that supports OpenXR,
 regardless of the graphics API or windowing system in use.
@@ -684,9 +688,13 @@ Chained to `XrSystemProperties` to return physical display information.
 | `displayPixelWidth` | `uint32_t` | Native display panel width in pixels (0 if unknown). |
 | `displayPixelHeight` | `uint32_t` | Native display panel height in pixels (0 if unknown). |
 
-> **Note:** `hardwareDisplay3D` was removed from `XrDisplayInfoEXT` in v12 and is now
-> a per-mode field on `XrDisplayRenderingModeInfoEXT`. Query it via
-> `xrEnumerateDisplayRenderingModesEXT`.
+> **Note:** `hardwareDisplay3D` was removed from `XrDisplayInfoEXT` in v12. It is now a per-mode
+> field on `XrDisplayRenderingModeInfoEXT` (and is also reported by the
+> `XrEventDataHardwareDisplayStateChangedEXT` event). Query it via
+> `xrEnumerateDisplayRenderingModesEXT` — see
+> [Enumerating Rendering Modes](#enumerating-rendering-modes-v8--xrdisplayrenderingmodeinfoext--xrenumeratedisplayrenderingmodesext).
+> Likewise, the modern way to learn the view count, tile layout, per-view scale, active mode, and
+> which modes are requestable is the same enumeration API — not fields on `XrDisplayInfoEXT`.
 
 ```c
 typedef struct XrDisplayInfoEXT {
@@ -730,9 +738,18 @@ typedef enum XrDisplayModeEXT {
 
 ### New Functions
 
+This extension's current (v13) function set:
+
+| Function | Added | Purpose |
+|---|---|---|
+| [`xrEnumerateDisplayRenderingModesEXT`](#enumerating-rendering-modes-v8--xrdisplayrenderingmodeinfoext--xrenumeratedisplayrenderingmodesext) | v8 | Enumerate available rendering modes (`XrDisplayRenderingModeInfoEXT`). |
+| [`xrRequestDisplayRenderingModeEXT`](#7-display-rendering-mode-control-v7) | v7 | Request a rendering mode by index (the unified mode-control API). |
+| [`xrRequestEyeTrackingModeEXT`](#new-function-xrrequesteyetrackingmodeext) | v6 | Switch between managed and manual eye tracking. |
+| `xrRequestDisplayModeEXT` | v4 (**deprecated** v10) | Legacy 2D/3D toggle — thin wrapper over `xrRequestDisplayRenderingModeEXT`. |
+
 #### xrRequestDisplayModeEXT
 
-> **Deprecated in v10.** Use `xrRequestDisplayRenderingModeEXT` instead. See [Display Rendering Mode Control (v7)](#7-display-rendering-mode-control-v7) for the unified replacement. `xrRequestDisplayModeEXT` remains supported for backward compatibility.
+> **Deprecated in v10.** Use `xrRequestDisplayRenderingModeEXT` instead. See [Display Rendering Mode Control (v7)](#7-display-rendering-mode-control-v7) for the unified replacement (and [Enumerating Rendering Modes](#enumerating-rendering-modes-v8--xrdisplayrenderingmodeinfoext--xrenumeratedisplayrenderingmodesext) to discover modes). `xrRequestDisplayModeEXT` remains supported for backward compatibility as a thin wrapper that finds the first mode matching the requested hardware-3D state and delegates.
 
 Requests that the runtime switch the display between 2D and 3D modes.
 
@@ -754,7 +771,7 @@ XrResult xrRequestDisplayModeEXT(
 | Code | Meaning |
 |---|---|
 | `XR_SUCCESS` | The mode request was accepted by the runtime. |
-| `XR_ERROR_FEATURE_UNSUPPORTED` | The display does not support mode switching (`hardwareDisplay3D` is `XR_FALSE`). |
+| `XR_ERROR_FEATURE_UNSUPPORTED` | The display does not support mode switching (no enumerated rendering mode reports `hardwareDisplay3D == XR_TRUE`). |
 | `XR_ERROR_SESSION_NOT_RUNNING` | The session is not in a running state. |
 | `XR_ERROR_HANDLE_INVALID` | The session handle is invalid. |
 
@@ -766,8 +783,9 @@ XrResult xrRequestDisplayModeEXT(
 - The function returns `XR_SUCCESS` when the request has been accepted, regardless of
   whether the display has physically completed the mode change.
 - The application **may** call this function at any time while the session is running.
-- If `hardwareDisplay3D` in `XrDisplayInfoEXT` is `XR_FALSE`, this function
-  returns `XR_ERROR_FEATURE_UNSUPPORTED` and has no effect.
+- If no enumerated rendering mode reports `hardwareDisplay3D == XR_TRUE` (the display has no 3D
+  mode), this function returns `XR_ERROR_FEATURE_UNSUPPORTED` and has no effect. (`hardwareDisplay3D`
+  is a per-mode field on `XrDisplayRenderingModeInfoEXT`; it is no longer on `XrDisplayInfoEXT`.)
 
 ### Display Mode Switching
 
@@ -802,11 +820,13 @@ single full-resolution view instead of two reduced-resolution stereo views, yiel
 significant quality improvement for 2D content.
 
 **Runtime behavior:**
-- `xrLocateViews` still returns 2 views regardless of display mode. The application uses
-  the returned eye positions to compute a center-eye camera position (or any position it
-  chooses).
-- `xrEndFrame` accepts `viewCount == 1` projection layers when in 2D mode. In 3D mode,
-  `viewCount` must equal the view configuration's view count (2 for `PRIMARY_STEREO`).
+- `xrLocateViews` is called with an `XRT_MAX_VIEWS` (8)-sized buffer and returns the active
+  mode's views; the application uses the returned eye positions to compute a center-eye camera
+  position (or any position it chooses). (See the multiview model — the render/submit loop is
+  bounded by the active mode's `viewCount`, not a hardcoded 2.)
+- `xrEndFrame` accepts `viewCount == 1` projection layers when the active mode is a 2D/mono mode.
+  In a 3D mode, `viewCount` must equal the active rendering mode's `viewCount` (2 for SBS stereo,
+  4 for quad, etc.).
 - The compositor renders the single view to fill the full display output and skips light
   field interlacing (weaving), since 2D mode does not use the lenticular optics.
 
@@ -815,12 +835,13 @@ significant quality improvement for 2D content.
 - Create or reuse a swapchain at full window/display resolution for the mono view.
 - Render a single view using a center-eye camera position and full-resolution viewport.
 - Submit `viewCount == 1` with the single projection view to `xrEndFrame`.
-- When switching back to 3D mode, resume submitting `viewCount == 2` with per-eye stereo
-  views at the recommended scaled resolution.
+- When switching back to a 3D mode, resume submitting the active mode's `viewCount` (2 for SBS
+  stereo, 4 for quad) with per-view content at the recommended scaled resolution.
 
 **Backward compatibility:**
-- Applications that always submit `viewCount == 2` continue to work in both 2D and 3D
-  modes. The runtime blits the stereo content as before.
+- Applications that always submit the stereo view count continue to work in 2D and stereo 3D
+  modes. The runtime blits the content as before. (Multi-view modes such as quad require the app
+  to honor the active mode's `viewCount`.)
 
 #### Implementation Notes
 
@@ -845,6 +866,19 @@ Two new event types are delivered via `xrPollEvent` to notify applications of as
 
 ### Example Code: Querying Display Mode Support and Requesting 2D
 
+> ⚠️ **These inline examples predate the multiview model and the v13 header — read with care.**
+> Three things below are stale (corrected inline where safe, flagged where a rewrite would need
+> unverified API). For authoritative, working code use the shipping test apps
+> (`test_apps/cube_handle_*`, `test_apps/common/xr_session_common.cpp`) and
+> [`docs/guides/displayxr-app-rules.md`](../../guides/displayxr-app-rules.md):
+> 1. **View arrays must be `XRT_MAX_VIEWS` (8)-sized, not `[2]`**, and render loops must be
+>    bounded by the **active mode's `viewCount`**, not a hardcoded 2 (quad modes have 4 views).
+> 2. **`hardwareDisplay3D` is no longer a field on `XrDisplayInfoEXT`** (v13). It lives per-mode on
+>    `XrDisplayRenderingModeInfoEXT` and on the `XrEventDataHardwareDisplayStateChangedEXT` event.
+> 3. **`xrRequestDisplayModeEXT` / `XR_DISPLAY_MODE_*_EXT` are deprecated** in favor of
+>    `xrRequestDisplayRenderingModeEXT(session, modeIndex)` driven by mode enumeration; mode changes
+>    are *requests* — update local state only on `XrEventDataRenderingModeChangedEXT`.
+
 ```cpp
 // Query display capabilities
 XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
@@ -852,28 +886,33 @@ XrDisplayInfoEXT displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
 sysProps.next = &displayInfo;
 xrGetSystemProperties(instance, systemId, &sysProps);
 
-if (displayInfo.hardwareDisplay3D) {
-    // Display is a hardware 3D display supporting 2D/3D switching.
-    // The runtime automatically requests 3D mode when the session becomes READY.
-
-    // Example: temporarily switch to 2D for a settings menu
-    xrRequestDisplayModeEXT(session, XR_DISPLAY_MODE_2D_EXT);
-
-    // ... user interacts with 2D menu ...
-
-    // Switch back to 3D when menu closes
-    xrRequestDisplayModeEXT(session, XR_DISPLAY_MODE_3D_EXT);
+// NOTE (v13): hardwareDisplay3D is NOT on XrDisplayInfoEXT anymore — enumerate
+// rendering modes (xrEnumerateDisplayRenderingModesEXT) and read it per-mode on
+// XrDisplayRenderingModeInfoEXT. The pseudo-code below uses the DEPRECATED
+// xrRequestDisplayModeEXT API; the current path is xrRequestDisplayRenderingModeEXT
+// (request a mode index, then react to XrEventDataRenderingModeChangedEXT).
+if (/* a 3D-capable rendering mode exists */ false) {
+    // Example (deprecated API shown for historical context only):
+    //   xrRequestDisplayModeEXT(session, XR_DISPLAY_MODE_2D_EXT);   // -> request a 2D mode index
+    //   ... user interacts with 2D menu ...
+    //   xrRequestDisplayModeEXT(session, XR_DISPLAY_MODE_3D_EXT);   // -> request a 3D mode index
 }
 
 // Example: mono submission in 2D mode
 if (!displayMode3D) {
-    // xrLocateViews still returns 2 views — compute center eye
-    XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
-    // ... xrLocateViews(session, ..., 2, &viewCount, views) ...
-    XrVector3f centerEye;
-    centerEye.x = (views[0].pose.position.x + views[1].pose.position.x) * 0.5f;
-    centerEye.y = (views[0].pose.position.y + views[1].pose.position.y) * 0.5f;
-    centerEye.z = (views[0].pose.position.z + views[1].pose.position.z) * 0.5f;
+    // xrLocateViews fills an 8-wide buffer; in a 2D mode viewCount comes back 1,
+    // but locate into XRT_MAX_VIEWS regardless and compute the center eye from the
+    // valid entries.
+    XrView views[8];
+    for (uint32_t i = 0; i < 8; i++) views[i] = {XR_TYPE_VIEW};
+    uint32_t viewCount = 8;
+    // ... xrLocateViews(session, ..., 8, &viewCount, views) ...
+    XrVector3f centerEye = {0, 0, 0};
+    for (uint32_t i = 0; i < viewCount; i++) {
+        centerEye.x += views[i].pose.position.x / viewCount;
+        centerEye.y += views[i].pose.position.y / viewCount;
+        centerEye.z += views[i].pose.position.z / viewCount;
+    }
 
     // Render 1 view at full window resolution (no stereo scale factors)
     // ... render to monoSwapchain at windowWidth x windowHeight ...
@@ -1036,7 +1075,9 @@ float scaleX = displayInfo.recommendedViewScaleX;             // e.g. 0.5
 float scaleY = displayInfo.recommendedViewScaleY;             // e.g. 1.0
 XrVector3f nominalPos = displayInfo.nominalViewerPositionInDisplaySpace;
 // nominalPos ~ {0.0, 0.0, 0.65}
-XrBool32 isHardware3D = displayInfo.hardwareDisplay3D;         // XR_TRUE if hardware 3D display
+// NOTE (v13): hardwareDisplay3D is NOT on XrDisplayInfoEXT — read it per-mode on
+// XrDisplayRenderingModeInfoEXT (via xrEnumerateDisplayRenderingModesEXT) or from the
+// XrEventDataHardwareDisplayStateChangedEXT event.
 ```
 
 ### Example Code: Locating Views in RAW Mode
@@ -1051,9 +1092,12 @@ locateInfo.displayTime = predictedDisplayTime;
 locateInfo.space = localSpace;
 
 XrViewState viewState = {XR_TYPE_VIEW_STATE};
-uint32_t viewCount = 2;
-XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
-xrLocateViews(session, &locateInfo, &viewState, 2, &viewCount, views);
+// Locate into an XRT_MAX_VIEWS (8)-wide buffer — modes range from 1 (mono) to 4
+// (quad) views. Only the first viewCount entries are valid after the call.
+uint32_t viewCount = 8;
+XrView views[8];
+for (uint32_t i = 0; i < 8; i++) views[i] = {XR_TYPE_VIEW};
+xrLocateViews(session, &locateInfo, &viewState, 8, &viewCount, views);
 // views[i].pose.position = screen-relative eye position (identity orientation)
 ```
 
@@ -1138,6 +1182,13 @@ XrFovf ComputeKooimaFov(
 This example shows a complete frame with RAW mode Kooima projection, dynamic render
 resolution, and window-space HUD submission:
 
+> ⚠️ **Stale render loop — illustrative, not copy-paste.** This example hardcodes 2 views and a
+> per-eye swapchain array. The shipping model is N-view (1–4) into a **single tiled atlas
+> swapchain**, with the loop bounded by the **active mode's `viewCount`**. The view-count fixes
+> are applied below; for the full correct loop (tile layout, canvas×scale sizing, mode-change
+> handling) see `test_apps/cube_handle_*` and
+> [`docs/guides/displayxr-app-rules.md`](../../guides/displayxr-app-rules.md) §3–§4.
+
 ```cpp
 // --- Frame begin ---
 XrFrameState frameState = {XR_TYPE_FRAME_STATE};
@@ -1156,9 +1207,14 @@ if (frameState.shouldRender) {
     locateInfo.space = localSpace;
 
     XrViewState viewState = {XR_TYPE_VIEW_STATE};
-    uint32_t viewCount = 2;
-    XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
-    xrLocateViews(session, &locateInfo, &viewState, 2, &viewCount, views);
+    // Locate into an XRT_MAX_VIEWS (8)-wide buffer; only [0, viewCount) are valid.
+    uint32_t viewCount = 8;
+    XrView views[8];
+    for (uint32_t i = 0; i < 8; i++) views[i] = {XR_TYPE_VIEW};
+    xrLocateViews(session, &locateInfo, &viewState, 8, &viewCount, views);
+    // Number of views to actually render/submit = the ACTIVE mode's viewCount
+    // (from the enumerated XrDisplayRenderingModeInfoEXT), not necessarily viewCount.
+    uint32_t renderViewCount = activeMode.viewCount;  // 1 (mono) / 2 (SBS) / 4 (quad)
 
     // --- Compute dynamic render resolution ---
     uint32_t renderW = (uint32_t)(windowWidth  * recommendedViewScaleX);
@@ -1172,9 +1228,9 @@ if (frameState.shouldRender) {
     float screenW = displayWidthM  * (float)renderW / (float)swapchainWidth;
     float screenH = displayHeightM * (float)renderH / (float)swapchainHeight;
 
-    XrCompositionLayerProjectionView projViews[2] = {};
+    XrCompositionLayerProjectionView projViews[8] = {};
 
-    for (int eye = 0; eye < 2; eye++) {
+    for (uint32_t eye = 0; eye < renderViewCount; eye++) {
         // Acquire swapchain image
         uint32_t imageIndex;
         XrSwapchainImageAcquireInfo acqInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
@@ -1216,7 +1272,7 @@ if (frameState.shouldRender) {
     // --- Submit projection layer + HUD layer ---
     XrCompositionLayerProjection projLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     projLayer.space = localSpace;
-    projLayer.viewCount = 2;
+    projLayer.viewCount = renderViewCount;
     projLayer.views = projViews;
 
     XrCompositionLayerWindowSpaceEXT hudLayer = {};
@@ -1747,6 +1803,82 @@ Switches the active display rendering mode. Mode indices are vendor-defined:
 | 0 | Standard rendering (always available) |
 | 1+ | Vendor-specific variations |
 
+A mode change is a **request**, not an immediate state change. The runtime fires
+`XrEventDataRenderingModeChangedEXT` when the active mode actually changes (and
+`XrEventDataHardwareDisplayStateChangedEXT` if the hardware-3D state flips). Applications
+**must** update their local mode state from that event, not optimistically at call time. When
+running under a workspace controller, app requests may be dropped — see `isRequestable` below.
+
+### Enumerating Rendering Modes (v8) — `XrDisplayRenderingModeInfoEXT` + `xrEnumerateDisplayRenderingModesEXT`
+
+Before requesting a mode, the application enumerates the modes the runtime exposes. Each mode
+describes its view count, atlas tile layout, per-view scale, hardware-3D state, and (per session)
+whether it is currently active and whether this session is allowed to request it.
+
+```c
+#define XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT ((XrStructureType)1000999008)
+
+typedef struct XrDisplayRenderingModeInfoEXT {
+    XrStructureType    type;             // XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT
+    void*              next;
+    uint32_t           modeIndex;        // pass to xrRequestDisplayRenderingModeEXT
+    char               modeName[XR_MAX_SYSTEM_NAME_SIZE]; // human-readable
+    uint32_t           viewCount;        // 1 = mono, 2 = stereo, 4 = quad, ...
+    float              viewScaleX;       // per-view horizontal scale (vendor-provided)
+    float              viewScaleY;       // per-view vertical scale (vendor-provided)
+    XrBool32           hardwareDisplay3D; // whether the display hardware is in 3D for this mode
+    uint32_t           tileColumns;      // (v12) atlas tile columns
+    uint32_t           tileRows;         // (v12) atlas tile rows
+    uint32_t           viewWidthPixels;  // (v12) per-view width in pixels
+    uint32_t           viewHeightPixels; // (v12) per-view height in pixels
+    XrBool32           isActive;         // (v13) this mode is the session's active mode
+    XrBool32           isRequestable;    // (v13) this session may request this mode
+} XrDisplayRenderingModeInfoEXT;
+```
+
+| Member | Description |
+|---|---|
+| `modeIndex` | Vendor-defined index to pass to `xrRequestDisplayRenderingModeEXT`. |
+| `modeName` | Human-readable label (e.g. `"2D"`, `"Stereo SBS"`, `"Quad"`). |
+| `viewCount` | Number of views this mode renders. Drives the `xrLocateViews` render/submit loop bound (1=mono … 4=quad). |
+| `viewScaleX/Y` | Per-view render-resolution scale. The app sizes each tile as `windowSize × viewScale` (see [Recommended View Scale](#recommended-view-scale) and the multiview tiling spec). |
+| `hardwareDisplay3D` | `XR_TRUE` if the display's light-field hardware is active in this mode. **This is the authoritative location** — `hardwareDisplay3D` is *not* a field on `XrDisplayInfoEXT` (removed in v12). |
+| `tileColumns`, `tileRows` | Atlas tile layout for the mode's views (e.g. `2×1` SBS, `2×2` quad). |
+| `viewWidthPixels`, `viewHeightPixels` | Per-view pixel dimensions for the mode. |
+| `isActive` (v13) | `XR_TRUE` for the mode currently active for this session. Read it on the **first** enumerate after `xrCreateSession` to learn the active mode without waiting for an `XrEventDataRenderingModeChangedEXT` — useful when starting under a workspace that already chose a mode. Re-enumerating after a change reflects the new active mode. |
+| `isRequestable` (v13) | `XR_TRUE` iff this session may request this mode. **False for non-controller sessions running under a workspace** — there the workspace controller is the sole mode authority and app requests are dropped. Apps should gate their mode-toggle UI on this (e.g. disable the V toggle, show "mode locked by workspace"). Always `XR_TRUE` for standalone sessions and workspace-controller sessions. |
+
+```c
+XrResult xrEnumerateDisplayRenderingModesEXT(
+    XrSession                       session,
+    uint32_t                        modeCapacityInput,   // 0 to query count
+    uint32_t*                       modeCountOutput,
+    XrDisplayRenderingModeInfoEXT*  modes);
+```
+
+Standard OpenXR two-call enumerate: call with `modeCapacityInput = 0` to read
+`modeCountOutput`, allocate, then call again. Returns `XR_ERROR_SIZE_INSUFFICIENT` if the
+supplied capacity is too small.
+
+```c
+// Two-call enumerate; struct type must be set on every element before the second call.
+uint32_t modeCount = 0;
+xrEnumerateDisplayRenderingModesEXT(session, 0, &modeCount, NULL);
+XrDisplayRenderingModeInfoEXT modes[8];
+for (uint32_t i = 0; i < modeCount && i < 8; i++)
+    modes[i] = (XrDisplayRenderingModeInfoEXT){ .type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT };
+xrEnumerateDisplayRenderingModesEXT(session, modeCount, &modeCount, modes);
+
+// Learn the active mode at startup without waiting for an event:
+uint32_t activeIndex = 0;
+for (uint32_t i = 0; i < modeCount; i++)
+    if (modes[i].isActive) activeIndex = modes[i].modeIndex;
+
+// Request a different mode only if allowed, then wait for the event to update local state:
+if (modes[target].isRequestable)
+    xrRequestDisplayRenderingModeEXT(session, modes[target].modeIndex);
+```
+
 ### Internal Dispatch
 
 The runtime dispatches the request through the existing device property mechanism:
@@ -1803,7 +1935,12 @@ the property) silently ignore the call — graceful degradation.
 | 8 | 2026-03-06 | David Fattal | Removed `XR_REFERENCE_SPACE_TYPE_DISPLAY_EXT`. In RAW mode, `xrLocateViews` returns screen-centered eye positions regardless of the reference space parameter — a dedicated DISPLAY space is unnecessary. Applications use LOCAL space for both view location and layer submission. |
 | 10 | 2026-03-12 | David Fattal | Removed `supportsDisplayModeSwitch` (derivable from mode enumeration), renamed `display3D` to `hardwareDisplay3D`, deprecated `xrRequestDisplayModeEXT` in favor of unified `xrRequestDisplayRenderingModeEXT`, added rendering mode and hardware display state change events (`XrEventDataRenderingModeChangedEXT`, `XrEventDataHardwareDisplayStateChangedEXT`). |
 | 11 | 2026-03-20 | David Fattal | Added per-mode tile layout fields to `XrDisplayRenderingModeInfoEXT`: `tileColumns`, `tileRows`, `viewWidthPixels`, `viewHeightPixels`. Enables runtime to describe atlas layout for multi-view rendering modes (e.g., 2x2 quad). |
-| 12 | 2026-03-28 | David Fattal | Moved `hardwareDisplay3D` from `XrDisplayInfoEXT` to `XrEventDataHardwareDisplayStateChangedEXT` (event-only). Hardware 3D state is now purely event-driven — apps track state via events rather than polling a field. **Header frozen at v12.** |
+| 12 | 2026-03-28 | David Fattal | Removed `hardwareDisplay3D` from `XrDisplayInfoEXT`. It remains available **per-mode** on `XrDisplayRenderingModeInfoEXT` (via `xrEnumerateDisplayRenderingModesEXT`) and is also reported by the `XrEventDataHardwareDisplayStateChangedEXT` event. Also moved `xrSetSharedTextureOutputRectEXT` to the window-binding extension headers. |
+| 13 | 2026-05-18 | David Fattal | Added per-session `isActive` and `isRequestable` fields to `XrDisplayRenderingModeInfoEXT` (#234). `isActive` lets an app learn the current mode from the first enumerate without waiting for an event; `isRequestable` tells a session whether it may request a mode (false for non-controller sessions under a workspace). **Current header version (`XR_EXT_display_info_SPEC_VERSION == 13`).** |
+
+> The `XR_EXT_display_info_SPEC_VERSION` define in the header is the authoritative current
+> revision. Earlier revision numbers in this table reflect the proposal's editing history and do
+> not all map one-to-one onto the header's inline `// ---- vN ----` section comments.
 
 ---
 

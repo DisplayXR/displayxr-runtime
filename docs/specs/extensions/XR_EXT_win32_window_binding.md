@@ -367,9 +367,27 @@ This is required because vendor weavers (e.g. Leia SR) compute lenticular phase 
 
 ### 3.6 xrSetSharedTextureSurround2DEXT
 
-For `_texture` apps whose 3D canvas is a sub-rect of the window — typically constrained by a display with a fixed hardware 3D zone (e.g. a centered viewport on a panel where the surrounding pixels are 2D-native) — this function registers a **full-window 2D shared texture** whose pixels outside the canvas sub-rect are blitted into the target swapchain each frame.
+For `_texture` apps whose 3D canvas is a sub-rect of the window — typically constrained by a display with a fixed hardware 3D zone (e.g. a centered viewport on a panel where the surrounding pixels are 2D-native) — this function registers a 2D shared texture whose pixels outside the canvas sub-rect are blitted into the destination the display processor weaves into each frame.
 
 The 3D canvas (set via `xrSetSharedTextureOutputRectEXT`) is still weaved by the display processor and overwrites whatever the surround texture contains in that sub-rect. The surround texture exclusively provides the *non*-canvas pixels.
+
+> **Allocation size vs. content (important — this is what the runtime actually enforces).**
+> The surround texture's **registered dimensions must equal the multiview shared texture's
+> dimensions** (the worst-case-atlas size from [ADR-010](../../adr/ADR-010-shared-app-iosurface-worst-case-sized.md),
+> i.e. `max over modes of (tileColumns·viewScaleX·displayPixelWidth) × (tileRows·viewScaleY·displayPixelHeight)`),
+> **not** the HWND client area. The strip-blit copies via `CopySubresourceRegion` into the
+> shared texture and requires `surround.dims == sharedTexture.dims`; a mismatch is logged once
+> and the blit is **silently skipped** (`comp_d3d11_compositor.cpp` → `d3d11_blit_surround_strips`).
+> Sizing the surround to the worst-case atlas lets it be allocated **once** and survive window
+> resizes without a destroy/recreate cycle.
+>
+> The **content** the app writes, however, must be aligned to the HWND client area
+> pixel-for-pixel (1:1, no scaling), occupying the top-left `clientWidth × clientHeight` region
+> of the texture, and must be **redrawn when the HWND resizes**. The app only ever presents that
+> window-sized region (it reads back `clientWidth/sharedWidth × clientHeight/sharedHeight` of the
+> shared texture), so surround pixels beyond the client area are never displayed. The canvas
+> sub-rect (set via `xrSetSharedTextureOutputRectEXT`) is carved out of this region by the
+> strip-blit and owned by the display processor.
 
 ```c
 typedef XrResult (XRAPI_PTR *PFN_xrSetSharedTextureSurround2DEXT)(
@@ -385,8 +403,8 @@ typedef XrResult (XRAPI_PTR *PFN_xrSetSharedTextureSurround2DEXT)(
 |-----------|-------------|
 | `session` | The session. Must have been created with `XrWin32WindowBindingCreateInfoEXT`. |
 | `sharedTextureHandle` | Shared D3D11/D3D12 NT `HANDLE` for the 2D surround texture, or `NULL` to clear. |
-| `width` | Texture width in pixels. Must equal the HWND client-area width. |
-| `height` | Texture height in pixels. Must equal the HWND client-area height. |
+| `width` | Texture width in pixels. Must equal the **multiview shared texture** width (worst-case atlas, per ADR-010), *not* the HWND client-area width. |
+| `height` | Texture height in pixels. Must equal the **multiview shared texture** height (worst-case atlas, per ADR-010), *not* the HWND client-area height. |
 
 **Returns:**
 
@@ -394,7 +412,7 @@ typedef XrResult (XRAPI_PTR *PFN_xrSetSharedTextureSurround2DEXT)(
 |---|---|
 | `XR_SUCCESS` | Texture registered (or cleared if `sharedTextureHandle == NULL`). |
 | `XR_ERROR_FUNCTION_UNSUPPORTED` | Extension not enabled or runtime build predates spec v6. |
-| `XR_ERROR_VALIDATION_FAILURE` | `width × height` does not match the current HWND client-area dimensions. |
+| `XR_ERROR_VALIDATION_FAILURE` | `width × height` does not match the registered multiview shared-texture dimensions. |
 | `XR_ERROR_HANDLE_INVALID` | Runtime could not `OpenSharedResource` on the handle. |
 
 **Valid Usage:**
@@ -404,7 +422,7 @@ typedef XrResult (XRAPI_PTR *PFN_xrSetSharedTextureSurround2DEXT)(
 - The texture must include `D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX` (D3D12: `D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER` as appropriate) so the runtime can synchronize via `IDXGIKeyedMutex`.
 - The synchronization key is **0**: app `AcquireSync(0)` before writing, `ReleaseSync(0)` when done; runtime `AcquireSync(0)` before sampling, `ReleaseSync(0)` after submitting the frame. Symmetric to the multiview shared texture.
 - Call with `sharedTextureHandle = NULL` to disable the surround blit. Non-canvas pixels of the target swapchain then fall back to undefined (the spec v5 behavior).
-- On window resize (`WM_SIZE` triggers a new HWND client size), the app allocates a new shared texture at the new size and calls this function again. Calling with stale dimensions returns `XR_ERROR_VALIDATION_FAILURE`.
+- On window resize (`WM_SIZE` triggers a new HWND client size), the surround texture does **not** need to be reallocated or re-registered — it is sized to the worst-case atlas (which does not change) and allocated once. The app simply redraws its 2D content into the top-left `newClientWidth × newClientHeight` region (1:1, window-aligned) on the next frame, and updates the canvas rect via `xrSetSharedTextureOutputRectEXT`. (This is the reason the surround is worst-case-sized rather than HWND-sized: it avoids a per-resize destroy/recreate.)
 
 **Loaded at runtime via:**
 
@@ -427,7 +445,7 @@ for each pixel (px, py) in the target swapchain:
         write to target swapchain at (px, py)
 ```
 
-The 1:1 mapping is enforced by the size-equality requirement — surround texture dimensions must equal the HWND client area, which equals the target swapchain dimensions. No scaling, no UV math, no filtering.
+The 1:1 mapping is enforced by the size-equality requirement — the surround texture dimensions equal the destination (multiview shared texture) dimensions, so `CopySubresourceRegion` of the non-canvas strips needs no scaling, UV math, or filtering. The app writes its content window-aligned into the top-left client-area region; pixels of the surround outside that region are copied but never presented (the app reads back only the client-area region).
 
 The compositor scissor-rects the blit to the four non-canvas regions (top strip / bottom strip / left strip / right strip), or equivalently runs a shader-blit with a "skip the canvas rect" branch. Implementation choice is per-graphics-API.
 
@@ -439,17 +457,20 @@ The compositor scissor-rects the blit to the four non-canvas regions (top strip 
 // 1. Tell the runtime where the 3D canvas is (set by hardware constraint).
 xrSetSharedTextureOutputRectEXT(session, zoneX, zoneY, zoneW, zoneH);
 
-// 2. Allocate a full-window 2D shared texture for the surround UI.
-//    Unity renders its 2D viewport chrome (toolbars, panels, status bar)
-//    into this texture each frame via a RenderTexture / RenderTarget.
+// 2. Allocate a 2D shared texture for the surround UI, sized to the WORST-CASE
+//    atlas (== the multiview shared texture), NOT the window. Allocated once;
+//    survives resizes without recreate.
 HANDLE surroundHandle = CreateD3D11SharedKeyedMutexTexture(
-    windowClientWidth, windowClientHeight, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+    sharedTexWidth, sharedTexHeight, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
 
-// 3. Register it with the runtime.
-pfnSetSurround2D(session, surroundHandle, windowClientWidth, windowClientHeight);
+// 3. Register it with the runtime at the shared-texture dimensions.
+pfnSetSurround2D(session, surroundHandle, sharedTexWidth, sharedTexHeight);
 
-// Per frame: Unity writes 2D UI into the surround texture (acquire/release key 0),
-// the runtime samples it after weave, blits non-canvas pixels into the target swapchain.
+// Per frame: Unity writes its 2D viewport chrome (toolbars, panels, status bar)
+// into the TOP-LEFT windowClientWidth x windowClientHeight region of the surround
+// texture (1:1, window-aligned), acquire/release key 0. The runtime samples it
+// after weave and blits the non-canvas strips into the destination. On resize, just
+// redraw into the new client-area region — no reallocation, no re-registration.
 ```
 
 **Read-back contract:**
