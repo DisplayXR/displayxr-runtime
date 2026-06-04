@@ -2669,7 +2669,7 @@ init_client_render_resources(struct d3d11_service_system *sys,
 		    &res->window);
 		if (wret != XRT_SUCCESS || res->window == nullptr) {
 			U_LOG_E("Failed to create window for client");
-			return XRT_ERROR_VULKAN;
+			return XRT_ERROR_D3D11;
 		}
 		res->hwnd = (HWND)comp_d3d11_window_get_hwnd(res->window);
 		res->owns_window = true;
@@ -2766,9 +2766,23 @@ init_client_render_resources(struct d3d11_service_system *sys,
 	}
 
 	if (FAILED(hr)) {
-		U_LOG_E("Failed to create swap chain for client: 0x%08lx", hr);
+		if (!res->owns_window && hr == E_ACCESSDENIED) {
+			// res->hwnd is the app's OWN (cross-process) window. A process cannot
+			// create a DXGI swap chain on a window it does not own, so
+			// CreateSwapChainForHwnd returns E_ACCESSDENIED. This is only reached
+			// by a windowed _handle app forced into bare IPC (XRT_FORCE_MODE=ipc)
+			// outside workspace mode — not a valid configuration. Such an app must
+			// run in-process (native compositor) or under the workspace/shell,
+			// which uses the atlas-only path (no HWND swap chain).
+			U_LOG_E("Failed to create swap chain on the app's cross-process HWND "
+			        "(0x%08lx E_ACCESSDENIED): a windowed _handle app cannot use "
+			        "non-workspace IPC. Run it in-process or under the workspace/shell.",
+			        hr);
+		} else {
+			U_LOG_E("Failed to create swap chain for client: 0x%08lx", hr);
+		}
 		fini_client_render_resources(res);
-		return XRT_ERROR_VULKAN;
+		return XRT_ERROR_D3D11;
 	}
 
 	// Transparent path: bind composition swapchain to HWND through DComp.
@@ -2780,7 +2794,7 @@ init_client_render_resources(struct d3d11_service_system *sys,
 		if (FAILED(hr) || res->dcomp_device.get() == nullptr) {
 			U_LOG_E("DCompositionCreateDevice2 failed: 0x%08lx", hr);
 			fini_client_render_resources(res);
-			return XRT_ERROR_VULKAN;
+			return XRT_ERROR_D3D11;
 		}
 
 		hr = res->dcomp_device->CreateTargetForHwnd(
@@ -2788,14 +2802,14 @@ init_client_render_resources(struct d3d11_service_system *sys,
 		if (FAILED(hr) || res->dcomp_target.get() == nullptr) {
 			U_LOG_E("IDCompositionDevice::CreateTargetForHwnd failed: 0x%08lx", hr);
 			fini_client_render_resources(res);
-			return XRT_ERROR_VULKAN;
+			return XRT_ERROR_D3D11;
 		}
 
 		hr = res->dcomp_device->CreateVisual(res->dcomp_visual.put());
 		if (FAILED(hr) || res->dcomp_visual.get() == nullptr) {
 			U_LOG_E("IDCompositionDevice::CreateVisual failed: 0x%08lx", hr);
 			fini_client_render_resources(res);
-			return XRT_ERROR_VULKAN;
+			return XRT_ERROR_D3D11;
 		}
 
 		hr = res->dcomp_visual->SetContent(res->swap_chain.get());
@@ -2808,7 +2822,7 @@ init_client_render_resources(struct d3d11_service_system *sys,
 		if (FAILED(hr)) {
 			U_LOG_E("DComp visual setup failed: 0x%08lx", hr);
 			fini_client_render_resources(res);
-			return XRT_ERROR_VULKAN;
+			return XRT_ERROR_D3D11;
 		}
 	}
 
@@ -2832,7 +2846,7 @@ init_client_render_resources(struct d3d11_service_system *sys,
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create atlas texture for client: 0x%08lx", hr);
 		fini_client_render_resources(res);
-		return XRT_ERROR_VULKAN;
+		return XRT_ERROR_D3D11;
 	}
 
 	// Create SRV for stereo texture
@@ -2840,7 +2854,7 @@ init_client_render_resources(struct d3d11_service_system *sys,
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create atlas SRV for client: 0x%08lx", hr);
 		fini_client_render_resources(res);
-		return XRT_ERROR_VULKAN;
+		return XRT_ERROR_D3D11;
 	}
 
 	// Create RTV for stereo texture
@@ -2848,7 +2862,7 @@ init_client_render_resources(struct d3d11_service_system *sys,
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create atlas RTV for client: 0x%08lx", hr);
 		fini_client_render_resources(res);
-		return XRT_ERROR_VULKAN;
+		return XRT_ERROR_D3D11;
 	}
 
 	U_LOG_W("Created stereo render target for client (%ux%u)", sys->display_width, sys->display_height);
@@ -10421,7 +10435,7 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create D3D11 device: 0x%08lx", hr);
 		delete sys;
-		return XRT_ERROR_VULKAN;  // Generic graphics error
+		return XRT_ERROR_D3D11;
 	}
 
 	// Enable D3D11 multithread protection: multiple IPC client threads + render thread
@@ -10440,13 +10454,13 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	if (!device_base.try_query_to(sys->device.put())) {
 		U_LOG_E("Device doesn't support ID3D11Device5");
 		delete sys;
-		return XRT_ERROR_VULKAN;
+		return XRT_ERROR_D3D11;
 	}
 
 	if (!context_base.try_query_to(sys->context.put())) {
 		U_LOG_E("Context doesn't support ID3D11DeviceContext4");
 		delete sys;
-		return XRT_ERROR_VULKAN;
+		return XRT_ERROR_D3D11;
 	}
 
 	// Get DXGI factory
@@ -10475,7 +10489,7 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to get DXGI factory: 0x%08lx", hr);
 		delete sys;
-		return XRT_ERROR_VULKAN;
+		return XRT_ERROR_D3D11;
 	}
 
 	// Store system devices for passing to per-client windows
