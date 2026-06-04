@@ -200,7 +200,11 @@ is the only class with no app window.
     in-process path: the compositor passes the bytes straight through with no linear→sRGB encode.
     It's only correct if you write display-referred bytes into it; writing genuinely-linear values
     and expecting the runtime to encode → **too bright**. ("Submit a linear-format swapchain and
-    the runtime color-manages it" is a future runtime follow-up, not current behavior.)
+    the runtime color-manages it" is a future runtime follow-up, not current behavior.) **Subject to
+    change — see [#409](https://github.com/DisplayXR/displayxr-runtime/issues/409):** if the color
+    model lands on linear-compose ("Model B"), a linear-format swapchain *would* be honored as
+    linear (the runtime would encode at the DP boundary). This bullet describes current ("Model A")
+    behavior; the recommendation above (request an sRGB swapchain) stays correct either way.
   - **Data textures (normal, AO, roughness, metalness) are ALWAYS linear — never sRGB.** Only
     albedo/color is sRGB; sample those through an `_SRGB` texture view (or decode in-shader) so
     lighting runs in linear, then write your result into the sRGB swapchain per above.
@@ -209,12 +213,13 @@ is the only class with no app window.
     linear atlas — see the canonical reference). As an app author you don't depend on which path
     runs you: request an sRGB swapchain and write a correctly-encoded image, and both paths are
     correct.
-  - Reference: PR [#407](https://github.com/DisplayXR/displayxr-runtime/pull/407) (the GL fix +
-    the cross-API contract) and
+  - Reference: PRs [#407](https://github.com/DisplayXR/displayxr-runtime/pull/407) (GL) and
+    [#408](https://github.com/DisplayXR/displayxr-runtime/pull/408) (D3D11/D3D12/Vulkan/Metal),
+    which established the cross-API sRGB-passthrough contract, plus
     `docs/architecture/compositor-pipeline.md#color-space-handling-d3d11-service-compositor-shell-mode`.
-    Rollout: the GL in-process compositor passes sRGB swapchains through correctly as of #407;
-    D3D11/D3D12/Vulkan/Metal in-process are being aligned (their composited path currently applies
-    an unmatched sRGB decode — tracked in the #407 follow-up audit).
+    As of #408 **all five in-process native compositors pass sRGB swapchains through correctly**;
+    the broader color-management design is tracked in
+    [#409](https://github.com/DisplayXR/displayxr-runtime/issues/409).
 
 ---
 
