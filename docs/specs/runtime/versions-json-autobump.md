@@ -55,7 +55,7 @@ displayxr-runtime ──── tag v* ──────────────
 
 The `BumpVersionsJsonOnTag` job in
 `.github/workflows/build-windows.yml` runs on every `v*` tag push,
-gated on `Runtime` + `BundleTestApps` succeeding. It:
+gated on `Runtime` succeeding. It:
 
 1. Reads the currently-pinned `leia_plugin` field from
    `versions.json`.

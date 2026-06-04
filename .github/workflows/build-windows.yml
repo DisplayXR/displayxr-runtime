@@ -47,14 +47,17 @@ jobs:
           fetch-depth: 0
       - id: filter
         run: |
-          # Tag pushes are releases — always build test apps + demos so the
-          # per-demo publish workflows can attach binary zips to releases.
+          # Tag pushes are releases. Test apps are a *compile check* gated on
+          # test_apps/ changes — they're no longer packaged into artifacts or
+          # attached to releases, so there's nothing to build on a tag. Force
+          # docs_only=false (Runtime + installer must build) but leave
+          # test_apps=false so the per-app compile jobs stay skipped on tags.
           # github.event.before is all-zeros on tag pushes, so the diff-based
           # path below would miss this case.
           if [ "${{ github.ref_type }}" = "tag" ]; then
-            echo "test_apps=true" >> "$GITHUB_OUTPUT"
+            echo "test_apps=false" >> "$GITHUB_OUTPUT"
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            echo "Detected tag push — forcing test_apps_changed=true, docs_only=false"
+            echo "Detected tag push — forcing docs_only=false, test_apps_changed=false"
             exit 0
           fi
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -63,8 +66,9 @@ jobs:
             BASE=${{ github.event.before }}
           fi
           CHANGED=$(git diff --name-only "$BASE" HEAD)
-          # test_apps_changed: any test_apps/ or demos/ files modified.
-          if echo "$CHANGED" | grep -qE '^(test_apps/|demos/)'; then
+          # test_apps_changed: any test_apps/ files modified. (Demos live in
+          # their own displayxr-demo-* repos now — no demos/ tree to watch.)
+          if echo "$CHANGED" | grep -qE '^test_apps/'; then
             echo "test_apps=true" >> "$GITHUB_OUTPUT"
           else
             echo "test_apps=false" >> "$GITHUB_OUTPUT"
@@ -339,10 +343,9 @@ jobs:
           path: _package/DisplayXRSetup-*.exe
 
       # Attach the Windows installer to the v* GitHub release (#290).
-      # First workflow to complete on the tag creates the release;
-      # subsequent ones (macOS BuildInstaller, BundleTestApps) append
-      # their artifacts. Filename is DisplayXRSetup-X.Y.Z.BUILD.exe
-      # from the NSI's OutFile.
+      # First workflow to complete on the tag creates the release; the
+      # macOS BuildInstaller appends its .pkg. Filename is
+      # DisplayXRSetup-X.Y.Z.BUILD.exe from the NSI's OutFile.
       - name: Attach Windows installer to GitHub release on tag
         if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
@@ -448,18 +451,6 @@ jobs:
           Write-Host "`nAll DLLs in build directory:"
           Get-ChildItem test_apps/cube_handle_d3d11_win/build/*.dll | ForEach-Object { Write-Host "  $($_.Name)" }
 
-      - name: Upload test app
-        uses: actions/upload-artifact@v4
-        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
-        with:
-          retention-days: 3
-          name: CubeHandleD3D11
-          if-no-files-found: error
-          path: |
-            test_apps/cube_handle_d3d11_win/build/cube_handle_d3d11_win.exe
-            test_apps/cube_handle_d3d11_win/build/*.dll
-            test_apps/cube_handle_d3d11_win/build/textures/
-
   # D3D11 hosted test app - Standard OpenXR app (runtime creates window)
   TestAppCubeHostedD3D11:
     if: needs.DetectChanges.outputs.test_apps_changed == 'true'
@@ -509,18 +500,6 @@ jobs:
           if ($loaderDll) {
             Copy-Item $loaderDll.FullName -Destination test_apps/cube_hosted_d3d11_win/build/
           }
-
-      - name: Upload D3D11 hosted test app
-        uses: actions/upload-artifact@v4
-        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
-        with:
-          retention-days: 3
-          name: CubeHostedD3D11
-          if-no-files-found: error
-          path: |
-            test_apps/cube_hosted_d3d11_win/build/cube_hosted_d3d11_win.exe
-            test_apps/cube_hosted_d3d11_win/build/*.dll
-            test_apps/cube_hosted_d3d11_win/build/textures/
 
   # D3D12 test app with XR_EXT_win32_window_binding
   TestAppCubeHandleD3D12:
@@ -572,18 +551,6 @@ jobs:
             Copy-Item $loaderDll.FullName -Destination test_apps/cube_handle_d3d12_win/build/
           }
 
-      - name: Upload D3D12 test app
-        uses: actions/upload-artifact@v4
-        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
-        with:
-          retention-days: 3
-          name: CubeHandleD3D12
-          if-no-files-found: error
-          path: |
-            test_apps/cube_handle_d3d12_win/build/cube_handle_d3d12_win.exe
-            test_apps/cube_handle_d3d12_win/build/*.dll
-            test_apps/cube_handle_d3d12_win/build/textures/
-
   # OpenGL test app with XR_EXT_win32_window_binding
   TestAppCubeHandleGL:
     if: needs.DetectChanges.outputs.test_apps_changed == 'true'
@@ -633,18 +600,6 @@ jobs:
           if ($loaderDll) {
             Copy-Item $loaderDll.FullName -Destination test_apps/cube_handle_gl_win/build/
           }
-
-      - name: Upload OpenGL test app
-        uses: actions/upload-artifact@v4
-        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
-        with:
-          retention-days: 3
-          name: CubeHandleGL
-          if-no-files-found: error
-          path: |
-            test_apps/cube_handle_gl_win/build/cube_handle_gl_win.exe
-            test_apps/cube_handle_gl_win/build/*.dll
-            test_apps/cube_handle_gl_win/build/textures/
 
   # Vulkan test app with XR_EXT_win32_window_binding (requires Vulkan SDK)
   TestAppCubeHandleVK:
@@ -702,18 +657,6 @@ jobs:
             Copy-Item $loaderDll.FullName -Destination test_apps/cube_handle_vk_win/build/
           }
 
-      - name: Upload Vulkan test app
-        uses: actions/upload-artifact@v4
-        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
-        with:
-          retention-days: 3
-          name: CubeHandleVK
-          if-no-files-found: error
-          path: |
-            test_apps/cube_handle_vk_win/build/cube_handle_vk_win.exe
-            test_apps/cube_handle_vk_win/build/*.dll
-            test_apps/cube_handle_vk_win/build/textures/
-
   # D3D11 texture test app (offscreen shared texture mode)
   TestAppCubeTextureD3D11:
     if: needs.DetectChanges.outputs.test_apps_changed == 'true'
@@ -756,18 +699,6 @@ jobs:
             Copy-Item $loaderDll.FullName -Destination test_apps/cube_texture_d3d11_win/build/
           }
 
-      - name: Upload texture D3D11 test app
-        uses: actions/upload-artifact@v4
-        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
-        with:
-          retention-days: 3
-          name: CubeTextureD3D11
-          if-no-files-found: error
-          path: |
-            test_apps/cube_texture_d3d11_win/build/cube_texture_d3d11_win.exe
-            test_apps/cube_texture_d3d11_win/build/*.dll
-            test_apps/cube_texture_d3d11_win/build/textures/
-
   # D3D12 shared texture test app
   TestAppCubeTextureD3D12:
     if: needs.DetectChanges.outputs.test_apps_changed == 'true'
@@ -809,18 +740,6 @@ jobs:
           if ($loaderDll) {
             Copy-Item $loaderDll.FullName -Destination test_apps/cube_texture_d3d12_win/build/
           }
-
-      - name: Upload texture D3D12 test app
-        uses: actions/upload-artifact@v4
-        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
-        with:
-          retention-days: 3
-          name: CubeTextureD3D12
-          if-no-files-found: error
-          path: |
-            test_apps/cube_texture_d3d12_win/build/cube_texture_d3d12_win.exe
-            test_apps/cube_texture_d3d12_win/build/*.dll
-            test_apps/cube_texture_d3d12_win/build/textures/
 
   # D3D11 legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyD3D11:
@@ -872,18 +791,6 @@ jobs:
             Copy-Item $loaderDll.FullName -Destination test_apps/cube_hosted_legacy_d3d11_win/build/
           }
 
-      - name: Upload legacy hosted D3D11 test app
-        uses: actions/upload-artifact@v4
-        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
-        with:
-          retention-days: 3
-          name: CubeHostedLegacyD3D11
-          if-no-files-found: error
-          path: |
-            test_apps/cube_hosted_legacy_d3d11_win/build/cube_hosted_legacy_d3d11_win.exe
-            test_apps/cube_hosted_legacy_d3d11_win/build/*.dll
-            test_apps/cube_hosted_legacy_d3d11_win/build/textures/
-
   # D3D12 legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyD3D12:
     if: needs.DetectChanges.outputs.test_apps_changed == 'true'
@@ -929,18 +836,6 @@ jobs:
           $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1
           if (-not $loaderDll) { $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1 }
           if ($loaderDll) { Copy-Item $loaderDll.FullName -Destination test_apps/cube_hosted_legacy_d3d12_win/build/ }
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
-        with:
-          retention-days: 3
-          name: CubeHostedLegacyD3D12
-          if-no-files-found: error
-          path: |
-            test_apps/cube_hosted_legacy_d3d12_win/build/cube_hosted_legacy_d3d12_win.exe
-            test_apps/cube_hosted_legacy_d3d12_win/build/*.dll
-            test_apps/cube_hosted_legacy_d3d12_win/build/textures/
 
   # Vulkan legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyVK:
@@ -994,18 +889,6 @@ jobs:
           if (-not $loaderDll) { $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1 }
           if ($loaderDll) { Copy-Item $loaderDll.FullName -Destination test_apps/cube_hosted_legacy_vk_win/build/ }
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
-        with:
-          retention-days: 3
-          name: CubeHostedLegacyVK
-          if-no-files-found: error
-          path: |
-            test_apps/cube_hosted_legacy_vk_win/build/cube_hosted_legacy_vk_win.exe
-            test_apps/cube_hosted_legacy_vk_win/build/*.dll
-            test_apps/cube_hosted_legacy_vk_win/build/textures/
-
   # OpenGL legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyGL:
     if: needs.DetectChanges.outputs.test_apps_changed == 'true'
@@ -1046,96 +929,10 @@ jobs:
           if (-not $loaderDll) { $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1 }
           if ($loaderDll) { Copy-Item $loaderDll.FullName -Destination test_apps/cube_hosted_legacy_gl_win/build/ }
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
-        with:
-          retention-days: 3
-          name: CubeHostedLegacyGL
-          if-no-files-found: error
-          path: |
-            test_apps/cube_hosted_legacy_gl_win/build/cube_hosted_legacy_gl_win.exe
-            test_apps/cube_hosted_legacy_gl_win/build/*.dll
-            test_apps/cube_hosted_legacy_gl_win/build/textures/
-
-  # Bundle all test apps into a single artifact with per-app subfolders
-  BundleTestApps:
-    if: ${{ !cancelled() && needs.DetectChanges.outputs.test_apps_changed == 'true' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) }}
-    runs-on: ubuntu-latest
-    needs: [DetectChanges, TestAppCubeHandleD3D11, TestAppCubeHostedD3D11, TestAppCubeHandleD3D12, TestAppCubeHandleGL, TestAppCubeHandleVK, TestAppCubeTextureD3D11, TestAppCubeTextureD3D12, TestAppCubeHostedLegacyD3D11, TestAppCubeHostedLegacyD3D12, TestAppCubeHostedLegacyVK, TestAppCubeHostedLegacyGL]
-
-    steps:
-      - name: Download cube test app artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: TestApps
-          pattern: Cube*
-
-      - name: List bundled contents
-        run: |
-          echo "Bundled test apps:"
-          find TestApps -type f | sort
-
-      - name: Upload bundled test apps
-        uses: actions/upload-artifact@v4
-        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
-        with:
-          retention-days: 3
-          name: TestApps-${{ github.run_number }}
-          if-no-files-found: error
-          path: TestApps
-
-      - name: Delete individual test app artifacts
-        uses: geekyeggo/delete-artifact@v5
-        with:
-          failOnError: false
-          name: |
-            CubeHandleD3D11
-            CubeHostedD3D11
-            CubeHandleD3D12
-            CubeHandleGL
-            CubeHandleVK
-            CubeTextureD3D11
-            CubeTextureD3D12
-            CubeHostedLegacyD3D11
-            CubeHostedLegacyD3D12
-            CubeHostedLegacyVK
-            CubeHostedLegacyGL
-            CubeIpcLegacyD3D11
-            CubeIpcD3D11
-
-      # NOTE: per-CI OneDrive upload of the test-apps zip removed. OneDrive
-      # now receives release artifacts only, via the bundle meta-installer
-      # (DisplayXR/displayxr-installer, publish-bundle.yml). Reviewers use
-      # the bundled artifact-upload above; the versioned release zip below
-      # still attaches to the GitHub Release on tag.
-
-      # Versioned re-zip for the v* GitHub release (#290). Asset name
-      # mirrors the convention from the /release skill — DisplayXR-
-      # TestApps-X.Y.Z.zip — so older skill-cut releases and CI-cut
-      # releases use identical naming.
-      - name: Zip test apps for release (versioned)
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          cd TestApps
-          zip -r "../DisplayXR-TestApps-${VERSION}.zip" .
-          cd ..
-          ls -lh "DisplayXR-TestApps-${VERSION}.zip"
-
-      - name: Attach test apps bundle to GitHub release on tag
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: DisplayXR-TestApps-*.zip
-          fail_on_unmatched_files: true
-          draft: false
-          prerelease: false
-
-  # On a v* tag push, after Runtime + BundleTestApps prove the build
-  # works end-to-end, observe the new tag in versions.json so the dev
-  # orchestrator (scripts/setup-displayxr.{sh,bat}) starts installing
-  # this release. Sibling repos use .github/workflows/versions-bump.yml
+  # On a v* tag push, after Runtime proves the build works end-to-end,
+  # observe the new tag in versions.json so the dev orchestrator
+  # (scripts/setup-displayxr.{sh,bat}) starts installing this release.
+  # Sibling repos use .github/workflows/versions-bump.yml
   # via repository_dispatch for their fields; this job is the runtime's
   # own field-self-bump. See docs/specs/runtime/versions-json-autobump.md.
   #
@@ -1146,7 +943,7 @@ jobs:
   # come in via versions-bump.yml and clear the path.
   BumpVersionsJsonOnTag:
     if: ${{ startsWith(github.ref, 'refs/tags/v') && github.repository == 'DisplayXR/displayxr-runtime' }}
-    needs: [Runtime, BundleTestApps]
+    needs: [Runtime]
     runs-on: ubuntu-latest
     steps:
       - name: Mint App installation token

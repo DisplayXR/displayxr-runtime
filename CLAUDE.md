@@ -134,7 +134,7 @@ For tagged releases use `/release` — don't tag manually.
 
 ## Releasing
 
-This repo IS the public runtime (no private→public mirror). A release is a `vX.Y.Z` tag → parallel Windows + macOS CI → GitHub Release with both installers (`DisplayXRSetup-*.exe`, `DisplayXR-Installer-*.pkg`) + test-apps bundle attached.
+This repo IS the public runtime (no private→public mirror). A release is a `vX.Y.Z` tag → parallel Windows + macOS CI → GitHub Release with both installers (`DisplayXRSetup-*.exe`, `DisplayXR-Installer-*.pkg`) attached. (Test apps aren't packaged — CI compiles them as a check on `test_apps/` changes only, no artifacts.)
 
 ```
 /release v1.2.1   # explicit            /release patch
