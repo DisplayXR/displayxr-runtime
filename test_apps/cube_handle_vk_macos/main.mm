@@ -43,6 +43,7 @@
 
 #include "view_params.h"
 #include "display3d_view.h"
+#include "projection_depth.h"
 #include "camera3d_view.h"
 #include "atlas_capture.h"
 #include "xr_window_space_hud.h"
@@ -3108,6 +3109,11 @@ int main() {
                                     rawEyePos.data(), eyeCount, &nominalViewer,
                                     &screen, &tunables, &cameraPose,
                                     tunables.virtual_display_height, 1000.0f * tunables.virtual_display_height, /*vulkan_flip_y=*/0, d3dViews.data());
+                                // display3d emits a GL ([-1,1] clip-z) projection; Vulkan clips [0,1].
+                                // Remap depth on the 3D per-view projections (not the mono/legacy
+                                // xr.projMatrices path). [#396 W1]
+                                for (uint32_t _v = 0; _v < eyeCount; _v++)
+                                    convert_projection_gl_to_zero_to_one(d3dViews[_v].projection_matrix);
                             }
                         }
 
