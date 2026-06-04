@@ -15,6 +15,57 @@
 
 using namespace DirectX;
 
+// ADR-021 regression-matrix helper. Lets a tester force the color swapchain's
+// encoding state so the runtime's per-client color path can be exercised:
+//   DXR_SWAPCHAIN_ENCODING=srgb  → prefer an advertised *_SRGB format. The
+//       per-frame RTV is created with the swapchain's format, so the GPU
+//       auto-encodes on write (honest encoded). Two such clients blending under
+//       the workspace make the service compositor's Model-B linear-compose path
+//       engage (decode-on-sample → linear atlas → DP encodes at handoff).
+//   DXR_SWAPCHAIN_ENCODING=unorm → prefer a plain UNORM format (the app writes
+//       its bytes raw; today's encoded-into-UNORM default, also the
+//       true-linear-into-UNORM source — content is whatever the renderer wrote).
+//   unset → runtime-preferred (formats[0]), unchanged behavior.
+// Windows-only test code, so MSVC _stricmp is fine.
+static int64_t
+SelectColorSwapchainFormat(const std::vector<int64_t>& formats)
+{
+    if (formats.empty()) {
+        return 0;
+    }
+    const char* enc = getenv("DXR_SWAPCHAIN_ENCODING");
+    if (enc == nullptr) {
+        return formats[0];
+    }
+    // Known *_SRGB codes: DXGI R8G8B8A8_UNORM_SRGB=29, B8G8R8A8_UNORM_SRGB=91;
+    //                     VK R8G8B8A8_SRGB=43, B8G8R8A8_SRGB=50; GL SRGB8_ALPHA8=0x8C43.
+    // Known UNORM codes:  DXGI 28/87; VK 37/44; GL_RGBA8=0x8058.
+    static const int64_t srgb_codes[]  = {29, 91, 43, 50, 0x8C43};
+    static const int64_t unorm_codes[] = {28, 87, 37, 44, 0x8058};
+    const int64_t* prefer = nullptr;
+    size_t n = 0;
+    if (_stricmp(enc, "srgb") == 0) {
+        prefer = srgb_codes;
+        n = sizeof(srgb_codes) / sizeof(srgb_codes[0]);
+    } else if (_stricmp(enc, "unorm") == 0) {
+        prefer = unorm_codes;
+        n = sizeof(unorm_codes) / sizeof(unorm_codes[0]);
+    } else {
+        LOG_INFO("DXR_SWAPCHAIN_ENCODING='%s' unrecognized (use srgb|unorm); using formats[0]", enc);
+        return formats[0];
+    }
+    for (size_t k = 0; k < n; k++) {
+        for (int64_t f : formats) {
+            if (f == prefer[k]) {
+                LOG_INFO("DXR_SWAPCHAIN_ENCODING=%s → selected format %lld (0x%llX)", enc, f, f);
+                return f;
+            }
+        }
+    }
+    LOG_INFO("DXR_SWAPCHAIN_ENCODING=%s: no matching format advertised; using formats[0]", enc);
+    return formats[0];
+}
+
 // Pick the environment blend mode to submit at xrEndFrame.
 //
 // DisplayXR advertises both OPAQUE and ALPHA_BLEND through
@@ -182,8 +233,8 @@ bool CreateSwapchain(XrSessionManager& xr) {
         LOG_DEBUG("  Format[%u]: %lld (0x%llX)", i, formats[i], formats[i]);
     }
 
-    // Use runtime's preferred format (first in the list per OpenXR spec)
-    int64_t selectedFormat = formats[0];
+    // ADR-021: honor DXR_SWAPCHAIN_ENCODING (srgb|unorm) when set; else runtime-preferred (formats[0]).
+    int64_t selectedFormat = SelectColorSwapchainFormat(formats);
     LOG_INFO("Selected swapchain format: %lld (0x%llX)", selectedFormat, selectedFormat);
 
     const auto& view = xr.configViews[0];
@@ -267,8 +318,8 @@ bool CreateQuadLayerSwapchain(XrSessionManager& xr, uint32_t width, uint32_t hei
     std::vector<int64_t> formats(formatCount);
     XR_CHECK(xrEnumerateSwapchainFormats(xr.session, formatCount, &formatCount, formats.data()));
 
-    // Use runtime's preferred format (first in the list per OpenXR spec)
-    int64_t selectedFormat = formats[0];
+    // ADR-021: honor DXR_SWAPCHAIN_ENCODING (srgb|unorm) when set; else runtime-preferred (formats[0]).
+    int64_t selectedFormat = SelectColorSwapchainFormat(formats);
     LOG_INFO("Selected quad swapchain format: %lld (0x%llX)", selectedFormat, selectedFormat);
 
     XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};

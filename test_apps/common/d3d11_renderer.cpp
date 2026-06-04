@@ -86,7 +86,19 @@ float4 PSMain(PSInput input) : SV_TARGET {
     float3 lightDir = normalize(float3(0.3, 0.8, 0.5));
     float diffuse = max(dot(mappedNormal, lightDir), 0.0) * 0.7 + 0.3;
 
-    return float4(basecolor * ao * diffuse, 1.0);
+    float3 col = basecolor * ao * diffuse;
+#ifdef DXR_LINEARIZE
+    // ADR-021 true-linear test (DXR_TRUE_LINEAR): the cube normally writes
+    // display-referred bytes (authored for a UNORM passthrough swapchain). To be
+    // an HONEST source for an sRGB swapchain, emit scene-linear here so the sRGB
+    // RTV re-encodes back to the intended display value — i.e. the swapchain ends
+    // up holding correctly-encoded bytes in an sRGB-typed texture. This lets the
+    // workspace Model-B path (decode-on-sample → linear compose → DP output
+    // encode) be verified end-to-end: correct color ⟹ the matched round-trip
+    // holds; too-dark ⟹ a missing DP encode; too-bright ⟹ a missing decode.
+    col = (col <= 0.04045) ? (col / 12.92) : pow((col + 0.055) / 1.055, 2.4);
+#endif
+    return float4(col, 1.0);
 }
 )";
 
@@ -120,9 +132,14 @@ float4 PSMain(PSInput input) : SV_TARGET {
 static bool CompileShader(const char* source, const char* entryPoint, const char* target, ID3DBlob** blob) {
     LOG_DEBUG("Compiling shader: %s (%s)", entryPoint, target);
     ComPtr<ID3DBlob> errorBlob;
+    // ADR-021: when DXR_TRUE_LINEAR is set, define DXR_LINEARIZE so the cube PS
+    // emits scene-linear (honest source for an sRGB swapchain). Harmless for
+    // shaders that don't reference the macro (e.g. the grid).
+    static const bool linearize = (getenv("DXR_TRUE_LINEAR") != nullptr);
+    const D3D_SHADER_MACRO macros[] = { { "DXR_LINEARIZE", "1" }, { nullptr, nullptr } };
     HRESULT hr = D3DCompile(
         source, strlen(source),
-        nullptr, nullptr, nullptr,
+        nullptr, linearize ? macros : nullptr, nullptr,
         entryPoint, target,
         D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
         blob, &errorBlob

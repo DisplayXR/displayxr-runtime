@@ -226,6 +226,8 @@ sim_dp_metal_process_atlas(struct xrt_display_processor_metal *xdp,
 	id<MTLTexture> atlas_tex = (__bridge id<MTLTexture>)atlas_texture;
 	id<MTLTexture> target_tex = (__bridge id<MTLTexture>)target_texture;
 
+	(void)format;
+
 	if (cmd_buf == nil || atlas_tex == nil || target_tex == nil) {
 		return;
 	}

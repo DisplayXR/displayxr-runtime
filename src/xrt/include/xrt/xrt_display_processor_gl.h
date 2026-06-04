@@ -20,6 +20,7 @@
 
 #include "xrt/xrt_compiler.h"
 #include "xrt/xrt_results.h"
+#include "xrt/xrt_display_color.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -71,7 +72,9 @@ struct xrt_display_processor_gl
 	 * @param      view_height      Height of one eye view in pixels.
 	 * @param      tile_columns     Number of tile columns in the atlas layout.
 	 * @param      tile_rows        Number of tile rows in the atlas layout.
-	 * @param      format           GL internal format of the atlas texture (GLenum as uint32_t).
+	 * @param      format           GL internal format of the atlas texture (GLenum as
+	 *                              uint32_t). Atlas *encoding state* (ADR-021) is
+	 *                              conveyed via @ref set_atlas_encoding, not this.
 	 * @param      target_width     Width of the output render target in pixels.
 	 * @param      target_height    Height of the output render target in pixels.
 	 * @param      canvas_offset_x  Canvas left edge in window client-area pixels (0 = no offset).
@@ -165,6 +168,20 @@ struct xrt_display_processor_gl
 	 * @param xdp Pointer to self.
 	 */
 	void (*destroy)(struct xrt_display_processor_gl *xdp);
+
+	/*!
+	 * Declare which atlas encoding state(s) this DP accepts at handoff
+	 * (ADR-021 §3, @ref xrt_dp_color_capability). Optional — absent slot or
+	 * NULL ⟹ @ref XRT_DP_COLOR_ENCODED. Appended per ADR-020.
+	 */
+	enum xrt_dp_color_capability (*get_handoff_color_capability)(struct xrt_display_processor_gl *xdp);
+
+	/*!
+	 * Declare the atlas encoding for the next process_atlas (ADR-021 per-frame
+	 * runtime intent; out-of-band so the format arg stays real). Optional —
+	 * absent slot or NULL ⟹ DP assumes @ref XRT_ATLAS_ENCODING_ENCODED.
+	 */
+	void (*set_atlas_encoding)(struct xrt_display_processor_gl *xdp, enum xrt_atlas_encoding atlas_encoding);
 };
 
 /*
@@ -206,7 +223,9 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, get_display_pixel_in
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, is_alpha_native)             == XRT_DP_GL_BASE_OFF + 7 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, set_chroma_key)              == XRT_DP_GL_BASE_OFF + 8 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, destroy)                     == XRT_DP_GL_BASE_OFF + 9 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_gl)                                == XRT_DP_GL_BASE_OFF + 10 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, get_handoff_color_capability) == XRT_DP_GL_BASE_OFF + 10 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, set_atlas_encoding)           == XRT_DP_GL_BASE_OFF + 11 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_gl)                                == XRT_DP_GL_BASE_OFF + 12 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -357,6 +376,35 @@ xrt_display_processor_gl_set_chroma_key(struct xrt_display_processor_gl *xdp,
 		return;
 	}
 	xdp->set_chroma_key(xdp, key_color, transparent_bg_enabled);
+}
+
+/*!
+ * @copydoc xrt_display_processor_gl::get_handoff_color_capability
+ * Returns @ref XRT_DP_COLOR_ENCODED if not supported (slot absent or NULL).
+ * @public @memberof xrt_display_processor_gl
+ */
+static inline enum xrt_dp_color_capability
+xrt_display_processor_gl_get_handoff_color_capability(struct xrt_display_processor_gl *xdp)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, get_handoff_color_capability) || xdp->get_handoff_color_capability == NULL) {
+		return XRT_DP_COLOR_ENCODED;
+	}
+	return xdp->get_handoff_color_capability(xdp);
+}
+
+/*!
+ * @copydoc xrt_display_processor_gl::set_atlas_encoding
+ * No-op if not supported (slot absent or NULL) — the DP then assumes ENCODED.
+ * @public @memberof xrt_display_processor_gl
+ */
+static inline void
+xrt_display_processor_gl_set_atlas_encoding(struct xrt_display_processor_gl *xdp,
+                                            enum xrt_atlas_encoding atlas_encoding)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, set_atlas_encoding) || xdp->set_atlas_encoding == NULL) {
+		return;
+	}
+	xdp->set_atlas_encoding(xdp, atlas_encoding);
 }
 
 /*!

@@ -16,6 +16,7 @@
 
 #include "xrt/xrt_compiler.h"
 #include "xrt/xrt_results.h"
+#include "xrt/xrt_display_color.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -104,7 +105,11 @@ struct xrt_display_processor
 	 * @param      view_height      Height of one view in the atlas in pixels.
 	 * @param      tile_columns     Number of tile columns in the atlas layout.
 	 * @param      tile_rows        Number of tile rows in the atlas layout.
-	 * @param      view_format      Vulkan format of the atlas texture.
+	 * @param      view_format      Vulkan format of the atlas texture. (The atlas
+	 *                              *encoding state* — ADR-021 — is conveyed
+	 *                              out-of-band via @ref set_atlas_encoding, not
+	 *                              this format, so older plug-ins that consume
+	 *                              the real format keep working.)
 	 * @param      target_fb        Target framebuffer to render into.
 	 * @param      target_image     Target VkImage handle (for blit/copy ops).
 	 * @param      target_width     Width of the target framebuffer in pixels.
@@ -311,6 +316,36 @@ struct xrt_display_processor
 	 */
 	void (*destroy)(struct xrt_display_processor *xdp);
 
+	/*!
+	 * Declare which atlas encoding state(s) this DP accepts at handoff
+	 * (ADR-021 §3, @ref xrt_dp_color_capability).
+	 *
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL ⟹
+	 * @ref XRT_DP_COLOR_ENCODED, preserving Model-A passthrough. Appended at
+	 * the end per ADR-020 (append-only within a major); see the ABI tripwire
+	 * below.
+	 *
+	 * @param xdp Pointer to self.
+	 * @return The DP's accepted handoff encoding capability.
+	 */
+	enum xrt_dp_color_capability (*get_handoff_color_capability)(struct xrt_display_processor *xdp);
+
+	/*!
+	 * Declare the encoding state of the atlas the runtime will send on the
+	 * *next* @ref process_atlas call (ADR-021 per-frame runtime intent). The DP
+	 * stores it and configures itself (e.g. enabling an output sRGB encode when
+	 * the atlas is LINEAR). Conveyed out-of-band (not via the process_atlas
+	 * format arg) so older plug-ins that consume the real format are unaffected.
+	 *
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL means the
+	 * runtime can't declare and the DP assumes @ref XRT_ATLAS_ENCODING_ENCODED
+	 * (Model-A passthrough). Appended per ADR-020 (append-only within a major).
+	 *
+	 * @param xdp            Pointer to self.
+	 * @param atlas_encoding Encoding of the atlas for the next process_atlas.
+	 */
+	void (*set_atlas_encoding)(struct xrt_display_processor *xdp, enum xrt_atlas_encoding atlas_encoding);
+
 	/*! @} */
 };
 
@@ -381,7 +416,9 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_chroma_key)        
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, on_pause)                     == XRT_DP_BASE_OFF + 11 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, on_resume)                    == XRT_DP_BASE_OFF + 12 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, destroy)                      == XRT_DP_BASE_OFF + 13 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor)                                 == XRT_DP_BASE_OFF + 14 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_handoff_color_capability) == XRT_DP_BASE_OFF + 14 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_atlas_encoding)            == XRT_DP_BASE_OFF + 15 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor)                                 == XRT_DP_BASE_OFF + 16 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -622,6 +659,35 @@ xrt_display_processor_on_resume(struct xrt_display_processor *xdp)
 		return;
 	}
 	xdp->on_resume(xdp);
+}
+
+/*!
+ * @copydoc xrt_display_processor::get_handoff_color_capability
+ * Returns @ref XRT_DP_COLOR_ENCODED if not supported (slot absent or NULL) —
+ * the ADR-021 back-compat default.
+ * @public @memberof xrt_display_processor
+ */
+static inline enum xrt_dp_color_capability
+xrt_display_processor_get_handoff_color_capability(struct xrt_display_processor *xdp)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, get_handoff_color_capability) || xdp->get_handoff_color_capability == NULL) {
+		return XRT_DP_COLOR_ENCODED;
+	}
+	return xdp->get_handoff_color_capability(xdp);
+}
+
+/*!
+ * @copydoc xrt_display_processor::set_atlas_encoding
+ * No-op if not supported (slot absent or NULL) — the DP then assumes ENCODED.
+ * @public @memberof xrt_display_processor
+ */
+static inline void
+xrt_display_processor_set_atlas_encoding(struct xrt_display_processor *xdp, enum xrt_atlas_encoding atlas_encoding)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, set_atlas_encoding) || xdp->set_atlas_encoding == NULL) {
+		return;
+	}
+	xdp->set_atlas_encoding(xdp, atlas_encoding);
 }
 
 /*!

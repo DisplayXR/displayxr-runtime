@@ -229,6 +229,8 @@ sim_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 	(void)canvas_width;
 	(void)canvas_height;
 
+	(void)format; // colorspace handled by SRV/format selection, not this arg
+
 	(void)target_resource; // sim_display uses target_rtv_cpu_handle via render pass
 	struct sim_display_processor_d3d12_impl *sdp = sim_dp_d3d12(xdp);
 	ID3D12GraphicsCommandList *cmd_list = static_cast<ID3D12GraphicsCommandList *>(d3d12_command_list);
