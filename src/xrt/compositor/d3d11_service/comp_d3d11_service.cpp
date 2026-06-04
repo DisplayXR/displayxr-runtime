@@ -499,6 +499,12 @@ struct d3d11_service_system
 	wil::com_ptr<ID3D11PixelShader> blit_blur_ps;
 	wil::com_ptr<ID3D11Buffer> blit_constant_buffer;
 
+	//! ADR-021 Model B: 16-byte global cbuffer bound at PS register b1 during the
+	//! workspace combine pass. Carries one float `g_linearize_output` telling
+	//! every blit output to emit scene-linear (so content + chrome all reach the
+	//! DP linear). Bound once per frame; left at 0 for Model A.
+	wil::com_ptr<ID3D11Buffer> color_linearize_cb;
+
 	//! Constant buffer for layer rendering
 	wil::com_ptr<ID3D11Buffer> layer_constant_buffer;
 
@@ -1894,6 +1900,18 @@ create_layer_resources(struct d3d11_service_system *sys)
 	hr = sys->device->CreateBuffer(&blit_cb_desc, nullptr, sys->blit_constant_buffer.put());
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create blit constant buffer: 0x%08lx", hr);
+		return false;
+	}
+
+	// ADR-021 Model B: 16-byte global color cbuffer (PS register b1).
+	D3D11_BUFFER_DESC color_cb_desc = {};
+	color_cb_desc.ByteWidth = 16;
+	color_cb_desc.Usage = D3D11_USAGE_DYNAMIC;
+	color_cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	color_cb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+	hr = sys->device->CreateBuffer(&color_cb_desc, nullptr, sys->color_linearize_cb.put());
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create color linearize constant buffer: 0x%08lx", hr);
 		return false;
 	}
 
@@ -6240,7 +6258,31 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 	// Clear combined atlas to dark gray background each frame.
 	{
-		float bg_color[4] = {0.102f, 0.102f, 0.102f, 1.0f}; // #1a1a1a
+		// ADR-021 Model B: the backdrop clear bypasses the blit shader, so under
+		// Model B (linear atlas) it must use the LINEAR equivalent of #1a1a1a —
+		// otherwise the DP's output encode brightens it (~0.102→0.35), the
+		// "overexposed background". srgb_to_linear(0.102) ≈ 0.01034. This mirrors
+		// the compose_linear gate computed below (render_count == placed count).
+		int placed_count = 0;
+		int placed_srgb = 0;
+		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+			if (mc->clients[s].active && !mc->clients[s].minimized && mc->clients[s].placed) {
+				placed_count++;
+				struct d3d11_service_compositor *ccc = mc->clients[s].compositor;
+				if (mc->clients[s].client_type != CLIENT_TYPE_CAPTURE && ccc != nullptr &&
+				    ccc->atlas_holds_srgb_bytes) {
+					placed_srgb++;
+				}
+			}
+		}
+		enum xrt_dp_color_capability cap0 =
+		    xrt_display_processor_d3d11_get_handoff_color_capability(mc->display_processor);
+		// Must mirror the compose_linear gate below (incl. the all-honest-sRGB
+		// requirement) so the backdrop matches the atlas encoding the DP receives.
+		const bool clear_linear = (cap0 == XRT_DP_COLOR_LINEAR || cap0 == XRT_DP_COLOR_EITHER) &&
+		                          placed_count > 1 && placed_srgb == placed_count;
+		const float bg = clear_linear ? 0.01034f : 0.102f; // #1a1a1a (linear vs encoded)
+		float bg_color[4] = {bg, bg, bg, 1.0f};
 		sys->context->ClearRenderTargetView(mc->combined_atlas_rtv.get(), bg_color);
 		// Phase 2.K: clear depth target to far (1.0) so the per-slot LESS
 		// test resolves occlusion from scratch each frame.
@@ -6485,6 +6527,82 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// edge-resize z scrolls, controller-driven 3D layouts). The painter's
 	// sort above stays useful for transparent-edge alpha blending — opaque
 	// occlusion now comes from the depth buffer.
+	// ── ADR-021 Model A vs Model B decision (whole-frame) ──────────────────
+	// Model A (baseline): compose in ENCODED space — passthrough. Model B:
+	// compose in LINEAR (decode-iff-sRGB on read → linear atlas → the DP
+	// performs the matched encode at handoff). Linear compose is *only* needed
+	// where layers actually blend (alpha / compose-under-background), and it is
+	// only correct/cheap when:
+	//   (a) the DP declares it accepts a LINEAR handoff (LINEAR or EITHER) —
+	//       the runtime never encodes at the boundary itself (the vendor curve
+	//       was deleted per §2), so B is confined to LINEAR/EITHER DPs;
+	//   (b) more than one layer composites — a single opaque layer is pure
+	//       passthrough, so B degenerates to A and the fast path is untouched;
+	//   (c) every contributing layer is honestly sRGB-encoded, so it has a
+	//       matched sRGB decode view — a layer that stored encoded bytes in a
+	//       UNORM swapchain has no matched decode, so we cannot linear-compose
+	//       it. The atlas-encoding handoff is single-valued per process_atlas(),
+	//       so a mixed frame falls back to A for the whole frame.
+	// Today's apps all store encoded-into-UNORM, so (c) keeps B dormant — it is
+	// exercised by the honest-sRGB / true-linear test apps against an
+	// EITHER-declaring DP (sim_display).
+	enum xrt_dp_color_capability dp_color_cap =
+	    xrt_display_processor_d3d11_get_handoff_color_capability(mc->display_processor);
+	const bool dp_accepts_linear =
+	    (dp_color_cap == XRT_DP_COLOR_LINEAR || dp_color_cap == XRT_DP_COLOR_EITHER);
+	// Model B engages only when the DP accepts a linear handoff, more than one
+	// layer composites (a single opaque layer is pure passthrough = A), AND every
+	// contributing client is genuinely sRGB-format. The blit shader's b1-gated
+	// srgb_to_linear (applied to client content + runtime chrome alike) is a
+	// *matched* decode only when the client content really is display-referred —
+	// which we can only trust from an honest sRGB swapchain. A UNORM swapchain is
+	// ambiguous: it may hold encoded bytes (our test cubes) OR already-linear
+	// bytes (the VK demos), and decoding the latter over-darkens it. So UNORM
+	// clients stay on Model A passthrough (always correct), and Model B is
+	// confined to honest-sRGB content where the decode→linear-blend→DP-encode
+	// round-trip is provably right (ADR-021 §6: format is the source of truth).
+	int honest_srgb_count = 0;
+	for (int ri = 0; ri < render_count; ri++) {
+		struct d3d11_service_compositor *cc_b = mc->clients[render_order[ri]].compositor;
+		if (mc->clients[render_order[ri]].client_type != CLIENT_TYPE_CAPTURE && cc_b != nullptr &&
+		    cc_b->atlas_holds_srgb_bytes) {
+			honest_srgb_count++;
+		}
+	}
+	bool compose_linear = dp_accepts_linear && render_count > 1 && honest_srgb_count == render_count;
+
+	// On-change diagnostic: the compose-model decision + every gate input, so a
+	// "stuck on A" is attributable to dp_cap / layer-count / honest-sRGB.
+	{
+		static int last_key = -1;
+		const int key = (compose_linear ? 1 : 0) | ((int)dp_color_cap << 1) |
+		                (render_count << 4) | (honest_srgb_count << 8);
+		if (key != last_key) {
+			last_key = key;
+			U_LOG_W("Color (ADR-021): model=%s  dp_cap=%d(%s) layers=%d honest_srgb=%d",
+			        compose_linear ? "B/linear" : "A/passthrough", (int)dp_color_cap,
+			        dp_color_cap == XRT_DP_COLOR_EITHER    ? "EITHER"
+			        : dp_color_cap == XRT_DP_COLOR_LINEAR ? "LINEAR"
+			                                              : "ENCODED",
+			        render_count, honest_srgb_count);
+		}
+	}
+
+	// ADR-021 Model B: publish the linearize flag to PS register b1 for the whole
+	// combine pass (every frame; 0 = Model A). It stays bound across the per-draw
+	// b0 BlitConstants updates below, and nothing else binds b1 — so all
+	// blit_ps/blit_blur_ps draws (content + chrome) emit scene-linear under B.
+	{
+		D3D11_MAPPED_SUBRESOURCE cm = {};
+		if (SUCCEEDED(sys->context->Map(sys->color_linearize_cb.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &cm))) {
+			float *f = reinterpret_cast<float *>(cm.pData);
+			f[0] = compose_linear ? 1.0f : 0.0f;
+			f[1] = f[2] = f[3] = 0.0f;
+			sys->context->Unmap(sys->color_linearize_cb.get(), 0);
+		}
+		sys->context->PSSetConstantBuffers(1, 1, sys->color_linearize_cb.addressof());
+	}
+
 	uint32_t dp_view_w = sys->view_width;
 	uint32_t dp_view_h = sys->view_height;
 	for (int ri = 0; ri < render_count; ri++) {
@@ -6525,43 +6643,22 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				continue;
 			}
 
-			// Pick UNORM vs SRGB-typed SRV onto the per-client atlas
-			// based on whether the client's most-recent swapchain was
-			// SRGB-encoded. Atlas storage is TYPELESS in workspace mode (see
+			// Pick UNORM vs SRGB-typed SRV onto the per-client atlas (ADR-021).
+			// Atlas storage is TYPELESS in workspace mode (see
 			// init_client_render_resources), so both views were created
-			// up-front. The UNORM SRV is raw passthrough: a client that
-			// stored encoded bytes in a UNORM swapchain reaches the DP
-			// correctly. DisplayXR's handoff encoding is whatever the active
-			// DP accepts (not a fixed value); the runtime sends encoded today
-			// and the active DP accepts it, so passthrough is correct
-			// (see ADR-021).
+			// up-front.
 			//
-			// KNOWN LATENT HALF-CONVERSION (ADR-021 / #409): the SRGB-SRV
-			// branch makes the GPU decode sRGB->linear on sample, but
-			// NOTHING re-encodes before process_atlas() (the multi-comp
-			// shader is passthrough at convert_srgb=0; linear_to_srgb() in
-			// d3d11_service_shaders.h is defined but never called). So an
-			// sRGB-swapchain client would reach an ENCODED-declaring DP
-			// ~2.2x too dark -- the same unmatched decode #407/#408 fixed
-			// in-process. Dead in practice today: every workspace app stores
-			// encoded-into-UNORM, so atlas_holds_srgb_bytes is false and we
-			// take the UNORM SRV. Fix is the Model-A passthrough baseline
-			// (always use the UNORM SRV here); the eventual general fix is the
-			// declared compose->handoff conversion in ADR-021 §4. Do NOT
-			// "fix" by linearizing more.
-			if (cc->atlas_holds_srgb_bytes && cc->render.atlas_srv_srgb) {
-				static bool logged_srgb_halfconv = false;
-				if (!logged_srgb_halfconv) {
-					logged_srgb_halfconv = true;
-					U_LOG_W("Color: sRGB-SRV decode on per-client atlas with no "
-					        "re-encode before process_atlas() -- known latent "
-					        "half-conversion (ADR-021/#409); an ENCODED-declaring "
-					        "DP receives too-dark values for this sRGB client.");
-				}
-				slot_srv = cc->render.atlas_srv_srgb.get();
-			} else {
-				slot_srv = cc->render.atlas_srv.get();
-			}
+			// Always take the UNORM (raw) SRV — for BOTH models.
+			//   Model A: raw passthrough; the bytes reach the DP verbatim
+			//     (encoded), as an ENCODED/EITHER DP expects. Never the sRGB
+			//     SRV here — that decode with no matching re-encode was the
+			//     latent half-conversion that reached the DP ~2.2x too dark (#409).
+			//   Model B: the blit shader's b1-gated `srgb_to_linear` does the
+			//     decode on OUTPUT (uniformly for content + chrome), so we still
+			//     sample raw here and let the shader linearize. Using the sRGB
+			//     SRV too would double-decode. The atlas then holds linear bytes,
+			//     is declared LINEAR, and the DP performs the matched encode (§4).
+			slot_srv = cc->render.atlas_srv.get();
 			cvw = mc->clients[s].content_view_w;
 			cvh = mc->clients[s].content_view_h;
 			if (cvw == 0 || cvh == 0) {
@@ -7866,6 +7963,13 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			}
 		}
 
+		// ADR-021: declare the encoding of the atlas we are sending out-of-band
+		// (append-only setter; the format arg stays the real DXGI format so
+		// older plug-ins are unaffected). LINEAR under Model B (the DP performs
+		// the matched output encode), ENCODED under Model A (passthrough).
+		xrt_display_processor_d3d11_set_atlas_encoding(
+		    mc->display_processor,
+		    compose_linear ? XRT_ATLAS_ENCODING_LINEAR : XRT_ATLAS_ENCODING_ENCODED);
 		xrt_display_processor_d3d11_process_atlas(
 		    mc->display_processor, sys->context.get(), dp_input_srv,
 		    dp_view_w, dp_view_h, sys->tile_columns, sys->tile_rows,
@@ -9715,6 +9819,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		xrt_display_processor_d3d11_process_atlas(
 		    c->render.display_processor, sys->context.get(), input_srv,
 		    input_view_w, input_view_h, sys->tile_columns, sys->tile_rows,
+		    // ADR-021: per-client single-layer weave is always Model A passthrough
+		    // (one client → nothing to blend). No set_atlas_encoding call ⟹ the DP
+		    // keeps its ENCODED default. Pass the real atlas format here.
 		    DXGI_FORMAT_R8G8B8A8_UNORM, back_buffer_width, back_buffer_height,
 		    0, 0, 0, 0);
 		weaving_done = true;

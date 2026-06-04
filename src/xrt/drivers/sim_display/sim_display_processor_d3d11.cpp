@@ -31,6 +31,26 @@
 
 DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_nominal_z_m_d3d11, "SIM_DISPLAY_NOMINAL_Z_M", 0.60f)
 
+// ADR-021: this DP declares XRT_DP_COLOR_EITHER. When the runtime sends a
+// LINEAR atlas (Model B), the matched encode lives here in the DP. Shared HLSL:
+// the TileParams cbuffer carries `encode_srgb` (1.0 ⟹ linear atlas, apply the
+// standard sRGB OETF before write; 0.0 ⟹ encoded atlas, passthrough) and a
+// standard-sRGB `srgb_encode()` helper. Every pixel shader prepends this and
+// runs its result through `out_encode()` so the matched-pair invariant holds
+// for either incoming encoding. Kept to standard sRGB only — no vendor curve.
+#define SIM_DP_D3D11_CB_AND_ENCODE                                                                                      \
+	"cbuffer TileParams : register(b0) {\n"                                                                        \
+	"  float tile_cols_inv; float tile_rows_inv; float tile_cols; float tile_rows;\n"                              \
+	"  float encode_srgb; float3 _pad;\n"                                                                          \
+	"};\n"                                                                                                         \
+	"float3 srgb_encode(float3 c) {\n"                                                                             \
+	"  c = max(c, 0.0);\n"                                                                                         \
+	"  return (c <= 0.0031308) ? (c * 12.92) : (1.055 * pow(c, 1.0 / 2.4) - 0.055);\n"                             \
+	"}\n"                                                                                                          \
+	"float4 out_encode(float4 color) {\n"                                                                          \
+	"  return (encode_srgb > 0.5) ? float4(srgb_encode(color.rgb), color.a) : color;\n"                            \
+	"}\n"
+
 
 // Fullscreen quad vertex shader (4 vertices, triangle strip via SV_VertexID)
 static const char *vs_source = R"(
@@ -49,26 +69,19 @@ VS_OUTPUT main(uint id : SV_VertexID) {
 )";
 
 // SBS pixel shader: pass-through (identity) so all modes go through the same path
-static const char *ps_sbs_source = R"(
+static const char *ps_sbs_source = SIM_DP_D3D11_CB_AND_ENCODE R"(
 Texture2D atlas_tex : register(t0);
 SamplerState samp : register(s0);
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
-	return atlas_tex.Sample(samp, uv);
+	return out_encode(atlas_tex.Sample(samp, uv));
 }
 )";
 
 // Anaglyph pixel shader: tiled atlas texture, left=red, right=green+blue
-static const char *ps_anaglyph_source = R"(
+static const char *ps_anaglyph_source = SIM_DP_D3D11_CB_AND_ENCODE R"(
 Texture2D atlas_tex : register(t0);
 SamplerState samp : register(s0);
-
-cbuffer TileParams : register(b0) {
-	float tile_cols_inv;
-	float tile_rows_inv;
-	float tile_cols;
-	float tile_rows;
-};
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	float2 left_uv  = float2(uv.x * tile_cols_inv, uv.y * tile_rows_inv);
@@ -77,21 +90,14 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	float2 right_uv = float2((uv.x + col1) * tile_cols_inv, (uv.y + row1) * tile_rows_inv);
 	float4 left  = atlas_tex.Sample(samp, left_uv);
 	float4 right = atlas_tex.Sample(samp, right_uv);
-	return float4(left.r, right.g, right.b, 1.0);
+	return out_encode(float4(left.r, right.g, right.b, 1.0));
 }
 )";
 
 // Squeezed SBS pixel shader: left tile on left half, right tile on right half, no crop
-static const char *ps_squeezed_sbs_source = R"(
+static const char *ps_squeezed_sbs_source = SIM_DP_D3D11_CB_AND_ENCODE R"(
 Texture2D atlas_tex : register(t0);
 SamplerState samp : register(s0);
-
-cbuffer TileParams : register(b0) {
-	float tile_cols_inv;
-	float tile_rows_inv;
-	float tile_cols;
-	float tile_rows;
-};
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	float eye_index = (uv.x < 0.5) ? 0.0 : 1.0;
@@ -100,21 +106,14 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	uint row = (uint)eye_index / (uint)tile_cols;
 	float src_u = (eye_u + col) * tile_cols_inv;
 	float src_v = (uv.y + row) * tile_rows_inv;
-	return atlas_tex.Sample(samp, float2(src_u, src_v));
+	return out_encode(atlas_tex.Sample(samp, float2(src_u, src_v)));
 }
 )";
 
 // Quad pixel shader: 2x2 grid — TL=view0, TR=view1, BL=view2, BR=view3
-static const char *ps_quad_source = R"(
+static const char *ps_quad_source = SIM_DP_D3D11_CB_AND_ENCODE R"(
 Texture2D atlas_tex : register(t0);
 SamplerState samp : register(s0);
-
-cbuffer TileParams : register(b0) {
-	float tile_cols_inv;
-	float tile_rows_inv;
-	float tile_cols;
-	float tile_rows;
-};
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	float col_idx = (uv.x < 0.5) ? 0.0 : 1.0;
@@ -126,21 +125,14 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	float row = floor(view_index / tile_cols);
 	float atlas_u = (local_u + col) * tile_cols_inv;
 	float atlas_v = (local_v + row) * tile_rows_inv;
-	return atlas_tex.Sample(samp, float2(atlas_u, atlas_v));
+	return out_encode(atlas_tex.Sample(samp, float2(atlas_u, atlas_v)));
 }
 )";
 
 // Blend pixel shader: tiled atlas texture, 50/50 mix
-static const char *ps_blend_source = R"(
+static const char *ps_blend_source = SIM_DP_D3D11_CB_AND_ENCODE R"(
 Texture2D atlas_tex : register(t0);
 SamplerState samp : register(s0);
-
-cbuffer TileParams : register(b0) {
-	float tile_cols_inv;
-	float tile_rows_inv;
-	float tile_cols;
-	float tile_rows;
-};
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	float2 left_uv  = float2(uv.x * tile_cols_inv, uv.y * tile_rows_inv);
@@ -149,24 +141,17 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	float2 right_uv = float2((uv.x + col1) * tile_cols_inv, (uv.y + row1) * tile_rows_inv);
 	float4 left  = atlas_tex.Sample(samp, left_uv);
 	float4 right = atlas_tex.Sample(samp, right_uv);
-	return lerp(left, right, 0.5);
+	return out_encode(lerp(left, right, 0.5));
 }
 )";
 
-static const char *ps_passthrough_source = R"(
+static const char *ps_passthrough_source = SIM_DP_D3D11_CB_AND_ENCODE R"(
 Texture2D atlas_tex : register(t0);
 SamplerState samp : register(s0);
 
-cbuffer TileParams : register(b0) {
-	float tile_cols_inv;
-	float tile_rows_inv;
-	float tile_cols;
-	float tile_rows;
-};
-
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	float2 atlas_uv = float2(uv.x * tile_cols_inv, uv.y * tile_rows_inv);
-	return atlas_tex.Sample(samp, atlas_uv);
+	return out_encode(atlas_tex.Sample(samp, atlas_uv));
 }
 )";
 
@@ -187,6 +172,10 @@ struct sim_display_processor_d3d11_impl
 	float nominal_x_m;
 	float nominal_y_m;
 	float nominal_z_m;
+
+	//! ADR-021: encoding the runtime declared for the next process_atlas (set via
+	//! set_atlas_encoding). calloc-zeroed ⟹ XRT_ATLAS_ENCODING_ENCODED (Model A).
+	enum xrt_atlas_encoding atlas_encoding;
 };
 
 static inline struct sim_display_processor_d3d11_impl *
@@ -211,6 +200,8 @@ struct tile_params_cb
 	float tile_rows_inv;
 	float tile_cols;
 	float tile_rows;
+	float encode_srgb; //!< 1.0 ⟹ incoming atlas is LINEAR; apply sRGB OETF on output (ADR-021).
+	float _pad[3];     //!< 16-byte alignment to match the HLSL cbuffer.
 };
 
 static void
@@ -236,9 +227,15 @@ sim_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	(void)canvas_width;
 	(void)canvas_height;
 
+	(void)format; // real atlas format; colorspace comes from set_atlas_encoding.
+
 	struct sim_display_processor_d3d11_impl *sdp = sim_dp_d3d11(xdp);
 	ID3D11DeviceContext *ctx = static_cast<ID3D11DeviceContext *>(d3d11_context);
 	ID3D11ShaderResourceView *srv = static_cast<ID3D11ShaderResourceView *>(atlas_srv);
+
+	// ADR-021: this DP declares EITHER. Encode on output iff the runtime declared
+	// a LINEAR atlas (via set_atlas_encoding) — the matched encode for Model B.
+	const bool encode_srgb = (sdp->atlas_encoding == XRT_ATLAS_ENCODING_LINEAR);
 
 	if (ctx == nullptr || srv == nullptr) {
 		return;
@@ -262,6 +259,7 @@ sim_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	tile_data.tile_rows_inv = (tile_rows > 0) ? (1.0f / static_cast<float>(tile_rows)) : 1.0f;
 	tile_data.tile_cols = static_cast<float>(tile_columns);
 	tile_data.tile_rows = static_cast<float>(tile_rows);
+	tile_data.encode_srgb = encode_srgb ? 1.0f : 0.0f;
 	ctx->UpdateSubresource(sdp->tile_cb, 0, nullptr, &tile_data, 0, 0);
 
 	// Set viewport
@@ -391,6 +389,25 @@ sim_dp_d3d11_set_chroma_key(struct xrt_display_processor_d3d11 *xdp,
 	// Alpha-native — no chroma-key fill/strip required.
 }
 
+/*
+ * ADR-021: this DP samples the atlas and runs the result through out_encode(),
+ * which encodes to sRGB when the runtime declares a LINEAR atlas and passes
+ * through when it declares ENCODED. So it correctly accepts EITHER — the
+ * in-repo test double for Model B's encode-at-handoff direction.
+ */
+static enum xrt_dp_color_capability
+sim_dp_d3d11_get_handoff_color_capability(struct xrt_display_processor_d3d11 *xdp)
+{
+	(void)xdp;
+	return XRT_DP_COLOR_EITHER;
+}
+
+static void
+sim_dp_d3d11_set_atlas_encoding(struct xrt_display_processor_d3d11 *xdp, enum xrt_atlas_encoding atlas_encoding)
+{
+	sim_dp_d3d11(xdp)->atlas_encoding = atlas_encoding;
+}
+
 
 /*
  *
@@ -425,6 +442,8 @@ sim_display_processor_d3d11_create(enum sim_display_output_mode mode,
 	sdp->base.get_predicted_eye_positions = sim_dp_d3d11_get_predicted_eye_positions;
 	sdp->base.is_alpha_native = sim_dp_d3d11_is_alpha_native;
 	sdp->base.set_chroma_key = sim_dp_d3d11_set_chroma_key;
+	sdp->base.get_handoff_color_capability = sim_dp_d3d11_get_handoff_color_capability;
+	sdp->base.set_atlas_encoding = sim_dp_d3d11_set_atlas_encoding;
 
 	// Nominal viewer parameters (same defaults as sim_display_hmd_create)
 	sdp->ipd_m = 0.06f;

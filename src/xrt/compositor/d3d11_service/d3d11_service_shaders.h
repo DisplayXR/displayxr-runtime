@@ -663,6 +663,18 @@ cbuffer BlitCB : register(b0)
     float4 hud_flags;        // x = present, y = premul
 };
 
+// ADR-021 Model B: a single global flag (set once per combine pass, register b1
+// so it survives across all the per-draw BlitCB updates at b0) telling every
+// blit output to emit scene-LINEAR instead of display-referred. When set, the
+// combined atlas is genuinely linear end-to-end (client content sampled raw +
+// runtime chrome alike), the ROP blends in linear, and the DP performs the
+// single matched encode at handoff. 0 ⟹ Model A passthrough (today's behavior).
+cbuffer ColorCB : register(b1)
+{
+    float g_linearize_output; // >0.5 ⟹ apply the sRGB→linear OETF^-1 on output
+    float3 _color_pad;
+};
+
 Texture2D src_tex : register(t0);
 // Phase 2.K Commit 8.D: optional HUD layer source. Bound by content-blit draws
 // in workspace mode when the slot has an active XR_EXT_window_space_layer; left
@@ -680,14 +692,21 @@ struct VS_OUTPUT
     float2 quad_uv : TEXCOORD1;
 };
 
-// Linear to sRGB encode (gamma compression)
-// When sampling from an SRGB SRV, the GPU auto-linearizes the values.
-// We need to re-encode to sRGB before writing to the non-SRGB stereo texture
-// so the weaver receives sRGB-encoded values (matching SR Hydra's behavior).
-float3 linear_to_srgb(float3 linear_color)
+// ADR-021 §2: the runtime's compositor/shader code never uses a vendor-specific
+// transfer function. The former linear_to_srgb() (a vendor power-law, pow 1/2.333)
+// was deleted — any non-sRGB panel curve belongs inside that vendor's DP, applied
+// after the runtime hands off standard bytes. The only transform here is the
+// STANDARD sRGB decode below, applied on output only under Model B so the whole
+// atlas (content + chrome) reaches the DP as linear; the DP does the matched encode.
+float3 srgb_to_linear(float3 c)
 {
-    // Use SR Hydra's gamma exponent (2.333) for consistent color output
-    return pow(abs(linear_color), 1.0 / 2.333);
+    return (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4);
+}
+// Output transform: decode display-referred → linear when Model B is active,
+// else passthrough. Apply to the straight (un-premultiplied) RGB.
+float3 oetf_out(float3 c)
+{
+    return (g_linearize_output > 0.5) ? srgb_to_linear(c) : c;
 }
 
 float4 PSMain(VS_OUTPUT input) : SV_Target
@@ -717,7 +736,7 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
         // Falloff peaks at edge (dist=0), fades inward.
         float falloff = exp(-glow_falloff * dist * dist);
         float a = glow_intensity * falloff;
-        return float4(glow_color.rgb * a, a);  // premultiplied alpha
+        return float4(oetf_out(glow_color.rgb) * a, a);  // premultiplied alpha
     }
 
     // --- Glow mode (convert_srgb >= 3.0): soft halo around focused window ---
@@ -741,7 +760,7 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
         if (dist <= 0.0) discard;  // inside inner rect — content draws on top
         float falloff = exp(-glow_falloff * dist * dist);
         float a = glow_intensity * falloff;
-        return float4(glow_color.rgb * a, a);  // premultiplied alpha
+        return float4(oetf_out(glow_color.rgb) * a, a);  // premultiplied alpha
     }
 
     // --- Corner rounding with smooth alpha falloff ---
@@ -828,7 +847,7 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
 
     // Solid color mode: convert_srgb >= 2.0 outputs src_rect.rgb as solid color
     if (convert_srgb > 1.5)
-        return float4(src_rect.xyz, alpha * a_mul);
+        return float4(oetf_out(src_rect.xyz), alpha * a_mul);
 
     float4 color = src_tex.Sample(src_samp, input.uv);
 
@@ -866,7 +885,7 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
     // pointer when it hovers a workspace window. chrome_alpha.x still
     // controls the global fade-in/out multiplier as before.
     if (chrome_alpha.y > 0.5) {
-        return float4(glow_color.rgb, color.a * glow_color.a * alpha * a_mul);
+        return float4(oetf_out(glow_color.rgb), color.a * glow_color.a * alpha * a_mul);
     }
 
     // Phase 2.C spec_version 9: focus tint. When this content blit is for the
@@ -892,7 +911,7 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
         color = color * glow_color;
     }
 
-    return float4(color.rgb, color.a * alpha * a_mul);
+    return float4(oetf_out(color.rgb), color.a * alpha * a_mul);
 }
 )";
 
@@ -931,6 +950,21 @@ cbuffer BlitCB : register(b0)
 Texture2D src_tex : register(t0);
 SamplerState src_samp : register(s0);
 
+// ADR-021 Model B (see blit_ps_hlsl): emit scene-linear on output when active.
+cbuffer ColorCB : register(b1)
+{
+    float g_linearize_output;
+    float3 _color_pad;
+};
+float3 srgb_to_linear(float3 c)
+{
+    return (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4);
+}
+float3 oetf_out(float3 c)
+{
+    return (g_linearize_output > 0.5) ? srgb_to_linear(c) : c;
+}
+
 struct VS_OUTPUT
 {
     float4 position : SV_Position;
@@ -944,8 +978,10 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
     // matter because callers sample non-square regions (e.g. a glyph in the wide
     // font atlas) yet want a uniform SCREEN-space blur.
     float2 r = float2(glow_falloff, glow_extent);
-    if (r.x <= 0.0 && r.y <= 0.0)
-        return src_tex.Sample(src_samp, input.uv);
+    if (r.x <= 0.0 && r.y <= 0.0) {
+        float4 s = src_tex.Sample(src_samp, input.uv);
+        return float4(oetf_out(s.rgb), s.a);
+    }
 
     // Clamp taps to the source sub-rect so the blur can't bleed past it (e.g.
     // into neighbouring glyphs packed in the font atlas).
@@ -969,6 +1005,6 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
     }
     float out_a = acc_a / count;
     float3 out_rgb = (acc_a > 1e-4) ? (acc_rgb / acc_a) : float3(0, 0, 0);
-    return float4(out_rgb, out_a);
+    return float4(oetf_out(out_rgb), out_a);
 }
 )";

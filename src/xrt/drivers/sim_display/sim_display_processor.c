@@ -116,6 +116,8 @@ sim_dp_process_atlas(struct xrt_display_processor *xdp,
 	(void)canvas_width;
 	(void)canvas_height;
 
+	(void)view_format; // colorspace handled by SRV/format selection, not this arg
+
 	(void)atlas_image; // sim_display uses atlas_view via shader sampling
 	(void)target_image; // sim_display uses target_fb via render pass
 	struct sim_display_processor *sdp = sim_display_processor(xdp);
