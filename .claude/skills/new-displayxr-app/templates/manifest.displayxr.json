@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "name": "<APP DISPLAY NAME>",
+  "type": "3d",
+  "category": "app",
+  "display_mode": "auto",
+  "description": "<one-line tooltip shown in the launcher>",
+  "icon": "icon.png",
+  "icon_3d": "icon_sbs.png",
+  "icon_3d_layout": "sbs-lr"
+}

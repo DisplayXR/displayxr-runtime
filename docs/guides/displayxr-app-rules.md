@@ -8,6 +8,13 @@
 > **Authoritative source = shipped code, not prose.** Where this doc and an inline spec
 > example disagree, the test apps under `test_apps/` win (several spec examples predate the
 > multiview model — see [§12 Known discrepancies](#12-known-discrepancies)).
+>
+> **Tooling that consumes this doc:**
+> - **Scaffold** a new app correct-by-construction: the `/new-displayxr-app` skill clones the
+>   nearest `cube_*` reference, drops a manifest + per-app `CLAUDE.md`, wires CMake, and lints.
+> - **Lint** an existing app against these invariants: `python3 scripts/check_displayxr_app.py
+>   <app-dir>` (`--list-rules` prints the catalog). It flags the INV-* anti-patterns mechanically —
+>   run it before declaring an app done.
 
 ---
 
