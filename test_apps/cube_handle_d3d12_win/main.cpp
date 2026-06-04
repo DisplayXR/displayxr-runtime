@@ -19,6 +19,7 @@
 #include "hud_renderer.h"
 #include "text_overlay.h"
 #include "display3d_view.h"
+#include "projection_depth.h"
 #include "atlas_capture.h"
 
 #include <atomic>
@@ -437,6 +438,11 @@ static void RenderThreadFunc(
                                 rawEyes.data(), eyeCount, &nominalViewer,
                                 &screen, &tunables, &displayPose,
                                 tunables.virtual_display_height, 1000.0f * tunables.virtual_display_height, /*vulkan_flip_y=*/0, stereoViews.data());
+                            // display3d emits a GL ([-1,1] clip-z) projection; D3D clips [0,1].
+                            // Remap depth on the 3D per-view projections (not the mono/legacy
+                            // xr.projMatrices path). [#396 W1]
+                            for (uint32_t _v = 0; _v < eyeCount; _v++)
+                                convert_projection_gl_to_zero_to_one(stereoViews[_v].projection_matrix);
                         }
 
                         rendered = true;
