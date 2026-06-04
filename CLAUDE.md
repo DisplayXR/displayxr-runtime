@@ -128,6 +128,7 @@ Public-repo CI is free, so `build-windows.yml` + `build-macos.yml` fire on every
 - **Cancel-in-progress** — rapid pushes cancel earlier runs.
 - **`shell-path-guard`** — fails any push reintroducing `src/xrt/targets/shell/*` or `installer/DisplayXRShellInstaller.nsi` (those live in `displayxr-shell-pvt`).
 - **Headless self-test gate** — the `Runtime` job registers the freshly-built sim-display plug-in in `HKLM\Software\DisplayXR\DisplayProcessors` and runs `displayxr-cli selftest` (see below). This is the only CI step that *executes* the runtime (every other job just builds); it gates on plug-in discovery + ABI + display-info validity, hardware-free.
+- **No per-CI OneDrive upload** — `build-windows.yml` no longer rclone-copies build artifacts (runtime installer / test-apps zip) to OneDrive. The OneDrive copy now happens **on bundle release only**, in `displayxr-installer`'s `publish-bundle.yml` (uploads `DisplayXRBundle-*.exe` to `SANDBOX/RUNTIMES + SDK + PLUGINS/OpenXR`, gated on its own `RCLONE_CONFIG` secret). CI artifacts stay on GitHub via `upload-artifact`.
 
 For tagged releases use `/release` — don't tag manually.
 
@@ -150,7 +151,7 @@ This repo IS the public runtime (no private→public mirror). A release is a `vX
 | MCP framework | `displayxr-mcp` | `/dxr-release` → matrix build + dual-platform installers (`DisplayXRMCPSetup-*.exe` NSIS + `DisplayXRMCP-*.pkg` productbuild) + dispatches `versions-bump`. |
 | Extension headers | `displayxr-extensions` | Auto-syncs from `src/external/openxr_includes/` on every push to main. No tag. |
 | Standalone demos | `displayxr-demo-*` | `/dxr-release` → builds installer + dispatches `versions-bump`. |
-| Meta-installer bundle | `displayxr-installer` | `/installer-release` or `workflow_dispatch` (NOT auto-fired). Chains every component installer. |
+| Meta-installer bundle | `displayxr-installer` | `/installer-release` or `workflow_dispatch` (NOT auto-fired). Chains every component installer. On release, uploads `DisplayXRBundle-*.exe` to OneDrive (the sole OneDrive upload point; runtime CI no longer does). |
 
 `/dxr-release` handles every sibling repo; `/installer-release` handles the bundle. Neither applies to this repo (use `/release` here).
 
