@@ -259,7 +259,7 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   - Reference: PRs [#407](https://github.com/DisplayXR/displayxr-runtime/pull/407) (GL) and
     [#408](https://github.com/DisplayXR/displayxr-runtime/pull/408) (D3D11/D3D12/Vulkan/Metal),
     which established the cross-API sRGB-passthrough contract, plus
-    `docs/architecture/compositor-pipeline.md#color-space-handling-d3d11-service-compositor-shell-mode`.
+    `docs/architecture/compositor-pipeline.md#color-space-handling-d3d11-service-compositor`.
     As of #408 **all five in-process native compositors pass sRGB swapchains through correctly**;
     the broader color-management design is tracked in
     [#409](https://github.com/DisplayXR/displayxr-runtime/issues/409).
