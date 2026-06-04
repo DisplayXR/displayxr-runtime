@@ -132,6 +132,28 @@ for p in k: v=v[p]
 print(v)" "$VERSIONS_JSON" "$1"
 }
 
+# Retry a gh invocation a few times with exponential backoff to ride out
+# transient GitHub API failures — secondary rate limits and broken pipes
+# that crop up mid-run when the install loop fires a burst of authenticated
+# calls + large downloads. Without this, one hiccup aborts a component even
+# though the same command succeeds when run by hand a moment later. stdout is
+# discarded (callers that need files use --dir side effects); the final
+# attempt's stderr is surfaced so a genuine failure shows its real cause
+# instead of a misleading "bump the pin".
+gh_retry() {
+    local attempt=1 max=4 delay=2 err_out rc
+    while :; do
+        err_out="$("$@" 2>&1 1>/dev/null)"; rc=$?
+        [ "$rc" -eq 0 ] && return 0
+        if [ "$attempt" -ge "$max" ]; then
+            [ -n "$err_out" ] && printf '%s\n' "$err_out" >&2
+            return "$rc"
+        fi
+        warn "  gh call failed (attempt $attempt/$max) — retrying in ${delay}s…"
+        sleep "$delay"; attempt=$((attempt + 1)); delay=$((delay * 2))
+    done
+}
+
 # --- uninstall path ---
 
 if [ "$ACTION" = "uninstall" ]; then
@@ -205,13 +227,12 @@ install_component() {
         return 0
     fi
 
-    # Validate the pin exists in the source repo's releases before downloading.
-    if ! gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
-        err "versions.json pins $name to '$tag', but"
-        err "  gh release view $tag --repo $repo"
-        err "failed. Bump the pin in versions.json, or verify the repo is accessible."
-        return 1
-    fi
+    # No separate "does the release exist" pre-check: it was a redundant,
+    # non-resilient gh call (a single transient throttle aborted the whole
+    # component with a misleading "bump the pin"). The asset probe below
+    # already tolerates transient failure, and the retried download is the
+    # real gate — a genuinely missing tag/asset surfaces there with its
+    # actual gh error.
 
     # Confirm the macOS asset exists on this release — gh download will
     # fail with a noisy stack otherwise, and we want a clean warn-and-skip
@@ -233,12 +254,17 @@ install_component() {
 
     local subdir="$STAGING/$name"
     mkdir -p "$subdir"
-    gh release download "$tag" --repo "$repo" --pattern "$glob" --dir "$subdir"
+    if ! gh_retry gh release download "$tag" --repo "$repo" --pattern "$glob" --dir "$subdir" --clobber; then
+        err "$name: 'gh release download $tag --repo $repo' failed after retries (real error above)."
+        err "       A 403 / secondary-rate-limit is transient — re-run. A 404 means the"
+        err "       tag or asset is genuinely missing — bump the pin in versions.json."
+        return 1
+    fi
 
     local pkg
     pkg="$(find "$subdir" -maxdepth 1 -name "*.pkg" -type f | head -1)"
     if [ -z "$pkg" ]; then
-        err "$name: download succeeded but no .pkg landed in $subdir"
+        err "$name: download reported success but no .pkg landed in $subdir"
         return 1
     fi
 
