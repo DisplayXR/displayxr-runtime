@@ -1384,10 +1384,15 @@ android_main(struct android_app *app)
 		// session isn't actively rendering yet — once we hit
 		// SYNCHRONIZED+, we want to spin the frame loop and only
 		// non-blocking poll Android.
+		//
+		// ALooper_pollOnce (not the NDK r26-deprecated ALooper_pollAll)
+		// dispatches one ready source per call; the enclosing while loop
+		// drains the rest, matching android_native_app_glue's own
+		// migration off pollAll.
 		const int poll_timeout_ms = g_session_running ? 0 : 250;
 		int events;
 		struct android_poll_source *source;
-		while (ALooper_pollAll(poll_timeout_ms, nullptr, &events, (void **)&source) >= 0) {
+		while (ALooper_pollOnce(poll_timeout_ms, nullptr, &events, (void **)&source) >= 0) {
 			if (source != nullptr) {
 				source->process(app, source);
 			}
