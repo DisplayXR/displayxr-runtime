@@ -82,6 +82,18 @@ COMPONENT_EXE_WINDOWS_modelviewer_demo="DisplayXRModelViewerSetup-*.exe"
 COMPONENT_INSTALL_MARKER_MACOS_modelviewer_demo=""
 COMPONENT_INSTALL_MARKER_WINDOWS_modelviewer_demo="HKLM\\Software\\DisplayXR\\Demos\\ModelViewer"
 
+# --- mediaplayer_demo ---
+# Stereo media player demo (displayxr-demo-mediaplayer). Plays SBS image/video
+# on the 3D display via the OpenXR extension wire protocol — no vendor SR SDK.
+# Both installers (macOS .pkg + Windows .exe) are built + attached by CI on a
+# v* tag. First release v1.0.0. Note: the macOS install marker has a space in
+# the path — consumers must quote when testing existence.
+COMPONENT_REPO_mediaplayer_demo="DisplayXR/displayxr-demo-mediaplayer"
+COMPONENT_PKG_MACOS_mediaplayer_demo="DisplayXRMediaPlayer-*.pkg"
+COMPONENT_EXE_WINDOWS_mediaplayer_demo="DisplayXRMediaPlayerSetup-*.exe"
+COMPONENT_INSTALL_MARKER_MACOS_mediaplayer_demo="/Applications/Stereo Media Player.app"
+COMPONENT_INSTALL_MARKER_WINDOWS_mediaplayer_demo="HKLM\\Software\\DisplayXR\\Demos\\MediaPlayer"
+
 # Helper: look up a per-component field for the current platform.
 #   $1 = component name (runtime, shell, leia_plugin, mcp_tools)
 #   $2 = field (REPO, PKG_MACOS, EXE_WINDOWS, INSTALL_MARKER_MACOS)
