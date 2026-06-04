@@ -54,6 +54,10 @@ set "COMPONENT_REPO_modelviewer_demo=DisplayXR/displayxr-demo-modelviewer"
 set "COMPONENT_EXE_modelviewer_demo=DisplayXRModelViewerSetup-*.exe"
 set "COMPONENT_MARKER_modelviewer_demo=HKLM\Software\DisplayXR\Demos\ModelViewer"
 
+set "COMPONENT_REPO_mediaplayer_demo=DisplayXR/displayxr-demo-mediaplayer"
+set "COMPONENT_EXE_mediaplayer_demo=DisplayXRMediaPlayerSetup-*.exe"
+set "COMPONENT_MARKER_mediaplayer_demo=HKLM\Software\DisplayXR\Demos\MediaPlayer"
+
 REM --- Default flag state ---
 set "WITH_MCP=0"
 set "WITH_DEMOS=0"
