@@ -6,7 +6,7 @@ allowed-tools: Read, Grep, Glob, Bash, Agent, Edit, Write
 
 # Release Skill
 
-Creates a tagged release of the **displayxr-runtime** repo, monitors the Windows + macOS CI builds, and publishes the GitHub Release with both platform installers attached (`DisplayXRSetup-*.exe` and `DisplayXR-Installer.pkg`) plus the test-apps bundle.
+Creates a tagged release of the **displayxr-runtime** repo, monitors the Windows + macOS CI builds, and publishes the GitHub Release with both platform installers attached (`DisplayXRSetup-*.exe` and `DisplayXR-Installer.pkg`). Test apps are no longer packaged — CI compiles them as a check on `test_apps/` changes only.
 
 ## Scope
 
@@ -98,7 +98,7 @@ Execute the DisplayXR runtime release workflow for [VERSION] (tag: [FULL_TAG]).
 ## Configuration
 - Source repo: DisplayXR/displayxr-runtime (this is the public repo — there is no separate "publish" mirror)
 - Workflows to monitor (both produce artifacts the release attaches):
-  - `.github/workflows/build-windows.yml` — produces `DisplayXRSetup-*.exe` (artifact `DisplayXR-Installer`) + `TestApps-*` bundle
+  - `.github/workflows/build-windows.yml` — produces `DisplayXRSetup-*.exe` (artifact `DisplayXR-Installer`). Test apps are compiled as a CI check (on `test_apps/` changes) but no longer bundled or attached.
   - `.github/workflows/build-macos.yml` — produces `DisplayXR-Installer.pkg` (artifact `DisplayXR-Installer-macOS`) (post-#277)
 - publish-extensions.yml fires automatically on every push to main; it does not need monitoring as part of a tagged release (header sync is independent of tags)
 - Shell, demos, displayxr-extensions are out of scope; each has its own flow
@@ -188,7 +188,7 @@ Windows CI can take up to 30 min with test apps; macOS is faster (~10-15 min inc
 ## PHASE 4: VERIFY AUTO-BUMP + INSTALLER MIRROR
 
 The Windows build pipeline contains a `BumpVersionsJsonOnTag` job
-that runs after `Runtime` + `BundleTestApps` succeed. It bumps
+that runs after `Runtime` succeeds. It bumps
 `versions.json[runtime]` to the new tag on `displayxr-runtime/main`
 and mirrors the file to `displayxr-installer/main` so the
 dev-orchestrator (`scripts/setup-displayxr.{sh,bat}`) and the
@@ -208,8 +208,8 @@ BUMP_JOB=$(gh run view $WIN_RUN_ID --repo DisplayXR/displayxr-runtime \
 echo "$BUMP_JOB" | jq -r '.status + "/" + (.conclusion // "running")'
 ```
 
-It runs in parallel with the test-app jobs once `Runtime` + `BundleTestApps`
-finish, so it usually lands within 1-2 minutes of those completing.
+It runs once `Runtime` finishes, so it usually lands within 1-2
+minutes of that completing.
 If it hasn't started by the time Phase 3 returned, poll the parent
 run every 25s with `gh run view ... --json jobs --jq '.jobs[] | select(.name=="BumpVersionsJsonOnTag")'`
 until it has a non-empty `status`.
@@ -348,7 +348,6 @@ Verify:
 - Tag matches [FULL_TAG]
 - Asset list contains `DisplayXRSetup-*.exe` with non-zero size (Windows installer, hard requirement)
 - Asset list contains `DisplayXR-Installer-*.pkg` with non-zero size (macOS installer; warn but don't fail if the macOS run skipped it — flag in final report)
-- Asset list contains `DisplayXR-TestApps-*.zip` with non-zero size (warn but don't fail if the BundleTestApps job skipped it — flag in final report)
 - Title is `DisplayXR Runtime [FULL_TAG]`
 - Body starts with `## Highlights`
 
@@ -372,7 +371,6 @@ Build:     Windows CI run #RUN_ID — Runtime + cube test apps passed
 Release:   https://github.com/DisplayXR/displayxr-runtime/releases/tag/[FULL_TAG]
 Assets:    DisplayXRSetup-X.Y.Z.BUILD.exe (~N MB)
            DisplayXR-Installer-X.Y.Z.pkg (~N MB)  [or "skipped — macOS run did not produce .pkg"]
-           DisplayXR-TestApps-X.Y.Z.zip (~17 MB)  [or "skipped — DetectChanges did not produce TestApps-*"]
 Commits:   N commits since $PREV_TAG
 
 Auto-bump:
