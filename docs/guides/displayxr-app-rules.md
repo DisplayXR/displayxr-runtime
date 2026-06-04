@@ -43,6 +43,49 @@ is the only class with no app window.
 
 ---
 
+## 0.5 Foundations — standard OpenXR you still must do
+
+This doc is a list of **DisplayXR-specific invariants**, not a from-scratch OpenXR tutorial. It
+assumes you also get the baseline OpenXR mechanics right. They're easy to bungle when bootstrapping
+a new app, so they're listed here with pointers — the canonical working reference for all of them is
+the tutorial [`docs/getting-started/first-handle-app.md`](../getting-started/first-handle-app.md)
+and the shared session code `test_apps/common/xr_session_common.cpp` (reuse it rather than
+re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
+
+- **F-1 — Session lifecycle & frame loop.** Drive the `xrPollEvent` session-state machine
+  (`IDLE → READY → SYNCHRONIZED → VISIBLE → FOCUSED → … → STOPPING → IDLE`): call `xrBeginSession`
+  on `READY`, `xrEndSession` on `STOPPING`. Each frame: `xrWaitFrame` → `xrBeginFrame` → render →
+  `xrEndFrame`, using `frameState.predictedDisplayTime` for `xrLocateViews`/submission and skipping
+  rendering when `frameState.shouldRender` is false. Exit gracefully via `xrRequestExitSession`
+  (→ `SESSION_STATE_EXITING`). Ref: `xr_session_common.cpp` (`PollEvents`, `BeginFrame`, `EndFrame`).
+- **F-2 — Swapchain image lifecycle.** Per frame, per swapchain: `xrAcquireSwapchainImage` →
+  `xrWaitSwapchainImage` (with a real timeout) → render into the returned image →
+  `xrReleaseSwapchainImage` **before** `xrEndFrame`. Releasing late or submitting an unreleased
+  image is a common stall/validation error.
+- **F-3 — Graphics binding & adapter matching.** Call the API's graphics-requirements query
+  (`xrGetD3D11GraphicsRequirementsKHR` / `xrGetD3D12GraphicsRequirementsKHR` /
+  `xrGetVulkanGraphicsDeviceKHR` / `xrGetOpenGLGraphicsRequirementsKHR`) **before** creating your
+  device, and create the device on the **adapter/LUID the runtime requires** — mismatching it
+  causes failures or silent cross-adapter copies. (This adapter/loader mismatch is the root of the
+  macOS two-`libvulkan` gotcha in [building.md](../getting-started/building.md).) Chain the matching
+  graphics binding (`XrGraphicsBinding*`) into `XrSessionCreateInfo.next` at `xrCreateSession`.
+- **F-4 — Reference space.** Create one `LOCAL` reference space
+  (`xrCreateReferenceSpace`, `XR_REFERENCE_SPACE_TYPE_LOCAL`) and use it for **both** `xrLocateViews`
+  and layer submission. In RAW mode (`XR_EXT_display_info` enabled) the runtime returns
+  screen-centered positions regardless of the space, but LOCAL is the correct, portable choice
+  (see [INV-6.1](#6-kooima-projection)).
+- **F-5 — Enable the extensions you use.** Check availability with
+  `xrEnumerateInstanceExtensionProperties`, then list each in
+  `XrInstanceCreateInfo.enabledExtensionNames` at `xrCreateInstance`, and resolve its functions via
+  `xrGetInstanceProcAddr` (e.g. `xrCaptureAtlasEXT`, the window-binding setters). Header set:
+  [INV-8.3](#8-app-folder-layout--what-to-include).
+- **F-6 — Optional: window-space HUD overlay.** To draw a flat 2D overlay (HUD, labels) on top of
+  the weaved 3D, submit an `XrCompositionLayerWindowSpaceEXT` layer (window-relative `[0,1]`
+  coordinates) after your projection layer — see `XR_EXT_win32_window_binding` §3 and
+  `xr_session_common.cpp` (`EndFrameWithWindowSpaceHud`). Not required for a basic app.
+
+---
+
 ## 1. Window binding & app class
 
 - **INV-1.1 — Pass a real window for handle/texture; NULL for hosted.** Create your window
