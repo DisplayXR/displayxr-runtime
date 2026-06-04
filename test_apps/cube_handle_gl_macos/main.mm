@@ -46,6 +46,7 @@
 #include "xr_window_space_hud.h"
 #include "hud_renderer_macos.h"
 #include <openxr/XR_EXT_display_info.h>
+#include <openxr/XR_EXT_atlas_capture.h>
 
 // ============================================================================
 // Logging
@@ -1083,6 +1084,10 @@ struct AppXrSession {
     PFN_xrRequestDisplayModeEXT pfnRequestDisplayModeEXT;
     PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingModeEXT;
     PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT;
+
+    // XR_EXT_atlas_capture (W6 of #396): runtime-owned 'I'-key atlas capture.
+    bool hasAtlasCaptureExt = false;
+    PFN_xrCaptureAtlasEXT pfnCaptureAtlasEXT = nullptr;
     // Enumerated rendering mode info. currentModeIndex is initialized to mode 1
     // as a fallback for runtimes that don't expose isActive; v13+ runtimes
     // replace it via the enumerate step (initial-mode-sync, #234/#239).
@@ -1132,6 +1137,8 @@ static bool InitializeOpenXR(AppXrSession &app)
             app.hasMacosGlBinding = true;
         if (strcmp(e.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0)
             app.hasDisplayInfoExt = true;
+        if (strcmp(e.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0)
+            app.hasAtlasCaptureExt = true;
     }
 
     if (!app.hasMacosGlBinding) {
@@ -1142,6 +1149,7 @@ static bool InitializeOpenXR(AppXrSession &app)
         LOG_WARN("Runtime does not support XR_EXT_cocoa_window_binding — will create own window");
     }
     LOG_INFO("XR_EXT_display_info: %s", app.hasDisplayInfoExt ? "available" : "not available");
+    LOG_INFO("XR_EXT_atlas_capture: %s", app.hasAtlasCaptureExt ? "available" : "not available");
 
     // Enable extensions
     std::vector<const char *> enabledExts = {XR_EXT_MACOS_GL_BINDING_EXTENSION_NAME};
@@ -1153,6 +1161,9 @@ static bool InitializeOpenXR(AppXrSession &app)
     }
     if (app.hasDisplayInfoExt) {
         enabledExts.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+    }
+    if (app.hasAtlasCaptureExt) {
+        enabledExts.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -1209,6 +1220,11 @@ static bool InitializeOpenXR(AppXrSession &app)
                 (PFN_xrVoidFunction*)&app.pfnRequestDisplayRenderingModeEXT);
             xrGetInstanceProcAddr(app.instance, "xrEnumerateDisplayRenderingModesEXT",
                 (PFN_xrVoidFunction*)&app.pfnEnumerateDisplayRenderingModesEXT);
+        }
+        if (app.hasAtlasCaptureExt) {
+            xrGetInstanceProcAddr(app.instance, "xrCaptureAtlasEXT",
+                (PFN_xrVoidFunction*)&app.pfnCaptureAtlasEXT);
+            LOG_INFO("xrCaptureAtlasEXT: %s", app.pfnCaptureAtlasEXT ? "resolved" : "NULL");
         }
     }
 
@@ -1838,27 +1854,36 @@ int main(int argc, char **argv)
                         app.swapchain.width, app.swapchain.height,
                         eyeParams.data(), eyeCount);
 
-            // 'I' key: snapshot the multi-view atlas. Skipped for mono.
+            // 'I' key: snapshot the multi-view atlas via the runtime-owned
+            // XR_EXT_atlas_capture (W6 of #396) — the runtime does the readback
+            // from its own atlas image, so the app keeps no staging texture.
+            // PROJECTION_ONLY = the app's own projection atlas, pre-compose.
+            // Skipped for mono (1×1) layouts; the runtime appends "_atlas.png".
             if (g_input.captureAtlasRequested) {
                 g_input.captureAtlasRequested = false;
-                if (display3D && (tileColumns > 1 || tileRows > 1)) {
-                    uint32_t atlasW = tileColumns * renderW;
-                    uint32_t atlasH = tileRows * renderH;
-                    if (atlasW <= app.swapchain.width && atlasH <= app.swapchain.height) {
-                        std::string outPath = dxr_capture::MakeCapturePath(
+                if (app.pfnCaptureAtlasEXT && app.session != XR_NULL_HANDLE) {
+                    if (display3D && (tileColumns > 1 || tileRows > 1)) {
+                        std::string prefix = dxr_capture::MakeCaptureAtlasPrefix(
                             "cube_handle_gl_macos", tileColumns, tileRows);
-                        bool ok = dxr_capture::CaptureAtlasRegionGL(
-                            (uint32_t)app.swapchain.images[imageIndex],
-                            app.swapchain.width, app.swapchain.height,
-                            0, 0, atlasW, atlasH, outPath);
-                        if (ok) {
-                            LOG_INFO("Captured atlas %ux%u -> %s",
-                                     atlasW, atlasH, outPath.c_str());
+                        XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
+                        info.next = nullptr;
+                        info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT;
+                        strncpy(info.pathPrefix, prefix.c_str(),
+                                XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1);
+                        info.pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1] = '\0';
+                        XrResult cr = app.pfnCaptureAtlasEXT(app.session, &info, nullptr);
+                        if (XR_SUCCEEDED(cr)) {
+                            LOG_INFO("Atlas capture requested -> %s_atlas.png",
+                                     prefix.c_str());
                             dxr_capture::TriggerCaptureFlash((__bridge void*)g_glView);
+                        } else {
+                            LOG_WARN("xrCaptureAtlasEXT failed: 0x%x", (unsigned)cr);
                         }
+                    } else {
+                        LOG_WARN("Capture skipped: need 3D mode with cols/rows > 1");
                     }
                 } else {
-                    LOG_WARN("Capture skipped: need 3D mode with cols/rows > 1");
+                    LOG_WARN("Atlas capture unavailable: XR_EXT_atlas_capture not active");
                 }
             }
         }

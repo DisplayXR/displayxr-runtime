@@ -52,9 +52,9 @@ add_executable(cube_handle_gl_macos
     "${CMAKE_SOURCE_DIR}/../common/camera3d_view.c"
     "${CMAKE_SOURCE_DIR}/../common/hud_renderer_macos.mm"
     "${CMAKE_SOURCE_DIR}/../common/xr_window_space_hud.cpp"
-    # 'I' key atlas capture: filename + flash helpers + GL readback
+    # 'I' key atlas capture: filename + flash helpers (runtime-owned readback
+    # via XR_EXT_atlas_capture / xrCaptureAtlasEXT — no app-side GL readback)
     "${CMAKE_SOURCE_DIR}/../common/atlas_capture_macos.mm"
-    "${CMAKE_SOURCE_DIR}/../common/atlas_capture_gl.cpp"
 )
 
 target_compile_definitions(cube_handle_gl_macos PRIVATE

@@ -28,6 +28,7 @@
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_EXT_cocoa_window_binding.h>
 #include <openxr/XR_EXT_display_info.h>
+#include <openxr/XR_EXT_atlas_capture.h>
 
 #include <cmath>
 #include <csignal>
@@ -777,6 +778,11 @@ static bool CreateTextureFromFile(VkDevice device, VkPhysicalDevice physDevice,
 
     VkDeviceSize imageSize = (VkDeviceSize)w * h * 4;
 
+    // Full mip chain so the wood texture stays smooth under minification
+    // (#396 W6 parity with GL/Win). Generated on the GPU via vkCmdBlitImage.
+    uint32_t mipLevels = 1;
+    for (int d = (w > h ? w : h); d > 1; d >>= 1) mipLevels++;
+
     // Staging buffer
     VkBuffer stagingBuffer;
     VkDeviceMemory stagingMemory;
@@ -809,11 +815,14 @@ static bool CreateTextureFromFile(VkDevice device, VkPhysicalDevice physDevice,
     imgInfo.imageType = VK_IMAGE_TYPE_2D;
     imgInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
     imgInfo.extent = {(uint32_t)w, (uint32_t)h, 1};
-    imgInfo.mipLevels = 1;
+    imgInfo.mipLevels = mipLevels;
     imgInfo.arrayLayers = 1;
     imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
     imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    imgInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    // TRANSFER_SRC is required to read each level as the blit source when
+    // downsampling into the next level.
+    imgInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                    VK_IMAGE_USAGE_SAMPLED_BIT;
     imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     vkCreateImage(device, &imgInfo, nullptr, &outImage);
 
@@ -846,7 +855,8 @@ static bool CreateTextureFromFile(VkDevice device, VkPhysicalDevice physDevice,
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = outImage;
-    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    // All mip levels start UNDEFINED → transition the whole chain to TRANSFER_DST.
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mipLevels, 0, 1};
     barrier.srcAccessMask = 0;
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -857,7 +867,48 @@ static bool CreateTextureFromFile(VkDevice device, VkPhysicalDevice physDevice,
     region.imageExtent = {(uint32_t)w, (uint32_t)h, 1};
     vkCmdCopyBufferToImage(cmd, stagingBuffer, outImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-    // Transition TRANSFER_DST → SHADER_READ_ONLY
+    // Generate the mip chain: blit each level down from the previous one with a
+    // linear filter, transitioning each source level to SHADER_READ_ONLY once
+    // it has been consumed. (mipLevels == 1 → the loop is skipped and only the
+    // base level's final transition below runs.)
+    barrier.subresourceRange.levelCount = 1;
+    int32_t mipW = w, mipH = h;
+    for (uint32_t i = 1; i < mipLevels; i++) {
+        // level i-1: TRANSFER_DST → TRANSFER_SRC
+        barrier.subresourceRange.baseMipLevel = i - 1;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+        VkImageBlit blit = {};
+        blit.srcOffsets[0] = {0, 0, 0};
+        blit.srcOffsets[1] = {mipW, mipH, 1};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, 1};
+        blit.dstOffsets[0] = {0, 0, 0};
+        blit.dstOffsets[1] = {mipW > 1 ? mipW / 2 : 1, mipH > 1 ? mipH / 2 : 1, 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
+        vkCmdBlitImage(cmd,
+            outImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            outImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1, &blit, VK_FILTER_LINEAR);
+
+        // level i-1: TRANSFER_SRC → SHADER_READ_ONLY
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+        if (mipW > 1) mipW /= 2;
+        if (mipH > 1) mipH /= 2;
+    }
+
+    // Last level is still TRANSFER_DST → SHADER_READ_ONLY.
+    barrier.subresourceRange.baseMipLevel = mipLevels - 1;
     barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -884,7 +935,7 @@ static bool CreateTextureFromFile(VkDevice device, VkPhysicalDevice physDevice,
     viewInfo.image = outImage;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
-    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mipLevels, 0, 1};
     vkCreateImageView(device, &viewInfo, nullptr, &outView);
 
     return !fallback;
@@ -1309,7 +1360,13 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
         samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
         samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
         samplerInfo.maxAnisotropy = 1.0f;
-        samplerInfo.maxLod = 1.0f;
+        // Trilinear: sample the full mip chain (built via vkCmdBlitImage in
+        // CreateTextureFromFile) so the wood texture stays smooth under
+        // minification (#396 W6 parity with GL/Win). VK_LOD_CLAMP_NONE uses
+        // whatever mip levels the bound texture actually has.
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        samplerInfo.minLod = 0.0f;
+        samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
         VK_CHECK(vkCreateSampler(device, &samplerInfo, nullptr, &renderer.texSampler));
 
         // Descriptor pool and set
@@ -1865,6 +1922,10 @@ struct AppXrSession {
     PFN_xrRequestDisplayModeEXT pfnRequestDisplayModeEXT = nullptr;
     PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingModeEXT = nullptr;
     PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT = nullptr;
+
+    // XR_EXT_atlas_capture (W6 of #396): runtime-owned 'I'-key atlas capture.
+    bool hasAtlasCaptureExt = false;
+    PFN_xrCaptureAtlasEXT pfnCaptureAtlasEXT = nullptr;
     // Enumerated rendering mode info. currentModeIndex is initialized to mode 1
     // as a fallback for runtimes that don't expose isActive; v13+ runtimes
     // replace it via the enumerate step (initial-mode-sync, #234/#239).
@@ -1913,6 +1974,9 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) {
             xr.hasDisplayInfoExt = true;
         }
+        if (strcmp(ext.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0) {
+            xr.hasAtlasCaptureExt = true;
+        }
     }
 
     if (!hasVulkan) {
@@ -1922,6 +1986,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
 
     LOG_INFO("XR_EXT_cocoa_window_binding: %s", xr.hasCocoaWindowBinding ? "available" : "not available");
     LOG_INFO("XR_EXT_display_info: %s", xr.hasDisplayInfoExt ? "available" : "not available");
+    LOG_INFO("XR_EXT_atlas_capture: %s", xr.hasAtlasCaptureExt ? "available" : "not available");
 
     // Build extension list
     std::vector<const char*> enabledExtensions;
@@ -1931,6 +1996,9 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     }
     if (xr.hasDisplayInfoExt) {
         enabledExtensions.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+    }
+    if (xr.hasAtlasCaptureExt) {
+        enabledExtensions.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -1994,6 +2062,13 @@ static bool InitializeOpenXR(AppXrSession& xr) {
             (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
         xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesEXT",
             (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
+
+        // XR_EXT_atlas_capture (W6 of #396): resolve the runtime-owned capture entry.
+        if (xr.hasAtlasCaptureExt) {
+            xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasEXT",
+                (PFN_xrVoidFunction*)&xr.pfnCaptureAtlasEXT);
+            LOG_INFO("xrCaptureAtlasEXT: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
+        }
 
         // Load eye tracking mode request function pointer
         if (xr.supportedEyeTrackingModes != 0) {
@@ -3076,32 +3151,38 @@ int main() {
                             }
                             RenderScene(vkRenderer, imageIndex, eyeParams.data(), eyeCount);
 
-                            // 'I' key: snapshot the multi-view atlas. Skipped
-                            // for mono (1×1) layouts.
+                            // 'I' key: snapshot the multi-view atlas via the
+                            // runtime-owned XR_EXT_atlas_capture (W6 of #396) —
+                            // the runtime does the readback from its own atlas
+                            // image, so the app keeps no staging texture.
+                            // PROJECTION_ONLY = the app's own projection atlas,
+                            // pre-compose. Skipped for mono (1×1) layouts; the
+                            // runtime appends "_atlas.png".
                             if (g_input.captureAtlasRequested) {
                                 g_input.captureAtlasRequested = false;
-                                if (display3D && (tileColumns > 1 || tileRows > 1)) {
-                                    uint32_t atlasW = tileColumns * renderW;
-                                    uint32_t atlasH = tileRows * renderH;
-                                    if (atlasW <= xr.swapchain.width &&
-                                        atlasH <= xr.swapchain.height) {
-                                        std::string outPath = dxr_capture::MakeCapturePath(
+                                if (xr.pfnCaptureAtlasEXT && xr.session != XR_NULL_HANDLE) {
+                                    if (display3D && (tileColumns > 1 || tileRows > 1)) {
+                                        std::string prefix = dxr_capture::MakeCaptureAtlasPrefix(
                                             "cube_handle_vk_macos", tileColumns, tileRows);
-                                        bool ok = dxr_capture::CaptureAtlasRegionVk(
-                                            vkDevice, physDevice,
-                                            graphicsQueue, vkRenderer.commandPool,
-                                            swapchainImages[imageIndex].image,
-                                            (int)colorFormat,
-                                            xr.swapchain.width, xr.swapchain.height,
-                                            0, 0, atlasW, atlasH, outPath);
-                                        if (ok) {
-                                            LOG_INFO("Captured atlas %ux%u -> %s",
-                                                     atlasW, atlasH, outPath.c_str());
+                                        XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
+                                        info.next = nullptr;
+                                        info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT;
+                                        strncpy(info.pathPrefix, prefix.c_str(),
+                                                XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1);
+                                        info.pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1] = '\0';
+                                        XrResult cr = xr.pfnCaptureAtlasEXT(xr.session, &info, nullptr);
+                                        if (XR_SUCCEEDED(cr)) {
+                                            LOG_INFO("Atlas capture requested -> %s_atlas.png",
+                                                     prefix.c_str());
                                             dxr_capture::TriggerCaptureFlash((__bridge void*)g_metalView);
+                                        } else {
+                                            LOG_WARN("xrCaptureAtlasEXT failed: 0x%x", (unsigned)cr);
                                         }
+                                    } else {
+                                        LOG_WARN("Capture skipped: need 3D mode with cols/rows > 1");
                                     }
                                 } else {
-                                    LOG_WARN("Capture skipped: need 3D mode with cols/rows > 1");
+                                    LOG_WARN("Atlas capture unavailable: XR_EXT_atlas_capture not active");
                                 }
                             }
                             ReleaseSwapchainImage(xr);
