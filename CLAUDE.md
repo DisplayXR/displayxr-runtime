@@ -21,7 +21,7 @@ App (any graphics API)
    |    |     |        |        |
  D3D11 D3D12 Vulkan  Metal   OpenGL   <-- native compositors
    |    |     |        |        |
-   Display Processor (LeiaSR / sim_display)
+   Display Processor (vendor plug-in / sim_display)
         |
    Display
 ```
@@ -334,7 +334,10 @@ See `docs/README.md` for the full index. By task:
 | Add a new OpenXR extension | `docs/guides/implementing-extension.md` |
 | Write a device driver | `docs/guides/writing-driver.md` |
 | Leia SR weaver internals (DX11/DX12/GL/VK) | `docs/vendors/leia/weaver.md` |
-| Leia transparency model | `docs/vendors/leia/transparency.md` |
+| Leia transparency — **primary path**: WGC background-capture (compose-under-bg) on D3D11/D3D12/VK | `docs/vendors/leia/transparency.md` |
+| Leia chroma-key overlay — **legacy fallback, not the expected path** (background capture is; chroma-key survives only on the GL DP) | `docs/vendors/leia/chroma-key-overlay.md` |
+| Leia window phase-snapping (WndProc snap + resolved WndProcDispatcher race) | `docs/vendors/leia/window-phase-snapping.md` |
+| Leia display mode switching (2D/3D: SwitchableLensHint / backlight) | `docs/vendors/leia/display-mode-switching.md` |
 | Kooima projection math | `docs/architecture/kooima-projection.md` |
 | Compositor pipeline | `docs/architecture/compositor-pipeline.md` |
 | Swapchain model / canvas | `docs/specs/runtime/swapchain-model.md` |
