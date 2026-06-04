@@ -984,91 +984,10 @@ destroy_render_pass()
 
 // ─── per-frame draw ───────────────────────────────────────────────────
 //
-// Records and submits a cmd buffer that begins our render pass on the
-// view's framebuffer, clears to a per-eye background color (red/blue —
-// same calibration hint as the old record_clear), binds the triangle
-// pipeline, pushes proj*view, and draws 3 vertices. Replaces the old
-// vkCmdClearColorImage-only path.
-
-// COLOR_ATTACHMENT_OPTIMAL (per OpenXR spec), transitions to
-// TRANSFER_DST for the clear, then back to COLOR_ATTACHMENT_OPTIMAL
-// for xrReleaseSwapchainImage.
-bool
-record_clear(uint32_t view_idx, uint32_t image_idx)
-{
-	VkCommandBufferAllocateInfo ai = {};
-	ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-	ai.commandPool = g_app_cmd_pool;
-	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-	ai.commandBufferCount = 1;
-	VkCommandBuffer cmd = VK_NULL_HANDLE;
-	if (vkAllocateCommandBuffers(g_vk_device, &ai, &cmd) != VK_SUCCESS) {
-		return false;
-	}
-
-	VkCommandBufferBeginInfo bi = {};
-	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	vkBeginCommandBuffer(cmd, &bi);
-
-	VkImage img = g_views[view_idx].images[image_idx].image;
-
-	VkImageMemoryBarrier to_dst = {};
-	to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-	to_dst.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-	to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-	to_dst.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-	to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-	to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	to_dst.image = img;
-	to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-	vkCmdPipelineBarrier(cmd,
-	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-	    VK_PIPELINE_STAGE_TRANSFER_BIT,
-	    0, 0, nullptr, 0, nullptr, 1, &to_dst);
-
-	VkClearColorValue color = {};
-	color.float32[0] = (view_idx == 0) ? 0.8f : 0.1f;  // left: red, right: blue
-	color.float32[1] = 0.1f;
-	color.float32[2] = (view_idx == 0) ? 0.1f : 0.8f;
-	color.float32[3] = 1.0f;
-	VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-	vkCmdClearColorImage(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	                     &color, 1, &range);
-
-	VkImageMemoryBarrier to_color = to_dst;
-	to_color.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-	to_color.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-	to_color.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-	to_color.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-	vkCmdPipelineBarrier(cmd,
-	    VK_PIPELINE_STAGE_TRANSFER_BIT,
-	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-	    0, 0, nullptr, 0, nullptr, 1, &to_color);
-
-	vkEndCommandBuffer(cmd);
-
-	VkSubmitInfo si = {};
-	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	si.commandBufferCount = 1;
-	si.pCommandBuffers = &cmd;
-	VkResult res = vkQueueSubmit(g_vk_queue, 1, &si, VK_NULL_HANDLE);
-	if (res == VK_SUCCESS) {
-		// vkQueueWaitIdle is a host stall but acceptable for this
-		// skeleton — xrEndFrame needs the image to be ready and we
-		// haven't wired a per-frame fence yet.
-		vkQueueWaitIdle(g_vk_queue);
-	}
-	vkFreeCommandBuffers(g_vk_device, g_app_cmd_pool, 1, &cmd);
-	return res == VK_SUCCESS;
-}
-
-// Triangle draw — supersedes record_clear. Begins our render pass on the
-// per-view framebuffer (LOAD_OP_CLEAR clears to the per-eye background
-// color so the lightfield calibration check stays visible behind the
-// triangle), binds the triangle pipeline, pushes proj*view, draws 3
-// vertices.
+// Begins our render pass on the per-view framebuffer (LOAD_OP_CLEAR clears
+// to the per-eye background color so the lightfield calibration check stays
+// visible behind the triangle), binds the triangle pipeline, pushes
+// proj*view, draws 3 vertices.
 bool
 record_draw(uint32_t view_idx, uint32_t image_idx, const XrView &view)
 {
