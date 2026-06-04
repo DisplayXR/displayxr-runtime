@@ -3107,7 +3107,7 @@ int main() {
                                 display3d_compute_views(
                                     rawEyePos.data(), eyeCount, &nominalViewer,
                                     &screen, &tunables, &cameraPose,
-                                    0.01f, 100.0f, d3dViews.data());
+                                    tunables.virtual_display_height, 1000.0f * tunables.virtual_display_height, /*vulkan_flip_y=*/0, d3dViews.data());
                             }
                         }
 
