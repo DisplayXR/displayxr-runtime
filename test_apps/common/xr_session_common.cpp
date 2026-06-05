@@ -621,7 +621,22 @@ bool EndFrame(XrSessionManager& xr, XrTime displayTime, const XrCompositionLayer
     endInfo.layerCount = 1;
     endInfo.layers = layers;
 
-    return XR_SUCCEEDED(xrEndFrame(xr.session, &endInfo));
+    XrResult result = xrEndFrame(xr.session, &endInfo);
+    if (XR_FAILED(result)) {
+        // A rejected frame leaves the compositor presenting the previous
+        // atlas — make that loud (throttled) instead of silent (#433).
+        static int endFrameFailLog = 0;
+        if (endFrameFailLog < 10 || endFrameFailLog % 300 == 0) {
+            LOG_WARN("[Frame] xrEndFrame FAILED: %d (view[0] rect=(%d,%d %dx%d))",
+                     result,
+                     viewCount > 0 ? views[0].subImage.imageRect.offset.x : 0,
+                     viewCount > 0 ? views[0].subImage.imageRect.offset.y : 0,
+                     viewCount > 0 ? views[0].subImage.imageRect.extent.width : 0,
+                     viewCount > 0 ? views[0].subImage.imageRect.extent.height : 0);
+        }
+        endFrameFailLog++;
+    }
+    return XR_SUCCEEDED(result);
 }
 
 bool CreateHudSwapchain(XrSessionManager& xr, uint32_t width, uint32_t height) {
@@ -750,7 +765,22 @@ bool EndFrameWithWindowSpaceHud(
     endInfo.layerCount = xr.hasHudSwapchain ? 2 : 1;
     endInfo.layers = layers;
 
-    return XR_SUCCEEDED(xrEndFrame(xr.session, &endInfo));
+    XrResult result = xrEndFrame(xr.session, &endInfo);
+    if (XR_FAILED(result)) {
+        // A rejected frame leaves the compositor presenting the previous
+        // atlas — make that loud (throttled) instead of silent (#433).
+        static int endFrameFailLog = 0;
+        if (endFrameFailLog < 10 || endFrameFailLog % 300 == 0) {
+            LOG_WARN("[Frame] xrEndFrame (HUD) FAILED: %d (view[0] rect=(%d,%d %dx%d))",
+                     result,
+                     viewCount > 0 ? projViews[0].subImage.imageRect.offset.x : 0,
+                     viewCount > 0 ? projViews[0].subImage.imageRect.offset.y : 0,
+                     viewCount > 0 ? projViews[0].subImage.imageRect.extent.width : 0,
+                     viewCount > 0 ? projViews[0].subImage.imageRect.extent.height : 0);
+        }
+        endFrameFailLog++;
+    }
+    return XR_SUCCEEDED(result);
 }
 
 // [Commented out — will be reused for 3D-positioned HUD later]

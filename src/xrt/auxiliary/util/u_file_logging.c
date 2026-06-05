@@ -259,6 +259,17 @@ u_file_logging_write_raw(const char *msg)
 }
 
 void
+u_file_logging_write_va(const char *func, enum u_logging_level level, const char *format, va_list args)
+{
+	u_file_logging_init();
+	if (g_log_file == NULL || format == NULL) {
+		return;
+	}
+
+	file_logging_sink(NULL, 0, func, level, format, args, NULL);
+}
+
+void
 u_file_logging_shutdown(void)
 {
 	if (g_log_file != NULL) {
@@ -283,6 +294,16 @@ void
 u_file_logging_write_raw(const char *msg)
 {
 	(void)msg;
+	// File logging only implemented on Windows
+}
+
+void
+u_file_logging_write_va(const char *func, enum u_logging_level level, const char *format, va_list args)
+{
+	(void)func;
+	(void)level;
+	(void)format;
+	(void)args;
 	// File logging only implemented on Windows
 }
 

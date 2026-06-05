@@ -36,6 +36,8 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <sstream>
 #include <vector>
@@ -821,6 +823,11 @@ struct RenderState {
     bool hudOk;
     std::vector<XrSwapchainImageD3D12KHR>* swapchainImages;
     int rtvBaseIndex;
+    // #433 DXR_TEST_PER_VIEW_SC: optional second swapchain so view 1 submits
+    // from its own swapchain (Unity submission shape). XR_NULL_HANDLE when off.
+    XrSwapchain swapchain2;
+    std::vector<XrSwapchainImageD3D12KHR>* swapchain2Images;
+    int rtv2BaseIndex;
     std::vector<XrSwapchainImageD3D12KHR>* hudSwapchainImages;
     ID3D12Resource* hudUploadBuffer;
     uint8_t* hudUploadMapped;
@@ -929,6 +936,37 @@ static void RenderOneFrame(RenderState& rs) {
                         renderH = (uint32_t)(g_canvasH * xr.recommendedViewScaleY);
                         if (renderW > maxTileW) renderW = maxTileW;
                         if (renderH > maxTileH) renderH = maxTileH;
+                    }
+
+                    // #433 regression knobs: a runtime must treat any in-bounds
+                    // sub-rect as a plain UV window, so the composited result
+                    // must be pixel-identical with these set.
+                    //   DXR_TEST_RECT_DELTA=<int>   extent = computed + N px
+                    //                               (render viewport follows —
+                    //                               mirrors Unity's floor()-
+                    //                               rounded renderViewportScale)
+                    //   DXR_TEST_RECT_ANCHOR=bottom rect anchored to the bottom
+                    //                               of the swapchain instead of
+                    //                               the top (Unity-style)
+                    static const int testRectDelta = []() {
+                        const char* e = getenv("DXR_TEST_RECT_DELTA");
+                        return e != nullptr ? atoi(e) : 0;
+                    }();
+                    static const bool testRectBottomAnchor = []() {
+                        const char* e = getenv("DXR_TEST_RECT_ANCHOR");
+                        return e != nullptr && _stricmp(e, "bottom") == 0;
+                    }();
+                    if (testRectDelta != 0) {
+                        int w = (int)renderW + testRectDelta;
+                        int h = (int)renderH + testRectDelta;
+                        renderW = (uint32_t)(w < 16 ? 16 : w);
+                        renderH = (uint32_t)(h < 16 ? 16 : h);
+                        static bool deltaLogged = false;
+                        if (!deltaLogged) {
+                            LOG_WARN("[#433] DXR_TEST_RECT_DELTA=%d -> submitting %ux%u rects",
+                                     testRectDelta, renderW, renderH);
+                            deltaLogged = true;
+                        }
                     }
 
                     // Kooima projection using canvas dims
@@ -1205,14 +1243,48 @@ static void RenderOneFrame(RenderState& rs) {
                     // Render scene into OpenXR swapchain atlas
                     uint32_t imageIndex;
                     if (AcquireSwapchainImage(xr, imageIndex)) {
-                        ID3D12Resource* swapchainTexture = (*rs.swapchainImages)[imageIndex].texture;
-                        int rtvIdx = rs.rtvBaseIndex + (int)imageIndex;
+                        // #433: DXR_TEST_PER_VIEW_SC — Unity submission shape:
+                        // each view in its OWN swapchain, identical rects.
+                        uint32_t imageIndex2 = 0;
+                        bool sc2Acquired = false;
+                        if (rs.swapchain2 != XR_NULL_HANDLE && !monoMode) {
+                            XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+                            if (XR_SUCCEEDED(xrAcquireSwapchainImage(rs.swapchain2, &ai, &imageIndex2))) {
+                                XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+                                wi.timeout = XR_INFINITE_DURATION;
+                                sc2Acquired = XR_SUCCEEDED(xrWaitSwapchainImage(rs.swapchain2, &wi));
+                                if (!sc2Acquired) {
+                                    XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                                    xrReleaseSwapchainImage(rs.swapchain2, &ri);
+                                }
+                            }
+                        }
 
                         for (int eye = 0; eye < eyeCount; eye++) {
-                            uint32_t tileX = monoMode ? 0 : (eye % tileColumns);
-                            uint32_t tileY = monoMode ? 0 : (eye / tileColumns);
+                            const bool useSc2 = sc2Acquired && eye == 1;
+                            uint32_t tileX = (monoMode || useSc2) ? 0 : (eye % tileColumns);
+                            uint32_t tileY = (monoMode || useSc2) ? 0 : (eye / tileColumns);
                             uint32_t vpX = tileX * renderW;
                             uint32_t vpY = tileY * renderH;
+                            if (testRectBottomAnchor) {
+                                // #433: bottom-anchored rect, Unity-style — the
+                                // render viewport moves with the submitted rect.
+                                vpY = xr.swapchain.height - (tileY + 1) * renderH;
+                                static bool anchorLogged = false;
+                                if (!anchorLogged) {
+                                    LOG_WARN("[#433] DXR_TEST_RECT_ANCHOR=bottom -> view0 rect=(%u,%u %ux%u) in %ux%u swapchain",
+                                             vpX, vpY, renderW, renderH,
+                                             xr.swapchain.width, xr.swapchain.height);
+                                    anchorLogged = true;
+                                }
+                            }
+
+                            ID3D12Resource* swapchainTexture = useSc2
+                                ? (*rs.swapchain2Images)[imageIndex2].texture
+                                : (*rs.swapchainImages)[imageIndex].texture;
+                            int rtvIdx = useSc2
+                                ? rs.rtv2BaseIndex + (int)imageIndex2
+                                : rs.rtvBaseIndex + (int)imageIndex;
 
                             int vi = eye < (int)viewCount ? eye : 0;
                             XMMATRIX viewMatrix, projMatrix;
@@ -1231,10 +1303,11 @@ static void RenderOneFrame(RenderState& rs) {
                                 vpX, vpY, renderW, renderH,
                                 viewMatrix, projMatrix,
                                 useAppProjection ? 1.0f : g_inputState.viewParams.scaleFactor,
-                                eye == 0);
+                                eye == 0 || useSc2);
 
                             projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-                            projectionViews[eye].subImage.swapchain = xr.swapchain.swapchain;
+                            projectionViews[eye].subImage.swapchain = useSc2
+                                ? rs.swapchain2 : xr.swapchain.swapchain;
                             projectionViews[eye].subImage.imageRect.offset = {
                                 (int32_t)vpX, (int32_t)vpY
                             };
@@ -1248,6 +1321,10 @@ static void RenderOneFrame(RenderState& rs) {
                                 (monoMode ? monoFov : rawViews[vi].fov);
                         }
 
+                        if (sc2Acquired) {
+                            XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                            xrReleaseSwapchainImage(rs.swapchain2, &ri);
+                        }
                         ReleaseSwapchainImage(xr);
                     }
                 }
@@ -1502,7 +1579,45 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    // Enumerate D3D12 swapchain images
+    // #433 DXR_TEST_PER_VIEW_SC: create a second, identical swapchain so view 1
+    // can submit from its own swapchain — mirrors Unity's per-view-swapchain
+    // submission shape. The runtime must composite this identically to the
+    // single-swapchain tiling. Created BEFORE the RTV pass because
+    // CreateSwapchainRTVs (re)creates the RTV heap sized to its texture count —
+    // both swapchains' images must go into ONE combined call.
+    XrSwapchain swapchain2 = XR_NULL_HANDLE;
+    std::vector<XrSwapchainImageD3D12KHR> swapchain2Images;
+    int rtv2BaseIndex = 0;
+    {
+        const char* e = getenv("DXR_TEST_PER_VIEW_SC");
+        if (e != nullptr && *e != '\0' && *e != '0') {
+            XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+            sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+            sci.format = xr.swapchain.format;
+            sci.sampleCount = 1;
+            sci.width = xr.swapchain.width;
+            sci.height = xr.swapchain.height;
+            sci.faceCount = 1;
+            sci.arraySize = 1;
+            sci.mipCount = 1;
+            XrResult r = xrCreateSwapchain(xr.session, &sci, &swapchain2);
+            if (XR_SUCCEEDED(r)) {
+                uint32_t count2 = 0;
+                xrEnumerateSwapchainImages(swapchain2, 0, &count2, nullptr);
+                swapchain2Images.resize(count2, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+                xrEnumerateSwapchainImages(swapchain2, count2, &count2,
+                    (XrSwapchainImageBaseHeader*)swapchain2Images.data());
+                LOG_WARN("[#433] DXR_TEST_PER_VIEW_SC=1 -> view 1 submits from its own %ux%u swapchain (%u images)",
+                         xr.swapchain.width, xr.swapchain.height, count2);
+            } else {
+                LOG_WARN("[#433] DXR_TEST_PER_VIEW_SC: xrCreateSwapchain failed (%d), knob disabled", r);
+                swapchain2 = XR_NULL_HANDLE;
+            }
+        }
+    }
+
+    // Enumerate D3D12 swapchain images and create RTVs (one combined heap for
+    // both swapchains — see the #433 note above).
     std::vector<XrSwapchainImageD3D12KHR> swapchainImages;
     int rtvBaseIndex = 0;
     {
@@ -1515,9 +1630,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         for (uint32_t i = 0; i < count; i++) {
             textures[i] = swapchainImages[i].texture;
         }
+        rtv2BaseIndex = (int)count;
+        for (const auto& img : swapchain2Images) {
+            textures.push_back(img.texture);
+        }
 
         rtvBaseIndex = (int)renderer.rtvCount;
-        if (!CreateSwapchainRTVs(renderer, textures.data(), count,
+        if (!CreateSwapchainRTVs(renderer, textures.data(), (uint32_t)textures.size(),
             xr.swapchain.width, xr.swapchain.height,
             (DXGI_FORMAT)xr.swapchain.format)) {
             LOG_ERROR("Failed to create RTVs");
@@ -1605,6 +1724,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     rs.hudOk = hudOk;
     rs.swapchainImages = &swapchainImages;
     rs.rtvBaseIndex = rtvBaseIndex;
+    rs.swapchain2 = swapchain2;
+    rs.swapchain2Images = &swapchain2Images;
+    rs.rtv2BaseIndex = rtv2BaseIndex;
     rs.hudSwapchainImages = &hudSwapImages;
     rs.hudUploadBuffer = hudUploadBuffer.Get();
     rs.hudUploadMapped = hudUploadMapped;
@@ -1699,6 +1821,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     g_appSwapchain.Reset();
 
     g_xr = nullptr;
+    if (swapchain2 != XR_NULL_HANDLE) {
+        xrDestroySwapchain(swapchain2);
+        swapchain2 = XR_NULL_HANDLE;
+    }
     CleanupOpenXR(xr);
     if (hudOk) CleanupHudRenderer(hudRenderer);
     CleanupD3D12(renderer);
