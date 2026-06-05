@@ -74,10 +74,13 @@ app render → [swapchain] → sample → [compose / atlas] → process_atlas() 
   define it:
   1. **DP capability (static):** the DP declares which encoding state(s) it can accept —
      `LINEAR`, `ENCODED`, or `EITHER`.
-  2. **Runtime intent (per-frame):** the runtime declares, through `process_atlas()`, the
-     encoding state of the atlas it is actually sending. (Today the `format` argument is
-     hardcoded to `R8G8B8A8_UNORM` and carries no encoding meaning — this declaration
-     replaces that dead parameter with real intent.)
+  2. **Runtime intent (per-frame):** the runtime declares the encoding state of the atlas
+     it is actually sending via a dedicated `set_atlas_encoding(LINEAR|ENCODED)` call made
+     immediately before `process_atlas()`. (This is conveyed out-of-band, *not* by
+     overloading the `process_atlas` `format` argument: that argument turned out **not** to
+     be dead — some DPs feed it straight to their weaver's `setInputViewTexture` as the real
+     texture format — so it stays the real format and the encoding rides a separate,
+     append-only vtable slot. See *Consequences*.)
 
   The runtime guarantees it sends an encoding the DP can accept; if its compose space
   doesn't match a capability-restricted DP, the runtime converts compose→accepted as a
@@ -144,15 +147,18 @@ this today (encoded bytes in UNORM swapchains); see *Consequences*.
 - **Vendor isolation preserved.** Color conventions are DisplayXR's; the DP adapts via
   a declaration. Adding a vendor with a different input-encoding need requires zero
   compositor changes — only the DP declares its preference.
-- **New DP-vtable capability required:** the DP declares its accepted handoff encoding
-  (`LINEAR` / `ENCODED` / `EITHER`). Per ADR-020 (append-only, `struct_size`-gated),
-  this is a new field; **absent ⟹ `ENCODED`**, which preserves the current de-facto
-  passthrough behavior for older plug-ins. Production weavers with a configurable
-  conversion control declare **`EITHER`**.
-- **`process_atlas()` gains a per-frame atlas-encoding argument** (replacing the dead
-  hardcoded `R8G8B8A8_UNORM` `format` parameter, which DPs ignore for colorspace anyway).
-  The runtime states whether the atlas is linear or encoded; the DP configures itself
-  accordingly.
+- **Two new append-only DP-vtable slots** (ADR-020: `struct_size`-gated, **absent ⟹
+  `ENCODED`** so older plug-ins keep their passthrough behavior):
+  1. `get_handoff_color_capability()` — the DP's static accepted encoding (`LINEAR` /
+     `ENCODED` / `EITHER`). Production weavers with a configurable conversion control
+     declare **`EITHER`**.
+  2. `set_atlas_encoding(LINEAR|ENCODED)` — the runtime's per-frame intent, called just
+     before `process_atlas()`. It is a *separate* slot rather than a `process_atlas`
+     argument because the `format` argument is **not** dead in practice — some weavers
+     consume it as the real input-texture format — so it stays the real format and the
+     encoding rides out-of-band. Both slots are append-only ⟹ **no ABI major bump**, and
+     the change is back-compatible in both directions (old-runtime+new-plug-in and
+     new-runtime+old-plug-in both fall to Model A).
 - **Vendor DP work (per-vendor, in each plug-in repo):** a vendor whose weaver supports
   configurable conversion should (1) wire that control to the runtime's declared atlas
   encoding (encode on output whenever input is linear), (2) expose it for **every
@@ -169,14 +175,32 @@ this today (encoded bytes in UNORM swapchains); see *Consequences*.
   Model B; a transitional per-app `treat-as-encoded` override is the escape hatch for
   legacy/test apps that put encoded bytes in UNORM. Our own test apps should migrate to
   honest sRGB swapchains.
-- **Verification gap must be closed.** No current test app renders *true linear* into a
-  UNORM swapchain, so the linear path has never been exercised — which is why the
-  half-conversion sat hidden. Required regression matrix:
-  `{sRGB swapchain, UNORM-encoded, true-linear} × {single-layer opaque, multi-layer
-  blend} × {in-process, IPC, workspace}`, and — once the declaration lands — a DP test
-  double that declares `LINEAR` to exercise the encode-at-handoff direction.
+- **Verification gap closed.** The cube test apps gained `DXR_SWAPCHAIN_ENCODING=srgb|unorm`
+  + `DXR_TRUE_LINEAR` modes (a true-linear-into-UNORM source), and `sim_display`'s D3D11
+  variant declares `EITHER` + encodes on `LINEAR` — the in-repo DP test double for the
+  encode-at-handoff direction. Matrix: `{sRGB, UNORM-encoded, true-linear} × {single, multi}
+  × {in-process, IPC, workspace}` (`test_apps/COLOR_REGRESSION_MATRIX.md`).
 - **HDR / wide-gamut**, if it lands on the roadmap, forces Model B with a float16 linear
   compose space and would move B from "gated future" to "now."
+
+### As shipped (runtime #419 + leia-plugin)
+
+Model B landed on the **D3D11 workspace/service compose path** with two refinements the
+implementation forced:
+
+- **Honest-sRGB gate (load-bearing).** Model B engages only when the DP accepts linear, ≥2
+  layers composite, **and every contributing client is a genuine `*_SRGB` swapchain**. A
+  UNORM swapchain is ambiguous (encoded-in-UNORM vs already-linear-in-UNORM — the two can't
+  be told apart from the format), so UNORM clients stay on Model A passthrough. This is §6
+  "format is the source of truth" made operational: only honest-sRGB content is decoded.
+- **Runtime chrome + backdrop linearize too.** Under Model B the whole atlas is declared
+  `LINEAR`, so everything the *runtime* composites (window chrome, focus glow, cursor, and
+  the `#1a1a1a` backdrop clear) — all display-referred — must also be decoded to linear, or
+  the DP's single output encode double-encodes them. The blit shader applies the standard
+  sRGB decode on every output (content + chrome) and the backdrop is cleared to the linear
+  value; the DP performs the one matched encode.
+- The mechanism is otherwise as in §3–§5: raw-sample → linear compose → `set_atlas_encoding(LINEAR)`
+  → the weaver's output encode. In-process paths and UNORM workspaces are unchanged Model A.
 
 ## Encoding state at each hop (current baseline = Model A; DP configured for encoded passthrough)
 
