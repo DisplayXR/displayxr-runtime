@@ -399,10 +399,17 @@ client_gl_compositor_layer_window_space(struct xrt_compositor *xc,
 
 	xscfb = to_native_swapchain(xsc);
 
-	struct xrt_layer_data d = *data;
-	d.flip_y = !d.flip_y;
-
-	return xrt_comp_layer_window_space(xcn, xdev, xscfb, &d);
+	/*
+	 * No flip_y toggle here, unlike the other layer types: the
+	 * window-space contract is that HUD pixels are uploaded top-down
+	 * (D2D/CG row order, image top at texel row 0) regardless of client
+	 * API, so the shared texture already matches the D3D11/Vulkan
+	 * convention. The in-process GL compositor bakes that assumption
+	 * into its window-space shader (ignores flip_y), and the D3D11
+	 * service honors flip_y as a V-flip — toggling it here Y-flipped GL
+	 * clients' HUDs on the IPC/workspace path (#429).
+	 */
+	return xrt_comp_layer_window_space(xcn, xdev, xscfb, data);
 }
 
 static xrt_result_t
