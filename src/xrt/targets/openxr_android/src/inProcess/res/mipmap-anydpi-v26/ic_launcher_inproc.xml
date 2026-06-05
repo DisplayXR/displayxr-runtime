@@ -6,6 +6,6 @@
     SPDX-License-Identifier: CC-BY-4.0
     -->
     <background android:drawable="@color/ic_launcher_background" />
-    <foreground android:drawable="@drawable/ic_logo_inproc_launcher" />
-    <monochrome android:drawable="@drawable/ic_logo_inproc_mono" />
+    <foreground android:drawable="@drawable/ic_displayxr_foreground" />
+    <monochrome android:drawable="@drawable/ic_displayxr_foreground" />
 </adaptive-icon>

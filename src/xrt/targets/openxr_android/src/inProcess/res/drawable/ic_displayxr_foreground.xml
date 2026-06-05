@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Copyright 2026, Leia Inc.
+    SPDX-License-Identifier: BSL-1.0
+    DisplayXR adaptive-icon foreground: the white DisplayXR logo, inset into the
+    108dp adaptive canvas so it sits within the safe zone (not clipped by the
+    launcher mask).
+-->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@drawable/ic_displayxr_fg"
+    android:insetLeft="22dp"
+    android:insetRight="22dp"
+    android:insetTop="22dp"
+    android:insetBottom="22dp" />

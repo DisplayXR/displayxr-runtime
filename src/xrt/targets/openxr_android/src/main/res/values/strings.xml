@@ -5,5 +5,5 @@
   -->
 
 <resources>
-    <string name="service_name">Monado OpenXR</string>
+    <string name="service_name">DisplayXR</string>
 </resources>
