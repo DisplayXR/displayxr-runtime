@@ -68,9 +68,20 @@
             wrapper inherits the native lib load path from
             NativeActivity.
         -->
+        <!--
+            Lock to PORTRAIT — the nubia NP02J (K68) panel's native
+            orientation (1600x2560) and the axis its lenticular runs along.
+            KEY device finding: the weave only SEPARATES (real stereo 3D —
+            confirmed by per-eye red/blue separating + the resulting eye
+            strain) when the surface is PORTRAIT. In landscape the weave does
+            not separate ("weaving not working"). So portrait is required for
+            3D. (Head-tracking sync + stereo comfort/calibration in portrait
+            are the remaining items, tuned via swap_lr / calibration.)
+        -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:screenOrientation="portrait"
             android:configChanges="orientation|keyboardHidden|screenSize"
             android:launchMode="singleTask">
             <meta-data
