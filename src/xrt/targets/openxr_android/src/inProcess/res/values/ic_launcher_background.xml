@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Copyright 2026, Leia Inc.
+    SPDX-License-Identifier: BSL-1.0
+    DisplayXR launcher-icon background (dark, so the white DisplayXR logo shows).
+    Overrides the main #FFFFFF for the inProcess flavor only.
+-->
+<resources>
+    <color name="ic_launcher_background">#000000</color>
+</resources>
