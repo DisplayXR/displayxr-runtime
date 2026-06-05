@@ -19,11 +19,11 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/../../../../../cmake")
 include(SPIR-V)
 
 spirv_shaders(
-    TRIANGLE_SHADER_HEADERS
+    CUBE_SHADER_HEADERS
     SPIRV_VERSION 1.0
     SOURCES
-        shaders/triangle.vert
-        shaders/triangle.frag
+        shaders/cube.vert
+        shaders/cube.frag
 )
 
 # NativeActivity glue ships with the NDK.
@@ -37,7 +37,7 @@ target_include_directories(native_app_glue PUBLIC
 # OpenXR::openxr_loader IMPORTED target with its headers + libopenxr_loader.so.
 find_package(OpenXR REQUIRED CONFIG)
 
-add_library(cube_handle_vk_android SHARED main.cpp ${TRIANGLE_SHADER_HEADERS})
+add_library(cube_handle_vk_android SHARED main.cpp ${CUBE_SHADER_HEADERS})
 target_include_directories(cube_handle_vk_android PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 # -u ANativeActivity_onCreate forces the linker to keep the symbol the

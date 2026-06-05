@@ -346,6 +346,25 @@ struct xrt_display_processor
 	 */
 	void (*set_atlas_encoding)(struct xrt_display_processor *xdp, enum xrt_atlas_encoding atlas_encoding);
 
+	/*!
+	 * Hand the DP the compositor's image view for the target image it is
+	 * about to receive in the next @ref process_atlas call. Called once per
+	 * frame, immediately before process_atlas, for self-submitting DPs that
+	 * must build their own destination VkFramebuffer (the compositor passes
+	 * VK_NULL_HANDLE for target_fb in that case). Reusing the compositor's
+	 * existing, lifecycle-managed swapchain view lets the DP avoid creating
+	 * its own VkImageView on swapchain images — which some Android (Adreno)
+	 * drivers fault on — and keeps view lifetimes tied to swapchain
+	 * (re)creation that only the compositor tracks.
+	 *
+	 * Optional — NULL means not supported (DP must source the view itself).
+	 *
+	 * @param xdp         Pointer to self.
+	 * @param color_view  Compositor's VkImageView for the upcoming target image.
+	 */
+	void (*set_target_color_view)(struct xrt_display_processor *xdp,
+	                              VkImageView color_view);
+
 	/*! @} */
 };
 
@@ -418,7 +437,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, on_resume)             
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, destroy)                      == XRT_DP_BASE_OFF + 13 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_handoff_color_capability) == XRT_DP_BASE_OFF + 14 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_atlas_encoding)            == XRT_DP_BASE_OFF + 15 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor)                                 == XRT_DP_BASE_OFF + 16 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_target_color_view)        == XRT_DP_BASE_OFF + 16 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor)                                 == XRT_DP_BASE_OFF + 17 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -688,6 +708,22 @@ xrt_display_processor_set_atlas_encoding(struct xrt_display_processor *xdp, enum
 		return;
 	}
 	xdp->set_atlas_encoding(xdp, atlas_encoding);
+}
+
+/*!
+ * @copydoc xrt_display_processor::set_target_color_view
+ *
+ * No-op when the DP doesn't expose the slot (older plug-in) or leaves it NULL.
+ *
+ * @public @memberof xrt_display_processor
+ */
+static inline void
+xrt_display_processor_set_target_color_view(struct xrt_display_processor *xdp, VkImageView color_view)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, set_target_color_view) || xdp->set_target_color_view == NULL) {
+		return;
+	}
+	xdp->set_target_color_view(xdp, color_view);
 }
 
 /*!

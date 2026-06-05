@@ -39,7 +39,13 @@
 
 #define DCOMP_RING 2 // Number of shared back-buffers in the bridge ring
 
-#define MAX_TARGET_IMAGES 4
+// Upper bound on swapchain images we track. The driver may create more than
+// the minImageCount we request (it's a floor, not a cap) — Adreno commonly
+// hands back 5-6 — and vkAcquireNextImageKHR can return ANY index in
+// [0, actual_count), so this must be ≥ the largest count any driver returns.
+// Was 4, which silently under-captured on Adreno and made get_current_image
+// read out of bounds for the surplus images (garbage image/view handles).
+#define MAX_TARGET_IMAGES 8
 
 /*!
  * Vulkan target structure.
@@ -270,11 +276,26 @@ create_swapchain(struct comp_vk_native_target *target)
 		return XRT_ERROR_VULKAN;
 	}
 
-	// Get swapchain images
-	target->image_count = MAX_TARGET_IMAGES;
+	// Get swapchain images. Query the real count first — the driver may
+	// create more images than the minImageCount we requested (Adreno does),
+	// and acquire can return any index in [0, count), so we must capture all
+	// of them. Under-capturing makes get_current_image read past images[]/
+	// views[] and hand the DP a garbage handle.
+	uint32_t actual_count = 0;
+	res = vk->vkGetSwapchainImagesKHR(vk->device, target->swapchain, &actual_count, NULL);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("Failed to query swapchain image count: %d", res);
+		return XRT_ERROR_VULKAN;
+	}
+	if (actual_count > MAX_TARGET_IMAGES) {
+		U_LOG_E("Swapchain has %u images, exceeds MAX_TARGET_IMAGES=%u — raise the cap",
+		        actual_count, (uint32_t)MAX_TARGET_IMAGES);
+		return XRT_ERROR_VULKAN;
+	}
+	target->image_count = actual_count;
 	res = vk->vkGetSwapchainImagesKHR(vk->device, target->swapchain,
 	                                    &target->image_count, target->images);
-	if (res != VK_SUCCESS && res != VK_INCOMPLETE) {
+	if (res != VK_SUCCESS) {
 		U_LOG_E("Failed to get swapchain images: %d", res);
 		return XRT_ERROR_VULKAN;
 	}

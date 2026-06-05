@@ -2445,7 +2445,18 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			    ? xrt_display_processor_get_render_pass(c->display_processor)
 			    : VK_NULL_HANDLE;
 
-			if (c->display_processor != NULL && dp_render_pass != VK_NULL_HANDLE) {
+			// A self-submitting DP (e.g. the Leia CNSDK weaver) runs its
+			// own render pass internally and exposes none to us, so
+			// get_render_pass() is NULL. Route it through the DP path
+			// anyway — gating solely on a non-NULL render pass would drop
+			// it into the blit_to_target fallback below, which on Android
+			// faults inside the Adreno driver (HW-3) and never weaves. Only
+			// the explicit-cmd-buffer DP path needs our render pass/FB.
+			bool dp_self_submits = (c->display_processor != NULL) &&
+			    xrt_display_processor_is_self_submitting(c->display_processor);
+
+			if (c->display_processor != NULL &&
+			    (dp_render_pass != VK_NULL_HANDLE || dp_self_submits)) {
 				static bool dp_logged = false;
 				if (!dp_logged) {
 					U_LOG_W("VK rendering via display processor (compositor-owned swapchain)");
@@ -2499,17 +2510,22 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 				// Create temporary framebuffer from the target's swapchain image.
 				// Must use the DP's render pass for compatibility with vkCmdBeginRenderPass.
-				VkImageView fb_view = (VkImageView)(uintptr_t)target_view;
-				VkFramebufferCreateInfo fb_ci = {
-				    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-				    .renderPass = dp_render_pass,
-				    .attachmentCount = 1,
-				    .pAttachments = &fb_view,
-				    .width = tgt_width,
-				    .height = tgt_height,
-				    .layers = 1,
-				};
-				vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &target_fb);
+				// A self-submitting DP exposes no render pass, so leave target_fb
+				// NULL for it (it weaves internally and ignores the FB) — calling
+				// vkCreateFramebuffer with a NULL render pass would be invalid.
+				if (dp_render_pass != VK_NULL_HANDLE) {
+					VkImageView fb_view = (VkImageView)(uintptr_t)target_view;
+					VkFramebufferCreateInfo fb_ci = {
+					    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+					    .renderPass = dp_render_pass,
+					    .attachmentCount = 1,
+					    .pAttachments = &fb_view,
+					    .width = tgt_width,
+					    .height = tgt_height,
+					    .layers = 1,
+					};
+					vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &target_fb);
+				}
 
 				// Pre-weave barrier: target → COLOR_ATTACHMENT_OPTIMAL
 				VkImageMemoryBarrier pre_weave = {
@@ -2525,9 +2541,6 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 				    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 				    0, 0, NULL, 0, NULL, 1, &pre_weave);
-
-				bool dp_self_submits =
-				    xrt_display_processor_is_self_submitting(c->display_processor);
 
 				if (dp_self_submits) {
 					// Flush pre-DP work (WS-layer composite, atlas crop,
@@ -2545,6 +2558,15 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 					}
 				}
 
+				// Hand the DP our lifecycle-managed view for this target
+				// image. A self-submitting DP with no render pass (Leia
+				// CNSDK) builds its own destination framebuffer and would
+				// otherwise have to create its own VkImageView on the
+				// swapchain image — which Adreno faults on. No-op for DPs
+				// that don't expose the slot.
+				xrt_display_processor_set_target_color_view(
+				    c->display_processor, (VkImageView)(uintptr_t)target_view);
+
 				// Call display processor with atlas (or zero-copy swapchain) texture
 				xrt_display_processor_process_atlas(
 				    c->display_processor,
@@ -2557,7 +2579,7 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				    target_fb,
 				    (VkImage_XDP)(uintptr_t)target_image,
 				    tgt_width, tgt_height,
-				    (VkFormat_XDP)VK_FORMAT_B8G8R8A8_UNORM,
+				    (VkFormat_XDP)comp_vk_native_target_get_format(c->target),
 				    c->canvas.valid ? c->canvas.x : 0,
 				    c->canvas.valid ? c->canvas.y : 0,
 				    c->canvas.valid ? c->canvas.w : 0,
@@ -2609,6 +2631,30 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				// Diagnostic HUD overlay (TAB key toggle)
 				vk_compositor_render_hud(c, cmd,
 				    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
+
+				// A self-submitting DP (Leia CNSDK) ran its own internal
+				// render pass, whose finalLayout leaves the target in
+				// COLOR_ATTACHMENT_OPTIMAL — not PRESENT_SRC_KHR. The
+				// non-self-submit path above relies on the compositor render
+				// pass's finalLayout for that transition, but here there's no
+				// such pass, so transition explicitly before present.
+				if (dp_self_submits) {
+					VkImageMemoryBarrier to_present = {
+					    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+					    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+					    .dstAccessMask = 0,
+					    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+					    .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+					    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+					    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+					    .image = (VkImage)(uintptr_t)target_image,
+					    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+					};
+					vk->vkCmdPipelineBarrier(cmd,
+					    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+					    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+					    0, 0, NULL, 0, NULL, 1, &to_present);
+				}
 			} else {
 				// No display processor (or mono/2D mode): blit atlas texture to target
 				comp_vk_native_renderer_blit_to_target(c->renderer, cmd,

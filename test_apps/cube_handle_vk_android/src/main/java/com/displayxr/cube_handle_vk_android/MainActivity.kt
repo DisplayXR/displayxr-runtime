@@ -22,6 +22,7 @@ package com.displayxr.cube_handle_vk_android
 
 import android.Manifest
 import android.app.NativeActivity
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.os.Bundle
 
@@ -32,6 +33,12 @@ class MainActivity : NativeActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Force PORTRAIT before NativeActivity creates the surface. The nubia
+        // NP02J panel is portrait-native and the Leia weave only separates
+        // (real 3D) when the surface is portrait 1600x2560 — but the manifest
+        // android:screenOrientation lock is ignored by NativeActivity, so the
+        // surface came up portrait OR landscape at random. Pin it here.
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         super.onCreate(savedInstanceState)
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.CAMERA), REQUEST_CAMERA)
