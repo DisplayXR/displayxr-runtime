@@ -8,7 +8,8 @@ description: |
   schema-v1 manifest. Complements /new-displayxr-app (which ships only placeholder icons).
   Windows-first.
   Usage: /make-app-logos <exe-path> [name="Display Name"] [args="..."] [type=3d|2d]
-         [category=app] [description="..."] [crop-nudge=DX,DY] [wait=2] [--register]
+         [category=app] [description="..."] [crop-nudge=DX,DY] [wait=2]
+         [snapshot-ms=N] [--register]
   Examples:
     /make-app-logos test_apps/cube_handle_d3d11_win/build/cube_handle_d3d11_win.exe name="Cube D3D11"
     /make-app-logos C:/apps/photo.exe name="Photo" args="C:/pics/sample.jpg" --register
@@ -44,6 +45,15 @@ Resolve from the invocation; ask (AskUserQuestion) only if the exe is missing/am
 - **type** `3d|2d` (default `3d`), **category** (default `app`), **description**, **display_mode**.
 - **crop-nudge** `DX,DY` px — shift the square crop centre. Default `0,0`.
 - **wait** seconds to render after FOCUSED before capturing. Default `2`.
+- **snapshot-ms** — absolute capture time in **milliseconds after app launch** (process
+  start), overriding `wait`. Use to land the capture at a known media timestamp (e.g.
+  `snapshot-ms=22000` for 22 s into a video the app starts playing on launch). Capture still
+  requires `FOCUSED` first: fire the trigger at `launch_time + snapshot_ms` or immediately
+  after `FOCUSED`+1 frame, whichever is **later** (warn if FOCUSED arrived after the target —
+  the media clock will be ahead of the requested point by the focus latency). If the app's
+  stdout marks actual media start (e.g. the media player's `Playing ... video` line), anchor
+  the countdown on that line instead of launch time — startup latency (session init + decoder
+  open, ~3 s) otherwise lands the capture that much *early* in media time.
 - **--register** — also install into `%LOCALAPPDATA%\DisplayXR\apps\` for an immediate
   launcher test (registered mode: `exe_path` + app-specific icon names).
 
@@ -70,15 +80,20 @@ app. The manifest stem is the exe stem (`<exe-stem>.displayxr.json`).
    **process-global**: every running native compositor polls the same `%TEMP%` trigger file, and
    the first to poll consumes it and writes *its* atlas — so a second app (e.g. a video player)
    will silently win the race and you'll capture the wrong content. Check for other DisplayXR
-   clients before launching and abort (or warn the user) if any are up:
+   clients before launching and abort (or warn the user) if any are up. Do NOT grep process
+   names (a Unity `DisplayXR-test.exe` slipped past a name regex once) — check for the loaded
+   runtime DLL, which is what actually polls the trigger:
    ```bash
-   powershell.exe -NoProfile -Command "Get-Process | ? { \$_.ProcessName -match 'cube_|_handle_|_hosted_|_texture_|mediaplayer|modelviewer|gaussian|depthview|XRInteractive' } | Select Id,ProcessName"
+   powershell.exe -NoProfile -Command "Get-Process | ? { try { (\$_.Modules | % ModuleName) -contains 'DisplayXRClient.dll' } catch { \$false } } | Select Id,ProcessName"
    ```
    (The `displayxr-service` IPC compositor is a separate, non-global path and does not race this.)
 
-3. **Launch + wait for FOCUSED.** Run the exe (with `args`) via Bash `run_in_background`,
-   capturing stdout to a log. Poll the log for the `FOCUSED` session-state line (printed by
-   `xr_session_common.cpp`), then sleep `wait` seconds so content is rendered. If `FOCUSED`
+3. **Launch + wait for FOCUSED.** Record the launch wall-clock time, then run the exe (with
+   `args`) via Bash `run_in_background`, capturing stdout to a log. Poll the log for the
+   `FOCUSED` session-state line (printed by `xr_session_common.cpp`), then sleep `wait`
+   seconds so content is rendered — or, if `snapshot-ms` was given, sleep until
+   `launch_time + snapshot_ms` instead (if FOCUSED arrived after that target, capture right
+   away and warn that the media clock is past the requested point). If `FOCUSED`
    never appears within a reasonable window, report and stop (likely no runtime / wrong DLL —
    check the `loaded from:` line in `%LOCALAPPDATA%\DisplayXR\DisplayXR_<exe>.*.log`).
 
@@ -88,6 +103,9 @@ app. The manifest stem is the exe stem (`<exe-stem>.displayxr.json`).
    # poll up to ~3s for the PNG, then:
    cp "$TEMP/displayxr_atlas.projection.png" "$TEMP/make_app_logos_atlas.png"
    ```
+   **Verify provenance:** the captured PNG's dimensions must equal `tiles × view` from the
+   target app's own `Atlas blit: ... tiles=CxR, view=WxH` stdout line. A mismatch means
+   another client won the trigger race — abort and re-check the pre-flight.
 
 5. **Stop the app.** Kill **only** the PID you launched (never by process age — that can kill
    the user's terminal).
