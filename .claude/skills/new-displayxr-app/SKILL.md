@@ -65,6 +65,8 @@ Pick the exact match; if none exists, pick the same **class+platform** (swap API
    (1024×512) as **placeholders** (correct sizes already) and leave a `TODO: replace icon art`
    note — do not invent art. (`hosted`/`texture` test variants in the repo deliberately ship no
    manifest, but a real app should have one, so include it unless the user says otherwise.)
+   Once the app builds and renders, run **`/make-app-logos <exe>`** to replace the placeholder
+   art with **real** logos generated from a live atlas capture (and refresh the manifest).
 
 4. **Drop the per-app guidance file.** Copy `templates/app-CLAUDE.md` to `<target>/CLAUDE.md`
    (replace `<APP>` placeholders). This keeps the invariants + the linter command in front of any
