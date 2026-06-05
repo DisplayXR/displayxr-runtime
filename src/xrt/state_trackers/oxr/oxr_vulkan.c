@@ -116,6 +116,13 @@ static const char *required_vk_instance_extensions[] = {
     // VK native compositor on macOS needs VkSurfaceKHR via VK_EXT_metal_surface
     VK_KHR_SURFACE_EXTENSION_NAME,        //
     VK_EXT_METAL_SURFACE_EXTENSION_NAME,  //
+#elif defined(VK_KHR_android_surface) && defined(XRT_OS_ANDROID)
+    // VK native compositor on Android needs VkSurfaceKHR via VK_KHR_android_surface
+    // (ANativeWindow -> VkSurfaceKHR in comp_vk_native_target). Without this the
+    // instance-level vkCreateAndroidSurfaceKHR PFN is never loaded and the
+    // compositor fails target creation at xrCreateSession.
+    VK_KHR_SURFACE_EXTENSION_NAME,         //
+    VK_KHR_ANDROID_SURFACE_EXTENSION_NAME, //
 #endif
 };
 
@@ -145,6 +152,7 @@ static const char *required_vk_device_extensions[] = {
     VK_KHR_MAINTENANCE_1_EXTENSION_NAME,
     VK_KHR_BIND_MEMORY_2_EXTENSION_NAME,
     VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
+    VK_KHR_SWAPCHAIN_EXTENSION_NAME, // VK native compositor presents to the ANativeWindow surface via a swapchain
 
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
     VK_EXT_EXTERNAL_MEMORY_METAL_EXTENSION_NAME,
