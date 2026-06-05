@@ -35,6 +35,7 @@
 
 #include "util/u_logging.h"
 #include "util/u_trace_marker.h"
+#include "util/u_capture_dims.h"
 
 #include "os/os_time.h"
 
@@ -153,14 +154,35 @@ capture_inprocess(struct oxr_logger *log,
 		result->type = XR_TYPE_ATLAS_CAPTURE_RESULT_EXT;
 		result->next = NULL;
 		result->timestampNs = (uint64_t)os_monotonic_get_ns();
-		result->atlasWidth = sci->atlas_width_pixels;
-		result->atlasHeight = sci->atlas_height_pixels;
-		// Per-view recommended dims approximate the captured eye-tile size.
-		result->eyeWidth = sci->views[0].recommended.width_pixels;
-		result->eyeHeight = sci->views[0].recommended.height_pixels;
-		// Tile layout from the active rendering mode (resolved above). Eye
-		// poses are still not surfaced on the in-process path — eye-pose
-		// plumbing stops at the display processor; the IPC path returns them.
+
+		// Prefer the compositor's CURRENT window-scaled dims — what the capture
+		// actually writes — over the static nominal system-compositor info,
+		// which disagrees with the PNG whenever the window differs from the
+		// display (#431). Falls back to nominal dims if no provider is
+		// registered (gl/vk/metal) or the renderer isn't sized yet.
+		uint32_t qvw = 0, qvh = 0, qcols = 0, qrows = 0;
+		if (u_capture_dims_query(&qvw, &qvh, &qcols, &qrows) && qvw > 0 && qvh > 0) {
+			if (qcols > 0) {
+				cols = qcols;
+			}
+			if (qrows > 0) {
+				rows = qrows;
+			}
+			result->eyeWidth = qvw;
+			result->eyeHeight = qvh;
+			result->atlasWidth = cols * qvw;
+			result->atlasHeight = rows * qvh;
+		} else {
+			result->atlasWidth = sci->atlas_width_pixels;
+			result->atlasHeight = sci->atlas_height_pixels;
+			// Per-view recommended dims approximate the captured eye-tile size.
+			result->eyeWidth = sci->views[0].recommended.width_pixels;
+			result->eyeHeight = sci->views[0].recommended.height_pixels;
+		}
+		// Tile layout from the active rendering mode (resolved above), unless
+		// the provider supplied a current layout. Eye poses are still not
+		// surfaced on the in-process path — eye-pose plumbing stops at the
+		// display processor; the IPC path returns them.
 		result->tileColumns = cols;
 		result->tileRows = rows;
 		result->displayWidthM = sci->display_width_m;

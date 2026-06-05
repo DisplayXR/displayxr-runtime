@@ -49,9 +49,11 @@
 #include "stb_image_write.h"
 
 #include "math/m_api.h"
+#include "d3d/d3d_dxgi_formats.h"
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
+#include "util/u_capture_dims.h"
 #include "util/u_image_capture.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
@@ -872,7 +874,19 @@ d3d11_crop_atlas_for_dp(struct comp_d3d11_compositor *c,
 			return atlas_srv; // fallback to original
 		}
 
-		hr = c->device->CreateShaderResourceView(c->dp_input_texture, nullptr, &c->dp_input_srv);
+		// Build an explicit SRV desc: a null desc is only valid over a fully
+		// typed resource, and Unity D3D11 swapchains are TYPELESS — the null
+		// path failed E_INVALIDARG every frame (#431). Select the typed UNORM
+		// sibling (NOT the _SRGB one): in-process is ADR-021 Model A
+		// passthrough, so the DP must sample the raw bytes — an _SRGB view
+		// would decode sRGB->linear on sample and re-introduce the ~2.2x
+		// too-dark half-conversion fixed by #407/#408/#409.
+		D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+		srv_desc.Format = d3d_dxgi_format_to_unorm_sample(atlas_desc.Format);
+		srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		srv_desc.Texture2D.MostDetailedMip = 0;
+		srv_desc.Texture2D.MipLevels = 1;
+		hr = c->device->CreateShaderResourceView(c->dp_input_texture, &srv_desc, &c->dp_input_srv);
 		if (FAILED(hr)) {
 			U_LOG_E("Failed to create DP input SRV: 0x%lx", hr);
 			c->dp_input_texture->Release();
@@ -905,11 +919,22 @@ d3d11_crop_atlas_for_dp(struct comp_d3d11_compositor *c,
 // (clamped to its actual size) and write @p path as an opaque RGBA8 PNG. The
 // source may be the renderer's composited atlas OR, in zero-copy present, the
 // app's own swapchain image — both already hold the laid-out multi-view atlas.
+//
+// When @p dst_w / @p dst_h are non-zero and differ from the read-back region,
+// the buffer is bilinear-resampled to (dst_w × dst_h) before the PNG write.
+// This is used by the zero-copy path: an app may present a multi-view atlas at
+// the mode NOMINAL dims while the runtime renders at the window-scaled dims, so
+// the readback (nominal) must be scaled down to the content dims the DP sees
+// (#431). A uniform resample is correct for an equal-sized tile grid — the tile
+// boundary at source view_w maps exactly to the target view_w. Pass 0 to write
+// the read-back region verbatim (no resample).
 static bool
 d3d11_capture_texture_to_png(struct comp_d3d11_compositor *c,
                              ID3D11Texture2D *atlas_tex,
                              uint32_t content_w,
                              uint32_t content_h,
+                             uint32_t dst_w,
+                             uint32_t dst_h,
                              const char *path)
 {
 	if (atlas_tex == nullptr || content_w == 0 || content_h == 0) {
@@ -956,7 +981,44 @@ d3d11_capture_texture_to_png(struct comp_d3d11_compositor *c,
 			memcpy(tight + (size_t)y * tight_pitch, src + (size_t)y * m.RowPitch, tight_pitch);
 		}
 		u_image_force_opaque_rgba8(tight, content_w, content_h, tight_pitch);
-		ok = stbi_write_png(path, (int)content_w, (int)content_h, 4, tight, (int)tight_pitch) != 0;
+
+		// Optional resample to (dst_w × dst_h) — see header comment (#431).
+		if (dst_w != 0 && dst_h != 0 && (dst_w != content_w || dst_h != content_h)) {
+			size_t dst_pitch = (size_t)dst_w * 4;
+			uint8_t *out = (uint8_t *)malloc(dst_pitch * dst_h);
+			if (out != nullptr) {
+				// Bilinear, RGBA8. Sample centers map source<->dst so the
+				// outer edges align (no half-texel shift across the grid).
+				float sx = (dst_w > 1) ? (float)(content_w - 1) / (float)(dst_w - 1) : 0.0f;
+				float sy = (dst_h > 1) ? (float)(content_h - 1) / (float)(dst_h - 1) : 0.0f;
+				for (uint32_t dy = 0; dy < dst_h; dy++) {
+					float fy = dy * sy;
+					uint32_t y0 = (uint32_t)fy;
+					uint32_t y1 = (y0 + 1 < content_h) ? y0 + 1 : y0;
+					float wy = fy - (float)y0;
+					for (uint32_t dx = 0; dx < dst_w; dx++) {
+						float fx = dx * sx;
+						uint32_t x0 = (uint32_t)fx;
+						uint32_t x1 = (x0 + 1 < content_w) ? x0 + 1 : x0;
+						float wx = fx - (float)x0;
+						const uint8_t *p00 = tight + (size_t)y0 * tight_pitch + (size_t)x0 * 4;
+						const uint8_t *p01 = tight + (size_t)y0 * tight_pitch + (size_t)x1 * 4;
+						const uint8_t *p10 = tight + (size_t)y1 * tight_pitch + (size_t)x0 * 4;
+						const uint8_t *p11 = tight + (size_t)y1 * tight_pitch + (size_t)x1 * 4;
+						uint8_t *d = out + (size_t)dy * dst_pitch + (size_t)dx * 4;
+						for (int ch = 0; ch < 4; ch++) {
+							float top = p00[ch] * (1.0f - wx) + p01[ch] * wx;
+							float bot = p10[ch] * (1.0f - wx) + p11[ch] * wx;
+							d[ch] = (uint8_t)(top * (1.0f - wy) + bot * wy + 0.5f);
+						}
+					}
+				}
+				ok = stbi_write_png(path, (int)dst_w, (int)dst_h, 4, out, (int)dst_pitch) != 0;
+				free(out);
+			}
+		} else {
+			ok = stbi_write_png(path, (int)content_w, (int)content_h, 4, tight, (int)tight_pitch) != 0;
+		}
 		free(tight);
 	}
 
@@ -985,6 +1047,33 @@ d3d11_compositor_content_dims(struct comp_d3d11_compositor *c, uint32_t *out_w, 
 	return true;
 }
 
+// u_capture_dims provider: report the renderer's CURRENT window-scaled per-view
+// dims + tile layout so xrCaptureAtlasEXT can fill XrAtlasCaptureResultEXT with
+// what the capture actually writes, not the nominal system info (#431).
+static bool
+d3d11_compositor_capture_dims_provider(void *userdata,
+                                       uint32_t *out_view_w,
+                                       uint32_t *out_view_h,
+                                       uint32_t *out_tile_cols,
+                                       uint32_t *out_tile_rows)
+{
+	struct comp_d3d11_compositor *c = static_cast<struct comp_d3d11_compositor *>(userdata);
+	if (c == nullptr || c->renderer == nullptr) {
+		return false;
+	}
+	uint32_t vw = 0, vh = 0, cols = 1, rows = 1;
+	comp_d3d11_renderer_get_view_dimensions(c->renderer, &vw, &vh);
+	comp_d3d11_renderer_get_tile_layout(c->renderer, &cols, &rows);
+	if (vw == 0 || vh == 0) {
+		return false;
+	}
+	*out_view_w = vw;
+	*out_view_h = vh;
+	*out_tile_cols = cols;
+	*out_tile_rows = rows;
+	return true;
+}
+
 // Capture from the renderer's composited atlas (non-zero-copy frames).
 static bool
 d3d11_compositor_capture_atlas_to_png(struct comp_d3d11_compositor *c, const char *path)
@@ -995,7 +1084,7 @@ d3d11_compositor_capture_atlas_to_png(struct comp_d3d11_compositor *c, const cha
 	if (atlas_tex == nullptr || !d3d11_compositor_content_dims(c, &content_w, &content_h)) {
 		return false;
 	}
-	return d3d11_capture_texture_to_png(c, atlas_tex, content_w, content_h, path);
+	return d3d11_capture_texture_to_png(c, atlas_tex, content_w, content_h, 0, 0, path);
 }
 
 // Service a pending MCP capture_frame request — thin wrapper around
@@ -1039,19 +1128,34 @@ d3d11_compositor_dispatch_capture_zerocopy(struct comp_d3d11_compositor *c, void
 	srv->GetResource(&resource);
 	ID3D11Texture2D *zc_tex = static_cast<ID3D11Texture2D *>(resource);
 
-	// Capture the whole swapchain texture: zero-copy is only eligible when the
-	// app's swapchain matches the active mode's atlas dimensions exactly
-	// (u_tiling_can_zero_copy), so the entire texture IS the multi-view atlas.
-	// Do NOT use the renderer's view/tile dims here — for a legacy app those are
-	// the 2D/3D compromise size (e.g. 1200×1080), which is smaller than the
-	// app's real per-view render (e.g. 1920×1080) and would crop the atlas
-	// (issue #425, the Unity stretched/cropped-PNG case).
+	// Read back the whole swapchain texture: zero-copy is only eligible when the
+	// app's swapchain laid-out rects tile it exactly (u_tiling_can_zero_copy), so
+	// the entire texture IS the multi-view atlas.
+	//
+	// For an EXTENSION app, the swapchain may be presented at the mode NOMINAL
+	// dims (e.g. a Unity backend composes a double-wide 3840×1080 atlas) while the
+	// runtime renders at the window-scaled content dims (e.g. 2400×1080) — so we
+	// resample the readback down to the renderer's current content dims, matching
+	// the PNG D3D12 produces for the same window (#431). A plain crop would slice
+	// the larger tiles; a uniform resample preserves the equal-sized tile grid.
+	//
+	// For a LEGACY app, the renderer view dims are the 2D/3D compromise size
+	// (smaller than the app's real per-view render), so resampling to them would
+	// needlessly downscale — keep the verbatim full-swapchain dump (#425).
 	bool ok = false;
 	if (zc_tex != nullptr) {
 		D3D11_TEXTURE2D_DESC zdesc;
 		zc_tex->GetDesc(&zdesc);
+		uint32_t dst_w = 0, dst_h = 0;
+		if (!c->legacy_app_tile_scaling) {
+			uint32_t content_w = 0, content_h = 0;
+			if (d3d11_compositor_content_dims(c, &content_w, &content_h)) {
+				dst_w = content_w;
+				dst_h = content_h;
+			}
+		}
 		ok = d3d11_capture_texture_to_png(c, zc_tex, zdesc.Width, zdesc.Height,
-		                                  c->capture_intent.path);
+		                                  dst_w, dst_h, c->capture_intent.path);
 	}
 	if (resource != nullptr) {
 		resource->Release();
@@ -1593,6 +1697,7 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 
 	U_LOG_I("Destroying D3D11 compositor");
 
+	u_capture_dims_set_provider(NULL, c);
 	mcp_capture_uninstall();
 	mcp_capture_fini(&c->mcp_capture);
 
@@ -1987,6 +2092,9 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		d3d11_compositor_destroy(&c->base.base);
 		return xret;
 	}
+
+	// Expose current window-scaled capture dims to xrCaptureAtlasEXT (#431).
+	u_capture_dims_set_provider(d3d11_compositor_capture_dims_provider, c);
 
 #ifdef XRT_FEATURE_DEBUG_GUI
 	// Create debug GUI (controlled by XRT_DEBUG_GUI env var)
