@@ -19,6 +19,9 @@
         <intent>
             <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
         </intent>
+        <!-- Explicit package visibility so we can wake the DisplayXR runtime
+             out of Android's "stopped" state before xrCreateInstance. -->
+        <package android:name="org.freedesktop.monado.openxr_runtime.in_process" />
     </queries>
 
     <uses-feature
