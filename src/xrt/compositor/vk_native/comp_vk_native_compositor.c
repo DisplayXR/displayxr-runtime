@@ -37,6 +37,7 @@
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
+#include "util/u_image_capture.h"
 #include <displayxr_mcp/mcp_capture.h>
 
 // STB_IMAGE_WRITE_STATIC scopes all stbi_write_* to this TU so linking
@@ -1837,6 +1838,10 @@ vk_native_capture_atlas_to_png(struct comp_vk_native_compositor *c, const char *
 				pixels = swapped;
 			}
 		}
+		// Force opaque: swapchain alpha is undefined for display output, and
+		// left as-is the PNG renders transparent/black (issue #425). Covers
+		// both the BGRA-swapped copy and the direct (mapped) path.
+		u_image_force_opaque_rgba8(pixels, content_w, content_h, (size_t)content_w * 4);
 		ok = stbi_write_png(path, (int)content_w, (int)content_h, 4,
 		                    pixels, (int)content_w * 4) != 0;
 		free(swapped);

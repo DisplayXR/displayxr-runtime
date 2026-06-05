@@ -42,6 +42,7 @@
 
 #include "util/u_hud.h"
 #include "util/u_tiling.h"
+#include "util/u_image_capture.h"
 #include <displayxr_mcp/mcp_capture.h>
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
@@ -10945,8 +10946,15 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 			       src + (size_t)y * m.RowPitch,
 			       (size_t)used_w * 4u);
 		}
+		// Swapchain alpha is undefined for display output — force opaque so the
+		// PNG doesn't render fully transparent/black (issue #425).
+		u_image_force_opaque_rgba8(buf.data(), used_w, used_h, (size_t)used_w * 4u);
+		// Encode the atlas geometry into the suffix so consumers don't re-derive
+		// it: "_atlas_<viewCount>_<cols>x<rows>.png" (issue #425). viewCount is
+		// the tile count (cols*rows for all current DisplayXR layouts).
 		char path[MAX_PATH];
-		snprintf(path, sizeof(path), "%s_atlas.png", path_prefix);
+		snprintf(path, sizeof(path), "%s_atlas_%u_%ux%u.png", path_prefix,
+		         tile_columns * tile_rows, tile_columns, tile_rows);
 		if (stbi_write_png(path, (int)used_w, (int)used_h, 4,
 		                   buf.data(), (int)(used_w * 4u)) != 0) {
 			views_written |= want_flag;

@@ -1870,7 +1870,8 @@ int main(int argc, char **argv)
             // XR_EXT_atlas_capture (W6 of #396) — the runtime does the readback
             // from its own atlas image, so the app keeps no staging texture.
             // PROJECTION_ONLY = the app's own projection atlas, pre-compose.
-            // Skipped for mono (1×1) layouts; the runtime appends "_atlas.png".
+            // Skipped for mono (1×1) layouts; the runtime appends
+            // "_atlas_<viewCount>_<cols>x<rows>.png".
             if (g_input.captureAtlasRequested) {
                 g_input.captureAtlasRequested = false;
                 if (app.pfnCaptureAtlasEXT && app.session != XR_NULL_HANDLE) {
@@ -1885,8 +1886,8 @@ int main(int argc, char **argv)
                         info.pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1] = '\0';
                         XrResult cr = app.pfnCaptureAtlasEXT(app.session, &info, nullptr);
                         if (XR_SUCCEEDED(cr)) {
-                            LOG_INFO("Atlas capture requested -> %s_atlas.png",
-                                     prefix.c_str());
+                            LOG_INFO("Atlas capture requested -> %s_atlas_%u_%ux%u.png",
+                                     prefix.c_str(), tileColumns * tileRows, tileColumns, tileRows);
                             dxr_capture::TriggerCaptureFlash((__bridge void*)g_metalView);
                         } else {
                             LOG_WARN("xrCaptureAtlasEXT failed: 0x%x", (unsigned)cr);

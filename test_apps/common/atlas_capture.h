@@ -99,11 +99,13 @@ std::string MakeCapturePath(const std::string& stem,
                             uint32_t cols,
                             uint32_t rows);
 
-// Path PREFIX (no extension) for xrCaptureAtlasEXT, which appends "_atlas.png".
-// Numbers against existing "<stem>-<N>_<cols>x<rows>_atlas.png" files (the
+// Path PREFIX (no extension) for xrCaptureAtlasEXT, which appends
+// "_atlas_<viewCount>_<cols>x<rows>.png" (viewCount == cols*rows). Numbers
+// against existing "<stem>-<N>_atlas_<viewCount>_<cols>x<rows>.png" files (the
 // runtime-produced names) so repeat captures accumulate instead of overwriting.
-// Returns "<dir>/<stem>-<N>_<cols>x<rows>" (no "_atlas", no ".png"). The legacy
-// readback path keeps MakeCapturePath; the two name spaces don't collide.
+// Returns "<dir>/<stem>-<N>" (no "_atlas", no ".png") — the runtime owns the
+// layout tokens. The legacy readback path keeps MakeCapturePath; the two name
+// spaces don't collide.
 std::string MakeCaptureAtlasPrefix(const std::string& stem,
                                    uint32_t cols,
                                    uint32_t rows);

@@ -153,6 +153,37 @@ oxr_system_fill_in(
 	// use 0.5x1.0 so the app renders full-height tiles. The compositor will
 	// downscale Y for 3D and stretch X for 2D.
 	if (!inst->extensions.EXT_display_info) {
+		// Engine OpenXR plug-ins (Unity, Unreal) create a throwaway probe
+		// instance with ZERO extensions before the real one. Such an
+		// instance can never create a session (no graphics binding /
+		// headless extension), so the compromise scale computed below is
+		// dead on arrival. Log it as a clearly-labeled INFO instead of a
+		// misleading "Legacy app" WARN — the authoritative legacy WARN
+		// fires in oxr_session_create() when the scale actually takes
+		// effect (probe instances never get there).
+		bool probe_only = true;
+#ifdef OXR_HAVE_KHR_D3D11_enable
+		probe_only = probe_only && !inst->extensions.KHR_D3D11_enable;
+#endif
+#ifdef OXR_HAVE_KHR_D3D12_enable
+		probe_only = probe_only && !inst->extensions.KHR_D3D12_enable;
+#endif
+#ifdef OXR_HAVE_KHR_opengl_enable
+		probe_only = probe_only && !inst->extensions.KHR_opengl_enable;
+#endif
+#ifdef OXR_HAVE_KHR_vulkan_enable
+		probe_only = probe_only && !inst->extensions.KHR_vulkan_enable;
+#endif
+#ifdef OXR_HAVE_KHR_vulkan_enable2
+		probe_only = probe_only && !inst->extensions.KHR_vulkan_enable2;
+#endif
+#ifdef OXR_HAVE_KHR_metal_enable
+		probe_only = probe_only && !inst->extensions.KHR_metal_enable;
+#endif
+#ifdef OXR_HAVE_MND_headless
+		probe_only = probe_only && !inst->extensions.MND_headless;
+#endif
+
 		struct xrt_device *head = GET_XDEV_BY_ROLE(sys, head);
 		if (head != NULL && head->rendering_mode_count > 1) {
 			uint32_t default_3d_idx = head->hmd->active_rendering_mode_index;
@@ -165,9 +196,6 @@ oxr_system_fill_in(
 				info->legacy_app_tile_scaling = true;
 				info->legacy_view_scale_x = 0.5f;
 				info->legacy_view_scale_y = 1.0f;
-				U_LOG_W("Legacy app (no XR_EXT_display_info): using compromise "
-				        "view scale 0.5x1.0 (3D mode '%s' is %.1fx%.1f)",
-				        mode3d->mode_name, mode3d->view_scale_x, mode3d->view_scale_y);
 			} else {
 				// Case B: use 3D mode's actual scale, stretch for 2D
 				view_scale_x = mode3d->view_scale_x;
@@ -175,8 +203,17 @@ oxr_system_fill_in(
 				info->legacy_app_tile_scaling = true;
 				info->legacy_view_scale_x = mode3d->view_scale_x;
 				info->legacy_view_scale_y = mode3d->view_scale_y;
-				U_LOG_W("Legacy app (no XR_EXT_display_info): using 3D mode '%s' "
-				        "scale %.2fx%.2f", mode3d->mode_name,
+			}
+			if (probe_only) {
+				U_LOG_I("Probe instance (no extensions enabled): provisional "
+				        "compromise view scale %.2fx%.2f computed - NOT used for "
+				        "rendering, this instance cannot create a session",
+				        view_scale_x, view_scale_y);
+			} else {
+				U_LOG_I("Instance without XR_EXT_display_info: compromise view "
+				        "scale %.2fx%.2f provisioned (3D mode '%s' is %.2fx%.2f); "
+				        "a LEGACY-session WARN fires at xrCreateSession if used",
+				        view_scale_x, view_scale_y, mode3d->mode_name,
 				        mode3d->view_scale_x, mode3d->view_scale_y);
 			}
 		}
@@ -210,7 +247,7 @@ oxr_system_fill_in(
 		h = imin(h, h_max);
 
 		if (i == 0 && info->legacy_app_tile_scaling) {
-			U_LOG_W("Legacy view[0]: raw w=%u h=%u (disp=%ux%u scale=%.2fx%.2f dbg_scale=%.2f) "
+			U_LOG_I("Compromise view[0] (provisional): raw w=%u h=%u (disp=%ux%u scale=%.2fx%.2f dbg_scale=%.2f) "
 			        "w_max=%u h_max=%u -> clamped w=%u h=%u",
 			        (uint32_t)(info->display_pixel_width * view_scale_x * scale),
 			        (uint32_t)(info->display_pixel_height * view_scale_y * scale),
