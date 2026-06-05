@@ -60,7 +60,10 @@ but together they are ~90% of the implementation.
    - `MCP_CAPTURE_MODE_PROJECTION_ONLY` (1) — atlas with only projection-class
      layers, captured at the projection-done boundary.
 
-   Driven today by **dev trigger files** (`%TEMP%\displayxr_atlas_trigger[.projection]`)
+   Driven today by **dev trigger files** (`%TEMP%\displayxr_atlas_trigger[.projection]`,
+   plus per-exe variants `displayxr_atlas_trigger.<exe>[.projection]` →
+   `displayxr_atlas.<exe>[.projection].png` that target one process when several
+   DisplayXR apps run at once — a per-exe trigger beats the global one)
    and the **MCP `capture_frame` tool** (`mcp_capture_blocking_handler`, which
    submits a request and blocks up to 3 s for the compositor thread to do the
    readback + PNG encode). Per-API readback lives in each compositor's
