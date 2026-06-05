@@ -69,19 +69,17 @@
             NativeActivity.
         -->
         <!--
-            Lock to PORTRAIT — the nubia NP02J (K68) panel's native
-            orientation (1600x2560) and the axis its lenticular runs along.
-            KEY device finding: the weave only SEPARATES (real stereo 3D —
-            confirmed by per-eye red/blue separating + the resulting eye
-            strain) when the surface is PORTRAIT. In landscape the weave does
-            not separate ("weaving not working"). So portrait is required for
-            3D. (Head-tracking sync + stereo comfort/calibration in portrait
-            are the remaining items, tuned via swap_lr / calibration.)
+            Orientation is NOT locked. The runtime + CNSDK detect the current
+            orientation and adapt the weave + face-detector axes, and re-adapt
+            on physical rotation — matching Leia-viewer behavior (confirmed:
+            the Leia viewer head-tracks correctly in landscape on this unit, so
+            the head-tracking service handles all orientations; forcing portrait
+            was our bug). configChanges keeps the NativeActivity alive across
+            rotations (the surface resizes instead of the activity recreating).
         -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:screenOrientation="portrait"
             android:configChanges="orientation|keyboardHidden|screenSize"
             android:launchMode="singleTask">
             <meta-data
