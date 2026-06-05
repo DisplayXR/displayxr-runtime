@@ -1399,7 +1399,10 @@ metal_compositor_capture_atlas_to_png(struct comp_metal_compositor *c,
 				rgba[i + 0] = bgra[i + 2];
 				rgba[i + 1] = bgra[i + 1];
 				rgba[i + 2] = bgra[i + 0];
-				rgba[i + 3] = bgra[i + 3];
+				// Force opaque: swapchain alpha is undefined for display
+				// output, and left as-is the PNG renders transparent/black
+				// (issue #425).
+				rgba[i + 3] = 255;
 			}
 			ok = stbi_write_png(path, (int)content_w, (int)content_h, 4, rgba, (int)row_pitch) != 0;
 			free(rgba);

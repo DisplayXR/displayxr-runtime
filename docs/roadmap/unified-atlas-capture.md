@@ -112,7 +112,7 @@ New header `src/external/openxr_includes/openxr/XR_EXT_atlas_capture.h`
 
 ```c
 #define XR_EXT_atlas_capture 1
-#define XR_EXT_atlas_capture_SPEC_VERSION 1
+#define XR_EXT_atlas_capture_SPEC_VERSION 2
 #define XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME "XR_EXT_atlas_capture"
 
 // Reuse the reserved 1000999xxx range (next free slot after the workspace block).
@@ -132,7 +132,7 @@ typedef struct XrAtlasCaptureInfoEXT {
     XrStructureType        type;   // XR_TYPE_ATLAS_CAPTURE_INFO_EXT
     const void* XR_MAY_ALIAS next;
     XrAtlasCaptureStageEXT  stage;
-    char                    pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_EXT]; // runtime appends "_atlas.png"
+    char                    pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_EXT]; // runtime appends "_atlas_<viewCount>_<cols>x<rows>.png"
 } XrAtlasCaptureInfoEXT;
 
 // Identical metadata block to XrWorkspaceCaptureResultEXT (see rationale below).
@@ -152,6 +152,23 @@ typedef XrResult (XRAPI_PTR *PFN_xrCaptureAtlasEXT)(
     const XrAtlasCaptureInfoEXT *info,
     XrAtlasCaptureResultEXT     *result); // result may be NULL if the caller wants only the PNG
 ```
+
+### Filename + alpha contract (SPEC_VERSION 2, issue #425)
+
+- **Suffix.** The runtime appends `_atlas_<viewCount>_<cols>x<rows>.png` to
+  `pathPrefix` (e.g. a 2-view 2×1 capture → `<prefix>_atlas_2_2x1.png`), so
+  consumers don't re-derive the atlas geometry. `viewCount` is the tile count
+  (`cols*rows` for all current layouts). Callers pass a bare `<stem>-<N>` prefix
+  and must **not** pre-bake the layout (avoids `..._2x1_atlas_2_2x1.png`). The
+  suffix is built at the EXT-contract layer — `oxr_capture.c` (in-process,
+  resolving the active rendering mode's tile layout) and
+  `comp_d3d11_service.cpp` (IPC) — **not** inside the per-API
+  `*_capture_atlas_to_png`, because the MCP `capture_frame` tool and the dev
+  trigger files write/report a verbatim full path.
+- **Opaque alpha.** Every encoder forces `A=255` before PNG write
+  (`u_image_force_opaque_rgba8`). The swapchain alpha is undefined for display
+  output (the DP/weaver ignores it); left verbatim it reads back as 0 → fully
+  transparent → renders black.
 
 Edit to `XR_EXT_spatial_workspace.h` (spec_version bump): add the second capture
 flag so the privileged path also supports stage selection.

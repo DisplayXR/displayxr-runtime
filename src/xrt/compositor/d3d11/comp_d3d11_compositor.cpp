@@ -52,6 +52,7 @@
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
+#include "util/u_image_capture.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty_interface.h"
@@ -900,25 +901,20 @@ d3d11_crop_atlas_for_dp(struct comp_d3d11_compositor *c,
 // compositor crops and sends to the DP) into a staging texture, then write
 // @p path as PNG. D3D11 renderer uses DXGI_FORMAT_R8G8B8A8_UNORM so no
 // channel swap is needed.
+// Read back the @p content_w × @p content_h top-left region of @p atlas_tex
+// (clamped to its actual size) and write @p path as an opaque RGBA8 PNG. The
+// source may be the renderer's composited atlas OR, in zero-copy present, the
+// app's own swapchain image — both already hold the laid-out multi-view atlas.
 static bool
-d3d11_compositor_capture_atlas_to_png(struct comp_d3d11_compositor *c, const char *path)
+d3d11_capture_texture_to_png(struct comp_d3d11_compositor *c,
+                             ID3D11Texture2D *atlas_tex,
+                             uint32_t content_w,
+                             uint32_t content_h,
+                             const char *path)
 {
-	ID3D11Texture2D *atlas_tex = static_cast<ID3D11Texture2D *>(
-	    comp_d3d11_renderer_get_atlas_texture(c->renderer));
-	if (atlas_tex == nullptr || c->renderer == nullptr) {
+	if (atlas_tex == nullptr || content_w == 0 || content_h == 0) {
 		return false;
 	}
-
-	uint32_t tile_columns = 1, tile_rows = 1;
-	comp_d3d11_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);
-	uint32_t view_w = 0, view_h = 0;
-	comp_d3d11_renderer_get_view_dimensions(c->renderer, &view_w, &view_h);
-	if (tile_columns == 0 || tile_rows == 0 || view_w == 0 || view_h == 0) {
-		return false;
-	}
-
-	uint32_t content_w = tile_columns * view_w;
-	uint32_t content_h = tile_rows * view_h;
 
 	D3D11_TEXTURE2D_DESC adesc;
 	atlas_tex->GetDesc(&adesc);
@@ -947,12 +943,59 @@ d3d11_compositor_capture_atlas_to_png(struct comp_d3d11_compositor *c, const cha
 		return false;
 	}
 
-	bool ok = stbi_write_png(path, (int)content_w, (int)content_h, 4,
-	                         m.pData, (int)m.RowPitch) != 0;
+	// Repack into a tightly-packed RGBA8 buffer (the mapped staging is
+	// READ-only, so we can't fix alpha in place) and force opaque: swapchain
+	// alpha is undefined for display output, and left as-is the PNG renders
+	// fully transparent/black (issue #425).
+	bool ok = false;
+	size_t tight_pitch = (size_t)content_w * 4;
+	uint8_t *tight = (uint8_t *)malloc(tight_pitch * content_h);
+	if (tight != nullptr) {
+		const uint8_t *src = (const uint8_t *)m.pData;
+		for (uint32_t y = 0; y < content_h; y++) {
+			memcpy(tight + (size_t)y * tight_pitch, src + (size_t)y * m.RowPitch, tight_pitch);
+		}
+		u_image_force_opaque_rgba8(tight, content_w, content_h, tight_pitch);
+		ok = stbi_write_png(path, (int)content_w, (int)content_h, 4, tight, (int)tight_pitch) != 0;
+		free(tight);
+	}
 
 	c->context->Unmap(staging, 0);
 	staging->Release();
 	return ok;
+}
+
+// Resolve the active content region (tile_columns·view_w × tile_rows·view_h)
+// from the renderer. Returns false if the renderer hasn't been sized yet.
+static bool
+d3d11_compositor_content_dims(struct comp_d3d11_compositor *c, uint32_t *out_w, uint32_t *out_h)
+{
+	if (c->renderer == nullptr) {
+		return false;
+	}
+	uint32_t tile_columns = 1, tile_rows = 1;
+	comp_d3d11_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);
+	uint32_t view_w = 0, view_h = 0;
+	comp_d3d11_renderer_get_view_dimensions(c->renderer, &view_w, &view_h);
+	if (tile_columns == 0 || tile_rows == 0 || view_w == 0 || view_h == 0) {
+		return false;
+	}
+	*out_w = tile_columns * view_w;
+	*out_h = tile_rows * view_h;
+	return true;
+}
+
+// Capture from the renderer's composited atlas (non-zero-copy frames).
+static bool
+d3d11_compositor_capture_atlas_to_png(struct comp_d3d11_compositor *c, const char *path)
+{
+	ID3D11Texture2D *atlas_tex = static_cast<ID3D11Texture2D *>(
+	    comp_d3d11_renderer_get_atlas_texture(c->renderer));
+	uint32_t content_w = 0, content_h = 0;
+	if (atlas_tex == nullptr || !d3d11_compositor_content_dims(c, &content_w, &content_h)) {
+		return false;
+	}
+	return d3d11_capture_texture_to_png(c, atlas_tex, content_w, content_h, path);
 }
 
 // Service a pending MCP capture_frame request — thin wrapper around
@@ -970,6 +1013,54 @@ d3d11_compositor_dispatch_capture(struct comp_d3d11_compositor *c, uint32_t mode
 		        c->capture_intent.mode, c->capture_intent.path);
 	} else {
 		U_LOG_W("Atlas capture failed (mode=%u path=%s)",
+		        c->capture_intent.mode, c->capture_intent.path);
+	}
+	u_capture_intent_complete(&c->capture_intent, &c->mcp_capture, ok);
+}
+
+// Zero-copy capture: in zero-copy present the app's own swapchain image IS the
+// laid-out multi-view atlas (that's why it qualifies), and the normal composite
+// passes — and their PROJECTION_ONLY/POST_COMPOSE dispatch points — are skipped,
+// so a pending capture would otherwise silently produce no PNG (issue #425: the
+// Unity path submits a single double-wide projection layer that hits zero-copy,
+// unlike the native/Unreal apps). Read directly from the same swapchain SRV the
+// DP receives — NOT by forcing a re-composite, which re-projects the already-
+// tiled texture and corrupts it. Stage selector is irrelevant here: zero-copy
+// has a single projection layer and no window-space layers, so PROJECTION_ONLY
+// and POST_COMPOSE are identical.
+static void
+d3d11_compositor_dispatch_capture_zerocopy(struct comp_d3d11_compositor *c, void *zc_srv)
+{
+	if (!c->capture_intent.pending || zc_srv == nullptr) {
+		return;
+	}
+	ID3D11ShaderResourceView *srv = static_cast<ID3D11ShaderResourceView *>(zc_srv);
+	ID3D11Resource *resource = nullptr;
+	srv->GetResource(&resource);
+	ID3D11Texture2D *zc_tex = static_cast<ID3D11Texture2D *>(resource);
+
+	// Capture the whole swapchain texture: zero-copy is only eligible when the
+	// app's swapchain matches the active mode's atlas dimensions exactly
+	// (u_tiling_can_zero_copy), so the entire texture IS the multi-view atlas.
+	// Do NOT use the renderer's view/tile dims here — for a legacy app those are
+	// the 2D/3D compromise size (e.g. 1200×1080), which is smaller than the
+	// app's real per-view render (e.g. 1920×1080) and would crop the atlas
+	// (issue #425, the Unity stretched/cropped-PNG case).
+	bool ok = false;
+	if (zc_tex != nullptr) {
+		D3D11_TEXTURE2D_DESC zdesc;
+		zc_tex->GetDesc(&zdesc);
+		ok = d3d11_capture_texture_to_png(c, zc_tex, zdesc.Width, zdesc.Height,
+		                                  c->capture_intent.path);
+	}
+	if (resource != nullptr) {
+		resource->Release();
+	}
+	if (ok) {
+		U_LOG_I("Atlas captured (zero-copy, mode=%u) to %s",
+		        c->capture_intent.mode, c->capture_intent.path);
+	} else {
+		U_LOG_W("Atlas capture failed (zero-copy, mode=%u path=%s)",
 		        c->capture_intent.mode, c->capture_intent.path);
 	}
 	u_capture_intent_complete(&c->capture_intent, &c->mcp_capture, ok);
@@ -1198,6 +1289,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
+
 	// Wait for GPU completion of all projection swapchain textures before reading.
 	//
 	// barrier_image(TO_COMP) at xrReleaseSwapchainImage inserts a Flush() then
@@ -1275,6 +1367,14 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				}
 			}
 		}
+	}
+
+	// Zero-copy capture: the app's swapchain (synced by the GPU-completion
+	// wait above) already holds the atlas the DP will present, and the normal
+	// dispatch points below are gated behind !zero_copy — so service a pending
+	// capture here, reading the swapchain directly (issue #425).
+	if (zero_copy) {
+		d3d11_compositor_dispatch_capture_zerocopy(c, zc_srv);
 	}
 
 	// Render layers to atlas texture (skip if zero-copy). Split into a

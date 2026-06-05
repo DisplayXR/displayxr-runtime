@@ -100,14 +100,17 @@ std::string MakeCapturePath(const std::string& stem,
 std::string MakeCaptureAtlasPrefix(const std::string& stem,
                                    uint32_t cols, uint32_t rows) {
     std::string dir = PicturesDirectory();
-    // xrCaptureAtlasEXT appends "_atlas.png"; number against that final name so
-    // repeats accumulate rather than overwrite (the legacy "_CxR.png" name space
-    // is scanned separately, so the two never clobber each other's count).
+    // The runtime owns the layout tokens: it appends
+    // "_atlas_<viewCount>_<cols>x<rows>.png" (viewCount == cols*rows). We pass
+    // just "<stem>-<N>" so the final name isn't duplicated. Number against that
+    // final name so repeats accumulate rather than overwrite (the legacy
+    // "_CxR.png" name space is scanned separately, so the two never clobber
+    // each other's count).
     char atlasSuffix[80];
-    snprintf(atlasSuffix, sizeof(atlasSuffix), "_%ux%u_atlas.png", cols, rows);
+    snprintf(atlasSuffix, sizeof(atlasSuffix), "_atlas_%u_%ux%u.png", cols * rows, cols, rows);
     int n = NextCaptureNumSuffix(dir, stem, atlasSuffix);
     char tail[256];
-    snprintf(tail, sizeof(tail), "%s-%d_%ux%u", stem.c_str(), n, cols, rows);
+    snprintf(tail, sizeof(tail), "%s-%d", stem.c_str(), n);
     return dir.empty() ? std::string(tail) : (dir + "/" + tail);
 }
 

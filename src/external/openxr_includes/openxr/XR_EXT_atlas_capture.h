@@ -27,7 +27,10 @@ extern "C" {
 #endif
 
 #define XR_EXT_atlas_capture 1
-#define XR_EXT_atlas_capture_SPEC_VERSION 1
+// SPEC_VERSION 2: the runtime appends "_atlas_<viewCount>_<cols>x<rows>.png"
+// (was a flat "_atlas.png" in v1), and the encoded PNG is always opaque
+// (alpha forced to 255). See issue #425.
+#define XR_EXT_atlas_capture_SPEC_VERSION 2
 #define XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME "XR_EXT_atlas_capture"
 
 // Reserved 1000999xxx range, next free slot after the workspace block
@@ -57,9 +60,13 @@ typedef enum XrAtlasCaptureStageEXT {
 /*!
  * @brief Request struct for xrCaptureAtlasEXT.
  *
- * The runtime appends a format-specific suffix (e.g. "_atlas.png") to
- * @c pathPrefix. The prefix is an in-struct char array (not a separately
- * allocated string) so the same struct can cross the IPC schema unchanged.
+ * The runtime appends a layout-encoded suffix
+ * "_atlas_<viewCount>_<cols>x<rows>.png" to @c pathPrefix (e.g. a 2-view 2x1
+ * capture → "<pathPrefix>_atlas_2_2x1.png"), so consumers don't re-derive the
+ * multi-view atlas geometry. Callers should pass a bare prefix (e.g.
+ * "<stem>-<N>") and not pre-bake the layout, to avoid duplicating it. The
+ * prefix is an in-struct char array (not a separately allocated string) so the
+ * same struct can cross the IPC schema unchanged.
  */
 typedef struct XrAtlasCaptureInfoEXT {
     XrStructureType          type;   //!< Must be XR_TYPE_ATLAS_CAPTURE_INFO_EXT
@@ -72,9 +79,10 @@ typedef struct XrAtlasCaptureInfoEXT {
  * @brief Result returned by xrCaptureAtlasEXT.
  *
  * Same metadata block as XrWorkspaceCaptureResultEXT minus @c viewsWritten.
- * For in-process sessions @c eyeLeftM / @c eyeRightM (and @c tileColumns /
- * @c tileRows) may be zero — eye-pose plumbing currently stops at the display
- * processor and is only surfaced on the IPC/workspace path.
+ * @c tileColumns / @c tileRows are populated on both paths (from the active
+ * rendering mode in-process). For in-process sessions @c eyeLeftM /
+ * @c eyeRightM may still be zero — eye-pose plumbing currently stops at the
+ * display processor and is only surfaced on the IPC/workspace path.
  */
 typedef struct XrAtlasCaptureResultEXT {
     XrStructureType    type;   //!< Must be XR_TYPE_ATLAS_CAPTURE_RESULT_EXT
@@ -96,8 +104,11 @@ typedef struct XrAtlasCaptureResultEXT {
  * @brief Capture the multi-view atlas the runtime composes for this session.
  *
  * The runtime reads the compositor's own atlas at @c info->stage and writes it
- * to a PNG named after @c info->pathPrefix (the runtime appends "_atlas.png").
- * If @c result is non-NULL it is filled with metadata describing the capture.
+ * to a PNG named after @c info->pathPrefix (the runtime appends
+ * "_atlas_<viewCount>_<cols>x<rows>.png"). The encoded PNG is always opaque
+ * (alpha forced to 255 — the swapchain's alpha is undefined for display
+ * output). If @c result is non-NULL it is filled with metadata describing the
+ * capture.
  *
  * Timing: the call is non-blocking and latches the request; the readback runs
  * at the next composed frame (the caller's next xrEndFrame), so the PNG exists

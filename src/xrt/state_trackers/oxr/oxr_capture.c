@@ -108,11 +108,32 @@ capture_inprocess(struct oxr_logger *log,
                   const XrAtlasCaptureInfoEXT *info,
                   XrAtlasCaptureResultEXT *result)
 {
-	// The runtime appends "_atlas.png" — same suffix convention as the
-	// workspace capture path.
-	char path[XR_ATLAS_CAPTURE_PATH_MAX_EXT + 16];
-	int n = snprintf(path, sizeof(path), "%.*s_atlas.png", (int)(XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1),
-	                 info->pathPrefix);
+	// Resolve the active rendering mode's tile layout so the suffix can encode
+	// the atlas geometry (issue #425). This also surfaces tileColumns/tileRows
+	// on the in-process path, which previously reported zero.
+	struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
+	uint32_t cols = 0, rows = 0;
+	if (head != NULL && head->hmd != NULL) {
+		uint32_t idx = head->hmd->active_rendering_mode_index;
+		if (idx < head->rendering_mode_count) {
+			cols = head->rendering_modes[idx].tile_columns;
+			rows = head->rendering_modes[idx].tile_rows;
+		}
+	}
+	if (cols == 0) {
+		cols = 1;
+	}
+	if (rows == 0) {
+		rows = 1;
+	}
+	uint32_t view_count = cols * rows;
+
+	// The runtime appends "_atlas_<viewCount>_<cols>x<rows>.png" so consumers
+	// don't re-derive the multi-view atlas geometry — same suffix the workspace
+	// (IPC) capture path emits.
+	char path[XR_ATLAS_CAPTURE_PATH_MAX_EXT + 32];
+	int n = snprintf(path, sizeof(path), "%.*s_atlas_%u_%ux%u.png",
+	                 (int)(XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1), info->pathPrefix, view_count, cols, rows);
 	if (n <= 0 || (size_t)n >= sizeof(path)) {
 		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "xrCaptureAtlasEXT: path prefix too long");
 	}
@@ -137,11 +158,11 @@ capture_inprocess(struct oxr_logger *log,
 		// Per-view recommended dims approximate the captured eye-tile size.
 		result->eyeWidth = sci->views[0].recommended.width_pixels;
 		result->eyeHeight = sci->views[0].recommended.height_pixels;
-		// Tile layout and eye poses are not surfaced to oxr on the in-process
-		// path (no accessor; eye-pose plumbing stops at the display processor).
-		// Left zero; the IPC path below returns them. See the W6 design doc.
-		result->tileColumns = 0;
-		result->tileRows = 0;
+		// Tile layout from the active rendering mode (resolved above). Eye
+		// poses are still not surfaced on the in-process path — eye-pose
+		// plumbing stops at the display processor; the IPC path returns them.
+		result->tileColumns = cols;
+		result->tileRows = rows;
 		result->displayWidthM = sci->display_width_m;
 		result->displayHeightM = sci->display_height_m;
 		result->eyeLeftM[0] = result->eyeLeftM[1] = result->eyeLeftM[2] = 0.0f;

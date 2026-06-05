@@ -33,6 +33,7 @@
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
+#include "util/u_image_capture.h"
 #include "util/u_hud.h"
 #include <displayxr_mcp/mcp_capture.h>
 
@@ -1060,6 +1061,9 @@ d3d12_compositor_capture_atlas_to_png(struct comp_d3d12_compositor *c, const cha
 				       rb_pixels + (size_t)y * row_pitch,
 				       tight_pitch);
 			}
+			// Swapchain alpha is undefined for display output — force opaque
+			// so the PNG doesn't render fully transparent/black (issue #425).
+			u_image_force_opaque_rgba8(tight, content_w, content_h, tight_pitch);
 			ok = stbi_write_png(path, (int)content_w, (int)content_h, 4,
 			                    tight, (int)tight_pitch) != 0;
 			free(tight);

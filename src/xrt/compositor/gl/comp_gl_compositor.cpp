@@ -32,6 +32,7 @@
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
+#include "util/u_image_capture.h"
 #include "util/u_time.h"
 #include "util/u_hud.h"
 #include <displayxr_mcp/mcp_capture.h>
@@ -1132,6 +1133,10 @@ gl_compositor_capture_atlas_to_png(struct comp_gl_compositor *c, const char *pat
 		       row_pitch);
 	}
 	free(bottom_up);
+
+	// Swapchain alpha is undefined for display output — force opaque so the
+	// PNG doesn't render fully transparent/black (issue #425).
+	u_image_force_opaque_rgba8(top_down, content_w, content_h, row_pitch);
 
 	bool ok = stbi_write_png(path, (int)content_w, (int)content_h, 4, top_down, (int)row_pitch) != 0;
 	free(top_down);

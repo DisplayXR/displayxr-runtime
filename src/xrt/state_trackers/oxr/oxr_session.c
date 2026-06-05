@@ -2764,6 +2764,22 @@ oxr_session_create(struct oxr_logger *log,
 	    (xsi.external_window_handle != NULL || xsi.readback_callback != NULL || xsi.shared_texture_handle != NULL);
 	sess->is_bridge_relay = xsi.is_bridge_relay;
 
+#ifdef OXR_HAVE_EXT_display_info
+	// Authoritative legacy WARN: fires only when the compromise view scale
+	// computed in oxr_system_fill_in() will actually drive rendering — i.e.
+	// a real session exists on an instance without XR_EXT_display_info.
+	// Engine probe instances (created with zero extensions, then destroyed)
+	// never reach this point, so they no longer emit a misleading "Legacy
+	// app" WARN at xrCreateInstance.
+	if (!sys->inst->extensions.EXT_display_info && sys->xsysc != NULL &&
+	    sys->xsysc->info.legacy_app_tile_scaling) {
+		U_LOG_W("LEGACY session: app did not enable XR_EXT_display_info - "
+		        "compromise view scale %.2fx%.2f (%ux%u per view) is in effect",
+		        sys->xsysc->info.legacy_view_scale_x, sys->xsysc->info.legacy_view_scale_y,
+		        sys->xsysc->info.legacy_view_width_pixels, sys->xsysc->info.legacy_view_height_pixels);
+	}
+#endif
+
 #ifdef XRT_OS_WINDOWS
 	// GH #227 Tier 0: when workspace mode hid the app HWND above (the
 	// ShowWindow(SW_HIDE) site at line ~2669), install the CBT hook that
