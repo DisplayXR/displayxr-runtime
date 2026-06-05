@@ -27,6 +27,7 @@
 #include <displayxr_mcp/mcp_log_ring.h>
 
 #include "util/u_logging.h"
+#include "util/u_file_logging.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -866,8 +867,16 @@ oxr_mcp_log_sink(const char *file,
 {
 	(void)file;
 	(void)line;
-	(void)func;
 	(void)data;
+
+	// Tee into the per-process file log first (#433): replacing the file
+	// sink with a ring-only sink made DisplayXR_<exe>.*.log stop growing at
+	// xrCreateInstance, hiding every compositor diagnostic from field debugging.
+	va_list args_copy;
+	va_copy(args_copy, args);
+	u_file_logging_write_va(func, level, fmt, args_copy);
+	va_end(args_copy);
+
 	mcp_log_ring_append(xlate_log_level(level), fmt, args);
 }
 
@@ -1162,9 +1171,9 @@ oxr_mcp_tools_register_all(void)
 	// Only hijack the global log sink when MCP is actually enabled; otherwise
 	// leave whatever sink the runtime had already installed (typically
 	// `file_logging_sink` so per-process .log files keep growing past
-	// xrCreateInstance). Without this gate the MCP ring sink silently swallows
-	// every U_LOG_* call once the OXR instance is created, even with MCP off,
-	// breaking standalone diagnostics like [CLIENT_FRAME_NS].
+	// xrCreateInstance). The MCP sink tees into the file log before appending
+	// to the ring (#433), so even with MCP on the per-process .log stays
+	// complete for field debugging.
 	if (mcp_check_env_or(oxr_mcp_capability_enabled())) {
 		u_log_set_sink(oxr_mcp_log_sink, NULL);
 	}
