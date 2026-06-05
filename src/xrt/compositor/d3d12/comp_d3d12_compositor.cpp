@@ -33,6 +33,7 @@
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
+#include "util/u_capture_dims.h"
 #include "util/u_image_capture.h"
 #include "util/u_hud.h"
 #include <displayxr_mcp/mcp_capture.h>
@@ -945,6 +946,33 @@ d3d12_crop_atlas_for_dp(struct comp_d3d12_compositor *c,
  *
  */
 
+// u_capture_dims provider: report the renderer's CURRENT window-scaled per-view
+// dims + tile layout so xrCaptureAtlasEXT can fill XrAtlasCaptureResultEXT with
+// what the capture actually writes, not the nominal system info (#431).
+static bool
+d3d12_compositor_capture_dims_provider(void *userdata,
+                                       uint32_t *out_view_w,
+                                       uint32_t *out_view_h,
+                                       uint32_t *out_tile_cols,
+                                       uint32_t *out_tile_rows)
+{
+	struct comp_d3d12_compositor *c = static_cast<struct comp_d3d12_compositor *>(userdata);
+	if (c == nullptr || c->renderer == nullptr) {
+		return false;
+	}
+	uint32_t vw = 0, vh = 0, cols = 1, rows = 1;
+	comp_d3d12_renderer_get_view_dimensions(c->renderer, &vw, &vh);
+	comp_d3d12_renderer_get_tile_layout(c->renderer, &cols, &rows);
+	if (vw == 0 || vh == 0) {
+		return false;
+	}
+	*out_view_w = vw;
+	*out_view_h = vh;
+	*out_tile_cols = cols;
+	*out_tile_rows = rows;
+	return true;
+}
+
 // Copy the content region of the renderer's atlas (tile_columns × view_width
 // by tile_rows × view_height — what the app actually wrote, same region the
 // compositor crops and sends to the DP) into a READBACK heap buffer, then
@@ -1825,6 +1853,7 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 	U_LOG_I("Destroying D3D12 compositor");
 
 	// Uninstall MCP capture hook before the GPU resources go away.
+	u_capture_dims_set_provider(NULL, c);
 	mcp_capture_uninstall();
 	mcp_capture_fini(&c->mcp_capture);
 
@@ -2226,6 +2255,9 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 		d3d12_compositor_destroy(&c->base.base);
 		return xret;
 	}
+
+	// Expose current window-scaled capture dims to xrCaptureAtlasEXT (#431).
+	u_capture_dims_set_provider(d3d12_compositor_capture_dims_provider, c);
 
 	// Initialize layer accumulator
 	memset(&c->layer_accum, 0, sizeof(c->layer_accum));
