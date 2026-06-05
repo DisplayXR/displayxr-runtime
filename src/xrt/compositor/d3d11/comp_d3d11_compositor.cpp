@@ -1527,10 +1527,19 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			uint32_t tile_columns, tile_rows;
 			comp_d3d11_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);
 
-			// Crop atlas to content dimensions before passing to DP
+			// Crop the renderer's atlas to content dims before passing to the
+			// DP (the renderer allocates a worst-case atlas; content sits
+			// top-left at the content stride). Do NOT crop a zero-copy atlas:
+			// the app's swapchain is already a complete, correctly-strided
+			// multi-view atlas (the DP derives tile stride from atlas_width /
+			// tile_columns), so a top-left crop to the window-scaled width
+			// would slice the tiles and weave them misaligned — big disparity
+			// (#431 follow-up: the crop must not touch the zero-copy path).
 			uint32_t content_w = tile_columns * view_width;
 			uint32_t content_h = tile_rows * view_height;
-			atlas_srv = d3d11_crop_atlas_for_dp(c, atlas_srv, content_w, content_h);
+			if (!zero_copy) {
+				atlas_srv = d3d11_crop_atlas_for_dp(c, atlas_srv, content_w, content_h);
+			}
 
 			// Weave directly into the shared texture at the canvas sub-rect.
 			// The SR weaver handles backbuffer > HWND correctly as long as the
@@ -1598,10 +1607,16 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		uint32_t tile_columns, tile_rows;
 		comp_d3d11_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);
 
-		// Crop atlas to content dimensions before passing to DP
+		// Crop the renderer's atlas to content dims before passing to the DP;
+		// never crop a zero-copy atlas — the app's swapchain is already a
+		// complete, correctly-strided multi-view atlas, and a top-left crop to
+		// the window-scaled width would slice the tiles and weave them
+		// misaligned (big disparity). See the offscreen path above (#431).
 		uint32_t content_w = tile_columns * view_width;
 		uint32_t content_h = tile_rows * view_height;
-		atlas_srv = d3d11_crop_atlas_for_dp(c, atlas_srv, content_w, content_h);
+		if (!zero_copy) {
+			atlas_srv = d3d11_crop_atlas_for_dp(c, atlas_srv, content_w, content_h);
+		}
 
 		uint32_t target_width, target_height;
 		comp_d3d11_target_get_dimensions(c->target, &target_width, &target_height);
