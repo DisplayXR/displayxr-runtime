@@ -21,6 +21,7 @@
  */
 
 #include "target_plugin_loader.h"
+#include "target_plugin_preload_sanitize.h"
 
 #include "xrt/xrt_plugin.h"
 #include "xrt/xrt_compositor.h"
@@ -310,6 +311,16 @@ load_and_probe_one(const struct plugin_entry *e,
 	if (out_version != NULL) {
 		*out_version = 0;
 	}
+
+	// Pre-load any dependency whose unwind data would crash host-engine
+	// module tracers during this LoadLibrary (issue #434) — loaded from a
+	// path those tracers' filters skip, so the buggy parse never runs.
+	target_plugin_sanitized_preload(e->binary_path);
+
+	// One-shot breadcrumb: a host-side crash during the load below (DLL
+	// notification callbacks run host code) leaves this as the last line
+	// in the per-app log, naming the in-flight binary (issue #434).
+	U_LOG_W("plugin loader:   %s: loading plug-in binary %ls", e->id, e->binary_path);
 
 	HMODULE dll = LoadLibraryExW(e->binary_path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
 	if (dll == NULL) {
