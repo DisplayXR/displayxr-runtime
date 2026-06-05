@@ -371,10 +371,37 @@ struct xrt_plugin_host_iface
 	uint32_t host_api_version;
 
 	/*!
+	 * Return the host's Android `JavaVM *` (cast to `void *`), or NULL if
+	 * the host has none (non-Android runtime, or the app never supplied it
+	 * via `XrInstanceCreateInfoAndroidKHR` / `XrLoaderInitInfoAndroidKHR`).
+	 *
+	 * Android plug-ins need the host's `JavaVM` to initialize vendor SDKs
+	 * (e.g. CNSDK's `PlatformInitArgs.javaVM`). A plug-in that statically
+	 * links the runtime's `aux_android` ends up with its own *private*,
+	 * never-populated copy of the VM globals (hidden-visibility binds
+	 * locally), so it MUST obtain the VM through this host callback rather
+	 * than calling `android_globals_get_vm()` itself.
+	 *
+	 * Carved out of the former `reserved[]` block: `struct_size` is
+	 * unchanged and the slot was previously zero-initialized, so older
+	 * plug-ins (which never read it) are unaffected and no
+	 * @ref XRT_PLUGIN_API_VERSION_CURRENT bump is needed. Plug-ins MUST
+	 * NULL-check before calling.
+	 */
+	void *(*get_android_vm)(void);
+
+	/*!
+	 * Return the host's Android Activity `jobject` (as `void *`), or NULL.
+	 * Companion to @ref get_android_vm; same back-compat contract. Plug-ins
+	 * MUST NULL-check before calling.
+	 */
+	void *(*get_android_activity)(void);
+
+	/*!
 	 * Reserved space for forward-compatible host-supplied callbacks.
 	 * Plug-ins MUST NOT dereference any reserved slot.
 	 */
-	void *reserved[14];
+	void *reserved[12];
 };
 
 /*!

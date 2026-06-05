@@ -404,6 +404,12 @@ load_and_probe_one(const struct plugin_entry *e,
 	struct xrt_plugin_host_iface host = {0};
 	host.struct_size = (uint32_t)sizeof(struct xrt_plugin_host_iface);
 	host.host_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
+#if defined(XRT_OS_ANDROID)
+	// Android plug-ins need the host's JavaVM/activity for vendor-SDK init
+	// (their own statically-linked aux_android copy is never populated).
+	host.get_android_vm = plugin_host_get_android_vm;
+	host.get_android_activity = android_globals_get_activity;
+#endif
 
 	struct xrt_plugin_iface *iface = NULL;
 	uint32_t plugin_version = 0;
@@ -780,6 +786,8 @@ target_plugin_clear_preferred(void)
 
 #elif defined(XRT_OS_ANDROID)
 
+#include "android/android_globals.h"
+
 #include <dirent.h>
 #include <dlfcn.h>
 #include <limits.h>
@@ -793,6 +801,20 @@ target_plugin_clear_preferred(void)
  * the sim_display fallback with plenty of headroom.
  */
 #define MAX_PLUGIN_ENTRIES 16
+
+/*
+ * Host-iface callback: hand the plug-in the runtime's Android `JavaVM *`
+ * (as `void *`). A plug-in that statically links aux_android has its own
+ * private, never-populated VM globals, so it can't call
+ * `android_globals_get_vm()` itself — it must go through the host iface.
+ * Thin cast wrapper so the function pointer matches the `void *(*)(void)`
+ * field type (`android_globals_get_activity` already returns `void *`).
+ */
+static void *
+plugin_host_get_android_vm(void)
+{
+	return (void *)android_globals_get_vm();
+}
 
 /*
  * Discovery contract: see docs/specs/runtime/plugin-discovery.md §3.2.
@@ -1091,6 +1113,12 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 	struct xrt_plugin_host_iface host = {0};
 	host.struct_size = (uint32_t)sizeof(struct xrt_plugin_host_iface);
 	host.host_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
+#if defined(XRT_OS_ANDROID)
+	// Android plug-ins need the host's JavaVM/activity for vendor-SDK init
+	// (their own statically-linked aux_android copy is never populated).
+	host.get_android_vm = plugin_host_get_android_vm;
+	host.get_android_activity = android_globals_get_activity;
+#endif
 
 	struct xrt_plugin_iface *iface = NULL;
 	uint32_t plugin_version = 0;
@@ -1578,6 +1606,12 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 	struct xrt_plugin_host_iface host = {0};
 	host.struct_size = (uint32_t)sizeof(struct xrt_plugin_host_iface);
 	host.host_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
+#if defined(XRT_OS_ANDROID)
+	// Android plug-ins need the host's JavaVM/activity for vendor-SDK init
+	// (their own statically-linked aux_android copy is never populated).
+	host.get_android_vm = plugin_host_get_android_vm;
+	host.get_android_activity = android_globals_get_activity;
+#endif
 
 	struct xrt_plugin_iface *iface = NULL;
 	uint32_t plugin_version = 0;
