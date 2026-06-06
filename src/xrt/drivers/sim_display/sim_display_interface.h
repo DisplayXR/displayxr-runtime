@@ -92,6 +92,35 @@ uint32_t
 sim_display_get_view_count(void);
 
 /*!
+ * Dev-only fake-tracking toggle (#441): `SIM_DISPLAY_FAKE_TRACKING=1`.
+ *
+ * sim_display has no real eye tracker — by default it advertises
+ * `supported_eye_tracking_modes = 0`, leaves every rendering mode untracked
+ * (`mode_flags = 0`), and its DPs report `is_tracking = false`. This toggle
+ * re-enables MANUAL_BIT + tracked 3D modes so the MANUAL code path and
+ * XrEventDataEyeTrackingStateChangedEXT can be exercised without hardware.
+ *
+ * @return True iff the env toggle is set (cached on first call).
+ * @ingroup drv_sim_display
+ */
+bool
+sim_display_fake_tracking_enabled(void);
+
+/*!
+ * The simulated per-frame tracking state (#441).
+ *
+ * False when the fake-tracking toggle is off (honest: sim never tracks).
+ * When on: true, or a square wave if `SIM_DISPLAY_FAKE_TRACKING_PERIOD_MS=N`
+ * is also set — flips every N ms to exercise tracking-loss/recovery edges
+ * and the tracking-state-changed event.
+ *
+ * @return The simulated is_tracking value for this instant.
+ * @ingroup drv_sim_display
+ */
+bool
+sim_display_fake_tracking_is_tracking(void);
+
+/*!
  * Set the view count for the active rendering mode.
  *
  * Thread-safe (atomic). Called when the rendering mode changes.
