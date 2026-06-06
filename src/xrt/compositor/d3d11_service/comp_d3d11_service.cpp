@@ -12698,6 +12698,28 @@ comp_d3d11_service_set_focused_slot(struct xrt_system_compositor *xsysc, int slo
 	}
 }
 
+extern "C" int
+comp_d3d11_service_get_focused_slot(struct xrt_system_compositor *xsysc)
+{
+	// Read-side counterpart of the setter above. The compositor's
+	// focused_slot is the workspace focus source of truth — every focus
+	// mutation path updates it (both xrSetWorkspaceFocusedClientEXT id
+	// forms incl. capture clients, the clear path, click-to-focus, and
+	// visibility-hide of the focused slot) — so the IPC layer's
+	// get_focused_client derives its answer from here rather than from
+	// active_client_index (which capture clients never touch).
+	if (xsysc == nullptr) {
+		return -1;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (!sys->workspace_mode || mc == nullptr) {
+		return -1;
+	}
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	return mc->focused_slot;
+}
+
 extern "C" void
 comp_d3d11_service_set_client_modal_state(struct xrt_system_compositor *xsysc, int slot, bool is_open)
 {
@@ -13204,6 +13226,96 @@ comp_d3d11_service_get_capture_client_window_pose(struct xrt_system_compositor *
 	if (out_width_m) *out_width_m = mc->clients[slot_index].window_width_m;
 	if (out_height_m) *out_height_m = mc->clients[slot_index].window_height_m;
 
+	return true;
+}
+
+bool
+comp_d3d11_service_set_capture_client_visibility(struct xrt_system_compositor *xsysc,
+                                                  int slot_index,
+                                                  bool visible)
+{
+	if (xsysc == nullptr) {
+		return false;
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (!sys->workspace_mode || sys->multi_comp == nullptr) {
+		return false;
+	}
+
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (slot_index < 0 || slot_index >= D3D11_MULTI_MAX_CLIENTS) {
+		return false;
+	}
+
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+
+	if (!mc->clients[slot_index].active) {
+		return false;
+	}
+
+	// Same semantics as the by-xc setter above (#307 slice B): `minimized`
+	// is purely the composite gate; the controller owns the user-minimize
+	// vs maximize-hide distinction. Slot-addressed and type-agnostic, like
+	// set_capture_client_window_pose.
+	mc->clients[slot_index].minimized = !visible;
+	U_LOG_W("Workspace: set_visibility slot %d visible=%d (slot-addressed)", slot_index, visible);
+
+	if (!visible && slot_index == mc->focused_slot) {
+		// ADR-018: hiding the focused client clears focus for forwarding
+		// safety; the controller picks the successor.
+		mc->focused_slot = -1;
+		multi_compositor_update_input_forward(mc);
+	}
+	return true;
+}
+
+bool
+comp_d3d11_service_get_capture_client_info(struct xrt_system_compositor *xsysc,
+                                            int slot_index,
+                                            char *out_name,
+                                            size_t name_cap,
+                                            uint32_t *out_pid,
+                                            bool *out_visible,
+                                            bool *out_focused)
+{
+	if (xsysc == nullptr) {
+		return false;
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (!sys->workspace_mode || sys->multi_comp == nullptr) {
+		return false;
+	}
+
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (slot_index < 0 || slot_index >= D3D11_MULTI_MAX_CLIENTS) {
+		return false;
+	}
+
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+
+	struct d3d11_multi_client_slot *slot = &mc->clients[slot_index];
+	if (!slot->active || slot->client_type != CLIENT_TYPE_CAPTURE) {
+		return false;
+	}
+
+	if (out_name != nullptr && name_cap > 0) {
+		snprintf(out_name, name_cap, "%s", slot->app_name);
+	}
+	if (out_pid != nullptr) {
+		DWORD pid = 0;
+		if (slot->app_hwnd != nullptr && IsWindow(slot->app_hwnd)) {
+			GetWindowThreadProcessId(slot->app_hwnd, &pid);
+		}
+		*out_pid = (uint32_t)pid;
+	}
+	if (out_visible != nullptr) {
+		*out_visible = !slot->minimized;
+	}
+	if (out_focused != nullptr) {
+		*out_focused = (slot_index == mc->focused_slot);
+	}
 	return true;
 }
 

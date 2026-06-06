@@ -13,10 +13,8 @@
 //     set/get focused client (Phase 2.D) ->
 //     enumerate input events (count-query) (Phase 2.D) ->
 //     enable/disable pointer capture (Phase 2.D) ->
-//     create chrome swapchain + acquire/wait/clear/release one image ->
-//     set chrome layout with auto-anchor + 2 hit regions (spec_version 8) ->
+//     chrome-on-capture documented rejection (captures carry no chrome) ->
 //     acquire wakeup event handle (spec_version 8) ->
-//     destroy chrome swapchain ->
 //     enumerate workspace clients + get client info (Phase 2.I-prequel) ->
 //     capture workspace frame (Phase 2.I-prequel) ->
 //     remove capture client ->
@@ -304,12 +302,9 @@ run_workspace_test()
 	}
 	std::printf("INFO: added capture client id=%u\n", (unsigned)clientId);
 
-	// Window pose + visibility smoke (Phase 2.C). Whether the captured
-	// HWND is treated as a positionable workspace client is a runtime
-	// decision; we expect either XR_SUCCESS or a documented error code
-	// (typically XR_ERROR_VALIDATION_FAILURE if the slot isn't mapped to
-	// a positionable client). Either response proves the dispatch path
-	// reaches the IPC layer end-to-end.
+	// Window pose + visibility smoke (Phase 2.C). Capture clients are
+	// full positionable workspace clients (slot-addressed via their
+	// 1000+slot id) — pose set/get and visibility set must all succeed.
 	{
 		XrPosef testPose = {};
 		testPose.orientation.w = 1.0f; // identity
@@ -326,10 +321,13 @@ run_workspace_test()
 			            readback.position.y, readback.position.z, w, h);
 		}
 
-		XrResult vr = pfnSetClientVisibility(session, clientId, XR_FALSE);
-		std::printf("[xrSetWorkspaceClientVisibilityEXT(FALSE)   ] %s\n", xr_result_str(vr));
-		vr = pfnSetClientVisibility(session, clientId, XR_TRUE);
-		std::printf("[xrSetWorkspaceClientVisibilityEXT(TRUE)    ] %s\n", xr_result_str(vr));
+		// Visibility round-trip: capture clients are slot-addressed in the
+		// runtime (no canonical IPC id), and the visibility handler routes
+		// 1000+slot ids to the by-slot setter — both calls must succeed.
+		CHECK_XR(pfnSetClientVisibility(session, clientId, XR_FALSE),
+		         "xrSetWorkspaceClientVisibilityEXT(FALSE)");
+		CHECK_XR(pfnSetClientVisibility(session, clientId, XR_TRUE),
+		         "xrSetWorkspaceClientVisibilityEXT(TRUE)");
 
 		// Cursor-depth smoke (spec_version 22): the runtime raycast +
 		// xrWorkspaceHitTestEXT were removed; the controller now owns the
@@ -352,6 +350,7 @@ run_workspace_test()
 		if (focused != clientId) {
 			std::printf("FAIL: focused-client roundtrip mismatch (got %u, set %u)\n",
 			            (unsigned)focused, (unsigned)clientId);
+			return XR_ERROR_RUNTIME_FAILURE;
 		}
 
 		// Drain count-query (capacity=0): expect zero events because no
@@ -466,13 +465,15 @@ run_workspace_test()
 
 		// Phase 2.C controller-owned chrome smoke (spec_version 7 + 8).
 		//
-		// Mints a chrome swapchain bound to the captured client, walks the
-		// standard acquire / wait / render-into-image[index] / release
-		// loop once (clearing image to a recognizable magenta), pushes a
-		// chrome layout with two UV-space hit regions and the new
-		// auto-anchor flags (spec_version 8), acquires a wakeup event
-		// handle, then destroys. Validates dispatch reaches the runtime
-		// for every chrome path without requiring a real controller.
+		// Chrome decorates OPENXR clients only — capture clients are
+		// rejected by design ("captures aren't decorated with chrome",
+		// ipc_handle_workspace_register_chrome_swapchain; the controller
+		// draws its own chrome around captured windows). This smoke's only
+		// addressable client IS a capture client (the controller's own
+		// session is never slotted), so assert the documented rejection
+		// here; the full create / acquire / layout / destroy walk needs a
+		// slotted OpenXR app client under a real controller and lives
+		// outside this single-process smoke.
 		{
 			constexpr int64_t  kSrgbFormat   = 29; // DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
 			constexpr uint32_t kChromeWidth  = 256;
@@ -486,90 +487,24 @@ run_workspace_test()
 			chromeCi.sampleCount = 1;
 			chromeCi.mipCount = 1;
 			XrSwapchain chromeSwapchain = XR_NULL_HANDLE;
-			CHECK_XR(pfnCreateChromeSwapchain(session, clientId, &chromeCi, &chromeSwapchain),
-			         "xrCreateWorkspaceClientChromeSwapchainEXT");
-
-			// Enumerate images via the standard core entry point —
-			// chrome swapchains behave like normal XrSwapchains once
-			// created. Single-image loop (mipCount=1, sampleCount=1).
-			uint32_t imgCount = 0;
-			CHECK_XR(xrEnumerateSwapchainImages(chromeSwapchain, 0, &imgCount, nullptr),
-			         "xrEnumerateSwapchainImages(chrome,count)");
-			std::vector<XrSwapchainImageD3D11KHR> images(
-			    imgCount, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
-			CHECK_XR(xrEnumerateSwapchainImages(
-			             chromeSwapchain, imgCount, &imgCount,
-			             reinterpret_cast<XrSwapchainImageBaseHeader *>(images.data())),
-			         "xrEnumerateSwapchainImages(chrome,fill)");
-			std::printf("[xrEnumerateSwapchainImages(chrome)         ] count=%u\n",
-			            (unsigned)imgCount);
-
-			XrSwapchainImageAcquireInfo acqInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-			uint32_t idx = 0xFFFFFFFFu;
-			CHECK_XR(xrAcquireSwapchainImage(chromeSwapchain, &acqInfo, &idx),
-			         "xrAcquireSwapchainImage(chrome)");
-
-			XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-			waitInfo.timeout = XR_INFINITE_DURATION;
-			CHECK_XR(xrWaitSwapchainImage(chromeSwapchain, &waitInfo),
-			         "xrWaitSwapchainImage(chrome)");
-
-			// Render: ClearRTV the acquired image to magenta. Best-effort
-			// — failure to create the RTV doesn't fail the smoke; the
-			// acquire/release loop itself is what's being validated.
-			if (idx < images.size() && images[idx].texture != nullptr) {
-				ComPtr<ID3D11RenderTargetView> rtv;
-				D3D11_RENDER_TARGET_VIEW_DESC rtvd = {};
-				rtvd.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-				rtvd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-				rtvd.Texture2D.MipSlice = 0;
-				HRESULT rh = device->CreateRenderTargetView(
-				    images[idx].texture, &rtvd, rtv.GetAddressOf());
-				if (SUCCEEDED(rh)) {
-					const float magenta[4] = {0.85f, 0.10f, 0.85f, 0.85f};
-					context->ClearRenderTargetView(rtv.Get(), magenta);
-					context->Flush();
-					std::printf("[Phase 2.C chrome ClearRTV(magenta)         ] OK\n");
-				} else {
-					std::printf("INFO: CreateRenderTargetView(chrome img %u) hr=0x%08lx — paint skipped\n",
-					            (unsigned)idx, (unsigned long)rh);
-				}
+			XrResult ccr = pfnCreateChromeSwapchain(session, clientId, &chromeCi, &chromeSwapchain);
+			std::printf("[xrCreateWorkspaceClientChromeSwapchainEXT  ] %s "
+			            "(expect RUNTIME_FAILURE: capture clients carry no chrome)\n",
+			            xr_result_str(ccr));
+			if (ccr == XR_SUCCESS) {
+				// Chrome-on-capture gained support since this was written —
+				// don't leak the handle, and flag the stale expectation.
+				std::printf("INFO: chrome-on-capture unexpectedly supported — update this "
+				            "smoke to walk the full chrome loop.\n");
+				CHECK_XR(pfnDestroyChromeSwapchain(chromeSwapchain),
+				         "xrDestroyWorkspaceClientChromeSwapchainEXT");
+			} else if (ccr != XR_ERROR_RUNTIME_FAILURE) {
+				std::printf("FAIL: expected RUNTIME_FAILURE for chrome on a capture client\n");
+				return ccr;
 			}
 
-			XrSwapchainImageReleaseInfo relInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-			CHECK_XR(xrReleaseSwapchainImage(chromeSwapchain, &relInfo),
-			         "xrReleaseSwapchainImage(chrome)");
-
-			// Layout with two hit regions + spec_version 8 auto-anchor.
-			// Region IDs are controller-defined opaque uint32_t — the
-			// runtime echoes them back as `chromeRegionId` on POINTER
-			// events. We use 1=drag, 2=close as a self-documenting smoke.
-			XrWorkspaceChromeHitRegionEXT regions[2] = {};
-			regions[0].id = 1;
-			regions[0].bounds.offset = {0.0f, 0.0f};
-			regions[0].bounds.extent = {0.5f, 1.0f};
-			regions[1].id = 2;
-			regions[1].bounds.offset = {0.5f, 0.0f};
-			regions[1].bounds.extent = {0.5f, 1.0f};
-
-			XrWorkspaceChromeLayoutEXT layout = {XR_TYPE_WORKSPACE_CHROME_LAYOUT_EXT};
-			layout.poseInClient.orientation.w = 1.0f;
-			// With anchorToWindowTopEdge = XR_TRUE (spec_version 8), this
-			// y is interpreted as an offset ABOVE the window's top edge.
-			// 12 mm sits a generous gap above any reasonable window.
-			layout.poseInClient.position.y = 0.012f;
-			layout.sizeMeters = {0.20f, 0.012f};
-			layout.followsWindowOrient = XR_FALSE;
-			layout.hitRegionCount = 2;
-			layout.hitRegions = regions;
-			layout.depthBiasMeters = 0.0f; // runtime default (1 mm)
-			layout.anchorToWindowTopEdge = XR_TRUE;
-			layout.widthAsFractionOfWindow = 0.75f; // 75% of current win_w
-			CHECK_XR(pfnSetChromeLayout(session, clientId, &layout),
-			         "xrSetWorkspaceClientChromeLayoutEXT");
-			std::printf("[Phase 2.C chrome layout (auto-anchor, 2 regions)] OK\n");
-
-			// Wakeup event handle (spec_version 8). Validate the handle
+			// Wakeup event handle (spec_version 8) — session-level, not
+			// chrome-bound, so it stays exercised. Validate the handle
 			// is non-NULL and well-formed (zero-timeout wait should
 			// succeed with WAIT_TIMEOUT or WAIT_OBJECT_0 — both prove
 			// the kernel object is reachable). We don't rely on a signal
@@ -589,9 +524,6 @@ run_workspace_test()
 				            wstr);
 				CloseHandle(reinterpret_cast<HANDLE>(wakeup));
 			}
-
-			CHECK_XR(pfnDestroyChromeSwapchain(chromeSwapchain),
-			         "xrDestroyWorkspaceClientChromeSwapchainEXT");
 		}
 
 		// Phase 2.C spec_version 9: per-client visual style smoke. Push a
@@ -621,10 +553,14 @@ run_workspace_test()
 		}
 
 		// Phase 2.I-prequel: client enumeration smoke.
-		// Count-query first, then enumerate. The smoke session is itself an
-		// OpenXR client connection so enumerate should return at least 1 id
-		// (this session). xrGetWorkspaceClientInfoEXT against the first id
-		// should succeed and return a non-empty name.
+		// Enumerate walks IPC-connected OpenXR clients with bound slots.
+		// Neither of this smoke's connections qualifies: the controller's
+		// own session is never slotted, and capture clients aren't IPC
+		// clients (they're deliberately excluded — the shell's per-tick
+		// chrome-creation walk would otherwise spam rejected creates; the
+		// controller already holds the 1000+slot id from add). So expect
+		// count == 0 here; a non-zero count (some other OpenXR app is
+		// connected) exercises the fill + info path below.
 		uint32_t client_count = 0;
 		CHECK_XR(pfnEnumClients(session, 0, &client_count, nullptr),
 		         "xrEnumerateWorkspaceClientsEXT(count)");
@@ -646,6 +582,24 @@ run_workspace_test()
 				            (unsigned)ids[0], cinfo.name, (unsigned long long)cinfo.pid,
 				            (unsigned)cinfo.zOrder, (unsigned)cinfo.isFocused,
 				            (unsigned)cinfo.isVisible);
+			}
+		}
+
+		// Capture-client introspection: enumerate doesn't list captures, but
+		// xrGetWorkspaceClientInfoEXT must resolve the 1000+slot id the
+		// controller got from add — name/pid/visible/focused are filled from
+		// the compositor slot (captures have no IPC client_state).
+		{
+			XrWorkspaceClientInfoEXT cinfo = {XR_TYPE_WORKSPACE_CLIENT_INFO_EXT};
+			CHECK_XR(pfnGetClientInfo(session, clientId, &cinfo),
+			         "xrGetWorkspaceClientInfoEXT(capture)");
+			std::printf("[xrGetWorkspaceClientInfoEXT(capture id=%u)] name=\"%s\" pid=%llu "
+			            "focused=%u visible=%u\n",
+			            (unsigned)clientId, cinfo.name, (unsigned long long)cinfo.pid,
+			            (unsigned)cinfo.isFocused, (unsigned)cinfo.isVisible);
+			if (cinfo.name[0] == '\0') {
+				std::printf("FAIL: capture-client info returned an empty name\n");
+				return XR_ERROR_RUNTIME_FAILURE;
 			}
 		}
 
