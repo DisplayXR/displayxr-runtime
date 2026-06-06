@@ -995,15 +995,34 @@ jobs:
           **To unblock:** rebuild the leia plug-in against runtime \`${{ github.ref_name }}\` (bump \`DXR_RUNTIME_GIT_TAG\` in this repo's \`CMakeLists.txt\`), tag a new release. The leia release's \`versions-bump\` dispatch will then bump leia first; the next runtime tag (or a manual workflow_dispatch on \`versions-bump.yml\` with \`field=runtime\`) will catch up the runtime field.
           EOF
           )
+          # Surface the by-design skip BEFORE any fallible gh call so the
+          # annotation always lands even if issue/label plumbing fails (#453).
+          echo "::warning::Skipped versions.json[runtime] bump — ABI mismatch; opening tracking issue in displayxr-leia-plugin."
+
+          # Ensure the labels exist (idempotent; --force updates in place).
+          # Best-effort: label problems must never fail the gate (#453 —
+          # 'abi-mismatch' missing on the target repo hard-failed the
+          # v1.13.0 run AFTER the issue was already created).
+          gh label create abi-mismatch --repo DisplayXR/displayxr-leia-plugin \
+            --description "Plug-in ABI does not match the runtime's XRT_PLUGIN_API_VERSION_CURRENT" \
+            --color B60205 --force || true
+          gh label create automated --repo DisplayXR/displayxr-leia-plugin \
+            --description "Opened by a DisplayXR workflow" \
+            --color 0E8A16 --force || true
+
           EXISTING=$(gh issue list --repo DisplayXR/displayxr-leia-plugin \
                        --state open --search "$TITLE in:title" --json number --jq '.[0].number // empty')
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --repo DisplayXR/displayxr-leia-plugin --body "$BODY"
           else
-            gh issue create --repo DisplayXR/displayxr-leia-plugin \
-              --title "$TITLE" --body "$BODY" --label "abi-mismatch,automated"
+            # Create WITHOUT --label (gh creates the issue and only then
+            # attaches labels, so a label failure used to abort the job with
+            # the issue already open — #453). Attach labels best-effort after.
+            NEW_URL=$(gh issue create --repo DisplayXR/displayxr-leia-plugin \
+              --title "$TITLE" --body "$BODY")
+            gh issue edit "$NEW_URL" --repo DisplayXR/displayxr-leia-plugin \
+              --add-label "abi-mismatch" --add-label "automated" || true
           fi
-          echo "::warning::Skipped versions.json[runtime] bump — opened tracking issue in displayxr-leia-plugin."
 
       - name: Bump versions.json[runtime]
         if: steps.abi.outputs.rc == '0'

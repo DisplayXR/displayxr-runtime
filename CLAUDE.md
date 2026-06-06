@@ -208,6 +208,9 @@ After a rebuild, copy runtime binaries into `C:\Program Files\DisplayXR\Runtime`
 
 Both use registry discovery on Windows (so they pick up whatever plug-in is installed — Leia SR or sim-display), `XRT_PLUGIN_SEARCH_PATH` on POSIX.
 
+### Simulating eye tracking without hardware
+sim_display honestly advertises **no** eye tracking (per-mode `has_tracking=false`, `supportedModes=0`) — `SIM_DISPLAY_FAKE_TRACKING=1` re-enables MANUAL_BIT + tracked 3D modes, and `SIM_DISPLAY_FAKE_TRACKING_PERIOD_MS=N` square-waves `is_tracking` to exercise tracking-loss edges + `XrEventDataEyeTrackingStateChangedEXT` (look for `OXR EVENT: Eye tracking state changed` WARN lines). Works in-process and via `XRT_FORCE_MODE=ipc`. Contract: `docs/specs/vendor/eye-tracking-modes.md`; design: ADR-022.
+
 ### Windows test apps
 `scripts\build_windows.bat test-apps` builds apps and generates run scripts in `_package/` that set `XR_RUNTIME_JSON` to the dev build.
 
@@ -340,16 +343,12 @@ See `docs/README.md` for the full index. By task:
 | Eye-tracking MANAGED/MANUAL contract | `docs/specs/vendor/eye-tracking-modes.md` |
 | Add a new OpenXR extension | `docs/guides/implementing-extension.md` |
 | Write a device driver | `docs/guides/writing-driver.md` |
-| Leia SR weaver internals (DX11/DX12/GL/VK) | `docs/vendors/leia/weaver.md` |
-| Leia transparency — **primary path**: WGC background-capture (compose-under-bg) on D3D11/D3D12/VK | `docs/vendors/leia/transparency.md` |
-| Leia chroma-key overlay — **legacy fallback, not the expected path** (background capture is; chroma-key survives only on the GL DP) | `docs/vendors/leia/chroma-key-overlay.md` |
-| Leia window phase-snapping (WndProc snap + resolved WndProcDispatcher race) | `docs/vendors/leia/window-phase-snapping.md` |
-| Leia display mode switching (2D/3D: SwitchableLensHint / backlight) | `docs/vendors/leia/display-mode-switching.md` |
+| Leia implementation internals (weaver, transparency/WGC bg-capture, chroma-key fallback, phase-snapping, 2D/3D mode switching) | `displayxr-leia-plugin` repo, [`docs/`](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/docs/README.md) (migrated from `docs/vendors/leia/`) |
 | Kooima projection math | `docs/architecture/kooima-projection.md` |
 | Compositor pipeline | `docs/architecture/compositor-pipeline.md` |
 | Swapchain model / canvas | `docs/specs/runtime/swapchain-model.md` |
 | Workspace ↔ runtime contract / boundary | `docs/architecture/separation-of-concerns.md`, `docs/roadmap/workspace-runtime-contract.md` |
-| Vendor-specific docs | `docs/vendors/<vendor>/README.md` |
+| Vendor-specific docs | `docs/vendors/README.md` (index) — internals live in each vendor's plug-in repo; `sim_display` docs stay in-tree |
 | 3D capture pipeline | `docs/roadmap/3d-capture.md` |
 | Workspace/runtime IPC contract | `docs/roadmap/workspace-runtime-contract.md` |
 | Product vision | `docs/roadmap/spatial-desktop-prd.md` |

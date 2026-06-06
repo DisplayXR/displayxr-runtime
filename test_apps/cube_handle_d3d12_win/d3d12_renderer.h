@@ -89,8 +89,9 @@ bool CreateSwapchainRTVs(D3D12Renderer& renderer,
     uint32_t width, uint32_t height,
     DXGI_FORMAT format);
 
-// Update scene state
-void UpdateScene(D3D12Renderer& renderer, float deltaTime);
+// Update scene state. spinSpeed (rad/s) is agent-settable via the
+// set_spin MCP tool (#457).
+void UpdateScene(D3D12Renderer& renderer, float deltaTime, float spinSpeed = 0.5f);
 
 // Render the scene to a swapchain image
 void RenderScene(

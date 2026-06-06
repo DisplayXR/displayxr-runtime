@@ -30,7 +30,7 @@
 #include <unistd.h>
 #include <mach-o/dyld.h>
 
-#define STB_IMAGE_IMPLEMENTATION
+// stb_image implementation TU lives in displayxr::common (stb_image_impl_macos.cpp) — declarations only here (#396 W4).
 #include "stb_image.h"
 
 // ============================================================================
@@ -981,6 +981,13 @@ static void PollEvents(AppXrSession &app)
             auto *rmc = (XrEventDataRenderingModeChangedEXT *)&event;
             app.currentModeIndex = rmc->currentModeIndex;
             LOG_INFO("Rendering mode changed: %u -> %u", rmc->previousModeIndex, rmc->currentModeIndex);
+            break;
+        }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT: {
+            // Edge-triggered tracking loss/recovery (#441 v14) — log-only here.
+            auto *ets = (XrEventDataEyeTrackingStateChangedEXT *)&event;
+            LOG_INFO("Eye tracking state changed: isTracking=%s mode=%u",
+                ets->isTracking == XR_TRUE ? "YES" : "NO", (uint32_t)ets->activeMode);
             break;
         }
         default: break;

@@ -220,11 +220,11 @@ Ideally vendors support **both** modes (bits = 3), giving developers the choice.
 
 ## Acceptance Criteria
 
-- [ ] Vendor integration guide updated with MANAGED/MANUAL transition contract
-- [ ] `XR_EXT_display_info.h` comments updated to document auto-switch behavior per mode
-- [ ] Vendor display processors pass eye tracking mode to the SDK wrapper when `xrRequestEyeTrackingModeEXT` is called
+- [x] Vendor integration guide updated with MANAGED/MANUAL transition contract (`docs/guides/vendor-plugin-onboarding.md`)
+- [x] `XR_EXT_display_info.h` comments updated to document auto-switch behavior per mode (v6 + v14 doc blocks)
+- [ ] Vendor display processors pass eye tracking mode to the SDK wrapper when `xrRequestEyeTrackingModeEXT` is called (vendor-side; tracked per plug-in repo)
 - [ ] Event propagation path exists for vendor-initiated 2D/3D switches (MANAGED mode auto-transitions fire `XrEventDataRenderingModeChangedEXT` + `XrEventDataHardwareDisplayStateChangedEXT`)
-- [ ] sim_display honest: `supported_eye_tracking_modes = 0`, all modes untracked; `SIM_DISPLAY_FAKE_TRACKING=1` dev toggle re-enables MANUAL_BIT + tracked modes (+ `SIM_DISPLAY_FAKE_TRACKING_PERIOD_MS` square wave) for hardware-free testing (#441)
-- [ ] Per-mode `has_tracking` plumbed plugin → `xrt_rendering_mode.mode_flags` → chained `XrDisplayRenderingModeTrackingInfoEXT` (#441)
-- [ ] `XrEventDataEyeTrackingStateChangedEXT` queued on every derived-isTracking edge (#441)
-- [ ] `is_tracking` transported over IPC; fake-TRUE fallback removed (#441 Phase 2)
+- [x] sim_display honest: `supported_eye_tracking_modes = 0`, all modes untracked; `SIM_DISPLAY_FAKE_TRACKING=1` dev toggle re-enables MANUAL_BIT + tracked modes (+ `SIM_DISPLAY_FAKE_TRACKING_PERIOD_MS` square wave) for hardware-free testing (#441, runtime v1.13.0)
+- [x] Per-mode `has_tracking` plumbed plugin → `xrt_rendering_mode.mode_flags` → chained `XrDisplayRenderingModeTrackingInfoEXT` (#441, ABI v3 / header v14 — see ADR-022)
+- [x] `XrEventDataEyeTrackingStateChangedEXT` queued on every derived-isTracking edge (#441; validated against real view-zone edges on 3D-display hardware)
+- [x] `is_tracking` transported over IPC; fake-TRUE fallback removed (#441 Phase 2, PR #446)

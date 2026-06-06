@@ -1,0 +1,58 @@
+name: drift-guard
+
+# Epic #396: the shared off-axis Kooima math (display3d_view / camera3d_view,
+# W3) and the C++ app scaffolding (logging / input / window / xr_session /
+# HUD / d3d11_renderer / window-space UI / capture helper / stb, W4) live in
+# displayxr-common (displayxr::math + displayxr::common) and are consumed via
+# FetchContent / submodule. They must NOT be re-vendored into this repo's
+# tracked sources — re-copying is exactly how the drift this epic killed got
+# started. This guard fails the build if a vendored copy reappears.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: drift-guard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  no-vendored-math:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No re-vendored displayxr::math sources
+        shell: bash
+        run: |
+          # FetchContent copies live in _deps/ (gitignored); a git submodule's
+          # files are not parent-tracked; the runtime's m_*_view.c FOV-only ports
+          # are a different (deferred) layer and don't match this pattern; and
+          # leia_math.h is an app-local reference, not part of displayxr::math.
+          hits=$(git ls-files | grep -E '(^|/)(display3d_view|camera3d_view)\.(c|h)$' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::Re-vendored displayxr::math sources found. The off-axis Kooima"
+            echo "::error::math must come from displayxr::math (FetchContent / submodule),"
+            echo "::error::not be copied into this repo. See epic #396."
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK: no vendored display3d_view / camera3d_view sources."
+
+      - name: No re-vendored displayxr::common scaffolding (test_apps)
+        shell: bash
+        run: |
+          # W4 (#396): the C++ scaffolding lives in displayxr::common. Scoped
+          # to test_apps/** because the file names are generic (logging.h);
+          # the runtime's own src/ tree legitimately has unrelated files with
+          # similar names. leia_math.h is intentionally absent (app-local).
+          hits=$(git ls-files 'test_apps/**' | grep -E '(^|/)(logging|input_handler|window_manager|xr_session_common|xr_window_space_hud|atlas_capture|atlas_capture_macos|hud_renderer|hud_renderer_macos|text_overlay|d3d11_renderer|mip_chain|optimus_dgpu_hint|view_params|stb_image|stb_image_write|stb_image_impl_macos)\.(c|cpp|h|mm)$|(^|/)displayxr_manifest\.cmake$' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::Re-vendored displayxr::common scaffolding found under test_apps/."
+            echo "::error::The shared C++ scaffolding must come from displayxr::common"
+            echo "::error::(FetchContent), not be copied back into test_apps. See epic #396 W4."
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK: no vendored scaffolding sources under test_apps/."

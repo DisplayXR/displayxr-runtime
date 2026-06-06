@@ -374,6 +374,14 @@ static void RenderOneFrame(RenderState& rs) {
             XrResult fr = xr.pfnRequestFilePickerEXT(xr.session, &info, &rid);
             LOG_INFO("[#228] xrRequestFilePickerEXT -> rc=0x%x requestId=%llu",
                 (unsigned)fr, (unsigned long long)rid);
+            if (XR_SUCCEEDED(fr)) {
+                // Feed the shared PollEvents completion state machine
+                // (displayxr::common) so the completion event matches the
+                // live request instead of logging a stale-id warning.
+                xr.filePickerRequestId = rid;
+                xr.filePickerInFlight = true;
+                xr.filePickerHasResult = false;
+            }
         } else {
             LOG_INFO("[#228] xrRequestFilePickerEXT not available (ext missing or PFN NULL)");
         }
@@ -392,8 +400,8 @@ static void RenderOneFrame(RenderState& rs) {
         }
     }
 
-    // Update scene (cube rotation)
-    UpdateScene(renderer, rs.perfStats->deltaTime);
+    // Update scene (cube rotation) — speed agent-settable via cube-d3d11__set_spin (#457)
+    UpdateScene(renderer, rs.perfStats->deltaTime, xr.spinSpeed);
 
     // Poll OpenXR events
     PollEvents(xr);

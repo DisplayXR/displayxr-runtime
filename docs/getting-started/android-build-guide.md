@@ -12,7 +12,7 @@ Build and deploy DisplayXR on an Android device with a Leia 3D display (Lume Pad
 
 Companion docs:
 - [`android-bringup-checklist.md`](android-bringup-checklist.md) — A→B→C→D step-by-step test procedure once both APKs are built.
-- [`docs/vendors/leia/cnsdk-android-calibration.md`](../vendors/leia/cnsdk-android-calibration.md) — symptom→fix table for the three CNSDK convention assumptions (face axes, view mapping, UV flip).
+- [`displayxr-leia-plugin/docs/cnsdk-android-calibration.md`](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/docs/cnsdk-android-calibration.md) — symptom→fix table for the three CNSDK convention assumptions (face axes, view mapping, UV flip).
 
 ## Prerequisites
 

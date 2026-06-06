@@ -75,8 +75,7 @@ add_executable(windowspace_handle_d3d11_win WIN32
     # Standalone window-space helpers (4-arg CreateHudSwapchain overload +
     # SubmitWindowSpaceLayersFrame). Not compiled into sr_common on Windows,
     # so each windowspace app adds it directly.
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/xr_window_space_hud.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/xr_window_space_hud.h
+    # xr_window_space_hud comes from displayxr::common (#396 W4).
     resource.rc
 )
 
@@ -106,5 +105,4 @@ if(TARGET OpenXR::openxr_loader)
 endif()
 
 # DisplayXR shell manifest sidecar
-include(${CMAKE_CURRENT_SOURCE_DIR}/../common/displayxr_manifest.cmake)
 displayxr_install_manifest(windowspace_handle_d3d11_win "${CMAKE_CURRENT_SOURCE_DIR}/displayxr")

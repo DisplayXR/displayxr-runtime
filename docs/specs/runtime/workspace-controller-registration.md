@@ -226,8 +226,9 @@ its structure:
 `Version` is informational. The compatibility contract between
 runtime and workspace app is enforced by the OpenXR extension layer:
 each workspace app declares the minimum runtime `XR_EXT_spatial_workspace`
-spec_version it requires (typically in its README; see
-`docs/roadmap/demo-distribution.md` for the demo precedent). When
+spec_version it requires (typically in its README — the same
+"Requires the DisplayXR runtime ≥ vX.Y.Z" covenant the standalone
+demo repos state in theirs). When
 that version is unavailable, the workspace app fails at
 `xrCreateInstance` and the user sees a clean OpenXR error rather than
 a runtime-crash mystery.

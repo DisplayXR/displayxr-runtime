@@ -102,7 +102,7 @@ Display panel (simplified — 3 subpixels per lens pitch):
 This is why the extension requires the actual **window handle** (HWND), not just a texture or screen coordinates:
 
 - The display processor needs to query the window's screen-space position each frame to compute the correct interlacing origin
-- Some advanced vendor display processors go further: they hook `WM_WINDOWPOSCHANGING` on the HWND to **snap** window drag positions to phase-aligned coordinates, preventing crosstalk jitter during drag. This is an optional vendor optimization — without it, 3D quality degrades during drag but is correct at rest. (For one vendor's implementation, see [Leia window phase snapping](../../vendors/leia/window-phase-snapping.md).)
+- Some advanced vendor display processors go further: they hook `WM_WINDOWPOSCHANGING` on the HWND to **snap** window drag positions to phase-aligned coordinates, preventing crosstalk jitter during drag. This is an optional vendor optimization — without it, 3D quality degrades during drag but is correct at rest. (For one vendor's implementation, see [Leia window phase snapping](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/docs/window-phase-snapping.md).)
 - For `_texture` apps where the 3D canvas is a sub-rect of the window (e.g., a 3D viewport surrounded by 2D UI), the canvas offset and size from `xrSetSharedTextureOutputRectEXT` flow through the compositor to the display processor's `process_atlas()` call as `canvas_offset_x/y` and `canvas_width/height`, enabling correct phase alignment without any hidden windows. The app's real HWND is passed directly to the display processor at init time.
 
 A texture handle or screen coordinate alone would not allow the display processor to track position changes or hook window messages.
@@ -939,7 +939,7 @@ Only size-dependent resources (stereo texture, SRV, RTV, depth texture, DSV) are
 
 On a lenticular display, each subpixel projects light at a specific angle determined by its absolute position relative to the lens array. When a window is dragged to an arbitrary pixel position, the phase relationship between content and lenses can break, causing crosstalk (left/right eye images bleeding into each other).
 
-Some vendor weavers handle this **automatically** by subclassing the application's window procedure and snapping drag positions to phase-aligned coordinates, so the 3D effect stays stable throughout a drag. This is an optional vendor optimization that needs no runtime or application code. For one vendor's concrete implementation (the messages it intercepts and how it snaps), see [Leia window phase snapping](../../vendors/leia/window-phase-snapping.md).
+Some vendor weavers handle this **automatically** by subclassing the application's window procedure and snapping drag positions to phase-aligned coordinates, so the 3D effect stays stable throughout a drag. This is an optional vendor optimization that needs no runtime or application code. For one vendor's concrete implementation (the messages it intercepts and how it snaps), see [Leia window phase snapping](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/docs/window-phase-snapping.md).
 
 ---
 
@@ -1027,7 +1027,7 @@ A vendor weaver that subclasses the application's window procedure (see §5.7) m
 synchronize the dispatch path against weaver destruction, or a use-after-free race can occur
 when one thread destroys the weaver while another is inside the subclassed `WndProc`. For one
 vendor's historical race condition and its resolution, see
-[Leia window phase snapping](../../vendors/leia/window-phase-snapping.md#sr-sdk-wndprocdispatcher-race-condition-resolved).
+[Leia window phase snapping](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/docs/window-phase-snapping.md#sr-sdk-wndprocdispatcher-race-condition-resolved).
 
 ### 7.2 D3D11 Thread Safety
 
@@ -1099,7 +1099,7 @@ The vendor weaver — the component the compositor binds to the HWND and calls p
 as a plug-in DLL from its own repo (ADR-019), not from this tree. It exposes a create call, a
 per-frame weave call, and a predicted-eye-positions query. For the Leia weaver sources, see
 the [`displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin) repo and
-[`docs/vendors/leia/weaver.md`](../../vendors/leia/weaver.md).
+[`displayxr-leia-plugin/docs/weaver.md`](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/docs/weaver.md).
 
 ### Hybrid Mode
 

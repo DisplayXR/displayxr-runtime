@@ -127,7 +127,7 @@ frame 120
 
 **Goal:** Validate the three CNSDK convention assumptions (face axes, tile-to-eye mapping, UV vertical flip) on real hardware. Each takes 1–2 minutes.
 
-**Reference:** [`docs/vendors/leia/cnsdk-android-calibration.md`](../vendors/leia/cnsdk-android-calibration.md) has the full symptom→fix table.
+**Reference:** [`displayxr-leia-plugin/docs/cnsdk-android-calibration.md`](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/docs/cnsdk-android-calibration.md) has the full symptom→fix table.
 
 1. **Face axes (audit B15).** Stand in front of the display, head still. Move head right ~10 cm. Watch logcat for eye-position values. X should increase. If decreases → flip sign of `out_x` in `leia_cnsdk_get_primary_face`. Repeat for up (Y) and toward (Z).
 2. **Tile-to-eye mapping (audit B17).** Cover left eye — should see solid blue (right tile). Cover right eye — should see solid red (left tile). If reversed → swap args to `set_view_for_texture_array` (or per-tile blit order on the per-tile-blit branch).

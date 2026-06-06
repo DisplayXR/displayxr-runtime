@@ -30,7 +30,7 @@ Build apps for 3D displays using the OpenXR standard.
 - [XR_EXT_win32_window_binding](specs/extensions/XR_EXT_win32_window_binding.md) — app-provided Win32 HWND
 - [XR_EXT_cocoa_window_binding](specs/extensions/XR_EXT_cocoa_window_binding.md) — app-provided Cocoa NSView
 - [XR_EXT_spatial_workspace](specs/extensions/XR_EXT_spatial_workspace.md) — workspace controller surface (shell-style apps)
-- [Kooima Projection](architecture/kooima-projection.md) — stereo math and projection pipelines
+- [Kooima Projection](architecture/kooima-projection.md) — N-view Kooima math and projection pipelines
 
 ---
 
@@ -66,6 +66,7 @@ Integrate your 3D display hardware into DisplayXR.
 - **[`xrt_plugin_iface` reference](reference/xrt_plugin_iface.md)** — per-method contract for the plug-in vtable
 - **[Plug-in discovery spec](specs/runtime/plugin-discovery.md)** — registry / JSON manifest formats, env-var overrides
 - **[ADR-019: Vendor Plug-in / Aux Boundary](adr/ADR-019-vendor-plugin-aux-boundary.md)** — why the runtime DLL holds zero vendor identifiers
+- **[ADR-022: Per-Mode Capability Flags + Frozen Enumerated App Structs](adr/ADR-022-per-mode-capability-flags-frozen-enum-structs.md)** — `mode_flags` bits (no more rendering-mode ABI breaks) + `XrDisplayRenderingModeInfoEXT` frozen at v13 (all future per-mode fields chain)
 - **[Display Processor Interface](specs/vendor/display-processor-interface.md)** — the DP vtable you'll implement
 - **[Eye Tracking Modes](specs/vendor/eye-tracking-modes.md)** — MANAGED vs MANUAL contract
 - **[ADR-003: Vendor Abstraction](adr/ADR-003-vendor-abstraction-via-display-processor-vtable.md)** — why vendor code is isolated
@@ -78,7 +79,7 @@ Integrate your 3D display hardware into DisplayXR.
 ### Integrated vendors (`vendors/`)
 
 - **[Vendors index](vendors/README.md)** — list of integrated vendors + how to add a new one
-- [Leia SR](vendors/leia/README.md) — D3D11 / D3D12 / OpenGL / Vulkan, weaver, transparency model
+- [Leia SR](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/docs/README.md) (in [displayxr-leia-plugin](https://github.com/DisplayXR/displayxr-leia-plugin)) — D3D11 / D3D12 / OpenGL / Vulkan, weaver, transparency model
 - [sim_display](vendors/sim_display/README.md) — reference simulation vendor (SBS / anaglyph on a 2D window)
 
 ---
@@ -114,6 +115,7 @@ Design docs, status trackers, and plans — some shipped, some in progress. Afte
 - [Workspace/Runtime Contract](roadmap/workspace-runtime-contract.md) — IPC between a workspace controller and the runtime
 - **MCP** — framework extracted to [`DisplayXR/displayxr-mcp`](https://github.com/DisplayXR/displayxr-mcp). See the [MCP spec](https://github.com/DisplayXR/displayxr-mcp/blob/main/docs/mcp-spec.md) for the protocol; Phase A (handle-app introspection) and Phase B (workspace tools, hosted in `displayxr-shell-pvt`) both shipped.
 - [Desktop Overlay Apps — Forward Work](roadmap/avatar-overlay-native.md) — follow-on work after the transparent HWND path shipped (#191)
+- [Unified Atlas Capture](roadmap/unified-atlas-capture.md) — one runtime capture API (`XR_EXT_atlas_capture`, #396 W6; shipped in runtime v1.10.0)
 
 ### Planned / In Progress
 
@@ -126,11 +128,11 @@ Design docs, status trackers, and plans — some shipped, some in progress. Afte
 - [Workspace Activation Auth Handshake](roadmap/spatial-workspace-auth-handshake.md) — Phase 2.0 prep: orchestrator-PID match replaces the brand-coupled `application_name == "displayxr-shell"` check
 - [Phase 2 Audit](roadmap/spatial-workspace-extensions-phase2-audit.md) — line-by-line classification of the remaining `shell` mentions in `comp_d3d11_service.cpp`
 - [Per-App MCP Tools & Workspace Aggregator](roadmap/per-app-mcp-tools.md) — apps register their own MCP tools via `XR_EXT_mcp_tools`; one-connection `--target workspace` aggregator with `<app-id>__<tool>` namespacing
+- [Raw vs Render-Ready Views](roadmap/raw-vs-render-ready-views.md) — `XR_EXT_view_rig`: apps feed Kooima rig descriptors, runtime does the view math (#396 W7)
 - [WebXR Bridge v2 Plan](roadmap/webxr-bridge-v2-plan.md) — metadata/control sideband for Chrome's native WebXR
 - [Display Spatial Model](roadmap/display-spatial-model.md) — displays in the spatial graph (#46)
 - [Multi-Display Single Machine](roadmap/multi-display-single-machine.md) — multiple displays, one machine (#69)
 - [Multi-Display Networked](roadmap/multi-display-networked.md) — displays across the network (#70)
-- [Demo Distribution](roadmap/demo-distribution.md) — per-component tag scheme + runtime-compat covenant
 - [XR_VIEW_CONFIGURATION_PRIMARY_MULTIVIEW](roadmap/XR_VIEW_CONFIGURATION_PRIMARY_MULTIVIEW.md) — Khronos multiview proposal (#80)
 
 ---

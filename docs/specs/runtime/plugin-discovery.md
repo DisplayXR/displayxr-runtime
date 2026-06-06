@@ -404,11 +404,19 @@ manifest + binary, leaves the runtime alone.
 ## 6. Version negotiation
 
 `XRT_PLUGIN_API_VERSION_CURRENT` is defined in `xrt/xrt_plugin.h`. As of
-runtime v1.6.0 the current major is `XRT_PLUGIN_API_VERSION_2`
-(ADR-020). v1 → v2 is the one-time break that introduced the
-`struct_size` header on the display-processor vtables; ABI-v1 plug-ins
-(≤ leia v1.0.5) are rejected by the loader and must be rebuilt against
-v2 headers.
+runtime v1.13.0 the current major is `XRT_PLUGIN_API_VERSION_3`
+(ADR-020, ADR-022). History:
+
+- v1 → v2 (runtime v1.6.0): the one-time break that introduced the
+  `struct_size` header on the display-processor vtables; ABI-v1
+  plug-ins are rejected by the loader and must rebuild against v2
+  headers.
+- v2 → v3 (runtime v1.13.0, #441): `xrt_rendering_mode` gained
+  `mode_flags` (bit 0 = `XRT_RENDERING_MODE_FLAG_HAS_TRACKING`) +
+  `reserved[3]` — an element-stride change in the `xrt_device`-embedded
+  array, so ABI-v2 plug-ins are rejected. The flags word + reserved
+  padding make v3 the intended **last** rendering-mode layout break
+  (ADR-022): future per-mode capabilities are new bits, not new fields.
 
 Both the runtime and the plug-in pass their own version through
 `xrtPluginNegotiate`. The runtime enforces a strict major match — a

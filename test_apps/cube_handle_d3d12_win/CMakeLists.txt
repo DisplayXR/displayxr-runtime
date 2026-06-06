@@ -72,12 +72,8 @@ add_executable(cube_handle_d3d12_win WIN32
     xr_session.h
     d3d12_renderer.cpp
     d3d12_renderer.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/hud_renderer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/hud_renderer.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/text_overlay.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/text_overlay.h
-    # 'I' key atlas capture is runtime-owned now (XR_EXT_atlas_capture); the
-    # shared dxr_capture::RequestRuntimeAtlasCapture lives in sr_common_base.
+    # hud_renderer / text_overlay / atlas capture come from displayxr::common
+    # (via sr_common_base) — no direct ../common TU compilation (#396 W4).
     resource.rc
 )
 
@@ -122,8 +118,8 @@ if(TEXTURE_FILES)
     )
 endif()
 
-# DisplayXR shell manifest sidecar
-include(${CMAKE_CURRENT_SOURCE_DIR}/../common/displayxr_manifest.cmake)
+# DisplayXR shell manifest sidecar (displayxr_install_manifest is defined by
+# the fetched displayxr-common, brought in by add_subdirectory(../common))
 displayxr_install_manifest(cube_handle_d3d12_win "${CMAKE_CURRENT_SOURCE_DIR}/displayxr")
 
 

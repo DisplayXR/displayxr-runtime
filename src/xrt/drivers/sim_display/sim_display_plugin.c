@@ -21,6 +21,14 @@
  * @ingroup drv_sim_display
  */
 
+// xrt_config_have.h supplies the XRT_HAVE_* feature macros used by the
+// vtable gating below. Without it, `#if defined(XRT_HAVE_VULKAN)` was
+// silently false in this TU, so the Windows plug-in never wired
+// create_dp_vk (or the VK bit in probe_displays claims) even though the
+// VK display processor was compiled in — every VK app under sim-display
+// on Windows ran DP-less in permanent 2D (#456).
+#include "xrt/xrt_config_have.h"
+
 #include "xrt/xrt_plugin.h"
 #include "xrt/xrt_results.h"
 

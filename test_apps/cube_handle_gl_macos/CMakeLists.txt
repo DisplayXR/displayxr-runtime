@@ -46,25 +46,31 @@ if(NOT OPENXR_FOUND)
     message(FATAL_ERROR "OpenXR not found. Install via: brew install openxr-loader")
 endif()
 
-# Off-axis Kooima math via displayxr::math, pinned by tag instead of compiled
-# from ../common (epic #396 W3). OpenXR (set up above) is reused, not re-fetched.
+# Off-axis Kooima math (displayxr::math) AND the shared app scaffolding
+# (displayxr::common: macOS HUD, window-space-layer UI, atlas-capture helper,
+# stb) pinned by tag instead of compiled from ../common (epic #396 W3+W4).
+# OpenXR (set up above) is reused, not re-fetched; the DisplayXR extension
+# headers come from this repo's source-of-truth copy.
 include(FetchContent)
 set(DISPLAYXR_COMMON_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+get_filename_component(_dxr_ext_includes
+    "${CMAKE_SOURCE_DIR}/../../src/external/openxr_includes" ABSOLUTE)
+set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
+    "DisplayXR OpenXR extension headers for displayxr::common")
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v0.1.1
+    GIT_TAG v0.3.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
 
 add_executable(cube_handle_gl_macos
     main.mm
-    "${CMAKE_SOURCE_DIR}/../common/hud_renderer_macos.mm"
-    "${CMAKE_SOURCE_DIR}/../common/xr_window_space_hud.cpp"
+    # hud_renderer_macos / xr_window_space_hud / atlas_capture_macos come
+    # from displayxr::common (#396 W4).
     # 'I' key atlas capture: filename + flash helpers (runtime-owned readback
     # via XR_EXT_atlas_capture / xrCaptureAtlasEXT — no app-side GL readback)
-    "${CMAKE_SOURCE_DIR}/../common/atlas_capture_macos.mm"
 )
 
 target_compile_definitions(cube_handle_gl_macos PRIVATE
@@ -87,7 +93,7 @@ foreach(TEX ${TEXTURE_FILES})
 endforeach()
 
 target_link_libraries(cube_handle_gl_macos PRIVATE
-    displayxr::math
+    displayxr::common
     OpenXR::openxr_loader
     "-framework OpenGL"
     "-framework Foundation"
