@@ -1,10 +1,11 @@
 {
   "schema_version": 1,
   "name": "Cube D3D12 (Handle)",
+  "id": "cube-d3d12",
   "type": "3d",
   "category": "test",
   "display_mode": "auto",
-  "description": "Reference spinning cube demonstrating XR_EXT_win32_window_binding on Direct3D 12.",
+  "description": "Reference spinning cube demonstrating XR_EXT_win32_window_binding on Direct3D 12; XR_EXT_mcp_tools adopter (agent tools: set_spin, get_status).",
   "icon": "icon.png",
   "icon_3d": "icon_sbs.png",
   "icon_3d_layout": "sbs-lr"

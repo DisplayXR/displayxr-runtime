@@ -392,8 +392,8 @@ static void RenderOneFrame(RenderState& rs) {
         }
     }
 
-    // Update scene (cube rotation)
-    UpdateScene(renderer, rs.perfStats->deltaTime);
+    // Update scene (cube rotation) — speed agent-settable via cube-d3d11__set_spin (#457)
+    UpdateScene(renderer, rs.perfStats->deltaTime, xr.spinSpeed);
 
     // Poll OpenXR events
     PollEvents(xr);

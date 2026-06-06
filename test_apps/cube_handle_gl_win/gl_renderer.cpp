@@ -318,8 +318,9 @@ bool CreateSwapchainFBOs(GLRenderer& renderer,
     return true;
 }
 
-void UpdateScene(GLRenderer& renderer, float deltaTime) {
-    renderer.cubeRotation += deltaTime * 0.5f;
+void UpdateScene(GLRenderer& renderer, float deltaTime, float spinSpeed) {
+    // spinSpeed is agent-settable via cube-gl__set_spin (#457)
+    renderer.cubeRotation += deltaTime * spinSpeed;
     if (renderer.cubeRotation > XM_2PI) {
         renderer.cubeRotation -= XM_2PI;
     }

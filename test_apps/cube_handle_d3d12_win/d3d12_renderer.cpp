@@ -817,8 +817,9 @@ bool CreateSwapchainRTVs(D3D12Renderer& renderer,
     return true;
 }
 
-void UpdateScene(D3D12Renderer& renderer, float deltaTime) {
-    renderer.cubeRotation += deltaTime * 0.5f;
+void UpdateScene(D3D12Renderer& renderer, float deltaTime, float spinSpeed) {
+    // spinSpeed is agent-settable via cube-d3d12__set_spin (#457)
+    renderer.cubeRotation += deltaTime * spinSpeed;
     if (renderer.cubeRotation > XM_2PI) {
         renderer.cubeRotation -= XM_2PI;
     }

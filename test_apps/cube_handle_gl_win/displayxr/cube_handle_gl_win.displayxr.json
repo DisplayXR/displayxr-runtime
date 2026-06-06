@@ -1,10 +1,11 @@
 {
   "schema_version": 1,
   "name": "Cube OpenGL (Handle)",
+  "id": "cube-gl",
   "type": "3d",
   "category": "test",
   "display_mode": "auto",
-  "description": "Reference spinning cube demonstrating XR_EXT_win32_window_binding on OpenGL.",
+  "description": "Reference spinning cube demonstrating XR_EXT_win32_window_binding on OpenGL; XR_EXT_mcp_tools adopter (agent tools: set_spin, get_status).",
   "icon": "icon.png",
   "icon_3d": "icon_sbs.png",
   "icon_3d_layout": "sbs-lr"

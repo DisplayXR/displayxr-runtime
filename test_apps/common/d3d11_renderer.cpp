@@ -608,9 +608,9 @@ void CleanupD3D11(D3D11Renderer& renderer) {
     renderer.dxgiFactory.Reset();
 }
 
-void UpdateScene(D3D11Renderer& renderer, float deltaTime) {
-    // Rotate cube
-    renderer.cubeRotation += deltaTime * 0.5f; // Half rotation per second
+void UpdateScene(D3D11Renderer& renderer, float deltaTime, float spinSpeed) {
+    // Rotate cube — spinSpeed is agent-settable via cube-d3d11__set_spin (#457)
+    renderer.cubeRotation += deltaTime * spinSpeed;
     if (renderer.cubeRotation > XM_2PI) {
         renderer.cubeRotation -= XM_2PI;
     }

@@ -10,6 +10,7 @@
 #include "logging.h"
 #include <cstring>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 // #include <chrono>  // [Commented out — was only used for convergence plane logging throttle]
 
@@ -450,6 +451,50 @@ bool PollEvents(XrSessionManager& xr) {
                 (unsigned long long)pickEvent->requestId,
                 (int)pickEvent->result,
                 pickEvent->path);
+            break;
+        }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_EXT: {
+            // An agent invoked one of our XR_EXT_mcp_tools tools (#457). Fetch
+            // the JSON args (two-call idiom; argsSize is the required
+            // capacity), act on app state — we're on the main loop, so no
+            // locking — and answer. An unanswered call fails to the agent
+            // after ~5 s. Only apps that registered tools in their
+            // CreateSession ever receive this event.
+            auto* call = (XrEventDataMCPToolCallEXT*)&event;
+            char args[512] = {0};
+            uint32_t needed = 0;
+            if (xr.pfnGetMCPToolCallArgsEXT != nullptr) {
+                xr.pfnGetMCPToolCallArgsEXT(xr.session, call->callId, sizeof(args), &needed, args);
+            }
+            char result[256];
+            XrBool32 ok = XR_TRUE;
+            if (strcmp(call->toolName, "set_spin") == 0) {
+                // Test apps stay dependency-free: hand-scan the one expected
+                // numeric key instead of pulling in a JSON parser.
+                const char* key = strstr(args, "\"speed_rad_per_sec\"");
+                const char* colon = key != nullptr ? strchr(key, ':') : nullptr;
+                if (colon != nullptr) {
+                    float speed = strtof(colon + 1, nullptr);
+                    if (speed < 0.f) speed = 0.f;
+                    if (speed > 10.f) speed = 10.f;
+                    xr.spinSpeed = speed;
+                    snprintf(result, sizeof(result), "{\"spin_speed_rad_per_sec\":%.3f}", xr.spinSpeed);
+                } else {
+                    ok = XR_FALSE;
+                    snprintf(result, sizeof(result), "{\"error\":\"missing speed_rad_per_sec\"}");
+                }
+            } else if (strcmp(call->toolName, "get_status") == 0) {
+                snprintf(result, sizeof(result),
+                    "{\"spin_speed_rad_per_sec\":%.3f,\"session_running\":%s,"
+                    "\"rendering_mode_index\":%u}",
+                    xr.spinSpeed, xr.sessionRunning ? "true" : "false", xr.currentModeIndex);
+            } else {
+                ok = XR_FALSE;
+                snprintf(result, sizeof(result), "{\"error\":\"unhandled tool\"}");
+            }
+            if (xr.pfnSubmitMCPToolResultEXT != nullptr) {
+                xr.pfnSubmitMCPToolResultEXT(xr.session, call->callId, ok, result);
+            }
             break;
         }
         default:
