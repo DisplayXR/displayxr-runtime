@@ -1,7 +1,7 @@
 # Per-Mode Tracking Capability + Tracking-State Event — Implementation Plan
 
-**Status:** DRAFT (2026-06-05)
-**Scope:** runtime, sim_display plug-in (in-tree), Leia SR plug-in (`displayxr-leia-plugin`), extension header v14, IPC.
+**Status:** ✅ COMPLETE (2026-06-06) — all 5 phases shipped as runtime **v1.13.0** + vendor plug-in ABI-v3 rebuild + bundle **v0.13.0**; #441 closed. Architectural decisions promoted to **ADR-022** (flags-word vendor ABI + frozen-at-v13 app struct / chaining policy).
+**Scope:** runtime, sim_display plug-in (in-tree), vendor plug-ins (own repos), extension header v14, IPC.
 **Breaking:** plug-in ABI v2 → v3 (coordinated release). Zero app-binary breakage by design.
 
 ## Goal

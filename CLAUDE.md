@@ -208,6 +208,9 @@ After a rebuild, copy runtime binaries into `C:\Program Files\DisplayXR\Runtime`
 
 Both use registry discovery on Windows (so they pick up whatever plug-in is installed — Leia SR or sim-display), `XRT_PLUGIN_SEARCH_PATH` on POSIX.
 
+### Simulating eye tracking without hardware
+sim_display honestly advertises **no** eye tracking (per-mode `has_tracking=false`, `supportedModes=0`) — `SIM_DISPLAY_FAKE_TRACKING=1` re-enables MANUAL_BIT + tracked 3D modes, and `SIM_DISPLAY_FAKE_TRACKING_PERIOD_MS=N` square-waves `is_tracking` to exercise tracking-loss edges + `XrEventDataEyeTrackingStateChangedEXT` (look for `OXR EVENT: Eye tracking state changed` WARN lines). Works in-process and via `XRT_FORCE_MODE=ipc`. Contract: `docs/specs/vendor/eye-tracking-modes.md`; design: ADR-022.
+
 ### Windows test apps
 `scripts\build_windows.bat test-apps` builds apps and generates run scripts in `_package/` that set `XR_RUNTIME_JSON` to the dev build.
 
