@@ -68,6 +68,7 @@ The manifest sits in a system-known discovery directory and points at any execut
 {
   "schema_version": 1,
   "name": "Cube D3D11",
+  "id": "cube-d3d11",
   "type": "3d",
   "icon": "icon.png",
   "icon_3d": "icon_sbs.png",
@@ -90,6 +91,7 @@ The manifest sits in a system-known discovery directory and points at any execut
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
+| `id` | string | *none* | Stable machine identifier (slug) for the app — see §3.4. Matches `^[a-z0-9][a-z0-9-]{0,31}$`. Strongly recommended for all apps; **required for apps that register MCP tools** via `XR_EXT_mcp_tools` (the runtime-declared `appId` must match this field). |
 | `exe_path` | string | *none* | Absolute path to the executable. **Required in registered mode (§2.2), MUST be absent in sidecar mode (§2.1).** Forward or back slashes accepted; the scanner normalizes to backslashes. The referenced file must exist at scan time or the entry is skipped. |
 | `icon` | string | *none* | Relative path to a 2D icon image. PNG or JPEG. Recommended 512×512. When absent, the tile is rendered with the app name as a text label on a category-colored background. |
 | `icon_3d` | string | *none* | Relative path to a stereoscopic icon image. When present, the workspace controller renders the tile stereoscopically. Resolution matches `icon` aspect but doubled along the layout axis (e.g. 1024×512 for `sbs-lr`). Requires `icon` to also be set (as the 2D fallback). |
@@ -102,7 +104,21 @@ The manifest sits in a system-known discovery directory and points at any execut
 
 Names a workspace controller may consume in later schema versions — do not use for custom data:
 
-`version`, `publisher`, `homepage`, `min_runtime`, `required_extensions`, `screenshots`, `trailer`, `pose`, `window_size`, `args`, `working_dir`.
+`version`, `publisher`, `homepage`, `min_runtime`, `required_extensions`, `screenshots`, `trailer`, `pose`, `window_size`, `args`, `working_dir`, `mcp`.
+
+(`mcp` is reserved for the planned declarative tool-discovery block — see [per-app MCP tools](../../roadmap/per-app-mcp-tools.md) §9 P3.)
+
+### 3.4 App identity (`id`)
+
+`id` is the app's **stable machine identifier**, as opposed to `name`, which is its mutable display string. It exists so that anything needing to refer to the app programmatically — most immediately the **MCP tool namespace** (`<id>__<tool>`, e.g. `mediaplayer__play_pause`; see [per-app MCP tools](../../roadmap/per-app-mcp-tools.md)) — has a slug that survives display-name rebrandings and contains no spaces/Unicode.
+
+Rules:
+
+- **Charset:** `^[a-z0-9][a-z0-9-]{0,31}$` — lowercase ASCII letters, digits, hyphens; 1–32 chars; must start alphanumeric. Underscores are deliberately excluded: `__` is the reserved MCP namespace separator.
+- **Stability:** treat `id` as immutable once shipped. Changing it renames every MCP tool the app exposes and orphans any per-app state keyed on it.
+- **Uniqueness:** ids should be unique across the ecosystem by convention (pick something specific: `mediaplayer`, `gaussiansplat` — not `viewer`). There is no central registry; collisions between *different* apps are a scanner **warning** (both entries survive — dedup remains by `exe_path`), and consumers such as the MCP workspace aggregator disambiguate at runtime with sticky suffixes (`-2`, `-3`).
+- **Cross-check:** an app that registers MCP tools declares the same id at runtime via `xrSetMCPAppInfoEXT`. The runtime-declared value is authoritative; `scripts/check_displayxr_app.py` lints that manifest and code agree.
+- **Fallback:** when `id` is absent (and the app declares none at runtime), consumers derive a fallback from the sanitized exe basename. Fine for Browse-for-app entries; apps shipping manifests should set it explicitly.
 
 ## 4. 3D icons
 
@@ -170,6 +186,11 @@ The scanner rejects a manifest if any of the following are true:
 
 Rejected manifests are logged as warnings. The scanner does not attempt to recover partial data.
 
+**Soft failures** (warning; field ignored, manifest still accepted):
+
+- `id` is specified but does not match `^[a-z0-9][a-z0-9-]{0,31}$` — the entry behaves as if `id` were absent (fallback per §3.4). A malformed slug must not knock an otherwise-valid app out of the launcher.
+- `id` duplicates another discovered manifest's `id` (different `exe_path`) — both entries survive; consumers disambiguate per §3.4.
+
 ## 7. Example: minimal manifest
 
 ```json
@@ -188,6 +209,7 @@ This is enough for the launcher to show a named tile. Without `icon` the tile re
 {
   "schema_version": 1,
   "name": "Gaussian Splatting Demo",
+  "id": "gaussiansplat",
   "type": "3d",
   "icon": "icon.png",
   "icon_3d": "icon_sbs.png",
@@ -212,7 +234,7 @@ A workspace controller does NOT extract icons from the PE for sidecar/registered
 
 ## 10. Versioning
 
-Breaking changes bump `schema_version`. A workspace controller will refuse to parse manifests with a `schema_version` it does not understand, and log the unsupported version. Additive changes (new optional fields) keep `schema_version: 1`. The `exe_path` field added in this revision is additive — older controllers that read a registered manifest will fall back to sidecar resolution (look for sibling exe, fail, skip the entry); they will never crash. Registered-mode manifests therefore require a workspace controller ≥ the version that introduced this field.
+Breaking changes bump `schema_version`. A workspace controller will refuse to parse manifests with a `schema_version` it does not understand, and log the unsupported version. Additive changes (new optional fields) keep `schema_version: 1`. The `exe_path` field added in this revision is additive — older controllers that read a registered manifest will fall back to sidecar resolution (look for sibling exe, fail, skip the entry); they will never crash. Registered-mode manifests therefore require a workspace controller ≥ the version that introduced this field. The `id` field (§3.4) is likewise additive — controllers that predate it simply ignore the key, and every `id`-consuming behavior has a defined fallback.
 
 ## 11. Browse-for-app and registered-apps state cache (DisplayXR Shell reference implementation)
 
