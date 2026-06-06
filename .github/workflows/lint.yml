@@ -10,6 +10,13 @@ name: lint
 #   feature branch would expose shell source in a public repo. See
 #   reference_org_protection_state.md.
 #
+# - Vendor-docs guard: `docs/vendors/` is an *index* only. Plug-in
+#   vendor internals docs live in the vendor's own repo (ADR-019;
+#   leia docs migrated to displayxr-leia-plugin/docs/ in June 2026).
+#   Only the index README and `sim_display/` (whose driver ships
+#   in-tree) are allowed here. Catches stale pre-migration branches
+#   re-adding `docs/vendors/leia/` on merge.
+#
 # Add other lightweight lint jobs here as needed (yaml validity,
 # CLAUDE.md presence, etc.).
 
@@ -49,3 +56,28 @@ jobs:
             exit 1
           fi
           echo "Runtime tree is shell-source-free. ✓"
+
+  vendor-docs-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No vendor internals docs in runtime tree
+        run: |
+          # docs/vendors/ is an index: README.md + sim_display/ only.
+          # Plug-in vendor internals belong in the vendor's own repo
+          # (e.g. displayxr-leia-plugin/docs/). See ADR-019 and
+          # docs/vendors/README.md.
+          MATCHES=$(git ls-files docs/vendors/ | grep -vE '^docs/vendors/(README\.md$|sim_display/)' || true)
+          if [ -n "$MATCHES" ]; then
+            echo "::error::Vendor internals docs detected under docs/vendors/:"
+            echo "$MATCHES"
+            echo ""
+            echo "Vendor implementation docs live in the vendor's plug-in repo"
+            echo "(leia: displayxr-leia-plugin/docs/), not in the runtime tree."
+            echo "If you branched off pre-migration main, rebase onto current main"
+            echo "and move the doc to the plug-in repo, then link it from"
+            echo "docs/vendors/README.md."
+            exit 1
+          fi
+          echo "docs/vendors/ is index-only. ✓"
