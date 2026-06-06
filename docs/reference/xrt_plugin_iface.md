@@ -140,7 +140,7 @@ Fields to populate:
 | `display_pixel_width`, `display_pixel_height` | pixels (uint32) | Native panel resolution |
 | `recommended_view_scale_x`, `recommended_view_scale_y` | float, 1.0 = native | Vendor-recommended per-view scaling. <1.0 means downscale. |
 | `display_screen_left`, `display_screen_top` | virtual-screen coords (int32) | Display top-left in Windows-style virtual-screen pixels. Used to position workspace windows. Both 0 = "no preference / display origin == desktop origin" (sim-display picks this). |
-| `supported_eye_tracking_modes` | bitmask | bit 0 = MANAGED, bit 1 = MANUAL. A typical hardware DP is MANAGED-only; the reference simulator (sim_display) is MANUAL-only. |
+| `supported_eye_tracking_modes` | bitmask | bit 0 = MANAGED, bit 1 = MANUAL, `0` = no eye tracking. A typical hardware DP is MANAGED-only; the reference simulator (sim_display) declares `0` — its positions are nominal, not tracked (`SIM_DISPLAY_FAKE_TRACKING=1` dev toggle re-enables MANUAL for testing). Must be non-zero iff at least one `xrt_rendering_mode` sets `XRT_RENDERING_MODE_FLAG_HAS_TRACKING` in `mode_flags` (ABI v3, #441). |
 | `default_eye_tracking_mode` | enum | 0 = MANAGED, 1 = MANUAL. |
 
 **Returns:**

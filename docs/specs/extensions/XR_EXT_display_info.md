@@ -637,7 +637,7 @@ No known IP claims.
 ### Name Strings
 
 - Extension name: `XR_EXT_display_info`
-- Spec version: 13
+- Spec version: 14
 - Extension name define: `XR_EXT_DISPLAY_INFO_EXTENSION_NAME`
 
 ### Overview
@@ -738,7 +738,10 @@ typedef enum XrDisplayModeEXT {
 
 ### New Functions
 
-This extension's current (v13) function set:
+This extension's current (v14) function set (v14 adds no functions — only the chained
+`XrDisplayRenderingModeTrackingInfoEXT` struct and the
+`XrEventDataEyeTrackingStateChangedEXT` event; see
+[Per-Mode Tracking Capability + Tracking-State Event (v14)](#7c-per-mode-tracking-capability--tracking-state-event-v14)):
 
 | Function | Added | Purpose |
 |---|---|---|
@@ -1777,8 +1780,97 @@ See `docs/specs/vendor/eye-tracking-modes.md` for the full MANAGED/MANUAL contra
 |--------|-------------------|---------------|---------------------|
 | Hardware DP (typical) | `MANAGED_BIT` | `MANAGED` | Eye-distance heuristic (collapsed = not tracking) |
 | Hardware DP (future) | `MANAGED_BIT \| MANUAL_BIT` | `MANAGED` | SDK native flag |
-| Sim display | `MANUAL_BIT` | `MANUAL` | Always `XR_TRUE` (simulated) |
+| Sim display | `0` (NONE) — no real tracker (v14; was `MANUAL_BIT`) | undefined | Always `XR_FALSE` (dev toggle `SIM_DISPLAY_FAKE_TRACKING=1` re-enables `MANUAL_BIT` for hardware-free testing) |
 | No-tracker display | `0` (NONE) | undefined | Always `XR_FALSE` |
+
+---
+
+## 7c. Per-Mode Tracking Capability + Tracking-State Event (v14)
+
+### Motivation
+
+Tracking capability is not uniform across a display's rendering modes. A vendor may offer
+a **"2D tracked"** mode (content presented in 2D while the viewer remains eye-tracked, e.g.
+for head-coupled UI) alongside the default tracked 3D mode and fully untracked export modes
+(side-by-side, anaglyph). v13 and earlier could only express tracking capability
+system-wide via `XrEyeTrackingModeCapabilitiesEXT.supportedModes`.
+
+Separately, MANUAL-mode apps had to poll `XrViewEyeTrackingStateEXT.isTracking` every
+`xrLocateViews` to detect tracking loss; an edge-triggered event is the right primitive.
+
+### `XrDisplayRenderingModeTrackingInfoEXT` — chained per enumerated mode
+
+```c
+#define XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_EXT ((XrStructureType)1000999012)
+
+typedef struct XrDisplayRenderingModeTrackingInfoEXT {
+    XrStructureType    type;        // XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_EXT
+    void* XR_MAY_ALIAS next;
+    XrBool32           hasTracking; // mode consumes live eye tracking
+} XrDisplayRenderingModeTrackingInfoEXT;
+```
+
+The application chains one instance to the `next` pointer of **each**
+`XrDisplayRenderingModeInfoEXT` element it wants the capability for, before calling
+`xrEnumerateDisplayRenderingModesEXT`. The runtime fills `hasTracking` for every element
+that carries the chain; elements without it are filled exactly as in v13.
+
+> **Why a chained struct, not a field append — layout-freeze policy.** The runtime's
+> enumerate fill writes array elements with its own compiled struct stride. Appending
+> fields to `XrDisplayRenderingModeInfoEXT` (as v12/v13 did) silently corrupts memory in
+> application binaries compiled against an older header — there is no version handshake on
+> the app ABI to reject them cleanly. **`XrDisplayRenderingModeInfoEXT` is therefore frozen
+> at its v13 layout; all future per-mode fields MUST be added as chained structs.** This is
+> the canonical OpenXR pattern for extending enumerated output structs.
+
+**Semantics:**
+
+- `hasTracking == XR_FALSE` on the active mode forces
+  `XrViewEyeTrackingStateEXT.isTracking = XR_FALSE`, regardless of tracker state. The
+  runtime derives: `isTracking = activeMode.hasTracking && dp.is_tracking`.
+- `xrLocateViews` still ALWAYS returns fully populated views in every mode — in untracked
+  modes positions derive from the nominal viewer (or whatever the vendor chooses).
+- Consistency rule: `XrEyeTrackingModeCapabilitiesEXT.supportedModes != 0` ⇔ at least one
+  rendering mode reports `hasTracking == XR_TRUE`.
+- `xrRequestEyeTrackingModeEXT` remains a session-level preference validated against
+  `supportedModes` only; requesting MANAGED/MANUAL while an untracked mode is active is
+  valid and latent.
+
+### `XrEventDataEyeTrackingStateChangedEXT` — tracking-state edge event
+
+```c
+#define XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT ((XrStructureType)1000999013)
+
+typedef struct XrEventDataEyeTrackingStateChangedEXT {
+    XrStructureType          type;       // XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT
+    const void* XR_MAY_ALIAS next;
+    XrBool32                 isTracking; // new state
+    XrEyeTrackingModeEXT     activeMode; // session's MANAGED/MANUAL preference at edge time
+} XrEventDataEyeTrackingStateChangedEXT;
+```
+
+Queued on **every edge of the derived `isTracking` value** — DP-reported tracking
+loss/recovery AND rendering-mode switches into/out of untracked modes. This is the primary
+tracking-loss notification for MANUAL mode (detect `isTracking == XR_FALSE`, run your own
+transition, request a 2D mode when ready); it also fires in MANAGED mode, where apps may
+ignore it entirely. Edge detection runs in the runtime's `xrLocateViews` path, so apps that
+never locate views receive no events.
+
+### Backward Compatibility
+
+- v13-and-earlier binaries: `XrDisplayRenderingModeInfoEXT` layout unchanged; apps that
+  don't chain see exactly v13 behavior. The new event type is never delivered to apps that
+  don't recognize it any differently than other unhandled events (apps skip unknown
+  `xrPollEvent` results by design).
+- sim_display behavior change: `isTracking` is now honestly `XR_FALSE` (previously
+  inconsistently `XR_TRUE`/`XR_FALSE` depending on code path). Only test code asserting
+  `XR_TRUE` on sim would notice; use `SIM_DISPLAY_FAKE_TRACKING=1` there.
+
+### Vendor requirements
+
+Vendors set `XRT_RENDERING_MODE_FLAG_HAS_TRACKING` in `xrt_rendering_mode.mode_flags` for
+each tracked mode (plug-in ABI v3 — see `docs/specs/vendor/eye-tracking-modes.md` and
+`docs/guides/vendor-plugin-onboarding.md`). Zero-init = untracked = safe default.
 
 ---
 
