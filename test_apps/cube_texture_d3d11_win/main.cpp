@@ -96,6 +96,10 @@ static ComPtr<ID3D11Buffer> g_blitParamsCB;
 static ComPtr<ID3D11PixelShader> g_surroundPS;
 static ComPtr<ID3D11Buffer> g_surroundParamsCB;
 
+// #439 Phase 1 zone-mask harness ('Z' key) — set in WindowProc, consumed in
+// RenderOneFrame where the XR session + D3D device are at hand.
+static bool g_zoneCycleRequested = false;
+
 struct RenderState;
 static RenderState* g_renderState = nullptr;
 static void RenderOneFrame(RenderState& rs);
@@ -177,6 +181,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) {
             PostMessage(hwnd, WM_CLOSE, 0, 0);
+            return 0;
+        }
+        if (wParam == 'Z') {
+            // #439 Phase 1: cycle the XR_EXT_local_3d_zone test states.
+            g_zoneCycleRequested = true;
             return 0;
         }
         break;
@@ -560,6 +569,135 @@ static void UpdatePerformanceStats(PerformanceStats& stats) {
     }
 }
 
+// #439 Phase 1 — XR_EXT_local_3d_zone authoring harness. 'Z' cycles:
+//   0 no mask (rect-surround behavior)
+//   1 Tier-1 whole-window 3D (full weave, no 2D anywhere)
+//   2 Tier-2 single rect == the canvas rect (must match the analytic
+//     rect-surround output inside the window — impl doc §6 case 3)
+//   3 Tier-2 multi-rect: three disconnected 3D islands
+//   4 Tier-3 freeform: CPU radial gradient uploaded onto the mask RT
+//     (soft 2D↔3D edge — validates the mask-lerp, impl doc §6 case 4)
+static void ZoneMaskApplyNextState(XrSessionManager& xr, D3D11Renderer& renderer) {
+    if (!g_zone.available || xr.session == XR_NULL_HANDLE) {
+        LOG_WARN("Zone mask: XR_EXT_local_3d_zone not available on this runtime");
+        return;
+    }
+
+    int next = (g_zone.state + 1) % 5;
+
+    if (next == 0) {
+        if (g_zone.mask != XR_NULL_HANDLE) {
+            g_zone.pfnDestroy(g_zone.mask);
+            g_zone.mask = XR_NULL_HANDLE;
+        }
+        g_zone.state = 0;
+        LOG_INFO("Zone mask [0]: destroyed — rect-surround behavior restored");
+        return;
+    }
+
+    if (g_zone.mask == XR_NULL_HANDLE) {
+        XrLocal3DZoneCapabilitiesEXT caps = {XR_TYPE_LOCAL_3D_ZONE_CAPABILITIES_EXT};
+        if (g_zone.pfnGetCaps && XR_SUCCEEDED(g_zone.pfnGetCaps(xr.session, &caps))) {
+            LOG_INFO("Zone caps: supported=%d hwGrid=%ux%u maxMask=%ux%u", caps.supported,
+                caps.hardwareZoneGridWidth, caps.hardwareZoneGridHeight,
+                caps.maxMaskWidth, caps.maxMaskHeight);
+        }
+        XrLocal3DZoneMaskCreateInfoEXT ci = {XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_EXT};
+        ci.maskWidth = 0;  // 0 = runtime chooses the client-window dims (#464)
+        ci.maskHeight = 0;
+        XrResult res = g_zone.pfnCreate(xr.session, &ci, &g_zone.mask);
+        if (XR_FAILED(res)) {
+            LogXrResult("xrCreateLocal3DZoneMaskEXT", res);
+            return;
+        }
+    }
+
+    XrResult res = XR_SUCCESS;
+    switch (next) {
+    case 1: // Tier 1 — whole window 3D
+        res = g_zone.pfnSetWhole(g_zone.mask, XR_TRUE);
+        LOG_INFO("Zone mask [1]: Tier-1 whole-window 3D (full weave)");
+        break;
+    case 2: { // Tier 2 — single rect == the canvas rect (centered 50%)
+        XrRect2Di rect = {};
+        rect.offset.x = (int32_t)(g_windowWidth / 4);
+        rect.offset.y = (int32_t)(g_windowHeight / 4);
+        rect.extent.width = (int32_t)g_canvasW;
+        rect.extent.height = (int32_t)g_canvasH;
+        res = g_zone.pfnSetRects(g_zone.mask, 1, &rect);
+        LOG_INFO("Zone mask [2]: Tier-2 single rect == canvas (%d,%d %dx%d)",
+            rect.offset.x, rect.offset.y, rect.extent.width, rect.extent.height);
+        break;
+    }
+    case 3: { // Tier 2 — three disconnected 3D islands
+        const int32_t w = (int32_t)g_windowWidth;
+        const int32_t h = (int32_t)g_windowHeight;
+        XrRect2Di rects[3] = {};
+        rects[0].offset = {w / 8, h / 8};
+        rects[0].extent = {w / 4, h / 4};
+        rects[1].offset = {5 * w / 8, h / 8};
+        rects[1].extent = {w / 4, h / 4};
+        rects[2].offset = {3 * w / 8, 5 * h / 8};
+        rects[2].extent = {w / 4, h / 4};
+        res = g_zone.pfnSetRects(g_zone.mask, 3, rects);
+        LOG_INFO("Zone mask [3]: Tier-2 multi-rect — 3 disconnected 3D islands");
+        break;
+    }
+    case 4: { // Tier 3 — freeform radial gradient drawn by the app
+        XrLocal3DZoneRenderTargetD3D11EXT binding = {XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D11_EXT};
+        res = g_zone.pfnAcquireRT(g_zone.mask, &binding);
+        if (XR_SUCCEEDED(res) && binding.renderTargetView != nullptr &&
+            binding.width > 0 && binding.height > 0) {
+            // The mask RT lives on the app's own device in-process — write a
+            // CPU radial gradient straight onto the underlying resource
+            // (M=1 core → soft falloff → M=0). UpdateSubresource is legal on
+            // a DEFAULT-usage texture.
+            ID3D11RenderTargetView* rtv =
+                static_cast<ID3D11RenderTargetView*>(binding.renderTargetView);
+            ComPtr<ID3D11Resource> maskRes;
+            rtv->GetResource(&maskRes);
+            const uint32_t mw = binding.width;
+            const uint32_t mh = binding.height;
+            std::vector<uint8_t> pixels((size_t)mw * mh);
+            const float cxf = mw * 0.5f;
+            const float cyf = mh * 0.5f;
+            const float r3d = 0.30f * (float)(mw < mh ? mw : mh);  // full-3D core
+            const float feather = 0.5f * r3d;                      // soft edge
+            for (uint32_t y = 0; y < mh; y++) {
+                for (uint32_t x = 0; x < mw; x++) {
+                    float dx = (float)x - cxf;
+                    float dy = (float)y - cyf;
+                    float d = sqrtf(dx * dx + dy * dy);
+                    float m = 1.0f - (d - r3d) / feather;
+                    m = m < 0.0f ? 0.0f : (m > 1.0f ? 1.0f : m);
+                    pixels[(size_t)y * mw + x] = (uint8_t)(m * 255.0f + 0.5f);
+                }
+            }
+            renderer.context->UpdateSubresource(maskRes.Get(), 0, nullptr,
+                pixels.data(), mw, 0);
+            LOG_INFO("Zone mask [4]: Tier-3 radial gradient (%ux%u, core r=%.0f, feather=%.0f)",
+                mw, mh, r3d, feather);
+        } else {
+            LogXrResult("xrAcquireLocal3DZoneRenderTargetEXT", res);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    if (XR_FAILED(res)) {
+        LogXrResult("zone mask authoring", res);
+        return;
+    }
+
+    res = g_zone.pfnSubmit(g_zone.mask);
+    if (XR_FAILED(res)) {
+        LogXrResult("xrSubmitLocal3DZoneEXT", res);
+        return;
+    }
+    g_zone.state = next;
+}
+
 struct RenderState {
     HWND hwnd;
     XrSessionManager* xr;
@@ -612,6 +750,11 @@ static void RenderOneFrame(RenderState& rs) {
                 ? XR_EYE_TRACKING_MODE_MANUAL_EXT : XR_EYE_TRACKING_MODE_MANAGED_EXT;
             xr.pfnRequestEyeTrackingModeEXT(xr.session, newMode);
         }
+    }
+    // #439 Phase 1: 'Z' cycles the XR_EXT_local_3d_zone test states.
+    if (g_zoneCycleRequested) {
+        g_zoneCycleRequested = false;
+        ZoneMaskApplyNextState(xr, renderer);
     }
     UpdateScene(renderer, rs.perfStats->deltaTime);
     PollEvents(xr);
@@ -1264,7 +1407,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("");
     LOG_INFO("=== Entering main loop ===");
     LOG_INFO("Shared texture mode: runtime renders to shared texture, app blits to window");
-    LOG_INFO("Controls: WASD=Fly, Mouse=Look, Space=Reset, V=Mode, SHIFT+TAB=HUD, F11=Fullscreen, ESC=Quit");
+    LOG_INFO("Controls: WASD=Fly, Mouse=Look, Space=Reset, V=Mode, Z=ZoneMask, SHIFT+TAB=HUD, F11=Fullscreen, ESC=Quit");
 
     PerformanceStats perfStats = {};
     perfStats.lastTime = std::chrono::high_resolution_clock::now();
@@ -1313,6 +1456,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     rs.appSwapchain.Reset();
     rs.depthDSV.Reset();
     rs.depthTexture.Reset();
+
+    // #439 Phase 1: destroy the zone mask before session teardown (the oxr
+    // handle cascade would also do it; explicit keeps ordering obvious).
+    if (g_zone.mask != XR_NULL_HANDLE && g_zone.pfnDestroy) {
+        g_zone.pfnDestroy(g_zone.mask);
+        g_zone.mask = XR_NULL_HANDLE;
+        g_zone.state = 0;
+    }
 
     // Clear the runtime's surround registration first so the compositor
     // releases its opened texture before we drop our refs.

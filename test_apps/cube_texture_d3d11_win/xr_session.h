@@ -14,6 +14,28 @@
 #include <d3d11.h>
 #define XR_USE_GRAPHICS_API_D3D11
 #include "xr_session_common.h"
+#include <openxr/XR_EXT_local_3d_zone.h>
+
+// #439 Phase 1 — XR_EXT_local_3d_zone test harness state. App-local: the
+// shared XrSessionManager lives in displayxr-common, which doesn't carry this
+// extension yet. Populated by InitializeOpenXR, driven by the 'Z' key cycle
+// in main.cpp.
+struct ZoneMaskHarness {
+    bool available = false;
+    PFN_xrGetLocal3DZoneCapabilitiesEXT pfnGetCaps = nullptr;
+    PFN_xrCreateLocal3DZoneMaskEXT pfnCreate = nullptr;
+    PFN_xrSetLocal3DZoneWholeWindowEXT pfnSetWhole = nullptr;
+    PFN_xrSetLocal3DZoneFromRectsEXT pfnSetRects = nullptr;
+    PFN_xrAcquireLocal3DZoneRenderTargetEXT pfnAcquireRT = nullptr;
+    PFN_xrSubmitLocal3DZoneEXT pfnSubmit = nullptr;
+    PFN_xrDestroyLocal3DZoneMaskEXT pfnDestroy = nullptr;
+    XrLocal3DZoneMaskEXT mask = XR_NULL_HANDLE;
+    // 0 = no mask (rect-surround behavior), 1 = Tier-1 whole-window 3D,
+    // 2 = Tier-2 single rect == canvas, 3 = Tier-2 multi-rect islands,
+    // 4 = Tier-3 freeform radial gradient.
+    int state = 0;
+};
+extern ZoneMaskHarness g_zone;
 
 // Initialize OpenXR instance and check for XR_EXT_win32_window_binding support
 bool InitializeOpenXR(XrSessionManager& xr);

@@ -1536,8 +1536,10 @@ extern "C" xrt_result_t
 comp_d3d11_renderer_composite_2d_masked(struct comp_d3d11_renderer *renderer,
                                         void *dst_texture,
                                         void *twod_srv,
-                                        uint32_t dst_w,
-                                        uint32_t dst_h,
+                                        void *mask_srv,
+                                        void *weave_srv,
+                                        uint32_t region_w,
+                                        uint32_t region_h,
                                         int32_t cx,
                                         int32_t cy,
                                         uint32_t cw,
@@ -1546,10 +1548,13 @@ comp_d3d11_renderer_composite_2d_masked(struct comp_d3d11_renderer *renderer,
 	if (renderer == nullptr || dst_texture == nullptr || twod_srv == nullptr) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
+	// The authored-mask path lerps against the weave, so it must be readable.
+	if (mask_srv != nullptr && weave_srv == nullptr) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
 
 	auto internals = get_internals(renderer->c);
 	ID3D11Texture2D *dst = static_cast<ID3D11Texture2D *>(dst_texture);
-	ID3D11ShaderResourceView *src_srv = static_cast<ID3D11ShaderResourceView *>(twod_srv);
 
 	// Temporary RTV on the weave target (which already holds the weave).
 	ID3D11RenderTargetView *rtv = nullptr;
@@ -1559,13 +1564,18 @@ comp_d3d11_renderer_composite_2d_masked(struct comp_d3d11_renderer *renderer,
 		return XRT_ERROR_D3D;
 	}
 
-	// Bind weave target as RTV (no depth — the PS discards inside the canvas
-	// so those weaved pixels stay untouched; outside it writes the 2D layer).
+	// Bind weave target as RTV (no depth — the rect path discards inside the
+	// canvas so those weaved pixels stay untouched; the mask path lerps
+	// against the weave snapshot in t2).
 	internals->context->OMSetRenderTargets(1, &rtv, nullptr);
 
+	// #464: the composite region is window-sized at the top-left anchor of
+	// the (worst-case-allocated) surface; pixels beyond it are never written.
+	// The full-screen triangle's uv [0,1] spans the viewport, so region-sized
+	// SRVs sample 1:1. Phase 0 passes region == dst dims (full surface).
 	D3D11_VIEWPORT vp = {};
-	vp.Width = static_cast<float>(dst_w);
-	vp.Height = static_cast<float>(dst_h);
+	vp.Width = static_cast<float>(region_w);
+	vp.Height = static_cast<float>(region_h);
 	vp.MaxDepth = 1.0f;
 	internals->context->RSSetViewports(1, &vp);
 
@@ -1579,16 +1589,27 @@ comp_d3d11_renderer_composite_2d_masked(struct comp_d3d11_renderer *renderer,
 	internals->context->OMSetDepthStencilState(renderer->depth_stencil_state, 0);
 	internals->context->OMSetBlendState(renderer->blend_opaque, nullptr, 0xFFFFFFFF);
 	internals->context->PSSetSamplers(0, 1, &renderer->sampler_point);
-	internals->context->PSSetShaderResources(0, 1, &src_srv);
+
+	// t0 = 2D layer, t1 = authored mask (Phase 1), t2 = weave snapshot
+	// (Phase 1). t1/t2 stay NULL on the Phase 0 rect path — the shader never
+	// samples them when use_rect_mask is set.
+	ID3D11ShaderResourceView *srvs[3] = {
+	    static_cast<ID3D11ShaderResourceView *>(twod_srv),
+	    static_cast<ID3D11ShaderResourceView *>(mask_srv),
+	    static_cast<ID3D11ShaderResourceView *>(weave_srv),
+	};
+	internals->context->PSSetShaderResources(0, 3, srvs);
 
 	CompositeParams params = {};
-	params.dst_dims[0] = static_cast<float>(dst_w);
-	params.dst_dims[1] = static_cast<float>(dst_h);
+	params.dst_dims[0] = static_cast<float>(region_w);
+	params.dst_dims[1] = static_cast<float>(region_h);
 	params.canvas_origin[0] = static_cast<float>(cx);
 	params.canvas_origin[1] = static_cast<float>(cy);
 	params.canvas_size[0] = static_cast<float>(cw);
 	params.canvas_size[1] = static_cast<float>(ch);
-	params.use_rect_mask = 1; // Phase 0: hard rect mask derived from the canvas.
+	// Phase 0: hard rect mask derived from the canvas. Phase 1: sample the
+	// authored mask and run the lerp.
+	params.use_rect_mask = (mask_srv == nullptr) ? 1 : 0;
 
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	hr = internals->context->Map(renderer->composite_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -1605,11 +1626,11 @@ comp_d3d11_renderer_composite_2d_masked(struct comp_d3d11_renderer *renderer,
 
 	internals->context->Draw(3, 0);
 
-	// Unbind SRV + RTV to avoid read/write hazard warnings — the dst is the
+	// Unbind SRVs + RTV to avoid read/write hazard warnings — the dst is the
 	// DP's weave target and gets copied/sampled downstream (shared-texture
 	// readback, capture) while still in flight.
-	ID3D11ShaderResourceView *null_srv = nullptr;
-	internals->context->PSSetShaderResources(0, 1, &null_srv);
+	ID3D11ShaderResourceView *null_srvs[3] = {nullptr, nullptr, nullptr};
+	internals->context->PSSetShaderResources(0, 3, null_srvs);
 	ID3D11RenderTargetView *null_rtv = nullptr;
 	internals->context->OMSetRenderTargets(1, &null_rtv, nullptr);
 

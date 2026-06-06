@@ -9,6 +9,9 @@
 #include "logging.h"
 #include <cstring>
 
+// #439 Phase 1 — XR_EXT_local_3d_zone harness state (see xr_session.h).
+ZoneMaskHarness g_zone;
+
 #define XR_CHECK(call) \
     do { \
         XrResult result = (call); \
@@ -75,11 +78,15 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) {
             xr.hasDisplayInfoExt = true;
         }
+        if (strcmp(ext.extensionName, XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) {
+            g_zone.available = true;
+        }
     }
 
     LOG_INFO("XR_KHR_D3D11_enable: %s", hasD3D11 ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_win32_window_binding: %s", xr.hasWin32WindowBindingExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_display_info: %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_EXT_local_3d_zone: %s", g_zone.available ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasD3D11) {
         LOG_ERROR("XR_KHR_D3D11_enable extension not available");
@@ -96,6 +103,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     enabledExtensions.push_back(XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME);
     if (xr.hasDisplayInfoExt) {
         enabledExtensions.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+    }
+    if (g_zone.available) {
+        enabledExtensions.push_back(XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME);
     }
 
     LOG_INFO("Enabling %zu extensions", enabledExtensions.size());
@@ -162,6 +172,28 @@ bool InitializeOpenXR(XrSessionManager& xr) {
             (PFN_xrVoidFunction*)&xr.pfnSetSharedTextureOutputRectEXT);
         xrGetInstanceProcAddr(xr.instance, "xrSetSharedTextureSurround2DEXT",
             (PFN_xrVoidFunction*)&xr.pfnSetSharedTextureSurround2DEXT);
+    }
+
+    // #439 Phase 1 — XR_EXT_local_3d_zone entry points (app-local harness).
+    if (g_zone.available) {
+        xrGetInstanceProcAddr(xr.instance, "xrGetLocal3DZoneCapabilitiesEXT",
+            (PFN_xrVoidFunction*)&g_zone.pfnGetCaps);
+        xrGetInstanceProcAddr(xr.instance, "xrCreateLocal3DZoneMaskEXT",
+            (PFN_xrVoidFunction*)&g_zone.pfnCreate);
+        xrGetInstanceProcAddr(xr.instance, "xrSetLocal3DZoneWholeWindowEXT",
+            (PFN_xrVoidFunction*)&g_zone.pfnSetWhole);
+        xrGetInstanceProcAddr(xr.instance, "xrSetLocal3DZoneFromRectsEXT",
+            (PFN_xrVoidFunction*)&g_zone.pfnSetRects);
+        xrGetInstanceProcAddr(xr.instance, "xrAcquireLocal3DZoneRenderTargetEXT",
+            (PFN_xrVoidFunction*)&g_zone.pfnAcquireRT);
+        xrGetInstanceProcAddr(xr.instance, "xrSubmitLocal3DZoneEXT",
+            (PFN_xrVoidFunction*)&g_zone.pfnSubmit);
+        xrGetInstanceProcAddr(xr.instance, "xrDestroyLocal3DZoneMaskEXT",
+            (PFN_xrVoidFunction*)&g_zone.pfnDestroy);
+        if (!g_zone.pfnCreate || !g_zone.pfnSubmit || !g_zone.pfnDestroy) {
+            LOG_WARN("XR_EXT_local_3d_zone advertised but entry points missing — harness disabled");
+            g_zone.available = false;
+        }
     }
 
     // Get view configuration views
