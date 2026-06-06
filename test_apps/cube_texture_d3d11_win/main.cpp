@@ -628,7 +628,16 @@ static void RenderOneFrame(RenderState& rs) {
     // RenderSurroundPattern handshakes with the compositor's read pass.
     if (g_surroundRegistered && rs.perfStats) {
         static auto surroundStartTime = std::chrono::steady_clock::now();
-        float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - surroundStartTime).count();
+        // Repro knob (#439 Phase 0 A/B diff): DXR_SURROUND_FREEZE=1 pins the
+        // pattern's time term so two captures from different runs are
+        // byte-comparable in the surround region.
+        static int surroundFreeze = -1;
+        if (surroundFreeze < 0) {
+            const char* e = getenv("DXR_SURROUND_FREEZE");
+            surroundFreeze = (e && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+        }
+        float t = surroundFreeze ? 0.0f
+            : std::chrono::duration<float>(std::chrono::steady_clock::now() - surroundStartTime).count();
         int32_t cx = (int32_t)(g_windowWidth * 0.25f);
         int32_t cy = (int32_t)(g_windowHeight * 0.25f);
         uint32_t cw = g_windowWidth / 2;

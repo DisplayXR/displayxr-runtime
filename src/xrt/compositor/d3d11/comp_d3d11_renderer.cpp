@@ -1592,17 +1592,26 @@ comp_d3d11_renderer_composite_2d_masked(struct comp_d3d11_renderer *renderer,
 
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	hr = internals->context->Map(renderer->composite_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-	if (SUCCEEDED(hr)) {
-		memcpy(mapped.pData, &params, sizeof(params));
-		internals->context->Unmap(renderer->composite_cb, 0);
+	if (FAILED(hr)) {
+		// A stale CB could write the 2D layer over the canvas — bail and let
+		// the caller fall back to the strip copy.
+		U_LOG_E("composite_2d_masked: failed to map constant buffer: 0x%08x", hr);
+		rtv->Release();
+		return XRT_ERROR_D3D;
 	}
+	memcpy(mapped.pData, &params, sizeof(params));
+	internals->context->Unmap(renderer->composite_cb, 0);
 	internals->context->PSSetConstantBuffers(0, 1, &renderer->composite_cb);
 
 	internals->context->Draw(3, 0);
 
-	// Unbind SRV to avoid read/write hazard warnings.
+	// Unbind SRV + RTV to avoid read/write hazard warnings — the dst is the
+	// DP's weave target and gets copied/sampled downstream (shared-texture
+	// readback, capture) while still in flight.
 	ID3D11ShaderResourceView *null_srv = nullptr;
 	internals->context->PSSetShaderResources(0, 1, &null_srv);
+	ID3D11RenderTargetView *null_rtv = nullptr;
+	internals->context->OMSetRenderTargets(1, &null_rtv, nullptr);
 
 	rtv->Release();
 	return XRT_SUCCESS;

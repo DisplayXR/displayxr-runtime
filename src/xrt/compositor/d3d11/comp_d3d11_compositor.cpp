@@ -276,6 +276,9 @@ static bool d3d11_composite_surround_shader(struct comp_d3d11_compositor *c,
                                             int32_t cx, int32_t cy,
                                             uint32_t cw, uint32_t ch);
 static bool d3d11_surround_shader_enabled(void);
+static void d3d11_maybe_capture_surround_target(struct comp_d3d11_compositor *c,
+                                                ID3D11Texture2D *dst,
+                                                uint32_t dst_w, uint32_t dst_h);
 
 /*
  *
@@ -1603,6 +1606,10 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				    c->canvas.valid ? c->canvas.h : dp_target_h);
 			}
 
+			// #439 Phase 0 A/B validation probe (no-op unless
+			// DISPLAYXR_SURROUND_CAPTURE is set + trigger file exists).
+			d3d11_maybe_capture_surround_target(c, c->shared_texture, dp_target_w, dp_target_h);
+
 			weaving_done = true;
 		}
 
@@ -1685,6 +1692,10 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			    c->canvas.valid ? c->canvas.w : target_width,
 			    c->canvas.valid ? c->canvas.h : target_height);
 		}
+
+		// #439 Phase 0 A/B validation probe (no-op unless
+		// DISPLAYXR_SURROUND_CAPTURE is set + trigger file exists).
+		d3d11_maybe_capture_surround_target(c, back_buffer_for_surround, target_width, target_height);
 
 		weaving_done = true;
 	}
@@ -2314,6 +2325,16 @@ d3d11_composite_surround_shader(struct comp_d3d11_compositor *c,
 	D3D11_TEXTURE2D_DESC sd;
 	c->surround_texture->GetDesc(&sd);
 
+	// Contract parity with d3d11_blit_surround_strips: require matching DXGI
+	// formats. The strip path skips the blit on mismatch (with a WARN), so the
+	// shader path must decline too or A/B behavior diverges — falling back to
+	// the strips reuses their logging.
+	D3D11_TEXTURE2D_DESC dd;
+	dst->GetDesc(&dd);
+	if (sd.Format != dd.Format) {
+		return false;
+	}
+
 	// (Re)allocate the SRV-capable scratch to match the surround.
 	bool need_alloc = c->surround_scratch == nullptr;
 	if (!need_alloc) {
@@ -2359,8 +2380,19 @@ d3d11_composite_surround_shader(struct comp_d3d11_compositor *c,
 	c->context->CopyResource(c->surround_scratch, c->surround_texture);
 	c->surround_mutex->ReleaseSync(0);
 
+	// Clamp the canvas exactly as d3d11_blit_surround_strips does, so the
+	// shader's analytic rect classifies every pixel identically — including
+	// degenerate rects (negative origin, rect spilling past the dst edge).
+	uint32_t cx_u = (cx < 0) ? 0u : (uint32_t)cx;
+	uint32_t cy_u = (cy < 0) ? 0u : (uint32_t)cy;
+	if (cx_u > dst_w) cx_u = dst_w;
+	if (cy_u > dst_h) cy_u = dst_h;
+	uint32_t cright = (cx_u + cw > dst_w) ? dst_w : cx_u + cw;
+	uint32_t cbottom = (cy_u + ch > dst_h) ? dst_h : cy_u + ch;
+
 	xrt_result_t xret = comp_d3d11_renderer_composite_2d_masked(
-	    c->renderer, dst, c->surround_scratch_srv, dst_w, dst_h, cx, cy, cw, ch);
+	    c->renderer, dst, c->surround_scratch_srv, dst_w, dst_h,
+	    (int32_t)cx_u, (int32_t)cy_u, cright - cx_u, cbottom - cy_u);
 	return xret == XRT_SUCCESS;
 }
 
@@ -2375,6 +2407,45 @@ d3d11_surround_shader_enabled(void)
 		cached = (e != nullptr && e[0] != '\0' && e[0] != '0') ? 1 : 0;
 	}
 	return cached != 0;
+}
+
+// #439 Phase 0 validation probe — env-gated (DISPLAYXR_SURROUND_CAPTURE=1)
+// file-trigger dump of the final surround-composited target. The normal
+// POST_COMPOSE capture reads the renderer ATLAS, which the surround pass never
+// touches, so the §6 A/B pixel-identity diff needs this dedicated probe.
+// Trigger: %TEMP%\displayxr_surround_trigger → %TEMP%\displayxr_surround.png
+// (raw channel order of the target — both A and B captures swap identically,
+// so the diff is unaffected). Default-off, zero per-frame cost when unset.
+static void
+d3d11_maybe_capture_surround_target(struct comp_d3d11_compositor *c,
+                                    ID3D11Texture2D *dst,
+                                    uint32_t dst_w, uint32_t dst_h)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		const char *e = getenv("DISPLAYXR_SURROUND_CAPTURE");
+		enabled = (e != nullptr && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+	}
+	if (!enabled || dst == nullptr) {
+		return;
+	}
+	static char trig[MAX_PATH] = {0};
+	static char outp[MAX_PATH] = {0};
+	if (trig[0] == '\0') {
+		const char *tmp = getenv("TEMP");
+		if (tmp == nullptr || tmp[0] == '\0') {
+			tmp = "C:\\Temp";
+		}
+		snprintf(trig, sizeof(trig), "%s\\displayxr_surround_trigger", tmp);
+		snprintf(outp, sizeof(outp), "%s\\displayxr_surround.png", tmp);
+	}
+	if (GetFileAttributesA(trig) == INVALID_FILE_ATTRIBUTES) {
+		return;
+	}
+	DeleteFileA(trig);
+	bool ok = d3d11_capture_texture_to_png(c, dst, dst_w, dst_h, 0, 0, outp);
+	U_LOG_W("Surround composite capture %s -> %s (shader=%d)",
+	        ok ? "written" : "FAILED", outp, d3d11_surround_shader_enabled() ? 1 : 0);
 }
 
 // Blit non-canvas pixels of the surround texture into the dst texture
