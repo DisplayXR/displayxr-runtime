@@ -35,6 +35,21 @@ struct LayerConstants
 };
 
 /*!
+ * Masked 2D-over-3D composite constant buffer (unified-2d-3d-compositing #439,
+ * Phase 0). Matches `cbuffer CompositeParams : register(b0)` in
+ * shaders/masked_composite.hlsl. 32 bytes; HLSL packs as two float4 rows with
+ * no straddle (dst_dims.xy | canvas_origin.xy , canvas_size.xy | mask | pad).
+ */
+struct CompositeParams
+{
+	float dst_dims[2];      // destination width,height in px
+	float canvas_origin[2]; // 3D canvas sub-rect top-left (px)
+	float canvas_size[2];   // 3D canvas sub-rect size (px)
+	uint32_t use_rect_mask; // 1 = Phase 0 analytic rect mask
+	uint32_t _pad;
+};
+
+/*!
  * D3D11 renderer structure.
  */
 struct comp_d3d11_renderer
@@ -68,6 +83,12 @@ struct comp_d3d11_renderer
 
 	//! Pixel shader for quad layers.
 	ID3D11PixelShader *quad_ps;
+
+	//! Masked 2D-over-3D composite shaders (#439 Phase 0).
+	ID3D11VertexShader *composite_vs;
+	ID3D11PixelShader *composite_ps;
+	//! Constant buffer for the composite pass (CompositeParams).
+	ID3D11Buffer *composite_cb;
 
 	//! Constant buffer for shader parameters.
 	ID3D11Buffer *constant_buffer;
@@ -270,6 +291,89 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
 }
 )";
 
+// Masked 2D-over-3D composite (#439 Phase 0). Keep byte-aligned with
+// shaders/masked_composite.hlsl. Phase 0 derives a hard mask from the canvas
+// rect (discard inside → weave kept; sample 2D outside at 1:1). The Phase 1+
+// lerp path (sample mask_tex t1, lerp against weave_tex t2) is present but
+// gated by use_rect_mask.
+static const char *masked_composite_vs_source = R"(
+struct VS_OUTPUT
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+static const float2 positions[3] = {
+    float2(-1.0, -1.0),
+    float2(-1.0,  3.0),
+    float2( 3.0, -1.0),
+};
+static const float2 uvs[3] = {
+    float2(0.0, 1.0),
+    float2(0.0, -1.0),
+    float2(2.0, 1.0),
+};
+
+VS_OUTPUT VSMain(uint vertex_id : SV_VertexID)
+{
+    VS_OUTPUT o;
+    o.position = float4(positions[vertex_id], 0.0, 1.0);
+    o.uv = uvs[vertex_id];
+    return o;
+}
+)";
+
+static const char *masked_composite_ps_source = R"(
+Texture2D twod_tex   : register(t0);
+Texture2D mask_tex   : register(t1);
+Texture2D weave_tex  : register(t2);
+SamplerState samp    : register(s0);
+
+cbuffer CompositeParams : register(b0)
+{
+    float2 dst_dims;
+    float2 canvas_origin;
+    float2 canvas_size;
+    uint   use_rect_mask;
+    uint   _pad;
+};
+
+struct VS_OUTPUT
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+float region_mask(float2 px, float2 uv)
+{
+    if (use_rect_mask)
+    {
+        bool inside =
+            px.x >= canvas_origin.x && px.x < canvas_origin.x + canvas_size.x &&
+            px.y >= canvas_origin.y && px.y < canvas_origin.y + canvas_size.y;
+        return inside ? 1.0 : 0.0;
+    }
+    return saturate(mask_tex.Sample(samp, uv).r);
+}
+
+float4 PSMain(VS_OUTPUT input) : SV_Target
+{
+    float2 px = input.uv * dst_dims;
+    float M = region_mask(px, input.uv);
+
+    if (use_rect_mask)
+    {
+        if (M >= 0.5)
+            discard;
+        return twod_tex.Sample(samp, input.uv);
+    }
+
+    float4 twod  = twod_tex.Sample(samp, input.uv);
+    float4 weave = weave_tex.Sample(samp, input.uv);
+    return M * weave + (1.0 - M) * twod;
+}
+)";
+
 static xrt_result_t
 compile_shader(ID3D11Device *device,
                const char *source,
@@ -359,6 +463,34 @@ create_shaders(struct comp_d3d11_renderer *r)
 		return XRT_ERROR_D3D;
 	}
 
+	// Masked 2D-over-3D composite vertex shader (#439 Phase 0).
+	xret = compile_shader(internals->device, masked_composite_vs_source, "VSMain", "vs_5_0", &blob);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_E("Failed to compile composite vertex shader");
+		return xret;
+	}
+	hr = internals->device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+	                                            &r->composite_vs);
+	blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create composite vertex shader: 0x%08x", hr);
+		return XRT_ERROR_D3D;
+	}
+
+	// Masked 2D-over-3D composite pixel shader (#439 Phase 0).
+	xret = compile_shader(internals->device, masked_composite_ps_source, "PSMain", "ps_5_0", &blob);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_E("Failed to compile composite pixel shader");
+		return xret;
+	}
+	hr = internals->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+	                                           &r->composite_ps);
+	blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create composite pixel shader: 0x%08x", hr);
+		return XRT_ERROR_D3D;
+	}
+
 	return XRT_SUCCESS;
 }
 
@@ -436,6 +568,18 @@ create_resources(struct comp_d3d11_renderer *r)
 	hr = internals->device->CreateBuffer(&cbDesc, nullptr, &r->constant_buffer);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create constant buffer: 0x%08x", hr);
+		return XRT_ERROR_D3D;
+	}
+
+	// Composite constant buffer (#439 Phase 0).
+	D3D11_BUFFER_DESC compCbDesc = {};
+	compCbDesc.ByteWidth = sizeof(CompositeParams);
+	compCbDesc.Usage = D3D11_USAGE_DYNAMIC;
+	compCbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	compCbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+	hr = internals->device->CreateBuffer(&compCbDesc, nullptr, &r->composite_cb);
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create composite constant buffer: 0x%08x", hr);
 		return XRT_ERROR_D3D;
 	}
 
@@ -982,6 +1126,9 @@ comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr)
 	SAFE_RELEASE(r->sampler_point);
 	SAFE_RELEASE(r->sampler_linear);
 	SAFE_RELEASE(r->constant_buffer);
+	SAFE_RELEASE(r->composite_cb);
+	SAFE_RELEASE(r->composite_ps);
+	SAFE_RELEASE(r->composite_vs);
 	SAFE_RELEASE(r->quad_ps);
 	SAFE_RELEASE(r->quad_vs);
 	SAFE_RELEASE(r->projection_ps);
@@ -1386,6 +1533,82 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 }
 
 extern "C" xrt_result_t
+comp_d3d11_renderer_composite_2d_masked(struct comp_d3d11_renderer *renderer,
+                                        void *dst_texture,
+                                        void *twod_srv,
+                                        uint32_t dst_w,
+                                        uint32_t dst_h,
+                                        int32_t cx,
+                                        int32_t cy,
+                                        uint32_t cw,
+                                        uint32_t ch)
+{
+	if (renderer == nullptr || dst_texture == nullptr || twod_srv == nullptr) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	auto internals = get_internals(renderer->c);
+	ID3D11Texture2D *dst = static_cast<ID3D11Texture2D *>(dst_texture);
+	ID3D11ShaderResourceView *src_srv = static_cast<ID3D11ShaderResourceView *>(twod_srv);
+
+	// Temporary RTV on the weave target (which already holds the weave).
+	ID3D11RenderTargetView *rtv = nullptr;
+	HRESULT hr = internals->device->CreateRenderTargetView(dst, nullptr, &rtv);
+	if (FAILED(hr)) {
+		U_LOG_E("composite_2d_masked: failed to create RTV: 0x%08x", hr);
+		return XRT_ERROR_D3D;
+	}
+
+	// Bind weave target as RTV (no depth — the PS discards inside the canvas
+	// so those weaved pixels stay untouched; outside it writes the 2D layer).
+	internals->context->OMSetRenderTargets(1, &rtv, nullptr);
+
+	D3D11_VIEWPORT vp = {};
+	vp.Width = static_cast<float>(dst_w);
+	vp.Height = static_cast<float>(dst_h);
+	vp.MaxDepth = 1.0f;
+	internals->context->RSSetViewports(1, &vp);
+
+	// Full-screen triangle (3 verts pulled from SV_VertexID), opaque output
+	// + point sampling → byte-identical to the strip CopySubresourceRegion.
+	internals->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	internals->context->IASetInputLayout(nullptr);
+	internals->context->VSSetShader(renderer->composite_vs, nullptr, 0);
+	internals->context->PSSetShader(renderer->composite_ps, nullptr, 0);
+	internals->context->RSSetState(renderer->rasterizer_state);
+	internals->context->OMSetDepthStencilState(renderer->depth_stencil_state, 0);
+	internals->context->OMSetBlendState(renderer->blend_opaque, nullptr, 0xFFFFFFFF);
+	internals->context->PSSetSamplers(0, 1, &renderer->sampler_point);
+	internals->context->PSSetShaderResources(0, 1, &src_srv);
+
+	CompositeParams params = {};
+	params.dst_dims[0] = static_cast<float>(dst_w);
+	params.dst_dims[1] = static_cast<float>(dst_h);
+	params.canvas_origin[0] = static_cast<float>(cx);
+	params.canvas_origin[1] = static_cast<float>(cy);
+	params.canvas_size[0] = static_cast<float>(cw);
+	params.canvas_size[1] = static_cast<float>(ch);
+	params.use_rect_mask = 1; // Phase 0: hard rect mask derived from the canvas.
+
+	D3D11_MAPPED_SUBRESOURCE mapped;
+	hr = internals->context->Map(renderer->composite_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+	if (SUCCEEDED(hr)) {
+		memcpy(mapped.pData, &params, sizeof(params));
+		internals->context->Unmap(renderer->composite_cb, 0);
+	}
+	internals->context->PSSetConstantBuffers(0, 1, &renderer->composite_cb);
+
+	internals->context->Draw(3, 0);
+
+	// Unbind SRV to avoid read/write hazard warnings.
+	ID3D11ShaderResourceView *null_srv = nullptr;
+	internals->context->PSSetShaderResources(0, 1, &null_srv);
+
+	rtv->Release();
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
 comp_d3d11_renderer_blit_stretch(struct comp_d3d11_renderer *renderer,
                                  void *back_buffer_texture,
                                  uint32_t target_width,

@@ -4,6 +4,8 @@
 **Spec:** [`docs/roadmap/unified-2d-3d-compositing.md`](docs/roadmap/unified-2d-3d-compositing.md) §4, §6 (Phase 0). Epic #439.
 **Goal:** stand up the general masked-2D-over-3D composite as a runtime-compiled shader pass, prove it **pixel-identical** to today's rectangular `d3d11_blit_surround_strips`, behind an opt-in toggle. Zero default behavioral change.
 
+**STATUS (drafted, UNBUILT):** shader + full renderer/compositor wiring written on this branch — **Option A (scratch copy) chosen** (§0). Not yet compiled (authored on macOS). Next: the Windows build loop (§6) — `build_windows.bat build` → fix compile errors → A/B capture diff. Default path (env unset) is untouched, so the draft is safe to carry until then.
+
 > **BUILD NOTE:** D3D11 only compiles on Windows (`scripts\build_windows.bat build`). This worktree is macOS — the shader + this plan are authored here; the `.cpp` wiring + the pixel-diff validation run in a Windows session on the Leia machine. The shader (`shaders/masked_composite.hlsl`) and embedded-source string must stay byte-identical.
 
 ---
@@ -16,7 +18,7 @@ This means "re-express the surround strip-copy as a shader sample" is **not free
 
 | Option | What | Cost | Spec impact |
 |---|---|---|---|
-| **A. Scratch copy** (recommended for Phase 0) | `CopySubresourceRegion` surround → an internal SRV-capable scratch texture (runtime-allocated, `BIND_SHADER_RESOURCE`), then the shader samples the scratch | +1 copy/frame (removed once the 2D side is a runtime-allocated layer in Phase 3) | none |
+| **A. Scratch copy** ✅ **CHOSEN** | `CopyResource` surround → an internal SRV-capable scratch texture (runtime-allocated, `BIND_SHADER_RESOURCE`), then the shader samples the scratch | +1 copy/frame (removed once the 2D side is a runtime-allocated layer in Phase 3) | none |
 | **B. Require SRV on surround** | `XR_EXT_win32_window_binding` §3.6 mandates the app create the surround with `D3D11_BIND_SHADER_RESOURCE` | zero extra copy | spec bump + breaks existing surround apps until they add the flag |
 | **C. Defer** | leave `d3d11_blit_surround_strips` untouched; only exercise the shader pass against a runtime-allocated 2D layer (Phase 1), never against the app surround | zero | none, but Phase 0 no longer "re-expresses surround" — it validates the shader against a synthetic source |
 

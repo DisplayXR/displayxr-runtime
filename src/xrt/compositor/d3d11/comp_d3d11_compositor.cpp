@@ -161,6 +161,15 @@ struct comp_d3d11_compositor
 	//! between Acquire(0)/Release(0)).
 	IDXGIKeyedMutex *surround_mutex;
 
+	//! SRV-capable scratch copy of the surround texture, for the shader
+	//! composite path (#439 Phase 0, DISPLAYXR_SURROUND_SHADER). The app's
+	//! surround is copy-only (may lack BIND_SHADER_RESOURCE), so each frame
+	//! we CopyResource it here and the composite shader samples this. Lazily
+	//! (re)allocated to the surround dims+format. Removed in Phase 3 when the
+	//! 2D layer is a runtime-owned, SRV-capable composition layer.
+	ID3D11Texture2D *surround_scratch;
+	ID3D11ShaderResourceView *surround_scratch_srv;
+
 	//! Generic D3D11 display processor (vendor-agnostic weaving).
 	struct xrt_display_processor_d3d11 *display_processor;
 
@@ -259,6 +268,14 @@ static void d3d11_blit_surround_strips(struct comp_d3d11_compositor *c,
                                         uint32_t dst_w, uint32_t dst_h,
                                         int32_t cx, int32_t cy,
                                         uint32_t cw, uint32_t ch);
+// #439 Phase 0 shader composite path + its dev toggle (defined below, called
+// from the layer-commit paths above the definitions).
+static bool d3d11_composite_surround_shader(struct comp_d3d11_compositor *c,
+                                            ID3D11Texture2D *dst,
+                                            uint32_t dst_w, uint32_t dst_h,
+                                            int32_t cx, int32_t cy,
+                                            uint32_t cw, uint32_t ch);
+static bool d3d11_surround_shader_enabled(void);
 
 /*
  *
@@ -1565,12 +1582,26 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			// Spec v6 surround blit: fill non-canvas pixels of the shared
 			// texture from the app-supplied 2D surround texture (no-op if
 			// xrSetSharedTextureSurround2DEXT was never called).
-			d3d11_blit_surround_strips(
-			    c, c->shared_texture, dp_target_w, dp_target_h,
-			    c->canvas.valid ? c->canvas.x : 0,
-			    c->canvas.valid ? c->canvas.y : 0,
-			    c->canvas.valid ? c->canvas.w : dp_target_w,
-			    c->canvas.valid ? c->canvas.h : dp_target_h);
+			// #439 Phase 0: DISPLAYXR_SURROUND_SHADER routes this through the
+			// general masked-composite shader instead of the strip copy
+			// (pixel-identical); falls back to the strips if it can't run.
+			bool surround_done = false;
+			if (d3d11_surround_shader_enabled()) {
+				surround_done = d3d11_composite_surround_shader(
+				    c, c->shared_texture, dp_target_w, dp_target_h,
+				    c->canvas.valid ? c->canvas.x : 0,
+				    c->canvas.valid ? c->canvas.y : 0,
+				    c->canvas.valid ? c->canvas.w : dp_target_w,
+				    c->canvas.valid ? c->canvas.h : dp_target_h);
+			}
+			if (!surround_done) {
+				d3d11_blit_surround_strips(
+				    c, c->shared_texture, dp_target_w, dp_target_h,
+				    c->canvas.valid ? c->canvas.x : 0,
+				    c->canvas.valid ? c->canvas.y : 0,
+				    c->canvas.valid ? c->canvas.w : dp_target_w,
+				    c->canvas.valid ? c->canvas.h : dp_target_h);
+			}
 
 			weaving_done = true;
 		}
@@ -1635,12 +1666,25 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// composite into c->shared_texture for _texture-mode read-back.
 		ID3D11Texture2D *back_buffer_for_surround = static_cast<ID3D11Texture2D *>(
 		    comp_d3d11_target_get_back_buffer(c->target));
-		d3d11_blit_surround_strips(
-		    c, back_buffer_for_surround, target_width, target_height,
-		    c->canvas.valid ? c->canvas.x : 0,
-		    c->canvas.valid ? c->canvas.y : 0,
-		    c->canvas.valid ? c->canvas.w : target_width,
-		    c->canvas.valid ? c->canvas.h : target_height);
+		// #439 Phase 0: DISPLAYXR_SURROUND_SHADER routes through the general
+		// masked-composite shader (pixel-identical); strip-copy fallback.
+		bool surround_done = false;
+		if (d3d11_surround_shader_enabled()) {
+			surround_done = d3d11_composite_surround_shader(
+			    c, back_buffer_for_surround, target_width, target_height,
+			    c->canvas.valid ? c->canvas.x : 0,
+			    c->canvas.valid ? c->canvas.y : 0,
+			    c->canvas.valid ? c->canvas.w : target_width,
+			    c->canvas.valid ? c->canvas.h : target_height);
+		}
+		if (!surround_done) {
+			d3d11_blit_surround_strips(
+			    c, back_buffer_for_surround, target_width, target_height,
+			    c->canvas.valid ? c->canvas.x : 0,
+			    c->canvas.valid ? c->canvas.y : 0,
+			    c->canvas.valid ? c->canvas.w : target_width,
+			    c->canvas.valid ? c->canvas.h : target_height);
+		}
 
 		weaving_done = true;
 	}
@@ -2232,6 +2276,105 @@ d3d11_release_surround(struct comp_d3d11_compositor *c)
 		c->surround_texture->Release();
 		c->surround_texture = nullptr;
 	}
+	// #439 Phase 0: scratch SRV copy used by the shader composite path.
+	if (c->surround_scratch_srv != nullptr) {
+		c->surround_scratch_srv->Release();
+		c->surround_scratch_srv = nullptr;
+	}
+	if (c->surround_scratch != nullptr) {
+		c->surround_scratch->Release();
+		c->surround_scratch = nullptr;
+	}
+}
+
+// #439 Phase 0 — shader composite path (gated by DISPLAYXR_SURROUND_SHADER).
+// Generalizes d3d11_blit_surround_strips: instead of CopySubresourceRegion of
+// the rect-complement strips, copy the (copy-only, app-supplied) surround into
+// an SRV-capable scratch, then run the masked-composite shader which keeps the
+// weave inside the canvas and writes the 2D layer outside. Output is
+// pixel-identical to the strip blit (point sampler + opaque output). dst_rtv
+// is unused — the renderer creates a transient RTV on dst — but dst must carry
+// the weave already. Returns without compositing (leaving the strip-blit
+// fallback to run) if the surround/scratch can't be prepared.
+static bool
+d3d11_composite_surround_shader(struct comp_d3d11_compositor *c,
+                                ID3D11Texture2D *dst,
+                                uint32_t dst_w, uint32_t dst_h,
+                                int32_t cx, int32_t cy,
+                                uint32_t cw, uint32_t ch)
+{
+	if (!c->surround_2d.valid || c->surround_texture == nullptr || c->surround_mutex == nullptr ||
+	    dst == nullptr || c->renderer == nullptr) {
+		return false;
+	}
+	if (c->surround_2d.w != dst_w || c->surround_2d.h != dst_h) {
+		return false; // dim contract — same as the strip path; caller logs.
+	}
+
+	D3D11_TEXTURE2D_DESC sd;
+	c->surround_texture->GetDesc(&sd);
+
+	// (Re)allocate the SRV-capable scratch to match the surround.
+	bool need_alloc = c->surround_scratch == nullptr;
+	if (!need_alloc) {
+		D3D11_TEXTURE2D_DESC cur;
+		c->surround_scratch->GetDesc(&cur);
+		need_alloc = (cur.Width != sd.Width || cur.Height != sd.Height || cur.Format != sd.Format);
+	}
+	if (need_alloc) {
+		if (c->surround_scratch_srv != nullptr) {
+			c->surround_scratch_srv->Release();
+			c->surround_scratch_srv = nullptr;
+		}
+		if (c->surround_scratch != nullptr) {
+			c->surround_scratch->Release();
+			c->surround_scratch = nullptr;
+		}
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = sd.Width;
+		td.Height = sd.Height;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = sd.Format;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		HRESULT hr = c->device->CreateTexture2D(&td, nullptr, &c->surround_scratch);
+		if (FAILED(hr) || c->surround_scratch == nullptr) {
+			U_LOG_W("composite_surround_shader: scratch alloc failed: 0x%08x", hr);
+			return false;
+		}
+		hr = c->device->CreateShaderResourceView(c->surround_scratch, nullptr, &c->surround_scratch_srv);
+		if (FAILED(hr) || c->surround_scratch_srv == nullptr) {
+			U_LOG_W("composite_surround_shader: scratch SRV failed: 0x%08x", hr);
+			return false;
+		}
+	}
+
+	// Copy the app surround into the scratch under the keyed-mutex protocol.
+	HRESULT hr = c->surround_mutex->AcquireSync(0, 16);
+	if (FAILED(hr)) {
+		return false; // timeout/abandoned — skip; previous scratch contents stay.
+	}
+	c->context->CopyResource(c->surround_scratch, c->surround_texture);
+	c->surround_mutex->ReleaseSync(0);
+
+	xrt_result_t xret = comp_d3d11_renderer_composite_2d_masked(
+	    c->renderer, dst, c->surround_scratch_srv, dst_w, dst_h, cx, cy, cw, ch);
+	return xret == XRT_SUCCESS;
+}
+
+// Cached DISPLAYXR_SURROUND_SHADER toggle (dev-only A/B harness for #439
+// Phase 0). Default off → unchanged strip-copy behavior.
+static bool
+d3d11_surround_shader_enabled(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char *e = getenv("DISPLAYXR_SURROUND_SHADER");
+		cached = (e != nullptr && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+	}
+	return cached != 0;
 }
 
 // Blit non-canvas pixels of the surround texture into the dst texture
