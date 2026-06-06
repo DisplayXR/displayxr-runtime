@@ -106,8 +106,12 @@ struct xrt_plugin_display_info
 
 	/*! Eye-tracking mode bits supported by this display, as
 	 *  understood by `XR_EXT_display_info`. Bit 0 = MANAGED, bit 1 =
-	 *  MANUAL. Leia is MANAGED-only (bit 0); sim_display is
-	 *  MANUAL-only (bit 1). */
+	 *  MANUAL; 0 = no eye tracking at all. A typical hardware DP is
+	 *  MANAGED-only (bit 0); sim_display declares 0 — its positions
+	 *  are nominal, not tracked (`SIM_DISPLAY_FAKE_TRACKING=1`
+	 *  re-enables MANUAL for hardware-free testing). Consistency rule
+	 *  (#441): non-zero iff at least one rendering mode sets
+	 *  XRT_RENDERING_MODE_FLAG_HAS_TRACKING in `mode_flags`. */
 	uint32_t supported_eye_tracking_modes;
 
 	/*! Default eye-tracking mode for sessions that don't override.
