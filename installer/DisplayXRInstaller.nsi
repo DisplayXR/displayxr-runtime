@@ -791,9 +791,24 @@ Section "DisplayXR Runtime" SecRuntime
 		DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "DisplayXR Service"
 		SetRegView 64
 
-		; Start the service immediately so it's available without relogon
-		DetailPrint "Starting DisplayXR Service..."
-		Exec '"$INSTDIR\displayxr-service.exe"'
+		; Start the service immediately so it's available without relogon.
+		; #461: '/NOSTART' suppresses ONLY this immediate launch (the Run key
+		; above is still written). The bundle installer passes it so the
+		; service can't be holding plug-in DLLs mapped when later chain
+		; components (e.g. the Leia plug-in) replace them — NSIS /S installs
+		; skip locked files SILENTLY, leaving registry/disk version skew.
+		; The bundle restarts the service once at the end of the chain (#342).
+		; Unknown switches are ignored by older installers, so passing
+		; /NOSTART is always safe for the caller.
+		${GetParameters} $R0
+		ClearErrors
+		${GetOptions} $R0 "/NOSTART" $R1
+		${IfNot} ${Errors}
+			DetailPrint "Skipping immediate service start (/NOSTART)."
+		${Else}
+			DetailPrint "Starting DisplayXR Service..."
+			Exec '"$INSTDIR\displayxr-service.exe"'
+		${EndIf}
 	skip_service_autostart:
 
 	; Save installation log to install directory

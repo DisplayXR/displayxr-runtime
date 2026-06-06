@@ -114,6 +114,15 @@ static int g_display_source_count = -1;
 #include <stdio.h>
 #include <wchar.h>
 
+/* GetFileVersionInfoW / VerQueryValueW for the registry↔DLL version-skew
+ * tripwire (#461). MSVC-style autolink keeps the dependency local to this
+ * translation unit instead of threading version.lib through every target
+ * that links target_common. (MinGW ignores the pragma; the cross-check
+ * subset doesn't build this target.) */
+#ifdef _MSC_VER
+#pragma comment(lib, "version.lib")
+#endif
+
 /*!
  * Maximum number of plug-ins we enumerate from the registry. 16 is
  * generous — the design admits at most a handful in practice (vendor
@@ -294,6 +303,55 @@ compare_by_probe_order(const void *a, const void *b)
  * function pointers remain callable.
  */
 /*!
+ * Registry↔DLL version-skew tripwire (#461). Installers replace the plug-in
+ * DLL and rewrite the registry `Version` in one transaction — EXCEPT when a
+ * running process (typically displayxr-service) has the DLL mapped: NSIS
+ * silent installs skip locked files with exit 0, leaving an old DLL on disk
+ * under a new registry version (the v0.14.0 bundle incident). Compare the
+ * registry semver against the DLL's embedded VERSIONINFO and WARN loudly on
+ * mismatch. Quietly does nothing when the DLL ships no version resource
+ * (sim-display today) or the registry value isn't a semver.
+ */
+static void
+check_registry_dll_version_skew(const struct plugin_entry *e)
+{
+	unsigned reg_major = 0, reg_minor = 0, reg_patch = 0;
+	const char *v = e->version;
+	if (*v == 'v') {
+		v++;
+	}
+	if (sscanf(v, "%u.%u.%u", &reg_major, &reg_minor, &reg_patch) != 3) {
+		return; /* empty / non-semver registry Version — nothing to compare */
+	}
+
+	DWORD ignored = 0;
+	DWORD size = GetFileVersionInfoSizeW(e->binary_path, &ignored);
+	if (size == 0) {
+		return; /* DLL ships no VERSIONINFO resource — nothing to compare */
+	}
+	void *buf = malloc(size);
+	if (buf == NULL) {
+		return;
+	}
+	VS_FIXEDFILEINFO *ffi = NULL;
+	UINT ffi_len = 0;
+	if (GetFileVersionInfoW(e->binary_path, 0, size, buf) &&
+	    VerQueryValueW(buf, L"\\", (LPVOID *)&ffi, &ffi_len) && ffi != NULL &&
+	    ffi_len >= sizeof(*ffi)) {
+		unsigned dll_major = HIWORD(ffi->dwFileVersionMS);
+		unsigned dll_minor = LOWORD(ffi->dwFileVersionMS);
+		unsigned dll_patch = HIWORD(ffi->dwFileVersionLS);
+		if (dll_major != reg_major || dll_minor != reg_minor || dll_patch != reg_patch) {
+			U_LOG_W("plugin loader:   %s: registry Version '%s' != DLL file version "
+			        "%u.%u.%u (%ls) — an installer likely failed to replace a locked "
+			        "DLL; reinstall the plug-in with displayxr-service stopped (#461).",
+			        e->id, e->version, dll_major, dll_minor, dll_patch, e->binary_path);
+		}
+	}
+	free(buf);
+}
+
+/*!
  * Load + negotiate + ABI-check + probe one registered plug-in. Returns the
  * iface (writing the instance to *out_inst and the negotiated ABI version to
  * *out_version) on success, NULL (and closes the DLL) on any failure. No
@@ -321,6 +379,11 @@ load_and_probe_one(const struct plugin_entry *e,
 	// notification callbacks run host code) leaves this as the last line
 	// in the per-app log, naming the in-flight binary (issue #434).
 	U_LOG_W("plugin loader:   %s: loading plug-in binary %ls", e->id, e->binary_path);
+
+	// #461: warn if the registry-declared version doesn't match the DLL on
+	// disk (an installer skipped a locked file). Diagnostic only — the ABI
+	// negotiation below remains the actual compatibility gate.
+	check_registry_dll_version_skew(e);
 
 	HMODULE dll = LoadLibraryExW(e->binary_path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
 	if (dll == NULL) {
