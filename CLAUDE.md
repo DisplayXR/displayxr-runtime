@@ -70,6 +70,7 @@ Vendor display drivers ship as **plug-in DLLs** from their own repos (ADR-019). 
 - `XR_EXT_cocoa_window_binding` — app passes NSWindow to runtime
 - `XR_EXT_display_info` — display dimensions, eye-tracking modes
 - `XR_EXT_android_surface_binding` — Android surface binding
+- `XR_EXT_mcp_tools` — app registers its own MCP tools (agent control surface); event-queue dispatch via `XrEventDataMCPToolCallEXT`
 
 Specs: `docs/specs/extensions/`. Eye-tracking MANAGED vs MANUAL contract: `docs/specs/vendor/eye-tracking-modes.md`.
 

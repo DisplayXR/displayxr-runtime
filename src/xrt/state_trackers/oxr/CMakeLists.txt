@@ -34,6 +34,7 @@ add_library(
 	oxr_instance.c
 	oxr_logger.c
 	oxr_logger.h
+	oxr_mcp_app_tools.c
 	oxr_mcp_tools.c
 	oxr_mcp_tools.h
 	oxr_objects.h

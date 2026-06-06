@@ -949,6 +949,25 @@ oxr_xrCompleteFilePickerEXT(XrSession session,
                             const char *path);
 #endif
 
+#ifdef OXR_HAVE_EXT_mcp_tools
+//! OpenXR API function @ep{xrSetMCPAppInfoEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetMCPAppInfoEXT(XrSession session, const XrMCPAppInfoEXT *info);
+//! OpenXR API function @ep{xrRegisterMCPToolEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrRegisterMCPToolEXT(XrSession session, const XrMCPToolInfoEXT *tool);
+//! OpenXR API function @ep{xrUnregisterMCPToolEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrUnregisterMCPToolEXT(XrSession session, const char *name);
+//! OpenXR API function @ep{xrGetMCPToolCallArgsEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetMCPToolCallArgsEXT(
+    XrSession session, uint64_t callId, uint32_t capacity, uint32_t *countOutput, char *buffer);
+//! OpenXR API function @ep{xrSubmitMCPToolResultEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSubmitMCPToolResultEXT(XrSession session, uint64_t callId, XrBool32 success, const char *resultJson);
+#endif
+
 // xrSetSharedTextureOutputRectEXT — canvas sub-rect, part of window binding extensions
 #if defined(OXR_HAVE_EXT_win32_window_binding) || defined(OXR_HAVE_EXT_cocoa_window_binding)
 //! OpenXR API function @ep{xrSetSharedTextureOutputRectEXT}

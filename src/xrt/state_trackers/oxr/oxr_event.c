@@ -154,6 +154,12 @@ is_session_link_to_event(struct oxr_event *event, XrSession session)
 		return complete->session == session;
 	}
 #endif
+#ifdef OXR_HAVE_EXT_mcp_tools
+	case XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_EXT: {
+		XrEventDataMCPToolCallEXT *call = (XrEventDataMCPToolCallEXT *)type;
+		return call->session == session;
+	}
+#endif
 	default: return false;
 	}
 }
@@ -507,6 +513,44 @@ oxr_event_push_XrEventDataFilePickerComplete(struct oxr_logger *log,
 	return XR_SUCCESS;
 }
 #endif // OXR_HAVE_EXT_workspace_file_dialog
+
+#ifdef OXR_HAVE_EXT_mcp_tools
+XrResult
+oxr_event_push_XrEventDataMCPToolCall(struct oxr_logger *log,
+                                      struct oxr_session *sess,
+                                      uint64_t call_id,
+                                      const char *tool_name,
+                                      uint32_t args_size)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataMCPToolCallEXT *call;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &call);
+
+	call->type = XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_EXT;
+	call->next = NULL;
+	call->session = oxr_session_to_openxr(sess);
+	call->callId = call_id;
+	// toolName[] was already zero-initialised by ALLOC.
+	if (tool_name != NULL) {
+		size_t len = strnlen(tool_name, XR_MAX_MCP_TOOL_NAME_SIZE_EXT - 1);
+		memcpy(call->toolName, tool_name, len);
+		call->toolName[len] = '\0';
+	}
+	call->argsSize = args_size;
+	event->result = XR_SUCCESS;
+
+	U_LOG_I("OXR EVENT: MCP tool call (callId=%llu, tool=%s)", (unsigned long long)call_id,
+	        tool_name != NULL ? tool_name : "(null)");
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_EXT_mcp_tools
 
 XrResult
 oxr_event_remove_session_events(struct oxr_logger *log, struct oxr_session *sess)
