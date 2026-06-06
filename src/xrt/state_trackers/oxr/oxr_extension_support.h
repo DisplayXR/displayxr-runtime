@@ -598,6 +598,18 @@
 
 
 /*
+ * XR_EXT_view_rig
+ */
+#if defined(XR_EXT_view_rig)
+#define OXR_HAVE_EXT_view_rig
+#define OXR_EXTENSION_SUPPORT_EXT_view_rig(_) \
+    _(EXT_view_rig, EXT_VIEW_RIG)
+#else
+#define OXR_EXTENSION_SUPPORT_EXT_view_rig(_)
+#endif
+
+
+/*
  * XR_EXT_workspace_file_dialog
  */
 #if defined(XR_EXT_workspace_file_dialog) && defined(XR_USE_PLATFORM_WIN32)
@@ -1100,6 +1112,7 @@
     OXR_EXTENSION_SUPPORT_EXT_spatial_workspace(_) \
     OXR_EXTENSION_SUPPORT_EXT_atlas_capture(_) \
     OXR_EXTENSION_SUPPORT_EXT_local_3d_zone(_) \
+    OXR_EXTENSION_SUPPORT_EXT_view_rig(_) \
     OXR_EXTENSION_SUPPORT_EXT_workspace_file_dialog(_) \
     OXR_EXTENSION_SUPPORT_EXT_mcp_tools(_) \
     OXR_EXTENSION_SUPPORT_BD_controller_interaction(_) \

@@ -2031,6 +2031,48 @@ struct oxr_instance
 };
 
 /*!
+ * Which rig descriptor a session chained via XR_EXT_view_rig (#396 W7).
+ */
+enum oxr_view_rig_type
+{
+	OXR_VIEW_RIG_NONE = 0,    //!< nothing chained — default behavior (qwerty/forcing)
+	OXR_VIEW_RIG_DISPLAY = 1, //!< XrDisplayRigEXT
+	OXR_VIEW_RIG_CAMERA = 2,  //!< XrCameraRigEXT
+};
+
+/*!
+ * Per-session view-rig state for XR_EXT_view_rig (#396 W7).
+ *
+ * The rig drives the view math only on locates that chain a descriptor
+ * (per-locate, not sticky — non-chained locates keep the default behavior,
+ * including the raw-eye transport contract in XrView.pose for external-window
+ * apps). This struct holds the last-parsed values and the one-shot warn latch.
+ * Values are stored post-clamp and post-boundary-conversion
+ * (convergenceDiopters → inv_convergence_distance, verticalFov → half-tan),
+ * i.e. exactly the shape the view math consumes.
+ */
+struct oxr_view_rig_state
+{
+	enum oxr_view_rig_type type;
+	struct xrt_pose pose; //!< display-plane (display rig) or camera (camera rig) pose
+
+	// Display-rig tunables.
+	float virtual_display_height;
+	float perspective_factor;
+
+	// Camera-rig tunables.
+	float inv_convergence_distance;
+	float half_tan_vfov;
+
+	// Shared tunables.
+	float ipd_factor;
+	float parallax_factor;
+
+	//! One-shot WARN latch for out-of-range descriptor clamping.
+	bool clamp_warned;
+};
+
+/*!
  * Object that client program interact with.
  *
  * Parent type/handle is @ref oxr_instance
@@ -2078,6 +2120,12 @@ struct oxr_session
 	//! a browser-side app, which renders via a separate Chrome session; treat
 	//! view poses like a handle app (display-local, no world_head_pos offset).
 	bool is_bridge_relay;
+
+	//! XR_EXT_view_rig (#396 W7): per-session rig parse state. A rig chained
+	//! on a locate drives the view math for that locate (lifting the
+	//! external-window display-centric forcing); locates that chain nothing
+	//! keep the default behavior exactly.
+	struct oxr_view_rig_state view_rig;
 
 	//! True if this session has successfully called xrActivateSpatialWorkspaceEXT
 	//! and is currently the active workspace controller (#234).

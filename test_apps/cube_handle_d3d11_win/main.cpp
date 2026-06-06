@@ -58,6 +58,60 @@ static bool g_fullscreen = false;
 static RECT g_savedWindowRect = {};
 static DWORD g_savedWindowStyle = 0;
 
+// XR_EXT_view_rig (#396 W7) verify hook: R toggles between the app-side
+// Kooima block (default, today's path) and the runtime rig — chain
+// XrCameraRigEXT on xrLocateViews and consume the runtime's render-ready
+// XrView{pose, fov} directly. Also chains XrViewDisplayRawEXT and one-shot
+// logs the raw inputs as a cross-check against the app's own locate data.
+static bool g_useRuntimeRig = false;
+static bool g_rigRawLogged = false;
+
+// Column-major view matrix from a render-ready XrView pose:
+// viewMatrix = R^T * translate(-position) — same construction as the
+// displayxr::math rigs, so the runtime-rig path feeds the renderer the
+// identical convention.
+static void ViewMatrixFromXrPose(const XrPosef& pose, float* out) {
+    const float qx = pose.orientation.x, qy = pose.orientation.y;
+    const float qz = pose.orientation.z, qw = pose.orientation.w;
+    float rot[16] = {};
+    rot[0] = 1.0f - 2.0f * (qy * qy + qz * qz);
+    rot[1] = 2.0f * (qx * qy + qz * qw);
+    rot[2] = 2.0f * (qx * qz - qy * qw);
+    rot[4] = 2.0f * (qx * qy - qz * qw);
+    rot[5] = 1.0f - 2.0f * (qx * qx + qz * qz);
+    rot[6] = 2.0f * (qy * qz + qx * qw);
+    rot[8] = 2.0f * (qx * qz + qy * qw);
+    rot[9] = 2.0f * (qy * qz - qx * qw);
+    rot[10] = 1.0f - 2.0f * (qx * qx + qy * qy);
+    rot[15] = 1.0f;
+    for (int i = 0; i < 16; i++) out[i] = 0.0f;
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            out[j * 4 + i] = rot[i * 4 + j]; // R^T
+    out[15] = 1.0f;
+    out[12] = -(out[0] * pose.position.x + out[4] * pose.position.y + out[8] * pose.position.z);
+    out[13] = -(out[1] * pose.position.x + out[5] * pose.position.y + out[9] * pose.position.z);
+    out[14] = -(out[2] * pose.position.x + out[6] * pose.position.y + out[10] * pose.position.z);
+}
+
+// Column-major GL ([-1,1] clip-z) off-axis projection from a render-ready
+// XrView fov + the app's own clip policy (fov is clip-independent). Pair with
+// convert_projection_gl_to_zero_to_one() for D3D.
+static void ProjectionFromXrFov(const XrFovf& fov, float nearZ, float farZ, float* out) {
+    const float l = tanf(fov.angleLeft) * nearZ;
+    const float r = tanf(fov.angleRight) * nearZ;
+    const float b = tanf(fov.angleDown) * nearZ;
+    const float t = tanf(fov.angleUp) * nearZ;
+    for (int i = 0; i < 16; i++) out[i] = 0.0f;
+    out[0] = 2.0f * nearZ / (r - l);
+    out[5] = 2.0f * nearZ / (t - b);
+    out[8] = (r + l) / (r - l);
+    out[9] = (t + b) / (t - b);
+    out[10] = -(farZ + nearZ) / (farZ - nearZ);
+    out[11] = -1.0f;
+    out[14] = -2.0f * farZ * nearZ / (farZ - nearZ);
+}
+
 // Forward declaration — defined after PerformanceStats
 struct RenderState;
 static RenderState* g_renderState = nullptr;
@@ -156,6 +210,29 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) {
             PostMessage(hwnd, WM_CLOSE, 0, 0);
+            return 0;
+        }
+        // XR_EXT_view_rig verify toggle (app-local; 'R' is unused by the
+        // shared input handler). Turning the runtime rig ON also enters the
+        // app's camera mode (same state the shared 'C' handler sets) so the
+        // chained XrCameraRigEXT gets the camera-mode vantage — R then A/Bs
+        // runtime-rig vs app-side math with identical tunables.
+        if (wParam == 'R' && g_hasViewRigExt) {
+            g_useRuntimeRig = !g_useRuntimeRig;
+            g_rigRawLogged = false;
+            if (g_useRuntimeRig && !g_inputState.cameraMode) {
+                g_inputState.cameraMode = true;
+                g_inputState.cameraPosX = 0.0f;
+                g_inputState.cameraPosY = 0.0f;
+                g_inputState.cameraPosZ = g_inputState.nominalViewerZ;
+                g_inputState.yaw = 0.0f;
+                g_inputState.pitch = 0.0f;
+                if (g_inputState.nominalViewerZ > 0.0f)
+                    g_inputState.viewParams.invConvergenceDistance = 1.0f / g_inputState.nominalViewerZ;
+                g_inputState.viewParams.zoomFactor = 1.0f;
+            }
+            LOG_INFO("View rig: %s", g_useRuntimeRig ? "RUNTIME (XR_EXT_view_rig camera rig)"
+                                                     : "APP-SIDE (local Kooima math)");
             return 0;
         }
         break;
@@ -441,6 +518,30 @@ static void RenderOneFrame(RenderState& rs) {
                     uint32_t viewCount = 8;
                     XrView rawViews[8];
                     for (uint32_t vi = 0; vi < 8; vi++) rawViews[vi] = {XR_TYPE_VIEW};
+
+                    // XR_EXT_view_rig (R toggle): drive the runtime's camera
+                    // rig with the SAME app tunables the local Kooima block
+                    // uses, and chain the raw-input result for cross-checking.
+                    const bool runtimeRig = g_useRuntimeRig && g_hasViewRigExt;
+                    XrCameraRigEXT cameraRig = {XR_TYPE_CAMERA_RIG_EXT};
+                    XrViewDisplayRawEXT viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+                    if (runtimeRig) {
+                        XMVECTOR rigOri = XMQuaternionRotationRollPitchYaw(
+                            g_inputState.pitch, g_inputState.yaw, 0);
+                        XMFLOAT4 rq;
+                        XMStoreFloat4(&rq, rigOri);
+                        cameraRig.pose.orientation = {rq.x, rq.y, rq.z, rq.w};
+                        cameraRig.pose.position = {g_inputState.cameraPosX, g_inputState.cameraPosY,
+                                                   g_inputState.cameraPosZ};
+                        cameraRig.ipdFactor = g_inputState.viewParams.ipdFactor;
+                        cameraRig.parallaxFactor = g_inputState.viewParams.parallaxFactor;
+                        cameraRig.convergenceDiopters = g_inputState.viewParams.invConvergenceDistance;
+                        cameraRig.verticalFov =
+                            2.0f * atanf(CAMERA_HALF_TAN_VFOV / g_inputState.viewParams.zoomFactor);
+                        locateInfo.next = &cameraRig;
+                        viewState.next = &viewRigRaw;
+                    }
+
                     xrLocateViews(xr.session, &locateInfo, &viewState, 8, &viewCount, rawViews);
 
                     // --- App-side Kooima projection (RAW mode, app-owned camera model) ---
@@ -450,7 +551,39 @@ static void RenderOneFrame(RenderState& rs) {
 
                     std::vector<Display3DView> stereoViews(eyeCount);
                     bool useAppProjection = (xr.hasDisplayInfoExt && xr.displayWidthM > 0.0f);
-                    if (useAppProjection) {
+                    if (useAppProjection && runtimeRig) {
+                        // XR_EXT_view_rig path: the runtime ran the camera rig
+                        // for us — consume render-ready XrView{pose, fov}
+                        // directly. Only clip policy (near/far + the GL→[0,1]
+                        // depth remap) stays app-side, by design.
+                        for (int i = 0; i < eyeCount; i++) {
+                            const XrView& v = rawViews[(i < (int)viewCount) ? i : 0];
+                            ViewMatrixFromXrPose(v.pose, stereoViews[i].view_matrix);
+                            ProjectionFromXrFov(v.fov, 0.01f, 100.0f, stereoViews[i].projection_matrix);
+                            convert_projection_gl_to_zero_to_one(stereoViews[i].projection_matrix);
+                            stereoViews[i].fov = v.fov;
+                            stereoViews[i].eye_world = v.pose.position;
+                        }
+
+                        // One-shot raw-channel cross-check log.
+                        if (!g_rigRawLogged) {
+                            g_rigRawLogged = true;
+                            LOG_INFO("ViewRig RAW: eyes=%u [0]=(%.4f,%.4f,%.4f) [1]=(%.4f,%.4f,%.4f) "
+                                     "canvas=(%d,%d %dx%d) %.4fx%.4fm sampleNs=%lld tracking=%d",
+                                     viewRigRaw.eyeCountOutput,
+                                     viewRigRaw.rawEyes[0].x, viewRigRaw.rawEyes[0].y, viewRigRaw.rawEyes[0].z,
+                                     viewRigRaw.rawEyes[1].x, viewRigRaw.rawEyes[1].y, viewRigRaw.rawEyes[1].z,
+                                     viewRigRaw.canvasRectPx.offset.x, viewRigRaw.canvasRectPx.offset.y,
+                                     viewRigRaw.canvasRectPx.extent.width, viewRigRaw.canvasRectPx.extent.height,
+                                     viewRigRaw.canvasSizeMeters.width, viewRigRaw.canvasSizeMeters.height,
+                                     (long long)viewRigRaw.sampleTimeNs, (int)viewRigRaw.isTracking);
+                            LOG_INFO("ViewRig VIEW[0]: pos=(%.4f,%.4f,%.4f) fov L=%.4f R=%.4f U=%.4f D=%.4f",
+                                     rawViews[0].pose.position.x, rawViews[0].pose.position.y,
+                                     rawViews[0].pose.position.z, rawViews[0].fov.angleLeft,
+                                     rawViews[0].fov.angleRight, rawViews[0].fov.angleUp,
+                                     rawViews[0].fov.angleDown);
+                        }
+                    } else if (useAppProjection) {
                         // Window-relative Kooima: the window's placement on the
                         // display + raw eyes -> Kooima screen dims + window-relative
                         // eyes, via the shared displayxr::math helper (#396 Layer 1).
@@ -569,6 +702,11 @@ static void RenderOneFrame(RenderState& rs) {
                             modeText += g_inputState.cameraMode ?
                                 L"\nKooima: Camera-Centric [C=Toggle]" :
                                 L"\nKooima: Display-Centric [C=Toggle]";
+                            if (g_hasViewRigExt) {
+                                modeText += g_useRuntimeRig ?
+                                    L"\nView rig: RUNTIME camera rig [R=Toggle]" :
+                                    L"\nView rig: app-side math [R=Toggle]";
+                            }
 
                             // Dynamic render dims matching the actual viewport computation
                             bool dispMonoMode = (xr.renderingModeCount > 0 && !xr.renderingModeDisplay3D[xr.currentModeIndex]);
