@@ -4,7 +4,7 @@
 **Spec:** [`unified-2d-3d-compositing.md`](unified-2d-3d-compositing.md) §5, §6 (Phase 1); the authoring API is from [`local-3d-zones.md`](local-3d-zones.md). Epic #439.
 **Builds on:** Phase 0 (the masked-composite shader, validated max-diff-0 on Leia hardware). The shader **already carries the Phase 1 path** (`use_rect_mask = 0` → sample `mask_tex` t1, lerp against `weave_tex` t2). Phase 1 lights it up.
 
-> **STATUS: drafting.** This doc + the extension header are the first deliverables; oxr handlers + compositor wiring follow once the contract is reviewed.
+> **STATUS: implemented + hardware-validated.** oxr layer (macOS leg) and the D3D11 consumer (Windows leg, window-clamped per #464) are both on the branch; §6 validation done on Leia hardware (capture diffs 0 for the regression + analytic-vs-authored cases, soft-edge Tier-3 blend eyeballed on-glass). Remaining: PR to `main` (extension header auto-syncs to `displayxr-extensions` on merge).
 
 ---
 
@@ -90,11 +90,11 @@ Confirm soft-edge AA (a Tier-3 gradient mask) shows a clean 2D↔3D blend, no in
 
 ## 7. Done-when
 
-- [ ] `XR_EXT_local_3d_zone` registered; `displayxr-cli selftest` still passes.
-- [ ] Tiers 1–3 author a mask; the D3D11 consumer lerps it (soft edges work).
-- [ ] No-mask path byte-identical to Phase 0 (zero regression).
-- [ ] Tier-2-single-rect == Phase-0 rect output (authored path validated against analytic).
-- [ ] `git clang-format` clean; extension header syncs to `displayxr-extensions` on merge.
+- [x] `XR_EXT_local_3d_zone` registered; `displayxr-cli selftest` still passes.
+- [x] Tiers 1–3 author a mask; the D3D11 consumer lerps it (soft edges work — Tier-3 radial gradient validated on-glass).
+- [x] No-mask path byte-identical to Phase 0 (zero regression — strip vs shader A/B capture diff 0 through the extended pass signature).
+- [x] Tier-2-single-rect == Phase-0 rect output (capture diff 0 in the window 2D region; beyond-window untouched per #464 — Phase-0 fills the display extent there, the zone path deliberately doesn't).
+- [ ] Extension header syncs to `displayxr-extensions` on merge to `main`.
 
 ## 8. Hand-off split
 
