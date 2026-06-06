@@ -67,6 +67,12 @@ RAW inputs ──> RIG (generator) ──> RENDER-READY output
   `xrSetSharedTextureOutputRectEXT` sub-rect; hosted apps → the runtime's own
   window), the sample timestamp, and the tracking-lock flag.
 
+The whole pipeline is **strictly per-view**: each raw eye position
+independently yields one `{pose, fov}`. N views are N independent evaluations
+of the same math — nothing anywhere depends on the view count, so the model is
+N-view by construction; a rendering mode's view count only changes the array
+length, never the math.
+
 A consumer that takes raw + a rig descriptor and runs the shared math gets
 *exactly* the render-ready output — that equivalence is the backbone of the
 design (see "Equivalence by construction" below).
@@ -107,10 +113,11 @@ app-facing API.
 - **Surplus-view synthesis is runtime-only.** For rendering modes with more
   views than tracked eyes (e.g. quad modes), `oxr_session.c:1355-1369`
   synthesizes the extra eye positions from the mode's per-view optical offsets
-  (`xdev->hmd->view_eye_offsets`). App-side math **cannot replicate this** —
-  the per-mode optical layout is runtime/DP knowledge. Today that means an app
-  doing its own math is silently wrong in >2-view modes; under the rig API it
-  inherits the synthesis for free.
+  (`xdev->hmd->view_eye_offsets`). The math itself is per-view and indifferent
+  to N — what an app doing its own math lacks is the **input**: the
+  synthesized eye positions, because the per-mode optical layout is runtime/DP
+  knowledge. Today that means such an app silently feeds wrong (or missing)
+  surplus views; under the rig API it inherits the synthesis for free.
 - **A raw channel half-exists.** The IPC headless fast-path
   (`ipc_server_handler.c:416-436`, compositor-less clients) returns raw
   display-space eyes + device-default FOVs, skipping the rig math — this is
@@ -126,20 +133,17 @@ app-facing API.
 ### And what apps do with it: nothing
 
 The render-ready output is computed every frame and **ignored by every 3D
-app**. `cube_handle_d3d11_win/main.cpp:773-775` is representative:
-
-```cpp
-projectionViews[eye].fov = useAppProjection
-    ? stereoViews[monoMode ? 0 : eye].fov      // app's own display3d/camera3d output
-    : (monoMode ? monoFov : rawViews[safeIdx].fov); // runtime fov: mono/legacy only
-```
+app**. `cube_handle_d3d11_win/main.cpp:773-775` is representative: the fov
+each app submits per view is a ternary — in 3D mode it takes the app's own
+`display3d_compute_views()` output; the runtime's `rawViews[i].fov` is
+consumed only in the mono/legacy branch.
 
 In 3D mode (`useAppProjection`, i.e. `XR_EXT_display_info` present) the app
 uses `XrView.pose.position` as a raw-eye transport, recomputes everything with
 its own `displayxr::math` calls, and submits its own fov back through
 `xrEndFrame`. The runtime's fov is consumed only in mono/legacy mode. The same
-pattern is vendored into both demos and both engine plugins (Unity rebuilds
-via `Camera.SetStereoProjectionMatrix`; Unreal rebuilds its own reverse-Z
+pattern is vendored into both demos and both engine plugins (Unity overrides
+its per-view camera projection matrices; Unreal rebuilds its own reverse-Z
 projection per ADR-003).
 
 This isn't app authors being perverse — it's the only way to get vHeight /
@@ -176,7 +180,7 @@ typedef struct XrDisplayRigEXT {
     const void* XR_MAY_ALIAS next;
     XrPosef pose;                  // virtual display plane pose in the locate space
     float   virtualDisplayHeight;  // app units; m2v = this / physical canvas height
-    float   ipdFactor;             // [0,1] scales inter-view distance
+    float   ipdFactor;             // [0,1] multiplies view-pose spread about the center
     float   parallaxFactor;        // [0,1] lerps eye centroid toward nominal viewer
     float   perspectiveFactor;     // [0.1,10] scales eye XYZ (object perspective)
 } XrDisplayRigEXT;
@@ -186,7 +190,7 @@ typedef struct XrCameraRigEXT {
     XrStructureType          type;   // XR_TYPE_CAMERA_RIG_EXT
     const void* XR_MAY_ALIAS next;
     XrPosef pose;                  // camera pose in the locate space
-    float   ipdFactor;             // [0,1]
+    float   ipdFactor;             // [0,1] multiplies view-pose spread about the center
     float   parallaxFactor;        // [0,1]
     float   convergenceDiopters;   // 1/m to the convergence plane; 0 = infinity
     float   verticalFov;           // radians, full vertical angle

@@ -30,7 +30,7 @@ Build apps for 3D displays using the OpenXR standard.
 - [XR_EXT_win32_window_binding](specs/extensions/XR_EXT_win32_window_binding.md) — app-provided Win32 HWND
 - [XR_EXT_cocoa_window_binding](specs/extensions/XR_EXT_cocoa_window_binding.md) — app-provided Cocoa NSView
 - [XR_EXT_spatial_workspace](specs/extensions/XR_EXT_spatial_workspace.md) — workspace controller surface (shell-style apps)
-- [Kooima Projection](architecture/kooima-projection.md) — stereo math and projection pipelines
+- [Kooima Projection](architecture/kooima-projection.md) — N-view Kooima math and projection pipelines
 
 ---
 
