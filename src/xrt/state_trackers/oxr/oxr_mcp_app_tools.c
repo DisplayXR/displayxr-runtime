@@ -278,9 +278,6 @@ oxr_mcp_app_tools_session_destroy(struct oxr_session *sess)
 		strncpy(names[name_count], t->name, sizeof(names[0]) - 1);
 		names[name_count][sizeof(names[0]) - 1] = '\0';
 		name_count++;
-		free(t->description);
-		free(t->schema);
-		memset(t, 0, sizeof(*t));
 	}
 	// Fail the session's pending calls; parked trampolines wake and
 	// return errors to their agents.
@@ -294,9 +291,25 @@ oxr_mcp_app_tools_session_destroy(struct oxr_session *sess)
 	pthread_cond_broadcast(&g_cond);
 	pthread_mutex_unlock(&g_lock);
 
+	// Drop the tools from the framework registry BEFORE freeing the slots:
+	// the registry stores &slot->tool, whose .name points into the slot, so
+	// the registry scan strcmp's it — zeroing the slot first reads NULL
+	// (#459).
 	for (size_t i = 0; i < name_count; i++) {
 		mcp_server_unregister_tool(names[i]);
 	}
+
+	pthread_mutex_lock(&g_lock);
+	for (size_t i = 0; i < MAX_APP_TOOLS; i++) {
+		struct app_tool *t = &g_tools[i];
+		if (!t->used || t->sess != sess) {
+			continue;
+		}
+		free(t->description);
+		free(t->schema);
+		memset(t, 0, sizeof(*t));
+	}
+	pthread_mutex_unlock(&g_lock);
 }
 
 /*
@@ -415,16 +428,24 @@ oxr_xrUnregisterMCPToolEXT(XrSession session, const char *name)
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "tool '%s' is not registered on this session",
 		                 name);
 	}
-	free(found->description);
-	free(found->schema);
-	memset(found, 0, sizeof(*found));
 	// In-flight calls on the tool: their slots survive (keyed by
 	// call_id, not tool pointer) and fail at timeout or session end —
 	// wake them now so they fail promptly.
 	pthread_cond_broadcast(&g_cond);
 	pthread_mutex_unlock(&g_lock);
 
+	// Drop the tool from the framework registry BEFORE freeing the slot:
+	// the registry stores &found->tool, whose .name points at found->name,
+	// so the registry scan strcmp's it — zeroing the slot first reads NULL
+	// (#459). `found` stays valid across the unlock: the slot is still
+	// marked used, so a concurrent register can't reuse it.
 	mcp_server_unregister_tool(name);
+
+	pthread_mutex_lock(&g_lock);
+	free(found->description);
+	free(found->schema);
+	memset(found, 0, sizeof(*found));
+	pthread_mutex_unlock(&g_lock);
 	return XR_SUCCESS;
 }
 
