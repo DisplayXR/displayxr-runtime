@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "name": "Cube Metal (Handle)",
+  "id": "cube-metal",
+  "type": "3d",
+  "category": "test",
+  "display_mode": "auto",
+  "description": "Reference spinning cube demonstrating XR_EXT_cocoa_window_binding on Metal; also the reference XR_EXT_mcp_tools adopter (agent tools: set_spin, get_status)."
+}

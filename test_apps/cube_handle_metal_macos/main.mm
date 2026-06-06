@@ -45,6 +45,7 @@
 #include "hud_renderer_macos.h"
 #include <openxr/XR_EXT_display_info.h>
 #include <openxr/XR_EXT_atlas_capture.h>
+#include <openxr/XR_EXT_mcp_tools.h>
 
 // ============================================================================
 // Logging
@@ -62,6 +63,27 @@
             return false;                                                      \
         }                                                                      \
     } while (0)
+
+// ============================================================================
+// XR_EXT_mcp_tools — reference adoption (#447)
+//
+// This is the canonical in-tree example of an app exposing its own MCP
+// tools to agents: declare an appId matching the manifest `id` (the
+// agent-visible tool prefix, e.g. cube-metal__set_spin through the
+// workspace aggregator), register tools after session create, and
+// answer XrEventDataMCPToolCallEXT from the normal event pump. Inert
+// when the MCP capability is disabled. Spec:
+// docs/specs/extensions/XR_EXT_mcp_tools.md.
+// ============================================================================
+
+static bool g_hasMcpToolsExt = false;
+static PFN_xrSetMCPAppInfoEXT g_pfnSetMCPAppInfo = nullptr;
+static PFN_xrRegisterMCPToolEXT g_pfnRegisterMCPTool = nullptr;
+static PFN_xrGetMCPToolCallArgsEXT g_pfnGetMCPToolCallArgs = nullptr;
+static PFN_xrSubmitMCPToolResultEXT g_pfnSubmitMCPToolResult = nullptr;
+
+//! Cube spin speed in rad/s — historically hardcoded 0.5; now agent-settable.
+static float g_spinSpeed = 0.5f;
 
 // ============================================================================
 // Math (column-major 4x4 matrices)
@@ -1171,6 +1193,8 @@ static bool InitializeOpenXR(AppXrSession &app)
             app.hasDisplayInfoExt = true;
         if (strcmp(e.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0)
             app.hasAtlasCaptureExt = true;
+        if (strcmp(e.extensionName, XR_EXT_MCP_TOOLS_EXTENSION_NAME) == 0)
+            g_hasMcpToolsExt = true;
     }
 
     if (!hasMetalEnable) {
@@ -1193,6 +1217,9 @@ static bool InitializeOpenXR(AppXrSession &app)
     }
     if (app.hasAtlasCaptureExt) {
         enabledExts.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
+    }
+    if (g_hasMcpToolsExt) {
+        enabledExts.push_back(XR_EXT_MCP_TOOLS_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -1331,6 +1358,48 @@ static bool CreateSession(AppXrSession &app, MetalRenderer &r)
 
     XR_CHECK(xrCreateSession(app.instance, &sessionInfo, &app.session));
     LOG_INFO("Session created%s", app.hasCocoaWindowBinding ? " (with external window)" : "");
+
+    // XR_EXT_mcp_tools: declare identity + register agent tools. The appId
+    // MUST match `id` in displayxr/cube_handle_metal_macos.displayxr.json
+    // (INV-10.1). Failure is non-fatal by design — the MCP capability gate
+    // may simply be off on this machine.
+    if (g_hasMcpToolsExt) {
+        xrGetInstanceProcAddr(app.instance, "xrSetMCPAppInfoEXT",
+                              (PFN_xrVoidFunction *)&g_pfnSetMCPAppInfo);
+        xrGetInstanceProcAddr(app.instance, "xrRegisterMCPToolEXT",
+                              (PFN_xrVoidFunction *)&g_pfnRegisterMCPTool);
+        xrGetInstanceProcAddr(app.instance, "xrGetMCPToolCallArgsEXT",
+                              (PFN_xrVoidFunction *)&g_pfnGetMCPToolCallArgs);
+        xrGetInstanceProcAddr(app.instance, "xrSubmitMCPToolResultEXT",
+                              (PFN_xrVoidFunction *)&g_pfnSubmitMCPToolResult);
+        if (g_pfnSetMCPAppInfo && g_pfnRegisterMCPTool && g_pfnSubmitMCPToolResult) {
+            XrMCPAppInfoEXT mcpAppInfo = {XR_TYPE_MCP_APP_INFO_EXT};
+            strncpy(mcpAppInfo.appId, "cube-metal", sizeof(mcpAppInfo.appId) - 1);
+            XrResult ar = g_pfnSetMCPAppInfo(app.session, &mcpAppInfo);
+
+            XrMCPToolInfoEXT setSpin = {XR_TYPE_MCP_TOOL_INFO_EXT};
+            setSpin.name = "set_spin";
+            setSpin.description =
+                "Set the cube's spin speed. Takes effect immediately; the change is "
+                "visually verifiable via capture_frame. Returns the applied speed.";
+            setSpin.inputSchemaJson =
+                "{\"type\":\"object\",\"properties\":{\"speed_rad_per_sec\":{\"type\":\"number\","
+                "\"minimum\":0,\"maximum\":10,\"description\":\"Spin speed in radians/second; "
+                "0 freezes the cube. Default at launch is 0.5.\"}},"
+                "\"required\":[\"speed_rad_per_sec\"]}";
+            XrResult tr1 = g_pfnRegisterMCPTool(app.session, &setSpin);
+
+            XrMCPToolInfoEXT getStatus = {XR_TYPE_MCP_TOOL_INFO_EXT};
+            getStatus.name = "get_status";
+            getStatus.description =
+                "Read the cube app's live state: spin speed (rad/s), whether the XR "
+                "session is running, and the active rendering-mode index.";
+            getStatus.inputSchemaJson = "{\"type\":\"object\"}";
+            XrResult tr2 = g_pfnRegisterMCPTool(app.session, &getStatus);
+
+            LOG_INFO("XR_EXT_mcp_tools: appId=%d set_spin=%d get_status=%d", ar, tr1, tr2);
+        }
+    }
 
     // Enumerate available rendering modes and store names
     app.renderingModeCount = 0;
@@ -1498,6 +1567,48 @@ static void PollEvents(AppXrSession &app)
             app.currentModeIndex = modeEvent->currentModeIndex;
             break;
         }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_EXT: {
+            // An agent invoked one of our XR_EXT_mcp_tools tools. Fetch the
+            // JSON args (two-call idiom; argsSize is the required capacity),
+            // act on app state — we're on the main loop, so no locking —
+            // and answer. An unanswered call fails to the agent after ~5 s.
+            auto *call = (XrEventDataMCPToolCallEXT *)&event;
+            char args[512] = {0};
+            uint32_t needed = 0;
+            if (g_pfnGetMCPToolCallArgs != nullptr) {
+                g_pfnGetMCPToolCallArgs(app.session, call->callId, sizeof(args), &needed, args);
+            }
+            char result[256];
+            XrBool32 ok = XR_TRUE;
+            if (strcmp(call->toolName, "set_spin") == 0) {
+                // Test apps stay dependency-free: hand-scan the one expected
+                // numeric key instead of pulling in a JSON parser.
+                const char *key = strstr(args, "\"speed_rad_per_sec\"");
+                const char *colon = key != nullptr ? strchr(key, ':') : nullptr;
+                if (colon != nullptr) {
+                    float speed = strtof(colon + 1, nullptr);
+                    if (speed < 0.f) speed = 0.f;
+                    if (speed > 10.f) speed = 10.f;
+                    g_spinSpeed = speed;
+                    snprintf(result, sizeof(result), "{\"spin_speed_rad_per_sec\":%.3f}", g_spinSpeed);
+                } else {
+                    ok = XR_FALSE;
+                    snprintf(result, sizeof(result), "{\"error\":\"missing speed_rad_per_sec\"}");
+                }
+            } else if (strcmp(call->toolName, "get_status") == 0) {
+                snprintf(result, sizeof(result),
+                         "{\"spin_speed_rad_per_sec\":%.3f,\"session_running\":%s,"
+                         "\"rendering_mode_index\":%u}",
+                         g_spinSpeed, app.sessionRunning ? "true" : "false", app.currentModeIndex);
+            } else {
+                ok = XR_FALSE;
+                snprintf(result, sizeof(result), "{\"error\":\"unhandled tool\"}");
+            }
+            if (g_pfnSubmitMCPToolResult != nullptr) {
+                g_pfnSubmitMCPToolResult(app.session, call->callId, ok, result);
+            }
+            break;
+        }
         default: break;
         }
         event = {XR_TYPE_EVENT_DATA_BUFFER};
@@ -1637,7 +1748,7 @@ int main(int argc, char **argv)
         }
 
         // Update animation
-        renderer.cubeRotation += dt * 0.5f;
+        renderer.cubeRotation += dt * g_spinSpeed; // agent-settable via cube-metal__set_spin
 
         // Wait frame
         XrFrameWaitInfo waitInfo = {XR_TYPE_FRAME_WAIT_INFO};

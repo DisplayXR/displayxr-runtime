@@ -34,6 +34,10 @@ done
 
 export DISPLAYXR_MCP=1
 export XR_RUNTIME_JSON="$RUNTIME_JSON"
+# Hermetic plug-in discovery: don't depend on an installed plug-in under
+# ~/Library/Application Support — use the dev package tree (sim-display).
+PLUGINS="$ROOT/_package/DisplayXR-macOS/lib/displayxr/plugins"
+[[ -d "$PLUGINS" ]] && export XRT_PLUGIN_SEARCH_PATH="$PLUGINS"
 
 # Launch the handle app detached.
 "$APP" >/tmp/mcp_handshake_app.log 2>&1 &
