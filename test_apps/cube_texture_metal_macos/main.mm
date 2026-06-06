@@ -43,7 +43,7 @@
 #include <unistd.h>
 #include <mach-o/dyld.h>
 
-#define STB_IMAGE_IMPLEMENTATION
+// stb_image implementation TU lives in displayxr::common (stb_image_impl_macos.cpp) — declarations only here (#396 W4).
 #include "stb_image.h"
 #include "display3d_view.h"
 #include "camera3d_view.h"

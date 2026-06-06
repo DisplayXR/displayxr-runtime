@@ -30,7 +30,7 @@ Build apps for 3D displays using the OpenXR standard.
 - [XR_EXT_win32_window_binding](specs/extensions/XR_EXT_win32_window_binding.md) — app-provided Win32 HWND
 - [XR_EXT_cocoa_window_binding](specs/extensions/XR_EXT_cocoa_window_binding.md) — app-provided Cocoa NSView
 - [XR_EXT_spatial_workspace](specs/extensions/XR_EXT_spatial_workspace.md) — workspace controller surface (shell-style apps)
-- [Kooima Projection](architecture/kooima-projection.md) — stereo math and projection pipelines
+- [Kooima Projection](architecture/kooima-projection.md) — N-view Kooima math and projection pipelines
 
 ---
 
@@ -133,7 +133,6 @@ Design docs, status trackers, and plans — some shipped, some in progress. Afte
 - [Display Spatial Model](roadmap/display-spatial-model.md) — displays in the spatial graph (#46)
 - [Multi-Display Single Machine](roadmap/multi-display-single-machine.md) — multiple displays, one machine (#69)
 - [Multi-Display Networked](roadmap/multi-display-networked.md) — displays across the network (#70)
-- [Demo Distribution](roadmap/demo-distribution.md) — per-component tag scheme + runtime-compat covenant
 - [XR_VIEW_CONFIGURATION_PRIMARY_MULTIVIEW](roadmap/XR_VIEW_CONFIGURATION_PRIMARY_MULTIVIEW.md) — Khronos multiview proposal (#80)
 
 ---
