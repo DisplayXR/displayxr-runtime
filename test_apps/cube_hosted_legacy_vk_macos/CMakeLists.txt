@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSL-1.0
 
 cmake_minimum_required(VERSION 3.21)
-project(cube_hosted_legacy_vk_macos LANGUAGES CXX)
+project(cube_hosted_legacy_vk_macos LANGUAGES C CXX OBJCXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -50,6 +50,23 @@ if(NOT OPENXR_FOUND)
     message(FATAL_ERROR "OpenXR not found. Install via: brew install openxr-loader")
 endif()
 
+# Shared scaffolding (stb_image header + macOS implementation TU and friends)
+# via displayxr::common, pinned by tag (epic #396 W4). OpenXR (set up above)
+# is reused, not re-fetched.
+include(FetchContent)
+set(DISPLAYXR_COMMON_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+get_filename_component(_dxr_ext_includes
+    "${CMAKE_SOURCE_DIR}/../../src/external/openxr_includes" ABSOLUTE)
+set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
+    "DisplayXR OpenXR extension headers for displayxr::common")
+FetchContent_Declare(
+    displayxr_common
+    GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
+    GIT_TAG v0.3.0
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(displayxr_common)
+
 add_executable(cube_hosted_legacy_vk_macos main.cpp)
 
 target_include_directories(cube_hosted_legacy_vk_macos PRIVATE
@@ -68,6 +85,7 @@ foreach(TEX ${TEXTURE_FILES})
 endforeach()
 
 target_link_libraries(cube_hosted_legacy_vk_macos PRIVATE
+    displayxr::common
     OpenXR::openxr_loader
     Vulkan::Vulkan
 )

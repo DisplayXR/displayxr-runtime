@@ -67,8 +67,7 @@ add_executable(windowspace_handle_gl_win WIN32
     gl_functions.cpp
     gl_functions.h
     windowspace_layers.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/xr_window_space_hud.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/xr_window_space_hud.h
+    # xr_window_space_hud comes from displayxr::common (#396 W4).
     resource.rc
 )
 
@@ -97,5 +96,4 @@ if(TARGET OpenXR::openxr_loader)
     endif()
 endif()
 
-include(${CMAKE_CURRENT_SOURCE_DIR}/../common/displayxr_manifest.cmake)
 displayxr_install_manifest(windowspace_handle_gl_win "${CMAKE_CURRENT_SOURCE_DIR}/displayxr")

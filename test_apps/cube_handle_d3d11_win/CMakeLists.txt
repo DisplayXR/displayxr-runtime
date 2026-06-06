@@ -112,7 +112,6 @@ if(TEXTURE_FILES)
 endif()
 
 # DisplayXR shell manifest sidecar
-include(${CMAKE_CURRENT_SOURCE_DIR}/../common/displayxr_manifest.cmake)
 displayxr_install_manifest(cube_handle_d3d11_win "${CMAKE_CURRENT_SOURCE_DIR}/displayxr")
 
 # Copy runtime DLLs

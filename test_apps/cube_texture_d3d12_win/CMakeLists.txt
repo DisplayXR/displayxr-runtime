@@ -72,10 +72,8 @@ add_executable(cube_texture_d3d12_win WIN32
     xr_session.h
     d3d12_renderer.cpp
     d3d12_renderer.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/hud_renderer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/hud_renderer.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/text_overlay.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/text_overlay.h
+    # hud_renderer / text_overlay come from displayxr::common (via
+    # sr_common_base) — no direct ../common TU compilation (#396 W4).
     resource.rc
 )
 
