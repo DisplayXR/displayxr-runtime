@@ -1845,9 +1845,15 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				uint32_t tile_x = eye % c->tile_columns;
 				uint32_t tile_y = eye / c->tile_columns;
 
-				// Per-eye horizontal disparity (eye 0 shifts left).
+				// Per-view disparity, graded across the view sweep (#413):
+				// first view = -half, last = +half. Degenerates to the
+				// classic -/+ pair for 2-view modes; one view = no shift.
 				float half_disp = ws->disparity / 2.0f;
-				float eye_shift = (eye == 0) ? -half_disp : half_disp;
+				float eye_shift = 0.0f;
+				if (mode_views_ws > 1) {
+					float t = (float)eye / (float)(mode_views_ws - 1);
+					eye_shift = -half_disp + ws->disparity * t;
+				}
 
 				// Per-eye sub-rect within the atlas, in atlas pixels. The
 				// projection_pipeline shader expects viewport=(0,0,1,1) and

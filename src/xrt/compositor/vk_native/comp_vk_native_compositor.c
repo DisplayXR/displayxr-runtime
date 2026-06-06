@@ -1079,27 +1079,68 @@ vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c
 		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 		    0, 0, NULL, 0, NULL, 1, &src_to_sample);
 
-		// Per-tile pass with disparity shift in tile-fraction → atlas px.
+		// Per-view pass with disparity shift in tile-fraction → atlas px.
+		// Mirrors the metal/GL compositors (#413): a 2D (non-3D) mode gets
+		// ONE stamp over the full content region (tile grid × view dims);
+		// 3D modes stamp every tile. The previous code looped the tile grid
+		// unconditionally and hardcoded the 2-view disparity pair
+		// (tile_index == 0 ? -half : +half), which mis-shifts every layout
+		// other than 2 views.
+		uint32_t effective_views = c->hardware_display_3d ? (tile_columns * tile_rows) : 1;
 		float half_disp = ws->disparity / 2.0f;
-		for (uint32_t row = 0; row < tile_rows; row++) {
-			for (uint32_t col = 0; col < tile_columns; col++) {
-				uint32_t tile_index = row * tile_columns + col;
-				float eye_shift = (tile_index == 0) ? -half_disp : half_disp;
+		for (uint32_t eye = 0; eye < effective_views; eye++) {
+			uint32_t tile_x = eye % tile_columns;
+			uint32_t tile_y = eye / tile_columns;
 
-				int32_t dx = (int32_t)((ws->x + eye_shift) * (float)view_w)
-				             + (int32_t)(col * view_w);
-				int32_t dy = (int32_t)(ws->y * (float)view_h)
-				             + (int32_t)(row * view_h);
-				int32_t dw_i = (int32_t)(ws->width * (float)view_w);
-				int32_t dh_i = (int32_t)(ws->height * (float)view_h);
-				if (dw_i <= 0 || dh_i <= 0) {
-					continue;
-				}
+			float tile_origin_x = c->hardware_display_3d ? (float)(tile_x * view_w) : 0.0f;
+			float tile_origin_y = c->hardware_display_3d ? (float)(tile_y * view_h) : 0.0f;
+			float tile_w = c->hardware_display_3d ? (float)view_w
+			                                      : (float)(tile_columns * view_w);
+			float tile_h = c->hardware_display_3d ? (float)view_h
+			                                      : (float)(tile_rows * view_h);
 
-				vk_hud_blend_draw_no_layout(&c->window_space_blend, vk, cmd,
-				    c->atlas_ws_fb, atlas_w, atlas_h,
-				    src_image, dx, dy, (uint32_t)dw_i, (uint32_t)dh_i);
+			// Per-view horizontal disparity, graded across the view sweep
+			// (view index = baseline order, same as the projection views):
+			// first view = -half, last = +half. Degenerates to the classic
+			// -/+ pair for 2-view modes and to 0 for a single view.
+			float eye_shift = 0.0f;
+			if (effective_views > 1) {
+				float t = (float)eye / (float)(effective_views - 1);
+				eye_shift = -half_disp + ws->disparity * t;
 			}
+
+			int32_t dx = (int32_t)(tile_origin_x + (ws->x + eye_shift) * tile_w);
+			int32_t dy = (int32_t)(tile_origin_y + ws->y * tile_h);
+			int32_t dw_i = (int32_t)(ws->width * tile_w);
+			int32_t dh_i = (int32_t)(ws->height * tile_h);
+			if (dw_i <= 0 || dh_i <= 0) {
+				continue;
+			}
+
+			// One-shot per-geometry diagnostic (#413): logs the resolved
+			// per-view placement whenever the mode/layout/dims change, so a
+			// missing-HUD report can be pinned to placement vs crop without
+			// a custom build. Not per-frame (see debug-logging conventions).
+			{
+				static uint32_t logged_key = 0;
+				uint32_t key = (tile_columns << 28) ^ (tile_rows << 24) ^
+				               (effective_views << 20) ^ (view_w << 8) ^ view_h ^
+				               ((uint32_t)c->hardware_display_3d << 31);
+				if (key != logged_key && eye == 0) {
+					logged_key = key;
+					U_LOG_W("[VK native] window-space placement: 3d=%d tiles=%ux%u "
+					        "views=%u view=%ux%u atlas=%ux%u first stamp dst=(%d,%d "
+					        "%dx%d) ws=(%.3f,%.3f %.3fx%.3f disp=%.3f)",
+					        (int)c->hardware_display_3d, tile_columns, tile_rows,
+					        effective_views, view_w, view_h, atlas_w, atlas_h,
+					        dx, dy, dw_i, dh_i,
+					        ws->x, ws->y, ws->width, ws->height, ws->disparity);
+				}
+			}
+
+			vk_hud_blend_draw_no_layout(&c->window_space_blend, vk, cmd,
+			    c->atlas_ws_fb, atlas_w, atlas_h,
+			    src_image, dx, dy, (uint32_t)dw_i, (uint32_t)dh_i);
 		}
 
 		// Source back to COLOR_ATTACHMENT_OPTIMAL so the app can rerender.
