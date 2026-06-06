@@ -21,7 +21,7 @@ set(DISPLAYXR_COMMON_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v0.1.1
+    GIT_TAG v0.2.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
