@@ -169,6 +169,7 @@ if "%TARGET%"=="installer" goto :done
 :do_test_apps
 echo.
 echo === Building test apps ===
+set TESTAPP_FAILED=
 
 :: Copy OpenXR SDK to a short path to avoid spaces-in-path linker issues
 set OPENXR_SDK_SHORT=C:\dev\openxr_sdk
@@ -184,7 +185,7 @@ if exist "%REPO%test_apps\cube_handle_d3d11_win\CMakeLists.txt" (
     echo --- cube_handle_d3d11_win ---
     cmake -S "%REPO%\test_apps\cube_handle_d3d11_win" -B "%REPO%\test_apps\cube_handle_d3d11_win\build" -G Ninja ^
         -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_handle_d3d11_win\build"
+    cmake --build "%REPO%\test_apps\cube_handle_d3d11_win\build" || set TESTAPP_FAILED=1
     if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_handle_d3d11_win\build\" >nul
 )
 
@@ -193,7 +194,7 @@ if exist "%REPO%test_apps\cube_hosted_d3d11_win\CMakeLists.txt" (
     echo --- cube_hosted_d3d11_win ---
     cmake -S "%REPO%\test_apps\cube_hosted_d3d11_win" -B "%REPO%\test_apps\cube_hosted_d3d11_win\build" -G Ninja ^
         -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_hosted_d3d11_win\build"
+    cmake --build "%REPO%\test_apps\cube_hosted_d3d11_win\build" || set TESTAPP_FAILED=1
     if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_hosted_d3d11_win\build\" >nul
 )
 
@@ -202,7 +203,7 @@ if exist "%REPO%test_apps\cube_handle_d3d12_win\CMakeLists.txt" (
     echo --- cube_handle_d3d12_win ---
     cmake -S "%REPO%\test_apps\cube_handle_d3d12_win" -B "%REPO%\test_apps\cube_handle_d3d12_win\build" -G Ninja ^
         -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_handle_d3d12_win\build"
+    cmake --build "%REPO%\test_apps\cube_handle_d3d12_win\build" || set TESTAPP_FAILED=1
     if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_handle_d3d12_win\build\" >nul
 )
 
@@ -211,7 +212,7 @@ if exist "%REPO%test_apps\cube_handle_gl_win\CMakeLists.txt" (
     echo --- cube_handle_gl_win ---
     cmake -S "%REPO%\test_apps\cube_handle_gl_win" -B "%REPO%\test_apps\cube_handle_gl_win\build" -G Ninja ^
         -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_handle_gl_win\build"
+    cmake --build "%REPO%\test_apps\cube_handle_gl_win\build" || set TESTAPP_FAILED=1
     if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_handle_gl_win\build\" >nul
 )
 
@@ -220,7 +221,7 @@ if exist "%REPO%test_apps\cube_texture_d3d11_win\CMakeLists.txt" (
     echo --- cube_texture_d3d11_win ---
     cmake -S "%REPO%\test_apps\cube_texture_d3d11_win" -B "%REPO%\test_apps\cube_texture_d3d11_win\build" -G Ninja ^
         -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_texture_d3d11_win\build"
+    cmake --build "%REPO%\test_apps\cube_texture_d3d11_win\build" || set TESTAPP_FAILED=1
     if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_texture_d3d11_win\build\" >nul
 )
 
@@ -229,7 +230,7 @@ if exist "%REPO%test_apps\cube_texture_d3d12_win\CMakeLists.txt" (
     echo --- cube_texture_d3d12_win ---
     cmake -S "%REPO%\test_apps\cube_texture_d3d12_win" -B "%REPO%\test_apps\cube_texture_d3d12_win\build" -G Ninja ^
         -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_texture_d3d12_win\build"
+    cmake --build "%REPO%\test_apps\cube_texture_d3d12_win\build" || set TESTAPP_FAILED=1
     if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_texture_d3d12_win\build\" >nul
 )
 
@@ -238,7 +239,7 @@ if exist "%REPO%test_apps\workspace_minimal_d3d11_win\CMakeLists.txt" (
     echo --- workspace_minimal_d3d11_win ---
     cmake -S "%REPO%\test_apps\workspace_minimal_d3d11_win" -B "%REPO%\test_apps\workspace_minimal_d3d11_win\build" -G Ninja ^
         -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\workspace_minimal_d3d11_win\build"
+    cmake --build "%REPO%\test_apps\workspace_minimal_d3d11_win\build" || set TESTAPP_FAILED=1
     if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\workspace_minimal_d3d11_win\build\" >nul
 )
 
@@ -247,7 +248,7 @@ if exist "%REPO%test_apps\windowspace_handle_d3d11_win\CMakeLists.txt" (
     echo --- windowspace_handle_d3d11_win ---
     cmake -S "%REPO%\test_apps\windowspace_handle_d3d11_win" -B "%REPO%\test_apps\windowspace_handle_d3d11_win\build" -G Ninja ^
         -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\windowspace_handle_d3d11_win\build"
+    cmake --build "%REPO%\test_apps\windowspace_handle_d3d11_win\build" || set TESTAPP_FAILED=1
     if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\windowspace_handle_d3d11_win\build\" >nul
 )
 
@@ -256,7 +257,7 @@ if exist "%REPO%test_apps\windowspace_handle_d3d12_win\CMakeLists.txt" (
     echo --- windowspace_handle_d3d12_win ---
     cmake -S "%REPO%\test_apps\windowspace_handle_d3d12_win" -B "%REPO%\test_apps\windowspace_handle_d3d12_win\build" -G Ninja ^
         -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\windowspace_handle_d3d12_win\build"
+    cmake --build "%REPO%\test_apps\windowspace_handle_d3d12_win\build" || set TESTAPP_FAILED=1
     if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\windowspace_handle_d3d12_win\build\" >nul
 )
 
@@ -265,7 +266,7 @@ if exist "%REPO%test_apps\windowspace_handle_gl_win\CMakeLists.txt" (
     echo --- windowspace_handle_gl_win ---
     cmake -S "%REPO%\test_apps\windowspace_handle_gl_win" -B "%REPO%\test_apps\windowspace_handle_gl_win\build" -G Ninja ^
         -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\windowspace_handle_gl_win\build"
+    cmake --build "%REPO%\test_apps\windowspace_handle_gl_win\build" || set TESTAPP_FAILED=1
     if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\windowspace_handle_gl_win\build\" >nul
 )
 
@@ -274,7 +275,7 @@ if exist "%REPO%test_apps\cube_handle_vk_win\CMakeLists.txt" (
     echo --- cube_handle_vk_win ---
     cmake -S "%REPO%\test_apps\cube_handle_vk_win" -B "%REPO%\test_apps\cube_handle_vk_win\build" -G Ninja ^
         -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_handle_vk_win\build"
+    cmake --build "%REPO%\test_apps\cube_handle_vk_win\build" || set TESTAPP_FAILED=1
     if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_handle_vk_win\build\" >nul
 )
 
@@ -283,8 +284,16 @@ if exist "%REPO%test_apps\windowspace_handle_vk_win\CMakeLists.txt" (
     echo --- windowspace_handle_vk_win ---
     cmake -S "%REPO%\test_apps\windowspace_handle_vk_win" -B "%REPO%\test_apps\windowspace_handle_vk_win\build" -G Ninja ^
         -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\windowspace_handle_vk_win\build"
+    cmake --build "%REPO%\test_apps\windowspace_handle_vk_win\build" || set TESTAPP_FAILED=1
     if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\windowspace_handle_vk_win\build\" >nul
+)
+
+:: Any per-app configure/build failure above set TESTAPP_FAILED — fail the
+:: script instead of silently exiting 0 (the silent form hid real breakage).
+if defined TESTAPP_FAILED (
+    echo.
+    echo *** One or more test apps FAILED to build — see the per-app sections above ***
+    exit /b 1
 )
 
 
