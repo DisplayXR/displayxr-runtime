@@ -131,6 +131,7 @@ struct oxr_face_tracker2_fb;
 struct oxr_body_tracker_fb;
 struct oxr_xdev_list;
 struct oxr_plane_detector_ext;
+struct oxr_local_3d_zone_ext;
 
 #define XRT_MAX_HANDLE_CHILDREN 256
 #define OXR_MAX_BINDINGS_PER_ACTION 32
@@ -408,6 +409,19 @@ oxr_plane_detector_to_openxr(struct oxr_plane_detector_ext *plane_detector)
 	return XRT_CAST_PTR_TO_OXR_HANDLE(XrPlaneDetectorEXT, plane_detector);
 }
 #endif // OXR_HAVE_EXT_plane_detection
+
+#ifdef OXR_HAVE_EXT_local_3d_zone
+/*!
+ * To go back to a OpenXR object.
+ *
+ * @relates oxr_local_3d_zone_ext
+ */
+static inline XrLocal3DZoneMaskEXT
+oxr_local_3d_zone_to_openxr(struct oxr_local_3d_zone_ext *zone)
+{
+	return XRT_CAST_PTR_TO_OXR_HANDLE(XrLocal3DZoneMaskEXT, zone);
+}
+#endif // OXR_HAVE_EXT_local_3d_zone
 
 /*!
  * To go back to a OpenXR object.
@@ -3274,6 +3288,35 @@ struct oxr_plane_detector_ext
 	uint64_t detection_id;
 };
 #endif // OXR_HAVE_EXT_plane_detection
+
+#ifdef OXR_HAVE_EXT_local_3d_zone
+/*!
+ * A local-3D-zone mask: a per-pixel scalar "3D-ness" channel the app authors
+ * (whole window / rect list / freeform RT) and the compositor consumes for
+ * masked 2D/3D composition. See docs/roadmap/unified-2d-3d-phase1-impl.md.
+ *
+ * Parent type/handle is @ref oxr_session
+ *
+ * @obj{XrLocal3DZoneMaskEXT}
+ * @extends oxr_handle_base
+ */
+struct oxr_local_3d_zone_ext
+{
+	//! Common structure for things referred to by OpenXR handles.
+	struct oxr_handle_base handle;
+
+	//! Owner of this mask.
+	struct oxr_session *sess;
+
+	//! Authored mask resolution in client-window pixels.
+	uint32_t width;
+	uint32_t height;
+
+	//! Opaque per-mask state owned by the native compositor (GPU texture
+	//! + views); created/destroyed via comp_*_zone_mask_create/_destroy.
+	void *comp_mask;
+};
+#endif // OXR_HAVE_EXT_local_3d_zone
 
 
 #ifdef OXR_HAVE_EXT_user_presence

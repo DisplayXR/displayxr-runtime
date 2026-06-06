@@ -109,6 +109,88 @@ comp_d3d11_compositor_set_surround_2d(struct xrt_compositor *xc,
                                        void *shared_handle,
                                        uint32_t w, uint32_t h);
 
+/*
+ * XR_EXT_local_3d_zone — authored 2D/3D mask consumer (Phase 1 of unified
+ * 2D/3D compositing, docs/roadmap/unified-2d-3d-phase1-impl.md §3–§5).
+ *
+ * The oxr handlers forward here; the mask generalizes the surround path's
+ * rect-derived 2D region to an arbitrary scalar mask (the Phase-0 shader's
+ * use_rect_mask = 0 path). Each function takes/returns an opaque per-mask
+ * pointer owned by the compositor (an R8_UNORM texture + views).
+ *
+ * NOTE: declared here as the macOS↔Windows hand-off boundary — the
+ * implementations are the Windows leg (consumer wiring + Tier-3 RTV) and do
+ * not exist yet. Signatures may still be refined with that wiring.
+ */
+
+/*!
+ * Create the compositor-side mask state (R8_UNORM texture, w×h client px).
+ *
+ * @param xc       The compositor.
+ * @param w        Mask width in client-window pixels.
+ * @param h        Mask height in client-window pixels.
+ * @param out_mask Receives the opaque per-mask state.
+ *
+ * @ingroup comp_d3d11
+ */
+xrt_result_t
+comp_d3d11_compositor_zone_mask_create(struct xrt_compositor *xc,
+                                       uint32_t w, uint32_t h,
+                                       void **out_mask);
+
+/*!
+ * Tier 1 — fill the whole mask: all-3D (enable_3d) or all-2D.
+ *
+ * @ingroup comp_d3d11
+ */
+xrt_result_t
+comp_d3d11_compositor_zone_mask_set_whole(struct xrt_compositor *xc,
+                                          void *mask,
+                                          bool enable_3d);
+
+/*!
+ * Tier 2 — rasterize client-window-pixel rects as the 3D region (M=1 inside,
+ * M=0 elsewhere).
+ *
+ * @ingroup comp_d3d11
+ */
+xrt_result_t
+comp_d3d11_compositor_zone_mask_set_rects(struct xrt_compositor *xc,
+                                          void *mask,
+                                          uint32_t count,
+                                          const struct xrt_rect *rects);
+
+/*!
+ * Tier 3 — hand back the RTV on the mask texture for freeform app drawing.
+ *
+ * @param out_rtv Receives an ID3D11RenderTargetView* (as void*).
+ *
+ * @ingroup comp_d3d11
+ */
+xrt_result_t
+comp_d3d11_compositor_zone_mask_acquire_rt(struct xrt_compositor *xc,
+                                           void *mask,
+                                           void **out_rtv,
+                                           uint32_t *out_w,
+                                           uint32_t *out_h);
+
+/*!
+ * Stage the mask's current contents for the next frame submission (atomic
+ * with that frame's weave — spec §9 Q3).
+ *
+ * @ingroup comp_d3d11
+ */
+xrt_result_t
+comp_d3d11_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask);
+
+/*!
+ * Destroy the compositor-side mask state.
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask);
+
 /*!
  * Get the predicted eye positions from the display processor.
  *

@@ -477,6 +477,16 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrCaptureAtlasEXT, EXT_atlas_capture);
 #endif
 
+#ifdef OXR_HAVE_EXT_local_3d_zone
+	ENTRY_IF_EXT(xrGetLocal3DZoneCapabilitiesEXT, EXT_local_3d_zone);
+	ENTRY_IF_EXT(xrCreateLocal3DZoneMaskEXT, EXT_local_3d_zone);
+	ENTRY_IF_EXT(xrSetLocal3DZoneWholeWindowEXT, EXT_local_3d_zone);
+	ENTRY_IF_EXT(xrSetLocal3DZoneFromRectsEXT, EXT_local_3d_zone);
+	ENTRY_IF_EXT(xrAcquireLocal3DZoneRenderTargetEXT, EXT_local_3d_zone);
+	ENTRY_IF_EXT(xrSubmitLocal3DZoneEXT, EXT_local_3d_zone);
+	ENTRY_IF_EXT(xrDestroyLocal3DZoneMaskEXT, EXT_local_3d_zone);
+#endif
+
 #ifdef OXR_HAVE_EXT_workspace_file_dialog
 	ENTRY_IF_EXT(xrRequestFilePickerEXT, EXT_workspace_file_dialog);
 	ENTRY_IF_EXT(xrGetFilePickerRequestEXT, EXT_workspace_file_dialog);
