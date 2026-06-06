@@ -142,8 +142,10 @@ struct comp_d3d11_compositor
 	bool has_shared_texture;
 
 	//! Canvas output rect for shared-texture apps.
-	//! When valid, the hidden weaver window is positioned to match this
-	//! sub-rect instead of the full client rect.
+	//! When valid, it flows to the DP as the weave sub-rect via the
+	//! process_atlas canvas params (#85) and drives view dims + Kooima
+	//! metrics. Superseded by an active zone mask (#439 Phase 2) — read
+	//! through d3d11_effective_canvas() on every frame-path site.
 	struct u_canvas_rect canvas;
 
 	//! 2D surround texture handle (Spec v6).
@@ -303,9 +305,42 @@ d3d11_maybe_capture_surround_target(struct comp_d3d11_compositor *c,
 // near the bottom of the file alongside the comp_d3d11_compositor_zone_mask_*
 // entry points, called from the layer-commit paths + destroy above them.
 static bool
-d3d11_composite_zone_mask(struct comp_d3d11_compositor *c, ID3D11Texture2D *dst, uint32_t dst_w, uint32_t dst_h);
+d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
+                          ID3D11Texture2D *dst,
+                          uint32_t dst_w,
+                          uint32_t dst_h,
+                          const struct u_canvas_rect *eff_canvas);
 static void
 d3d11_release_zone_state(struct comp_d3d11_compositor *c);
+
+// #439 Phase 2: an active zone mask supersedes the canvas output rect —
+// the weave region, view dims, Kooima metrics, and composite region all
+// become the client-window rect (top-left anchored per #464). With no mask
+// this returns c->canvas verbatim, so the no-mask path is unchanged.
+// Returning a *valid* window rect (not just "invalid") matters on the
+// shared-texture path: the texture is display-sized worst-case, so an
+// invalid canvas there would fall back to display dims — the window rect
+// keeps the #464 clamp. Callers in the frame path hold c->mutex, which
+// zone_mask_submit/destroy also take, so the mask cannot flip mid-frame.
+static struct u_canvas_rect
+d3d11_effective_canvas(struct comp_d3d11_compositor *c)
+{
+	if (c->active_zone_mask == nullptr) {
+		return c->canvas;
+	}
+	struct u_canvas_rect win = {};
+	HWND wnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
+	RECT r;
+	if (wnd != nullptr && GetClientRect(wnd, &r) && r.right > 0 && r.bottom > 0) {
+		win.valid = true;
+		win.x = 0;
+		win.y = 0;
+		win.w = (uint32_t)r.right;
+		win.h = (uint32_t)r.bottom;
+		return win;
+	}
+	return win; // invalid → existing full-target fallbacks
+}
 
 /*
  *
@@ -1337,6 +1372,14 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	}
 #endif
 
+	// #439 Phase 2: the one canvas authority for this frame. While a zone
+	// mask is active this is the client-window rect (the mask supersedes
+	// the output rect); otherwise it is c->canvas unchanged. Computed once
+	// under c->mutex (held for this whole function) so the weave region,
+	// view dims, and composite all see the same rect even if submit/destroy
+	// race the frame.
+	const struct u_canvas_rect eff_canvas = d3d11_effective_canvas(c);
+
 	// Get target (window) dimensions for mono viewport sizing.
 	// In shared texture mode (no target), use canvas dims if available —
 	// the DP weaves at canvas resolution, not full shared texture size.
@@ -1344,9 +1387,9 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	uint32_t tgt_height = c->settings.preferred.height;
 	if (c->target != nullptr) {
 		comp_d3d11_target_get_dimensions(c->target, &tgt_width, &tgt_height);
-	} else if (c->canvas.valid && c->canvas.w > 0 && c->canvas.h > 0) {
-		tgt_width = c->canvas.w;
-		tgt_height = c->canvas.h;
+	} else if (eff_canvas.valid && eff_canvas.w > 0 && eff_canvas.h > 0) {
+		tgt_width = eff_canvas.w;
+		tgt_height = eff_canvas.h;
 	}
 
 	// Sync renderer view dims from active mode — set_tile_layout derives
@@ -1361,8 +1404,8 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			if (mode->view_width_pixels > 0) {
 				uint32_t new_vw = mode->view_width_pixels;
 				uint32_t new_vh = mode->view_height_pixels;
-				if (c->canvas.valid) {
-					u_tiling_compute_canvas_view(mode, c->canvas.w, c->canvas.h,
+				if (eff_canvas.valid) {
+					u_tiling_compute_canvas_view(mode, eff_canvas.w, eff_canvas.h,
 					                             &new_vw, &new_vh);
 				} else if (!c->owns_window && tgt_width > 0 && tgt_height > 0) {
 					// Handle app: window may differ from display size,
@@ -1604,10 +1647,10 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			xrt_display_processor_d3d11_process_atlas(
 			    c->display_processor, c->context, atlas_srv, view_width, view_height,
 			    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, dp_target_w, dp_target_h,
-			    c->canvas.valid ? c->canvas.x : 0,
-			    c->canvas.valid ? c->canvas.y : 0,
-			    c->canvas.valid ? c->canvas.w : 0,
-			    c->canvas.valid ? c->canvas.h : 0);
+			    eff_canvas.valid ? eff_canvas.x : 0,
+			    eff_canvas.valid ? eff_canvas.y : 0,
+			    eff_canvas.valid ? eff_canvas.w : 0,
+			    eff_canvas.valid ? eff_canvas.h : 0);
 
 			// Spec v6 surround blit: fill non-canvas pixels of the shared
 			// texture from the app-supplied 2D surround texture (no-op if
@@ -1619,18 +1662,19 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			// #439 Phase 0: DISPLAYXR_SURROUND_SHADER routes this through the
 			// general masked-composite shader instead of the strip copy
 			// (pixel-identical); falls back to the strips if it can't run.
-			bool surround_done = d3d11_composite_zone_mask(c, c->shared_texture, dp_target_w, dp_target_h);
+			bool surround_done =
+			    d3d11_composite_zone_mask(c, c->shared_texture, dp_target_w, dp_target_h, &eff_canvas);
 			if (!surround_done && d3d11_surround_shader_enabled()) {
 				surround_done = d3d11_composite_surround_shader(
-				    c, c->shared_texture, dp_target_w, dp_target_h, c->canvas.valid ? c->canvas.x : 0,
-				    c->canvas.valid ? c->canvas.y : 0, c->canvas.valid ? c->canvas.w : dp_target_w,
-				    c->canvas.valid ? c->canvas.h : dp_target_h);
+				    c, c->shared_texture, dp_target_w, dp_target_h, eff_canvas.valid ? eff_canvas.x : 0,
+				    eff_canvas.valid ? eff_canvas.y : 0, eff_canvas.valid ? eff_canvas.w : dp_target_w,
+				    eff_canvas.valid ? eff_canvas.h : dp_target_h);
 			}
 			if (!surround_done) {
 				d3d11_blit_surround_strips(
-				    c, c->shared_texture, dp_target_w, dp_target_h, c->canvas.valid ? c->canvas.x : 0,
-				    c->canvas.valid ? c->canvas.y : 0, c->canvas.valid ? c->canvas.w : dp_target_w,
-				    c->canvas.valid ? c->canvas.h : dp_target_h);
+				    c, c->shared_texture, dp_target_w, dp_target_h, eff_canvas.valid ? eff_canvas.x : 0,
+				    eff_canvas.valid ? eff_canvas.y : 0, eff_canvas.valid ? eff_canvas.w : dp_target_w,
+				    eff_canvas.valid ? eff_canvas.h : dp_target_h);
 			}
 
 			// #439 Phase 0 A/B validation probe (no-op unless
@@ -1689,10 +1733,10 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		xrt_display_processor_d3d11_process_atlas(
 		    c->display_processor, c->context, atlas_srv, view_width, view_height,
 		    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height,
-		    c->canvas.valid ? c->canvas.x : 0,
-		    c->canvas.valid ? c->canvas.y : 0,
-		    c->canvas.valid ? c->canvas.w : 0,
-		    c->canvas.valid ? c->canvas.h : 0);
+		    eff_canvas.valid ? eff_canvas.x : 0,
+		    eff_canvas.valid ? eff_canvas.y : 0,
+		    eff_canvas.valid ? eff_canvas.w : 0,
+		    eff_canvas.valid ? eff_canvas.h : 0);
 
 		// Spec v6 surround blit: fill non-canvas pixels of the DXGI back
 		// buffer from the app-supplied 2D surround texture. The downstream
@@ -1704,18 +1748,19 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// the rect-derived region selection entirely (see the offscreen path).
 		// #439 Phase 0: DISPLAYXR_SURROUND_SHADER routes through the general
 		// masked-composite shader (pixel-identical); strip-copy fallback.
-		bool surround_done = d3d11_composite_zone_mask(c, back_buffer_for_surround, target_width, target_height);
+		bool surround_done =
+		    d3d11_composite_zone_mask(c, back_buffer_for_surround, target_width, target_height, &eff_canvas);
 		if (!surround_done && d3d11_surround_shader_enabled()) {
 			surround_done = d3d11_composite_surround_shader(
-			    c, back_buffer_for_surround, target_width, target_height, c->canvas.valid ? c->canvas.x : 0,
-			    c->canvas.valid ? c->canvas.y : 0, c->canvas.valid ? c->canvas.w : target_width,
-			    c->canvas.valid ? c->canvas.h : target_height);
+			    c, back_buffer_for_surround, target_width, target_height, eff_canvas.valid ? eff_canvas.x : 0,
+			    eff_canvas.valid ? eff_canvas.y : 0, eff_canvas.valid ? eff_canvas.w : target_width,
+			    eff_canvas.valid ? eff_canvas.h : target_height);
 		}
 		if (!surround_done) {
 			d3d11_blit_surround_strips(c, back_buffer_for_surround, target_width, target_height,
-			                           c->canvas.valid ? c->canvas.x : 0, c->canvas.valid ? c->canvas.y : 0,
-			                           c->canvas.valid ? c->canvas.w : target_width,
-			                           c->canvas.valid ? c->canvas.h : target_height);
+			                           eff_canvas.valid ? eff_canvas.x : 0, eff_canvas.valid ? eff_canvas.y : 0,
+			                           eff_canvas.valid ? eff_canvas.w : target_width,
+			                           eff_canvas.valid ? eff_canvas.h : target_height);
 		}
 
 		// #439 Phase 0 A/B validation probe (no-op unless
@@ -2789,8 +2834,17 @@ d3d11_ensure_srv_scratch(struct comp_d3d11_compositor *c,
 //
 // #464 window clamping: all inputs are window-sized; the pass writes only the
 // window region at the top-left anchor of the (worst-case-allocated) dst.
+//
+// #439 Phase 2: eff_canvas is the caller's per-frame effective canvas
+// (d3d11_effective_canvas under c->mutex) — the window rect while the mask
+// is active, so the composite region and the weave region share one
+// authority.
 static bool
-d3d11_composite_zone_mask(struct comp_d3d11_compositor *c, ID3D11Texture2D *dst, uint32_t dst_w, uint32_t dst_h)
+d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
+                          ID3D11Texture2D *dst,
+                          uint32_t dst_w,
+                          uint32_t dst_h,
+                          const struct u_canvas_rect *eff_canvas)
 {
 	struct comp_d3d11_zone_mask *mask = c->active_zone_mask;
 	if (mask == nullptr || !mask->submitted || dst == nullptr || c->renderer == nullptr) {
@@ -2876,12 +2930,13 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c, ID3D11Texture2D *dst,
 	// the lerp reads this copy — impl doc §3 step 2).
 	c->context->CopySubresourceRegion(c->weave_scratch, 0, 0, 0, 0, dst, 0, &sbox);
 
-	// Canvas rect clamped to the window region (the shader ignores it on the
-	// mask path; kept coherent for the CB anyway).
-	int32_t cx = c->canvas.valid ? c->canvas.x : 0;
-	int32_t cy = c->canvas.valid ? c->canvas.y : 0;
-	uint32_t cw = c->canvas.valid ? c->canvas.w : region_w;
-	uint32_t ch = c->canvas.valid ? c->canvas.h : region_h;
+	// Effective canvas rect clamped to the window region (the shader ignores
+	// it on the mask path; kept coherent for the CB anyway). #439 Phase 2:
+	// this is the window rect while the mask is active.
+	int32_t cx = eff_canvas->valid ? eff_canvas->x : 0;
+	int32_t cy = eff_canvas->valid ? eff_canvas->y : 0;
+	uint32_t cw = eff_canvas->valid ? eff_canvas->w : region_w;
+	uint32_t ch = eff_canvas->valid ? eff_canvas->h : region_h;
 	uint32_t cx_u = (cx < 0) ? 0u : (uint32_t)cx;
 	uint32_t cy_u = (cy < 0) ? 0u : (uint32_t)cy;
 	if (cx_u > region_w)
@@ -3259,7 +3314,13 @@ comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc,
 
 	out_metrics->valid = true;
 
-	u_canvas_apply_to_metrics(out_metrics, &c->canvas);
+	// #439 Phase 2: the effective canvas, not c->canvas — while a zone mask
+	// is active this is the window rect, so the apply is a no-op by
+	// construction and the Kooima/adaptive-FOV metrics follow the
+	// window-spanning weave region. (Unlocked read, same as the rest of this
+	// function — the pointer check in d3d11_effective_canvas is benign.)
+	const struct u_canvas_rect eff_canvas = d3d11_effective_canvas(c);
+	u_canvas_apply_to_metrics(out_metrics, &eff_canvas);
 
 	return true;
 }
