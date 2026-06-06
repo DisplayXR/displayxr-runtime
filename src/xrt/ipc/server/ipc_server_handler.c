@@ -1574,6 +1574,34 @@ ipc_handle_compositor_get_window_metrics(volatile struct ipc_client_state *ics,
 }
 
 xrt_result_t
+ipc_handle_compositor_get_predicted_eye_positions(volatile struct ipc_client_state *ics,
+                                                  struct xrt_eye_positions *out_eye_positions)
+{
+	IPC_TRACE_MARKER();
+
+	struct xrt_eye_positions eyes = {0};
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// Full DP eye-position struct incl. is_tracking (#441 Phase 2). The
+	// client's OpenXR state tracker consumes this ONLY for the derived
+	// XrViewEyeTrackingStateEXT.isTracking value + the tracking-state
+	// event — view poses stay server-computed (ipc_try_get_sr_view_poses),
+	// so these positions never feed the client-side Kooima path.
+	if (ics->server != NULL && ics->server->xsysc != NULL &&
+	    comp_d3d11_service_is_d3d11_service(ics->server->xsysc)) {
+		(void)comp_d3d11_service_get_predicted_eye_positions_full(ics->server->xsysc, &eyes);
+	}
+#else
+	(void)ics;
+#endif
+
+	// eyes.valid == false signals "no DP / no data" to the client.
+	*out_eye_positions = eyes;
+
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
 ipc_handle_compositor_predict_frame(volatile struct ipc_client_state *ics,
                                     int64_t *out_frame_id,
                                     int64_t *out_wake_up_time_ns,

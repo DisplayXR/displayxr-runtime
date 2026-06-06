@@ -471,6 +471,12 @@
 		]
 	},
 
+	"compositor_get_predicted_eye_positions": {
+		"out": [
+			{"name": "eye_positions", "type": "struct xrt_eye_positions"}
+		]
+	},
+
 	"compositor_predict_frame": {
 		"out": [
 			{"name": "frame_id", "type": "int64_t"},

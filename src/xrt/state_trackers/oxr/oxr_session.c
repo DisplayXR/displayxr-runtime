@@ -98,6 +98,14 @@ struct xrt_window_metrics;
 bool
 comp_ipc_client_compositor_get_window_metrics(struct xrt_compositor *xc, struct xrt_window_metrics *out_metrics);
 
+// IPC-client DP tracking state (#441 Phase 2) — same linkage pattern as
+// above. Consumed ONLY for the derived isTracking value + tracking-state
+// event; view poses stay server-computed (ipc_try_get_sr_view_poses).
+struct xrt_eye_positions;
+bool
+comp_ipc_client_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
+                                                       struct xrt_eye_positions *out_eyes);
+
 #ifdef XRT_OS_WINDOWS
 // GH #227 Tier 0: install / tear down the in-app CBT hook that re-parents
 // owned modal popups (file dialogs etc.) from the hidden app HWND onto a
@@ -1753,6 +1761,25 @@ oxr_session_locate_views(struct oxr_logger *log,
 			    (et_head->rendering_modes[ami].mode_flags & XRT_RENDERING_MODE_FLAG_HAS_TRACKING) != 0;
 		}
 		bool is_tracking = mode_has_tracking && got_eye_positions && eye_pos.valid && eye_pos.is_tracking;
+
+		// IPC sessions (#441 Phase 2): the in-process eye-position getters
+		// all miss (sess->xcn is an IPC proxy), so fetch the DP tracking
+		// state over IPC. Consumed ONLY here — feeding these positions
+		// into got_eye_positions would activate the client-side Kooima
+		// path and double-apply window math on top of the
+		// server-computed view poses (the Phase-0 multi-comp regression).
+		// Skipped when the active mode is untracked: the result would be
+		// FALSE either way, so don't pay the round-trip.
+		if (!got_eye_positions && mode_has_tracking && sess->xcn != NULL &&
+		    sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode &&
+		    !sess->is_d3d11_native_compositor && !sess->is_d3d12_native_compositor &&
+		    !sess->is_gl_native_compositor && !sess->is_vk_native_compositor &&
+		    !sess->is_metal_native_compositor && sess->sys->xsysc->xmcc == NULL) {
+			struct xrt_eye_positions ipc_eyes;
+			if (comp_ipc_client_compositor_get_predicted_eye_positions(&sess->xcn->base, &ipc_eyes)) {
+				is_tracking = ipc_eyes.is_tracking;
+			}
+		}
 
 		XrViewEyeTrackingStateEXT *ets = OXR_GET_OUTPUT_FROM_CHAIN(
 		    viewState, XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT, XrViewEyeTrackingStateEXT);

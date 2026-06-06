@@ -91,6 +91,22 @@ comp_d3d11_service_get_predicted_eye_positions(struct xrt_system_compositor *xsy
                                                 struct xrt_vec3 *out_right);
 
 /*!
+ * Get the full predicted eye-position struct from the active DP — N-view
+ * positions plus `valid` and `is_tracking` (#441 Phase 2). The left/right
+ * variant above is a thin wrapper over this.
+ *
+ * @param xsysc The system compositor (must be D3D11 service compositor).
+ * @param[out] out_eyes Full eye-position struct incl. is_tracking.
+ * @return true if the DP produced positions (out_eyes->valid may still
+ *         gate usability), false if no DP was available.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_get_predicted_eye_positions_full(struct xrt_system_compositor *xsysc,
+                                                     struct xrt_eye_positions *out_eyes);
+
+/*!
  * Get display dimensions from the D3D11 service compositor's SR weaver.
  *
  * @param xsysc The system compositor (must be D3D11 service compositor).
