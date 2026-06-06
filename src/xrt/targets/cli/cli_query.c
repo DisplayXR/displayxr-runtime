@@ -94,6 +94,15 @@ cli_query_run(struct cli_query_result *r)
 	r->head_ok = true;
 	snprintf(r->head_str, sizeof(r->head_str), "%s", head->str);
 
+	// Rendering-mode snapshot incl. per-mode tracking flags (#441).
+	r->rendering_mode_count = head->rendering_mode_count;
+	if (r->rendering_mode_count > XRT_MAX_RENDERING_MODES) {
+		r->rendering_mode_count = XRT_MAX_RENDERING_MODES;
+	}
+	for (uint32_t m = 0; m < r->rendering_mode_count; m++) {
+		r->rendering_modes[m] = head->rendering_modes[m];
+	}
+
 	const struct xrt_plugin_iface *iface = target_plugin_get_active();
 	if (iface == NULL) {
 		r->result_code = CLI_SELFTEST_NO_DP;
@@ -227,6 +236,13 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	PT("eye-tracking: supported=%s (0x%x) default=%s\n",
 	   eye_modes_label(i->supported_eye_tracking_modes, et_buf, sizeof(et_buf)),
 	   i->supported_eye_tracking_modes, eye_default_label(i->default_eye_tracking_mode));
+	PT("modes:        %u\n", r->rendering_mode_count);
+	for (uint32_t m = 0; m < r->rendering_mode_count; m++) {
+		const struct xrt_rendering_mode *rm = &r->rendering_modes[m];
+		PT("  [%u] %-14s views=%u 3d=%c tracked=%c\n", rm->mode_index, rm->mode_name, rm->view_count,
+		   rm->hardware_display_3d ? 'y' : 'n',
+		   (rm->mode_flags & XRT_RENDERING_MODE_FLAG_HAS_TRACKING) ? 'y' : 'n');
+	}
 }
 
 void
@@ -262,6 +278,18 @@ cli_query_print_info_json(const struct cli_query_result *r)
 
 	if (r->head_ok) {
 		cJSON_AddStringToObject(root, "device", r->head_str);
+		cJSON *rms = cJSON_AddArrayToObject(root, "rendering_modes");
+		for (uint32_t m = 0; m < r->rendering_mode_count; m++) {
+			const struct xrt_rendering_mode *rm = &r->rendering_modes[m];
+			cJSON *o = cJSON_CreateObject();
+			cJSON_AddNumberToObject(o, "mode_index", (double)rm->mode_index);
+			cJSON_AddStringToObject(o, "name", rm->mode_name);
+			cJSON_AddNumberToObject(o, "view_count", (double)rm->view_count);
+			cJSON_AddBoolToObject(o, "hardware_display_3d", rm->hardware_display_3d);
+			cJSON_AddBoolToObject(o, "has_tracking",
+			                      (rm->mode_flags & XRT_RENDERING_MODE_FLAG_HAS_TRACKING) != 0);
+			cJSON_AddItemToArray(rms, o);
+		}
 	} else {
 		cJSON_AddNullToObject(root, "device");
 	}

@@ -306,6 +306,32 @@ out:
 				xsysc->info.supported_eye_tracking_modes = pdi.supported_eye_tracking_modes;
 				xsysc->info.default_eye_tracking_mode = pdi.default_eye_tracking_mode;
 
+				// Consistency rule (#441): supported_eye_tracking_modes != 0
+				// ⇔ at least one rendering mode claims HAS_TRACKING. A
+				// mismatch means the plug-in's capability advertisement and
+				// its per-mode flags disagree — apps would see impossible
+				// combinations (e.g. MANAGED offered but isTracking pinned
+				// FALSE). One-shot init WARN, not fatal.
+				{
+					bool any_tracked = false;
+					for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
+						if (head->rendering_modes[mi].mode_flags &
+						    XRT_RENDERING_MODE_FLAG_HAS_TRACKING) {
+							any_tracked = true;
+							break;
+						}
+					}
+					if ((pdi.supported_eye_tracking_modes != 0) != any_tracked) {
+						U_LOG_W("Plug-in '%s' tracking advertisement inconsistent: "
+						        "supported_eye_tracking_modes=0x%x but %s rendering "
+						        "mode sets XRT_RENDERING_MODE_FLAG_HAS_TRACKING "
+						        "(see #441 consistency rule)",
+						        plugin->id ? plugin->id : "?",
+						        pdi.supported_eye_tracking_modes,
+						        any_tracked ? "at least one" : "no");
+					}
+				}
+
 				// Compute tiling once we have native pixel dims.
 				if (pdi.display_pixel_width > 0 && pdi.display_pixel_height > 0) {
 					for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {

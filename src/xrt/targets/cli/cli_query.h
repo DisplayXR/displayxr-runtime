@@ -17,6 +17,7 @@
 #pragma once
 
 #include "xrt/xrt_plugin.h"
+#include "xrt/xrt_device.h"
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -73,6 +74,11 @@ struct cli_query_result
 
 	/* Head/display device description (valid iff head_ok). */
 	char head_str[256];
+
+	/* Rendering-mode snapshot incl. per-mode tracking flags (#441;
+	 * valid iff head_ok — count 0 if the device exposes none). */
+	uint32_t rendering_mode_count;
+	struct xrt_rendering_mode rendering_modes[XRT_MAX_RENDERING_MODES];
 
 	/* Vendor-neutral display info (valid iff display_info_ok). */
 	struct xrt_plugin_display_info display_info;
