@@ -1,0 +1,39 @@
+name: drift-guard
+
+# Epic #396: the shared off-axis Kooima math (display3d_view / camera3d_view)
+# lives in displayxr::math and is consumed via FetchContent / submodule. It must
+# NOT be re-vendored into this repo's tracked sources — re-copying it is exactly
+# how the 6x drift this epic killed got started. This guard fails the build if a
+# vendored copy reappears.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: drift-guard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  no-vendored-math:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No re-vendored displayxr::math sources
+        shell: bash
+        run: |
+          # FetchContent copies live in _deps/ (gitignored); a git submodule's
+          # files are not parent-tracked; the runtime's m_*_view.c FOV-only ports
+          # are a different (deferred) layer and don't match this pattern; and
+          # leia_math.h is an app-local reference, not part of displayxr::math.
+          hits=$(git ls-files | grep -E '(^|/)(display3d_view|camera3d_view)\.(c|h)$' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::Re-vendored displayxr::math sources found. The off-axis Kooima"
+            echo "::error::math must come from displayxr::math (FetchContent / submodule),"
+            echo "::error::not be copied into this repo. See epic #396."
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK: no vendored display3d_view / camera3d_view sources."
