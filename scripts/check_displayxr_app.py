@@ -51,7 +51,11 @@ RULES = {
     "INV-7.2": "xrCaptureAtlasEXT pathPrefix takes NO extension; the runtime appends _atlas.png.",
     "INV-9.1": "Ship a <exe>.displayxr.json (schema_version=1, name 1-64, type 2d|3d) or the app won't appear in the workspace launcher.",
     "INV-9.2": "2D icon is 512x512 (`icon`); 3D icon is 1024x512 (`icon_3d`, requires `icon`); layout in {sbs-lr,sbs-rl,tb,bt}.",
+    "INV-10.1": "Apps registering MCP tools (XR_EXT_mcp_tools) declare a manifest `id` (^[a-z0-9][a-z0-9-]{0,31}$) matching the xrSetMCPAppInfoEXT appId.",
 }
+
+# Manifest `id` / XrMCPAppInfoEXT appId slug (manifest spec §3.4).
+APP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 
 ERROR, WARN, INFO = "ERROR", "WARN", "INFO"
 
@@ -243,6 +247,69 @@ def validate_manifest(mpath: Path, root: Path, findings: list):
                                     f"Re-export {key} at {want[0]}x{want[1]} (PNG)."))
 
 
+def check_mcp_pairing(root: Path, findings: list):
+    """INV-10.1 — XR_EXT_mcp_tools <-> manifest `id` pairing.
+
+    If any source registers MCP tools, a manifest must declare a valid
+    `id`; when the appId literal is extractable from the source, it must
+    equal the manifest's. Manifests with a malformed `id` get a WARN
+    regardless (soft failure per manifest spec §6 — the launcher still
+    accepts the app, consumers fall back to the exe basename).
+    """
+    # Manifest ids.
+    manifest_ids = {}
+    for m in root.rglob("*.displayxr.json"):
+        if any(part in EXCLUDE_DIRS for part in m.relative_to(root).parts[:-1]):
+            continue
+        try:
+            data = json.loads(m.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue  # INV-9.1 already reported it.
+        app_id = data.get("id")
+        if app_id is None:
+            continue
+        if not isinstance(app_id, str) or not APP_ID_RE.match(app_id):
+            findings.append(Finding(WARN, "INV-10.1", rel(m, root), 1,
+                                    f"id {app_id!r} does not match ^[a-z0-9][a-z0-9-]{{0,31}}$ — consumers will ignore it.",
+                                    "Use a lowercase slug (letters/digits/hyphens, no underscores — '__' is the MCP namespace separator)."))
+            continue
+        manifest_ids[rel(m, root)] = app_id
+
+    # Source-side usage + declared appId literals.
+    uses_mcp_tools = False
+    declared = []  # (path, line, appId literal)
+    appid_re = re.compile(r"\.appId\s*=\s*\"([^\"]*)\"|appId\s*,\s*\"([^\"]*)\"")
+    for p in sorted(root.rglob("*")):
+        if p.suffix.lower() not in SOURCE_EXTS or not p.is_file():
+            continue
+        if any(part in EXCLUDE_DIRS for part in p.relative_to(root).parts[:-1]):
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "xrRegisterMCPToolEXT" in text or "xrSetMCPAppInfoEXT" in text:
+            uses_mcp_tools = True
+        for i, line in enumerate(text.splitlines(), 1):
+            m = appid_re.search(line)
+            if m:
+                declared.append((rel(p, root), i, m.group(1) or m.group(2)))
+
+    if not uses_mcp_tools:
+        return
+    if not manifest_ids:
+        findings.append(Finding(ERROR, "INV-10.1", str(root), 1,
+                                "Source registers MCP tools (XR_EXT_mcp_tools) but no manifest declares an `id`.",
+                                'Add "id": "<slug>" to the .displayxr.json — it is the agent-visible tool prefix.'))
+        return
+    for path, line, lit in declared:
+        if lit and lit not in manifest_ids.values():
+            findings.append(Finding(ERROR, "INV-10.1", path, line,
+                                    f"xrSetMCPAppInfoEXT appId {lit!r} does not match any manifest id "
+                                    f"({', '.join(sorted(set(manifest_ids.values())))}).",
+                                    "Make the code and manifest agree — agents key tool names on this slug."))
+
+
 def scan_manifests(root: Path, findings: list):
     manifests = [p for p in root.rglob("*.displayxr.json")
                  if not any(part in EXCLUDE_DIRS for part in p.relative_to(root).parts[:-1])]
@@ -289,6 +356,7 @@ def main(argv=None) -> int:
     findings: list = []
     scan_sources(root, findings)
     scan_manifests(root, findings)
+    check_mcp_pairing(root, findings)
     print_findings(findings, root)
 
     n_err = sum(1 for f in findings if f.level == ERROR)

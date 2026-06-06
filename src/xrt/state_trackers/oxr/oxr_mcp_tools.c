@@ -810,6 +810,10 @@ static const struct mcp_tool TOOL_CAPTURE_FRAME = {
         "\"enum\":[\"post-compose\",\"projection-only\"],"
         "\"description\":\"Atlas state to capture; default post-compose.\"}}}",
     .fn = tool_capture_frame,
+    // The verification primitive — exposed by default through the
+    // workspace aggregator (every other Phase A tool stays DIAGNOSTIC,
+    // the zero-init default, hidden unless --expose-diagnostics).
+    .group = MCP_TOOL_GROUP_CAPTURE,
 };
 
 static const struct mcp_tool TOOL_DIFF_PROJECTION = {

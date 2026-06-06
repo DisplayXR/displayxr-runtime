@@ -1175,6 +1175,31 @@ oxr_event_push_XrEventDataFilePickerComplete(struct oxr_logger *log,
                                               const char *path);
 #endif // OXR_HAVE_EXT_workspace_file_dialog
 
+#ifdef OXR_HAVE_EXT_mcp_tools
+/*!
+ * Push an `XrEventDataMCPToolCallEXT` onto the instance event queue.
+ *
+ * Called by the MCP app-tool trampoline (oxr_mcp_app_tools.c) when an
+ * agent invokes an app-registered tool; the app fetches the args via
+ * `xrGetMCPToolCallArgsEXT(callId)` and answers with
+ * `xrSubmitMCPToolResultEXT`.
+ */
+XrResult
+oxr_event_push_XrEventDataMCPToolCall(struct oxr_logger *log,
+                                      struct oxr_session *sess,
+                                      uint64_t call_id,
+                                      const char *tool_name,
+                                      uint32_t args_size);
+
+/*!
+ * Unregister every app tool the session registered via
+ * `xrRegisterMCPToolEXT` and fail its pending tool calls. Called from
+ * session destroy. Implemented in oxr_mcp_app_tools.c.
+ */
+void
+oxr_mcp_app_tools_session_destroy(struct oxr_session *sess);
+#endif // OXR_HAVE_EXT_mcp_tools
+
 #ifdef OXR_HAVE_FB_display_refresh_rate
 XrResult
 oxr_event_push_XrEventDataDisplayRefreshRateChangedFB(struct oxr_logger *log,

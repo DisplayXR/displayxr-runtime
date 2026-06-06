@@ -2004,6 +2004,12 @@ oxr_session_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 	// MCP tool handler stops reading.
 	oxr_mcp_tools_detach_session(sess);
 
+#ifdef OXR_HAVE_EXT_mcp_tools
+	// Unregister the session's app-defined tools (XR_EXT_mcp_tools) and
+	// fail their pending calls before the event queue is drained below.
+	oxr_mcp_app_tools_session_destroy(sess);
+#endif
+
 #ifdef XRT_OS_WINDOWS
 	// GH #227 Tier 0: tear down the modal-dialog hook before sess->xcn is
 	// destroyed — the hook proc dereferences sess->xcn->base via its

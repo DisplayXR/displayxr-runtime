@@ -483,6 +483,14 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrCompleteFilePickerEXT, EXT_workspace_file_dialog);
 #endif
 
+#ifdef OXR_HAVE_EXT_mcp_tools
+	ENTRY_IF_EXT(xrSetMCPAppInfoEXT, EXT_mcp_tools);
+	ENTRY_IF_EXT(xrRegisterMCPToolEXT, EXT_mcp_tools);
+	ENTRY_IF_EXT(xrUnregisterMCPToolEXT, EXT_mcp_tools);
+	ENTRY_IF_EXT(xrGetMCPToolCallArgsEXT, EXT_mcp_tools);
+	ENTRY_IF_EXT(xrSubmitMCPToolResultEXT, EXT_mcp_tools);
+#endif
+
 	// xrSetSharedTextureOutputRectEXT — canvas sub-rect, part of window binding extensions
 #ifdef OXR_HAVE_EXT_win32_window_binding
 	ENTRY_IF_EXT(xrSetSharedTextureOutputRectEXT, EXT_win32_window_binding);
