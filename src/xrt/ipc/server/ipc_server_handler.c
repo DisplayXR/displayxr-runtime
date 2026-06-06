@@ -29,6 +29,7 @@
 #endif
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
@@ -2651,6 +2652,15 @@ ipc_handle_workspace_set_window_visibility(volatile struct ipc_client_state *_ic
 
 	IPC_INFO(s, "Workspace: set_visibility client_id=%u visible=%d", client_id, visible);
 
+	// Pure capture clients stay slot-addressed after normalize (they have no
+	// canonical id) — route them straight to the slot setter, mirroring
+	// set_window_pose's 1000+slot branch.
+	if (client_id >= 1000u) {
+		int slot = (int)(client_id - 1000u);
+		bool capture_ok = comp_d3d11_service_set_capture_client_visibility(s->xsysc, slot, visible);
+		return capture_ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
+	}
+
 	os_mutex_lock(&s->global_state.lock);
 
 	volatile struct ipc_client_state *target_ics = NULL;
@@ -2913,21 +2923,26 @@ ipc_handle_workspace_get_focused_client(volatile struct ipc_client_state *_ics, 
 	}
 	*out_client_id = 0;
 
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// The compositor's focused_slot is the workspace focus source of truth —
+	// BOTH set_focused id forms update it (incl. capture clients, which have
+	// no IPC session and never touch active_client_index), as do the clear
+	// path, click-to-focus, and visibility-hide of the focused slot. Deriving
+	// the answer from active_client_index instead broke the set→get roundtrip
+	// for capture clients (set updated focused_slot only; the index stayed
+	// stale). Return the unified 1000+slot form (matches enumerate + events).
+	if (s->xsysc != NULL) {
+		int slot = comp_d3d11_service_get_focused_slot(s->xsysc);
+		*out_client_id = (slot >= 0) ? (1000u + (uint32_t)slot) : 0;
+		return XRT_SUCCESS;
+	}
+#endif
+
 	os_mutex_lock(&s->global_state.lock);
 	int idx = s->global_state.active_client_index;
 	if (idx >= 0 && idx < IPC_MAX_CLIENTS) {
 		volatile struct ipc_client_state *ics = &s->threads[idx].ics;
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-		// #304 id-unification: return the 1000+slot workspace id (matches
-		// enumerate + events), resolved from the active client's slot.
-		int slot = (s->xsysc != NULL && ics->xc != NULL)
-		    ? comp_d3d11_service_workspace_find_slot_by_xc(
-		          s->xsysc, (struct xrt_compositor *)ics->xc)
-		    : -1;
-		*out_client_id = (slot >= 0) ? (1000u + (uint32_t)slot) : 0;
-#else
 		*out_client_id = ics->client_state.id;
-#endif
 	}
 	os_mutex_unlock(&s->global_state.lock);
 
@@ -3229,6 +3244,35 @@ ipc_handle_workspace_get_client_info(volatile struct ipc_client_state *_ics,
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	client_id = ipc_workspace_normalize_client_id(s, client_id); // #304: accept 1000+slot
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// Pure capture clients stay slot-addressed after normalize (no IPC
+	// client_state to read). Enumerate hands out these 1000+slot ids, so the
+	// controller must be able to introspect them — fill from the compositor
+	// slot instead (captured window title, owning pid, workspace
+	// minimize/focus state).
+	if (client_id >= 1000u && s->xsysc != NULL) {
+		int slot = (int)(client_id - 1000u);
+		char cap_name[XRT_MAX_APPLICATION_NAME_SIZE] = {0};
+		uint32_t cap_pid = 0;
+		bool ws_visible = false, ws_focused = false;
+		if (!comp_d3d11_service_get_capture_client_info(s->xsysc, slot, cap_name,
+		                                                sizeof(cap_name), &cap_pid,
+		                                                &ws_visible, &ws_focused)) {
+			return XRT_ERROR_IPC_FAILURE;
+		}
+		memset(out_state, 0, sizeof(*out_state));
+		out_state->id = client_id;
+		out_state->pid = (pid_t)cap_pid;
+		out_state->session_active = true;
+		out_state->session_visible = ws_visible;
+		out_state->session_focused = ws_focused;
+		snprintf(out_state->info.application_name, sizeof(out_state->info.application_name),
+		         "%s", cap_name);
+		return XRT_SUCCESS;
+	}
+#endif
+
 	xrt_result_t xret = ipc_server_get_client_app_state(s, client_id, out_state);
 	if (xret != XRT_SUCCESS) {
 		return xret;

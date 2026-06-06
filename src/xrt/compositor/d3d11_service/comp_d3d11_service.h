@@ -302,6 +302,50 @@ comp_d3d11_service_get_capture_client_window_pose(struct xrt_system_compositor *
                                                     float *out_height_m);
 
 /*!
+ * Set visibility (minimize/un-minimize) for a client by slot index.
+ *
+ * Slot-addressed counterpart of comp_d3d11_service_set_client_visibility —
+ * same semantics (`minimized` composite gate + focus-clear on hiding the
+ * focused slot), but addressed by slot so the IPC layer's 1000+slot id form
+ * (capture clients have no canonical id) can route here. Type-agnostic,
+ * like comp_d3d11_service_set_capture_client_window_pose.
+ *
+ * @param xsysc       The system compositor.
+ * @param slot_index   Slot index.
+ * @param visible      false = minimized (hidden from composite), true = shown.
+ * @return true on success.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_set_capture_client_visibility(struct xrt_system_compositor *xsysc,
+                                                  int slot_index,
+                                                  bool visible);
+
+/*!
+ * Introspect a CAPTURE client slot for xrGetWorkspaceClientInfoEXT.
+ *
+ * Capture clients have no IPC client_state to read, but enumerate hands out
+ * their 1000+slot ids, so the controller must be able to introspect them.
+ * Fills the captured window's title (`app_name`), owning process id (via
+ * GetWindowThreadProcessId on the captured HWND), workspace visibility
+ * (!minimized) and focus (slot == focused_slot).
+ *
+ * @return true on success; false if the slot is inactive or not a capture
+ *         client (OpenXR clients resolve through the canonical-id path).
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_get_capture_client_info(struct xrt_system_compositor *xsysc,
+                                            int slot_index,
+                                            char *out_name,
+                                            size_t name_cap,
+                                            uint32_t *out_pid,
+                                            bool *out_visible,
+                                            bool *out_focused);
+
+/*!
  * Eagerly create the workspace compositor window (for empty workspace startup).
  * Called after workspace_activate when no clients are connected yet, so the
  * window exists to receive Ctrl+O app launch requests.
@@ -631,6 +675,17 @@ comp_d3d11_service_set_client_style_by_slot(struct xrt_system_compositor *xsysc,
  */
 void
 comp_d3d11_service_set_focused_slot(struct xrt_system_compositor *xsysc, int slot);
+
+/*!
+ * Read the compositor's `focused_slot` (-1 = none / workspace not active).
+ * This is the workspace focus source of truth — every focus mutation path
+ * updates it (both set_focused id forms incl. capture clients, the clear
+ * path, click-to-focus, visibility-hide) — so xrGetWorkspaceFocusedClientEXT
+ * derives its answer from here rather than from the IPC active_client_index
+ * (which capture clients never touch).
+ */
+int
+comp_d3d11_service_get_focused_slot(struct xrt_system_compositor *xsysc);
 
 /*!
  * spec_version 10: mark slot @p slot as having a Win32 modal popup open
