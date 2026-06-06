@@ -113,10 +113,20 @@ sim_display_plugin_get_display_info(struct xrt_plugin_instance *inst,
 	/* No EDID screen position for the simulated display. */
 	out_info->display_screen_left = 0;
 	out_info->display_screen_top = 0;
-	/* MANUAL eye tracking only — the simulated device is always
-	 * "tracking" and eye positions come from app input. */
-	out_info->supported_eye_tracking_modes = 2u; /* MANUAL_BIT */
-	out_info->default_eye_tracking_mode = 1u;    /* MANUAL */
+	/* Honest by default (#441): sim_display has no eye tracker — its
+	 * positions are nominal, not tracked — so it advertises NO
+	 * eye-tracking capability. The dev-only SIM_DISPLAY_FAKE_TRACKING
+	 * toggle re-enables MANUAL_BIT (paired with HAS_TRACKING on the 3D
+	 * rendering modes in sim_display_device.c) so the MANUAL path and
+	 * XrEventDataEyeTrackingStateChangedEXT are testable without
+	 * hardware. */
+	if (sim_display_fake_tracking_enabled()) {
+		out_info->supported_eye_tracking_modes = 2u; /* MANUAL_BIT */
+		out_info->default_eye_tracking_mode = 1u;    /* MANUAL */
+	} else {
+		out_info->supported_eye_tracking_modes = 0u; /* no tracking */
+		out_info->default_eye_tracking_mode = 0u;    /* undefined; keep 0 */
+	}
 
 	return true;
 }

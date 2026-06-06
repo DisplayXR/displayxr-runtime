@@ -528,7 +528,7 @@ sim_dp_get_predicted_eye_positions(struct xrt_display_processor *xdp, struct xrt
 	}
 	out->timestamp_ns = os_monotonic_get_ns();
 	out->valid = true;
-	out->is_tracking = false; // Nominal, not real tracking
+	out->is_tracking = sim_display_fake_tracking_is_tracking(); // false unless SIM_DISPLAY_FAKE_TRACKING (#441)
 	return true;
 }
 

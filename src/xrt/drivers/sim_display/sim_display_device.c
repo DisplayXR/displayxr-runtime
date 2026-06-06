@@ -112,6 +112,43 @@ sim_display_get_view_count(void)
 	return (uint32_t)xrt_atomic_s32_load(&g_sim_display_view_count);
 }
 
+bool
+sim_display_fake_tracking_enabled(void)
+{
+	// Dev-only override (#441) — product gates live in the registry, but
+	// this is a test harness knob, so an env var is the right shape.
+	static int cached = -1;
+	if (cached < 0) {
+		const char *e = getenv("SIM_DISPLAY_FAKE_TRACKING");
+		cached = (e != NULL && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+	}
+	return cached == 1;
+}
+
+bool
+sim_display_fake_tracking_is_tracking(void)
+{
+	if (!sim_display_fake_tracking_enabled()) {
+		return false; // Honest: sim_display never really tracks.
+	}
+
+	static int64_t period_ms = -1;
+	if (period_ms < 0) {
+		const char *e = getenv("SIM_DISPLAY_FAKE_TRACKING_PERIOD_MS");
+		period_ms = (e != NULL) ? atol(e) : 0;
+		if (period_ms < 0) {
+			period_ms = 0;
+		}
+	}
+	if (period_ms == 0) {
+		return true; // Toggle on, no period: always tracking.
+	}
+
+	// Square wave: tracking for one period, lost for the next.
+	int64_t now_ms = (int64_t)(os_monotonic_get_ns() / 1000000);
+	return ((now_ms / period_ms) % 2) == 0;
+}
+
 void
 sim_display_set_view_count(uint32_t count)
 {
@@ -634,6 +671,18 @@ sim_display_hmd_create(void)
 	hmd->base.rendering_modes[4].hardware_display_3d = true;
 	hmd->base.rendering_modes[4].tile_columns = 2;
 	hmd->base.rendering_modes[4].tile_rows = 2;
+
+	// Per-mode tracking capability (#441): sim_display has no real eye
+	// tracker, so every mode stays untracked (mode_flags/reserved are
+	// zero from the calloc'd device). Under the dev-only
+	// SIM_DISPLAY_FAKE_TRACKING toggle the 3D modes claim HAS_TRACKING so
+	// the MANUAL path + tracking-state event are exercisable without
+	// hardware (matches the MANUAL_BIT the plug-in then advertises).
+	if (sim_display_fake_tracking_enabled()) {
+		for (uint32_t m = 1; m < hmd->base.rendering_mode_count; m++) {
+			hmd->base.rendering_modes[m].mode_flags |= XRT_RENDERING_MODE_FLAG_HAS_TRACKING;
+		}
+	}
 
 	// view_count = max across all rendering modes
 	{
