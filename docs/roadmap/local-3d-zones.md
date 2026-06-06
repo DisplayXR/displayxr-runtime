@@ -4,6 +4,8 @@
 **Scope**: regular Windows desktop, no shell, single or multiple 3D apps in normal windows. Shell-mode generalization is a superset of this and not covered here.
 **Audience**: DisplayXR runtime contributors; vendors implementing the display processor (DP) vtable.
 
+> **Relationship to compositor 2D/3D compositing.** This note covers the **hardware-consumer leg** of a shared mask: publishing a screen-space 3D-zone mask to the vendor DP → panel firmware so the *physical switchable-lens cells* track which window regions are 3D. The complementary **compositor-consumer leg** — the runtime software-compositing flat 2D over weaved 3D inside an app's surface, driven by the *same* authored alpha mask — is specified in [unified-2d-3d-compositing.md](unified-2d-3d-compositing.md). The two are one artifact with two readers and **must agree** (a weaved pixel needs a 3D lens cell over it; a flat pixel needs a flat cell). The `XR_EXT_local_3d_zone` authoring API below is shared by both legs; the unifying spec adds the second consumer behind it rather than inventing a second mask.
+
 ## Problem
 
 Today's switchable-lens displays expose a single global panel state: either the whole panel is in 3D or none of it is. Any connected client requesting 3D pins the entire panel to 3D. This forces 3D apps into either fullscreen or "the whole desktop looks distorted while a small 3D window is open."

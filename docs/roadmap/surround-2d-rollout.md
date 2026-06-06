@@ -3,7 +3,7 @@
 **Status:** D3D11 shipping; D3D12 fence path shipping (post spec-v7 bump on 2026-05-28).
 **Branch:** `feature/surround-2d-spec`.
 **Spec:** Win32 [§3.6](../specs/extensions/XR_EXT_win32_window_binding.md#36-xrsetsharedtexturesurround2dext) (D3D11 keyed-mutex, v6) + [§3.7](../specs/extensions/XR_EXT_win32_window_binding.md#37-xrsetsharedtexturesurround2dfenceext) (D3D12 fence, v7); Cocoa [§4](../specs/extensions/XR_EXT_cocoa_window_binding.md) (IOSurface, v6). Win32 at spec version 7; Cocoa at 6.
-**Related:** [#224 local-3d-zones](../roadmap/local-3d-zones.md) (deliberately *not* the same path — see §6).
+**Related:** [#224 local-3d-zones](../roadmap/local-3d-zones.md) (deliberately *not* the same path — see §6). **Generalized by:** [unified-2d-3d-compositing.md](unified-2d-3d-compositing.md) — the rectangular canvas-sub-rect + surround here is the rect special case of that spec's arbitrary alpha mask (Tier-2 single-rect); the surround entry points stay supported through its Phases 0–2.
 
 ## TL;DR
 
