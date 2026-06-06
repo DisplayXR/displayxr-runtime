@@ -1094,6 +1094,90 @@ adjust_fov(const struct xrt_fov *original_fov, const struct xrt_quat *original_r
 	};
 }
 
+#ifdef OXR_HAVE_EXT_view_rig
+/*
+ * XR_EXT_view_rig (#396 W7) — descriptor validation policy: CLAMP out-of-range
+ * values (one-shot WARN per session), never reject. Per-frame error handling
+ * would be awkward for apps animating tunables.
+ */
+static float
+view_rig_clampf(float v, float lo, float hi, bool *clamped)
+{
+	if (v < lo) {
+		*clamped = true;
+		return lo;
+	}
+	if (v > hi) {
+		*clamped = true;
+		return hi;
+	}
+	return v;
+}
+
+/*
+ * Walk XrViewLocateInfo::next for a chained rig descriptor and parse it into
+ * the per-session rig state. Returns the rig type chained on THIS locate —
+ * OXR_VIEW_RIG_NONE when nothing is chained. The rig is strictly per-locate
+ * (chain it on every locate you want it to drive): a non-chained locate keeps
+ * the default behavior, including the raw-eye transport contract in
+ * XrView.pose for external-window apps.
+ * Values are stored post-clamp and post-boundary-conversion so the locate path
+ * consumes them directly: convergenceDiopters (1/m) IS the inverse convergence
+ * distance the math takes (identity conversion); full-angle verticalFov
+ * converts to half-tan.
+ */
+static enum oxr_view_rig_type
+view_rig_update_from_chain(struct oxr_session *sess, const XrViewLocateInfo *viewLocateInfo)
+{
+	const XrDisplayRigEXT *drig =
+	    OXR_GET_INPUT_FROM_CHAIN(viewLocateInfo, XR_TYPE_DISPLAY_RIG_EXT, XrDisplayRigEXT);
+	const XrCameraRigEXT *crig =
+	    OXR_GET_INPUT_FROM_CHAIN(viewLocateInfo, XR_TYPE_CAMERA_RIG_EXT, XrCameraRigEXT);
+	if (drig == NULL && crig == NULL) {
+		return OXR_VIEW_RIG_NONE;
+	}
+
+	struct oxr_view_rig_state *rig = &sess->view_rig;
+	bool clamped = false;
+
+	if (drig != NULL && crig != NULL && !rig->clamp_warned) {
+		U_LOG_W("XR_EXT_view_rig: both XrDisplayRigEXT and XrCameraRigEXT chained — "
+		        "chain exactly one; using the camera rig");
+		rig->clamp_warned = true;
+	}
+
+	if (crig != NULL) {
+		rig->type = OXR_VIEW_RIG_CAMERA;
+		rig->pose = (struct xrt_pose){
+		    {crig->pose.orientation.x, crig->pose.orientation.y, crig->pose.orientation.z,
+		     crig->pose.orientation.w},
+		    {crig->pose.position.x, crig->pose.position.y, crig->pose.position.z}};
+		rig->ipd_factor = view_rig_clampf(crig->ipdFactor, 0.0f, 1.0f, &clamped);
+		rig->parallax_factor = view_rig_clampf(crig->parallaxFactor, 0.0f, 1.0f, &clamped);
+		rig->inv_convergence_distance = view_rig_clampf(crig->convergenceDiopters, 0.0f, 20.0f, &clamped);
+		float vfov = view_rig_clampf(crig->verticalFov, 0.01f, 3.13f, &clamped);
+		rig->half_tan_vfov = tanf(vfov * 0.5f);
+	} else {
+		rig->type = OXR_VIEW_RIG_DISPLAY;
+		rig->pose = (struct xrt_pose){
+		    {drig->pose.orientation.x, drig->pose.orientation.y, drig->pose.orientation.z,
+		     drig->pose.orientation.w},
+		    {drig->pose.position.x, drig->pose.position.y, drig->pose.position.z}};
+		rig->virtual_display_height = view_rig_clampf(drig->virtualDisplayHeight, 0.01f, 1000.0f, &clamped);
+		rig->ipd_factor = view_rig_clampf(drig->ipdFactor, 0.0f, 1.0f, &clamped);
+		rig->parallax_factor = view_rig_clampf(drig->parallaxFactor, 0.0f, 1.0f, &clamped);
+		rig->perspective_factor = view_rig_clampf(drig->perspectiveFactor, 0.1f, 10.0f, &clamped);
+	}
+
+	if (clamped && !rig->clamp_warned) {
+		U_LOG_W("XR_EXT_view_rig: descriptor value(s) out of range — clamped");
+		rig->clamp_warned = true;
+	}
+
+	return rig->type;
+}
+#endif // OXR_HAVE_EXT_view_rig
+
 XrResult
 oxr_session_locate_views(struct oxr_logger *log,
                          struct oxr_session *sess,
@@ -1187,6 +1271,38 @@ oxr_session_locate_views(struct oxr_logger *log,
 	bool have_view_state = false;
 #endif
 
+	// XR_EXT_view_rig (#396 W7): parse a chained rig descriptor (per-locate)
+	// and locate the optional raw-result output struct. A chained rig drives
+	// the view math below in place of the qwerty debug state and lifts the
+	// external-window display-centric forcing — the explicit descriptor is
+	// the knowledge that guard substituted for. Locates that chain nothing
+	// keep today's behavior exactly.
+	bool rig_camera = false;
+	bool rig_display = false;
+#ifdef OXR_HAVE_EXT_view_rig
+	XrViewDisplayRawEXT *view_raw = NULL;
+	if (sess->sys->inst->extensions.EXT_view_rig) {
+		enum oxr_view_rig_type rig_type = view_rig_update_from_chain(sess, viewLocateInfo);
+		rig_camera = rig_type == OXR_VIEW_RIG_CAMERA;
+		rig_display = rig_type == OXR_VIEW_RIG_DISPLAY;
+
+		view_raw = OXR_GET_OUTPUT_FROM_CHAIN(viewState, XR_TYPE_VIEW_DISPLAY_RAW_EXT, XrViewDisplayRawEXT);
+		if (view_raw != NULL) {
+			// Defaults for frames with no eye/window data (e.g. IPC
+			// proxies, pre-tracking frames); overwritten below when
+			// the Kooima input set is resolved. Don't touch ->next.
+			U_ZERO_ARRAY(view_raw->rawEyes);
+			view_raw->eyeCountOutput = 0;
+			view_raw->displayPlanePose = (XrPosef){{0, 0, 0, 1}, {0, 0, 0}};
+			view_raw->canvasRectPx = (XrRect2Di){{0, 0}, {0, 0}};
+			view_raw->canvasSizeMeters = (XrExtent2Df){0, 0};
+			view_raw->sampleTimeNs = 0;
+			view_raw->isTracking = XR_FALSE;
+		}
+	}
+#endif
+	const bool rig_active = rig_camera || rig_display;
+
 	// Query eye tracking (vendor-neutral — returns false if no backend available).
 	// Safe to call unconditionally: oxr_session_get_predicted_eye_positions()
 	// checks xmcc != NULL before casting to multi_compositor, so IPC proxies
@@ -1238,6 +1354,16 @@ oxr_session_locate_views(struct oxr_logger *log,
 		}
 	}
 
+	// XR_EXT_view_rig: the chained rig pose IS the display-plane / camera
+	// pose — it replaces the qwerty device pose (runtime-window sessions)
+	// and the {0,1.6,0}/identity defaults (external-window sessions, where
+	// the defaults were harmless only because their eye_world output was
+	// discarded under the forcing this extension lifts).
+	if (rig_active) {
+		world_head_pos = sess->view_rig.pose.position;
+		world_head_ori = sess->view_rig.pose.orientation;
+	}
+
 	bool have_eyes = got_eye_positions && eye_pos.valid;
 
 	// Kooima FOV computation (vendor-neutral)
@@ -1275,6 +1401,26 @@ oxr_session_locate_views(struct oxr_logger *log,
 				}
 			}
 		}
+
+#ifdef OXR_HAVE_EXT_view_rig
+		// XR_EXT_view_rig raw channel: report the rig INPUT eyes verbatim
+		// in display space — tracked set when the DP provides one, else
+		// the nominal-viewer pair (isTracking=false). Captured before the
+		// legacy-2D center override and the surplus-view synthesis below:
+		// both are rig-side concepts, not raw inputs.
+		if (view_raw != NULL && have_eye_positions) {
+			uint32_t raw_count = eye_count;
+			if (raw_count > XR_VIEW_RIG_MAX_RAW_EYES_EXT) {
+				raw_count = XR_VIEW_RIG_MAX_RAW_EYES_EXT;
+			}
+			for (uint32_t ei = 0; ei < raw_count; ei++) {
+				view_raw->rawEyes[ei] = (XrVector3f){adj_eyes[ei].x, adj_eyes[ei].y, adj_eyes[ei].z};
+			}
+			view_raw->eyeCountOutput = raw_count;
+			view_raw->sampleTimeNs = have_eyes ? eye_pos.timestamp_ns : 0;
+			view_raw->isTracking = (have_eyes && eye_pos.is_tracking) ? XR_TRUE : XR_FALSE;
+		}
+#endif
 
 		// Legacy apps in 2D mode: override both eye positions to center.
 		// The compositor crops to the left view, so it must be rendered
@@ -1339,6 +1485,30 @@ oxr_session_locate_views(struct oxr_logger *log,
 				// eye_offset stays (0,0) — identity behavior
 			}
 
+#ifdef OXR_HAVE_EXT_view_rig
+			// XR_EXT_view_rig raw channel: the effective canvas + display
+			// plane — exactly the input set the rig math below consumes
+			// (window client area today; the texture-app canvas sub-rect
+			// is a follow-up, see raw-vs-render-ready-views.md).
+			if (view_raw != NULL) {
+				// Same gate as the window-relative branch above, so the
+				// rect and the meters always describe the same canvas.
+				if (have_wm && wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f) {
+					view_raw->canvasRectPx = (XrRect2Di){
+					    {wm.window_screen_left - wm.display_screen_left,
+					     wm.window_screen_top - wm.display_screen_top},
+					    {(int32_t)wm.window_pixel_width, (int32_t)wm.window_pixel_height}};
+				} else if (have_wm && wm.valid) {
+					view_raw->canvasRectPx = (XrRect2Di){
+					    {0, 0}, {(int32_t)wm.display_pixel_width, (int32_t)wm.display_pixel_height}};
+				}
+				view_raw->canvasSizeMeters = (XrExtent2Df){screen_width_m, screen_height_m};
+				view_raw->displayPlanePose = (XrPosef){
+				    {world_head_ori.x, world_head_ori.y, world_head_ori.z, world_head_ori.w},
+				    {world_head_pos.x, world_head_pos.y, world_head_pos.z}};
+			}
+#endif
+
 			if (should_log) {
 					U_LOG_I("KOOIMA GATE: have_eyes=%d screen=%.4fx%.4f have_view=%d cam=%d ext_win=%d",
 					        have_eye_positions, screen_width_m, screen_height_m,
@@ -1389,15 +1559,29 @@ oxr_session_locate_views(struct oxr_logger *log,
 				    {world_head_ori.x, world_head_ori.y, world_head_ori.z, world_head_ori.w},
 				    {world_head_pos.x, world_head_pos.y, world_head_pos.z}};
 
-				// Camera-centric path: canonical camera3d_compute_views
-				if (have_view_state && view_state.camera_mode &&
-				    !sess->has_external_window) {
-					Camera3DTunables ct = {
-					    .ipd_factor = view_state.cam_spread_factor,
-					    .parallax_factor = view_state.cam_parallax_factor,
-					    .inv_convergence_distance = view_state.cam_convergence,
-					    .half_tan_vfov = view_state.cam_half_tan_vfov,
-					};
+				// Camera-centric path: canonical camera3d_compute_views.
+				// A chained XrCameraRigEXT (#396 W7) takes it regardless of
+				// has_external_window — the explicit rig descriptor is the
+				// knowledge the external-window forcing substituted for.
+				if (rig_camera ||
+				    (have_view_state && view_state.camera_mode &&
+				     !sess->has_external_window)) {
+					Camera3DTunables ct;
+					if (rig_camera) {
+						ct = (Camera3DTunables){
+						    .ipd_factor = sess->view_rig.ipd_factor,
+						    .parallax_factor = sess->view_rig.parallax_factor,
+						    .inv_convergence_distance = sess->view_rig.inv_convergence_distance,
+						    .half_tan_vfov = sess->view_rig.half_tan_vfov,
+						};
+					} else {
+						ct = (Camera3DTunables){
+						    .ipd_factor = view_state.cam_spread_factor,
+						    .parallax_factor = view_state.cam_parallax_factor,
+						    .inv_convergence_distance = view_state.cam_convergence,
+						    .half_tan_vfov = view_state.cam_half_tan_vfov,
+						};
+					}
 					Camera3DView cam_views[XRT_MAX_VIEWS];
 					camera3d_compute_views(raw_eyes, eye_count, &nominal, &scr, &ct,
 					                       &display_pose, 0.01f, 100.0f,
@@ -1413,7 +1597,14 @@ oxr_session_locate_views(struct oxr_logger *log,
 				} else {
 					// Display-centric (Kooima) path: canonical display3d_compute_views
 					Display3DTunables dt = display3d_default_tunables();
-					if (have_view_state && !sess->has_external_window) {
+					if (rig_display) {
+						// Chained XrDisplayRigEXT (#396 W7) — lifts the
+						// identity-m2v forcing for external windows too.
+						dt.ipd_factor = sess->view_rig.ipd_factor;
+						dt.parallax_factor = sess->view_rig.parallax_factor;
+						dt.perspective_factor = sess->view_rig.perspective_factor;
+						dt.virtual_display_height = sess->view_rig.virtual_display_height;
+					} else if (have_view_state && !sess->has_external_window) {
 						dt.ipd_factor = view_state.disp_spread_factor;
 						dt.parallax_factor = view_state.disp_parallax_factor;
 						dt.perspective_factor = 1.0f;
@@ -1433,7 +1624,8 @@ oxr_session_locate_views(struct oxr_logger *log,
 					}
 					have_kooima_fov = true;
 
-					if (have_view_state && !sess->has_external_window) {
+					if (rig_display ||
+					    (have_view_state && !sess->has_external_window)) {
 						for (uint32_t ei = 0; ei < eye_count; ei++) {
 							view_eye_world[ei] = disp_views[ei].eye_world;
 						}
@@ -1480,7 +1672,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 	{
 		struct xrt_fov kooima_fovs[XRT_MAX_VIEWS];
 		uint32_t fov_save_count = (active_view_count < view_count) ? active_view_count : view_count;
-		if (have_kooima_fov && have_view_state) {
+		if (have_kooima_fov && (have_view_state || rig_active)) {
 			for (uint32_t ei = 0; ei < fov_save_count; ei++) {
 				kooima_fovs[ei] = fovs[ei];
 			}
@@ -1497,10 +1689,10 @@ oxr_session_locate_views(struct oxr_logger *log,
 		OXR_CHECK_XRET(log, sess, xret, xrt_device_get_view_poses);
 
 		// Restore client-side Kooima FOVs only when the client has local
-		// 3D state (non-IPC mode). In IPC mode, the server already
-		// computes 3D-adjusted Kooima FOVs and returns them via
-		// get_view_poses — don't override those.
-		if (have_kooima_fov && have_view_state) {
+		// 3D state (non-IPC mode) or a chained view rig. In IPC mode, the
+		// server already computes 3D-adjusted Kooima FOVs and returns them
+		// via get_view_poses — don't override those.
+		if (have_kooima_fov && (have_view_state || rig_active)) {
 			for (uint32_t ei = 0; ei < fov_save_count; ei++) {
 				fovs[ei] = kooima_fovs[ei];
 			}

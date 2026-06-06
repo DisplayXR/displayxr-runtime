@@ -9,6 +9,9 @@
 #include "logging.h"
 #include <cstring>
 
+// XR_EXT_view_rig (#396 W7): app-local availability flag (see xr_session.h).
+bool g_hasViewRigExt = false;
+
 // Helper macro for XR error checking with logging
 #define XR_CHECK(call) \
     do { \
@@ -90,6 +93,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_EXT_MCP_TOOLS_EXTENSION_NAME) == 0) {
             xr.hasMcpToolsExt = true;
         }
+        if (strcmp(ext.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
+            g_hasViewRigExt = true;
+        }
     }
 
     LOG_INFO("XR_KHR_D3D11_enable: %s", hasD3D11 ? "AVAILABLE" : "NOT FOUND");
@@ -98,6 +104,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_EXT_workspace_file_dialog: %s", xr.hasFileDialogExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_atlas_capture: %s", xr.hasAtlasCaptureExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_mcp_tools: %s", xr.hasMcpToolsExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_EXT_view_rig: %s", g_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasD3D11) {
         LOG_ERROR("XR_KHR_D3D11_enable extension not available - cannot continue");
@@ -126,6 +133,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (xr.hasMcpToolsExt) {
         enabledExtensions.push_back(XR_EXT_MCP_TOOLS_EXTENSION_NAME);
+    }
+    if (g_hasViewRigExt) {
+        enabledExtensions.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
     }
 
     LOG_INFO("Enabling %zu extensions", enabledExtensions.size());

@@ -1,9 +1,10 @@
 ---
-status: Proposal
+status: Phase 1 implemented (extension surface)
 owner: David Fattal
 updated: 2026-06-06
 issues: [396]
 code-paths:
+  - src/external/openxr_includes/openxr/XR_EXT_view_rig.h
   - src/xrt/state_trackers/oxr/oxr_session.c
   - src/xrt/drivers/qwerty/qwerty_device.c
   - src/xrt/auxiliary/math/m_display3d_view.*
@@ -12,9 +13,42 @@ code-paths:
   - src/xrt/ipc/server/ipc_server_handler.c
 ---
 
-> **Status: Proposal** — design spike, no implementation yet. Promote the
-> "Proposal" section to an ADR (next free number) once accepted. Tracked as
+> **Status: Phase 1 implemented** — the `XR_EXT_view_rig` extension surface
+> ships (header, registration, per-locate rig chaining on in-process sessions,
+> raw-result channel; verify vehicle `cube_handle_d3d11_win` R-toggle). The
+> equivalence-by-construction half (type-neutral `displayxr::math` core
+> replacing the runtime's `m_*_view` ports) is a follow-up phase, as are IPC
+> plumbing, the texture-canvas sub-rect in the raw channel, and surplus-eye
+> exposure — see "Phase 1 decisions" below. Promote to an ADR (next free
+> number) once the math fold-in lands. Tracked as
 > **W7 of [#396](https://github.com/DisplayXR/displayxr-runtime/issues/396)**.
+
+## Phase 1 decisions (implementation, 2026-06-06)
+
+- **Per-locate, not sticky.** A rig drives exactly the locates that chain it.
+  Sticky state would break the raw-eye transport contract: an external-window
+  app that stops chaining must get raw display-local eyes in `XrView.pose`
+  again (its local math consumes them), not a latched rig's `eye_world`.
+- **Raw chain point**: single `XrViewDisplayRawEXT` on `XrViewState::next`
+  (as recommended).
+- **Validation**: clamp + one-shot WARN per session, never reject. Factors
+  clamp to their doc ranges; `virtualDisplayHeight` to [0.01, 1000] (math-safe
+  bounds, deliberately wider than qwerty's keyboard-UX range);
+  `convergenceDiopters` to [0, 20]; `verticalFov` to [0.01, π−0.01]. Both
+  structs chained → one-shot WARN, camera rig wins.
+- **Raw eyes**: tracked set verbatim (pre legacy-2D centering, pre surplus
+  synthesis); nominal-viewer pair with `isTracking = false` when the DP has no
+  lock. Synthesized surplus eyes stay runtime-internal (gap noted below).
+- **Boundary conversions**: `convergenceDiopters` → `inv_convergence_distance`
+  is numerically identity (qwerty's `cam_convergence` is already diopters);
+  `verticalFov` → `tanf(v/2)`.
+- **Known Phase-1 gaps** (each a follow-up): IPC-client sessions parse but
+  ignore the rig (the client-side Kooima block never runs — the server
+  computes views; raw channel returns defaults); the raw `canvasRectPx` is the
+  window client area even for texture apps (mirrors exactly what the runtime's
+  own rig math consumes today — the canvas sub-rect lives compositor-side);
+  workspace-controller rig constraints unimplemented (rig stays app visual
+  policy).
 
 # Raw vs Render-Ready Views — the rig API
 
