@@ -43,7 +43,7 @@ Once `handle + mask` exists, the *layout* reason most apps reach for `texture` d
 The app authors **one alpha mask** — "these regions are 3D" — and it can drive up to three consumers that **must agree** or the display is wrong:
 
 1. **Compositor (software).** Weave vs alpha-composite-2D. Active only when the runtime owns the composite (`handle + mask`, or `texture + mask` where the runtime composites). ← *this spec*
-2. **Hardware DP (firmware).** Threshold the alpha → switchable-lens cell state, so the lens over a 3D region is in 3D mode and the lens over a 2D region is flat. Active on switchable-zone hardware. ← *[local-3d-zones.md](local-3d-zones.md)*
+2. **Hardware DP (firmware).** The runtime publishes the *same* mask; **how the vendor maps it to switchable-lens state is entirely the vendor's choice** — turn a cell 3D on any non-zero mask coverage (the OR-union default), or apply its own thresholding, hysteresis, debounce, partial-cell dithering, or anything else. The spec guarantees only faithful mask delivery to the DP vtable + the OR-union default; everything past the vtable is vendor policy (local-3d-zones §"What the DP vtable does NOT specify"). Active on switchable-zone hardware. ← *[local-3d-zones.md](local-3d-zones.md)*
 3. **The app itself.** If the app owns its own 2D composition (the original local-3d-zones model: app pre-weaves and composites 2D in its own window), consumer #1 happens in app-space rather than runtime-space.
 
 **The agreement invariant:** weaved pixels need a 3D lens cell over them; flat-2D pixels need a flat cell. Driving consumers #1 and #2 from the *same* authored mask is what guarantees this for free. A weaved pixel under a flat lens reads as interlace garbage; a flat pixel under a 3D lens reads as soft/ghosted. **Do not let the two masks diverge** — they are one artifact with two readers.
@@ -67,31 +67,42 @@ Two preserved properties:
 
 ---
 
-## 4. The composite — alpha is region + blend + content-transparency, all at once
+## 4. The composite — a separate mask lerps two independently-alpha'd layers
 
-The 2D layer is **RGBA, premultiplied, and its alpha *is* the mask.** There is no separate binary-mask concept. The composite is one in-place blended fullscreen pass on the weave target:
+The composite takes **three** inputs, and the region selector is a **dedicated scalar mask, not the 2D layer's alpha** (this decoupling is deliberate — §4.0):
+
+- **2D layer** — RGBA, premultiplied, carrying **its own** transparency (resolved downstream against the desktop background, *not* against the 3D content).
+- **3D layer** — the weaved RGBA in the target, carrying **its own** transparency.
+- **Mask `M`** — a *separate* scalar in `[0,1]`, "3D-ness" per pixel (`M=1` → 3D, `M=0` → 2D; local-3d-zones polarity). Fractional only at anti-aliased region boundaries.
+
+The composite is a **mask-lerp that preserves each layer's own alpha**:
 
 ```
-final.rgb = lerp(weaved.rgb, layer2D.rgb, layer2D.a)   // premultiplied: final.rgb = layer2D.rgb + weaved.rgb*(1 - layer2D.a)
+final.rgb = M · weave.rgb + (1 − M) · twod.rgb
+final.a   = M · weave.a   + (1 − M) · twod.a
 ```
 
-- `a = 0` → pure weave (3D). `a = 1` → pure 2D. Binary mask = hard 0/1 alpha — nothing lost.
-- One resource, not two. The app renders its 2D UI with a transparent background; transparency *is* "show 3D here." AA text edges and PNG-style cutouts just work, giving **free anti-aliased 2D/3D boundaries**.
-- Partial alpha unifies "region select" and "translucent 2D panel over 3D" into one op.
+- `M = 0` → pure 2D content, **with its own alpha** → downstream compose-under-bg resolves the desktop behind it.
+- `M = 1` → pure weave, with the weave's own alpha.
+- `0 < M < 1` → only the 1-px AA region boundary; the blend there is imperceptible.
 
-### 4.1 In-place blend, not a copy
+### 4.0 Why a separate mask, not the 2D layer's alpha
 
-The composite binds the weave target (swapchain back buffer / shared texture / runtime window) as RTV and draws one fullscreen quad sampling the 2D layer, letting the blend unit read the weaved pixels as `dst`. No read-back surface, no extra allocation. Mask cost = **one blended fullscreen quad**, bandwidth-bound on the 2D-covered pixels only. When the mask is absent (all-3D), the stage is **skipped** — runtime-presented apps pay nothing.
+Folding region-selection into the 2D layer's alpha (an earlier draft of this spec) forces a translucent 2D pixel to mean "blend with the 3D weave" — so a large semi-transparent panel would show **L/R interlace structure bleeding through** the weave. Separating the two channels dissolves it: a translucent 2D panel is `M = 0` (fully a 2D region) with `twod.a = 0.5`, so the weave contributes **zero** and the translucency resolves against the *background*, not the 3D content. **Region-selection and content-transparency are independent quantities and get independent channels.** This is the original local-3d-zones design — the runtime publishes the same separate mask to both the compositor and the DP consumer.
+
+### 4.1 The composite pass
+
+The mask-lerp is a true per-pixel blend (not fixed-function Porter-Duff "over"), so the pass **reads the weave as a texture**: weave into the target (or an intermediate), then a fullscreen pass samples `{weave, 2D layer, mask}` and writes `final`. Cost = one fullscreen pass, present **only when a mask is supplied**; all-3D `handle` apps **skip the stage entirely** and keep today's zero-copy weave-straight-into-swapchain fast path. (The earlier "in-place blend, zero extra read" claim held only for the alpha-as-mask design; the separate-mask lerp costs one weave read — bounded, and opt-in.)
 
 ### 4.2 Output-alpha rule — protect the compose-under-bg path (issue #225)
 
-The weaved target's **alpha channel is load-bearing.** Per `comp_d3d11_renderer.cpp:466–473`, the layered composite uses Porter-Duff "over" specifically so `dst.a` survives, because the Leia DP **compose-under-bg** pass lerps the captured desktop under `atlas.a` (transparency / WGC background path, [#225](https://github.com/DisplayXR/displayxr-runtime/issues/225)). The 2D composite therefore must **define what it writes to alpha**, not just RGB:
+The weaved target's **alpha channel is load-bearing.** Per `comp_d3d11_renderer.cpp:466–473`, layered composition uses Porter-Duff "over" so `dst.a` survives, because the Leia DP **compose-under-bg** pass lerps the captured desktop under `atlas.a` (transparency / WGC background path, [#225](https://github.com/DisplayXR/displayxr-runtime/issues/225)). The mask-lerp **honors this by construction**:
 
 ```
-final.a = layer2D.a + weaved.a * (1 - layer2D.a)   // same "over" rule; never clobber dst.a with src.a
+final.a = M · weave.a + (1 − M) · twod.a    // each layer's real alpha survives; whichever layer wins the pixel, its transparency is what the background pass sees
 ```
 
-Getting RGB right but alpha wrong does **not** corrupt the image — it silently regresses **window transparency**, which is far harder to catch in review. This rule must be pinned in Phase 0 and asserted by a capture diff against a known-transparent scene.
+Getting RGB right but alpha wrong does **not** corrupt the image — it silently regresses **window transparency**, far harder to catch in review. Pin this in Phase 0 and assert it with a capture diff against a known-transparent scene.
 
 ### 4.3 Premultiplied, and forward-compatible with OpenXR layers
 
@@ -107,7 +118,7 @@ Use **premultiplied** alpha for the 2D layer to avoid edge fringing along the 2D
 - **Tier 2 — rect list.** `xrSetLocal3DZoneFromRectsEXT(mask, count, rects)`. Runtime rasterizes rects into the mask texture. **This is the strict generalization of today's canvas sub-rect + surround** — a single rect reproduces current `texture` behavior.
 - **Tier 3 — freeform render target.** `xrAcquireLocal3DZoneRenderTargetEXT(mask, &binding)`. App draws arbitrary alpha into the mask each frame via the API-typed sibling binding.
 
-The wire primitive in all tiers is one shared GPU alpha texture in **client-window pixel space**. The only delta this spec adds: that same mask now also routes to the **compositor composite** (§4), not only to the DP hardware publish (local-3d-zones §"DP vtable contract"). The mask object grows from "one consumer (DP)" to "fan-out to up-to-two runtime-side consumers (composite + DP) from one authored source."
+The wire primitive in all tiers is one shared GPU **scalar mask** texture in **client-window pixel space** — *separate from* the 2D content layer. (The 2D RGBA carries its own alpha; the mask only selects regions — §4.0.) The only delta this spec adds: that same mask now also routes to the **compositor composite** (§4), not only to the DP hardware publish (local-3d-zones §"DP vtable contract"), where the **vendor owns its interpretation** (§2). The mask object grows from "one consumer (DP)" to "fan-out to up-to-two runtime-side consumers (composite + DP) from one authored source."
 
 > Migration note for `texture` apps: today's `xrSetSharedTextureOutputRectEXT` + `xrSetSharedTextureSurround2DEXT[Fence]` becomes the **Tier-2 single-rect** path. Both surfaces are kept working in parallel during Phases 0–2 (§6); the surround entry points are not removed until the layer path (Phase 3) lands and apps migrate.
 
@@ -163,13 +174,13 @@ Per-API sync primitive for the shared 2D source (when app-presented): D3D11 keye
 
 ---
 
-## 9. Open questions
+## 9. Design decisions (resolved June 2026)
 
-1. **Mask resolution defaults** — inherit local-3d-zones' suggestion (`window/8` clamped to `[16² .. 1024²]`)? The *compositor* consumer may want higher resolution than the *hardware* consumer (soft AA edges vs coarse lens cells). Allow the composite to sample the mask at full layer resolution while the DP publish downsamples? (Leaning yes — they are different readers of the same authored source.)
-2. **Large translucent 2D over 3D** — weaved pixels showing through a big semi-transparent region carry visible L/R interlace structure. Fine for AA edges and opaque panels; a real artifact for large translucent overlays. Document as a known limitation, or offer an app hint to force-flatten (re-weave at zero disparity) under translucent regions?
-3. **Mask ↔ layer coherence** — when the 2D layer and the mask are authored separately (Tier 3 freeform), must they be submitted atomically per frame to avoid a one-frame mismatch? Likely yes; define the submission barrier.
-4. **Capture pipeline** — `POST_COMPOSE` capture now includes masked 2D; `PROJECTION_ONLY` stays pre-2D. Confirm both capture intents still mean what their consumers (logos, debugging, atlas tooling) expect.
-5. **Phase-2 weave-bbox vs full-window** — is the wasted weave under large 2D regions ever measurable enough to justify the bbox optimization, or is full-window weave permanently fine on target GPUs?
+1. **Mask resolution per consumer — RESOLVED (decouple).** The authored mask is stored at **full layer resolution**; the compositor samples it 1:1 for crisp AA 2D/3D edges and text cutouts, while the DP-publish path **downsamples** (OR-union into hardware cells) from that same source. One authored artifact, two readers each taking what they need; the agreement invariant holds because both derive from one source — only sampling granularity differs. (local-3d-zones' `window/8`-clamped default applies to the *DP publish's* downsample target, not the compositor's sample.)
+2. **Large translucent 2D over 3D — RESOLVED (separate mask, dissolves by construction).** The region selector is a **separate scalar mask**, not the 2D layer's alpha (§4.0). A large translucent panel is `M = 0` with `twod.a < 1`: the weave contributes zero, so there is no interlace structure to bleed through; the translucency resolves against the desktop background. Interlace blending occurs only in the 1-px AA boundary (`0 < M < 1`) — imperceptible. No force-flatten, no documented limitation.
+3. **Mask ↔ 2D-layer coherence — RESOLVED (atomic per frame).** The mask, the 2D layer, and the 3D layers are bound to a **single `xrEndFrame` submission** and consumed as one consistent set; the compositor never composites a mismatched pair. Apps must update the mask and the 2D content in the same frame. The submission barrier is the frame: a frame is the atomic unit, no partial cross-frame updates.
+4. **Capture pipeline — RESOLVED (two points suffice).** Keep `PROJECTION_ONLY` (pre-weave, unaffected — logos stay clean) and `POST_COMPOSE` (now includes the masked 2D = the presented frame). No new capture mode. A post-weave/pre-2D debug point is added later **only if** weave-vs-2D isolation proves necessary in practice.
+5. **Phase-2 weave region — RESOLVED (full-window, optimize under profiling).** Phase 2 weaves the **full window** when a mask is present — simplest and provably correct. The mask-bbox (or scissored multi-region) weave is a **profiling-gated** optimization, added only if measurement on target GPUs shows the wasted weave matters. Note disconnected 3D islands can produce a near-full-window bbox anyway, so true multi-region weave would be a separate later step.
 
 ---
 
