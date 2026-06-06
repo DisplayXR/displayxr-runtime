@@ -10749,11 +10749,10 @@ comp_d3d11_service_is_d3d11_service(struct xrt_system_compositor *xsysc)
 }
 
 bool
-comp_d3d11_service_get_predicted_eye_positions(struct xrt_system_compositor *xsysc,
-                                                struct xrt_vec3 *out_left,
-                                                struct xrt_vec3 *out_right)
+comp_d3d11_service_get_predicted_eye_positions_full(struct xrt_system_compositor *xsysc,
+                                                     struct xrt_eye_positions *out_eyes)
 {
-	if (xsysc == NULL || out_left == NULL || out_right == NULL) {
+	if (xsysc == NULL || out_eyes == NULL) {
 		return false;
 	}
 
@@ -10787,23 +10786,8 @@ comp_d3d11_service_get_predicted_eye_positions(struct xrt_system_compositor *xsy
 	}
 
 	if (dp != nullptr) {
-		struct xrt_eye_positions eyes;
-		if (xrt_display_processor_d3d11_get_predicted_eye_positions(dp, &eyes) && eyes.valid) {
-			out_left->x = eyes.eyes[0].x;
-			out_left->y = eyes.eyes[0].y;
-			out_left->z = eyes.eyes[0].z;
-			out_right->x = eyes.eyes[1].x;
-			out_right->y = eyes.eyes[1].y;
-			out_right->z = eyes.eyes[1].z;
-
-			// Log periodically for debugging
-			static int log_counter = 0;
-			if (++log_counter >= 60) {
-				log_counter = 0;
-				U_LOG_D("IPC eye positions (from display processor): L=(%.3f,%.3f,%.3f) R=(%.3f,%.3f,%.3f)",
-				        out_left->x, out_left->y, out_left->z,
-				        out_right->x, out_right->y, out_right->z);
-			}
+		U_ZERO(out_eyes);
+		if (xrt_display_processor_d3d11_get_predicted_eye_positions(dp, out_eyes)) {
 			return true;
 		}
 	}
@@ -10816,6 +10800,38 @@ comp_d3d11_service_get_predicted_eye_positions(struct xrt_system_compositor *xsy
 	}
 
 	return false;
+}
+
+bool
+comp_d3d11_service_get_predicted_eye_positions(struct xrt_system_compositor *xsysc,
+                                                struct xrt_vec3 *out_left,
+                                                struct xrt_vec3 *out_right)
+{
+	if (out_left == NULL || out_right == NULL) {
+		return false;
+	}
+
+	struct xrt_eye_positions eyes;
+	if (!comp_d3d11_service_get_predicted_eye_positions_full(xsysc, &eyes) || !eyes.valid) {
+		return false;
+	}
+
+	out_left->x = eyes.eyes[0].x;
+	out_left->y = eyes.eyes[0].y;
+	out_left->z = eyes.eyes[0].z;
+	out_right->x = eyes.eyes[1].x;
+	out_right->y = eyes.eyes[1].y;
+	out_right->z = eyes.eyes[1].z;
+
+	// Log periodically for debugging
+	static int log_counter = 0;
+	if (++log_counter >= 60) {
+		log_counter = 0;
+		U_LOG_D("IPC eye positions (from display processor): L=(%.3f,%.3f,%.3f) R=(%.3f,%.3f,%.3f)",
+		        out_left->x, out_left->y, out_left->z,
+		        out_right->x, out_right->y, out_right->z);
+	}
+	return true;
 }
 
 bool

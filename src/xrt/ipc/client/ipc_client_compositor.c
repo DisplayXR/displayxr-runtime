@@ -218,6 +218,37 @@ comp_ipc_client_compositor_get_window_metrics(struct xrt_compositor *xc, struct 
 }
 
 /*
+ * Full DP eye-position struct incl. is_tracking, over IPC (#441 Phase 2).
+ * Same gating contract as comp_ipc_client_compositor_get_window_metrics:
+ * only safe to call when `xc` is an ipc_client_compositor (the OpenXR state
+ * tracker gates on is_service_mode && !is_*_native_compositor).
+ *
+ * Consumed ONLY for the derived isTracking value + tracking-state event —
+ * NOT for view poses, which stay server-computed. Returns false on IPC
+ * failure or when the server has no DP data (out->valid == false).
+ */
+bool
+comp_ipc_client_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
+                                                       struct xrt_eye_positions *out_eyes)
+{
+	if (xc == NULL || out_eyes == NULL) {
+		return false;
+	}
+
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return false;
+	}
+
+	xrt_result_t xret = ipc_call_compositor_get_predicted_eye_positions(icc->ipc_c, out_eyes);
+	if (xret != XRT_SUCCESS) {
+		return false;
+	}
+
+	return out_eyes->valid;
+}
+
+/*
  * Phase 2 — workspace_sync_fence bridges (D3D11 client compositor only).
  * Same gating contract: only safe to call when `xc` is an ipc_client_compositor.
  *
