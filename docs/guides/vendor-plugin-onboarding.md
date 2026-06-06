@@ -196,7 +196,24 @@ If it doesn't, document the SDK as a hard prereq in your installer's pre-install
 - bit 0 (`0x1`) — `MANAGED` (vendor SDK predicts eye positions; the runtime queries them per frame)
 - bit 1 (`0x2`) — `MANUAL` (the app submits eye positions via `XR_EXT_display_info`)
 
-Declare both bits if your SDK supports both modes; declare just one if not. A typical hardware DP is `MANAGED`-only; sim-display is `MANUAL`-only. The `default_eye_tracking_mode` field picks which mode the runtime uses for sessions that don't explicitly opt in.
+Declare both bits if your SDK supports both modes; declare just one if not. A typical hardware DP is `MANAGED`-only. Declare `0` if your display has no eye tracker at all — sim-display does this (its positions are nominal, not tracked). The `default_eye_tracking_mode` field picks which mode the runtime uses for sessions that don't explicitly opt in.
+
+### Per-mode tracking capability (`mode_flags`, ABI v3 / #441)
+
+Every `xrt_rendering_mode` your `create_device` device exposes carries a `mode_flags`
+bitmask in the **vendor-provided (MUST set)** section:
+
+- `XRT_RENDERING_MODE_FLAG_HAS_TRACKING` (`1u << 0`) — set on each mode that consumes live
+  eye tracking (typically your 3D modes; optionally a "2D tracked" mode where content is
+  flat but the viewer remains tracked).
+- Zero-init = untracked = the safe default; `reserved[]` MUST stay zeroed.
+
+The runtime forces the app-visible `isTracking` to false whenever the active mode is
+untracked, and surfaces the flag to apps via the chained
+`XrDisplayRenderingModeTrackingInfoEXT` (header v14). **Consistency rule:**
+`supported_eye_tracking_modes != 0` ⇔ at least one mode sets `HAS_TRACKING` — the runtime
+logs a one-shot WARN at init if violated. Full contract:
+`docs/specs/vendor/eye-tracking-modes.md`.
 
 ### Per-API DP factories
 
