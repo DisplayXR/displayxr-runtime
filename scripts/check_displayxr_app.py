@@ -44,6 +44,7 @@ SOURCE_EXTS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".m", ".mm"}
 
 # ---- rule catalog (kept in sync with docs/guides/displayxr-app-rules.md) ----
 RULES = {
+    "INV-2.8": "Apps requesting MANUAL eye tracking SHOULD handle XrEventDataEyeTrackingStateChangedEXT (tracking loss is the app's problem in MANUAL).",
     "INV-3.1": "Locate into an XRT_MAX_VIEWS (8)-wide buffer; render/submit the active mode's viewCount, never a hardcoded 2.",
     "INV-4.3": "Per-tile render size = window/canvas x scaleXY, never display size.",
     "INV-4.6": "Request an sRGB swapchain (and store a correctly-encoded image); don't double-encode.",
@@ -310,6 +311,53 @@ def check_mcp_pairing(root: Path, findings: list):
                                     "Make the code and manifest agree — agents key tool names on this slug."))
 
 
+def check_manual_tracking_event(root: Path, findings: list):
+    """INV-2.8 (advisory) — MANUAL eye tracking <-> tracking-state event.
+
+    An app that REQUESTS MANUAL mode has opted out of the vendor's grace
+    period / collapse animation / auto 2D fallback — tracking loss becomes the
+    app's problem, and the edge-triggered XrEventDataEyeTrackingStateChangedEXT
+    (#441 v14) is the intended primitive for reacting to it. Conservative
+    trigger: only fires when BOTH xrRequestEyeTrackingModeEXT is called AND the
+    XR_EYE_TRACKING_MODE_MANUAL_EXT enum appears (merely printing "MANUAL" in a
+    HUD doesn't flag), and no source references the event type.
+    """
+    requests_manual = None  # (path, line) of the first MANUAL enum use
+    calls_request = False
+    handles_event = False
+    for p in sorted(root.rglob("*")):
+        if p.suffix.lower() not in SOURCE_EXTS or not p.is_file():
+            continue
+        if any(part in EXCLUDE_DIRS for part in p.relative_to(root).parts[:-1]):
+            continue
+        try:
+            text = strip_comments(p.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        if "xrRequestEyeTrackingModeEXT" in text:
+            calls_request = True
+        m = re.search(r"\bXR_EYE_TRACKING_MODE_MANUAL_EXT\b", text)
+        if m and requests_manual is None:
+            requests_manual = (rel(p, root), text.count("\n", 0, m.start()) + 1)
+        if ("XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT" in text or
+                "XrEventDataEyeTrackingStateChangedEXT" in text):
+            handles_event = True
+        # Apps built on test_apps/common delegate event polling to the shared
+        # PollEvents(XrSessionManager&), which handles the event (common/ is
+        # excluded from linting, so look for the call instead).
+        if re.search(r"\bPollEvents\s*\(", text):
+            handles_event = True
+
+    if calls_request and requests_manual and not handles_event:
+        path, line = requests_manual
+        findings.append(Finding(
+            WARN, "INV-2.8", path, line,
+            "App requests MANUAL eye tracking but never handles XrEventDataEyeTrackingStateChangedEXT.",
+            "Handle the event in your xrPollEvent loop (run your own loss transition, request a 2D "
+            "mode when ready) — in MANUAL mode the vendor does no grace period or auto-fallback for you.",
+        ))
+
+
 def scan_manifests(root: Path, findings: list):
     manifests = [p for p in root.rglob("*.displayxr.json")
                  if not any(part in EXCLUDE_DIRS for part in p.relative_to(root).parts[:-1])]
@@ -324,7 +372,9 @@ def scan_manifests(root: Path, findings: list):
 
 def print_findings(findings: list, root: Path) -> None:
     if not findings:
-        print(f"✓ check_displayxr_app: no issues in {root}")
+        # ASCII on purpose: a checkmark glyph dies with UnicodeEncodeError on
+        # cp1252 Windows consoles, turning a CLEAN lint into exit 1.
+        print(f"OK check_displayxr_app: no issues in {root}")
         return
     order = {ERROR: 0, WARN: 1, INFO: 2}
     findings.sort(key=lambda f: (order[f.level], f.rule, f.path, f.line))
@@ -357,6 +407,7 @@ def main(argv=None) -> int:
     scan_sources(root, findings)
     scan_manifests(root, findings)
     check_mcp_pairing(root, findings)
+    check_manual_tracking_event(root, findings)
     print_findings(findings, root)
 
     n_err = sum(1 for f in findings if f.level == ERROR)

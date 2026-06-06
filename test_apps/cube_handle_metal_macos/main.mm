@@ -1567,6 +1567,16 @@ static void PollEvents(AppXrSession &app)
             app.currentModeIndex = modeEvent->currentModeIndex;
             break;
         }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT: {
+            // Edge-triggered tracking loss/recovery (#441 v14); HUD state
+            // also refreshes per-frame from the XrViewEyeTrackingStateEXT chain.
+            auto* etEvent = (XrEventDataEyeTrackingStateChangedEXT*)&event;
+            LOG_INFO("Eye tracking state changed: isTracking=%s mode=%u",
+                etEvent->isTracking == XR_TRUE ? "YES" : "NO",
+                (uint32_t)etEvent->activeMode);
+            app.isEyeTracking = (etEvent->isTracking == XR_TRUE);
+            break;
+        }
         case (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_EXT: {
             // An agent invoked one of our XR_EXT_mcp_tools tools. Fetch the
             // JSON args (two-call idiom; argsSize is the required capacity),

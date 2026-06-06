@@ -430,6 +430,20 @@ bool PollEvents(XrSessionManager& xr) {
             xr.currentModeIndex = modeEvent->currentModeIndex;
             break;
         }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT: {
+            // Edge-triggered tracking loss/recovery (#441 v14). The HUD state
+            // refreshes per-frame from the XrViewEyeTrackingStateEXT chain in
+            // LocateViews; this handler exists so every manual test session
+            // logs the edges, and as the reference for the MANUAL-mode
+            // pattern (react here instead of polling isTracking).
+            auto* etEvent = (XrEventDataEyeTrackingStateChangedEXT*)&event;
+            LOG_INFO("Eye tracking state changed: isTracking=%s mode=%u",
+                etEvent->isTracking == XR_TRUE ? "YES" : "NO",
+                (uint32_t)etEvent->activeMode);
+            xr.isEyeTracking = (etEvent->isTracking == XR_TRUE);
+            xr.activeEyeTrackingMode = (uint32_t)etEvent->activeMode;
+            break;
+        }
         case (XrStructureType)XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_EXT: {
             auto* pickEvent = (XrEventDataFilePickerCompleteEXT*)&event;
             LOG_INFO("[#228] File picker complete: requestId=%llu result=%d path=\"%s\"",

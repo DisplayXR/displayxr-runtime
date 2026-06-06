@@ -151,6 +151,18 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   `isTracking` tells you whether poses are live or a vendor fallback — it does **not** mean the
   views are unpopulated. Ref: `XR_EXT_display_info.h:141-165`.
 
+- **INV-2.8 (advisory) — MANUAL mode: handle the tracking-state event.** If you request
+  `XR_EYE_TRACKING_MODE_MANUAL_EXT` you've told the vendor *not* to run its grace
+  period / collapse animation / auto 2D fallback — tracking loss is **your** problem. React to
+  `XrEventDataEyeTrackingStateChangedEXT` (v14, edge-triggered on every `isTracking` flip;
+  also fires on mode switches into/out of untracked modes) instead of polling
+  `XrViewEyeTrackingStateEXT.isTracking` per frame: run your own transition, then
+  `xrRequestDisplayRenderingModeEXT` a 2D mode when ready. MANAGED apps may ignore the event
+  (the vendor handles the lifecycle). Per-mode tracking capability is queryable by chaining
+  `XrDisplayRenderingModeTrackingInfoEXT` at enumerate time (opt-in handshake — pre-set each
+  element's `type` and `next`; reference: `cube_handle_d3d11_win/xr_session.cpp`). Ref:
+  `XR_EXT_display_info.h` v14 block, `docs/specs/vendor/eye-tracking-modes.md`.
+
 ---
 
 ## 3. Views — the locate-views gotcha
@@ -545,6 +557,7 @@ launcher. The bare runtime ignores manifests — discovery is the workspace laye
 - [ ] Window passed for handle/texture, NULL for hosted (INV-1.1); HWND kept even in texture mode (INV-1.2)
 - [ ] Display info queried once via `XrSystemProperties`, treated as static (INV-2.1)
 - [ ] Modes enumerated; active mode tracked via the *event*, not set locally (INV-2.4); per-mode state re-derived each frame (INV-2.6)
+- [ ] (MANUAL eye tracking) `XrEventDataEyeTrackingStateChangedEXT` handled — own transition + 2D mode request on loss (INV-2.8)
 - [ ] `xrLocateViews` into an 8-wide buffer; render/submit `eyeCount` from the active mode, not 2 (INV-3.1)
 - [ ] App swapchain sized once to worst-case atlas (INV-4.2); per-tile = window/canvas × scaleXY, never display (INV-4.3)
 - [ ] Color space: request an **sRGB swapchain** and write a correctly-encoded image (linear render + GPU sRGB-write, or display-referred bytes — not both); linear/UNORM swapchain is not color-managed; data textures always linear (INV-4.6)

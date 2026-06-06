@@ -983,6 +983,13 @@ static void PollEvents(AppXrSession &app)
             LOG_INFO("Rendering mode changed: %u -> %u", rmc->previousModeIndex, rmc->currentModeIndex);
             break;
         }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT: {
+            // Edge-triggered tracking loss/recovery (#441 v14) — log-only here.
+            auto *ets = (XrEventDataEyeTrackingStateChangedEXT *)&event;
+            LOG_INFO("Eye tracking state changed: isTracking=%s mode=%u",
+                ets->isTracking == XR_TRUE ? "YES" : "NO", (uint32_t)ets->activeMode);
+            break;
+        }
         default: break;
         }
         event = {XR_TYPE_EVENT_DATA_BUFFER};

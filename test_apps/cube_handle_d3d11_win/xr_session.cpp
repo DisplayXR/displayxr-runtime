@@ -302,9 +302,18 @@ bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd) {
         XrResult enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, 0, &modeCount, nullptr);
         if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
             std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
+            // Per-mode tracking capability (#441 v14) — reference adoption of
+            // the chained-struct opt-in: pre-set each element's type AND chain
+            // the tracking struct on next BEFORE the fill call. The runtime
+            // only walks elements carrying the pre-set type, so v13 binaries
+            // (uninitialized type/next) are untouched.
+            std::vector<XrDisplayRenderingModeTrackingInfoEXT> trackingInfos(modeCount);
             for (uint32_t i = 0; i < modeCount; i++) {
+                trackingInfos[i].type = (XrStructureType)XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_EXT;
+                trackingInfos[i].next = nullptr;
+                trackingInfos[i].hasTracking = XR_FALSE;
                 modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
-                modes[i].next = nullptr;
+                modes[i].next = &trackingInfos[i];
             }
             enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, modeCount, &modeCount, modes.data());
             if (XR_SUCCEEDED(enumRes)) {
@@ -313,7 +322,7 @@ bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd) {
                 for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
                     strncpy(xr.renderingModeNames[i], modes[i].modeName, XR_MAX_SYSTEM_NAME_SIZE - 1);
                     xr.renderingModeNames[i][XR_MAX_SYSTEM_NAME_SIZE - 1] = '\0';
-                    LOG_INFO("  [%u] %s (views=%u, tiles=%ux%u, scale=%.2fx%.2f, 3D=%d)", modes[i].modeIndex, modes[i].modeName, modes[i].viewCount, modes[i].tileColumns, modes[i].tileRows, modes[i].viewScaleX, modes[i].viewScaleY, modes[i].hardwareDisplay3D);
+                    LOG_INFO("  [%u] %s (views=%u, tiles=%ux%u, scale=%.2fx%.2f, 3D=%d, tracked=%d)", modes[i].modeIndex, modes[i].modeName, modes[i].viewCount, modes[i].tileColumns, modes[i].tileRows, modes[i].viewScaleX, modes[i].viewScaleY, modes[i].hardwareDisplay3D, trackingInfos[i].hasTracking == XR_TRUE);
                     xr.renderingModeViewCounts[i] = modes[i].viewCount;
                     xr.renderingModeTileColumns[i] = modes[i].tileColumns;
                     xr.renderingModeTileRows[i] = modes[i].tileRows;
