@@ -59,6 +59,8 @@ Cost: +2 copies/frame vs Phase 0's +1 (weave + mask). Both evaporate in Phase 3 
 
 > **sRGB note (carried from Phase 0 §4):** all views UNORM, point sampler. The lerp is in the view's numeric space — keep `weave_scratch` / `surround_scratch` UNORM so the math matches the bytes; the mask is R8_UNORM scalar.
 
+> **Window-sized inputs, NOT display-sized (#464) — load-bearing.** The shared texture is allocated worst-case/display-sized (ADR-010, kept), but the 2D content is **window-proportional** (the mask + 2D layer are authored in client-window pixels; the app renders + reads back at window size). Do **NOT** inherit the rect-surround's "fill the whole worst-case surface" assumption (`surround_2d.w == dst_w`). The composite must operate on the **window rect** (window minus canvas), positioned at the window anchor inside the worst-case surface; sample the mask/2D at window resolution; leave the rest of the surface untouched. Concretely: the composite viewport/scissor + the mask/2D scratch dims are **window-sized**, not `dst` (surface)-sized. This avoids the over-fill in #464 and keeps the mask coordinate space coherent with `XrLocal3DZoneMaskCreateInfoEXT` (client-window pixels).
+
 ## 4. The mask object + authoring (oxr) — `XR_EXT_local_3d_zone`
 
 The extension (header drafted alongside this doc) defines a mask handle and three authoring tiers (from local-3d-zones §"runtime piece"):
