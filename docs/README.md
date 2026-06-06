@@ -115,6 +115,7 @@ Design docs, status trackers, and plans — some shipped, some in progress. Afte
 - [Workspace/Runtime Contract](roadmap/workspace-runtime-contract.md) — IPC between a workspace controller and the runtime
 - **MCP** — framework extracted to [`DisplayXR/displayxr-mcp`](https://github.com/DisplayXR/displayxr-mcp). See the [MCP spec](https://github.com/DisplayXR/displayxr-mcp/blob/main/docs/mcp-spec.md) for the protocol; Phase A (handle-app introspection) and Phase B (workspace tools, hosted in `displayxr-shell-pvt`) both shipped.
 - [Desktop Overlay Apps — Forward Work](roadmap/avatar-overlay-native.md) — follow-on work after the transparent HWND path shipped (#191)
+- [Unified Atlas Capture](roadmap/unified-atlas-capture.md) — one runtime capture API (`XR_EXT_atlas_capture`, #396 W6; shipped in runtime v1.10.0)
 
 ### Planned / In Progress
 
@@ -127,6 +128,7 @@ Design docs, status trackers, and plans — some shipped, some in progress. Afte
 - [Workspace Activation Auth Handshake](roadmap/spatial-workspace-auth-handshake.md) — Phase 2.0 prep: orchestrator-PID match replaces the brand-coupled `application_name == "displayxr-shell"` check
 - [Phase 2 Audit](roadmap/spatial-workspace-extensions-phase2-audit.md) — line-by-line classification of the remaining `shell` mentions in `comp_d3d11_service.cpp`
 - [Per-App MCP Tools & Workspace Aggregator](roadmap/per-app-mcp-tools.md) — apps register their own MCP tools via `XR_EXT_mcp_tools`; one-connection `--target workspace` aggregator with `<app-id>__<tool>` namespacing
+- [Raw vs Render-Ready Views](roadmap/raw-vs-render-ready-views.md) — `XR_EXT_view_rig`: apps feed Kooima rig descriptors, runtime does the view math (#396 W7)
 - [WebXR Bridge v2 Plan](roadmap/webxr-bridge-v2-plan.md) — metadata/control sideband for Chrome's native WebXR
 - [Display Spatial Model](roadmap/display-spatial-model.md) — displays in the spatial graph (#46)
 - [Multi-Display Single Machine](roadmap/multi-display-single-machine.md) — multiple displays, one machine (#69)
