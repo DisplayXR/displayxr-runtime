@@ -230,6 +230,12 @@ struct comp_metal_compositor
 	//! 2D surround IOSurface handle (Spec v6).
 	struct u_surround_2d_handle surround_2d;
 
+	//! Retained IOSurfaceRef backing the 2D surround (NULL when unregistered).
+	IOSurfaceRef surround_iosurface;
+
+	//! Metal texture wrapping surround_iosurface (MRR — explicit release).
+	id<MTLTexture> surround_texture;
+
 	//! Thread safety.
 	struct os_mutex mutex;
 
@@ -256,6 +262,20 @@ static inline struct comp_metal_swapchain *
 metal_swapchain(struct xrt_swapchain *xsc)
 {
 	return (struct comp_metal_swapchain *)xsc;
+}
+
+// Release the 2D surround resources (texture wrap + retained IOSurface).
+// Single choke point for clear / replace / destroy — keeps the MRR
+// retain/release pairing auditable.
+static void
+metal_release_surround(struct comp_metal_compositor *c)
+{
+	[c->surround_texture release];
+	c->surround_texture = nil;
+	if (c->surround_iosurface != NULL) {
+		CFRelease(c->surround_iosurface);
+		c->surround_iosurface = NULL;
+	}
 }
 
 /*
@@ -1434,6 +1454,130 @@ metal_compositor_dispatch_capture(struct comp_metal_compositor *c,
 	u_capture_intent_complete(&c->capture_intent, &c->mcp_capture, ok);
 }
 
+// Blit non-canvas pixels of the surround IOSurface into the dst texture
+// (the shared IOSurface for _texture apps). Called after the DP has weaved
+// into dst's canvas sub-rect.
+//
+// Strip layout (same as d3d11_blit_surround_strips):
+//
+//   +---------------------------------+
+//   |              TOP                |   (0, 0) -> (fw, cy)
+//   +------+--------------------+-----+
+//   | LEFT |   <canvas-region>  | RGT |   LEFT  (0, cy) -> (cx, cy+ch)
+//   |      |    (untouched —    |     |   RIGHT (cx+cw, cy) -> (fw, cy+ch)
+//   |      |     DP wrote here) |     |
+//   +------+--------------------+-----+
+//   |             BOTTOM              |   (0, cy+ch) -> (fw, fh)
+//   +---------------------------------+
+//
+// WINDOW-CLAMPED fill (#464): the fill extent (fw, fh) is the registered
+// surround dims — the window backing rect — clamped to dst, anchored at
+// (0,0) in the worst-case-sized dst. This deliberately diverges from the
+// current D3D11 strips (which require surround.dims == dst.dims and fill
+// the whole worst-case surface); D3D11 is retrofitted separately in #464.
+// Src coords == dst coords (1:1, both window-anchored top-left).
+//
+// Skips any zero-area strip. Strict pixel-format equality between surround
+// and dst is required for copyFromTexture — logs once and skips on mismatch.
+static void
+metal_blit_surround_strips(struct comp_metal_compositor *c,
+                           id<MTLCommandBuffer> cmd_buf,
+                           id<MTLTexture> dst,
+                           uint32_t dst_w,
+                           uint32_t dst_h,
+                           int32_t cx,
+                           int32_t cy,
+                           uint32_t cw,
+                           uint32_t ch)
+{
+	if (!c->surround_2d.valid || c->surround_texture == nil || dst == nil) {
+		return;
+	}
+
+	if (c->surround_texture.pixelFormat != dst.pixelFormat) {
+		static bool fmt_logged = false;
+		if (!fmt_logged) {
+			U_LOG_W("Metal surround 2D: format mismatch — surround=%lu, target=%lu. "
+			        "Surround blit skipped; the surround IOSurface must use the same "
+			        "pixel format as the multiview shared IOSurface.",
+			        (unsigned long)c->surround_texture.pixelFormat,
+			        (unsigned long)dst.pixelFormat);
+			fmt_logged = true;
+		}
+		return;
+	}
+
+	// Window-clamped fill extent (#464): surround dims ARE the window rect.
+	uint32_t fw = (c->surround_2d.w < dst_w) ? c->surround_2d.w : dst_w;
+	uint32_t fh = (c->surround_2d.h < dst_h) ? c->surround_2d.h : dst_h;
+	if (fw == 0 || fh == 0) {
+		return;
+	}
+
+	// Clamp canvas to the fill extent in case the app submitted a
+	// degenerate rect (or a one-frame resize race left canvas and surround
+	// dims briefly inconsistent — harmless, just clamp).
+	uint32_t cx_u = (cx < 0) ? 0u : (uint32_t)cx;
+	uint32_t cy_u = (cy < 0) ? 0u : (uint32_t)cy;
+	if (cx_u > fw) cx_u = fw;
+	if (cy_u > fh) cy_u = fh;
+	uint32_t cright = (cx_u + cw > fw) ? fw : cx_u + cw;
+	uint32_t cbottom = (cy_u + ch > fh) ? fh : cy_u + ch;
+
+	id<MTLBlitCommandEncoder> blit = [cmd_buf blitCommandEncoder];
+
+	// Top strip: full fill width, y in [0, cy_u).
+	if (cy_u > 0) {
+		[blit copyFromTexture:c->surround_texture
+		          sourceSlice:0
+		          sourceLevel:0
+		         sourceOrigin:MTLOriginMake(0, 0, 0)
+		           sourceSize:MTLSizeMake(fw, cy_u, 1)
+		            toTexture:dst
+		     destinationSlice:0
+		     destinationLevel:0
+		    destinationOrigin:MTLOriginMake(0, 0, 0)];
+	}
+	// Bottom strip: full fill width, y in [cbottom, fh).
+	if (cbottom < fh) {
+		[blit copyFromTexture:c->surround_texture
+		          sourceSlice:0
+		          sourceLevel:0
+		         sourceOrigin:MTLOriginMake(0, cbottom, 0)
+		           sourceSize:MTLSizeMake(fw, fh - cbottom, 1)
+		            toTexture:dst
+		     destinationSlice:0
+		     destinationLevel:0
+		    destinationOrigin:MTLOriginMake(0, cbottom, 0)];
+	}
+	// Left strip: x in [0, cx_u), y in [cy_u, cbottom).
+	if (cx_u > 0 && cbottom > cy_u) {
+		[blit copyFromTexture:c->surround_texture
+		          sourceSlice:0
+		          sourceLevel:0
+		         sourceOrigin:MTLOriginMake(0, cy_u, 0)
+		           sourceSize:MTLSizeMake(cx_u, cbottom - cy_u, 1)
+		            toTexture:dst
+		     destinationSlice:0
+		     destinationLevel:0
+		    destinationOrigin:MTLOriginMake(0, cy_u, 0)];
+	}
+	// Right strip: x in [cright, fw), y in [cy_u, cbottom).
+	if (cright < fw && cbottom > cy_u) {
+		[blit copyFromTexture:c->surround_texture
+		          sourceSlice:0
+		          sourceLevel:0
+		         sourceOrigin:MTLOriginMake(cright, cy_u, 0)
+		           sourceSize:MTLSizeMake(fw - cright, cbottom - cy_u, 1)
+		            toTexture:dst
+		     destinationSlice:0
+		     destinationLevel:0
+		    destinationOrigin:MTLOriginMake(cright, cy_u, 0)];
+	}
+
+	[blit endEncoding];
+}
+
 static xrt_result_t
 metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -2070,6 +2214,87 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		[blit_encoder endEncoding];
 	}
 
+	// Spec v6 surround blit: fill non-canvas pixels of the output from the
+	// app-supplied 2D surround IOSurface (no-op if
+	// xrSetSharedTextureSurround2DEXT was never called). Window-clamped
+	// fill per #464. One call site covers both the DP path and the no-DP
+	// fallback — they converge on output_texture. (In fallback mode the
+	// canvas region holds the full-target stretched atlas — consistent
+	// with the fallback's existing canvas-ignorance.)
+	metal_blit_surround_strips(c, cmd_buf, output_texture,
+	                           (uint32_t)output_texture.width,
+	                           (uint32_t)output_texture.height,
+	                           c->canvas.valid ? c->canvas.x : 0,
+	                           c->canvas.valid ? c->canvas.y : 0,
+	                           c->canvas.valid ? c->canvas.w : (uint32_t)output_texture.width,
+	                           c->canvas.valid ? c->canvas.h : (uint32_t)output_texture.height);
+
+	// Surround composite capture probe — env-gated (DISPLAYXR_SURROUND_CAPTURE=1)
+	// file-trigger dump of the post-surround output. The atlas trigger above
+	// reads the pre-DP atlas, which the surround pass never touches, so
+	// validating the surround needs this dedicated probe (mirrors
+	// d3d11_maybe_capture_surround_target). Trigger: /tmp/dxr_surround_trigger
+	// → /tmp/dxr_surround.png. Default-off, zero per-frame cost when unset.
+	{
+		static int surround_cap_enabled = -1;
+		if (surround_cap_enabled < 0) {
+			const char *e = getenv("DISPLAYXR_SURROUND_CAPTURE");
+			surround_cap_enabled = (e != NULL && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+		}
+		struct stat surround_cap_st;
+		if (surround_cap_enabled && output_texture != nil &&
+		    stat("/tmp/dxr_surround_trigger", &surround_cap_st) == 0) {
+			unlink("/tmp/dxr_surround_trigger");
+			uint32_t cw = (uint32_t)output_texture.width;
+			uint32_t ch = (uint32_t)output_texture.height;
+			size_t pitch = (size_t)cw * 4;
+			size_t bytes = pitch * ch;
+			id<MTLBuffer> stg = [c->device newBufferWithLength:bytes
+			                                           options:MTLResourceStorageModeShared];
+			if (stg != nil) {
+				// Flush pending encodings (incl. the surround strips)
+				// so the readback observes the final composite.
+				[cmd_buf commit];
+				[cmd_buf waitUntilCompleted];
+
+				id<MTLCommandBuffer> bcb = [c->command_queue commandBuffer];
+				id<MTLBlitCommandEncoder> bl = [bcb blitCommandEncoder];
+				[bl copyFromTexture:output_texture
+				          sourceSlice:0
+				          sourceLevel:0
+				         sourceOrigin:MTLOriginMake(0, 0, 0)
+				           sourceSize:MTLSizeMake(cw, ch, 1)
+				             toBuffer:stg
+				    destinationOffset:0
+				 destinationBytesPerRow:pitch
+				destinationBytesPerImage:bytes];
+				[bl endEncoding];
+				[bcb commit];
+				[bcb waitUntilCompleted];
+
+				uint8_t *src = (uint8_t *)stg.contents;
+				uint8_t *out = malloc(bytes);
+				if (out != NULL) {
+					for (size_t i = 0; i < bytes; i += 4) {
+						out[i + 0] = src[i + 2];
+						out[i + 1] = src[i + 1];
+						out[i + 2] = src[i + 0];
+						out[i + 3] = src[i + 3];
+					}
+					stbi_write_png("/tmp/dxr_surround.png", (int)cw, (int)ch, 4, out,
+					               (int)pitch);
+					free(out);
+					U_LOG_W("Surround composite capture written -> /tmp/dxr_surround.png");
+				}
+				[stg release];
+
+				// The committed cmd_buf is dead — the HUD/present
+				// remainder of this frame needs a fresh one.
+				cmd_buf = [c->command_queue commandBuffer];
+			}
+		}
+	}
+
 	// HUD overlay (post-weave, before present)
 	if (c->owns_window) {
 		metal_compositor_render_hud(c, dt, cmd_buf, output_texture);
@@ -2080,7 +2305,12 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// just whatever the AppKit background draws — i.e. solid grey).
 	// Only relevant when both a shared IOSurface AND an external view are
 	// present (the editor preview / Unity standalone path).
-	if (c->shared_texture != nil && c->metal_layer != nil && !c->owns_window) {
+	//
+	// Skipped once the app declares a canvas rect: a _texture app owns
+	// presentation (it blits the IOSurface into its view itself, per the
+	// Cocoa binding spec's Texture mode) — mirroring here would fight the
+	// app over the layer's nextDrawable.
+	if (c->shared_texture != nil && c->metal_layer != nil && !c->owns_window && !c->canvas.valid) {
 		id<CAMetalDrawable> mirror = [c->metal_layer nextDrawable];
 		if (mirror != nil) {
 			id<MTLBlitCommandEncoder> blit = [cmd_buf blitCommandEncoder];
@@ -2169,6 +2399,7 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 		CFRelease(c->shared_iosurface);
 		c->shared_iosurface = NULL;
 	}
+	metal_release_surround(c);
 
 	// 5. Release HUD resources
 	u_hud_destroy(&c->hud);
@@ -2628,21 +2859,68 @@ comp_metal_compositor_set_surround_2d(struct xrt_compositor *xc,
                                        uint32_t w, uint32_t h)
 {
 	struct comp_metal_compositor *c = metal_comp(xc);
+
+	// Release previous registration first (no-op on first call). Covers
+	// both the NULL-handle clear path and replace-on-resize.
+	metal_release_surround(c);
+
 	if (shared_handle == NULL) {
-		// Phase F-late TODO: release IOSurface use-count + Metal texture cache.
 		c->surround_2d = (struct u_surround_2d_handle){0};
 		U_LOG_I("Metal surround 2D cleared");
 		return;
 	}
+
+	// The handle is an in-process IOSurfaceRef — same convention as the
+	// multiview sharedIOSurface field. CFRetain guarantees lifetime; the
+	// IOSurface is cache-coherent between the app's CPU writes (under
+	// IOSurfaceLock) and our GPU reads, so no fence/use-count protocol is
+	// needed in-process. Cross-process (Mach-port lookup + use-count) is
+	// the follow-up when an out-of-process consumer shows up.
+	IOSurfaceRef surface = (IOSurfaceRef)shared_handle;
+	CFRetain(surface);
+	c->surround_iosurface = surface;
+
+	// Registered dims must be self-consistent with the surface. Per #464
+	// the surround is WINDOW-sized (the app re-registers on resize) — it
+	// is deliberately NOT required to match the worst-case shared
+	// IOSurface; the strip blit clamps its fill extent to these dims.
+	size_t sw = IOSurfaceGetWidth(surface);
+	size_t sh = IOSurfaceGetHeight(surface);
+	if (sw != w || sh != h) {
+		U_LOG_E("Metal surround 2D: registration dims (%ux%u) do not match "
+		        "IOSurface dims (%zux%zu)",
+		        w, h, sw, sh);
+		metal_release_surround(c);
+		c->surround_2d = (struct u_surround_2d_handle){0};
+		return;
+	}
+
+	uint32_t fourcc = IOSurfaceGetPixelFormat(surface);
+	MTLPixelFormat format = iosurface_fourcc_to_metal_format(fourcc);
+	MTLTextureDescriptor *desc =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+	                                                       width:sw
+	                                                      height:sh
+	                                                   mipmapped:NO];
+	desc.usage = MTLTextureUsageShaderRead;
+	desc.storageMode = MTLStorageModeShared;
+	c->surround_texture = [c->device newTextureWithDescriptor:desc
+	                                                 iosurface:surface
+	                                                     plane:0];
+	if (c->surround_texture == nil) {
+		U_LOG_E("Metal surround 2D: failed to wrap IOSurface (%zux%zu, fourcc=0x%08x)",
+		        sw, sh, fourcc);
+		metal_release_surround(c);
+		c->surround_2d = (struct u_surround_2d_handle){0};
+		return;
+	}
+
 	c->surround_2d.valid = true;
 	c->surround_2d.shared_handle = shared_handle;
 	c->surround_2d.w = w;
 	c->surround_2d.h = h;
-	// Phase F-late TODO: IOSurfaceIncrementUseCount + MTLDevice
-	// newTextureWithDescriptor:iosurface:plane: + cache Metal texture
-	// for the per-frame surround blit pass.
-	U_LOG_I("Metal surround 2D registered: handle=%p %ux%u (open + blit pending Phase F-late)",
-	        shared_handle, w, h);
+	U_LOG_I("Metal surround 2D registered: handle=%p %ux%u format=%lu",
+	        shared_handle, w, h, (unsigned long)format);
 }
 
 bool

@@ -104,12 +104,20 @@ comp_metal_compositor_set_output_rect(struct xrt_compositor *xc,
                                        uint32_t w, uint32_t h);
 
 /*!
- * Register a full-view 2D IOSurface for the surround region (Spec v6).
+ * Register a window-sized 2D IOSurface for the surround region (Spec v6).
  *
  * Pass shared_handle == NULL to clear. The handle is an IOSurfaceRef cast
- * to void*; synchronization uses Metal fences + IOSurface use-count rather
- * than a KeyedMutex. See comp_d3d11_compositor_set_surround_2d for the
- * cross-platform semantics.
+ * to void*. The registered dims must equal the IOSurface's own dims and
+ * track the window backing size (#464 window-clamped model — the app
+ * re-registers on window resize); the per-frame strip blit fills only the
+ * window rect minus the canvas, never the whole worst-case shared surface.
+ * The surface's pixel format must match the multiview shared IOSurface.
+ *
+ * Lifetime is held by CFRetain; the IOSurface is cache-coherent between
+ * app CPU writes and compositor GPU reads, so no fence / use-count
+ * protocol is needed in-process. See comp_d3d11_compositor_set_surround_2d
+ * for the cross-platform semantics (D3D11 still enforces the pre-#464
+ * worst-case dims contract).
  */
 void
 comp_metal_compositor_set_surround_2d(struct xrt_compositor *xc,

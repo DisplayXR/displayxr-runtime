@@ -379,7 +379,7 @@ export XR_RUNTIME_JSON="$DIR/openxr_displayxr.json"
 export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
 export XRT_PLUGIN_SEARCH_PATH="$DIR/lib/displayxr/plugins"
 export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
-echo "Starting cube_texture_metal_macos (Metal, IOSurface shared texture) with $SIM_DISPLAY_OUTPUT output..."
+echo "Starting cube_texture_metal_macos (Metal, real view + shared IOSurface + 2D surround) with $SIM_DISPLAY_OUTPUT output..."
 exec "$DIR/bin/cube_texture_metal_macos" "$@"
 SCRIPT
 chmod +x "$PKG_DIR/run_cube_texture_metal.sh"

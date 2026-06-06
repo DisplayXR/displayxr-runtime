@@ -583,11 +583,15 @@ The three spec-vs-code discrepancies found during research have been resolved:
    dims and *skips* on mismatch, it never rejects). `XR_EXT_win32_window_binding.md` §3.6 was
    updated to match the shipped runtime + this contract. See INV-5.4.
 
-2. **macOS `cube_texture_metal_macos` divergence — TRACKED.** The macOS sample uses the
-   offscreen/IOSurface mode (not real-view + shared-surface) and omits the surround API. Porting
-   it is tracked in [#406](https://github.com/DisplayXR/displayxr-runtime/issues/406). Until then,
-   the "real handle + shared surface + surround" model in §5 is **Windows-accurate**; macOS is the
-   exception.
+2. **macOS `cube_texture_metal_macos` divergence — RESOLVED
+   ([#406](https://github.com/DisplayXR/displayxr-runtime/issues/406)).** The macOS sample now
+   binds real-view + shared-IOSurface (Texture mode) and registers the 2D surround via
+   `xrSetSharedTextureSurround2DEXT`, so the "real handle + shared surface + surround" model in
+   §5 is accurate on both platforms. One deliberate platform delta: the **Metal surround is
+   window-clamped per [#464](https://github.com/DisplayXR/displayxr-runtime/issues/464)** — the
+   app registers a *window-sized* surround IOSurface (re-registered on resize) and the runtime
+   fills only the window rect minus the canvas. INV-5.4/5.7's "worst-case size" wording remains
+   **Windows-accurate** until the #464 D3D11/D3D12 retrofit lands.
 
 3. **Stale `XR_EXT_display_info.md` examples — RESOLVED, plus a full v13 spec refresh.** The
    view-count hardcoding (`XrView views[2]` / `for (eye<2)`) was fixed to the `XRT_MAX_VIEWS`(8)-wide

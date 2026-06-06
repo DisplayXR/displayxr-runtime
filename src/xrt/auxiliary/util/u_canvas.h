@@ -51,17 +51,23 @@ struct u_canvas_rect
  * "what fills the rest." See docs/specs/extensions/XR_EXT_win32_window_binding.md §3.6.
  *
  * The handle is a D3D11/D3D12 NT HANDLE on Windows, an IOSurfaceRef cast
- * to void* on macOS. The compositor opens it lazily on first use and
- * releases on clear / replace / session teardown. Dimensions MUST equal
- * the HWND/NSView client-area dimensions — the runtime does a 1:1 blit
- * with scissor-rects around the canvas hole, no scaling.
+ * to void* on macOS. The compositor opens it on registration and releases
+ * on clear / replace / session teardown. The runtime does a 1:1 blit with
+ * scissor-rects around the canvas hole, no scaling.
+ *
+ * Dimensions contract (#464): the target model is WINDOW-sized — dims equal
+ * the HWND/NSView client-area backing dimensions, the fill is clamped to
+ * the window rect, and the app re-registers on resize. The Metal compositor
+ * implements this; D3D11/D3D12 currently still enforce the legacy
+ * worst-case contract (dims == shared-texture dims, display-extent
+ * over-fill) pending the #464 retrofit.
  */
 struct u_surround_2d_handle
 {
 	bool valid;             //!< True if a surround texture has been registered
 	void *shared_handle;    //!< NT HANDLE (Win) / IOSurfaceRef (Mac), or NULL
-	uint32_t w;             //!< Texture width in pixels (== HWND client width)
-	uint32_t h;             //!< Texture height in pixels (== HWND client height)
+	uint32_t w;             //!< Texture width in pixels (window rect on Metal; see #464 note)
+	uint32_t h;             //!< Texture height in pixels (window rect on Metal; see #464 note)
 };
 
 /*!

@@ -2,20 +2,29 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Metal OpenXR spinning cube with IOSurface shared texture
+ * @brief  Metal OpenXR spinning cube — texture mode (real view + shared IOSurface)
  *
- * Demonstrates XR_EXT_cocoa_window_binding with IOSurface shared texture:
- * the app creates an IOSurface and passes it to the runtime via the cocoa
- * window binding (viewHandle=NULL, sharedIOSurface=surface). The runtime
- * renders the composited output into the IOSurface. The app then blits
- * the IOSurface content into its own window with UI drawn around it.
+ * Demonstrates XR_EXT_cocoa_window_binding in Texture mode, matching the
+ * Windows texture apps (real HWND + shared HANDLE): the app passes BOTH its
+ * real NSView (viewHandle — used by the display processor for screen-space
+ * position tracking / phase alignment) AND a shared IOSurface
+ * (sharedIOSurface — the runtime weaves into its canvas sub-rect, declared
+ * via xrSetSharedTextureOutputRectEXT). The app owns presentation: it blits
+ * the IOSurface back into its own CAMetalLayer.
  *
- * Key difference from cube_handle_metal_macos: the app's CAMetalLayer is NOT
- * passed to the runtime. Instead, the IOSurface acts as a shared render
- * target, and the app composites the result into its own rendering pipeline.
+ * The app also registers a window-sized 2D surround IOSurface via
+ * xrSetSharedTextureSurround2DEXT (spec v6; window-clamped per #464) — the
+ * runtime strip-blits its non-canvas pixels into the shared IOSurface each
+ * frame, and the app presents the full window region (3D canvas + 2D
+ * surround).
+ *
+ * Key difference from cube_handle_metal_macos: the runtime does not present
+ * to the app's CAMetalLayer. The IOSurface acts as a shared render target,
+ * and the app composites the result into its own rendering pipeline.
  *
  * Features:
- * - IOSurface shared texture (zero-copy Metal texture sharing)
+ * - Real-view + shared-IOSurface binding (zero-copy Metal texture sharing)
+ * - 2D surround (checkerboard pattern) around a center-50% 3D canvas
  * - App-owned window with toolbar and status bar UI
  * - Mouse drag camera rotation, scroll zoom, WASD movement
  * - Metal rendering (no Vulkan/MoltenVK dependency)
@@ -776,6 +785,16 @@ static id<MTLTexture> g_ioSurfaceReadTexture = nil;
 static uint32_t g_ioSurfaceWidth = 1920;
 static uint32_t g_ioSurfaceHeight = 1080;
 
+// 2D surround IOSurface (spec v6 xrSetSharedTextureSurround2DEXT, Cocoa
+// form). Window-sized per #464 — reallocated + re-registered on window
+// resize, CPU-filled with a static checkerboard+gradient pattern. The
+// runtime strip-blits its non-canvas pixels into the shared IOSurface
+// each frame.
+static IOSurfaceRef g_surroundIOSurface = NULL;
+static uint32_t g_surroundWidth = 0;
+static uint32_t g_surroundHeight = 0;
+static bool g_surroundRegistered = false;
+
 // Input state
 struct InputState {
     float yaw = 0.0f, pitch = 0.0f;
@@ -809,7 +828,7 @@ static const float HUD_WIDTH_FRACTION = 0.20f;
 static double g_avgFrameTime = 0.0;
 static float g_hudUpdateTimer = 0.0f;
 static uint32_t g_windowW = 1512, g_windowH = 823;  // Full window backing pixels
-static uint32_t g_canvasW = 1512, g_canvasH = 823;  // Canvas (Metal view) backing pixels
+static uint32_t g_canvasW = 1512, g_canvasH = 823;  // Logical canvas backing pixels (center 50%)
 static uint32_t g_renderW = 0, g_renderH = 0;
 
 // Cached HUD section strings, refreshed at HUD throttle rate (~2 Hz).
@@ -837,7 +856,7 @@ static void SignalHandler(int)
 @implementation ToolbarView
 - (instancetype)initWithFrame:(NSRect)frame {
     self = [super initWithFrame:frame];
-    if (self) { _toolbarText = @"IOSurface Shared Texture"; [self setWantsLayer:YES]; }
+    if (self) { _toolbarText = @"Real View + Shared IOSurface + 2D Surround"; [self setWantsLayer:YES]; }
     return self;
 }
 - (BOOL)isOpaque { return YES; }
@@ -957,37 +976,26 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, id<MTLDevice> dev
                                                  backing:NSBackingStoreBuffered
                                                    defer:NO];
 
-        [g_window setTitle:@"Metal Cube — Metal Native Compositor (IOSurface Shared)"];
+        [g_window setTitle:@"Metal Cube — Metal Native Compositor (Real View + Shared IOSurface)"];
         [g_window setAcceptsMouseMovedEvents:YES];
         [g_window setReleasedWhenClosed:NO];
 
         g_windowDelegate = [[AppWindowDelegate alloc] init];
         [g_window setDelegate:g_windowDelegate];
 
-        // Create a container view that holds toolbar + Metal view + status bar
+        // Create a container view that holds Metal view + toolbar + status bar.
+        // Layer-backed so the toolbar/status-bar overlays reliably composite
+        // ABOVE the full-window CAMetalLayer sibling.
         NSView *container = [[NSView alloc] initWithFrame:frame];
+        [container setWantsLayer:YES];
 
-        // Toolbar (top)
-        NSRect toolbarFrame = NSMakeRect(0, height - TOOLBAR_HEIGHT, width, TOOLBAR_HEIGHT);
-        g_toolbarView = [[ToolbarView alloc] initWithFrame:toolbarFrame];
-        g_toolbarView.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
-        [container addSubview:g_toolbarView];
-
-        // Status bar (bottom)
-        NSRect statusFrame = NSMakeRect(0, 0, width, STATUSBAR_HEIGHT);
-        g_statusBarView = [[StatusBarView alloc] initWithFrame:statusFrame];
-        g_statusBarView.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
-        [container addSubview:g_statusBarView];
-
-        // Metal view (canvas — center 50% of window to clearly show canvas ≠ window)
-        float canvasW = width * 0.5f;
-        float canvasH = height * 0.5f;
-        float canvasX = width * 0.25f;
-        float canvasY = height * 0.25f;
-        NSRect metalFrame = NSMakeRect(canvasX, canvasY, canvasW, canvasH);
-        g_metalView = [[AppMetalView alloc] initWithFrame:metalFrame];
+        // Metal view — FULL content area (added first = bottom of z-order).
+        // The 3D canvas is a logical center sub-rect inside it (see
+        // ComputeCanvasRectPx), matching the Windows texture apps where the
+        // canvas is a sub-rect of the one full-window client area.
+        g_metalView = [[AppMetalView alloc] initWithFrame:[container bounds]];
         [g_metalView setWantsLayer:YES];
-        g_metalView.autoresizingMask = 0;  // No autoresize — repositioned each frame
+        g_metalView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
 
         // Set Retina scale
         CAMetalLayer *metalLayer = (CAMetalLayer *)[g_metalView layer];
@@ -998,6 +1006,20 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, id<MTLDevice> dev
         }
 
         [container addSubview:g_metalView];
+
+        // Toolbar (top, overlays the metal view)
+        NSRect toolbarFrame = NSMakeRect(0, height - TOOLBAR_HEIGHT, width, TOOLBAR_HEIGHT);
+        g_toolbarView = [[ToolbarView alloc] initWithFrame:toolbarFrame];
+        g_toolbarView.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+        [g_toolbarView setWantsLayer:YES];
+        [container addSubview:g_toolbarView];
+
+        // Status bar (bottom, overlays the metal view)
+        NSRect statusFrame = NSMakeRect(0, 0, width, STATUSBAR_HEIGHT);
+        g_statusBarView = [[StatusBarView alloc] initWithFrame:statusFrame];
+        g_statusBarView.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+        [g_statusBarView setWantsLayer:YES];
+        [container addSubview:g_statusBarView];
 
         // HUD now lives as an XR_EXT_window_space_layer composed by the
         // runtime, not as an NSView subview.
@@ -1069,6 +1091,142 @@ static bool CreateIOSurface(uint32_t width, uint32_t height, id<MTLDevice> devic
 }
 
 // ============================================================================
+// Logical canvas rect (center 50% of the window, in backing pixels)
+// ============================================================================
+
+// The 3D canvas is a logical sub-rect of the full-window Metal view —
+// center 50%, like the Windows texture apps. Coordinates are TOP-DOWN
+// (client-area convention per XR_EXT_win32_window_binding §3.5, matching
+// Metal texture space). The pre-#406 code passed AppKit's bottom-up
+// `frame.origin.y * scale` as canvas y — it round-tripped only because the
+// same value was used for both the runtime write and the app read AND the
+// rect is centered; standardize on top-down deliberately.
+// Clamped to the shared IOSurface dims (window may exceed the worst-case
+// atlas on huge displays).
+static void ComputeCanvasRectPx(int32_t *cx, int32_t *cy, uint32_t *cw, uint32_t *ch)
+{
+    uint32_t winW = 0, winH = 0;
+    if (g_window != nil) {
+        CGFloat bs = [g_window backingScaleFactor];
+        NSSize sz = [[g_window contentView] bounds].size;
+        winW = (uint32_t)(sz.width * bs);
+        winH = (uint32_t)(sz.height * bs);
+    }
+    if (winW > g_ioSurfaceWidth) winW = g_ioSurfaceWidth;
+    if (winH > g_ioSurfaceHeight) winH = g_ioSurfaceHeight;
+
+    *cx = (int32_t)(winW / 4);
+    *cy = (int32_t)(winH / 4);
+    *cw = winW / 2;
+    *ch = winH / 2;
+}
+
+// Window content-area backing pixels, clamped to the shared IOSurface dims
+// (the region of the IOSurface the app actually presents).
+static void WindowBackingPx(uint32_t *w, uint32_t *h)
+{
+    *w = 0;
+    *h = 0;
+    if (g_window != nil) {
+        CGFloat bs = [g_window backingScaleFactor];
+        NSSize sz = [[g_window contentView] bounds].size;
+        *w = (uint32_t)(sz.width * bs);
+        *h = (uint32_t)(sz.height * bs);
+    }
+    if (*w > g_ioSurfaceWidth) *w = g_ioSurfaceWidth;
+    if (*h > g_ioSurfaceHeight) *h = g_ioSurfaceHeight;
+}
+
+// ============================================================================
+// 2D surround IOSurface (window-sized, #464)
+// ============================================================================
+
+// Fill the surround with a static checkerboard + vertical gradient, with a
+// bright border ring just outside the canvas rect so the canvas/surround
+// boundary is visually unmistakable (same intent as the Windows app's
+// RenderSurroundPattern pixel shader). Pixels inside the canvas rect are
+// skipped — the runtime never reads them (the DP owns that region).
+// CPU fill is deliberate: no per-frame redraw is required on macOS (no
+// keyed-mutex handshake; the IOSurface is coherent), and a static pattern
+// keeps captures byte-stable. A Metal-pass + shared-event version is the
+// production-shaped follow-up.
+static void FillSurroundPattern(int32_t canvasX, int32_t canvasY,
+                                uint32_t canvasW, uint32_t canvasH)
+{
+    if (g_surroundIOSurface == NULL) return;
+
+    IOSurfaceLock(g_surroundIOSurface, 0, NULL);
+    uint8_t *base = (uint8_t *)IOSurfaceGetBaseAddress(g_surroundIOSurface);
+    size_t stride = IOSurfaceGetBytesPerRow(g_surroundIOSurface);
+    uint32_t w = g_surroundWidth;
+    uint32_t h = g_surroundHeight;
+
+    const uint32_t cell = 64;        // checker cell in pixels
+    const uint32_t ring = 6;         // border ring thickness around canvas
+    int64_t cL = canvasX, cT = canvasY;
+    int64_t cR = canvasX + (int64_t)canvasW, cB = canvasY + (int64_t)canvasH;
+
+    for (uint32_t y = 0; y < h; y++) {
+        uint8_t *row = base + (size_t)y * stride;
+        for (uint32_t x = 0; x < w; x++) {
+            bool insideCanvas = ((int64_t)x >= cL && (int64_t)x < cR &&
+                                 (int64_t)y >= cT && (int64_t)y < cB);
+            if (insideCanvas) continue; // DP-owned, never read
+
+            uint8_t *px = row + (size_t)x * 4;
+            bool inRing = ((int64_t)x >= cL - (int64_t)ring && (int64_t)x < cR + (int64_t)ring &&
+                           (int64_t)y >= cT - (int64_t)ring && (int64_t)y < cB + (int64_t)ring);
+            if (inRing) {
+                // Bright amber ring at the canvas boundary
+                px[0] = 0;   px[1] = 170; px[2] = 255; px[3] = 255; // BGRA
+                continue;
+            }
+            bool check = (((x / cell) + (y / cell)) & 1) != 0;
+            float grad = (h > 1) ? (float)y / (float)(h - 1) : 0.0f;
+            uint8_t lo = (uint8_t)(40.0f + 50.0f * grad);
+            uint8_t hi = (uint8_t)(90.0f + 90.0f * grad);
+            uint8_t v = check ? hi : lo;
+            // Teal-tinted checker (BGRA byte order)
+            px[0] = v;                       // B
+            px[1] = (uint8_t)(v * 3 / 4);    // G
+            px[2] = (uint8_t)(v / 2);        // R
+            px[3] = 255;                     // A
+        }
+    }
+
+    IOSurfaceUnlock(g_surroundIOSurface, 0, NULL);
+}
+
+// (Re)create the surround IOSurface at the current window backing size.
+// Same pixel format as the multiview shared IOSurface ('BGRA') — the
+// runtime's strip blit requires strict format equality.
+static bool CreateSurroundIOSurface(uint32_t width, uint32_t height)
+{
+    if (g_surroundIOSurface != NULL) {
+        CFRelease(g_surroundIOSurface);
+        g_surroundIOSurface = NULL;
+    }
+    if (width == 0 || height == 0) return false;
+
+    NSDictionary *props = @{
+        (id)kIOSurfaceWidth:       @(width),
+        (id)kIOSurfaceHeight:      @(height),
+        (id)kIOSurfaceBytesPerElement: @(4),
+        (id)kIOSurfacePixelFormat: @((uint32_t)'BGRA'),
+    };
+    g_surroundIOSurface = IOSurfaceCreate((CFDictionaryRef)props);
+    if (g_surroundIOSurface == NULL) {
+        LOG_ERROR("Failed to create surround IOSurface (%ux%u)", width, height);
+        return false;
+    }
+    g_surroundWidth = width;
+    g_surroundHeight = height;
+    LOG_INFO("Created surround IOSurface: %ux%u, BGRA8, id=%u",
+             width, height, IOSurfaceGetID(g_surroundIOSurface));
+    return true;
+}
+
+// ============================================================================
 // Blit IOSurface to drawable (app's Metal rendering)
 // ============================================================================
 
@@ -1086,40 +1244,47 @@ static void BlitIOSurfaceToDrawable(MetalRenderer &r, CAMetalLayer *metalLayer)
     id<MTLCommandBuffer> cmdBuf = [r.commandQueue commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cmdBuf renderCommandEncoderWithDescriptor:rpd];
 
-    // Blit the canvas portion of the IOSurface, letterboxed into the drawable
+    // Position-true 1:1 readback of the shared IOSurface — the drawable IS
+    // the full window now (parity with cube_texture_d3d11_win main.cpp):
+    //  - surround active:   blit the whole window region (canvas 3D weave +
+    //                       runtime-blitted 2D surround strips).
+    //  - surround inactive: blit ONLY the canvas sub-rect, at its position;
+    //                       the rest of the drawable keeps the clear color.
     if (g_ioSurfaceReadTexture != nil) {
+        // Derive the window pixel dims from the drawable itself — always
+        // self-consistent, even mid-resize while the compositor adjusts
+        // the layer's drawableSize.
         float drawW = (float)drawable.texture.width;
         float drawH = (float)drawable.texture.height;
+        float ioW = (float)g_ioSurfaceWidth;
+        float ioH = (float)g_ioSurfaceHeight;
 
-        // UV scale + offset: compositor writes the canvas region at
-        // (canvasX, canvasY) inside the IOSurface per ADR-010. Sample at
-        // uv_offset + uv * uv_scale.
-        float uvScaleX = (g_ioSurfaceWidth > 0) ? (float)g_canvasW / (float)g_ioSurfaceWidth : 1.0f;
-        float uvScaleY = (g_ioSurfaceHeight > 0) ? (float)g_canvasH / (float)g_ioSurfaceHeight : 1.0f;
-        float uvOffsetX = 0.0f, uvOffsetY = 0.0f;
-        if (g_metalView != nil && g_window != nil) {
-            CGFloat bs = [g_window backingScaleFactor];
-            NSRect mf = [g_metalView frame];
-            float canvasXpx = (float)(mf.origin.x * bs);
-            float canvasYpx = (float)(mf.origin.y * bs);
-            if (g_ioSurfaceWidth > 0) uvOffsetX = canvasXpx / (float)g_ioSurfaceWidth;
-            if (g_ioSurfaceHeight > 0) uvOffsetY = canvasYpx / (float)g_ioSurfaceHeight;
-        }
-
-        // Letterbox using canvas aspect ratio (not IOSurface aspect)
-        float canvasAspect = (g_canvasH > 0) ? (float)g_canvasW / (float)g_canvasH : 1.0f;
-        float drawAspect = drawW / drawH;
         float vpX, vpY, vpW, vpH;
-        if (canvasAspect > drawAspect) {
-            vpW = drawW;
-            vpH = drawW / canvasAspect;
-            vpX = 0;
-            vpY = (drawH - vpH) / 2.0f;
+        float uvOffsetX, uvOffsetY, uvScaleX, uvScaleY;
+        if (g_surroundRegistered) {
+            // Full window region, clamped to the worst-case IOSurface.
+            vpW = (drawW < ioW) ? drawW : ioW;
+            vpH = (drawH < ioH) ? drawH : ioH;
+            vpX = 0.0f;
+            vpY = 0.0f;
+            uvOffsetX = 0.0f;
+            uvOffsetY = 0.0f;
+            uvScaleX = (ioW > 0) ? vpW / ioW : 1.0f;
+            uvScaleY = (ioH > 0) ? vpH / ioH : 1.0f;
         } else {
-            vpH = drawH;
-            vpW = drawH * canvasAspect;
-            vpX = (drawW - vpW) / 2.0f;
-            vpY = 0;
+            // Canvas sub-rect at its position (top-down coords; MTLViewport
+            // origin is top-left, so the canvas y drops straight in).
+            int32_t cx, cy;
+            uint32_t cw, ch;
+            ComputeCanvasRectPx(&cx, &cy, &cw, &ch);
+            vpX = (float)cx;
+            vpY = (float)cy;
+            vpW = (float)cw;
+            vpH = (float)ch;
+            uvOffsetX = (ioW > 0) ? (float)cx / ioW : 0.0f;
+            uvOffsetY = (ioH > 0) ? (float)cy / ioH : 0.0f;
+            uvScaleX = (ioW > 0) ? (float)cw / ioW : 1.0f;
+            uvScaleY = (ioH > 0) ? (float)ch / ioH : 1.0f;
         }
 
         // Pass UV scale + offset to blit shader
@@ -1264,22 +1429,19 @@ static void PumpMacOSEvents()
             }
         }
 
-        // Update pixel sizes and reposition canvas at center 25%-75%
+        // Update pixel sizes. The Metal view autoresizes to fill the window;
+        // the canvas is a LOGICAL center-50% sub-rect (ComputeCanvasRectPx),
+        // no view repositioning needed.
         if (g_metalView != nil && g_window != nil) {
             CGFloat backingScale = [g_window backingScaleFactor];
-            // Full window content area
             NSSize winSize = [[g_window contentView] bounds].size;
             g_windowW = (uint32_t)(winSize.width * backingScale);
             g_windowH = (uint32_t)(winSize.height * backingScale);
-            // Reposition Metal view to center 50% of content area
-            float cw = winSize.width * 0.5f;
-            float ch = winSize.height * 0.5f;
-            float cx = winSize.width * 0.25f;
-            float cy = winSize.height * 0.25f;
-            [g_metalView setFrame:NSMakeRect(cx, cy, cw, ch)];
-            // Canvas = Metal view backing pixels
-            g_canvasW = (uint32_t)(cw * backingScale);
-            g_canvasH = (uint32_t)(ch * backingScale);
+            int32_t cx, cy;
+            uint32_t cw, ch;
+            ComputeCanvasRectPx(&cx, &cy, &cw, &ch);
+            g_canvasW = cw;
+            g_canvasH = ch;
         }
     }
 }
@@ -1368,6 +1530,7 @@ struct AppXrSession {
     PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingModeEXT;
     PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT;
     PFN_xrSetSharedTextureOutputRectEXT pfnSetSharedTextureOutputRectEXT;
+    PFN_xrSetSharedTextureSurround2DEXT pfnSetSharedTextureSurround2DEXT;
     // Enumerated rendering mode info. currentModeIndex is initialized to mode 1
     // as a fallback for runtimes that don't expose isActive; v13+ runtimes
     // replace it via the enumerate step (initial-mode-sync, #234/#239).
@@ -1488,6 +1651,9 @@ static bool InitializeOpenXR(AppXrSession &app)
                 (PFN_xrVoidFunction*)&app.pfnEnumerateDisplayRenderingModesEXT);
             xrGetInstanceProcAddr(app.instance, "xrSetSharedTextureOutputRectEXT",
                 (PFN_xrVoidFunction*)&app.pfnSetSharedTextureOutputRectEXT);
+            // NULL-tolerant: pre-v6 runtimes don't export the surround call.
+            xrGetInstanceProcAddr(app.instance, "xrSetSharedTextureSurround2DEXT",
+                (PFN_xrVoidFunction*)&app.pfnSetSharedTextureSurround2DEXT);
         }
     }
 
@@ -1527,28 +1693,31 @@ static bool GetMetalGraphicsRequirements(AppXrSession &app)
 
 static bool CreateSession(AppXrSession &app, MetalRenderer &r)
 {
-    LOG_INFO("Creating OpenXR session with IOSurface shared texture...");
+    LOG_INFO("Creating OpenXR session (texture mode: real view + shared IOSurface)...");
 
     XrGraphicsBindingMetalKHR metalBinding = {XR_TYPE_GRAPHICS_BINDING_METAL_KHR};
     metalBinding.commandQueue = (__bridge void *)r.commandQueue;
 
-    // Chain the cocoa window binding extension:
-    // viewHandle=NULL (offscreen), sharedIOSurface=our IOSurface
+    // Chain the cocoa window binding extension — Texture mode:
+    // real NSView (for DP screen-space position tracking / phase alignment)
+    // + shared IOSurface (the runtime composites into its canvas sub-rect).
+    // Parity with the Windows texture apps (real HWND + shared HANDLE).
     XrCocoaWindowBindingCreateInfoEXT cocoaBinding = {};
     cocoaBinding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT;
     cocoaBinding.next = nullptr;
-    cocoaBinding.viewHandle = NULL;  // Offscreen — no NSView passed to runtime
+    cocoaBinding.viewHandle = (__bridge void *)g_metalView;
     cocoaBinding.sharedIOSurface = (void *)g_ioSurface;
 
     metalBinding.next = &cocoaBinding;
-    LOG_INFO("Chaining XR_EXT_cocoa_window_binding: viewHandle=NULL, sharedIOSurface=%p", (void *)g_ioSurface);
+    LOG_INFO("Chaining XR_EXT_cocoa_window_binding: viewHandle=%p, sharedIOSurface=%p",
+             (__bridge void *)g_metalView, (void *)g_ioSurface);
 
     XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
     sessionInfo.next = &metalBinding;
     sessionInfo.systemId = app.systemId;
 
     XR_CHECK(xrCreateSession(app.instance, &sessionInfo, &app.session));
-    LOG_INFO("Session created (IOSurface shared texture mode)");
+    LOG_INFO("Session created (texture mode: real view + shared IOSurface)");
 
     // Enumerate available rendering modes and store names
     app.renderingModeCount = 0;
@@ -1779,12 +1948,10 @@ int main(int argc, char **argv)
         }
     }
     if (ioW == 0 || ioH == 0) {
-        // Fallback: display dims or canvas backing
+        // Fallback: display dims or window backing
         ioW = app.displayPixelWidth > 0 ? app.displayPixelWidth : (uint32_t)backing.size.width;
         ioH = app.displayPixelHeight > 0 ? app.displayPixelHeight : (uint32_t)backing.size.height;
     }
-    app.canvasPixelWidth = (uint32_t)backing.size.width;
-    app.canvasPixelHeight = (uint32_t)backing.size.height;
     LOG_INFO("IOSurface dimensions (worst-case atlas): %ux%u", ioW, ioH);
 
     // Create the shared IOSurface
@@ -1793,7 +1960,17 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // Create session with IOSurface (viewHandle=NULL)
+    // Canvas = logical center-50% sub-rect of the window (clamped to the
+    // now-known IOSurface dims). The Metal view itself fills the window.
+    {
+        int32_t cx0, cy0;
+        uint32_t cw0, ch0;
+        ComputeCanvasRectPx(&cx0, &cy0, &cw0, &ch0);
+        app.canvasPixelWidth = cw0;
+        app.canvasPixelHeight = ch0;
+    }
+
+    // Create session with real view + shared IOSurface (texture mode)
     if (!CreateSession(app, renderer)) {
         LOG_ERROR("Failed to create session");
         return 1;
@@ -1801,14 +1978,35 @@ int main(int argc, char **argv)
 
     // Tell the compositor where the canvas is within the window client area
     if (app.pfnSetSharedTextureOutputRectEXT) {
-        CGFloat backingScale = g_window ? [g_window backingScaleFactor] : 2.0;
-        NSRect mf = [g_metalView frame];
-        int32_t canvasX = (int32_t)(mf.origin.x * backingScale);
-        int32_t canvasY = (int32_t)(mf.origin.y * backingScale);
+        int32_t canvasX, canvasY;
+        uint32_t canvasW, canvasH;
+        ComputeCanvasRectPx(&canvasX, &canvasY, &canvasW, &canvasH);
         app.pfnSetSharedTextureOutputRectEXT(app.session, canvasX, canvasY,
-                                              app.canvasPixelWidth, app.canvasPixelHeight);
+                                              canvasW, canvasH);
         LOG_INFO("Set shared texture output rect: x=%d, y=%d, w=%u, h=%u",
-                 canvasX, canvasY, app.canvasPixelWidth, app.canvasPixelHeight);
+                 canvasX, canvasY, canvasW, canvasH);
+    }
+
+    // Register the 2D surround (spec v6) — window-sized per #464. The
+    // runtime strip-blits its non-canvas pixels into the shared IOSurface
+    // each frame; the app then presents the full window region.
+    if (app.pfnSetSharedTextureSurround2DEXT) {
+        uint32_t winPxW, winPxH;
+        WindowBackingPx(&winPxW, &winPxH);
+        if (CreateSurroundIOSurface(winPxW, winPxH)) {
+            int32_t cx0, cy0;
+            uint32_t cw0, ch0;
+            ComputeCanvasRectPx(&cx0, &cy0, &cw0, &ch0);
+            FillSurroundPattern(cx0, cy0, cw0, ch0);
+            XrResult sres = app.pfnSetSharedTextureSurround2DEXT(
+                app.session, (void *)g_surroundIOSurface, winPxW, winPxH);
+            g_surroundRegistered = XR_SUCCEEDED(sres);
+            LOG_INFO("Surround 2D %s: %ux%u (XrResult=%d)",
+                     g_surroundRegistered ? "registered" : "REGISTRATION FAILED",
+                     winPxW, winPxH, (int)sres);
+        }
+    } else {
+        LOG_INFO("xrSetSharedTextureSurround2DEXT unavailable — no 2D surround");
     }
 
     if (!CreateSpaces(app)) {
@@ -1869,16 +2067,32 @@ int main(int argc, char **argv)
 
         PumpMacOSEvents();
 
-        // Update canvas rect and recreate IOSurface if canvas size changed
+        // Update canvas rect (logical center-50%) for Kooima/weaver alignment,
+        // and re-register the window-sized surround on window resize (#464:
+        // the surround tracks the window rect, not the worst-case surface).
         if (g_metalView != nil && g_window != nil) {
-            CGFloat bs = [g_window backingScaleFactor];
-            NSRect mf = [g_metalView frame];
+            int32_t cx, cy;
+            uint32_t cw, ch;
+            ComputeCanvasRectPx(&cx, &cy, &cw, &ch);
 
-            // Update canvas position for Kooima/weaver alignment
             if (app.pfnSetSharedTextureOutputRectEXT) {
-                app.pfnSetSharedTextureOutputRectEXT(app.session,
-                    (int32_t)(mf.origin.x * bs), (int32_t)(mf.origin.y * bs),
-                    g_canvasW, g_canvasH);
+                app.pfnSetSharedTextureOutputRectEXT(app.session, cx, cy, cw, ch);
+            }
+
+            if (g_surroundRegistered && app.pfnSetSharedTextureSurround2DEXT) {
+                uint32_t winPxW, winPxH;
+                WindowBackingPx(&winPxW, &winPxH);
+                if (winPxW != g_surroundWidth || winPxH != g_surroundHeight) {
+                    if (CreateSurroundIOSurface(winPxW, winPxH)) {
+                        FillSurroundPattern(cx, cy, cw, ch);
+                        XrResult sres = app.pfnSetSharedTextureSurround2DEXT(
+                            app.session, (void *)g_surroundIOSurface, winPxW, winPxH);
+                        g_surroundRegistered = XR_SUCCEEDED(sres);
+                    } else {
+                        app.pfnSetSharedTextureSurround2DEXT(app.session, NULL, 0, 0);
+                        g_surroundRegistered = false;
+                    }
+                }
             }
         }
 
@@ -2035,11 +2249,25 @@ int main(int argc, char **argv)
 
                 // Canvas-relative Kooima: physical size + eye offset both anchored
                 // on the canvas region within the window (not the window itself).
+                // The Metal view fills the window now, so derive the canvas rect
+                // logically (top-down backing px) and convert to AppKit's
+                // bottom-up point space for the screen conversion.
                 float eyeOffsetX = 0.0f, eyeOffsetY = 0.0f;
                 if (g_window != nil && g_metalView != nil) {
                     NSScreen *screen_ns = [g_window screen] ?: [NSScreen mainScreen];
                     NSRect screenFrame = [screen_ns frame];
-                    NSRect canvasInWindow = [g_metalView convertRect:[g_metalView bounds] toView:nil];
+                    int32_t ccx, ccy;
+                    uint32_t ccw, cch;
+                    ComputeCanvasRectPx(&ccx, &ccy, &ccw, &cch);
+                    CGFloat cbs = [g_window backingScaleFactor];
+                    NSView *content = [g_window contentView];
+                    NSSize winPts = [content bounds].size;
+                    NSRect canvasInContent = NSMakeRect(
+                        (CGFloat)ccx / cbs,
+                        winPts.height - (CGFloat)(ccy + (int32_t)cch) / cbs, // top-down -> bottom-up
+                        (CGFloat)ccw / cbs,
+                        (CGFloat)cch / cbs);
+                    NSRect canvasInWindow = [content convertRect:canvasInContent toView:nil];
                     NSRect canvasInScreen = [g_window convertRectToScreen:canvasInWindow];
                     float canvasCenterX = (canvasInScreen.origin.x - screenFrame.origin.x) + canvasInScreen.size.width / 2.0f;
                     float canvasCenterY = (canvasInScreen.origin.y - screenFrame.origin.y) + canvasInScreen.size.height / 2.0f;
@@ -2280,7 +2508,7 @@ int main(int argc, char **argv)
                 const char *kooimaMode = g_input.cameraMode
                     ? "Camera-Centric [C=Toggle]" : "Display-Centric [C=Toggle]";
                 snprintf(buf, sizeof(buf),
-                    "XR_EXT_cocoa_window_binding: ACTIVE (Metal IOSurface)\nMode: %s (%s)%s\nKooima: %s",
+                    "XR_EXT_cocoa_window_binding: ACTIVE (Real View + IOSurface)\nMode: %s (%s)%s\nKooima: %s",
                     outputModeName, display3D ? "3D" : "2D", lockSuffix, kooimaMode);
                 g_hudModeText = utf8ToW(buf);
 
@@ -2350,6 +2578,13 @@ int main(int argc, char **argv)
 
     LOG_INFO("Shutting down...");
 
+    // Clear the surround registration before tearing the session down
+    // (documented lifecycle: clear with NULL, then destroy).
+    if (g_surroundRegistered && app.pfnSetSharedTextureSurround2DEXT && app.session) {
+        app.pfnSetSharedTextureSurround2DEXT(app.session, NULL, 0, 0);
+        g_surroundRegistered = false;
+    }
+
     if (hudReady) {
         CleanupHudRenderer(hudRenderer);
     }
@@ -2367,11 +2602,15 @@ int main(int argc, char **argv)
     if (app.instance)
         xrDestroyInstance(app.instance);
 
-    // Release IOSurface
+    // Release IOSurfaces
     g_ioSurfaceReadTexture = nil;
     if (g_ioSurface != NULL) {
         CFRelease(g_ioSurface);
         g_ioSurface = NULL;
+    }
+    if (g_surroundIOSurface != NULL) {
+        CFRelease(g_surroundIOSurface);
+        g_surroundIOSurface = NULL;
     }
 
     LOG_INFO("Clean shutdown complete");
