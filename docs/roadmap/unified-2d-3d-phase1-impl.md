@@ -98,3 +98,26 @@ Confirm soft-edge AA (a Tier-3 gradient mask) shows a clean 2D↔3D blend, no in
 
 - **macOS (me):** extension header + spec, oxr registration + handlers + mask object + Tier 1/2 rasterization (portable C; MinGW-cross-check the portable bits).
 - **Windows (agent):** the D3D11 consumer wiring (weave/mask scratch SRVs, flip `use_rect_mask`, Tier-3 RTV), and all §6 validation on Leia hardware.
+
+---
+
+## Appendix — oxr integration map (ready to execute)
+
+The oxr layer **compiles + links on macOS** (`./scripts/build_macos.sh`): the per-API forwarding is `#ifdef XRT_HAVE_<API>_NATIVE_COMPOSITOR`-guarded, so writing **only** the D3D11 branch + an `XR_ERROR_FEATURE_UNSUPPORTED` fallthrough builds clean on macOS (D3D11 guard off → no symbol referenced) and links on Windows (guard on → needs the D3D11 entry points). So the whole oxr layer is verifiable here; **only the D3D11 compositor entry-point *implementations* are the Windows task** (they're declared but unimplemented → Windows link error until written, which is the clean hand-off boundary).
+
+**8 touch-points** (anchors verified against the branch HEAD):
+
+1. **`oxr_defines.h`** (after `OXR_XR_DEBUG_PLANEDET`, ~:36) — add tag:
+   `#define OXR_XR_DEBUG_LOCAL3DZONE (*(uint64_t *)"oxrl3dz\0")`
+2. **`oxr_objects.h`** — forward-decl `struct oxr_local_3d_zone_mask;` (near :133); define the struct (model on `oxr_plane_detector_ext` @ :3246 — first member `struct oxr_handle_base handle;`, then `struct oxr_session *sess;`, dims, tier state, and an opaque `void *comp_mask;` the compositor owns); add the `oxr_local_3d_zone_mask_to_openxr()` inline (model @ :406, `XRT_CAST_PTR_TO_OXR_HANDLE`).
+3. **`oxr_api_funcs.h`** (after the surround decls, ~:985) — the 7 `XRAPI_ATTR XrResult XRAPI_CALL oxr_xr<Fn>EXT(...)` prototypes.
+4. **`oxr_extension_support.h`** — add the `XR_EXT_local_3d_zone` block (model the `EXT_atlas_capture` block @ :577) **and** the master-list line `OXR_EXTENSION_SUPPORT_EXT_local_3d_zone(_) \` (after `EXT_mcp_tools` @ ~:1092).
+5. **`oxr_api_negotiate.c`** (after the atlas block @ :476) — `#ifdef OXR_HAVE_EXT_local_3d_zone` + `ENTRY_IF_EXT(xr<Fn>EXT, EXT_local_3d_zone);` ×7.
+6. **`comp_d3d11_compositor.h`** (beside `comp_d3d11_compositor_set_surround_2d` @ :108, extern "C") — declare the entry points the handlers forward to:
+   `comp_d3d11_compositor_zone_mask_create / _set_rects / _set_whole / _acquire_rt / _submit / _destroy` (signatures TBD with the consumer wiring).
+7. **`oxr_local_3d_zone.c`** (NEW) — the 7 `oxr_xr*EXT` handlers (`OXR_VERIFY_SESSION_AND_INIT_LOG`; create uses `OXR_ALLOCATE_HANDLE_OR_RETURN(&log, mask, OXR_XR_DEBUG_LOCAL3DZONE, oxr_local_3d_zone_destroy_cb, &sess->handle)`), the destroy_cb (model @ oxr_api_session.c:926), and the D3D11-guarded forwarding (model the surround handler @ oxr_api_session.c:1591 — `#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR` + `sess->is_d3d11_native_compositor` branch, else `XR_ERROR_FEATURE_UNSUPPORTED`). `#include "d3d11/comp_d3d11_compositor.h"` under the guard.
+8. **`CMakeLists.txt`** (the oxr source list, ~:45) — add `oxr_local_3d_zone.c`.
+
+Then `./scripts/build_macos.sh` → fix errors → commit green. Caps query (`xrGetLocal3DZoneCapabilitiesEXT`) reports `supported = TRUE`, `hardwareZoneGridWidth/Height = 0` (compositor-only, no hardware-zone DP yet).
+
+> **Recommendation:** execute this appendix in a **fresh session** — it's a contained, mechanical-but-sizable build-and-verify task, and a clean context budget makes the macOS build-iterate loop crisp. Everything needed is here + in §1–8. The Windows boundary is reached when `build_macos.sh` is green and the D3D11 entry points in (6) are declared-but-unimplemented.
