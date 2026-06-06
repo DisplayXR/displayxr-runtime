@@ -4,9 +4,9 @@
 **Spec:** [`docs/roadmap/unified-2d-3d-compositing.md`](docs/roadmap/unified-2d-3d-compositing.md) §4, §6 (Phase 0). Epic #439.
 **Goal:** stand up the general masked-2D-over-3D composite as a runtime-compiled shader pass, prove it **pixel-identical** to today's rectangular `d3d11_blit_surround_strips`, behind an opt-in toggle. Zero default behavioral change.
 
-**STATUS (drafted, UNBUILT):** shader + full renderer/compositor wiring written on this branch — **Option A (scratch copy) chosen** (§0). Not yet compiled (authored on macOS). Next: the Windows build loop (§6) — `build_windows.bat build` → fix compile errors → A/B capture diff. Default path (env unset) is untouched, so the draft is safe to carry until then.
+**STATUS (BUILT + VALIDATED, 2026-06-05, Leia machine):** compiled clean on Windows first try; §6 A/B capture diff run on Leia hardware — **outside-canvas max diff = 0 across 8,064,000 pixels** (byte-identical, no sRGB tolerance needed: all views UNORM), inside-canvas weave alive under the shader path (66 k pixels differ between two shader-mode captures seconds apart → the discard isn't stomping the 3D region), boundary crisp at exactly the canvas rect. `displayxr-cli selftest` passes; default path (env unset) unchanged. Fixes applied during the Windows pass: format-parity check + strip-identical canvas clamping in `d3d11_composite_surround_shader`, CB-map-failure bail, RTV unbind after the composite draw. Remaining: live-display eyeball in both modes (user), then merge.
 
-> **BUILD NOTE:** D3D11 only compiles on Windows (`scripts\build_windows.bat build`). This worktree is macOS — the shader + this plan are authored here; the `.cpp` wiring + the pixel-diff validation run in a Windows session on the Leia machine. The shader (`shaders/masked_composite.hlsl`) and embedded-source string must stay byte-identical.
+> **CAPTURE NOTE (supersedes the §6 draft below):** `MCP_CAPTURE_MODE_POST_COMPOSE` on the in-process D3D11 compositor reads the renderer **atlas** (`d3d11_compositor_capture_atlas_to_png`), which the surround pass never touches — it cannot validate this A/B. The branch adds a dedicated probe: `DISPLAYXR_SURROUND_CAPTURE=1` + touch `%TEMP%\displayxr_surround_trigger` → dumps the composited DP target (shared texture / back buffer, post-surround) to `%TEMP%\displayxr_surround.png`. The surround pattern in `cube_texture_d3d11_win` is time-animated, so cross-run diffs also need `DXR_SURROUND_FREEZE=1`. Diff only the outside-canvas region (canvas = window/2 centered → (320,180,640×360) at the default 1280×720 window); the inside region is animated weave.
 
 ---
 
@@ -90,10 +90,11 @@ Use `cube_texture_d3d11_win` (a `_texture` app with a canvas sub-rect + surround
 
 ## 7. Done-when
 
-- [ ] Shader embedded + compiles at runtime (no `D3DCompile` warnings).
-- [ ] `DISPLAYXR_SURROUND_SHADER=1` produces a POST_COMPOSE capture pixel-identical to the default (within the documented tolerance).
-- [ ] Default path (env unset) is byte-for-byte unchanged (strip copy) — no regression.
-- [ ] `git clang-format` clean; runtime self-test still passes.
+- [x] Shader embedded + compiles at runtime (no `D3DCompile` warnings).
+- [x] `DISPLAYXR_SURROUND_SHADER=1` produces a surround-target capture pixel-identical to the default (max diff 0 — exceeded the documented ≤1 LSB tolerance; both views UNORM so no sRGB round-trip).
+- [x] Default path (env unset) is byte-for-byte unchanged (strip copy) — no regression. (Only env-gated additions on the default path: the `DISPLAYXR_SURROUND_CAPTURE` probe, off by default.)
+- [x] clang-format clean (changed lines); `displayxr-cli selftest` passes against the Leia plug-in.
+- [ ] Live-display eyeball in both modes (surround crisp 2D, canvas weaved 3D, boundary identical) — needs human eyes on the Leia panel.
 
 ## 8. Hand-off to Phase 1
 

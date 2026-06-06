@@ -132,8 +132,12 @@ The mask, the 2D layer, the weave target, and the physical screen rect must alig
 
 **Non-regression guarantee:** current apps never opt into the mask, so they ride the unchanged paths byte-for-byte. Each phase is independently shippable.
 
-### Phase 0 — Refactor rect-surround into a general masked composite (no API change). *D3D11.*
-Re-express `d3d11_blit_surround_strips` internals as the in-place premultiplied-alpha composite of §4, but keep **deriving the mask from the canvas rect** (inside → keep weave, outside → 2D surround texture). Output must be **pixel-identical** to today's strip blit — validate by diffing atlas/post-compose captures (`MCP_CAPTURE_MODE_POST_COMPOSE`). Pin the §4.2 output-alpha rule and the §5.1 coordinate contract here. Pure refactor, zero behavioral change, zero regression surface.
+### Phase 0 — Refactor rect-surround into a general masked composite (no API change). *D3D11.* ✅ **VALIDATED**
+Re-express `d3d11_blit_surround_strips` internals as the in-place premultiplied-alpha composite of §4, but keep **deriving the mask from the canvas rect** (inside → keep weave, outside → 2D surround texture). Output must be **pixel-identical** to today's strip blit. Pin the §4.2 output-alpha rule and the §5.1 coordinate contract here. Pure refactor, zero behavioral change, zero regression surface.
+
+**Shipped mechanism notes** (see [the Phase 0 impl plan](unified-2d-3d-phase0-impl.md) for the full record):
+- **Option A scratch copy**: the app's surround texture is copy-only (no `BIND_SHADER_RESOURCE` guarantee), so the pass `CopyResource`s it into a runtime-owned SRV-capable scratch each frame — one transient extra copy that evaporates in Phase 3 when the 2D layer is runtime-allocated.
+- **Validation capture**: `MCP_CAPTURE_MODE_POST_COMPOSE` reads the renderer **atlas**, which the surround pass never touches — the A/B diff instead uses the dedicated `DISPLAYXR_SURROUND_CAPTURE` probe, which dumps the composited DP target. Validated on Leia hardware 2026-06-05: outside-canvas max diff **0** across 8.06 M pixels (`DISPLAYXR_SURROUND_SHADER=1` vs strip copy, surround animation frozen via `DXR_SURROUND_FREEZE`).
 
 ### Phase 1 — Add the opt-in alpha mask behind `XR_EXT_local_3d_zone` (Tiers 1–3). *D3D11.*
 Wire the mask object's compositor-consumer leg: when an app supplies a mask, the composite uses it; when it doesn't, fall back to the Phase-0 rect-derived mask. Regression surface = zero (new path only reachable on explicit opt-in). This already unlocks arbitrary 2D/3D regions on `handle` apps (`handle + mask`).

@@ -470,7 +470,7 @@ create_shaders(struct comp_d3d11_renderer *r)
 		return xret;
 	}
 	hr = internals->device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
-	                                            &r->composite_vs);
+	                                           &r->composite_vs);
 	blob->Release();
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create composite vertex shader: 0x%08x", hr);
@@ -484,7 +484,7 @@ create_shaders(struct comp_d3d11_renderer *r)
 		return xret;
 	}
 	hr = internals->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
-	                                           &r->composite_ps);
+	                                          &r->composite_ps);
 	blob->Release();
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create composite pixel shader: 0x%08x", hr);

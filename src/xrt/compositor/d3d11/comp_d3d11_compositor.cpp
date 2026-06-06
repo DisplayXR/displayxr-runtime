@@ -270,15 +270,22 @@ static void d3d11_blit_surround_strips(struct comp_d3d11_compositor *c,
                                         uint32_t cw, uint32_t ch);
 // #439 Phase 0 shader composite path + its dev toggle (defined below, called
 // from the layer-commit paths above the definitions).
-static bool d3d11_composite_surround_shader(struct comp_d3d11_compositor *c,
-                                            ID3D11Texture2D *dst,
-                                            uint32_t dst_w, uint32_t dst_h,
-                                            int32_t cx, int32_t cy,
-                                            uint32_t cw, uint32_t ch);
-static bool d3d11_surround_shader_enabled(void);
-static void d3d11_maybe_capture_surround_target(struct comp_d3d11_compositor *c,
-                                                ID3D11Texture2D *dst,
-                                                uint32_t dst_w, uint32_t dst_h);
+static bool
+d3d11_composite_surround_shader(struct comp_d3d11_compositor *c,
+                                ID3D11Texture2D *dst,
+                                uint32_t dst_w,
+                                uint32_t dst_h,
+                                int32_t cx,
+                                int32_t cy,
+                                uint32_t cw,
+                                uint32_t ch);
+static bool
+d3d11_surround_shader_enabled(void);
+static void
+d3d11_maybe_capture_surround_target(struct comp_d3d11_compositor *c,
+                                    ID3D11Texture2D *dst,
+                                    uint32_t dst_w,
+                                    uint32_t dst_h);
 
 /*
  *
@@ -1591,18 +1598,14 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			bool surround_done = false;
 			if (d3d11_surround_shader_enabled()) {
 				surround_done = d3d11_composite_surround_shader(
-				    c, c->shared_texture, dp_target_w, dp_target_h,
-				    c->canvas.valid ? c->canvas.x : 0,
-				    c->canvas.valid ? c->canvas.y : 0,
-				    c->canvas.valid ? c->canvas.w : dp_target_w,
+				    c, c->shared_texture, dp_target_w, dp_target_h, c->canvas.valid ? c->canvas.x : 0,
+				    c->canvas.valid ? c->canvas.y : 0, c->canvas.valid ? c->canvas.w : dp_target_w,
 				    c->canvas.valid ? c->canvas.h : dp_target_h);
 			}
 			if (!surround_done) {
 				d3d11_blit_surround_strips(
-				    c, c->shared_texture, dp_target_w, dp_target_h,
-				    c->canvas.valid ? c->canvas.x : 0,
-				    c->canvas.valid ? c->canvas.y : 0,
-				    c->canvas.valid ? c->canvas.w : dp_target_w,
+				    c, c->shared_texture, dp_target_w, dp_target_h, c->canvas.valid ? c->canvas.x : 0,
+				    c->canvas.valid ? c->canvas.y : 0, c->canvas.valid ? c->canvas.w : dp_target_w,
 				    c->canvas.valid ? c->canvas.h : dp_target_h);
 			}
 
@@ -1678,19 +1681,15 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		bool surround_done = false;
 		if (d3d11_surround_shader_enabled()) {
 			surround_done = d3d11_composite_surround_shader(
-			    c, back_buffer_for_surround, target_width, target_height,
-			    c->canvas.valid ? c->canvas.x : 0,
-			    c->canvas.valid ? c->canvas.y : 0,
-			    c->canvas.valid ? c->canvas.w : target_width,
+			    c, back_buffer_for_surround, target_width, target_height, c->canvas.valid ? c->canvas.x : 0,
+			    c->canvas.valid ? c->canvas.y : 0, c->canvas.valid ? c->canvas.w : target_width,
 			    c->canvas.valid ? c->canvas.h : target_height);
 		}
 		if (!surround_done) {
-			d3d11_blit_surround_strips(
-			    c, back_buffer_for_surround, target_width, target_height,
-			    c->canvas.valid ? c->canvas.x : 0,
-			    c->canvas.valid ? c->canvas.y : 0,
-			    c->canvas.valid ? c->canvas.w : target_width,
-			    c->canvas.valid ? c->canvas.h : target_height);
+			d3d11_blit_surround_strips(c, back_buffer_for_surround, target_width, target_height,
+			                           c->canvas.valid ? c->canvas.x : 0, c->canvas.valid ? c->canvas.y : 0,
+			                           c->canvas.valid ? c->canvas.w : target_width,
+			                           c->canvas.valid ? c->canvas.h : target_height);
 		}
 
 		// #439 Phase 0 A/B validation probe (no-op unless
@@ -2310,12 +2309,15 @@ d3d11_release_surround(struct comp_d3d11_compositor *c)
 static bool
 d3d11_composite_surround_shader(struct comp_d3d11_compositor *c,
                                 ID3D11Texture2D *dst,
-                                uint32_t dst_w, uint32_t dst_h,
-                                int32_t cx, int32_t cy,
-                                uint32_t cw, uint32_t ch)
+                                uint32_t dst_w,
+                                uint32_t dst_h,
+                                int32_t cx,
+                                int32_t cy,
+                                uint32_t cw,
+                                uint32_t ch)
 {
-	if (!c->surround_2d.valid || c->surround_texture == nullptr || c->surround_mutex == nullptr ||
-	    dst == nullptr || c->renderer == nullptr) {
+	if (!c->surround_2d.valid || c->surround_texture == nullptr || c->surround_mutex == nullptr || dst == nullptr ||
+	    c->renderer == nullptr) {
 		return false;
 	}
 	if (c->surround_2d.w != dst_w || c->surround_2d.h != dst_h) {
@@ -2385,14 +2387,16 @@ d3d11_composite_surround_shader(struct comp_d3d11_compositor *c,
 	// degenerate rects (negative origin, rect spilling past the dst edge).
 	uint32_t cx_u = (cx < 0) ? 0u : (uint32_t)cx;
 	uint32_t cy_u = (cy < 0) ? 0u : (uint32_t)cy;
-	if (cx_u > dst_w) cx_u = dst_w;
-	if (cy_u > dst_h) cy_u = dst_h;
+	if (cx_u > dst_w)
+		cx_u = dst_w;
+	if (cy_u > dst_h)
+		cy_u = dst_h;
 	uint32_t cright = (cx_u + cw > dst_w) ? dst_w : cx_u + cw;
 	uint32_t cbottom = (cy_u + ch > dst_h) ? dst_h : cy_u + ch;
 
-	xrt_result_t xret = comp_d3d11_renderer_composite_2d_masked(
-	    c->renderer, dst, c->surround_scratch_srv, dst_w, dst_h,
-	    (int32_t)cx_u, (int32_t)cy_u, cright - cx_u, cbottom - cy_u);
+	xrt_result_t xret =
+	    comp_d3d11_renderer_composite_2d_masked(c->renderer, dst, c->surround_scratch_srv, dst_w, dst_h,
+	                                            (int32_t)cx_u, (int32_t)cy_u, cright - cx_u, cbottom - cy_u);
 	return xret == XRT_SUCCESS;
 }
 
@@ -2419,7 +2423,8 @@ d3d11_surround_shader_enabled(void)
 static void
 d3d11_maybe_capture_surround_target(struct comp_d3d11_compositor *c,
                                     ID3D11Texture2D *dst,
-                                    uint32_t dst_w, uint32_t dst_h)
+                                    uint32_t dst_w,
+                                    uint32_t dst_h)
 {
 	static int enabled = -1;
 	if (enabled < 0) {
@@ -2444,8 +2449,8 @@ d3d11_maybe_capture_surround_target(struct comp_d3d11_compositor *c,
 	}
 	DeleteFileA(trig);
 	bool ok = d3d11_capture_texture_to_png(c, dst, dst_w, dst_h, 0, 0, outp);
-	U_LOG_W("Surround composite capture %s -> %s (shader=%d)",
-	        ok ? "written" : "FAILED", outp, d3d11_surround_shader_enabled() ? 1 : 0);
+	U_LOG_W("Surround composite capture %s -> %s (shader=%d)", ok ? "written" : "FAILED", outp,
+	        d3d11_surround_shader_enabled() ? 1 : 0);
 }
 
 // Blit non-canvas pixels of the surround texture into the dst texture
