@@ -34,6 +34,8 @@
 #define OXR_XR_DEBUG_XDEVLIST  (*(uint64_t *)"oxrxdli\0")
 // plane detection
 #define OXR_XR_DEBUG_PLANEDET  (*(uint64_t *)"oxrplan\0")
+// local 3D zone mask
+#define OXR_XR_DEBUG_LOCAL3DZONE  (*(uint64_t *)"oxrl3dz\0")
 // clang-format on
 
 /*!

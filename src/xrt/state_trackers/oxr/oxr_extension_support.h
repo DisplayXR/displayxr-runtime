@@ -586,6 +586,18 @@
 
 
 /*
+ * XR_EXT_local_3d_zone
+ */
+#if defined(XR_EXT_local_3d_zone)
+#define OXR_HAVE_EXT_local_3d_zone
+#define OXR_EXTENSION_SUPPORT_EXT_local_3d_zone(_) \
+    _(EXT_local_3d_zone, EXT_LOCAL_3D_ZONE)
+#else
+#define OXR_EXTENSION_SUPPORT_EXT_local_3d_zone(_)
+#endif
+
+
+/*
  * XR_EXT_workspace_file_dialog
  */
 #if defined(XR_EXT_workspace_file_dialog) && defined(XR_USE_PLATFORM_WIN32)
@@ -1087,6 +1099,7 @@
     OXR_EXTENSION_SUPPORT_EXT_display_info(_) \
     OXR_EXTENSION_SUPPORT_EXT_spatial_workspace(_) \
     OXR_EXTENSION_SUPPORT_EXT_atlas_capture(_) \
+    OXR_EXTENSION_SUPPORT_EXT_local_3d_zone(_) \
     OXR_EXTENSION_SUPPORT_EXT_workspace_file_dialog(_) \
     OXR_EXTENSION_SUPPORT_EXT_mcp_tools(_) \
     OXR_EXTENSION_SUPPORT_BD_controller_interaction(_) \

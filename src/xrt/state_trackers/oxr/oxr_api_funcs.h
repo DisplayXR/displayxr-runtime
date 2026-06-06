@@ -997,6 +997,38 @@ oxr_xrSetSharedTextureSurround2DFenceEXT(XrSession session,
                                           uint64_t awaitFenceValue);
 #endif
 
+#ifdef OXR_HAVE_EXT_local_3d_zone
+//! OpenXR API function @ep{xrGetLocal3DZoneCapabilitiesEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetLocal3DZoneCapabilitiesEXT(XrSession session, XrLocal3DZoneCapabilitiesEXT *capabilities);
+
+//! OpenXR API function @ep{xrCreateLocal3DZoneMaskEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrCreateLocal3DZoneMaskEXT(XrSession session,
+                               const XrLocal3DZoneMaskCreateInfoEXT *createInfo,
+                               XrLocal3DZoneMaskEXT *mask);
+
+//! OpenXR API function @ep{xrSetLocal3DZoneWholeWindowEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetLocal3DZoneWholeWindowEXT(XrLocal3DZoneMaskEXT mask, XrBool32 enable3D);
+
+//! OpenXR API function @ep{xrSetLocal3DZoneFromRectsEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetLocal3DZoneFromRectsEXT(XrLocal3DZoneMaskEXT mask, uint32_t rectCount, const XrRect2Di *rects);
+
+//! OpenXR API function @ep{xrAcquireLocal3DZoneRenderTargetEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrAcquireLocal3DZoneRenderTargetEXT(XrLocal3DZoneMaskEXT mask, void *binding);
+
+//! OpenXR API function @ep{xrSubmitLocal3DZoneEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSubmitLocal3DZoneEXT(XrLocal3DZoneMaskEXT mask);
+
+//! OpenXR API function @ep{xrDestroyLocal3DZoneMaskEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrDestroyLocal3DZoneMaskEXT(XrLocal3DZoneMaskEXT mask);
+#endif
+
 /*!
  * @}
  */
