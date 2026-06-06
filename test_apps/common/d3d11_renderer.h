@@ -77,8 +77,10 @@ bool CreateResources(D3D11Renderer& renderer);
 // Clean up D3D11 resources
 void CleanupD3D11(D3D11Renderer& renderer);
 
-// Update scene state (cube rotation, etc.)
-void UpdateScene(D3D11Renderer& renderer, float deltaTime);
+// Update scene state (cube rotation, etc.). spinSpeed is in rad/s — the
+// handle apps pass xr.spinSpeed (agent-settable via the set_spin MCP tool,
+// #457); other callers keep the historical 0.5 default.
+void UpdateScene(D3D11Renderer& renderer, float deltaTime, float spinSpeed = 0.5f);
 
 // Render the scene to a render target view
 // viewMatrix and projMatrix come from OpenXR views (already includes player locomotion

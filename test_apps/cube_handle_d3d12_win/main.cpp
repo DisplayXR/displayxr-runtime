@@ -310,7 +310,8 @@ static void RenderThreadFunc(
             }
         }
 
-        UpdateScene(*renderer, perfStats.deltaTime);
+        // Cube spin speed is agent-settable via cube-d3d12__set_spin (#457)
+        UpdateScene(*renderer, perfStats.deltaTime, xr->spinSpeed);
         PollEvents(*xr);
 
         if (xr->sessionRunning) {

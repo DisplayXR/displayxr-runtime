@@ -29,6 +29,7 @@
 #include <openxr/XR_EXT_display_info.h>
 #include <openxr/XR_EXT_workspace_file_dialog.h>
 #include <openxr/XR_EXT_atlas_capture.h>
+#include <openxr/XR_EXT_mcp_tools.h>
 #include <DirectXMath.h>
 #include <vector>
 #include <string>
@@ -92,6 +93,22 @@ struct XrSessionManager {
     // so the app drops its per-API CaptureAtlasRegion* glue for one call.
     bool hasAtlasCaptureExt = false;
     PFN_xrCaptureAtlasEXT pfnCaptureAtlasEXT = nullptr;
+
+    // XR_EXT_mcp_tools (#457): reference adoption — the app registers its own
+    // agent tools (set_spin/get_status). Each app's xr_session.cpp detects the
+    // extension, resolves these PFNs after xrCreateSession, and declares its
+    // per-app appId (matching the manifest `id`, INV-10.1); the shared
+    // PollEvents answers XrEventDataMCPToolCallEXT. Inert when the extension /
+    // MCP capability is absent.
+    bool hasMcpToolsExt = false;
+    PFN_xrSetMCPAppInfoEXT pfnSetMCPAppInfoEXT = nullptr;
+    PFN_xrRegisterMCPToolEXT pfnRegisterMCPToolEXT = nullptr;
+    PFN_xrGetMCPToolCallArgsEXT pfnGetMCPToolCallArgsEXT = nullptr;
+    PFN_xrSubmitMCPToolResultEXT pfnSubmitMCPToolResultEXT = nullptr;
+
+    //! Cube spin speed in rad/s — historically hardcoded 0.5; now agent-settable
+    //! via the set_spin MCP tool. Apps pass it to their renderer's UpdateScene.
+    float spinSpeed = 0.5f;
 
     // Display info from XR_EXT_display_info (static display properties)
     float recommendedViewScaleX = 1.0f;

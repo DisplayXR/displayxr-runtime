@@ -1218,8 +1218,9 @@ bool CreateSwapchainFramebuffers(VkRenderer& renderer, int eye,
     return true;
 }
 
-void UpdateScene(VkRenderer& renderer, float deltaTime) {
-    renderer.cubeRotation += deltaTime * 0.5f;
+void UpdateScene(VkRenderer& renderer, float deltaTime, float spinSpeed) {
+    // spinSpeed is agent-settable via cube-vk__set_spin (#457)
+    renderer.cubeRotation += deltaTime * spinSpeed;
     if (renderer.cubeRotation > XM_2PI) {
         renderer.cubeRotation -= XM_2PI;
     }

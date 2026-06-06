@@ -47,8 +47,9 @@ bool CreateSwapchainFBOs(GLRenderer& renderer,
     const GLuint* images, uint32_t count,
     uint32_t width, uint32_t height);
 
-// Update scene
-void UpdateScene(GLRenderer& renderer, float deltaTime);
+// Update scene. spinSpeed (rad/s) is agent-settable via the set_spin
+// MCP tool (#457).
+void UpdateScene(GLRenderer& renderer, float deltaTime, float spinSpeed = 0.5f);
 
 // Render to a specific FBO with viewport offset (SBS layout)
 void RenderScene(

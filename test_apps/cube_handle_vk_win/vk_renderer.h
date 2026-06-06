@@ -89,8 +89,9 @@ bool CreateSwapchainFramebuffers(VkRenderer& renderer, int eye,
     const VkImage* images, uint32_t count,
     uint32_t width, uint32_t height, VkFormat colorFormat);
 
-// Update scene
-void UpdateScene(VkRenderer& renderer, float deltaTime);
+// Update scene. spinSpeed (rad/s) is agent-settable via the set_spin
+// MCP tool (#457).
+void UpdateScene(VkRenderer& renderer, float deltaTime, float spinSpeed = 0.5f);
 
 // Per-eye render parameters for single-pass SBS rendering
 struct EyeRenderParams {
