@@ -254,9 +254,18 @@ struct xrt_display_claim
  * `struct_size` header on the DP vtables and turns the loader's version *log*
  * into an enforced *reject*. ABI-v1 plug-ins (≤ leia v1.0.5) are rejected and
  * must rebuild against v2 headers.
+ *
+ * v2 → v3 history (#441): `xrt_rendering_mode` gained `mode_flags`
+ * (bit 0 = XRT_RENDERING_MODE_FLAG_HAS_TRACKING) + `reserved[3]` in its
+ * vendor-provided section. The array is embedded by value in `xrt_device`
+ * (created by the plug-in), so the element-stride change is a layout break.
+ * The flags word + reserved padding exist so future per-mode capabilities are
+ * new bits, not new fields — v3 is intended to be the last rendering-mode
+ * layout break.
  */
 #define XRT_PLUGIN_API_VERSION_1 1
 #define XRT_PLUGIN_API_VERSION_2 2
+#define XRT_PLUGIN_API_VERSION_3 3
 
 /*!
  * The version the runtime / plug-in is built against at compile time.
@@ -264,7 +273,7 @@ struct xrt_display_claim
  * `*out_plugin_api_version` are rejected by the runtime (ADR-020 rule 3) with a
  * logged error, and the loader falls back to the next plug-in / sim_display.
  */
-#define XRT_PLUGIN_API_VERSION_CURRENT XRT_PLUGIN_API_VERSION_2
+#define XRT_PLUGIN_API_VERSION_CURRENT XRT_PLUGIN_API_VERSION_3
 
 /*!
  * The single exported symbol every plug-in DLL must provide. C linkage,
