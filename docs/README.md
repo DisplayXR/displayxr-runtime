@@ -79,7 +79,7 @@ Integrate your 3D display hardware into DisplayXR.
 ### Integrated vendors (`vendors/`)
 
 - **[Vendors index](vendors/README.md)** — list of integrated vendors + how to add a new one
-- [Leia SR](vendors/leia/README.md) — D3D11 / D3D12 / OpenGL / Vulkan, weaver, transparency model
+- [Leia SR](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/docs/README.md) (in [displayxr-leia-plugin](https://github.com/DisplayXR/displayxr-leia-plugin)) — D3D11 / D3D12 / OpenGL / Vulkan, weaver, transparency model
 - [sim_display](vendors/sim_display/README.md) — reference simulation vendor (SBS / anaglyph on a 2D window)
 
 ---

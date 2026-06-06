@@ -853,7 +853,7 @@ The runtime translates `xrRequestDisplayModeEXT` into the appropriate vendor SDK
 display processor's `set_property` method. Vendor implementations vary — a preference-based
 hint aggregated across applications, or direct hardware (backlight/optics) control. For the
 concrete per-platform mapping of the first vendor integration, see
-[Leia display mode switching](../../vendors/leia/display-mode-switching.md).
+[Leia display mode switching](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/docs/display-mode-switching.md).
 
 This abstraction also operates through:
 - `XrDisplayInfoEXT` chaining to `xrGetSystemProperties`.

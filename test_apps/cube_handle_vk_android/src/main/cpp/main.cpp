@@ -650,7 +650,7 @@ destroy_cmd_pool()
 // Record + submit a clear-to-color cmd buffer on the swapchain image
 // for view `view_idx` at swapchain index `image_idx`. Distinct colors
 // per view so a one-eye-covered hardware test can verify left/right
-// (see docs/vendors/leia/cnsdk-android-calibration.md § "Tile-to-eye
+// (see displayxr-leia-plugin docs/cnsdk-android-calibration.md § "Tile-to-eye
 // mapping"). Layout-aware: arrives from xrAcquireSwapchainImage in
 // ─── matrix helpers ──────────────────────────────────────────────────
 //

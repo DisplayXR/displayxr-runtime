@@ -260,7 +260,7 @@ The shell drives the runtime through the OpenXR workspace extensions, so cube-in
 
 ### Optional: link to the vendor list
 
-Add a short `docs/vendors/<your-vendor>.md` to the runtime repo via PR — a one-page summary of your plug-in (link to your repo, supported APIs, eye-tracking mode, installer link). The runtime maintainers will review + merge as a docs-only change.
+Document your implementation internals in your plug-in repo's `docs/`, then add a row to the table in the runtime repo's `docs/vendors/README.md` via PR — vendor name, link to your repo + docs, supported APIs. The runtime maintainers will review + merge as a docs-only change. (Example: [displayxr-leia-plugin/docs/](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/docs/README.md).)
 
 ## Related
 

@@ -70,7 +70,7 @@ the `xrt_plugin_iface` discovery contract.
   [`docs/specs/runtime/plugin-discovery.md`](../specs/runtime/plugin-discovery.md).
 - The first vendor integration (Leia SR) ships from
   [`displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin); its
-  implementation notes live under [`docs/vendors/leia/`](../vendors/leia/README.md).
+  implementation notes live under [`displayxr-leia-plugin/docs/`](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/docs/README.md).
 
 ### Simulation Display (`src/xrt/drivers/sim_display/`)
 
