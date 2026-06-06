@@ -4,13 +4,12 @@
 // workspace_minimal_d3d11_win
 //
 // Minimal validation client for XR_EXT_spatial_workspace (Phase 2.A + 2.C
-// + 2.D + 2.F + 2.I-prequel, spec_version 9) and XR_EXT_app_launcher
-// (Phase 2.B). Creates an instance + session, resolves all 29 extension
-// PFNs, and walks through:
+// + 2.D + 2.F + 2.I-prequel). Creates an instance + session, resolves all
+// 24 extension PFNs, and walks through:
 //   activate -> get-state ->
 //     add capture client ->
 //     set/get/set client window pose + visibility ->
-//     hit-test (center + off-screen) ->
+//     set cursor depth (spec_version 22) ->
 //     set/get focused client (Phase 2.D) ->
 //     enumerate input events (count-query) (Phase 2.D) ->
 //     enable/disable pointer capture (Phase 2.D) ->
@@ -21,7 +20,6 @@
 //     enumerate workspace clients + get client info (Phase 2.I-prequel) ->
 //     capture workspace frame (Phase 2.I-prequel) ->
 //     remove capture client ->
-//     clear / add / set-visible / set-running-mask / poll / hide launcher ->
 //   deactivate.
 //
 // Two valid run paths:
@@ -46,7 +44,6 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_EXT_spatial_workspace.h>
-#include <openxr/XR_EXT_app_launcher.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -99,14 +96,9 @@ run_workspace_test()
 	}
 
 	bool workspace_listed = false;
-	bool launcher_listed = false;
 	for (const auto &p : props) {
 		if (std::strcmp(p.extensionName, XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME) == 0) {
 			workspace_listed = true;
-			std::printf("[enumerate                                ] found %s v%u\n", p.extensionName,
-			            p.extensionVersion);
-		} else if (std::strcmp(p.extensionName, XR_EXT_APP_LAUNCHER_EXTENSION_NAME) == 0) {
-			launcher_listed = true;
 			std::printf("[enumerate                                ] found %s v%u\n", p.extensionName,
 			            p.extensionVersion);
 		}
@@ -115,16 +107,11 @@ run_workspace_test()
 		std::printf("FAIL: runtime did not advertise %s\n", XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME);
 		return XR_ERROR_RUNTIME_FAILURE;
 	}
-	if (!launcher_listed) {
-		std::printf("FAIL: runtime did not advertise %s\n", XR_EXT_APP_LAUNCHER_EXTENSION_NAME);
-		return XR_ERROR_RUNTIME_FAILURE;
-	}
 
-	// 2. Create instance with workspace + launcher extensions and D3D11 binding.
+	// 2. Create instance with the workspace extension and D3D11 binding.
 	const char *enabled_exts[] = {
 	    XR_KHR_D3D11_ENABLE_EXTENSION_NAME,
 	    XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME,
-	    XR_EXT_APP_LAUNCHER_EXTENSION_NAME,
 	};
 	XrInstanceCreateInfo instInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
 	instInfo.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
@@ -143,11 +130,6 @@ run_workspace_test()
 	PFN_xrGetSpatialWorkspaceStateEXT pfnGetState = nullptr;
 	PFN_xrAddWorkspaceCaptureClientEXT pfnAddCapture = nullptr;
 	PFN_xrRemoveWorkspaceCaptureClientEXT pfnRemoveCapture = nullptr;
-	PFN_xrClearLauncherAppsEXT pfnClearLauncher = nullptr;
-	PFN_xrAddLauncherAppEXT pfnAddLauncherApp = nullptr;
-	PFN_xrSetLauncherVisibleEXT pfnSetLauncherVisible = nullptr;
-	PFN_xrPollLauncherClickEXT pfnPollLauncherClick = nullptr;
-	PFN_xrSetLauncherRunningTileMaskEXT pfnSetRunningTileMask = nullptr;
 	PFN_xrSetWorkspaceClientWindowPoseEXT pfnSetClientPose = nullptr;
 	PFN_xrGetWorkspaceClientWindowPoseEXT pfnGetClientPose = nullptr;
 	PFN_xrSetWorkspaceClientVisibilityEXT pfnSetClientVisibility = nullptr;
@@ -181,12 +163,6 @@ run_workspace_test()
 	    {"xrGetSpatialWorkspaceStateEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnGetState)},
 	    {"xrAddWorkspaceCaptureClientEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnAddCapture)},
 	    {"xrRemoveWorkspaceCaptureClientEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnRemoveCapture)},
-	    {"xrClearLauncherAppsEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnClearLauncher)},
-	    {"xrAddLauncherAppEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnAddLauncherApp)},
-	    {"xrSetLauncherVisibleEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetLauncherVisible)},
-	    {"xrPollLauncherClickEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnPollLauncherClick)},
-	    {"xrSetLauncherRunningTileMaskEXT",
-	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetRunningTileMask)},
 	    {"xrSetWorkspaceClientWindowPoseEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetClientPose)},
 	    {"xrGetWorkspaceClientWindowPoseEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnGetClientPose)},
 	    {"xrSetWorkspaceClientVisibilityEXT",
@@ -715,32 +691,6 @@ run_workspace_test()
 	std::printf("[xrRemoveWorkspaceCaptureClientEXT(post-exit)] %s (best-effort; "
 	            "exit above already removed the slot)\n", xr_result_str(rmr));
 
-	// Launcher smoke: clear, push 3 synthetic tiles, set visible, set running
-	// mask, poll once (expect "no click" since no human is interacting),
-	// hide, clear, then proceed to deactivate.
-	CHECK_XR(pfnClearLauncher(session), "xrClearLauncherAppsEXT");
-	for (int i = 0; i < 3; ++i) {
-		XrLauncherAppInfoEXT info = {XR_TYPE_LAUNCHER_APP_INFO_EXT};
-		std::snprintf(info.name, sizeof(info.name), "TestApp%d", i);
-		info.iconPath[0] = '\0'; // No icon — runtime renders a placeholder.
-		info.appIndex = i;
-		CHECK_XR(pfnAddLauncherApp(session, &info), "xrAddLauncherAppEXT");
-	}
-	CHECK_XR(pfnSetLauncherVisible(session, XR_TRUE), "xrSetLauncherVisibleEXT(TRUE)");
-	CHECK_XR(pfnSetRunningTileMask(session, 0x3 /* tiles 0+1 running */),
-	         "xrSetLauncherRunningTileMaskEXT");
-
-	int32_t clicked_index = 0;
-	CHECK_XR(pfnPollLauncherClick(session, &clicked_index), "xrPollLauncherClickEXT");
-	if (clicked_index != XR_LAUNCHER_INVALID_APPINDEX_EXT) {
-		std::printf("INFO: launcher click pending index=%d (unexpected — no human input expected)\n",
-		            (int)clicked_index);
-	} else {
-		std::printf("INFO: launcher poll = no pending click (expected)\n");
-	}
-
-	CHECK_XR(pfnSetLauncherVisible(session, XR_FALSE), "xrSetLauncherVisibleEXT(FALSE)");
-	CHECK_XR(pfnClearLauncher(session), "xrClearLauncherAppsEXT");
 	CHECK_XR(pfnDeactivate(session), "xrDeactivateSpatialWorkspaceEXT");
 
 	xrDestroySession(session);
