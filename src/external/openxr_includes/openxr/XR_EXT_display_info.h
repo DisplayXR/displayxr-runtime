@@ -22,7 +22,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_display_info 1
-#define XR_EXT_display_info_SPEC_VERSION 13
+#define XR_EXT_display_info_SPEC_VERSION 14
 #define XR_EXT_DISPLAY_INFO_EXTENSION_NAME "XR_EXT_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
@@ -325,6 +325,61 @@ typedef struct XrEventDataHardwareDisplayStateChangedEXT {
 } XrEventDataHardwareDisplayStateChangedEXT;
 
 // xrSetSharedTextureOutputRectEXT moved to XR_EXT_win32_window_binding.h / XR_EXT_cocoa_window_binding.h (v12)
+
+// ---- v14: Per-Mode Tracking Capability + Tracking-State Event (#441) ----
+
+#define XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_EXT  ((XrStructureType)1000999012)
+#define XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT ((XrStructureType)1000999013)
+
+/*!
+ * @brief Per-mode tracking capability — chained by the APP to each
+ * XrDisplayRenderingModeInfoEXT element's next before calling
+ * xrEnumerateDisplayRenderingModesEXT.
+ *
+ * hasTracking tells whether the rendering mode consumes live eye tracking
+ * (e.g., a tracked 3D mode or a "2D tracked" mode) or is fully untracked
+ * (e.g., SBS/anaglyph export modes; every sim_display mode). When the ACTIVE
+ * mode has hasTracking == XR_FALSE, XrViewEyeTrackingStateEXT.isTracking is
+ * always XR_FALSE — regardless of tracker state. xrLocateViews still returns
+ * fully populated views in every mode.
+ *
+ * LAYOUT-FREEZE POLICY: XrDisplayRenderingModeInfoEXT is frozen at its v13
+ * layout. The runtime's enumerate fill writes array elements with its own
+ * compiled stride, so appending fields (as v12/v13 did) silently corrupts app
+ * binaries compiled against older headers. All future per-mode fields MUST be
+ * added as chained structs like this one.
+ *
+ * @extends XrDisplayRenderingModeInfoEXT
+ */
+typedef struct XrDisplayRenderingModeTrackingInfoEXT {
+    XrStructureType             type;        //!< Must be XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_EXT
+    void* XR_MAY_ALIAS          next;
+    XrBool32                    hasTracking; //!< Mode consumes live eye tracking
+} XrDisplayRenderingModeTrackingInfoEXT;
+
+/*!
+ * @brief Event fired on every edge of the derived isTracking value.
+ *
+ * The runtime derives isTracking as
+ *   activeMode.hasTracking && dp.is_tracking
+ * and queues this event whenever the value changes — on DP-reported tracking
+ * loss/recovery AND on rendering-mode switches into/out of untracked modes.
+ *
+ * This is the primary tracking-loss notification for MANUAL eye-tracking mode
+ * (detect isTracking == XR_FALSE, run your own transition, request a 2D mode
+ * when ready). It also fires in MANAGED mode, where apps may ignore it.
+ * Edge detection runs in the runtime's xrLocateViews path, so a session that
+ * never locates views receives no events.
+ *
+ * @extends XrEventDataBaseHeader
+ */
+typedef struct XrEventDataEyeTrackingStateChangedEXT {
+    XrStructureType             type;       //!< Must be XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT
+    const void* XR_MAY_ALIAS    next;
+    XrSession                   session;
+    XrBool32                    isTracking; //!< New state
+    XrEyeTrackingModeEXT        activeMode; //!< Session's MANAGED/MANUAL preference at edge time
+} XrEventDataEyeTrackingStateChangedEXT;
 
 #ifdef __cplusplus
 }

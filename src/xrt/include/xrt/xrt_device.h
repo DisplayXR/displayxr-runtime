@@ -242,6 +242,18 @@ struct xrt_binding_profile
 };
 
 /*!
+ * Per-rendering-mode capability bits for @ref xrt_rendering_mode::mode_flags.
+ *
+ * Future per-mode capabilities are new bits here (plus `reserved[]` words),
+ * NOT new struct fields — `xrt_rendering_mode` is embedded by value in
+ * `xrt_device`, so any stride change is a plug-in ABI break (the v2→v3
+ * lesson; see #441 and ADR-020).
+ *
+ * @ingroup xrt_iface
+ */
+#define XRT_RENDERING_MODE_FLAG_HAS_TRACKING (1u << 0) //!< Mode consumes live eye tracking
+
+/*!
  * A named rendering mode exposed by a device.
  *
  * @ingroup xrt_iface
@@ -257,6 +269,8 @@ struct xrt_rendering_mode
 	bool hardware_display_3d;               //!< Whether display hardware is in 3D mode
 	uint32_t tile_columns;                  //!< Tile columns in atlas layout (MUST be set by driver)
 	uint32_t tile_rows;                     //!< Tile rows in atlas layout (MUST be set by driver)
+	uint32_t mode_flags;                    //!< XRT_RENDERING_MODE_FLAG_* bits (zero = untracked; v3, #441)
+	uint32_t reserved[3];                   //!< MUST be zeroed; future capability bits/values, no ABI bump
 
 	// --- Runtime-computed (u_tiling_compute_mode fills these) ---
 	uint32_t view_width_pixels;             //!< Per-view width in pixels

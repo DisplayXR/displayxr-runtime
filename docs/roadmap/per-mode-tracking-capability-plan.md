@@ -45,6 +45,7 @@ typedef struct XrDisplayRenderingModeTrackingInfoEXT {
 typedef struct XrEventDataEyeTrackingStateChangedEXT {
     XrStructureType       type;
     const void* XR_MAY_ALIAS next;
+    XrSession             session;
     XrBool32              isTracking;  //!< New state
     XrEyeTrackingModeEXT  activeMode;  //!< Session's MANAGED/MANUAL preference at edge time
 } XrEventDataEyeTrackingStateChangedEXT;

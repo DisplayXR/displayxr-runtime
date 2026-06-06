@@ -1844,6 +1844,7 @@ that carries the chain; elements without it are filled exactly as in v13.
 typedef struct XrEventDataEyeTrackingStateChangedEXT {
     XrStructureType          type;       // XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT
     const void* XR_MAY_ALIAS next;
+    XrSession                session;
     XrBool32                 isTracking; // new state
     XrEyeTrackingModeEXT     activeMode; // session's MANAGED/MANUAL preference at edge time
 } XrEventDataEyeTrackingStateChangedEXT;
