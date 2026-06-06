@@ -118,9 +118,12 @@ comp_d3d11_compositor_set_surround_2d(struct xrt_compositor *xc,
  * use_rect_mask = 0 path). Each function takes/returns an opaque per-mask
  * pointer owned by the compositor (an R8_UNORM texture + views).
  *
- * NOTE: declared here as the macOS↔Windows hand-off boundary — the
- * implementations are the Windows leg (consumer wiring + Tier-3 RTV) and do
- * not exist yet. Signatures may still be refined with that wiring.
+ * Submission is sticky, last-submit-wins: zone_mask_submit snapshots the
+ * mask and makes it THE active mask until a later submit or its destroy
+ * (destroy reverts the compositor to the rect-surround behavior). The mask
+ * and the 2D layer are window-sized (client-window pixels, #464); the
+ * consumer composites the window region at the top-left anchor of the
+ * worst-case surface and never writes beyond it.
  */
 
 /*!
