@@ -238,6 +238,40 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
                            uint32_t new_target_height);
 
 /*!
+ * Composite a 2D layer over the weaved 3D output, gated by a per-pixel
+ * region mask (unified 2D/3D compositing, #439 Phase 0).
+ *
+ * The weave target (@p dst_texture) already holds the weaved 3D output. This
+ * pass derives a hard mask from the canvas sub-rect: pixels INSIDE the canvas
+ * keep the weave (the pixel shader discards), pixels OUTSIDE are written from
+ * @p twod_srv at 1:1. With a point sampler + opaque output this is
+ * pixel-identical to the rectangular strip-copy surround it generalizes.
+ *
+ * @param renderer The renderer.
+ * @param dst_texture Weave target (ID3D11Texture2D*) — holds the weave; a
+ *        temporary RTV is created on it.
+ * @param twod_srv The 2D layer (ID3D11ShaderResourceView*). Phase 0: an
+ *        SRV-capable scratch copy of the app surround texture.
+ * @param dst_w Destination width in pixels.
+ * @param dst_h Destination height in pixels.
+ * @param cx,cy,cw,ch The 3D canvas sub-rect (pixels) → the Phase 0 mask.
+ *
+ * @return XRT_SUCCESS on success, error code otherwise.
+ *
+ * @ingroup comp_d3d11
+ */
+xrt_result_t
+comp_d3d11_renderer_composite_2d_masked(struct comp_d3d11_renderer *renderer,
+                                        void *dst_texture,
+                                        void *twod_srv,
+                                        uint32_t dst_w,
+                                        uint32_t dst_h,
+                                        int32_t cx,
+                                        int32_t cy,
+                                        uint32_t cw,
+                                        uint32_t ch);
+
+/*!
  * Blit the atlas texture to a back buffer with GPU stretching.
  *
  * Used for mono/2D fallback when the atlas texture is smaller than
