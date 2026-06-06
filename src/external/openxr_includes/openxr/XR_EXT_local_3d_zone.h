@@ -141,7 +141,15 @@ XRAPI_ATTR XrResult XRAPI_CALL xrAcquireLocal3DZoneRenderTargetEXT(
 
 //! Stage the mask's current state for the next frame submission. The mask,
 //! the 2D layer, and the 3D layers are consumed as one coherent xrEndFrame
-//! set (atomic per frame — spec §9 Q3).
+//! set (atomic per frame — spec §9 Q3). The mask stays active across frames
+//! (sticky, last-submit-wins) until re-submit or destroy.
+//!
+//! While a submitted mask is active, the canvas output rect
+//! (xrSetSharedTextureOutputRectEXT) is SUPERSEDED, not an error: the weave
+//! region, view dimensions, and projection metrics span the full client
+//! window, and the mask is the sole 2D/3D region selector over that
+//! window-spanning 3D scene. Destroying the mask restores the rect-derived
+//! behavior on the next frame. (#439 Phase 2.)
 XRAPI_ATTR XrResult XRAPI_CALL xrSubmitLocal3DZoneEXT(
     XrLocal3DZoneMaskEXT mask);
 
