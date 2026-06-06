@@ -1496,9 +1496,15 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				           c->view_width, c->view_height);
 			}
 
-			// Per-eye disparity offset
+			// Per-view disparity, graded across the view sweep (#413):
+			// first view = -half, last = +half. Degenerates to the classic
+			// -/+ pair for 2-view modes; a single view gets no shift.
 			float half_disp = ws->disparity / 2.0f;
-			float eye_shift = (eye == 0) ? -half_disp : half_disp;
+			float eye_shift = 0.0f;
+			if (effective_views > 1) {
+				float t = (float)eye / (float)(effective_views - 1);
+				eye_shift = -half_disp + ws->disparity * t;
+			}
 
 			// Window-space fractional coords → NDC [-1, 1]
 			float ndc_x = (ws->x + eye_shift) * 2.0f - 1.0f;
