@@ -1495,8 +1495,29 @@ oxr_xrEnumerateDisplayRenderingModesEXT(XrSession session,
 	uint32_t active_idx = (head->hmd != NULL) ? head->hmd->active_rendering_mode_index : 0;
 
 	for (uint32_t i = 0; i < count; i++) {
+		// v14 (#441): apps opt into per-element chain processing by
+		// pre-setting type on input (standard OpenXR convention). The
+		// handshake matters: v13-and-earlier binaries leave type/next
+		// uninitialized (the runtime always overwrote them), so the
+		// chain must never be walked without it.
+		bool app_chained = (modes[i].type == XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT);
+		XrDisplayRenderingModeTrackingInfoEXT *tracking = NULL;
+		if (app_chained) {
+			tracking = OXR_GET_OUTPUT_FROM_CHAIN(&modes[i],
+			                                     XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_EXT,
+			                                     XrDisplayRenderingModeTrackingInfoEXT);
+		}
+		if (tracking != NULL) {
+			tracking->hasTracking =
+			    (head->rendering_modes[i].mode_flags & XRT_RENDERING_MODE_FLAG_HAS_TRACKING)
+			        ? XR_TRUE
+			        : XR_FALSE;
+		}
+
 		modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
-		modes[i].next = NULL;
+		if (!app_chained) {
+			modes[i].next = NULL; // v13 behavior for non-opted-in callers.
+		}
 		modes[i].modeIndex = head->rendering_modes[i].mode_index;
 		snprintf(modes[i].modeName, XR_MAX_SYSTEM_NAME_SIZE, "%s",
 		         head->rendering_modes[i].mode_name);

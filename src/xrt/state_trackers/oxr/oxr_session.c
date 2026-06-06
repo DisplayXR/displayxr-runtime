@@ -1738,31 +1738,41 @@ oxr_session_locate_views(struct oxr_logger *log,
 
 #ifdef OXR_HAVE_EXT_display_info
 	if (sess->sys->inst->extensions.EXT_display_info) {
+		// Derived per-frame tracking state (#441):
+		//   isTracking = active_mode.has_tracking && dp.is_tracking
+		// The active rendering mode's capability gates the DP value, so
+		// untracked modes (and trackerless displays — every sim_display
+		// mode) are always FALSE. This replaces the old fallback
+		// heuristic that guessed TRUE for sim_display / IPC sessions.
+		bool mode_has_tracking = false;
+		struct xrt_device *et_head = GET_XDEV_BY_ROLE(sess->sys, head);
+		if (et_head != NULL && et_head->hmd != NULL &&
+		    et_head->hmd->active_rendering_mode_index < et_head->rendering_mode_count) {
+			uint32_t ami = et_head->hmd->active_rendering_mode_index;
+			mode_has_tracking =
+			    (et_head->rendering_modes[ami].mode_flags & XRT_RENDERING_MODE_FLAG_HAS_TRACKING) != 0;
+		}
+		bool is_tracking = mode_has_tracking && got_eye_positions && eye_pos.valid && eye_pos.is_tracking;
+
 		XrViewEyeTrackingStateEXT *ets = OXR_GET_OUTPUT_FROM_CHAIN(
 		    viewState, XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT, XrViewEyeTrackingStateEXT);
 		if (ets) {
 			ets->activeMode = (XrEyeTrackingModeEXT)sess->eye_tracking_mode;
-			if (got_eye_positions && eye_pos.valid) {
-				ets->isTracking = eye_pos.is_tracking ? XR_TRUE : XR_FALSE;
-			} else {
-				// No eye tracking backend or invalid data.
-				// For sim_display (MANUAL_BIT, always "tracking"), eye positions
-				// come from nominal viewer, not the eye tracking path.
-				// Report isTracking based on whether the system has tracking
-				// and the nominal path was used successfully.
-				const struct xrt_system_compositor_info *et_info =
-				    sess->sys->xsysc ? &sess->sys->xsysc->info : NULL;
-				uint32_t supported = et_info ? et_info->supported_eye_tracking_modes : 0;
-				if (supported != 0 && !got_eye_positions) {
-					// System claims tracking support but no eye tracking
-					// backend is active (e.g., sim_display with nominal viewer).
-					// Sim display is always "tracking" its simulated viewer.
-					ets->isTracking = XR_TRUE;
-				} else {
-					ets->isTracking = XR_FALSE;
-				}
-			}
+			ets->isTracking = is_tracking ? XR_TRUE : XR_FALSE;
 		}
+
+		// Edge-triggered XrEventDataEyeTrackingStateChangedEXT (#441) —
+		// fires on DP tracking loss/recovery AND on mode switches
+		// into/out of untracked modes. last_is_tracking == -1 means "no
+		// sample yet": the first locate establishes the baseline
+		// without firing (apps read the initial state from
+		// XrViewEyeTrackingStateEXT).
+		if (sess->last_is_tracking >= 0 && (sess->last_is_tracking != 0) != is_tracking) {
+			oxr_event_push_XrEventDataEyeTrackingStateChanged(
+			    log, sess, is_tracking ? XR_TRUE : XR_FALSE,
+			    (XrEyeTrackingModeEXT)sess->eye_tracking_mode);
+		}
+		sess->last_is_tracking = is_tracking ? 1 : 0;
 	}
 #endif // OXR_HAVE_EXT_display_info
 
@@ -2075,6 +2085,9 @@ oxr_session_allocate_and_init(struct oxr_logger *log,
 	if (sys->xsysc) {
 		sess->eye_tracking_mode = sys->xsysc->info.default_eye_tracking_mode;
 	}
+	// No derived-isTracking sample yet (#441) — first xrLocateViews
+	// establishes the baseline without firing the state-changed event.
+	sess->last_is_tracking = -1;
 #endif
 
 	// Action system hashmaps.

@@ -336,6 +336,13 @@ typedef struct XrEventDataHardwareDisplayStateChangedEXT {
  * XrDisplayRenderingModeInfoEXT element's next before calling
  * xrEnumerateDisplayRenderingModesEXT.
  *
+ * OPT-IN HANDSHAKE: to use the chain, the app MUST pre-set each array
+ * element's type to XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT (standard OpenXR
+ * input convention) and set next to this struct (or a chain containing it).
+ * The runtime only walks elements carrying that type — v13-and-earlier
+ * binaries leave type/next uninitialized, and the runtime keeps overwriting
+ * next with NULL for them, exactly as before.
+ *
  * hasTracking tells whether the rendering mode consumes live eye tracking
  * (e.g., a tracked 3D mode or a "2D tracked" mode) or is fully untracked
  * (e.g., SBS/anaglyph export modes; every sim_display mode). When the ACTIVE

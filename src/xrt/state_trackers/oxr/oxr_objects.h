@@ -1149,6 +1149,12 @@ oxr_event_push_XrEventDataHardwareDisplayStateChanged(struct oxr_logger *log,
                                                        struct oxr_session *sess,
                                                        XrBool32 hardwareDisplay3D);
 
+XrResult
+oxr_event_push_XrEventDataEyeTrackingStateChanged(struct oxr_logger *log,
+                                                  struct oxr_session *sess,
+                                                  XrBool32 isTracking,
+                                                  XrEyeTrackingModeEXT activeMode);
+
 #ifdef OXR_HAVE_EXT_workspace_file_dialog
 /*!
  * Push an `XrEventDataFilePickerCompleteEXT` onto the instance event queue.
@@ -2050,6 +2056,11 @@ struct oxr_session
 
 	//! Active eye tracking mode (0=MANAGED, 1=MANUAL). Default: 0 (MANAGED).
 	uint32_t eye_tracking_mode;
+
+	//! Last derived isTracking value (#441): -1 = no sample yet, else 0/1.
+	//! Edge detection in the xrLocateViews path pushes
+	//! XrEventDataEyeTrackingStateChangedEXT on change.
+	int32_t last_is_tracking;
 
 	//! Cached rendering mode index for detecting compositor-driven mode changes.
 	uint32_t last_rendering_mode_index;

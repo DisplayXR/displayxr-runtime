@@ -144,6 +144,10 @@ is_session_link_to_event(struct oxr_event *event, XrSession session)
 		XrEventDataHardwareDisplayStateChangedEXT *changed = (XrEventDataHardwareDisplayStateChangedEXT *)type;
 		return changed->session == session;
 	}
+	case XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT: {
+		XrEventDataEyeTrackingStateChangedEXT *changed = (XrEventDataEyeTrackingStateChangedEXT *)type;
+		return changed->session == session;
+	}
 #ifdef OXR_HAVE_EXT_workspace_file_dialog
 	case XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_EXT: {
 		XrEventDataFilePickerCompleteEXT *complete = (XrEventDataFilePickerCompleteEXT *)type;
@@ -403,6 +407,35 @@ oxr_event_push_XrEventDataRenderingModeChanged(struct oxr_logger *log,
 	event->result = XR_SUCCESS;
 
 	U_LOG_I("OXR EVENT: Rendering mode changed %u -> %u", previousModeIndex, currentModeIndex);
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+
+XrResult
+oxr_event_push_XrEventDataEyeTrackingStateChanged(struct oxr_logger *log,
+                                                  struct oxr_session *sess,
+                                                  XrBool32 isTracking,
+                                                  XrEyeTrackingModeEXT activeMode)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataEyeTrackingStateChangedEXT *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+
+	changed->type = XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT;
+	changed->next = NULL;
+	changed->session = oxr_session_to_openxr(sess);
+	changed->isTracking = isTracking;
+	changed->activeMode = activeMode;
+	event->result = XR_SUCCESS;
+
+	// One-off lifecycle edge, not per-frame — WARN is the visible tier (#441).
+	U_LOG_W("OXR EVENT: Eye tracking state changed: isTracking=%d mode=%d", isTracking, (int)activeMode);
 
 	lock(inst);
 	push(inst, event);

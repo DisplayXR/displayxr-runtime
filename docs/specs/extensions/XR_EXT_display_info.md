@@ -1812,8 +1812,12 @@ typedef struct XrDisplayRenderingModeTrackingInfoEXT {
 
 The application chains one instance to the `next` pointer of **each**
 `XrDisplayRenderingModeInfoEXT` element it wants the capability for, before calling
-`xrEnumerateDisplayRenderingModesEXT`. The runtime fills `hasTracking` for every element
-that carries the chain; elements without it are filled exactly as in v13.
+`xrEnumerateDisplayRenderingModesEXT`, **and pre-sets each element's `type` to
+`XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT`** (standard OpenXR input convention). The
+type value is the opt-in handshake: v13-and-earlier binaries leave `type`/`next`
+uninitialized (the runtime always overwrote them), so the runtime only walks the chain of
+elements carrying the correct input type — and keeps nulling `next` for everyone else,
+exactly as in v13. The runtime fills `hasTracking` for every chained element.
 
 > **Why a chained struct, not a field append — layout-freeze policy.** The runtime's
 > enumerate fill writes array elements with its own compiled struct stride. Appending
