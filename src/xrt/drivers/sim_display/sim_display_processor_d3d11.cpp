@@ -26,6 +26,7 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 
+#include <cstdio> // sscanf — SIM_DISPLAY_ZONE_GRID parsing (#224)
 #include <cstdlib>
 #include <cstring>
 
@@ -176,6 +177,23 @@ struct sim_display_processor_d3d11_impl
 	//! ADR-021: encoding the runtime declared for the next process_atlas (set via
 	//! set_atlas_encoding). calloc-zeroed ⟹ XRT_ATLAS_ENCODING_ENCODED (Model A).
 	enum xrt_atlas_encoding atlas_encoding;
+
+	//! #224 local-zone test double: simulated hardware zone grid (from
+	//! SIM_DISPLAY_ZONE_GRID="WxH", default 1x1 = global on/off).
+	uint32_t zone_grid_w;
+	uint32_t zone_grid_h;
+	//! Last published screen rect + mask dims, for change-gated logging.
+	int32_t zone_last_x, zone_last_y;
+	uint32_t zone_last_w, zone_last_h;
+	uint32_t zone_last_mask_w, zone_last_mask_h;
+	uint64_t zone_last_seq;
+	bool zone_active; //!< A client mask is currently published (not cleared).
+	//! SIM_DISPLAY_ZONE_DUMP=1: CPU OR-downsample readback of each published
+	//! mask into the zone grid (change-gated log). Staging tex lazily sized.
+	bool zone_dump;
+	ID3D11Texture2D *zone_staging;
+	uint32_t zone_staging_w, zone_staging_h;
+	char zone_last_map[257]; //!< Last logged cell map ('0'/'1' row-major).
 };
 
 static inline struct sim_display_processor_d3d11_impl *
@@ -337,6 +355,9 @@ sim_dp_d3d11_destroy(struct xrt_display_processor_d3d11 *xdp)
 	if (sdp->tile_cb != nullptr) {
 		sdp->tile_cb->Release();
 	}
+	if (sdp->zone_staging != nullptr) {
+		sdp->zone_staging->Release();
+	}
 
 	free(sdp);
 }
@@ -411,6 +432,172 @@ sim_dp_d3d11_set_atlas_encoding(struct xrt_display_processor_d3d11 *xdp, enum xr
 
 /*
  *
+ * #224 local 2D/3D zones — in-repo test double for the hardware-DP leg.
+ *
+ * sim_display has no switchable lens, so "hardware zone state" here is a
+ * change-gated log line: enough for a hardware-free end-to-end check that the
+ * runtime publishes the right mask at the right screen anchor (CI-greppable),
+ * without faking panel behavior. SIM_DISPLAY_ZONE_GRID="WxH" picks the
+ * simulated cell grid (default 1x1, today's global on/off shape);
+ * SIM_DISPLAY_ZONE_DUMP=1 additionally reads the published mask back and logs
+ * the OR-downsampled per-cell map whenever it changes.
+ *
+ */
+
+static bool
+sim_dp_d3d11_get_local_zone_caps(struct xrt_display_processor_d3d11 *xdp, struct xrt_dp_local_zone_caps *out_caps)
+{
+	struct sim_display_processor_d3d11_impl *sdp = sim_dp_d3d11(xdp);
+	if (out_caps == nullptr || out_caps->struct_size < sizeof(struct xrt_dp_local_zone_caps)) {
+		// v1 is the minimum shape; a smaller caller struct would mean a
+		// runtime older than this header — impossible in-tree.
+		return false;
+	}
+	out_caps->supported = 1;
+	out_caps->zone_grid_width = sdp->zone_grid_w;
+	out_caps->zone_grid_height = sdp->zone_grid_h;
+	out_caps->max_mask_width = 16384;
+	out_caps->max_mask_height = 16384;
+	out_caps->max_update_hz = 0; // unlimited — it's a log line.
+	return true;
+}
+
+static bool
+sim_dp_d3d11_publish_local_zone_mask(struct xrt_display_processor_d3d11 *xdp,
+                                     void *d3d11_context,
+                                     void *mask_srv,
+                                     uint32_t mask_width,
+                                     uint32_t mask_height,
+                                     int32_t screen_x,
+                                     int32_t screen_y,
+                                     uint32_t screen_w,
+                                     uint32_t screen_h,
+                                     uint64_t seq)
+{
+	struct sim_display_processor_d3d11_impl *sdp = sim_dp_d3d11(xdp);
+	ID3D11DeviceContext *ctx = static_cast<ID3D11DeviceContext *>(d3d11_context);
+	ID3D11ShaderResourceView *srv = static_cast<ID3D11ShaderResourceView *>(mask_srv);
+	if (ctx == nullptr || srv == nullptr || mask_width == 0 || mask_height == 0) {
+		return false;
+	}
+
+	// Change-gated geometry log (seq ticks every frame — not a change).
+	bool geo_changed = !sdp->zone_active || screen_x != sdp->zone_last_x || screen_y != sdp->zone_last_y ||
+	                   screen_w != sdp->zone_last_w || screen_h != sdp->zone_last_h ||
+	                   mask_width != sdp->zone_last_mask_w || mask_height != sdp->zone_last_mask_h;
+	if (geo_changed) {
+		U_LOG_W("SIM ZONE PUBLISH: mask=%ux%u screen=(%d,%d %ux%u) grid=%ux%u seq=%llu", mask_width,
+		        mask_height, screen_x, screen_y, screen_w, screen_h, sdp->zone_grid_w, sdp->zone_grid_h,
+		        (unsigned long long)seq);
+	}
+	sdp->zone_active = true;
+	sdp->zone_last_x = screen_x;
+	sdp->zone_last_y = screen_y;
+	sdp->zone_last_w = screen_w;
+	sdp->zone_last_h = screen_h;
+	sdp->zone_last_mask_w = mask_width;
+	sdp->zone_last_mask_h = mask_height;
+	sdp->zone_last_seq = seq;
+
+	// Optional content readback: OR-downsample the mask into the cell grid
+	// (any non-zero pixel in a cell ⟹ cell is 3D — the arbitration rule from
+	// docs/roadmap/local-3d-zones.md) and log the map when it changes.
+	uint32_t cells = sdp->zone_grid_w * sdp->zone_grid_h;
+	if (!sdp->zone_dump || cells == 0 || cells > 256) {
+		return true;
+	}
+
+	ID3D11Resource *res = nullptr;
+	srv->GetResource(&res);
+	if (res == nullptr) {
+		return true;
+	}
+	ID3D11Device *device = nullptr;
+	ctx->GetDevice(&device);
+	if (device == nullptr) {
+		res->Release();
+		return true;
+	}
+	if (sdp->zone_staging == nullptr || sdp->zone_staging_w != mask_width || sdp->zone_staging_h != mask_height) {
+		if (sdp->zone_staging != nullptr) {
+			sdp->zone_staging->Release();
+			sdp->zone_staging = nullptr;
+		}
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = mask_width;
+		td.Height = mask_height;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R8_UNORM; // the XR_EXT_local_3d_zone mask format
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_STAGING;
+		td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		if (FAILED(device->CreateTexture2D(&td, nullptr, &sdp->zone_staging))) {
+			sdp->zone_staging = nullptr;
+		}
+		sdp->zone_staging_w = mask_width;
+		sdp->zone_staging_h = mask_height;
+	}
+	device->Release();
+	if (sdp->zone_staging == nullptr) {
+		res->Release();
+		return true;
+	}
+
+	ctx->CopyResource(sdp->zone_staging, res);
+	res->Release();
+
+	D3D11_MAPPED_SUBRESOURCE mapped = {};
+	if (FAILED(ctx->Map(sdp->zone_staging, 0, D3D11_MAP_READ, 0, &mapped))) {
+		return true;
+	}
+	char map[257];
+	for (uint32_t cy = 0; cy < sdp->zone_grid_h; cy++) {
+		uint32_t y0 = (cy * mask_height) / sdp->zone_grid_h;
+		uint32_t y1 = ((cy + 1) * mask_height) / sdp->zone_grid_h;
+		for (uint32_t cx = 0; cx < sdp->zone_grid_w; cx++) {
+			uint32_t x0 = (cx * mask_width) / sdp->zone_grid_w;
+			uint32_t x1 = ((cx + 1) * mask_width) / sdp->zone_grid_w;
+			char bit = '0';
+			for (uint32_t y = y0; y < y1 && bit == '0'; y++) {
+				const uint8_t *row = static_cast<const uint8_t *>(mapped.pData) + (size_t)y * mapped.RowPitch;
+				for (uint32_t x = x0; x < x1; x++) {
+					if (row[x] != 0) {
+						bit = '1';
+						break;
+					}
+				}
+			}
+			map[cy * sdp->zone_grid_w + cx] = bit;
+		}
+	}
+	map[cells] = '\0';
+	ctx->Unmap(sdp->zone_staging, 0);
+
+	if (strcmp(map, sdp->zone_last_map) != 0) {
+		U_LOG_W("SIM ZONE CELLS [%ux%u]: %s (seq=%llu)", sdp->zone_grid_w, sdp->zone_grid_h, map,
+		        (unsigned long long)seq);
+		memcpy(sdp->zone_last_map, map, sizeof(map));
+	}
+	return true;
+}
+
+static bool
+sim_dp_d3d11_clear_local_zone_mask(struct xrt_display_processor_d3d11 *xdp)
+{
+	struct sim_display_processor_d3d11_impl *sdp = sim_dp_d3d11(xdp);
+	if (sdp->zone_active) {
+		U_LOG_W("SIM ZONE CLEAR: client contribution withdrawn (last seq=%llu)",
+		        (unsigned long long)sdp->zone_last_seq);
+	}
+	sdp->zone_active = false;
+	sdp->zone_last_map[0] = '\0';
+	return true;
+}
+
+
+/*
+ *
  * Exported creation function.
  *
  */
@@ -444,6 +631,27 @@ sim_display_processor_d3d11_create(enum sim_display_output_mode mode,
 	sdp->base.set_chroma_key = sim_dp_d3d11_set_chroma_key;
 	sdp->base.get_handoff_color_capability = sim_dp_d3d11_get_handoff_color_capability;
 	sdp->base.set_atlas_encoding = sim_dp_d3d11_set_atlas_encoding;
+	sdp->base.get_local_zone_caps = sim_dp_d3d11_get_local_zone_caps;
+	sdp->base.publish_local_zone_mask = sim_dp_d3d11_publish_local_zone_mask;
+	sdp->base.clear_local_zone_mask = sim_dp_d3d11_clear_local_zone_mask;
+
+	// #224 local-zone test double config (see the zone section above).
+	sdp->zone_grid_w = 1;
+	sdp->zone_grid_h = 1;
+	const char *zone_grid_env = getenv("SIM_DISPLAY_ZONE_GRID");
+	if (zone_grid_env != nullptr && zone_grid_env[0] != '\0') {
+		unsigned gw = 0;
+		unsigned gh = 0;
+		if (sscanf(zone_grid_env, "%ux%u", &gw, &gh) == 2 && gw >= 1 && gh >= 1 && gw <= 256 && gh <= 256) {
+			sdp->zone_grid_w = gw;
+			sdp->zone_grid_h = gh;
+		} else {
+			U_LOG_W("sim_display D3D11: bad SIM_DISPLAY_ZONE_GRID '%s' (want WxH, 1..256) — using 1x1",
+			        zone_grid_env);
+		}
+	}
+	const char *zone_dump_env = getenv("SIM_DISPLAY_ZONE_DUMP");
+	sdp->zone_dump = (zone_dump_env != nullptr && zone_dump_env[0] != '\0' && zone_dump_env[0] != '0');
 
 	// Nominal viewer parameters (same defaults as sim_display_hmd_create)
 	sdp->ipd_m = 0.06f;
