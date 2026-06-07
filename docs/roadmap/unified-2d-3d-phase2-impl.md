@@ -104,4 +104,4 @@ Reuse the Phase-1 harness (`cube_texture_d3d11_win` 'Z' cycle + `DISPLAYXR_SURRO
 - [x] Tier-2 island beyond the old canvas shows real weave (capture: island region 100% changed vs noise-level on Phase 1; interlace eyeballed good on-glass). Re-baselined golden: Tier-2 single rect now crops a window-spanning weave (82% changed inside the rect vs the Phase-0/1 canvas-fit output) — intended end-state semantics per §2.
 - [x] Mask destroy restores output-rect behavior (capture matches pre-mask frame within noise; geometry snap-back logged).
 - [x] Comment fixes (:144) + extension-header note (output rect superseded while a mask is active).
-- [ ] Epic #439 Phase-2 checkbox ticked; this doc's STATUS updated.
+- [x] Epic #439 Phase-2 checkbox ticked (PR #471 merged as `b67f9f6f1`); this doc's STATUS updated.
