@@ -181,7 +181,8 @@ if(XRT_BUILD_DRIVER_QWERTY AND TARGET drv_qwerty)
 endif()
 
 
-# 3D geometry math now lives in aux_math (m_display3d_view, m_camera3d_view)
+# 3D rig math comes from displayxr-common's shared core via aux_math
+# (displayxr::math_xrt — see src/xrt/auxiliary/math/CMakeLists.txt, #396 W7)
 
 if(WIN32 AND XRT_HAVE_OPENGL)
 	target_sources(st_oxr PRIVATE oxr_session_gfx_gl_win32.c)

@@ -35,7 +35,6 @@
 
 #include "math/m_api.h"
 #include "math/m_vec3.h"
-#include "math/m_display3d_view.h"
 
 #include "d3d/d3d_d3d11_fence.hpp"
 #include "d3d/d3d_dxgi_formats.h"

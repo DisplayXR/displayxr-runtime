@@ -3,16 +3,34 @@
 
 xrt_optimized_math_flags()
 
+# #396 W7: the Kooima rig math (formerly the hand-synced m_display3d_view /
+# m_camera3d_view / m_multiview ports) comes from displayxr-common's
+# type-neutral core via the xrt-typed FOV-only wrapper displayxr::math_xrt.
+# DISPLAYXR_BUILD_MATH_OPENXR=OFF keeps the fetch OpenXR-free (no OpenXR-SDK
+# headers, no displayxr-extensions fetch) — the runtime provides only its own
+# xrt headers via DISPLAYXR_XRT_INCLUDE_DIR. Because apps/engines link the
+# same core through the OpenXR-typed wrapper, runtime render-ready views and
+# app-from-raw views are the same function by construction (XR_EXT_view_rig
+# equivalence guarantee, docs/roadmap/raw-vs-render-ready-views.md).
+include(FetchContent)
+set(DISPLAYXR_BUILD_MATH_OPENXR OFF CACHE BOOL "" FORCE)
+set(DISPLAYXR_COMMON_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+get_filename_component(_dxr_xrt_includes "${CMAKE_CURRENT_SOURCE_DIR}/../../include" ABSOLUTE)
+set(DISPLAYXR_XRT_INCLUDE_DIR "${_dxr_xrt_includes}" CACHE PATH "" FORCE)
+FetchContent_Declare(
+	displayxr_common
+	GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
+	GIT_TAG v0.4.0
+	GIT_SHALLOW TRUE
+	)
+FetchContent_MakeAvailable(displayxr_common)
+
 add_library(
 	aux_math STATIC
 	m_api.h
 	m_base.cpp
-	m_camera3d_view.c
-	m_camera3d_view.h
 	m_clock_tracking.c
 	m_clock_tracking.h
-	m_display3d_view.c
-	m_display3d_view.h
 	m_documentation.hpp
 	m_eigen_interop.hpp
 	m_filter_fifo.c
@@ -45,14 +63,12 @@ add_library(
 	m_relation_history.h
 	m_space.cpp
 	m_space.h
-	m_multiview.c
-	m_multiview.h
 	m_vec2.h
 	m_vec3.h
 	)
 target_link_libraries(
 	aux_math
-	PUBLIC aux-includes aux_util Eigen3::Eigen
+	PUBLIC aux-includes aux_util Eigen3::Eigen displayxr::math_xrt
 	PRIVATE xrt-optimized-math
 	)
 

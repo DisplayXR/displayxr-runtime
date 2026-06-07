@@ -38,8 +38,11 @@
 #include "math/m_mathinclude.h"
 #include "math/m_space.h"
 
-#include "math/m_display3d_view.h"
-#include "math/m_camera3d_view.h"
+// Shared Kooima rig math (#396 W7): the xrt-typed FOV-only wrapper over
+// displayxr-common's type-neutral core — the same core every app/engine
+// consumer links through the OpenXR-typed wrapper, so runtime render-ready
+// views ≡ app-from-raw views by construction (XR_EXT_view_rig guarantee).
+#include "displayxr_math_xrt.h"
 
 #include "oxr_objects.h"
 #include "oxr_mcp_tools.h"
@@ -1554,40 +1557,39 @@ oxr_session_locate_views(struct oxr_logger *log,
 						raw_eyes[ei] = delta;
 					}
 				}
-				Display3DScreen scr = {screen_width_m, screen_height_m};
+				dxr_screen scr = {screen_width_m, screen_height_m};
 				struct xrt_pose display_pose = {
 				    {world_head_ori.x, world_head_ori.y, world_head_ori.z, world_head_ori.w},
 				    {world_head_pos.x, world_head_pos.y, world_head_pos.z}};
 
-				// Camera-centric path: canonical camera3d_compute_views.
+				// Camera-centric path: canonical camera3d math (shared core).
 				// A chained XrCameraRigEXT (#396 W7) takes it regardless of
 				// has_external_window — the explicit rig descriptor is the
 				// knowledge the external-window forcing substituted for.
 				if (rig_camera ||
 				    (have_view_state && view_state.camera_mode &&
 				     !sess->has_external_window)) {
-					Camera3DTunables ct;
+					dxr_camera3d_tunables ct;
 					if (rig_camera) {
-						ct = (Camera3DTunables){
+						ct = (dxr_camera3d_tunables){
 						    .ipd_factor = sess->view_rig.ipd_factor,
 						    .parallax_factor = sess->view_rig.parallax_factor,
 						    .inv_convergence_distance = sess->view_rig.inv_convergence_distance,
 						    .half_tan_vfov = sess->view_rig.half_tan_vfov,
 						};
 					} else {
-						ct = (Camera3DTunables){
+						ct = (dxr_camera3d_tunables){
 						    .ipd_factor = view_state.cam_spread_factor,
 						    .parallax_factor = view_state.cam_parallax_factor,
 						    .inv_convergence_distance = view_state.cam_convergence,
 						    .half_tan_vfov = view_state.cam_half_tan_vfov,
 						};
 					}
-					Camera3DView cam_views[XRT_MAX_VIEWS];
-					camera3d_compute_views(raw_eyes, eye_count, &nominal, &scr, &ct,
-					                       &display_pose, 0.01f, 100.0f,
-					                       cam_views);
+					struct dxr_xrt_view cam_views[XRT_MAX_VIEWS];
+					dxr_xrt_camera3d_compute_views(raw_eyes, eye_count, &nominal, &scr, &ct,
+					                               &display_pose, cam_views);
 
-					// Extract {fov, eye_world} — runtime doesn't need matrices
+					// Extract {fov, eye_world} — FOV-only wrapper, no matrices
 					for (uint32_t ei = 0; ei < eye_count; ei++) {
 						fovs[ei] = cam_views[ei].fov;
 						view_eye_world[ei] = cam_views[ei].eye_world;
@@ -1595,8 +1597,8 @@ oxr_session_locate_views(struct oxr_logger *log,
 					have_kooima_fov = true;
 					have_eye_override = true;
 				} else {
-					// Display-centric (Kooima) path: canonical display3d_compute_views
-					Display3DTunables dt = display3d_default_tunables();
+					// Display-centric (Kooima) path: canonical display3d math (shared core)
+					dxr_display3d_tunables dt = dxr_display3d_default_tunables();
 					if (rig_display) {
 						// Chained XrDisplayRigEXT (#396 W7) — lifts the
 						// identity-m2v forcing for external windows too.
@@ -1613,12 +1615,11 @@ oxr_session_locate_views(struct oxr_logger *log,
 						dt.virtual_display_height = screen_height_m; // identity m2v
 					}
 
-					Display3DView disp_views[XRT_MAX_VIEWS];
-					display3d_compute_views(raw_eyes, eye_count, &nominal, &scr, &dt,
-					                        &display_pose, 0.01f, 100.0f,
-					                        disp_views);
+					struct dxr_xrt_view disp_views[XRT_MAX_VIEWS];
+					dxr_xrt_display3d_compute_views(raw_eyes, eye_count, &nominal, &scr,
+					                                &dt, &display_pose, disp_views);
 
-					// Extract {fov, eye_world} — runtime doesn't need matrices
+					// Extract {fov, eye_world} — FOV-only wrapper, no matrices
 					for (uint32_t ei = 0; ei < eye_count; ei++) {
 						fovs[ei] = disp_views[ei].fov;
 					}
