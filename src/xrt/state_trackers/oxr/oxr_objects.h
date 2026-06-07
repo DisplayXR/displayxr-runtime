@@ -1169,6 +1169,22 @@ oxr_event_push_XrEventDataEyeTrackingStateChanged(struct oxr_logger *log,
                                                   XrBool32 isTracking,
                                                   XrEyeTrackingModeEXT activeMode);
 
+#ifdef OXR_HAVE_EXT_local_3d_zone
+/*!
+ * Push an `XrEventDataLocal3DZoneViewSizeChangedEXT` onto the instance event
+ * queue (#439 Phase 3 Q4). Fired from the frame-end poll when the
+ * compositor's recommended per-view render size changes (mask activation /
+ * deactivation / window resize); the app should recreate its projection
+ * swapchains at the new size. Purely advisory — a laggy app stays correct,
+ * just soft.
+ */
+XrResult
+oxr_event_push_XrEventDataLocal3DZoneViewSizeChanged(struct oxr_logger *log,
+                                                     struct oxr_session *sess,
+                                                     uint32_t recommendedImageRectWidth,
+                                                     uint32_t recommendedImageRectHeight);
+#endif // OXR_HAVE_EXT_local_3d_zone
+
 #ifdef OXR_HAVE_EXT_workspace_file_dialog
 /*!
  * Push an `XrEventDataFilePickerCompleteEXT` onto the instance event queue.
@@ -2151,6 +2167,12 @@ struct oxr_session
 
 	//! Cached rendering mode index for detecting compositor-driven mode changes.
 	uint32_t last_rendering_mode_index;
+
+	//! Last recommended per-view render size polled at frame end (#439
+	//! Phase 3 Q4): 0 = no sample yet (baseline set without firing), else
+	//! edge detection pushes XrEventDataLocal3DZoneViewSizeChangedEXT.
+	uint32_t last_local2d_view_w;
+	uint32_t last_local2d_view_h;
 
 	//! True if XR_EXT_win32_appcontainer_compatible was enabled (Chrome WebXR).
 	//! Used to delay session state transitions for AppContainer sandbox compatibility.
