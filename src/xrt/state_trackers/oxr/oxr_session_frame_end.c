@@ -36,6 +36,10 @@
 
 #include <openxr/XR_EXT_win32_window_binding.h>
 
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+#include "metal/comp_metal_compositor.h"
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -2113,6 +2117,36 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 
 	xret = xrt_comp_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
 	OXR_CHECK_XRET(log, sess, xret, xrt_comp_layer_commit);
+
+#ifdef OXR_HAVE_EXT_local_3d_zone
+	// #439 Phase 3 Q4 — view-size renegotiation poll. The just-committed
+	// frame resolved the compositor's recommended per-view render size
+	// (mask activation/deactivation supersedes the canvas; window resize
+	// changes the window). Baseline on the first sample without firing,
+	// push XrEventDataLocal3DZoneViewSizeChangedEXT on subsequent change
+	// (#441 edge-detection pattern; the event is advisory). Per-compositor
+	// getter dispatch — the D3D11/VK/GL consumer legs add their branches
+	// beside the Metal one.
+	if (sess->sys->inst->extensions.EXT_local_3d_zone && sess->xcn != NULL) {
+		uint32_t view_w = 0;
+		uint32_t view_h = 0;
+		bool have_dims = false;
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+		if (sess->is_metal_native_compositor) {
+			have_dims =
+			    comp_metal_compositor_get_recommended_view_size(&sess->xcn->base, &view_w, &view_h);
+		}
+#endif
+		if (have_dims && view_w > 0 && view_h > 0) {
+			if (sess->last_local2d_view_w != 0 &&
+			    (sess->last_local2d_view_w != view_w || sess->last_local2d_view_h != view_h)) {
+				oxr_event_push_XrEventDataLocal3DZoneViewSizeChanged(log, sess, view_w, view_h);
+			}
+			sess->last_local2d_view_w = view_w;
+			sess->last_local2d_view_h = view_h;
+		}
+	}
+#endif // OXR_HAVE_EXT_local_3d_zone
 
 	sess->frame_id.begun = -1;
 	sess->frame_started = false;

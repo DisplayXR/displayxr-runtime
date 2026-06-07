@@ -195,6 +195,7 @@ typedef struct XrCompositionLayerLocal2DEXT {
 typedef struct XrEventDataLocal3DZoneViewSizeChangedEXT {
     XrStructureType          type;   //!< XR_TYPE_EVENT_DATA_LOCAL_3D_ZONE_VIEW_SIZE_CHANGED_EXT
     const void* XR_MAY_ALIAS next;
+    XrSession                session; //!< The session whose view size changed
     uint32_t                 recommendedImageRectWidth;
     uint32_t                 recommendedImageRectHeight;
 } XrEventDataLocal3DZoneViewSizeChangedEXT;

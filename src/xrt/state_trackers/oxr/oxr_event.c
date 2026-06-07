@@ -148,6 +148,12 @@ is_session_link_to_event(struct oxr_event *event, XrSession session)
 		XrEventDataEyeTrackingStateChangedEXT *changed = (XrEventDataEyeTrackingStateChangedEXT *)type;
 		return changed->session == session;
 	}
+#ifdef OXR_HAVE_EXT_local_3d_zone
+	case XR_TYPE_EVENT_DATA_LOCAL_3D_ZONE_VIEW_SIZE_CHANGED_EXT: {
+		XrEventDataLocal3DZoneViewSizeChangedEXT *changed = (XrEventDataLocal3DZoneViewSizeChangedEXT *)type;
+		return changed->session == session;
+	}
+#endif
 #ifdef OXR_HAVE_EXT_workspace_file_dialog
 	case XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_EXT: {
 		XrEventDataFilePickerCompleteEXT *complete = (XrEventDataFilePickerCompleteEXT *)type;
@@ -449,6 +455,40 @@ oxr_event_push_XrEventDataEyeTrackingStateChanged(struct oxr_logger *log,
 
 	return XR_SUCCESS;
 }
+
+#ifdef OXR_HAVE_EXT_local_3d_zone
+XrResult
+oxr_event_push_XrEventDataLocal3DZoneViewSizeChanged(struct oxr_logger *log,
+                                                     struct oxr_session *sess,
+                                                     uint32_t recommendedImageRectWidth,
+                                                     uint32_t recommendedImageRectHeight)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataLocal3DZoneViewSizeChangedEXT *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+
+	changed->type = XR_TYPE_EVENT_DATA_LOCAL_3D_ZONE_VIEW_SIZE_CHANGED_EXT;
+	changed->next = NULL;
+	changed->session = oxr_session_to_openxr(sess);
+	changed->recommendedImageRectWidth = recommendedImageRectWidth;
+	changed->recommendedImageRectHeight = recommendedImageRectHeight;
+	event->result = XR_SUCCESS;
+
+	// Fires only on actual dim change (mask activation / deactivation /
+	// window resize) — one-off lifecycle edge, WARN tier (#439 Q4, #441
+	// precedent).
+	U_LOG_W("OXR EVENT: Local-3D-zone view size changed: %ux%u", recommendedImageRectWidth,
+	        recommendedImageRectHeight);
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_EXT_local_3d_zone
 
 XrResult
 oxr_event_push_XrEventDataHardwareDisplayStateChanged(struct oxr_logger *log,
