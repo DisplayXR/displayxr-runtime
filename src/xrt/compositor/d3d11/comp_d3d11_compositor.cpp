@@ -192,7 +192,10 @@ struct comp_d3d11_compositor
 	//! DP zone caps when zone_dp_state == 1 (grid dims surface through
 	//! comp_d3d11_compositor_zone_get_hw_caps → xrGetLocal3DZoneCapabilitiesEXT).
 	struct xrt_dp_local_zone_caps zone_dp_caps;
-	//! Monotonic per-session publish sequence (bumped on every publish).
+	//! Zone-mask content generation: bumped on every zone_mask_submit (the
+	//! only point the staged content can change). Per-frame publishes carry
+	//! the current generation, so a vendor evaluates mask CONTENT once per
+	//! generation and treats same-seq publishes as screen-anchor-only updates.
 	uint64_t zone_publish_seq;
 	//! True while this client's mask is published to the DP — drives the
 	//! clear-on-deactivate edge (mask destroyed / compositor teardown).
@@ -2860,7 +2863,10 @@ d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
 		return;
 	}
 
-	c->zone_publish_seq++;
+	// seq is the content GENERATION (bumped in zone_mask_submit), not a frame
+	// counter — same-seq publishes differ only in the screen anchor, so a
+	// vendor's content evaluation (e.g. the 1×1 any-nonzero check) runs once
+	// per submit instead of once per frame.
 	bool ok = xrt_display_processor_d3d11_publish_local_zone_mask(
 	    c->display_processor, c->context, mask->staged_srv, mask->w, mask->h, (int32_t)origin.x,
 	    (int32_t)origin.y, (uint32_t)r.right, (uint32_t)r.bottom, c->zone_publish_seq);
@@ -3248,6 +3254,7 @@ comp_d3d11_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask_ptr
 	c->context->CopyResource(mask->staged, mask->tex);
 	mask->submitted = true;
 	c->active_zone_mask = mask;
+	c->zone_publish_seq++; // #224: new content generation for the DP publish
 	return XRT_SUCCESS;
 }
 
