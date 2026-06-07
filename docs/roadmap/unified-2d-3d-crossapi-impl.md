@@ -4,7 +4,7 @@
 **Spec:** [`unified-2d-3d-compositing.md`](unified-2d-3d-compositing.md) §4 (composite pass + output-alpha), §5.1 (coordinate contract), §8 (rollout priority). Epic #439.
 **Builds on:** D3D11 Phases 0–2 (merged: PR #469 + #471) — the proven pathfinder every port references.
 
-> **STATUS: base leg in progress.** This doc + the base leg (header v2, oxr forwarding, comp stubs) ship together; the D3D12 and VK consumer legs follow as parallel hand-offs.
+> **STATUS: base leg merged (PR #473); D3D12 consumer leg implemented + capture-validated** (Z-cycle states 0–4 on `cube_texture_d3d12_win` via the ported `DISPLAYXR_SURROUND_CAPTURE` probe; on-glass Leia eyeball pending as the merge gate). VK leg scoped to ride with Phase 3 (§4).
 
 ---
 
@@ -89,13 +89,13 @@ So a full Phase-1-style VK port has nothing to composite and nothing to validate
 ## 5. Done-when
 
 **Base leg**
-- [ ] Header v2 (two structs, SPEC_VERSION 2) syncs to `displayxr-extensions` on merge.
-- [ ] oxr branches + stubs build green on macOS (`build_macos.sh`) and Windows (PR CI).
-- [ ] Caps report `supported=false` on D3D12/VK; create returns `XR_ERROR_FEATURE_UNSUPPORTED`.
+- [x] Header v2 (two structs, SPEC_VERSION 2) syncs to `displayxr-extensions` on merge.
+- [x] oxr branches + stubs build green on macOS (`build_macos.sh`) and Windows (PR CI).
+- [x] Caps report `supported=false` on D3D12/VK; create returns `XR_ERROR_FEATURE_UNSUPPORTED`. *(Merged as PR #473.)*
 
 **D3D12 leg**
-- [ ] §3 checklist 1–5; caps flipped.
-- [ ] Phase-1 + Phase-2 validation matrices green on `cube_texture_d3d12_win` (Leia, capture + on-glass); no-mask diff 0.
+- [x] §3 checklist 1–5; caps flipped. *(Plus the `DISPLAYXR_SURROUND_CAPTURE` probe ported — the D3D12 compositor had no composite-target capture; the matrices depend on it. Composite PSOs cover RGBA8 + BGRA8 — D3D12 bakes the RTV format into the PSO and app shared textures are BGRA8 in the wild.)*
+- [ ] Phase-1 + Phase-2 validation matrices green on `cube_texture_d3d12_win` (Leia, capture + on-glass); no-mask diff 0. *(Capture leg green — Z-cycle 0→4 + wrap-around, view dims resize both directions, beyond-window untouched; on-glass interlace eyeball pending.)*
 - [ ] Epic #439 "D3D12 — all engine plugins" box ticked.
 
 **VK leg**

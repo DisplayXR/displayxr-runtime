@@ -273,8 +273,13 @@ struct comp_d3d12_renderer
 	//! Root signature for the masked 2D-over-3D composite (#439).
 	ID3D12RootSignature *composite_root_signature;
 
-	//! Masked-composite PSO (opaque, fullscreen triangle).
-	ID3D12PipelineState *composite_pso;
+	//! Masked-composite PSOs (opaque, fullscreen triangle). D3D12 bakes the
+	//! RTV format into the PSO (unlike D3D11's format-agnostic RTV), and the
+	//! weave target's format is the app's choice — shared textures in the
+	//! wild are BGRA8 (cube_texture_d3d12_win) while DXGI targets are RGBA8.
+	//! The lerp shader is channel-agnostic, so the two PSOs share bytecode.
+	ID3D12PipelineState *composite_pso;      // DXGI_FORMAT_R8G8B8A8_UNORM
+	ID3D12PipelineState *composite_pso_bgra; // DXGI_FORMAT_B8G8R8A8_UNORM
 
 	//! Shader-visible 3-slot SRV heap for the composite pass
 	//! (t0 = 2D surround, t1 = authored mask, t2 = weave snapshot).
@@ -1034,6 +1039,13 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 
 	hr = device->CreateGraphicsPipelineState(&comp_pso_desc, __uuidof(ID3D12PipelineState),
 	                                          reinterpret_cast<void **>(&r->composite_pso));
+
+	if (SUCCEEDED(hr)) {
+		// BGRA8 variant — same shader/state, only the baked RTV format differs.
+		comp_pso_desc.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+		hr = device->CreateGraphicsPipelineState(&comp_pso_desc, __uuidof(ID3D12PipelineState),
+		                                          reinterpret_cast<void **>(&r->composite_pso_bgra));
+	}
 	comp_vs_blob->Release();
 	comp_ps_blob->Release();
 
@@ -1080,6 +1092,9 @@ comp_d3d12_renderer_destroy(struct comp_d3d12_renderer **renderer_ptr)
 
 	if (r->composite_srv_heap != nullptr) {
 		r->composite_srv_heap->Release();
+	}
+	if (r->composite_pso_bgra != nullptr) {
+		r->composite_pso_bgra->Release();
 	}
 	if (r->composite_pso != nullptr) {
 		r->composite_pso->Release();
@@ -1538,6 +1553,7 @@ extern "C" xrt_result_t
 comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
                                         void *cmd_list_ptr,
                                         uint64_t dst_rtv_handle,
+                                        uint32_t dst_format,
                                         void *twod_resource,
                                         void *mask_resource,
                                         void *weave_resource,
@@ -1551,6 +1567,17 @@ comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
 	if (renderer == nullptr || cmd_list_ptr == nullptr || dst_rtv_handle == 0 || twod_resource == nullptr ||
 	    mask_resource == nullptr || weave_resource == nullptr) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	// PSO by target format — D3D12 bakes the RTV format into the PSO.
+	ID3D12PipelineState *pso = nullptr;
+	switch (static_cast<DXGI_FORMAT>(dst_format)) {
+	case DXGI_FORMAT_R8G8B8A8_UNORM: pso = renderer->composite_pso; break;
+	case DXGI_FORMAT_B8G8R8A8_UNORM: pso = renderer->composite_pso_bgra; break;
+	default: break;
+	}
+	if (pso == nullptr) {
+		return XRT_ERROR_D3D;
 	}
 
 	auto internals = get_internals(renderer->c);
@@ -1609,7 +1636,7 @@ comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
 	// composite; HUD + capture are copy ops) re-binds what it needs.
 	cmd_list->SetDescriptorHeaps(1, &renderer->composite_srv_heap);
 	cmd_list->SetGraphicsRootSignature(renderer->composite_root_signature);
-	cmd_list->SetPipelineState(renderer->composite_pso);
+	cmd_list->SetPipelineState(pso);
 	cmd_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
 	cmd_list->RSSetViewports(1, &vp);
 	cmd_list->RSSetScissorRects(1, &scissor);

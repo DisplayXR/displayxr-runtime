@@ -219,6 +219,8 @@ comp_d3d12_renderer_get_atlas_resource(struct comp_d3d12_renderer *renderer);
  * @param renderer The renderer.
  * @param cmd_list Open D3D12 command list (void* = ID3D12GraphicsCommandList*).
  * @param dst_rtv_handle CPU RTV handle of the weave target (D3D12_CPU_DESCRIPTOR_HANDLE::ptr).
+ * @param dst_format DXGI_FORMAT of the weave target — selects the PSO
+ *                   (R8G8B8A8_UNORM or B8G8R8A8_UNORM; anything else errors).
  * @param twod_resource 2D surround scratch (ID3D12Resource*, region-sized).
  * @param mask_resource Authored mask staged copy (ID3D12Resource*, R8_UNORM).
  * @param weave_resource Weave snapshot scratch (ID3D12Resource*, region-sized).
@@ -231,6 +233,7 @@ xrt_result_t
 comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
                                         void *cmd_list,
                                         uint64_t dst_rtv_handle,
+                                        uint32_t dst_format,
                                         void *twod_resource,
                                         void *mask_resource,
                                         void *weave_resource,

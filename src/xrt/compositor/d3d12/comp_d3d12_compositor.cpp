@@ -3153,15 +3153,16 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	}
 
 	// Format contract: surround must match dst (same rule as the rect path),
-	// and dst must be R8G8B8A8_UNORM — the composite PSO's fixed RTV format
-	// (the same assumption the blit PSO and process_atlas already bake in).
+	// and dst must be one of the two formats the composite has a PSO for —
+	// app-created shared textures are BGRA8 in the wild, DXGI targets RGBA8.
 	D3D12_RESOURCE_DESC sd = c->surround_texture->GetDesc();
 	D3D12_RESOURCE_DESC dd = dst->GetDesc();
-	if (sd.Format != dd.Format || dd.Format != DXGI_FORMAT_R8G8B8A8_UNORM) {
+	if (sd.Format != dd.Format ||
+	    (dd.Format != DXGI_FORMAT_R8G8B8A8_UNORM && dd.Format != DXGI_FORMAT_B8G8R8A8_UNORM)) {
 		static bool fmt_logged = false;
 		if (!fmt_logged) {
 			U_LOG_W("D3D12 zone mask: format mismatch — surround=%u, target=%u "
-			        "(composite PSO needs R8G8B8A8_UNORM) — mask ignored",
+			        "(composite PSOs cover R8G8B8A8/B8G8R8A8 UNORM) — mask ignored",
 			        (unsigned)sd.Format, (unsigned)dd.Format);
 			fmt_logged = true;
 		}
@@ -3294,8 +3295,8 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	uint32_t cbottom = (cy_u + ch > region_h) ? region_h : cy_u + ch;
 
 	xrt_result_t xret = comp_d3d12_renderer_composite_2d_masked(
-	    c->renderer, c->cmd_list, dst_rtv, c->surround_scratch, mask->staged, c->weave_scratch,
-	    region_w, region_h, (int32_t)cx_u, (int32_t)cy_u, cright - cx_u, cbottom - cy_u);
+	    c->renderer, c->cmd_list, dst_rtv, static_cast<uint32_t>(dd.Format), c->surround_scratch, mask->staged,
+	    c->weave_scratch, region_w, region_h, (int32_t)cx_u, (int32_t)cy_u, cright - cx_u, cbottom - cy_u);
 
 	// Restore steady states: dst → caller's post state, scratches → COMMON.
 	D3D12_RESOURCE_BARRIER restore[3] = {};
@@ -3639,10 +3640,12 @@ comp_d3d12_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_pt
  *
  */
 
-// Read back an arbitrary R8G8B8A8 resource region and write it as PNG.
-// Generalizes the atlas capture above to any resource/state: barrier
+// Read back a 4-byte-UNORM (RGBA8/BGRA8) resource region and write it as
+// PNG. Generalizes the atlas capture above to any resource/state: barrier
 // pre_state → COPY_SOURCE, placed-footprint copy into a transient READBACK
-// buffer, restore, execute + wait, repack + stbi_write_png.
+// buffer, restore, execute + wait, repack (+ BGRA→RGBA swizzle) +
+// stbi_write_png. The placed footprint MUST use the resource's own format —
+// app shared textures are BGRA8 in the wild.
 //
 // Re-arms c->cmd_allocator / c->cmd_list for its private use — caller must
 // ensure the list is CLOSED and the GPU idle on entry (call after the frame
@@ -3656,6 +3659,13 @@ d3d12_capture_resource_to_png(struct comp_d3d12_compositor *c,
                               const char *path)
 {
 	if (res == nullptr || w == 0 || h == 0) {
+		return false;
+	}
+
+	D3D12_RESOURCE_DESC res_desc = res->GetDesc();
+	const bool is_bgra = res_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM;
+	if (!is_bgra && res_desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM) {
+		U_LOG_W("d3d12_capture_resource_to_png: unsupported format %u", (unsigned)res_desc.Format);
 		return false;
 	}
 
@@ -3705,7 +3715,7 @@ d3d12_capture_resource_to_png(struct comp_d3d12_compositor *c,
 	dst_loc.pResource = readback;
 	dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
 	dst_loc.PlacedFootprint.Offset = 0;
-	dst_loc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	dst_loc.PlacedFootprint.Footprint.Format = res_desc.Format;
 	dst_loc.PlacedFootprint.Footprint.Width = w;
 	dst_loc.PlacedFootprint.Footprint.Height = h;
 	dst_loc.PlacedFootprint.Footprint.Depth = 1;
@@ -3735,10 +3745,18 @@ d3d12_capture_resource_to_png(struct comp_d3d12_compositor *c,
 				       rb_pixels + (size_t)y * row_pitch,
 				       tight_pitch);
 			}
+			// BGRA targets: swizzle to the RGBA byte order stbi expects.
+			// Identical for both A and B captures, so the §6 diff is
+			// unaffected.
+			if (is_bgra) {
+				for (size_t i = 0; i < tight_pitch * h; i += 4) {
+					uint8_t tmp = tight[i];
+					tight[i] = tight[i + 2];
+					tight[i + 2] = tmp;
+				}
+			}
 			// Composited-output alpha is undefined for display output —
 			// force opaque so the PNG doesn't render transparent (#425).
-			// Both A and B captures go through this same writer, so the
-			// §6 diff is unaffected.
 			u_image_force_opaque_rgba8(tight, w, h, tight_pitch);
 			ok = stbi_write_png(path, (int)w, (int)h, 4, tight, (int)tight_pitch) != 0;
 			free(tight);
