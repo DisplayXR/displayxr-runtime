@@ -10,11 +10,12 @@
  * The oxr layer owns the mask handle lifecycle and forwards authoring calls to
  * the native compositor's zone-mask entry points. The D3D11 consumer shipped
  * with Phases 1–2 (docs/roadmap/unified-2d-3d-phase1-impl.md, -phase2-impl.md);
- * D3D12 and VK forward to stubs until their consumer legs land
- * (docs/roadmap/unified-2d-3d-crossapi-impl.md) — the caps query reports
- * supported = false for those sessions, and a stubbed compositor's
- * XRT_ERROR_NOT_IMPLEMENTED maps to XR_ERROR_FEATURE_UNSUPPORTED. Every other
- * compositor falls through to XR_ERROR_FEATURE_UNSUPPORTED.
+ * the D3D12 consumer with the cross-API leg
+ * (docs/roadmap/unified-2d-3d-crossapi-impl.md §3). VK forwards to stubs until
+ * its consumer leg lands — the caps query reports supported = false for those
+ * sessions, and a stubbed compositor's XRT_ERROR_NOT_IMPLEMENTED maps to
+ * XR_ERROR_FEATURE_UNSUPPORTED. Every other compositor falls through to
+ * XR_ERROR_FEATURE_UNSUPPORTED.
  */
 
 #include <stdlib.h>
@@ -130,7 +131,7 @@ oxr_xrGetLocal3DZoneCapabilitiesEXT(XrSession session, XrLocal3DZoneCapabilities
 	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, capabilities, XR_TYPE_LOCAL_3D_ZONE_CAPABILITIES_EXT);
 
 	// Never errors on an unsupported compositor — reports supported = false.
-	// D3D12 + VK sessions also report false until their consumer legs land
+	// VK sessions also report false until that consumer leg lands
 	// (docs/roadmap/unified-2d-3d-crossapi-impl.md — flip here per leg).
 	capabilities->supported = XR_FALSE;
 	capabilities->hardwareZoneGridWidth = 0;
@@ -142,6 +143,17 @@ oxr_xrGetLocal3DZoneCapabilitiesEXT(XrSession session, XrLocal3DZoneCapabilities
 	if (sess->is_d3d11_native_compositor && sess->xcn != NULL) {
 		capabilities->supported = XR_TRUE;
 		// Compositor consumer only — no hardware-zone DP leg yet.
+		capabilities->hardwareZoneGridWidth = 0;
+		capabilities->hardwareZoneGridHeight = 0;
+		capabilities->maxMaskWidth = OXR_LOCAL_3D_ZONE_MAX_MASK_DIM;
+		capabilities->maxMaskHeight = OXR_LOCAL_3D_ZONE_MAX_MASK_DIM;
+	}
+#endif
+
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+	if (sess->is_d3d12_native_compositor && sess->xcn != NULL) {
+		// #439 D3D12 consumer leg — parity with the D3D11 consumer.
+		capabilities->supported = XR_TRUE;
 		capabilities->hardwareZoneGridWidth = 0;
 		capabilities->hardwareZoneGridHeight = 0;
 		capabilities->maxMaskWidth = OXR_LOCAL_3D_ZONE_MAX_MASK_DIM;

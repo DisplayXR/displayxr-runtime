@@ -104,6 +104,11 @@ typedef struct XrLocal3DZoneRenderTargetD3D11EXT {
  * Sync contract: the in-process D3D12 native compositor runs on the app's
  * device AND command queue, so same-queue submission order is the contract —
  * execute the mask draw, then call xrSubmitLocal3DZoneEXT. No fence.
+ *
+ * State contract: the resource is handed out in
+ * D3D12_RESOURCE_STATE_RENDER_TARGET; the app must transition it back to
+ * RENDER_TARGET before calling xrSubmitLocal3DZoneEXT (the runtime's Tier-1/2
+ * clears and submit snapshot assume that steady state).
  */
 typedef struct XrLocal3DZoneRenderTargetD3D12EXT {
     XrStructureType    type;   //!< XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D12_EXT

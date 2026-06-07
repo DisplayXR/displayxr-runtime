@@ -207,6 +207,41 @@ void *
 comp_d3d12_renderer_get_atlas_resource(struct comp_d3d12_renderer *renderer);
 
 /*!
+ * Masked 2D-over-3D composite (#439, XR_EXT_local_3d_zone): records a
+ * fullscreen-triangle draw into @p cmd_list that writes every pixel of the
+ * window region as `M*weave + (1-M)*twod` (per-channel, preserving each
+ * layer's own alpha — spec §4.2).
+ *
+ * The caller owns all resource states: the three sources must be in
+ * PIXEL_SHADER_RESOURCE and the destination in RENDER_TARGET when the draw
+ * executes. Leaves the composite heap/root-signature/PSO bound on the list.
+ *
+ * @param renderer The renderer.
+ * @param cmd_list Open D3D12 command list (void* = ID3D12GraphicsCommandList*).
+ * @param dst_rtv_handle CPU RTV handle of the weave target (D3D12_CPU_DESCRIPTOR_HANDLE::ptr).
+ * @param twod_resource 2D surround scratch (ID3D12Resource*, region-sized).
+ * @param mask_resource Authored mask staged copy (ID3D12Resource*, R8_UNORM).
+ * @param weave_resource Weave snapshot scratch (ID3D12Resource*, region-sized).
+ * @param region_w,region_h Window region (viewport) in pixels (#464 top-left anchor).
+ * @param cx,cy,cw,ch Canvas rect for the analytic-rect shader path (parity only).
+ *
+ * @ingroup comp_d3d12
+ */
+xrt_result_t
+comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
+                                        void *cmd_list,
+                                        uint64_t dst_rtv_handle,
+                                        void *twod_resource,
+                                        void *mask_resource,
+                                        void *weave_resource,
+                                        uint32_t region_w,
+                                        uint32_t region_h,
+                                        int32_t cx,
+                                        int32_t cy,
+                                        uint32_t cw,
+                                        uint32_t ch);
+
+/*!
  * Resize the renderer's atlas texture to match a new view size.
  *
  * Recreates the atlas texture, RTV, and SRV at the new dimensions.

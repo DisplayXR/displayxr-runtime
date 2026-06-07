@@ -135,6 +135,102 @@ float4 main(VS_OUTPUT input) : SV_Target {
 }
 )";
 
+// Masked 2D-over-3D composite (#439 cross-API leg). Keep byte-aligned with
+// the D3D11 reference (comp_d3d11_renderer.cpp / shaders/masked_composite.hlsl).
+// The lerp path samples the authored mask (t1) against the weave snapshot (t2);
+// the analytic rect path (use_rect_mask) is kept for shader parity but the
+// D3D12 leg always passes a mask (the no-mask path stays on the strip copies).
+static const char *masked_composite_vs_source = R"(
+struct VS_OUTPUT
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+static const float2 positions[3] = {
+    float2(-1.0, -1.0),
+    float2(-1.0,  3.0),
+    float2( 3.0, -1.0),
+};
+static const float2 uvs[3] = {
+    float2(0.0, 1.0),
+    float2(0.0, -1.0),
+    float2(2.0, 1.0),
+};
+
+VS_OUTPUT VSMain(uint vertex_id : SV_VertexID)
+{
+    VS_OUTPUT o;
+    o.position = float4(positions[vertex_id], 0.0, 1.0);
+    o.uv = uvs[vertex_id];
+    return o;
+}
+)";
+
+static const char *masked_composite_ps_source = R"(
+Texture2D twod_tex   : register(t0);
+Texture2D mask_tex   : register(t1);
+Texture2D weave_tex  : register(t2);
+SamplerState samp    : register(s0);
+
+cbuffer CompositeParams : register(b0)
+{
+    float2 dst_dims;
+    float2 canvas_origin;
+    float2 canvas_size;
+    uint   use_rect_mask;
+    uint   _pad;
+};
+
+struct VS_OUTPUT
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+float region_mask(float2 px, float2 uv)
+{
+    if (use_rect_mask)
+    {
+        bool inside =
+            px.x >= canvas_origin.x && px.x < canvas_origin.x + canvas_size.x &&
+            px.y >= canvas_origin.y && px.y < canvas_origin.y + canvas_size.y;
+        return inside ? 1.0 : 0.0;
+    }
+    return saturate(mask_tex.Sample(samp, uv).r);
+}
+
+float4 PSMain(VS_OUTPUT input) : SV_Target
+{
+    float2 px = input.uv * dst_dims;
+    float M = region_mask(px, input.uv);
+
+    if (use_rect_mask)
+    {
+        if (M >= 0.5)
+            discard;
+        return twod_tex.Sample(samp, input.uv);
+    }
+
+    float4 twod  = twod_tex.Sample(samp, input.uv);
+    float4 weave = weave_tex.Sample(samp, input.uv);
+    return M * weave + (1.0 - M) * twod;
+}
+)";
+
+/*!
+ * Composite shader constants — 8 DWORDs, passed as root constants (b0).
+ * Layout matches the D3D11 CompositeParams CB (HLSL packing: two float4 rows).
+ */
+struct CompositeParams
+{
+	float dst_dims[2];
+	float canvas_origin[2];
+	float canvas_size[2];
+	uint32_t use_rect_mask;
+	uint32_t _pad;
+};
+
 /*!
  * D3D12 renderer structure.
  */
@@ -173,6 +269,17 @@ struct comp_d3d12_renderer
 
 	//! Quad PSO with premultiplied alpha blending.
 	ID3D12PipelineState *quad_pso_premul;
+
+	//! Root signature for the masked 2D-over-3D composite (#439).
+	ID3D12RootSignature *composite_root_signature;
+
+	//! Masked-composite PSO (opaque, fullscreen triangle).
+	ID3D12PipelineState *composite_pso;
+
+	//! Shader-visible 3-slot SRV heap for the composite pass
+	//! (t0 = 2D surround, t1 = authored mask, t2 = weave snapshot).
+	//! SRVs are written fresh on every composite call.
+	ID3D12DescriptorHeap *composite_srv_heap;
 
 	//! Descriptor sizes.
 	uint32_t rtv_descriptor_size;
@@ -829,6 +936,128 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 		return XRT_ERROR_D3D;
 	}
 
+	// --- Masked-composite root signature (#439): SRV table of 3 (t0 2D /
+	// t1 mask / t2 weave snapshot) + 8 root constants (CompositeParams, b0)
+	// + static POINT sampler (byte-identity with the strip copies). ---
+	D3D12_DESCRIPTOR_RANGE comp_srv_range = {};
+	comp_srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+	comp_srv_range.NumDescriptors = 3;
+	comp_srv_range.BaseShaderRegister = 0;
+	comp_srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+	D3D12_ROOT_PARAMETER comp_root_params[2] = {};
+
+	// Param 0: SRV descriptor table (t0..t2)
+	comp_root_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	comp_root_params[0].DescriptorTable.NumDescriptorRanges = 1;
+	comp_root_params[0].DescriptorTable.pDescriptorRanges = &comp_srv_range;
+	comp_root_params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+	// Param 1: 8 root constants (CompositeParams — 2x float2 + float2 + 2x uint)
+	comp_root_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+	comp_root_params[1].Constants.ShaderRegister = 0;
+	comp_root_params[1].Constants.RegisterSpace = 0;
+	comp_root_params[1].Constants.Num32BitValues = 8;
+	comp_root_params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+	D3D12_STATIC_SAMPLER_DESC comp_sampler = {};
+	comp_sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+	comp_sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	comp_sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	comp_sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	comp_sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+	comp_sampler.MaxLOD = D3D12_FLOAT32_MAX;
+	comp_sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+	D3D12_ROOT_SIGNATURE_DESC comp_rs_desc = {};
+	comp_rs_desc.NumParameters = 2;
+	comp_rs_desc.pParameters = comp_root_params;
+	comp_rs_desc.NumStaticSamplers = 1;
+	comp_rs_desc.pStaticSamplers = &comp_sampler;
+	comp_rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+	sig_blob = nullptr;
+	error_blob = nullptr;
+	hr = D3D12SerializeRootSignature(&comp_rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &sig_blob, &error_blob);
+	if (FAILED(hr)) {
+		if (error_blob != nullptr) {
+			U_LOG_E("Composite root signature serialize error: %s",
+			        static_cast<const char *>(error_blob->GetBufferPointer()));
+			error_blob->Release();
+		}
+		comp_d3d12_renderer_destroy(&r);
+		return XRT_ERROR_D3D;
+	}
+
+	hr = device->CreateRootSignature(0, sig_blob->GetBufferPointer(), sig_blob->GetBufferSize(),
+	                                  __uuidof(ID3D12RootSignature),
+	                                  reinterpret_cast<void **>(&r->composite_root_signature));
+	sig_blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create composite root signature: 0x%08x", hr);
+		comp_d3d12_renderer_destroy(&r);
+		return XRT_ERROR_D3D;
+	}
+
+	// --- Compile masked-composite shaders and create the opaque PSO ---
+	ID3DBlob *comp_vs_blob = nullptr;
+	ID3DBlob *comp_ps_blob = nullptr;
+
+	hr = compile_shader(masked_composite_vs_source, "VSMain", "vs_5_0", &comp_vs_blob);
+	if (FAILED(hr)) {
+		comp_d3d12_renderer_destroy(&r);
+		return XRT_ERROR_D3D;
+	}
+
+	hr = compile_shader(masked_composite_ps_source, "PSMain", "ps_5_0", &comp_ps_blob);
+	if (FAILED(hr)) {
+		comp_vs_blob->Release();
+		comp_d3d12_renderer_destroy(&r);
+		return XRT_ERROR_D3D;
+	}
+
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC comp_pso_desc = {};
+	comp_pso_desc.pRootSignature = r->composite_root_signature;
+	comp_pso_desc.VS.pShaderBytecode = comp_vs_blob->GetBufferPointer();
+	comp_pso_desc.VS.BytecodeLength = comp_vs_blob->GetBufferSize();
+	comp_pso_desc.PS.pShaderBytecode = comp_ps_blob->GetBufferPointer();
+	comp_pso_desc.PS.BytecodeLength = comp_ps_blob->GetBufferSize();
+	comp_pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+	comp_pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+	comp_pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+	comp_pso_desc.RasterizerState.DepthClipEnable = TRUE;
+	comp_pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+	comp_pso_desc.NumRenderTargets = 1;
+	comp_pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+	comp_pso_desc.SampleDesc.Count = 1;
+	comp_pso_desc.SampleMask = UINT_MAX;
+
+	hr = device->CreateGraphicsPipelineState(&comp_pso_desc, __uuidof(ID3D12PipelineState),
+	                                          reinterpret_cast<void **>(&r->composite_pso));
+	comp_vs_blob->Release();
+	comp_ps_blob->Release();
+
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create composite PSO: 0x%08x", hr);
+		comp_d3d12_renderer_destroy(&r);
+		return XRT_ERROR_D3D;
+	}
+
+	// Dedicated shader-visible heap for the composite's 3 SRVs — written
+	// fresh per composite call so a stale slot can never be sampled.
+	D3D12_DESCRIPTOR_HEAP_DESC comp_heap_desc = {};
+	comp_heap_desc.NumDescriptors = 3;
+	comp_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+	comp_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+
+	hr = device->CreateDescriptorHeap(
+	    &comp_heap_desc, __uuidof(ID3D12DescriptorHeap), reinterpret_cast<void **>(&r->composite_srv_heap));
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create composite SRV heap: 0x%08x", hr);
+		comp_d3d12_renderer_destroy(&r);
+		return XRT_ERROR_D3D;
+	}
+
 	*out_renderer = r;
 
 	U_LOG_I("Created D3D12 renderer: %ux%u per view, atlas %ux%u (%u cols x %u rows), texture_h=%u",
@@ -849,6 +1078,15 @@ comp_d3d12_renderer_destroy(struct comp_d3d12_renderer **renderer_ptr)
 
 	comp_d3d12_renderer *r = *renderer_ptr;
 
+	if (r->composite_srv_heap != nullptr) {
+		r->composite_srv_heap->Release();
+	}
+	if (r->composite_pso != nullptr) {
+		r->composite_pso->Release();
+	}
+	if (r->composite_root_signature != nullptr) {
+		r->composite_root_signature->Release();
+	}
 	if (r->quad_pso_premul != nullptr) {
 		r->quad_pso_premul->Release();
 	}
@@ -1294,4 +1532,91 @@ comp_d3d12_renderer_resize(struct comp_d3d12_renderer *renderer,
 	// Recreate atlas texture with new dimensions
 	auto internals = get_internals(renderer->c);
 	return create_atlas_texture(renderer, internals->device, new_view_width, new_view_height);
+}
+
+extern "C" xrt_result_t
+comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
+                                        void *cmd_list_ptr,
+                                        uint64_t dst_rtv_handle,
+                                        void *twod_resource,
+                                        void *mask_resource,
+                                        void *weave_resource,
+                                        uint32_t region_w,
+                                        uint32_t region_h,
+                                        int32_t cx,
+                                        int32_t cy,
+                                        uint32_t cw,
+                                        uint32_t ch)
+{
+	if (renderer == nullptr || cmd_list_ptr == nullptr || dst_rtv_handle == 0 || twod_resource == nullptr ||
+	    mask_resource == nullptr || weave_resource == nullptr) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	auto internals = get_internals(renderer->c);
+	ID3D12Device *device = internals->device;
+	auto *cmd_list = static_cast<ID3D12GraphicsCommandList *>(cmd_list_ptr);
+
+	// Write the 3 SRVs fresh into the dedicated shader-visible heap
+	// (t0 = 2D surround scratch, t1 = authored mask staged copy, t2 = weave
+	// snapshot scratch). Formats come from each resource — the scratches are
+	// runtime-created with concrete formats, the mask is R8_UNORM.
+	ID3D12Resource *srcs[3] = {
+	    static_cast<ID3D12Resource *>(twod_resource),
+	    static_cast<ID3D12Resource *>(mask_resource),
+	    static_cast<ID3D12Resource *>(weave_resource),
+	};
+	D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = renderer->composite_srv_heap->GetCPUDescriptorHandleForHeapStart();
+	for (int i = 0; i < 3; i++) {
+		D3D12_RESOURCE_DESC rd = srcs[i]->GetDesc();
+		D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+		srv_desc.Format = rd.Format;
+		srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		srv_desc.Texture2D.MipLevels = 1;
+		device->CreateShaderResourceView(srcs[i], &srv_desc, srv_cpu);
+		srv_cpu.ptr += renderer->srv_descriptor_size;
+	}
+
+	// #464: the composite region is window-sized at the top-left anchor of
+	// the (worst-case-allocated) surface; pixels beyond it are never written.
+	// The full-screen triangle's uv [0,1] spans the viewport, so region-sized
+	// SRVs sample 1:1.
+	D3D12_VIEWPORT vp = {};
+	vp.Width = static_cast<float>(region_w);
+	vp.Height = static_cast<float>(region_h);
+	vp.MaxDepth = 1.0f;
+	D3D12_RECT scissor = {};
+	scissor.right = static_cast<LONG>(region_w);
+	scissor.bottom = static_cast<LONG>(region_h);
+
+	CompositeParams params = {};
+	params.dst_dims[0] = static_cast<float>(region_w);
+	params.dst_dims[1] = static_cast<float>(region_h);
+	params.canvas_origin[0] = static_cast<float>(cx);
+	params.canvas_origin[1] = static_cast<float>(cy);
+	params.canvas_size[0] = static_cast<float>(cw);
+	params.canvas_size[1] = static_cast<float>(ch);
+	// The D3D12 leg always composites an authored mask; the analytic rect
+	// path (use_rect_mask=1) exists for shader parity with D3D11 only.
+	params.use_rect_mask = 0;
+
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv = {};
+	rtv.ptr = static_cast<SIZE_T>(dst_rtv_handle);
+
+	// NOTE: this leaves the composite heap / root signature / PSO bound —
+	// downstream recording (strips fallback never runs after a successful
+	// composite; HUD + capture are copy ops) re-binds what it needs.
+	cmd_list->SetDescriptorHeaps(1, &renderer->composite_srv_heap);
+	cmd_list->SetGraphicsRootSignature(renderer->composite_root_signature);
+	cmd_list->SetPipelineState(renderer->composite_pso);
+	cmd_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+	cmd_list->RSSetViewports(1, &vp);
+	cmd_list->RSSetScissorRects(1, &scissor);
+	cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	cmd_list->SetGraphicsRootDescriptorTable(0, renderer->composite_srv_heap->GetGPUDescriptorHandleForHeapStart());
+	cmd_list->SetGraphicsRoot32BitConstants(1, 8, &params, 0);
+	cmd_list->DrawInstanced(3, 1, 0, 0);
+
+	return XRT_SUCCESS;
 }

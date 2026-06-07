@@ -203,13 +203,9 @@ comp_d3d12_compositor_set_surround_2d_fence(struct xrt_compositor *xc,
                                               uint64_t await_fence_value);
 
 /*
- * XR_EXT_local_3d_zone — authored 2D/3D mask consumer, D3D12 leg.
- * Contracts + porting reference (the shipped D3D11 consumer):
+ * XR_EXT_local_3d_zone — authored 2D/3D mask consumer, D3D12 leg (#439).
+ * Contracts + the D3D11 porting reference:
  * docs/roadmap/unified-2d-3d-crossapi-impl.md §3.
- *
- * STUBS until the D3D12 consumer leg lands — all return
- * XRT_ERROR_NOT_IMPLEMENTED and the oxr caps query reports
- * supported = false for D3D12 sessions until then.
  */
 
 /*!
