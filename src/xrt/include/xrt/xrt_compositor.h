@@ -83,7 +83,8 @@ enum xrt_layer_type
 	XRT_LAYER_EQUIRECT1,
 	XRT_LAYER_EQUIRECT2,
 	XRT_LAYER_PASSTHROUGH,
-	XRT_LAYER_WINDOW_SPACE
+	XRT_LAYER_WINDOW_SPACE,
+	XRT_LAYER_LOCAL_2D
 };
 
 /*!
@@ -404,6 +405,23 @@ struct xrt_layer_window_space_data
 };
 
 /*!
+ * All the pure data values associated with a local-2D layer
+ * (XR_EXT_local_3d_zone v3, #439 Phase 3).
+ *
+ * Post-weave 2D content placed at @p rect in client-window pixels (post-DPI;
+ * the same coordinate space as the zone-mask tiers — NOT window-space's
+ * fractional [0..1]). Flattened in layer-list order with premultiplied-alpha
+ * "over" and composited POST-weave, gated by the zone mask:
+ * final = M·weave + (1−M)·flatten(local2D layers).
+ */
+struct xrt_layer_local_2d_data
+{
+	struct xrt_sub_image sub;
+
+	struct xrt_rect rect; //!< Destination, client-window pixels
+};
+
+/*!
  * All the pure data values associated with a composition layer.
  *
  * The @ref xrt_swapchain references and @ref xrt_device are provided outside of
@@ -488,6 +506,7 @@ struct xrt_layer_data
 		struct xrt_layer_equirect2_data equirect2;
 		struct xrt_layer_passthrough_data passthrough;
 		struct xrt_layer_window_space_data window_space;
+		struct xrt_layer_local_2d_data local_2d;
 	};
 	uint32_t view_count;
 };
@@ -1432,6 +1451,23 @@ struct xrt_compositor
 	                                   const struct xrt_layer_data *data);
 
 	/*!
+	 * Adds a local-2D layer for submission (XR_EXT_local_3d_zone v3,
+	 * #439 Phase 3). Post-weave 2D content at a client-window pixel rect,
+	 * gated by the zone mask (explicit, or implicit from layer coverage).
+	 *
+	 * @param xc          Self pointer
+	 * @param xdev        The device the layer is relative to.
+	 * @param xsc         Swapchain.
+	 * @param data        All of the pure data bits (not pointers/handles),
+	 *                    including what part of the supplied swapchain
+	 *                    object to use.
+	 */
+	xrt_result_t (*layer_local_2d)(struct xrt_compositor *xc,
+	                               struct xrt_device *xdev,
+	                               struct xrt_swapchain *xsc,
+	                               const struct xrt_layer_data *data);
+
+	/*!
 	 * @brief Commits all of the submitted layers.
 	 *
 	 * Only after this call will the compositor actually use the layers.
@@ -1921,6 +1957,22 @@ xrt_comp_layer_window_space(struct xrt_compositor *xc,
                             const struct xrt_layer_data *data)
 {
 	return xc->layer_window_space(xc, xdev, xsc, data);
+}
+
+/*!
+ * @copydoc xrt_compositor::layer_local_2d
+ *
+ * Helper for calling through the function pointer.
+ *
+ * @public @memberof xrt_compositor
+ */
+static inline xrt_result_t
+xrt_comp_layer_local_2d(struct xrt_compositor *xc,
+                        struct xrt_device *xdev,
+                        struct xrt_swapchain *xsc,
+                        const struct xrt_layer_data *data)
+{
+	return xc->layer_local_2d(xc, xdev, xsc, data);
 }
 
 /*!

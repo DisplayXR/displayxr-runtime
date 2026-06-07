@@ -21,6 +21,13 @@
  * The mask is a SEPARATE scalar channel, NOT the 2D layer's alpha — region
  * selection and content transparency are independent (spec §4.0). M = 1 → 3D
  * (keep the weave), M = 0 → 2D, fractional only at anti-aliased boundaries.
+ *
+ * Spec v3 (#439 Phase 3) adds the 2D side of the story as a first-class
+ * composition layer: XrCompositionLayerLocal2DEXT, a post-weave screen-space
+ * 2D layer submitted through the normal xrEndFrame layer list (replacing the
+ * shared-texture surround side-channel as the 2D source), plus
+ * XrEventDataLocal3DZoneViewSizeChangedEXT, the view-size renegotiation
+ * event. Design: docs/roadmap/unified-2d-3d-phase3-impl.md.
  */
 #ifndef XR_EXT_LOCAL_3D_ZONE_H
 #define XR_EXT_LOCAL_3D_ZONE_H 1
@@ -33,7 +40,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_local_3d_zone 1
-#define XR_EXT_local_3d_zone_SPEC_VERSION 2
+#define XR_EXT_local_3d_zone_SPEC_VERSION 3
 #define XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME "XR_EXT_local_3d_zone"
 
 // Vendor extension range (1000999xxx); replace with a Khronos-assigned value
@@ -41,9 +48,15 @@ extern "C" {
 #define XR_TYPE_LOCAL_3D_ZONE_CAPABILITIES_EXT      ((XrStructureType)1000999130)
 #define XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_EXT  ((XrStructureType)1000999131)
 #define XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D11_EXT ((XrStructureType)1000999132)
-// Spec v2 additions — D3D12 + Vulkan Tier-3 bindings.
+// Spec v2 additions — D3D12 + Vulkan Tier-3 bindings. (No Metal Tier-3
+// binding yet — Tier 1/2 are API-agnostic and fully supported on Metal;
+// xrAcquireLocal3DZoneRenderTargetEXT reports XR_ERROR_FEATURE_UNSUPPORTED.)
 #define XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D12_EXT  ((XrStructureType)1000999133)
 #define XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_VULKAN_EXT ((XrStructureType)1000999134)
+// Spec v3 additions — the post-weave 2D composition layer + the view-size
+// renegotiation event (#439 Phase 3).
+#define XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT                  ((XrStructureType)1000999135)
+#define XR_TYPE_EVENT_DATA_LOCAL_3D_ZONE_VIEW_SIZE_CHANGED_EXT ((XrStructureType)1000999136)
 
 XR_DEFINE_HANDLE(XrLocal3DZoneMaskEXT)
 
@@ -133,6 +146,58 @@ typedef struct XrLocal3DZoneRenderTargetVulkanEXT {
     uint32_t           width;
     uint32_t           height;
 } XrLocal3DZoneRenderTargetVulkanEXT;
+
+/*!
+ * @brief Post-weave 2D content at a client-window pixel rect, mask-gated
+ *        (spec v3, #439 Phase 3).
+ *
+ * Submitted through the normal xrEndFrame layer list beside the projection
+ * layers; composited POST-weave at full resolution:
+ *
+ *     final = M·weave + (1−M)·flatten(local2D layers)
+ *
+ * @c rect places @c subImage at a client-window pixel rect (post-DPI; the
+ * same coordinate space as the mask tiers — spec §5.1). Outside the rect the
+ * layer contributes transparent 2D; where M = 0 and no 2D coverage,
+ * final.a → 0 and the compose-under-bg path shows the desktop. A full-window
+ * rect is the degenerate case (reproduces the legacy surround source).
+ *
+ * Multiple Local2D layers flatten in layer-list order (later = on top) with
+ * premultiplied-alpha "over"; XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT
+ * is honored per layer. Local2D layers SUPERSEDE a registered surround
+ * texture for that frame (newer authority wins totally).
+ *
+ * It is valid to submit Local2D layers without ever creating a mask object:
+ * with no active mask, the union of the frame's Local2D layer rects implies
+ * an IMPLICIT mask (M = 0 inside the rects, M = 1 elsewhere) that behaves
+ * exactly like an explicit Tier-2 mask built from those rects — including
+ * superseding the canvas output rect (uniform rule: any active mask
+ * supersedes; no third state). An explicit submitted mask takes total
+ * authority. The extension must still be enabled on the instance.
+ */
+typedef struct XrCompositionLayerLocal2DEXT {
+    XrStructureType             type;       //!< XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT
+    const void* XR_MAY_ALIAS    next;
+    XrCompositionLayerFlags     layerFlags; //!< alpha bits honored
+    XrSwapchainSubImage         subImage;   //!< source texture + sub-rect
+    XrRect2Di                   rect;       //!< client-window pixels, dest
+} XrCompositionLayerLocal2DEXT;
+
+/*!
+ * @brief Queued when the runtime's recommended view size changes — mask
+ *        activation / deactivation / window resize (spec v3, #439 Phase 3).
+ *
+ * The app should recreate its projection swapchains at the new size. Purely
+ * advisory — the projection pass scales arbitrary submitted sizes, so a
+ * laggy app stays correct (just soft); there is no hard protocol step.
+ * Fired only when the dimensions actually change.
+ */
+typedef struct XrEventDataLocal3DZoneViewSizeChangedEXT {
+    XrStructureType          type;   //!< XR_TYPE_EVENT_DATA_LOCAL_3D_ZONE_VIEW_SIZE_CHANGED_EXT
+    const void* XR_MAY_ALIAS next;
+    uint32_t                 recommendedImageRectWidth;
+    uint32_t                 recommendedImageRectHeight;
+} XrEventDataLocal3DZoneViewSizeChangedEXT;
 
 typedef XrResult (XRAPI_PTR *PFN_xrGetLocal3DZoneCapabilitiesEXT)(
     XrSession session, XrLocal3DZoneCapabilitiesEXT* capabilities);
