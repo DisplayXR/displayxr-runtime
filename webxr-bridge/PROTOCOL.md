@@ -46,15 +46,15 @@ Bridge calls `xrRequestDisplayRenderingModeEXT(session, modeIndex)`. Runtime pro
   "recommendedViewScale": [0.5, 0.5],
   "nominalViewerPosition": [0.0, 0.1, 0.6],
   "renderingModes": [
-    { "index": 0, "name": "2D", "viewCount": 1, "tileColumns": 1, "tileRows": 1, "viewScale": [1.0, 1.0], "hardware3D": false },
-    { "index": 1, "name": "LeiaSR", "viewCount": 2, "tileColumns": 2, "tileRows": 1, "viewScale": [0.5, 0.5], "hardware3D": true }
+    { "index": 0, "name": "2D", "viewCount": 1, "tileColumns": 1, "tileRows": 1, "viewScale": [1.0, 1.0], "hardware3D": false, "hasTracking": false },
+    { "index": 1, "name": "LeiaSR", "viewCount": 2, "tileColumns": 2, "tileRows": 1, "viewScale": [0.5, 0.5], "hardware3D": true, "hasTracking": true }
   ],
   "currentModeIndex": 1,
   "views": [
     { "index": 0, "recommendedImageRectWidth": 1920, "recommendedImageRectHeight": 1080, "maxImageRectWidth": 3840, "maxImageRectHeight": 2160 },
     { "index": 1, "recommendedImageRectWidth": 1920, "recommendedImageRectHeight": 1080, "maxImageRectWidth": 3840, "maxImageRectHeight": 2160 }
   ],
-  "eyeTracking": { "supportedModes": ["MANAGED"], "defaultMode": "MANAGED" },
+  "eyeTracking": { "supportedModes": ["MANAGED"], "defaultMode": "MANAGED", "isTracking": true },
   "windowInfo": {
     "valid": true,
     "windowPixelSize": [1920, 1080],
@@ -71,6 +71,10 @@ Bridge calls `xrRequestDisplayRenderingModeEXT(session, modeIndex)`. Runtime pro
 `viewWidth` and `viewHeight` are the compositor's actual per-view tile dimensions in pixels, read from the compositor's HWND properties. These are deferred-resize-aware — they don't update mid-drag, only after the compositor finishes resizing its atlas. Pages should use these for per-tile viewport sizing instead of computing from `displayPixelSize × viewScale` or dividing the framebuffer by the tile grid. Present when the compositor has published its view dims; absent on older bridges.
 
 `eyeTracking.supportedModes` is an array of the eye-tracking modes the DP actually supports (currently one of `"MANAGED"`, `"MANUAL"`, or both). Apps **MUST** check membership before calling `requestEyeTrackingMode` — requesting an unsupported mode is ignored by the bridge (logged) and never reaches the DP. Leia's DP today reports `["MANAGED"]`. `eyeTracking.defaultMode` is the mode the DP uses when the app hasn't requested one.
+
+`eyeTracking.isTracking` is the last-known derived tracking state — `activeMode.hasTracking && tracker lock` (#441 v14). Omitted while still unknown (no view locate yet). It is a snapshot for late-joining clients; live edges arrive via `eye-tracking-state-changed` messages.
+
+`renderingModes[].hasTracking` is the per-mode tracking capability (#441 v14): whether the mode consumes live eye tracking. When the **active** mode has `hasTracking: false` (export modes like SBS/anaglyph; every sim_display mode), `isTracking` is always `false` regardless of tracker state. Absent on older bridges — treat absence as `false`-unknown.
 
 ### `window-info`
 
@@ -136,6 +140,19 @@ Sent on every `XrEventDataRenderingModeChangedEXT`. The `views` array contains r
 ```
 
 Sent on `XrEventDataHardwareDisplayStateChangedEXT` (physical display's 3D backlight state changed).
+
+### `eye-tracking-state-changed`
+
+```json
+{
+  "type": "eye-tracking-state-changed",
+  "version": 1,
+  "isTracking": false,
+  "activeMode": "MANAGED"
+}
+```
+
+Sent on `XrEventDataEyeTrackingStateChangedEXT` (#441 v14) — edge-triggered on every flip of the derived `isTracking` value (`activeMode.hasTracking && tracker lock`). Fires on DP tracking loss/recovery **and** on rendering-mode switches into/out of untracked modes. The extension dispatches an `eyetrackingstatechange` event on the session with `event.detail = { isTracking, activeMode }` and keeps `displayXR.eyeTracking.isTracking` current. Pages should use this instead of polling — e.g. pause head-coupled rendering on loss, or request a 2D mode after their own transition.
 
 ### `eye-poses`
 

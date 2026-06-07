@@ -249,6 +249,35 @@ comp_ipc_client_compositor_get_predicted_eye_positions(struct xrt_compositor *xc
 }
 
 /*
+ * Same fetch reached through the SYSTEM compositor (#449). Compositor-less
+ * sessions — headless XR_MND_headless clients like the WebXR bridge — have no
+ * xcn to route through, but their xsysc IS the embedded system proxy of this
+ * file's ipc_client_compositor, so container_of recovers the connection.
+ * Only safe to call when `xsysc` is the IPC client system compositor (the
+ * OpenXR state tracker gates on info.is_service_mode && xmcc == NULL).
+ */
+bool
+comp_ipc_client_system_compositor_get_predicted_eye_positions(struct xrt_system_compositor *xsysc,
+                                                              struct xrt_eye_positions *out_eyes)
+{
+	if (xsysc == NULL || out_eyes == NULL) {
+		return false;
+	}
+
+	struct ipc_client_compositor *icc = container_of(xsysc, struct ipc_client_compositor, system);
+	if (icc->ipc_c == NULL) {
+		return false;
+	}
+
+	xrt_result_t xret = ipc_call_compositor_get_predicted_eye_positions(icc->ipc_c, out_eyes);
+	if (xret != XRT_SUCCESS) {
+		return false;
+	}
+
+	return out_eyes->valid;
+}
+
+/*
  * Phase 2 — workspace_sync_fence bridges (D3D11 client compositor only).
  * Same gating contract: only safe to call when `xc` is an ipc_client_compositor.
  *
