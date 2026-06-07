@@ -181,6 +181,16 @@ comp_layer_accum_window_space(struct comp_layer_accum *cla, struct xrt_swapchain
 
 
 /*!
+ * Accumulate swapchain and data for a local-2D layer for a frame
+ * (XR_EXT_local_3d_zone v3, #439 Phase 3).
+ *
+ * @public @memberof comp_layer_accum
+ */
+xrt_result_t
+comp_layer_accum_local_2d(struct comp_layer_accum *cla, struct xrt_swapchain *xsc, const struct xrt_layer_data *data);
+
+
+/*!
  * Get a (color) swapchain associated with a layer.
  *
  * @param cla self
