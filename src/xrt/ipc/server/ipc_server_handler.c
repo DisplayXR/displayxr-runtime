@@ -167,6 +167,14 @@ fill_surplus_view_poses(struct xrt_device *xdev,
  * Try to get SR-aware view poses for IPC clients.
  * Returns true if SR view poses were computed, false to fall back to device poses.
  */
+// rig / rig_reply (#396 W7, XR_EXT_view_rig over IPC): when `rig` carries a
+// chained descriptor it drives the two-rig branch below exactly like the
+// in-process oxr_session.c path — rig tunables replace the qwerty stereo
+// state, the rig pose replaces the qwerty/zero display pose, and the
+// use_qwerty_head forcing is lifted (the explicit descriptor is the knowledge
+// that forcing substituted for). `rig_reply` (optional) receives the raw
+// input set (XrViewDisplayRawEXT payload) + the world-space rig eyes. Both
+// NULL on the legacy device_get_view_poses path — zero behavior change.
 static bool
 ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
                           struct xrt_compositor *xc,
@@ -174,6 +182,8 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
                           const struct xrt_vec3 *fallback_eye_relation,
                           int64_t at_timestamp_ns,
                           uint32_t view_count,
+                          const struct ipc_view_rig_info *rig,
+                          struct ipc_info_locate_views_rig *rig_reply,
                           struct xrt_space_relation *out_head_relation,
                           struct xrt_fov *out_fovs,
                           struct xrt_pose *out_poses)
@@ -233,6 +243,24 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		if (eye_count > 1) raw_eyes[1] = right_eye;
 	}
 
+	// XR_EXT_view_rig raw channel (#396 W7): capture the raw display-space
+	// eyes VERBATIM — before the window/canvas rebase below, mirroring the
+	// in-process rule (raw = the untransformed input set; the consumer
+	// applies the window/canvas resolve itself). Timestamp + tracking lock
+	// come from the full DP eye query.
+	if (rig_reply != NULL) {
+		for (uint32_t i = 0; i < eye_count; i++) {
+			rig_reply->raw.eyes[i] = raw_eyes[i];
+		}
+		rig_reply->raw.eye_count = eye_count;
+		struct xrt_eye_positions full_eyes = {0};
+		if (comp_d3d11_service_get_predicted_eye_positions_full(s->xsysc, &full_eyes) && full_eyes.valid) {
+			rig_reply->raw.sample_time_ns = full_eyes.timestamp_ns;
+			rig_reply->raw.is_tracking = full_eyes.is_tracking ? 1u : 0u;
+		}
+		rig_reply->raw.valid = 1;
+	}
+
 	// Get screen dimensions for Kooima FOV
 	// Try per-client window metrics first (workspace mode dynamic windows),
 	// then fall back to global window metrics, then display dimensions.
@@ -274,6 +302,19 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 			                      fabsf(win_orient.y) > 0.0001f ||
 			                      fabsf(win_orient.z) > 0.0001f ||
 			                      fabsf(win_orient.w - 1.0f) > 0.0001f);
+			// XR_EXT_view_rig raw channel: the effective canvas on the
+			// panel — wm already describes the canvas sub-rect when one
+			// is set (u_canvas_apply_to_metrics), the client area
+			// otherwise. Same gate as the screen dims above so rect and
+			// meters always describe the same canvas.
+			if (rig_reply != NULL && wm.valid) {
+				rig_reply->raw.rect_x_px = wm.window_screen_left - wm.display_screen_left;
+				rig_reply->raw.rect_y_px = wm.window_screen_top - wm.display_screen_top;
+				rig_reply->raw.rect_w_px = (int32_t)wm.window_pixel_width;
+				rig_reply->raw.rect_h_px = (int32_t)wm.window_pixel_height;
+				rig_reply->raw.size_w_m = wm.window_width_m;
+				rig_reply->raw.size_h_m = wm.window_height_m;
+			}
 		} else if (!comp_d3d11_service_get_display_dimensions(s->xsysc, &screen_width_m, &screen_height_m)) {
 			static bool logged_no_dims = false;
 			if (!logged_no_dims) {
@@ -435,13 +476,48 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		return true;
 	}
 
+	// XR_EXT_view_rig (#396 W7): a chained rig drives the math below in
+	// place of the qwerty debug state — its pose replaces the qwerty/zero
+	// display pose, its tunables take the corresponding branch regardless
+	// of use_qwerty_head (lifting the identity-m2v forcing, mirroring the
+	// in-process oxr_session.c semantics). Strictly per-locate: the rig
+	// arrives in the call payload, nothing is latched. Values arrive
+	// pre-clamped by the client's chain parser.
+	const bool rig_display = rig != NULL && rig->rig_type == IPC_VIEW_RIG_DISPLAY;
+	const bool rig_camera = rig != NULL && rig->rig_type == IPC_VIEW_RIG_CAMERA;
+	if (rig_display || rig_camera) {
+		display_pos = rig->pose.position;
+		display_ori = rig->pose.orientation;
+		static bool rig_logged = false;
+		if (!rig_logged) {
+			rig_logged = true;
+			IPC_WARN(s, "VIEW-RIG IPC: first rig locate, type=%u (1=display 2=camera)", rig->rig_type);
+		}
+	}
+
+	// No-window fallback for the raw rect: report the full display.
+	if (rig_reply != NULL && rig_reply->raw.rect_w_px == 0) {
+		rig_reply->raw.rect_x_px = 0;
+		rig_reply->raw.rect_y_px = 0;
+		rig_reply->raw.rect_w_px = (int32_t)s->xsysc->info.display_pixel_width;
+		rig_reply->raw.rect_h_px = (int32_t)s->xsysc->info.display_pixel_height;
+		rig_reply->raw.size_w_m = screen_width_m;
+		rig_reply->raw.size_h_m = screen_height_m;
+	}
+
 	// Both paths use the canonical display3d/camera3d math via the shared
 	// displayxr-common core (displayxr_math_xrt.h) — the SAME code as the
 	// in-process oxr_session.c path and every app/engine consumer (#396 W7).
 	dxr_screen scr = {screen_width_m, screen_height_m};
 	struct xrt_pose display_pose = {display_ori, display_pos};
 
-	if (have_stereo_state && stereo_state.camera_mode && use_qwerty_head) {
+	if (rig_reply != NULL) {
+		rig_reply->raw.display_pose = display_pose;
+		rig_reply->rig_applied =
+		    rig_camera ? IPC_VIEW_RIG_CAMERA : (rig_display ? IPC_VIEW_RIG_DISPLAY : IPC_VIEW_RIG_NONE);
+	}
+
+	if (rig_camera || (have_stereo_state && stereo_state.camera_mode && use_qwerty_head && !rig_display)) {
 		// CAMERA-CENTRIC PATH (canonical camera3d math, shared core)
 		// In workspace mode, app sessions take this path with qwerty pose as
 		// the camera position. qwerty_toggle_camera_mode preserves the
@@ -451,12 +527,23 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		// the convergence plane in camera mode coincide. Both paths must
 		// be reachable in workspace mode for app sessions or the toggle becomes
 		// asymmetric (works in non-workspace mode, no-op in workspace mode).
-		dxr_camera3d_tunables ct = {
-		    .ipd_factor = stereo_state.cam_spread_factor,
-		    .parallax_factor = stereo_state.cam_parallax_factor,
-		    .inv_convergence_distance = stereo_state.cam_convergence,
-		    .half_tan_vfov = stereo_state.cam_half_tan_vfov,
-		};
+		dxr_camera3d_tunables ct;
+		if (rig_camera) {
+			// Chained XrCameraRigEXT — descriptor tunables, not qwerty.
+			ct = (dxr_camera3d_tunables){
+			    .ipd_factor = rig->ipd_factor,
+			    .parallax_factor = rig->parallax_factor,
+			    .inv_convergence_distance = rig->inv_convergence_distance,
+			    .half_tan_vfov = rig->half_tan_vfov,
+			};
+		} else {
+			ct = (dxr_camera3d_tunables){
+			    .ipd_factor = stereo_state.cam_spread_factor,
+			    .parallax_factor = stereo_state.cam_parallax_factor,
+			    .inv_convergence_distance = stereo_state.cam_convergence,
+			    .half_tan_vfov = stereo_state.cam_half_tan_vfov,
+			};
+		}
 		struct dxr_xrt_view cam_views[XRT_MAX_VIEWS];
 		dxr_xrt_camera3d_compute_views(raw_eyes, eye_count, NULL, &scr, &ct,
 		                               &display_pose, cam_views);
@@ -476,10 +563,13 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 			};
 			math_quat_rotate_vec3(&inv_ori, &diff, &out_poses[i].position);
 			out_poses[i].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+			if (rig_reply != NULL) {
+				rig_reply->eye_world[i] = cam_views[i].eye_world;
+			}
 		}
 	} else {
 		// DISPLAY-CENTRIC PATH (canonical display3d math, shared core)
-		if (use_qwerty_head) {
+		if (use_qwerty_head || rig_display) {
 			out_head_relation->pose.position = display_pos;
 			out_head_relation->pose.orientation = display_ori;
 		} else {
@@ -488,7 +578,14 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		}
 
 		dxr_display3d_tunables dt = dxr_display3d_default_tunables();
-		if (have_stereo_state && use_qwerty_head) {
+		if (rig_display) {
+			// Chained XrDisplayRigEXT — lifts the identity-m2v forcing
+			// for non-qwerty clients too, exactly like in-process.
+			dt.ipd_factor = rig->ipd_factor;
+			dt.parallax_factor = rig->parallax_factor;
+			dt.perspective_factor = rig->perspective_factor;
+			dt.virtual_display_height = rig->virtual_display_height;
+		} else if (have_stereo_state && use_qwerty_head) {
 			// Same gate as the camera-centric branch: workspace clients must
 			// see disp_vHeight (the user-tuned virtual display size)
 			// rather than identity m2v, otherwise the P-key toggle from
@@ -518,6 +615,9 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 			};
 			math_quat_rotate_vec3(&inv_ori, &diff, &out_poses[i].position);
 			out_poses[i].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+			if (rig_reply != NULL) {
+				rig_reply->eye_world[i] = disp_views[i].eye_world;
+			}
 		}
 	}
 
@@ -4246,7 +4346,7 @@ ipc_handle_device_get_view_poses(volatile struct ipc_client_state *ics,
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	// Try SR-aware view poses first (pass client compositor for per-client window metrics)
 	if (ipc_try_get_sr_view_poses(ics, (struct xrt_compositor *)ics->xc, xdev, fallback_eye_relation, at_timestamp_ns,
-	                               view_count, &reply.head_relation, fovs, poses)) {
+	                               view_count, NULL, NULL, &reply.head_relation, fovs, poses)) {
 		reply.result = XRT_SUCCESS;
 	} else
 #endif
@@ -4313,7 +4413,8 @@ ipc_handle_device_get_view_poses_2(volatile struct ipc_client_state *ics,
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	// Try SR-aware view poses first (pass client compositor for per-client window metrics)
 	if (ipc_try_get_sr_view_poses(ics, (struct xrt_compositor *)ics->xc, xdev, default_eye_relation, at_timestamp_ns,
-	                               view_count, &out_info->head_relation, out_info->fovs, out_info->poses)) {
+	                               view_count, NULL, NULL, &out_info->head_relation, out_info->fovs,
+	                               out_info->poses)) {
 		return XRT_SUCCESS;
 	}
 #endif
@@ -4322,6 +4423,61 @@ ipc_handle_device_get_view_poses_2(volatile struct ipc_client_state *ics,
 	return xrt_device_get_view_poses( //
 	    xdev,                         //
 	    default_eye_relation,         //
+	    at_timestamp_ns,              //
+	    view_count,                   //
+	    &out_info->head_relation,     //
+	    out_info->fovs,               //
+	    out_info->poses);             //
+}
+
+xrt_result_t
+ipc_handle_session_locate_views_rig(volatile struct ipc_client_state *ics,
+                                    const struct ipc_view_rig_info *rig,
+                                    int64_t at_timestamp_ns,
+                                    uint32_t view_count,
+                                    struct ipc_info_locate_views_rig *out_info)
+{
+	struct ipc_server *s = ics->server;
+
+	if (view_count == 0 || view_count > XRT_MAX_VIEWS) {
+		IPC_ERROR(s, "session_locate_views_rig: bad view_count %u", view_count);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	// Views are always computed for the head device — resolve it from the
+	// system roles rather than a wire device id (this call is session-
+	// scoped, not device-scoped).
+	struct xrt_device *head = s->xsysd != NULL ? s->xsysd->static_roles.head : NULL;
+	if (head == NULL) {
+		IPC_ERROR(s, "session_locate_views_rig: no head device");
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	U_ZERO(out_info);
+
+	// The legacy path's fallback eye relation is the client's IPD-based
+	// default; this call always runs against the DP-tracked path, so a
+	// nominal IPD is only consumed if the SR path is unavailable.
+	struct xrt_vec3 fallback_eye_relation = {0.063f, 0.0f, 0.0f};
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (ipc_try_get_sr_view_poses(ics, (struct xrt_compositor *)ics->xc, head, &fallback_eye_relation,
+	                               at_timestamp_ns, view_count, rig, out_info, &out_info->head_relation,
+	                               out_info->fovs, out_info->poses)) {
+		return XRT_SUCCESS;
+	}
+#else
+	(void)rig;
+#endif
+
+	// No SR path (no DP / no eyes / not the D3D11 service): legacy device
+	// poses, rig inert, raw left invalid — the client falls back to the
+	// plain locate behavior.
+	out_info->rig_applied = IPC_VIEW_RIG_NONE;
+	out_info->raw.valid = 0;
+	return xrt_device_get_view_poses( //
+	    head,                         //
+	    &fallback_eye_relation,       //
 	    at_timestamp_ns,              //
 	    view_count,                   //
 	    &out_info->head_relation,     //

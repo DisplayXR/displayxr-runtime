@@ -700,6 +700,81 @@ struct ipc_info_get_view_poses_2
 	struct xrt_space_relation head_relation;
 };
 
+/*!
+ * XR_EXT_view_rig over IPC (#396 W7): rig kinds on the wire.
+ */
+#define IPC_VIEW_RIG_NONE 0
+#define IPC_VIEW_RIG_DISPLAY 1
+#define IPC_VIEW_RIG_CAMERA 2
+
+/*!
+ * XR_EXT_view_rig over IPC (#396 W7): a chained rig descriptor crossing the
+ * boundary (oxr client -> service) for ONE xrLocateViews call. POD mirror of
+ * the client's already-clamped oxr_view_rig_state. Strictly per-locate —
+ * never latched on either side: a non-chained locate takes the legacy
+ * device_get_view_poses path untouched, preserving the raw-eye transport
+ * contract in XrView.pose that external-window app math depends on.
+ *
+ * @ingroup ipc
+ */
+struct ipc_view_rig_info
+{
+	uint32_t rig_type;              //!< IPC_VIEW_RIG_*
+	struct xrt_pose pose;           //!< Display-plane / camera pose in the locate space
+	float virtual_display_height;   //!< Display rig only
+	float perspective_factor;       //!< Display rig only
+	float inv_convergence_distance; //!< Camera rig only
+	float half_tan_vfov;            //!< Camera rig only
+	float ipd_factor;               //!< Both rigs
+	float parallax_factor;          //!< Both rigs
+};
+
+/*!
+ * XR_EXT_view_rig over IPC (#396 W7): the XrViewDisplayRawEXT payload,
+ * gathered service-side from the same inputs the server rig math consumes —
+ * raw display-space eyes VERBATIM (pre window/canvas rebase, pre surplus
+ * synthesis), the per-client effective canvas (window metrics after
+ * u_canvas_apply_to_metrics), the display-plane pose, and the DP sample
+ * timestamp / tracking lock.
+ *
+ * @ingroup ipc
+ */
+struct ipc_view_raw_info
+{
+	struct xrt_vec3 eyes[XRT_MAX_VIEWS]; //!< Raw display-space eyes (verbatim)
+	uint32_t eye_count;                  //!< Valid entries in eyes[]
+	struct xrt_pose display_pose;        //!< Display plane pose in the locate space
+	int32_t rect_x_px;                   //!< Effective canvas on the panel (display-relative px)
+	int32_t rect_y_px;
+	int32_t rect_w_px;
+	int32_t rect_h_px;
+	float size_w_m;       //!< Physical size of that canvas (meters)
+	float size_h_m;
+	int64_t sample_time_ns; //!< When the eyes were sampled (monotonic)
+	uint32_t is_tracking;   //!< Physical tracker lock (bool on the wire)
+	uint32_t valid;         //!< Raw block actually populated
+};
+
+/*!
+ * XR_EXT_view_rig over IPC (#396 W7): reply for session_locate_views_rig.
+ * head_relation/fovs/poses are the SAME outputs the legacy
+ * device_get_view_poses handler produces (same server code path, with the
+ * rig overrides applied when one is chained); eye_world carries the
+ * world-space rig eyes the in-process path writes into XrView.pose, valid
+ * when rig_applied != IPC_VIEW_RIG_NONE.
+ *
+ * @ingroup ipc
+ */
+struct ipc_info_locate_views_rig
+{
+	struct xrt_space_relation head_relation;
+	struct xrt_fov fovs[XRT_MAX_VIEWS];
+	struct xrt_pose poses[XRT_MAX_VIEWS];
+	struct xrt_vec3 eye_world[XRT_MAX_VIEWS];
+	uint32_t rig_applied; //!< IPC_VIEW_RIG_* actually applied by the server
+	struct ipc_view_raw_info raw;
+};
+
 struct ipc_pcm_haptic_buffer
 {
 	uint32_t num_samples;

@@ -771,6 +771,23 @@ comp_ipc_client_compositor_workspace_capture_frame(struct xrt_compositor *xc,
 }
 
 xrt_result_t
+comp_ipc_client_compositor_locate_views_rig(struct xrt_compositor *xc,
+                                            const struct ipc_view_rig_info *rig,
+                                            int64_t at_timestamp_ns,
+                                            uint32_t view_count,
+                                            struct ipc_info_locate_views_rig *out_info)
+{
+	if (xc == NULL || rig == NULL || out_info == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_session_locate_views_rig(icc->ipc_c, rig, at_timestamp_ns, view_count, out_info);
+}
+
+xrt_result_t
 comp_ipc_client_compositor_workspace_enumerate_clients(struct xrt_compositor *xc,
                                                        uint32_t capacity,
                                                        uint32_t *out_count,
