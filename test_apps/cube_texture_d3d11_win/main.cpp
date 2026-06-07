@@ -577,13 +577,16 @@ static void UpdatePerformanceStats(PerformanceStats& stats) {
 //   3 Tier-2 multi-rect: three disconnected 3D islands
 //   4 Tier-3 freeform: CPU radial gradient uploaded onto the mask RT
 //     (soft 2D↔3D edge — validates the mask-lerp, impl doc §6 case 4)
+//   5 Tier-1 whole-window 2D (all-zero mask — the #224 hardware-DP leg must
+//     collapse the panel to 2D while the mask stays active; the composite
+//     shows the 2D surround everywhere)
 static void ZoneMaskApplyNextState(XrSessionManager& xr, D3D11Renderer& renderer) {
     if (!g_zone.available || xr.session == XR_NULL_HANDLE) {
         LOG_WARN("Zone mask: XR_EXT_local_3d_zone not available on this runtime");
         return;
     }
 
-    int next = (g_zone.state + 1) % 5;
+    int next = (g_zone.state + 1) % 6;
 
     if (next == 0) {
         if (g_zone.mask != XR_NULL_HANDLE) {
@@ -682,6 +685,10 @@ static void ZoneMaskApplyNextState(XrSessionManager& xr, D3D11Renderer& renderer
         }
         break;
     }
+    case 5: // Tier 1 — whole window 2D (all-zero mask; #224: panel must drop to 2D)
+        res = g_zone.pfnSetWhole(g_zone.mask, XR_FALSE);
+        LOG_INFO("Zone mask [5]: Tier-1 whole-window 2D (all-zero mask — panel should drop to 2D)");
+        break;
     default:
         break;
     }
