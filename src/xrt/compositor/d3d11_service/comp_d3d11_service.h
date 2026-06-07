@@ -196,6 +196,25 @@ comp_d3d11_service_get_client_window_metrics(struct xrt_system_compositor *xsysc
                                               struct xrt_window_metrics *out_metrics);
 
 /*!
+ * Window metrics from the client's REAL HWND (XR_EXT_win32_window_binding,
+ * carried in xrt_session_info) — for non-workspace IPC clients, which have
+ * no virtual-window slot. Used by the XR_EXT_view_rig IPC path (#396 W7) so
+ * rig math runs window-scoped like the in-process path; same math as
+ * comp_d3d11_compositor_get_window_metrics.
+ *
+ * @param xsysc The system compositor (must be D3D11 service compositor).
+ * @param xc The client's compositor (holds the app HWND).
+ * @param[out] out_metrics Filled with real window dimensions and center offset.
+ * @return true if metrics were obtained, false otherwise.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_get_client_app_window_metrics(struct xrt_system_compositor *xsysc,
+                                                  struct xrt_compositor *xc,
+                                                  struct xrt_window_metrics *out_metrics);
+
+/*!
  * Check if the compositor's window is still valid (not closed by user).
  *
  * This should be checked periodically by the IPC server to detect when

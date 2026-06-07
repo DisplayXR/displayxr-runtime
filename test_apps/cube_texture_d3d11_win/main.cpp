@@ -821,7 +821,41 @@ static void RenderOneFrame(RenderState& rs) {
                     uint32_t viewCount = 0;
                     XrView rawViews[8] = {};
                     for (int i = 0; i < 8; i++) rawViews[i].type = XR_TYPE_VIEW;
+
+                    // XR_EXT_view_rig raw channel (#396 W7): chain the raw
+                    // result struct (no rig request) — the one-shot log below
+                    // proves canvasRectPx reports this texture app's canvas
+                    // SUB-RECT (xrSetSharedTextureOutputRectEXT), not the
+                    // window client area.
+                    XrViewDisplayRawEXT viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+                    if (g_hasViewRigExt) {
+                        viewState.next = &viewRigRaw;
+                    }
+
                     xrLocateViews(xr.session, &locateInfo, &viewState, 8, &viewCount, rawViews);
+
+                    if (g_hasViewRigExt) {
+                        // Latch on the first locate with a real canvas rect —
+                        // the earliest frames run before the window metrics /
+                        // output rect exist and report the display fallback.
+                        // Frame ~120 fallback: log whatever we have so a
+                        // missing rect is visible in the log too.
+                        static bool rawLogged = false;
+                        static int rawFrames = 0;
+                        rawFrames++;
+                        if (!rawLogged && viewRigRaw.eyeCountOutput > 0 &&
+                            (viewRigRaw.canvasRectPx.extent.width > 0 || rawFrames >= 120)) {
+                            rawLogged = true;
+                            LOG_INFO("ViewRig RAW (texture): eyes=%u [0]=(%.4f,%.4f,%.4f) "
+                                     "canvas=(%d,%d %dx%d) %.4fx%.4fm tracking=%d",
+                                     viewRigRaw.eyeCountOutput,
+                                     viewRigRaw.rawEyes[0].x, viewRigRaw.rawEyes[0].y, viewRigRaw.rawEyes[0].z,
+                                     viewRigRaw.canvasRectPx.offset.x, viewRigRaw.canvasRectPx.offset.y,
+                                     viewRigRaw.canvasRectPx.extent.width, viewRigRaw.canvasRectPx.extent.height,
+                                     viewRigRaw.canvasSizeMeters.width, viewRigRaw.canvasSizeMeters.height,
+                                     (int)viewRigRaw.isTracking);
+                        }
+                    }
 
                     uint32_t maxTileW = tileColumns > 0 ? xr.swapchain.width / tileColumns : xr.swapchain.width;
                     uint32_t maxTileH = tileRows > 0 ? xr.swapchain.height / tileRows : xr.swapchain.height;

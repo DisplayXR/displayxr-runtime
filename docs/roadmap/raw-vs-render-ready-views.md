@@ -1,26 +1,30 @@
 ---
-status: Phase 1 implemented (extension surface)
+status: Implemented (extension surface + shared core + IPC)
 owner: David Fattal
-updated: 2026-06-06
+updated: 2026-06-07
 issues: [396]
 code-paths:
   - src/external/openxr_includes/openxr/XR_EXT_view_rig.h
   - src/xrt/state_trackers/oxr/oxr_session.c
   - src/xrt/drivers/qwerty/qwerty_device.c
-  - src/xrt/auxiliary/math/m_display3d_view.*
-  - src/xrt/auxiliary/math/m_camera3d_view.*
+  - src/xrt/auxiliary/math/CMakeLists.txt
   - src/xrt/include/xrt/xrt_display_metrics.h
   - src/xrt/ipc/server/ipc_server_handler.c
+  - src/xrt/ipc/shared/ipc_protocol.h
 ---
 
-> **Status: Phase 1 implemented** — the `XR_EXT_view_rig` extension surface
-> ships (header, registration, per-locate rig chaining on in-process sessions,
-> raw-result channel; verify vehicle `cube_handle_d3d11_win` R-toggle). The
-> equivalence-by-construction half (type-neutral `displayxr::math` core
-> replacing the runtime's `m_*_view` ports) is a follow-up phase, as are IPC
-> plumbing, the texture-canvas sub-rect in the raw channel, and surplus-eye
-> exposure — see "Phase 1 decisions" below. Promote to an ADR (next free
-> number) once the math fold-in lands. Tracked as
+> **Status: implemented** — the `XR_EXT_view_rig` extension surface ships
+> (header, registration, per-locate rig chaining, raw-result channel; verify
+> vehicles: `cube_handle_d3d11_win` R-toggle, `cube_texture_d3d11_win`
+> raw-canvas log); the equivalence-by-construction half is structural (the
+> runtime's `m_*_view` ports are deleted — the runtime and every app/engine
+> consumer run displayxr-common's type-neutral core `dxr_view_math`,
+> v0.4.0); and the rig + raw channel work over IPC for service-mode sessions
+> (`session_locate_views_rig`, same server code path as the legacy locate
+> plus rig overrides). Remaining tails are optional: consumer migrations onto
+> the rig request, the WebXR bridge's move to the explicit raw result,
+> surplus-eye exposure, the workspace constraint hook, and ADR promotion of
+> this doc. Tracked as
 > **W7 of [#396](https://github.com/DisplayXR/displayxr-runtime/issues/396)**.
 
 ## Phase 1 decisions (implementation, 2026-06-06)
@@ -42,13 +46,20 @@ code-paths:
 - **Boundary conversions**: `convergenceDiopters` → `inv_convergence_distance`
   is numerically identity (qwerty's `cam_convergence` is already diopters);
   `verticalFov` → `tanf(v/2)`.
-- **Known Phase-1 gaps** (each a follow-up): IPC-client sessions parse but
-  ignore the rig (the client-side Kooima block never runs — the server
-  computes views; raw channel returns defaults); the raw `canvasRectPx` is the
-  window client area even for texture apps (mirrors exactly what the runtime's
-  own rig math consumes today — the canvas sub-rect lives compositor-side);
-  workspace-controller rig constraints unimplemented (rig stays app visual
-  policy).
+- **Former Phase-1 gaps, now closed** (W7 completion, 2026-06-07):
+  - *IPC*: service-mode locates that chain a rig and/or the raw struct route
+    through `session_locate_views_rig` — the same server code path as the
+    legacy `device_get_view_poses` (`ipc_try_get_sr_view_poses`), with the
+    rig overrides applied and the raw block gathered server-side. Per-locate
+    on both sides; non-chained locates take the legacy path untouched.
+  - *Texture-canvas raw rect*: turned out to need no plumbing — every
+    compositor's `get_window_metrics` already rewrites the window fields to
+    the effective canvas sub-rect (`u_canvas_apply_to_metrics`), so the raw
+    channel (and the runtime's own rig math) consume the canvas by
+    construction. Verified live via `cube_texture_d3d11_win`'s raw-canvas
+    log.
+- **Still open** (optional): workspace-controller rig constraints (rig stays
+  app visual policy); surplus-eye exposure in the raw channel.
 
 # Raw vs Render-Ready Views — the rig API
 
