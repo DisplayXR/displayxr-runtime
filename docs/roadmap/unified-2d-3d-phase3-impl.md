@@ -3,7 +3,7 @@
 **Spec:** [`unified-2d-3d-compositing.md`](unified-2d-3d-compositing.md) §6 (Phase 3), §4 (composite + output-alpha), §5.1 (coordinate contract). Epic #439.
 **Builds on:** D3D11 Phases 0–2 + D3D12 consumer + cross-API base (all on `main`); the `XRT_LAYER_WINDOW_SPACE` machinery as the structural sibling.
 
-> **STATUS: designed (Q1–Q4 resolved with product owner 2026-06-07); ready to split into the macOS and Windows legs (§7).**
+> **STATUS: macOS hub leg LANDED + validated 2026-06-07 (header v3, xrt/oxr plumbing, view-size event, all vtables wired, Metal Tier-1/2 backend + consumer; §8 cases 1–4 green on the metal test apps). Windows legs (§7) next — D3D11 consumer is the pathfinder.**
 
 ---
 
@@ -104,7 +104,7 @@ IPC: nothing — the union rides `ipc_layer_entry` as-is (out-of-process *consum
 
 ## 9. Done-when
 
-- [ ] Header v3 + xrt/oxr layer plumbing + event, macOS-green, Metal consumer validated locally (§8 cases on metal test apps).
+- [x] Header v3 + xrt/oxr layer plumbing + event, macOS-green, Metal consumer validated locally (§8 cases on metal test apps). *(2026-06-07: case 1 surround-region byte-identical, canvas resampling epsilon mean<2 with app-side world-scale constancy; cases 2/3/4 pixel-checked incl. §4.2 alpha; view-size event fires exactly once at mask activation, silent for handle apps. Notes: Metal Tier-3 = `XR_ERROR_FEATURE_UNSUPPORTED` (no Metal binding type in v3); the event struct carries the conventional `XrSession session` field the §3 sketch omitted; hosted (framebufferOnly) drawables skip the composite with a one-time WARN.)*
 - [ ] D3D11 consumer Leia-validated (§8 full matrix); surround path zero-regression.
 - [ ] VK consumer landed → epic "VK — all demos" ticked; demos can adopt.
 - [ ] D3D12 delta landed; GL tracked or ticked.
