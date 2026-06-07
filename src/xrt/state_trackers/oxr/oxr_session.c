@@ -109,6 +109,19 @@ bool
 comp_ipc_client_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
                                                        struct xrt_eye_positions *out_eyes);
 
+#ifdef OXR_HAVE_EXT_view_rig
+// XR_EXT_view_rig over IPC (#396 W7) — same linkage pattern as above; the
+// wire structs come from shared/ipc_protocol.h (include precedent:
+// oxr_capture.c / oxr_workspace.c).
+#include "shared/ipc_protocol.h"
+xrt_result_t
+comp_ipc_client_compositor_locate_views_rig(struct xrt_compositor *xc,
+                                            const struct ipc_view_rig_info *rig,
+                                            int64_t at_timestamp_ns,
+                                            uint32_t view_count,
+                                            struct ipc_info_locate_views_rig *out_info);
+#endif
+
 #ifdef XRT_OS_WINDOWS
 // GH #227 Tier 0: install / tear down the in-app CBT hook that re-parents
 // owned modal popups (file dialogs etc.) from the hidden app HWND onto a
@@ -1490,9 +1503,12 @@ oxr_session_locate_views(struct oxr_logger *log,
 
 #ifdef OXR_HAVE_EXT_view_rig
 			// XR_EXT_view_rig raw channel: the effective canvas + display
-			// plane — exactly the input set the rig math below consumes
-			// (window client area today; the texture-app canvas sub-rect
-			// is a follow-up, see raw-vs-render-ready-views.md).
+			// plane — exactly the input set the rig math below consumes.
+			// For texture apps these wm fields already describe the canvas
+			// sub-rect, not the window client area: every compositor's
+			// get_window_metrics runs u_canvas_apply_to_metrics(), which
+			// rewrites window_pixel_*/window_screen_*/window_*_m to the
+			// effective canvas when one is set.
 			if (view_raw != NULL) {
 				// Same gate as the window-relative branch above, so the
 				// rect and the meters always describe the same canvas.
@@ -1665,12 +1681,111 @@ oxr_session_locate_views(struct oxr_logger *log,
 		}
 	}
 
+	// XR_EXT_view_rig over IPC (#396 W7): on a service-mode session the
+	// client-side Kooima block above never runs (IPC proxies have no eye
+	// accessor; the SERVER computes views in ipc_try_get_sr_view_poses).
+	// When this locate chains a rig and/or the raw result struct, route it
+	// through the rig-aware server call instead of the device proxy — the
+	// SAME server code path as device_get_view_poses, plus the rig
+	// overrides and the raw-inputs block. Strictly per-locate: a locate
+	// that chains nothing takes the legacy path below untouched, keeping
+	// the raw-eye transport contract in XrView.pose. Bridge-relay sessions
+	// keep their headless fast-path contract.
+	bool ipc_rig_done = false;
+#ifdef OXR_HAVE_EXT_view_rig
+	if ((rig_active || view_raw != NULL) && !sess->is_bridge_relay && sess->xcn != NULL &&
+	    sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode) {
+		struct ipc_view_rig_info rig_info = {0};
+		if (rig_camera) {
+			rig_info.rig_type = IPC_VIEW_RIG_CAMERA;
+		} else if (rig_display) {
+			rig_info.rig_type = IPC_VIEW_RIG_DISPLAY;
+		}
+		if (rig_active) {
+			// Values are already clamped by view_rig_update_from_chain.
+			rig_info.pose = sess->view_rig.pose;
+			rig_info.virtual_display_height = sess->view_rig.virtual_display_height;
+			rig_info.perspective_factor = sess->view_rig.perspective_factor;
+			rig_info.inv_convergence_distance = sess->view_rig.inv_convergence_distance;
+			rig_info.half_tan_vfov = sess->view_rig.half_tan_vfov;
+			rig_info.ipd_factor = sess->view_rig.ipd_factor;
+			rig_info.parallax_factor = sess->view_rig.parallax_factor;
+		}
+
+		uint32_t wire_views = (view_count < XRT_MAX_VIEWS) ? view_count : XRT_MAX_VIEWS;
+		struct ipc_info_locate_views_rig reply = {0};
+		xrt_result_t xret = comp_ipc_client_compositor_locate_views_rig(
+		    &sess->xcn->base, &rig_info, xdisplay_time, wire_views, &reply);
+		if (xret == XRT_SUCCESS) {
+			ipc_rig_done = true;
+			T_xdev_head = reply.head_relation;
+			for (uint32_t i = 0; i < wire_views; i++) {
+				fovs[i] = reply.fovs[i];
+				poses[i] = reply.poses[i];
+			}
+
+			// Raw block, server-gathered from the same inputs its rig
+			// math consumed.
+			if (view_raw != NULL && reply.raw.valid) {
+				uint32_t rc = reply.raw.eye_count;
+				if (rc > XR_VIEW_RIG_MAX_RAW_EYES_EXT) {
+					rc = XR_VIEW_RIG_MAX_RAW_EYES_EXT;
+				}
+				for (uint32_t i = 0; i < rc; i++) {
+					view_raw->rawEyes[i] = (XrVector3f){
+					    reply.raw.eyes[i].x, reply.raw.eyes[i].y, reply.raw.eyes[i].z};
+				}
+				view_raw->eyeCountOutput = rc;
+				view_raw->displayPlanePose = (XrPosef){
+				    {reply.raw.display_pose.orientation.x, reply.raw.display_pose.orientation.y,
+				     reply.raw.display_pose.orientation.z, reply.raw.display_pose.orientation.w},
+				    {reply.raw.display_pose.position.x, reply.raw.display_pose.position.y,
+				     reply.raw.display_pose.position.z}};
+				view_raw->canvasRectPx = (XrRect2Di){{reply.raw.rect_x_px, reply.raw.rect_y_px},
+				                                     {reply.raw.rect_w_px, reply.raw.rect_h_px}};
+				view_raw->canvasSizeMeters =
+				    (XrExtent2Df){reply.raw.size_w_m, reply.raw.size_h_m};
+				view_raw->sampleTimeNs = reply.raw.sample_time_ns;
+				view_raw->isTracking = reply.raw.is_tracking ? XR_TRUE : XR_FALSE;
+			}
+
+			// Rig applied server-side: surface the world-space rig eyes
+			// through the existing view-override machinery, exactly like
+			// the in-process rig path (override block below writes
+			// XrView.pose from view_eye_world + world_head_ori).
+			if (reply.rig_applied != IPC_VIEW_RIG_NONE) {
+				for (uint32_t ei = 0; ei < wire_views; ei++) {
+					view_eye_world[ei] = reply.eye_world[ei];
+				}
+				have_eye_override = true;
+				world_head_pos = reply.head_relation.pose.position;
+				world_head_ori = reply.head_relation.pose.orientation;
+			}
+
+			static bool ipc_rig_logged = false;
+			if (!ipc_rig_logged) {
+				ipc_rig_logged = true;
+				U_LOG_W("VIEW-RIG IPC client: locate ok, rig_applied=%u raw_valid=%u eyes=%u",
+				        reply.rig_applied, reply.raw.valid, reply.raw.eye_count);
+			}
+		} else {
+			static bool ipc_rig_fail_logged = false;
+			if (!ipc_rig_fail_logged) {
+				ipc_rig_fail_logged = true;
+				U_LOG_W("VIEW-RIG IPC client: locate call failed (xret=%d), "
+				        "falling back to legacy device locate",
+				        xret);
+			}
+		}
+	}
+#endif
+
 	// Always get view poses from device (provides T_xdev_head and poses[])
 	// Save Kooima fovs before xrt_device_get_view_poses overwrites them.
 	// Save/restore is bounded by active_view_count: Kooima only populated
 	// fovs[0..active_view_count-1] (see #246). Entries beyond active are
 	// filled by the device's get_view_poses and must not be overwritten.
-	{
+	if (!ipc_rig_done) {
 		struct xrt_fov kooima_fovs[XRT_MAX_VIEWS];
 		uint32_t fov_save_count = (active_view_count < view_count) ? active_view_count : view_count;
 		if (have_kooima_fov && (have_view_state || rig_active)) {

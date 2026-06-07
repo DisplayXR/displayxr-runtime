@@ -325,6 +325,20 @@ comp_ipc_client_compositor_workspace_capture_frame(struct xrt_compositor *xc,
                                                    float out_eye_right_m[3]);
 
 /*!
+ * XR_EXT_view_rig over IPC (#396 W7): per-locate rig-driven view computation
+ * + raw-inputs fetch for one xrLocateViews call on an IPC session. The
+ * caller (oxr_session.c) includes shared/ipc_protocol.h for the wire structs
+ * (precedent: oxr_capture.c / oxr_workspace.c). Strictly per-locate — the
+ * legacy device_get_view_poses path stays untouched for non-chained locates.
+ */
+xrt_result_t
+comp_ipc_client_compositor_locate_views_rig(struct xrt_compositor *xc,
+                                            const struct ipc_view_rig_info *rig,
+                                            int64_t at_timestamp_ns,
+                                            uint32_t view_count,
+                                            struct ipc_info_locate_views_rig *out_info);
+
+/*!
  * Phase 2.I-prequel: workspace client enumeration. Bridge accepts a primitive
  * id array so st_oxr does not include IPC types.
  */

@@ -714,6 +714,17 @@
 		]
 	},
 
+	"session_locate_views_rig": {
+		"in": [
+			{"name": "rig", "type": "struct ipc_view_rig_info"},
+			{"name": "at_timestamp_ns", "type": "int64_t"},
+			{"name": "view_count", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "info", "type": "struct ipc_info_locate_views_rig"}
+		]
+	},
+
 	"device_compute_distortion": {
 		"in": [
 			{"name": "id", "type": "uint32_t"},
