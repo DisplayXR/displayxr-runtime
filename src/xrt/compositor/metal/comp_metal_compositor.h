@@ -124,6 +124,108 @@ comp_metal_compositor_set_surround_2d(struct xrt_compositor *xc,
                                        void *shared_handle,
                                        uint32_t w, uint32_t h);
 
+/*
+ * XR_EXT_local_3d_zone — authored 2D/3D mask consumer (#439 Phase 3; mirrors
+ * the D3D11 entry points from Phase 1, comp_d3d11_compositor.h).
+ *
+ * The oxr handlers forward here. Tier 1 (whole window) and Tier 2 (rect
+ * list) are CPU-authored into a canonical byte buffer and uploaded to an
+ * R8Unorm MTLTexture on submit (sticky, last-submit-wins). Tier 3 (freeform
+ * render target) has no Metal binding type in header v3 —
+ * zone_mask_acquire_rt returns XRT_ERROR_NOT_IMPLEMENTED, which oxr maps to
+ * XR_ERROR_FEATURE_UNSUPPORTED.
+ *
+ * While a submitted mask is active (or Local2D layers imply one), the
+ * canvas output rect is superseded: the weave spans the client window and
+ * the mask is the sole 2D/3D selector (Phase-2 rule, uniform).
+ */
+
+/*!
+ * Create the compositor-side mask state (R8Unorm texture, w×h client px;
+ * 0 lets the compositor choose the window backing size).
+ *
+ * @ingroup comp_metal
+ */
+xrt_result_t
+comp_metal_compositor_zone_mask_create(struct xrt_compositor *xc,
+                                       uint32_t w, uint32_t h,
+                                       void **out_mask);
+
+/*!
+ * Tier 1 — fill the whole mask: all-3D (enable_3d) or all-2D.
+ *
+ * @ingroup comp_metal
+ */
+xrt_result_t
+comp_metal_compositor_zone_mask_set_whole(struct xrt_compositor *xc,
+                                          void *mask,
+                                          bool enable_3d);
+
+/*!
+ * Tier 2 — rasterize client-window-pixel rects as the 3D region (M=1 inside,
+ * M=0 elsewhere).
+ *
+ * @ingroup comp_metal
+ */
+xrt_result_t
+comp_metal_compositor_zone_mask_set_rects(struct xrt_compositor *xc,
+                                          void *mask,
+                                          uint32_t count,
+                                          const struct xrt_rect *rects);
+
+/*!
+ * Tier 3 — not available on Metal (no Metal render-target binding in
+ * XR_EXT_local_3d_zone v3); always returns XRT_ERROR_NOT_IMPLEMENTED.
+ *
+ * @ingroup comp_metal
+ */
+xrt_result_t
+comp_metal_compositor_zone_mask_acquire_rt(struct xrt_compositor *xc,
+                                           void *mask,
+                                           void **out_rt,
+                                           uint32_t *out_w,
+                                           uint32_t *out_h);
+
+/*!
+ * Stage the mask's current contents for the next frame submission (atomic
+ * with that frame's weave — spec §9 Q3).
+ *
+ * @ingroup comp_metal
+ */
+xrt_result_t
+comp_metal_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask);
+
+/*!
+ * Destroy the compositor-side mask state.
+ *
+ * @ingroup comp_metal
+ */
+void
+comp_metal_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask);
+
+/*!
+ * Query the display processor's hardware zone grid. Always 0×0 on macOS
+ * (sim_display — compositor consumer only); returns false.
+ *
+ * @ingroup comp_metal
+ */
+bool
+comp_metal_compositor_zone_get_hw_caps(struct xrt_compositor *xc,
+                                       uint32_t *out_grid_w,
+                                       uint32_t *out_grid_h);
+
+/*!
+ * Current recommended per-view render size (client-window-derived when a
+ * mask is active, canvas-derived otherwise). Polled by oxr at frame end to
+ * fire XrEventDataLocal3DZoneViewSizeChangedEXT on change (#439 Phase 3 Q4).
+ *
+ * @ingroup comp_metal
+ */
+bool
+comp_metal_compositor_get_recommended_view_size(struct xrt_compositor *xc,
+                                                uint32_t *out_w,
+                                                uint32_t *out_h);
+
 /*!
  * Request a display mode switch (2D/3D).
  * Returns false if not supported.

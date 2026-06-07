@@ -88,6 +88,28 @@ struct comp_metal_swapchain
 
 /*
  *
+ * Zone-mask state (XR_EXT_local_3d_zone, #439 Phase 3)
+ *
+ */
+
+/*!
+ * Compositor-side state for one authored 2D/3D zone mask.
+ *
+ * Tier 1/2 author into the CPU-canonical @p author_bytes; submit uploads
+ * the bytes into @p tex (replaceRegion — Shared storage, sticky
+ * last-submit-wins). There is no Tier-3 authoring render target on Metal.
+ */
+struct comp_metal_zone_mask
+{
+	id<MTLTexture> tex;    //!< R8Unorm, the staged (submitted) mask content
+	uint8_t *author_bytes; //!< CPU authoring buffer, w*h, M in [0,255]
+	uint32_t w;            //!< Mask width in client-window pixels
+	uint32_t h;            //!< Mask height in client-window pixels
+	bool submitted;        //!< True once submitted at least once
+};
+
+/*
+ *
  * Metal compositor structure
  *
  */
@@ -236,6 +258,44 @@ struct comp_metal_compositor
 	//! Metal texture wrapping surround_iosurface (MRR — explicit release).
 	id<MTLTexture> surround_texture;
 
+	/*
+	 * XR_EXT_local_3d_zone consumer state (#439 Phase 3).
+	 */
+
+	//! The active (submitted) explicit zone mask, or NULL. Owned by the
+	//! oxr handle via the zone_mask_* entry points; this is a borrow.
+	struct comp_metal_zone_mask *zone_mask_active;
+
+	//! Runtime-owned implicit mask rasterized from the frame's Local2D
+	//! layer rects (M=0 inside, M=1 elsewhere) when no explicit mask.
+	id<MTLTexture> implicit_mask_tex;
+	uint8_t *implicit_mask_bytes;       //!< CPU raster buffer (w*h)
+	uint32_t implicit_mask_w;           //!< Current implicit mask width
+	uint32_t implicit_mask_h;           //!< Current implicit mask height
+	struct xrt_rect implicit_rects[XRT_MAX_LAYERS]; //!< Rect cache for change detection
+	uint32_t implicit_rect_count;       //!< Number of cached rects (0 = none rasterized)
+
+	//! Window-sized 2D scratch the Local2D layers flatten into (the `twod`
+	//! input of the masked composite) + the weave snapshot it lerps against.
+	id<MTLTexture> local2d_scratch;
+	id<MTLTexture> weave_scratch;
+	uint32_t composite_w;               //!< Current scratch width (0 = not allocated)
+	uint32_t composite_h;               //!< Current scratch height
+
+	//! Pipelines for the Local2D flatten (premultiplied over / unpremultiplied
+	//! source) and the masked composite pass.
+	id<MTLRenderPipelineState> local2d_premult_pipeline;
+	id<MTLRenderPipelineState> local2d_unpremult_pipeline;
+	id<MTLRenderPipelineState> masked_composite_pipeline;
+
+	//! Point sampler for the 1:1 composite reads.
+	id<MTLSamplerState> sampler_nearest;
+
+	//! True when the last committed frame carried Local2D layers (the
+	//! implicit mask is per-frame; this makes its canvas-supersede effect
+	//! visible to out-of-frame readers like get_window_metrics).
+	bool local_2d_last_frame;
+
 	//! Thread safety.
 	struct os_mutex mutex;
 
@@ -262,6 +322,14 @@ static inline struct comp_metal_swapchain *
 metal_swapchain(struct xrt_swapchain *xsc)
 {
 	return (struct comp_metal_swapchain *)xsc;
+}
+
+//! #439: any active mask — explicit submitted, or implicit from the last
+//! committed frame's Local2D layers — supersedes the canvas output rect.
+static inline bool
+metal_mask_is_active(struct comp_metal_compositor *c)
+{
+	return (c->zone_mask_active != NULL && c->zone_mask_active->submitted) || c->local_2d_last_frame;
 }
 
 // Release the 2D surround resources (texture wrap + retained IOSurface).
@@ -336,6 +404,22 @@ static NSString *const metal_shader_source = @
     "    float4 color = tex.sample(smp, in.texCoord);\n"
     "    if (pc.swizzle_rb > 0.5) color = float4(color.b, color.g, color.r, color.a);\n"
     "    return color * pc.color_scale + pc.color_bias;\n"
+    "}\n"
+    "\n"
+    "// #439 Phase 3 — masked 2D/3D composite (MSL port of the D3D11\n"
+    "// masked_composite.hlsl sampled-mask path). M=1 keeps the weave, M=0\n"
+    "// shows the flattened 2D layer; BOTH rgb and alpha are lerped so each\n"
+    "// layer's own transparency survives to the compose-under-bg pass\n"
+    "// (spec 4.2 output-alpha rule).\n"
+    "fragment float4 masked_composite_fragment(VertexOut in [[stage_in]],\n"
+    "                                          texture2d<float> twod_tex [[texture(0)]],\n"
+    "                                          texture2d<float> mask_tex [[texture(1)]],\n"
+    "                                          texture2d<float> weave_tex [[texture(2)]],\n"
+    "                                          sampler smp [[sampler(0)]]) {\n"
+    "    float M = saturate(mask_tex.sample(smp, in.texCoord).r);\n"
+    "    float4 twod = twod_tex.sample(smp, in.texCoord);\n"
+    "    float4 weave = weave_tex.sample(smp, in.texCoord);\n"
+    "    return M * weave + (1.0 - M) * twod;\n"
     "}\n";
 
 /*
@@ -523,6 +607,65 @@ compile_shaders(struct comp_metal_compositor *c)
 		}
 	}
 
+	// Local-2D flatten pipelines (#439 Phase 3) — projection shaders with
+	// alpha blending into the window-sized 2D scratch (no depth attachment).
+	// Premultiplied "over" by default; the unpremultiplied variant only
+	// changes the source RGB factor (XR_COMPOSITION_LAYER_UNPREMULTIPLIED_
+	// ALPHA_BIT). Alpha factors are One/OneMinusSrcAlpha in both so the
+	// flattened layer's own transparency survives (spec §4.2).
+	{
+		MTLRenderPipelineDescriptor *l2d_desc = [[MTLRenderPipelineDescriptor alloc] init];
+		l2d_desc.vertexFunction = proj_vs;
+		l2d_desc.fragmentFunction = proj_fs;
+		l2d_desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+		l2d_desc.colorAttachments[0].blendingEnabled = YES;
+		l2d_desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+		l2d_desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+		l2d_desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+		l2d_desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+
+		c->local2d_premult_pipeline = [c->device newRenderPipelineStateWithDescriptor:l2d_desc error:&error];
+		if (c->local2d_premult_pipeline == nil) {
+			U_LOG_E("Failed to create local-2D premult pipeline: %s",
+			        error.localizedDescription.UTF8String);
+			[l2d_desc release];
+			goto cleanup;
+		}
+
+		l2d_desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+		c->local2d_unpremult_pipeline = [c->device newRenderPipelineStateWithDescriptor:l2d_desc error:&error];
+		[l2d_desc release];
+		if (c->local2d_unpremult_pipeline == nil) {
+			U_LOG_E("Failed to create local-2D unpremult pipeline: %s",
+			        error.localizedDescription.UTF8String);
+			goto cleanup;
+		}
+	}
+
+	// Masked composite pipeline (#439 Phase 3) — fullscreen mask-lerp of
+	// {2D scratch, mask, weave snapshot} into the output. No blending: the
+	// shader computes the final value (incl. alpha) directly.
+	{
+		id<MTLFunction> mc_fs = [library newFunctionWithName:@"masked_composite_fragment"];
+		if (mc_fs == nil) {
+			U_LOG_E("Failed to find masked_composite_fragment");
+			goto cleanup;
+		}
+		MTLRenderPipelineDescriptor *mc_desc = [[MTLRenderPipelineDescriptor alloc] init];
+		mc_desc.vertexFunction = blit_vs;
+		mc_desc.fragmentFunction = mc_fs;
+		mc_desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+
+		c->masked_composite_pipeline = [c->device newRenderPipelineStateWithDescriptor:mc_desc error:&error];
+		[mc_desc release];
+		[mc_fs release];
+		if (c->masked_composite_pipeline == nil) {
+			U_LOG_E("Failed to create masked composite pipeline: %s",
+			        error.localizedDescription.UTF8String);
+			goto cleanup;
+		}
+	}
+
 	// Sampler
 	{
 		MTLSamplerDescriptor *sampler_desc = [[MTLSamplerDescriptor alloc] init];
@@ -531,6 +674,18 @@ compile_shaders(struct comp_metal_compositor *c)
 		sampler_desc.sAddressMode = MTLSamplerAddressModeClampToEdge;
 		sampler_desc.tAddressMode = MTLSamplerAddressModeClampToEdge;
 		c->sampler_linear = [c->device newSamplerStateWithDescriptor:sampler_desc];
+		[sampler_desc release];
+	}
+
+	// Point sampler — 1:1 composite reads (#439 Phase 3, mirrors the D3D11
+	// composite's point sampler).
+	{
+		MTLSamplerDescriptor *sampler_desc = [[MTLSamplerDescriptor alloc] init];
+		sampler_desc.minFilter = MTLSamplerMinMagFilterNearest;
+		sampler_desc.magFilter = MTLSamplerMinMagFilterNearest;
+		sampler_desc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+		sampler_desc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+		c->sampler_nearest = [c->device newSamplerStateWithDescriptor:sampler_desc];
 		[sampler_desc release];
 	}
 
@@ -1595,6 +1750,462 @@ metal_blit_surround_strips(struct comp_metal_compositor *c,
 	[blit endEncoding];
 }
 
+/*
+ *
+ * Local 2D/3D zone consumer (#439 Phase 3)
+ *
+ */
+
+/*!
+ * Best available client-window backing dimensions. Order: the bound NSView's
+ * backing size (handle + texture apps pass a real view), the registered
+ * surround dims (#464 window-clamped contract), the active mask dims, the
+ * output texture itself (handle apps: drawable == window).
+ */
+static bool
+metal_window_backing_dims(struct comp_metal_compositor *c,
+                          id<MTLTexture> output_texture,
+                          uint32_t *out_w,
+                          uint32_t *out_h)
+{
+	if (c->view != nil) {
+		NSRect backing = [c->view convertRectToBacking:c->view.bounds];
+		if (backing.size.width > 0 && backing.size.height > 0) {
+			*out_w = (uint32_t)backing.size.width;
+			*out_h = (uint32_t)backing.size.height;
+			return true;
+		}
+	}
+	if (c->surround_2d.valid && c->surround_2d.w > 0 && c->surround_2d.h > 0) {
+		*out_w = c->surround_2d.w;
+		*out_h = c->surround_2d.h;
+		return true;
+	}
+	if (c->zone_mask_active != NULL && c->zone_mask_active->w > 0 && c->zone_mask_active->h > 0) {
+		*out_w = c->zone_mask_active->w;
+		*out_h = c->zone_mask_active->h;
+		return true;
+	}
+	if (output_texture != nil) {
+		*out_w = (uint32_t)output_texture.width;
+		*out_h = (uint32_t)output_texture.height;
+		return true;
+	}
+	return false;
+}
+
+/*!
+ * #439 Phase 2 rule, uniform across explicit and implicit masks: while a
+ * mask is active the effective canvas is the client-window rect (top-left
+ * anchored), regardless of any xrSetSharedTextureOutputRectEXT call.
+ * Mirrors d3d11_effective_canvas.
+ */
+static struct u_canvas_rect
+metal_effective_canvas(struct comp_metal_compositor *c,
+                       id<MTLTexture> output_texture,
+                       bool mask_active)
+{
+	if (!mask_active) {
+		return c->canvas;
+	}
+
+	struct u_canvas_rect r = {0};
+	uint32_t w = 0;
+	uint32_t h = 0;
+	if (metal_window_backing_dims(c, output_texture, &w, &h)) {
+		r.valid = true;
+		r.x = 0;
+		r.y = 0;
+		r.w = w;
+		r.h = h;
+	}
+	return r;
+}
+
+/*!
+ * Rasterize the implicit Tier-2-style mask from the frame's Local2D layer
+ * rects: M=1 everywhere, M=0 inside the union of the rects (Q3). CPU fill +
+ * replaceRegion; re-rasterized only when the rect set or dims change.
+ * Returns the mask texture or nil on failure.
+ */
+static id<MTLTexture>
+metal_update_implicit_mask(struct comp_metal_compositor *c,
+                           const struct xrt_rect *rects,
+                           uint32_t rect_count,
+                           uint32_t w,
+                           uint32_t h)
+{
+	if (w == 0 || h == 0 || rect_count == 0) {
+		return nil;
+	}
+
+	bool dirty = (c->implicit_mask_tex == nil) || c->implicit_mask_w != w || c->implicit_mask_h != h ||
+	             c->implicit_rect_count != rect_count;
+	for (uint32_t i = 0; !dirty && i < rect_count; i++) {
+		if (memcmp(&c->implicit_rects[i], &rects[i], sizeof(rects[i])) != 0) {
+			dirty = true;
+		}
+	}
+	if (!dirty) {
+		return c->implicit_mask_tex;
+	}
+
+	if (c->implicit_mask_tex == nil || c->implicit_mask_w != w || c->implicit_mask_h != h) {
+		[c->implicit_mask_tex release];
+		c->implicit_mask_tex = nil;
+		free(c->implicit_mask_bytes);
+		c->implicit_mask_bytes = NULL;
+
+		MTLTextureDescriptor *desc =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+		                                                       width:w
+		                                                      height:h
+		                                                   mipmapped:NO];
+		desc.usage = MTLTextureUsageShaderRead;
+		desc.storageMode = MTLStorageModeShared;
+		c->implicit_mask_tex = [c->device newTextureWithDescriptor:desc];
+		c->implicit_mask_bytes = (uint8_t *)malloc((size_t)w * h);
+		if (c->implicit_mask_tex == nil || c->implicit_mask_bytes == NULL) {
+			U_LOG_E("Failed to allocate implicit zone mask (%ux%u)", w, h);
+			[c->implicit_mask_tex release];
+			c->implicit_mask_tex = nil;
+			free(c->implicit_mask_bytes);
+			c->implicit_mask_bytes = NULL;
+			return nil;
+		}
+		c->implicit_mask_w = w;
+		c->implicit_mask_h = h;
+	}
+
+	memset(c->implicit_mask_bytes, 0xFF, (size_t)w * h);
+	for (uint32_t i = 0; i < rect_count; i++) {
+		int32_t x0 = rects[i].offset.w;
+		int32_t y0 = rects[i].offset.h;
+		int32_t x1 = x0 + rects[i].extent.w;
+		int32_t y1 = y0 + rects[i].extent.h;
+		if (x0 < 0) x0 = 0;
+		if (y0 < 0) y0 = 0;
+		if (x1 > (int32_t)w) x1 = (int32_t)w;
+		if (y1 > (int32_t)h) y1 = (int32_t)h;
+		for (int32_t y = y0; y < y1; y++) {
+			memset(c->implicit_mask_bytes + (size_t)y * w + x0, 0x00, (size_t)(x1 > x0 ? x1 - x0 : 0));
+		}
+	}
+
+	[c->implicit_mask_tex replaceRegion:MTLRegionMake2D(0, 0, w, h)
+	                        mipmapLevel:0
+	                          withBytes:c->implicit_mask_bytes
+	                        bytesPerRow:w];
+
+	memcpy(c->implicit_rects, rects, sizeof(rects[0]) * rect_count);
+	c->implicit_rect_count = rect_count;
+
+	U_LOG_I("Implicit zone mask rasterized: %ux%u, %u layer rect(s)", w, h, rect_count);
+	return c->implicit_mask_tex;
+}
+
+/*!
+ * Ensure the window-sized 2D scratch + weave snapshot textures exist at w×h.
+ */
+static bool
+metal_ensure_composite_scratch(struct comp_metal_compositor *c, uint32_t w, uint32_t h)
+{
+	if (c->composite_w == w && c->composite_h == h && c->local2d_scratch != nil && c->weave_scratch != nil) {
+		return true;
+	}
+
+	[c->local2d_scratch release];
+	c->local2d_scratch = nil;
+	[c->weave_scratch release];
+	c->weave_scratch = nil;
+	c->composite_w = 0;
+	c->composite_h = 0;
+
+	MTLTextureDescriptor *desc =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:w
+	                                                      height:h
+	                                                   mipmapped:NO];
+	desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	c->local2d_scratch = [c->device newTextureWithDescriptor:desc];
+
+	desc.usage = MTLTextureUsageShaderRead;
+	c->weave_scratch = [c->device newTextureWithDescriptor:desc];
+
+	if (c->local2d_scratch == nil || c->weave_scratch == nil) {
+		U_LOG_E("Failed to allocate composite scratch textures (%ux%u)", w, h);
+		[c->local2d_scratch release];
+		c->local2d_scratch = nil;
+		[c->weave_scratch release];
+		c->weave_scratch = nil;
+		return false;
+	}
+	c->composite_w = w;
+	c->composite_h = h;
+	U_LOG_I("Composite scratch allocated: %ux%u", w, h);
+	return true;
+}
+
+/*!
+ * The Metal Local-2D consumer (#439 Phase 3, impl doc §4 steps 2/4/5):
+ * resolve the frame's mask (explicit staged, else implicit from layer
+ * rects), flatten the accumulated Local2D layers into the 2D scratch
+ * (premultiplied over, list order; legacy surround snapshot when the mask
+ * is explicit but no layers were submitted), snapshot the weave, then
+ * mask-lerp {2D, mask, weave} into the output's window rect.
+ *
+ * Returns true when the masked composite ran (the legacy surround strips
+ * must then be skipped — layers/mask supersede the surround).
+ */
+static bool
+metal_composite_local_2d(struct comp_metal_compositor *c,
+                         id<MTLCommandBuffer> cmd_buf,
+                         id<MTLTexture> output_texture,
+                         const struct u_canvas_rect *eff,
+                         bool have_local_2d)
+{
+	if (!eff->valid || eff->w == 0 || eff->h == 0 || output_texture == nil) {
+		return false;
+	}
+	if (output_texture.pixelFormat != MTLPixelFormatBGRA8Unorm) {
+		static bool warned_fmt = false;
+		if (!warned_fmt) {
+			warned_fmt = true;
+			U_LOG_W("Masked composite skipped: output format %lu != BGRA8Unorm (one-time warning)",
+			        (unsigned long)output_texture.pixelFormat);
+		}
+		return false;
+	}
+
+	uint32_t w = eff->w;
+	uint32_t h = eff->h;
+	if (w > (uint32_t)output_texture.width) w = (uint32_t)output_texture.width;
+	if (h > (uint32_t)output_texture.height) h = (uint32_t)output_texture.height;
+
+	// Step 2 — resolve the frame's mask.
+	id<MTLTexture> mask_tex = nil;
+	if (c->zone_mask_active != NULL && c->zone_mask_active->submitted) {
+		mask_tex = c->zone_mask_active->tex;
+	} else if (have_local_2d) {
+		struct xrt_rect rects[XRT_MAX_LAYERS];
+		uint32_t rect_count = 0;
+		for (uint32_t i = 0; i < c->layer_accum.layer_count && rect_count < XRT_MAX_LAYERS; i++) {
+			if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
+				rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
+			}
+		}
+		mask_tex = metal_update_implicit_mask(c, rects, rect_count, w, h);
+	}
+	if (mask_tex == nil) {
+		return false;
+	}
+
+	if (!metal_ensure_composite_scratch(c, w, h)) {
+		return false;
+	}
+
+	// Step 4 — fill the 2D scratch.
+	{
+		MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+		pass.colorAttachments[0].texture = c->local2d_scratch;
+		pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+		pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+		pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+
+		id<MTLRenderCommandEncoder> enc = [cmd_buf renderCommandEncoderWithDescriptor:pass];
+
+		// Flatten Local2D layers in layer-list (accumulation) order.
+		for (uint32_t i = 0; have_local_2d && i < c->layer_accum.layer_count; i++) {
+			struct comp_layer *layer = &c->layer_accum.layers[i];
+			if (layer->data.type != XRT_LAYER_LOCAL_2D) {
+				continue;
+			}
+			struct xrt_swapchain *sc = layer->sc_array[0];
+			if (sc == NULL) {
+				continue;
+			}
+			struct comp_metal_swapchain *msc = metal_swapchain(sc);
+			uint32_t img_idx = layer->data.local_2d.sub.image_index;
+			if (img_idx >= msc->image_count || msc->images[img_idx] == nil) {
+				continue;
+			}
+
+			// Clip the dest rect to the window scratch; carry the
+			// clipped fractions into the source UVs.
+			const struct xrt_rect *dr = &layer->data.local_2d.rect;
+			int32_t dx = dr->offset.w;
+			int32_t dy = dr->offset.h;
+			int32_t dw = dr->extent.w;
+			int32_t dh = dr->extent.h;
+			if (dw <= 0 || dh <= 0) {
+				continue;
+			}
+			int32_t x0 = dx < 0 ? 0 : dx;
+			int32_t y0 = dy < 0 ? 0 : dy;
+			int32_t x1 = (dx + dw) > (int32_t)w ? (int32_t)w : (dx + dw);
+			int32_t y1 = (dy + dh) > (int32_t)h ? (int32_t)h : (dy + dh);
+			if (x1 <= x0 || y1 <= y0) {
+				continue;
+			}
+			float fx0 = (float)(x0 - dx) / (float)dw;
+			float fy0 = (float)(y0 - dy) / (float)dh;
+			float fx1 = (float)(x1 - dx) / (float)dw;
+			float fy1 = (float)(y1 - dy) / (float)dh;
+
+			struct xrt_normalized_rect nr = layer->data.local_2d.sub.norm_rect;
+			if (nr.w <= 0.0f || nr.h <= 0.0f) {
+				nr.x = 0.0f;
+				nr.y = 0.0f;
+				nr.w = 1.0f;
+				nr.h = 1.0f;
+			}
+
+			// sRGB passthrough (see projection pass).
+			id<MTLTexture> src_tex = msc->images[img_idx];
+			id<MTLTexture> src_view = nil;
+			{
+				MTLPixelFormat unorm_fmt = metal_srgb_to_unorm(src_tex.pixelFormat);
+				if (unorm_fmt != src_tex.pixelFormat) {
+					src_view = [src_tex newTextureViewWithPixelFormat:unorm_fmt];
+					if (src_view != nil) {
+						src_tex = src_view;
+					}
+				}
+			}
+
+			MTLViewport vp;
+			vp.originX = x0;
+			vp.originY = y0;
+			vp.width = x1 - x0;
+			vp.height = y1 - y0;
+			vp.znear = 0.0;
+			vp.zfar = 1.0;
+			[enc setViewport:vp];
+
+			bool unpremult = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
+			[enc setRenderPipelineState:unpremult ? c->local2d_unpremult_pipeline
+			                                      : c->local2d_premult_pipeline];
+			[enc setFragmentTexture:src_tex atIndex:0];
+			[enc setFragmentSamplerState:c->sampler_linear atIndex:0];
+
+			struct {
+				float viewport[4];
+				float src_rect[4];
+				float color_scale[4];
+				float color_bias[4];
+				float swizzle_rb;
+				float _pad[3];
+			} constants;
+
+			constants.viewport[0] = 0.0f;
+			constants.viewport[1] = 0.0f;
+			constants.viewport[2] = 1.0f;
+			constants.viewport[3] = 1.0f;
+
+			constants.src_rect[0] = nr.x + nr.w * fx0;
+			constants.src_rect[2] = nr.w * (fx1 - fx0);
+			if (layer->data.flip_y) {
+				constants.src_rect[1] = nr.y + nr.h * (1.0f - fy0);
+				constants.src_rect[3] = -(nr.h * (fy1 - fy0));
+			} else {
+				constants.src_rect[1] = nr.y + nr.h * fy0;
+				constants.src_rect[3] = nr.h * (fy1 - fy0);
+			}
+
+			constants.color_scale[0] = 1.0f;
+			constants.color_scale[1] = 1.0f;
+			constants.color_scale[2] = 1.0f;
+			constants.color_scale[3] = 1.0f;
+			constants.color_bias[0] = 0.0f;
+			constants.color_bias[1] = 0.0f;
+			constants.color_bias[2] = 0.0f;
+			constants.color_bias[3] = 0.0f;
+			constants.swizzle_rb = 0.0f;
+			constants._pad[0] = constants._pad[1] = constants._pad[2] = 0.0f;
+
+			[enc setVertexBytes:&constants length:sizeof(constants) atIndex:0];
+			[enc setFragmentBytes:&constants length:sizeof(constants) atIndex:0];
+			[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+
+			[src_view release];
+		}
+
+		[enc endEncoding];
+	}
+
+	// Legacy 2D source: an explicit mask with no Local2D layers this frame
+	// composites against the registered surround (impl doc §4 step 4).
+	// Layers, when present, SUPERSEDE the surround entirely.
+	if (!have_local_2d) {
+		if (c->surround_texture != nil && c->surround_2d.valid &&
+		    c->surround_texture.pixelFormat == c->local2d_scratch.pixelFormat) {
+			uint32_t cw = c->surround_2d.w < w ? c->surround_2d.w : w;
+			uint32_t ch = c->surround_2d.h < h ? c->surround_2d.h : h;
+			if (cw > 0 && ch > 0) {
+				id<MTLBlitCommandEncoder> blit = [cmd_buf blitCommandEncoder];
+				[blit copyFromTexture:c->surround_texture
+				          sourceSlice:0
+				          sourceLevel:0
+				         sourceOrigin:MTLOriginMake(0, 0, 0)
+				           sourceSize:MTLSizeMake(cw, ch, 1)
+				            toTexture:c->local2d_scratch
+				     destinationSlice:0
+				     destinationLevel:0
+				    destinationOrigin:MTLOriginMake(0, 0, 0)];
+				[blit endEncoding];
+			}
+		}
+		// else: scratch stays transparent — where M=0 with no 2D
+		// coverage, final.a → 0 and the desktop shows through (Q2).
+	}
+
+	// Snapshot the weave (the DP just wrote output_texture).
+	{
+		id<MTLBlitCommandEncoder> blit = [cmd_buf blitCommandEncoder];
+		[blit copyFromTexture:output_texture
+		          sourceSlice:0
+		          sourceLevel:0
+		         sourceOrigin:MTLOriginMake(0, 0, 0)
+		           sourceSize:MTLSizeMake(w, h, 1)
+		            toTexture:c->weave_scratch
+		     destinationSlice:0
+		     destinationLevel:0
+		    destinationOrigin:MTLOriginMake(0, 0, 0)];
+		[blit endEncoding];
+	}
+
+	// Step 5 — masked composite into the output's window rect. Pixels
+	// beyond the window (worst-case shared surface band) stay untouched.
+	{
+		MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+		pass.colorAttachments[0].texture = output_texture;
+		pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+		pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+		id<MTLRenderCommandEncoder> enc = [cmd_buf renderCommandEncoderWithDescriptor:pass];
+
+		MTLViewport vp;
+		vp.originX = 0;
+		vp.originY = 0;
+		vp.width = w;
+		vp.height = h;
+		vp.znear = 0.0;
+		vp.zfar = 1.0;
+		[enc setViewport:vp];
+
+		[enc setRenderPipelineState:c->masked_composite_pipeline];
+		[enc setFragmentTexture:c->local2d_scratch atIndex:0];
+		[enc setFragmentTexture:mask_tex atIndex:1];
+		[enc setFragmentTexture:c->weave_scratch atIndex:2];
+		[enc setFragmentSamplerState:c->sampler_nearest atIndex:0];
+		[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+
+		[enc endEncoding];
+	}
+
+	return true;
+}
+
 static xrt_result_t
 metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -1676,6 +2287,22 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	}
 #endif
 
+	// #439 Phase 3 — frame mask state. An explicit submitted mask, or any
+	// Local2D layer this frame (which implies a Tier-2-style mask from its
+	// rect, Q3), supersedes the canvas output rect: the weave spans the
+	// client window and the mask is the sole 2D/3D selector (Phase-2 rule,
+	// uniform — no third state).
+	bool have_local_2d = false;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
+			have_local_2d = true;
+			break;
+		}
+	}
+	const bool mask_active = (c->zone_mask_active != NULL && c->zone_mask_active->submitted) || have_local_2d;
+	c->local_2d_last_frame = have_local_2d;
+	struct u_canvas_rect eff_canvas = metal_effective_canvas(c, output_texture, mask_active);
+
 	// Sync hardware_display_3d, tile layout, and per-view dimensions
 	// from device's active rendering mode.
 	// Legacy apps: view dims are fixed at compromise scale, only update tile layout.
@@ -1691,8 +2318,10 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			if (!c->legacy_app_tile_scaling && mode->view_width_pixels > 0) {
 				c->view_width = mode->view_width_pixels;
 				c->view_height = mode->view_height_pixels;
-				if (c->canvas.valid) {
-					u_tiling_compute_canvas_view(mode, c->canvas.w, c->canvas.h,
+				if (eff_canvas.valid) {
+					// Effective canvas: the app's output rect, or the
+					// full client window while a mask is active (#439).
+					u_tiling_compute_canvas_view(mode, eff_canvas.w, eff_canvas.h,
 					                             &c->view_width, &c->view_height);
 				} else if (!c->owns_window && output_texture != nil) {
 					// Handle app: window may differ from display size,
@@ -2201,6 +2830,9 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		uint32_t dp_target_w = (uint32_t)output_texture.width;
 		uint32_t dp_target_h = (uint32_t)output_texture.height;
 
+		// Effective canvas (#439): while a mask is active this is the
+		// full client-window rect — the DP weaves every pixel the mask
+		// can select (Phase-2 rule).
 		xrt_display_processor_metal_process_atlas(
 		    c->display_processor,
 		    (__bridge void *)cmd_buf,
@@ -2213,10 +2845,10 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		    (__bridge void *)output_texture,
 		    dp_target_w,
 		    dp_target_h,
-		    c->canvas.valid ? c->canvas.x : 0,
-		    c->canvas.valid ? c->canvas.y : 0,
-		    c->canvas.valid ? c->canvas.w : 0,
-		    c->canvas.valid ? c->canvas.h : 0);
+		    eff_canvas.valid ? eff_canvas.x : 0,
+		    eff_canvas.valid ? eff_canvas.y : 0,
+		    eff_canvas.valid ? eff_canvas.w : 0,
+		    eff_canvas.valid ? eff_canvas.h : 0);
 	} else {
 		// No display processor: simple blit passthrough.
 		MTLRenderPassDescriptor *blit_pass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -2237,20 +2869,35 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		[blit_encoder endEncoding];
 	}
 
+	// #439 Phase 3 — masked 2D/3D composite. When a mask is active
+	// (explicit submitted mask, or implicit from this frame's Local2D
+	// layer rects) the post-weave output is mask-lerped against the
+	// flattened Local2D layers (or the legacy surround when the mask is
+	// explicit and no layers were submitted). Layers/mask supersede the
+	// surround strips entirely.
+	bool did_masked_composite = false;
+	if (mask_active) {
+		did_masked_composite =
+		    metal_composite_local_2d(c, cmd_buf, output_texture, &eff_canvas, have_local_2d);
+	}
+
 	// Spec v6 surround blit: fill non-canvas pixels of the output from the
 	// app-supplied 2D surround IOSurface (no-op if
 	// xrSetSharedTextureSurround2DEXT was never called). Window-clamped
 	// fill per #464. One call site covers both the DP path and the no-DP
 	// fallback — they converge on output_texture. (In fallback mode the
 	// canvas region holds the full-target stretched atlas — consistent
-	// with the fallback's existing canvas-ignorance.)
-	metal_blit_surround_strips(c, cmd_buf, output_texture,
-	                           (uint32_t)output_texture.width,
-	                           (uint32_t)output_texture.height,
-	                           c->canvas.valid ? c->canvas.x : 0,
-	                           c->canvas.valid ? c->canvas.y : 0,
-	                           c->canvas.valid ? c->canvas.w : (uint32_t)output_texture.width,
-	                           c->canvas.valid ? c->canvas.h : (uint32_t)output_texture.height);
+	// with the fallback's existing canvas-ignorance.) Skipped when the
+	// masked composite ran — the mask/layers are the 2D authority (#439).
+	if (!did_masked_composite) {
+		metal_blit_surround_strips(c, cmd_buf, output_texture,
+		                           (uint32_t)output_texture.width,
+		                           (uint32_t)output_texture.height,
+		                           c->canvas.valid ? c->canvas.x : 0,
+		                           c->canvas.valid ? c->canvas.y : 0,
+		                           c->canvas.valid ? c->canvas.w : (uint32_t)output_texture.width,
+		                           c->canvas.valid ? c->canvas.h : (uint32_t)output_texture.height);
+	}
 
 	// Surround composite capture probe — env-gated (DISPLAYXR_SURROUND_CAPTURE=1)
 	// file-trigger dump of the post-surround output. The atlas trigger above
@@ -2424,6 +3071,28 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	}
 	metal_release_surround(c);
 
+	// 4b. Release #439 zone-mask consumer resources. The active explicit
+	// mask itself is owned by its oxr handle (destroyed via
+	// zone_mask_destroy before the session compositor goes away) — only
+	// drop the borrow here.
+	c->zone_mask_active = NULL;
+	[c->implicit_mask_tex release];
+	c->implicit_mask_tex = nil;
+	free(c->implicit_mask_bytes);
+	c->implicit_mask_bytes = NULL;
+	[c->local2d_scratch release];
+	c->local2d_scratch = nil;
+	[c->weave_scratch release];
+	c->weave_scratch = nil;
+	[c->local2d_premult_pipeline release];
+	c->local2d_premult_pipeline = nil;
+	[c->local2d_unpremult_pipeline release];
+	c->local2d_unpremult_pipeline = nil;
+	[c->masked_composite_pipeline release];
+	c->masked_composite_pipeline = nil;
+	[c->sampler_nearest release];
+	c->sampler_nearest = nil;
+
 	// 5. Release HUD resources
 	u_hud_destroy(&c->hud);
 	[c->hud_texture release];
@@ -2517,6 +3186,208 @@ comp_metal_swapchain_get_texture(struct xrt_swapchain *xsc, uint32_t index)
 		return NULL;
 	}
 	return (__bridge void *)msc->images[index];
+}
+
+/*
+ *
+ * XR_EXT_local_3d_zone — zone-mask entry points (#439 Phase 3)
+ *
+ * Tier 1/2 author into the CPU-canonical buffer; submit uploads to the
+ * R8Unorm texture (sticky, last-submit-wins). All entry points take the
+ * compositor mutex (cheap; matches set_output_rect / set_surround_2d).
+ *
+ */
+
+xrt_result_t
+comp_metal_compositor_zone_mask_create(struct xrt_compositor *xc, uint32_t w, uint32_t h, void **out_mask)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	if (out_mask == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+
+	os_mutex_lock(&c->mutex);
+
+	// 0 lets the compositor choose: the client-window backing size.
+	if (w == 0 || h == 0) {
+		uint32_t win_w = 0;
+		uint32_t win_h = 0;
+		if (!metal_window_backing_dims(c, c->shared_texture, &win_w, &win_h)) {
+			os_mutex_unlock(&c->mutex);
+			U_LOG_E("zone_mask_create: no window dims available for auto-size");
+			return XRT_ERROR_ALLOCATION;
+		}
+		w = win_w;
+		h = win_h;
+	}
+
+	struct comp_metal_zone_mask *mask = U_TYPED_CALLOC(struct comp_metal_zone_mask);
+	if (mask == NULL) {
+		os_mutex_unlock(&c->mutex);
+		return XRT_ERROR_ALLOCATION;
+	}
+
+	MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+	                                                                                width:w
+	                                                                               height:h
+	                                                                            mipmapped:NO];
+	desc.usage = MTLTextureUsageShaderRead;
+	desc.storageMode = MTLStorageModeShared;
+	mask->tex = [c->device newTextureWithDescriptor:desc];
+	mask->author_bytes = (uint8_t *)malloc((size_t)w * h);
+	if (mask->tex == nil || mask->author_bytes == NULL) {
+		U_LOG_E("zone_mask_create: allocation failed (%ux%u)", w, h);
+		[mask->tex release];
+		free(mask->author_bytes);
+		free(mask);
+		os_mutex_unlock(&c->mutex);
+		return XRT_ERROR_ALLOCATION;
+	}
+	mask->w = w;
+	mask->h = h;
+	// Default to all-3D — submit-without-author == whole-window 3D.
+	memset(mask->author_bytes, 0xFF, (size_t)w * h);
+
+	os_mutex_unlock(&c->mutex);
+
+	U_LOG_W("Zone mask created: %ux%u (Metal, Tier 1/2)", w, h);
+	*out_mask = mask;
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+comp_metal_compositor_zone_mask_set_whole(struct xrt_compositor *xc, void *mask_ptr, bool enable_3d)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	struct comp_metal_zone_mask *mask = (struct comp_metal_zone_mask *)mask_ptr;
+	if (mask == NULL || mask->author_bytes == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+
+	os_mutex_lock(&c->mutex);
+	memset(mask->author_bytes, enable_3d ? 0xFF : 0x00, (size_t)mask->w * mask->h);
+	os_mutex_unlock(&c->mutex);
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+comp_metal_compositor_zone_mask_set_rects(struct xrt_compositor *xc,
+                                          void *mask_ptr,
+                                          uint32_t count,
+                                          const struct xrt_rect *rects)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	struct comp_metal_zone_mask *mask = (struct comp_metal_zone_mask *)mask_ptr;
+	if (mask == NULL || mask->author_bytes == NULL || (count > 0 && rects == NULL)) {
+		return XRT_ERROR_ALLOCATION;
+	}
+
+	os_mutex_lock(&c->mutex);
+
+	// M=0 everywhere, then M=1 inside each rect (client-window px, clamped).
+	memset(mask->author_bytes, 0x00, (size_t)mask->w * mask->h);
+	for (uint32_t i = 0; i < count; i++) {
+		int32_t x0 = rects[i].offset.w;
+		int32_t y0 = rects[i].offset.h;
+		int32_t x1 = x0 + rects[i].extent.w;
+		int32_t y1 = y0 + rects[i].extent.h;
+		if (x0 < 0) x0 = 0;
+		if (y0 < 0) y0 = 0;
+		if (x1 > (int32_t)mask->w) x1 = (int32_t)mask->w;
+		if (y1 > (int32_t)mask->h) y1 = (int32_t)mask->h;
+		if (x1 <= x0 || y1 <= y0) {
+			continue;
+		}
+		for (int32_t y = y0; y < y1; y++) {
+			memset(mask->author_bytes + (size_t)y * mask->w + x0, 0xFF, (size_t)(x1 - x0));
+		}
+	}
+
+	os_mutex_unlock(&c->mutex);
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+comp_metal_compositor_zone_mask_acquire_rt(
+    struct xrt_compositor *xc, void *mask_ptr, void **out_rt, uint32_t *out_w, uint32_t *out_h)
+{
+	// No Metal Tier-3 binding type in XR_EXT_local_3d_zone v3 — oxr maps
+	// this to XR_ERROR_FEATURE_UNSUPPORTED.
+	(void)xc;
+	(void)mask_ptr;
+	(void)out_rt;
+	(void)out_w;
+	(void)out_h;
+	return XRT_ERROR_NOT_IMPLEMENTED;
+}
+
+xrt_result_t
+comp_metal_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask_ptr)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	struct comp_metal_zone_mask *mask = (struct comp_metal_zone_mask *)mask_ptr;
+	if (mask == NULL || mask->tex == nil || mask->author_bytes == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+
+	os_mutex_lock(&c->mutex);
+	[mask->tex replaceRegion:MTLRegionMake2D(0, 0, mask->w, mask->h)
+	             mipmapLevel:0
+	               withBytes:mask->author_bytes
+	             bytesPerRow:mask->w];
+	mask->submitted = true;
+	c->zone_mask_active = mask;
+	os_mutex_unlock(&c->mutex);
+
+	U_LOG_I("Zone mask submitted: %ux%u (Metal)", mask->w, mask->h);
+	return XRT_SUCCESS;
+}
+
+void
+comp_metal_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_ptr)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	struct comp_metal_zone_mask *mask = (struct comp_metal_zone_mask *)mask_ptr;
+	if (mask == NULL) {
+		return;
+	}
+
+	os_mutex_lock(&c->mutex);
+	if (c->zone_mask_active == mask) {
+		// Reverts to the rect-derived behavior on the next frame.
+		c->zone_mask_active = NULL;
+	}
+	os_mutex_unlock(&c->mutex);
+
+	[mask->tex release];
+	free(mask->author_bytes);
+	free(mask);
+}
+
+bool
+comp_metal_compositor_zone_get_hw_caps(struct xrt_compositor *xc, uint32_t *out_grid_w, uint32_t *out_grid_h)
+{
+	// sim_display has no switchable-lens zone grid — compositor consumer only.
+	(void)xc;
+	if (out_grid_w != NULL) {
+		*out_grid_w = 0;
+	}
+	if (out_grid_h != NULL) {
+		*out_grid_h = 0;
+	}
+	return false;
+}
+
+bool
+comp_metal_compositor_get_recommended_view_size(struct xrt_compositor *xc, uint32_t *out_w, uint32_t *out_h)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	if (out_w == NULL || out_h == NULL || c->view_width == 0 || c->view_height == 0) {
+		return false;
+	}
+	*out_w = c->view_width;
+	*out_h = c->view_height;
+	return true;
 }
 
 xrt_result_t
@@ -2852,14 +3723,18 @@ comp_metal_compositor_get_window_metrics(struct xrt_compositor *xc,
 		out_metrics->window_center_offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
 
 		out_metrics->valid = true;
-		u_canvas_apply_to_metrics(out_metrics, &c->canvas);
+		// #439: an active mask supersedes the canvas — the window metrics
+		// already describe the window, so skip the canvas override.
+		if (!metal_mask_is_active(c)) {
+			u_canvas_apply_to_metrics(out_metrics, &c->canvas);
+		}
 		return true;
 	}
 
 	// Fallback: delegate to display processor (ext/shared path)
 	if (c->display_processor != NULL) {
 		bool ok = xrt_display_processor_metal_get_window_metrics(c->display_processor, out_metrics);
-		if (ok) {
+		if (ok && !metal_mask_is_active(c)) {
 			u_canvas_apply_to_metrics(out_metrics, &c->canvas);
 		}
 		return ok;
