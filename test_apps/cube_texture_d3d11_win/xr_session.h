@@ -15,6 +15,14 @@
 #define XR_USE_GRAPHICS_API_D3D11
 #include "xr_session_common.h"
 #include <openxr/XR_EXT_local_3d_zone.h>
+#include <openxr/XR_EXT_view_rig.h>
+
+// XR_EXT_view_rig (#396 W7) available + enabled on the instance. App-local
+// for the same reason as the zone harness. The texture app chains only the
+// RAW result struct — the one-shot log proves canvasRectPx reports the
+// canvas SUB-RECT (xrSetSharedTextureOutputRectEXT), not the window client
+// area.
+extern bool g_hasViewRigExt;
 
 // #439 Phase 1 — XR_EXT_local_3d_zone test harness state. App-local: the
 // shared XrSessionManager lives in displayxr-common, which doesn't carry this

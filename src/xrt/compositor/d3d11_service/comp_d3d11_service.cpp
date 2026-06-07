@@ -11748,6 +11748,98 @@ comp_d3d11_service_get_client_window_metrics(struct xrt_system_compositor *xsysc
 }
 
 bool
+comp_d3d11_service_get_client_app_window_metrics(struct xrt_system_compositor *xsysc,
+                                                  struct xrt_compositor *xc,
+                                                  struct xrt_window_metrics *out_metrics)
+{
+	// XR_EXT_view_rig over IPC (#396 W7): window metrics from the client's
+	// REAL HWND (XR_EXT_win32_window_binding, transported in
+	// xrt_session_info at session_create). Non-workspace IPC clients have
+	// no virtual-window slot, so the per-client lookup above fails for
+	// them and the rig math would run display-scoped — diverging from the
+	// in-process path, which is always window-scoped for external-window
+	// apps. Same math as comp_d3d11_compositor_get_window_metrics
+	// (GetClientRect works cross-process on a real HWND).
+	if (xsysc == nullptr || xc == nullptr || out_metrics == nullptr) {
+		if (out_metrics != nullptr) {
+			out_metrics->valid = false;
+		}
+		return false;
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+
+	memset(out_metrics, 0, sizeof(*out_metrics));
+
+	// app_hwnd is only populated in workspace mode; outside it the client's
+	// external HWND lives on the per-client render resources (set by
+	// init_client_render_resources from xsi->external_window_handle).
+	HWND hwnd = c->app_hwnd;
+	if (hwnd == nullptr || !IsWindow(hwnd)) {
+		hwnd = c->render.hwnd;
+	}
+	if (hwnd == nullptr || !IsWindow(hwnd)) {
+		return false;
+	}
+
+	float disp_w_m = sys->base.info.display_width_m;
+	float disp_h_m = sys->base.info.display_height_m;
+	uint32_t disp_px_w = sys->base.info.display_pixel_width;
+	uint32_t disp_px_h = sys->base.info.display_pixel_height;
+	int32_t disp_left = sys->base.info.display_screen_left;
+	int32_t disp_top = sys->base.info.display_screen_top;
+	if (disp_w_m <= 0.0f || disp_h_m <= 0.0f || disp_px_w == 0 || disp_px_h == 0) {
+		return false;
+	}
+
+	RECT rect;
+	if (!GetClientRect(hwnd, &rect)) {
+		return false;
+	}
+	uint32_t win_px_w = static_cast<uint32_t>(rect.right - rect.left);
+	uint32_t win_px_h = static_cast<uint32_t>(rect.bottom - rect.top);
+	if (win_px_w == 0 || win_px_h == 0) {
+		return false;
+	}
+
+	POINT client_origin = {0, 0};
+	ClientToScreen(hwnd, &client_origin);
+
+	float pixel_size_x = disp_w_m / (float)disp_px_w;
+	float pixel_size_y = disp_h_m / (float)disp_px_h;
+
+	float win_center_px_x = (float)(client_origin.x - disp_left) + (float)win_px_w / 2.0f;
+	float win_center_px_y = (float)(client_origin.y - disp_top) + (float)win_px_h / 2.0f;
+	float disp_center_px_x = (float)disp_px_w / 2.0f;
+	float disp_center_px_y = (float)disp_px_h / 2.0f;
+
+	out_metrics->display_width_m = disp_w_m;
+	out_metrics->display_height_m = disp_h_m;
+	out_metrics->display_pixel_width = disp_px_w;
+	out_metrics->display_pixel_height = disp_px_h;
+	out_metrics->display_screen_left = disp_left;
+	out_metrics->display_screen_top = disp_top;
+
+	out_metrics->window_pixel_width = win_px_w;
+	out_metrics->window_pixel_height = win_px_h;
+	out_metrics->window_screen_left = static_cast<int32_t>(client_origin.x);
+	out_metrics->window_screen_top = static_cast<int32_t>(client_origin.y);
+
+	out_metrics->window_width_m = (float)win_px_w * pixel_size_x;
+	out_metrics->window_height_m = (float)win_px_h * pixel_size_y;
+	out_metrics->window_center_offset_x_m = (win_center_px_x - disp_center_px_x) * pixel_size_x;
+	out_metrics->window_center_offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
+	out_metrics->window_orientation.x = 0.0f;
+	out_metrics->window_orientation.y = 0.0f;
+	out_metrics->window_orientation.z = 0.0f;
+	out_metrics->window_orientation.w = 1.0f;
+	out_metrics->valid = true;
+
+	return true;
+}
+
+bool
 comp_d3d11_service_owns_window(struct xrt_system_compositor *xsysc)
 {
 	// Workspace mode: per-client compositors don't own windows (multi-comp does).

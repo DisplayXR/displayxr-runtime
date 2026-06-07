@@ -283,6 +283,26 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 			have_wm = comp_d3d11_service_get_client_window_metrics(s->xsysc, xc, &wm) &&
 			          wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f;
 		}
+		// XR_EXT_view_rig locates (#396 W7): non-workspace IPC clients have
+		// no virtual-window slot, so the per-client lookup above fails and
+		// the math would run against the GLOBAL service window (native-res,
+		// effectively display-scoped) — but the in-process path is always
+		// scoped to the APP's window for external-window apps, and the rig
+		// A/B (runtime-vs-app math) only matches if the server consumes the
+		// same window rect the app's own math does. Resolve it from the
+		// client's real HWND, BEFORE the global fallback. Legacy locates
+		// (rig_reply == NULL) keep today's behavior exactly.
+		if (!have_wm && !headless_client && rig_reply != NULL && xc != NULL) {
+			have_wm = comp_d3d11_service_get_client_app_window_metrics(s->xsysc, xc, &wm) &&
+			          wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f;
+			static bool hwnd_wm_logged = false;
+			if (!hwnd_wm_logged && have_wm) {
+				hwnd_wm_logged = true;
+				IPC_WARN(s, "VIEW-RIG IPC: window-scoped via client HWND (%ux%u px, %.4fx%.4fm)",
+				         wm.window_pixel_width, wm.window_pixel_height,
+				         wm.window_width_m, wm.window_height_m);
+			}
+		}
 		// Global window metrics fallback — skipped for headless clients so
 		// the bridge doesn't pick up Chrome's window offset and double-
 		// subtract it from eye positions sent onward to the browser sample.
@@ -511,6 +531,12 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 	dxr_screen scr = {screen_width_m, screen_height_m};
 	struct xrt_pose display_pose = {display_ori, display_pos};
 
+	// Rig locates get the real nominal viewer (the parallax lerp target),
+	// matching the in-process path; legacy locates keep the NULL/0.5m
+	// default they have always used.
+	struct xrt_vec3 nominal_viewer = {0.0f, s->xsysc->info.nominal_viewer_y_m, s->xsysc->info.nominal_viewer_z_m};
+	const struct xrt_vec3 *rig_nominal = (rig_display || rig_camera) ? &nominal_viewer : NULL;
+
 	if (rig_reply != NULL) {
 		rig_reply->raw.display_pose = display_pose;
 		rig_reply->rig_applied =
@@ -545,7 +571,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 			};
 		}
 		struct dxr_xrt_view cam_views[XRT_MAX_VIEWS];
-		dxr_xrt_camera3d_compute_views(raw_eyes, eye_count, NULL, &scr, &ct,
+		dxr_xrt_camera3d_compute_views(raw_eyes, eye_count, rig_nominal, &scr, &ct,
 		                               &display_pose, cam_views);
 
 		out_head_relation->pose.position = display_pos;
@@ -600,7 +626,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		}
 
 		struct dxr_xrt_view disp_views[XRT_MAX_VIEWS];
-		dxr_xrt_display3d_compute_views(raw_eyes, eye_count, NULL, &scr, &dt,
+		dxr_xrt_display3d_compute_views(raw_eyes, eye_count, rig_nominal, &scr, &dt,
 		                                &display_pose, disp_views);
 
 		// Convert world-space eye positions to head-local

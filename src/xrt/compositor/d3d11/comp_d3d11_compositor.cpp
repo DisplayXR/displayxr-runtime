@@ -3365,7 +3365,16 @@ comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc,
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
 	memset(out_metrics, 0, sizeof(*out_metrics));
 
-	if (c->display_processor == nullptr || c->hwnd == nullptr) {
+	// Shared-texture (texture-app) sessions carry the app's window in
+	// app_hwnd (c->hwnd stays null — no swapchain on it). Their metrics
+	// come from that window, then u_canvas_apply_to_metrics below rewrites
+	// them to the canvas sub-rect — the documented model (swapchain-model.md:
+	// view dims + Kooima projection use canvas size, not display size).
+	// Without this, texture sessions had NO window metrics at all and the
+	// runtime-side Kooima (rig path, raw channel, legacy-2D fovs) ran
+	// display-scoped (#396 W7).
+	HWND metrics_hwnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
+	if (c->display_processor == nullptr || metrics_hwnd == nullptr) {
 		return false;
 	}
 
@@ -3391,7 +3400,7 @@ comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc,
 
 	// Get window client rect
 	RECT rect;
-	if (!GetClientRect(c->hwnd, &rect)) {
+	if (!GetClientRect(metrics_hwnd, &rect)) {
 		return false;
 	}
 	uint32_t win_px_w = static_cast<uint32_t>(rect.right - rect.left);
@@ -3402,7 +3411,7 @@ comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc,
 
 	// Get window screen position
 	POINT client_origin = {0, 0};
-	ClientToScreen(c->hwnd, &client_origin);
+	ClientToScreen(metrics_hwnd, &client_origin);
 
 	// Compute pixel size (meters per pixel)
 	float pixel_size_x = disp_w_m / (float)disp_px_w;
