@@ -195,6 +195,19 @@ void
 comp_d3d11_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask);
 
 /*!
+ * Query the display processor's hardware zone grid (#224 hardware-DP leg).
+ * Returns false on a legacy DP (no zone support) with grids zeroed; on true
+ * the grid dims feed XrLocal3DZoneCapabilitiesEXT.hardwareZoneGridWidth/Height
+ * (1×1 = global on/off panel).
+ *
+ * @ingroup comp_d3d11
+ */
+bool
+comp_d3d11_compositor_zone_get_hw_caps(struct xrt_compositor *xc,
+                                       uint32_t *out_grid_w,
+                                       uint32_t *out_grid_h);
+
+/*!
  * Get the predicted eye positions from the display processor.
  *
  * @param xc The compositor.

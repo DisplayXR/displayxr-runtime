@@ -21,6 +21,7 @@
 #include "xrt/xrt_compiler.h"
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_display_color.h"
+#include "xrt/xrt_display_zones.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -188,6 +189,83 @@ struct xrt_display_processor_d3d11
 	 * Optional — absent slot or NULL ⟹ DP assumes @ref XRT_ATLAS_ENCODING_ENCODED.
 	 */
 	void (*set_atlas_encoding)(struct xrt_display_processor_d3d11 *xdp, enum xrt_atlas_encoding atlas_encoding);
+
+	/*!
+	 * Query the DP's local 2D/3D-zone capability (#224 Phase 0,
+	 * docs/roadmap/local-3d-zones.md). The caller pre-sets
+	 * @ref xrt_dp_local_zone_caps::struct_size; the DP writes only fields
+	 * within it.
+	 *
+	 * Optional — absent slot (older plug-in `struct_size`) or NULL ⟹ legacy
+	 * DP: the runtime keeps the global request_display_mode path and never
+	 * calls the zone publish methods. Appended per ADR-020 (append-only
+	 * within a major).
+	 *
+	 * @param      xdp       Pointer to self.
+	 * @param[out] out_caps  Filled by the DP (struct_size pre-set by caller).
+	 * @return true if @p out_caps was filled.
+	 */
+	bool (*get_local_zone_caps)(struct xrt_display_processor_d3d11 *xdp,
+	                            struct xrt_dp_local_zone_caps *out_caps);
+
+	/*!
+	 * Publish this client's screen-anchored 3D-zone mask (#224 Phase 0).
+	 *
+	 * Stateless in-process contract: the runtime owns the mask texture (the
+	 * staged XR_EXT_local_3d_zone snapshot — R8_UNORM, client-window pixels,
+	 * non-zero = 3D) and passes an SRV on the session's own D3D11 device; the
+	 * DP samples or copies it DURING this call (the immediate context
+	 * serializes against the runtime's writes), and must not hold the SRV
+	 * past return. @p screen_x/y/w/h anchor the mask's pixel space on the
+	 * panel in physical screen pixels (post-DPI client rect). @p seq is a
+	 * monotonic per-session publish counter for vendor-side coalescing.
+	 *
+	 * Downsample-and-arbitrate rule: any non-zero mask pixel overlapping a
+	 * hardware cell ⟹ that cell is 3D (OR union across all connected
+	 * clients) — which makes the 1×1 grid bit-compatible with today's global
+	 * bool arbitration. A vendor admin force-2D override supersedes the
+	 * union. The runtime republishes every frame while a mask is active
+	 * (screen rect tracks the window); vendors coalesce per their
+	 * max_update_hz.
+	 *
+	 * Optional — absent slot or NULL ⟹ not supported (see
+	 * @ref get_local_zone_caps). Appended per ADR-020.
+	 *
+	 * @param xdp            Pointer to self.
+	 * @param d3d11_context  D3D11 immediate context (ID3D11DeviceContext*).
+	 * @param mask_srv       Mask SRV (ID3D11ShaderResourceView*, R8_UNORM).
+	 * @param mask_width     Mask width in client-window pixels.
+	 * @param mask_height    Mask height in client-window pixels.
+	 * @param screen_x       Client-area left edge in physical screen pixels.
+	 * @param screen_y       Client-area top edge in physical screen pixels.
+	 * @param screen_w       Client-area width in physical screen pixels.
+	 * @param screen_h       Client-area height in physical screen pixels.
+	 * @param seq            Monotonic per-session publish sequence number.
+	 * @return true if the publish was accepted.
+	 */
+	bool (*publish_local_zone_mask)(struct xrt_display_processor_d3d11 *xdp,
+	                                void *d3d11_context,
+	                                void *mask_srv,
+	                                uint32_t mask_width,
+	                                uint32_t mask_height,
+	                                int32_t screen_x,
+	                                int32_t screen_y,
+	                                uint32_t screen_w,
+	                                uint32_t screen_h,
+	                                uint64_t seq);
+
+	/*!
+	 * Withdraw this client's zone contribution (#224 Phase 0) — equivalent to
+	 * (and cheaper than) publishing an all-zero mask. Called when the active
+	 * mask is destroyed or the session ends; the client's contribution
+	 * disappears from the vendor's union on the next arbitration pass.
+	 *
+	 * Optional — absent slot or NULL ⟹ not supported. Appended per ADR-020.
+	 *
+	 * @param xdp Pointer to self.
+	 * @return true if the clear was accepted.
+	 */
+	bool (*clear_local_zone_mask)(struct xrt_display_processor_d3d11 *xdp);
 };
 
 /*
@@ -233,7 +311,10 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_chroma_key)  
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, destroy)                     == XRT_DP_D3D11_BASE_OFF + 9 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, get_handoff_color_capability) == XRT_DP_D3D11_BASE_OFF + 10 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_atlas_encoding)           == XRT_DP_D3D11_BASE_OFF + 11 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 12 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, get_local_zone_caps)          == XRT_DP_D3D11_BASE_OFF + 12 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, publish_local_zone_mask)      == XRT_DP_D3D11_BASE_OFF + 13 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, clear_local_zone_mask)        == XRT_DP_D3D11_BASE_OFF + 14 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 15 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -414,6 +495,60 @@ xrt_display_processor_d3d11_set_atlas_encoding(struct xrt_display_processor_d3d1
 		return;
 	}
 	xdp->set_atlas_encoding(xdp, atlas_encoding);
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::get_local_zone_caps
+ * Returns false (legacy DP — caps untouched) if not supported (slot absent or
+ * NULL). The caller must pre-set out_caps->struct_size.
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_get_local_zone_caps(struct xrt_display_processor_d3d11 *xdp,
+                                                struct xrt_dp_local_zone_caps *out_caps)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, get_local_zone_caps) || xdp->get_local_zone_caps == NULL) {
+		return false;
+	}
+	return xdp->get_local_zone_caps(xdp, out_caps);
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::publish_local_zone_mask
+ * Returns false if not supported (slot absent or NULL).
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_publish_local_zone_mask(struct xrt_display_processor_d3d11 *xdp,
+                                                    void *d3d11_context,
+                                                    void *mask_srv,
+                                                    uint32_t mask_width,
+                                                    uint32_t mask_height,
+                                                    int32_t screen_x,
+                                                    int32_t screen_y,
+                                                    uint32_t screen_w,
+                                                    uint32_t screen_h,
+                                                    uint64_t seq)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, publish_local_zone_mask) || xdp->publish_local_zone_mask == NULL) {
+		return false;
+	}
+	return xdp->publish_local_zone_mask(xdp, d3d11_context, mask_srv, mask_width, mask_height, screen_x, screen_y,
+	                                    screen_w, screen_h, seq);
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::clear_local_zone_mask
+ * Returns false if not supported (slot absent or NULL).
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_clear_local_zone_mask(struct xrt_display_processor_d3d11 *xdp)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, clear_local_zone_mask) || xdp->clear_local_zone_mask == NULL) {
+		return false;
+	}
+	return xdp->clear_local_zone_mask(xdp);
 }
 
 /*!

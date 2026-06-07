@@ -141,9 +141,14 @@ oxr_xrGetLocal3DZoneCapabilitiesEXT(XrSession session, XrLocal3DZoneCapabilities
 #ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 	if (sess->is_d3d11_native_compositor && sess->xcn != NULL) {
 		capabilities->supported = XR_TRUE;
-		// Compositor consumer only — no hardware-zone DP leg yet.
-		capabilities->hardwareZoneGridWidth = 0;
-		capabilities->hardwareZoneGridHeight = 0;
+		// #224 hardware-DP leg: surface the DP's switchable-lens zone grid
+		// (1×1 = global on/off panel; 0×0 = legacy DP, compositor consumer
+		// only — the mask still composites, it just can't drive the panel).
+		uint32_t grid_w = 0;
+		uint32_t grid_h = 0;
+		comp_d3d11_compositor_zone_get_hw_caps(&sess->xcn->base, &grid_w, &grid_h);
+		capabilities->hardwareZoneGridWidth = grid_w;
+		capabilities->hardwareZoneGridHeight = grid_h;
 		capabilities->maxMaskWidth = OXR_LOCAL_3D_ZONE_MAX_MASK_DIM;
 		capabilities->maxMaskHeight = OXR_LOCAL_3D_ZONE_MAX_MASK_DIM;
 	}

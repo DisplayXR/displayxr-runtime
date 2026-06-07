@@ -185,6 +185,19 @@ struct comp_d3d11_compositor
 	ID3D11Texture2D *weave_scratch;
 	ID3D11ShaderResourceView *weave_scratch_srv;
 
+	//! #224 hardware-DP zone leg: cached get_local_zone_caps result.
+	//! 0 = not queried yet (calloc default), 1 = supported, 2 = legacy DP
+	//! (slot absent / caps unsupported — never publish).
+	int zone_dp_state;
+	//! DP zone caps when zone_dp_state == 1 (grid dims surface through
+	//! comp_d3d11_compositor_zone_get_hw_caps → xrGetLocal3DZoneCapabilitiesEXT).
+	struct xrt_dp_local_zone_caps zone_dp_caps;
+	//! Monotonic per-session publish sequence (bumped on every publish).
+	uint64_t zone_publish_seq;
+	//! True while this client's mask is published to the DP — drives the
+	//! clear-on-deactivate edge (mask destroyed / compositor teardown).
+	bool zone_published;
+
 	//! Generic D3D11 display processor (vendor-agnostic weaving).
 	struct xrt_display_processor_d3d11 *display_processor;
 
@@ -312,6 +325,11 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
                           const struct u_canvas_rect *eff_canvas);
 static void
 d3d11_release_zone_state(struct comp_d3d11_compositor *c);
+// #224 hardware-DP zone leg: per-frame sideband publish of the active mask to
+// the display processor (and the clear-on-deactivate edge). Defined with the
+// other zone helpers near the bottom.
+static void
+d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c);
 
 // #439 Phase 2: an active zone mask supersedes the canvas output rect —
 // the weave region, view dims, Kooima metrics, and composite region all
@@ -1379,6 +1397,12 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// view dims, and composite all see the same rect even if submit/destroy
 	// race the frame.
 	const struct u_canvas_rect eff_canvas = d3d11_effective_canvas(c);
+
+	// #224 hardware-DP zone leg: sideband-publish the active mask (or clear
+	// it on the inactive edge) so switchable-lens cells track the authored
+	// zones. Same mutex scope as the composite — the DP sees the same mask
+	// state as this frame's weave/composite (the two consumers must agree).
+	d3d11_sync_zone_mask_to_dp(c);
 
 	// Get target (window) dimensions for mono viewport sizing.
 	// In shared texture mode (no target), use canvas dims if available —
@@ -2764,6 +2788,7 @@ static void
 d3d11_release_zone_state(struct comp_d3d11_compositor *c)
 {
 	c->active_zone_mask = nullptr;
+	d3d11_sync_zone_mask_to_dp(c); // withdraw this client's DP zone contribution (#224)
 	if (c->weave_scratch_srv != nullptr) {
 		c->weave_scratch_srv->Release();
 		c->weave_scratch_srv = nullptr;
@@ -2771,6 +2796,76 @@ d3d11_release_zone_state(struct comp_d3d11_compositor *c)
 	if (c->weave_scratch != nullptr) {
 		c->weave_scratch->Release();
 		c->weave_scratch = nullptr;
+	}
+}
+
+// #224 hardware-DP zone leg — keep the DP's view of this client's zone mask in
+// sync with the compositor's. While a submitted mask is active, republish it
+// every frame (the screen rect tracks window moves/resizes; vendors coalesce
+// per their max_update_hz). On the active→inactive edge (mask destroyed,
+// compositor teardown), clear once so this client's contribution drops out of
+// the vendor's OR-union. Caller holds c->mutex (layer_commit / the zone entry
+// points), matching the rest of the zone state machine.
+//
+// Occlusion subtraction (Z-order walk, local-3d-zones.md "runtime per-frame
+// work" step 2-3) is deferred — Phase 0 publishes the un-occluded mask; on
+// 1×1-grid hardware the union result is identical.
+// One-time DP zone-capability probe, cached on the compositor (caller holds
+// c->mutex). Returns true when the DP consumes published zone masks; caps are
+// then in c->zone_dp_caps.
+static bool
+d3d11_zone_dp_supported(struct comp_d3d11_compositor *c)
+{
+	if (c->display_processor == nullptr) {
+		return false;
+	}
+	if (c->zone_dp_state == 0) { // 0 = unqueried, 1 = supported, 2 = legacy
+		struct xrt_dp_local_zone_caps caps = {};
+		caps.struct_size = sizeof(caps);
+		bool ok = xrt_display_processor_d3d11_get_local_zone_caps(c->display_processor, &caps);
+		c->zone_dp_state = (ok && caps.supported != 0) ? 1 : 2;
+		if (c->zone_dp_state == 1) {
+			c->zone_dp_caps = caps;
+			U_LOG_W("D3D11 zone DP: local zones supported, grid %ux%u max_mask %ux%u max_hz %u",
+			        caps.zone_grid_width, caps.zone_grid_height, caps.max_mask_width, caps.max_mask_height,
+			        caps.max_update_hz);
+		}
+	}
+	return c->zone_dp_state == 1;
+}
+
+static void
+d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
+{
+	if (!d3d11_zone_dp_supported(c)) {
+		return; // legacy DP — global request_display_mode path unchanged.
+	}
+
+	struct comp_d3d11_zone_mask *mask = c->active_zone_mask;
+	if (mask == nullptr || !mask->submitted || mask->staged_srv == nullptr) {
+		if (c->zone_published) {
+			xrt_display_processor_d3d11_clear_local_zone_mask(c->display_processor);
+			c->zone_published = false;
+		}
+		return;
+	}
+
+	// Screen-anchor the mask: client-area origin in physical screen pixels.
+	// No HWND (pure offscreen) → nothing to anchor to; skip the publish.
+	HWND wnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
+	RECT r;
+	POINT origin = {0, 0};
+	if (wnd == nullptr || !GetClientRect(wnd, &r) || r.right <= 0 || r.bottom <= 0 ||
+	    !ClientToScreen(wnd, &origin)) {
+		return;
+	}
+
+	c->zone_publish_seq++;
+	bool ok = xrt_display_processor_d3d11_publish_local_zone_mask(
+	    c->display_processor, c->context, mask->staged_srv, mask->w, mask->h, (int32_t)origin.x,
+	    (int32_t)origin.y, (uint32_t)r.right, (uint32_t)r.bottom, c->zone_publish_seq);
+	if (ok) {
+		c->zone_published = true;
 	}
 }
 
@@ -3168,6 +3263,10 @@ comp_d3d11_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_pt
 	}
 	if (c->active_zone_mask == mask) {
 		c->active_zone_mask = nullptr; // revert to rect-surround behavior
+		// #224: withdraw the DP zone contribution now — the session may not
+		// commit another frame (teardown-path destroy), and the per-frame
+		// sync would otherwise leave the panel pinned by a dead client.
+		d3d11_sync_zone_mask_to_dp(c);
 	}
 	if (mask->staged_srv != nullptr) {
 		mask->staged_srv->Release();
@@ -3182,6 +3281,32 @@ comp_d3d11_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_pt
 		mask->tex->Release();
 	}
 	free(mask);
+}
+
+extern "C" bool
+comp_d3d11_compositor_zone_get_hw_caps(struct xrt_compositor *xc,
+                                       uint32_t *out_grid_w,
+                                       uint32_t *out_grid_h)
+{
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+	std::lock_guard<std::mutex> lock(c->mutex);
+
+	if (out_grid_w != nullptr) {
+		*out_grid_w = 0;
+	}
+	if (out_grid_h != nullptr) {
+		*out_grid_h = 0;
+	}
+	if (!d3d11_zone_dp_supported(c)) {
+		return false;
+	}
+	if (out_grid_w != nullptr) {
+		*out_grid_w = c->zone_dp_caps.zone_grid_width;
+	}
+	if (out_grid_h != nullptr) {
+		*out_grid_h = c->zone_dp_caps.zone_grid_height;
+	}
+	return true;
 }
 
 extern "C" bool

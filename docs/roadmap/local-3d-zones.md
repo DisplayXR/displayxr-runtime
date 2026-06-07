@@ -1,6 +1,6 @@
 # Local 2D/3D Zones — Per-Window 3D Without Switching the Whole Screen
 
-**Status**: design draft (May 2026). Pre-implementation.
+**Status**: Phase 0 runtime side IMPLEMENTED (June 2026) — D3D11 DP vtable additions (`get_local_zone_caps` / `publish_local_zone_mask` / `clear_local_zone_mask`, appended per ADR-020), the compositor per-frame publish path, hwGrid caps wiring, and the sim_display test double (`SIM_DISPLAY_ZONE_GRID` / `SIM_DISPLAY_ZONE_DUMP`). The authoring extension shipped earlier via #439 Phases 1–2. **Revised from the original draft:** the in-process D3D11 vtable contract is *stateless publish* (runtime-owned mask texture, SRV passed per publish) instead of the DP-allocated create/publish/clear/destroy lifecycle below — see "DP vtable contract". Remaining: first-vendor (Leia) 1×1 implementation, occlusion subtraction, per-zone hardware.
 **Scope**: regular Windows desktop, no shell, single or multiple 3D apps in normal windows. Shell-mode generalization is a superset of this and not covered here.
 **Audience**: DisplayXR runtime contributors; vendors implementing the display processor (DP) vtable.
 
@@ -61,67 +61,57 @@ Two channels per app: (1) the swap chain DWM sees (interlaced inside 3D rects, m
 
 ---
 
-## DP vtable contract
+## DP vtable contract (as implemented — Phase 0, D3D11)
 
-This is the only surface between runtime and vendor. Extends `xrt_display_processor` (`src/xrt/include/xrt/xrt_display_processor.h`).
+This is the only surface between runtime and vendor. Three methods appended to `xrt_display_processor_d3d11` (`src/xrt/include/xrt/xrt_display_processor_d3d11.h`, slots 12–14; shared caps struct in `xrt_display_zones.h`), append-only within the ABI major per ADR-020 — older plug-ins report a smaller `struct_size` and the runtime treats the slots as absent (legacy DP).
+
+> **Design revision vs. the original draft.** The draft had the DP allocate a shared mask texture behind a create/publish/clear/destroy handle lifecycle — a shape motivated by cross-process sharing. The shipped `XR_EXT_local_3d_zone` compositor consumer (#439) already owns a window-sized R8_UNORM staged mask on the session's own in-process D3D11 device, so the in-process contract is **stateless publish**: the runtime passes the mask SRV per publish and the DP samples/copies it during the call (the immediate context serializes against the runtime's writes; the DP must not hold the SRV past return). DP-side lifecycle methods can be appended later when a cross-process leg (IPC/service zone masks) needs real sharing primitives.
 
 ### Capability query
 
 ```c
-struct xrt_dp_local_zone_caps {
-    bool     supported;            // false on DPs that don't implement local zones
-    uint32_t zone_grid_width;      // hardware cells across (1 = global on/off)
-    uint32_t zone_grid_height;     // hardware cells down
-    uint32_t max_mask_width;       // upper bound on client-published mask resolution
+struct xrt_dp_local_zone_caps {        // xrt_display_zones.h — fixed-width, struct_size-headed (ADR-020)
+    uint32_t struct_size;              // pre-set by the CALLER (runtime); DP writes only fields within
+    uint32_t supported;                // 0 on DPs that don't implement local zones
+    uint32_t zone_grid_width;          // hardware cells across (1 = global on/off)
+    uint32_t zone_grid_height;         // hardware cells down
+    uint32_t max_mask_width;           // upper bound on the published mask resolution (0 = no preference)
     uint32_t max_mask_height;
-    uint32_t max_update_hz;        // 0 = unlimited; vendor's preferred max mask refresh
+    uint32_t max_update_hz;            // 0 = unlimited; vendor's preferred max mask refresh (advisory in Phase 0)
 };
 
-xrt_result_t xrt_dp_get_local_zone_caps(struct xrt_display_processor *dp,
-                                        struct xrt_dp_local_zone_caps *caps);
+bool (*get_local_zone_caps)(struct xrt_display_processor_d3d11 *xdp,
+                            struct xrt_dp_local_zone_caps *out_caps);
 ```
 
 Three meaningful return shapes:
 
-- `supported = false`: legacy DP. Runtime falls back to the existing global `request_display_mode` path. App-facing extension reports unsupported.
-- `supported = true, zone_grid = 1×1`: vendor implements the new API but the hardware is single-zone. OR-union of all client masks collapses to "any client requesting any 3D anywhere → screen is 3D" — identical to today's bool arbitration.
-- `supported = true, zone_grid > 1×1`: real local zones. Same runtime path; vendor does the heavy lifting.
+- slot absent / NULL / `supported = 0`: legacy DP. Runtime keeps the existing global `request_display_mode` path and never calls the publish methods. `xrGetLocal3DZoneCapabilitiesEXT` reports `hardwareZoneGrid = 0×0` (the compositor consumer still works — the mask composites, it just can't drive the panel).
+- `supported = 1, zone_grid = 1×1`: vendor implements the new API but the hardware is single-zone. OR-union of all client masks collapses to "any client requesting any 3D anywhere → screen is 3D" — identical to today's bool arbitration.
+- `supported = 1, zone_grid > 1×1`: real local zones. Same runtime path; vendor does the heavy lifting.
 
-### Per-client mask publish
-
-The runtime holds one **mask handle** per active client (per-session in the OpenXR sense). Lifecycle:
+### Per-client mask publish (stateless)
 
 ```c
-// Allocate a mask. Vendor returns an opaque handle plus a shared GPU texture
-// the runtime can write into. The shared-texture format and sync primitive
-// are API-specific (D3D11 NT handle, D3D12 fence, Vulkan external memory, etc.)
-// and selected based on the graphics binding the session was created with.
-xrt_result_t xrt_dp_create_local_zone_mask(
-    struct xrt_display_processor *dp,
-    const struct xrt_dp_mask_create_info *info,   // graphics API, initial resolution
-    struct xrt_dp_local_zone_mask **out_mask);
+// Per-frame publish. The runtime owns the mask texture (the staged
+// XR_EXT_local_3d_zone snapshot — R8_UNORM, client-window pixels, non-zero =
+// 3D) and passes an SRV on the session's own D3D11 device. screen_x/y/w/h
+// anchor the mask's pixel space on the panel (physical pixels, post-DPI
+// client rect). seq is a monotonic per-session publish counter for
+// vendor-side coalescing. The DP samples or copies DURING the call.
+bool (*publish_local_zone_mask)(struct xrt_display_processor_d3d11 *xdp,
+                                void *d3d11_context, void *mask_srv,
+                                uint32_t mask_width, uint32_t mask_height,
+                                int32_t screen_x, int32_t screen_y,
+                                uint32_t screen_w, uint32_t screen_h,
+                                uint64_t seq);
 
-// Per-frame publish. Tells the vendor: this mask handle's texture has been
-// updated; sample it as covering this screen rect (physical pixels, post-DPI).
-// Sync token (fence/event) is on the mask object; vendor reads after runtime
-// signals it.
-xrt_result_t xrt_dp_publish_local_zone_mask(
-    struct xrt_display_processor *dp,
-    struct xrt_dp_local_zone_mask *mask,
-    const struct xrt_rect2di *screen_rect_px,     // top-left + size in physical pixels
-    uint64_t sync_token);                          // monotonic per-mask seq
-
-// Equivalent to "this client is fully 2D." Cheaper than publishing an empty mask.
-xrt_result_t xrt_dp_clear_local_zone_mask(
-    struct xrt_display_processor *dp,
-    struct xrt_dp_local_zone_mask *mask);
-
-xrt_result_t xrt_dp_destroy_local_zone_mask(
-    struct xrt_display_processor *dp,
-    struct xrt_dp_local_zone_mask *mask);
+// Equivalent to "this client is fully 2D." Cheaper than publishing an empty
+// mask. Called on the active→inactive edge (mask destroyed, session ends).
+bool (*clear_local_zone_mask)(struct xrt_display_processor_d3d11 *xdp);
 ```
 
-Texture format is **binary** (1 channel, 1 = 3D, 0 = 2D). The vendor may treat any non-zero value as 3D for tolerance. Resolution is chosen by the runtime (informed by `max_mask_width/height` from caps) and is in **client-window pixels** — the runtime tells the vendor where that pixel space maps onto the screen via `screen_rect_px`.
+Mask values: 1 channel; the vendor must treat **any non-zero value as 3D** (the authored mask has fractional anti-aliased edges — the OR rule makes them conservative). Resolution is the authored mask resolution in **client-window pixels**; the runtime tells the vendor where that pixel space maps onto the screen via the `screen_*` args, and republishes every frame while a mask is active so the anchor tracks window moves/resizes (vendors coalesce per `max_update_hz`).
 
 ### What the DP vtable specifies
 
@@ -205,12 +195,12 @@ In all three tiers the wire-level primitive — what reaches the DP — is the s
 
 ### Runtime per-frame work (for each session with an active mask)
 
-On every `xrEndFrame` (or rate-limited if the DP caps say so):
+On every `xrEndFrame` (as implemented: `d3d11_sync_zone_mask_to_dp` in `comp_d3d11_compositor.cpp`, under the same `c->mutex` scope as the zone composite so the two mask consumers see identical state):
 
-1. **HWND screen rect**: `GetWindowRect(hwnd)` in physical pixels with per-monitor DPI awareness. Cache; invalidate on `WM_MOVE` / `WM_SIZE` / `WM_DPICHANGED` (subclass or `SetWinEventHook` on `EVENT_OBJECT_LOCATIONCHANGE`).
-2. **Z-order occlusion**: walk `GetWindow(hwnd, GW_HWNDPREV)` up to the top; for each top-level window above ours, intersect its rect with ours and accumulate into a "visible region in client-window pixels."
-3. **Apply occlusion to the client mask**: small compute shader ANDs the app-published mask with the rasterized visible region. Result is "what this client contributes to the panel."
-4. **Publish**: bump the sync token on the mask object, call `xrt_dp_publish_local_zone_mask(dp, mask, screen_rect_px, token)`.
+1. **Client screen rect**: `GetClientRect(hwnd)` + `ClientToScreen` each frame (physical pixels, same convention as `get_window_metrics`).
+2. **Z-order occlusion** — *deferred (Phase-0 publishes the un-occluded mask)*: walk `GetWindow(hwnd, GW_HWNDPREV)` up to the top; intersect each window above ours and accumulate a "visible region in client-window pixels."
+3. **Apply occlusion to the client mask** — *deferred with 2*: small shader ANDs the staged mask with the rasterized visible region. On 1×1-grid hardware the deferral changes nothing (the union result is identical); it starts mattering when overlapping windows meet per-zone hardware.
+4. **Publish**: bump the per-session seq, call `publish_local_zone_mask(dp, ctx, staged_srv, mask_w, mask_h, screen rect, seq)`. On the active→inactive edge (mask destroyed / teardown), call `clear_local_zone_mask` once.
 
 Occlusion is the runtime's responsibility, not the vendor's. The DP vtable sees only "this client wants this region in screen space, post-occlusion."
 
@@ -279,10 +269,10 @@ xrSubmitLocal3DZoneEXT(mask);
 ## Phasing
 
 **Phase 0 — DP vtable additions land in the runtime, on top of existing hardware.**
-First-vendor DP implements `xrt_dp_get_local_zone_caps` reporting `supported = true, zone_grid = 1×1`. Internally OR-collapses to today's global on/off path. Runtime can plumb the full extension end-to-end. Existing apps unaffected. Validates the API surface before any per-zone hardware exists.
+*Runtime side DONE (June 2026): D3D11 vtable slots 12–14, compositor per-frame publish/clear, hwGrid caps wiring, sim_display test double (`SIM_DISPLAY_ZONE_GRID=WxH` simulated grid + `SIM_DISPLAY_ZONE_DUMP=1` OR-downsampled per-cell readback logging — the hardware-free end-to-end check).* Remaining: first-vendor (Leia) DP implements `get_local_zone_caps` reporting `supported = 1, zone_grid = 1×1` and OR-collapses publishes to today's global on/off path. Existing apps unaffected. Validates the API surface before any per-zone hardware exists.
 
 **Phase 1 — runtime ships `XR_EXT_local_3d_zone`.**
-DisplayXR apps adopt it. On single-zone hardware, behavior identical to today. Occlusion subtraction starts working in preparation for Phase 2. Any vendor wanting to participate implements the DP vtable additions; the bar is low (1×1 grid + the new vtable methods is enough).
+*Authoring API + compositor consumer SHIPPED via #439 Phases 1–2 (ahead of this leg).* Remaining here: occlusion subtraction (deferred from Phase 0) in preparation for Phase 2. Any vendor wanting to participate implements the DP vtable additions; the bar is low (1×1 grid + the new vtable methods is enough).
 
 **Phase 2 — per-zone hardware lands** (from any vendor).
 That vendor's DP reports a real `zone_grid_width/height`. Same client code now produces per-window 3D zones. No app changes; runtime changes are confined to capability reporting and any optional vendor-specific tuning.
@@ -294,7 +284,7 @@ Shell becomes one more client publishing a mask; multi-app per-window 3D in shel
 
 ## Cross-references
 
-- DP vtable (existing): `src/xrt/include/xrt/xrt_display_processor.h:152–164` — `get_hardware_3d_state`, `request_display_mode`, `process_atlas`. The local-zone methods sit alongside these.
+- DP vtable: `src/xrt/include/xrt/xrt_display_processor_d3d11.h` — the local-zone methods (slots 12–14) sit after `set_atlas_encoding`; shared caps struct in `xrt_display_zones.h`. The base/Vulkan and other per-API vtables get the same append when their consumer legs land (zone masks are in-process D3D11 only today).
 - Vendor integration guide: `docs/guides/vendor-plugin-onboarding.md` — to be extended with the local-zone vtable methods once this spec lands.
 - Vendor-initiated state change events (today): `comp_d3d11_service.cpp:10180–10230`, `oxr_session.c:968` — the polling/event pattern that the new local-zone path coexists with, not replaces.
 - ADR-014 (shell owns rendering mode): generalizes in the zone world — the shell becomes one mask publisher among many rather than the sole policy holder.
