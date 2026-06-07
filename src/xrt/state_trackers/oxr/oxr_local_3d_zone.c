@@ -2,16 +2,19 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  XR_EXT_local_3d_zone entrypoints — authored 2D/3D mask (Phase 1 of
- *         unified 2D/3D compositing, docs/roadmap/unified-2d-3d-phase1-impl.md).
+ * @brief  XR_EXT_local_3d_zone entrypoints — authored 2D/3D mask (#439,
+ *         unified 2D/3D compositing).
  * @author David Fattal
  * @ingroup oxr_api
  *
  * The oxr layer owns the mask handle lifecycle and forwards authoring calls to
- * the native compositor's zone-mask entry points. Phase 1 wires the D3D11
- * consumer only; every other compositor falls through to
- * XR_ERROR_FEATURE_UNSUPPORTED (the caps query reports supported = false
- * instead of erroring).
+ * the native compositor's zone-mask entry points. The D3D11 consumer shipped
+ * with Phases 1–2 (docs/roadmap/unified-2d-3d-phase1-impl.md, -phase2-impl.md);
+ * D3D12 and VK forward to stubs until their consumer legs land
+ * (docs/roadmap/unified-2d-3d-crossapi-impl.md) — the caps query reports
+ * supported = false for those sessions, and a stubbed compositor's
+ * XRT_ERROR_NOT_IMPLEMENTED maps to XR_ERROR_FEATURE_UNSUPPORTED. Every other
+ * compositor falls through to XR_ERROR_FEATURE_UNSUPPORTED.
  */
 
 #include <stdlib.h>
@@ -32,10 +35,43 @@
 #include "d3d11/comp_d3d11_compositor.h"
 #endif
 
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+#include "d3d12/comp_d3d12_compositor.h"
+#endif
+
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+#include "vk_native/comp_vk_native_compositor.h"
+#endif
+
 #ifdef OXR_HAVE_EXT_local_3d_zone
 
-//! D3D11 max texture dimension — bounds the authored mask size.
+//! D3D11/D3D12/VK max texture dimension — bounds the authored mask size.
 #define OXR_LOCAL_3D_ZONE_MAX_MASK_DIM 16384
+
+#if defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR) || defined(XRT_HAVE_D3D12_NATIVE_COMPOSITOR) ||                          \
+    defined(XRT_HAVE_VK_NATIVE_COMPOSITOR)
+#define OXR_LOCAL_3D_ZONE_HAVE_ANY_COMPOSITOR
+#endif
+
+#ifdef OXR_LOCAL_3D_ZONE_HAVE_ANY_COMPOSITOR
+/*!
+ * Map a compositor zone-mask result: stubs (consumer leg not landed) report
+ * XRT_ERROR_NOT_IMPLEMENTED → XR_ERROR_FEATURE_UNSUPPORTED; anything else
+ * non-success is a runtime failure.
+ */
+static XrResult
+zone_mask_xret_to_xr(struct oxr_logger *log, xrt_result_t xret, const char *what)
+{
+	if (xret == XRT_SUCCESS) {
+		return XR_SUCCESS;
+	}
+	if (xret == XRT_ERROR_NOT_IMPLEMENTED) {
+		return oxr_error(log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "%s: local 3D zone consumer not implemented for this compositor yet", what);
+	}
+	return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "%s failed (%d)", what, xret);
+}
+#endif
 
 
 /*
@@ -49,12 +85,26 @@ oxr_local_3d_zone_destroy_cb(struct oxr_logger *log, struct oxr_handle_base *hb)
 {
 	struct oxr_local_3d_zone_ext *zone = (struct oxr_local_3d_zone_ext *)hb;
 
-#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+#ifdef OXR_LOCAL_3D_ZONE_HAVE_ANY_COMPOSITOR
 	struct oxr_session *sess = zone->sess;
-	if (zone->comp_mask != NULL && sess != NULL && sess->is_d3d11_native_compositor && sess->xcn != NULL) {
-		comp_d3d11_compositor_zone_mask_destroy(&sess->xcn->base, zone->comp_mask);
-	}
+	if (zone->comp_mask != NULL && sess != NULL && sess->xcn != NULL) {
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+		if (sess->is_d3d11_native_compositor) {
+			comp_d3d11_compositor_zone_mask_destroy(&sess->xcn->base, zone->comp_mask);
+		}
 #endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+		if (sess->is_d3d12_native_compositor) {
+			comp_d3d12_compositor_zone_mask_destroy(&sess->xcn->base, zone->comp_mask);
+		}
+#endif
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+		if (sess->is_vk_native_compositor) {
+			comp_vk_native_compositor_zone_mask_destroy(&sess->xcn->base, zone->comp_mask);
+		}
+#endif
+	}
+#endif // OXR_LOCAL_3D_ZONE_HAVE_ANY_COMPOSITOR
 	zone->comp_mask = NULL;
 
 	free(zone);
@@ -80,6 +130,8 @@ oxr_xrGetLocal3DZoneCapabilitiesEXT(XrSession session, XrLocal3DZoneCapabilities
 	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, capabilities, XR_TYPE_LOCAL_3D_ZONE_CAPABILITIES_EXT);
 
 	// Never errors on an unsupported compositor — reports supported = false.
+	// D3D12 + VK sessions also report false until their consumer legs land
+	// (docs/roadmap/unified-2d-3d-crossapi-impl.md — flip here per leg).
 	capabilities->supported = XR_FALSE;
 	capabilities->hardwareZoneGridWidth = 0;
 	capabilities->hardwareZoneGridHeight = 0;
@@ -120,8 +172,20 @@ oxr_xrCreateLocal3DZoneMaskEXT(XrSession session,
 		                 createInfo->maskWidth, createInfo->maskHeight, OXR_LOCAL_3D_ZONE_MAX_MASK_DIM);
 	}
 
+#ifdef OXR_LOCAL_3D_ZONE_HAVE_ANY_COMPOSITOR
+	bool api_matched = false;
+	if (sess->xcn != NULL) {
 #ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
-	if (sess->is_d3d11_native_compositor && sess->xcn != NULL) {
+		api_matched = api_matched || sess->is_d3d11_native_compositor;
+#endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+		api_matched = api_matched || sess->is_d3d12_native_compositor;
+#endif
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+		api_matched = api_matched || sess->is_vk_native_compositor;
+#endif
+	}
+	if (api_matched) {
 		struct oxr_local_3d_zone_ext *zone = NULL;
 		OXR_ALLOCATE_HANDLE_OR_RETURN(&log, zone, OXR_XR_DEBUG_LOCAL3DZONE, oxr_local_3d_zone_destroy_cb,
 		                              &sess->handle);
@@ -131,11 +195,27 @@ oxr_xrCreateLocal3DZoneMaskEXT(XrSession session,
 		zone->width = createInfo->maskWidth;
 		zone->height = createInfo->maskHeight;
 
-		xrt_result_t xret = comp_d3d11_compositor_zone_mask_create(&sess->xcn->base, zone->width,
-		                                                           zone->height, &zone->comp_mask);
+		xrt_result_t xret = XRT_ERROR_NOT_IMPLEMENTED;
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+		if (sess->is_d3d11_native_compositor) {
+			xret = comp_d3d11_compositor_zone_mask_create(&sess->xcn->base, zone->width, zone->height,
+			                                              &zone->comp_mask);
+		}
+#endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+		if (sess->is_d3d12_native_compositor) {
+			xret = comp_d3d12_compositor_zone_mask_create(&sess->xcn->base, zone->width, zone->height,
+			                                              &zone->comp_mask);
+		}
+#endif
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+		if (sess->is_vk_native_compositor) {
+			xret = comp_vk_native_compositor_zone_mask_create(&sess->xcn->base, zone->width, zone->height,
+			                                                  &zone->comp_mask);
+		}
+#endif
 		if (xret != XRT_SUCCESS) {
-			XrResult ret = oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
-			                         "Failed to create compositor zone mask (%d)", xret);
+			XrResult ret = zone_mask_xret_to_xr(&log, xret, "xrCreateLocal3DZoneMaskEXT");
 			oxr_handle_destroy(&log, &zone->handle);
 			return ret;
 		}
@@ -143,7 +223,7 @@ oxr_xrCreateLocal3DZoneMaskEXT(XrSession session,
 		*mask = oxr_local_3d_zone_to_openxr(zone);
 		return XR_SUCCESS;
 	}
-#endif
+#endif // OXR_LOCAL_3D_ZONE_HAVE_ANY_COMPOSITOR
 
 	return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
 	                 "Local 3D zone masks are not supported for this compositor");
@@ -158,20 +238,37 @@ oxr_xrSetLocal3DZoneWholeWindowEXT(XrLocal3DZoneMaskEXT mask, XrBool32 enable3D)
 	struct oxr_logger log;
 	OXR_VERIFY_LOCAL_3D_ZONE_AND_INIT_LOG(&log, mask, zone, "xrSetLocal3DZoneWholeWindowEXT");
 
-#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+#ifdef OXR_LOCAL_3D_ZONE_HAVE_ANY_COMPOSITOR
 	struct oxr_session *sess = zone->sess;
-	if (sess->is_d3d11_native_compositor && sess->xcn != NULL) {
-		xrt_result_t xret =
-		    comp_d3d11_compositor_zone_mask_set_whole(&sess->xcn->base, zone->comp_mask, enable3D == XR_TRUE);
-		if (xret != XRT_SUCCESS) {
-			return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE, "Failed to set whole-window zone mask (%d)",
-			                 xret);
+	if (sess->xcn != NULL) {
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+		if (sess->is_d3d11_native_compositor) {
+			return zone_mask_xret_to_xr(&log,
+			                            comp_d3d11_compositor_zone_mask_set_whole(
+			                                &sess->xcn->base, zone->comp_mask, enable3D == XR_TRUE),
+			                            "xrSetLocal3DZoneWholeWindowEXT");
 		}
-		return XR_SUCCESS;
+#endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+		if (sess->is_d3d12_native_compositor) {
+			return zone_mask_xret_to_xr(&log,
+			                            comp_d3d12_compositor_zone_mask_set_whole(
+			                                &sess->xcn->base, zone->comp_mask, enable3D == XR_TRUE),
+			                            "xrSetLocal3DZoneWholeWindowEXT");
+		}
+#endif
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+		if (sess->is_vk_native_compositor) {
+			return zone_mask_xret_to_xr(&log,
+			                            comp_vk_native_compositor_zone_mask_set_whole(
+			                                &sess->xcn->base, zone->comp_mask, enable3D == XR_TRUE),
+			                            "xrSetLocal3DZoneWholeWindowEXT");
+		}
+#endif
 	}
 #else
 	(void)enable3D;
-#endif
+#endif // OXR_LOCAL_3D_ZONE_HAVE_ANY_COMPOSITOR
 
 	return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
 	                 "Local 3D zone masks are not supported for this compositor");
@@ -191,9 +288,9 @@ oxr_xrSetLocal3DZoneFromRectsEXT(XrLocal3DZoneMaskEXT mask, uint32_t rectCount, 
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "(rectCount == 0) must be at least one rect");
 	}
 
-#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+#ifdef OXR_LOCAL_3D_ZONE_HAVE_ANY_COMPOSITOR
 	struct oxr_session *sess = zone->sess;
-	if (sess->is_d3d11_native_compositor && sess->xcn != NULL) {
+	if (sess->xcn != NULL) {
 		struct xrt_rect *xrects = U_TYPED_ARRAY_CALLOC(struct xrt_rect, rectCount);
 		if (xrects == NULL) {
 			return oxr_error(&log, XR_ERROR_OUT_OF_MEMORY, "Failed to allocate rect array");
@@ -205,15 +302,35 @@ oxr_xrSetLocal3DZoneFromRectsEXT(XrLocal3DZoneMaskEXT mask, uint32_t rectCount, 
 			xrects[i].extent.h = rects[i].extent.height;
 		}
 
-		xrt_result_t xret =
-		    comp_d3d11_compositor_zone_mask_set_rects(&sess->xcn->base, zone->comp_mask, rectCount, xrects);
-		free(xrects);
-		if (xret != XRT_SUCCESS) {
-			return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE, "Failed to set zone mask rects (%d)", xret);
+		xrt_result_t xret = XRT_ERROR_NOT_IMPLEMENTED;
+		bool api_matched = false;
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+		if (sess->is_d3d11_native_compositor) {
+			xret = comp_d3d11_compositor_zone_mask_set_rects(&sess->xcn->base, zone->comp_mask, rectCount,
+			                                                 xrects);
+			api_matched = true;
 		}
-		return XR_SUCCESS;
-	}
 #endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+		if (!api_matched && sess->is_d3d12_native_compositor) {
+			xret = comp_d3d12_compositor_zone_mask_set_rects(&sess->xcn->base, zone->comp_mask, rectCount,
+			                                                 xrects);
+			api_matched = true;
+		}
+#endif
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+		if (!api_matched && sess->is_vk_native_compositor) {
+			xret = comp_vk_native_compositor_zone_mask_set_rects(&sess->xcn->base, zone->comp_mask,
+			                                                     rectCount, xrects);
+			api_matched = true;
+		}
+#endif
+		free(xrects);
+		if (api_matched) {
+			return zone_mask_xret_to_xr(&log, xret, "xrSetLocal3DZoneFromRectsEXT");
+		}
+	}
+#endif // OXR_LOCAL_3D_ZONE_HAVE_ANY_COMPOSITOR
 
 	return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
 	                 "Local 3D zone masks are not supported for this compositor");
@@ -229,9 +346,16 @@ oxr_xrAcquireLocal3DZoneRenderTargetEXT(XrLocal3DZoneMaskEXT mask, void *binding
 	OXR_VERIFY_LOCAL_3D_ZONE_AND_INIT_LOG(&log, mask, zone, "xrAcquireLocal3DZoneRenderTargetEXT");
 	OXR_VERIFY_ARG_NOT_NULL(&log, binding);
 
-#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+#ifdef OXR_LOCAL_3D_ZONE_HAVE_ANY_COMPOSITOR
 	struct oxr_session *sess = zone->sess;
-	if (sess->is_d3d11_native_compositor && sess->xcn != NULL) {
+	if (sess->xcn == NULL) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "Local 3D zone masks are not supported for this compositor");
+	}
+#endif
+
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+	if (sess->is_d3d11_native_compositor) {
 		XrLocal3DZoneRenderTargetD3D11EXT *d3d11_binding = (XrLocal3DZoneRenderTargetD3D11EXT *)binding;
 		if (d3d11_binding->type != XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D11_EXT) {
 			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
@@ -243,13 +367,60 @@ oxr_xrAcquireLocal3DZoneRenderTargetEXT(XrLocal3DZoneMaskEXT mask, void *binding
 		xrt_result_t xret =
 		    comp_d3d11_compositor_zone_mask_acquire_rt(&sess->xcn->base, zone->comp_mask, &rtv, &w, &h);
 		if (xret != XRT_SUCCESS) {
-			return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
-			                 "Failed to acquire zone mask render target (%d)", xret);
+			return zone_mask_xret_to_xr(&log, xret, "xrAcquireLocal3DZoneRenderTargetEXT");
 		}
 
 		d3d11_binding->renderTargetView = rtv;
 		d3d11_binding->width = w;
 		d3d11_binding->height = h;
+		return XR_SUCCESS;
+	}
+#endif
+
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+	if (sess->is_d3d12_native_compositor) {
+		XrLocal3DZoneRenderTargetD3D12EXT *d3d12_binding = (XrLocal3DZoneRenderTargetD3D12EXT *)binding;
+		if (d3d12_binding->type != XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D12_EXT) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "(binding->type) expected XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D12_EXT");
+		}
+
+		void *resource = NULL;
+		uint32_t w = 0, h = 0;
+		xrt_result_t xret =
+		    comp_d3d12_compositor_zone_mask_acquire_rt(&sess->xcn->base, zone->comp_mask, &resource, &w, &h);
+		if (xret != XRT_SUCCESS) {
+			return zone_mask_xret_to_xr(&log, xret, "xrAcquireLocal3DZoneRenderTargetEXT");
+		}
+
+		d3d12_binding->resource = resource;
+		d3d12_binding->width = w;
+		d3d12_binding->height = h;
+		return XR_SUCCESS;
+	}
+#endif
+
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->is_vk_native_compositor) {
+		XrLocal3DZoneRenderTargetVulkanEXT *vk_binding = (XrLocal3DZoneRenderTargetVulkanEXT *)binding;
+		if (vk_binding->type != XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_VULKAN_EXT) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "(binding->type) expected XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_VULKAN_EXT");
+		}
+
+		void *image = NULL;
+		void *image_view = NULL;
+		uint32_t w = 0, h = 0;
+		xrt_result_t xret = comp_vk_native_compositor_zone_mask_acquire_rt(&sess->xcn->base, zone->comp_mask,
+		                                                                   &image, &image_view, &w, &h);
+		if (xret != XRT_SUCCESS) {
+			return zone_mask_xret_to_xr(&log, xret, "xrAcquireLocal3DZoneRenderTargetEXT");
+		}
+
+		vk_binding->image = image;
+		vk_binding->imageView = image_view;
+		vk_binding->width = w;
+		vk_binding->height = h;
 		return XR_SUCCESS;
 	}
 #endif
@@ -267,16 +438,32 @@ oxr_xrSubmitLocal3DZoneEXT(XrLocal3DZoneMaskEXT mask)
 	struct oxr_logger log;
 	OXR_VERIFY_LOCAL_3D_ZONE_AND_INIT_LOG(&log, mask, zone, "xrSubmitLocal3DZoneEXT");
 
-#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+#ifdef OXR_LOCAL_3D_ZONE_HAVE_ANY_COMPOSITOR
 	struct oxr_session *sess = zone->sess;
-	if (sess->is_d3d11_native_compositor && sess->xcn != NULL) {
-		xrt_result_t xret = comp_d3d11_compositor_zone_mask_submit(&sess->xcn->base, zone->comp_mask);
-		if (xret != XRT_SUCCESS) {
-			return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE, "Failed to submit zone mask (%d)", xret);
+	if (sess->xcn != NULL) {
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+		if (sess->is_d3d11_native_compositor) {
+			return zone_mask_xret_to_xr(
+			    &log, comp_d3d11_compositor_zone_mask_submit(&sess->xcn->base, zone->comp_mask),
+			    "xrSubmitLocal3DZoneEXT");
 		}
-		return XR_SUCCESS;
-	}
 #endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+		if (sess->is_d3d12_native_compositor) {
+			return zone_mask_xret_to_xr(
+			    &log, comp_d3d12_compositor_zone_mask_submit(&sess->xcn->base, zone->comp_mask),
+			    "xrSubmitLocal3DZoneEXT");
+		}
+#endif
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+		if (sess->is_vk_native_compositor) {
+			return zone_mask_xret_to_xr(
+			    &log, comp_vk_native_compositor_zone_mask_submit(&sess->xcn->base, zone->comp_mask),
+			    "xrSubmitLocal3DZoneEXT");
+		}
+#endif
+	}
+#endif // OXR_LOCAL_3D_ZONE_HAVE_ANY_COMPOSITOR
 
 	return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
 	                 "Local 3D zone masks are not supported for this compositor");

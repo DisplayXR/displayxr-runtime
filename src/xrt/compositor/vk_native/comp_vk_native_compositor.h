@@ -192,6 +192,83 @@ comp_vk_native_compositor_get_vk(struct comp_vk_native_compositor *c);
 uint32_t
 comp_vk_native_compositor_get_queue_family(struct comp_vk_native_compositor *c);
 
+/*
+ * XR_EXT_local_3d_zone — authored 2D/3D mask consumer, VK leg.
+ * Contracts + scoping (the composite consumer rides with Phase 3 — handle
+ * apps have no 2D source before the xrEndFrame 2D layer):
+ * docs/roadmap/unified-2d-3d-crossapi-impl.md §4.
+ *
+ * STUBS until that leg lands — all return XRT_ERROR_NOT_IMPLEMENTED and the
+ * oxr caps query reports supported = false for VK sessions until then.
+ * NOTE: unlike the D3D11/D3D12 guards, XRT_HAVE_VK_NATIVE_COMPOSITOR is
+ * defined on every platform, so these must stay real (linkable) symbols.
+ */
+
+/*!
+ * Create the compositor-side mask state (R8_UNORM image, w×h client px).
+ *
+ * @ingroup comp_vk_native
+ */
+xrt_result_t
+comp_vk_native_compositor_zone_mask_create(struct xrt_compositor *xc,
+                                           uint32_t w, uint32_t h,
+                                           void **out_mask);
+
+/*!
+ * Tier 1 — fill the whole mask: all-3D (enable_3d) or all-2D.
+ *
+ * @ingroup comp_vk_native
+ */
+xrt_result_t
+comp_vk_native_compositor_zone_mask_set_whole(struct xrt_compositor *xc,
+                                              void *mask,
+                                              bool enable_3d);
+
+/*!
+ * Tier 2 — rasterize client-window-pixel rects as the 3D region.
+ *
+ * @ingroup comp_vk_native
+ */
+xrt_result_t
+comp_vk_native_compositor_zone_mask_set_rects(struct xrt_compositor *xc,
+                                              void *mask,
+                                              uint32_t count,
+                                              const struct xrt_rect *rects);
+
+/*!
+ * Tier 3 — hand back the VkImage + VkImageView for freeform app drawing
+ * (the compositor shares the app's VkDevice; same-queue submission order is
+ * the sync contract).
+ *
+ * @param out_image      Receives a VkImage (as void*).
+ * @param out_image_view Receives a VkImageView (as void*).
+ *
+ * @ingroup comp_vk_native
+ */
+xrt_result_t
+comp_vk_native_compositor_zone_mask_acquire_rt(struct xrt_compositor *xc,
+                                               void *mask,
+                                               void **out_image,
+                                               void **out_image_view,
+                                               uint32_t *out_w,
+                                               uint32_t *out_h);
+
+/*!
+ * Stage the mask's current contents for the next frame submission.
+ *
+ * @ingroup comp_vk_native
+ */
+xrt_result_t
+comp_vk_native_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask);
+
+/*!
+ * Destroy the compositor-side mask state.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask);
+
 #ifdef __cplusplus
 }
 #endif
