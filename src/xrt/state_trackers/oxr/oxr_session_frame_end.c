@@ -1249,6 +1249,81 @@ verify_window_space_layer(struct oxr_session *sess,
 	return XR_SUCCESS;
 }
 
+#ifdef OXR_HAVE_EXT_local_3d_zone
+static XrResult
+verify_local_2d_layer(struct oxr_session *sess,
+                      struct xrt_compositor *xc,
+                      struct oxr_logger *log,
+                      uint32_t layer_index,
+                      const XrCompositionLayerLocal2DEXT *l2d,
+                      struct xrt_device *head,
+                      uint64_t timestamp)
+{
+	// Valid to submit without ever creating a mask object (the implicit
+	// mask is compositor-side), but the extension itself must be enabled.
+	if (!sess->sys->inst->extensions.EXT_local_3d_zone) {
+		return oxr_error(log, XR_ERROR_LAYER_INVALID,
+		                 "(frameEndInfo->layers[%u]) local-2D layer requires XR_EXT_local_3d_zone to be "
+		                 "enabled",
+		                 layer_index);
+	}
+
+	// Same session gate as window-space layers: a window-bound native compositor.
+	if (!sess->is_d3d11_native_compositor && !sess->is_d3d12_native_compositor &&
+	    !sess->is_metal_native_compositor && !sess->is_gl_native_compositor && !sess->has_external_window) {
+		return oxr_error(log, XR_ERROR_LAYER_INVALID,
+		                 "(frameEndInfo->layers[%u]) local-2D layer requires a session created with a "
+		                 "window binding extension",
+		                 layer_index);
+	}
+
+	struct oxr_swapchain *sc = XRT_CAST_OXR_HANDLE_TO_PTR(struct oxr_swapchain *, l2d->subImage.swapchain);
+
+	if (sc == NULL) {
+		return oxr_error(log, XR_ERROR_LAYER_INVALID,
+		                 "(frameEndInfo->layers[%u]->subImage.swapchain) swapchain is NULL!", layer_index);
+	}
+
+	if (!sc->released.yes) {
+		return oxr_error(log, XR_ERROR_LAYER_INVALID,
+		                 "(frameEndInfo->layers[%u]->subImage.swapchain) swapchain has not been released!",
+		                 layer_index);
+	}
+
+	if (sc->released.index >= (int)sc->swapchain->image_count) {
+		return oxr_error(log, XR_ERROR_RUNTIME_FAILURE,
+		                 "(frameEndInfo->layers[%u]->subImage.swapchain) internal image index out of bounds",
+		                 layer_index);
+	}
+
+	if (is_rect_neg(&l2d->subImage.imageRect)) {
+		return oxr_error(
+		    log, XR_ERROR_SWAPCHAIN_RECT_INVALID,
+		    "(frameEndInfo->layers[%u]->subImage.imageRect.offset == {%i, %i}) has negative component(s)",
+		    layer_index, l2d->subImage.imageRect.offset.x, l2d->subImage.imageRect.offset.y);
+	}
+
+	if (is_rect_out_of_bounds(&l2d->subImage.imageRect, sc)) {
+		return oxr_error(log, XR_ERROR_SWAPCHAIN_RECT_INVALID,
+		                 "(frameEndInfo->layers[%u]->subImage.imageRect == {{%i, %i}, {%u, %u}}) imageRect out "
+		                 "of image bounds (%u, %u)",
+		                 layer_index, l2d->subImage.imageRect.offset.x, l2d->subImage.imageRect.offset.y,
+		                 l2d->subImage.imageRect.extent.width, l2d->subImage.imageRect.extent.height,
+		                 sc->width, sc->height);
+	}
+
+	// Destination rect: positive extent required; the offset may place the
+	// rect partially (or fully) outside the window — the compositor clips.
+	if (l2d->rect.extent.width <= 0 || l2d->rect.extent.height <= 0) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+		                 "(frameEndInfo->layers[%u]->rect.extent == {%i, %i}) must be positive", layer_index,
+		                 l2d->rect.extent.width, l2d->rect.extent.height);
+	}
+
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_EXT_local_3d_zone
+
 /*
  *
  * Submit functions.
@@ -1748,6 +1823,43 @@ submit_window_space_layer(struct oxr_session *sess,
 	return XR_SUCCESS;
 }
 
+#ifdef OXR_HAVE_EXT_local_3d_zone
+static XrResult
+submit_local_2d_layer(struct oxr_session *sess,
+                      struct xrt_compositor *xc,
+                      struct oxr_logger *log,
+                      const XrCompositionLayerLocal2DEXT *l2d,
+                      struct xrt_device *head,
+                      struct xrt_pose *inv_offset,
+                      uint64_t oxr_timestamp,
+                      uint64_t xrt_timestamp)
+{
+	struct oxr_swapchain *sc = XRT_CAST_OXR_HANDLE_TO_PTR(struct oxr_swapchain *, l2d->subImage.swapchain);
+
+	enum xrt_layer_composition_flags flags = convert_layer_flags(l2d->layerFlags);
+
+	struct xrt_layer_data data;
+	U_ZERO(&data);
+	data.type = XRT_LAYER_LOCAL_2D;
+	data.name = XRT_INPUT_GENERIC_HEAD_POSE;
+	data.timestamp = xrt_timestamp;
+	data.flags = flags;
+
+	data.local_2d.rect.offset.w = l2d->rect.offset.x;
+	data.local_2d.rect.offset.h = l2d->rect.offset.y;
+	data.local_2d.rect.extent.w = l2d->rect.extent.width;
+	data.local_2d.rect.extent.h = l2d->rect.extent.height;
+	fill_in_sub_image(sc, &l2d->subImage, &data.local_2d.sub);
+	fill_in_color_scale_bias(sess, (XrCompositionLayerBaseHeader *)l2d, &data);
+	fill_in_y_flip(sess, (XrCompositionLayerBaseHeader *)l2d, &data);
+
+	xrt_result_t xret = xrt_comp_layer_local_2d(xc, head, sc->swapchain, &data);
+	OXR_CHECK_XRET(log, sess, xret, xrt_comp_layer_local_2d);
+
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_EXT_local_3d_zone
+
 static XrResult
 submit_passthrough_layer(struct oxr_session *sess,
                          struct xrt_compositor *xc,
@@ -1914,6 +2026,12 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 			                                (XrCompositionLayerWindowSpaceEXT *)layer, xdev,
 			                                frameEndInfo->displayTime);
 			break;
+#ifdef OXR_HAVE_EXT_local_3d_zone
+		case XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT:
+			res = verify_local_2d_layer(sess, xc, log, i, (XrCompositionLayerLocal2DEXT *)layer, xdev,
+			                            frameEndInfo->displayTime);
+			break;
+#endif // OXR_HAVE_EXT_local_3d_zone
 		default:
 			return oxr_error(log, XR_ERROR_LAYER_INVALID,
 			                 "(frameEndInfo->layers[%u]->type) layer type not supported (%u)", i,
@@ -1983,6 +2101,12 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 			submit_window_space_layer(sess, xc, log, (XrCompositionLayerWindowSpaceEXT *)layer, xdev,
 			                          &inv_offset, frameEndInfo->displayTime, xrt_display_time_ns);
 			break;
+#ifdef OXR_HAVE_EXT_local_3d_zone
+		case XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT:
+			submit_local_2d_layer(sess, xc, log, (XrCompositionLayerLocal2DEXT *)layer, xdev, &inv_offset,
+			                      frameEndInfo->displayTime, xrt_display_time_ns);
+			break;
+#endif // OXR_HAVE_EXT_local_3d_zone
 		default: assert(false && "invalid layer type");
 		}
 	}
