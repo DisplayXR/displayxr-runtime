@@ -1976,6 +1976,18 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 		}
 		return false;
 	}
+	if (output_texture.framebufferOnly) {
+		// Runtime-owned-window drawables are framebufferOnly=YES — the
+		// weave-snapshot blit can't read them. Handle/texture sessions
+		// (external view / shared IOSurface) are the Phase-3 targets and
+		// are readable; hosted is a follow-up.
+		static bool warned_fbo = false;
+		if (!warned_fbo) {
+			warned_fbo = true;
+			U_LOG_W("Masked composite skipped: output drawable is framebufferOnly (one-time warning)");
+		}
+		return false;
+	}
 
 	uint32_t w = eff->w;
 	uint32_t h = eff->h;
