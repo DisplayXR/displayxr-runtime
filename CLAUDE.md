@@ -141,7 +141,7 @@ This repo IS the public runtime (no private→public mirror). A release is a `vX
 /release v1.2.1   # explicit            /release patch
 /release minor                          /release major
 ```
-`/release` tags `main` HEAD (CI patches `CMakeLists.txt VERSION` from `git describe` at build time, so the source-tree value isn't committed), watches both CI workflows, writes curated notes, then waits for `BumpVersionsJsonOnTag` (ABI gate + `versions.json` bump + mirror to `displayxr-installer`). macOS `.pkg` is a soft requirement (warns, doesn't block). Auto-bump regex is strict (`^v[0-9]+\.[0-9]+\.[0-9]+$`) so non-canonical tags are skipped. See `.claude/skills/release/SKILL.md`.
+`/release` pushes an **empty "Release vX.Y.Z" marker commit** to `main` and tags it (so the graph shows an obvious release boundary; CI still patches `CMakeLists.txt VERSION` from `git describe` at build time — the marker carries no version content, so PR #353's drift vector stays dead; the marker's main-push CI short-circuits via the empty-diff → docs_only rule in `DetectChanges`), watches both CI workflows, writes curated notes, then waits for `BumpVersionsJsonOnTag` (ABI gate + `versions.json` bump + mirror to `displayxr-installer`). `/dxr-release` and `/installer-release` push the same marker commit to their target repos. macOS `.pkg` is a soft requirement (warns, doesn't block). Auto-bump regex is strict (`^v[0-9]+\.[0-9]+\.[0-9]+$`) so non-canonical tags are skipped. See `.claude/skills/release/SKILL.md`.
 
 **Sibling release flows (NOT `/release` in this repo):**
 

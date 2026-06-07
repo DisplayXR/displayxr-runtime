@@ -36,7 +36,7 @@ version-spec:
 /release patch
   │   (bumps from latest v[0-9]+.[0-9]+.[0-9]+ tag)
   ├─ Pre-flight (clean tree, on main, tag not taken)
-  ├─ Tag HEAD → push tag
+  ├─ Empty "Release vX.Y.Z" marker commit → push main → tag it → push tag
   │
   │  (CI takes over here — build-windows.yml patches CMakeLists.txt
   │   VERSION from the tag at build time per PR #353, then both
@@ -52,14 +52,19 @@ version-spec:
   └─ Report (includes auto-bump SHAs + any ABI-mismatch issue link)
 ```
 
-The skill no longer touches CMakeLists.txt — CI is authoritative for
+The skill never touches CMakeLists.txt — CI is authoritative for
 the source-tree VERSION (synced from `git describe --tags --abbrev=0`
 on every Windows build per PR #353; macOS derives version directly
-from `GITHUB_REF` in build-macos.yml). The previous flow's "Release
-X.Y.Z" version-bump commit was both redundant (CI overrode it anyway)
-and a drift vector if the bump was forgotten — that's exactly what
-landed PR #353 (after the in-tree value pinned at 1.2.3 silently
-drifted for three releases past v1.3.0 in displayxr-shell-pvt).
+from `GITHUB_REF` in build-macos.yml). The old flow's "Release X.Y.Z"
+*version-bump* commit was a drift vector if the bump was forgotten —
+that's exactly what landed PR #353 (after the in-tree value pinned at
+1.2.3 silently drifted for three releases past v1.3.0 in
+displayxr-shell-pvt). The marker commit reintroduced here is **empty**
+(`--allow-empty`, no version content), so it restores the obvious
+"Release vX.Y.Z" boundary in the main history without restoring the
+drift vector. Every DisplayXR repo's release flow uses the same marker
+pattern (`/dxr-release`, `/installer-release`, and the Unity/Unreal
+plugin repos).
 
 The skill also no longer downloads or re-uploads any artifacts — that
 moved into the workflows themselves per #290.
@@ -126,25 +131,38 @@ If empty, PREV_TAG=<empty> → use "Initial release" in notes.
 
 ---
 
-## PHASE 2: TAG
+## PHASE 2: MARKER COMMIT + TAG
 
-### Step 2.1: Tag HEAD and push the tag
-The skill no longer commits anything to `main` — CI patches
-CMakeLists.txt VERSION from the tag at build time (PR #353). Just tag
-the current `main` HEAD and push the tag.
+### Step 2.1: Create the empty release-marker commit, push it, tag it
+The marker is an **empty** commit — it exists purely so `git log` /
+graph views show an obvious "Release vX.Y.Z" boundary on main (which
+release got which commits). It carries no version content, so the
+CMakeLists drift vector that killed the old version-bump commit
+(PR #353) does not apply — CI still patches VERSION from the tag at
+build time.
 
 ```bash
+git commit --allow-empty -m "Release [FULL_TAG]"
+git push origin main
 git tag [FULL_TAG]
 git push origin [FULL_TAG]
 ```
 
-Store the tagged commit SHA for later monitoring: `RELEASE_SHA=$(git rev-parse [FULL_TAG]^{commit})`.
+Store the tagged commit SHA for later monitoring:
+`RELEASE_SHA=$(git rev-parse [FULL_TAG]^{commit})` (this is the marker
+commit). Also keep it as `MARKER_SHA` for Phase 7 rollback.
 
-### Step 2.2: Branch protection note
-Branch protection on `main` does not apply to tag pushes, so no
-admin override is needed. (Earlier versions of this skill committed a
-"Release vX.Y.Z" version-bump to `main`; that step is gone — see the
-Architecture diagram.)
+### Step 2.2: Branch protection + duplicate-CI notes
+- Branch protection on `main` allows the owner's direct push; tag
+  pushes are unaffected by protection. If the marker push is ever
+  rejected (ruleset change), fall back to tagging HEAD directly (the
+  pre-marker flow) and flag it in the final report.
+- The marker push to `main` fires its own build-windows + build-macos
+  runs alongside the tag runs. Both workflows' `DetectChanges` treat
+  an **empty diff as docs_only=true**, so the main-push runs
+  short-circuit in ~30 s — the real release build is the tag run.
+  Phase 3's run lookup already disambiguates the two same-SHA runs by
+  `headBranch == [FULL_TAG]`.
 
 ---
 
@@ -398,8 +416,22 @@ git tag -d [FULL_TAG]
 git push --delete origin [FULL_TAG]
 ```
 
-There's nothing else to revert — Phase 2 no longer commits anything to
-`main`, so deleting the tag fully rolls back the release.
+### Step 7.2: Remove the marker commit (only if still main's tip)
+The marker commit is empty, so leaving it is harmless to the build —
+but misleading (a "Release vX.Y.Z" marker with no release). Remove it
+only if `main` hasn't moved past it; never force-push over someone
+else's commits:
+
+```bash
+git fetch origin main
+if [ "$(git rev-parse origin/main)" = "$MARKER_SHA" ]; then
+  git push --force-with-lease=main:"$MARKER_SHA" origin "$MARKER_SHA^:main"
+  git reset --hard origin/main
+else
+  echo "main moved past the marker — leaving it; note in report that"
+  echo "the [FULL_TAG] marker commit is orphaned (release rolled back)."
+fi
+```
 
 ### Step 7.2: Error summary + report
 ```bash
@@ -414,7 +446,7 @@ Report the error and that the tag has been deleted. STOP.
 ```
 /release v1.2.1
     → explicit version
-    → tags current main HEAD as v1.2.1 (no source-tree commit)
+    → empty "Release v1.2.1" marker commit on main, tagged v1.2.1
     → push v1.2.1 → CI patches CMakeLists VERSION → builds installer
     → workflows attach installer to the GH release
 
