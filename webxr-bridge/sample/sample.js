@@ -105,6 +105,7 @@ const VK = {
 const keyDown = new Set();           // VK codes currently down
 let lastRequestedMode = -1;          // V key: track locally (async mode-changed is stale)
 let eyeTrackingMode = 0;            // 0=MANAGED, 1=MANUAL (T key toggle)
+let eyeTrackingActive = null;        // last-known isTracking (#449); null=unknown
 let hudVisible = false;              // TAB key toggle
 let hudJustToggled = false;          // Send one frame after toggle-off to clear
 let mouseLookDown = false;           // Left-mouse-drag for look (matches cube_handle)
@@ -852,6 +853,12 @@ async function enterXR() {
     } else {
       eyeTrackingMode = 0;
     }
+    // Seed last-known tracking state (#449) — display-info carries it when
+    // the bridge has located views at least once; edges arrive via the
+    // 'eyetrackingstatechange' session event afterwards.
+    if (displayXR.eyeTracking && typeof displayXR.eyeTracking.isTracking === 'boolean') {
+      eyeTrackingActive = displayXR.eyeTracking.isTracking;
+    }
     populateModeButtons();
     refreshEyeTrackingButton();
   } else {
@@ -908,6 +915,17 @@ async function enterXR() {
   xrSession.addEventListener('bridgestatus', (event) => {
     setDot(dotBridge, event.detail.connected ? 'ok' : 'err');
     log('BRIDGE: ' + (event.detail.connected ? 'connected' : 'disconnected — is displayxr-webxr-bridge running?'));
+  });
+
+  // Edge-triggered tracking loss/recovery (#449). Fires on DP tracking
+  // loss/recovery AND on mode switches into/out of untracked modes — no
+  // per-frame polling needed. The sample just surfaces it in the status
+  // panel; a real app might pause head-coupled rendering or request a 2D
+  // mode on loss.
+  xrSession.addEventListener('eyetrackingstatechange', (event) => {
+    eyeTrackingActive = event.detail.isTracking;
+    log('EYE TRACKING: ' + (event.detail.isTracking ? 'TRACKING' : 'LOST') +
+        ' [' + event.detail.activeMode + ']');
   });
 
   // Debounce hardwarestatechange: the Leia driver briefly flaps 3D→2D→3D
@@ -1258,6 +1276,7 @@ function updateBridgeStatePanel() {
     lines.push('window  : (waiting)');
   }
   lines.push('tracking: ' + (eyeTrackingMode === 1 ? 'MANUAL' : 'MANAGED') +
+             (eyeTrackingActive === null ? '' : (eyeTrackingActive ? ' ● live' : ' ○ lost')) +
              '  eyes=' + eyes.length);
   if (eyes.length > 0) {
     for (let i = 0; i < eyes.length; i++) {

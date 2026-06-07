@@ -135,6 +135,9 @@
       // Eye-tracking capabilities advertised by the DP.
       //   supportedModes: string[] of 'MANAGED' / 'MANUAL'
       //   defaultMode:    'MANAGED' | 'MANUAL'
+      //   isTracking:     boolean — last-known derived tracking state (#449);
+      //                   undefined while unknown. Kept current by
+      //                   'eyetrackingstatechange' session events.
       // Apps MUST check supportedModes before calling requestEyeTrackingMode
       // — some devices only support one mode (e.g. Leia is MANAGED-only).
       eyeTracking: di.eyeTracking || { supportedModes: [], defaultMode: 'MANAGED' },
@@ -155,6 +158,7 @@
         tileRows: getModeField('tileRows', rm.currentModeIndex),
         viewScale: getModeField('viewScale', rm.currentModeIndex),
         hardware3D: rm.hardware3D !== undefined ? rm.hardware3D : false,
+        hasTracking: getModeField('hasTracking', rm.currentModeIndex) || false,
         views: rm.views || di.views || []
       } : buildRenderingModeFromDisplayInfo(di),
 
@@ -200,6 +204,10 @@
       tileRows: mode.tileRows || 1,
       viewScale: mode.viewScale || [1, 1],
       hardware3D: mode.hardware3D || false,
+      // Per-mode tracking capability (#449): does this mode consume live eye
+      // tracking? false for export/untracked modes (and absent→false on
+      // older bridges).
+      hasTracking: mode.hasTracking || false,
       views: di.views || []
     };
   }
@@ -274,6 +282,20 @@
       activeSessions.forEach(function (entry) {
         try {
           entry.session.dispatchEvent(new CustomEvent('hardwarestatechange', { detail: hwDetail }));
+        } catch (e) {}
+      });
+    } else if (msg.type === 'eye-tracking-state-changed') {
+      // Edge-triggered tracking loss/recovery (#449) — fires on DP tracking
+      // loss/recovery AND on mode switches into/out of untracked modes.
+      // Keep the cached eyeTracking surface current so displayXR reads after
+      // the edge see the latest state without waiting for the next event.
+      if (latestDisplayInfo && latestDisplayInfo.eyeTracking) {
+        latestDisplayInfo.eyeTracking.isTracking = msg.isTracking;
+      }
+      var etDetail = { isTracking: msg.isTracking, activeMode: msg.activeMode };
+      activeSessions.forEach(function (entry) {
+        try {
+          entry.session.dispatchEvent(new CustomEvent('eyetrackingstatechange', { detail: etDetail }));
         } catch (e) {}
       });
     } else if (msg.type === 'bridge-status') {

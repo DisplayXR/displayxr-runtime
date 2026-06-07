@@ -441,8 +441,19 @@ struct Bridge {
 	XrDisplayInfoEXT display_info{};
 	XrEyeTrackingModeCapabilitiesEXT eye_tracking_caps{};
 	std::vector<XrDisplayRenderingModeInfoEXT> modes;
+	// Per-mode tracking capability (#441 v14), parallel to `modes`. Filled by
+	// the chained-struct opt-in at enumerate time; hasTracking == XR_FALSE for
+	// modes that never consume live eye tracking (e.g. every sim_display mode).
+	std::vector<XrDisplayRenderingModeTrackingInfoEXT> mode_tracking;
 	uint32_t current_mode_index = 0;
 	std::vector<XrViewConfigurationView> config_views;
+
+	// Last-known derived isTracking (#441 v14): -1 = unknown (no locate yet),
+	// 0/1 otherwise. Seeded from the XrViewEyeTrackingStateEXT chain on
+	// xrLocateViews and kept current by XrEventDataEyeTrackingStateChangedEXT
+	// edges. Serialized into display-info so late-joining WS clients get the
+	// current state (the event itself is edge-triggered only).
+	int eye_tracking_state = -1;
 
 	// Compositor window metrics (polled from service HWND).
 	WindowMetrics window_metrics;
@@ -895,13 +906,19 @@ static std::string build_display_info_json(const Bridge &b) {
 	for (size_t i = 0; i < b.modes.size(); i++) {
 		if (i) s += ",";
 		const auto &m = b.modes[i];
+		// hasTracking (#441 v14): whether the mode consumes live eye
+		// tracking. When the ACTIVE mode has hasTracking == false,
+		// isTracking is always false regardless of tracker state.
+		const bool has_trk = i < b.mode_tracking.size() &&
+		                     b.mode_tracking[i].hasTracking == XR_TRUE;
 		s += "{\"index\":" + json_u(m.modeIndex)
 		   + ",\"name\":\"" + json_escape(m.modeName) + "\""
 		   + ",\"viewCount\":" + json_u(m.viewCount)
 		   + ",\"tileColumns\":" + json_u(m.tileColumns)
 		   + ",\"tileRows\":" + json_u(m.tileRows)
 		   + ",\"viewScale\":[" + json_f(m.viewScaleX) + "," + json_f(m.viewScaleY) + "]"
-		   + ",\"hardware3D\":" + (m.hardwareDisplay3D ? "true" : "false") + "}";
+		   + ",\"hardware3D\":" + (m.hardwareDisplay3D ? "true" : "false")
+		   + ",\"hasTracking\":" + (has_trk ? "true" : "false") + "}";
 	}
 	s += "]";
 
@@ -920,7 +937,15 @@ static std::string build_display_info_json(const Bridge &b) {
 	if (has_manual)  { if (!first) s += ","; s += "\"MANUAL\""; }
 	s += "],\"defaultMode\":\"";
 	s += (b.eye_tracking_caps.defaultMode == XR_EYE_TRACKING_MODE_MANUAL_EXT) ? "MANUAL" : "MANAGED";
-	s += "\"}";
+	s += "\"";
+	// Last-known derived isTracking (#449). Omitted while unknown (no
+	// xrLocateViews yet) — pages treat absence as "state not yet known".
+	// Kept current by eye-tracking-state-changed messages afterwards.
+	if (b.eye_tracking_state >= 0) {
+		s += ",\"isTracking\":";
+		s += (b.eye_tracking_state == 1) ? "true" : "false";
+	}
+	s += "}";
 
 	s += build_window_info_fields(b.window_metrics);
 	s += "}";
@@ -941,6 +966,15 @@ static std::string build_mode_changed_json(uint32_t prev, uint32_t curr, bool hw
 static std::string build_hardware_state_json(bool hw3d) {
 	return "{\"type\":\"hardware-state-changed\",\"version\":1,\"hardware3D\":"
 	       + std::string(hw3d ? "true" : "false") + "}";
+}
+
+static std::string build_eye_tracking_state_json(bool is_tracking, XrEyeTrackingModeEXT mode) {
+	std::string s = "{\"type\":\"eye-tracking-state-changed\",\"version\":1,\"isTracking\":";
+	s += (is_tracking ? "true" : "false");
+	s += ",\"activeMode\":\"";
+	s += (mode == XR_EYE_TRACKING_MODE_MANUAL_EXT) ? "MANUAL" : "MANAGED";
+	s += "\"}";
+	return s;
 }
 
 static std::string build_input_event_json(const InputEvent &e) {
@@ -1646,9 +1680,18 @@ static bool create_session_and_enumerate_modes(Bridge &b) {
 		return true;
 	}
 	b.modes.resize(mode_count);
-	for (auto &m : b.modes) {
-		m.type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
-		m.next = nullptr;
+	// Per-mode tracking capability (#441 v14, #449) — chained-struct opt-in:
+	// pre-set each element's type AND chain the tracking struct on next
+	// BEFORE the fill call. The runtime only walks elements carrying the
+	// pre-set type, so v13 binaries (uninitialized type/next) are untouched.
+	// Mirrors the reference adoption in cube_handle_d3d11_win/xr_session.cpp.
+	b.mode_tracking.resize(mode_count);
+	for (uint32_t i = 0; i < mode_count; i++) {
+		b.mode_tracking[i].type = (XrStructureType)XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_EXT;
+		b.mode_tracking[i].next = nullptr;
+		b.mode_tracking[i].hasTracking = XR_FALSE;
+		b.modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+		b.modes[i].next = &b.mode_tracking[i];
 	}
 	r = b.pfnEnumerateDisplayRenderingModes(b.session, mode_count, &mode_count, b.modes.data());
 	if (XR_FAILED(r)) {
@@ -1660,9 +1703,10 @@ static bool create_session_and_enumerate_modes(Bridge &b) {
 	LOG_I("Display rendering modes (%u):", mode_count);
 	for (uint32_t i = 0; i < mode_count; i++) {
 		const auto &m = b.modes[i];
-		LOG_I("  [%u] \"%s\" views=%u tiles=%ux%u viewScale=%.3fx%.3f hw3D=%d",
+		LOG_I("  [%u] \"%s\" views=%u tiles=%ux%u viewScale=%.3fx%.3f hw3D=%d tracked=%d",
 		      m.modeIndex, m.modeName, m.viewCount, m.tileColumns, m.tileRows,
-		      m.viewScaleX, m.viewScaleY, (int)m.hardwareDisplay3D);
+		      m.viewScaleX, m.viewScaleY, (int)m.hardwareDisplay3D,
+		      (int)(b.mode_tracking[i].hasTracking == XR_TRUE));
 	}
 
 	// Default current_mode_index to the first 3D mode (Leia device starts in 3D).
@@ -1759,6 +1803,22 @@ static void handle_event(Bridge &b, const XrEventDataBuffer &evt) {
 		}
 	} break;
 
+	case XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT: {
+		// Edge-triggered tracking loss/recovery (#441 v14, #449). The runtime
+		// derives isTracking as activeMode.hasTracking && dp.is_tracking and
+		// fires this on every edge — DP tracking loss/recovery AND mode
+		// switches into/out of untracked modes. Forwarded to the page so web
+		// content gets event-driven loss/recovery instead of polling.
+		auto *e = reinterpret_cast<const XrEventDataEyeTrackingStateChangedEXT *>(&evt);
+		LOG_I("EYE_TRACKING_STATE_CHANGED isTracking=%s activeMode=%d",
+		      e->isTracking == XR_TRUE ? "YES" : "NO", (int)e->activeMode);
+		b.eye_tracking_state = (e->isTracking == XR_TRUE) ? 1 : 0;
+		if (b.ws_client_connected.load()) {
+			b.outgoing.push(build_eye_tracking_state_json(
+			    e->isTracking == XR_TRUE, e->activeMode));
+		}
+	} break;
+
 	case XR_TYPE_EVENT_DATA_HARDWARE_DISPLAY_STATE_CHANGED_EXT: {
 		LOG_I("HARDWARE_DISPLAY_STATE_CHANGED_EXT (physical 3D state flipped)");
 		if (b.ws_client_connected.load()) {
@@ -1780,18 +1840,28 @@ static void handle_event(Bridge &b, const XrEventDataBuffer &evt) {
 // ---------------------------------------------------------------------------
 
 static void poll_eye_poses(Bridge &b) {
-	if (!b.stream_eye_poses || b.local_space == XR_NULL_HANDLE || !b.session_begun)
-		return;
-	if (!b.ws_client_connected.load())
+	if (b.local_space == XR_NULL_HANDLE || !b.session_begun)
 		return;
 
-	// Backpressure: skip if the outgoing queue has pending messages.
-	// Eye poses are stateless — only the latest matters. Dropping
-	// intermediate samples prevents TCP buffer overflow which causes
-	// WS disconnect/reconnect loops and loses mode-changed events.
-	{
+	const bool streaming = b.stream_eye_poses && b.ws_client_connected.load();
+	if (streaming) {
+		// Backpressure: skip if the outgoing queue has pending messages.
+		// Eye poses are stateless — only the latest matters. Dropping
+		// intermediate samples prevents TCP buffer overflow which causes
+		// WS disconnect/reconnect loops and loses mode-changed events.
 		std::lock_guard<std::mutex> lk(b.outgoing.mtx);
 		if (b.outgoing.q.size() > 2) return;
+	} else {
+		// Not streaming — still locate at a low rate (~4 Hz vs the 10 ms
+		// loop). The runtime's isTracking edge detection runs in its
+		// xrLocateViews path (#441 v14): a session that never locates views
+		// receives no XrEventDataEyeTrackingStateChangedEXT events. This
+		// keeps tracking-loss edges flowing when the page configured
+		// eyePoseFormat "none" (and keeps b.eye_tracking_state seeded
+		// before any WS client connects).
+		static int idle_locate_counter = 0;
+		if (++idle_locate_counter < 25) return;
+		idle_locate_counter = 0;
 	}
 
 	XrViewLocateInfo vli{XR_TYPE_VIEW_LOCATE_INFO};
@@ -1801,7 +1871,12 @@ static void poll_eye_poses(Bridge &b) {
 	vli.displayTime = now.QuadPart;
 	vli.space = b.local_space;
 
+	// Chain per-frame eye-tracking state (#446 truthful isTracking) so the
+	// cached value is seeded before the first edge event — display-info
+	// serializes it for late-joining WS clients.
+	XrViewEyeTrackingStateEXT et_state{(XrStructureType)XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT};
 	XrViewState vs{XR_TYPE_VIEW_STATE};
+	vs.next = &et_state;
 	uint32_t view_count = 8;
 	XrView views[8];
 	for (uint32_t i = 0; i < 8; i++) views[i] = {XR_TYPE_VIEW};
@@ -1809,7 +1884,11 @@ static void poll_eye_poses(Bridge &b) {
 	XrResult r = xrLocateViews(b.session, &vli, &vs, 8, &view_count, views);
 	if (XR_FAILED(r)) return;
 
-	b.outgoing.push(build_eye_poses_json(views, view_count));
+	b.eye_tracking_state = (et_state.isTracking == XR_TRUE) ? 1 : 0;
+
+	if (streaming) {
+		b.outgoing.push(build_eye_poses_json(views, view_count));
+	}
 }
 
 // ---------------------------------------------------------------------------

@@ -109,6 +109,14 @@ bool
 comp_ipc_client_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
                                                        struct xrt_eye_positions *out_eyes);
 
+// Same fetch via the SYSTEM compositor (#449) for compositor-less sessions
+// (headless XR_MND_headless clients like the WebXR bridge, which have no
+// xcn). Same linkage pattern as above.
+struct xrt_system_compositor;
+bool
+comp_ipc_client_system_compositor_get_predicted_eye_positions(struct xrt_system_compositor *xsysc,
+                                                              struct xrt_eye_positions *out_eyes);
+
 #ifdef OXR_HAVE_EXT_view_rig
 // XR_EXT_view_rig over IPC (#396 W7) — same linkage pattern as above; the
 // wire structs come from shared/ipc_protocol.h (include precedent:
@@ -2078,13 +2086,25 @@ oxr_session_locate_views(struct oxr_logger *log,
 		// server-computed view poses (the Phase-0 multi-comp regression).
 		// Skipped when the active mode is untracked: the result would be
 		// FALSE either way, so don't pay the round-trip.
-		if (!got_eye_positions && mode_has_tracking && sess->xcn != NULL &&
+		if (!got_eye_positions && mode_has_tracking &&
 		    sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode &&
 		    !sess->is_d3d11_native_compositor && !sess->is_d3d12_native_compositor &&
 		    !sess->is_gl_native_compositor && !sess->is_vk_native_compositor &&
 		    !sess->is_metal_native_compositor && sess->sys->xsysc->xmcc == NULL) {
 			struct xrt_eye_positions ipc_eyes;
-			if (comp_ipc_client_compositor_get_predicted_eye_positions(&sess->xcn->base, &ipc_eyes)) {
+			bool got = false;
+			if (sess->xcn != NULL) {
+				got = comp_ipc_client_compositor_get_predicted_eye_positions(&sess->xcn->base, &ipc_eyes);
+			} else {
+				// Compositor-less sessions (#449): headless clients
+				// like the WebXR bridge have no xcn — route the same
+				// RPC through the IPC system-compositor proxy so
+				// their derived isTracking (and the edge event) is
+				// truthful instead of constant-FALSE.
+				got = comp_ipc_client_system_compositor_get_predicted_eye_positions(sess->sys->xsysc,
+				                                                                    &ipc_eyes);
+			}
+			if (got) {
 				is_tracking = ipc_eyes.is_tracking;
 			}
 		}

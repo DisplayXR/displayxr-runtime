@@ -66,6 +66,7 @@ Apps MUST `await session.displayXR.ready` before reading `displayInfo`, `renderi
 | `eyePoses` | array | Streaming tracked eyes (call `configureEyePoses('raw')` first). |
 | `eyeTracking.supportedModes` | `string[]` | Modes the DP advertises (subset of `['MANAGED', 'MANUAL']`). |
 | `eyeTracking.defaultMode` | `'MANAGED'` \| `'MANUAL'` | Mode active if the app doesn't request one. |
+| `eyeTracking.isTracking` | `boolean` \| `undefined` | Last-known derived tracking state (`undefined` while unknown). Kept current by `eyetrackingstatechange` events. |
 
 ### Session bootstrap
 
@@ -109,6 +110,7 @@ Each mode object carries:
 | `viewScale` | `[sx, sy]` — per-tile scale relative to display. |
 | `viewCount` | Eyes per frame (1 mono, 2 stereo, etc.). |
 | `hardware3D` | Whether the display is in 3D-emit mode for this mode. |
+| `hasTracking` | Whether the mode consumes live eye tracking. `false` for export modes (SBS/anaglyph) — in those, `eyeTracking.isTracking` is always `false`. |
 
 ```js
 // List modes (e.g. for a UI dropdown):
@@ -172,6 +174,19 @@ if (canToggle) displayXR.requestEyeTrackingMode(wantManual ? 1 : 0);
 
 The bridge rejects unsupported mode requests with a log-only warning; this guard exists so your UI matches the device's actual state.
 
+**Tracking loss/recovery — don't poll.** Subscribe to `eyetrackingstatechange`; it fires on every edge of the derived tracking state (DP tracking loss/recovery *and* mode switches into/out of untracked modes):
+
+```js
+session.addEventListener('eyetrackingstatechange', e => {
+  if (!e.detail.isTracking) {
+    // e.g. freeze head-coupled rendering, run your own fade, or
+    // displayXR.requestRenderingMode(MODE_2D) when your transition is done.
+  }
+});
+// Current state without waiting for an edge:
+const tracking = displayXR.eyeTracking.isTracking; // undefined while unknown
+```
+
 ### HUD
 
 Compositor-side overlay. Send up to 8 lines, label + text:
@@ -208,6 +223,7 @@ The bridge auto-suppresses mouse events while the compositor window is in a moda
 | `renderingmodechange` | Mode switched (via your request OR vendor SDK). | Refresh tile layout; update UI selector. |
 | `windowinfochange` | Window moved / resized. | Recompute Kooima screen dims + center offset. |
 | `hardwarestatechange` | Display backlight toggled 3D ↔ 2D. | **Debounce** ≥ 600 ms before reacting (see Pitfalls). |
+| `eyetrackingstatechange` | Derived tracking state flipped (tracker loss/recovery, or mode switch into/out of an untracked mode). | Freeze head-coupled rendering / run your own loss transition. |
 | `bridgestatus` | Bridge process connected / disconnected. | Update status UI. |
 | `displayxrinput` | Key / mouse / wheel from compositor focus. | App input. |
 
