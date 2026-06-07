@@ -42,6 +42,7 @@
 #include "xr_window_space_hud.h"
 #include "hud_renderer_macos.h"
 #include <openxr/XR_EXT_display_info.h>
+#include <openxr/XR_EXT_local_3d_zone.h>
 #include <openxr/XR_EXT_atlas_capture.h>
 #include <openxr/XR_EXT_mcp_tools.h>
 #include <openxr/XR_EXT_view_rig.h>
@@ -817,6 +818,25 @@ static const float HUD_WIDTH_FRACTION = 0.20f;
 static double g_avgFrameTime = 0.0;
 static float g_hudUpdateTimer = 0.0f;
 static uint32_t g_windowW = 1512, g_windowH = 823;
+
+// ============================================================================
+// #439 Phase 3 — handle + mask + Local2D layer modes (§8 cases 2/3/4)
+// ============================================================================
+// DXR_LOCAL2D_PANEL=1  — submit a Local2D panel layer (case 3: layer-only,
+//                        IMPLICIT mask from the panel rect, zero mask calls).
+// DXR_LOCAL2D_MASK=1   — additionally create + submit an explicit Tier-2
+//                        mask with 3D island rects (case 2: the first
+//                        handle + mask + layer app — islands weave, panel
+//                        crisp, desktop visible where neither covers).
+// DXR_LOCAL2D_PANEL2=1 — additionally submit a second, overlapping panel
+//                        with XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT
+//                        (case 4: list-order stacking + alpha fringing).
+static bool g_l2dPanel = false;
+static bool g_l2dMask = false;
+static bool g_l2dPanel2 = false;
+static bool g_l2dActive = false;   // set once panels (+ optional mask) are live
+static long g_frameCounter = 0;
+static const int g_l2dActivationFrame = 10;
 static uint32_t g_renderW = 0, g_renderH = 0;
 
 // Cached HUD section strings, refreshed at HUD throttle rate (~2 Hz).
@@ -1152,6 +1172,14 @@ struct AppXrSession {
     bool hasViewRigExt = false;  // XR_EXT_view_rig (#396 W7)
     PFN_xrCaptureAtlasEXT pfnCaptureAtlasEXT = nullptr;
 
+    // XR_EXT_local_3d_zone (#439 Phase 3, cases 2/3/4)
+    bool hasLocal3DZoneExt = false;
+    PFN_xrCreateLocal3DZoneMaskEXT pfnCreateLocal3DZoneMaskEXT = nullptr;
+    PFN_xrSetLocal3DZoneFromRectsEXT pfnSetLocal3DZoneFromRectsEXT = nullptr;
+    PFN_xrSubmitLocal3DZoneEXT pfnSubmitLocal3DZoneEXT = nullptr;
+    PFN_xrDestroyLocal3DZoneMaskEXT pfnDestroyLocal3DZoneMaskEXT = nullptr;
+    XrLocal3DZoneMaskEXT local3DZoneMask = XR_NULL_HANDLE;
+
     // Enumerated rendering mode info. currentModeIndex is initialized to mode 1
     // as a fallback for runtimes that don't expose isActive; v13+ runtimes
     // replace it via the enumerate step (initial-mode-sync, #234/#239).
@@ -1200,6 +1228,8 @@ static bool InitializeOpenXR(AppXrSession &app)
             app.hasDisplayInfoExt = true;
         if (strcmp(e.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0)
             app.hasAtlasCaptureExt = true;
+        if (strcmp(e.extensionName, XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME) == 0)
+            app.hasLocal3DZoneExt = true;
         if (strcmp(e.extensionName, XR_EXT_MCP_TOOLS_EXTENSION_NAME) == 0)
             g_hasMcpToolsExt = true;
         if (strcmp(e.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0)
@@ -1227,6 +1257,9 @@ static bool InitializeOpenXR(AppXrSession &app)
     }
     if (app.hasAtlasCaptureExt) {
         enabledExts.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
+    }
+    if (app.hasLocal3DZoneExt) {
+        enabledExts.push_back(XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME);
     }
     if (g_hasMcpToolsExt) {
         enabledExts.push_back(XR_EXT_MCP_TOOLS_EXTENSION_NAME);
@@ -1294,6 +1327,16 @@ static bool InitializeOpenXR(AppXrSession &app)
             xrGetInstanceProcAddr(app.instance, "xrCaptureAtlasEXT",
                 (PFN_xrVoidFunction*)&app.pfnCaptureAtlasEXT);
             LOG_INFO("xrCaptureAtlasEXT: %s", app.pfnCaptureAtlasEXT ? "resolved" : "NULL");
+        }
+        if (app.hasLocal3DZoneExt) {
+            xrGetInstanceProcAddr(app.instance, "xrCreateLocal3DZoneMaskEXT",
+                (PFN_xrVoidFunction*)&app.pfnCreateLocal3DZoneMaskEXT);
+            xrGetInstanceProcAddr(app.instance, "xrSetLocal3DZoneFromRectsEXT",
+                (PFN_xrVoidFunction*)&app.pfnSetLocal3DZoneFromRectsEXT);
+            xrGetInstanceProcAddr(app.instance, "xrSubmitLocal3DZoneEXT",
+                (PFN_xrVoidFunction*)&app.pfnSubmitLocal3DZoneEXT);
+            xrGetInstanceProcAddr(app.instance, "xrDestroyLocal3DZoneMaskEXT",
+                (PFN_xrVoidFunction*)&app.pfnDestroyLocal3DZoneMaskEXT);
         }
     }
 
@@ -1543,6 +1586,120 @@ static bool CreateSwapchain(AppXrSession &app)
 }
 
 // ============================================================================
+// #439 Phase 3 — Local2D panel swapchains (cases 2/3/4)
+// ============================================================================
+
+struct L2DPanel {
+    XrSwapchain swapchain = XR_NULL_HANDLE;
+    uint32_t w = 0, h = 0;
+};
+static L2DPanel g_panel1, g_panel2;
+static XrRect2Di g_panel1Rect, g_panel2Rect;
+
+// Create a window-anchored Local2D panel swapchain and fill it once (static
+// content: acquire/fill/release once; the layer references the released
+// image every frame).
+//  variant 0 — crispness panel: opaque fine 8-px checker core with a 24-px
+//              half-transparent green border (PREMULTIPLIED bytes), so the
+//              border resolves against the desktop where M=0.
+//  variant 1 — stacking/alpha panel: UNPREMULTIPLIED orange at a=128 with
+//              opaque white diagonal stripes; submitted with
+//              XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT (fringing
+//              check for the SrcAlpha flatten path).
+static bool CreateAndFillL2DPanel(AppXrSession &app, uint32_t w, uint32_t h, int variant, L2DPanel &out)
+{
+    if (w == 0 || h == 0) {
+        return false;
+    }
+
+    XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    sci.format = (int64_t)MTLPixelFormatBGRA8Unorm;
+    sci.sampleCount = 1;
+    sci.width = w;
+    sci.height = h;
+    sci.faceCount = 1;
+    sci.arraySize = 1;
+    sci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(app.session, &sci, &out.swapchain))) {
+        return false;
+    }
+    out.w = w;
+    out.h = h;
+
+    uint32_t n = 0;
+    xrEnumerateSwapchainImages(out.swapchain, 0, &n, nullptr);
+    std::vector<XrSwapchainImageMetalKHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_METAL_KHR});
+    if (n == 0 || XR_FAILED(xrEnumerateSwapchainImages(out.swapchain, n, &n,
+                                                       (XrSwapchainImageBaseHeader *)imgs.data()))) {
+        return false;
+    }
+
+    XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    uint32_t idx = 0;
+    if (XR_FAILED(xrAcquireSwapchainImage(out.swapchain, &ai, &idx))) {
+        return false;
+    }
+    XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = XR_INFINITE_DURATION;
+    xrWaitSwapchainImage(out.swapchain, &wi);
+
+    size_t stride = (size_t)w * 4;
+    uint8_t *buf = (uint8_t *)malloc(stride * h);
+    if (buf != NULL) {
+        const uint32_t border = 24;
+        for (uint32_t y = 0; y < h; y++) {
+            uint8_t *row = buf + (size_t)y * stride;
+            for (uint32_t x = 0; x < w; x++) {
+                uint8_t *px = row + (size_t)x * 4;
+                if (variant == 0) {
+                    bool inBorder = (x < border || y < border || x >= w - border || y >= h - border);
+                    if (inBorder) {
+                        // Half-transparent green, PREMULTIPLIED bytes.
+                        px[0] = 0;
+                        px[1] = 128;
+                        px[2] = 0;
+                        px[3] = 128;
+                    } else {
+                        // Opaque fine checker (crispness probe).
+                        bool check = (((x / 8) + (y / 8)) & 1) != 0;
+                        uint8_t v = check ? 235 : 40;
+                        px[0] = v;
+                        px[1] = v;
+                        px[2] = v;
+                        px[3] = 255;
+                    }
+                } else {
+                    bool stripe = (((x + y) / 16) & 1) != 0;
+                    if (stripe) {
+                        // Opaque white stripes.
+                        px[0] = 255;
+                        px[1] = 255;
+                        px[2] = 255;
+                        px[3] = 255;
+                    } else {
+                        // UNPREMULTIPLIED orange at a=128 — channels carry
+                        // the full color; the compositor's SrcAlpha blend
+                        // does the multiply.
+                        px[0] = 0;
+                        px[1] = 165;
+                        px[2] = 255;
+                        px[3] = 128;
+                    }
+                }
+            }
+        }
+        id<MTLTexture> tex = (__bridge id<MTLTexture>)imgs[idx].texture;
+        [tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:buf bytesPerRow:stride];
+        free(buf);
+    }
+
+    XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(out.swapchain, &ri);
+    return true;
+}
+
+// ============================================================================
 // Event handling
 // ============================================================================
 
@@ -1551,6 +1708,16 @@ static void PollEvents(AppXrSession &app)
     XrEventDataBuffer event = {XR_TYPE_EVENT_DATA_BUFFER};
     while (xrPollEvent(app.instance, &event) == XR_SUCCESS) {
         switch (event.type) {
+        case (XrStructureType)XR_TYPE_EVENT_DATA_LOCAL_3D_ZONE_VIEW_SIZE_CHANGED_EXT: {
+            // #439 Q4 — for a handle app the view dims are window-derived
+            // already, so this should stay silent when the mask activates;
+            // it fires on window resize. Log-only: our swapchain is
+            // worst-case sized and render dims follow g_windowW/H per frame.
+            auto *vsEvent = (XrEventDataLocal3DZoneViewSizeChangedEXT *)&event;
+            LOG_INFO("Local-3D-zone view size changed: %ux%u",
+                vsEvent->recommendedImageRectWidth, vsEvent->recommendedImageRectHeight);
+            break;
+        }
         case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
             auto *ssc = (XrEventDataSessionStateChanged *)&event;
             app.sessionState = ssc->state;
@@ -1649,6 +1816,27 @@ int main(int argc, char **argv)
     signal(SIGTERM, SignalHandler);
 
     LOG_INFO("=== Metal Cube OpenXR (External Window) ===");
+
+    // #439 Phase 3 cases 2/3/4 (see the g_l2dPanel globals block).
+    {
+        const char *e = getenv("DXR_LOCAL2D_PANEL");
+        g_l2dPanel = (e != NULL && e[0] != '\0' && e[0] != '0');
+        e = getenv("DXR_LOCAL2D_MASK");
+        g_l2dMask = (e != NULL && e[0] != '\0' && e[0] != '0');
+        e = getenv("DXR_LOCAL2D_PANEL2");
+        g_l2dPanel2 = (e != NULL && e[0] != '\0' && e[0] != '0');
+        e = getenv("DXR_HUD");
+        if (e != NULL && e[0] == '0') {
+            g_input.hudVisible = false;
+        }
+        if (g_l2dPanel) {
+            // Keep the layer list simple while panels are live.
+            g_input.hudVisible = false;
+            LOG_INFO("DXR_LOCAL2D_PANEL=1 — Local2D panel layer%s%s",
+                     g_l2dMask ? " + explicit Tier-2 island mask" : " (implicit mask)",
+                     g_l2dPanel2 ? " + second unpremultiplied panel" : "");
+        }
+    }
 
     // Initialize Metal renderer
     MetalRenderer renderer = {};
@@ -1772,6 +1960,68 @@ int main(int argc, char **argv)
 
         // Update animation
         renderer.cubeRotation += dt * g_spinSpeed; // agent-settable via cube-metal__set_spin
+
+        // #439 cases 2/3/4 activation: create + fill the panel swapchain(s)
+        // (+ the explicit Tier-2 island mask for case 2) a few frames in,
+        // once the session is running and window dims are settled.
+        if (g_l2dPanel && !g_l2dActive && g_frameCounter >= g_l2dActivationFrame) {
+            static bool attempted = false;
+            if (!attempted) {
+                attempted = true;
+                uint32_t winW = g_windowW;
+                uint32_t winH = g_windowH;
+                uint32_t pw = winW * 3 / 8;
+                uint32_t ph = winH * 5 / 16;
+                g_panel1Rect.offset = {(int32_t)(winW / 16), (int32_t)(winH * 9 / 16)};
+                g_panel1Rect.extent = {(int32_t)pw, (int32_t)ph};
+                bool ok = CreateAndFillL2DPanel(app, pw, ph, 0, g_panel1);
+
+                if (ok && g_l2dPanel2) {
+                    // Overlaps panel 1's top-right quadrant — list-order
+                    // stacking check (panel 2 is later in the list = on top).
+                    g_panel2Rect.offset = {g_panel1Rect.offset.x + (int32_t)(pw / 2),
+                                           g_panel1Rect.offset.y - (int32_t)(ph / 4)};
+                    g_panel2Rect.extent = {(int32_t)pw, (int32_t)ph};
+                    ok = CreateAndFillL2DPanel(app, pw, ph, 1, g_panel2);
+                }
+
+                if (ok && g_l2dMask && app.hasLocal3DZoneExt &&
+                    app.pfnCreateLocal3DZoneMaskEXT != nullptr &&
+                    app.pfnSetLocal3DZoneFromRectsEXT != nullptr &&
+                    app.pfnSubmitLocal3DZoneEXT != nullptr) {
+                    XrLocal3DZoneMaskCreateInfoEXT mci = {
+                        (XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_EXT};
+                    mci.maskWidth = 0; // runtime picks the window backing size
+                    mci.maskHeight = 0;
+                    ok = XR_SUCCEEDED(app.pfnCreateLocal3DZoneMaskEXT(app.session, &mci,
+                                                                      &app.local3DZoneMask));
+                    if (ok) {
+                        // Two 3D islands: a large center-right one and a
+                        // small top-left one. Everything else is 2D — the
+                        // panel where it covers, desktop (final.a = 0)
+                        // where nothing does.
+                        XrRect2Di islands[2];
+                        islands[0].offset = {(int32_t)(winW * 7 / 16), (int32_t)(winH / 4)};
+                        islands[0].extent = {(int32_t)(winW * 7 / 16), (int32_t)(winH / 2)};
+                        islands[1].offset = {(int32_t)(winW / 16), (int32_t)(winH / 16)};
+                        islands[1].extent = {(int32_t)(winW / 4), (int32_t)(winH / 4)};
+                        ok = XR_SUCCEEDED(app.pfnSetLocal3DZoneFromRectsEXT(app.local3DZoneMask, 2,
+                                                                            islands)) &&
+                             XR_SUCCEEDED(app.pfnSubmitLocal3DZoneEXT(app.local3DZoneMask));
+                    }
+                }
+
+                if (ok) {
+                    g_l2dActive = true;
+                    LOG_INFO("Local2D panels active: panel1 %d,%d %ux%u%s%s",
+                             g_panel1Rect.offset.x, g_panel1Rect.offset.y, pw, ph,
+                             g_l2dPanel2 ? " + panel2 (unpremultiplied, overlapping)" : "",
+                             g_l2dMask ? " + explicit Tier-2 island mask" : " (implicit mask)");
+                } else {
+                    LOG_ERROR("Local2D panel activation failed");
+                }
+            }
+        }
 
         // Wait frame
         XrFrameWaitInfo waitInfo = {XR_TYPE_FRAME_WAIT_INFO};
@@ -2032,18 +2282,45 @@ int main(int argc, char **argv)
             projLayer.viewCount = (uint32_t)eyeCount;
             projLayer.views = projViews.data();
 
-            const XrCompositionLayerBaseHeader *layers[] = {
-                (XrCompositionLayerBaseHeader *)&projLayer
-            };
+            // #439 cases 2/3/4: Local2D panel layers ride the normal layer
+            // list after the projection layer (list order = stacking order).
+            XrCompositionLayerLocal2DEXT panel1Layer = {
+                (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+            XrCompositionLayerLocal2DEXT panel2Layer = {
+                (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+            const XrCompositionLayerBaseHeader *layers[3] = {
+                (XrCompositionLayerBaseHeader *)&projLayer, nullptr, nullptr};
+            uint32_t layerCount = (rendered && frameState.shouldRender) ? 1 : 0;
+            if (layerCount > 0 && g_l2dActive && g_panel1.swapchain != XR_NULL_HANDLE) {
+                panel1Layer.layerFlags = 0; // premultiplied bytes
+                panel1Layer.subImage.swapchain = g_panel1.swapchain;
+                panel1Layer.subImage.imageRect.offset = {0, 0};
+                panel1Layer.subImage.imageRect.extent = {(int32_t)g_panel1.w, (int32_t)g_panel1.h};
+                panel1Layer.subImage.imageArrayIndex = 0;
+                panel1Layer.rect = g_panel1Rect;
+                layers[layerCount++] = (XrCompositionLayerBaseHeader *)&panel1Layer;
+
+                if (g_l2dPanel2 && g_panel2.swapchain != XR_NULL_HANDLE) {
+                    panel2Layer.layerFlags = XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+                    panel2Layer.subImage.swapchain = g_panel2.swapchain;
+                    panel2Layer.subImage.imageRect.offset = {0, 0};
+                    panel2Layer.subImage.imageRect.extent = {(int32_t)g_panel2.w, (int32_t)g_panel2.h};
+                    panel2Layer.subImage.imageArrayIndex = 0;
+                    panel2Layer.rect = g_panel2Rect;
+                    layers[layerCount++] = (XrCompositionLayerBaseHeader *)&panel2Layer;
+                }
+            }
 
             XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
             endInfo.displayTime = frameState.predictedDisplayTime;
             endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-            endInfo.layerCount = (rendered && frameState.shouldRender) ? 1 : 0;
+            endInfo.layerCount = layerCount;
             endInfo.layers = layers;
 
             xrEndFrame(app.session, &endInfo);
         }
+
+        g_frameCounter++;
 
         // FPS tracking
         g_avgFrameTime = g_avgFrameTime * 0.95 + dt * 0.05;
@@ -2160,6 +2437,15 @@ int main(int argc, char **argv)
     }
     if (hudSwapchain.swapchain != XR_NULL_HANDLE) {
         xrDestroySwapchain(hudSwapchain.swapchain);
+    }
+    if (app.local3DZoneMask != XR_NULL_HANDLE && app.pfnDestroyLocal3DZoneMaskEXT != nullptr) {
+        app.pfnDestroyLocal3DZoneMaskEXT(app.local3DZoneMask);
+    }
+    if (g_panel1.swapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(g_panel1.swapchain);
+    }
+    if (g_panel2.swapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(g_panel2.swapchain);
     }
     if (app.swapchain.swapchain)
         xrDestroySwapchain(app.swapchain.swapchain);

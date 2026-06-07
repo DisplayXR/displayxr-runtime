@@ -40,6 +40,7 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_EXT_cocoa_window_binding.h>
+#include <openxr/XR_EXT_local_3d_zone.h>
 
 #include <cmath>
 #include <csignal>
@@ -835,6 +836,26 @@ static double g_avgFrameTime = 0.0;
 static float g_hudUpdateTimer = 0.0f;
 static uint32_t g_windowW = 1512, g_windowH = 823;  // Full window backing pixels
 static uint32_t g_canvasW = 1512, g_canvasH = 823;  // Logical canvas backing pixels (center 50%)
+
+// ============================================================================
+// #439 Phase 3 case-1 A/B (DXR_AB_LOCAL2D=1)
+// ============================================================================
+// B-mode replaces the surround side-channel with the spec-§5 migration
+// shape: an explicit Tier-2 single-rect mask (the canvas rect as 3D) + a
+// full-window XrCompositionLayerLocal2DEXT carrying the same surround
+// pattern. The mask activates at frame N (not startup) so the Q4 view-size
+// event fires and the renegotiation flow is exercised end-to-end: the app
+// then renders window-sized (the mask supersedes the canvas) and the
+// screen-anchored Kooima projection keeps the 3D content on the same
+// screen pixels — capture diff vs the legacy surround path ≈ 0.
+// Determinism hooks for the A/B capture: DXR_FREEZE=1 stops the cube
+// animation, DXR_HUD=0 starts with the HUD hidden.
+static bool g_abLocal2D = false;       // B-mode toggle (DXR_AB_LOCAL2D=1)
+static bool g_local2DActive = false;   // mask + layer submitted from here on
+static bool g_canvasIsWindow = false;  // post view-size event: window-sized rendering
+static int g_local2DActivationFrame = 60;
+static long g_frameCounter = 0;
+static bool g_freezeAnimation = false; // DXR_FREEZE=1
 static uint32_t g_renderW = 0, g_renderH = 0;
 
 // Cached HUD section strings, refreshed at HUD throttle rate (~2 Hz).
@@ -1143,6 +1164,25 @@ static void WindowBackingPx(uint32_t *w, uint32_t *h)
     if (*h > g_ioSurfaceHeight) *h = g_ioSurfaceHeight;
 }
 
+// #439: the rect the app should RENDER for. While the B-mode mask is active
+// (post view-size event) the declared canvas is superseded — the effective
+// rendering canvas is the full window, top-left anchored. The declared
+// canvas (ComputeCanvasRectPx) is still what the output-rect call and the
+// Tier-2 mask rect carry.
+static void EffectiveCanvasRectPx(int32_t *cx, int32_t *cy, uint32_t *cw, uint32_t *ch)
+{
+    if (g_canvasIsWindow) {
+        uint32_t w = 0, h = 0;
+        WindowBackingPx(&w, &h);
+        *cx = 0;
+        *cy = 0;
+        *cw = w;
+        *ch = h;
+        return;
+    }
+    ComputeCanvasRectPx(cx, cy, cw, ch);
+}
+
 // ============================================================================
 // 2D surround IOSurface (window-sized, #464)
 // ============================================================================
@@ -1156,17 +1196,13 @@ static void WindowBackingPx(uint32_t *w, uint32_t *h)
 // keyed-mutex handshake; the IOSurface is coherent), and a static pattern
 // keeps captures byte-stable. A Metal-pass + shared-event version is the
 // production-shaped follow-up.
-static void FillSurroundPattern(int32_t canvasX, int32_t canvasY,
-                                uint32_t canvasW, uint32_t canvasH)
+// Buffer-based core shared by the IOSurface surround (A path) and the
+// B-mode Local2D layer fill — identical bytes so the A/B capture diff is
+// pattern-exact. BGRA byte order.
+static void FillSurroundPatternBuffer(uint8_t *base, size_t stride, uint32_t w, uint32_t h,
+                                      int32_t canvasX, int32_t canvasY,
+                                      uint32_t canvasW, uint32_t canvasH)
 {
-    if (g_surroundIOSurface == NULL) return;
-
-    IOSurfaceLock(g_surroundIOSurface, 0, NULL);
-    uint8_t *base = (uint8_t *)IOSurfaceGetBaseAddress(g_surroundIOSurface);
-    size_t stride = IOSurfaceGetBytesPerRow(g_surroundIOSurface);
-    uint32_t w = g_surroundWidth;
-    uint32_t h = g_surroundHeight;
-
     const uint32_t cell = 64;        // checker cell in pixels
     const uint32_t ring = 6;         // border ring thickness around canvas
     int64_t cL = canvasX, cT = canvasY;
@@ -1177,7 +1213,7 @@ static void FillSurroundPattern(int32_t canvasX, int32_t canvasY,
         for (uint32_t x = 0; x < w; x++) {
             bool insideCanvas = ((int64_t)x >= cL && (int64_t)x < cR &&
                                  (int64_t)y >= cT && (int64_t)y < cB);
-            if (insideCanvas) continue; // DP-owned, never read
+            if (insideCanvas) continue; // DP/mask-owned, never shown
 
             uint8_t *px = row + (size_t)x * 4;
             bool inRing = ((int64_t)x >= cL - (int64_t)ring && (int64_t)x < cR + (int64_t)ring &&
@@ -1199,7 +1235,18 @@ static void FillSurroundPattern(int32_t canvasX, int32_t canvasY,
             px[3] = 255;                     // A
         }
     }
+}
 
+static void FillSurroundPattern(int32_t canvasX, int32_t canvasY,
+                                uint32_t canvasW, uint32_t canvasH)
+{
+    if (g_surroundIOSurface == NULL) return;
+
+    IOSurfaceLock(g_surroundIOSurface, 0, NULL);
+    uint8_t *base = (uint8_t *)IOSurfaceGetBaseAddress(g_surroundIOSurface);
+    size_t stride = IOSurfaceGetBytesPerRow(g_surroundIOSurface);
+    FillSurroundPatternBuffer(base, stride, g_surroundWidth, g_surroundHeight,
+                              canvasX, canvasY, canvasW, canvasH);
     IOSurfaceUnlock(g_surroundIOSurface, 0, NULL);
 }
 
@@ -1267,8 +1314,10 @@ static void BlitIOSurfaceToDrawable(MetalRenderer &r, CAMetalLayer *metalLayer)
 
         float vpX, vpY, vpW, vpH;
         float uvOffsetX, uvOffsetY, uvScaleX, uvScaleY;
-        if (g_surroundRegistered) {
+        if (g_surroundRegistered || g_local2DActive) {
             // Full window region, clamped to the worst-case IOSurface.
+            // (#439 B-mode: the masked composite fills the window rect —
+            // present it whole, exactly like the surround path.)
             vpW = (drawW < ioW) ? drawW : ioW;
             vpH = (drawH < ioH) ? drawH : ioH;
             vpX = 0.0f;
@@ -1445,7 +1494,7 @@ static void PumpMacOSEvents()
             g_windowH = (uint32_t)(winSize.height * backingScale);
             int32_t cx, cy;
             uint32_t cw, ch;
-            ComputeCanvasRectPx(&cx, &cy, &cw, &ch);
+            EffectiveCanvasRectPx(&cx, &cy, &cw, &ch);
             g_canvasW = cw;
             g_canvasH = ch;
         }
@@ -1538,6 +1587,14 @@ struct AppXrSession {
     PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT;
     PFN_xrSetSharedTextureOutputRectEXT pfnSetSharedTextureOutputRectEXT;
     PFN_xrSetSharedTextureSurround2DEXT pfnSetSharedTextureSurround2DEXT;
+
+    // XR_EXT_local_3d_zone (#439 Phase 3 A/B, B-mode only)
+    bool hasLocal3DZoneExt = false;
+    PFN_xrCreateLocal3DZoneMaskEXT pfnCreateLocal3DZoneMaskEXT = nullptr;
+    PFN_xrSetLocal3DZoneFromRectsEXT pfnSetLocal3DZoneFromRectsEXT = nullptr;
+    PFN_xrSubmitLocal3DZoneEXT pfnSubmitLocal3DZoneEXT = nullptr;
+    PFN_xrDestroyLocal3DZoneMaskEXT pfnDestroyLocal3DZoneMaskEXT = nullptr;
+    XrLocal3DZoneMaskEXT local3DZoneMask = XR_NULL_HANDLE;
     // Enumerated rendering mode info. currentModeIndex is initialized to mode 1
     // as a fallback for runtimes that don't expose isActive; v13+ runtimes
     // replace it via the enumerate step (initial-mode-sync, #234/#239).
@@ -1582,6 +1639,8 @@ static bool InitializeOpenXR(AppXrSession &app)
             hasMetalEnable = true;
         if (strcmp(e.extensionName, XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME) == 0)
             app.hasCocoaWindowBinding = true;
+        if (strcmp(e.extensionName, XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME) == 0)
+            app.hasLocal3DZoneExt = true;
         if (strcmp(e.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0)
             app.hasDisplayInfoExt = true;
         if (strcmp(e.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0)
@@ -1609,6 +1668,9 @@ static bool InitializeOpenXR(AppXrSession &app)
     }
     if (app.hasViewRigExt) {
         enabledExts.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
+    }
+    if (app.hasLocal3DZoneExt) {
+        enabledExts.push_back(XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -1667,6 +1729,16 @@ static bool InitializeOpenXR(AppXrSession &app)
             // NULL-tolerant: pre-v6 runtimes don't export the surround call.
             xrGetInstanceProcAddr(app.instance, "xrSetSharedTextureSurround2DEXT",
                 (PFN_xrVoidFunction*)&app.pfnSetSharedTextureSurround2DEXT);
+        }
+        if (app.hasLocal3DZoneExt) {
+            xrGetInstanceProcAddr(app.instance, "xrCreateLocal3DZoneMaskEXT",
+                (PFN_xrVoidFunction*)&app.pfnCreateLocal3DZoneMaskEXT);
+            xrGetInstanceProcAddr(app.instance, "xrSetLocal3DZoneFromRectsEXT",
+                (PFN_xrVoidFunction*)&app.pfnSetLocal3DZoneFromRectsEXT);
+            xrGetInstanceProcAddr(app.instance, "xrSubmitLocal3DZoneEXT",
+                (PFN_xrVoidFunction*)&app.pfnSubmitLocal3DZoneEXT);
+            xrGetInstanceProcAddr(app.instance, "xrDestroyLocal3DZoneMaskEXT",
+                (PFN_xrVoidFunction*)&app.pfnDestroyLocal3DZoneMaskEXT);
         }
     }
 
@@ -1894,6 +1966,20 @@ static void PollEvents(AppXrSession &app)
             app.currentModeIndex = modeEvent->currentModeIndex;
             break;
         }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_LOCAL_3D_ZONE_VIEW_SIZE_CHANGED_EXT: {
+            // #439 Phase 3 Q4 — the mask superseded the canvas (or the
+            // window resized): the runtime now recommends a new per-view
+            // render size. Our projection swapchain is worst-case sized, so
+            // no recreate is needed — pivot the rendering canvas to the
+            // window and render at the new size next frame.
+            auto* vsEvent = (XrEventDataLocal3DZoneViewSizeChangedEXT*)&event;
+            LOG_INFO("Local-3D-zone view size changed: %ux%u -> window-sized rendering",
+                vsEvent->recommendedImageRectWidth, vsEvent->recommendedImageRectHeight);
+            if (g_abLocal2D) {
+                g_canvasIsWindow = true;
+            }
+            break;
+        }
         case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT: {
             // Edge-triggered tracking loss/recovery (#441 v14); HUD state
             // also refreshes per-frame from the XrViewEyeTrackingStateEXT chain.
@@ -1921,6 +2007,21 @@ int main(int argc, char **argv)
     signal(SIGTERM, SignalHandler);
 
     LOG_INFO("=== Metal Cube OpenXR (IOSurface Shared Texture) ===");
+
+    // #439 Phase 3 A/B + capture-determinism hooks (see g_abLocal2D block).
+    {
+        const char *e = getenv("DXR_AB_LOCAL2D");
+        g_abLocal2D = (e != NULL && e[0] != '\0' && e[0] != '0');
+        e = getenv("DXR_FREEZE");
+        g_freezeAnimation = (e != NULL && e[0] != '\0' && e[0] != '0');
+        e = getenv("DXR_HUD");
+        if (e != NULL && e[0] == '0') {
+            g_input.hudVisible = false;
+        }
+        if (g_abLocal2D) {
+            LOG_INFO("DXR_AB_LOCAL2D=1 — case-1 B-mode (Tier-2 mask + Local2D layer, no surround)");
+        }
+    }
 
     // Initialize Metal renderer
     MetalRenderer renderer = {};
@@ -2003,7 +2104,10 @@ int main(int argc, char **argv)
     // Register the 2D surround (spec v6) — window-sized per #464. The
     // runtime strip-blits its non-canvas pixels into the shared IOSurface
     // each frame; the app then presents the full window region.
-    if (app.pfnSetSharedTextureSurround2DEXT) {
+    if (g_abLocal2D) {
+        LOG_INFO("A/B B-mode (DXR_AB_LOCAL2D=1): surround registration skipped — "
+                 "Tier-2 mask + Local2D layer activate at frame %d", g_local2DActivationFrame);
+    } else if (app.pfnSetSharedTextureSurround2DEXT) {
         uint32_t winPxW, winPxH;
         WindowBackingPx(&winPxW, &winPxH);
         if (CreateSurroundIOSurface(winPxW, winPxH)) {
@@ -2031,6 +2135,10 @@ int main(int argc, char **argv)
         LOG_ERROR("Failed to create swapchain");
         return 1;
     }
+
+    // #439 A/B B-mode: full-window Local2D layer swapchain (created at
+    // activation time so it matches the window backing size then).
+    SwapchainInfo l2dSwapchain = {};
 
     // HUD window-space layer swapchain (XR_EXT_window_space_layer).
     XrHudSwapchain hudSwapchain;
@@ -2140,8 +2248,95 @@ int main(int argc, char **argv)
             continue;
         }
 
-        // Update animation
-        renderer.cubeRotation += dt * 0.5f;
+        // Update animation (DXR_FREEZE=1 pins it for byte-stable A/B captures)
+        if (!g_freezeAnimation) {
+            renderer.cubeRotation += dt * 0.5f;
+        }
+
+        // #439 A/B B-mode activation: at frame N create + submit the Tier-2
+        // mask (declared canvas rect = the 3D region) and fill the
+        // full-window Local2D swapchain with the surround pattern (static
+        // content: acquire/fill/release once; the layer references the
+        // released image every frame). Deferred to frame N — not startup —
+        // so the canvas-supersede changes the runtime's recommended view
+        // size and the Q4 view-size event demonstrably fires.
+        if (g_abLocal2D && !g_local2DActive && g_frameCounter >= g_local2DActivationFrame &&
+            app.hasLocal3DZoneExt && app.pfnCreateLocal3DZoneMaskEXT != nullptr &&
+            app.pfnSetLocal3DZoneFromRectsEXT != nullptr && app.pfnSubmitLocal3DZoneEXT != nullptr) {
+            uint32_t winW = 0, winH = 0;
+            WindowBackingPx(&winW, &winH);
+            int32_t mcx = 0, mcy = 0;
+            uint32_t mcw = 0, mch = 0;
+            ComputeCanvasRectPx(&mcx, &mcy, &mcw, &mch);
+            bool ok = (winW > 0 && winH > 0);
+            if (ok) {
+                XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+                sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+                sci.format = (int64_t)MTLPixelFormatBGRA8Unorm;
+                sci.sampleCount = 1;
+                sci.width = winW;
+                sci.height = winH;
+                sci.faceCount = 1;
+                sci.arraySize = 1;
+                sci.mipCount = 1;
+                ok = XR_SUCCEEDED(xrCreateSwapchain(app.session, &sci, &l2dSwapchain.swapchain));
+                l2dSwapchain.width = winW;
+                l2dSwapchain.height = winH;
+            }
+            if (ok) {
+                uint32_t n = 0;
+                xrEnumerateSwapchainImages(l2dSwapchain.swapchain, 0, &n, nullptr);
+                std::vector<XrSwapchainImageMetalKHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_METAL_KHR});
+                ok = n > 0 && XR_SUCCEEDED(xrEnumerateSwapchainImages(l2dSwapchain.swapchain, n, &n,
+                                                                      (XrSwapchainImageBaseHeader *)imgs.data()));
+                if (ok) {
+                    XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+                    uint32_t idx = 0;
+                    ok = XR_SUCCEEDED(xrAcquireSwapchainImage(l2dSwapchain.swapchain, &ai, &idx));
+                    if (ok) {
+                        XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+                        wi.timeout = XR_INFINITE_DURATION;
+                        xrWaitSwapchainImage(l2dSwapchain.swapchain, &wi);
+                        size_t stride = (size_t)winW * 4;
+                        uint8_t *buf = (uint8_t *)calloc(1, stride * winH); // canvas hole transparent
+                        if (buf != NULL) {
+                            FillSurroundPatternBuffer(buf, stride, winW, winH, mcx, mcy, mcw, mch);
+                            id<MTLTexture> tex = (__bridge id<MTLTexture>)imgs[idx].texture;
+                            [tex replaceRegion:MTLRegionMake2D(0, 0, winW, winH)
+                                   mipmapLevel:0
+                                     withBytes:buf
+                                   bytesPerRow:stride];
+                            free(buf);
+                        }
+                        XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                        xrReleaseSwapchainImage(l2dSwapchain.swapchain, &ri);
+                    }
+                }
+            }
+            if (ok) {
+                XrLocal3DZoneMaskCreateInfoEXT mci = {
+                    (XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_EXT};
+                mci.maskWidth = 0; // runtime picks the window backing size
+                mci.maskHeight = 0;
+                ok = XR_SUCCEEDED(app.pfnCreateLocal3DZoneMaskEXT(app.session, &mci, &app.local3DZoneMask));
+            }
+            if (ok) {
+                XrRect2Di rect;
+                rect.offset = {mcx, mcy};
+                rect.extent = {(int32_t)mcw, (int32_t)mch};
+                ok = XR_SUCCEEDED(app.pfnSetLocal3DZoneFromRectsEXT(app.local3DZoneMask, 1, &rect)) &&
+                     XR_SUCCEEDED(app.pfnSubmitLocal3DZoneEXT(app.local3DZoneMask));
+            }
+            if (ok) {
+                g_local2DActive = true;
+                LOG_INFO("A/B B-mode activated: Tier-2 mask (canvas %d,%d %ux%u 3D) + "
+                         "full-window Local2D layer %ux%u",
+                         mcx, mcy, mcw, mch, winW, winH);
+            } else {
+                LOG_ERROR("A/B B-mode activation failed — staying on plain projection path");
+                g_local2DActivationFrame = 0x7fffffff; // don't retry every frame
+            }
+        }
 
         // Wait frame
         XrFrameWaitInfo waitInfo = {XR_TYPE_FRAME_WAIT_INFO};
@@ -2369,14 +2564,31 @@ int main(int argc, char **argv)
             projLayer.viewCount = (uint32_t)eyeCount;
             projLayer.views = projViews.data();
 
-            const XrCompositionLayerBaseHeader *layers[] = {
-                (XrCompositionLayerBaseHeader *)&projLayer
-            };
+            // #439 A/B B-mode: the full-window Local2D layer rides the
+            // normal layer list beside the projection layer (the post-weave
+            // 2D source — supersedes the surround side-channel).
+            XrCompositionLayerLocal2DEXT l2dLayer = {
+                (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+            const XrCompositionLayerBaseHeader *layers[2] = {
+                (XrCompositionLayerBaseHeader *)&projLayer, nullptr};
+            uint32_t layerCount = (rendered && frameState.shouldRender) ? 1 : 0;
+            if (layerCount > 0 && g_local2DActive && l2dSwapchain.swapchain != XR_NULL_HANDLE) {
+                l2dLayer.layerFlags = 0; // premultiplied; the pattern is opaque
+                l2dLayer.subImage.swapchain = l2dSwapchain.swapchain;
+                l2dLayer.subImage.imageRect.offset = {0, 0};
+                l2dLayer.subImage.imageRect.extent = {(int32_t)l2dSwapchain.width,
+                                                      (int32_t)l2dSwapchain.height};
+                l2dLayer.subImage.imageArrayIndex = 0;
+                l2dLayer.rect.offset = {0, 0};
+                l2dLayer.rect.extent = {(int32_t)l2dSwapchain.width, (int32_t)l2dSwapchain.height};
+                layers[1] = (XrCompositionLayerBaseHeader *)&l2dLayer;
+                layerCount = 2;
+            }
 
             XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
             endInfo.displayTime = frameState.predictedDisplayTime;
             endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-            endInfo.layerCount = (rendered && frameState.shouldRender) ? 1 : 0;
+            endInfo.layerCount = layerCount;
             endInfo.layers = layers;
 
             xrEndFrame(app.session, &endInfo);
@@ -2387,6 +2599,8 @@ int main(int argc, char **argv)
         if (metalLayer) {
             BlitIOSurfaceToDrawable(renderer, metalLayer);
         }
+
+        g_frameCounter++;
 
         // FPS tracking
         g_avgFrameTime = g_avgFrameTime * 0.95 + dt * 0.05;
@@ -2543,6 +2757,12 @@ int main(int argc, char **argv)
 
     if (hudReady) {
         CleanupHudRenderer(hudRenderer);
+    }
+    if (app.local3DZoneMask != XR_NULL_HANDLE && app.pfnDestroyLocal3DZoneMaskEXT != nullptr) {
+        app.pfnDestroyLocal3DZoneMaskEXT(app.local3DZoneMask);
+    }
+    if (l2dSwapchain.swapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(l2dSwapchain.swapchain);
     }
     if (hudSwapchain.swapchain != XR_NULL_HANDLE) {
         xrDestroySwapchain(hudSwapchain.swapchain);
