@@ -811,6 +811,22 @@ gl_compositor_layer_window_space(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
+/*!
+ * Local-2D layer (XR_EXT_local_3d_zone v3, #439 Phase 3) — accumulate only;
+ * the GL consumer is a Windows follow-up leg
+ * (docs/roadmap/unified-2d-3d-phase3-impl.md §7).
+ */
+static xrt_result_t
+gl_compositor_layer_local_2d(struct xrt_compositor *xc,
+                             struct xrt_device *xdev,
+                             struct xrt_swapchain *xsc,
+                             const struct xrt_layer_data *data)
+{
+	struct comp_gl_compositor *c = gl_comp(xc);
+	comp_layer_accum_local_2d(&c->layer_accum, xsc, data);
+	return XRT_SUCCESS;
+}
+
 
 /*
  *
@@ -2552,6 +2568,7 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	xc->layer_projection_depth = gl_compositor_layer_projection_depth;
 	xc->layer_quad = gl_compositor_layer_quad;
 	xc->layer_window_space = gl_compositor_layer_window_space;
+	xc->layer_local_2d = gl_compositor_layer_local_2d;
 	xc->layer_commit = gl_compositor_layer_commit;
 	xc->destroy = gl_compositor_destroy;
 

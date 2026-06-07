@@ -913,6 +913,22 @@ client_d3d12_compositor_layer_window_space(struct xrt_compositor *xc,
 }
 
 static xrt_result_t
+client_d3d12_compositor_layer_local_2d(struct xrt_compositor *xc,
+                                       struct xrt_device *xdev,
+                                       struct xrt_swapchain *xsc,
+                                       const struct xrt_layer_data *data)
+{
+	struct client_d3d12_compositor *c = as_client_d3d12_compositor(xc);
+
+	assert(data->type == XRT_LAYER_LOCAL_2D);
+
+	struct xrt_swapchain *xscfb = as_client_d3d12_swapchain(xsc)->xsc.get();
+
+	// No flip required: D3D12 swapchain image convention matches Vulkan.
+	return xrt_comp_layer_local_2d(&c->xcn->base, xdev, xscfb, data);
+}
+
+static xrt_result_t
 client_d3d12_compositor_layer_passthrough(struct xrt_compositor *xc,
                                           struct xrt_device *xdev,
                                           const struct xrt_layer_data *data)
@@ -1155,6 +1171,7 @@ try {
 	c->base.base.layer_equirect2 = client_d3d12_compositor_layer_equirect2;
 	c->base.base.layer_passthrough = client_d3d12_compositor_layer_passthrough;
 	c->base.base.layer_window_space = client_d3d12_compositor_layer_window_space;
+	c->base.base.layer_local_2d = client_d3d12_compositor_layer_local_2d;
 	c->base.base.layer_commit = client_d3d12_compositor_layer_commit;
 	c->base.base.destroy = client_d3d12_compositor_destroy;
 

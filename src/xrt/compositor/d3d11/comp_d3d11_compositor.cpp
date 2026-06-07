@@ -754,6 +754,26 @@ d3d11_compositor_layer_window_space(struct xrt_compositor *xc,
 }
 
 /*!
+ * Local-2D layer (XR_EXT_local_3d_zone v3, #439 Phase 3) — accumulate only;
+ * the D3D11 consumer (flatten + masked composite) is the Windows leg 1 of
+ * docs/roadmap/unified-2d-3d-phase3-impl.md §7.
+ */
+static xrt_result_t
+d3d11_compositor_layer_local_2d(struct xrt_compositor *xc,
+                                struct xrt_device *xdev,
+                                struct xrt_swapchain *xsc,
+                                const struct xrt_layer_data *data)
+{
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+
+	std::lock_guard<std::mutex> lock(c->mutex);
+
+	comp_layer_accum_local_2d(&c->layer_accum, xsc, data);
+
+	return XRT_SUCCESS;
+}
+
+/*!
  * Render the HUD overlay onto the back buffer (post-weave).
  * Uses CopySubresourceRegion for zero-shader simplicity.
  */
@@ -2349,6 +2369,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	c->base.base.layer_equirect2 = d3d11_compositor_layer_equirect2;
 	c->base.base.layer_passthrough = d3d11_compositor_layer_passthrough;
 	c->base.base.layer_window_space = d3d11_compositor_layer_window_space;
+	c->base.base.layer_local_2d = d3d11_compositor_layer_local_2d;
 	c->base.base.layer_commit = d3d11_compositor_layer_commit;
 	c->base.base.layer_commit_with_semaphore = d3d11_compositor_layer_commit_with_semaphore;
 	c->base.base.destroy = d3d11_compositor_destroy;
