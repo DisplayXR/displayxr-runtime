@@ -4,7 +4,7 @@
 **Spec:** [`unified-2d-3d-compositing.md`](unified-2d-3d-compositing.md) §4 (composite pass + output-alpha), §5.1 (coordinate contract), §8 (rollout priority). Epic #439.
 **Builds on:** D3D11 Phases 0–2 (merged: PR #469 + #471) — the proven pathfinder every port references.
 
-> **STATUS: base leg merged (PR #473); D3D12 consumer leg implemented + capture-validated** (Z-cycle states 0–4 on `cube_texture_d3d12_win` via the ported `DISPLAYXR_SURROUND_CAPTURE` probe; on-glass Leia eyeball pending as the merge gate). VK leg scoped to ride with Phase 3 (§4).
+> **STATUS: base leg merged (PR #473); D3D12 consumer leg DONE** — implemented, capture-validated (Z-cycle states 0–4 via the ported `DISPLAYXR_SURROUND_CAPTURE` probe) and Leia on-glass validated (PR #476). VK leg scoped to ride with Phase 3 (§4).
 
 ---
 
@@ -95,8 +95,8 @@ So a full Phase-1-style VK port has nothing to composite and nothing to validate
 
 **D3D12 leg**
 - [x] §3 checklist 1–5; caps flipped. *(Plus the `DISPLAYXR_SURROUND_CAPTURE` probe ported — the D3D12 compositor had no composite-target capture; the matrices depend on it. Composite PSOs cover RGBA8 + BGRA8 — D3D12 bakes the RTV format into the PSO and app shared textures are BGRA8 in the wild.)*
-- [ ] Phase-1 + Phase-2 validation matrices green on `cube_texture_d3d12_win` (Leia, capture + on-glass); no-mask diff 0. *(Capture leg green — Z-cycle 0→4 + wrap-around, view dims resize both directions, beyond-window untouched; on-glass interlace eyeball pending.)*
-- [ ] Epic #439 "D3D12 — all engine plugins" box ticked.
+- [x] Phase-1 + Phase-2 validation matrices green on `cube_texture_d3d12_win` (Leia, capture + on-glass); no-mask diff 0. *(Capture leg: Z-cycle 0→4 + wrap-around, view dims resize both directions, beyond-window untouched. On-glass eyeballed by user 2026-06-07 — interlace correct at islands + gradient feather.)*
+- [x] Epic #439 "D3D12 — all engine plugins" box ticked.
 
 **VK leg**
 - [ ] Scope decision recorded (this doc §4); composite consumer tracked into the Phase-3 plan.
