@@ -217,8 +217,11 @@ struct xrt_display_processor_d3d11
 	 * DP samples or copies it DURING this call (the immediate context
 	 * serializes against the runtime's writes), and must not hold the SRV
 	 * past return. @p screen_x/y/w/h anchor the mask's pixel space on the
-	 * panel in physical screen pixels (post-DPI client rect). @p seq is a
-	 * monotonic per-session publish counter for vendor-side coalescing.
+	 * panel in physical screen pixels (post-DPI client rect). @p seq is the
+	 * mask CONTENT generation — monotonic, bumped only when the staged mask
+	 * content changes (xrSubmitLocal3DZoneEXT); publishes carrying the same
+	 * seq differ only in the screen anchor, so a vendor evaluates content
+	 * (downsample, any-nonzero check) once per generation, not per frame.
 	 *
 	 * Downsample-and-arbitrate rule: any non-zero mask pixel overlapping a
 	 * hardware cell ⟹ that cell is 3D (OR union across all connected
@@ -240,7 +243,7 @@ struct xrt_display_processor_d3d11
 	 * @param screen_y       Client-area top edge in physical screen pixels.
 	 * @param screen_w       Client-area width in physical screen pixels.
 	 * @param screen_h       Client-area height in physical screen pixels.
-	 * @param seq            Monotonic per-session publish sequence number.
+	 * @param seq            Mask content generation (bumped per submit).
 	 * @return true if the publish was accepted.
 	 */
 	bool (*publish_local_zone_mask)(struct xrt_display_processor_d3d11 *xdp,

@@ -97,8 +97,10 @@ Three meaningful return shapes:
 // XR_EXT_local_3d_zone snapshot — R8_UNORM, client-window pixels, non-zero =
 // 3D) and passes an SRV on the session's own D3D11 device. screen_x/y/w/h
 // anchor the mask's pixel space on the panel (physical pixels, post-DPI
-// client rect). seq is a monotonic per-session publish counter for
-// vendor-side coalescing. The DP samples or copies DURING the call.
+// client rect). seq is the mask CONTENT generation — bumped only on
+// xrSubmitLocal3DZoneEXT; same-seq publishes differ only in the screen
+// anchor, so a vendor evaluates content once per generation, not per
+// frame. The DP samples or copies DURING the call.
 bool (*publish_local_zone_mask)(struct xrt_display_processor_d3d11 *xdp,
                                 void *d3d11_context, void *mask_srv,
                                 uint32_t mask_width, uint32_t mask_height,
