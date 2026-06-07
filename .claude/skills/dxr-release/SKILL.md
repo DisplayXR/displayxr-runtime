@@ -116,15 +116,32 @@ PREV_TAG=$(git tag --sort=-creatordate | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | h
 
 ---
 
-## PHASE 2: TAG
+## PHASE 2: MARKER COMMIT + TAG
+
+Create an **empty** "Release vX.Y.Z" marker commit on the sibling's
+`main` and tag THAT commit — same pattern as `/release` on the runtime
+and the Unity/Unreal plugin repos, so every repo's history shows an
+obvious release boundary (which release got which commits). Empty
+commit = no version content = no drift vector.
 
 ```bash
+git commit --allow-empty -m "Release $NEW_TAG"
+# Retry once if main moved underneath us (the empty commit rebases trivially).
+git push origin HEAD:main || (git pull --rebase origin main && git push origin HEAD:main)
 git tag -a "$NEW_TAG" -m "$NEW_TAG
 
 Commits since $PREV_TAG:
 $(git log --oneline --no-merges "$PREV_TAG..HEAD" 2>/dev/null | head -20)"
 git push origin "$NEW_TAG"
 ```
+
+Notes:
+- The marker push fires the sibling's regular main-push CI alongside
+  the tag-triggered release run — a harmless (if slightly wasteful)
+  duplicate. Siblings can adopt the runtime's empty-diff →
+  docs_only=true `DetectChanges` short-circuit to make it ~free.
+- If the sibling's ruleset rejects the direct push to main, fall back
+  to tagging HEAD directly and flag it in the Phase 6 report.
 
 The temp clone can be deleted after the tag is pushed — the rest of the
 flow polls GitHub via `gh api`, no local checkout needed. Keep it until

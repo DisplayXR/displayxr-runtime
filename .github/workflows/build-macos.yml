@@ -62,8 +62,10 @@ jobs:
             BASE=${{ github.event.before }}
           fi
           CHANGED=$(git diff --name-only "$BASE" HEAD)
+          # Empty diff = /release's empty "Release vX.Y.Z" marker commit on
+          # main; the real build runs on the tag push (docs_only=false above).
           NON_DOC=$(echo "$CHANGED" | grep -vE '^(docs/|.*\.md$|LICENSE$|\.github/ISSUE_TEMPLATE/)' || true)
-          if [ -n "$CHANGED" ] && [ -z "$NON_DOC" ]; then
+          if [ -z "$NON_DOC" ]; then
             echo "docs_only=true" >> "$GITHUB_OUTPUT"
           else
             echo "docs_only=false" >> "$GITHUB_OUTPUT"

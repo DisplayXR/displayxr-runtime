@@ -103,8 +103,30 @@ component release first, then re-run.
 
 ---
 
-## PHASE 2: FIRE THE DISPATCH
+## PHASE 2: MARKER COMMIT + FIRE THE DISPATCH
 
+### Step 2.0: Push the empty release-marker commit
+Same pattern as every other DisplayXR repo's release flow (`/release`,
+`/dxr-release`, Unity/Unreal plugins): an **empty** "Release vX.Y.Z"
+commit on `main` so the history shows an obvious release boundary.
+Because the dispatch below runs `--ref main`, the workflow's
+`GITHUB_SHA` — and therefore the tag `softprops/action-gh-release`
+creates — lands on this marker commit.
+
+```bash
+WORK=$(mktemp -d)
+gh repo clone DisplayXR/displayxr-installer "$WORK/repo" -- --quiet --depth 30
+cd "$WORK/repo"
+git commit --allow-empty -m "Release $TAG"
+# Retry once if a versions.json mirror commit raced us (empty commit rebases trivially).
+git push origin HEAD:main || (git pull --rebase origin main && git push origin HEAD:main)
+cd - && rm -rf "$WORK"
+```
+
+The marker changes no files, so the pre-checked `versions.json` sync
+assertion (Step 1.2 / `assert-versions-in-sync`) is unaffected.
+
+### Step 2.1: Fire the dispatch
 `publish-bundle.yml` is `workflow_dispatch`-only. Fire it via the gh
 CLI with the tag input.
 
@@ -118,7 +140,8 @@ gh workflow run publish-bundle.yml \
 
 The workflow creates the actual tag itself during the release step
 (`softprops/action-gh-release@v2` with `tag_name: ${{ inputs.tag }}`),
-so no `git tag && git push` needed beforehand.
+so no `git tag && git push` needed beforehand — only the Step 2.0
+marker push.
 
 ---
 

@@ -77,8 +77,13 @@ jobs:
           # When true, Runtime (and downstream test-app jobs) still RUN — to
           # report a status for branch protection — but skip their heavy
           # steps via per-step `if:`.
+          # An EMPTY diff also counts as docs_only: the only zero-file pushes
+          # to main are /release's empty "Release vX.Y.Z" marker commits, and
+          # their real build runs on the tag push (forced docs_only=false
+          # above). A bad BASE object can't masquerade as an empty diff — the
+          # step runs under bash -e, so a failed `git diff` fails the job.
           NON_DOC=$(echo "$CHANGED" | grep -vE '^(docs/|.*\.md$|LICENSE$|\.github/ISSUE_TEMPLATE/)' || true)
-          if [ -n "$CHANGED" ] && [ -z "$NON_DOC" ]; then
+          if [ -z "$NON_DOC" ]; then
             echo "docs_only=true" >> "$GITHUB_OUTPUT"
           else
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
