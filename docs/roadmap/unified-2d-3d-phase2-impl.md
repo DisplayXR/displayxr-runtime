@@ -4,7 +4,7 @@
 **Spec:** [`unified-2d-3d-compositing.md`](unified-2d-3d-compositing.md) §6 (Phase 2), §9 Q5 (full-window first, bbox under profiling). Epic #439.
 **Builds on:** Phase 1 (`XR_EXT_local_3d_zone` oxr layer + D3D11 consumer, merged in PR #469; window-clamped per #464).
 
-> **STATUS: ready to execute.** Windows-only — D3D11 compositor + Leia validation; no oxr, no DP-interface, no macOS-verifiable code.
+> **STATUS: implemented + hardware-validated (2026-06-06).** `d3d11_effective_canvas()` applied at all 8 sites; §5 matrix green on Leia hardware — no-mask leg statistically identical to a Phase-1 `main` build (DP weave geometry byte-identical, pixel diff within the same-runtime noise envelope, beyond-window region diff 0), mask-active weave flips to `canvas=(0,0,win)` with window-derived view dims, Tier-2 islands beyond the old canvas show real weave on-glass (Phase 1 showed stale 2D there), destroy snaps geometry back, drag-resize tracks the client rect per frame, `selftest` passes. Note: the window-spanning 3D is upscaled from the app's canvas-sized swapchain (app didn't re-render; expected — view dims are the runtime side only). Windows-only — D3D11 compositor + Leia validation; no oxr, no DP-interface, no macOS-verifiable code.
 
 ---
 
@@ -99,9 +99,9 @@ Reuse the Phase-1 harness (`cube_texture_d3d11_win` 'Z' cycle + `DISPLAYXR_SURRO
 
 ## 6. Done-when
 
-- [ ] Active mask ⇒ weave region, view dims, Kooima metrics, and composite region are all the client-window rect (one effective-canvas authority, all 8 sites).
-- [ ] No-mask path byte-identical to Phase 1 (capture diff 0).
-- [ ] Tier-2 island beyond the old canvas shows real weave (capture + on-glass).
-- [ ] Mask destroy restores output-rect behavior (capture matches pre-mask frame).
-- [ ] Comment fixes (:144) + extension-header note (output rect superseded while a mask is active).
+- [x] Active mask ⇒ weave region, view dims, Kooima metrics, and composite region are all the client-window rect (one effective-canvas authority, all 8 sites). DP log: `canvas=(320,180 640x360)` → `canvas=(0,0 1280x720)`, `view=320x180` → `640x360` on submit; reverse on destroy.
+- [x] No-mask path byte-identical to Phase 1 (the helper returns `c->canvas` verbatim with no mask; capture A/B vs a Phase-1 `main` build: weave geometry identical, beyond-window diff 0, window-region diff within the same-runtime capture noise — strict diff-0 is unattainable across runs because the app's surround + cube animate).
+- [x] Tier-2 island beyond the old canvas shows real weave (capture: island region 100% changed vs noise-level on Phase 1; interlace eyeballed good on-glass). Re-baselined golden: Tier-2 single rect now crops a window-spanning weave (82% changed inside the rect vs the Phase-0/1 canvas-fit output) — intended end-state semantics per §2.
+- [x] Mask destroy restores output-rect behavior (capture matches pre-mask frame within noise; geometry snap-back logged).
+- [x] Comment fixes (:144) + extension-header note (output rect superseded while a mask is active).
 - [ ] Epic #439 Phase-2 checkbox ticked; this doc's STATUS updated.
