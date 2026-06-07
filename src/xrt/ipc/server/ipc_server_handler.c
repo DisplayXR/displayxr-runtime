@@ -22,7 +22,6 @@
 #include "xrt/xrt_config_have.h"
 
 #include "math/m_api.h"
-#include "math/m_multiview.h"
 
 #ifdef XRT_GRAPHICS_SYNC_HANDLE_IS_FD
 #include <unistd.h>
@@ -41,8 +40,9 @@
  * specific vendor (issue #256 / ADR-019).
  */
 #include "d3d11_service/comp_d3d11_service.h"
-#include "math/m_display3d_view.h"
-#include "math/m_camera3d_view.h"
+// Shared Kooima rig math (#396 W7): same displayxr-common core as the
+// in-process oxr_session.c path and every app/engine consumer.
+#include "displayxr_math_xrt.h"
 #endif
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
@@ -435,13 +435,14 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		return true;
 	}
 
-	// Both paths use canonical display3d/camera3d functions from m_display3d_view.h
-	// and m_camera3d_view.h — same code as the in-process oxr_session.c path.
-	Display3DScreen scr = {screen_width_m, screen_height_m};
+	// Both paths use the canonical display3d/camera3d math via the shared
+	// displayxr-common core (displayxr_math_xrt.h) — the SAME code as the
+	// in-process oxr_session.c path and every app/engine consumer (#396 W7).
+	dxr_screen scr = {screen_width_m, screen_height_m};
 	struct xrt_pose display_pose = {display_ori, display_pos};
 
 	if (have_stereo_state && stereo_state.camera_mode && use_qwerty_head) {
-		// CAMERA-CENTRIC PATH (canonical camera3d_compute_views)
+		// CAMERA-CENTRIC PATH (canonical camera3d math, shared core)
 		// In workspace mode, app sessions take this path with qwerty pose as
 		// the camera position. qwerty_toggle_camera_mode preserves the
 		// convergence plane across the P-key toggle: cam->disp moves the
@@ -450,15 +451,15 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		// the convergence plane in camera mode coincide. Both paths must
 		// be reachable in workspace mode for app sessions or the toggle becomes
 		// asymmetric (works in non-workspace mode, no-op in workspace mode).
-		Camera3DTunables ct = {
+		dxr_camera3d_tunables ct = {
 		    .ipd_factor = stereo_state.cam_spread_factor,
 		    .parallax_factor = stereo_state.cam_parallax_factor,
 		    .inv_convergence_distance = stereo_state.cam_convergence,
 		    .half_tan_vfov = stereo_state.cam_half_tan_vfov,
 		};
-		Camera3DView cam_views[XRT_MAX_VIEWS];
-		camera3d_compute_views(raw_eyes, eye_count, NULL, &scr, &ct,
-		                       &display_pose, 0.01f, 100.0f, cam_views);
+		struct dxr_xrt_view cam_views[XRT_MAX_VIEWS];
+		dxr_xrt_camera3d_compute_views(raw_eyes, eye_count, NULL, &scr, &ct,
+		                               &display_pose, cam_views);
 
 		out_head_relation->pose.position = display_pos;
 		out_head_relation->pose.orientation = display_ori;
@@ -477,7 +478,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 			out_poses[i].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
 		}
 	} else {
-		// DISPLAY-CENTRIC PATH (canonical display3d_compute_views)
+		// DISPLAY-CENTRIC PATH (canonical display3d math, shared core)
 		if (use_qwerty_head) {
 			out_head_relation->pose.position = display_pos;
 			out_head_relation->pose.orientation = display_ori;
@@ -486,7 +487,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 			out_head_relation->pose.orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
 		}
 
-		Display3DTunables dt = display3d_default_tunables();
+		dxr_display3d_tunables dt = dxr_display3d_default_tunables();
 		if (have_stereo_state && use_qwerty_head) {
 			// Same gate as the camera-centric branch: workspace clients must
 			// see disp_vHeight (the user-tuned virtual display size)
@@ -501,9 +502,9 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 			dt.virtual_display_height = screen_height_m; // identity m2v
 		}
 
-		Display3DView disp_views[XRT_MAX_VIEWS];
-		display3d_compute_views(raw_eyes, eye_count, NULL, &scr, &dt,
-		                        &display_pose, 0.01f, 100.0f, disp_views);
+		struct dxr_xrt_view disp_views[XRT_MAX_VIEWS];
+		dxr_xrt_display3d_compute_views(raw_eyes, eye_count, NULL, &scr, &dt,
+		                                &display_pose, disp_views);
 
 		// Convert world-space eye positions to head-local
 		struct xrt_quat inv_ori;
