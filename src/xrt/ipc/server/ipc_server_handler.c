@@ -2095,6 +2095,32 @@ _update_window_space_layer(struct xrt_compositor *xc,
 }
 
 static bool
+_update_local_2d_layer(struct xrt_compositor *xc,
+                       volatile struct ipc_client_state *ics,
+                       volatile struct ipc_layer_entry *layer,
+                       uint32_t i)
+{
+	// Local-2D layers are silently skipped if the compositor doesn't
+	// implement them (the consumer is per-API; the service path drops
+	// with a one-time WARN — #439 Phase 3).
+	if (xc->layer_local_2d == NULL) {
+		return true;
+	}
+
+	struct xrt_device *xdev;
+	struct xrt_swapchain *xcs;
+	struct xrt_layer_data *data;
+
+	if (!do_single(xc, ics, layer, i, "local_2d", &xdev, &xcs, &data)) {
+		return false;
+	}
+
+	xrt_comp_layer_local_2d(xc, xdev, xcs, data);
+
+	return true;
+}
+
+static bool
 _update_layers(volatile struct ipc_client_state *ics, struct xrt_compositor *xc, struct ipc_layer_slot *slot)
 {
 	IPC_TRACE_MARKER();
@@ -2145,6 +2171,11 @@ _update_layers(volatile struct ipc_client_state *ics, struct xrt_compositor *xc,
 			break;
 		case XRT_LAYER_WINDOW_SPACE:
 			if (!_update_window_space_layer(xc, ics, layer, i)) {
+				return false;
+			}
+			break;
+		case XRT_LAYER_LOCAL_2D:
+			if (!_update_local_2d_layer(xc, ics, layer, i)) {
 				return false;
 			}
 			break;

@@ -3885,6 +3885,28 @@ compositor_layer_window_space(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
+/*!
+ * Local-2D layer (XR_EXT_local_3d_zone v3, #439 Phase 3). The service
+ * consumer is out of scope for v1 (in-process native compositors first —
+ * docs/roadmap/unified-2d-3d-phase3-impl.md §2): drop with a one-time WARN;
+ * never an error (layers are advisory compositing).
+ */
+static xrt_result_t
+compositor_layer_local_2d(struct xrt_compositor *xc,
+                          struct xrt_device *xdev,
+                          struct xrt_swapchain *xsc,
+                          const struct xrt_layer_data *data)
+{
+	static bool warned = false;
+	if (!warned) {
+		warned = true;
+		U_LOG_W("Local-2D layers are not consumed by the D3D11 service compositor yet — dropping (one-time "
+		        "warning)");
+	}
+
+	return XRT_SUCCESS;
+}
+
 static xrt_result_t
 compositor_layer_passthrough(struct xrt_compositor *xc,
                               struct xrt_device *xdev,
@@ -10338,6 +10360,7 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	c->base.base.layer_equirect1 = compositor_layer_equirect1;
 	c->base.base.layer_equirect2 = compositor_layer_equirect2;
 	c->base.base.layer_window_space = compositor_layer_window_space;
+	c->base.base.layer_local_2d = compositor_layer_local_2d;
 	c->base.base.layer_passthrough = compositor_layer_passthrough;
 	c->base.base.layer_commit = compositor_layer_commit;
 	c->base.base.layer_commit_with_semaphore = compositor_layer_commit_with_semaphore;

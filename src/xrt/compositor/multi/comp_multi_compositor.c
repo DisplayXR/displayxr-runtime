@@ -1031,6 +1031,29 @@ multi_compositor_layer_window_space(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
+/*!
+ * Local-2D layer (XR_EXT_local_3d_zone v3, #439 Phase 3). The
+ * service/multi-compositor consumer is out of scope for v1 (in-process
+ * native compositors first — docs/roadmap/unified-2d-3d-phase3-impl.md §2),
+ * so drop with a one-time WARN; never an error (layers are advisory
+ * compositing). Deliberately NOT enqueued into progress — the
+ * comp_multi_system transfer switch would log an unhandled-type error.
+ */
+static xrt_result_t
+multi_compositor_layer_local_2d(struct xrt_compositor *xc,
+                                struct xrt_device *xdev,
+                                struct xrt_swapchain *xsc,
+                                const struct xrt_layer_data *data)
+{
+	static bool warned = false;
+	if (!warned) {
+		warned = true;
+		U_LOG_W("Local-2D layers are not consumed on the IPC/service path yet — dropping (one-time warning)");
+	}
+
+	return XRT_SUCCESS;
+}
+
 static xrt_result_t
 multi_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -1935,6 +1958,7 @@ multi_compositor_create(struct multi_system_compositor *msc,
 	mc->base.base.layer_equirect1 = multi_compositor_layer_equirect1;
 	mc->base.base.layer_equirect2 = multi_compositor_layer_equirect2;
 	mc->base.base.layer_window_space = multi_compositor_layer_window_space;
+	mc->base.base.layer_local_2d = multi_compositor_layer_local_2d;
 	mc->base.base.layer_commit = multi_compositor_layer_commit;
 	mc->base.base.layer_commit_with_semaphore = multi_compositor_layer_commit_with_semaphore;
 	mc->base.base.destroy = multi_compositor_destroy;

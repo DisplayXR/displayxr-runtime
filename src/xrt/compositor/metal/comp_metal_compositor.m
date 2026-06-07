@@ -1177,6 +1177,23 @@ metal_compositor_layer_window_space(struct xrt_compositor *xc,
 }
 
 /*!
+ * Local-2D layer (XR_EXT_local_3d_zone v3, #439 Phase 3). Post-weave 2D
+ * content at a client-window pixel rect, mask-gated. Here we just
+ * accumulate; the Metal consumer (flatten + masked composite) runs in
+ * layer_commit — search for `XRT_LAYER_LOCAL_2D` in this file.
+ */
+static xrt_result_t
+metal_compositor_layer_local_2d(struct xrt_compositor *xc,
+                                struct xrt_device *xdev,
+                                struct xrt_swapchain *xsc,
+                                const struct xrt_layer_data *data)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	comp_layer_accum_local_2d(&c->layer_accum, xsc, data);
+	return XRT_SUCCESS;
+}
+
+/*!
  * Update the HUD overlay text (throttled, main-thread safe).
  */
 static void
@@ -2734,6 +2751,7 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	xc->layer_projection_depth = metal_compositor_layer_projection_depth;
 	xc->layer_quad = metal_compositor_layer_quad;
 	xc->layer_window_space = metal_compositor_layer_window_space;
+	xc->layer_local_2d = metal_compositor_layer_local_2d;
 	xc->layer_commit = metal_compositor_layer_commit;
 	xc->destroy = metal_compositor_destroy;
 

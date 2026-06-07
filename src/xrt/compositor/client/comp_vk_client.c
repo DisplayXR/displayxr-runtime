@@ -724,6 +724,23 @@ client_vk_compositor_layer_window_space(struct xrt_compositor *xc,
 }
 
 static xrt_result_t
+client_vk_compositor_layer_local_2d(struct xrt_compositor *xc,
+                                    struct xrt_device *xdev,
+                                    struct xrt_swapchain *xsc,
+                                    const struct xrt_layer_data *data)
+{
+	struct xrt_compositor *xcn;
+	struct xrt_swapchain *xscfb;
+
+	assert(data->type == XRT_LAYER_LOCAL_2D);
+
+	xcn = to_native_compositor(xc);
+	xscfb = to_native_swapchain(xsc);
+
+	return xrt_comp_layer_local_2d(xcn, xdev, xscfb, data);
+}
+
+static xrt_result_t
 client_vk_compositor_layer_passthrough(struct xrt_compositor *xc,
                                        struct xrt_device *xdev,
                                        const struct xrt_layer_data *data)
@@ -983,6 +1000,7 @@ client_vk_compositor_create(struct xrt_compositor_native *xcn,
 	c->base.base.layer_equirect1 = client_vk_compositor_layer_equirect1;
 	c->base.base.layer_equirect2 = client_vk_compositor_layer_equirect2;
 	c->base.base.layer_window_space = client_vk_compositor_layer_window_space;
+	c->base.base.layer_local_2d = client_vk_compositor_layer_local_2d;
 	c->base.base.layer_passthrough = client_vk_compositor_layer_passthrough;
 	c->base.base.layer_commit = client_vk_compositor_layer_commit;
 	c->base.base.destroy = client_vk_compositor_destroy;
