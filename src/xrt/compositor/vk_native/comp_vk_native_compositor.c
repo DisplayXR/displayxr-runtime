@@ -3411,3 +3411,81 @@ comp_vk_native_compositor_get_queue_family(struct comp_vk_native_compositor *c)
 {
 	return c->queue_family_index;
 }
+
+
+/*
+ *
+ * XR_EXT_local_3d_zone — VK consumer leg STUBS (#439 cross-API).
+ *
+ * The oxr layer forwards here for VK sessions; the composite consumer rides
+ * with Phase 3 (docs/roadmap/unified-2d-3d-crossapi-impl.md §4). Until then
+ * these return XRT_ERROR_NOT_IMPLEMENTED and the oxr caps query reports
+ * supported = false, so a caps-honoring app never reaches them. They must
+ * stay real symbols: XRT_HAVE_VK_NATIVE_COMPOSITOR is defined on every
+ * platform (macOS/MoltenVK + Android included).
+ *
+ */
+
+xrt_result_t
+comp_vk_native_compositor_zone_mask_create(struct xrt_compositor *xc, uint32_t w, uint32_t h, void **out_mask)
+{
+	(void)xc;
+	(void)w;
+	(void)h;
+	(void)out_mask;
+	return XRT_ERROR_NOT_IMPLEMENTED;
+}
+
+xrt_result_t
+comp_vk_native_compositor_zone_mask_set_whole(struct xrt_compositor *xc, void *mask, bool enable_3d)
+{
+	(void)xc;
+	(void)mask;
+	(void)enable_3d;
+	return XRT_ERROR_NOT_IMPLEMENTED;
+}
+
+xrt_result_t
+comp_vk_native_compositor_zone_mask_set_rects(struct xrt_compositor *xc,
+                                              void *mask,
+                                              uint32_t count,
+                                              const struct xrt_rect *rects)
+{
+	(void)xc;
+	(void)mask;
+	(void)count;
+	(void)rects;
+	return XRT_ERROR_NOT_IMPLEMENTED;
+}
+
+xrt_result_t
+comp_vk_native_compositor_zone_mask_acquire_rt(struct xrt_compositor *xc,
+                                               void *mask,
+                                               void **out_image,
+                                               void **out_image_view,
+                                               uint32_t *out_w,
+                                               uint32_t *out_h)
+{
+	(void)xc;
+	(void)mask;
+	(void)out_image;
+	(void)out_image_view;
+	(void)out_w;
+	(void)out_h;
+	return XRT_ERROR_NOT_IMPLEMENTED;
+}
+
+xrt_result_t
+comp_vk_native_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask)
+{
+	(void)xc;
+	(void)mask;
+	return XRT_ERROR_NOT_IMPLEMENTED;
+}
+
+void
+comp_vk_native_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask)
+{
+	(void)xc;
+	(void)mask;
+}

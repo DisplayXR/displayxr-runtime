@@ -2816,3 +2816,74 @@ comp_d3d12_compositor_set_surround_2d_fence(struct xrt_compositor *xc,
 	            (unsigned)sd.Format,
 	            (unsigned long long)await_fence_value);
 }
+
+
+/*
+ *
+ * XR_EXT_local_3d_zone — D3D12 consumer leg STUBS (#439 cross-API).
+ *
+ * The oxr layer forwards here for D3D12 sessions; until the consumer leg
+ * lands (docs/roadmap/unified-2d-3d-crossapi-impl.md §3) these return
+ * XRT_ERROR_NOT_IMPLEMENTED and the oxr caps query reports
+ * supported = false, so a caps-honoring app never reaches them.
+ *
+ */
+
+extern "C" xrt_result_t
+comp_d3d12_compositor_zone_mask_create(struct xrt_compositor *xc, uint32_t w, uint32_t h, void **out_mask)
+{
+	(void)xc;
+	(void)w;
+	(void)h;
+	(void)out_mask;
+	return XRT_ERROR_NOT_IMPLEMENTED;
+}
+
+extern "C" xrt_result_t
+comp_d3d12_compositor_zone_mask_set_whole(struct xrt_compositor *xc, void *mask, bool enable_3d)
+{
+	(void)xc;
+	(void)mask;
+	(void)enable_3d;
+	return XRT_ERROR_NOT_IMPLEMENTED;
+}
+
+extern "C" xrt_result_t
+comp_d3d12_compositor_zone_mask_set_rects(struct xrt_compositor *xc,
+                                          void *mask,
+                                          uint32_t count,
+                                          const struct xrt_rect *rects)
+{
+	(void)xc;
+	(void)mask;
+	(void)count;
+	(void)rects;
+	return XRT_ERROR_NOT_IMPLEMENTED;
+}
+
+extern "C" xrt_result_t
+comp_d3d12_compositor_zone_mask_acquire_rt(
+    struct xrt_compositor *xc, void *mask, void **out_resource, uint32_t *out_w, uint32_t *out_h)
+{
+	(void)xc;
+	(void)mask;
+	(void)out_resource;
+	(void)out_w;
+	(void)out_h;
+	return XRT_ERROR_NOT_IMPLEMENTED;
+}
+
+extern "C" xrt_result_t
+comp_d3d12_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask)
+{
+	(void)xc;
+	(void)mask;
+	return XRT_ERROR_NOT_IMPLEMENTED;
+}
+
+extern "C" void
+comp_d3d12_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask)
+{
+	(void)xc;
+	(void)mask;
+}

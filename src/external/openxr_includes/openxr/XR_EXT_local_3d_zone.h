@@ -33,7 +33,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_local_3d_zone 1
-#define XR_EXT_local_3d_zone_SPEC_VERSION 1
+#define XR_EXT_local_3d_zone_SPEC_VERSION 2
 #define XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME "XR_EXT_local_3d_zone"
 
 // Vendor extension range (1000999xxx); replace with a Khronos-assigned value
@@ -41,6 +41,9 @@ extern "C" {
 #define XR_TYPE_LOCAL_3D_ZONE_CAPABILITIES_EXT      ((XrStructureType)1000999130)
 #define XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_EXT  ((XrStructureType)1000999131)
 #define XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D11_EXT ((XrStructureType)1000999132)
+// Spec v2 additions — D3D12 + Vulkan Tier-3 bindings.
+#define XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D12_EXT  ((XrStructureType)1000999133)
+#define XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_VULKAN_EXT ((XrStructureType)1000999134)
 
 XR_DEFINE_HANDLE(XrLocal3DZoneMaskEXT)
 
@@ -91,6 +94,40 @@ typedef struct XrLocal3DZoneRenderTargetD3D11EXT {
     uint32_t           width;
     uint32_t           height;
 } XrLocal3DZoneRenderTargetD3D11EXT;
+
+/*!
+ * @brief Tier-3 freeform binding, D3D12 variant (spec v2). The runtime
+ *        returns the ID3D12Resource* (R8_UNORM, client-window pixels); the
+ *        app creates its OWN render-target descriptor on it (descriptor
+ *        heaps are app-owned in D3D12) and writes M (3D-ness) to .r.
+ *
+ * Sync contract: the in-process D3D12 native compositor runs on the app's
+ * device AND command queue, so same-queue submission order is the contract —
+ * execute the mask draw, then call xrSubmitLocal3DZoneEXT. No fence.
+ */
+typedef struct XrLocal3DZoneRenderTargetD3D12EXT {
+    XrStructureType    type;   //!< XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D12_EXT
+    void* XR_MAY_ALIAS next;
+    void*              resource; //!< ID3D12Resource*
+    uint32_t           width;
+    uint32_t           height;
+} XrLocal3DZoneRenderTargetD3D12EXT;
+
+/*!
+ * @brief Tier-3 freeform binding, Vulkan variant (spec v2). VkImage +
+ *        VkImageView on an R8_UNORM image in client-window pixels; write M
+ *        (3D-ness) to .r. The vk_native compositor shares the app's
+ *        VkDevice, so the handles are directly usable by the app; same-queue
+ *        submission ordering is the sync contract (as D3D12).
+ */
+typedef struct XrLocal3DZoneRenderTargetVulkanEXT {
+    XrStructureType    type;   //!< XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_VULKAN_EXT
+    void* XR_MAY_ALIAS next;
+    void*              image;     //!< VkImage
+    void*              imageView; //!< VkImageView
+    uint32_t           width;
+    uint32_t           height;
+} XrLocal3DZoneRenderTargetVulkanEXT;
 
 typedef XrResult (XRAPI_PTR *PFN_xrGetLocal3DZoneCapabilitiesEXT)(
     XrSession session, XrLocal3DZoneCapabilitiesEXT* capabilities);

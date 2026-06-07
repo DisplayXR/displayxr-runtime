@@ -202,6 +202,78 @@ comp_d3d12_compositor_set_surround_2d_fence(struct xrt_compositor *xc,
                                               void *shared_fence_handle,
                                               uint64_t await_fence_value);
 
+/*
+ * XR_EXT_local_3d_zone — authored 2D/3D mask consumer, D3D12 leg.
+ * Contracts + porting reference (the shipped D3D11 consumer):
+ * docs/roadmap/unified-2d-3d-crossapi-impl.md §3.
+ *
+ * STUBS until the D3D12 consumer leg lands — all return
+ * XRT_ERROR_NOT_IMPLEMENTED and the oxr caps query reports
+ * supported = false for D3D12 sessions until then.
+ */
+
+/*!
+ * Create the compositor-side mask state (R8_UNORM resource, w×h client px).
+ *
+ * @ingroup comp_d3d12
+ */
+xrt_result_t
+comp_d3d12_compositor_zone_mask_create(struct xrt_compositor *xc,
+                                       uint32_t w, uint32_t h,
+                                       void **out_mask);
+
+/*!
+ * Tier 1 — fill the whole mask: all-3D (enable_3d) or all-2D.
+ *
+ * @ingroup comp_d3d12
+ */
+xrt_result_t
+comp_d3d12_compositor_zone_mask_set_whole(struct xrt_compositor *xc,
+                                          void *mask,
+                                          bool enable_3d);
+
+/*!
+ * Tier 2 — rasterize client-window-pixel rects as the 3D region.
+ *
+ * @ingroup comp_d3d12
+ */
+xrt_result_t
+comp_d3d12_compositor_zone_mask_set_rects(struct xrt_compositor *xc,
+                                          void *mask,
+                                          uint32_t count,
+                                          const struct xrt_rect *rects);
+
+/*!
+ * Tier 3 — hand back the ID3D12Resource* for freeform app drawing (the app
+ * creates its own RTV; same-queue submission order is the sync contract).
+ *
+ * @param out_resource Receives an ID3D12Resource* (as void*).
+ *
+ * @ingroup comp_d3d12
+ */
+xrt_result_t
+comp_d3d12_compositor_zone_mask_acquire_rt(struct xrt_compositor *xc,
+                                           void *mask,
+                                           void **out_resource,
+                                           uint32_t *out_w,
+                                           uint32_t *out_h);
+
+/*!
+ * Stage the mask's current contents for the next frame submission.
+ *
+ * @ingroup comp_d3d12
+ */
+xrt_result_t
+comp_d3d12_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask);
+
+/*!
+ * Destroy the compositor-side mask state.
+ *
+ * @ingroup comp_d3d12
+ */
+void
+comp_d3d12_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask);
+
 #ifdef __cplusplus
 }
 #endif
