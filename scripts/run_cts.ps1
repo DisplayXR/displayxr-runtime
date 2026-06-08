@@ -71,6 +71,10 @@ try {
   # FPS overlay) can crash the runtime's internal VK device. Neither is under test.
   $env:DISPLAYXR_MCP = "0"
   $env:VK_LOADER_LAYERS_DISABLE = "*"
+  # The CTS app has no window of its own, so the D3D11 native compositor
+  # self-creates one per session. Keep it windowed (not fullscreen) so a run
+  # doesn't repeatedly take over the display.
+  $env:XRT_COMPOSITOR_START_WINDOWED = "true"
 
   $cliArgs = @(
     $TestSpec, "-G", $Graphics, "--apiVersion", $ApiVersion,
