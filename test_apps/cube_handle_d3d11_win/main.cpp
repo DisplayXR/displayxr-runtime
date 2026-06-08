@@ -641,6 +641,16 @@ static void RenderOneFrame(RenderState& rs) {
                     XrView rawViews[8];
                     for (uint32_t vi = 0; vi < 8; vi++) rawViews[vi] = {XR_TYPE_VIEW};
 
+                    // XR_EXT_view_rig raw-channel verification (#396 W7): chain
+                    // XrViewDisplayRawEXT so the runtime reports the DP's full
+                    // per-view eye set. Logged once below to confirm
+                    // eyeCountOutput == viewCount with sane positions (esp. in
+                    // >2-view modes, where the DP — not the runtime — fills N).
+                    XrViewDisplayRawEXT rawProbe = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+                    if (g_hasViewRigExt) {
+                        viewState.next = &rawProbe;
+                    }
+
                     // XR_EXT_view_rig (#396 W7): drive the runtime rig matching
                     // the app's current mode (C selects the rig) with the app's
                     // tunables — the runtime owns the window/canvas resolve and
@@ -681,6 +691,21 @@ static void RenderOneFrame(RenderState& rs) {
                     }
 
                     xrLocateViews(xr.session, &locateInfo, &viewState, 8, &viewCount, rawViews);
+
+                    // XR_EXT_view_rig raw-channel verification (#396 W7): one-shot
+                    // proof the raw channel reports the DP's full per-view set.
+                    if (g_hasViewRigExt) {
+                        static int rawLogged = 0;
+                        if (rawLogged < 3) {
+                            rawLogged++;
+                            LOG_INFO("view-rig RAW: eyeCountOutput=%u viewCount=%u isTracking=%d",
+                                     rawProbe.eyeCountOutput, viewCount, (int)rawProbe.isTracking);
+                            for (uint32_t i = 0; i < rawProbe.eyeCountOutput && i < 8; i++) {
+                                LOG_INFO("  rawEyes[%u]=(%.4f,%.4f,%.4f)", i, rawProbe.rawEyes[i].x,
+                                         rawProbe.rawEyes[i].y, rawProbe.rawEyes[i].z);
+                            }
+                        }
+                    }
 
                     // Max per-tile capacity from swapchain
                     uint32_t maxTileW = tileColumns > 0 ? xr.swapchain.width / tileColumns : xr.swapchain.width;

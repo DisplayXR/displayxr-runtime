@@ -846,6 +846,16 @@ XrResult
 oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *sess, bool enable_3d);
 #endif
 
+#ifdef OXR_HAVE_EXT_view_rig
+/*!
+ * XR_EXT_view_rig (#396 W7): parse + clamp a workspace-controller rig override
+ * (NULL clears) and push it to the system compositor. Caller must already have
+ * verified the session is the active workspace controller.
+ */
+XrResult
+oxr_session_set_workspace_view_rig(struct oxr_logger *log, struct oxr_session *sess, const void *rig);
+#endif
+
 XRT_CHECK_RESULT XrResult
 oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess);
 

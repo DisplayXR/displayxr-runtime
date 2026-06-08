@@ -732,8 +732,9 @@ struct ipc_view_rig_info
 /*!
  * XR_EXT_view_rig over IPC (#396 W7): the XrViewDisplayRawEXT payload,
  * gathered service-side from the same inputs the server rig math consumes —
- * raw display-space eyes VERBATIM (pre window/canvas rebase, pre surplus
- * synthesis), the per-client effective canvas (window metrics after
+ * the DP's full per-view eye set VERBATIM (one eye per active view; the DP
+ * owns multi-view fill, the runtime never synthesizes), pre window/canvas
+ * rebase, the per-client effective canvas (window metrics after
  * u_canvas_apply_to_metrics), the display-plane pose, and the DP sample
  * timestamp / tracking lock.
  *

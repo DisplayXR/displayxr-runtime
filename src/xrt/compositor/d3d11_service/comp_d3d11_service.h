@@ -801,6 +801,23 @@ comp_d3d11_service_workspace_request_mode_flip(struct xrt_system_compositor *xsy
                                                uint32_t mode_index);
 
 /*!
+ * XR_EXT_view_rig (#396 W7): store / clear the workspace controller's imposed
+ * view rig. In workspace mode the workspace owns view geometry — a client's own
+ * chained rig is gated inert, and this override (applied in
+ * ipc_try_get_sr_view_poses) governs the app clients' locates. Pass a rig with
+ * type == XRT_VIEW_RIG_NONE, or @p rig == NULL, to clear. Returns true on success.
+ */
+bool
+comp_d3d11_service_set_workspace_view_rig(struct xrt_system_compositor *xsysc, const struct xrt_view_rig *rig);
+
+/*!
+ * XR_EXT_view_rig (#396 W7): read the current workspace view-rig override into
+ * @p out_rig (type == XRT_VIEW_RIG_NONE when none). Returns true on success.
+ */
+bool
+comp_d3d11_service_get_workspace_view_rig(struct xrt_system_compositor *xsysc, struct xrt_view_rig *out_rig);
+
+/*!
  * Force-reset the display to 3D on workspace activate (#234).
  *
  * Bypasses the acked-flip state machine's no-op guard so the DP gets

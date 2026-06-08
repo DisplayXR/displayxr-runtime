@@ -2695,6 +2695,43 @@ struct xrt_system_compositor_info
 struct xrt_system_compositor;
 
 /*!
+ * XR_EXT_view_rig (#396 W7): kind of view rig, for the workspace controller
+ * override carried over the @ref xrt_system_compositor vtable. Mirrors the
+ * oxr-side `enum oxr_view_rig_type` and the IPC `IPC_VIEW_RIG_*` wire enum.
+ */
+enum xrt_view_rig_type
+{
+	XRT_VIEW_RIG_NONE = 0,
+	XRT_VIEW_RIG_DISPLAY,
+	XRT_VIEW_RIG_CAMERA,
+};
+
+/*!
+ * XR_EXT_view_rig (#396 W7): a view-rig descriptor at the xrt boundary —
+ * post-clamp, post-boundary-conversion (convergenceDiopters →
+ * inv_convergence_distance, verticalFov → half_tan_vfov), i.e. exactly the
+ * shape the shared view math consumes. Used by the workspace controller to
+ * impose a rig on its app clients via @ref xrt_system_compositor::set_workspace_view_rig.
+ */
+struct xrt_view_rig
+{
+	enum xrt_view_rig_type type;
+	struct xrt_pose pose; //!< display-plane (display rig) or camera (camera rig) pose
+
+	// Display-rig tunables.
+	float virtual_display_height;
+	float perspective_factor;
+
+	// Camera-rig tunables.
+	float inv_convergence_distance;
+	float half_tan_vfov;
+
+	// Shared tunables.
+	float ipd_factor;
+	float parallax_factor;
+};
+
+/*!
  * @interface xrt_multi_compositor_control
  * Special functions to control multi session/clients.
  * Effectively an optional aspect of @ref xrt_system_compositor
@@ -2815,6 +2852,21 @@ struct xrt_system_compositor
 	 * legacy immediate flip); false to fall back.
 	 */
 	bool (*request_workspace_mode_flip)(struct xrt_system_compositor *xsc, uint32_t mode_index);
+
+	/*!
+	 * Optional. XR_EXT_view_rig (#396 W7): workspace controller's request to
+	 * impose a view rig on its app clients. By default an app's own rig is
+	 * honored within its canvas; this hook lets the controller take over view
+	 * geometry server-side (the override substitutes for the app's forwarded
+	 * rig on non-controller locates). Pass a rig with
+	 * `type == XRT_VIEW_RIG_NONE` (or @p rig == NULL) to clear the override.
+	 * NULL on backends without multi-compositor support.
+	 *
+	 * Set by `comp_d3d11_service` during system compositor creation. Called
+	 * from `oxr_xrSetWorkspaceViewRigEXT` when the calling session is the
+	 * active workspace controller. Returns true if accepted.
+	 */
+	bool (*set_workspace_view_rig)(struct xrt_system_compositor *xsc, const struct xrt_view_rig *rig);
 };
 
 /*!

@@ -790,6 +790,9 @@ oxr_xrEnumerateDisplayRenderingModesEXT(XrSession session,
                                         uint32_t modeCapacityInput,
                                         uint32_t *modeCountOutput,
                                         XrDisplayRenderingModeInfoEXT *modes);
+//! OpenXR API function @ep{xrSetWorkspaceViewRigEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceViewRigEXT(XrSession session, const void *rig);
 
 #endif
 
