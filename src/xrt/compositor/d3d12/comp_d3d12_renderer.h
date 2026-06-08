@@ -245,6 +245,45 @@ comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
                                         uint32_t ch);
 
 /*!
+ * Flatten one Local2D layer into the scratch RTV (#439 Phase 3, the `twod`
+ * source for comp_d3d12_renderer_composite_2d_masked). Records a
+ * fullscreen-triangle draw into @p cmd_list whose viewport is the clipped dest
+ * sub-rect, sampling the source image through src_rect (flip_y via negative
+ * src_h). Premultiplied vs straight "over" is chosen by @p unpremultiplied.
+ *
+ * The caller has transitioned the scratch to RENDER_TARGET and cleared it; this
+ * function transitions the source image RENDER_TARGET<->PIXEL_SHADER_RESOURCE
+ * around its own draw. Each call needs a distinct @p slot_index (D3D12 consumes
+ * descriptors at GPU-execute time).
+ *
+ * @param renderer The renderer.
+ * @param cmd_list Open D3D12 command list (void* = ID3D12GraphicsCommandList*).
+ * @param scratch_rtv_handle CPU RTV handle of the Local2D scratch (R8G8B8A8_UNORM).
+ * @param src_resource The layer's swapchain image (ID3D12Resource*).
+ * @param slot_index Unique flatten-heap SRV slot for this draw (< XRT_MAX_LAYERS).
+ * @param dst_x,dst_y,dst_w,dst_h Clipped dest sub-rect (viewport) in pixels.
+ * @param src_x,src_y,src_w,src_h Source rect (normalized; src_h < 0 => flip_y).
+ * @param unpremultiplied True for straight-alpha layers (XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT).
+ *
+ * @ingroup comp_d3d12
+ */
+xrt_result_t
+comp_d3d12_renderer_flatten_local_2d(struct comp_d3d12_renderer *renderer,
+                                     void *cmd_list,
+                                     uint64_t scratch_rtv_handle,
+                                     void *src_resource,
+                                     uint32_t slot_index,
+                                     int32_t dst_x,
+                                     int32_t dst_y,
+                                     uint32_t dst_w,
+                                     uint32_t dst_h,
+                                     float src_x,
+                                     float src_y,
+                                     float src_w,
+                                     float src_h,
+                                     bool unpremultiplied);
+
+/*!
  * Resize the renderer's atlas texture to match a new view size.
  *
  * Recreates the atlas texture, RTV, and SRV at the new dimensions.

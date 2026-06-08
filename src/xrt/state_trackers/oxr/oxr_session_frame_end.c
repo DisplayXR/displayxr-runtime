@@ -40,6 +40,10 @@
 #include "d3d11/comp_d3d11_compositor.h"
 #endif
 
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+#include "d3d12/comp_d3d12_compositor.h"
+#endif
+
 #ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
 #include "metal/comp_metal_compositor.h"
 #endif
@@ -2143,6 +2147,12 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 		if (sess->is_d3d11_native_compositor) {
 			have_dims =
 			    comp_d3d11_compositor_get_recommended_view_size(&sess->xcn->base, &view_w, &view_h);
+		}
+#endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+		if (sess->is_d3d12_native_compositor) {
+			have_dims =
+			    comp_d3d12_compositor_get_recommended_view_size(&sess->xcn->base, &view_w, &view_h);
 		}
 #endif
 #ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR

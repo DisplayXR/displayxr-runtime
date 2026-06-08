@@ -231,6 +231,33 @@ struct CompositeParams
 	uint32_t _pad;
 };
 
+// #439 Phase 3 — Local2D flatten. Reuses the masked_composite fullscreen-triangle
+// VS (uv 0..1 over the viewport); the PS samples the source image through
+// src_rect (origin + size; size.y < 0 => flip_y). Premultiplied vs straight
+// "over" is the PSO blend state, not the shader. Byte-aligned with the D3D11
+// local2d_flatten reference (comp_d3d11_renderer.cpp).
+static const char *local2d_flatten_ps_source = R"(
+Texture2D src_tex : register(t0);
+SamplerState samp : register(s0);
+
+cbuffer FlattenParams : register(b0)
+{
+    float4 src_rect; // xy = origin (norm), zw = size (norm; zw.y < 0 => flip_y)
+};
+
+struct VS_OUTPUT
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+float4 PSMain(VS_OUTPUT input) : SV_Target
+{
+    float2 src_uv = src_rect.xy + input.uv * src_rect.zw;
+    return src_tex.Sample(samp, src_uv);
+}
+)";
+
 /*!
  * D3D12 renderer structure.
  */
@@ -285,6 +312,18 @@ struct comp_d3d12_renderer
 	//! (t0 = 2D surround, t1 = authored mask, t2 = weave snapshot).
 	//! SRVs are written fresh on every composite call.
 	ID3D12DescriptorHeap *composite_srv_heap;
+
+	//! #439 Phase 3 — Local2D flatten pipeline. Each Local2D layer is drawn
+	//! into a runtime scratch with premultiplied (or straight) "over"; the
+	//! masked composite then lerps that scratch under the weave. Reuses the
+	//! masked_composite VS; the PS samples through src_rect.
+	ID3D12RootSignature *flatten_root_signature;
+	ID3D12PipelineState *flatten_pso_premul;   // SrcBlend = ONE
+	ID3D12PipelineState *flatten_pso_straight; // SrcBlend = SRC_ALPHA
+	//! Shader-visible SRV heap for flatten source images — one slot per layer
+	//! draw (D3D12 consumes descriptors at GPU-execute time, so concurrent
+	//! draws in one cmd-list each need their own slot). Written fresh / frame.
+	ID3D12DescriptorHeap *flatten_srv_heap;
 
 	//! Descriptor sizes.
 	uint32_t rtv_descriptor_size;
@@ -1070,6 +1109,136 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 		return XRT_ERROR_D3D;
 	}
 
+	// --- #439 Phase 3: Local2D flatten root signature (SRV table of 1 [t0
+	// source] + 4 root constants [src_rect, b0] + static LINEAR sampler —
+	// linear matches the D3D11 flatten's bilinear sub-rect sampling). ---
+	D3D12_DESCRIPTOR_RANGE flat_srv_range = {};
+	flat_srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+	flat_srv_range.NumDescriptors = 1;
+	flat_srv_range.BaseShaderRegister = 0;
+	flat_srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+	D3D12_ROOT_PARAMETER flat_root_params[2] = {};
+	flat_root_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	flat_root_params[0].DescriptorTable.NumDescriptorRanges = 1;
+	flat_root_params[0].DescriptorTable.pDescriptorRanges = &flat_srv_range;
+	flat_root_params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	flat_root_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+	flat_root_params[1].Constants.ShaderRegister = 0;
+	flat_root_params[1].Constants.RegisterSpace = 0;
+	flat_root_params[1].Constants.Num32BitValues = 4; // src_rect float4
+	flat_root_params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+	D3D12_STATIC_SAMPLER_DESC flat_sampler = {};
+	flat_sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+	flat_sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	flat_sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	flat_sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	flat_sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+	flat_sampler.MaxLOD = D3D12_FLOAT32_MAX;
+	flat_sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+	D3D12_ROOT_SIGNATURE_DESC flat_rs_desc = {};
+	flat_rs_desc.NumParameters = 2;
+	flat_rs_desc.pParameters = flat_root_params;
+	flat_rs_desc.NumStaticSamplers = 1;
+	flat_rs_desc.pStaticSamplers = &flat_sampler;
+	flat_rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+	sig_blob = nullptr;
+	error_blob = nullptr;
+	hr = D3D12SerializeRootSignature(&flat_rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &sig_blob, &error_blob);
+	if (FAILED(hr)) {
+		if (error_blob != nullptr) {
+			U_LOG_E("Flatten root signature serialize error: %s",
+			        static_cast<const char *>(error_blob->GetBufferPointer()));
+			error_blob->Release();
+		}
+		comp_d3d12_renderer_destroy(&r);
+		return XRT_ERROR_D3D;
+	}
+	hr = device->CreateRootSignature(0, sig_blob->GetBufferPointer(), sig_blob->GetBufferSize(),
+	                                  __uuidof(ID3D12RootSignature),
+	                                  reinterpret_cast<void **>(&r->flatten_root_signature));
+	sig_blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create flatten root signature: 0x%08x", hr);
+		comp_d3d12_renderer_destroy(&r);
+		return XRT_ERROR_D3D;
+	}
+
+	// Flatten PSOs: shared masked_composite VS + local2d_flatten PS. The
+	// scratch is always R8G8B8A8_UNORM (the masked composite is channel-
+	// agnostic), so one RTV format covers both blend variants.
+	ID3DBlob *flat_vs_blob = nullptr;
+	ID3DBlob *flat_ps_blob = nullptr;
+	hr = compile_shader(masked_composite_vs_source, "VSMain", "vs_5_0", &flat_vs_blob);
+	if (FAILED(hr)) {
+		comp_d3d12_renderer_destroy(&r);
+		return XRT_ERROR_D3D;
+	}
+	hr = compile_shader(local2d_flatten_ps_source, "PSMain", "ps_5_0", &flat_ps_blob);
+	if (FAILED(hr)) {
+		flat_vs_blob->Release();
+		comp_d3d12_renderer_destroy(&r);
+		return XRT_ERROR_D3D;
+	}
+
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC flat_pso_desc = {};
+	flat_pso_desc.pRootSignature = r->flatten_root_signature;
+	flat_pso_desc.VS.pShaderBytecode = flat_vs_blob->GetBufferPointer();
+	flat_pso_desc.VS.BytecodeLength = flat_vs_blob->GetBufferSize();
+	flat_pso_desc.PS.pShaderBytecode = flat_ps_blob->GetBufferPointer();
+	flat_pso_desc.PS.BytecodeLength = flat_ps_blob->GetBufferSize();
+	// Straight-alpha "over": SrcBlend = SRC_ALPHA. Alpha channel composes
+	// Porter-Duff over (SrcAlpha = ONE, DestAlpha = INV_SRC_ALPHA) so stacked
+	// layers accumulate coverage.
+	flat_pso_desc.BlendState.RenderTarget[0].BlendEnable = TRUE;
+	flat_pso_desc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+	flat_pso_desc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+	flat_pso_desc.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+	flat_pso_desc.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+	flat_pso_desc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+	flat_pso_desc.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+	flat_pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+	flat_pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+	flat_pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+	flat_pso_desc.RasterizerState.DepthClipEnable = TRUE;
+	flat_pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+	flat_pso_desc.NumRenderTargets = 1;
+	flat_pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+	flat_pso_desc.SampleDesc.Count = 1;
+	flat_pso_desc.SampleMask = UINT_MAX;
+
+	hr = device->CreateGraphicsPipelineState(&flat_pso_desc, __uuidof(ID3D12PipelineState),
+	                                          reinterpret_cast<void **>(&r->flatten_pso_straight));
+	if (SUCCEEDED(hr)) {
+		// Premultiplied "over": SrcBlend = ONE (the default for Local2D).
+		flat_pso_desc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+		hr = device->CreateGraphicsPipelineState(&flat_pso_desc, __uuidof(ID3D12PipelineState),
+		                                          reinterpret_cast<void **>(&r->flatten_pso_premul));
+	}
+	flat_vs_blob->Release();
+	flat_ps_blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create flatten PSO: 0x%08x", hr);
+		comp_d3d12_renderer_destroy(&r);
+		return XRT_ERROR_D3D;
+	}
+
+	// Shader-visible heap for flatten source SRVs — one slot per Local2D layer.
+	D3D12_DESCRIPTOR_HEAP_DESC flat_heap_desc = {};
+	flat_heap_desc.NumDescriptors = XRT_MAX_LAYERS;
+	flat_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+	flat_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+	hr = device->CreateDescriptorHeap(
+	    &flat_heap_desc, __uuidof(ID3D12DescriptorHeap), reinterpret_cast<void **>(&r->flatten_srv_heap));
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create flatten SRV heap: 0x%08x", hr);
+		comp_d3d12_renderer_destroy(&r);
+		return XRT_ERROR_D3D;
+	}
+
 	*out_renderer = r;
 
 	U_LOG_I("Created D3D12 renderer: %ux%u per view, atlas %ux%u (%u cols x %u rows), texture_h=%u",
@@ -1090,6 +1259,18 @@ comp_d3d12_renderer_destroy(struct comp_d3d12_renderer **renderer_ptr)
 
 	comp_d3d12_renderer *r = *renderer_ptr;
 
+	if (r->flatten_srv_heap != nullptr) {
+		r->flatten_srv_heap->Release();
+	}
+	if (r->flatten_pso_premul != nullptr) {
+		r->flatten_pso_premul->Release();
+	}
+	if (r->flatten_pso_straight != nullptr) {
+		r->flatten_pso_straight->Release();
+	}
+	if (r->flatten_root_signature != nullptr) {
+		r->flatten_root_signature->Release();
+	}
 	if (r->composite_srv_heap != nullptr) {
 		r->composite_srv_heap->Release();
 	}
@@ -1644,6 +1825,106 @@ comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
 	cmd_list->SetGraphicsRootDescriptorTable(0, renderer->composite_srv_heap->GetGPUDescriptorHandleForHeapStart());
 	cmd_list->SetGraphicsRoot32BitConstants(1, 8, &params, 0);
 	cmd_list->DrawInstanced(3, 1, 0, 0);
+
+	return XRT_SUCCESS;
+}
+
+// #439 Phase 3 — flatten one Local2D layer into the scratch RTV (the `twod`
+// source the masked composite reads). Records into the OPEN cmd-list mid-frame;
+// the caller has already bound nothing (we set our own RTV) and transitioned
+// the scratch to RENDER_TARGET + cleared it. Ported from the D3D11
+// comp_d3d11_renderer_flatten_local_2d: a fullscreen triangle whose viewport
+// is the clipped dest sub-rect, sampling the source through src_rect (with
+// flip_y via a negative src_h). Premultiplied vs straight "over" is the PSO.
+//
+// slot_index gives this draw its own flatten_srv_heap slot — D3D12 consumes
+// descriptors at GPU-execute time, so concurrent draws can't share one slot.
+// The source image is transitioned RENDER_TARGET<->PIXEL_SHADER_RESOURCE around
+// the draw, the same steady-state convention render_window_space_layer uses for
+// app color swapchains.
+extern "C" xrt_result_t
+comp_d3d12_renderer_flatten_local_2d(struct comp_d3d12_renderer *renderer,
+                                     void *cmd_list_ptr,
+                                     uint64_t scratch_rtv_handle,
+                                     void *src_resource,
+                                     uint32_t slot_index,
+                                     int32_t dst_x,
+                                     int32_t dst_y,
+                                     uint32_t dst_w,
+                                     uint32_t dst_h,
+                                     float src_x,
+                                     float src_y,
+                                     float src_w,
+                                     float src_h,
+                                     bool unpremultiplied)
+{
+	if (renderer == nullptr || cmd_list_ptr == nullptr || scratch_rtv_handle == 0 || src_resource == nullptr) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	if (slot_index >= XRT_MAX_LAYERS) {
+		U_LOG_E("D3D12 flatten: SRV slot %u >= %u", slot_index, (uint32_t)XRT_MAX_LAYERS);
+		return XRT_ERROR_D3D;
+	}
+
+	auto internals = get_internals(renderer->c);
+	ID3D12Device *device = internals->device;
+	auto *cmd_list = static_cast<ID3D12GraphicsCommandList *>(cmd_list_ptr);
+	auto *src = static_cast<ID3D12Resource *>(src_resource);
+
+	// Source image → sampleable. Sample app color swapchains as their UNORM
+	// sibling (no implicit sRGB decode — the DP wants display-referred bytes).
+	D3D12_RESOURCE_BARRIER src_barrier = {};
+	src_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	src_barrier.Transition.pResource = src;
+	src_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	src_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	cmd_list->ResourceBarrier(1, &src_barrier);
+
+	D3D12_RESOURCE_DESC rd = src->GetDesc();
+	D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+	srv_desc.Format = d3d_dxgi_format_to_unorm_sample(rd.Format);
+	srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	srv_desc.Texture2D.MipLevels = 1;
+	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = renderer->flatten_srv_heap->GetCPUDescriptorHandleForHeapStart();
+	srv_cpu.ptr += renderer->srv_descriptor_size * slot_index;
+	device->CreateShaderResourceView(src, &srv_desc, srv_cpu);
+
+	cmd_list->SetDescriptorHeaps(1, &renderer->flatten_srv_heap);
+	cmd_list->SetGraphicsRootSignature(renderer->flatten_root_signature);
+	cmd_list->SetPipelineState(unpremultiplied ? renderer->flatten_pso_straight : renderer->flatten_pso_premul);
+
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv = {};
+	rtv.ptr = static_cast<SIZE_T>(scratch_rtv_handle);
+	cmd_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+
+	// Viewport = clipped dest sub-rect; the fullscreen triangle's uv [0,1]
+	// spans it, mapping through src_rect into the source image.
+	D3D12_VIEWPORT vp = {};
+	vp.TopLeftX = static_cast<float>(dst_x);
+	vp.TopLeftY = static_cast<float>(dst_y);
+	vp.Width = static_cast<float>(dst_w);
+	vp.Height = static_cast<float>(dst_h);
+	vp.MaxDepth = 1.0f;
+	cmd_list->RSSetViewports(1, &vp);
+	D3D12_RECT scissor = {dst_x, dst_y, dst_x + (int32_t)dst_w, dst_y + (int32_t)dst_h};
+	cmd_list->RSSetScissorRects(1, &scissor);
+
+	float src_rect[4] = {src_x, src_y, src_w, src_h};
+	cmd_list->SetGraphicsRoot32BitConstants(1, 4, src_rect, 0);
+
+	D3D12_GPU_DESCRIPTOR_HANDLE gpu_srv = renderer->flatten_srv_heap->GetGPUDescriptorHandleForHeapStart();
+	gpu_srv.ptr += renderer->srv_descriptor_size * slot_index;
+	cmd_list->SetGraphicsRootDescriptorTable(0, gpu_srv);
+
+	cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	cmd_list->DrawInstanced(3, 1, 0, 0);
+
+	// Source back to its steady RENDER_TARGET state.
+	src_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	cmd_list->ResourceBarrier(1, &src_barrier);
 
 	return XRT_SUCCESS;
 }

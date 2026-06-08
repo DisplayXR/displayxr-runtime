@@ -270,6 +270,16 @@ comp_d3d12_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask);
 void
 comp_d3d12_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask);
 
+/*!
+ * Current recommended per-view render size (#439 Phase 3 Q4). Polled at frame
+ * end so oxr can fire XrEventDataLocal3DZoneViewSizeChangedEXT when a mask /
+ * Local2D activation or window resize changes it. Returns false if unavailable.
+ *
+ * @ingroup comp_d3d12
+ */
+bool
+comp_d3d12_compositor_get_recommended_view_size(struct xrt_compositor *xc, uint32_t *out_w, uint32_t *out_h);
+
 #ifdef __cplusplus
 }
 #endif
