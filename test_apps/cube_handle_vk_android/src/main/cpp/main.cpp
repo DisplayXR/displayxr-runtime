@@ -1203,6 +1203,7 @@ hud_glyph(char ch, uint8_t rows[5])
 	case '8': set(0b111,0b101,0b111,0b101,0b111); break;
 	case '9': set(0b111,0b101,0b111,0b001,0b111); break;
 	case '-': set(0b000,0b000,0b111,0b000,0b000); break;
+	case '+': set(0b000,0b010,0b111,0b010,0b000); break;
 	case '.': set(0b000,0b000,0b000,0b000,0b010); break;
 	case ':': set(0b000,0b010,0b000,0b010,0b000); break;
 	case 'B': set(0b110,0b101,0b110,0b101,0b110); break;
@@ -1266,7 +1267,7 @@ hud_ftoa(float val, char *buf, size_t cap)
 	int whole = (int)a;
 	int frac = (int)((a - (float)whole) * 100.0f + 0.5f);
 	if (frac >= 100) { whole += 1; frac -= 100; }
-	snprintf(buf, cap, "%s%d.%02d", neg ? "-" : "", whole, frac);
+	snprintf(buf, cap, "%s%d.%02d", neg ? "-" : "+", whole, frac);
 }
 
 // Build the HUD geometry into the mapped buffer. Returns the vertex count.
@@ -1276,16 +1277,9 @@ build_hud(CubeVertex *v)
 	uint32_t n = 0;
 	const float px = 0.016f, py = 0.026f;  // glyph pixel size in NDC
 	const float white[3] = {1.0f, 1.0f, 1.0f};
-	const float on[3]  = {0.20f, 0.85f, 0.30f};  // green = background ON
-	const float off[3] = {0.30f, 0.30f, 0.30f};  // gray  = background OFF
 
-	// Background-state button (top-left): filled rect + "BG" label. Tapping
-	// anywhere toggles it (handle_input); the color reflects the live state.
-	const bool bg = g_bg_enabled.load(std::memory_order_relaxed);
-	n = hud_quad(v, n, -0.98f, -0.97f, -0.86f, -0.86f, 0.06f, bg ? on : off);
-	n = hud_text(v, n, "BG", -0.965f, -0.955f, px, py, 0.04f, white);
-
-	// Eye-position readout below the button.
+	// Eye-position readout (BG toggle button removed; background is always
+	// clean black now). oy=-0.80 with the HUD's vflip lands it at the TOP edge.
 	char xs[16], ys[16], zs[16], line[64];
 	hud_ftoa(g_eye_x.load(std::memory_order_relaxed), xs, sizeof xs);
 	hud_ftoa(g_eye_y.load(std::memory_order_relaxed), ys, sizeof ys);
@@ -1582,22 +1576,10 @@ record_draw(uint32_t view_idx, uint32_t image_idx, const XrView &view)
 	// or the Kotlin overlay). Default OFF → black in both eyes so the weave/3D
 	// is judged against a clean black field. When ON, the per-eye red/blue
 	// tint aids calibration test 2 (one-eye-covered tile-mapping check).
-	// Background state: tap toggles g_bg_enabled, but a setprop override wins
-	// when set (-1 = unset → use the tap state). Lets me force it via adb:
-	//   adb shell setprop debug.dxr.bg 1   (per-eye red/blue 3D-on check)
-	const float bg_prop = get_prop_float("debug.dxr.bg", -1.0f);
-	if (bg_prop >= 0.0f) {
-		g_bg_enabled.store(bg_prop != 0.0f, std::memory_order_relaxed);
-	}
-	const bool bg_on = g_bg_enabled.load(std::memory_order_relaxed);
+	// Clean black background on both eye tiles (LOAD_OP_CLEAR to black). The
+	// per-eye red/blue 3D-check tint and the on-screen BG toggle were removed
+	// for a clean display.
 	VkClearValue clears[2] = {};
-	if (bg_on) {
-		// Left eye (tile 0) reddish, right eye (tile 1) bluish — distinct per
-		// eye so 3D-on is verifiable: cover one eye → red, the other → blue.
-		clears[0].color.float32[0] = (view_idx == 0) ? 0.6f : 0.0f;
-		clears[0].color.float32[1] = 0.05f;
-		clears[0].color.float32[2] = (view_idx == 0) ? 0.0f : 0.6f;
-	}
 	clears[0].color.float32[3] = 1.0f;
 	clears[1].depthStencil.depth = 1.0f;
 
@@ -1684,23 +1666,19 @@ record_draw(uint32_t view_idx, uint32_t image_idx, const XrView &view)
 			//   debug.dxr.hud_rot 0|1|2|3, hud_hflip, hud_vflip
 			const float rot_prop = get_prop_float("debug.dxr.hud_rot", -1.0f);
 			const float hflip_prop = get_prop_float("debug.dxr.hud_hflip", -1.0f);
-			// Counter-rotate the HUD by the live display rotation so it stays
-			// upright in all 4 orientations. (4 - disp_rot) % 4 in the rot's
-			// 90°-CCW units; the sign is verified by screenshot per rotation.
-			// Calibrated per display rotation (with vflip on): rot = disp_rot.
-			// Verified upright via screenshot at disp_rot=0 (portrait, rot=0) and
-			// disp_rot=1 (landscape ROTATION_90, rot=1). The other two follow the
-			// same +90°-per-step rule.
+			// HUD orientation. Only change from the original {0,1,2,3} table is
+			// the two landscape entries (1→0, 3→2): with the preTransform=IDENTITY
+			// weave (LOXR-730/733) landscape no longer needs the 90° counter-rotate.
+			// vflip stays ON (the weave flips vertically; verified rot=0/vflip=1
+			// reads upright in landscape and portrait).
 			//   disp_rot: 0(port) 1(land) 2(rev-port) 3(rev-land)
-			//   hud_rot:   0       1       2           3
-			static const int kHudRotForDisp[4] = {0, 1, 2, 3};
+			//   hud_rot:   0       0       2           2
+			static const int kHudRotForDisp[4] = {0, 0, 2, 2};
 			const int disp_rot_h = g_display_rotation.load(std::memory_order_relaxed) & 3;
 			const int rot = ((rot_prop >= 0.0f) ? (int)rot_prop : kHudRotForDisp[disp_rot_h]) & 3;
 			const bool hflip = (hflip_prop >= 0.0f) ? (hflip_prop != 0.0f) : false;
-			// vflip defaults ON: the tile->panel weave flips vertically, so the
-			// HUD needs a vertical flip to read upright (verified at disp_rot 0
-			// and 1). -1 is the "use derived" sentinel (=> default true); only an
-			// explicit 0 turns it off.
+			// vflip defaults ON (the tile->panel weave flips vertically); setprop
+			// debug.dxr.hud_vflip (>=0) overrides.
 			const float vflip_prop = get_prop_float("debug.dxr.hud_vflip", -1.0f);
 			const bool vflip = (vflip_prop >= 0.0f) ? (vflip_prop != 0.0f) : true;
 			static int huddbg = 0;
