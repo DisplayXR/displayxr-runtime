@@ -210,11 +210,42 @@ static const char *FS_TEXTURED =
     "    fragColor = texture(u_texture, uv);\n"
     "}\n";
 
+//! Fragment shader: masked 2D-over-3D composite (#439 Phase 3 GL leg).
+//! final = M*weave + (1-M)*twod, per-channel — the same hard-mask composite
+//! the D3D11/D3D12/VK/Metal legs ship (parity; the translucent redesign is
+//! #491). All three sources are window-resolution textures in the same GL
+//! framebuffer orientation, sampled 1:1 by the fullscreen triangle.
+static const char *FS_MASKED_COMPOSITE =
+    "#version 330 core\n"
+    "in vec2 v_uv;\n"
+    "out vec4 fragColor;\n"
+    "uniform sampler2D u_twod;\n"
+    "uniform sampler2D u_mask;\n"
+    "uniform sampler2D u_weave;\n"
+    "void main() {\n"
+    "    float M = clamp(texture(u_mask, v_uv).r, 0.0, 1.0);\n"
+    "    vec4 twod  = texture(u_twod,  v_uv);\n"
+    "    vec4 weave = texture(u_weave, v_uv);\n"
+    "    fragColor = M * weave + (1.0 - M) * twod;\n"
+    "}\n";
+
 /*
  *
  * GL compositor structure
  *
  */
+
+// #439 Phase 3 — authored zone mask (XR_EXT_local_3d_zone), GL R8 texture.
+// In-process handle apps author it on the same GL context the composite
+// samples from, frame-serialized, so a single texture (no staged copy) is
+// coherent. Tier-3 acquire_rt is unimplemented on GL (chroma-key-only DP).
+struct comp_gl_zone_mask
+{
+	GLuint tex;  //!< R8 mask, M in [0,1] (1 = 3D / keep weave).
+	GLuint fbo;  //!< Framebuffer over tex for the Tier-1/2 scissored clears.
+	uint32_t w, h;
+	bool submitted; //!< True once submitted at least once (else invisible).
+};
 
 struct comp_gl_compositor
 {
@@ -311,6 +342,29 @@ struct comp_gl_compositor
 
 	//! 2D surround texture handle (Spec v6).
 	struct u_surround_2d_handle surround_2d;
+
+	// --- #439 Phase 3 — Local2D / zone-mask consumer (full net-new GL leg) ---
+	//! Active authored zone mask (XR_EXT_local_3d_zone). Set by zone_mask_submit
+	//! (sticky, last-submit-wins), cleared on that mask's destroy. NOT owned.
+	struct comp_gl_zone_mask *active_zone_mask;
+	//! True if this frame's accumulator carried any XRT_LAYER_LOCAL_2D layer
+	//! (set once at the top of layer_commit). Drives the effective-canvas
+	//! supersede + the composite's have_local_2d branch.
+	bool local_2d_last_frame;
+	//! Masked-composite program (FS_MASKED_COMPOSITE + VS_FULLSCREEN_QUAD).
+	GLuint program_masked_composite;
+	//! Post-weave composite scratch. weave_tex receives the DP weave (the DP
+	//! is redirected to it when the consumer is active); local2d_scratch holds
+	//! the flattened Local2D layers; implicit_mask is the R8 mask rasterized
+	//! from the layer rects. Each has its own FBO. Lazily (re)allocated at the
+	//! window region dims; the composite lerps them into the window.
+	GLuint weave_tex, weave_fbo;
+	GLuint local2d_scratch_tex, local2d_scratch_fbo;
+	GLuint implicit_mask_tex, implicit_mask_fbo;
+	uint32_t composite_scratch_w, composite_scratch_h; // weave + local2d dims
+	uint32_t implicit_mask_w, implicit_mask_h;
+	uint32_t implicit_rect_count;
+	struct xrt_rect implicit_rects[XRT_MAX_LAYERS];
 
 	//! MCP capture_frame request box (serviced at end of layer_commit).
 	struct mcp_capture_request mcp_capture;
@@ -1096,6 +1150,391 @@ gl_crop_and_process_dp(struct comp_gl_compositor *c,
 
 /*
  *
+ * #439 Phase 3 — Local2D / masked 2D-over-3D composite (GL leg).
+ *
+ * Parity with the D3D11/D3D12/VK/Metal legs: final = M*weave + (1-M)*twod, a
+ * hard-mask composite (the translucent redesign is #491). The GL Leia DP weaves
+ * into a bound framebuffer, so when the consumer is active we redirect the
+ * weave into a texture (weave_tex), flatten the Local2D layers into
+ * local2d_scratch, rasterize/sample the mask, then lerp the three into the
+ * window. GL framebuffers are bottom-left origin; the mask raster + the flatten
+ * both flip Y from the app's top-left window pixels so they align with the
+ * weave when the composite samples all three 1:1.
+ *
+ */
+
+// (Re)allocate an RGBA8 color texture + its FBO at w×h (no-op if matching).
+static bool
+gl_ensure_color_tex_fbo(GLuint *tex, GLuint *fbo, uint32_t *cur_w, uint32_t *cur_h, uint32_t w, uint32_t h)
+{
+	if (*tex != 0 && *cur_w == w && *cur_h == h) {
+		return true;
+	}
+	if (*tex != 0) {
+		glDeleteTextures(1, tex);
+		*tex = 0;
+	}
+	if (*fbo == 0) {
+		glGenFramebuffers(1, fbo);
+	}
+	glGenTextures(1, tex);
+	glBindTexture(GL_TEXTURE_2D, *tex);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	glBindFramebuffer(GL_FRAMEBUFFER, *fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, *tex, 0);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	*cur_w = w;
+	*cur_h = h;
+	return true;
+}
+
+// #439 Phase 3 — (re)rasterize the IMPLICIT R8 zone mask from the frame's
+// Local2D rects: M=1 (keep weave) everywhere, M=0 (show 2D) inside each rect
+// (the inverse of an authored set_rects mask). GL scissor clears = the analog
+// of D3D11 ClearView-rects / VK vkCmdClearAttachments. Rects are window pixels
+// (top-left); flip Y for the bottom-left GL framebuffer. Dirty-checked. Returns
+// the mask texture, or 0 on failure.
+static GLuint
+gl_update_implicit_mask(struct comp_gl_compositor *c,
+                        const struct xrt_rect *rects,
+                        uint32_t rect_count,
+                        uint32_t w,
+                        uint32_t h)
+{
+	if (w == 0 || h == 0 || rect_count == 0) {
+		return 0;
+	}
+
+	bool dirty = c->implicit_mask_tex == 0 || c->implicit_mask_w != w || c->implicit_mask_h != h ||
+	             c->implicit_rect_count != rect_count;
+	for (uint32_t i = 0; !dirty && i < rect_count; i++) {
+		if (memcmp(&c->implicit_rects[i], &rects[i], sizeof(rects[i])) != 0) {
+			dirty = true;
+		}
+	}
+	if (!dirty) {
+		return c->implicit_mask_tex;
+	}
+
+	if (c->implicit_mask_tex == 0 || c->implicit_mask_w != w || c->implicit_mask_h != h) {
+		if (c->implicit_mask_tex != 0) {
+			glDeleteTextures(1, &c->implicit_mask_tex);
+			c->implicit_mask_tex = 0;
+		}
+		if (c->implicit_mask_fbo == 0) {
+			glGenFramebuffers(1, &c->implicit_mask_fbo);
+		}
+		glGenTextures(1, &c->implicit_mask_tex);
+		glBindTexture(GL_TEXTURE_2D, c->implicit_mask_tex);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, w, h, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glBindTexture(GL_TEXTURE_2D, 0);
+		glBindFramebuffer(GL_FRAMEBUFFER, c->implicit_mask_fbo);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, c->implicit_mask_tex, 0);
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		c->implicit_mask_w = w;
+		c->implicit_mask_h = h;
+	}
+
+	glBindFramebuffer(GL_FRAMEBUFFER, c->implicit_mask_fbo);
+	glViewport(0, 0, w, h);
+	glDisable(GL_SCISSOR_TEST);
+	glClearColor(1.0f, 0.0f, 0.0f, 0.0f); // M=1 everywhere (keep weave)
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	glEnable(GL_SCISSOR_TEST);
+	glClearColor(0.0f, 0.0f, 0.0f, 0.0f); // M=0 inside the layer rects (show 2D)
+	for (uint32_t i = 0; i < rect_count; i++) {
+		int32_t left = rects[i].offset.w;
+		int32_t top = rects[i].offset.h;
+		int32_t rw = rects[i].extent.w;
+		int32_t rh = rects[i].extent.h;
+		if (rw <= 0 || rh <= 0) {
+			continue;
+		}
+		if (left < 0) {
+			rw += left;
+			left = 0;
+		}
+		if (top < 0) {
+			rh += top;
+			top = 0;
+		}
+		if (left + rw > (int32_t)w) {
+			rw = (int32_t)w - left;
+		}
+		if (top + rh > (int32_t)h) {
+			rh = (int32_t)h - top;
+		}
+		if (rw <= 0 || rh <= 0) {
+			continue;
+		}
+		// Flip Y: window top-left → GL bottom-left framebuffer.
+		int32_t gl_y = (int32_t)h - (top + rh);
+		glScissor(left, gl_y, rw, rh);
+		glClear(GL_COLOR_BUFFER_BIT);
+	}
+	glDisable(GL_SCISSOR_TEST);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+	memcpy(c->implicit_rects, rects, sizeof(rects[0]) * rect_count);
+	c->implicit_rect_count = rect_count;
+	U_LOG_W("implicit zone mask: %ux%u, %u Local2D rect(s)", w, h, rect_count);
+	return c->implicit_mask_tex;
+}
+
+// #439 Phase 3 — flatten this frame's Local2D layers into local2d_scratch (the
+// `twod` source). Clears transparent, draws each layer in list order (later =
+// on top) with premultiplied (or straight) "over" via program_window_space.
+// Dest rects clip to the window region; flip Y for the bottom-left GL FBO.
+static void
+gl_flatten_local_2d_layers(struct comp_gl_compositor *c, uint32_t region_w, uint32_t region_h)
+{
+	glBindFramebuffer(GL_FRAMEBUFFER, c->local2d_scratch_fbo);
+	glViewport(0, 0, region_w, region_h);
+	glDisable(GL_SCISSOR_TEST);
+	glClearColor(0.0f, 0.0f, 0.0f, 0.0f); // transparent → desktop where uncovered (final.a=0)
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	glUseProgram(c->program_window_space);
+	glBindVertexArray(c->vao_empty);
+	GLint loc_rect = glGetUniformLocation(c->program_window_space, "u_rect");
+	GLint loc_tex = glGetUniformLocation(c->program_window_space, "u_texture");
+	GLint loc_src = glGetUniformLocation(c->program_window_space, "u_src_rect");
+	const bool skip_decode = gl_has_srgb_decode_ext();
+
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
+			continue;
+		}
+		struct xrt_swapchain *sc = layer->sc_array[0];
+		if (sc == NULL) {
+			continue;
+		}
+		struct comp_gl_swapchain *gsc = gl_swapchain(sc);
+		uint32_t img_idx = layer->data.local_2d.sub.image_index;
+		if (img_idx >= gsc->image_count) {
+			continue;
+		}
+		GLuint src_tex = gsc->textures[img_idx];
+
+		const struct xrt_rect *dr = &layer->data.local_2d.rect;
+		float dx = (float)dr->offset.w;
+		float dy = (float)dr->offset.h;
+		float dw = (float)dr->extent.w;
+		float dh = (float)dr->extent.h;
+		if (dw <= 0.0f || dh <= 0.0f) {
+			continue;
+		}
+
+		// NDC rect for the positioned-quad VS. Window pixels are top-left
+		// origin; flip Y for the bottom-left GL framebuffer: the panel's GL
+		// bottom edge is region_h - (dy + dh).
+		float nx = dx / (float)region_w * 2.0f - 1.0f;
+		float ny = ((float)region_h - (dy + dh)) / (float)region_h * 2.0f - 1.0f;
+		float nw = dw / (float)region_w * 2.0f;
+		float nh = dh / (float)region_h * 2.0f;
+
+		// App sub-rect within the swapchain image (normalized). Default full.
+		struct xrt_normalized_rect nr = layer->data.local_2d.sub.norm_rect;
+		if (nr.w <= 0.0f || nr.h <= 0.0f) {
+			nr.x = 0.0f;
+			nr.y = 0.0f;
+			nr.w = 1.0f;
+			nr.h = 1.0f;
+		}
+		// VS_WINDOW_SPACE maps the NDC top to v_uv.y=0; combined with the GL
+		// bottom-left flip above, sample the source bottom-up so the panel is
+		// upright. flip_y inverts that.
+		float src_x = nr.x;
+		float src_w = nr.w;
+		float src_y, src_h;
+		if (layer->data.flip_y) {
+			src_y = nr.y;
+			src_h = nr.h;
+		} else {
+			src_y = nr.y + nr.h;
+			src_h = -nr.h;
+		}
+
+		bool unpremult = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
+		glEnable(GL_BLEND);
+		if (unpremult) {
+			glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+		} else {
+			glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+		}
+
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, src_tex);
+		if (skip_decode) {
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SRGB_DECODE_EXT, GL_SKIP_DECODE_EXT);
+		}
+		glUniform1i(loc_tex, 0);
+		glUniform4f(loc_rect, nx, ny, nw, nh);
+		glUniform4f(loc_src, src_x, src_y, src_w, src_h);
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	}
+
+	glDisable(GL_BLEND);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+// Weave the (cropped) atlas into an arbitrary target FBO — same crop logic as
+// gl_crop_and_process_dp, but lets the caller redirect the DP output into a
+// texture FBO (the post-weave composite needs the weave in a sampleable tex).
+static void
+gl_dp_weave_to_fbo(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint target_fbo, uint32_t output_w,
+                   uint32_t output_h)
+{
+	uint32_t content_w = c->tile_columns * c->view_width;
+	uint32_t content_h = c->tile_rows * c->view_height;
+	GLuint dp_tex = atlas_tex;
+
+	if (content_w != c->atlas_tex_width || content_h != c->atlas_tex_height) {
+		if (c->dp_input_width != content_w || c->dp_input_height != content_h) {
+			if (c->dp_input_texture != 0) {
+				glDeleteTextures(1, &c->dp_input_texture);
+			}
+			glGenTextures(1, &c->dp_input_texture);
+			glBindTexture(GL_TEXTURE_2D, c->dp_input_texture);
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, content_w, content_h, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+			             NULL);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+			glBindTexture(GL_TEXTURE_2D, 0);
+			c->dp_input_width = content_w;
+			c->dp_input_height = content_h;
+		}
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, c->fbo);
+		glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, atlas_tex, 0);
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, c->dp_crop_fbo);
+		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, c->dp_input_texture,
+		                       0);
+		glBlitFramebuffer(0, 0, content_w, content_h, 0, 0, content_w, content_h, GL_COLOR_BUFFER_BIT,
+		                  GL_NEAREST);
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+		dp_tex = c->dp_input_texture;
+	}
+
+	glBindFramebuffer(GL_FRAMEBUFFER, target_fbo);
+	glViewport(0, 0, output_w, output_h);
+	xrt_display_processor_gl_process_atlas(c->display_processor, dp_tex, c->view_width, c->view_height,
+	                                       c->tile_columns, c->tile_rows, GL_RGBA8, output_w, output_h,
+	                                       c->canvas.valid ? c->canvas.x : 0, c->canvas.valid ? c->canvas.y : 0,
+	                                       c->canvas.valid ? c->canvas.w : 0, c->canvas.valid ? c->canvas.h : 0);
+}
+
+// #439 Phase 3 — the post-weave masked composite. Runs INSTEAD of the plain
+// gl_crop_and_process_dp present when an explicit submitted mask or Local2D
+// layers are present. Flattens the 2D, resolves the mask (explicit tex or
+// implicit raster), redirects the DP weave into weave_tex, then lerps
+// M*weave + (1-M)*twod into target_fbo (the window). Returns false → caller
+// falls through to the plain present.
+static bool
+gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint target_fbo, uint32_t output_w,
+                      uint32_t output_h)
+{
+	struct comp_gl_zone_mask *mask = c->active_zone_mask;
+	const bool have_explicit = (mask != NULL && mask->submitted && mask->tex != 0);
+	const bool have_local_2d = c->local_2d_last_frame;
+	if ((!have_explicit && !have_local_2d) || c->program_masked_composite == 0 || output_w == 0 ||
+	    output_h == 0) {
+		return false;
+	}
+
+	// weave_tex + local2d_scratch are both window-sized; (re)allocate them
+	// together under one dims guard (composite_scratch_w/h is the canonical
+	// pair). The inner ensure's throwaway dims are fine — it only runs when the
+	// guard already decided a (re)alloc is needed.
+	if (c->weave_tex == 0 || c->local2d_scratch_tex == 0 || c->composite_scratch_w != output_w ||
+	    c->composite_scratch_h != output_h) {
+		uint32_t tmp_w = 0, tmp_h = 0;
+		gl_ensure_color_tex_fbo(&c->weave_tex, &c->weave_fbo, &tmp_w, &tmp_h, output_w, output_h);
+		tmp_w = 0;
+		tmp_h = 0;
+		gl_ensure_color_tex_fbo(&c->local2d_scratch_tex, &c->local2d_scratch_fbo, &tmp_w, &tmp_h, output_w,
+		                        output_h);
+		c->composite_scratch_w = output_w;
+		c->composite_scratch_h = output_h;
+	}
+
+	// Resolve the mask texture: explicit submitted mask wins; else implicit.
+	GLuint mask_tex = 0;
+	if (have_explicit) {
+		mask_tex = mask->tex;
+	} else {
+		struct xrt_rect rects[XRT_MAX_LAYERS];
+		uint32_t rect_count = 0;
+		for (uint32_t i = 0; i < c->layer_accum.layer_count && rect_count < XRT_MAX_LAYERS; i++) {
+			if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
+				rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
+			}
+		}
+		mask_tex = gl_update_implicit_mask(c, rects, rect_count, output_w, output_h);
+	}
+	if (mask_tex == 0) {
+		return false;
+	}
+
+	// Flatten the Local2D layers (the twod source). With no Local2D layers (a
+	// pure explicit-mask frame) the scratch stays transparent → the masked
+	// region shows the desktop, matching the VK leg.
+	if (have_local_2d) {
+		gl_flatten_local_2d_layers(c, output_w, output_h);
+	} else {
+		glBindFramebuffer(GL_FRAMEBUFFER, c->local2d_scratch_fbo);
+		glViewport(0, 0, output_w, output_h);
+		glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	}
+
+	// Redirect the DP weave into weave_tex.
+	gl_dp_weave_to_fbo(c, atlas_tex, c->weave_fbo, output_w, output_h);
+
+	// Lerp M*weave + (1-M)*twod into the window framebuffer.
+	glBindFramebuffer(GL_FRAMEBUFFER, target_fbo);
+	glViewport(0, 0, output_w, output_h);
+	glDisable(GL_BLEND);
+	glDisable(GL_SCISSOR_TEST);
+	glUseProgram(c->program_masked_composite);
+	glBindVertexArray(c->vao_empty);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, c->local2d_scratch_tex);
+	glActiveTexture(GL_TEXTURE1);
+	glBindTexture(GL_TEXTURE_2D, mask_tex);
+	glActiveTexture(GL_TEXTURE2);
+	glBindTexture(GL_TEXTURE_2D, c->weave_tex);
+	glUniform1i(glGetUniformLocation(c->program_masked_composite, "u_twod"), 0);
+	glUniform1i(glGetUniformLocation(c->program_masked_composite, "u_mask"), 1);
+	glUniform1i(glGetUniformLocation(c->program_masked_composite, "u_weave"), 2);
+	glDrawArrays(GL_TRIANGLES, 0, 3);
+	glActiveTexture(GL_TEXTURE0);
+
+	static bool composite_logged = false;
+	if (!composite_logged) {
+		U_LOG_W("GL Local2D composite: %ux%u region, %s mask, twod=%s", output_w, output_h,
+		        have_explicit ? "explicit" : "implicit", have_local_2d ? "local2d layers" : "(empty)");
+		composite_logged = true;
+	}
+	return true;
+}
+
+
+/*
+ *
  * MCP capture helpers
  *
  */
@@ -1203,6 +1642,16 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 	if (c->layer_accum.layer_count == 0) {
 		return XRT_SUCCESS;
+	}
+
+	// #439 Phase 3 — detect Local2D layers once per frame; drives the
+	// post-weave masked composite (the GL leg's consumer path).
+	c->local_2d_last_frame = false;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
+			c->local_2d_last_frame = true;
+			break;
+		}
 	}
 
 	// Save previous GL context and switch to compositor's
@@ -1701,9 +2150,14 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
 		if (c->display_processor != NULL) {
-			// Crop atlas to content dims, then pass to DP
-			// (DP handles both 2D and 3D modes internally)
-			gl_crop_and_process_dp(c, atlas_for_present, present_w, present_h);
+			// #439 Phase 3: when this frame carries Local2D layers or an
+			// active submitted mask, run the post-weave masked composite
+			// (DP weaves into weave_tex, then lerp M*weave+(1-M)*twod into the
+			// window). Otherwise the DP weaves straight to the window — the
+			// pre-Phase-3 path, byte-identical.
+			if (!gl_composite_local_2d(c, atlas_for_present, 0, present_w, present_h)) {
+				gl_crop_and_process_dp(c, atlas_for_present, present_w, present_h);
+			}
 		} else {
 			// No display processor: simple blit
 			glViewport(0, 0, present_w, present_h);
@@ -1829,9 +2283,17 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	if (c->dp_crop_fbo) glDeleteFramebuffers(1, &c->dp_crop_fbo);
 	if (c->program_blit) glDeleteProgram(c->program_blit);
 	if (c->program_window_space) glDeleteProgram(c->program_window_space);
+	if (c->program_masked_composite) glDeleteProgram(c->program_masked_composite);
 	if (c->vao_empty) glDeleteVertexArrays(1, &c->vao_empty);
 	if (c->fbo) glDeleteFramebuffers(1, &c->fbo);
 	if (c->atlas_texture) glDeleteTextures(1, &c->atlas_texture);
+	// #439 Phase 3 — Local2D composite scratch.
+	if (c->weave_tex) glDeleteTextures(1, &c->weave_tex);
+	if (c->weave_fbo) glDeleteFramebuffers(1, &c->weave_fbo);
+	if (c->local2d_scratch_tex) glDeleteTextures(1, &c->local2d_scratch_tex);
+	if (c->local2d_scratch_fbo) glDeleteFramebuffers(1, &c->local2d_scratch_fbo);
+	if (c->implicit_mask_tex) glDeleteTextures(1, &c->implicit_mask_tex);
+	if (c->implicit_mask_fbo) glDeleteFramebuffers(1, &c->implicit_mask_fbo);
 
 #ifdef XRT_OS_WINDOWS
 	// Clean up D3D11 interop resources
@@ -2055,8 +2517,10 @@ gl_init_resources(struct comp_gl_compositor *c, uint32_t width, uint32_t height)
 	// Compile shaders
 	c->program_blit = create_program(VS_FULLSCREEN_QUAD, FS_BLIT);
 	c->program_window_space = create_program(VS_WINDOW_SPACE, FS_TEXTURED);
+	// #439 Phase 3 — masked 2D-over-3D composite (flatten reuses program_window_space).
+	c->program_masked_composite = create_program(VS_FULLSCREEN_QUAD, FS_MASKED_COMPOSITE);
 
-	if (!c->program_blit || !c->program_window_space) {
+	if (!c->program_blit || !c->program_window_space || !c->program_masked_composite) {
 		U_LOG_E("Failed to compile GL compositor shaders");
 		return false;
 	}
@@ -2166,6 +2630,228 @@ comp_gl_compositor_set_surround_2d(struct xrt_compositor *xc,
 	// import for the per-frame surround blit pass.
 	U_LOG_I("GL surround 2D registered: handle=%p %ux%u (open + blit pending)",
 	        shared_handle, w, h);
+}
+
+/*
+ *
+ * #439 Phase 3 — XR_EXT_local_3d_zone authored-mask API (GL leg).
+ *
+ * GL R8 mask textures authored in-process on the compositor's GL context,
+ * frame-serialized with the composite. Tier 1 (set_whole), Tier 2 (set_rects);
+ * Tier 3 (acquire_rt) is unimplemented on GL. All entry points serialize on the
+ * compositor context being current — the oxr state tracker calls them on the
+ * app thread, which shares the context; a real cross-thread/process GL mask
+ * would need an explicit context make-current (out of scope for the in-process
+ * handle-app consumer this leg targets).
+ *
+ */
+
+// (Re)allocate the R8 mask texture + FBO at w×h.
+static bool
+gl_zone_mask_ensure(struct comp_gl_zone_mask *m, uint32_t w, uint32_t h)
+{
+	if (m->tex != 0 && m->w == w && m->h == h) {
+		return true;
+	}
+	if (m->tex != 0) {
+		glDeleteTextures(1, &m->tex);
+		m->tex = 0;
+	}
+	if (m->fbo == 0) {
+		glGenFramebuffers(1, &m->fbo);
+	}
+	glGenTextures(1, &m->tex);
+	glBindTexture(GL_TEXTURE_2D, m->tex);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, w, h, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	glBindFramebuffer(GL_FRAMEBUFFER, m->fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m->tex, 0);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	m->w = w;
+	m->h = h;
+	return true;
+}
+
+extern "C" xrt_result_t
+comp_gl_compositor_zone_mask_create(struct xrt_compositor *xc, uint32_t w, uint32_t h, void **out_mask)
+{
+	struct comp_gl_compositor *c = gl_comp(xc);
+	if (out_mask == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	// 0 → runtime picks the client-window dims (the mask is window-sized).
+	if (w == 0 || h == 0) {
+#ifdef XRT_OS_WINDOWS
+		RECT r;
+		if (c->hwnd != NULL && GetClientRect(c->hwnd, &r) && r.right > 0 && r.bottom > 0) {
+			w = (uint32_t)r.right;
+			h = (uint32_t)r.bottom;
+		}
+#endif
+		if (w == 0 || h == 0) {
+			w = c->tile_columns * c->view_width;
+			h = c->tile_rows * c->view_height;
+		}
+	}
+	if (w == 0 || h == 0) {
+		return XRT_ERROR_ALLOCATION;
+	}
+
+	struct comp_gl_zone_mask *m = U_TYPED_CALLOC(struct comp_gl_zone_mask);
+	if (m == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	if (!gl_zone_mask_ensure(m, w, h)) {
+		free(m);
+		return XRT_ERROR_ALLOCATION;
+	}
+	// Default to all-3D (M=1): an unauthored-but-submitted mask = full weave.
+	glBindFramebuffer(GL_FRAMEBUFFER, m->fbo);
+	glViewport(0, 0, w, h);
+	glDisable(GL_SCISSOR_TEST);
+	glClearColor(1.0f, 0.0f, 0.0f, 0.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+	U_LOG_W("GL zone_mask_create: %ux%u (client-window px)", w, h);
+	*out_mask = m;
+	return XRT_SUCCESS;
+}
+
+extern "C" xrt_result_t
+comp_gl_compositor_zone_mask_set_whole(struct xrt_compositor *xc, void *mask_ptr, bool enable_3d)
+{
+	(void)xc;
+	struct comp_gl_zone_mask *m = (struct comp_gl_zone_mask *)mask_ptr;
+	if (m == NULL || m->fbo == 0) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	glBindFramebuffer(GL_FRAMEBUFFER, m->fbo);
+	glViewport(0, 0, m->w, m->h);
+	glDisable(GL_SCISSOR_TEST);
+	glClearColor(enable_3d ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	return XRT_SUCCESS;
+}
+
+extern "C" xrt_result_t
+comp_gl_compositor_zone_mask_set_rects(struct xrt_compositor *xc,
+                                       void *mask_ptr,
+                                       uint32_t count,
+                                       const struct xrt_rect *rects)
+{
+	(void)xc;
+	struct comp_gl_zone_mask *m = (struct comp_gl_zone_mask *)mask_ptr;
+	if (m == NULL || m->fbo == 0 || (count > 0 && rects == NULL)) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	// M=0 everywhere, then M=1 inside the surviving rects (3D islands). Flip Y
+	// from window top-left to the bottom-left GL framebuffer.
+	glBindFramebuffer(GL_FRAMEBUFFER, m->fbo);
+	glViewport(0, 0, m->w, m->h);
+	glDisable(GL_SCISSOR_TEST);
+	glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	glEnable(GL_SCISSOR_TEST);
+	glClearColor(1.0f, 0.0f, 0.0f, 0.0f);
+	for (uint32_t i = 0; i < count; i++) {
+		int32_t left = rects[i].offset.w;
+		int32_t top = rects[i].offset.h;
+		int32_t rw = rects[i].extent.w;
+		int32_t rh = rects[i].extent.h;
+		if (rw <= 0 || rh <= 0) {
+			continue;
+		}
+		if (left < 0) {
+			rw += left;
+			left = 0;
+		}
+		if (top < 0) {
+			rh += top;
+			top = 0;
+		}
+		if (left + rw > (int32_t)m->w) {
+			rw = (int32_t)m->w - left;
+		}
+		if (top + rh > (int32_t)m->h) {
+			rh = (int32_t)m->h - top;
+		}
+		if (rw <= 0 || rh <= 0) {
+			continue;
+		}
+		int32_t gl_y = (int32_t)m->h - (top + rh);
+		glScissor(left, gl_y, rw, rh);
+		glClear(GL_COLOR_BUFFER_BIT);
+	}
+	glDisable(GL_SCISSOR_TEST);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	return XRT_SUCCESS;
+}
+
+extern "C" xrt_result_t
+comp_gl_compositor_zone_mask_acquire_rt(
+    struct xrt_compositor *xc, void *mask_ptr, void **out_texture, uint32_t *out_w, uint32_t *out_h)
+{
+	(void)xc;
+	(void)mask_ptr;
+	(void)out_texture;
+	(void)out_w;
+	(void)out_h;
+	// Tier 3 (app-authored RT) is unimplemented on the GL leg.
+	return XRT_ERROR_NOT_IMPLEMENTED;
+}
+
+extern "C" xrt_result_t
+comp_gl_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask_ptr)
+{
+	struct comp_gl_compositor *c = gl_comp(xc);
+	struct comp_gl_zone_mask *m = (struct comp_gl_zone_mask *)mask_ptr;
+	if (m == NULL || m->tex == 0) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	// Same-context authoring → the composite samples m->tex directly; no
+	// staged copy needed. Sticky last-submit-wins.
+	m->submitted = true;
+	c->active_zone_mask = m;
+	return XRT_SUCCESS;
+}
+
+extern "C" void
+comp_gl_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_ptr)
+{
+	struct comp_gl_compositor *c = gl_comp(xc);
+	struct comp_gl_zone_mask *m = (struct comp_gl_zone_mask *)mask_ptr;
+	if (m == NULL) {
+		return;
+	}
+	if (c->active_zone_mask == m) {
+		c->active_zone_mask = NULL;
+	}
+	if (m->tex != 0) {
+		glDeleteTextures(1, &m->tex);
+	}
+	if (m->fbo != 0) {
+		glDeleteFramebuffers(1, &m->fbo);
+	}
+	free(m);
+}
+
+extern "C" bool
+comp_gl_compositor_get_recommended_view_size(struct xrt_compositor *xc, uint32_t *out_w, uint32_t *out_h)
+{
+	struct comp_gl_compositor *c = gl_comp(xc);
+	if (out_w == NULL || out_h == NULL || c->view_width == 0 || c->view_height == 0) {
+		return false;
+	}
+	*out_w = c->view_width;
+	*out_h = c->view_height;
+	return true;
 }
 
 bool

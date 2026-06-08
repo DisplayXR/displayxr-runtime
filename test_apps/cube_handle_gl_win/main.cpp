@@ -48,6 +48,25 @@ static XrSessionManager* g_xr = nullptr;
 static UINT g_windowWidth = 1280;
 static UINT g_windowHeight = 720;
 
+// #439 Phase 3 — handle + mask + Local2D layer modes (§8 cases 2/3/4), GL leg.
+// DXR_LOCAL2D_PANEL=1 (case 3, implicit mask) / +DXR_LOCAL2D_MASK=1 (case 2,
+// explicit Tier-2 island mask) / +DXR_LOCAL2D_PANEL2=1 (case 4, second
+// unpremultiplied overlapping panel). The GL Leia DP is chroma-key-only, so
+// desktop-show-through behaves differently than D3D11/VK — expected.
+static bool g_l2dPanel = false;
+static bool g_l2dMask = false;
+static bool g_l2dPanel2 = false;
+static bool g_l2dActive = false;
+static long g_l2dFrameCounter = 0;
+static const long g_l2dActivationFrame = 10;
+
+struct L2DPanel {
+    XrSwapchain swapchain = XR_NULL_HANDLE;
+    uint32_t w = 0, h = 0;
+};
+static L2DPanel g_panel1, g_panel2;
+static XrRect2Di g_panel1Rect, g_panel2Rect;
+
 // Fullscreen state
 static bool g_fullscreen = false;
 static RECT g_savedWindowRect = {};
@@ -361,6 +380,96 @@ static void UpdatePerformanceStats(PerformanceStats& stats) {
         stats.frameCount = 0;
         stats.fpsAccumulator = 0.0f;
     }
+}
+
+// #439 Phase 3 — create a window-anchored Local2D panel swapchain and fill it
+// once via glTexSubImage2D (the GL context is current on the render thread).
+// Static content: acquire/fill/release once; the layer references the released
+// image every frame. RGBA8; same probe imagery as the D3D11/D3D12 legs.
+//  variant 0 — crispness: opaque fine 8-px checker core + 24-px half-transparent
+//              green border (premultiplied bytes).
+//  variant 1 — stacking/alpha: UNPREMULTIPLIED orange a=128 + opaque white
+//              diagonal stripes (submitted with the unpremultiplied bit).
+static bool CreateAndFillL2DPanel(XrSessionManager& xr, uint32_t w, uint32_t h, int variant, L2DPanel& out) {
+    if (w == 0 || h == 0) {
+        return false;
+    }
+
+    XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    sci.format = 0x8058; // GL_RGBA8
+    sci.sampleCount = 1;
+    sci.width = w;
+    sci.height = h;
+    sci.faceCount = 1;
+    sci.arraySize = 1;
+    sci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(xr.session, &sci, &out.swapchain))) {
+        LOG_ERROR("Local2D panel: xrCreateSwapchain failed");
+        return false;
+    }
+    out.w = w;
+    out.h = h;
+
+    uint32_t n = 0;
+    xrEnumerateSwapchainImages(out.swapchain, 0, &n, nullptr);
+    std::vector<XrSwapchainImageOpenGLKHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR});
+    if (n == 0 || XR_FAILED(xrEnumerateSwapchainImages(out.swapchain, n, &n,
+                                                       (XrSwapchainImageBaseHeader*)imgs.data()))) {
+        LOG_ERROR("Local2D panel: xrEnumerateSwapchainImages failed");
+        return false;
+    }
+
+    XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    uint32_t idx = 0;
+    if (XR_FAILED(xrAcquireSwapchainImage(out.swapchain, &ai, &idx))) {
+        return false;
+    }
+    XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = XR_INFINITE_DURATION;
+    xrWaitSwapchainImage(out.swapchain, &wi);
+
+    size_t stride = (size_t)w * 4; // RGBA8
+    std::vector<uint8_t> buf(stride * h);
+    const uint32_t border = 24;
+    for (uint32_t y = 0; y < h; y++) {
+        uint8_t* row = buf.data() + (size_t)y * stride;
+        for (uint32_t x = 0; x < w; x++) {
+            uint8_t* px = row + (size_t)x * 4; // R,G,B,A
+            if (variant == 0) {
+                bool inBorder = (x < border || y < border || x >= w - border || y >= h - border);
+                if (inBorder) {
+                    px[0] = 0; px[1] = 128; px[2] = 0; px[3] = 128; // half-transparent green, premultiplied
+                } else {
+                    bool check = (((x / 8) + (y / 8)) & 1) != 0;
+                    uint8_t v = check ? 235 : 40;
+                    px[0] = v; px[1] = v; px[2] = v; px[3] = 255; // opaque fine checker
+                }
+            } else {
+                bool stripe = (((x + y) / 16) & 1) != 0;
+                if (stripe) {
+                    px[0] = 255; px[1] = 255; px[2] = 255; px[3] = 255; // opaque white stripes
+                } else {
+                    px[0] = 255; px[1] = 165; px[2] = 0; px[3] = 128; // UNPREMULTIPLIED orange a=128
+                }
+            }
+        }
+    }
+
+    while (glGetError() != GL_NO_ERROR) {}
+    glBindTexture(GL_TEXTURE_2D, imgs[idx].image);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, buf.data());
+    glFlush();
+    GLenum glErr = glGetError();
+    glBindTexture(GL_TEXTURE_2D, 0);
+    if (glErr != GL_NO_ERROR) {
+        LOG_WARN("Local2D panel: glTexSubImage2D error 0x%X", glErr);
+    }
+
+    XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(out.swapchain, &ri);
+    return true;
 }
 
 static void RenderThreadFunc(
@@ -777,9 +886,102 @@ static void RenderThreadFunc(
                     }
                 }
 
+                // #439 cases 2/3/4 activation: create + fill the panel(s) a
+                // few frames in (GL context current on this thread).
+                if (g_l2dPanel && !g_l2dActive && g_l2dFrameCounter >= g_l2dActivationFrame) {
+                    static bool attempted = false;
+                    if (!attempted) {
+                        attempted = true;
+                        uint32_t winW = g_windowWidth;
+                        uint32_t winH = g_windowHeight;
+                        uint32_t pw = winW * 3 / 8;
+                        uint32_t ph = winH * 5 / 16;
+                        g_panel1Rect.offset = {(int32_t)(winW / 16), (int32_t)(winH * 9 / 16)};
+                        g_panel1Rect.extent = {(int32_t)pw, (int32_t)ph};
+                        bool ok = CreateAndFillL2DPanel(*xr, pw, ph, 0, g_panel1);
+
+                        if (ok && g_l2dPanel2) {
+                            g_panel2Rect.offset = {g_panel1Rect.offset.x + (int32_t)(pw / 2),
+                                                   g_panel1Rect.offset.y - (int32_t)(ph / 4)};
+                            g_panel2Rect.extent = {(int32_t)pw, (int32_t)ph};
+                            ok = CreateAndFillL2DPanel(*xr, pw, ph, 1, g_panel2);
+                        }
+
+                        if (ok && g_l2dMask && g_zone.available && g_zone.pfnCreate && g_zone.pfnSetRects &&
+                            g_zone.pfnSubmit) {
+                            XrLocal3DZoneMaskCreateInfoEXT mci = {
+                                (XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_EXT};
+                            mci.maskWidth = 0;
+                            mci.maskHeight = 0;
+                            ok = XR_SUCCEEDED(g_zone.pfnCreate(xr->session, &mci, &g_zone.mask));
+                            if (ok) {
+                                XrRect2Di islands[2];
+                                islands[0].offset = {(int32_t)(winW * 7 / 16), (int32_t)(winH / 4)};
+                                islands[0].extent = {(int32_t)(winW * 7 / 16), (int32_t)(winH / 2)};
+                                islands[1].offset = {(int32_t)(winW / 16), (int32_t)(winH / 16)};
+                                islands[1].extent = {(int32_t)(winW / 4), (int32_t)(winH / 4)};
+                                ok = XR_SUCCEEDED(g_zone.pfnSetRects(g_zone.mask, 2, islands)) &&
+                                     XR_SUCCEEDED(g_zone.pfnSubmit(g_zone.mask));
+                            }
+                        }
+
+                        if (ok) {
+                            g_l2dActive = true;
+                            LOG_INFO("Local2D panels active: panel1 %d,%d %ux%u%s%s",
+                                     g_panel1Rect.offset.x, g_panel1Rect.offset.y, pw, ph,
+                                     g_l2dPanel2 ? " + panel2 (unpremultiplied, overlapping)" : "",
+                                     g_l2dMask ? " + explicit Tier-2 island mask" : " (implicit mask)");
+                        } else {
+                            LOG_ERROR("Local2D panel activation failed");
+                        }
+                    }
+                }
+
                 // submitViewCount = eyeCount (mono=1, stereo=N)
                 uint32_t submitViewCount = (uint32_t)eyeCount;
-                if (hudSubmitted) {
+                if (g_l2dActive && g_panel1.swapchain != XR_NULL_HANDLE) {
+                    // #439 cases 2/3/4: manual projection + Local2D layer list
+                    // (the shared EndFrame helpers don't carry the Local2D type).
+                    XrCompositionLayerProjection projLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+                    projLayer.space = xr->localSpace;
+                    projLayer.viewCount = (uint32_t)eyeCount;
+                    projLayer.views = projectionViews.data();
+
+                    XrCompositionLayerLocal2DEXT panel1Layer = {
+                        (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+                    XrCompositionLayerLocal2DEXT panel2Layer = {
+                        (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+                    const XrCompositionLayerBaseHeader* layers[3] = {
+                        (XrCompositionLayerBaseHeader*)&projLayer, nullptr, nullptr};
+                    uint32_t layerCount = 1;
+
+                    panel1Layer.layerFlags = 0; // premultiplied bytes
+                    panel1Layer.subImage.swapchain = g_panel1.swapchain;
+                    panel1Layer.subImage.imageRect.offset = {0, 0};
+                    panel1Layer.subImage.imageRect.extent = {(int32_t)g_panel1.w, (int32_t)g_panel1.h};
+                    panel1Layer.subImage.imageArrayIndex = 0;
+                    panel1Layer.rect = g_panel1Rect;
+                    layers[layerCount++] = (XrCompositionLayerBaseHeader*)&panel1Layer;
+
+                    if (g_l2dPanel2 && g_panel2.swapchain != XR_NULL_HANDLE) {
+                        panel2Layer.layerFlags = XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+                        panel2Layer.subImage.swapchain = g_panel2.swapchain;
+                        panel2Layer.subImage.imageRect.offset = {0, 0};
+                        panel2Layer.subImage.imageRect.extent = {(int32_t)g_panel2.w, (int32_t)g_panel2.h};
+                        panel2Layer.subImage.imageArrayIndex = 0;
+                        panel2Layer.rect = g_panel2Rect;
+                        layers[layerCount++] = (XrCompositionLayerBaseHeader*)&panel2Layer;
+                    }
+
+                    XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
+                    endInfo.displayTime = frameState.predictedDisplayTime;
+                    endInfo.environmentBlendMode = xr->runtimeSupportsAlphaBlend
+                        ? XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
+                        : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+                    endInfo.layerCount = layerCount;
+                    endInfo.layers = layers;
+                    xrEndFrame(xr->session, &endInfo);
+                } else if (hudSubmitted) {
                     LOG_DEBUG("[Frame] Submitting EndFrame with HUD (layerCount=2)");
                     float hudAR = (float)hudWidth / (float)hudHeight;
                     float windowAR = (windowW > 0 && windowH > 0) ? (float)windowW / (float)windowH : 1.0f;
@@ -795,6 +997,7 @@ static void RenderThreadFunc(
                 } else {
                     EndFrame(*xr, frameState.predictedDisplayTime, projectionViews.data(), submitViewCount);
                 }
+                g_l2dFrameCounter++;
             }
         } else {
             Sleep(100);
@@ -820,6 +1023,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     LOG_INFO("=== SR Cube OpenXR Ext OpenGL Application ===");
+
+    // #439 Phase 3 — handle + mask + Local2D layer modes (§8 cases 2/3/4).
+    {
+        const char* e = getenv("DXR_LOCAL2D_PANEL");
+        if (e && *e == '1') g_l2dPanel = true;
+        e = getenv("DXR_LOCAL2D_MASK");
+        if (e && *e == '1') g_l2dMask = true;
+        e = getenv("DXR_LOCAL2D_PANEL2");
+        if (e && *e == '1') g_l2dPanel2 = true;
+        if (g_l2dPanel) {
+            LOG_INFO("DXR_LOCAL2D_PANEL=1 — Local2D panel layer%s%s",
+                g_l2dPanel2 ? " + panel2 (unpremultiplied, overlapping)" : "",
+                g_l2dMask ? " + explicit Tier-2 island mask" : " (implicit mask)");
+        }
+    }
 
     HWND hwnd = CreateAppWindow(hInstance, g_windowWidth, g_windowHeight);
     if (!hwnd) {
