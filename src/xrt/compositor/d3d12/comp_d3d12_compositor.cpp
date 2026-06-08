@@ -215,6 +215,31 @@ struct comp_d3d12_compositor
 	ID3D12Resource *surround_scratch;
 	ID3D12Resource *weave_scratch;
 
+	//! #439 Phase 3 — Local2D consumer state (mirrors the D3D11 leg). True if
+	//! this frame's accumulator carried any XRT_LAYER_LOCAL_2D layer; set once
+	//! under c->mutex at the top of layer_commit. Drives the effective-canvas
+	//! supersede + the composite's have_local_2d branch.
+	bool local_2d_last_frame;
+
+	//! Implicit zone mask rasterized from the frame's Local2D layer rects
+	//! (R8_UNORM RT + staged SRV copy), reused across frames via dirty-check.
+	//! INVERSE of an authored set_rects mask: M=1 (keep weave) everywhere, M=0
+	//! (show the flattened 2D) inside the layer rects.
+	ID3D12Resource *implicit_mask_tex;
+	ID3D12DescriptorHeap *implicit_mask_rtv_heap;
+	ID3D12Resource *implicit_mask_staged;
+	uint32_t implicit_mask_w, implicit_mask_h;
+	uint32_t implicit_rect_count;
+	struct xrt_rect implicit_rects[XRT_MAX_LAYERS];
+
+	//! Flattened Local2D layers (the `twod` source). R8G8B8A8_UNORM render
+	//! target — dedicated, NOT shared with surround_scratch (avoids an
+	//! RTV-dangle when the app switches between the surround and Local2D
+	//! models). Lazily (re)allocated window-sized.
+	ID3D12Resource *local2d_scratch;
+	ID3D12DescriptorHeap *local2d_scratch_rtv_heap;
+	uint32_t local2d_scratch_w, local2d_scratch_h;
+
 	//! HUD overlay.
 	struct u_hud *hud;
 
@@ -300,7 +325,9 @@ static void d3d12_maybe_capture_surround_target(struct comp_d3d12_compositor *c,
 static struct u_canvas_rect
 d3d12_effective_canvas(struct comp_d3d12_compositor *c)
 {
-	if (c->active_zone_mask == nullptr) {
+	// #439 Phase 3: Local2D layers supersede the canvas the same way an
+	// authored mask does — the composite writes the whole window region.
+	if (c->active_zone_mask == nullptr && !c->local_2d_last_frame) {
 		return c->canvas;
 	}
 	struct u_canvas_rect win = {};
@@ -1302,12 +1329,23 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	}
 #endif
 
+	// #439 Phase 3: detect Local2D layers once per frame (under c->mutex).
+	// Drives the effective-canvas supersede + the composite's have_local_2d
+	// branch — mirrors the D3D11 leg (set before eff_canvas is computed).
+	c->local_2d_last_frame = false;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
+			c->local_2d_last_frame = true;
+			break;
+		}
+	}
+
 	// #439 Phase 2: the one canvas authority for this frame. While a zone
-	// mask is active this is the client-window rect (the mask supersedes
-	// the output rect); otherwise it is c->canvas unchanged. Computed once
-	// under c->mutex (held for this whole function) so the weave region,
-	// view dims, and composite all see the same rect even if submit/destroy
-	// race the frame.
+	// mask is active (or Local2D layers are present) this is the client-window
+	// rect (it supersedes the output rect); otherwise it is c->canvas
+	// unchanged. Computed once under c->mutex (held for this whole function)
+	// so the weave region, view dims, and composite all see the same rect even
+	// if submit/destroy race the frame.
 	const struct u_canvas_rect eff_canvas = d3d12_effective_canvas(c);
 
 	// Get target dimensions
@@ -3111,6 +3149,32 @@ d3d12_release_zone_state(struct comp_d3d12_compositor *c)
 		c->weave_scratch->Release();
 		c->weave_scratch = nullptr;
 	}
+	// #439 Phase 3 — Local2D consumer scratches + implicit mask.
+	if (c->local2d_scratch != nullptr) {
+		c->local2d_scratch->Release();
+		c->local2d_scratch = nullptr;
+	}
+	if (c->local2d_scratch_rtv_heap != nullptr) {
+		c->local2d_scratch_rtv_heap->Release();
+		c->local2d_scratch_rtv_heap = nullptr;
+	}
+	c->local2d_scratch_w = 0;
+	c->local2d_scratch_h = 0;
+	if (c->implicit_mask_staged != nullptr) {
+		c->implicit_mask_staged->Release();
+		c->implicit_mask_staged = nullptr;
+	}
+	if (c->implicit_mask_rtv_heap != nullptr) {
+		c->implicit_mask_rtv_heap->Release();
+		c->implicit_mask_rtv_heap = nullptr;
+	}
+	if (c->implicit_mask_tex != nullptr) {
+		c->implicit_mask_tex->Release();
+		c->implicit_mask_tex = nullptr;
+	}
+	c->implicit_mask_w = 0;
+	c->implicit_mask_h = 0;
+	c->implicit_rect_count = 0;
 }
 
 // (Re)allocate a DEFAULT-heap committed scratch texture at the given
@@ -3186,6 +3250,340 @@ d3d12_zone_cmd_execute(struct comp_d3d12_compositor *c)
 	gpu_wait_idle(c);
 }
 
+// #439 Phase 3 — (re)allocate the dedicated Local2D flatten scratch
+// (R8G8B8A8_UNORM, ALLOW_RENDER_TARGET, steady COMMON) + its RTV heap. Kept
+// separate from surround_scratch so switching between the surround and Local2D
+// models can't dangle an RTV. Returns false on allocation failure.
+static bool
+d3d12_ensure_local2d_scratch(struct comp_d3d12_compositor *c, uint32_t w, uint32_t h)
+{
+	if (c->local2d_scratch != nullptr && c->local2d_scratch_w == w && c->local2d_scratch_h == h) {
+		return true;
+	}
+	if (c->local2d_scratch != nullptr) {
+		c->local2d_scratch->Release();
+		c->local2d_scratch = nullptr;
+	}
+	c->local2d_scratch_w = 0;
+	c->local2d_scratch_h = 0;
+
+	D3D12_RESOURCE_DESC desc = {};
+	desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	desc.Width = w;
+	desc.Height = h;
+	desc.DepthOrArraySize = 1;
+	desc.MipLevels = 1;
+	desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	desc.SampleDesc.Count = 1;
+	desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+	D3D12_HEAP_PROPERTIES heap = {};
+	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+	D3D12_CLEAR_VALUE clear = {};
+	clear.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // transparent (flatten clears to 0,0,0,0)
+
+	HRESULT hr = c->device->CreateCommittedResource(
+	    &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, &clear, IID_PPV_ARGS(&c->local2d_scratch));
+	if (FAILED(hr) || c->local2d_scratch == nullptr) {
+		U_LOG_W("local2d scratch alloc (%ux%u) failed: 0x%08x", w, h, hr);
+		c->local2d_scratch = nullptr;
+		return false;
+	}
+
+	if (c->local2d_scratch_rtv_heap == nullptr) {
+		D3D12_DESCRIPTOR_HEAP_DESC rtv_desc = {};
+		rtv_desc.NumDescriptors = 1;
+		rtv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+		hr = c->device->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&c->local2d_scratch_rtv_heap));
+		if (FAILED(hr) || c->local2d_scratch_rtv_heap == nullptr) {
+			U_LOG_W("local2d scratch RTV heap failed: 0x%08x", hr);
+			c->local2d_scratch->Release();
+			c->local2d_scratch = nullptr;
+			return false;
+		}
+	}
+	c->device->CreateRenderTargetView(c->local2d_scratch, nullptr,
+	                                  c->local2d_scratch_rtv_heap->GetCPUDescriptorHandleForHeapStart());
+	c->local2d_scratch_w = w;
+	c->local2d_scratch_h = h;
+	return true;
+}
+
+// #439 Phase 3 — (re)rasterize the runtime-owned IMPLICIT zone mask from this
+// frame's Local2D layer rects. Inverse of zone_mask_set_rects: M=1 (keep the
+// weave / 3D) everywhere, then M=0 (show the flattened 2D) inside each layer
+// rect. The masked-composite shader lerps M*weave + (1-M)*twod, so M=0 in the
+// rects is what surfaces the 2D content there. Records the raster + staging
+// copy into the OPEN c->cmd_list (mid-frame, like the surround copy). Re-rasters
+// only when the rect set or dims change (steady-state frames reuse the staged
+// snapshot). Returns the staged R8 resource (sampled by the composite) or
+// nullptr on failure. Caller holds c->mutex.
+static ID3D12Resource *
+d3d12_update_implicit_mask(struct comp_d3d12_compositor *c,
+                           const struct xrt_rect *rects,
+                           uint32_t rect_count,
+                           uint32_t w,
+                           uint32_t h)
+{
+	if (w == 0 || h == 0 || rect_count == 0) {
+		return nullptr;
+	}
+
+	bool dirty = c->implicit_mask_tex == nullptr || c->implicit_mask_staged == nullptr ||
+	             c->implicit_mask_w != w || c->implicit_mask_h != h || c->implicit_rect_count != rect_count;
+	for (uint32_t i = 0; !dirty && i < rect_count; i++) {
+		if (memcmp(&c->implicit_rects[i], &rects[i], sizeof(rects[i])) != 0) {
+			dirty = true;
+		}
+	}
+	if (!dirty) {
+		return c->implicit_mask_staged; // steady PSR, reuse
+	}
+
+	// (Re)allocate the R8 RT + staged copy on dims change (mirrors
+	// zone_mask_create — tex steady RENDER_TARGET, staged steady PSR).
+	if (c->implicit_mask_tex == nullptr || c->implicit_mask_w != w || c->implicit_mask_h != h) {
+		if (c->implicit_mask_staged != nullptr) {
+			c->implicit_mask_staged->Release();
+			c->implicit_mask_staged = nullptr;
+		}
+		if (c->implicit_mask_rtv_heap != nullptr) {
+			c->implicit_mask_rtv_heap->Release();
+			c->implicit_mask_rtv_heap = nullptr;
+		}
+		if (c->implicit_mask_tex != nullptr) {
+			c->implicit_mask_tex->Release();
+			c->implicit_mask_tex = nullptr;
+		}
+		c->implicit_mask_w = 0;
+		c->implicit_mask_h = 0;
+
+		D3D12_RESOURCE_DESC td = {};
+		td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		td.Width = w;
+		td.Height = h;
+		td.DepthOrArraySize = 1;
+		td.MipLevels = 1;
+		td.Format = DXGI_FORMAT_R8_UNORM;
+		td.SampleDesc.Count = 1;
+		td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+		D3D12_HEAP_PROPERTIES heap = {};
+		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+		D3D12_CLEAR_VALUE clear = {};
+		clear.Format = DXGI_FORMAT_R8_UNORM;
+		clear.Color[0] = 1.0f;
+
+		HRESULT hr = c->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
+		                                                D3D12_RESOURCE_STATE_RENDER_TARGET, &clear,
+		                                                IID_PPV_ARGS(&c->implicit_mask_tex));
+		if (SUCCEEDED(hr) && c->implicit_mask_tex != nullptr) {
+			D3D12_DESCRIPTOR_HEAP_DESC rtv_desc = {};
+			rtv_desc.NumDescriptors = 1;
+			rtv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+			hr = c->device->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&c->implicit_mask_rtv_heap));
+		}
+		if (SUCCEEDED(hr) && c->implicit_mask_rtv_heap != nullptr) {
+			c->device->CreateRenderTargetView(c->implicit_mask_tex, nullptr,
+			                                  c->implicit_mask_rtv_heap->GetCPUDescriptorHandleForHeapStart());
+			td.Flags = D3D12_RESOURCE_FLAG_NONE;
+			hr = c->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
+			                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+			                                        IID_PPV_ARGS(&c->implicit_mask_staged));
+		}
+		if (FAILED(hr) || c->implicit_mask_staged == nullptr) {
+			U_LOG_E("implicit zone mask: D3D12 resource creation failed: 0x%08x", hr);
+			if (c->implicit_mask_rtv_heap != nullptr) {
+				c->implicit_mask_rtv_heap->Release();
+				c->implicit_mask_rtv_heap = nullptr;
+			}
+			if (c->implicit_mask_tex != nullptr) {
+				c->implicit_mask_tex->Release();
+				c->implicit_mask_tex = nullptr;
+			}
+			return nullptr;
+		}
+		c->implicit_mask_w = w;
+		c->implicit_mask_h = h;
+	}
+
+	// Clamp the layer rects → D3D12_RECT (client-window px); skip degenerate
+	// / fully-outside ones.
+	D3D12_RECT drs[XRT_MAX_LAYERS];
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < rect_count && n < XRT_MAX_LAYERS; i++) {
+		int32_t left = rects[i].offset.w;
+		int32_t top = rects[i].offset.h;
+		int32_t right = left + rects[i].extent.w;
+		int32_t bottom = top + rects[i].extent.h;
+		if (left < 0) {
+			left = 0;
+		}
+		if (top < 0) {
+			top = 0;
+		}
+		if (right > (int32_t)w) {
+			right = (int32_t)w;
+		}
+		if (bottom > (int32_t)h) {
+			bottom = (int32_t)h;
+		}
+		if (right <= left || bottom <= top) {
+			continue;
+		}
+		drs[n].left = left;
+		drs[n].top = top;
+		drs[n].right = right;
+		drs[n].bottom = bottom;
+		n++;
+	}
+
+	// Raster onto the open cmd-list: M=1 everywhere, then M=0 inside the rects
+	// (tex is in its steady RENDER_TARGET state). D3D12's ClearRenderTargetView
+	// takes the rect array natively (one call vs D3D11's per-rect ClearView).
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv = c->implicit_mask_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+	const float all_3d[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+	c->cmd_list->ClearRenderTargetView(rtv, all_3d, 0, nullptr);
+	if (n > 0) {
+		const float all_2d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+		c->cmd_list->ClearRenderTargetView(rtv, all_2d, n, drs);
+	}
+
+	// Stage the snapshot the composite samples (RT≠SRV; decouple as the
+	// explicit mask's submit does). Leaves tex in RENDER_TARGET, staged in PSR.
+	D3D12_RESOURCE_BARRIER to_copy[2] = {};
+	to_copy[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	to_copy[0].Transition.pResource = c->implicit_mask_tex;
+	to_copy[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	to_copy[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	to_copy[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	to_copy[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	to_copy[1].Transition.pResource = c->implicit_mask_staged;
+	to_copy[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	to_copy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+	to_copy[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	c->cmd_list->ResourceBarrier(2, to_copy);
+
+	c->cmd_list->CopyResource(c->implicit_mask_staged, c->implicit_mask_tex);
+
+	std::swap(to_copy[0].Transition.StateBefore, to_copy[0].Transition.StateAfter);
+	std::swap(to_copy[1].Transition.StateBefore, to_copy[1].Transition.StateAfter);
+	c->cmd_list->ResourceBarrier(2, to_copy);
+
+	memcpy(c->implicit_rects, rects, sizeof(rects[0]) * rect_count);
+	c->implicit_rect_count = rect_count;
+
+	// One-off-ish lifecycle event (fires only on a rect/dims change).
+	U_LOG_W("implicit zone mask: %ux%u, %u Local2D rect(s)", w, h, rect_count);
+	return c->implicit_mask_staged;
+}
+
+// #439 Phase 3 — flatten this frame's Local2D layers into local2d_scratch (the
+// `twod` source the masked composite reads). Records into the OPEN c->cmd_list:
+// transition the scratch to RENDER_TARGET, clear transparent, draw each layer
+// in list order (later = on top) with premultiplied (or straight) "over", then
+// transition to PIXEL_SHADER_RESOURCE. Dest rects clip to the window region;
+// the clip fractions, the layer's norm_rect, and flip_y are carried into the
+// source UVs (matches d3d11_flatten_local_2d_layers). Caller holds c->mutex and
+// has ensured local2d_scratch at (region_w, region_h). Returns false on error.
+static bool
+d3d12_flatten_local_2d_layers(struct comp_d3d12_compositor *c, uint32_t region_w, uint32_t region_h)
+{
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv = c->local2d_scratch_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+
+	// Scratch COMMON → RENDER_TARGET, clear transparent. Where a pixel is M=0
+	// (2D) but no layer covers it, twod stays (0,0,0,0) → final.a → 0 → the
+	// desktop shows through (the §4.2 output-alpha rule).
+	D3D12_RESOURCE_BARRIER to_rt = {};
+	to_rt.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	to_rt.Transition.pResource = c->local2d_scratch;
+	to_rt.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+	to_rt.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	to_rt.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	c->cmd_list->ResourceBarrier(1, &to_rt);
+
+	const float transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	c->cmd_list->ClearRenderTargetView(rtv, transparent, 0, nullptr);
+
+	uint32_t slot = 0;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
+			continue;
+		}
+		struct xrt_swapchain *sc = layer->sc_array[0];
+		if (sc == nullptr) {
+			continue;
+		}
+		uint32_t img_idx = layer->data.local_2d.sub.image_index;
+		ID3D12Resource *src_res = static_cast<ID3D12Resource *>(comp_d3d12_swapchain_get_resource(sc, img_idx));
+		if (src_res == nullptr) {
+			continue;
+		}
+
+		// Dest rect (client-window px), clipped to the window region.
+		const struct xrt_rect *dr = &layer->data.local_2d.rect;
+		int32_t dx = dr->offset.w;
+		int32_t dy = dr->offset.h;
+		int32_t dw = dr->extent.w;
+		int32_t dh = dr->extent.h;
+		if (dw <= 0 || dh <= 0) {
+			continue;
+		}
+		int32_t x0 = dx < 0 ? 0 : dx;
+		int32_t y0 = dy < 0 ? 0 : dy;
+		int32_t x1 = (dx + dw) > (int32_t)region_w ? (int32_t)region_w : (dx + dw);
+		int32_t y1 = (dy + dh) > (int32_t)region_h ? (int32_t)region_h : (dy + dh);
+		if (x1 <= x0 || y1 <= y0) {
+			continue;
+		}
+
+		// Clip fractions within the original dest rect (carry into the UVs).
+		float fx0 = (float)(x0 - dx) / (float)dw;
+		float fy0 = (float)(y0 - dy) / (float)dh;
+		float fx1 = (float)(x1 - dx) / (float)dw;
+		float fy1 = (float)(y1 - dy) / (float)dh;
+
+		// App sub-rect within the swapchain image (normalized). Default full.
+		struct xrt_normalized_rect nr = layer->data.local_2d.sub.norm_rect;
+		if (nr.w <= 0.0f || nr.h <= 0.0f) {
+			nr.x = 0.0f;
+			nr.y = 0.0f;
+			nr.w = 1.0f;
+			nr.h = 1.0f;
+		}
+
+		float src_x = nr.x + nr.w * fx0;
+		float src_w = nr.w * (fx1 - fx0);
+		float src_y, src_h;
+		if (layer->data.flip_y) {
+			src_y = nr.y + nr.h * (1.0f - fy0);
+			src_h = -(nr.h * (fy1 - fy0));
+		} else {
+			src_y = nr.y + nr.h * fy0;
+			src_h = nr.h * (fy1 - fy0);
+		}
+
+		bool unpremult = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
+
+		comp_d3d12_renderer_flatten_local_2d(c->renderer, c->cmd_list, rtv.ptr, src_res, slot++, x0, y0,
+		                                     (uint32_t)(x1 - x0), (uint32_t)(y1 - y0), src_x, src_y, src_w,
+		                                     src_h, unpremult);
+	}
+
+	// Scratch → sampleable for the masked composite.
+	D3D12_RESOURCE_BARRIER to_psr = {};
+	to_psr.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	to_psr.Transition.pResource = c->local2d_scratch;
+	to_psr.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	to_psr.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	to_psr.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	c->cmd_list->ResourceBarrier(1, &to_psr);
+	return true;
+}
+
 // #439 — composite the authored zone mask. Records into the OPEN c->cmd_list
 // (both call sites are mid-recording in layer_commit). Runs INSTEAD of the
 // rect surround path when an active submitted mask exists (the mask-lerp
@@ -3213,8 +3611,14 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
                           uint32_t dst_h,
                           const struct u_canvas_rect *eff_canvas)
 {
+	// #439 Phase 3: run when EITHER an explicit submitted mask exists (legacy
+	// `texture + mask`, surround supplies the 2D pixels) OR this frame carries
+	// Local2D layers (the layers supply both the 2D pixels and an implicit
+	// mask). Mirrors the D3D11 leg.
 	struct comp_d3d12_zone_mask *mask = c->active_zone_mask;
-	if (mask == nullptr || !mask->submitted || dst == nullptr || dst_rtv == 0 || c->renderer == nullptr) {
+	const bool have_explicit = (mask != nullptr && mask->submitted);
+	const bool have_local_2d = c->local_2d_last_frame;
+	if ((!have_explicit && !have_local_2d) || dst == nullptr || dst_rtv == 0 || c->renderer == nullptr) {
 		return false;
 	}
 
@@ -3231,126 +3635,178 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 		}
 	}
 
-	// The composite is `texture + mask` (impl doc §2): the surround supplies
-	// the 2D pixels. Without one there is nothing to composite — full weave.
-	// D3D12 accepts either sync flavor: keyed mutex (spec v6) or fence (v7).
-	const bool use_fence = (c->surround_fence != nullptr);
-	if (!c->surround_2d.valid || c->surround_texture == nullptr ||
-	    (!use_fence && c->surround_mutex == nullptr)) {
-		static bool no_surround_logged = false;
-		if (!no_surround_logged) {
-			U_LOG_W("D3D12 zone mask: no 2D surround registered — mask ignored "
-			        "(the composite needs xrSetSharedTextureSurround2D(Fence)EXT for the 2D pixels)");
-			no_surround_logged = true;
-		}
-		return false;
-	}
-
-	// Relaxed dims contract (#464): accept a window-sized surround or the
-	// legacy display-sized one — content is top-left-anchored in both; we
-	// copy only the window region.
-	if (c->surround_2d.w < region_w || c->surround_2d.h < region_h) {
-		static bool dims_logged = false;
-		if (!dims_logged) {
-			U_LOG_W("D3D12 zone mask: surround %ux%u smaller than window region %ux%u — "
-			        "mask ignored. Re-register surround on window resize.",
-			        c->surround_2d.w, c->surround_2d.h, region_w, region_h);
-			dims_logged = true;
-		}
-		return false;
-	}
-
-	// Format contract: surround must match dst (same rule as the rect path),
-	// and dst must be one of the two formats the composite has a PSO for —
-	// app-created shared textures are BGRA8 in the wild, DXGI targets RGBA8.
-	D3D12_RESOURCE_DESC sd = c->surround_texture->GetDesc();
+	// Validate the weave-target format up front (both paths): the composite
+	// has PSOs only for RGBA8/BGRA8 UNORM (the lerp is channel-agnostic —
+	// app shared textures are BGRA8 in the wild, DXGI targets RGBA8).
 	D3D12_RESOURCE_DESC dd = dst->GetDesc();
-	if (sd.Format != dd.Format ||
-	    (dd.Format != DXGI_FORMAT_R8G8B8A8_UNORM && dd.Format != DXGI_FORMAT_B8G8R8A8_UNORM)) {
-		static bool fmt_logged = false;
-		if (!fmt_logged) {
-			U_LOG_W("D3D12 zone mask: format mismatch — surround=%u, target=%u "
+	if (dd.Format != DXGI_FORMAT_R8G8B8A8_UNORM && dd.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+		static bool dfmt_logged = false;
+		if (!dfmt_logged) {
+			U_LOG_W("D3D12 zone mask: target format %u unsupported "
 			        "(composite PSOs cover R8G8B8A8/B8G8R8A8 UNORM) — mask ignored",
-			        (unsigned)sd.Format, (unsigned)dd.Format);
-			fmt_logged = true;
+			        (unsigned)dd.Format);
+			dfmt_logged = true;
 		}
 		return false;
 	}
 
-	// Window-sized scratches (the shader samples uv [0,1] over the window
-	// region, so inputs must carry exactly that region).
-	if (!d3d12_ensure_scratch(c, &c->surround_scratch, region_w, region_h, sd.Format, "zone_mask surround")) {
-		return false;
+	// Resolve the mask source: an explicit submitted mask wins; else
+	// rasterize the implicit mask from the Local2D layer rects (M=0 inside the
+	// rect union, M=1 elsewhere — records onto the open cmd-list).
+	ID3D12Resource *mask_res = nullptr;
+	if (have_explicit) {
+		mask_res = mask->staged;
+	} else {
+		struct xrt_rect rects[XRT_MAX_LAYERS];
+		uint32_t rect_count = 0;
+		for (uint32_t i = 0; i < c->layer_accum.layer_count && rect_count < XRT_MAX_LAYERS; i++) {
+			if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
+				rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
+			}
+		}
+		mask_res = d3d12_update_implicit_mask(c, rects, rect_count, region_w, region_h);
 	}
-	if (!d3d12_ensure_scratch(c, &c->weave_scratch, region_w, region_h, dd.Format, "zone_mask weave")) {
+	if (mask_res == nullptr) {
 		return false;
 	}
 
-	// Surround sync — same flavors as d3d12_blit_surround_strips: fence →
-	// queue->Wait gates the caller's later ExecuteCommandLists; mutex →
-	// AcquireSync(0, 16) bracket around the recording (the shipping v6
-	// pattern), short timeout — skip a frame rather than stall.
-	if (use_fence) {
-		HRESULT hr = c->command_queue->Wait(c->surround_fence, c->surround_await_fence_value);
-		if (FAILED(hr)) {
-			static bool wait_logged = false;
-			if (!wait_logged) {
-				U_LOG_W("D3D12 zone mask: queue->Wait(fence=%p, value=%llu) failed (hr=0x%08x). "
-				        "Composite skipped.",
-				        (void *)c->surround_fence,
-				        (unsigned long long)c->surround_await_fence_value, hr);
-				wait_logged = true;
+	// Resolve the `twod` source + a window-sized weave snapshot scratch.
+	// Local2D layers (Phase 3) SUPERSEDE any registered surround for this
+	// frame: flatten them into the dedicated local2d_scratch. Otherwise the
+	// legacy `texture + mask` path copies the app surround.
+	ID3D12Resource *twod_res = nullptr;
+	if (have_local_2d) {
+		if (!d3d12_ensure_local2d_scratch(c, region_w, region_h)) {
+			return false;
+		}
+		if (!d3d12_ensure_scratch(c, &c->weave_scratch, region_w, region_h, dd.Format, "local2d weave")) {
+			return false;
+		}
+		if (!d3d12_flatten_local_2d_layers(c, region_w, region_h)) {
+			return false;
+		}
+		twod_res = c->local2d_scratch;
+	} else {
+		// The composite is `texture + mask` (impl doc §2): the surround
+		// supplies the 2D pixels. Without one there is nothing to composite —
+		// full weave. D3D12 accepts either sync flavor: keyed mutex (v6) or
+		// fence (v7). These guards gate ONLY this path so the legacy behavior
+		// stays byte-identical when no Local2D layers are present.
+		const bool use_fence = (c->surround_fence != nullptr);
+		if (!c->surround_2d.valid || c->surround_texture == nullptr ||
+		    (!use_fence && c->surround_mutex == nullptr)) {
+			static bool no_surround_logged = false;
+			if (!no_surround_logged) {
+				U_LOG_W("D3D12 zone mask: no 2D surround registered — mask ignored "
+				        "(the composite needs xrSetSharedTextureSurround2D(Fence)EXT for the 2D pixels)");
+				no_surround_logged = true;
 			}
 			return false;
 		}
-	} else {
-		HRESULT hr = c->surround_mutex->AcquireSync(0, 16);
-		if (FAILED(hr)) {
-			return false; // timeout/abandoned — previous frame's pixels stay.
+
+		// Relaxed dims contract (#464): accept a window-sized surround or the
+		// legacy display-sized one — content is top-left-anchored in both; we
+		// copy only the window region.
+		if (c->surround_2d.w < region_w || c->surround_2d.h < region_h) {
+			static bool dims_logged = false;
+			if (!dims_logged) {
+				U_LOG_W("D3D12 zone mask: surround %ux%u smaller than window region %ux%u — "
+				        "mask ignored. Re-register surround on window resize.",
+				        c->surround_2d.w, c->surround_2d.h, region_w, region_h);
+				dims_logged = true;
+			}
+			return false;
 		}
-	}
 
-	// Copy the window region of the app surround into its scratch.
-	D3D12_RESOURCE_BARRIER enter[2] = {};
-	enter[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	enter[0].Transition.pResource = c->surround_texture;
-	enter[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-	enter[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-	enter[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	enter[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	enter[1].Transition.pResource = c->surround_scratch;
-	enter[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-	enter[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-	enter[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	c->cmd_list->ResourceBarrier(2, enter);
+		// Format contract: surround must match dst (same rule as the rect path).
+		D3D12_RESOURCE_DESC sd = c->surround_texture->GetDesc();
+		if (sd.Format != dd.Format) {
+			static bool fmt_logged = false;
+			if (!fmt_logged) {
+				U_LOG_W("D3D12 zone mask: format mismatch — surround=%u, target=%u — mask ignored",
+				        (unsigned)sd.Format, (unsigned)dd.Format);
+				fmt_logged = true;
+			}
+			return false;
+		}
 
-	D3D12_TEXTURE_COPY_LOCATION dst_loc = {};
-	dst_loc.pResource = c->surround_scratch;
-	dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-	dst_loc.SubresourceIndex = 0;
-	D3D12_TEXTURE_COPY_LOCATION src_loc = {};
-	src_loc.pResource = c->surround_texture;
-	src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-	src_loc.SubresourceIndex = 0;
-	D3D12_BOX region_box = {0, 0, 0, region_w, region_h, 1};
-	c->cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &region_box);
+		// Window-sized scratches (the shader samples uv [0,1] over the window
+		// region, so inputs must carry exactly that region).
+		if (!d3d12_ensure_scratch(c, &c->surround_scratch, region_w, region_h, sd.Format,
+		                          "zone_mask surround")) {
+			return false;
+		}
+		if (!d3d12_ensure_scratch(c, &c->weave_scratch, region_w, region_h, dd.Format, "zone_mask weave")) {
+			return false;
+		}
 
-	// Surround back to COMMON (cross-process invariant), scratch → sampleable.
-	D3D12_RESOURCE_BARRIER exit_sr[2] = {};
-	exit_sr[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	exit_sr[0].Transition.pResource = c->surround_texture;
-	exit_sr[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-	exit_sr[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-	exit_sr[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	exit_sr[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	exit_sr[1].Transition.pResource = c->surround_scratch;
-	exit_sr[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-	exit_sr[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-	exit_sr[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	c->cmd_list->ResourceBarrier(2, exit_sr);
+		// Surround sync — same flavors as d3d12_blit_surround_strips: fence →
+		// queue->Wait gates the caller's later ExecuteCommandLists; mutex →
+		// AcquireSync(0, 16) bracket around the recording (the shipping v6
+		// pattern), short timeout — skip a frame rather than stall.
+		if (use_fence) {
+			HRESULT hr = c->command_queue->Wait(c->surround_fence, c->surround_await_fence_value);
+			if (FAILED(hr)) {
+				static bool wait_logged = false;
+				if (!wait_logged) {
+					U_LOG_W("D3D12 zone mask: queue->Wait(fence=%p, value=%llu) failed (hr=0x%08x). "
+					        "Composite skipped.",
+					        (void *)c->surround_fence,
+					        (unsigned long long)c->surround_await_fence_value, hr);
+					wait_logged = true;
+				}
+				return false;
+			}
+		} else {
+			HRESULT hr = c->surround_mutex->AcquireSync(0, 16);
+			if (FAILED(hr)) {
+				return false; // timeout/abandoned — previous frame's pixels stay.
+			}
+		}
 
-	if (!use_fence) {
-		c->surround_mutex->ReleaseSync(0);
+		// Copy the window region of the app surround into its scratch.
+		D3D12_RESOURCE_BARRIER enter[2] = {};
+		enter[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		enter[0].Transition.pResource = c->surround_texture;
+		enter[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+		enter[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+		enter[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		enter[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		enter[1].Transition.pResource = c->surround_scratch;
+		enter[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+		enter[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+		enter[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		c->cmd_list->ResourceBarrier(2, enter);
+
+		D3D12_TEXTURE_COPY_LOCATION dst_loc = {};
+		dst_loc.pResource = c->surround_scratch;
+		dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		dst_loc.SubresourceIndex = 0;
+		D3D12_TEXTURE_COPY_LOCATION src_loc = {};
+		src_loc.pResource = c->surround_texture;
+		src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		src_loc.SubresourceIndex = 0;
+		D3D12_BOX region_box = {0, 0, 0, region_w, region_h, 1};
+		c->cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &region_box);
+
+		// Surround back to COMMON (cross-process invariant), scratch → sampleable.
+		D3D12_RESOURCE_BARRIER exit_sr[2] = {};
+		exit_sr[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		exit_sr[0].Transition.pResource = c->surround_texture;
+		exit_sr[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+		exit_sr[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+		exit_sr[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		exit_sr[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		exit_sr[1].Transition.pResource = c->surround_scratch;
+		exit_sr[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+		exit_sr[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		exit_sr[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		c->cmd_list->ResourceBarrier(2, exit_sr);
+
+		if (!use_fence) {
+			c->surround_mutex->ReleaseSync(0);
+		}
+		twod_res = c->surround_scratch;
 	}
 
 	// Snapshot the window region of the weave (the DP wrote dst; the weave
@@ -3368,9 +3824,16 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	weave_enter[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 	c->cmd_list->ResourceBarrier(2, weave_enter);
 
-	dst_loc.pResource = c->weave_scratch;
-	src_loc.pResource = dst;
-	c->cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &region_box);
+	D3D12_TEXTURE_COPY_LOCATION weave_dst_loc = {};
+	weave_dst_loc.pResource = c->weave_scratch;
+	weave_dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	weave_dst_loc.SubresourceIndex = 0;
+	D3D12_TEXTURE_COPY_LOCATION weave_src_loc = {};
+	weave_src_loc.pResource = dst;
+	weave_src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	weave_src_loc.SubresourceIndex = 0;
+	D3D12_BOX weave_box = {0, 0, 0, region_w, region_h, 1};
+	c->cmd_list->CopyTextureRegion(&weave_dst_loc, 0, 0, 0, &weave_src_loc, &weave_box);
 
 	// Weave scratch → sampleable; dst → RENDER_TARGET for the composite draw.
 	D3D12_RESOURCE_BARRIER weave_exit[2] = {};
@@ -3402,11 +3865,22 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	uint32_t cright = (cx_u + cw > region_w) ? region_w : cx_u + cw;
 	uint32_t cbottom = (cy_u + ch > region_h) ? region_h : cy_u + ch;
 
+	// One-shot proof-of-life (capture is pre-weave, #492 — this is how we
+	// confirm the post-weave composite ran without a live eyeball).
+	static bool composite_logged = false;
+	if (!composite_logged) {
+		U_LOG_W("D3D12 Local2D composite: %ux%u region, %s mask, twod=%s", region_w, region_h,
+		        have_explicit ? "explicit" : "implicit", have_local_2d ? "local2d layers" : "surround");
+		composite_logged = true;
+	}
+
 	xrt_result_t xret = comp_d3d12_renderer_composite_2d_masked(
-	    c->renderer, c->cmd_list, dst_rtv, static_cast<uint32_t>(dd.Format), c->surround_scratch, mask->staged,
+	    c->renderer, c->cmd_list, dst_rtv, static_cast<uint32_t>(dd.Format), twod_res, mask_res,
 	    c->weave_scratch, region_w, region_h, (int32_t)cx_u, (int32_t)cy_u, cright - cx_u, cbottom - cy_u);
 
 	// Restore steady states: dst → caller's post state, scratches → COMMON.
+	// twod_res is whichever scratch supplied the 2D pixels (local2d or
+	// surround); both sit in PIXEL_SHADER_RESOURCE after their setup above.
 	D3D12_RESOURCE_BARRIER restore[3] = {};
 	uint32_t n = 0;
 	if (dst_post_state != D3D12_RESOURCE_STATE_RENDER_TARGET) {
@@ -3418,7 +3892,7 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 		n++;
 	}
 	restore[n].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	restore[n].Transition.pResource = c->surround_scratch;
+	restore[n].Transition.pResource = twod_res;
 	restore[n].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 	restore[n].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
 	restore[n].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -3740,6 +4214,30 @@ comp_d3d12_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_pt
 		mask->tex->Release();
 	}
 	free(mask);
+}
+
+// #439 Phase 3 Q4 — the compositor's current recommended per-view render size,
+// polled at frame end by oxr to fire XrEventDataLocal3DZoneViewSizeChangedEXT
+// on a change (mask/Local2D activation or window resize supersedes the canvas).
+// Returns false if no renderer / zero dims. Mirrors the D3D11 getter.
+extern "C" bool
+comp_d3d12_compositor_get_recommended_view_size(struct xrt_compositor *xc, uint32_t *out_w, uint32_t *out_h)
+{
+	struct comp_d3d12_compositor *c = d3d12_comp(xc);
+	std::lock_guard<std::mutex> lock(c->mutex);
+
+	if (out_w == nullptr || out_h == nullptr || c->renderer == nullptr) {
+		return false;
+	}
+	uint32_t vw = 0;
+	uint32_t vh = 0;
+	comp_d3d12_renderer_get_view_dimensions(c->renderer, &vw, &vh);
+	if (vw == 0 || vh == 0) {
+		return false;
+	}
+	*out_w = vw;
+	*out_h = vh;
+	return true;
 }
 
 /*
