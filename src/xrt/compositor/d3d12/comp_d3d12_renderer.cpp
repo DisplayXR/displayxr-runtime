@@ -179,7 +179,7 @@ cbuffer CompositeParams : register(b0)
     float2 canvas_origin;
     float2 canvas_size;
     uint   use_rect_mask;
-    uint   _pad;
+    uint   alpha_over;   // #491: premul "over" of the 2D atop the weave
 };
 
 struct VS_OUTPUT
@@ -203,10 +203,10 @@ float region_mask(float2 px, float2 uv)
 float4 PSMain(VS_OUTPUT input) : SV_Target
 {
     float2 px = input.uv * dst_dims;
-    float M = region_mask(px, input.uv);
 
     if (use_rect_mask)
     {
+        float M = region_mask(px, input.uv);
         if (M >= 0.5)
             discard;
         return twod_tex.Sample(samp, input.uv);
@@ -214,6 +214,13 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
 
     float4 twod  = twod_tex.Sample(samp, input.uv);
     float4 weave = weave_tex.Sample(samp, input.uv);
+    if (alpha_over != 0)
+    {
+        // #491: the 2D layer's own (premultiplied) alpha IS the blend —
+        // translucent 2D reveals the 3D scene, not the desktop.
+        return twod + (1.0 - twod.a) * weave;
+    }
+    float M = saturate(mask_tex.Sample(samp, input.uv).r);
     return M * weave + (1.0 - M) * twod;
 }
 )";
@@ -228,7 +235,7 @@ struct CompositeParams
 	float canvas_origin[2];
 	float canvas_size[2];
 	uint32_t use_rect_mask;
-	uint32_t _pad;
+	uint32_t alpha_over; // #491
 };
 
 // #439 Phase 3 — Local2D flatten. Reuses the masked_composite fullscreen-triangle
@@ -1743,7 +1750,8 @@ comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
                                         int32_t cx,
                                         int32_t cy,
                                         uint32_t cw,
-                                        uint32_t ch)
+                                        uint32_t ch,
+                                        bool alpha_over)
 {
 	if (renderer == nullptr || cmd_list_ptr == nullptr || dst_rtv_handle == 0 || twod_resource == nullptr ||
 	    mask_resource == nullptr || weave_resource == nullptr) {
@@ -1808,6 +1816,7 @@ comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
 	// The D3D12 leg always composites an authored mask; the analytic rect
 	// path (use_rect_mask=1) exists for shader parity with D3D11 only.
 	params.use_rect_mask = 0;
+	params.alpha_over = alpha_over ? 1u : 0u; // #491: implicit Local2D = premul over
 
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv = {};
 	rtv.ptr = static_cast<SIZE_T>(dst_rtv_handle);

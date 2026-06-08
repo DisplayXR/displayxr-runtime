@@ -411,14 +411,22 @@ static NSString *const metal_shader_source = @
     "// shows the flattened 2D layer; BOTH rgb and alpha are lerped so each\n"
     "// layer's own transparency survives to the compose-under-bg pass\n"
     "// (spec 4.2 output-alpha rule).\n"
+    "// #491 alpha_over path: premultiplied 'over' of the 2D atop the weave\n"
+    "// (twod + (1-twod.a)*weave) — translucent 2D reveals the 3D scene, not\n"
+    "// the desktop. Used for the IMPLICIT Local2D mask; explicit masks keep\n"
+    "// the hard M-lerp.\n"
     "fragment float4 masked_composite_fragment(VertexOut in [[stage_in]],\n"
     "                                          texture2d<float> twod_tex [[texture(0)]],\n"
     "                                          texture2d<float> mask_tex [[texture(1)]],\n"
     "                                          texture2d<float> weave_tex [[texture(2)]],\n"
+    "                                          constant uint &alpha_over [[buffer(0)]],\n"
     "                                          sampler smp [[sampler(0)]]) {\n"
-    "    float M = saturate(mask_tex.sample(smp, in.texCoord).r);\n"
     "    float4 twod = twod_tex.sample(smp, in.texCoord);\n"
     "    float4 weave = weave_tex.sample(smp, in.texCoord);\n"
+    "    if (alpha_over != 0u) {\n"
+    "        return twod + (1.0 - twod.a) * weave;\n"
+    "    }\n"
+    "    float M = saturate(mask_tex.sample(smp, in.texCoord).r);\n"
     "    return M * weave + (1.0 - M) * twod;\n"
     "}\n";
 
@@ -2205,10 +2213,17 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 		vp.zfar = 1.0;
 		[enc setViewport:vp];
 
+		// #491: the implicit (auto) Local2D mask composites the 2D over the
+		// weave by its own premultiplied alpha (translucent 2D reveals the 3D
+		// scene). The explicit authored mask keeps the hard M-lerp.
+		const bool have_explicit = (c->zone_mask_active != NULL && c->zone_mask_active->submitted);
+		uint alpha_over = (have_local_2d && !have_explicit) ? 1u : 0u;
+
 		[enc setRenderPipelineState:c->masked_composite_pipeline];
 		[enc setFragmentTexture:c->local2d_scratch atIndex:0];
 		[enc setFragmentTexture:mask_tex atIndex:1];
 		[enc setFragmentTexture:c->weave_scratch atIndex:2];
+		[enc setFragmentBytes:&alpha_over length:sizeof(alpha_over) atIndex:0];
 		[enc setFragmentSamplerState:c->sampler_nearest atIndex:0];
 		[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 

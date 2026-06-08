@@ -170,6 +170,12 @@ vk_local2d_composite_flatten_draw(struct vk_local2d_composite *lc,
  *
  * @param region_w,region_h  Window region (uv [0,1] spans this).
  * @param cx,cy,cw,ch        Canvas rect (only used by the rect path).
+ * @param alpha_over         #491: when true (and not the rect path), composite
+ *                           the 2D over the weave by its own premultiplied alpha
+ *                           (final = twod + (1-twod.a)*weave) instead of the
+ *                           hard M-lerp — translucent 2D reveals the 3D scene.
+ *                           Use for the IMPLICIT mask; false for an explicit
+ *                           authored mask (designer cutout/portal).
  * @ingroup aux_vk
  */
 void
@@ -187,7 +193,8 @@ vk_local2d_composite_draw(struct vk_local2d_composite *lc,
                           int32_t cx,
                           int32_t cy,
                           uint32_t cw,
-                          uint32_t ch);
+                          uint32_t ch,
+                          bool alpha_over);
 
 /*!
  * Destroy composite resources.

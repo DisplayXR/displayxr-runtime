@@ -25,6 +25,7 @@ struct composite_push
 	float canvas_origin[2];
 	float canvas_size[2];
 	uint32_t use_rect_mask;
+	uint32_t alpha_over; // #491: implicit path = premul "over" (twod + (1-a)*weave)
 };
 
 // Must match the local2d_flatten.frag push_constant block.
@@ -544,7 +545,8 @@ vk_local2d_composite_draw(struct vk_local2d_composite *lc,
                           int32_t cx,
                           int32_t cy,
                           uint32_t cw,
-                          uint32_t ch)
+                          uint32_t ch,
+                          bool alpha_over)
 {
 	if (!lc->initialized || target_fb == VK_NULL_HANDLE || twod_view == VK_NULL_HANDLE || region_w == 0 ||
 	    region_h == 0) {
@@ -593,6 +595,7 @@ vk_local2d_composite_draw(struct vk_local2d_composite *lc,
 	    .canvas_origin = {(float)cx, (float)cy},
 	    .canvas_size = {(float)cw, (float)ch},
 	    .use_rect_mask = use_rect_mask ? 1u : 0u,
+	    .alpha_over = (!use_rect_mask && alpha_over) ? 1u : 0u,
 	};
 	vk->vkCmdPushConstants(cmd, lc->composite_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
 

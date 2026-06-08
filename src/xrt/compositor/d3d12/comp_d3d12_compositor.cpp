@@ -3865,18 +3865,25 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	uint32_t cright = (cx_u + cw > region_w) ? region_w : cx_u + cw;
 	uint32_t cbottom = (cy_u + ch > region_h) ? region_h : cy_u + ch;
 
+	// #491: the implicit (auto) Local2D mask composites the 2D over the weave by
+	// its own premultiplied alpha (translucent 2D reveals the 3D scene). The
+	// explicit authored mask + the legacy surround path keep the hard M-lerp.
+	const bool alpha_over = have_local_2d && !have_explicit;
+
 	// One-shot proof-of-life (capture is pre-weave, #492 — this is how we
 	// confirm the post-weave composite ran without a live eyeball).
 	static bool composite_logged = false;
 	if (!composite_logged) {
-		U_LOG_W("D3D12 Local2D composite: %ux%u region, %s mask, twod=%s", region_w, region_h,
-		        have_explicit ? "explicit" : "implicit", have_local_2d ? "local2d layers" : "surround");
+		U_LOG_W("D3D12 Local2D composite: %ux%u region, %s mask, twod=%s (#491 alpha_over=%d)", region_w,
+		        region_h, have_explicit ? "explicit" : "implicit",
+		        have_local_2d ? "local2d layers" : "surround", alpha_over);
 		composite_logged = true;
 	}
 
 	xrt_result_t xret = comp_d3d12_renderer_composite_2d_masked(
 	    c->renderer, c->cmd_list, dst_rtv, static_cast<uint32_t>(dd.Format), twod_res, mask_res,
-	    c->weave_scratch, region_w, region_h, (int32_t)cx_u, (int32_t)cy_u, cright - cx_u, cbottom - cy_u);
+	    c->weave_scratch, region_w, region_h, (int32_t)cx_u, (int32_t)cy_u, cright - cx_u, cbottom - cy_u,
+	    alpha_over);
 
 	// Restore steady states: dst → caller's post state, scratches → COMMON.
 	// twod_res is whichever scratch supplied the 2D pixels (local2d or
