@@ -1954,13 +1954,18 @@ static void poll_eye_poses(Bridge &b) {
 	const XrViewDisplayRawEXT *rawp =
 	    (b.has_view_rig_ext && raw.eyeCountOutput > 0) ? &raw : nullptr;
 
-	// One-shot proof the formal channel is live + value-identity A/B against
-	// the XrView poses on the SAME locate (raw eyes must equal XrView pose
-	// positions by construction). All logs one-shot — never per-frame.
+	// One-shot-per-tracking-state proof that the formal channel is live, plus a
+	// value-identity A/B against the XrView poses on the SAME locate. The
+	// identity (raw eyes == XrView pose positions) only holds when TRACKED:
+	// then both are the same server-side DP eyes. When NOT tracked the bridge
+	// relays the nominal-viewer eyes (z≈0.6) — deliberately NOT equal to the
+	// XrView fallback (z=0); nominal is the correct render fallback, so a
+	// difference there is expected, not a violation. Log each state once.
 	if (rawp != nullptr) {
-		static bool raw_live_logged = false;
-		if (!raw_live_logged) {
-			raw_live_logged = true;
+		static bool logged_tracked = false, logged_untracked = false;
+		bool tracked = raw.isTracking == XR_TRUE;
+		if ((tracked && !logged_tracked) || (!tracked && !logged_untracked)) {
+			if (tracked) logged_tracked = true; else logged_untracked = true;
 			LOG_I("view-rig raw channel LIVE: eyes=%u tracking=%d sampleTimeNs=%lld "
 			      "canvas=%dx%d@(%d,%d) %.4fx%.4fm",
 			      raw.eyeCountOutput, (int)raw.isTracking, (long long)raw.sampleTimeNs,
@@ -1979,9 +1984,13 @@ static void poll_eye_poses(Bridge &b) {
 				      i, views[i].pose.position.x, views[i].pose.position.y,
 				      views[i].pose.position.z, d);
 			}
-			if (worst > 1e-6f) {
-				LOG_W("view-rig raw/XrView identity VIOLATED: worst delta=%.2e "
-				      "(expected ~0 — both are pre-rebase DP eyes)", worst);
+			// Identity is only contractual while tracked.
+			if (tracked && worst > 1e-4f) {
+				LOG_W("view-rig raw/XrView identity VIOLATED while tracked: worst "
+				      "delta=%.2e (expected ~0 — both are the same DP eyes)", worst);
+			} else if (!tracked) {
+				LOG_I("  (untracked: raw uses nominal-viewer eyes; differs from the "
+				      "XrView z=0 fallback by design)");
 			}
 		}
 	}
