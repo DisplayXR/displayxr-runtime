@@ -388,7 +388,7 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   XrResult xrCaptureAtlasEXT(XrSession, const XrAtlasCaptureInfoEXT*, XrAtlasCaptureResultEXT* /*may be NULL*/);
   ```
   Header `src/external/openxr_includes/openxr/XR_EXT_atlas_capture.h`; impl
-  `src/xrt/state_trackers/oxr/oxr_capture.c`; design `docs/roadmap/unified-atlas-capture.md`.
+  `src/xrt/state_trackers/oxr/oxr_capture.c`; design `docs/adr/ADR-023-unified-atlas-capture.md`.
 
 - **INV-7.2 — `pathPrefix` is an in-struct char[256] with NO extension.** The runtime appends
   `_atlas.png`. Pass a path prefix only.

@@ -26,7 +26,7 @@
  *   workspace mode — so POST_COMPOSE over IPC is reported UNSUPPORTED for a
  *   single non-workspace client.
  *
- * Full design: docs/roadmap/unified-atlas-capture.md (W6 of issue #396).
+ * Full design: docs/adr/ADR-023-unified-atlas-capture.md (W6 of issue #396).
  */
 
 #include "oxr_objects.h"

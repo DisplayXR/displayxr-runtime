@@ -35,7 +35,7 @@
  * an app's own rig is honored by default (app visual policy within its canvas),
  * but in workspace mode the controller may take over the clients' view geometry
  * through this call (e.g. forcing identity m2v during a layout animation). Full
- * design: docs/roadmap/raw-vs-render-ready-views.md (W7 of issue #396).
+ * design: docs/adr/ADR-024-raw-vs-render-ready-views.md (W7 of issue #396).
  */
 #ifndef XR_EXT_VIEW_RIG_H
 #define XR_EXT_VIEW_RIG_H 1

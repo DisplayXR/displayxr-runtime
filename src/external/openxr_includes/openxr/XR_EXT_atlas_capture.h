@@ -15,7 +15,7 @@
  * Any session class (handle / texture / hosted / IPC) may call it. The
  * privileged cross-client workspace capture (xrCaptureWorkspaceFrameEXT in
  * XR_EXT_spatial_workspace) stays separate; the two share the runtime readback
- * core. Full design: docs/roadmap/unified-atlas-capture.md (W6 of issue #396).
+ * core. Full design: docs/adr/ADR-023-unified-atlas-capture.md (W6 of issue #396).
  */
 #ifndef XR_EXT_ATLAS_CAPTURE_H
 #define XR_EXT_ATLAS_CAPTURE_H 1

@@ -102,6 +102,14 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-014](adr/ADR-014-shell-owns-rendering-mode.md) — Shell owns rendering mode
 - [ADR-015](adr/ADR-015-displayxr-owns-multi-display-vendor-routing.md) — DisplayXR owns multi-display vendor routing
 - [ADR-016](adr/ADR-016-workspace-controllers-own-tray-surface-and-lifecycle.md) — Workspace controllers own tray surface and lifecycle
+- [ADR-017](adr/ADR-017-modal-dialogs-tiered-strategy.md) — Tiered strategy for Win32 modal dialogs
+- [ADR-018](adr/ADR-018-workspace-hit-test-plumbing-vs-policy.md) — Workspace hit-test is plumbing; policy is the controller's
+- [ADR-019](adr/ADR-019-vendor-plugin-aux-boundary.md) — Aux library boundary for vendor plug-in DLLs
+- [ADR-020](adr/ADR-020-plugin-abi-compatibility-policy.md) — Plug-in ABI compatibility policy
+- [ADR-021](adr/ADR-021-color-management-encoding-state-invariant.md) — Color management & the encoding-state invariant
+- [ADR-022](adr/ADR-022-per-mode-capability-flags-frozen-enum-structs.md) — Per-mode capability flags + frozen enumerated app structs
+- [ADR-023](adr/ADR-023-unified-atlas-capture.md) — Unified atlas capture (`XR_EXT_atlas_capture`)
+- [ADR-024](adr/ADR-024-raw-vs-render-ready-views.md) — Raw vs render-ready views (`XR_EXT_view_rig`)
 
 ---
 
@@ -115,7 +123,6 @@ Design docs, status trackers, and plans — some shipped, some in progress. Afte
 - [Workspace/Runtime Contract](roadmap/workspace-runtime-contract.md) — IPC between a workspace controller and the runtime
 - **MCP** — framework extracted to [`DisplayXR/displayxr-mcp`](https://github.com/DisplayXR/displayxr-mcp). See the [MCP spec](https://github.com/DisplayXR/displayxr-mcp/blob/main/docs/mcp-spec.md) for the protocol; Phase A (handle-app introspection) and Phase B (workspace tools, hosted in `displayxr-shell-pvt`) both shipped.
 - [Desktop Overlay Apps — Forward Work](roadmap/avatar-overlay-native.md) — follow-on work after the transparent HWND path shipped (#191)
-- [Unified Atlas Capture](roadmap/unified-atlas-capture.md) — one runtime capture API (`XR_EXT_atlas_capture`, #396 W6; shipped in runtime v1.10.0)
 
 ### Planned / In Progress
 
@@ -128,7 +135,6 @@ Design docs, status trackers, and plans — some shipped, some in progress. Afte
 - [Workspace Activation Auth Handshake](roadmap/spatial-workspace-auth-handshake.md) — Phase 2.0 prep: orchestrator-PID match replaces the brand-coupled `application_name == "displayxr-shell"` check
 - [Phase 2 Audit](roadmap/spatial-workspace-extensions-phase2-audit.md) — line-by-line classification of the remaining `shell` mentions in `comp_d3d11_service.cpp`
 - [Per-App MCP Tools & Workspace Aggregator](roadmap/per-app-mcp-tools.md) — apps register their own MCP tools via `XR_EXT_mcp_tools`; one-connection `--target workspace` aggregator with `<app-id>__<tool>` namespacing
-- [Raw vs Render-Ready Views](roadmap/raw-vs-render-ready-views.md) — `XR_EXT_view_rig`: apps feed Kooima rig descriptors, runtime does the view math (#396 W7)
 - [WebXR Bridge v2 Plan](roadmap/webxr-bridge-v2-plan.md) — metadata/control sideband for Chrome's native WebXR
 - [Display Spatial Model](roadmap/display-spatial-model.md) — displays in the spatial graph (#46)
 - [Multi-Display Single Machine](roadmap/multi-display-single-machine.md) — multiple displays, one machine (#69)
