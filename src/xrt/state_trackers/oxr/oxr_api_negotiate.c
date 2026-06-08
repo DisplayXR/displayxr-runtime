@@ -505,6 +505,14 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrSubmitMCPToolResultEXT, EXT_mcp_tools);
 #endif
 
+#ifdef OXR_HAVE_EXT_conformance_automation
+	ENTRY_IF_EXT(xrSetInputDeviceActiveEXT, EXT_conformance_automation);
+	ENTRY_IF_EXT(xrSetInputDeviceStateBoolEXT, EXT_conformance_automation);
+	ENTRY_IF_EXT(xrSetInputDeviceStateFloatEXT, EXT_conformance_automation);
+	ENTRY_IF_EXT(xrSetInputDeviceStateVector2fEXT, EXT_conformance_automation);
+	ENTRY_IF_EXT(xrSetInputDeviceLocationEXT, EXT_conformance_automation);
+#endif
+
 	// xrSetSharedTextureOutputRectEXT — canvas sub-rect, part of window binding extensions
 #ifdef OXR_HAVE_EXT_win32_window_binding
 	ENTRY_IF_EXT(xrSetSharedTextureOutputRectEXT, EXT_win32_window_binding);

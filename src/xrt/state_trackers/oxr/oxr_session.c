@@ -2500,6 +2500,11 @@ oxr_session_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 	oxr_workspace_modal_win32_fini(sess);
 #endif
 
+	// XR_EXT_conformance_automation: free synthetic-input state (incl. mutex).
+	// No-op if the extension was never used. Done here so nothing outlives the
+	// session across the CTS's rapid create/destroy cycling.
+	oxr_conformance_teardown(sess);
+
 	XrResult ret = oxr_event_remove_session_events(log, sess);
 
 	oxr_session_binding_destroy_all(log, sess);

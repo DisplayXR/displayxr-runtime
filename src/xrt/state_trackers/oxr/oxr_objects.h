@@ -510,6 +510,93 @@ oxr_action_get_pose_input(struct oxr_session *sess,
                           const struct oxr_subaction_paths *subaction_paths_ptr,
                           struct oxr_action_input **out_input);
 
+
+/*
+ *
+ * oxr_conformance.c — XR_EXT_conformance_automation synthetic input.
+ *
+ */
+
+/*!
+ * Lazily initialize the session's conformance-automation state (mutex etc.).
+ * Idempotent. Called from the entry points before mutating state.
+ *
+ * @public @memberof oxr_session
+ */
+XrResult
+oxr_conformance_init(struct oxr_logger *log, struct oxr_session *sess);
+
+/*!
+ * Tear down the conformance-automation state. Safe to call on a session that
+ * never used the extension (no-op when not inited).
+ *
+ * @public @memberof oxr_session
+ */
+void
+oxr_conformance_teardown(struct oxr_session *sess);
+
+/*!
+ * Mark a top-level user path (device) active/inactive — xrSetInputDeviceActiveEXT.
+ *
+ * @public @memberof oxr_session
+ */
+XrResult
+oxr_conformance_set_device_active(
+    struct oxr_logger *log, struct oxr_session *sess, XrPath top_level_path, bool active);
+
+/*!
+ * Store a synthetic value (bool/float/vec2) for an input source — the
+ * xrSetInputDeviceState*EXT family. @p type selects the union member in @p value.
+ *
+ * @public @memberof oxr_session
+ */
+XrResult
+oxr_conformance_set_input_value(struct oxr_logger *log,
+                                struct oxr_session *sess,
+                                XrPath top_level_path,
+                                XrPath source_path,
+                                enum xrt_input_type type,
+                                union xrt_input_value value);
+
+/*!
+ * Store a synthetic pose for an input source — xrSetInputDeviceLocationEXT.
+ *
+ * @public @memberof oxr_session
+ */
+XrResult
+oxr_conformance_set_input_pose(struct oxr_logger *log,
+                               struct oxr_session *sess,
+                               XrPath top_level_path,
+                               XrPath source_path,
+                               struct xrt_pose pose);
+
+/*!
+ * Look up a value override for a bound input source. Returns true and fills the
+ * out params when an override applies (extension enabled, override present, and
+ * the owning device marked active). Called from the xrSyncActions hot path —
+ * returns false immediately when the extension is disabled.
+ *
+ * @public @memberof oxr_session
+ */
+bool
+oxr_conformance_lookup_value(struct oxr_session *sess,
+                             XrPath source_path,
+                             union xrt_input_value *out_value,
+                             int64_t *out_timestamp);
+
+/*!
+ * Look up a pose override for a bound input source. Returns true and fills
+ * @p out_relation when a pose override applies. Hot-path safe like
+ * @ref oxr_conformance_lookup_value.
+ *
+ * @public @memberof oxr_session
+ */
+bool
+oxr_conformance_lookup_pose(struct oxr_session *sess,
+                            XrPath source_path,
+                            struct xrt_space_relation *out_relation);
+
+
 /*!
  * @public @memberof oxr_instance
  */
@@ -2099,6 +2186,63 @@ struct oxr_view_rig_state
 };
 
 /*!
+ * Maximum number of distinct input sources the conformance-automation
+ * extension (@ref XR_EXT_conformance_automation) can hold synthetic state for
+ * at once. The CTS drives only a handful of sources per session; this is a
+ * generous bound.
+ */
+#define OXR_MAX_CONFORMANCE_OVERRIDES 64
+
+/*!
+ * Maximum number of top-level user paths (e.g. /user/hand/left) the
+ * conformance-automation extension tracks an active/inactive flag for.
+ */
+#define OXR_MAX_CONFORMANCE_DEVICES 8
+
+/*!
+ * One synthetic input value injected via @ref XR_EXT_conformance_automation.
+ * Keyed by @ref source_path which equals the suggested-binding path the CTS
+ * passes as `inputSourcePath` — the same value stored in
+ * @ref oxr_action_input::bound_path, so no reverse path→device mapping is
+ * needed.
+ *
+ * @ingroup oxr_input
+ */
+struct oxr_conformance_override
+{
+	bool used;
+	XrPath top_level_path; //!< Owning device, e.g. /user/hand/left.
+	XrPath source_path;    //!< Matches @ref oxr_action_input::bound_path.
+
+	enum xrt_input_type type;
+	union xrt_input_value value;
+	int64_t timestamp;
+
+	bool is_pose;                   //!< True for xrSetInputDeviceLocationEXT.
+	struct xrt_space_relation pose; //!< Synthetic pose when @ref is_pose.
+};
+
+/*!
+ * Per-session synthetic-input state for @ref XR_EXT_conformance_automation.
+ * Lives inside @ref oxr_session so it is created and freed with the session —
+ * the CTS loads and unloads the runtime hundreds of times, so no state may
+ * outlive the instance (see ADR notes / legacy-monado teardown race).
+ *
+ * @ingroup oxr_input
+ */
+struct oxr_conformance_state
+{
+	bool inited;
+	struct os_mutex mutex; //!< Guards all fields below vs xrSyncActions.
+
+	//! Top-level paths the CTS has marked active via xrSetInputDeviceActiveEXT.
+	XrPath active_devices[OXR_MAX_CONFORMANCE_DEVICES];
+	size_t active_device_count;
+
+	struct oxr_conformance_override overrides[OXR_MAX_CONFORMANCE_OVERRIDES];
+};
+
+/*!
  * Object that client program interact with.
  *
  * Parent type/handle is @ref oxr_instance
@@ -2306,6 +2450,11 @@ struct oxr_session
 	struct xrt_space_relation local_space_pure_relation;
 
 	bool has_lost;
+
+	//! Synthetic-input state for XR_EXT_conformance_automation (CTS).
+	//! Only touched when the extension is enabled; @ref oxr_conformance_state::inited
+	//! is false otherwise.
+	struct oxr_conformance_state conformance;
 
 #ifdef XRT_OS_WINDOWS
 	/*!
