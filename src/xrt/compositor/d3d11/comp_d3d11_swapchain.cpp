@@ -54,14 +54,14 @@ struct comp_d3d11_swapchain
 	//! Creation info.
 	struct xrt_swapchain_create_info info;
 
-	//! Currently acquired image index (-1 if none).
-	int32_t acquired_index;
+	//! Number of images currently acquired (acquired, not yet released).
+	//! OpenXR permits acquiring up to image_count images before any wait/
+	//! release (the CTS Swapchains tests acquire all of them in a loop), so we
+	//! track a count + a ring cursor instead of a single acquired index.
+	uint32_t num_acquired;
 
-	//! Currently waited image index (-1 if none).
-	int32_t waited_index;
-
-	//! Last released image index (for round-robin).
-	uint32_t last_released_index;
+	//! Next ring index that acquire() will hand out.
+	uint32_t next_acquire;
 
 	//! D3D11.4 fence for efficient GPU→CPU release notification.
 	//! Signaled at xrReleaseSwapchainImage; waited in layer_commit.
@@ -162,16 +162,18 @@ d3d11_swapchain_acquire_image(struct xrt_swapchain *xsc, uint32_t *out_index)
 {
 	struct comp_d3d11_swapchain *sc = d3d11_sc(xsc);
 
-	if (sc->acquired_index >= 0) {
-		U_LOG_E("Image already acquired");
-		return XRT_ERROR_IPC_FAILURE;
+	// OpenXR allows up to image_count images to be acquired concurrently. The
+	// oxr state tracker already bounds this before calling us, but guard too.
+	if (sc->num_acquired >= sc->image_count) {
+		U_LOG_E("All %u swapchain images already acquired", sc->image_count);
+		return XRT_ERROR_NO_IMAGE_AVAILABLE;
 	}
 
-	// Round-robin acquisition using per-swapchain counter
-	// Find next available index (start from last released + 1)
-	uint32_t index = (sc->last_released_index + 1) % sc->image_count;
-
-	sc->acquired_index = static_cast<int32_t>(index);
+	// Hand out the next ring index; images are acquired/waited/released in FIFO
+	// order, which the oxr layer enforces.
+	uint32_t index = sc->next_acquire;
+	sc->next_acquire = (sc->next_acquire + 1) % sc->image_count;
+	sc->num_acquired++;
 	*out_index = index;
 
 	return XRT_SUCCESS;
@@ -183,18 +185,13 @@ d3d11_swapchain_wait_image(struct xrt_swapchain *xsc, int64_t timeout_ns, uint32
 	struct comp_d3d11_swapchain *sc = d3d11_sc(xsc);
 	(void)timeout_ns;
 
-	if (sc->acquired_index < 0) {
-		U_LOG_E("No image acquired");
-		return XRT_ERROR_IPC_FAILURE;
+	// The app owns these textures; there is no runtime-side GPU work to wait on
+	// here (the to-comp barrier does the GPU handoff at release time). The oxr
+	// layer enforces acquire->wait->release ordering, so just range-check.
+	if (index >= sc->image_count) {
+		U_LOG_E("Wait index %u out of range (image_count=%u)", index, sc->image_count);
+		return XRT_ERROR_NO_IMAGE_AVAILABLE;
 	}
-
-	if (static_cast<uint32_t>(sc->acquired_index) != index) {
-		U_LOG_E("Wait index %u doesn't match acquired index %d", index, sc->acquired_index);
-		return XRT_ERROR_IPC_FAILURE;
-	}
-
-	sc->waited_index = sc->acquired_index;
-	sc->acquired_index = -1;
 
 	return XRT_SUCCESS;
 }
@@ -239,19 +236,16 @@ d3d11_swapchain_release_image(struct xrt_swapchain *xsc, uint32_t index)
 {
 	struct comp_d3d11_swapchain *sc = d3d11_sc(xsc);
 
-	if (sc->waited_index < 0) {
-		U_LOG_E("No image to release");
-		return XRT_ERROR_IPC_FAILURE;
+	if (sc->num_acquired == 0) {
+		U_LOG_E("Release with no acquired image");
+		return XRT_ERROR_NO_IMAGE_AVAILABLE;
+	}
+	if (index >= sc->image_count) {
+		U_LOG_E("Release index %u out of range (image_count=%u)", index, sc->image_count);
+		return XRT_ERROR_NO_IMAGE_AVAILABLE;
 	}
 
-	if (static_cast<uint32_t>(sc->waited_index) != index) {
-		U_LOG_E("Release index %u doesn't match waited index %d", index, sc->waited_index);
-		return XRT_ERROR_IPC_FAILURE;
-	}
-
-	// Track the last released index for round-robin acquisition
-	sc->last_released_index = index;
-	sc->waited_index = -1;
+	sc->num_acquired--;
 
 	return XRT_SUCCESS;
 }
@@ -296,8 +290,10 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 {
 	auto internals = get_internals(c);
 
-	// Validate image count
-	uint32_t image_count = 3; // Default to triple buffering
+	// Static swapchains (XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT) hold exactly one
+	// image and may be acquired only once (OpenXR spec); dynamic swapchains use
+	// triple buffering.
+	uint32_t image_count = (info->create & XRT_SWAPCHAIN_CREATE_STATIC_IMAGE) ? 1u : 3u;
 	if (image_count > MAX_SWAPCHAIN_IMAGES) {
 		image_count = MAX_SWAPCHAIN_IMAGES;
 	}
@@ -309,9 +305,8 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 	sc->c = c;
 	sc->info = *info;
 	sc->image_count = image_count;
-	sc->acquired_index = -1;
-	sc->waited_index = -1;
-	sc->last_released_index = image_count - 1; // Start so first acquire returns index 0
+	sc->num_acquired = 0;
+	sc->next_acquire = 0; // First acquire returns index 0
 	sc->release_fence = nullptr;
 	sc->release_event = nullptr;
 	sc->release_fence_value = 0;
