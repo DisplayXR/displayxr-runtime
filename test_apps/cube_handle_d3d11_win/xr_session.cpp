@@ -12,6 +12,9 @@
 // XR_EXT_view_rig (#396 W7): app-local availability flag (see xr_session.h).
 bool g_hasViewRigExt = false;
 
+// #439 Phase 3 — XR_EXT_local_3d_zone harness (see xr_session.h).
+ZoneMaskHarness g_zone;
+
 // Helper macro for XR error checking with logging
 #define XR_CHECK(call) \
     do { \
@@ -96,6 +99,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
             g_hasViewRigExt = true;
         }
+        if (strcmp(ext.extensionName, XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) {
+            g_zone.available = true;
+        }
     }
 
     LOG_INFO("XR_KHR_D3D11_enable: %s", hasD3D11 ? "AVAILABLE" : "NOT FOUND");
@@ -105,6 +111,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_EXT_atlas_capture: %s", xr.hasAtlasCaptureExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_mcp_tools: %s", xr.hasMcpToolsExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_view_rig: %s", g_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_EXT_local_3d_zone: %s", g_zone.available ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasD3D11) {
         LOG_ERROR("XR_KHR_D3D11_enable extension not available - cannot continue");
@@ -136,6 +143,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (g_hasViewRigExt) {
         enabledExtensions.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
+    }
+    if (g_zone.available) {
+        enabledExtensions.push_back(XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME);
     }
 
     LOG_INFO("Enabling %zu extensions", enabledExtensions.size());
@@ -243,6 +253,23 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasEXT",
             (PFN_xrVoidFunction*)&xr.pfnCaptureAtlasEXT);
         LOG_INFO("xrCaptureAtlasEXT: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
+    }
+
+    // #439 Phase 3 — XR_EXT_local_3d_zone entry points (app-local harness; the
+    // handle-app panel modes use the explicit Tier-2 island mask for case 2).
+    if (g_zone.available) {
+        xrGetInstanceProcAddr(xr.instance, "xrCreateLocal3DZoneMaskEXT",
+            (PFN_xrVoidFunction*)&g_zone.pfnCreate);
+        xrGetInstanceProcAddr(xr.instance, "xrSetLocal3DZoneFromRectsEXT",
+            (PFN_xrVoidFunction*)&g_zone.pfnSetRects);
+        xrGetInstanceProcAddr(xr.instance, "xrSubmitLocal3DZoneEXT",
+            (PFN_xrVoidFunction*)&g_zone.pfnSubmit);
+        xrGetInstanceProcAddr(xr.instance, "xrDestroyLocal3DZoneMaskEXT",
+            (PFN_xrVoidFunction*)&g_zone.pfnDestroy);
+        if (!g_zone.pfnCreate || !g_zone.pfnSetRects || !g_zone.pfnSubmit || !g_zone.pfnDestroy) {
+            LOG_WARN("XR_EXT_local_3d_zone advertised but entry points missing — harness disabled");
+            g_zone.available = false;
+        }
     }
 
     // Get view configuration views

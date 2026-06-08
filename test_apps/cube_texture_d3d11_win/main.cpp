@@ -169,6 +169,26 @@ static ComPtr<ID3D11Buffer> g_surroundParamsCB;
 // RenderOneFrame where the XR session + D3D device are at hand.
 static bool g_zoneCycleRequested = false;
 
+// #439 Phase 3 case-1 A/B (DXR_AB_LOCAL2D=1). B-mode replaces the surround
+// side-channel with the spec-§5 migration shape: an explicit Tier-2 single-rect
+// mask (the canvas rect as 3D) + a full-window XrCompositionLayerLocal2DEXT
+// carrying the same surround pattern. The mask activates at frame N (not
+// startup) so the canvas is superseded and the runtime's view-size event fires;
+// the app then renders window-sized (the mask supersedes the canvas) and the
+// screen-anchored projection keeps 3D on the same screen pixels — capture diff
+// vs the legacy surround path ≈ 0 in the surround region. The app pivots on its
+// OWN mask activation (not the event) because the shared PollEvents drains the
+// queue; the runtime still fires the event for the §8 case-5 log check.
+// Determinism hooks: DXR_FREEZE=1 stops the cube animation, DXR_HUD=0 hides HUD.
+static bool g_abLocal2D = false;      // B-mode toggle (DXR_AB_LOCAL2D=1)
+static bool g_local2DActive = false;  // mask + layer submitted from here on
+static bool g_canvasIsWindow = false; // post-pivot: window-sized rendering
+static const long g_local2DActivationFrame = 60;
+static long g_l2dFrameCounter = 0;
+static bool g_freezeAnimation = false; // DXR_FREEZE=1
+static XrSwapchain g_l2dSwapchain = XR_NULL_HANDLE;
+static uint32_t g_l2dW = 0, g_l2dH = 0;
+
 struct RenderState;
 static RenderState* g_renderState = nullptr;
 static void RenderOneFrame(RenderState& rs);
@@ -492,6 +512,149 @@ static void RenderSurroundPattern(D3D11Renderer& renderer,
     renderer.context->OMSetRenderTargets(1, &nullRTV, nullptr);
 
     g_surroundMutex->ReleaseSync(0);
+}
+
+// #439 Phase 3 — render the SAME surround pattern shader into the Local2D
+// swapchain image so the B-mode A/B is byte-comparable with the legacy surround
+// in the non-canvas region (both use g_surroundPS with identical params). The
+// canvas region is masked out (M=1 → weave) so its contents never show; we draw
+// the full window pattern (matching the surround texture) anyway. No keyed
+// mutex — the XR swapchain's acquire/wait/release provides cross-process sync.
+static bool FillL2DPanelWithSurround(D3D11Renderer& renderer, ID3D11Texture2D* image,
+                                     uint32_t winW, uint32_t winH,
+                                     int32_t canvasX, int32_t canvasY,
+                                     uint32_t canvasW, uint32_t canvasH) {
+    if (!g_surroundPS || !g_surroundParamsCB || !g_blitVS || image == nullptr) {
+        return false;
+    }
+    ComPtr<ID3D11RenderTargetView> rtv;
+    if (FAILED(renderer.device->CreateRenderTargetView(image, nullptr, &rtv))) {
+        LOG_ERROR("Local2D fill: CreateRenderTargetView failed");
+        return false;
+    }
+
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (SUCCEEDED(renderer.context->Map(g_surroundParamsCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+        struct Params {
+            float windowSize[2];
+            float _pad0[2];
+            int32_t canvas[4];
+            float time;
+            float _pad1[3];
+        } p = {};
+        p.windowSize[0] = (float)winW;
+        p.windowSize[1] = (float)winH;
+        p.canvas[0] = canvasX;
+        p.canvas[1] = canvasY;
+        p.canvas[2] = (int32_t)canvasW;
+        p.canvas[3] = (int32_t)canvasH;
+        p.time = 0.0f; // static content — frozen so the A/B is byte-stable
+        memcpy(mapped.pData, &p, sizeof(p));
+        renderer.context->Unmap(g_surroundParamsCB.Get(), 0);
+    }
+
+    ID3D11RenderTargetView* rtvp = rtv.Get();
+    renderer.context->OMSetRenderTargets(1, &rtvp, nullptr);
+    D3D11_VIEWPORT vp = {};
+    vp.Width = (FLOAT)winW;
+    vp.Height = (FLOAT)winH;
+    vp.MaxDepth = 1.0f;
+    renderer.context->RSSetViewports(1, &vp);
+    renderer.context->VSSetShader(g_blitVS.Get(), nullptr, 0);
+    renderer.context->PSSetShader(g_surroundPS.Get(), nullptr, 0);
+    ID3D11Buffer* cb = g_surroundParamsCB.Get();
+    renderer.context->PSSetConstantBuffers(0, 1, &cb);
+    renderer.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    renderer.context->IASetInputLayout(nullptr);
+    renderer.context->Draw(3, 0);
+    ID3D11RenderTargetView* nullRTV = nullptr;
+    renderer.context->OMSetRenderTargets(1, &nullRTV, nullptr);
+    return true;
+}
+
+// #439 Phase 3 — activate B-mode: create + fill the full-window Local2D
+// swapchain (surround pattern), then create + submit the explicit Tier-2 mask
+// (the canvas rect as 3D). Pivots the app to window-sized rendering and scales
+// the virtual display height by the canvas→window ratio so the cube keeps the
+// same physical size across the renegotiation (else it renders 2× — the
+// #396-W7 ↔ Phase-3 reconciliation point). Returns true on success.
+static bool ActivateLocal2DBMode(XrSessionManager& xr, D3D11Renderer& renderer) {
+    uint32_t winW = g_windowWidth;
+    uint32_t winH = g_windowHeight;
+    if (winW == 0 || winH == 0 || !g_zone.available || !g_zone.pfnCreate || !g_zone.pfnSetRects ||
+        !g_zone.pfnSubmit) {
+        return false;
+    }
+    // The declared canvas sub-rect (center 50%, matching the output rect + the
+    // surround pattern's canvas hole).
+    int32_t mcx = (int32_t)(winW * 0.25f);
+    int32_t mcy = (int32_t)(winH * 0.25f);
+    uint32_t mcw = winW / 2;
+    uint32_t mch = winH / 2;
+
+    // Full-window Local2D swapchain, filled once with the surround pattern.
+    XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    sci.format = (int64_t)DXGI_FORMAT_B8G8R8A8_UNORM;
+    sci.sampleCount = 1;
+    sci.width = winW;
+    sci.height = winH;
+    sci.faceCount = 1;
+    sci.arraySize = 1;
+    sci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(xr.session, &sci, &g_l2dSwapchain))) {
+        LOG_ERROR("A/B B-mode: xrCreateSwapchain failed");
+        return false;
+    }
+    g_l2dW = winW;
+    g_l2dH = winH;
+
+    uint32_t n = 0;
+    xrEnumerateSwapchainImages(g_l2dSwapchain, 0, &n, nullptr);
+    std::vector<XrSwapchainImageD3D11KHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
+    if (n == 0 || XR_FAILED(xrEnumerateSwapchainImages(g_l2dSwapchain, n, &n,
+                                                       (XrSwapchainImageBaseHeader*)imgs.data()))) {
+        return false;
+    }
+    XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    uint32_t idx = 0;
+    if (XR_FAILED(xrAcquireSwapchainImage(g_l2dSwapchain, &ai, &idx))) {
+        return false;
+    }
+    XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = XR_INFINITE_DURATION;
+    xrWaitSwapchainImage(g_l2dSwapchain, &wi);
+    FillL2DPanelWithSurround(renderer, imgs[idx].texture, winW, winH, mcx, mcy, mcw, mch);
+    XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(g_l2dSwapchain, &ri);
+
+    // Explicit Tier-2 mask: the canvas rect is 3D, everything else 2D.
+    XrLocal3DZoneMaskCreateInfoEXT mci = {(XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_EXT};
+    mci.maskWidth = 0; // runtime picks the window backing size
+    mci.maskHeight = 0;
+    if (XR_FAILED(g_zone.pfnCreate(xr.session, &mci, &g_zone.mask))) {
+        LOG_ERROR("A/B B-mode: create mask failed");
+        return false;
+    }
+    XrRect2Di rect;
+    rect.offset = {mcx, mcy};
+    rect.extent = {(int32_t)mcw, (int32_t)mch};
+    if (XR_FAILED(g_zone.pfnSetRects(g_zone.mask, 1, &rect)) || XR_FAILED(g_zone.pfnSubmit(g_zone.mask))) {
+        LOG_ERROR("A/B B-mode: set/submit mask failed");
+        return false;
+    }
+
+    // Pivot to window-sized rendering + world-scale constancy: the render canvas
+    // grows canvas→window (2×), so scale the virtual display height by the same
+    // ratio to keep the cube the same physical size (else it renders 2×).
+    g_canvasIsWindow = true;
+    if (mch > 0) {
+        g_inputState.viewParams.virtualDisplayHeight *= (float)winH / (float)mch;
+    }
+    LOG_INFO("A/B B-mode activated: Tier-2 mask (canvas %d,%d %ux%u 3D) + full-window Local2D layer %ux%u, "
+             "virtualDisplayHeight*=%.3f",
+             mcx, mcy, mcw, mch, winW, winH, mch > 0 ? (float)winH / (float)mch : 1.0f);
+    return true;
 }
 
 static bool CreateBlitResources(ID3D11Device* device) {
@@ -825,14 +988,39 @@ static void RenderOneFrame(RenderState& rs) {
         g_zoneCycleRequested = false;
         ZoneMaskApplyNextState(xr, renderer);
     }
-    UpdateScene(renderer, rs.perfStats->deltaTime);
+    // #439 Phase 3: DXR_FREEZE=1 stops the cube animation for byte-stable A/B.
+    if (!g_freezeAnimation) {
+        UpdateScene(renderer, rs.perfStats->deltaTime);
+    }
     PollEvents(xr);
 
-    // Canvas = center 50% of window (matches blit viewport)
-    if (g_windowWidth > 0 && g_windowHeight > 0) {
-        g_canvasW = g_windowWidth / 2;
-        g_canvasH = g_windowHeight / 2;
+    // #439 case-1 B-mode activation (frame N): create the Local2D layer + the
+    // Tier-2 mask, pivot to window-sized rendering. Done before the canvas calc
+    // below so this frame already renders the new canvas.
+    if (g_abLocal2D && !g_local2DActive && g_l2dFrameCounter >= g_local2DActivationFrame) {
+        static bool attempted = false;
+        if (!attempted) {
+            attempted = true;
+            if (ActivateLocal2DBMode(xr, renderer)) {
+                g_local2DActive = true;
+            } else {
+                LOG_ERROR("A/B B-mode activation failed — staying on plain projection path");
+            }
+        }
     }
+
+    // Canvas = center 50% of window normally; the full window once B-mode has
+    // pivoted (the mask superseded the canvas → the app renegotiates).
+    if (g_windowWidth > 0 && g_windowHeight > 0) {
+        if (g_canvasIsWindow) {
+            g_canvasW = g_windowWidth;
+            g_canvasH = g_windowHeight;
+        } else {
+            g_canvasW = g_windowWidth / 2;
+            g_canvasH = g_windowHeight / 2;
+        }
+    }
+    g_l2dFrameCounter++;
 
     // Spec v6 §3.6: refresh the surround texture each frame. Done before
     // xrBeginFrame so the runtime sees up-to-date pixels when it reads the
@@ -1195,7 +1383,36 @@ static void RenderOneFrame(RenderState& rs) {
                 }
             }
 
-            if (hudSubmitted) {
+            // #439 case-1 B-mode: submit the projection layer + the full-window
+            // Local2D layer raw (the shared EndFrame helpers don't carry the
+            // Local2D type). The mask makes the canvas 3D, the rest the layer's
+            // surround pattern — the A/B vs the legacy surround path.
+            if (g_local2DActive && g_l2dSwapchain != XR_NULL_HANDLE) {
+                XrCompositionLayerProjection projLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+                projLayer.space = xr.localSpace;
+                projLayer.viewCount = (uint32_t)eyeCount;
+                projLayer.views = projectionViews.data();
+
+                XrCompositionLayerLocal2DEXT l2dLayer = {
+                    (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+                l2dLayer.layerFlags = 0; // premultiplied; the pattern is opaque
+                l2dLayer.subImage.swapchain = g_l2dSwapchain;
+                l2dLayer.subImage.imageRect.offset = {0, 0};
+                l2dLayer.subImage.imageRect.extent = {(int32_t)g_l2dW, (int32_t)g_l2dH};
+                l2dLayer.subImage.imageArrayIndex = 0;
+                l2dLayer.rect.offset = {0, 0};
+                l2dLayer.rect.extent = {(int32_t)g_l2dW, (int32_t)g_l2dH};
+
+                const XrCompositionLayerBaseHeader* layers[2] = {
+                    (XrCompositionLayerBaseHeader*)&projLayer,
+                    (XrCompositionLayerBaseHeader*)&l2dLayer};
+                XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
+                endInfo.displayTime = frameState.predictedDisplayTime;
+                endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+                endInfo.layerCount = 2;
+                endInfo.layers = layers;
+                xrEndFrame(xr.session, &endInfo);
+            } else if (hudSubmitted) {
                 float hudAR = (float)HUD_PIXEL_WIDTH / (float)HUD_PIXEL_HEIGHT;
                 float windowAR = (g_windowWidth > 0 && g_windowHeight > 0) ? (float)g_windowWidth / (float)g_windowHeight : 1.0f;
                 float fracW = HUD_WIDTH_FRACTION;
@@ -1244,6 +1461,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     LOG_INFO("=== SR Cube Shared Texture D3D11 ===");
     LOG_INFO("Shared D3D11 texture (zero-copy GPU texture sharing)");
+
+    // #439 Phase 3 case-1 A/B + capture-determinism hooks.
+    {
+        const char* e = getenv("DXR_AB_LOCAL2D");
+        if (e && *e == '1') g_abLocal2D = true;
+        e = getenv("DXR_FREEZE");
+        if (e && *e == '1') g_freezeAnimation = true;
+        e = getenv("DXR_HUD");
+        if (e && *e == '0') g_inputState.hudVisible = false;
+        if (g_abLocal2D) {
+            LOG_INFO("DXR_AB_LOCAL2D=1 — case-1 B-mode (Tier-2 mask + Local2D layer, no surround)");
+        }
+    }
 
     HWND hwnd = CreateAppWindow(hInstance, g_windowWidth, g_windowHeight);
     if (!hwnd) {
@@ -1407,7 +1637,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Register the surround texture with the runtime. NULL pfn or handle =
     // we skip and the blit stays on the canvas-only path.
-    if (surroundSetupOk && xr.pfnSetSharedTextureSurround2DEXT && g_surroundHandle) {
+    // #439 case-1 B-mode (DXR_AB_LOCAL2D=1): skip surround registration — the
+    // full-window Local2D layer supplies the 2D pixels instead (the A/B).
+    if (surroundSetupOk && !g_abLocal2D && xr.pfnSetSharedTextureSurround2DEXT && g_surroundHandle) {
         XrResult sres = xr.pfnSetSharedTextureSurround2DEXT(xr.session, g_surroundHandle,
             g_sharedWidth, g_sharedHeight);
         if (XR_SUCCEEDED(sres)) {
