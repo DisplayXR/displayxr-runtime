@@ -1666,21 +1666,27 @@ record_draw(uint32_t view_idx, uint32_t image_idx, const XrView &view)
 			//   debug.dxr.hud_rot 0|1|2|3, hud_hflip, hud_vflip
 			const float rot_prop = get_prop_float("debug.dxr.hud_rot", -1.0f);
 			const float hflip_prop = get_prop_float("debug.dxr.hud_hflip", -1.0f);
-			// HUD orientation. Only change from the original {0,1,2,3} table is
-			// the two landscape entries (1→0, 3→2): with the preTransform=IDENTITY
-			// weave (LOXR-730/733) landscape no longer needs the 90° counter-rotate.
-			// vflip stays ON (the weave flips vertically; verified rot=0/vflip=1
-			// reads upright in landscape and portrait).
-			//   disp_rot: 0(port) 1(land) 2(rev-port) 3(rev-land)
-			//   hud_rot:   0       0       2           2
-			static const int kHudRotForDisp[4] = {0, 0, 2, 2};
+			// HUD orientation, per display rotation, calibrated on-device for the
+			// preTransform=IDENTITY weave (LOXR-730/733). Portrait & normal
+			// landscape: rot=0, vflip on. Reverse-landscape (disp_rot=3) needs a
+			// 180° rotate with hflip (not vflip) to read upright at the top-left.
+			// Verified on device at disp_rot 0/1/3; disp_rot=2 (reverse-portrait,
+			// rarely reached) keeps the portrait-style values. setprop
+			// debug.dxr.hud_rot/hud_hflip/hud_vflip (>=0) override per knob.
+			//   disp_rot:  0(port) 1(land) 2(rev-port) 3(rev-land)
+			//   hud_rot:    0       0       2           2
+			//   hud_hflip:  0       0       0           1
+			//   hud_vflip:  1       1       1           0
+			static const int kHudRotForDisp[4]   = {0, 0, 2, 2};
+			static const int kHudHflipForDisp[4] = {0, 0, 0, 1};
+			static const int kHudVflipForDisp[4] = {1, 1, 1, 0};
 			const int disp_rot_h = g_display_rotation.load(std::memory_order_relaxed) & 3;
 			const int rot = ((rot_prop >= 0.0f) ? (int)rot_prop : kHudRotForDisp[disp_rot_h]) & 3;
-			const bool hflip = (hflip_prop >= 0.0f) ? (hflip_prop != 0.0f) : false;
-			// vflip defaults ON (the tile->panel weave flips vertically); setprop
-			// debug.dxr.hud_vflip (>=0) overrides.
+			const bool hflip = (hflip_prop >= 0.0f) ? (hflip_prop != 0.0f)
+			                                        : (kHudHflipForDisp[disp_rot_h] != 0);
 			const float vflip_prop = get_prop_float("debug.dxr.hud_vflip", -1.0f);
-			const bool vflip = (vflip_prop >= 0.0f) ? (vflip_prop != 0.0f) : true;
+			const bool vflip = (vflip_prop >= 0.0f) ? (vflip_prop != 0.0f)
+			                                        : (kHudVflipForDisp[disp_rot_h] != 0);
 			static int huddbg = 0;
 			if ((huddbg++ % 120) == 0) {
 				LOGI("HW_HUD: disp_rot=%d rot=%d hflip=%d vflip=%d",
