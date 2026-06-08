@@ -75,6 +75,32 @@ static bool g_fullscreen = false;
 static RECT g_savedWindowRect = {};
 static DWORD g_savedWindowStyle = 0;
 
+// #439 Phase 3 — handle + mask + Local2D layer modes (§8 cases 2/3/4), VK leg.
+// DXR_LOCAL2D_PANEL=1  — submit a Local2D panel layer (layer-only, IMPLICIT
+//                        mask from the panel rect, zero mask calls).
+// DXR_LOCAL2D_MASK=1   — additionally create + submit an explicit Tier-2 mask
+//                        with 3D island rects (islands weave, panel crisp,
+//                        desktop visible where neither covers).
+// DXR_LOCAL2D_PANEL2=1 — additionally submit a second, overlapping panel with
+//                        XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT.
+static bool g_l2dPanel = false;
+static bool g_l2dMask = false;
+static bool g_l2dPanel2 = false;
+static bool g_l2dActive = false; // set once panels (+ optional mask) are live
+static long g_l2dFrameCounter = 0;
+static const long g_l2dActivationFrame = 10;
+
+// A window-anchored Local2D panel swapchain (static content: filled once, then
+// referenced every frame). The image rests in SHADER_READ_ONLY_OPTIMAL so the
+// compositor's flatten samples it directly with no per-frame transition.
+struct L2DPanel {
+    XrSwapchain swapchain = XR_NULL_HANDLE;
+    uint32_t imageIndex = 0;
+    uint32_t w = 0, h = 0;
+};
+static L2DPanel g_panel1, g_panel2;
+static XrRect2Di g_panel1Rect, g_panel2Rect;
+
 // XR_EXT_view_rig (#396 W7 dogfood): the app chains a rig descriptor
 // (XrDisplayRigEXT, or XrCameraRigEXT in camera mode) on every xrLocateViews
 // and consumes the runtime's render-ready XrView{pose, fov} directly — the
@@ -302,6 +328,175 @@ static void UpdatePerformanceStats(PerformanceStats& stats) {
         stats.frameCount = 0;
         stats.fpsAccumulator = 0.0f;
     }
+}
+
+// #439 Phase 3 — create a window-anchored Local2D panel swapchain and fill it
+// once (static content). Mirrors the D3D11 leg's CreateAndFillL2DPanel: same two
+// content variants (0 = opaque checker core + half-transparent green premul
+// border; 1 = opaque white stripes + UNPREMULTIPLIED orange a=128). Fills via a
+// host-visible staging buffer + vkCmdCopyBufferToImage, then leaves the image in
+// SHADER_READ_ONLY_OPTIMAL so the compositor flatten samples it directly.
+static uint32_t FindMemoryTypeIdx(VkPhysicalDevice phys, uint32_t typeBits, VkMemoryPropertyFlags props) {
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        if ((typeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & props) == props) {
+            return i;
+        }
+    }
+    return UINT32_MAX;
+}
+
+static bool CreateAndFillL2DPanel(XrSessionManager& xr, VkRenderer* renderer, VkCommandPool cmdPool,
+                                  uint32_t w, uint32_t h, int variant, L2DPanel& out) {
+    if (w == 0 || h == 0) {
+        return false;
+    }
+    XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+                     XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    sci.format = (int64_t)VK_FORMAT_B8G8R8A8_UNORM;
+    sci.sampleCount = 1;
+    sci.width = w;
+    sci.height = h;
+    sci.faceCount = 1;
+    sci.arraySize = 1;
+    sci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(xr.session, &sci, &out.swapchain))) {
+        LOG_ERROR("Local2D panel: xrCreateSwapchain failed");
+        return false;
+    }
+    out.w = w;
+    out.h = h;
+
+    uint32_t n = 0;
+    xrEnumerateSwapchainImages(out.swapchain, 0, &n, nullptr);
+    std::vector<XrSwapchainImageVulkanKHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+    if (n == 0 || XR_FAILED(xrEnumerateSwapchainImages(out.swapchain, n, &n,
+                                                       (XrSwapchainImageBaseHeader*)imgs.data()))) {
+        LOG_ERROR("Local2D panel: xrEnumerateSwapchainImages failed");
+        return false;
+    }
+
+    XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    uint32_t idx = 0;
+    if (XR_FAILED(xrAcquireSwapchainImage(out.swapchain, &ai, &idx))) {
+        return false;
+    }
+    XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = XR_INFINITE_DURATION;
+    xrWaitSwapchainImage(out.swapchain, &wi);
+    out.imageIndex = idx;
+    VkImage img = imgs[idx].image;
+
+    // CPU-build the BGRA8 content (identical bytes to the D3D11 leg).
+    size_t stride = (size_t)w * 4;
+    std::vector<uint8_t> buf(stride * h);
+    const uint32_t border = 24;
+    for (uint32_t y = 0; y < h; y++) {
+        uint8_t* row = buf.data() + (size_t)y * stride;
+        for (uint32_t x = 0; x < w; x++) {
+            uint8_t* px = row + (size_t)x * 4; // B,G,R,A
+            if (variant == 0) {
+                bool inBorder = (x < border || y < border || x >= w - border || y >= h - border);
+                if (inBorder) {
+                    px[0] = 0; px[1] = 128; px[2] = 0; px[3] = 128; // half-transparent green (premul)
+                } else {
+                    bool check = (((x / 8) + (y / 8)) & 1) != 0;
+                    uint8_t v = check ? 235 : 40;
+                    px[0] = v; px[1] = v; px[2] = v; px[3] = 255; // opaque checker
+                }
+            } else {
+                bool stripe = (((x + y) / 16) & 1) != 0;
+                if (stripe) {
+                    px[0] = 255; px[1] = 255; px[2] = 255; px[3] = 255; // opaque white
+                } else {
+                    px[0] = 0; px[1] = 165; px[2] = 255; px[3] = 128; // UNPREMULTIPLIED orange a=128
+                }
+            }
+        }
+    }
+
+    // Host-visible staging buffer.
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMem = VK_NULL_HANDLE;
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = buf.size();
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(renderer->device, &bci, nullptr, &staging) != VK_SUCCESS) {
+        LOG_ERROR("Local2D panel: staging buffer create failed");
+        return false;
+    }
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(renderer->device, staging, &mr);
+    uint32_t memType = FindMemoryTypeIdx(renderer->physicalDevice, mr.memoryTypeBits,
+                                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (memType == UINT32_MAX) {
+        LOG_ERROR("Local2D panel: no host-visible memory type");
+        vkDestroyBuffer(renderer->device, staging, nullptr);
+        return false;
+    }
+    VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = mr.size;
+    mai.memoryTypeIndex = memType;
+    vkAllocateMemory(renderer->device, &mai, nullptr, &stagingMem);
+    vkBindBufferMemory(renderer->device, staging, stagingMem, 0);
+    void* mapped = nullptr;
+    vkMapMemory(renderer->device, stagingMem, 0, buf.size(), 0, &mapped);
+    memcpy(mapped, buf.data(), buf.size());
+    vkUnmapMemory(renderer->device, stagingMem);
+
+    // Copy staging → image, then transition to SHADER_READ_ONLY for sampling.
+    VkCommandBufferAllocateInfo cbai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cbai.commandPool = cmdPool;
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(renderer->device, &cbai, &cmd);
+    VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &cbi);
+
+    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask = 0;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = img;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                         nullptr, 0, nullptr, 1, &b);
+
+    VkBufferImageCopy region = {};
+    region.bufferRowLength = w;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageOffset = {0, 0, 0};
+    region.imageExtent = {w, h, 1};
+    vkCmdCopyBufferToImage(cmd, staging, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                         nullptr, 0, nullptr, 1, &b);
+
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkQueueSubmit(renderer->graphicsQueue, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(renderer->graphicsQueue);
+    vkFreeCommandBuffers(renderer->device, cmdPool, 1, &cmd);
+    vkDestroyBuffer(renderer->device, staging, nullptr);
+    vkFreeMemory(renderer->device, stagingMem, nullptr);
+
+    XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(out.swapchain, &ri);
+    return true;
 }
 
 static void RenderThreadFunc(
@@ -791,7 +986,109 @@ static void RenderThreadFunc(
                     ? XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
                     : 0;
 
-                if (rendered && hudSubmitted) {
+                // #439 cases 2/3/4 activation: create + fill the panel
+                // swapchain(s) (+ the explicit Tier-2 island mask for case 2) a
+                // few frames in, once the session is running and dims settled.
+                if (g_l2dPanel && !g_l2dActive && rendered &&
+                    g_l2dFrameCounter >= g_l2dActivationFrame) {
+                    static bool attempted = false;
+                    if (!attempted) {
+                        attempted = true;
+                        uint32_t winW = windowW;
+                        uint32_t winH = windowH;
+                        uint32_t pw = winW * 3 / 8;
+                        uint32_t ph = winH * 5 / 16;
+                        g_panel1Rect.offset = {(int32_t)(winW / 16), (int32_t)(winH * 9 / 16)};
+                        g_panel1Rect.extent = {(int32_t)pw, (int32_t)ph};
+                        bool ok = CreateAndFillL2DPanel(*xr, renderer, hudCmdPool, pw, ph, 0, g_panel1);
+
+                        if (ok && g_l2dPanel2) {
+                            // Overlaps panel 1's top-right quadrant — list-order
+                            // stacking check (panel 2 later = on top).
+                            g_panel2Rect.offset = {g_panel1Rect.offset.x + (int32_t)(pw / 2),
+                                                   g_panel1Rect.offset.y - (int32_t)(ph / 4)};
+                            g_panel2Rect.extent = {(int32_t)pw, (int32_t)ph};
+                            ok = CreateAndFillL2DPanel(*xr, renderer, hudCmdPool, pw, ph, 1, g_panel2);
+                        }
+
+                        if (ok && g_l2dMask && g_zone.available && g_zone.pfnCreate &&
+                            g_zone.pfnSetRects && g_zone.pfnSubmit) {
+                            XrLocal3DZoneMaskCreateInfoEXT mci = {
+                                (XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_EXT};
+                            mci.maskWidth = 0; // runtime picks the window backing size
+                            mci.maskHeight = 0;
+                            ok = XR_SUCCEEDED(g_zone.pfnCreate(xr->session, &mci, &g_zone.mask));
+                            if (ok) {
+                                // Two 3D islands; everything else is 2D (panel
+                                // where it covers, desktop where nothing does).
+                                XrRect2Di islands[2];
+                                islands[0].offset = {(int32_t)(winW * 7 / 16), (int32_t)(winH / 4)};
+                                islands[0].extent = {(int32_t)(winW * 7 / 16), (int32_t)(winH / 2)};
+                                islands[1].offset = {(int32_t)(winW / 16), (int32_t)(winH / 16)};
+                                islands[1].extent = {(int32_t)(winW / 4), (int32_t)(winH / 4)};
+                                ok = XR_SUCCEEDED(g_zone.pfnSetRects(g_zone.mask, 2, islands)) &&
+                                     XR_SUCCEEDED(g_zone.pfnSubmit(g_zone.mask));
+                            }
+                        }
+
+                        if (ok) {
+                            g_l2dActive = true;
+                            LOG_INFO("Local2D panels active: panel1 %d,%d %ux%u%s%s",
+                                     g_panel1Rect.offset.x, g_panel1Rect.offset.y, pw, ph,
+                                     g_l2dPanel2 ? " + panel2 (unpremultiplied, overlapping)" : "",
+                                     g_l2dMask ? " + explicit Tier-2 island mask" : " (implicit mask)");
+                        } else {
+                            LOG_ERROR("Local2D panel activation failed");
+                        }
+                    }
+                }
+
+                // #439 cases 2/3/4: when Local2D panels are active, build the
+                // layer list manually (projection + panels in list order) and
+                // submit raw — the shared EndFrame helpers don't carry the
+                // Local2D layer type.
+                if (g_l2dActive && rendered && g_panel1.swapchain != XR_NULL_HANDLE) {
+                    XrCompositionLayerProjection projLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+                    projLayer.layerFlags = projLayerFlags;
+                    projLayer.space = xr->localSpace;
+                    projLayer.viewCount = submitViewCount;
+                    projLayer.views = projectionViews.data();
+
+                    XrCompositionLayerLocal2DEXT panel1Layer = {
+                        (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+                    XrCompositionLayerLocal2DEXT panel2Layer = {
+                        (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+                    const XrCompositionLayerBaseHeader* layers[3] = {
+                        (XrCompositionLayerBaseHeader*)&projLayer, nullptr, nullptr};
+                    uint32_t layerCount = 1;
+
+                    panel1Layer.layerFlags = 0; // premultiplied bytes
+                    panel1Layer.subImage.swapchain = g_panel1.swapchain;
+                    panel1Layer.subImage.imageRect.offset = {0, 0};
+                    panel1Layer.subImage.imageRect.extent = {(int32_t)g_panel1.w, (int32_t)g_panel1.h};
+                    panel1Layer.subImage.imageArrayIndex = 0;
+                    panel1Layer.rect = g_panel1Rect;
+                    layers[layerCount++] = (XrCompositionLayerBaseHeader*)&panel1Layer;
+
+                    if (g_l2dPanel2 && g_panel2.swapchain != XR_NULL_HANDLE) {
+                        panel2Layer.layerFlags = XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+                        panel2Layer.subImage.swapchain = g_panel2.swapchain;
+                        panel2Layer.subImage.imageRect.offset = {0, 0};
+                        panel2Layer.subImage.imageRect.extent = {(int32_t)g_panel2.w, (int32_t)g_panel2.h};
+                        panel2Layer.subImage.imageArrayIndex = 0;
+                        panel2Layer.rect = g_panel2Rect;
+                        layers[layerCount++] = (XrCompositionLayerBaseHeader*)&panel2Layer;
+                    }
+
+                    XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
+                    endInfo.displayTime = frameState.predictedDisplayTime;
+                    endInfo.environmentBlendMode = xr->runtimeSupportsAlphaBlend
+                        ? XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
+                        : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+                    endInfo.layerCount = layerCount;
+                    endInfo.layers = layers;
+                    xrEndFrame(xr->session, &endInfo);
+                } else if (rendered && hudSubmitted) {
                     LOG_INFO("[FRAME] EndFrameWithWindowSpaceHud (rendered+hud)...");
                     float hudAR = (float)hudWidth / (float)hudHeight;
                     float windowAR = (windowW > 0 && windowH > 0) ? (float)windowW / (float)windowH : 1.0f;
@@ -819,6 +1116,7 @@ static void RenderThreadFunc(
                     xrEndFrame(xr->session, &endInfo);
                     LOG_INFO("[FRAME] EndFrame (empty) done");
                 }
+                g_l2dFrameCounter++;
             } else {
                 LOG_WARN("[FRAME] BeginFrame FAILED");
             }
@@ -868,6 +1166,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     LOG_INFO("=== SR Cube OpenXR Ext Vulkan Application ===");
+
+    // #439 Phase 3 — handle + mask + Local2D layer modes (§8 cases 2/3/4).
+    {
+        const char* e = getenv("DXR_LOCAL2D_PANEL");
+        if (e && *e == '1') g_l2dPanel = true;
+        e = getenv("DXR_LOCAL2D_MASK");
+        if (e && *e == '1') g_l2dMask = true;
+        e = getenv("DXR_LOCAL2D_PANEL2");
+        if (e && *e == '1') g_l2dPanel2 = true;
+        if (g_l2dPanel) {
+            LOG_INFO("DXR_LOCAL2D_PANEL=1 — Local2D panel layer%s%s",
+                g_l2dPanel2 ? " + panel2 (unpremultiplied, overlapping)" : "",
+                g_l2dMask ? " + explicit Tier-2 island mask" : " (implicit mask)");
+        }
+    }
 
     HWND hwnd = CreateAppWindow(hInstance, g_windowWidth, g_windowHeight);
     if (!hwnd) {
