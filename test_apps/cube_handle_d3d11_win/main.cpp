@@ -1059,9 +1059,17 @@ static void RenderOneFrame(RenderState& rs) {
                     layers[layerCount++] = (XrCompositionLayerBaseHeader*)&panel2Layer;
                 }
 
+                // Honor DISPLAYXR_TRANSPARENT_BG the same way the shared
+                // EndFrame path does: the pre-activation frames ran
+                // SelectEnvBlendMode, so runtimeSupportsAlphaBlend is already
+                // resolved. ALPHA_BLEND is what makes the desktop show through
+                // where the mask is 2D + the layer alpha < 1 (the §4.2 output
+                // rule + the panel's half-transparent border).
                 XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
                 endInfo.displayTime = frameState.predictedDisplayTime;
-                endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+                endInfo.environmentBlendMode = xr.runtimeSupportsAlphaBlend
+                    ? XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
+                    : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
                 endInfo.layerCount = layerCount;
                 endInfo.layers = layers;
                 xrEndFrame(xr.session, &endInfo);
