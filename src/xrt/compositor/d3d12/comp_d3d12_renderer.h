@@ -242,7 +242,8 @@ comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
                                         int32_t cx,
                                         int32_t cy,
                                         uint32_t cw,
-                                        uint32_t ch);
+                                        uint32_t ch,
+                                        bool alpha_over);
 
 /*!
  * Flatten one Local2D layer into the scratch RTV (#439 Phase 3, the `twod`

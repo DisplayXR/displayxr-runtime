@@ -4026,9 +4026,13 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 	uint32_t cw = ec.valid ? ec.w : region_w;
 	uint32_t ch = ec.valid ? ec.h : region_h;
 
+	// #491: the implicit (auto) mask composites the 2D over the weave by its own
+	// premultiplied alpha — translucent 2D reveals the 3D scene, not the desktop.
+	// An explicit authored mask keeps the hard M-lerp (designer cutout/portal).
+	const bool have_explicit = (emask != NULL && emask->submitted && emask->staged_view != VK_NULL_HANDLE);
 	vk_local2d_composite_draw(&c->local2d, vk, cmd, c->composite_target_fb, dst_w, dst_h,
 	                          c->local2d_scratch_view, mask_view, c->weave_scratch_view, region_w,
-	                          region_h, cx, cy, cw, ch);
+	                          region_h, cx, cy, cw, ch, !have_explicit);
 
 	// One-shot lifecycle log (NOT per-frame): proves the masked composite ran +
 	// which mask source resolved. WARN so it survives the hot-path INFO filter.
@@ -4036,9 +4040,9 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 		static bool logged = false;
 		if (!logged) {
 			logged = true;
-			U_LOG_W("VK Local2D composite: %ux%u region, %u layer(s), %s mask", region_w,
-			        region_h, rect_count,
-			        (emask != NULL && emask->submitted) ? "explicit" : "implicit");
+			U_LOG_W("VK Local2D composite: %ux%u region, %u layer(s), %s mask (#491 alpha_over=%d)",
+			        region_w, region_h, rect_count, have_explicit ? "explicit" : "implicit",
+			        !have_explicit);
 		}
 	}
 

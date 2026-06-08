@@ -211,10 +211,11 @@ static const char *FS_TEXTURED =
     "}\n";
 
 //! Fragment shader: masked 2D-over-3D composite (#439 Phase 3 GL leg).
-//! final = M*weave + (1-M)*twod, per-channel — the same hard-mask composite
-//! the D3D11/D3D12/VK/Metal legs ship (parity; the translucent redesign is
-//! #491). All three sources are window-resolution textures in the same GL
-//! framebuffer orientation, sampled 1:1 by the fullscreen triangle.
+//! Hard-mask path: final = M*weave + (1-M)*twod (explicit authored mask).
+//! #491 alpha-over path (u_alpha_over): final = twod + (1-twod.a)*weave —
+//! premultiplied "over" of the 2D atop the weave, so translucent 2D reveals the
+//! 3D scene (used for the IMPLICIT Local2D mask). All three sources are
+//! window-resolution textures in the same GL framebuffer orientation, 1:1.
 static const char *FS_MASKED_COMPOSITE =
     "#version 330 core\n"
     "in vec2 v_uv;\n"
@@ -222,10 +223,15 @@ static const char *FS_MASKED_COMPOSITE =
     "uniform sampler2D u_twod;\n"
     "uniform sampler2D u_mask;\n"
     "uniform sampler2D u_weave;\n"
+    "uniform int u_alpha_over;\n"
     "void main() {\n"
-    "    float M = clamp(texture(u_mask, v_uv).r, 0.0, 1.0);\n"
     "    vec4 twod  = texture(u_twod,  v_uv);\n"
     "    vec4 weave = texture(u_weave, v_uv);\n"
+    "    if (u_alpha_over != 0) {\n"
+    "        fragColor = twod + (1.0 - twod.a) * weave;\n"
+    "        return;\n"
+    "    }\n"
+    "    float M = clamp(texture(u_mask, v_uv).r, 0.0, 1.0);\n"
     "    fragColor = M * weave + (1.0 - M) * twod;\n"
     "}\n";
 
@@ -1520,13 +1526,19 @@ gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint tar
 	glUniform1i(glGetUniformLocation(c->program_masked_composite, "u_twod"), 0);
 	glUniform1i(glGetUniformLocation(c->program_masked_composite, "u_mask"), 1);
 	glUniform1i(glGetUniformLocation(c->program_masked_composite, "u_weave"), 2);
+	// #491: the implicit (auto) Local2D mask composites the 2D over the weave by
+	// its own premultiplied alpha (translucent 2D reveals the 3D scene). The
+	// explicit authored mask keeps the hard M-lerp.
+	const bool alpha_over = have_local_2d && !have_explicit;
+	glUniform1i(glGetUniformLocation(c->program_masked_composite, "u_alpha_over"), alpha_over ? 1 : 0);
 	glDrawArrays(GL_TRIANGLES, 0, 3);
 	glActiveTexture(GL_TEXTURE0);
 
 	static bool composite_logged = false;
 	if (!composite_logged) {
-		U_LOG_W("GL Local2D composite: %ux%u region, %s mask, twod=%s", output_w, output_h,
-		        have_explicit ? "explicit" : "implicit", have_local_2d ? "local2d layers" : "(empty)");
+		U_LOG_W("GL Local2D composite: %ux%u region, %s mask, twod=%s (#491 alpha_over=%d)", output_w,
+		        output_h, have_explicit ? "explicit" : "implicit",
+		        have_local_2d ? "local2d layers" : "(empty)", alpha_over);
 		composite_logged = true;
 	}
 	return true;

@@ -287,7 +287,8 @@ comp_d3d11_renderer_composite_2d_masked(struct comp_d3d11_renderer *renderer,
                                         int32_t cx,
                                         int32_t cy,
                                         uint32_t cw,
-                                        uint32_t ch);
+                                        uint32_t ch,
+                                        bool alpha_over);
 
 /*!
  * Flatten one app Local2D layer image into the runtime 2D scratch (#439

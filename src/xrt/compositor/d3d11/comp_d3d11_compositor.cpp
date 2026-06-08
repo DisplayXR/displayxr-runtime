@@ -2569,10 +2569,11 @@ d3d11_composite_surround_shader(struct comp_d3d11_compositor *c,
 	uint32_t cbottom = (cy_u + ch > dst_h) ? dst_h : cy_u + ch;
 
 	// Phase 0: no authored mask (rect path), region == full dst surface.
+	// alpha_over=false: the analytic rect path keeps its hard discard.
 	xrt_result_t xret =
 	    comp_d3d11_renderer_composite_2d_masked(c->renderer, dst, c->surround_scratch_srv, nullptr, nullptr,
 	                                            dst_w, dst_h, (int32_t)cx_u, (int32_t)cy_u, cright - cx_u,
-	                                            cbottom - cy_u);
+	                                            cbottom - cy_u, false);
 	return xret == XRT_SUCCESS;
 }
 
@@ -3513,9 +3514,14 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	uint32_t cright = (cx_u + cw > region_w) ? region_w : cx_u + cw;
 	uint32_t cbottom = (cy_u + ch > region_h) ? region_h : cy_u + ch;
 
+	// #491: the implicit (auto) Local2D mask composites the 2D over the weave by
+	// its own premultiplied alpha (translucent 2D reveals the 3D scene). The
+	// explicit authored mask + the legacy surround path keep the hard M-lerp.
+	const bool alpha_over = have_local_2d && !have_explicit;
+
 	xrt_result_t xret = comp_d3d11_renderer_composite_2d_masked(
 	    c->renderer, dst, twod_srv, mask_srv, c->weave_scratch_srv, region_w, region_h, (int32_t)cx_u,
-	    (int32_t)cy_u, cright - cx_u, cbottom - cy_u);
+	    (int32_t)cy_u, cright - cx_u, cbottom - cy_u, alpha_over);
 	return xret == XRT_SUCCESS;
 }
 
