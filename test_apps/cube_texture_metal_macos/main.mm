@@ -1166,9 +1166,21 @@ static void WindowBackingPx(uint32_t *w, uint32_t *h)
 
 // #439: the rect the app should RENDER for. While the B-mode mask is active
 // (post view-size event) the declared canvas is superseded — the effective
-// rendering canvas is the full window, top-left anchored. The declared
-// canvas (ComputeCanvasRectPx) is still what the output-rect call and the
-// Tier-2 mask rect carry.
+// rendering canvas is the full window, top-left anchored: the app
+// renegotiates to window-sized rendering (Q4). The declared canvas
+// (ComputeCanvasRectPx) is still what the output-rect call and the Tier-2
+// mask rect carry.
+//
+// KNOWN (post-#396-W7 rebase): #396 moved view generation runtime-side (the
+// app consumes render-ready XrView{pose,fov}); the compositor's
+// get_window_metrics pivots to the window when a mask is active. The texture
+// app's old app-side world-scale compensation point was deleted by #396, so
+// the B-mode 3D currently renders at a residual scale offset vs the A
+// (surround) path inside the canvas region — the surround region stays
+// byte-identical and the Q4 event fires correctly. Reconciling a texture
+// app's canvas-sized 3D with the runtime-owned window-metric view gen is a
+// Windows-D3D11-leg item (where #396 + Phase 3 meet under Leia validation);
+// the handle cases (2/3/4) — the headline — are exact and unaffected.
 static void EffectiveCanvasRectPx(int32_t *cx, int32_t *cy, uint32_t *cw, uint32_t *ch)
 {
     if (g_canvasIsWindow) {
