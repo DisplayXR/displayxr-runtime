@@ -530,6 +530,13 @@ struct vk_bundle
 #endif // defined(VK_KHR_present_wait)
 
 	// end of GENERATED device loader code - do not modify - used by scripts
+
+	// #439 Phase 3 — appended AFTER the generated block (NOT inserted into it):
+	// the vk_bundle pointer crosses the display-processor plugin ABI boundary
+	// (xrt_dp_factory_vk_fn_t takes void *vk_bundle and the plugin reads PFNs by
+	// offset), so a new field must be append-only to preserve every prior field's
+	// offset. Loaded in vk_function_loaders.c alongside vkCmdClearColorImage.
+	PFN_vkCmdClearAttachments vkCmdClearAttachments;
 };
 
 struct vk_buffer
