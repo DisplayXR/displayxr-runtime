@@ -50,6 +50,17 @@ struct CompositeParams
 };
 
 /*!
+ * Local2D flatten constant buffer (#439 Phase 3). One float4: the source
+ * sub-rect in normalized [0,1] swapchain-image coords. The viewport's uv [0,1]
+ * maps through it as `src_uv = xy + uv*zw`. The caller bakes the dest-clip
+ * fractions, the layer's norm_rect, and flip_y (negative zw.y) into it.
+ */
+struct FlattenParams
+{
+	float src_rect[4]; // xy = src origin (norm), zw = src size (norm; zw.y < 0 ⇒ flip_y)
+};
+
+/*!
  * D3D11 renderer structure.
  */
 struct comp_d3d11_renderer
@@ -89,6 +100,13 @@ struct comp_d3d11_renderer
 	ID3D11PixelShader *composite_ps;
 	//! Constant buffer for the composite pass (CompositeParams).
 	ID3D11Buffer *composite_cb;
+
+	//! Local2D flatten shaders (#439 Phase 3): draw one app Local2D layer
+	//! image into the runtime 2D scratch at a per-draw viewport.
+	ID3D11VertexShader *local2d_flatten_vs;
+	ID3D11PixelShader *local2d_flatten_ps;
+	//! Constant buffer for the flatten pass (FlattenParams).
+	ID3D11Buffer *flatten_cb;
 
 	//! Constant buffer for shader parameters.
 	ID3D11Buffer *constant_buffer;
@@ -374,6 +392,65 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
 }
 )";
 
+// #439 Phase 3 — Local2D flatten. Draws one app Local2D layer image into the
+// runtime 2D scratch. The per-draw viewport (RSSetViewports, set by the caller)
+// restricts output to the clipped dest sub-rect; uv [0,1] over that viewport
+// maps through src_rect into the source swapchain image (dest-clip fractions,
+// the layer norm_rect, and flip_y are all baked into src_rect by the caller).
+// Premultiplied-vs-unpremultiplied is the caller's blend-state choice; the
+// shader passes the sampled texel straight through (sRGB-passthrough: the
+// source SRV is the swapchain's UNORM sibling, so no auto-decode).
+static const char *local2d_flatten_vs_source = R"(
+struct VS_OUTPUT
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+// Fullscreen triangle, uv [0,1] with top-left origin (uv grows right/down),
+// matching D3D texture-sampling convention.
+static const float2 positions[3] = {
+    float2(-1.0,  1.0),
+    float2(-1.0, -3.0),
+    float2( 3.0,  1.0),
+};
+static const float2 uvs[3] = {
+    float2(0.0, 0.0),
+    float2(0.0, 2.0),
+    float2(2.0, 0.0),
+};
+
+VS_OUTPUT VSMain(uint vertex_id : SV_VertexID)
+{
+    VS_OUTPUT o;
+    o.position = float4(positions[vertex_id], 0.0, 1.0);
+    o.uv = uvs[vertex_id];
+    return o;
+}
+)";
+
+static const char *local2d_flatten_ps_source = R"(
+Texture2D src_tex  : register(t0);
+SamplerState samp  : register(s0);
+
+cbuffer FlattenParams : register(b0)
+{
+    float4 src_rect; // xy = src origin (norm), zw = src size (norm; zw.y < 0 = flip_y)
+};
+
+struct VS_OUTPUT
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+float4 PSMain(VS_OUTPUT input) : SV_Target
+{
+    float2 src_uv = src_rect.xy + input.uv * src_rect.zw;
+    return src_tex.Sample(samp, src_uv);
+}
+)";
+
 static xrt_result_t
 compile_shader(ID3D11Device *device,
                const char *source,
@@ -491,6 +568,34 @@ create_shaders(struct comp_d3d11_renderer *r)
 		return XRT_ERROR_D3D;
 	}
 
+	// Local2D flatten vertex shader (#439 Phase 3).
+	xret = compile_shader(internals->device, local2d_flatten_vs_source, "VSMain", "vs_5_0", &blob);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_E("Failed to compile Local2D flatten vertex shader");
+		return xret;
+	}
+	hr = internals->device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+	                                           &r->local2d_flatten_vs);
+	blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create Local2D flatten vertex shader: 0x%08x", hr);
+		return XRT_ERROR_D3D;
+	}
+
+	// Local2D flatten pixel shader (#439 Phase 3).
+	xret = compile_shader(internals->device, local2d_flatten_ps_source, "PSMain", "ps_5_0", &blob);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_E("Failed to compile Local2D flatten pixel shader");
+		return xret;
+	}
+	hr = internals->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+	                                          &r->local2d_flatten_ps);
+	blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create Local2D flatten pixel shader: 0x%08x", hr);
+		return XRT_ERROR_D3D;
+	}
+
 	return XRT_SUCCESS;
 }
 
@@ -580,6 +685,18 @@ create_resources(struct comp_d3d11_renderer *r)
 	hr = internals->device->CreateBuffer(&compCbDesc, nullptr, &r->composite_cb);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create composite constant buffer: 0x%08x", hr);
+		return XRT_ERROR_D3D;
+	}
+
+	// Local2D flatten constant buffer (#439 Phase 3).
+	D3D11_BUFFER_DESC flattenCbDesc = {};
+	flattenCbDesc.ByteWidth = sizeof(FlattenParams);
+	flattenCbDesc.Usage = D3D11_USAGE_DYNAMIC;
+	flattenCbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	flattenCbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+	hr = internals->device->CreateBuffer(&flattenCbDesc, nullptr, &r->flatten_cb);
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create flatten constant buffer: 0x%08x", hr);
 		return XRT_ERROR_D3D;
 	}
 
@@ -1126,6 +1243,9 @@ comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr)
 	SAFE_RELEASE(r->sampler_point);
 	SAFE_RELEASE(r->sampler_linear);
 	SAFE_RELEASE(r->constant_buffer);
+	SAFE_RELEASE(r->flatten_cb);
+	SAFE_RELEASE(r->local2d_flatten_ps);
+	SAFE_RELEASE(r->local2d_flatten_vs);
 	SAFE_RELEASE(r->composite_cb);
 	SAFE_RELEASE(r->composite_ps);
 	SAFE_RELEASE(r->composite_vs);
@@ -1529,6 +1649,89 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 	        new_view_width, new_view_height,
 	        renderer->tile_columns, renderer->tile_rows, new_texture_height);
 
+	return XRT_SUCCESS;
+}
+
+extern "C" xrt_result_t
+comp_d3d11_renderer_flatten_local_2d(struct comp_d3d11_renderer *renderer,
+                                     void *scratch_rtv,
+                                     void *src_srv,
+                                     int32_t dst_x,
+                                     int32_t dst_y,
+                                     uint32_t dst_w,
+                                     uint32_t dst_h,
+                                     float src_x,
+                                     float src_y,
+                                     float src_w,
+                                     float src_h,
+                                     bool unpremultiplied)
+{
+	if (renderer == nullptr || scratch_rtv == nullptr || src_srv == nullptr || dst_w == 0 || dst_h == 0) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	auto internals = get_internals(renderer->c);
+	ID3D11RenderTargetView *rtv = static_cast<ID3D11RenderTargetView *>(scratch_rtv);
+
+	// Bind the scratch as the render target (the caller clears it transparent
+	// once before the layer loop). No depth — flatten is a flat over-blend.
+	internals->context->OMSetRenderTargets(1, &rtv, nullptr);
+
+	// Restrict output to the clipped dest sub-rect (window px). uv [0,1] over
+	// this viewport maps through src_rect into the source image.
+	D3D11_VIEWPORT vp = {};
+	vp.TopLeftX = static_cast<float>(dst_x);
+	vp.TopLeftY = static_cast<float>(dst_y);
+	vp.Width = static_cast<float>(dst_w);
+	vp.Height = static_cast<float>(dst_h);
+	vp.MaxDepth = 1.0f;
+	internals->context->RSSetViewports(1, &vp);
+
+	internals->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	internals->context->IASetInputLayout(nullptr);
+	internals->context->VSSetShader(renderer->local2d_flatten_vs, nullptr, 0);
+	internals->context->PSSetShader(renderer->local2d_flatten_ps, nullptr, 0);
+	internals->context->RSSetState(renderer->rasterizer_state);
+	internals->context->OMSetDepthStencilState(renderer->depth_stencil_state, 0);
+	// Premultiplied-over (default) vs straight/unpremultiplied-over
+	// (XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT). Both preserve dst.a
+	// via INV_SRC_ALPHA so stacked layers compose Porter-Duff "over".
+	internals->context->OMSetBlendState(unpremultiplied ? renderer->blend_alpha : renderer->blend_premul,
+	                                    nullptr, 0xFFFFFFFF);
+	// Linear+clamp: the source SRV is the swapchain's UNORM sibling
+	// (sRGB-passthrough — no auto-decode); clamp keeps sub-rect sampling
+	// from bleeding past the layer's norm_rect edges.
+	internals->context->PSSetSamplers(0, 1, &renderer->sampler_linear);
+
+	ID3D11ShaderResourceView *srv = static_cast<ID3D11ShaderResourceView *>(src_srv);
+	internals->context->PSSetShaderResources(0, 1, &srv);
+
+	FlattenParams params = {};
+	params.src_rect[0] = src_x;
+	params.src_rect[1] = src_y;
+	params.src_rect[2] = src_w;
+	params.src_rect[3] = src_h;
+
+	D3D11_MAPPED_SUBRESOURCE mapped;
+	HRESULT hr = internals->context->Map(renderer->flatten_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+	if (FAILED(hr)) {
+		U_LOG_E("flatten_local_2d: failed to map constant buffer: 0x%08x", hr);
+		ID3D11ShaderResourceView *null_srv = nullptr;
+		internals->context->PSSetShaderResources(0, 1, &null_srv);
+		ID3D11RenderTargetView *null_rtv = nullptr;
+		internals->context->OMSetRenderTargets(1, &null_rtv, nullptr);
+		return XRT_ERROR_D3D;
+	}
+	memcpy(mapped.pData, &params, sizeof(params));
+	internals->context->Unmap(renderer->flatten_cb, 0);
+	internals->context->PSSetConstantBuffers(0, 1, &renderer->flatten_cb);
+
+	internals->context->Draw(3, 0);
+
+	// Unbind the source SRV. The caller unbinds the scratch RTV after the
+	// whole layer loop (or the masked composite rebinds dst as RTV, which
+	// drops this binding anyway — no scratch read/write overlap).
+	ID3D11ShaderResourceView *null_srv = nullptr;
+	internals->context->PSSetShaderResources(0, 1, &null_srv);
 	return XRT_SUCCESS;
 }
 
