@@ -11,6 +11,7 @@
 
 // #439 — XR_EXT_local_3d_zone harness state (see xr_session.h).
 ZoneMaskHarness g_zone;
+bool g_hasViewRigExt = false;
 
 #define XR_CHECK(call) \
     do { \
@@ -81,12 +82,16 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) {
             g_zone.available = true;
         }
+        if (strcmp(ext.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
+            g_hasViewRigExt = true;
+        }
     }
 
     LOG_INFO("XR_KHR_D3D12_enable: %s", hasD3D12 ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_win32_window_binding: %s", xr.hasWin32WindowBindingExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_display_info: %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_local_3d_zone: %s", g_zone.available ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_EXT_view_rig: %s", g_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasD3D12) {
         LOG_ERROR("XR_KHR_D3D12_enable extension not available");
@@ -106,6 +111,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (g_zone.available) {
         enabledExtensions.push_back(XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME);
+    }
+    if (g_hasViewRigExt) {
+        enabledExtensions.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
     }
 
     LOG_INFO("Enabling %zu extensions", enabledExtensions.size());
