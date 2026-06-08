@@ -9136,22 +9136,46 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			c->atlas_flip_y = true;
 		}
 
-		static bool logged_bridge_blit = false;
-		if (bridge_override && !logged_bridge_blit) {
-			logged_bridge_blit = true;
-			U_LOG_W("BRIDGE BLIT: active=%ux%u sys_view=%ux%u display=%ux%u "
-			        "chrome_rect=(%d,%d %dx%d) tiles=%ux%u scale=%.2fx%.2f",
-			        active_vw, active_vh, sys->view_width, sys->view_height,
-			        sys->display_width, sys->display_height,
-			        layer->data.proj.v[0].sub.rect.offset.w,
-			        layer->data.proj.v[0].sub.rect.offset.h,
-			        layer->data.proj.v[0].sub.rect.extent.w,
-			        layer->data.proj.v[0].sub.rect.extent.h,
-			        sys->tile_columns, sys->tile_rows,
-			        (sys->xdev && sys->xdev->hmd && sys->xdev->hmd->active_rendering_mode_index < sys->xdev->rendering_mode_count)
-			            ? sys->xdev->rendering_modes[sys->xdev->hmd->active_rendering_mode_index].view_scale_x : -1.0f,
-			        (sys->xdev && sys->xdev->hmd && sys->xdev->hmd->active_rendering_mode_index < sys->xdev->rendering_mode_count)
-			            ? sys->xdev->rendering_modes[sys->xdev->hmd->active_rendering_mode_index].view_scale_y : -1.0f);
+		// #486 bridge atlas-crop regression: log on CHANGE (not one-shot) so we
+		// capture steady-state dims after the 3D-mode flip settles, not just the
+		// warmup frame. Keyed on (active dims, chrome subimage extent,
+		// tile_columns, proj_view_count) — the values that decide whether each
+		// view's source box covers its full content or only half.
+		if (bridge_override) {
+			static uint32_t prev_avw = 0, prev_avh = 0;
+			static int32_t prev_crw = -1, prev_crh = -1;
+			static uint32_t prev_tc = 0, prev_pvc = 0;
+			uint32_t crw = (uint32_t)layer->data.proj.v[0].sub.rect.extent.w;
+			uint32_t crh = (uint32_t)layer->data.proj.v[0].sub.rect.extent.h;
+			if (active_vw != prev_avw || active_vh != prev_avh ||
+			    (int32_t)crw != prev_crw || (int32_t)crh != prev_crh ||
+			    sys->tile_columns != prev_tc || proj_view_count != prev_pvc) {
+				prev_avw = active_vw; prev_avh = active_vh;
+				prev_crw = (int32_t)crw; prev_crh = (int32_t)crh;
+				prev_tc = sys->tile_columns; prev_pvc = proj_view_count;
+				U_LOG_W("BRIDGE BLIT: active=%ux%u sys_view=%ux%u display=%ux%u "
+				        "views=%u chrome_rect=(%d,%d %dx%d) tiles=%ux%u scale=%.2fx%.2f",
+				        active_vw, active_vh, sys->view_width, sys->view_height,
+				        sys->display_width, sys->display_height, proj_view_count,
+				        layer->data.proj.v[0].sub.rect.offset.w,
+				        layer->data.proj.v[0].sub.rect.offset.h,
+				        layer->data.proj.v[0].sub.rect.extent.w,
+				        layer->data.proj.v[0].sub.rect.extent.h,
+				        sys->tile_columns, sys->tile_rows,
+				        (sys->xdev && sys->xdev->hmd && sys->xdev->hmd->active_rendering_mode_index < sys->xdev->rendering_mode_count)
+				            ? sys->xdev->rendering_modes[sys->xdev->hmd->active_rendering_mode_index].view_scale_x : -1.0f,
+				        (sys->xdev && sys->xdev->hmd && sys->xdev->hmd->active_rendering_mode_index < sys->xdev->rendering_mode_count)
+				            ? sys->xdev->rendering_modes[sys->xdev->hmd->active_rendering_mode_index].view_scale_y : -1.0f);
+				// Per-view source offsets — confirms the L/R split when active_vw
+				// is narrower than the per-view content extent.
+				for (uint32_t dv = 0; dv < proj_view_count && dv < XRT_MAX_VIEWS; dv++) {
+					U_LOG_W("  BRIDGE BLIT view[%u]: src_off=(%d,%d) src_ext=%dx%d -> crop_w=%u",
+					        dv, layer->data.proj.v[dv].sub.rect.offset.w,
+					        layer->data.proj.v[dv].sub.rect.offset.h,
+					        layer->data.proj.v[dv].sub.rect.extent.w,
+					        layer->data.proj.v[dv].sub.rect.extent.h, active_vw);
+				}
+			}
 		}
 
 		for (uint32_t eye = 0; eye < proj_view_count; eye++) {
