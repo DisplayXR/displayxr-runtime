@@ -817,6 +817,34 @@ comp_ipc_client_compositor_locate_views_rig(struct xrt_compositor *xc,
 }
 
 xrt_result_t
+comp_ipc_client_system_compositor_locate_views_rig(struct xrt_system_compositor *xsysc,
+                                                   const struct ipc_view_rig_info *rig,
+                                                   int64_t at_timestamp_ns,
+                                                   uint32_t view_count,
+                                                   struct ipc_info_locate_views_rig *out_info)
+{
+	// Bridge-relay sessions (#396 W7) are headless: they have no per-session
+	// native compositor (sess->xcn == NULL), so the xc-keyed sibling above
+	// can't reach the IPC connection. Resolve it from the system compositor
+	// instead, which the bridge session always holds. The container_of below
+	// is only valid on an IPC client system compositor — gated by the
+	// is_service_mode flag, which is set exclusively by
+	// ipc_client_create_system_compositor (the bridge also forces
+	// XRT_FORCE_MODE=ipc, so this is always the IPC variant in practice).
+	if (xsysc == NULL || rig == NULL || out_info == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (!xsysc->info.is_service_mode) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = container_of(xsysc, struct ipc_client_compositor, system);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_session_locate_views_rig(icc->ipc_c, rig, at_timestamp_ns, view_count, out_info);
+}
+
+xrt_result_t
 comp_ipc_client_compositor_workspace_enumerate_clients(struct xrt_compositor *xc,
                                                        uint32_t capacity,
                                                        uint32_t *out_count,

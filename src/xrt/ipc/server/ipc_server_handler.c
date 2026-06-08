@@ -493,6 +493,25 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 			}
 		}
 		fill_surplus_view_poses(xdev, eye_count, view_count, out_fovs, out_poses);
+
+		// XR_EXT_view_rig raw channel (#396 W7 bridge-raw tail): complete the
+		// raw block for headless relays. Eyes/count/sampleTime/isTracking were
+		// captured above (verbatim, pre-rebase — and the rebase is a no-op for
+		// headless clients, so raw eyes == out_poses positions by
+		// construction). The window-keyed display_pose + canvas fields are
+		// skipped above (no window lookup runs for headless), so fill them
+		// here: identity display plane (matches the identity head this path
+		// returns) and the full display rect (a relay owns no window). Mirrors
+		// the in-process oxr_session.c display-rect fallback semantics.
+		if (rig_reply != NULL) {
+			rig_reply->raw.display_pose = (struct xrt_pose){{0, 0, 0, 1}, {0, 0, 0}};
+			rig_reply->raw.rect_x_px = 0;
+			rig_reply->raw.rect_y_px = 0;
+			rig_reply->raw.rect_w_px = (int32_t)s->xsysc->info.display_pixel_width;
+			rig_reply->raw.rect_h_px = (int32_t)s->xsysc->info.display_pixel_height;
+			rig_reply->raw.size_w_m = screen_width_m;
+			rig_reply->raw.size_h_m = screen_height_m;
+		}
 		return true;
 	}
 
@@ -995,15 +1014,7 @@ ipc_handle_session_create(volatile struct ipc_client_state *ics,
 	// For headless sessions (create_native_compositor=false), pass NULL
 	// for out_xcn so u_system::create_session registers the session for
 	// event broadcasting without returning a compositor to the caller.
-	{
-		FILE *dbg = fopen("C:\\bridge_debug.txt", "a");
-		if (dbg) {
-			fprintf(dbg, "ipc_handle_session_create: create_native_compositor=%d xsys=%p\n",
-			        (int)create_native_compositor, (void *)ics->server->xsys);
-			fflush(dbg);
-			fclose(dbg);
-		}
-	}
+	//
 	// Populate application_name on the session info from the IPC client's
 	// instance-describe record so the compositor can surface meaningful
 	// slot titles for clients that don't set XR_EXT_win32_window_binding

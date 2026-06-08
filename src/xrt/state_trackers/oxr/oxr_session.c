@@ -128,6 +128,14 @@ comp_ipc_client_compositor_locate_views_rig(struct xrt_compositor *xc,
                                             int64_t at_timestamp_ns,
                                             uint32_t view_count,
                                             struct ipc_info_locate_views_rig *out_info);
+// Bridge-relay variant (headless, xcn == NULL): keyed off the system
+// compositor the bridge session always holds. See ipc_client.h.
+xrt_result_t
+comp_ipc_client_system_compositor_locate_views_rig(struct xrt_system_compositor *xsysc,
+                                                   const struct ipc_view_rig_info *rig,
+                                                   int64_t at_timestamp_ns,
+                                                   uint32_t view_count,
+                                                   struct ipc_info_locate_views_rig *out_info);
 #endif
 
 #ifdef XRT_OS_WINDOWS
@@ -1697,19 +1705,36 @@ oxr_session_locate_views(struct oxr_logger *log,
 	// SAME server code path as device_get_view_poses, plus the rig
 	// overrides and the raw-inputs block. Strictly per-locate: a locate
 	// that chains nothing takes the legacy path below untouched, keeping
-	// the raw-eye transport contract in XrView.pose. Bridge-relay sessions
-	// keep their headless fast-path contract.
+	// the raw-eye transport contract in XrView.pose.
+	//
+	// Two routes (#396 W7 bridge-raw tail):
+	//  - native: external-window / texture / hosted service sessions that
+	//    own a per-session compositor (sess->xcn). They may chain a rig
+	//    descriptor AND/OR the raw struct; the rig overrides apply.
+	//  - bridge: headless bridge-relay sessions (XR_MND_headless +
+	//    XR_EXT_display_info) own no xcn but still hold sess->sys->xsysc.
+	//    They route view_raw-chained locates through the system-compositor
+	//    conduit so the WebXR bridge consumes the SAME formal raw inputs as
+	//    a native aware app. Chained rig DESCRIPTORS stay inert for bridge
+	//    relays — the server's headless fast path returns before rig
+	//    handling, so we force rig_type NONE to keep that explicit and the
+	//    XrView.pose headless contract byte-identical (raw eyes verbatim).
 	bool ipc_rig_done = false;
 #ifdef OXR_HAVE_EXT_view_rig
-	if ((rig_active || view_raw != NULL) && !sess->is_bridge_relay && sess->xcn != NULL &&
-	    sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode) {
+	const bool ipc_service_mode = sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode;
+	const bool rig_route_native =
+	    (rig_active || view_raw != NULL) && !sess->is_bridge_relay && sess->xcn != NULL;
+	const bool rig_route_bridge = view_raw != NULL && sess->is_bridge_relay;
+	if ((rig_route_native || rig_route_bridge) && ipc_service_mode) {
 		struct ipc_view_rig_info rig_info = {0};
-		if (rig_camera) {
+		// Bridge relays keep rig_type NONE (descriptors inert); only native
+		// routes carry the chained rig overrides.
+		if (rig_route_native && rig_camera) {
 			rig_info.rig_type = IPC_VIEW_RIG_CAMERA;
-		} else if (rig_display) {
+		} else if (rig_route_native && rig_display) {
 			rig_info.rig_type = IPC_VIEW_RIG_DISPLAY;
 		}
-		if (rig_active) {
+		if (rig_route_native && rig_active) {
 			// Values are already clamped by view_rig_update_from_chain.
 			rig_info.pose = sess->view_rig.pose;
 			rig_info.virtual_display_height = sess->view_rig.virtual_display_height;
@@ -1722,8 +1747,12 @@ oxr_session_locate_views(struct oxr_logger *log,
 
 		uint32_t wire_views = (view_count < XRT_MAX_VIEWS) ? view_count : XRT_MAX_VIEWS;
 		struct ipc_info_locate_views_rig reply = {0};
-		xrt_result_t xret = comp_ipc_client_compositor_locate_views_rig(
-		    &sess->xcn->base, &rig_info, xdisplay_time, wire_views, &reply);
+		xrt_result_t xret =
+		    rig_route_bridge
+		        ? comp_ipc_client_system_compositor_locate_views_rig(
+		              sess->sys->xsysc, &rig_info, xdisplay_time, wire_views, &reply)
+		        : comp_ipc_client_compositor_locate_views_rig(
+		              &sess->xcn->base, &rig_info, xdisplay_time, wire_views, &reply);
 		if (xret == XRT_SUCCESS) {
 			ipc_rig_done = true;
 			T_xdev_head = reply.head_relation;
@@ -1783,6 +1812,23 @@ oxr_session_locate_views(struct oxr_logger *log,
 				U_LOG_W("VIEW-RIG IPC client: locate call failed (xret=%d), "
 				        "falling back to legacy device locate",
 				        xret);
+			}
+			// Bridge route fallback: the legacy device locate (below) still
+			// fills XrView.pose with raw eyes via the headless fast path, but
+			// it does NOT touch view_raw. The in-process pre-fill above
+			// (the eye-count>0 branch) may have left CLIENT-NOMINAL eyes in
+			// view_raw — re-zero to the no-data defaults so eyeCountOutput==0
+			// stays a reliable "no server-authoritative raw data" signal for
+			// the bridge (its validity gate). Native routes don't need this:
+			// their pre-fill is the same data the server would return.
+			if (rig_route_bridge && view_raw != NULL) {
+				U_ZERO_ARRAY(view_raw->rawEyes);
+				view_raw->eyeCountOutput = 0;
+				view_raw->displayPlanePose = (XrPosef){{0, 0, 0, 1}, {0, 0, 0}};
+				view_raw->canvasRectPx = (XrRect2Di){{0, 0}, {0, 0}};
+				view_raw->canvasSizeMeters = (XrExtent2Df){0, 0};
+				view_raw->sampleTimeNs = 0;
+				view_raw->isTracking = XR_FALSE;
 			}
 		}
 	}

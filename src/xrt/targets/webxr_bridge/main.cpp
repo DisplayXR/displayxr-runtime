@@ -35,6 +35,7 @@
 
 #include <openxr/openxr.h>
 #include <openxr/XR_EXT_display_info.h>
+#include <openxr/XR_EXT_view_rig.h>
 #include "../../auxiliary/util/u_bridge_hud_shared.h"
 
 // IPC client — opened as a parallel query-only channel so the bridge can
@@ -433,6 +434,7 @@ struct Bridge {
 	XrSpace local_space = XR_NULL_HANDLE;
 	bool has_display_info_ext = false;
 	bool has_headless_ext = false;
+	bool has_view_rig_ext = false;
 	PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModes = nullptr;
 	PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingMode = nullptr;
 	PFN_xrRequestEyeTrackingModeEXT pfnRequestEyeTrackingMode = nullptr;
@@ -1012,13 +1014,51 @@ static std::string build_input_event_json(const InputEvent &e) {
 	return s;
 }
 
-static std::string build_eye_poses_json(const XrView *views, uint32_t count) {
-	std::string s = "{\"type\":\"eye-poses\",\"version\":1,\"format\":\"raw\",\"eyes\":[";
+// Build the eye-poses message. When `raw` is non-NULL the per-view positions
+// come from the formal XR_EXT_view_rig raw channel (XrViewDisplayRawEXT), the
+// same display-space inputs a native aware app consumes — replacing the
+// implicit headless-fast-path contract that smuggled raw eyes through
+// XrView.pose. Values are identical by construction (the runtime's raw channel
+// and the headless XrView path both report the pre-rebase DP eyes); the raw
+// channel additionally carries the DP sample time, tracking lock, and display
+// plane, forwarded as additive fields below.
+//
+// Surplus views (rendering modes wanting more views than the tracker reports,
+// e.g. quad) are NOT in the raw channel's tracked-eye set today — for indices
+// >= eyeCountOutput fall back to the XrView pose, preserving today's JSON
+// entries. When the raw channel later exposes synthesized surplus eyes, this
+// loop picks them up automatically (the bound is eyeCountOutput).
+static std::string build_eye_poses_json(const XrView *views, uint32_t count,
+                                        const XrViewDisplayRawEXT *raw) {
+	std::string s = "{\"type\":\"eye-poses\",\"version\":1,\"format\":\"raw\"";
+	if (raw != nullptr) {
+		// int64 ns can exceed JS Number's safe range — serialize as a string.
+		char nsbuf[32];
+		std::snprintf(nsbuf, sizeof(nsbuf), "%lld", (long long)raw->sampleTimeNs);
+		const auto &dp = raw->displayPlanePose.position;
+		const auto &dq = raw->displayPlanePose.orientation;
+		s += ",\"source\":\"view-rig\"";
+		s += ",\"isTracking\":";
+		s += raw->isTracking ? "true" : "false";
+		s += ",\"sampleTimeNs\":\"";
+		s += nsbuf;
+		s += "\"";
+		s += ",\"displayPlane\":{\"position\":[" + json_f(dp.x) + "," + json_f(dp.y) + "," + json_f(dp.z) + "]"
+		   + ",\"orientation\":[" + json_f(dq.x) + "," + json_f(dq.y) + "," + json_f(dq.z) + "," + json_f(dq.w) + "]}";
+	}
+	s += ",\"eyes\":[";
 	for (uint32_t i = 0; i < count; i++) {
 		if (i) s += ",";
-		const auto &p = views[i].pose.position;
+		// Position: formal raw eye when available, else the XrView pose
+		// (surplus views / no raw channel).
+		float px, py, pz;
+		if (raw != nullptr && i < raw->eyeCountOutput) {
+			px = raw->rawEyes[i].x; py = raw->rawEyes[i].y; pz = raw->rawEyes[i].z;
+		} else {
+			px = views[i].pose.position.x; py = views[i].pose.position.y; pz = views[i].pose.position.z;
+		}
 		const auto &o = views[i].pose.orientation;
-		s += "{\"position\":[" + json_f(p.x) + "," + json_f(p.y) + "," + json_f(p.z) + "]"
+		s += "{\"position\":[" + json_f(px) + "," + json_f(py) + "," + json_f(pz) + "]"
 		   + ",\"orientation\":[" + json_f(o.x) + "," + json_f(o.y) + "," + json_f(o.z) + "," + json_f(o.w) + "]"
 		   + ",\"fov\":{\"angleLeft\":" + json_f(views[i].fov.angleLeft)
 		   + ",\"angleRight\":" + json_f(views[i].fov.angleRight)
@@ -1548,9 +1588,13 @@ static bool create_instance(Bridge &b) {
 		if (std::strcmp(e.extensionName, XR_MND_HEADLESS_EXTENSION_NAME) == 0) {
 			b.has_headless_ext = true;
 		}
+		if (std::strcmp(e.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
+			b.has_view_rig_ext = true;
+		}
 	}
 	LOG_I("XR_EXT_display_info: %s", b.has_display_info_ext ? "yes" : "NO");
 	LOG_I("XR_MND_headless:     %s", b.has_headless_ext ? "yes" : "NO");
+	LOG_I("XR_EXT_view_rig:     %s", b.has_view_rig_ext ? "yes" : "NO (raw eyes via XrView fallback)");
 
 	if (!b.has_display_info_ext) {
 		LOG_E("XR_EXT_display_info is required by this bridge; aborting");
@@ -1564,6 +1608,14 @@ static bool create_instance(Bridge &b) {
 	std::vector<const char *> enabled_exts;
 	enabled_exts.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
 	enabled_exts.push_back(XR_MND_HEADLESS_EXTENSION_NAME);
+	// Optional: the formal raw-inputs channel. When present the bridge sources
+	// its per-view eyes from XrViewDisplayRawEXT instead of the implicit
+	// headless-fast-path XrView.pose contract. Absent (older runtime) → the
+	// bridge falls back to the XrView pose, byte-identical to its prior
+	// behavior.
+	if (b.has_view_rig_ext) {
+		enabled_exts.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
+	}
 
 	XrInstanceCreateInfo ici{XR_TYPE_INSTANCE_CREATE_INFO};
 	std::strncpy(ici.applicationInfo.applicationName, "displayxr-webxr-bridge",
@@ -1881,13 +1933,61 @@ static void poll_eye_poses(Bridge &b) {
 	XrView views[8];
 	for (uint32_t i = 0; i < 8; i++) views[i] = {XR_TYPE_VIEW};
 
+	// XR_EXT_view_rig (#396 W7 bridge-raw tail): chain the formal raw-inputs
+	// struct so the runtime fills display-space eyes + display plane + sample
+	// time + tracking lock — the same inputs a native aware app consumes.
+	// Chain it AFTER et_state (et_state.next) so BOTH output structs ride the
+	// XrViewState::next chain — don't clobber the #446 eye-tracking-state.
+	XrViewDisplayRawEXT raw{XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+	if (b.has_view_rig_ext) {
+		et_state.next = &raw;
+	}
+
 	XrResult r = xrLocateViews(b.session, &vli, &vs, 8, &view_count, views);
 	if (XR_FAILED(r)) return;
 
 	b.eye_tracking_state = (et_state.isTracking == XR_TRUE) ? 1 : 0;
 
+	// Use the formal channel only when the runtime actually populated it
+	// (eyeCountOutput > 0). On failure/older runtimes the serializer falls
+	// back to XrView poses — byte-identical to the prior behavior.
+	const XrViewDisplayRawEXT *rawp =
+	    (b.has_view_rig_ext && raw.eyeCountOutput > 0) ? &raw : nullptr;
+
+	// One-shot proof the formal channel is live + value-identity A/B against
+	// the XrView poses on the SAME locate (raw eyes must equal XrView pose
+	// positions by construction). All logs one-shot — never per-frame.
+	if (rawp != nullptr) {
+		static bool raw_live_logged = false;
+		if (!raw_live_logged) {
+			raw_live_logged = true;
+			LOG_I("view-rig raw channel LIVE: eyes=%u tracking=%d sampleTimeNs=%lld "
+			      "canvas=%dx%d@(%d,%d) %.4fx%.4fm",
+			      raw.eyeCountOutput, (int)raw.isTracking, (long long)raw.sampleTimeNs,
+			      raw.canvasRectPx.extent.width, raw.canvasRectPx.extent.height,
+			      raw.canvasRectPx.offset.x, raw.canvasRectPx.offset.y,
+			      raw.canvasSizeMeters.width, raw.canvasSizeMeters.height);
+			float worst = 0.0f;
+			for (uint32_t i = 0; i < raw.eyeCountOutput && i < view_count; i++) {
+				float dx = raw.rawEyes[i].x - views[i].pose.position.x;
+				float dy = raw.rawEyes[i].y - views[i].pose.position.y;
+				float dz = raw.rawEyes[i].z - views[i].pose.position.z;
+				float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+				if (d > worst) worst = d;
+				LOG_I("  raw[%u]=(%.6f,%.6f,%.6f) view[%u]=(%.6f,%.6f,%.6f) delta=%.2e",
+				      i, raw.rawEyes[i].x, raw.rawEyes[i].y, raw.rawEyes[i].z,
+				      i, views[i].pose.position.x, views[i].pose.position.y,
+				      views[i].pose.position.z, d);
+			}
+			if (worst > 1e-6f) {
+				LOG_W("view-rig raw/XrView identity VIOLATED: worst delta=%.2e "
+				      "(expected ~0 — both are pre-rebase DP eyes)", worst);
+			}
+		}
+	}
+
 	if (streaming) {
-		b.outgoing.push(build_eye_poses_json(views, view_count));
+		b.outgoing.push(build_eye_poses_json(views, view_count, rawp));
 	}
 }
 
