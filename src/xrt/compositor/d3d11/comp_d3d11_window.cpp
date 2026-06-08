@@ -118,6 +118,12 @@ struct comp_d3d11_window
 	//! True if user closed the window (window thread writes, compositor reads)
 	volatile LONG should_exit;
 
+	//! Two-party cleanup vote. The window thread (on exit) and
+	//! comp_d3d11_window_destroy each vote exactly once via window_release();
+	//! the second voter frees the struct. This guarantees w outlives both users
+	//! with no use-after-free and no leak, regardless of teardown timing.
+	volatile LONG cleanup_votes;
+
 	//! True while inside a modal move/size loop (window thread writes, compositor reads)
 	volatile LONG in_size_move;
 
@@ -992,6 +998,38 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 }
 
 /*!
+ * Two-party cleanup for @ref comp_d3d11_window. Both the window thread (when it
+ * exits) and @ref comp_d3d11_window_destroy call this exactly once. The second
+ * caller (vote reaches 2) frees the struct and closes its handles; the first
+ * caller returns, leaving the struct alive for the other party still using it.
+ *
+ * This is the fix for the CTS full-run crash: previously destroy freed @p w on a
+ * wait timeout while the window thread was still inside DestroyWindow (its window
+ * proc reads @p w back from GWLP_USERDATA), causing a use-after-free
+ * ACCESS_VIOLATION. Now whoever finishes last frees, so @p w always outlives both.
+ */
+static void
+window_release(struct comp_d3d11_window *w)
+{
+	if (InterlockedIncrement(&w->cleanup_votes) < 2) {
+		return; // other party is still using w; it will free.
+	}
+	if (w->thread_handle != NULL) {
+		CloseHandle(w->thread_handle);
+	}
+	if (w->window_ready_event != NULL) {
+		CloseHandle(w->window_ready_event);
+	}
+	if (w->paint_requested_event != NULL) {
+		CloseHandle(w->paint_requested_event);
+	}
+	if (w->paint_done_event != NULL) {
+		CloseHandle(w->paint_done_event);
+	}
+	free(w);
+}
+
+/*!
  * Window thread function.
  *
  * Creates the window, runs the message loop, and cleans up the window class
@@ -1024,6 +1062,7 @@ window_thread_func(LPVOID param)
 		} else {
 			U_LOG_E("D3D11 window thread: RegisterClassExW failed with error %lu", err);
 			SetEvent(w->window_ready_event);
+			window_release(w);
 			return 1;
 		}
 	}
@@ -1058,6 +1097,7 @@ window_thread_func(LPVOID param)
 			w->window_class = 0;
 		}
 		SetEvent(w->window_ready_event);
+		window_release(w);
 		return 1;
 	}
 
@@ -1122,6 +1162,7 @@ window_thread_func(LPVOID param)
 	}
 
 	U_LOG_W("D3D11 window thread: exiting");
+	window_release(w);
 	return 0;
 }
 
@@ -1190,21 +1231,20 @@ comp_d3d11_window_create(uint32_t width,
 	DWORD wait_result = WaitForSingleObject(w->window_ready_event, 10000);
 	if (wait_result != WAIT_OBJECT_0) {
 		U_LOG_E("D3D11 window: Timeout waiting for window thread to create HWND");
-		// Try to terminate the thread gracefully
-		WaitForSingleObject(w->thread_handle, 1000);
-		CloseHandle(w->thread_handle);
-		CloseHandle(w->window_ready_event);
-		free(w);
+		// The thread is still running and still references w. Vote and let the
+		// thread free w when it eventually exits (window_release: last voter
+		// frees). Freeing here would be a use-after-free.
+		window_release(w);
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
 	// Check if the window was actually created
 	if (w->hwnd == NULL) {
 		U_LOG_E("D3D11 window: Window thread failed to create HWND");
+		// The thread took an error exit and already cast its vote; wait for it
+		// to finish, then this second vote frees w.
 		WaitForSingleObject(w->thread_handle, 5000);
-		CloseHandle(w->thread_handle);
-		CloseHandle(w->window_ready_event);
-		free(w);
+		window_release(w);
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
@@ -1222,37 +1262,34 @@ comp_d3d11_window_destroy(struct comp_d3d11_window **window)
 	}
 
 	struct comp_d3d11_window *w = *window;
+	*window = NULL;
 
 	U_LOG_W("D3D11 window: Destroying window");
 
-	// Tell the window thread to close (PostMessage is safe cross-thread)
+	// Ask the window thread to close: WM_CLOSE -> DestroyWindow -> WM_DESTROY ->
+	// PostQuitMessage breaks its message loop, after which it frees its own
+	// resources and votes via window_release().
+	InterlockedExchange(&w->should_exit, TRUE);
 	if (w->hwnd != NULL) {
 		PostMessageW(w->hwnd, WM_CLOSE, 0, 0);
 	}
 
-	// Wait for window thread to exit
+	// Wait so the caller (compositor teardown) knows the window is gone before it
+	// releases the D3D device the thread renders with. The WM_CLOSE handler
+	// switches the DP to 2D and runs DestroyWindow, which synchronously re-enters
+	// the window proc (it reads w back from GWLP_USERDATA), so under the CTS's
+	// heavy create/destroy churn this can take a while — allow a generous timeout.
+	// If it still hasn't exited we proceed anyway: window_release() guarantees we
+	// never free w while the thread is alive (whoever finishes last frees), which
+	// eliminates the use-after-free ACCESS_VIOLATION that crashed the CTS run.
 	if (w->thread_handle != NULL) {
-		DWORD wait_result = WaitForSingleObject(w->thread_handle, 5000);
-		if (wait_result != WAIT_OBJECT_0) {
-			U_LOG_W("D3D11 window: Window thread did not exit within timeout");
+		if (WaitForSingleObject(w->thread_handle, 30000) != WAIT_OBJECT_0) {
+			U_LOG_E("D3D11 window: thread still running after 30s; deferring "
+			        "cleanup to it (no use-after-free)");
 		}
-		CloseHandle(w->thread_handle);
 	}
 
-	if (w->window_ready_event != NULL) {
-		CloseHandle(w->window_ready_event);
-	}
-
-	if (w->paint_requested_event != NULL) {
-		CloseHandle(w->paint_requested_event);
-	}
-
-	if (w->paint_done_event != NULL) {
-		CloseHandle(w->paint_done_event);
-	}
-
-	free(w);
-	*window = NULL;
+	window_release(w);
 }
 
 extern "C" void *
