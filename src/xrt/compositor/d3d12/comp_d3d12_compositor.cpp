@@ -2457,19 +2457,109 @@ extern "C" bool
 comp_d3d12_compositor_get_window_metrics(struct xrt_compositor *xc,
                                           struct xrt_window_metrics *out_metrics)
 {
+	if (xc == nullptr || out_metrics == nullptr) {
+		if (out_metrics != nullptr) {
+			out_metrics->valid = false;
+		}
+		return false;
+	}
+
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);
 
+	// Prefer a DP-provided window metrics implementation if one exists.
 	bool ok = xrt_display_processor_d3d12_get_window_metrics(c->display_processor, out_metrics);
-	if (ok) {
-		// #439 Phase 2: the active zone mask supersedes the canvas — the
-		// Kooima/adaptive-FOV metrics follow the same authority as the
-		// weave region. (This path doesn't take c->mutex; the canvas/mask
-		// fields are pointer-sized reads updated under the lock in another
-		// function — the pointer check in d3d12_effective_canvas is benign.)
-		const struct u_canvas_rect eff_canvas = d3d12_effective_canvas(c);
-		u_canvas_apply_to_metrics(out_metrics, &eff_canvas);
+	if (!ok) {
+		// No DP implementation (the in-tree sim_display DP and the Leia
+		// plug-in delegate window placement to the runtime). Compute the
+		// metrics directly from the HWND — same construction as the d3d11
+		// native compositor. Without this, d3d12 handle/texture sessions
+		// had NO window metrics and the runtime-side Kooima (rig path, raw
+		// channel, legacy-2D fovs) ran display-scoped, so window-relative
+		// 3D and the rig's rotation pivot were wrong (#396 W7 dogfood).
+		memset(out_metrics, 0, sizeof(*out_metrics));
+
+		// Shared-texture (texture-app) sessions carry the app's window in
+		// app_hwnd (c->hwnd stays null); u_canvas_apply_to_metrics below
+		// rewrites the result to the canvas sub-rect.
+		HWND metrics_hwnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
+		if (c->display_processor == nullptr || metrics_hwnd == nullptr) {
+			return false;
+		}
+
+		uint32_t disp_px_w = 0, disp_px_h = 0;
+		int32_t disp_left = 0, disp_top = 0;
+		if (!xrt_display_processor_d3d12_get_display_pixel_info(
+		        c->display_processor, &disp_px_w, &disp_px_h, &disp_left, &disp_top)) {
+			return false;
+		}
+		if (disp_px_w == 0 || disp_px_h == 0) {
+			return false;
+		}
+
+		float disp_w_m = 0.0f, disp_h_m = 0.0f;
+		if (!xrt_display_processor_d3d12_get_display_dimensions(
+		        c->display_processor, &disp_w_m, &disp_h_m)) {
+			return false;
+		}
+
+		RECT rect;
+		if (!GetClientRect(metrics_hwnd, &rect)) {
+			return false;
+		}
+		uint32_t win_px_w = static_cast<uint32_t>(rect.right - rect.left);
+		uint32_t win_px_h = static_cast<uint32_t>(rect.bottom - rect.top);
+		if (win_px_w == 0 || win_px_h == 0) {
+			return false;
+		}
+
+		POINT client_origin = {0, 0};
+		ClientToScreen(metrics_hwnd, &client_origin);
+
+		float pixel_size_x = disp_w_m / (float)disp_px_w;
+		float pixel_size_y = disp_h_m / (float)disp_px_h;
+
+		float win_w_m = (float)win_px_w * pixel_size_x;
+		float win_h_m = (float)win_px_h * pixel_size_y;
+
+		float win_center_px_x = (float)(client_origin.x - disp_left) + (float)win_px_w / 2.0f;
+		float win_center_px_y = (float)(client_origin.y - disp_top) + (float)win_px_h / 2.0f;
+		float disp_center_px_x = (float)disp_px_w / 2.0f;
+		float disp_center_px_y = (float)disp_px_h / 2.0f;
+
+		// X: +right (screen and eye coords agree). Y: negated (screen
+		// Y-down, eye Y-up).
+		float offset_x_m = (win_center_px_x - disp_center_px_x) * pixel_size_x;
+		float offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
+
+		out_metrics->display_width_m = disp_w_m;
+		out_metrics->display_height_m = disp_h_m;
+		out_metrics->display_pixel_width = disp_px_w;
+		out_metrics->display_pixel_height = disp_px_h;
+		out_metrics->display_screen_left = disp_left;
+		out_metrics->display_screen_top = disp_top;
+
+		out_metrics->window_pixel_width = win_px_w;
+		out_metrics->window_pixel_height = win_px_h;
+		out_metrics->window_screen_left = static_cast<int32_t>(client_origin.x);
+		out_metrics->window_screen_top = static_cast<int32_t>(client_origin.y);
+
+		out_metrics->window_width_m = win_w_m;
+		out_metrics->window_height_m = win_h_m;
+		out_metrics->window_center_offset_x_m = offset_x_m;
+		out_metrics->window_center_offset_y_m = offset_y_m;
+
+		out_metrics->valid = true;
 	}
-	return ok;
+
+	// #439 Phase 2: the active zone mask supersedes the canvas — the
+	// Kooima/adaptive-FOV metrics follow the same authority as the
+	// weave region. (This path doesn't take c->mutex; the canvas/mask
+	// fields are pointer-sized reads updated under the lock in another
+	// function — the pointer check in d3d12_effective_canvas is benign.)
+	const struct u_canvas_rect eff_canvas = d3d12_effective_canvas(c);
+	u_canvas_apply_to_metrics(out_metrics, &eff_canvas);
+
+	return true;
 }
 
 extern "C" bool

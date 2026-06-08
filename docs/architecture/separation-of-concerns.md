@@ -72,7 +72,7 @@ Implementations live in `src/xrt/drivers/` (vendor-specific) or `src/xrt/composi
 | Atlas → display | — | — | calls DP | DP implements |
 | Eye positions | — | queries | extracts from DP | DP provides |
 | Display dimensions | — | queries | — | DP provides |
-| Window metrics | — | — | queries from DP | DP provides |
+| Window metrics | — | — | computes from HWND + DP display info | DP provides display dims/pixels only |
 
 ## Vendor Isolation Rule
 
