@@ -3705,8 +3705,20 @@ comp_metal_compositor_get_window_metrics(struct xrt_compositor *xc,
 	struct comp_metal_compositor *c = metal_comp(xc);
 	memset(out_metrics, 0, sizeof(*out_metrics));
 
-	// If we own the window, compute metrics directly from our window + sys_info
-	if (c->window != nil && c->sys_info != NULL) {
+	// Compute window metrics compositor-side whenever we have a backing
+	// NSView — our own window (hosted) OR the app's external view (handle /
+	// texture). The metrics view is c->view in both cases (create_window
+	// sets c->view = the content view; setup_external_window sets it to the
+	// app's view). Before #396-W7 the apps did their own Kooima, so the
+	// external-view path never needed this; the dogfood (runtime owns view
+	// generation) exposed that the Metal sim/Leia DP doesn't implement
+	// get_window_metrics, so the external-view session fell through to the
+	// DP delegate (which returns false) and the runtime ran display-scoped —
+	// stretching the scene to the display aspect (vertical squish on a
+	// window whose aspect differs from the display). Mirrors the d3d12 fix
+	// (d34bf0a57) and the d3d11/gl/vk_native compositor-side construction.
+	NSView *metrics_view = c->view;
+	if (metrics_view != nil && c->sys_info != NULL) {
 		float disp_w_m = c->sys_info->display_width_m;
 		float disp_h_m = c->sys_info->display_height_m;
 		uint32_t disp_px_w = c->sys_info->display_pixel_width;
@@ -3715,7 +3727,7 @@ comp_metal_compositor_get_window_metrics(struct xrt_compositor *xc,
 			return false;
 		}
 
-		NSRect backing = [c->window.contentView convertRectToBacking:c->window.contentView.bounds];
+		NSRect backing = [metrics_view convertRectToBacking:metrics_view.bounds];
 		uint32_t win_px_w = (uint32_t)backing.size.width;
 		uint32_t win_px_h = (uint32_t)backing.size.height;
 		if (win_px_w == 0 || win_px_h == 0) {
@@ -3724,6 +3736,42 @@ comp_metal_compositor_get_window_metrics(struct xrt_compositor *xc,
 
 		float pixel_size_x = disp_w_m / (float)disp_px_w;
 		float pixel_size_y = disp_h_m / (float)disp_px_h;
+
+		// Window centre offset within the display. Use the real on-screen
+		// position when the view's window + screen are available (so
+		// window-relative 3D tracks the window); fall back to centred (the
+		// runtime-owned window is centred anyway).
+		float win_center_px_x = (float)win_px_w / 2.0f;
+		float win_center_px_y = (float)win_px_h / 2.0f;
+		float disp_center_px_x = (float)disp_px_w / 2.0f;
+		float disp_center_px_y = (float)disp_px_h / 2.0f;
+		int32_t win_screen_left = 0;
+		int32_t win_screen_top = 0;
+		float offset_x_m = (win_center_px_x - disp_center_px_x) * pixel_size_x;
+		float offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
+
+		NSWindow *ns_win = metrics_view.window;
+		NSScreen *screen = ns_win.screen ?: [NSScreen mainScreen];
+		if (ns_win != nil && screen != nil) {
+			// View bounds → screen points (AppKit bottom-up) → top-down
+			// backing px relative to the screen origin.
+			NSRect view_in_win = [metrics_view convertRect:metrics_view.bounds toView:nil];
+			NSRect view_in_screen = [ns_win convertRectToScreen:view_in_win];
+			NSRect screen_frame = [screen frame];
+			CGFloat bs = [screen backingScaleFactor];
+			float win_left_px = (float)((view_in_screen.origin.x - screen_frame.origin.x) * bs);
+			// Flip Y to top-down: distance from the screen top to the view top.
+			float view_top_pts = (screen_frame.origin.y + screen_frame.size.height) -
+			                     (view_in_screen.origin.y + view_in_screen.size.height);
+			float win_top_px = (float)(view_top_pts * bs);
+
+			win_screen_left = (int32_t)win_left_px;
+			win_screen_top = (int32_t)win_top_px;
+			float wc_x = win_left_px + win_center_px_x;
+			float wc_y = win_top_px + win_center_px_y;
+			offset_x_m = (wc_x - disp_center_px_x) * pixel_size_x;
+			offset_y_m = -((wc_y - disp_center_px_y) * pixel_size_y);
+		}
 
 		out_metrics->display_width_m = disp_w_m;
 		out_metrics->display_height_m = disp_h_m;
@@ -3734,20 +3782,14 @@ comp_metal_compositor_get_window_metrics(struct xrt_compositor *xc,
 
 		out_metrics->window_pixel_width = win_px_w;
 		out_metrics->window_pixel_height = win_px_h;
-		out_metrics->window_screen_left = 0;
-		out_metrics->window_screen_top = 0;
+		out_metrics->window_screen_left = win_screen_left;
+		out_metrics->window_screen_top = win_screen_top;
 
 		out_metrics->window_width_m = (float)win_px_w * pixel_size_x;
 		out_metrics->window_height_m = (float)win_px_h * pixel_size_y;
 
-		// Center offset (assume centered — no screen position tracking yet)
-		float win_center_px_x = (float)win_px_w / 2.0f;
-		float win_center_px_y = (float)win_px_h / 2.0f;
-		float disp_center_px_x = (float)disp_px_w / 2.0f;
-		float disp_center_px_y = (float)disp_px_h / 2.0f;
-
-		out_metrics->window_center_offset_x_m = (win_center_px_x - disp_center_px_x) * pixel_size_x;
-		out_metrics->window_center_offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
+		out_metrics->window_center_offset_x_m = offset_x_m;
+		out_metrics->window_center_offset_y_m = offset_y_m;
 
 		out_metrics->valid = true;
 		// #439: an active mask supersedes the canvas — the window metrics
