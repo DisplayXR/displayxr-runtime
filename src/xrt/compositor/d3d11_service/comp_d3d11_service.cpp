@@ -579,6 +579,14 @@ struct d3d11_service_system
 	//! Read from base.info.workspace_mode on first client connect.
 	bool workspace_mode;
 
+	//! XR_EXT_view_rig (#396 W7): the workspace controller's imposed view rig,
+	//! applied to app-client locates server-side (ipc_try_get_sr_view_poses).
+	//! type == XRT_VIEW_RIG_NONE when no override is set. Guarded by its own
+	//! lightweight mutex (NOT render_mutex) so the per-locate read never
+	//! contends with rendering. Set rarely (controller layout policy).
+	struct xrt_view_rig workspace_view_rig;
+	std::mutex workspace_view_rig_mutex;
+
 	//! Multi-compositor (NULL when workspace_mode is false).
 	struct d3d11_multi_compositor *multi_comp;
 
@@ -10435,6 +10443,16 @@ system_request_workspace_mode_flip(struct xrt_system_compositor *xsysc, uint32_t
 	return comp_d3d11_service_workspace_request_mode_flip(xsysc, mode_index);
 }
 
+/*!
+ * Hook for oxr_xrSetWorkspaceViewRigEXT (#396 W7). Stores the controller's
+ * imposed view rig; ipc_try_get_sr_view_poses applies it to app-client locates.
+ */
+static bool
+system_set_workspace_view_rig(struct xrt_system_compositor *xsysc, const struct xrt_view_rig *rig)
+{
+	return comp_d3d11_service_set_workspace_view_rig(xsysc, rig);
+}
+
 static void
 system_destroy(struct xrt_system_compositor *xsysc)
 {
@@ -10673,6 +10691,7 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	sys->base.create_native_compositor = system_create_native_compositor;
 	sys->base.destroy = system_destroy;
 	sys->base.request_workspace_mode_flip = system_request_workspace_mode_flip;
+	sys->base.set_workspace_view_rig = system_set_workspace_view_rig;
 
 	// Set up multi-compositor control for session state management
 	sys->xmcc.set_state = system_set_state;
@@ -13144,6 +13163,43 @@ comp_d3d11_service_workspace_request_mode_flip(struct xrt_system_compositor *xsy
 	// origin_slot = -1 (system origin) — the workspace controller is logically
 	// the system, not a renderable slot.
 	multi_compositor_request_mode_flip(sys, mode_index, /*origin=*/-1);
+	return true;
+}
+
+extern "C" bool
+comp_d3d11_service_set_workspace_view_rig(struct xrt_system_compositor *xsysc, const struct xrt_view_rig *rig)
+{
+	if (xsysc == nullptr) {
+		return false;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (sys == nullptr) {
+		return false;
+	}
+	std::lock_guard<std::mutex> lock(sys->workspace_view_rig_mutex);
+	if (rig == nullptr) {
+		sys->workspace_view_rig.type = XRT_VIEW_RIG_NONE;
+	} else {
+		sys->workspace_view_rig = *rig;
+	}
+	U_LOG_I("[view_rig] workspace override %s (type=%d)",
+	        sys->workspace_view_rig.type == XRT_VIEW_RIG_NONE ? "cleared" : "set",
+	        (int)sys->workspace_view_rig.type);
+	return true;
+}
+
+extern "C" bool
+comp_d3d11_service_get_workspace_view_rig(struct xrt_system_compositor *xsysc, struct xrt_view_rig *out_rig)
+{
+	if (xsysc == nullptr || out_rig == nullptr) {
+		return false;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (sys == nullptr) {
+		return false;
+	}
+	std::lock_guard<std::mutex> lock(sys->workspace_view_rig_mutex);
+	*out_rig = sys->workspace_view_rig;
 	return true;
 }
 

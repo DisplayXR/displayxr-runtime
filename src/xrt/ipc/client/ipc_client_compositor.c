@@ -2055,6 +2055,40 @@ ipc_syscomp_request_workspace_mode_flip(struct xrt_system_compositor *xsc, uint3
 	return r == XRT_SUCCESS;
 }
 
+/*!
+ * Workspace controller view-rig override hook (#396 W7). Marshals the xrt rig
+ * into the IPC wire shape and forwards it to the server-side
+ * comp_d3d11_service_set_workspace_view_rig via the workspace_set_view_rig RPC.
+ * The server applies it to the workspace's app-client locates. Returns true on
+ * success so the OXR layer reports XR_SUCCESS.
+ */
+static bool
+ipc_syscomp_set_workspace_view_rig(struct xrt_system_compositor *xsc, const struct xrt_view_rig *rig)
+{
+	if (xsc == NULL) {
+		return false;
+	}
+	struct ipc_client_compositor *icc = container_of(xsc, struct ipc_client_compositor, system);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return false;
+	}
+	struct ipc_view_rig_info wire = {0};
+	if (rig != NULL) {
+		wire.rig_type = (rig->type == XRT_VIEW_RIG_CAMERA)
+		                    ? IPC_VIEW_RIG_CAMERA
+		                    : (rig->type == XRT_VIEW_RIG_DISPLAY ? IPC_VIEW_RIG_DISPLAY : IPC_VIEW_RIG_NONE);
+		wire.pose = rig->pose;
+		wire.virtual_display_height = rig->virtual_display_height;
+		wire.perspective_factor = rig->perspective_factor;
+		wire.inv_convergence_distance = rig->inv_convergence_distance;
+		wire.half_tan_vfov = rig->half_tan_vfov;
+		wire.ipd_factor = rig->ipd_factor;
+		wire.parallax_factor = rig->parallax_factor;
+	}
+	xrt_result_t r = ipc_call_workspace_set_view_rig(icc->ipc_c, &wire);
+	return r == XRT_SUCCESS;
+}
+
 static void
 ipc_syscomp_destroy(struct xrt_system_compositor *xsc)
 {
@@ -2135,6 +2169,7 @@ ipc_client_create_system_compositor(struct ipc_connection *ipc_c,
 	// marshal the request to the server-side comp_d3d11_service hook so
 	// it routes through the acked-flip + curtain path.
 	c->system.request_workspace_mode_flip = ipc_syscomp_request_workspace_mode_flip;
+	c->system.set_workspace_view_rig = ipc_syscomp_set_workspace_view_rig;
 	c->ipc_c = ipc_c;
 	c->xina = xina;
 

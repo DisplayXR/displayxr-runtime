@@ -243,20 +243,34 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		if (eye_count > 1) raw_eyes[1] = right_eye;
 	}
 
-	// XR_EXT_view_rig raw channel (#396 W7): capture the raw display-space
-	// eyes VERBATIM — before the window/canvas rebase below, mirroring the
-	// in-process rule (raw = the untransformed input set; the consumer
-	// applies the window/canvas resolve itself). Timestamp + tracking lock
-	// come from the full DP eye query.
+	// XR_EXT_view_rig raw channel (#396 W7): report the DP's eyes VERBATIM —
+	// the FULL per-view set the DP provides (sim_display fills N for >2-view
+	// modes; Leia is 2-view), not the 2-eye render pair above. The runtime
+	// never synthesizes eyes; multi-view fill is the DP's responsibility, so
+	// the raw consumer (WebXR bridge / aware app over IPC) gets every view's
+	// eye — not a truncated 2. Raw is the untransformed input set (pre
+	// window/canvas rebase below — the consumer applies the resolve itself).
+	// Timestamp + tracking lock come from the same full DP eye query.
 	if (rig_reply != NULL) {
-		for (uint32_t i = 0; i < eye_count; i++) {
-			rig_reply->raw.eyes[i] = raw_eyes[i];
-		}
-		rig_reply->raw.eye_count = eye_count;
 		struct xrt_eye_positions full_eyes = {0};
 		if (comp_d3d11_service_get_predicted_eye_positions_full(s->xsysc, &full_eyes) && full_eyes.valid) {
+			uint32_t raw_n = full_eyes.count;
+			if (raw_n > XRT_MAX_VIEWS) {
+				raw_n = XRT_MAX_VIEWS;
+			}
+			for (uint32_t i = 0; i < raw_n; i++) {
+				rig_reply->raw.eyes[i] = (struct xrt_vec3){
+				    full_eyes.eyes[i].x, full_eyes.eyes[i].y, full_eyes.eyes[i].z};
+			}
+			rig_reply->raw.eye_count = raw_n;
 			rig_reply->raw.sample_time_ns = full_eyes.timestamp_ns;
 			rig_reply->raw.is_tracking = full_eyes.is_tracking ? 1u : 0u;
+		} else {
+			// Full query unavailable — fall back to the 2-eye render pair.
+			for (uint32_t i = 0; i < eye_count; i++) {
+				rig_reply->raw.eyes[i] = raw_eyes[i];
+			}
+			rig_reply->raw.eye_count = eye_count;
 		}
 		rig_reply->raw.valid = 1;
 	}
@@ -515,13 +529,42 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		return true;
 	}
 
+	// Workspace rig override (#396 W7): in workspace mode an app's own rig is
+	// honored by default (app visual policy within its canvas), but the
+	// controller can take over via xrSetWorkspaceViewRigEXT. When an override
+	// is set, substitute it for the forwarded rig on NON-controller locates —
+	// this is the sole enforcement point ("workspace can own view geometry"),
+	// no client-side gate. The controller's own chrome locates (caller PID ==
+	// workspace controller PID) keep whatever they chained. ws_override is
+	// function-scoped so `rig` can point at it for the rest of this call.
+	struct ipc_view_rig_info ws_override;
+	{
+		unsigned long caller_pid = (unsigned long)ics->client_state.pid;
+		bool is_controller = s->workspace_controller_pid != 0 && caller_pid == s->workspace_controller_pid;
+		struct xrt_view_rig ws_rig;
+		if (!is_controller && comp_d3d11_service_get_workspace_view_rig(s->xsysc, &ws_rig) &&
+		    ws_rig.type != XRT_VIEW_RIG_NONE) {
+			ws_override = (struct ipc_view_rig_info){
+			    .rig_type = (ws_rig.type == XRT_VIEW_RIG_CAMERA) ? IPC_VIEW_RIG_CAMERA : IPC_VIEW_RIG_DISPLAY,
+			    .pose = ws_rig.pose,
+			    .virtual_display_height = ws_rig.virtual_display_height,
+			    .perspective_factor = ws_rig.perspective_factor,
+			    .inv_convergence_distance = ws_rig.inv_convergence_distance,
+			    .half_tan_vfov = ws_rig.half_tan_vfov,
+			    .ipd_factor = ws_rig.ipd_factor,
+			    .parallax_factor = ws_rig.parallax_factor,
+			};
+			rig = &ws_override;
+		}
+	}
+
 	// XR_EXT_view_rig (#396 W7): a chained rig drives the math below in
 	// place of the qwerty debug state — its pose replaces the qwerty/zero
 	// display pose, its tunables take the corresponding branch regardless
 	// of use_qwerty_head (lifting the identity-m2v forcing, mirroring the
 	// in-process oxr_session.c semantics). Strictly per-locate: the rig
-	// arrives in the call payload, nothing is latched. Values arrive
-	// pre-clamped by the client's chain parser.
+	// arrives in the call payload (or the workspace override above), nothing
+	// is latched. Values arrive pre-clamped.
 	const bool rig_display = rig != NULL && rig->rig_type == IPC_VIEW_RIG_DISPLAY;
 	const bool rig_camera = rig != NULL && rig->rig_type == IPC_VIEW_RIG_CAMERA;
 	if (rig_display || rig_camera) {
@@ -2674,6 +2717,48 @@ ipc_handle_workspace_request_display_mode(volatile struct ipc_client_state *_ics
 	}
 #else
 	(void)mode_index;
+	return XRT_ERROR_NOT_IMPLEMENTED;
+#endif
+
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_workspace_set_view_rig(volatile struct ipc_client_state *_ics, const struct ipc_view_rig_info *rig)
+{
+	struct ipc_server *s = _ics->server;
+
+	// PID-match auth: only the registered workspace controller may impose a
+	// rig on the workspace's app clients (mirrors workspace_request_display_mode).
+	unsigned long expected_pid = s->workspace_controller_pid;
+	unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
+	if (expected_pid == 0 || caller_pid != expected_pid) {
+		IPC_WARN(s, "workspace_set_view_rig: PID mismatch (caller=%lu, controller=%lu) — denied", caller_pid,
+		         expected_pid);
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	struct xrt_view_rig xr = {0};
+	xr.type = (rig->rig_type == IPC_VIEW_RIG_CAMERA)
+	              ? XRT_VIEW_RIG_CAMERA
+	              : (rig->rig_type == IPC_VIEW_RIG_DISPLAY ? XRT_VIEW_RIG_DISPLAY : XRT_VIEW_RIG_NONE);
+	xr.pose = rig->pose;
+	xr.virtual_display_height = rig->virtual_display_height;
+	xr.perspective_factor = rig->perspective_factor;
+	xr.inv_convergence_distance = rig->inv_convergence_distance;
+	xr.half_tan_vfov = rig->half_tan_vfov;
+	xr.ipd_factor = rig->ipd_factor;
+	xr.parallax_factor = rig->parallax_factor;
+	if (!comp_d3d11_service_set_workspace_view_rig(s->xsysc, &xr)) {
+		return XRT_ERROR_NOT_IMPLEMENTED;
+	}
+#else
+	(void)rig;
 	return XRT_ERROR_NOT_IMPLEMENTED;
 #endif
 

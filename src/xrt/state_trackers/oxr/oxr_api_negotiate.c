@@ -439,6 +439,10 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrEnumerateDisplayRenderingModesEXT, EXT_display_info);
 #endif
 
+#ifdef OXR_HAVE_EXT_view_rig
+	ENTRY_IF_EXT(xrSetWorkspaceViewRigEXT, EXT_view_rig);
+#endif
+
 #ifdef OXR_HAVE_EXT_spatial_workspace
 	ENTRY_IF_EXT(xrActivateSpatialWorkspaceEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrDeactivateSpatialWorkspaceEXT, EXT_spatial_workspace);

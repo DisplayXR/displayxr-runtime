@@ -1172,6 +1172,14 @@ view_rig_update_from_chain(struct oxr_session *sess, const XrViewLocateInfo *vie
 	struct oxr_view_rig_state *rig = &sess->view_rig;
 	bool clamped = false;
 
+	// Workspace note: a non-controller workspace client's own rig is honored
+	// by default (app visual policy within its canvas). The workspace
+	// controller can take it over via xrSetWorkspaceViewRigEXT, applied
+	// SERVER-side (ipc_try_get_sr_view_poses substitutes the controller
+	// override for the forwarded rig on non-controller locates). There is no
+	// client-side gate — gating here would drop the locate off the rig IPC
+	// route and break a rig-consuming app's render-ready expectation.
+
 	if (drig != NULL && crig != NULL && !rig->clamp_warned) {
 		U_LOG_W("XR_EXT_view_rig: both XrDisplayRigEXT and XrCameraRigEXT chained — "
 		        "chain exactly one; using the camera rig");
@@ -1207,6 +1215,70 @@ view_rig_update_from_chain(struct oxr_session *sess, const XrViewLocateInfo *vie
 	}
 
 	return rig->type;
+}
+
+/*
+ * XR_EXT_view_rig (#396 W7) workspace-controller override: parse + clamp a rig
+ * descriptor (NULL clears) into the xrt-boundary shape and push it to the
+ * system compositor, which applies it to the workspace's app-client locates
+ * server-side. Same clamp policy + boundary conversions as the per-locate
+ * chain parser above. Caller (oxr_xrSetWorkspaceViewRigEXT) has already
+ * verified the session is the active workspace controller.
+ */
+XrResult
+oxr_session_set_workspace_view_rig(struct oxr_logger *log, struct oxr_session *sess, const void *rig)
+{
+	struct xrt_system_compositor *xsysc = sess->sys != NULL ? sess->sys->xsysc : NULL;
+	if (xsysc == NULL || xsysc->set_workspace_view_rig == NULL) {
+		return oxr_error(log, XR_ERROR_FUNCTION_UNSUPPORTED,
+		                 "xrSetWorkspaceViewRigEXT: not supported by this compositor");
+	}
+
+	struct xrt_view_rig out = {0};
+	out.type = XRT_VIEW_RIG_NONE;
+
+	const XrBaseInStructure *base = (const XrBaseInStructure *)rig;
+	if (base != NULL && base->type == XR_TYPE_CAMERA_RIG_EXT) {
+		const XrCameraRigEXT *crig = (const XrCameraRigEXT *)rig;
+		bool clamped = false;
+		out.type = XRT_VIEW_RIG_CAMERA;
+		out.pose = (struct xrt_pose){
+		    {crig->pose.orientation.x, crig->pose.orientation.y, crig->pose.orientation.z,
+		     crig->pose.orientation.w},
+		    {crig->pose.position.x, crig->pose.position.y, crig->pose.position.z}};
+		out.ipd_factor = view_rig_clampf(crig->ipdFactor, 0.0f, 1.0f, &clamped);
+		out.parallax_factor = view_rig_clampf(crig->parallaxFactor, 0.0f, 1.0f, &clamped);
+		out.inv_convergence_distance = view_rig_clampf(crig->convergenceDiopters, 0.0f, 20.0f, &clamped);
+		out.half_tan_vfov = tanf(view_rig_clampf(crig->verticalFov, 0.01f, 3.13f, &clamped) * 0.5f);
+		if (clamped) {
+			U_LOG_W("xrSetWorkspaceViewRigEXT: camera rig value(s) out of range — clamped");
+		}
+	} else if (base != NULL && base->type == XR_TYPE_DISPLAY_RIG_EXT) {
+		const XrDisplayRigEXT *drig = (const XrDisplayRigEXT *)rig;
+		bool clamped = false;
+		out.type = XRT_VIEW_RIG_DISPLAY;
+		out.pose = (struct xrt_pose){
+		    {drig->pose.orientation.x, drig->pose.orientation.y, drig->pose.orientation.z,
+		     drig->pose.orientation.w},
+		    {drig->pose.position.x, drig->pose.position.y, drig->pose.position.z}};
+		out.virtual_display_height = view_rig_clampf(drig->virtualDisplayHeight, 0.01f, 1000.0f, &clamped);
+		out.ipd_factor = view_rig_clampf(drig->ipdFactor, 0.0f, 1.0f, &clamped);
+		out.parallax_factor = view_rig_clampf(drig->parallaxFactor, 0.0f, 1.0f, &clamped);
+		out.perspective_factor = view_rig_clampf(drig->perspectiveFactor, 0.1f, 10.0f, &clamped);
+		if (clamped) {
+			U_LOG_W("xrSetWorkspaceViewRigEXT: display rig value(s) out of range — clamped");
+		}
+	} else if (base != NULL) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrSetWorkspaceViewRigEXT: rig must be XrDisplayRigEXT, XrCameraRigEXT, or NULL");
+	}
+	// base == NULL → clear the override (out.type stays XRT_VIEW_RIG_NONE).
+
+	if (!xsysc->set_workspace_view_rig(xsysc, &out)) {
+		return oxr_error(log, XR_ERROR_RUNTIME_FAILURE,
+		                 "xrSetWorkspaceViewRigEXT: compositor rejected the rig");
+	}
+	return XR_SUCCESS;
 }
 #endif // OXR_HAVE_EXT_view_rig
 
@@ -1435,11 +1507,13 @@ oxr_session_locate_views(struct oxr_logger *log,
 		}
 
 #ifdef OXR_HAVE_EXT_view_rig
-		// XR_EXT_view_rig raw channel: report the rig INPUT eyes verbatim
-		// in display space — tracked set when the DP provides one, else
-		// the nominal-viewer pair (isTracking=false). Captured before the
-		// legacy-2D center override and the surplus-view synthesis below:
-		// both are rig-side concepts, not raw inputs.
+		// XR_EXT_view_rig raw channel: report the DP's eyes verbatim in
+		// display space — the full per-view set the DP provides (sim_display
+		// fills N for >2-view modes; Leia is 2-view), or the nominal-viewer
+		// pair (isTracking=false) when no DP eyes. The runtime never
+		// synthesizes eyes; multi-view fill is the DP's responsibility.
+		// Captured before the legacy-2D center override below (a render-side
+		// concept, not a raw input).
 		if (view_raw != NULL && have_eye_positions) {
 			uint32_t raw_count = eye_count;
 			if (raw_count > XR_VIEW_RIG_MAX_RAW_EYES_EXT) {
@@ -1557,20 +1631,23 @@ oxr_session_locate_views(struct oxr_logger *log,
 				struct xrt_vec3 nominal = {0, si->nominal_viewer_y_m, si->nominal_viewer_z_m};
 				struct xrt_vec3 raw_eyes[XRT_MAX_VIEWS];
 
-				// Extend adj_eyes[] to active_view_count when the tile mode wants more
-				// views than the tracker provides (e.g. Quad mode = 4 views, tracker = 2).
-				// Each synthesized eye = tracked-eye-0 + (per-view-offset[ei] - per-view-offset[0])
-				// — i.e. apply the tile's role in the mode's optical layout to the tracked
-				// reference eye. Entries [0, eye_count) stay as-is to preserve tracker IPD.
-				if (xdev->hmd != NULL && active_view_count > eye_count &&
-				    active_view_count <= XRT_MAX_VIEWS) {
-					const struct xrt_vec3 *off = xdev->hmd->view_eye_offsets;
-					for (uint32_t ei = eye_count; ei < active_view_count; ei++) {
-						adj_eyes[ei].x = adj_eyes[0].x + (off[ei].x - off[0].x);
-						adj_eyes[ei].y = adj_eyes[0].y + (off[ei].y - off[0].y);
-						adj_eyes[ei].z = adj_eyes[0].z + (off[ei].z - off[0].z);
+				// The DP owns multi-view eye fill: it must report one eye
+				// position per active view (sim_display fills N; Leia is
+				// 2-view, 2 eyes). The runtime never synthesizes eyes — the
+				// per-mode optical layout is DP knowledge, and the
+				// XR_EXT_view_rig raw channel reports the DP's eyes verbatim.
+				// If a DP ever under-reports vs the active mode, surface it
+				// once rather than papering over it: views beyond eye_count
+				// then fall back to device-default FOV below.
+				if (active_view_count > eye_count) {
+					static bool warned_dp_under_report = false;
+					if (!warned_dp_under_report) {
+						warned_dp_under_report = true;
+						U_LOG_W("DP reported %u eye position(s) for a %u-view mode — "
+						        "the DP must report one eye per active view; views "
+						        "beyond %u use device-default FOV",
+						        eye_count, active_view_count, eye_count);
 					}
-					eye_count = active_view_count;
 				}
 
 				for (uint32_t ei = 0; ei < eye_count; ei++) {
@@ -1728,7 +1805,11 @@ oxr_session_locate_views(struct oxr_logger *log,
 	if ((rig_route_native || rig_route_bridge) && ipc_service_mode) {
 		struct ipc_view_rig_info rig_info = {0};
 		// Bridge relays keep rig_type NONE (descriptors inert); only native
-		// routes carry the chained rig overrides.
+		// routes carry the chained rig overrides. In workspace mode the app's
+		// own rig is honored by default (app visual policy within its canvas);
+		// the workspace controller can take over via xrSetWorkspaceViewRigEXT,
+		// applied SERVER-side in ipc_try_get_sr_view_poses (the override
+		// substitutes for the forwarded rig on non-controller locates).
 		if (rig_route_native && rig_camera) {
 			rig_info.rig_type = IPC_VIEW_RIG_CAMERA;
 		} else if (rig_route_native && rig_display) {

@@ -75,6 +75,12 @@
 		]
 	},
 
+	"workspace_set_view_rig": {
+		"in": [
+			{"name": "rig", "type": "struct ipc_view_rig_info"}
+		]
+	},
+
 	"workspace_get_state": {
 		"out": [
 			{"name": "active", "type": "bool"}

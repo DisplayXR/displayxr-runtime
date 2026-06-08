@@ -1452,6 +1452,31 @@ oxr_xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceViewRigEXT(XrSession session, const void *rig)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceViewRigEXT");
+
+#ifdef OXR_HAVE_EXT_view_rig
+	// Workspace controller only: this imposes view geometry on the workspace's
+	// app clients (the "workspace owns view geometry" contract). A non-
+	// controller caller has no authority here. The server also PID-gates the
+	// IPC RPC, so an app cannot forge the call.
+	if (!sess->is_active_workspace_controller) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrSetWorkspaceViewRigEXT: caller is not the active workspace controller");
+	}
+	return oxr_session_set_workspace_view_rig(&log, sess, rig);
+#else
+	(void)rig;
+	return oxr_error(&log, XR_ERROR_FUNCTION_UNSUPPORTED, "XR_EXT_view_rig not supported");
+#endif
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrEnumerateDisplayRenderingModesEXT(XrSession session,
                                         uint32_t modeCapacityInput,
                                         uint32_t *modeCountOutput,
