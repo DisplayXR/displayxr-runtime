@@ -928,10 +928,20 @@ static void RenderThreadFunc(
                         uint32_t winH = g_windowHeight;
                         uint32_t pw = winW * 3 / 8;
                         uint32_t ph = winH * 5 / 16;
-                        g_panel1Rect.offset = {(int32_t)(winW / 16), (int32_t)(winH * 9 / 16)};
+                        // #491 validation aid: DXR_LOCAL2D_OVERCUBE centers the
+                        // panel over the cube + uses the diagonal-stripes variant
+                        // (clearest read of glass-over-3D).
+                        const char* oc = getenv("DXR_LOCAL2D_OVERCUBE");
+                        bool overCube = (oc && *oc == '1');
+                        int p1variant = overCube ? 1 : 0;
+                        if (overCube) {
+                            g_panel1Rect.offset = {(int32_t)(winW / 2 - pw / 2), (int32_t)(winH / 2 - ph / 2)};
+                        } else {
+                            g_panel1Rect.offset = {(int32_t)(winW / 16), (int32_t)(winH * 9 / 16)};
+                        }
                         g_panel1Rect.extent = {(int32_t)pw, (int32_t)ph};
                         bool ok = CreateAndFillL2DPanel(*xr, renderer->device.Get(), renderer->commandQueue.Get(),
-                                                        pw, ph, 0, g_panel1);
+                                                        pw, ph, p1variant, g_panel1);
 
                         if (ok && g_l2dPanel2) {
                             // Overlaps panel 1's top-right quadrant — list-order
