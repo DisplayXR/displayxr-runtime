@@ -59,7 +59,7 @@ $xrKey = "HKLM:\Software\Khronos\OpenXR\1"
 $dpKey = "HKLM:\Software\DisplayXR\DisplayProcessors\$Plugin"
 $origRuntime = (Get-ItemProperty $xrKey -Name ActiveRuntime -ErrorAction SilentlyContinue).ActiveRuntime
 $origProbe   = (Get-ItemProperty $dpKey -Name ProbeOrder   -ErrorAction SilentlyContinue).ProbeOrder
-$env:DISPLAYXR_MCP = "0"; $env:VK_LOADER_LAYERS_DISABLE = "*"
+$env:DISPLAYXR_MCP = "0"; $env:VK_LOADER_LAYERS_DISABLE = "*"; $env:XRT_COMPOSITOR_START_WINDOWED = "true"
 if ($ApiLayerPath -eq "USE_BASE") { $ApiLayerPath = $base }
 if ($ApiLayerPath) {
   $env:XR_API_LAYER_PATH = $ApiLayerPath
