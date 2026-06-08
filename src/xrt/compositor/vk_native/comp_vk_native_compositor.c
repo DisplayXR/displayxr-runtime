@@ -26,6 +26,7 @@
 
 #include "vk/vk_helpers.h"
 #include "vk/vk_hud_blend.h"
+#include "vk/vk_local2d_composite.h"
 
 #include "util/u_logging.h"
 #include "util/u_misc.h"
@@ -227,6 +228,55 @@ struct comp_vk_native_compositor
 	//! at the projection-done boundary (PROJECTION_ONLY) or end of
 	//! frame (POST_COMPOSE).
 	struct u_capture_intent capture_intent;
+
+	//! #439 Phase 3 — masked 2D-over-3D composite (post-weave). Pipelines +
+	//! render passes; created eagerly at compositor init (formats are fixed
+	//! B8G8R8A8_UNORM for both the target and the scratch — see the init).
+	struct vk_local2d_composite local2d;
+	bool local2d_initialized;
+
+	//! twod flatten scratch (B8G8R8A8_UNORM, COLOR_ATTACHMENT|SAMPLED). The
+	//! frame's Local2D layers are flattened here, then sampled as `twod` by the
+	//! masked composite. Lazily (re)allocated to the window region dims.
+	VkImage local2d_scratch;
+	VkDeviceMemory local2d_scratch_mem;
+	VkImageView local2d_scratch_view;
+	VkFramebuffer local2d_scratch_fb;
+	uint32_t local2d_scratch_w, local2d_scratch_h;
+
+	//! Weave snapshot scratch (target format, TRANSFER_DST|SAMPLED). The DP
+	//! wrote the woven 3D into the target (RT≠SRV), so the lerp reads this
+	//! copy. Lazily (re)allocated to the window region dims.
+	VkImage weave_scratch;
+	VkDeviceMemory weave_scratch_mem;
+	VkImageView weave_scratch_view;
+	uint32_t weave_scratch_w, weave_scratch_h;
+
+	//! Runtime-owned IMPLICIT zone mask (R8_UNORM, COLOR_ATTACHMENT|SAMPLED),
+	//! rasterized each frame from the Local2D layer rects (M=1 keep weave, M=0
+	//! inside the rects). Sampled by the composite when no explicit mask is
+	//! submitted. No staged sibling needed — raster + sample share one cmd
+	//! buffer with a barrier between (unlike the cross-call explicit mask).
+	VkImage implicit_mask_tex;
+	VkDeviceMemory implicit_mask_mem;
+	VkImageView implicit_mask_view;
+	VkFramebuffer implicit_mask_fb;
+	uint32_t implicit_mask_w, implicit_mask_h;
+
+	//! Composite-target framebuffer cache (over the rotating swapchain/shared
+	//! image view, keyed by view — the DP target image rotates per frame).
+	VkFramebuffer composite_target_fb;
+	VkImageView composite_target_fb_view;
+	uint32_t composite_fb_w, composite_fb_h;
+
+	//! Active authored zone mask (#439 Phase 1, XR_EXT_local_3d_zone). Sticky
+	//! last-submit-wins; cleared on destroy. NOT owned (the oxr handle owns it).
+	struct comp_vk_native_zone_mask *active_zone_mask;
+
+	//! True when the last committed frame carried Local2D layers — makes the
+	//! implicit mask's canvas-supersede visible to vk_effective_canvas. Set once
+	//! under the frame path at the top of layer_commit.
+	bool local_2d_last_frame;
 };
 
 /*
@@ -1931,6 +1981,20 @@ vk_native_dispatch_capture(struct comp_vk_native_compositor *c, uint32_t mode_fi
 }
 
 
+// #439 Phase 3 — masked 2D-over-3D composite, defined below near the zone-mask
+// API. Called from the weave path in layer_commit; release from destroy.
+static bool
+vk_composite_local_2d(struct comp_vk_native_compositor *c,
+                      VkCommandBuffer cmd,
+                      VkImage dst_image,
+                      VkImageView dst_view,
+                      uint32_t dst_w,
+                      uint32_t dst_h,
+                      VkImageLayout dst_incoming,
+                      VkImageLayout dst_outgoing);
+static void
+vk_release_local2d_state(struct comp_vk_native_compositor *c);
+
 static xrt_result_t
 vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -1941,6 +2005,17 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	// frame; consumed at the projection-done boundary or end of frame
 	// depending on requested mode. See u_capture_intent.h.
 	u_capture_intent_poll(&c->capture_intent, &c->mcp_capture);
+
+	// #439 Phase 3 — per-frame Local2D accumulator flag (read by
+	// vk_effective_canvas + vk_composite_local_2d). Set once here so it reflects
+	// this frame's committed layers.
+	c->local_2d_last_frame = false;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
+			c->local_2d_last_frame = true;
+			break;
+		}
+	}
 
 	// Phase 1 diagnostic — env-gated per-client commit interval. Mirrors
 	// the same `[CLIENT_FRAME_NS]` line emitted by the D3D11 in-process and
@@ -2523,6 +2598,14 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				// (see vk_compositor_render_window_space_into_atlas), so we
 				// only need the diagnostic HUD on the target post-weave.
 
+				// #439 Phase 3 — overlay the frame's flattened 2D where the
+				// zone mask says "2D" (M*weave + (1-M)*twod). No-op unless the
+				// frame carries Local2D layers. Target stays PRESENT_SRC so the
+				// HUD's own PRESENT_SRC→COLOR→PRESENT transition still applies.
+				vk_composite_local_2d(c, cmd, (VkImage)(uintptr_t)target_image,
+				    (VkImageView)(uintptr_t)target_view, tgt_width, tgt_height,
+				    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+
 				// Diagnostic HUD overlay (TAB key toggle)
 				vk_compositor_render_hud(c, cmd,
 				    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
@@ -2618,6 +2701,10 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 		c->atlas_ws_fb = VK_NULL_HANDLE;
 	}
 	vk_hud_blend_fini(&c->window_space_blend, vk);
+
+	// #439 Phase 3 — masked composite pipelines + scratch images. (The active
+	// zone mask is owned by the oxr handle, freed via zone_mask_destroy.)
+	vk_release_local2d_state(c);
 
 	// Destroy DP input crop image
 	if (c->dp_input_view != VK_NULL_HANDLE) {
@@ -3083,6 +3170,18 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	// Initialize layer accumulator
 	memset(&c->layer_accum, 0, sizeof(c->layer_accum));
 
+	// #439 Phase 3 — masked 2D-over-3D composite pipelines. The target and the
+	// runtime-owned scratch are both B8G8R8A8_UNORM (the windowed target prefers
+	// it, the shared IOSurface image is it, and the weave snapshot is a raw copy
+	// of the target), so the render-pass formats are fixed. Created eagerly so
+	// the zone-mask API (which can be called before the first frame) has its R8
+	// raster render pass available.
+	c->local2d_initialized = vk_local2d_composite_init(&c->local2d, &c->vk, VK_FORMAT_B8G8R8A8_UNORM,
+	                                                   VK_FORMAT_B8G8R8A8_UNORM);
+	if (!c->local2d_initialized) {
+		U_LOG_W("VK Local2D composite init failed — 2D-over-3D masking disabled this session");
+	}
+
 	// Populate supported swapchain formats (Vulkan formats)
 	uint32_t format_count = 0;
 	c->base.base.info.formats[format_count++] = VK_FORMAT_B8G8R8A8_UNORM;
@@ -3433,77 +3532,741 @@ comp_vk_native_compositor_get_queue_family(struct comp_vk_native_compositor *c)
 
 /*
  *
- * XR_EXT_local_3d_zone — VK consumer leg STUBS (#439 cross-API).
+ * XR_EXT_local_3d_zone — VK consumer leg (#439 Phase 3).
  *
- * The oxr layer forwards here for VK sessions; the composite consumer rides
- * with Phase 3 (docs/roadmap/unified-2d-3d-crossapi-impl.md §4). Until then
- * these return XRT_ERROR_NOT_IMPLEMENTED and the oxr caps query reports
- * supported = false, so a caps-honoring app never reaches them. They must
- * stay real symbols: XRT_HAVE_VK_NATIVE_COMPOSITOR is defined on every
- * platform (macOS/MoltenVK + Android included).
+ * Builds the masked-composite mechanism net-new in Vulkan (the D3D11 leg in
+ * comp_d3d11_compositor.cpp is the line-by-line algorithm reference). The
+ * authored R8 zone mask is rasterized GPU-side (one-shot cmd buffers, since
+ * these run outside layer_commit) and snapshotted into a SAMPLED `staged`
+ * sibling on submit; the per-frame composite (vk_composite_local_2d, defined
+ * above near layer_commit) lerps M*weave + (1-M)*twod into the woven target.
  *
  */
+
+//! Authored zone-mask handle (XR_EXT_local_3d_zone). `tex` is the R8 raster
+//! target (COLOR_ATTACHMENT, also app-drawable for Tier-3); `staged` is the
+//! SAMPLED snapshot the composite reads, decoupled so in-progress authoring
+//! can't tear into a frame.
+struct comp_vk_native_zone_mask
+{
+	uint32_t w, h;
+	VkImage tex;
+	VkDeviceMemory tex_mem;
+	VkImageView tex_view;
+	VkFramebuffer fb; //!< Over tex, with local2d.mask_rp.
+	VkImage staged;
+	VkDeviceMemory staged_mem;
+	VkImageView staged_view;
+	VkImageLayout tex_layout;
+	bool submitted;
+};
+
+static const VkImageSubresourceRange k_color_sub = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+// One-shot cmd buffer for the cross-call zone-mask raster ops (create / set_* /
+// submit run outside layer_commit). Record → submit → wait → free, matching the
+// rest of this file's single-threaded GPU-op idiom.
+static VkCommandBuffer
+vk_oneshot_begin(struct comp_vk_native_compositor *c)
+{
+	struct vk_bundle *vk = &c->vk;
+	VkCommandPool pool = (VkCommandPool)(uintptr_t)comp_vk_native_renderer_get_cmd_pool(c->renderer);
+	VkCommandBufferAllocateInfo ai = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+	    .commandPool = pool,
+	    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+	    .commandBufferCount = 1,
+	};
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	if (vk->vkAllocateCommandBuffers(vk->device, &ai, &cmd) != VK_SUCCESS) {
+		return VK_NULL_HANDLE;
+	}
+	VkCommandBufferBeginInfo bi = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	vk->vkBeginCommandBuffer(cmd, &bi);
+	return cmd;
+}
+
+static void
+vk_oneshot_end(struct comp_vk_native_compositor *c, VkCommandBuffer cmd)
+{
+	struct vk_bundle *vk = &c->vk;
+	VkCommandPool pool = (VkCommandPool)(uintptr_t)comp_vk_native_renderer_get_cmd_pool(c->renderer);
+	vk->vkEndCommandBuffer(cmd);
+	VkSubmitInfo si = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .commandBufferCount = 1,
+	    .pCommandBuffers = &cmd,
+	};
+	if (vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS) {
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+	}
+	vk->vkFreeCommandBuffers(vk->device, pool, 1, &cmd);
+}
+
+// Create/reuse an RT-or-sampled image (+view, +optional framebuffer), freeing
+// the old one on a dims change. Returns true if usable.
+static bool
+vk_ensure_rt(struct comp_vk_native_compositor *c,
+             VkImage *img,
+             VkDeviceMemory *mem,
+             VkImageView *view,
+             VkFramebuffer *fb,
+             uint32_t *cw,
+             uint32_t *ch,
+             uint32_t w,
+             uint32_t h,
+             VkFormat fmt,
+             VkImageUsageFlags usage,
+             VkRenderPass rp,
+             const char *what)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (*img != VK_NULL_HANDLE && *cw == w && *ch == h) {
+		return true;
+	}
+	if (fb != NULL && *fb != VK_NULL_HANDLE) {
+		vk->vkDestroyFramebuffer(vk->device, *fb, NULL);
+		*fb = VK_NULL_HANDLE;
+	}
+	if (*view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, *view, NULL);
+		*view = VK_NULL_HANDLE;
+	}
+	if (*img != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, *img, NULL);
+		*img = VK_NULL_HANDLE;
+	}
+	if (*mem != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, *mem, NULL);
+		*mem = VK_NULL_HANDLE;
+	}
+	*cw = 0;
+	*ch = 0;
+
+	VkExtent2D ext = {w, h};
+	if (vk_create_image_simple(vk, ext, fmt, usage, mem, img) != VK_SUCCESS) {
+		U_LOG_E("[local2d] %s: image alloc %ux%u failed", what, w, h);
+		return false;
+	}
+	if (vk_create_view(vk, *img, VK_IMAGE_VIEW_TYPE_2D, fmt, k_color_sub, view) != VK_SUCCESS) {
+		U_LOG_E("[local2d] %s: view failed", what);
+		return false;
+	}
+	if (rp != VK_NULL_HANDLE && fb != NULL) {
+		VkFramebufferCreateInfo fb_ci = {
+		    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+		    .renderPass = rp,
+		    .attachmentCount = 1,
+		    .pAttachments = view,
+		    .width = w,
+		    .height = h,
+		    .layers = 1,
+		};
+		if (vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, fb) != VK_SUCCESS) {
+			U_LOG_E("[local2d] %s: framebuffer failed", what);
+			return false;
+		}
+	}
+	*cw = w;
+	*ch = h;
+	return true;
+}
+
+static void
+vk_destroy_rt(struct comp_vk_native_compositor *c,
+              VkImage *img,
+              VkDeviceMemory *mem,
+              VkImageView *view,
+              VkFramebuffer *fb)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (fb != NULL && *fb != VK_NULL_HANDLE) {
+		vk->vkDestroyFramebuffer(vk->device, *fb, NULL);
+		*fb = VK_NULL_HANDLE;
+	}
+	if (*view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, *view, NULL);
+		*view = VK_NULL_HANDLE;
+	}
+	if (*img != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, *img, NULL);
+		*img = VK_NULL_HANDLE;
+	}
+	if (*mem != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, *mem, NULL);
+		*mem = VK_NULL_HANDLE;
+	}
+}
+
+// #439 Phase 2/3 effective canvas: an active mask or a Local2D-carrying frame
+// supersedes the canvas output rect with the client-window rect (the weave
+// region, composite region, and view dims share one authority). With neither,
+// returns c->canvas verbatim so the no-mask path is unchanged.
+static struct u_canvas_rect
+vk_effective_canvas(struct comp_vk_native_compositor *c)
+{
+	if (c->active_zone_mask == NULL && !c->local_2d_last_frame) {
+		return c->canvas;
+	}
+	struct u_canvas_rect win = {0};
+#ifdef XRT_OS_WINDOWS
+	if (c->hwnd != NULL) {
+		RECT r;
+		if (GetClientRect((HWND)c->hwnd, &r) && r.right > 0 && r.bottom > 0) {
+			win.valid = true;
+			win.x = 0;
+			win.y = 0;
+			win.w = (uint32_t)r.right;
+			win.h = (uint32_t)r.bottom;
+			return win;
+		}
+	}
+#endif
+	return win; // invalid → existing full-target fallbacks
+}
+
+// Compute the window region inside the (worst-case-allocated) dst surface.
+static void
+vk_window_region(struct comp_vk_native_compositor *c, uint32_t dst_w, uint32_t dst_h, uint32_t *rw, uint32_t *rh)
+{
+	*rw = dst_w;
+	*rh = dst_h;
+#ifdef XRT_OS_WINDOWS
+	if (c->hwnd != NULL) {
+		RECT r;
+		if (GetClientRect((HWND)c->hwnd, &r) && r.right > 0 && r.bottom > 0) {
+			*rw = ((uint32_t)r.right < dst_w) ? (uint32_t)r.right : dst_w;
+			*rh = ((uint32_t)r.bottom < dst_h) ? (uint32_t)r.bottom : dst_h;
+		}
+	}
+#endif
+}
+
+// #439 Phase 3 — masked 2D-over-3D composite, POST-weave. The DP has woven the
+// 3D into `dst`; this overlays the frame's 2D content where the zone mask says
+// "2D". Runs only when the frame carries Local2D layers (the `twod` source); a
+// pure explicit-mask-only frame has no 2D pixels on VK (no surround) and is
+// skipped. Returns true if it composited (dst left in dst_outgoing) or false if
+// it skipped (dst untouched, still in dst_incoming).
+static bool
+vk_composite_local_2d(struct comp_vk_native_compositor *c,
+                      VkCommandBuffer cmd,
+                      VkImage dst_image,
+                      VkImageView dst_view,
+                      uint32_t dst_w,
+                      uint32_t dst_h,
+                      VkImageLayout dst_incoming,
+                      VkImageLayout dst_outgoing)
+{
+	struct vk_bundle *vk = &c->vk;
+
+	if (!c->local2d_initialized || !c->local_2d_last_frame || dst_image == VK_NULL_HANDLE ||
+	    dst_view == VK_NULL_HANDLE) {
+		return false;
+	}
+
+	uint32_t region_w, region_h;
+	vk_window_region(c, dst_w, dst_h, &region_w, &region_h);
+	if (region_w == 0 || region_h == 0) {
+		return false;
+	}
+
+	const VkFormat scratch_fmt = VK_FORMAT_B8G8R8A8_UNORM; // matches target (raw weave copy)
+	const VkFormat mask_fmt = VK_FORMAT_R8_UNORM;
+
+	// Collect this frame's Local2D layer rects (for the implicit mask) once.
+	struct xrt_rect rects[XRT_MAX_LAYERS];
+	uint32_t rect_count = 0;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count && rect_count < XRT_MAX_LAYERS; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
+			rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
+		}
+	}
+	if (rect_count == 0) {
+		return false; // local_2d_last_frame stale vs accum — nothing to draw
+	}
+
+	// Resolve the `twod` source: flatten the Local2D layers into local2d_scratch.
+	if (!vk_ensure_rt(c, &c->local2d_scratch, &c->local2d_scratch_mem, &c->local2d_scratch_view,
+	                  &c->local2d_scratch_fb, &c->local2d_scratch_w, &c->local2d_scratch_h, region_w,
+	                  region_h, scratch_fmt,
+	                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+	                      VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+	                  c->local2d.flatten_rp, "local2d scratch")) {
+		return false;
+	}
+	// Weave snapshot scratch (the lerp reads a copy; dst is RT≠SRV).
+	if (!vk_ensure_rt(c, &c->weave_scratch, &c->weave_scratch_mem, &c->weave_scratch_view, NULL,
+	                  &c->weave_scratch_w, &c->weave_scratch_h, region_w, region_h, scratch_fmt,
+	                  VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_NULL_HANDLE,
+	                  "local2d weave")) {
+		return false;
+	}
+
+	vk_local2d_composite_begin_frame(&c->local2d, vk);
+
+	// --- twod: clear local2d_scratch transparent, flatten layers, → SHADER_READ.
+	vk_cmd_image_barrier_locked(vk, cmd, c->local2d_scratch, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+	                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                            k_color_sub);
+	VkClearColorValue transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
+	vk->vkCmdClearColorImage(cmd, c->local2d_scratch, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &transparent, 1,
+	                         &k_color_sub);
+	vk_cmd_image_barrier_locked(vk, cmd, c->local2d_scratch, VK_ACCESS_TRANSFER_WRITE_BIT,
+	                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
+
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
+			continue;
+		}
+		struct xrt_swapchain *sc = layer->sc_array[0];
+		if (sc == NULL) {
+			continue;
+		}
+		uint32_t img_idx = layer->data.local_2d.sub.image_index;
+		// sRGB-passthrough: sample the layer's own view (the projection path
+		// samples the same). UNORM-sibling decode is a follow-up if a layer
+		// ever uses an _SRGB swapchain.
+		VkImageView src_view =
+		    (VkImageView)(uintptr_t)comp_vk_native_swapchain_get_image_view(sc, img_idx);
+		if (src_view == VK_NULL_HANDLE) {
+			continue;
+		}
+
+		const struct xrt_rect *dr = &layer->data.local_2d.rect;
+		int32_t dx = dr->offset.w, dy = dr->offset.h, dw = dr->extent.w, dh = dr->extent.h;
+		if (dw <= 0 || dh <= 0) {
+			continue;
+		}
+		int32_t x0 = dx < 0 ? 0 : dx;
+		int32_t y0 = dy < 0 ? 0 : dy;
+		int32_t x1 = (dx + dw) > (int32_t)region_w ? (int32_t)region_w : (dx + dw);
+		int32_t y1 = (dy + dh) > (int32_t)region_h ? (int32_t)region_h : (dy + dh);
+		if (x1 <= x0 || y1 <= y0) {
+			continue;
+		}
+		float fx0 = (float)(x0 - dx) / (float)dw;
+		float fy0 = (float)(y0 - dy) / (float)dh;
+		float fx1 = (float)(x1 - dx) / (float)dw;
+		float fy1 = (float)(y1 - dy) / (float)dh;
+
+		struct xrt_normalized_rect nr = layer->data.local_2d.sub.norm_rect;
+		if (nr.w <= 0.0f || nr.h <= 0.0f) {
+			nr.x = 0.0f;
+			nr.y = 0.0f;
+			nr.w = 1.0f;
+			nr.h = 1.0f;
+		}
+		float src_x = nr.x + nr.w * fx0;
+		float src_w = nr.w * (fx1 - fx0);
+		float src_y, src_h;
+		if (layer->data.flip_y) {
+			src_y = nr.y + nr.h * (1.0f - fy0);
+			src_h = -(nr.h * (fy1 - fy0));
+		} else {
+			src_y = nr.y + nr.h * fy0;
+			src_h = nr.h * (fy1 - fy0);
+		}
+		bool unpremult = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
+
+		vk_local2d_composite_flatten_draw(&c->local2d, vk, cmd, c->local2d_scratch_fb, region_w,
+		                                  region_h, src_view, x0, y0, (uint32_t)(x1 - x0),
+		                                  (uint32_t)(y1 - y0), src_x, src_y, src_w, src_h, unpremult);
+	}
+	vk_cmd_image_barrier_locked(vk, cmd, c->local2d_scratch, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                            VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+
+	// --- mask: explicit submitted mask wins; else rasterize the implicit one.
+	VkImageView mask_view = VK_NULL_HANDLE;
+	struct comp_vk_native_zone_mask *emask = c->active_zone_mask;
+	if (emask != NULL && emask->submitted && emask->staged_view != VK_NULL_HANDLE) {
+		mask_view = emask->staged_view; // already SHADER_READ from submit
+	} else {
+		if (!vk_ensure_rt(c, &c->implicit_mask_tex, &c->implicit_mask_mem, &c->implicit_mask_view,
+		                  &c->implicit_mask_fb, &c->implicit_mask_w, &c->implicit_mask_h, region_w,
+		                  region_h, mask_fmt,
+		                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+		                  c->local2d.mask_rp, "implicit mask")) {
+			return false;
+		}
+		vk_cmd_image_barrier_locked(vk, cmd, c->implicit_mask_tex, 0,
+		                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+		                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
+		// Inverse of set_rects: M=1 (keep weave) everywhere, M=0 inside the
+		// Local2D rects (show the flattened 2D there).
+		vk_local2d_composite_raster_mask(&c->local2d, vk, cmd, c->implicit_mask_fb, region_w, region_h,
+		                                 1.0f, rects, rect_count, 0.0f);
+		vk_cmd_image_barrier_locked(vk, cmd, c->implicit_mask_tex, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		                            VK_ACCESS_SHADER_READ_BIT,
+		                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+		mask_view = c->implicit_mask_view;
+	}
+
+	// --- weave snapshot: dst → TRANSFER_SRC, copy region → weave_scratch, dst
+	// → COLOR_ATTACHMENT for the composite render pass.
+	vk_cmd_image_barrier_locked(vk, cmd, dst_image, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                            VK_ACCESS_TRANSFER_READ_BIT, dst_incoming,
+	                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                            VK_PIPELINE_STAGE_TRANSFER_BIT, k_color_sub);
+	vk_cmd_image_barrier_locked(vk, cmd, c->weave_scratch, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+	                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                            k_color_sub);
+	VkImageCopy copy = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .srcOffset = {0, 0, 0},
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstOffset = {0, 0, 0},
+	    .extent = {region_w, region_h, 1},
+	};
+	vk->vkCmdCopyImage(cmd, dst_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->weave_scratch,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+	vk_cmd_image_barrier_locked(vk, cmd, c->weave_scratch, VK_ACCESS_TRANSFER_WRITE_BIT,
+	                            VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+	vk_cmd_image_barrier_locked(vk, cmd, dst_image, VK_ACCESS_TRANSFER_READ_BIT,
+	                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
+
+	// --- composite target framebuffer (over the rotating dst view).
+	if (c->composite_target_fb_view != dst_view || c->composite_fb_w != dst_w ||
+	    c->composite_fb_h != dst_h) {
+		if (c->composite_target_fb != VK_NULL_HANDLE) {
+			vk->vkDestroyFramebuffer(vk->device, c->composite_target_fb, NULL);
+			c->composite_target_fb = VK_NULL_HANDLE;
+		}
+		VkFramebufferCreateInfo fb_ci = {
+		    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+		    .renderPass = c->local2d.composite_rp,
+		    .attachmentCount = 1,
+		    .pAttachments = &dst_view,
+		    .width = dst_w,
+		    .height = dst_h,
+		    .layers = 1,
+		};
+		if (vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &c->composite_target_fb) != VK_SUCCESS) {
+			return false;
+		}
+		c->composite_target_fb_view = dst_view;
+		c->composite_fb_w = dst_w;
+		c->composite_fb_h = dst_h;
+	}
+
+	// Effective canvas (window rect while active) — carried into the CB; the
+	// mask-lerp path ignores it, kept coherent anyway.
+	struct u_canvas_rect ec = vk_effective_canvas(c);
+	int32_t cx = ec.valid ? ec.x : 0;
+	int32_t cy = ec.valid ? ec.y : 0;
+	uint32_t cw = ec.valid ? ec.w : region_w;
+	uint32_t ch = ec.valid ? ec.h : region_h;
+
+	vk_local2d_composite_draw(&c->local2d, vk, cmd, c->composite_target_fb, dst_w, dst_h,
+	                          c->local2d_scratch_view, mask_view, c->weave_scratch_view, region_w,
+	                          region_h, cx, cy, cw, ch);
+
+	// One-shot lifecycle log (NOT per-frame): proves the masked composite ran +
+	// which mask source resolved. WARN so it survives the hot-path INFO filter.
+	{
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			U_LOG_W("VK Local2D composite: %ux%u region, %u layer(s), %s mask", region_w,
+			        region_h, rect_count,
+			        (emask != NULL && emask->submitted) ? "explicit" : "implicit");
+		}
+	}
+
+	// dst → outgoing for the downstream stage (HUD / present / readback).
+	vk_cmd_image_barrier_locked(vk, cmd, dst_image, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0,
+	                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, dst_outgoing,
+	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, k_color_sub);
+	return true;
+}
+
+// Release all #439 Phase 3 composite + zone state (called from destroy).
+static void
+vk_release_local2d_state(struct comp_vk_native_compositor *c)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (c->composite_target_fb != VK_NULL_HANDLE) {
+		vk->vkDestroyFramebuffer(vk->device, c->composite_target_fb, NULL);
+		c->composite_target_fb = VK_NULL_HANDLE;
+		c->composite_target_fb_view = VK_NULL_HANDLE;
+	}
+	vk_destroy_rt(c, &c->local2d_scratch, &c->local2d_scratch_mem, &c->local2d_scratch_view,
+	              &c->local2d_scratch_fb);
+	vk_destroy_rt(c, &c->weave_scratch, &c->weave_scratch_mem, &c->weave_scratch_view, NULL);
+	vk_destroy_rt(c, &c->implicit_mask_tex, &c->implicit_mask_mem, &c->implicit_mask_view,
+	              &c->implicit_mask_fb);
+	if (c->local2d_initialized) {
+		vk_local2d_composite_fini(&c->local2d, vk);
+		c->local2d_initialized = false;
+	}
+}
 
 xrt_result_t
 comp_vk_native_compositor_zone_mask_create(struct xrt_compositor *xc, uint32_t w, uint32_t h, void **out_mask)
 {
-	(void)xc;
-	(void)w;
-	(void)h;
-	(void)out_mask;
-	return XRT_ERROR_NOT_IMPLEMENTED;
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	struct vk_bundle *vk = &c->vk;
+	if (out_mask == NULL || !c->local2d_initialized) {
+		return XRT_ERROR_ALLOCATION;
+	}
+
+	// 0 → runtime chooses the client-window dims (the mask is window-sized).
+	if (w == 0 || h == 0) {
+#ifdef XRT_OS_WINDOWS
+		if (c->hwnd != NULL) {
+			RECT r;
+			if (GetClientRect((HWND)c->hwnd, &r) && r.right > 0 && r.bottom > 0) {
+				w = (uint32_t)r.right;
+				h = (uint32_t)r.bottom;
+			}
+		}
+#endif
+		if (w == 0 || h == 0) {
+			w = c->settings.preferred.width;
+			h = c->settings.preferred.height;
+		}
+	}
+	if (w == 0 || h == 0) {
+		U_LOG_E("zone_mask_create: no window/surface to derive mask dims from");
+		return XRT_ERROR_ALLOCATION;
+	}
+
+	struct comp_vk_native_zone_mask *mask = U_TYPED_CALLOC(struct comp_vk_native_zone_mask);
+	if (mask == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	mask->w = w;
+	mask->h = h;
+	mask->tex_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+	uint32_t tw = 0, th = 0, sw = 0, sh = 0;
+	bool ok = vk_ensure_rt(c, &mask->tex, &mask->tex_mem, &mask->tex_view, &mask->fb, &tw, &th, w, h,
+	                       VK_FORMAT_R8_UNORM,
+	                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+	                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+	                       c->local2d.mask_rp, "zone_mask tex");
+	VkFramebuffer no_fb = VK_NULL_HANDLE;
+	ok = ok && vk_ensure_rt(c, &mask->staged, &mask->staged_mem, &mask->staged_view, &no_fb, &sw, &sh, w, h,
+	                        VK_FORMAT_R8_UNORM,
+	                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_NULL_HANDLE,
+	                        "zone_mask staged");
+	if (!ok) {
+		vk_destroy_rt(c, &mask->staged, &mask->staged_mem, &mask->staged_view, NULL);
+		vk_destroy_rt(c, &mask->tex, &mask->tex_mem, &mask->tex_view, &mask->fb);
+		free(mask);
+		return XRT_ERROR_ALLOCATION;
+	}
+
+	// Default all-3D (M=1): an unauthored-but-submitted mask degrades to the
+	// full weave, never a blanked canvas.
+	VkCommandBuffer cmd = vk_oneshot_begin(c);
+	if (cmd != VK_NULL_HANDLE) {
+		vk_cmd_image_barrier_locked(vk, cmd, mask->tex, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
+		vk_local2d_composite_raster_mask(&c->local2d, vk, cmd, mask->fb, w, h, 1.0f, NULL, 0, 1.0f);
+		vk_oneshot_end(c, cmd);
+		mask->tex_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	}
+
+	U_LOG_W("zone_mask_create: %ux%u (client-window px)", w, h);
+	*out_mask = mask;
+	return XRT_SUCCESS;
 }
 
 xrt_result_t
-comp_vk_native_compositor_zone_mask_set_whole(struct xrt_compositor *xc, void *mask, bool enable_3d)
+comp_vk_native_compositor_zone_mask_set_whole(struct xrt_compositor *xc, void *mask_ptr, bool enable_3d)
 {
-	(void)xc;
-	(void)mask;
-	(void)enable_3d;
-	return XRT_ERROR_NOT_IMPLEMENTED;
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	struct vk_bundle *vk = &c->vk;
+	struct comp_vk_native_zone_mask *mask = (struct comp_vk_native_zone_mask *)mask_ptr;
+	if (mask == NULL || mask->fb == VK_NULL_HANDLE) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	VkCommandBuffer cmd = vk_oneshot_begin(c);
+	if (cmd == VK_NULL_HANDLE) {
+		return XRT_ERROR_VULKAN;
+	}
+	vk_cmd_image_barrier_locked(vk, cmd, mask->tex, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                            mask->tex_layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
+	vk_local2d_composite_raster_mask(&c->local2d, vk, cmd, mask->fb, mask->w, mask->h,
+	                                 enable_3d ? 1.0f : 0.0f, NULL, 0, 0.0f);
+	mask->tex_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	vk_oneshot_end(c, cmd);
+	return XRT_SUCCESS;
 }
 
 xrt_result_t
 comp_vk_native_compositor_zone_mask_set_rects(struct xrt_compositor *xc,
-                                              void *mask,
+                                              void *mask_ptr,
                                               uint32_t count,
                                               const struct xrt_rect *rects)
 {
-	(void)xc;
-	(void)mask;
-	(void)count;
-	(void)rects;
-	return XRT_ERROR_NOT_IMPLEMENTED;
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	struct vk_bundle *vk = &c->vk;
+	struct comp_vk_native_zone_mask *mask = (struct comp_vk_native_zone_mask *)mask_ptr;
+	if (mask == NULL || mask->fb == VK_NULL_HANDLE || (count > 0 && rects == NULL)) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	VkCommandBuffer cmd = vk_oneshot_begin(c);
+	if (cmd == VK_NULL_HANDLE) {
+		return XRT_ERROR_VULKAN;
+	}
+	vk_cmd_image_barrier_locked(vk, cmd, mask->tex, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                            mask->tex_layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
+	// M=0 everywhere, then M=1 inside each rect.
+	vk_local2d_composite_raster_mask(&c->local2d, vk, cmd, mask->fb, mask->w, mask->h, 0.0f, rects, count,
+	                                 1.0f);
+	mask->tex_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	vk_oneshot_end(c, cmd);
+	return XRT_SUCCESS;
 }
 
 xrt_result_t
 comp_vk_native_compositor_zone_mask_acquire_rt(struct xrt_compositor *xc,
-                                               void *mask,
+                                               void *mask_ptr,
                                                void **out_image,
                                                void **out_image_view,
                                                uint32_t *out_w,
                                                uint32_t *out_h)
 {
-	(void)xc;
-	(void)mask;
-	(void)out_image;
-	(void)out_image_view;
-	(void)out_w;
-	(void)out_h;
-	return XRT_ERROR_NOT_IMPLEMENTED;
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	struct vk_bundle *vk = &c->vk;
+	struct comp_vk_native_zone_mask *mask = (struct comp_vk_native_zone_mask *)mask_ptr;
+	if (mask == NULL || mask->tex == VK_NULL_HANDLE || out_image == NULL || out_image_view == NULL ||
+	    out_w == NULL || out_h == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	// Tier-3: hand the R8 raster image to the app to draw into. Put it in
+	// COLOR_ATTACHMENT_OPTIMAL (where the app's own render pass expects it);
+	// submit then snapshots it to staged.
+	VkCommandBuffer cmd = vk_oneshot_begin(c);
+	if (cmd != VK_NULL_HANDLE) {
+		vk_cmd_image_barrier_locked(vk, cmd, mask->tex, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		                            mask->tex_layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
+		vk_oneshot_end(c, cmd);
+		mask->tex_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	}
+	*out_image = (void *)(uintptr_t)mask->tex;
+	*out_image_view = (void *)(uintptr_t)mask->tex_view;
+	*out_w = mask->w;
+	*out_h = mask->h;
+	return XRT_SUCCESS;
 }
 
 xrt_result_t
-comp_vk_native_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask)
+comp_vk_native_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask_ptr)
 {
-	(void)xc;
-	(void)mask;
-	return XRT_ERROR_NOT_IMPLEMENTED;
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	struct vk_bundle *vk = &c->vk;
+	struct comp_vk_native_zone_mask *mask = (struct comp_vk_native_zone_mask *)mask_ptr;
+	if (mask == NULL || mask->tex == VK_NULL_HANDLE || mask->staged == VK_NULL_HANDLE) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	VkCommandBuffer cmd = vk_oneshot_begin(c);
+	if (cmd == VK_NULL_HANDLE) {
+		return XRT_ERROR_VULKAN;
+	}
+	// Snapshot tex → staged so in-progress authoring can't tear into a frame.
+	vk_cmd_image_barrier_locked(vk, cmd, mask->tex, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                            VK_ACCESS_TRANSFER_READ_BIT, mask->tex_layout,
+	                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                            VK_PIPELINE_STAGE_TRANSFER_BIT, k_color_sub);
+	vk_cmd_image_barrier_locked(vk, cmd, mask->staged, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+	                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                            k_color_sub);
+	VkImageCopy copy = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .extent = {mask->w, mask->h, 1},
+	};
+	vk->vkCmdCopyImage(cmd, mask->tex, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, mask->staged,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+	vk_cmd_image_barrier_locked(vk, cmd, mask->staged, VK_ACCESS_TRANSFER_WRITE_BIT,
+	                            VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+	// tex returns to COLOR_ATTACHMENT for the next authoring round.
+	vk_cmd_image_barrier_locked(vk, cmd, mask->tex, VK_ACCESS_TRANSFER_READ_BIT,
+	                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
+	vk_oneshot_end(c, cmd);
+
+	mask->tex_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	mask->submitted = true;
+	c->active_zone_mask = mask; // sticky last-submit-wins
+	return XRT_SUCCESS;
 }
 
 void
-comp_vk_native_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask)
+comp_vk_native_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_ptr)
 {
-	(void)xc;
-	(void)mask;
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	struct vk_bundle *vk = &c->vk;
+	struct comp_vk_native_zone_mask *mask = (struct comp_vk_native_zone_mask *)mask_ptr;
+	if (mask == NULL) {
+		return;
+	}
+	vk->vkDeviceWaitIdle(vk->device); // mask may be in flight
+	if (c->active_zone_mask == mask) {
+		c->active_zone_mask = NULL; // revert to implicit / legacy behavior
+	}
+	vk_destroy_rt(c, &mask->staged, &mask->staged_mem, &mask->staged_view, NULL);
+	vk_destroy_rt(c, &mask->tex, &mask->tex_mem, &mask->tex_view, &mask->fb);
+	free(mask);
+}
+
+// #439 Phase 3 Q4 — current recommended per-view render size (the renderer's
+// view dims, recomputed each frame from the effective canvas). oxr fires
+// XrEventDataLocal3DZoneViewSizeChangedEXT when this changes.
+bool
+comp_vk_native_compositor_get_recommended_view_size(struct xrt_compositor *xc, uint32_t *out_w, uint32_t *out_h)
+{
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	if (out_w == NULL || out_h == NULL || c->renderer == NULL) {
+		return false;
+	}
+	uint32_t vw = 0, vh = 0;
+	comp_vk_native_renderer_get_view_dimensions(c->renderer, &vw, &vh);
+	if (vw == 0 || vh == 0) {
+		return false;
+	}
+	*out_w = vw;
+	*out_h = vh;
+	return true;
 }

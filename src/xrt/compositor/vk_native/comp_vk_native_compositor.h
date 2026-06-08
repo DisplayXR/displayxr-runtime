@@ -269,6 +269,16 @@ comp_vk_native_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask
 void
 comp_vk_native_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask);
 
+/*!
+ * #439 Phase 3 Q4 — current recommended per-view render size (renderer view
+ * dims, recomputed each frame from the effective canvas). The oxr frame-end
+ * poll fires XrEventDataLocal3DZoneViewSizeChangedEXT when this changes.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_compositor_get_recommended_view_size(struct xrt_compositor *xc, uint32_t *out_w, uint32_t *out_h);
+
 #ifdef __cplusplus
 }
 #endif

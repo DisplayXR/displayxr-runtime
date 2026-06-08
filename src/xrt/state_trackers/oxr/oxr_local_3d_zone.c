@@ -190,6 +190,18 @@ oxr_xrGetLocal3DZoneCapabilitiesEXT(XrSession session, XrLocal3DZoneCapabilities
 	}
 #endif
 
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->is_vk_native_compositor && sess->xcn != NULL) {
+		// #439 Phase 3 VK consumer — Tier 1/2/3 authored masks + Local2D
+		// layers (compositor-side composite; no DP-driven hardware zone grid).
+		capabilities->supported = XR_TRUE;
+		capabilities->hardwareZoneGridWidth = 0;
+		capabilities->hardwareZoneGridHeight = 0;
+		capabilities->maxMaskWidth = OXR_LOCAL_3D_ZONE_MAX_MASK_DIM;
+		capabilities->maxMaskHeight = OXR_LOCAL_3D_ZONE_MAX_MASK_DIM;
+	}
+#endif
+
 	return XR_SUCCESS;
 }
 

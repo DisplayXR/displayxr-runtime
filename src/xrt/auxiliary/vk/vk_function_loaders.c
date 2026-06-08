@@ -369,6 +369,10 @@ vk_get_device_functions(struct vk_bundle *vk)
 #endif // defined(VK_KHR_present_wait)
 	// end of GENERATED device loader code - do not modify - used by scripts
 
+	// #439 Phase 3 — loaded outside the generated block (matches the append-only
+	// vkCmdClearAttachments field at the end of struct vk_bundle in vk_helpers.h).
+	vk->vkCmdClearAttachments = GET_DEV_PROC(vk, vkCmdClearAttachments);
+
 	// clang-format on
 	return VK_SUCCESS;
 }

@@ -17,6 +17,8 @@ add_library(
 	vk_helpers.h
 	vk_hud_blend.c
 	vk_hud_blend.h
+	vk_local2d_composite.c
+	vk_local2d_composite.h
 	vk_image_allocator.c
 	vk_image_allocator.h
 	vk_image_readback_to_xf_pool.c
