@@ -1753,10 +1753,6 @@ oxr_session_locate_views(struct oxr_logger *log,
 		              sess->sys->xsysc, &rig_info, xdisplay_time, wire_views, &reply)
 		        : comp_ipc_client_compositor_locate_views_rig(
 		              &sess->xcn->base, &rig_info, xdisplay_time, wire_views, &reply);
-		// Tracks whether the server actually populated view_raw this locate.
-		// Bridge route only: when false we reset view_raw below so the stale
-		// in-process nominal pre-fill can't leak to the consumer.
-		bool bridge_raw_from_server = false;
 		if (xret == XRT_SUCCESS) {
 			ipc_rig_done = true;
 			T_xdev_head = reply.head_relation;
@@ -1768,7 +1764,6 @@ oxr_session_locate_views(struct oxr_logger *log,
 			// Raw block, server-gathered from the same inputs its rig
 			// math consumed.
 			if (view_raw != NULL && reply.raw.valid) {
-				bridge_raw_from_server = true;
 				uint32_t rc = reply.raw.eye_count;
 				if (rc > XR_VIEW_RIG_MAX_RAW_EYES_EXT) {
 					rc = XR_VIEW_RIG_MAX_RAW_EYES_EXT;
@@ -1818,26 +1813,23 @@ oxr_session_locate_views(struct oxr_logger *log,
 				        "falling back to legacy device locate",
 				        xret);
 			}
-		}
-
-		// Bridge route: if the server did NOT provide a valid raw block this
-		// locate — the call failed, OR it succeeded but the DP had no eye
-		// sample so raw.valid==0 (e.g. no tracking lock; the server falls back
-		// to the legacy device locate) — the in-process pre-fill above left
-		// CLIENT-NOMINAL eyes in view_raw. Reset to the no-data defaults so
-		// eyeCountOutput==0 is a reliable "no server-authoritative raw" gate:
-		// the bridge then relays XrView.pose (the server's fallback poses in
-		// poses[]) instead of leaking the nominal pre-fill, keeping the raw
-		// channel and XrView.pose value-identical. Native routes keep their
-		// pre-fill — it is the same data the server would have returned.
-		if (rig_route_bridge && view_raw != NULL && !bridge_raw_from_server) {
-			U_ZERO_ARRAY(view_raw->rawEyes);
-			view_raw->eyeCountOutput = 0;
-			view_raw->displayPlanePose = (XrPosef){{0, 0, 0, 1}, {0, 0, 0}};
-			view_raw->canvasRectPx = (XrRect2Di){{0, 0}, {0, 0}};
-			view_raw->canvasSizeMeters = (XrExtent2Df){0, 0};
-			view_raw->sampleTimeNs = 0;
-			view_raw->isTracking = XR_FALSE;
+			// Bridge route fallback: the legacy device locate (below) still
+			// fills XrView.pose with raw eyes via the headless fast path, but
+			// it does NOT touch view_raw. The in-process pre-fill above
+			// (the eye-count>0 branch) may have left CLIENT-NOMINAL eyes in
+			// view_raw — re-zero to the no-data defaults so eyeCountOutput==0
+			// stays a reliable "no server-authoritative raw data" signal for
+			// the bridge (its validity gate). Native routes don't need this:
+			// their pre-fill is the same data the server would return.
+			if (rig_route_bridge && view_raw != NULL) {
+				U_ZERO_ARRAY(view_raw->rawEyes);
+				view_raw->eyeCountOutput = 0;
+				view_raw->displayPlanePose = (XrPosef){{0, 0, 0, 1}, {0, 0, 0}};
+				view_raw->canvasRectPx = (XrRect2Di){{0, 0}, {0, 0}};
+				view_raw->canvasSizeMeters = (XrExtent2Df){0, 0};
+				view_raw->sampleTimeNs = 0;
+				view_raw->isTracking = XR_FALSE;
+			}
 		}
 	}
 #endif
