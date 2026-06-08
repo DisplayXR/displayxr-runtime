@@ -161,6 +161,10 @@ Sent on `XrEventDataEyeTrackingStateChangedEXT` (#441 v14) — edge-triggered on
   "type": "eye-poses",
   "version": 1,
   "format": "raw",
+  "source": "view-rig",
+  "isTracking": true,
+  "sampleTimeNs": "123456789012",
+  "displayPlane": { "position": [0, 0, 0], "orientation": [0, 0, 0, 1] },
   "eyes": [
     {
       "position": [-0.0315, 0.1, 0.6],
@@ -176,7 +180,20 @@ Sent on `XrEventDataEyeTrackingStateChangedEXT` (#441 v14) — edge-triggered on
 }
 ```
 
-Streamed at ~100 Hz when `eyePoseFormat` is `"raw"`. Contains per-eye position, orientation (quaternion xyzw), and asymmetric FOV angles (radians) from `xrLocateViews` in RAW mode (no qwerty transform).
+Streamed at ~100 Hz when `eyePoseFormat` is `"raw"`. Contains per-view position, orientation (quaternion xyzw), and asymmetric FOV angles (radians) from `xrLocateViews` in RAW mode (no qwerty transform).
+
+**Per-view position sourcing.** When the runtime supports `XR_EXT_view_rig`, the bridge chains `XrViewDisplayRawEXT` on `xrLocateViews` and sources each view's `position` from the formal raw channel (`rawEyes[]`) — the same display-space inputs a native aware app consumes. The values are identical by construction to the legacy `XrView.pose` transport (both are the pre-rebase display-processor eyes); this is an input-plumbing formalization, not a behavior change. Views beyond the tracked-eye count (`eyeCountOutput`) — e.g. the surplus views of a quad rendering mode — fall back to the `XrView` pose, exactly as before.
+
+**Additive fields (present only when the formal raw channel is live):**
+
+| Field | Type | Meaning |
+|---|---|---|
+| `source` | string | `"view-rig"` — positions came from the formal `XrViewDisplayRawEXT` channel. Absent on older runtimes (positions then come from `XrView.pose`). |
+| `isTracking` | bool | Physical eye-tracker lock (vs nominal-viewer fallback). |
+| `sampleTimeNs` | string | Monotonic timestamp (ns) when the eyes were sampled, as a **decimal string** (int64 exceeds JS `Number` precision). |
+| `displayPlane` | object | Physical display-plane pose in the locate space (`position` [x,y,z], `orientation` quaternion xyzw). Identity for the headless relay. |
+
+The message `version` stays `1` — these fields are additive and absent on older runtimes; consumers must treat them as optional. Window/canvas geometry is **not** carried here — it stays on the `windowInfo` channel (which describes the page's slot, not the bridge session's full-display canvas).
 
 ## Tile layout model
 

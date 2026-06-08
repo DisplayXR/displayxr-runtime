@@ -21,10 +21,13 @@ code-paths:
 > consumer run displayxr-common's type-neutral core `dxr_view_math`,
 > v0.4.0); and the rig + raw channel work over IPC for service-mode sessions
 > (`session_locate_views_rig`, same server code path as the legacy locate
-> plus rig overrides). Remaining tails are optional: consumer migrations onto
-> the rig request, the WebXR bridge's move to the explicit raw result,
-> surplus-eye exposure, the workspace constraint hook, and ADR promotion of
-> this doc. Tracked as
+> plus rig overrides). The WebXR bridge now consumes the explicit
+> `XrViewDisplayRawEXT` channel (headless bridge-relay sessions route a
+> view_raw-chained locate through a system-compositor conduit; the server
+> completes the headless raw block with the display plane + full-display
+> canvas). Remaining tails are optional: consumer migrations onto the rig
+> request, surplus-eye exposure, the workspace constraint hook, and ADR
+> promotion of this doc. Tracked as
 > **W7 of [#396](https://github.com/DisplayXR/displayxr-runtime/issues/396)**.
 
 ## Phase 1 decisions (implementation, 2026-06-06)
@@ -297,7 +300,7 @@ Notes on the shape:
 |---|---|---|
 | Native apps (cube_*, demos) | rig request | delete the per-frame Kooima block; consume `XrView` directly |
 | Unity / Unreal plugins | rig request | keep rebuilding matrices *from fov* (engine conventions, reverse-Z) — but stop computing the fov |
-| WebXR bridge | raw result | formalizes the headless fast-path; keeps doing its own math |
+| WebXR bridge | raw result | **done** — chains `XrViewDisplayRawEXT`, forwards the formal raw inputs to the browser; keeps doing its own math |
 | Hybrid / debugging | both | request a rig AND read raw to cross-check (the selftest in app form) |
 
 ### Per-session state, qwerty as fallback

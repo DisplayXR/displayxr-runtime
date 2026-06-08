@@ -339,6 +339,22 @@ comp_ipc_client_compositor_locate_views_rig(struct xrt_compositor *xc,
                                             struct ipc_info_locate_views_rig *out_info);
 
 /*!
+ * XR_EXT_view_rig over IPC (#396 W7), bridge-relay variant: same per-locate
+ * rig/raw fetch as comp_ipc_client_compositor_locate_views_rig, but keyed off
+ * the system compositor instead of a per-session native compositor. Headless
+ * bridge-relay sessions (XR_MND_headless + XR_EXT_display_info) have no xcn,
+ * yet still hold sess->sys->xsysc — the conduit to the IPC connection. Only
+ * valid when xsysc->info.is_service_mode (the IPC client variant); returns
+ * XRT_ERROR_IPC_FAILURE otherwise.
+ */
+xrt_result_t
+comp_ipc_client_system_compositor_locate_views_rig(struct xrt_system_compositor *xsysc,
+                                                   const struct ipc_view_rig_info *rig,
+                                                   int64_t at_timestamp_ns,
+                                                   uint32_t view_count,
+                                                   struct ipc_info_locate_views_rig *out_info);
+
+/*!
  * Phase 2.I-prequel: workspace client enumeration. Bridge accepts a primitive
  * id array so st_oxr does not include IPC types.
  */
