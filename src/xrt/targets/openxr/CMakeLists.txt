@@ -145,6 +145,26 @@ generate_openxr_runtime_manifest_buildtree(
 	OUT_FILE ${DEV_MANIFEST_OUTPUT}
 	)
 
+# Strip vulkan-1.dll from the BUILD-TREE output dir too (issue #105). The
+# install rules above filter it from _package/, but the dev manifest
+# (DEV_MANIFEST_OUTPUT) points XR_RUNTIME_JSON at the build-tree
+# DisplayXRClient.dll, and X_VCPKG_APPLOCAL_DEPS stages vulkan-1.dll right next
+# to it as its own POST_BUILD step — a second Vulkan loader that shadows
+# C:\Windows\System32\vulkan-1.dll → NVIDIA ICD null-deref in
+# vkEnumeratePhysicalDevices the moment a dev app runs against the build tree.
+# This POST_BUILD runs after applocal's (later registration = later execution),
+# so the build-tree runtime dir relies on the system loader like the install
+# does. Idempotent; Windows-only (vulkan-1.dll is a Windows loader name).
+if(WIN32)
+	add_custom_command(
+		TARGET ${RUNTIME_TARGET}
+		POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E rm -f "$<TARGET_FILE_DIR:${RUNTIME_TARGET}>/vulkan-1.dll"
+		COMMENT "Removing build-tree vulkan-1.dll (runtime uses the system loader; issue #105)"
+		VERBATIM
+		)
+endif()
+
 ###
 # Prepare the installable manifest: will be generated completely at install time,
 # by a script we generate now.
