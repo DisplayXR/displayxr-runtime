@@ -211,6 +211,28 @@ create_swapchain(struct comp_vk_native_target *target)
 	// Pick present mode: FIFO (VSync) is always available
 	VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
 
+	// Pick the surface pre-transform. Default: match the surface's current
+	// transform so the WSI rotates our output for us (correct for normal 2D/3D
+	// content).
+	VkSurfaceTransformFlagBitsKHR pre_transform = caps.currentTransform;
+#ifdef XRT_OS_ANDROID
+	// LOXR-730/733 (landscape weave ghost): a Leia-WOVEN image cannot be
+	// rotated by the WSI — the interlaced sub-pixel pattern must stay aligned to
+	// the physically-bonded, panel-native lenticular. With Android pre-rotation,
+	// in landscape the surface is panel-native portrait (currentExtent
+	// 1600x2560) + currentTransform=ROTATE_90, so presenting our woven buffer
+	// with preTransform=ROTATE_90 shears the weave off the lenticular (ghosting;
+	// portrait is clean because currentTransform is IDENTITY there). Force
+	// IDENTITY so the woven buffer scans out 1:1 onto the panel; content is
+	// rotated per-orientation upstream instead of rotating the woven image.
+	if (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) {
+		pre_transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+	}
+	U_LOG_W("HW_XFORM: currentTransform=0x%x supported=0x%x chosen_preTransform=0x%x extent=%ux%u",
+	        (unsigned)caps.currentTransform, (unsigned)caps.supportedTransforms,
+	        (unsigned)pre_transform, extent.width, extent.height);
+#endif
+
 	// Pick compositeAlpha. The DP's chroma-key strip pass writes premultiplied
 	// alpha into the swapchain image, so we want PRE_MULTIPLIED. INHERIT works
 	// on some Win32 WSI drivers where DWM still respects the alpha channel.
@@ -263,7 +285,7 @@ create_swapchain(struct comp_vk_native_target *target)
 	    .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
 	                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
 	    .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
-	    .preTransform = caps.currentTransform,
+	    .preTransform = pre_transform,
 	    .compositeAlpha = composite_alpha,
 	    .presentMode = present_mode,
 	    .clipped = VK_TRUE,
@@ -930,6 +952,35 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 		target->current_index = target->dcomp_ring_idx;
 		*out_index = target->current_index;
 		return XRT_SUCCESS;
+	}
+#endif
+
+#ifdef XRT_OS_ANDROID
+	// LOXR-730/733: Adreno does NOT report VK_ERROR_OUT_OF_DATE_KHR on device
+	// rotation, so without this the swapchain would stay at the launch
+	// orientation's extent forever (portrait 1600x2560 <-> landscape 2560x1600).
+	// The Leia weave must map 1:1 to the panel, so a stale extent breaks the
+	// weave in whichever orientation we did NOT launch in. Poll the surface
+	// extent each acquire and recreate the target (with preTransform=IDENTITY)
+	// when it flips. vkGetPhysicalDeviceSurfaceCapabilitiesKHR is cheap.
+	{
+		VkSurfaceCapabilitiesKHR caps;
+		VkResult cres = vk->vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+		    vk->physical_device, target->surface, &caps);
+		if (cres == VK_SUCCESS && caps.currentExtent.width != UINT32_MAX &&
+		    caps.currentExtent.width != 0 && caps.currentExtent.height != 0 &&
+		    (caps.currentExtent.width != target->width ||
+		     caps.currentExtent.height != target->height)) {
+			U_LOG_W("HW_XFORM: surface extent %ux%u -> %ux%u (rotation), recreating target",
+			        target->width, target->height, caps.currentExtent.width,
+			        caps.currentExtent.height);
+			xrt_result_t rret = comp_vk_native_target_resize(
+			    target, caps.currentExtent.width, caps.currentExtent.height);
+			if (rret != XRT_SUCCESS) {
+				U_LOG_E("Failed to recreate target swapchain on rotation");
+				return rret;
+			}
+		}
 	}
 #endif
 
