@@ -208,6 +208,17 @@ comp_d3d11_compositor_zone_get_hw_caps(struct xrt_compositor *xc,
                                        uint32_t *out_grid_h);
 
 /*!
+ * Current recommended per-view render size (client-window-derived when a
+ * mask/Local2D is active, canvas-derived otherwise). Polled by oxr at frame
+ * end to fire XrEventDataLocal3DZoneViewSizeChangedEXT on change (#439
+ * Phase 3 Q4).
+ *
+ * @ingroup comp_d3d11
+ */
+bool
+comp_d3d11_compositor_get_recommended_view_size(struct xrt_compositor *xc, uint32_t *out_w, uint32_t *out_h);
+
+/*!
  * Get the predicted eye positions from the display processor.
  *
  * @param xc The compositor.

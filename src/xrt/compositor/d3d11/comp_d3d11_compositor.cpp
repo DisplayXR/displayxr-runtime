@@ -185,6 +185,39 @@ struct comp_d3d11_compositor
 	ID3D11Texture2D *weave_scratch;
 	ID3D11ShaderResourceView *weave_scratch_srv;
 
+	//! #439 Phase 3 — runtime-owned flatten target (RT+SRV) the masked
+	//! composite reads as `twod` when the frame carries
+	//! XrCompositionLayerLocal2DEXT layers (instead of the surround copy).
+	//! Kept SEPARATE from surround_scratch (which is SRV-only, managed by a
+	//! different helper) so the RT bind + RTV never alias the legacy path —
+	//! an app uses one 2D model, but a model switch must not dangle the RTV.
+	//! Allocated as a trio by d3d11_ensure_rt_srv_scratch.
+	ID3D11Texture2D *local2d_scratch;
+	ID3D11ShaderResourceView *local2d_scratch_srv;
+	ID3D11RenderTargetView *local2d_scratch_rtv;
+
+	//! #439 Phase 3 — runtime-owned IMPLICIT zone mask, rasterized from the
+	//! frame's Local2D layer rects (Q3): M=1 (keep the weave) everywhere,
+	//! M=0 (show the 2D layers) inside the union of the layer rects. Used as
+	//! the mask source when no explicit mask is submitted but Local2D layers
+	//! are present. Mirrors the explicit comp_d3d11_zone_mask RTV+staged
+	//! pattern (GPU raster via ClearView, then CopyResource to an SRV-capable
+	//! staged sibling) — runtime lifetime, re-rasterized only when the rect
+	//! set or dims change.
+	ID3D11Texture2D *implicit_mask_tex;            //!< R8_UNORM, RTV-capable
+	ID3D11RenderTargetView *implicit_mask_rtv;
+	ID3D11Texture2D *implicit_mask_staged;         //!< R8_UNORM, SRV-capable
+	ID3D11ShaderResourceView *implicit_mask_staged_srv;
+	uint32_t implicit_mask_w, implicit_mask_h;     //!< 0 = unallocated
+	struct xrt_rect implicit_rects[XRT_MAX_LAYERS]; //!< dirty-check cache
+	uint32_t implicit_rect_count;
+
+	//! #439 Phase 3 — true when the last committed frame carried Local2D
+	//! layers. Makes the implicit mask's canvas-supersede effect visible to
+	//! d3d11_effective_canvas (the per-frame canvas authority). Set once
+	//! under c->mutex at the top of layer_commit (per-frame atomicity).
+	bool local_2d_last_frame;
+
 	//! #224 hardware-DP zone leg: cached get_local_zone_caps result.
 	//! 0 = not queried yet (calloc default), 1 = supported, 2 = legacy DP
 	//! (slot absent / caps unsupported — never publish).
@@ -343,10 +376,14 @@ d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c);
 // invalid canvas there would fall back to display dims — the window rect
 // keeps the #464 clamp. Callers in the frame path hold c->mutex, which
 // zone_mask_submit/destroy also take, so the mask cannot flip mid-frame.
+// #439 Phase 3: a frame carrying Local2D layers raises an IMPLICIT mask
+// (Q3), which supersedes the canvas by the same uniform rule — no third
+// state. local_2d_last_frame is set under c->mutex at the top of
+// layer_commit, so it reflects the current frame's accumulator.
 static struct u_canvas_rect
 d3d11_effective_canvas(struct comp_d3d11_compositor *c)
 {
-	if (c->active_zone_mask == nullptr) {
+	if (c->active_zone_mask == nullptr && !c->local_2d_last_frame) {
 		return c->canvas;
 	}
 	struct u_canvas_rect win = {};
@@ -1412,6 +1449,20 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 #endif
+
+	// #439 Phase 3: frame mask state. Any XrCompositionLayerLocal2DEXT layer
+	// this frame raises an implicit mask (Q3) which, like an explicit one,
+	// supersedes the canvas (uniform Phase-2 rule). Compute once under
+	// c->mutex (held here) so d3d11_effective_canvas below and the composite
+	// downstream see one coherent decision for the frame.
+	bool have_local_2d = false;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
+			have_local_2d = true;
+			break;
+		}
+	}
+	c->local_2d_last_frame = have_local_2d;
 
 	// #439 Phase 2: the one canvas authority for this frame. While a zone
 	// mask is active this is the client-window rect (the mask supersedes
@@ -2821,6 +2872,39 @@ d3d11_release_zone_state(struct comp_d3d11_compositor *c)
 		c->weave_scratch->Release();
 		c->weave_scratch = nullptr;
 	}
+
+	// #439 Phase 3 — runtime-owned Local2D flatten scratch + implicit mask.
+	if (c->local2d_scratch_rtv != nullptr) {
+		c->local2d_scratch_rtv->Release();
+		c->local2d_scratch_rtv = nullptr;
+	}
+	if (c->local2d_scratch_srv != nullptr) {
+		c->local2d_scratch_srv->Release();
+		c->local2d_scratch_srv = nullptr;
+	}
+	if (c->local2d_scratch != nullptr) {
+		c->local2d_scratch->Release();
+		c->local2d_scratch = nullptr;
+	}
+	if (c->implicit_mask_staged_srv != nullptr) {
+		c->implicit_mask_staged_srv->Release();
+		c->implicit_mask_staged_srv = nullptr;
+	}
+	if (c->implicit_mask_staged != nullptr) {
+		c->implicit_mask_staged->Release();
+		c->implicit_mask_staged = nullptr;
+	}
+	if (c->implicit_mask_rtv != nullptr) {
+		c->implicit_mask_rtv->Release();
+		c->implicit_mask_rtv = nullptr;
+	}
+	if (c->implicit_mask_tex != nullptr) {
+		c->implicit_mask_tex->Release();
+		c->implicit_mask_tex = nullptr;
+	}
+	c->implicit_mask_w = 0;
+	c->implicit_mask_h = 0;
+	c->implicit_rect_count = 0;
 }
 
 // #224 hardware-DP zone leg — keep the DP's view of this client's zone mask in
@@ -2949,6 +3033,314 @@ d3d11_ensure_srv_scratch(struct comp_d3d11_compositor *c,
 	return true;
 }
 
+// #439 Phase 3 — like d3d11_ensure_srv_scratch but RENDER_TARGET-capable, so
+// the Local2D flatten can draw into it before the masked composite samples it.
+// Keeps surround_scratch_srv and surround_scratch_rtv in lockstep (both
+// (re)created on dims/format change). Kept separate from d3d11_ensure_srv_scratch
+// so weave_scratch stays SRV-only (no wasted RT bind on a pure snapshot).
+static bool
+d3d11_ensure_rt_srv_scratch(struct comp_d3d11_compositor *c,
+                            ID3D11Texture2D **tex,
+                            ID3D11ShaderResourceView **srv,
+                            ID3D11RenderTargetView **rtv,
+                            uint32_t w,
+                            uint32_t h,
+                            DXGI_FORMAT fmt,
+                            const char *what)
+{
+	bool need_alloc = *tex == nullptr || *rtv == nullptr;
+	if (!need_alloc) {
+		D3D11_TEXTURE2D_DESC cur;
+		(*tex)->GetDesc(&cur);
+		need_alloc = (cur.Width != w || cur.Height != h || cur.Format != fmt);
+	}
+	if (!need_alloc) {
+		return true;
+	}
+	if (*rtv != nullptr) {
+		(*rtv)->Release();
+		*rtv = nullptr;
+	}
+	if (*srv != nullptr) {
+		(*srv)->Release();
+		*srv = nullptr;
+	}
+	if (*tex != nullptr) {
+		(*tex)->Release();
+		*tex = nullptr;
+	}
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w;
+	td.Height = h;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = fmt;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+	HRESULT hr = c->device->CreateTexture2D(&td, nullptr, tex);
+	if (FAILED(hr) || *tex == nullptr) {
+		U_LOG_W("%s: RT scratch alloc (%ux%u fmt=%u) failed: 0x%08x", what, w, h, fmt, hr);
+		return false;
+	}
+	hr = c->device->CreateShaderResourceView(*tex, nullptr, srv);
+	if (FAILED(hr) || *srv == nullptr) {
+		U_LOG_W("%s: RT scratch SRV failed: 0x%08x", what, hr);
+		(*tex)->Release();
+		*tex = nullptr;
+		return false;
+	}
+	hr = c->device->CreateRenderTargetView(*tex, nullptr, rtv);
+	if (FAILED(hr) || *rtv == nullptr) {
+		U_LOG_W("%s: RT scratch RTV failed: 0x%08x", what, hr);
+		(*srv)->Release();
+		*srv = nullptr;
+		(*tex)->Release();
+		*tex = nullptr;
+		return false;
+	}
+	return true;
+}
+
+// #439 Phase 3 — (re)rasterize the runtime-owned IMPLICIT zone mask from this
+// frame's Local2D layer rects (Q3). Inverse of zone_mask_set_rects: clear M=1
+// (keep the weave / 3D) everywhere, then ClearView M=0 (show the 2D layers)
+// inside each layer rect. The masked-composite shader lerps M·weave+(1−M)·twod,
+// so M=0 inside the rects is what surfaces the flattened Local2D content there.
+// Re-rasters only when the rect set or dims change (the common steady-state
+// frame reuses the staged SRV). Returns the staged SRV (sampled by the
+// composite) or nullptr on failure. Caller holds c->mutex.
+static ID3D11ShaderResourceView *
+d3d11_update_implicit_mask(struct comp_d3d11_compositor *c,
+                           const struct xrt_rect *rects,
+                           uint32_t rect_count,
+                           uint32_t w,
+                           uint32_t h)
+{
+	if (w == 0 || h == 0 || rect_count == 0) {
+		return nullptr;
+	}
+
+	// Dirty-check: reuse the existing rasterization unless dims or the rect
+	// set changed.
+	bool dirty = c->implicit_mask_tex == nullptr || c->implicit_mask_staged_srv == nullptr ||
+	             c->implicit_mask_w != w || c->implicit_mask_h != h || c->implicit_rect_count != rect_count;
+	for (uint32_t i = 0; !dirty && i < rect_count; i++) {
+		if (memcmp(&c->implicit_rects[i], &rects[i], sizeof(rects[i])) != 0) {
+			dirty = true;
+		}
+	}
+	if (!dirty) {
+		return c->implicit_mask_staged_srv;
+	}
+
+	// (Re)allocate the R8 RTV + staged SRV textures on dims change (mirrors
+	// zone_mask_create). Reused across re-rasters at the same size.
+	if (c->implicit_mask_tex == nullptr || c->implicit_mask_w != w || c->implicit_mask_h != h) {
+		if (c->implicit_mask_staged_srv != nullptr) {
+			c->implicit_mask_staged_srv->Release();
+			c->implicit_mask_staged_srv = nullptr;
+		}
+		if (c->implicit_mask_staged != nullptr) {
+			c->implicit_mask_staged->Release();
+			c->implicit_mask_staged = nullptr;
+		}
+		if (c->implicit_mask_rtv != nullptr) {
+			c->implicit_mask_rtv->Release();
+			c->implicit_mask_rtv = nullptr;
+		}
+		if (c->implicit_mask_tex != nullptr) {
+			c->implicit_mask_tex->Release();
+			c->implicit_mask_tex = nullptr;
+		}
+		c->implicit_mask_w = 0;
+		c->implicit_mask_h = 0;
+
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = w;
+		td.Height = h;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R8_UNORM;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_RENDER_TARGET;
+		HRESULT hr = c->device->CreateTexture2D(&td, nullptr, &c->implicit_mask_tex);
+		if (SUCCEEDED(hr) && c->implicit_mask_tex != nullptr) {
+			hr = c->device->CreateRenderTargetView(c->implicit_mask_tex, nullptr, &c->implicit_mask_rtv);
+		}
+		if (SUCCEEDED(hr) && c->implicit_mask_rtv != nullptr) {
+			td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			hr = c->device->CreateTexture2D(&td, nullptr, &c->implicit_mask_staged);
+		}
+		if (SUCCEEDED(hr) && c->implicit_mask_staged != nullptr) {
+			hr = c->device->CreateShaderResourceView(c->implicit_mask_staged, nullptr,
+			                                         &c->implicit_mask_staged_srv);
+		}
+		if (FAILED(hr) || c->implicit_mask_staged_srv == nullptr) {
+			U_LOG_E("implicit zone mask: D3D resource creation failed: 0x%08x", hr);
+			if (c->implicit_mask_staged != nullptr) {
+				c->implicit_mask_staged->Release();
+				c->implicit_mask_staged = nullptr;
+			}
+			if (c->implicit_mask_rtv != nullptr) {
+				c->implicit_mask_rtv->Release();
+				c->implicit_mask_rtv = nullptr;
+			}
+			if (c->implicit_mask_tex != nullptr) {
+				c->implicit_mask_tex->Release();
+				c->implicit_mask_tex = nullptr;
+			}
+			return nullptr;
+		}
+		c->implicit_mask_w = w;
+		c->implicit_mask_h = h;
+	}
+
+	// Raster: M=1 (keep weave) everywhere, then M=0 (show 2D) inside each
+	// clamped layer rect — the inverse of zone_mask_set_rects.
+	const float all_3d[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+	c->context->ClearRenderTargetView(c->implicit_mask_rtv, all_3d);
+
+	ID3D11DeviceContext1 *ctx1 = nullptr;
+	HRESULT hr = c->context->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void **>(&ctx1));
+	if (FAILED(hr) || ctx1 == nullptr) {
+		U_LOG_E("implicit zone mask: ID3D11DeviceContext1 unavailable (hr=0x%08x)", hr);
+		return nullptr;
+	}
+	const float all_2d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	for (uint32_t i = 0; i < rect_count; i++) {
+		int32_t left = rects[i].offset.w;
+		int32_t top = rects[i].offset.h;
+		int32_t right = left + rects[i].extent.w;
+		int32_t bottom = top + rects[i].extent.h;
+		if (left < 0) {
+			left = 0;
+		}
+		if (top < 0) {
+			top = 0;
+		}
+		if (right > (int32_t)w) {
+			right = (int32_t)w;
+		}
+		if (bottom > (int32_t)h) {
+			bottom = (int32_t)h;
+		}
+		if (right <= left || bottom <= top) {
+			continue;
+		}
+		D3D11_RECT dr = {left, top, right, bottom};
+		ctx1->ClearView(c->implicit_mask_rtv, all_2d, &dr, 1);
+	}
+	ctx1->Release();
+
+	// Stage the snapshot the composite samples (RT≠SRV; same decouple as the
+	// explicit mask's submit).
+	c->context->CopyResource(c->implicit_mask_staged, c->implicit_mask_tex);
+
+	// Cache the rect set for the next frame's dirty-check.
+	memcpy(c->implicit_rects, rects, sizeof(rects[0]) * rect_count);
+	c->implicit_rect_count = rect_count;
+
+	// One-off-ish lifecycle event (only fires on a rect/dims change, not
+	// per-frame). WARN per the debug-logging convention.
+	U_LOG_W("implicit zone mask: %ux%u, %u Local2D rect(s)", w, h, rect_count);
+	return c->implicit_mask_staged_srv;
+}
+
+// #439 Phase 3 — flatten this frame's Local2D layers into local2d_scratch (the
+// `twod` source the masked composite reads). Clears transparent, then draws each
+// layer in list order (later = on top) with premultiplied (or straight-alpha)
+// over. Dest rects are clipped to the window region; the clip fractions, the
+// layer's norm_rect, and flip_y are carried into the source UVs. Caller holds
+// c->mutex and has already (re)allocated local2d_scratch (+RTV) at region dims.
+static bool
+d3d11_flatten_local_2d_layers(struct comp_d3d11_compositor *c, uint32_t region_w, uint32_t region_h)
+{
+	// Clear transparent once. Where a pixel is M=0 (2D) but no layer covers
+	// it, twod stays (0,0,0,0) → final.a → 0 → the desktop shows through (Q2,
+	// §4.2 output-alpha rule).
+	const float transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	c->context->ClearRenderTargetView(c->local2d_scratch_rtv, transparent);
+
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
+			continue;
+		}
+		struct xrt_swapchain *sc = layer->sc_array[0];
+		if (sc == nullptr) {
+			continue;
+		}
+		uint32_t img_idx = layer->data.local_2d.sub.image_index;
+		// sRGB-passthrough: get_srv returns the swapchain's UNORM sibling SRV
+		// (no auto-decode), the same SRV the projection draws sample.
+		ID3D11ShaderResourceView *src_srv =
+		    static_cast<ID3D11ShaderResourceView *>(comp_d3d11_swapchain_get_srv(sc, img_idx));
+		if (src_srv == nullptr) {
+			continue; // swapchain not SAMPLED — nothing to flatten
+		}
+
+		// Dest rect (client-window px), clipped to the window region.
+		const struct xrt_rect *dr = &layer->data.local_2d.rect;
+		int32_t dx = dr->offset.w;
+		int32_t dy = dr->offset.h;
+		int32_t dw = dr->extent.w;
+		int32_t dh = dr->extent.h;
+		if (dw <= 0 || dh <= 0) {
+			continue;
+		}
+		int32_t x0 = dx < 0 ? 0 : dx;
+		int32_t y0 = dy < 0 ? 0 : dy;
+		int32_t x1 = (dx + dw) > (int32_t)region_w ? (int32_t)region_w : (dx + dw);
+		int32_t y1 = (dy + dh) > (int32_t)region_h ? (int32_t)region_h : (dy + dh);
+		if (x1 <= x0 || y1 <= y0) {
+			continue; // clipped fully out
+		}
+
+		// Clip fractions within the original dest rect (carry into the UVs so
+		// the correct source region is sampled when the rect is clipped).
+		float fx0 = (float)(x0 - dx) / (float)dw;
+		float fy0 = (float)(y0 - dy) / (float)dh;
+		float fx1 = (float)(x1 - dx) / (float)dw;
+		float fy1 = (float)(y1 - dy) / (float)dh;
+
+		// App sub-rect within the swapchain image (normalized). Default full.
+		struct xrt_normalized_rect nr = layer->data.local_2d.sub.norm_rect;
+		if (nr.w <= 0.0f || nr.h <= 0.0f) {
+			nr.x = 0.0f;
+			nr.y = 0.0f;
+			nr.w = 1.0f;
+			nr.h = 1.0f;
+		}
+
+		// Source rect (normalized) carrying clip + flip_y. flip_y: start at
+		// the bottom of the sub-rect and sample upward (negative height).
+		float src_x = nr.x + nr.w * fx0;
+		float src_w = nr.w * (fx1 - fx0);
+		float src_y, src_h;
+		if (layer->data.flip_y) {
+			src_y = nr.y + nr.h * (1.0f - fy0);
+			src_h = -(nr.h * (fy1 - fy0));
+		} else {
+			src_y = nr.y + nr.h * fy0;
+			src_h = nr.h * (fy1 - fy0);
+		}
+
+		bool unpremult = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
+
+		comp_d3d11_renderer_flatten_local_2d(c->renderer, c->local2d_scratch_rtv, src_srv, x0, y0,
+		                                     (uint32_t)(x1 - x0), (uint32_t)(y1 - y0), src_x, src_y, src_w,
+		                                     src_h, unpremult);
+	}
+
+	// Unbind the scratch RTV so the masked composite can sample it as an SRV
+	// without a read/write-hazard warning.
+	ID3D11RenderTargetView *null_rtv = nullptr;
+	c->context->OMSetRenderTargets(1, &null_rtv, nullptr);
+	return true;
+}
+
 // #439 Phase 1 — composite the authored zone mask. Runs INSTEAD of the rect
 // surround path when an active submitted mask exists (the mask-lerp writes
 // every window pixel, so the rect path must not also run). Returns false →
@@ -2968,8 +3360,13 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
                           uint32_t dst_h,
                           const struct u_canvas_rect *eff_canvas)
 {
+	// #439 Phase 3: run when EITHER an explicit submitted mask exists (legacy
+	// `texture + mask`, surround supplies the 2D pixels) OR this frame carries
+	// Local2D layers (the layers supply the 2D pixels + an implicit mask).
 	struct comp_d3d11_zone_mask *mask = c->active_zone_mask;
-	if (mask == nullptr || !mask->submitted || dst == nullptr || c->renderer == nullptr) {
+	const bool have_explicit = (mask != nullptr && mask->submitted);
+	const bool have_local_2d = c->local_2d_last_frame;
+	if ((!have_explicit && !have_local_2d) || dst == nullptr || c->renderer == nullptr) {
 		return false;
 	}
 
@@ -2986,70 +3383,118 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		}
 	}
 
-	// Phase 1 is `texture + mask` (impl doc §2): the surround supplies the
-	// 2D pixels. Without one there is nothing to composite — full weave.
-	if (!c->surround_2d.valid || c->surround_texture == nullptr || c->surround_mutex == nullptr) {
-		static bool no_surround_logged = false;
-		if (!no_surround_logged) {
-			U_LOG_W("D3D11 zone mask: no 2D surround registered — mask ignored "
-			        "(Phase 1 needs xrSetSharedTextureSurround2DEXT for the 2D pixels)");
-			no_surround_logged = true;
-		}
-		return false;
-	}
-
-	// Relaxed dims contract (#464): accept a window-sized surround or the
-	// legacy display-sized one — content is top-left-anchored in both; we
-	// copy only the window region.
-	if (c->surround_2d.w < region_w || c->surround_2d.h < region_h) {
-		static bool dims_logged = false;
-		if (!dims_logged) {
-			U_LOG_W("D3D11 zone mask: surround %ux%u smaller than window region %ux%u — "
-			        "mask ignored. Re-register surround on window resize.",
-			        c->surround_2d.w, c->surround_2d.h, region_w, region_h);
-			dims_logged = true;
-		}
-		return false;
-	}
-
-	// Format contract: surround must match dst (same rule as the rect path).
-	D3D11_TEXTURE2D_DESC sd;
-	c->surround_texture->GetDesc(&sd);
 	D3D11_TEXTURE2D_DESC dd;
 	dst->GetDesc(&dd);
-	if (sd.Format != dd.Format) {
-		static bool fmt_logged = false;
-		if (!fmt_logged) {
-			U_LOG_W("D3D11 zone mask: surround format %u != target format %u — mask ignored",
-			        sd.Format, dd.Format);
-			fmt_logged = true;
+
+	// Resolve the frame's mask source: an explicit submitted mask wins; else
+	// rasterize the implicit Tier-2-style mask from the Local2D layer rects
+	// (Q3 — M=0 inside the rect union, M=1 elsewhere).
+	ID3D11ShaderResourceView *mask_srv = nullptr;
+	if (have_explicit) {
+		mask_srv = mask->staged_srv;
+	} else {
+		struct xrt_rect rects[XRT_MAX_LAYERS];
+		uint32_t rect_count = 0;
+		for (uint32_t i = 0; i < c->layer_accum.layer_count && rect_count < XRT_MAX_LAYERS; i++) {
+			if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
+				rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
+			}
 		}
+		mask_srv = d3d11_update_implicit_mask(c, rects, rect_count, region_w, region_h);
+	}
+	if (mask_srv == nullptr) {
 		return false;
 	}
 
-	// Window-sized scratches (the shader samples uv [0,1] over the window
-	// region, so inputs must carry exactly that region).
-	if (!d3d11_ensure_srv_scratch(c, &c->surround_scratch, &c->surround_scratch_srv, region_w, region_h,
-	                              sd.Format, "zone_mask surround")) {
-		return false;
-	}
-	if (!d3d11_ensure_srv_scratch(c, &c->weave_scratch, &c->weave_scratch_srv, region_w, region_h, dd.Format,
-	                              "zone_mask weave")) {
-		return false;
-	}
+	// Resolve the `twod` source + a window-sized weave snapshot scratch.
+	ID3D11ShaderResourceView *twod_srv = nullptr;
+	if (have_local_2d) {
+		// #439 Phase 3: flatten the Local2D layers into a runtime-owned RT
+		// scratch. The flatten write, the weave snapshot, and the lerp all
+		// operate on plain UNORM bytes (sRGB-passthrough), so both scratches
+		// use the UNORM sibling of the dst format — no implicit gamma. Layers
+		// SUPERSEDE any registered surround for this frame.
+		DXGI_FORMAT unorm_fmt = d3d_dxgi_format_srgb_to_unorm(dd.Format);
+		if (!d3d11_ensure_rt_srv_scratch(c, &c->local2d_scratch, &c->local2d_scratch_srv,
+		                                 &c->local2d_scratch_rtv, region_w, region_h, unorm_fmt,
+		                                 "local2d scratch")) {
+			return false;
+		}
+		if (!d3d11_ensure_srv_scratch(c, &c->weave_scratch, &c->weave_scratch_srv, region_w, region_h,
+		                              unorm_fmt, "local2d weave")) {
+			return false;
+		}
+		if (!d3d11_flatten_local_2d_layers(c, region_w, region_h)) {
+			return false;
+		}
+		twod_srv = c->local2d_scratch_srv;
+	} else {
+		// Legacy `texture + mask` (impl doc §2): the registered surround
+		// supplies the 2D pixels. These guards gate ONLY this path so the
+		// behavior stays byte-identical when no Local2D layers are present.
+		if (!c->surround_2d.valid || c->surround_texture == nullptr || c->surround_mutex == nullptr) {
+			static bool no_surround_logged = false;
+			if (!no_surround_logged) {
+				U_LOG_W("D3D11 zone mask: no 2D surround registered — mask ignored "
+				        "(Phase 1 needs xrSetSharedTextureSurround2DEXT for the 2D pixels)");
+				no_surround_logged = true;
+			}
+			return false;
+		}
 
-	// Copy the window region of the app surround under the keyed-mutex
-	// protocol (key 0, short timeout — skip a frame rather than stall).
-	HRESULT hr = c->surround_mutex->AcquireSync(0, 16);
-	if (FAILED(hr)) {
-		return false; // timeout/abandoned — previous frame's pixels stay.
+		// Relaxed dims contract (#464): accept a window-sized surround or the
+		// legacy display-sized one — content is top-left-anchored in both; we
+		// copy only the window region.
+		if (c->surround_2d.w < region_w || c->surround_2d.h < region_h) {
+			static bool dims_logged = false;
+			if (!dims_logged) {
+				U_LOG_W("D3D11 zone mask: surround %ux%u smaller than window region %ux%u — "
+				        "mask ignored. Re-register surround on window resize.",
+				        c->surround_2d.w, c->surround_2d.h, region_w, region_h);
+				dims_logged = true;
+			}
+			return false;
+		}
+
+		// Format contract: surround must match dst (same rule as the rect path).
+		D3D11_TEXTURE2D_DESC sd;
+		c->surround_texture->GetDesc(&sd);
+		if (sd.Format != dd.Format) {
+			static bool fmt_logged = false;
+			if (!fmt_logged) {
+				U_LOG_W("D3D11 zone mask: surround format %u != target format %u — mask ignored",
+				        sd.Format, dd.Format);
+				fmt_logged = true;
+			}
+			return false;
+		}
+
+		// Window-sized scratches (the shader samples uv [0,1] over the window
+		// region, so inputs must carry exactly that region).
+		if (!d3d11_ensure_srv_scratch(c, &c->surround_scratch, &c->surround_scratch_srv, region_w, region_h,
+		                              sd.Format, "zone_mask surround")) {
+			return false;
+		}
+		if (!d3d11_ensure_srv_scratch(c, &c->weave_scratch, &c->weave_scratch_srv, region_w, region_h,
+		                              dd.Format, "zone_mask weave")) {
+			return false;
+		}
+
+		// Copy the window region of the app surround under the keyed-mutex
+		// protocol (key 0, short timeout — skip a frame rather than stall).
+		HRESULT hr = c->surround_mutex->AcquireSync(0, 16);
+		if (FAILED(hr)) {
+			return false; // timeout/abandoned — previous frame's pixels stay.
+		}
+		D3D11_BOX sbox = {0, 0, 0, region_w, region_h, 1};
+		c->context->CopySubresourceRegion(c->surround_scratch, 0, 0, 0, 0, c->surround_texture, 0, &sbox);
+		c->surround_mutex->ReleaseSync(0);
+		twod_srv = c->surround_scratch_srv;
 	}
-	D3D11_BOX sbox = {0, 0, 0, region_w, region_h, 1};
-	c->context->CopySubresourceRegion(c->surround_scratch, 0, 0, 0, 0, c->surround_texture, 0, &sbox);
-	c->surround_mutex->ReleaseSync(0);
 
 	// Snapshot the window region of the weave (the DP wrote dst; RT≠SRV, so
 	// the lerp reads this copy — impl doc §3 step 2).
+	D3D11_BOX sbox = {0, 0, 0, region_w, region_h, 1};
 	c->context->CopySubresourceRegion(c->weave_scratch, 0, 0, 0, 0, dst, 0, &sbox);
 
 	// Effective canvas rect clamped to the window region (the shader ignores
@@ -3069,8 +3514,8 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	uint32_t cbottom = (cy_u + ch > region_h) ? region_h : cy_u + ch;
 
 	xrt_result_t xret = comp_d3d11_renderer_composite_2d_masked(
-	    c->renderer, dst, c->surround_scratch_srv, mask->staged_srv, c->weave_scratch_srv, region_w, region_h,
-	    (int32_t)cx_u, (int32_t)cy_u, cright - cx_u, cbottom - cy_u);
+	    c->renderer, dst, twod_srv, mask_srv, c->weave_scratch_srv, region_w, region_h, (int32_t)cx_u,
+	    (int32_t)cy_u, cright - cx_u, cbottom - cy_u);
 	return xret == XRT_SUCCESS;
 }
 
@@ -3334,6 +3779,31 @@ comp_d3d11_compositor_zone_get_hw_caps(struct xrt_compositor *xc,
 	if (out_grid_h != nullptr) {
 		*out_grid_h = c->zone_dp_caps.zone_grid_height;
 	}
+	return true;
+}
+
+// #439 Phase 3 Q4 — current recommended per-view render size. The renderer's
+// view dims are recomputed each frame from the effective canvas (window rect
+// while a mask/Local2D is active, canvas otherwise — see layer_commit's
+// u_tiling_compute_canvas_view + resize), so this reflects the renegotiated
+// size and oxr fires XrEventDataLocal3DZoneViewSizeChangedEXT when it changes.
+extern "C" bool
+comp_d3d11_compositor_get_recommended_view_size(struct xrt_compositor *xc, uint32_t *out_w, uint32_t *out_h)
+{
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+	std::lock_guard<std::mutex> lock(c->mutex);
+
+	if (out_w == nullptr || out_h == nullptr || c->renderer == nullptr) {
+		return false;
+	}
+	uint32_t vw = 0;
+	uint32_t vh = 0;
+	comp_d3d11_renderer_get_view_dimensions(c->renderer, &vw, &vh);
+	if (vw == 0 || vh == 0) {
+		return false;
+	}
+	*out_w = vw;
+	*out_h = vh;
 	return true;
 }
 

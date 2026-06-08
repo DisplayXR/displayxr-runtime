@@ -290,6 +290,34 @@ comp_d3d11_renderer_composite_2d_masked(struct comp_d3d11_renderer *renderer,
                                         uint32_t ch);
 
 /*!
+ * Flatten one app Local2D layer image into the runtime 2D scratch (#439
+ * Phase 3). Draws a textured quad restricted to @p dst_x,dst_y,dst_w,dst_h
+ * (the clipped dest sub-rect, window px) into @p scratch_rtv, sampling
+ * @p src_srv over the normalized source rect @p src_x,src_y,src_w,src_h
+ * (the caller bakes the dest-clip fractions, the layer's norm_rect, and
+ * flip_y — a negative @p src_h — into it). The caller clears the scratch
+ * transparent once before the layer loop and submits layers in list order;
+ * @p unpremultiplied selects straight-alpha over (vs premultiplied over).
+ *
+ * @return XRT_SUCCESS on success, error code otherwise.
+ *
+ * @ingroup comp_d3d11
+ */
+xrt_result_t
+comp_d3d11_renderer_flatten_local_2d(struct comp_d3d11_renderer *renderer,
+                                     void *scratch_rtv,
+                                     void *src_srv,
+                                     int32_t dst_x,
+                                     int32_t dst_y,
+                                     uint32_t dst_w,
+                                     uint32_t dst_h,
+                                     float src_x,
+                                     float src_y,
+                                     float src_w,
+                                     float src_h,
+                                     bool unpremultiplied);
+
+/*!
  * Blit the atlas texture to a back buffer with GPU stretching.
  *
  * Used for mono/2D fallback when the atlas texture is smaller than
