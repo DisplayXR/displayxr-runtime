@@ -11,6 +11,9 @@
 
 bool g_hasViewRigExt = false;
 
+// #439 Phase 3 — XR_EXT_local_3d_zone harness (see xr_session.h).
+ZoneMaskHarness g_zone;
+
 #define XR_CHECK(call) \
     do { \
         XrResult result = (call); \
@@ -89,6 +92,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
             g_hasViewRigExt = true;
         }
+        if (strcmp(ext.extensionName, XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) {
+            g_zone.available = true;
+        }
     }
 
     LOG_INFO("XR_KHR_D3D12_enable: %s", hasD3D12 ? "AVAILABLE" : "NOT FOUND");
@@ -96,6 +102,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_EXT_display_info: %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_mcp_tools: %s", xr.hasMcpToolsExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_view_rig: %s", g_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_EXT_local_3d_zone: %s", g_zone.available ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasD3D12) {
         LOG_ERROR("XR_KHR_D3D12_enable extension not available - cannot continue");
@@ -118,6 +125,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (g_hasViewRigExt) {
         enabledExtensions.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
+    }
+    if (g_zone.available) {
+        enabledExtensions.push_back(XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME);
     }
 
     LOG_INFO("Enabling %zu extensions", enabledExtensions.size());
@@ -271,6 +281,23 @@ bool CreateSession(XrSessionManager& xr, ID3D12Device* device, ID3D12CommandQueu
     LOG_INFO("Calling xrCreateSession...");
     XR_CHECK_LOG(xrCreateSession(xr.instance, &sessionInfo, &xr.session));
     LOG_INFO("Session created: 0x%p", (void*)xr.session);
+
+    // #439 Phase 3 — XR_EXT_local_3d_zone entry points (app-local harness; the
+    // handle-app panel modes use the explicit Tier-2 island mask for case 2).
+    if (g_zone.available) {
+        xrGetInstanceProcAddr(xr.instance, "xrCreateLocal3DZoneMaskEXT",
+            (PFN_xrVoidFunction*)&g_zone.pfnCreate);
+        xrGetInstanceProcAddr(xr.instance, "xrSetLocal3DZoneFromRectsEXT",
+            (PFN_xrVoidFunction*)&g_zone.pfnSetRects);
+        xrGetInstanceProcAddr(xr.instance, "xrSubmitLocal3DZoneEXT",
+            (PFN_xrVoidFunction*)&g_zone.pfnSubmit);
+        xrGetInstanceProcAddr(xr.instance, "xrDestroyLocal3DZoneMaskEXT",
+            (PFN_xrVoidFunction*)&g_zone.pfnDestroy);
+        if (!g_zone.pfnCreate || !g_zone.pfnSetRects || !g_zone.pfnSubmit || !g_zone.pfnDestroy) {
+            LOG_WARN("XR_EXT_local_3d_zone advertised but entry points missing — harness disabled");
+            g_zone.available = false;
+        }
+    }
 
     // XR_EXT_mcp_tools (#457): declare identity + register agent tools. The
     // appId MUST match `id` in displayxr/cube_handle_d3d12_win.displayxr.json
