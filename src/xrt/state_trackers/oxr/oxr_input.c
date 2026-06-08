@@ -1050,9 +1050,16 @@ oxr_input_combine_input(struct oxr_session *sess,
 			continue;
 		}
 
+		// XR_EXT_conformance_automation: the CTS may have injected a
+		// synthetic value for this bound source. Returns false (no copy)
+		// when the extension is disabled, so non-CTS sessions pay one bool.
+		union xrt_input_value eff_value = input->value;
+		int64_t eff_timestamp = input->timestamp;
+		oxr_conformance_lookup_value(sess, action_input->bound_path, &eff_value, &eff_timestamp);
+
 		struct oxr_input_value_tagged raw_input = {
 		    .type = XRT_GET_INPUT_TYPE(input->name),
-		    .value = input->value,
+		    .value = eff_value,
 		};
 
 		struct oxr_input_value_tagged transformed = {0};
@@ -1075,18 +1082,18 @@ oxr_input_combine_input(struct oxr_session *sess,
 			 * OR. The action only changes to true on the earliest
 			 * input that sets it to true, and to false on the
 			 * latest input that is false. */
-			if (res.value.boolean && transformed.value.boolean && input->timestamp < res_timestamp) {
-				res_timestamp = input->timestamp;
+			if (res.value.boolean && transformed.value.boolean && eff_timestamp < res_timestamp) {
+				res_timestamp = eff_timestamp;
 			} else if (!res.value.boolean && !transformed.value.boolean &&
-			           input->timestamp > res_timestamp) {
-				res_timestamp = input->timestamp;
+			           eff_timestamp > res_timestamp) {
+				res_timestamp = eff_timestamp;
 			}
 			break;
 		case XRT_INPUT_TYPE_VEC1_MINUS_ONE_TO_ONE:
 		case XRT_INPUT_TYPE_VEC1_ZERO_TO_ONE:
 			if (fabsf(transformed.value.vec1.x) > fabsf(res.value.vec1.x)) {
 				res.value.vec1.x = transformed.value.vec1.x;
-				res_timestamp = input->timestamp;
+				res_timestamp = eff_timestamp;
 			}
 			break;
 		case XRT_INPUT_TYPE_VEC2_MINUS_ONE_TO_ONE: {
@@ -1095,7 +1102,7 @@ oxr_input_combine_input(struct oxr_session *sess,
 			                 transformed.value.vec2.y * transformed.value.vec2.y;
 			if (trans_sq > res_sq) {
 				res.value.vec2 = transformed.value.vec2;
-				res_timestamp = input->timestamp;
+				res_timestamp = eff_timestamp;
 			}
 		} break;
 		case XRT_INPUT_TYPE_VEC3_MINUS_ONE_TO_ONE:

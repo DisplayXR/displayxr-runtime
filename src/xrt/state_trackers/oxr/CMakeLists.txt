@@ -10,6 +10,7 @@ add_subdirectory(oxr_bindings)
 add_library(
 	st_oxr STATIC
 	oxr_api_action.c
+	oxr_api_conformance.c
 	oxr_api_funcs.h
 	oxr_api_instance.c
 	oxr_api_negotiate.c
@@ -21,6 +22,7 @@ add_library(
 	oxr_api_xdev.c
 	oxr_binding.c
 	oxr_capture.c
+	oxr_conformance.c
 	oxr_chain.h
 	oxr_dpad.c
 	oxr_event.c

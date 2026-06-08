@@ -500,6 +500,25 @@ oxr_space_locate(
 		    &result);                    //
 	}
 
+	/*
+	 * XR_EXT_conformance_automation: if the CTS injected a synthetic pose for
+	 * this action space's bound source, it replaces the located relation.
+	 * No-op when the extension is disabled (lookup returns false). The pose is
+	 * applied in the base-space frame — resolving it through the XrSpace the
+	 * CTS supplied is a refinement to validate against CTS on Windows.
+	 */
+	if (spc->space_type == OXR_SPACE_TYPE_ACTION) {
+		struct oxr_action_input *pose_input = NULL;
+		if (oxr_action_get_pose_input(spc->sess, spc->act_key, &spc->subaction_paths, &pose_input) ==
+		        XR_SUCCESS &&
+		    pose_input != NULL) {
+			struct xrt_space_relation override_relation = XRT_SPACE_RELATION_ZERO;
+			if (oxr_conformance_lookup_pose(spc->sess, pose_input->bound_path, &override_relation)) {
+				result = override_relation;
+			}
+		}
+	}
+
 
 	/*
 	 * Validate results
