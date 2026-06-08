@@ -48,13 +48,18 @@
 #include "metal/comp_metal_compositor.h"
 #endif
 
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+#include "gl/comp_gl_compositor.h"
+#endif
+
 #ifdef OXR_HAVE_EXT_local_3d_zone
 
-//! D3D11/D3D12/VK max texture dimension — bounds the authored mask size.
+//! D3D11/D3D12/VK/GL max texture dimension — bounds the authored mask size.
 #define OXR_LOCAL_3D_ZONE_MAX_MASK_DIM 16384
 
 #if defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR) || defined(XRT_HAVE_D3D12_NATIVE_COMPOSITOR) ||                          \
-    defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) || defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR)
+    defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) || defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR) ||                            \
+    defined(XRT_HAVE_GL_NATIVE_COMPOSITOR)
 #define OXR_LOCAL_3D_ZONE_HAVE_ANY_COMPOSITOR
 #endif
 
@@ -111,6 +116,11 @@ oxr_local_3d_zone_destroy_cb(struct oxr_logger *log, struct oxr_handle_base *hb)
 #ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
 		if (sess->is_metal_native_compositor) {
 			comp_metal_compositor_zone_mask_destroy(&sess->xcn->base, zone->comp_mask);
+		}
+#endif
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+		if (sess->is_gl_native_compositor) {
+			comp_gl_compositor_zone_mask_destroy(&sess->xcn->base, zone->comp_mask);
 		}
 #endif
 	}
@@ -202,6 +212,18 @@ oxr_xrGetLocal3DZoneCapabilitiesEXT(XrSession session, XrLocal3DZoneCapabilities
 	}
 #endif
 
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+	if (sess->is_gl_native_compositor && sess->xcn != NULL) {
+		// #439 Phase 3 GL consumer — Tier 1/2 authored masks + Local2D layers
+		// (compositor-side composite; Tier 3 unimplemented on GL).
+		capabilities->supported = XR_TRUE;
+		capabilities->hardwareZoneGridWidth = 0;
+		capabilities->hardwareZoneGridHeight = 0;
+		capabilities->maxMaskWidth = OXR_LOCAL_3D_ZONE_MAX_MASK_DIM;
+		capabilities->maxMaskHeight = OXR_LOCAL_3D_ZONE_MAX_MASK_DIM;
+	}
+#endif
+
 	return XR_SUCCESS;
 }
 
@@ -240,6 +262,9 @@ oxr_xrCreateLocal3DZoneMaskEXT(XrSession session,
 #ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
 		api_matched = api_matched || sess->is_metal_native_compositor;
 #endif
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+		api_matched = api_matched || sess->is_gl_native_compositor;
+#endif
 	}
 	if (api_matched) {
 		struct oxr_local_3d_zone_ext *zone = NULL;
@@ -274,6 +299,12 @@ oxr_xrCreateLocal3DZoneMaskEXT(XrSession session,
 		if (sess->is_metal_native_compositor) {
 			xret = comp_metal_compositor_zone_mask_create(&sess->xcn->base, zone->width, zone->height,
 			                                              &zone->comp_mask);
+		}
+#endif
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+		if (sess->is_gl_native_compositor) {
+			xret = comp_gl_compositor_zone_mask_create(&sess->xcn->base, zone->width, zone->height,
+			                                           &zone->comp_mask);
 		}
 #endif
 		if (xret != XRT_SUCCESS) {
@@ -331,6 +362,14 @@ oxr_xrSetLocal3DZoneWholeWindowEXT(XrLocal3DZoneMaskEXT mask, XrBool32 enable3D)
 		if (sess->is_metal_native_compositor) {
 			return zone_mask_xret_to_xr(&log,
 			                            comp_metal_compositor_zone_mask_set_whole(
+			                                &sess->xcn->base, zone->comp_mask, enable3D == XR_TRUE),
+			                            "xrSetLocal3DZoneWholeWindowEXT");
+		}
+#endif
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+		if (sess->is_gl_native_compositor) {
+			return zone_mask_xret_to_xr(&log,
+			                            comp_gl_compositor_zone_mask_set_whole(
 			                                &sess->xcn->base, zone->comp_mask, enable3D == XR_TRUE),
 			                            "xrSetLocal3DZoneWholeWindowEXT");
 		}
@@ -399,6 +438,13 @@ oxr_xrSetLocal3DZoneFromRectsEXT(XrLocal3DZoneMaskEXT mask, uint32_t rectCount, 
 		if (!api_matched && sess->is_metal_native_compositor) {
 			xret = comp_metal_compositor_zone_mask_set_rects(&sess->xcn->base, zone->comp_mask, rectCount,
 			                                                 xrects);
+			api_matched = true;
+		}
+#endif
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+		if (!api_matched && sess->is_gl_native_compositor) {
+			xret = comp_gl_compositor_zone_mask_set_rects(&sess->xcn->base, zone->comp_mask, rectCount,
+			                                              xrects);
 			api_matched = true;
 		}
 #endif
@@ -510,6 +556,14 @@ oxr_xrAcquireLocal3DZoneRenderTargetEXT(XrLocal3DZoneMaskEXT mask, void *binding
 	}
 #endif
 
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+	if (sess->is_gl_native_compositor) {
+		// GL Phase-3 consumer is Tier 1/2 only — author via set_whole/set_rects.
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "Tier-3 freeform masks are not available on GL (use Tier 1/2)");
+	}
+#endif
+
 	return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
 	                 "Local 3D zone masks are not supported for this compositor");
 }
@@ -551,6 +605,13 @@ oxr_xrSubmitLocal3DZoneEXT(XrLocal3DZoneMaskEXT mask)
 		if (sess->is_metal_native_compositor) {
 			return zone_mask_xret_to_xr(
 			    &log, comp_metal_compositor_zone_mask_submit(&sess->xcn->base, zone->comp_mask),
+			    "xrSubmitLocal3DZoneEXT");
+		}
+#endif
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+		if (sess->is_gl_native_compositor) {
+			return zone_mask_xret_to_xr(
+			    &log, comp_gl_compositor_zone_mask_submit(&sess->xcn->base, zone->comp_mask),
 			    "xrSubmitLocal3DZoneEXT");
 		}
 #endif

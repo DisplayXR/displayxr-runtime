@@ -52,6 +52,10 @@
 #include "vk_native/comp_vk_native_compositor.h"
 #endif
 
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+#include "gl/comp_gl_compositor.h"
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -2165,6 +2169,12 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 		if (sess->is_vk_native_compositor) {
 			have_dims =
 			    comp_vk_native_compositor_get_recommended_view_size(&sess->xcn->base, &view_w, &view_h);
+		}
+#endif
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+		if (sess->is_gl_native_compositor) {
+			have_dims =
+			    comp_gl_compositor_get_recommended_view_size(&sess->xcn->base, &view_w, &view_h);
 		}
 #endif
 		if (have_dims && view_w > 0 && view_h > 0) {

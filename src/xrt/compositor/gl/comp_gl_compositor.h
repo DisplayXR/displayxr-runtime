@@ -15,6 +15,7 @@
 
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_display_metrics.h"
+#include "xrt/xrt_defines.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -23,6 +24,7 @@ extern "C" {
 struct xrt_device;
 struct xrt_system_devices;
 struct xrt_system_compositor_info;
+struct xrt_rect;
 
 /*!
  * Create a native OpenGL compositor.
@@ -146,6 +148,39 @@ comp_gl_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 bool
 comp_gl_compositor_get_window_metrics(struct xrt_compositor *xc,
                                       struct xrt_window_metrics *out_metrics);
+
+/*!
+ * @name #439 Phase 3 — XR_EXT_local_3d_zone authored-mask API (GL leg).
+ * GL R8 mask textures; Tier 1/2 only (acquire_rt returns NOT_IMPLEMENTED).
+ * @{
+ * @ingroup comp_gl
+ */
+xrt_result_t
+comp_gl_compositor_zone_mask_create(struct xrt_compositor *xc, uint32_t w, uint32_t h, void **out_mask);
+xrt_result_t
+comp_gl_compositor_zone_mask_set_whole(struct xrt_compositor *xc, void *mask, bool enable_3d);
+xrt_result_t
+comp_gl_compositor_zone_mask_set_rects(struct xrt_compositor *xc,
+                                       void *mask,
+                                       uint32_t count,
+                                       const struct xrt_rect *rects);
+xrt_result_t
+comp_gl_compositor_zone_mask_acquire_rt(
+    struct xrt_compositor *xc, void *mask, void **out_texture, uint32_t *out_w, uint32_t *out_h);
+xrt_result_t
+comp_gl_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask);
+void
+comp_gl_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask);
+/*! @} */
+
+/*!
+ * Current recommended per-view render size (#439 Phase 3 Q4). Returns false if
+ * unavailable.
+ *
+ * @ingroup comp_gl
+ */
+bool
+comp_gl_compositor_get_recommended_view_size(struct xrt_compositor *xc, uint32_t *out_w, uint32_t *out_h);
 
 #ifdef __cplusplus
 }
