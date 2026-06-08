@@ -54,12 +54,11 @@
 
 // stb_image implementation TU lives in displayxr::common (stb_image_impl_macos.cpp) — declarations only here (#396 W4).
 #include "stb_image.h"
-#include "display3d_view.h"
-#include "camera3d_view.h"
 #include "view_params.h"
 #include "xr_window_space_hud.h"
 #include "hud_renderer_macos.h"
 #include <openxr/XR_EXT_display_info.h>
+#include <openxr/XR_EXT_view_rig.h>
 
 // ============================================================================
 // Logging
@@ -184,12 +183,19 @@ static void quat_rotate_vec3(XrQuaternionf q, float vx, float vy, float vz,
     *oz = vz + q.w * tz + (q.x * ty - q.y * tx);
 }
 
-// Convert display3d/camera3d projection (OpenGL z[-1,1]) to Metal z[0,1]
-static void convert_projection_gl_to_metal(float m[16]) {
-    m[2]  = 0.5f * m[2]  + 0.5f * m[3];
-    m[6]  = 0.5f * m[6]  + 0.5f * m[7];
-    m[10] = 0.5f * m[10] + 0.5f * m[11];
-    m[14] = 0.5f * m[14] + 0.5f * m[15];
+// Display-local eye distance for the ZDP-anchored clip (#396 W7 consume
+// path): z of (rigPose^-1 * eyeWorld). Degenerates to pose.position.z at
+// identity rig pose.
+static float RigLocalEyeZ(const XrPosef &rig, const XrVector3f &eyeWorld) {
+    XrQuaternionf inv = {-rig.orientation.x, -rig.orientation.y,
+                         -rig.orientation.z, rig.orientation.w};
+    float ox, oy, oz;
+    quat_rotate_vec3(inv,
+                     eyeWorld.x - rig.position.x,
+                     eyeWorld.y - rig.position.y,
+                     eyeWorld.z - rig.position.z,
+                     &ox, &oy, &oz);
+    return oz;
 }
 
 // ============================================================================
@@ -1520,6 +1526,7 @@ struct AppXrSession {
 
     // XR_EXT_display_info
     bool hasDisplayInfoExt;
+    bool hasViewRigExt = false;  // XR_EXT_view_rig (#396 W7)
     float displayWidthM;
     float displayHeightM;
     float nominalViewerX, nominalViewerY, nominalViewerZ;
@@ -1577,6 +1584,8 @@ static bool InitializeOpenXR(AppXrSession &app)
             app.hasCocoaWindowBinding = true;
         if (strcmp(e.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0)
             app.hasDisplayInfoExt = true;
+        if (strcmp(e.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0)
+            app.hasViewRigExt = true;
     }
 
     if (!hasMetalEnable) {
@@ -1588,6 +1597,7 @@ static bool InitializeOpenXR(AppXrSession &app)
         return false;
     }
     LOG_INFO("XR_EXT_display_info: %s", app.hasDisplayInfoExt ? "available" : "not available");
+    LOG_INFO("XR_EXT_view_rig: %s", app.hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
 
     // Enable extensions
     std::vector<const char *> enabledExts = {
@@ -1596,6 +1606,9 @@ static bool InitializeOpenXR(AppXrSession &app)
     };
     if (app.hasDisplayInfoExt) {
         enabledExts.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+    }
+    if (app.hasViewRigExt) {
+        enabledExts.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -2150,6 +2163,42 @@ int main(int argc, char **argv)
         locateInfo.displayTime = frameState.predictedDisplayTime;
         locateInfo.space = app.localSpace;
 
+        // XR_EXT_view_rig (#396 W7): drive the runtime rig matching the app's
+        // current mode (C selects the rig) with the app's tunables — the
+        // runtime owns the CANVAS sub-rect resolve and the Kooima math, and
+        // returns render-ready XrView{pose, fov}. Per-locate semantics: chain
+        // the rig on every consume locate. The raw result struct feeds the
+        // HUD's display-space eye readout.
+        const bool useRig =
+            app.hasViewRigExt && app.displayWidthM > 0 && app.displayHeightM > 0;
+        const bool rigCamera = useRig && g_input.cameraMode;
+        XrCameraRigEXT cameraRig = {XR_TYPE_CAMERA_RIG_EXT};
+        XrDisplayRigEXT displayRig = {XR_TYPE_DISPLAY_RIG_EXT};
+        XrViewDisplayRawEXT viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+        XrPosef rigPose = {{0, 0, 0, 1}, {0, 0, 0}};
+        if (useRig) {
+            quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &rigPose.orientation);
+            rigPose.position = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};
+            if (rigCamera) {
+                cameraRig.pose = rigPose;
+                cameraRig.ipdFactor = g_input.viewParams.ipdFactor;
+                cameraRig.parallaxFactor = g_input.viewParams.parallaxFactor;
+                cameraRig.convergenceDiopters = g_input.viewParams.invConvergenceDistance;
+                cameraRig.verticalFov =
+                    2.0f * atanf(CAMERA_HALF_TAN_VFOV / g_input.viewParams.zoomFactor);
+                locateInfo.next = &cameraRig;
+            } else {
+                displayRig.pose = rigPose;
+                displayRig.virtualDisplayHeight =
+                    g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
+                displayRig.ipdFactor = g_input.viewParams.ipdFactor;
+                displayRig.parallaxFactor = g_input.viewParams.parallaxFactor;
+                displayRig.perspectiveFactor = g_input.viewParams.perspectiveFactor;
+                locateInfo.next = &displayRig;
+            }
+            viewState.next = &viewRigRaw;
+        }
+
         uint32_t viewCount = 0;
         xrLocateViews(app.session, &locateInfo, &viewState, (uint32_t)views.size(), &viewCount, views.data());
 
@@ -2183,35 +2232,23 @@ int main(int argc, char **argv)
 
         // Render
         if (frameState.shouldRender && viewCount >= 1) {
-            std::vector<XrVector3f> rawEyePos(modeViewCount);
-            for (uint32_t v = 0; v < modeViewCount; v++) {
-                rawEyePos[v] = (v < viewCount) ? views[v].pose.position : views[0].pose.position;
-            }
+            // Save display-space eye positions for the HUD. Under the rig,
+            // views[] carries render-ready world eyes — the raw channel
+            // (XrViewDisplayRawEXT) keeps the HUD readout in display space.
             app.eyeCount = modeViewCount;
-            for (uint32_t v = 0; v < modeViewCount && v < 8; v++) {
-                app.eyePositions[v][0] = rawEyePos[v].x;
-                app.eyePositions[v][1] = rawEyePos[v].y;
-                app.eyePositions[v][2] = rawEyePos[v].z;
-            }
-
-            if (!display3D && modeViewCount >= 2) {
-                XrVector3f center = {0, 0, 0};
-                for (uint32_t v = 0; v < modeViewCount; v++) {
-                    center.x += rawEyePos[v].x;
-                    center.y += rawEyePos[v].y;
-                    center.z += rawEyePos[v].z;
+            if (useRig && viewRigRaw.eyeCountOutput > 0) {
+                for (uint32_t v = 0; v < viewRigRaw.eyeCountOutput && v < 8; v++) {
+                    app.eyePositions[v][0] = viewRigRaw.rawEyes[v].x;
+                    app.eyePositions[v][1] = viewRigRaw.rawEyes[v].y;
+                    app.eyePositions[v][2] = viewRigRaw.rawEyes[v].z;
                 }
-                center.x /= modeViewCount;
-                center.y /= modeViewCount;
-                center.z /= modeViewCount;
-                rawEyePos[0] = center;
+            } else {
+                for (uint32_t v = 0; v < viewCount && v < 8; v++) {
+                    app.eyePositions[v][0] = views[v].pose.position.x;
+                    app.eyePositions[v][1] = views[v].pose.position.y;
+                    app.eyePositions[v][2] = views[v].pose.position.z;
+                }
             }
-
-            XrPosef cameraPose;
-            quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &cameraPose.orientation);
-            cameraPose.position = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};
-
-            XrVector3f nominalViewer = {app.nominalViewerX, app.nominalViewerY, app.nominalViewerZ};
 
             float scaleX = (app.currentModeIndex < app.renderingModeCount)
                 ? app.renderingModeScaleX[app.currentModeIndex] : 0.5f;
@@ -2236,112 +2273,31 @@ int main(int argc, char **argv)
             g_renderW = renderW;
             g_renderH = renderH;
 
-            // Compute stereo views
-            std::vector<Display3DView> d3dViews(eyeCount);
-            bool hasKooima = (app.displayWidthM > 0 && app.displayHeightM > 0);
-            if (hasKooima) {
-                float dispPxW = app.displayPixelWidth > 0 ? (float)app.displayPixelWidth : (float)app.swapchain.width;
-                float dispPxH = app.displayPixelHeight > 0 ? (float)app.displayPixelHeight : (float)app.swapchain.height;
-                float pxSizeX = app.displayWidthM / dispPxW;
-                float pxSizeY = app.displayHeightM / dispPxH;
-                float canvasW_m = (float)g_canvasW * pxSizeX;
-                float canvasH_m = (float)g_canvasH * pxSizeY;
-
-                // Canvas-relative Kooima: physical size + eye offset both anchored
-                // on the canvas region within the window (not the window itself).
-                // The Metal view fills the window now, so derive the canvas rect
-                // logically (top-down backing px) and convert to AppKit's
-                // bottom-up point space for the screen conversion.
-                float eyeOffsetX = 0.0f, eyeOffsetY = 0.0f;
-                if (g_window != nil && g_metalView != nil) {
-                    NSScreen *screen_ns = [g_window screen] ?: [NSScreen mainScreen];
-                    NSRect screenFrame = [screen_ns frame];
-                    int32_t ccx, ccy;
-                    uint32_t ccw, cch;
-                    ComputeCanvasRectPx(&ccx, &ccy, &ccw, &cch);
-                    CGFloat cbs = [g_window backingScaleFactor];
-                    NSView *content = [g_window contentView];
-                    NSSize winPts = [content bounds].size;
-                    NSRect canvasInContent = NSMakeRect(
-                        (CGFloat)ccx / cbs,
-                        winPts.height - (CGFloat)(ccy + (int32_t)cch) / cbs, // top-down -> bottom-up
-                        (CGFloat)ccw / cbs,
-                        (CGFloat)cch / cbs);
-                    NSRect canvasInWindow = [content convertRect:canvasInContent toView:nil];
-                    NSRect canvasInScreen = [g_window convertRectToScreen:canvasInWindow];
-                    float canvasCenterX = (canvasInScreen.origin.x - screenFrame.origin.x) + canvasInScreen.size.width / 2.0f;
-                    float canvasCenterY = (canvasInScreen.origin.y - screenFrame.origin.y) + canvasInScreen.size.height / 2.0f;
-                    float dispCenterX = screenFrame.size.width / 2.0f;
-                    float dispCenterY = screenFrame.size.height / 2.0f;
-                    CGFloat backingScale = [g_window backingScaleFactor];
-                    float pxSizeXBacking = pxSizeX / (float)backingScale;
-                    float pxSizeYBacking = pxSizeY / (float)backingScale;
-                    eyeOffsetX = (canvasCenterX - dispCenterX) * pxSizeXBacking;
-                    eyeOffsetY = (canvasCenterY - dispCenterY) * pxSizeYBacking;
-                }
-
-                // Apply canvas-center offset to raw eye positions
-                for (uint32_t v = 0; v < modeViewCount; v++) {
-                    rawEyePos[v].x -= eyeOffsetX;
-                    rawEyePos[v].y -= eyeOffsetY;
-                }
-
-                Display3DScreen screen;
-                screen.width_m = canvasW_m;
-                screen.height_m = canvasH_m;
-
-                if (g_input.cameraMode) {
-                    Camera3DTunables camTunables;
-                    camTunables.ipd_factor = g_input.viewParams.ipdFactor;
-                    camTunables.parallax_factor = g_input.viewParams.parallaxFactor;
-                    camTunables.inv_convergence_distance = g_input.viewParams.invConvergenceDistance;
-                    camTunables.half_tan_vfov = CAMERA_HALF_TAN_VFOV / g_input.viewParams.zoomFactor;
-
-                    std::vector<Camera3DView> camViews(eyeCount);
-                    camera3d_compute_views(
-                        rawEyePos.data(), eyeCount, &nominalViewer,
-                        &screen, &camTunables, &cameraPose,
-                        0.01f, 100.0f, camViews.data());
-
-                    for (int i = 0; i < eyeCount; i++) {
-                        memcpy(d3dViews[i].view_matrix, camViews[i].view_matrix, sizeof(float) * 16);
-                        memcpy(d3dViews[i].projection_matrix, camViews[i].projection_matrix, sizeof(float) * 16);
-                        d3dViews[i].fov = camViews[i].fov;
-                        d3dViews[i].eye_world = camViews[i].eye_world;
-                    }
-                } else {
-                    Display3DTunables tunables;
-                    tunables.ipd_factor = g_input.viewParams.ipdFactor;
-                    tunables.parallax_factor = g_input.viewParams.parallaxFactor;
-                    tunables.perspective_factor = g_input.viewParams.perspectiveFactor;
-                    tunables.virtual_display_height = g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
-
-                    display3d_compute_views(
-                        rawEyePos.data(), eyeCount, &nominalViewer,
-                        &screen, &tunables, &cameraPose,
-                        tunables.virtual_display_height, 1000.0f * tunables.virtual_display_height, /*vulkan_flip_y=*/0, d3dViews.data());
-                }
-
-                for (int i = 0; i < eyeCount; i++) {
-                    convert_projection_gl_to_metal(d3dViews[i].projection_matrix);
-                }
-            }
+            // --- Consume the runtime's render-ready XrView{pose, fov} ---
+            // (#396 W7) The runtime resolves the CANVAS sub-rect itself
+            // (get_window_metrics + u_canvas_apply_to_metrics), so the app
+            // keeps zero canvas geometry for view generation. Only clip
+            // policy stays app-side, by design (fov is clip-independent).
+            // Camera rig: same absolute clip as the old app-side camera
+            // path. Display rig: ZDP-anchored clip (near = ez - vH, far =
+            // ez + 1000·vH; ez = rig-local z of the view pose).
+            // mat4_from_xr_fov is Metal [0,1]-native — no remap.
+            const float rigVH =
+                g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
 
             rendered = true;
             std::vector<EyeRenderParams> eyeParams(eyeCount);
             for (int eye = 0; eye < eyeCount; eye++) {
                 int viewIdx = eye < (int)viewCount ? eye : 0;
                 XrFovf submitFov = views[viewIdx].fov;
-                if (hasKooima) {
-                    memcpy(eyeParams[eye].viewMat, d3dViews[eye].view_matrix, sizeof(float) * 16);
-                    memcpy(eyeParams[eye].projMat, d3dViews[eye].projection_matrix, sizeof(float) * 16);
-                    submitFov = d3dViews[eye].fov;
-                    views[viewIdx].pose.position = d3dViews[eye].eye_world;
-                    views[viewIdx].pose.orientation = cameraPose.orientation;
-                } else {
-                    mat4_view_from_xr_pose(eyeParams[eye].viewMat, views[viewIdx].pose);
-                    mat4_from_xr_fov(eyeParams[eye].projMat, views[viewIdx].fov, 0.01f, 100.0f);
+                float nearZ = 0.01f, farZ = 100.0f;
+                if (useRig && !rigCamera) {
+                    float ez = RigLocalEyeZ(rigPose, views[viewIdx].pose.position);
+                    nearZ = (ez - rigVH > 0.001f) ? (ez - rigVH) : 0.001f;
+                    farZ = ez + 1000.0f * rigVH;
                 }
+                mat4_view_from_xr_pose(eyeParams[eye].viewMat, views[viewIdx].pose);
+                mat4_from_xr_fov(eyeParams[eye].projMat, views[viewIdx].fov, nearZ, farZ);
 
                 uint32_t tileX = display3D ? (eye % tileColumns) : 0;
                 uint32_t tileY = display3D ? (eye / tileColumns) : 0;

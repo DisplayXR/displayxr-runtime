@@ -9,6 +9,8 @@
 #include "logging.h"
 #include <cstring>
 
+bool g_hasViewRigExt = false;
+
 #define XR_CHECK(call) \
     do { \
         XrResult result = (call); \
@@ -87,12 +89,16 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_EXT_MCP_TOOLS_EXTENSION_NAME) == 0) {
             xr.hasMcpToolsExt = true;
         }
+        if (strcmp(ext.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
+            g_hasViewRigExt = true;
+        }
     }
 
     LOG_INFO("XR_KHR_opengl_enable: %s", hasOpenGL ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_win32_window_binding: %s", xr.hasWin32WindowBindingExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_display_info: %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_mcp_tools: %s", xr.hasMcpToolsExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_EXT_view_rig: %s", g_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasOpenGL) {
         LOG_ERROR("XR_KHR_opengl_enable extension not available");
@@ -112,6 +118,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (xr.hasMcpToolsExt) {
         enabledExtensions.push_back(XR_EXT_MCP_TOOLS_EXTENSION_NAME);
+    }
+    if (g_hasViewRigExt) {
+        enabledExtensions.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};

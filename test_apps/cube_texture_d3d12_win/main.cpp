@@ -30,9 +30,7 @@
 #include "hud_renderer.h"
 #include "text_overlay.h"
 #include "xr_session.h"
-#include "display3d_view.h"
 #include "projection_depth.h"
-#include "camera3d_view.h"
 
 #include <chrono>
 #include <cmath>
@@ -65,6 +63,77 @@ static const float HUD_WIDTH_FRACTION = 0.30f;
 static bool g_fullscreen = false;
 static RECT g_savedWindowRect = {};
 static DWORD g_savedWindowStyle = 0;
+
+// XR_EXT_view_rig (#396 W7 dogfood): the app chains a rig descriptor
+// (XrDisplayRigEXT, or XrCameraRigEXT in camera mode) on every xrLocateViews
+// and consumes the runtime's render-ready XrView{pose, fov} directly — the
+// per-frame Kooima generation is deleted; only clip policy stays app-side.
+// The runtime resolves the CANVAS sub-rect itself (the d3d12 compositor
+// delegates window metrics to the DP). Per-view staging container (matrices
+// column-major):
+struct RigView {
+    float view_matrix[16];
+    float projection_matrix[16];
+    XrFovf fov;
+};
+
+// Column-major view matrix from a render-ready XrView pose:
+// viewMatrix = R^T * translate(-position) — same construction as the
+// displayxr::math rigs.
+static void ViewMatrixFromXrPose(const XrPosef& pose, float* out) {
+    const float qx = pose.orientation.x, qy = pose.orientation.y;
+    const float qz = pose.orientation.z, qw = pose.orientation.w;
+    float rot[16] = {};
+    rot[0] = 1.0f - 2.0f * (qy * qy + qz * qz);
+    rot[1] = 2.0f * (qx * qy + qz * qw);
+    rot[2] = 2.0f * (qx * qz - qy * qw);
+    rot[4] = 2.0f * (qx * qy - qz * qw);
+    rot[5] = 1.0f - 2.0f * (qx * qx + qz * qz);
+    rot[6] = 2.0f * (qy * qz + qx * qw);
+    rot[8] = 2.0f * (qx * qz + qy * qw);
+    rot[9] = 2.0f * (qy * qz - qx * qw);
+    rot[10] = 1.0f - 2.0f * (qx * qx + qy * qy);
+    rot[15] = 1.0f;
+    for (int i = 0; i < 16; i++) out[i] = 0.0f;
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            out[j * 4 + i] = rot[i * 4 + j]; // R^T
+    out[15] = 1.0f;
+    out[12] = -(out[0] * pose.position.x + out[4] * pose.position.y + out[8] * pose.position.z);
+    out[13] = -(out[1] * pose.position.x + out[5] * pose.position.y + out[9] * pose.position.z);
+    out[14] = -(out[2] * pose.position.x + out[6] * pose.position.y + out[10] * pose.position.z);
+}
+
+// Column-major GL ([-1,1] clip-z) off-axis projection from a render-ready
+// XrView fov + the app's own clip policy (fov is clip-independent). Pair with
+// convert_projection_gl_to_zero_to_one() for D3D.
+static void ProjectionFromXrFov(const XrFovf& fov, float nearZ, float farZ, float* out) {
+    const float l = tanf(fov.angleLeft) * nearZ;
+    const float r = tanf(fov.angleRight) * nearZ;
+    const float b = tanf(fov.angleDown) * nearZ;
+    const float t = tanf(fov.angleUp) * nearZ;
+    for (int i = 0; i < 16; i++) out[i] = 0.0f;
+    out[0] = 2.0f * nearZ / (r - l);
+    out[5] = 2.0f * nearZ / (t - b);
+    out[8] = (r + l) / (r - l);
+    out[9] = (t + b) / (t - b);
+    out[10] = -(farZ + nearZ) / (farZ - nearZ);
+    out[11] = -1.0f;
+    out[14] = -2.0f * farZ * nearZ / (farZ - nearZ);
+}
+
+// Display-local eye distance for the ZDP-anchored clip: z of (rigPose^-1 *
+// eyeWorld). Degenerates to pose.position.z at identity rig pose.
+static float RigLocalEyeZ(const XrPosef& rig, const XrVector3f& eyeWorld) {
+    const float dx = eyeWorld.x - rig.position.x;
+    const float dy = eyeWorld.y - rig.position.y;
+    const float dz = eyeWorld.z - rig.position.z;
+    const float qx = -rig.orientation.x, qy = -rig.orientation.y;
+    const float qz = -rig.orientation.z, qw = rig.orientation.w;
+    const float cx = qy * dz - qz * dy + qw * dx;
+    const float cy = qz * dx - qx * dz + qw * dy;
+    return dz + 2.0f * (qx * cy - qy * cx);
+}
 
 // Shared texture resources (D3D12)
 static ComPtr<ID3D12Resource> g_sharedTexture;
@@ -1126,6 +1195,45 @@ static void RenderOneFrame(RenderState& rs) {
                     uint32_t viewCount = 0;
                     XrView rawViews[8] = {};
                     for (int i = 0; i < 8; i++) rawViews[i].type = XR_TYPE_VIEW;
+
+                    // XR_EXT_view_rig (#396 W7): drive the runtime rig matching
+                    // the app's current mode (C selects the rig) with the app's
+                    // tunables — the runtime owns the canvas resolve and the
+                    // Kooima math, and returns render-ready XrView{pose, fov}.
+                    // Per-locate semantics: chain the rig on every consume
+                    // locate.
+                    const bool useAppProjection =
+                        xr.hasDisplayInfoExt && xr.displayWidthM > 0.0f && g_hasViewRigExt;
+                    const bool rigCamera = useAppProjection && g_inputState.cameraMode;
+                    XrCameraRigEXT cameraRig = {XR_TYPE_CAMERA_RIG_EXT};
+                    XrDisplayRigEXT displayRig = {XR_TYPE_DISPLAY_RIG_EXT};
+                    XrPosef rigPose = {{0, 0, 0, 1}, {0, 0, 0}};
+                    if (useAppProjection) {
+                        XMVECTOR rigOri = XMQuaternionRotationRollPitchYaw(
+                            g_inputState.pitch, g_inputState.yaw, 0);
+                        XMFLOAT4 rq;
+                        XMStoreFloat4(&rq, rigOri);
+                        rigPose.orientation = {rq.x, rq.y, rq.z, rq.w};
+                        rigPose.position = {g_inputState.cameraPosX, g_inputState.cameraPosY,
+                                            g_inputState.cameraPosZ};
+                        if (rigCamera) {
+                            cameraRig.pose = rigPose;
+                            cameraRig.ipdFactor = g_inputState.viewParams.ipdFactor;
+                            cameraRig.parallaxFactor = g_inputState.viewParams.parallaxFactor;
+                            cameraRig.convergenceDiopters = g_inputState.viewParams.invConvergenceDistance;
+                            cameraRig.verticalFov =
+                                2.0f * atanf(CAMERA_HALF_TAN_VFOV / g_inputState.viewParams.zoomFactor);
+                            locateInfo.next = &cameraRig;
+                        } else {
+                            displayRig.pose = rigPose;
+                            displayRig.virtualDisplayHeight =
+                                g_inputState.viewParams.virtualDisplayHeight / g_inputState.viewParams.scaleFactor;
+                            displayRig.ipdFactor = g_inputState.viewParams.ipdFactor;
+                            displayRig.parallaxFactor = g_inputState.viewParams.parallaxFactor;
+                            displayRig.perspectiveFactor = g_inputState.viewParams.perspectiveFactor;
+                            locateInfo.next = &displayRig;
+                        }
+                    }
                     xrLocateViews(xr.session, &locateInfo, &viewState, 8, &viewCount, rawViews);
 
                     uint32_t maxTileW = tileColumns > 0 ? xr.swapchain.width / tileColumns : xr.swapchain.width;
@@ -1176,99 +1284,28 @@ static void RenderOneFrame(RenderState& rs) {
                         }
                     }
 
-                    // Kooima projection using canvas dims
-                    std::vector<Display3DView> stereoViews(eyeCount);
-                    bool useAppProjection = (xr.hasDisplayInfoExt && xr.displayWidthM > 0.0f);
+                    // --- Consume the runtime's render-ready XrView{pose, fov} ---
+                    // Only clip policy (near/far + the GL→[0,1] depth remap)
+                    // stays app-side, by design (fov is clip-independent).
+                    // Camera rig: same absolute clip as the old app-side camera
+                    // path. Display rig: ZDP-anchored clip (near = ez - vH,
+                    // far = ez + 1000·vH; ez = rig-local z of the view pose).
+                    std::vector<RigView> stereoViews(eyeCount);
                     if (useAppProjection) {
-                        float pxSizeX = xr.displayWidthM / (float)xr.displayPixelWidth;
-                        float pxSizeY = xr.displayHeightM / (float)xr.displayPixelHeight;
-                        float canvasW_m = (float)g_canvasW * pxSizeX;
-                        float canvasH_m = (float)g_canvasH * pxSizeY;
-
-                        // Canvas-relative Kooima: physical size + eye offset both anchored
-                        // on the canvas region within the window (not the window itself).
-                        float canvas_off_x = (float)g_windowWidth  / 4.0f;
-                        float canvas_off_y = (float)g_windowHeight / 4.0f;
-                        float eyeOffsetX = 0.0f, eyeOffsetY = 0.0f;
-                        {
-                            POINT clientOrigin = {0, 0};
-                            ClientToScreen(rs.hwnd, &clientOrigin);
-                            HMONITOR hMon = MonitorFromWindow(rs.hwnd, MONITOR_DEFAULTTONEAREST);
-                            MONITORINFO mi = {sizeof(mi)};
-                            if (GetMonitorInfo(hMon, &mi)) {
-                                float canvasCenterX = (float)(clientOrigin.x - mi.rcMonitor.left) + canvas_off_x + g_canvasW / 2.0f;
-                                float canvasCenterY = (float)(clientOrigin.y - mi.rcMonitor.top)  + canvas_off_y + g_canvasH / 2.0f;
-                                float dispW = (float)(mi.rcMonitor.right - mi.rcMonitor.left);
-                                float dispH = (float)(mi.rcMonitor.bottom - mi.rcMonitor.top);
-                                eyeOffsetX =  (canvasCenterX - dispW / 2.0f) * pxSizeX;
-                                eyeOffsetY = -((canvasCenterY - dispH / 2.0f) * pxSizeY);
+                        const float rigVH =
+                            g_inputState.viewParams.virtualDisplayHeight / g_inputState.viewParams.scaleFactor;
+                        for (int i = 0; i < eyeCount; i++) {
+                            const XrView& v = rawViews[(i < (int)viewCount) ? i : 0];
+                            ViewMatrixFromXrPose(v.pose, stereoViews[i].view_matrix);
+                            float nearZ = 0.01f, farZ = 100.0f;
+                            if (!rigCamera) {
+                                float ez = RigLocalEyeZ(rigPose, v.pose.position);
+                                nearZ = (ez - rigVH > 0.001f) ? (ez - rigVH) : 0.001f;
+                                farZ = ez + 1000.0f * rigVH;
                             }
-                        }
-
-                        std::vector<XrVector3f> rawEyes(modeViewCount);
-                        for (uint32_t v = 0; v < modeViewCount; v++) {
-                            XrVector3f pos = (v < viewCount) ? rawViews[v].pose.position : rawViews[0].pose.position;
-                            rawEyes[v] = {pos.x - eyeOffsetX, pos.y - eyeOffsetY, pos.z};
-                        }
-                        if (monoMode && modeViewCount >= 2) {
-                            XrVector3f center = {0, 0, 0};
-                            for (uint32_t v = 0; v < modeViewCount; v++) {
-                                center.x += rawEyes[v].x;
-                                center.y += rawEyes[v].y;
-                                center.z += rawEyes[v].z;
-                            }
-                            center.x /= modeViewCount;
-                            center.y /= modeViewCount;
-                            center.z /= modeViewCount;
-                            rawEyes[0] = center;
-                        }
-
-                        XrPosef cameraPose;
-                        XMVECTOR pOri = XMQuaternionRotationRollPitchYaw(
-                            g_inputState.pitch, g_inputState.yaw, 0);
-                        XMFLOAT4 q;
-                        XMStoreFloat4(&q, pOri);
-                        cameraPose.orientation = {q.x, q.y, q.z, q.w};
-                        cameraPose.position = {g_inputState.cameraPosX, g_inputState.cameraPosY, g_inputState.cameraPosZ};
-
-                        XrVector3f nominalViewer = {xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ};
-                        Display3DScreen screen = {canvasW_m, canvasH_m};
-
-                        if (g_inputState.cameraMode) {
-                            Camera3DTunables camTunables;
-                            camTunables.ipd_factor = g_inputState.viewParams.ipdFactor;
-                            camTunables.parallax_factor = g_inputState.viewParams.parallaxFactor;
-                            camTunables.inv_convergence_distance = g_inputState.viewParams.invConvergenceDistance;
-                            camTunables.half_tan_vfov = CAMERA_HALF_TAN_VFOV / g_inputState.viewParams.zoomFactor;
-
-                            std::vector<Camera3DView> camViews(eyeCount);
-                            camera3d_compute_views(
-                                rawEyes.data(), eyeCount, &nominalViewer,
-                                &screen, &camTunables, &cameraPose,
-                                0.01f, 100.0f, camViews.data());
-
-                            for (int i = 0; i < eyeCount; i++) {
-                                memcpy(stereoViews[i].view_matrix, camViews[i].view_matrix, sizeof(float) * 16);
-                                memcpy(stereoViews[i].projection_matrix, camViews[i].projection_matrix, sizeof(float) * 16);
-                                stereoViews[i].fov = camViews[i].fov;
-                                stereoViews[i].eye_world = camViews[i].eye_world;
-                            }
-                        } else {
-                            Display3DTunables tunables;
-                            tunables.ipd_factor = g_inputState.viewParams.ipdFactor;
-                            tunables.parallax_factor = g_inputState.viewParams.parallaxFactor;
-                            tunables.perspective_factor = g_inputState.viewParams.perspectiveFactor;
-                            tunables.virtual_display_height = g_inputState.viewParams.virtualDisplayHeight / g_inputState.viewParams.scaleFactor;
-
-                            display3d_compute_views(
-                                rawEyes.data(), eyeCount, &nominalViewer,
-                                &screen, &tunables, &cameraPose,
-                                tunables.virtual_display_height, 1000.0f * tunables.virtual_display_height, /*vulkan_flip_y=*/0, stereoViews.data());
-                            // display3d emits a GL ([-1,1] clip-z) projection; D3D clips [0,1].
-                            // Remap depth on the 3D per-view projections (not the mono/legacy
-                            // xr.projMatrices path). [#396 W1]
-                            for (uint32_t _v = 0; _v < eyeCount; _v++)
-                                convert_projection_gl_to_zero_to_one(stereoViews[_v].projection_matrix);
+                            ProjectionFromXrFov(v.fov, nearZ, farZ, stereoViews[i].projection_matrix);
+                            convert_projection_gl_to_zero_to_one(stereoViews[i].projection_matrix);
+                            stereoViews[i].fov = v.fov;
                         }
                     }
 
