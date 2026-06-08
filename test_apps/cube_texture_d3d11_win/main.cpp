@@ -527,9 +527,26 @@ static bool FillL2DPanelWithSurround(D3D11Renderer& renderer, ID3D11Texture2D* i
     if (!g_surroundPS || !g_surroundParamsCB || !g_blitVS || image == nullptr) {
         return false;
     }
+    // The runtime allocates swapchain images TYPELESS/SRGB so they can be
+    // viewed as either; CreateRenderTargetView(nullptr) fails on those. Use an
+    // explicit UNORM-sibling RTV desc so the pattern is written as ENCODED
+    // bytes (no sRGB encode) — matching the surround texture (format 87 =
+    // B8G8R8A8_UNORM) for the A/B byte comparison.
+    D3D11_TEXTURE2D_DESC td = {};
+    image->GetDesc(&td);
+    DXGI_FORMAT rtvFmt = td.Format;
+    if (rtvFmt == DXGI_FORMAT_B8G8R8A8_TYPELESS || rtvFmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
+        rtvFmt = DXGI_FORMAT_B8G8R8A8_UNORM;
+    } else if (rtvFmt == DXGI_FORMAT_R8G8B8A8_TYPELESS || rtvFmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+        rtvFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
+    D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+    rtvDesc.Format = rtvFmt;
+    rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    rtvDesc.Texture2D.MipSlice = 0;
     ComPtr<ID3D11RenderTargetView> rtv;
-    if (FAILED(renderer.device->CreateRenderTargetView(image, nullptr, &rtv))) {
-        LOG_ERROR("Local2D fill: CreateRenderTargetView failed");
+    if (FAILED(renderer.device->CreateRenderTargetView(image, &rtvDesc, &rtv))) {
+        LOG_ERROR("Local2D fill: CreateRenderTargetView failed (fmt=%u)", (unsigned)td.Format);
         return false;
     }
 
@@ -624,9 +641,13 @@ static bool ActivateLocal2DBMode(XrSessionManager& xr, D3D11Renderer& renderer) 
     XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
     wi.timeout = XR_INFINITE_DURATION;
     xrWaitSwapchainImage(g_l2dSwapchain, &wi);
-    FillL2DPanelWithSurround(renderer, imgs[idx].texture, winW, winH, mcx, mcy, mcw, mch);
+    bool filled = FillL2DPanelWithSurround(renderer, imgs[idx].texture, winW, winH, mcx, mcy, mcw, mch);
     XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     xrReleaseSwapchainImage(g_l2dSwapchain, &ri);
+    if (!filled) {
+        LOG_ERROR("A/B B-mode: Local2D layer fill failed — surround region would be black");
+        return false;
+    }
 
     // Explicit Tier-2 mask: the canvas rect is 3D, everything else 2D.
     XrLocal3DZoneMaskCreateInfoEXT mci = {(XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_EXT};
@@ -646,7 +667,11 @@ static bool ActivateLocal2DBMode(XrSessionManager& xr, D3D11Renderer& renderer) 
 
     // Pivot to window-sized rendering + world-scale constancy: the render canvas
     // grows canvas→window (2×), so scale the virtual display height by the same
-    // ratio to keep the cube the same physical size (else it renders 2×).
+    // ratio to keep the cube the same physical size (else it renders ~2×).
+    // Leia-validated 2026-06-08: the B cube matches the A baseline within
+    // eye-tracking parallax (two identical-baseline captures vary ±11% in cube
+    // size from head distance alone; B falls inside that envelope). A
+    // pixel-deterministic 3D A/B needs eye tracking pinned — see impl doc §9.
     g_canvasIsWindow = true;
     if (mch > 0) {
         g_inputState.viewParams.virtualDisplayHeight *= (float)winH / (float)mch;
@@ -725,11 +750,17 @@ static void BlitSharedTextureToBackBuffer(D3D11Renderer& renderer, ID3D11RenderT
             (uint32_t)canvasW, (uint32_t)canvasH);
     }
 
-    // Pick the viewport + UV range based on whether surround is active.
+    // Pick the viewport + UV range based on whether the shared texture's
+    // surround region is populated. #439 case-1 B-mode: once the Local2D layer
+    // + mask have pivoted (g_canvasIsWindow), the masked composite fills the
+    // full window region of the shared texture (canvas weave + the flattened
+    // Local2D surround pattern), so blit the full window — same as the legacy
+    // surround path. Without this, the surround region stays at the clear
+    // color (black) even though the shared texture holds the pattern.
     D3D11_VIEWPORT vp = {};
     float uvParams[4];  // (scaleX, scaleY, offsetX, offsetY)
-    if (g_surroundRegistered) {
-        // Full window — read back canvas weave + surround strips.
+    if (g_surroundRegistered || g_canvasIsWindow) {
+        // Full window — read back canvas weave + surround strips / Local2D.
         vp.TopLeftX = 0.0f;
         vp.TopLeftY = 0.0f;
         vp.Width = (FLOAT)winW;
@@ -1406,9 +1437,14 @@ static void RenderOneFrame(RenderState& rs) {
                 const XrCompositionLayerBaseHeader* layers[2] = {
                     (XrCompositionLayerBaseHeader*)&projLayer,
                     (XrCompositionLayerBaseHeader*)&l2dLayer};
+                // Match the legacy surround path's blend mode (it runs through
+                // the shared EndFrame, which resolves DISPLAYXR_TRANSPARENT_BG
+                // via SelectEnvBlendMode) so the B-mode A/B is apples-to-apples.
                 XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
                 endInfo.displayTime = frameState.predictedDisplayTime;
-                endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+                endInfo.environmentBlendMode = xr.runtimeSupportsAlphaBlend
+                    ? XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
+                    : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
                 endInfo.layerCount = 2;
                 endInfo.layers = layers;
                 xrEndFrame(xr.session, &endInfo);
