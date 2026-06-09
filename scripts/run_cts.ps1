@@ -26,7 +26,11 @@ param(
   [string]$ApiVersion = "1.1",
   [string]$TestSpec   = "exclude:[interactive]",
   [int]   $TimeoutSec = 1800,
-  [string]$Tag        = ""
+  [string]$Tag        = "",
+  # Enable the CTS's required XR_APILAYER_KHRONOS_runtime_conformance layer for a
+  # submission-valid run. Registered in HKLM (the elevated loader ignores
+  # XR_API_LAYER_PATH) and requested via -L; snapshot/restored like the rest.
+  [switch]$ConformanceLayer
 )
 
 $ErrorActionPreference = "Stop"
@@ -54,6 +58,17 @@ if ($Plugin -ne "none") {
 Write-Output "SNAPSHOT ActiveRuntime = $origRuntime"
 Write-Output "SNAPSHOT $Plugin ProbeOrder = $origProbe"
 
+# Both CTS layers: the runtime-conformance validation layer (requested via -L)
+# and the conformance_test_layer (== conformance_test.dll; validApiLayer requests
+# it itself). Register both as Explicit so the elevated loader can find them.
+$layerJsons  = @("$base\XrApiLayer_runtime_conformance.json", "$base\XrApiLayer_conformance_test_layer.json")
+$explicitKey  = "$xrKey\ApiLayers\Explicit"
+$explicitKeyPreexisted = Test-Path $explicitKey
+$preRegistered = @{}
+if ($ConformanceLayer -and $explicitKeyPreexisted) {
+  foreach ($lj in $layerJsons) { $preRegistered[$lj] = $null -ne (Get-ItemProperty $explicitKey -Name $lj -ErrorAction SilentlyContinue) }
+}
+
 try {
   # ---- apply ----
   Set-ItemProperty $xrKey -Name ActiveRuntime -Value $devManifest -Type String
@@ -62,6 +77,12 @@ try {
   }
   Write-Output "APPLIED ActiveRuntime -> $devManifest"
   Write-Output "APPLIED $Plugin ProbeOrder -> 5 (wins)"
+
+  if ($ConformanceLayer) {
+    if (-not (Test-Path $explicitKey)) { New-Item -Path $explicitKey -Force | Out-Null }
+    foreach ($lj in $layerJsons) { New-ItemProperty -Path $explicitKey -Name $lj -Value 0 -PropertyType DWord -Force | Out-Null }
+    Write-Output "APPLIED $($layerJsons.Count) conformance layers (HKLM Explicit)"
+  }
 
   if (Test-Path $xml)     { Remove-Item $xml -Force }
   if (Test-Path $console) { Remove-Item $console -Force }
@@ -81,6 +102,7 @@ try {
     "--reporter", "ctsxml::out=$xml",
     "--reporter", "console::out=$console"
   )
+  if ($ConformanceLayer) { $cliArgs += @("-L", "XR_APILAYER_KHRONOS_runtime_conformance") }
   Write-Output "RUN: conformance_cli $($cliArgs -join ' ')"
   Write-Output "CWD: $base"
 
@@ -101,6 +123,13 @@ finally {
   }
   if ($Plugin -ne "none" -and $null -ne $origProbe) {
     Set-ItemProperty $dpKey -Name ProbeOrder -Value ([int]$origProbe) -Type DWord
+  }
+  if ($ConformanceLayer -and (Test-Path $explicitKey)) {
+    foreach ($lj in $layerJsons) {
+      if (-not $preRegistered[$lj]) { Remove-ItemProperty -Path $explicitKey -Name $lj -ErrorAction SilentlyContinue }
+    }
+    if (-not $explicitKeyPreexisted) { Remove-Item -Path $explicitKey -Force -ErrorAction SilentlyContinue }
+    Write-Output "RESTORED conformance layer registration removed"
   }
   Write-Output "RESTORED ActiveRuntime = $((Get-ItemProperty $xrKey -Name ActiveRuntime).ActiveRuntime)"
   if ($Plugin -ne "none") {
