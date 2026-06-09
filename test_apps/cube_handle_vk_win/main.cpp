@@ -86,6 +86,10 @@ static DWORD g_savedWindowStyle = 0;
 static bool g_l2dPanel = false;
 static bool g_l2dMask = false;
 static bool g_l2dPanel2 = false;
+// #491 part 3 — a Local2D backdrop submitted BEFORE the projection (an UNDER
+// layer). 0 = off, 2 = opaque checker, 3 = semi-transparent (desktop shows
+// through). DXR_LOCAL2D_BACKDROP=1 ⟹ opaque (2); =2 ⟹ semi-transparent (3).
+static int g_l2dBackdropVariant = 0;
 static bool g_l2dActive = false; // set once panels (+ optional mask) are live
 static long g_l2dFrameCounter = 0;
 static const long g_l2dActivationFrame = 10;
@@ -98,8 +102,8 @@ struct L2DPanel {
     uint32_t imageIndex = 0;
     uint32_t w = 0, h = 0;
 };
-static L2DPanel g_panel1, g_panel2;
-static XrRect2Di g_panel1Rect, g_panel2Rect;
+static L2DPanel g_panel1, g_panel2, g_backdrop;
+static XrRect2Di g_panel1Rect, g_panel2Rect, g_backdropRect;
 
 // XR_EXT_view_rig (#396 W7 dogfood): the app chains a rig descriptor
 // (XrDisplayRigEXT, or XrCameraRigEXT in camera mode) on every xrLocateViews
@@ -397,7 +401,28 @@ static bool CreateAndFillL2DPanel(XrSessionManager& xr, VkRenderer* renderer, Vk
         uint8_t* row = buf.data() + (size_t)y * stride;
         for (uint32_t x = 0; x < w; x++) {
             uint8_t* px = row + (size_t)x * 4; // B,G,R,A
-            if (variant == 0) {
+            if (variant == 2) {
+                // #491 part 3 backdrop (opaque): coarse cyan/blue checker — an
+                // obvious flat 2D plane that the floating 3D cube sits in front
+                // of. The 2D-under layer (submitted before the projection).
+                bool check = (((x / 32) + (y / 32)) & 1) != 0;
+                px[0] = check ? 200 : 90;  // B
+                px[1] = check ? 120 : 40;  // G
+                px[2] = 0;                 // R
+                px[3] = 255;               // opaque
+            } else if (variant == 3) {
+                // #491 part 3 backdrop (semi-transparent): coarse magenta
+                // checker at ~50% alpha, PREMULTIPLIED (rgb already scaled by
+                // a=0.5). The desktop must show through it (`desktop ⊕ backdrop`)
+                // — the case the runtime-only prototype could NOT do, the whole
+                // point of routing the backdrop through the DP.
+                bool check = (((x / 32) + (y / 32)) & 1) != 0;
+                if (check) {
+                    px[0] = 110; px[1] = 0; px[2] = 110; px[3] = 128; // 50% magenta (premul)
+                } else {
+                    px[0] = 0; px[1] = 90; px[2] = 90; px[3] = 128;   // 50% teal (premul)
+                }
+            } else if (variant == 0) {
                 bool inBorder = (x < border || y < border || x >= w - border || y >= h - border);
                 if (inBorder) {
                     px[0] = 0; px[1] = 128; px[2] = 0; px[3] = 128; // half-transparent green (premul)
@@ -1014,6 +1039,20 @@ static void RenderThreadFunc(
                         g_panel1Rect.extent = {(int32_t)pw, (int32_t)ph};
                         bool ok = CreateAndFillL2DPanel(*xr, renderer, hudCmdPool, pw, ph, p1variant, g_panel1);
 
+                        // #491 part 3 — a large backdrop submitted BEFORE the
+                        // projection (an UNDER layer): the flat 2D plane the
+                        // transparent-bg cube floats in front of. Variant 2 =
+                        // opaque, 3 = semi-transparent (desktop shows through).
+                        if (ok && g_l2dBackdropVariant != 0) {
+                            uint32_t bw = winW * 3 / 4;
+                            uint32_t bh = winH * 3 / 4;
+                            g_backdropRect.offset = {(int32_t)(winW / 2 - bw / 2),
+                                                     (int32_t)(winH / 2 - bh / 2)};
+                            g_backdropRect.extent = {(int32_t)bw, (int32_t)bh};
+                            ok = CreateAndFillL2DPanel(*xr, renderer, hudCmdPool, bw, bh,
+                                                       g_l2dBackdropVariant, g_backdrop);
+                        }
+
                         if (ok && g_l2dPanel2) {
                             // Overlaps panel 1's top-right quadrant — list-order
                             // stacking check (panel 2 later = on top).
@@ -1070,9 +1109,26 @@ static void RenderThreadFunc(
                         (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
                     XrCompositionLayerLocal2DEXT panel2Layer = {
                         (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
-                    const XrCompositionLayerBaseHeader* layers[3] = {
-                        (XrCompositionLayerBaseHeader*)&projLayer, nullptr, nullptr};
-                    uint32_t layerCount = 1;
+                    XrCompositionLayerLocal2DEXT backdropLayer = {
+                        (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+                    const XrCompositionLayerBaseHeader* layers[4] = {nullptr, nullptr, nullptr, nullptr};
+                    uint32_t layerCount = 0;
+
+                    // #491 part 3 — the backdrop goes BEFORE the projection in
+                    // list order (an UNDER layer → flat 2D behind the 3D, routed
+                    // to the DP via set_background_2d).
+                    if (g_l2dBackdropVariant != 0 && g_backdrop.swapchain != XR_NULL_HANDLE) {
+                        backdropLayer.layerFlags = 0; // premultiplied bytes
+                        backdropLayer.subImage.swapchain = g_backdrop.swapchain;
+                        backdropLayer.subImage.imageRect.offset = {0, 0};
+                        backdropLayer.subImage.imageRect.extent = {(int32_t)g_backdrop.w,
+                                                                   (int32_t)g_backdrop.h};
+                        backdropLayer.subImage.imageArrayIndex = 0;
+                        backdropLayer.rect = g_backdropRect;
+                        layers[layerCount++] = (XrCompositionLayerBaseHeader*)&backdropLayer;
+                    }
+
+                    layers[layerCount++] = (XrCompositionLayerBaseHeader*)&projLayer;
 
                     panel1Layer.layerFlags = 0; // premultiplied bytes
                     panel1Layer.subImage.swapchain = g_panel1.swapchain;
@@ -1187,10 +1243,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         if (e && *e == '1') g_l2dMask = true;
         e = getenv("DXR_LOCAL2D_PANEL2");
         if (e && *e == '1') g_l2dPanel2 = true;
+        // #491 part 3 — DXR_LOCAL2D_BACKDROP=1 ⟹ opaque backdrop (variant 2);
+        // =2 ⟹ semi-transparent backdrop (variant 3, desktop shows through).
+        // Either implies the Local2D panel path is active.
+        e = getenv("DXR_LOCAL2D_BACKDROP");
+        if (e && (*e == '1' || *e == '2')) {
+            g_l2dBackdropVariant = (*e == '2') ? 3 : 2;
+            g_l2dPanel = true;
+        }
         if (g_l2dPanel) {
-            LOG_INFO("DXR_LOCAL2D_PANEL=1 — Local2D panel layer%s%s",
+            LOG_INFO("DXR_LOCAL2D_PANEL=1 — Local2D panel layer%s%s%s",
                 g_l2dPanel2 ? " + panel2 (unpremultiplied, overlapping)" : "",
-                g_l2dMask ? " + explicit Tier-2 island mask" : " (implicit mask)");
+                g_l2dMask ? " + explicit Tier-2 island mask" : " (implicit mask)",
+                g_l2dBackdropVariant == 2 ? " + opaque 2D-under backdrop" :
+                g_l2dBackdropVariant == 3 ? " + semi-transparent 2D-under backdrop" : "");
         }
     }
 
