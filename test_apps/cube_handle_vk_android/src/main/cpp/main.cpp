@@ -2073,6 +2073,22 @@ render_frame()
 		}
 	}
 
+	// Orbit camera also driveable from adb for testing / as a fallback while
+	// touch-to-app routing is sorted (the runtime's display overlay currently
+	// consumes touch). Degrees; sentinel -999 = unset (use the touch value).
+	//   adb shell setprop debug.dxr.cam_yaw 30 ; debug.dxr.cam_pitch -15
+	{
+		const float yaw_deg = get_prop_float("debug.dxr.cam_yaw", -999.0f);
+		const float pitch_deg = get_prop_float("debug.dxr.cam_pitch", -999.0f);
+		const float kDeg2Rad = 3.14159265f / 180.0f;
+		if (yaw_deg > -990.0f) {
+			g_cam_yaw.store(yaw_deg * kDeg2Rad, std::memory_order_relaxed);
+		}
+		if (pitch_deg > -990.0f) {
+			g_cam_pitch.store(pitch_deg * kDeg2Rad, std::memory_order_relaxed);
+		}
+	}
+
 	XrFrameWaitInfo wait_info = {};
 	wait_info.type = XR_TYPE_FRAME_WAIT_INFO;
 	XrFrameState frame_state = {};
@@ -2354,24 +2370,68 @@ handle_cmd(struct android_app *app, int32_t cmd)
 	}
 }
 
-// On-device input: DOUBLE-TAP cycles the rendering mode (2D / Anaglyph /
-// Cropped-SBS / Squeezed-SBS / Quad …). MonadoView is FLAG_NOT_FOCUSABLE, so
-// touch events land in this NativeActivity input queue rather than being
-// swallowed by the runtime's display window. Double-tap (not single-tap) is
-// used so the gesture doesn't interfere with a press-drag (which ends in a
-// single pointer-up); absolute switching is still available via
-// `adb shell setprop debug.dxr.mode N`.
+// On-device input (MonadoView is FLAG_NOT_FOCUSABLE, so touch lands in this
+// NativeActivity input queue rather than the runtime's display window):
+//   - single-finger DRAG orbits the camera (updates the display-rig yaw/pitch
+//     the runtime projects through). The cube also auto-spins in world space,
+//     so the two compose (auto-spin + drag-orbit).
+//   - DOUBLE-TAP (two quick taps with no drag) cycles the rendering mode
+//     (2D / Anaglyph / Cropped-SBS / Squeezed-SBS / Quad …). Absolute switching
+//     is also available via `adb shell setprop debug.dxr.mode N`.
+// A drag is distinguished from a tap by total pointer travel, so the orbit
+// gesture never trips the mode cycle.
 static int32_t
 handle_input(struct android_app *app, AInputEvent *event)
 {
 	(void)app;
-	if (AInputEvent_getType(event) == AINPUT_EVENT_TYPE_MOTION &&
-	    (AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK) ==
-	        AMOTION_EVENT_ACTION_UP) {
-		// Key off the event time (ns) so two taps within ~300 ms count as a
-		// double-tap. A drag produces a single UP and never triggers.
+	if (AInputEvent_getType(event) != AINPUT_EVENT_TYPE_MOTION) {
+		return 0;
+	}
+	const int32_t action = AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK;
+	const float x = AMotionEvent_getX(event, 0);
+	const float y = AMotionEvent_getY(event, 0);
+
+	// Drag-orbit state. moved_px accumulates travel so we can tell a drag
+	// (orbit) from a tap (mode cycle) at pointer-up.
+	static float last_x = 0.0f, last_y = 0.0f;
+	static float moved_px = 0.0f;
+	static int64_t last_up_ns = 0;
+
+	switch (action) {
+	case AMOTION_EVENT_ACTION_DOWN:
+		last_x = x;
+		last_y = y;
+		moved_px = 0.0f;
+		return 1;
+
+	case AMOTION_EVENT_ACTION_MOVE: {
+		const float dx = x - last_x;
+		const float dy = y - last_y;
+		last_x = x;
+		last_y = y;
+		moved_px += std::fabs(dx) + std::fabs(dy);
+		// ~0.005 rad/px. Drag right → orbit right (yaw+); drag down → tilt up.
+		// Pitch clamped to keep the camera off the poles.
+		const float kSens = 0.005f;
+		float yaw = g_cam_yaw.load(std::memory_order_relaxed) + dx * kSens;
+		float pitch = g_cam_pitch.load(std::memory_order_relaxed) + dy * kSens;
+		const float kPitchLimit = 1.2f;
+		if (pitch > kPitchLimit) pitch = kPitchLimit;
+		if (pitch < -kPitchLimit) pitch = -kPitchLimit;
+		g_cam_yaw.store(yaw, std::memory_order_relaxed);
+		g_cam_pitch.store(pitch, std::memory_order_relaxed);
+		return 1;
+	}
+
+	case AMOTION_EVENT_ACTION_UP: {
+		// A drag (significant travel) never counts as a tap.
+		const float kTapSlopPx = 24.0f;
+		if (moved_px > kTapSlopPx) {
+			last_up_ns = 0;  // a drag breaks any pending double-tap
+			return 1;
+		}
+		// Two taps within ~300 ms → cycle the rendering mode.
 		const int64_t now_ns = AMotionEvent_getEventTime(event);
-		static int64_t last_up_ns = 0;
 		const int64_t dt = now_ns - last_up_ns;
 		if (last_up_ns != 0 && dt > 0 && dt < 300LL * 1000LL * 1000LL) {
 			LOGI("double-tap → cycle rendering mode");
@@ -2380,9 +2440,12 @@ handle_input(struct android_app *app, AInputEvent *event)
 		} else {
 			last_up_ns = now_ns;
 		}
-		return 1;  // consumed
+		return 1;
 	}
-	return 0;
+
+	default:
+		return 0;
+	}
 }
 
 } // namespace
