@@ -4,7 +4,7 @@
   "shell":       "v1.6.0",
   "leia_plugin": "v1.6.1",
   "mcp_tools":   "v0.4.0",
-  "gauss_demo":  "v1.8.0",
+  "gauss_demo":  "v1.9.0",
   "modelviewer_demo": "v0.9.0",
   "mediaplayer_demo": "v1.2.0"
 }
