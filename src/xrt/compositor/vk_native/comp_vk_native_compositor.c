@@ -3230,8 +3230,18 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 
 	// Populate supported swapchain formats (Vulkan formats)
 	uint32_t format_count = 0;
+#ifndef XRT_OS_ANDROID
+	// BGRA is the desktop swapchain-native order (DXGI back-buffers and
+	// IOSurfaces are BGRA8), so list it first there. On Android it must NOT be
+	// advertised: app swapchain images are AHardwareBuffer-backed, and Adreno's
+	// gralloc cannot allocate B8G8R8A8 (gralloc rejects format 52 →
+	// "isSupported(...,52,...) failed", VK_FORMAT_B8G8R8A8_UNORM probes false).
+	// Advertising it makes an app that prefers BGRA (e.g. cube_handle_vk_android)
+	// fail xrCreateSwapchain → no reference space → black screen. RGBA8 is the
+	// Adreno-allocatable order and is advertised first below. (#496)
 	c->base.base.info.formats[format_count++] = VK_FORMAT_B8G8R8A8_UNORM;
 	c->base.base.info.formats[format_count++] = VK_FORMAT_B8G8R8A8_SRGB;
+#endif
 	c->base.base.info.formats[format_count++] = VK_FORMAT_R8G8B8A8_UNORM;
 	c->base.base.info.formats[format_count++] = VK_FORMAT_R8G8B8A8_SRGB;
 	c->base.base.info.formats[format_count++] = VK_FORMAT_R16G16B16A16_SFLOAT;
