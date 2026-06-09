@@ -22,6 +22,11 @@
 // XR_EXT_display_info: display dimensions + the rendering-mode enumeration /
 // switching entry points. Drives the adaptive tiled-atlas multiview port (#499).
 #include <openxr/XR_EXT_display_info.h>
+// XR_EXT_view_rig: the runtime owns the Kooima/off-axis projection. The app
+// chains a display-centric XrDisplayRigEXT on xrLocateViews and consumes the
+// render-ready XrView{pose, fov} — no app-side projection or per-orientation
+// compensation (device rotation is the weaver/DP's job, per the CNSDK model).
+#include <openxr/XR_EXT_view_rig.h>
 
 #include <atomic>
 #include <cmath>
@@ -149,6 +154,17 @@ uint32_t g_max_view_count = 2;        // xrEnumerateViewConfigurationViews → l
 uint32_t g_display_px_w = 0;          // native panel pixels (XR_EXT_display_info)
 uint32_t g_display_px_h = 0;
 bool g_has_display_info = false;
+bool g_has_view_rig = false;          // XR_EXT_view_rig: runtime-owned Kooima projection
+
+// Display-centric rig defaults (match cube_handle_vk_win). virtualDisplayHeight
+// in app units — 0.24 = 4x the 0.06 m cube; all factors at their neutral 1.0.
+constexpr float kRigVirtualDisplayHeight = 0.24f;
+
+// Drag-orbit camera: single-finger drag orbits the viewer around the scene.
+// Stored as yaw/pitch (radians); the rig pose is built from these each frame.
+// Default 0 → identity rig (viewer square-on to the virtual display plane).
+std::atomic<float> g_cam_yaw{0.0f};
+std::atomic<float> g_cam_pitch{0.0f};
 
 // XR_EXT_display_info entry points (resolved after the session exists).
 PFN_xrEnumerateDisplayRenderingModesEXT g_pfnEnumModes = nullptr;
@@ -275,6 +291,7 @@ create_instance(struct android_app *app)
 	// needs (#499). Enable it only when the runtime advertises it so a runtime
 	// built without it still brings up (degrading to a default stereo atlas).
 	g_has_display_info = false;
+	g_has_view_rig = false;
 	{
 		uint32_t ext_count = 0;
 		if (xrEnumerateInstanceExtensionProperties(nullptr, 0, &ext_count, nullptr) == XR_SUCCESS &&
@@ -292,15 +309,18 @@ create_instance(struct android_app *app)
 					if (std::strcmp(props_buf[i].extensionName,
 					                XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) {
 						g_has_display_info = true;
-						break;
+					} else if (std::strcmp(props_buf[i].extensionName,
+					                       XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
+						g_has_view_rig = true;
 					}
 				}
 			}
 		}
-		LOGI("XR_EXT_display_info advertised: %s", g_has_display_info ? "yes" : "no");
+		LOGI("XR_EXT_display_info advertised: %s; XR_EXT_view_rig advertised: %s",
+		     g_has_display_info ? "yes" : "no", g_has_view_rig ? "yes" : "no");
 	}
 
-	const char *extensions[3] = {
+	const char *extensions[4] = {
 	    XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
 	    // _enable2 lets the runtime help create our VkInstance/VkDevice and is
 	    // the modern replacement for _enable.
@@ -309,6 +329,9 @@ create_instance(struct android_app *app)
 	uint32_t extension_count = 2;
 	if (g_has_display_info) {
 		extensions[extension_count++] = XR_EXT_DISPLAY_INFO_EXTENSION_NAME;
+	}
+	if (g_has_view_rig) {
+		extensions[extension_count++] = XR_EXT_VIEW_RIG_EXTENSION_NAME;
 	}
 
 	XrInstanceCreateInfoAndroidKHR android_info = {};
@@ -1086,6 +1109,43 @@ projection_matrix_from_fov(const XrFovf &fov, float aspect_w_over_h, float near_
 	return p;
 }
 
+// Build the display-rig pose from the orbit camera (yaw/pitch). The rig pose
+// is the virtual-display-plane pose in the locate space; orbiting rotates the
+// viewer about the scene. Position stays at the origin (the runtime places the
+// eyes relative to this plane).
+XrPosef
+build_rig_pose()
+{
+	const float yaw = g_cam_yaw.load(std::memory_order_relaxed);
+	const float pitch = g_cam_pitch.load(std::memory_order_relaxed);
+	// Quaternion from yaw (about Y) then pitch (about X): q = qYaw * qPitch.
+	const float cy = std::cos(yaw * 0.5f), sy = std::sin(yaw * 0.5f);
+	const float cp = std::cos(pitch * 0.5f), sp = std::sin(pitch * 0.5f);
+	XrPosef pose{};
+	pose.orientation.w = cy * cp;
+	pose.orientation.x = cy * sp;
+	pose.orientation.y = sy * cp;
+	pose.orientation.z = -sy * sp;
+	pose.position = {0.0f, 0.0f, 0.0f};
+	return pose;
+}
+
+// Display-local eye distance for the ZDP-anchored clip: z of (rigPose^-1 *
+// eyeWorld). Degenerates to pose.position.z at identity rig pose. Mirrors
+// RigLocalEyeZ() in cube_handle_vk_win.
+float
+rig_local_eye_z(const XrPosef &rig, const XrVector3f &eye_world)
+{
+	const float dx = eye_world.x - rig.position.x;
+	const float dy = eye_world.y - rig.position.y;
+	const float dz = eye_world.z - rig.position.z;
+	const float qx = -rig.orientation.x, qy = -rig.orientation.y;
+	const float qz = -rig.orientation.z, qw = rig.orientation.w;
+	const float cx = qy * dz - qz * dy + qw * dx;
+	const float cy = qz * dx - qx * dz + qw * dy;
+	return dz + 2.0f * (qx * cy - qy * cx);
+}
+
 // Read a float system property (live-tunable knob), e.g.
 //   adb shell setprop debug.dxr.aspect_mult 1.5
 // Returns default_val if unset/unparseable. Used to tune the SBS aspect
@@ -1103,16 +1163,21 @@ get_prop_float(const char *name, float default_val)
 	return (end != buf) ? v : default_val;
 }
 
-// Model matrix for the spinning cube: rotate about Y (and slower about X)
-// by `angle` radians, then push 1 m in front of the viewer (-Z in the
-// reference space). Depth testing makes occlusion correct regardless of
-// the rotation signs, so direction here is purely cosmetic.
+// Model matrix for the spinning cube: scale to ~0.08 app units (a sensible
+// fraction of the 0.24 virtual-display height the rig anchors to), rotate about
+// Y (and slower about X). Sits at the rig origin (the virtual display plane).
+// With the runtime view-rig driving the projection, the cube no longer needs an
+// app-side forward push — the rig anchors depth to the display plane.
 Mat4
 cube_model_matrix(float angle)
 {
 	const float cy = std::cos(angle), sy = std::sin(angle);
 	const float ax = angle * 0.5f;
 	const float cx = std::cos(ax), sx = std::sin(ax);
+
+	const float kCubeScale = 0.08f;
+	Mat4 s = mat4_identity();
+	s.m[0] = kCubeScale; s.m[5] = kCubeScale; s.m[10] = kCubeScale;
 
 	Mat4 ry = mat4_identity();  // rotate about Y
 	ry.m[0] = cy;  ry.m[2] = -sy;
@@ -1122,10 +1187,8 @@ cube_model_matrix(float angle)
 	rx.m[5] = cx;  rx.m[6] = sx;
 	rx.m[9] = -sx; rx.m[10] = cx;
 
-	Mat4 t = mat4_identity();   // translate forward (-Z); closer = bigger + more pop
-	t.m[14] = -0.6f;
-
-	return mat4_mul(t, mat4_mul(ry, rx));
+	// column-major (M·v): scale first, then rotate.
+	return mat4_mul(ry, mat4_mul(rx, s));
 }
 
 // ─── render pass + pipeline ───────────────────────────────────────────
@@ -1715,7 +1778,7 @@ destroy_render_pass()
 // eye-swap knob.
 bool
 record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint32_t render_w,
-             uint32_t render_h, uint32_t cols, uint32_t rows, bool swap_lr)
+             uint32_t render_h, uint32_t cols, uint32_t rows, bool swap_lr, const XrPosef &rig_pose)
 {
 	(void)rows;
 	VkCommandBufferAllocateInfo ai = {};
@@ -1751,59 +1814,22 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline);
 
-	// Orientation knobs — identical for every tile, so computed once.
-	//  - aspect_mult (HORIZONTAL): also scales the stereo disparity (lower =
-	//    more disparity). 1.0 gives the clean weave on the nubia NP02J.
-	//  - yscale (VERTICAL): stretches clip-space Y to cancel the ~2x vertical
-	//    squash (half-width SBS tile + landscape-atlas→portrait-panel rotation).
-	//    Vertical does NOT affect horizontal disparity, so it un-squishes
-	//    without hurting the weave.
-	//    adb shell setprop debug.dxr.aspect_mult <f> ; debug.dxr.yscale <f>
-	const int disp_rot_a = g_display_rotation.load(std::memory_order_relaxed) & 3;
-	const bool is_landscape = (disp_rot_a == 1 || disp_rot_a == 3);
-	const float am_prop = get_prop_float("debug.dxr.aspect_mult", -1.0f);
-	const float ys_prop = get_prop_float("debug.dxr.yscale", -1.0f);
-	const float aspect_mult = (am_prop >= 0.0f) ? am_prop : 1.0f;
-	const float yscale = (ys_prop >= 0.0f) ? ys_prop : (is_landscape ? 1.0f : 0.6f);
+	// CANONICAL render (CNSDK model): the app draws its source views in the
+	// natural orientation and applies NO per-orientation compensation. Device
+	// rotation is the weaver/DP's job (the Leia interlacer rotates the weave
+	// pattern; the DisplayXR vk_native compositor + DP do the same). The old
+	// app-side aspect_mult / yscale / HUD-rotation knobs were the wrong layer
+	// and are gone. Projection comes from the runtime via XR_EXT_view_rig.
+	const float rig_vh = kRigVirtualDisplayHeight;  // scaleFactor = 1.0
 
 	// Build the HUD geometry ONCE (identical in every tile) — rebuilding it
 	// into the persistently-mapped buffer mid-pass would be a write-while-read
-	// hazard against an already-recorded tile draw.
+	// hazard against an already-recorded tile draw. Drawn upright in tile-NDC.
 	uint32_t hud_n = 0;
-	Mat4 hud_mvp = mat4_identity();
+	const Mat4 hud_mvp = mat4_identity();
 	const bool hud_ok = (g_hud_vbuf != VK_NULL_HANDLE && g_hud_mapped != nullptr);
 	if (hud_ok) {
 		hud_n = build_hud(reinterpret_cast<CubeVertex *>(g_hud_mapped));
-		// HUD orientation, per display rotation, calibrated on-device for the
-		// preTransform=IDENTITY weave (LOXR-730/733). setprop
-		// debug.dxr.hud_rot/hud_hflip/hud_vflip (>=0) override per knob.
-		//   disp_rot:  0(port) 1(land) 2(rev-port) 3(rev-land)
-		//   hud_rot:    0       0       2           2
-		//   hud_hflip:  0       0       0           1
-		//   hud_vflip:  1       1       1           0
-		static const int kHudRotForDisp[4] = {0, 0, 2, 2};
-		static const int kHudHflipForDisp[4] = {0, 0, 0, 1};
-		static const int kHudVflipForDisp[4] = {1, 1, 1, 0};
-		const float rot_prop = get_prop_float("debug.dxr.hud_rot", -1.0f);
-		const float hflip_prop = get_prop_float("debug.dxr.hud_hflip", -1.0f);
-		const float vflip_prop = get_prop_float("debug.dxr.hud_vflip", -1.0f);
-		const int rot = ((rot_prop >= 0.0f) ? (int)rot_prop : kHudRotForDisp[disp_rot_a]) & 3;
-		const bool hflip = (hflip_prop >= 0.0f) ? (hflip_prop != 0.0f)
-		                                        : (kHudHflipForDisp[disp_rot_a] != 0);
-		const bool vflip = (vflip_prop >= 0.0f) ? (vflip_prop != 0.0f)
-		                                        : (kHudVflipForDisp[disp_rot_a] != 0);
-		static int huddbg = 0;
-		if ((huddbg++ % 120) == 0) {
-			LOGI("HW_HUD: disp_rot=%d rot=%d hflip=%d vflip=%d", disp_rot_a, rot, (int)hflip,
-			     (int)vflip);
-		}
-		const float cs[4] = {1.0f, 0.0f, -1.0f, 0.0f};
-		const float sn[4] = {0.0f, 1.0f, 0.0f, -1.0f};
-		const float c = cs[rot], s = sn[rot];
-		hud_mvp.m[0] = c;  hud_mvp.m[4] = -s;
-		hud_mvp.m[1] = s;  hud_mvp.m[5] = c;
-		if (hflip) { hud_mvp.m[0] = -hud_mvp.m[0]; hud_mvp.m[4] = -hud_mvp.m[4]; }
-		if (vflip) { hud_mvp.m[1] = -hud_mvp.m[1]; hud_mvp.m[5] = -hud_mvp.m[5]; }
 	}
 
 	const Mat4 model = cube_model_matrix((float)g_frame_count * 0.02f);
@@ -1833,11 +1859,17 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 		const uint32_t src = swap_lr ? (view_count - 1 - i) : i;
 		const XrView &view = views[src];
 
+		// Consume the runtime's render-ready XrView{pose, fov}: the rig already
+		// baked the off-axis (Kooima) FOV, so pass it straight through (aspect
+		// = -1 → no app-side aspect override / skew). Only the clip policy stays
+		// app-side (FOV is clip-independent): ZDP-anchored near/far about the
+		// virtual display plane — near = ez - vH, far = ez + 1000·vH, where ez
+		// is the rig-local z of this eye.
 		const Mat4 view_mat = view_matrix_from_pose(view.pose);
-		const float aspect = aspect_mult * (float)render_w / (float)render_h;
-		Mat4 proj_mat = projection_matrix_from_fov(view.fov, aspect, 0.05f, 100.0f);
-		proj_mat.m[5] *= yscale;  // clip-space Y stretch (disparity is horizontal, untouched)
-		proj_mat.m[9] *= yscale;
+		const float ez = rig_local_eye_z(rig_pose, view.pose.position);
+		float near_z = (ez - rig_vh > 0.001f) ? (ez - rig_vh) : 0.001f;
+		float far_z = ez + 1000.0f * rig_vh;
+		const Mat4 proj_mat = projection_matrix_from_fov(view.fov, -1.0f, near_z, far_z);
 		const Mat4 view_proj = mat4_mul(proj_mat, view_mat);
 		const Mat4 mvp = mat4_mul(view_proj, model);
 		vkCmdPushConstants(cmd, g_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(mvp), &mvp);
@@ -2030,6 +2062,21 @@ render_frame()
 		locate_info.displayTime = frame_state.predictedDisplayTime;
 		locate_info.space = g_app_space;
 
+		// XR_EXT_view_rig: drive the runtime's display-centric rig so it returns
+		// render-ready off-axis XrView{pose, fov} (the Kooima math is the
+		// runtime's job now). The rig pose is the orbit camera; virtualDisplay-
+		// Height = 0.24 app units; ipd/parallax/perspective at neutral 1.0.
+		const XrPosef rig_pose = build_rig_pose();
+		XrDisplayRigEXT display_rig = {XR_TYPE_DISPLAY_RIG_EXT};
+		display_rig.pose = rig_pose;
+		display_rig.virtualDisplayHeight = kRigVirtualDisplayHeight;
+		display_rig.ipdFactor = 1.0f;
+		display_rig.parallaxFactor = 1.0f;
+		display_rig.perspectiveFactor = 1.0f;
+		if (g_has_view_rig) {
+			locate_info.next = &display_rig;
+		}
+
 		// Locate with capacity for the MAX view count (xrLocateViews returns
 		// the device's full view_count and rejects an under-capacity array
 		// with XR_ERROR_SIZE_INSUFFICIENT — the exact gate the old hard-coded
@@ -2082,7 +2129,8 @@ render_frame()
 				res = xrWaitSwapchainImage(g_atlas.swapchain, &wait_img);
 			}
 			if (res == XR_SUCCESS) {
-				record_atlas(img_idx, views, submit_views, render_w, render_h, cols, rows, swap_lr);
+				record_atlas(img_idx, views, submit_views, render_w, render_h, cols, rows, swap_lr,
+				             rig_pose);
 
 				XrSwapchainImageReleaseInfo rel = {};
 				rel.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
