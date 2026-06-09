@@ -2299,6 +2299,15 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				dp_target_h = c->canvas.h;
 			}
 
+			// Hand the DP our shared image's color view as the weave
+			// target. A self-submitting DP (Android CNSDK) ignores the
+			// framebuffer arg and builds its own from this view — without
+			// this it weaves into a stale/null target and the shared image
+			// stays black. (The present-to-window branch does the same with
+			// the swapchain view.) No-op for DPs without the slot.
+			xrt_display_processor_set_target_color_view(
+			    c->display_processor, (VkImageView)(uintptr_t)c->shared_view);
+
 			bool dp_self_submits =
 			    xrt_display_processor_is_self_submitting(c->display_processor);
 
