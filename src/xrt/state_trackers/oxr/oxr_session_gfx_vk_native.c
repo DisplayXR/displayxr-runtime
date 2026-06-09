@@ -299,6 +299,12 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 			                 "Android: surfaceCreated callback never fired within 5 s");
 		}
 		android_globals_store_window((struct _ANativeWindow *)win);
+		// Keep the custom surface alive + discoverable so oxr_session_poll can pull
+		// the live surface each tick and republish it on background/resume — the
+		// robust path that doesn't depend on JNI surface-callback registration
+		// (unreliable under the in-process runtime's multiple MonadoView
+		// classloaders). Last writer wins if the session is (re)created. #507
+		android_globals_set_custom_surface(cs);
 		window_handle = (void *)win;
 		U_LOG_IFL_I(U_LOGGING_INFO,
 		            "Android: ANativeWindow %p obtained via android_custom_surface", (void *)win);

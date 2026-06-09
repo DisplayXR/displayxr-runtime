@@ -2728,18 +2728,19 @@ android_main(struct android_app *app)
 				destroy_instance();
 				return;
 			}
-			// Only render with a live surface. On background / card / split
-			// (APP_CMD_TERM_WINDOW) native_app_glue clears app->window; the
-			// runtime's MonadoView overlay is torn down with the activity, so
-			// rendering would block forever in xrWaitSwapchainImage
-			// (XR_INFINITE_DURATION) on the dead surface — the hang seen when the
-			// app is sent to the recents/card view. Skipping render while the
-			// window is gone lets the loop keep polling; the runtime recreates
-			// its target on the next frame once the surface returns (INIT_WINDOW).
-			if (app->window != nullptr && g_session_running &&
-			    (g_session_state == XR_SESSION_STATE_SYNCHRONIZED ||
-			     g_session_state == XR_SESSION_STATE_VISIBLE ||
-			     g_session_state == XR_SESSION_STATE_FOCUSED)) {
+			// Run the frame loop whenever the session is running (READY..STOPPING)
+			// and we have a live surface. We must drive frames starting in READY:
+			// a CTS-compliant runtime only advances READY->SYNCHRONIZED on the
+			// app's first xrBeginFrame, so gating render on SYNCHRONIZED+ here would
+			// deadlock (the session never leaves READY → black screen). render_frame
+			// honors frame_state.shouldRender, so it submits no layers until the
+			// runtime reports the session visible — the spec-correct bootstrap.
+			//
+			// The app->window guard is the #507 surface gate: on background / card /
+			// split, native_app_glue clears app->window, so we skip the frame loop
+			// (no wait/present on a dead surface) until the surface returns on resume
+			// (APP_CMD_INIT_WINDOW). g_session_running drops on STOPPING (xrEndSession).
+			if (app->window != nullptr && g_session_running) {
 				render_frame();
 			}
 		}

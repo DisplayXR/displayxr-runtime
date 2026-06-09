@@ -44,66 +44,6 @@ struct android_custom_surface
 };
 
 
-/*!
- * JNI: MonadoView.surfaceChanged() / first surfaceCreated() hands us a brand-new
- * android.view.Surface. Acquire an ANativeWindow from it (+1 ref) and publish it
- * as the current versioned surface; the compositor target picks the change up on
- * its next frame and rebuilds VkSurfaceKHR + swapchain. The previously published
- * window is released by the compositor when it tears its old surface down (single
- * producer/consumer handoff — see comp_vk_native_target sync_surface), so we never
- * release here. #507
- */
-static void
-MonadoView_nativeSurfaceAvailable(JNIEnv *env, jobject /*thiz*/, jobject surface)
-{
-	if (surface == nullptr) {
-		U_LOG_W("nativeSurfaceAvailable: null Surface");
-		return;
-	}
-	ANativeWindow *win = ANativeWindow_fromSurface(env, surface);
-	if (win == nullptr) {
-		U_LOG_E("nativeSurfaceAvailable: ANativeWindow_fromSurface returned NULL");
-		return;
-	}
-
-	// Dedupe: the very first surfaceChanged re-announces the same surface that
-	// the init path (android_custom_surface_wait_get_surface) already acquired.
-	// fromSurface returns the same ANativeWindow* (with an extra ref) for the
-	// same Surface — drop the extra ref and skip, so we don't churn a spurious
-	// surface rebuild or leak a reference. A genuinely new surface (resume) has
-	// a different pointer and falls through to publish.
-	struct _ANativeWindow *current = nullptr;
-	bool current_valid = false;
-	android_globals_get_window_state(&current, nullptr, &current_valid);
-	if (current_valid && (struct _ANativeWindow *)win == current) {
-		ANativeWindow_release(win);
-		return;
-	}
-
-	U_LOG_I("nativeSurfaceAvailable: publishing ANativeWindow %p", (void *)win);
-	android_globals_set_window((struct _ANativeWindow *)win);
-}
-
-/*!
- * JNI: MonadoView.surfaceDestroyed() — the SurfaceView's surface is gone. Mark
- * the current window invalid so the compositor stops presenting to a dead surface
- * and tears its VkSurfaceKHR down (instead of wedging in vkAcquireNextImageKHR /
- * present, which on Adreno never reports VK_ERROR_OUT_OF_DATE_KHR on background).
- * #507
- */
-static void
-MonadoView_nativeSurfaceDestroyed(JNIEnv * /*env*/, jobject /*thiz*/)
-{
-	U_LOG_I("nativeSurfaceDestroyed: marking surface invalid");
-	android_globals_clear_window();
-}
-
-static JNINativeMethod surfaceMethods[] = {
-    {(char *)"nativeSurfaceAvailable", (char *)"(Landroid/view/Surface;)V",
-     (void *)&MonadoView_nativeSurfaceAvailable},
-    {(char *)"nativeSurfaceDestroyed", (char *)"()V", (void *)&MonadoView_nativeSurfaceDestroyed},
-};
-
 android_custom_surface::android_custom_surface() {}
 
 android_custom_surface::~android_custom_surface()
@@ -150,15 +90,6 @@ android_custom_surface_async_start(
 		if (clazz_name != MonadoView::getFullyQualifiedTypeName()) {
 			U_LOG_E("Unexpected class name: %s", clazz_name.c_str());
 			return nullptr;
-		}
-
-		// Wire the surface-lifecycle natives so MonadoView can hand us a new
-		// surface on resume / signal loss on background (#507). Mirrors the
-		// RegisterNatives pattern in android_lifecycle_callbacks.cpp.
-		if (jni::env()->RegisterNatives((jclass)clazz.object().getHandle(), surfaceMethods,
-		                                sizeof(surfaceMethods) / sizeof(surfaceMethods[0])) != 0) {
-			U_LOG_E("Failed to RegisterNatives for MonadoView surface callbacks");
-			// Non-fatal: the initial surface still works; only resume recovery is lost.
 		}
 
 		Context ctx = Context((jobject)context);
@@ -265,10 +196,10 @@ android_custom_surface_wait_get_surface(struct android_custom_surface *custom_su
 		return nullptr;
 	}
 
-	// If surfaceChanged already fired, nativeSurfaceAvailable has acquired +
-	// published the ANativeWindow — reuse it so we keep a single owning reference
-	// (the compositor releases exactly one ref on teardown). Only if nothing has
-	// been published yet (we won the race) do we acquire + publish here. #507
+	// If the periodic pull (android_custom_surface_refresh_window) already
+	// published this surface's ANativeWindow, reuse it so we keep a single owning
+	// reference (the compositor releases exactly one ref on teardown). Only if
+	// nothing has been published yet do we acquire + publish here. #507
 	struct _ANativeWindow *published = nullptr;
 	bool valid = false;
 	android_globals_get_window_state(&published, nullptr, &valid);
@@ -281,6 +212,59 @@ android_custom_surface_wait_get_surface(struct android_custom_surface *custom_su
 		android_globals_set_window((struct _ANativeWindow *)win);
 	}
 	return win;
+}
+
+void
+android_custom_surface_refresh_window(struct android_custom_surface *custom_surface)
+{
+	if (custom_surface == NULL) {
+		return;
+	}
+
+	// Pull the current SurfaceView surface (non-blocking). The Java
+	// surfaceCreated/Changed/Destroyed callbacks keep currentSurfaceHolder up to
+	// date, so a null holder means "backgrounded" and a non-null one means a live
+	// (possibly brand-new, post-resume) surface. This is the robust alternative to
+	// JNI surface-callback registration, which the in-process runtime's multiple
+	// MonadoView classloaders make unreliable. #507
+	SurfaceHolder holder{};
+	try {
+		holder = custom_surface->monadoView.waitGetSurfaceHolder(0);
+	} catch (std::exception const &e) {
+		return;
+	}
+
+	if (holder.isNull()) {
+		// Surface gone — mark invalid so the compositor tears its VkSurfaceKHR down
+		// instead of presenting to a dead window.
+		android_globals_clear_window();
+		return;
+	}
+	auto surf = holder.getSurface();
+	if (surf.isNull()) {
+		android_globals_clear_window();
+		return;
+	}
+
+	ANativeWindow *win = ANativeWindow_fromSurface(jni::env(), surf.object().makeLocalReference());
+	if (win == nullptr) {
+		return;
+	}
+
+	// Dedupe vs the currently published window: ANativeWindow_fromSurface returns
+	// the same pointer for an unchanged Surface, so drop the extra ref and skip
+	// when nothing changed. A genuinely new surface (resume) has a different
+	// pointer (or the current one is invalid) and is published for the compositor
+	// to adopt + rebuild from.
+	struct _ANativeWindow *cur = nullptr;
+	bool cur_valid = false;
+	android_globals_get_window_state(&cur, nullptr, &cur_valid);
+	if (cur_valid && (struct _ANativeWindow *)win == cur) {
+		ANativeWindow_release(win);
+		return;
+	}
+
+	android_globals_set_window((struct _ANativeWindow *)win);
 }
 
 bool

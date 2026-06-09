@@ -18,7 +18,6 @@ import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.Display;
-import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.WindowManager;
@@ -81,24 +80,6 @@ public class MonadoView extends SurfaceView
 
         nativeCounterpart = new NativeCounterpart(nativePointer);
     }
-
-    /**
-     * Hand a freshly-available surface to native code so the compositor can (re)bind
-     * its output to it. Called on every surfaceChanged — including the brand-new
-     * surface delivered on resume after a background→card cycle (#507).
-     *
-     * <p>Registered from native via RegisterNatives in android_custom_surface.cpp.
-     */
-    private native void nativeSurfaceAvailable(Surface surface);
-
-    /**
-     * Tell native code the surface is gone (surfaceDestroyed) so the compositor
-     * stops presenting to a dead window and tears its VkSurfaceKHR down instead of
-     * wedging the render thread (#507).
-     *
-     * <p>Registered from native via RegisterNatives in android_custom_surface.cpp.
-     */
-    private native void nativeSurfaceDestroyed();
 
     /**
      * Construct and start attaching a MonadoView to a client application.
@@ -331,18 +312,8 @@ public class MonadoView extends SurfaceView
                         + this.height
                         + " holder "
                         + currentSurfaceHolder.toString());
-
-        // Hand the (possibly brand-new, post-resume) surface to native so the
-        // compositor can rebind its output. Guard on nativeCounterpart so we only
-        // call when the surface natives have been registered (the in-process /
-        // service path that created us with a native pointer). #507
-        if (nativeCounterpart != null) {
-            try {
-                nativeSurfaceAvailable(surfaceHolder.getSurface());
-            } catch (UnsatisfiedLinkError e) {
-                Log.w(TAG, "nativeSurfaceAvailable not registered: " + e.getMessage());
-            }
-        }
+        // The native side pulls this updated surface via android_custom_surface_
+        // refresh_window() on its next poll (#507) — no push needed here.
     }
 
     @Override
@@ -356,25 +327,17 @@ public class MonadoView extends SurfaceView
             }
         }
         if (lost) {
-            // Notify native that the surface is gone so the compositor marks its
-            // output invalid and tears its VkSurfaceKHR down on its next frame
-            // (the compositor holds its own ANativeWindow ref, so teardown is safe
-            // even after Android frees this Surface). #507
+            // The native side notices the surface is gone on its next pull
+            // (android_custom_surface_refresh_window → waitGetSurfaceHolder returns
+            // null → the compositor tears its VkSurfaceKHR down). #507
             //
             // We deliberately do NOT block on nativeCounterpart.blockUntilNativeDiscard
             // here: that wait only completes when native DESTROYS the counterpart
             // (session teardown), so on a plain background→card cycle it would block
             // this UI thread forever — and a frozen UI thread can never deliver the
-            // surfaceCreated/surfaceChanged that resume needs. The block stays in the
-            // session-teardown path (android_custom_surface destructor → markAs
-            // DiscardedByNative); it does not belong on a transient surface loss.
-            if (nativeCounterpart != null) {
-                try {
-                    nativeSurfaceDestroyed();
-                } catch (UnsatisfiedLinkError e) {
-                    Log.w(TAG, "nativeSurfaceDestroyed not registered: " + e.getMessage());
-                }
-            }
+            // surfaceCreated/surfaceChanged that resume needs. The teardown handshake
+            // stays in the session-destroy path (android_custom_surface destructor →
+            // markAsDiscardedByNative); it does not belong on a transient surface loss.
         }
     }
 

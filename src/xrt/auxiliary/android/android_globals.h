@@ -114,6 +114,20 @@ android_globals_clear_window(void);
 void
 android_globals_get_window_state(struct _ANativeWindow **out_window, uint64_t *out_generation, bool *out_valid);
 
+/*!
+ * Store/retrieve the active android_custom_surface (opaque) so a periodic tick
+ * (oxr_session_poll) can pull the live SurfaceView surface and republish it via
+ * android_globals_set_window / android_globals_clear_window on resume/background.
+ * Avoids relying on JNI surface-callback registration, which is unreliable when
+ * the runtime loads MonadoView under multiple classloaders. #507
+ * @ingroup aux_android
+ */
+void
+android_globals_set_custom_surface(void *custom_surface);
+
+void *
+android_globals_get_custom_surface(void);
+
 #ifdef __cplusplus
 }
 #endif
