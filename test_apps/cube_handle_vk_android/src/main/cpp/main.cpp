@@ -2490,12 +2490,19 @@ handle_cmd(struct android_app *app, int32_t cmd)
 		break;
 	case APP_CMD_TERM_WINDOW:
 		LOGI("APP_CMD_TERM_WINDOW");
+		// Clear any in-progress touch: a card/recents gesture sends a DOWN to the
+		// app, then the system steals it for the swipe, so the matching UP never
+		// arrives — leaving g_touching stuck true, which pauses the cube auto-spin
+		// forever (the scene "freezes" on resume even though frames keep
+		// advancing). Resetting here releases that stuck gesture.
+		g_touching.store(false, std::memory_order_relaxed);
 		break;
 	case APP_CMD_GAINED_FOCUS:
 		LOGI("APP_CMD_GAINED_FOCUS");
 		break;
 	case APP_CMD_LOST_FOCUS:
 		LOGI("APP_CMD_LOST_FOCUS");
+		g_touching.store(false, std::memory_order_relaxed);  // release any stuck gesture
 		break;
 	case APP_CMD_DESTROY:
 		LOGI("APP_CMD_DESTROY");
@@ -2721,7 +2728,15 @@ android_main(struct android_app *app)
 				destroy_instance();
 				return;
 			}
-			if (g_session_running &&
+			// Only render with a live surface. On background / card / split
+			// (APP_CMD_TERM_WINDOW) native_app_glue clears app->window; the
+			// runtime's MonadoView overlay is torn down with the activity, so
+			// rendering would block forever in xrWaitSwapchainImage
+			// (XR_INFINITE_DURATION) on the dead surface — the hang seen when the
+			// app is sent to the recents/card view. Skipping render while the
+			// window is gone lets the loop keep polling; the runtime recreates
+			// its target on the next frame once the surface returns (INIT_WINDOW).
+			if (app->window != nullptr && g_session_running &&
 			    (g_session_state == XR_SESSION_STATE_SYNCHRONIZED ||
 			     g_session_state == XR_SESSION_STATE_VISIBLE ||
 			     g_session_state == XR_SESSION_STATE_FOCUSED)) {
