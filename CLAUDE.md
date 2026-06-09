@@ -253,7 +253,9 @@ Copy binaries to `_package/DisplayXR-macOS/bin/`. Generated `run_*.sh` set `XRT_
 ### Shell mode (Windows)
 The DisplayXR Shell ships from `displayxr-shell-pvt` via `DisplayXRShellSetup-*.exe`, installs into the runtime tree (`C:\Program Files\DisplayXR\Runtime\displayxr-shell.exe`), requires the runtime as a hard prereq (`HKLM\Software\DisplayXR\Runtime\InstallPath`), and registers at `HKLM\Software\DisplayXR\WorkspaceControllers\shell`. **This repo does NOT build a shell binary** — any `_package\bin\displayxr-shell.exe` is stale; ignore/delete. The runtime owns no specific workspace app; third-party verticals follow the same registration contract (`docs/specs/runtime/workspace-controller-registration.md`).
 
-`displayxr-shell.exe` auto-starts the service, activates shell mode via IPC, sets `XR_RUNTIME_JSON` + `DISPLAYXR_WORKSPACE_SESSION=1`, launches apps, and monitors clients:
+**Orchestration topology (who starts whom).** `displayxr-service.exe` is the **always-on orchestrator** — it auto-starts at logon (`HKLM\…\Run\DisplayXR Service`), runs as a tray daemon, and *it* spawns children **on demand**: the workspace controller (shell) via the Ctrl+Space hotkey, and the WebXR bridge (`displayxr-webxr-bridge.exe`) via the :9014 trampoline (`src/xrt/targets/service/service_orchestrator.c`). So the service is the long-lived root; the shell and bridge are on-demand children. **Do not kill the service as part of test cleanup** — tearing down the shell + client apps is fine, but leaving the service down breaks on-demand orchestration until next logon (restart it non-elevated via `explorer.exe "…\displayxr-service.exe"`). The reverse direction below (shell starting the service) is a *fallback* for the direct CLI-launch path when the service isn't already up.
+
+`displayxr-shell.exe` (launched directly from the CLI) auto-starts the service if it isn't running, activates shell mode via IPC, sets `XR_RUNTIME_JSON` + `DISPLAYXR_WORKSPACE_SESSION=1`, launches apps, and monitors clients:
 ```
 "C:\Program Files\DisplayXR\Runtime\displayxr-shell.exe" app1.exe app2.exe
 ```
