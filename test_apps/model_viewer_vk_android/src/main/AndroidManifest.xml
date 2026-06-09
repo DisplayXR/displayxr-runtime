@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Copyright 2026, Leia Inc.
+    SPDX-License-Identifier: BSL-1.0
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+        Android 12+ package-visibility restriction: cross-package
+        intent queries return empty unless the caller declares what
+        it wants to see in <queries>. Without this, the Khronos
+        OpenXR loader's PackageManager scan for
+        org.khronos.openxr.OpenXRRuntimeService returns zero matches
+        and xrCreateInstance fails with XR_ERROR_RUNTIME_UNAVAILABLE
+        — even on a device that has the DisplayXR runtime installed.
+        See https://developer.android.com/training/package-visibility
+    -->
+    <queries>
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
+        </intent>
+        <!-- Explicit package visibility so we can wake the DisplayXR runtime
+             out of Android's "stopped" state before xrCreateInstance. -->
+        <package android:name="org.freedesktop.monado.openxr_runtime.in_process" />
+    </queries>
+
+    <uses-feature
+        android:glEsVersion="0x00030002"
+        android:required="false" />
+
+    <!--
+        CNSDK's face tracker uses the front-facing camera at runtime
+        (via libleiaSDK-faceTrackingInApp.so, loaded by the runtime
+        broker into this app's process). Without these declarations:
+          - CAMERA permission missing → camera open silently fails →
+            CNSDK never reports a face → all xrLocateViews calls use
+            the default centered eye position (no head tracking on
+            Lume Pad).
+          - uses-feature camera.front missing → Play Store filters
+            this app off devices that lack a front camera, AND
+            Android may not surface camera in the runtime permission
+            dialog.
+        Both required="false" so the same APK still installs on the
+        emulator (no camera hardware) — CNSDK is fine with no face.
+    -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.front" android:required="false" />
+
+    <!--
+        Long XR sessions don't generate user-input events; without
+        WAKE_LOCK the screen dims/sleeps and the session pauses.
+        FLAG_KEEP_SCREEN_ON would also work but requires the Activity
+        to set it programmatically — for a NativeActivity, easier to
+        request the permission and let the runtime keep the wake
+        lock for its session duration.
+    -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:allowBackup="false"
+        android:label="DisplayXR Model Viewer VK">
+
+        <!--
+            MainActivity is a thin Kotlin wrapper around NativeActivity
+            that requests CAMERA at onCreate so CNSDK's face tracker
+            can open the front camera at xrCreateSession. The
+            android.app.lib_name meta-data is still required so the
+            wrapper inherits the native lib load path from
+            NativeActivity.
+        -->
+        <!--
+            Orientation is NOT locked. The runtime + CNSDK detect the current
+            orientation and adapt the weave + face-detector axes, and re-adapt
+            on physical rotation — matching Leia-viewer behavior (confirmed:
+            the Leia viewer head-tracks correctly in landscape on this unit, so
+            the head-tracking service handles all orientations; forcing portrait
+            was our bug). configChanges keeps the NativeActivity alive across
+            rotations (the surface resizes instead of the activity recreating).
+        -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|keyboardHidden|screenSize"
+            android:launchMode="singleTask">
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="model_viewer_vk_android" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
