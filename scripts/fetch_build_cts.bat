@@ -26,11 +26,22 @@ set NINJA_DIR=%LOCALAPPDATA%\Microsoft\WinGet\Packages\Ninja-build.Ninja_Microso
 :: 1. MSVC environment (same as build_windows.bat)
 :: ------------------------------------------------------------
 echo === Setting up MSVC environment ===
+:: Skip vcvars if MSVC is already on PATH (e.g. CI ran msvc-dev-cmd).
+where cl.exe >nul 2>&1
+if %ERRORLEVEL% EQU 0 goto :msvc_ready
+:: Find any VS 2022 edition (Community/Professional/Enterprise/BuildTools) via vswhere.
+set "_VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if exist "%_VSWHERE%" for /f "usebackq tokens=*" %%i in (`"%_VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
+where cl.exe >nul 2>&1
+if %ERRORLEVEL% EQU 0 goto :msvc_ready
+:: Last-resort hardcoded Community path.
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
+where cl.exe >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
-    echo ERROR: Could not find Visual Studio 2022. Install VS 2022 with C++ workload.
+    echo ERROR: Could not find Visual Studio 2022 C++ tools ^(tried PATH, vswhere, Community^).
     exit /b 1
 )
+:msvc_ready
 if exist "%NINJA_DIR%\ninja.exe" set "PATH=%NINJA_DIR%;%PATH%"
 if exist "%VULKAN_SDK%\Bin" set "PATH=%VULKAN_SDK%\Bin;%PATH%"
 
