@@ -40,6 +40,11 @@
  * specific vendor (issue #256 / ADR-019).
  */
 #include "d3d11_service/comp_d3d11_service.h"
+#ifdef XRT_OS_ANDROID
+// Out-of-process Android (#510): the per-client compositor is a multi_compositor;
+// the server pulls its live present-target extent for the client's Kooima.
+#include "multi/comp_multi_private.h"
+#endif
 // Shared Kooima rig math (#396 W7): same displayxr-common core as the
 // in-process oxr_session.c path and every app/engine consumer.
 #include "displayxr_math_xrt.h"
@@ -1744,6 +1749,14 @@ ipc_handle_compositor_get_window_metrics(volatile struct ipc_client_state *ics,
 			         (double)wm.window_center_offset_y_m,
 			         (double)wm.window_center_offset_z_m);
 		}
+	}
+#elif defined(XRT_OS_ANDROID)
+	// Out-of-process Android (#510): the per-client compositor is a
+	// multi_compositor driving a per-session comp_window_android target. Return
+	// its live extent so the client's oxr swaps the Kooima display meters to the
+	// held orientation (#499). xc is NULL for headless / pre-render sessions.
+	if (ics->xc != NULL) {
+		(void)multi_compositor_get_window_metrics(multi_compositor(ics->xc), &wm);
 	}
 #else
 	(void)ics;
