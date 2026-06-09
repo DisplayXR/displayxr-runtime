@@ -80,6 +80,15 @@ android {
         }
     }
 
+    // Ship the shared Wood_Crate textures (basecolor / normal / AO) in the APK
+    // assets so the native crate_scene loads them via AAssetManager (#499). The
+    // same JPEGs the Windows / macOS cubes use, in test_apps/common/textures.
+    sourceSets {
+        main {
+            assets.srcDirs += ['../common/textures']
+        }
+    }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
