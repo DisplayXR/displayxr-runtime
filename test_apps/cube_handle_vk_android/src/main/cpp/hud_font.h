@@ -41,14 +41,21 @@ struct HudFont {
 	float pixel_height = 0.0f;
 	HudFontBakedChar chars[HUD_FONT_NUM_CHARS] = {};
 
-	// Descriptor + pipeline.
+	// Descriptor + text pipeline.
 	VkDescriptorSetLayout dset_layout = VK_NULL_HANDLE;
 	VkDescriptorPool dpool = VK_NULL_HANDLE;
 	VkDescriptorSet dset = VK_NULL_HANDLE;
 	VkPipelineLayout pipe_layout = VK_NULL_HANDLE;
 	VkPipeline pipeline = VK_NULL_HANDLE;
 
-	// Persistently-mapped quad vertex buffer ({vec2 pos; vec2 uv}).
+	// SDF rounded-rect panel pipeline (no texture; smooth antialiased corners).
+	VkPipelineLayout panel_layout = VK_NULL_HANDLE;
+	VkPipeline panel_pipeline = VK_NULL_HANDLE;
+	VkBuffer panel_vbuf = VK_NULL_HANDLE;
+	VkDeviceMemory panel_vbuf_mem = VK_NULL_HANDLE;
+	void *panel_vbuf_mapped = nullptr;
+
+	// Persistently-mapped glyph quad vertex buffer ({vec2 pos; vec2 uv}).
 	VkBuffer vbuf = VK_NULL_HANDLE;
 	VkDeviceMemory vbuf_mem = VK_NULL_HANDLE;
 	void *vbuf_mapped = nullptr;
@@ -65,9 +72,16 @@ bool hud_font_init(HudFont &f, VkPhysicalDevice phys, VkDevice device, VkQueue q
 //   ox, oy      — top-left of the text block, in HUD NDC (pre-vflip).
 //   ndc_per_px  — NDC units per font pixel (controls on-screen size).
 //   line_step   — NDC advance between lines.
-// Returns the vertex count to pass to hud_font_draw().
+// Returns the vertex count to pass to hud_font_draw(). If out_bbox != null it
+// receives the text's tight bounds in HUD NDC {minX, minY, maxX, maxY} — use it
+// to size a snug panel.
 uint32_t hud_font_build(HudFont &f, const char *text, float ox, float oy, float ndc_per_px,
-                        float line_step);
+                        float line_step, float out_bbox[4]);
+
+// Draw a smooth antialiased rounded-rect panel (SDF) covering NDC rect
+// (x0,y0)-(x1,y1). radius/aa are in NDC. color is RGBA (alpha = panel opacity).
+void hud_font_draw_panel(HudFont &f, VkCommandBuffer cmd, const float mvp[16], float x0, float y0,
+                         float x1, float y1, float radius, float aa, const float color[4]);
 
 // Draw the built quads. mvp = the HUD MVP (the v-flip the app already uses);
 // color = RGBA (alpha multiplies the glyph coverage).

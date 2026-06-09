@@ -1631,6 +1631,14 @@ build_hud(CubeVertex *v)
 {
 	uint32_t n = 0;
 
+	// When the stb_truetype font is up, the HUD is drawn entirely by hud_font
+	// (a smooth SDF panel sized snugly to the text + crisp glyphs) — this
+	// legacy bitmap path (panel + 3x5 glyphs) is only the no-font fallback.
+	if (g_hud_font.ready) {
+		g_hud_panel_n = 0;
+		return 0;
+	}
+
 	// ── translucent rounded panel (drawn first; alpha comes from the blend
 	// constant). The HUD MVP v-flips Y, so y≈-0.80 is the TOP edge; the panel
 	// hangs down from there into the top-left corner. Rounded corners are the
@@ -1946,13 +1954,14 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 	// Build the crisp stb_truetype text once per frame (drawn per tile below,
 	// on top of the translucent panel). The panel top-left is (-0.975,-0.800).
 	uint32_t hud_text_n = 0;
+	float hud_bbox[4] = {0, 0, 0, 0};  // tight text bounds (NDC) → snug panel
 	if (g_hud_font.ready) {
 		char xb[16], yb[16], zb[16], block[80];
 		hud_ftoa(g_eye_x.load(std::memory_order_relaxed), xb, sizeof xb);
 		hud_ftoa(g_eye_y.load(std::memory_order_relaxed), yb, sizeof yb);
 		hud_ftoa(g_eye_z.load(std::memory_order_relaxed), zb, sizeof zb);
 		snprintf(block, sizeof block, "X %s\nY %s\nZ %s", xb, yb, zb);
-		hud_text_n = hud_font_build(g_hud_font, block, -0.945f, -0.775f, 0.0013f, 0.085f);
+		hud_text_n = hud_font_build(g_hud_font, block, -0.945f, -0.775f, 0.0013f, 0.085f, hud_bbox);
 	}
 
 	for (uint32_t i = 0; i < view_count; ++i) {
@@ -2024,8 +2033,12 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 			}
 		}
 
-		// Crisp antialiased text on top (its own textured pipeline + atlas).
+		// Smooth SDF panel sized snugly to the text, then crisp glyphs on top.
 		if (g_hud_font.ready && hud_text_n > 0) {
+			const float padx = 0.030f, pady = 0.024f;  // margin around the text
+			const float pcol[4] = {0.05f, 0.06f, 0.12f, 0.72f};
+			hud_font_draw_panel(g_hud_font, cmd, hud_mvp.m, hud_bbox[0] - padx, hud_bbox[1] - pady,
+			                    hud_bbox[2] + padx, hud_bbox[3] + pady, 0.022f, 0.0045f, pcol);
 			const float text_col[4] = {0.92f, 0.96f, 1.0f, 1.0f};
 			hud_font_draw(g_hud_font, cmd, hud_mvp.m, text_col, hud_text_n);
 		}

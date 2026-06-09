@@ -435,6 +435,114 @@ hud_font_init(HudFont &f, VkPhysicalDevice phys, VkDevice device, VkQueue queue,
 	}
 	vkMapMemory(device, f.vbuf_mem, 0, sizeof(TextVtx) * kMaxVerts, 0, &f.vbuf_mapped);
 
+	// ── 6. SDF rounded-rect panel pipeline (smooth corners, no texture). Same
+	// {vec2 pos; vec2 c} vertex layout + alpha blend + no-depth as the text
+	// pipeline; differs only in shaders and a larger push block. ──
+	{
+		VkPushConstantRange ppcr = {};
+		ppcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+		ppcr.offset = 0;
+		ppcr.size = 96; // mat4(64)+vec4(16)+vec2(8)+float(4)+float(4)
+		VkPipelineLayoutCreateInfo ppli = {};
+		ppli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+		ppli.pushConstantRangeCount = 1;
+		ppli.pPushConstantRanges = &ppcr;
+		if (vkCreatePipelineLayout(device, &ppli, nullptr, &f.panel_layout) != VK_SUCCESS) {
+			HFLOGE("hud_font: panel layout failed");
+			return false;
+		}
+		VkShaderModule pv = make_shader(device, g_hudPanelVertSpv, sizeof(g_hudPanelVertSpv));
+		VkShaderModule pf = make_shader(device, g_hudPanelFragSpv, sizeof(g_hudPanelFragSpv));
+		VkPipelineShaderStageCreateInfo pst[2] = {};
+		pst[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		pst[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+		pst[0].module = pv;
+		pst[0].pName = "main";
+		pst[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		pst[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+		pst[1].module = pf;
+		pst[1].pName = "main";
+		VkVertexInputBindingDescription pbind = {0, sizeof(TextVtx), VK_VERTEX_INPUT_RATE_VERTEX};
+		VkVertexInputAttributeDescription pattrs[2] = {};
+		pattrs[0] = {0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(TextVtx, pos)};
+		pattrs[1] = {1, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(TextVtx, uv)}; // uv slot = centered coord
+		VkPipelineVertexInputStateCreateInfo pvis = {};
+		pvis.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+		pvis.vertexBindingDescriptionCount = 1;
+		pvis.pVertexBindingDescriptions = &pbind;
+		pvis.vertexAttributeDescriptionCount = 2;
+		pvis.pVertexAttributeDescriptions = pattrs;
+		VkPipelineInputAssemblyStateCreateInfo pia = {};
+		pia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+		pia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+		VkPipelineViewportStateCreateInfo pvp = {};
+		pvp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+		pvp.viewportCount = 1;
+		pvp.scissorCount = 1;
+		VkPipelineRasterizationStateCreateInfo prs = {};
+		prs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+		prs.polygonMode = VK_POLYGON_MODE_FILL;
+		prs.cullMode = VK_CULL_MODE_NONE;
+		prs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+		prs.lineWidth = 1.0f;
+		VkPipelineMultisampleStateCreateInfo pms = {};
+		pms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+		pms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+		VkPipelineColorBlendAttachmentState pcba = {};
+		pcba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+		                      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+		pcba.blendEnable = VK_TRUE;
+		pcba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+		pcba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+		pcba.colorBlendOp = VK_BLEND_OP_ADD;
+		pcba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+		pcba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+		pcba.alphaBlendOp = VK_BLEND_OP_ADD;
+		VkPipelineColorBlendStateCreateInfo pcb = {};
+		pcb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+		pcb.attachmentCount = 1;
+		pcb.pAttachments = &pcba;
+		VkPipelineDepthStencilStateCreateInfo pds = {};
+		pds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+		pds.depthTestEnable = VK_FALSE;
+		pds.depthWriteEnable = VK_FALSE;
+		const VkDynamicState pdyns[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+		VkPipelineDynamicStateCreateInfo pdyn = {};
+		pdyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+		pdyn.dynamicStateCount = 2;
+		pdyn.pDynamicStates = pdyns;
+		VkGraphicsPipelineCreateInfo pgpi = {};
+		pgpi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+		pgpi.stageCount = 2;
+		pgpi.pStages = pst;
+		pgpi.pVertexInputState = &pvis;
+		pgpi.pInputAssemblyState = &pia;
+		pgpi.pViewportState = &pvp;
+		pgpi.pRasterizationState = &prs;
+		pgpi.pMultisampleState = &pms;
+		pgpi.pColorBlendState = &pcb;
+		pgpi.pDepthStencilState = &pds;
+		pgpi.pDynamicState = &pdyn;
+		pgpi.layout = f.panel_layout;
+		pgpi.renderPass = rp;
+		pgpi.subpass = 0;
+		VkResult ppr =
+		    vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pgpi, nullptr, &f.panel_pipeline);
+		vkDestroyShaderModule(device, pv, nullptr);
+		vkDestroyShaderModule(device, pf, nullptr);
+		if (ppr != VK_SUCCESS) {
+			HFLOGE("hud_font: panel pipeline failed (%d)", (int)ppr);
+			return false;
+		}
+		if (!make_buffer(phys, device, sizeof(TextVtx) * 6, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+		                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		                 f.panel_vbuf, f.panel_vbuf_mem)) {
+			HFLOGE("hud_font: panel vbuf failed");
+			return false;
+		}
+		vkMapMemory(device, f.panel_vbuf_mem, 0, sizeof(TextVtx) * 6, 0, &f.panel_vbuf_mapped);
+	}
+
 	f.ready = true;
 	HFLOGI("hud_font: ready (atlas %ux%u, %.0fpx, %d baked rows)", f.atlas_w, f.atlas_h,
 	       pixel_height, baked_rows);
@@ -442,14 +550,19 @@ hud_font_init(HudFont &f, VkPhysicalDevice phys, VkDevice device, VkQueue queue,
 }
 
 uint32_t
-hud_font_build(HudFont &f, const char *text, float ox, float oy, float ndc_per_px, float line_step)
+hud_font_build(HudFont &f, const char *text, float ox, float oy, float ndc_per_px, float line_step,
+               float out_bbox[4])
 {
+	if (out_bbox) {
+		out_bbox[0] = out_bbox[1] = out_bbox[2] = out_bbox[3] = 0.0f;
+	}
 	if (!f.ready || !f.vbuf_mapped || !text) {
 		return 0;
 	}
 	TextVtx *v = (TextVtx *)f.vbuf_mapped;
 	uint32_t n = 0;
 	const stbtt_bakedchar *cd = (const stbtt_bakedchar *)f.chars;
+	float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;
 
 	int line = 0;
 	float xpos = 0.0f;
@@ -483,6 +596,16 @@ hud_font_build(HudFont &f, const char *text, float ox, float oy, float ndc_per_p
 		v[n++] = {{x0, y0}, {q.s0, q.t0}};
 		v[n++] = {{x1, y1}, {q.s1, q.t1}};
 		v[n++] = {{x0, y1}, {q.s0, q.t1}};
+		if (x0 < bx0) bx0 = x0;
+		if (y0 < by0) by0 = y0;
+		if (x1 > bx1) bx1 = x1;
+		if (y1 > by1) by1 = y1;
+	}
+	if (out_bbox && n > 0) {
+		out_bbox[0] = bx0;
+		out_bbox[1] = by0;
+		out_bbox[2] = bx1;
+		out_bbox[3] = by1;
 	}
 	return n;
 }
@@ -508,6 +631,39 @@ hud_font_draw(HudFont &f, VkCommandBuffer cmd, const float mvp[16], const float 
 }
 
 void
+hud_font_draw_panel(HudFont &f, VkCommandBuffer cmd, const float mvp[16], float x0, float y0,
+                    float x1, float y1, float radius, float aa, const float color[4])
+{
+	if (!f.ready || !f.panel_vbuf_mapped) {
+		return;
+	}
+	const float hx = 0.5f * (x1 - x0), hy = 0.5f * (y1 - y0);
+	// 6 verts: NDC corner + centered coord (corner relative to panel center).
+	TextVtx *v = (TextVtx *)f.panel_vbuf_mapped;
+	v[0] = {{x0, y0}, {-hx, -hy}};
+	v[1] = {{x1, y0}, {hx, -hy}};
+	v[2] = {{x1, y1}, {hx, hy}};
+	v[3] = {{x0, y0}, {-hx, -hy}};
+	v[4] = {{x1, y1}, {hx, hy}};
+	v[5] = {{x0, y1}, {-hx, hy}};
+
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, f.panel_pipeline);
+	float push[24]; // mat4(16) + color(4) + halfSize(2) + radius(1) + aa(1)
+	memcpy(push, mvp, sizeof(float) * 16);
+	memcpy(push + 16, color, sizeof(float) * 4);
+	push[20] = hx;
+	push[21] = hy;
+	push[22] = radius;
+	push[23] = aa;
+	vkCmdPushConstants(cmd, f.panel_layout,
+	                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push),
+	                   push);
+	VkDeviceSize off = 0;
+	vkCmdBindVertexBuffers(cmd, 0, 1, &f.panel_vbuf, &off);
+	vkCmdDraw(cmd, 6, 1, 0, 0);
+}
+
+void
 hud_font_destroy(HudFont &f)
 {
 	if (f.device == VK_NULL_HANDLE) {
@@ -520,6 +676,11 @@ hud_font_destroy(HudFont &f)
 	}
 	if (f.vbuf) vkDestroyBuffer(d, f.vbuf, nullptr);
 	if (f.vbuf_mem) vkFreeMemory(d, f.vbuf_mem, nullptr);
+	if (f.panel_vbuf_mapped) vkUnmapMemory(d, f.panel_vbuf_mem);
+	if (f.panel_vbuf) vkDestroyBuffer(d, f.panel_vbuf, nullptr);
+	if (f.panel_vbuf_mem) vkFreeMemory(d, f.panel_vbuf_mem, nullptr);
+	if (f.panel_pipeline) vkDestroyPipeline(d, f.panel_pipeline, nullptr);
+	if (f.panel_layout) vkDestroyPipelineLayout(d, f.panel_layout, nullptr);
 	if (f.pipeline) vkDestroyPipeline(d, f.pipeline, nullptr);
 	if (f.pipe_layout) vkDestroyPipelineLayout(d, f.pipe_layout, nullptr);
 	if (f.dpool) vkDestroyDescriptorPool(d, f.dpool, nullptr);
