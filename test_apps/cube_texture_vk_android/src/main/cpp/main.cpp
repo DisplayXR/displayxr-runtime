@@ -191,21 +191,30 @@ Mat4 view_from_pose(const XrPosef &p) {
     v.m[15] = 1.0f;
     return v;
 }
-// Asymmetric-FOV projection for Vulkan clip (z in [0,1], y down). Mirrors
-// XrMatrix4x4f_CreateProjectionFov(GRAPHICS_VULKAN).
-Mat4 proj_from_fov(const XrFovf &fov, float nearZ, float farZ) {
+// Asymmetric-FOV projection for Vulkan clip (z in [0,1]). Mirrors
+// cube_handle_vk_android: the runtime reports a near-square per-eye FOV but the
+// eye image is 16:10, so derive the horizontal scale from the vertical FOV +
+// the real viewport aspect (keeps vertical FOV, un-stretches horizontally).
+// m[5]/m[9] are negated for Vulkan's flipped clip-space Y.
+Mat4 proj_from_fov(const XrFovf &fov, float aspect_w_over_h, float nearZ, float farZ) {
     float tl = tanf(fov.angleLeft), tr = tanf(fov.angleRight);
-    float tu = tanf(fov.angleUp), td = tanf(fov.angleDown);
-    float w = tr - tl, h = (td - tu);  // Vulkan: y down
-    Mat4 r{};
-    r.m[0] = 2.0f / w;
-    r.m[5] = 2.0f / h;
-    r.m[8] = (tr + tl) / w;
-    r.m[9] = (tu + td) / h;
-    r.m[10] = -(farZ) / (farZ - nearZ);
-    r.m[11] = -1.0f;
-    r.m[14] = -(farZ * nearZ) / (farZ - nearZ);
-    return r;
+    float td = tanf(fov.angleDown), tu = tanf(fov.angleUp);
+    float tan_w = tr - tl, tan_h = tu - td;
+    Mat4 p{};
+    p.m[0] = 2.0f / tan_w;
+    p.m[5] = 2.0f / tan_h;
+    p.m[8] = (tr + tl) / tan_w;
+    p.m[9] = (tu + td) / tan_h;
+    p.m[10] = -farZ / (farZ - nearZ);
+    p.m[11] = -1.0f;
+    p.m[14] = -(farZ * nearZ) / (farZ - nearZ);
+    if (aspect_w_over_h > 0.0f) {
+        p.m[0] = (2.0f / tan_h) / aspect_w_over_h;  // un-stretch horizontally
+        p.m[8] = 0.0f;                              // symmetric Leia FOV
+    }
+    p.m[5] = -p.m[5];  // Vulkan Y flip
+    p.m[9] = -p.m[9];
+    return p;
 }
 Mat4 cube_model(float angle) {
     float c = cosf(angle), s = sinf(angle);
@@ -932,7 +941,16 @@ void record_cube(uint32_t v, uint32_t img, const XrView &view) {
     vkCmdBindVertexBuffers(cmd, 0, 1, &g_cube_vbuf, &off);
     vkCmdBindIndexBuffer(cmd, g_cube_ibuf, 0, VK_INDEX_TYPE_UINT16);
 
-    Mat4 proj = proj_from_fov(view.fov, 0.05f, 100.0f);
+    // Aspect un-stretch (16:10 eye image vs near-square FOV) + orientation-aware
+    // vertical un-squish: the portrait-panel weave rotates the eye tile, so
+    // portrait needs yscale<1 (matches cube_handle_vk_android). Orientation is
+    // derived from the panel/window dims (no rotation push in this port).
+    float aspect = (float)g_views[v].width / (float)g_views[v].height;
+    bool is_landscape = g_shared_w >= g_shared_h;
+    float yscale = is_landscape ? 1.0f : 0.6f;
+    Mat4 proj = proj_from_fov(view.fov, aspect, 0.05f, 100.0f);
+    proj.m[5] *= yscale;
+    proj.m[9] *= yscale;
     Mat4 vmat = view_from_pose(view.pose);
     Mat4 model = cube_model((float)g_frame_count * 0.01f);
     struct { Mat4 mvp; Mat4 model; } pcd;
