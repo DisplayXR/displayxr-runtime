@@ -40,13 +40,20 @@
  * specific vendor (issue #256 / ADR-019).
  */
 #include "d3d11_service/comp_d3d11_service.h"
+#endif
+
 #ifdef XRT_OS_ANDROID
 // Out-of-process Android (#510): the per-client compositor is a multi_compositor;
-// the server pulls its live present-target extent for the client's Kooima.
+// the server pulls its live present-target extent for the client's Kooima and
+// runs the server-side Kooima for the null+comp_multi path (no D3D11 service).
 #include "multi/comp_multi_private.h"
+#include "xrt/xrt_display_metrics.h" // struct xrt_eye_positions (DP-tracked eyes; Leia M2)
 #endif
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) || defined(XRT_OS_ANDROID)
 // Shared Kooima rig math (#396 W7): same displayxr-common core as the
-// in-process oxr_session.c path and every app/engine consumer.
+// in-process oxr_session.c path and every app/engine consumer. Both server-side
+// Kooima paths (D3D11 service on Windows, null+comp_multi on Android) use it.
 #include "displayxr_math_xrt.h"
 #endif
 
@@ -131,7 +138,7 @@ validate_device_id(volatile struct ipc_client_state *ics, int64_t device_id, str
 	} while (0)
 
 
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) || defined(XRT_OS_ANDROID)
 /*!
  * Fill surplus view slots [from, view_count) with valid poses.
  *
@@ -167,7 +174,9 @@ fill_surplus_view_poses(struct xrt_device *xdev,
 		}
 	}
 }
+#endif // D3D11 service || Android — fill_surplus_view_poses
 
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 /*!
  * Try to get SR-aware view poses for IPC clients.
  * Returns true if SR view poses were computed, false to fall back to device poses.
@@ -739,6 +748,236 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 	return true;
 }
 #endif // XRT_HAVE_D3D11_SERVICE_COMPOSITOR
+
+#ifdef XRT_OS_ANDROID
+/*!
+ * Server-side Kooima for the out-of-process Android path (#510).
+ *
+ * On Android the runtime service runs the null compositor + comp_multi (NOT the
+ * D3D11 service compositor), so ipc_try_get_sr_view_poses above is compiled out.
+ * This is its analogue for the null+comp_multi path: it computes orientation-
+ * aware, render-ready off-axis FOVs + head-local poses via the SAME shared
+ * displayxr-common Kooima core (dxr_xrt_display3d_compute_views) used by the
+ * D3D11 server and the in-process oxr_session.c path. Without it,
+ * ipc_handle_session_locate_views_rig falls back to xrt_device_get_view_poses →
+ * sim_display's FIXED landscape device FOV (portrait stretched, 2D off-center).
+ *
+ * Inputs mirror the in-process block (oxr_session.c:1512-1797):
+ *   - screen meters: the head display dims from xrt_system_compositor_info.
+ *   - live window px + orientation swap: multi_compositor_get_window_metrics
+ *     (#499 — a vendor DP can report a fixed landscape size while the panel
+ *     rotates; swap the meters so the Kooima aspect matches the held orientation).
+ *   - eyes: DP-tracked if the per-session DP provides them (Leia/M2), else the
+ *     nominal viewer from the system compositor info (sim_display has no tracking).
+ *
+ * Returns true on success; false → caller's legacy device-poses fallback.
+ */
+static bool
+ipc_try_get_android_view_poses(volatile struct ipc_client_state *ics,
+                               struct xrt_device *head,
+                               const struct xrt_vec3 *fallback_eye_relation,
+                               int64_t at_timestamp_ns,
+                               uint32_t view_count,
+                               const struct ipc_view_rig_info *rig,
+                               struct ipc_info_locate_views_rig *rig_reply,
+                               struct xrt_space_relation *out_head_relation,
+                               struct xrt_fov *out_fovs,
+                               struct xrt_pose *out_poses)
+{
+	struct ipc_server *s = ics->server;
+	(void)at_timestamp_ns;
+
+	if (view_count < 1 || view_count > XRT_MAX_VIEWS) {
+		return false;
+	}
+	if (s->xsysc == NULL || ics->xc == NULL) {
+		return false;
+	}
+	struct multi_compositor *mc = multi_compositor(ics->xc);
+	if (mc == NULL) {
+		return false;
+	}
+
+	// Screen meters from the head display dims (sim_display 0.344x0.194
+	// landscape; a vendor DP reports its panel). Bail to the legacy path if
+	// unknown — the Kooima needs a real physical size.
+	float screen_width_m = s->xsysc->info.display_width_m;
+	float screen_height_m = s->xsysc->info.display_height_m;
+	if (screen_width_m <= 0.0f || screen_height_m <= 0.0f) {
+		static bool logged_no_dims = false;
+		if (!logged_no_dims) {
+			logged_no_dims = true;
+			IPC_WARN(s, "android Kooima: no display dims from xsysc, using legacy poses");
+		}
+		return false;
+	}
+
+	// Live window px + #499 orientation swap: if the held orientation disagrees
+	// with the physical-dims orientation, swap the meters so the FOV aspect
+	// follows the panel. Android metrics carry identity orientation + zero
+	// center offset (display-centric), so no window-local eye rebase is needed.
+	struct xrt_window_metrics wm = {0};
+	bool have_wm = multi_compositor_get_window_metrics(mc, &wm);
+	if (have_wm && wm.window_pixel_width > 0 && wm.window_pixel_height > 0) {
+		bool win_landscape = wm.window_pixel_width >= wm.window_pixel_height;
+		bool dims_landscape = screen_width_m >= screen_height_m;
+		if (win_landscape != dims_landscape) {
+			float tmp = screen_width_m;
+			screen_width_m = screen_height_m;
+			screen_height_m = tmp;
+		}
+	}
+
+	// Eyes: DP-tracked if available (Leia/M2 plugs in here unchanged), else the
+	// nominal viewer + a default IPD. head_eyes is the head's actual L/R pair
+	// (reported verbatim in the raw block for the app's HUD); raw_eyes is the
+	// render input (collapsed to a centered eye for 2D below).
+	struct xrt_vec3 head_eyes[2];
+	uint32_t head_eye_count = 2;
+	bool is_tracking = false;
+	int64_t sample_time_ns = 0;
+	struct xrt_eye_positions eyes = {0};
+	bool have_dp_eyes = multi_compositor_get_predicted_eye_positions(mc, &eyes) && eyes.valid && eyes.count > 0;
+	if (have_dp_eyes) {
+		uint32_t i1 = (eyes.count >= 2) ? 1 : 0;
+		head_eyes[0] = (struct xrt_vec3){eyes.eyes[0].x, eyes.eyes[0].y, eyes.eyes[0].z};
+		head_eyes[1] = (struct xrt_vec3){eyes.eyes[i1].x, eyes.eyes[i1].y, eyes.eyes[i1].z};
+		head_eye_count = (eyes.count >= 2) ? 2 : 1;
+		is_tracking = eyes.is_tracking;
+		sample_time_ns = eyes.timestamp_ns;
+	} else {
+		float ipd = (fallback_eye_relation != NULL && fallback_eye_relation->x > 0.0f)
+		                ? fallback_eye_relation->x
+		                : 0.063f;
+		float nx = s->xsysc->info.nominal_viewer_x_m;
+		float ny = s->xsysc->info.nominal_viewer_y_m;
+		float nz = s->xsysc->info.nominal_viewer_z_m;
+		if (nz <= 0.0f) {
+			nz = 0.6f; // sane default if the DP left it unset
+		}
+		head_eyes[0] = (struct xrt_vec3){nx - ipd * 0.5f, ny, nz};
+		head_eyes[1] = (struct xrt_vec3){nx + ipd * 0.5f, ny, nz};
+	}
+
+	// Render input. 2D / mono (view_count == 1): collapse to a CENTERED eye so
+	// the off-axis frustum is symmetric (no off-center crop). 3D: per-eye
+	// off-axis. Gate on the active mode's view_count directly (the cube is an
+	// extension app, so the in-process legacy_app_tile_scaling gate doesn't apply).
+	struct xrt_vec3 raw_eyes[XRT_MAX_VIEWS] = {0};
+	uint32_t eye_count;
+	if (view_count == 1) {
+		raw_eyes[0] = (struct xrt_vec3){
+		    0.5f * (head_eyes[0].x + head_eyes[1].x),
+		    0.5f * (head_eyes[0].y + head_eyes[1].y),
+		    0.5f * (head_eyes[0].z + head_eyes[1].z),
+		};
+		eye_count = 1;
+	} else {
+		raw_eyes[0] = head_eyes[0];
+		raw_eyes[1] = head_eyes[1];
+		eye_count = 2;
+	}
+
+	// A chained XR_EXT_view_rig DISPLAY descriptor (the cube's orbit camera)
+	// supplies the world-space display pose + tunables; otherwise identity pose
+	// with default display tunables. CAMERA rigs aren't expected on this path —
+	// treat anything but DISPLAY as no-rig display-centric.
+	const bool rig_display = rig != NULL && rig->rig_type == IPC_VIEW_RIG_DISPLAY;
+	struct xrt_vec3 display_pos = rig_display ? rig->pose.position : (struct xrt_vec3){0, 0, 0};
+	struct xrt_quat display_ori = rig_display ? rig->pose.orientation : (struct xrt_quat)XRT_QUAT_IDENTITY;
+
+	dxr_screen scr = {screen_width_m, screen_height_m};
+	struct xrt_pose display_pose = {display_ori, display_pos};
+
+	struct xrt_vec3 nominal_viewer = {0.0f, s->xsysc->info.nominal_viewer_y_m, s->xsysc->info.nominal_viewer_z_m};
+	const struct xrt_vec3 *rig_nominal = rig_display ? &nominal_viewer : NULL;
+
+	dxr_display3d_tunables dt = dxr_display3d_default_tunables();
+	if (rig_display) {
+		dt.ipd_factor = rig->ipd_factor;
+		dt.parallax_factor = rig->parallax_factor;
+		dt.perspective_factor = rig->perspective_factor;
+		dt.virtual_display_height = rig->virtual_display_height;
+	} else {
+		dt.virtual_display_height = screen_height_m; // identity m2v
+	}
+
+	struct dxr_xrt_view disp_views[XRT_MAX_VIEWS];
+	dxr_xrt_display3d_compute_views(raw_eyes, eye_count, rig_nominal, &scr, &dt, &display_pose, disp_views);
+
+	out_head_relation->relation_flags =
+	    (enum xrt_space_relation_flags)(XRT_SPACE_RELATION_POSITION_VALID_BIT |
+	                                    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
+	                                    XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
+	                                    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT);
+	out_head_relation->pose.position = display_pos;
+	out_head_relation->pose.orientation = display_ori;
+
+	// Convert the world-space rig eyes to head-local poses (mirrors the D3D11
+	// server tail, ipc_server_handler.c display-centric branch).
+	struct xrt_quat inv_ori;
+	math_quat_invert(&display_ori, &inv_ori);
+	for (uint32_t i = 0; i < eye_count; i++) {
+		out_fovs[i] = disp_views[i].fov;
+		struct xrt_vec3 diff = {
+		    disp_views[i].eye_world.x - display_pos.x,
+		    disp_views[i].eye_world.y - display_pos.y,
+		    disp_views[i].eye_world.z - display_pos.z,
+		};
+		math_quat_rotate_vec3(&inv_ori, &diff, &out_poses[i].position);
+		out_poses[i].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+		if (rig_reply != NULL) {
+			rig_reply->eye_world[i] = disp_views[i].eye_world;
+		}
+	}
+
+	// XR_EXT_view_rig raw channel: the head's actual display-space eyes (the
+	// face-dot the app HUD reads), plus the display plane + canvas. Reported
+	// independent of the 2D render collapse above.
+	if (rig_reply != NULL) {
+		rig_reply->raw.eyes[0] = head_eyes[0];
+		rig_reply->raw.eyes[1] = head_eyes[1];
+		rig_reply->raw.eye_count = head_eye_count;
+		rig_reply->raw.sample_time_ns = sample_time_ns;
+		rig_reply->raw.is_tracking = is_tracking ? 1u : 0u;
+		rig_reply->raw.display_pose = display_pose;
+		rig_reply->raw.rect_x_px = 0;
+		rig_reply->raw.rect_y_px = 0;
+		rig_reply->raw.rect_w_px =
+		    (have_wm && wm.window_pixel_width > 0) ? (int32_t)wm.window_pixel_width
+		                                           : (int32_t)s->xsysc->info.display_pixel_width;
+		rig_reply->raw.rect_h_px =
+		    (have_wm && wm.window_pixel_height > 0) ? (int32_t)wm.window_pixel_height
+		                                            : (int32_t)s->xsysc->info.display_pixel_height;
+		rig_reply->raw.size_w_m = screen_width_m;
+		rig_reply->raw.size_h_m = screen_height_m;
+		rig_reply->raw.valid = 1;
+		rig_reply->rig_applied = rig_display ? IPC_VIEW_RIG_DISPLAY : IPC_VIEW_RIG_NONE;
+	}
+
+	fill_surplus_view_poses(head, eye_count, view_count, out_fovs, out_poses);
+
+	// First-call + periodic (~5s @ 60fps) diagnostics — never per-frame.
+	static bool first_call = true;
+	if (first_call) {
+		first_call = false;
+		IPC_WARN(s, "android Kooima: FIRST CALL view_count=%u dp_eyes=%d screen=%.3fx%.3fm win_px=%ux%u",
+		         view_count, (int)have_dp_eyes, (double)screen_width_m, (double)screen_height_m,
+		         (unsigned)wm.window_pixel_width, (unsigned)wm.window_pixel_height);
+	}
+	static int log_counter = 0;
+	if (++log_counter >= 300) {
+		log_counter = 0;
+		float h = (out_fovs[0].angle_right - out_fovs[0].angle_left) * 180.0f / 3.14159265f;
+		float v = (out_fovs[0].angle_up - out_fovs[0].angle_down) * 180.0f / 3.14159265f;
+		IPC_WARN(s, "android Kooima: views=%u screen=%.3fx%.3fm FOV H=%.1f° V=%.1f° tracking=%d rig=%d",
+		         view_count, (double)screen_width_m, (double)screen_height_m, (double)h, (double)v,
+		         (int)is_tracking, (int)rig_display);
+	}
+
+	return true;
+}
+#endif // XRT_OS_ANDROID
 
 
 static xrt_result_t
@@ -4630,6 +4869,13 @@ ipc_handle_session_locate_views_rig(volatile struct ipc_client_state *ics,
 	if (ipc_try_get_sr_view_poses(ics, (struct xrt_compositor *)ics->xc, head, &fallback_eye_relation,
 	                               at_timestamp_ns, view_count, rig, out_info, &out_info->head_relation,
 	                               out_info->fovs, out_info->poses)) {
+		return XRT_SUCCESS;
+	}
+#elif defined(XRT_OS_ANDROID)
+	// Out-of-process Android (#510): the service runs null+comp_multi, not the
+	// D3D11 service compositor, so run the server-side Kooima for that path.
+	if (ipc_try_get_android_view_poses(ics, head, &fallback_eye_relation, at_timestamp_ns, view_count, rig,
+	                                   out_info, &out_info->head_relation, out_info->fovs, out_info->poses)) {
 		return XRT_SUCCESS;
 	}
 #else
