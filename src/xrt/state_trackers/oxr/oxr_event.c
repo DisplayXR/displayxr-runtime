@@ -627,17 +627,23 @@ oxr_event_remove_session_events(struct oxr_logger *log, struct oxr_session *sess
 XrResult
 oxr_poll_event(struct oxr_logger *log, struct oxr_instance *inst, XrEventDataBuffer *eventData)
 {
-	struct oxr_session *sess = inst->sessions;
 	XrResult ret;
 
-	while (sess) {
+	// Walk the session list under its lock so a concurrent xrCreateSession /
+	// xrDestroySession can't mutate the list or free a session mid-walk. The
+	// CTS multithreading test calls all three from different threads at once;
+	// without this the walk reads a freed session's ->next -> heap corruption.
+	// oxr_session_poll is non-blocking on this path, so holding the lock across
+	// it does not meaningfully stall create/destroy.
+	os_mutex_lock(&inst->sessions_mutex);
+	for (struct oxr_session *sess = inst->sessions; sess != NULL; sess = sess->next) {
 		ret = oxr_session_poll(log, sess);
 		if (ret != XR_SUCCESS) {
+			os_mutex_unlock(&inst->sessions_mutex);
 			return ret;
 		}
-
-		sess = sess->next;
 	}
+	os_mutex_unlock(&inst->sessions_mutex);
 
 	lock(inst);
 	struct oxr_event *event = pop(inst);
