@@ -44,6 +44,23 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!--
+        Android 11+ package visibility: the out-of-process runtime SERVICE
+        hosts the vendor display-processor plug-in (e.g. the Leia CNSDK),
+        whose loader calls PackageManager.getPackageInfo() on the on-device
+        LeiaSR services to bind them for display config + face tracking. Under
+        package visibility those packages are invisible unless declared here —
+        without this the CNSDK loader gets a NameNotFoundException it doesn't
+        clear, and the next JNI call trips CheckJNI → the service process
+        aborts (no tracked eyes). In-process apps declare these in their own
+        manifest; the OOP service must declare them itself. (#510 M2)
+    -->
+    <queries>
+        <package android:name="com.leialoft.display.config" />
+        <package android:name="com.leia.headtrackingservice" />
+        <package android:name="com.leiainc.media.service" />
+    </queries>
+
     <application
         android:name="org.freedesktop.monado.openxr_runtime.MonadoOpenXrApplication"
         android:allowBackup="true"
