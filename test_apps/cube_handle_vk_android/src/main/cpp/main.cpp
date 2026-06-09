@@ -170,6 +170,14 @@ constexpr float kRigVirtualDisplayHeight = 0.24f;
 std::atomic<float> g_cam_yaw{0.0f};
 std::atomic<float> g_cam_pitch{0.0f};
 
+// True while a finger is down — pauses the cube's auto-spin so a drag-orbit
+// isn't fighting a moving cube (and so releasing doesn't read as a "jump" as
+// the spin resumes). Set from the touch handler (UI thread), read by the
+// render loop. g_spin_angle accumulates only when not touching, so the spin
+// resumes smoothly from where it paused (no discontinuity).
+std::atomic<bool> g_touching{false};
+float g_spin_angle = 0.0f;  // render-thread only
+
 // The crate cube + grid scene, and the APK asset manager it loads textures
 // from (captured in android_main from app->activity->assetManager).
 CrateScene g_scene;
@@ -1846,7 +1854,12 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 	// lifted to y = 0.03). Grid: scaled 0.05 and lifted so its y=-1 line plane
 	// sits at the floor (y = 0). Column-major (M·v). Mirrors RenderScene() in
 	// cube_handle_vk_win.
-	const float angle = (float)g_frame_count * 0.02f;
+	// Accumulated spin angle — advances only when not being touched, so the
+	// cube holds still during a drag-orbit and resumes the spin smoothly.
+	if (!g_touching.load(std::memory_order_relaxed)) {
+		g_spin_angle += 0.02f;
+	}
+	const float angle = g_spin_angle;
 	const float ca = std::cos(angle), sa = std::sin(angle);
 	Mat4 cube_rot = mat4_identity();
 	cube_rot.m[0] = ca;  cube_rot.m[2] = -sa;
@@ -2373,8 +2386,9 @@ handle_cmd(struct android_app *app, int32_t cmd)
 // On-device input (MonadoView is FLAG_NOT_FOCUSABLE, so touch lands in this
 // NativeActivity input queue rather than the runtime's display window):
 //   - single-finger DRAG orbits the camera (updates the display-rig yaw/pitch
-//     the runtime projects through). The cube also auto-spins in world space,
-//     so the two compose (auto-spin + drag-orbit).
+//     the runtime projects through). The cube auto-spins when idle but HOLDS
+//     STILL while a finger is down (g_touching), so the drag isn't fighting a
+//     moving cube and releasing doesn't read as a spin "jump".
 //   - DOUBLE-TAP (two quick taps with no drag) cycles the rendering mode
 //     (2D / Anaglyph / Cropped-SBS / Squeezed-SBS / Quad …). Absolute switching
 //     is also available via `adb shell setprop debug.dxr.mode N`.
@@ -2400,6 +2414,7 @@ process_touch_event(int32_t action, float x, float y, int64_t time_ms)
 		last_x = x;
 		last_y = y;
 		moved_px = 0.0f;
+		g_touching.store(true, std::memory_order_relaxed);  // pause auto-spin
 		break;
 
 	case AMOTION_EVENT_ACTION_MOVE: {
@@ -2423,6 +2438,7 @@ process_touch_event(int32_t action, float x, float y, int64_t time_ms)
 	}
 
 	case AMOTION_EVENT_ACTION_UP: {
+		g_touching.store(false, std::memory_order_relaxed);  // resume auto-spin
 		// A drag (significant travel) never counts as a tap.
 		const float kTapSlopPx = 24.0f;
 		if (moved_px > kTapSlopPx) {
@@ -2440,6 +2456,10 @@ process_touch_event(int32_t action, float x, float y, int64_t time_ms)
 		}
 		break;
 	}
+
+	case AMOTION_EVENT_ACTION_CANCEL:
+		g_touching.store(false, std::memory_order_relaxed);  // resume auto-spin
+		break;
 
 	default:
 		break;
