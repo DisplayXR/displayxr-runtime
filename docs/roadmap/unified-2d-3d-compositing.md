@@ -108,6 +108,30 @@ Getting RGB right but alpha wrong does **not** corrupt the image — it silently
 
 Use **premultiplied** alpha for the 2D layer to avoid edge fringing along the 2D/3D boundary. When the 2D side graduates from a side-channel texture to a real composition layer (§6, Phase 3), OpenXR already models this via `XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT` — the layer carries its own alpha-mode flag, so we inherit a specified contract instead of inventing one.
 
+### 4.4 Two composite intents — the implicit alpha-over vs the explicit authored mask (#491)
+
+§4.0 argued for a *separate* mask: region-selection decoupled from the 2D layer's own alpha, so a translucent flat panel is a hard 2D region (`M=0`, weave suppressed) and its transparency resolves against the **desktop**. That is the right model for **one** designer intent — *"a flat 2D region (possibly translucent over the desktop) sitting beside the 3D."* But it is the **wrong default** for the other, more common intent — *"a glass/HUD panel **over** the live 3D scene"* — where a translucent panel should reveal the **3D**, not the desktop.
+
+**#491 resolves this with two paths, chosen by whether the mask is implicit or authored:**
+
+- **Implicit mask (auto, for a `XrCompositionLayerLocal2DEXT` with no authored zone mask) → premultiplied alpha-over.** The 2D layer's own (premultiplied) alpha **is** the blend:
+  ```
+  final = twod + (1 − twod.a) · weave        // premultiplied "over" of 2D atop the weave
+  ```
+  opaque 2D (`a=1`) → crisp flat panel; translucent (`a=0.5`) → **glass-over-3D** (the 3D scene shows through, tinted); uncovered (`a=0`) → full weave. This is the designer-intuitive default and matches every 2D compositor. (The §4.0 "interlace bleed" worry does not apply: seeing the woven 3D through a glass panel **is** the intent on a 3D display, and it reads as the 3D object behind glass — validated on Leia. The flat-region intent is still available — via an authored mask, below.)
+
+- **Explicit authored Tier-2/3 mask → the hard mask-lerp** (`final = M·weave + (1−M)·twod`, §4). This keeps the *"3D portal cut into a flat 2D world; the cut-out reveals desktop/backdrop regardless of 2D alpha"* intent. The author opts into region-selection-decoupled-from-alpha precisely when they want it.
+
+**Soft / feathered masks come for free.** Because the explicit path is a *continuous* lerp over `M ∈ [0,1]`, an authored **gradient** R8 mask (Tier-3 freeform render target, §5) feathers the 2D/3D boundary with no extra code:
+- a soft-edged **3D pop-out** dissolving into flat 2D at its silhouette (`M` ramps 1→0 across a few px);
+- **animated 2D↔3D dissolves** (animate the whole mask 1→0 over time → a region melts from 3D into flat);
+- antialiased non-rectangular 3D regions (the original §4 use of fractional `M`).
+These are supported effects, not accidents — pin them so a future refactor keeps the lerp continuous (don't threshold `M` to 0/1).
+
+### 4.5 The layered stack — 2D under and over the 3D (#491 part 3)
+
+The composite generalizes from "2D over 3D" to a **back-to-front stack**: `desktop → 2D-under (backdrop) → 3D → 2D-over (overlay)`. A `Local2D` layer **before** the projection in `xrEndFrame` list order is a flat **backdrop** behind a transparent/floating 3D object; **after** the projection it is an **overlay** (§4.4). The backdrop is composited into the **DP's background capture** (`backdrop over captured-desktop`) — not the runtime post-weave composite — so a *semi-transparent* backdrop correctly reveals the desktop through it. This consolidates/supersedes the legacy rect-`surround_2D` (a crude opaque backdrop). Cross-repo design + ABI: [unified-2d-3d-2d-under-3d-backdrop.md](unified-2d-3d-2d-under-3d-backdrop.md).
+
 ---
 
 ## 5. Mask-authoring API — adopt `XR_EXT_local_3d_zone`, add a second consumer
