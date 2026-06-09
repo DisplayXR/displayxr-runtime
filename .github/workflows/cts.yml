@@ -121,8 +121,11 @@ jobs:
         run: |
           cmake -S . -B build -G "Ninja Multi-Config" `
             -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_MANIFEST_FEATURES=gui `
+            -DX_VCPKG_APPLOCAL_DEPS_INSTALL=ON `
             -DCMAKE_INSTALL_PREFIX=_package `
             -DXRT_FEATURE_SERVICE=ON `
+            -DXRT_FEATURE_HYBRID_MODE=ON `
             -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
           cmake --build build --config Release --target install
 
