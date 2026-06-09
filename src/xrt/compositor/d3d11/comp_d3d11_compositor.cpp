@@ -196,6 +196,15 @@ struct comp_d3d11_compositor
 	ID3D11ShaderResourceView *local2d_scratch_srv;
 	ID3D11RenderTargetView *local2d_scratch_rtv;
 
+	//! #491 part 3 — 2D-under backdrop flatten target (RT+SRV), same trio as
+	//! local2d_scratch. The frame's UNDER Local2D layers (before the projection
+	//! in list order) flatten here PRE-weave; the SRV is handed to the DP via
+	//! set_background_2d so it composites `backdrop over captured-desktop` under
+	//! the 3D. Compositor-owned so it outlives process_atlas.
+	ID3D11Texture2D *backdrop_scratch;
+	ID3D11ShaderResourceView *backdrop_scratch_srv;
+	ID3D11RenderTargetView *backdrop_scratch_rtv;
+
 	//! #439 Phase 3 — runtime-owned IMPLICIT zone mask, rasterized from the
 	//! frame's Local2D layer rects (Q3): M=1 (keep the weave) everywhere,
 	//! M=0 (show the 2D layers) inside the union of the layer rects. Used as
@@ -359,6 +368,11 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
                           uint32_t dst_w,
                           uint32_t dst_h,
                           const struct u_canvas_rect *eff_canvas);
+// #491 part 3 — pre-weave 2D-under backdrop flatten (defined with the other
+// Local2D helpers near the bottom; called from the process_atlas sites above).
+static ID3D11ShaderResourceView *
+d3d11_flatten_backdrop_2d(struct comp_d3d11_compositor *c, uint32_t dst_w, uint32_t dst_h, uint32_t *out_w,
+                          uint32_t *out_h);
 static void
 d3d11_release_zone_state(struct comp_d3d11_compositor *c);
 // #224 hardware-DP zone leg: per-frame sideband publish of the active mask to
@@ -1740,6 +1754,15 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			uint32_t dp_target_w = st_desc.Width;
 			uint32_t dp_target_h = st_desc.Height;
 
+			// #491 part 3 — flatten the 2D-under layers PRE-weave and hand them
+			// to the DP (it composites `backdrop over captured-desktop` under
+			// the 3D). The flatten unbinds its RTV; the shared RTV is bound
+			// after. NULL ⟹ no under-layers (DP clears its backdrop).
+			uint32_t bd_w = 0, bd_h = 0;
+			ID3D11ShaderResourceView *bd_srv =
+			    d3d11_flatten_backdrop_2d(c, dp_target_w, dp_target_h, &bd_w, &bd_h);
+			xrt_display_processor_d3d11_set_background_2d(c->display_processor, bd_srv, bd_w, bd_h);
+
 			c->context->OMSetRenderTargets(1, &c->shared_rtv, nullptr);
 
 			xrt_display_processor_d3d11_process_atlas(
@@ -1827,6 +1850,18 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 		uint32_t target_width, target_height;
 		comp_d3d11_target_get_dimensions(c->target, &target_width, &target_height);
+
+		// #491 part 3 — flatten the 2D-under layers PRE-weave and hand them to
+		// the DP (it composites `backdrop over captured-desktop` under the 3D).
+		// The flatten binds/unbinds its own RTV, so re-bind the target RTV after
+		// (the DP writes to the currently bound target). NULL ⟹ no under-layers.
+		uint32_t bd_w = 0, bd_h = 0;
+		ID3D11ShaderResourceView *bd_srv =
+		    d3d11_flatten_backdrop_2d(c, target_width, target_height, &bd_w, &bd_h);
+		xrt_display_processor_d3d11_set_background_2d(c->display_processor, bd_srv, bd_w, bd_h);
+		if (bd_srv != nullptr) {
+			comp_d3d11_target_bind(c->target);
+		}
 
 		xrt_display_processor_d3d11_process_atlas(
 		    c->display_processor, c->context, atlas_srv, view_width, view_height,
@@ -2887,6 +2922,19 @@ d3d11_release_zone_state(struct comp_d3d11_compositor *c)
 		c->local2d_scratch->Release();
 		c->local2d_scratch = nullptr;
 	}
+	// #491 part 3 — 2D-under backdrop flatten scratch.
+	if (c->backdrop_scratch_rtv != nullptr) {
+		c->backdrop_scratch_rtv->Release();
+		c->backdrop_scratch_rtv = nullptr;
+	}
+	if (c->backdrop_scratch_srv != nullptr) {
+		c->backdrop_scratch_srv->Release();
+		c->backdrop_scratch_srv = nullptr;
+	}
+	if (c->backdrop_scratch != nullptr) {
+		c->backdrop_scratch->Release();
+		c->backdrop_scratch = nullptr;
+	}
 	if (c->implicit_mask_staged_srv != nullptr) {
 		c->implicit_mask_staged_srv->Release();
 		c->implicit_mask_staged_srv = nullptr;
@@ -3249,14 +3297,88 @@ d3d11_update_implicit_mask(struct comp_d3d11_compositor *c,
 	return c->implicit_mask_staged_srv;
 }
 
-// #439 Phase 3 — flatten this frame's Local2D layers into local2d_scratch (the
-// `twod` source the masked composite reads). Clears transparent, then draws each
-// layer in list order (later = on top) with premultiplied (or straight-alpha)
-// over. Dest rects are clipped to the window region; the clip fractions, the
-// layer's norm_rect, and flip_y are carried into the source UVs. Caller holds
-// c->mutex and has already (re)allocated local2d_scratch (+RTV) at region dims.
+// #439 Phase 3 — flatten one Local2D layer into @p rtv (premultiplied or
+// straight-alpha over), clipped to the window region with clip/norm_rect/flip_y
+// carried into the source UVs. Shared by the post-weave overlay flatten and the
+// pre-weave 2D-under backdrop flatten (#491 part 3). Caller holds c->mutex.
+static void
+d3d11_flatten_one_local2d_layer(struct comp_d3d11_compositor *c,
+                                ID3D11RenderTargetView *rtv,
+                                struct comp_layer *layer,
+                                uint32_t region_w,
+                                uint32_t region_h)
+{
+	struct xrt_swapchain *sc = layer->sc_array[0];
+	if (sc == nullptr) {
+		return;
+	}
+	uint32_t img_idx = layer->data.local_2d.sub.image_index;
+	// sRGB-passthrough: get_srv returns the swapchain's UNORM sibling SRV
+	// (no auto-decode), the same SRV the projection draws sample.
+	ID3D11ShaderResourceView *src_srv =
+	    static_cast<ID3D11ShaderResourceView *>(comp_d3d11_swapchain_get_srv(sc, img_idx));
+	if (src_srv == nullptr) {
+		return; // swapchain not SAMPLED — nothing to flatten
+	}
+
+	// Dest rect (client-window px), clipped to the window region.
+	const struct xrt_rect *dr = &layer->data.local_2d.rect;
+	int32_t dx = dr->offset.w;
+	int32_t dy = dr->offset.h;
+	int32_t dw = dr->extent.w;
+	int32_t dh = dr->extent.h;
+	if (dw <= 0 || dh <= 0) {
+		return;
+	}
+	int32_t x0 = dx < 0 ? 0 : dx;
+	int32_t y0 = dy < 0 ? 0 : dy;
+	int32_t x1 = (dx + dw) > (int32_t)region_w ? (int32_t)region_w : (dx + dw);
+	int32_t y1 = (dy + dh) > (int32_t)region_h ? (int32_t)region_h : (dy + dh);
+	if (x1 <= x0 || y1 <= y0) {
+		return; // clipped fully out
+	}
+
+	// Clip fractions within the original dest rect (carry into the UVs so
+	// the correct source region is sampled when the rect is clipped).
+	float fx0 = (float)(x0 - dx) / (float)dw;
+	float fy0 = (float)(y0 - dy) / (float)dh;
+	float fx1 = (float)(x1 - dx) / (float)dw;
+	float fy1 = (float)(y1 - dy) / (float)dh;
+
+	// App sub-rect within the swapchain image (normalized). Default full.
+	struct xrt_normalized_rect nr = layer->data.local_2d.sub.norm_rect;
+	if (nr.w <= 0.0f || nr.h <= 0.0f) {
+		nr.x = 0.0f;
+		nr.y = 0.0f;
+		nr.w = 1.0f;
+		nr.h = 1.0f;
+	}
+
+	// Source rect (normalized) carrying clip + flip_y. flip_y: start at
+	// the bottom of the sub-rect and sample upward (negative height).
+	float src_x = nr.x + nr.w * fx0;
+	float src_w = nr.w * (fx1 - fx0);
+	float src_y, src_h;
+	if (layer->data.flip_y) {
+		src_y = nr.y + nr.h * (1.0f - fy0);
+		src_h = -(nr.h * (fy1 - fy0));
+	} else {
+		src_y = nr.y + nr.h * fy0;
+		src_h = nr.h * (fy1 - fy0);
+	}
+
+	bool unpremult = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
+
+	comp_d3d11_renderer_flatten_local_2d(c->renderer, rtv, src_srv, x0, y0, (uint32_t)(x1 - x0),
+	                                     (uint32_t)(y1 - y0), src_x, src_y, src_w, src_h, unpremult);
+}
+
+// #439 Phase 3 — flatten this frame's OVER Local2D layers into local2d_scratch
+// (the `twod` source the masked composite reads). Under-layers (#491 part 3,
+// before the projection in list order) are the DP backdrop and are skipped here.
+// Caller holds c->mutex and has already (re)allocated local2d_scratch (+RTV).
 static bool
-d3d11_flatten_local_2d_layers(struct comp_d3d11_compositor *c, uint32_t region_w, uint32_t region_h)
+d3d11_flatten_local_2d_layers(struct comp_d3d11_compositor *c, uint32_t region_w, uint32_t region_h, int32_t proj_idx)
 {
 	// Clear transparent once. Where a pixel is M=0 (2D) but no layer covers
 	// it, twod stays (0,0,0,0) → final.a → 0 → the desktop shows through (Q2,
@@ -3269,70 +3391,11 @@ d3d11_flatten_local_2d_layers(struct comp_d3d11_compositor *c, uint32_t region_w
 		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
 			continue;
 		}
-		struct xrt_swapchain *sc = layer->sc_array[0];
-		if (sc == nullptr) {
+		// #491 part 3 — under-layers are the DP backdrop (handled pre-weave).
+		if (proj_idx >= 0 && (int32_t)i < proj_idx) {
 			continue;
 		}
-		uint32_t img_idx = layer->data.local_2d.sub.image_index;
-		// sRGB-passthrough: get_srv returns the swapchain's UNORM sibling SRV
-		// (no auto-decode), the same SRV the projection draws sample.
-		ID3D11ShaderResourceView *src_srv =
-		    static_cast<ID3D11ShaderResourceView *>(comp_d3d11_swapchain_get_srv(sc, img_idx));
-		if (src_srv == nullptr) {
-			continue; // swapchain not SAMPLED — nothing to flatten
-		}
-
-		// Dest rect (client-window px), clipped to the window region.
-		const struct xrt_rect *dr = &layer->data.local_2d.rect;
-		int32_t dx = dr->offset.w;
-		int32_t dy = dr->offset.h;
-		int32_t dw = dr->extent.w;
-		int32_t dh = dr->extent.h;
-		if (dw <= 0 || dh <= 0) {
-			continue;
-		}
-		int32_t x0 = dx < 0 ? 0 : dx;
-		int32_t y0 = dy < 0 ? 0 : dy;
-		int32_t x1 = (dx + dw) > (int32_t)region_w ? (int32_t)region_w : (dx + dw);
-		int32_t y1 = (dy + dh) > (int32_t)region_h ? (int32_t)region_h : (dy + dh);
-		if (x1 <= x0 || y1 <= y0) {
-			continue; // clipped fully out
-		}
-
-		// Clip fractions within the original dest rect (carry into the UVs so
-		// the correct source region is sampled when the rect is clipped).
-		float fx0 = (float)(x0 - dx) / (float)dw;
-		float fy0 = (float)(y0 - dy) / (float)dh;
-		float fx1 = (float)(x1 - dx) / (float)dw;
-		float fy1 = (float)(y1 - dy) / (float)dh;
-
-		// App sub-rect within the swapchain image (normalized). Default full.
-		struct xrt_normalized_rect nr = layer->data.local_2d.sub.norm_rect;
-		if (nr.w <= 0.0f || nr.h <= 0.0f) {
-			nr.x = 0.0f;
-			nr.y = 0.0f;
-			nr.w = 1.0f;
-			nr.h = 1.0f;
-		}
-
-		// Source rect (normalized) carrying clip + flip_y. flip_y: start at
-		// the bottom of the sub-rect and sample upward (negative height).
-		float src_x = nr.x + nr.w * fx0;
-		float src_w = nr.w * (fx1 - fx0);
-		float src_y, src_h;
-		if (layer->data.flip_y) {
-			src_y = nr.y + nr.h * (1.0f - fy0);
-			src_h = -(nr.h * (fy1 - fy0));
-		} else {
-			src_y = nr.y + nr.h * fy0;
-			src_h = nr.h * (fy1 - fy0);
-		}
-
-		bool unpremult = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
-
-		comp_d3d11_renderer_flatten_local_2d(c->renderer, c->local2d_scratch_rtv, src_srv, x0, y0,
-		                                     (uint32_t)(x1 - x0), (uint32_t)(y1 - y0), src_x, src_y, src_w,
-		                                     src_h, unpremult);
+		d3d11_flatten_one_local2d_layer(c, c->local2d_scratch_rtv, layer, region_w, region_h);
 	}
 
 	// Unbind the scratch RTV so the masked composite can sample it as an SRV
@@ -3340,6 +3403,92 @@ d3d11_flatten_local_2d_layers(struct comp_d3d11_compositor *c, uint32_t region_w
 	ID3D11RenderTargetView *null_rtv = nullptr;
 	c->context->OMSetRenderTargets(1, &null_rtv, nullptr);
 	return true;
+}
+
+// #491 part 3 — flatten this frame's 2D-UNDER Local2D layers (before the
+// projection in list order) into backdrop_scratch PRE-weave and return its SRV
+// (+ region dims) so the caller hands it to the DP via set_background_2d (the DP
+// composites `backdrop over captured-desktop` under the 3D). Returns nullptr
+// (out dims 0) when there are no under-layers. Caller holds c->mutex; the
+// immediate context orders these draws before the subsequent process_atlas.
+static ID3D11ShaderResourceView *
+d3d11_flatten_backdrop_2d(struct comp_d3d11_compositor *c, uint32_t dst_w, uint32_t dst_h, uint32_t *out_w,
+                          uint32_t *out_h)
+{
+	*out_w = 0;
+	*out_h = 0;
+	if (!c->local_2d_last_frame || c->renderer == nullptr) {
+		return nullptr;
+	}
+
+	// Under = Local2D layers BEFORE the projection. No projection ⟹ no backdrop.
+	int32_t proj_idx = -1;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+		if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+			proj_idx = (int32_t)i;
+			break;
+		}
+	}
+	if (proj_idx < 0) {
+		return nullptr;
+	}
+	bool have_under = false;
+	for (int32_t i = 0; i < proj_idx; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
+			have_under = true;
+			break;
+		}
+	}
+	if (!have_under) {
+		return nullptr;
+	}
+
+	// Window region inside the worst-case dst (#464).
+	uint32_t region_w = dst_w;
+	uint32_t region_h = dst_h;
+	HWND wnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
+	if (wnd != nullptr) {
+		RECT r;
+		if (GetClientRect(wnd, &r) && r.right > 0 && r.bottom > 0) {
+			region_w = ((uint32_t)r.right < dst_w) ? (uint32_t)r.right : dst_w;
+			region_h = ((uint32_t)r.bottom < dst_h) ? (uint32_t)r.bottom : dst_h;
+		}
+	}
+	if (region_w == 0 || region_h == 0) {
+		return nullptr;
+	}
+
+	// Premultiplied RGBA, UNORM (sRGB-passthrough) like local2d_scratch.
+	if (!d3d11_ensure_rt_srv_scratch(c, &c->backdrop_scratch, &c->backdrop_scratch_srv, &c->backdrop_scratch_rtv,
+	                                 region_w, region_h, DXGI_FORMAT_R8G8B8A8_UNORM, "backdrop scratch")) {
+		return nullptr;
+	}
+
+	const float transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	c->context->ClearRenderTargetView(c->backdrop_scratch_rtv, transparent);
+
+	for (int32_t i = 0; i < proj_idx; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
+			continue;
+		}
+		d3d11_flatten_one_local2d_layer(c, c->backdrop_scratch_rtv, layer, region_w, region_h);
+	}
+
+	ID3D11RenderTargetView *null_rtv = nullptr;
+	c->context->OMSetRenderTargets(1, &null_rtv, nullptr);
+
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		U_LOG_W("D3D11 #491 part3: flattened 2D-under backdrop %ux%u (handed to DP set_background_2d)",
+		        region_w, region_h);
+	}
+
+	*out_w = region_w;
+	*out_h = region_h;
+	return c->backdrop_scratch_srv;
 }
 
 // #439 Phase 1 — composite the authored zone mask. Runs INSTEAD of the rect
@@ -3387,8 +3536,20 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	D3D11_TEXTURE2D_DESC dd;
 	dst->GetDesc(&dd);
 
+	// #491 part 3 — split Local2D by list order vs the projection: layers BEFORE
+	// the projection are the 2D-under backdrop (handled pre-weave by the DP) and
+	// are excluded from the overlay mask + flatten here. is_over == !under.
+	int32_t proj_idx = -1;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+		if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+			proj_idx = (int32_t)i;
+			break;
+		}
+	}
+
 	// Resolve the frame's mask source: an explicit submitted mask wins; else
-	// rasterize the implicit Tier-2-style mask from the Local2D layer rects
+	// rasterize the implicit Tier-2-style mask from the OVER Local2D layer rects
 	// (Q3 — M=0 inside the rect union, M=1 elsewhere).
 	ID3D11ShaderResourceView *mask_srv = nullptr;
 	if (have_explicit) {
@@ -3397,9 +3558,13 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		struct xrt_rect rects[XRT_MAX_LAYERS];
 		uint32_t rect_count = 0;
 		for (uint32_t i = 0; i < c->layer_accum.layer_count && rect_count < XRT_MAX_LAYERS; i++) {
-			if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
-				rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
+			if (c->layer_accum.layers[i].data.type != XRT_LAYER_LOCAL_2D) {
+				continue;
 			}
+			if (proj_idx >= 0 && (int32_t)i < proj_idx) {
+				continue; // under-layer (backdrop) — not part of the overlay mask
+			}
+			rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
 		}
 		mask_srv = d3d11_update_implicit_mask(c, rects, rect_count, region_w, region_h);
 	}
@@ -3425,7 +3590,7 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		                              unorm_fmt, "local2d weave")) {
 			return false;
 		}
-		if (!d3d11_flatten_local_2d_layers(c, region_w, region_h)) {
+		if (!d3d11_flatten_local_2d_layers(c, region_w, region_h, proj_idx)) {
 			return false;
 		}
 		twod_srv = c->local2d_scratch_srv;
