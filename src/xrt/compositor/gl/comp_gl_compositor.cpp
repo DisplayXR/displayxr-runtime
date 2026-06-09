@@ -74,6 +74,9 @@
 #include "ogl/ogl_api.h"
 #include "ogl/wgl_api.h"
 #include <d3d11.h>
+#include <dxgi1_3.h>     // CreateDXGIFactory2, IDXGISwapChain1, CreateSwapChainForComposition
+#include <dcomp.h>       // DirectComposition (transparent GL present path)
+#include <d3dcompiler.h> // D3DCompile (inline blit shader for the DComp present path)
 // GUID for ID3D11Texture2D (needed for OpenSharedResource in C)
 static const IID IID_ID3D11Texture2D_local = {
     0x6f15aaf2, 0xd208, 0x4e89,
@@ -384,14 +387,35 @@ struct comp_gl_compositor
 	struct u_capture_intent capture_intent;
 
 	// --- Transparent-background opt-in plumbing ---
-	// Currently only used by the GL DP's chroma-key fill+strip programs;
-	// the GL native compositor itself does NOT yet wire up a DComp+interop
-	// present path, so transparent_background acts as a no-op at the
-	// compositor level (the DP's chroma-key infrastructure exists for
-	// future work but is not turned on — see PR #3b deferred-scope note in
-	// docs/roadmap/transparency-support-followup-2.md).
 	bool transparent_background;
 	uint32_t chroma_key_color;
+
+	// --- Transparent-background present path (Windows: DComp + WGL_NV_DX_interop2) ---
+	// See the big comment block above gl_setup_dcomp_present() for the architecture
+	// and why it composes two independently-proven halves instead of the reverted
+	// (PR #3b) direct-interop-into-flip-model-backbuffer approach.
+#ifdef XRT_OS_WINDOWS
+	bool dcomp_active;                  //!< True once the DComp present path is wired up.
+	ID3D11Device *dcomp_dx_device;      //!< Dedicated D3D11 device for the present bridge.
+	ID3D11DeviceContext *dcomp_dx_context;
+	IDXGISwapChain1 *dcomp_swapchain;   //!< Flip-model composition swapchain (PREMULTIPLIED).
+	IDCompositionDevice *dcomp_device;
+	IDCompositionTarget *dcomp_target;
+	IDCompositionVisual *dcomp_visual;
+	HANDLE dcomp_dx_interop_device;     //!< wglDXOpenDeviceNV(dcomp_dx_device).
+	// Off-screen transit texture: GL weaves into it (proven interop path), then a
+	// D3D11 fullscreen-quad blit copies it to the swapchain back buffer (RTV write).
+	ID3D11Texture2D *dcomp_transit_tex;
+	ID3D11ShaderResourceView *dcomp_transit_srv;
+	GLuint dcomp_transit_gl_tex;        //!< GL view of dcomp_transit_tex.
+	GLuint dcomp_transit_fbo;           //!< FBO bound to dcomp_transit_gl_tex.
+	HANDLE dcomp_transit_iop;           //!< wglDXRegisterObjectNV handle for the transit tex.
+	// D3D11 fullscreen-triangle blit pipeline.
+	ID3D11VertexShader *dcomp_vs;
+	ID3D11PixelShader *dcomp_ps;
+	ID3D11SamplerState *dcomp_samp;
+	uint32_t dcomp_present_w, dcomp_present_h;
+#endif
 };
 
 static inline struct comp_gl_compositor *
@@ -403,46 +427,326 @@ gl_comp(struct xrt_compositor *xc)
 
 /*
  *
- * Transparent-background present path (DEFERRED).
+ * Transparent-background present path (Windows: DComp + WGL_NV_DX_interop2).
  *
- * PR #3b initially shipped a DComp + CreateSwapChainForComposition +
- * WGL_NV_DX_interop2 bridge that routed the GL native compositor's output
- * through a flip-model DXGI swapchain bound to the HWND via
- * DirectComposition, mirroring the architecture used by the D3D12 native
- * compositor and the VK->D3D11 bridge in PR #3c-part-2. The GL DP's
- * chroma-key fill+strip programs (left in place under
- * src/xrt/drivers/leia/leia_display_processor_gl.cpp) work correctly when
- * driven from that path.
+ * Mirrors what the D3D11/D3D12/VK native compositors do for transparent desktop
+ * composition: route the compositor's output through a flip-model DXGI swapchain
+ * created with DXGI_ALPHA_MODE_PREMULTIPLIED and bound to the app's HWND via
+ * DirectComposition, so DWM blends per-pixel alpha (alpha-0 pixels show the
+ * desktop through the window) without any chroma-key trick.
  *
- * On the dev hardware (NVIDIA RTX 3080 + Win11 + WGL_NV_DX_interop2) the
- * bridge proved fragile: GL writes via WGL interop reached the GL FBO
- * (verified via glReadPixels) but D3D11 CopyResource transit ->
- * swapchain back buffer didn't produce visible content on the DComp
- * surface, even when the source was a fresh non-interop D3D11 texture
- * cleared via ClearRenderTargetView. ClearRenderTargetView directly on
- * the back buffer DID present visibly, so the Present/DComp half works;
- * the failure point was specifically D3D11 CopyResource into a
- * FLIP_DISCARD + DComp back buffer (or, possibly, sync between the GL
- * interop's writes and the D3D11 immediate context's CopyResource on
- * this driver/setup).
+ * GL is special: it can't render to a DXGI swapchain back buffer directly. A
+ * prior attempt (PR #3b, reverted in commit 670d0158d) registered the
+ * flip-model back buffers themselves as GL FBOs via wglDXRegisterObjectNV and
+ * had the DP weave straight into them — on the dev hardware (RTX 3080 + Win11)
+ * those GL writes never became visible. That is the known WGL_NV_DX_interop2 ->
+ * *flip-model* swapchain back-buffer incompatibility. The revert confirmed the
+ * useful split: D3D11 RTV writes (ClearRenderTargetView) to the back buffer DID
+ * present; only GL-interop writes (and CopyResource) into it failed.
  *
- * Rather than ship a fragile path, the DComp present is reverted and
- * left as a known follow-up. The GL DP's chroma-key infrastructure
- * stays in place — it's exercised today only when transparent_background
- * is wired up via a future GL present path. See:
- *   docs/roadmap/transparency-support-followup-2.md §3b
- * Workarounds explored: D3D11 immediate context Flush after CopyResource
- * (no help); render via fullscreen-quad shader instead of CopyResource
- * (deferred — would require ~50 LOC of D3D11 vertex/pixel shader
- * scaffolding); use D3D12 + WGL_NV_DX_interop2 instead of D3D11 (cleaner
- * sync model on paper but a larger architectural change).
+ * So this path composes the two halves that ARE proven on this hardware:
+ *   1. GL weaves into an OFF-SCREEN interop transit texture — the exact path the
+ *      runtime already ships for _texture apps (register an off-screen
+ *      ID3D11Texture2D as a GL FBO, lock / render / unlock).
+ *   2. A D3D11 fullscreen-triangle shader blit (an RTV write — proven) samples
+ *      that transit texture and draws it into the flip-model DComp back buffer.
+ *   3. swapchain->Present + dcomp_device->Commit.
+ * No GL write to a flip-model back buffer; no CopyResource.
  *
- * For graphics APIs that DO have transparency end-to-end today, see:
- *   - D3D11 native compositor: shipping (PR #213)
- *   - D3D12 native compositor: shipping (PR #213, PR #3a)
- *   - Vulkan native compositor: shipping (PR #3c, PR #3c-part-2)
- *   - Metal native compositor: shipping (PR #4)
+ * Gated on (transparent_background && hwnd != NULL && !owns_window): the app's
+ * HWND must carry WS_EX_NOREDIRECTIONBITMAP (set by the app, e.g.
+ * cube_handle_gl_win), and runtime-hosted GL windows are out of scope for now.
+ * Any setup failure (no WGL_NV_DX_interop2, no DComp, etc.) leaves dcomp_active
+ * false and the compositor falls back to the opaque SwapBuffers path.
  */
+
+#ifdef XRT_OS_WINDOWS
+// Inline HLSL for the transit-texture -> back-buffer blit. Fullscreen triangle
+// from SV_VertexID; V is flipped because the GL transit texture is bottom-up.
+static const char *kDcompBlitHLSL =
+    "Texture2D gTex : register(t0);\n"
+    "SamplerState gSamp : register(s0);\n"
+    "struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };\n"
+    "VSOut vs_main(uint vid : SV_VertexID) {\n"
+    "  VSOut o;\n"
+    "  float2 p = float2((vid << 1) & 2, vid & 2);\n"      // (0,0),(2,0),(0,2)
+    "  o.pos = float4(p * float2(2,-2) + float2(-1,1), 0, 1);\n"
+    "  o.uv  = float2(p.x, 1.0 - p.y);\n"                  // flip V (GL bottom-up)
+    "  return o;\n"
+    "}\n"
+    "float4 ps_main(VSOut i) : SV_TARGET {\n"
+    "  return gTex.Sample(gSamp, i.uv);\n"                 // already premultiplied
+    "}\n";
+
+// Tear down the DComp present path. Safe to call when !dcomp_active.
+static void
+gl_destroy_dcomp_present(struct comp_gl_compositor *c)
+{
+	if (c->dcomp_transit_iop != NULL && c->pfn_wglDXUnregisterObjectNV != NULL &&
+	    c->dcomp_dx_interop_device != NULL) {
+		c->pfn_wglDXUnregisterObjectNV(c->dcomp_dx_interop_device, c->dcomp_transit_iop);
+		c->dcomp_transit_iop = NULL;
+	}
+	if (c->dcomp_transit_fbo != 0) {
+		glDeleteFramebuffers(1, &c->dcomp_transit_fbo);
+		c->dcomp_transit_fbo = 0;
+	}
+	if (c->dcomp_transit_gl_tex != 0) {
+		glDeleteTextures(1, &c->dcomp_transit_gl_tex);
+		c->dcomp_transit_gl_tex = 0;
+	}
+	if (c->dcomp_dx_interop_device != NULL && c->pfn_wglDXCloseDeviceNV != NULL) {
+		c->pfn_wglDXCloseDeviceNV(c->dcomp_dx_interop_device);
+		c->dcomp_dx_interop_device = NULL;
+	}
+	if (c->dcomp_samp)         { c->dcomp_samp->Release();         c->dcomp_samp = NULL; }
+	if (c->dcomp_ps)           { c->dcomp_ps->Release();           c->dcomp_ps = NULL; }
+	if (c->dcomp_vs)           { c->dcomp_vs->Release();           c->dcomp_vs = NULL; }
+	if (c->dcomp_transit_srv)  { c->dcomp_transit_srv->Release();  c->dcomp_transit_srv = NULL; }
+	if (c->dcomp_transit_tex)  { c->dcomp_transit_tex->Release();  c->dcomp_transit_tex = NULL; }
+	if (c->dcomp_visual)       { c->dcomp_visual->Release();       c->dcomp_visual = NULL; }
+	if (c->dcomp_target)       { c->dcomp_target->Release();       c->dcomp_target = NULL; }
+	if (c->dcomp_device)       { c->dcomp_device->Release();       c->dcomp_device = NULL; }
+	if (c->dcomp_swapchain)    { c->dcomp_swapchain->Release();    c->dcomp_swapchain = NULL; }
+	if (c->dcomp_dx_context)   { c->dcomp_dx_context->Release();   c->dcomp_dx_context = NULL; }
+	if (c->dcomp_dx_device)    { c->dcomp_dx_device->Release();    c->dcomp_dx_device = NULL; }
+	c->dcomp_active = false;
+}
+
+// Initialize the DComp + WGL_NV_DX_interop2 present path. Returns false on any
+// failure (caller stays on the opaque SwapBuffers path); always leaves the
+// struct in a consistent torn-down state on false.
+static bool
+gl_setup_dcomp_present(struct comp_gl_compositor *c, HWND hwnd, uint32_t w, uint32_t h)
+{
+	if (w == 0 || h == 0) {
+		return false;
+	}
+
+	// 1. WGL_NV_DX_interop2 entry points (may already be loaded by the
+	//    shared-texture path; load defensively).
+	if (c->pfn_wglDXOpenDeviceNV == NULL) {
+		c->pfn_wglDXOpenDeviceNV = (PFN_wglDXOpenDeviceNV)wglGetProcAddress("wglDXOpenDeviceNV");
+		c->pfn_wglDXCloseDeviceNV = (PFN_wglDXCloseDeviceNV)wglGetProcAddress("wglDXCloseDeviceNV");
+		c->pfn_wglDXRegisterObjectNV = (PFN_wglDXRegisterObjectNV)wglGetProcAddress("wglDXRegisterObjectNV");
+		c->pfn_wglDXUnregisterObjectNV = (PFN_wglDXUnregisterObjectNV)wglGetProcAddress("wglDXUnregisterObjectNV");
+		c->pfn_wglDXLockObjectsNV = (PFN_wglDXLockObjectsNV)wglGetProcAddress("wglDXLockObjectsNV");
+		c->pfn_wglDXUnlockObjectsNV = (PFN_wglDXUnlockObjectsNV)wglGetProcAddress("wglDXUnlockObjectsNV");
+	}
+	if (c->pfn_wglDXOpenDeviceNV == NULL || c->pfn_wglDXRegisterObjectNV == NULL ||
+	    c->pfn_wglDXLockObjectsNV == NULL || c->pfn_wglDXUnlockObjectsNV == NULL ||
+	    c->pfn_wglDXCloseDeviceNV == NULL || c->pfn_wglDXUnregisterObjectNV == NULL) {
+		U_LOG_W("Transparent GL: WGL_NV_DX_interop2 unavailable on this GPU/driver — "
+		        "staying opaque");
+		return false;
+	}
+
+	// 2. Dedicated D3D11 device for the present bridge.
+	HRESULT hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0,
+	                               D3D11_SDK_VERSION, &c->dcomp_dx_device, NULL,
+	                               &c->dcomp_dx_context);
+	if (FAILED(hr) || c->dcomp_dx_device == NULL) {
+		U_LOG_W("Transparent GL: D3D11CreateDevice failed: 0x%08x — staying opaque", (unsigned)hr);
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+
+	// 3. Open the D3D11 device for GL interop.
+	c->dcomp_dx_interop_device = c->pfn_wglDXOpenDeviceNV(c->dcomp_dx_device);
+	if (c->dcomp_dx_interop_device == NULL) {
+		U_LOG_W("Transparent GL: wglDXOpenDeviceNV failed: %lu — staying opaque", GetLastError());
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+
+	// 4. Off-screen transit texture (RT + SRV) and its GL interop view + FBO.
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w;
+	td.Height = h;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+	hr = c->dcomp_dx_device->CreateTexture2D(&td, NULL, &c->dcomp_transit_tex);
+	if (FAILED(hr)) {
+		U_LOG_W("Transparent GL: transit CreateTexture2D failed: 0x%08x", (unsigned)hr);
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+	hr = c->dcomp_dx_device->CreateShaderResourceView(c->dcomp_transit_tex, NULL,
+	                                                  &c->dcomp_transit_srv);
+	if (FAILED(hr)) {
+		U_LOG_W("Transparent GL: transit SRV failed: 0x%08x", (unsigned)hr);
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+	glGenTextures(1, &c->dcomp_transit_gl_tex);
+	c->dcomp_transit_iop = c->pfn_wglDXRegisterObjectNV(
+	    c->dcomp_dx_interop_device, c->dcomp_transit_tex, c->dcomp_transit_gl_tex,
+	    GL_TEXTURE_2D, WGL_ACCESS_READ_WRITE_NV);
+	if (c->dcomp_transit_iop == NULL) {
+		U_LOG_W("Transparent GL: wglDXRegisterObjectNV(transit) failed: %lu", GetLastError());
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+	// Build the FBO around the transit GL texture (lock while attaching).
+	glGenFramebuffers(1, &c->dcomp_transit_fbo);
+	c->pfn_wglDXLockObjectsNV(c->dcomp_dx_interop_device, 1, &c->dcomp_transit_iop);
+	glBindFramebuffer(GL_FRAMEBUFFER, c->dcomp_transit_fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+	                       c->dcomp_transit_gl_tex, 0);
+	GLenum fbst = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	c->pfn_wglDXUnlockObjectsNV(c->dcomp_dx_interop_device, 1, &c->dcomp_transit_iop);
+	if (fbst != GL_FRAMEBUFFER_COMPLETE) {
+		U_LOG_W("Transparent GL: transit FBO incomplete: 0x%x", (unsigned)fbst);
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+
+	// 5. Flip-model composition swapchain (PREMULTIPLIED alpha).
+	IDXGIFactory2 *factory = NULL;
+	hr = CreateDXGIFactory2(0, __uuidof(IDXGIFactory2), (void **)&factory);
+	if (FAILED(hr) || factory == NULL) {
+		U_LOG_W("Transparent GL: CreateDXGIFactory2 failed: 0x%08x", (unsigned)hr);
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+	DXGI_SWAP_CHAIN_DESC1 scd = {};
+	scd.Width = w;
+	scd.Height = h;
+	scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	scd.SampleDesc.Count = 1;
+	scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+	scd.BufferCount = 2;
+	scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+	scd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+	hr = factory->CreateSwapChainForComposition(c->dcomp_dx_device, &scd, NULL,
+	                                            &c->dcomp_swapchain);
+	factory->Release();
+	if (FAILED(hr) || c->dcomp_swapchain == NULL) {
+		U_LOG_W("Transparent GL: CreateSwapChainForComposition failed: 0x%08x", (unsigned)hr);
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+
+	// 6. Bind the swapchain to the HWND through DirectComposition.
+	hr = DCompositionCreateDevice2(NULL, __uuidof(IDCompositionDevice),
+	                               (void **)&c->dcomp_device);
+	if (SUCCEEDED(hr)) hr = c->dcomp_device->CreateTargetForHwnd(hwnd, TRUE, &c->dcomp_target);
+	if (SUCCEEDED(hr)) hr = c->dcomp_device->CreateVisual(&c->dcomp_visual);
+	if (SUCCEEDED(hr)) hr = c->dcomp_visual->SetContent(c->dcomp_swapchain);
+	if (SUCCEEDED(hr)) hr = c->dcomp_target->SetRoot(c->dcomp_visual);
+	if (SUCCEEDED(hr)) hr = c->dcomp_device->Commit();
+	if (FAILED(hr)) {
+		U_LOG_W("Transparent GL: DirectComposition bind failed: 0x%08x", (unsigned)hr);
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+
+	// 7. Compile the fullscreen-triangle blit pipeline.
+	ID3DBlob *vsb = NULL, *psb = NULL, *err = NULL;
+	hr = D3DCompile(kDcompBlitHLSL, strlen(kDcompBlitHLSL), "dcomp_blit", NULL, NULL,
+	                "vs_main", "vs_5_0", 0, 0, &vsb, &err);
+	if (FAILED(hr)) {
+		U_LOG_W("Transparent GL: blit VS compile failed: 0x%08x %s", (unsigned)hr,
+		        err ? (const char *)err->GetBufferPointer() : "");
+		if (err) err->Release();
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+	if (err) { err->Release(); err = NULL; }
+	hr = D3DCompile(kDcompBlitHLSL, strlen(kDcompBlitHLSL), "dcomp_blit", NULL, NULL,
+	                "ps_main", "ps_5_0", 0, 0, &psb, &err);
+	if (FAILED(hr)) {
+		U_LOG_W("Transparent GL: blit PS compile failed: 0x%08x %s", (unsigned)hr,
+		        err ? (const char *)err->GetBufferPointer() : "");
+		if (err) err->Release();
+		vsb->Release();
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+	if (err) { err->Release(); err = NULL; }
+	hr = c->dcomp_dx_device->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(),
+	                                            NULL, &c->dcomp_vs);
+	if (SUCCEEDED(hr))
+		hr = c->dcomp_dx_device->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(),
+		                                          NULL, &c->dcomp_ps);
+	vsb->Release();
+	psb->Release();
+	if (FAILED(hr)) {
+		U_LOG_W("Transparent GL: blit shader create failed: 0x%08x", (unsigned)hr);
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+	D3D11_SAMPLER_DESC sd = {};
+	sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+	sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+	sd.MaxLOD = D3D11_FLOAT32_MAX;
+	hr = c->dcomp_dx_device->CreateSamplerState(&sd, &c->dcomp_samp);
+	if (FAILED(hr)) {
+		U_LOG_W("Transparent GL: blit sampler failed: 0x%08x", (unsigned)hr);
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+
+	c->dcomp_present_w = w;
+	c->dcomp_present_h = h;
+	c->dcomp_active = true;
+	U_LOG_W("Transparent GL: DComp present path active (%ux%u, FLIP_DISCARD + PREMULTIPLIED + "
+	        "off-screen interop transit + D3D11 blit)", w, h);
+	return true;
+}
+
+// Per-frame: blit the (already GL-woven) transit texture into the current DComp
+// back buffer via a D3D11 fullscreen-triangle draw, then Present + Commit.
+static void
+gl_dcomp_present_frame(struct comp_gl_compositor *c)
+{
+	ID3D11Texture2D *bb = NULL;
+	HRESULT hr = c->dcomp_swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&bb);
+	if (FAILED(hr) || bb == NULL) {
+		U_LOG_W("Transparent GL: GetBuffer failed: 0x%08x", (unsigned)hr);
+		return;
+	}
+	ID3D11RenderTargetView *rtv = NULL;
+	hr = c->dcomp_dx_device->CreateRenderTargetView(bb, NULL, &rtv);
+	bb->Release();
+	if (FAILED(hr) || rtv == NULL) {
+		U_LOG_W("Transparent GL: back-buffer RTV failed: 0x%08x", (unsigned)hr);
+		return;
+	}
+
+	ID3D11DeviceContext *ctx = c->dcomp_dx_context;
+	D3D11_VIEWPORT vp = {};
+	vp.Width = (float)c->dcomp_present_w;
+	vp.Height = (float)c->dcomp_present_h;
+	vp.MaxDepth = 1.0f;
+	ctx->OMSetRenderTargets(1, &rtv, NULL);
+	ctx->RSSetViewports(1, &vp);
+	ctx->IASetInputLayout(NULL);
+	ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	ctx->VSSetShader(c->dcomp_vs, NULL, 0);
+	ctx->PSSetShader(c->dcomp_ps, NULL, 0);
+	ctx->PSSetShaderResources(0, 1, &c->dcomp_transit_srv);
+	ctx->PSSetSamplers(0, 1, &c->dcomp_samp);
+	ctx->Draw(3, 0);
+	// Unbind the SRV so the next frame's interop lock isn't held by the context.
+	ID3D11ShaderResourceView *nullsrv = NULL;
+	ctx->PSSetShaderResources(0, 1, &nullsrv);
+	ctx->OMSetRenderTargets(0, NULL, NULL);
+	ctx->Flush();
+	rtv->Release();
+
+	hr = c->dcomp_swapchain->Present(1, 0);
+	if (FAILED(hr)) {
+		U_LOG_W("Transparent GL: swapchain Present failed: 0x%08x", (unsigned)hr);
+	}
+	c->dcomp_device->Commit();
+}
+#endif // XRT_OS_WINDOWS
 
 
 
@@ -1099,6 +1403,14 @@ gl_crop_and_process_dp(struct comp_gl_compositor *c,
                        uint32_t output_w,
                        uint32_t output_h)
 {
+	// Snapshot the caller's draw FBO — the DP must weave into whatever target
+	// the caller bound (window FBO 0, the shared-texture FBO, or the DComp
+	// transit FBO on the transparent path), NOT an assumed FBO 0. The crop and
+	// backdrop-flatten blits below bind their own FBOs, so we restore this one
+	// before process_atlas.
+	GLint caller_draw_fbo = 0;
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &caller_draw_fbo);
+
 	// #491 part 3 — flatten the 2D-under layers PRE-weave and hand them to the DP
 	// (it composites `backdrop over captured-desktop` under the 3D). 0 ⟹ no
 	// under-layers (DP clears its backdrop). Covers the plain present, the
@@ -1154,9 +1466,10 @@ gl_crop_and_process_dp(struct comp_gl_compositor *c,
 		    0, 0, content_w, content_h,   // dst rect (same size)
 		    GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
-		// Restore FBO state
+		// Restore FBO state — DRAW back to the caller's target (not FBO 0), so
+		// the weave below lands where the caller intended.
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)caller_draw_fbo);
 
 		dp_tex = c->dp_input_texture;
 	}
@@ -1990,11 +2303,17 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	                        c->atlas_texture, 0);
 
 	glViewport(0, 0, c->tile_columns * c->view_width, c->tile_rows * c->view_height);
-	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	// Transparent-background apps clear their views to alpha=0; the atlas must
+	// preserve that so the woven output composes through the desktop. Opaque
+	// apps keep the alpha=1 clear (unchanged). The per-eye blit below must be a
+	// REPLACE (blend off) so the app's alpha is written verbatim rather than
+	// blended over this clear.
+	glClearColor(0.0f, 0.0f, 0.0f, c->transparent_background ? 0.0f : 1.0f);
 	glClear(GL_COLOR_BUFFER_BIT);
 
 	glUseProgram(c->program_blit);
 	glBindVertexArray(c->vao_empty);
+	glDisable(GL_BLEND);
 
 	GLint loc_tex = glGetUniformLocation(c->program_blit, "u_texture");
 	GLint loc_rect = glGetUniformLocation(c->program_blit, "u_src_rect");
@@ -2315,8 +2634,25 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		comp_gl_window_macos_get_dimensions(c->macos_window, &present_w, &present_h);
 #endif
 
-		// Bind the WGL default framebuffer for present.
-		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		// Bind the present target. Default WGL path: FBO 0 (window default
+		// framebuffer). Transparent (DComp) path: lock the off-screen interop
+		// transit texture and bind its FBO — the DP weaves into it, then the
+		// D3D11 blit + Present below copies it to the DComp back buffer.
+#ifdef XRT_OS_WINDOWS
+		if (c->dcomp_active) {
+			// The transit texture is fixed-size; resize isn't supported yet
+			// (deferred follow-up). Clamp present dims to the setup dims.
+			if (present_w != c->dcomp_present_w || present_h != c->dcomp_present_h) {
+				present_w = c->dcomp_present_w;
+				present_h = c->dcomp_present_h;
+			}
+			c->pfn_wglDXLockObjectsNV(c->dcomp_dx_interop_device, 1, &c->dcomp_transit_iop);
+			glBindFramebuffer(GL_FRAMEBUFFER, c->dcomp_transit_fbo);
+		} else
+#endif
+		{
+			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		}
 
 		if (c->display_processor != NULL) {
 			// #439 Phase 3: when this frame carries Local2D layers or an
@@ -2355,9 +2691,19 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 		// Platform-specific swap
 #ifdef XRT_OS_WINDOWS
-		SwapBuffers(c->hdc);
-		if (c->owns_window && c->own_window != NULL) {
-			comp_d3d11_window_signal_paint_done(c->own_window);
+		if (c->dcomp_active) {
+			// Transparent path: flush GL writes to the transit texture, release
+			// the interop lock, then blit + Present through DComp.
+			glFlush();
+			c->pfn_wglDXUnlockObjectsNV(c->dcomp_dx_interop_device, 1, &c->dcomp_transit_iop);
+			gl_dcomp_present_frame(c);
+			// Restore default FBO so other paths see what they expect.
+			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		} else {
+			SwapBuffers(c->hdc);
+			if (c->owns_window && c->own_window != NULL) {
+				comp_d3d11_window_signal_paint_done(c->own_window);
+			}
 		}
 #elif defined(XRT_OS_ANDROID)
 		// eglSwapBuffers(c->egl_display, c->egl_surface);
@@ -2489,6 +2835,10 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 			c->dx_device->Release();
 		}
 	}
+
+	// Tear down the transparent DComp present path (no-op if !dcomp_active).
+	// Runs while the GL context is still current (it deletes GL tex/FBO).
+	gl_destroy_dcomp_present(c);
 
 	if (c->hglrc) {
 		wglMakeCurrent(NULL, NULL);
@@ -3382,22 +3732,45 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		xrt_result_t dp_ret = factory(dp_window, &c->display_processor);
 		if (dp_ret == XRT_SUCCESS && c->display_processor != NULL) {
 			U_LOG_W("GL compositor: display processor created via factory");
+			// Forward session-level transparency config (mirrors the D3D11/
+			// D3D12/VK legs). The Leia GL DP runs its chroma-key fill+strip
+			// internally when transparent_background is set, so per-pixel alpha
+			// survives the weaver and composes through DComp; chroma_key_color=0
+			// means the DP picks its own key. No-op on DPs without the slot
+			// (e.g. sim_display, which preserves alpha natively).
+			xrt_display_processor_gl_set_chroma_key(
+			    c->display_processor, c->chroma_key_color, c->transparent_background);
 		} else {
 			U_LOG_W("GL compositor: display processor factory returned %d, using built-in shaders", dp_ret);
 			c->display_processor = NULL;
 		}
 	}
 
-	// transparent_background and chroma_key_color plumbed but not yet
-	// activated — the GL native compositor's transparent present path is
-	// deferred (see comment block above the deleted dcomp helpers). The
-	// GL DP's chroma-key fill+strip programs (leia_display_processor_gl.cpp)
-	// stay in place for the future end-to-end wiring; this compositor
-	// does NOT call xrt_display_processor_gl_set_chroma_key today, so the
-	// programs aren't exercised — running them without a DComp present
-	// path produces black-where-transparent (alpha-strip output dropped
-	// at WSI present), which would be a visible regression.
-	(void)transparent_background; // unused for now
+	// Transparent-background present path (Windows). Gated on an app-provided
+	// HWND (the app must carry WS_EX_NOREDIRECTIONBITMAP); runtime-hosted GL
+	// windows are out of scope for now. Any setup failure leaves dcomp_active
+	// false and the compositor falls back to the opaque SwapBuffers path.
+	// See gl_setup_dcomp_present() for the architecture.
+#ifdef XRT_OS_WINDOWS
+	if (c->transparent_background && c->hwnd != NULL && !c->owns_window) {
+		uint32_t tw = c->tile_columns * c->view_width;
+		uint32_t th = c->tile_rows * c->view_height;
+		RECT rc;
+		if (GetClientRect(c->hwnd, &rc)) {
+			uint32_t ww = (uint32_t)(rc.right - rc.left);
+			uint32_t wh = (uint32_t)(rc.bottom - rc.top);
+			if (ww > 0 && wh > 0) {
+				tw = ww;
+				th = wh;
+			}
+		}
+		if (!gl_setup_dcomp_present(c, c->hwnd, tw, th)) {
+			c->dcomp_active = false; // stay opaque
+		}
+	}
+#else
+	(void)transparent_background;
+#endif
 
 	// Initialize GL resources (atlas worst-case sized, crop before DP per-frame)
 	if (!gl_init_resources(c, width, height)) {
