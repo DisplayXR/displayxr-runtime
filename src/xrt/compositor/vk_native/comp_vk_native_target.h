@@ -128,6 +128,36 @@ comp_vk_native_target_resize(struct comp_vk_native_target *target,
                                uint32_t width,
                                uint32_t height);
 
+/*!
+ * Outcome of re-syncing the target against the current Android output surface.
+ * @ingroup comp_vk_native
+ */
+enum comp_vk_native_target_surface_state
+{
+	//! Surface unchanged and live — safe to acquire/present.
+	COMP_VK_NATIVE_TARGET_SURFACE_READY = 0,
+	//! No live surface (backgrounded) — the swapchain + VkSurfaceKHR were torn
+	//! down; the caller must skip acquire/present this frame.
+	COMP_VK_NATIVE_TARGET_SURFACE_LOST,
+	//! A new surface arrived (resume) — VkSurfaceKHR + swapchain were rebuilt;
+	//! safe to acquire/present.
+	COMP_VK_NATIVE_TARGET_SURFACE_RECREATED,
+};
+
+/*!
+ * Android only: re-sync the target's VkSurfaceKHR + swapchain against the
+ * ANativeWindow currently published by aux_android (which the SurfaceView
+ * destroy/recreate callbacks drive). Called once per frame before acquire.
+ *
+ * On surface loss it idles the GPU and destroys the swapchain + VkSurfaceKHR so
+ * the compositor never blocks acquiring/presenting on a dead window; on a new
+ * surface it rebuilds both. A no-op (returns READY) on non-Android. #507
+ *
+ * @ingroup comp_vk_native
+ */
+enum comp_vk_native_target_surface_state
+comp_vk_native_target_sync_surface(struct comp_vk_native_target *target);
+
 #ifdef __cplusplus
 }
 #endif

@@ -11,6 +11,9 @@
 
 #include <xrt/xrt_config_os.h>
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #ifdef XRT_OS_ANDROID
 
 #ifdef __cplusplus
@@ -74,6 +77,42 @@ android_globals_store_window(struct _ANativeWindow *window);
 
 struct _ANativeWindow *
 android_globals_get_window(void);
+
+/*!
+ * Publish a freshly-acquired ANativeWindow (e.g. from a new SurfaceView surface
+ * on resume). Bumps a monotonic generation counter and marks the window valid so
+ * a consumer (the compositor target) can detect "the surface changed under me"
+ * and rebuild its VkSurfaceKHR + swapchain. Thread-safe.
+ *
+ * @param window the new ANativeWindow (may be NULL, treated like a clear).
+ * @ingroup aux_android
+ */
+void
+android_globals_set_window(struct _ANativeWindow *window);
+
+/*!
+ * Mark the current ANativeWindow as gone (surfaceDestroyed). Bumps the generation
+ * counter and clears the valid flag so the compositor tears its surface down
+ * instead of presenting to a dead window. Thread-safe.
+ *
+ * Keeps the ANativeWindow pointer around (still the "current" window) so a
+ * consumer mid-frame can finish/idle before it next re-syncs; the consumer
+ * releases the old reference itself once it has idled the GPU.
+ * @ingroup aux_android
+ */
+void
+android_globals_clear_window(void);
+
+/*!
+ * Atomically read the current window + generation + validity.
+ *
+ * @param[out] out_window     the current ANativeWindow (may be NULL).
+ * @param[out] out_generation monotonic counter, bumped on every set/clear.
+ * @param[out] out_valid      true if a live surface is currently published.
+ * @ingroup aux_android
+ */
+void
+android_globals_get_window_state(struct _ANativeWindow **out_window, uint64_t *out_generation, bool *out_valid);
 
 #ifdef __cplusplus
 }

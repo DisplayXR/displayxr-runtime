@@ -35,6 +35,7 @@
 #define VK_USE_PLATFORM_ANDROID_KHR
 #include <vulkan/vulkan_android.h>
 #include <android/native_window.h>
+#include "android/android_globals.h"
 #endif
 
 #define DCOMP_RING 2 // Number of shared back-buffers in the bridge ring
@@ -88,6 +89,22 @@ struct comp_vk_native_target
 
 	//! Window handle.
 	void *hwnd;
+
+#ifdef XRT_OS_ANDROID
+	//! The ANativeWindow the current VkSurfaceKHR was built from (owns one
+	//! reference, released when the surface is torn down). Distinct from @ref
+	//! hwnd, which is the launch window and is not re-pointed on resume.
+	void *android_window;
+
+	//! android_globals surface generation this target's VkSurfaceKHR matches.
+	//! A mismatch on the next frame means the SurfaceView handed us a new
+	//! surface (resume) — rebuild — or lost it (background) — tear down. #507
+	uint64_t surface_generation;
+
+	//! True while there is no live output surface (backgrounded). The compositor
+	//! skips acquire/present so the render thread never blocks on a dead window.
+	bool surface_lost;
+#endif
 
 	//! Queue family index for present support check.
 	uint32_t queue_family_index;
@@ -726,6 +743,14 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 	target->queue_family_index = queue_family_index;
 	target->transparent_background = transparent_background;
 
+#ifdef XRT_OS_ANDROID
+	// Track the surface we build from + the generation it matches, so the
+	// per-frame re-sync can detect surface loss / replacement on resume. #507
+	target->android_window = hwnd;
+	target->surface_lost = false;
+	android_globals_get_window_state(NULL, &target->surface_generation, NULL);
+#endif
+
 #ifdef XRT_OS_WINDOWS
 	// Transparent-background path: VK -> D3D11 KMT shared -> DComp bridge,
 	// no WSI swapchain at all. Falls back to opaque WSI on failure.
@@ -933,8 +958,112 @@ comp_vk_native_target_destroy(struct comp_vk_native_target **target_ptr)
 		vk->vkDestroySurfaceKHR(vk->instance, target->surface, NULL);
 	}
 
+#ifdef XRT_OS_ANDROID
+	// Release the ANativeWindow reference aux_android handed us (the one the
+	// current VkSurfaceKHR was built from). #507
+	if (target->android_window != NULL) {
+		ANativeWindow_release((ANativeWindow *)target->android_window);
+		target->android_window = NULL;
+	}
+#endif
+
 	free(target);
 	*target_ptr = NULL;
+}
+
+enum comp_vk_native_target_surface_state
+comp_vk_native_target_sync_surface(struct comp_vk_native_target *target)
+{
+#ifndef XRT_OS_ANDROID
+	(void)target;
+	return COMP_VK_NATIVE_TARGET_SURFACE_READY;
+#else
+	struct vk_bundle *vk = target->vk;
+
+	struct _ANativeWindow *cur_window = NULL;
+	uint64_t cur_gen = 0;
+	bool cur_valid = false;
+	android_globals_get_window_state(&cur_window, &cur_gen, &cur_valid);
+
+	// Surface unchanged since we (re)built — nothing to do here. The HW_XFORM
+	// rotation-extent poll still runs in target_acquire for the live surface.
+	if (cur_gen == target->surface_generation) {
+		return target->surface_lost ? COMP_VK_NATIVE_TARGET_SURFACE_LOST
+		                            : COMP_VK_NATIVE_TARGET_SURFACE_READY;
+	}
+
+	// The SurfaceView handed us a different surface (or lost it). Idle the GPU
+	// and tear the old swapchain + VkSurfaceKHR down before touching the new one
+	// — vkDestroySwapchainKHR must precede a new swapchain on the same window,
+	// and we must not present to the dead surface.
+	vk->vkDeviceWaitIdle(vk->device);
+	destroy_swapchain_views(target);
+	if (target->swapchain != VK_NULL_HANDLE) {
+		vk->vkDestroySwapchainKHR(vk->device, target->swapchain, NULL);
+		target->swapchain = VK_NULL_HANDLE;
+	}
+	if (target->surface != VK_NULL_HANDLE) {
+		vk->vkDestroySurfaceKHR(vk->instance, target->surface, NULL);
+		target->surface = VK_NULL_HANDLE;
+	}
+	if (target->android_window != NULL) {
+		// Release the reference aux_android handed us for the old window.
+		ANativeWindow_release((ANativeWindow *)target->android_window);
+		target->android_window = NULL;
+	}
+
+	target->surface_generation = cur_gen;
+
+	if (!cur_valid || cur_window == NULL) {
+		// Backgrounded: no live surface. Stay torn down; caller skips present so
+		// the render thread never blocks on a dead window. #507
+		target->surface_lost = true;
+		U_LOG_I("Android output surface lost — target torn down (#507)");
+		return COMP_VK_NATIVE_TARGET_SURFACE_LOST;
+	}
+
+	// Resume: rebuild VkSurfaceKHR + swapchain from the new ANativeWindow,
+	// taking ownership of the reference aux_android published.
+	VkAndroidSurfaceCreateInfoKHR surface_ci = {
+	    .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
+	    .pNext = NULL,
+	    .flags = 0,
+	    .window = (ANativeWindow *)cur_window,
+	};
+	VkResult res = vk->vkCreateAndroidSurfaceKHR(vk->instance, &surface_ci, NULL, &target->surface);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("sync_surface: vkCreateAndroidSurfaceKHR failed: %d", res);
+		target->surface = VK_NULL_HANDLE;
+		target->surface_lost = true;
+		return COMP_VK_NATIVE_TARGET_SURFACE_LOST;
+	}
+	target->android_window = cur_window;
+
+	// Adopt the new surface's current extent (covers a portrait<->landscape flip
+	// that happened while backgrounded).
+	VkSurfaceCapabilitiesKHR caps;
+	if (vk->vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk->physical_device, target->surface, &caps) == VK_SUCCESS &&
+	    caps.currentExtent.width != UINT32_MAX && caps.currentExtent.width != 0 &&
+	    caps.currentExtent.height != 0) {
+		target->width = caps.currentExtent.width;
+		target->height = caps.currentExtent.height;
+	}
+
+	xrt_result_t xret = create_swapchain(target);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_E("sync_surface: create_swapchain failed after resume");
+		vk->vkDestroySurfaceKHR(vk->instance, target->surface, NULL);
+		target->surface = VK_NULL_HANDLE;
+		ANativeWindow_release((ANativeWindow *)target->android_window);
+		target->android_window = NULL;
+		target->surface_lost = true;
+		return COMP_VK_NATIVE_TARGET_SURFACE_LOST;
+	}
+
+	target->surface_lost = false;
+	U_LOG_I("Android output surface recreated %ux%u (#507)", target->width, target->height);
+	return COMP_VK_NATIVE_TARGET_SURFACE_RECREATED;
+#endif
 }
 
 xrt_result_t

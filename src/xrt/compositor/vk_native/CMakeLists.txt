@@ -50,6 +50,12 @@ if((WIN32 OR APPLE OR ANDROID) AND XRT_HAVE_VULKAN)
 			"-framework Cocoa" "-framework QuartzCore" "-framework IOSurface")
 	endif()
 
+	if(ANDROID)
+		# Surface-lifecycle re-sync reads the live ANativeWindow published by the
+		# SurfaceView callbacks via android_globals_* (#507).
+		target_link_libraries(comp_vk_native PRIVATE aux_android)
+	endif()
+
 	# Qwerty include path for runtime-side 2D/3D toggle polling
 	if(XRT_BUILD_DRIVER_QWERTY)
 		target_link_libraries(comp_vk_native PRIVATE drv_qwerty_includes)

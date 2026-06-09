@@ -2456,6 +2456,18 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 	// If we have a target (window), present to it
 	if (c->target != NULL) {
+		// Re-sync the output surface against the live ANativeWindow (Android).
+		// On background→card the SurfaceView's surface is destroyed; presenting
+		// to that dead window wedges the render thread (Adreno never reports
+		// VK_ERROR_OUT_OF_DATE_KHR there) and the OS freezes the process. Skip
+		// acquire/present entirely while no surface exists, and pick up the new
+		// surface on resume. No-op on non-Android. #507
+		enum comp_vk_native_target_surface_state sstate =
+		    comp_vk_native_target_sync_surface(c->target);
+		if (sstate == COMP_VK_NATIVE_TARGET_SURFACE_LOST) {
+			return XRT_SUCCESS;
+		}
+
 		uint32_t target_index;
 		xret = comp_vk_native_target_acquire(c->target, &target_index);
 		if (xret != XRT_SUCCESS) {
