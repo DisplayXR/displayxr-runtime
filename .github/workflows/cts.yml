@@ -1,0 +1,199 @@
+name: OpenXR CTS
+
+# Tiered OpenXR Conformance Test Suite runs against the freshly-built DisplayXR
+# runtime + the sim-display plug-in (hardware-free), using the Khronos
+# conformance_cli pinned to the loader version.
+#
+#  - pull_request (only when runtime / compositor / CTS-harness paths change) -> SMOKE subset
+#  - nightly cron on main                                                     -> FULL non-interactive suite
+#  - v* tag                                                                   -> FULL suite (release gate)
+#  - workflow_dispatch                                                        -> on-demand (choose graphics + scope)
+#
+# The runtime is registered for the (elevated) Khronos loader via HKLM
+# ActiveRuntime — XR_RUNTIME_JSON is ignored when elevated. scripts/run_cts.ps1
+# owns that registration + the conformance API-layer registration, and restores
+# both in a finally. See docs/roadmap/cts-windows-handoff.md.
+
+on:
+  pull_request:
+    paths:
+      - 'src/xrt/state_trackers/oxr/**'
+      - 'src/xrt/compositor/**'
+      - 'src/xrt/auxiliary/**'
+      - 'src/xrt/drivers/sim_display/**'
+      - 'src/xrt/include/**'
+      - 'scripts/run_cts.ps1'
+      - 'scripts/fetch_build_cts.bat'
+      - '.github/workflows/cts.yml'
+  push:
+    tags:
+      - 'v*'
+  schedule:
+    # 07:00 UTC nightly — full suite on main.
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+    inputs:
+      graphics:
+        description: 'Graphics plugin'
+        type: choice
+        default: d3d11
+        options: [d3d11, d3d12]
+      scope:
+        description: 'Test scope'
+        type: choice
+        default: smoke
+        options: [smoke, full]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  CTS:
+    runs-on: windows-2022
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: true
+
+      # Decide graphics + test spec from the trigger.
+      #   PR                 -> smoke / d3d11
+      #   schedule / tag     -> full  / d3d11
+      #   workflow_dispatch  -> inputs
+      - name: Resolve run parameters
+        id: params
+        shell: pwsh
+        run: |
+          $graphics = "d3d11"
+          $scope = "smoke"
+          if ($env:GITHUB_EVENT_NAME -eq "workflow_dispatch") {
+            $graphics = "${{ inputs.graphics }}"
+            $scope = "${{ inputs.scope }}"
+          } elseif ($env:GITHUB_EVENT_NAME -eq "schedule" -or $env:GITHUB_REF -like "refs/tags/*") {
+            $scope = "full"
+          }
+          # Smoke = a fast, representative slice; full = the whole non-interactive
+          # subset. Interactive (HMD/controller) categories are out of scope.
+          if ($scope -eq "full") {
+            $spec = "exclude:[interactive]"
+            $timeout = "900"
+          } else {
+            $spec = "Swapchains,SessionState,ValidateEnvironment,validApiLayer,XR_KHR_visibility_mask,XR_KHR_composition_layer_cylinder"
+            $timeout = "300"
+          }
+          "graphics=$graphics" >> $env:GITHUB_OUTPUT
+          "scope=$scope"       >> $env:GITHUB_OUTPUT
+          "spec=$spec"         >> $env:GITHUB_OUTPUT
+          "timeout=$timeout"   >> $env:GITHUB_OUTPUT
+          Write-Host "graphics=$graphics scope=$scope timeout=$timeout"
+          Write-Host "spec=$spec"
+
+      - name: Restore from cache and setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgGitCommitId: '5d90b0d5d0317336e65662f2bf0d671b0902c632'
+          vcpkgJsonGlob: 'vcpkg.json'
+
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.3.283.0
+          cache: true
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install OpenXR loader
+        run: |
+          $openxrVersion = "1.1.43"
+          $openxrUrl = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$openxrVersion/openxr_loader_windows-$openxrVersion.zip"
+          Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
+          Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
+
+      - name: Generate + build runtime
+        run: |
+          cmake -S . -B build -G "Ninja Multi-Config" `
+            -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" `
+            -DCMAKE_INSTALL_PREFIX=_package `
+            -DXRT_FEATURE_SERVICE=ON `
+            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
+          cmake --build build --config Release --target install
+
+      # Build the Khronos conformance_cli + conformance_test (+ the two CTS API
+      # layers) pinned to the loader version. Cached on the harness script hash.
+      - name: Cache CTS build
+        id: cts-cache
+        uses: actions/cache@v4
+        with:
+          path: build-cts
+          key: cts-${{ runner.os }}-${{ hashFiles('scripts/fetch_build_cts.bat') }}-1.1.43
+
+      - name: Build CTS
+        if: steps.cts-cache.outputs.cache-hit != 'true'
+        shell: cmd
+        run: scripts\fetch_build_cts.bat
+
+      # Register the freshly-built sim-display plug-in for DP discovery, exactly
+      # as build-windows.yml's self-test gate does.
+      - name: Register sim-display plug-in
+        shell: pwsh
+        run: |
+          $plugin = Join-Path $env:GITHUB_WORKSPACE "_package\bin\plugins\DisplayXR-SimDisplay.dll"
+          if (-not (Test-Path $plugin)) {
+            $plugin = (Get-ChildItem -Path "$env:GITHUB_WORKSPACE\build" -Recurse -Filter "DisplayXR-SimDisplay.dll" | Select-Object -First 1).FullName
+          }
+          if (-not $plugin) { throw "DisplayXR-SimDisplay.dll not found" }
+          $key = "HKLM\Software\DisplayXR\DisplayProcessors\sim-display"
+          reg add $key /v Binary /t REG_SZ /d "$plugin" /f | Out-Null
+          reg add $key /v ProbeOrder /t REG_DWORD /d 200 /f | Out-Null
+          reg add $key /v DisplayName /t REG_SZ /d "Simulated 3D Display" /f | Out-Null
+          Write-Host "Registered sim-display plug-in: $plugin"
+
+      - name: Run CTS (${{ steps.params.outputs.scope }} / ${{ steps.params.outputs.graphics }})
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE\scripts\run_cts.ps1" `
+            -TestSpec "${{ steps.params.outputs.spec }}" `
+            -Graphics "${{ steps.params.outputs.graphics }}" `
+            -ConformanceLayer `
+            -TimeoutSec ${{ steps.params.outputs.timeout }} `
+            -Tag "ci"
+
+      - name: Evaluate results
+        shell: pwsh
+        run: |
+          $xml = "$env:TEMP\cts_ci.xml"
+          if (-not (Test-Path $xml)) { throw "CTS produced no result XML — the run likely crashed before writing results." }
+          [xml]$doc = Get-Content $xml
+          $suite = $doc.testsuites.testsuite
+          if (-not $suite) { $suite = $doc.testsuite }
+          $failures = [int]$suite.failures
+          $tests = [int]$suite.tests
+          $skipped = [int]$suite.skipped
+          Write-Host "CTS: $tests assertions, $failures failures, $skipped skipped"
+          if (-not (Select-String -Path $xml -Pattern '</testsuites>' -Quiet)) {
+            throw "CTS result XML is truncated — the run crashed mid-suite."
+          }
+          if ($failures -gt 0) {
+            Write-Host "::error::CTS reported $failures failing assertions"
+            $doc.SelectNodes('//testcase[failure]') | ForEach-Object { Write-Host "  FAIL: $($_.name)" }
+            exit 1
+          }
+          Write-Host "CTS passed."
+
+      - name: Upload CTS results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cts-${{ steps.params.outputs.scope }}-${{ steps.params.outputs.graphics }}
+          path: |
+            ${{ runner.temp }}/cts_ci.xml
+            ${{ runner.temp }}/cts_ci_console.log
+          if-no-files-found: warn
