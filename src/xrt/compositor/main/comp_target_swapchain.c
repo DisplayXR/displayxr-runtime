@@ -873,6 +873,31 @@ comp_target_swapchain_acquire_next_image(struct comp_target *ct, uint32_t *out_i
 		return VK_ERROR_INITIALIZATION_FAILED;
 	}
 
+#ifdef XRT_OS_ANDROID
+	// Live device rotation (#510, mirrors the in-process vk_native poll #507):
+	// Adreno does NOT report VK_ERROR_OUT_OF_DATE_KHR when the device rotates,
+	// and with preTransform forced to IDENTITY the swapchain extent must track
+	// the live surface currentExtent or the present is stretched / wrong
+	// orientation. Poll the surface caps each acquire and force a recreate (via
+	// the caller's OUT_OF_DATE handling) when the extent flips. The recreate
+	// updates cts->base.width/height, which flows to the client's oxr Kooima
+	// over IPC (multi_compositor_get_window_metrics) so the FOV re-orients too.
+	{
+		VkSurfaceCapabilitiesKHR caps;
+		VkResult cres = vk->vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk->physical_device,
+		                                                              cts->surface.handle, &caps);
+		if (cres == VK_SUCCESS && caps.currentExtent.width != (uint32_t)-1 &&
+		    caps.currentExtent.width != 0 && caps.currentExtent.height != 0 &&
+		    (caps.currentExtent.width != cts->base.width ||
+		     caps.currentExtent.height != cts->base.height)) {
+			U_LOG_W("comp_window_android: surface extent %ux%u -> %ux%u (rotation), recreating",
+			        cts->base.width, cts->base.height, caps.currentExtent.width,
+			        caps.currentExtent.height);
+			return VK_ERROR_OUT_OF_DATE_KHR;
+		}
+	}
+#endif
+
 	return vk->vkAcquireNextImageKHR(          //
 	    vk->device,                            // device
 	    cts->swapchain.handle,                 // swapchain
