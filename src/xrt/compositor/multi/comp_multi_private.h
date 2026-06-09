@@ -244,6 +244,13 @@ struct multi_compositor
 		//! (HANDLE on Win32, IOSurfaceRef on macOS). NULL if not used.
 		void *shared_texture_handle;
 
+		//! Android out-of-process: the app's surface arrives via the IPC
+		//! injection path (passAppSurface → android_globals), not as an
+		//! external_window_handle over IPC. When true, per-session rendering
+		//! engages and the Android comp_target pulls the surface from
+		//! android_globals. (#510)
+		bool use_android_surface;
+
 		//! Per-session render target (VkSwapchain from external HWND)
 		struct comp_target *target;
 
@@ -615,7 +622,7 @@ static inline bool
 multi_compositor_has_session_render(struct multi_compositor *mc)
 {
 	return mc->session_render.external_window_handle != NULL || mc->session_render.readback_callback != NULL ||
-	       mc->session_render.shared_texture_handle != NULL;
+	       mc->session_render.shared_texture_handle != NULL || mc->session_render.use_android_surface;
 }
 
 /*!

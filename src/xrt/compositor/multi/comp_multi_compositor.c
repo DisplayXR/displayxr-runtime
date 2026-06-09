@@ -589,6 +589,16 @@ multi_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin
 			}
 		}
 #endif
+
+#ifdef XRT_OS_ANDROID
+		// Out-of-process Android (#510): the app's surface reaches the service
+		// over the IPC injection path (Client.java passAppSurface →
+		// MonadoImpl → android_globals), not as an external_window_handle
+		// through IPC. Engage per-session rendering; the Android comp_target
+		// (comp_window_android) pulls the live surface from android_globals.
+		mc->session_render.use_android_surface = true;
+		U_LOG_I("Android: enabling per-session rendering (surface via android_globals)");
+#endif
 		multi_system_compositor_update_session_status(mc->msc, true);
 		mc->state.session_active = true;
 	}
@@ -1442,9 +1452,11 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 		return true;
 	}
 
-	// No external window handle, readback callback, or shared texture - use shared native compositor
+	// No external window handle, readback callback, or shared texture - use shared native compositor.
+	// On Android (#510) the surface arrives out-of-band via android_globals, so use_android_surface
+	// is the signal to proceed even though all the handle fields are NULL.
 	if (mc->session_render.external_window_handle == NULL && mc->session_render.readback_callback == NULL &&
-	    mc->session_render.shared_texture_handle == NULL) {
+	    mc->session_render.shared_texture_handle == NULL && !mc->session_render.use_android_surface) {
 		U_LOG_I("init_session_render: no window handle, readback callback, or shared texture, using shared "
 		        "compositor");
 		return false;
