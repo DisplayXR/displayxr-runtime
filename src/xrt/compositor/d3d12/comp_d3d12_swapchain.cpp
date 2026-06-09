@@ -214,7 +214,11 @@ comp_d3d12_swapchain_create(struct comp_d3d12_compositor *c,
 {
 	auto internals = get_internals(c);
 
-	uint32_t image_count = 3; // Triple buffering
+	// Static swapchains (XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT) hold exactly one
+	// image and may be acquired only once (OpenXR spec); dynamic swapchains use
+	// triple buffering. (Mirrors the D3D11 fix; CTS Swapchains "Non-default
+	// create flags" otherwise saw 3 images and got XR_ERROR_CALL_ORDER_INVALID.)
+	uint32_t image_count = (info->create & XRT_SWAPCHAIN_CREATE_STATIC_IMAGE) ? 1u : 3u;
 	if (image_count > MAX_SWAPCHAIN_IMAGES) {
 		image_count = MAX_SWAPCHAIN_IMAGES;
 	}
