@@ -282,6 +282,13 @@ struct comp_metal_compositor
 	uint32_t composite_w;               //!< Current scratch width (0 = not allocated)
 	uint32_t composite_h;               //!< Current scratch height
 
+	//! #491 part 3 — the flattened 2D-UNDER backdrop (Local2D layers before the
+	//! projection in list order), handed to the DP via set_background_2d so it
+	//! composites `backdrop over captured-desktop` under the 3D weave.
+	id<MTLTexture> backdrop_scratch;
+	uint32_t backdrop_w;                //!< Current backdrop scratch width (0 = none)
+	uint32_t backdrop_h;
+
 	//! Pipelines for the Local2D flatten (premultiplied over / unpremultiplied
 	//! source) and the masked composite pass.
 	id<MTLRenderPipelineState> local2d_premult_pipeline;
@@ -1954,6 +1961,232 @@ metal_ensure_composite_scratch(struct comp_metal_compositor *c, uint32_t w, uint
 	return true;
 }
 
+// #491 part 3 — (re)allocate the 2D-under backdrop scratch (BGRA8, render-target
+// + shader-read, premultiplied) at w×h. No-op when already matching.
+static bool
+metal_ensure_backdrop_scratch(struct comp_metal_compositor *c, uint32_t w, uint32_t h)
+{
+	if (c->backdrop_w == w && c->backdrop_h == h && c->backdrop_scratch != nil) {
+		return true;
+	}
+	[c->backdrop_scratch release];
+	c->backdrop_scratch = nil;
+	c->backdrop_w = 0;
+	c->backdrop_h = 0;
+
+	MTLTextureDescriptor *desc =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:w
+	                                                      height:h
+	                                                   mipmapped:NO];
+	desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	c->backdrop_scratch = [c->device newTextureWithDescriptor:desc];
+	if (c->backdrop_scratch == nil) {
+		U_LOG_E("Failed to allocate backdrop scratch texture (%ux%u)", w, h);
+		return false;
+	}
+	c->backdrop_w = w;
+	c->backdrop_h = h;
+	return true;
+}
+
+// #439 Phase 3 / #491 part 3 — draw one Local2D layer into the currently-bound
+// flatten render encoder (premultiplied / unpremultiplied "over", sRGB
+// passthrough). Dest rect clips to the w×h window scratch; clipped fractions
+// carry into the source UVs. Shared by the over-flatten (masked composite) and
+// the under-flatten (backdrop).
+static void
+metal_flatten_one_local2d_layer(struct comp_metal_compositor *c,
+                                id<MTLRenderCommandEncoder> enc,
+                                struct comp_layer *layer,
+                                uint32_t w,
+                                uint32_t h)
+{
+	struct xrt_swapchain *sc = layer->sc_array[0];
+	if (sc == NULL) {
+		return;
+	}
+	struct comp_metal_swapchain *msc = metal_swapchain(sc);
+	uint32_t img_idx = layer->data.local_2d.sub.image_index;
+	if (img_idx >= msc->image_count || msc->images[img_idx] == nil) {
+		return;
+	}
+
+	// Clip the dest rect to the window scratch; carry the clipped fractions
+	// into the source UVs.
+	const struct xrt_rect *dr = &layer->data.local_2d.rect;
+	int32_t dx = dr->offset.w;
+	int32_t dy = dr->offset.h;
+	int32_t dw = dr->extent.w;
+	int32_t dh = dr->extent.h;
+	if (dw <= 0 || dh <= 0) {
+		return;
+	}
+	int32_t x0 = dx < 0 ? 0 : dx;
+	int32_t y0 = dy < 0 ? 0 : dy;
+	int32_t x1 = (dx + dw) > (int32_t)w ? (int32_t)w : (dx + dw);
+	int32_t y1 = (dy + dh) > (int32_t)h ? (int32_t)h : (dy + dh);
+	if (x1 <= x0 || y1 <= y0) {
+		return;
+	}
+	float fx0 = (float)(x0 - dx) / (float)dw;
+	float fy0 = (float)(y0 - dy) / (float)dh;
+	float fx1 = (float)(x1 - dx) / (float)dw;
+	float fy1 = (float)(y1 - dy) / (float)dh;
+
+	struct xrt_normalized_rect nr = layer->data.local_2d.sub.norm_rect;
+	if (nr.w <= 0.0f || nr.h <= 0.0f) {
+		nr.x = 0.0f;
+		nr.y = 0.0f;
+		nr.w = 1.0f;
+		nr.h = 1.0f;
+	}
+
+	// sRGB passthrough (see projection pass).
+	id<MTLTexture> src_tex = msc->images[img_idx];
+	id<MTLTexture> src_view = nil;
+	{
+		MTLPixelFormat unorm_fmt = metal_srgb_to_unorm(src_tex.pixelFormat);
+		if (unorm_fmt != src_tex.pixelFormat) {
+			src_view = [src_tex newTextureViewWithPixelFormat:unorm_fmt];
+			if (src_view != nil) {
+				src_tex = src_view;
+			}
+		}
+	}
+
+	MTLViewport vp;
+	vp.originX = x0;
+	vp.originY = y0;
+	vp.width = x1 - x0;
+	vp.height = y1 - y0;
+	vp.znear = 0.0;
+	vp.zfar = 1.0;
+	[enc setViewport:vp];
+
+	bool unpremult = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
+	[enc setRenderPipelineState:unpremult ? c->local2d_unpremult_pipeline : c->local2d_premult_pipeline];
+	[enc setFragmentTexture:src_tex atIndex:0];
+	[enc setFragmentSamplerState:c->sampler_linear atIndex:0];
+
+	struct {
+		float viewport[4];
+		float src_rect[4];
+		float color_scale[4];
+		float color_bias[4];
+		float swizzle_rb;
+		float _pad[3];
+	} constants;
+
+	constants.viewport[0] = 0.0f;
+	constants.viewport[1] = 0.0f;
+	constants.viewport[2] = 1.0f;
+	constants.viewport[3] = 1.0f;
+
+	constants.src_rect[0] = nr.x + nr.w * fx0;
+	constants.src_rect[2] = nr.w * (fx1 - fx0);
+	if (layer->data.flip_y) {
+		constants.src_rect[1] = nr.y + nr.h * (1.0f - fy0);
+		constants.src_rect[3] = -(nr.h * (fy1 - fy0));
+	} else {
+		constants.src_rect[1] = nr.y + nr.h * fy0;
+		constants.src_rect[3] = nr.h * (fy1 - fy0);
+	}
+
+	constants.color_scale[0] = 1.0f;
+	constants.color_scale[1] = 1.0f;
+	constants.color_scale[2] = 1.0f;
+	constants.color_scale[3] = 1.0f;
+	constants.color_bias[0] = 0.0f;
+	constants.color_bias[1] = 0.0f;
+	constants.color_bias[2] = 0.0f;
+	constants.color_bias[3] = 0.0f;
+	constants.swizzle_rb = 0.0f;
+	constants._pad[0] = constants._pad[1] = constants._pad[2] = 0.0f;
+
+	[enc setVertexBytes:&constants length:sizeof(constants) atIndex:0];
+	[enc setFragmentBytes:&constants length:sizeof(constants) atIndex:0];
+	[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+
+	[src_view release];
+}
+
+// #491 part 3 — flatten this frame's 2D-UNDER Local2D layers (before the
+// projection in list order) into backdrop_scratch PRE-weave and return it (+
+// region dims) so the caller hands it to the DP via set_background_2d (the DP
+// composites `backdrop over captured-desktop` under the 3D). Returns nil (out
+// dims 0) when there are no under-layers. The flatten is encoded on @p cmd_buf
+// before the DP's process_atlas.
+static id<MTLTexture>
+metal_flatten_backdrop_2d(struct comp_metal_compositor *c,
+                          id<MTLCommandBuffer> cmd_buf,
+                          uint32_t dst_w,
+                          uint32_t dst_h,
+                          uint32_t *out_w,
+                          uint32_t *out_h)
+{
+	*out_w = 0;
+	*out_h = 0;
+	if (!c->local_2d_last_frame || dst_w == 0 || dst_h == 0) {
+		return nil;
+	}
+
+	// Under = Local2D layers BEFORE the projection. No projection ⟹ no backdrop.
+	int32_t proj_idx = -1;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+		if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+			proj_idx = (int32_t)i;
+			break;
+		}
+	}
+	if (proj_idx < 0) {
+		return nil;
+	}
+	bool have_under = false;
+	for (int32_t i = 0; i < proj_idx; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
+			have_under = true;
+			break;
+		}
+	}
+	if (!have_under) {
+		return nil;
+	}
+
+	uint32_t w = dst_w;
+	uint32_t h = dst_h;
+	if (!metal_ensure_backdrop_scratch(c, w, h)) {
+		return nil;
+	}
+
+	MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+	pass.colorAttachments[0].texture = c->backdrop_scratch;
+	pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+	pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+	pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+
+	id<MTLRenderCommandEncoder> enc = [cmd_buf renderCommandEncoderWithDescriptor:pass];
+	for (int32_t i = 0; i < proj_idx; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
+			continue;
+		}
+		metal_flatten_one_local2d_layer(c, enc, layer, w, h);
+	}
+	[enc endEncoding];
+
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		U_LOG_W("Metal #491 part3: flattened 2D-under backdrop %ux%u (handed to DP set_background_2d)", w, h);
+	}
+
+	*out_w = w;
+	*out_h = h;
+	return c->backdrop_scratch;
+}
+
 /*!
  * The Metal Local-2D consumer (#439 Phase 3, impl doc §4 steps 2/4/5):
  * resolve the frame's mask (explicit staged, else implicit from layer
@@ -2002,6 +2235,18 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 	if (w > (uint32_t)output_texture.width) w = (uint32_t)output_texture.width;
 	if (h > (uint32_t)output_texture.height) h = (uint32_t)output_texture.height;
 
+	// #491 part 3 — split Local2D by list order vs the projection: layers BEFORE
+	// the projection are the 2D-under backdrop (handed to the DP pre-weave) and
+	// are excluded from the overlay mask + flatten here.
+	int32_t proj_idx = -1;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+		if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+			proj_idx = (int32_t)i;
+			break;
+		}
+	}
+
 	// Step 2 — resolve the frame's mask.
 	id<MTLTexture> mask_tex = nil;
 	if (c->zone_mask_active != NULL && c->zone_mask_active->submitted) {
@@ -2010,9 +2255,13 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 		struct xrt_rect rects[XRT_MAX_LAYERS];
 		uint32_t rect_count = 0;
 		for (uint32_t i = 0; i < c->layer_accum.layer_count && rect_count < XRT_MAX_LAYERS; i++) {
-			if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
-				rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
+			if (c->layer_accum.layers[i].data.type != XRT_LAYER_LOCAL_2D) {
+				continue;
 			}
+			if (proj_idx >= 0 && (int32_t)i < proj_idx) {
+				continue; // under-layer (backdrop) — not part of the overlay mask
+			}
+			rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
 		}
 		mask_tex = metal_update_implicit_mask(c, rects, rect_count, w, h);
 	}
@@ -2034,120 +2283,18 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 
 		id<MTLRenderCommandEncoder> enc = [cmd_buf renderCommandEncoderWithDescriptor:pass];
 
-		// Flatten Local2D layers in layer-list (accumulation) order.
+		// Flatten the OVER Local2D layers in layer-list (accumulation) order.
+		// #491 part 3: under-layers (before the projection) are the DP backdrop
+		// and are skipped here.
 		for (uint32_t i = 0; have_local_2d && i < c->layer_accum.layer_count; i++) {
 			struct comp_layer *layer = &c->layer_accum.layers[i];
 			if (layer->data.type != XRT_LAYER_LOCAL_2D) {
 				continue;
 			}
-			struct xrt_swapchain *sc = layer->sc_array[0];
-			if (sc == NULL) {
-				continue;
+			if (proj_idx >= 0 && (int32_t)i < proj_idx) {
+				continue; // under-layer (backdrop) — handled pre-weave
 			}
-			struct comp_metal_swapchain *msc = metal_swapchain(sc);
-			uint32_t img_idx = layer->data.local_2d.sub.image_index;
-			if (img_idx >= msc->image_count || msc->images[img_idx] == nil) {
-				continue;
-			}
-
-			// Clip the dest rect to the window scratch; carry the
-			// clipped fractions into the source UVs.
-			const struct xrt_rect *dr = &layer->data.local_2d.rect;
-			int32_t dx = dr->offset.w;
-			int32_t dy = dr->offset.h;
-			int32_t dw = dr->extent.w;
-			int32_t dh = dr->extent.h;
-			if (dw <= 0 || dh <= 0) {
-				continue;
-			}
-			int32_t x0 = dx < 0 ? 0 : dx;
-			int32_t y0 = dy < 0 ? 0 : dy;
-			int32_t x1 = (dx + dw) > (int32_t)w ? (int32_t)w : (dx + dw);
-			int32_t y1 = (dy + dh) > (int32_t)h ? (int32_t)h : (dy + dh);
-			if (x1 <= x0 || y1 <= y0) {
-				continue;
-			}
-			float fx0 = (float)(x0 - dx) / (float)dw;
-			float fy0 = (float)(y0 - dy) / (float)dh;
-			float fx1 = (float)(x1 - dx) / (float)dw;
-			float fy1 = (float)(y1 - dy) / (float)dh;
-
-			struct xrt_normalized_rect nr = layer->data.local_2d.sub.norm_rect;
-			if (nr.w <= 0.0f || nr.h <= 0.0f) {
-				nr.x = 0.0f;
-				nr.y = 0.0f;
-				nr.w = 1.0f;
-				nr.h = 1.0f;
-			}
-
-			// sRGB passthrough (see projection pass).
-			id<MTLTexture> src_tex = msc->images[img_idx];
-			id<MTLTexture> src_view = nil;
-			{
-				MTLPixelFormat unorm_fmt = metal_srgb_to_unorm(src_tex.pixelFormat);
-				if (unorm_fmt != src_tex.pixelFormat) {
-					src_view = [src_tex newTextureViewWithPixelFormat:unorm_fmt];
-					if (src_view != nil) {
-						src_tex = src_view;
-					}
-				}
-			}
-
-			MTLViewport vp;
-			vp.originX = x0;
-			vp.originY = y0;
-			vp.width = x1 - x0;
-			vp.height = y1 - y0;
-			vp.znear = 0.0;
-			vp.zfar = 1.0;
-			[enc setViewport:vp];
-
-			bool unpremult = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
-			[enc setRenderPipelineState:unpremult ? c->local2d_unpremult_pipeline
-			                                      : c->local2d_premult_pipeline];
-			[enc setFragmentTexture:src_tex atIndex:0];
-			[enc setFragmentSamplerState:c->sampler_linear atIndex:0];
-
-			struct {
-				float viewport[4];
-				float src_rect[4];
-				float color_scale[4];
-				float color_bias[4];
-				float swizzle_rb;
-				float _pad[3];
-			} constants;
-
-			constants.viewport[0] = 0.0f;
-			constants.viewport[1] = 0.0f;
-			constants.viewport[2] = 1.0f;
-			constants.viewport[3] = 1.0f;
-
-			constants.src_rect[0] = nr.x + nr.w * fx0;
-			constants.src_rect[2] = nr.w * (fx1 - fx0);
-			if (layer->data.flip_y) {
-				constants.src_rect[1] = nr.y + nr.h * (1.0f - fy0);
-				constants.src_rect[3] = -(nr.h * (fy1 - fy0));
-			} else {
-				constants.src_rect[1] = nr.y + nr.h * fy0;
-				constants.src_rect[3] = nr.h * (fy1 - fy0);
-			}
-
-			constants.color_scale[0] = 1.0f;
-			constants.color_scale[1] = 1.0f;
-			constants.color_scale[2] = 1.0f;
-			constants.color_scale[3] = 1.0f;
-			constants.color_bias[0] = 0.0f;
-			constants.color_bias[1] = 0.0f;
-			constants.color_bias[2] = 0.0f;
-			constants.color_bias[3] = 0.0f;
-			constants.swizzle_rb = 0.0f;
-			constants._pad[0] = constants._pad[1] = constants._pad[2] = 0.0f;
-
-			[enc setVertexBytes:&constants length:sizeof(constants) atIndex:0];
-			[enc setFragmentBytes:&constants length:sizeof(constants) atIndex:0];
-			[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-
-			[src_view release];
+			metal_flatten_one_local2d_layer(c, enc, layer, w, h);
 		}
 
 		[enc endEncoding];
@@ -2857,6 +3004,19 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		uint32_t dp_target_w = (uint32_t)output_texture.width;
 		uint32_t dp_target_h = (uint32_t)output_texture.height;
 
+		// #491 part 3 — flatten the 2D-under layers PRE-weave and hand them to
+		// the DP (it composites `backdrop over captured-desktop` under the 3D).
+		// nil ⟹ no under-layers (DP clears its backdrop). Encoded on cmd_buf
+		// before process_atlas. (Code-only on Windows — macOS CI gates the
+		// compile; visual needs a Mac+Leia eyeball.)
+		{
+			uint32_t bd_w = 0, bd_h = 0;
+			id<MTLTexture> bd_tex =
+			    metal_flatten_backdrop_2d(c, cmd_buf, dp_target_w, dp_target_h, &bd_w, &bd_h);
+			xrt_display_processor_metal_set_background_2d(c->display_processor,
+			                                              (__bridge void *)bd_tex, bd_w, bd_h);
+		}
+
 		// Effective canvas (#439): while a mask is active this is the
 		// full client-window rect — the DP weaves every pixel the mask
 		// can select (Phase-2 rule).
@@ -3111,6 +3271,8 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	c->local2d_scratch = nil;
 	[c->weave_scratch release];
 	c->weave_scratch = nil;
+	[c->backdrop_scratch release]; // #491 part 3
+	c->backdrop_scratch = nil;
 	[c->local2d_premult_pipeline release];
 	c->local2d_premult_pipeline = nil;
 	[c->local2d_unpremult_pipeline release];
