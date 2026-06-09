@@ -660,14 +660,18 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 			sess->compositor_focused = true;
 		}
 
-		// Trigger state transitions if visibility/focus flags are set.
-		// AppContainer apps: delay VISIBLE/FOCUSED until first xrWaitFrame.
-		if (sess->compositor_visible && sess->compositor_focused) {
+		// AppContainer (WebXR) keeps the begin-time SYNCHRONIZED shortcut; its
+		// VISIBLE/FOCUSED are completed later (do_synchronize_state_change / the
+		// poll loop). Normal graphics apps must NOT advance past READY here: per
+		// the OpenXR spec the runtime may only move READY->SYNCHRONIZED once the
+		// app begins its frame loop. oxr_session_frame_begin() fires that
+		// transition on the first xrBeginFrame, and the xrPollEvent loop then
+		// advances SYNCHRONIZED->VISIBLE->FOCUSED (every native compositor sets
+		// initial_visible/focused = true). Firing the whole chain here was the
+		// CTS SessionState failure: "must not move from READY to SYNCHRONIZED
+		// without submitting frames".
+		if (sess->is_appcontainer && sess->compositor_visible && sess->compositor_focused) {
 			oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
-			if (!sess->is_appcontainer) {
-				oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
-				oxr_session_change_state(log, sess, XR_SESSION_STATE_FOCUSED, 0);
-			}
 		}
 	} else {
 		// Headless, pretend we got event from the compositor.
@@ -2472,6 +2476,17 @@ oxr_session_frame_begin(struct oxr_logger *log, struct oxr_session *sess)
 	if (XR_SUCCESS != osh_ret) {
 		U_LOG_W("[frame_begin] frame_sync_release FAILED: %d", (int)osh_ret);
 		return osh_ret;
+	}
+
+	// First xrBeginFrame: synchronize the session. The OpenXR spec requires
+	// READY->SYNCHRONIZED only once the app begins its frame loop (not at
+	// xrBeginSession). Trigger here, on begin-frame, rather than on a successful
+	// xrEndFrame, so an app that submits an empty/zero-size first frame while not
+	// yet visible still progresses; the xrPollEvent loop then advances
+	// SYNCHRONIZED->VISIBLE->FOCUSED. AppContainer/WebXR keeps its begin-time
+	// path; headless (xc==NULL) synchronizes at xrBeginSession.
+	if (xc != NULL && !sess->is_appcontainer && sess->state == XR_SESSION_STATE_READY) {
+		oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
 	}
 
 	return ret;
