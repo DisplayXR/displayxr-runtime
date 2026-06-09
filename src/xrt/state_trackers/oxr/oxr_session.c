@@ -26,6 +26,11 @@
 
 #endif // XRT_HAVE_VULKAN
 
+#ifdef XRT_OS_ANDROID
+#include "android/android_globals.h"
+#include "android/android_custom_surface.h"
+#endif
+
 #include "os/os_time.h"
 
 #include "util/u_debug.h"
@@ -909,6 +914,20 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 #endif
 
 #ifdef XRT_OS_ANDROID
+	// Pull the live SurfaceView surface each poll and republish it to
+	// android_globals: clears it on background (surface gone) and publishes the
+	// fresh surface on resume, so the compositor's per-frame surface re-sync tears
+	// down / rebuilds its VkSurfaceKHR instead of wedging on a dead window. This
+	// runs every tick (even while backgrounded, since the app keeps polling
+	// events), on this JVM-attached thread — the robust alternative to JNI
+	// surface-callback registration. #507
+	{
+		void *cs = android_globals_get_custom_surface();
+		if (cs != NULL) {
+			android_custom_surface_refresh_window(cs);
+		}
+	}
+
 	// Most recent Android activity lifecycle event was OnPause: move toward stopping
 	if (sess->sys->inst->activity_state == XRT_ANDROID_LIVECYCLE_EVENT_ON_PAUSE) {
 		if (sess->state == XR_SESSION_STATE_FOCUSED) {

@@ -37,6 +37,8 @@ static struct
 	struct _ANativeWindow *window = nullptr;
 	uint64_t generation = 0;
 	bool valid = false;
+	//! Active android_custom_surface (opaque), polled by oxr_session_poll. #507
+	void *custom_surface = nullptr;
 } android_surface;
 
 void
@@ -115,6 +117,20 @@ android_globals_get_window_state(struct _ANativeWindow **out_window, uint64_t *o
 	if (out_valid != nullptr) {
 		*out_valid = android_surface.valid;
 	}
+}
+
+void
+android_globals_set_custom_surface(void *custom_surface)
+{
+	std::lock_guard<std::mutex> lock(android_surface.mutex);
+	android_surface.custom_surface = custom_surface;
+}
+
+void *
+android_globals_get_custom_surface(void)
+{
+	std::lock_guard<std::mutex> lock(android_surface.mutex);
+	return android_surface.custom_surface;
 }
 
 struct _JavaVM *

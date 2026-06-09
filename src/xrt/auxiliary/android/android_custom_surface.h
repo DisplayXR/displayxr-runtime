@@ -101,6 +101,19 @@ android_custom_surface_destroy(struct android_custom_surface **ptr_custom_surfac
 ANativeWindow *
 android_custom_surface_wait_get_surface(struct android_custom_surface *custom_surface, uint64_t timeout_ms);
 
+/*!
+ * Pull the current SurfaceView surface (non-blocking) and republish it to
+ * android_globals: clears the window when the surface is gone (backgrounded) and
+ * publishes a fresh ANativeWindow when a new surface arrives (resume). Call this
+ * periodically from a JVM-attached thread (oxr_session_poll) so the compositor's
+ * surface re-sync sees background/resume without relying on JNI surface-callback
+ * registration. #507
+ *
+ * @public @memberof android_custom_surface
+ */
+void
+android_custom_surface_refresh_window(struct android_custom_surface *custom_surface);
+
 bool
 android_custom_surface_get_display_metrics(struct _JavaVM *vm,
                                            void *activity,
