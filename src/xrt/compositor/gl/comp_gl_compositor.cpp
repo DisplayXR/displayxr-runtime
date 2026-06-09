@@ -368,6 +368,11 @@ struct comp_gl_compositor
 	GLuint local2d_scratch_tex, local2d_scratch_fbo;
 	GLuint implicit_mask_tex, implicit_mask_fbo;
 	uint32_t composite_scratch_w, composite_scratch_h; // weave + local2d dims
+	//! #491 part 3 — the flattened 2D-UNDER backdrop (Local2D layers before the
+	//! projection in list order), handed to the DP via set_background_2d so it
+	//! composites `backdrop over captured-desktop` under the 3D weave. Own FBO.
+	GLuint backdrop_scratch_tex, backdrop_scratch_fbo;
+	uint32_t backdrop_scratch_w, backdrop_scratch_h;
 	uint32_t implicit_mask_w, implicit_mask_h;
 	uint32_t implicit_rect_count;
 	struct xrt_rect implicit_rects[XRT_MAX_LAYERS];
@@ -1073,6 +1078,11 @@ gl_compositor_render_hud(struct comp_gl_compositor *c, float dt, uint32_t win_w,
  *
  */
 
+// #491 part 3 — defined below near the composite; called here pre-weave.
+static GLuint
+gl_flatten_backdrop_2d(struct comp_gl_compositor *c, uint32_t dst_w, uint32_t dst_h, uint32_t *out_w,
+                       uint32_t *out_h);
+
 /*!
  * Crop the valid content region from the (potentially oversized) atlas texture
  * and pass it to the display processor. If the atlas exactly matches the
@@ -1089,6 +1099,22 @@ gl_crop_and_process_dp(struct comp_gl_compositor *c,
                        uint32_t output_w,
                        uint32_t output_h)
 {
+	// #491 part 3 — flatten the 2D-under layers PRE-weave and hand them to the DP
+	// (it composites `backdrop over captured-desktop` under the 3D). 0 ⟹ no
+	// under-layers (DP clears its backdrop). Covers the plain present, the
+	// shared-texture/IOSurface paths, and the under-only fallback from the masked
+	// composite. The flatten binds its own FBO, so snapshot/restore the caller's
+	// draw FBO (the shared-texture path binds c->fbo before calling) so the DP
+	// weaves into the intended target.
+	{
+		GLint prev_draw_fbo = 0;
+		glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw_fbo);
+		uint32_t bd_w = 0, bd_h = 0;
+		GLuint bd_tex = gl_flatten_backdrop_2d(c, output_w, output_h, &bd_w, &bd_h);
+		xrt_display_processor_gl_set_background_2d(c->display_processor, bd_tex, bd_w, bd_h);
+		glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_draw_fbo);
+	}
+
 	uint32_t content_w = c->tile_columns * c->view_width;
 	uint32_t content_h = c->tile_rows * c->view_height;
 
@@ -1297,12 +1323,89 @@ gl_update_implicit_mask(struct comp_gl_compositor *c,
 	return c->implicit_mask_tex;
 }
 
-// #439 Phase 3 — flatten this frame's Local2D layers into local2d_scratch (the
-// `twod` source). Clears transparent, draws each layer in list order (later =
-// on top) with premultiplied (or straight) "over" via program_window_space.
-// Dest rects clip to the window region; flip Y for the bottom-left GL FBO.
+// #439 Phase 3 — draw one Local2D layer into the currently-bound flatten FBO
+// (premultiplied or straight "over"). Assumes program_window_space is bound and
+// the loc_* uniforms fetched by the caller. Dest rect clips to the window region;
+// Y is flipped for the bottom-left GL framebuffer.
 static void
-gl_flatten_local_2d_layers(struct comp_gl_compositor *c, uint32_t region_w, uint32_t region_h)
+gl_flatten_one_local2d_layer(struct comp_gl_compositor *c, struct comp_layer *layer, uint32_t region_w,
+                             uint32_t region_h, GLint loc_rect, GLint loc_tex, GLint loc_src, bool skip_decode)
+{
+	struct xrt_swapchain *sc = layer->sc_array[0];
+	if (sc == NULL) {
+		return;
+	}
+	struct comp_gl_swapchain *gsc = gl_swapchain(sc);
+	uint32_t img_idx = layer->data.local_2d.sub.image_index;
+	if (img_idx >= gsc->image_count) {
+		return;
+	}
+	GLuint src_tex = gsc->textures[img_idx];
+
+	const struct xrt_rect *dr = &layer->data.local_2d.rect;
+	float dx = (float)dr->offset.w;
+	float dy = (float)dr->offset.h;
+	float dw = (float)dr->extent.w;
+	float dh = (float)dr->extent.h;
+	if (dw <= 0.0f || dh <= 0.0f) {
+		return;
+	}
+
+	// NDC rect for the positioned-quad VS. Window pixels are top-left origin;
+	// flip Y for the bottom-left GL framebuffer: the panel's GL bottom edge is
+	// region_h - (dy + dh).
+	float nx = dx / (float)region_w * 2.0f - 1.0f;
+	float ny = ((float)region_h - (dy + dh)) / (float)region_h * 2.0f - 1.0f;
+	float nw = dw / (float)region_w * 2.0f;
+	float nh = dh / (float)region_h * 2.0f;
+
+	// App sub-rect within the swapchain image (normalized). Default full.
+	struct xrt_normalized_rect nr = layer->data.local_2d.sub.norm_rect;
+	if (nr.w <= 0.0f || nr.h <= 0.0f) {
+		nr.x = 0.0f;
+		nr.y = 0.0f;
+		nr.w = 1.0f;
+		nr.h = 1.0f;
+	}
+	// VS_WINDOW_SPACE maps the NDC top to v_uv.y=0; combined with the GL
+	// bottom-left flip above, sample the source bottom-up so the panel is
+	// upright. flip_y inverts that.
+	float src_x = nr.x;
+	float src_w = nr.w;
+	float src_y, src_h;
+	if (layer->data.flip_y) {
+		src_y = nr.y;
+		src_h = nr.h;
+	} else {
+		src_y = nr.y + nr.h;
+		src_h = -nr.h;
+	}
+
+	bool unpremult = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
+	glEnable(GL_BLEND);
+	if (unpremult) {
+		glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+	} else {
+		glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+	}
+
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, src_tex);
+	if (skip_decode) {
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SRGB_DECODE_EXT, GL_SKIP_DECODE_EXT);
+	}
+	glUniform1i(loc_tex, 0);
+	glUniform4f(loc_rect, nx, ny, nw, nh);
+	glUniform4f(loc_src, src_x, src_y, src_w, src_h);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
+// #439 Phase 3 — flatten this frame's OVER Local2D layers into local2d_scratch
+// (the `twod` source). Clears transparent, draws each layer in list order (later
+// = on top). #491 part 3: under-layers (before the projection in list order,
+// proj_idx) are the DP backdrop and are skipped here.
+static void
+gl_flatten_local_2d_layers(struct comp_gl_compositor *c, uint32_t region_w, uint32_t region_h, int32_t proj_idx)
 {
 	glBindFramebuffer(GL_FRAMEBUFFER, c->local2d_scratch_fbo);
 	glViewport(0, 0, region_w, region_h);
@@ -1322,78 +1425,107 @@ gl_flatten_local_2d_layers(struct comp_gl_compositor *c, uint32_t region_w, uint
 		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
 			continue;
 		}
-		struct xrt_swapchain *sc = layer->sc_array[0];
-		if (sc == NULL) {
+		// #491 part 3 — under-layers are the DP backdrop (handled pre-weave).
+		if (proj_idx >= 0 && (int32_t)i < proj_idx) {
 			continue;
 		}
-		struct comp_gl_swapchain *gsc = gl_swapchain(sc);
-		uint32_t img_idx = layer->data.local_2d.sub.image_index;
-		if (img_idx >= gsc->image_count) {
-			continue;
-		}
-		GLuint src_tex = gsc->textures[img_idx];
-
-		const struct xrt_rect *dr = &layer->data.local_2d.rect;
-		float dx = (float)dr->offset.w;
-		float dy = (float)dr->offset.h;
-		float dw = (float)dr->extent.w;
-		float dh = (float)dr->extent.h;
-		if (dw <= 0.0f || dh <= 0.0f) {
-			continue;
-		}
-
-		// NDC rect for the positioned-quad VS. Window pixels are top-left
-		// origin; flip Y for the bottom-left GL framebuffer: the panel's GL
-		// bottom edge is region_h - (dy + dh).
-		float nx = dx / (float)region_w * 2.0f - 1.0f;
-		float ny = ((float)region_h - (dy + dh)) / (float)region_h * 2.0f - 1.0f;
-		float nw = dw / (float)region_w * 2.0f;
-		float nh = dh / (float)region_h * 2.0f;
-
-		// App sub-rect within the swapchain image (normalized). Default full.
-		struct xrt_normalized_rect nr = layer->data.local_2d.sub.norm_rect;
-		if (nr.w <= 0.0f || nr.h <= 0.0f) {
-			nr.x = 0.0f;
-			nr.y = 0.0f;
-			nr.w = 1.0f;
-			nr.h = 1.0f;
-		}
-		// VS_WINDOW_SPACE maps the NDC top to v_uv.y=0; combined with the GL
-		// bottom-left flip above, sample the source bottom-up so the panel is
-		// upright. flip_y inverts that.
-		float src_x = nr.x;
-		float src_w = nr.w;
-		float src_y, src_h;
-		if (layer->data.flip_y) {
-			src_y = nr.y;
-			src_h = nr.h;
-		} else {
-			src_y = nr.y + nr.h;
-			src_h = -nr.h;
-		}
-
-		bool unpremult = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
-		glEnable(GL_BLEND);
-		if (unpremult) {
-			glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-		} else {
-			glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-		}
-
-		glActiveTexture(GL_TEXTURE0);
-		glBindTexture(GL_TEXTURE_2D, src_tex);
-		if (skip_decode) {
-			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SRGB_DECODE_EXT, GL_SKIP_DECODE_EXT);
-		}
-		glUniform1i(loc_tex, 0);
-		glUniform4f(loc_rect, nx, ny, nw, nh);
-		glUniform4f(loc_src, src_x, src_y, src_w, src_h);
-		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		gl_flatten_one_local2d_layer(c, layer, region_w, region_h, loc_rect, loc_tex, loc_src, skip_decode);
 	}
 
 	glDisable(GL_BLEND);
 	glBindTexture(GL_TEXTURE_2D, 0);
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+// #491 part 3 — flatten this frame's 2D-UNDER Local2D layers (before the
+// projection in list order) into backdrop_scratch PRE-weave and return its GL
+// texture name (+ region dims) so the caller hands it to the DP via
+// set_background_2d (the DP composites `backdrop over captured-desktop` under the
+// 3D). Returns 0 (out dims 0) when there are no under-layers.
+//
+// NOTE: the GL Leia DP is chroma-key-only (no WGC compose-under-bg path, see
+// project_leia_transparency_model) → the backdrop has nowhere to composite, so
+// the GL leg's set_background_2d is a VISUAL NO-OP today; the wiring lands so it
+// works once GL transparency/compose lands (separate deferred follow-up).
+static GLuint
+gl_flatten_backdrop_2d(struct comp_gl_compositor *c, uint32_t dst_w, uint32_t dst_h, uint32_t *out_w,
+                       uint32_t *out_h)
+{
+	*out_w = 0;
+	*out_h = 0;
+	if (!c->local_2d_last_frame) {
+		return 0;
+	}
+
+	// Under = Local2D layers BEFORE the projection. No projection ⟹ no backdrop.
+	int32_t proj_idx = -1;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+		if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+			proj_idx = (int32_t)i;
+			break;
+		}
+	}
+	if (proj_idx < 0) {
+		return 0;
+	}
+	bool have_under = false;
+	for (int32_t i = 0; i < proj_idx; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
+			have_under = true;
+			break;
+		}
+	}
+	if (!have_under) {
+		return 0;
+	}
+
+	uint32_t region_w = dst_w;
+	uint32_t region_h = dst_h;
+	if (region_w == 0 || region_h == 0) {
+		return 0;
+	}
+	if (!gl_ensure_color_tex_fbo(&c->backdrop_scratch_tex, &c->backdrop_scratch_fbo, &c->backdrop_scratch_w,
+	                             &c->backdrop_scratch_h, region_w, region_h)) {
+		return 0;
+	}
+
+	glBindFramebuffer(GL_FRAMEBUFFER, c->backdrop_scratch_fbo);
+	glViewport(0, 0, region_w, region_h);
+	glDisable(GL_SCISSOR_TEST);
+	glClearColor(0.0f, 0.0f, 0.0f, 0.0f); // transparent where no under-layer covers
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	glUseProgram(c->program_window_space);
+	glBindVertexArray(c->vao_empty);
+	GLint loc_rect = glGetUniformLocation(c->program_window_space, "u_rect");
+	GLint loc_tex = glGetUniformLocation(c->program_window_space, "u_texture");
+	GLint loc_src = glGetUniformLocation(c->program_window_space, "u_src_rect");
+	const bool skip_decode = gl_has_srgb_decode_ext();
+
+	for (int32_t i = 0; i < proj_idx; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
+			continue;
+		}
+		gl_flatten_one_local2d_layer(c, layer, region_w, region_h, loc_rect, loc_tex, loc_src, skip_decode);
+	}
+
+	glDisable(GL_BLEND);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		U_LOG_W("GL #491 part3: flattened 2D-under backdrop %ux%u (handed to DP set_background_2d; "
+		        "GL DP is chroma-key-only → visual no-op until GL compose lands)",
+		        region_w, region_h);
+	}
+
+	*out_w = region_w;
+	*out_h = region_h;
+	return c->backdrop_scratch_tex;
 }
 
 // Weave the (cropped) atlas into an arbitrary target FBO — same crop logic as
@@ -1460,6 +1592,18 @@ gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint tar
 		return false;
 	}
 
+	// #491 part 3 — split Local2D by list order vs the projection: layers BEFORE
+	// the projection are the 2D-under backdrop (handed to the DP pre-weave) and
+	// are excluded from the overlay mask + flatten here.
+	int32_t proj_idx = -1;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+		if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+			proj_idx = (int32_t)i;
+			break;
+		}
+	}
+
 	// weave_tex + local2d_scratch are both window-sized; (re)allocate them
 	// together under one dims guard (composite_scratch_w/h is the canonical
 	// pair). The inner ensure's throwaway dims are fine — it only runs when the
@@ -1484,9 +1628,13 @@ gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint tar
 		struct xrt_rect rects[XRT_MAX_LAYERS];
 		uint32_t rect_count = 0;
 		for (uint32_t i = 0; i < c->layer_accum.layer_count && rect_count < XRT_MAX_LAYERS; i++) {
-			if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
-				rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
+			if (c->layer_accum.layers[i].data.type != XRT_LAYER_LOCAL_2D) {
+				continue;
 			}
+			if (proj_idx >= 0 && (int32_t)i < proj_idx) {
+				continue; // under-layer (backdrop) — not part of the overlay mask
+			}
+			rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
 		}
 		mask_tex = gl_update_implicit_mask(c, rects, rect_count, output_w, output_h);
 	}
@@ -1498,13 +1646,22 @@ gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint tar
 	// pure explicit-mask frame) the scratch stays transparent → the masked
 	// region shows the desktop, matching the VK leg.
 	if (have_local_2d) {
-		gl_flatten_local_2d_layers(c, output_w, output_h);
+		gl_flatten_local_2d_layers(c, output_w, output_h, proj_idx);
 	} else {
 		glBindFramebuffer(GL_FRAMEBUFFER, c->local2d_scratch_fbo);
 		glViewport(0, 0, output_w, output_h);
 		glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
 		glClear(GL_COLOR_BUFFER_BIT);
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	}
+
+	// #491 part 3 — flatten the 2D-under layers PRE-weave and hand them to the DP
+	// (it composites `backdrop over captured-desktop` under the 3D weave). 0 ⟹ no
+	// under-layers. Must precede the weave redirect below.
+	{
+		uint32_t bd_w = 0, bd_h = 0;
+		GLuint bd_tex = gl_flatten_backdrop_2d(c, output_w, output_h, &bd_w, &bd_h);
+		xrt_display_processor_gl_set_background_2d(c->display_processor, bd_tex, bd_w, bd_h);
 	}
 
 	// Redirect the DP weave into weave_tex.
@@ -2306,6 +2463,9 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	if (c->local2d_scratch_fbo) glDeleteFramebuffers(1, &c->local2d_scratch_fbo);
 	if (c->implicit_mask_tex) glDeleteTextures(1, &c->implicit_mask_tex);
 	if (c->implicit_mask_fbo) glDeleteFramebuffers(1, &c->implicit_mask_fbo);
+	// #491 part 3 — 2D-under backdrop scratch.
+	if (c->backdrop_scratch_tex) glDeleteTextures(1, &c->backdrop_scratch_tex);
+	if (c->backdrop_scratch_fbo) glDeleteFramebuffers(1, &c->backdrop_scratch_fbo);
 
 #ifdef XRT_OS_WINDOWS
 	// Clean up D3D11 interop resources
