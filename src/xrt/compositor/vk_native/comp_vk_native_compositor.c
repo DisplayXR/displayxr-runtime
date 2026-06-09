@@ -146,6 +146,14 @@ struct comp_vk_native_compositor
 	//! True if shared texture mode is active.
 	bool has_shared_texture;
 
+	//! True when shared_image is owned by the app (Android in-process texture
+	//! class) and must NOT be destroyed by the compositor — only our view of it.
+	bool shared_image_external;
+
+	//! Shared texture dimensions (the full app image; canvas is a sub-rect).
+	uint32_t shared_image_width;
+	uint32_t shared_image_height;
+
 	//! Shared texture HANDLE (Win32).
 	void *shared_texture_handle;
 
@@ -444,6 +452,65 @@ import_shared_iosurface(struct comp_vk_native_compositor *c, void *iosurface_han
 #endif
 }
 #endif // XRT_OS_MACOS
+
+#ifdef XRT_OS_ANDROID
+/*!
+ * "Import" an app-owned VkImage as the shared weave-output target (texture
+ * class). On Android the app and runtime share one VkDevice, so the raw VkImage
+ * handle is used directly — no external-memory import. We only create our own
+ * VkImageView of it (for the DP framebuffer) and record its dims; the image
+ * itself stays owned by the app (see shared_image_external in cleanup).
+ */
+static bool
+import_shared_android_image(struct comp_vk_native_compositor *c,
+                            const struct comp_vk_native_shared_image *desc)
+{
+	struct vk_bundle *vk = &c->vk;
+
+	if (desc == NULL || desc->image == 0 || desc->width == 0 || desc->height == 0) {
+		U_LOG_E("Android shared image descriptor invalid");
+		return false;
+	}
+
+	c->shared_image = (VkImage)(uintptr_t)desc->image;
+
+	VkImageViewCreateInfo view_ci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+	    .image = c->shared_image,
+	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+	    .format = (VkFormat)desc->format,
+	    .components =
+	        {
+	            VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+	            VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+	        },
+	    .subresourceRange =
+	        {
+	            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+	            .baseMipLevel = 0,
+	            .levelCount = 1,
+	            .baseArrayLayer = 0,
+	            .layerCount = 1,
+	        },
+	};
+	VkResult ret = vk->vkCreateImageView(vk->device, &view_ci, NULL, &c->shared_view);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("Failed to create image view for app shared image: %d", ret);
+		c->shared_image = VK_NULL_HANDLE;
+		return false;
+	}
+
+	c->has_shared_texture = true;
+	c->shared_image_external = true;  // app owns the image; never destroy it
+	c->shared_image_width = desc->width;
+	c->shared_image_height = desc->height;
+
+	U_LOG_W("Android shared VkImage bound as weave target: %ux%u, VkImage=%p, VkImageView=%p, fmt=%u",
+	        desc->width, desc->height, (void *)(uintptr_t)c->shared_image,
+	        (void *)(uintptr_t)c->shared_view, desc->format);
+	return true;
+}
+#endif // XRT_OS_ANDROID
 
 #ifdef XRT_OS_WINDOWS
 /*!
@@ -2662,15 +2729,20 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	// Destroy display processor
 	xrt_display_processor_destroy(&c->display_processor);
 
-	// Destroy shared texture resources
+	// Destroy shared texture resources. The view is always ours. The image +
+	// memory are ours ONLY when we imported/allocated them (Windows/macOS);
+	// when shared_image_external (Android in-process texture class) the image
+	// is the app's VkImage and must not be destroyed here.
 	if (c->shared_view != VK_NULL_HANDLE) {
 		vk->vkDestroyImageView(vk->device, c->shared_view, NULL);
 	}
-	if (c->shared_image != VK_NULL_HANDLE) {
-		vk->vkDestroyImage(vk->device, c->shared_image, NULL);
-	}
-	if (c->shared_memory != VK_NULL_HANDLE) {
-		vk->vkFreeMemory(vk->device, c->shared_memory, NULL);
+	if (!c->shared_image_external) {
+		if (c->shared_image != VK_NULL_HANDLE) {
+			vk->vkDestroyImage(vk->device, c->shared_image, NULL);
+		}
+		if (c->shared_memory != VK_NULL_HANDLE) {
+			vk->vkFreeMemory(vk->device, c->shared_memory, NULL);
+		}
 	}
 
 	if (c->renderer != NULL) {
@@ -2822,6 +2894,19 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	}
 #endif
 
+#ifdef XRT_OS_ANDROID
+	// Texture class: shared_texture_handle is a comp_vk_native_shared_image
+	// descriptor (app-owned VkImage + dims/format). Bind it as the weave target.
+	if (shared_texture_handle != NULL) {
+		if (!import_shared_android_image(
+		        c, (const struct comp_vk_native_shared_image *)shared_texture_handle)) {
+			U_LOG_E("Failed to bind app shared VkImage");
+			free(c);
+			return XRT_ERROR_VULKAN;
+		}
+	}
+#endif
+
 #ifdef XRT_OS_WINDOWS
 	// Import shared D3D11 texture if provided
 	if (shared_texture_handle != NULL) {
@@ -2937,6 +3022,17 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		IOSurfaceRef surface = (IOSurfaceRef)shared_texture_handle;
 		c->settings.preferred.width = (uint32_t)IOSurfaceGetWidth(surface);
 		c->settings.preferred.height = (uint32_t)IOSurfaceGetHeight(surface);
+	}
+#endif
+
+#ifdef XRT_OS_ANDROID
+	// Texture class: the weave target is the app's shared VkImage, so the
+	// preferred (full target) dims are the shared image dims, not the screen.
+	// tgt_width/height (which size the DP framebuffer) then come from here when
+	// c->target == NULL; the canvas sub-rect lives within this.
+	if (c->has_shared_texture && c->shared_image_width > 0 && c->shared_image_height > 0) {
+		c->settings.preferred.width = c->shared_image_width;
+		c->settings.preferred.height = c->shared_image_height;
 	}
 #endif
 
