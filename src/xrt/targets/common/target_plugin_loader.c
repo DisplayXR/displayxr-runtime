@@ -408,7 +408,9 @@ load_and_probe_one(const struct plugin_entry *e,
 	// Android plug-ins need the host's JavaVM/activity for vendor-SDK init
 	// (their own statically-linked aux_android copy is never populated).
 	host.get_android_vm = plugin_host_get_android_vm;
-	host.get_android_activity = android_globals_get_activity;
+	// Activity when in-process; Service Context when out-of-process (CNSDK only
+	// needs an android.content.Context to bind the on-device tracking service).
+	host.get_android_activity = plugin_host_get_android_activity;
 #endif
 
 	struct xrt_plugin_iface *iface = NULL;
@@ -817,6 +819,28 @@ plugin_host_get_android_vm(void)
 }
 
 /*
+ * Host-iface callback: hand the plug-in an Android `Context` (as a jobject
+ * `void *`) for vendor-SDK init — e.g. CNSDK's loader, which binds the
+ * on-device LeiaSR face-tracking service (the same out-of-process flow the
+ * stock CNSDK apps use) and needs only an `android.content.Context`, not an
+ * Activity. In-process the host is an Activity (returned verbatim, so the
+ * plug-in's Activity-only paths like orientation-locking still work); in the
+ * out-of-process SERVICE there is no Activity, only the Service `Context`
+ * stored by nativeStartServer → android_globals_store_vm_and_context. The
+ * callback is named *_activity for back-compat with the host-iface slot, but
+ * it returns the Activity when present and otherwise the Service Context.
+ * Without this, get_android_activity() returned NULL in the service process →
+ * CNSDK aborted with "android context and JavaVM must be specified" → no
+ * tracked eyes (#510 M2).
+ */
+static void *
+plugin_host_get_android_activity(void)
+{
+	void *activity = android_globals_get_activity();
+	return activity != NULL ? activity : android_globals_get_context();
+}
+
+/*
  * Discovery contract: see docs/specs/runtime/plugin-discovery.md §3.2.
  *
  * Android v1 uses **convention-driven** discovery rather than the JSON
@@ -1117,7 +1141,9 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 	// Android plug-ins need the host's JavaVM/activity for vendor-SDK init
 	// (their own statically-linked aux_android copy is never populated).
 	host.get_android_vm = plugin_host_get_android_vm;
-	host.get_android_activity = android_globals_get_activity;
+	// Activity when in-process; Service Context when out-of-process (CNSDK only
+	// needs an android.content.Context to bind the on-device tracking service).
+	host.get_android_activity = plugin_host_get_android_activity;
 #endif
 
 	struct xrt_plugin_iface *iface = NULL;
@@ -1610,7 +1636,9 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 	// Android plug-ins need the host's JavaVM/activity for vendor-SDK init
 	// (their own statically-linked aux_android copy is never populated).
 	host.get_android_vm = plugin_host_get_android_vm;
-	host.get_android_activity = android_globals_get_activity;
+	// Activity when in-process; Service Context when out-of-process (CNSDK only
+	// needs an android.content.Context to bind the on-device tracking service).
+	host.get_android_activity = plugin_host_get_android_activity;
 #endif
 
 	struct xrt_plugin_iface *iface = NULL;

@@ -180,6 +180,42 @@ if (project.hasProperty("sharedStl") && project.getProperty("sharedStl")) {
     println "Using SHARED C++ standard library"
 }
 
+// CNSDK Java glue for the OUT-OF-PROCESS service (#510 M2). When the Leia
+// CNSDK plug-in (libdxrp050_leia_cnsdk.so) runs in the runtime SERVICE
+// process, its loader resolves the on-device LeiaSR core impl through a
+// DexClassLoader that needs the com.leia.* glue classes present in THIS
+// process — the in-process path gets them from the host app's APK, but the
+// service must bundle them itself. Resolve sdk-<ver>.aar from `cnsdk.dir`
+// (local.properties) or -PcnsdkDir; if unset, the service builds CNSDK-free
+// (sim_display fallback), matching the cube's opt-in pattern + ADR-019 (no
+// vendor SDK in default/CI builds). The .aar is the SOLE source of the CNSDK
+// native runtime (libleiaCore-loader.so + libleiaSDK-jni.so) for this APK;
+// only the Leia plug-in itself (libdxrp050_leia_cnsdk.so) lives in jniLibs.
+def resolveCnsdkDir = {
+    def fromProp = project.findProperty('cnsdkDir') ?: project.findProperty('cnsdk.dir')
+    if (fromProp) {
+        def f = new File(fromProp as String)
+        return (f.isAbsolute() ? f : new File(rootProject.projectDir, fromProp as String)).absolutePath
+    }
+    def lp = new File(rootProject.projectDir, 'local.properties')
+    if (lp.exists()) {
+        def props = new Properties()
+        lp.withReader('UTF-8') { props.load(it) }
+        def d = props.getProperty('cnsdk.dir')
+        if (d) {
+            def f = new File(d)
+            return (f.isAbsolute() ? f : new File(rootProject.projectDir, d)).absolutePath
+        }
+    }
+    return null
+}
+def cnsdkDir = resolveCnsdkDir()
+def cnsdkVersionFile = cnsdkDir ? new File("${cnsdkDir}/VERSION.txt") : null
+def cnsdkVersion = (cnsdkVersionFile?.exists()) ? cnsdkVersionFile.text.trim() : null
+def cnsdkAar = (cnsdkDir && cnsdkVersion) ? new File("${cnsdkDir}/android/sdk-${cnsdkVersion}.aar") : null
+def hasCnsdk = cnsdkAar?.exists()
+println "openxr_android: out-of-process CNSDK Java glue ${hasCnsdk ? "ENABLED (${cnsdkAar})" : 'disabled (sim_display path)'}"
+
 android {
     compileSdk project.sharedCompileSdk
     buildToolsVersion = buildToolsVersion
@@ -362,6 +398,16 @@ dependencies {
     // for Hilt dependency injection
     implementation "com.google.dagger:hilt-android:$hiltVersion"
     kapt "com.google.dagger:hilt-compiler:$hiltVersion"
+
+    // CNSDK Java glue (com.leia.* classes) for the out-of-process SERVICE only,
+    // when cnsdk.dir is set. The Leia plug-in's loader resolves the on-device
+    // core impl via a DexClassLoader that FindClass()es these in the service
+    // process; the in-process flavor gets them from the host app instead. The
+    // .aar's native .so are excluded in packagingOptions above (#510 M2).
+    if (hasCnsdk) {
+        outOfProcessImplementation files(cnsdkAar)
+        outOfProcessImplementation "androidx.annotation:annotation:$androidxAnnotationVersion"
+    }
 }
 
 // For signing of release binaries - env var must contain an absolute path
