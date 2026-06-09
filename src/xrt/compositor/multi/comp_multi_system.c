@@ -2166,6 +2166,21 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	}
 #endif
 
+	// Establish frame pacing so the per-session comp_target_swapchain has a
+	// valid current_frame_id before acquire/present. render_session_to_own_target
+	// is the only consumer of this target, so it must drive pacing itself —
+	// without this, comp_target_swapchain_present asserts current_frame_id > 0.
+	// (#510: first path to actually exercise comp_window_android present.)
+	{
+		int64_t frame_id = -1;
+		int64_t wake_up_ns = 0, desired_present_ns = 0, present_slop_ns = 0, predicted_display_ns = 0;
+		comp_target_calc_frame_pacing(ct, &frame_id, &wake_up_ns, &desired_present_ns, &present_slop_ns,
+		                              &predicted_display_ns);
+		int64_t now_ns = os_monotonic_get_ns();
+		comp_target_mark_wake_up(ct, frame_id, now_ns);
+		comp_target_mark_begin(ct, frame_id, now_ns);
+	}
+
 	// Acquire the next swapchain image from the per-session target
 	uint32_t buffer_index = 0;
 	VkResult ret = comp_target_acquire(ct, &buffer_index);
