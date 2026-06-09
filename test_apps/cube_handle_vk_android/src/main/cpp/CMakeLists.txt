@@ -40,6 +40,15 @@ find_package(OpenXR REQUIRED CONFIG)
 add_library(cube_handle_vk_android SHARED main.cpp ${CUBE_SHADER_HEADERS})
 target_include_directories(cube_handle_vk_android PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
+# DisplayXR's in-tree OpenXR headers provide the custom XR_EXT_* extensions
+# (XR_EXT_display_info etc.) the loader AAR's stock headers don't ship. Placed
+# BEFORE the AAR's -isystem headers so <openxr/...> resolves here — this is the
+# same header set the runtime is built against and that the Windows / macOS
+# cubes use (via displayxr_common), so core OpenXR stays consistent.
+# Path: src/main/cpp → repo root is five levels up (matches CMAKE_MODULE_PATH).
+target_include_directories(cube_handle_vk_android BEFORE PRIVATE
+    "${CMAKE_SOURCE_DIR}/../../../../../src/external/openxr_includes")
+
 # -u ANativeActivity_onCreate forces the linker to keep the symbol the
 # Android runtime resolves dynamically on Activity launch — without it,
 # the shared lib loads but exposes nothing.

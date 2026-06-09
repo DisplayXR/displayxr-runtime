@@ -19,6 +19,9 @@
 #include <vulkan/vulkan.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
+// XR_EXT_display_info: display dimensions + the rendering-mode enumeration /
+// switching entry points. Drives the adaptive tiled-atlas multiview port (#499).
+#include <openxr/XR_EXT_display_info.h>
 
 #include <atomic>
 #include <cmath>
@@ -111,30 +114,71 @@ bool g_exit_requested = false;
 // Reference space for the projection layer. STAGE if available, else LOCAL.
 XrSpace g_app_space = XR_NULL_HANDLE;
 
-// View configuration + per-view swapchains. Hardcoded to stereo since
-// that's the only mode the runtime currently exposes on Android.
-constexpr uint32_t kViewCount = 2;
+// ─── Adaptive tiled-atlas multiview model (#499) ──────────────────────────
+// DisplayXR exposes a tiled-atlas multiview model exactly like the Windows /
+// macOS cubes: the runtime advertises up to `g_max_view_count` views (the max
+// across every rendering mode) via xrEnumerateViewConfigurationViews, and the
+// app renders the *active* mode's `view_count` views into TILES of a SINGLE
+// atlas swapchain. The projection layer submits N projection views that all
+// reference that one swapchain, each with a per-tile imageRect.
+//
+// The previous build hard-coded stereo (kViewCount = 2, one swapchain per
+// view) and bailed in create_swapchains() the moment the runtime reported a
+// different count — sim_display advertises 4 (max across its 2D / Anaglyph /
+// Cropped-SBS / Squeezed-SBS / Quad modes), so create failed, g_app_space
+// stayed NULL, xrLocateViews busy-looped, and nothing was ever presented.
+// That was the Android black screen. This file now mirrors cube_handle_vk_win.
+constexpr uint32_t kMaxViews = 8;
 
-struct PerView
+// One advertised rendering mode (mirror of XrDisplayRenderingModeInfoEXT).
+struct RenderingModeInfo
+{
+	uint32_t view_count{2};
+	uint32_t tile_columns{2};
+	uint32_t tile_rows{1};
+	float view_scale_x{0.5f};
+	float view_scale_y{1.0f};
+	bool hardware_3d{true};
+	bool requestable{true};
+	char name[64]{"Stereo"};
+};
+RenderingModeInfo g_modes[kMaxViews] = {};
+uint32_t g_mode_count = 0;            // 0 → no XR_EXT_display_info; default stereo
+std::atomic<uint32_t> g_current_mode{0};
+uint32_t g_max_view_count = 2;        // xrEnumerateViewConfigurationViews → locate capacity
+uint32_t g_display_px_w = 0;          // native panel pixels (XR_EXT_display_info)
+uint32_t g_display_px_h = 0;
+bool g_has_display_info = false;
+
+// XR_EXT_display_info entry points (resolved after the session exists).
+PFN_xrEnumerateDisplayRenderingModesEXT g_pfnEnumModes = nullptr;
+PFN_xrRequestDisplayRenderingModeEXT g_pfnRequestMode = nullptr;
+
+// Single tiled-atlas swapchain shared by all views. Each view writes into its
+// tile via a viewport/scissor offset inside one render pass; xrEndFrame submits
+// N projection views that all point at this swapchain with per-tile imageRects.
+struct AtlasSwapchain
 {
 	XrSwapchain swapchain{XR_NULL_HANDLE};
 	uint32_t width{0};
 	uint32_t height{0};
-	// Image arrays sized at xrEnumerateSwapchainImages time. We cap at
-	// 8 (matches typical OpenXR runtime budgets) and abort if more come
-	// back — keeps the test app std-lib-free in case the prefab AAR
-	// surprises us.
+	// Image arrays sized at xrEnumerateSwapchainImages time. Capped at 8
+	// (typical OpenXR runtime budget); more is logged + clamped.
 	XrSwapchainImageVulkanKHR images[8]{};
 	VkImageView image_views[8]{};
 	VkFramebuffer framebuffers[8]{};
 	uint32_t image_count{0};
-	// Shared depth target for this view (rendering is serialized per view
-	// via vkQueueWaitIdle, so one depth image per view is sufficient).
+	// One depth target sized to the whole atlas (tiles don't overlap, so a
+	// single LOAD_OP_CLEAR depth shared across all tiles is correct).
 	VkImage depth_image{VK_NULL_HANDLE};
 	VkDeviceMemory depth_mem{VK_NULL_HANDLE};
 	VkImageView depth_view{VK_NULL_HANDLE};
 };
-PerView g_views[kViewCount];
+AtlasSwapchain g_atlas;
+
+// Forward decls used across the rendering-mode helpers.
+const RenderingModeInfo &active_mode();
+uint32_t active_view_count();
 
 // ─── on-device UI / eye-tracking readout state ────────────────────────────
 // g_bg_enabled: background color on/off. Default OFF → black clear in both
@@ -225,14 +269,47 @@ create_instance(struct android_app *app)
 	// after the runtime was already started).
 	g_runtime_unavailable.store(false, std::memory_order_relaxed);
 
-	const char *extensions[] = {
+	// XR_EXT_display_info is what turns this into a real DisplayXR *extension*
+	// app: it unlocks the display-pixel dimensions + the rendering-mode
+	// enumeration / switching entry points the tiled-atlas multiview port
+	// needs (#499). Enable it only when the runtime advertises it so a runtime
+	// built without it still brings up (degrading to a default stereo atlas).
+	g_has_display_info = false;
+	{
+		uint32_t ext_count = 0;
+		if (xrEnumerateInstanceExtensionProperties(nullptr, 0, &ext_count, nullptr) == XR_SUCCESS &&
+		    ext_count > 0) {
+			XrExtensionProperties props_buf[128] = {};
+			if (ext_count > 128) {
+				ext_count = 128;
+			}
+			for (uint32_t i = 0; i < ext_count; ++i) {
+				props_buf[i].type = XR_TYPE_EXTENSION_PROPERTIES;
+			}
+			if (xrEnumerateInstanceExtensionProperties(nullptr, ext_count, &ext_count, props_buf) ==
+			    XR_SUCCESS) {
+				for (uint32_t i = 0; i < ext_count; ++i) {
+					if (std::strcmp(props_buf[i].extensionName,
+					                XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) {
+						g_has_display_info = true;
+						break;
+					}
+				}
+			}
+		}
+		LOGI("XR_EXT_display_info advertised: %s", g_has_display_info ? "yes" : "no");
+	}
+
+	const char *extensions[3] = {
 	    XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
-	    // _enable2 lets the runtime help create our VkInstance/VkDevice
-	    // (next step, B13c) and is the modern replacement for _enable.
-	    // The graphics-requirements query in this commit needs only this
-	    // extension to be enabled.
+	    // _enable2 lets the runtime help create our VkInstance/VkDevice and is
+	    // the modern replacement for _enable.
 	    XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
 	};
+	uint32_t extension_count = 2;
+	if (g_has_display_info) {
+		extensions[extension_count++] = XR_EXT_DISPLAY_INFO_EXTENSION_NAME;
+	}
 
 	XrInstanceCreateInfoAndroidKHR android_info = {};
 	android_info.type = XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR;
@@ -250,8 +327,7 @@ create_instance(struct android_app *app)
 	             XR_MAX_ENGINE_NAME_SIZE - 1);
 	create_info.applicationInfo.engineVersion = 1;
 	create_info.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
-	create_info.enabledExtensionCount =
-	    sizeof(extensions) / sizeof(extensions[0]);
+	create_info.enabledExtensionCount = extension_count;
 	create_info.enabledExtensionNames = extensions;
 
 	// Retry on RUNTIME_UNAVAILABLE: on a cold launch the DisplayXR runtime may
@@ -554,40 +630,174 @@ create_session()
 	return res == XR_SUCCESS;
 }
 
-// Enumerate the runtime's view configuration for PRIMARY_STEREO and
-// create one swapchain per view using a runtime-supported color format.
-// xrEndFrame will reference these swapchains via the projection layer.
+// ── Active rendering-mode accessors ───────────────────────────────────────
+// active_mode() returns the live mode; with no XR_EXT_display_info it returns
+// a sane default-stereo (2 views, 2×1 tiles, 0.5×1.0 scale) so the atlas path
+// still works against a runtime that doesn't advertise rendering modes.
+const RenderingModeInfo &
+active_mode()
+{
+	static const RenderingModeInfo kDefaultStereo = {};
+	if (g_mode_count == 0) {
+		return kDefaultStereo;
+	}
+	uint32_t idx = g_current_mode.load(std::memory_order_relaxed);
+	if (idx >= g_mode_count) {
+		idx = 0;
+	}
+	return g_modes[idx];
+}
+
+uint32_t
+active_view_count()
+{
+	uint32_t vc = active_mode().view_count;
+	if (vc < 1) {
+		vc = 1;
+	}
+	if (vc > kMaxViews) {
+		vc = kMaxViews;
+	}
+	return vc;
+}
+
+// Per-tile render size + tile grid for the active mode, inside the atlas.
+// Mirrors cube_handle_vk_win: renderW = atlas.width × scaleX, clamped to the
+// per-tile capacity atlas.width / tileColumns (so tiles never overlap).
+void
+active_tile_dims(uint32_t *render_w, uint32_t *render_h, uint32_t *cols, uint32_t *rows)
+{
+	const RenderingModeInfo &m = active_mode();
+	uint32_t c = m.tile_columns ? m.tile_columns : 1;
+	uint32_t r = m.tile_rows ? m.tile_rows : 1;
+	uint32_t max_tw = g_atlas.width / c;
+	uint32_t max_th = g_atlas.height / r;
+	uint32_t rw = (uint32_t)((double)g_atlas.width * m.view_scale_x);
+	uint32_t rh = (uint32_t)((double)g_atlas.height * m.view_scale_y);
+	if (rw == 0 || rw > max_tw) {
+		rw = max_tw;
+	}
+	if (rh == 0 || rh > max_th) {
+		rh = max_th;
+	}
+	*render_w = rw;
+	*render_h = rh;
+	*cols = c;
+	*rows = r;
+}
+
+// Query display pixel dimensions (XR_EXT_display_info) + the runtime's
+// rendering modes, and the max view count the runtime advertises. Must run
+// AFTER create_session() (mode enumeration is session-scoped) and BEFORE
+// create_swapchains() (atlas sizing needs the display dims + mode tile layout).
+bool
+query_display_info_and_modes()
+{
+	// Max view count = the device's advertised PRIMARY_STEREO view count (the
+	// max across all rendering modes). xrLocateViews REQUIRES capacity >= this
+	// value or it returns XR_ERROR_SIZE_INSUFFICIENT — the exact gate the old
+	// hard-coded `2` tripped on sim_display (which reports 4).
+	uint32_t vc = 0;
+	XrResult res = xrEnumerateViewConfigurationViews(
+	    g_instance, g_system_id, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &vc, nullptr);
+	if (res == XR_SUCCESS && vc > 0) {
+		g_max_view_count = vc > kMaxViews ? kMaxViews : vc;
+	}
+	LOGI("Runtime advertises %u views (max across modes)", g_max_view_count);
+
+	// Native panel pixels — chain XrDisplayInfoEXT onto the system-properties
+	// query (there is no standalone xrGetDisplayInfoEXT).
+	if (g_has_display_info) {
+		XrDisplayInfoEXT di = {XR_TYPE_DISPLAY_INFO_EXT};
+		XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
+		sp.next = &di;
+		if (xrGetSystemProperties(g_instance, g_system_id, &sp) == XR_SUCCESS) {
+			g_display_px_w = di.displayPixelWidth;
+			g_display_px_h = di.displayPixelHeight;
+			LOGI("Display: %ux%u px, %.3fx%.3f m", g_display_px_w, g_display_px_h,
+			     di.displaySizeMeters.width, di.displaySizeMeters.height);
+		}
+
+		xrGetInstanceProcAddr(g_instance, "xrEnumerateDisplayRenderingModesEXT",
+		                      reinterpret_cast<PFN_xrVoidFunction *>(&g_pfnEnumModes));
+		xrGetInstanceProcAddr(g_instance, "xrRequestDisplayRenderingModeEXT",
+		                      reinterpret_cast<PFN_xrVoidFunction *>(&g_pfnRequestMode));
+	}
+
+	// Enumerate rendering modes (view counts, tile layouts, scales). The
+	// runtime reports which mode is active via isActive; we adopt it.
+	if (g_pfnEnumModes != nullptr) {
+		uint32_t mc = 0;
+		if (g_pfnEnumModes(g_session, 0, &mc, nullptr) == XR_SUCCESS && mc > 0) {
+			if (mc > kMaxViews) {
+				mc = kMaxViews;
+			}
+			XrDisplayRenderingModeInfoEXT modes[kMaxViews] = {};
+			for (uint32_t i = 0; i < mc; ++i) {
+				modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+			}
+			if (g_pfnEnumModes(g_session, mc, &mc, modes) == XR_SUCCESS) {
+				g_mode_count = mc;
+				LOGI("Rendering modes (%u):", mc);
+				for (uint32_t i = 0; i < mc; ++i) {
+					g_modes[i].view_count = modes[i].viewCount ? modes[i].viewCount : 1;
+					g_modes[i].tile_columns = modes[i].tileColumns ? modes[i].tileColumns : 1;
+					g_modes[i].tile_rows = modes[i].tileRows ? modes[i].tileRows : 1;
+					g_modes[i].view_scale_x = modes[i].viewScaleX > 0.0f ? modes[i].viewScaleX : 1.0f;
+					g_modes[i].view_scale_y = modes[i].viewScaleY > 0.0f ? modes[i].viewScaleY : 1.0f;
+					g_modes[i].hardware_3d = modes[i].hardwareDisplay3D != 0;
+					g_modes[i].requestable = modes[i].isRequestable != 0;
+					std::strncpy(g_modes[i].name, modes[i].modeName, sizeof(g_modes[i].name) - 1);
+					g_modes[i].name[sizeof(g_modes[i].name) - 1] = '\0';
+					LOGI("  [%u] %s views=%u tiles=%ux%u scale=%.2fx%.2f 3D=%d active=%d req=%d",
+					     modes[i].modeIndex, g_modes[i].name, g_modes[i].view_count,
+					     g_modes[i].tile_columns, g_modes[i].tile_rows, g_modes[i].view_scale_x,
+					     g_modes[i].view_scale_y, (int)g_modes[i].hardware_3d, (int)modes[i].isActive,
+					     (int)g_modes[i].requestable);
+					if (modes[i].isActive) {
+						g_current_mode.store(modes[i].modeIndex, std::memory_order_relaxed);
+					}
+				}
+			}
+		}
+	}
+	if (g_mode_count == 0) {
+		LOGW("No rendering modes enumerated — defaulting to a single 2-view SBS atlas");
+	}
+	return true;
+}
+
+// Create the SINGLE tiled-atlas swapchain. Each frame the app renders the
+// active mode's views into tiles of this one image and submits N projection
+// views that reference it with per-tile imageRects (mirrors the Windows /
+// macOS cubes). Sized to the largest atlas any mode can produce full-screen —
+// for sim_display / Leia SR that collapses to the panel resolution.
 bool
 create_swapchains()
 {
-	uint32_t expected_view_count = 0;
-	XrResult res = xrEnumerateViewConfigurationViews(
-	    g_instance, g_system_id, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
-	    0, &expected_view_count, nullptr);
-	log_xr_result("xrEnumerateViewConfigurationViews(count)", res);
-	if (res != XR_SUCCESS || expected_view_count != kViewCount) {
-		LOGE("Expected %u views, runtime reports %u", kViewCount, expected_view_count);
-		return false;
-	}
-
-	XrViewConfigurationView view_configs[kViewCount] = {};
-	for (uint32_t i = 0; i < kViewCount; ++i) {
-		view_configs[i].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
-	}
-	res = xrEnumerateViewConfigurationViews(
-	    g_instance, g_system_id, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
-	    kViewCount, &expected_view_count, view_configs);
-	if (res != XR_SUCCESS) {
-		log_xr_result("xrEnumerateViewConfigurationViews(fill)", res);
-		return false;
+	// Per-view config: only needed here for the sample count + the no-display-
+	// info fallback dims. Don't gate on the count anymore.
+	XrViewConfigurationView view_config = {XR_TYPE_VIEW_CONFIGURATION_VIEW};
+	{
+		uint32_t got = 0;
+		XrViewConfigurationView buf[kMaxViews] = {};
+		for (uint32_t i = 0; i < kMaxViews; ++i) {
+			buf[i].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
+		}
+		uint32_t cap = g_max_view_count > kMaxViews ? kMaxViews : g_max_view_count;
+		XrResult vres = xrEnumerateViewConfigurationViews(
+		    g_instance, g_system_id, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, cap, &got, buf);
+		if (vres == XR_SUCCESS && got > 0) {
+			view_config = buf[0];
+		}
 	}
 
 	// Pick a swapchain format the runtime supports. Prefer 8-bit linear
 	// RGBA / BGRA — these line up with what the runtime's vk_native
-	// compositor and the CNSDK DP expect. SRGB variants kicked out so we
-	// don't trip the gamma double-correction we just fixed in audit B2.
+	// compositor and the DP expect. SRGB variants kicked out so we don't
+	// trip a gamma double-correction.
 	uint32_t format_count = 0;
-	res = xrEnumerateSwapchainFormats(g_session, 0, &format_count, nullptr);
+	XrResult res = xrEnumerateSwapchainFormats(g_session, 0, &format_count, nullptr);
 	if (res != XR_SUCCESS || format_count == 0) {
 		log_xr_result("xrEnumerateSwapchainFormats(count)", res);
 		return false;
@@ -622,52 +832,79 @@ create_swapchains()
 	}
 	LOGI("Chose swapchain format: 0x%x", (uint32_t)g_swapchain_format);
 
-	for (uint32_t i = 0; i < kViewCount; ++i) {
-		g_views[i].width = view_configs[i].recommendedImageRectWidth;
-		g_views[i].height = view_configs[i].recommendedImageRectHeight;
-
-		XrSwapchainCreateInfo ci = {};
-		ci.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
-		ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
-		                XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
-		ci.format = g_swapchain_format;
-		ci.sampleCount = view_configs[i].recommendedSwapchainSampleCount;
-		ci.width = g_views[i].width;
-		ci.height = g_views[i].height;
-		ci.faceCount = 1;
-		ci.arraySize = 1;
-		ci.mipCount = 1;
-
-		res = xrCreateSwapchain(g_session, &ci, &g_views[i].swapchain);
-		if (res != XR_SUCCESS) {
-			log_xr_result("xrCreateSwapchain", res);
-			return false;
+	// Atlas dims = max over all modes of (cols × scaleX × panelW) × (rows ×
+	// scaleY × panelH), floored at the panel resolution. For sim_display this
+	// is exactly panelW × panelH.
+	uint32_t atlas_w = 0, atlas_h = 0;
+	if (g_display_px_w > 0 && g_display_px_h > 0) {
+		atlas_w = g_display_px_w;
+		atlas_h = g_display_px_h;
+		for (uint32_t i = 0; i < g_mode_count; ++i) {
+			uint32_t aw = (uint32_t)((double)g_modes[i].tile_columns * g_modes[i].view_scale_x *
+			                         (double)g_display_px_w);
+			uint32_t ah = (uint32_t)((double)g_modes[i].tile_rows * g_modes[i].view_scale_y *
+			                         (double)g_display_px_h);
+			if (aw > atlas_w) {
+				atlas_w = aw;
+			}
+			if (ah > atlas_h) {
+				atlas_h = ah;
+			}
 		}
-
-		uint32_t img_count = 0;
-		res = xrEnumerateSwapchainImages(g_views[i].swapchain, 0, &img_count, nullptr);
-		if (res != XR_SUCCESS) {
-			log_xr_result("xrEnumerateSwapchainImages(count)", res);
-			return false;
-		}
-		if (img_count > 8) {
-			LOGW("Swapchain advertises %u images; capping at 8", img_count);
-			img_count = 8;
-		}
-		for (uint32_t j = 0; j < img_count; ++j) {
-			g_views[i].images[j].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
-		}
-		res = xrEnumerateSwapchainImages(
-		    g_views[i].swapchain, img_count, &img_count,
-		    reinterpret_cast<XrSwapchainImageBaseHeader *>(g_views[i].images));
-		if (res != XR_SUCCESS) {
-			log_xr_result("xrEnumerateSwapchainImages(fill)", res);
-			return false;
-		}
-		g_views[i].image_count = img_count;
-		LOGI("View %u swapchain: %ux%u, %u images", i, g_views[i].width,
-		     g_views[i].height, img_count);
+	} else {
+		// No display info: fall back to the recommended per-view rect laid out
+		// across the default mode's tile grid.
+		const RenderingModeInfo &m = active_mode();
+		atlas_w = view_config.recommendedImageRectWidth * m.tile_columns;
+		atlas_h = view_config.recommendedImageRectHeight * m.tile_rows;
 	}
+	if (atlas_w == 0 || atlas_h == 0) {
+		LOGE("Atlas sizing failed (%ux%u); aborting swapchain create", atlas_w, atlas_h);
+		return false;
+	}
+
+	g_atlas.width = atlas_w;
+	g_atlas.height = atlas_h;
+
+	XrSwapchainCreateInfo ci = {};
+	ci.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
+	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+	ci.format = g_swapchain_format;
+	ci.sampleCount = view_config.recommendedSwapchainSampleCount ? view_config.recommendedSwapchainSampleCount : 1;
+	ci.width = atlas_w;
+	ci.height = atlas_h;
+	ci.faceCount = 1;
+	ci.arraySize = 1;
+	ci.mipCount = 1;
+
+	res = xrCreateSwapchain(g_session, &ci, &g_atlas.swapchain);
+	if (res != XR_SUCCESS) {
+		log_xr_result("xrCreateSwapchain", res);
+		return false;
+	}
+
+	uint32_t img_count = 0;
+	res = xrEnumerateSwapchainImages(g_atlas.swapchain, 0, &img_count, nullptr);
+	if (res != XR_SUCCESS) {
+		log_xr_result("xrEnumerateSwapchainImages(count)", res);
+		return false;
+	}
+	if (img_count > 8) {
+		LOGW("Swapchain advertises %u images; capping at 8", img_count);
+		img_count = 8;
+	}
+	for (uint32_t j = 0; j < img_count; ++j) {
+		g_atlas.images[j].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
+	}
+	res = xrEnumerateSwapchainImages(g_atlas.swapchain, img_count, &img_count,
+	                                 reinterpret_cast<XrSwapchainImageBaseHeader *>(g_atlas.images));
+	if (res != XR_SUCCESS) {
+		log_xr_result("xrEnumerateSwapchainImages(fill)", res);
+		return false;
+	}
+	g_atlas.image_count = img_count;
+	LOGI("Atlas swapchain: %ux%u, %u images (active mode '%s', %u views)", atlas_w, atlas_h,
+	     img_count, active_mode().name, active_view_count());
 	return true;
 }
 
@@ -706,15 +943,13 @@ create_cmd_pool()
 void
 destroy_swapchains()
 {
-	for (uint32_t i = 0; i < kViewCount; ++i) {
-		if (g_views[i].swapchain != XR_NULL_HANDLE) {
-			xrDestroySwapchain(g_views[i].swapchain);
-			g_views[i].swapchain = XR_NULL_HANDLE;
-		}
-		g_views[i].image_count = 0;
-		g_views[i].width = 0;
-		g_views[i].height = 0;
+	if (g_atlas.swapchain != XR_NULL_HANDLE) {
+		xrDestroySwapchain(g_atlas.swapchain);
+		g_atlas.swapchain = XR_NULL_HANDLE;
 	}
+	g_atlas.image_count = 0;
+	g_atlas.width = 0;
+	g_atlas.height = 0;
 	g_swapchain_format = VK_FORMAT_UNDEFINED;
 }
 
@@ -1316,7 +1551,7 @@ create_hud_buffer()
 		return false;
 	}
 	vkBindBufferMemory(g_vk_device, g_hud_vbuf, g_hud_vbuf_mem, 0);
-	// Persistently mapped (host-coherent): rebuilt each frame in record_draw.
+	// Persistently mapped (host-coherent): rebuilt each frame in record_atlas.
 	if (vkMapMemory(g_vk_device, g_hud_vbuf_mem, 0, size, 0, &g_hud_mapped) != VK_SUCCESS) {
 		LOGE("map HUD vertex buffer failed");
 		return false;
@@ -1325,15 +1560,17 @@ create_hud_buffer()
 	return true;
 }
 
-// Create the per-view depth target (D32_SFLOAT, view dimensions).
+// Create the atlas depth target (D32_SFLOAT, full atlas dimensions). One depth
+// image is shared by every tile — tiles don't overlap, so a single per-frame
+// LOAD_OP_CLEAR is correct.
 bool
-create_view_depth(uint32_t view_idx)
+create_atlas_depth()
 {
 	VkImageCreateInfo ici = {};
 	ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 	ici.imageType = VK_IMAGE_TYPE_2D;
 	ici.format = VK_FORMAT_D32_SFLOAT;
-	ici.extent = {g_views[view_idx].width, g_views[view_idx].height, 1};
+	ici.extent = {g_atlas.width, g_atlas.height, 1};
 	ici.mipLevels = 1;
 	ici.arrayLayers = 1;
 	ici.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -1341,69 +1578,69 @@ create_view_depth(uint32_t view_idx)
 	ici.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
 	ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 	ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-	if (vkCreateImage(g_vk_device, &ici, nullptr, &g_views[view_idx].depth_image) != VK_SUCCESS) {
-		LOGE("create depth image view=%u failed", view_idx);
+	if (vkCreateImage(g_vk_device, &ici, nullptr, &g_atlas.depth_image) != VK_SUCCESS) {
+		LOGE("create atlas depth image failed");
 		return false;
 	}
 
 	VkMemoryRequirements req = {};
-	vkGetImageMemoryRequirements(g_vk_device, g_views[view_idx].depth_image, &req);
+	vkGetImageMemoryRequirements(g_vk_device, g_atlas.depth_image, &req);
 	VkMemoryAllocateInfo mai = {};
 	mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
 	mai.allocationSize = req.size;
 	mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 	if (mai.memoryTypeIndex == UINT32_MAX ||
-	    vkAllocateMemory(g_vk_device, &mai, nullptr, &g_views[view_idx].depth_mem) != VK_SUCCESS) {
-		LOGE("alloc depth memory view=%u failed", view_idx);
+	    vkAllocateMemory(g_vk_device, &mai, nullptr, &g_atlas.depth_mem) != VK_SUCCESS) {
+		LOGE("alloc atlas depth memory failed");
 		return false;
 	}
-	vkBindImageMemory(g_vk_device, g_views[view_idx].depth_image, g_views[view_idx].depth_mem, 0);
+	vkBindImageMemory(g_vk_device, g_atlas.depth_image, g_atlas.depth_mem, 0);
 
 	VkImageViewCreateInfo dvci = {};
 	dvci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-	dvci.image = g_views[view_idx].depth_image;
+	dvci.image = g_atlas.depth_image;
 	dvci.viewType = VK_IMAGE_VIEW_TYPE_2D;
 	dvci.format = VK_FORMAT_D32_SFLOAT;
 	dvci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
-	if (vkCreateImageView(g_vk_device, &dvci, nullptr, &g_views[view_idx].depth_view) != VK_SUCCESS) {
-		LOGE("create depth view view=%u failed", view_idx);
+	if (vkCreateImageView(g_vk_device, &dvci, nullptr, &g_atlas.depth_view) != VK_SUCCESS) {
+		LOGE("create atlas depth view failed");
 		return false;
 	}
 	return true;
 }
 
+// One framebuffer per atlas swapchain image (color = atlas image, depth =
+// shared atlas depth). The single render pass spans the whole atlas; per-tile
+// rendering is done with viewport/scissor.
 bool
-create_view_framebuffers(uint32_t view_idx)
+create_view_framebuffers()
 {
-	if (!create_view_depth(view_idx)) {
+	if (!create_atlas_depth()) {
 		return false;
 	}
-	for (uint32_t i = 0; i < g_views[view_idx].image_count; ++i) {
+	for (uint32_t i = 0; i < g_atlas.image_count; ++i) {
 		VkImageViewCreateInfo ivci = {};
 		ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-		ivci.image = g_views[view_idx].images[i].image;
+		ivci.image = g_atlas.images[i].image;
 		ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
 		ivci.format = g_swapchain_format;
 		ivci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-		if (vkCreateImageView(g_vk_device, &ivci, nullptr,
-		                      &g_views[view_idx].image_views[i]) != VK_SUCCESS) {
-			LOGE("vkCreateImageView view=%u img=%u failed", view_idx, i);
+		if (vkCreateImageView(g_vk_device, &ivci, nullptr, &g_atlas.image_views[i]) != VK_SUCCESS) {
+			LOGE("vkCreateImageView atlas img=%u failed", i);
 			return false;
 		}
 
-		VkImageView fb_attachments[2] = {g_views[view_idx].image_views[i],
-		                                 g_views[view_idx].depth_view};
+		VkImageView fb_attachments[2] = {g_atlas.image_views[i], g_atlas.depth_view};
 		VkFramebufferCreateInfo fbi = {};
 		fbi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
 		fbi.renderPass = g_render_pass;
 		fbi.attachmentCount = 2;
 		fbi.pAttachments = fb_attachments;
-		fbi.width = g_views[view_idx].width;
-		fbi.height = g_views[view_idx].height;
+		fbi.width = g_atlas.width;
+		fbi.height = g_atlas.height;
 		fbi.layers = 1;
-		if (vkCreateFramebuffer(g_vk_device, &fbi, nullptr,
-		                        &g_views[view_idx].framebuffers[i]) != VK_SUCCESS) {
-			LOGE("vkCreateFramebuffer view=%u img=%u failed", view_idx, i);
+		if (vkCreateFramebuffer(g_vk_device, &fbi, nullptr, &g_atlas.framebuffers[i]) != VK_SUCCESS) {
+			LOGE("vkCreateFramebuffer atlas img=%u failed", i);
 			return false;
 		}
 	}
@@ -1411,29 +1648,29 @@ create_view_framebuffers(uint32_t view_idx)
 }
 
 void
-destroy_view_framebuffers(uint32_t view_idx)
+destroy_view_framebuffers()
 {
 	for (uint32_t i = 0; i < 8; ++i) {
-		if (g_views[view_idx].framebuffers[i] != VK_NULL_HANDLE) {
-			vkDestroyFramebuffer(g_vk_device, g_views[view_idx].framebuffers[i], nullptr);
-			g_views[view_idx].framebuffers[i] = VK_NULL_HANDLE;
+		if (g_atlas.framebuffers[i] != VK_NULL_HANDLE) {
+			vkDestroyFramebuffer(g_vk_device, g_atlas.framebuffers[i], nullptr);
+			g_atlas.framebuffers[i] = VK_NULL_HANDLE;
 		}
-		if (g_views[view_idx].image_views[i] != VK_NULL_HANDLE) {
-			vkDestroyImageView(g_vk_device, g_views[view_idx].image_views[i], nullptr);
-			g_views[view_idx].image_views[i] = VK_NULL_HANDLE;
+		if (g_atlas.image_views[i] != VK_NULL_HANDLE) {
+			vkDestroyImageView(g_vk_device, g_atlas.image_views[i], nullptr);
+			g_atlas.image_views[i] = VK_NULL_HANDLE;
 		}
 	}
-	if (g_views[view_idx].depth_view != VK_NULL_HANDLE) {
-		vkDestroyImageView(g_vk_device, g_views[view_idx].depth_view, nullptr);
-		g_views[view_idx].depth_view = VK_NULL_HANDLE;
+	if (g_atlas.depth_view != VK_NULL_HANDLE) {
+		vkDestroyImageView(g_vk_device, g_atlas.depth_view, nullptr);
+		g_atlas.depth_view = VK_NULL_HANDLE;
 	}
-	if (g_views[view_idx].depth_image != VK_NULL_HANDLE) {
-		vkDestroyImage(g_vk_device, g_views[view_idx].depth_image, nullptr);
-		g_views[view_idx].depth_image = VK_NULL_HANDLE;
+	if (g_atlas.depth_image != VK_NULL_HANDLE) {
+		vkDestroyImage(g_vk_device, g_atlas.depth_image, nullptr);
+		g_atlas.depth_image = VK_NULL_HANDLE;
 	}
-	if (g_views[view_idx].depth_mem != VK_NULL_HANDLE) {
-		vkFreeMemory(g_vk_device, g_views[view_idx].depth_mem, nullptr);
-		g_views[view_idx].depth_mem = VK_NULL_HANDLE;
+	if (g_atlas.depth_mem != VK_NULL_HANDLE) {
+		vkFreeMemory(g_vk_device, g_atlas.depth_mem, nullptr);
+		g_atlas.depth_mem = VK_NULL_HANDLE;
 	}
 }
 
@@ -1469,18 +1706,18 @@ destroy_render_pass()
 
 // ─── per-frame draw ───────────────────────────────────────────────────
 //
-// Records and submits a cmd buffer that begins our render pass on the
-// view's framebuffer, clears to a per-eye background color (red/blue —
-// same calibration hint as the old record_clear), binds the triangle
-// pipeline, pushes proj*view, and draws 3 vertices. Replaces the old
-// vkCmdClearColorImage-only path.
-
-// COLOR_ATTACHMENT_OPTIMAL (per OpenXR spec), transitions to
-// TRANSFER_DST for the clear, then back to COLOR_ATTACHMENT_OPTIMAL
-// for xrReleaseSwapchainImage.
+// Render the active mode's `view_count` views into TILES of the single atlas
+// image, in ONE render pass, then submit once. Mirrors RenderScene() in
+// cube_handle_vk_win: LOAD_OP_CLEAR blacks the whole atlas, then each view
+// draws into its tile via a viewport/scissor offset. The HUD is drawn per-tile
+// at zero disparity (same screen-plane NDC in every tile). `render_w/h` are the
+// per-tile dims; `cols/rows` the atlas grid; `swap_lr` is the ghost-diagnosis
+// eye-swap knob.
 bool
-record_clear(uint32_t view_idx, uint32_t image_idx)
+record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint32_t render_w,
+             uint32_t render_h, uint32_t cols, uint32_t rows, bool swap_lr)
 {
+	(void)rows;
 	VkCommandBufferAllocateInfo ai = {};
 	ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
 	ai.commandPool = g_app_cmd_pool;
@@ -1496,212 +1733,124 @@ record_clear(uint32_t view_idx, uint32_t image_idx)
 	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	vkBeginCommandBuffer(cmd, &bi);
 
-	VkImage img = g_views[view_idx].images[image_idx].image;
-
-	VkImageMemoryBarrier to_dst = {};
-	to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-	to_dst.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-	to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-	to_dst.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-	to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-	to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	to_dst.image = img;
-	to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-	vkCmdPipelineBarrier(cmd,
-	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-	    VK_PIPELINE_STAGE_TRANSFER_BIT,
-	    0, 0, nullptr, 0, nullptr, 1, &to_dst);
-
-	VkClearColorValue color = {};
-	color.float32[0] = (view_idx == 0) ? 0.8f : 0.1f;  // left: red, right: blue
-	color.float32[1] = 0.1f;
-	color.float32[2] = (view_idx == 0) ? 0.1f : 0.8f;
-	color.float32[3] = 1.0f;
-	VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-	vkCmdClearColorImage(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	                     &color, 1, &range);
-
-	VkImageMemoryBarrier to_color = to_dst;
-	to_color.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-	to_color.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-	to_color.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-	to_color.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-	vkCmdPipelineBarrier(cmd,
-	    VK_PIPELINE_STAGE_TRANSFER_BIT,
-	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-	    0, 0, nullptr, 0, nullptr, 1, &to_color);
-
-	vkEndCommandBuffer(cmd);
-
-	VkSubmitInfo si = {};
-	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	si.commandBufferCount = 1;
-	si.pCommandBuffers = &cmd;
-	VkResult res = vkQueueSubmit(g_vk_queue, 1, &si, VK_NULL_HANDLE);
-	if (res == VK_SUCCESS) {
-		// vkQueueWaitIdle is a host stall but acceptable for this
-		// skeleton — xrEndFrame needs the image to be ready and we
-		// haven't wired a per-frame fence yet.
-		vkQueueWaitIdle(g_vk_queue);
-	}
-	vkFreeCommandBuffers(g_vk_device, g_app_cmd_pool, 1, &cmd);
-	return res == VK_SUCCESS;
-}
-
-// Triangle draw — supersedes record_clear. Begins our render pass on the
-// per-view framebuffer (LOAD_OP_CLEAR clears to the per-eye background
-// color so the lightfield calibration check stays visible behind the
-// triangle), binds the triangle pipeline, pushes proj*view, draws 3
-// vertices.
-bool
-record_draw(uint32_t view_idx, uint32_t image_idx, const XrView &view)
-{
-	VkCommandBufferAllocateInfo ai = {};
-	ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-	ai.commandPool = g_app_cmd_pool;
-	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-	ai.commandBufferCount = 1;
-	VkCommandBuffer cmd = VK_NULL_HANDLE;
-	if (vkAllocateCommandBuffers(g_vk_device, &ai, &cmd) != VK_SUCCESS) {
-		return false;
-	}
-
-	VkCommandBufferBeginInfo bi = {};
-	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	vkBeginCommandBuffer(cmd, &bi);
-
-	// LOAD_OP_CLEAR. Background color is toggleable on-device (tap the screen,
-	// or the Kotlin overlay). Default OFF → black in both eyes so the weave/3D
-	// is judged against a clean black field. When ON, the per-eye red/blue
-	// tint aids calibration test 2 (one-eye-covered tile-mapping check).
-	// Clean black background on both eye tiles (LOAD_OP_CLEAR to black). The
-	// per-eye red/blue 3D-check tint and the on-screen BG toggle were removed
-	// for a clean display.
+	// LOAD_OP_CLEAR blacks the WHOLE atlas (every tile) once at render-pass
+	// begin, so the weave/3D is judged against a clean black field.
 	VkClearValue clears[2] = {};
-	clears[0].color.float32[3] = 1.0f;
+	clears[0].color.float32[3] = 1.0f;  // opaque black
 	clears[1].depthStencil.depth = 1.0f;
 
 	VkRenderPassBeginInfo rpbi = {};
 	rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
 	rpbi.renderPass = g_render_pass;
-	rpbi.framebuffer = g_views[view_idx].framebuffers[image_idx];
+	rpbi.framebuffer = g_atlas.framebuffers[image_idx];
 	rpbi.renderArea.offset = {0, 0};
-	rpbi.renderArea.extent = {g_views[view_idx].width, g_views[view_idx].height};
+	rpbi.renderArea.extent = {g_atlas.width, g_atlas.height};
 	rpbi.clearValueCount = 2;
 	rpbi.pClearValues = clears;
 	vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
-	VkViewport vp = {};
-	vp.x = 0.0f;
-	vp.y = 0.0f;
-	vp.width = (float)g_views[view_idx].width;
-	vp.height = (float)g_views[view_idx].height;
-	vp.minDepth = 0.0f;
-	vp.maxDepth = 1.0f;
-	vkCmdSetViewport(cmd, 0, 1, &vp);
-
-	VkRect2D scissor = {};
-	scissor.offset = {0, 0};
-	scissor.extent = {g_views[view_idx].width, g_views[view_idx].height};
-	vkCmdSetScissor(cmd, 0, 1, &scissor);
-
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline);
 
-	// MVP = proj * view * model for this eye. Both eyes use the same
-	// g_frame_count-derived angle so the stereo pair stays in sync.
-	const Mat4 view_mat = view_matrix_from_pose(view.pose);
-	// Two decoupled knobs (both live, read every frame):
+	// Orientation knobs — identical for every tile, so computed once.
 	//  - aspect_mult (HORIZONTAL): also scales the stereo disparity (lower =
-	//    more disparity). 1.0 gives the clean weave on the nubia NP02J; 0.5
-	//    over-drove disparity and degraded the weave. Keep it at the
-	//    weave-clean value.
+	//    more disparity). 1.0 gives the clean weave on the nubia NP02J.
 	//  - yscale (VERTICAL): stretches clip-space Y to cancel the ~2x vertical
-	//    squash (from the half-width SBS tile + the landscape-atlas->portrait-
-	//    panel rotation). Vertical does NOT affect the horizontal disparity,
-	//    so it un-squishes WITHOUT hurting the weave.
+	//    squash (half-width SBS tile + landscape-atlas→portrait-panel rotation).
+	//    Vertical does NOT affect horizontal disparity, so it un-squishes
+	//    without hurting the weave.
 	//    adb shell setprop debug.dxr.aspect_mult <f> ; debug.dxr.yscale <f>
-	// Orientation-aware aspect. Portrait: the weave rotates the landscape tile
-	// onto the portrait panel, needing yscale=1.25. Landscape: no such rotation,
-	// so the correction differs. Defaults derived from orientation; setprop
-	// (>=0) overrides for tuning (set to -1 to return to the derived value).
 	const int disp_rot_a = g_display_rotation.load(std::memory_order_relaxed) & 3;
 	const bool is_landscape = (disp_rot_a == 1 || disp_rot_a == 3);
 	const float am_prop = get_prop_float("debug.dxr.aspect_mult", -1.0f);
 	const float ys_prop = get_prop_float("debug.dxr.yscale", -1.0f);
-	// Landscape correct at yscale=1.0; portrait needs vertical compression
-	// (cube was too tall) because the weave fits the tile to the taller portrait
-	// panel. 0.6 is the first calibration point — tune if still tall / too wide.
 	const float aspect_mult = (am_prop >= 0.0f) ? am_prop : 1.0f;
 	const float yscale = (ys_prop >= 0.0f) ? ys_prop : (is_landscape ? 1.0f : 0.6f);
-	const float aspect = aspect_mult * (float)g_views[view_idx].width / (float)g_views[view_idx].height;
-	Mat4 proj_mat = projection_matrix_from_fov(view.fov, aspect, 0.05f, 100.0f);
-	proj_mat.m[5] *= yscale;  // clip-space Y stretch (cancels vertical squash; disparity is horizontal, untouched)
-	proj_mat.m[9] *= yscale;
-	const Mat4 view_proj = mat4_mul(proj_mat, view_mat);
+
+	// Build the HUD geometry ONCE (identical in every tile) — rebuilding it
+	// into the persistently-mapped buffer mid-pass would be a write-while-read
+	// hazard against an already-recorded tile draw.
+	uint32_t hud_n = 0;
+	Mat4 hud_mvp = mat4_identity();
+	const bool hud_ok = (g_hud_vbuf != VK_NULL_HANDLE && g_hud_mapped != nullptr);
+	if (hud_ok) {
+		hud_n = build_hud(reinterpret_cast<CubeVertex *>(g_hud_mapped));
+		// HUD orientation, per display rotation, calibrated on-device for the
+		// preTransform=IDENTITY weave (LOXR-730/733). setprop
+		// debug.dxr.hud_rot/hud_hflip/hud_vflip (>=0) override per knob.
+		//   disp_rot:  0(port) 1(land) 2(rev-port) 3(rev-land)
+		//   hud_rot:    0       0       2           2
+		//   hud_hflip:  0       0       0           1
+		//   hud_vflip:  1       1       1           0
+		static const int kHudRotForDisp[4] = {0, 0, 2, 2};
+		static const int kHudHflipForDisp[4] = {0, 0, 0, 1};
+		static const int kHudVflipForDisp[4] = {1, 1, 1, 0};
+		const float rot_prop = get_prop_float("debug.dxr.hud_rot", -1.0f);
+		const float hflip_prop = get_prop_float("debug.dxr.hud_hflip", -1.0f);
+		const float vflip_prop = get_prop_float("debug.dxr.hud_vflip", -1.0f);
+		const int rot = ((rot_prop >= 0.0f) ? (int)rot_prop : kHudRotForDisp[disp_rot_a]) & 3;
+		const bool hflip = (hflip_prop >= 0.0f) ? (hflip_prop != 0.0f)
+		                                        : (kHudHflipForDisp[disp_rot_a] != 0);
+		const bool vflip = (vflip_prop >= 0.0f) ? (vflip_prop != 0.0f)
+		                                        : (kHudVflipForDisp[disp_rot_a] != 0);
+		static int huddbg = 0;
+		if ((huddbg++ % 120) == 0) {
+			LOGI("HW_HUD: disp_rot=%d rot=%d hflip=%d vflip=%d", disp_rot_a, rot, (int)hflip,
+			     (int)vflip);
+		}
+		const float cs[4] = {1.0f, 0.0f, -1.0f, 0.0f};
+		const float sn[4] = {0.0f, 1.0f, 0.0f, -1.0f};
+		const float c = cs[rot], s = sn[rot];
+		hud_mvp.m[0] = c;  hud_mvp.m[4] = -s;
+		hud_mvp.m[1] = s;  hud_mvp.m[5] = c;
+		if (hflip) { hud_mvp.m[0] = -hud_mvp.m[0]; hud_mvp.m[4] = -hud_mvp.m[4]; }
+		if (vflip) { hud_mvp.m[1] = -hud_mvp.m[1]; hud_mvp.m[5] = -hud_mvp.m[5]; }
+	}
+
 	const Mat4 model = cube_model_matrix((float)g_frame_count * 0.02f);
-	const Mat4 mvp = mat4_mul(view_proj, model);
-	vkCmdPushConstants(cmd, g_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
-	                   0, sizeof(mvp), &mvp);
 
-	VkDeviceSize vb_offset = 0;
-	vkCmdBindVertexBuffers(cmd, 0, 1, &g_cube_vbuf, &vb_offset);
-	vkCmdDraw(cmd, kCubeVertexCount, 1, 0, 0);
+	for (uint32_t i = 0; i < view_count; ++i) {
+		// Place this view in its atlas tile (column-major within the grid).
+		const uint32_t tile_x = (cols > 0) ? (i % cols) : 0;
+		const uint32_t tile_y = (cols > 0) ? (i / cols) : 0;
+		const float vp_x = (float)(tile_x * render_w);
+		const float vp_y = (float)(tile_y * render_h);
 
-	// In-frame HUD (identity MVP → screen-space NDC), drawn over the cube and
-	// identically into both eye tiles (zero disparity → sits at the screen
-	// plane). Rebuilt into the persistently-mapped buffer each call; the
-	// per-submit vkQueueWaitIdle below guarantees it isn't in flight.
-	if (g_hud_vbuf != VK_NULL_HANDLE && g_hud_mapped != nullptr) {
-		const uint32_t hud_n = build_hud(reinterpret_cast<CubeVertex *>(g_hud_mapped));
-		if (hud_n > 0) {
-			// The landscape per-eye tile is rotated onto the portrait panel, so
-			// the HUD (drawn in tile-NDC) needs a compensating rotation to read
-			// upright. Live-tunable:
-			//   adb shell setprop debug.dxr.hud_rot 0|1|2|3   (×90° CCW)
-			// Orientation-aware. Portrait needs rot=3/hflip=1 (tile rotated onto
-			// the portrait panel); landscape needs no rotation. Defaults derived
-			// from orientation; setprop (>=0) overrides for tuning (-1 = derived).
-			//   debug.dxr.hud_rot 0|1|2|3, hud_hflip, hud_vflip
-			const float rot_prop = get_prop_float("debug.dxr.hud_rot", -1.0f);
-			const float hflip_prop = get_prop_float("debug.dxr.hud_hflip", -1.0f);
-			// HUD orientation, per display rotation, calibrated on-device for the
-			// preTransform=IDENTITY weave (LOXR-730/733). Portrait & normal
-			// landscape: rot=0, vflip on. Reverse-landscape (disp_rot=3) needs a
-			// 180° rotate with hflip (not vflip) to read upright at the top-left.
-			// Verified on device at disp_rot 0/1/3; disp_rot=2 (reverse-portrait,
-			// rarely reached) keeps the portrait-style values. setprop
-			// debug.dxr.hud_rot/hud_hflip/hud_vflip (>=0) override per knob.
-			//   disp_rot:  0(port) 1(land) 2(rev-port) 3(rev-land)
-			//   hud_rot:    0       0       2           2
-			//   hud_hflip:  0       0       0           1
-			//   hud_vflip:  1       1       1           0
-			static const int kHudRotForDisp[4]   = {0, 0, 2, 2};
-			static const int kHudHflipForDisp[4] = {0, 0, 0, 1};
-			static const int kHudVflipForDisp[4] = {1, 1, 1, 0};
-			const int disp_rot_h = g_display_rotation.load(std::memory_order_relaxed) & 3;
-			const int rot = ((rot_prop >= 0.0f) ? (int)rot_prop : kHudRotForDisp[disp_rot_h]) & 3;
-			const bool hflip = (hflip_prop >= 0.0f) ? (hflip_prop != 0.0f)
-			                                        : (kHudHflipForDisp[disp_rot_h] != 0);
-			const float vflip_prop = get_prop_float("debug.dxr.hud_vflip", -1.0f);
-			const bool vflip = (vflip_prop >= 0.0f) ? (vflip_prop != 0.0f)
-			                                        : (kHudVflipForDisp[disp_rot_h] != 0);
-			static int huddbg = 0;
-			if ((huddbg++ % 120) == 0) {
-				LOGI("HW_HUD: disp_rot=%d rot=%d hflip=%d vflip=%d",
-				     disp_rot_h, rot, (int)hflip, (int)vflip);
-			}
-			const float cs[4] = {1.0f, 0.0f, -1.0f, 0.0f};
-			const float sn[4] = {0.0f, 1.0f, 0.0f, -1.0f};
-			const float c = cs[rot], s = sn[rot];
-			Mat4 hud_mvp = mat4_identity();
-			hud_mvp.m[0] = c;  hud_mvp.m[4] = -s;
-			hud_mvp.m[1] = s;  hud_mvp.m[5] = c;
-			if (hflip) { hud_mvp.m[0] = -hud_mvp.m[0]; hud_mvp.m[4] = -hud_mvp.m[4]; }
-			if (vflip) { hud_mvp.m[1] = -hud_mvp.m[1]; hud_mvp.m[5] = -hud_mvp.m[5]; }
-			vkCmdPushConstants(cmd, g_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
-			                   0, sizeof(hud_mvp), &hud_mvp);
+		VkViewport vp = {};
+		vp.x = vp_x;
+		vp.y = vp_y;
+		vp.width = (float)render_w;
+		vp.height = (float)render_h;
+		vp.minDepth = 0.0f;
+		vp.maxDepth = 1.0f;
+		vkCmdSetViewport(cmd, 0, 1, &vp);
+
+		VkRect2D scissor = {};
+		scissor.offset = {(int32_t)vp_x, (int32_t)vp_y};
+		scissor.extent = {render_w, render_h};
+		vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+		// Render eye `src` into tile `i` (src != i only under the swap knob).
+		const uint32_t src = swap_lr ? (view_count - 1 - i) : i;
+		const XrView &view = views[src];
+
+		const Mat4 view_mat = view_matrix_from_pose(view.pose);
+		const float aspect = aspect_mult * (float)render_w / (float)render_h;
+		Mat4 proj_mat = projection_matrix_from_fov(view.fov, aspect, 0.05f, 100.0f);
+		proj_mat.m[5] *= yscale;  // clip-space Y stretch (disparity is horizontal, untouched)
+		proj_mat.m[9] *= yscale;
+		const Mat4 view_proj = mat4_mul(proj_mat, view_mat);
+		const Mat4 mvp = mat4_mul(view_proj, model);
+		vkCmdPushConstants(cmd, g_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(mvp), &mvp);
+
+		VkDeviceSize vb_offset = 0;
+		vkCmdBindVertexBuffers(cmd, 0, 1, &g_cube_vbuf, &vb_offset);
+		vkCmdDraw(cmd, kCubeVertexCount, 1, 0, 0);
+
+		// In-frame HUD over the cube in this tile (identity-ish MVP → screen-
+		// space NDC; zero disparity so it sits at the screen plane).
+		if (hud_ok && hud_n > 0) {
+			vkCmdPushConstants(cmd, g_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+			                   sizeof(hud_mvp), &hud_mvp);
 			VkDeviceSize hud_off = 0;
 			vkCmdBindVertexBuffers(cmd, 0, 1, &g_hud_vbuf, &hud_off);
 			vkCmdDraw(cmd, hud_n, 1, 0, 0);
@@ -1717,11 +1866,13 @@ record_draw(uint32_t view_idx, uint32_t image_idx, const XrView &view)
 	si.pCommandBuffers = &cmd;
 	VkResult res = vkQueueSubmit(g_vk_queue, 1, &si, VK_NULL_HANDLE);
 	if (res == VK_SUCCESS) {
+		// Host stall — acceptable for this test app; xrEndFrame needs the
+		// atlas image ready and there's no per-frame fence wired yet.
 		vkQueueWaitIdle(g_vk_queue);
 	}
 	vkFreeCommandBuffers(g_vk_device, g_app_cmd_pool, 1, &cmd);
 
-	DXR_HW_DBG_ONCE("record_draw: first successful triangle submit");
+	DXR_HW_DBG_ONCE("record_atlas: first successful tiled-atlas submit");
 	return res == VK_SUCCESS;
 }
 
@@ -1776,6 +1927,18 @@ poll_xr_events()
 				LOGI("session state -> %d", (int)e->state);
 				handle_session_state(e->state);
 			}
+		} else if (ev.type == XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT) {
+			// The runtime's authoritative confirmation that the active mode
+			// changed (via xrRequestDisplayRenderingModeEXT or a vendor-side
+			// switch). Adopt it: drives the per-frame view count + tile layout.
+			const auto *e = reinterpret_cast<const XrEventDataRenderingModeChangedEXT *>(&ev);
+			if (e->session == g_session && e->currentModeIndex < g_mode_count) {
+				g_current_mode.store(e->currentModeIndex, std::memory_order_relaxed);
+				LOGI("rendering mode -> %u (%s): %u views, tiles %ux%u", e->currentModeIndex,
+				     g_modes[e->currentModeIndex].name, g_modes[e->currentModeIndex].view_count,
+				     g_modes[e->currentModeIndex].tile_columns,
+				     g_modes[e->currentModeIndex].tile_rows);
+			}
 		} else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
 			LOGW("instance loss pending — exiting");
 			g_exit_requested = true;
@@ -1783,9 +1946,55 @@ poll_xr_events()
 	}
 }
 
+// Request an absolute rendering-mode switch. The runtime confirms via
+// XrEventDataRenderingModeChangedEXT (handled in poll_xr_events), which updates
+// g_current_mode — so we don't pre-set it here.
+void
+request_mode(uint32_t idx)
+{
+	if (g_pfnRequestMode == nullptr || g_mode_count == 0 || idx >= g_mode_count) {
+		return;
+	}
+	if (!g_modes[idx].requestable) {
+		LOGW("rendering mode %u (%s) is not requestable", idx, g_modes[idx].name);
+		return;
+	}
+	LOGI("requesting rendering mode %u (%s)", idx, g_modes[idx].name);
+	XrResult res = g_pfnRequestMode(g_session, idx);
+	log_xr_result("xrRequestDisplayRenderingModeEXT", res);
+}
+
+// Advance to the next requestable mode (double-tap on device).
+void
+cycle_mode()
+{
+	if (g_mode_count == 0) {
+		return;
+	}
+	uint32_t start = g_current_mode.load(std::memory_order_relaxed);
+	for (uint32_t step = 1; step <= g_mode_count; ++step) {
+		uint32_t cand = (start + step) % g_mode_count;
+		if (g_modes[cand].requestable) {
+			request_mode(cand);
+			return;
+		}
+	}
+}
+
 bool
 render_frame()
 {
+	// Mode switch via adb: `setprop debug.dxr.mode N` requests mode N
+	// (absolute). Re-request only on change so the runtime isn't spammed.
+	{
+		static int last_prop_mode = -1;
+		int want = (int)get_prop_float("debug.dxr.mode", -1.0f);
+		if (want >= 0 && want != last_prop_mode) {
+			last_prop_mode = want;
+			request_mode((uint32_t)want);
+		}
+	}
+
 	XrFrameWaitInfo wait_info = {};
 	wait_info.type = XR_TYPE_FRAME_WAIT_INFO;
 	XrFrameState frame_state = {};
@@ -1804,8 +2013,14 @@ render_frame()
 		return false;
 	}
 
-	XrCompositionLayerProjectionView projection_views[kViewCount] = {};
+	XrCompositionLayerProjectionView projection_views[kMaxViews] = {};
 	bool rendered = false;
+	// Active mode → how many views to submit + the atlas tile layout. The
+	// app renders/submits the ACTIVE mode's view count; xrLocateViews still
+	// needs capacity for the MAX (g_max_view_count) and returns all of them.
+	const uint32_t submit_views = active_view_count();
+	uint32_t render_w = 0, render_h = 0, cols = 1, rows = 1;
+	active_tile_dims(&render_w, &render_h, &cols, &rows);
 	if (frame_state.shouldRender) {
 		XrViewState view_state = {};
 		view_state.type = XR_TYPE_VIEW_STATE;
@@ -1815,91 +2030,83 @@ render_frame()
 		locate_info.displayTime = frame_state.predictedDisplayTime;
 		locate_info.space = g_app_space;
 
-		XrView views[kViewCount] = {};
-		for (uint32_t i = 0; i < kViewCount; ++i) {
+		// Locate with capacity for the MAX view count (xrLocateViews returns
+		// the device's full view_count and rejects an under-capacity array
+		// with XR_ERROR_SIZE_INSUFFICIENT — the exact gate the old hard-coded
+		// `2` tripped on sim_display's 4).
+		XrView views[kMaxViews] = {};
+		for (uint32_t i = 0; i < kMaxViews; ++i) {
 			views[i].type = XR_TYPE_VIEW;
 		}
 		uint32_t located_view_count = 0;
-		res = xrLocateViews(g_session, &locate_info, &view_state,
-		                    kViewCount, &located_view_count, views);
-		if (res == XR_SUCCESS && located_view_count == kViewCount) {
+		res = xrLocateViews(g_session, &locate_info, &view_state, g_max_view_count,
+		                    &located_view_count, views);
+		if (res == XR_SUCCESS && located_view_count >= submit_views) {
 #ifdef XRT_DEBUG_ANDROID_VERBOSE
-			// Throttle ~1Hz: dump per-view pose + FOV so calibration tests
-			// (see android-bringup-checklist.md § B) can read them off
-			// directly without instrumenting further.
+			// Throttle ~1Hz: dump per-view pose + FOV for calibration checks.
 			if ((g_frame_count % 60) == 0) {
-				DXR_HW_DBG("views[L]: pos=(%.3f, %.3f, %.3f) quat=(%.3f, %.3f, %.3f, %.3f) "
-				           "fov=(L=%.3f R=%.3f U=%.3f D=%.3f) rad",
+				DXR_HW_DBG("located %u views (submitting %u, mode '%s', tiles %ux%u)",
+				           located_view_count, submit_views, active_mode().name, cols, rows);
+				DXR_HW_DBG("views[0]: pos=(%.3f, %.3f, %.3f) fov=(L=%.3f R=%.3f U=%.3f D=%.3f) rad",
 				           views[0].pose.position.x, views[0].pose.position.y, views[0].pose.position.z,
-				           views[0].pose.orientation.x, views[0].pose.orientation.y,
-				           views[0].pose.orientation.z, views[0].pose.orientation.w,
-				           views[0].fov.angleLeft, views[0].fov.angleRight,
-				           views[0].fov.angleUp, views[0].fov.angleDown);
-				DXR_HW_DBG("views[R]: pos=(%.3f, %.3f, %.3f) quat=(%.3f, %.3f, %.3f, %.3f)",
-				           views[1].pose.position.x, views[1].pose.position.y, views[1].pose.position.z,
-				           views[1].pose.orientation.x, views[1].pose.orientation.y,
-				           views[1].pose.orientation.z, views[1].pose.orientation.w);
+				           views[0].fov.angleLeft, views[0].fov.angleRight, views[0].fov.angleUp,
+				           views[0].fov.angleDown);
 			}
 #endif
 			DXR_HW_DBG_ONCE("first xrLocateViews success");
-			// L/R swap test (ghost diagnosis): when set, render the OTHER
-			// eye's camera into each tile, swapping which view feeds which
-			// eye. Live-tunable:
-			//   adb shell setprop debug.dxr.leia.swap_lr 1   (0 = normal)
+			// L/R swap test (ghost diagnosis): render the OTHER eye into each
+			// tile. Live-tunable: adb shell setprop debug.dxr.leia.swap_lr 1
 			const bool swap_lr = get_prop_float("debug.dxr.leia.swap_lr", 0.0f) != 0.0f;
 
-			// Cache the tracked head-center (midpoint of the two eye poses)
-			// for the on-screen marker + the Kotlin overlay readout. When the
-			// runtime has a real face this moves with the head; otherwise it
-			// sits at the static IPD fallback (~0,0,0.5).
-			g_eye_x.store(0.5f * (views[0].pose.position.x + views[1].pose.position.x),
+			// Cache the tracked head-center (midpoint of the first two eye
+			// poses — always located since g_max_view_count >= 2) for the
+			// on-screen marker + the Kotlin overlay readout.
+			const uint32_t e1 = (located_view_count >= 2) ? 1 : 0;
+			g_eye_x.store(0.5f * (views[0].pose.position.x + views[e1].pose.position.x),
 			              std::memory_order_relaxed);
-			g_eye_y.store(0.5f * (views[0].pose.position.y + views[1].pose.position.y),
+			g_eye_y.store(0.5f * (views[0].pose.position.y + views[e1].pose.position.y),
 			              std::memory_order_relaxed);
-			g_eye_z.store(0.5f * (views[0].pose.position.z + views[1].pose.position.z),
+			g_eye_z.store(0.5f * (views[0].pose.position.z + views[e1].pose.position.z),
 			              std::memory_order_relaxed);
 
-			for (uint32_t i = 0; i < kViewCount; ++i) {
-				XrSwapchainImageAcquireInfo acq = {};
-				acq.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
-				uint32_t img_idx = 0;
-				res = xrAcquireSwapchainImage(g_views[i].swapchain, &acq, &img_idx);
-				if (res != XR_SUCCESS) {
-					log_xr_result("xrAcquireSwapchainImage", res);
-					break;
-				}
-
+			// SINGLE atlas swapchain: one acquire, one tiled render pass (all
+			// `submit_views` tiles), one release.
+			XrSwapchainImageAcquireInfo acq = {};
+			acq.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
+			uint32_t img_idx = 0;
+			res = xrAcquireSwapchainImage(g_atlas.swapchain, &acq, &img_idx);
+			if (res == XR_SUCCESS) {
 				XrSwapchainImageWaitInfo wait_img = {};
 				wait_img.type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO;
 				wait_img.timeout = XR_INFINITE_DURATION;
-				res = xrWaitSwapchainImage(g_views[i].swapchain, &wait_img);
-				if (res != XR_SUCCESS) {
-					log_xr_result("xrWaitSwapchainImage", res);
-					break;
-				}
-
-				// Render eye `src` into tile `i` (src != i when swapped).
-				const uint32_t src = swap_lr ? (kViewCount - 1 - i) : i;
-				record_draw(i, img_idx, views[src]);
+				res = xrWaitSwapchainImage(g_atlas.swapchain, &wait_img);
+			}
+			if (res == XR_SUCCESS) {
+				record_atlas(img_idx, views, submit_views, render_w, render_h, cols, rows, swap_lr);
 
 				XrSwapchainImageReleaseInfo rel = {};
 				rel.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
-				res = xrReleaseSwapchainImage(g_views[i].swapchain, &rel);
-				if (res != XR_SUCCESS) {
-					log_xr_result("xrReleaseSwapchainImage", res);
-					break;
-				}
-
-				projection_views[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-				projection_views[i].pose = views[i].pose;
-				projection_views[i].fov = views[i].fov;
-				projection_views[i].subImage.swapchain = g_views[i].swapchain;
-				projection_views[i].subImage.imageRect.offset = {0, 0};
-				projection_views[i].subImage.imageRect.extent = {
-				    (int32_t)g_views[i].width, (int32_t)g_views[i].height};
-				projection_views[i].subImage.imageArrayIndex = 0;
+				res = xrReleaseSwapchainImage(g_atlas.swapchain, &rel);
 			}
-			rendered = (res == XR_SUCCESS);
+
+			if (res == XR_SUCCESS) {
+				for (uint32_t i = 0; i < submit_views; ++i) {
+					const uint32_t tile_x = (cols > 0) ? (i % cols) : 0;
+					const uint32_t tile_y = (cols > 0) ? (i / cols) : 0;
+					projection_views[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+					projection_views[i].pose = views[i].pose;
+					projection_views[i].fov = views[i].fov;
+					projection_views[i].subImage.swapchain = g_atlas.swapchain;
+					projection_views[i].subImage.imageRect.offset = {(int32_t)(tile_x * render_w),
+					                                                  (int32_t)(tile_y * render_h)};
+					projection_views[i].subImage.imageRect.extent = {(int32_t)render_w,
+					                                                  (int32_t)render_h};
+					projection_views[i].subImage.imageArrayIndex = 0;
+				}
+				rendered = true;
+			} else {
+				log_xr_result("atlas acquire/wait/release", res);
+			}
 		} else {
 			log_xr_result("xrLocateViews", res);
 		}
@@ -1908,7 +2115,7 @@ render_frame()
 	XrCompositionLayerProjection projection_layer = {};
 	projection_layer.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION;
 	projection_layer.space = g_app_space;
-	projection_layer.viewCount = kViewCount;
+	projection_layer.viewCount = submit_views;
 	projection_layer.views = projection_views;
 
 	const XrCompositionLayerBaseHeader *layers[1] = {
@@ -1974,8 +2181,7 @@ destroy_instance()
 	if (g_vk_device != VK_NULL_HANDLE) {
 		vkDeviceWaitIdle(g_vk_device);
 	}
-	destroy_view_framebuffers(0);
-	destroy_view_framebuffers(1);
+	destroy_view_framebuffers();
 	if (g_cube_vbuf != VK_NULL_HANDLE) {
 		vkDestroyBuffer(g_vk_device, g_cube_vbuf, nullptr);
 		g_cube_vbuf = VK_NULL_HANDLE;
@@ -2018,6 +2224,7 @@ handle_cmd(struct android_app *app, int32_t cmd)
 			    pick_physical_device() &&
 			    create_vulkan_device() &&
 			    create_session() &&
+			    query_display_info_and_modes() &&
 			    create_swapchains() &&
 			    create_reference_space() &&
 			    create_cmd_pool() &&
@@ -2025,8 +2232,7 @@ handle_cmd(struct android_app *app, int32_t cmd)
 			    create_pipeline() &&
 			    create_cube_vertex_buffer() &&
 			    create_hud_buffer() &&
-			    create_view_framebuffers(0) &&
-			    create_view_framebuffers(1);
+			    create_view_framebuffers();
 			if (brought_up) {
 				LOGI("Bring-up chain complete; awaiting session state events.");
 			} else {
@@ -2052,10 +2258,13 @@ handle_cmd(struct android_app *app, int32_t cmd)
 	}
 }
 
-// On-device background toggle: a single tap anywhere flips g_bg_enabled.
-// MonadoView is FLAG_NOT_FOCUSABLE, so touch events land in this
-// NativeActivity input queue rather than being swallowed by the runtime's
-// display window.
+// On-device input: DOUBLE-TAP cycles the rendering mode (2D / Anaglyph /
+// Cropped-SBS / Squeezed-SBS / Quad …). MonadoView is FLAG_NOT_FOCUSABLE, so
+// touch events land in this NativeActivity input queue rather than being
+// swallowed by the runtime's display window. Double-tap (not single-tap) is
+// used so the gesture doesn't interfere with a press-drag (which ends in a
+// single pointer-up); absolute switching is still available via
+// `adb shell setprop debug.dxr.mode N`.
 static int32_t
 handle_input(struct android_app *app, AInputEvent *event)
 {
@@ -2063,9 +2272,18 @@ handle_input(struct android_app *app, AInputEvent *event)
 	if (AInputEvent_getType(event) == AINPUT_EVENT_TYPE_MOTION &&
 	    (AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK) ==
 	        AMOTION_EVENT_ACTION_UP) {
-		const bool now = !g_bg_enabled.load(std::memory_order_relaxed);
-		g_bg_enabled.store(now, std::memory_order_relaxed);
-		LOGI("background color %s (tap)", now ? "ON" : "OFF");
+		// Key off the event time (ns) so two taps within ~300 ms count as a
+		// double-tap. A drag produces a single UP and never triggers.
+		const int64_t now_ns = AMotionEvent_getEventTime(event);
+		static int64_t last_up_ns = 0;
+		const int64_t dt = now_ns - last_up_ns;
+		if (last_up_ns != 0 && dt > 0 && dt < 300LL * 1000LL * 1000LL) {
+			LOGI("double-tap → cycle rendering mode");
+			cycle_mode();
+			last_up_ns = 0;  // reset so a triple-tap isn't two cycles
+		} else {
+			last_up_ns = now_ns;
+		}
 		return 1;  // consumed
 	}
 	return 0;
