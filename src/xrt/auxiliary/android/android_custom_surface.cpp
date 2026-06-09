@@ -95,7 +95,12 @@ android_custom_surface_async_start(
 		Context ctx = Context((jobject)context);
 		Context displayContext;
 		int32_t type = 0;
-		// Not focusable
+		// Not focusable. The overlay stays TOUCHABLE on purpose: it sits on top
+		// of the app to present the (weaved) output, and the NativeActivity's own
+		// window gets no touchable frame in this setup — so the overlay is the
+		// only window that can receive touch. MonadoView forwards every touch to
+		// the host Activity's dispatchTouchEvent, letting an in-process app
+		// (e.g. cube_handle_vk_android) drive input from there (#499).
 		int32_t flags =
 		    WindowManager_LayoutParams::FLAG_FULLSCREEN() | WindowManager_LayoutParams::FLAG_NOT_FOCUSABLE();
 

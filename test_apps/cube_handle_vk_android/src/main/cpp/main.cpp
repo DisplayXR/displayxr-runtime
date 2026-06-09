@@ -2380,6 +2380,72 @@ handle_cmd(struct android_app *app, int32_t cmd)
 //     is also available via `adb shell setprop debug.dxr.mode N`.
 // A drag is distinguished from a tap by total pointer travel, so the orbit
 // gesture never trips the mode cycle.
+// Shared touch handler driving the drag-orbit + double-tap-mode-cycle. Called
+// from BOTH the NativeActivity input queue (handle_input) and the Kotlin
+// dispatchTouchEvent bridge (nativeOnTouch) — on this overlay-rendered setup
+// the runtime's display surface sits above the app and the NativeActivity's own
+// input channel gets no touchable frame, so the Kotlin path is what actually
+// delivers touch. action/x are pointer-0 values; action uses the MotionEvent
+// ACTION_* codes (DOWN=0, UP=1, MOVE=2, same as AMOTION_EVENT_ACTION_*).
+// time_ms is the event time in milliseconds (for double-tap timing).
+void
+process_touch_event(int32_t action, float x, float y, int64_t time_ms)
+{
+	static float last_x = 0.0f, last_y = 0.0f;
+	static float moved_px = 0.0f;
+	static int64_t last_up_ms = 0;
+
+	switch (action) {
+	case AMOTION_EVENT_ACTION_DOWN:
+		last_x = x;
+		last_y = y;
+		moved_px = 0.0f;
+		break;
+
+	case AMOTION_EVENT_ACTION_MOVE: {
+		const float dx = x - last_x;
+		const float dy = y - last_y;
+		last_x = x;
+		last_y = y;
+		moved_px += std::fabs(dx) + std::fabs(dy);
+		// ~0.005 rad/px, sign-flipped so the scene tracks the finger (drag the
+		// content, not the camera): drag right → scene rotates right; drag down
+		// → scene tilts down. Pitch clamped to keep the camera off the poles.
+		const float kSens = 0.005f;
+		float yaw = g_cam_yaw.load(std::memory_order_relaxed) - dx * kSens;
+		float pitch = g_cam_pitch.load(std::memory_order_relaxed) - dy * kSens;
+		const float kPitchLimit = 1.2f;
+		if (pitch > kPitchLimit) pitch = kPitchLimit;
+		if (pitch < -kPitchLimit) pitch = -kPitchLimit;
+		g_cam_yaw.store(yaw, std::memory_order_relaxed);
+		g_cam_pitch.store(pitch, std::memory_order_relaxed);
+		break;
+	}
+
+	case AMOTION_EVENT_ACTION_UP: {
+		// A drag (significant travel) never counts as a tap.
+		const float kTapSlopPx = 24.0f;
+		if (moved_px > kTapSlopPx) {
+			last_up_ms = 0;  // a drag breaks any pending double-tap
+			break;
+		}
+		// Two taps within ~300 ms → cycle the rendering mode.
+		const int64_t dt = time_ms - last_up_ms;
+		if (last_up_ms != 0 && dt > 0 && dt < 300) {
+			LOGI("double-tap → cycle rendering mode");
+			cycle_mode();
+			last_up_ms = 0;  // reset so a triple-tap isn't two cycles
+		} else {
+			last_up_ms = time_ms;
+		}
+		break;
+	}
+
+	default:
+		break;
+	}
+}
+
 static int32_t
 handle_input(struct android_app *app, AInputEvent *event)
 {
@@ -2390,62 +2456,9 @@ handle_input(struct android_app *app, AInputEvent *event)
 	const int32_t action = AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK;
 	const float x = AMotionEvent_getX(event, 0);
 	const float y = AMotionEvent_getY(event, 0);
-
-	// Drag-orbit state. moved_px accumulates travel so we can tell a drag
-	// (orbit) from a tap (mode cycle) at pointer-up.
-	static float last_x = 0.0f, last_y = 0.0f;
-	static float moved_px = 0.0f;
-	static int64_t last_up_ns = 0;
-
-	switch (action) {
-	case AMOTION_EVENT_ACTION_DOWN:
-		last_x = x;
-		last_y = y;
-		moved_px = 0.0f;
-		return 1;
-
-	case AMOTION_EVENT_ACTION_MOVE: {
-		const float dx = x - last_x;
-		const float dy = y - last_y;
-		last_x = x;
-		last_y = y;
-		moved_px += std::fabs(dx) + std::fabs(dy);
-		// ~0.005 rad/px. Drag right → orbit right (yaw+); drag down → tilt up.
-		// Pitch clamped to keep the camera off the poles.
-		const float kSens = 0.005f;
-		float yaw = g_cam_yaw.load(std::memory_order_relaxed) + dx * kSens;
-		float pitch = g_cam_pitch.load(std::memory_order_relaxed) + dy * kSens;
-		const float kPitchLimit = 1.2f;
-		if (pitch > kPitchLimit) pitch = kPitchLimit;
-		if (pitch < -kPitchLimit) pitch = -kPitchLimit;
-		g_cam_yaw.store(yaw, std::memory_order_relaxed);
-		g_cam_pitch.store(pitch, std::memory_order_relaxed);
-		return 1;
-	}
-
-	case AMOTION_EVENT_ACTION_UP: {
-		// A drag (significant travel) never counts as a tap.
-		const float kTapSlopPx = 24.0f;
-		if (moved_px > kTapSlopPx) {
-			last_up_ns = 0;  // a drag breaks any pending double-tap
-			return 1;
-		}
-		// Two taps within ~300 ms → cycle the rendering mode.
-		const int64_t now_ns = AMotionEvent_getEventTime(event);
-		const int64_t dt = now_ns - last_up_ns;
-		if (last_up_ns != 0 && dt > 0 && dt < 300LL * 1000LL * 1000LL) {
-			LOGI("double-tap → cycle rendering mode");
-			cycle_mode();
-			last_up_ns = 0;  // reset so a triple-tap isn't two cycles
-		} else {
-			last_up_ns = now_ns;
-		}
-		return 1;
-	}
-
-	default:
-		return 0;
-	}
+	const int64_t time_ms = AMotionEvent_getEventTime(event) / 1000000;  // ns → ms
+	process_touch_event(action, x, y, time_ms);
+	return 1;  // consumed
 }
 
 } // namespace
@@ -2479,6 +2492,17 @@ Java_com_displayxr_cube_1handle_1vk_1android_MainActivity_nativeGetEye(
 // Authoritative device orientation, pushed from MainActivity (onCreate +
 // onConfigurationChanged) since the native window buffer reports a fixed
 // orientation. Drives the orientation-aware HUD rotation + projection aspect.
+// Kotlin dispatchTouchEvent bridge — the reliable touch path on this overlay-
+// rendered setup (the NativeActivity's own input queue gets no touchable frame
+// because the runtime's display surface covers it). action = MotionEvent
+// ACTION_* (DOWN=0/UP=1/MOVE=2); x/y in view pixels; eventTimeMs = getEventTime().
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_cube_1handle_1vk_1android_MainActivity_nativeOnTouch(
+    JNIEnv * /*env*/, jobject /*thiz*/, jint action, jfloat x, jfloat y, jlong eventTimeMs)
+{
+	process_touch_event((int32_t)action, (float)x, (float)y, (int64_t)eventTimeMs);
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_displayxr_cube_1handle_1vk_1android_MainActivity_nativeSetRotation(
     JNIEnv * /*env*/, jobject /*thiz*/, jint rotation)
