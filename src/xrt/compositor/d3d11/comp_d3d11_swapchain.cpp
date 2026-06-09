@@ -368,29 +368,37 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 	if (bind_flags & D3D11_BIND_DEPTH_STENCIL) {
 		is_depth = true;
 
-		// Only promote to TYPELESS when SRV is also requested —
-		// that's the only case D3D11 actually requires it.
-		if (bind_flags & D3D11_BIND_SHADER_RESOURCE) {
-			switch (dxgi_format) {
-			case DXGI_FORMAT_D24_UNORM_S8_UINT:
-				texture_format = DXGI_FORMAT_R24G8_TYPELESS;
-				dsv_format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-				srv_format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-				break;
-			case DXGI_FORMAT_D32_FLOAT:
-				texture_format = DXGI_FORMAT_R32_TYPELESS;
-				dsv_format = DXGI_FORMAT_D32_FLOAT;
-				srv_format = DXGI_FORMAT_R32_FLOAT;
-				break;
-			case DXGI_FORMAT_D16_UNORM:
-				texture_format = DXGI_FORMAT_R16_TYPELESS;
-				dsv_format = DXGI_FORMAT_D16_UNORM;
-				srv_format = DXGI_FORMAT_R16_UNORM;
-				break;
-			default:
-				// Use format as-is for other depth formats
-				break;
-			}
+		// Create depth textures with a TYPELESS format and hand the app a
+		// typeless image, so it can build its own typed DSV/SRV. This matches
+		// the OpenXR D3D11 spec (and the D3D12 native compositor, which already
+		// does this), and is required by the CTS Swapchains format check, which
+		// expects e.g. D24_UNORM_S8_UINT -> R24G8_TYPELESS. The typed
+		// dsv_format/srv_format below are used for the runtime's own views.
+		//
+		// (This restores the original always-typeless behaviour. The previous
+		// "only typeless when SRV requested" variant — #91, c08148c32 — kept
+		// depth typed for a Unity D3D11 path; Unity defaults to D3D12, which has
+		// always created depth typeless without issue, so the typed special-case
+		// is unnecessary and non-conformant.)
+		switch (dxgi_format) {
+		case DXGI_FORMAT_D24_UNORM_S8_UINT:
+			texture_format = DXGI_FORMAT_R24G8_TYPELESS;
+			dsv_format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+			srv_format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+			break;
+		case DXGI_FORMAT_D32_FLOAT:
+			texture_format = DXGI_FORMAT_R32_TYPELESS;
+			dsv_format = DXGI_FORMAT_D32_FLOAT;
+			srv_format = DXGI_FORMAT_R32_FLOAT;
+			break;
+		case DXGI_FORMAT_D16_UNORM:
+			texture_format = DXGI_FORMAT_R16_TYPELESS;
+			dsv_format = DXGI_FORMAT_D16_UNORM;
+			srv_format = DXGI_FORMAT_R16_UNORM;
+			break;
+		default:
+			// Use format as-is for other depth formats
+			break;
 		}
 	}
 
