@@ -10,6 +10,7 @@
 #include "android_globals.h"
 
 #include <stddef.h>
+#include <mutex>
 #include <wrap/android.app.h>
 
 /*!
@@ -22,6 +23,21 @@ static struct
 	jni::Object context = {};
 	struct _ANativeWindow *window = nullptr;
 } android_globals;
+
+/*!
+ * Versioned surface state, mutated from the Java SurfaceView callbacks
+ * (surfaceChanged / surfaceDestroyed on the UI thread) and read from the
+ * compositor render thread — hence its own lock, separate from the (unlocked)
+ * legacy globals above. @ref generation is bumped on every publish/clear so the
+ * consumer can tell a brand-new surface (resume) from the one it already built.
+ */
+static struct
+{
+	std::mutex mutex;
+	struct _ANativeWindow *window = nullptr;
+	uint64_t generation = 0;
+	bool valid = false;
+} android_surface;
 
 void
 android_globals_store_vm_and_activity(struct _JavaVM *vm, void *activity)
@@ -55,12 +71,50 @@ void
 android_globals_store_window(struct _ANativeWindow *window)
 {
 	android_globals.window = window;
+	// Keep the versioned view in sync for legacy callers (IPC service path
+	// seeds the window via this entry point) so the compositor's surface
+	// re-sync sees a valid initial surface too.
+	android_globals_set_window(window);
 }
 
 struct _ANativeWindow *
 android_globals_get_window()
 {
 	return android_globals.window;
+}
+
+void
+android_globals_set_window(struct _ANativeWindow *window)
+{
+	std::lock_guard<std::mutex> lock(android_surface.mutex);
+	android_surface.window = window;
+	android_surface.valid = (window != nullptr);
+	android_surface.generation++;
+}
+
+void
+android_globals_clear_window(void)
+{
+	std::lock_guard<std::mutex> lock(android_surface.mutex);
+	// Keep the pointer (consumer releases it after idling the GPU) but mark it
+	// invalid + bump the generation so the next re-sync tears the surface down.
+	android_surface.valid = false;
+	android_surface.generation++;
+}
+
+void
+android_globals_get_window_state(struct _ANativeWindow **out_window, uint64_t *out_generation, bool *out_valid)
+{
+	std::lock_guard<std::mutex> lock(android_surface.mutex);
+	if (out_window != nullptr) {
+		*out_window = android_surface.window;
+	}
+	if (out_generation != nullptr) {
+		*out_generation = android_surface.generation;
+	}
+	if (out_valid != nullptr) {
+		*out_valid = android_surface.valid;
+	}
 }
 
 struct _JavaVM *
