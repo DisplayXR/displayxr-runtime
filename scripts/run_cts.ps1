@@ -50,6 +50,9 @@ $xrKey  = "HKLM:\Software\Khronos\OpenXR\1"
 $dpKey  = "HKLM:\Software\DisplayXR\DisplayProcessors\$Plugin"
 
 # ---- snapshot ----
+# A clean machine (CI runner with no OpenXR runtime installed) has no Khronos key
+# at all; track that so we can fully undo what we create.
+$xrKeyPreexisted = Test-Path $xrKey
 $origRuntime   = (Get-ItemProperty $xrKey -Name ActiveRuntime -ErrorAction SilentlyContinue).ActiveRuntime
 $origProbe     = $null
 if ($Plugin -ne "none") {
@@ -71,6 +74,7 @@ if ($ConformanceLayer -and $explicitKeyPreexisted) {
 
 try {
   # ---- apply ----
+  if (-not (Test-Path $xrKey)) { New-Item -Path $xrKey -Force | Out-Null }
   Set-ItemProperty $xrKey -Name ActiveRuntime -Value $devManifest -Type String
   if ($Plugin -ne "none") {
     Set-ItemProperty $dpKey -Name ProbeOrder -Value 5 -Type DWord   # below leia-sr (50)
@@ -118,12 +122,11 @@ try {
 }
 finally {
   # ---- restore (always) ----
-  if ($null -ne $origRuntime) {
-    Set-ItemProperty $xrKey -Name ActiveRuntime -Value $origRuntime -Type String
-  }
   if ($Plugin -ne "none" -and $null -ne $origProbe) {
     Set-ItemProperty $dpKey -Name ProbeOrder -Value ([int]$origProbe) -Type DWord
   }
+  # Remove the conformance-layer registrations we added (before any wholesale
+  # key removal below).
   if ($ConformanceLayer -and (Test-Path $explicitKey)) {
     foreach ($lj in $layerJsons) {
       if (-not $preRegistered[$lj]) { Remove-ItemProperty -Path $explicitKey -Name $lj -ErrorAction SilentlyContinue }
@@ -131,9 +134,19 @@ finally {
     if (-not $explicitKeyPreexisted) { Remove-Item -Path $explicitKey -Force -ErrorAction SilentlyContinue }
     Write-Output "RESTORED conformance layer registration removed"
   }
-  Write-Output "RESTORED ActiveRuntime = $((Get-ItemProperty $xrKey -Name ActiveRuntime).ActiveRuntime)"
+  if ($null -ne $origRuntime) {
+    Set-ItemProperty $xrKey -Name ActiveRuntime -Value $origRuntime -Type String
+    Write-Output "RESTORED ActiveRuntime = $((Get-ItemProperty $xrKey -Name ActiveRuntime -ErrorAction SilentlyContinue).ActiveRuntime)"
+  } elseif (-not $xrKeyPreexisted) {
+    # Clean machine: we created the Khronos key — remove it wholesale.
+    Remove-Item -Path $xrKey -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Output "RESTORED ActiveRuntime = (Khronos key removed; did not pre-exist)"
+  } else {
+    Remove-ItemProperty -Path $xrKey -Name ActiveRuntime -ErrorAction SilentlyContinue
+    Write-Output "RESTORED ActiveRuntime = (value removed; did not pre-exist)"
+  }
   if ($Plugin -ne "none") {
-    Write-Output "RESTORED $Plugin ProbeOrder = $((Get-ItemProperty $dpKey -Name ProbeOrder).ProbeOrder)"
+    Write-Output "RESTORED $Plugin ProbeOrder = $((Get-ItemProperty $dpKey -Name ProbeOrder -ErrorAction SilentlyContinue).ProbeOrder)"
   }
 }
 
