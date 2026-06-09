@@ -37,7 +37,7 @@ target_include_directories(native_app_glue PUBLIC
 # OpenXR::openxr_loader IMPORTED target with its headers + libopenxr_loader.so.
 find_package(OpenXR REQUIRED CONFIG)
 
-add_library(cube_handle_vk_android SHARED main.cpp crate_scene.cpp ${CUBE_SHADER_HEADERS})
+add_library(cube_handle_vk_android SHARED main.cpp crate_scene.cpp hud_font.cpp ${CUBE_SHADER_HEADERS})
 target_include_directories(cube_handle_vk_android PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 # stb_image (single-header) for loading the crate JPEGs from the APK assets.

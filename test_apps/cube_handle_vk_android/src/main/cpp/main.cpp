@@ -47,6 +47,7 @@
 // The Wood_Crate textured cube + floor grid (ported from cube_handle_vk_win).
 #include <android/asset_manager.h>
 #include "crate_scene.h"
+#include "hud_font.h"
 
 #define LOG_TAG "cube_handle_vk_android"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -181,6 +182,10 @@ float g_spin_angle = 0.0f;  // render-thread only
 // The crate cube + grid scene, and the APK asset manager it loads textures
 // from (captured in android_main from app->activity->assetManager).
 CrateScene g_scene;
+
+// Crisp antialiased HUD text (stb_truetype atlas). Falls back to the legacy
+// bitmap glyphs if init fails (g_hud_font.ready == false).
+HudFont g_hud_font;
 AAssetManager *g_asset_manager = nullptr;
 
 // XR_EXT_display_info entry points (resolved after the session exists).
@@ -1640,20 +1645,24 @@ build_hud(CubeVertex *v)
 	n = hud_rect(v, n, x0 + r, y0,     x1 - r, y1,     zp, panel);  // full height
 	g_hud_panel_n = n;
 
-	// ── face-position readout: three stacked lines, opaque white, on top.
-	const float px = 0.012f, py = 0.015f;
-	const float zt = 0.045f;  // slightly nearer than the panel → drawn on top
-	const float white[3] = {0.92f, 0.96f, 1.0f};
-	char b[16], line[24];
-	hud_ftoa(g_eye_x.load(std::memory_order_relaxed), b, sizeof b);
-	snprintf(line, sizeof line, "X %s", b);
-	n = hud_text(v, n, line, x0 + 0.035f, -0.775f, px, py, zt, white);
-	hud_ftoa(g_eye_y.load(std::memory_order_relaxed), b, sizeof b);
-	snprintf(line, sizeof line, "Y %s", b);
-	n = hud_text(v, n, line, x0 + 0.035f, -0.695f, px, py, zt, white);
-	hud_ftoa(g_eye_z.load(std::memory_order_relaxed), b, sizeof b);
-	snprintf(line, sizeof line, "Z %s", b);
-	n = hud_text(v, n, line, x0 + 0.035f, -0.615f, px, py, zt, white);
+	// ── face-position readout. When the stb_truetype font is up it draws the
+	// text (crisp, separate pipeline) — see the HUD draw block. Only fall back to
+	// the legacy bitmap glyphs here if the font failed to initialize.
+	if (!g_hud_font.ready) {
+		const float px = 0.012f, py = 0.015f;
+		const float zt = 0.045f;  // slightly nearer than the panel → drawn on top
+		const float white[3] = {0.92f, 0.96f, 1.0f};
+		char b[16], line[24];
+		hud_ftoa(g_eye_x.load(std::memory_order_relaxed), b, sizeof b);
+		snprintf(line, sizeof line, "X %s", b);
+		n = hud_text(v, n, line, x0 + 0.035f, -0.775f, px, py, zt, white);
+		hud_ftoa(g_eye_y.load(std::memory_order_relaxed), b, sizeof b);
+		snprintf(line, sizeof line, "Y %s", b);
+		n = hud_text(v, n, line, x0 + 0.035f, -0.695f, px, py, zt, white);
+		hud_ftoa(g_eye_z.load(std::memory_order_relaxed), b, sizeof b);
+		snprintf(line, sizeof line, "Z %s", b);
+		n = hud_text(v, n, line, x0 + 0.035f, -0.615f, px, py, zt, white);
+	}
 	return n;
 }
 
@@ -1934,6 +1943,18 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 		hud_n = build_hud(reinterpret_cast<CubeVertex *>(g_hud_mapped));
 	}
 
+	// Build the crisp stb_truetype text once per frame (drawn per tile below,
+	// on top of the translucent panel). The panel top-left is (-0.975,-0.800).
+	uint32_t hud_text_n = 0;
+	if (g_hud_font.ready) {
+		char xb[16], yb[16], zb[16], block[80];
+		hud_ftoa(g_eye_x.load(std::memory_order_relaxed), xb, sizeof xb);
+		hud_ftoa(g_eye_y.load(std::memory_order_relaxed), yb, sizeof yb);
+		hud_ftoa(g_eye_z.load(std::memory_order_relaxed), zb, sizeof zb);
+		snprintf(block, sizeof block, "X %s\nY %s\nZ %s", xb, yb, zb);
+		hud_text_n = hud_font_build(g_hud_font, block, -0.945f, -0.775f, 0.0013f, 0.085f);
+	}
+
 	for (uint32_t i = 0; i < view_count; ++i) {
 		// Place this view in its atlas tile (column-major within the grid).
 		const uint32_t tile_x = (cols > 0) ? (i % cols) : 0;
@@ -1994,12 +2015,19 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 				vkCmdSetBlendConstants(cmd, panel_alpha);
 				vkCmdDraw(cmd, g_hud_panel_n, 1, 0, 0);
 			}
-			// Pass 2: opaque text on top.
-			if (hud_n > g_hud_panel_n) {
+			// Pass 2 (fallback only): legacy bitmap text on top, when the
+			// stb_truetype font isn't available.
+			if (!g_hud_font.ready && hud_n > g_hud_panel_n) {
 				const float text_alpha[4] = {0.0f, 0.0f, 0.0f, 1.0f};
 				vkCmdSetBlendConstants(cmd, text_alpha);
 				vkCmdDraw(cmd, hud_n - g_hud_panel_n, 1, g_hud_panel_n, 0);
 			}
+		}
+
+		// Crisp antialiased text on top (its own textured pipeline + atlas).
+		if (g_hud_font.ready && hud_text_n > 0) {
+			const float text_col[4] = {0.92f, 0.96f, 1.0f, 1.0f};
+			hud_font_draw(g_hud_font, cmd, hud_mvp.m, text_col, hud_text_n);
 		}
 	}
 
@@ -2381,6 +2409,7 @@ destroy_instance()
 		vkDeviceWaitIdle(g_vk_device);
 	}
 	destroy_view_framebuffers();
+	hud_font_destroy(g_hud_font);
 	crate_scene_destroy(g_scene);
 	if (g_cube_vbuf != VK_NULL_HANDLE) {
 		vkDestroyBuffer(g_vk_device, g_cube_vbuf, nullptr);
@@ -2436,6 +2465,11 @@ handle_cmd(struct android_app *app, int32_t cmd)
 			    create_view_framebuffers();
 			if (brought_up) {
 				LOGI("Bring-up chain complete; awaiting session state events.");
+				// Optional crisp HUD font (stb_truetype). Non-fatal: on failure
+				// g_hud_font.ready stays false and the HUD falls back to the
+				// legacy bitmap glyphs.
+				hud_font_init(g_hud_font, g_vk_phys_device, g_vk_device, g_vk_queue,
+				              g_vk_queue_family, g_render_pass, 48.0f);
 			} else {
 				LOGW("Bring-up chain failed; see logs above.");
 			}
