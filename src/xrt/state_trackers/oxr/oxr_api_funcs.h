@@ -969,7 +969,8 @@ oxr_xrSubmitMCPToolResultEXT(XrSession session, uint64_t callId, XrBool32 succes
 #endif
 
 // xrSetSharedTextureOutputRectEXT — canvas sub-rect, part of window binding extensions
-#if defined(OXR_HAVE_EXT_win32_window_binding) || defined(OXR_HAVE_EXT_cocoa_window_binding)
+#if defined(OXR_HAVE_EXT_win32_window_binding) || defined(OXR_HAVE_EXT_cocoa_window_binding) || \
+    defined(OXR_HAVE_EXT_android_surface_binding)
 //! OpenXR API function @ep{xrSetSharedTextureOutputRectEXT}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetSharedTextureOutputRectEXT(XrSession session,

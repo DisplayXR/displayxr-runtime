@@ -277,6 +277,11 @@ create_instance(struct android_app *app)
 	    // The graphics-requirements query in this commit needs only this
 	    // extension to be enabled.
 	    XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
+	    // Texture class: enabling this is what makes the runtime hand out
+	    // xrSetSharedTextureOutputRectEXT (gated on the binding extension,
+	    // like win32/cocoa). Without it the canvas sub-rect can't be set and
+	    // the runtime weaves the full image (no 2D surround).
+	    XR_EXT_ANDROID_SURFACE_BINDING_EXTENSION_NAME,
 	};
 
 	XrInstanceCreateInfoAndroidKHR android_info = {};
