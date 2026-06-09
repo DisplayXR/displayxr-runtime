@@ -12,13 +12,38 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
-// NOTE (#499): this app is now CNSDK-free. It exercises the vendor-neutral
-// path — the runtime's vk_native compositor weaving against whatever display
-// processor is installed (sim_display fallback, or the Leia CNSDK plug-in when
-// present). The proprietary CNSDK AAR (sdk-<ver>.aar) and its Java glue were a
-// hard build dependency only because the in-process Leia DP resolves its
-// com.leia.* classes against THIS app's classloader; sim_display needs none of
-// that, so the dependency is dropped to keep the app buildable on any box.
+// CNSDK is OPTIONAL (#499). The app is CNSDK-free by default — the vendor-
+// neutral sim_display fallback needs none of it. But the in-process Leia CNSDK
+// display-processor resolves its com.leia.* classes via FindClass against THIS
+// app's classloader, so when testing against the Leia plug-in the CNSDK Java
+// glue (sdk-<ver>.aar) must be dexed here. Resolve it from `cnsdk.dir` in
+// local.properties (or -PcnsdkDir); if unset / the AAR isn't found, the app
+// builds CNSDK-free. So: no cnsdk.dir → sim_display path; cnsdk.dir set →
+// Leia path.
+def resolveCnsdkDir = {
+    def fromProp = project.findProperty('cnsdkDir') ?: project.findProperty('cnsdk.dir')
+    if (fromProp) {
+        def f = new File(fromProp as String)
+        return (f.isAbsolute() ? f : new File(rootProject.projectDir, fromProp as String)).absolutePath
+    }
+    def lp = new File(rootProject.projectDir, 'local.properties')
+    if (lp.exists()) {
+        def props = new Properties()
+        lp.withReader('UTF-8') { props.load(it) }
+        def d = props.getProperty('cnsdk.dir')
+        if (d) {
+            def f = new File(d)
+            return (f.isAbsolute() ? f : new File(rootProject.projectDir, d)).absolutePath
+        }
+    }
+    return null
+}
+def cnsdkDir = resolveCnsdkDir()
+def cnsdkVersionFile = cnsdkDir ? new File("${cnsdkDir}/VERSION.txt") : null
+def cnsdkVersion = (cnsdkVersionFile?.exists()) ? cnsdkVersionFile.text.trim() : null
+def cnsdkAar = (cnsdkDir && cnsdkVersion) ? new File("${cnsdkDir}/android/sdk-${cnsdkVersion}.aar") : null
+def hasCnsdk = cnsdkAar?.exists()
+println "cube_handle_vk_android: CNSDK glue ${hasCnsdk ? "ENABLED (${cnsdkAar})" : 'disabled (sim_display path)'}"
 
 android {
     namespace 'com.displayxr.cube_handle_vk_android'
@@ -102,6 +127,18 @@ android {
         jniLibs {
             // libopenxr_loader.so ships in the loader AAR; keep it as-is.
             useLegacyPackaging true
+
+            // When the CNSDK AAR is consumed for its Java glue, its bundled
+            // native .so (loader + jni) are EXCLUDED here — they already ship
+            // in the runtime APK's jniLibs (dropped alongside the Leia plug-in)
+            // and are dlopen'd from there. A second copy risks a duplicate load
+            // in this app's linker namespace.
+            if (hasCnsdk) {
+                excludes += [
+                    '**/libleiaCore-loader.so',
+                    '**/libleiaSDK-jni.so',
+                ]
+            }
         }
     }
 }
@@ -114,4 +151,13 @@ dependencies {
     // APK at runtime via the OpenXRRuntimeService intent declared in
     // src/xrt/targets/openxr_android/src/main/AndroidManifest.xml.
     implementation 'org.khronos.openxr:openxr_loader_for_android:1.1.41'
+
+    // CNSDK Java glue — only when testing against the Leia plug-in (cnsdk.dir
+    // set). Provides the com.leia.* classes the in-process CNSDK DP resolves
+    // via FindClass against this app's classloader. Its native .so are excluded
+    // above (they live in the runtime APK).
+    if (hasCnsdk) {
+        implementation files(cnsdkAar)
+        implementation "androidx.annotation:annotation:$androidxAnnotationVersion"
+    }
 }

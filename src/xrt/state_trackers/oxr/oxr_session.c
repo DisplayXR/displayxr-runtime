@@ -284,7 +284,18 @@ oxr_session_get_display_dimensions(struct oxr_session *sess, float *out_width_m,
 #ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
 	// VK native compositor path
 	if (sess->xcn != NULL && sess->is_vk_native_compositor) {
-		return comp_vk_native_compositor_get_display_dimensions(&sess->xcn->base, out_width_m, out_height_m);
+		if (comp_vk_native_compositor_get_display_dimensions(&sess->xcn->base, out_width_m,
+		                                                     out_height_m) &&
+		    *out_width_m > 0.0f && *out_height_m > 0.0f) {
+			return true;
+		}
+		// Fall through to the generic info path (mirrors the Metal branch
+		// above). A vendor DP — e.g. the Leia CNSDK plug-in — may report its
+		// physical size via get_display_info (→ xsysc->info) but return 0 (or
+		// false) from the separate get_display_dimensions hook, and the
+		// compositor's own sys_info copy can be empty. Without this fall-
+		// through the Kooima FOV gets zero screen dims and falls back to a
+		// default symmetric square FOV (#499 — Leia 3D aspect + focus).
 	}
 #endif
 
