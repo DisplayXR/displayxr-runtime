@@ -1602,6 +1602,25 @@ oxr_session_locate_views(struct oxr_logger *log,
 				// eye_offset stays (0,0) — identity behavior
 			}
 
+			// #499 portrait: a vendor DP can report a FIXED (landscape-major)
+			// physical size while the live surface rotates (e.g. the Leia CNSDK
+			// plug-in on the portrait-natural nubia). CNSDK weaves to the panel
+			// in either orientation; the runtime only needs the Kooima FOV
+			// aspect to match the held orientation. So if the live window px
+			// orientation disagrees with the physical-dims orientation, swap the
+			// meters. On Windows/macOS the window-metrics meters already track
+			// orientation, so this is a no-op there.
+			if (have_wm && wm.window_pixel_width > 0 && wm.window_pixel_height > 0 &&
+			    screen_width_m > 0.0f && screen_height_m > 0.0f) {
+				bool win_landscape = wm.window_pixel_width >= wm.window_pixel_height;
+				bool dims_landscape = screen_width_m >= screen_height_m;
+				if (win_landscape != dims_landscape) {
+					float tmp = screen_width_m;
+					screen_width_m = screen_height_m;
+					screen_height_m = tmp;
+				}
+			}
+
 #ifdef OXR_HAVE_EXT_view_rig
 			// XR_EXT_view_rig raw channel: the effective canvas + display
 			// plane — exactly the input set the rig math below consumes.

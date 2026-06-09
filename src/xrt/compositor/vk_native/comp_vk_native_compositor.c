@@ -3464,8 +3464,33 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	}
 	return false;
 #else
-	(void)c;
-	return false;
+	// Android: report the LIVE (orientation-aware) target surface extent in
+	// pixels. The physical panel meters live in the runtime's xsysc->info (the
+	// DP's get_display_dimensions is unreliable here — it can return 0), so we
+	// populate pixels only and leave meters 0; the Kooima maps the physical
+	// dims to this orientation (#499 portrait aspect). CNSDK weaves to the panel
+	// regardless of orientation, so we only need the right aspect into Kooima.
+	if (c->target == NULL) {
+		return false;
+	}
+	uint32_t win_px_w = 0, win_px_h = 0;
+	comp_vk_native_target_get_dimensions(c->target, &win_px_w, &win_px_h);
+	if (win_px_w == 0 || win_px_h == 0) {
+		return false;
+	}
+	out_metrics->window_pixel_width = win_px_w;
+	out_metrics->window_pixel_height = win_px_h;
+	out_metrics->display_pixel_width = win_px_w;   // fullscreen: window == display
+	out_metrics->display_pixel_height = win_px_h;
+	out_metrics->window_screen_left = 0;
+	out_metrics->window_screen_top = 0;
+	out_metrics->display_screen_left = 0;
+	out_metrics->display_screen_top = 0;
+	out_metrics->window_orientation = (struct xrt_quat){0, 0, 0, 1};
+	// Meters left 0 (see above) — the caller derives them from xsysc->info.
+	out_metrics->valid = true;
+	u_canvas_apply_to_metrics(out_metrics, &c->canvas);
+	return true;
 #endif
 }
 
