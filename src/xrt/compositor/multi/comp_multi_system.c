@@ -1453,11 +1453,22 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 
 	uint32_t old_image_count = mc->session_render.buffer_count;
 
-	// 2. Recreate swapchain images (queries new surface extent internally)
+	// 2. Recreate swapchain images (queries new surface extent internally).
+	// Request the SAME format the target already settled on at init
+	// (ct->format) rather than a hardcoded one: the per-session render pass +
+	// framebuffers were built for that format, and a resize/rotation must not
+	// change it. Hardcoding VK_FORMAT_B8G8R8A8_SRGB broke live rotation on
+	// Android (#510) — that surface only exposes R8G8B8A8_*, so the init's
+	// 4-format fallback (null_compositor.c) picks R8G8B8A8_UNORM, but the
+	// recreate then failed find_surface_format → VK_ERROR_INITIALIZATION_FAILED
+	// → every acquire failed → compositor froze on the last frame. Fall back to
+	// the init's preferred only if the target has no format yet (never on the
+	// recreate path, but keeps the request well-formed).
+	VkFormat keep_format = (ct->format != VK_FORMAT_UNDEFINED) ? ct->format : VK_FORMAT_B8G8R8A8_SRGB;
 	struct comp_target_create_images_info info = {
 	    .image_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
 	    .format_count = 1,
-	    .formats = {VK_FORMAT_B8G8R8A8_SRGB},
+	    .formats = {keep_format},
 	    .extent = {ct->width, ct->height}, // Will be overridden by surface caps
 	    .color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
 	    .present_mode = VK_PRESENT_MODE_FIFO_KHR,
