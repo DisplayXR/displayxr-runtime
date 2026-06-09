@@ -63,8 +63,9 @@ struct os_display_edid_list
 	// Diagnostic fields (set on both success and failure for debugging)
 	enum os_edid_diag_error diag_error; //!< What went wrong (0 = OK)
 	uint32_t diag_gdi_count;            //!< Number of GDI monitors found
-	uint32_t diag_setupdi_count;        //!< Number of SetupDi devices with EDID
+	uint32_t diag_setupdi_count;        //!< Number of SetupDi monitor devices enumerated
 	uint32_t diag_edid_read_count;      //!< Number of EDID blobs successfully read
+	uint32_t diag_displayconfig_count;  //!< Monitors recovered via the DisplayConfig fallback
 	uint32_t diag_win32_error;          //!< GetLastError() value if SetupDi failed
 	char diag_gdi_device_ids[OS_DISPLAY_EDID_MAX_MONITORS][256]; //!< GDI device ID strings
 };
