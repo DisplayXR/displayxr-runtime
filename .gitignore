@@ -139,3 +139,7 @@ shell_capture*.png
 # The canonical store is org-level GitHub Actions secrets; this dir is
 # just a local backup / working copy. NEVER commit its contents.
 .secrets/
+
+# Leia CNSDK plug-in binaries dropped into the runtime APK jniLibs by
+# displayxr-leia-plugin's build-android.sh (vendor build artifacts, #499).
+src/xrt/targets/openxr_android/src/main/jniLibs/
