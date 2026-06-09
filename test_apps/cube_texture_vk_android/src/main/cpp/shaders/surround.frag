@@ -19,34 +19,8 @@ layout(location = 0) in vec2 vUV;
 layout(location = 0) out vec4 outColor;
 
 void main() {
-    vec2 p = gl_FragCoord.xy;
-    if (p.x >= pc.windowSize.x || p.y >= pc.windowSize.y) {
-        outColor = vec4(0.0, 0.0, 0.0, 1.0);
-        return;
-    }
-    float bx0 = float(pc.canvas.x);
-    float by0 = float(pc.canvas.y);
-    float bx1 = float(pc.canvas.x + pc.canvas.z);
-    float by1 = float(pc.canvas.y + pc.canvas.w);
-    float dx = max(bx0 - p.x, p.x - bx1);
-    float dy = max(by0 - p.y, p.y - by1);
-    float d  = max(dx, dy);   // < 0 inside canvas, > 0 outside
-    if (d <= 0.0) {
-        outColor = vec4(0.0, 0.0, 0.0, 1.0);
-        return;
-    }
-    if (d <= 4.0) {
-        outColor = vec4(1.0, 0.25, 0.25, 1.0);  // bright canvas border
-        return;
-    }
-    ivec2 cell = ivec2(p / 24.0);
-    bool light = ((cell.x + cell.y) & 1) == 0;
-    vec3 base = light ? vec3(0.82, 0.84, 0.92) : vec3(0.50, 0.55, 0.80);
-    vec2 g = clamp(p / pc.windowSize, 0.0, 1.0);
-    base.r += g.x * 0.18;
-    base.g += g.y * 0.10;
-    base.b += (1.0 - g.x) * 0.10;
-    float sweep = fract((p.x + p.y) / 256.0 - pc.time * 0.10);
-    base += (smoothstep(0.45, 0.5, sweep) - smoothstep(0.5, 0.55, sweep)) * 0.10;
-    outColor = vec4(clamp(base, 0.0, 1.0), 1.0);
+    // Checkerboard surround removed — plain solid black so only the textured
+    // cube (woven into the canvas, blitted over this) shows. canvas/windowSize
+    // kept in the push-constant layout for parity with the C++ side.
+    outColor = vec4(0.0, 0.0, 0.0, 1.0);
 }
