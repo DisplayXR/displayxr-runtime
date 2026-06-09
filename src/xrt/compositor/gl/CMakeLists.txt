@@ -41,7 +41,11 @@ endif()
 
 # Platform-specific linking
 if(WIN32)
-	target_link_libraries(comp_gl PRIVATE opengl32 d3d11 comp_win32_window)
+	# dxgi/dcomp/d3dcompiler: transparent-background present path
+	# (CreateSwapChainForComposition + DirectComposition + inline blit shader).
+	target_link_libraries(
+		comp_gl PRIVATE opengl32 d3d11 dxgi dcomp d3dcompiler comp_win32_window
+		)
 elseif(APPLE)
 	target_link_libraries(comp_gl PRIVATE "-framework OpenGL" "-framework Cocoa" "-framework IOSurface")
 endif()

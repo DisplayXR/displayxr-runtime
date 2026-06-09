@@ -48,6 +48,19 @@ static XrSessionManager* g_xr = nullptr;
 static UINT g_windowWidth = 1280;
 static UINT g_windowHeight = 720;
 
+// Set DISPLAYXR_TRANSPARENT_BG=1 in the environment to opt into transparent
+// desktop composition: the HWND is created with WS_EX_NOREDIRECTIONBITMAP +
+// null background brush, the cube clears RGBA(0,0,0,0), and the win32 window
+// binding asks the runtime to present through DComp so per-pixel alpha composes
+// against the desktop.
+static bool TransparentBackgroundEnabled() {
+    static const bool e = []() {
+        const char *v = getenv("DISPLAYXR_TRANSPARENT_BG");
+        return v != nullptr && *v != '\0' && *v != '0';
+    }();
+    return e;
+}
+
 // #439 Phase 3 — handle + mask + Local2D layer modes (§8 cases 2/3/4), GL leg.
 // DXR_LOCAL2D_PANEL=1 (case 3, implicit mask) / +DXR_LOCAL2D_MASK=1 (case 2,
 // explicit Tier-2 island mask) / +DXR_LOCAL2D_PANEL2=1 (case 4, second
@@ -237,13 +250,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     LOG_INFO("Creating application window (%dx%d)", width, height);
 
+    const bool transparent = TransparentBackgroundEnabled();
+
     WNDCLASSEX wc = {};
     wc.cbSize = sizeof(WNDCLASSEX);
     wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS | CS_OWNDC;
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    // For transparent backgrounds the HWND must NOT have a redirection bitmap
+    // and must NOT have a background brush — DComp's per-pixel alpha-out
+    // composes through to the desktop only when both are absent.
+    wc.hbrBackground = transparent ? nullptr : (HBRUSH)GetStockObject(BLACK_BRUSH);
     wc.lpszClassName = WINDOW_CLASS;
 
     if (!RegisterClassEx(&wc)) {
@@ -257,7 +275,8 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     RECT rect = { 0, 0, width, height };
     AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
 
-    HWND hwnd = CreateWindowEx(0, WINDOW_CLASS, WINDOW_TITLE, WS_OVERLAPPEDWINDOW,
+    DWORD exStyle = transparent ? WS_EX_NOREDIRECTIONBITMAP : 0;
+    HWND hwnd = CreateWindowEx(exStyle, WINDOW_CLASS, WINDOW_TITLE, WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         rect.right - rect.left, rect.bottom - rect.top,
         nullptr, nullptr, hInstance, nullptr);
@@ -1034,14 +1053,22 @@ static void RenderThreadFunc(
                     float fracW = HUD_WIDTH_FRACTION;
                     float fracH = fracW * windowAR / hudAR;
                     if (fracH > 1.0f) { fracH = 1.0f; fracW = hudAR / windowAR; }
+                    XrCompositionLayerFlags projLayerFlags = TransparentBackgroundEnabled()
+                        ? XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
+                        : 0;
                     if (!EndFrameWithWindowSpaceHud(*xr, frameState.predictedDisplayTime, projectionViews.data(),
-                        0.0f, 0.0f, fracW, fracH, 0.0f, submitViewCount)) {
+                        0.0f, 0.0f, fracW, fracH, 0.0f, submitViewCount,
+                        0, 0, -1, -1, projLayerFlags)) {
                         LOG_WARN("[Frame] EndFrameWithWindowSpaceHud FAILED — disabling HUD for this session");
                         hud = nullptr;  // Disable HUD for subsequent frames
                     }
                     LOG_DEBUG("[Frame] EndFrame with HUD returned");
                 } else {
-                    EndFrame(*xr, frameState.predictedDisplayTime, projectionViews.data(), submitViewCount);
+                    XrCompositionLayerFlags projLayerFlags = TransparentBackgroundEnabled()
+                        ? XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
+                        : 0;
+                    EndFrame(*xr, frameState.predictedDisplayTime, projectionViews.data(),
+                             submitViewCount, projLayerFlags);
                 }
                 g_l2dFrameCounter++;
             }
