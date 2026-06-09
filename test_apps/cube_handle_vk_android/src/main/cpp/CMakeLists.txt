@@ -37,8 +37,13 @@ target_include_directories(native_app_glue PUBLIC
 # OpenXR::openxr_loader IMPORTED target with its headers + libopenxr_loader.so.
 find_package(OpenXR REQUIRED CONFIG)
 
-add_library(cube_handle_vk_android SHARED main.cpp ${CUBE_SHADER_HEADERS})
+add_library(cube_handle_vk_android SHARED main.cpp crate_scene.cpp ${CUBE_SHADER_HEADERS})
 target_include_directories(cube_handle_vk_android PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
+# stb_image (single-header) for loading the crate JPEGs from the APK assets.
+# Path: src/main/cpp → repo root is five levels up.
+target_include_directories(cube_handle_vk_android PRIVATE
+    "${CMAKE_SOURCE_DIR}/../../../../../src/external/stb")
 
 # DisplayXR's in-tree OpenXR headers provide the custom XR_EXT_* extensions
 # (XR_EXT_display_info etc.) the loader AAR's stock headers don't ship. Placed

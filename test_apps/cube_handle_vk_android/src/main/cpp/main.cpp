@@ -44,6 +44,10 @@
 #include "shaders/cube.vert.h"
 #include "shaders/cube.frag.h"
 
+// The Wood_Crate textured cube + floor grid (ported from cube_handle_vk_win).
+#include <android/asset_manager.h>
+#include "crate_scene.h"
+
 #define LOG_TAG "cube_handle_vk_android"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
@@ -165,6 +169,11 @@ constexpr float kRigVirtualDisplayHeight = 0.24f;
 // Default 0 → identity rig (viewer square-on to the virtual display plane).
 std::atomic<float> g_cam_yaw{0.0f};
 std::atomic<float> g_cam_pitch{0.0f};
+
+// The crate cube + grid scene, and the APK asset manager it loads textures
+// from (captured in android_main from app->activity->assetManager).
+CrateScene g_scene;
+AAssetManager *g_asset_manager = nullptr;
 
 // XR_EXT_display_info entry points (resolved after the session exists).
 PFN_xrEnumerateDisplayRenderingModesEXT g_pfnEnumModes = nullptr;
@@ -944,6 +953,15 @@ create_reference_space()
 	XrResult res = xrCreateReferenceSpace(g_session, &ci, &g_app_space);
 	log_xr_result("xrCreateReferenceSpace(LOCAL)", res);
 	return res == XR_SUCCESS;
+}
+
+// Initialize the crate cube + grid scene (pipelines, geometry, textures). Runs
+// after the render pass exists (the scene pipelines compile against it).
+bool
+create_scene()
+{
+	return crate_scene_init(g_scene, g_vk_device, g_vk_phys_device, g_vk_queue, g_vk_queue_family,
+	                        g_render_pass, g_asset_manager);
 }
 
 // Standalone command pool for the test app's per-frame cmd buffers.
@@ -1796,10 +1814,13 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	vkBeginCommandBuffer(cmd, &bi);
 
-	// LOAD_OP_CLEAR blacks the WHOLE atlas (every tile) once at render-pass
-	// begin, so the weave/3D is judged against a clean black field.
+	// LOAD_OP_CLEAR fills the WHOLE atlas (every tile) once at render-pass
+	// begin. Dark blue, matching cube_handle_vk_win's scene background.
 	VkClearValue clears[2] = {};
-	clears[0].color.float32[3] = 1.0f;  // opaque black
+	clears[0].color.float32[0] = 0.05f;
+	clears[0].color.float32[1] = 0.05f;
+	clears[0].color.float32[2] = 0.25f;
+	clears[0].color.float32[3] = 1.0f;
 	clears[1].depthStencil.depth = 1.0f;
 
 	VkRenderPassBeginInfo rpbi = {};
@@ -1812,8 +1833,6 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 	rpbi.pClearValues = clears;
 	vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
-	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline);
-
 	// CANONICAL render (CNSDK model): the app draws its source views in the
 	// natural orientation and applies NO per-orientation compensation. Device
 	// rotation is the weaver/DP's job (the Leia interlacer rotates the weave
@@ -1821,6 +1840,32 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 	// app-side aspect_mult / yscale / HUD-rotation knobs were the wrong layer
 	// and are gone. Projection comes from the runtime via XR_EXT_view_rig.
 	const float rig_vh = kRigVirtualDisplayHeight;  // scaleFactor = 1.0
+
+	// Scene model matrices (tile-independent — only view/proj vary per tile).
+	// Cube: unit cube → 0.06 m, spun about Y, base resting on the grid (centre
+	// lifted to y = 0.03). Grid: scaled 0.05 and lifted so its y=-1 line plane
+	// sits at the floor (y = 0). Column-major (M·v). Mirrors RenderScene() in
+	// cube_handle_vk_win.
+	const float angle = (float)g_frame_count * 0.02f;
+	const float ca = std::cos(angle), sa = std::sin(angle);
+	Mat4 cube_rot = mat4_identity();
+	cube_rot.m[0] = ca;  cube_rot.m[2] = -sa;
+	cube_rot.m[8] = sa;  cube_rot.m[10] = ca;
+	const float kCubeSize = 0.06f;
+	Mat4 cube_scale = mat4_identity();
+	cube_scale.m[0] = cube_scale.m[5] = cube_scale.m[10] = kCubeSize;
+	Mat4 cube_trans = mat4_identity();
+	cube_trans.m[13] = kCubeSize * 0.5f;  // base on the grid floor
+	const Mat4 cube_model = mat4_mul(cube_trans, mat4_mul(cube_scale, cube_rot));
+	const Mat4 cube_model_normals = mat4_mul(cube_scale, cube_rot);  // for lighting
+
+	const float kGridScale = 0.05f;
+	Mat4 grid_scale = mat4_identity();
+	grid_scale.m[0] = grid_scale.m[5] = grid_scale.m[10] = kGridScale;
+	Mat4 grid_trans = mat4_identity();
+	grid_trans.m[13] = kGridScale;  // lift the y=-1 plane to y=0
+	const Mat4 grid_world = mat4_mul(grid_trans, grid_scale);
+	const float grid_color[4] = {0.3f, 0.3f, 0.35f, 1.0f};
 
 	// Build the HUD geometry ONCE (identical in every tile) — rebuilding it
 	// into the persistently-mapped buffer mid-pass would be a write-while-read
@@ -1831,8 +1876,6 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 	if (hud_ok) {
 		hud_n = build_hud(reinterpret_cast<CubeVertex *>(g_hud_mapped));
 	}
-
-	const Mat4 model = cube_model_matrix((float)g_frame_count * 0.02f);
 
 	for (uint32_t i = 0; i < view_count; ++i) {
 		// Place this view in its atlas tile (column-major within the grid).
@@ -1871,16 +1914,19 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 		float far_z = ez + 1000.0f * rig_vh;
 		const Mat4 proj_mat = projection_matrix_from_fov(view.fov, -1.0f, near_z, far_z);
 		const Mat4 view_proj = mat4_mul(proj_mat, view_mat);
-		const Mat4 mvp = mat4_mul(view_proj, model);
-		vkCmdPushConstants(cmd, g_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(mvp), &mvp);
 
-		VkDeviceSize vb_offset = 0;
-		vkCmdBindVertexBuffers(cmd, 0, 1, &g_cube_vbuf, &vb_offset);
-		vkCmdDraw(cmd, kCubeVertexCount, 1, 0, 0);
+		// Floor grid, then the textured crate cube (each binds its own
+		// pipeline). Depth test resolves occlusion; the grid is behind/below.
+		const Mat4 grid_mvp = mat4_mul(view_proj, grid_world);
+		crate_scene_draw_grid(g_scene, cmd, grid_mvp.m, grid_color);
+		const Mat4 cube_mvp = mat4_mul(view_proj, cube_model);
+		crate_scene_draw_cube(g_scene, cmd, cube_mvp.m, cube_model_normals.m);
 
-		// In-frame HUD over the cube in this tile (identity-ish MVP → screen-
-		// space NDC; zero disparity so it sits at the screen plane).
+		// In-frame HUD over the scene in this tile (identity MVP → screen-space
+		// NDC; zero disparity so it sits at the screen plane). Uses the app's
+		// simple pos+color pipeline, re-bound here after the scene pipelines.
 		if (hud_ok && hud_n > 0) {
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline);
 			vkCmdPushConstants(cmd, g_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
 			                   sizeof(hud_mvp), &hud_mvp);
 			VkDeviceSize hud_off = 0;
@@ -2230,6 +2276,7 @@ destroy_instance()
 		vkDeviceWaitIdle(g_vk_device);
 	}
 	destroy_view_framebuffers();
+	crate_scene_destroy(g_scene);
 	if (g_cube_vbuf != VK_NULL_HANDLE) {
 		vkDestroyBuffer(g_vk_device, g_cube_vbuf, nullptr);
 		g_cube_vbuf = VK_NULL_HANDLE;
@@ -2278,6 +2325,7 @@ handle_cmd(struct android_app *app, int32_t cmd)
 			    create_cmd_pool() &&
 			    create_render_pass() &&
 			    create_pipeline() &&
+			    create_scene() &&
 			    create_cube_vertex_buffer() &&
 			    create_hud_buffer() &&
 			    create_view_framebuffers();
@@ -2402,6 +2450,8 @@ android_main(struct android_app *app)
 	           (void *)app->activity->vm);
 	app->onAppCmd = handle_cmd;
 	app->onInputEvent = handle_input;
+	// Captured for crate_scene texture loading from the APK assets.
+	g_asset_manager = app->activity->assetManager;
 
 	if (!initialize_loader(app)) {
 		LOGE("OpenXR loader init failed; the loop continues but no XR calls will work");
