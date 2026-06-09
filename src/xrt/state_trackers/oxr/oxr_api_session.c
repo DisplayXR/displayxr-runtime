@@ -15,6 +15,8 @@
 #include "math/m_space.h"
 #include "xrt/xrt_compiler.h"
 
+#include "os/os_threading.h"
+
 #include "util/u_debug.h"
 #include "util/u_trace_marker.h"
 
@@ -74,12 +76,14 @@ oxr_xrCreateSession(XrInstance instance, const XrSessionCreateInfo *createInfo, 
 
 	*out_session = oxr_session_to_openxr(sess);
 
-	/* Add to session list */
+	/* Add to session list (under lock — concurrent with poll/destroy). */
+	os_mutex_lock(&inst->sessions_mutex);
 	link = &inst->sessions;
 	while (*link) {
 		link = &(*link)->next;
 	}
 	*link = sess;
+	os_mutex_unlock(&inst->sessions_mutex);
 
 	return XR_SUCCESS;
 }
@@ -95,13 +99,17 @@ oxr_xrDestroySession(XrSession session)
 	struct oxr_logger log;
 	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrDestroySession");
 
-	/* Remove from session list */
+	/* Remove from the session list under lock BEFORE freeing the session, so a
+	 * concurrent oxr_poll_event walk never reaches a freed session. The actual
+	 * teardown runs outside the lock — once unlinked, no walker can reach it. */
 	inst = sess->sys->inst;
+	os_mutex_lock(&inst->sessions_mutex);
 	link = &inst->sessions;
 	while (*link != sess) {
 		link = &(*link)->next;
 	}
 	*link = sess->next;
+	os_mutex_unlock(&inst->sessions_mutex);
 
 	return oxr_handle_destroy(&log, &sess->handle);
 }

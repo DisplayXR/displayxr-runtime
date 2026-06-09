@@ -2083,6 +2083,13 @@ struct oxr_instance
 
 	struct oxr_session *sessions;
 
+	//! Guards the @ref sessions linked list. xrCreateSession appends,
+	//! xrDestroySession unlinks, and oxr_poll_event walks it — the CTS
+	//! multithreading test does all three concurrently, so the walk must not
+	//! race a concurrent unlink+free (heap corruption). Held across the
+	//! per-session poll, which is non-blocking on this path.
+	struct os_mutex sessions_mutex;
+
 	struct
 	{
 
