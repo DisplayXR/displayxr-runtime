@@ -600,23 +600,35 @@ oxr_event_remove_session_events(struct oxr_logger *log, struct oxr_session *sess
 
 	lock(inst);
 
+	// Walk the queue removing this session's events, keeping `prev` pointed at
+	// the last KEPT node so the list is correctly relinked. The old code only
+	// fixed event.next/last and never updated the predecessor's ->next, so
+	// removing a *middle* event left a dangling ->next to freed memory — a later
+	// walk/pop then read a freed-and-reused node (use-after-free). The CTS
+	// multithreading test intersperses events from rapid session create/destroy,
+	// so it routinely removes middle events and hit this.
+	struct oxr_event *prev = NULL;
 	struct oxr_event *e = inst->event.next;
 	while (e != NULL) {
 		struct oxr_event *cur = e;
 		e = e->next;
 
 		if (!is_session_link_to_event(cur, session)) {
+			prev = cur;
 			continue;
 		}
 
-		if (cur == inst->event.next) {
+		// Unlink cur from the list.
+		if (prev != NULL) {
+			prev->next = cur->next;
+		} else {
 			inst->event.next = cur->next;
 		}
-
 		if (cur == inst->event.last) {
-			inst->event.last = NULL;
+			inst->event.last = prev;
 		}
 		free(cur);
+		// prev stays the same — cur is gone.
 	}
 
 	unlock(inst);
