@@ -21,7 +21,7 @@ android {
         minSdkVersion 26
         targetSdkVersion project.sharedTargetSdk
 
-        def defaultServiceLibName = "monado-service"
+        def defaultServiceLibName = "displayxr-service"
         def serviceLibName = project.hasProperty("serviceLibName") ?
             project.serviceLibName : defaultServiceLibName
         if (serviceLibName == null || serviceLibName.length() == 0) {

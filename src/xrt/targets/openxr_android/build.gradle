@@ -294,7 +294,7 @@ android {
             dimension 'deployment'
             applicationIdSuffix '.out_of_process'
             externalNativeBuild.cmake.arguments += "-DXRT_FEATURE_SERVICE=ON"
-            externalNativeBuild.cmake.targets "openxr_displayxr", "monado-service", "drv_sim_display_plugin"
+            externalNativeBuild.cmake.targets "openxr_displayxr", "displayxr-service", "drv_sim_display_plugin"
 
             buildConfigField "boolean", "inProcess", "false"
             resValue "string", "app_name", "DisplayXR"
