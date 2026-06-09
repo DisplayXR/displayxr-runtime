@@ -1,0 +1,151 @@
+// Copyright 2026, Leia Inc.
+// SPDX-License-Identifier: BSL-1.0
+//
+// Android test app for the CNSDK POC. Links the Khronos OpenXR loader
+// (from the openxr_loader_for_android .aar) so the app can call
+// xrCreateInstance and bind to our runtime APK via the
+// org.khronos.openxr.OpenXRRuntimeService intent. Vulkan instance/device
+// + cube renderer + session land in follow-up commits.
+
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+// Resolve the CNSDK directory the same way the CNSDK samples do: a
+// `cnsdk.dir` entry in local.properties (absolute, or relative to the
+// repo root), overridable with -PcnsdkDir, else the sibling cnsdk/
+// checkout this repo's Android tooling defaults to.
+def resolveCnsdkDir = {
+    def fromProp = project.findProperty('cnsdkDir') ?: project.findProperty('cnsdk.dir')
+    if (fromProp) {
+        def f = new File(fromProp as String)
+        return (f.isAbsolute() ? f : new File(rootProject.projectDir, fromProp as String)).absolutePath
+    }
+    def lp = new File(rootProject.projectDir, 'local.properties')
+    if (lp.exists()) {
+        def props = new Properties()
+        lp.withReader('UTF-8') { props.load(it) }
+        def d = props.getProperty('cnsdk.dir')
+        if (d) {
+            def f = new File(d)
+            return (f.isAbsolute() ? f : new File(rootProject.projectDir, d)).absolutePath
+        }
+    }
+    return new File(rootProject.projectDir, 'cnsdk').absolutePath
+}
+def cnsdkDir = resolveCnsdkDir()
+def cnsdkVersionFile = new File("${cnsdkDir}/VERSION.txt")
+def cnsdkVersion = cnsdkVersionFile.exists() ? cnsdkVersionFile.text.trim() : '0.7.28'
+
+android {
+    namespace 'com.displayxr.cube_texture_vk_android'
+    compileSdk project.sharedCompileSdk
+    buildToolsVersion = buildToolsVersion
+
+    ndkVersion "${ndk_version}"
+
+    // prefab consumes native libs + headers from .aar dependencies;
+    // needed to pick up libopenxr_loader.so + the openxr/openxr.h
+    // headers from openxr_loader_for_android via find_package(OpenXR).
+    buildFeatures {
+        prefab true
+    }
+
+    defaultConfig {
+        applicationId 'com.displayxr.cube_texture_vk_android'
+        minSdkVersion project.sharedMinSdk
+        targetSdkVersion project.sharedTargetSdk
+        versionCode 1
+        versionName "0.1"
+
+        externalNativeBuild {
+            cmake {
+                arguments "-DANDROID_PLATFORM=${project.sharedMinSdk}",
+                    "-DANDROID_STL=c++_shared",
+                    "-DANDROID_ARM_NEON=TRUE"
+            }
+        }
+
+        //noinspection ChromeOsAbiSupport
+        ndk { abiFilters 'arm64-v8a' }
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+            debuggable true
+            jniDebuggable true
+
+            // Mirror the runtime APK: verbose XR/Vulkan-call logging for
+            // the test app's debug build only. Compiled out in release.
+            externalNativeBuild {
+                cmake {
+                    cppFlags '-DXRT_DEBUG_ANDROID_VERBOSE'
+                    cFlags '-DXRT_DEBUG_ANDROID_VERBOSE'
+                }
+            }
+        }
+        release {
+            minifyEnabled false
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "${cmake_version}"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = JavaVersion.VERSION_17
+    }
+
+    packagingOptions {
+        jniLibs {
+            // libopenxr_loader.so ships in the AAR; keep it as-is
+            useLegacyPackaging true
+
+            // The CNSDK 0.10.x AAR (added below for its Java classes.jar +
+            // service-bind manifest — HW-2b/HW-2c) also carries the loader +
+            // jni .so. They already ship in the runtime APK's jniLibs and are
+            // dlopen'd from there by absolute path (preload, #333). Excluding
+            // the AAR's copies keeps a single, namespace-consistent instance
+            // in this process — a second copy risks a duplicate load in the
+            // test app's own linker namespace.
+            excludes += [
+                '**/libleiaCore-loader.so',
+                '**/libleiaSDK-jni.so',
+            ]
+        }
+    }
+}
+
+dependencies {
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlinVersion"
+
+    // Khronos OpenXR loader for Android — bundles libopenxr_loader.so +
+    // openxr/*.h headers via prefab. The loader discovers our runtime
+    // APK at runtime via the OpenXRRuntimeService intent declared in
+    // src/xrt/targets/openxr_android/src/main/AndroidManifest.xml.
+    implementation 'org.khronos.openxr:openxr_loader_for_android:1.1.41'
+
+    // CNSDK Java glue (faceTrackingService variant — HW-2c). This app's
+    // process hosts the in-process runtime + Leia DP plug-in, so CNSDK's
+    // native RegisterNativeLibraryJniMethods resolves its com.leia.* classes
+    // via FindClass against THIS app's classloader — they must be dexed here
+    // (HW-2b: without this, leia_core_init_async fails FindClass -2 and the
+    // DP never comes up). The service variant's Java also brings the
+    // head-tracking-service connection glue + manifest <queries>/permissions
+    // needed to bind the device's Leia tracking service. We consume the whole
+    // AAR for its classes.jar + resources + manifest; its native .so is
+    // excluded above (it lives in the runtime APK).
+    implementation files("${cnsdkDir}/android/sdk-${cnsdkVersion}.aar")
+    implementation "androidx.annotation:annotation:$androidxAnnotationVersion"
+}
