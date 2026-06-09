@@ -1,7 +1,7 @@
 // Copyright 2026, Leia Inc.
 // SPDX-License-Identifier: BSL-1.0
 //
-// cube_handle_vk_android entry point. Wires the Khronos OpenXR loader
+// cube_texture_vk_android entry point. Wires the Khronos OpenXR loader
 // (`xrInitializeLoaderKHR` + `xrCreateInstance`) and logs the runtime
 // the loader binds to. No Vulkan / session / cube renderer yet — that
 // lands in follow-up commits. The point of this step is to prove the
@@ -13,12 +13,18 @@
 
 #define XR_USE_PLATFORM_ANDROID
 #define XR_USE_GRAPHICS_API_VULKAN
+// VK_USE_PLATFORM_ANDROID_KHR pulls in vulkan_android.h
+// (VkAndroidSurfaceCreateInfoKHR + vkCreateAndroidSurfaceKHR) — the texture
+// app creates + presents its OWN swapchain on the Activity's ANativeWindow.
+#define VK_USE_PLATFORM_ANDROID_KHR
 // openxr_platform.h references VkInstance / VkDevice / VkFormat under
 // XR_USE_GRAPHICS_API_VULKAN but does NOT include <vulkan/vulkan.h>
 // itself — the consumer must do that first.
 #include <vulkan/vulkan.h>
+#include <android/native_window.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
+#include <openxr/XR_EXT_android_surface_binding.h>
 
 #include <atomic>
 #include <cmath>
@@ -36,7 +42,7 @@
 #include "shaders/cube.vert.h"
 #include "shaders/cube.frag.h"
 
-#define LOG_TAG "cube_handle_vk_android"
+#define LOG_TAG "cube_texture_vk_android"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -152,6 +158,45 @@ std::atomic<float> g_eye_z{0.0f};
 VkFormat g_swapchain_format = VK_FORMAT_UNDEFINED;
 VkCommandPool g_app_cmd_pool = VK_NULL_HANDLE;
 
+// ─── texture-class state (app-owns-presentation) ──────────────────────────
+// The android_app, stashed in android_main so the bring-up helpers can reach
+// app->window for the shared image + present surface.
+struct android_app *g_app = nullptr;
+
+// Shared weave-target VkImage. The app creates it and hands it to the runtime
+// via XrAndroidSurfaceBindingCreateInfoEXT; the runtime weaves the stereo
+// content into its canvas sub-rect (xrSetSharedTextureOutputRectEXT) and does
+// NOT present. Format must match what the DP writes (B8G8R8A8_UNORM, see
+// comp_vk_native_compositor.c). usage: color attachment (DP weave target) +
+// transfer-src (our present blit).
+constexpr VkFormat kSharedFormat = VK_FORMAT_B8G8R8A8_UNORM;
+VkImage g_shared_image = VK_NULL_HANDLE;
+VkDeviceMemory g_shared_mem = VK_NULL_HANDLE;
+uint32_t g_shared_w = 0, g_shared_h = 0;
+
+// Canvas sub-rect within the shared image where the runtime weaves 3D. The
+// region OUTSIDE it is the app-owned 2D surround. Inset as a fraction of the
+// panel on each side — 0.0 = full-panel canvas (no surround). Default demos
+// the texture class with a visible surround border. The runtime is told this
+// via xrSetSharedTextureOutputRectEXT.
+constexpr float kCanvasInsetFrac = 0.12f;
+int32_t g_canvas_x = 0, g_canvas_y = 0;
+uint32_t g_canvas_w = 0, g_canvas_h = 0;
+
+// App-owned present swapchain on app->window (the runtime presents nothing in
+// texture mode).
+VkSurfaceKHR g_present_surface = VK_NULL_HANDLE;
+VkSwapchainKHR g_present_swapchain = VK_NULL_HANDLE;
+VkFormat g_present_format = VK_FORMAT_UNDEFINED;
+uint32_t g_present_w = 0, g_present_h = 0;
+VkImage g_present_images[8] = {};
+uint32_t g_present_image_count = 0;
+VkSemaphore g_present_acquire_sem = VK_NULL_HANDLE;  // signalled by acquire
+VkSemaphore g_present_blit_sem = VK_NULL_HANDLE;     // signalled by blit, waited by present
+bool g_present_ready = false;
+
+PFN_xrSetSharedTextureOutputRectEXT g_set_output_rect = nullptr;
+
 // Graphics pipeline state for the triangle renderer.
 VkRenderPass g_render_pass = VK_NULL_HANDLE;
 VkPipelineLayout g_pipeline_layout = VK_NULL_HANDLE;
@@ -243,7 +288,7 @@ create_instance(struct android_app *app)
 	create_info.type = XR_TYPE_INSTANCE_CREATE_INFO;
 	create_info.next = &android_info;
 	std::strncpy(create_info.applicationInfo.applicationName,
-	             "cube_handle_vk_android",
+	             "cube_texture_vk_android",
 	             XR_MAX_APPLICATION_NAME_SIZE - 1);
 	create_info.applicationInfo.applicationVersion = 1;
 	std::strncpy(create_info.applicationInfo.engineName, "displayxr",
@@ -398,7 +443,7 @@ create_vulkan_instance()
 
 	VkApplicationInfo app_info = {};
 	app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-	app_info.pApplicationName = "cube_handle_vk_android";
+	app_info.pApplicationName = "cube_texture_vk_android";
 	app_info.applicationVersion = 1;
 	app_info.pEngineName = "displayxr";
 	app_info.engineVersion = 1;
@@ -544,6 +589,18 @@ create_session()
 	binding.queueFamilyIndex = g_vk_queue_family;
 	binding.queueIndex = 0;
 
+	// Texture class: hand the runtime our shared VkImage as the weave target so
+	// it weaves 3D into the canvas sub-rect and presents nothing — the app owns
+	// presentation (present_frame). window=NULL: we keep our own surface.
+	XrAndroidSurfaceBindingCreateInfoEXT android_binding = {};
+	android_binding.type = XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_EXT;
+	android_binding.window = nullptr;
+	android_binding.sharedImage = (uint64_t)(uintptr_t)g_shared_image;
+	android_binding.sharedImageWidth = g_shared_w;
+	android_binding.sharedImageHeight = g_shared_h;
+	android_binding.sharedImageFormat = (uint32_t)kSharedFormat;
+	binding.next = &android_binding;
+
 	XrSessionCreateInfo ci = {};
 	ci.type = XR_TYPE_SESSION_CREATE_INFO;
 	ci.next = &binding;
@@ -551,7 +608,21 @@ create_session()
 
 	XrResult res = xrCreateSession(g_instance, &ci, &g_session);
 	log_xr_result("xrCreateSession", res);
-	return res == XR_SUCCESS;
+	if (res != XR_SUCCESS) {
+		return false;
+	}
+
+	// Tell the runtime the canvas sub-rect within the shared image where 3D
+	// should be woven (the surround region we 2D-fill ourselves).
+	res = xrGetInstanceProcAddr(g_instance, "xrSetSharedTextureOutputRectEXT",
+	                            reinterpret_cast<PFN_xrVoidFunction *>(&g_set_output_rect));
+	if (res == XR_SUCCESS && g_set_output_rect != nullptr) {
+		XrResult rr = g_set_output_rect(g_session, g_canvas_x, g_canvas_y, g_canvas_w, g_canvas_h);
+		log_xr_result("xrSetSharedTextureOutputRectEXT", rr);
+	} else {
+		LOGW("xrSetSharedTextureOutputRectEXT unavailable (%d) — canvas = full image", (int)res);
+	}
+	return true;
 }
 
 // Enumerate the runtime's view configuration for PRIMARY_STEREO and
@@ -1107,6 +1178,329 @@ find_memory_type(uint32_t type_bits, VkMemoryPropertyFlags props)
 		}
 	}
 	return UINT32_MAX;
+}
+
+// ─── texture-class helpers (app-owns-presentation) ────────────────────────
+
+// Create the shared weave-target VkImage at panel resolution and compute the
+// canvas sub-rect. The runtime weaves 3D into the canvas; we 2D-fill the
+// surround and blit the canvas to our own swapchain in present_frame().
+bool
+create_shared_image()
+{
+	if (g_app == nullptr || g_app->window == nullptr) {
+		LOGE("create_shared_image: no window");
+		return false;
+	}
+	g_shared_w = (uint32_t)ANativeWindow_getWidth(g_app->window);
+	g_shared_h = (uint32_t)ANativeWindow_getHeight(g_app->window);
+	if (g_shared_w == 0 || g_shared_h == 0) {
+		LOGE("create_shared_image: window has zero extent");
+		return false;
+	}
+
+	VkImageCreateInfo ici = {};
+	ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	ici.imageType = VK_IMAGE_TYPE_2D;
+	ici.format = kSharedFormat;
+	ici.extent = {g_shared_w, g_shared_h, 1};
+	ici.mipLevels = 1;
+	ici.arrayLayers = 1;
+	ici.samples = VK_SAMPLE_COUNT_1_BIT;
+	ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+	ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |  // DP weave target
+	            VK_IMAGE_USAGE_TRANSFER_SRC_BIT |       // our present blit
+	            VK_IMAGE_USAGE_SAMPLED_BIT;
+	ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	if (vkCreateImage(g_vk_device, &ici, nullptr, &g_shared_image) != VK_SUCCESS) {
+		LOGE("create_shared_image: vkCreateImage failed");
+		return false;
+	}
+
+	VkMemoryRequirements req = {};
+	vkGetImageMemoryRequirements(g_vk_device, g_shared_image, &req);
+	VkMemoryAllocateInfo mai = {};
+	mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	mai.allocationSize = req.size;
+	mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+	if (mai.memoryTypeIndex == UINT32_MAX ||
+	    vkAllocateMemory(g_vk_device, &mai, nullptr, &g_shared_mem) != VK_SUCCESS) {
+		LOGE("create_shared_image: memory alloc failed");
+		return false;
+	}
+	vkBindImageMemory(g_vk_device, g_shared_image, g_shared_mem, 0);
+
+	// Canvas sub-rect: inset on each side. 0.0 → full panel (no surround).
+	uint32_t ix = (uint32_t)(kCanvasInsetFrac * (float)g_shared_w);
+	uint32_t iy = (uint32_t)(kCanvasInsetFrac * (float)g_shared_h);
+	g_canvas_x = (int32_t)ix;
+	g_canvas_y = (int32_t)iy;
+	g_canvas_w = g_shared_w - 2 * ix;
+	g_canvas_h = g_shared_h - 2 * iy;
+
+	LOGI("Shared image %ux%u, canvas rect=(%d,%d %ux%u)", g_shared_w, g_shared_h,
+	     g_canvas_x, g_canvas_y, g_canvas_w, g_canvas_h);
+	return true;
+}
+
+// Create the app's own present swapchain on the Activity's ANativeWindow. The
+// runtime presents nothing in texture mode — we composite + present here.
+bool
+create_present_swapchain()
+{
+	VkAndroidSurfaceCreateInfoKHR sci = {};
+	sci.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
+	sci.window = g_app->window;
+	if (vkCreateAndroidSurfaceKHR(g_vk_instance, &sci, nullptr, &g_present_surface) != VK_SUCCESS) {
+		LOGE("create_present_swapchain: vkCreateAndroidSurfaceKHR failed");
+		return false;
+	}
+
+	VkBool32 supported = VK_FALSE;
+	vkGetPhysicalDeviceSurfaceSupportKHR(g_vk_phys_device, g_vk_queue_family,
+	                                     g_present_surface, &supported);
+	if (!supported) {
+		LOGE("create_present_swapchain: queue family %u can't present", g_vk_queue_family);
+		return false;
+	}
+
+	VkSurfaceCapabilitiesKHR caps = {};
+	vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk_phys_device, g_present_surface, &caps);
+
+	// Pick a surface format: prefer B8G8R8A8_UNORM to match the blit source.
+	uint32_t fmt_count = 0;
+	vkGetPhysicalDeviceSurfaceFormatsKHR(g_vk_phys_device, g_present_surface, &fmt_count, nullptr);
+	VkSurfaceFormatKHR fmts[32] = {};
+	if (fmt_count > 32) fmt_count = 32;
+	vkGetPhysicalDeviceSurfaceFormatsKHR(g_vk_phys_device, g_present_surface, &fmt_count, fmts);
+	VkSurfaceFormatKHR chosen = fmts[0];
+	for (uint32_t i = 0; i < fmt_count; ++i) {
+		if (fmts[i].format == kSharedFormat) { chosen = fmts[i]; break; }
+	}
+	g_present_format = chosen.format;
+
+	g_present_w = caps.currentExtent.width;
+	g_present_h = caps.currentExtent.height;
+	if (g_present_w == 0xFFFFFFFFu) { g_present_w = g_shared_w; g_present_h = g_shared_h; }
+
+	uint32_t min_images = caps.minImageCount + 1;
+	if (caps.maxImageCount > 0 && min_images > caps.maxImageCount) min_images = caps.maxImageCount;
+
+	// Woven 3D in the canvas region must NOT be rotated by WSI (the lenticular
+	// is fixed to the panel) — prefer IDENTITY transform, like the runtime's
+	// vk_native target does. The 2D surround tolerates either.
+	VkSurfaceTransformFlagBitsKHR pre_xform =
+	    (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+	        ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+	        : caps.currentTransform;
+
+	VkSwapchainCreateInfoKHR ci = {};
+	ci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+	ci.surface = g_present_surface;
+	ci.minImageCount = min_images;
+	ci.imageFormat = g_present_format;
+	ci.imageColorSpace = chosen.colorSpace;
+	ci.imageExtent = {g_present_w, g_present_h};
+	ci.imageArrayLayers = 1;
+	ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+	ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	ci.preTransform = pre_xform;
+	ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+	ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;  // always supported
+	ci.clipped = VK_TRUE;
+	if (vkCreateSwapchainKHR(g_vk_device, &ci, nullptr, &g_present_swapchain) != VK_SUCCESS) {
+		LOGE("create_present_swapchain: vkCreateSwapchainKHR failed");
+		return false;
+	}
+
+	g_present_image_count = 0;
+	vkGetSwapchainImagesKHR(g_vk_device, g_present_swapchain, &g_present_image_count, nullptr);
+	if (g_present_image_count > 8) g_present_image_count = 8;
+	vkGetSwapchainImagesKHR(g_vk_device, g_present_swapchain, &g_present_image_count, g_present_images);
+
+	VkSemaphoreCreateInfo sem_ci = {};
+	sem_ci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+	vkCreateSemaphore(g_vk_device, &sem_ci, nullptr, &g_present_acquire_sem);
+	vkCreateSemaphore(g_vk_device, &sem_ci, nullptr, &g_present_blit_sem);
+
+	g_present_ready = true;
+	LOGI("Present swapchain %ux%u, %u images, fmt=0x%x, xform=0x%x",
+	     g_present_w, g_present_h, g_present_image_count, g_present_format, pre_xform);
+	return true;
+}
+
+// Composite the woven shared image (canvas region) + 2D surround into the
+// app's swapchain and present. Called after xrEndFrame — the runtime's weave
+// already vkQueueWaitIdle'd, so the canvas pixels are ready.
+void
+present_frame()
+{
+	if (!g_present_ready || g_shared_image == VK_NULL_HANDLE) return;
+
+	uint32_t idx = 0;
+	VkResult res = vkAcquireNextImageKHR(g_vk_device, g_present_swapchain, UINT64_MAX,
+	                                     g_present_acquire_sem, VK_NULL_HANDLE, &idx);
+	if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR) {
+		// Rotation/resize — swapchain recreation is a follow-up; skip this frame.
+		DXR_HW_DBG_ONCE("present acquire returned %d (out-of-date) — skipping", (int)res);
+		return;
+	}
+	if (res != VK_SUCCESS) {
+		LOGW("vkAcquireNextImageKHR failed: %d", (int)res);
+		return;
+	}
+	VkImage dst = g_present_images[idx];
+
+	VkCommandBufferAllocateInfo cai = {};
+	cai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	cai.commandPool = g_app_cmd_pool;
+	cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	cai.commandBufferCount = 1;
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	if (vkAllocateCommandBuffers(g_vk_device, &cai, &cmd) != VK_SUCCESS) return;
+
+	VkCommandBufferBeginInfo bi = {};
+	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	vkBeginCommandBuffer(cmd, &bi);
+
+	const VkImageSubresourceRange full = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+	// dst: UNDEFINED → TRANSFER_DST
+	VkImageMemoryBarrier b = {};
+	b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	b.srcAccessMask = 0;
+	b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	b.image = dst;
+	b.subresourceRange = full;
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                     0, 0, nullptr, 0, nullptr, 1, &b);
+
+	// shared: the DP just wrote it as a color attachment. Transition to
+	// TRANSFER_SRC to read it. ★ DEVICE-ITERATION POINT: oldLayout must match
+	// the Leia DP render-pass finalLayout (assumed COLOR_ATTACHMENT_OPTIMAL).
+	VkImageMemoryBarrier sb = {};
+	sb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	sb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	sb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	sb.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	sb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	sb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	sb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	sb.image = g_shared_image;
+	sb.subresourceRange = full;
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &sb);
+
+	// 2D surround: clear the whole present image to a distinct color.
+	VkClearColorValue surround = {{0.05f, 0.08f, 0.14f, 1.0f}};  // dark slate-blue
+	vkCmdClearColorImage(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &surround, 1, &full);
+
+	// Order the clear before the canvas blit (both write dst).
+	VkMemoryBarrier mb = {};
+	mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                     0, 1, &mb, 0, nullptr, 0, nullptr);
+
+	// Blit the woven canvas sub-rect 1:1 into the present image.
+	VkImageBlit blit = {};
+	blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+	blit.srcOffsets[0] = {g_canvas_x, g_canvas_y, 0};
+	blit.srcOffsets[1] = {g_canvas_x + (int32_t)g_canvas_w, g_canvas_y + (int32_t)g_canvas_h, 1};
+	blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+	blit.dstOffsets[0] = {g_canvas_x, g_canvas_y, 0};
+	blit.dstOffsets[1] = {g_canvas_x + (int32_t)g_canvas_w, g_canvas_y + (int32_t)g_canvas_h, 1};
+	vkCmdBlitImage(cmd, g_shared_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	               dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+
+	// dst → PRESENT_SRC
+	b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	b.dstAccessMask = 0;
+	b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+	                     0, 0, nullptr, 0, nullptr, 1, &b);
+
+	// shared: TRANSFER_SRC → COLOR_ATTACHMENT_OPTIMAL (restore for next weave).
+	sb.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	sb.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	sb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	sb.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                     0, 0, nullptr, 0, nullptr, 1, &sb);
+
+	vkEndCommandBuffer(cmd);
+
+	VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+	VkSubmitInfo si = {};
+	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	si.waitSemaphoreCount = 1;
+	si.pWaitSemaphores = &g_present_acquire_sem;
+	si.pWaitDstStageMask = &wait_stage;
+	si.commandBufferCount = 1;
+	si.pCommandBuffers = &cmd;
+	si.signalSemaphoreCount = 1;
+	si.pSignalSemaphores = &g_present_blit_sem;
+	vkQueueSubmit(g_vk_queue, 1, &si, VK_NULL_HANDLE);
+
+	VkPresentInfoKHR pi = {};
+	pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+	pi.waitSemaphoreCount = 1;
+	pi.pWaitSemaphores = &g_present_blit_sem;
+	pi.swapchainCount = 1;
+	pi.pSwapchains = &g_present_swapchain;
+	pi.pImageIndices = &idx;
+	vkQueuePresentKHR(g_vk_queue, &pi);
+
+	// Serialize (matches the rest of this app's per-frame vkQueueWaitIdle idiom)
+	// and lets us free the command buffer safely.
+	vkQueueWaitIdle(g_vk_queue);
+	vkFreeCommandBuffers(g_vk_device, g_app_cmd_pool, 1, &cmd);
+}
+
+void
+destroy_present_swapchain()
+{
+	if (g_vk_device == VK_NULL_HANDLE) return;
+	if (g_present_blit_sem != VK_NULL_HANDLE) {
+		vkDestroySemaphore(g_vk_device, g_present_blit_sem, nullptr);
+		g_present_blit_sem = VK_NULL_HANDLE;
+	}
+	if (g_present_acquire_sem != VK_NULL_HANDLE) {
+		vkDestroySemaphore(g_vk_device, g_present_acquire_sem, nullptr);
+		g_present_acquire_sem = VK_NULL_HANDLE;
+	}
+	if (g_present_swapchain != VK_NULL_HANDLE) {
+		vkDestroySwapchainKHR(g_vk_device, g_present_swapchain, nullptr);
+		g_present_swapchain = VK_NULL_HANDLE;
+	}
+	if (g_present_surface != VK_NULL_HANDLE) {
+		vkDestroySurfaceKHR(g_vk_instance, g_present_surface, nullptr);
+		g_present_surface = VK_NULL_HANDLE;
+	}
+	g_present_ready = false;
+}
+
+void
+destroy_shared_image()
+{
+	if (g_vk_device == VK_NULL_HANDLE) return;
+	if (g_shared_image != VK_NULL_HANDLE) {
+		vkDestroyImage(g_vk_device, g_shared_image, nullptr);
+		g_shared_image = VK_NULL_HANDLE;
+	}
+	if (g_shared_mem != VK_NULL_HANDLE) {
+		vkFreeMemory(g_vk_device, g_shared_mem, nullptr);
+		g_shared_mem = VK_NULL_HANDLE;
+	}
 }
 
 // Upload the cube's 36 vertices (6 faces × 2 triangles, per-face color) into
@@ -1928,6 +2322,11 @@ render_frame()
 		return false;
 	}
 
+	// Texture class: the runtime has now woven the cube into the shared image's
+	// canvas sub-rect (and waited idle). Composite it with the 2D surround and
+	// present to our own swapchain.
+	present_frame();
+
 	g_frame_count++;
 	if ((g_frame_count % 60) == 0) {
 		LOGI("frame %llu", (unsigned long long)g_frame_count);
@@ -1990,6 +2389,10 @@ destroy_instance()
 	destroy_reference_space();
 	destroy_swapchains();
 	destroy_session();
+	// After the session (and thus the compositor) is gone, nothing references
+	// our shared image — tear down the present swapchain + shared image.
+	destroy_present_swapchain();
+	destroy_shared_image();
 	destroy_vulkan();
 	if (g_instance != XR_NULL_HANDLE) {
 		XrResult res = xrDestroyInstance(g_instance);
@@ -2017,7 +2420,9 @@ handle_cmd(struct android_app *app, int32_t cmd)
 			    create_vulkan_instance() &&
 			    pick_physical_device() &&
 			    create_vulkan_device() &&
-			    create_session() &&
+			    create_shared_image() &&       // texture class: weave target
+			    create_session() &&            // chains the binding + output rect
+			    create_present_swapchain() &&  // app-owned presentation
 			    create_swapchains() &&
 			    create_reference_space() &&
 			    create_cmd_pool() &&
@@ -2076,14 +2481,14 @@ handle_input(struct android_app *app, AInputEvent *event)
 // ─── JNI bridge to the Kotlin overlay (MainActivity) ──────────────────────
 // Underscores in the package/class become `_1` in JNI symbol names.
 extern "C" JNIEXPORT void JNICALL
-Java_com_displayxr_cube_1handle_1vk_1android_MainActivity_nativeSetBackgroundEnabled(
+Java_com_displayxr_cube_1texture_1vk_1android_MainActivity_nativeSetBackgroundEnabled(
     JNIEnv * /*env*/, jobject /*thiz*/, jboolean enabled)
 {
 	g_bg_enabled.store(enabled == JNI_TRUE, std::memory_order_relaxed);
 }
 
 extern "C" JNIEXPORT jfloatArray JNICALL
-Java_com_displayxr_cube_1handle_1vk_1android_MainActivity_nativeGetEye(
+Java_com_displayxr_cube_1texture_1vk_1android_MainActivity_nativeGetEye(
     JNIEnv *env, jobject /*thiz*/)
 {
 	jfloatArray arr = env->NewFloatArray(3);
@@ -2103,7 +2508,7 @@ Java_com_displayxr_cube_1handle_1vk_1android_MainActivity_nativeGetEye(
 // onConfigurationChanged) since the native window buffer reports a fixed
 // orientation. Drives the orientation-aware HUD rotation + projection aspect.
 extern "C" JNIEXPORT void JNICALL
-Java_com_displayxr_cube_1handle_1vk_1android_MainActivity_nativeSetRotation(
+Java_com_displayxr_cube_1texture_1vk_1android_MainActivity_nativeSetRotation(
     JNIEnv * /*env*/, jobject /*thiz*/, jint rotation)
 {
 	g_display_rotation.store(rotation & 3, std::memory_order_relaxed);
@@ -2113,7 +2518,7 @@ Java_com_displayxr_cube_1handle_1vk_1android_MainActivity_nativeSetRotation(
 // True once xrCreateInstance has failed with RUNTIME_UNAVAILABLE — MainActivity
 // polls this to prompt the user to launch DisplayXR first.
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_displayxr_cube_1handle_1vk_1android_MainActivity_nativeRuntimeUnavailable(
+Java_com_displayxr_cube_1texture_1vk_1android_MainActivity_nativeRuntimeUnavailable(
     JNIEnv * /*env*/, jobject /*thiz*/)
 {
 	return g_runtime_unavailable.load(std::memory_order_relaxed) ? JNI_TRUE : JNI_FALSE;
@@ -2122,7 +2527,7 @@ Java_com_displayxr_cube_1handle_1vk_1android_MainActivity_nativeRuntimeUnavailab
 // True once the OpenXR instance is up (runtime reached) — lets MainActivity stop
 // watching so the "runtime missing" dialog can't re-fire after a good start.
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_displayxr_cube_1handle_1vk_1android_MainActivity_nativeXrReady(
+Java_com_displayxr_cube_1texture_1vk_1android_MainActivity_nativeXrReady(
     JNIEnv * /*env*/, jobject /*thiz*/)
 {
 	return (g_instance != XR_NULL_HANDLE) ? JNI_TRUE : JNI_FALSE;
@@ -2131,9 +2536,10 @@ Java_com_displayxr_cube_1handle_1vk_1android_MainActivity_nativeXrReady(
 extern "C" void
 android_main(struct android_app *app)
 {
-	LOGI("cube_handle_vk_android: android_main entered");
+	LOGI("cube_texture_vk_android: android_main entered");
 	DXR_HW_DBG("android_main: activity=%p vm=%p", (void *)app->activity->clazz,
 	           (void *)app->activity->vm);
+	g_app = app;  // texture-class helpers reach app->window through this
 	app->onAppCmd = handle_cmd;
 	app->onInputEvent = handle_input;
 

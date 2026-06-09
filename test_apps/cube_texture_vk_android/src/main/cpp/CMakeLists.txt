@@ -40,6 +40,13 @@ find_package(OpenXR REQUIRED CONFIG)
 add_library(cube_texture_vk_android SHARED main.cpp ${CUBE_SHADER_HEADERS})
 target_include_directories(cube_texture_vk_android PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
+# The Khronos AAR ships the base OpenXR headers, but the DisplayXR custom
+# extension headers (XR_EXT_android_surface_binding.h) live in the repo. Add
+# the repo's openxr_includes so the texture app can chain the Android surface
+# binding struct. Path: .../src/main/cpp -> repo-root/src/external/openxr_includes.
+target_include_directories(cube_texture_vk_android PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../../../src/external/openxr_includes)
+
 # -u ANativeActivity_onCreate forces the linker to keep the symbol the
 # Android runtime resolves dynamically on Activity launch — without it,
 # the shared lib loads but exposes nothing.
