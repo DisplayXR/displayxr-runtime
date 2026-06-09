@@ -19,9 +19,25 @@
         <intent>
             <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
         </intent>
+        <!-- The Khronos loader resolves the active runtime through this broker
+             ContentProvider. Under Android 11+ package visibility the provider
+             is invisible unless we declare its authority here; without it the
+             loader gets "Failed to find provider info … runtime_broker" → a
+             null cursor → xrCreateInstance fails with RUNTIME_UNAVAILABLE
+             (the app shows a black screen). The authority is shared by both
+             runtime flavors. (#510) -->
+        <provider android:authorities="org.khronos.openxr.runtime_broker" />
         <!-- Explicit package visibility so we can wake the DisplayXR runtime
-             out of Android's "stopped" state before xrCreateInstance. -->
+             out of Android's "stopped" state and bind its IPC service before
+             xrCreateInstance. Both flavors are listed so the same cube APK runs
+             against either: in_process (dev) or out_of_process (#510, vendor
+             DPs run in the runtime service). -->
         <package android:name="org.freedesktop.monado.openxr_runtime.in_process" />
+        <package android:name="org.freedesktop.monado.openxr_runtime.out_of_process" />
+        <!-- IPC bind to the out-of-process runtime service. -->
+        <intent>
+            <action android:name="org.freedesktop.monado.ipc.CONNECT" />
+        </intent>
     </queries>
 
     <uses-feature
