@@ -182,6 +182,31 @@ struct xrt_display_processor_metal
 	 * absent slot or NULL ⟹ DP assumes @ref XRT_ATLAS_ENCODING_ENCODED.
 	 */
 	void (*set_atlas_encoding)(struct xrt_display_processor_metal *xdp, enum xrt_atlas_encoding atlas_encoding);
+
+	/*!
+	 * Hand the DP this frame's flattened 2D-under backdrop (#491 part 3).
+	 * Called once per frame, immediately before @ref process_atlas, when the
+	 * frame carries Local2D layers before the projection (the "under" layers).
+	 * The runtime flattens them into a single premultiplied-RGBA Metal texture
+	 * in the client-window pixel space / canvas rect and passes it here. The DP
+	 * composites it OVER its captured desktop background and uses the result as
+	 * the under-3D background for the NEXT process_atlas. The texture must
+	 * outlive that call and be sampleable.
+	 *
+	 * Pass NULL (or width/height 0) to clear — desktop-only background.
+	 *
+	 * Optional — absent slot or NULL ⟹ no-op (part-1-only behavior). Appended
+	 * per ADR-020 (append-only within a major).
+	 *
+	 * @param xdp              Pointer to self.
+	 * @param background_texture id<MTLTexture> of the flattened backdrop (or NULL to clear).
+	 * @param width            Backdrop width in pixels.
+	 * @param height           Backdrop height in pixels.
+	 */
+	void (*set_background_2d)(struct xrt_display_processor_metal *xdp,
+	                          void *background_texture,
+	                          uint32_t width,
+	                          uint32_t height);
 };
 
 /*
@@ -225,7 +250,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, set_chroma_key)  
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, destroy)                     == XRT_DP_METAL_BASE_OFF + 9 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, get_handoff_color_capability) == XRT_DP_METAL_BASE_OFF + 10 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, set_atlas_encoding)           == XRT_DP_METAL_BASE_OFF + 11 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_metal)                                == XRT_DP_METAL_BASE_OFF + 12 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, set_background_2d)            == XRT_DP_METAL_BASE_OFF + 12 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_metal)                                == XRT_DP_METAL_BASE_OFF + 13 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -407,6 +433,23 @@ xrt_display_processor_metal_set_atlas_encoding(struct xrt_display_processor_meta
 		return;
 	}
 	xdp->set_atlas_encoding(xdp, atlas_encoding);
+}
+
+/*!
+ * @copydoc xrt_display_processor_metal::set_background_2d
+ * No-op when the DP doesn't expose the slot (older plug-in) or leaves it NULL.
+ * @public @memberof xrt_display_processor_metal
+ */
+static inline void
+xrt_display_processor_metal_set_background_2d(struct xrt_display_processor_metal *xdp,
+                                              void *background_texture,
+                                              uint32_t width,
+                                              uint32_t height)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, set_background_2d) || xdp->set_background_2d == NULL) {
+		return;
+	}
+	xdp->set_background_2d(xdp, background_texture, width, height);
 }
 
 /*!

@@ -365,6 +365,37 @@ struct xrt_display_processor
 	void (*set_target_color_view)(struct xrt_display_processor *xdp,
 	                              VkImageView color_view);
 
+	/*!
+	 * Hand the DP this frame's flattened 2D-under backdrop (#491 part 3).
+	 * Called once per frame, immediately before @ref process_atlas, when the
+	 * frame carries Local2D layers that sit *before* the projection in
+	 * xrEndFrame list order (the "under" layers). The runtime flattens them
+	 * into a single premultiplied-RGBA texture in the same client-window pixel
+	 * space / canvas rect as process_atlas and passes its view here. The DP
+	 * composites it OVER its captured desktop background (`backdrop over
+	 * desktop`, honoring the backdrop's alpha so a semi-transparent backdrop
+	 * reveals the desktop) and uses the result as the under-3D background for
+	 * the NEXT process_atlas. The view is left in SHADER_READ_ONLY_OPTIMAL /
+	 * SAMPLED and outlives the process_atlas call.
+	 *
+	 * Pass VK_NULL_HANDLE (or width/height 0) to clear — no backdrop this
+	 * frame, so the DP falls back to its desktop-only background (today's
+	 * behavior).
+	 *
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL means the
+	 * runtime keeps part-1-only behavior (overlay-only, no under-layer) so old
+	 * plug-ins are unaffected. Appended per ADR-020 (append-only within a major).
+	 *
+	 * @param xdp            Pointer to self.
+	 * @param background_view Flattened premultiplied backdrop view (or NULL to clear).
+	 * @param width          Backdrop width in pixels.
+	 * @param height         Backdrop height in pixels.
+	 */
+	void (*set_background_2d)(struct xrt_display_processor *xdp,
+	                          VkImageView background_view,
+	                          uint32_t width,
+	                          uint32_t height);
+
 	/*! @} */
 };
 
@@ -438,7 +469,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, destroy)               
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_handoff_color_capability) == XRT_DP_BASE_OFF + 14 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_atlas_encoding)            == XRT_DP_BASE_OFF + 15 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_target_color_view)        == XRT_DP_BASE_OFF + 16 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor)                                 == XRT_DP_BASE_OFF + 17 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_background_2d)             == XRT_DP_BASE_OFF + 17 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor)                                 == XRT_DP_BASE_OFF + 18 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -724,6 +756,26 @@ xrt_display_processor_set_target_color_view(struct xrt_display_processor *xdp, V
 		return;
 	}
 	xdp->set_target_color_view(xdp, color_view);
+}
+
+/*!
+ * @copydoc xrt_display_processor::set_background_2d
+ *
+ * No-op when the DP doesn't expose the slot (older plug-in) or leaves it NULL —
+ * the runtime then keeps part-1-only behavior (no 2D-under backdrop).
+ *
+ * @public @memberof xrt_display_processor
+ */
+static inline void
+xrt_display_processor_set_background_2d(struct xrt_display_processor *xdp,
+                                        VkImageView background_view,
+                                        uint32_t width,
+                                        uint32_t height)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, set_background_2d) || xdp->set_background_2d == NULL) {
+		return;
+	}
+	xdp->set_background_2d(xdp, background_view, width, height);
 }
 
 /*!

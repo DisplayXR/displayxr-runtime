@@ -269,6 +269,31 @@ struct xrt_display_processor_d3d11
 	 * @return true if the clear was accepted.
 	 */
 	bool (*clear_local_zone_mask)(struct xrt_display_processor_d3d11 *xdp);
+
+	/*!
+	 * Hand the DP this frame's flattened 2D-under backdrop (#491 part 3).
+	 * Called once per frame, immediately before @ref process_atlas, when the
+	 * frame carries Local2D layers before the projection (the "under" layers).
+	 * The runtime flattens them into a single premultiplied-RGBA texture in the
+	 * client-window pixel space / canvas rect and passes its SRV here. The DP
+	 * composites it OVER its captured desktop background and uses the result as
+	 * the under-3D background for the NEXT process_atlas. The SRV must outlive
+	 * that call.
+	 *
+	 * Pass NULL (or width/height 0) to clear — desktop-only background.
+	 *
+	 * Optional — absent slot or NULL ⟹ no-op (part-1-only behavior). Appended
+	 * per ADR-020 (append-only within a major).
+	 *
+	 * @param xdp             Pointer to self.
+	 * @param background_srv  ID3D11ShaderResourceView* of the flattened backdrop (or NULL to clear).
+	 * @param width           Backdrop width in pixels.
+	 * @param height          Backdrop height in pixels.
+	 */
+	void (*set_background_2d)(struct xrt_display_processor_d3d11 *xdp,
+	                          void *background_srv,
+	                          uint32_t width,
+	                          uint32_t height);
 };
 
 /*
@@ -317,7 +342,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_atlas_encodin
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, get_local_zone_caps)          == XRT_DP_D3D11_BASE_OFF + 12 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, publish_local_zone_mask)      == XRT_DP_D3D11_BASE_OFF + 13 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, clear_local_zone_mask)        == XRT_DP_D3D11_BASE_OFF + 14 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 15 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_background_2d)            == XRT_DP_D3D11_BASE_OFF + 15 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 16 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -552,6 +578,23 @@ xrt_display_processor_d3d11_clear_local_zone_mask(struct xrt_display_processor_d
 		return false;
 	}
 	return xdp->clear_local_zone_mask(xdp);
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::set_background_2d
+ * No-op when the DP doesn't expose the slot (older plug-in) or leaves it NULL.
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline void
+xrt_display_processor_d3d11_set_background_2d(struct xrt_display_processor_d3d11 *xdp,
+                                              void *background_srv,
+                                              uint32_t width,
+                                              uint32_t height)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, set_background_2d) || xdp->set_background_2d == NULL) {
+		return;
+	}
+	xdp->set_background_2d(xdp, background_srv, width, height);
 }
 
 /*!

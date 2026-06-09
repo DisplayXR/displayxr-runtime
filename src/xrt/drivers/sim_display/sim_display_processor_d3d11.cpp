@@ -429,6 +429,27 @@ sim_dp_d3d11_set_atlas_encoding(struct xrt_display_processor_d3d11 *xdp, enum xr
 	sim_dp_d3d11(xdp)->atlas_encoding = atlas_encoding;
 }
 
+// #491 part 3 — test double: record the 2D-under backdrop handoff (no captured
+// desktop to composite under). The one-shot WARN proves the runtime → DP
+// set_background_2d wiring works without Leia hardware.
+static void
+sim_dp_d3d11_set_background_2d(struct xrt_display_processor_d3d11 *xdp,
+                              void *background_srv,
+                              uint32_t width,
+                              uint32_t height)
+{
+	(void)xdp;
+	if (background_srv != nullptr) {
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			U_LOG_W("sim_display D3D11 #491 part3: received 2D-under backdrop %ux%u via "
+			        "set_background_2d (test double — handoff recorded, not composited)",
+			        width, height);
+		}
+	}
+}
+
 
 /*
  *
@@ -634,6 +655,7 @@ sim_display_processor_d3d11_create(enum sim_display_output_mode mode,
 	sdp->base.get_local_zone_caps = sim_dp_d3d11_get_local_zone_caps;
 	sdp->base.publish_local_zone_mask = sim_dp_d3d11_publish_local_zone_mask;
 	sdp->base.clear_local_zone_mask = sim_dp_d3d11_clear_local_zone_mask;
+	sdp->base.set_background_2d = sim_dp_d3d11_set_background_2d; // #491 part 3
 
 	// #224 local-zone test double config (see the zone section above).
 	sdp->zone_grid_w = 1;
