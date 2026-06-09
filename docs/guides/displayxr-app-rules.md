@@ -64,7 +64,18 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   on `READY`, `xrEndSession` on `STOPPING`. Each frame: `xrWaitFrame` → `xrBeginFrame` → render →
   `xrEndFrame`, using `frameState.predictedDisplayTime` for `xrLocateViews`/submission and skipping
   rendering when `frameState.shouldRender` is false. Exit gracefully via `xrRequestExitSession`
-  (→ `SESSION_STATE_EXITING`). Ref: `xr_session_common.cpp` (`PollEvents`, `BeginFrame`, `EndFrame`).
+  (→ `SESSION_STATE_EXITING`). Reference loop: `test_apps/cube_handle_*`
+  (`poll_xr_events` / `handle_session_state` / `render_frame`).
+  - **Run the frame loop from `READY`, gated on a "session running" flag — never on
+    `SYNCHRONIZED`/`VISIBLE`/`FOCUSED`.** A spec-compliant runtime only advances
+    `READY → SYNCHRONIZED` on your **first `xrBeginFrame`** (the CTS rule: it may not synchronize
+    without a submitted frame). If you withhold the frame loop until the session is already
+    `SYNCHRONIZED+`, you deadlock at `READY` and never render (black screen). Correct shape: gate the
+    loop on a boolean set true on `READY` / false on `STOPPING` (plus a live window/surface) and let
+    `frameState.shouldRender` decide whether to actually draw — the runtime then walks you
+    `SYNCHRONIZED → VISIBLE → FOCUSED` as you submit frames. (This is the #507 Android lesson:
+    `cube_handle_vk_android` had drifted to a `SYNCHRONIZED+` gate and showed black on a compliant
+    runtime.)
 - **F-2 — Swapchain image lifecycle.** Per frame, per swapchain: `xrAcquireSwapchainImage` →
   `xrWaitSwapchainImage` (with a real timeout) → render into the returned image →
   `xrReleaseSwapchainImage` **before** `xrEndFrame`. Releasing late or submitting an unreleased

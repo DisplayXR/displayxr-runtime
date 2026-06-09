@@ -44,6 +44,7 @@ SOURCE_EXTS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".m", ".mm"}
 
 # ---- rule catalog (kept in sync with docs/guides/displayxr-app-rules.md) ----
 RULES = {
+    "F-1": "Run the frame loop from READY, gated on a 'session running' flag (not SYNCHRONIZED+); a compliant runtime only leaves READY on your first xrBeginFrame, so a SYNCHRONIZED+ gate deadlocks (black screen).",
     "INV-2.8": "Apps requesting MANUAL eye tracking SHOULD handle XrEventDataEyeTrackingStateChangedEXT (tracking loss is the app's problem in MANUAL).",
     "INV-3.1": "Locate into an XRT_MAX_VIEWS (8)-wide buffer; render/submit the active mode's viewCount, never a hardcoded 2.",
     "INV-4.3": "Per-tile render size = window/canvas x scaleXY, never display size.",
@@ -101,6 +102,14 @@ SRC_PATTERNS = [
      WARN, "INV-3.1",
      "Render/eye loop bounded by a literal 2.",
      "Bound by the active mode's viewCount (eyeCount), not 2 — clamp array reads to viewCountOutput.", True),
+    (re.compile(r"(?:==|!=|>=|<=)\s*XR_SESSION_STATE_(?:SYNCHRONIZED|VISIBLE|FOCUSED)\b"
+                r"|\bXR_SESSION_STATE_(?:SYNCHRONIZED|VISIBLE|FOCUSED)\s*(?:==|!=|>=|<=)"),
+     WARN, "F-1",
+     "Frame loop appears gated on a visibility session-state (SYNCHRONIZED/VISIBLE/FOCUSED).",
+     "Gate the frame loop on a 'session running' flag (set true on READY, false on STOPPING) plus a "
+     "live window/surface, and gate drawing on frameState.shouldRender. A spec-compliant runtime only "
+     "advances READY->SYNCHRONIZED on your FIRST xrBeginFrame, so gating the loop on SYNCHRONIZED+ "
+     "deadlocks at READY (black screen). See F-1 in docs/guides/displayxr-app-rules.md.", False),
 ]
 
 # Tokens that indicate the app uses an sRGB swapchain somewhere (for INV-4.6).
