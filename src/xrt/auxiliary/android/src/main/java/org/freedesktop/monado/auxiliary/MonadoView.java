@@ -44,16 +44,35 @@ public class MonadoView extends SurfaceView
 
     private SystemUiController systemUiController = null;
 
+    // Host activity (when attached to one), so touch on this overlay can be
+    // forwarded to the app. The overlay covers the app's own window, so it's
+    // the only window that receives touch — forwarding lets an in-process app
+    // handle input via Activity.dispatchTouchEvent (#499).
+    @Nullable private Activity hostActivity = null;
+
     public MonadoView(Context context) {
         super(context);
 
         if (context instanceof Activity) {
             Activity activity = (Activity) context;
+            hostActivity = activity;
             systemUiController = new SystemUiController(activity.getWindow().getDecorView());
             systemUiController.hide();
         }
         SurfaceHolder surfaceHolder = getHolder();
         surfaceHolder.addCallback(this);
+    }
+
+    @Override
+    public boolean onTouchEvent(android.view.MotionEvent event) {
+        // Forward to the host activity so the app can handle drag/tap input.
+        // The activity's dispatchTouchEvent goes to its own view hierarchy
+        // (not back to this separate overlay window), so there's no loop.
+        if (hostActivity != null) {
+            hostActivity.dispatchTouchEvent(event);
+            return true; // claim the gesture so we keep receiving MOVE/UP
+        }
+        return super.onTouchEvent(event);
     }
 
     private MonadoView(Context context, long nativePointer) {

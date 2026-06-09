@@ -26,6 +26,7 @@ import android.hardware.display.DisplayManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.MotionEvent
 
 class MainActivity : NativeActivity() {
 
@@ -42,6 +43,12 @@ class MainActivity : NativeActivity() {
 
     // Implemented in main.cpp. rotation = Surface.ROTATION_0/90/180/270 → 0/1/2/3.
     private external fun nativeSetRotation(rotation: Int)
+
+    // Implemented in main.cpp. Forwards touch to the native drag-orbit / mode
+    // handler. The runtime's display surface covers the NativeActivity, so the
+    // native input queue never gets a touchable frame — dispatchTouchEvent on
+    // this (focused) activity window is the path that actually delivers touch.
+    private external fun nativeOnTouch(action: Int, x: Float, y: Float, eventTimeMs: Long)
 
     // True once xrCreateInstance failed with RUNTIME_UNAVAILABLE.
     private external fun nativeRuntimeUnavailable(): Boolean
@@ -148,6 +155,19 @@ class MainActivity : NativeActivity() {
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         pushRotation()
+    }
+
+    // Forward every touch to native (drag-orbit + double-tap mode cycle). This
+    // is the activity-window path; the runtime's display overlay sits on top but
+    // is FLAG_NOT_TOUCHABLE, so touches land here. Use the raw (screen) coords —
+    // the activity window is fullscreen.
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        try {
+            nativeOnTouch(event.actionMasked, event.rawX, event.rawY, event.eventTime)
+        } catch (_: Throwable) {
+            // Native lib not bound yet — ignore until it is.
+        }
+        return true
     }
 
     override fun onResume() {
