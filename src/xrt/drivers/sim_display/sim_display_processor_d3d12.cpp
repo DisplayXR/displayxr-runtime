@@ -469,6 +469,27 @@ sim_dp_d3d12_set_chroma_key(struct xrt_display_processor_d3d12 *xdp,
 	// Alpha-native — no chroma-key fill/strip required.
 }
 
+// #491 part 3 — test double: record the 2D-under backdrop handoff (no captured
+// desktop to composite under). The one-shot WARN proves the runtime → DP
+// set_background_2d wiring works without Leia hardware.
+static void
+sim_dp_d3d12_set_background_2d(struct xrt_display_processor_d3d12 *xdp,
+                              void *background_resource,
+                              uint32_t width,
+                              uint32_t height)
+{
+	(void)xdp;
+	if (background_resource != nullptr) {
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			U_LOG_W("sim_display D3D12 #491 part3: received 2D-under backdrop %ux%u via "
+			        "set_background_2d (test double — handoff recorded, not composited)",
+			        width, height);
+		}
+	}
+}
+
 
 /*
  *
@@ -503,6 +524,7 @@ sim_display_processor_d3d12_create(enum sim_display_output_mode mode,
 	sdp->base.get_predicted_eye_positions = sim_dp_d3d12_get_predicted_eye_positions;
 	sdp->base.is_alpha_native = sim_dp_d3d12_is_alpha_native;
 	sdp->base.set_chroma_key = sim_dp_d3d12_set_chroma_key;
+	sdp->base.set_background_2d = sim_dp_d3d12_set_background_2d; // #491 part 3
 
 	// Nominal viewer parameters (same defaults as sim_display_hmd_create)
 	sdp->ipd_m = 0.06f;

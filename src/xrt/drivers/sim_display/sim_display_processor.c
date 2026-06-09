@@ -63,6 +63,15 @@ struct sim_display_processor
 	//! When true, the app requested a transparent background — clear the
 	//! weave target to alpha=0 so alpha<1 regions stay see-through.
 	bool transparent_bg;
+
+	//! #491 part 3 — the runtime's flattened 2D-under backdrop for the next
+	//! process_atlas (set via set_background_2d). sim_display is a test double:
+	//! it records the handoff (proving the runtime wiring) but does not capture
+	//! a desktop, so it has no `backdrop over desktop` to weave under (the real
+	//! visual proof is the Leia DP). Stored + logged so the slot is a non-NULL
+	//! in-repo consumer exercisable headlessly. VK_NULL_HANDLE ⟹ no backdrop.
+	VkImageView bg_view;
+	uint32_t bg_w, bg_h;
 };
 
 static inline struct sim_display_processor *
@@ -598,6 +607,31 @@ sim_dp_set_chroma_key(struct xrt_display_processor *xdp,
 	sim_display_processor(xdp)->transparent_bg = transparent_bg_enabled;
 }
 
+// #491 part 3 — store the runtime's flattened 2D-under backdrop for the next
+// process_atlas. sim_display is a test double (no captured desktop), so it
+// records the handoff rather than compositing pixels; the one-shot WARN proves
+// the runtime → DP set_background_2d wiring works without Leia hardware.
+static void
+sim_dp_set_background_2d(struct xrt_display_processor *xdp,
+                         VkImageView background_view,
+                         uint32_t width,
+                         uint32_t height)
+{
+	struct sim_display_processor *sdp = sim_display_processor(xdp);
+	sdp->bg_view = background_view;
+	sdp->bg_w = width;
+	sdp->bg_h = height;
+	if (background_view != VK_NULL_HANDLE) {
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			U_LOG_W("sim_display #491 part3: received 2D-under backdrop %ux%u via set_background_2d "
+			        "(test double — handoff recorded, not composited)",
+			        width, height);
+		}
+	}
+}
+
 
 /*
  *
@@ -628,6 +662,7 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 	sdp->base.get_predicted_eye_positions = sim_dp_get_predicted_eye_positions;
 	sdp->base.is_alpha_native = sim_dp_is_alpha_native;
 	sdp->base.set_chroma_key = sim_dp_set_chroma_key;
+	sdp->base.set_background_2d = sim_dp_set_background_2d; // #491 part 3
 
 	// Nominal viewer parameters (same defaults as sim_display_hmd_create)
 	sdp->ipd_m = 0.06f;

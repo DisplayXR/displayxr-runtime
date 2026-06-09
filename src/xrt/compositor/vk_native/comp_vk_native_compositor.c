@@ -236,13 +236,26 @@ struct comp_vk_native_compositor
 	bool local2d_initialized;
 
 	//! twod flatten scratch (B8G8R8A8_UNORM, COLOR_ATTACHMENT|SAMPLED). The
-	//! frame's Local2D layers are flattened here, then sampled as `twod` by the
-	//! masked composite. Lazily (re)allocated to the window region dims.
+	//! frame's OVER Local2D layers (after the projection in list order) are
+	//! flattened here, then sampled as `twod` by the masked composite. Lazily
+	//! (re)allocated to the window region dims.
 	VkImage local2d_scratch;
 	VkDeviceMemory local2d_scratch_mem;
 	VkImageView local2d_scratch_view;
 	VkFramebuffer local2d_scratch_fb;
 	uint32_t local2d_scratch_w, local2d_scratch_h;
+
+	//! #491 part 3 — 2D-under backdrop scratch (same fmt/usage as
+	//! local2d_scratch). The frame's UNDER Local2D layers (before the projection
+	//! in list order) are flattened here PRE-weave and handed to the DP via
+	//! set_background_2d, so the DP composites `backdrop over captured-desktop`
+	//! as the under-3D background. Compositor-owned so it outlives process_atlas
+	//! (the DP samples it). Left in SHADER_READ_ONLY_OPTIMAL after the flatten.
+	VkImage backdrop_scratch;
+	VkDeviceMemory backdrop_scratch_mem;
+	VkImageView backdrop_scratch_view;
+	VkFramebuffer backdrop_scratch_fb;
+	uint32_t backdrop_scratch_w, backdrop_scratch_h;
 
 	//! Weave snapshot scratch (target format, TRANSFER_DST|SAMPLED). The DP
 	//! wrote the woven 3D into the target (RT≠SRV), so the lerp reads this
@@ -277,6 +290,13 @@ struct comp_vk_native_compositor
 	//! implicit mask's canvas-supersede visible to vk_effective_canvas. Set once
 	//! under the frame path at the top of layer_commit.
 	bool local_2d_last_frame;
+
+	//! #491 part 3 — guards vk_local2d_composite_begin_frame (which resets the
+	//! shared descriptor pool) to run at most once per frame. Both the pre-weave
+	//! backdrop flatten and the post-weave overlay composite allocate from the
+	//! one pool; resetting it twice while a shared cmd buffer still references
+	//! the earlier sets is a use-after-reset. Cleared at the top of layer_commit.
+	bool local2d_pool_reset_this_frame;
 };
 
 /*
@@ -1992,6 +2012,15 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
                       uint32_t dst_h,
                       VkImageLayout dst_incoming,
                       VkImageLayout dst_outgoing);
+// #491 part 3 — pre-weave 2D-under backdrop flatten (defined below near the
+// composite). Called before process_atlas; result handed to the DP.
+static VkImageView
+vk_flatten_backdrop_2d(struct comp_vk_native_compositor *c,
+                       VkCommandBuffer cmd,
+                       uint32_t dst_w,
+                       uint32_t dst_h,
+                       uint32_t *out_w,
+                       uint32_t *out_h);
 static void
 vk_release_local2d_state(struct comp_vk_native_compositor *c);
 
@@ -2016,6 +2045,11 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			break;
 		}
 	}
+
+	// #491 part 3 — the Local2D descriptor pool is reset on first use this
+	// frame (vk_local2d_begin_frame_once); both the pre-weave backdrop flatten
+	// and the post-weave overlay composite share it. Reset the per-frame guard.
+	c->local2d_pool_reset_this_frame = false;
 
 	// Phase 1 diagnostic — env-gated per-client commit interval. Mirrors
 	// the same `[CLIENT_FRAME_NS]` line emitted by the D3D11 in-process and
@@ -2324,12 +2358,23 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				dp_target_h = c->canvas.h;
 			}
 
+			// #491 part 3 — flatten this frame's 2D-under layers PRE-weave (into
+			// backdrop_scratch) and hand them to the DP so it composites
+			// `backdrop over captured-desktop` under the 3D. Recorded into `cmd`
+			// here; the dp_self_submits flush below makes the backdrop visible
+			// (in SHADER_READ) before the DP's internal weave samples it. On the
+			// non-self-submit path the flatten's SHADER_READ barrier orders it
+			// within the one submit. VK_NULL_HANDLE ⟹ no under-layers this frame.
+			uint32_t bd_w = 0, bd_h = 0;
+			VkImageView bd_view = vk_flatten_backdrop_2d(c, cmd, dp_target_w, dp_target_h, &bd_w, &bd_h);
+
 			bool dp_self_submits =
 			    xrt_display_processor_is_self_submitting(c->display_processor);
 
 			if (dp_self_submits) {
-				// Flush pre-DP work (window-space composite, atlas crop)
-				// so the DP's internal submit sees a coherent atlas.
+				// Flush pre-DP work (window-space composite, atlas crop,
+				// 2D-under backdrop flatten) so the DP's internal submit sees a
+				// coherent atlas + backdrop.
 				vk->vkEndCommandBuffer(cmd);
 				VkSubmitInfo pre_si = {
 				    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -2341,6 +2386,10 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 					vk->vkQueueWaitIdle(vk->main_queue->queue);
 				}
 			}
+
+			// Hand the DP this frame's backdrop (NULL ⟹ clears it → desktop-only
+			// background). Must precede process_atlas.
+			xrt_display_processor_set_background_2d(c->display_processor, bd_view, bd_w, bd_h);
 
 			xrt_display_processor_process_atlas(
 			    c->display_processor,
@@ -2527,6 +2576,17 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 					vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &target_fb);
 				}
 
+				// #491 part 3 — flatten this frame's 2D-under layers PRE-weave
+				// (into backdrop_scratch) and hand them to the DP so it
+				// composites `backdrop over captured-desktop` under the 3D.
+				// Recorded into `cmd`; the dp_self_submits flush below makes the
+				// backdrop visible (SHADER_READ) before the DP's internal weave
+				// samples it. Independent of target_image, so its order vs the
+				// pre-weave target barrier is irrelevant. NULL ⟹ no under-layers.
+				uint32_t bd_w = 0, bd_h = 0;
+				VkImageView bd_view =
+				    vk_flatten_backdrop_2d(c, cmd, tgt_width, tgt_height, &bd_w, &bd_h);
+
 				// Pre-weave barrier: target → COLOR_ATTACHMENT_OPTIMAL
 				VkImageMemoryBarrier pre_weave = {
 				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -2566,6 +2626,10 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				// that don't expose the slot.
 				xrt_display_processor_set_target_color_view(
 				    c->display_processor, (VkImageView)(uintptr_t)target_view);
+
+				// #491 part 3 — hand the DP this frame's backdrop (NULL ⟹ clears
+				// it → desktop-only background). Must precede process_atlas.
+				xrt_display_processor_set_background_2d(c->display_processor, bd_view, bd_w, bd_h);
 
 				// Call display processor with atlas (or zero-copy swapchain) texture
 				xrt_display_processor_process_atlas(
@@ -3791,12 +3855,204 @@ vk_window_region(struct comp_vk_native_compositor *c, uint32_t dst_w, uint32_t d
 #endif
 }
 
+// #491 part 3 — reset the Local2D descriptor pool at most once per frame. Both
+// the pre-weave backdrop flatten and the post-weave overlay composite allocate
+// sets from the one pool; vk_local2d_composite_begin_frame resets it, which
+// would invalidate sets still referenced by a shared (un-submitted) cmd buffer
+// if called twice. The per-frame guard is cleared at the top of layer_commit.
+static void
+vk_local2d_begin_frame_once(struct comp_vk_native_compositor *c)
+{
+	if (c->local2d_pool_reset_this_frame) {
+		return;
+	}
+	vk_local2d_composite_begin_frame(&c->local2d, &c->vk);
+	c->local2d_pool_reset_this_frame = true;
+}
+
+// Flatten one Local2D layer into @p target_fb (premultiplied), clamped to the
+// region. Shared by the pre-weave backdrop flatten (#491 part 3, under-layers)
+// and the post-weave overlay flatten (#439 Phase 3, over-layers) so the source
+// geometry / flip / unpremult handling stays identical between the two.
+static void
+vk_flatten_one_local2d_layer(struct comp_vk_native_compositor *c,
+                             VkCommandBuffer cmd,
+                             VkFramebuffer target_fb,
+                             struct comp_layer *layer,
+                             uint32_t region_w,
+                             uint32_t region_h)
+{
+	struct vk_bundle *vk = &c->vk;
+	struct xrt_swapchain *sc = layer->sc_array[0];
+	if (sc == NULL) {
+		return;
+	}
+	uint32_t img_idx = layer->data.local_2d.sub.image_index;
+	// sRGB-passthrough: sample the layer's own view (the projection path
+	// samples the same). UNORM-sibling decode is a follow-up if a layer
+	// ever uses an _SRGB swapchain.
+	VkImageView src_view = (VkImageView)(uintptr_t)comp_vk_native_swapchain_get_image_view(sc, img_idx);
+	if (src_view == VK_NULL_HANDLE) {
+		return;
+	}
+
+	const struct xrt_rect *dr = &layer->data.local_2d.rect;
+	int32_t dx = dr->offset.w, dy = dr->offset.h, dw = dr->extent.w, dh = dr->extent.h;
+	if (dw <= 0 || dh <= 0) {
+		return;
+	}
+	int32_t x0 = dx < 0 ? 0 : dx;
+	int32_t y0 = dy < 0 ? 0 : dy;
+	int32_t x1 = (dx + dw) > (int32_t)region_w ? (int32_t)region_w : (dx + dw);
+	int32_t y1 = (dy + dh) > (int32_t)region_h ? (int32_t)region_h : (dy + dh);
+	if (x1 <= x0 || y1 <= y0) {
+		return;
+	}
+	float fx0 = (float)(x0 - dx) / (float)dw;
+	float fy0 = (float)(y0 - dy) / (float)dh;
+	float fx1 = (float)(x1 - dx) / (float)dw;
+	float fy1 = (float)(y1 - dy) / (float)dh;
+
+	struct xrt_normalized_rect nr = layer->data.local_2d.sub.norm_rect;
+	if (nr.w <= 0.0f || nr.h <= 0.0f) {
+		nr.x = 0.0f;
+		nr.y = 0.0f;
+		nr.w = 1.0f;
+		nr.h = 1.0f;
+	}
+	float src_x = nr.x + nr.w * fx0;
+	float src_w = nr.w * (fx1 - fx0);
+	float src_y, src_h;
+	if (layer->data.flip_y) {
+		src_y = nr.y + nr.h * (1.0f - fy0);
+		src_h = -(nr.h * (fy1 - fy0));
+	} else {
+		src_y = nr.y + nr.h * fy0;
+		src_h = nr.h * (fy1 - fy0);
+	}
+	bool unpremult = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
+
+	vk_local2d_composite_flatten_draw(&c->local2d, vk, cmd, target_fb, region_w, region_h, src_view, x0, y0,
+	                                  (uint32_t)(x1 - x0), (uint32_t)(y1 - y0), src_x, src_y, src_w, src_h,
+	                                  unpremult);
+}
+
+// #491 part 3 — flatten the frame's 2D-UNDER Local2D layers (those BEFORE the
+// projection in xrEndFrame list order) into backdrop_scratch (premultiplied),
+// PRE-weave, and return its view + dims so the caller can hand it to the DP via
+// xrt_display_processor_set_background_2d. The DP composites `backdrop over
+// captured-desktop` as the under-3D background, so a semi-transparent backdrop
+// reveals the desktop. Returns VK_NULL_HANDLE (out dims 0) when there are no
+// under-layers (no projection, or all Local2D layers are over-layers) — the
+// caller then clears the DP backdrop. Records into @p cmd only (does NOT
+// submit); leaves backdrop_scratch in SHADER_READ_ONLY_OPTIMAL so it is
+// DP-sampleable and outlives the process_atlas call (compositor-owned image).
+static VkImageView
+vk_flatten_backdrop_2d(struct comp_vk_native_compositor *c,
+                       VkCommandBuffer cmd,
+                       uint32_t dst_w,
+                       uint32_t dst_h,
+                       uint32_t *out_w,
+                       uint32_t *out_h)
+{
+	struct vk_bundle *vk = &c->vk;
+	*out_w = 0;
+	*out_h = 0;
+
+	if (!c->local2d_initialized || !c->local_2d_last_frame) {
+		return VK_NULL_HANDLE;
+	}
+
+	// Under = Local2D layers BEFORE the projection in list order. No projection
+	// ⟹ everything is an over-layer ⟹ no backdrop.
+	int32_t proj_idx = -1;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+		if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+			proj_idx = (int32_t)i;
+			break;
+		}
+	}
+	if (proj_idx < 0) {
+		return VK_NULL_HANDLE;
+	}
+	bool have_under = false;
+	for (int32_t i = 0; i < proj_idx; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
+			have_under = true;
+			break;
+		}
+	}
+	if (!have_under) {
+		return VK_NULL_HANDLE;
+	}
+
+	uint32_t region_w, region_h;
+	vk_window_region(c, dst_w, dst_h, &region_w, &region_h);
+	if (region_w == 0 || region_h == 0) {
+		return VK_NULL_HANDLE;
+	}
+
+	const VkFormat scratch_fmt = VK_FORMAT_B8G8R8A8_UNORM;
+	if (!vk_ensure_rt(c, &c->backdrop_scratch, &c->backdrop_scratch_mem, &c->backdrop_scratch_view,
+	                  &c->backdrop_scratch_fb, &c->backdrop_scratch_w, &c->backdrop_scratch_h, region_w,
+	                  region_h, scratch_fmt,
+	                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+	                      VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+	                  c->local2d.flatten_rp, "backdrop scratch")) {
+		return VK_NULL_HANDLE;
+	}
+
+	vk_local2d_begin_frame_once(c);
+
+	// Clear transparent + → COLOR_ATTACHMENT (mirrors the local2d_scratch prep).
+	vk_cmd_image_barrier_locked(vk, cmd, c->backdrop_scratch, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+	                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, k_color_sub);
+	VkClearColorValue transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
+	vk->vkCmdClearColorImage(cmd, c->backdrop_scratch, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &transparent, 1,
+	                         &k_color_sub);
+	vk_cmd_image_barrier_locked(vk, cmd, c->backdrop_scratch, VK_ACCESS_TRANSFER_WRITE_BIT,
+	                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                            k_color_sub);
+
+	// Flatten ONLY the under-layers (before the projection) into the backdrop.
+	for (int32_t i = 0; i < proj_idx; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
+			continue;
+		}
+		vk_flatten_one_local2d_layer(c, cmd, c->backdrop_scratch_fb, layer, region_w, region_h);
+	}
+
+	vk_cmd_image_barrier_locked(vk, cmd, c->backdrop_scratch, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                            VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		U_LOG_W("VK #491 part3: flattened 2D-under backdrop %ux%u (handed to DP set_background_2d)",
+		        region_w, region_h);
+	}
+
+	*out_w = region_w;
+	*out_h = region_h;
+	return c->backdrop_scratch_view;
+}
+
 // #439 Phase 3 — masked 2D-over-3D composite, POST-weave. The DP has woven the
 // 3D into `dst`; this overlays the frame's 2D content where the zone mask says
-// "2D". Runs only when the frame carries Local2D layers (the `twod` source); a
-// pure explicit-mask-only frame has no 2D pixels on VK (no surround) and is
-// skipped. Returns true if it composited (dst left in dst_outgoing) or false if
-// it skipped (dst untouched, still in dst_incoming).
+// "2D". Runs only when the frame carries OVER Local2D layers (the `twod`
+// source); under-layers (before the projection) are the DP backdrop and are
+// handled pre-weave by vk_flatten_backdrop_2d. A frame whose only Local2D
+// layers are under-layers has no over pixels and is skipped. Returns true if it
+// composited (dst left in dst_outgoing) or false if it skipped (dst untouched,
+// still in dst_incoming).
 static bool
 vk_composite_local_2d(struct comp_vk_native_compositor *c,
                       VkCommandBuffer cmd,
@@ -3823,16 +4079,34 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 	const VkFormat scratch_fmt = VK_FORMAT_B8G8R8A8_UNORM; // matches target (raw weave copy)
 	const VkFormat mask_fmt = VK_FORMAT_R8_UNORM;
 
-	// Collect this frame's Local2D layer rects (for the implicit mask) once.
+	// #491 part 3 — split Local2D layers by list order vs the projection. A
+	// layer BEFORE the projection is a 2D-under backdrop (handled pre-weave by
+	// vk_flatten_backdrop_2d → the DP); AFTER (or with no projection) it is a
+	// 2D-over overlay handled here. is_over(i) == !(proj_idx >= 0 && i < proj_idx).
+	int32_t proj_idx = -1;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+		if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+			proj_idx = (int32_t)i;
+			break;
+		}
+	}
+
+	// Collect this frame's OVER Local2D layer rects (for the implicit mask) once
+	// — under-layers are the backdrop, not part of the overlay mask.
 	struct xrt_rect rects[XRT_MAX_LAYERS];
 	uint32_t rect_count = 0;
 	for (uint32_t i = 0; i < c->layer_accum.layer_count && rect_count < XRT_MAX_LAYERS; i++) {
-		if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
-			rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
+		if (c->layer_accum.layers[i].data.type != XRT_LAYER_LOCAL_2D) {
+			continue;
 		}
+		if (proj_idx >= 0 && (int32_t)i < proj_idx) {
+			continue; // under-layer (backdrop) — skip
+		}
+		rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
 	}
 	if (rect_count == 0) {
-		return false; // local_2d_last_frame stale vs accum — nothing to draw
+		return false; // only under-layers (or stale flag) — nothing to overlay
 	}
 
 	// Resolve the `twod` source: flatten the Local2D layers into local2d_scratch.
@@ -3852,7 +4126,7 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 		return false;
 	}
 
-	vk_local2d_composite_begin_frame(&c->local2d, vk);
+	vk_local2d_begin_frame_once(c);
 
 	// --- twod: clear local2d_scratch transparent, flatten layers, → SHADER_READ.
 	vk_cmd_image_barrier_locked(vk, cmd, c->local2d_scratch, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -3873,59 +4147,12 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
 			continue;
 		}
-		struct xrt_swapchain *sc = layer->sc_array[0];
-		if (sc == NULL) {
+		// #491 part 3 — under-layers are the DP backdrop (handled pre-weave);
+		// the overlay flattens only over-layers.
+		if (proj_idx >= 0 && (int32_t)i < proj_idx) {
 			continue;
 		}
-		uint32_t img_idx = layer->data.local_2d.sub.image_index;
-		// sRGB-passthrough: sample the layer's own view (the projection path
-		// samples the same). UNORM-sibling decode is a follow-up if a layer
-		// ever uses an _SRGB swapchain.
-		VkImageView src_view =
-		    (VkImageView)(uintptr_t)comp_vk_native_swapchain_get_image_view(sc, img_idx);
-		if (src_view == VK_NULL_HANDLE) {
-			continue;
-		}
-
-		const struct xrt_rect *dr = &layer->data.local_2d.rect;
-		int32_t dx = dr->offset.w, dy = dr->offset.h, dw = dr->extent.w, dh = dr->extent.h;
-		if (dw <= 0 || dh <= 0) {
-			continue;
-		}
-		int32_t x0 = dx < 0 ? 0 : dx;
-		int32_t y0 = dy < 0 ? 0 : dy;
-		int32_t x1 = (dx + dw) > (int32_t)region_w ? (int32_t)region_w : (dx + dw);
-		int32_t y1 = (dy + dh) > (int32_t)region_h ? (int32_t)region_h : (dy + dh);
-		if (x1 <= x0 || y1 <= y0) {
-			continue;
-		}
-		float fx0 = (float)(x0 - dx) / (float)dw;
-		float fy0 = (float)(y0 - dy) / (float)dh;
-		float fx1 = (float)(x1 - dx) / (float)dw;
-		float fy1 = (float)(y1 - dy) / (float)dh;
-
-		struct xrt_normalized_rect nr = layer->data.local_2d.sub.norm_rect;
-		if (nr.w <= 0.0f || nr.h <= 0.0f) {
-			nr.x = 0.0f;
-			nr.y = 0.0f;
-			nr.w = 1.0f;
-			nr.h = 1.0f;
-		}
-		float src_x = nr.x + nr.w * fx0;
-		float src_w = nr.w * (fx1 - fx0);
-		float src_y, src_h;
-		if (layer->data.flip_y) {
-			src_y = nr.y + nr.h * (1.0f - fy0);
-			src_h = -(nr.h * (fy1 - fy0));
-		} else {
-			src_y = nr.y + nr.h * fy0;
-			src_h = nr.h * (fy1 - fy0);
-		}
-		bool unpremult = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
-
-		vk_local2d_composite_flatten_draw(&c->local2d, vk, cmd, c->local2d_scratch_fb, region_w,
-		                                  region_h, src_view, x0, y0, (uint32_t)(x1 - x0),
-		                                  (uint32_t)(y1 - y0), src_x, src_y, src_w, src_h, unpremult);
+		vk_flatten_one_local2d_layer(c, cmd, c->local2d_scratch_fb, layer, region_w, region_h);
 	}
 	vk_cmd_image_barrier_locked(vk, cmd, c->local2d_scratch, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 	                            VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -4066,6 +4293,8 @@ vk_release_local2d_state(struct comp_vk_native_compositor *c)
 	}
 	vk_destroy_rt(c, &c->local2d_scratch, &c->local2d_scratch_mem, &c->local2d_scratch_view,
 	              &c->local2d_scratch_fb);
+	vk_destroy_rt(c, &c->backdrop_scratch, &c->backdrop_scratch_mem, &c->backdrop_scratch_view,
+	              &c->backdrop_scratch_fb);
 	vk_destroy_rt(c, &c->weave_scratch, &c->weave_scratch_mem, &c->weave_scratch_view, NULL);
 	vk_destroy_rt(c, &c->implicit_mask_tex, &c->implicit_mask_mem, &c->implicit_mask_view,
 	              &c->implicit_mask_fb);

@@ -201,6 +201,31 @@ struct xrt_display_processor_d3d12
 	 * absent slot or NULL ⟹ DP assumes @ref XRT_ATLAS_ENCODING_ENCODED.
 	 */
 	void (*set_atlas_encoding)(struct xrt_display_processor_d3d12 *xdp, enum xrt_atlas_encoding atlas_encoding);
+
+	/*!
+	 * Hand the DP this frame's flattened 2D-under backdrop (#491 part 3).
+	 * Called once per frame, immediately before @ref process_atlas, when the
+	 * frame carries Local2D layers before the projection (the "under" layers).
+	 * The runtime flattens them into a single premultiplied-RGBA texture in the
+	 * client-window pixel space / canvas rect and passes the resource here. The
+	 * DP composites it OVER its captured desktop background and uses the result
+	 * as the under-3D background for the NEXT process_atlas. The resource must
+	 * outlive that call and be left in a shader-readable state.
+	 *
+	 * Pass NULL (or width/height 0) to clear — desktop-only background.
+	 *
+	 * Optional — absent slot or NULL ⟹ no-op (part-1-only behavior). Appended
+	 * per ADR-020 (append-only within a major).
+	 *
+	 * @param xdp                  Pointer to self.
+	 * @param background_resource  ID3D12Resource* of the flattened backdrop (or NULL to clear).
+	 * @param width                Backdrop width in pixels.
+	 * @param height               Backdrop height in pixels.
+	 */
+	void (*set_background_2d)(struct xrt_display_processor_d3d12 *xdp,
+	                          void *background_resource,
+	                          uint32_t width,
+	                          uint32_t height);
 };
 
 /*
@@ -246,7 +271,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d12, set_chroma_key)  
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d12, destroy)                     == XRT_DP_D3D12_BASE_OFF + 10 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d12, get_handoff_color_capability) == XRT_DP_D3D12_BASE_OFF + 11 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d12, set_atlas_encoding)           == XRT_DP_D3D12_BASE_OFF + 12 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d12)                                == XRT_DP_D3D12_BASE_OFF + 13 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d12, set_background_2d)            == XRT_DP_D3D12_BASE_OFF + 13 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d12)                                == XRT_DP_D3D12_BASE_OFF + 14 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -445,6 +471,23 @@ xrt_display_processor_d3d12_set_atlas_encoding(struct xrt_display_processor_d3d1
 		return;
 	}
 	xdp->set_atlas_encoding(xdp, atlas_encoding);
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d12::set_background_2d
+ * No-op when the DP doesn't expose the slot (older plug-in) or leaves it NULL.
+ * @public @memberof xrt_display_processor_d3d12
+ */
+static inline void
+xrt_display_processor_d3d12_set_background_2d(struct xrt_display_processor_d3d12 *xdp,
+                                              void *background_resource,
+                                              uint32_t width,
+                                              uint32_t height)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, set_background_2d) || xdp->set_background_2d == NULL) {
+		return;
+	}
+	xdp->set_background_2d(xdp, background_resource, width, height);
 }
 
 /*!
