@@ -98,9 +98,14 @@ if(WIN32 AND XRT_HAVE_D3D12)
 		sim_display/sim_display_processor_d3d12.cpp)
 endif()
 
-# GL display processor (GLSL shaders compiled at runtime)
-list(APPEND SIM_DISPLAY_SOURCES
-	sim_display/sim_display_processor_gl.c)
+# GL display processor (GLSL shaders compiled at runtime). Desktop-GL only —
+# Android has no desktop GL native compositor (it uses the VK DP), and the
+# processor's GLAD/ogl_api.h calls don't exist under GLES. Excluding it keeps
+# the Android sim_display plug-in (libdxrp200_sim_display.so) VK-only.
+if(NOT ANDROID)
+	list(APPEND SIM_DISPLAY_SOURCES
+		sim_display/sim_display_processor_gl.c)
+endif()
 
 # macOS visible frame helper (NSScreen query)
 if(APPLE)
@@ -110,7 +115,12 @@ if(APPLE)
 endif()
 
 add_library(drv_sim_display STATIC ${SIM_DISPLAY_SOURCES})
-target_link_libraries(drv_sim_display PRIVATE xrt-interfaces aux_util aux_os aux_ogl PUBLIC drv_includes)
+# aux_ogl is only needed by the desktop-GL display processor, which is excluded
+# on Android above — so don't drag GLES into the Android (VK-only) build.
+target_link_libraries(drv_sim_display PRIVATE xrt-interfaces aux_util aux_os PUBLIC drv_includes)
+if(NOT ANDROID)
+	target_link_libraries(drv_sim_display PRIVATE aux_ogl)
+endif()
 
 # aux_ogl headers (ogl_api.h) are in auxiliary/ogl/
 target_include_directories(drv_sim_display PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary)
@@ -171,25 +181,40 @@ list(APPEND ENABLED_DRIVERS drv_sim_display)
 # resolves because it's evaluated at generate time, when the target exists).
 if(XRT_FEATURE_OPENXR)
 add_library(drv_sim_display_plugin SHARED ${SIM_DISPLAY_SOURCES} sim_display/sim_display_plugin.c)
-target_compile_definitions(drv_sim_display_plugin PRIVATE XRT_USING_RUNTIME_DLL)
-target_link_libraries(
-	drv_sim_display_plugin
-	PRIVATE
-		# DisplayXRClient.lib — import library for the runtime DLL's
-		# aux export surface. Generator expression to skip pulling in
-		# the runtime target's PUBLIC INTERFACE_LINK_LIBRARIES (which
-		# would drag in st_oxr, every compositor, etc.).
-		$<TARGET_LINKER_FILE:${RUNTIME_TARGET}>
-		# Non-exported aux helpers. The linker only pulls in .obj
-		# files that satisfy unresolved symbols, so this does not
-		# duplicate exported TUs into the plug-in DLL.
-		xrt-interfaces
-		aux_util
-		aux_os
-		aux_ogl
-		drv_includes
-	)
-add_dependencies(drv_sim_display_plugin ${RUNTIME_TARGET})
+if(ANDROID)
+	# Android plug-in model: a self-contained .so that STATIC-links aux.
+	# The ADR-019 Option-C aux-export boundary (below) exists to keep a
+	# single file log sink / u_var registry per process on Windows — but
+	# Android logging is logcat (process-global via the kernel), so
+	# per-plug-in aux state is harmless. Hence NO XRT_USING_RUNTIME_DLL
+	# (xrt_api.h §: static-linkers MUST NOT define it — it would turn
+	# XRT_API_FUNC into dllimport and is a no-op on ELF anyway) and NO link
+	# against the runtime .so. aux_ogl is omitted — the GL DP is excluded on
+	# Android (VK-only). The runtime + plug-in .so's co-locate in the APK's
+	# lib dir and the loader preloads siblings by absolute path (#333).
+	target_link_libraries(drv_sim_display_plugin PRIVATE
+		xrt-interfaces aux_util aux_os drv_includes)
+else()
+	target_compile_definitions(drv_sim_display_plugin PRIVATE XRT_USING_RUNTIME_DLL)
+	target_link_libraries(
+		drv_sim_display_plugin
+		PRIVATE
+			# DisplayXRClient.lib — import library for the runtime DLL's
+			# aux export surface. Generator expression to skip pulling in
+			# the runtime target's PUBLIC INTERFACE_LINK_LIBRARIES (which
+			# would drag in st_oxr, every compositor, etc.).
+			$<TARGET_LINKER_FILE:${RUNTIME_TARGET}>
+			# Non-exported aux helpers. The linker only pulls in .obj
+			# files that satisfy unresolved symbols, so this does not
+			# duplicate exported TUs into the plug-in DLL.
+			xrt-interfaces
+			aux_util
+			aux_os
+			aux_ogl
+			drv_includes
+		)
+	add_dependencies(drv_sim_display_plugin ${RUNTIME_TARGET})
+endif()
 target_include_directories(drv_sim_display_plugin PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR}/sim_display
 	${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
@@ -219,13 +244,27 @@ endif()
 # plug-in's own TUs; static archives pulled in from aux_util / aux_os
 # / aux_math carry their original (default-visible) symbols into the
 # plug-in dylib unless we explicitly filter at the link step.
-set_target_properties(drv_sim_display_plugin PROPERTIES
-	OUTPUT_NAME "DisplayXR-SimDisplay"
-	PREFIX ""
-	C_VISIBILITY_PRESET hidden
-	CXX_VISIBILITY_PRESET hidden
-	VISIBILITY_INLINES_HIDDEN ON
-	)
+if(ANDROID)
+	# Android discovery is convention-driven: the loader greps the runtime
+	# APK's lib dir for libdxrp<NNN>_<id>.so where NNN is the probe order
+	# (target_plugin_loader.c §3.2). sim_display is the neutral fallback at
+	# 200. Keep the default SHARED `lib` prefix + `.so` suffix so the file
+	# lands as libdxrp200_sim_display.so.
+	set_target_properties(drv_sim_display_plugin PROPERTIES
+		OUTPUT_NAME "dxrp200_sim_display"
+		C_VISIBILITY_PRESET hidden
+		CXX_VISIBILITY_PRESET hidden
+		VISIBILITY_INLINES_HIDDEN ON
+		)
+else()
+	set_target_properties(drv_sim_display_plugin PROPERTIES
+		OUTPUT_NAME "DisplayXR-SimDisplay"
+		PREFIX ""
+		C_VISIBILITY_PRESET hidden
+		CXX_VISIBILITY_PRESET hidden
+		VISIBILITY_INLINES_HIDDEN ON
+		)
+endif()
 
 # Single-symbol export filter for the plug-in dylib. Mirrors the
 # runtime's exported_symbols.list-driven Mach-O filter and Linux's
@@ -234,7 +273,13 @@ set_target_properties(drv_sim_display_plugin PROPERTIES
 if(APPLE)
 	target_link_options(drv_sim_display_plugin PRIVATE
 		"LINKER:-exported_symbol,_xrtPluginNegotiate")
-elseif(NOT WIN32 AND NOT ANDROID)
+elseif(NOT WIN32)
+	# Android included: the plug-in static-links aux, so without this filter its
+	# ~1700 default-visible aux symbols (u_log, u_var's Tracker, …) get exported
+	# and INTERPOSE the runtime .so's copies when the loader dlopens the plug-in —
+	# corrupting the runtime's logging/state mid-xrCreateInstance (observed: the
+	# runtime goes silent and the instance never comes up). The version script
+	# keeps only xrtPluginNegotiate global; lld honors it on Android. Issue #496.
 	target_link_options(drv_sim_display_plugin PRIVATE
 		"LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/plugin_exports.version")
 endif()

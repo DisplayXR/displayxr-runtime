@@ -215,6 +215,16 @@ android {
             }
 
             cmake.arguments "-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH"
+
+            // Cross-building Android on a host that has a system cJSON
+            // (e.g. macOS `brew install cjson`, Linux `libcjson-dev`) leaks the
+            // host dylib/.so into the aarch64 link via FIND_ROOT_PATH_MODE=BOTH
+            // above (ld.lld: "unknown file type"). Pass -PdxrForceVendoredCjson
+            // to force the bundled cJSON. CI hosts have no system cJSON, so the
+            // default path is unchanged there. Issue #496.
+            if (project.hasProperty('dxrForceVendoredCjson')) {
+                cmake.arguments "-DCMAKE_DISABLE_FIND_PACKAGE_cJSON=ON"
+            }
         }
 
         // Be sure to copy over licenses formatted as required.
@@ -271,7 +281,11 @@ android {
             dimension 'deployment'
             applicationIdSuffix '.in_process'
             externalNativeBuild.cmake.arguments += "-DXRT_FEATURE_SERVICE=OFF"
-            externalNativeBuild.cmake.targets "openxr_displayxr"
+            // Build the vendor-neutral fallback DP plug-in too. CMake emits it
+            // as libdxrp200_sim_display.so; gradle packages it into the APK's
+            // jniLibs/<abi>/, where the runtime's convention-driven discovery
+            // finds it (probe order 200). Issue #496.
+            externalNativeBuild.cmake.targets "openxr_displayxr", "drv_sim_display_plugin"
 
             buildConfigField "boolean", "inProcess", "true"
             resValue "string", "app_name", "DisplayXR"
@@ -280,7 +294,7 @@ android {
             dimension 'deployment'
             applicationIdSuffix '.out_of_process'
             externalNativeBuild.cmake.arguments += "-DXRT_FEATURE_SERVICE=ON"
-            externalNativeBuild.cmake.targets "openxr_displayxr", "monado-service"
+            externalNativeBuild.cmake.targets "openxr_displayxr", "monado-service", "drv_sim_display_plugin"
 
             buildConfigField "boolean", "inProcess", "false"
             resValue "string", "app_name", "DisplayXR"
