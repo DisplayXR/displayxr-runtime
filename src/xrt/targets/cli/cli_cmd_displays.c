@@ -189,6 +189,7 @@ cli_cmd_displays(int argc, const char **argv)
 		cJSON_AddNumberToObject(diag, "gdi_count", (double)list.diag_gdi_count);
 		cJSON_AddNumberToObject(diag, "setupdi_count", (double)list.diag_setupdi_count);
 		cJSON_AddNumberToObject(diag, "edid_read_count", (double)list.diag_edid_read_count);
+		cJSON_AddNumberToObject(diag, "displayconfig_count", (double)list.diag_displayconfig_count);
 		cJSON_AddNumberToObject(diag, "win32_error", (double)list.diag_win32_error);
 
 		char *out = cJSON_Print(root);
