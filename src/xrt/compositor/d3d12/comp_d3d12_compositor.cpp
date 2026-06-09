@@ -240,6 +240,15 @@ struct comp_d3d12_compositor
 	ID3D12DescriptorHeap *local2d_scratch_rtv_heap;
 	uint32_t local2d_scratch_w, local2d_scratch_h;
 
+	//! #491 part 3 — 2D-under backdrop flatten target (same trio as
+	//! local2d_scratch). UNDER Local2D layers (before the projection in list
+	//! order) flatten here PRE-weave, left in PIXEL_SHADER_RESOURCE; the
+	//! ID3D12Resource* is handed to the DP via set_background_2d (the DP creates
+	//! its own shader-visible SRV). Compositor-owned so it outlives process_atlas.
+	ID3D12Resource *backdrop_scratch;
+	ID3D12DescriptorHeap *backdrop_scratch_rtv_heap;
+	uint32_t backdrop_scratch_w, backdrop_scratch_h;
+
 	//! HUD overlay.
 	struct u_hud *hud;
 
@@ -305,6 +314,10 @@ static bool d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
                                        D3D12_RESOURCE_STATES dst_post_state,
                                        uint32_t dst_w, uint32_t dst_h,
                                        const struct u_canvas_rect *eff_canvas);
+// #491 part 3 — pre-weave 2D-under backdrop flatten (defined with the Local2D
+// helpers near the bottom; called from the process_atlas sites above).
+static ID3D12Resource *d3d12_flatten_backdrop_2d(struct comp_d3d12_compositor *c, uint32_t dst_w, uint32_t dst_h,
+                                                 uint32_t *out_w, uint32_t *out_h);
 static void d3d12_release_zone_state(struct comp_d3d12_compositor *c);
 // #439 surround-capture probe (DISPLAYXR_SURROUND_CAPTURE); defined with the
 // zone helpers, called after each path's fence wait in layer_commit.
@@ -1609,6 +1622,13 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				pa_log++;
 			}
 
+			// #491 part 3 — flatten the 2D-under layers PRE-weave (records into
+			// the open cmd_list, leaves backdrop_scratch in PSR) and hand the
+			// resource to the DP. NULL ⟹ no under-layers (DP clears its backdrop).
+			uint32_t bd_w = 0, bd_h = 0;
+			ID3D12Resource *bd_res = d3d12_flatten_backdrop_2d(c, dp_target_w, dp_target_h, &bd_w, &bd_h);
+			xrt_display_processor_d3d12_set_background_2d(c->display_processor, bd_res, bd_w, bd_h);
+
 			xrt_display_processor_d3d12_process_atlas(
 			    c->display_processor,
 			    c->cmd_list,
@@ -1801,6 +1821,14 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			uint32_t content_h = tile_rows * view_height;
 			ID3D12Resource *dp_resource = d3d12_crop_atlas_for_dp(
 			    c, atlas_resource, content_w, content_h);
+
+			// #491 part 3 — flatten the 2D-under layers PRE-weave and hand the
+			// resource to the DP. Done BEFORE the DP viewport/scissor setup
+			// below (the flatten sets its own viewport/scissor; the runtime
+			// re-sets the DP's afterward). NULL ⟹ no under-layers.
+			uint32_t bd_w = 0, bd_h = 0;
+			ID3D12Resource *bd_res = d3d12_flatten_backdrop_2d(c, tgt_width, tgt_height, &bd_w, &bd_h);
+			xrt_display_processor_d3d12_set_background_2d(c->display_processor, bd_res, bd_w, bd_h);
 
 			D3D12_VIEWPORT viewport = {};
 			viewport.TopLeftX = 0.0f;
@@ -3160,6 +3188,17 @@ d3d12_release_zone_state(struct comp_d3d12_compositor *c)
 	}
 	c->local2d_scratch_w = 0;
 	c->local2d_scratch_h = 0;
+	// #491 part 3 — 2D-under backdrop scratch.
+	if (c->backdrop_scratch != nullptr) {
+		c->backdrop_scratch->Release();
+		c->backdrop_scratch = nullptr;
+	}
+	if (c->backdrop_scratch_rtv_heap != nullptr) {
+		c->backdrop_scratch_rtv_heap->Release();
+		c->backdrop_scratch_rtv_heap = nullptr;
+	}
+	c->backdrop_scratch_w = 0;
+	c->backdrop_scratch_h = 0;
 	if (c->implicit_mask_staged != nullptr) {
 		c->implicit_mask_staged->Release();
 		c->implicit_mask_staged = nullptr;
@@ -3489,7 +3528,7 @@ d3d12_update_implicit_mask(struct comp_d3d12_compositor *c,
 // source UVs (matches d3d11_flatten_local_2d_layers). Caller holds c->mutex and
 // has ensured local2d_scratch at (region_w, region_h). Returns false on error.
 static bool
-d3d12_flatten_local_2d_layers(struct comp_d3d12_compositor *c, uint32_t region_w, uint32_t region_h)
+d3d12_flatten_local_2d_layers(struct comp_d3d12_compositor *c, uint32_t region_w, uint32_t region_h, int32_t proj_idx)
 {
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv = c->local2d_scratch_rtv_heap->GetCPUDescriptorHandleForHeapStart();
 
@@ -3507,10 +3546,13 @@ d3d12_flatten_local_2d_layers(struct comp_d3d12_compositor *c, uint32_t region_w
 	const float transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 	c->cmd_list->ClearRenderTargetView(rtv, transparent, 0, nullptr);
 
-	uint32_t slot = 0;
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
 		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
+			continue;
+		}
+		// #491 part 3 — under-layers (before the projection) are the DP backdrop.
+		if (proj_idx >= 0 && (int32_t)i < proj_idx) {
 			continue;
 		}
 		struct xrt_swapchain *sc = layer->sc_array[0];
@@ -3568,7 +3610,10 @@ d3d12_flatten_local_2d_layers(struct comp_d3d12_compositor *c, uint32_t region_w
 
 		bool unpremult = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
 
-		comp_d3d12_renderer_flatten_local_2d(c->renderer, c->cmd_list, rtv.ptr, src_res, slot++, x0, y0,
+		// #491 part 3 — use the layer's accum index as the flatten descriptor
+		// slot (unique across the pre-weave backdrop + this post-weave overlay,
+		// which share flatten_srv_heap within the one deferred cmd list).
+		comp_d3d12_renderer_flatten_local_2d(c->renderer, c->cmd_list, rtv.ptr, src_res, i, x0, y0,
 		                                     (uint32_t)(x1 - x0), (uint32_t)(y1 - y0), src_x, src_y, src_w,
 		                                     src_h, unpremult);
 	}
@@ -3582,6 +3627,210 @@ d3d12_flatten_local_2d_layers(struct comp_d3d12_compositor *c, uint32_t region_w
 	to_psr.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 	c->cmd_list->ResourceBarrier(1, &to_psr);
 	return true;
+}
+
+// #491 part 3 — ensure the 2D-under backdrop scratch (clone of
+// d3d12_ensure_local2d_scratch; separate so a model switch can't dangle it).
+static bool
+d3d12_ensure_backdrop_scratch(struct comp_d3d12_compositor *c, uint32_t w, uint32_t h)
+{
+	if (c->backdrop_scratch != nullptr && c->backdrop_scratch_w == w && c->backdrop_scratch_h == h) {
+		return true;
+	}
+	if (c->backdrop_scratch != nullptr) {
+		c->backdrop_scratch->Release();
+		c->backdrop_scratch = nullptr;
+	}
+	c->backdrop_scratch_w = 0;
+	c->backdrop_scratch_h = 0;
+
+	D3D12_RESOURCE_DESC desc = {};
+	desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	desc.Width = w;
+	desc.Height = h;
+	desc.DepthOrArraySize = 1;
+	desc.MipLevels = 1;
+	desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	desc.SampleDesc.Count = 1;
+	desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+	D3D12_HEAP_PROPERTIES heap = {};
+	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+	D3D12_CLEAR_VALUE clear = {};
+	clear.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+	HRESULT hr = c->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+	                                                D3D12_RESOURCE_STATE_COMMON, &clear,
+	                                                IID_PPV_ARGS(&c->backdrop_scratch));
+	if (FAILED(hr) || c->backdrop_scratch == nullptr) {
+		U_LOG_W("backdrop scratch alloc (%ux%u) failed: 0x%08x", w, h, hr);
+		c->backdrop_scratch = nullptr;
+		return false;
+	}
+
+	if (c->backdrop_scratch_rtv_heap == nullptr) {
+		D3D12_DESCRIPTOR_HEAP_DESC rtv_desc = {};
+		rtv_desc.NumDescriptors = 1;
+		rtv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+		hr = c->device->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&c->backdrop_scratch_rtv_heap));
+		if (FAILED(hr) || c->backdrop_scratch_rtv_heap == nullptr) {
+			U_LOG_W("backdrop scratch RTV heap failed: 0x%08x", hr);
+			c->backdrop_scratch->Release();
+			c->backdrop_scratch = nullptr;
+			return false;
+		}
+	}
+	c->device->CreateRenderTargetView(c->backdrop_scratch, nullptr,
+	                                  c->backdrop_scratch_rtv_heap->GetCPUDescriptorHandleForHeapStart());
+	c->backdrop_scratch_w = w;
+	c->backdrop_scratch_h = h;
+	return true;
+}
+
+// #491 part 3 — flatten this frame's 2D-UNDER Local2D layers (before the
+// projection in list order) into backdrop_scratch PRE-weave and return the
+// ID3D12Resource* (+ region dims) for set_background_2d (the DP creates its own
+// shader-visible SRV; the compose then puts `backdrop over captured-desktop`
+// under the 3D). Returns nullptr (out dims 0) when there are no under-layers.
+// Records into the OPEN c->cmd_list; leaves backdrop_scratch in
+// PIXEL_SHADER_RESOURCE (DP-sampleable, outlives process_atlas). Caller holds
+// c->mutex. Uses each layer's accum index as the flatten slot (unique vs the
+// post-weave overlay flatten that shares flatten_srv_heap in this cmd list).
+static ID3D12Resource *
+d3d12_flatten_backdrop_2d(struct comp_d3d12_compositor *c, uint32_t dst_w, uint32_t dst_h, uint32_t *out_w,
+                          uint32_t *out_h)
+{
+	*out_w = 0;
+	*out_h = 0;
+	if (!c->local_2d_last_frame || c->renderer == nullptr) {
+		return nullptr;
+	}
+
+	int32_t proj_idx = -1;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+		if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+			proj_idx = (int32_t)i;
+			break;
+		}
+	}
+	if (proj_idx < 0) {
+		return nullptr;
+	}
+	bool have_under = false;
+	for (int32_t i = 0; i < proj_idx; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
+			have_under = true;
+			break;
+		}
+	}
+	if (!have_under) {
+		return nullptr;
+	}
+
+	uint32_t region_w = dst_w;
+	uint32_t region_h = dst_h;
+	HWND wnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
+	if (wnd != nullptr) {
+		RECT r;
+		if (GetClientRect(wnd, &r) && r.right > 0 && r.bottom > 0) {
+			region_w = ((uint32_t)r.right < dst_w) ? (uint32_t)r.right : dst_w;
+			region_h = ((uint32_t)r.bottom < dst_h) ? (uint32_t)r.bottom : dst_h;
+		}
+	}
+	if (region_w == 0 || region_h == 0) {
+		return nullptr;
+	}
+
+	if (!d3d12_ensure_backdrop_scratch(c, region_w, region_h)) {
+		return nullptr;
+	}
+
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv = c->backdrop_scratch_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+
+	D3D12_RESOURCE_BARRIER to_rt = {};
+	to_rt.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	to_rt.Transition.pResource = c->backdrop_scratch;
+	to_rt.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+	to_rt.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	to_rt.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	c->cmd_list->ResourceBarrier(1, &to_rt);
+
+	const float transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	c->cmd_list->ClearRenderTargetView(rtv, transparent, 0, nullptr);
+
+	for (int32_t i = 0; i < proj_idx; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
+			continue;
+		}
+		struct xrt_swapchain *sc = layer->sc_array[0];
+		if (sc == nullptr) {
+			continue;
+		}
+		uint32_t img_idx = layer->data.local_2d.sub.image_index;
+		ID3D12Resource *src_res = static_cast<ID3D12Resource *>(comp_d3d12_swapchain_get_resource(sc, img_idx));
+		if (src_res == nullptr) {
+			continue;
+		}
+		const struct xrt_rect *dr = &layer->data.local_2d.rect;
+		int32_t dx = dr->offset.w, dy = dr->offset.h, dw = dr->extent.w, dh = dr->extent.h;
+		if (dw <= 0 || dh <= 0) {
+			continue;
+		}
+		int32_t x0 = dx < 0 ? 0 : dx;
+		int32_t y0 = dy < 0 ? 0 : dy;
+		int32_t x1 = (dx + dw) > (int32_t)region_w ? (int32_t)region_w : (dx + dw);
+		int32_t y1 = (dy + dh) > (int32_t)region_h ? (int32_t)region_h : (dy + dh);
+		if (x1 <= x0 || y1 <= y0) {
+			continue;
+		}
+		float fx0 = (float)(x0 - dx) / (float)dw;
+		float fy0 = (float)(y0 - dy) / (float)dh;
+		float fx1 = (float)(x1 - dx) / (float)dw;
+		float fy1 = (float)(y1 - dy) / (float)dh;
+		struct xrt_normalized_rect nr = layer->data.local_2d.sub.norm_rect;
+		if (nr.w <= 0.0f || nr.h <= 0.0f) {
+			nr.x = 0.0f;
+			nr.y = 0.0f;
+			nr.w = 1.0f;
+			nr.h = 1.0f;
+		}
+		float src_x = nr.x + nr.w * fx0;
+		float src_w = nr.w * (fx1 - fx0);
+		float src_y, src_h;
+		if (layer->data.flip_y) {
+			src_y = nr.y + nr.h * (1.0f - fy0);
+			src_h = -(nr.h * (fy1 - fy0));
+		} else {
+			src_y = nr.y + nr.h * fy0;
+			src_h = nr.h * (fy1 - fy0);
+		}
+		bool unpremult = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
+		comp_d3d12_renderer_flatten_local_2d(c->renderer, c->cmd_list, rtv.ptr, src_res, i, x0, y0,
+		                                     (uint32_t)(x1 - x0), (uint32_t)(y1 - y0), src_x, src_y, src_w,
+		                                     src_h, unpremult);
+	}
+
+	D3D12_RESOURCE_BARRIER to_psr = {};
+	to_psr.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	to_psr.Transition.pResource = c->backdrop_scratch;
+	to_psr.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	to_psr.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	to_psr.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	c->cmd_list->ResourceBarrier(1, &to_psr);
+
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		U_LOG_W("D3D12 #491 part3: flattened 2D-under backdrop %ux%u (handed to DP set_background_2d)",
+		        region_w, region_h);
+	}
+
+	*out_w = region_w;
+	*out_h = region_h;
+	return c->backdrop_scratch;
 }
 
 // #439 — composite the authored zone mask. Records into the OPEN c->cmd_list
@@ -3653,6 +3902,17 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	// Resolve the mask source: an explicit submitted mask wins; else
 	// rasterize the implicit mask from the Local2D layer rects (M=0 inside the
 	// rect union, M=1 elsewhere — records onto the open cmd-list).
+	// #491 part 3 — split Local2D by list order vs the projection: under-layers
+	// (before the projection) are the DP backdrop, excluded from the overlay.
+	int32_t proj_idx = -1;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+		if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+			proj_idx = (int32_t)i;
+			break;
+		}
+	}
+
 	ID3D12Resource *mask_res = nullptr;
 	if (have_explicit) {
 		mask_res = mask->staged;
@@ -3660,9 +3920,13 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 		struct xrt_rect rects[XRT_MAX_LAYERS];
 		uint32_t rect_count = 0;
 		for (uint32_t i = 0; i < c->layer_accum.layer_count && rect_count < XRT_MAX_LAYERS; i++) {
-			if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
-				rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
+			if (c->layer_accum.layers[i].data.type != XRT_LAYER_LOCAL_2D) {
+				continue;
 			}
+			if (proj_idx >= 0 && (int32_t)i < proj_idx) {
+				continue; // under-layer (backdrop) — not part of the overlay mask
+			}
+			rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
 		}
 		mask_res = d3d12_update_implicit_mask(c, rects, rect_count, region_w, region_h);
 	}
@@ -3682,7 +3946,7 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 		if (!d3d12_ensure_scratch(c, &c->weave_scratch, region_w, region_h, dd.Format, "local2d weave")) {
 			return false;
 		}
-		if (!d3d12_flatten_local_2d_layers(c, region_w, region_h)) {
+		if (!d3d12_flatten_local_2d_layers(c, region_w, region_h, proj_idx)) {
 			return false;
 		}
 		twod_res = c->local2d_scratch;
