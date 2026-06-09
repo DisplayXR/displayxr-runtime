@@ -14,6 +14,7 @@
 
 #include <android/log.h>
 #include <android/native_window.h>
+#include <android/asset_manager.h>
 #include <android_native_app_glue.h>
 
 #define XR_USE_PLATFORM_ANDROID
@@ -30,6 +31,10 @@
 #include <cstdio>
 #include <cstring>
 #include <time.h>
+#include <vector>
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 
 #include "shaders/cube.vert.h"
 #include "shaders/cube.frag.h"
@@ -88,8 +93,20 @@ VkPipelineLayout g_cube_layout = VK_NULL_HANDLE;
 VkPipeline g_cube_pipe = VK_NULL_HANDLE;
 VkBuffer g_cube_vbuf = VK_NULL_HANDLE;
 VkDeviceMemory g_cube_vmem = VK_NULL_HANDLE;
-struct CubeVertex { float pos[3]; float color[3]; };
-constexpr uint32_t kCubeVertexCount = 36;
+VkBuffer g_cube_ibuf = VK_NULL_HANDLE;
+VkDeviceMemory g_cube_imem = VK_NULL_HANDLE;
+// Matches cube_handle_vk_win's textured CubeVertex (pos/color/uv/normal/tangent).
+struct CubeVertex { float pos[3]; float color[4]; float uv[2]; float normal[3]; float tangent[3]; };
+constexpr uint32_t kCubeIndexCount = 36;
+
+// Wood_Crate textures (basecolor / normal / AO) sampled by cube.frag.
+VkImage g_tex_image[3] = {};
+VkDeviceMemory g_tex_mem[3] = {};
+VkImageView g_tex_view[3] = {};
+VkSampler g_sampler = VK_NULL_HANDLE;
+VkDescriptorSetLayout g_cube_dsl = VK_NULL_HANDLE;
+VkDescriptorPool g_cube_dpool = VK_NULL_HANDLE;
+VkDescriptorSet g_cube_dset = VK_NULL_HANDLE;
 
 // ─── texture-class state ──────────────────────────────────────────────────
 constexpr VkFormat kSharedFormat = VK_FORMAT_B8G8R8A8_UNORM;
@@ -565,8 +582,22 @@ VkRenderPass make_render_pass(VkFormat color, VkFormat depth, VkImageLayout fina
 bool create_cube_pipeline() {
     g_cube_rp = make_render_pass(g_color_format, kDepthFormat, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
-    VkPushConstantRange pc{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(Mat4)};
+    // Descriptor set layout: 3 combined image samplers (basecolor/normal/AO).
+    VkDescriptorSetLayoutBinding binds[3]{};
+    for (int i = 0; i < 3; ++i) {
+        binds[i].binding = i;
+        binds[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        binds[i].descriptorCount = 1;
+        binds[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dlci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dlci.bindingCount = 3; dlci.pBindings = binds;
+    vkCreateDescriptorSetLayout(g_vk_device, &dlci, nullptr, &g_cube_dsl);
+
+    VkPushConstantRange pc{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(Mat4) * 2};  // mvp + model
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &g_cube_dsl;
     pli.pushConstantRangeCount = 1;
     pli.pPushConstantRanges = &pc;
     vkCreatePipelineLayout(g_vk_device, &pli, nullptr, &g_cube_layout);
@@ -580,13 +611,16 @@ bool create_cube_pipeline() {
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = fs; stages[1].pName = "main";
 
     VkVertexInputBindingDescription vbind{0, sizeof(CubeVertex), VK_VERTEX_INPUT_RATE_VERTEX};
-    VkVertexInputAttributeDescription vattr[2] = {
+    VkVertexInputAttributeDescription vattr[5] = {
         {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(CubeVertex, pos)},
-        {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(CubeVertex, color)},
+        {1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(CubeVertex, color)},
+        {2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(CubeVertex, uv)},
+        {3, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(CubeVertex, normal)},
+        {4, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(CubeVertex, tangent)},
     };
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vbind;
-    vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = vattr;
+    vi.vertexAttributeDescriptionCount = 5; vi.pVertexAttributeDescriptions = vattr;
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
@@ -619,41 +653,160 @@ bool create_cube_pipeline() {
     return r == VK_SUCCESS;
 }
 
-bool create_cube_vertex_buffer() {
-    const float h = 0.12f;
-    // 6 faces, per-face color, 2 tris each.
-    CubeVertex verts[kCubeVertexCount];
-    const float c[6][3] = {{0.9f,0.2f,0.2f},{0.2f,0.9f,0.2f},{0.2f,0.4f,0.95f},
-                           {0.9f,0.9f,0.2f},{0.9f,0.4f,0.9f},{0.2f,0.9f,0.9f}};
-    // cube corners
-    const float P[8][3] = {{-h,-h,-h},{h,-h,-h},{h,h,-h},{-h,h,-h},
-                           {-h,-h,h},{h,-h,h},{h,h,h},{-h,h,h}};
-    const int F[6][4] = {{4,5,6,7},{1,0,3,2},{5,1,2,6},{0,4,7,3},{7,6,2,3},{0,1,5,4}};
-    uint32_t n = 0;
-    for (int f = 0; f < 6; ++f) {
-        int a = F[f][0], b = F[f][1], cc = F[f][2], d = F[f][3];
-        int tri[6] = {a, b, cc, a, cc, d};
-        for (int t = 0; t < 6; ++t) {
-            verts[n].pos[0] = P[tri[t]][0]; verts[n].pos[1] = P[tri[t]][1]; verts[n].pos[2] = P[tri[t]][2];
-            verts[n].color[0] = c[f][0]; verts[n].color[1] = c[f][1]; verts[n].color[2] = c[f][2];
-            ++n;
-        }
-    }
+bool make_hostbuf(VkDeviceSize size, VkBufferUsageFlags usage, const void *data, VkBuffer *outBuf, VkDeviceMemory *outMem) {
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bi.size = sizeof(verts);
-    bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
-    if (vkCreateBuffer(g_vk_device, &bi, nullptr, &g_cube_vbuf) != VK_SUCCESS) return false;
+    bi.size = size; bi.usage = usage;
+    if (vkCreateBuffer(g_vk_device, &bi, nullptr, outBuf) != VK_SUCCESS) return false;
     VkMemoryRequirements req{};
-    vkGetBufferMemoryRequirements(g_vk_device, g_cube_vbuf, &req);
+    vkGetBufferMemoryRequirements(g_vk_device, *outBuf, &req);
     VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = find_mem(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g_vk_device, &mai, nullptr, &g_cube_vmem) != VK_SUCCESS) return false;
-    vkBindBufferMemory(g_vk_device, g_cube_vbuf, g_cube_vmem, 0);
-    void *mapped = nullptr;
-    vkMapMemory(g_vk_device, g_cube_vmem, 0, sizeof(verts), 0, &mapped);
-    std::memcpy(mapped, verts, sizeof(verts));
-    vkUnmapMemory(g_vk_device, g_cube_vmem);
+    if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g_vk_device, &mai, nullptr, outMem) != VK_SUCCESS) return false;
+    vkBindBufferMemory(g_vk_device, *outBuf, *outMem, 0);
+    if (data) {
+        void *m = nullptr;
+        vkMapMemory(g_vk_device, *outMem, 0, size, 0, &m);
+        std::memcpy(m, data, (size_t)size);
+        vkUnmapMemory(g_vk_device, *outMem);
+    }
+    return true;
+}
+
+// Load a Wood_Crate .jpg from the APK assets into g_tex_image[idx] (RGBA8).
+bool load_texture_asset(const char *name, int idx) {
+    AAssetManager *am = g_app->activity->assetManager;
+    AAsset *asset = AAssetManager_open(am, name, AASSET_MODE_BUFFER);
+    int w = 1, h = 1;
+    unsigned char *pixels = nullptr;
+    unsigned char fallback[4] = {200, 180, 140, 255};  // crate-ish tan
+    if (asset) {
+        size_t len = (size_t)AAsset_getLength(asset);
+        const void *buf = AAsset_getBuffer(asset);
+        int ch = 0;
+        pixels = stbi_load_from_memory((const stbi_uc *)buf, (int)len, &w, &h, &ch, 4);
+        AAsset_close(asset);
+    }
+    const unsigned char *src = pixels ? pixels : fallback;
+    if (!pixels) { w = 1; h = 1; LOGW("texture %s missing — fallback", name); }
+    else LOGI("Loaded texture %s (%dx%d)", name, w, h);
+
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ici.extent = {(uint32_t)w, (uint32_t)h, 1};
+    ici.mipLevels = 1; ici.arrayLayers = 1; ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    vkCreateImage(g_vk_device, &ici, nullptr, &g_tex_image[idx]);
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(g_vk_device, g_tex_image[idx], &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = find_mem(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    vkAllocateMemory(g_vk_device, &mai, nullptr, &g_tex_mem[idx]);
+    vkBindImageMemory(g_vk_device, g_tex_image[idx], g_tex_mem[idx], 0);
+
+    VkDeviceSize sz = (VkDeviceSize)w * h * 4;
+    VkBuffer stage = VK_NULL_HANDLE; VkDeviceMemory stageMem = VK_NULL_HANDLE;
+    make_hostbuf(sz, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, src, &stage, &stageMem);
+    if (pixels) stbi_image_free(pixels);
+
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = g_cmd_pool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(g_vk_device, &cai, &cmd);
+    VkCommandBufferBeginInfo bbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bbi);
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = g_tex_image[idx];
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcAccessMask = 0; b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    VkBufferImageCopy cp{};
+    cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    cp.imageExtent = {(uint32_t)w, (uint32_t)h, 1};
+    vkCmdCopyBufferToImage(cmd, stage, g_tex_image[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+    vkQueueSubmit(g_vk_queue, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(g_vk_queue);
+    vkFreeCommandBuffers(g_vk_device, g_cmd_pool, 1, &cmd);
+    vkDestroyBuffer(g_vk_device, stage, nullptr);
+    vkFreeMemory(g_vk_device, stageMem, nullptr);
+
+    VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = g_tex_image[idx]; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCreateImageView(g_vk_device, &vci, nullptr, &g_tex_view[idx]);
+    return true;
+}
+
+bool create_cube_vertex_buffer() {
+    const float s = 0.24f;  // scale win's 0.5 half-extent cube to ~0.12 m
+    CubeVertex verts[24] = {
+        // Front (-Z)
+        {{-0.5f,-0.5f,-0.5f},{1,1,1,1},{0,1},{0,0,-1},{1,0,0}}, {{-0.5f,0.5f,-0.5f},{1,1,1,1},{0,0},{0,0,-1},{1,0,0}},
+        {{0.5f,0.5f,-0.5f},{1,1,1,1},{1,0},{0,0,-1},{1,0,0}},   {{0.5f,-0.5f,-0.5f},{1,1,1,1},{1,1},{0,0,-1},{1,0,0}},
+        // Back (+Z)
+        {{-0.5f,-0.5f,0.5f},{1,1,1,1},{1,1},{0,0,1},{-1,0,0}},  {{0.5f,-0.5f,0.5f},{1,1,1,1},{0,1},{0,0,1},{-1,0,0}},
+        {{0.5f,0.5f,0.5f},{1,1,1,1},{0,0},{0,0,1},{-1,0,0}},    {{-0.5f,0.5f,0.5f},{1,1,1,1},{1,0},{0,0,1},{-1,0,0}},
+        // Top (+Y)
+        {{-0.5f,0.5f,-0.5f},{1,1,1,1},{0,1},{0,1,0},{1,0,0}},   {{-0.5f,0.5f,0.5f},{1,1,1,1},{0,0},{0,1,0},{1,0,0}},
+        {{0.5f,0.5f,0.5f},{1,1,1,1},{1,0},{0,1,0},{1,0,0}},     {{0.5f,0.5f,-0.5f},{1,1,1,1},{1,1},{0,1,0},{1,0,0}},
+        // Bottom (-Y)
+        {{-0.5f,-0.5f,-0.5f},{1,1,1,1},{0,0},{0,-1,0},{1,0,0}}, {{0.5f,-0.5f,-0.5f},{1,1,1,1},{1,0},{0,-1,0},{1,0,0}},
+        {{0.5f,-0.5f,0.5f},{1,1,1,1},{1,1},{0,-1,0},{1,0,0}},   {{-0.5f,-0.5f,0.5f},{1,1,1,1},{0,1},{0,-1,0},{1,0,0}},
+        // Left (-X)
+        {{-0.5f,-0.5f,0.5f},{1,1,1,1},{0,1},{-1,0,0},{0,0,-1}}, {{-0.5f,0.5f,0.5f},{1,1,1,1},{0,0},{-1,0,0},{0,0,-1}},
+        {{-0.5f,0.5f,-0.5f},{1,1,1,1},{1,0},{-1,0,0},{0,0,-1}}, {{-0.5f,-0.5f,-0.5f},{1,1,1,1},{1,1},{-1,0,0},{0,0,-1}},
+        // Right (+X)
+        {{0.5f,-0.5f,-0.5f},{1,1,1,1},{0,1},{1,0,0},{0,0,1}},   {{0.5f,0.5f,-0.5f},{1,1,1,1},{0,0},{1,0,0},{0,0,1}},
+        {{0.5f,0.5f,0.5f},{1,1,1,1},{1,0},{1,0,0},{0,0,1}},     {{0.5f,-0.5f,0.5f},{1,1,1,1},{1,1},{1,0,0},{0,0,1}},
+    };
+    for (auto &v : verts) { v.pos[0] *= s; v.pos[1] *= s; v.pos[2] *= s; }
+    const uint16_t idxs[kCubeIndexCount] = {
+        0,1,2, 0,2,3, 4,5,6, 4,6,7, 8,9,10, 8,10,11,
+        12,13,14, 12,14,15, 16,17,18, 16,18,19, 20,21,22, 20,22,23,
+    };
+    if (!make_hostbuf(sizeof(verts), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, verts, &g_cube_vbuf, &g_cube_vmem)) return false;
+    if (!make_hostbuf(sizeof(idxs), VK_BUFFER_USAGE_INDEX_BUFFER_BIT, idxs, &g_cube_ibuf, &g_cube_imem)) return false;
+
+    // Textures.
+    load_texture_asset("textures/Wood_Crate_001_basecolor.jpg", 0);
+    load_texture_asset("textures/Wood_Crate_001_normal.jpg", 1);
+    load_texture_asset("textures/Wood_Crate_001_ambientOcclusion.jpg", 2);
+
+    VkSamplerCreateInfo smp{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    smp.magFilter = smp.minFilter = VK_FILTER_LINEAR;
+    smp.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    smp.addressModeU = smp.addressModeV = smp.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    smp.maxLod = 1.0f;
+    vkCreateSampler(g_vk_device, &smp, nullptr, &g_sampler);
+
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3};
+    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpi.maxSets = 1; dpi.poolSizeCount = 1; dpi.pPoolSizes = &ps;
+    vkCreateDescriptorPool(g_vk_device, &dpi, nullptr, &g_cube_dpool);
+    VkDescriptorSetAllocateInfo dsa{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dsa.descriptorPool = g_cube_dpool; dsa.descriptorSetCount = 1; dsa.pSetLayouts = &g_cube_dsl;
+    vkAllocateDescriptorSets(g_vk_device, &dsa, &g_cube_dset);
+    VkDescriptorImageInfo dii[3]{}; VkWriteDescriptorSet w[3]{};
+    for (int i = 0; i < 3; ++i) {
+        dii[i].sampler = g_sampler; dii[i].imageView = g_tex_view[i]; dii[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[i].dstSet = g_cube_dset; w[i].dstBinding = i; w[i].descriptorCount = 1;
+        w[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[i].pImageInfo = &dii[i];
+    }
+    vkUpdateDescriptorSets(g_vk_device, 3, w, 0, nullptr);
     return true;
 }
 
@@ -774,15 +927,19 @@ void record_cube(uint32_t v, uint32_t img, const XrView &view) {
     vkCmdSetViewport(cmd, 0, 1, &vpr);
     vkCmdSetScissor(cmd, 0, 1, &sc);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_cube_pipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_cube_layout, 0, 1, &g_cube_dset, 0, nullptr);
     VkDeviceSize off = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &g_cube_vbuf, &off);
+    vkCmdBindIndexBuffer(cmd, g_cube_ibuf, 0, VK_INDEX_TYPE_UINT16);
 
     Mat4 proj = proj_from_fov(view.fov, 0.05f, 100.0f);
     Mat4 vmat = view_from_pose(view.pose);
     Mat4 model = cube_model((float)g_frame_count * 0.01f);
-    Mat4 mvp = mat4_mul(proj, mat4_mul(vmat, model));
-    vkCmdPushConstants(cmd, g_cube_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(Mat4), mvp.m);
-    vkCmdDraw(cmd, kCubeVertexCount, 1, 0, 0);
+    struct { Mat4 mvp; Mat4 model; } pcd;
+    pcd.mvp = mat4_mul(proj, mat4_mul(vmat, model));
+    pcd.model = model;
+    vkCmdPushConstants(cmd, g_cube_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pcd), &pcd);
+    vkCmdDrawIndexed(cmd, kCubeIndexCount, 1, 0, 0, 0);
 
     vkCmdEndRenderPass(cmd);
     vkEndCommandBuffer(cmd);
@@ -985,9 +1142,19 @@ void destroy_all() {
     }
     if (g_cube_pipe) vkDestroyPipeline(g_vk_device, g_cube_pipe, nullptr);
     if (g_cube_layout) vkDestroyPipelineLayout(g_vk_device, g_cube_layout, nullptr);
+    if (g_cube_dpool) vkDestroyDescriptorPool(g_vk_device, g_cube_dpool, nullptr);
+    if (g_cube_dsl) vkDestroyDescriptorSetLayout(g_vk_device, g_cube_dsl, nullptr);
+    if (g_sampler) vkDestroySampler(g_vk_device, g_sampler, nullptr);
+    for (int i = 0; i < 3; ++i) {
+        if (g_tex_view[i]) vkDestroyImageView(g_vk_device, g_tex_view[i], nullptr);
+        if (g_tex_image[i]) vkDestroyImage(g_vk_device, g_tex_image[i], nullptr);
+        if (g_tex_mem[i]) vkFreeMemory(g_vk_device, g_tex_mem[i], nullptr);
+    }
     if (g_cube_rp) vkDestroyRenderPass(g_vk_device, g_cube_rp, nullptr);
     if (g_cube_vbuf) vkDestroyBuffer(g_vk_device, g_cube_vbuf, nullptr);
     if (g_cube_vmem) vkFreeMemory(g_vk_device, g_cube_vmem, nullptr);
+    if (g_cube_ibuf) vkDestroyBuffer(g_vk_device, g_cube_ibuf, nullptr);
+    if (g_cube_imem) vkFreeMemory(g_vk_device, g_cube_imem, nullptr);
     if (g_cmd_pool) vkDestroyCommandPool(g_vk_device, g_cmd_pool, nullptr);
     if (g_app_space) xrDestroySpace(g_app_space);
     if (g_session) xrDestroySession(g_session);
