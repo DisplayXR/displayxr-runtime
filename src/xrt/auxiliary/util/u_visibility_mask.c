@@ -122,3 +122,24 @@ u_visibility_mask_get_default(enum xrt_visibility_mask_type type,
 out:
 	*out_mask = mask; // Always NULL or allocated data.
 }
+
+void
+u_visibility_mask_get_empty(enum xrt_visibility_mask_type type, struct xrt_visibility_mask **out_mask)
+{
+	// Flat panel: nothing is occluded, so every mask type is empty. This is a
+	// valid "no view mask" per the OpenXR spec and keeps all three types
+	// consistent (the CTS requires all-or-none).
+	struct xrt_visibility_mask *mask =
+	    U_CALLOC_WITH_CAST(struct xrt_visibility_mask, sizeof(struct xrt_visibility_mask));
+	if (mask == NULL) {
+		U_LOG_E("failed to allocate out xrt_visibility_mask");
+		*out_mask = NULL;
+		return;
+	}
+
+	mask->type = type;
+	mask->index_count = 0;
+	mask->vertex_count = 0;
+
+	*out_mask = mask;
+}

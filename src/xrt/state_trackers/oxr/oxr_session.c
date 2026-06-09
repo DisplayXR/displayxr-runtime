@@ -3661,9 +3661,7 @@ oxr_session_get_visibility_mask(struct oxr_logger *log,
                                 XrVisibilityMaskKHR *visibilityMask)
 {
 	struct oxr_system *sys = sess->sys;
-	struct xrt_device *xdev = GET_XDEV_BY_ROLE(sess->sys, head);
 	enum xrt_visibility_mask_type type = convert_mask_type(visibilityMaskType);
-	xrt_result_t xret;
 
 	assert(viewIndex < ARRAY_SIZE(sys->visibility_mask));
 
@@ -3676,15 +3674,16 @@ oxr_session_get_visibility_mask(struct oxr_logger *log,
 		sys->visibility_mask[viewIndex] = NULL;
 	}
 
-	// If we didn't have any cached mask get it.
+	// If we didn't have any cached mask, build one. DisplayXR drives flat
+	// panels with no lens occlusion, so nothing is hidden and the whole view is
+	// visible — represented as an empty mask. (The head device's FoV-scaled
+	// default mask is invalid for the off-axis Kooima projection: its winding
+	// fails the CTS counter-clockwise-around-origin check.)
 	if (mask == NULL) {
-		xret = xrt_device_get_visibility_mask(xdev, type, viewIndex, &mask);
-		if (xret == XRT_ERROR_NOT_IMPLEMENTED && xdev->hmd != NULL) {
-			const struct xrt_fov fov = xdev->hmd->distortion.fov[viewIndex];
-			u_visibility_mask_get_default(type, &fov, &mask);
-			xret = XRT_SUCCESS;
+		u_visibility_mask_get_empty(type, &mask);
+		if (mask == NULL) {
+			return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "failed to allocate visibility mask");
 		}
-		OXR_CHECK_XRET(log, sess, xret, get_visibility_mask);
 		sys->visibility_mask[viewIndex] = mask;
 	}
 
