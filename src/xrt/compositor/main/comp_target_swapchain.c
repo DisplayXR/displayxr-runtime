@@ -724,11 +724,26 @@ comp_target_swapchain_create_images(struct comp_target *ct, const struct comp_ta
 	 * Non-failable selections.
 	 */
 
+	// Pick the surface pre-transform. Default: match the surface's current
+	// transform so the WSI rotates our output for us.
+	VkSurfaceTransformFlagBitsKHR pre_transform = surface_caps.currentTransform;
+#ifdef XRT_OS_ANDROID
+	// Match in-process vk_native (LOXR-730/733): on Android pre-rotation the
+	// surface reports panel-native extent + currentTransform=ROTATE_90 when the
+	// device is held rotated. Presenting with preTransform=ROTATE_90 makes the
+	// WSI rotate our composited buffer, which out-of-process shows up as a
+	// wrong-orientation image. Force IDENTITY so the buffer scans out 1:1 onto
+	// the panel; orientation is handled upstream (Kooima aspect / DP weave).
+	if (surface_caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) {
+		pre_transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+	}
+#endif
+
 	// Get the extents of the swapchain.
 	VkExtent2D extent = select_extent(cts, surface_caps, create_info->extent);
 
-	if (surface_caps.currentTransform & VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
-	    surface_caps.currentTransform & VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) {
+	if (pre_transform & VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
+	    pre_transform & VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) {
 		COMP_DEBUG(ct->c, "Swapping width and height, since we are going to pre rotate");
 		uint32_t w2 = extent.width;
 		uint32_t h2 = extent.height;
@@ -776,7 +791,7 @@ comp_target_swapchain_create_images(struct comp_target *ct, const struct comp_ta
 	    .imageUsage = create_info->image_usage,
 	    .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
 	    .queueFamilyIndexCount = 0,
-	    .preTransform = surface_caps.currentTransform,
+	    .preTransform = pre_transform,
 	    .compositeAlpha = composite_alpha,
 	    .presentMode = cts->present_mode,
 	    .clipped = VK_TRUE,
@@ -808,7 +823,7 @@ comp_target_swapchain_create_images(struct comp_target *ct, const struct comp_ta
 	cts->base.height = extent.height;
 	cts->base.format = cts->surface.format.format;
 	cts->base.final_layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-	cts->base.surface_transform = surface_caps.currentTransform;
+	cts->base.surface_transform = pre_transform;
 
 	create_image_views(cts);
 

@@ -1889,6 +1889,31 @@ multi_compositor_get_window_metrics(struct multi_compositor *mc, struct xrt_wind
 			    mc->session_render.external_window_handle, info, out_metrics);
 		}
 #endif
+
+#ifdef XRT_OS_ANDROID
+		// Out-of-process Android (#510): report the live present-target extent
+		// in pixels so the client's oxr can swap the display meters to match the
+		// held orientation (#499 Kooima aspect — landscape atlas on a portrait
+		// panel). Pixels only; oxr derives meters from the display dims + the
+		// orientation swap. Runs after the DP path so a vendor DP (Leia) can
+		// still provide precise metrics; sim_display's DP returns none.
+		if (mc->session_render.use_android_surface && mc->session_render.target != NULL) {
+			struct comp_target *ct = mc->session_render.target;
+			if (ct->width > 0 && ct->height > 0) {
+				out_metrics->window_pixel_width = ct->width;
+				out_metrics->window_pixel_height = ct->height;
+				out_metrics->display_pixel_width = ct->width;
+				out_metrics->display_pixel_height = ct->height;
+				out_metrics->window_screen_left = 0;
+				out_metrics->window_screen_top = 0;
+				out_metrics->display_screen_left = 0;
+				out_metrics->display_screen_top = 0;
+				out_metrics->window_orientation = (struct xrt_quat){0, 0, 0, 1};
+				out_metrics->valid = true;
+				return true;
+			}
+		}
+#endif
 	}
 
 	// No main compositor available — metrics only from per-session paths above.
