@@ -1373,6 +1373,17 @@ create_pipeline()
 	VkPipelineColorBlendAttachmentState cba = {};
 	cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
 	                     VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+	// HUD-only pipeline → alpha blend via a DYNAMIC blend constant, so the HUD
+	// can draw a translucent panel (low constant alpha) and crisp opaque text
+	// (alpha 1) in two passes. CubeVertex carries no alpha, so the per-draw
+	// blend constant supplies it (vkCmdSetBlendConstants before each pass).
+	cba.blendEnable = VK_TRUE;
+	cba.srcColorBlendFactor = VK_BLEND_FACTOR_CONSTANT_ALPHA;
+	cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+	cba.colorBlendOp = VK_BLEND_OP_ADD;
+	cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+	cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+	cba.alphaBlendOp = VK_BLEND_OP_ADD;
 	VkPipelineColorBlendStateCreateInfo cb = {};
 	cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
 	cb.attachmentCount = 1;
@@ -1386,10 +1397,11 @@ create_pipeline()
 	ds.depthWriteEnable = VK_TRUE;
 	ds.depthCompareOp = VK_COMPARE_OP_LESS;
 
-	const VkDynamicState dyn_states[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+	const VkDynamicState dyn_states[3] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+	                                      VK_DYNAMIC_STATE_BLEND_CONSTANTS};
 	VkPipelineDynamicStateCreateInfo dyn = {};
 	dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-	dyn.dynamicStateCount = 2;
+	dyn.dynamicStateCount = 3;
 	dyn.pDynamicStates = dyn_states;
 
 	VkGraphicsPipelineCreateInfo gpi = {};
@@ -1594,22 +1606,54 @@ hud_ftoa(float val, char *buf, size_t cap)
 	snprintf(buf, cap, "%s%d.%02d", neg ? "-" : "+", whole, frac);
 }
 
-// Build the HUD geometry into the mapped buffer. Returns the vertex count.
+// Vertex count of the translucent panel (drawn first, at low blend-constant
+// alpha); the remaining verts are the opaque text. Set by build_hud().
+static uint32_t g_hud_panel_n = 0;
+
+// A filled axis-aligned rect (two triangles) in HUD NDC.
+static uint32_t
+hud_rect(CubeVertex *v, uint32_t n, float x0, float y0, float x1, float y1, float z, const float c[3])
+{
+	return hud_quad(v, n, x0, y0, x1, y1, z, c);
+}
+
+// Build the HUD geometry into the mapped buffer. Returns the total vertex count;
+// g_hud_panel_n holds the leading panel-vertex count for the two-pass draw.
+// Layout: a slick rounded translucent panel in the TOP-LEFT, with the tracked
+// face position (display-space, the face-dot frame) as three stacked lines.
 static uint32_t
 build_hud(CubeVertex *v)
 {
 	uint32_t n = 0;
-	const float px = 0.016f, py = 0.026f;  // glyph pixel size in NDC
-	const float white[3] = {1.0f, 1.0f, 1.0f};
 
-	// Eye-position readout (BG toggle button removed; background is always
-	// clean black now). oy=-0.80 with the HUD's vflip lands it at the TOP edge.
-	char xs[16], ys[16], zs[16], line[64];
-	hud_ftoa(g_eye_x.load(std::memory_order_relaxed), xs, sizeof xs);
-	hud_ftoa(g_eye_y.load(std::memory_order_relaxed), ys, sizeof ys);
-	hud_ftoa(g_eye_z.load(std::memory_order_relaxed), zs, sizeof zs);
-	snprintf(line, sizeof line, "X%s Y%s Z%s", xs, ys, zs);
-	n = hud_text(v, n, line, -0.98f, -0.80f, px, py, 0.04f, white);
+	// ── translucent rounded panel (drawn first; alpha comes from the blend
+	// constant). The HUD MVP v-flips Y, so y≈-0.80 is the TOP edge; the panel
+	// hangs down from there into the top-left corner. Rounded corners are the
+	// classic two-overlapping-rects approximation (a horizontal band + a
+	// vertical band leaves the four corners chamfered/rounded).
+	const float panel[3] = {0.05f, 0.06f, 0.12f};  // dark slate
+	const float x0 = -0.975f, y0 = -0.800f;        // top-left
+	const float x1 = -0.545f, y1 = -0.520f;        // bottom-right
+	const float r = 0.028f;                         // corner radius
+	const float zp = 0.050f;
+	n = hud_rect(v, n, x0,     y0 + r, x1,     y1 - r, zp, panel);  // full width
+	n = hud_rect(v, n, x0 + r, y0,     x1 - r, y1,     zp, panel);  // full height
+	g_hud_panel_n = n;
+
+	// ── face-position readout: three stacked lines, opaque white, on top.
+	const float px = 0.012f, py = 0.015f;
+	const float zt = 0.045f;  // slightly nearer than the panel → drawn on top
+	const float white[3] = {0.92f, 0.96f, 1.0f};
+	char b[16], line[24];
+	hud_ftoa(g_eye_x.load(std::memory_order_relaxed), b, sizeof b);
+	snprintf(line, sizeof line, "X %s", b);
+	n = hud_text(v, n, line, x0 + 0.035f, -0.775f, px, py, zt, white);
+	hud_ftoa(g_eye_y.load(std::memory_order_relaxed), b, sizeof b);
+	snprintf(line, sizeof line, "Y %s", b);
+	n = hud_text(v, n, line, x0 + 0.035f, -0.695f, px, py, zt, white);
+	hud_ftoa(g_eye_z.load(std::memory_order_relaxed), b, sizeof b);
+	snprintf(line, sizeof line, "Z %s", b);
+	n = hud_text(v, n, line, x0 + 0.035f, -0.615f, px, py, zt, white);
 	return n;
 }
 
@@ -1944,7 +1988,18 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 			                   sizeof(hud_mvp), &hud_mvp);
 			VkDeviceSize hud_off = 0;
 			vkCmdBindVertexBuffers(cmd, 0, 1, &g_hud_vbuf, &hud_off);
-			vkCmdDraw(cmd, hud_n, 1, 0, 0);
+			// Pass 1: translucent panel (blend-constant alpha < 1).
+			if (g_hud_panel_n > 0) {
+				const float panel_alpha[4] = {0.0f, 0.0f, 0.0f, 0.62f};
+				vkCmdSetBlendConstants(cmd, panel_alpha);
+				vkCmdDraw(cmd, g_hud_panel_n, 1, 0, 0);
+			}
+			// Pass 2: opaque text on top.
+			if (hud_n > g_hud_panel_n) {
+				const float text_alpha[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+				vkCmdSetBlendConstants(cmd, text_alpha);
+				vkCmdDraw(cmd, hud_n - g_hud_panel_n, 1, g_hud_panel_n, 0);
+			}
 		}
 	}
 
@@ -2131,6 +2186,14 @@ render_frame()
 	if (frame_state.shouldRender) {
 		XrViewState view_state = {};
 		view_state.type = XR_TYPE_VIEW_STATE;
+		// Request the RAW display-space eyes the DP reported (display-center
+		// meters, +X right +Y up, already orientation-rotated). This is the
+		// face-tracking position — the dot you'd draw mirroring the user's head —
+		// independent of the orbit camera (unlike the world-space view poses).
+		XrViewDisplayRawEXT view_raw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+		if (g_has_view_rig) {
+			view_state.next = &view_raw;
+		}
 		XrViewLocateInfo locate_info = {};
 		locate_info.type = XR_TYPE_VIEW_LOCATE_INFO;
 		locate_info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -2180,16 +2243,29 @@ render_frame()
 			// tile. Live-tunable: adb shell setprop debug.dxr.leia.swap_lr 1
 			const bool swap_lr = get_prop_float("debug.dxr.leia.swap_lr", 0.0f) != 0.0f;
 
-			// Cache the tracked head-center (midpoint of the first two eye
-			// poses — always located since g_max_view_count >= 2) for the
-			// on-screen marker + the Kotlin overlay readout.
-			const uint32_t e1 = (located_view_count >= 2) ? 1 : 0;
-			g_eye_x.store(0.5f * (views[0].pose.position.x + views[e1].pose.position.x),
-			              std::memory_order_relaxed);
-			g_eye_y.store(0.5f * (views[0].pose.position.y + views[e1].pose.position.y),
-			              std::memory_order_relaxed);
-			g_eye_z.store(0.5f * (views[0].pose.position.z + views[e1].pose.position.z),
-			              std::memory_order_relaxed);
+			// Cache the tracked head-center for the HUD readout. Use the RAW
+			// display-space eyes (view_raw.rawEyes — display-center meters, the
+			// face-dot frame) rather than the world-space view poses, so the
+			// numbers mirror the user's actual head position and DON'T move when
+			// the cube is orbited. Fall back to the view poses if the raw channel
+			// wasn't filled (e.g. view-rig unsupported).
+			if (g_has_view_rig && view_raw.eyeCountOutput > 0) {
+				const uint32_t r1 = (view_raw.eyeCountOutput >= 2) ? 1 : 0;
+				g_eye_x.store(0.5f * (view_raw.rawEyes[0].x + view_raw.rawEyes[r1].x),
+				              std::memory_order_relaxed);
+				g_eye_y.store(0.5f * (view_raw.rawEyes[0].y + view_raw.rawEyes[r1].y),
+				              std::memory_order_relaxed);
+				g_eye_z.store(0.5f * (view_raw.rawEyes[0].z + view_raw.rawEyes[r1].z),
+				              std::memory_order_relaxed);
+			} else {
+				const uint32_t e1 = (located_view_count >= 2) ? 1 : 0;
+				g_eye_x.store(0.5f * (views[0].pose.position.x + views[e1].pose.position.x),
+				              std::memory_order_relaxed);
+				g_eye_y.store(0.5f * (views[0].pose.position.y + views[e1].pose.position.y),
+				              std::memory_order_relaxed);
+				g_eye_z.store(0.5f * (views[0].pose.position.z + views[e1].pose.position.z),
+				              std::memory_order_relaxed);
+			}
 
 			// SINGLE atlas swapchain: one acquire, one tiled render pass (all
 			// `submit_views` tiles), one release.
@@ -2445,12 +2521,15 @@ process_touch_event(int32_t action, float x, float y, int64_t time_ms)
 			last_up_ms = 0;  // a drag breaks any pending double-tap
 			break;
 		}
-		// Two taps within ~300 ms → cycle the rendering mode.
+		// Two taps within ~300 ms → reset the view (re-center the orbit camera),
+		// like Space on the Windows app. Rendering-mode switching stays available
+		// via `adb shell setprop debug.dxr.mode N`.
 		const int64_t dt = time_ms - last_up_ms;
 		if (last_up_ms != 0 && dt > 0 && dt < 300) {
-			LOGI("double-tap → cycle rendering mode");
-			cycle_mode();
-			last_up_ms = 0;  // reset so a triple-tap isn't two cycles
+			LOGI("double-tap → reset view (orbit re-centered)");
+			g_cam_yaw.store(0.0f, std::memory_order_relaxed);
+			g_cam_pitch.store(0.0f, std::memory_order_relaxed);
+			last_up_ms = 0;  // reset so a triple-tap isn't two resets
 		} else {
 			last_up_ms = time_ms;
 		}
