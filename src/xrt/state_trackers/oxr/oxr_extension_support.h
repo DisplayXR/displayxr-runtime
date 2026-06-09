@@ -538,6 +538,18 @@
 
 
 /*
+ * XR_EXT_android_surface_binding
+ */
+#if defined(XR_EXT_android_surface_binding) && defined(XR_USE_PLATFORM_ANDROID)
+#define OXR_HAVE_EXT_android_surface_binding
+#define OXR_EXTENSION_SUPPORT_EXT_android_surface_binding(_) \
+    _(EXT_android_surface_binding, EXT_ANDROID_SURFACE_BINDING)
+#else
+#define OXR_EXTENSION_SUPPORT_EXT_android_surface_binding(_)
+#endif
+
+
+/*
  * XR_EXT_macos_gl_binding
  */
 #if defined(XR_EXT_macos_gl_binding) && defined(XR_USE_PLATFORM_MACOS)
@@ -1095,6 +1107,7 @@
     OXR_EXTENSION_SUPPORT_EXT_win32_appcontainer_compatible(_) \
     OXR_EXTENSION_SUPPORT_EXT_win32_window_binding(_) \
     OXR_EXTENSION_SUPPORT_EXT_cocoa_window_binding(_) \
+    OXR_EXTENSION_SUPPORT_EXT_android_surface_binding(_) \
     OXR_EXTENSION_SUPPORT_EXT_macos_gl_binding(_) \
     OXR_EXTENSION_SUPPORT_EXT_display_info(_) \
     OXR_EXTENSION_SUPPORT_EXT_spatial_workspace(_) \

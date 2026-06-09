@@ -253,6 +253,9 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
                                 XrGraphicsBindingVulkanKHR const *next,
                                 void *window_handle,
                                 void *shared_texture_handle,
+                                uint32_t shared_image_width,
+                                uint32_t shared_image_height,
+                                uint32_t shared_image_format,
                                 bool transparent_background,
                                 uint32_t chroma_key_color,
                                 struct oxr_session *sess)
@@ -272,11 +275,13 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 
 #ifdef XRT_OS_ANDROID
 	// POC plumbing for XR_EXT_android_surface_binding. Apps don't pass an
-	// ANativeWindow* yet, so spawn a SurfaceView on the activity via
-	// android_custom_surface (existing Monado machinery) and block briefly
+	// ANativeWindow* yet (handle class), so spawn a SurfaceView on the activity
+	// via android_custom_surface (existing Monado machinery) and block briefly
 	// for its ANativeWindow. Leaks the handle for now — process scope,
-	// single-app POC.
-	if (window_handle == NULL) {
+	// single-app POC. SKIPPED in texture-class mode: there the app owns
+	// presentation and hands us a shared VkImage (shared_texture_handle != NULL)
+	// to weave into, so the runtime needs no surface of its own.
+	if (window_handle == NULL && shared_texture_handle == NULL) {
 		struct _JavaVM *vm = (struct _JavaVM *)android_globals_get_vm();
 		void *activity = android_globals_get_activity();
 		if (vm == NULL || activity == NULL) {
@@ -305,6 +310,31 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	}
 #endif
 
+	// On Android the void* shared_texture_handle is a raw app-owned VkImage,
+	// not a queryable native handle — pack it with its dims/format into a
+	// descriptor the compositor reads. The descriptor's address replaces the
+	// raw handle for the (synchronous) create call below. Other platforms pass
+	// their native handle (HANDLE / IOSurfaceRef) through unchanged.
+	void *compositor_shared_handle = shared_texture_handle;
+#ifdef XRT_OS_ANDROID
+	struct comp_vk_native_shared_image android_shared_image;
+	if (shared_texture_handle != NULL) {
+		android_shared_image.image = (uint64_t)(uintptr_t)shared_texture_handle;
+		android_shared_image.width = shared_image_width;
+		android_shared_image.height = shared_image_height;
+		android_shared_image.format = shared_image_format;
+		compositor_shared_handle = &android_shared_image;
+		U_LOG_IFL_I(U_LOGGING_INFO,
+		            "Android texture mode: app VkImage %p (%ux%u fmt=%u) as weave target",
+		            shared_texture_handle, shared_image_width, shared_image_height,
+		            shared_image_format);
+	}
+#else
+	(void)shared_image_width;
+	(void)shared_image_height;
+	(void)shared_image_format;
+#endif
+
 	// Create the VK native compositor
 	xrt_result_t xret = comp_vk_native_compositor_create(
 	    xdev, window_handle,
@@ -313,7 +343,7 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	    (void *)next->device,
 	    next->queueFamilyIndex,
 	    next->queueIndex,
-	    dp_factory_vk, shared_texture_handle,
+	    dp_factory_vk, compositor_shared_handle,
 	    transparent_background, chroma_key_color,
 	    display_screen_left, display_screen_top,
 	    &xcn);

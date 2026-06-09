@@ -24,6 +24,26 @@ extern "C" {
 #endif
 
 /*!
+ * Android texture-class shared image descriptor.
+ *
+ * On Android the app and runtime share one VkDevice, so an app-owned VkImage
+ * can be used directly as the compositor's weave-output target with no
+ * external-memory import. The session layer fills this from
+ * XrAndroidSurfaceBindingCreateInfoEXT and passes its address as
+ * @p shared_texture_handle to comp_vk_native_compositor_create (the void*
+ * meaning is platform-specific: HANDLE on Windows, IOSurfaceRef on macOS, and
+ * a pointer to this descriptor on Android). Valid only for the duration of the
+ * synchronous create call.
+ */
+struct comp_vk_native_shared_image
+{
+	uint64_t image;   //!< VkImage handle (non-dispatchable, 64-bit)
+	uint32_t width;   //!< width in pixels
+	uint32_t height;  //!< height in pixels
+	uint32_t format;  //!< VkFormat as a uint32_t
+};
+
+/*!
  * Create a native Vulkan compositor.
  *
  * This compositor renders directly using Vulkan without the multi-compositor,

@@ -2359,6 +2359,9 @@ oxr_session_create_impl(struct oxr_logger *log,
 		if (oxr_vk_native_compositor_supported(sys, xsi->external_window_handle)) {
 			void *window_handle = xsi->external_window_handle;
 			void *shared_texture_handle = xsi->shared_texture_handle;
+			uint32_t shared_image_width = 0;
+			uint32_t shared_image_height = 0;
+			uint32_t shared_image_format = 0;
 
 #ifdef XRT_OS_MACOS
 			// On macOS, extract from cocoa_window_binding
@@ -2376,6 +2379,27 @@ oxr_session_create_impl(struct oxr_logger *log,
 			// via VK_EXT_metal_objects import.
 #endif
 
+#ifdef XRT_OS_ANDROID
+			// Texture-class on Android: the app hands us its own ANativeWindow
+			// and/or a shared VkImage weave target via the android surface
+			// binding. Read leniently from the chain (the in-process POC channel
+			// for XR_EXT_android_surface_binding).
+			const XrAndroidSurfaceBindingCreateInfoEXT *android_binding = OXR_GET_INPUT_FROM_CHAIN(
+			    createInfo, XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_EXT,
+			    XrAndroidSurfaceBindingCreateInfoEXT);
+			if (android_binding != NULL) {
+				if (android_binding->window != NULL) {
+					window_handle = android_binding->window;
+				}
+				if (android_binding->sharedImage != 0) {
+					shared_texture_handle = (void *)(uintptr_t)android_binding->sharedImage;
+					shared_image_width = android_binding->sharedImageWidth;
+					shared_image_height = android_binding->sharedImageHeight;
+					shared_image_format = android_binding->sharedImageFormat;
+				}
+			}
+#endif
+
 			xrt_result_t xret = xrt_system_create_session(
 			    sys->xsys, xsi, &(*out_session)->xs, NULL);
 			if (xret == XRT_ERROR_MULTI_SESSION_NOT_IMPLEMENTED) {
@@ -2388,6 +2412,7 @@ oxr_session_create_impl(struct oxr_logger *log,
 			}
 			return oxr_session_populate_vk_native(
 			    log, sys, vulkan, window_handle, shared_texture_handle,
+			    shared_image_width, shared_image_height, shared_image_format,
 			    xsi->transparent_background_enabled,
 			    xsi->chroma_key_color, *out_session);
 		}
