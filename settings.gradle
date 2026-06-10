@@ -37,3 +37,6 @@ project(':test_apps:cube_handle_vk_android').projectDir = new File(rootDir, 'tes
 
 include ':test_apps:model_viewer_vk_android'
 project(':test_apps:model_viewer_vk_android').projectDir = new File(rootDir, 'test_apps/model_viewer_vk_android')
+
+include ':test_apps:mediaplayer_vk_android'
+project(':test_apps:mediaplayer_vk_android').projectDir = new File(rootDir, 'test_apps/mediaplayer_vk_android')
