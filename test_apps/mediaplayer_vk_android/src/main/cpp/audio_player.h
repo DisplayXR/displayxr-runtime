@@ -27,6 +27,12 @@ struct AudioPlayer {
 
 	void setPaused(bool p);
 	void seekRelative(double deltaSeconds);
+	void seekTo(double seconds)
+	{
+		if (open_.load(std::memory_order_relaxed))
+			seekRequestUs_.store((int64_t)(seconds < 0 ? 0 : seconds * 1e6),
+			                     std::memory_order_relaxed);
+	}
 
 	// Playback position in seconds (PTS of the last buffer handed to AAudio), or
 	// -1 when unavailable. This is the A/V master clock.

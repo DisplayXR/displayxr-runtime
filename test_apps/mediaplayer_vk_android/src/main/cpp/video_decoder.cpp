@@ -185,6 +185,16 @@ VideoDecoder::seekRelative(double deltaSeconds)
 }
 
 void
+VideoDecoder::seekTo(double seconds)
+{
+	if (!open_.load(std::memory_order_relaxed)) return;
+	int64_t target = (int64_t)(seconds * 1e6);
+	if (target < 0) target = 0;
+	if (durationUs_ > 0 && target > durationUs_) target = durationUs_;
+	seekRequestUs_.store(target, std::memory_order_relaxed);
+}
+
+void
 VideoDecoder::decodeLoop()
 {
 	using clock = std::chrono::steady_clock;

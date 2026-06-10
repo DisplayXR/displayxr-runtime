@@ -36,6 +36,7 @@
 #include "sbs_renderer.h"
 #include "video_decoder.h"
 #include "audio_player.h"
+#include "transport_ui.h"
 #include "stb_image.h"  // declarations only; impl is in stb_impl.cpp
 
 #define LOG_TAG "mediaplayer_vk_android"
@@ -55,6 +56,23 @@
 #endif
 
 namespace {
+
+// Format seconds as "M:SS" (or "H:MM:SS" past an hour) into buf (>=12 bytes).
+void
+fmt_time(double seconds, char *buf)
+{
+	if (seconds < 0.0 || seconds > 360000.0) {
+		std::strcpy(buf, "0:00");
+		return;
+	}
+	int total = (int)(seconds + 0.5);
+	int h = total / 3600, m = (total % 3600) / 60, s = total % 60;
+	if (h > 0) {
+		std::snprintf(buf, 12, "%d:%02d:%02d", h, m, s);
+	} else {
+		std::snprintf(buf, 12, "%d:%02d", m, s);
+	}
+}
 
 const char *
 xr_result_str(XrResult r)
@@ -833,6 +851,16 @@ render_frame()
 			                (uint32_t)vf->height, vf->nv12, vf->fullRange);
 			g_scene_loaded.store(true, std::memory_order_relaxed);
 		}
+		// Transport overlay (scrub bar + play/pause + load + time).
+		const double pos = g_video.positionSeconds();
+		const double dur = g_video.durationSeconds();
+		char left[12], right[12];
+		fmt_time(pos, left);
+		fmt_time(dur, right);
+		g_sbs.setOverlay(true, dur > 0.0 ? (float)(pos / dur) : 0.0f, g_video.paused(), left,
+		                 right);
+	} else {
+		g_sbs.setOverlay(false, 0.0f, false, "", "");  // image: no transport
 	}
 
 	XrCompositionLayerProjectionView projection_views[kViewCount] = {};
@@ -1041,29 +1069,52 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeOpenVideoFd(
 	g_pick_fd.store((int)fd, std::memory_order_release);  // publish last
 }
 
-// Transport, from Java gestures: single-tap = play/pause, horizontal drag =
-// scrub. The decoder methods are thread-safe (atomics the decode thread reads).
-extern "C" JNIEXPORT void JNICALL
-Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeTogglePause(
-    JNIEnv * /*env*/, jobject /*thiz*/)
+// Raw touch (normalized screen coords) hit-tested against the transport bar
+// (transport_ui.h). Returns 1 to ask Java to open the SAF picker (Load button
+// tapped — only Java can launch ACTION_OPEN_DOCUMENT); 0 otherwise. The button
+// toggles pause, the bar seeks (tap or drag = absolute), and a tap on the video
+// also toggles pause. Decoder methods are thread-safe.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeTouch(
+    JNIEnv * /*env*/, jobject /*thiz*/, jint action, jfloat nx, jfloat ny)
 {
-	if (g_is_video) {
+	static tui::Region downRegion = tui::Region::None;
+	static bool moved = false;
+	static float downX = 0.0f, downY = 0.0f;
+	constexpr int kDown = 0, kUp = 1, kMove = 2;
+	if (!g_is_video) return 0;
+
+	auto seekBar = [&](float x) {
+		const double t = tui::barFraction(x) * g_video.durationSeconds();
+		g_video.seekTo(t);
+		g_audio.seekTo(t);
+	};
+	auto togglePause = [&]() {
 		g_video.togglePaused();
 		g_audio.setPaused(g_video.paused());
-		LOGI("transport: %s @ %.1fs", g_video.paused() ? "PAUSE" : "PLAY",
-		     g_video.positionSeconds());
-	}
-}
+	};
 
-extern "C" JNIEXPORT void JNICALL
-Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeSeekRelative(
-    JNIEnv * /*env*/, jobject /*thiz*/, jfloat seconds)
-{
-	if (g_is_video) {
-		g_video.seekRelative((double)seconds);
-		g_audio.seekRelative((double)seconds);
-		LOGI("transport: seek %+.2fs (from %.1fs)", (double)seconds, g_video.positionSeconds());
+	if (action == kDown) {
+		downX = nx;
+		downY = ny;
+		moved = false;
+		downRegion = tui::hit(nx, ny);
+		if (downRegion == tui::Region::Bar) seekBar(nx);
+	} else if (action == kMove) {
+		if (std::fabs(nx - downX) + std::fabs(ny - downY) > 0.01f) moved = true;
+		if (downRegion == tui::Region::Bar) seekBar(nx);
+	} else if (action == kUp) {
+		const tui::Region r = downRegion;
+		downRegion = tui::Region::None;
+		if (r == tui::Region::Button) {
+			togglePause();
+		} else if (r == tui::Region::Load) {
+			return 1;  // Java opens the picker
+		} else if (r == tui::Region::None && !moved) {
+			togglePause();  // tap on the video area
+		}
 	}
+	return 0;
 }
 
 extern "C" void

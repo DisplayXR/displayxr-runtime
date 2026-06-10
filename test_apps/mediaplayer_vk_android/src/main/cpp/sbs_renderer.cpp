@@ -5,9 +5,64 @@
 
 #include <android/log.h>
 #include <cstring>
+#include <vector>
 
 #include "fullscreen.vert.h"  // fullscreen_vert_data (SPIR-V)
 #include "sbs.frag.h"         // sbs_frag_data (SPIR-V)
+#include "transport_ui.h"     // shared bar/button layout fractions
+
+namespace {
+// 3x5 bitmap font for the time readout: digits 0-9 then ':'. Rows top→bottom,
+// bit2 = leftmost column.
+constexpr uint8_t kFont3x5[11][5] = {
+    {0b111, 0b101, 0b101, 0b101, 0b111},  // 0
+    {0b010, 0b110, 0b010, 0b010, 0b111},  // 1
+    {0b111, 0b001, 0b111, 0b100, 0b111},  // 2
+    {0b111, 0b001, 0b111, 0b001, 0b111},  // 3
+    {0b101, 0b101, 0b111, 0b001, 0b001},  // 4
+    {0b111, 0b100, 0b111, 0b001, 0b111},  // 5
+    {0b111, 0b100, 0b111, 0b101, 0b111},  // 6
+    {0b111, 0b001, 0b001, 0b001, 0b001},  // 7
+    {0b111, 0b101, 0b111, 0b101, 0b111},  // 8
+    {0b111, 0b101, 0b111, 0b001, 0b111},  // 9
+    {0b000, 0b010, 0b000, 0b010, 0b000},  // :
+};
+
+inline VkClearRect
+pxRect(int x, int y, int w, int h)
+{
+	VkClearRect r = {};
+	r.rect.offset = {x, y};
+	r.rect.extent = {(uint32_t)(w < 0 ? 0 : w), (uint32_t)(h < 0 ? 0 : h)};
+	r.baseArrayLayer = 0;
+	r.layerCount = 1;
+	return r;
+}
+
+// Append the pixel rects for one glyph (digit or ':') at (x,y), cell size `px`.
+void
+appendGlyph(std::vector<VkClearRect> &out, char c, int x, int y, int px)
+{
+	int idx = (c >= '0' && c <= '9') ? (c - '0') : (c == ':' ? 10 : -1);
+	if (idx < 0) return;
+	for (int row = 0; row < 5; ++row) {
+		for (int col = 0; col < 3; ++col) {
+			if (kFont3x5[idx][row] & (1 << (2 - col))) {
+				out.push_back(pxRect(x + col * px, y + row * px, px, px));
+			}
+		}
+	}
+}
+
+void
+appendText(std::vector<VkClearRect> &out, const char *s, int x, int y, int px)
+{
+	for (const char *p = s; *p; ++p) {
+		appendGlyph(out, *p, x, y, px);
+		x += (*p == ':') ? (2 * px) : (4 * px);  // ':' is narrower
+	}
+}
+}  // namespace
 
 #define LOG_TAG "mediaplayer_vk_android"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -545,6 +600,88 @@ SbsRenderer::targetFor(VkImage image, uint32_t w, uint32_t h)
 }
 
 void
+SbsRenderer::setOverlay(bool visible, float progress, bool paused, const char *left,
+                        const char *right)
+{
+	ovVisible_ = visible;
+	ovProgress_ = progress < 0.0f ? 0.0f : (progress > 1.0f ? 1.0f : progress);
+	ovPaused_ = paused;
+	std::strncpy(ovLeft_, left ? left : "", sizeof(ovLeft_) - 1);
+	ovLeft_[sizeof(ovLeft_) - 1] = '\0';
+	std::strncpy(ovRight_, right ? right : "", sizeof(ovRight_) - 1);
+	ovRight_[sizeof(ovRight_) - 1] = '\0';
+}
+
+// Draw the transport overlay with vkCmdClearAttachments (solid rects, no extra
+// pipeline). Must be called inside the render pass. Grouped by colour so each
+// colour is one clear call. Drawn identically in both eyes → zero disparity →
+// sits at the screen plane. Layout fractions from transport_ui.h.
+void
+SbsRenderer::drawOverlay(VkCommandBuffer cmd, uint32_t w, uint32_t h)
+{
+	if (!ovVisible_) return;
+	auto X = [&](float fx) { return (int)(fx * w); };
+	auto Y = [&](float fy) { return (int)(fy * h); };
+
+	const int barY = Y(tui::kBarY0);
+	const int barH = Y(tui::kBarY1) - barY;
+	const int barX = X(tui::kBarX0);
+	const int barW = X(tui::kBarX1) - barX;
+	const int rowMidY = Y((tui::kRowY0 + tui::kRowY1) * 0.5f);
+	const int btnX = X(tui::kBtnX0);
+	const int btnW = X(tui::kBtnX1) - btnX;
+	const int btnH = (int)(0.045f * h);
+	const int btnY = rowMidY - btnH / 2;
+	const int px = (int)(0.006f * h);  // 3x5 font cell size
+	if (px < 1) return;
+
+	auto clearRects = [&](float r, float g, float b, const std::vector<VkClearRect> &rects) {
+		if (rects.empty()) return;
+		VkClearAttachment at = {};
+		at.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		at.colorAttachment = 0;
+		at.clearValue.color = {{r, g, b, 1.0f}};
+		vkCmdClearAttachments(cmd, 1, &at, (uint32_t)rects.size(), rects.data());
+	};
+
+	// Track (dark grey) + elapsed fill (teal accent) + handle (white).
+	clearRects(0.16f, 0.16f, 0.18f, {pxRect(barX, barY, barW, barH)});
+	const int fillW = (int)(barW * ovProgress_);
+	clearRects(0.20f, 0.80f, 0.85f, {pxRect(barX, barY, fillW, barH)});
+	const int handleX = barX + fillW;
+	const int handleW = (int)(0.006f * w);
+	const int handleH = (int)(0.06f * h);
+	clearRects(0.95f, 0.95f, 0.97f,
+	           {pxRect(handleX - handleW / 2, rowMidY - handleH / 2, handleW, handleH)});
+
+	// White group: button glyph + load glyph + time text (one clear call).
+	std::vector<VkClearRect> white;
+	if (ovPaused_) {  // show PLAY (right triangle, staircase strips)
+		const int n = 9, sh = btnH / n, ph = (sh < 1 ? 1 : sh);
+		for (int i = 0; i < n; ++i) {
+			const float d = (i - (n - 1) * 0.5f) / ((n - 1) * 0.5f);  // -1..1
+			const int rw = (int)(btnW * (1.0f - (d < 0 ? -d : d)));
+			white.push_back(pxRect(btnX, btnY + i * ph, rw, ph));
+		}
+	} else {  // show PAUSE (two vertical bars)
+		const int bw = btnW / 3;
+		white.push_back(pxRect(btnX, btnY, bw, btnH));
+		white.push_back(pxRect(btnX + 2 * bw, btnY, bw, btnH));
+	}
+	// Load button (right): a simple folder — base rect + a small tab on top-left.
+	const int loadX = X(tui::kLoadX0);
+	const int loadW = X(tui::kLoadX1) - loadX;
+	const int loadH = (int)(0.04f * h);
+	const int loadY = rowMidY - loadH / 2;
+	white.push_back(pxRect(loadX, loadY + loadH / 4, loadW, loadH - loadH / 4));
+	white.push_back(pxRect(loadX, loadY, loadW / 2, loadH / 3));
+	// Time text: elapsed (left of bar) + total (right of bar).
+	appendText(white, ovLeft_, X(tui::kElapsedX), rowMidY - 2 * px, px);
+	appendText(white, ovRight_, X(tui::kTotalX), rowMidY - 2 * px, px);
+	clearRects(0.95f, 0.95f, 0.97f, white);
+}
+
+void
 SbsRenderer::drawEye(VkImage image, uint32_t w, uint32_t h, float offX, float offY,
                      float scaleX, float scaleY)
 {
@@ -584,6 +721,7 @@ SbsRenderer::drawEye(VkImage image, uint32_t w, uint32_t h, float offX, float of
 	push.fullRange = sourceFullRange_;
 	vkCmdPushConstants(cmd_, pipeLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 	vkCmdDraw(cmd_, 3, 1, 0, 0);
+	drawOverlay(cmd_, w, h);  // transport bar / buttons, same in both eyes (screen plane)
 	vkCmdEndRenderPass(cmd_);
 	vkEndCommandBuffer(cmd_);
 

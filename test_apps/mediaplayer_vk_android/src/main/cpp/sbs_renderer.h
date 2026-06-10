@@ -37,6 +37,12 @@ struct SbsRenderer {
 
 	bool hasSource() const { return planes_[0].view != VK_NULL_HANDLE; }
 
+	// Transport overlay (scrub bar + play/pause + load button + time), drawn
+	// into each eye at zero disparity (screen plane). progress in [0,1]. left/
+	// right are short time strings (e.g. "0:42"). Layout: transport_ui.h.
+	void setOverlay(bool visible, float progress, bool paused, const char *left,
+	                const char *right);
+
 	// Blit the UV sub-rect [off, off+scale) into `image` (a per-view swapchain
 	// image of size w x h), clearing to black first. Left eye = off(0,0)
 	// scale(0.5,1); right eye = off(0.5,0). Blocks until the GPU finishes.
@@ -65,6 +71,7 @@ private:
 	};
 
 	const Target &targetFor(VkImage image, uint32_t w, uint32_t h);
+	void drawOverlay(VkCommandBuffer cmd, uint32_t w, uint32_t h);
 	uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) const;
 	bool ensurePlane(int idx, uint32_t w, uint32_t h, VkFormat fmt, uint32_t bytesPerTexel);
 	void recordPlaneCopy(VkCommandBuffer cmd, int idx, const uint8_t *src, uint32_t w,
@@ -98,4 +105,11 @@ private:
 	VkImageView dummyView_ = VK_NULL_HANDLE;
 
 	std::unordered_map<VkImage, Target> targets_;
+
+	// Transport overlay state (set per frame from main).
+	bool ovVisible_ = false;
+	float ovProgress_ = 0.0f;
+	bool ovPaused_ = false;
+	char ovLeft_[12] = {0};
+	char ovRight_[12] = {0};
 };

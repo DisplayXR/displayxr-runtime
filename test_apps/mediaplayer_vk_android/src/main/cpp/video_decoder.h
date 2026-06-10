@@ -52,6 +52,8 @@ struct VideoDecoder {
 	double durationSeconds() const { return durationUs_ / 1e6; }
 	// Scrub by a relative offset (drag). Clamped to [0, duration] on the decode thread.
 	void seekRelative(double deltaSeconds);
+	// Seek to an absolute position (scrub bar). Clamped to [0, duration].
+	void seekTo(double seconds);
 	// Optional A/V master clock (audio position, seconds; <0 = unavailable). When set
 	// and >=0, the decode thread presents each frame when the clock reaches its PTS
 	// instead of using its own wall clock. Set once before openPath/openFd.

@@ -26,7 +26,6 @@ import android.hardware.display.DisplayManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.view.GestureDetector
 import android.view.MotionEvent
 import android.widget.Toast
 
@@ -54,48 +53,26 @@ class MainActivity : NativeActivity() {
     private external fun nativeXrReady(): Boolean
 
     // Hand a picked video to native as an open fd + byte range (AMediaExtractor
-    // reads the fd). The picker is reached by double-tapping the screen.
+    // reads the fd). Reached by tapping the on-screen Load button.
     private external fun nativeOpenVideoFd(fd: Int, offset: Long, length: Long)
-    private external fun nativeTogglePause()
-    private external fun nativeSeekRelative(seconds: Float)
 
-    // The runtime's MonadoView overlay covers our NativeActivity and forwards
-    // touch via Activity.dispatchTouchEvent (Monado #499). Transport gestures:
-    //   single tap   → play/pause
-    //   double tap   → open the system file picker
-    //   horizontal drag → scrub (≈ 60px/sec)
-    private val gestureDetector by lazy {
-        GestureDetector(
-            this,
-            object : GestureDetector.SimpleOnGestureListener() {
-                override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
-                    try { nativeTogglePause() } catch (_: Throwable) {}
-                    return true
-                }
-
-                override fun onDoubleTap(e: MotionEvent): Boolean {
-                    openVideoPicker()
-                    return true
-                }
-
-                override fun onScroll(
-                    e1: MotionEvent?,
-                    e2: MotionEvent,
-                    distanceX: Float,
-                    distanceY: Float,
-                ): Boolean {
-                    // distanceX > 0 when the finger moves left; drag right = seek forward.
-                    if (kotlin.math.abs(distanceX) > kotlin.math.abs(distanceY)) {
-                        try { nativeSeekRelative(-distanceX / 60f) } catch (_: Throwable) {}
-                    }
-                    return true
-                }
-            },
-        )
-    }
+    // Raw touch (normalized coords) → native hit-tests the on-screen transport
+    // bar (play/pause, scrub, load). The runtime's MonadoView overlay covers our
+    // NativeActivity and forwards touch via Activity.dispatchTouchEvent (#499);
+    // we normalize against the screen and let native decide. Returns 1 when the
+    // Load button was tapped — only Java can launch the system file picker.
+    private external fun nativeTouch(action: Int, nx: Float, ny: Float): Int
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
-        gestureDetector.onTouchEvent(event)
+        if (event.pointerCount >= 1) {
+            val dm = resources.displayMetrics
+            val nx = event.x / dm.widthPixels.toFloat()
+            val ny = event.y / dm.heightPixels.toFloat()
+            try {
+                if (nativeTouch(event.actionMasked, nx, ny) == 1) openVideoPicker()
+            } catch (_: Throwable) {
+            }
+        }
         return super.dispatchTouchEvent(event)
     }
 
@@ -232,7 +209,7 @@ class MainActivity : NativeActivity() {
             if (!isFinishing) {
                 Toast.makeText(
                     this,
-                    "Tap: play/pause   ·   drag: scrub   ·   double-tap: open file",
+                    "Transport bar: ▶/❚❚ play/pause · drag to scrub · 🗀 load",
                     Toast.LENGTH_LONG,
                 ).show()
             }
