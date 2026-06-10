@@ -56,16 +56,38 @@ class MainActivity : NativeActivity() {
     // Hand a picked video to native as an open fd + byte range (AMediaExtractor
     // reads the fd). The picker is reached by double-tapping the screen.
     private external fun nativeOpenVideoFd(fd: Int, offset: Long, length: Long)
+    private external fun nativeTogglePause()
+    private external fun nativeSeekRelative(seconds: Float)
 
     // The runtime's MonadoView overlay covers our NativeActivity and forwards
-    // touch via Activity.dispatchTouchEvent (Monado #499). A double-tap there
-    // opens the system file picker so the user can choose a video from device.
+    // touch via Activity.dispatchTouchEvent (Monado #499). Transport gestures:
+    //   single tap   → play/pause
+    //   double tap   → open the system file picker
+    //   horizontal drag → scrub (≈ 60px/sec)
     private val gestureDetector by lazy {
         GestureDetector(
             this,
             object : GestureDetector.SimpleOnGestureListener() {
+                override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                    try { nativeTogglePause() } catch (_: Throwable) {}
+                    return true
+                }
+
                 override fun onDoubleTap(e: MotionEvent): Boolean {
                     openVideoPicker()
+                    return true
+                }
+
+                override fun onScroll(
+                    e1: MotionEvent?,
+                    e2: MotionEvent,
+                    distanceX: Float,
+                    distanceY: Float,
+                ): Boolean {
+                    // distanceX > 0 when the finger moves left; drag right = seek forward.
+                    if (kotlin.math.abs(distanceX) > kotlin.math.abs(distanceY)) {
+                        try { nativeSeekRelative(-distanceX / 60f) } catch (_: Throwable) {}
+                    }
                     return true
                 }
             },
@@ -210,7 +232,7 @@ class MainActivity : NativeActivity() {
             if (!isFinishing) {
                 Toast.makeText(
                     this,
-                    "DisplayXR Stereo Media Player  ·  double-tap to open a file",
+                    "Tap: play/pause   ·   drag: scrub   ·   double-tap: open file",
                     Toast.LENGTH_LONG,
                 ).show()
             }

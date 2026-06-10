@@ -91,6 +91,8 @@ VideoDecoder::start()
 	}
 	width_ = fmtInt(trackFmt, AMEDIAFORMAT_KEY_WIDTH, 0);
 	height_ = fmtInt(trackFmt, AMEDIAFORMAT_KEY_HEIGHT, 0);
+	int64_t dur = 0;
+	if (AMediaFormat_getInt64(trackFmt, AMEDIAFORMAT_KEY_DURATION, &dur)) durationUs_ = dur;
 	AMediaExtractor_selectTrack(ex_, videoTrack);
 
 	codec_ = AMediaCodec_createDecoderByType(mime);
@@ -173,14 +175,42 @@ VideoDecoder::extractFrame(uint8_t *src, int /*srcSize*/)
 }
 
 void
+VideoDecoder::seekRelative(double deltaSeconds)
+{
+	if (!open_.load(std::memory_order_relaxed)) return;
+	int64_t target = positionUs_.load(std::memory_order_relaxed) + (int64_t)(deltaSeconds * 1e6);
+	if (target < 0) target = 0;
+	if (durationUs_ > 0 && target > durationUs_) target = durationUs_;
+	seekRequestUs_.store(target, std::memory_order_relaxed);
+}
+
+void
 VideoDecoder::decodeLoop()
 {
 	using clock = std::chrono::steady_clock;
 	auto wallStart = clock::now();
 	int64_t firstPtsUs = -1;
 	bool sawInputEOS = false;
+	bool decodeOneWhilePaused = false;  // after a seek-while-paused, show the new frame
 
 	while (!stop_.load(std::memory_order_relaxed)) {
+		// ── seek (works even while paused: reposition + flush, then show one frame) ──
+		const int64_t sk = seekRequestUs_.exchange(-1, std::memory_order_relaxed);
+		if (sk >= 0) {
+			AMediaExtractor_seekTo(ex_, sk, AMEDIAEXTRACTOR_SEEK_CLOSEST_SYNC);
+			AMediaCodec_flush(codec_);
+			sawInputEOS = false;
+			firstPtsUs = -1;
+			positionUs_.store(sk, std::memory_order_relaxed);
+			decodeOneWhilePaused = paused_.load(std::memory_order_relaxed);
+		}
+		// ── pause: hold the current frame (don't feed/drain) unless a seek just asked
+		//    for one fresh frame ──
+		if (paused_.load(std::memory_order_relaxed) && !decodeOneWhilePaused) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+			continue;
+		}
+
 		// ── feed input ──
 		if (!sawInputEOS) {
 			ssize_t inIdx = AMediaCodec_dequeueInputBuffer(codec_, 2000);
@@ -208,21 +238,40 @@ VideoDecoder::decodeLoop()
 				size_t outSize = 0;
 				uint8_t *obuf = AMediaCodec_getOutputBuffer(codec_, outIdx, &outSize);
 				if (obuf != nullptr) {
-					// Pace to the frame's PTS so playback runs at real speed.
-					if (firstPtsUs < 0) {
-						firstPtsUs = info.presentationTimeUs;
-						wallStart = clock::now();
-					}
-					const int64_t targetUs = info.presentationTimeUs - firstPtsUs;
-					const int64_t elapsedUs =
-					    std::chrono::duration_cast<std::chrono::microseconds>(clock::now() -
-					                                                          wallStart)
-					        .count();
-					if (targetUs > elapsedUs + 1000) {
-						std::this_thread::sleep_for(
-						    std::chrono::microseconds(targetUs - elapsedUs));
+					// Pace the frame: to the audio clock if one is set (A/V master),
+					// else to the frame PTS on our own wall clock.
+					if (!decodeOneWhilePaused) {
+						if (masterClock_ != nullptr) {
+							const double audioSec = masterClock_(masterCtx_);
+							if (audioSec >= 0.0) {
+								const double frameSec = info.presentationTimeUs / 1e6;
+								for (int guard = 0; guard < 200 &&
+								                    !stop_.load(std::memory_order_relaxed) &&
+								                    !paused_.load(std::memory_order_relaxed) &&
+								                    masterClock_(masterCtx_) + 0.005 < frameSec;
+								     ++guard) {
+									std::this_thread::sleep_for(std::chrono::milliseconds(2));
+								}
+							}
+						} else {
+							if (firstPtsUs < 0) {
+								firstPtsUs = info.presentationTimeUs;
+								wallStart = clock::now();
+							}
+							const int64_t targetUs = info.presentationTimeUs - firstPtsUs;
+							const int64_t elapsedUs =
+							    std::chrono::duration_cast<std::chrono::microseconds>(
+							        clock::now() - wallStart)
+							        .count();
+							if (targetUs > elapsedUs + 1000) {
+								std::this_thread::sleep_for(
+								    std::chrono::microseconds(targetUs - elapsedUs));
+							}
+						}
 					}
 					extractFrame(obuf, (int)info.size);
+					positionUs_.store(info.presentationTimeUs, std::memory_order_relaxed);
+					decodeOneWhilePaused = false;  // shown the post-seek frame; hold again
 				}
 			}
 			const bool eos = (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) != 0;

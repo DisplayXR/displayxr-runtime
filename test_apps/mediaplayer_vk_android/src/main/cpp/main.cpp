@@ -1032,6 +1032,29 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeOpenVideoFd(
 	g_pick_fd.store((int)fd, std::memory_order_release);  // publish last
 }
 
+// Transport, from Java gestures: single-tap = play/pause, horizontal drag =
+// scrub. The decoder methods are thread-safe (atomics the decode thread reads).
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeTogglePause(
+    JNIEnv * /*env*/, jobject /*thiz*/)
+{
+	if (g_is_video) {
+		g_video.togglePaused();
+		LOGI("transport: %s @ %.1fs", g_video.paused() ? "PAUSE" : "PLAY",
+		     g_video.positionSeconds());
+	}
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeSeekRelative(
+    JNIEnv * /*env*/, jobject /*thiz*/, jfloat seconds)
+{
+	if (g_is_video) {
+		g_video.seekRelative((double)seconds);
+		LOGI("transport: seek %+.2fs (from %.1fs)", (double)seconds, g_video.positionSeconds());
+	}
+}
+
 extern "C" void
 android_main(struct android_app *app)
 {

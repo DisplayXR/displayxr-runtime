@@ -45,6 +45,18 @@ struct VideoDecoder {
 	int width() const { return width_; }
 	int height() const { return height_; }
 
+	// ── Transport (thread-safe; the decode thread applies them). ──
+	void togglePaused() { paused_.store(!paused_.load(std::memory_order_relaxed)); }
+	bool paused() const { return paused_.load(std::memory_order_relaxed); }
+	double positionSeconds() const { return positionUs_.load(std::memory_order_relaxed) / 1e6; }
+	double durationSeconds() const { return durationUs_ / 1e6; }
+	// Scrub by a relative offset (drag). Clamped to [0, duration] on the decode thread.
+	void seekRelative(double deltaSeconds);
+	// Optional A/V master clock (audio position, seconds; <0 = unavailable). When set
+	// and >=0, the decode thread presents each frame when the clock reaches its PTS
+	// instead of using its own wall clock. Set once before openPath/openFd.
+	void setMasterClock(double (*fn)(void *), void *ctx) { masterClock_ = fn; masterCtx_ = ctx; }
+
 	// Latest decoded frame, or nullptr if nothing new since the last call.
 	// Owned by the decoder; valid until the next acquireLatest().
 	const Frame *acquireLatest();
@@ -61,6 +73,12 @@ private:
 	std::thread thread_;
 	std::atomic<bool> stop_{false};
 	std::atomic<bool> open_{false};
+	std::atomic<bool> paused_{false};
+	std::atomic<int64_t> positionUs_{0};       // last presented frame PTS
+	std::atomic<int64_t> seekRequestUs_{-1};   // >=0 = pending seek target
+	int64_t durationUs_ = 0;                   // from the track format (0 if unknown)
+	double (*masterClock_)(void *) = nullptr;  // audio clock (A/V master), or null
+	void *masterCtx_ = nullptr;
 	int width_ = 0;
 	int height_ = 0;
 
