@@ -1,6 +1,6 @@
 # Android demo ports — modelviewer / mediaplayer / gauss
 
-**Status:** in progress (modelviewer leg first). **Owner:** runtime hub. **Date:** 2026-06-10.
+**Status:** in progress (modelviewer landed, rig paused; **mediaplayer DONE 2026-06-10**; gauss next). **Owner:** runtime hub. **Date:** 2026-06-10.
 
 Tracking doc for porting the three Vulkan demos to Android. Driven from the
 `displayxr-runtime` hub but the work lands in the **demo repos**, not here.
@@ -115,11 +115,28 @@ upside* — runs on parts with weak/absent int64). **No runtime impact.**
 - Bundled model: the demo's existing `sample.glb` (multi-model + license
   attribution later).
 
-### 2. mediaplayer → `displayxr-demo-mediaplayer`
-- `android/` harness + keep `video_decoder.cpp` / `audio_player.cpp` (AMediaCodec)
-  verbatim. Reconcile SBS shader against the shared `sbs.frag` / `fullscreen.vert`.
-- Confirm framing intent: a flat SBS panel likely wants a window-filling/default
-  rig, not an orbit rig.
+### 2. mediaplayer → `displayxr-demo-mediaplayer` — **DONE 2026-06-10**
+- Landed as `displayxr-demo-mediaplayer#12` (branch `android/mediaplayer-vk-android`),
+  superseding runtime#515 (closed with a pointer). Harvested `video_decoder` /
+  `sbs_renderer` / `transport_ui` ~verbatim; SBS shaders were byte-identical to
+  the demo's shared `shaders/` → referenced by relative path, not forked. Audio
+  (AAudio) stayed out (Stage 3; decoder paces to wall clock). Transport overlay
+  KEPT (deliberate: device-verified in #515, audio-free, and it's the SAF-picker
+  entry point).
+- **Device-verified on the nubia NP02J (all four stages):** image weaves 3D,
+  video (NV12 → GPU BT.709) plays ~20 fps, transport works, rotation re-adapts.
+- **Rig finding:** the plain `xrLocateViews` path now returns VALID views on
+  this device (`rig=0`) — the runtime#510 server-side view-pose path works, so
+  the minimal `XrDisplayRigEXT` contingency (auto-enables after 10 invalid
+  locates; identity pose, factors=1) stayed dormant. The modelviewer rig pause
+  is therefore about *framing*, not validity.
+- **New environment issue:** the nubia's vendor CPU freezer
+  (`CpuFreezerManagerServiceV2`) freezes the backgrounded OOP runtime process
+  after ~2.5 min → clients block in `xrWaitFrame`; after unfreeze the session
+  goes STOPPING and does not resume (#507-class). Worked around per-device via
+  `appops RUN_ANY_IN_BACKGROUND allow` + deviceidle whitelist; durable fix is
+  runtime-side foreground-service promotion of the OOP service (file on
+  displayxr-runtime).
 
 ### 3. gauss → `displayxr-demo-gaussiansplat`
 - Land the Adreno 32-bit sort into `3dgs_common/` (Option A unified), `android/`

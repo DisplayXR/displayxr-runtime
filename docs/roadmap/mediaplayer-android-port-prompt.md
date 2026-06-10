@@ -1,5 +1,11 @@
 # New-session prompt — Android port of the media player
 
+> **EXECUTED 2026-06-10** → `DisplayXR/displayxr-demo-mediaplayer#12`
+> (runtime#515 closed with a supersession pointer). All four verification
+> stages passed on the NP02J; the plain-locate path returned valid views so the
+> rig contingency stayed dormant. Outcome details:
+> `android-demo-ports-plan.md` §2. Kept for the decision record.
+
 Paste the block below as the first message of a fresh session (the nubia NP02J
 must be connected via adb). Context that produced it: the model-viewer Android
 port (PR DisplayXR/displayxr-demo-modelviewer#26) established the pattern; the
