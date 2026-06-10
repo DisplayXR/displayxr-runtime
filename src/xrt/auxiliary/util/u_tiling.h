@@ -79,6 +79,60 @@ u_tiling_compute_system_atlas(const struct xrt_rendering_mode *modes,
 }
 
 /*!
+ * Worst-case atlas dimensions across all modes, spanning device orientation for
+ * modes flagged @ref XRT_RENDERING_MODE_FLAG_CAN_ROTATE.
+ *
+ * For each mode the atlas is sized at the given (display_w, display_h); if the mode
+ * sets CAN_ROTATE it is ALSO sized at the 90°-swapped (display_h, display_w), and the
+ * global per-dimension max is taken. On Android the app's render swapchain is never
+ * recreated on rotation, so it must be allocated to this worst case to survive a flip;
+ * orientation-locked modes (flag clear) only contribute their native orientation.
+ *
+ * Computes from view_scale_x/y + tile_columns/rows directly (does NOT require or mutate
+ * the modes' runtime-computed fields), so it is independent of @ref u_tiling_compute_mode.
+ *
+ * @param modes        Array of rendering modes (tile_columns/rows + view_scale_x/y set).
+ * @param count        Number of modes.
+ * @param display_w    Native (current) display width in pixels.
+ * @param display_h    Native (current) display height in pixels.
+ * @param[out] out_w   Worst-case atlas width.
+ * @param[out] out_h   Worst-case atlas height.
+ */
+static inline void
+u_tiling_compute_system_atlas_oriented(const struct xrt_rendering_mode *modes,
+                                       uint32_t count,
+                                       uint32_t display_w,
+                                       uint32_t display_h,
+                                       uint32_t *out_w,
+                                       uint32_t *out_h)
+{
+	uint32_t max_w = 0, max_h = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		const struct xrt_rendering_mode *m = &modes[i];
+		// Native orientation, plus the 90°-swapped one when the mode can rotate.
+		uint32_t dims[2][2] = {{display_w, display_h}, {display_h, display_w}};
+		uint32_t n = (m->mode_flags & XRT_RENDERING_MODE_FLAG_CAN_ROTATE) ? 2u : 1u;
+		for (uint32_t o = 0; o < n; o++) {
+			uint32_t dw = dims[o][0], dh = dims[o][1];
+			uint32_t vw = (uint32_t)(dw * m->view_scale_x);
+			uint32_t vh = (uint32_t)(dh * m->view_scale_y);
+			if (vw == 0)
+				vw = dw;
+			if (vh == 0)
+				vh = dh;
+			uint32_t aw = m->tile_columns * vw;
+			uint32_t ah = m->tile_rows * vh;
+			if (aw > max_w)
+				max_w = aw;
+			if (ah > max_h)
+				max_h = ah;
+		}
+	}
+	*out_w = max_w;
+	*out_h = max_h;
+}
+
+/*!
  * Compute the origin of a view within the atlas.
  *
  * @param view_index  Index of the view (0..N-1).
