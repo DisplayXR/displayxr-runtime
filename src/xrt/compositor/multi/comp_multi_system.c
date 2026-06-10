@@ -2601,6 +2601,16 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 			                         0, 0, NULL, 0, NULL, 1, &pre_weave);
 
+			// Hand the DP the target swapchain image view BEFORE process_atlas.
+			// A self-submitting DP (Leia CNSDK) builds its own destination
+			// framebuffer and needs this view; without it get_or_create_weave_fb
+			// bails ("no target view from compositor") and the weave is skipped
+			// every frame → black. The in-process compositor already does this
+			// (comp_vk_native_compositor.c); the OOP per-session path was missing
+			// it — which is why in-process Leia 3D works but OOP was black. (#510 M2)
+			xrt_display_processor_set_target_color_view(mc->session_render.display_processor,
+			                                            ct->images[buffer_index].view);
+
 			// Call display processor with atlas input
 			xrt_display_processor_process_atlas(
 			    mc->session_render.display_processor, cmd,
