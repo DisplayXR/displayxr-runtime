@@ -706,25 +706,47 @@ active_view_count()
 	return vc;
 }
 
-// Per-tile render size + tile grid for the active mode, inside the atlas.
-// Mirrors cube_handle_vk_win: renderW = atlas.width × scaleX, clamped to the
-// per-tile capacity atlas.width / tileColumns (so tiles never overlap).
+// Per-tile render size + tile grid for the active mode, sized for the CURRENTLY
+// HELD orientation (#518). Each eye renders at current_display × view_scale — so
+// landscape gives e.g. 1920×1200 and portrait 1200×1920 (the device's per-eye tile
+// in that orientation), not a fixed startup-orientation size. The swapchain/atlas is
+// allocated worst-case across orientations (create_swapchains), so the per-frame tile
+// is a sub-rect of it; render_w/render_h drive both the render viewport and the
+// submitted subImage.imageRect, so the weave reads the correct per-orientation tile.
 void
 active_tile_dims(uint32_t *render_w, uint32_t *render_h, uint32_t *cols, uint32_t *rows)
 {
 	const RenderingModeInfo &m = active_mode();
 	uint32_t c = m.tile_columns ? m.tile_columns : 1;
 	uint32_t r = m.tile_rows ? m.tile_rows : 1;
+
+	// Panel long/short edges are fixed; the held orientation (g_display_rotation
+	// 1/3 = portrait) decides which is width vs height. g_display_px is the startup
+	// orientation, so derive orientation-independent long/short first.
+	uint32_t big = g_display_px_w >= g_display_px_h ? g_display_px_w : g_display_px_h;
+	uint32_t small = g_display_px_w >= g_display_px_h ? g_display_px_h : g_display_px_w;
+	int rot = g_display_rotation.load(std::memory_order_relaxed);
+	bool portrait = (rot == 1 || rot == 3);
+	uint32_t disp_w = portrait ? small : big;
+	uint32_t disp_h = portrait ? big : small;
+	if (disp_w == 0 || disp_h == 0) { // no display info yet — fall back to atlas tiles
+		disp_w = g_atlas.width / c;
+		disp_h = g_atlas.height / r;
+	}
+
+	uint32_t rw = (uint32_t)((double)disp_w * m.view_scale_x);
+	uint32_t rh = (uint32_t)((double)disp_h * m.view_scale_y);
+	if (rw == 0)
+		rw = disp_w;
+	if (rh == 0)
+		rh = disp_h;
+	// Never exceed the atlas tile capacity (tiles must not overlap / overflow).
 	uint32_t max_tw = g_atlas.width / c;
 	uint32_t max_th = g_atlas.height / r;
-	uint32_t rw = (uint32_t)((double)g_atlas.width * m.view_scale_x);
-	uint32_t rh = (uint32_t)((double)g_atlas.height * m.view_scale_y);
-	if (rw == 0 || rw > max_tw) {
+	if (rw > max_tw)
 		rw = max_tw;
-	}
-	if (rh == 0 || rh > max_th) {
+	if (rh > max_th)
 		rh = max_th;
-	}
 	*render_w = rw;
 	*render_h = rh;
 	*cols = c;
@@ -877,23 +899,30 @@ create_swapchains()
 	}
 	LOGI("Chose swapchain format: 0x%x", (uint32_t)g_swapchain_format);
 
-	// Atlas dims = max over all modes of (cols × scaleX × panelW) × (rows ×
-	// scaleY × panelH), floored at the panel resolution. For sim_display this
-	// is exactly panelW × panelH.
+	// Atlas dims = worst case over all modes AND BOTH ORIENTATIONS (#518). The
+	// swapchain is never recreated on device rotation, so it must hold either
+	// orientation's largest tile layout; each frame renders a per-orientation
+	// sub-rect of it (active_tile_dims). For each mode the atlas is sized for
+	// (long×short) and (short×long); the global max per dim is taken.
 	uint32_t atlas_w = 0, atlas_h = 0;
 	if (g_display_px_w > 0 && g_display_px_h > 0) {
-		atlas_w = g_display_px_w;
-		atlas_h = g_display_px_h;
+		uint32_t big = g_display_px_w >= g_display_px_h ? g_display_px_w : g_display_px_h;
+		uint32_t small = g_display_px_w >= g_display_px_h ? g_display_px_h : g_display_px_w;
+		atlas_w = big;
+		atlas_h = big; // square lower bound — either orientation's long edge can be width or height
 		for (uint32_t i = 0; i < g_mode_count; ++i) {
-			uint32_t aw = (uint32_t)((double)g_modes[i].tile_columns * g_modes[i].view_scale_x *
-			                         (double)g_display_px_w);
-			uint32_t ah = (uint32_t)((double)g_modes[i].tile_rows * g_modes[i].view_scale_y *
-			                         (double)g_display_px_h);
-			if (aw > atlas_w) {
-				atlas_w = aw;
-			}
-			if (ah > atlas_h) {
-				atlas_h = ah;
+			const uint32_t dims[2][2] = {{big, small}, {small, big}}; // landscape, portrait
+			for (uint32_t o = 0; o < 2; ++o) {
+				uint32_t aw = (uint32_t)((double)g_modes[i].tile_columns *
+				                         g_modes[i].view_scale_x * (double)dims[o][0]);
+				uint32_t ah = (uint32_t)((double)g_modes[i].tile_rows *
+				                         g_modes[i].view_scale_y * (double)dims[o][1]);
+				if (aw > atlas_w) {
+					atlas_w = aw;
+				}
+				if (ah > atlas_h) {
+					atlas_h = ah;
+				}
 			}
 		}
 	} else {

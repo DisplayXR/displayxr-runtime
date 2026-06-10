@@ -3,7 +3,8 @@
     Copyright 2026, Leia Inc.
     SPDX-License-Identifier: BSL-1.0
 -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!--
         Android 12+ package-visibility restriction: cross-package
@@ -26,7 +27,13 @@
              null cursor → xrCreateInstance fails with RUNTIME_UNAVAILABLE
              (the app shows a black screen). The authority is shared by both
              runtime flavors. (#510) -->
-        <provider android:authorities="org.khronos.openxr.runtime_broker" />
+        <!-- tools:replace resolves the merge conflict with the openxr_loader AAR
+             (1.1.41+), which declares the same broker provider authority. The cube
+             only needs visibility of the user-installed runtime's runtime_broker;
+             the loader AAR's system_runtime_broker (for system runtimes) is N/A here. -->
+        <provider
+            android:authorities="org.khronos.openxr.runtime_broker"
+            tools:replace="android:authorities" />
         <!-- Explicit package visibility so we can wake the DisplayXR runtime
              out of Android's "stopped" state and bind its IPC service before
              xrCreateInstance. Both flavors are listed so the same cube APK runs
