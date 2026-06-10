@@ -50,6 +50,7 @@ add_library(mediaplayer_vk_android SHARED
     main.cpp
     sbs_renderer.cpp
     video_decoder.cpp
+    audio_player.cpp
     stb_impl.cpp
     display3d_view.c
     camera3d_view.c
@@ -70,5 +71,6 @@ target_link_libraries(mediaplayer_vk_android
     OpenXR::openxr_loader
     vulkan
     mediandk   # AMediaExtractor + AMediaCodec (framework-native video decode)
+    aaudio     # AAudio output (audio playback / A-V master clock)
     android
     log)

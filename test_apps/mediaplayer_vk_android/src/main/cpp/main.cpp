@@ -35,6 +35,7 @@
 
 #include "sbs_renderer.h"
 #include "video_decoder.h"
+#include "audio_player.h"
 #include "stb_image.h"  // declarations only; impl is in stb_impl.cpp
 
 #define LOG_TAG "mediaplayer_vk_android"
@@ -133,6 +134,7 @@ std::atomic<bool> g_scene_loaded{false};
 // to choose another file, handed down as an fd via nativeOpenVideoFd. If no
 // video opens, fall back to the bundled SBS test image (stb).
 VideoDecoder g_video;
+AudioPlayer g_audio;  // A/V master clock; video paces to it
 bool g_is_video = false;
 const char *const kDefaultVideo = "Aquaman_half_2x1.mp4";  // in externalDataPath
 const char *const kFallbackImage = "test_LR_2x1.png";      // bundled asset
@@ -731,7 +733,13 @@ load_media(struct android_app *app)
 	    "/" + kDefaultVideo;
 	if (g_video.openPath(videoPath)) {
 		g_is_video = true;
-		LOGI("Playing SBS video: %s", videoPath.c_str());
+		// Audio is the A/V master: open its own extractor over the same file and
+		// have the video decoder pace frames to the audio clock. Silent + wall-
+		// clock paced if the file has no audio track.
+		g_audio.openPath(videoPath);
+		g_video.setMasterClock(&AudioPlayer::clockThunk, &g_audio);
+		LOGI("Playing SBS video: %s (audio=%s)", videoPath.c_str(),
+		     g_audio.hasAudio() ? "yes" : "none");
 		return true;  // g_scene_loaded flips true on the first decoded frame
 	}
 	LOGW("No video at %s — falling back to bundled image", videoPath.c_str());
@@ -928,6 +936,7 @@ render_frame()
 void
 destroy_all()
 {
+	g_audio.stop();
 	g_video.stop();
 	if (g_vk_device != VK_NULL_HANDLE) {
 		vkDeviceWaitIdle(g_vk_device);
@@ -1040,6 +1049,7 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeTogglePause(
 {
 	if (g_is_video) {
 		g_video.togglePaused();
+		g_audio.setPaused(g_video.paused());
 		LOGI("transport: %s @ %.1fs", g_video.paused() ? "PAUSE" : "PLAY",
 		     g_video.positionSeconds());
 	}
@@ -1051,6 +1061,7 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeSeekRelative(
 {
 	if (g_is_video) {
 		g_video.seekRelative((double)seconds);
+		g_audio.seekRelative((double)seconds);
 		LOGI("transport: seek %+.2fs (from %.1fs)", (double)seconds, g_video.positionSeconds());
 	}
 }
@@ -1091,6 +1102,7 @@ android_main(struct android_app *app)
 			// decoder on this thread; the old decode thread is joined in stop().
 			const int pick = g_pick_fd.exchange(-1, std::memory_order_acquire);
 			if (pick >= 0) {
+				g_audio.stop();  // SAF gives one fd (video only) — no audio for picks
 				g_video.stop();
 				g_scene_loaded.store(false, std::memory_order_relaxed);
 				if (g_video.openFd(pick, g_pick_off.load(std::memory_order_relaxed),
