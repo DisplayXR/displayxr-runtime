@@ -130,13 +130,18 @@ upside* — runs on parts with weak/absent int64). **No runtime impact.**
   the minimal `XrDisplayRigEXT` contingency (auto-enables after 10 invalid
   locates; identity pose, factors=1) stayed dormant. The modelviewer rig pause
   is therefore about *framing*, not validity.
-- **New environment issue:** the nubia's vendor CPU freezer
-  (`CpuFreezerManagerServiceV2`) freezes the backgrounded OOP runtime process
-  after ~2.5 min → clients block in `xrWaitFrame`; after unfreeze the session
-  goes STOPPING and does not resume (#507-class). Worked around per-device via
-  `appops RUN_ANY_IN_BACKGROUND allow` + deviceidle whitelist; durable fix is
-  runtime-side foreground-service promotion of the OOP service (file on
-  displayxr-runtime).
+- **New environment issue (runtime#523):** the nubia's vendor CPU freezer
+  (`CpuFreezerManagerServiceV2`/`cfreezer`) freezes the backgrounded OOP
+  runtime process ~60–150 s after its window leaves the foreground → clients
+  block in `xrWaitFrame`; after unfreeze the session goes STOPPING and does
+  not resume (#507-class). **Standard exemptions do NOT work** (deviceidle
+  whitelist, appops RUN_ANY_IN_BACKGROUND, disabling the AOSP cached-apps
+  freezer — all empirically ignored; ZTE freezes via its own mechanism,
+  silently). The one working per-device whitelist: **ZTE smart app
+  optimization → DisplayXR runtime → always allow background activity**
+  (`adb shell am start -n com.zte.powersavemode/.appsmartoptimizer.AppSmartOptimizeActivity`),
+  verified 5 min freeze-free. Durable fix = runtime-side foreground-service
+  promotion while clients are connected (runtime#523).
 
 ### 3. gauss → `displayxr-demo-gaussiansplat`
 - Land the Adreno 32-bit sort into `3dgs_common/` (Option A unified), `android/`
