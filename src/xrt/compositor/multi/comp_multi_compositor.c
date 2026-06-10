@@ -61,6 +61,27 @@
 #ifdef XRT_OS_ANDROID
 #include "android/android_custom_surface.h"
 #include "android/android_globals.h"
+#include "android/android_main_thread.h"
+
+//! Context for marshaling the vendor DP factory call onto the service main thread.
+struct dp_factory_call_ctx
+{
+	xrt_dp_factory_vk_fn_t factory;
+	void *vk_bundle;
+	void *vk_cmd_pool;
+	void *window_handle;
+	int32_t target_format;
+	struct xrt_display_processor **out_xdp;
+	xrt_result_t result;
+};
+
+static void
+run_dp_factory_on_main_thread(void *data)
+{
+	struct dp_factory_call_ctx *c = (struct dp_factory_call_ctx *)data;
+	c->result =
+	    c->factory(c->vk_bundle, c->vk_cmd_pool, c->window_handle, c->target_format, c->out_xdp);
+}
 #endif
 
 DEBUG_GET_ONCE_LOG_OPTION(app_frame_lag_level, "XRT_APP_FRAME_LAG_LOG_AS_LEVEL", U_LOGGING_DEBUG)
@@ -1692,12 +1713,32 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 		xrt_dp_factory_vk_fn_t factory =
 		    (xrt_dp_factory_vk_fn_t)mc->msc->base.info.dp_factory_vk;
 		if (factory != NULL) {
+#ifdef XRT_OS_ANDROID
+			// The Leia CNSDK (and likely other Android vendor DPs) must have their
+			// async init kicked off from a Looper-bearing thread. This code runs on
+			// the comp_multi render worker (no Looper), so marshal the factory call
+			// onto the service main thread, which owns the pumped main Looper. The
+			// call is brief (the init is async on the DP's own thread) and the worker
+			// holds list_and_timing_lock only for that window. (#510 M2)
+			struct dp_factory_call_ctx ctx = {
+			    .factory = factory,
+			    .vk_bundle = vk,
+			    .vk_cmd_pool = (void *)(uintptr_t)mc->session_render.cmd_pool,
+			    .window_handle = mc->session_render.external_window_handle,
+			    .target_format = (int32_t)ct->format,
+			    .out_xdp = &mc->session_render.display_processor,
+			    .result = XRT_SUCCESS,
+			};
+			android_run_on_main_thread_blocking(run_dp_factory_on_main_thread, &ctx);
+			xrt_result_t dp_ret = ctx.result;
+#else
 			xrt_result_t dp_ret = factory(
 			    vk,                                          // vk_bundle
 			    (void *)(uintptr_t)mc->session_render.cmd_pool, // cmd_pool
 			    mc->session_render.external_window_handle,   // window_handle
 			    (int32_t)ct->format,                         // target_format
 			    &mc->session_render.display_processor);      // out_xdp
+#endif
 			if (dp_ret != XRT_SUCCESS) {
 				U_LOG_W("Display processor factory failed: %d (continuing without)", dp_ret);
 				mc->session_render.display_processor = NULL;
