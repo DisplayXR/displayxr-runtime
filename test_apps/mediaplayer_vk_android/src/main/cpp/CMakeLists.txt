@@ -49,6 +49,7 @@ find_package(OpenXR REQUIRED CONFIG)
 add_library(mediaplayer_vk_android SHARED
     main.cpp
     sbs_renderer.cpp
+    video_decoder.cpp
     stb_impl.cpp
     display3d_view.c
     camera3d_view.c
@@ -68,5 +69,6 @@ target_link_libraries(mediaplayer_vk_android
     native_app_glue
     OpenXR::openxr_loader
     vulkan
+    mediandk   # AMediaExtractor + AMediaCodec (framework-native video decode)
     android
     log)

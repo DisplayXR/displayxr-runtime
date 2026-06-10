@@ -26,12 +26,15 @@ import android.hardware.display.DisplayManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.GestureDetector
+import android.view.MotionEvent
 import android.widget.Toast
 
 class MainActivity : NativeActivity() {
 
     companion object {
         private const val REQUEST_CAMERA = 1
+        private const val REQUEST_PICK_VIDEO = 2
 
         // Load the native lib into the JVM so the external JNI function below
         // resolves (NativeActivity also dlopens it for android_main; this load
@@ -49,6 +52,57 @@ class MainActivity : NativeActivity() {
 
     // True once the OpenXR instance is up (runtime reached).
     private external fun nativeXrReady(): Boolean
+
+    // Hand a picked video to native as an open fd + byte range (AMediaExtractor
+    // reads the fd). The picker is reached by double-tapping the screen.
+    private external fun nativeOpenVideoFd(fd: Int, offset: Long, length: Long)
+
+    // The runtime's MonadoView overlay covers our NativeActivity and forwards
+    // touch via Activity.dispatchTouchEvent (Monado #499). A double-tap there
+    // opens the system file picker so the user can choose a video from device.
+    private val gestureDetector by lazy {
+        GestureDetector(
+            this,
+            object : GestureDetector.SimpleOnGestureListener() {
+                override fun onDoubleTap(e: MotionEvent): Boolean {
+                    openVideoPicker()
+                    return true
+                }
+            },
+        )
+    }
+
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        gestureDetector.onTouchEvent(event)
+        return super.dispatchTouchEvent(event)
+    }
+
+    private fun openVideoPicker() {
+        try {
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "video/*"
+            }
+            startActivityForResult(intent, REQUEST_PICK_VIDEO)
+        } catch (_: Throwable) {
+        }
+    }
+
+    @Deprecated("startActivityForResult is fine for a NativeActivity test app")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQUEST_PICK_VIDEO && resultCode == RESULT_OK) {
+            val uri = data?.data ?: return
+            try {
+                val pfd = contentResolver.openFileDescriptor(uri, "r") ?: return
+                val length = pfd.statSize
+                // detachFd → native owns the fd (AMediaExtractor reads it); the
+                // ParcelFileDescriptor no longer closes it on GC.
+                nativeOpenVideoFd(pfd.detachFd(), 0L, length)
+            } catch (_: Throwable) {
+            }
+        }
+    }
 
     private val runtimePackage = "org.freedesktop.monado.openxr_runtime.in_process"
 
@@ -156,7 +210,7 @@ class MainActivity : NativeActivity() {
             if (!isFinishing) {
                 Toast.makeText(
                     this,
-                    "DisplayXR Stereo Media Player",
+                    "DisplayXR Stereo Media Player  ·  double-tap to open a file",
                     Toast.LENGTH_LONG,
                 ).show()
             }

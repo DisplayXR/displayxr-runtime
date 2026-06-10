@@ -34,6 +34,7 @@
 #include <unistd.h>
 
 #include "sbs_renderer.h"
+#include "video_decoder.h"
 #include "stb_image.h"  // declarations only; impl is in stb_impl.cpp
 
 #define LOG_TAG "mediaplayer_vk_android"
@@ -127,10 +128,20 @@ SbsRenderer g_sbs;
 bool g_sbs_ready = false;
 std::atomic<bool> g_scene_loaded{false};
 
-// Bundled stereo media (shipped in src/main/assets/). Stage 1 = a single SBS
-// image, decoded via stb and blitted L/R per eye. Stage 2 swaps this for an
-// AMediaCodec-decoded SBS video feeding the shader's YUV path.
-const char *const kMediaFile = "test_LR_2x1.png";
+// Media sources. The default at launch is an SBS video in the app's external
+// files dir (pushed there; too big to bundle); double-tap opens the SAF picker
+// to choose another file, handed down as an fd via nativeOpenVideoFd. If no
+// video opens, fall back to the bundled SBS test image (stb).
+VideoDecoder g_video;
+bool g_is_video = false;
+const char *const kDefaultVideo = "Aquaman_half_2x1.mp4";  // in externalDataPath
+const char *const kFallbackImage = "test_LR_2x1.png";      // bundled asset
+
+// A file the user picked via SAF: fd + byte range, published from the JNI
+// thread and serviced (decoder reopen) on the android_main thread.
+std::atomic<int> g_pick_fd{-1};
+std::atomic<long long> g_pick_off{0};
+std::atomic<long long> g_pick_len{0};
 
 std::atomic<int> g_display_rotation{0};
 std::atomic<bool> g_runtime_unavailable{false};
@@ -675,19 +686,14 @@ gs_init()
 	return true;
 }
 
-// Load the bundled SBS image: read it straight from the APK assets (in memory),
-// decode to RGBA8 via stb, and upload as the SBS source. drawEye then samples
-// the left half into the left view and the right half into the right view.
+// Decode the bundled SBS image (APK asset) to RGBA8 via stb and upload it.
 bool
-load_media(struct android_app *app)
+load_fallback_image(struct android_app *app)
 {
-	if (!g_sbs_ready) {
-		return false;
-	}
 	AAssetManager *mgr = app->activity->assetManager;
-	AAsset *asset = AAssetManager_open(mgr, kMediaFile, AASSET_MODE_BUFFER);
+	AAsset *asset = AAssetManager_open(mgr, kFallbackImage, AASSET_MODE_BUFFER);
 	if (asset == nullptr) {
-		LOGE("%s not found in assets", kMediaFile);
+		LOGE("%s not found in assets", kFallbackImage);
 		return false;
 	}
 	const uint8_t *buf = (const uint8_t *)AAsset_getBuffer(asset);
@@ -699,18 +705,37 @@ load_media(struct android_app *app)
 	}
 	AAsset_close(asset);
 	if (pixels == nullptr) {
-		LOGE("stbi_load_from_memory failed for %s: %s", kMediaFile, stbi_failure_reason());
+		LOGE("stbi_load_from_memory failed for %s: %s", kFallbackImage, stbi_failure_reason());
 		return false;
 	}
 	const bool ok = g_sbs.uploadTexture(pixels, (uint32_t)w, (uint32_t)h);
 	stbi_image_free(pixels);
-	if (!ok) {
-		LOGE("uploadTexture failed for %s", kMediaFile);
+	if (ok) {
+		LOGI("Loaded SBS image: %s (%dx%d)", kFallbackImage, w, h);
+		g_scene_loaded.store(true, std::memory_order_relaxed);
+	}
+	return ok;
+}
+
+// Default media: try the SBS video in the app's external files dir; if it can't
+// be opened, show the bundled SBS test image instead. Video frames stream in on
+// the decoder thread and get uploaded per-frame in render_frame.
+bool
+load_media(struct android_app *app)
+{
+	if (!g_sbs_ready) {
 		return false;
 	}
-	LOGI("Loaded SBS media: %s (%dx%d, %d ch)", kMediaFile, w, h, comp);
-	g_scene_loaded.store(true, std::memory_order_relaxed);
-	return true;
+	std::string videoPath =
+	    std::string(app->activity->externalDataPath ? app->activity->externalDataPath : ".") +
+	    "/" + kDefaultVideo;
+	if (g_video.openPath(videoPath)) {
+		g_is_video = true;
+		LOGI("Playing SBS video: %s", videoPath.c_str());
+		return true;  // g_scene_loaded flips true on the first decoded frame
+	}
+	LOGW("No video at %s — falling back to bundled image", videoPath.c_str());
+	return load_fallback_image(app);
 }
 
 void
@@ -788,6 +813,18 @@ render_frame()
 	if (res != XR_SUCCESS) {
 		log_xr_result("xrBeginFrame", res);
 		return false;
+	}
+
+	// Pull the latest decoded video frame (if any) and upload its YUV planes —
+	// the GPU does the BT.709 convert + per-eye downscale in sbs.frag. First
+	// frame flips g_scene_loaded so the render block below engages.
+	if (g_is_video) {
+		if (const VideoDecoder::Frame *vf = g_video.acquireLatest()) {
+			g_sbs.uploadYUV(vf->y.data(), vf->uv.data(),
+			                vf->nv12 ? nullptr : vf->v.data(), (uint32_t)vf->width,
+			                (uint32_t)vf->height, vf->nv12, vf->fullRange);
+			g_scene_loaded.store(true, std::memory_order_relaxed);
+		}
 	}
 
 	XrCompositionLayerProjectionView projection_views[kViewCount] = {};
@@ -891,6 +928,7 @@ render_frame()
 void
 destroy_all()
 {
+	g_video.stop();
 	if (g_vk_device != VK_NULL_HANDLE) {
 		vkDeviceWaitIdle(g_vk_device);
 	}
@@ -981,6 +1019,19 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeXrReady(
 	return (g_instance != XR_NULL_HANDLE) ? JNI_TRUE : JNI_FALSE;
 }
 
+// The user picked a file via SAF (double-tap → ACTION_OPEN_DOCUMENT). Java
+// passes an open, dup'd file descriptor + its byte range; we publish it and the
+// android_main loop reopens the decoder on its own thread (AMediaExtractor reads
+// the fd, so it must outlive this call — Java keeps the ParcelFileDescriptor).
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeOpenVideoFd(
+    JNIEnv * /*env*/, jobject /*thiz*/, jint fd, jlong offset, jlong length)
+{
+	g_pick_off.store((long long)offset, std::memory_order_relaxed);
+	g_pick_len.store((long long)length, std::memory_order_relaxed);
+	g_pick_fd.store((int)fd, std::memory_order_release);  // publish last
+}
+
 extern "C" void
 android_main(struct android_app *app)
 {
@@ -1012,6 +1063,20 @@ android_main(struct android_app *app)
 			if (g_exit_requested) {
 				destroy_all();
 				return;
+			}
+			// Service a file the user picked (double-tap → SAF). Reopen the
+			// decoder on this thread; the old decode thread is joined in stop().
+			const int pick = g_pick_fd.exchange(-1, std::memory_order_acquire);
+			if (pick >= 0) {
+				g_video.stop();
+				g_scene_loaded.store(false, std::memory_order_relaxed);
+				if (g_video.openFd(pick, g_pick_off.load(std::memory_order_relaxed),
+				                   g_pick_len.load(std::memory_order_relaxed))) {
+					g_is_video = true;
+					LOGI("Opened picked video (fd=%d)", pick);
+				} else {
+					LOGE("Failed to open picked video (fd=%d)", pick);
+				}
 			}
 			// Drive frames from READY (not SYNCHRONIZED+): a CTS-compliant
 			// runtime only advances READY->SYNCHRONIZED on the first
