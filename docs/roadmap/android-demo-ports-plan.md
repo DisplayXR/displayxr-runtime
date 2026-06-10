@@ -88,7 +88,24 @@ upside* — runs on parts with weak/absent int64). **No runtime impact.**
 > alone does NOT bring the OOP service up on this device — launch the runtime's
 > launcher activity once.)
 
-### 1. modelviewer → `displayxr-demo-modelviewer` (in progress)
+> **Rig follow-up status (2026-06-10): PAUSED.** Wiring `XR_EXT_view_rig` into the
+> android leg got it rendering 3D (`VIEW-RIG IPC … eyes=2`; the rig is what makes
+> the OOP runtime return valid view poses — the plain locate path returns
+> `got_eyes=0` → black). But the *depth/focus* came out wrong and couldn't be
+> dialed in on the panel: with `virtualDisplayHeight = modelHeight×1.4` (the
+> desktop value; m2v makes size environment-independent) the on-screen **size** is
+> right, but a *deep* model (Z extent ≈ height) sits with depth/vHeight ≈ 0.79 vs
+> the cube's comfortable ≈ 0.25, and at the phone's ~0.3 m viewing distance
+> (~½ the desktop's) the parallax ≈ doubles → "comes off screen a lot." vHeight
+> alone can't satisfy both correct size and comfortable depth for a deep model;
+> the lever is depth placement / nominal viewing distance, which is a
+> runtime-side rig question. **Decision: establish the `XR_EXT_view_rig` path on
+> the Windows + macOS legs first (where it's verifiable), then redo the android
+> rig to match.** The android rig experiments were reverted; PR #26 stays at the
+> raw-`xrLocateViews` v1 (renders only once the rig path is settled). The
+> mediaplayer leg is taken up next (see `mediaplayer-android-port-prompt.md`).
+
+### 1. modelviewer → `displayxr-demo-modelviewer` (rig paused — see note above)
 - `android/` leg = harness only (Gradle bootstrap, `NativeActivity`,
   `MainActivity.kt`, `main.cpp`, JNI touch). CMake → shared `model_common/`.
 - Gate OBJ/STL/FBX/USD in `model_common/model_loader.cpp` (`#if !defined(__ANDROID__)`).
