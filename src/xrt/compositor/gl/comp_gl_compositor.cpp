@@ -3507,17 +3507,24 @@ comp_gl_compositor_get_window_metrics(struct xrt_compositor *xc,
 
 	out_metrics->window_pixel_width = win_px_w;
 	out_metrics->window_pixel_height = win_px_h;
-	out_metrics->window_screen_left = 0;
-	out_metrics->window_screen_top = 0;
 
 	out_metrics->window_width_m = (float)win_px_w * pixel_size_x;
 	out_metrics->window_height_m = (float)win_px_h * pixel_size_y;
 
-	// Center offset (assume centered — no screen position API for GL macOS window yet)
-	float win_center_px_x = (float)win_px_w / 2.0f;
-	float win_center_px_y = (float)win_px_h / 2.0f;
+	// Window centre offset within the display: real on-screen position when
+	// available (so window-relative 3D tracks window moves), else centred.
+	// Mirrors the VK native / Metal macOS paths (#524).
 	float disp_center_px_x = (float)disp_px_w / 2.0f;
 	float disp_center_px_y = (float)disp_px_h / 2.0f;
+	float win_center_px_x = disp_center_px_x;
+	float win_center_px_y = disp_center_px_y;
+	int32_t win_left = 0, win_top = 0;
+	if (comp_gl_window_macos_get_screen_position(c->macos_window, &win_left, &win_top)) {
+		win_center_px_x = (float)win_left + (float)win_px_w / 2.0f;
+		win_center_px_y = (float)win_top + (float)win_px_h / 2.0f;
+	}
+	out_metrics->window_screen_left = win_left;
+	out_metrics->window_screen_top = win_top;
 
 	out_metrics->window_center_offset_x_m = (win_center_px_x - disp_center_px_x) * pixel_size_x;
 	out_metrics->window_center_offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);

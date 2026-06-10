@@ -453,6 +453,42 @@ comp_gl_window_macos_get_dimensions(struct comp_gl_window_macos *win,
 }
 
 bool
+comp_gl_window_macos_get_screen_position(struct comp_gl_window_macos *win,
+                                         int32_t *out_left_px,
+                                         int32_t *out_top_px)
+{
+	if (win == NULL || win->view == nil) {
+		return false;
+	}
+
+	NSView *view = win->view;
+	NSWindow *ns_win = view.window != nil ? view.window : win->window;
+	if (ns_win == nil) {
+		return false;
+	}
+	NSScreen *screen = ns_win.screen ?: [NSScreen mainScreen];
+	if (screen == nil) {
+		return false;
+	}
+
+	// View bounds → screen points (AppKit bottom-up) → top-down backing px
+	// relative to the screen origin. Mirrors comp_vk_native_window_macos.m /
+	// comp_metal_compositor.m (#524).
+	NSRect view_in_win = [view convertRect:view.bounds toView:nil];
+	NSRect view_in_screen = [ns_win convertRectToScreen:view_in_win];
+	NSRect screen_frame = [screen frame];
+	CGFloat bs = [screen backingScaleFactor];
+
+	float left_px = (float)((view_in_screen.origin.x - screen_frame.origin.x) * bs);
+	// Flip Y to top-down: distance from the screen top to the view top.
+	float top_pts = (float)((screen_frame.origin.y + screen_frame.size.height) -
+	                        (view_in_screen.origin.y + view_in_screen.size.height));
+	*out_left_px = (int32_t)left_px;
+	*out_top_px = (int32_t)(top_pts * bs);
+	return true;
+}
+
+bool
 comp_gl_window_macos_is_valid(struct comp_gl_window_macos *win)
 {
 	if (win == NULL) return false;

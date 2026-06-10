@@ -131,6 +131,21 @@ comp_gl_window_macos_get_dimensions(struct comp_gl_window_macos *win,
                                     uint32_t *out_height);
 
 /*!
+ * Get the view's on-screen position in top-down backing pixels,
+ * relative to the origin of the screen the window is on (#524).
+ *
+ * @param win          The window handle.
+ * @param out_left_px  Pointer to receive the view's left edge in pixels.
+ * @param out_top_px   Pointer to receive the view's top edge in pixels.
+ *
+ * @return true if the position could be determined.
+ */
+bool
+comp_gl_window_macos_get_screen_position(struct comp_gl_window_macos *win,
+                                         int32_t *out_left_px,
+                                         int32_t *out_top_px);
+
+/*!
  * Check if the window is still valid (not closed by user).
  *
  * @param win The window handle.
