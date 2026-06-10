@@ -252,6 +252,11 @@ struct xrt_binding_profile
  * @ingroup xrt_iface
  */
 #define XRT_RENDERING_MODE_FLAG_HAS_TRACKING (1u << 0) //!< Mode consumes live eye tracking
+//! Mode is usable in either device orientation (landscape AND portrait). When set, the
+//! worst-case atlas sizing (u_tiling_compute_system_atlas_oriented) spans both
+//! orientations so the app's swapchain — never recreated on rotation — fits either. When
+//! clear, the mode is orientation-locked and only its native orientation is sized for.
+#define XRT_RENDERING_MODE_FLAG_CAN_ROTATE   (1u << 1)
 
 /*!
  * A named rendering mode exposed by a device.

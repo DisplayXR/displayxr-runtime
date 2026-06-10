@@ -332,15 +332,21 @@ out:
 					}
 				}
 
-				// Compute tiling once we have native pixel dims.
+				// Compute tiling once we have native pixel dims. The per-mode
+				// fields are filled for the current orientation, but the
+				// system-wide atlas is the worst case ACROSS orientations for
+				// modes that can rotate (XRT_RENDERING_MODE_FLAG_CAN_ROTATE) —
+				// on Android the app's render swapchain is never recreated on a
+				// device flip, so it must be allocated large enough for either.
 				if (pdi.display_pixel_width > 0 && pdi.display_pixel_height > 0) {
 					for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
 						u_tiling_compute_mode(&head->rendering_modes[mi],
 						                      pdi.display_pixel_width,
 						                      pdi.display_pixel_height);
 					}
-					u_tiling_compute_system_atlas(
+					u_tiling_compute_system_atlas_oriented(
 					    head->rendering_modes, head->rendering_mode_count,
+					    pdi.display_pixel_width, pdi.display_pixel_height,
 					    &xsysc->info.atlas_width_pixels,
 					    &xsysc->info.atlas_height_pixels);
 				}
