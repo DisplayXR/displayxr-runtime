@@ -2092,6 +2092,21 @@ int main(int argc, char **argv)
         uint32_t viewCount = 0;
         xrLocateViews(app.session, &locateInfo, &viewState, (uint32_t)views.size(), &viewCount, views.data());
 
+        // XR_EXT_view_rig raw-channel verification (#396 W7): one-shot proof
+        // the raw channel reports the DP's full per-view set.
+        if (useRig) {
+            static int rawLogged = 0;
+            if (rawLogged < 3) {
+                rawLogged++;
+                LOG_INFO("view-rig RAW: eyeCountOutput=%u viewCount=%u isTracking=%d",
+                         viewRigRaw.eyeCountOutput, viewCount, (int)viewRigRaw.isTracking);
+                for (uint32_t i = 0; i < viewRigRaw.eyeCountOutput && i < 8; i++) {
+                    LOG_INFO("  rawEyes[%u]=(%.4f,%.4f,%.4f)", i, viewRigRaw.rawEyes[i].x,
+                             viewRigRaw.rawEyes[i].y, viewRigRaw.rawEyes[i].z);
+                }
+            }
+        }
+
         // Acquire swapchain image
         XrSwapchainImageAcquireInfo acqInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
         uint32_t imageIndex = 0;

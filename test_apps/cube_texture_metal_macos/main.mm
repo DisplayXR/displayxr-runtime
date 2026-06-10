@@ -2409,6 +2409,29 @@ int main(int argc, char **argv)
         uint32_t viewCount = 0;
         xrLocateViews(app.session, &locateInfo, &viewState, (uint32_t)views.size(), &viewCount, views.data());
 
+        // XR_EXT_view_rig raw channel (#396 W7): one-shot proof canvasRectPx
+        // reports this texture app's canvas SUB-RECT (the output rect), not
+        // the window client area. Latch on the first locate with a real canvas
+        // rect; frame ~120 fallback logs whatever we have so a missing rect is
+        // visible too.
+        if (useRig) {
+            static bool rawLogged = false;
+            static int rawFrames = 0;
+            rawFrames++;
+            if (!rawLogged && viewRigRaw.eyeCountOutput > 0 &&
+                (viewRigRaw.canvasRectPx.extent.width > 0 || rawFrames >= 120)) {
+                rawLogged = true;
+                LOG_INFO("view-rig RAW (texture): eyes=%u [0]=(%.4f,%.4f,%.4f) "
+                         "canvas=(%d,%d %dx%d) %.4fx%.4fm tracking=%d",
+                         viewRigRaw.eyeCountOutput,
+                         viewRigRaw.rawEyes[0].x, viewRigRaw.rawEyes[0].y, viewRigRaw.rawEyes[0].z,
+                         viewRigRaw.canvasRectPx.offset.x, viewRigRaw.canvasRectPx.offset.y,
+                         viewRigRaw.canvasRectPx.extent.width, viewRigRaw.canvasRectPx.extent.height,
+                         viewRigRaw.canvasSizeMeters.width, viewRigRaw.canvasSizeMeters.height,
+                         (int)viewRigRaw.isTracking);
+            }
+        }
+
         // Acquire swapchain image
         XrSwapchainImageAcquireInfo acqInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
         uint32_t imageIndex = 0;
