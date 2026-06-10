@@ -453,6 +453,7 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrGetWorkspaceClientWindowPoseEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrSetWorkspaceClientVisibilityEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrSetWorkspaceFocusedClientEXT, EXT_spatial_workspace);
+	ENTRY_IF_EXT(xrSetWorkspaceReservedKeysEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrGetWorkspaceFocusedClientEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrSetWorkspaceClientFrameRateCapEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrEnumerateWorkspaceInputEventsEXT, EXT_spatial_workspace);

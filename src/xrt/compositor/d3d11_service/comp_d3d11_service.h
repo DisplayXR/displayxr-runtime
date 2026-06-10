@@ -30,6 +30,7 @@ struct u_system;
 // Forward decls from ipc_protocol.h — full definition is included by callers.
 struct ipc_capture_result;
 struct ipc_workspace_chrome_layout;
+struct ipc_workspace_reserved_keys;
 struct ipc_file_picker_info;
 struct ipc_file_picker_result_path;
 
@@ -649,6 +650,16 @@ comp_d3d11_service_workspace_set_cursor(struct xrt_system_compositor *xsysc,
                                          float hot_x, float hot_y,
                                          float size_meters,
                                          bool visible);
+
+/*!
+ * spec_version 24: install the controller's reserved-key table on the workspace
+ * window. Reserved (vkCode, modifiers) chords are emitted on the public input
+ * ring but not forwarded to the focused app. table->count == 0 restores the
+ * runtime's built-in default reserved set.
+ */
+xrt_result_t
+comp_d3d11_service_workspace_set_reserved_keys(struct xrt_system_compositor *xsysc,
+                                                const struct ipc_workspace_reserved_keys *table);
 
 /*!
  * spec_version 17: set the active controller-pushed overlay source (display-

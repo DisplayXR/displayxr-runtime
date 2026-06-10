@@ -229,6 +229,17 @@ struct comp_d3d11_window
 
 	//! Signaled by window thread after SetForegroundWindow completes.
 	volatile LONG foreground_done;
+
+	//! Controller-supplied reserved-key table (XR_EXT_spatial_workspace spec_version
+	//! 24). The controller declares which (vkCode, modifiers) chords it owns via
+	//! xrSetWorkspaceReservedKeysEXT; reserved chords are still emitted on the public
+	//! ring but never forwarded to the focused app. reserved_key_count is the publish
+	//! barrier: the service thread fills reserved_keys[] then InterlockedExchanges the
+	//! count LAST, so the WndProc thread never reads a half-written table. -1 means the
+	//! controller has not registered a set — fall back to is_workspace_reserved_key's
+	//! built-in default. >= 0 is the controller's table size.
+	struct { uint32_t vk; uint32_t mods; } reserved_keys[WORKSPACE_RESERVED_KEYS_MAX];
+	volatile LONG reserved_key_count;
 };
 
 // Forward declarations
@@ -239,6 +250,18 @@ static void set_fullscreen(HWND hWnd, bool fullscreen);
 // (WM_USER + 101) was WM_WORKSPACE_LAUNCH_APP — removed in #376; the
 // browse + launch affordance is controller-owned now.
 #define WM_WORKSPACE_SET_CAPTURE   (WM_USER + 102) //!< Phase 2.K: wParam=enabled (0/1).
+
+// spec_version 24: when a key/char message is PostMessage'd to a composited IPC
+// app, the runtime stamps the current modifier mask into spare lParam bits so
+// the client-side shim (oxr_workspace_modal_win32.c) can restore the app
+// thread's keyboard state before TranslateMessage / GetKeyState — PostMessage
+// alone does not carry modifier state across processes. Bit 28 marks a forwarded
+// message; bits 25-27 hold SHIFT/CTRL/ALT (same 3-bit mask as
+// workspace_compute_modifiers()). These are Windows-reserved lParam bits (25-28)
+// that TranslateMessage ignores; the shim clears them before the app sees them.
+// KEEP IN SYNC with the decoder in oxr_workspace_modal_win32.c.
+#define DXR_FWD_KEY_MARKER_BIT  (1u << 28)
+#define DXR_FWD_KEY_MODS_SHIFT  25
 
 /*!
  * Push an input event into the ring buffer (WndProc thread only).
@@ -321,14 +344,15 @@ workspace_compute_modifiers(void)
 }
 
 /*!
- * Check if a virtual key code is reserved for workspace controls.
- * These keys are NOT forwarded to the focused app in workspace mode.
+ * The built-in default reserved-key policy, used until a controller registers
+ * its own table via xrSetWorkspaceReservedKeysEXT. These keys are NOT forwarded
+ * to the focused app in workspace mode.
  *
- * SHIFT+TAB is forwarded (apps use it as a HUD toggle); only bare TAB
- * is reserved for workspace focus cycling.
+ * SHIFT+TAB is forwarded (apps use it as a HUD toggle); only bare TAB is
+ * reserved for workspace focus cycling.
  */
 static bool
-is_workspace_reserved_key(WPARAM vk, bool shift)
+is_default_reserved_key(WPARAM vk, bool shift)
 {
 	// Only true workspace-management keys are reserved.
 	// V, P, 0-9 are forwarded to the app (it may use them for its own purposes).
@@ -350,6 +374,32 @@ is_workspace_reserved_key(WPARAM vk, bool shift)
 	case VK_OEM_6:  return true;    // ] = window Z forward
 	default:        return false;
 	}
+}
+
+/*!
+ * Decide whether a key event is reserved (consumed by the workspace, never
+ * forwarded to the focused app). spec_version 24: if the controller has
+ * registered a reserved-key table, match exactly on (vkCode, modifiers) against
+ * it — so {TAB,0} reserves bare Tab while Shift+Tab forwards. Until then, fall
+ * back to the built-in default policy above.
+ */
+static bool
+is_workspace_reserved_key(struct comp_d3d11_window *w, WPARAM vk)
+{
+	LONG n = InterlockedCompareExchange(&w->reserved_key_count, 0, 0);
+	if (n < 0) {
+		// No controller table yet — use the built-in default.
+		bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+		return is_default_reserved_key(vk, shift);
+	}
+	uint32_t mods = workspace_compute_modifiers();
+	for (LONG i = 0; i < n; i++) {
+		if (w->reserved_keys[i].vk == (uint32_t)vk &&
+		    w->reserved_keys[i].mods == mods) {
+			return true;
+		}
+	}
+	return false;
 }
 
 /*!
@@ -532,7 +582,10 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 					// Capture client: buffer for SendInput dispatch
 					input_ring_push(w, message, (uint64_t)wParam, (int64_t)lParam, -1, -1);
 				} else {
-					PostMessage(fwd, message, wParam, lParam);
+					LPARAM lp = (LPARAM)lParam | DXR_FWD_KEY_MARKER_BIT |
+					            ((LPARAM)(workspace_compute_modifiers() & 0x7u)
+					             << DXR_FWD_KEY_MODS_SHIFT);
+					PostMessage(fwd, message, wParam, lp);
 				}
 				return 0;
 			}
@@ -552,10 +605,11 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				                     message, wParam, lParam, &handled);
 			}
 #endif
-			bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-			if (is_workspace_reserved_key(wParam, shift)) {
-				// Workspace-only keys (bare TAB, DELETE) → don't forward to app.
-				// SHIFT+TAB falls through and gets PostMessage'd below.
+			if (is_workspace_reserved_key(w, wParam)) {
+				// Controller-reserved chord (or built-in default: bare
+				// TAB/DELETE/ESC/[/]) → emitted on the public ring above but
+				// NOT forwarded to the app. Non-reserved chords (e.g. Shift+Tab,
+				// Ctrl+C) fall through and get forwarded below.
 				return 0;
 			}
 			// #307: ESC is no longer suppressed here. The maximize state
@@ -568,11 +622,18 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			// They flow through the public input-event drain so a workspace
 			// controller can bind them to its own layout presets.
 			if (is_capture) {
-				// Capture client: buffer for SendInput dispatch
+				// Capture client: buffer for SendInput dispatch. SendInput
+				// injects into the real OS input queue (modifier VK keydowns
+				// included), so chords are already preserved — no mask needed.
 				input_ring_push(w, message, (uint64_t)wParam, (int64_t)lParam, -1, -1);
 			} else {
-				// IPC app: forward via PostMessage (works fine)
-				PostMessage(fwd, message, wParam, lParam);
+				// IPC app: PostMessage can't carry keyboard state across
+				// processes, so stamp the modifier mask into spare lParam bits
+				// for the client-side shim to restore (spec_version 24).
+				LPARAM lp = (LPARAM)lParam | DXR_FWD_KEY_MARKER_BIT |
+				            ((LPARAM)(workspace_compute_modifiers() & 0x7u)
+				             << DXR_FWD_KEY_MODS_SHIFT);
+				PostMessage(fwd, message, wParam, lp);
 			}
 			return 0;
 		}
@@ -1191,6 +1252,10 @@ comp_d3d11_window_create(uint32_t width,
 	w->display_screen_top = screen_top;
 	w->xsysd = NULL;
 	w->qwerty_enabled = true;  // Always enabled for DisplayXR-owned windows
+	// -1 = controller has not registered a reserved-key set yet; the WndProc
+	// gate falls back to the built-in default until xrSetWorkspaceReservedKeysEXT
+	// arrives (U_TYPED_CALLOC would otherwise leave this 0 = "empty set").
+	w->reserved_key_count = -1;
 
 	U_LOG_W("D3D11 window: QWERTY input ENABLED");
 
@@ -1423,6 +1488,36 @@ comp_d3d11_window_set_input_forward(struct comp_d3d11_window *window,
 	} else {
 		U_LOG_W("D3D11 window: input forwarding disabled");
 	}
+}
+
+extern "C" void
+comp_d3d11_window_set_reserved_keys(struct comp_d3d11_window *window,
+                                    const uint32_t *vks,
+                                    const uint32_t *mods,
+                                    uint32_t count)
+{
+	if (window == NULL) {
+		return;
+	}
+	if (count == 0 || vks == NULL || mods == NULL) {
+		// Restore the built-in default policy.
+		InterlockedExchange(&window->reserved_key_count, -1);
+		U_LOG_W("D3D11 window: reserved keys reset to built-in default");
+		return;
+	}
+	if (count > WORKSPACE_RESERVED_KEYS_MAX) {
+		count = WORKSPACE_RESERVED_KEYS_MAX;
+	}
+	// Fill the table BEFORE publishing the count: the WndProc reader keys off
+	// reserved_key_count, so the array must be fully written when the count
+	// becomes visible. InterlockedExchange of the count is the publish barrier.
+	for (uint32_t i = 0; i < count; i++) {
+		window->reserved_keys[i].vk = vks[i];
+		window->reserved_keys[i].mods = mods[i];
+	}
+	MemoryBarrier();
+	InterlockedExchange(&window->reserved_key_count, (LONG)count);
+	U_LOG_W("D3D11 window: controller registered %u reserved key chord(s)", count);
 }
 
 void *

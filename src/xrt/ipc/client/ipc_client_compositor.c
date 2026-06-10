@@ -532,6 +532,20 @@ comp_ipc_client_compositor_workspace_set_focused_client(struct xrt_compositor *x
 }
 
 xrt_result_t
+comp_ipc_client_compositor_workspace_set_reserved_keys(struct xrt_compositor *xc,
+                                                       const struct ipc_workspace_reserved_keys *table)
+{
+	if (xc == NULL || table == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_set_reserved_keys(icc->ipc_c, table);
+}
+
+xrt_result_t
 comp_ipc_client_compositor_workspace_get_focused_client(struct xrt_compositor *xc, uint32_t *out_client_id)
 {
 	if (xc == NULL || out_client_id == NULL) {

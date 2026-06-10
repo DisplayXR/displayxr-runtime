@@ -43,6 +43,11 @@ struct workspace_input_event
 
 #define WORKSPACE_INPUT_RING_SIZE 64
 
+//! Max controller-supplied reserved-key chords (spec_version 24). Must match
+//! XR_WORKSPACE_MAX_RESERVED_KEYS_EXT in the OpenXR extension header — kept as a
+//! local define so this compositor header doesn't pull in the OpenXR headers.
+#define WORKSPACE_RESERVED_KEYS_MAX 32
+
 /*!
  * Phase 2.D: raw event captured by WndProc for the public-API event drain
  * (xrEnumerateWorkspaceInputEventsEXT). The service-side drain enriches each
@@ -250,6 +255,25 @@ comp_d3d11_window_set_input_forward(struct comp_d3d11_window *window,
                                      int32_t rect_w,
                                      int32_t rect_h,
                                      bool is_capture);
+
+/*!
+ * Install the controller's reserved-key table (XR_EXT_spatial_workspace
+ * spec_version 24). Each (vks[i], mods[i]) is a chord the controller owns:
+ * matching key events are still emitted on the public ring but NOT forwarded
+ * to the focused app. mods uses the 3-bit KEY-event mask (bit0=SHIFT,
+ * bit1=CTRL, bit2=ALT); matching is exact on (vk, mods).
+ *
+ * Pass count == 0 (or NULL arrays) to restore the runtime's built-in default
+ * reserved set. count is clamped to WORKSPACE_RESERVED_KEYS_MAX.
+ *
+ * Thread-safe: the service thread calls this; the WndProc thread reads the
+ * table. The count is published last as the visibility barrier.
+ */
+void
+comp_d3d11_window_set_reserved_keys(struct comp_d3d11_window *window,
+                                    const uint32_t *vks,
+                                    const uint32_t *mods,
+                                    uint32_t count);
 
 /*!
  * Return the HWND the most recent button-DOWN was forwarded to, or NULL if it
