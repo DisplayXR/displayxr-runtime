@@ -21,6 +21,7 @@
 #include <android/native_window_jni.h>
 
 #include "android/android_globals.h"
+#include "android/android_main_thread.h"
 
 #include <chrono>
 #include <memory>
@@ -147,6 +148,12 @@ Java_org_freedesktop_monado_ipc_MonadoImpl_nativeStartServer(JNIEnv *env, jobjec
 	U_LOG_D("service: Called nativeStartServer");
 
 	android_globals_store_vm_and_context(jvm, context);
+
+	// nativeStartServer runs on the service main thread (Service.onCreate → MonadoImpl
+	// ctor). Capture the main Looper here so vendor display-processor init (e.g. the
+	// Leia CNSDK) can be marshaled onto it from the comp_multi render worker — that
+	// init must be kicked off from a Looper-bearing thread or it hangs (#510 M2).
+	android_main_thread_dispatch_init();
 
 	IpcServerHelper::instance().startServer();
 }

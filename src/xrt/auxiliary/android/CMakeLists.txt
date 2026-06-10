@@ -25,6 +25,8 @@ add_library(
 	android_load_class.hpp
 	android_looper.cpp
 	android_looper.h
+	android_main_thread.c
+	android_main_thread.h
 	org.freedesktop.monado.auxiliary.cpp
 	org.freedesktop.monado.auxiliary.hpp
 	org.freedesktop.monado.auxiliary.impl.hpp
