@@ -1175,7 +1175,7 @@ static void RenderOneFrame(RenderState& rs) {
                         if (!rawLogged && viewRigRaw.eyeCountOutput > 0 &&
                             (viewRigRaw.canvasRectPx.extent.width > 0 || rawFrames >= 120)) {
                             rawLogged = true;
-                            LOG_INFO("ViewRig RAW (texture): eyes=%u [0]=(%.4f,%.4f,%.4f) "
+                            LOG_INFO("view-rig RAW (texture): eyes=%u [0]=(%.4f,%.4f,%.4f) "
                                      "canvas=(%d,%d %dx%d) %.4fx%.4fm tracking=%d",
                                      viewRigRaw.eyeCountOutput,
                                      viewRigRaw.rawEyes[0].x, viewRigRaw.rawEyes[0].y, viewRigRaw.rawEyes[0].z,
