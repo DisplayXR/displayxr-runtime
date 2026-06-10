@@ -165,6 +165,20 @@ std::atomic<long long> g_pick_len{0};
 
 std::atomic<int> g_display_rotation{0};
 std::atomic<bool> g_runtime_unavailable{false};
+
+// Transport auto-hide: the bar stays up while paused and for a few seconds
+// after the last touch; during steady playback it fades away. Every touch
+// refreshes the timestamp (so any tap re-reveals the controls).
+std::atomic<int64_t> g_ui_interaction_ns{0};
+constexpr int64_t kOverlayHideAfterNs = 3000000000LL;  // 3 s
+
+int64_t
+now_ns()
+{
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
 uint64_t g_frame_count = 0;
 
 // ─── matrix helpers removed — the SBS player does a flat per-eye blit and
@@ -751,6 +765,7 @@ load_media(struct android_app *app)
 	    "/" + kDefaultVideo;
 	if (g_video.openPath(videoPath)) {
 		g_is_video = true;
+		g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);  // show controls at start
 		// Audio is the A/V master: open its own extractor over the same file and
 		// have the video decoder pace frames to the audio clock. Silent + wall-
 		// clock paced if the file has no audio track.
@@ -857,7 +872,11 @@ render_frame()
 		char left[12], right[12];
 		fmt_time(pos, left);
 		fmt_time(dur, right);
-		g_sbs.setOverlay(true, dur > 0.0 ? (float)(pos / dur) : 0.0f, g_video.paused(), left,
+		// Auto-hide while playing: show if paused or recently touched.
+		const bool show =
+		    g_video.paused() ||
+		    (now_ns() - g_ui_interaction_ns.load(std::memory_order_relaxed)) < kOverlayHideAfterNs;
+		g_sbs.setOverlay(show, dur > 0.0 ? (float)(pos / dur) : 0.0f, g_video.paused(), left,
 		                 right);
 	} else {
 		g_sbs.setOverlay(false, 0.0f, false, "", "");  // image: no transport
@@ -1083,15 +1102,20 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeTouch(
 	static float downX = 0.0f, downY = 0.0f;
 	constexpr int kDown = 0, kUp = 1, kMove = 2;
 	if (!g_is_video) return 0;
+	g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);  // re-reveal + keep controls up
 
 	auto seekBar = [&](float x) {
-		const double t = tui::barFraction(x) * g_video.durationSeconds();
+		const double frac = tui::barFraction(x);
+		const double t = frac * g_video.durationSeconds();
 		g_video.seekTo(t);
 		g_audio.seekTo(t);
+		LOGI("transport: seek -> %.1fs (%.0f%%)", t, frac * 100.0);
 	};
 	auto togglePause = [&]() {
 		g_video.togglePaused();
 		g_audio.setPaused(g_video.paused());
+		LOGI("transport: %s @ %.1fs", g_video.paused() ? "PAUSE" : "PLAY",
+		     g_video.positionSeconds());
 	};
 
 	if (action == kDown) {
@@ -1099,6 +1123,11 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeTouch(
 		downY = ny;
 		moved = false;
 		downRegion = tui::hit(nx, ny);
+		const char *rn = downRegion == tui::Region::Button  ? "Button"
+		                 : downRegion == tui::Region::Bar    ? "Bar"
+		                 : downRegion == tui::Region::Load   ? "Load"
+		                                                     : "None";
+		LOGI("touch DOWN (%.3f,%.3f) -> %s", (double)nx, (double)ny, rn);
 		if (downRegion == tui::Region::Bar) seekBar(nx);
 	} else if (action == kMove) {
 		if (std::fabs(nx - downX) + std::fabs(ny - downY) > 0.01f) moved = true;
@@ -1109,6 +1138,7 @@ Java_com_displayxr_mediaplayer_1vk_1android_MainActivity_nativeTouch(
 		if (r == tui::Region::Button) {
 			togglePause();
 		} else if (r == tui::Region::Load) {
+			LOGI("touch UP -> Load (open picker)");
 			return 1;  // Java opens the picker
 		} else if (r == tui::Region::None && !moved) {
 			togglePause();  // tap on the video area
@@ -1159,6 +1189,7 @@ android_main(struct android_app *app)
 				if (g_video.openFd(pick, g_pick_off.load(std::memory_order_relaxed),
 				                   g_pick_len.load(std::memory_order_relaxed))) {
 					g_is_video = true;
+					g_ui_interaction_ns.store(now_ns(), std::memory_order_relaxed);
 					LOGI("Opened picked video (fd=%d)", pick);
 				} else {
 					LOGE("Failed to open picked video (fd=%d)", pick);

@@ -71,6 +71,7 @@ private:
 	};
 
 	const Target &targetFor(VkImage image, uint32_t w, uint32_t h);
+	bool initOverlayPipeline();
 	void drawOverlay(VkCommandBuffer cmd, uint32_t w, uint32_t h);
 	uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) const;
 	bool ensurePlane(int idx, uint32_t w, uint32_t h, VkFormat fmt, uint32_t bytesPerTexel);
@@ -105,6 +106,17 @@ private:
 	VkImageView dummyView_ = VK_NULL_HANDLE;
 
 	std::unordered_map<VkImage, Target> targets_;
+
+	// 2D triangle overlay pipeline (transport bar geometry). Vertices are
+	// (vec2 NDC, vec4 RGBA); alpha-blended over the video. The vertex buffer is
+	// host-visible and rebuilt each drawOverlay (serialized by drawEye's
+	// per-eye fence wait, so the prior submit is done before we overwrite).
+	VkPipelineLayout ovPipeLayout_ = VK_NULL_HANDLE;
+	VkPipeline ovPipeline_ = VK_NULL_HANDLE;
+	VkBuffer ovVbo_ = VK_NULL_HANDLE;
+	VkDeviceMemory ovVboMem_ = VK_NULL_HANDLE;
+	void *ovVboMapped_ = nullptr;
+	uint32_t ovVboCapVerts_ = 0;
 
 	// Transport overlay state (set per frame from main).
 	bool ovVisible_ = false;

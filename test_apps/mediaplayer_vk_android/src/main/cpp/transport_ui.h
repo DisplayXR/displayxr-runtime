@@ -11,7 +11,7 @@
 
 namespace tui {
 
-constexpr float kRowY0 = 0.855f, kRowY1 = 0.925f;  // interactive vertical band
+constexpr float kRowY0 = 0.835f, kRowY1 = 0.945f;  // interactive vertical band (= panel)
 constexpr float kBarY0 = 0.880f, kBarY1 = 0.900f;  // the thin track itself
 
 constexpr float kBtnX0 = 0.020f, kBtnX1 = 0.070f;  // play / pause (left)

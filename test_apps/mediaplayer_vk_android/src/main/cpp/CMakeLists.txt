@@ -23,7 +23,7 @@ if(NOT GLSLANGVALIDATOR_COMMAND)
     message(FATAL_ERROR "glslangValidator required — install the Vulkan SDK")
 endif()
 set(SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
-set(MP_SHADERS fullscreen.vert sbs.frag)
+set(MP_SHADERS fullscreen.vert sbs.frag overlay.vert overlay.frag)
 set(SHADER_HEADERS "")
 foreach(S ${MP_SHADERS})
     string(REPLACE "." "_" VN "${S}")          # fullscreen.vert -> fullscreen_vert
