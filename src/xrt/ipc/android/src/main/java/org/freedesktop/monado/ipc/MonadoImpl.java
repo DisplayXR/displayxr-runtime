@@ -43,7 +43,13 @@ public class MonadoImpl extends IMonado.Stub {
 
     public MonadoImpl(@NonNull Context context) {
         this.context = context.getApplicationContext();
-        nativeStartServer(this.context);
+        // #510: hand the native side the *original* context (the Service), not the
+        // application context. A vendor display-processor plug-in run out-of-process
+        // (Leia CNSDK) calls Context#getApplication() during init — that method exists
+        // on Activity/Service but NOT on Application, so passing the application
+        // context made CNSDK throw NoSuchMethodError and tear down (refCount=0). The
+        // Service is also process-lived, so holding a global ref to it is fine.
+        nativeStartServer(context);
     }
 
     @Override
