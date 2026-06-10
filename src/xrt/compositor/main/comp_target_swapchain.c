@@ -886,14 +886,48 @@ comp_target_swapchain_acquire_next_image(struct comp_target *ct, uint32_t *out_i
 		VkSurfaceCapabilitiesKHR caps;
 		VkResult cres = vk->vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk->physical_device,
 		                                                              cts->surface.handle, &caps);
-		if (cres == VK_SUCCESS && caps.currentExtent.width != (uint32_t)-1 &&
-		    caps.currentExtent.width != 0 && caps.currentExtent.height != 0 &&
-		    (caps.currentExtent.width != cts->base.width ||
-		     caps.currentExtent.height != cts->base.height)) {
-			U_LOG_W("comp_window_android: surface extent %ux%u -> %ux%u (rotation), recreating",
-			        cts->base.width, cts->base.height, caps.currentExtent.width,
-			        caps.currentExtent.height);
-			return VK_ERROR_OUT_OF_DATE_KHR;
+		bool valid_extent = cres == VK_SUCCESS && caps.currentExtent.width != (uint32_t)-1 &&
+		                    caps.currentExtent.width != 0 && caps.currentExtent.height != 0;
+		bool differs = valid_extent && (caps.currentExtent.width != cts->base.width ||
+		                                caps.currentExtent.height != cts->base.height);
+		if (!differs) {
+			// Settled (or no caps) — drop any pending debounce.
+			cts->pending_extent.since_ns = 0;
+		} else {
+			// A real orientation change flips which dimension is larger; honor it
+			// immediately. A same-orientation resize (transient startup inset flap,
+			// e.g. 1600<->1540) must persist before we churn the swapchain, which
+			// otherwise stalls the Android BufferQueue / pacing (#510).
+			bool cur_landscape = cts->base.width >= cts->base.height;
+			bool new_landscape = caps.currentExtent.width >= caps.currentExtent.height;
+			bool orientation_flip = cur_landscape != new_landscape;
+
+			const int64_t same_orient_debounce_ns = 2500 * 1000 * 1000LL; // 2.5 s
+			int64_t now_ns = os_monotonic_get_ns();
+			bool persisted = false;
+			if (!orientation_flip) {
+				if (caps.currentExtent.width == cts->pending_extent.width &&
+				    caps.currentExtent.height == cts->pending_extent.height &&
+				    cts->pending_extent.since_ns != 0) {
+					persisted = (now_ns - cts->pending_extent.since_ns) >= same_orient_debounce_ns;
+				} else {
+					// New pending value — start its timer.
+					cts->pending_extent.width = caps.currentExtent.width;
+					cts->pending_extent.height = caps.currentExtent.height;
+					cts->pending_extent.since_ns = now_ns;
+				}
+			}
+
+			if (orientation_flip || persisted) {
+				U_LOG_W("comp_window_android: surface extent %ux%u -> %ux%u (%s), recreating",
+				        cts->base.width, cts->base.height, caps.currentExtent.width,
+				        caps.currentExtent.height,
+				        orientation_flip ? "rotation" : "resize-debounced");
+				cts->pending_extent.since_ns = 0;
+				return VK_ERROR_OUT_OF_DATE_KHR;
+			}
+			// Same-orientation flap, not yet persistent: keep the current swapchain
+			// (present is at worst slightly scaled) and acquire normally.
 		}
 	}
 #endif
