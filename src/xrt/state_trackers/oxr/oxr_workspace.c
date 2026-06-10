@@ -261,6 +261,9 @@ oxr_xrActivateSpatialWorkspaceEXT(XrSession session)
 		// its own chrome) have `compositor != NULL` and would otherwise be
 		// gated alongside actual workspace apps.
 		sess->is_active_workspace_controller = true;
+		// A workspace is now managing the display — re-arm the mode-request gate
+		// for non-controller apps (#518: relaxed for single-app OOP otherwise).
+		sess->sys->inst->workspace_controller_active = true;
 	}
 	return xret_to_xr_result(&log, xret, "workspace_activate");
 }
@@ -284,6 +287,7 @@ oxr_xrDeactivateSpatialWorkspaceEXT(XrSession session)
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_deactivate(&sess->xcn->base);
 	if (xret == XRT_SUCCESS) {
 		sess->is_active_workspace_controller = false;
+		sess->sys->inst->workspace_controller_active = false;
 	}
 	return xret_to_xr_result(&log, xret, "workspace_deactivate");
 }

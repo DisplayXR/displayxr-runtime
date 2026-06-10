@@ -2141,6 +2141,13 @@ struct oxr_instance
 	bool debug_spaces;
 	bool debug_bindings;
 
+	//! True while some session is the active workspace controller (shell). The
+	//! "workspace owns the display mode" gate in xrRequestDisplayRenderingModeEXT /
+	//! the isRequestable enumeration only applies when a workspace is actually
+	//! managing — single-app out-of-process (no controller) lets the lone app
+	//! request modes itself. Set/cleared in xrActivate/DeactivateSpatialWorkspaceEXT.
+	bool workspace_controller_active;
+
 #ifdef XRT_FEATURE_RENDERDOC
 	RENDERDOC_API_1_4_1 *rdoc_api;
 #endif

@@ -1389,8 +1389,12 @@ oxr_xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex)
 	// `renderingModeViewCounts[active_idx]=0` reads and `XR_ERROR_POSE_INVALID`
 	// at xrEndFrame across cube/gauss/others. Apps need the full enumerator
 	// to interpret indices that arrive via XrEventDataRenderingModeChangedEXT.
+	// #518: only gate when a workspace controller is ACTUALLY active. In
+	// single-app out-of-process (no shell), no controller exists, so the lone app
+	// owns its display mode — otherwise nobody could ever switch 2D<->3D in OOP.
 	if (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode &&
 	    sess->compositor != NULL &&
+	    sess->sys->inst->workspace_controller_active &&
 	    !sess->is_active_workspace_controller) {
 		return XR_SUCCESS;
 	}
@@ -1522,6 +1526,7 @@ oxr_xrEnumerateDisplayRenderingModesEXT(XrSession session,
 	XrBool32 session_is_requestable = XR_TRUE;
 	if (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode &&
 	    sess->compositor != NULL &&
+	    sess->sys->inst->workspace_controller_active && // #518: only when a workspace is active
 	    !sess->is_active_workspace_controller) {
 		session_is_requestable = XR_FALSE;
 	}
