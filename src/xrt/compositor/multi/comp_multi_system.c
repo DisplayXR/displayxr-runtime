@@ -1450,6 +1450,11 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 			vk->vkWaitForFences(vk->device, 1, &mc->session_render.fences[i], VK_TRUE, UINT64_MAX);
 		}
 	}
+	// Fences only cover render work; a present (vkQueuePresentKHR) can still be in
+	// flight holding a BufferQueue slot. Drain the whole device so destroying the
+	// old swapchain releases every buffer back to the queue — otherwise the new
+	// swapchain's first vkAcquireNextImageKHR can block forever on Android (#510).
+	vk->vkDeviceWaitIdle(vk->device);
 
 	uint32_t old_image_count = mc->session_render.buffer_count;
 

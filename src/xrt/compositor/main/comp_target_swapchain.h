@@ -63,6 +63,25 @@ struct comp_target_swapchain
 		VkExtent2D extent;
 	} override;
 
+#ifdef XRT_OS_ANDROID
+	/*!
+	 * Android live-rotation extent-change debounce (#510). The startup
+	 * inset-settle flaps the surface extent (e.g. 2560x1600 -> 1540 -> 1600)
+	 * over ~1.5 s; recreating the swapchain on every flap stalls the Android
+	 * BufferQueue (acquire blocks) / frame pacing. A real orientation change
+	 * (landscape<->portrait) flips which dimension is larger and is honored
+	 * immediately; a same-orientation resize (inset) is only honored after it
+	 * persists past @ref same_orient_debounce_ns. See
+	 * comp_target_swapchain_acquire_next_image.
+	 */
+	struct
+	{
+		uint32_t width;
+		uint32_t height;
+		int64_t since_ns;
+	} pending_extent;
+#endif
+
 	struct
 	{
 		VkSwapchainKHR handle;
