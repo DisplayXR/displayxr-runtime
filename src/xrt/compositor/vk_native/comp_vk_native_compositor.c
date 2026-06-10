@@ -882,6 +882,11 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 			        c->settings.preferred.width, c->settings.preferred.height,
 			        new_width, new_height);
 
+			// MoltenVK derives the surface currentExtent from the
+			// CAMetalLayer drawableSize — sync it to the live view
+			// bounds before recreating the swapchain (#524).
+			comp_vk_native_window_macos_sync_drawable_size(c->macos_window);
+
 			if (c->target != NULL) {
 				comp_vk_native_target_resize(c->target, new_width, new_height);
 			}
@@ -3485,60 +3490,87 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	u_canvas_apply_to_metrics(out_metrics, &c->canvas);
 	return true;
 #elif defined(XRT_OS_MACOS)
-	// On macOS, delegate to display processor if available
-	if (c->display_processor != NULL) {
-		// Use xrt_display_processor_get_display_pixel_info + dimensions
-		uint32_t disp_px_w = 0, disp_px_h = 0;
-		int32_t disp_left = 0, disp_top = 0;
-		if (!xrt_display_processor_get_display_pixel_info(
-		        c->display_processor, &disp_px_w, &disp_px_h,
-		        &disp_left, &disp_top)) {
-			return false;
-		}
-		if (disp_px_w == 0 || disp_px_h == 0) return false;
-
-		float disp_w_m = 0.0f, disp_h_m = 0.0f;
-		if (!xrt_display_processor_get_display_dimensions(
-		        c->display_processor, &disp_w_m, &disp_h_m)) {
-			return false;
-		}
-
-		uint32_t win_px_w = c->settings.preferred.width;
-		uint32_t win_px_h = c->settings.preferred.height;
-		if (win_px_w == 0 || win_px_h == 0) return false;
-
-		float pixel_size_x = disp_w_m / (float)disp_px_w;
-		float pixel_size_y = disp_h_m / (float)disp_px_h;
-
-		out_metrics->display_width_m = disp_w_m;
-		out_metrics->display_height_m = disp_h_m;
-		out_metrics->display_pixel_width = disp_px_w;
-		out_metrics->display_pixel_height = disp_px_h;
-		out_metrics->display_screen_left = disp_left;
-		out_metrics->display_screen_top = disp_top;
-
-		out_metrics->window_pixel_width = win_px_w;
-		out_metrics->window_pixel_height = win_px_h;
-		out_metrics->window_screen_left = 0;
-		out_metrics->window_screen_top = 0;
-
-		out_metrics->window_width_m = (float)win_px_w * pixel_size_x;
-		out_metrics->window_height_m = (float)win_px_h * pixel_size_y;
-
-		// Center offset (assume centered for now)
-		float win_center_px_x = (float)win_px_w / 2.0f;
-		float win_center_px_y = (float)win_px_h / 2.0f;
-		float disp_center_px_x = (float)disp_px_w / 2.0f;
-		float disp_center_px_y = (float)disp_px_h / 2.0f;
-
-		out_metrics->window_center_offset_x_m = (win_center_px_x - disp_center_px_x) * pixel_size_x;
-		out_metrics->window_center_offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
-
-		out_metrics->valid = true;
-		u_canvas_apply_to_metrics(out_metrics, &c->canvas);
-		return true;
+	// Compute compositor-side from the live NSView — own window (hosted) or
+	// the app's external view (handle). #524: the old code froze the window
+	// at settings.preferred (the initial size) and assumed centered, so the
+	// rig fov/canvas did not track live resize or window moves. Display info
+	// comes from the DP when it implements pixel info, else from sys_info
+	// (the VK sim DP implements neither on macOS). Mirrors the Metal
+	// compositor's get_window_metrics + the Windows GetClientRect path above.
+	if (c->macos_window == NULL) {
+		return false;
 	}
-	return false;
+
+	uint32_t disp_px_w = 0, disp_px_h = 0;
+	int32_t disp_left = 0, disp_top = 0;
+	float disp_w_m = 0.0f, disp_h_m = 0.0f;
+	bool have_disp = false;
+	if (c->display_processor != NULL &&
+	    xrt_display_processor_get_display_pixel_info(
+	        c->display_processor, &disp_px_w, &disp_px_h,
+	        &disp_left, &disp_top) &&
+	    disp_px_w > 0 && disp_px_h > 0 &&
+	    xrt_display_processor_get_display_dimensions(
+	        c->display_processor, &disp_w_m, &disp_h_m) &&
+	    disp_w_m > 0.0f && disp_h_m > 0.0f) {
+		have_disp = true;
+	}
+	if (!have_disp && c->sys_info_set &&
+	    c->sys_info.display_pixel_width > 0 && c->sys_info.display_pixel_height > 0 &&
+	    c->sys_info.display_width_m > 0.0f && c->sys_info.display_height_m > 0.0f) {
+		disp_px_w = c->sys_info.display_pixel_width;
+		disp_px_h = c->sys_info.display_pixel_height;
+		disp_left = c->sys_info.display_screen_left;
+		disp_top = c->sys_info.display_screen_top;
+		disp_w_m = c->sys_info.display_width_m;
+		disp_h_m = c->sys_info.display_height_m;
+		have_disp = true;
+	}
+	if (!have_disp) {
+		return false;
+	}
+
+	uint32_t win_px_w = 0, win_px_h = 0;
+	comp_vk_native_window_macos_get_dimensions(c->macos_window, &win_px_w, &win_px_h);
+	if (win_px_w == 0 || win_px_h == 0) return false;
+
+	float pixel_size_x = disp_w_m / (float)disp_px_w;
+	float pixel_size_y = disp_h_m / (float)disp_px_h;
+
+	out_metrics->display_width_m = disp_w_m;
+	out_metrics->display_height_m = disp_h_m;
+	out_metrics->display_pixel_width = disp_px_w;
+	out_metrics->display_pixel_height = disp_px_h;
+	out_metrics->display_screen_left = disp_left;
+	out_metrics->display_screen_top = disp_top;
+
+	out_metrics->window_pixel_width = win_px_w;
+	out_metrics->window_pixel_height = win_px_h;
+
+	out_metrics->window_width_m = (float)win_px_w * pixel_size_x;
+	out_metrics->window_height_m = (float)win_px_h * pixel_size_y;
+
+	// Window centre offset within the display: real on-screen position when
+	// available (so window-relative 3D tracks window moves), else centred.
+	float disp_center_px_x = (float)disp_px_w / 2.0f;
+	float disp_center_px_y = (float)disp_px_h / 2.0f;
+	float win_center_px_x = disp_center_px_x;
+	float win_center_px_y = disp_center_px_y;
+	int32_t win_left = 0, win_top = 0;
+	if (comp_vk_native_window_macos_get_screen_position(
+	        c->macos_window, &win_left, &win_top)) {
+		win_center_px_x = (float)(win_left - disp_left) + (float)win_px_w / 2.0f;
+		win_center_px_y = (float)(win_top - disp_top) + (float)win_px_h / 2.0f;
+	}
+	out_metrics->window_screen_left = win_left;
+	out_metrics->window_screen_top = win_top;
+
+	out_metrics->window_center_offset_x_m = (win_center_px_x - disp_center_px_x) * pixel_size_x;
+	out_metrics->window_center_offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
+
+	out_metrics->valid = true;
+	u_canvas_apply_to_metrics(out_metrics, &c->canvas);
+	return true;
 #else
 	// Android: report the LIVE (orientation-aware) target surface extent in
 	// pixels. The physical panel meters live in the runtime's xsysc->info (the

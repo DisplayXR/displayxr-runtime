@@ -77,6 +77,9 @@ comp_vk_native_window_macos_get_layer(struct comp_vk_native_window_macos *win);
 /*!
  * Get the current backing pixel dimensions.
  *
+ * Computed live from the view's bounds (so it tracks window resize, #524);
+ * falls back to the CAMetalLayer drawableSize when no view is available.
+ *
  * @param win        The window handle.
  * @param out_width  Pointer to receive width in pixels.
  * @param out_height Pointer to receive height in pixels.
@@ -85,6 +88,33 @@ void
 comp_vk_native_window_macos_get_dimensions(struct comp_vk_native_window_macos *win,
                                             uint32_t *out_width,
                                             uint32_t *out_height);
+
+/*!
+ * Sync the CAMetalLayer drawableSize to the live view backing size.
+ *
+ * MoltenVK derives the VkSurface currentExtent from the layer's
+ * drawableSize, so this must be called before recreating the swapchain
+ * on a window resize (#524).
+ *
+ * @param win The window handle.
+ */
+void
+comp_vk_native_window_macos_sync_drawable_size(struct comp_vk_native_window_macos *win);
+
+/*!
+ * Get the view's on-screen position in top-down backing pixels,
+ * relative to the origin of the screen the window is on.
+ *
+ * @param win          The window handle.
+ * @param out_left_px  Pointer to receive the view's left edge in pixels.
+ * @param out_top_px   Pointer to receive the view's top edge in pixels.
+ *
+ * @return true if the position could be determined.
+ */
+bool
+comp_vk_native_window_macos_get_screen_position(struct comp_vk_native_window_macos *win,
+                                                 int32_t *out_left_px,
+                                                 int32_t *out_top_px);
 
 /*!
  * Check if the window is still valid (not closed by user).
