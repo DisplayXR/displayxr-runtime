@@ -835,6 +835,11 @@ oxr_xrSetWorkspaceClientVisibilityEXT(XrSession session, XrWorkspaceClientId cli
 //! OpenXR API function @ep{xrSetWorkspaceFocusedClientEXT}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceFocusedClientEXT(XrSession session, XrWorkspaceClientId clientId);
+//! OpenXR API function @ep{xrSetWorkspaceReservedKeysEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceReservedKeysEXT(XrSession session,
+                                 uint32_t keyCount,
+                                 const XrWorkspaceReservedKeyEXT *keys);
 //! OpenXR API function @ep{xrGetWorkspaceFocusedClientEXT}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrGetWorkspaceFocusedClientEXT(XrSession session, XrWorkspaceClientId *outClientId);

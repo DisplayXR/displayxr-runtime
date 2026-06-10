@@ -604,6 +604,35 @@ struct ipc_workspace_chrome_layout
 };
 
 /*!
+ * spec_version 24: maximum controller-reserved key chords per registration.
+ * Mirrors XR_WORKSPACE_MAX_RESERVED_KEYS_EXT — kept fixed-size so the wire
+ * form stays POD.
+ *
+ * @ingroup ipc
+ */
+#define IPC_WORKSPACE_MAX_RESERVED_KEYS 32
+
+/*!
+ * spec_version 24: the controller's reserved-key table. POD mirror of the
+ * XrWorkspaceReservedKeyEXT[] passed to xrSetWorkspaceReservedKeysEXT, inlined
+ * as a fixed-size array so the wire stays POD. count == 0 restores the
+ * runtime's built-in default reserved set.
+ *
+ * @ingroup ipc
+ */
+struct ipc_workspace_reserved_key
+{
+	uint32_t vk_code;   //!< Win32 VK_*
+	uint32_t modifiers; //!< bit0=SHIFT, bit1=CTRL, bit2=ALT
+};
+
+struct ipc_workspace_reserved_keys
+{
+	uint32_t count;     //!< <= IPC_WORKSPACE_MAX_RESERVED_KEYS
+	struct ipc_workspace_reserved_key keys[IPC_WORKSPACE_MAX_RESERVED_KEYS];
+};
+
+/*!
  * spec_version 13: session-global cursor source. The controller renders
  * its cursor sprite into a swapchain (allocated via
  * xrCreateWorkspaceCursorSwapchainEXT) and points the runtime at it via

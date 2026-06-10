@@ -76,6 +76,11 @@ comp_ipc_client_compositor_workspace_set_window_visibility(struct xrt_compositor
                                                            bool visible);
 xrt_result_t
 comp_ipc_client_compositor_workspace_set_focused_client(struct xrt_compositor *xc, uint32_t client_id);
+// spec_version 24: controller-reserved key table.
+struct ipc_workspace_reserved_keys;
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_reserved_keys(struct xrt_compositor *xc,
+                                                       const struct ipc_workspace_reserved_keys *table);
 xrt_result_t
 comp_ipc_client_compositor_workspace_set_input_grab(struct xrt_compositor *xc, bool grab);
 xrt_result_t
@@ -548,6 +553,51 @@ oxr_xrSetWorkspaceFocusedClientEXT(XrSession session, XrWorkspaceClientId client
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_focused_client(&sess->xcn->base,
 	                                                                            (uint32_t)clientId);
 	return xret_to_xr_result(&log, xret, "workspace_set_focused_client");
+}
+
+/*
+ * Reserved keys (spec_version 24)
+ */
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceReservedKeysEXT(XrSession session,
+                                  uint32_t keyCount,
+                                  const XrWorkspaceReservedKeyEXT *keys)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceReservedKeysEXT");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+
+	if (keyCount > XR_WORKSPACE_MAX_RESERVED_KEYS_EXT) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrSetWorkspaceReservedKeysEXT: keyCount %u exceeds max %u",
+		                 keyCount, XR_WORKSPACE_MAX_RESERVED_KEYS_EXT);
+	}
+	if (keyCount > 0 && keys == NULL) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrSetWorkspaceReservedKeysEXT: keys must not be NULL when keyCount > 0");
+	}
+
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrSetWorkspaceReservedKeysEXT requires an IPC-mode session");
+	}
+
+	struct ipc_workspace_reserved_keys table;
+	memset(&table, 0, sizeof(table));
+	table.count = keyCount;
+	for (uint32_t i = 0; i < keyCount; i++) {
+		table.keys[i].vk_code = keys[i].vkCode;
+		table.keys[i].modifiers = keys[i].modifiers;
+	}
+
+	xrt_result_t xret =
+	    comp_ipc_client_compositor_workspace_set_reserved_keys(&sess->xcn->base, &table);
+	return xret_to_xr_result(&log, xret, "workspace_set_reserved_keys");
 }
 
 /*

@@ -51,6 +51,7 @@
 
 #include <windows.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 
 // Bridge to the IPC client compositor — declared here rather than via
@@ -65,9 +66,22 @@ comp_ipc_client_compositor_session_set_modal_state(struct xrt_compositor *xc, bo
 #define MODAL_OWNER_CLASS L"DisplayXRModalDialogOwner"
 #define MAX_TRACKED_DIALOGS 16
 
+// spec_version 24: when the runtime forwards a keystroke to a composited IPC app
+// via PostMessage, it stamps the current modifier mask into spare lParam bits —
+// PostMessage cannot carry keyboard state across processes, so the app thread's
+// GetKeyState / TranslateMessage would otherwise see no modifiers (Ctrl+L → 'l',
+// Shift+Tab → bare Tab). The WH_GETMESSAGE hook below decodes the mask and
+// SetKeyboardState's the app thread to match before the app's own message loop
+// translates / dispatches the key. Bit 28 marks a forwarded message; bits 25-27
+// hold SHIFT/CTRL/ALT. KEEP IN SYNC with the encoder in comp_d3d11_window.cpp.
+#define DXR_FWD_KEY_MARKER_BIT  (1u << 28)
+#define DXR_FWD_KEY_MODS_SHIFT  25
+#define DXR_FWD_KEY_BITS_MASK   (0xFu << DXR_FWD_KEY_MODS_SHIFT) // bits 25-28
+
 static HWND s_app_hidden_hwnd = NULL;
 static HWND s_dialog_owner_hwnd = NULL;
 static HHOOK s_cbt_hook = NULL;
+static HHOOK s_getmsg_hook = NULL;
 static struct xrt_compositor *s_workspace_xc = NULL;
 static int s_modal_open_depth = 0;
 static HWND s_tracked_dialogs[MAX_TRACKED_DIALOGS];
@@ -210,6 +224,62 @@ cbt_hook_proc(int code, WPARAM wParam, LPARAM lParam)
 	return CallNextHookEx(NULL, code, wParam, lParam);
 }
 
+// Force the app thread's keyboard state to match the forwarded modifier mask
+// (bit0=SHIFT, bit1=CTRL, bit2=ALT) so the app's own TranslateMessage and any
+// GetKeyState in its WindowProc see the real chord. Runs on the app UI thread.
+static void
+apply_forwarded_modifiers(uint32_t mods)
+{
+	BYTE state[256];
+	if (!GetKeyboardState(state)) {
+		return;
+	}
+	BYTE shift = (mods & 0x1u) ? (BYTE)0x80 : (BYTE)0x00;
+	BYTE ctrl  = (mods & 0x2u) ? (BYTE)0x80 : (BYTE)0x00;
+	BYTE alt   = (mods & 0x4u) ? (BYTE)0x80 : (BYTE)0x00;
+	// Set both the generic and the left-hand specific VKs so GetKeyState
+	// (generic) and TranslateMessage both observe the right state.
+	state[VK_SHIFT]    = shift;
+	state[VK_LSHIFT]   = shift;
+	state[VK_CONTROL]  = ctrl;
+	state[VK_LCONTROL] = ctrl;
+	state[VK_MENU]     = alt;
+	state[VK_LMENU]    = alt;
+	(void)SetKeyboardState(state);
+}
+
+// WH_GETMESSAGE hook on the app UI thread. Fires from inside the app's
+// GetMessage/PeekMessage, before it TranslateMessage's / DispatchMessage's the
+// message — exactly where the keyboard state must be right. For forwarded key
+// messages (marker bit set) we apply the carried modifier mask and strip our
+// private lParam bits so the app sees a clean message.
+static LRESULT CALLBACK
+getmsg_hook_proc(int code, WPARAM wParam, LPARAM lParam)
+{
+	if (code == HC_ACTION && wParam == PM_REMOVE) {
+		MSG *msg = (MSG *)lParam;
+		if (msg != NULL) {
+			switch (msg->message) {
+			case WM_KEYDOWN:
+			case WM_KEYUP:
+			case WM_SYSKEYDOWN:
+			case WM_SYSKEYUP:
+			case WM_CHAR:
+			case WM_SYSCHAR:
+				if (msg->lParam & (LPARAM)DXR_FWD_KEY_MARKER_BIT) {
+					uint32_t mods = (uint32_t)((msg->lParam >> DXR_FWD_KEY_MODS_SHIFT) & 0x7u);
+					apply_forwarded_modifiers(mods);
+					msg->lParam &= ~(LPARAM)DXR_FWD_KEY_BITS_MASK;
+				}
+				break;
+			default:
+				break;
+			}
+		}
+	}
+	return CallNextHookEx(NULL, code, wParam, lParam);
+}
+
 static bool
 ensure_class_registered(void)
 {
@@ -293,10 +363,22 @@ oxr_workspace_modal_win32_init(struct oxr_session *sess, void *app_hwnd)
 		return;
 	}
 
+	// spec_version 24: per-thread WH_GETMESSAGE hook that restores forwarded
+	// modifier state before the app translates/dispatches the key. Same thread
+	// scope as the CBT hook. A failure here is non-fatal — chord forwarding
+	// degrades but modal re-parenting still works — so we keep going.
+	HHOOK getmsg = SetWindowsHookExW(WH_GETMESSAGE, getmsg_hook_proc, NULL, GetCurrentThreadId());
+	if (getmsg == NULL) {
+		U_LOG_W("workspace_modal: SetWindowsHookExW(WH_GETMESSAGE) failed: 0x%08lx — "
+		        "forwarded key chords may lose modifiers",
+		        GetLastError());
+	}
+
 	EnterCriticalSection(&s_lock);
 	s_app_hidden_hwnd = (HWND)app_hwnd;
 	s_dialog_owner_hwnd = owner;
 	s_cbt_hook = hook;
+	s_getmsg_hook = getmsg;
 	s_workspace_xc = (sess->xcn != NULL) ? &sess->xcn->base : NULL;
 	s_modal_open_depth = 0;
 	s_tracked_dialog_count = 0;
@@ -332,10 +414,13 @@ oxr_workspace_modal_win32_fini(struct oxr_session *sess)
 	// Process globals cleared first so any in-flight hook callback no-ops.
 	EnterCriticalSection(&s_lock);
 	bool was_active = (s_cbt_hook == hook && hook != NULL);
+	HHOOK getmsg = NULL;
 	if (was_active) {
 		s_app_hidden_hwnd = NULL;
 		s_dialog_owner_hwnd = NULL;
 		s_cbt_hook = NULL;
+		getmsg = s_getmsg_hook; // unhook outside the lock (paired with the CBT hook)
+		s_getmsg_hook = NULL;
 		s_workspace_xc = NULL;
 		s_modal_open_depth = 0;
 		s_tracked_dialog_count = 0;
@@ -345,6 +430,9 @@ oxr_workspace_modal_win32_fini(struct oxr_session *sess)
 	if (was_active) {
 		if (hook != NULL) {
 			(void)UnhookWindowsHookEx(hook);
+		}
+		if (getmsg != NULL) {
+			(void)UnhookWindowsHookEx(getmsg);
 		}
 		if (owner != NULL) {
 			(void)DestroyWindow(owner);

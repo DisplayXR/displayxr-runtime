@@ -270,6 +270,10 @@ xrt_result_t
 comp_ipc_client_compositor_workspace_set_focused_client(struct xrt_compositor *xc, uint32_t client_id);
 
 xrt_result_t
+comp_ipc_client_compositor_workspace_set_reserved_keys(struct xrt_compositor *xc,
+                                                       const struct ipc_workspace_reserved_keys *table);
+
+xrt_result_t
 comp_ipc_client_compositor_workspace_get_focused_client(struct xrt_compositor *xc, uint32_t *out_client_id);
 
 xrt_result_t

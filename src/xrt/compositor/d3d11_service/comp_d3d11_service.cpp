@@ -12639,6 +12639,37 @@ comp_d3d11_service_workspace_set_cursor(struct xrt_system_compositor *xsysc,
 	return XRT_SUCCESS;
 }
 
+// spec_version 24: install the controller's reserved-key table on the workspace
+// window. Reserved chords are emitted on the public ring but not forwarded to
+// the focused app. count == 0 restores the runtime's built-in default set.
+extern "C" xrt_result_t
+comp_d3d11_service_workspace_set_reserved_keys(struct xrt_system_compositor *xsysc,
+                                                const struct ipc_workspace_reserved_keys *table)
+{
+	if (xsysc == nullptr || table == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr || mc->window == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	uint32_t count = table->count;
+	if (count > IPC_WORKSPACE_MAX_RESERVED_KEYS) {
+		count = IPC_WORKSPACE_MAX_RESERVED_KEYS;
+	}
+	// Unpack the interleaved wire form into the parallel arrays the window
+	// setter takes. count is small (<= 32) so stack arrays are fine.
+	uint32_t vks[IPC_WORKSPACE_MAX_RESERVED_KEYS];
+	uint32_t mods[IPC_WORKSPACE_MAX_RESERVED_KEYS];
+	for (uint32_t i = 0; i < count; i++) {
+		vks[i] = table->keys[i].vk_code;
+		mods[i] = table->keys[i].modifiers;
+	}
+	comp_d3d11_window_set_reserved_keys(mc->window, vks, mods, count);
+	return XRT_SUCCESS;
+}
+
 // spec_version 17: store the controller-pushed overlay source. xsc may be NULL
 // (caller passed XR_NULL_HANDLE / invalid swapchain) — that hides the overlay
 // without tearing anything down. The runtime composites this swapchain at z = 0

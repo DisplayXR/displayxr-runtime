@@ -4011,6 +4011,32 @@ ipc_handle_workspace_set_chrome_layout(volatile struct ipc_client_state *_ics,
 }
 
 xrt_result_t
+ipc_handle_workspace_set_reserved_keys(volatile struct ipc_client_state *_ics,
+                                       const struct ipc_workspace_reserved_keys *table)
+{
+	struct ipc_server *s = _ics->server;
+
+	// PID-auth gate matches workspace_activate / set_focused_client: the
+	// reserved-key policy is owned by the registered workspace controller.
+	unsigned long expected_pid = get_orchestrator_workspace_pid();
+	unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
+	if (expected_pid != 0 && caller_pid != expected_pid) {
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL || table == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return comp_d3d11_service_workspace_set_reserved_keys(s->xsysc, table);
+#else
+	(void)s;
+	(void)table;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
 ipc_handle_workspace_set_cursor(volatile struct ipc_client_state *_ics,
                                  const struct ipc_workspace_cursor_info *info)
 {

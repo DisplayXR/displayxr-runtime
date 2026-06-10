@@ -141,6 +141,12 @@
 		]
 	},
 
+	"workspace_set_reserved_keys": {
+		"in": [
+			{"name": "table", "type": "struct ipc_workspace_reserved_keys"}
+		]
+	},
+
 	"workspace_get_focused_client": {
 		"out": [
 			{"name": "client_id", "type": "uint32_t"}
