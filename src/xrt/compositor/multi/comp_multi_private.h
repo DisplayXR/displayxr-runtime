@@ -672,6 +672,20 @@ multi_compositor_get_window_metrics(struct multi_compositor *mc, struct xrt_wind
 bool
 multi_compositor_request_display_mode(struct multi_compositor *mc, bool enable_3d);
 
+/*!
+ * Select the eye-tracking control mode (MANAGED=0 / MANUAL=1) on the
+ * out-of-process display processor — the policy counterpart to @ref
+ * multi_compositor_request_display_mode. No-op if the DP doesn't react.
+ *
+ * @param mc   The multi_compositor (must have per-session rendering initialized)
+ * @param mode 0 = MANAGED, 1 = MANUAL.
+ *
+ * @ingroup comp_multi
+ * @private @memberof multi_compositor
+ */
+void
+multi_compositor_set_eye_tracking_mode(struct multi_compositor *mc, uint32_t mode);
+
 
 #ifdef __cplusplus
 }

@@ -4068,6 +4068,17 @@ comp_metal_compositor_request_display_mode(struct xrt_compositor *xc, bool enabl
 }
 
 void
+comp_metal_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t mode)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	if (c->display_processor == NULL) {
+		return;
+	}
+	// Delegate to display processor (a no-op for sim_display, which has no tracking)
+	xrt_display_processor_metal_set_eye_tracking_mode(c->display_processor, mode);
+}
+
+void
 comp_metal_compositor_set_system_devices(struct xrt_compositor *xc,
                                          struct xrt_system_devices *xsysd)
 {

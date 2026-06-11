@@ -3392,6 +3392,20 @@ comp_gl_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3
 	return false;
 }
 
+void
+comp_gl_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t mode)
+{
+	if (xc == NULL) {
+		return;
+	}
+
+	struct comp_gl_compositor *c = gl_comp(xc);
+
+	if (c->display_processor != NULL) {
+		xrt_display_processor_gl_set_eye_tracking_mode(c->display_processor, mode);
+	}
+}
+
 bool
 comp_gl_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
                                                struct xrt_eye_positions *out_eye_pos)

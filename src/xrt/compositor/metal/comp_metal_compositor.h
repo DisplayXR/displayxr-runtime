@@ -234,6 +234,14 @@ bool
 comp_metal_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3d);
 
 /*!
+ * Select the eye-tracking control mode (MANAGED=0 / MANUAL=1) on the Metal
+ * display processor — the policy counterpart to @ref
+ * comp_metal_compositor_request_display_mode. No-op if the DP doesn't react.
+ */
+void
+comp_metal_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t mode);
+
+/*!
  * Set system devices for qwerty driver support.
  */
 void

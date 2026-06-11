@@ -931,6 +931,15 @@ oxr_session_request_exit(struct oxr_logger *log, struct oxr_session *sess);
  */
 XrResult
 oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *sess, bool enable_3d);
+
+/*!
+ * Push the session's eye-tracking control mode (MANAGED=0 / MANUAL=1) to the
+ * display processor (#522). Best-effort policy hint; the DP enacts whatever the
+ * vendor advertised. Routed in-process via the native compositor or
+ * out-of-process via IPC to the server DP.
+ */
+void
+oxr_session_set_eye_tracking_mode(struct oxr_session *sess, uint32_t mode);
 #endif
 
 #ifdef OXR_HAVE_EXT_view_rig

@@ -2125,6 +2125,31 @@ ipc_handle_compositor_request_display_refresh_rate(volatile struct ipc_client_st
 }
 
 xrt_result_t
+ipc_handle_compositor_set_eye_tracking_mode(volatile struct ipc_client_state *ics, uint32_t mode)
+{
+	IPC_TRACE_MARKER();
+
+	if (ics->xc == NULL) {
+		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+
+	// Per-session DP policy (MANAGED/MANUAL). The out-of-process per-client
+	// compositor is a multi_compositor; forward to its DP. Only the Android
+	// null+comp_multi service reaches the DP this way (#510/#522); on the
+	// Windows D3D11 service the workspace owns mode and the in-process native
+	// path handles handle apps, so this is a no-op there.
+#ifdef XRT_OS_ANDROID
+	struct multi_compositor *mc = multi_compositor((struct xrt_compositor *)ics->xc);
+	if (mc != NULL) {
+		multi_compositor_set_eye_tracking_mode(mc, mode);
+	}
+#else
+	(void)mode;
+#endif
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
 ipc_handle_compositor_set_performance_level(volatile struct ipc_client_state *ics,
                                             enum xrt_perf_domain domain,
                                             enum xrt_perf_set_level level)

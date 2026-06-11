@@ -114,6 +114,11 @@ bool
 comp_ipc_client_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
                                                        struct xrt_eye_positions *out_eyes);
 
+// IPC-client eye-tracking-mode push to the out-of-process DP (#522) — same
+// linkage pattern as above. Best-effort; no-op on IPC failure.
+void
+comp_ipc_client_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t mode);
+
 // Same fetch via the SYSTEM compositor (#449) for compositor-less sessions
 // (headless XR_MND_headless clients like the WebXR bridge, which have no
 // xcn). Same linkage pattern as above.
@@ -452,6 +457,66 @@ oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *ses
 
 	(void)success;
 	return XR_SUCCESS;
+}
+
+void
+oxr_session_set_eye_tracking_mode(struct oxr_session *sess, uint32_t mode)
+{
+	if (sess == NULL || sess->xcn == NULL) {
+		return;
+	}
+
+	// Policy push to the display processor (MANAGED=0 / MANUAL=1), mirroring the
+	// oxr_session_request_display_mode dispatch. The DP enacts whatever the
+	// vendor advertised; the runtime carries no MANAGED/MANUAL assumption.
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+	if (sess->is_d3d11_native_compositor) {
+		comp_d3d11_compositor_set_eye_tracking_mode(&sess->xcn->base, mode);
+		return;
+	}
+#endif
+
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+	if (sess->is_d3d12_native_compositor) {
+		comp_d3d12_compositor_set_eye_tracking_mode(&sess->xcn->base, mode);
+		return;
+	}
+#endif
+
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+	if (sess->is_metal_native_compositor) {
+		comp_metal_compositor_set_eye_tracking_mode(&sess->xcn->base, mode);
+		return;
+	}
+#endif
+
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+	if (sess->is_gl_native_compositor) {
+		comp_gl_compositor_set_eye_tracking_mode(&sess->xcn->base, mode);
+		return;
+	}
+#endif
+
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->is_vk_native_compositor) {
+		comp_vk_native_compositor_set_eye_tracking_mode(&sess->xcn->base, mode);
+		return;
+	}
+#endif
+
+	// In-process multi compositor path (not used for IPC clients).
+	if (sess->sys->xsysc != NULL && sess->sys->xsysc->xmcc != NULL) {
+		struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
+		multi_compositor_set_eye_tracking_mode(mc, mode);
+		return;
+	}
+
+	// Out-of-process IPC client (single-app OOP Android, #522): the per-client
+	// compositor is an ipc_client_compositor; push the mode to the server DP
+	// over IPC. Bridge-relay sessions forward eyes to the browser and own no DP.
+	if (!sess->is_bridge_relay) {
+		comp_ipc_client_compositor_set_eye_tracking_mode(&sess->xcn->base, mode);
+	}
 }
 #endif // OXR_HAVE_EXT_display_info
 
@@ -2638,7 +2703,11 @@ oxr_session_allocate_and_init(struct oxr_logger *log,
 	sess->frame_timing_wait_sleep_ms = debug_get_num_option_wait_frame_sleep();
 
 #ifdef OXR_HAVE_EXT_display_info
-	// Initialize eye tracking mode from driver's default
+	// Initialize eye tracking mode from driver's default. We do NOT push this to
+	// the DP here: out-of-process the DP is created lazily on the first frame, so
+	// a push now would no-op. The DP self-initializes to the same advertised
+	// default (the vendor owns it); the runtime only pushes on an explicit
+	// xrRequestEyeTrackingModeEXT (#522, oxr_session_set_eye_tracking_mode).
 	if (sys->xsysc) {
 		sess->eye_tracking_mode = sys->xsysc->info.default_eye_tracking_mode;
 	}

@@ -294,6 +294,18 @@ struct xrt_display_processor_d3d11
 	                          void *background_srv,
 	                          uint32_t width,
 	                          uint32_t height);
+
+	/*!
+	 * Select the eye-tracking control mode (MANAGED=0 / MANUAL=1) — the policy
+	 * counterpart to @ref request_display_mode. See the base
+	 * @ref xrt_display_processor::set_eye_tracking_mode and
+	 * docs/specs/vendor/eye-tracking-modes.md. Optional — absent slot or NULL
+	 * means the DP doesn't react. Appended per ADR-020 (append-only).
+	 *
+	 * @param xdp   Pointer to self.
+	 * @param mode  0 = MANAGED, 1 = MANUAL.
+	 */
+	void (*set_eye_tracking_mode)(struct xrt_display_processor_d3d11 *xdp, uint32_t mode);
 };
 
 /*
@@ -343,7 +355,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, get_local_zone_ca
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, publish_local_zone_mask)      == XRT_DP_D3D11_BASE_OFF + 13 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, clear_local_zone_mask)        == XRT_DP_D3D11_BASE_OFF + 14 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_background_2d)            == XRT_DP_D3D11_BASE_OFF + 15 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 16 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_eye_tracking_mode)        == XRT_DP_D3D11_BASE_OFF + 16 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 17 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -595,6 +608,20 @@ xrt_display_processor_d3d11_set_background_2d(struct xrt_display_processor_d3d11
 		return;
 	}
 	xdp->set_background_2d(xdp, background_srv, width, height);
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::set_eye_tracking_mode
+ * No-op when the DP doesn't expose the slot (older plug-in) or leaves it NULL.
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline void
+xrt_display_processor_d3d11_set_eye_tracking_mode(struct xrt_display_processor_d3d11 *xdp, uint32_t mode)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, set_eye_tracking_mode) || xdp->set_eye_tracking_mode == NULL) {
+		return;
+	}
+	xdp->set_eye_tracking_mode(xdp, mode);
 }
 
 /*!

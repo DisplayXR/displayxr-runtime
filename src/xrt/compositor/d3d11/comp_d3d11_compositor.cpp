@@ -4145,6 +4145,20 @@ comp_d3d11_compositor_request_display_mode(struct xrt_compositor *xc, bool enabl
 }
 
 extern "C" void
+comp_d3d11_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t mode)
+{
+	if (xc == nullptr) {
+		return;
+	}
+
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+
+	if (c->display_processor != nullptr) {
+		xrt_display_processor_d3d11_set_eye_tracking_mode(c->display_processor, mode);
+	}
+}
+
+extern "C" void
 comp_d3d11_compositor_set_system_devices(struct xrt_compositor *xc,
                                           struct xrt_system_devices *xsysd)
 {

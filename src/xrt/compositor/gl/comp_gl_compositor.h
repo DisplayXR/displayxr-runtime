@@ -124,6 +124,19 @@ bool
 comp_gl_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3d);
 
 /*!
+ * Select the eye-tracking control mode (MANAGED=0 / MANUAL=1) on the GL display
+ * processor — the policy counterpart to @ref
+ * comp_gl_compositor_request_display_mode. No-op if the DP doesn't react.
+ *
+ * @param xc   GL compositor base.
+ * @param mode 0 = MANAGED, 1 = MANUAL.
+ *
+ * @ingroup comp_gl
+ */
+void
+comp_gl_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t mode);
+
+/*!
  * Get predicted eye positions from the GL display processor.
  *
  * @param xc            GL compositor base.

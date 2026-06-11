@@ -278,6 +278,19 @@ bool
 comp_d3d11_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3d);
 
 /*!
+ * Select the eye-tracking control mode (MANAGED=0 / MANUAL=1) on the display
+ * processor — the policy counterpart to @ref
+ * comp_d3d11_compositor_request_display_mode. No-op if the DP doesn't react.
+ *
+ * @param xc The compositor.
+ * @param mode 0 = MANAGED, 1 = MANUAL.
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t mode);
+
+/*!
  * Set the system devices for the debug GUI (needed for qwerty driver support).
  *
  * This should be called after creating the compositor when xsysd is available.
