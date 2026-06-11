@@ -25,6 +25,24 @@ extern "C" {
 #endif
 
 /*!
+ * Per-frame effective CONTENT layout (#542): the atlas tile grid the renderer
+ * paints and the DP receives, derived from the app's SUBMISSION — decoupled
+ * from the hardware weave-state (which only drives the DP's mode_3d via
+ * request_display_mode). Matched submissions reproduce the mode layout
+ * exactly; a hardware/content divergence gets a views×1 strip instead of
+ * being clamped away. Mirrors comp_d3d11_eff_layout / comp_d3d12_eff_layout.
+ * Computed once per frame by the compositor (which owns the legacy flag).
+ */
+struct comp_vk_native_eff_layout
+{
+	uint32_t views;  //!< effective view count (post legacy clamp)
+	uint32_t cols;   //!< atlas tile columns
+	uint32_t rows;   //!< atlas tile rows
+	uint32_t tile_w; //!< per-tile width in pixels
+	uint32_t tile_h; //!< per-tile height in pixels
+};
+
+/*!
  * Create a Vulkan renderer for layer compositing.
  *
  * @param c The Vulkan native compositor.
@@ -63,8 +81,8 @@ comp_vk_native_renderer_destroy(struct comp_vk_native_renderer **renderer_ptr);
  * @param right_eye Right eye position (NULL for default).
  * @param target_width Width of the render target (window).
  * @param target_height Height of the render target (window).
- * @param hardware_display_3d True when in 3D mode (stereo rendering),
- *        false for 2D passthrough (mono rendering).
+ * @param layout The frame's effective content layout (#542), computed by
+ *        the compositor.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
  *
@@ -77,7 +95,7 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *renderer,
                               struct xrt_vec3 *right_eye,
                               uint32_t target_width,
                               uint32_t target_height,
-                              bool hardware_display_3d);
+                              const struct comp_vk_native_eff_layout *layout);
 
 /*!
  * Get the atlas VkImageView (tile_columns * view_width x tile_rows * height).
