@@ -25,6 +25,38 @@ extern "C" {
 #endif
 
 /*!
+ * Per-frame effective CONTENT layout (#542): the atlas tile grid the renderer
+ * paints and the DP receives, derived from the app's SUBMISSION — decoupled
+ * from the hardware weave-state (which only drives the DP's mode_3d via
+ * request_display_mode). Matched submissions reproduce the mode layout
+ * exactly; a hardware/content divergence gets a views×1 strip instead of
+ * being clamped away. Mirrors comp_d3d11_eff_layout.
+ */
+struct comp_d3d12_eff_layout
+{
+	uint32_t views;  //!< effective view count (post legacy clamp)
+	uint32_t cols;   //!< atlas tile columns
+	uint32_t rows;   //!< atlas tile rows
+	uint32_t tile_w; //!< per-tile width in pixels
+	uint32_t tile_h; //!< per-tile height in pixels
+};
+
+/*!
+ * Compute the frame's effective content layout from the accumulated layers.
+ * Same policy as the D3D11 leg: submission view_count (mode grid default,
+ * legacy apps keep the hardware-keyed mono clamp); matched → mode layout,
+ * mono → one tile over the full content region, divergence → views×1 strip
+ * sized by the submitted imageRect, capped to the physical atlas.
+ *
+ * @ingroup comp_d3d12
+ */
+void
+comp_d3d12_renderer_compute_effective_layout(struct comp_d3d12_renderer *renderer,
+                                             struct comp_layer_accum *layers,
+                                             bool hardware_display_3d,
+                                             struct comp_d3d12_eff_layout *out_layout);
+
+/*!
  * Create a D3D12 renderer.
  *
  * @param c The D3D12 compositor.
@@ -62,8 +94,8 @@ comp_d3d12_renderer_destroy(struct comp_d3d12_renderer **renderer_ptr);
  * @param right_eye Right eye position for projection (NULL for default).
  * @param target_width Width of the render target (window).
  * @param target_height Height of the render target (window).
- * @param hardware_display_3d True when in 3D mode (stereo rendering),
- *        false for 2D passthrough (mono rendering).
+ * @param layout The frame's effective content layout (#542), from
+ *        @ref comp_d3d12_renderer_compute_effective_layout.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
  *
@@ -77,7 +109,7 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
                          struct xrt_vec3 *right_eye,
                          uint32_t target_width,
                          uint32_t target_height,
-                         bool hardware_display_3d);
+                         const struct comp_d3d12_eff_layout *layout);
 
 /*!
  * Project-pass half of @ref comp_d3d12_renderer_draw. Records into
@@ -99,7 +131,7 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
                                           struct xrt_vec3 *right_eye,
                                           uint32_t target_width,
                                           uint32_t target_height,
-                                          bool hardware_display_3d);
+                                          const struct comp_d3d12_eff_layout *layout);
 
 /*!
  * Window-space-pass half of @ref comp_d3d12_renderer_draw. Records:
@@ -117,7 +149,7 @@ comp_d3d12_renderer_draw_window_space_pass(struct comp_d3d12_renderer *renderer,
                                             struct comp_layer_accum *layers,
                                             uint32_t target_width,
                                             uint32_t target_height,
-                                            bool hardware_display_3d);
+                                            const struct comp_d3d12_eff_layout *layout);
 
 /*!
  * Get the atlas texture SRV GPU descriptor handle for weaving.

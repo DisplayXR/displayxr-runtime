@@ -525,6 +525,8 @@ render_window_space_layer(struct comp_d3d12_renderer *r,
                           ID3D12GraphicsCommandList *cmd_list,
                           const struct comp_layer *layer,
                           uint32_t view_index,
+                          uint32_t tile_x,
+                          uint32_t tile_y,
                           uint32_t vp_w,
                           uint32_t vp_h)
 {
@@ -644,11 +646,9 @@ render_window_space_layer(struct comp_d3d12_renderer *r,
 	cmd_list->SetGraphicsRootDescriptorTable(0, gpu_srv);
 
 	// Set RTV (atlas as render target) — viewport for the current view tile
+	// (tile origin from the caller's effective layout, #542).
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv = r->rtv_heap->GetCPUDescriptorHandleForHeapStart();
 	cmd_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-
-	uint32_t tile_x = (view_index % r->tile_columns) * r->view_width;
-	uint32_t tile_y = (view_index / r->tile_columns) * r->view_height;
 
 	D3D12_VIEWPORT vp = {};
 	vp.TopLeftX = (float)tile_x;
@@ -1363,7 +1363,7 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
                                           struct xrt_vec3 *right_eye,
                                           uint32_t target_width,
                                           uint32_t target_height,
-                                          bool hardware_display_3d)
+                                          const struct comp_d3d12_eff_layout *layout)
 {
 	ID3D12GraphicsCommandList *cmd_list = static_cast<ID3D12GraphicsCommandList *>(cmd_list_ptr);
 
@@ -1376,9 +1376,9 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 	bool draw_log = (draw_counter < 5 || draw_counter % 300 == 0);
 	draw_counter++;
 	if (draw_log) {
-		U_LOG_W("D3D12 renderer draw: layers=%u, 3d=%d, view=%ux%u, target=%ux%u",
-		        layers->layer_count, hardware_display_3d,
-		        renderer->view_width, renderer->view_height,
+		U_LOG_W("D3D12 renderer draw: layers=%u, eff=%ux%u tile=%ux%u, target=%ux%u",
+		        layers->layer_count, layout->cols, layout->rows,
+		        layout->tile_w, layout->tile_h,
 		        target_width, target_height);
 	}
 
@@ -1422,8 +1422,9 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 	cmd_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
 	cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
-	// Determine view count
-	uint32_t view_count = hardware_display_3d ? 2 : 1;
+	// CONTENT view count from the SUBMISSION-derived effective layout
+	// (#542) — no longer clamped by the hardware weave-state.
+	uint32_t view_count = layout->views;
 
 	// For each projection / zone layer, stretch-blit swapchain images into
 	// atlas tiles (zone layers land at the zone rect scaled into the tile
@@ -1439,9 +1440,6 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 		}
 
 		uint32_t layer_view_count = layer->data.view_count;
-		if (!hardware_display_3d) {
-			layer_view_count = 1;
-		}
 
 		for (uint32_t vi = 0; vi < layer_view_count && vi < view_count; vi++) {
 			struct xrt_swapchain *xsc = layer->sc_array[vi];
@@ -1527,10 +1525,10 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 			D3D12_GPU_DESCRIPTOR_HANDLE gpu_srv = renderer->srv_heap->GetGPUDescriptorHandleForHeapStart();
 			gpu_srv.ptr += renderer->srv_descriptor_size * srv_slot;
 
-			// Tile position in atlas grid
-			uint32_t tile_idx = (layer_view_count == 1) ? 0 : vi;
-			uint32_t tile_x = (tile_idx % renderer->tile_columns) * renderer->view_width;
-			uint32_t tile_y = (tile_idx / renderer->tile_columns) * renderer->view_height;
+			// Tile position in the effective atlas grid (#542)
+			uint32_t tile_idx = vi;
+			uint32_t tile_x = (tile_idx % layout->cols) * layout->tile_w;
+			uint32_t tile_y = (tile_idx / layout->cols) * layout->tile_h;
 
 			if (draw_log) {
 				U_LOG_W("D3D12 renderer: blit layer=%u view=%u, src=%p (%llux%u), "
@@ -1538,15 +1536,14 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 				        li, vi, (void *)src_resource,
 				        (unsigned long long)src_desc.Width, (unsigned)src_desc.Height,
 				        src_x, src_y, src_w, src_h,
-				        tile_x, tile_y, renderer->view_width, renderer->view_height);
+				        tile_x, tile_y, layout->tile_w, layout->tile_h);
 			}
 
-			// In mono/2D mode, clamp viewport to window dims (matching D3D11)
-			uint32_t vp_w = renderer->view_width;
-			uint32_t vp_h = renderer->view_height;
-			if (!hardware_display_3d) {
-				uint32_t atlas_w = renderer->tile_columns * renderer->view_width;
-				if (target_width < atlas_w) vp_w = target_width;
+			// Mono content: clamp viewport to window dims (matching D3D11)
+			uint32_t vp_w = layout->tile_w;
+			uint32_t vp_h = layout->tile_h;
+			if (layout->views == 1) {
+				if (target_width < layout->tile_w) vp_w = target_width;
 				if (target_height < renderer->texture_height) vp_h = target_height;
 			}
 
@@ -1606,37 +1603,10 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 			cmd_list->SetGraphicsRoot32BitConstants(1, 4, blit_src_rect, 0);
 			cmd_list->DrawInstanced(4, 1, 0, 0);
 
-			// For mono: draw same quad again at second tile position
-			if (layer_view_count == 1 && view_count == 2) {
-				uint32_t dup_x = (1 % renderer->tile_columns) * renderer->view_width;
-				uint32_t dup_y = (1 / renderer->tile_columns) * renderer->view_height;
-
-				vp.TopLeftX = static_cast<float>(dup_x);
-				vp.TopLeftY = static_cast<float>(dup_y);
-				vp.Width = static_cast<float>(vp_w);
-				vp.Height = static_cast<float>(vp_h);
-				if (is_zone && target_width > 0 && target_height > 0) {
-					// Same zone sub-rect, duplicated into the second tile.
-					const struct xrt_rect *zr = &layer->data.zone_3d.rect;
-					const float zsx = vp.Width / static_cast<float>(target_width);
-					const float zsy = vp.Height / static_cast<float>(target_height);
-					vp.TopLeftX += static_cast<float>(zr->offset.w) * zsx;
-					vp.TopLeftY += static_cast<float>(zr->offset.h) * zsy;
-					vp.Width = static_cast<float>(zr->extent.w) * zsx;
-					vp.Height = static_cast<float>(zr->extent.h) * zsy;
-				}
-				if (vp.Width > 0.0f && vp.Height > 0.0f) {
-					cmd_list->RSSetViewports(1, &vp);
-
-					scissor.left = dup_x;
-					scissor.top = dup_y;
-					scissor.right = dup_x + vp_w;
-					scissor.bottom = dup_y + vp_h;
-					cmd_list->RSSetScissorRects(1, &scissor);
-
-					cmd_list->DrawInstanced(4, 1, 0, 0);
-				}
-			}
+			// #542: the old mono dup-to-tile-1 draw is gone — the atlas
+			// holds exactly the tiles the app submitted (1 view ⇒ a 1×1
+			// effective grid), so there is no second tile to fill. The DP
+			// weaves or flattens whatever arrives per its own mode_3d.
 
 			// XR_EXT_display_zones: restore the REPLACE blit PSO for the
 			// next (projection) draw.
@@ -1662,32 +1632,35 @@ comp_d3d12_renderer_draw_window_space_pass(struct comp_d3d12_renderer *renderer,
                                             struct comp_layer_accum *layers,
                                             uint32_t target_width,
                                             uint32_t target_height,
-                                            bool hardware_display_3d)
+                                            const struct comp_d3d12_eff_layout *layout)
 {
 	ID3D12GraphicsCommandList *cmd_list = static_cast<ID3D12GraphicsCommandList *>(cmd_list_ptr);
 	if (cmd_list == nullptr || layers == nullptr) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
-	uint32_t view_count = hardware_display_3d ? 2 : 1;
+	// Same effective grid as the projection pass (#542) — HUD tiles must
+	// land on the per-tile viewports the projection pass painted.
+	uint32_t view_count = layout->views;
 
 	// Compute effective viewport for window-space layers (same clamp as projection)
-	uint32_t ws_vp_w = renderer->view_width;
-	uint32_t ws_vp_h = renderer->view_height;
-	if (!hardware_display_3d) {
-		uint32_t atlas_w = renderer->tile_columns * renderer->view_width;
-		if (target_width < atlas_w) ws_vp_w = target_width;
+	uint32_t ws_vp_w = layout->tile_w;
+	uint32_t ws_vp_h = layout->tile_h;
+	if (layout->views == 1) {
+		if (target_width < layout->tile_w) ws_vp_w = target_width;
 		if (target_height < renderer->texture_height) ws_vp_h = target_height;
 	}
 
 	// Draw window-space layers (atlas is in RENDER_TARGET state)
 	for (uint32_t vi = 0; vi < view_count; vi++) {
+		uint32_t tile_x = (vi % layout->cols) * layout->tile_w;
+		uint32_t tile_y = (vi / layout->cols) * layout->tile_h;
 		for (uint32_t li = 0; li < layers->layer_count; li++) {
 			struct comp_layer *layer = &layers->layers[li];
 			if (layer->data.type != XRT_LAYER_WINDOW_SPACE) {
 				continue;
 			}
-			render_window_space_layer(renderer, cmd_list, layer, vi, ws_vp_w, ws_vp_h);
+			render_window_space_layer(renderer, cmd_list, layer, vi, tile_x, tile_y, ws_vp_w, ws_vp_h);
 		}
 	}
 
@@ -1711,17 +1684,87 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
                          struct xrt_vec3 *right_eye,
                          uint32_t target_width,
                          uint32_t target_height,
-                         bool hardware_display_3d)
+                         const struct comp_d3d12_eff_layout *layout)
 {
 	xrt_result_t xret = comp_d3d12_renderer_draw_projection_pass(
 	    renderer, cmd_list_ptr, layers, left_eye, right_eye,
-	    target_width, target_height, hardware_display_3d);
+	    target_width, target_height, layout);
 	if (xret != XRT_SUCCESS) {
 		return xret;
 	}
 	return comp_d3d12_renderer_draw_window_space_pass(
 	    renderer, cmd_list_ptr, layers,
-	    target_width, target_height, hardware_display_3d);
+	    target_width, target_height, layout);
+}
+
+// Per-frame effective CONTENT layout (#542) — same policy as the D3D11 leg
+// (comp_d3d11_renderer_compute_effective_layout): submission view_count, mode
+// grid when matched, views×1 strip sized by the submitted imageRect on a
+// hardware/content divergence, legacy apps keep the hardware-keyed mono clamp.
+extern "C" void
+comp_d3d12_renderer_compute_effective_layout(struct comp_d3d12_renderer *renderer,
+                                             struct comp_layer_accum *layers,
+                                             bool hardware_display_3d,
+                                             struct comp_d3d12_eff_layout *out_layout)
+{
+	uint32_t mode_cols = renderer->tile_columns > 0 ? renderer->tile_columns : 1;
+	uint32_t mode_rows = renderer->tile_rows > 0 ? renderer->tile_rows : 1;
+	uint32_t mode_tiles = mode_cols * mode_rows;
+
+	uint32_t views = mode_tiles;
+	const struct comp_layer *proj_layer = NULL;
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		if (layers->layers[i].data.type == XRT_LAYER_PROJECTION ||
+		    layers->layers[i].data.type == XRT_LAYER_PROJECTION_DEPTH ||
+		    layers->layers[i].data.type == XRT_LAYER_ZONE_3D) {
+			proj_layer = &layers->layers[i];
+			views = proj_layer->data.view_count;
+			break;
+		}
+	}
+	if (views == 0) {
+		views = 1;
+	}
+	if (views > XRT_MAX_VIEWS) {
+		views = XRT_MAX_VIEWS;
+	}
+	if (renderer->legacy_app_tile_scaling && !hardware_display_3d && views > 1) {
+		views = 1;
+	}
+
+	out_layout->views = views;
+	if (views == 1) {
+		out_layout->cols = 1;
+		out_layout->rows = 1;
+		out_layout->tile_w = mode_cols * renderer->view_width;
+		out_layout->tile_h = mode_rows * renderer->view_height;
+	} else if (views == mode_tiles) {
+		out_layout->cols = mode_cols;
+		out_layout->rows = mode_rows;
+		out_layout->tile_w = renderer->view_width;
+		out_layout->tile_h = renderer->view_height;
+	} else {
+		uint32_t tile_w = (mode_cols * renderer->view_width) / views;
+		uint32_t tile_h = mode_rows * renderer->view_height;
+		if (proj_layer != NULL) {
+			const struct xrt_rect *r0 = &proj_layer->data.proj.v[0].sub.rect;
+			if (r0->extent.w > 0 && r0->extent.h > 0) {
+				tile_w = static_cast<uint32_t>(r0->extent.w);
+				tile_h = static_cast<uint32_t>(r0->extent.h);
+			}
+		}
+		uint32_t atlas_w = mode_cols * renderer->view_width;
+		if (tile_w * views > atlas_w && views > 0) {
+			tile_w = atlas_w / views;
+		}
+		if (tile_h > renderer->texture_height) {
+			tile_h = renderer->texture_height;
+		}
+		out_layout->cols = views;
+		out_layout->rows = 1;
+		out_layout->tile_w = tile_w;
+		out_layout->tile_h = tile_h;
+	}
 }
 
 
