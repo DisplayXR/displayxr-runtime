@@ -3742,10 +3742,13 @@ d3d12_update_implicit_mask(struct comp_d3d12_compositor *c,
 }
 
 // XR_EXT_display_zones (ADR-027) — (re)rasterize the AUTO wish: union of the
-// frame's zone rects with a stepped ring feather. M=0 everywhere, then for
-// each feather step (outermost first, ascending M) clear the expanded rect of
-// EVERY zone — max-semantics without a shader: the final step writes M=1 at
-// every zone core, so overlapping feathers can never dim a core. Reuses the
+// frame's zone rects with an INWARD stepped ring feather. M=0 outside the
+// zones; inside each zone M ramps 0->1 over the first 16 px from the edge
+// (ascending-value insets, one rect-array clear per step — max semantics:
+// overlapping feathers can never dim a core; small zones clamp the inset so
+// the center still reaches 1). Feathering inward keeps the visual lerp
+// fading zone content toward TRANSPARENT at the edge (never toward the
+// weave of empty atlas, which DPs may report opaque black). Reuses the
 // implicit-mask R8 resources (the implicit rule is inert in zones frames) and
 // re-rasters every zones frame, VK-style — a handful of rect clears — while
 // invalidating the implicit rect cache so a later legacy frame re-rasters.
@@ -3837,23 +3840,33 @@ d3d12_update_zone_wish_mask(struct comp_d3d12_compositor *c,
 	// The wish raster replaces whatever the implicit rule cached.
 	c->implicit_rect_count = 0;
 
-	// Ring raster: M=0 everywhere, then one rect-array clear per feather
-	// step (outermost first, ascending value — D3D12's
+	// INWARD ring raster: M=0 everywhere, then one rect-array clear per
+	// feather step (ascending value, insets deepening — D3D12's
 	// ClearRenderTargetView takes the rect array natively).
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv = c->implicit_mask_rtv_heap->GetCPUDescriptorHandleForHeapStart();
 	const float all_off[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 	c->cmd_list->ClearRenderTargetView(rtv, all_off, 0, nullptr);
-	for (int32_t s = D3D12_ZONE_WISH_FEATHER_STEPS; s >= 0; s--) {
-		const float v = (float)(D3D12_ZONE_WISH_FEATHER_STEPS - s) / (float)D3D12_ZONE_WISH_FEATHER_STEPS;
+	for (int32_t s = 1; s <= D3D12_ZONE_WISH_FEATHER_STEPS; s++) {
+		const float v = (float)s / (float)D3D12_ZONE_WISH_FEATHER_STEPS;
 		const float val[4] = {v, 0.0f, 0.0f, 0.0f};
-		const int32_t expand = s * D3D12_ZONE_WISH_FEATHER_STEP_PX;
 		D3D12_RECT drs[XRT_MAX_LAYERS];
 		uint32_t n = 0;
 		for (uint32_t i = 0; i < rect_count && n < XRT_MAX_LAYERS; i++) {
-			int32_t left = rects[i].offset.w - expand;
-			int32_t top = rects[i].offset.h - expand;
-			int32_t right = rects[i].offset.w + rects[i].extent.w + expand;
-			int32_t bottom = rects[i].offset.h + rects[i].extent.h + expand;
+			// Small zones clamp the inset so the center still reaches 1.
+			int32_t min_ext = rects[i].extent.w < rects[i].extent.h ? rects[i].extent.w
+			                                                        : rects[i].extent.h;
+			int32_t max_inset = (min_ext - 1) / 2;
+			if (max_inset < 0) {
+				max_inset = 0;
+			}
+			int32_t inset = s * D3D12_ZONE_WISH_FEATHER_STEP_PX;
+			if (inset > max_inset) {
+				inset = max_inset;
+			}
+			int32_t left = rects[i].offset.w + inset;
+			int32_t top = rects[i].offset.h + inset;
+			int32_t right = rects[i].offset.w + rects[i].extent.w - inset;
+			int32_t bottom = rects[i].offset.h + rects[i].extent.h - inset;
 			if (left < 0) {
 				left = 0;
 			}

@@ -3433,10 +3433,15 @@ d3d11_update_implicit_mask(struct comp_d3d11_compositor *c,
 }
 
 // XR_EXT_display_zones (ADR-027) — (re)rasterize the AUTO wish: union of the
-// frame's zone rects with a stepped ring feather. M=0 everywhere, then for
-// each feather step (outermost first, ascending M) ClearView the expanded
-// rect of EVERY zone — max-semantics without a shader: the final step writes
-// M=1 at every zone core, so overlapping feathers can never dim a core.
+// frame's zone rects with an INWARD stepped ring feather. M=0 outside the
+// zones; inside each zone M ramps 0->1 over the first 16 px from the edge
+// (ascending-value insets, ClearView per step on EVERY zone — max semantics
+// without a shader, so overlapping feathers can never dim a core; small
+// zones clamp the inset so the center still reaches 1). Feathering INWARD
+// keeps the visual lerp fading zone content toward TRANSPARENT at the zone
+// edge — an outward feather would lerp toward the weave of empty atlas,
+// which DPs may report as opaque black (a dark halo on glass) — and keeps
+// the hardware wish inside the zone rects.
 // Same R8 RTV + staged-SRV pattern as the implicit mask (separate textures —
 // the two never coexist in one frame but lifetimes differ). Dirty-checked on
 // the rect set + dims; bumps c->zone_publish_seq on re-raster. Caller holds
@@ -3535,15 +3540,27 @@ d3d11_update_zone_wish_mask(struct comp_d3d11_compositor *c,
 		U_LOG_E("zone wish mask: ID3D11DeviceContext1 unavailable (hr=0x%08x)", hr);
 		return nullptr;
 	}
-	for (int32_t s = D3D11_ZONE_WISH_FEATHER_STEPS; s >= 0; s--) {
-		const float v = (float)(D3D11_ZONE_WISH_FEATHER_STEPS - s) / (float)D3D11_ZONE_WISH_FEATHER_STEPS;
+	for (int32_t s = 1; s <= D3D11_ZONE_WISH_FEATHER_STEPS; s++) {
+		const float v = (float)s / (float)D3D11_ZONE_WISH_FEATHER_STEPS;
 		const float val[4] = {v, 0.0f, 0.0f, 0.0f};
-		const int32_t expand = s * D3D11_ZONE_WISH_FEATHER_STEP_PX;
 		for (uint32_t i = 0; i < rect_count; i++) {
-			int32_t left = rects[i].offset.w - expand;
-			int32_t top = rects[i].offset.h - expand;
-			int32_t right = rects[i].offset.w + rects[i].extent.w + expand;
-			int32_t bottom = rects[i].offset.h + rects[i].extent.h + expand;
+			// Per-zone inset clamp: zones smaller than the feather
+			// collapse the deeper rings onto one core so the center
+			// still reaches M=1.
+			int32_t min_ext = rects[i].extent.w < rects[i].extent.h ? rects[i].extent.w
+			                                                        : rects[i].extent.h;
+			int32_t max_inset = (min_ext - 1) / 2;
+			if (max_inset < 0) {
+				max_inset = 0;
+			}
+			int32_t inset = s * D3D11_ZONE_WISH_FEATHER_STEP_PX;
+			if (inset > max_inset) {
+				inset = max_inset;
+			}
+			int32_t left = rects[i].offset.w + inset;
+			int32_t top = rects[i].offset.h + inset;
+			int32_t right = rects[i].offset.w + rects[i].extent.w - inset;
+			int32_t bottom = rects[i].offset.h + rects[i].extent.h - inset;
 			if (left < 0) {
 				left = 0;
 			}

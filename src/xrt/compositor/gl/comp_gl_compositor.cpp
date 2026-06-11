@@ -1698,10 +1698,13 @@ gl_update_implicit_mask(struct comp_gl_compositor *c,
 }
 
 // XR_EXT_display_zones (ADR-027) — (re)rasterize the AUTO wish: union of the
-// frame's zone rects with a stepped ring feather. M=0 everywhere, then for
-// each feather step (outermost first, ascending M) scissor-clear the expanded
-// rect of EVERY zone — max-semantics without a shader: the final step writes
-// M=1 at every zone core, so overlapping feathers can never dim a core.
+// frame's zone rects with an INWARD stepped ring feather. M=0 outside the
+// zones; inside each zone M ramps 0->1 over the first 16 px from the edge
+// (ascending-value insets — max semantics: overlapping feathers can never
+// dim a core; small zones clamp the inset so the center still reaches 1).
+// Feathering inward keeps the visual lerp fading zone content toward
+// TRANSPARENT at the edge (never toward the weave of empty atlas, which DPs
+// may report opaque black).
 // Reuses the implicit-mask R8 texture (the implicit rule is inert in zones
 // frames) and re-rasters every zones frame, VK-style — a handful of scissored
 // clears — while invalidating the implicit rect cache so a later legacy frame
@@ -1754,15 +1757,25 @@ gl_update_zone_wish_mask(struct comp_gl_compositor *c,
 	glClear(GL_COLOR_BUFFER_BIT);
 
 	glEnable(GL_SCISSOR_TEST);
-	for (int32_t s = ZONE_WISH_FEATHER_STEPS; s >= 0; s--) {
-		const float v = (float)(ZONE_WISH_FEATHER_STEPS - s) / (float)ZONE_WISH_FEATHER_STEPS;
-		const int32_t expand = s * ZONE_WISH_FEATHER_STEP_PX;
+	for (int32_t s = 1; s <= ZONE_WISH_FEATHER_STEPS; s++) {
+		const float v = (float)s / (float)ZONE_WISH_FEATHER_STEPS;
 		glClearColor(v, 0.0f, 0.0f, 0.0f);
 		for (uint32_t i = 0; i < rect_count; i++) {
-			int32_t left = rects[i].offset.w - expand;
-			int32_t top = rects[i].offset.h - expand;
-			int32_t right = rects[i].offset.w + rects[i].extent.w + expand;
-			int32_t bottom = rects[i].offset.h + rects[i].extent.h + expand;
+			// Small zones clamp the inset so the center still reaches 1.
+			int32_t min_ext = rects[i].extent.w < rects[i].extent.h ? rects[i].extent.w
+			                                                        : rects[i].extent.h;
+			int32_t max_inset = (min_ext - 1) / 2;
+			if (max_inset < 0) {
+				max_inset = 0;
+			}
+			int32_t inset = s * ZONE_WISH_FEATHER_STEP_PX;
+			if (inset > max_inset) {
+				inset = max_inset;
+			}
+			int32_t left = rects[i].offset.w + inset;
+			int32_t top = rects[i].offset.h + inset;
+			int32_t right = rects[i].offset.w + rects[i].extent.w - inset;
+			int32_t bottom = rects[i].offset.h + rects[i].extent.h - inset;
 			if (left < 0) {
 				left = 0;
 			}
