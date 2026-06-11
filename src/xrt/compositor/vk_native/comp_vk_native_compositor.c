@@ -159,6 +159,12 @@ struct comp_vk_native_compositor
 	//! True when display is in 3D mode (weaver active). False = 2D passthrough.
 	bool hardware_display_3d;
 
+	//! Per-frame effective CONTENT layout (#542): the atlas grid actually
+	//! painted and handed to the DP this frame — submission-derived,
+	//! decoupled from hardware_display_3d. views == 0 until the first
+	//! layer commit computes it.
+	struct comp_vk_native_eff_layout eff_layout;
+
 	//! Last known 3D rendering mode index (for V-key toggle restore).
 	uint32_t last_3d_mode_index;
 
@@ -1238,24 +1244,20 @@ vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c
 		    0, 0, NULL, 0, NULL, 1, &src_to_sample);
 
 		// Per-view pass with disparity shift in tile-fraction → atlas px.
-		// Mirrors the metal/GL compositors (#413): a 2D (non-3D) mode gets
-		// ONE stamp over the full content region (tile grid × view dims);
-		// 3D modes stamp every tile. The previous code looped the tile grid
-		// unconditionally and hardcoded the 2-view disparity pair
-		// (tile_index == 0 ? -half : +half), which mis-shifts every layout
-		// other than 2 views.
-		uint32_t effective_views = c->hardware_display_3d ? (tile_columns * tile_rows) : 1;
+		// Mirrors the metal/GL compositors (#413). The caller passes the
+		// frame's EFFECTIVE content grid (#542): mono content arrives as a
+		// 1×1 grid whose tile spans the full content region, so the old
+		// hardware-keyed full-region special case is just the grid math.
+		uint32_t effective_views = tile_columns * tile_rows;
 		float half_disp = ws->disparity / 2.0f;
 		for (uint32_t eye = 0; eye < effective_views; eye++) {
 			uint32_t tile_x = eye % tile_columns;
 			uint32_t tile_y = eye / tile_columns;
 
-			float tile_origin_x = c->hardware_display_3d ? (float)(tile_x * view_w) : 0.0f;
-			float tile_origin_y = c->hardware_display_3d ? (float)(tile_y * view_h) : 0.0f;
-			float tile_w = c->hardware_display_3d ? (float)view_w
-			                                      : (float)(tile_columns * view_w);
-			float tile_h = c->hardware_display_3d ? (float)view_h
-			                                      : (float)(tile_rows * view_h);
+			float tile_origin_x = (float)(tile_x * view_w);
+			float tile_origin_y = (float)(tile_y * view_h);
+			float tile_w = (float)view_w;
+			float tile_h = (float)view_h;
 
 			// Per-view horizontal disparity, graded across the view sweep
 			// (view index = baseline order, same as the projection views):
@@ -1890,10 +1892,19 @@ vk_native_capture_atlas_to_png(struct comp_vk_native_compositor *c, const char *
 		return false;
 	}
 
+	// #542: capture the frame's effective content region (what the renderer
+	// painted), falling back to the mode layout pre-first-commit.
 	uint32_t tile_columns = 1, tile_rows = 1;
-	comp_vk_native_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);
 	uint32_t view_w = 0, view_h = 0;
-	comp_vk_native_renderer_get_view_dimensions(c->renderer, &view_w, &view_h);
+	if (c->eff_layout.views > 0 && c->eff_layout.tile_w > 0 && c->eff_layout.tile_h > 0) {
+		tile_columns = c->eff_layout.cols;
+		tile_rows = c->eff_layout.rows;
+		view_w = c->eff_layout.tile_w;
+		view_h = c->eff_layout.tile_h;
+	} else {
+		comp_vk_native_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);
+		comp_vk_native_renderer_get_view_dimensions(c->renderer, &view_w, &view_h);
+	}
 	if (tile_columns == 0 || tile_rows == 0 || view_w == 0 || view_h == 0) {
 		return false;
 	}
@@ -2102,6 +2113,81 @@ vk_zone_dp_supported(struct comp_vk_native_compositor *c);
 static void
 vk_sync_zone_mask_to_dp(struct comp_vk_native_compositor *c);
 
+// Per-frame effective CONTENT layout (#542) — same policy as the D3D11/D3D12/
+// GL legs: views from the first projection-class layer's view_count (mode grid
+// default; legacy apps keep the hardware-keyed mono clamp); matched → the mode
+// layout (bit-identical), mono → one tile spanning the full content region,
+// divergence → views×1 strip sized by the submitted imageRect, capped to the
+// physical atlas. Decoupled from c->hardware_display_3d, which only drives the
+// DP weave (request_display_mode), HUD, and V-key paths.
+static void
+vk_compute_effective_layout(struct comp_vk_native_compositor *c)
+{
+	uint32_t mode_cols = 1, mode_rows = 1;
+	uint32_t view_w = 0, view_h = 0;
+	uint32_t atlas_w = 0, atlas_h = 0;
+	comp_vk_native_renderer_get_tile_layout(c->renderer, &mode_cols, &mode_rows);
+	comp_vk_native_renderer_get_view_dimensions(c->renderer, &view_w, &view_h);
+	comp_vk_native_renderer_get_atlas_dimensions(c->renderer, &atlas_w, &atlas_h);
+	if (mode_cols == 0) mode_cols = 1;
+	if (mode_rows == 0) mode_rows = 1;
+	uint32_t mode_tiles = mode_cols * mode_rows;
+
+	uint32_t views = mode_tiles;
+	const struct comp_layer *proj_layer = NULL;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_PROJECTION ||
+		    c->layer_accum.layers[i].data.type == XRT_LAYER_PROJECTION_DEPTH ||
+		    c->layer_accum.layers[i].data.type == XRT_LAYER_ZONE_3D) {
+			proj_layer = &c->layer_accum.layers[i];
+			views = proj_layer->data.view_count;
+			break;
+		}
+	}
+	if (views == 0) {
+		views = 1;
+	}
+	if (views > XRT_MAX_VIEWS) {
+		views = XRT_MAX_VIEWS;
+	}
+	if (c->legacy_app_tile_scaling && !c->hardware_display_3d && views > 1) {
+		views = 1;
+	}
+
+	c->eff_layout.views = views;
+	if (views == 1) {
+		c->eff_layout.cols = 1;
+		c->eff_layout.rows = 1;
+		c->eff_layout.tile_w = mode_cols * view_w;
+		c->eff_layout.tile_h = mode_rows * view_h;
+	} else if (views == mode_tiles) {
+		c->eff_layout.cols = mode_cols;
+		c->eff_layout.rows = mode_rows;
+		c->eff_layout.tile_w = view_w;
+		c->eff_layout.tile_h = view_h;
+	} else {
+		uint32_t tile_w = (mode_cols * view_w) / views;
+		uint32_t tile_h = mode_rows * view_h;
+		if (proj_layer != NULL) {
+			const struct xrt_rect *r0 = &proj_layer->data.proj.v[0].sub.rect;
+			if (r0->extent.w > 0 && r0->extent.h > 0) {
+				tile_w = (uint32_t)r0->extent.w;
+				tile_h = (uint32_t)r0->extent.h;
+			}
+		}
+		if (atlas_w > 0 && tile_w * views > atlas_w && views > 0) {
+			tile_w = atlas_w / views;
+		}
+		if (atlas_h > 0 && tile_h > atlas_h) {
+			tile_h = atlas_h;
+		}
+		c->eff_layout.cols = views;
+		c->eff_layout.rows = 1;
+		c->eff_layout.tile_w = tile_w;
+		c->eff_layout.tile_h = tile_h;
+	}
+}
+
 static xrt_result_t
 vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -2277,6 +2363,12 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		comp_vk_native_target_get_dimensions(c->target, &tgt_width, &tgt_height);
 	}
 
+	// Per-frame effective CONTENT layout (#542): tile grid/dims from the
+	// SUBMISSION, decoupled from the hardware weave-state. Feeds the
+	// renderer draw, the window-space pass, both DP handoffs, and the
+	// capture path — they must all agree on the frame's geometry.
+	vk_compute_effective_layout(c);
+
 	// Zero-copy check: can we pass the app's swapchain directly to the DP?
 	bool zero_copy = false;
 	uint64_t zc_image_u64 = 0;
@@ -2296,7 +2388,12 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			if (layer->data.type == XRT_LAYER_PROJECTION ||
 			    layer->data.type == XRT_LAYER_PROJECTION_DEPTH) {
 				uint32_t vc = mode->view_count;
-				bool same_sc = (vc > 0 && vc <= XRT_MAX_VIEWS && layer->sc_array[0] != NULL);
+				// #542: a hardware/content divergence frame (submitted
+				// views != mode views) must take the atlas path — the
+				// per-view loops below would read stale proj.v[] slots,
+				// and zero-copy can't re-tile a mismatched submission.
+				bool same_sc = (vc > 0 && vc <= XRT_MAX_VIEWS && layer->data.view_count == vc &&
+				                layer->sc_array[0] != NULL);
 				for (uint32_t v = 1; v < vc && same_sc; v++) {
 					if (layer->sc_array[v] != layer->sc_array[0])
 						same_sc = false;
@@ -2346,7 +2443,7 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	xrt_result_t xret = XRT_SUCCESS;
 	if (!zero_copy) {
 		xret = comp_vk_native_renderer_draw(
-		    c->renderer, &c->layer_accum, &left_eye, &right_eye, tgt_width, tgt_height, c->hardware_display_3d);
+		    c->renderer, &c->layer_accum, &left_eye, &right_eye, tgt_width, tgt_height, &c->eff_layout);
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to render layers");
 			return xret;
@@ -2403,8 +2500,13 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				view_format = comp_vk_native_renderer_get_format(c->renderer);
 			}
 
-			comp_vk_native_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
-			comp_vk_native_renderer_get_tile_layout(c->renderer, &tc, &tr);
+			// #542: the DP and the window-space pass get the frame's
+			// EFFECTIVE content layout — the grid the renderer painted
+			// (== the mode layout for matched submissions).
+			view_width = c->eff_layout.tile_w;
+			view_height = c->eff_layout.tile_h;
+			tc = c->eff_layout.cols;
+			tr = c->eff_layout.rows;
 
 			// Pre-weave: composite window-space layers per-tile INTO the atlas
 			// so the DP weaves them along with the projection content. Skipped
@@ -2642,8 +2744,13 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 					view_format = comp_vk_native_renderer_get_format(c->renderer);
 				}
 
-				comp_vk_native_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
-				comp_vk_native_renderer_get_tile_layout(c->renderer, &tc, &tr);
+				// #542: the DP and the window-space pass get the frame's
+				// EFFECTIVE content layout — the grid the renderer painted
+				// (== the mode layout for matched submissions).
+				view_width = c->eff_layout.tile_w;
+				view_height = c->eff_layout.tile_h;
+				tc = c->eff_layout.cols;
+				tr = c->eff_layout.rows;
 
 				// Pre-weave: composite window-space layers per-tile INTO the
 				// atlas. Skipped in zero-copy (no atlas) and when no

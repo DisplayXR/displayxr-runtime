@@ -720,7 +720,9 @@ zone_draw_ensure_framebuffer(struct comp_vk_native_renderer *r)
 //! Every zone layer must be drawable: plain 2D swapchain (the whole-image
 //! view is a 2D view only when array_size == 1) with a valid view.
 static bool
-zone_pass_usable(struct comp_vk_native_renderer *r, struct comp_layer_accum *layers, bool hardware_display_3d)
+zone_pass_usable(struct comp_vk_native_renderer *r,
+                 struct comp_layer_accum *layers,
+                 const struct comp_vk_native_eff_layout *layout)
 {
 	if (!zone_draw_ensure(r) || !zone_draw_ensure_framebuffer(r)) {
 		return false;
@@ -731,7 +733,10 @@ zone_pass_usable(struct comp_vk_native_renderer *r, struct comp_layer_accum *lay
 		if (layer->data.type != XRT_LAYER_ZONE_3D) {
 			continue;
 		}
-		uint32_t view_count = hardware_display_3d ? layer->data.view_count : 1;
+		uint32_t view_count = layer->data.view_count;
+		if (view_count > layout->views) {
+			view_count = layout->views;
+		}
 		if (view_count == 0) {
 			view_count = 1;
 		}
@@ -767,7 +772,7 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
                 struct comp_layer_accum *layers,
                 uint32_t target_width,
                 uint32_t target_height,
-                bool hardware_display_3d)
+                const struct comp_vk_native_eff_layout *layout)
 {
 	struct vk_bundle *vk = r->vk;
 
@@ -803,7 +808,10 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 		if (layer->data.type != XRT_LAYER_ZONE_3D) {
 			continue;
 		}
-		uint32_t view_count = hardware_display_3d ? layer->data.view_count : 1;
+		uint32_t view_count = layer->data.view_count;
+		if (view_count > layout->views) {
+			view_count = layout->views;
+		}
 		if (view_count == 0) {
 			view_count = 1;
 		}
@@ -856,7 +864,10 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			continue;
 		}
 
-		uint32_t view_count = hardware_display_3d ? layer->data.view_count : 1;
+		uint32_t view_count = layer->data.view_count;
+		if (view_count > layout->views) {
+			view_count = layout->views;
+		}
 		if (view_count == 0) {
 			view_count = 1;
 		}
@@ -878,19 +889,21 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 
 			// Destination: the same tile box + zone-rect scale as the
 			// blit path (in zones frames the tile spans the full window).
+			// Tile-place by the effective grid (#542); mono content
+			// spans the full content region.
 			float dx0, dy0, dx1, dy1;
-			if (!hardware_display_3d || view_count == 1) {
+			if (layout->views == 1 || view_count == 1) {
 				dx0 = 0.0f;
 				dy0 = 0.0f;
-				dx1 = (float)(r->tile_columns * r->view_width);
-				dy1 = (float)(r->tile_rows * r->view_height);
+				dx1 = (float)(layout->cols * layout->tile_w);
+				dy1 = (float)(layout->rows * layout->tile_h);
 			} else {
-				uint32_t tile_x = eye % r->tile_columns;
-				uint32_t tile_y = eye / r->tile_columns;
-				dx0 = (float)(tile_x * r->view_width);
-				dy0 = (float)(tile_y * r->view_height);
-				dx1 = dx0 + (float)r->view_width;
-				dy1 = dy0 + (float)r->view_height;
+				uint32_t tile_x = eye % layout->cols;
+				uint32_t tile_y = eye / layout->cols;
+				dx0 = (float)(tile_x * layout->tile_w);
+				dy0 = (float)(tile_y * layout->tile_h);
+				dx1 = dx0 + (float)layout->tile_w;
+				dy1 = dy0 + (float)layout->tile_h;
 			}
 			if (target_width == 0 || target_height == 0) {
 				continue;
@@ -1040,7 +1053,7 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
                               struct xrt_vec3 *right_eye,
                               uint32_t target_width,
                               uint32_t target_height,
-                              bool hardware_display_3d)
+                              const struct comp_vk_native_eff_layout *layout)
 {
 	struct vk_bundle *vk = r->vk;
 	(void)left_eye;
@@ -1061,8 +1074,8 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	// alpha-over in layer-list order; blits cannot blend. Falls back to the
 	// blit path below (overlap overwrites, one-shot WARN) if the pipeline
 	// bundle cannot be created or a zone swapchain is layered.
-	if (zones_frame && zone_pass_usable(r, layers, hardware_display_3d)) {
-		return draw_zones_pass(r, layers, target_width, target_height, hardware_display_3d);
+	if (zones_frame && zone_pass_usable(r, layers, layout)) {
+		return draw_zones_pass(r, layers, target_width, target_height, layout);
 	}
 
 	VkCommandBufferAllocateInfo alloc_info = {
@@ -1118,16 +1131,19 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 			continue;
 		}
 
-		uint32_t view_count = hardware_display_3d ? layer->data.view_count : 1;
+		// CONTENT tile count from the SUBMISSION-derived effective layout
+		// (#542) — no longer clamped by the hardware weave-state.
+		uint32_t view_count = layer->data.view_count;
+		if (view_count > layout->views) view_count = layout->views;
 		if (view_count == 0) view_count = 1;
 
 		static bool blit_logged = false;
 		if (!blit_logged) {
-			U_LOG_W("Atlas blit: view_count=%u, hardware_3d=%d, tiles=%ux%u, "
-			        "view=%ux%u, layer_view_count=%u",
-			        view_count, (int)hardware_display_3d,
-			        r->tile_columns, r->tile_rows,
-			        r->view_width, r->view_height,
+			U_LOG_W("Atlas blit: view_count=%u, eff_tiles=%ux%u, "
+			        "eff_view=%ux%u, layer_view_count=%u",
+			        view_count,
+			        layout->cols, layout->rows,
+			        layout->tile_w, layout->tile_h,
 			        layer->data.view_count);
 		}
 
@@ -1160,20 +1176,20 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 			int32_t sy1 = sy0 + (int32_t)src_rect->extent.h;
 
 			int32_t dx0, dy0, dx1, dy1;
-			if (!hardware_display_3d || view_count == 1) {
-				// 2D mode: stretch across entire atlas
+			if (layout->views == 1 || view_count == 1) {
+				// Mono content: stretch across the full content region
 				dx0 = 0;
 				dy0 = 0;
-				dx1 = (int32_t)(r->tile_columns * r->view_width);
-				dy1 = (int32_t)(r->tile_rows * r->view_height);
+				dx1 = (int32_t)(layout->cols * layout->tile_w);
+				dy1 = (int32_t)(layout->rows * layout->tile_h);
 			} else {
-				// Tiled layout: place each eye in its tile
-				uint32_t tile_x = eye % r->tile_columns;
-				uint32_t tile_y = eye / r->tile_columns;
-				dx0 = (int32_t)(tile_x * r->view_width);
-				dy0 = (int32_t)(tile_y * r->view_height);
-				dx1 = dx0 + (int32_t)r->view_width;
-				dy1 = dy0 + (int32_t)r->view_height;
+				// Tiled layout: place each eye in its effective tile (#542)
+				uint32_t tile_x = eye % layout->cols;
+				uint32_t tile_y = eye / layout->cols;
+				dx0 = (int32_t)(tile_x * layout->tile_w);
+				dy0 = (int32_t)(tile_y * layout->tile_h);
+				dx1 = dx0 + (int32_t)layout->tile_w;
+				dy1 = dy0 + (int32_t)layout->tile_h;
 			}
 
 			// XR_EXT_display_zones: scale the zone rect (client-window
