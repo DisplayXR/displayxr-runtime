@@ -129,11 +129,15 @@ vk_local2d_composite_raster_mask(struct vk_local2d_composite *lc,
                                  float rect_value);
 
 /*!
- * Rasterize an R8 wish mask with a stepped ring feather
+ * Rasterize an R8 wish mask with an INWARD stepped ring feather
  * (XR_EXT_display_zones, ADR-027): LOAD_OP_CLEAR to 0, then for each feather
- * step (outermost first, ascending value to 1.0 at the core) clear the
- * expanded rect of EVERY zone — max-semantics without a shader; overlapping
- * feathers can never dim a zone core. Layout contract identical to
+ * step (ascending value to 1.0 at the core) clear the INSET rect of EVERY
+ * zone — M ramps 0->1 over the first steps*px pixels inside each zone edge.
+ * Max-semantics without a shader; overlapping feathers can never dim a zone
+ * core, and small zones clamp the inset so the center still reaches 1.
+ * Feathering inward keeps the visual lerp fading zone content toward
+ * TRANSPARENT at the edge (never toward the weave of empty atlas, which DPs
+ * may report opaque black). Layout contract identical to
  * vk_local2d_composite_raster_mask.
  *
  * @ingroup aux_vk

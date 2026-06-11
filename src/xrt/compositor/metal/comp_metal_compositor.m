@@ -1996,12 +1996,17 @@ metal_update_implicit_mask(struct comp_metal_compositor *c,
 
 /*!
  * XR_EXT_display_zones (ADR-027) — (re)rasterize the AUTO wish: union of the
- * frame's zone rects with a feathered edge. CPU fill + replaceRegion like the
- * implicit mask, but with max-semantics across zones (overlapping feathers
- * never dim a zone core). NOTE: the Metal CPU raster does a TRUE per-pixel
- * distance feather — clamp(1 − dist_outside/16px) — rather than the GPU legs'
- * stepped 8×2px rings (D3D11 ClearView / D3D12 rect clears / VK
- * vkCmdClearAttachments); same 16-px footprint, smoother profile.
+ * frame's zone rects with an INWARD feathered edge: M=0 outside the zones;
+ * inside each zone M ramps 0->1 over the first 16 px from the edge, so the
+ * visual lerp fades zone content toward TRANSPARENT at the edge (never
+ * toward the weave of empty atlas, which DPs may report opaque black). CPU
+ * fill + replaceRegion like the implicit mask, with max-semantics across
+ * zones (overlapping feathers never dim a zone core; small zones still
+ * reach M=1 at the center because the inside-distance peaks there). NOTE:
+ * the Metal CPU raster does a TRUE per-pixel distance feather —
+ * clamp(dist_inside/16px) — rather than the GPU legs' stepped 8×2px inset
+ * rings (D3D11 ClearView / D3D12 rect clears / VK vkCmdClearAttachments);
+ * same 16-px footprint, smoother profile.
  * Re-rasterized only when the rect set or dims change. Returns the wish
  * texture or nil on failure.
  */
@@ -2055,8 +2060,8 @@ metal_update_zone_wish_mask(struct comp_metal_compositor *c,
 		c->wish_mask_h = h;
 	}
 
-	// M=0 everywhere (no 3D wish), then per zone: M=1 inside the rect, a
-	// distance feather ramp outside it, folded in with max().
+	// M=0 everywhere (no 3D wish), then per zone: an inside-distance feather
+	// ramp from the rect edge to M=1 at >=16 px inside, folded in with max().
 	memset(c->wish_mask_bytes, 0x00, (size_t)w * h);
 	const float feather = (float)METAL_ZONE_WISH_FEATHER_PX;
 	for (uint32_t i = 0; i < rect_count; i++) {
@@ -2067,30 +2072,23 @@ metal_update_zone_wish_mask(struct comp_metal_compositor *c,
 		if (rx1 <= rx0 || ry1 <= ry0) {
 			continue;
 		}
-		int32_t ex0 = rx0 - METAL_ZONE_WISH_FEATHER_PX;
-		int32_t ey0 = ry0 - METAL_ZONE_WISH_FEATHER_PX;
-		int32_t ex1 = rx1 + METAL_ZONE_WISH_FEATHER_PX;
-		int32_t ey1 = ry1 + METAL_ZONE_WISH_FEATHER_PX;
-		if (ex0 < 0) ex0 = 0;
-		if (ey0 < 0) ey0 = 0;
-		if (ex1 > (int32_t)w) ex1 = (int32_t)w;
-		if (ey1 > (int32_t)h) ey1 = (int32_t)h;
+		int32_t ex0 = rx0 < 0 ? 0 : rx0;
+		int32_t ey0 = ry0 < 0 ? 0 : ry0;
+		int32_t ex1 = rx1 > (int32_t)w ? (int32_t)w : rx1;
+		int32_t ey1 = ry1 > (int32_t)h ? (int32_t)h : ry1;
 		for (int32_t y = ey0; y < ey1; y++) {
-			const int32_t dy = (y < ry0) ? (ry0 - y) : (y >= ry1 ? (y - ry1 + 1) : 0);
+			// Distance from this row to the nearest horizontal edge,
+			// measured INSIDE the rect (>= 1 on the innermost row).
+			int32_t dy_in = (y - ry0 + 1) < (ry1 - y) ? (y - ry0 + 1) : (ry1 - y);
 			uint8_t *row = c->wish_mask_bytes + (size_t)y * w;
 			for (int32_t x = ex0; x < ex1; x++) {
-				const int32_t dx = (x < rx0) ? (rx0 - x) : (x >= rx1 ? (x - rx1 + 1) : 0);
-				uint8_t v;
-				if (dx == 0 && dy == 0) {
-					v = 0xFF; // zone core: full 3D wish
-				} else {
-					const float dist = sqrtf((float)(dx * dx + dy * dy));
-					float fv = 1.0f - dist / feather;
-					if (fv <= 0.0f) {
-						continue;
-					}
-					v = (uint8_t)(fv * 255.0f + 0.5f);
+				int32_t dx_in = (x - rx0 + 1) < (rx1 - x) ? (x - rx0 + 1) : (rx1 - x);
+				int32_t d_in = dx_in < dy_in ? dx_in : dy_in;
+				float fv = (float)d_in / feather;
+				if (fv > 1.0f) {
+					fv = 1.0f;
 				}
+				uint8_t v = (uint8_t)(fv * 255.0f + 0.5f);
 				if (v > row[x]) {
 					row[x] = v; // max across overlapping zones
 				}

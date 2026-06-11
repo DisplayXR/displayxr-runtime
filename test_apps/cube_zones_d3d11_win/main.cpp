@@ -11,7 +11,8 @@
  *    spin phase 0, dark-red clear.
  *  - Zone B (zoneId=2, right) : rect {700,180,520,360}, display rig with
  *    ipdFactor 0.6 + perspectiveFactor 0.5 (visibly different framing),
- *    spin phase +1.5 rad, dark-blue clear.
+ *    spin phase +1.5 rad, SEMI-TRANSPARENT dark-blue clear (alpha 0.55,
+ *    premultiplied) so the O-key overlap visibly alpha-overs zone A.
  *  - Local2D strip (top)      : rect {0,0,1280,180}, always on, filled once
  *    with a CPU-generated checker + label band.
  *
@@ -39,6 +40,7 @@
 #define _UNICODE
 #include <windows.h>
 #include <wrl/client.h>
+#include <d3dcompiler.h> // zone edge-fade pass (content-alpha feather)
 #include <d3d11_1.h>
 
 #include "logging.h"
@@ -100,7 +102,8 @@ struct DisplayZone {
     float ipdFactor = 1.0f;
     float perspectiveFactor = 1.0f;
     float spinPhase = 0.0f;         //!< added to the shared cube rotation for this zone
-    float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f}; //!< OPAQUE alpha — zones composite alpha-over
+    float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f}; //!< premultiplied RGBA — zone blends are
+                                                    //!< expressed through content alpha (ADR-027)
     XrSwapchain swapchain = XR_NULL_HANDLE;
     int64_t format = 0;
     uint32_t tileW = 0;             //!< per-view tile width (= recommended view width)
@@ -608,16 +611,21 @@ static void TryActivateZones(XrSessionManager& xr, D3D11Renderer& renderer) {
     g_zonesArr[0].clearColor[3] = 1.0f;
 
     // Zone B: right. Reduced view spread + flattened perspective (visibly
-    // different framing), phase +1.5 rad, dark-blue clear.
+    // different framing), phase +1.5 rad, SEMI-TRANSPARENT dark-blue clear
+    // (premultiplied, alpha 0.55): zones composite alpha-over in layer-list
+    // order with blends expressed through CONTENT alpha (ADR-027 rule 4) —
+    // an opaque background would make the overlap a plain replacement. The
+    // cube itself stays opaque; the background lets zone A (and the desktop,
+    // when not overlapping) show through.
     g_zonesArr[1].zoneId = 2;
     g_zonesArr[1].rect = g_zoneBOverlap ? kZoneBOverlapRect : kZoneBRect;
     g_zonesArr[1].ipdFactor = 0.6f;
     g_zonesArr[1].perspectiveFactor = 0.5f;
     g_zonesArr[1].spinPhase = 1.5f;
-    g_zonesArr[1].clearColor[0] = 0.03f;
-    g_zonesArr[1].clearColor[1] = 0.03f;
-    g_zonesArr[1].clearColor[2] = 0.15f;
-    g_zonesArr[1].clearColor[3] = 1.0f;
+    g_zonesArr[1].clearColor[0] = 0.03f * 0.55f;
+    g_zonesArr[1].clearColor[1] = 0.03f * 0.55f;
+    g_zonesArr[1].clearColor[2] = 0.15f * 0.55f;
+    g_zonesArr[1].clearColor[3] = 0.55f;
 
     for (uint32_t zi = 0; zi < kNumZones; zi++) {
         if (!CreateZoneResources(xr, renderer, g_zonesArr[zi], viewCount)) {
@@ -672,6 +680,131 @@ static bool EnsureWishRenderTarget() {
     g_wishW = binding.width;
     g_wishH = binding.height;
     return true;
+}
+
+// ---- Zone edge fade (content-alpha feather) -------------------------------
+//
+// Per ADR-027 rule 4, zone blends are expressed through CONTENT alpha — a
+// zone wanting a soft edge fades its OWN rendered alpha at the tile edges.
+// Content-alpha fades composite correctly EVERYWHERE, including zone overlap
+// (where the union wish mask is saturated at M=1 and cannot express per-zone
+// fades). This 16-px multiplicative edge fade (dst *= f, premultiplied) is
+// the recipe the avatar app's tiger zone uses later.
+static ID3D11VertexShader* g_fadeVS = nullptr;
+static ID3D11PixelShader* g_fadePS = nullptr;
+static ID3D11Buffer* g_fadeCB = nullptr;
+static ID3D11BlendState* g_fadeBlend = nullptr;
+static ID3D11DepthStencilState* g_fadeDepthOff = nullptr;
+static ID3D11RasterizerState* g_fadeRaster = nullptr;
+static bool g_fadeInitTried = false;
+static const float kZoneEdgeFadePx = 16.0f;
+
+static const char* kFadeShaderSrc = R"(
+cbuffer FadeCB : register(b0) { float2 tile_px; float feather_px; float pad; };
+struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+VSOut vs_main(uint id : SV_VertexID) {
+    VSOut o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    o.uv = uv;
+    return o;
+}
+float4 ps_main(VSOut i) : SV_Target {
+    float2 px = i.uv * tile_px;
+    float d = min(min(px.x, tile_px.x - px.x), min(px.y, tile_px.y - px.y));
+    float f = saturate(d / feather_px);
+    // Blend (ZERO, INV_SRC_ALPHA): dst *= (1 - src.a) = f.
+    return float4(0.0, 0.0, 0.0, 1.0 - f);
+}
+)";
+
+static bool EnsureEdgeFadePass(D3D11Renderer& renderer) {
+    if (g_fadeVS && g_fadePS && g_fadeCB && g_fadeBlend && g_fadeDepthOff) return true;
+    if (g_fadeInitTried) return false;
+    g_fadeInitTried = true;
+
+    ComPtr<ID3DBlob> blob, err;
+    if (FAILED(D3DCompile(kFadeShaderSrc, strlen(kFadeShaderSrc), nullptr, nullptr, nullptr,
+                          "vs_main", "vs_5_0", 0, 0, &blob, &err)) ||
+        FAILED(renderer.device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+                                                   nullptr, &g_fadeVS))) {
+        LOG_ERROR("[zones] edge-fade VS compile/create failed%s%s", err ? ": " : "",
+                  err ? (const char*)err->GetBufferPointer() : "");
+        return false;
+    }
+    blob.Reset(); err.Reset();
+    if (FAILED(D3DCompile(kFadeShaderSrc, strlen(kFadeShaderSrc), nullptr, nullptr, nullptr,
+                          "ps_main", "ps_5_0", 0, 0, &blob, &err)) ||
+        FAILED(renderer.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+                                                  nullptr, &g_fadePS))) {
+        LOG_ERROR("[zones] edge-fade PS compile/create failed%s%s", err ? ": " : "",
+                  err ? (const char*)err->GetBufferPointer() : "");
+        return false;
+    }
+
+    D3D11_BUFFER_DESC cbd = {};
+    cbd.ByteWidth = 16;
+    cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(renderer.device->CreateBuffer(&cbd, nullptr, &g_fadeCB))) return false;
+
+    D3D11_BLEND_DESC bd = {};
+    bd.RenderTarget[0].BlendEnable = TRUE;
+    bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ZERO;
+    bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;
+    bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    if (FAILED(renderer.device->CreateBlendState(&bd, &g_fadeBlend))) return false;
+
+    D3D11_DEPTH_STENCIL_DESC dsd = {};
+    dsd.DepthEnable = FALSE;
+    if (FAILED(renderer.device->CreateDepthStencilState(&dsd, &g_fadeDepthOff))) return false;
+
+    // The scene renderer leaves a FrontCounterClockwise + CULL_BACK
+    // rasterizer state bound, which culls our clockwise fullscreen
+    // triangle — the fade needs its own CULL_NONE state.
+    D3D11_RASTERIZER_DESC rd = {};
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = TRUE;
+    if (FAILED(renderer.device->CreateRasterizerState(&rd, &g_fadeRaster))) return false;
+
+    LOG_INFO("[zones] content-alpha edge fade pass ready (%.0f px)", kZoneEdgeFadePx);
+    return true;
+}
+
+// Multiply the current tile's RGBA by the edge ramp (viewport must already
+// be the tile; rtv bound without depth).
+static void DrawZoneEdgeFade(D3D11Renderer& renderer, ID3D11RenderTargetView* rtv,
+                             uint32_t tileW, uint32_t tileH) {
+    if (!EnsureEdgeFadePass(renderer)) return;
+
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (SUCCEEDED(renderer.context->Map(g_fadeCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+        float cb[4] = {(float)tileW, (float)tileH, kZoneEdgeFadePx, 0.0f};
+        memcpy(mapped.pData, cb, sizeof(cb));
+        renderer.context->Unmap(g_fadeCB, 0);
+    }
+
+    renderer.context->OMSetRenderTargets(1, &rtv, nullptr);
+    renderer.context->OMSetBlendState(g_fadeBlend, nullptr, 0xFFFFFFFF);
+    renderer.context->OMSetDepthStencilState(g_fadeDepthOff, 0);
+    renderer.context->RSSetState(g_fadeRaster);
+    renderer.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    renderer.context->IASetInputLayout(nullptr);
+    renderer.context->VSSetShader(g_fadeVS, nullptr, 0);
+    renderer.context->PSSetShader(g_fadePS, nullptr, 0);
+    renderer.context->PSSetConstantBuffers(0, 1, &g_fadeCB);
+    renderer.context->Draw(3, 0);
+
+    ID3D11RenderTargetView* nullRtv = nullptr;
+    renderer.context->OMSetRenderTargets(1, &nullRtv, nullptr);
+    renderer.context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    renderer.context->OMSetDepthStencilState(nullptr, 0);
 }
 
 // Tier-3 feathered wish: clear to 0, then per zone rect paint 8 concentric
@@ -868,8 +1001,9 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
         CreateRenderTargetView(renderer, z.images[imageIndex].texture,
                                static_cast<DXGI_FORMAT>(z.format), &rtv);
 
-        // OPAQUE per-zone clear — zones composite alpha-over, so alpha = 1
-        // makes each zone show fully.
+        // Per-zone clear (premultiplied RGBA). Zone A is opaque; zone B's
+        // semi-transparent background demonstrates the alpha-over composite
+        // (the cube geometry itself renders opaque in both).
         renderer.context->ClearRenderTargetView(rtv, z.clearColor);
         renderer.context->ClearDepthStencilView(z.depthDSV.Get(),
             D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
@@ -901,6 +1035,23 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
         }
 
         renderer.cubeRotation = savedRotation;
+
+        // Content-alpha edge feather (ADR-027 rule 4): fade THIS zone's
+        // rendered RGBA at its tile edges so the zone blends softly into
+        // whatever is behind it — desktop OR another zone (the union wish
+        // mask cannot express per-zone fades inside an overlap). One pass
+        // per view tile, after the scene render.
+        for (uint32_t vi = 0; vi < n; vi++) {
+            D3D11_VIEWPORT vp = {};
+            vp.TopLeftX = (FLOAT)(vi * z.tileW);
+            vp.TopLeftY = 0.0f;
+            vp.Width = (FLOAT)z.tileW;
+            vp.Height = (FLOAT)z.tileH;
+            vp.MaxDepth = 1.0f;
+            renderer.context->RSSetViewports(1, &vp);
+            DrawZoneEdgeFade(renderer, rtv, z.tileW, z.tileH);
+        }
+
         if (rtv) rtv->Release();
 
         XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
@@ -917,7 +1068,9 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
         if (submitViewCounts[zi] == 0) continue;
         projLayers[zi] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
         projLayers[zi].next = &zoneStructs[zi]; // SAME instance as the locate chain
-        projLayers[zi].layerFlags = 0;          // opaque
+        // Content alpha is meaningful (zone B translucent bg + the edge
+        // fade): declare source-alpha blending (premultiplied bytes).
+        projLayers[zi].layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
         projLayers[zi].space = xr.localSpace;
         projLayers[zi].viewCount = submitViewCounts[zi];
         projLayers[zi].views = projViews[zi].data();
@@ -934,9 +1087,32 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
         layers[layerCount++] = (const XrCompositionLayerBaseHeader*)&stripLayer;
     }
 
+    // Zones alpha-composite against the DESKTOP by design (translucent zone
+    // backgrounds, content-alpha edge fades, transparent unzoned regions) —
+    // submit ALPHA_BLEND whenever the runtime advertises it. With OPAQUE the
+    // whole window floor is black and every translucent pixel reads as
+    // "faded to black". (No DISPLAYXR_TRANSPARENT_BG gate here: desktop
+    // show-through is the point of this demo, as it will be for the avatar.)
+    static XrEnvironmentBlendMode zonesBlendMode = []() {
+        XrEnvironmentBlendMode modes[8];
+        uint32_t count = 0;
+        if (g_xr != nullptr &&
+            XR_SUCCEEDED(xrEnumerateEnvironmentBlendModes(g_xr->instance, g_xr->systemId,
+                                                          g_xr->viewConfigType, 8, &count, modes))) {
+            for (uint32_t i = 0; i < count; i++) {
+                if (modes[i] == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) {
+                    LOG_INFO("[zones] runtime advertises ALPHA_BLEND — compositing zones over the desktop");
+                    return XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
+                }
+            }
+        }
+        LOG_WARN("[zones] ALPHA_BLEND not advertised — zones composite over an opaque black window");
+        return XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    }();
+
     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
     endInfo.displayTime = frameState.predictedDisplayTime;
-    endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    endInfo.environmentBlendMode = zonesBlendMode;
     endInfo.layerCount = layerCount;
     endInfo.layers = layers;
 

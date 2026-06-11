@@ -504,9 +504,12 @@ vk_local2d_composite_raster_mask_rings(struct vk_local2d_composite *lc,
 	};
 	vk->vkCmdBeginRenderPass(cmd, &rp_bi, VK_SUBPASS_CONTENTS_INLINE);
 
-	for (int32_t s = (int32_t)feather_steps; s >= 0; s--) {
-		const float v = (float)((int32_t)feather_steps - s) / (float)feather_steps;
-		const int32_t expand = s * (int32_t)feather_step_px;
+	// INWARD feather: ascending-value insets — M ramps 0->1 over the first
+	// feather_steps*feather_step_px pixels inside each zone edge, so the
+	// visual lerp fades zone content toward TRANSPARENT at the edge (never
+	// toward the weave of empty atlas, which DPs may report opaque black).
+	for (int32_t s = 1; s <= (int32_t)feather_steps; s++) {
+		const float v = (float)s / (float)feather_steps;
 		VkClearAttachment ca = {
 		    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 		    .colorAttachment = 0,
@@ -515,10 +518,21 @@ vk_local2d_composite_raster_mask_rings(struct vk_local2d_composite *lc,
 		VkClearRect cr[XRT_MAX_LAYERS];
 		uint32_t n = 0;
 		for (uint32_t i = 0; i < rect_count && n < XRT_MAX_LAYERS; i++) {
-			int32_t left = rects[i].offset.w - expand;
-			int32_t top = rects[i].offset.h - expand;
-			int32_t right = rects[i].offset.w + rects[i].extent.w + expand;
-			int32_t bottom = rects[i].offset.h + rects[i].extent.h + expand;
+			// Small zones clamp the inset so the center still reaches 1.
+			int32_t min_ext = rects[i].extent.w < rects[i].extent.h ? rects[i].extent.w
+			                                                        : rects[i].extent.h;
+			int32_t max_inset = (min_ext - 1) / 2;
+			if (max_inset < 0) {
+				max_inset = 0;
+			}
+			int32_t inset = s * (int32_t)feather_step_px;
+			if (inset > max_inset) {
+				inset = max_inset;
+			}
+			int32_t left = rects[i].offset.w + inset;
+			int32_t top = rects[i].offset.h + inset;
+			int32_t right = rects[i].offset.w + rects[i].extent.w - inset;
+			int32_t bottom = rects[i].offset.h + rects[i].extent.h - inset;
 			if (left < 0) {
 				left = 0;
 			}
