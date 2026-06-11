@@ -349,6 +349,7 @@ See `docs/README.md` for the full index. By task:
 | Kooima projection math | `docs/architecture/kooima-projection.md` |
 | Compositor pipeline | `docs/architecture/compositor-pipeline.md` |
 | Swapchain model / canvas | `docs/specs/runtime/swapchain-model.md` |
+| Mixed 2D/3D zones (N 3D zones + 2D zones + wish mask) | `docs/adr/ADR-027-display-zones.md` → `docs/specs/extensions/XR_EXT_display_zones.md`, `docs/roadmap/display-zones.md` |
 | Workspace ↔ runtime contract / boundary | `docs/architecture/separation-of-concerns.md`, `docs/roadmap/workspace-runtime-contract.md` |
 | Vendor-specific docs | `docs/vendors/README.md` (index) — internals live in each vendor's plug-in repo; `sim_display` docs stay in-tree |
 | 3D capture pipeline | `docs/roadmap/3d-capture.md` |
