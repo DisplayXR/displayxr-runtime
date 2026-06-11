@@ -2323,7 +2323,11 @@ static void RenderZoneScene(MetalRenderer &r, id<MTLTexture> target, DisplayZone
     }
 
     // --- Content-alpha edge fade per view tile (after the scene) ---
-    {
+    // Skipped in wish mode 1 (explicit Tier-2 rects): that wish is M=1 out
+    // to the exact rect edge, and weave output carries no alpha — content
+    // faded inside a hard-M=1 band weaves to opaque black (dark halo), not
+    // to the desktop. Tier-2 content must fill its rect to the hard edge.
+    if (g_wishMode != 1) {
         FadeUniforms fu = {};
         fu.tile_px[0] = (float)z.tileW;
         fu.tile_px[1] = (float)z.tileH;

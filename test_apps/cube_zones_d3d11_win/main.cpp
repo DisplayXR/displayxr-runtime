@@ -1073,15 +1073,24 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
         // whatever is behind it — desktop OR another zone (the union wish
         // mask cannot express per-zone fades inside an overlap). One pass
         // per view tile, after the scene render.
-        for (uint32_t vi = 0; vi < n; vi++) {
-            D3D11_VIEWPORT vp = {};
-            vp.TopLeftX = (FLOAT)(vi * z.tileW);
-            vp.TopLeftY = 0.0f;
-            vp.Width = (FLOAT)z.tileW;
-            vp.Height = (FLOAT)z.tileH;
-            vp.MaxDepth = 1.0f;
-            renderer.context->RSSetViewports(1, &vp);
-            DrawZoneEdgeFade(renderer, rtv, z.tileW, z.tileH);
+        //
+        // Skipped in wish mode 1 (explicit Tier-2 rects): that wish is
+        // M=1 out to the exact rect edge, and weave output carries no
+        // alpha — content faded inside a hard-M=1 band weaves to opaque
+        // black (the dark-halo mechanism), not to the desktop. Tier-2
+        // content must fill its rect to the hard edge; soft outer edges
+        // belong to AUTO / Tier-3, whose wish feathers M inward to 0.
+        if (g_wishMode != 1) {
+            for (uint32_t vi = 0; vi < n; vi++) {
+                D3D11_VIEWPORT vp = {};
+                vp.TopLeftX = (FLOAT)(vi * z.tileW);
+                vp.TopLeftY = 0.0f;
+                vp.Width = (FLOAT)z.tileW;
+                vp.Height = (FLOAT)z.tileH;
+                vp.MaxDepth = 1.0f;
+                renderer.context->RSSetViewports(1, &vp);
+                DrawZoneEdgeFade(renderer, rtv, z.tileW, z.tileH);
+            }
         }
 
         if (rtv) rtv->Release();
