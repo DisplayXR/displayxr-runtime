@@ -25,6 +25,42 @@ extern "C" {
 #endif
 
 /*!
+ * Per-frame effective CONTENT layout (#542): the atlas tile grid the renderer
+ * paints and the DP receives, derived from the app's SUBMISSION — decoupled
+ * from the hardware weave-state (which only drives the DP's mode_3d via
+ * request_display_mode). Matched submissions reproduce the mode layout
+ * exactly; a hardware/content divergence gets a views×1 strip instead of
+ * being clamped away.
+ */
+struct comp_d3d11_eff_layout
+{
+	uint32_t views;  //!< effective view count (post legacy clamp)
+	uint32_t cols;   //!< atlas tile columns
+	uint32_t rows;   //!< atlas tile rows
+	uint32_t tile_w; //!< per-tile width in pixels
+	uint32_t tile_h; //!< per-tile height in pixels
+};
+
+/*!
+ * Compute the frame's effective content layout from the accumulated layers.
+ *
+ * views comes from the first projection-class layer's view_count (default:
+ * the mode tile grid when none). Legacy apps keep the hardware-keyed mono
+ * clamp — they always submit the same views and can't author transitions.
+ * When views matches the mode grid the layout IS the mode layout; when it
+ * is 1 the single tile spans the full content region (the mono paint box
+ * additionally caps to the window target, as before); otherwise a views×1
+ * strip sized by the submitted imageRect, capped to the physical atlas.
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_renderer_compute_effective_layout(struct comp_d3d11_renderer *renderer,
+                                             struct comp_layer_accum *layers,
+                                             bool hardware_display_3d,
+                                             struct comp_d3d11_eff_layout *out_layout);
+
+/*!
  * Create a D3D11 renderer.
  *
  * @param c The D3D11 compositor.
@@ -64,8 +100,8 @@ comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr);
  * @param target_width Width of the render target (window). Used for mono
  *        viewport sizing so 2D content fills the full window.
  * @param target_height Height of the render target (window).
- * @param hardware_display_3d True when in 3D mode (stereo rendering),
- *        false for 2D passthrough (mono rendering, single view fills window).
+ * @param layout The frame's effective content layout (#542), from
+ *        @ref comp_d3d11_renderer_compute_effective_layout.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
  *
@@ -78,7 +114,7 @@ comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
                          struct xrt_vec3 *right_eye,
                          uint32_t target_width,
                          uint32_t target_height,
-                         bool hardware_display_3d);
+                         const struct comp_d3d11_eff_layout *layout);
 
 /*!
  * Render the projection-class pass of the atlas (projection /
@@ -101,7 +137,7 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
                                           struct xrt_vec3 *right_eye,
                                           uint32_t target_width,
                                           uint32_t target_height,
-                                          bool hardware_display_3d);
+                                          const struct comp_d3d11_eff_layout *layout);
 
 /*!
  * Render only window-space layers into the atlas, on top of whatever
@@ -119,7 +155,7 @@ comp_d3d11_renderer_draw_window_space_pass(struct comp_d3d11_renderer *renderer,
                                             struct comp_layer_accum *layers,
                                             uint32_t target_width,
                                             uint32_t target_height,
-                                            bool hardware_display_3d);
+                                            const struct comp_d3d11_eff_layout *layout);
 
 /*!
  * Get the atlas texture SRV for weaving.
