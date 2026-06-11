@@ -1272,25 +1272,85 @@ comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr)
 	*renderer_ptr = nullptr;
 }
 
-// Compute effective_views consistently between the two passes (must
-// agree so window-space layers land on the same per-tile viewports
-// the projection pass painted).
-static uint32_t
-compute_effective_views(struct comp_layer_accum *layers, bool hardware_display_3d)
+// Per-frame effective CONTENT layout (#542): tile count from the SUBMISSION,
+// decoupled from the hardware weave-state. Computed once per frame and shared
+// by both passes (must agree so window-space layers land on the same per-tile
+// viewports the projection pass painted) and the DP handoff.
+extern "C" void
+comp_d3d11_renderer_compute_effective_layout(struct comp_d3d11_renderer *renderer,
+                                             struct comp_layer_accum *layers,
+                                             bool hardware_display_3d,
+                                             struct comp_d3d11_eff_layout *out_layout)
 {
-	uint32_t effective_views = 2;
+	uint32_t mode_cols = renderer->tile_columns > 0 ? renderer->tile_columns : 1;
+	uint32_t mode_rows = renderer->tile_rows > 0 ? renderer->tile_rows : 1;
+	uint32_t mode_tiles = mode_cols * mode_rows;
+
+	uint32_t views = mode_tiles;
+	const struct comp_layer *proj_layer = NULL;
 	for (uint32_t i = 0; i < layers->layer_count; i++) {
 		if (layers->layers[i].data.type == XRT_LAYER_PROJECTION ||
 		    layers->layers[i].data.type == XRT_LAYER_PROJECTION_DEPTH ||
 		    layers->layers[i].data.type == XRT_LAYER_ZONE_3D) {
-			effective_views = layers->layers[i].data.view_count;
+			proj_layer = &layers->layers[i];
+			views = proj_layer->data.view_count;
 			break;
 		}
 	}
-	if (!hardware_display_3d && effective_views > 1) {
-		effective_views = 1;
+	if (views == 0) {
+		views = 1;
 	}
-	return effective_views;
+	if (views > XRT_MAX_VIEWS) {
+		views = XRT_MAX_VIEWS;
+	}
+	// Legacy apps always submit the same views and can't author transitions
+	// — keep the hardware-keyed mono clamp so V→2D stays mono, not SBS.
+	if (renderer->legacy_app_tile_scaling && !hardware_display_3d && views > 1) {
+		views = 1;
+	}
+
+	out_layout->views = views;
+	if (views == 1) {
+		// Mono content: one tile spanning the full content region (the
+		// paint box additionally caps to the window target — see
+		// get_view_tile_box). In a matched 2D mode (1×1 grid) this IS
+		// the mode layout.
+		out_layout->cols = 1;
+		out_layout->rows = 1;
+		out_layout->tile_w = mode_cols * renderer->view_width;
+		out_layout->tile_h = mode_rows * renderer->view_height;
+	} else if (views == mode_tiles) {
+		// Matched submission: the mode layout, unchanged.
+		out_layout->cols = mode_cols;
+		out_layout->rows = mode_rows;
+		out_layout->tile_w = renderer->view_width;
+		out_layout->tile_h = renderer->view_height;
+	} else {
+		// Hardware/content divergence: a views×1 strip sized by the
+		// submitted imageRect, capped to the physical atlas so a
+		// mid-transition frame renders predictably instead of
+		// overflowing.
+		uint32_t tile_w = (mode_cols * renderer->view_width) / views;
+		uint32_t tile_h = mode_rows * renderer->view_height;
+		if (proj_layer != NULL) {
+			const struct xrt_rect *r0 = &proj_layer->data.proj.v[0].sub.rect;
+			if (r0->extent.w > 0 && r0->extent.h > 0) {
+				tile_w = static_cast<uint32_t>(r0->extent.w);
+				tile_h = static_cast<uint32_t>(r0->extent.h);
+			}
+		}
+		uint32_t atlas_w = mode_cols * renderer->view_width;
+		if (tile_w * views > atlas_w && views > 0) {
+			tile_w = atlas_w / views;
+		}
+		if (tile_h > renderer->texture_height) {
+			tile_h = renderer->texture_height;
+		}
+		out_layout->cols = views;
+		out_layout->rows = 1;
+		out_layout->tile_w = tile_w;
+		out_layout->tile_h = tile_h;
+	}
 }
 
 // Compute the per-view tile box for either pass — the box set_view_viewport
@@ -1298,7 +1358,7 @@ compute_effective_views(struct comp_layer_accum *layers, bool hardware_display_3
 static void
 get_view_tile_box(struct comp_d3d11_renderer *renderer,
                   uint32_t view_index,
-                  uint32_t effective_views,
+                  const struct comp_d3d11_eff_layout *layout,
                   uint32_t target_width,
                   uint32_t target_height,
                   float *out_x,
@@ -1306,12 +1366,11 @@ get_view_tile_box(struct comp_d3d11_renderer *renderer,
                   float *out_w,
                   float *out_h)
 {
-	if (effective_views == 1) {
+	if (layout->views == 1) {
 		// MONO: use target (window) dimensions so 2D content fills
-		// the full window. Width is capped to the atlas texture width
-		// (tile_columns*view_width); height is capped to texture_height.
-		uint32_t atlas_w = renderer->tile_columns * renderer->view_width;
-		uint32_t mono_w = (target_width < atlas_w) ? target_width : atlas_w;
+		// the full window. Width is capped to the content region
+		// (layout tile_w spans it); height is capped to texture_height.
+		uint32_t mono_w = (target_width < layout->tile_w) ? target_width : layout->tile_w;
 		uint32_t mono_h = (target_height < renderer->texture_height)
 		                      ? target_height
 		                      : renderer->texture_height;
@@ -1320,13 +1379,13 @@ get_view_tile_box(struct comp_d3d11_renderer *renderer,
 		*out_w = static_cast<float>(mono_w);
 		*out_h = static_cast<float>(mono_h);
 	} else {
-		// MULTI-VIEW: tile-based atlas layout
-		uint32_t col = view_index % renderer->tile_columns;
-		uint32_t row = view_index / renderer->tile_columns;
-		*out_x = static_cast<float>(col * renderer->view_width);
-		*out_y = static_cast<float>(row * renderer->view_height);
-		*out_w = static_cast<float>(renderer->view_width);
-		*out_h = static_cast<float>(renderer->view_height);
+		// MULTI-VIEW: tile-based atlas layout from the effective grid
+		uint32_t col = view_index % layout->cols;
+		uint32_t row = view_index / layout->cols;
+		*out_x = static_cast<float>(col * layout->tile_w);
+		*out_y = static_cast<float>(row * layout->tile_h);
+		*out_w = static_cast<float>(layout->tile_w);
+		*out_h = static_cast<float>(layout->tile_h);
 	}
 }
 
@@ -1334,13 +1393,13 @@ get_view_tile_box(struct comp_d3d11_renderer *renderer,
 static void
 set_view_viewport(struct comp_d3d11_renderer *renderer,
                   uint32_t view_index,
-                  uint32_t effective_views,
+                  const struct comp_d3d11_eff_layout *layout,
                   uint32_t target_width,
                   uint32_t target_height)
 {
 	auto internals = get_internals(renderer->c);
 	D3D11_VIEWPORT viewport = {};
-	get_view_tile_box(renderer, view_index, effective_views, target_width, target_height, &viewport.TopLeftX,
+	get_view_tile_box(renderer, view_index, layout, target_width, target_height, &viewport.TopLeftX,
 	                  &viewport.TopLeftY, &viewport.Width, &viewport.Height);
 	viewport.MinDepth = 0.0f;
 	viewport.MaxDepth = 1.0f;
@@ -1354,7 +1413,7 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
                                           struct xrt_vec3 *right_eye,
                                           uint32_t target_width,
                                           uint32_t target_height,
-                                          bool hardware_display_3d)
+                                          const struct comp_d3d11_eff_layout *layout)
 {
 	auto internals = get_internals(renderer->c);
 
@@ -1408,10 +1467,10 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 		fovs[view].angle_down = -fov_angle;
 	}
 
-	uint32_t effective_views = compute_effective_views(layers, hardware_display_3d);
+	uint32_t effective_views = layout->views;
 
 	for (uint32_t view_index = 0; view_index < effective_views; view_index++) {
-		set_view_viewport(renderer, view_index, effective_views, target_width, target_height);
+		set_view_viewport(renderer, view_index, layout, target_width, target_height);
 		struct xrt_vec3 *eye = (view_index == 0) ? left_eye : right_eye;
 
 		for (uint32_t i = 0; i < layers->layer_count; i++) {
@@ -1434,7 +1493,7 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 					break;
 				}
 				float tx, ty, tw, th;
-				get_view_tile_box(renderer, view_index, effective_views, target_width,
+				get_view_tile_box(renderer, view_index, layout, target_width,
 				                  target_height, &tx, &ty, &tw, &th);
 				const float sx = tw / static_cast<float>(target_width);
 				const float sy = th / static_cast<float>(target_height);
@@ -1459,7 +1518,7 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 				// the right per-view sub/fov data unchanged.
 				render_projection_layer(renderer, layer, view_index, eye);
 				internals->context->OMSetBlendState(renderer->blend_opaque, nullptr, 0xFFFFFFFF);
-				set_view_viewport(renderer, view_index, effective_views, target_width, target_height);
+				set_view_viewport(renderer, view_index, layout, target_width, target_height);
 				break;
 			}
 
@@ -1516,11 +1575,11 @@ comp_d3d11_renderer_draw_window_space_pass(struct comp_d3d11_renderer *renderer,
                                             struct comp_layer_accum *layers,
                                             uint32_t target_width,
                                             uint32_t target_height,
-                                            bool hardware_display_3d)
+                                            const struct comp_d3d11_eff_layout *layout)
 {
-	uint32_t effective_views = compute_effective_views(layers, hardware_display_3d);
+	uint32_t effective_views = layout->views;
 	for (uint32_t view_index = 0; view_index < effective_views; view_index++) {
-		set_view_viewport(renderer, view_index, effective_views, target_width, target_height);
+		set_view_viewport(renderer, view_index, layout, target_width, target_height);
 		for (uint32_t i = 0; i < layers->layer_count; i++) {
 			struct comp_layer *layer = &layers->layers[i];
 			if (layer->data.type == XRT_LAYER_WINDOW_SPACE) {
@@ -1538,15 +1597,15 @@ comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
                          struct xrt_vec3 *right_eye,
                          uint32_t target_width,
                          uint32_t target_height,
-                         bool hardware_display_3d)
+                         const struct comp_d3d11_eff_layout *layout)
 {
 	xrt_result_t xret = comp_d3d11_renderer_draw_projection_pass(
-	    renderer, layers, left_eye, right_eye, target_width, target_height, hardware_display_3d);
+	    renderer, layers, left_eye, right_eye, target_width, target_height, layout);
 	if (xret != XRT_SUCCESS) {
 		return xret;
 	}
 	return comp_d3d11_renderer_draw_window_space_pass(
-	    renderer, layers, target_width, target_height, hardware_display_3d);
+	    renderer, layers, target_width, target_height, layout);
 }
 
 extern "C" void *

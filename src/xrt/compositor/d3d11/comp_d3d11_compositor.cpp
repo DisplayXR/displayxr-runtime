@@ -319,6 +319,12 @@ struct comp_d3d11_compositor
 	//! True when display is in 3D mode (weaver active). False = 2D passthrough.
 	bool hardware_display_3d;
 
+	//! Per-frame effective CONTENT layout (#542): the atlas grid actually
+	//! painted and handed to the DP this frame — submission-derived,
+	//! decoupled from hardware_display_3d. views == 0 until the first
+	//! layer commit computes it.
+	struct comp_d3d11_eff_layout eff_layout;
+
 	//! Last known 3D rendering mode index (for V-key toggle restore).
 	uint32_t last_3d_mode_index;
 
@@ -1262,13 +1268,20 @@ d3d11_capture_texture_to_png(struct comp_d3d11_compositor *c,
 	return ok;
 }
 
-// Resolve the active content region (tile_columns·view_w × tile_rows·view_h)
-// from the renderer. Returns false if the renderer hasn't been sized yet.
+// Resolve the active content region from the frame's effective layout (#542:
+// what the passes actually painted — submission-derived), falling back to the
+// renderer's mode layout before the first commit. Returns false if the
+// renderer hasn't been sized yet.
 static bool
 d3d11_compositor_content_dims(struct comp_d3d11_compositor *c, uint32_t *out_w, uint32_t *out_h)
 {
 	if (c->renderer == nullptr) {
 		return false;
+	}
+	if (c->eff_layout.views > 0 && c->eff_layout.tile_w > 0 && c->eff_layout.tile_h > 0) {
+		*out_w = c->eff_layout.cols * c->eff_layout.tile_w;
+		*out_h = c->eff_layout.rows * c->eff_layout.tile_h;
+		return true;
 	}
 	uint32_t tile_columns = 1, tile_rows = 1;
 	comp_d3d11_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);
@@ -1295,6 +1308,15 @@ d3d11_compositor_capture_dims_provider(void *userdata,
 	struct comp_d3d11_compositor *c = static_cast<struct comp_d3d11_compositor *>(userdata);
 	if (c == nullptr || c->renderer == nullptr) {
 		return false;
+	}
+	// #542: report the frame's effective layout (what the capture actually
+	// holds), falling back to the renderer's mode layout pre-first-commit.
+	if (c->eff_layout.views > 0 && c->eff_layout.tile_w > 0 && c->eff_layout.tile_h > 0) {
+		*out_view_w = c->eff_layout.tile_w;
+		*out_view_h = c->eff_layout.tile_h;
+		*out_tile_cols = c->eff_layout.cols;
+		*out_tile_rows = c->eff_layout.rows;
+		return true;
 	}
 	uint32_t vw = 0, vh = 0, cols = 1, rows = 1;
 	comp_d3d11_renderer_get_view_dimensions(c->renderer, &vw, &vh);
@@ -1615,6 +1637,13 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
+	// Per-frame effective CONTENT layout (#542): tile grid/dims from the
+	// SUBMISSION, decoupled from the hardware weave-state. Feeds both
+	// renderer passes, the DP handoff, and the capture providers — they
+	// must all agree on the frame's geometry.
+	comp_d3d11_renderer_compute_effective_layout(c->renderer, &c->layer_accum, c->hardware_display_3d,
+	                                             &c->eff_layout);
+
 	// Zero-copy check: can we pass the app's swapchain directly to the DP?
 	bool zero_copy = false;
 	void *zc_srv = nullptr;
@@ -1630,7 +1659,12 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			if (layer->data.type == XRT_LAYER_PROJECTION ||
 			    layer->data.type == XRT_LAYER_PROJECTION_DEPTH) {
 				uint32_t vc = mode->view_count;
-				bool same_sc = (vc > 0 && vc <= XRT_MAX_VIEWS && layer->sc_array[0] != NULL);
+				// #542: a hardware/content divergence frame (submitted
+				// views != mode views) must take the atlas path — the
+				// per-view loops below would read stale proj.v[] slots,
+				// and zero-copy can't re-tile a mismatched submission.
+				bool same_sc = (vc > 0 && vc <= XRT_MAX_VIEWS && layer->data.view_count == vc &&
+				                layer->sc_array[0] != NULL);
 				for (uint32_t v = 1; v < vc && same_sc; v++) {
 					if (layer->sc_array[v] != layer->sc_array[0])
 						same_sc = false;
@@ -1766,7 +1800,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	xrt_result_t xret = XRT_SUCCESS;
 	if (!zero_copy) {
 		xret = comp_d3d11_renderer_draw_projection_pass(
-		    c->renderer, &c->layer_accum, &left_eye, &right_eye, tgt_width, tgt_height, c->hardware_display_3d);
+		    c->renderer, &c->layer_accum, &left_eye, &right_eye, tgt_width, tgt_height, &c->eff_layout);
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to render projection pass");
 			return xret;
@@ -1778,7 +1812,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		d3d11_compositor_dispatch_capture(c, MCP_CAPTURE_MODE_PROJECTION_ONLY);
 
 		xret = comp_d3d11_renderer_draw_window_space_pass(
-		    c->renderer, &c->layer_accum, tgt_width, tgt_height, c->hardware_display_3d);
+		    c->renderer, &c->layer_accum, tgt_width, tgt_height, &c->eff_layout);
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to render window-space pass");
 			return xret;
@@ -1801,10 +1835,13 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// Weave/blit directly into the shared texture
 		if (c->display_processor != NULL && c->shared_rtv != nullptr) {
 			void *atlas_srv = zero_copy ? zc_srv : comp_d3d11_renderer_get_atlas_srv(c->renderer);
-			uint32_t view_width, view_height;
-			comp_d3d11_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
-			uint32_t tile_columns, tile_rows;
-			comp_d3d11_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);
+			// #542: the DP gets the frame's EFFECTIVE content layout —
+			// the grid the passes above actually painted (== the mode
+			// layout for matched submissions) — not the mode layout.
+			uint32_t view_width = c->eff_layout.tile_w;
+			uint32_t view_height = c->eff_layout.tile_h;
+			uint32_t tile_columns = c->eff_layout.cols;
+			uint32_t tile_rows = c->eff_layout.rows;
 
 			// Crop the renderer's atlas to content dims before passing to the
 			// DP (the renderer allocates a worst-case atlas; content sits
@@ -1909,10 +1946,13 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 		void *atlas_srv = zero_copy ? zc_srv : comp_d3d11_renderer_get_atlas_srv(c->renderer);
 
-		uint32_t view_width, view_height;
-		comp_d3d11_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
-		uint32_t tile_columns, tile_rows;
-		comp_d3d11_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);
+		// #542: the DP gets the frame's EFFECTIVE content layout — the grid
+		// the passes above actually painted (== the mode layout for matched
+		// submissions) — not the mode layout.
+		uint32_t view_width = c->eff_layout.tile_w;
+		uint32_t view_height = c->eff_layout.tile_h;
+		uint32_t tile_columns = c->eff_layout.cols;
+		uint32_t tile_rows = c->eff_layout.rows;
 
 		// Crop the renderer's atlas to content dims before passing to the DP;
 		// never crop a zero-copy atlas — the app's swapchain is already a
