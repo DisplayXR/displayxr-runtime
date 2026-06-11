@@ -50,7 +50,7 @@ window/canvas rect, so it does all the math internally.
 
 The raw channel reports the **DP's eyes verbatim** — one eye per active view.
 Multi-view eye fill is the **DP's responsibility** (sim_display reports N for
-`>2`-view modes; Leia is 2-view, 2 eyes). **The runtime never synthesizes
+`>2`-view modes; a 2-view vendor display reports 2 eyes). **The runtime never synthesizes
 eyes**: the former runtime surplus-synthesis was redundant (it only fired when a
 DP under-reported vs the active mode, which no current DP does) and was deleted
 in favor of a one-shot WARN. The IPC raw path likewise reports the DP's full

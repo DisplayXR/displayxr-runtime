@@ -18,7 +18,7 @@ rendering modes, so each eye over-rendered at display × (0.5 from the 2×1 SBS 
 Two things make Android harder than Windows:
 
 1. **The tile geometry is device-config-driven and asynchronous.** The vendor SDK exposes
-   the per-view tile through a device-config query (e.g. 1200×1920 on the nubia NP02J
+   the per-view tile through a device-config query (e.g. 1200×1920 on the Android
    validation unit), reported in the device **natural** orientation (portrait on that
    unit). That config is only readable after the vendor core's async init, but rendering
    modes + display info are queried at `xrCreateInstance`.
@@ -62,9 +62,9 @@ architecture.
    `target_instance.c`): each mode contributes its native atlas and, if CAN_ROTATE, also
    its 90°-swapped atlas. The app renders a **per-orientation sub-rect** of that fixed
    swapchain (per-eye = current-orientation display × view_scale), so each held orientation
-   is rendered at its correct native tile resolution. Validated on the nubia NP02J: live
-   landscape↔portrait swaps the per-eye 1920×1200 ↔ 1200×1920 on a fixed 3840×2560 atlas,
-   weave correct in both.
+   is rendered at its correct native tile resolution. Validated on the Android
+   validation unit: live landscape↔portrait swaps the per-eye 1920×1200 ↔ 1200×1920 on a
+   fixed 3840×2560 atlas, weave correct in both.
 
 ## Alternatives considered
 

@@ -183,7 +183,7 @@ this today (encoded bytes in UNORM swapchains); see *Consequences*.
 - **HDR / wide-gamut**, if it lands on the roadmap, forces Model B with a float16 linear
   compose space and would move B from "gated future" to "now."
 
-### As shipped (runtime #419 + leia-plugin)
+### As shipped (runtime #419 + vendor plug-in)
 
 Model B landed on the **D3D11 workspace/service compose path** with two refinements the
 implementation forced:

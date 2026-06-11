@@ -6,11 +6,11 @@ date: 2026-05-20
 
 ## Context
 
-`docs/roadmap/vendor-plugin-architecture.md` proposes restructuring `drv_leia` and `drv_sim_display` from in-tree static links of `DisplayXRClient.dll` into separately-built plug-in DLLs the runtime discovers via `LoadLibraryExW` at `xrCreateInstance`. The motivation is in the plan; this ADR is concerned with a single sub-decision the plan calls out as load-bearing (§4.3): how the aux library — `aux_util`, `aux_os`, `aux_math` and friends, all currently built as `STATIC` archives — should be linked across the new DLL boundary.
+`docs/roadmap/vendor-plugin-architecture.md` proposes restructuring the vendor driver and `drv_sim_display` from in-tree static links of `DisplayXRClient.dll` into separately-built plug-in DLLs the runtime discovers via `LoadLibraryExW` at `xrCreateInstance`. The motivation is in the plan; this ADR is concerned with a single sub-decision the plan calls out as load-bearing (§4.3): how the aux library — `aux_util`, `aux_os`, `aux_math` and friends, all currently built as `STATIC` archives — should be linked across the new DLL boundary.
 
 Today every binary in the tree (`DisplayXRClient.dll`, `displayxr-service.exe`, `displayxr-cli.exe`, the cube test apps in their `_handle`/`_texture` shapes) static-links aux. Because those binaries each live in their own process, every binary having its own private copy of aux's file-scope state has been a non-issue: log sinks, debug-variable registries, metrics streams, ID generators — duplicating them across processes is what we want.
 
-The plug-in restructure breaks that assumption. After the change, **two DLLs in the same process** — `DisplayXRClient.dll` and `DisplayXR-LeiaSR.dll` (or `DisplayXR-SimDisplay.dll`) — will both contain code that calls into aux. Whatever the link line says, the C language's rules are not negotiable: a file-scope `static` variable inside a translation unit packaged into a static archive becomes a per-DLL private when that archive gets linked into multiple DLLs. Picking the wrong sharing strategy here corrupts logging, debug-var tracking, metrics, and ID generation in ways that surface only at runtime and look like ghost bugs.
+The plug-in restructure breaks that assumption. After the change, **two DLLs in the same process** — `DisplayXRClient.dll` and a vendor plug-in DLL (or `DisplayXR-SimDisplay.dll`) — will both contain code that calls into aux. Whatever the link line says, the C language's rules are not negotiable: a file-scope `static` variable inside a translation unit packaged into a static archive becomes a per-DLL private when that archive gets linked into multiple DLLs. Picking the wrong sharing strategy here corrupts logging, debug-var tracking, metrics, and ID generation in ways that surface only at runtime and look like ghost bugs.
 
 The plan offers three options (A/B/C) and recommends C. The recommendation isn't binding until we've audited aux for what's actually state-bearing and confirmed empirically that the failure mode happens the way the C language says it does. That's this ADR.
 
@@ -32,7 +32,7 @@ Every aux function (`u_log`, `u_log_set_sink`, `u_var_add_*`, `u_metrics_*`, `u_
 ### Three options, restated concretely
 
 **Option A — each plug-in static-links aux.**
-`DisplayXR-LeiaSR.dll` and `DisplayXR-SimDisplay.dll` each contain their own copy of `aux_util.lib`, `aux_os.lib`, `aux_math.lib`. The runtime DLL keeps its copy. **Consequence:** every state-bearing TU now exists in 2-N independent copies per process.
+Each vendor plug-in DLL and `DisplayXR-SimDisplay.dll` contain their own copy of `aux_util.lib`, `aux_os.lib`, `aux_math.lib`. The runtime DLL keeps its copy. **Consequence:** every state-bearing TU now exists in 2-N independent copies per process.
 
 **Option B — export all of aux from the runtime DLL.**
 `DisplayXRClient.dll` declares `aux_util` (etc.) as DLL-exported. Plug-ins link an import library that points at the runtime DLL. **Consequence:** one copy of every aux symbol per process. The entire aux C surface — currently ~40 TUs and growing — becomes part of the runtime DLL's stable ABI.
@@ -79,7 +79,7 @@ These TUs have no file-scope mutable state and no shared-registry patterns. Thei
 
 ### Sanity-check at the call sites
 
-`drv_leia` — the first plug-in candidate — has **260** call sites of `U_LOG_*` macros across 13 files and uses `u_var_add_*` in `leia_device.c`. Whatever sharing strategy we choose has to keep those working without touching the call sites. Both code paths point at state-bearing TUs in the table above, so Option A is ruled out by direct contradiction with `drv_leia` already in the tree.
+The first plug-in candidate — the vendor driver — has **260** call sites of `U_LOG_*` macros across 13 files and uses `u_var_add_*` in its device TU. Whatever sharing strategy we choose has to keep those working without touching the call sites. Both code paths point at state-bearing TUs in the table above, so Option A is ruled out by direct contradiction with that driver already in the tree.
 
 ### Empirical anchor
 
@@ -91,7 +91,7 @@ The audit conclusion is anchored by `dumpbin` output already quoted under "Why t
 
 Reasoning, in order of weight:
 
-1. **Option A is ruled out by the audit.** `drv_leia` already calls `U_LOG_*` 260 times and `u_var_add_*` in `leia_device.c`; both paths hit file-scope-static state in `u_logging.c` / `u_file_logging.c` / `u_var.cpp`. Letting the plug-in have its own private copy of that state silently breaks the project's "one log file per process" debug invariant — a regression that wouldn't be visible until a vendor opens a support case complaining their U_LOG lines aren't in the runtime's log.
+1. **Option A is ruled out by the audit.** The vendor driver already calls `U_LOG_*` 260 times and `u_var_add_*` in its device TU; both paths hit file-scope-static state in `u_logging.c` / `u_file_logging.c` / `u_var.cpp`. Letting the plug-in have its own private copy of that state silently breaks the project's "one log file per process" debug invariant — a regression that wouldn't be visible until a vendor opens a support case complaining their U_LOG lines aren't in the runtime's log.
 
 2. **Option B is overcommitted relative to need.** The aux surface is ~40 TUs and growing — most of them helper math, container code, and instance-based device/system helpers that nobody benefits from sharing state on. Committing the whole thing to DLL-exported ABI status forces every aux change to consider downstream-plug-in compatibility, including changes to TUs whose contract is purely "you call this function and it returns the value." That's friction with no upside. The "shouldn't grow much" property is something the surface needs to *earn* — Option C earns it by including only the TUs whose state-bearing role can be named.
 
@@ -185,9 +185,9 @@ A failure on any of those four anchors is a regression in the boundary's impleme
 
 ## Consequences
 
-- **`drv_leia` and `drv_sim_display` migrate to plug-in DLLs without changing their U_LOG / u_var / u_metrics call sites.** Source compatibility for the existing 260 `U_LOG_*` call sites in drv_leia is preserved; only the link line changes.
+- **The vendor driver and `drv_sim_display` migrate to plug-in DLLs without changing their U_LOG / u_var / u_metrics call sites.** Source compatibility for the existing 260 `U_LOG_*` call sites in the vendor driver is preserved; only the link line changes.
 - **`DisplayXRClient.dll`'s export count goes from 1 to roughly 50.** The Khronos loader interface (`xrNegotiateLoaderRuntimeInterface`) stays the one OpenXR-facing export; the new ~50 are explicitly for in-process plug-in consumption and live behind the `aux_imp.lib` import library. They're not part of any OpenXR-spec surface and do not need to satisfy any external contract.
-- **The CI `findstr /i SimulatedReality` guard from §4.8 of the plan continues to assert what it asserts.** Aux exports don't introduce vendor identifiers; the runtime's link line remains vendor-agnostic.
+- **The CI vendor-identifier guard (a `findstr` on the vendor SDK identifier) from §4.8 of the plan continues to assert what it asserts.** Aux exports don't introduce vendor identifiers; the runtime's link line remains vendor-agnostic.
 - **One copy of log / var / metrics state per process.** The "one log per process" debug invariant becomes a structural property again, not a coincidence of in-tree static linking.
 - **`aux_util.lib` as built today doesn't disappear.** Internal consumers in the runtime DLL still static-link it the same way; the exports are layered on top via a small `__declspec(dllexport)` wrapper TU inside the runtime target. Plug-ins use `aux_imp.lib`. macOS uses the corresponding visibility annotations on the shared library. Linux uses `-fvisibility=hidden` + explicit `__attribute__((visibility("default")))`. Existing in-tree consumers (test apps that link aux_util directly) keep working unmodified; the boundary only matters for the new plug-in DLLs.
 - **Headers in `src/xrt/include/xrt/util/` and `src/xrt/auxiliary/util/` describing the exported TUs gain `XRT_API_FUNC` / `XRT_API_VAR` macros** to tag the exported symbols. The macros expand to `__declspec(dllexport)` when building the runtime DLL, `__declspec(dllimport)` when building plug-ins, and nothing for internal consumers and test apps that static-link. The exact macro shape is a Step 2 deliverable (the `xrt_plugin.h` work) — this ADR commits to the **set** of symbols, not the spelling.

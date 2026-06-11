@@ -209,7 +209,7 @@ precisely the shipped #439 Phase 2 supersede-mode path, generalized from one
 implicit full-window projection to N placed ones. It respects ADR-007
 (compositing zone atlases is layer accumulation — the compositor's job; a
 per-zone DP handoff would force every vendor to build an internal N-source
-compositor, and the Leia/CNSDK weavers take a single input atlas), keeps the
+compositor, and shipping vendor weavers take a single input atlas), keeps the
 atlas-stride invariant intact (one tiling layout; `slot stride = atlas_width /
 tile_columns`, all three coupled callsites untouched), and keeps lenticular
 phase continuous across the window with zero new phase plumbing.
@@ -228,7 +228,7 @@ ADR-020, **no ABI major bump**:
    *upward* as the wish: M ∈ [0,1], fractional at DP discretion. The existing
    downsample-and-arbitrate rule ("any non-zero mask pixel overlapping a
    hardware cell ⇒ cell 3D, OR-union across clients") is restated as the
-   **default quantization of the wish** — so every existing plugin (Leia v1.4,
+   **default quantization of the wish** — so every existing plugin (including
    sim_display) is already conformant at `wish_fractional = 0`, and boolean
    Local3DZone masks are valid wishes. Zero plugin migration.
 3. **Port the zone-slot triple** (`get_local_zone_caps` /
@@ -304,18 +304,19 @@ substitutes rig tunables on every zone-scoped locate; zone rects stay app-owned
 
 ## Risks / open items
 
-- **Verify the Leia column-band claim** with the vendor before pinning
+- **Verify the column-band switching claim** with the vendor before pinning
   `switch_granularity` enum values into the contract.
 - Fractional wish on real hardware is untested; v1 ships with the visual blend
   carrying the fraction and the physical switch quantized.
 - `_texture`-class zone apps: the canvas sub-rect becomes a zone rect
   naturally, but the shared-texture worst-case-sizing interaction needs its own
   check during compositor implementation.
-- Pre-existing `XrStructureType` collisions in the vendor range (mcp_tools vs
-  local_3d_zone at 1000999130–132; spatial_workspace vs atlas_capture at
-  1000999100; workspace_file_dialog vs atlas_capture at 1000999120–121) —
-  independent of this design (the 150+ block is clean) but worth a tracking
-  issue before the next header roll.
+- Pre-existing `XrStructureType` collisions in the extension range
+  (local_3d_zone vs mcp_tools at 1000999130–132; atlas_capture vs
+  workspace_file_dialog at 1000999120–121; macos_gl_binding vs display_info at
+  1000999010) — independent of this design (the 150+ block is clean); resolved
+  by the relocation + the allocation registry in
+  `src/external/openxr_includes/openxr/README.md`.
 
 ## References
 

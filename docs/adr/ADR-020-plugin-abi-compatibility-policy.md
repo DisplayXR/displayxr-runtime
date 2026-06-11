@@ -7,7 +7,7 @@ date: 2026-05-27
 ## Context
 
 ADR-019 split the vendor display drivers into separately-built plug-in DLLs
-(`DisplayXR-LeiaSR.dll`, `DisplayXR-SimDisplay.dll`) that the runtime
+(the vendor plug-in, `DisplayXR-SimDisplay.dll`) that the runtime
 (`DisplayXRClient.dll`) discovers and negotiates with at `xrCreateInstance`.
 The negotiation handshake (`xrt_plugin.h`) was designed with forward-compat in
 mind: `xrt_plugin_iface`, `xrt_plugin_host_iface`, and
@@ -22,18 +22,18 @@ the API-version contract. And the plug-in builds it against whatever runtime
 headers it pinned via `FetchContent` (`DXR_RUNTIME_GIT_TAG`).
 
 This bit us hard (the multi-day standalone-VK-no-weave / `xrCreateSession`-crash
-saga, fixed immediately by leia PR #16):
+saga, fixed immediately by a vendor plug-in PR):
 
 - Runtime commit `d665014ab` (after `v1.4.1`) **inserted** `is_self_submitting`,
   `on_pause`, `on_resume` into `xrt_display_processor` *before* `destroy`,
   shifting `set_chroma_key` `0x48 → 0x50` and `destroy` `0x50 → 0x68`.
 - `XRT_PLUGIN_API_VERSION_CURRENT` was **not** bumped (the version contract only
   ever covered the structs in `xrt_plugin.h`, not the DP vtable).
-- The leia plug-in pinned runtime headers at `v1.4.1` while shipping alongside
+- The vendor plug-in pinned runtime headers at `v1.4.1` while shipping alongside
   runtime `v1.5.2`. So the runtime's `set_chroma_key` call (slot `0x50`) landed
-  on the plug-in's `leia_dp_destroy` (which sits at `0x50` in the `v1.4.1`
+  on the plug-in's DP `destroy` (which sits at `0x50` in the `v1.4.1`
   layout): **the runtime destroyed the DP immediately after creating it** —
-  freeing `ldp`, tearing down the vendor weaver. Downstream that manifested as
+  freeing the DP instance, tearing down the vendor weaver. Downstream that manifested as
   "freed/corrupt vtable", a UAF crash, and no weave.
 - It reproduced only in CI/shipping because only the CI build uses the pinned
   tag; local/ASan builds point `DXR_RUNTIME_SOURCE_DIR` at the current runtime
@@ -50,7 +50,7 @@ Two structural facts made this possible and will recur unless addressed:
    *logs* the negotiated `plugin_api` version but never compares it.
 
 We also want plug-ins to be **updatable independently of the runtime** (ship a
-new `DisplayXR-LeiaSR.dll` without re-cutting the runtime, and vice-versa)
+new vendor plug-in DLL without re-cutting the runtime, and vice-versa)
 within a compatible window — lock-step pairing (e.g. a bundle-only pairing
 assert) is explicitly *not* the goal.
 
@@ -120,7 +120,7 @@ becomes a check). This catches "bumped one, forgot the other."
 ### What we explicitly do NOT do
 
 - **No bundle-level pairing assert as the primary mechanism.** Verifying "the
-  leia release in this bundle was built against the runtime this bundle pins"
+  plug-in release in this bundle was built against the runtime this bundle pins"
   enforces *lock-step*, which is the opposite of the independent-update goal,
   only covers the bundle (not standalone/third-party installs), and catches the
   symptom rather than the cause. Rules 1–4 make compatible combinations *work*
@@ -130,8 +130,8 @@ becomes a check). This catches "bumped one, forgot the other."
 
 - Implementing rules 1–3 is a **coordinated, major-version-bumped change**:
   runtime + every in-tree/first-party plug-in rebuild together, and the bump is
-  validated end-to-end on hardware. It must **not** gate the immediate leia
-  `v1.0.5` fix (PR #16), which is already correctly matched to runtime `v1.5.2`.
+  validated end-to-end on hardware. It must **not** gate the immediate vendor
+  plug-in `v1.0.5` fix, which is already correctly matched to runtime `v1.5.2`.
   It lands as the next runtime minor/major (e.g. `v1.6.0`) + matching plug-ins.
 - Rule 4 (the `_Static_assert` tripwire) and rule 5 (plug-in pin self-check) are
   **safe to land immediately** — they change no runtime behavior, only fail the
@@ -157,7 +157,8 @@ becomes a check). This catches "bumped one, forgot the other."
   `target_plugin_loader.c` `try_load_one` variants (Windows registry, POSIX/JSON,
   Android). `XRT_PLUGIN_API_VERSION_CURRENT` bumped `1 → 2`; the tripwire asserts
   rewritten to the `XRT_DP_BASE_OFF`-anchored, struct_size-aware scheme; all
-  first-party plug-ins (in-tree sim_display, and leia v1.0.6 out-of-tree) set
-  `struct_size` and re-pin to v1.6.0.
-- **Plug-in repos:** rule 5 (pin self-consistency CI assert) — leia v1.0.6's CI
-  asserts `DXR_RUNTIME_GIT_TAG` == the workflow's runtime checkout `ref`.
+  first-party plug-ins (in-tree sim_display, and the vendor plug-in v1.0.6
+  out-of-tree) set `struct_size` and re-pin to v1.6.0.
+- **Plug-in repos:** rule 5 (pin self-consistency CI assert) — the vendor
+  plug-in v1.0.6's CI asserts `DXR_RUNTIME_GIT_TAG` == the workflow's runtime
+  checkout `ref`.

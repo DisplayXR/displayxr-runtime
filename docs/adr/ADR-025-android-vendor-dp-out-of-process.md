@@ -7,12 +7,12 @@ date: 2026-06-09
 ## Context
 
 [ADR-019](ADR-019-vendor-plugin-aux-boundary.md) establishes the vendor-isolation
-principle: vendor display processors (Leia SR and friends) ship as plug-ins behind a
+principle: vendor display processors ship as plug-ins behind a
 stable boundary, and an application talks only to DisplayXR (the OpenXR loader →
-runtime), never to a vendor SDK. On **Windows** this holds for free — the SR weaving
-runs in the runtime's own module and reaches the SR service over COM/named-pipes, so
-the vendor SDK never loads into the application's address space. The app is pure
-OpenXR.
+runtime), never to a vendor SDK. On **Windows** this holds for free — the vendor
+weaving runs in the runtime's own module and reaches the vendor's tracking service
+over COM/named-pipes, so the vendor SDK never loads into the application's address
+space. The app is pure OpenXR.
 
 On **Android** the runtime ships in two deployment flavors
 (`src/xrt/targets/openxr_android/build.gradle`, `flavorDimensions 'deployment'`):
@@ -26,22 +26,22 @@ On **Android** the runtime ships in two deployment flavors
   (`MonadoImpl.nativeAppSurface` / `nativeStartServer` / `nativeAddClient` in
   `src/xrt/targets/service-lib/service_target.cpp`).
 
-The Android Leia bring-up (#499) and the background→resume surface-lifecycle fix
-(#507) were both done on **`inProcess`**, because it is one APK with no service
+The Android vendor-DP bring-up (#499) and the background→resume surface-lifecycle
+fix (#507) were both done on **`inProcess`**, because it is one APK with no service
 lifecycle — ideal for fast iteration. But in-process **cannot** satisfy ADR-019 on
 Android, for a reason intrinsic to the platform, not to our code.
 
 ### Why in-process breaks vendor isolation on Android
 
-In the in-process flavor the vendor SDK (CNSDK) is loaded into the **app's** process.
-CNSDK must reach the Leia system services — `com.leialoft.display.config` (device
-config / backlight), the head-tracking service — which are separate APKs. Under
+In the in-process flavor the vendor SDK is loaded into the **app's** process.
+The SDK must reach the vendor's system services — a device-config/backlight service
+APK and a head-tracking service APK — which are separate packages. Under
 **Android 11+ package visibility**, the *calling process's manifest* must declare
-`<queries>` for any package it binds or queries. Since CNSDK runs in the app's
+`<queries>` for any package it binds or queries. Since the SDK runs in the app's
 process, it is the **app's** manifest that must carry those `<queries>` (plus the
-CNSDK loader `.so` + JNI glue the aar provides). A CNSDK-free app aborts the moment
-CNSDK calls `GetPackageInfo("com.leialoft.display.config")` →
-`NameNotFoundException` → JNI fatal abort (observed on a nubia NP02J during #507
+SDK loader `.so` + JNI glue the vendor aar provides). An SDK-free app aborts the
+moment the SDK calls `GetPackageInfo` on the vendor service package →
+`NameNotFoundException` → JNI fatal abort (observed on a retail device during #507
 follow-up).
 
 This couples the app to the vendor set known **at build time**. It defeats the
@@ -54,21 +54,20 @@ ship later, plugs in* — in two independent ways:
    conflicts, bloat, and duplicate native libs — maintained by the app developer,
    which is backwards.
 
-### CNSDK is already core-in-service — so this adds no new heavy process
+### The vendor SDK is already core-in-service — so this adds no new heavy process
 
-Inspecting the CNSDK repo (`LeiaInc/CNSDK`) shows the heavy stack is **already**
+Inspecting the vendor SDK source shows the heavy stack is **already**
 out-of-process:
 
-- `leia/core/loader/loader.service.cpp` (built under `LNK_CORE_IN_SERVICE`) hosts
-  `leiaCore` **in the device-release APK** (`com.leialoft.display.config`): the
-  app-side `libleiaCore-loader.so` is a thin loader that `GetPackageInfo`s that
-  service APK, then loads the real `leiaCore` **from it** via an isolated classloader
-  + a `leia_core_vtable` hand-off (required because `dlsym` doesn't work on a
-  `System.loadLibrary`'d lib). The 0.10.56 release bundle ships **no** `leiaCore.so` —
-  the tell that core-in-service is the deployed mode.
-- Device config / backlight / head-tracking are **AIDL/Binder services**
-  (`leia/device/android/service/.../aidl/*.aidl`, `BaseServiceConnection`), shared by
-  every Leia app.
+- The SDK's core loader (built under its core-in-service mode) hosts the SDK core
+  **in the vendor's device-release APK**: the app-side loader `.so` is a thin
+  loader that `GetPackageInfo`s that service APK, then loads the real core
+  **from it** via an isolated classloader + a vtable hand-off (required because
+  `dlsym` doesn't work on a `System.loadLibrary`'d lib). The current SDK release
+  bundle ships **no** core `.so` — the tell that core-in-service is the deployed
+  mode.
+- Device config / backlight / head-tracking are **AIDL/Binder services**, shared by
+  every app of that vendor.
 
 So the in-app footprint is only **loader + JNI client + `<queries>`**. The decision
 below relocates *that thin client* — it does not introduce a new heavy process.
@@ -100,8 +99,8 @@ Concretely:
 ```
 App  (pure OpenXR — nothing vendor-specific)
   └─ DisplayXR runtime SERVICE   ← native compositor + DP plug-in + thin vendor-SDK client + vendor <queries>
-        └─ Leia device-release APK (com.leialoft.display.config): leiaCore .so + AIDL config/backlight   ← already out-of-process
-        └─ Leia head-tracking service APK                                                                 ← already out-of-process
+        └─ Vendor device-release APK: SDK core .so + AIDL config/backlight services   ← already out-of-process
+        └─ Vendor head-tracking service APK                                           ← already out-of-process
 ```
 
 Only the **middle tier's placement** is the change. The bottom tier already exists
@@ -120,7 +119,7 @@ and already runs out-of-process.
    SteamVR, upstream Monado — which we forked) runs out-of-process with Binder IPC +
    shared GPU buffers, at full refresh. The machinery is already in-tree from that
    heritage (see Consequences).
-4. **It costs nothing extra in heavy work.** CNSDK's `leiaCore` is already hosted in
+4. **It costs nothing extra in heavy work.** The vendor SDK core is already hosted in
    the device-release APK; the app↔service frame path is zero-copy; the
    service↔device-service AIDL traffic is unchanged regardless of where the DP sits.
    The weave/interlace GPU pass is the same work, run in the service.
@@ -143,7 +142,7 @@ No meaningful per-frame penalty, with the right mechanics — all present in-tre
   here even though it is already acceptable for the VR runtimes that ship this way.
 
 The one genuinely Android-specific operational cost is the **service process
-lifecycle**: aggressive OEM process freezers (e.g. the ZTE/MyOS `CpuFreezer` seen in
+lifecycle**: aggressive OEM process freezers (e.g. the `CpuFreezer` seen in
 #507) will freeze a backgrounded service. The runtime service must be kept
 alive/foregrounded appropriately. This is an implementation concern, not an objection
 to the model.
@@ -151,16 +150,16 @@ to the model.
 ## Consequences
 
 - **Applications become vendor-clean and future-proof.** The same app binary runs
-  against sim_display, Leia, or a vendor that ships next year, with no rebuild — the
-  ADR-019 promise made real on Android.
+  against sim_display, the current vendor, or a vendor that ships next year, with no
+  rebuild — the ADR-019 promise made real on Android.
 - **The `outOfProcess` flavor becomes the supported/production target on Android;
   `inProcess` is retained as a dev-only iteration aid.** Docs and the app-authoring
-  guidance should state this; the in-process CNSDK-aar escape hatch in
-  `test_apps/cube_handle_vk_android/build.gradle` (the `-PcnsdkDir` conditional) is
-  dev-only and is removed once out-of-process Leia is validated (remove-last; see
-  #510).
+  guidance should state this; the in-process vendor-SDK-aar escape hatch in
+  `test_apps/cube_handle_vk_android/build.gradle` (the vendor-SDK-dir conditional) is
+  dev-only and is removed once the out-of-process vendor DP is validated
+  (remove-last; see #510).
 - **Vendor `<queries>` and the thin vendor-SDK client move to the runtime service
-  manifest / jniLibs.** The vendor `leiaCore` tier (`com.leialoft.display.config`) is
+  manifest / jniLibs.** The vendor's device-service tier is
   untouched — DisplayXR is just another client of it.
 - **The #507 surface lifecycle needs an out-of-process equivalent.** In-process,
   background→resume is driven by `oxr_session_poll` →
@@ -173,7 +172,7 @@ to the model.
   `src/xrt/ipc/{server,client,shared,android}`, `src/xrt/compositor/{client,multi}`,
   the AHardwareBuffer allocator, the sync objects. The work in #510 is wiring +
   validating them for the 3D-display compositor path, not building them.
-- **The cube is the acceptance test.** "A CNSDK-free cube renders Leia 3D
+- **The cube is the acceptance test.** "A vendor-SDK-free cube renders vendor 3D
   out-of-process" is the closed-boundary proof; until then this ADR is *Accepted but
   unvalidated on device*.
 
@@ -181,7 +180,7 @@ to the model.
 
 - **Accepted as the architectural direction.** Implementation tracked in **#510**
   (milestones: M1 sim_display out-of-process → M1b surface lifecycle over IPC → M2
-  Leia out-of-process → M3 cube zero-aar acceptance).
+  vendor DP out-of-process → M3 cube zero-aar acceptance).
 - Validated on device only for **in-process** today (#499/#507). On-device validation
   of the out-of-process path is the gating signal for moving this ADR's status from
   "Accepted (direction)" to fully realized; a failure there is an implementation
@@ -195,7 +194,7 @@ to the model.
   — the DP contract, unchanged by this work.
 - `docs/architecture/separation-of-concerns.md` — the layering rule this makes
   structurally enforceable on Android.
-- Issue #510 — the implementation plan, performance analysis, CNSDK-core-in-service
-  findings, and cube acceptance test.
+- Issue #510 — the implementation plan, performance analysis, the
+  vendor-SDK core-in-service findings, and cube acceptance test.
 - Issue #507 / PR #509 — the in-process Android background→resume surface lifecycle
   whose out-of-process equivalent is a consequence above.
