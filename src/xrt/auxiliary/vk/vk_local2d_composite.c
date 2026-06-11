@@ -476,6 +476,81 @@ vk_local2d_composite_raster_mask(struct vk_local2d_composite *lc,
 }
 
 void
+vk_local2d_composite_raster_mask_rings(struct vk_local2d_composite *lc,
+                                       struct vk_bundle *vk,
+                                       VkCommandBuffer cmd,
+                                       VkFramebuffer mask_fb,
+                                       uint32_t w,
+                                       uint32_t h,
+                                       const struct xrt_rect *rects,
+                                       uint32_t rect_count,
+                                       uint32_t feather_steps,
+                                       uint32_t feather_step_px)
+{
+	if (!lc->initialized || mask_fb == VK_NULL_HANDLE || w == 0 || h == 0 || rects == NULL ||
+	    rect_count == 0 || feather_steps == 0) {
+		return;
+	}
+
+	// LOAD_OP_CLEAR fills the whole attachment with 0 (no 3D wish).
+	VkClearValue clear = {.color = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}}};
+	VkRenderPassBeginInfo rp_bi = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+	    .renderPass = lc->mask_rp,
+	    .framebuffer = mask_fb,
+	    .renderArea = {{0, 0}, {w, h}},
+	    .clearValueCount = 1,
+	    .pClearValues = &clear,
+	};
+	vk->vkCmdBeginRenderPass(cmd, &rp_bi, VK_SUBPASS_CONTENTS_INLINE);
+
+	for (int32_t s = (int32_t)feather_steps; s >= 0; s--) {
+		const float v = (float)((int32_t)feather_steps - s) / (float)feather_steps;
+		const int32_t expand = s * (int32_t)feather_step_px;
+		VkClearAttachment ca = {
+		    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+		    .colorAttachment = 0,
+		    .clearValue = {.color = {.float32 = {v, 0.0f, 0.0f, 0.0f}}},
+		};
+		VkClearRect cr[XRT_MAX_LAYERS];
+		uint32_t n = 0;
+		for (uint32_t i = 0; i < rect_count && n < XRT_MAX_LAYERS; i++) {
+			int32_t left = rects[i].offset.w - expand;
+			int32_t top = rects[i].offset.h - expand;
+			int32_t right = rects[i].offset.w + rects[i].extent.w + expand;
+			int32_t bottom = rects[i].offset.h + rects[i].extent.h + expand;
+			if (left < 0) {
+				left = 0;
+			}
+			if (top < 0) {
+				top = 0;
+			}
+			if (right > (int32_t)w) {
+				right = (int32_t)w;
+			}
+			if (bottom > (int32_t)h) {
+				bottom = (int32_t)h;
+			}
+			if (right <= left || bottom <= top) {
+				continue;
+			}
+			cr[n].rect.offset.x = left;
+			cr[n].rect.offset.y = top;
+			cr[n].rect.extent.width = (uint32_t)(right - left);
+			cr[n].rect.extent.height = (uint32_t)(bottom - top);
+			cr[n].baseArrayLayer = 0;
+			cr[n].layerCount = 1;
+			n++;
+		}
+		if (n > 0) {
+			vk->vkCmdClearAttachments(cmd, 1, &ca, n, cr);
+		}
+	}
+
+	vk->vkCmdEndRenderPass(cmd);
+}
+
+void
 vk_local2d_composite_flatten_draw(struct vk_local2d_composite *lc,
                                   struct vk_bundle *vk,
                                   VkCommandBuffer cmd,

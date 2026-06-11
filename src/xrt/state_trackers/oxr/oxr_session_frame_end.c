@@ -1366,9 +1366,11 @@ static XrResult
 verify_zones_frame(struct oxr_session *sess,
                    struct oxr_logger *log,
                    const XrFrameEndInfo *frameEndInfo,
-                   bool *out_zones_frame)
+                   bool *out_zones_frame,
+                   void **out_wish_comp_mask)
 {
 	*out_zones_frame = false;
+	*out_wish_comp_mask = NULL;
 
 	uint32_t projection_count = 0;
 	uint32_t zone_count = 0;
@@ -1456,9 +1458,11 @@ verify_zones_frame(struct oxr_session *sess,
 			return oxr_error(log, XR_ERROR_HANDLE_INVALID,
 			                 "(frameEndInfo->next...wishMask) mask does not belong to this session");
 		}
-		//! @todo P2: hand the mask to the compositor as the frame's
-		//! hardware wish (comp_*_compositor_zones_set_frame_wish);
-		//! absent/NULL = auto-derive from the zone-rect union.
+		// The compositor-side mask state becomes the frame's explicit
+		// hardware wish (dispatched via
+		// comp_*_compositor_zones_set_frame_wish by the caller);
+		// absent/NULL = auto-derive from the zone-rect union.
+		*out_wish_comp_mask = mask->comp_mask;
 	}
 
 	// VALIDATE_BIT: locate<->submit cross-checks, one-shot WARN per
@@ -2276,9 +2280,29 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	// all inert (compositor-side, P2).
 	bool zones_frame = false;
 	if (sess->sys->inst->extensions.EXT_display_zones) {
-		XrResult zres = verify_zones_frame(sess, log, frameEndInfo, &zones_frame);
+		void *zones_wish_comp_mask = NULL;
+		XrResult zres = verify_zones_frame(sess, log, frameEndInfo, &zones_frame, &zones_wish_comp_mask);
 		if (zres != XR_SUCCESS) {
 			return zres;
+		}
+		// Hand the frame's wish reference (NULL = auto-derive) to the
+		// in-process native compositor before the layer submission it
+		// gates. P2 wires D3D11 + VK; the other APIs land with their
+		// zone-consumer legs (P3) — until then their zone layers drop
+		// with the one-shot WARN and the wish has no consumer.
+		if (zones_frame && sess->xcn != NULL) {
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+			if (sess->is_d3d11_native_compositor) {
+				comp_d3d11_compositor_zones_set_frame_wish(&sess->xcn->base,
+				                                           zones_wish_comp_mask);
+			}
+#endif
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+			if (sess->is_vk_native_compositor) {
+				comp_vk_native_compositor_zones_set_frame_wish(&sess->xcn->base,
+				                                               zones_wish_comp_mask);
+			}
+#endif
 		}
 	}
 #endif

@@ -334,9 +334,21 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 	                   VK_PIPELINE_STAGE_TRANSFER_BIT);
 
+	// XR_EXT_display_zones (ADR-027): a zones frame composes N placed zone
+	// layers into the window-spanning atlas — the unzoned area must stay
+	// transparent so the feathered wish edge blends toward the desktop.
+	bool zones_frame = false;
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		if (layers->layers[i].data.type == XRT_LAYER_ZONE_3D) {
+			zones_frame = true;
+			break;
+		}
+	}
+
 	// Clear atlas texture to black. Use alpha=0 in transparent-background mode
 	// so atlas regions not overwritten by a tile blit stay see-through (issue #392).
-	VkClearColorValue clear_color = {{0.0f, 0.0f, 0.0f, r->transparent_background ? 0.0f : 1.0f}};
+	VkClearColorValue clear_color = {
+	    {0.0f, 0.0f, 0.0f, (r->transparent_background || zones_frame) ? 0.0f : 1.0f}};
 	VkImageSubresourceRange range = {
 	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 	    .baseMipLevel = 0,
@@ -348,12 +360,13 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 	                          &clear_color, 1, &range);
 
-	// Blit each projection layer into the atlas texture
+	// Blit each projection / zone layer into the atlas texture
 	for (uint32_t i = 0; i < layers->layer_count; i++) {
 		struct comp_layer *layer = &layers->layers[i];
 
+		const bool is_zone = layer->data.type == XRT_LAYER_ZONE_3D;
 		if (layer->data.type != XRT_LAYER_PROJECTION &&
-		    layer->data.type != XRT_LAYER_PROJECTION_DEPTH) {
+		    layer->data.type != XRT_LAYER_PROJECTION_DEPTH && !is_zone) {
 			continue;
 		}
 
@@ -413,6 +426,70 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 				dy0 = (int32_t)(tile_y * r->view_height);
 				dx1 = dx0 + (int32_t)r->view_width;
 				dy1 = dy0 + (int32_t)r->view_height;
+			}
+
+			// XR_EXT_display_zones: scale the zone rect (client-window
+			// px) into the tile box — in zones frames the tile spans
+			// the full window. NOTE (VK P2): blits OVERWRITE — an
+			// overlapping zone replaces rather than alpha-overs the
+			// one below (one-shot WARN; draw-based blending rides the
+			// P4 wish-publish leg or a later renderer rework).
+			if (is_zone && target_width > 0 && target_height > 0) {
+				const struct xrt_rect *zr = &layer->data.zone_3d.rect;
+				const float bw = (float)(dx1 - dx0);
+				const float bh = (float)(dy1 - dy0);
+				const float zsx = bw / (float)target_width;
+				const float zsy = bh / (float)target_height;
+				int32_t zx0 = dx0 + (int32_t)((float)zr->offset.w * zsx);
+				int32_t zy0 = dy0 + (int32_t)((float)zr->offset.h * zsy);
+				int32_t zx1 = dx0 + (int32_t)((float)(zr->offset.w + zr->extent.w) * zsx);
+				int32_t zy1 = dy0 + (int32_t)((float)(zr->offset.h + zr->extent.h) * zsy);
+				if (zx0 < dx0) {
+					zx0 = dx0;
+				}
+				if (zy0 < dy0) {
+					zy0 = dy0;
+				}
+				if (zx1 > dx1) {
+					zx1 = dx1;
+				}
+				if (zy1 > dy1) {
+					zy1 = dy1;
+				}
+				if (zx1 <= zx0 || zy1 <= zy0) {
+					cmd_image_barrier(vk, cmd, src_image,
+					                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+					                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+					                   VK_ACCESS_TRANSFER_READ_BIT,
+					                   VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+					                   VK_PIPELINE_STAGE_TRANSFER_BIT,
+					                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+					continue;
+				}
+				dx0 = zx0;
+				dy0 = zy0;
+				dx1 = zx1;
+				dy1 = zy1;
+
+				static bool zone_overlap_warned = false;
+				if (!zone_overlap_warned && i > 0) {
+					for (uint32_t pz = 0; pz < i && !zone_overlap_warned; pz++) {
+						if (layers->layers[pz].data.type != XRT_LAYER_ZONE_3D) {
+							continue;
+						}
+						const struct xrt_rect *pr = &layers->layers[pz].data.zone_3d.rect;
+						bool overlap = pr->offset.w < zr->offset.w + zr->extent.w &&
+						               zr->offset.w < pr->offset.w + pr->extent.w &&
+						               pr->offset.h < zr->offset.h + zr->extent.h &&
+						               zr->offset.h < pr->offset.h + pr->extent.h;
+						if (overlap) {
+							zone_overlap_warned = true;
+							U_LOG_W("VK zones: overlapping zones OVERWRITE in "
+							        "blit order (alpha-over not implemented on "
+							        "the VK blit path yet — one-time warning)");
+						}
+					}
+				}
 			}
 
 			VkImageBlit blit = {

@@ -129,6 +129,28 @@ vk_local2d_composite_raster_mask(struct vk_local2d_composite *lc,
                                  float rect_value);
 
 /*!
+ * Rasterize an R8 wish mask with a stepped ring feather
+ * (XR_EXT_display_zones, ADR-027): LOAD_OP_CLEAR to 0, then for each feather
+ * step (outermost first, ascending value to 1.0 at the core) clear the
+ * expanded rect of EVERY zone — max-semantics without a shader; overlapping
+ * feathers can never dim a zone core. Layout contract identical to
+ * vk_local2d_composite_raster_mask.
+ *
+ * @ingroup aux_vk
+ */
+void
+vk_local2d_composite_raster_mask_rings(struct vk_local2d_composite *lc,
+                                       struct vk_bundle *vk,
+                                       VkCommandBuffer cmd,
+                                       VkFramebuffer mask_fb,
+                                       uint32_t w,
+                                       uint32_t h,
+                                       const struct xrt_rect *rects,
+                                       uint32_t rect_count,
+                                       uint32_t feather_steps,
+                                       uint32_t feather_step_px);
+
+/*!
  * Flatten one Local2D layer into the `twod` scratch (caller clears the scratch
  * transparent once before the first layer, and manages its layout).
  *

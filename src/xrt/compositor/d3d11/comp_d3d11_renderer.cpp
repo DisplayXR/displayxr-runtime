@@ -1281,7 +1281,8 @@ compute_effective_views(struct comp_layer_accum *layers, bool hardware_display_3
 	uint32_t effective_views = 2;
 	for (uint32_t i = 0; i < layers->layer_count; i++) {
 		if (layers->layers[i].data.type == XRT_LAYER_PROJECTION ||
-		    layers->layers[i].data.type == XRT_LAYER_PROJECTION_DEPTH) {
+		    layers->layers[i].data.type == XRT_LAYER_PROJECTION_DEPTH ||
+		    layers->layers[i].data.type == XRT_LAYER_ZONE_3D) {
 			effective_views = layers->layers[i].data.view_count;
 			break;
 		}
@@ -1290,6 +1291,43 @@ compute_effective_views(struct comp_layer_accum *layers, bool hardware_display_3
 		effective_views = 1;
 	}
 	return effective_views;
+}
+
+// Compute the per-view tile box for either pass — the box set_view_viewport
+// covers, and the box a zone rect scales into (XR_EXT_display_zones).
+static void
+get_view_tile_box(struct comp_d3d11_renderer *renderer,
+                  uint32_t view_index,
+                  uint32_t effective_views,
+                  uint32_t target_width,
+                  uint32_t target_height,
+                  float *out_x,
+                  float *out_y,
+                  float *out_w,
+                  float *out_h)
+{
+	if (effective_views == 1) {
+		// MONO: use target (window) dimensions so 2D content fills
+		// the full window. Width is capped to the atlas texture width
+		// (tile_columns*view_width); height is capped to texture_height.
+		uint32_t atlas_w = renderer->tile_columns * renderer->view_width;
+		uint32_t mono_w = (target_width < atlas_w) ? target_width : atlas_w;
+		uint32_t mono_h = (target_height < renderer->texture_height)
+		                      ? target_height
+		                      : renderer->texture_height;
+		*out_x = 0.0f;
+		*out_y = 0.0f;
+		*out_w = static_cast<float>(mono_w);
+		*out_h = static_cast<float>(mono_h);
+	} else {
+		// MULTI-VIEW: tile-based atlas layout
+		uint32_t col = view_index % renderer->tile_columns;
+		uint32_t row = view_index / renderer->tile_columns;
+		*out_x = static_cast<float>(col * renderer->view_width);
+		*out_y = static_cast<float>(row * renderer->view_height);
+		*out_w = static_cast<float>(renderer->view_width);
+		*out_h = static_cast<float>(renderer->view_height);
+	}
 }
 
 // Set the per-view viewport on the immediate context for either pass.
@@ -1302,27 +1340,8 @@ set_view_viewport(struct comp_d3d11_renderer *renderer,
 {
 	auto internals = get_internals(renderer->c);
 	D3D11_VIEWPORT viewport = {};
-	if (effective_views == 1) {
-		// MONO: use target (window) dimensions so 2D content fills
-		// the full window. Width is capped to the atlas texture width
-		// (tile_columns*view_width); height is capped to texture_height.
-		uint32_t atlas_w = renderer->tile_columns * renderer->view_width;
-		uint32_t mono_w = (target_width < atlas_w) ? target_width : atlas_w;
-		uint32_t mono_h = (target_height < renderer->texture_height)
-		                      ? target_height
-		                      : renderer->texture_height;
-		viewport.TopLeftX = 0.0f;
-		viewport.Width = static_cast<float>(mono_w);
-		viewport.Height = static_cast<float>(mono_h);
-	} else {
-		// MULTI-VIEW: tile-based atlas layout
-		uint32_t col = view_index % renderer->tile_columns;
-		uint32_t row = view_index / renderer->tile_columns;
-		viewport.TopLeftX = static_cast<float>(col * renderer->view_width);
-		viewport.TopLeftY = static_cast<float>(row * renderer->view_height);
-		viewport.Width = static_cast<float>(renderer->view_width);
-		viewport.Height = static_cast<float>(renderer->view_height);
-	}
+	get_view_tile_box(renderer, view_index, effective_views, target_width, target_height, &viewport.TopLeftX,
+	                  &viewport.TopLeftY, &viewport.Width, &viewport.Height);
 	viewport.MinDepth = 0.0f;
 	viewport.MaxDepth = 1.0f;
 	internals->context->RSSetViewports(1, &viewport);
@@ -1339,11 +1358,27 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 {
 	auto internals = get_internals(renderer->c);
 
+	// XR_EXT_display_zones (ADR-027): a zones frame composes N placed zone
+	// layers into the window-spanning atlas — the unzoned area must weave
+	// to nothing (transparent), not the dark-blue debug clear, so the
+	// feathered wish edge blends toward the desktop.
+	bool zones_frame = false;
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		if (layers->layers[i].data.type == XRT_LAYER_ZONE_3D) {
+			zones_frame = true;
+			break;
+		}
+	}
+
 	// Set render target to atlas texture
 	internals->context->OMSetRenderTargets(1, &renderer->atlas_rtv, renderer->depth_dsv);
 
-	// Clear to dark blue (similar to Vulkan compositor)
+	// Clear to dark blue (similar to Vulkan compositor); transparent in
+	// zones frames.
 	float clear_color[4] = {0.05f, 0.05f, 0.25f, 1.0f};
+	if (zones_frame) {
+		clear_color[0] = clear_color[1] = clear_color[2] = clear_color[3] = 0.0f;
+	}
 	internals->context->ClearRenderTargetView(renderer->atlas_rtv, clear_color);
 	internals->context->ClearDepthStencilView(renderer->depth_dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f,
 	                                           0);
@@ -1387,6 +1422,46 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 			case XRT_LAYER_PROJECTION_DEPTH:
 				render_projection_layer(renderer, layer, view_index, eye);
 				break;
+
+			case XRT_LAYER_ZONE_3D: {
+				// XR_EXT_display_zones: scaled-blit this zone's view
+				// tile into the view tile box at the zone rect
+				// (client-window px scaled into tile coordinates —
+				// in zones frames the tile spans the full window).
+				// Alpha-over in layer-list order falls out of the
+				// layers-inner-in-order loop; depth is disabled.
+				if (target_width == 0 || target_height == 0) {
+					break;
+				}
+				float tx, ty, tw, th;
+				get_view_tile_box(renderer, view_index, effective_views, target_width,
+				                  target_height, &tx, &ty, &tw, &th);
+				const float sx = tw / static_cast<float>(target_width);
+				const float sy = th / static_cast<float>(target_height);
+				const struct xrt_rect *zr = &layer->data.zone_3d.rect;
+				D3D11_VIEWPORT zvp = {};
+				zvp.TopLeftX = tx + static_cast<float>(zr->offset.w) * sx;
+				zvp.TopLeftY = ty + static_cast<float>(zr->offset.h) * sy;
+				zvp.Width = static_cast<float>(zr->extent.w) * sx;
+				zvp.Height = static_cast<float>(zr->extent.h) * sy;
+				zvp.MinDepth = 0.0f;
+				zvp.MaxDepth = 1.0f;
+				if (zvp.Width <= 0.0f || zvp.Height <= 0.0f) {
+					break;
+				}
+				internals->context->RSSetViewports(1, &zvp);
+				const bool unpremul =
+				    (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
+				internals->context->OMSetBlendState(
+				    unpremul ? renderer->blend_alpha : renderer->blend_premul, nullptr, 0xFFFFFFFF);
+				// zone_3d.proj shares xrt_layer_projection_data's layout
+				// at union offset 0, so the projection draw body reads
+				// the right per-view sub/fov data unchanged.
+				render_projection_layer(renderer, layer, view_index, eye);
+				internals->context->OMSetBlendState(renderer->blend_opaque, nullptr, 0xFFFFFFFF);
+				set_view_viewport(renderer, view_index, effective_views, target_width, target_height);
+				break;
+			}
 
 			case XRT_LAYER_QUAD:
 				render_quad_layer(renderer, layer, view_index, &view_poses[view_index],

@@ -291,6 +291,24 @@ struct comp_vk_native_compositor
 	//! under the frame path at the top of layer_commit.
 	bool local_2d_last_frame;
 
+	//! XR_EXT_display_zones (ADR-027): true when the current frame's
+	//! accumulator carries XRT_LAYER_ZONE_3D layers (a "zones frame"). The
+	//! effective canvas is the full client window; the wish drives the
+	//! post-weave lerp (the implicit-mask + sticky-mask rules are inert).
+	//! The base DP vtable has no zone-publish slots until P4, so the
+	//! hardware leg is the tier-1 global fallback below.
+	bool zones_frame;
+
+	//! Explicit per-frame wish (XrDisplayZonesFrameEndInfoEXT.wishMask) set
+	//! via comp_vk_native_compositor_zones_set_frame_wish before commit;
+	//! NULL = auto-derive from the zone rects. Not owned.
+	struct comp_vk_native_zone_mask *frame_wish;
+
+	//! Tier-1 fallback edge state: request_display_mode(true) fired once on
+	//! the zones rising edge ("any zone active => request 3D"); never forces
+	//! 2D on the falling edge (mode restore stays with the V-toggle logic).
+	bool zones_mode_requested;
+
 	//! #491 part 3 — guards vk_local2d_composite_begin_frame (which resets the
 	//! shared descriptor pool) to run at most once per frame. Both the pre-weave
 	//! backdrop flatten and the post-weave overlay composite allocate from the
@@ -1034,6 +1052,22 @@ vk_compositor_layer_local_2d(struct xrt_compositor *xc,
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
 	comp_layer_accum_local_2d(&c->layer_accum, xsc, data);
+	return XRT_SUCCESS;
+}
+
+/*!
+ * 3D display zone layer (XR_EXT_display_zones, ADR-027) — multi-swapchain
+ * accumulate like projection; consumed by the zones-frame branch of
+ * layer_commit (scaled blit into the window-spanning atlas at the zone rect).
+ */
+static xrt_result_t
+vk_compositor_layer_zone_3d(struct xrt_compositor *xc,
+                            struct xrt_device *xdev,
+                            struct xrt_swapchain *xsc[XRT_MAX_VIEWS],
+                            const struct xrt_layer_data *data)
+{
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	comp_layer_accum_zone_3d(&c->layer_accum, xsc, data);
 	return XRT_SUCCESS;
 }
 
@@ -2042,13 +2076,26 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 	// #439 Phase 3 — per-frame Local2D accumulator flag (read by
 	// vk_effective_canvas + vk_composite_local_2d). Set once here so it reflects
-	// this frame's committed layers.
+	// this frame's committed layers. XR_EXT_display_zones: the zones-frame
+	// flag is resolved in the same scan (one coherent per-frame decision).
 	c->local_2d_last_frame = false;
+	c->zones_frame = false;
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
 			c->local_2d_last_frame = true;
-			break;
+		} else if (c->layer_accum.layers[i].data.type == XRT_LAYER_ZONE_3D) {
+			c->zones_frame = true;
 		}
+	}
+
+	// XR_EXT_display_zones tier-1 hardware fallback: the base DP vtable has
+	// no zone-publish slots until P4, so "any zone active => request 3D"
+	// once on the rising edge. No forced 2D on the falling edge.
+	if (c->zones_frame && !c->zones_mode_requested) {
+		c->zones_mode_requested = true;
+		comp_vk_native_compositor_request_display_mode(&c->base.base, true);
+	} else if (!c->zones_frame) {
+		c->zones_mode_requested = false;
 	}
 
 	// #491 part 3 — the Local2D descriptor pool is reset on first use this
@@ -3361,6 +3408,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	c->base.base.layer_passthrough = vk_compositor_layer_passthrough;
 	c->base.base.layer_window_space = vk_compositor_layer_window_space;
 	c->base.base.layer_local_2d = vk_compositor_layer_local_2d;
+	c->base.base.layer_zone_3d = vk_compositor_layer_zone_3d;
 	c->base.base.layer_commit = vk_compositor_layer_commit;
 	c->base.base.layer_commit_with_semaphore = vk_compositor_layer_commit_with_semaphore;
 	c->base.base.destroy = vk_compositor_destroy;
@@ -3908,7 +3956,10 @@ vk_destroy_rt(struct comp_vk_native_compositor *c,
 static struct u_canvas_rect
 vk_effective_canvas(struct comp_vk_native_compositor *c)
 {
-	if (c->active_zone_mask == NULL && !c->local_2d_last_frame) {
+	// XR_EXT_display_zones: a zones frame spans the full client window by
+	// definition (each zone rect is its own canvas; the output rect is
+	// inert) — same supersede geometry as the mask/Local2D rules.
+	if (!c->zones_frame && c->active_zone_mask == NULL && !c->local_2d_last_frame) {
 		return c->canvas;
 	}
 	struct u_canvas_rect win = {0};
@@ -4155,7 +4206,12 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 {
 	struct vk_bundle *vk = &c->vk;
 
-	if (!c->local2d_initialized || !c->local_2d_last_frame || dst_image == VK_NULL_HANDLE ||
+	// XR_EXT_display_zones: a zones frame ALWAYS runs the composite (the
+	// feathered wish edge lerps the weave toward the 2D flatten even with
+	// zero Local2D layers); the implicit-mask + sticky-mask rules are inert.
+	const bool zones_frame = c->zones_frame;
+
+	if (!c->local2d_initialized || (!c->local_2d_last_frame && !zones_frame) || dst_image == VK_NULL_HANDLE ||
 	    dst_view == VK_NULL_HANDLE) {
 		return false;
 	}
@@ -4183,20 +4239,34 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 	}
 
 	// Collect this frame's OVER Local2D layer rects (for the implicit mask) once
-	// — under-layers are the backdrop, not part of the overlay mask.
+	// — under-layers are the backdrop, not part of the overlay mask. In zones
+	// frames there is no under/over split (2D-under reserved in v1): every
+	// Local2D layer flattens as 2D-over.
 	struct xrt_rect rects[XRT_MAX_LAYERS];
 	uint32_t rect_count = 0;
 	for (uint32_t i = 0; i < c->layer_accum.layer_count && rect_count < XRT_MAX_LAYERS; i++) {
 		if (c->layer_accum.layers[i].data.type != XRT_LAYER_LOCAL_2D) {
 			continue;
 		}
-		if (proj_idx >= 0 && (int32_t)i < proj_idx) {
+		if (!zones_frame && proj_idx >= 0 && (int32_t)i < proj_idx) {
 			continue; // under-layer (backdrop) — skip
 		}
 		rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
 	}
-	if (rect_count == 0) {
+	if (rect_count == 0 && !zones_frame) {
 		return false; // only under-layers (or stale flag) — nothing to overlay
+	}
+
+	// XR_EXT_display_zones: the auto wish rasterizes from the ZONE rects.
+	struct xrt_rect zone_rects[XRT_MAX_LAYERS];
+	uint32_t zone_rect_count = 0;
+	if (zones_frame) {
+		for (uint32_t i = 0; i < c->layer_accum.layer_count && zone_rect_count < XRT_MAX_LAYERS; i++) {
+			if (c->layer_accum.layers[i].data.type != XRT_LAYER_ZONE_3D) {
+				continue;
+			}
+			zone_rects[zone_rect_count++] = c->layer_accum.layers[i].data.zone_3d.rect;
+		}
 	}
 
 	// Resolve the `twod` source: flatten the Local2D layers into local2d_scratch.
@@ -4238,8 +4308,9 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 			continue;
 		}
 		// #491 part 3 — under-layers are the DP backdrop (handled pre-weave);
-		// the overlay flattens only over-layers.
-		if (proj_idx >= 0 && (int32_t)i < proj_idx) {
+		// the overlay flattens only over-layers. Zones frames have no
+		// under/over split (2D-under reserved in v1).
+		if (!zones_frame && proj_idx >= 0 && (int32_t)i < proj_idx) {
 			continue;
 		}
 		vk_flatten_one_local2d_layer(c, cmd, c->local2d_scratch_fb, layer, region_w, region_h);
@@ -4250,10 +4321,75 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 	                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
 
-	// --- mask: explicit submitted mask wins; else rasterize the implicit one.
+	// --- mask. Zones frame (XR_EXT_display_zones): the WISH — the explicit
+	// frame wish (staged in-cmd; referenced-at-frame-end = consume current
+	// authored state, no submit required) or the auto ring-feathered raster
+	// from the zone rects (reusing the implicit-mask image — the implicit
+	// rule is inert in zones frames). Legacy: explicit submitted mask wins;
+	// else rasterize the implicit one.
 	VkImageView mask_view = VK_NULL_HANDLE;
 	struct comp_vk_native_zone_mask *emask = c->active_zone_mask;
-	if (emask != NULL && emask->submitted && emask->staged_view != VK_NULL_HANDLE) {
+	if (zones_frame && c->frame_wish != NULL && c->frame_wish->staged != VK_NULL_HANDLE &&
+	    c->frame_wish->tex != VK_NULL_HANDLE) {
+		struct comp_vk_native_zone_mask *fw = c->frame_wish;
+		// Stage tex → staged inside this frame's cmd (the submit body,
+		// inlined): in-progress authoring can't tear into the frame.
+		vk_cmd_image_barrier_locked(vk, cmd, fw->tex, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		                            VK_ACCESS_TRANSFER_READ_BIT,
+		                            fw->tex_layout != VK_IMAGE_LAYOUT_UNDEFINED
+		                                ? fw->tex_layout
+		                                : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		                            VK_PIPELINE_STAGE_TRANSFER_BIT, k_color_sub);
+		vk_cmd_image_barrier_locked(vk, cmd, fw->staged, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+		                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                            k_color_sub);
+		VkImageCopy wish_copy = {
+		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+		    .extent = {fw->w, fw->h, 1},
+		};
+		vk->vkCmdCopyImage(cmd, fw->tex, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, fw->staged,
+		                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &wish_copy);
+		vk_cmd_image_barrier_locked(vk, cmd, fw->staged, VK_ACCESS_TRANSFER_WRITE_BIT,
+		                            VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+		vk_cmd_image_barrier_locked(vk, cmd, fw->tex, VK_ACCESS_TRANSFER_READ_BIT,
+		                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
+		fw->tex_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		mask_view = fw->staged_view;
+	} else if (zones_frame) {
+		if (zone_rect_count == 0) {
+			return false; // defensive — a zones frame always has zones
+		}
+		if (!vk_ensure_rt(c, &c->implicit_mask_tex, &c->implicit_mask_mem, &c->implicit_mask_view,
+		                  &c->implicit_mask_fb, &c->implicit_mask_w, &c->implicit_mask_h, region_w,
+		                  region_h, mask_fmt,
+		                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+		                  c->local2d.mask_rp, "zone wish mask")) {
+			return false;
+		}
+		vk_cmd_image_barrier_locked(vk, cmd, c->implicit_mask_tex, 0,
+		                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+		                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
+		vk_local2d_composite_raster_mask_rings(&c->local2d, vk, cmd, c->implicit_mask_fb, region_w,
+		                                       region_h, zone_rects, zone_rect_count, 8, 2);
+		vk_cmd_image_barrier_locked(vk, cmd, c->implicit_mask_tex, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		                            VK_ACCESS_SHADER_READ_BIT,
+		                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+		mask_view = c->implicit_mask_view;
+	} else if (emask != NULL && emask->submitted && emask->staged_view != VK_NULL_HANDLE) {
 		mask_view = emask->staged_view; // already SHADER_READ from submit
 	} else {
 		if (!vk_ensure_rt(c, &c->implicit_mask_tex, &c->implicit_mask_mem, &c->implicit_mask_view,
@@ -4346,10 +4482,13 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 	// #491: the implicit (auto) mask composites the 2D over the weave by its own
 	// premultiplied alpha — translucent 2D reveals the 3D scene, not the desktop.
 	// An explicit authored mask keeps the hard M-lerp (designer cutout/portal).
+	// XR_EXT_display_zones: zones frames are ALWAYS the hard M-lerp
+	// (final = M·weave + (1−M)·flatten(2D-over)).
 	const bool have_explicit = (emask != NULL && emask->submitted && emask->staged_view != VK_NULL_HANDLE);
+	const bool alpha_over = !zones_frame && !have_explicit;
 	vk_local2d_composite_draw(&c->local2d, vk, cmd, c->composite_target_fb, dst_w, dst_h,
 	                          c->local2d_scratch_view, mask_view, c->weave_scratch_view, region_w,
-	                          region_h, cx, cy, cw, ch, !have_explicit);
+	                          region_h, cx, cy, cw, ch, alpha_over);
 
 	// One-shot lifecycle log (NOT per-frame): proves the masked composite ran +
 	// which mask source resolved. WARN so it survives the hot-path INFO filter.
@@ -4615,9 +4754,25 @@ comp_vk_native_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mas
 	if (c->active_zone_mask == mask) {
 		c->active_zone_mask = NULL; // revert to implicit / legacy behavior
 	}
+	// XR_EXT_display_zones: never leave a dangling frame-wish reference.
+	if (c->frame_wish == mask) {
+		c->frame_wish = NULL;
+	}
 	vk_destroy_rt(c, &mask->staged, &mask->staged_mem, &mask->staged_view, NULL);
 	vk_destroy_rt(c, &mask->tex, &mask->tex_mem, &mask->tex_view, &mask->fb);
 	free(mask);
+}
+
+void
+comp_vk_native_compositor_zones_set_frame_wish(struct xrt_compositor *xc, void *mask)
+{
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+
+	// Per-frame reference (XR_EXT_display_zones): oxr sets this on every
+	// zones frame before layer_commit, NULL meaning auto-derive. Consumed
+	// by the commit's composite; harmlessly stale on zero-zone frames (the
+	// zones branch never reads it there).
+	c->frame_wish = (struct comp_vk_native_zone_mask *)mask;
 }
 
 // #439 Phase 3 Q4 — current recommended per-view render size (the renderer's

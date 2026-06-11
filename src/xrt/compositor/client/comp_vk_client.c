@@ -741,6 +741,32 @@ client_vk_compositor_layer_local_2d(struct xrt_compositor *xc,
 }
 
 static xrt_result_t
+client_vk_compositor_layer_zone_3d(struct xrt_compositor *xc,
+                                   struct xrt_device *xdev,
+                                   struct xrt_swapchain *xsc[XRT_MAX_VIEWS],
+                                   const struct xrt_layer_data *data)
+{
+	struct xrt_compositor *xcn;
+	struct xrt_swapchain *xscn[XRT_MAX_VIEWS];
+
+	assert(data->type == XRT_LAYER_ZONE_3D);
+
+	xcn = to_native_compositor(xc);
+
+	// Guard the native slot like the state tracker does — the IPC-mode
+	// native is the ipc client compositor whose own stub handles the drop.
+	if (xcn->layer_zone_3d == NULL) {
+		return XRT_SUCCESS;
+	}
+
+	for (uint32_t i = 0; i < data->view_count; ++i) {
+		xscn[i] = &client_vk_swapchain(xsc[i])->xscn->base;
+	}
+
+	return xrt_comp_layer_zone_3d(xcn, xdev, xscn, data);
+}
+
+static xrt_result_t
 client_vk_compositor_layer_passthrough(struct xrt_compositor *xc,
                                        struct xrt_device *xdev,
                                        const struct xrt_layer_data *data)
@@ -1001,6 +1027,7 @@ client_vk_compositor_create(struct xrt_compositor_native *xcn,
 	c->base.base.layer_equirect2 = client_vk_compositor_layer_equirect2;
 	c->base.base.layer_window_space = client_vk_compositor_layer_window_space;
 	c->base.base.layer_local_2d = client_vk_compositor_layer_local_2d;
+	c->base.base.layer_zone_3d = client_vk_compositor_layer_zone_3d;
 	c->base.base.layer_passthrough = client_vk_compositor_layer_passthrough;
 	c->base.base.layer_commit = client_vk_compositor_layer_commit;
 	c->base.base.destroy = client_vk_compositor_destroy;
