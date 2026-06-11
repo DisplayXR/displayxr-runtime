@@ -636,6 +636,19 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 
 	assert(mc->state.session_active);
 	if (mc->state.session_active) {
+		// Deactivate the session FIRST, under the lock the render thread holds
+		// in transfer_layers_locked: on Android use_android_surface keeps
+		// has_session_render() true even after the handle clears below, so the
+		// lazy re-init gate keys on session_active — flipping it only after
+		// the teardown left a window where the render thread rebuilt the very
+		// target we are tearing down, racing vkCreateAndroidSurfaceKHR against
+		// the old swapchain's BufferQueue connection (#528,
+		// VK_ERROR_NATIVE_WINDOW_IN_USE_KHR storm).
+		os_mutex_lock(&mc->msc->list_and_timing_lock);
+		mc->state.session_active = false;
+		os_mutex_unlock(&mc->msc->list_and_timing_lock);
+		multi_system_compositor_update_session_status(mc->msc, false);
+
 		// Clean up per-session render resources
 		if (mc->session_render.initialized) {
 			// Save handle for logging before we NULL it
@@ -724,9 +737,6 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 		mc->session_render.owns_window = false;
 #endif
 		mc->session_render.window_close_exit_sent = false;
-
-		multi_system_compositor_update_session_status(mc->msc, false);
-		mc->state.session_active = false;
 	}
 
 	return XRT_SUCCESS;
