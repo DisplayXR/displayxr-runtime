@@ -1997,6 +1997,21 @@ multi_compositor_request_display_mode(struct multi_compositor *mc, bool enable_3
 	return false;
 }
 
+void
+multi_compositor_set_eye_tracking_mode(struct multi_compositor *mc, uint32_t mode)
+{
+	if (mc == NULL || !mc->session_render.initialized) {
+		return;
+	}
+
+	// Policy counterpart to multi_compositor_request_display_mode: tell the
+	// out-of-process DP whether the vendor (MANAGED) or the app (MANUAL) owns
+	// the tracking-loss lifecycle. No-op for DPs that don't react to the slot.
+	if (mc->session_render.display_processor != NULL) {
+		xrt_display_processor_set_eye_tracking_mode(mc->session_render.display_processor, mode);
+	}
+}
+
 xrt_result_t
 multi_compositor_create(struct multi_system_compositor *msc,
                         const struct xrt_session_info *xsi,

@@ -1359,7 +1359,19 @@ oxr_xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeEXT mode)
 		                 "Eye tracking mode %d not supported by this system", (int)mode);
 	}
 
+	// Store the session preference unconditionally (spec: it stays latent until
+	// honored — XrViewEyeTrackingStateEXT.activeMode keeps reporting it).
 	sess->eye_tracking_mode = (uint32_t)mode;
+
+	// Push the selection to the display processor, but only when this session
+	// has authority to drive global vendor policy: in single-app out-of-process
+	// (no workspace controller) the lone app owns it; under a workspace only the
+	// active controller does. Mirrors the #518 display-mode authority gate.
+	bool workspace_gated =
+	    sess->sys->inst->workspace_controller_active && !sess->is_active_workspace_controller;
+	if (!workspace_gated) {
+		oxr_session_set_eye_tracking_mode(sess, (uint32_t)mode);
+	}
 	return XR_SUCCESS;
 }
 

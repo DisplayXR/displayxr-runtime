@@ -396,6 +396,35 @@ struct xrt_display_processor
 	                          uint32_t width,
 	                          uint32_t height);
 
+	/*!
+	 * Select the eye-tracking control mode this DP should enact
+	 * (MANAGED vs MANUAL — see @ref docs/specs/vendor/eye-tracking-modes.md).
+	 * This is the *policy* counterpart to @ref request_display_mode (an
+	 * imperative 2D/3D hardware command): it tells the vendor whether to own
+	 * the tracking-loss lifecycle on its side.
+	 *
+	 *   - mode 0 (MANAGED): the vendor SDK runs the grace period + collapse
+	 *     animation + auto 2D⇄3D switch on tracking loss/recovery; the app is
+	 *     passive and reads filtered positions + `isTracking`.
+	 *   - mode 1 (MANUAL): the vendor stands down (no animation, no auto-switch,
+	 *     reports `isTracking` immediately); the app drives 2D⇄3D itself via
+	 *     @ref request_display_mode / xrRequestDisplayRenderingModeEXT.
+	 *
+	 * The runtime only ever passes a mode the DP's plug-in advertised in
+	 * `xrt_plugin_display_info.supported_eye_tracking_modes`, and pushes the
+	 * advertised default once at session start. The runtime carries no
+	 * MANAGED/MANUAL assumption — a DP that supports only one mode (or none)
+	 * simply leaves this slot NULL or ignores the unsupported value.
+	 *
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL means the
+	 * DP doesn't react to mode selection. Appended at the end per ADR-020
+	 * (append-only within a major; no version bump — gated by @ref XRT_DP_HAS_SLOT).
+	 *
+	 * @param xdp   Pointer to self.
+	 * @param mode  0 = MANAGED, 1 = MANUAL.
+	 */
+	void (*set_eye_tracking_mode)(struct xrt_display_processor *xdp, uint32_t mode);
+
 	/*! @} */
 };
 
@@ -470,7 +499,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_handoff_color_capab
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_atlas_encoding)            == XRT_DP_BASE_OFF + 15 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_target_color_view)        == XRT_DP_BASE_OFF + 16 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_background_2d)             == XRT_DP_BASE_OFF + 17 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor)                                 == XRT_DP_BASE_OFF + 18 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_eye_tracking_mode)         == XRT_DP_BASE_OFF + 18 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor)                                 == XRT_DP_BASE_OFF + 19 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -776,6 +806,23 @@ xrt_display_processor_set_background_2d(struct xrt_display_processor *xdp,
 		return;
 	}
 	xdp->set_background_2d(xdp, background_view, width, height);
+}
+
+/*!
+ * @copydoc xrt_display_processor::set_eye_tracking_mode
+ *
+ * No-op when the DP doesn't expose the slot (older plug-in) or leaves it NULL —
+ * the DP then doesn't react to the app's MANAGED/MANUAL selection.
+ *
+ * @public @memberof xrt_display_processor
+ */
+static inline void
+xrt_display_processor_set_eye_tracking_mode(struct xrt_display_processor *xdp, uint32_t mode)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, set_eye_tracking_mode) || xdp->set_eye_tracking_mode == NULL) {
+		return;
+	}
+	xdp->set_eye_tracking_mode(xdp, mode);
 }
 
 /*!

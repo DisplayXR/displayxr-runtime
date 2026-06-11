@@ -3615,6 +3615,17 @@ comp_vk_native_compositor_request_display_mode(struct xrt_compositor *xc, bool e
 }
 
 void
+comp_vk_native_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t mode)
+{
+	if (xc == NULL) return;
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+
+	if (c->display_processor != NULL) {
+		xrt_display_processor_set_eye_tracking_mode(c->display_processor, mode);
+	}
+}
+
+void
 comp_vk_native_compositor_set_system_devices(struct xrt_compositor *xc,
                                               struct xrt_system_devices *xsysd)
 {

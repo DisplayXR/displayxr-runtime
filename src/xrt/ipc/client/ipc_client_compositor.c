@@ -218,6 +218,28 @@ comp_ipc_client_compositor_get_window_metrics(struct xrt_compositor *xc, struct 
 }
 
 /*
+ * Push the session's eye-tracking control mode (MANAGED=0 / MANUAL=1) to the
+ * out-of-process display processor (#522). Same gating contract as
+ * comp_ipc_client_compositor_get_window_metrics: only call when `xc` is an
+ * ipc_client_compositor (the OpenXR state tracker gates on is_service_mode &&
+ * !is_*_native_compositor). Best-effort — no-op on IPC failure.
+ */
+void
+comp_ipc_client_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t mode)
+{
+	if (xc == NULL) {
+		return;
+	}
+
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return;
+	}
+
+	(void)ipc_call_compositor_set_eye_tracking_mode(icc->ipc_c, mode);
+}
+
+/*
  * Full DP eye-position struct incl. is_tracking, over IPC (#441 Phase 2).
  * Same gating contract as comp_ipc_client_compositor_get_window_metrics:
  * only safe to call when `xc` is an ipc_client_compositor (the OpenXR state
