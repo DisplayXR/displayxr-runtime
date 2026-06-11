@@ -333,9 +333,25 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
+// Transparent window background — ON BY DEFAULT for this app: zones
+// alpha-composite against the DESKTOP by design (translucent zone
+// backgrounds, content-alpha edge fades, transparent unzoned regions), so
+// the window uses WS_EX_NOREDIRECTIONBITMAP + a null brush so DComp can
+// show the desktop through (mirrors cube_handle's DISPLAYXR_TRANSPARENT_BG
+// plumbing, default-flipped). Set DISPLAYXR_TRANSPARENT_BG=0 to opt out
+// (opaque black floor).
+static bool TransparentBackgroundEnabled() {
+    static const bool enabled = []() {
+        const char* v = getenv("DISPLAYXR_TRANSPARENT_BG");
+        return v == nullptr || *v == '\0' || *v != '0';
+    }();
+    return enabled;
+}
+
 // Create the application window
 static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
-    LOG_INFO("Creating application window (%dx%d)", width, height);
+    const bool transparent = TransparentBackgroundEnabled();
+    LOG_INFO("Creating application window (%dx%d, transparent=%d)", width, height, transparent);
 
     WNDCLASSEX wc = {};
     wc.cbSize = sizeof(WNDCLASSEX);
@@ -343,7 +359,9 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    // Null brush in transparent mode so the redirection bitmap doesn't
+    // paint an opaque floor under the DComp visual.
+    wc.hbrBackground = transparent ? nullptr : (HBRUSH)GetStockObject(BLACK_BRUSH);
     wc.lpszClassName = WINDOW_CLASS;
 
     if (!RegisterClassEx(&wc)) {
@@ -358,7 +376,7 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
 
     HWND hwnd = CreateWindowEx(
-        0,
+        transparent ? WS_EX_NOREDIRECTIONBITMAP : 0,
         WINDOW_CLASS,
         WINDOW_TITLE,
         WS_OVERLAPPEDWINDOW,
@@ -697,7 +715,20 @@ static ID3D11BlendState* g_fadeBlend = nullptr;
 static ID3D11DepthStencilState* g_fadeDepthOff = nullptr;
 static ID3D11RasterizerState* g_fadeRaster = nullptr;
 static bool g_fadeInitTried = false;
-static const float kZoneEdgeFadePx = 16.0f;
+// Content-alpha edge fade width. DXR_ZONES_FADE_PX overrides (validation
+// runs use exaggerated widths to make the composite math obvious in
+// captures); 0 disables the fade pass.
+static float ZoneEdgeFadePx() {
+    static const float px = []() {
+        const char* v = getenv("DXR_ZONES_FADE_PX");
+        if (v != nullptr && *v != '\0') {
+            float f = (float)atof(v);
+            if (f >= 0.0f && f <= 256.0f) return f;
+        }
+        return 16.0f;
+    }();
+    return px;
+}
 
 static const char* kFadeShaderSrc = R"(
 cbuffer FadeCB : register(b0) { float2 tile_px; float feather_px; float pad; };
@@ -773,7 +804,7 @@ static bool EnsureEdgeFadePass(D3D11Renderer& renderer) {
     rd.DepthClipEnable = TRUE;
     if (FAILED(renderer.device->CreateRasterizerState(&rd, &g_fadeRaster))) return false;
 
-    LOG_INFO("[zones] content-alpha edge fade pass ready (%.0f px)", kZoneEdgeFadePx);
+    LOG_INFO("[zones] content-alpha edge fade pass ready (%.0f px)", ZoneEdgeFadePx());
     return true;
 }
 
@@ -781,11 +812,12 @@ static bool EnsureEdgeFadePass(D3D11Renderer& renderer) {
 // be the tile; rtv bound without depth).
 static void DrawZoneEdgeFade(D3D11Renderer& renderer, ID3D11RenderTargetView* rtv,
                              uint32_t tileW, uint32_t tileH) {
+    if (ZoneEdgeFadePx() <= 0.0f) return; // DXR_ZONES_FADE_PX=0 disables
     if (!EnsureEdgeFadePass(renderer)) return;
 
     D3D11_MAPPED_SUBRESOURCE mapped;
     if (SUCCEEDED(renderer.context->Map(g_fadeCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-        float cb[4] = {(float)tileW, (float)tileH, kZoneEdgeFadePx, 0.0f};
+        float cb[4] = {(float)tileW, (float)tileH, ZoneEdgeFadePx(), 0.0f};
         memcpy(mapped.pData, cb, sizeof(cb));
         renderer.context->Unmap(g_fadeCB, 0);
     }
@@ -1094,6 +1126,10 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
     // "faded to black". (No DISPLAYXR_TRANSPARENT_BG gate here: desktop
     // show-through is the point of this demo, as it will be for the avatar.)
     static XrEnvironmentBlendMode zonesBlendMode = []() {
+        if (!TransparentBackgroundEnabled()) {
+            LOG_INFO("[zones] DISPLAYXR_TRANSPARENT_BG=0 — submitting OPAQUE (black window floor)");
+            return XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        }
         XrEnvironmentBlendMode modes[8];
         uint32_t count = 0;
         if (g_xr != nullptr &&

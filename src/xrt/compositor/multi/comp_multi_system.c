@@ -140,6 +140,43 @@ do_projection_layer_depth(struct xrt_compositor *xc,
 	xrt_comp_layer_projection_depth(xc, xdev, xsc, d_xsc, data);
 }
 
+static void
+do_zone_3d_layer(struct xrt_compositor *xc, struct multi_compositor *mc, struct multi_layer_entry *layer, uint32_t i)
+{
+	// XR_EXT_display_zones P5: the target compositor may not consume zone
+	// layers (e.g. the null compositor) — drop with a one-shot WARN,
+	// never an error (layers are advisory compositing).
+	if (xc->layer_zone_3d == NULL) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			U_LOG_W("Zone-3D layers are not consumed by the target compositor — "
+			        "dropping (one-time warning)");
+		}
+		return;
+	}
+
+	struct xrt_device *xdev = layer->xdev;
+
+	// Cast away
+	struct xrt_layer_data *data = (struct xrt_layer_data *)&layer->data;
+
+	// Do not need to copy the reference, but should verify the pointers for consistency
+	for (uint32_t j = 0; j < data->view_count; j++) {
+		if (layer->xscs[j] == NULL) {
+			U_LOG_E("Invalid swap chain for zone-3D layer #%u!", i);
+			return;
+		}
+	}
+
+	if (xdev == NULL) {
+		U_LOG_E("Invalid xdev for zone-3D layer #%u!", i);
+		return;
+	}
+
+	xrt_comp_layer_zone_3d(xc, xdev, layer->xscs, data);
+}
+
 static bool
 do_single(struct xrt_compositor *xc,
           struct multi_compositor *mc,
@@ -2829,6 +2866,7 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 			case XRT_LAYER_CYLINDER: do_cylinder_layer(xc, mc, layer, i); break;
 			case XRT_LAYER_EQUIRECT1: do_equirect1_layer(xc, mc, layer, i); break;
 			case XRT_LAYER_EQUIRECT2: do_equirect2_layer(xc, mc, layer, i); break;
+			case XRT_LAYER_ZONE_3D: do_zone_3d_layer(xc, mc, layer, i); break;
 			default: U_LOG_E("Unhandled layer type '%i'!", layer->data.type); break;
 			}
 		}

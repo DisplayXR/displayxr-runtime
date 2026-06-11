@@ -1999,22 +1999,42 @@ oxr_session_locate_views(struct oxr_logger *log,
 	bool ipc_rig_done = false;
 #ifdef OXR_HAVE_EXT_view_rig
 	const bool ipc_service_mode = sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode;
+	// XR_EXT_display_zones P5: a zone-chained locate must also ride the
+	// server call — the client-side Kooima block (where the in-process
+	// zone rebase lives) never runs on IPC sessions, so the zone rect can
+	// only be applied where the window metrics are resolved: server-side.
+#ifdef OXR_HAVE_EXT_display_zones
+	const bool zone_chained = zone != NULL;
+#else
+	const bool zone_chained = false;
+#endif
 	const bool rig_route_native =
-	    (rig_active || view_raw != NULL) && !sess->is_bridge_relay && sess->xcn != NULL;
+	    (rig_active || view_raw != NULL || zone_chained) && !sess->is_bridge_relay && sess->xcn != NULL;
 	const bool rig_route_bridge = view_raw != NULL && sess->is_bridge_relay;
 	if ((rig_route_native || rig_route_bridge) && ipc_service_mode) {
+		struct ipc_view_rig_info rig_info = {0};
 #ifdef OXR_HAVE_EXT_display_zones
-		// Zone-scoped locate over IPC is not implemented (rides P5):
-		// the SERVER computes views from the session canvas, so the
-		// chained zone rect is silently not applied. One-shot WARN.
-		if (zone != NULL && !sess->display_zones.warned_ipc_locate) {
-			sess->display_zones.warned_ipc_locate = true;
-			U_LOG_W("Zone-scoped locate over IPC not implemented — "
-			        "session canvas used instead of zone %u rect (one-time warning)",
-			        zone->zoneId);
+		// Zone-scoped locate over IPC (P5): forward the zone rect; the
+		// server rebases its resolved window metrics with
+		// u_canvas_apply_to_metrics (ipc_try_get_sr_view_poses),
+		// mirroring the in-process zone block above. The raw channel
+		// (XrViewDisplayRawEXT.canvasRectPx) then reports the zone rect
+		// for free — it reads the rewritten metrics. Bridge relays stay
+		// inert — the server's headless fast path returns before window
+		// resolution, matching the rig-descriptor policy.
+		//
+		// @todo P5 tail: the wish-mask cross-process transport does NOT
+		// ride this call (roadmap-sanctioned slip) — service-mode wish
+		// stays on the tier-1 global fallback until the service
+		// compositor consumes zone layers.
+		if (zone != NULL && rig_route_native) {
+			rig_info.zone_valid = 1;
+			rig_info.zone_x_px = zone->rect.offset.x;
+			rig_info.zone_y_px = zone->rect.offset.y;
+			rig_info.zone_w_px = zone->rect.extent.width;
+			rig_info.zone_h_px = zone->rect.extent.height;
 		}
 #endif
-		struct ipc_view_rig_info rig_info = {0};
 		// Bridge relays keep rig_type NONE (descriptors inert); only native
 		// routes carry the chained rig overrides. In workspace mode the app's
 		// own rig is honored by default (app visual policy within its canvas);

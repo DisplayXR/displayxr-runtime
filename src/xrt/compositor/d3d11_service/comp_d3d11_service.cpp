@@ -3915,6 +3915,40 @@ compositor_layer_local_2d(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
+/*!
+ * Zone-3D layer (XR_EXT_display_zones P5, ADR-027). The IPC transport now
+ * delivers zone layers here (client serialization + _update_zone_3d_layer),
+ * but this compositor cannot yet consume them honestly: its projection path
+ * is a single-layer full-tile blit / zero-copy pipeline into the per-client
+ * atlas slot (cross-process KeyedMutex/fence sync, DP pass-through) — it has
+ * no alpha-over compositing of N placed layers, no transparent-slot
+ * semantics, and no auto-wish derivation, all of which a zones frame
+ * requires (see comp_d3d11_renderer's XRT_LAYER_ZONE_3D case for the
+ * in-process model). Rendering the zone's projection views full-tile would
+ * silently ignore the placement rect, so drop with a one-time WARN instead;
+ * never an error (layers are advisory compositing).
+ *
+ * @todo XR_EXT_display_zones P5 tail: zones_frame detection + transparent
+ *       slot clear + per-view scaled alpha-over blits at the zone rect +
+ *       auto-wish derivation for service-mode clients (the wish stays on
+ *       the tier-1 global fallback until then).
+ */
+static xrt_result_t
+compositor_layer_zone_3d(struct xrt_compositor *xc,
+                         struct xrt_device *xdev,
+                         struct xrt_swapchain *xsc[XRT_MAX_VIEWS],
+                         const struct xrt_layer_data *data)
+{
+	static bool warned = false;
+	if (!warned) {
+		warned = true;
+		U_LOG_W("Zone-3D layer reached the D3D11 service compositor (IPC transport ok) but is not "
+		        "consumed yet — dropping (one-time warning)");
+	}
+
+	return XRT_SUCCESS;
+}
+
 static xrt_result_t
 compositor_layer_passthrough(struct xrt_compositor *xc,
                               struct xrt_device *xdev,
@@ -10393,6 +10427,7 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	c->base.base.layer_equirect2 = compositor_layer_equirect2;
 	c->base.base.layer_window_space = compositor_layer_window_space;
 	c->base.base.layer_local_2d = compositor_layer_local_2d;
+	c->base.base.layer_zone_3d = compositor_layer_zone_3d;
 	c->base.base.layer_passthrough = compositor_layer_passthrough;
 	c->base.base.layer_commit = compositor_layer_commit;
 	c->base.base.layer_commit_with_semaphore = compositor_layer_commit_with_semaphore;
