@@ -191,6 +191,8 @@ AAssetManager *g_asset_manager = nullptr;
 // XR_EXT_display_info entry points (resolved after the session exists).
 PFN_xrEnumerateDisplayRenderingModesEXT g_pfnEnumModes = nullptr;
 PFN_xrRequestDisplayRenderingModeEXT g_pfnRequestMode = nullptr;
+// #522 test hook: select MANAGED/MANUAL via `setprop debug.dxr.eyemode N`.
+PFN_xrRequestEyeTrackingModeEXT g_pfnRequestEyeMode = nullptr;
 
 // Single tiled-atlas swapchain shared by all views. Each view writes into its
 // tile via a viewport/scissor offset inside one render pass; xrEndFrame submits
@@ -789,6 +791,8 @@ query_display_info_and_modes()
 		                      reinterpret_cast<PFN_xrVoidFunction *>(&g_pfnEnumModes));
 		xrGetInstanceProcAddr(g_instance, "xrRequestDisplayRenderingModeEXT",
 		                      reinterpret_cast<PFN_xrVoidFunction *>(&g_pfnRequestMode));
+		xrGetInstanceProcAddr(g_instance, "xrRequestEyeTrackingModeEXT",
+		                      reinterpret_cast<PFN_xrVoidFunction *>(&g_pfnRequestEyeMode));
 	}
 
 	// Enumerate rendering modes (view counts, tile layouts, scales). The
@@ -2208,6 +2212,19 @@ render_frame()
 		if (want >= 0 && want != last_prop_mode) {
 			last_prop_mode = want;
 			request_mode((uint32_t)want);
+		}
+	}
+
+	// #522 test hook: eye-tracking mode via adb:
+	//   `setprop debug.dxr.eyemode 0` → MANAGED (vendor auto-2D on tracking loss)
+	//   `setprop debug.dxr.eyemode 1` → MANUAL  (app owns 2D⇄3D; immediate isTracking)
+	{
+		static int last_eyemode = -1;
+		int want = (int)get_prop_float("debug.dxr.eyemode", -1.0f);
+		if (want >= 0 && want != last_eyemode && g_pfnRequestEyeMode != nullptr) {
+			last_eyemode = want;
+			XrResult r = g_pfnRequestEyeMode(g_session, (XrEyeTrackingModeEXT)want);
+			log_xr_result("xrRequestEyeTrackingModeEXT", r);
 		}
 	}
 
