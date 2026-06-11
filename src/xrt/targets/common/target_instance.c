@@ -208,10 +208,13 @@ t_instance_create_system(struct xrt_instance *xinst,
 	if (use_null) {
 		// Refresh rate sourcing: previously queried via leia_edid + SR SDK
 		// when the in-proc Leia fallback was linked. Post-#263 the SR
-		// path lives entirely in the plug-in DLL; the null compositor
-		// uses the default refresh rate. Add an entry to
-		// xrt_plugin_display_info if this becomes load-bearing.
-		float sr_refresh_rate_hz = 0.0f;
+		// path lives entirely in the plug-in DLL. INTERIM: pass a real rate
+		// instead of 0 (which the null compositor maps to a 20 FPS default —
+		// that placeholder was capping xrWaitFrame to 20 Hz on Android, far
+		// below the panel's 60-144 Hz and the ~10 ms/frame app workload).
+		// TODO: source the true panel refresh from xrt_plugin_display_info
+		// (the monitor-descriptor refresh_mhz path is not yet plumbed there).
+		float sr_refresh_rate_hz = 90.0f;
 		xret = null_compositor_create_system_with_dims(head, 0, 0,
 		                                               sr_refresh_rate_hz, &xsysc);
 	}
