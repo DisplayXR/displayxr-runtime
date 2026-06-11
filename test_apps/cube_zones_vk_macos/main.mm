@@ -5,19 +5,23 @@
  * @brief  Cube Zones VK — XR_EXT_display_zones exerciser (ADR-027), macOS VK leg
  *
  * Port of cube_zones_d3d11_win / cube_zones_metal_macos onto the
- * cube_handle_vk_macos scaffold, with one deliberate simplification: zones
- * are SOLID CLEARS (vkCmdClearColorImage), not 3D scenes. The point of this
- * app is validating the COMPOSITOR-side zones path on the VK native
- * compositor — placement per view tile, the draw-based alpha-over overlap
- * composite, the AUTO/Tier-2 wish, the zone-scoped locate — and exact flat
- * colors make every one of those checks pixel-predictable:
+ * cube_handle_vk_macos scaffold. Each zone renders the full cube + grid
+ * scene into its own swapchain (per-zone rig framing, spin phase, and
+ * premultiplied background clear); the flat background regions keep the
+ * compositor-side checks pixel-predictable:
  *
- *  - Zone A (zoneId=1, left)  : identity rig, OPAQUE dark-red clear
- *    (0.15, 0.03, 0.03, 1).
- *  - Zone B (zoneId=2, right) : ipdFactor 0.6 + perspectiveFactor 0.5 rig,
- *    SEMI-TRANSPARENT dark-blue clear (premultiplied 0.0165, 0.0165,
- *    0.0825, 0.55) — overlap oracle: B + A*(1-0.55) per channel.
+ *  - Zone A (zoneId=1, left)  : identity rig, spin phase 0, OPAQUE
+ *    dark-red clear (0.15, 0.03, 0.03, 1).
+ *  - Zone B (zoneId=2, right) : ipdFactor 0.6 + perspectiveFactor 0.5 rig
+ *    (visibly different framing), spin phase +1.5 rad, SEMI-TRANSPARENT
+ *    dark-blue clear (premultiplied 0.0165, 0.0165, 0.0825, 0.55) —
+ *    overlap oracle in background regions: B + A*(1-0.55) per channel.
  *  - Local2D strip (top 25%)  : solid amber clear, always on.
+ *
+ * No content-alpha edge fade here (the D3D11/Metal apps have one): this
+ * app's shaders are embedded pre-compiled SPIR-V arrays, so adding a fade
+ * pipeline isn't a two-liner — zone edges are hard. The fade recipe is
+ * Metal/D3D11-validated.
  *
  * Keys / env: M = wish mode (AUTO / explicit Tier-2 rects), O = zone B
  * overlap toggle; DXR_ZONES_WISH_MODE=1 / DXR_ZONES_OVERLAP=1 preselect
@@ -99,6 +103,7 @@ struct DisplayZone {
     XrRect2Di rect = {};            //!< client-window (backing) pixels; locate AND submit use this one variable
     float ipdFactor = 1.0f;
     float perspectiveFactor = 1.0f;
+    float spinPhase = 0.0f;         //!< added to the shared cube rotation for this zone
     float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f}; //!< premultiplied RGBA
     XrSwapchain swapchain = XR_NULL_HANDLE;
     uint32_t tileW = 0;
@@ -107,6 +112,8 @@ struct DisplayZone {
     std::vector<VkImage> images;
 };
 static DisplayZone g_zonesArr[kNumZones];
+// Per-zone framebuffer sets (declared after the renderer structs they need —
+// see g_zoneFbs below the VkRenderer definition).
 
 static XrRect2Di g_zoneARect, g_zoneBRect, g_zoneBOverlapRect, g_stripRect;
 static bool g_zoneBOverlap = false;
@@ -753,6 +760,10 @@ struct VkRenderer {
     bool texturesLoaded = false;
 };
 
+//! XR_EXT_display_zones: per-zone framebuffer sets over the zone swapchains
+//! (the zones render the same cube + grid scene as the main path).
+static SwapchainFramebuffers g_zoneFbs[kNumZones];
+
 // ============================================================================
 // Texture path helper
 // ============================================================================
@@ -1025,11 +1036,10 @@ static bool CreateTextureFromFile(VkDevice device, VkPhysicalDevice physDevice,
 // Store physDevice globally for depth image creation
 static VkPhysicalDevice g_physDevice = VK_NULL_HANDLE;
 
-static bool CreateSwapchainFramebuffers(VkRenderer& renderer,
+static bool CreateFramebuffersInto(VkRenderer& renderer, SwapchainFramebuffers& fb,
     VkImage* images, uint32_t imageCount,
     uint32_t width, uint32_t height, VkFormat colorFormat)
 {
-    auto& fb = renderer.swapchainFBs;
     fb.width = width;
     fb.height = height;
     fb.colorViews.resize(imageCount);
@@ -1076,6 +1086,30 @@ static bool CreateSwapchainFramebuffers(VkRenderer& renderer,
             return false;
     }
     return true;
+}
+
+static bool CreateSwapchainFramebuffers(VkRenderer& renderer,
+    VkImage* images, uint32_t imageCount,
+    uint32_t width, uint32_t height, VkFormat colorFormat)
+{
+    return CreateFramebuffersInto(renderer, renderer.swapchainFBs, images, imageCount,
+                                  width, height, colorFormat);
+}
+
+static void DestroyFramebuffers(VkDevice device, SwapchainFramebuffers& fb)
+{
+    for (auto f : fb.framebuffers) {
+        if (f != VK_NULL_HANDLE) vkDestroyFramebuffer(device, f, nullptr);
+    }
+    for (auto v : fb.colorViews) {
+        if (v != VK_NULL_HANDLE) vkDestroyImageView(device, v, nullptr);
+    }
+    for (auto v : fb.depthViews) {
+        if (v != VK_NULL_HANDLE) vkDestroyImageView(device, v, nullptr);
+    }
+    if (fb.depthImage != VK_NULL_HANDLE) vkDestroyImage(device, fb.depthImage, nullptr);
+    if (fb.depthMemory != VK_NULL_HANDLE) vkFreeMemory(device, fb.depthMemory, nullptr);
+    fb = SwapchainFramebuffers{};
 }
 
 static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysicalDevice physDevice,
@@ -1501,14 +1535,18 @@ struct EyeRenderParams {
     float projMat[16];
 };
 
-static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
-    const EyeRenderParams* eyes, int eyeCount)
+// Generalized scene render: cube + grid into any framebuffer set with an
+// explicit clear color and a per-call rotation offset (XR_EXT_display_zones:
+// each zone renders into its own swapchain with its own spin phase and
+// premultiplied background).
+static void RenderSceneToFramebuffer(VkRenderer& renderer, SwapchainFramebuffers& fb,
+    uint32_t imageIndex, const EyeRenderParams* eyes, int eyeCount,
+    const float clearColor[4], float rotationOffset)
 {
     VkDevice device = renderer.device;
     vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
     vkResetFences(device, 1, &renderer.frameFence);
 
-    auto& fb = renderer.swapchainFBs;
     VkCommandBuffer cmd = renderer.commandBuffer;
     vkResetCommandBuffer(cmd, 0);
 
@@ -1517,16 +1555,8 @@ static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &beginInfo);
 
-    // Transparent-background mode (DISPLAYXR_TRANSPARENT_BG=1) clears RGBA(0,0,0,0)
-    // so the desktop shows through everywhere the cube isn't drawn. Pairs with
-    // XrCocoaWindowBindingCreateInfoEXT.transparentBackgroundEnabled = XR_TRUE.
-    static const bool transparent_bg = []() {
-        const char *e = getenv("DISPLAYXR_TRANSPARENT_BG");
-        return e != nullptr && *e != '\0' && *e != '0';
-    }();
     VkClearValue clearValues[2] = {};
-    clearValues[0].color = transparent_bg ? VkClearColorValue{{0.0f, 0.0f, 0.0f, 0.0f}}
-                                          : VkClearColorValue{{0.05f, 0.05f, 0.1f, 1.0f}};
+    clearValues[0].color = VkClearColorValue{{clearColor[0], clearColor[1], clearColor[2], clearColor[3]}};
     clearValues[1].depthStencil = {1.0f, 0};
 
     VkRenderPassBeginInfo rpBegin = {};
@@ -1572,7 +1602,7 @@ static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
             const float cubeSize = 0.06f;
             const float cubeHeight = cubeSize / 2.0f;
             float rot[16], scl[16], trans[16], model[16], tmp[16];
-            mat4_rotation_y(rot, renderer.cubeRotation);
+            mat4_rotation_y(rot, renderer.cubeRotation + rotationOffset);
             mat4_scale(scl, cubeSize, cubeSize, cubeSize);
             mat4_translation(trans, 0, cubeHeight, 0);
             mat4_multiply(tmp, scl, rot);
@@ -1604,6 +1634,22 @@ static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cmd;
     vkQueueSubmit(renderer.graphicsQueue, 1, &submitInfo, renderer.frameFence);
+}
+
+static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
+    const EyeRenderParams* eyes, int eyeCount)
+{
+    // Transparent-background mode (DISPLAYXR_TRANSPARENT_BG, default ON for
+    // this zones app) clears RGBA(0,0,0,0) so the desktop shows through
+    // everywhere the cube isn't drawn.
+    static const bool transparent_bg = []() {
+        const char *e = getenv("DISPLAYXR_TRANSPARENT_BG");
+        return e == nullptr || *e != '0';
+    }();
+    const float clearTransparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const float clearOpaque[4] = {0.05f, 0.05f, 0.1f, 1.0f};
+    RenderSceneToFramebuffer(renderer, renderer.swapchainFBs, imageIndex, eyes, eyeCount,
+                             transparent_bg ? clearTransparent : clearOpaque, 0.0f);
 }
 
 static void CleanupVkRenderer(VkRenderer& renderer) {
@@ -2894,8 +2940,10 @@ static void ClearImageToColor(VkDevice device, VkCommandPool pool, VkQueue queue
 }
 
 // Create one zone's swapchain, sized per xrGetDisplayZoneRecommendedViewSizeEXT,
-// horizontally tiled per view, and enumerate its VK images.
-static bool CreateZoneResources(AppXrSession& xr, DisplayZone& z, uint32_t viewCount)
+// horizontally tiled per view; enumerate its VK images and build the zone's
+// framebuffer set (the zone renders the cube + grid scene).
+static bool CreateZoneResources(AppXrSession& xr, VkRenderer& renderer, uint32_t zoneIndex,
+                                DisplayZone& z, uint32_t viewCount)
 {
     XrExtent2Di rec = {};
     XrResult r = g_pfnGetZoneViewSize(xr.session, &z.rect, &rec);
@@ -2934,6 +2982,12 @@ static bool CreateZoneResources(AppXrSession& xr, DisplayZone& z, uint32_t viewC
     z.images.resize(n);
     for (uint32_t i = 0; i < n; i++) {
         z.images[i] = imgs[i].image;
+    }
+
+    if (!CreateFramebuffersInto(renderer, g_zoneFbs[zoneIndex], z.images.data(), n,
+                                z.tileW * z.tileCount, z.tileH, (VkFormat)xr.swapchain.format)) {
+        LOG_ERROR("[zones] zone %u: framebuffer creation failed", z.zoneId);
+        return false;
     }
 
     LOG_INFO("[zones] zone %u: rect %d,%d %dx%d -> swapchain %ux%u (%u tiles of %ux%u)",
@@ -3051,7 +3105,8 @@ static void HandleZoneKeys(AppXrSession& xr)
 }
 
 // One-time zones activation: capabilities check + per-zone swapchains + strip.
-static void TryActivateZones(AppXrSession& xr, VkDevice device, VkCommandPool pool, VkQueue queue)
+static void TryActivateZones(AppXrSession& xr, VkRenderer& renderer,
+                             VkDevice device, VkCommandPool pool, VkQueue queue)
 {
     const int32_t W = (int32_t)g_windowW;
     const int32_t H = (int32_t)g_windowH;
@@ -3089,11 +3144,13 @@ static void TryActivateZones(AppXrSession& xr, VkDevice device, VkCommandPool po
     if (viewCount > 8) viewCount = 8;
 
     // Zone A: opaque dark red. Zone B: SEMI-TRANSPARENT dark blue
-    // (premultiplied, alpha 0.55) — overlap oracle: B + A*(1-0.55).
+    // (premultiplied, alpha 0.55) — overlap oracle (background regions):
+    // B + A*(1-0.55).
     g_zonesArr[0].zoneId = 1;
     g_zonesArr[0].rect = g_zoneARect;
     g_zonesArr[0].ipdFactor = 1.0f;
     g_zonesArr[0].perspectiveFactor = 1.0f;
+    g_zonesArr[0].spinPhase = 0.0f;
     g_zonesArr[0].clearColor[0] = 0.15f;
     g_zonesArr[0].clearColor[1] = 0.03f;
     g_zonesArr[0].clearColor[2] = 0.03f;
@@ -3103,13 +3160,14 @@ static void TryActivateZones(AppXrSession& xr, VkDevice device, VkCommandPool po
     g_zonesArr[1].rect = g_zoneBOverlap ? g_zoneBOverlapRect : g_zoneBRect;
     g_zonesArr[1].ipdFactor = 0.6f;
     g_zonesArr[1].perspectiveFactor = 0.5f;
+    g_zonesArr[1].spinPhase = 1.5f;
     g_zonesArr[1].clearColor[0] = 0.03f * 0.55f;
     g_zonesArr[1].clearColor[1] = 0.03f * 0.55f;
     g_zonesArr[1].clearColor[2] = 0.15f * 0.55f;
     g_zonesArr[1].clearColor[3] = 0.55f;
 
     for (uint32_t zi = 0; zi < kNumZones; zi++) {
-        if (!CreateZoneResources(xr, g_zonesArr[zi], viewCount)) {
+        if (!CreateZoneResources(xr, renderer, zi, g_zonesArr[zi], viewCount)) {
             g_hasDisplayZonesExt = false;
             return;
         }
@@ -3133,10 +3191,10 @@ static void TryActivateZones(AppXrSession& xr, VkDevice device, VkCommandPool po
              viewCount, g_wishMode, WishModeName(g_wishMode), ZonesValidateEnabled() ? 1 : 0);
 }
 
-// Per-frame zones path: zone-scoped locate, per-zone solid clear, submit
+// Per-frame zones path: zone-scoped locate, per-zone cube + grid render
+// (per-zone clear color, rig framing, and spin phase), submit
 // [projA, projB, strip] with the zone structs chained on the projections.
-static void RenderZonesFrame(AppXrSession& xr, VkDevice device, VkCommandPool pool, VkQueue queue,
-                             const XrFrameState& frameState)
+static void RenderZonesFrame(AppXrSession& xr, VkRenderer& renderer, const XrFrameState& frameState)
 {
     XrDisplayZoneEXT zoneStructs[kNumZones];
     XrDisplayRigEXT rigStructs[kNumZones];
@@ -3182,13 +3240,32 @@ static void RenderZonesFrame(AppXrSession& xr, VkDevice device, VkCommandPool po
         const uint32_t n = viewCountOutput < z.tileCount ? viewCountOutput : z.tileCount;
         submitViewCounts[zi] = n;
         projViews[zi].assign(n, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+
+        // Render-ready views -> matrices. ZDP-anchored clip: near = ez - vH,
+        // far = ez + 1000*vH (identity rig here, so ez = pose z). Same
+        // recipe as the base app's rig-consume path: GL-convention fov
+        // matrix remapped to Vulkan's [0,1] clip.
+        std::vector<EyeRenderParams> eyes(n);
         for (uint32_t vi = 0; vi < n; vi++) {
+            const XrView& v = zoneViews[vi];
+            const float ez = RigLocalEyeZ(rigStructs[zi].pose, v.pose.position);
+            const float vH = kZoneVirtualDisplayHeight;
+            const float nearZ = (ez - vH > 0.001f) ? (ez - vH) : 0.001f;
+            const float farZ = ez + 1000.0f * vH;
+            mat4_view_from_xr_pose(eyes[vi].viewMat, v.pose);
+            mat4_from_xr_fov(eyes[vi].projMat, v.fov, nearZ, farZ);
+            convert_projection_gl_to_zero_to_one(eyes[vi].projMat);
+            eyes[vi].viewportX = vi * z.tileW;
+            eyes[vi].viewportY = 0;
+            eyes[vi].width = z.tileW;
+            eyes[vi].height = z.tileH;
+
             projViews[zi][vi].subImage.swapchain = z.swapchain;
             projViews[zi][vi].subImage.imageRect.offset = {(int32_t)(vi * z.tileW), 0};
             projViews[zi][vi].subImage.imageRect.extent = {(int32_t)z.tileW, (int32_t)z.tileH};
             projViews[zi][vi].subImage.imageArrayIndex = 0;
-            projViews[zi][vi].pose = zoneViews[vi].pose;
-            projViews[zi][vi].fov = zoneViews[vi].fov;
+            projViews[zi][vi].pose = v.pose;
+            projViews[zi][vi].fov = v.fov;
         }
 
         XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
@@ -3201,7 +3278,8 @@ static void RenderZonesFrame(AppXrSession& xr, VkDevice device, VkCommandPool po
         wi.timeout = XR_INFINITE_DURATION;
         xrWaitSwapchainImage(z.swapchain, &wi);
 
-        ClearImageToColor(device, pool, queue, z.images[imageIndex], z.clearColor);
+        RenderSceneToFramebuffer(renderer, g_zoneFbs[zi], imageIndex, eyes.data(), (int)n,
+                                 z.clearColor, z.spinPhase);
 
         XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         xrReleaseSwapchainImage(z.swapchain, &ri);
@@ -3546,12 +3624,12 @@ int main() {
                 g_zonesFrameCounter++;
                 if (g_hasDisplayZonesExt && !g_zonesActive && !g_zonesAttempted &&
                     g_zonesFrameCounter >= kZonesActivationFrame) {
-                    TryActivateZones(xr, vkDevice, vkRenderer.commandPool, graphicsQueue);
+                    TryActivateZones(xr, vkRenderer, vkDevice, vkRenderer.commandPool, graphicsQueue);
                 }
                 if (g_zonesActive && g_hasDisplayZonesExt) {
                     HandleZoneKeys(xr);
                     if (frameState.shouldRender) {
-                        RenderZonesFrame(xr, vkDevice, vkRenderer.commandPool, graphicsQueue, frameState);
+                        RenderZonesFrame(xr, vkRenderer, frameState);
 
                         // DXR_ZONES_CAPTURE=<path-prefix>: one-shot atlas capture
                         // (PROJECTION_ONLY = post zones pass) for headless
@@ -3980,6 +4058,12 @@ int main() {
     }
     if (g_zoneMask != XR_NULL_HANDLE && g_pfnDestroyZoneMask != nullptr) {
         g_pfnDestroyZoneMask(g_zoneMask);
+    }
+    // Zone framebuffer sets hold views onto the zone swapchain images —
+    // destroy them BEFORE the swapchains release those images.
+    vkDeviceWaitIdle(vkDevice);
+    for (uint32_t zi = 0; zi < kNumZones; zi++) {
+        DestroyFramebuffers(vkDevice, g_zoneFbs[zi]);
     }
     for (uint32_t zi = 0; zi < kNumZones; zi++) {
         if (g_zonesArr[zi].swapchain != XR_NULL_HANDLE) {
