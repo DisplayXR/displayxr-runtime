@@ -14,6 +14,7 @@
 #include "util/u_pretty_print.h"
 #include "util/u_visibility_mask.h"
 #include "util/u_trace_marker.h"
+#include "util/u_canvas.h" // XR_EXT_display_zones P5: zone-scoped locate rebase
 
 #include "server/ipc_server.h"
 #include "ipc_server_generated.h"
@@ -337,6 +338,37 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		if (!have_wm && !headless_client) {
 			have_wm = comp_d3d11_service_get_window_metrics(s->xsysc, &wm) &&
 			          wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f;
+		}
+
+		// XR_EXT_display_zones P5 — zone-scoped locate over IPC: rebase
+		// the resolved window metrics to the client's forwarded zone rect,
+		// exactly like the in-process oxr_session.c zone block. The rect
+		// IS the canvas: everything below (Kooima meters, eye offsets,
+		// the raw canvas rect) then describes the zone with zero further
+		// changes. Read from the wire `rig` BEFORE the workspace-override
+		// substitution below — the zone is the app's framing request and
+		// is honored regardless of who owns the rig.
+		//
+		// Workspace caveat (v1, ADR-027): for a workspace client the
+		// metrics describe a VIRTUAL window whose meters aren't tied to
+		// the display pixel pitch, so the rebase below is approximate
+		// there — zones under a workspace are deferred anyway (the
+		// service compositor doesn't consume zone layers yet).
+		if (have_wm && rig != NULL && rig->zone_valid != 0) {
+			struct u_canvas_rect zone_canvas = {
+			    .valid = true,
+			    .x = rig->zone_x_px,
+			    .y = rig->zone_y_px,
+			    .w = (uint32_t)rig->zone_w_px,
+			    .h = (uint32_t)rig->zone_h_px,
+			};
+			u_canvas_apply_to_metrics(&wm, &zone_canvas);
+			static bool zone_locate_logged = false;
+			if (!zone_locate_logged) {
+				zone_locate_logged = true;
+				IPC_WARN(s, "ZONES IPC: first zone-scoped locate, rect=(%d,%d %dx%d) px",
+				         rig->zone_x_px, rig->zone_y_px, rig->zone_w_px, rig->zone_h_px);
+			}
 		}
 
 		if (have_wm) {
@@ -827,6 +859,11 @@ ipc_try_get_android_view_poses(volatile struct ipc_client_state *ics,
 			screen_height_m = tmp;
 		}
 	}
+	//! @todo XR_EXT_display_zones P5: rig->zone_* is not applied on this
+	//! display-centric Android path yet — it lacks the window-relative
+	//! metric baseline (display_pixel_* / display_*_m in wm) that
+	//! u_canvas_apply_to_metrics needs. Zone-scoped locates fall back to
+	//! the full-display canvas here.
 
 	// Eyes: DP-tracked if available (Leia/M2 plugs in here unchanged), else the
 	// nominal viewer + a default IPD. head_eyes is the head's actual L/R pair
@@ -2504,6 +2541,56 @@ _update_local_2d_layer(struct xrt_compositor *xc,
 }
 
 static bool
+_update_zone_3d_layer(struct xrt_compositor *xc,
+                      volatile struct ipc_client_state *ics,
+                      volatile struct ipc_layer_entry *layer,
+                      uint32_t i)
+{
+	// Zone-3D layers (XR_EXT_display_zones P5) are silently skipped if
+	// the compositor doesn't implement them — the consumers own their
+	// one-shot drop WARNs (matches the local_2d precedent).
+	if (xc->layer_zone_3d == NULL) {
+		return true;
+	}
+
+	uint32_t device_id = layer->xdev_id;
+	struct xrt_device *xdev = NULL;
+	GET_XDEV_OR_RETURN(ics, device_id, xdev);
+
+	if (xdev == NULL) {
+		U_LOG_E("Invalid xdev for zone-3D layer #%u!", i);
+		return false;
+	}
+
+	// Cast away volatile.
+	struct xrt_layer_data *data = (struct xrt_layer_data *)&layer->data;
+
+	// Multi-swapchain lookup, projection-style: one id per view. Use the
+	// layer's own view_count (the app's submitted views), like the
+	// projection-depth path — zone tiles are not tied to the device's
+	// view config.
+	uint32_t view_count = data->view_count;
+	if (view_count > XRT_MAX_VIEWS) {
+		U_LOG_E("Invalid view count %u for zone-3D layer #%u!", view_count, i);
+		return false;
+	}
+
+	struct xrt_swapchain *xcs[XRT_MAX_VIEWS];
+	for (uint32_t k = 0; k < view_count; k++) {
+		const uint32_t xsci = layer->swapchain_ids[k];
+		xcs[k] = ics->xscs[xsci];
+		if (xcs[k] == NULL) {
+			U_LOG_E("Invalid swap chain for zone-3D layer #%u!", i);
+			return false;
+		}
+	}
+
+	xrt_comp_layer_zone_3d(xc, xdev, xcs, data);
+
+	return true;
+}
+
+static bool
 _update_layers(volatile struct ipc_client_state *ics, struct xrt_compositor *xc, struct ipc_layer_slot *slot)
 {
 	IPC_TRACE_MARKER();
@@ -2563,8 +2650,9 @@ _update_layers(volatile struct ipc_client_state *ics, struct xrt_compositor *xc,
 			}
 			break;
 		case XRT_LAYER_ZONE_3D:
-			// Clients never send these yet (IPC transport is P5 of
-			// XR_EXT_display_zones); skip rather than error.
+			if (!_update_zone_3d_layer(xc, ics, layer, i)) {
+				return false;
+			}
 			break;
 		default: U_LOG_E("Unhandled layer type '%i'!", layer->data.type); break;
 		}

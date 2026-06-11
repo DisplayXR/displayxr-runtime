@@ -763,6 +763,22 @@ struct ipc_view_rig_info
 	//! active mode) forwards it here so the server collapses to a centered eye in
 	//! 2D. 0 = unknown → server falls back to the located view_count.
 	uint32_t render_view_count;
+
+	/*
+	 * XR_EXT_display_zones P5 (ADR-027) — append-only past this point.
+	 */
+
+	//! Zone-scoped locate (XR_EXT_display_zones P5): nonzero when the
+	//! client's locate chained an XrDisplayZoneEXT. The server rebases its
+	//! resolved window metrics to the zone rect (u_canvas_apply_to_metrics)
+	//! exactly like the in-process oxr_session.c zone block, so the Kooima
+	//! meters, eye offsets, and the raw canvas rect all describe the zone.
+	//! Zero on legacy / non-zone locates — byte-identical behavior.
+	uint32_t zone_valid;
+	int32_t zone_x_px; //!< Zone rect left, client-window pixels (y-down)
+	int32_t zone_y_px; //!< Zone rect top, client-window pixels (y-down)
+	int32_t zone_w_px; //!< Zone rect width in pixels
+	int32_t zone_h_px; //!< Zone rect height in pixels
 };
 
 /*!

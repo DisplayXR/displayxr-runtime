@@ -2340,7 +2340,6 @@ struct oxr_session
 		uint32_t located_count;
 		uint32_t located_next_slot;
 		bool warned_bad_locate_rect;
-		bool warned_ipc_locate;
 		bool warned_no_compositor_consumer;
 		bool warned_depth_ignored;
 		bool warned_validate_unlocated;

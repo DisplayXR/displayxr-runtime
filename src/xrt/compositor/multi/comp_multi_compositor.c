@@ -1123,11 +1123,10 @@ multi_compositor_layer_local_2d(struct xrt_compositor *xc,
 }
 
 /*!
- * 3D display zone layer (XR_EXT_display_zones, ADR-027). The service/multi-
- * compositor consumer is out of scope until the IPC transport lands (P5),
- * so drop with a one-time WARN; never an error. Deliberately NOT enqueued
- * into progress — the comp_multi_system transfer switch would log an
- * unhandled-type error.
+ * 3D display zone layer (XR_EXT_display_zones P5, ADR-027). Enqueued into
+ * the progress slot projection-style (one swapchain reference per view);
+ * comp_multi_system's transfer switch hands it to the target compositor,
+ * which drops with its own one-shot WARN if it has no zone consumer.
  */
 static xrt_result_t
 multi_compositor_layer_zone_3d(struct xrt_compositor *xc,
@@ -1135,11 +1134,14 @@ multi_compositor_layer_zone_3d(struct xrt_compositor *xc,
                                struct xrt_swapchain *xsc[XRT_MAX_VIEWS],
                                const struct xrt_layer_data *data)
 {
-	static bool warned = false;
-	if (!warned) {
-		warned = true;
-		U_LOG_W("Zone-3D layers are not consumed on the IPC/service path yet — dropping (one-time warning)");
+	struct multi_compositor *mc = multi_compositor(xc);
+
+	size_t index = mc->progress.layer_count++;
+	mc->progress.layers[index].xdev = xdev;
+	for (uint32_t i = 0; i < data->view_count; ++i) {
+		xrt_swapchain_reference(&mc->progress.layers[index].xscs[i], xsc[i]);
 	}
+	mc->progress.layers[index].data = *data;
 
 	return XRT_SUCCESS;
 }

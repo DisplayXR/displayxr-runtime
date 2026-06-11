@@ -1774,13 +1774,10 @@ ipc_compositor_layer_local_2d(struct xrt_compositor *xc,
 }
 
 /*!
- * Zone-3D layers carry view_count swapchains (like projection), which the
- * generic single-swapchain handle_layer() cannot serialize. The IPC
- * transport rides the vendor-plugin phase (P5) — until then drop with a
- * one-time WARN, never an error.
- *
- * @todo P5: serialize multi-swapchain ids projection-style and consume in
- *       the service multi-compositor.
+ * Zone-3D layers (XR_EXT_display_zones P5) carry view_count swapchains —
+ * serialized projection-style: one swapchain id per view; the rest of the
+ * layer (per-view proj data + zone rect + zone id) rides the xrt_layer_data
+ * union verbatim in the shared-memory slot.
  */
 static xrt_result_t
 ipc_compositor_layer_zone_3d(struct xrt_compositor *xc,
@@ -1788,11 +1785,21 @@ ipc_compositor_layer_zone_3d(struct xrt_compositor *xc,
                              struct xrt_swapchain *xsc[XRT_MAX_VIEWS],
                              const struct xrt_layer_data *data)
 {
-	static bool warned = false;
-	if (!warned) {
-		warned = true;
-		U_LOG_W("Zone-3D layers are not transported over IPC yet — dropping (one-time warning)");
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+
+	assert(data->type == XRT_LAYER_ZONE_3D);
+
+	struct ipc_shared_memory *ism = icc->ipc_c->ism;
+	struct ipc_layer_slot *slot = &ism->slots[icc->layers.slot_id];
+	struct ipc_layer_entry *layer = &slot->layers[icc->layers.layer_count];
+	layer->xdev_id = 0; //! @todo Real id.
+	layer->data = *data;
+	for (uint32_t i = 0; i < data->view_count; ++i) {
+		struct ipc_client_swapchain *ics = ipc_client_swapchain(xsc[i]);
+		layer->swapchain_ids[i] = ics->id;
 	}
+	// Increment the number of layers.
+	icc->layers.layer_count++;
 
 	return XRT_SUCCESS;
 }
