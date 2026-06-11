@@ -132,17 +132,22 @@ comp_window_android_init_swapchain(struct comp_target *ct, uint32_t width, uint3
 	// Out-of-process: poll for the surface the app pushed across IPC
 	// (Client.java blockingConnect → passAppSurface → android_globals). It is
 	// normally already present by the time the session reaches this point.
+	// Use the versioned window state so the per-acquire surface sync (#528)
+	// and this init agree on the generation the surface was built from.
 	struct ANativeWindow *window = NULL;
+	uint64_t generation = 0;
+	bool valid = false;
 	for (int i = 0; i < 100; i++) {
-		window = (struct ANativeWindow *)android_globals_get_window();
-		if (window != NULL) {
+		android_globals_get_window_state((struct _ANativeWindow **)&window, &generation, &valid);
+		if (valid && window != NULL) {
 			break;
 		}
+		window = NULL;
 		os_nanosleep(20 * U_TIME_1MS_IN_NS);
 	}
 
 	if (window == NULL) {
-		U_LOG_E("comp_window_android: no ANativeWindow available from android_globals");
+		U_LOG_E("comp_window_android: no live ANativeWindow available from android_globals");
 		return false;
 	}
 
@@ -152,7 +157,15 @@ comp_window_android_init_swapchain(struct comp_target *ct, uint32_t width, uint3
 		return false;
 	}
 
-	U_LOG_W("comp_window_android: VkSurfaceKHR created from ANativeWindow %p", (void *)window);
+	// Seed the surface-lifecycle tracking (#528): take ownership of the
+	// published window ref, released when the sync tears the target down.
+	cwa->base.android_surface.window = (struct _ANativeWindow *)window;
+	cwa->base.android_surface.generation = generation;
+	cwa->base.android_surface.lost = false;
+	cwa->base.android_surface.recreate_requested = false;
+
+	U_LOG_W("comp_window_android: VkSurfaceKHR created from ANativeWindow %p (gen %llu)", (void *)window,
+	        (unsigned long long)generation);
 	return true;
 }
 
