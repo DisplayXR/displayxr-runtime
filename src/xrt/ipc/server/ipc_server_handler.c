@@ -944,6 +944,20 @@ ipc_try_get_android_view_poses(volatile struct ipc_client_state *ics,
 		}
 	}
 
+	// #533: when the active mode is 2D, oxr's locate path treats the view as mono
+	// (active_view_count==1) and sets XrView.pose to the CENTROID of
+	// view_eye_world[0..nc) / nc (nc = DP eye count, typically 2). But here we
+	// already collapsed to the cyclopean and filled only eye_world[0..eye_count);
+	// for a 2D collapse (eye_count==1) the surplus stays 0, so oxr averages
+	// (cyclopean + 0)/2 → HALF the eye distance → the asset renders ~2x zoomed.
+	// Duplicate the collapsed eye into the surplus entries so the centroid equals
+	// it. (out_fovs/out_poses are duplicated separately by fill_surplus_view_poses.)
+	if (rig_reply != NULL && eye_count > 0) {
+		for (uint32_t i = eye_count; i < XRT_MAX_VIEWS; i++) {
+			rig_reply->eye_world[i] = rig_reply->eye_world[eye_count - 1];
+		}
+	}
+
 	// XR_EXT_view_rig raw channel: the head's actual display-space eyes (the
 	// face-dot the app HUD reads), plus the display plane + canvas. Reported
 	// independent of the 2D render collapse above.
