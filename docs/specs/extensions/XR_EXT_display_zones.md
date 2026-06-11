@@ -3,16 +3,16 @@
 | Property | Value |
 |----------|-------|
 | Extension Name | `XR_EXT_display_zones` |
-| Spec Version | 1 (**design sketch — header not yet authored**) |
+| Spec Version | 1 |
 | Type Values | `1000999150–1000999153` |
 | Author | Leia Inc. |
 | Platform | All (extension-app classes only) |
 | Requires | `XR_EXT_local_3d_zone` (≥ v3), `XR_EXT_view_rig` (≥ v2) |
 
-> **Status:** header-level design sketch per
-> [ADR-027](../../adr/ADR-027-display-zones.md). The real header under
-> `src/external/openxr_includes/openxr/` is authored when implementation
-> starts (Phase 1 of `docs/roadmap/display-zones.md`).
+> **Status:** implemented (runtime phases P1–P4 of
+> `docs/roadmap/display-zones.md`); design per
+> [ADR-027](../../adr/ADR-027-display-zones.md). Canonical header:
+> `src/external/openxr_includes/openxr/XR_EXT_display_zones.h`.
 
 ---
 
