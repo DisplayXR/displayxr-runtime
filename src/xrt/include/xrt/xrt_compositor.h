@@ -84,7 +84,8 @@ enum xrt_layer_type
 	XRT_LAYER_EQUIRECT2,
 	XRT_LAYER_PASSTHROUGH,
 	XRT_LAYER_WINDOW_SPACE,
-	XRT_LAYER_LOCAL_2D
+	XRT_LAYER_LOCAL_2D,
+	XRT_LAYER_ZONE_3D
 };
 
 /*!
@@ -422,6 +423,25 @@ struct xrt_layer_local_2d_data
 };
 
 /*!
+ * All the pure data values associated with a 3D display zone layer
+ * (XR_EXT_display_zones, ADR-027).
+ *
+ * A zone-chained projection layer: per-view fov/pose/sub exactly as
+ * @ref xrt_layer_projection_data (view_count in the parent struct), plus the
+ * zone placement rect in client-window pixels (the same coordinate space as
+ * @ref xrt_layer_local_2d_data::rect). The compositor scaled-blits zone z's
+ * view-v tile into the window-spanning atlas view-v tile at @p rect,
+ * alpha-over in layer-list order.
+ */
+struct xrt_layer_zone_3d_data
+{
+	struct xrt_layer_projection_data proj;
+
+	struct xrt_rect rect; //!< Zone placement, client-window pixels
+	uint32_t zone_id;     //!< App-chosen; unique among this frame's zones
+};
+
+/*!
  * All the pure data values associated with a composition layer.
  *
  * The @ref xrt_swapchain references and @ref xrt_device are provided outside of
@@ -507,6 +527,7 @@ struct xrt_layer_data
 		struct xrt_layer_passthrough_data passthrough;
 		struct xrt_layer_window_space_data window_space;
 		struct xrt_layer_local_2d_data local_2d;
+		struct xrt_layer_zone_3d_data zone_3d;
 	};
 	uint32_t view_count;
 };
@@ -1468,6 +1489,27 @@ struct xrt_compositor
 	                               const struct xrt_layer_data *data);
 
 	/*!
+	 * Adds a 3D display zone layer for submission (XR_EXT_display_zones,
+	 * ADR-027). A projection layer bound to a client-window pixel rect:
+	 * the compositor scaled-blits each view tile into the window-spanning
+	 * atlas at the zone rect, alpha-over in layer-list order.
+	 *
+	 * May be NULL on compositors that don't consume zone layers yet —
+	 * callers must guard (matches the layer_local_2d precedent).
+	 *
+	 * @param xc          Self pointer
+	 * @param xdev        The device the layer is relative to.
+	 * @param xsc         Array of swapchain objects containing view RGB data.
+	 * @param data        All of the pure data bits (not pointers/handles),
+	 *                    including what parts of the supplied swapchain
+	 *                    objects to use for each view.
+	 */
+	xrt_result_t (*layer_zone_3d)(struct xrt_compositor *xc,
+	                              struct xrt_device *xdev,
+	                              struct xrt_swapchain *xsc[XRT_MAX_VIEWS],
+	                              const struct xrt_layer_data *data);
+
+	/*!
 	 * @brief Commits all of the submitted layers.
 	 *
 	 * Only after this call will the compositor actually use the layers.
@@ -1973,6 +2015,23 @@ xrt_comp_layer_local_2d(struct xrt_compositor *xc,
                         const struct xrt_layer_data *data)
 {
 	return xc->layer_local_2d(xc, xdev, xsc, data);
+}
+
+/*!
+ * @copydoc xrt_compositor::layer_zone_3d
+ *
+ * Helper for calling through the function pointer. The slot may be NULL on
+ * compositors without zone support — check before calling.
+ *
+ * @public @memberof xrt_compositor
+ */
+static inline xrt_result_t
+xrt_comp_layer_zone_3d(struct xrt_compositor *xc,
+                       struct xrt_device *xdev,
+                       struct xrt_swapchain *xsc[XRT_MAX_VIEWS],
+                       const struct xrt_layer_data *data)
+{
+	return xc->layer_zone_3d(xc, xdev, xsc, data);
 }
 
 /*!

@@ -38,6 +38,7 @@
 #include "util/u_time.h"
 #include "util/u_visibility_mask.h"
 #include "util/u_verify.h"
+#include "util/u_canvas.h" // XR_EXT_display_zones zone-scoped locate
 
 #include "math/m_api.h"
 #include "math/m_mathinclude.h"
@@ -1504,6 +1505,48 @@ oxr_session_locate_views(struct oxr_logger *log,
 		}
 	}
 #endif
+
+	// XR_EXT_display_zones (ADR-027): a zone-scoped locate chains an
+	// XrDisplayZoneEXT on XrViewLocateInfo — the zone rect IS the canvas
+	// for this locate's Kooima framing (applied to the window metrics
+	// below; the view_rig raw channel then reports the zone rect for
+	// free). A locate that chains nothing keeps today's behavior exactly.
+#ifdef OXR_HAVE_EXT_display_zones
+	const XrDisplayZoneEXT *zone = NULL;
+	if (sess->sys->inst->extensions.EXT_display_zones) {
+		zone = OXR_GET_INPUT_FROM_CHAIN(viewLocateInfo, XR_TYPE_DISPLAY_ZONE_EXT, XrDisplayZoneEXT);
+		if (zone != NULL && (zone->rect.extent.width <= 0 || zone->rect.extent.height <= 0)) {
+			// Clamp-don't-reject (view_rig policy): treat as absent.
+			if (!sess->display_zones.warned_bad_locate_rect) {
+				sess->display_zones.warned_bad_locate_rect = true;
+				U_LOG_W("Zone-scoped locate: zone %u has non-positive rect extent %dx%d — "
+				        "ignoring the zone chain (one-time warning)",
+				        zone->zoneId, zone->rect.extent.width, zone->rect.extent.height);
+			}
+			zone = NULL;
+		}
+		if (zone != NULL) {
+			// Record for VALIDATE_BIT locate<->submit cross-checks
+			// (approximate ring bookkeeping; one-shot WARNs only).
+			uint32_t zi = 0;
+			for (; zi < sess->display_zones.located_count; zi++) {
+				if (sess->display_zones.located[zi].id == zone->zoneId) {
+					break;
+				}
+			}
+			if (zi == sess->display_zones.located_count) {
+				if (sess->display_zones.located_count < OXR_DISPLAY_ZONES_MAX_ZONES_3D) {
+					sess->display_zones.located_count++;
+				} else {
+					zi = sess->display_zones.located_next_slot++ %
+					     OXR_DISPLAY_ZONES_MAX_ZONES_3D;
+				}
+			}
+			sess->display_zones.located[zi].id = zone->zoneId;
+			sess->display_zones.located[zi].rect = zone->rect;
+		}
+	}
+#endif
 	const bool rig_active = rig_camera || rig_display;
 
 	// Query eye tracking (vendor-neutral — returns false if no backend available).
@@ -1661,6 +1704,29 @@ oxr_session_locate_views(struct oxr_logger *log,
 
 			struct xrt_window_metrics wm = {0};
 			bool have_wm = oxr_session_get_window_metrics(sess, &wm);
+
+#ifdef OXR_HAVE_EXT_display_zones
+			// Zone-scoped locate: rebase the window metrics to the
+			// zone rect — the rect IS the canvas. Everything below
+			// (Kooima meters, eye offsets, the raw channel) then
+			// describes the zone with zero further changes.
+			//
+			// @todo P2: for _texture sessions get_window_metrics has
+			// already applied the session output rect, so the zone
+			// composes relative to that rect rather than the client
+			// window; zones frames ignore the output rect at the
+			// compositor in P2 (ADR-027 rule 2).
+			if (zone != NULL && have_wm && wm.valid) {
+				struct u_canvas_rect zone_canvas = {
+				    .valid = true,
+				    .x = zone->rect.offset.x,
+				    .y = zone->rect.offset.y,
+				    .w = (uint32_t)zone->rect.extent.width,
+				    .h = (uint32_t)zone->rect.extent.height,
+				};
+				u_canvas_apply_to_metrics(&wm, &zone_canvas);
+			}
+#endif
 
 			if (have_wm && wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f) {
 				// Window-relative Kooima: use actual window dims as screen,
@@ -1921,6 +1987,17 @@ oxr_session_locate_views(struct oxr_logger *log,
 	    (rig_active || view_raw != NULL) && !sess->is_bridge_relay && sess->xcn != NULL;
 	const bool rig_route_bridge = view_raw != NULL && sess->is_bridge_relay;
 	if ((rig_route_native || rig_route_bridge) && ipc_service_mode) {
+#ifdef OXR_HAVE_EXT_display_zones
+		// Zone-scoped locate over IPC is not implemented (rides P5):
+		// the SERVER computes views from the session canvas, so the
+		// chained zone rect is silently not applied. One-shot WARN.
+		if (zone != NULL && !sess->display_zones.warned_ipc_locate) {
+			sess->display_zones.warned_ipc_locate = true;
+			U_LOG_W("Zone-scoped locate over IPC not implemented — "
+			        "session canvas used instead of zone %u rect (one-time warning)",
+			        zone->zoneId);
+		}
+#endif
 		struct ipc_view_rig_info rig_info = {0};
 		// Bridge relays keep rig_type NONE (descriptors inert); only native
 		// routes carry the chained rig overrides. In workspace mode the app's

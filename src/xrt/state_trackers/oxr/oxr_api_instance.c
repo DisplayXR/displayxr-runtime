@@ -48,6 +48,12 @@ static volatile uintptr_t g_live_instance = 0;
 
 DEBUG_GET_ONCE_BOOL_OPTION(ignore_openxr_version, "OXR_IGNORE_OPENXR_VERSION", false)
 
+#ifdef OXR_HAVE_EXT_display_zones
+// P1/P2 development gate: XR_EXT_display_zones is advertised + enableable
+// only when DISPLAYXR_ZONES=1. Dropped when P3 flips the extension on.
+DEBUG_GET_ONCE_BOOL_OPTION(display_zones, "DISPLAYXR_ZONES", false)
+#endif
+
 #define MAKE_EXTENSION_PROPERTIES(mixed_case, all_caps)                                                                \
 	{XR_TYPE_EXTENSION_PROPERTIES, NULL, XR_##all_caps##_EXTENSION_NAME, XR_##mixed_case##_SPEC_VERSION},
 static const XrExtensionProperties extension_properties[] = {
@@ -68,6 +74,23 @@ oxr_xrEnumerateInstanceExtensionProperties(const char *layerName,
 
 	struct oxr_logger log;
 	oxr_log_init(&log, "xrEnumerateInstanceExtensionProperties");
+
+#ifdef OXR_HAVE_EXT_display_zones
+	// Dev gate: hide XR_EXT_display_zones unless DISPLAYXR_ZONES=1 (P3
+	// removes this filter when the extension is flipped on).
+	if (!debug_get_bool_option_display_zones()) {
+		XrExtensionProperties filtered[ARRAY_SIZE(extension_properties)];
+		uint32_t filtered_count = 0;
+		for (uint32_t i = 0; i < ARRAY_SIZE(extension_properties); i++) {
+			if (strcmp(extension_properties[i].extensionName, XR_EXT_DISPLAY_ZONES_EXTENSION_NAME) == 0) {
+				continue;
+			}
+			filtered[filtered_count++] = extension_properties[i];
+		}
+		OXR_TWO_CALL_HELPER(&log, propertyCapacityInput, propertyCountOutput, properties, filtered_count,
+		                    filtered, XR_SUCCESS);
+	}
+#endif
 
 	OXR_TWO_CALL_HELPER(&log, propertyCapacityInput, propertyCountOutput, properties,
 	                    ARRAY_SIZE(extension_properties), extension_properties, XR_SUCCESS);
@@ -213,6 +236,16 @@ oxr_xrCreateInstance(const XrInstanceCreateInfo *createInfo, XrInstance *out_ins
 		                 "(createInfo->enabledExtensionNames[%d]) Unrecognized extension name '%s'", i,
 		                 createInfo->enabledExtensionNames[i]);
 	}
+
+#ifdef OXR_HAVE_EXT_display_zones
+	// Dev gate: without DISPLAYXR_ZONES=1 the extension is invisible AND
+	// un-enableable (matches the enumerate filter above; dropped in P3).
+	if (extensions.EXT_display_zones && !debug_get_bool_option_display_zones()) {
+		return oxr_error(&log, XR_ERROR_EXTENSION_NOT_PRESENT,
+		                 "(createInfo->enabledExtensionNames) Unrecognized extension name '%s'",
+		                 XR_EXT_DISPLAY_ZONES_EXTENSION_NAME);
+	}
+#endif
 
 	ret = oxr_verify_extensions(&log, &extensions);
 	if (ret != XR_SUCCESS) {

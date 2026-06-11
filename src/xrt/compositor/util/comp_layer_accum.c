@@ -140,3 +140,12 @@ comp_layer_accum_local_2d(struct comp_layer_accum *cla, struct xrt_swapchain *xs
 {
 	return push_single_swapchain_layer(cla, xsc, data);
 }
+
+xrt_result_t
+comp_layer_accum_zone_3d(struct comp_layer_accum *cla,
+                         struct xrt_swapchain *xsc[XRT_MAX_VIEWS],
+                         const struct xrt_layer_data *data)
+{
+	// Multi-swapchain accumulate, identical to projection.
+	return comp_layer_accum_projection(cla, xsc, data);
+}

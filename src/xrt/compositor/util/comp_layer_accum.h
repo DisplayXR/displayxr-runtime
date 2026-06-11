@@ -191,6 +191,18 @@ comp_layer_accum_local_2d(struct comp_layer_accum *cla, struct xrt_swapchain *xs
 
 
 /*!
+ * Accumulate swapchains and data for a 3D display zone layer for a frame
+ * (XR_EXT_display_zones, ADR-027). Multi-swapchain like projection.
+ *
+ * @public @memberof comp_layer_accum
+ */
+xrt_result_t
+comp_layer_accum_zone_3d(struct comp_layer_accum *cla,
+                         struct xrt_swapchain *xsc[XRT_MAX_VIEWS],
+                         const struct xrt_layer_data *data);
+
+
+/*!
  * Get a (color) swapchain associated with a layer.
  *
  * @param cla self

@@ -24,6 +24,7 @@ add_library(
 	oxr_capture.c
 	oxr_conformance.c
 	oxr_chain.h
+	oxr_display_zones.c
 	oxr_dpad.c
 	oxr_event.c
 	oxr_extension_support.h
