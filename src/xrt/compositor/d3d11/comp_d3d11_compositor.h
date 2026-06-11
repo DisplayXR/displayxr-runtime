@@ -208,6 +208,19 @@ comp_d3d11_compositor_zone_get_hw_caps(struct xrt_compositor *xc,
                                        uint32_t *out_grid_h);
 
 /*!
+ * XR_EXT_display_zones (ADR-027): set the frame's explicit wish for the next
+ * layer_commit — @p mask is the compositor-side mask state of the
+ * XrLocal3DZoneMaskEXT referenced via XrDisplayZonesFrameEndInfoEXT.wishMask
+ * (oxr_local_3d_zone_ext::comp_mask), or NULL to auto-derive the wish from
+ * the frame's zone rects. Called by oxr on every zones frame before
+ * xrt_comp_layer_commit; consumed by that commit. No-op outside zones frames.
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_compositor_zones_set_frame_wish(struct xrt_compositor *xc, void *mask);
+
+/*!
  * Current recommended per-view render size (client-window-derived when a
  * mask/Local2D is active, canvas-derived otherwise). Polled by oxr at frame
  * end to fire XrEventDataLocal3DZoneViewSizeChangedEXT on change (#439

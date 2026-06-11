@@ -243,6 +243,39 @@ struct comp_d3d11_compositor
 	//! clear-on-deactivate edge (mask destroyed / compositor teardown).
 	bool zone_published;
 
+	//! XR_EXT_display_zones (ADR-027): true when the current frame's
+	//! accumulator carries XRT_LAYER_ZONE_3D layers (a "zones frame"). In a
+	//! zones frame the canvas output rect, the sticky submitted mask, and
+	//! the implicit-mask-from-Local2D rule are all inert; the effective
+	//! canvas is the full client window; the wish (explicit frame wish or
+	//! the auto union-of-zone-rects raster) drives both the DP publish and
+	//! the post-weave visual lerp. Set once under c->mutex at the top of
+	//! layer_commit, beside local_2d_last_frame.
+	bool zones_frame;
+
+	//! Explicit per-frame wish (XrDisplayZonesFrameEndInfoEXT.wishMask),
+	//! handed in via comp_d3d11_compositor_zones_set_frame_wish before
+	//! layer_commit and consumed by that commit (cleared at its end).
+	//! NULL = auto-derive. Not owned — the mask handle owns the resources;
+	//! handle destroy clears any dangling reference via zone_mask_destroy.
+	struct comp_d3d11_zone_mask *frame_wish;
+	//! Publish dedup for the explicit frame wish: last pointer + last
+	//! author generation actually staged/published.
+	struct comp_d3d11_zone_mask *frame_wish_last;
+	uint64_t frame_wish_last_seq;
+
+	//! Auto-wish raster (union of the frame's zone rects + ring feather),
+	//! R8_UNORM — same RTV+staged pattern as the implicit mask. One staged
+	//! SRV serves BOTH consumers (visual lerp + DP publish), the ADR's
+	//! no-drift property.
+	ID3D11Texture2D *wish_mask_tex;
+	ID3D11RenderTargetView *wish_mask_rtv;
+	ID3D11Texture2D *wish_mask_staged;
+	ID3D11ShaderResourceView *wish_mask_staged_srv;
+	uint32_t wish_mask_w, wish_mask_h; //!< 0 = unallocated
+	struct xrt_rect wish_rects[XRT_MAX_LAYERS]; //!< dirty-check cache
+	uint32_t wish_rect_count;
+
 	//! Generic D3D11 display processor (vendor-agnostic weaving).
 	struct xrt_display_processor_d3d11 *display_processor;
 
@@ -380,6 +413,11 @@ d3d11_release_zone_state(struct comp_d3d11_compositor *c);
 // other zone helpers near the bottom.
 static void
 d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c);
+// XR_EXT_display_zones (ADR-027): resolve the zones frame's wish source —
+// stage the explicit frame wish, or (re)rasterize the auto wish from the
+// frame's zone rects. Defined with the other zone helpers near the bottom.
+static void
+d3d11_update_zone_wish_state(struct comp_d3d11_compositor *c);
 
 // #439 Phase 2: an active zone mask supersedes the canvas output rect —
 // the weave region, view dims, Kooima metrics, and composite region all
@@ -397,7 +435,10 @@ d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c);
 static struct u_canvas_rect
 d3d11_effective_canvas(struct comp_d3d11_compositor *c)
 {
-	if (c->active_zone_mask == nullptr && !c->local_2d_last_frame) {
+	// XR_EXT_display_zones: a zones frame spans the full client window by
+	// definition (each zone rect is its own canvas; the output rect is
+	// inert) — same supersede geometry as the mask/Local2D rules below.
+	if (!c->zones_frame && c->active_zone_mask == nullptr && !c->local_2d_last_frame) {
 		return c->canvas;
 	}
 	struct u_canvas_rect win = {};
@@ -820,6 +861,26 @@ d3d11_compositor_layer_local_2d(struct xrt_compositor *xc,
 	std::lock_guard<std::mutex> lock(c->mutex);
 
 	comp_layer_accum_local_2d(&c->layer_accum, xsc, data);
+
+	return XRT_SUCCESS;
+}
+
+/*!
+ * 3D display zone layer (XR_EXT_display_zones, ADR-027) — multi-swapchain
+ * accumulate like projection; consumed by the zones-frame branch of
+ * layer_commit (sub-tile viewport scaled-blit into the window-spanning atlas).
+ */
+static xrt_result_t
+d3d11_compositor_layer_zone_3d(struct xrt_compositor *xc,
+                               struct xrt_device *xdev,
+                               struct xrt_swapchain *xsc[XRT_MAX_VIEWS],
+                               const struct xrt_layer_data *data)
+{
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+
+	std::lock_guard<std::mutex> lock(c->mutex);
+
+	comp_layer_accum_zone_3d(&c->layer_accum, xsc, data);
 
 	return XRT_SUCCESS;
 }
@@ -1470,13 +1531,19 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// c->mutex (held here) so d3d11_effective_canvas below and the composite
 	// downstream see one coherent decision for the frame.
 	bool have_local_2d = false;
+	bool zones_frame = false;
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
 			have_local_2d = true;
-			break;
+		} else if (c->layer_accum.layers[i].data.type == XRT_LAYER_ZONE_3D) {
+			zones_frame = true;
 		}
 	}
 	c->local_2d_last_frame = have_local_2d;
+	// XR_EXT_display_zones (ADR-027): one coherent per-frame decision —
+	// effective canvas, the wish raster/publish, and the visual composite
+	// all read this under the same c->mutex hold.
+	c->zones_frame = zones_frame;
 
 	// #439 Phase 2: the one canvas authority for this frame. While a zone
 	// mask is active this is the client-window rect (the mask supersedes
@@ -1486,10 +1553,19 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// race the frame.
 	const struct u_canvas_rect eff_canvas = d3d11_effective_canvas(c);
 
+	// XR_EXT_display_zones: resolve the frame's wish source BEFORE the DP
+	// sideband sync and the post-weave lerp — both consume the same staged
+	// SRV (the ADR's no-drift property).
+	if (c->zones_frame) {
+		d3d11_update_zone_wish_state(c);
+	}
+
 	// #224 hardware-DP zone leg: sideband-publish the active mask (or clear
 	// it on the inactive edge) so switchable-lens cells track the authored
 	// zones. Same mutex scope as the composite — the DP sees the same mask
 	// state as this frame's weave/composite (the two consumers must agree).
+	// In a zones frame the published content is the WISH (explicit frame
+	// wish or the auto raster), not the sticky legacy mask.
 	d3d11_sync_zone_mask_to_dp(c);
 
 	// Get target (window) dimensions for mono viewport sizing.
@@ -1614,7 +1690,8 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			// Determine which swapchains to wait on based on layer type
 			uint32_t sc_count = 0;
 			if (layer->data.type == XRT_LAYER_PROJECTION ||
-			    layer->data.type == XRT_LAYER_PROJECTION_DEPTH) {
+			    layer->data.type == XRT_LAYER_PROJECTION_DEPTH ||
+			    layer->data.type == XRT_LAYER_ZONE_3D) {
 				sc_count = layer->data.view_count < XRT_MAX_VIEWS
 				               ? layer->data.view_count
 				               : XRT_MAX_VIEWS;
@@ -2456,6 +2533,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	c->base.base.layer_passthrough = d3d11_compositor_layer_passthrough;
 	c->base.base.layer_window_space = d3d11_compositor_layer_window_space;
 	c->base.base.layer_local_2d = d3d11_compositor_layer_local_2d;
+	c->base.base.layer_zone_3d = d3d11_compositor_layer_zone_3d;
 	c->base.base.layer_commit = d3d11_compositor_layer_commit;
 	c->base.base.layer_commit_with_semaphore = d3d11_compositor_layer_commit_with_semaphore;
 	c->base.base.destroy = d3d11_compositor_destroy;
@@ -2889,6 +2967,10 @@ struct comp_d3d11_zone_mask
 	uint32_t w, h;
 	//! True once submitted at least once (an unsubmitted mask is invisible).
 	bool submitted;
+	//! Author generation: bumped on every authoring call (Tier 1/2 fills,
+	//! Tier-3 acquire, submit). The zones frame-wish publish dedups on this
+	//! (XR_EXT_display_zones — referenced per-frame, no submit required).
+	uint64_t author_seq;
 };
 
 // Release the compositor-owned zone consumables (weave scratch) and detach
@@ -2899,7 +2981,31 @@ static void
 d3d11_release_zone_state(struct comp_d3d11_compositor *c)
 {
 	c->active_zone_mask = nullptr;
+	c->frame_wish = nullptr;
+	c->frame_wish_last = nullptr;
+	c->zones_frame = false;
 	d3d11_sync_zone_mask_to_dp(c); // withdraw this client's DP zone contribution (#224)
+
+	// XR_EXT_display_zones — auto-wish raster set.
+	if (c->wish_mask_staged_srv != nullptr) {
+		c->wish_mask_staged_srv->Release();
+		c->wish_mask_staged_srv = nullptr;
+	}
+	if (c->wish_mask_staged != nullptr) {
+		c->wish_mask_staged->Release();
+		c->wish_mask_staged = nullptr;
+	}
+	if (c->wish_mask_rtv != nullptr) {
+		c->wish_mask_rtv->Release();
+		c->wish_mask_rtv = nullptr;
+	}
+	if (c->wish_mask_tex != nullptr) {
+		c->wish_mask_tex->Release();
+		c->wish_mask_tex = nullptr;
+	}
+	c->wish_mask_w = 0;
+	c->wish_mask_h = 0;
+	c->wish_rect_count = 0;
 	if (c->weave_scratch_srv != nullptr) {
 		c->weave_scratch_srv->Release();
 		c->weave_scratch_srv = nullptr;
@@ -2998,8 +3104,33 @@ d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
 		return; // legacy DP — global request_display_mode path unchanged.
 	}
 
-	struct comp_d3d11_zone_mask *mask = c->active_zone_mask;
-	if (mask == nullptr || !mask->submitted || mask->staged_srv == nullptr) {
+	// Resolve this frame's published content. Zones frame
+	// (XR_EXT_display_zones): the WISH — explicit frame wish or the auto
+	// raster — and the sticky legacy mask is inert. Legacy frame: the
+	// sticky submitted mask, unchanged.
+	ID3D11ShaderResourceView *srv = nullptr;
+	uint32_t mask_w = 0;
+	uint32_t mask_h = 0;
+	if (c->zones_frame) {
+		if (c->frame_wish != nullptr && c->frame_wish->staged_srv != nullptr) {
+			srv = c->frame_wish->staged_srv;
+			mask_w = c->frame_wish->w;
+			mask_h = c->frame_wish->h;
+		} else if (c->wish_mask_staged_srv != nullptr) {
+			srv = c->wish_mask_staged_srv;
+			mask_w = c->wish_mask_w;
+			mask_h = c->wish_mask_h;
+		}
+	} else {
+		struct comp_d3d11_zone_mask *mask = c->active_zone_mask;
+		if (mask != nullptr && mask->submitted && mask->staged_srv != nullptr) {
+			srv = mask->staged_srv;
+			mask_w = mask->w;
+			mask_h = mask->h;
+		}
+	}
+
+	if (srv == nullptr) {
 		if (c->zone_published) {
 			xrt_display_processor_d3d11_clear_local_zone_mask(c->display_processor);
 			c->zone_published = false;
@@ -3017,12 +3148,13 @@ d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
 		return;
 	}
 
-	// seq is the content GENERATION (bumped in zone_mask_submit), not a frame
-	// counter — same-seq publishes differ only in the screen anchor, so a
-	// vendor's content evaluation (e.g. the 1×1 any-nonzero check) runs once
-	// per submit instead of once per frame.
+	// seq is the content GENERATION (bumped on zone_mask_submit, the auto-
+	// wish re-raster, and explicit-frame-wish changes), not a frame counter —
+	// same-seq publishes differ only in the screen anchor, so a vendor's
+	// content evaluation (e.g. the 1×1 any-nonzero check) runs once per
+	// generation instead of once per frame.
 	bool ok = xrt_display_processor_d3d11_publish_local_zone_mask(
-	    c->display_processor, c->context, mask->staged_srv, mask->w, mask->h, (int32_t)origin.x,
+	    c->display_processor, c->context, srv, mask_w, mask_h, (int32_t)origin.x,
 	    (int32_t)origin.y, (uint32_t)r.right, (uint32_t)r.bottom, c->zone_publish_seq);
 	if (ok) {
 		c->zone_published = true;
@@ -3297,6 +3429,204 @@ d3d11_update_implicit_mask(struct comp_d3d11_compositor *c,
 	return c->implicit_mask_staged_srv;
 }
 
+// XR_EXT_display_zones (ADR-027) — (re)rasterize the AUTO wish: union of the
+// frame's zone rects with a stepped ring feather. M=0 everywhere, then for
+// each feather step (outermost first, ascending M) ClearView the expanded
+// rect of EVERY zone — max-semantics without a shader: the final step writes
+// M=1 at every zone core, so overlapping feathers can never dim a core.
+// Same R8 RTV + staged-SRV pattern as the implicit mask (separate textures —
+// the two never coexist in one frame but lifetimes differ). Dirty-checked on
+// the rect set + dims; bumps c->zone_publish_seq on re-raster. Caller holds
+// c->mutex. Returns the staged SRV or nullptr on failure.
+#define D3D11_ZONE_WISH_FEATHER_STEPS 8
+#define D3D11_ZONE_WISH_FEATHER_STEP_PX 2
+static ID3D11ShaderResourceView *
+d3d11_update_zone_wish_mask(struct comp_d3d11_compositor *c,
+                            const struct xrt_rect *rects,
+                            uint32_t rect_count,
+                            uint32_t w,
+                            uint32_t h)
+{
+	if (w == 0 || h == 0 || rect_count == 0) {
+		return nullptr;
+	}
+
+	bool dirty = c->wish_mask_tex == nullptr || c->wish_mask_staged_srv == nullptr || c->wish_mask_w != w ||
+	             c->wish_mask_h != h || c->wish_rect_count != rect_count;
+	for (uint32_t i = 0; !dirty && i < rect_count; i++) {
+		if (memcmp(&c->wish_rects[i], &rects[i], sizeof(rects[i])) != 0) {
+			dirty = true;
+		}
+	}
+	if (!dirty) {
+		return c->wish_mask_staged_srv;
+	}
+
+	if (c->wish_mask_tex == nullptr || c->wish_mask_w != w || c->wish_mask_h != h) {
+		if (c->wish_mask_staged_srv != nullptr) {
+			c->wish_mask_staged_srv->Release();
+			c->wish_mask_staged_srv = nullptr;
+		}
+		if (c->wish_mask_staged != nullptr) {
+			c->wish_mask_staged->Release();
+			c->wish_mask_staged = nullptr;
+		}
+		if (c->wish_mask_rtv != nullptr) {
+			c->wish_mask_rtv->Release();
+			c->wish_mask_rtv = nullptr;
+		}
+		if (c->wish_mask_tex != nullptr) {
+			c->wish_mask_tex->Release();
+			c->wish_mask_tex = nullptr;
+		}
+		c->wish_mask_w = 0;
+		c->wish_mask_h = 0;
+
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = w;
+		td.Height = h;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R8_UNORM;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_RENDER_TARGET;
+		HRESULT hr = c->device->CreateTexture2D(&td, nullptr, &c->wish_mask_tex);
+		if (SUCCEEDED(hr) && c->wish_mask_tex != nullptr) {
+			hr = c->device->CreateRenderTargetView(c->wish_mask_tex, nullptr, &c->wish_mask_rtv);
+		}
+		if (SUCCEEDED(hr) && c->wish_mask_rtv != nullptr) {
+			td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			hr = c->device->CreateTexture2D(&td, nullptr, &c->wish_mask_staged);
+		}
+		if (SUCCEEDED(hr) && c->wish_mask_staged != nullptr) {
+			hr = c->device->CreateShaderResourceView(c->wish_mask_staged, nullptr,
+			                                         &c->wish_mask_staged_srv);
+		}
+		if (FAILED(hr) || c->wish_mask_staged_srv == nullptr) {
+			U_LOG_E("zone wish mask: D3D resource creation failed: 0x%08x", hr);
+			if (c->wish_mask_staged != nullptr) {
+				c->wish_mask_staged->Release();
+				c->wish_mask_staged = nullptr;
+			}
+			if (c->wish_mask_rtv != nullptr) {
+				c->wish_mask_rtv->Release();
+				c->wish_mask_rtv = nullptr;
+			}
+			if (c->wish_mask_tex != nullptr) {
+				c->wish_mask_tex->Release();
+				c->wish_mask_tex = nullptr;
+			}
+			return nullptr;
+		}
+		c->wish_mask_w = w;
+		c->wish_mask_h = h;
+	}
+
+	const float all_off[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	c->context->ClearRenderTargetView(c->wish_mask_rtv, all_off);
+
+	ID3D11DeviceContext1 *ctx1 = nullptr;
+	HRESULT hr = c->context->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void **>(&ctx1));
+	if (FAILED(hr) || ctx1 == nullptr) {
+		U_LOG_E("zone wish mask: ID3D11DeviceContext1 unavailable (hr=0x%08x)", hr);
+		return nullptr;
+	}
+	for (int32_t s = D3D11_ZONE_WISH_FEATHER_STEPS; s >= 0; s--) {
+		const float v = (float)(D3D11_ZONE_WISH_FEATHER_STEPS - s) / (float)D3D11_ZONE_WISH_FEATHER_STEPS;
+		const float val[4] = {v, 0.0f, 0.0f, 0.0f};
+		const int32_t expand = s * D3D11_ZONE_WISH_FEATHER_STEP_PX;
+		for (uint32_t i = 0; i < rect_count; i++) {
+			int32_t left = rects[i].offset.w - expand;
+			int32_t top = rects[i].offset.h - expand;
+			int32_t right = rects[i].offset.w + rects[i].extent.w + expand;
+			int32_t bottom = rects[i].offset.h + rects[i].extent.h + expand;
+			if (left < 0) {
+				left = 0;
+			}
+			if (top < 0) {
+				top = 0;
+			}
+			if (right > (int32_t)w) {
+				right = (int32_t)w;
+			}
+			if (bottom > (int32_t)h) {
+				bottom = (int32_t)h;
+			}
+			if (right <= left || bottom <= top) {
+				continue;
+			}
+			D3D11_RECT dr = {left, top, right, bottom};
+			ctx1->ClearView(c->wish_mask_rtv, val, &dr, 1);
+		}
+	}
+	ctx1->Release();
+
+	c->context->CopyResource(c->wish_mask_staged, c->wish_mask_tex);
+
+	memcpy(c->wish_rects, rects, sizeof(rects[0]) * rect_count);
+	c->wish_rect_count = rect_count;
+	c->zone_publish_seq++; // new wish content generation
+
+	U_LOG_W("zone wish mask (auto): %ux%u, %u zone rect(s), %u-px feather", w, h, rect_count,
+	        D3D11_ZONE_WISH_FEATHER_STEPS * D3D11_ZONE_WISH_FEATHER_STEP_PX);
+	return c->wish_mask_staged_srv;
+}
+
+// Resolve the zones frame's wish source (called from layer_commit before the
+// DP sync + composite; caller holds c->mutex). Explicit frame wish: stage the
+// authoring texture (referenced-at-frame-end = consume current state — no
+// xrSubmitLocal3DZoneEXT required) and dedup the publish generation on the
+// mask's author_seq. Auto: rasterize the union of the frame's zone rects.
+static void
+d3d11_update_zone_wish_state(struct comp_d3d11_compositor *c)
+{
+	if (c->frame_wish != nullptr) {
+		struct comp_d3d11_zone_mask *fw = c->frame_wish;
+		if (fw->staged != nullptr && fw->tex != nullptr) {
+			c->context->CopyResource(fw->staged, fw->tex);
+		}
+		if (c->frame_wish_last != fw || c->frame_wish_last_seq != fw->author_seq) {
+			c->zone_publish_seq++;
+			c->frame_wish_last = fw;
+			c->frame_wish_last_seq = fw->author_seq;
+		}
+		return;
+	}
+
+	// Source flip explicit -> auto: even an unchanged auto raster is new
+	// content at the DP.
+	if (c->frame_wish_last != nullptr) {
+		c->frame_wish_last = nullptr;
+		c->zone_publish_seq++;
+	}
+
+	// Window region for the raster (same clamp as the composite).
+	uint32_t w = 0;
+	uint32_t h = 0;
+	HWND wnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
+	RECT r;
+	if (wnd != nullptr && GetClientRect(wnd, &r) && r.right > 0 && r.bottom > 0) {
+		w = (uint32_t)r.right;
+		h = (uint32_t)r.bottom;
+	} else if (c->shared_texture != nullptr) {
+		D3D11_TEXTURE2D_DESC td;
+		c->shared_texture->GetDesc(&td);
+		w = td.Width;
+		h = td.Height;
+	}
+
+	struct xrt_rect rects[XRT_MAX_LAYERS];
+	uint32_t rect_count = 0;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count && rect_count < XRT_MAX_LAYERS; i++) {
+		if (c->layer_accum.layers[i].data.type != XRT_LAYER_ZONE_3D) {
+			continue;
+		}
+		rects[rect_count++] = c->layer_accum.layers[i].data.zone_3d.rect;
+	}
+	d3d11_update_zone_wish_mask(c, rects, rect_count, w, h);
+}
+
 // #439 Phase 3 — flatten one Local2D layer into @p rtv (premultiplied or
 // straight-alpha over), clipped to the window region with clip/norm_rect/flip_y
 // carried into the source UVs. Shared by the post-weave overlay flatten and the
@@ -3513,10 +3843,14 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	// #439 Phase 3: run when EITHER an explicit submitted mask exists (legacy
 	// `texture + mask`, surround supplies the 2D pixels) OR this frame carries
 	// Local2D layers (the layers supply the 2D pixels + an implicit mask).
+	// XR_EXT_display_zones: a zones frame ALWAYS runs the composite (the
+	// feathered wish edge lerps the weave toward the 2D flatten even with
+	// zero Local2D layers); the sticky mask + implicit-mask rules are inert.
 	struct comp_d3d11_zone_mask *mask = c->active_zone_mask;
-	const bool have_explicit = (mask != nullptr && mask->submitted);
+	const bool zones_frame = c->zones_frame;
+	const bool have_explicit = !zones_frame && (mask != nullptr && mask->submitted);
 	const bool have_local_2d = c->local_2d_last_frame;
-	if ((!have_explicit && !have_local_2d) || dst == nullptr || c->renderer == nullptr) {
+	if ((!zones_frame && !have_explicit && !have_local_2d) || dst == nullptr || c->renderer == nullptr) {
 		return false;
 	}
 
@@ -3548,11 +3882,19 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		}
 	}
 
-	// Resolve the frame's mask source: an explicit submitted mask wins; else
-	// rasterize the implicit Tier-2-style mask from the OVER Local2D layer rects
-	// (Q3 — M=0 inside the rect union, M=1 elsewhere).
+	// Resolve the frame's mask source. Zones frame: the WISH (explicit frame
+	// wish or the auto raster, both staged by d3d11_update_zone_wish_state
+	// earlier this commit) — the same SRV the DP publish consumed, so the
+	// visual blend and the hardware switch cannot drift. Legacy: an explicit
+	// submitted mask wins; else rasterize the implicit Tier-2-style mask
+	// from the OVER Local2D layer rects (Q3 — M=0 inside the rect union,
+	// M=1 elsewhere).
 	ID3D11ShaderResourceView *mask_srv = nullptr;
-	if (have_explicit) {
+	if (zones_frame) {
+		mask_srv = (c->frame_wish != nullptr && c->frame_wish->staged_srv != nullptr)
+		               ? c->frame_wish->staged_srv
+		               : c->wish_mask_staged_srv;
+	} else if (have_explicit) {
 		mask_srv = mask->staged_srv;
 	} else {
 		struct xrt_rect rects[XRT_MAX_LAYERS];
@@ -3574,7 +3916,7 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 
 	// Resolve the `twod` source + a window-sized weave snapshot scratch.
 	ID3D11ShaderResourceView *twod_srv = nullptr;
-	if (have_local_2d) {
+	if (zones_frame || have_local_2d) {
 		// #439 Phase 3: flatten the Local2D layers into a runtime-owned RT
 		// scratch. The flatten write, the weave snapshot, and the lerp all
 		// operate on plain UNORM bytes (sRGB-passthrough), so both scratches
@@ -3590,7 +3932,10 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		                              unorm_fmt, "local2d weave")) {
 			return false;
 		}
-		if (!d3d11_flatten_local_2d_layers(c, region_w, region_h, proj_idx)) {
+		// Zones frame: flatten ALL Local2D layers (no under/over split —
+		// 2D-under is reserved in v1); with zero Local2D layers this is a
+		// clear-only flatten and the lerp fades the feather to transparent.
+		if (!d3d11_flatten_local_2d_layers(c, region_w, region_h, zones_frame ? -1 : proj_idx)) {
 			return false;
 		}
 		twod_srv = c->local2d_scratch_srv;
@@ -3682,7 +4027,10 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	// #491: the implicit (auto) Local2D mask composites the 2D over the weave by
 	// its own premultiplied alpha (translucent 2D reveals the 3D scene). The
 	// explicit authored mask + the legacy surround path keep the hard M-lerp.
-	const bool alpha_over = have_local_2d && !have_explicit;
+	// XR_EXT_display_zones: zones frames are ALWAYS the hard M-lerp
+	// (final = M·weave + (1−M)·flatten(2D-over)) — composition follows zone
+	// geometry + the wish, never the #491 alpha-over rule.
+	const bool alpha_over = !zones_frame && have_local_2d && !have_explicit;
 
 	xrt_result_t xret = comp_d3d11_renderer_composite_2d_masked(
 	    c->renderer, dst, twod_srv, mask_srv, c->weave_scratch_srv, region_w, region_h, (int32_t)cx_u,
@@ -3790,6 +4138,7 @@ comp_d3d11_compositor_zone_mask_set_whole(struct xrt_compositor *xc, void *mask_
 
 	const float m[4] = {enable_3d ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f};
 	c->context->ClearRenderTargetView(mask->rtv, m);
+	mask->author_seq++;
 	return XRT_SUCCESS;
 }
 
@@ -3846,6 +4195,7 @@ comp_d3d11_compositor_zone_mask_set_rects(struct xrt_compositor *xc,
 		ctx1->ClearView(mask->rtv, all_3d, &dr, 1);
 	}
 	ctx1->Release();
+	mask->author_seq++;
 	return XRT_SUCCESS;
 }
 
@@ -3870,6 +4220,7 @@ comp_d3d11_compositor_zone_mask_acquire_rt(struct xrt_compositor *xc,
 	*out_rtv = mask->rtv;
 	*out_w = mask->w;
 	*out_h = mask->h;
+	mask->author_seq++;
 	return XRT_SUCCESS;
 }
 
@@ -3890,6 +4241,7 @@ comp_d3d11_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask_ptr
 	// destroy (destroy reverts to the rect-surround behavior).
 	c->context->CopyResource(mask->staged, mask->tex);
 	mask->submitted = true;
+	mask->author_seq++;
 	c->active_zone_mask = mask;
 	c->zone_publish_seq++; // #224: new content generation for the DP publish
 	return XRT_SUCCESS;
@@ -3904,6 +4256,13 @@ comp_d3d11_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_pt
 	struct comp_d3d11_zone_mask *mask = static_cast<struct comp_d3d11_zone_mask *>(mask_ptr);
 	if (mask == nullptr) {
 		return;
+	}
+	// XR_EXT_display_zones: never leave a dangling frame-wish reference.
+	if (c->frame_wish == mask) {
+		c->frame_wish = nullptr;
+	}
+	if (c->frame_wish_last == mask) {
+		c->frame_wish_last = nullptr;
 	}
 	if (c->active_zone_mask == mask) {
 		c->active_zone_mask = nullptr; // revert to rect-surround behavior
@@ -3925,6 +4284,19 @@ comp_d3d11_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_pt
 		mask->tex->Release();
 	}
 	free(mask);
+}
+
+extern "C" void
+comp_d3d11_compositor_zones_set_frame_wish(struct xrt_compositor *xc, void *mask)
+{
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+	std::lock_guard<std::mutex> lock(c->mutex);
+
+	// Per-frame reference (XR_EXT_display_zones): oxr sets this on every
+	// zones frame before layer_commit, NULL meaning auto-derive. Consumed
+	// by the commit's wish-state resolve; harmlessly stale on zero-zone
+	// frames (the zones branch never reads it there).
+	c->frame_wish = static_cast<struct comp_d3d11_zone_mask *>(mask);
 }
 
 extern "C" bool
