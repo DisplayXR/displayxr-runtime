@@ -6,8 +6,20 @@
 #
 
 if((WIN32 OR APPLE OR ANDROID) AND XRT_HAVE_VULKAN)
+	# XR_EXT_display_zones alpha-over draw path (ADR-027): zone layers draw
+	# through a blend pipeline instead of vkCmdBlitImage.
+	spirv_shaders(
+		VK_NATIVE_SHADER_HEADERS
+		SPIRV_VERSION
+		1.0
+		SOURCES
+		shaders/zone_blit.vert
+		shaders/zone_blit.frag
+		)
+
 	add_library(
 		comp_vk_native STATIC
+		${VK_NATIVE_SHADER_HEADERS}
 		comp_vk_native_compositor.c
 		comp_vk_native_compositor.h
 		comp_vk_native_renderer.c
@@ -17,6 +29,9 @@ if((WIN32 OR APPLE OR ANDROID) AND XRT_HAVE_VULKAN)
 		comp_vk_native_target.cpp
 		comp_vk_native_target.h
 		)
+
+	# Generated SPIR-V headers land under the binary dir mirroring shaders/.
+	target_include_directories(comp_vk_native PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 	if(WIN32)
 		# DComp + WGL_NV_DX_interop2 dependencies for the VK->D3D11 transparent

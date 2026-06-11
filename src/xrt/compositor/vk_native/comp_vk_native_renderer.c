@@ -13,6 +13,12 @@
  * can be changed to support arbitrary atlas layouts (e.g. 2x2 for quad views).
  *
  * Uses vkCmdBlitImage for simplicity — no render pass or pipeline needed.
+ *
+ * Exception: XR_EXT_display_zones frames (ADR-027) draw zone layers through
+ * a small blend pipeline (zone_blit.vert/.frag) so overlapping zones
+ * composite alpha-over in layer-list order — blits cannot blend. Zones
+ * frames are all-or-none at the oxr layer, so normal frames never touch the
+ * draw path.
  */
 
 #include "comp_vk_native_renderer.h"
@@ -29,6 +35,14 @@
 
 #include <string.h>
 #include <math.h>
+
+// SPIR-V shader headers (generated at build time by spirv_shaders())
+#include "shaders/zone_blit.vert.h"
+#include "shaders/zone_blit.frag.h"
+
+//! Upper bound on zone draws (and so descriptor sets) per frame:
+//! layers (16) × views (8).
+#define VK_ZONE_MAX_DRAWS 128
 
 /*!
  * Vulkan renderer structure.
@@ -75,12 +89,81 @@ struct comp_vk_native_renderer
 	//! When true, clear the atlas to alpha=0 (transparent) instead of
 	//! opaque black, so app alpha<1 regions survive to the present (issue #392).
 	bool transparent_background;
+
+	//! XR_EXT_display_zones alpha-over draw path (ADR-027). Lazily created
+	//! on the first zones frame; the framebuffer alone is dropped on atlas
+	//! resize (it wraps atlas_view) and re-created on demand.
+	struct
+	{
+		VkRenderPass render_pass;
+		VkFramebuffer framebuffer;
+		VkDescriptorSetLayout set_layout;
+		VkPipelineLayout pipeline_layout;
+		VkSampler sampler;
+		VkPipeline pipeline_premult;
+		VkPipeline pipeline_unpremult;
+		VkDescriptorPool descriptor_pool;
+		bool ready;
+		bool failed; //!< init failed once — stay on the blit fallback
+	} zone;
 };
+
+static void
+zone_draw_destroy_framebuffer(struct comp_vk_native_renderer *r)
+{
+	struct vk_bundle *vk = r->vk;
+
+	if (r->zone.framebuffer != VK_NULL_HANDLE) {
+		vk->vkDestroyFramebuffer(vk->device, r->zone.framebuffer, NULL);
+		r->zone.framebuffer = VK_NULL_HANDLE;
+	}
+}
+
+static void
+zone_draw_destroy(struct comp_vk_native_renderer *r)
+{
+	struct vk_bundle *vk = r->vk;
+
+	zone_draw_destroy_framebuffer(r);
+	if (r->zone.pipeline_premult != VK_NULL_HANDLE) {
+		vk->vkDestroyPipeline(vk->device, r->zone.pipeline_premult, NULL);
+		r->zone.pipeline_premult = VK_NULL_HANDLE;
+	}
+	if (r->zone.pipeline_unpremult != VK_NULL_HANDLE) {
+		vk->vkDestroyPipeline(vk->device, r->zone.pipeline_unpremult, NULL);
+		r->zone.pipeline_unpremult = VK_NULL_HANDLE;
+	}
+	if (r->zone.descriptor_pool != VK_NULL_HANDLE) {
+		vk->vkDestroyDescriptorPool(vk->device, r->zone.descriptor_pool, NULL);
+		r->zone.descriptor_pool = VK_NULL_HANDLE;
+	}
+	if (r->zone.sampler != VK_NULL_HANDLE) {
+		vk->vkDestroySampler(vk->device, r->zone.sampler, NULL);
+		r->zone.sampler = VK_NULL_HANDLE;
+	}
+	if (r->zone.pipeline_layout != VK_NULL_HANDLE) {
+		vk->vkDestroyPipelineLayout(vk->device, r->zone.pipeline_layout, NULL);
+		r->zone.pipeline_layout = VK_NULL_HANDLE;
+	}
+	if (r->zone.set_layout != VK_NULL_HANDLE) {
+		vk->vkDestroyDescriptorSetLayout(vk->device, r->zone.set_layout, NULL);
+		r->zone.set_layout = VK_NULL_HANDLE;
+	}
+	if (r->zone.render_pass != VK_NULL_HANDLE) {
+		vk->vkDestroyRenderPass(vk->device, r->zone.render_pass, NULL);
+		r->zone.render_pass = VK_NULL_HANDLE;
+	}
+	r->zone.ready = false;
+}
 
 static void
 destroy_atlas_resources(struct comp_vk_native_renderer *r)
 {
 	struct vk_bundle *vk = r->vk;
+
+	// The zone framebuffer wraps atlas_view — drop it with the atlas; the
+	// rest of the zone bundle is atlas-independent and survives resizes.
+	zone_draw_destroy_framebuffer(r);
 
 	if (r->atlas_view != VK_NULL_HANDLE) {
 		vk->vkDestroyImageView(vk->device, r->atlas_view, NULL);
@@ -251,6 +334,7 @@ comp_vk_native_renderer_destroy(struct comp_vk_native_renderer **renderer_ptr)
 	vk->vkDeviceWaitIdle(vk->device);
 
 	destroy_atlas_resources(r);
+	zone_draw_destroy(r);
 
 	if (r->cmd_pool != VK_NULL_HANDLE) {
 		vk->vkDestroyCommandPool(vk->device, r->cmd_pool, NULL);
@@ -293,6 +377,662 @@ cmd_image_barrier(struct vk_bundle *vk,
 	                          0, NULL, 0, NULL, 1, &barrier);
 }
 
+
+/*
+ *
+ * XR_EXT_display_zones alpha-over draw path (ADR-027).
+ *
+ */
+
+static bool
+zone_create_pipeline(struct comp_vk_native_renderer *r,
+                     VkShaderModule vert,
+                     VkShaderModule frag,
+                     bool unpremultiplied,
+                     VkPipeline *out_pipeline)
+{
+	struct vk_bundle *vk = r->vk;
+
+	VkPipelineShaderStageCreateInfo stages[2] = {
+	    {
+	        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+	        .stage = VK_SHADER_STAGE_VERTEX_BIT,
+	        .module = vert,
+	        .pName = "main",
+	    },
+	    {
+	        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+	        .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+	        .module = frag,
+	        .pName = "main",
+	    },
+	};
+
+	VkPipelineVertexInputStateCreateInfo vertex_input = {
+	    .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+	};
+
+	VkPipelineInputAssemblyStateCreateInfo input_assembly = {
+	    .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+	    .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+	};
+
+	VkPipelineViewportStateCreateInfo viewport_state = {
+	    .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+	    .viewportCount = 1,
+	    .scissorCount = 1,
+	};
+
+	VkPipelineRasterizationStateCreateInfo rasterization = {
+	    .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+	    .polygonMode = VK_POLYGON_MODE_FILL,
+	    .cullMode = VK_CULL_MODE_NONE,
+	    .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+	    .lineWidth = 1.0f,
+	};
+
+	VkPipelineMultisampleStateCreateInfo multisample = {
+	    .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+	    .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+	};
+
+	// Alpha-over: premultiplied (One/OneMinusSrcAlpha) by default, straight
+	// alpha only swaps the source color factor. Alpha factors are
+	// One/OneMinusSrcAlpha in both so the zone's own transparency survives
+	// into the atlas (D3D11 blend_premul/blend_alpha parity).
+	VkPipelineColorBlendAttachmentState blend_attachment = {
+	    .blendEnable = VK_TRUE,
+	    .srcColorBlendFactor =
+	        unpremultiplied ? VK_BLEND_FACTOR_SRC_ALPHA : VK_BLEND_FACTOR_ONE,
+	    .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+	    .colorBlendOp = VK_BLEND_OP_ADD,
+	    .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+	    .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+	    .alphaBlendOp = VK_BLEND_OP_ADD,
+	    .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+	                      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+	};
+
+	VkPipelineColorBlendStateCreateInfo blend_state = {
+	    .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+	    .attachmentCount = 1,
+	    .pAttachments = &blend_attachment,
+	};
+
+	VkDynamicState dynamic_states[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+	VkPipelineDynamicStateCreateInfo dynamic_state = {
+	    .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+	    .dynamicStateCount = 2,
+	    .pDynamicStates = dynamic_states,
+	};
+
+	VkGraphicsPipelineCreateInfo pipeline_ci = {
+	    .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+	    .stageCount = 2,
+	    .pStages = stages,
+	    .pVertexInputState = &vertex_input,
+	    .pInputAssemblyState = &input_assembly,
+	    .pViewportState = &viewport_state,
+	    .pRasterizationState = &rasterization,
+	    .pMultisampleState = &multisample,
+	    .pColorBlendState = &blend_state,
+	    .pDynamicState = &dynamic_state,
+	    .layout = r->zone.pipeline_layout,
+	    .renderPass = r->zone.render_pass,
+	    .subpass = 0,
+	};
+
+	VkResult res =
+	    vk->vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_ci, NULL, out_pipeline);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("VK zones: failed to create %s pipeline: %d",
+		        unpremultiplied ? "unpremultiplied" : "premultiplied", res);
+		return false;
+	}
+	return true;
+}
+
+//! Lazily create the atlas-independent zone draw bundle. Returns ready state;
+//! a failure is sticky (the caller falls back to the blit path for good).
+static bool
+zone_draw_ensure(struct comp_vk_native_renderer *r)
+{
+	struct vk_bundle *vk = r->vk;
+
+	if (r->zone.ready) {
+		return true;
+	}
+	if (r->zone.failed) {
+		return false;
+	}
+	r->zone.failed = true; // cleared on full success
+
+	// Render pass: clear the whole atlas (zones frames own the frame's 3D
+	// content), end in SHADER_READ_ONLY for the display processor.
+	VkAttachmentDescription attachment = {
+	    .format = r->format,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+	    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+	    .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+	    .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	    .finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	};
+
+	VkAttachmentReference color_ref = {
+	    .attachment = 0,
+	    .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	};
+
+	VkSubpassDescription subpass = {
+	    .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+	    .colorAttachmentCount = 1,
+	    .pColorAttachments = &color_ref,
+	};
+
+	VkSubpassDependency dependencies[2] = {
+	    {
+	        .srcSubpass = VK_SUBPASS_EXTERNAL,
+	        .dstSubpass = 0,
+	        .srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	        .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	    },
+	    {
+	        .srcSubpass = 0,
+	        .dstSubpass = VK_SUBPASS_EXTERNAL,
+	        .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	        .dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	    },
+	};
+
+	VkRenderPassCreateInfo rp_ci = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+	    .attachmentCount = 1,
+	    .pAttachments = &attachment,
+	    .subpassCount = 1,
+	    .pSubpasses = &subpass,
+	    .dependencyCount = 2,
+	    .pDependencies = dependencies,
+	};
+
+	VkResult res = vk->vkCreateRenderPass(vk->device, &rp_ci, NULL, &r->zone.render_pass);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("VK zones: failed to create render pass: %d", res);
+		return false;
+	}
+
+	VkDescriptorSetLayoutBinding binding = {
+	    .binding = 0,
+	    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	    .descriptorCount = 1,
+	    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+	};
+
+	VkDescriptorSetLayoutCreateInfo dsl_ci = {
+	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+	    .bindingCount = 1,
+	    .pBindings = &binding,
+	};
+
+	res = vk->vkCreateDescriptorSetLayout(vk->device, &dsl_ci, NULL, &r->zone.set_layout);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("VK zones: failed to create descriptor set layout: %d", res);
+		zone_draw_destroy(r);
+		r->zone.failed = true;
+		return false;
+	}
+
+	VkPushConstantRange push_range = {
+	    .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+	    .offset = 0,
+	    .size = 4 * sizeof(float), // normalized src rect
+	};
+
+	VkPipelineLayoutCreateInfo pl_ci = {
+	    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+	    .setLayoutCount = 1,
+	    .pSetLayouts = &r->zone.set_layout,
+	    .pushConstantRangeCount = 1,
+	    .pPushConstantRanges = &push_range,
+	};
+
+	res = vk->vkCreatePipelineLayout(vk->device, &pl_ci, NULL, &r->zone.pipeline_layout);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("VK zones: failed to create pipeline layout: %d", res);
+		zone_draw_destroy(r);
+		r->zone.failed = true;
+		return false;
+	}
+
+	VkSamplerCreateInfo sampler_ci = {
+	    .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+	    .magFilter = VK_FILTER_LINEAR,
+	    .minFilter = VK_FILTER_LINEAR,
+	    .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+	    .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+	    .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+	    .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+	    .maxLod = 0.25f,
+	};
+
+	res = vk->vkCreateSampler(vk->device, &sampler_ci, NULL, &r->zone.sampler);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("VK zones: failed to create sampler: %d", res);
+		zone_draw_destroy(r);
+		r->zone.failed = true;
+		return false;
+	}
+
+	VkDescriptorPoolSize pool_size = {
+	    .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	    .descriptorCount = VK_ZONE_MAX_DRAWS,
+	};
+
+	VkDescriptorPoolCreateInfo dp_ci = {
+	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+	    .maxSets = VK_ZONE_MAX_DRAWS,
+	    .poolSizeCount = 1,
+	    .pPoolSizes = &pool_size,
+	};
+
+	res = vk->vkCreateDescriptorPool(vk->device, &dp_ci, NULL, &r->zone.descriptor_pool);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("VK zones: failed to create descriptor pool: %d", res);
+		zone_draw_destroy(r);
+		r->zone.failed = true;
+		return false;
+	}
+
+	VkShaderModule vert = VK_NULL_HANDLE;
+	VkShaderModule frag = VK_NULL_HANDLE;
+	VkShaderModuleCreateInfo sm_ci = {
+	    .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+	    .codeSize = sizeof(shaders_zone_blit_vert),
+	    .pCode = shaders_zone_blit_vert,
+	};
+	res = vk->vkCreateShaderModule(vk->device, &sm_ci, NULL, &vert);
+	if (res == VK_SUCCESS) {
+		sm_ci.codeSize = sizeof(shaders_zone_blit_frag);
+		sm_ci.pCode = shaders_zone_blit_frag;
+		res = vk->vkCreateShaderModule(vk->device, &sm_ci, NULL, &frag);
+	}
+	if (res != VK_SUCCESS) {
+		U_LOG_E("VK zones: failed to create shader modules: %d", res);
+		if (vert != VK_NULL_HANDLE) {
+			vk->vkDestroyShaderModule(vk->device, vert, NULL);
+		}
+		zone_draw_destroy(r);
+		r->zone.failed = true;
+		return false;
+	}
+
+	bool ok = zone_create_pipeline(r, vert, frag, false, &r->zone.pipeline_premult) &&
+	          zone_create_pipeline(r, vert, frag, true, &r->zone.pipeline_unpremult);
+
+	vk->vkDestroyShaderModule(vk->device, vert, NULL);
+	vk->vkDestroyShaderModule(vk->device, frag, NULL);
+
+	if (!ok) {
+		zone_draw_destroy(r);
+		r->zone.failed = true;
+		return false;
+	}
+
+	r->zone.failed = false;
+	r->zone.ready = true;
+	U_LOG_W("VK zones: alpha-over draw path ready (premult + unpremult pipelines)");
+	return true;
+}
+
+//! (Re)create the framebuffer over the current atlas view.
+static bool
+zone_draw_ensure_framebuffer(struct comp_vk_native_renderer *r)
+{
+	struct vk_bundle *vk = r->vk;
+
+	if (r->zone.framebuffer != VK_NULL_HANDLE) {
+		return true;
+	}
+
+	VkFramebufferCreateInfo fb_ci = {
+	    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+	    .renderPass = r->zone.render_pass,
+	    .attachmentCount = 1,
+	    .pAttachments = &r->atlas_view,
+	    .width = r->atlas_alloc_width,
+	    .height = r->atlas_alloc_height,
+	    .layers = 1,
+	};
+
+	VkResult res = vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &r->zone.framebuffer);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("VK zones: failed to create framebuffer: %d", res);
+		return false;
+	}
+	return true;
+}
+
+//! Every zone layer must be drawable: plain 2D swapchain (the whole-image
+//! view is a 2D view only when array_size == 1) with a valid view.
+static bool
+zone_pass_usable(struct comp_vk_native_renderer *r, struct comp_layer_accum *layers, bool hardware_display_3d)
+{
+	if (!zone_draw_ensure(r) || !zone_draw_ensure_framebuffer(r)) {
+		return false;
+	}
+
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		struct comp_layer *layer = &layers->layers[i];
+		if (layer->data.type != XRT_LAYER_ZONE_3D) {
+			continue;
+		}
+		uint32_t view_count = hardware_display_3d ? layer->data.view_count : 1;
+		if (view_count == 0) {
+			view_count = 1;
+		}
+		for (uint32_t eye = 0; eye < view_count; eye++) {
+			struct xrt_swapchain *xsc = layer->sc_array[eye];
+			if (xsc == NULL) {
+				continue;
+			}
+			if (comp_vk_native_swapchain_get_array_size(xsc) != 1 ||
+			    layer->data.proj.v[eye].sub.array_index != 0) {
+				static bool layered_warned = false;
+				if (!layered_warned) {
+					layered_warned = true;
+					U_LOG_W("VK zones: layered zone swapchain — falling back to the "
+					        "blit path (overlap overwrites; one-time warning)");
+				}
+				return false;
+			}
+			uint32_t sc_index = layer->data.proj.v[eye].sub.image_index;
+			if (comp_vk_native_swapchain_get_image_view(xsc, sc_index) == 0) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+//! Draw-based projection pass for zones frames: clear via loadOp, draw each
+//! zone's view tiles alpha-over in layer-list order, finish in
+//! SHADER_READ_ONLY. Mirrors comp_d3d11_renderer's zone branch.
+static xrt_result_t
+draw_zones_pass(struct comp_vk_native_renderer *r,
+                struct comp_layer_accum *layers,
+                uint32_t target_width,
+                uint32_t target_height,
+                bool hardware_display_3d)
+{
+	struct vk_bundle *vk = r->vk;
+
+	VkCommandBufferAllocateInfo alloc_info = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+	    .commandPool = r->cmd_pool,
+	    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+	    .commandBufferCount = 1,
+	};
+
+	VkCommandBuffer cmd;
+	VkResult res = vk->vkAllocateCommandBuffers(vk->device, &alloc_info, &cmd);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("VK zones: failed to allocate command buffer: %d", res);
+		return XRT_ERROR_VULKAN;
+	}
+
+	VkCommandBufferBeginInfo begin_info = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	vk->vkBeginCommandBuffer(cmd, &begin_info);
+
+	vk->vkResetDescriptorPool(vk->device, r->zone.descriptor_pool, 0);
+
+	// Transition each unique source image for sampling. A zone's view tiles
+	// share one swapchain image, so dedupe — re-transitioning would declare
+	// a wrong oldLayout.
+	VkImage transitioned[VK_ZONE_MAX_DRAWS];
+	uint32_t transitioned_count = 0;
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		struct comp_layer *layer = &layers->layers[i];
+		if (layer->data.type != XRT_LAYER_ZONE_3D) {
+			continue;
+		}
+		uint32_t view_count = hardware_display_3d ? layer->data.view_count : 1;
+		if (view_count == 0) {
+			view_count = 1;
+		}
+		for (uint32_t eye = 0; eye < view_count; eye++) {
+			struct xrt_swapchain *xsc = layer->sc_array[eye];
+			if (xsc == NULL) {
+				continue;
+			}
+			uint32_t sc_index = layer->data.proj.v[eye].sub.image_index;
+			VkImage img = (VkImage)(uintptr_t)comp_vk_native_swapchain_get_image(xsc, sc_index);
+			if (img == VK_NULL_HANDLE) {
+				continue;
+			}
+			bool seen = false;
+			for (uint32_t t = 0; t < transitioned_count; t++) {
+				if (transitioned[t] == img) {
+					seen = true;
+					break;
+				}
+			}
+			if (seen || transitioned_count >= VK_ZONE_MAX_DRAWS) {
+				continue;
+			}
+			transitioned[transitioned_count++] = img;
+			cmd_image_barrier(vk, cmd, img,
+			                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			                   VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			                   VK_ACCESS_SHADER_READ_BIT,
+			                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+		}
+	}
+
+	VkClearValue clear_value = {.color = {{0.0f, 0.0f, 0.0f, 0.0f}}};
+	VkRenderPassBeginInfo rp_begin = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+	    .renderPass = r->zone.render_pass,
+	    .framebuffer = r->zone.framebuffer,
+	    .renderArea = {{0, 0}, {r->atlas_alloc_width, r->atlas_alloc_height}},
+	    .clearValueCount = 1,
+	    .pClearValues = &clear_value,
+	};
+	vk->vkCmdBeginRenderPass(cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
+
+	uint32_t draw_count = 0;
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		struct comp_layer *layer = &layers->layers[i];
+		if (layer->data.type != XRT_LAYER_ZONE_3D) {
+			continue;
+		}
+
+		uint32_t view_count = hardware_display_3d ? layer->data.view_count : 1;
+		if (view_count == 0) {
+			view_count = 1;
+		}
+
+		const bool unpremul =
+		    (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
+
+		for (uint32_t eye = 0; eye < view_count; eye++) {
+			struct xrt_swapchain *xsc = layer->sc_array[eye];
+			if (xsc == NULL || draw_count >= VK_ZONE_MAX_DRAWS) {
+				continue;
+			}
+			uint32_t sc_index = layer->data.proj.v[eye].sub.image_index;
+			VkImageView src_view =
+			    (VkImageView)(uintptr_t)comp_vk_native_swapchain_get_image_view(xsc, sc_index);
+			if (src_view == VK_NULL_HANDLE) {
+				continue;
+			}
+
+			// Destination: the same tile box + zone-rect scale as the
+			// blit path (in zones frames the tile spans the full window).
+			float dx0, dy0, dx1, dy1;
+			if (!hardware_display_3d || view_count == 1) {
+				dx0 = 0.0f;
+				dy0 = 0.0f;
+				dx1 = (float)(r->tile_columns * r->view_width);
+				dy1 = (float)(r->tile_rows * r->view_height);
+			} else {
+				uint32_t tile_x = eye % r->tile_columns;
+				uint32_t tile_y = eye / r->tile_columns;
+				dx0 = (float)(tile_x * r->view_width);
+				dy0 = (float)(tile_y * r->view_height);
+				dx1 = dx0 + (float)r->view_width;
+				dy1 = dy0 + (float)r->view_height;
+			}
+			if (target_width == 0 || target_height == 0) {
+				continue;
+			}
+			const struct xrt_rect *zr = &layer->data.zone_3d.rect;
+			const float zsx = (dx1 - dx0) / (float)target_width;
+			const float zsy = (dy1 - dy0) / (float)target_height;
+			VkViewport vp = {
+			    .x = dx0 + (float)zr->offset.w * zsx,
+			    .y = dy0 + (float)zr->offset.h * zsy,
+			    .width = (float)zr->extent.w * zsx,
+			    .height = (float)zr->extent.h * zsy,
+			    .minDepth = 0.0f,
+			    .maxDepth = 1.0f,
+			};
+			if (vp.width <= 0.0f || vp.height <= 0.0f) {
+				continue;
+			}
+
+			// Scissor: the viewport clamped to the tile box (the zone
+			// rect is window-space and may poke past the tile under a
+			// stale resize) and to the atlas.
+			float sx0f = vp.x < dx0 ? dx0 : vp.x;
+			float sy0f = vp.y < dy0 ? dy0 : vp.y;
+			float sx1f = vp.x + vp.width > dx1 ? dx1 : vp.x + vp.width;
+			float sy1f = vp.y + vp.height > dy1 ? dy1 : vp.y + vp.height;
+			if (sx0f < 0.0f) {
+				sx0f = 0.0f;
+			}
+			if (sy0f < 0.0f) {
+				sy0f = 0.0f;
+			}
+			if (sx1f > (float)r->atlas_alloc_width) {
+				sx1f = (float)r->atlas_alloc_width;
+			}
+			if (sy1f > (float)r->atlas_alloc_height) {
+				sy1f = (float)r->atlas_alloc_height;
+			}
+			if (sx1f <= sx0f || sy1f <= sy0f) {
+				continue;
+			}
+			VkRect2D scissor = {
+			    .offset = {(int32_t)sx0f, (int32_t)sy0f},
+			    .extent = {(uint32_t)(sx1f - sx0f + 0.5f), (uint32_t)(sy1f - sy0f + 0.5f)},
+			};
+
+			VkDescriptorSetAllocateInfo ds_ai = {
+			    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+			    .descriptorPool = r->zone.descriptor_pool,
+			    .descriptorSetCount = 1,
+			    .pSetLayouts = &r->zone.set_layout,
+			};
+			VkDescriptorSet set = VK_NULL_HANDLE;
+			res = vk->vkAllocateDescriptorSets(vk->device, &ds_ai, &set);
+			if (res != VK_SUCCESS) {
+				continue;
+			}
+
+			VkDescriptorImageInfo image_info = {
+			    .sampler = r->zone.sampler,
+			    .imageView = src_view,
+			    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			};
+			VkWriteDescriptorSet write = {
+			    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+			    .dstSet = set,
+			    .dstBinding = 0,
+			    .descriptorCount = 1,
+			    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			    .pImageInfo = &image_info,
+			};
+			vk->vkUpdateDescriptorSets(vk->device, 1, &write, 0, NULL);
+
+			// Normalized source rect (the zone's view tile inside its
+			// swapchain image).
+			uint32_t sc_w = 0;
+			uint32_t sc_h = 0;
+			comp_vk_native_swapchain_get_dimensions(xsc, &sc_w, &sc_h);
+			if (sc_w == 0 || sc_h == 0) {
+				continue;
+			}
+			const struct xrt_rect *sr = &layer->data.proj.v[eye].sub.rect;
+			float push[4] = {
+			    (float)sr->offset.w / (float)sc_w,
+			    (float)sr->offset.h / (float)sc_h,
+			    (float)sr->extent.w / (float)sc_w,
+			    (float)sr->extent.h / (float)sc_h,
+			};
+
+			vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+			                       unpremul ? r->zone.pipeline_unpremult : r->zone.pipeline_premult);
+			vk->vkCmdSetViewport(cmd, 0, 1, &vp);
+			vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
+			vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+			                             r->zone.pipeline_layout, 0, 1, &set, 0, NULL);
+			vk->vkCmdPushConstants(cmd, r->zone.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+			                        sizeof(push), push);
+			vk->vkCmdDraw(cmd, 3, 1, 0, 0);
+			draw_count++;
+		}
+	}
+
+	vk->vkCmdEndRenderPass(cmd);
+
+	// Hand the source images back to the apps' steady-state layout.
+	for (uint32_t t = 0; t < transitioned_count; t++) {
+		cmd_image_barrier(vk, cmd, transitioned[t],
+		                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		                   VK_ACCESS_SHADER_READ_BIT,
+		                   VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+	}
+
+	vk->vkEndCommandBuffer(cmd);
+
+	VkSubmitInfo submit_info = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .commandBufferCount = 1,
+	    .pCommandBuffers = &cmd,
+	};
+
+	res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("VK zones: failed to submit draw commands: %d", res);
+		vk->vkFreeCommandBuffers(vk->device, r->cmd_pool, 1, &cmd);
+		return XRT_ERROR_VULKAN;
+	}
+
+	vk->vkQueueWaitIdle(vk->main_queue->queue);
+	vk->vkFreeCommandBuffers(vk->device, r->cmd_pool, 1, &cmd);
+
+	static bool zones_draw_logged = false;
+	if (!zones_draw_logged) {
+		zones_draw_logged = true;
+		U_LOG_W("VK zones: draw-based alpha-over pass active (%u draw(s) this frame)", draw_count);
+	}
+
+	return XRT_SUCCESS;
+}
+
 xrt_result_t
 comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
                               struct comp_layer_accum *layers,
@@ -305,6 +1045,25 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	struct vk_bundle *vk = r->vk;
 	(void)left_eye;
 	(void)right_eye;
+
+	// XR_EXT_display_zones (ADR-027): a zones frame composes N placed zone
+	// layers into the window-spanning atlas — the unzoned area must stay
+	// transparent so the feathered wish edge blends toward the desktop.
+	bool zones_frame = false;
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		if (layers->layers[i].data.type == XRT_LAYER_ZONE_3D) {
+			zones_frame = true;
+			break;
+		}
+	}
+
+	// Zones frames take the draw-based pass so overlapping zones composite
+	// alpha-over in layer-list order; blits cannot blend. Falls back to the
+	// blit path below (overlap overwrites, one-shot WARN) if the pipeline
+	// bundle cannot be created or a zone swapchain is layered.
+	if (zones_frame && zone_pass_usable(r, layers, hardware_display_3d)) {
+		return draw_zones_pass(r, layers, target_width, target_height, hardware_display_3d);
+	}
 
 	VkCommandBufferAllocateInfo alloc_info = {
 	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -333,17 +1092,6 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	                   0, VK_ACCESS_TRANSFER_WRITE_BIT,
 	                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 	                   VK_PIPELINE_STAGE_TRANSFER_BIT);
-
-	// XR_EXT_display_zones (ADR-027): a zones frame composes N placed zone
-	// layers into the window-spanning atlas — the unzoned area must stay
-	// transparent so the feathered wish edge blends toward the desktop.
-	bool zones_frame = false;
-	for (uint32_t i = 0; i < layers->layer_count; i++) {
-		if (layers->layers[i].data.type == XRT_LAYER_ZONE_3D) {
-			zones_frame = true;
-			break;
-		}
-	}
 
 	// Clear atlas texture to black. Use alpha=0 in transparent-background mode
 	// so atlas regions not overwritten by a tile blit stay see-through (issue #392).
@@ -430,10 +1178,10 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 
 			// XR_EXT_display_zones: scale the zone rect (client-window
 			// px) into the tile box — in zones frames the tile spans
-			// the full window. NOTE (VK P2): blits OVERWRITE — an
-			// overlapping zone replaces rather than alpha-overs the
-			// one below (one-shot WARN; draw-based blending rides the
-			// P4 wish-publish leg or a later renderer rework).
+			// the full window. FALLBACK ONLY: zones frames normally
+			// take draw_zones_pass (alpha-over); this blit leg runs
+			// when the pipeline bundle failed or a zone swapchain is
+			// layered, and then overlaps OVERWRITE (one-shot WARN).
 			if (is_zone && target_width > 0 && target_height > 0) {
 				const struct xrt_rect *zr = &layer->data.zone_3d.rect;
 				const float bw = (float)(dx1 - dx0);
@@ -484,9 +1232,8 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 						               zr->offset.h < pr->offset.h + pr->extent.h;
 						if (overlap) {
 							zone_overlap_warned = true;
-							U_LOG_W("VK zones: overlapping zones OVERWRITE in "
-							        "blit order (alpha-over not implemented on "
-							        "the VK blit path yet — one-time warning)");
+							U_LOG_W("VK zones: blit FALLBACK in use — overlapping "
+							        "zones OVERWRITE in blit order (one-time warning)");
 						}
 					}
 				}
