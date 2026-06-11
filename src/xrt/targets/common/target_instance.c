@@ -204,17 +204,32 @@ t_instance_create_system(struct xrt_instance *xinst,
 
 	bool use_null = debug_get_bool_option_use_null();
 
+	// Source the panel refresh from the active plug-in BEFORE creating the
+	// compositor — the null compositor seeds its frame pacer once at create
+	// (the DP plug-in owns present/weave on this path, so there's no swapchain
+	// vblank to read). 0/unknown from the plug-in (or no plug-in) falls back to
+	// 60 Hz, NOT the null compositor's own 20 FPS placeholder which used to cap
+	// xrWaitFrame far below the panel + the ~10 ms/frame app workload (#263
+	// dropped the old in-proc leia_edid refresh query). get_display_info is
+	// idempotent + cheap; it's called again below to populate the full info.
+	float sr_refresh_rate_hz = 60.0f;
+	{
+		const struct xrt_plugin_iface *rr_plugin = target_plugin_get_active();
+		if (rr_plugin != NULL &&
+		    rr_plugin->struct_size > offsetof(struct xrt_plugin_iface, get_display_info) &&
+		    rr_plugin->get_display_info != NULL) {
+			struct xrt_plugin_display_info rr_pdi = {0};
+			rr_pdi.struct_size = (uint32_t)sizeof(rr_pdi);
+			if (rr_plugin->get_display_info(target_plugin_get_active_instance(), head, &rr_pdi) &&
+			    rr_pdi.refresh_mhz > 0) {
+				sr_refresh_rate_hz = (float)rr_pdi.refresh_mhz / 1000.0f;
+			}
+		}
+	}
+	U_LOG_W("Null-compositor frame pacing: %.2f Hz", (double)sr_refresh_rate_hz);
+
 #ifdef XRT_MODULE_COMPOSITOR_NULL
 	if (use_null) {
-		// Refresh rate sourcing: previously queried via leia_edid + SR SDK
-		// when the in-proc Leia fallback was linked. Post-#263 the SR
-		// path lives entirely in the plug-in DLL. INTERIM: pass a real rate
-		// instead of 0 (which the null compositor maps to a 20 FPS default —
-		// that placeholder was capping xrWaitFrame to 20 Hz on Android, far
-		// below the panel's 60-144 Hz and the ~10 ms/frame app workload).
-		// TODO: source the true panel refresh from xrt_plugin_display_info
-		// (the monitor-descriptor refresh_mhz path is not yet plumbed there).
-		float sr_refresh_rate_hz = 90.0f;
 		xret = null_compositor_create_system_with_dims(head, 0, 0,
 		                                               sr_refresh_rate_hz, &xsysc);
 	}
