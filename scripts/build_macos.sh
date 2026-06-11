@@ -112,6 +112,13 @@ cmake -B "$ROOT/test_apps/cube_handle_gl_macos/build" \
   -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
 cmake --build "$ROOT/test_apps/cube_handle_gl_macos/build"
 
+echo "=== Building cube_zones_metal_macos ==="
+cmake -B "$ROOT/test_apps/cube_zones_metal_macos/build" \
+  -S "$ROOT/test_apps/cube_zones_metal_macos" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
+cmake --build "$ROOT/test_apps/cube_zones_metal_macos/build"
+
 # Step 3b: Build texture (shared-texture) test apps
 echo "=== Building cube_texture_metal_macos ==="
 cmake -B "$ROOT/test_apps/cube_texture_metal_macos/build" \
@@ -214,6 +221,7 @@ fi
 # Copy test app binaries
 cp "$ROOT/test_apps/cube_handle_vk_macos/build/cube_handle_vk_macos" "$PKG_DIR/bin/"
 cp "$ROOT/test_apps/cube_handle_metal_macos/build/cube_handle_metal_macos" "$PKG_DIR/bin/" 2>/dev/null || true
+cp "$ROOT/test_apps/cube_zones_metal_macos/build/cube_zones_metal_macos" "$PKG_DIR/bin/" 2>/dev/null || true
 cp "$ROOT/test_apps/cube_handle_gl_macos/build/cube_handle_gl_macos" "$PKG_DIR/bin/" 2>/dev/null || true
 cp "$ROOT/test_apps/cube_texture_metal_macos/build/cube_texture_metal_macos" "$PKG_DIR/bin/" 2>/dev/null || true
 cp "$ROOT/test_apps/cube_hosted_metal_macos/build/cube_hosted_metal_macos" "$PKG_DIR/bin/" 2>/dev/null || true
@@ -285,6 +293,7 @@ fi
 install_name_tool -add_rpath @loader_path "$PKG_DIR/lib/$RUNTIME_BASENAME" 2>/dev/null || true
 install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_handle_vk_macos" 2>/dev/null || true
 install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_handle_metal_macos" 2>/dev/null || true
+install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_zones_metal_macos" 2>/dev/null || true
 install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_handle_gl_macos" 2>/dev/null || true
 install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_texture_metal_macos" 2>/dev/null || true
 install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_hosted_metal_macos" 2>/dev/null || true
@@ -301,7 +310,7 @@ install_name_tool -add_rpath @loader_path "$PKG_DIR"/lib/libopenxr_loader*.dylib
 codesign --force --sign - "$PKG_DIR/lib/$RUNTIME_BASENAME" 2>/dev/null || true
 codesign --force --sign - "$PKG_DIR"/lib/libopenxr_loader*.dylib 2>/dev/null || true
 for app in cube_handle_vk_macos cube_handle_metal_macos cube_handle_gl_macos \
-           cube_texture_metal_macos cube_hosted_metal_macos \
+           cube_zones_metal_macos cube_texture_metal_macos cube_hosted_metal_macos \
            cube_hosted_legacy_metal_macos cube_hosted_legacy_gl_macos \
            cube_hosted_legacy_vk_macos; do
   [ -f "$PKG_DIR/bin/$app" ] && codesign --force --sign - "$PKG_DIR/bin/$app" 2>/dev/null || true
@@ -357,6 +366,19 @@ echo "Starting cube_handle_metal_macos (Metal, window handle) with $SIM_DISPLAY_
 exec "$DIR/bin/cube_handle_metal_macos" "$@"
 SCRIPT
 chmod +x "$PKG_DIR/run_cube_handle_metal.sh"
+
+# Create run script for the Metal display-zones exerciser (ADR-027)
+cat > "$PKG_DIR/run_cube_zones_metal.sh" <<'SCRIPT'
+#!/bin/bash
+DIR="$(cd "$(dirname "$0")" && pwd)"
+export XR_RUNTIME_JSON="$DIR/openxr_displayxr.json"
+export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
+export XRT_PLUGIN_SEARCH_PATH="$DIR/lib/displayxr/plugins"
+export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-sbs}"
+echo "Starting cube_zones_metal_macos (Metal, XR_EXT_display_zones) with $SIM_DISPLAY_OUTPUT output..."
+exec "$DIR/bin/cube_zones_metal_macos" "$@"
+SCRIPT
+chmod +x "$PKG_DIR/run_cube_zones_metal.sh"
 
 # Create run script for OpenGL handle test app (no Vulkan env vars needed)
 cat > "$PKG_DIR/run_cube_handle_gl.sh" <<'SCRIPT'
