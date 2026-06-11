@@ -21,6 +21,12 @@
 #include "main/comp_compositor.h"
 #include "main/comp_target_swapchain.h"
 
+#ifdef XRT_OS_ANDROID
+#include "android/android_globals.h"
+#include "util/u_time.h"
+#include <android/native_window.h>
+#endif
+
 #include <assert.h>
 #include <stdlib.h>
 
@@ -862,11 +868,181 @@ comp_target_swapchain_has_images(struct comp_target *ct)
 	return cts->surface.handle != VK_NULL_HANDLE && cts->swapchain.handle != VK_NULL_HANDLE;
 }
 
+#ifdef XRT_OS_ANDROID
+/*!
+ * Tear down everything tied to the current Android output surface: image
+ * views, swapchain, VkSurfaceKHR and our ref on the ANativeWindow. Order
+ * mirrors the in-process comp_vk_native_target_sync_surface (#507): idle the
+ * GPU first so nothing is in flight against the dying swapchain. Deliberately
+ * NOT comp_target_swapchain_cleanup() — that also destroys the semaphores and
+ * the pacer, which the per-session render path still needs.
+ */
+static void
+android_surface_teardown(struct comp_target_swapchain *cts)
+{
+	struct vk_bundle *vk = get_vk(cts);
+
+	vk->vkDeviceWaitIdle(vk->device);
+
+	destroy_image_views(cts);
+
+	if (cts->swapchain.handle != VK_NULL_HANDLE) {
+		vk->vkDestroySwapchainKHR(vk->device, cts->swapchain.handle, NULL);
+		cts->swapchain.handle = VK_NULL_HANDLE;
+	}
+
+	if (cts->surface.handle != VK_NULL_HANDLE) {
+		vk->vkDestroySurfaceKHR(vk->instance, cts->surface.handle, NULL);
+		cts->surface.handle = VK_NULL_HANDLE;
+	}
+
+	if (cts->android_surface.window != NULL) {
+		ANativeWindow_release((ANativeWindow *)cts->android_surface.window);
+		cts->android_surface.window = NULL;
+	}
+}
+
+/*!
+ * Follow the android_globals versioned window state (#528): the client
+ * forwards surfaceDestroyed / new-surface events over binder
+ * (clearAppSurface / passAppSurface), and this per-acquire sync makes the
+ * present target track them — instead of presenting into the abandoned
+ * BufferQueue forever.
+ *
+ * Returns:
+ * - VK_SUCCESS — surface healthy, proceed with the acquire.
+ * - VK_ERROR_OUT_OF_DATE_KHR — a fresh VkSurfaceKHR was just built (or the
+ *   swapchain is missing); the caller's existing recreate path must rebuild
+ *   the swapchain images.
+ * - VK_ERROR_SURFACE_LOST_KHR — no live output surface; skip the frame
+ *   quietly and retry next frame.
+ */
+static VkResult
+android_surface_sync(struct comp_target_swapchain *cts)
+{
+	struct _ANativeWindow *cur_window = NULL;
+	uint64_t cur_gen = 0;
+	bool cur_valid = false;
+	android_globals_get_window_state(&cur_window, &cur_gen, &cur_valid);
+
+	if (cur_gen == cts->android_surface.generation) {
+		if (cts->android_surface.lost) {
+			// Steady-state while backgrounded: stay torn down, presents paused.
+			int64_t now_ns = os_monotonic_get_ns();
+			if (now_ns - cts->android_surface.last_skip_log_ns >= U_TIME_1S_IN_NS) {
+				cts->android_surface.last_skip_log_ns = now_ns;
+				U_LOG_I("comp_window_android: no output surface — presents paused (#528)");
+			}
+			return VK_ERROR_SURFACE_LOST_KHR;
+		}
+
+		if (cts->surface.handle != VK_NULL_HANDLE && cts->swapchain.handle == VK_NULL_HANDLE) {
+			// The swapchain rebuild we asked for didn't happen or failed.
+			if (!cts->android_surface.recreate_requested) {
+				// Ask once more.
+				cts->android_surface.recreate_requested = true;
+				return VK_ERROR_OUT_OF_DATE_KHR;
+			}
+			// Two consecutive failures on this surface: give up until the
+			// next generation instead of spinning a hot recreate-fail loop.
+			U_LOG_W("comp_window_android: swapchain rebuild failed twice — pausing presents "
+			        "until a new surface arrives (#528)");
+			android_surface_teardown(cts);
+			cts->android_surface.lost = true;
+			cts->android_surface.last_skip_log_ns = os_monotonic_get_ns();
+			return VK_ERROR_SURFACE_LOST_KHR;
+		}
+
+		// Healthy.
+		cts->android_surface.recreate_requested = false;
+		return VK_SUCCESS;
+	}
+
+	// Generation changed: the surface was destroyed or replaced under us.
+	android_surface_teardown(cts);
+	cts->android_surface.generation = cur_gen;
+	cts->android_surface.recreate_requested = false;
+	// Drop any pending #510 extent debounce from the old surface.
+	cts->pending_extent.since_ns = 0;
+
+	if (!cur_valid || cur_window == NULL) {
+		// Backgrounded: no live surface. Stay torn down until the client
+		// passes the replacement (#528).
+		cts->android_surface.lost = true;
+		cts->android_surface.last_skip_log_ns = os_monotonic_get_ns();
+		U_LOG_W("comp_window_android: output surface lost — target torn down, presents paused (#528)");
+		return VK_ERROR_SURFACE_LOST_KHR;
+	}
+
+	// Resume: rebuild the VkSurfaceKHR from the new ANativeWindow. The caller's
+	// OUT_OF_DATE handling rebuilds the swapchain images at the new extent.
+	struct vk_bundle *vk = get_vk(cts);
+
+	VkAndroidSurfaceCreateInfoKHR surface_info = {
+	    .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
+	    .flags = 0,
+	    .window = (struct ANativeWindow *)cur_window,
+	};
+
+	VkSurfaceKHR surface = VK_NULL_HANDLE;
+	VkResult ret = vk->vkCreateAndroidSurfaceKHR(vk->instance, &surface_info, NULL, &surface);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("comp_window_android: vkCreateAndroidSurfaceKHR on resume failed: %s", vk_result_string(ret));
+		cts->android_surface.lost = true;
+		cts->android_surface.last_skip_log_ns = os_monotonic_get_ns();
+		return VK_ERROR_SURFACE_LOST_KHR;
+	}
+
+	cts->surface.handle = surface;
+	// Take ownership of the published ref (released at the next teardown). A
+	// window published and replaced between two syncs leaks one ref — bounded
+	// and rare, same accepted behavior as the in-process path (#507).
+	cts->android_surface.window = cur_window;
+	cts->android_surface.lost = false;
+
+	U_LOG_W("comp_window_android: surface recreated from new ANativeWindow %p, requesting swapchain "
+	        "rebuild (#528)",
+	        (void *)cur_window);
+
+	return VK_ERROR_OUT_OF_DATE_KHR;
+}
+
+/*!
+ * Handle a spontaneous VK_ERROR_SURFACE_LOST_KHR from the driver (the surface
+ * died before the client's clearAppSurface arrived over binder): tear down and
+ * pause presents; the pending generation bump rebuilds us when it lands.
+ */
+static VkResult
+android_surface_spontaneous_loss(struct comp_target_swapchain *cts, const char *where)
+{
+	U_LOG_W("comp_window_android: %s reported VK_ERROR_SURFACE_LOST_KHR — target torn down, presents "
+	        "paused (#528)",
+	        where);
+	android_surface_teardown(cts);
+	cts->android_surface.lost = true;
+	cts->android_surface.last_skip_log_ns = os_monotonic_get_ns();
+	return VK_ERROR_SURFACE_LOST_KHR;
+}
+#endif // XRT_OS_ANDROID
+
 static VkResult
 comp_target_swapchain_acquire_next_image(struct comp_target *ct, uint32_t *out_index)
 {
 	struct comp_target_swapchain *cts = (struct comp_target_swapchain *)ct;
 	struct vk_bundle *vk = get_vk(cts);
+
+#ifdef XRT_OS_ANDROID
+	// Follow the client's surface lifecycle before touching the swapchain:
+	// tears down on surfaceDestroyed, rebuilds the VkSurfaceKHR on the
+	// replacement surface and asks the caller (OUT_OF_DATE) to rebuild the
+	// swapchain (#528).
+	{
+		VkResult sres = android_surface_sync(cts);
+		if (sres != VK_SUCCESS) {
+			return sres;
+		}
+	}
+#endif
 
 	if (!comp_target_swapchain_has_images(ct)) {
 		//! @todo what error to return here?
@@ -886,6 +1062,10 @@ comp_target_swapchain_acquire_next_image(struct comp_target *ct, uint32_t *out_i
 		VkSurfaceCapabilitiesKHR caps;
 		VkResult cres = vk->vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk->physical_device,
 		                                                              cts->surface.handle, &caps);
+		if (cres == VK_ERROR_SURFACE_LOST_KHR) {
+			// The surface died before the client's clearAppSurface arrived (#528).
+			return android_surface_spontaneous_loss(cts, "surface-caps query");
+		}
 		bool valid_extent = cres == VK_SUCCESS && caps.currentExtent.width != (uint32_t)-1 &&
 		                    caps.currentExtent.width != 0 && caps.currentExtent.height != 0;
 		bool differs = valid_extent && (caps.currentExtent.width != cts->base.width ||
@@ -932,13 +1112,22 @@ comp_target_swapchain_acquire_next_image(struct comp_target *ct, uint32_t *out_i
 	}
 #endif
 
-	return vk->vkAcquireNextImageKHR(          //
+	VkResult ret = vk->vkAcquireNextImageKHR(  //
 	    vk->device,                            // device
 	    cts->swapchain.handle,                 // swapchain
 	    UINT64_MAX,                            // timeout
 	    cts->base.semaphores.present_complete, // semaphore
 	    VK_NULL_HANDLE,                        // fence
 	    out_index);                            // pImageIndex
+
+#ifdef XRT_OS_ANDROID
+	if (ret == VK_ERROR_SURFACE_LOST_KHR) {
+		// The surface died before the client's clearAppSurface arrived (#528).
+		return android_surface_spontaneous_loss(cts, "acquire");
+	}
+#endif
+
+	return ret;
 }
 
 static VkResult
@@ -1195,6 +1384,14 @@ comp_target_swapchain_cleanup(struct comp_target_swapchain *cts)
 		    NULL);               //
 		cts->surface.handle = VK_NULL_HANDLE;
 	}
+
+#ifdef XRT_OS_ANDROID
+	// Release our ref on the ANativeWindow the surface was built from (#528).
+	if (cts->android_surface.window != NULL) {
+		ANativeWindow_release((ANativeWindow *)cts->android_surface.window);
+		cts->android_surface.window = NULL;
+	}
+#endif
 
 	target_fini_semaphores(cts);
 

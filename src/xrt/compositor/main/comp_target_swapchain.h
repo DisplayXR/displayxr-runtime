@@ -80,6 +80,29 @@ struct comp_target_swapchain
 		uint32_t height;
 		int64_t since_ns;
 	} pending_extent;
+
+	/*!
+	 * Surface lifecycle tracking for the out-of-process present target
+	 * (#528, mirrors the in-process comp_vk_native_target sync #507). The
+	 * client forwards surfaceDestroyed/new-surface events over binder into
+	 * android_globals' versioned window state; the per-acquire sync
+	 * (comp_target_swapchain_acquire_next_image) follows the generation:
+	 * tears the VkSwapchainKHR + VkSurfaceKHR down on loss, rebuilds from
+	 * the new ANativeWindow on resume.
+	 */
+	struct
+	{
+		//! Published ANativeWindow the surface was built from; we own one ref.
+		struct _ANativeWindow *window;
+		//! android_globals generation the current surface matches.
+		uint64_t generation;
+		//! True while torn down (no live output surface); presents paused.
+		bool lost;
+		//! An OUT_OF_DATE was already returned for a missing swapchain.
+		bool recreate_requested;
+		//! Throttle for the while-lost skip log.
+		int64_t last_skip_log_ns;
+	} android_surface;
 #endif
 
 	struct
