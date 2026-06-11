@@ -1944,6 +1944,18 @@ oxr_session_locate_views(struct oxr_logger *log,
 			rig_info.parallax_factor = sess->view_rig.parallax_factor;
 		}
 
+		// #521: forward the ACTIVE rendering mode's view count (1 = mono/2D,
+		// 2 = stereo/3D). The located view_count is always the stereo view-config
+		// count and OUTPUT_MODE doesn't cross IPC, so this is how the server learns
+		// the app is in 2D and collapses to a centered eye. The client head proxy's
+		// active_rendering_mode_index is kept current by xrRequestDisplayRenderingModeEXT.
+		rig_info.render_view_count = 0;
+		if (xdev != NULL && xdev->hmd != NULL && xdev->rendering_mode_count > 0 &&
+		    xdev->hmd->active_rendering_mode_index < xdev->rendering_mode_count) {
+			rig_info.render_view_count =
+			    xdev->rendering_modes[xdev->hmd->active_rendering_mode_index].view_count;
+		}
+
 		uint32_t wire_views = (view_count < XRT_MAX_VIEWS) ? view_count : XRT_MAX_VIEWS;
 		struct ipc_info_locate_views_rig reply = {0};
 		xrt_result_t xret =
