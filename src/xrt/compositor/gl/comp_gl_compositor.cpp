@@ -360,6 +360,22 @@ struct comp_gl_compositor
 	//! (set once at the top of layer_commit). Drives the effective-canvas
 	//! supersede + the composite's have_local_2d branch.
 	bool local_2d_last_frame;
+	//! XR_EXT_display_zones (ADR-027): true when the current frame's
+	//! accumulator carries XRT_LAYER_ZONE_3D layers (a "zones frame"). In a
+	//! zones frame the canvas output rect, the sticky submitted mask, and
+	//! the implicit-mask-from-Local2D rule are all inert; the effective
+	//! canvas is the full client window; the wish drives the post-weave
+	//! visual lerp. Set in the same per-frame scan as local_2d_last_frame.
+	bool zones_frame;
+	//! Explicit per-frame wish (XrDisplayZonesFrameEndInfoEXT.wishMask) set
+	//! via comp_gl_compositor_zones_set_frame_wish before commit; NULL =
+	//! auto-derive from the zone rects. Not owned — zone_mask_destroy
+	//! clears any dangling reference.
+	struct comp_gl_zone_mask *frame_wish;
+	//! Tier-1 fallback edge state (the base GL DP vtable has no
+	//! zone-publish slots until P4): request_display_mode(true) fired once
+	//! on the zones rising edge; never forces 2D on the falling edge.
+	bool zones_mode_requested;
 	//! Masked-composite program (FS_MASKED_COMPOSITE + VS_FULLSCREEN_QUAD).
 	GLuint program_masked_composite;
 	//! Post-weave composite scratch. weave_tex receives the DP weave (the DP
@@ -1196,6 +1212,22 @@ gl_compositor_layer_local_2d(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
+/*!
+ * 3D display zone layer (XR_EXT_display_zones, ADR-027) — multi-swapchain
+ * accumulate like projection; consumed by the zones-frame branch of
+ * layer_commit (zone rect scaled into the window-spanning atlas tile).
+ */
+static xrt_result_t
+gl_compositor_layer_zone_3d(struct xrt_compositor *xc,
+                            struct xrt_device *xdev,
+                            struct xrt_swapchain *xsc[XRT_MAX_VIEWS],
+                            const struct xrt_layer_data *data)
+{
+	struct comp_gl_compositor *c = gl_comp(xc);
+	comp_layer_accum_zone_3d(&c->layer_accum, xsc, data);
+	return XRT_SUCCESS;
+}
+
 
 /*
  *
@@ -1474,7 +1506,10 @@ gl_crop_and_process_dp(struct comp_gl_compositor *c,
 		dp_tex = c->dp_input_texture;
 	}
 
-	// Pass (possibly cropped) texture to DP
+	// Pass (possibly cropped) texture to DP.
+	// XR_EXT_display_zones: in a zones frame the output rect is inert —
+	// pass no canvas (0s) so the DP weaves the full client window.
+	const bool use_canvas = c->canvas.valid && !c->zones_frame;
 	glViewport(0, 0, output_w, output_h);
 	xrt_display_processor_gl_process_atlas(
 	    c->display_processor,
@@ -1486,10 +1521,10 @@ gl_crop_and_process_dp(struct comp_gl_compositor *c,
 	    GL_RGBA8,
 	    output_w,
 	    output_h,
-	    c->canvas.valid ? c->canvas.x : 0,
-	    c->canvas.valid ? c->canvas.y : 0,
-	    c->canvas.valid ? c->canvas.w : 0,
-	    c->canvas.valid ? c->canvas.h : 0);
+	    use_canvas ? c->canvas.x : 0,
+	    use_canvas ? c->canvas.y : 0,
+	    use_canvas ? c->canvas.w : 0,
+	    use_canvas ? c->canvas.h : 0);
 }
 
 
@@ -1633,6 +1668,105 @@ gl_update_implicit_mask(struct comp_gl_compositor *c,
 	memcpy(c->implicit_rects, rects, sizeof(rects[0]) * rect_count);
 	c->implicit_rect_count = rect_count;
 	U_LOG_W("implicit zone mask: %ux%u, %u Local2D rect(s)", w, h, rect_count);
+	return c->implicit_mask_tex;
+}
+
+// XR_EXT_display_zones (ADR-027) — (re)rasterize the AUTO wish: union of the
+// frame's zone rects with a stepped ring feather. M=0 everywhere, then for
+// each feather step (outermost first, ascending M) scissor-clear the expanded
+// rect of EVERY zone — max-semantics without a shader: the final step writes
+// M=1 at every zone core, so overlapping feathers can never dim a core.
+// Reuses the implicit-mask R8 texture (the implicit rule is inert in zones
+// frames) and re-rasters every zones frame, VK-style — a handful of scissored
+// clears — while invalidating the implicit rect cache so a later legacy frame
+// re-rasters. Rects are window px (top-left); flip Y for the bottom-left GL
+// framebuffer. Returns the mask texture, or 0 on failure.
+#define ZONE_WISH_FEATHER_STEPS 8
+#define ZONE_WISH_FEATHER_STEP_PX 2
+static GLuint
+gl_update_zone_wish_mask(struct comp_gl_compositor *c,
+                         const struct xrt_rect *rects,
+                         uint32_t rect_count,
+                         uint32_t w,
+                         uint32_t h)
+{
+	if (w == 0 || h == 0 || rect_count == 0) {
+		return 0;
+	}
+
+	// (Re)allocate — same R8 texture + FBO block as gl_update_implicit_mask.
+	if (c->implicit_mask_tex == 0 || c->implicit_mask_w != w || c->implicit_mask_h != h) {
+		if (c->implicit_mask_tex != 0) {
+			glDeleteTextures(1, &c->implicit_mask_tex);
+			c->implicit_mask_tex = 0;
+		}
+		if (c->implicit_mask_fbo == 0) {
+			glGenFramebuffers(1, &c->implicit_mask_fbo);
+		}
+		glGenTextures(1, &c->implicit_mask_tex);
+		glBindTexture(GL_TEXTURE_2D, c->implicit_mask_tex);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, w, h, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glBindTexture(GL_TEXTURE_2D, 0);
+		glBindFramebuffer(GL_FRAMEBUFFER, c->implicit_mask_fbo);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, c->implicit_mask_tex, 0);
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		c->implicit_mask_w = w;
+		c->implicit_mask_h = h;
+	}
+
+	// The wish raster replaces whatever the implicit rule cached.
+	c->implicit_rect_count = 0;
+
+	glBindFramebuffer(GL_FRAMEBUFFER, c->implicit_mask_fbo);
+	glViewport(0, 0, w, h);
+	glDisable(GL_SCISSOR_TEST);
+	glClearColor(0.0f, 0.0f, 0.0f, 0.0f); // no 3D wish anywhere
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	glEnable(GL_SCISSOR_TEST);
+	for (int32_t s = ZONE_WISH_FEATHER_STEPS; s >= 0; s--) {
+		const float v = (float)(ZONE_WISH_FEATHER_STEPS - s) / (float)ZONE_WISH_FEATHER_STEPS;
+		const int32_t expand = s * ZONE_WISH_FEATHER_STEP_PX;
+		glClearColor(v, 0.0f, 0.0f, 0.0f);
+		for (uint32_t i = 0; i < rect_count; i++) {
+			int32_t left = rects[i].offset.w - expand;
+			int32_t top = rects[i].offset.h - expand;
+			int32_t right = rects[i].offset.w + rects[i].extent.w + expand;
+			int32_t bottom = rects[i].offset.h + rects[i].extent.h + expand;
+			if (left < 0) {
+				left = 0;
+			}
+			if (top < 0) {
+				top = 0;
+			}
+			if (right > (int32_t)w) {
+				right = (int32_t)w;
+			}
+			if (bottom > (int32_t)h) {
+				bottom = (int32_t)h;
+			}
+			if (right <= left || bottom <= top) {
+				continue;
+			}
+			// Flip Y: window top-left → GL bottom-left framebuffer.
+			int32_t gl_y = (int32_t)h - bottom;
+			glScissor(left, gl_y, right - left, bottom - top);
+			glClear(GL_COLOR_BUFFER_BIT);
+		}
+	}
+	glDisable(GL_SCISSOR_TEST);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+	static bool wish_logged = false;
+	if (!wish_logged) {
+		wish_logged = true;
+		U_LOG_W("GL zone wish mask (auto): %ux%u, %u zone rect(s), %u-px feather", w, h, rect_count,
+		        ZONE_WISH_FEATHER_STEPS * ZONE_WISH_FEATHER_STEP_PX);
+	}
 	return c->implicit_mask_tex;
 }
 
@@ -1879,12 +2013,15 @@ gl_dp_weave_to_fbo(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint target
 		dp_tex = c->dp_input_texture;
 	}
 
+	// XR_EXT_display_zones: in a zones frame the output rect is inert —
+	// pass no canvas (0s) so the DP weaves the full client window.
+	const bool use_canvas = c->canvas.valid && !c->zones_frame;
 	glBindFramebuffer(GL_FRAMEBUFFER, target_fbo);
 	glViewport(0, 0, output_w, output_h);
 	xrt_display_processor_gl_process_atlas(c->display_processor, dp_tex, c->view_width, c->view_height,
 	                                       c->tile_columns, c->tile_rows, GL_RGBA8, output_w, output_h,
-	                                       c->canvas.valid ? c->canvas.x : 0, c->canvas.valid ? c->canvas.y : 0,
-	                                       c->canvas.valid ? c->canvas.w : 0, c->canvas.valid ? c->canvas.h : 0);
+	                                       use_canvas ? c->canvas.x : 0, use_canvas ? c->canvas.y : 0,
+	                                       use_canvas ? c->canvas.w : 0, use_canvas ? c->canvas.h : 0);
 }
 
 // #439 Phase 3 — the post-weave masked composite. Runs INSTEAD of the plain
@@ -1897,11 +2034,15 @@ static bool
 gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint target_fbo, uint32_t output_w,
                       uint32_t output_h)
 {
+	// XR_EXT_display_zones: a zones frame ALWAYS runs the composite (the
+	// feathered wish edge lerps the weave toward the 2D flatten even with
+	// zero Local2D layers); the sticky mask + implicit-mask rules are inert.
 	struct comp_gl_zone_mask *mask = c->active_zone_mask;
-	const bool have_explicit = (mask != NULL && mask->submitted && mask->tex != 0);
+	const bool zones_frame = c->zones_frame;
+	const bool have_explicit = !zones_frame && (mask != NULL && mask->submitted && mask->tex != 0);
 	const bool have_local_2d = c->local_2d_last_frame;
-	if ((!have_explicit && !have_local_2d) || c->program_masked_composite == 0 || output_w == 0 ||
-	    output_h == 0) {
+	if ((!zones_frame && !have_explicit && !have_local_2d) || c->program_masked_composite == 0 ||
+	    output_w == 0 || output_h == 0) {
 		return false;
 	}
 
@@ -1933,9 +2074,29 @@ gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint tar
 		c->composite_scratch_h = output_h;
 	}
 
-	// Resolve the mask texture: explicit submitted mask wins; else implicit.
+	// Resolve the mask texture. Zones frame (XR_EXT_display_zones): the
+	// WISH — the explicit frame wish (same-context GL authoring texture,
+	// referenced-at-frame-end = consume current authored state, no submit
+	// required — mirroring zone_mask_submit's no-staging contract) or the
+	// auto ring-feathered raster from the zone rects. Legacy: explicit
+	// submitted mask wins; else implicit.
 	GLuint mask_tex = 0;
-	if (have_explicit) {
+	if (zones_frame) {
+		if (c->frame_wish != NULL && c->frame_wish->tex != 0) {
+			mask_tex = c->frame_wish->tex;
+		} else {
+			struct xrt_rect zone_rects[XRT_MAX_LAYERS];
+			uint32_t zone_rect_count = 0;
+			for (uint32_t i = 0; i < c->layer_accum.layer_count && zone_rect_count < XRT_MAX_LAYERS;
+			     i++) {
+				if (c->layer_accum.layers[i].data.type != XRT_LAYER_ZONE_3D) {
+					continue;
+				}
+				zone_rects[zone_rect_count++] = c->layer_accum.layers[i].data.zone_3d.rect;
+			}
+			mask_tex = gl_update_zone_wish_mask(c, zone_rects, zone_rect_count, output_w, output_h);
+		}
+	} else if (have_explicit) {
 		mask_tex = mask->tex;
 	} else {
 		struct xrt_rect rects[XRT_MAX_LAYERS];
@@ -1958,8 +2119,11 @@ gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint tar
 	// Flatten the Local2D layers (the twod source). With no Local2D layers (a
 	// pure explicit-mask frame) the scratch stays transparent → the masked
 	// region shows the desktop, matching the VK leg.
+	// Zones frame: flatten ALL Local2D layers (no under/over split — 2D-under
+	// is reserved in v1); with zero Local2D layers the clear-only scratch
+	// fades the feather to transparent.
 	if (have_local_2d) {
-		gl_flatten_local_2d_layers(c, output_w, output_h, proj_idx);
+		gl_flatten_local_2d_layers(c, output_w, output_h, zones_frame ? -1 : proj_idx);
 	} else {
 		glBindFramebuffer(GL_FRAMEBUFFER, c->local2d_scratch_fbo);
 		glViewport(0, 0, output_w, output_h);
@@ -1999,7 +2163,10 @@ gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint tar
 	// #491: the implicit (auto) Local2D mask composites the 2D over the weave by
 	// its own premultiplied alpha (translucent 2D reveals the 3D scene). The
 	// explicit authored mask keeps the hard M-lerp.
-	const bool alpha_over = have_local_2d && !have_explicit;
+	// XR_EXT_display_zones: zones frames are ALWAYS the hard M-lerp
+	// (final = M·weave + (1−M)·flatten(2D-over)) — composition follows zone
+	// geometry + the wish, never the #491 alpha-over rule.
+	const bool alpha_over = !zones_frame && have_local_2d && !have_explicit;
 	glUniform1i(glGetUniformLocation(c->program_masked_composite, "u_alpha_over"), alpha_over ? 1 : 0);
 	glDrawArrays(GL_TRIANGLES, 0, 3);
 	glActiveTexture(GL_TEXTURE0);
@@ -2007,7 +2174,7 @@ gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint tar
 	static bool composite_logged = false;
 	if (!composite_logged) {
 		U_LOG_W("GL Local2D composite: %ux%u region, %s mask, twod=%s (#491 alpha_over=%d)", output_w,
-		        output_h, have_explicit ? "explicit" : "implicit",
+		        output_h, zones_frame ? "zone wish" : (have_explicit ? "explicit" : "implicit"),
 		        have_local_2d ? "local2d layers" : "(empty)", alpha_over);
 		composite_logged = true;
 	}
@@ -2128,11 +2295,15 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 	// #439 Phase 3 — detect Local2D layers once per frame; drives the
 	// post-weave masked composite (the GL leg's consumer path).
+	// XR_EXT_display_zones: the zones-frame flag is resolved in the same
+	// scan (one coherent per-frame decision).
 	c->local_2d_last_frame = false;
+	c->zones_frame = false;
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
 			c->local_2d_last_frame = true;
-			break;
+		} else if (c->layer_accum.layers[i].data.type == XRT_LAYER_ZONE_3D) {
+			c->zones_frame = true;
 		}
 	}
 
@@ -2192,6 +2363,18 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	}
 #endif
 
+	// XR_EXT_display_zones tier-1 hardware fallback: the base GL DP vtable
+	// has no zone-publish slots until P4, so "any zone active => request
+	// 3D" once on the rising edge. No forced 2D on the falling edge.
+	// (After the context switch above — same context contract as the V-key
+	// toggle's request_display_mode call.)
+	if (c->zones_frame && !c->zones_mode_requested) {
+		c->zones_mode_requested = true;
+		comp_gl_compositor_request_display_mode(&c->base.base, true);
+	} else if (!c->zones_frame) {
+		c->zones_mode_requested = false;
+	}
+
 	// Sync hardware_display_3d, tile layout, and per-view dimensions
 	// from device's active rendering mode (MUST be before zero-copy check and blit)
 	if (c->xdev != NULL && c->xdev->hmd != NULL) {
@@ -2209,12 +2392,15 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			if (!c->legacy_app_tile_scaling && mode->view_width_pixels > 0) {
 				c->view_width = mode->view_width_pixels;
 				c->view_height = mode->view_height_pixels;
-				if (c->canvas.valid) {
+				// XR_EXT_display_zones: a zones frame spans the full
+				// client window (the output rect is inert) — view dims
+				// follow the window branch below.
+				if (c->canvas.valid && !c->zones_frame) {
 					u_tiling_compute_canvas_view(mode, c->canvas.w, c->canvas.h,
 					                             &c->view_width, &c->view_height);
 				}
 #if defined(XRT_OS_WINDOWS) || defined(__APPLE__)
-				else if (!c->owns_window) {
+				else if (!c->owns_window || c->zones_frame) {
 					// Handle app: window may be smaller than the display,
 					// so scale view dims to the actual window client area
 					// (matches the D3D11/D3D12 path) — keeps the atlas content
@@ -2308,8 +2494,33 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	// apps keep the alpha=1 clear (unchanged). The per-eye blit below must be a
 	// REPLACE (blend off) so the app's alpha is written verbatim rather than
 	// blended over this clear.
-	glClearColor(0.0f, 0.0f, 0.0f, c->transparent_background ? 0.0f : 1.0f);
+	// XR_EXT_display_zones (ADR-027): a zones frame composes N placed zone
+	// layers into the window-spanning atlas — the unzoned area must weave to
+	// nothing (transparent) so the feathered wish edge blends toward the
+	// desktop.
+	glClearColor(0.0f, 0.0f, 0.0f, (c->transparent_background || c->zones_frame) ? 0.0f : 1.0f);
 	glClear(GL_COLOR_BUFFER_BIT);
+
+	// XR_EXT_display_zones: zone rects are client-window px and the tile
+	// spans the full window in zones frames, so the zone scale target is
+	// the window client area (content dims as the headless fallback).
+	uint32_t zones_target_w = 0;
+	uint32_t zones_target_h = 0;
+	if (c->zones_frame) {
+#ifdef XRT_OS_WINDOWS
+		RECT zrc;
+		if (c->hwnd != NULL && GetClientRect(c->hwnd, &zrc) && zrc.right > 0 && zrc.bottom > 0) {
+			zones_target_w = (uint32_t)zrc.right;
+			zones_target_h = (uint32_t)zrc.bottom;
+		}
+#elif defined(__APPLE__)
+		comp_gl_window_macos_get_dimensions(c->macos_window, &zones_target_w, &zones_target_h);
+#endif
+		if (zones_target_w == 0 || zones_target_h == 0) {
+			zones_target_w = c->tile_columns * c->view_width;
+			zones_target_h = c->tile_rows * c->view_height;
+		}
+	}
 
 	glUseProgram(c->program_blit);
 	glBindVertexArray(c->vao_empty);
@@ -2324,8 +2535,11 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
 
+		// XR_EXT_display_zones: zone layers blit through the same pass at
+		// a sub-tile viewport (alpha-over in layer-list order).
+		const bool is_zone = layer->data.type == XRT_LAYER_ZONE_3D;
 		if (layer->data.type != XRT_LAYER_PROJECTION &&
-		    layer->data.type != XRT_LAYER_PROJECTION_DEPTH) {
+		    layer->data.type != XRT_LAYER_PROJECTION_DEPTH && !is_zone) {
 			continue;
 		}
 
@@ -2358,13 +2572,55 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			}
 
 			// Set viewport for this eye in the atlas texture
+			uint32_t tbx, tby, tbw, tbh; // per-view tile box
 			if (!c->hardware_display_3d) {
-				glViewport(0, 0, c->tile_columns * c->view_width, c->tile_rows * c->view_height);
+				tbx = 0;
+				tby = 0;
+				tbw = c->tile_columns * c->view_width;
+				tbh = c->tile_rows * c->view_height;
 			} else {
 				uint32_t tile_x = eye % c->tile_columns;
 				uint32_t tile_y = eye / c->tile_columns;
-				glViewport(tile_x * c->view_width, tile_y * c->view_height,
-				           c->view_width, c->view_height);
+				tbx = tile_x * c->view_width;
+				tby = tile_y * c->view_height;
+				tbw = c->view_width;
+				tbh = c->view_height;
+			}
+			if (is_zone) {
+				// XR_EXT_display_zones: scale the zone rect (client-
+				// window px, top-left origin) into the tile box — in
+				// zones frames the tile spans the full window, so
+				// scale = tile/window. The atlas is a GL bottom-left
+				// framebuffer, so the placement Y flips within the
+				// tile (zone content stays GL-oriented, like a
+				// projection tile). Premul vs straight alpha-over per
+				// the UNPREMULTIPLIED flag.
+				if (zones_target_w == 0 || zones_target_h == 0) {
+					continue;
+				}
+				const struct xrt_rect *zr = &layer->data.zone_3d.rect;
+				const float zsx = (float)tbw / (float)zones_target_w;
+				const float zsy = (float)tbh / (float)zones_target_h;
+				GLint zx = (GLint)tbx + (GLint)((float)zr->offset.w * zsx);
+				GLint zy = (GLint)tby +
+				           (GLint)((float)((int32_t)zones_target_h - zr->offset.h - zr->extent.h) *
+				                   zsy);
+				GLsizei zw = (GLsizei)((float)zr->extent.w * zsx);
+				GLsizei zh = (GLsizei)((float)zr->extent.h * zsy);
+				if (zw <= 0 || zh <= 0) {
+					continue;
+				}
+				glViewport(zx, zy, zw, zh);
+				glEnable(GL_BLEND);
+				if ((layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0) {
+					glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE,
+					                    GL_ONE_MINUS_SRC_ALPHA);
+				} else {
+					glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE,
+					                    GL_ONE_MINUS_SRC_ALPHA);
+				}
+			} else {
+				glViewport(tbx, tby, tbw, tbh);
 			}
 
 			glActiveTexture(GL_TEXTURE0);
@@ -2390,6 +2646,12 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 			// Draw fullscreen quad (3 vertices, generated in vertex shader)
 			glDrawArrays(GL_TRIANGLES, 0, 3);
+
+			// XR_EXT_display_zones: restore the REPLACE blit state for
+			// the next (projection) draw.
+			if (is_zone) {
+				glDisable(GL_BLEND);
+			}
 		}
 	}
 
@@ -2528,10 +2790,19 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			                        c->shared_gl_texture, 0);
 
 			if (c->display_processor != NULL) {
-				// DP target: use canvas dims for texture apps
+				// DP target: use canvas dims for texture apps.
+				// XR_EXT_display_zones: zones frames span the full
+				// shared surface (the output rect is inert — the
+				// gl_crop_and_process_dp canvas args are already
+				// zones-gated).
+				//! @todo P3 follow-up: the GL masked composite (and so
+				//! the zones wish lerp) only runs on the window-present
+				//! path — the shared-texture/IOSurface paths weave the
+				//! zone-placed atlas but skip the post-weave wish
+				//! composite (same pre-existing scope as Local2D).
 				uint32_t dp_w = c->shared_width;
 				uint32_t dp_h = c->shared_height;
-				if (c->canvas.valid && c->canvas.w > 0 && c->canvas.h > 0) {
+				if (c->canvas.valid && !c->zones_frame && c->canvas.w > 0 && c->canvas.h > 0) {
 					dp_w = c->canvas.w;
 					dp_h = c->canvas.h;
 				}
@@ -2575,10 +2846,12 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		                        GL_TEXTURE_RECTANGLE, c->iosurface_gl_texture, 0);
 
 		if (c->display_processor != NULL) {
-			// DP target: use canvas dims for texture apps
+			// DP target: use canvas dims for texture apps.
+			// XR_EXT_display_zones: zones frames span the full surface
+			// (output rect inert; see the shared-texture @todo above).
 			uint32_t dp_w = c->iosurface_width;
 			uint32_t dp_h = c->iosurface_height;
-			if (c->canvas.valid && c->canvas.w > 0 && c->canvas.h > 0) {
+			if (c->canvas.valid && !c->zones_frame && c->canvas.w > 0 && c->canvas.h > 0) {
 				dp_w = c->canvas.w;
 				dp_h = c->canvas.h;
 			}
@@ -3355,6 +3628,10 @@ comp_gl_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_ptr)
 	if (c->active_zone_mask == m) {
 		c->active_zone_mask = NULL;
 	}
+	// XR_EXT_display_zones: never leave a dangling frame-wish reference.
+	if (c->frame_wish == m) {
+		c->frame_wish = NULL;
+	}
 	if (m->tex != 0) {
 		glDeleteTextures(1, &m->tex);
 	}
@@ -3362,6 +3639,18 @@ comp_gl_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_ptr)
 		glDeleteFramebuffers(1, &m->fbo);
 	}
 	free(m);
+}
+
+extern "C" void
+comp_gl_compositor_zones_set_frame_wish(struct xrt_compositor *xc, void *mask)
+{
+	struct comp_gl_compositor *c = gl_comp(xc);
+
+	// Per-frame reference (XR_EXT_display_zones): oxr sets this on every
+	// zones frame before layer_commit, NULL meaning auto-derive. Consumed
+	// by the commit's composite; harmlessly stale on zero-zone frames (the
+	// zones branch never reads it there).
+	c->frame_wish = (struct comp_gl_zone_mask *)mask;
 }
 
 extern "C" bool
@@ -3488,7 +3777,11 @@ comp_gl_compositor_get_window_metrics(struct xrt_compositor *xc,
 	out_metrics->window_center_offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
 
 	out_metrics->valid = true;
-	u_canvas_apply_to_metrics(out_metrics, &c->canvas);
+	// XR_EXT_display_zones: a zones frame supersedes the canvas (the output
+	// rect is inert) — the metrics already describe the window.
+	if (!c->zones_frame) {
+		u_canvas_apply_to_metrics(out_metrics, &c->canvas);
+	}
 	return true;
 #elif defined(__APPLE__)
 	if (!c->sys_info_set || c->macos_window == NULL) {
@@ -3544,7 +3837,11 @@ comp_gl_compositor_get_window_metrics(struct xrt_compositor *xc,
 	out_metrics->window_center_offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
 
 	out_metrics->valid = true;
-	u_canvas_apply_to_metrics(out_metrics, &c->canvas);
+	// XR_EXT_display_zones: a zones frame supersedes the canvas (the output
+	// rect is inert) — the metrics already describe the window.
+	if (!c->zones_frame) {
+		u_canvas_apply_to_metrics(out_metrics, &c->canvas);
+	}
 	return true;
 #else
 	(void)c;
@@ -3821,6 +4118,7 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	xc->layer_quad = gl_compositor_layer_quad;
 	xc->layer_window_space = gl_compositor_layer_window_space;
 	xc->layer_local_2d = gl_compositor_layer_local_2d;
+	xc->layer_zone_3d = gl_compositor_layer_zone_3d;
 	xc->layer_commit = gl_compositor_layer_commit;
 	xc->destroy = gl_compositor_destroy;
 

@@ -2277,9 +2277,8 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 		}
 		// Hand the frame's wish reference (NULL = auto-derive) to the
 		// in-process native compositor before the layer submission it
-		// gates. P2 wires D3D11 + VK; the other APIs land with their
-		// zone-consumer legs (P3) — until then their zone layers drop
-		// with the one-shot WARN and the wish has no consumer.
+		// gates. All five native compositors consume it (D3D11 + VK in
+		// P2, D3D12/GL/Metal in the P3 parity port).
 		if (zones_frame && sess->xcn != NULL) {
 #ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 			if (sess->is_d3d11_native_compositor) {
@@ -2287,10 +2286,28 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 				                                           zones_wish_comp_mask);
 			}
 #endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+			if (sess->is_d3d12_native_compositor) {
+				comp_d3d12_compositor_zones_set_frame_wish(&sess->xcn->base,
+				                                           zones_wish_comp_mask);
+			}
+#endif
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+			if (sess->is_metal_native_compositor) {
+				comp_metal_compositor_zones_set_frame_wish(&sess->xcn->base,
+				                                           zones_wish_comp_mask);
+			}
+#endif
 #ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
 			if (sess->is_vk_native_compositor) {
 				comp_vk_native_compositor_zones_set_frame_wish(&sess->xcn->base,
 				                                               zones_wish_comp_mask);
+			}
+#endif
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+			if (sess->is_gl_native_compositor) {
+				comp_gl_compositor_zones_set_frame_wish(&sess->xcn->base,
+				                                        zones_wish_comp_mask);
 			}
 #endif
 		}
