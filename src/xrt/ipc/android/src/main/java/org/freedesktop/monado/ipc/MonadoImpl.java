@@ -92,6 +92,12 @@ public class MonadoImpl extends IMonado.Stub {
         return Settings.canDrawOverlays(context);
     }
 
+    @Override
+    public void clearAppSurface() {
+        Log.i(TAG, "clearAppSurface");
+        nativeClearAppSurface();
+    }
+
     public void shutdown() {
         Log.i(TAG, "shutdown");
         nativeShutdownServer();
@@ -121,6 +127,17 @@ public class MonadoImpl extends IMonado.Stub {
      */
     @SuppressWarnings("JavaJniMissingFunction")
     private native void nativeAppSurface(@NonNull Surface surface);
+
+    /**
+     * Native handling of the client's surface being destroyed (background → file picker etc.):
+     * marks the published window invalid so the compositor tears its VkSurfaceKHR down instead of
+     * presenting into the dead BufferQueue (#528).
+     *
+     * <p>Ignore warnings that this function is missing: it is not, it is just in a different
+     * module. See `src/xrt/targets/service-lib/service_target.cpp` for the implementation.
+     */
+    @SuppressWarnings("JavaJniMissingFunction")
+    private native void nativeClearAppSurface();
 
     /**
      * Native handling of receiving an FD for a new client: the FD should be used to start up the

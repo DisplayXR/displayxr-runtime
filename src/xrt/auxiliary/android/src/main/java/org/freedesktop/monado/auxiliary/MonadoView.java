@@ -32,6 +32,24 @@ public class MonadoView extends SurfaceView
         implements SurfaceHolder.Callback, SurfaceHolder.Callback2 {
     private static final String TAG = "MonadoView";
 
+    /**
+     * Observer for the surface lifecycle, fired from the SurfaceHolder callbacks on the UI thread.
+     *
+     * <p>Used by the out-of-process IPC client to forward surface destroy/recreate across the
+     * binder boundary so the service compositor can rebuild its VkSurfaceKHR (#528). Pure Java by
+     * design — JNI callback registration proved unreliable across classloaders (#507).
+     */
+    @Keep
+    public interface SurfaceStateListener {
+        /** A live surface is available (surfaceCreated/surfaceChanged). UI thread. */
+        void onSurfaceAvailable(@NonNull SurfaceHolder holder);
+
+        /** The current surface was destroyed. UI thread. */
+        void onSurfaceDestroyed();
+    }
+
+    @Nullable private SurfaceStateListener surfaceStateListener = null;
+
     private final Object currentSurfaceHolderSync = new Object();
 
     public int width = -1;
@@ -89,7 +107,25 @@ public class MonadoView extends SurfaceView
      */
     @NonNull @Keep
     public static MonadoView attachToActivity(@NonNull final Activity activity) {
+        return attachToActivity(activity, null);
+    }
+
+    /**
+     * Construct and start attaching a MonadoView to a client application, observing the surface
+     * lifecycle.
+     *
+     * <p>The listener is set before the view is posted to the window manager, so the first
+     * surfaceCreated is never missed.
+     *
+     * @param activity The activity to attach to.
+     * @param listener Surface lifecycle observer, may be null.
+     * @return The MonadoView instance created and asynchronously attached.
+     */
+    @NonNull @Keep
+    public static MonadoView attachToActivity(
+            @NonNull final Activity activity, @Nullable SurfaceStateListener listener) {
         final MonadoView view = new MonadoView(activity);
+        view.surfaceStateListener = listener;
         WindowManager.LayoutParams lp = new WindowManager.LayoutParams();
         lp.flags =
                 WindowManager.LayoutParams.FLAG_FULLSCREEN
@@ -291,6 +327,9 @@ public class MonadoView extends SurfaceView
             currentSurfaceHolderSync.notifyAll();
         }
         Log.i(TAG, "surfaceCreated: Got a surface holder!");
+        if (surfaceStateListener != null) {
+            surfaceStateListener.onSurfaceAvailable(surfaceHolder);
+        }
     }
 
     @Override
@@ -313,7 +352,11 @@ public class MonadoView extends SurfaceView
                         + " holder "
                         + currentSurfaceHolder.toString());
         // The native side pulls this updated surface via android_custom_surface_
-        // refresh_window() on its next poll (#507) — no push needed here.
+        // refresh_window() on its next poll (#507) — no push needed here. The
+        // out-of-process client instead observes via the listener (#528).
+        if (surfaceStateListener != null) {
+            surfaceStateListener.onSurfaceAvailable(surfaceHolder);
+        }
     }
 
     @Override
@@ -338,6 +381,9 @@ public class MonadoView extends SurfaceView
             // surfaceCreated/surfaceChanged that resume needs. The teardown handshake
             // stays in the session-destroy path (android_custom_surface destructor →
             // markAsDiscardedByNative); it does not belong on a transient surface loss.
+            if (surfaceStateListener != null) {
+                surfaceStateListener.onSurfaceDestroyed();
+            }
         }
     }
 

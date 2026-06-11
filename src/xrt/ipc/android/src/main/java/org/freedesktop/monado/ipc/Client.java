@@ -76,6 +76,19 @@ public class Client implements ServiceConnection {
     /** Control system ui visibility */
     private SystemUiController systemUiController = null;
 
+    /** The view we injected into the client activity; retained to observe its surface (#528). */
+    private MonadoView monadoView = null;
+
+    /** Guards lastSurfaceSent. */
+    private final Object surfaceSync = new Object();
+
+    /**
+     * The last Surface forwarded to the service via passAppSurface, for dedupe. Nulled on surface
+     * loss so the next available surface is always re-sent, even if the platform reuses the
+     * Surface object.
+     */
+    private Surface lastSurfaceSent = null;
+
     /**
      * Constructor
      *
@@ -173,7 +186,7 @@ public class Client implements ServiceConnection {
                                         return;
                                     }
 
-                                    monado.passAppSurface(surface);
+                                    sendSurfaceIfNew(surface);
                                 }
                             } catch (RemoteException e) {
                                 e.printStackTrace();
@@ -277,7 +290,24 @@ public class Client implements ServiceConnection {
     }
 
     @Nullable private Surface attachViewAndGetSurface(Activity activity) {
-        MonadoView monadoView = MonadoView.attachToActivity(activity);
+        // Observe the surface lifecycle so a background→resume cycle (e.g. a SAF
+        // file picker) forwards the destroy + the NEW surface to the service —
+        // otherwise the service compositor keeps presenting into the abandoned
+        // BufferQueue and the panel freezes (#528).
+        monadoView =
+                MonadoView.attachToActivity(
+                        activity,
+                        new MonadoView.SurfaceStateListener() {
+                            @Override
+                            public void onSurfaceAvailable(SurfaceHolder holder) {
+                                sendSurfaceIfNew(holder.getSurface());
+                            }
+
+                            @Override
+                            public void onSurfaceDestroyed() {
+                                notifySurfaceLost();
+                            }
+                        });
         SurfaceHolder holder = monadoView.waitGetSurfaceHolder(2000);
         Surface surface = null;
         if (holder != null) {
@@ -285,6 +315,57 @@ public class Client implements ServiceConnection {
         }
 
         return surface;
+    }
+
+    /**
+     * Forward the surface to the service unless it is the one we already sent.
+     *
+     * <p>Identity dedupe is enough: a size-only surfaceChanged keeps the same Surface, and the
+     * service tracks extent changes itself by polling the surface caps each acquire (#510).
+     * Called from both the blockingConnect worker thread and the UI-thread surface callbacks.
+     */
+    private void sendSurfaceIfNew(@Nullable Surface surface) {
+        synchronized (surfaceSync) {
+            if (surface == null || !surface.isValid() || surface == lastSurfaceSent) {
+                return;
+            }
+            IMonado service = monado;
+            if (service == null) {
+                return;
+            }
+            try {
+                service.passAppSurface(surface);
+                lastSurfaceSent = surface;
+                Log.i(TAG, "passAppSurface: forwarded new surface to service (#528)");
+            } catch (RemoteException e) {
+                Log.e(TAG, "passAppSurface failed: " + e);
+            }
+        }
+    }
+
+    /**
+     * Tell the service the surface is gone so its compositor stops presenting into the dead
+     * BufferQueue and tears its VkSurfaceKHR down (#528).
+     *
+     * <p>Synchronous binder call on purpose: returning from surfaceDestroyed is what invalidates
+     * the surface, so the service's generation bump must land before that.
+     */
+    private void notifySurfaceLost() {
+        synchronized (surfaceSync) {
+            // Null first: guarantees the next available surface is re-sent even if
+            // the platform hands back the same Surface object on resume.
+            lastSurfaceSent = null;
+            IMonado service = monado;
+            if (service == null) {
+                return;
+            }
+            try {
+                service.clearAppSurface();
+                Log.i(TAG, "clearAppSurface: notified service of surface loss (#528)");
+            } catch (RemoteException e) {
+                Log.e(TAG, "clearAppSurface failed: " + e);
+            }
+        }
     }
 
     /**
