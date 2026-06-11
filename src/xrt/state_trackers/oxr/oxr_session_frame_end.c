@@ -1214,11 +1214,21 @@ verify_window_space_layer(struct oxr_session *sess,
                           struct xrt_device *head,
                           uint64_t timestamp)
 {
-	// Window-space layers require a session created with XR_EXT_win32_window_binding
-	if (!sess->is_d3d11_native_compositor && !sess->is_d3d12_native_compositor && !sess->is_metal_native_compositor && !sess->is_gl_native_compositor && !sess->has_external_window) {
+	/*
+	 * Window-space layers need a compositor that can place a 2D layer in
+	 * window coordinates: any native compositor (all five implement the
+	 * composite), an IPC service-mode session (the service compositor
+	 * composites server-side — comp_multi on Android, D3D11 service on
+	 * Windows), or a session with a bound external window.
+	 */
+	bool is_native_compositor = sess->is_d3d11_native_compositor || sess->is_d3d12_native_compositor ||
+	                            sess->is_metal_native_compositor || sess->is_gl_native_compositor ||
+	                            sess->is_vk_native_compositor;
+	bool is_ipc_service = sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode;
+	if (!is_native_compositor && !is_ipc_service && !sess->has_external_window) {
 		return oxr_error(log, XR_ERROR_LAYER_INVALID,
-		                 "(frameEndInfo->layers[%u]) window-space layer requires session created with "
-		                 "XR_EXT_win32_window_binding",
+		                 "(frameEndInfo->layers[%u]) window-space layer requires a native-compositor "
+		                 "session, an IPC service session, or a window binding extension",
 		                 layer_index);
 	}
 

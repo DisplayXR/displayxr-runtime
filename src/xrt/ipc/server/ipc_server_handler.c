@@ -2420,7 +2420,8 @@ _update_window_space_layer(struct xrt_compositor *xc,
                            uint32_t i)
 {
 	// Window-space layers are silently skipped if the compositor doesn't implement them.
-	// The D3D11 service compositor accumulates them but doesn't render them yet (Phase 0D).
+	// Both service compositors render them: D3D11 service inline (ws_snapshot HUD path),
+	// comp_multi via composite_layers_to_intermediate (#506).
 	if (xc->layer_window_space == NULL) {
 		return true;
 	}
