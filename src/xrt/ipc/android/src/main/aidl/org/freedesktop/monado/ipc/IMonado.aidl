@@ -27,4 +27,12 @@ interface IMonado {
      * Asking service whether it has the capbility to draw over other apps or not.
      */
     boolean canDrawOverOtherApps();
+
+    /*!
+     * Tell the service the previously passed app surface was destroyed (e.g. the
+     * client backgrounded behind a file picker), so the compositor stops
+     * presenting into the dead BufferQueue and tears its VkSurfaceKHR down.
+     * The client passes the replacement via passAppSurface on resume. #528
+     */
+    void clearAppSurface();
 }

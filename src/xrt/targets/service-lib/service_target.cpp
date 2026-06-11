@@ -181,7 +181,20 @@ Java_org_freedesktop_monado_ipc_MonadoImpl_nativeAppSurface(JNIEnv *env, jobject
 
 	ANativeWindow *nativeWindow = ANativeWindow_fromSurface(env, surface);
 	android_globals_store_window((struct _ANativeWindow *)nativeWindow);
-	U_LOG_D("Stored ANativeWindow: %p", (void *)nativeWindow);
+	U_LOG_I("service: app surface published: ANativeWindow %p (#528)", (void *)nativeWindow);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_freedesktop_monado_ipc_MonadoImpl_nativeClearAppSurface(JNIEnv *env, jobject thiz)
+{
+	jni::init(env);
+	jni::Object monadoImpl(thiz);
+
+	// Mark the published window invalid + bump the generation; the compositor's
+	// per-acquire surface sync tears its VkSurfaceKHR down and pauses presents
+	// until the client passes the replacement surface (#528).
+	android_globals_clear_window();
+	U_LOG_I("service: app surface cleared (#528)");
 }
 
 extern "C" JNIEXPORT jint JNICALL
