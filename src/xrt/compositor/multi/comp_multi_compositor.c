@@ -675,8 +675,20 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 				mc->session_render.fenced_buffer = -1;
 			}
 
+#ifdef XRT_OS_ANDROID
+			// Keep the display processor (and, below, its borrowed command
+			// pool) alive across end→begin: session end/begin is a routine
+			// cycle now (SAF picker round-trip, #528), vendor DP creation is
+			// expensive (CNSDK init ~1 s), and CNSDK teardown is unreliable —
+			// leiaCore 0.10.x core release joins an internal thread that never
+			// exits, hanging this IPC handler and deadlocking the client in
+			// xrEndSession (displayxr-leia-plugin#39). init_session_render
+			// reuses the cached pair; the real destroy happens at client
+			// teardown.
+#else
 			// Destroy display processor (owns any vendor SDK handles)
 			xrt_display_processor_destroy(&mc->session_render.display_processor);
+#endif
 
 			// Destroy fences (generic Vulkan)
 			if (vk != NULL && mc->session_render.fences != NULL) {
@@ -690,6 +702,16 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 			mc->session_render.fences = NULL;
 
 			// Free command buffer array (command buffers destroyed with pool)
+#ifdef XRT_OS_ANDROID
+			// The pool survives end_session here (cached with the DP), so the
+			// buffers must be freed explicitly.
+			if (vk != NULL && mc->session_render.cmd_buffers != NULL &&
+			    mc->session_render.cmd_pool != VK_NULL_HANDLE && mc->session_render.buffer_count > 0) {
+				vk->vkFreeCommandBuffers(vk->device, mc->session_render.cmd_pool,
+				                         mc->session_render.buffer_count,
+				                         mc->session_render.cmd_buffers);
+			}
+#endif
 			free(mc->session_render.cmd_buffers);
 			mc->session_render.cmd_buffers = NULL;
 
@@ -714,12 +736,17 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 			}
 
 			// Destroy command pool
+#ifndef XRT_OS_ANDROID
+			// On Android the pool is cached across end→begin together with
+			// the display processor, which borrowed it at factory time and
+			// allocates per-frame command buffers from it (#528).
 			if (mc->session_render.cmd_pool != VK_NULL_HANDLE) {
 				if (vk != NULL) {
 					vk->vkDestroyCommandPool(vk->device, mc->session_render.cmd_pool, NULL);
 				}
 				mc->session_render.cmd_pool = VK_NULL_HANDLE;
 			}
+#endif
 
 			// Destroy per-session target using the service
 			if (mc->session_render.target != NULL && mc->msc->target_service != NULL) {
@@ -1571,18 +1598,22 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	U_LOG_W("Got Vulkan bundle: device=%p, physical=%p, queue=%p",
 	        (void *)vk->device, (void *)vk->physical_device, (void *)vk->main_queue->queue);
 
-	// Create command pool
-	VkCommandPoolCreateInfo pool_info = {
-	    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-	    .queueFamilyIndex = vk->main_queue->family_index,
-	    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-	};
+	// Create command pool — unless one survived a previous end_session (Android
+	// caches it together with the display processor that borrowed it, #528).
+	VkResult vk_ret;
+	if (mc->session_render.cmd_pool == VK_NULL_HANDLE) {
+		VkCommandPoolCreateInfo pool_info = {
+		    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+		    .queueFamilyIndex = vk->main_queue->family_index,
+		    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+		};
 
-	VkResult vk_ret = vk->vkCreateCommandPool(vk->device, &pool_info, NULL, &mc->session_render.cmd_pool);
-	if (vk_ret != VK_SUCCESS) {
-		U_LOG_E("Failed to create command pool: %d", vk_ret);
-		comp_target_service_destroy(mc->msc->target_service, &mc->session_render.target);
-		return false;
+		vk_ret = vk->vkCreateCommandPool(vk->device, &pool_info, NULL, &mc->session_render.cmd_pool);
+		if (vk_ret != VK_SUCCESS) {
+			U_LOG_E("Failed to create command pool: %d", vk_ret);
+			comp_target_service_destroy(mc->msc->target_service, &mc->session_render.target);
+			return false;
+		}
 	}
 
 	// Allocate command buffer ring and fences (one per swapchain image)
@@ -1719,7 +1750,16 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	// DISPLAY PROCESSOR: create via factory (set by driver at init time)
 	//
 
-	{
+	if (mc->session_render.display_processor != NULL) {
+		// Cached from a previous end_session (Android, #528): vendor DP
+		// creation is expensive and CNSDK teardown can hang
+		// (displayxr-leia-plugin#39), so the DP rides across session
+		// end→begin. It is not bound to the (recreated) swapchain — the
+		// target color view is set per frame — and its borrowed command
+		// pool was cached alongside it.
+		U_LOG_W("Reusing cached display processor for HWND %p (#528)",
+		        mc->session_render.external_window_handle);
+	} else {
 		xrt_dp_factory_vk_fn_t factory =
 		    (xrt_dp_factory_vk_fn_t)mc->msc->base.info.dp_factory_vk;
 		if (factory != NULL) {
