@@ -2051,6 +2051,14 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	} else
 #endif
 	if (mc->session_render.swapchain_needs_recreate) {
+		// Never recreate against a torn-down target (Android surface loss,
+		// #528): create_images on a VK_NULL_HANDLE surface is invalid usage.
+		// The acquire-time surface sync rebuilds the target when a new
+		// surface arrives.
+		if (!comp_target_check_ready(ct)) {
+			mc->session_render.swapchain_needs_recreate = false;
+			return;
+		}
 		recreate_session_swapchain(mc, vk);
 		// Re-read ct since create_images updates it in place
 		ct = mc->session_render.target;
@@ -2210,11 +2218,21 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		// Accept VK_SUBOPTIMAL_KHR — the image IS acquired, it's just not
 		// optimal (e.g. overlay window still resizing asynchronously).
 		ret = comp_target_acquire(ct, &buffer_index);
+		if (ret == VK_ERROR_SURFACE_LOST_KHR || ret == VK_ERROR_OUT_OF_DATE_KHR) {
+			// Surface gone / still settling (Android background, #528):
+			// skip this frame quietly, the target logs the transition.
+			return;
+		}
 		if (ret != VK_SUCCESS && ret != VK_SUBOPTIMAL_KHR) {
 			U_LOG_E("[per-session] Failed to acquire after swapchain recreation: %s",
 			        vk_result_string(ret));
 			return;
 		}
+	} else if (ret == VK_ERROR_SURFACE_LOST_KHR) {
+		// No live output surface (Android client backgrounded, #528): skip
+		// quietly. The delivered frame is still retired by the caller, so
+		// client frame pacing keeps flowing and xrWaitFrame never stalls.
+		return;
 	} else if (ret != VK_SUCCESS && ret != VK_SUBOPTIMAL_KHR) {
 		U_LOG_E("[per-session] Failed to acquire per-session target image: %s", vk_result_string(ret));
 		return;
@@ -2702,6 +2720,12 @@ submit_and_present:
 	if (ret == VK_ERROR_OUT_OF_DATE_KHR) {
 		U_LOG_W("[per-session] Present returned OUT_OF_DATE, flagging for recreation");
 		mc->session_render.swapchain_needs_recreate = true;
+	} else if (ret == VK_ERROR_SURFACE_LOST_KHR) {
+		// Surface died mid-frame (Android background, #528). Do NOT flag a
+		// recreate — the swapchain can't be rebuilt on a dead surface; the
+		// next acquire's surface sync tears the target down and pauses
+		// presents until the client passes a replacement surface.
+		U_LOG_W("[per-session] Present returned SURFACE_LOST, waiting for a new surface");
 	} else if (ret == VK_SUBOPTIMAL_KHR) {
 		// Presentation succeeded — swapchain size differs from surface but content is shown.
 	} else if (ret != VK_SUCCESS) {
