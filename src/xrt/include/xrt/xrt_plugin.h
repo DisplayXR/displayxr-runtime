@@ -117,6 +117,15 @@ struct xrt_plugin_display_info
 	/*! Default eye-tracking mode for sessions that don't override.
 	 *  0 = MANAGED, 1 = MANUAL. */
 	uint32_t default_eye_tracking_mode;
+
+	/*! Panel refresh rate in milli-Hz (e.g. 60000 = 60 Hz). Integer so no
+	 *  float crosses the ABI. 0 = unknown → the runtime keeps its own
+	 *  default (the null compositor's frame pacer falls back to 20 FPS).
+	 *  Drives `xrWaitFrame` pacing on the null-compositor (Android OOP)
+	 *  path, where the DP plug-in owns present/weave and there is no
+	 *  swapchain compositor to source vblank from. Append-only (struct_size
+	 *  guards older plug-ins that don't write it). */
+	uint32_t refresh_mhz;
 };
 
 
