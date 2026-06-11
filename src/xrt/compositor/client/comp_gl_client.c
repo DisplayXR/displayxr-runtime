@@ -436,6 +436,37 @@ client_gl_compositor_layer_local_2d(struct xrt_compositor *xc,
 }
 
 static xrt_result_t
+client_gl_compositor_layer_zone_3d(struct xrt_compositor *xc,
+                                   struct xrt_device *xdev,
+                                   struct xrt_swapchain *xsc[XRT_MAX_VIEWS],
+                                   const struct xrt_layer_data *data)
+{
+	struct xrt_compositor *xcn;
+	struct xrt_swapchain *xscn[XRT_MAX_VIEWS];
+
+	assert(data->type == XRT_LAYER_ZONE_3D);
+
+	xcn = to_native_compositor(xc);
+
+	// Guard the native slot like the state tracker does — the IPC-mode
+	// native is the ipc client compositor whose own stub handles the drop.
+	if (xcn->layer_zone_3d == NULL) {
+		return XRT_SUCCESS;
+	}
+
+	for (uint32_t i = 0; i < data->view_count; ++i) {
+		xscn[i] = to_native_swapchain(xsc[i]);
+	}
+
+	// GL row order is bottom-up — toggle flip_y like the projection
+	// forwarder.
+	struct xrt_layer_data d = *data;
+	d.flip_y = !d.flip_y;
+
+	return xrt_comp_layer_zone_3d(xcn, xdev, xscn, &d);
+}
+
+static xrt_result_t
 client_gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
 	COMP_TRACE_MARKER();
@@ -663,6 +694,7 @@ client_gl_compositor_init(struct client_gl_compositor *c,
 	c->base.base.layer_passthrough = client_gl_compositor_layer_passthrough;
 	c->base.base.layer_window_space = client_gl_compositor_layer_window_space;
 	c->base.base.layer_local_2d = client_gl_compositor_layer_local_2d;
+	c->base.base.layer_zone_3d = client_gl_compositor_layer_zone_3d;
 	c->base.base.layer_commit = client_gl_compositor_layer_commit;
 	c->base.base.destroy = client_gl_compositor_destroy;
 	c->context_begin_locked = context_begin_locked;

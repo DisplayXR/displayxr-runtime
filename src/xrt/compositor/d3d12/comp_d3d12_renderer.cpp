@@ -295,6 +295,14 @@ struct comp_d3d12_renderer
 	//! Blit PSO.
 	ID3D12PipelineState *blit_pso;
 
+	//! Blit PSO blend variants for 3D display zone layers
+	//! (XR_EXT_display_zones, ADR-027): same shaders/root signature as
+	//! blit_pso, alpha-over blend baked into the PSO (D3D12's analog of the
+	//! D3D11 renderer's blend_premul/blend_alpha OM states). Premul:
+	//! SrcBlend = ONE; straight: SrcBlend = SRC_ALPHA.
+	ID3D12PipelineState *blit_pso_premul;
+	ID3D12PipelineState *blit_pso_alpha;
+
 	//! Root signature for quad (window-space layer) operations.
 	ID3D12RootSignature *quad_root_signature;
 
@@ -847,6 +855,27 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 
 	hr = device->CreateGraphicsPipelineState(&pso_desc, __uuidof(ID3D12PipelineState),
 	                                          reinterpret_cast<void **>(&r->blit_pso));
+
+	// XR_EXT_display_zones (ADR-027): alpha-over blend variants of the blit
+	// PSO for zone-layer draws (zone rect scaled into the tile box; later
+	// zones composite over earlier ones in layer-list order). Alpha channel
+	// composes Porter-Duff over so stacked zones accumulate coverage.
+	if (SUCCEEDED(hr)) {
+		pso_desc.BlendState.RenderTarget[0].BlendEnable = TRUE;
+		pso_desc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE; // premultiplied
+		pso_desc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+		pso_desc.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+		pso_desc.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+		pso_desc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+		pso_desc.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+		hr = device->CreateGraphicsPipelineState(&pso_desc, __uuidof(ID3D12PipelineState),
+		                                          reinterpret_cast<void **>(&r->blit_pso_premul));
+	}
+	if (SUCCEEDED(hr)) {
+		pso_desc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA; // straight
+		hr = device->CreateGraphicsPipelineState(&pso_desc, __uuidof(ID3D12PipelineState),
+		                                          reinterpret_cast<void **>(&r->blit_pso_alpha));
+	}
 	vs_blob->Release();
 	ps_blob->Release();
 
@@ -1299,6 +1328,12 @@ comp_d3d12_renderer_destroy(struct comp_d3d12_renderer **renderer_ptr)
 	if (r->quad_root_signature != nullptr) {
 		r->quad_root_signature->Release();
 	}
+	if (r->blit_pso_alpha != nullptr) {
+		r->blit_pso_alpha->Release();
+	}
+	if (r->blit_pso_premul != nullptr) {
+		r->blit_pso_premul->Release();
+	}
 	if (r->blit_pso != nullptr) {
 		r->blit_pso->Release();
 	}
@@ -1353,6 +1388,18 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 	// Reset per-frame SRV slot allocator (slot 0 = atlas, slots 1+ for layers)
 	renderer->next_srv_slot = 1;
 
+	// XR_EXT_display_zones (ADR-027): a zones frame composes N placed zone
+	// layers into the window-spanning atlas — the unzoned area must weave
+	// to nothing (transparent), not opaque black, so the feathered wish
+	// edge blends toward the desktop.
+	bool zones_frame = false;
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		if (layers->layers[i].data.type == XRT_LAYER_ZONE_3D) {
+			zones_frame = true;
+			break;
+		}
+	}
+
 	// Transition atlas to RENDER_TARGET for shader-based stretch-blit
 	D3D12_RESOURCE_BARRIER barrier = {};
 	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1362,9 +1409,9 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 	cmd_list->ResourceBarrier(1, &barrier);
 
-	// Clear atlas to black
+	// Clear atlas to black; transparent in zones frames.
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv = renderer->rtv_heap->GetCPUDescriptorHandleForHeapStart();
-	float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+	float clear_color[4] = {0.0f, 0.0f, 0.0f, zones_frame ? 0.0f : 1.0f};
 	cmd_list->ClearRenderTargetView(rtv, clear_color, 0, nullptr);
 
 	// Set blit pipeline (shared across all projection views)
@@ -1378,12 +1425,16 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 	// Determine view count
 	uint32_t view_count = hardware_display_3d ? 2 : 1;
 
-	// For each projection layer, stretch-blit swapchain images into atlas tiles
+	// For each projection / zone layer, stretch-blit swapchain images into
+	// atlas tiles (zone layers land at the zone rect scaled into the tile
+	// box — XR_EXT_display_zones; alpha-over in layer-list order falls out
+	// of the layers-outer loop running in submission order per tile).
 	for (uint32_t li = 0; li < layers->layer_count; li++) {
 		struct comp_layer *layer = &layers->layers[li];
 
+		const bool is_zone = layer->data.type == XRT_LAYER_ZONE_3D;
 		if (layer->data.type != XRT_LAYER_PROJECTION &&
-		    layer->data.type != XRT_LAYER_PROJECTION_DEPTH) {
+		    layer->data.type != XRT_LAYER_PROJECTION_DEPTH && !is_zone) {
 			continue;
 		}
 
@@ -1507,6 +1558,40 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 			vp.Height = static_cast<float>(vp_h);
 			vp.MinDepth = 0.0f;
 			vp.MaxDepth = 1.0f;
+
+			// XR_EXT_display_zones: scale the zone rect (client-window
+			// px) into the view tile box — in zones frames the tile
+			// spans the full window, so scale = tile/window. Premul vs
+			// straight alpha-over per the UNPREMULTIPLIED flag (the
+			// blend variants of the blit PSO); the tile scissor below
+			// clamps any rounding spill into a neighboring tile.
+			// zone_3d.proj shares xrt_layer_projection_data's layout at
+			// union offset 0, so the per-view sub data above reads
+			// correctly unchanged.
+			if (is_zone) {
+				const struct xrt_rect *zr = &layer->data.zone_3d.rect;
+				const float zsx =
+				    target_width > 0 ? vp.Width / static_cast<float>(target_width) : 0.0f;
+				const float zsy =
+				    target_height > 0 ? vp.Height / static_cast<float>(target_height) : 0.0f;
+				vp.TopLeftX += static_cast<float>(zr->offset.w) * zsx;
+				vp.TopLeftY += static_cast<float>(zr->offset.h) * zsy;
+				vp.Width = static_cast<float>(zr->extent.w) * zsx;
+				vp.Height = static_cast<float>(zr->extent.h) * zsy;
+				if (vp.Width <= 0.0f || vp.Height <= 0.0f) {
+					// Degenerate / off-target zone: restore the
+					// swapchain state and skip the draw.
+					src_barrier.Transition.StateBefore =
+					    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+					src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+					cmd_list->ResourceBarrier(1, &src_barrier);
+					continue;
+				}
+				const bool unpremul =
+				    (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
+				cmd_list->SetPipelineState(unpremul ? renderer->blit_pso_alpha
+				                                    : renderer->blit_pso_premul);
+			}
 			cmd_list->RSSetViewports(1, &vp);
 
 			D3D12_RECT scissor = {};
@@ -1530,15 +1615,33 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 				vp.TopLeftY = static_cast<float>(dup_y);
 				vp.Width = static_cast<float>(vp_w);
 				vp.Height = static_cast<float>(vp_h);
-				cmd_list->RSSetViewports(1, &vp);
+				if (is_zone && target_width > 0 && target_height > 0) {
+					// Same zone sub-rect, duplicated into the second tile.
+					const struct xrt_rect *zr = &layer->data.zone_3d.rect;
+					const float zsx = vp.Width / static_cast<float>(target_width);
+					const float zsy = vp.Height / static_cast<float>(target_height);
+					vp.TopLeftX += static_cast<float>(zr->offset.w) * zsx;
+					vp.TopLeftY += static_cast<float>(zr->offset.h) * zsy;
+					vp.Width = static_cast<float>(zr->extent.w) * zsx;
+					vp.Height = static_cast<float>(zr->extent.h) * zsy;
+				}
+				if (vp.Width > 0.0f && vp.Height > 0.0f) {
+					cmd_list->RSSetViewports(1, &vp);
 
-				scissor.left = dup_x;
-				scissor.top = dup_y;
-				scissor.right = dup_x + vp_w;
-				scissor.bottom = dup_y + vp_h;
-				cmd_list->RSSetScissorRects(1, &scissor);
+					scissor.left = dup_x;
+					scissor.top = dup_y;
+					scissor.right = dup_x + vp_w;
+					scissor.bottom = dup_y + vp_h;
+					cmd_list->RSSetScissorRects(1, &scissor);
 
-				cmd_list->DrawInstanced(4, 1, 0, 0);
+					cmd_list->DrawInstanced(4, 1, 0, 0);
+				}
+			}
+
+			// XR_EXT_display_zones: restore the REPLACE blit PSO for the
+			// next (projection) draw.
+			if (is_zone) {
+				cmd_list->SetPipelineState(renderer->blit_pso);
 			}
 
 			// Transition swapchain image back: PIXEL_SHADER_RESOURCE → COMMON

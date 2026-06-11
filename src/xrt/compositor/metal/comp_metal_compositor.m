@@ -55,6 +55,7 @@
 #include "qwerty_interface.h"
 #endif
 
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -303,6 +304,35 @@ struct comp_metal_compositor
 	//! visible to out-of-frame readers like get_window_metrics).
 	bool local_2d_last_frame;
 
+	//! XR_EXT_display_zones (ADR-027): true when the current frame's
+	//! accumulator carries XRT_LAYER_ZONE_3D layers (a "zones frame"). In a
+	//! zones frame the canvas output rect, the sticky submitted mask, and
+	//! the implicit-mask-from-Local2D rule are all inert; the effective
+	//! canvas is the full client window (zones frames count as mask_active
+	//! for metal_effective_canvas); the wish drives the post-weave lerp.
+	bool zones_frame;
+
+	//! Explicit per-frame wish (XrDisplayZonesFrameEndInfoEXT.wishMask) set
+	//! via comp_metal_compositor_zones_set_frame_wish before commit; NULL =
+	//! auto-derive from the zone rects. Not owned — zone_mask_destroy
+	//! clears any dangling reference.
+	struct comp_metal_zone_mask *frame_wish;
+
+	//! Tier-1 fallback edge state (the base Metal DP vtable has no
+	//! zone-publish slots until P4): request_display_mode(true) fired once
+	//! on the zones rising edge; never forces 2D on the falling edge.
+	bool zones_mode_requested;
+
+	//! XR_EXT_display_zones AUTO wish raster (union of the frame's zone
+	//! rects with a feathered edge), CPU-rasterized like the implicit mask
+	//! but kept separate so the two dirty-caches can never cross-hit.
+	id<MTLTexture> wish_mask_tex;
+	uint8_t *wish_mask_bytes;                   //!< CPU raster buffer (w*h)
+	uint32_t wish_mask_w;                       //!< Current wish mask width (0 = none)
+	uint32_t wish_mask_h;
+	struct xrt_rect wish_rects[XRT_MAX_LAYERS]; //!< Rect cache for change detection
+	uint32_t wish_rect_count;
+
 	//! Thread safety.
 	struct os_mutex mutex;
 
@@ -333,10 +363,13 @@ metal_swapchain(struct xrt_swapchain *xsc)
 
 //! #439: any active mask — explicit submitted, or implicit from the last
 //! committed frame's Local2D layers — supersedes the canvas output rect.
+//! XR_EXT_display_zones: a zones frame supersedes it the same way (the
+//! output rect is inert; each zone rect is its own canvas).
 static inline bool
 metal_mask_is_active(struct comp_metal_compositor *c)
 {
-	return (c->zone_mask_active != NULL && c->zone_mask_active->submitted) || c->local_2d_last_frame;
+	return (c->zone_mask_active != NULL && c->zone_mask_active->submitted) || c->local_2d_last_frame ||
+	       c->zones_frame;
 }
 
 // Release the 2D surround resources (texture wrap + retained IOSurface).
@@ -1364,6 +1397,22 @@ metal_compositor_layer_local_2d(struct xrt_compositor *xc,
 }
 
 /*!
+ * 3D display zone layer (XR_EXT_display_zones, ADR-027) — multi-swapchain
+ * accumulate like projection; consumed by the zones-frame branch of
+ * layer_commit (zone rect scaled into the window-spanning atlas tile).
+ */
+static xrt_result_t
+metal_compositor_layer_zone_3d(struct xrt_compositor *xc,
+                               struct xrt_device *xdev,
+                               struct xrt_swapchain *xsc[XRT_MAX_VIEWS],
+                               const struct xrt_layer_data *data)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	comp_layer_accum_zone_3d(&c->layer_accum, xsc, data);
+	return XRT_SUCCESS;
+}
+
+/*!
  * Update the HUD overlay text (throttled, main-thread safe).
  */
 static void
@@ -1920,6 +1969,123 @@ metal_update_implicit_mask(struct comp_metal_compositor *c,
 }
 
 /*!
+ * XR_EXT_display_zones (ADR-027) — (re)rasterize the AUTO wish: union of the
+ * frame's zone rects with a feathered edge. CPU fill + replaceRegion like the
+ * implicit mask, but with max-semantics across zones (overlapping feathers
+ * never dim a zone core). NOTE: the Metal CPU raster does a TRUE per-pixel
+ * distance feather — clamp(1 − dist_outside/16px) — rather than the GPU legs'
+ * stepped 8×2px rings (D3D11 ClearView / D3D12 rect clears / VK
+ * vkCmdClearAttachments); same 16-px footprint, smoother profile.
+ * Re-rasterized only when the rect set or dims change. Returns the wish
+ * texture or nil on failure.
+ */
+#define METAL_ZONE_WISH_FEATHER_PX 16
+static id<MTLTexture>
+metal_update_zone_wish_mask(struct comp_metal_compositor *c,
+                            const struct xrt_rect *rects,
+                            uint32_t rect_count,
+                            uint32_t w,
+                            uint32_t h)
+{
+	if (w == 0 || h == 0 || rect_count == 0) {
+		return nil;
+	}
+
+	bool dirty = (c->wish_mask_tex == nil) || c->wish_mask_w != w || c->wish_mask_h != h ||
+	             c->wish_rect_count != rect_count;
+	for (uint32_t i = 0; !dirty && i < rect_count; i++) {
+		if (memcmp(&c->wish_rects[i], &rects[i], sizeof(rects[i])) != 0) {
+			dirty = true;
+		}
+	}
+	if (!dirty) {
+		return c->wish_mask_tex;
+	}
+
+	if (c->wish_mask_tex == nil || c->wish_mask_w != w || c->wish_mask_h != h) {
+		[c->wish_mask_tex release];
+		c->wish_mask_tex = nil;
+		free(c->wish_mask_bytes);
+		c->wish_mask_bytes = NULL;
+
+		MTLTextureDescriptor *desc =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+		                                                       width:w
+		                                                      height:h
+		                                                   mipmapped:NO];
+		desc.usage = MTLTextureUsageShaderRead;
+		desc.storageMode = MTLStorageModeShared;
+		c->wish_mask_tex = [c->device newTextureWithDescriptor:desc];
+		c->wish_mask_bytes = (uint8_t *)malloc((size_t)w * h);
+		if (c->wish_mask_tex == nil || c->wish_mask_bytes == NULL) {
+			U_LOG_E("Failed to allocate zone wish mask (%ux%u)", w, h);
+			[c->wish_mask_tex release];
+			c->wish_mask_tex = nil;
+			free(c->wish_mask_bytes);
+			c->wish_mask_bytes = NULL;
+			return nil;
+		}
+		c->wish_mask_w = w;
+		c->wish_mask_h = h;
+	}
+
+	// M=0 everywhere (no 3D wish), then per zone: M=1 inside the rect, a
+	// distance feather ramp outside it, folded in with max().
+	memset(c->wish_mask_bytes, 0x00, (size_t)w * h);
+	const float feather = (float)METAL_ZONE_WISH_FEATHER_PX;
+	for (uint32_t i = 0; i < rect_count; i++) {
+		int32_t rx0 = rects[i].offset.w;
+		int32_t ry0 = rects[i].offset.h;
+		int32_t rx1 = rx0 + rects[i].extent.w;
+		int32_t ry1 = ry0 + rects[i].extent.h;
+		if (rx1 <= rx0 || ry1 <= ry0) {
+			continue;
+		}
+		int32_t ex0 = rx0 - METAL_ZONE_WISH_FEATHER_PX;
+		int32_t ey0 = ry0 - METAL_ZONE_WISH_FEATHER_PX;
+		int32_t ex1 = rx1 + METAL_ZONE_WISH_FEATHER_PX;
+		int32_t ey1 = ry1 + METAL_ZONE_WISH_FEATHER_PX;
+		if (ex0 < 0) ex0 = 0;
+		if (ey0 < 0) ey0 = 0;
+		if (ex1 > (int32_t)w) ex1 = (int32_t)w;
+		if (ey1 > (int32_t)h) ey1 = (int32_t)h;
+		for (int32_t y = ey0; y < ey1; y++) {
+			const int32_t dy = (y < ry0) ? (ry0 - y) : (y >= ry1 ? (y - ry1 + 1) : 0);
+			uint8_t *row = c->wish_mask_bytes + (size_t)y * w;
+			for (int32_t x = ex0; x < ex1; x++) {
+				const int32_t dx = (x < rx0) ? (rx0 - x) : (x >= rx1 ? (x - rx1 + 1) : 0);
+				uint8_t v;
+				if (dx == 0 && dy == 0) {
+					v = 0xFF; // zone core: full 3D wish
+				} else {
+					const float dist = sqrtf((float)(dx * dx + dy * dy));
+					float fv = 1.0f - dist / feather;
+					if (fv <= 0.0f) {
+						continue;
+					}
+					v = (uint8_t)(fv * 255.0f + 0.5f);
+				}
+				if (v > row[x]) {
+					row[x] = v; // max across overlapping zones
+				}
+			}
+		}
+	}
+
+	[c->wish_mask_tex replaceRegion:MTLRegionMake2D(0, 0, w, h)
+	                    mipmapLevel:0
+	                      withBytes:c->wish_mask_bytes
+	                    bytesPerRow:w];
+
+	memcpy(c->wish_rects, rects, sizeof(rects[0]) * rect_count);
+	c->wish_rect_count = rect_count;
+
+	U_LOG_W("Metal zone wish mask (auto): %ux%u, %u zone rect(s), %u-px feather", w, h, rect_count,
+	        METAL_ZONE_WISH_FEATHER_PX);
+	return c->wish_mask_tex;
+}
+
+/*!
  * Ensure the window-sized 2D scratch + weave snapshot textures exist at w×h.
  */
 static bool
@@ -2247,9 +2413,36 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 		}
 	}
 
-	// Step 2 — resolve the frame's mask.
+	// XR_EXT_display_zones: a zones frame ALWAYS runs the composite (the
+	// feathered wish edge lerps the weave toward the 2D flatten even with
+	// zero Local2D layers); the sticky mask + implicit-mask rules are inert.
+	const bool zones_frame = c->zones_frame;
+
+	// Step 2 — resolve the frame's mask. Zones frame: the WISH — the
+	// explicit frame wish (referenced-at-frame-end: re-upload the CURRENT
+	// authored bytes, mirroring zone_mask_submit's replaceRegion body, so
+	// no xrSubmitLocal3DZoneEXT is required) or the auto feathered raster
+	// from the zone rects.
 	id<MTLTexture> mask_tex = nil;
-	if (c->zone_mask_active != NULL && c->zone_mask_active->submitted) {
+	if (zones_frame && c->frame_wish != NULL && c->frame_wish->tex != nil &&
+	    c->frame_wish->author_bytes != NULL) {
+		struct comp_metal_zone_mask *fw = c->frame_wish;
+		[fw->tex replaceRegion:MTLRegionMake2D(0, 0, fw->w, fw->h)
+		           mipmapLevel:0
+		             withBytes:fw->author_bytes
+		           bytesPerRow:fw->w];
+		mask_tex = fw->tex;
+	} else if (zones_frame) {
+		struct xrt_rect zone_rects[XRT_MAX_LAYERS];
+		uint32_t zone_rect_count = 0;
+		for (uint32_t i = 0; i < c->layer_accum.layer_count && zone_rect_count < XRT_MAX_LAYERS; i++) {
+			if (c->layer_accum.layers[i].data.type != XRT_LAYER_ZONE_3D) {
+				continue;
+			}
+			zone_rects[zone_rect_count++] = c->layer_accum.layers[i].data.zone_3d.rect;
+		}
+		mask_tex = metal_update_zone_wish_mask(c, zone_rects, zone_rect_count, w, h);
+	} else if (c->zone_mask_active != NULL && c->zone_mask_active->submitted) {
 		mask_tex = c->zone_mask_active->tex;
 	} else if (have_local_2d) {
 		struct xrt_rect rects[XRT_MAX_LAYERS];
@@ -2285,13 +2478,15 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 
 		// Flatten the OVER Local2D layers in layer-list (accumulation) order.
 		// #491 part 3: under-layers (before the projection) are the DP backdrop
-		// and are skipped here.
+		// and are skipped here. XR_EXT_display_zones: zones frames have no
+		// under/over split (2D-under reserved in v1) — every Local2D layer
+		// flattens as 2D-over.
 		for (uint32_t i = 0; have_local_2d && i < c->layer_accum.layer_count; i++) {
 			struct comp_layer *layer = &c->layer_accum.layers[i];
 			if (layer->data.type != XRT_LAYER_LOCAL_2D) {
 				continue;
 			}
-			if (proj_idx >= 0 && (int32_t)i < proj_idx) {
+			if (!zones_frame && proj_idx >= 0 && (int32_t)i < proj_idx) {
 				continue; // under-layer (backdrop) — handled pre-weave
 			}
 			metal_flatten_one_local2d_layer(c, enc, layer, w, h);
@@ -2303,7 +2498,10 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 	// Legacy 2D source: an explicit mask with no Local2D layers this frame
 	// composites against the registered surround (impl doc §4 step 4).
 	// Layers, when present, SUPERSEDE the surround entirely.
-	if (!have_local_2d) {
+	// XR_EXT_display_zones: zones frames never fall back to the surround —
+	// with zero Local2D layers the scratch stays transparent and the
+	// feathered edge lerps the weave toward the desktop.
+	if (!have_local_2d && !zones_frame) {
 		if (c->surround_texture != nil && c->surround_2d.valid &&
 		    c->surround_texture.pixelFormat == c->local2d_scratch.pixelFormat) {
 			uint32_t cw = c->surround_2d.w < w ? c->surround_2d.w : w;
@@ -2363,8 +2561,12 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 		// #491: the implicit (auto) Local2D mask composites the 2D over the
 		// weave by its own premultiplied alpha (translucent 2D reveals the 3D
 		// scene). The explicit authored mask keeps the hard M-lerp.
-		const bool have_explicit = (c->zone_mask_active != NULL && c->zone_mask_active->submitted);
-		uint alpha_over = (have_local_2d && !have_explicit) ? 1u : 0u;
+		// XR_EXT_display_zones: zones frames are ALWAYS the hard M-lerp
+		// (final = M·weave + (1−M)·flatten(2D-over)) — composition follows
+		// zone geometry + the wish, never the #491 alpha-over rule.
+		const bool have_explicit =
+		    !zones_frame && (c->zone_mask_active != NULL && c->zone_mask_active->submitted);
+		uint alpha_over = (!zones_frame && have_local_2d && !have_explicit) ? 1u : 0u;
 
 		[enc setRenderPipelineState:c->masked_composite_pipeline];
 		[enc setFragmentTexture:c->local2d_scratch atIndex:0];
@@ -2466,15 +2668,35 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// rect, Q3), supersedes the canvas output rect: the weave spans the
 	// client window and the mask is the sole 2D/3D selector (Phase-2 rule,
 	// uniform — no third state).
+	// XR_EXT_display_zones: the zones-frame flag is resolved in the same
+	// scan (one coherent per-frame decision); zones frames count as
+	// mask_active so metal_effective_canvas returns the full client window
+	// (the output rect is inert).
 	bool have_local_2d = false;
+	bool zones_frame = false;
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
 			have_local_2d = true;
-			break;
+		} else if (c->layer_accum.layers[i].data.type == XRT_LAYER_ZONE_3D) {
+			zones_frame = true;
 		}
 	}
-	const bool mask_active = (c->zone_mask_active != NULL && c->zone_mask_active->submitted) || have_local_2d;
+	const bool mask_active =
+	    (c->zone_mask_active != NULL && c->zone_mask_active->submitted) || have_local_2d || zones_frame;
 	c->local_2d_last_frame = have_local_2d;
+	c->zones_frame = zones_frame;
+
+	// XR_EXT_display_zones tier-1 hardware fallback: the base Metal DP
+	// vtable has no zone-publish slots until P4, so "any zone active =>
+	// request 3D" once on the rising edge. No forced 2D on the falling
+	// edge.
+	if (zones_frame && !c->zones_mode_requested) {
+		c->zones_mode_requested = true;
+		comp_metal_compositor_request_display_mode(&c->base.base, true);
+	} else if (!zones_frame) {
+		c->zones_mode_requested = false;
+	}
+
 	struct u_canvas_rect eff_canvas = metal_effective_canvas(c, output_texture, mask_active);
 
 	// Sync hardware_display_3d, tile layout, and per-view dimensions
@@ -2578,7 +2800,11 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// projection-layer alpha=0 regions propagate through sim_display
 		// alpha-native to the CAMetalLayer (isOpaque=NO) → desktop composite.
 		// Otherwise clear to opaque black.
-		pass.colorAttachments[0].clearColor = c->transparent_background
+		// XR_EXT_display_zones (ADR-027): a zones frame composes N placed
+		// zone layers into the window-spanning atlas — the unzoned area
+		// must weave to nothing (transparent) so the feathered wish edge
+		// blends toward the desktop.
+		pass.colorAttachments[0].clearColor = (c->transparent_background || zones_frame)
 		    ? MTLClearColorMake(0.0, 0.0, 0.0, 0.0)
 		    : MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
 		pass.depthAttachment.texture = c->depth_texture;
@@ -2588,17 +2814,37 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 		id<MTLRenderCommandEncoder> encoder = [cmd_buf renderCommandEncoderWithDescriptor:pass];
 
-		// Render each projection layer
+		// XR_EXT_display_zones: zone rects are client-window px and the
+		// tile spans the full window in zones frames, so the zone scale
+		// target is the effective canvas (= the window; mask_active
+		// includes zones frames), falling back to the output dims.
+		uint32_t zones_target_w = 0;
+		uint32_t zones_target_h = 0;
+		if (zones_frame) {
+			if (eff_canvas.valid && eff_canvas.w > 0 && eff_canvas.h > 0) {
+				zones_target_w = eff_canvas.w;
+				zones_target_h = eff_canvas.h;
+			} else if (output_texture != nil) {
+				zones_target_w = (uint32_t)output_texture.width;
+				zones_target_h = (uint32_t)output_texture.height;
+			}
+		}
+
+		// Render each projection / zone layer (XR_EXT_display_zones: zone
+		// layers blit through the same pass at a sub-tile viewport).
 		for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 			struct comp_layer *layer = &c->layer_accum.layers[i];
 
+			const bool is_zone = layer->data.type == XRT_LAYER_ZONE_3D;
 			if (layer->data.type != XRT_LAYER_PROJECTION &&
-			    layer->data.type != XRT_LAYER_PROJECTION_DEPTH) {
+			    layer->data.type != XRT_LAYER_PROJECTION_DEPTH && !is_zone) {
 				continue;
 			}
 
-			// Verify app renders at the expected resolution (not stretched)
-			{
+			// Verify app renders at the expected resolution (not stretched).
+			// Zone layers are excluded — a zone renders at its own rect
+			// size by design, not the view dims.
+			if (!is_zone) {
 				static int rect_check_log = 0;
 				for (uint32_t v = 0; v < layer->data.view_count && v < XRT_MAX_VIEWS; v++) {
 					const struct xrt_rect *r = &layer->data.proj.v[v].sub.rect;
@@ -2680,6 +2926,55 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					vp.originY = tile_y * c->view_height;
 					vp.width = c->view_width;
 					vp.height = c->view_height;
+				}
+				if (is_zone) {
+					// XR_EXT_display_zones: scale the zone rect
+					// (client-window px, top-left — same orientation
+					// as Metal textures) into the tile box; in zones
+					// frames the tile spans the full window, so
+					// scale = tile/window. NOTE (Metal P2): the
+					// projection pipeline draws with blending OFF, so
+					// overlapping zones OVERWRITE in layer order
+					// (one-shot WARN below; a blend pipeline-state
+					// variant rides the P4/renderer follow-up rather
+					// than being authored blind — Metal is code-only
+					// this pass).
+					if (zones_target_w == 0 || zones_target_h == 0) {
+						continue;
+					}
+					const struct xrt_rect *zr = &layer->data.zone_3d.rect;
+					const double zsx = vp.width / (double)zones_target_w;
+					const double zsy = vp.height / (double)zones_target_h;
+					vp.originX += (double)zr->offset.w * zsx;
+					vp.originY += (double)zr->offset.h * zsy;
+					vp.width = (double)zr->extent.w * zsx;
+					vp.height = (double)zr->extent.h * zsy;
+					if (vp.width <= 0.0 || vp.height <= 0.0) {
+						continue;
+					}
+					static bool zone_overlap_warned = false;
+					if (!zone_overlap_warned && i > 0) {
+						for (uint32_t pz = 0; pz < i && !zone_overlap_warned; pz++) {
+							if (c->layer_accum.layers[pz].data.type !=
+							    XRT_LAYER_ZONE_3D) {
+								continue;
+							}
+							const struct xrt_rect *pr =
+							    &c->layer_accum.layers[pz].data.zone_3d.rect;
+							bool overlap =
+							    pr->offset.w < zr->offset.w + zr->extent.w &&
+							    zr->offset.w < pr->offset.w + pr->extent.w &&
+							    pr->offset.h < zr->offset.h + zr->extent.h &&
+							    zr->offset.h < pr->offset.h + pr->extent.h;
+							if (overlap) {
+								zone_overlap_warned = true;
+								U_LOG_W(
+								    "Metal zones: overlapping zones OVERWRITE "
+								    "in draw order (alpha-over needs a blend "
+								    "pipeline variant — one-time warning)");
+							}
+						}
+					}
 				}
 				vp.znear = 0.0;
 				vp.zfar = 1.0;
@@ -3263,6 +3558,13 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	// zone_mask_destroy before the session compositor goes away) — only
 	// drop the borrow here.
 	c->zone_mask_active = NULL;
+	// XR_EXT_display_zones: drop the frame-wish borrow + auto-wish raster.
+	c->frame_wish = NULL;
+	c->zones_frame = false;
+	[c->wish_mask_tex release];
+	c->wish_mask_tex = nil;
+	free(c->wish_mask_bytes);
+	c->wish_mask_bytes = NULL;
 	[c->implicit_mask_tex release];
 	c->implicit_mask_tex = nil;
 	free(c->implicit_mask_bytes);
@@ -3546,11 +3848,29 @@ comp_metal_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_pt
 		// Reverts to the rect-derived behavior on the next frame.
 		c->zone_mask_active = NULL;
 	}
+	// XR_EXT_display_zones: never leave a dangling frame-wish reference.
+	if (c->frame_wish == mask) {
+		c->frame_wish = NULL;
+	}
 	os_mutex_unlock(&c->mutex);
 
 	[mask->tex release];
 	free(mask->author_bytes);
 	free(mask);
+}
+
+void
+comp_metal_compositor_zones_set_frame_wish(struct xrt_compositor *xc, void *mask)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+
+	// Per-frame reference (XR_EXT_display_zones): oxr sets this on every
+	// zones frame before layer_commit, NULL meaning auto-derive. Consumed
+	// by the commit's composite; harmlessly stale on zero-zone frames (the
+	// zones branch never reads it there).
+	os_mutex_lock(&c->mutex);
+	c->frame_wish = (struct comp_metal_zone_mask *)mask;
+	os_mutex_unlock(&c->mutex);
 }
 
 bool
@@ -3812,6 +4132,7 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	xc->layer_quad = metal_compositor_layer_quad;
 	xc->layer_window_space = metal_compositor_layer_window_space;
 	xc->layer_local_2d = metal_compositor_layer_local_2d;
+	xc->layer_zone_3d = metal_compositor_layer_zone_3d;
 	xc->layer_commit = metal_compositor_layer_commit;
 	xc->destroy = metal_compositor_destroy;
 

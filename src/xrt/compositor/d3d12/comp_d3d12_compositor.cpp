@@ -225,12 +225,40 @@ struct comp_d3d12_compositor
 	//! (R8_UNORM RT + staged SRV copy), reused across frames via dirty-check.
 	//! INVERSE of an authored set_rects mask: M=1 (keep weave) everywhere, M=0
 	//! (show the flattened 2D) inside the layer rects.
+	//! XR_EXT_display_zones (ADR-027): in zones frames the SAME resources hold
+	//! the AUTO wish (ring-feathered union of the zone rects, re-rastered
+	//! every zones frame — the implicit rule is inert there); the raster
+	//! invalidates implicit_rect_count so a later legacy frame re-rasters.
 	ID3D12Resource *implicit_mask_tex;
 	ID3D12DescriptorHeap *implicit_mask_rtv_heap;
 	ID3D12Resource *implicit_mask_staged;
 	uint32_t implicit_mask_w, implicit_mask_h;
 	uint32_t implicit_rect_count;
 	struct xrt_rect implicit_rects[XRT_MAX_LAYERS];
+
+	//! XR_EXT_display_zones (ADR-027): true when the current frame's
+	//! accumulator carries XRT_LAYER_ZONE_3D layers (a "zones frame"). In a
+	//! zones frame the canvas output rect, the sticky submitted mask, and
+	//! the implicit-mask-from-Local2D rule are all inert; the effective
+	//! canvas is the full client window; the wish (explicit frame wish or
+	//! the auto union-of-zone-rects raster) drives the post-weave visual
+	//! lerp. Set once under c->mutex at the top of layer_commit, beside
+	//! local_2d_last_frame.
+	bool zones_frame;
+
+	//! Explicit per-frame wish (XrDisplayZonesFrameEndInfoEXT.wishMask),
+	//! handed in via comp_d3d12_compositor_zones_set_frame_wish before
+	//! layer_commit and consumed by that commit. NULL = auto-derive. Not
+	//! owned — the mask handle owns the resources; handle destroy clears
+	//! any dangling reference via zone_mask_destroy.
+	struct comp_d3d12_zone_mask *frame_wish;
+
+	//! Tier-1 fallback edge state (the base D3D12 DP vtable has no
+	//! zone-publish slots until P4): request_display_mode(true) fired once
+	//! on the zones rising edge ("any zone active => request 3D"); never
+	//! forces 2D on the falling edge (mode restore stays with the V-toggle
+	//! logic).
+	bool zones_mode_requested;
 
 	//! Flattened Local2D layers (the `twod` source). R8G8B8A8_UNORM render
 	//! target — dedicated, NOT shared with surround_scratch (avoids an
@@ -340,7 +368,10 @@ d3d12_effective_canvas(struct comp_d3d12_compositor *c)
 {
 	// #439 Phase 3: Local2D layers supersede the canvas the same way an
 	// authored mask does — the composite writes the whole window region.
-	if (c->active_zone_mask == nullptr && !c->local_2d_last_frame) {
+	// XR_EXT_display_zones: a zones frame spans the full client window by
+	// definition (each zone rect is its own canvas; the output rect is
+	// inert) — same supersede geometry as the mask/Local2D rules.
+	if (!c->zones_frame && c->active_zone_mask == nullptr && !c->local_2d_last_frame) {
 		return c->canvas;
 	}
 	struct u_canvas_rect win = {};
@@ -707,6 +738,23 @@ d3d12_compositor_layer_local_2d(struct xrt_compositor *xc,
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);
 	std::lock_guard<std::mutex> lock(c->mutex);
 	comp_layer_accum_local_2d(&c->layer_accum, xsc, data);
+	return XRT_SUCCESS;
+}
+
+/*!
+ * 3D display zone layer (XR_EXT_display_zones, ADR-027) — multi-swapchain
+ * accumulate like projection; consumed by the zones-frame branch of
+ * layer_commit (zone rect scaled into the window-spanning atlas tile).
+ */
+static xrt_result_t
+d3d12_compositor_layer_zone_3d(struct xrt_compositor *xc,
+                               struct xrt_device *xdev,
+                               struct xrt_swapchain *xsc[XRT_MAX_VIEWS],
+                               const struct xrt_layer_data *data)
+{
+	struct comp_d3d12_compositor *c = d3d12_comp(xc);
+	std::lock_guard<std::mutex> lock(c->mutex);
+	comp_layer_accum_zone_3d(&c->layer_accum, xsc, data);
 	return XRT_SUCCESS;
 }
 
@@ -1345,12 +1393,27 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// #439 Phase 3: detect Local2D layers once per frame (under c->mutex).
 	// Drives the effective-canvas supersede + the composite's have_local_2d
 	// branch — mirrors the D3D11 leg (set before eff_canvas is computed).
+	// XR_EXT_display_zones: the zones-frame flag is resolved in the same
+	// scan (one coherent per-frame decision).
 	c->local_2d_last_frame = false;
+	c->zones_frame = false;
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
 			c->local_2d_last_frame = true;
-			break;
+		} else if (c->layer_accum.layers[i].data.type == XRT_LAYER_ZONE_3D) {
+			c->zones_frame = true;
 		}
+	}
+
+	// XR_EXT_display_zones tier-1 hardware fallback: the base D3D12 DP
+	// vtable has no zone-publish slots until P4, so "any zone active =>
+	// request 3D" once on the rising edge. No forced 2D on the falling
+	// edge.
+	if (c->zones_frame && !c->zones_mode_requested) {
+		c->zones_mode_requested = true;
+		comp_d3d12_compositor_request_display_mode(&c->base.base, true);
+	} else if (!c->zones_frame) {
+		c->zones_mode_requested = false;
 	}
 
 	// #439 Phase 2: the one canvas authority for this frame. While a zone
@@ -2494,6 +2557,7 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	c->base.base.layer_passthrough = d3d12_compositor_layer_passthrough;
 	c->base.base.layer_window_space = d3d12_compositor_layer_window_space;
 	c->base.base.layer_local_2d = d3d12_compositor_layer_local_2d;
+	c->base.base.layer_zone_3d = d3d12_compositor_layer_zone_3d;
 	c->base.base.layer_commit = d3d12_compositor_layer_commit;
 	c->base.base.layer_commit_with_semaphore = d3d12_compositor_layer_commit_with_semaphore;
 	c->base.base.destroy = d3d12_compositor_destroy;
@@ -3183,6 +3247,9 @@ static void
 d3d12_release_zone_state(struct comp_d3d12_compositor *c)
 {
 	c->active_zone_mask = nullptr;
+	// XR_EXT_display_zones: drop the frame-wish borrow + frame state.
+	c->frame_wish = nullptr;
+	c->zones_frame = false;
 	if (c->surround_scratch != nullptr) {
 		c->surround_scratch->Release();
 		c->surround_scratch = nullptr;
@@ -3533,6 +3600,222 @@ d3d12_update_implicit_mask(struct comp_d3d12_compositor *c,
 	return c->implicit_mask_staged;
 }
 
+// XR_EXT_display_zones (ADR-027) — (re)rasterize the AUTO wish: union of the
+// frame's zone rects with a stepped ring feather. M=0 everywhere, then for
+// each feather step (outermost first, ascending M) clear the expanded rect of
+// EVERY zone — max-semantics without a shader: the final step writes M=1 at
+// every zone core, so overlapping feathers can never dim a core. Reuses the
+// implicit-mask R8 resources (the implicit rule is inert in zones frames) and
+// re-rasters every zones frame, VK-style — a handful of rect clears — while
+// invalidating the implicit rect cache so a later legacy frame re-rasters.
+// Records onto the OPEN c->cmd_list. Caller holds c->mutex. Returns the
+// staged R8 resource (steady PIXEL_SHADER_RESOURCE) or nullptr on failure.
+#define D3D12_ZONE_WISH_FEATHER_STEPS 8
+#define D3D12_ZONE_WISH_FEATHER_STEP_PX 2
+static ID3D12Resource *
+d3d12_update_zone_wish_mask(struct comp_d3d12_compositor *c,
+                            const struct xrt_rect *rects,
+                            uint32_t rect_count,
+                            uint32_t w,
+                            uint32_t h)
+{
+	if (w == 0 || h == 0 || rect_count == 0) {
+		return nullptr;
+	}
+
+	// (Re)allocate the R8 RT + staged copy on dims change (same block as
+	// d3d12_update_implicit_mask — tex steady RENDER_TARGET, staged steady
+	// PIXEL_SHADER_RESOURCE).
+	if (c->implicit_mask_tex == nullptr || c->implicit_mask_staged == nullptr || c->implicit_mask_w != w ||
+	    c->implicit_mask_h != h) {
+		if (c->implicit_mask_staged != nullptr) {
+			c->implicit_mask_staged->Release();
+			c->implicit_mask_staged = nullptr;
+		}
+		if (c->implicit_mask_rtv_heap != nullptr) {
+			c->implicit_mask_rtv_heap->Release();
+			c->implicit_mask_rtv_heap = nullptr;
+		}
+		if (c->implicit_mask_tex != nullptr) {
+			c->implicit_mask_tex->Release();
+			c->implicit_mask_tex = nullptr;
+		}
+		c->implicit_mask_w = 0;
+		c->implicit_mask_h = 0;
+
+		D3D12_RESOURCE_DESC td = {};
+		td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		td.Width = w;
+		td.Height = h;
+		td.DepthOrArraySize = 1;
+		td.MipLevels = 1;
+		td.Format = DXGI_FORMAT_R8_UNORM;
+		td.SampleDesc.Count = 1;
+		td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+		D3D12_HEAP_PROPERTIES heap = {};
+		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+		D3D12_CLEAR_VALUE clear = {};
+		clear.Format = DXGI_FORMAT_R8_UNORM;
+		clear.Color[0] = 1.0f;
+
+		HRESULT hr = c->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
+		                                                D3D12_RESOURCE_STATE_RENDER_TARGET, &clear,
+		                                                IID_PPV_ARGS(&c->implicit_mask_tex));
+		if (SUCCEEDED(hr) && c->implicit_mask_tex != nullptr) {
+			D3D12_DESCRIPTOR_HEAP_DESC rtv_desc = {};
+			rtv_desc.NumDescriptors = 1;
+			rtv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+			hr = c->device->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&c->implicit_mask_rtv_heap));
+		}
+		if (SUCCEEDED(hr) && c->implicit_mask_rtv_heap != nullptr) {
+			c->device->CreateRenderTargetView(c->implicit_mask_tex, nullptr,
+			                                  c->implicit_mask_rtv_heap->GetCPUDescriptorHandleForHeapStart());
+			td.Flags = D3D12_RESOURCE_FLAG_NONE;
+			hr = c->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
+			                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+			                                        IID_PPV_ARGS(&c->implicit_mask_staged));
+		}
+		if (FAILED(hr) || c->implicit_mask_staged == nullptr) {
+			U_LOG_E("zone wish mask: D3D12 resource creation failed: 0x%08x", hr);
+			if (c->implicit_mask_rtv_heap != nullptr) {
+				c->implicit_mask_rtv_heap->Release();
+				c->implicit_mask_rtv_heap = nullptr;
+			}
+			if (c->implicit_mask_tex != nullptr) {
+				c->implicit_mask_tex->Release();
+				c->implicit_mask_tex = nullptr;
+			}
+			return nullptr;
+		}
+		c->implicit_mask_w = w;
+		c->implicit_mask_h = h;
+	}
+
+	// The wish raster replaces whatever the implicit rule cached.
+	c->implicit_rect_count = 0;
+
+	// Ring raster: M=0 everywhere, then one rect-array clear per feather
+	// step (outermost first, ascending value — D3D12's
+	// ClearRenderTargetView takes the rect array natively).
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv = c->implicit_mask_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+	const float all_off[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	c->cmd_list->ClearRenderTargetView(rtv, all_off, 0, nullptr);
+	for (int32_t s = D3D12_ZONE_WISH_FEATHER_STEPS; s >= 0; s--) {
+		const float v = (float)(D3D12_ZONE_WISH_FEATHER_STEPS - s) / (float)D3D12_ZONE_WISH_FEATHER_STEPS;
+		const float val[4] = {v, 0.0f, 0.0f, 0.0f};
+		const int32_t expand = s * D3D12_ZONE_WISH_FEATHER_STEP_PX;
+		D3D12_RECT drs[XRT_MAX_LAYERS];
+		uint32_t n = 0;
+		for (uint32_t i = 0; i < rect_count && n < XRT_MAX_LAYERS; i++) {
+			int32_t left = rects[i].offset.w - expand;
+			int32_t top = rects[i].offset.h - expand;
+			int32_t right = rects[i].offset.w + rects[i].extent.w + expand;
+			int32_t bottom = rects[i].offset.h + rects[i].extent.h + expand;
+			if (left < 0) {
+				left = 0;
+			}
+			if (top < 0) {
+				top = 0;
+			}
+			if (right > (int32_t)w) {
+				right = (int32_t)w;
+			}
+			if (bottom > (int32_t)h) {
+				bottom = (int32_t)h;
+			}
+			if (right <= left || bottom <= top) {
+				continue;
+			}
+			drs[n].left = left;
+			drs[n].top = top;
+			drs[n].right = right;
+			drs[n].bottom = bottom;
+			n++;
+		}
+		if (n > 0) {
+			c->cmd_list->ClearRenderTargetView(rtv, val, n, drs);
+		}
+	}
+
+	// Stage the snapshot the composite samples (same barrier dance as the
+	// implicit raster — leaves tex in RENDER_TARGET, staged in PSR).
+	D3D12_RESOURCE_BARRIER to_copy[2] = {};
+	to_copy[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	to_copy[0].Transition.pResource = c->implicit_mask_tex;
+	to_copy[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	to_copy[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	to_copy[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	to_copy[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	to_copy[1].Transition.pResource = c->implicit_mask_staged;
+	to_copy[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	to_copy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+	to_copy[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	c->cmd_list->ResourceBarrier(2, to_copy);
+
+	c->cmd_list->CopyResource(c->implicit_mask_staged, c->implicit_mask_tex);
+
+	std::swap(to_copy[0].Transition.StateBefore, to_copy[0].Transition.StateAfter);
+	std::swap(to_copy[1].Transition.StateBefore, to_copy[1].Transition.StateAfter);
+	c->cmd_list->ResourceBarrier(2, to_copy);
+
+	static bool wish_logged = false;
+	if (!wish_logged) {
+		wish_logged = true;
+		U_LOG_W("zone wish mask (auto): %ux%u, %u zone rect(s), %u-px feather", w, h, rect_count,
+		        D3D12_ZONE_WISH_FEATHER_STEPS * D3D12_ZONE_WISH_FEATHER_STEP_PX);
+	}
+	return c->implicit_mask_staged;
+}
+
+// Resolve the zones frame's wish source (called from the composite, mid-
+// recording; caller holds c->mutex). Explicit frame wish: stage the
+// authoring texture in-cmd (referenced-at-frame-end = consume current state —
+// no xrSubmitLocal3DZoneEXT required), mirroring zone_mask_submit's body.
+// Auto: rasterize the ring-feathered union of the frame's zone rects.
+// Returns the staged R8 resource or nullptr.
+static ID3D12Resource *
+d3d12_update_zone_wish_state(struct comp_d3d12_compositor *c, uint32_t region_w, uint32_t region_h)
+{
+	if (c->frame_wish != nullptr && c->frame_wish->tex != nullptr && c->frame_wish->staged != nullptr) {
+		struct comp_d3d12_zone_mask *fw = c->frame_wish;
+
+		// tex steady RENDER_TARGET, staged steady PIXEL_SHADER_RESOURCE
+		// (see comp_d3d12_zone_mask) — same dance as zone_mask_submit,
+		// recorded into the open frame cmd list.
+		D3D12_RESOURCE_BARRIER to_copy[2] = {};
+		to_copy[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		to_copy[0].Transition.pResource = fw->tex;
+		to_copy[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		to_copy[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+		to_copy[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		to_copy[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		to_copy[1].Transition.pResource = fw->staged;
+		to_copy[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		to_copy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+		to_copy[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		c->cmd_list->ResourceBarrier(2, to_copy);
+
+		c->cmd_list->CopyResource(fw->staged, fw->tex);
+
+		std::swap(to_copy[0].Transition.StateBefore, to_copy[0].Transition.StateAfter);
+		std::swap(to_copy[1].Transition.StateBefore, to_copy[1].Transition.StateAfter);
+		c->cmd_list->ResourceBarrier(2, to_copy);
+		return fw->staged;
+	}
+
+	struct xrt_rect rects[XRT_MAX_LAYERS];
+	uint32_t rect_count = 0;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count && rect_count < XRT_MAX_LAYERS; i++) {
+		if (c->layer_accum.layers[i].data.type != XRT_LAYER_ZONE_3D) {
+			continue;
+		}
+		rects[rect_count++] = c->layer_accum.layers[i].data.zone_3d.rect;
+	}
+	return d3d12_update_zone_wish_mask(c, rects, rect_count, region_w, region_h);
+}
+
 // #439 Phase 3 — flatten this frame's Local2D layers into local2d_scratch (the
 // `twod` source the masked composite reads). Records into the OPEN c->cmd_list:
 // transition the scratch to RENDER_TARGET, clear transparent, draw each layer
@@ -3878,10 +4161,15 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	// `texture + mask`, surround supplies the 2D pixels) OR this frame carries
 	// Local2D layers (the layers supply both the 2D pixels and an implicit
 	// mask). Mirrors the D3D11 leg.
+	// XR_EXT_display_zones: a zones frame ALWAYS runs the composite (the
+	// feathered wish edge lerps the weave toward the 2D flatten even with
+	// zero Local2D layers); the sticky mask + implicit-mask rules are inert.
 	struct comp_d3d12_zone_mask *mask = c->active_zone_mask;
-	const bool have_explicit = (mask != nullptr && mask->submitted);
+	const bool zones_frame = c->zones_frame;
+	const bool have_explicit = !zones_frame && (mask != nullptr && mask->submitted);
 	const bool have_local_2d = c->local_2d_last_frame;
-	if ((!have_explicit && !have_local_2d) || dst == nullptr || dst_rtv == 0 || c->renderer == nullptr) {
+	if ((!zones_frame && !have_explicit && !have_local_2d) || dst == nullptr || dst_rtv == 0 ||
+	    c->renderer == nullptr) {
 		return false;
 	}
 
@@ -3927,8 +4215,13 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 		}
 	}
 
+	// Zones frame (XR_EXT_display_zones): the mask is the WISH — explicit
+	// frame wish (staged in-cmd, referenced-at-frame-end) or the auto
+	// ring-feathered raster from the zone rects.
 	ID3D12Resource *mask_res = nullptr;
-	if (have_explicit) {
+	if (zones_frame) {
+		mask_res = d3d12_update_zone_wish_state(c, region_w, region_h);
+	} else if (have_explicit) {
 		mask_res = mask->staged;
 	} else {
 		struct xrt_rect rects[XRT_MAX_LAYERS];
@@ -3953,14 +4246,17 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	// frame: flatten them into the dedicated local2d_scratch. Otherwise the
 	// legacy `texture + mask` path copies the app surround.
 	ID3D12Resource *twod_res = nullptr;
-	if (have_local_2d) {
+	if (zones_frame || have_local_2d) {
 		if (!d3d12_ensure_local2d_scratch(c, region_w, region_h)) {
 			return false;
 		}
 		if (!d3d12_ensure_scratch(c, &c->weave_scratch, region_w, region_h, dd.Format, "local2d weave")) {
 			return false;
 		}
-		if (!d3d12_flatten_local_2d_layers(c, region_w, region_h, proj_idx)) {
+		// Zones frame: flatten ALL Local2D layers (no under/over split —
+		// 2D-under is reserved in v1); with zero Local2D layers this is a
+		// clear-only flatten and the lerp fades the feather to transparent.
+		if (!d3d12_flatten_local_2d_layers(c, region_w, region_h, zones_frame ? -1 : proj_idx)) {
 			return false;
 		}
 		twod_res = c->local2d_scratch;
@@ -4146,15 +4442,18 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	// #491: the implicit (auto) Local2D mask composites the 2D over the weave by
 	// its own premultiplied alpha (translucent 2D reveals the 3D scene). The
 	// explicit authored mask + the legacy surround path keep the hard M-lerp.
-	const bool alpha_over = have_local_2d && !have_explicit;
+	// XR_EXT_display_zones: zones frames are ALWAYS the hard M-lerp
+	// (final = M·weave + (1−M)·flatten(2D-over)) — composition follows zone
+	// geometry + the wish, never the #491 alpha-over rule.
+	const bool alpha_over = !zones_frame && have_local_2d && !have_explicit;
 
 	// One-shot proof-of-life (capture is pre-weave, #492 — this is how we
 	// confirm the post-weave composite ran without a live eyeball).
 	static bool composite_logged = false;
 	if (!composite_logged) {
 		U_LOG_W("D3D12 Local2D composite: %ux%u region, %s mask, twod=%s (#491 alpha_over=%d)", region_w,
-		        region_h, have_explicit ? "explicit" : "implicit",
-		        have_local_2d ? "local2d layers" : "surround", alpha_over);
+		        region_h, zones_frame ? "zone wish" : (have_explicit ? "explicit" : "implicit"),
+		        (zones_frame || have_local_2d) ? "local2d layers" : "surround", alpha_over);
 		composite_logged = true;
 	}
 
@@ -4483,6 +4782,10 @@ comp_d3d12_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_pt
 	if (mask == nullptr) {
 		return;
 	}
+	// XR_EXT_display_zones: never leave a dangling frame-wish reference.
+	if (c->frame_wish == mask) {
+		c->frame_wish = nullptr;
+	}
 	if (c->active_zone_mask == mask) {
 		c->active_zone_mask = nullptr; // revert to rect-surround behavior
 	}
@@ -4499,6 +4802,19 @@ comp_d3d12_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_pt
 		mask->tex->Release();
 	}
 	free(mask);
+}
+
+extern "C" void
+comp_d3d12_compositor_zones_set_frame_wish(struct xrt_compositor *xc, void *mask)
+{
+	struct comp_d3d12_compositor *c = d3d12_comp(xc);
+	std::lock_guard<std::mutex> lock(c->mutex);
+
+	// Per-frame reference (XR_EXT_display_zones): oxr sets this on every
+	// zones frame before layer_commit, NULL meaning auto-derive. Consumed
+	// by the commit's composite; harmlessly stale on zero-zone frames (the
+	// zones branch never reads it there).
+	c->frame_wish = static_cast<struct comp_d3d12_zone_mask *>(mask);
 }
 
 // #439 Phase 3 Q4 — the compositor's current recommended per-view render size,
