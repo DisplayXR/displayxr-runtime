@@ -2040,6 +2040,14 @@ multi_compositor_request_display_mode(struct multi_compositor *mc, bool enable_3
 		return false;
 	}
 
+	// #533: this is the authoritative HARDWARE 2D/3D signal (the weave-state),
+	// DECOUPLED from the per-frame content (the app's submitted tile count). Record
+	// it so the per-session render drives the DP's mode_3d from the request, not from
+	// how many tiles the app happened to submit this frame. (Out-of-process the
+	// device-mode sync can't see this — OUTPUT_MODE doesn't cross IPC — so this flag
+	// IS the source of truth there.)
+	mc->hardware_display_3d = enable_3d;
+
 	// Prefer display processor path (vendor-specific, e.g. SR SwitchableLensHint)
 	if (mc->session_render.display_processor != NULL) {
 		if (xrt_display_processor_request_display_mode(

@@ -2177,6 +2177,30 @@ ipc_handle_compositor_set_eye_tracking_mode(volatile struct ipc_client_state *ic
 }
 
 xrt_result_t
+ipc_handle_compositor_request_display_mode(volatile struct ipc_client_state *ics, uint32_t enable_3d)
+{
+	IPC_TRACE_MARKER();
+
+	if (ics->xc == NULL) {
+		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+
+	// HARDWARE 2D/3D request (#533) — the weave-state signal, DECOUPLED from the
+	// per-frame content (atlas tile count). The out-of-process per-client
+	// compositor is a multi_compositor; forward to its DP. Only the Android
+	// null+comp_multi service reaches the DP this way.
+#ifdef XRT_OS_ANDROID
+	struct multi_compositor *mc = multi_compositor((struct xrt_compositor *)ics->xc);
+	if (mc != NULL) {
+		multi_compositor_request_display_mode(mc, enable_3d != 0u);
+	}
+#else
+	(void)enable_3d;
+#endif
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
 ipc_handle_compositor_set_performance_level(volatile struct ipc_client_state *ics,
                                             enum xrt_perf_domain domain,
                                             enum xrt_perf_set_level level)
