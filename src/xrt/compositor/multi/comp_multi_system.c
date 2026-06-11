@@ -2826,9 +2826,15 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 
 		// Lazily initialize per-session render resources if session has external HWND or readback
 		// This creates the per-session comp_target and display processor for multi-app support
-		// Skip re-init if window close is in progress (avoids VK_ERROR_SURFACE_LOST_KHR on dead HWND)
-		if (multi_compositor_has_session_render(mc) && !mc->session_render.initialized &&
-		    !mc->session_render.window_close_exit_sent) {
+		// Skip re-init if window close is in progress (avoids VK_ERROR_SURFACE_LOST_KHR on dead HWND).
+		// Also require an ACTIVE session: end_session tears the target down on purpose
+		// (xrEndSession when the app backgrounds behind a picker, #528) — re-initializing
+		// here while it is still tearing down races vkCreateAndroidSurfaceKHR against the
+		// old swapchain's BufferQueue connection (VK_ERROR_NATIVE_WINDOW_IN_USE_KHR storm)
+		// and pointlessly rebuilds a target no layers will reach. begin_session flips
+		// session_active back on and the next pass re-inits from the then-current surface.
+		if (mc->state.session_active && multi_compositor_has_session_render(mc) &&
+		    !mc->session_render.initialized && !mc->session_render.window_close_exit_sent) {
 			multi_compositor_init_session_render(mc);
 		}
 
