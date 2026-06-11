@@ -1094,7 +1094,8 @@ static void RenderThreadFunc(
                 // build the layer list manually (projection + panels in list
                 // order) and submit raw — the shared EndFrame helpers don't
                 // carry the Local2D layer type. Otherwise the normal paths.
-                uint32_t submitViewCount = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2;
+                // (#542: follows the content pin, like the render path)
+                uint32_t submitViewCount = (xr->renderingModeCount > 0 && contentModeIndex < xr->renderingModeCount) ? xr->renderingModeViewCounts[contentModeIndex] : 2;
                 LOG_INFO("[FRAME] EndFrame: rendered=%d hudSubmitted=%d viewCount=%u", rendered, hudSubmitted, submitViewCount);
                 if (g_l2dActive && g_panel1.swapchain != XR_NULL_HANDLE) {
                     XrCompositionLayerProjection projLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
