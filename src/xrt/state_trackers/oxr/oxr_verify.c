@@ -429,6 +429,13 @@ oxr_verify_extensions(struct oxr_logger *log, const struct oxr_extension_status 
 		                 "XR_EXT_dpad_binding requires XR_KHR_binding_modification");
 	}
 
+#ifdef OXR_HAVE_EXT_display_zones
+	if (extensions->EXT_display_zones && (!extensions->EXT_local_3d_zone || !extensions->EXT_view_rig)) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+		                 "XR_EXT_display_zones requires XR_EXT_local_3d_zone and XR_EXT_view_rig");
+	}
+#endif
+
 	return XR_SUCCESS;
 }
 

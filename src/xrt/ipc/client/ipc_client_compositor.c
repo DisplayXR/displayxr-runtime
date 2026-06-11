@@ -1751,6 +1751,30 @@ ipc_compositor_layer_local_2d(struct xrt_compositor *xc,
 	return handle_layer(xc, xdev, xsc, data, XRT_LAYER_LOCAL_2D);
 }
 
+/*!
+ * Zone-3D layers carry view_count swapchains (like projection), which the
+ * generic single-swapchain handle_layer() cannot serialize. The IPC
+ * transport rides the vendor-plugin phase (P5) — until then drop with a
+ * one-time WARN, never an error.
+ *
+ * @todo P5: serialize multi-swapchain ids projection-style and consume in
+ *       the service multi-compositor.
+ */
+static xrt_result_t
+ipc_compositor_layer_zone_3d(struct xrt_compositor *xc,
+                             struct xrt_device *xdev,
+                             struct xrt_swapchain *xsc[XRT_MAX_VIEWS],
+                             const struct xrt_layer_data *data)
+{
+	static bool warned = false;
+	if (!warned) {
+		warned = true;
+		U_LOG_W("Zone-3D layers are not transported over IPC yet — dropping (one-time warning)");
+	}
+
+	return XRT_SUCCESS;
+}
+
 static xrt_result_t
 ipc_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -1926,6 +1950,7 @@ ipc_compositor_init(struct ipc_client_compositor *icc, struct xrt_compositor_nat
 	icc->base.base.layer_passthrough = ipc_compositor_layer_passthrough;
 	icc->base.base.layer_window_space = ipc_compositor_layer_window_space;
 	icc->base.base.layer_local_2d = ipc_compositor_layer_local_2d;
+	icc->base.base.layer_zone_3d = ipc_compositor_layer_zone_3d;
 	icc->base.base.layer_commit = ipc_compositor_layer_commit;
 	icc->base.base.layer_commit_with_semaphore = ipc_compositor_layer_commit_with_semaphore;
 	icc->base.base.destroy = ipc_compositor_destroy;

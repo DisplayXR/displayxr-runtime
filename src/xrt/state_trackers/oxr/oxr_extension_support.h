@@ -622,6 +622,21 @@
 
 
 /*
+ * XR_EXT_display_zones
+ *
+ * Hand-added DisplayXR extension (generate_oxr_ext_support.py knows nothing
+ * of the DisplayXR blocks — keep them when regenerating).
+ */
+#if defined(XR_EXT_display_zones)
+#define OXR_HAVE_EXT_display_zones
+#define OXR_EXTENSION_SUPPORT_EXT_display_zones(_) \
+    _(EXT_display_zones, EXT_DISPLAY_ZONES)
+#else
+#define OXR_EXTENSION_SUPPORT_EXT_display_zones(_)
+#endif
+
+
+/*
  * XR_EXT_workspace_file_dialog
  */
 #if defined(XR_EXT_workspace_file_dialog) && defined(XR_USE_PLATFORM_WIN32)
@@ -1126,6 +1141,7 @@
     OXR_EXTENSION_SUPPORT_EXT_atlas_capture(_) \
     OXR_EXTENSION_SUPPORT_EXT_local_3d_zone(_) \
     OXR_EXTENSION_SUPPORT_EXT_view_rig(_) \
+    OXR_EXTENSION_SUPPORT_EXT_display_zones(_) \
     OXR_EXTENSION_SUPPORT_EXT_workspace_file_dialog(_) \
     OXR_EXTENSION_SUPPORT_EXT_mcp_tools(_) \
     OXR_EXTENSION_SUPPORT_BD_controller_interaction(_) \

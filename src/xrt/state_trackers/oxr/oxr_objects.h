@@ -136,6 +136,10 @@ struct oxr_local_3d_zone_ext;
 #define XRT_MAX_HANDLE_CHILDREN 256
 #define OXR_MAX_BINDINGS_PER_ACTION 32
 
+//! XR_EXT_display_zones: max zone-chained projection layers per frame
+//! (ADR-027 — plugin-independent, compositor-side assembly).
+#define OXR_DISPLAY_ZONES_MAX_ZONES_3D 8
+
 struct time_state;
 
 /*!
@@ -2319,6 +2323,31 @@ struct oxr_session
 	//! external-window display-centric forcing); locates that chain nothing
 	//! keep the default behavior exactly.
 	struct oxr_view_rig_state view_rig;
+
+#ifdef OXR_HAVE_EXT_display_zones
+	//! XR_EXT_display_zones (ADR-027): per-session zone bookkeeping. The
+	//! located[] ring records recent zone-scoped locates for the
+	//! VALIDATE_BIT locate<->submit cross-checks (approximate, one-shot
+	//! WARNs only); the warned_* latches keep every diagnostic one-shot
+	//! per session. Zones themselves are stateless per-frame data.
+	struct
+	{
+		struct
+		{
+			uint32_t id;
+			XrRect2Di rect;
+		} located[OXR_DISPLAY_ZONES_MAX_ZONES_3D];
+		uint32_t located_count;
+		uint32_t located_next_slot;
+		bool warned_bad_locate_rect;
+		bool warned_ipc_locate;
+		bool warned_no_compositor_consumer;
+		bool warned_depth_ignored;
+		bool warned_validate_unlocated;
+		bool warned_validate_rect_mismatch;
+		bool warned_frame_end_info_legacy;
+	} display_zones;
+#endif
 
 	//! True if this session has successfully called xrActivateSpatialWorkspaceEXT
 	//! and is currently the active workspace controller (#234).

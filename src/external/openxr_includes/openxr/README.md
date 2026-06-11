@@ -33,7 +33,7 @@ Rules:
 | 1000999120–122 | `XR_EXT_workspace_file_dialog` | 122 is an `XrResult`, not an `XrStructureType` |
 | 1000999130–132 | `XR_EXT_mcp_tools` | |
 | 1000999140–142 | `XR_EXT_view_rig` | |
-| 1000999150–153 | `XR_EXT_display_zones` | reserved by the design sketch (`docs/specs/extensions/XR_EXT_display_zones.md`); header not yet authored |
+| 1000999150–153 | `XR_EXT_display_zones` | assigned (spec v1) |
 | 1000999160–166 | `XR_EXT_local_3d_zone` | relocated from 130–136 (collided with mcp_tools) — spec v4 |
 | 1000999170–171 | `XR_EXT_atlas_capture` | relocated from 120–121 (collided with workspace_file_dialog) — spec v3 |
 | 1000999180 | `XR_EXT_macos_gl_binding` | relocated from 1000999010 (collided with display_info) — spec v2 |

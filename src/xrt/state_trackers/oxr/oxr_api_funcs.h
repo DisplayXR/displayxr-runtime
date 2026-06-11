@@ -1037,6 +1037,18 @@ XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrDestroyLocal3DZoneMaskEXT(XrLocal3DZoneMaskEXT mask);
 #endif
 
+#ifdef OXR_HAVE_EXT_display_zones
+//! OpenXR API function @ep{xrGetDisplayZoneCapabilitiesEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetDisplayZoneCapabilitiesEXT(XrSession session, XrDisplayZoneCapabilitiesEXT *capabilities);
+
+//! OpenXR API function @ep{xrGetDisplayZoneRecommendedViewSizeEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetDisplayZoneRecommendedViewSizeEXT(XrSession session,
+                                           const XrRect2Di *zoneRect,
+                                           XrExtent2Di *recommendedViewSize);
+#endif
+
 #ifdef OXR_HAVE_EXT_conformance_automation
 //! OpenXR API function @ep{xrSetInputDeviceActiveEXT}
 XRAPI_ATTR XrResult XRAPI_CALL

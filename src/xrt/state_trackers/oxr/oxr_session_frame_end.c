@@ -1344,6 +1344,153 @@ verify_local_2d_layer(struct oxr_session *sess,
 }
 #endif // OXR_HAVE_EXT_local_3d_zone
 
+#ifdef OXR_HAVE_EXT_display_zones
+/*!
+ * Zones-frame pre-pass (XR_EXT_display_zones, ADR-027): detect whether this
+ * frame is a zones frame (>= 1 zone-chained projection layer), enforce the
+ * all-or-none rule + per-frame zone constraints, and consume the optional
+ * XrDisplayZonesFrameEndInfoEXT on the frame-end chain. Zero-zone frames
+ * return with *out_zones_frame == false and zero behavioral delta.
+ */
+static XrResult
+verify_zones_frame(struct oxr_session *sess,
+                   struct oxr_logger *log,
+                   const XrFrameEndInfo *frameEndInfo,
+                   bool *out_zones_frame)
+{
+	*out_zones_frame = false;
+
+	uint32_t projection_count = 0;
+	uint32_t zone_count = 0;
+	uint32_t first_unchained = 0;
+	bool have_unchained = false;
+	uint32_t zone_ids[OXR_DISPLAY_ZONES_MAX_ZONES_3D];
+	XrRect2Di zone_rects[OXR_DISPLAY_ZONES_MAX_ZONES_3D];
+
+	for (uint32_t i = 0; i < frameEndInfo->layerCount; i++) {
+		const XrCompositionLayerBaseHeader *layer = frameEndInfo->layers[i];
+		if (layer == NULL || layer->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+			continue;
+		}
+		projection_count++;
+
+		const XrDisplayZoneEXT *zone =
+		    OXR_GET_INPUT_FROM_CHAIN(layer, XR_TYPE_DISPLAY_ZONE_EXT, XrDisplayZoneEXT);
+		if (zone == NULL) {
+			if (!have_unchained) {
+				have_unchained = true;
+				first_unchained = i;
+			}
+			continue;
+		}
+
+		if (zone_count >= OXR_DISPLAY_ZONES_MAX_ZONES_3D) {
+			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+			                 "(frameEndInfo->layers[%u]) more than %u zone-chained projection layers "
+			                 "in this frame (maxZones3D)",
+			                 i, OXR_DISPLAY_ZONES_MAX_ZONES_3D);
+		}
+		if (zone->rect.extent.width <= 0 || zone->rect.extent.height <= 0) {
+			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+			                 "(frameEndInfo->layers[%u]) zone %u rect extent {%d, %d} must be positive",
+			                 i, zone->zoneId, zone->rect.extent.width, zone->rect.extent.height);
+		}
+		for (uint32_t z = 0; z < zone_count; z++) {
+			if (zone_ids[z] == zone->zoneId) {
+				return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+				                 "(frameEndInfo->layers[%u]) duplicate zoneId %u among this "
+				                 "frame's 3D zones",
+				                 i, zone->zoneId);
+			}
+		}
+		zone_ids[zone_count] = zone->zoneId;
+		zone_rects[zone_count] = zone->rect;
+		zone_count++;
+	}
+
+	const XrDisplayZonesFrameEndInfoEXT *fei = OXR_GET_INPUT_FROM_CHAIN(
+	    frameEndInfo, XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_EXT, XrDisplayZonesFrameEndInfoEXT);
+
+	if (zone_count == 0) {
+		// Zero-zone frame: bit-identical legacy behavior. A frame-end
+		// info chained outside a zones frame is inert, not an error.
+		if (fei != NULL && !sess->display_zones.warned_frame_end_info_legacy) {
+			sess->display_zones.warned_frame_end_info_legacy = true;
+			U_LOG_W("XrDisplayZonesFrameEndInfoEXT chained on a zero-zone frame — inert "
+			        "(one-time warning)");
+		}
+		return XR_SUCCESS;
+	}
+
+	// All-or-none: every projection layer in a zones frame must carry a
+	// zone chain. Other layer types are unaffected.
+	if (zone_count != projection_count) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+		                 "(frameEndInfo->layers[%u]) zones frame (%u zone-chained projection layers) but "
+		                 "this projection layer carries no XrDisplayZoneEXT chain (all-or-none)",
+		                 first_unchained, zone_count);
+	}
+
+	// Same session gate as local-2D layers: a window-bound native compositor.
+	if (!sess->is_d3d11_native_compositor && !sess->is_d3d12_native_compositor &&
+	    !sess->is_metal_native_compositor && !sess->is_gl_native_compositor && !sess->has_external_window) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+		                 "(frameEndInfo->layers) zone-chained projection layers require a session created "
+		                 "with a window binding extension");
+	}
+
+	if (fei != NULL && fei->wishMask != XR_NULL_HANDLE) {
+		struct oxr_local_3d_zone_ext *mask =
+		    XRT_CAST_OXR_HANDLE_TO_PTR(struct oxr_local_3d_zone_ext *, fei->wishMask);
+		if (mask == NULL || mask->sess != sess) {
+			return oxr_error(log, XR_ERROR_HANDLE_INVALID,
+			                 "(frameEndInfo->next...wishMask) mask does not belong to this session");
+		}
+		//! @todo P2: hand the mask to the compositor as the frame's
+		//! hardware wish (comp_*_compositor_zones_set_frame_wish);
+		//! absent/NULL = auto-derive from the zone-rect union.
+	}
+
+	// VALIDATE_BIT: locate<->submit cross-checks, one-shot WARN per
+	// violation class per session — never a per-frame error (ADR-024).
+	if (fei != NULL && (fei->flags & XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_EXT) != 0) {
+		for (uint32_t z = 0; z < zone_count; z++) {
+			bool found = false;
+			for (uint32_t li = 0; li < sess->display_zones.located_count; li++) {
+				if (sess->display_zones.located[li].id != zone_ids[z]) {
+					continue;
+				}
+				found = true;
+				const XrRect2Di *lr = &sess->display_zones.located[li].rect;
+				const XrRect2Di *sr = &zone_rects[z];
+				if ((lr->offset.x != sr->offset.x || lr->offset.y != sr->offset.y ||
+				     lr->extent.width != sr->extent.width ||
+				     lr->extent.height != sr->extent.height) &&
+				    !sess->display_zones.warned_validate_rect_mismatch) {
+					sess->display_zones.warned_validate_rect_mismatch = true;
+					U_LOG_W("Display-zones validate: zone %u submit rect {%d,%d %dx%d} != "
+					        "locate rect {%d,%d %dx%d} — one frame mis-framed "
+					        "(one-time warning)",
+					        zone_ids[z], sr->offset.x, sr->offset.y, sr->extent.width,
+					        sr->extent.height, lr->offset.x, lr->offset.y, lr->extent.width,
+					        lr->extent.height);
+				}
+				break;
+			}
+			if (!found && !sess->display_zones.warned_validate_unlocated) {
+				sess->display_zones.warned_validate_unlocated = true;
+				U_LOG_W("Display-zones validate: zone %u submitted but never located — stale "
+				        "framing (one-time warning)",
+				        zone_ids[z]);
+			}
+		}
+	}
+
+	*out_zones_frame = true;
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_EXT_display_zones
+
 /*
  *
  * Submit functions.
@@ -1574,6 +1721,114 @@ submit_projection_layer(struct oxr_session *sess,
 
 	return XR_SUCCESS;
 }
+
+#ifdef OXR_HAVE_EXT_display_zones
+/*!
+ * Submit a zone-chained projection layer as XRT_LAYER_ZONE_3D
+ * (XR_EXT_display_zones, ADR-027). Clone of submit_projection_layer with the
+ * zone tagging: same per-view fov/pose/sub fill (zone_3d.proj is
+ * layout-identical to proj at union offset 0), plus the zone rect + id from
+ * the chained XrDisplayZoneEXT. No depth variant in v1 — chained depth info
+ * is ignored with a one-shot WARN.
+ */
+static XrResult
+submit_zone_3d_layer(struct oxr_session *sess,
+                     struct xrt_compositor *xc,
+                     struct oxr_logger *log,
+                     XrCompositionLayerProjection *proj,
+                     struct xrt_device *head,
+                     struct xrt_pose *inv_offset,
+                     uint64_t oxr_timestamp,
+                     uint64_t xrt_timestamp)
+{
+	struct oxr_space *spc = XRT_CAST_OXR_HANDLE_TO_PTR(struct oxr_space *, proj->space);
+	struct oxr_swapchain *scs[XRT_MAX_VIEWS] = {0};
+	struct xrt_pose *pose_ptr = NULL;
+	struct xrt_pose pose[XRT_MAX_VIEWS] = {0};
+	struct xrt_swapchain *swapchains[XRT_MAX_VIEWS] = {0};
+
+	// Presence + validity guaranteed by verify_zones_frame.
+	const XrDisplayZoneEXT *zone = OXR_GET_INPUT_FROM_CHAIN(proj, XR_TYPE_DISPLAY_ZONE_EXT, XrDisplayZoneEXT);
+	assert(zone != NULL);
+
+	enum xrt_layer_composition_flags flags = convert_layer_flags(proj->layerFlags);
+
+	for (uint32_t i = 0; i < proj->viewCount; i++) {
+		scs[i] = XRT_CAST_OXR_HANDLE_TO_PTR(struct oxr_swapchain *, proj->views[i].subImage.swapchain);
+		pose_ptr = (struct xrt_pose *)&proj->views[i].pose;
+
+		if (!handle_space(log, sess, spc, pose_ptr, inv_offset, oxr_timestamp, &pose[i])) {
+			return XR_SUCCESS;
+		}
+	}
+
+	if (spc->space_type == OXR_SPACE_TYPE_REFERENCE_VIEW) {
+		flags |= XRT_LAYER_COMPOSITION_VIEW_SPACE_BIT;
+	}
+
+#ifdef OXR_HAVE_KHR_composition_layer_depth
+	if (!sess->display_zones.warned_depth_ignored) {
+		for (uint32_t i = 0; i < proj->viewCount; i++) {
+			const XrCompositionLayerDepthInfoKHR *d_info = OXR_GET_INPUT_FROM_CHAIN(
+			    &proj->views[i], XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR, XrCompositionLayerDepthInfoKHR);
+			if (d_info != NULL) {
+				sess->display_zones.warned_depth_ignored = true;
+				U_LOG_W("Zone-3D layers have no depth variant in v1 — chained "
+				        "XrCompositionLayerDepthInfoKHR ignored (one-time warning)");
+				break;
+			}
+		}
+	}
+#endif // OXR_HAVE_KHR_composition_layer_depth
+
+	struct xrt_layer_data data;
+	U_ZERO(&data);
+	data.type = XRT_LAYER_ZONE_3D;
+	data.name = XRT_INPUT_GENERIC_HEAD_POSE;
+	data.timestamp = xrt_timestamp;
+	data.flags = flags;
+	data.view_count = proj->viewCount;
+	for (size_t i = 0; i < proj->viewCount; ++i) {
+		struct xrt_fov *fov = (struct xrt_fov *)&proj->views[i].fov;
+		data.zone_3d.proj.v[i].fov = *fov;
+		data.zone_3d.proj.v[i].pose = pose[i];
+		fill_in_sub_image(scs[i], &proj->views[i].subImage, &data.zone_3d.proj.v[i].sub);
+		swapchains[i] = scs[i]->swapchain;
+	}
+	data.zone_3d.rect.offset.w = zone->rect.offset.x;
+	data.zone_3d.rect.offset.h = zone->rect.offset.y;
+	data.zone_3d.rect.extent.w = zone->rect.extent.width;
+	data.zone_3d.rect.extent.h = zone->rect.extent.height;
+	data.zone_3d.zone_id = zone->zoneId;
+	fill_in_color_scale_bias(sess, (XrCompositionLayerBaseHeader *)proj, &data);
+	fill_in_y_flip(sess, (XrCompositionLayerBaseHeader *)proj, &data);
+	fill_in_blend_factors(sess, (XrCompositionLayerBaseHeader *)proj, &data);
+	fill_in_layer_settings(sess, (XrCompositionLayerBaseHeader *)proj, &data);
+
+	if (xc->layer_zone_3d == NULL) {
+		// No compositor consumer yet (P2 wires the native compositors);
+		// drop with a one-shot WARN, never an error.
+		if (!sess->display_zones.warned_no_compositor_consumer) {
+			sess->display_zones.warned_no_compositor_consumer = true;
+			U_LOG_W("Zone-3D layers are not consumed by this compositor yet — dropping "
+			        "(one-time warning)");
+		}
+		return XR_SUCCESS;
+	}
+
+	xrt_result_t xret = xrt_comp_layer_zone_3d( //
+	    xc,                                     // compositor
+	    head,                                   // xdev
+	    swapchains,                             // swapchains
+	    &data);                                 // data
+	OXR_CHECK_XRET(log, sess, xret, xrt_comp_layer_zone_3d);
+
+	//! @todo P2: decide how zone layers surface in MCP introspection
+	//! (oxr_mcp_tools_record_submitted assumes data.proj).
+
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_EXT_display_zones
 
 static XrResult
 submit_cube_layer(struct oxr_session *sess,
@@ -2003,6 +2258,21 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 		return oxr_error(log, XR_ERROR_LAYER_INVALID, "(frameEndInfo->layers == NULL)");
 	}
 
+#ifdef OXR_HAVE_EXT_display_zones
+	// XR_EXT_display_zones (ADR-027): zones-frame detection + gating. Only
+	// runs with the extension enabled — zero-zone bit-identity is
+	// structural. In a zones frame the legacy canvas output rect, the
+	// sticky submitted mask, and the implicit-mask-from-Local2D rule are
+	// all inert (compositor-side, P2).
+	bool zones_frame = false;
+	if (sess->sys->inst->extensions.EXT_display_zones) {
+		XrResult zres = verify_zones_frame(sess, log, frameEndInfo, &zones_frame);
+		if (zres != XR_SUCCESS) {
+			return zres;
+		}
+	}
+#endif
+
 	for (uint32_t i = 0; i < frameEndInfo->layerCount; i++) {
 		const XrCompositionLayerBaseHeader *layer = frameEndInfo->layers[i];
 		if (layer == NULL) {
@@ -2090,6 +2360,15 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 
 		switch (layer->type) {
 		case XR_TYPE_COMPOSITION_LAYER_PROJECTION:
+#ifdef OXR_HAVE_EXT_display_zones
+			if (zones_frame) {
+				// All-or-none verified: every projection layer in a
+				// zones frame carries a zone chain.
+				submit_zone_3d_layer(sess, xc, log, (XrCompositionLayerProjection *)layer, xdev,
+				                     &inv_offset, frameEndInfo->displayTime, xrt_display_time_ns);
+				break;
+			}
+#endif
 			submit_projection_layer(sess, xc, log, (XrCompositionLayerProjection *)layer, xdev, &inv_offset,
 			                        frameEndInfo->displayTime, xrt_display_time_ns);
 			break;

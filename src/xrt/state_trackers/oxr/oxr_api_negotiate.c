@@ -492,6 +492,11 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrDestroyLocal3DZoneMaskEXT, EXT_local_3d_zone);
 #endif
 
+#ifdef OXR_HAVE_EXT_display_zones
+	ENTRY_IF_EXT(xrGetDisplayZoneCapabilitiesEXT, EXT_display_zones);
+	ENTRY_IF_EXT(xrGetDisplayZoneRecommendedViewSizeEXT, EXT_display_zones);
+#endif
+
 #ifdef OXR_HAVE_EXT_workspace_file_dialog
 	ENTRY_IF_EXT(xrRequestFilePickerEXT, EXT_workspace_file_dialog);
 	ENTRY_IF_EXT(xrGetFilePickerRequestEXT, EXT_workspace_file_dialog);

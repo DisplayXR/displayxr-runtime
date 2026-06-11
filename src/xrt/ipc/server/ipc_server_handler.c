@@ -2523,6 +2523,10 @@ _update_layers(volatile struct ipc_client_state *ics, struct xrt_compositor *xc,
 				return false;
 			}
 			break;
+		case XRT_LAYER_ZONE_3D:
+			// Clients never send these yet (IPC transport is P5 of
+			// XR_EXT_display_zones); skip rather than error.
+			break;
 		default: U_LOG_E("Unhandled layer type '%i'!", layer->data.type); break;
 		}
 	}
