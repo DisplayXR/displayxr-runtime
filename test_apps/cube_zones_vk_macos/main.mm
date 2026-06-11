@@ -1,0 +1,4000 @@
+// Copyright 2026, DisplayXR
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  Cube Zones VK — XR_EXT_display_zones exerciser (ADR-027), macOS VK leg
+ *
+ * Port of cube_zones_d3d11_win / cube_zones_metal_macos onto the
+ * cube_handle_vk_macos scaffold, with one deliberate simplification: zones
+ * are SOLID CLEARS (vkCmdClearColorImage), not 3D scenes. The point of this
+ * app is validating the COMPOSITOR-side zones path on the VK native
+ * compositor — placement per view tile, the draw-based alpha-over overlap
+ * composite, the AUTO/Tier-2 wish, the zone-scoped locate — and exact flat
+ * colors make every one of those checks pixel-predictable:
+ *
+ *  - Zone A (zoneId=1, left)  : identity rig, OPAQUE dark-red clear
+ *    (0.15, 0.03, 0.03, 1).
+ *  - Zone B (zoneId=2, right) : ipdFactor 0.6 + perspectiveFactor 0.5 rig,
+ *    SEMI-TRANSPARENT dark-blue clear (premultiplied 0.0165, 0.0165,
+ *    0.0825, 0.55) — overlap oracle: B + A*(1-0.55) per channel.
+ *  - Local2D strip (top 25%)  : solid amber clear, always on.
+ *
+ * Keys / env: M = wish mode (AUTO / explicit Tier-2 rects), O = zone B
+ * overlap toggle; DXR_ZONES_WISH_MODE=1 / DXR_ZONES_OVERLAP=1 preselect
+ * those states headlessly; DXR_ZONES_VALIDATE=1 chains the validate bit.
+ * Without XR_EXT_display_zones the app runs as the plain cube (the whole
+ * base-app path below is intact).
+ */
+
+#import <Cocoa/Cocoa.h>
+#import <QuartzCore/QuartzCore.h>
+
+#include <vulkan/vulkan.h>
+
+#define XR_USE_GRAPHICS_API_VULKAN
+#include <openxr/openxr.h>
+#include <openxr/openxr_platform.h>
+#include <openxr/XR_EXT_cocoa_window_binding.h>
+#include <openxr/XR_EXT_display_info.h>
+#include <openxr/XR_EXT_atlas_capture.h>
+#include <openxr/XR_EXT_view_rig.h>
+#include <openxr/XR_EXT_local_3d_zone.h>
+#include <openxr/XR_EXT_display_zones.h>
+
+#include <cmath>
+#include <csignal>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <chrono>
+#include <vector>
+
+#include <mach-o/dyld.h>
+#include <unistd.h>
+
+#include "view_params.h"
+#include "projection_depth.h"
+#include "atlas_capture.h"
+#include "xr_window_space_hud.h"
+#include "hud_renderer_macos.h"
+
+// stb_image implementation TU lives in displayxr::common (stb_image_impl_macos.cpp) — declarations only here (#396 W4).
+#include "stb_image.h"
+
+// ============================================================================
+// Logging
+// ============================================================================
+
+#define LOG_INFO(fmt, ...)  fprintf(stdout, "[INFO]  " fmt "\n", ##__VA_ARGS__)
+#define LOG_WARN(fmt, ...)  fprintf(stderr, "[WARN]  " fmt "\n", ##__VA_ARGS__)
+#define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
+
+#define XR_CHECK(call) \
+    do { \
+        XrResult _r = (call); \
+        if (XR_FAILED(_r)) { \
+            LOG_ERROR("%s failed: %d", #call, (int)_r); \
+            return false; \
+        } \
+    } while (0)
+
+#define VK_CHECK(call) \
+    do { \
+        VkResult _r = (call); \
+        if (_r != VK_SUCCESS) { \
+            LOG_ERROR("%s failed: %d", #call, (int)_r); \
+            return false; \
+        } \
+    } while (0)
+
+// ============================================================================
+// XR_EXT_display_zones state (ADR-027) — clear-based zones, see file header
+// ============================================================================
+
+static const uint32_t kNumZones = 2;
+static const float kZoneVirtualDisplayHeight = 0.30f;
+
+struct DisplayZone {
+    uint32_t zoneId = 0;
+    XrRect2Di rect = {};            //!< client-window (backing) pixels; locate AND submit use this one variable
+    float ipdFactor = 1.0f;
+    float perspectiveFactor = 1.0f;
+    float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f}; //!< premultiplied RGBA
+    XrSwapchain swapchain = XR_NULL_HANDLE;
+    uint32_t tileW = 0;
+    uint32_t tileH = 0;
+    uint32_t tileCount = 0;
+    std::vector<VkImage> images;
+};
+static DisplayZone g_zonesArr[kNumZones];
+
+static XrRect2Di g_zoneARect, g_zoneBRect, g_zoneBOverlapRect, g_stripRect;
+static bool g_zoneBOverlap = false;
+
+// Local2D strip: solid amber clear, filled once.
+struct StripLayer {
+    XrSwapchain swapchain = XR_NULL_HANDLE;
+    uint32_t w = 0, h = 0;
+};
+static StripLayer g_strip;
+
+static bool g_zonesActive = false;
+static bool g_zonesAttempted = false;
+static long g_zonesFrameCounter = 0;
+static const long kZonesActivationFrame = 10;
+
+// Wish modes (M key): 0 AUTO, 1 explicit Tier-2 rects.
+static int g_wishMode = 0;
+static bool g_wishModeCycleRequested = false;
+static bool g_overlapToggleRequested = false;
+
+static bool g_hasLocal3DZoneExt = false;
+static bool g_hasDisplayZonesExt = false;
+static PFN_xrGetDisplayZoneCapabilitiesEXT g_pfnGetZoneCaps = nullptr;
+static PFN_xrGetDisplayZoneRecommendedViewSizeEXT g_pfnGetZoneViewSize = nullptr;
+static PFN_xrCreateLocal3DZoneMaskEXT g_pfnCreateZoneMask = nullptr;
+static PFN_xrSetLocal3DZoneFromRectsEXT g_pfnSetZoneRects = nullptr;
+static PFN_xrDestroyLocal3DZoneMaskEXT g_pfnDestroyZoneMask = nullptr;
+static XrLocal3DZoneMaskEXT g_zoneMask = XR_NULL_HANDLE;
+
+static bool ZonesValidateEnabled() {
+    static const bool e = []() {
+        const char* v = getenv("DXR_ZONES_VALIDATE");
+        return v != nullptr && *v == '1';
+    }();
+    return e;
+}
+
+// ============================================================================
+// Input state (ported from test_apps/common/input_handler.h)
+// ============================================================================
+
+struct InputState {
+    // Mouse drag for camera look
+    float yaw = 0.0f;
+    float pitch = 0.0f;
+
+    // WASD/QE movement keys (held state)
+    bool keyW = false, keyA = false, keyS = false, keyD = false;
+    bool keyE = false, keyQ = false;
+
+    // Camera position
+    float cameraPosX = 0.0f, cameraPosY = 0.0f, cameraPosZ = 0.0f;
+
+    // View reset
+    bool resetViewRequested = false;
+
+    // Stereo camera parameters (IPD, parallax, perspective, scale/zoom)
+    ViewParams viewParams;
+
+    // HUD toggle (Tab)
+    bool hudVisible = true;
+
+    // Rendering mode REQUESTS — single source of truth lives on the runtime
+    // side (read back as xr.currentModeIndex after the runtime's
+    // XrEventDataRenderingModeChangedEXT lands). Keys emit transient requests;
+    // the actual current mode is never mirrored here.
+    uint32_t renderingModeCount = 0;             // mirror of xr.renderingModeCount for keypress bounds
+    bool cycleRenderingModeRequested = false;    // V key
+    int32_t absoluteRenderingModeRequested = -1; // 0-8 keys; -1 = none
+
+    // Camera vs display mode toggle (C key)
+    bool cameraMode = false;
+    float nominalViewerZ = 0.5f;  // Cached from runtime for camera-mode init
+
+    // Eye tracking mode toggle (T key)
+    bool eyeTrackingModeToggleRequested = false;
+
+    // 'I' key: snapshot the rendered atlas (cols × rows × renderW × renderH)
+    // to ~/Pictures/DisplayXR/<app>-<N>_<cols>x<rows>.png. Skipped for 1×1.
+    bool captureAtlasRequested = false;
+};
+
+// ============================================================================
+// Globals
+// ============================================================================
+
+static volatile bool g_running = true;
+static NSWindow *g_window = nil;
+static NSView *g_metalView = nil;
+static InputState g_input;
+static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18°) → 36° vFOV
+
+// Borderless fullscreen state
+static bool g_fullscreen = false;
+static NSRect g_savedWindowFrame = {};
+static NSUInteger g_savedWindowStyle = 0;
+
+static void ToggleBorderlessFullscreen() {
+    if (g_fullscreen) {
+        // Restore windowed mode
+        [g_window setStyleMask:g_savedWindowStyle];
+        [g_window setFrame:g_savedWindowFrame display:YES animate:NO];
+        [g_window setLevel:NSNormalWindowLevel];
+        g_fullscreen = false;
+        LOG_INFO("Exited fullscreen");
+    } else {
+        // Save state and go borderless fullscreen
+        g_savedWindowStyle = [g_window styleMask];
+        g_savedWindowFrame = [g_window frame];
+        NSScreen *screen = [g_window screen] ?: [NSScreen mainScreen];
+        [g_window setStyleMask:NSWindowStyleMaskBorderless];
+        [g_window setFrame:[screen frame] display:YES animate:NO];
+        [g_window setLevel:NSStatusWindowLevel]; // above menu bar
+        g_fullscreen = true;
+        LOG_INFO("Entered fullscreen");
+    }
+}
+
+// Performance stats
+static double g_avgFrameTime = 0.0;
+static uint64_t g_frameCount = 0;
+static float g_hudUpdateTimer = 0.0f;
+
+// Render/window dimensions for HUD
+static uint32_t g_renderW = 0, g_renderH = 0;
+static uint32_t g_windowW = 0, g_windowH = 0;
+
+// HUD window-space layer (XR_EXT_window_space_layer): replaces the legacy
+// NSView overlay so the runtime composes the HUD via the proper extension
+// path on macOS. Same constants as the other macOS test apps.
+static const uint32_t HUD_PIXEL_WIDTH = 380;
+static const uint32_t HUD_PIXEL_HEIGHT = 470;
+static const float HUD_WIDTH_FRACTION = 0.20f;
+
+// Cached HUD section strings, refreshed at HUD throttle rate (~2 Hz).
+static std::wstring g_hudSessionText, g_hudModeText, g_hudPerfText;
+static std::wstring g_hudDisplayText, g_hudEyeText, g_hudCameraText;
+static std::wstring g_hudStereoText, g_hudHelpText;
+
+// ============================================================================
+// Inline math — column-major float[16] matrices
+// ============================================================================
+
+static void mat4_identity(float* m) {
+    memset(m, 0, 16 * sizeof(float));
+    m[0] = m[5] = m[10] = m[15] = 1.0f;
+}
+
+static void mat4_multiply(float* out, const float* a, const float* b) {
+    float tmp[16];
+    for (int col = 0; col < 4; col++) {
+        for (int row = 0; row < 4; row++) {
+            float sum = 0.0f;
+            for (int k = 0; k < 4; k++) {
+                sum += a[k * 4 + row] * b[col * 4 + k];
+            }
+            tmp[col * 4 + row] = sum;
+        }
+    }
+    memcpy(out, tmp, sizeof(tmp));
+}
+
+static void mat4_translation(float* m, float tx, float ty, float tz) {
+    mat4_identity(m);
+    m[12] = tx;
+    m[13] = ty;
+    m[14] = tz;
+}
+
+static void mat4_scale(float* m, float sx, float sy, float sz) {
+    mat4_identity(m);
+    m[0] = sx;
+    m[5] = sy;
+    m[10] = sz;
+}
+
+static void mat4_rotation_y(float* m, float angle) {
+    mat4_identity(m);
+    float c = cosf(angle), s = sinf(angle);
+    m[0] = c;   m[8] = s;
+    m[2] = -s;  m[10] = c;
+}
+
+static void mat4_from_xr_fov(float* m, XrFovf fov, float nearZ, float farZ) {
+    float tanL = tanf(fov.angleLeft);
+    float tanR = tanf(fov.angleRight);
+    float tanU = tanf(fov.angleUp);
+    float tanD = tanf(fov.angleDown);
+    float w = tanR - tanL;
+    float h = tanU - tanD;
+    memset(m, 0, 16 * sizeof(float));
+    m[0]  = 2.0f / w;
+    m[5]  = 2.0f / h;
+    m[8]  = (tanR + tanL) / w;
+    m[9]  = (tanU + tanD) / h;
+    m[10] = -(farZ + nearZ) / (farZ - nearZ);
+    m[11] = -1.0f;
+    m[14] = -(2.0f * farZ * nearZ) / (farZ - nearZ);
+}
+
+static void mat4_view_from_xr_pose(float* viewMat, XrPosef pose) {
+    float qx = pose.orientation.x, qy = pose.orientation.y;
+    float qz = pose.orientation.z, qw = pose.orientation.w;
+
+    float rot[16];
+    mat4_identity(rot);
+    rot[0]  = 1 - 2*(qy*qy + qz*qz);
+    rot[1]  = 2*(qx*qy + qz*qw);
+    rot[2]  = 2*(qx*qz - qy*qw);
+    rot[4]  = 2*(qx*qy - qz*qw);
+    rot[5]  = 1 - 2*(qx*qx + qz*qz);
+    rot[6]  = 2*(qy*qz + qx*qw);
+    rot[8]  = 2*(qx*qz + qy*qw);
+    rot[9]  = 2*(qy*qz - qx*qw);
+    rot[10] = 1 - 2*(qx*qx + qy*qy);
+
+    // Transpose rotation (inverse of orthonormal)
+    float invRot[16];
+    mat4_identity(invRot);
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            invRot[j*4+i] = rot[i*4+j];
+
+    float invTrans[16];
+    mat4_translation(invTrans, -pose.position.x, -pose.position.y, -pose.position.z);
+    mat4_multiply(viewMat, invRot, invTrans);
+}
+
+// Quaternion from yaw/pitch (matches DirectX::XMQuaternionRotationRollPitchYaw(pitch, yaw, 0))
+static void quat_from_yaw_pitch(float yaw, float pitch, XrQuaternionf* out) {
+    float cy = cosf(yaw / 2.0f), sy = sinf(yaw / 2.0f);
+    float cp = cosf(pitch / 2.0f), sp = sinf(pitch / 2.0f);
+    out->w = cy * cp;
+    out->x = cy * sp;
+    out->y = sy * cp;
+    out->z = -sy * sp;
+}
+
+// Rotate vec3 by quaternion: v' = q * v * q^-1
+static void quat_rotate_vec3(XrQuaternionf q, float vx, float vy, float vz,
+    float* ox, float* oy, float* oz) {
+    float tx = 2.0f * (q.y * vz - q.z * vy);
+    float ty = 2.0f * (q.z * vx - q.x * vz);
+    float tz = 2.0f * (q.x * vy - q.y * vx);
+    *ox = vx + q.w * tx + (q.y * tz - q.z * ty);
+    *oy = vy + q.w * ty + (q.z * tx - q.x * tz);
+    *oz = vz + q.w * tz + (q.x * ty - q.y * tx);
+}
+
+// Display-local eye distance for the ZDP-anchored clip (#396 W7 consume
+// path): z of (rigPose^-1 * eyeWorld). Degenerates to pose.position.z at
+// identity rig pose.
+static float RigLocalEyeZ(const XrPosef &rig, const XrVector3f &eyeWorld) {
+    XrQuaternionf inv = {-rig.orientation.x, -rig.orientation.y,
+                         -rig.orientation.z, rig.orientation.w};
+    float ox, oy, oz;
+    quat_rotate_vec3(inv,
+                     eyeWorld.x - rig.position.x,
+                     eyeWorld.y - rig.position.y,
+                     eyeWorld.z - rig.position.z,
+                     &ox, &oy, &oz);
+    return oz;
+}
+
+// Hamilton product: a * b
+static XrQuaternionf quat_multiply(XrQuaternionf a, XrQuaternionf b) {
+    return {
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z
+    };
+}
+
+// ============================================================================
+// SPIR-V shaders (embedded)
+// ============================================================================
+// Cube vertex shader: push constant MVP, per-vertex color
+static const uint32_t cubeVertSpv[] = {
+    0x07230203,0x00010000,0x000d000a,0x00000028,0x00000000,0x00020011,0x00000001,0x0006000b,
+    0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,
+    0x0009000f,0x00000000,0x00000004,0x6e69616d,0x00000000,0x0000000d,0x00000012,0x0000001c,
+    0x00000025,0x00030003,0x00000002,0x000001c2,0x00040005,0x00000004,0x6e69616d,0x00000000,
+    0x00060005,0x0000000b,0x505f6c67,0x65567265,0x78657472,0x00000000,0x00060006,0x0000000b,
+    0x00000000,0x505f6c67,0x7469736f,0x006e6f69,0x00030005,0x0000000d,0x00000000,0x00050005,
+    0x0000000f,0x68737550,0x736e6f43,0x00000074,0x00040006,0x0000000f,0x00000000,0x0070766d,
+    0x00030005,0x00000011,0x00006370,0x00040005,0x00000012,0x6f506e69,0x00000073,0x00050005,
+    0x0000001c,0x4374756f,0x726f6c6f,0x00000000,0x00040005,0x00000025,0x6f436e69,0x00726f6c,
+    0x00050048,0x0000000b,0x00000000,0x0000000b,0x00000000,0x00030047,0x0000000b,0x00000002,
+    0x00040048,0x0000000f,0x00000000,0x00000005,0x00050048,0x0000000f,0x00000000,0x00000023,
+    0x00000000,0x00050048,0x0000000f,0x00000000,0x00000007,0x00000010,0x00030047,0x0000000f,
+    0x00000002,0x00040047,0x00000012,0x0000001e,0x00000000,0x00040047,0x0000001c,0x0000001e,
+    0x00000000,0x00040047,0x00000025,0x0000001e,0x00000001,0x00020013,0x00000002,0x00030021,
+    0x00000003,0x00000002,0x00030016,0x00000006,0x00000020,0x00040017,0x00000007,0x00000006,
+    0x00000004,0x0003001e,0x0000000b,0x00000007,0x00040020,0x0000000c,0x00000003,0x0000000b,
+    0x0004003b,0x0000000c,0x0000000d,0x00000003,0x00040015,0x0000000e,0x00000020,0x00000001,
+    0x00040018,0x00000010,0x00000007,0x00000004,0x0003001e,0x0000000f,0x00000010,0x00040020,
+    0x00000014,0x00000009,0x0000000f,0x0004003b,0x00000014,0x00000011,0x00000009,0x0004002b,
+    0x0000000e,0x00000013,0x00000000,0x00040020,0x00000015,0x00000009,0x00000010,0x00040017,
+    0x00000018,0x00000006,0x00000003,0x00040020,0x00000019,0x00000001,0x00000018,0x0004003b,
+    0x00000019,0x00000012,0x00000001,0x0004002b,0x00000006,0x0000001a,0x3f800000,0x00040020,
+    0x0000001b,0x00000003,0x00000007,0x0004003b,0x0000001b,0x0000001c,0x00000003,0x00040020,
+    0x00000024,0x00000001,0x00000007,0x0004003b,0x00000024,0x00000025,0x00000001,0x00050036,
+    0x00000002,0x00000004,0x00000000,0x00000003,0x000200f8,0x00000005,0x00050041,0x00000015,
+    0x00000016,0x00000011,0x00000013,0x0004003d,0x00000010,0x00000017,0x00000016,0x0004003d,
+    0x00000018,0x0000001d,0x00000012,0x00050051,0x00000006,0x0000001e,0x0000001d,0x00000000,
+    0x00050051,0x00000006,0x0000001f,0x0000001d,0x00000001,0x00050051,0x00000006,0x00000020,
+    0x0000001d,0x00000002,0x00070050,0x00000007,0x00000021,0x0000001e,0x0000001f,0x00000020,
+    0x0000001a,0x00050091,0x00000007,0x00000022,0x00000017,0x00000021,0x00050041,0x0000001b,
+    0x00000023,0x0000000d,0x00000013,0x0003003e,0x00000023,0x00000022,0x0004003d,0x00000007,
+    0x00000026,0x00000025,0x0003003e,0x0000001c,0x00000026,0x000100fd,0x00010038,
+};
+
+// Cube fragment shader: pass-through color
+static const uint32_t cubeFragSpv[] = {
+    0x07230203,0x00010000,0x000d000a,0x0000000d,0x00000000,0x00020011,0x00000001,0x0006000b,
+    0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,
+    0x0007000f,0x00000004,0x00000004,0x6e69616d,0x00000000,0x00000009,0x0000000b,0x00030010,
+    0x00000004,0x00000007,0x00030003,0x00000002,0x000001c2,0x00040005,0x00000004,0x6e69616d,
+    0x00000000,0x00050005,0x00000009,0x4374756f,0x726f6c6f,0x00000000,0x00040005,0x0000000b,
+    0x6f436e69,0x00726f6c,0x00040047,0x00000009,0x0000001e,0x00000000,0x00040047,0x0000000b,
+    0x0000001e,0x00000000,0x00020013,0x00000002,0x00030021,0x00000003,0x00000002,0x00030016,
+    0x00000006,0x00000020,0x00040017,0x00000007,0x00000006,0x00000004,0x00040020,0x00000008,
+    0x00000003,0x00000007,0x0004003b,0x00000008,0x00000009,0x00000003,0x00040020,0x0000000a,
+    0x00000001,0x00000007,0x0004003b,0x0000000a,0x0000000b,0x00000001,0x00050036,0x00000002,
+    0x00000004,0x00000000,0x00000003,0x000200f8,0x00000005,0x0004003d,0x00000007,0x0000000c,
+    0x0000000b,0x0003003e,0x00000009,0x0000000c,0x000100fd,0x00010038,
+};
+
+// Grid vertex shader: push constant MVP, fixed gray color
+static const uint32_t gridVertSpv[] = {
+    0x07230203,0x00010000,0x000d000a,0x00000024,0x00000000,0x00020011,0x00000001,0x0006000b,
+    0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,
+    0x0008000f,0x00000000,0x00000004,0x6e69616d,0x00000000,0x0000000d,0x00000012,0x0000001c,
+    0x00030003,0x00000002,0x000001c2,0x00040005,0x00000004,0x6e69616d,0x00000000,0x00060005,
+    0x0000000b,0x505f6c67,0x65567265,0x78657472,0x00000000,0x00060006,0x0000000b,0x00000000,
+    0x505f6c67,0x7469736f,0x006e6f69,0x00030005,0x0000000d,0x00000000,0x00050005,0x0000000f,
+    0x68737550,0x736e6f43,0x00000074,0x00040006,0x0000000f,0x00000000,0x0070766d,0x00030005,
+    0x00000011,0x00006370,0x00040005,0x00000012,0x6f506e69,0x00000073,0x00050005,0x0000001c,
+    0x4374756f,0x726f6c6f,0x00000000,0x00050048,0x0000000b,0x00000000,0x0000000b,0x00000000,
+    0x00030047,0x0000000b,0x00000002,0x00040048,0x0000000f,0x00000000,0x00000005,0x00050048,
+    0x0000000f,0x00000000,0x00000023,0x00000000,0x00050048,0x0000000f,0x00000000,0x00000007,
+    0x00000010,0x00030047,0x0000000f,0x00000002,0x00040047,0x00000012,0x0000001e,0x00000000,
+    0x00040047,0x0000001c,0x0000001e,0x00000000,0x00020013,0x00000002,0x00030021,0x00000003,
+    0x00000002,0x00030016,0x00000006,0x00000020,0x00040017,0x00000007,0x00000006,0x00000004,
+    0x0003001e,0x0000000b,0x00000007,0x00040020,0x0000000c,0x00000003,0x0000000b,0x0004003b,
+    0x0000000c,0x0000000d,0x00000003,0x00040015,0x0000000e,0x00000020,0x00000001,0x00040018,
+    0x00000010,0x00000007,0x00000004,0x0003001e,0x0000000f,0x00000010,0x00040020,0x00000014,
+    0x00000009,0x0000000f,0x0004003b,0x00000014,0x00000011,0x00000009,0x0004002b,0x0000000e,
+    0x00000013,0x00000000,0x00040020,0x00000015,0x00000009,0x00000010,0x00040017,0x00000018,
+    0x00000006,0x00000003,0x00040020,0x00000019,0x00000001,0x00000018,0x0004003b,0x00000019,
+    0x00000012,0x00000001,0x0004002b,0x00000006,0x0000001a,0x3f800000,0x00040020,0x0000001b,
+    0x00000003,0x00000007,0x0004003b,0x0000001b,0x0000001c,0x00000003,0x0004002b,0x00000006,
+    0x0000001d,0x3e4ccccd,0x0004002b,0x00000006,0x0000001e,0x3e99999a,0x00050036,0x00000002,
+    0x00000004,0x00000000,0x00000003,0x000200f8,0x00000005,0x00050041,0x00000015,0x00000016,
+    0x00000011,0x00000013,0x0004003d,0x00000010,0x00000017,0x00000016,0x0004003d,0x00000018,
+    0x00000020,0x00000012,0x00050051,0x00000006,0x00000021,0x00000020,0x00000000,0x00050051,
+    0x00000006,0x00000022,0x00000020,0x00000001,0x00050051,0x00000006,0x00000023,0x00000020,
+    0x00000002,0x00070050,0x00000007,0x0000001f,0x00000021,0x00000022,0x00000023,0x0000001a,
+    0x00050091,0x00000007,0x00000009,0x00000017,0x0000001f,0x00050041,0x0000001b,0x0000000a,
+    0x0000000d,0x00000013,0x0003003e,0x0000000a,0x00000009,0x00070050,0x00000007,0x00000008,
+    0x0000001d,0x0000001e,0x0000001d,0x0000001a,0x0003003e,0x0000001c,0x00000008,0x000100fd,
+    0x00010038,
+};
+
+// Grid fragment shader: pass-through color
+static const uint32_t gridFragSpv[] = {
+    0x07230203,0x00010000,0x000d000a,0x0000000d,0x00000000,0x00020011,0x00000001,0x0006000b,
+    0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,
+    0x0007000f,0x00000004,0x00000004,0x6e69616d,0x00000000,0x00000009,0x0000000b,0x00030010,
+    0x00000004,0x00000007,0x00030003,0x00000002,0x000001c2,0x00040005,0x00000004,0x6e69616d,
+    0x00000000,0x00050005,0x00000009,0x4374756f,0x726f6c6f,0x00000000,0x00040005,0x0000000b,
+    0x6f436e69,0x00726f6c,0x00040047,0x00000009,0x0000001e,0x00000000,0x00040047,0x0000000b,
+    0x0000001e,0x00000000,0x00020013,0x00000002,0x00030021,0x00000003,0x00000002,0x00030016,
+    0x00000006,0x00000020,0x00040017,0x00000007,0x00000006,0x00000004,0x00040020,0x00000008,
+    0x00000003,0x00000007,0x0004003b,0x00000008,0x00000009,0x00000003,0x00040020,0x0000000a,
+    0x00000001,0x00000007,0x0004003b,0x0000000a,0x0000000b,0x00000001,0x00050036,0x00000002,
+    0x00000004,0x00000000,0x00000003,0x000200f8,0x00000005,0x0004003d,0x00000007,0x0000000c,
+    0x0000000b,0x0003003e,0x00000009,0x0000000c,0x000100fd,0x00010038,
+};
+
+// Textured cube vertex shader: push constants (MVP + model), outputs UV/normal/tangent
+static const uint32_t cubeTexturedVertSpv[] = {
+    0x07230203,0x00010000,0x0008000b,0x00000043,0x00000000,0x00020011,
+    0x00000001,0x0006000b,0x00000001,0x4c534c47,0x6474732e,0x3035342e,
+    0x00000000,0x0003000e,0x00000000,0x00000001,0x000e000f,0x00000000,
+    0x00000004,0x6e69616d,0x00000000,0x0000000d,0x00000019,0x00000025,
+    0x00000027,0x00000037,0x00000039,0x0000003c,0x0000003e,0x00000042,
+    0x00030003,0x00000002,0x000001c2,0x00040005,0x00000004,0x6e69616d,
+    0x00000000,0x00060005,0x0000000b,0x505f6c67,0x65567265,0x78657472,
+    0x00000000,0x00060006,0x0000000b,0x00000000,0x505f6c67,0x7469736f,
+    0x006e6f69,0x00070006,0x0000000b,0x00000001,0x505f6c67,0x746e696f,
+    0x657a6953,0x00000000,0x00070006,0x0000000b,0x00000002,0x435f6c67,
+    0x4470696c,0x61747369,0x0065636e,0x00070006,0x0000000b,0x00000003,
+    0x435f6c67,0x446c6c75,0x61747369,0x0065636e,0x00030005,0x0000000d,
+    0x00000000,0x00060005,0x00000011,0x68737550,0x736e6f43,0x746e6174,
+    0x00000073,0x00040006,0x00000011,0x00000000,0x0070766d,0x00050006,
+    0x00000011,0x00000001,0x65646f6d,0x0000006c,0x00030005,0x00000013,
+    0x00000000,0x00050005,0x00000019,0x6f506e69,0x69746973,0x00006e6f,
+    0x00040005,0x00000025,0x67617266,0x00005655,0x00040005,0x00000027,
+    0x56556e69,0x00000000,0x00050005,0x0000002b,0x6d726f6e,0x614d6c61,
+    0x00000074,0x00060005,0x00000037,0x67617266,0x6c726f57,0x726f4e64,
+    0x006c616d,0x00050005,0x00000039,0x6f4e6e69,0x6c616d72,0x00000000,
+    0x00070005,0x0000003c,0x67617266,0x6c726f57,0x6e615464,0x746e6567,
+    0x00000000,0x00050005,0x0000003e,0x61546e69,0x6e65676e,0x00000074,
+    0x00040005,0x00000042,0x6f436e69,0x00726f6c,0x00030047,0x0000000b,
+    0x00000002,0x00050048,0x0000000b,0x00000000,0x0000000b,0x00000000,
+    0x00050048,0x0000000b,0x00000001,0x0000000b,0x00000001,0x00050048,
+    0x0000000b,0x00000002,0x0000000b,0x00000003,0x00050048,0x0000000b,
+    0x00000003,0x0000000b,0x00000004,0x00030047,0x00000011,0x00000002,
+    0x00040048,0x00000011,0x00000000,0x00000005,0x00050048,0x00000011,
+    0x00000000,0x00000007,0x00000010,0x00050048,0x00000011,0x00000000,
+    0x00000023,0x00000000,0x00040048,0x00000011,0x00000001,0x00000005,
+    0x00050048,0x00000011,0x00000001,0x00000007,0x00000010,0x00050048,
+    0x00000011,0x00000001,0x00000023,0x00000040,0x00040047,0x00000019,
+    0x0000001e,0x00000000,0x00040047,0x00000025,0x0000001e,0x00000000,
+    0x00040047,0x00000027,0x0000001e,0x00000002,0x00040047,0x00000037,
+    0x0000001e,0x00000001,0x00040047,0x00000039,0x0000001e,0x00000003,
+    0x00040047,0x0000003c,0x0000001e,0x00000002,0x00040047,0x0000003e,
+    0x0000001e,0x00000004,0x00040047,0x00000042,0x0000001e,0x00000001,
+    0x00020013,0x00000002,0x00030021,0x00000003,0x00000002,0x00030016,
+    0x00000006,0x00000020,0x00040017,0x00000007,0x00000006,0x00000004,
+    0x00040015,0x00000008,0x00000020,0x00000000,0x0004002b,0x00000008,
+    0x00000009,0x00000001,0x0004001c,0x0000000a,0x00000006,0x00000009,
+    0x0006001e,0x0000000b,0x00000007,0x00000006,0x0000000a,0x0000000a,
+    0x00040020,0x0000000c,0x00000003,0x0000000b,0x0004003b,0x0000000c,
+    0x0000000d,0x00000003,0x00040015,0x0000000e,0x00000020,0x00000001,
+    0x0004002b,0x0000000e,0x0000000f,0x00000000,0x00040018,0x00000010,
+    0x00000007,0x00000004,0x0004001e,0x00000011,0x00000010,0x00000010,
+    0x00040020,0x00000012,0x00000009,0x00000011,0x0004003b,0x00000012,
+    0x00000013,0x00000009,0x00040020,0x00000014,0x00000009,0x00000010,
+    0x00040017,0x00000017,0x00000006,0x00000003,0x00040020,0x00000018,
+    0x00000001,0x00000017,0x0004003b,0x00000018,0x00000019,0x00000001,
+    0x0004002b,0x00000006,0x0000001b,0x3f800000,0x00040020,0x00000021,
+    0x00000003,0x00000007,0x00040017,0x00000023,0x00000006,0x00000002,
+    0x00040020,0x00000024,0x00000003,0x00000023,0x0004003b,0x00000024,
+    0x00000025,0x00000003,0x00040020,0x00000026,0x00000001,0x00000023,
+    0x0004003b,0x00000026,0x00000027,0x00000001,0x00040018,0x00000029,
+    0x00000017,0x00000003,0x00040020,0x0000002a,0x00000007,0x00000029,
+    0x0004002b,0x0000000e,0x0000002c,0x00000001,0x00040020,0x00000036,
+    0x00000003,0x00000017,0x0004003b,0x00000036,0x00000037,0x00000003,
+    0x0004003b,0x00000018,0x00000039,0x00000001,0x0004003b,0x00000036,
+    0x0000003c,0x00000003,0x0004003b,0x00000018,0x0000003e,0x00000001,
+    0x00040020,0x00000041,0x00000001,0x00000007,0x0004003b,0x00000041,
+    0x00000042,0x00000001,0x00050036,0x00000002,0x00000004,0x00000000,
+    0x00000003,0x000200f8,0x00000005,0x0004003b,0x0000002a,0x0000002b,
+    0x00000007,0x00050041,0x00000014,0x00000015,0x00000013,0x0000000f,
+    0x0004003d,0x00000010,0x00000016,0x00000015,0x0004003d,0x00000017,
+    0x0000001a,0x00000019,0x00050051,0x00000006,0x0000001c,0x0000001a,
+    0x00000000,0x00050051,0x00000006,0x0000001d,0x0000001a,0x00000001,
+    0x00050051,0x00000006,0x0000001e,0x0000001a,0x00000002,0x00070050,
+    0x00000007,0x0000001f,0x0000001c,0x0000001d,0x0000001e,0x0000001b,
+    0x00050091,0x00000007,0x00000020,0x00000016,0x0000001f,0x00050041,
+    0x00000021,0x00000022,0x0000000d,0x0000000f,0x0003003e,0x00000022,
+    0x00000020,0x0004003d,0x00000023,0x00000028,0x00000027,0x0003003e,
+    0x00000025,0x00000028,0x00050041,0x00000014,0x0000002d,0x00000013,
+    0x0000002c,0x0004003d,0x00000010,0x0000002e,0x0000002d,0x00050051,
+    0x00000007,0x0000002f,0x0000002e,0x00000000,0x0008004f,0x00000017,
+    0x00000030,0x0000002f,0x0000002f,0x00000000,0x00000001,0x00000002,
+    0x00050051,0x00000007,0x00000031,0x0000002e,0x00000001,0x0008004f,
+    0x00000017,0x00000032,0x00000031,0x00000031,0x00000000,0x00000001,
+    0x00000002,0x00050051,0x00000007,0x00000033,0x0000002e,0x00000002,
+    0x0008004f,0x00000017,0x00000034,0x00000033,0x00000033,0x00000000,
+    0x00000001,0x00000002,0x00060050,0x00000029,0x00000035,0x00000030,
+    0x00000032,0x00000034,0x0003003e,0x0000002b,0x00000035,0x0004003d,
+    0x00000029,0x00000038,0x0000002b,0x0004003d,0x00000017,0x0000003a,
+    0x00000039,0x00050091,0x00000017,0x0000003b,0x00000038,0x0000003a,
+    0x0003003e,0x00000037,0x0000003b,0x0004003d,0x00000029,0x0000003d,
+    0x0000002b,0x0004003d,0x00000017,0x0000003f,0x0000003e,0x00050091,
+    0x00000017,0x00000040,0x0000003d,0x0000003f,0x0003003e,0x0000003c,
+    0x00000040,0x000100fd,0x00010038,
+};
+
+// Textured cube fragment shader: lighting matches cube_handle_gl_macos /
+// cube_handle_metal_macos — lightDir = normalize(0.3, 0.5, 1.0), 0.8·diffuse,
+// 0.3 + 0.15·ao ambient. Regenerate via `glslangValidator -V cube.frag -o
+// cube_frag.spv` from the GLSL source documented in
+// test_apps/cube_handle_vk_win/vk_renderer.cpp (kept in sync with this).
+static const uint32_t cubeTexturedFragSpv[] = {
+    0x07230203,0x00010000,0x0008000b,0x0000006f,0x00000000,0x00020011,
+    0x00000001,0x0006000b,0x00000001,0x4c534c47,0x6474732e,0x3035342e,
+    0x00000000,0x0003000e,0x00000000,0x00000001,0x0009000f,0x00000004,
+    0x00000004,0x6e69616d,0x00000000,0x00000011,0x0000002c,0x00000030,
+    0x00000065,0x00030010,0x00000004,0x00000007,0x00030003,0x00000002,
+    0x000001c2,0x00040005,0x00000004,0x6e69616d,0x00000000,0x00050005,
+    0x00000009,0x65736162,0x6f6c6f43,0x00000072,0x00060005,0x0000000d,
+    0x73614275,0x6c6f6365,0x6554726f,0x00000078,0x00040005,0x00000011,
+    0x67617266,0x00005655,0x00050005,0x00000016,0x6d726f6e,0x614d6c61,
+    0x00000070,0x00050005,0x00000017,0x726f4e75,0x546c616d,0x00007865,
+    0x00030005,0x00000022,0x00006f61,0x00040005,0x00000023,0x544f4175,
+    0x00007865,0x00030005,0x0000002a,0x0000004e,0x00060005,0x0000002c,
+    0x67617266,0x6c726f57,0x726f4e64,0x006c616d,0x00030005,0x0000002f,
+    0x00000054,0x00070005,0x00000030,0x67617266,0x6c726f57,0x6e615464,
+    0x746e6567,0x00000000,0x00030005,0x00000033,0x00000042,0x00030005,
+    0x00000039,0x004e4254,0x00040005,0x0000004b,0x6d726f6e,0x00006c61,
+    0x00050005,0x00000050,0x6867696c,0x72694474,0x00000000,0x00040005,
+    0x00000055,0x66666964,0x00657375,0x00040005,0x0000005e,0x69626d61,
+    0x00746e65,0x00050005,0x00000065,0x4374756f,0x726f6c6f,0x00000000,
+    0x00040047,0x0000000d,0x00000021,0x00000000,0x00040047,0x0000000d,
+    0x00000022,0x00000000,0x00040047,0x00000011,0x0000001e,0x00000000,
+    0x00040047,0x00000017,0x00000021,0x00000001,0x00040047,0x00000017,
+    0x00000022,0x00000000,0x00040047,0x00000023,0x00000021,0x00000002,
+    0x00040047,0x00000023,0x00000022,0x00000000,0x00040047,0x0000002c,
+    0x0000001e,0x00000001,0x00040047,0x00000030,0x0000001e,0x00000002,
+    0x00040047,0x00000065,0x0000001e,0x00000000,0x00020013,0x00000002,
+    0x00030021,0x00000003,0x00000002,0x00030016,0x00000006,0x00000020,
+    0x00040017,0x00000007,0x00000006,0x00000003,0x00040020,0x00000008,
+    0x00000007,0x00000007,0x00090019,0x0000000a,0x00000006,0x00000001,
+    0x00000000,0x00000000,0x00000000,0x00000001,0x00000000,0x0003001b,
+    0x0000000b,0x0000000a,0x00040020,0x0000000c,0x00000000,0x0000000b,
+    0x0004003b,0x0000000c,0x0000000d,0x00000000,0x00040017,0x0000000f,
+    0x00000006,0x00000002,0x00040020,0x00000010,0x00000001,0x0000000f,
+    0x0004003b,0x00000010,0x00000011,0x00000001,0x00040017,0x00000013,
+    0x00000006,0x00000004,0x0004003b,0x0000000c,0x00000017,0x00000000,
+    0x0004002b,0x00000006,0x0000001c,0x40000000,0x0004002b,0x00000006,
+    0x0000001e,0x3f800000,0x00040020,0x00000021,0x00000007,0x00000006,
+    0x0004003b,0x0000000c,0x00000023,0x00000000,0x00040015,0x00000027,
+    0x00000020,0x00000000,0x0004002b,0x00000027,0x00000028,0x00000000,
+    0x00040020,0x0000002b,0x00000001,0x00000007,0x0004003b,0x0000002b,
+    0x0000002c,0x00000001,0x0004003b,0x0000002b,0x00000030,0x00000001,
+    0x00040018,0x00000037,0x00000007,0x00000003,0x00040020,0x00000038,
+    0x00000007,0x00000037,0x0004002b,0x00000006,0x0000003d,0x00000000,
+    0x0004002b,0x00000006,0x00000051,0x3e84b0b0,0x0004002b,0x00000006,
+    0x00000052,0x3edd267b,0x0004002b,0x00000006,0x00000053,0x3f5d267b,
+    0x0006002c,0x00000007,0x00000054,0x00000051,0x00000052,0x00000053,
+    0x0004002b,0x00000006,0x0000005a,0x3f4ccccd,0x0004002b,0x00000006,
+    0x0000005f,0x3e99999a,0x0004002b,0x00000006,0x00000060,0x3e19999a,
+    0x00040020,0x00000064,0x00000003,0x00000013,0x0004003b,0x00000064,
+    0x00000065,0x00000003,0x00050036,0x00000002,0x00000004,0x00000000,
+    0x00000003,0x000200f8,0x00000005,0x0004003b,0x00000008,0x00000009,
+    0x00000007,0x0004003b,0x00000008,0x00000016,0x00000007,0x0004003b,
+    0x00000021,0x00000022,0x00000007,0x0004003b,0x00000008,0x0000002a,
+    0x00000007,0x0004003b,0x00000008,0x0000002f,0x00000007,0x0004003b,
+    0x00000008,0x00000033,0x00000007,0x0004003b,0x00000038,0x00000039,
+    0x00000007,0x0004003b,0x00000008,0x0000004b,0x00000007,0x0004003b,
+    0x00000008,0x00000050,0x00000007,0x0004003b,0x00000021,0x00000055,
+    0x00000007,0x0004003b,0x00000021,0x0000005e,0x00000007,0x0004003d,
+    0x0000000b,0x0000000e,0x0000000d,0x0004003d,0x0000000f,0x00000012,
+    0x00000011,0x00050057,0x00000013,0x00000014,0x0000000e,0x00000012,
+    0x0008004f,0x00000007,0x00000015,0x00000014,0x00000014,0x00000000,
+    0x00000001,0x00000002,0x0003003e,0x00000009,0x00000015,0x0004003d,
+    0x0000000b,0x00000018,0x00000017,0x0004003d,0x0000000f,0x00000019,
+    0x00000011,0x00050057,0x00000013,0x0000001a,0x00000018,0x00000019,
+    0x0008004f,0x00000007,0x0000001b,0x0000001a,0x0000001a,0x00000000,
+    0x00000001,0x00000002,0x0005008e,0x00000007,0x0000001d,0x0000001b,
+    0x0000001c,0x00060050,0x00000007,0x0000001f,0x0000001e,0x0000001e,
+    0x0000001e,0x00050083,0x00000007,0x00000020,0x0000001d,0x0000001f,
+    0x0003003e,0x00000016,0x00000020,0x0004003d,0x0000000b,0x00000024,
+    0x00000023,0x0004003d,0x0000000f,0x00000025,0x00000011,0x00050057,
+    0x00000013,0x00000026,0x00000024,0x00000025,0x00050051,0x00000006,
+    0x00000029,0x00000026,0x00000000,0x0003003e,0x00000022,0x00000029,
+    0x0004003d,0x00000007,0x0000002d,0x0000002c,0x0006000c,0x00000007,
+    0x0000002e,0x00000001,0x00000045,0x0000002d,0x0003003e,0x0000002a,
+    0x0000002e,0x0004003d,0x00000007,0x00000031,0x00000030,0x0006000c,
+    0x00000007,0x00000032,0x00000001,0x00000045,0x00000031,0x0003003e,
+    0x0000002f,0x00000032,0x0004003d,0x00000007,0x00000034,0x0000002a,
+    0x0004003d,0x00000007,0x00000035,0x0000002f,0x0007000c,0x00000007,
+    0x00000036,0x00000001,0x00000044,0x00000034,0x00000035,0x0003003e,
+    0x00000033,0x00000036,0x0004003d,0x00000007,0x0000003a,0x0000002f,
+    0x0004003d,0x00000007,0x0000003b,0x00000033,0x0004003d,0x00000007,
+    0x0000003c,0x0000002a,0x00050051,0x00000006,0x0000003e,0x0000003a,
+    0x00000000,0x00050051,0x00000006,0x0000003f,0x0000003a,0x00000001,
+    0x00050051,0x00000006,0x00000040,0x0000003a,0x00000002,0x00050051,
+    0x00000006,0x00000041,0x0000003b,0x00000000,0x00050051,0x00000006,
+    0x00000042,0x0000003b,0x00000001,0x00050051,0x00000006,0x00000043,
+    0x0000003b,0x00000002,0x00050051,0x00000006,0x00000044,0x0000003c,
+    0x00000000,0x00050051,0x00000006,0x00000045,0x0000003c,0x00000001,
+    0x00050051,0x00000006,0x00000046,0x0000003c,0x00000002,0x00060050,
+    0x00000007,0x00000047,0x0000003e,0x0000003f,0x00000040,0x00060050,
+    0x00000007,0x00000048,0x00000041,0x00000042,0x00000043,0x00060050,
+    0x00000007,0x00000049,0x00000044,0x00000045,0x00000046,0x00060050,
+    0x00000037,0x0000004a,0x00000047,0x00000048,0x00000049,0x0003003e,
+    0x00000039,0x0000004a,0x0004003d,0x00000037,0x0000004c,0x00000039,
+    0x0004003d,0x00000007,0x0000004d,0x00000016,0x00050091,0x00000007,
+    0x0000004e,0x0000004c,0x0000004d,0x0006000c,0x00000007,0x0000004f,
+    0x00000001,0x00000045,0x0000004e,0x0003003e,0x0000004b,0x0000004f,
+    0x0003003e,0x00000050,0x00000054,0x0004003d,0x00000007,0x00000056,
+    0x0000004b,0x0004003d,0x00000007,0x00000057,0x00000050,0x00050094,
+    0x00000006,0x00000058,0x00000056,0x00000057,0x0007000c,0x00000006,
+    0x00000059,0x00000001,0x00000028,0x00000058,0x0000003d,0x00050085,
+    0x00000006,0x0000005b,0x00000059,0x0000005a,0x0004003d,0x00000006,
+    0x0000005c,0x00000022,0x00050085,0x00000006,0x0000005d,0x0000005b,
+    0x0000005c,0x0003003e,0x00000055,0x0000005d,0x0004003d,0x00000006,
+    0x00000061,0x00000022,0x00050085,0x00000006,0x00000062,0x00000060,
+    0x00000061,0x00050081,0x00000006,0x00000063,0x0000005f,0x00000062,
+    0x0003003e,0x0000005e,0x00000063,0x0004003d,0x00000007,0x00000066,
+    0x00000009,0x0004003d,0x00000006,0x00000067,0x00000055,0x0004003d,
+    0x00000006,0x00000068,0x0000005e,0x00050081,0x00000006,0x00000069,
+    0x00000067,0x00000068,0x0005008e,0x00000007,0x0000006a,0x00000066,
+    0x00000069,0x00050051,0x00000006,0x0000006b,0x0000006a,0x00000000,
+    0x00050051,0x00000006,0x0000006c,0x0000006a,0x00000001,0x00050051,
+    0x00000006,0x0000006d,0x0000006a,0x00000002,0x00070050,0x00000013,
+    0x0000006e,0x0000006b,0x0000006c,0x0000006d,0x0000001e,0x0003003e,
+    0x00000065,0x0000006e,0x000100fd,0x00010038
+};
+
+// ============================================================================
+// Vulkan renderer structures (same as cube_vk_macos)
+// ============================================================================
+
+struct CubeVertex { float pos[3]; float color[4]; float uv[2]; float normal[3]; float tangent[3]; };
+struct GridVertex { float pos[3]; };
+
+struct SwapchainFramebuffers {
+    std::vector<VkImageView> colorViews;
+    std::vector<VkImageView> depthViews;
+    std::vector<VkFramebuffer> framebuffers;
+    VkImage depthImage = VK_NULL_HANDLE;
+    VkDeviceMemory depthMemory = VK_NULL_HANDLE;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+
+struct VkRenderer {
+    VkDevice device = VK_NULL_HANDLE;
+    VkQueue graphicsQueue = VK_NULL_HANDLE;
+    VkRenderPass renderPass = VK_NULL_HANDLE;
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;       // grid: push constants only (64 bytes)
+    VkPipelineLayout cubePipelineLayout = VK_NULL_HANDLE;   // textured cube: descriptor set + push constants (128 bytes)
+    VkPipeline cubePipeline = VK_NULL_HANDLE;
+    VkPipeline gridPipeline = VK_NULL_HANDLE;
+    VkBuffer cubeVertexBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory cubeVertexMemory = VK_NULL_HANDLE;
+    VkBuffer cubeIndexBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory cubeIndexMemory = VK_NULL_HANDLE;
+    VkBuffer gridVertexBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory gridVertexMemory = VK_NULL_HANDLE;
+    int gridVertexCount = 0;
+    VkCommandPool commandPool = VK_NULL_HANDLE;
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    VkFence frameFence = VK_NULL_HANDLE;
+    float cubeRotation = 0.0f;
+    SwapchainFramebuffers swapchainFBs;
+    VkRenderPass renderPassLoad = VK_NULL_HANDLE;
+    // Texture resources
+    VkImage texImages[3] = {};          // basecolor, normal, AO
+    VkDeviceMemory texMemory[3] = {};
+    VkImageView texViews[3] = {};
+    VkSampler texSampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+    bool texturesLoaded = false;
+};
+
+// ============================================================================
+// Texture path helper
+// ============================================================================
+
+static std::string GetTextureDir() {
+    char pathBuf[4096];
+    uint32_t pathSize = sizeof(pathBuf);
+    if (_NSGetExecutablePath(pathBuf, &pathSize) == 0) {
+        // Find last '/' to get directory
+        char* lastSlash = strrchr(pathBuf, '/');
+        if (lastSlash) *lastSlash = '\0';
+        return std::string(pathBuf) + "/textures/";
+    }
+    return "textures/";
+}
+
+// ============================================================================
+// Vulkan helpers (same as cube_vk_macos)
+// ============================================================================
+
+static uint32_t FindMemoryType(VkPhysicalDevice physDevice, uint32_t typeFilter, VkMemoryPropertyFlags properties) {
+    VkPhysicalDeviceMemoryProperties memProps;
+    vkGetPhysicalDeviceMemoryProperties(physDevice, &memProps);
+    for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
+        if ((typeFilter & (1 << i)) && (memProps.memoryTypes[i].propertyFlags & properties) == properties) {
+            return i;
+        }
+    }
+    return UINT32_MAX;
+}
+
+static bool CreateBuffer(VkDevice device, VkPhysicalDevice physDevice, VkDeviceSize size,
+    VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
+    VkBuffer& buffer, VkDeviceMemory& memory)
+{
+    VkBufferCreateInfo bufferInfo = {};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = size;
+    bufferInfo.usage = usage;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS) return false;
+
+    VkMemoryRequirements memReqs;
+    vkGetBufferMemoryRequirements(device, buffer, &memReqs);
+
+    VkMemoryAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = FindMemoryType(physDevice, memReqs.memoryTypeBits, properties);
+    if (allocInfo.memoryTypeIndex == UINT32_MAX) return false;
+
+    if (vkAllocateMemory(device, &allocInfo, nullptr, &memory) != VK_SUCCESS) return false;
+    vkBindBufferMemory(device, buffer, memory, 0);
+    return true;
+}
+
+static bool CreateDepthImage(VkDevice device, VkPhysicalDevice physDevice,
+    uint32_t width, uint32_t height,
+    VkImage& image, VkDeviceMemory& memory)
+{
+    VkImageCreateInfo imageInfo = {};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = VK_FORMAT_D32_SFLOAT;
+    imageInfo.extent = {width, height, 1};
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    if (vkCreateImage(device, &imageInfo, nullptr, &image) != VK_SUCCESS) return false;
+
+    VkMemoryRequirements memReqs;
+    vkGetImageMemoryRequirements(device, image, &memReqs);
+
+    VkMemoryAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = FindMemoryType(physDevice, memReqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (vkAllocateMemory(device, &allocInfo, nullptr, &memory) != VK_SUCCESS) return false;
+    vkBindImageMemory(device, image, memory, 0);
+    return true;
+}
+
+// Load a texture from disk, create VkImage + VkImageView, upload via staging buffer.
+// If the file can't be loaded, creates a 1x1 fallback (white for basecolor/AO, flat blue for normal).
+static bool CreateTextureFromFile(VkDevice device, VkPhysicalDevice physDevice,
+    VkCommandPool cmdPool, VkQueue queue,
+    const char* path, bool isNormalMap,
+    VkImage& outImage, VkDeviceMemory& outMemory, VkImageView& outView)
+{
+    int w, h, channels;
+    unsigned char* pixels = stbi_load(path, &w, &h, &channels, 4); // force RGBA
+    bool fallback = false;
+    if (!pixels) {
+        LOG_WARN("Failed to load texture: %s — using fallback", path);
+        w = h = 1;
+        static unsigned char whitePixel[] = {255, 255, 255, 255};
+        static unsigned char bluePixel[] = {128, 128, 255, 255}; // flat normal
+        pixels = isNormalMap ? bluePixel : whitePixel;
+        fallback = true;
+    }
+
+    VkDeviceSize imageSize = (VkDeviceSize)w * h * 4;
+
+    // Full mip chain so the wood texture stays smooth under minification
+    // (#396 W6 parity with GL/Win). Generated on the GPU via vkCmdBlitImage.
+    uint32_t mipLevels = 1;
+    for (int d = (w > h ? w : h); d > 1; d >>= 1) mipLevels++;
+
+    // Staging buffer
+    VkBuffer stagingBuffer;
+    VkDeviceMemory stagingMemory;
+    VkBufferCreateInfo bufInfo = {};
+    bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufInfo.size = imageSize;
+    bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    vkCreateBuffer(device, &bufInfo, nullptr, &stagingBuffer);
+
+    VkMemoryRequirements memReqs;
+    vkGetBufferMemoryRequirements(device, stagingBuffer, &memReqs);
+    VkMemoryAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = FindMemoryType(physDevice, memReqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    vkAllocateMemory(device, &allocInfo, nullptr, &stagingMemory);
+    vkBindBufferMemory(device, stagingBuffer, stagingMemory, 0);
+
+    void* data;
+    vkMapMemory(device, stagingMemory, 0, imageSize, 0, &data);
+    memcpy(data, pixels, (size_t)imageSize);
+    vkUnmapMemory(device, stagingMemory);
+    if (!fallback) stbi_image_free(pixels);
+
+    // Create image
+    VkImageCreateInfo imgInfo = {};
+    imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imgInfo.imageType = VK_IMAGE_TYPE_2D;
+    imgInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    imgInfo.extent = {(uint32_t)w, (uint32_t)h, 1};
+    imgInfo.mipLevels = mipLevels;
+    imgInfo.arrayLayers = 1;
+    imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    // TRANSFER_SRC is required to read each level as the blit source when
+    // downsampling into the next level.
+    imgInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                    VK_IMAGE_USAGE_SAMPLED_BIT;
+    imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    vkCreateImage(device, &imgInfo, nullptr, &outImage);
+
+    vkGetImageMemoryRequirements(device, outImage, &memReqs);
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = FindMemoryType(physDevice, memReqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    vkAllocateMemory(device, &allocInfo, nullptr, &outMemory);
+    vkBindImageMemory(device, outImage, outMemory, 0);
+
+    // Copy staging → image via one-shot command buffer
+    VkCommandBufferAllocateInfo cmdAlloc = {};
+    cmdAlloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmdAlloc.commandPool = cmdPool;
+    cmdAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdAlloc.commandBufferCount = 1;
+    VkCommandBuffer cmd;
+    vkAllocateCommandBuffers(device, &cmdAlloc, &cmd);
+
+    VkCommandBufferBeginInfo beginInfo = {};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    // Transition UNDEFINED → TRANSFER_DST
+    VkImageMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = outImage;
+    // All mip levels start UNDEFINED → transition the whole chain to TRANSFER_DST.
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mipLevels, 0, 1};
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    VkBufferImageCopy region = {};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {(uint32_t)w, (uint32_t)h, 1};
+    vkCmdCopyBufferToImage(cmd, stagingBuffer, outImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    // Generate the mip chain: blit each level down from the previous one with a
+    // linear filter, transitioning each source level to SHADER_READ_ONLY once
+    // it has been consumed. (mipLevels == 1 → the loop is skipped and only the
+    // base level's final transition below runs.)
+    barrier.subresourceRange.levelCount = 1;
+    int32_t mipW = w, mipH = h;
+    for (uint32_t i = 1; i < mipLevels; i++) {
+        // level i-1: TRANSFER_DST → TRANSFER_SRC
+        barrier.subresourceRange.baseMipLevel = i - 1;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+        VkImageBlit blit = {};
+        blit.srcOffsets[0] = {0, 0, 0};
+        blit.srcOffsets[1] = {mipW, mipH, 1};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, 1};
+        blit.dstOffsets[0] = {0, 0, 0};
+        blit.dstOffsets[1] = {mipW > 1 ? mipW / 2 : 1, mipH > 1 ? mipH / 2 : 1, 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
+        vkCmdBlitImage(cmd,
+            outImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            outImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1, &blit, VK_FILTER_LINEAR);
+
+        // level i-1: TRANSFER_SRC → SHADER_READ_ONLY
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+        if (mipW > 1) mipW /= 2;
+        if (mipH > 1) mipH /= 2;
+    }
+
+    // Last level is still TRANSFER_DST → SHADER_READ_ONLY.
+    barrier.subresourceRange.baseMipLevel = mipLevels - 1;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo submitInfo = {};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue);
+    vkFreeCommandBuffers(device, cmdPool, 1, &cmd);
+
+    // Cleanup staging
+    vkDestroyBuffer(device, stagingBuffer, nullptr);
+    vkFreeMemory(device, stagingMemory, nullptr);
+
+    // Create image view
+    VkImageViewCreateInfo viewInfo = {};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = outImage;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mipLevels, 0, 1};
+    vkCreateImageView(device, &viewInfo, nullptr, &outView);
+
+    return !fallback;
+}
+
+// Store physDevice globally for depth image creation
+static VkPhysicalDevice g_physDevice = VK_NULL_HANDLE;
+
+static bool CreateSwapchainFramebuffers(VkRenderer& renderer,
+    VkImage* images, uint32_t imageCount,
+    uint32_t width, uint32_t height, VkFormat colorFormat)
+{
+    auto& fb = renderer.swapchainFBs;
+    fb.width = width;
+    fb.height = height;
+    fb.colorViews.resize(imageCount);
+    fb.depthViews.resize(imageCount);
+    fb.framebuffers.resize(imageCount);
+
+    // g_physDevice is set during GetVulkanPhysicalDevice
+    VkPhysicalDevice physDevice = g_physDevice;
+
+    if (!CreateDepthImage(renderer.device, physDevice, width, height,
+        fb.depthImage, fb.depthMemory)) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < imageCount; i++) {
+        VkImageViewCreateInfo viewInfo = {};
+        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewInfo.image = images[i];
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = colorFormat;
+        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (vkCreateImageView(renderer.device, &viewInfo, nullptr, &fb.colorViews[i]) != VK_SUCCESS)
+            return false;
+
+        VkImageViewCreateInfo depthViewInfo = {};
+        depthViewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        depthViewInfo.image = fb.depthImage;
+        depthViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        depthViewInfo.format = VK_FORMAT_D32_SFLOAT;
+        depthViewInfo.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        if (vkCreateImageView(renderer.device, &depthViewInfo, nullptr, &fb.depthViews[i]) != VK_SUCCESS)
+            return false;
+
+        VkImageView attachments[] = {fb.colorViews[i], fb.depthViews[i]};
+        VkFramebufferCreateInfo fbInfo = {};
+        fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fbInfo.renderPass = renderer.renderPass;
+        fbInfo.attachmentCount = 2;
+        fbInfo.pAttachments = attachments;
+        fbInfo.width = width;
+        fbInfo.height = height;
+        fbInfo.layers = 1;
+        if (vkCreateFramebuffer(renderer.device, &fbInfo, nullptr, &fb.framebuffers[i]) != VK_SUCCESS)
+            return false;
+    }
+    return true;
+}
+
+static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysicalDevice physDevice,
+    VkQueue graphicsQueue, uint32_t queueFamilyIndex, VkFormat colorFormat)
+{
+    renderer.device = device;
+    renderer.graphicsQueue = graphicsQueue;
+    g_physDevice = physDevice;
+
+    // Render pass
+    VkAttachmentDescription attachments[2] = {};
+    attachments[0].format = colorFormat;
+    attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachments[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    attachments[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    attachments[1].format = VK_FORMAT_D32_SFLOAT;
+    attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference colorRef = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference depthRef = {1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+
+    VkSubpassDescription subpass = {};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &colorRef;
+    subpass.pDepthStencilAttachment = &depthRef;
+
+    VkRenderPassCreateInfo rpInfo = {};
+    rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rpInfo.attachmentCount = 2;
+    rpInfo.pAttachments = attachments;
+    rpInfo.subpassCount = 1;
+    rpInfo.pSubpasses = &subpass;
+    VK_CHECK(vkCreateRenderPass(device, &rpInfo, nullptr, &renderer.renderPass));
+
+    // Create second render pass with LOAD instead of CLEAR (for second eye in SBS)
+    attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attachments[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attachments[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    VK_CHECK(vkCreateRenderPass(device, &rpInfo, nullptr, &renderer.renderPassLoad));
+
+    // Grid pipeline layout (push constants only, 64 bytes)
+    VkPushConstantRange gridPushRange = {};
+    gridPushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    gridPushRange.offset = 0;
+    gridPushRange.size = 64; // MVP matrix
+
+    VkPipelineLayoutCreateInfo gridLayoutInfo = {};
+    gridLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    gridLayoutInfo.pushConstantRangeCount = 1;
+    gridLayoutInfo.pPushConstantRanges = &gridPushRange;
+    VK_CHECK(vkCreatePipelineLayout(device, &gridLayoutInfo, nullptr, &renderer.pipelineLayout));
+
+    // Descriptor set layout for textured cube (3 combined image samplers)
+    VkDescriptorSetLayoutBinding bindings[3] = {};
+    for (int i = 0; i < 3; i++) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dslInfo = {};
+    dslInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dslInfo.bindingCount = 3;
+    dslInfo.pBindings = bindings;
+    VK_CHECK(vkCreateDescriptorSetLayout(device, &dslInfo, nullptr, &renderer.descriptorSetLayout));
+
+    // Cube pipeline layout (descriptor set + 128 bytes push constants: MVP + model)
+    VkPushConstantRange cubePushRange = {};
+    cubePushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    cubePushRange.offset = 0;
+    cubePushRange.size = 128; // MVP + model matrices
+
+    VkPipelineLayoutCreateInfo cubeLayoutInfo = {};
+    cubeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    cubeLayoutInfo.setLayoutCount = 1;
+    cubeLayoutInfo.pSetLayouts = &renderer.descriptorSetLayout;
+    cubeLayoutInfo.pushConstantRangeCount = 1;
+    cubeLayoutInfo.pPushConstantRanges = &cubePushRange;
+    VK_CHECK(vkCreatePipelineLayout(device, &cubeLayoutInfo, nullptr, &renderer.cubePipelineLayout));
+
+    // Shader modules
+    auto createShaderModule = [&](const uint32_t* code, size_t size) -> VkShaderModule {
+        VkShaderModuleCreateInfo ci = {};
+        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        ci.codeSize = size;
+        ci.pCode = code;
+        VkShaderModule sm;
+        vkCreateShaderModule(device, &ci, nullptr, &sm);
+        return sm;
+    };
+
+    VkShaderModule cubeVert = createShaderModule(cubeTexturedVertSpv, sizeof(cubeTexturedVertSpv));
+    VkShaderModule cubeFrag = createShaderModule(cubeTexturedFragSpv, sizeof(cubeTexturedFragSpv));
+    VkShaderModule gridVert = createShaderModule(gridVertSpv, sizeof(gridVertSpv));
+    VkShaderModule gridFrag = createShaderModule(gridFragSpv, sizeof(gridFragSpv));
+
+    // Common pipeline states
+    VkPipelineViewportStateCreateInfo viewportState = {};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rasterizer = {};
+    rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.lineWidth = 1.0f;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
+
+    VkPipelineMultisampleStateCreateInfo multisampling = {};
+    multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo depthStencil = {};
+    depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencil.depthTestEnable = VK_TRUE;
+    depthStencil.depthWriteEnable = VK_TRUE;
+    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+
+    VkPipelineColorBlendAttachmentState colorBlendAttach = {};
+    colorBlendAttach.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+    VkPipelineColorBlendStateCreateInfo colorBlend = {};
+    colorBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlend.attachmentCount = 1;
+    colorBlend.pAttachments = &colorBlendAttach;
+
+    VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamicState = {};
+    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount = 2;
+    dynamicState.pDynamicStates = dynamicStates;
+
+    // Textured cube pipeline
+    {
+        VkPipelineShaderStageCreateInfo stages[2] = {};
+        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = cubeVert;
+        stages[0].pName = "main";
+        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = cubeFrag;
+        stages[1].pName = "main";
+
+        VkVertexInputBindingDescription binding = {};
+        binding.stride = sizeof(CubeVertex);
+        VkVertexInputAttributeDescription attrs[5] = {};
+        attrs[0].location = 0; attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[0].offset = offsetof(CubeVertex, pos);
+        attrs[1].location = 1; attrs[1].format = VK_FORMAT_R32G32B32A32_SFLOAT; attrs[1].offset = offsetof(CubeVertex, color);
+        attrs[2].location = 2; attrs[2].format = VK_FORMAT_R32G32_SFLOAT; attrs[2].offset = offsetof(CubeVertex, uv);
+        attrs[3].location = 3; attrs[3].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[3].offset = offsetof(CubeVertex, normal);
+        attrs[4].location = 4; attrs[4].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[4].offset = offsetof(CubeVertex, tangent);
+
+        VkPipelineVertexInputStateCreateInfo vertexInput = {};
+        vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        vertexInput.vertexBindingDescriptionCount = 1;
+        vertexInput.pVertexBindingDescriptions = &binding;
+        vertexInput.vertexAttributeDescriptionCount = 5;
+        vertexInput.pVertexAttributeDescriptions = attrs;
+
+        VkPipelineInputAssemblyStateCreateInfo inputAssembly = {};
+        inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+        VkGraphicsPipelineCreateInfo pipelineInfo = {};
+        pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pipelineInfo.stageCount = 2;
+        pipelineInfo.pStages = stages;
+        pipelineInfo.pVertexInputState = &vertexInput;
+        pipelineInfo.pInputAssemblyState = &inputAssembly;
+        pipelineInfo.pViewportState = &viewportState;
+        pipelineInfo.pRasterizationState = &rasterizer;
+        pipelineInfo.pMultisampleState = &multisampling;
+        pipelineInfo.pDepthStencilState = &depthStencil;
+        pipelineInfo.pColorBlendState = &colorBlend;
+        pipelineInfo.pDynamicState = &dynamicState;
+        pipelineInfo.layout = renderer.cubePipelineLayout;
+        pipelineInfo.renderPass = renderer.renderPass;
+        VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &renderer.cubePipeline));
+    }
+
+    // Grid pipeline
+    {
+        VkPipelineShaderStageCreateInfo stages[2] = {};
+        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = gridVert;
+        stages[0].pName = "main";
+        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = gridFrag;
+        stages[1].pName = "main";
+
+        VkVertexInputBindingDescription binding = {};
+        binding.stride = sizeof(GridVertex);
+        VkVertexInputAttributeDescription attr = {};
+        attr.format = VK_FORMAT_R32G32B32_SFLOAT;
+
+        VkPipelineVertexInputStateCreateInfo vertexInput = {};
+        vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        vertexInput.vertexBindingDescriptionCount = 1;
+        vertexInput.pVertexBindingDescriptions = &binding;
+        vertexInput.vertexAttributeDescriptionCount = 1;
+        vertexInput.pVertexAttributeDescriptions = &attr;
+
+        VkPipelineInputAssemblyStateCreateInfo inputAssembly = {};
+        inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+
+        VkGraphicsPipelineCreateInfo pipelineInfo = {};
+        pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pipelineInfo.stageCount = 2;
+        pipelineInfo.pStages = stages;
+        pipelineInfo.pVertexInputState = &vertexInput;
+        pipelineInfo.pInputAssemblyState = &inputAssembly;
+        pipelineInfo.pViewportState = &viewportState;
+        pipelineInfo.pRasterizationState = &rasterizer;
+        pipelineInfo.pMultisampleState = &multisampling;
+        pipelineInfo.pDepthStencilState = &depthStencil;
+        pipelineInfo.pColorBlendState = &colorBlend;
+        pipelineInfo.pDynamicState = &dynamicState;
+        pipelineInfo.layout = renderer.pipelineLayout;
+        pipelineInfo.renderPass = renderer.renderPass;
+        VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &renderer.gridPipeline));
+    }
+
+    vkDestroyShaderModule(device, cubeVert, nullptr);
+    vkDestroyShaderModule(device, cubeFrag, nullptr);
+    vkDestroyShaderModule(device, gridVert, nullptr);
+    vkDestroyShaderModule(device, gridFrag, nullptr);
+
+    // Vertex/index buffers — textured cube with UV, normal, tangent per vertex
+    //   pos[3], color[4], uv[2], normal[3], tangent[3] = 15 floats per vertex
+    CubeVertex cubeVerts[] = {
+        // Front face (-Z): normal (0,0,-1), tangent (1,0,0)
+        {{-0.5f,-0.5f,-0.5f},{1,1,1,1},{0,1},{0,0,-1},{1,0,0}},
+        {{-0.5f, 0.5f,-0.5f},{1,1,1,1},{0,0},{0,0,-1},{1,0,0}},
+        {{ 0.5f, 0.5f,-0.5f},{1,1,1,1},{1,0},{0,0,-1},{1,0,0}},
+        {{ 0.5f,-0.5f,-0.5f},{1,1,1,1},{1,1},{0,0,-1},{1,0,0}},
+        // Back face (+Z): normal (0,0,1), tangent (-1,0,0)
+        {{-0.5f,-0.5f, 0.5f},{1,1,1,1},{1,1},{0,0,1},{-1,0,0}},
+        {{ 0.5f,-0.5f, 0.5f},{1,1,1,1},{0,1},{0,0,1},{-1,0,0}},
+        {{ 0.5f, 0.5f, 0.5f},{1,1,1,1},{0,0},{0,0,1},{-1,0,0}},
+        {{-0.5f, 0.5f, 0.5f},{1,1,1,1},{1,0},{0,0,1},{-1,0,0}},
+        // Top face (+Y): normal (0,1,0), tangent (1,0,0)
+        {{-0.5f, 0.5f,-0.5f},{1,1,1,1},{0,1},{0,1,0},{1,0,0}},
+        {{-0.5f, 0.5f, 0.5f},{1,1,1,1},{0,0},{0,1,0},{1,0,0}},
+        {{ 0.5f, 0.5f, 0.5f},{1,1,1,1},{1,0},{0,1,0},{1,0,0}},
+        {{ 0.5f, 0.5f,-0.5f},{1,1,1,1},{1,1},{0,1,0},{1,0,0}},
+        // Bottom face (-Y): normal (0,-1,0), tangent (1,0,0)
+        {{-0.5f,-0.5f,-0.5f},{1,1,1,1},{0,0},{0,-1,0},{1,0,0}},
+        {{ 0.5f,-0.5f,-0.5f},{1,1,1,1},{1,0},{0,-1,0},{1,0,0}},
+        {{ 0.5f,-0.5f, 0.5f},{1,1,1,1},{1,1},{0,-1,0},{1,0,0}},
+        {{-0.5f,-0.5f, 0.5f},{1,1,1,1},{0,1},{0,-1,0},{1,0,0}},
+        // Left face (-X): normal (-1,0,0), tangent (0,0,-1)
+        {{-0.5f,-0.5f, 0.5f},{1,1,1,1},{0,1},{-1,0,0},{0,0,-1}},
+        {{-0.5f, 0.5f, 0.5f},{1,1,1,1},{0,0},{-1,0,0},{0,0,-1}},
+        {{-0.5f, 0.5f,-0.5f},{1,1,1,1},{1,0},{-1,0,0},{0,0,-1}},
+        {{-0.5f,-0.5f,-0.5f},{1,1,1,1},{1,1},{-1,0,0},{0,0,-1}},
+        // Right face (+X): normal (1,0,0), tangent (0,0,1)
+        {{ 0.5f,-0.5f,-0.5f},{1,1,1,1},{0,1},{1,0,0},{0,0,1}},
+        {{ 0.5f, 0.5f,-0.5f},{1,1,1,1},{0,0},{1,0,0},{0,0,1}},
+        {{ 0.5f, 0.5f, 0.5f},{1,1,1,1},{1,0},{1,0,0},{0,0,1}},
+        {{ 0.5f,-0.5f, 0.5f},{1,1,1,1},{1,1},{1,0,0},{0,0,1}},
+    };
+
+    uint16_t cubeIndices[] = {
+        0,1,2, 0,2,3, 4,5,6, 4,6,7, 8,9,10, 8,10,11,
+        12,13,14, 12,14,15, 16,17,18, 16,18,19, 20,21,22, 20,22,23,
+    };
+
+    if (!CreateBuffer(device, physDevice, sizeof(cubeVerts),
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        renderer.cubeVertexBuffer, renderer.cubeVertexMemory)) return false;
+    void* data;
+    vkMapMemory(device, renderer.cubeVertexMemory, 0, sizeof(cubeVerts), 0, &data);
+    memcpy(data, cubeVerts, sizeof(cubeVerts));
+    vkUnmapMemory(device, renderer.cubeVertexMemory);
+
+    if (!CreateBuffer(device, physDevice, sizeof(cubeIndices),
+        VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        renderer.cubeIndexBuffer, renderer.cubeIndexMemory)) return false;
+    vkMapMemory(device, renderer.cubeIndexMemory, 0, sizeof(cubeIndices), 0, &data);
+    memcpy(data, cubeIndices, sizeof(cubeIndices));
+    vkUnmapMemory(device, renderer.cubeIndexMemory);
+
+    const int gridSize = 10;
+    const float gridSpacing = 1.0f;
+    std::vector<GridVertex> gridVerts;
+    for (int i = -gridSize; i <= gridSize; i++) {
+        gridVerts.push_back({{(float)i * gridSpacing, -1.0f, -gridSize * gridSpacing}});
+        gridVerts.push_back({{(float)i * gridSpacing, -1.0f,  gridSize * gridSpacing}});
+        gridVerts.push_back({{-gridSize * gridSpacing, -1.0f, (float)i * gridSpacing}});
+        gridVerts.push_back({{ gridSize * gridSpacing, -1.0f, (float)i * gridSpacing}});
+    }
+    renderer.gridVertexCount = (int)gridVerts.size();
+
+    VkDeviceSize gridBufSize = gridVerts.size() * sizeof(GridVertex);
+    if (!CreateBuffer(device, physDevice, gridBufSize,
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        renderer.gridVertexBuffer, renderer.gridVertexMemory)) return false;
+    vkMapMemory(device, renderer.gridVertexMemory, 0, gridBufSize, 0, &data);
+    memcpy(data, gridVerts.data(), (size_t)gridBufSize);
+    vkUnmapMemory(device, renderer.gridVertexMemory);
+
+    // Command pool + buffer
+    VkCommandPoolCreateInfo poolInfo = {};
+    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    poolInfo.queueFamilyIndex = queueFamilyIndex;
+    VK_CHECK(vkCreateCommandPool(device, &poolInfo, nullptr, &renderer.commandPool));
+
+    VkCommandBufferAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool = renderer.commandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+    VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, &renderer.commandBuffer));
+
+    VkFenceCreateInfo fenceInfo = {};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    VK_CHECK(vkCreateFence(device, &fenceInfo, nullptr, &renderer.frameFence));
+
+    // Load textures and create descriptor set
+    {
+        std::string texDir = GetTextureDir();
+        const char* texFiles[3] = {
+            "Wood_Crate_001_basecolor.jpg",
+            "Wood_Crate_001_normal.jpg",
+            "Wood_Crate_001_ambientOcclusion.jpg",
+        };
+        bool isNormal[3] = {false, true, false};
+        renderer.texturesLoaded = true;
+        for (int i = 0; i < 3; i++) {
+            std::string path = texDir + texFiles[i];
+            if (!CreateTextureFromFile(device, physDevice, renderer.commandPool,
+                    renderer.graphicsQueue, path.c_str(), isNormal[i],
+                    renderer.texImages[i], renderer.texMemory[i], renderer.texViews[i])) {
+                renderer.texturesLoaded = false;
+            }
+        }
+
+        // Sampler (linear filtering, repeat wrap)
+        VkSamplerCreateInfo samplerInfo = {};
+        samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.maxAnisotropy = 1.0f;
+        // Trilinear: sample the full mip chain (built via vkCmdBlitImage in
+        // CreateTextureFromFile) so the wood texture stays smooth under
+        // minification (#396 W6 parity with GL/Win). VK_LOD_CLAMP_NONE uses
+        // whatever mip levels the bound texture actually has.
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        samplerInfo.minLod = 0.0f;
+        samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
+        VK_CHECK(vkCreateSampler(device, &samplerInfo, nullptr, &renderer.texSampler));
+
+        // Descriptor pool and set
+        VkDescriptorPoolSize poolSize = {};
+        poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        poolSize.descriptorCount = 3;
+        VkDescriptorPoolCreateInfo poolInfo = {};
+        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.maxSets = 1;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = &poolSize;
+        VK_CHECK(vkCreateDescriptorPool(device, &poolInfo, nullptr, &renderer.descriptorPool));
+
+        VkDescriptorSetAllocateInfo dsAllocInfo = {};
+        dsAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsAllocInfo.descriptorPool = renderer.descriptorPool;
+        dsAllocInfo.descriptorSetCount = 1;
+        dsAllocInfo.pSetLayouts = &renderer.descriptorSetLayout;
+        VK_CHECK(vkAllocateDescriptorSets(device, &dsAllocInfo, &renderer.descriptorSet));
+
+        // Update descriptor set with texture views
+        VkDescriptorImageInfo imageInfos[3] = {};
+        VkWriteDescriptorSet writes[3] = {};
+        for (int i = 0; i < 3; i++) {
+            imageInfos[i].sampler = renderer.texSampler;
+            imageInfos[i].imageView = renderer.texViews[i];
+            imageInfos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = renderer.descriptorSet;
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[i].pImageInfo = &imageInfos[i];
+        }
+        vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
+
+        if (renderer.texturesLoaded) {
+            LOG_INFO("All crate textures loaded successfully");
+        } else {
+            LOG_WARN("Some textures missing — using fallback colors");
+        }
+    }
+
+    LOG_INFO("Vulkan renderer initialized");
+    return true;
+}
+
+struct EyeRenderParams {
+    uint32_t viewportX, viewportY, width, height;
+    float viewMat[16];
+    float projMat[16];
+};
+
+static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
+    const EyeRenderParams* eyes, int eyeCount)
+{
+    VkDevice device = renderer.device;
+    vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
+    vkResetFences(device, 1, &renderer.frameFence);
+
+    auto& fb = renderer.swapchainFBs;
+    VkCommandBuffer cmd = renderer.commandBuffer;
+    vkResetCommandBuffer(cmd, 0);
+
+    VkCommandBufferBeginInfo beginInfo = {};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    // Transparent-background mode (DISPLAYXR_TRANSPARENT_BG=1) clears RGBA(0,0,0,0)
+    // so the desktop shows through everywhere the cube isn't drawn. Pairs with
+    // XrCocoaWindowBindingCreateInfoEXT.transparentBackgroundEnabled = XR_TRUE.
+    static const bool transparent_bg = []() {
+        const char *e = getenv("DISPLAYXR_TRANSPARENT_BG");
+        return e != nullptr && *e != '\0' && *e != '0';
+    }();
+    VkClearValue clearValues[2] = {};
+    clearValues[0].color = transparent_bg ? VkClearColorValue{{0.0f, 0.0f, 0.0f, 0.0f}}
+                                          : VkClearColorValue{{0.05f, 0.05f, 0.1f, 1.0f}};
+    clearValues[1].depthStencil = {1.0f, 0};
+
+    VkRenderPassBeginInfo rpBegin = {};
+    rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rpBegin.renderPass = renderer.renderPass;
+    rpBegin.framebuffer = fb.framebuffers[imageIndex];
+    rpBegin.renderArea = {{0, 0}, {fb.width, fb.height}};
+    rpBegin.clearValueCount = 2;
+    rpBegin.pClearValues = clearValues;
+    vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+
+    // Render all eyes in a single render pass — just change viewport/scissor
+    for (int eye = 0; eye < eyeCount; eye++) {
+        const auto& e = eyes[eye];
+
+        VkViewport viewport = {(float)e.viewportX, (float)(e.viewportY + e.height),
+            (float)e.width, -(float)e.height, 0.0f, 1.0f};
+        VkRect2D scissor = {{(int32_t)e.viewportX, (int32_t)e.viewportY}, {e.width, e.height}};
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        float vp[16];
+        mat4_multiply(vp, e.projMat, e.viewMat);
+
+        // Draw grid
+        {
+            const float gridScale = 0.05f;
+            float gridWorld[16], gridScl[16], gridTrans[16];
+            mat4_scale(gridScl, gridScale, gridScale, gridScale);
+            mat4_translation(gridTrans, 0, gridScale, 0);
+            mat4_multiply(gridWorld, gridTrans, gridScl);
+            float gridMvp[16];
+            mat4_multiply(gridMvp, vp, gridWorld);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.gridPipeline);
+            vkCmdPushConstants(cmd, renderer.pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, gridMvp);
+            VkDeviceSize offset = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &renderer.gridVertexBuffer, &offset);
+            vkCmdDraw(cmd, renderer.gridVertexCount, 1, 0, 0);
+        }
+
+        // Draw cube (textured)
+        {
+            const float cubeSize = 0.06f;
+            const float cubeHeight = cubeSize / 2.0f;
+            float rot[16], scl[16], trans[16], model[16], tmp[16];
+            mat4_rotation_y(rot, renderer.cubeRotation);
+            mat4_scale(scl, cubeSize, cubeSize, cubeSize);
+            mat4_translation(trans, 0, cubeHeight, 0);
+            mat4_multiply(tmp, scl, rot);
+            mat4_multiply(model, trans, tmp);
+            float mvp[16];
+            mat4_multiply(mvp, vp, model);
+
+            // Push constants: MVP (64 bytes) + model (64 bytes) = 128 bytes
+            float pushData[32];
+            memcpy(pushData, mvp, 64);
+            memcpy(pushData + 16, model, 64);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.cubePipeline);
+            vkCmdPushConstants(cmd, renderer.cubePipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 128, pushData);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.cubePipelineLayout,
+                0, 1, &renderer.descriptorSet, 0, nullptr);
+            VkDeviceSize offset = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &renderer.cubeVertexBuffer, &offset);
+            vkCmdBindIndexBuffer(cmd, renderer.cubeIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
+            vkCmdDrawIndexed(cmd, 36, 1, 0, 0, 0);
+        }
+    }
+
+    vkCmdEndRenderPass(cmd);
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo submitInfo = {};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmd;
+    vkQueueSubmit(renderer.graphicsQueue, 1, &submitInfo, renderer.frameFence);
+}
+
+static void CleanupVkRenderer(VkRenderer& renderer) {
+    if (renderer.device == VK_NULL_HANDLE) return;
+    vkDeviceWaitIdle(renderer.device);
+
+    {
+        auto& fb = renderer.swapchainFBs;
+        for (auto f : fb.framebuffers) vkDestroyFramebuffer(renderer.device, f, nullptr);
+        for (auto v : fb.colorViews) vkDestroyImageView(renderer.device, v, nullptr);
+        for (auto v : fb.depthViews) vkDestroyImageView(renderer.device, v, nullptr);
+        if (fb.depthImage) vkDestroyImage(renderer.device, fb.depthImage, nullptr);
+        if (fb.depthMemory) vkFreeMemory(renderer.device, fb.depthMemory, nullptr);
+    }
+
+    if (renderer.frameFence) vkDestroyFence(renderer.device, renderer.frameFence, nullptr);
+    if (renderer.commandPool) vkDestroyCommandPool(renderer.device, renderer.commandPool, nullptr);
+    if (renderer.gridVertexBuffer) vkDestroyBuffer(renderer.device, renderer.gridVertexBuffer, nullptr);
+    if (renderer.gridVertexMemory) vkFreeMemory(renderer.device, renderer.gridVertexMemory, nullptr);
+    if (renderer.cubeIndexBuffer) vkDestroyBuffer(renderer.device, renderer.cubeIndexBuffer, nullptr);
+    if (renderer.cubeIndexMemory) vkFreeMemory(renderer.device, renderer.cubeIndexMemory, nullptr);
+    if (renderer.cubeVertexBuffer) vkDestroyBuffer(renderer.device, renderer.cubeVertexBuffer, nullptr);
+    if (renderer.cubeVertexMemory) vkFreeMemory(renderer.device, renderer.cubeVertexMemory, nullptr);
+    if (renderer.gridPipeline) vkDestroyPipeline(renderer.device, renderer.gridPipeline, nullptr);
+    if (renderer.cubePipeline) vkDestroyPipeline(renderer.device, renderer.cubePipeline, nullptr);
+    // Texture cleanup
+    if (renderer.descriptorPool) vkDestroyDescriptorPool(renderer.device, renderer.descriptorPool, nullptr);
+    if (renderer.descriptorSetLayout) vkDestroyDescriptorSetLayout(renderer.device, renderer.descriptorSetLayout, nullptr);
+    if (renderer.texSampler) vkDestroySampler(renderer.device, renderer.texSampler, nullptr);
+    for (int i = 0; i < 3; i++) {
+        if (renderer.texViews[i]) vkDestroyImageView(renderer.device, renderer.texViews[i], nullptr);
+        if (renderer.texImages[i]) vkDestroyImage(renderer.device, renderer.texImages[i], nullptr);
+        if (renderer.texMemory[i]) vkFreeMemory(renderer.device, renderer.texMemory[i], nullptr);
+    }
+    if (renderer.cubePipelineLayout) vkDestroyPipelineLayout(renderer.device, renderer.cubePipelineLayout, nullptr);
+    if (renderer.pipelineLayout) vkDestroyPipelineLayout(renderer.device, renderer.pipelineLayout, nullptr);
+    if (renderer.renderPassLoad) vkDestroyRenderPass(renderer.device, renderer.renderPassLoad, nullptr);
+    if (renderer.renderPass) vkDestroyRenderPass(renderer.device, renderer.renderPass, nullptr);
+}
+
+// HUD is composed by the runtime as an XR_EXT_window_space_layer; pixels are
+// uploaded into the HUD swapchain image via a Vulkan staging buffer + copy
+// (see UploadHudPixels below).
+
+// ============================================================================
+// macOS Window + Metal View
+// ============================================================================
+
+/*!
+ * NSView subclass whose backing layer is a CAMetalLayer.
+ * Same pattern as DisplayXRMetalView in comp_window_macos.m.
+ */
+@interface AppMetalView : NSView
+@end
+
+@implementation AppMetalView
+- (CALayer *)makeBackingLayer {
+    return [CAMetalLayer layer];
+}
+- (BOOL)wantsUpdateLayer {
+    return YES;
+}
+@end
+
+// NSApplicationDelegate: prevent termination when the window is closed or app
+// loses focus.  Without this, macOS terminates CLI-launched GUI apps as soon as
+// the last window closes (applicationShouldTerminateAfterLastWindowClosed
+// defaults to YES).
+@interface AppDelegate : NSObject <NSApplicationDelegate>
+@end
+@implementation AppDelegate
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
+    (void)sender;
+    return NO;
+}
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
+    (void)sender;
+    g_running = false;
+    return NSTerminateCancel; // let our loop handle cleanup
+}
+@end
+
+// NSWindowDelegate: translate window-close into g_running = false so the render
+// loop exits gracefully; also keeps the app alive on focus loss.
+@interface AppWindowDelegate : NSObject <NSWindowDelegate>
+@end
+@implementation AppWindowDelegate
+- (BOOL)windowShouldClose:(NSWindow *)sender {
+    (void)sender;
+    g_running = false;
+    return NO; // we handle teardown ourselves
+}
+@end
+
+static AppDelegate *g_appDelegate = nil;
+static AppWindowDelegate *g_windowDelegate = nil;
+
+static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
+    @autoreleasepool {
+        [NSApplication sharedApplication];
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+
+        g_appDelegate = [[AppDelegate alloc] init];
+        [NSApp setDelegate:g_appDelegate];
+
+        NSRect frame = NSMakeRect(100, 100, width, height);
+        NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                           NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
+
+        g_window = [[NSWindow alloc] initWithContentRect:frame
+                                               styleMask:style
+                                                 backing:NSBackingStoreBuffered
+                                                   defer:NO];
+
+        [g_window setTitle:@"Vulkan Cube — VK Native Compositor (External Window)"];
+        [g_window setAcceptsMouseMovedEvents:YES];
+        [g_window setReleasedWhenClosed:NO];
+
+        g_windowDelegate = [[AppWindowDelegate alloc] init];
+        [g_window setDelegate:g_windowDelegate];
+
+        g_metalView = [[AppMetalView alloc] initWithFrame:frame];
+        [g_metalView setWantsLayer:YES];
+
+        // Set Retina scale so CAMetalLayer produces pixel-resolution drawables
+        CAMetalLayer *metalLayer = (CAMetalLayer *)[g_metalView layer];
+        if (metalLayer) {
+            metalLayer.contentsScale = [g_window backingScaleFactor];
+        }
+
+        [g_window setContentView:g_metalView];
+
+        // HUD now lives as an XR_EXT_window_space_layer composed by the runtime.
+
+        [g_window makeKeyAndOrderFront:nil];
+        [NSApp activateIgnoringOtherApps:YES];
+
+        // Pump events so the window appears
+        NSEvent *event;
+        while ((event = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                           untilDate:nil
+                                              inMode:NSDefaultRunLoopMode
+                                             dequeue:YES]) != nil) {
+            [NSApp sendEvent:event];
+        }
+    }
+
+    if (g_window == nil || g_metalView == nil) {
+        LOG_ERROR("Failed to create macOS window");
+        return false;
+    }
+
+    LOG_INFO("Created macOS window %ux%u with CAMetalLayer-backed NSView", width, height);
+    return true;
+}
+
+static void PumpMacOSEvents() {
+    // Track whether left-click started in content area vs title bar.
+    // Title bar drags should move the window, not rotate the scene.
+    static bool leftDragInContent = false;
+
+    @autoreleasepool {
+        NSEvent *event;
+        while ((event = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                           untilDate:nil
+                                              inMode:NSDefaultRunLoopMode
+                                             dequeue:YES]) != nil) {
+            NSEventType type = [event type];
+
+            if (type == NSEventTypeLeftMouseDown) {
+                NSPoint loc = [event locationInWindow];
+                NSRect contentRect = g_window ? [[g_window contentView] frame] : NSZeroRect;
+                leftDragInContent = NSMouseInRect(loc, contentRect, NO);
+                if ([event clickCount] >= 2) g_input.resetViewRequested = true;
+            } else if (type == NSEventTypeLeftMouseDragged) {
+                // Rotate camera only while left button is physically held AND
+                // the drag started in the content area (not the title bar).
+                // Uses event deltas — no persistent drag state that can get
+                // stuck when the window-resize modal loop swallows MouseUp.
+                if (leftDragInContent && ([NSEvent pressedMouseButtons] & 1)) {
+                    g_input.yaw   -= (float)[event deltaX] * 0.005f;
+                    g_input.pitch -= (float)[event deltaY] * 0.005f;
+                    if (g_input.pitch > 1.4f) g_input.pitch = 1.4f;
+                    if (g_input.pitch < -1.4f) g_input.pitch = -1.4f;
+                }
+            } else if (type == NSEventTypeScrollWheel) {
+                float dy = (float)[event scrollingDeltaY];
+                float factor = (dy > 0) ? 1.1f : (1.0f / 1.1f);
+                NSUInteger scrollMods = [event modifierFlags];
+                if (scrollMods & NSEventModifierFlagShift) {
+                    g_input.viewParams.ipdFactor *= factor;
+                    if (g_input.viewParams.ipdFactor < 0.0f) g_input.viewParams.ipdFactor = 0.0f;
+                    if (g_input.viewParams.ipdFactor > 1.0f) g_input.viewParams.ipdFactor = 1.0f;
+                } else if (scrollMods & NSEventModifierFlagControl) {
+                    g_input.viewParams.parallaxFactor *= factor;
+                    if (g_input.viewParams.parallaxFactor < 0.0f) g_input.viewParams.parallaxFactor = 0.0f;
+                    if (g_input.viewParams.parallaxFactor > 1.0f) g_input.viewParams.parallaxFactor = 1.0f;
+                } else if (scrollMods & NSEventModifierFlagOption) {
+                    if (g_input.cameraMode) {
+                        g_input.viewParams.invConvergenceDistance *= factor;
+                        if (g_input.viewParams.invConvergenceDistance < 0.1f) g_input.viewParams.invConvergenceDistance = 0.1f;
+                        if (g_input.viewParams.invConvergenceDistance > 10.0f) g_input.viewParams.invConvergenceDistance = 10.0f;
+                    } else {
+                        g_input.viewParams.perspectiveFactor *= factor;
+                        if (g_input.viewParams.perspectiveFactor < 0.1f) g_input.viewParams.perspectiveFactor = 0.1f;
+                        if (g_input.viewParams.perspectiveFactor > 10.0f) g_input.viewParams.perspectiveFactor = 10.0f;
+                    }
+                } else {
+                    if (g_input.cameraMode) {
+                        g_input.viewParams.zoomFactor *= factor;
+                        if (g_input.viewParams.zoomFactor < 0.1f) g_input.viewParams.zoomFactor = 0.1f;
+                        if (g_input.viewParams.zoomFactor > 10.0f) g_input.viewParams.zoomFactor = 10.0f;
+                    } else {
+                        g_input.viewParams.scaleFactor *= factor;
+                        if (g_input.viewParams.scaleFactor < 0.1f) g_input.viewParams.scaleFactor = 0.1f;
+                        if (g_input.viewParams.scaleFactor > 10.0f) g_input.viewParams.scaleFactor = 10.0f;
+                    }
+                }
+            } else if (type == NSEventTypeKeyDown) {
+                // Cmd+Ctrl+F fullscreen toggle (keyCode 3 = 'f', ignores character remapping)
+                NSUInteger mods = [event modifierFlags];
+                if ([event keyCode] == 3 &&
+                    (mods & NSEventModifierFlagCommand) &&
+                    (mods & NSEventModifierFlagControl) &&
+                    ![event isARepeat]) {
+                    ToggleBorderlessFullscreen();
+                }
+                else if ([[event characters] length] > 0) {
+                    unichar ch = tolower([[event characters] characterAtIndex:0]);
+                    bool isRepeat = [event isARepeat];
+                    if (ch == 27) { g_running = false; }
+                    else if (ch == 'w') { g_input.keyW = true; }
+                    else if (ch == 'a') { g_input.keyA = true; }
+                    else if (ch == 's') { g_input.keyS = true; }
+                    else if (ch == 'd') { g_input.keyD = true; }
+                    else if (ch == 'e') { g_input.keyE = true; }
+                    else if (ch == 'q') { g_input.keyQ = true; }
+                    else if (ch == ' ') { g_input.resetViewRequested = true; }
+                    else if ([event keyCode] == 48 /* kVK_Tab */ && !isRepeat &&
+                             ([event modifierFlags] & NSEventModifierFlagShift)) {
+                        // SHIFT+TAB so bare TAB stays free for the workspace shell's
+                        // focus-cycle binding (matches the Windows test apps).
+                        // NSEvent.characters returns 0x19 (NSBackTabCharacter) for
+                        // SHIFT+TAB, not '\t' — gate on the hardware keyCode.
+                        g_input.hudVisible = !g_input.hudVisible;
+                    }
+                    else if (ch == 'v' && !isRepeat) {
+                        g_input.cycleRenderingModeRequested = true;
+                    }
+                    else if (ch == 'm' && !isRepeat) {
+                        g_wishModeCycleRequested = true;
+                    }
+                    else if (ch == 'o' && !isRepeat) {
+                        g_overlapToggleRequested = true;
+                    }
+                    else if (ch == 't' && !isRepeat) {
+                        g_input.eyeTrackingModeToggleRequested = true;
+                    }
+                    else if ((ch == 'i' || ch == 'I') && !isRepeat) {
+                        g_input.captureAtlasRequested = true;
+                    }
+                    else if (ch == 'c' && !isRepeat) {
+                        g_input.cameraMode = !g_input.cameraMode;
+                        if (g_input.cameraMode) {
+                            g_input.cameraPosX = 0.0f;
+                            g_input.cameraPosY = 0.0f;
+                            g_input.cameraPosZ = g_input.nominalViewerZ;
+                            g_input.yaw = 0.0f;
+                            g_input.pitch = 0.0f;
+                            if (g_input.nominalViewerZ > 0.0f)
+                                g_input.viewParams.invConvergenceDistance = 1.0f / g_input.nominalViewerZ;
+                            g_input.viewParams.zoomFactor = 1.0f;
+                        } else {
+                            g_input.cameraPosX = 0.0f;
+                            g_input.cameraPosY = 0.0f;
+                            g_input.cameraPosZ = 0.0f;
+                            g_input.yaw = 0.0f;
+                            g_input.pitch = 0.0f;
+                        }
+                    }
+                    else if (ch >= '0' && ch <= '8' && !isRepeat) {
+                        g_input.absoluteRenderingModeRequested = (int32_t)(ch - '0');
+                    }
+                }
+            } else if (type == NSEventTypeKeyUp) {
+                if ([[event characters] length] > 0) {
+                    unichar ch = tolower([[event characters] characterAtIndex:0]);
+                    if (ch == 'w') g_input.keyW = false;
+                    else if (ch == 'a') g_input.keyA = false;
+                    else if (ch == 's') g_input.keyS = false;
+                    else if (ch == 'd') g_input.keyD = false;
+                    else if (ch == 'e') g_input.keyE = false;
+                    else if (ch == 'q') g_input.keyQ = false;
+                }
+            }
+
+            // Forward non-key events to NSApp; skip key events to prevent beep
+            if (type != NSEventTypeKeyDown && type != NSEventTypeKeyUp) {
+                [NSApp sendEvent:event];
+            }
+        }
+
+        // Update window dimensions from actual drawable size (handles resize + fullscreen).
+        // Multiply by backingScaleFactor to get pixel dimensions matching the Vulkan
+        // surface extent (CAMetalLayer uses pixel dimensions on Retina).
+        if (g_window != nil) {
+            NSSize contentSize = [[g_window contentView] bounds].size;
+            CGFloat backingScale = [g_window backingScaleFactor];
+            g_windowW = (uint32_t)(contentSize.width * backingScale);
+            g_windowH = (uint32_t)(contentSize.height * backingScale);
+        }
+    }
+}
+
+// ============================================================================
+// Camera movement (ported from test_apps/common/input_handler.cpp)
+// ============================================================================
+
+static void UpdateCameraMovement(InputState& state, float deltaTime, float displayHeightM = 0.0f) {
+    if (state.resetViewRequested) {
+        state.yaw = state.pitch = 0.0f;
+        float savedVDH = state.viewParams.virtualDisplayHeight;
+        bool savedCameraMode = state.cameraMode;
+        state.viewParams = ViewParams{};
+        state.viewParams.virtualDisplayHeight = savedVDH;
+        state.cameraMode = savedCameraMode;
+        if (state.cameraMode) {
+            state.cameraPosX = 0.0f;
+            state.cameraPosY = 0.0f;
+            state.cameraPosZ = state.nominalViewerZ;
+            if (state.nominalViewerZ > 0.0f)
+                state.viewParams.invConvergenceDistance = 1.0f / state.nominalViewerZ;
+        } else {
+            state.cameraPosX = state.cameraPosY = state.cameraPosZ = 0.0f;
+        }
+        state.resetViewRequested = false;
+        return;
+    }
+
+    // Meters-to-virtual conversion (matches Kooima projection scaling)
+    float m2v = 1.0f;
+    if (state.viewParams.virtualDisplayHeight > 0.0f && displayHeightM > 0.0f)
+        m2v = state.viewParams.virtualDisplayHeight / displayHeightM;
+
+    const float moveSpeed = 0.1f * m2v / state.viewParams.scaleFactor;
+    XrQuaternionf ori;
+    quat_from_yaw_pitch(state.yaw, state.pitch, &ori);
+
+    float fwdX, fwdY, fwdZ, rtX, rtY, rtZ, upX, upY, upZ;
+    quat_rotate_vec3(ori, 0, 0, -1, &fwdX, &fwdY, &fwdZ);
+    quat_rotate_vec3(ori, 1, 0, 0, &rtX, &rtY, &rtZ);
+    quat_rotate_vec3(ori, 0, 1, 0, &upX, &upY, &upZ);
+
+    float d = moveSpeed * deltaTime;
+    if (state.keyW) { state.cameraPosX += fwdX*d; state.cameraPosY += fwdY*d; state.cameraPosZ += fwdZ*d; }
+    if (state.keyS) { state.cameraPosX -= fwdX*d; state.cameraPosY -= fwdY*d; state.cameraPosZ -= fwdZ*d; }
+    if (state.keyD) { state.cameraPosX += rtX*d; state.cameraPosY += rtY*d; state.cameraPosZ += rtZ*d; }
+    if (state.keyA) { state.cameraPosX -= rtX*d; state.cameraPosY -= rtY*d; state.cameraPosZ -= rtZ*d; }
+    if (state.keyE) { state.cameraPosX += upX*d; state.cameraPosY += upY*d; state.cameraPosZ += upZ*d; }
+    if (state.keyQ) { state.cameraPosX -= upX*d; state.cameraPosY -= upY*d; state.cameraPosZ -= upZ*d; }
+}
+
+// ============================================================================
+// OpenXR session management
+// ============================================================================
+
+struct SwapchainInfo {
+    XrSwapchain swapchain = XR_NULL_HANDLE;
+    int64_t format = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t imageCount = 0;
+};
+
+struct AppXrSession {
+    XrInstance instance = XR_NULL_HANDLE;
+    XrSystemId systemId = XR_NULL_SYSTEM_ID;
+    XrSession session = XR_NULL_HANDLE;
+    XrSpace localSpace = XR_NULL_HANDLE;
+    XrSpace viewSpace = XR_NULL_HANDLE;
+    SwapchainInfo swapchain;
+
+    uint32_t displayPixelWidth = 0;
+    uint32_t displayPixelHeight = 0;
+
+    XrViewConfigurationType viewConfigType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    std::vector<XrViewConfigurationView> configViews;
+
+    XrSessionState sessionState = XR_SESSION_STATE_UNKNOWN;
+    bool sessionRunning = false;
+    bool exitRequested = false;
+    bool hasCocoaWindowBinding = false;
+
+    // XR_EXT_display_info
+    bool hasDisplayInfoExt = false;
+    float recommendedViewScaleX = 1.0f;
+    float recommendedViewScaleY = 1.0f;
+    float displayWidthM = 0.0f;
+    float displayHeightM = 0.0f;
+    float nominalViewerX = 0.0f;
+    float nominalViewerY = 0.0f;
+    float nominalViewerZ = 0.5f;
+    PFN_xrRequestDisplayModeEXT pfnRequestDisplayModeEXT = nullptr;
+    PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingModeEXT = nullptr;
+    PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT = nullptr;
+
+    // XR_EXT_atlas_capture (W6 of #396): runtime-owned 'I'-key atlas capture.
+    bool hasAtlasCaptureExt = false;
+    bool hasViewRigExt = false;  // XR_EXT_view_rig (#396 W7)
+    PFN_xrCaptureAtlasEXT pfnCaptureAtlasEXT = nullptr;
+    // Enumerated rendering mode info. currentModeIndex is initialized to mode 1
+    // as a fallback for runtimes that don't expose isActive; v13+ runtimes
+    // replace it via the enumerate step (initial-mode-sync, #234/#239).
+    uint32_t currentModeIndex = 1;
+    uint32_t renderingModeCount = 0;
+    char renderingModeNames[8][XR_MAX_SYSTEM_NAME_SIZE] = {};
+    uint32_t renderingModeViewCounts[8] = {};
+    uint32_t renderingModeTileColumns[8] = {};
+    uint32_t renderingModeTileRows[8] = {};
+    float renderingModeScaleX[8] = {};
+    float renderingModeScaleY[8] = {};
+    bool renderingModeDisplay3D[8] = {};
+    bool renderingModeIsRequestable[8] = {};  // v13: false when workspace-locked
+
+    // Eye tracking mode control (XR_EXT_display_info v6)
+    uint32_t supportedEyeTrackingModes = 0;
+    uint32_t defaultEyeTrackingMode = 0;
+    bool isEyeTracking = false;
+    uint32_t activeEyeTrackingMode = 0;
+    PFN_xrRequestEyeTrackingModeEXT pfnRequestEyeTrackingModeEXT = nullptr;
+
+    // Eye tracking data for HUD
+    uint32_t eyeCount = 2;
+    float eyePositions[8][3] = {};  // [view][x,y,z] — raw per-eye positions in display space
+    bool eyeTrackingActive = false;
+
+    // System name from xrGetSystemProperties
+    char systemName[XR_MAX_SYSTEM_NAME_SIZE] = {};
+};
+
+static bool InitializeOpenXR(AppXrSession& xr) {
+    LOG_INFO("Initializing OpenXR...");
+
+    uint32_t extensionCount = 0;
+    XR_CHECK(xrEnumerateInstanceExtensionProperties(nullptr, 0, &extensionCount, nullptr));
+
+    std::vector<XrExtensionProperties> extensions(extensionCount, {XR_TYPE_EXTENSION_PROPERTIES});
+    XR_CHECK(xrEnumerateInstanceExtensionProperties(nullptr, extensionCount, &extensionCount, extensions.data()));
+
+    bool hasVulkan = false;
+    for (const auto& ext : extensions) {
+        if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
+        if (strcmp(ext.extensionName, XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME) == 0) {
+            xr.hasCocoaWindowBinding = true;
+        }
+        if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) {
+            xr.hasDisplayInfoExt = true;
+        }
+        if (strcmp(ext.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0) {
+            xr.hasAtlasCaptureExt = true;
+        }
+        if (strcmp(ext.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
+            xr.hasViewRigExt = true;
+        }
+        if (strcmp(ext.extensionName, XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) {
+            g_hasLocal3DZoneExt = true;
+        }
+        if (strcmp(ext.extensionName, XR_EXT_DISPLAY_ZONES_EXTENSION_NAME) == 0) {
+            g_hasDisplayZonesExt = true;
+        }
+    }
+
+    if (!hasVulkan) {
+        LOG_ERROR("XR_KHR_vulkan_enable not supported");
+        return false;
+    }
+
+    // XR_EXT_display_zones composes XR_EXT_local_3d_zone + XR_EXT_view_rig.
+    if (g_hasDisplayZonesExt && (!g_hasLocal3DZoneExt || !xr.hasViewRigExt)) {
+        LOG_ERROR("XR_EXT_display_zones advertised without its prerequisites — zones path disabled");
+        g_hasDisplayZonesExt = false;
+    }
+    if (!g_hasDisplayZonesExt) {
+        LOG_ERROR("XR_EXT_display_zones NOT available — running as plain single-projection cube");
+    }
+
+    LOG_INFO("XR_EXT_cocoa_window_binding: %s", xr.hasCocoaWindowBinding ? "available" : "not available");
+    LOG_INFO("XR_EXT_display_info: %s", xr.hasDisplayInfoExt ? "available" : "not available");
+    LOG_INFO("XR_EXT_atlas_capture: %s", xr.hasAtlasCaptureExt ? "available" : "not available");
+    LOG_INFO("XR_EXT_view_rig: %s", xr.hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
+
+    // Build extension list
+    std::vector<const char*> enabledExtensions;
+    enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
+    if (xr.hasCocoaWindowBinding) {
+        enabledExtensions.push_back(XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME);
+    }
+    if (xr.hasDisplayInfoExt) {
+        enabledExtensions.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+    }
+    if (xr.hasAtlasCaptureExt) {
+        enabledExtensions.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
+    }
+    if (xr.hasViewRigExt) {
+        enabledExtensions.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
+    }
+    if (g_hasLocal3DZoneExt) {
+        enabledExtensions.push_back(XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME);
+    }
+    if (g_hasDisplayZonesExt) {
+        enabledExtensions.push_back(XR_EXT_DISPLAY_ZONES_EXTENSION_NAME);
+    }
+
+    XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
+    strncpy(createInfo.applicationInfo.applicationName, "VkCubeZonesMacOS", XR_MAX_APPLICATION_NAME_SIZE);
+    createInfo.applicationInfo.applicationVersion = 1;
+    createInfo.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
+    createInfo.enabledExtensionCount = (uint32_t)enabledExtensions.size();
+    createInfo.enabledExtensionNames = enabledExtensions.data();
+
+    XR_CHECK(xrCreateInstance(&createInfo, &xr.instance));
+    LOG_INFO("OpenXR instance created");
+
+    XrSystemGetInfo sysInfo = {XR_TYPE_SYSTEM_GET_INFO};
+    sysInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+    XR_CHECK(xrGetSystem(xr.instance, &sysInfo, &xr.systemId));
+    LOG_INFO("Got system ID: %llu", (unsigned long long)xr.systemId);
+
+    // Get system name
+    {
+        XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
+        if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sysProps))) {
+            memcpy(xr.systemName, sysProps.systemName, sizeof(xr.systemName));
+            LOG_INFO("System name: %s", xr.systemName);
+        }
+    }
+
+    // Query display info via XR_EXT_display_info
+    if (xr.hasDisplayInfoExt) {
+        XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
+        XrDisplayInfoEXT displayInfo = {};
+        displayInfo.type = XR_TYPE_DISPLAY_INFO_EXT;
+        XrEyeTrackingModeCapabilitiesEXT eyeCaps = {};
+        eyeCaps.type = (XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT;
+        displayInfo.next = &eyeCaps;
+        sysProps.next = &displayInfo;
+        if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sysProps))) {
+            xr.recommendedViewScaleX = displayInfo.recommendedViewScaleX;
+            xr.recommendedViewScaleY = displayInfo.recommendedViewScaleY;
+            xr.displayWidthM = displayInfo.displaySizeMeters.width;
+            xr.displayHeightM = displayInfo.displaySizeMeters.height;
+            xr.nominalViewerX = displayInfo.nominalViewerPositionInDisplaySpace.x;
+            xr.nominalViewerY = displayInfo.nominalViewerPositionInDisplaySpace.y;
+            xr.nominalViewerZ = displayInfo.nominalViewerPositionInDisplaySpace.z;
+            xr.displayPixelWidth = displayInfo.displayPixelWidth;
+            xr.displayPixelHeight = displayInfo.displayPixelHeight;
+            xr.supportedEyeTrackingModes = (uint32_t)eyeCaps.supportedModes;
+            xr.defaultEyeTrackingMode = (uint32_t)eyeCaps.defaultMode;
+            LOG_INFO("Display pixels: %ux%u", xr.displayPixelWidth, xr.displayPixelHeight);
+            LOG_INFO("Display info: %.3fx%.3f m, scale=%.2fx%.2f, nominal=(%.3f,%.3f,%.3f)",
+                xr.displayWidthM, xr.displayHeightM,
+                xr.recommendedViewScaleX, xr.recommendedViewScaleY,
+                xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ);
+            LOG_INFO("Eye tracking: supported=0x%x, default=%u",
+                xr.supportedEyeTrackingModes, xr.defaultEyeTrackingMode);
+        }
+
+        // Load display extension function pointers
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeEXT",
+            (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeEXT",
+            (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
+        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesEXT",
+            (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
+
+        // XR_EXT_atlas_capture (W6 of #396): resolve the runtime-owned capture entry.
+        if (xr.hasAtlasCaptureExt) {
+            xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasEXT",
+                (PFN_xrVoidFunction*)&xr.pfnCaptureAtlasEXT);
+            LOG_INFO("xrCaptureAtlasEXT: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
+        }
+
+        // Load eye tracking mode request function pointer
+        if (xr.supportedEyeTrackingModes != 0) {
+            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeEXT",
+                (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingModeEXT);
+        }
+    }
+
+    // XR_EXT_display_zones + XR_EXT_local_3d_zone entry points.
+    if (g_hasDisplayZonesExt) {
+        xrGetInstanceProcAddr(xr.instance, "xrGetDisplayZoneCapabilitiesEXT",
+            (PFN_xrVoidFunction*)&g_pfnGetZoneCaps);
+        xrGetInstanceProcAddr(xr.instance, "xrGetDisplayZoneRecommendedViewSizeEXT",
+            (PFN_xrVoidFunction*)&g_pfnGetZoneViewSize);
+        xrGetInstanceProcAddr(xr.instance, "xrCreateLocal3DZoneMaskEXT",
+            (PFN_xrVoidFunction*)&g_pfnCreateZoneMask);
+        xrGetInstanceProcAddr(xr.instance, "xrSetLocal3DZoneFromRectsEXT",
+            (PFN_xrVoidFunction*)&g_pfnSetZoneRects);
+        xrGetInstanceProcAddr(xr.instance, "xrDestroyLocal3DZoneMaskEXT",
+            (PFN_xrVoidFunction*)&g_pfnDestroyZoneMask);
+        if (g_pfnGetZoneCaps == nullptr || g_pfnGetZoneViewSize == nullptr) {
+            LOG_ERROR("XR_EXT_display_zones entry points unresolved — zones path disabled");
+            g_hasDisplayZonesExt = false;
+        }
+    }
+
+    uint32_t viewCount = 0;
+    XR_CHECK(xrEnumerateViewConfigurationViews(xr.instance, xr.systemId, xr.viewConfigType, 0, &viewCount, nullptr));
+    xr.configViews.resize(viewCount, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
+    XR_CHECK(xrEnumerateViewConfigurationViews(xr.instance, xr.systemId, xr.viewConfigType,
+        viewCount, &viewCount, xr.configViews.data()));
+
+    for (uint32_t i = 0; i < viewCount; i++) {
+        LOG_INFO("  View %u: %ux%u", i,
+            xr.configViews[i].recommendedImageRectWidth,
+            xr.configViews[i].recommendedImageRectHeight);
+    }
+
+    return true;
+}
+
+static bool GetVulkanGraphicsRequirements(AppXrSession& xr) {
+    PFN_xrGetVulkanGraphicsRequirementsKHR pfn = nullptr;
+    XR_CHECK(xrGetInstanceProcAddr(xr.instance, "xrGetVulkanGraphicsRequirementsKHR",
+        (PFN_xrVoidFunction*)&pfn));
+
+    XrGraphicsRequirementsVulkanKHR graphicsReq = {XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
+    XR_CHECK(pfn(xr.instance, xr.systemId, &graphicsReq));
+    return true;
+}
+
+static bool CreateVulkanInstance(AppXrSession& xr, VkInstance& vkInstance) {
+    PFN_xrGetVulkanInstanceExtensionsKHR pfn = nullptr;
+    XR_CHECK(xrGetInstanceProcAddr(xr.instance, "xrGetVulkanInstanceExtensionsKHR",
+        (PFN_xrVoidFunction*)&pfn));
+
+    uint32_t bufferSize = 0;
+    pfn(xr.instance, xr.systemId, 0, &bufferSize, nullptr);
+    std::string extensionsStr(bufferSize, '\0');
+    pfn(xr.instance, xr.systemId, bufferSize, &bufferSize, extensionsStr.data());
+
+    std::vector<std::string> extensionStorage;
+    std::vector<const char*> extensionPtrs;
+    size_t start = 0;
+    for (size_t i = 0; i <= extensionsStr.size(); i++) {
+        if (i == extensionsStr.size() || extensionsStr[i] == ' ' || extensionsStr[i] == '\0') {
+            if (i > start) {
+                extensionStorage.push_back(extensionsStr.substr(start, i - start));
+                extensionPtrs.push_back(extensionStorage.back().c_str());
+            }
+            start = i + 1;
+        }
+    }
+
+    // Check for portability enumeration
+    uint32_t availCount = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &availCount, nullptr);
+    std::vector<VkExtensionProperties> availExts(availCount);
+    vkEnumerateInstanceExtensionProperties(nullptr, &availCount, availExts.data());
+
+    bool hasPortabilityEnum = false;
+    for (const auto& e : availExts) {
+        if (strcmp(e.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0) {
+            hasPortabilityEnum = true;
+            extensionPtrs.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+            break;
+        }
+    }
+
+    VkApplicationInfo appInfo = {};
+    appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    appInfo.pApplicationName = "SimCubeExtMacOS";
+    appInfo.apiVersion = VK_API_VERSION_1_0;
+
+    VkInstanceCreateInfo createInfo = {};
+    createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    createInfo.pApplicationInfo = &appInfo;
+    createInfo.enabledExtensionCount = (uint32_t)extensionPtrs.size();
+    createInfo.ppEnabledExtensionNames = extensionPtrs.data();
+    if (hasPortabilityEnum) {
+        createInfo.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    }
+
+    VK_CHECK(vkCreateInstance(&createInfo, nullptr, &vkInstance));
+    LOG_INFO("Vulkan instance created");
+    return true;
+}
+
+static bool GetVulkanPhysicalDevice(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDevice& physDevice) {
+    PFN_xrGetVulkanGraphicsDeviceKHR pfn = nullptr;
+    XR_CHECK(xrGetInstanceProcAddr(xr.instance, "xrGetVulkanGraphicsDeviceKHR",
+        (PFN_xrVoidFunction*)&pfn));
+    XR_CHECK(pfn(xr.instance, xr.systemId, vkInstance, &physDevice));
+    g_physDevice = physDevice;
+
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(physDevice, &props);
+    LOG_INFO("Vulkan physical device: %s", props.deviceName);
+    return true;
+}
+
+static bool FindGraphicsQueueFamily(VkPhysicalDevice physDevice, uint32_t& queueFamilyIndex) {
+    uint32_t count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(physDevice, &count, nullptr);
+    std::vector<VkQueueFamilyProperties> families(count);
+    vkGetPhysicalDeviceQueueFamilyProperties(physDevice, &count, families.data());
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+            queueFamilyIndex = i;
+            return true;
+        }
+    }
+    LOG_ERROR("No graphics queue family found");
+    return false;
+}
+
+static bool GetVulkanDeviceExtensions(AppXrSession& xr,
+    std::vector<const char*>& deviceExtensions, std::vector<std::string>& extensionStorage,
+    VkPhysicalDevice physDevice)
+{
+    PFN_xrGetVulkanDeviceExtensionsKHR pfn = nullptr;
+    XR_CHECK(xrGetInstanceProcAddr(xr.instance, "xrGetVulkanDeviceExtensionsKHR",
+        (PFN_xrVoidFunction*)&pfn));
+
+    uint32_t bufferSize = 0;
+    pfn(xr.instance, xr.systemId, 0, &bufferSize, nullptr);
+    std::string extStr(bufferSize, '\0');
+    pfn(xr.instance, xr.systemId, bufferSize, &bufferSize, extStr.data());
+
+    // Enumerate available device extensions
+    uint32_t availCount = 0;
+    vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &availCount, nullptr);
+    std::vector<VkExtensionProperties> availExts(availCount);
+    vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &availCount, availExts.data());
+
+    auto isAvailable = [&](const char *name) -> bool {
+        for (const auto& e : availExts) {
+            if (strcmp(e.extensionName, name) == 0) return true;
+        }
+        return false;
+    };
+
+    // Phase 1: Build extensionStorage (all strings) first to avoid
+    // dangling c_str() pointers from vector reallocation.
+    extensionStorage.clear();
+    size_t start = 0;
+    for (size_t i = 0; i <= extStr.size(); i++) {
+        if (i == extStr.size() || extStr[i] == ' ' || extStr[i] == '\0') {
+            if (i > start) {
+                std::string ext = extStr.substr(start, i - start);
+                if (isAvailable(ext.c_str())) {
+                    extensionStorage.push_back(ext);
+                } else {
+                    LOG_WARN("  Device ext UNAVAILABLE (skipping): %s", ext.c_str());
+                }
+            }
+            start = i + 1;
+        }
+    }
+
+    // Add optional extensions if available
+    for (const auto& e : availExts) {
+        if (strcmp(e.extensionName, "VK_KHR_portability_subset") == 0) {
+            extensionStorage.push_back("VK_KHR_portability_subset");
+        }
+        if (strcmp(e.extensionName, VK_KHR_MAINTENANCE1_EXTENSION_NAME) == 0) {
+            extensionStorage.push_back(VK_KHR_MAINTENANCE1_EXTENSION_NAME);
+        }
+    }
+
+    // Phase 2: Build deviceExtensions pointers from final extensionStorage
+    // (safe now since extensionStorage won't be modified again)
+    for (const auto& name : extensionStorage) {
+        deviceExtensions.push_back(name.c_str());
+        LOG_INFO("  Device ext: %s", name.c_str());
+    }
+
+    return true;
+}
+
+static bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamilyIndex,
+    const std::vector<const char*>& deviceExtensions, VkDevice& device, VkQueue& graphicsQueue)
+{
+    float queuePriority = 1.0f;
+    VkDeviceQueueCreateInfo queueInfo = {};
+    queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    queueInfo.queueFamilyIndex = queueFamilyIndex;
+    queueInfo.queueCount = 1;
+    queueInfo.pQueuePriorities = &queuePriority;
+
+    VkDeviceCreateInfo createInfo = {};
+    createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    createInfo.queueCreateInfoCount = 1;
+    createInfo.pQueueCreateInfos = &queueInfo;
+    createInfo.enabledExtensionCount = (uint32_t)deviceExtensions.size();
+    createInfo.ppEnabledExtensionNames = deviceExtensions.data();
+
+    VK_CHECK(vkCreateDevice(physDevice, &createInfo, nullptr, &device));
+    vkGetDeviceQueue(device, queueFamilyIndex, 0, &graphicsQueue);
+    LOG_INFO("Vulkan device created");
+    return true;
+}
+
+/*!
+ * Create OpenXR session WITH the cocoa_window_binding extension.
+ * Chains XrCocoaWindowBindingCreateInfoEXT into session create info.
+ */
+static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDevice physDevice,
+    VkDevice device, uint32_t queueFamilyIndex)
+{
+    LOG_INFO("Creating OpenXR session with Vulkan binding + macOS window binding...");
+
+    XrGraphicsBindingVulkanKHR vkBinding = {XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
+    vkBinding.instance = vkInstance;
+    vkBinding.physicalDevice = physDevice;
+    vkBinding.device = device;
+    vkBinding.queueFamilyIndex = queueFamilyIndex;
+    vkBinding.queueIndex = 0;
+
+    // Chain the macOS window binding extension — pass our NSView to the runtime
+    XrCocoaWindowBindingCreateInfoEXT macosBinding = {};
+    macosBinding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT;
+    macosBinding.next = nullptr;
+    macosBinding.viewHandle = (__bridge void *)g_metalView;
+
+    // Optional transparent-background mode (spec v5). Pairs with the
+    // RGBA(0,0,0,0) clear above so alpha<1 regions show the desktop.
+    {
+        // DEFAULT ON for the zones demo: zones alpha-composite against the
+        // desktop by design. Opt out with DISPLAYXR_TRANSPARENT_BG=0.
+        const char *e = getenv("DISPLAYXR_TRANSPARENT_BG");
+        if (e == nullptr || *e != '0') {
+            macosBinding.transparentBackgroundEnabled = XR_TRUE;
+            // Make our app-owned NSWindow non-opaque too — the runtime configures
+            // the CAMetalLayer it presents into, but the NSWindow alpha is ours.
+            if (g_window != nil) {
+                [g_window setOpaque:NO];
+                [g_window setBackgroundColor:[NSColor clearColor]];
+            }
+            LOG_INFO("Transparent background ENABLED (zones default; DISPLAYXR_TRANSPARENT_BG=0 to opt out)");
+        }
+    }
+
+    // Chain: sessionInfo -> vkBinding -> macosBinding
+    if (xr.hasCocoaWindowBinding) {
+        vkBinding.next = &macosBinding;
+        LOG_INFO("Chaining XR_EXT_cocoa_window_binding with NSView %p", macosBinding.viewHandle);
+    }
+
+    XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
+    sessionInfo.next = &vkBinding;
+    sessionInfo.systemId = xr.systemId;
+
+    XR_CHECK(xrCreateSession(xr.instance, &sessionInfo, &xr.session));
+    LOG_INFO("Session created%s", xr.hasCocoaWindowBinding ? " (with external window)" : "");
+
+    // Enumerate available rendering modes and store names
+    if (xr.pfnEnumerateDisplayRenderingModesEXT && xr.session != XR_NULL_HANDLE) {
+        uint32_t modeCount = 0;
+        XrResult enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, 0, &modeCount, nullptr);
+        if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
+            std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
+            for (uint32_t i = 0; i < modeCount; i++) {
+                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+                modes[i].next = nullptr;
+            }
+            enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, modeCount, &modeCount, modes.data());
+            if (XR_SUCCEEDED(enumRes)) {
+                xr.renderingModeCount = modeCount > 8 ? 8 : modeCount;
+                LOG_INFO("Display rendering modes (%u):", modeCount);
+                for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
+                    strncpy(xr.renderingModeNames[i], modes[i].modeName, XR_MAX_SYSTEM_NAME_SIZE - 1);
+                    xr.renderingModeNames[i][XR_MAX_SYSTEM_NAME_SIZE - 1] = '\0';
+                    xr.renderingModeViewCounts[i] = modes[i].viewCount;
+                    xr.renderingModeTileColumns[i] = modes[i].tileColumns;
+                    xr.renderingModeTileRows[i] = modes[i].tileRows;
+                    xr.renderingModeScaleX[i] = modes[i].viewScaleX;
+                    xr.renderingModeScaleY[i] = modes[i].viewScaleY;
+                    xr.renderingModeDisplay3D[i] = modes[i].hardwareDisplay3D ? true : false;
+                    xr.renderingModeIsRequestable[i] = modes[i].isRequestable ? true : false;
+                    // v13 initial-mode-sync: trust runtime-reported active mode.
+                    if (modes[i].isActive) {
+                        xr.currentModeIndex = modes[i].modeIndex;
+                    }
+                    LOG_INFO("  [%u] %s (views=%u, tiles=%ux%u, scale=%.2fx%.2f, 3D=%s)",
+                        modes[i].modeIndex, modes[i].modeName,
+                        modes[i].viewCount, modes[i].tileColumns, modes[i].tileRows,
+                        modes[i].viewScaleX, modes[i].viewScaleY,
+                        modes[i].hardwareDisplay3D ? "yes" : "no");
+                }
+                g_input.renderingModeCount = xr.renderingModeCount;
+            }
+        }
+    }
+
+    return true;
+}
+
+static bool CreateSpaces(AppXrSession& xr) {
+    XrReferenceSpaceCreateInfo localSpaceInfo = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+    localSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    localSpaceInfo.poseInReferenceSpace.orientation = {0, 0, 0, 1};
+    localSpaceInfo.poseInReferenceSpace.position = {0, 0, 0};
+    XR_CHECK(xrCreateReferenceSpace(xr.session, &localSpaceInfo, &xr.localSpace));
+
+    XrReferenceSpaceCreateInfo viewSpaceInfo = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+    viewSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+    viewSpaceInfo.poseInReferenceSpace.orientation = {0, 0, 0, 1};
+    viewSpaceInfo.poseInReferenceSpace.position = {0, 0, 0};
+    XR_CHECK(xrCreateReferenceSpace(xr.session, &viewSpaceInfo, &xr.viewSpace));
+
+    LOG_INFO("Reference spaces created");
+    return true;
+}
+
+static bool CreateSwapchains(AppXrSession& xr) {
+    uint32_t formatCount = 0;
+    XR_CHECK(xrEnumerateSwapchainFormats(xr.session, 0, &formatCount, nullptr));
+    std::vector<int64_t> formats(formatCount);
+    XR_CHECK(xrEnumerateSwapchainFormats(xr.session, formatCount, &formatCount, formats.data()));
+
+    int64_t selectedFormat = formats[0];
+    LOG_INFO("Selected swapchain format: %lld", (long long)selectedFormat);
+
+    // Single SBS swapchain at native display resolution
+    uint32_t scWidth = xr.displayPixelWidth;
+    uint32_t scHeight = xr.displayPixelHeight;
+    if (scWidth == 0 || scHeight == 0) {
+        scWidth = xr.configViews[0].recommendedImageRectWidth * 2;
+        scHeight = xr.configViews[0].recommendedImageRectHeight;
+    }
+    // Cap at max
+    if (scWidth > xr.configViews[0].maxImageRectWidth) scWidth = xr.configViews[0].maxImageRectWidth;
+    if (scHeight > xr.configViews[0].maxImageRectHeight) scHeight = xr.configViews[0].maxImageRectHeight;
+
+    XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    swapchainInfo.format = selectedFormat;
+    swapchainInfo.sampleCount = 1;
+    swapchainInfo.width = scWidth;
+    swapchainInfo.height = scHeight;
+    swapchainInfo.faceCount = 1;
+    swapchainInfo.arraySize = 1;
+    swapchainInfo.mipCount = 1;
+
+    XR_CHECK(xrCreateSwapchain(xr.session, &swapchainInfo, &xr.swapchain.swapchain));
+    xr.swapchain.format = selectedFormat;
+    xr.swapchain.width = scWidth;
+    xr.swapchain.height = scHeight;
+
+    uint32_t imageCount = 0;
+    XR_CHECK(xrEnumerateSwapchainImages(xr.swapchain.swapchain, 0, &imageCount, nullptr));
+    xr.swapchain.imageCount = imageCount;
+    LOG_INFO("Swapchain: %ux%u, %u images", scWidth, scHeight, imageCount);
+
+    return true;
+}
+
+static bool PollEvents(AppXrSession& xr) {
+    XrEventDataBuffer event = {XR_TYPE_EVENT_DATA_BUFFER};
+    while (xrPollEvent(xr.instance, &event) == XR_SUCCESS) {
+        switch (event.type) {
+        case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
+            auto* stateEvent = (XrEventDataSessionStateChanged*)&event;
+            xr.sessionState = stateEvent->state;
+
+            switch (xr.sessionState) {
+            case XR_SESSION_STATE_READY: {
+                XrSessionBeginInfo beginInfo = {XR_TYPE_SESSION_BEGIN_INFO};
+                beginInfo.primaryViewConfigurationType = xr.viewConfigType;
+                if (XR_SUCCEEDED(xrBeginSession(xr.session, &beginInfo))) {
+                    xr.sessionRunning = true;
+                    LOG_INFO("Session running");
+                }
+                break;
+            }
+            case XR_SESSION_STATE_STOPPING:
+                xrEndSession(xr.session);
+                xr.sessionRunning = false;
+                break;
+            case XR_SESSION_STATE_EXITING:
+            case XR_SESSION_STATE_LOSS_PENDING:
+                xr.exitRequested = true;
+                break;
+            default:
+                break;
+            }
+            break;
+        }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT: {
+            auto* modeEvent = (XrEventDataRenderingModeChangedEXT*)&event;
+            LOG_INFO("Rendering mode changed: %u -> %u",
+                modeEvent->previousModeIndex, modeEvent->currentModeIndex);
+            xr.currentModeIndex = modeEvent->currentModeIndex;
+            break;
+        }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT: {
+            // Edge-triggered tracking loss/recovery (#441 v14); HUD state
+            // also refreshes per-frame from the XrViewEyeTrackingStateEXT chain.
+            auto* etEvent = (XrEventDataEyeTrackingStateChangedEXT*)&event;
+            LOG_INFO("Eye tracking state changed: isTracking=%s mode=%u",
+                etEvent->isTracking == XR_TRUE ? "YES" : "NO",
+                (uint32_t)etEvent->activeMode);
+            xr.isEyeTracking = (etEvent->isTracking == XR_TRUE);
+            break;
+        }
+        default:
+            break;
+        }
+        event = {XR_TYPE_EVENT_DATA_BUFFER};
+    }
+    return true;
+}
+
+static bool BeginFrame(AppXrSession& xr, XrFrameState& frameState) {
+    frameState = {XR_TYPE_FRAME_STATE};
+    XrFrameWaitInfo waitInfo = {XR_TYPE_FRAME_WAIT_INFO};
+    XrResult result = xrWaitFrame(xr.session, &waitInfo, &frameState);
+    if (XR_FAILED(result)) { xr.exitRequested = true; return false; }
+
+    XrFrameBeginInfo beginInfo = {XR_TYPE_FRAME_BEGIN_INFO};
+    result = xrBeginFrame(xr.session, &beginInfo);
+    if (XR_FAILED(result)) return false;
+    return true;
+}
+
+static bool AcquireSwapchainImage(AppXrSession& xr, uint32_t& imageIndex) {
+    XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    XrResult result = xrAcquireSwapchainImage(xr.swapchain.swapchain, &acquireInfo, &imageIndex);
+    if (XR_FAILED(result)) return false;
+
+    XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    waitInfo.timeout = XR_INFINITE_DURATION;
+    result = xrWaitSwapchainImage(xr.swapchain.swapchain, &waitInfo);
+    if (XR_FAILED(result)) {
+        XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        xrReleaseSwapchainImage(xr.swapchain.swapchain, &releaseInfo);
+        return false;
+    }
+    return true;
+}
+
+static bool ReleaseSwapchainImage(AppXrSession& xr) {
+    XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    return XR_SUCCEEDED(xrReleaseSwapchainImage(xr.swapchain.swapchain, &releaseInfo));
+}
+
+// Vulkan-side state for the HUD upload path. Created once after we have
+// the device + queue + command pool; reused every frame the HUD is visible.
+struct HudVkUploader {
+    VkDevice device = VK_NULL_HANDLE;
+    VkPhysicalDevice physDevice = VK_NULL_HANDLE;
+    VkQueue queue = VK_NULL_HANDLE;
+    VkCommandPool cmdPool = VK_NULL_HANDLE;
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    uint8_t* stagingMapped = nullptr;
+    VkDeviceSize stagingSize = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+
+// Pull the helper from the renderer.cpp-style pattern used elsewhere in this
+// file (line 689 area). Defined here so we don't have to reorder the file.
+static bool VkFindMemoryTypeForHud(VkPhysicalDevice phys, uint32_t typeBits,
+                                   VkMemoryPropertyFlags props, uint32_t* outIndex) {
+    VkPhysicalDeviceMemoryProperties memProps;
+    vkGetPhysicalDeviceMemoryProperties(phys, &memProps);
+    for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
+        if ((typeBits & (1u << i)) &&
+            (memProps.memoryTypes[i].propertyFlags & props) == props) {
+            *outIndex = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool InitializeHudVkUploader(HudVkUploader& up,
+    VkDevice device, VkPhysicalDevice phys, VkQueue queue, VkCommandPool pool,
+    uint32_t width, uint32_t height)
+{
+    up.device = device;
+    up.physDevice = phys;
+    up.queue = queue;
+    up.cmdPool = pool;
+    up.width = width;
+    up.height = height;
+    up.stagingSize = (VkDeviceSize)width * (VkDeviceSize)height * 4;
+
+    VkBufferCreateInfo bi = {};
+    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bi.size = up.stagingSize;
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(device, &bi, nullptr, &up.stagingBuffer) != VK_SUCCESS) return false;
+
+    VkMemoryRequirements memReqs;
+    vkGetBufferMemoryRequirements(device, up.stagingBuffer, &memReqs);
+    uint32_t memType = 0;
+    if (!VkFindMemoryTypeForHud(phys, memReqs.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &memType)) {
+        return false;
+    }
+    VkMemoryAllocateInfo ai = {};
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.allocationSize = memReqs.size;
+    ai.memoryTypeIndex = memType;
+    if (vkAllocateMemory(device, &ai, nullptr, &up.stagingMemory) != VK_SUCCESS) return false;
+    if (vkBindBufferMemory(device, up.stagingBuffer, up.stagingMemory, 0) != VK_SUCCESS) return false;
+    if (vkMapMemory(device, up.stagingMemory, 0, up.stagingSize, 0, (void**)&up.stagingMapped) != VK_SUCCESS) return false;
+    return true;
+}
+
+static void CleanupHudVkUploader(HudVkUploader& up) {
+    if (up.stagingMapped) { vkUnmapMemory(up.device, up.stagingMemory); up.stagingMapped = nullptr; }
+    if (up.stagingMemory) { vkFreeMemory(up.device, up.stagingMemory, nullptr); up.stagingMemory = VK_NULL_HANDLE; }
+    if (up.stagingBuffer) { vkDestroyBuffer(up.device, up.stagingBuffer, nullptr); up.stagingBuffer = VK_NULL_HANDLE; }
+}
+
+// Upload CPU pixels into a HUD swapchain image. Transitions UNDEFINED →
+// TRANSFER_DST_OPTIMAL → SHADER_READ_ONLY_OPTIMAL on release. The runtime's
+// vk_native compositor expects the image in SHADER_READ_ONLY_OPTIMAL layout
+// after xrReleaseSwapchainImage so it can sample from it.
+static bool UploadHudPixels(HudVkUploader& up, VkImage hudImage,
+                            const void* pixels, uint32_t rowPitch)
+{
+    if (rowPitch == up.width * 4) {
+        memcpy(up.stagingMapped, pixels, up.stagingSize);
+    } else {
+        const uint8_t* src = (const uint8_t*)pixels;
+        for (uint32_t y = 0; y < up.height; y++) {
+            memcpy(up.stagingMapped + (size_t)y * up.width * 4,
+                   src + (size_t)y * rowPitch,
+                   up.width * 4);
+        }
+    }
+
+    VkCommandBufferAllocateInfo ca = {};
+    ca.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    ca.commandPool = up.cmdPool;
+    ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ca.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(up.device, &ca, &cmd) != VK_SUCCESS) return false;
+
+    VkCommandBufferBeginInfo bi = {};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+
+    VkImageMemoryBarrier b = {};
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = hudImage;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b.srcAccessMask = 0;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &b);
+
+    VkBufferImageCopy region = {};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {up.width, up.height, 1};
+    vkCmdCopyBufferToImage(cmd, up.stagingBuffer, hudImage,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &b);
+
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si = {};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkQueueSubmit(up.queue, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(up.queue);
+    vkFreeCommandBuffers(up.device, up.cmdPool, 1, &cmd);
+    return true;
+}
+
+static bool EndFrame(AppXrSession& xr, XrTime displayTime,
+    const XrCompositionLayerProjectionView* views, uint32_t viewCount = 2) {
+    XrCompositionLayerProjection projectionLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    projectionLayer.space = xr.localSpace;
+    projectionLayer.viewCount = viewCount;
+    projectionLayer.views = views;
+
+    const XrCompositionLayerBaseHeader* layers[] = {
+        (XrCompositionLayerBaseHeader*)&projectionLayer
+    };
+
+    XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
+    endInfo.displayTime = displayTime;
+    endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    endInfo.layerCount = 1;
+    endInfo.layers = layers;
+    return XR_SUCCEEDED(xrEndFrame(xr.session, &endInfo));
+}
+
+static void CleanupOpenXR(AppXrSession& xr) {
+    if (xr.swapchain.swapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(xr.swapchain.swapchain);
+    }
+    if (xr.viewSpace != XR_NULL_HANDLE) xrDestroySpace(xr.viewSpace);
+    if (xr.localSpace != XR_NULL_HANDLE) xrDestroySpace(xr.localSpace);
+    if (xr.session != XR_NULL_HANDLE) xrDestroySession(xr.session);
+    if (xr.instance != XR_NULL_HANDLE) xrDestroyInstance(xr.instance);
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+static void SignalHandler(int sig) {
+    (void)sig;
+    g_running = false;
+}
+
+// ============================================================================
+// XR_EXT_display_zones helpers (ADR-027) — clear-based zones
+// ============================================================================
+
+// One-shot graphics-queue submit clearing a whole VK image to `color` and
+// leaving it in COLOR_ATTACHMENT_OPTIMAL (the steady-state layout the
+// compositor's zone pass transitions from). oldLayout UNDEFINED is always
+// valid here — the clear overwrites every pixel.
+static void ClearImageToColor(VkDevice device, VkCommandPool pool, VkQueue queue,
+                              VkImage image, const float color[4])
+{
+    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = pool;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(device, &ai, &cmd) != VK_SUCCESS) {
+        return;
+    }
+
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+
+    VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    VkClearColorValue cv;
+    for (int i = 0; i < 4; i++) {
+        cv.float32[i] = color[i];
+    }
+    VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cv, 1, &range);
+
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue);
+    vkFreeCommandBuffers(device, pool, 1, &cmd);
+}
+
+// Create one zone's swapchain, sized per xrGetDisplayZoneRecommendedViewSizeEXT,
+// horizontally tiled per view, and enumerate its VK images.
+static bool CreateZoneResources(AppXrSession& xr, DisplayZone& z, uint32_t viewCount)
+{
+    XrExtent2Di rec = {};
+    XrResult r = g_pfnGetZoneViewSize(xr.session, &z.rect, &rec);
+    if (XR_FAILED(r) || rec.width <= 0 || rec.height <= 0) {
+        LOG_ERROR("[zones] zone %u: xrGetDisplayZoneRecommendedViewSizeEXT failed (0x%x, %dx%d)",
+                  z.zoneId, (unsigned)r, rec.width, rec.height);
+        return false;
+    }
+    z.tileW = (uint32_t)rec.width;
+    z.tileH = (uint32_t)rec.height;
+    z.tileCount = viewCount;
+
+    XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+                     XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    sci.format = xr.swapchain.format;
+    sci.sampleCount = 1;
+    sci.width = z.tileW * z.tileCount;
+    sci.height = z.tileH;
+    sci.faceCount = 1;
+    sci.arraySize = 1;
+    sci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(xr.session, &sci, &z.swapchain))) {
+        LOG_ERROR("[zones] zone %u: xrCreateSwapchain failed (%ux%u)", z.zoneId, sci.width, sci.height);
+        return false;
+    }
+
+    uint32_t n = 0;
+    xrEnumerateSwapchainImages(z.swapchain, 0, &n, nullptr);
+    std::vector<XrSwapchainImageVulkanKHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+    if (n == 0 || XR_FAILED(xrEnumerateSwapchainImages(z.swapchain, n, &n,
+                                                       (XrSwapchainImageBaseHeader*)imgs.data()))) {
+        LOG_ERROR("[zones] zone %u: xrEnumerateSwapchainImages failed", z.zoneId);
+        return false;
+    }
+    z.images.resize(n);
+    for (uint32_t i = 0; i < n; i++) {
+        z.images[i] = imgs[i].image;
+    }
+
+    LOG_INFO("[zones] zone %u: rect %d,%d %dx%d -> swapchain %ux%u (%u tiles of %ux%u)",
+             z.zoneId, z.rect.offset.x, z.rect.offset.y, z.rect.extent.width, z.rect.extent.height,
+             z.tileW * z.tileCount, z.tileH, z.tileCount, z.tileW, z.tileH);
+    return true;
+}
+
+// Create the always-on Local2D strip and fill it once with solid amber.
+static bool CreateAndFillStrip(AppXrSession& xr, VkDevice device, VkCommandPool pool, VkQueue queue)
+{
+    const uint32_t w = (uint32_t)g_stripRect.extent.width;
+    const uint32_t h = (uint32_t)g_stripRect.extent.height;
+    if (w == 0 || h == 0) {
+        return false;
+    }
+
+    XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+                     XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    sci.format = xr.swapchain.format;
+    sci.sampleCount = 1;
+    sci.width = w;
+    sci.height = h;
+    sci.faceCount = 1;
+    sci.arraySize = 1;
+    sci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(xr.session, &sci, &g_strip.swapchain))) {
+        LOG_ERROR("[zones] strip: xrCreateSwapchain failed");
+        return false;
+    }
+    g_strip.w = w;
+    g_strip.h = h;
+
+    uint32_t n = 0;
+    xrEnumerateSwapchainImages(g_strip.swapchain, 0, &n, nullptr);
+    std::vector<XrSwapchainImageVulkanKHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+    if (n == 0 || XR_FAILED(xrEnumerateSwapchainImages(g_strip.swapchain, n, &n,
+                                                       (XrSwapchainImageBaseHeader*)imgs.data()))) {
+        LOG_ERROR("[zones] strip: xrEnumerateSwapchainImages failed");
+        return false;
+    }
+
+    XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    uint32_t idx = 0;
+    if (XR_FAILED(xrAcquireSwapchainImage(g_strip.swapchain, &ai, &idx))) {
+        return false;
+    }
+    XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = XR_INFINITE_DURATION;
+    xrWaitSwapchainImage(g_strip.swapchain, &wi);
+
+    const float amber[4] = {1.0f, 0.667f, 0.0f, 1.0f};
+    ClearImageToColor(device, pool, queue, imgs[idx].image, amber);
+
+    XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(g_strip.swapchain, &ri);
+    return true;
+}
+
+static bool EnsureWishMask(AppXrSession& xr)
+{
+    if (g_zoneMask != XR_NULL_HANDLE) return true;
+    if (g_pfnCreateZoneMask == nullptr) return false;
+    XrLocal3DZoneMaskCreateInfoEXT mci = {(XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_EXT};
+    mci.maskWidth = 0; // runtime picks the window backing size
+    mci.maskHeight = 0;
+    XrResult r = g_pfnCreateZoneMask(xr.session, &mci, &g_zoneMask);
+    if (XR_FAILED(r)) {
+        LOG_ERROR("[zones] xrCreateLocal3DZoneMaskEXT failed (0x%x)", (unsigned)r);
+        g_zoneMask = XR_NULL_HANDLE;
+        return false;
+    }
+    LOG_INFO("[zones] wish mask created (window backing size)");
+    return true;
+}
+
+static void ApplyWishAuthoring(AppXrSession& xr)
+{
+    if (g_wishMode == 1) {
+        if (!EnsureWishMask(xr) || g_pfnSetZoneRects == nullptr) return;
+        XrRect2Di rects[kNumZones];
+        for (uint32_t zi = 0; zi < kNumZones; zi++) rects[zi] = g_zonesArr[zi].rect;
+        XrResult r = g_pfnSetZoneRects(g_zoneMask, kNumZones, rects);
+        if (XR_FAILED(r)) {
+            LOG_ERROR("[zones] xrSetLocal3DZoneFromRectsEXT failed (0x%x)", (unsigned)r);
+        }
+    }
+}
+
+static const char* WishModeName(int mode)
+{
+    return mode == 1 ? "explicit Tier-2 rects" : "AUTO";
+}
+
+// Edge-triggered M (wish mode cycle) + O (zone B overlap toggle).
+static void HandleZoneKeys(AppXrSession& xr)
+{
+    if (g_wishModeCycleRequested) {
+        g_wishModeCycleRequested = false;
+        g_wishMode = (g_wishMode + 1) % 2;
+        LOG_INFO("[zones] wish mode %d (%s)", g_wishMode, WishModeName(g_wishMode));
+        ApplyWishAuthoring(xr);
+    }
+    if (g_overlapToggleRequested) {
+        g_overlapToggleRequested = false;
+        g_zoneBOverlap = !g_zoneBOverlap;
+        g_zonesArr[1].rect = g_zoneBOverlap ? g_zoneBOverlapRect : g_zoneBRect;
+        LOG_INFO("[zones] zone B rect -> %d,%d %dx%d (%s zone A)",
+                 g_zonesArr[1].rect.offset.x, g_zonesArr[1].rect.offset.y,
+                 g_zonesArr[1].rect.extent.width, g_zonesArr[1].rect.extent.height,
+                 g_zoneBOverlap ? "OVERLAPPING" : "beside");
+        ApplyWishAuthoring(xr);
+    }
+}
+
+// One-time zones activation: capabilities check + per-zone swapchains + strip.
+static void TryActivateZones(AppXrSession& xr, VkDevice device, VkCommandPool pool, VkQueue queue)
+{
+    const int32_t W = (int32_t)g_windowW;
+    const int32_t H = (int32_t)g_windowH;
+    if (W <= 0 || H <= 0) {
+        return; // window metrics not settled — retry next frame
+    }
+    g_zonesAttempted = true;
+
+    XrDisplayZoneCapabilitiesEXT caps = {XR_TYPE_DISPLAY_ZONE_CAPABILITIES_EXT};
+    XrResult r = g_pfnGetZoneCaps(xr.session, &caps);
+    if (XR_FAILED(r) || !caps.supported) {
+        LOG_ERROR("[zones] xrGetDisplayZoneCapabilitiesEXT: rc=0x%x supported=%d — zones path disabled",
+                  (unsigned)r, (int)caps.supported);
+        g_hasDisplayZonesExt = false;
+        return;
+    }
+    if (caps.maxZones3D < kNumZones) {
+        LOG_ERROR("[zones] maxZones3D=%u < %u — zones path disabled", caps.maxZones3D, kNumZones);
+        g_hasDisplayZonesExt = false;
+        return;
+    }
+    LOG_INFO("[zones] capabilities: supported=1 maxZones3D=%u", caps.maxZones3D);
+
+    // D3D11/Metal zones-app proportions of the window backing size.
+    g_stripRect        = {{0, 0}, {W, H / 4}};
+    g_zoneARect        = {{0, H / 4}, {W / 2, H * 3 / 4}};
+    g_zoneBRect        = {{W * 700 / 1280, H / 4}, {W * 520 / 1280, H / 2}};
+    g_zoneBOverlapRect = {{W * 400 / 1280, H * 300 / 720}, {W * 520 / 1280, H / 2}};
+
+    uint32_t viewCount = 2;
+    if (xr.renderingModeCount > 0 && xr.currentModeIndex < xr.renderingModeCount) {
+        viewCount = xr.renderingModeViewCounts[xr.currentModeIndex];
+    }
+    if (viewCount < 1) viewCount = 1;
+    if (viewCount > 8) viewCount = 8;
+
+    // Zone A: opaque dark red. Zone B: SEMI-TRANSPARENT dark blue
+    // (premultiplied, alpha 0.55) — overlap oracle: B + A*(1-0.55).
+    g_zonesArr[0].zoneId = 1;
+    g_zonesArr[0].rect = g_zoneARect;
+    g_zonesArr[0].ipdFactor = 1.0f;
+    g_zonesArr[0].perspectiveFactor = 1.0f;
+    g_zonesArr[0].clearColor[0] = 0.15f;
+    g_zonesArr[0].clearColor[1] = 0.03f;
+    g_zonesArr[0].clearColor[2] = 0.03f;
+    g_zonesArr[0].clearColor[3] = 1.0f;
+
+    g_zonesArr[1].zoneId = 2;
+    g_zonesArr[1].rect = g_zoneBOverlap ? g_zoneBOverlapRect : g_zoneBRect;
+    g_zonesArr[1].ipdFactor = 0.6f;
+    g_zonesArr[1].perspectiveFactor = 0.5f;
+    g_zonesArr[1].clearColor[0] = 0.03f * 0.55f;
+    g_zonesArr[1].clearColor[1] = 0.03f * 0.55f;
+    g_zonesArr[1].clearColor[2] = 0.15f * 0.55f;
+    g_zonesArr[1].clearColor[3] = 0.55f;
+
+    for (uint32_t zi = 0; zi < kNumZones; zi++) {
+        if (!CreateZoneResources(xr, g_zonesArr[zi], viewCount)) {
+            g_hasDisplayZonesExt = false;
+            return;
+        }
+    }
+    if (!CreateAndFillStrip(xr, device, pool, queue)) {
+        g_hasDisplayZonesExt = false;
+        return;
+    }
+
+    g_zonesActive = true;
+    g_input.hudVisible = false; // keep the layer list zones-only
+    if (g_wishMode == 1) {
+        ApplyWishAuthoring(xr);
+    }
+    LOG_INFO("[zones] ACTIVE: zone A %d,%d %dx%d + zone B %d,%d %dx%d + strip %d,%d %dx%d "
+             "(views=%u, wish mode %d %s, validate=%d) — M=wish mode, O=overlap toggle",
+             g_zoneARect.offset.x, g_zoneARect.offset.y, g_zoneARect.extent.width, g_zoneARect.extent.height,
+             g_zonesArr[1].rect.offset.x, g_zonesArr[1].rect.offset.y,
+             g_zonesArr[1].rect.extent.width, g_zonesArr[1].rect.extent.height,
+             g_stripRect.offset.x, g_stripRect.offset.y, g_stripRect.extent.width, g_stripRect.extent.height,
+             viewCount, g_wishMode, WishModeName(g_wishMode), ZonesValidateEnabled() ? 1 : 0);
+}
+
+// Per-frame zones path: zone-scoped locate, per-zone solid clear, submit
+// [projA, projB, strip] with the zone structs chained on the projections.
+static void RenderZonesFrame(AppXrSession& xr, VkDevice device, VkCommandPool pool, VkQueue queue,
+                             const XrFrameState& frameState)
+{
+    XrDisplayZoneEXT zoneStructs[kNumZones];
+    XrDisplayRigEXT rigStructs[kNumZones];
+    std::vector<XrCompositionLayerProjectionView> projViews[kNumZones];
+    uint32_t submitViewCounts[kNumZones] = {};
+
+    for (uint32_t zi = 0; zi < kNumZones; zi++) {
+        DisplayZone& z = g_zonesArr[zi];
+
+        rigStructs[zi] = {XR_TYPE_DISPLAY_RIG_EXT};
+        rigStructs[zi].pose = {{0, 0, 0, 1}, {0, 0, 0}};
+        rigStructs[zi].virtualDisplayHeight = kZoneVirtualDisplayHeight;
+        rigStructs[zi].ipdFactor = z.ipdFactor;
+        rigStructs[zi].parallaxFactor = 1.0f;
+        rigStructs[zi].perspectiveFactor = z.perspectiveFactor;
+
+        zoneStructs[zi] = {XR_TYPE_DISPLAY_ZONE_EXT};
+        zoneStructs[zi].next = &rigStructs[zi];
+        zoneStructs[zi].zoneId = z.zoneId;
+        zoneStructs[zi].rect = z.rect;
+
+        XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
+        locateInfo.next = &zoneStructs[zi];
+        locateInfo.viewConfigurationType = xr.viewConfigType;
+        locateInfo.displayTime = frameState.predictedDisplayTime;
+        locateInfo.space = xr.localSpace;
+
+        XrViewState viewState = {XR_TYPE_VIEW_STATE};
+        uint32_t viewCountOutput = 0;
+        XrView zoneViews[8];
+        for (uint32_t vi = 0; vi < 8; vi++) zoneViews[vi] = {XR_TYPE_VIEW};
+        XrResult lr = xrLocateViews(xr.session, &locateInfo, &viewState, 8, &viewCountOutput, zoneViews);
+        if (XR_FAILED(lr) || viewCountOutput == 0) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LOG_WARN("[zones] zone %u zone-scoped xrLocateViews failed (0x%x)", z.zoneId, (unsigned)lr);
+            }
+            submitViewCounts[zi] = 0;
+            continue;
+        }
+
+        const uint32_t n = viewCountOutput < z.tileCount ? viewCountOutput : z.tileCount;
+        submitViewCounts[zi] = n;
+        projViews[zi].assign(n, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+        for (uint32_t vi = 0; vi < n; vi++) {
+            projViews[zi][vi].subImage.swapchain = z.swapchain;
+            projViews[zi][vi].subImage.imageRect.offset = {(int32_t)(vi * z.tileW), 0};
+            projViews[zi][vi].subImage.imageRect.extent = {(int32_t)z.tileW, (int32_t)z.tileH};
+            projViews[zi][vi].subImage.imageArrayIndex = 0;
+            projViews[zi][vi].pose = zoneViews[vi].pose;
+            projViews[zi][vi].fov = zoneViews[vi].fov;
+        }
+
+        XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        uint32_t imageIndex = 0;
+        if (XR_FAILED(xrAcquireSwapchainImage(z.swapchain, &ai, &imageIndex))) {
+            submitViewCounts[zi] = 0;
+            continue;
+        }
+        XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+        wi.timeout = XR_INFINITE_DURATION;
+        xrWaitSwapchainImage(z.swapchain, &wi);
+
+        ClearImageToColor(device, pool, queue, z.images[imageIndex], z.clearColor);
+
+        XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        xrReleaseSwapchainImage(z.swapchain, &ri);
+    }
+
+    // Layer list: [projA (zone A chained), projB (zone B chained), strip].
+    XrCompositionLayerProjection projLayers[kNumZones];
+    XrCompositionLayerLocal2DEXT stripLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+    const XrCompositionLayerBaseHeader* layers[kNumZones + 1] = {};
+    uint32_t layerCount = 0;
+
+    for (uint32_t zi = 0; zi < kNumZones; zi++) {
+        if (submitViewCounts[zi] == 0) continue;
+        projLayers[zi] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+        projLayers[zi].next = &zoneStructs[zi]; // SAME instance as the locate chain
+        projLayers[zi].layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+        projLayers[zi].space = xr.localSpace;
+        projLayers[zi].viewCount = submitViewCounts[zi];
+        projLayers[zi].views = projViews[zi].data();
+        layers[layerCount++] = (const XrCompositionLayerBaseHeader*)&projLayers[zi];
+    }
+
+    if (g_strip.swapchain != XR_NULL_HANDLE) {
+        stripLayer.layerFlags = 0; // opaque content
+        stripLayer.subImage.swapchain = g_strip.swapchain;
+        stripLayer.subImage.imageRect.offset = {0, 0};
+        stripLayer.subImage.imageRect.extent = {(int32_t)g_strip.w, (int32_t)g_strip.h};
+        stripLayer.subImage.imageArrayIndex = 0;
+        stripLayer.rect = g_stripRect;
+        layers[layerCount++] = (const XrCompositionLayerBaseHeader*)&stripLayer;
+    }
+
+    // Zones alpha-composite against the desktop by design — submit
+    // ALPHA_BLEND whenever the runtime advertises it.
+    static XrEnvironmentBlendMode zonesBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    static bool blendModeResolved = false;
+    if (!blendModeResolved) {
+        blendModeResolved = true;
+        XrEnvironmentBlendMode modes[8];
+        uint32_t count = 0;
+        if (XR_SUCCEEDED(xrEnumerateEnvironmentBlendModes(xr.instance, xr.systemId,
+                                                          xr.viewConfigType, 8, &count, modes))) {
+            for (uint32_t i = 0; i < count; i++) {
+                if (modes[i] == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) {
+                    zonesBlendMode = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
+                    break;
+                }
+            }
+        }
+        LOG_INFO("[zones] environment blend mode: %s",
+                 zonesBlendMode == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND ? "ALPHA_BLEND" : "OPAQUE");
+    }
+
+    XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
+    endInfo.displayTime = frameState.predictedDisplayTime;
+    endInfo.environmentBlendMode = zonesBlendMode;
+    endInfo.layerCount = layerCount;
+    endInfo.layers = layers;
+
+    XrDisplayZonesFrameEndInfoEXT zonesEnd = {(XrStructureType)XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_EXT};
+    zonesEnd.flags = 0;
+    zonesEnd.wishMask = XR_NULL_HANDLE;
+    bool chainZonesEnd = false;
+    if (g_wishMode >= 1 && g_zoneMask != XR_NULL_HANDLE) {
+        zonesEnd.wishMask = g_zoneMask;
+        chainZonesEnd = true;
+    }
+    if (ZonesValidateEnabled()) {
+        zonesEnd.flags |= XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_EXT;
+        chainZonesEnd = true;
+    }
+    if (chainZonesEnd) {
+        endInfo.next = &zonesEnd;
+    }
+
+    xrEndFrame(xr.session, &endInfo);
+}
+
+int main() {
+    // Ensure logs appear immediately even when piped
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
+    signal(SIGINT, SignalHandler);
+    signal(SIGTERM, SignalHandler);
+
+    LOG_INFO("=== VK Cube Zones OpenXR (XR_EXT_display_zones, ADR-027) ===");
+
+    // Headless validation knobs: preselect the M / O key states.
+    {
+        const char *e = getenv("DXR_ZONES_WISH_MODE");
+        if (e != NULL && *e == '1') {
+            g_wishMode = 1;
+            LOG_INFO("DXR_ZONES_WISH_MODE=1 — starting in explicit Tier-2 rects wish mode");
+        }
+        e = getenv("DXR_ZONES_OVERLAP");
+        if (e != NULL && *e == '1') {
+            g_zoneBOverlap = true;
+            LOG_INFO("DXR_ZONES_OVERLAP=1 — zone B starts on the overlap rect");
+        }
+    }
+
+    // Initial rendering mode is sourced from the runtime via v13 `isActive`
+    // (set during xrEnumerateDisplayRenderingModesEXT). Fallback is mode 1
+    // (default of xr.currentModeIndex).
+
+    // Step 1: Create the macOS window FIRST (app owns it)
+    g_windowW = 1280;
+    g_windowH = 720;
+    if (!CreateMacOSWindow(g_windowW, g_windowH)) {
+        LOG_ERROR("Failed to create macOS window");
+        return 1;
+    }
+
+    // Update g_windowW/H to actual drawable pixel dimensions (Retina-aware).
+    // The initial 1280x720 are in points; the Vulkan surface uses pixel dimensions.
+    {
+        NSSize contentSize = [[g_window contentView] bounds].size;
+        CGFloat backingScale = [g_window backingScaleFactor];
+        g_windowW = (uint32_t)(contentSize.width * backingScale);
+        g_windowH = (uint32_t)(contentSize.height * backingScale);
+        LOG_INFO("Window drawable size: %ux%u (points: %.0fx%.0f, scale: %.1f)",
+                 g_windowW, g_windowH, contentSize.width, contentSize.height, (float)backingScale);
+    }
+
+    // Step 2: Initialize OpenXR
+    AppXrSession xr = {};
+    if (!InitializeOpenXR(xr)) {
+        LOG_ERROR("OpenXR initialization failed");
+        return 1;
+    }
+
+    if (!GetVulkanGraphicsRequirements(xr)) {
+        CleanupOpenXR(xr);
+        return 1;
+    }
+
+    // Step 3: Create Vulkan instance + device
+    VkInstance vkInstance = VK_NULL_HANDLE;
+    if (!CreateVulkanInstance(xr, vkInstance)) {
+        CleanupOpenXR(xr);
+        return 1;
+    }
+
+    VkPhysicalDevice physDevice = VK_NULL_HANDLE;
+    if (!GetVulkanPhysicalDevice(xr, vkInstance, physDevice)) {
+        vkDestroyInstance(vkInstance, nullptr);
+        CleanupOpenXR(xr);
+        return 1;
+    }
+
+    std::vector<const char*> deviceExtensions;
+    std::vector<std::string> extensionStorage;
+    if (!GetVulkanDeviceExtensions(xr, deviceExtensions, extensionStorage, physDevice)) {
+        vkDestroyInstance(vkInstance, nullptr);
+        CleanupOpenXR(xr);
+        return 1;
+    }
+    uint32_t queueFamilyIndex = 0;
+    if (!FindGraphicsQueueFamily(physDevice, queueFamilyIndex)) {
+        vkDestroyInstance(vkInstance, nullptr);
+        CleanupOpenXR(xr);
+        return 1;
+    }
+
+    VkDevice vkDevice = VK_NULL_HANDLE;
+    VkQueue graphicsQueue = VK_NULL_HANDLE;
+    if (!CreateVulkanDevice(physDevice, queueFamilyIndex, deviceExtensions, vkDevice, graphicsQueue)) {
+        vkDestroyInstance(vkInstance, nullptr);
+        CleanupOpenXR(xr);
+        return 1;
+    }
+
+    // Step 4: Create OpenXR session WITH the external window binding
+    if (!CreateSession(xr, vkInstance, physDevice, vkDevice, queueFamilyIndex)) {
+        vkDestroyDevice(vkDevice, nullptr);
+        vkDestroyInstance(vkInstance, nullptr);
+        CleanupOpenXR(xr);
+        return 1;
+    }
+
+    if (!CreateSpaces(xr) || !CreateSwapchains(xr)) {
+        CleanupOpenXR(xr);
+        vkDestroyDevice(vkDevice, nullptr);
+        vkDestroyInstance(vkInstance, nullptr);
+        return 1;
+    }
+
+    // Step 5: Enumerate swapchain images + init renderer
+    std::vector<XrSwapchainImageVulkanKHR> swapchainImages;
+    {
+        uint32_t count = xr.swapchain.imageCount;
+        swapchainImages.resize(count, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+        xrEnumerateSwapchainImages(xr.swapchain.swapchain, count, &count,
+            (XrSwapchainImageBaseHeader*)swapchainImages.data());
+    }
+
+    VkFormat colorFormat = (VkFormat)xr.swapchain.format;
+    VkRenderer vkRenderer = {};
+    if (!InitializeVkRenderer(vkRenderer, vkDevice, physDevice, graphicsQueue, queueFamilyIndex, colorFormat)) {
+        CleanupOpenXR(xr);
+        vkDestroyDevice(vkDevice, nullptr);
+        vkDestroyInstance(vkInstance, nullptr);
+        return 1;
+    }
+
+    {
+        uint32_t count = xr.swapchain.imageCount;
+        LOG_INFO("Creating framebuffers: %u images, %ux%u", count, xr.swapchain.width, xr.swapchain.height);
+        std::vector<VkImage> images(count);
+        for (uint32_t i = 0; i < count; i++) {
+            images[i] = swapchainImages[i].image;
+        }
+        if (!CreateSwapchainFramebuffers(vkRenderer, images.data(), count,
+            xr.swapchain.width, xr.swapchain.height, colorFormat)) {
+            CleanupVkRenderer(vkRenderer);
+            CleanupOpenXR(xr);
+            vkDestroyDevice(vkDevice, nullptr);
+            vkDestroyInstance(vkInstance, nullptr);
+            return 1;
+        }
+        LOG_INFO("Framebuffers created OK");
+    }
+
+    // HUD window-space layer swapchain (XR_EXT_window_space_layer).
+    XrHudSwapchain hudSwapchain;
+    HudRendererMacOS hudRenderer = {};
+    HudVkUploader hudUploader = {};
+    std::vector<VkImage> hudVkImages;
+    bool hudReady = false;
+    if (CreateHudSwapchain(xr.session, HUD_PIXEL_WIDTH, HUD_PIXEL_HEIGHT, hudSwapchain)) {
+        std::vector<XrSwapchainImageVulkanKHR> hudVk(hudSwapchain.imageCount,
+            {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+        if (XR_SUCCEEDED(xrEnumerateSwapchainImages(hudSwapchain.swapchain,
+                hudSwapchain.imageCount, &hudSwapchain.imageCount,
+                (XrSwapchainImageBaseHeader*)hudVk.data()))) {
+            hudVkImages.resize(hudSwapchain.imageCount);
+            for (uint32_t i = 0; i < hudSwapchain.imageCount; i++) {
+                hudVkImages[i] = hudVk[i].image;
+            }
+            if (InitializeHudRenderer(hudRenderer, HUD_PIXEL_WIDTH, HUD_PIXEL_HEIGHT) &&
+                InitializeHudVkUploader(hudUploader, vkDevice, physDevice,
+                    graphicsQueue, vkRenderer.commandPool,
+                    HUD_PIXEL_WIDTH, HUD_PIXEL_HEIGHT)) {
+                hudReady = true;
+                LOG_INFO("HUD window-space layer ready (%ux%u, %u images, format %lld)",
+                    HUD_PIXEL_WIDTH, HUD_PIXEL_HEIGHT, hudSwapchain.imageCount,
+                    (long long)hudSwapchain.format);
+            } else {
+                LOG_WARN("HUD initialization failed - HUD disabled");
+            }
+        } else {
+            LOG_WARN("Failed to enumerate HUD swapchain images - HUD disabled");
+        }
+    } else {
+        LOG_WARN("Failed to create HUD swapchain - HUD disabled");
+    }
+
+    g_input.viewParams.virtualDisplayHeight = 0.24f;
+    g_input.nominalViewerZ = xr.nominalViewerZ;
+
+    LOG_INFO("=== Entering main loop ===");
+    LOG_INFO("Controls: WASD=move, Mouse=look, Scroll=zoom, Space=reset, V=Mode, 1/2/3=SBS/anaglyph/blend, Shift+Tab=HUD, Cmd+Ctrl+F=fullscreen, ESC=quit");
+    LOG_INFO("          V=Mode, Shift+Tab=HUD, 1/2/3=SBS/Ana/Blend, ESC=quit");
+
+    // Known issue: during window resize, [NSApp sendEvent:] enters a modal
+    // tracking loop that blocks this while loop, freezing animation and frame
+    // submission until the mouse is released. Two approaches were tried:
+    //
+    //  1. CFRunLoopTimer on kCFRunLoopCommonModes — fires during resize
+    //     tracking but caused "Unknown failure" from the OpenXR loader
+    //     (C++ exception escaping from the DisplayXR runtime).
+    //
+    //  2. Dedicated render pthread — same "Unknown failure". The DisplayXR
+    //     runtime throws when OpenXR frame-loop calls (xrWaitFrame /
+    //     xrBeginFrame / xrEndFrame) run on a thread other than the one
+    //     that created the session. Even starting the session on the main
+    //     thread first did not help.
+    //
+    // The simple while-loop works reliably; resize just pauses animation.
+
+    auto lastTime = std::chrono::high_resolution_clock::now();
+
+    while (g_running && !xr.exitRequested) {
+        PumpMacOSEvents();
+
+        auto now = std::chrono::high_resolution_clock::now();
+        float deltaTime = std::chrono::duration<float>(now - lastTime).count();
+        lastTime = now;
+
+        // Performance stats
+        g_frameCount++;
+        g_avgFrameTime = g_avgFrameTime * 0.95 + deltaTime * 0.05;
+
+        UpdateCameraMovement(g_input, deltaTime, xr.displayHeightM);
+
+        vkRenderer.cubeRotation += deltaTime * 0.5f;
+        if (vkRenderer.cubeRotation > 2.0f * 3.14159265f)
+            vkRenderer.cubeRotation -= 2.0f * 3.14159265f;
+
+        // Handle rendering mode requests (V=cycle next, 0-8=jump absolute).
+        // Single source of truth: the runtime owns the current mode. Keypresses
+        // are REQUESTS — we call xrRequestDisplayRenderingModeEXT and let the
+        // XrEventDataRenderingModeChangedEXT event update xr.currentModeIndex.
+        // Render paths and HUD read xr.currentModeIndex directly.
+        if (g_input.cycleRenderingModeRequested) {
+            g_input.cycleRenderingModeRequested = false;
+            if (xr.pfnRequestDisplayRenderingModeEXT && xr.session != XR_NULL_HANDLE &&
+                xr.renderingModeCount > 0) {
+                uint32_t next = (xr.currentModeIndex + 1) % xr.renderingModeCount;
+                xr.pfnRequestDisplayRenderingModeEXT(xr.session, next);
+            }
+        }
+        if (g_input.absoluteRenderingModeRequested >= 0) {
+            uint32_t target = (uint32_t)g_input.absoluteRenderingModeRequested;
+            g_input.absoluteRenderingModeRequested = -1;
+            if (xr.pfnRequestDisplayRenderingModeEXT && xr.session != XR_NULL_HANDLE &&
+                target < xr.renderingModeCount) {
+                xr.pfnRequestDisplayRenderingModeEXT(xr.session, target);
+            }
+        }
+
+        // Handle eye tracking mode toggle (T key)
+        if (g_input.eyeTrackingModeToggleRequested) {
+            g_input.eyeTrackingModeToggleRequested = false;
+            if (xr.pfnRequestEyeTrackingModeEXT && xr.session != XR_NULL_HANDLE) {
+                XrEyeTrackingModeEXT newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_EXT)
+                    ? XR_EYE_TRACKING_MODE_MANUAL_EXT : XR_EYE_TRACKING_MODE_MANAGED_EXT;
+                XrResult etResult = xr.pfnRequestEyeTrackingModeEXT(xr.session, newMode);
+                LOG_INFO("Eye tracking mode -> %s (%s)",
+                    newMode == XR_EYE_TRACKING_MODE_MANUAL_EXT ? "MANUAL" : "MANAGED",
+                    XR_SUCCEEDED(etResult) ? "OK" : "unsupported");
+            }
+        }
+
+        PollEvents(xr);
+
+        if (xr.sessionRunning) {
+            XrFrameState frameState;
+            if (BeginFrame(xr, frameState)) {
+                // ---- zones path (XR_EXT_display_zones, ADR-027) -------------
+                g_zonesFrameCounter++;
+                if (g_hasDisplayZonesExt && !g_zonesActive && !g_zonesAttempted &&
+                    g_zonesFrameCounter >= kZonesActivationFrame) {
+                    TryActivateZones(xr, vkDevice, vkRenderer.commandPool, graphicsQueue);
+                }
+                if (g_zonesActive && g_hasDisplayZonesExt) {
+                    HandleZoneKeys(xr);
+                    if (frameState.shouldRender) {
+                        RenderZonesFrame(xr, vkDevice, vkRenderer.commandPool, graphicsQueue, frameState);
+
+                        // DXR_ZONES_CAPTURE=<path-prefix>: one-shot atlas capture
+                        // (PROJECTION_ONLY = post zones pass) for headless
+                        // validation — vk_native has no file-trigger capture.
+                        static const char* capturePrefix = getenv("DXR_ZONES_CAPTURE");
+                        static bool captured = false;
+                        if (!captured && capturePrefix != nullptr &&
+                            g_zonesFrameCounter >= kZonesActivationFrame + 30 &&
+                            xr.pfnCaptureAtlasEXT != nullptr) {
+                            captured = true;
+                            XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
+                            info.next = nullptr;
+                            info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT;
+                            strncpy(info.pathPrefix, capturePrefix, XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1);
+                            info.pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1] = '\0';
+                            XrResult cr = xr.pfnCaptureAtlasEXT(xr.session, &info, nullptr);
+                            LOG_INFO("[zones] atlas capture (%s): 0x%x", capturePrefix, (unsigned)cr);
+                        }
+                    } else {
+                        XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
+                        endInfo.displayTime = frameState.predictedDisplayTime;
+                        endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+                        endInfo.layerCount = 0;
+                        endInfo.layers = nullptr;
+                        xrEndFrame(xr.session, &endInfo);
+                    }
+                    continue;
+                }
+
+                // ---- fallback: plain single-projection cube ------------------
+                bool rendered = false;
+                bool display3D = (xr.currentModeIndex < xr.renderingModeCount)
+                    ? xr.renderingModeDisplay3D[xr.currentModeIndex] : true;
+
+                // Get N-view mode info from enumerated rendering modes
+                uint32_t modeViewCount = (xr.currentModeIndex < xr.renderingModeCount)
+                    ? xr.renderingModeViewCounts[xr.currentModeIndex] : 2;
+                uint32_t tileColumns = (xr.currentModeIndex < xr.renderingModeCount)
+                    ? xr.renderingModeTileColumns[xr.currentModeIndex] : 2;
+                uint32_t tileRows = (xr.currentModeIndex < xr.renderingModeCount)
+                    ? xr.renderingModeTileRows[xr.currentModeIndex] : 1;
+                int eyeCount = display3D ? (int)modeViewCount : 1;
+
+                // Dynamic arrays for N-view rendering
+                std::vector<XrCompositionLayerProjectionView> projectionViews(eyeCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+
+                if (frameState.shouldRender) {
+                    XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
+                    locateInfo.viewConfigurationType = xr.viewConfigType;
+                    locateInfo.displayTime = frameState.predictedDisplayTime;
+                    locateInfo.space = xr.localSpace;
+
+                    XrViewState viewState = {XR_TYPE_VIEW_STATE};
+
+                    // Chain eye tracking state (v6)
+                    XrViewEyeTrackingStateEXT eyeTrackingState = {};
+                    eyeTrackingState.type = (XrStructureType)XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT;
+                    viewState.next = &eyeTrackingState;
+
+                    // XR_EXT_view_rig (#396 W7): drive the runtime rig matching
+                    // the app's current mode (C selects the rig) with the app's
+                    // tunables — the runtime owns the window resolve and the
+                    // Kooima math, and returns render-ready XrView{pose, fov}.
+                    // Per-locate semantics: chain the rig on every consume
+                    // locate. The raw result struct (chained behind the eye
+                    // tracking state) feeds the HUD's display-space eye readout.
+                    const bool useRig =
+                        xr.hasViewRigExt && xr.displayWidthM > 0 && xr.displayHeightM > 0;
+                    const bool rigCamera = useRig && g_input.cameraMode;
+                    XrCameraRigEXT cameraRig = {XR_TYPE_CAMERA_RIG_EXT};
+                    XrDisplayRigEXT displayRig = {XR_TYPE_DISPLAY_RIG_EXT};
+                    XrViewDisplayRawEXT viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+                    XrPosef rigPose = {{0, 0, 0, 1}, {0, 0, 0}};
+                    if (useRig) {
+                        quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &rigPose.orientation);
+                        rigPose.position = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};
+                        if (rigCamera) {
+                            cameraRig.pose = rigPose;
+                            cameraRig.ipdFactor = g_input.viewParams.ipdFactor;
+                            cameraRig.parallaxFactor = g_input.viewParams.parallaxFactor;
+                            cameraRig.convergenceDiopters = g_input.viewParams.invConvergenceDistance;
+                            cameraRig.verticalFov =
+                                2.0f * atanf(CAMERA_HALF_TAN_VFOV / g_input.viewParams.zoomFactor);
+                            locateInfo.next = &cameraRig;
+                        } else {
+                            displayRig.pose = rigPose;
+                            displayRig.virtualDisplayHeight =
+                                g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
+                            displayRig.ipdFactor = g_input.viewParams.ipdFactor;
+                            displayRig.parallaxFactor = g_input.viewParams.parallaxFactor;
+                            displayRig.perspectiveFactor = g_input.viewParams.perspectiveFactor;
+                            locateInfo.next = &displayRig;
+                        }
+                        eyeTrackingState.next = &viewRigRaw;
+                    }
+
+                    uint32_t viewCount = (uint32_t)xr.configViews.size();
+                    std::vector<XrView> views(viewCount, {XR_TYPE_VIEW});
+
+                    XrResult locResult = xrLocateViews(xr.session, &locateInfo,
+                        &viewState, viewCount, &viewCount, views.data());
+                    if (XR_SUCCEEDED(locResult) &&
+                        (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) &&
+                        (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT))
+                    {
+                        // Save display-space eye positions for the HUD. Under
+                        // the rig, views[] carries render-ready world eyes —
+                        // the raw channel (XrViewDisplayRawEXT) keeps the HUD
+                        // readout in display space.
+                        xr.eyeCount = modeViewCount;
+                        if (useRig && viewRigRaw.eyeCountOutput > 0) {
+                            for (uint32_t v = 0; v < viewRigRaw.eyeCountOutput && v < 8; v++) {
+                                xr.eyePositions[v][0] = viewRigRaw.rawEyes[v].x;
+                                xr.eyePositions[v][1] = viewRigRaw.rawEyes[v].y;
+                                xr.eyePositions[v][2] = viewRigRaw.rawEyes[v].z;
+                            }
+                        } else {
+                            for (uint32_t v = 0; v < viewCount && v < 8; v++) {
+                                xr.eyePositions[v][0] = views[v].pose.position.x;
+                                xr.eyePositions[v][1] = views[v].pose.position.y;
+                                xr.eyePositions[v][2] = views[v].pose.position.z;
+                            }
+                        }
+
+                        xr.isEyeTracking = (eyeTrackingState.isTracking == XR_TRUE);
+                        xr.activeEyeTrackingMode = (uint32_t)eyeTrackingState.activeMode;
+                        xr.eyeTrackingActive = xr.isEyeTracking;
+
+                        // Compute render dims for SBS single-swapchain.
+                        // Scale depends on current output mode (may change at runtime):
+                        float scaleX = (xr.currentModeIndex < xr.renderingModeCount)
+                            ? xr.renderingModeScaleX[xr.currentModeIndex] : 0.5f;
+                        float scaleY = (xr.currentModeIndex < xr.renderingModeCount)
+                            ? xr.renderingModeScaleY[xr.currentModeIndex] : 0.5f;
+                        xr.recommendedViewScaleX = scaleX;
+                        xr.recommendedViewScaleY = scaleY;
+
+                        uint32_t maxTileW = tileColumns > 0 ? xr.swapchain.width / tileColumns : xr.swapchain.width;
+                        uint32_t maxTileH = tileRows > 0 ? xr.swapchain.height / tileRows : xr.swapchain.height;
+                        uint32_t renderW, renderH;
+                        if (!display3D) {
+                            renderW = g_windowW;
+                            renderH = g_windowH;
+                            if (renderW > xr.swapchain.width) renderW = xr.swapchain.width;
+                            if (renderH > xr.swapchain.height) renderH = xr.swapchain.height;
+                        } else {
+                            renderW = (uint32_t)(g_windowW * scaleX);
+                            renderH = (uint32_t)(g_windowH * scaleY);
+                            if (renderW > maxTileW) renderW = maxTileW;
+                            if (renderH > maxTileH) renderH = maxTileH;
+                        }
+                        g_renderW = renderW;
+                        g_renderH = renderH;
+
+                        // --- Consume the runtime's render-ready XrView{pose, fov} ---
+                        // (#396 W7) Only clip policy (near/far + the GL→[0,1]
+                        // depth remap) stays app-side, by design (fov is
+                        // clip-independent). Camera rig: same absolute clip as
+                        // the old app-side camera path. Display rig:
+                        // ZDP-anchored clip (near = ez - vH, far = ez +
+                        // 1000·vH; ez = rig-local z of the view pose).
+                        const float rigVH =
+                            g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
+
+                        rendered = true;
+                        uint32_t imageIndex;
+                        if (AcquireSwapchainImage(xr, imageIndex)) {
+                            std::vector<EyeRenderParams> eyeParams(eyeCount);
+                            for (int eye = 0; eye < eyeCount; eye++) {
+                                int vi = eye < (int)viewCount ? eye : 0;
+                                XrFovf submitFov = views[vi].fov;
+                                if (useRig) {
+                                    float nearZ = 0.01f, farZ = 100.0f;
+                                    if (!rigCamera) {
+                                        float ez = RigLocalEyeZ(rigPose, views[vi].pose.position);
+                                        nearZ = (ez - rigVH > 0.001f) ? (ez - rigVH) : 0.001f;
+                                        farZ = ez + 1000.0f * rigVH;
+                                    }
+                                    mat4_view_from_xr_pose(eyeParams[eye].viewMat, views[vi].pose);
+                                    // mat4_from_xr_fov is GL-convention; Vulkan clips [0,1].
+                                    mat4_from_xr_fov(eyeParams[eye].projMat, views[vi].fov, nearZ, farZ);
+                                    convert_projection_gl_to_zero_to_one(eyeParams[eye].projMat);
+                                } else {
+                                    mat4_view_from_xr_pose(eyeParams[eye].viewMat, views[vi].pose);
+                                    mat4_from_xr_fov(eyeParams[eye].projMat, views[vi].fov, 0.01f, 100.0f);
+                                }
+
+                                // Tile-aware viewport: place each view in the correct tile position
+                                uint32_t tileX = display3D ? (eye % tileColumns) : 0;
+                                uint32_t tileY = display3D ? (eye / tileColumns) : 0;
+                                uint32_t vpX = tileX * renderW;
+                                uint32_t vpY = tileY * renderH;
+                                eyeParams[eye].viewportX = vpX;
+                                eyeParams[eye].viewportY = vpY;
+                                eyeParams[eye].width = renderW;
+                                eyeParams[eye].height = renderH;
+
+                                projectionViews[eye].subImage.swapchain = xr.swapchain.swapchain;
+                                projectionViews[eye].subImage.imageRect.offset = {(int32_t)vpX, (int32_t)vpY};
+                                projectionViews[eye].subImage.imageRect.extent = {
+                                    (int32_t)renderW,
+                                    (int32_t)renderH};
+                                projectionViews[eye].subImage.imageArrayIndex = 0;
+                                projectionViews[eye].pose = views[eye < (int)viewCount ? eye : 0].pose;
+                                projectionViews[eye].fov = submitFov;
+                            }
+                            RenderScene(vkRenderer, imageIndex, eyeParams.data(), eyeCount);
+
+                            // 'I' key: snapshot the multi-view atlas via the
+                            // runtime-owned XR_EXT_atlas_capture (W6 of #396) —
+                            // the runtime does the readback from its own atlas
+                            // image, so the app keeps no staging texture.
+                            // PROJECTION_ONLY = the app's own projection atlas,
+                            // pre-compose. Skipped for mono (1×1) layouts; the
+                            // runtime appends "_atlas_<viewCount>_<cols>x<rows>.png".
+                            if (g_input.captureAtlasRequested) {
+                                g_input.captureAtlasRequested = false;
+                                if (xr.pfnCaptureAtlasEXT && xr.session != XR_NULL_HANDLE) {
+                                    if (display3D && (tileColumns > 1 || tileRows > 1)) {
+                                        std::string prefix = dxr_capture::MakeCaptureAtlasPrefix(
+                                            "cube_handle_vk_macos", tileColumns, tileRows);
+                                        XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
+                                        info.next = nullptr;
+                                        info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT;
+                                        strncpy(info.pathPrefix, prefix.c_str(),
+                                                XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1);
+                                        info.pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1] = '\0';
+                                        XrResult cr = xr.pfnCaptureAtlasEXT(xr.session, &info, nullptr);
+                                        if (XR_SUCCEEDED(cr)) {
+                                            LOG_INFO("Atlas capture requested -> %s_atlas_%u_%ux%u.png",
+                                                     prefix.c_str(), tileColumns * tileRows, tileColumns, tileRows);
+                                            dxr_capture::TriggerCaptureFlash((__bridge void*)g_metalView);
+                                        } else {
+                                            LOG_WARN("xrCaptureAtlasEXT failed: 0x%x", (unsigned)cr);
+                                        }
+                                    } else {
+                                        LOG_WARN("Capture skipped: need 3D mode with cols/rows > 1");
+                                    }
+                                } else {
+                                    LOG_WARN("Atlas capture unavailable: XR_EXT_atlas_capture not active");
+                                }
+                            }
+                            ReleaseSwapchainImage(xr);
+                        } else {
+                            rendered = false;
+                        }
+                    }
+                }
+
+                // Render HUD into the window-space layer swapchain (when visible).
+                bool hudSubmitted = false;
+                if (hudReady && g_input.hudVisible && rendered && frameState.shouldRender) {
+                    uint32_t hudIndex = 0;
+                    if (AcquireHudSwapchainImage(hudSwapchain, hudIndex)) {
+                        uint32_t rowPitch = 0;
+                        const void* pixels = RenderHudAndMap(hudRenderer, &rowPitch,
+                            g_hudSessionText, g_hudModeText, g_hudPerfText, g_hudDisplayText,
+                            g_hudEyeText, g_hudCameraText, g_hudStereoText, g_hudHelpText);
+                        if (pixels) {
+                            if (UploadHudPixels(hudUploader, hudVkImages[hudIndex], pixels, rowPitch)) {
+                                hudSubmitted = true;
+                            }
+                            UnmapHud(hudRenderer);
+                        }
+                        ReleaseHudSwapchainImage(hudSwapchain);
+                    }
+                }
+
+                if (rendered && hudSubmitted) {
+                    float hudAR = (float)HUD_PIXEL_WIDTH / (float)HUD_PIXEL_HEIGHT;
+                    float windowAR = (g_windowW > 0 && g_windowH > 0)
+                        ? (float)g_windowW / (float)g_windowH : 1.0f;
+                    float fracW = HUD_WIDTH_FRACTION;
+                    float fracH = fracW * windowAR / hudAR;
+                    if (fracH > 1.0f) { fracH = 1.0f; fracW = hudAR / windowAR; }
+                    SubmitWindowSpaceHudFrame(
+                        xr.session, xr.localSpace, frameState.predictedDisplayTime,
+                        XR_ENVIRONMENT_BLEND_MODE_OPAQUE,
+                        projectionViews.data(), (uint32_t)eyeCount,
+                        hudSwapchain, 0.0f, 0.0f, fracW, fracH, 0.0f);
+                } else if (rendered) {
+                    EndFrame(xr, frameState.predictedDisplayTime, projectionViews.data(), (uint32_t)eyeCount);
+                } else {
+                    XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
+                    endInfo.displayTime = frameState.predictedDisplayTime;
+                    endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+                    endInfo.layerCount = 0;
+                    endInfo.layers = nullptr;
+                    xrEndFrame(xr.session, &endInfo);
+                }
+            }
+        } else {
+            usleep(100000);
+        }
+
+        // Refresh cached HUD section strings (consumed each frame by RenderHudAndMap).
+        g_hudUpdateTimer += deltaTime;
+        if (g_hudUpdateTimer >= 0.5f) {
+            g_hudUpdateTimer = 0.0f;
+
+            auto utf8ToW = [](const char* s) -> std::wstring {
+                NSString* ns = [NSString stringWithUTF8String:(s ? s : "")];
+                NSData* d = [ns dataUsingEncoding:NSUTF32LittleEndianStringEncoding];
+                size_t n = d.length / sizeof(wchar_t);
+                std::wstring w(n, L'\0');
+                if (n) memcpy((void*)w.data(), d.bytes, d.length);
+                return w;
+            };
+
+            const char *sessionStateNames[] = {
+                "UNKNOWN", "IDLE", "READY", "SYNCHRONIZED",
+                "VISIBLE", "FOCUSED", "STOPPING", "LOSS_PENDING", "EXITING"};
+            int stateIdx = (int)xr.sessionState;
+            const char *sessionStateName = (stateIdx >= 0 && stateIdx < 9)
+                ? sessionStateNames[stateIdx] : "INVALID";
+
+            char buf[512];
+            snprintf(buf, sizeof(buf), "%s\nSession: %s",
+                xr.systemName, sessionStateName);
+            g_hudSessionText = utf8ToW(buf);
+
+            const char *outputModeName = (xr.currentModeIndex < xr.renderingModeCount)
+                ? xr.renderingModeNames[xr.currentModeIndex] : "?";
+            bool display3D = (xr.currentModeIndex < xr.renderingModeCount)
+                ? xr.renderingModeDisplay3D[xr.currentModeIndex] : true;
+            bool isReq = (xr.currentModeIndex < xr.renderingModeCount)
+                ? xr.renderingModeIsRequestable[xr.currentModeIndex] : true;
+            const char *lockSuffix = isReq ? "" : " [locked by workspace]";
+            const char *kooimaMode = g_input.cameraMode
+                ? "Camera-Centric [C=Toggle]" : "Display-Centric [C=Toggle]";
+            snprintf(buf, sizeof(buf),
+                "XR_EXT_cocoa_window_binding: %s (Vulkan)\nMode: %s (%s)%s\nKooima: %s",
+                xr.hasCocoaWindowBinding ? "ACTIVE" : "NOT AVAILABLE",
+                outputModeName, display3D ? "3D" : "2D", lockSuffix, kooimaMode);
+            g_hudModeText = utf8ToW(buf);
+
+            double fps = (g_avgFrameTime > 0) ? 1.0 / g_avgFrameTime : 0;
+            snprintf(buf, sizeof(buf), "FPS: %.0f  (%.1f ms)\nRender: %ux%u  Window: %ux%u",
+                fps, g_avgFrameTime * 1000.0,
+                g_renderW, g_renderH, g_windowW, g_windowH);
+            g_hudPerfText = utf8ToW(buf);
+
+            snprintf(buf, sizeof(buf),
+                "Display: %.3f x %.3f m\nScale: %.2f x %.2f\nNominal: (%.3f, %.3f, %.3f)",
+                xr.displayWidthM, xr.displayHeightM,
+                xr.recommendedViewScaleX, xr.recommendedViewScaleY,
+                xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ);
+            g_hudDisplayText = utf8ToW(buf);
+
+            std::string eyeLines;
+            for (uint32_t e = 0; e < xr.eyeCount && e < 8; e++) {
+                char line[128];
+                snprintf(line, sizeof(line), "Eye[%u]: (%.3f, %.3f, %.3f)\n",
+                    e, xr.eyePositions[e][0], xr.eyePositions[e][1], xr.eyePositions[e][2]);
+                eyeLines += line;
+            }
+            const char *eyeModeName = (xr.activeEyeTrackingMode == 1) ? "MANUAL" : "MANAGED";
+            char eyeTrackLine[80];
+            snprintf(eyeTrackLine, sizeof(eyeTrackLine), "Tracking: %s [%s] [T]",
+                xr.isEyeTracking ? "YES" : "NO", eyeModeName);
+            eyeLines += eyeTrackLine;
+            g_hudEyeText = utf8ToW(eyeLines.c_str());
+
+            const char *poseLabel = g_input.cameraMode ? "Virtual Camera" : "Virtual Display";
+            snprintf(buf, sizeof(buf), "%s: (%.2f, %.2f, %.2f)",
+                poseLabel, g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ);
+            g_hudCameraText = utf8ToW(buf);
+
+            const char *param1Label = g_input.cameraMode ? "Conv" : "Persp";
+            const char *param2Label = g_input.cameraMode ? "Zoom" : "Scale";
+            float param1Val = g_input.cameraMode
+                ? g_input.viewParams.invConvergenceDistance : g_input.viewParams.perspectiveFactor;
+            float param2Val = g_input.cameraMode
+                ? g_input.viewParams.zoomFactor : g_input.viewParams.scaleFactor;
+            char valueLine[96];
+            if (g_input.cameraMode) {
+                float tanHFOV = CAMERA_HALF_TAN_VFOV / g_input.viewParams.zoomFactor;
+                snprintf(valueLine, sizeof(valueLine), "tanHFOV: %.3f", tanHFOV);
+            } else {
+                float m2v = (g_input.viewParams.virtualDisplayHeight > 0.0f && xr.displayHeightM > 0.0f)
+                    ? g_input.viewParams.virtualDisplayHeight / xr.displayHeightM : 1.0f;
+                snprintf(valueLine, sizeof(valueLine), "vHeight: %.3f  m2v: %.3f",
+                    g_input.viewParams.virtualDisplayHeight, m2v);
+            }
+            snprintf(buf, sizeof(buf), "IPD: %.2f  Parallax: %.2f\n%s: %.2f  %s: %.2f\n%s",
+                g_input.viewParams.ipdFactor, g_input.viewParams.parallaxFactor,
+                param1Label, param1Val, param2Label, param2Val, valueLine);
+            g_hudStereoText = utf8ToW(buf);
+
+            const char *scrollHint = g_input.cameraMode ? "Scroll=Zoom" : "Scroll=Scale";
+            const char *perspHint = g_input.cameraMode ? "Opt=Conv" : "Opt=Persp";
+            char outputHint[32] = "";
+            if (xr.renderingModeCount > 1) {
+                snprintf(outputHint, sizeof(outputHint), "  0-%u=Mode", xr.renderingModeCount - 1);
+            }
+            snprintf(buf, sizeof(buf),
+                "WASD/QE=Move  Drag=Look  Space=Reset\n"
+                "%s  Shift=IPD  Ctrl=Parallax  %s\n"
+                "V=Mode%s  T=EyeMode  Shift+Tab=HUD  ESC=Quit",
+                scrollHint, perspHint, outputHint);
+            g_hudHelpText = utf8ToW(buf);
+        }
+    }
+
+    // Clean exit
+    if (!xr.exitRequested && xr.session != XR_NULL_HANDLE && xr.sessionRunning) {
+        LOG_INFO("Requesting session exit...");
+        xrRequestExitSession(xr.session);
+        for (int i = 0; i < 100 && !xr.exitRequested; i++) {
+            PollEvents(xr);
+            usleep(10000);
+        }
+    }
+
+    LOG_INFO("=== Shutting down ===");
+
+    if (hudReady) {
+        // HUD uploader uses vkRenderer.commandPool — clean up before
+        // CleanupVkRenderer destroys the pool.
+        CleanupHudVkUploader(hudUploader);
+        CleanupHudRenderer(hudRenderer);
+    }
+    if (hudSwapchain.swapchain != XR_NULL_HANDLE) {
+        // Destroy before CleanupOpenXR releases the session.
+        xrDestroySwapchain(hudSwapchain.swapchain);
+    }
+    if (g_zoneMask != XR_NULL_HANDLE && g_pfnDestroyZoneMask != nullptr) {
+        g_pfnDestroyZoneMask(g_zoneMask);
+    }
+    for (uint32_t zi = 0; zi < kNumZones; zi++) {
+        if (g_zonesArr[zi].swapchain != XR_NULL_HANDLE) {
+            xrDestroySwapchain(g_zonesArr[zi].swapchain);
+        }
+    }
+    if (g_strip.swapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(g_strip.swapchain);
+    }
+
+    CleanupVkRenderer(vkRenderer);
+    CleanupOpenXR(xr);
+    vkDestroyDevice(vkDevice, nullptr);
+    vkDestroyInstance(vkInstance, nullptr);
+
+    LOG_INFO("Application shutdown complete");
+    return 0;
+}

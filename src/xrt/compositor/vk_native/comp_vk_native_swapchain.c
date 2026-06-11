@@ -423,3 +423,10 @@ comp_vk_native_swapchain_get_dimensions(struct xrt_swapchain *xsc, uint32_t *out
 	*out_w = sc->info.width;
 	*out_h = sc->info.height;
 }
+
+uint32_t
+comp_vk_native_swapchain_get_array_size(struct xrt_swapchain *xsc)
+{
+	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
+	return sc->info.array_size;
+}

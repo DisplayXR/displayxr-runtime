@@ -4,12 +4,12 @@
 > [`XR_EXT_display_zones` spec sketch](../specs/extensions/XR_EXT_display_zones.md).
 > This doc carries the two living parts: the reference-consumer migration and
 > the implementation phasing. Status: **runtime phases P1–P4 SHIPPED**
-> (extension advertised; D3D11 capture- + Leia-validated, VK/D3D12/GL
-> code-validated, Metal sim- + eyeball-validated 2026-06-11 via the
-> permanent `cube_zones_metal_macos` test app — incl. zone overlap
-> alpha-over, which Metal now does natively). Remaining:
-> Phase 5 (Leia plugin caps + IPC, `displayxr-leia-plugin` repo) and
-> Phase 6 (avatar migration, `displayxr-demo-avatar` repo).
+> (extension advertised; D3D11 capture- + Leia-validated, D3D12/GL
+> code-validated, Metal + VK sim-validated on macOS 2026-06-11 via the
+> permanent `cube_zones_metal_macos` / `cube_zones_vk_macos` test apps —
+> incl. zone overlap alpha-over, now native on D3D11 + Metal + VK).
+> Remaining: Phase 5 (Leia plugin caps + IPC, `displayxr-leia-plugin`
+> repo) and Phase 6 (avatar migration, `displayxr-demo-avatar` repo).
 
 ## Reference consumer: `displayxr-demo-avatar` migration
 
@@ -124,9 +124,14 @@ renderer atlas IS the super-atlas (zones frames make the effective canvas the
 full window, so tiles are window-scaled and zone layers render at sub-tile
 viewports; the stride invariant holds by construction). The auto-wish feather
 is a stepped ClearView/ClearAttachments ring raster (8 × 2 px, max semantics).
-Known VK limitation: the VK renderer is blit-based, so overlapping zones
-OVERWRITE in layer order there (one-shot WARN) — alpha-over needs a VK draw
-path (follow-up). Validated on the Leia DP via atlas captures (zone placement
+The original VK limitation (blit-based renderer ⇒ overlapping zones
+OVERWRITE) was RESOLVED 2026-06-11: zones frames now take a dedicated
+draw-based pass (`zone_blit.vert/.frag` + premult/unpremult blend pipelines,
+depth-free, descriptor pool reset per frame) so overlaps composite alpha-over
+in layer-list order; the blit leg survives only as a fallback for layered
+zone swapchains (one-shot WARN). Pixel-validated on macOS/MoltenVK via
+`cube_zones_vk_macos` (clear-based zones: overlap = exact `B + A·(1−α_B)`).
+Validated on the Leia DP via atlas captures (zone placement
 per view tile + parallax + overlap alpha-over on D3D11) and wish generations.
 
 

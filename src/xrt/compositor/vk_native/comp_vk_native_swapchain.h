@@ -73,6 +73,18 @@ comp_vk_native_swapchain_get_image(struct xrt_swapchain *xsc, uint32_t index);
 void
 comp_vk_native_swapchain_get_dimensions(struct xrt_swapchain *xsc, uint32_t *out_w, uint32_t *out_h);
 
+/*!
+ * Get the array size of a swapchain (1 for plain 2D swapchains).
+ *
+ * The zone alpha-over draw path samples through the swapchain's whole-image
+ * view, which is a 2D view only when array_size == 1 — layered swapchains
+ * fall back to the blit path.
+ *
+ * @ingroup comp_vk_native
+ */
+uint32_t
+comp_vk_native_swapchain_get_array_size(struct xrt_swapchain *xsc);
+
 #ifdef __cplusplus
 }
 #endif
