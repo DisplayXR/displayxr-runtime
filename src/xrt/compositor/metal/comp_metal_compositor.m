@@ -2999,6 +2999,18 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
+	// Submission-derived CONTENT layout (#542): decouple the atlas tile
+	// count/size from the panel HARDWARE weave-state. The atlas holds
+	// exactly what the app submitted (view_count tiles, sized by the
+	// per-view imageRect), independent of c->hardware_display_3d — that flag
+	// drives only the DP weave via request_display_mode. Defaults are the
+	// mode-derived values, so zones frames and the no-projection-layer case
+	// stay byte-identical; the main projection layer overrides them below.
+	uint32_t atlas_view_w = c->view_width;
+	uint32_t atlas_view_h = c->view_height;
+	uint32_t atlas_cols = c->tile_columns;
+	uint32_t atlas_rows = c->tile_rows;
+
 	// Step 1: Render layers into atlas texture (skip if zero-copy)
 	if (!zero_copy && c->atlas_texture != nil && c->layer_accum.layer_count > 0) {
 		MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -3078,10 +3090,27 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				}
 			}
 
-			// Use min of compositor's tile count and layer's submitted views
-			uint32_t mode_views = c->hardware_display_3d ? (c->tile_columns * c->tile_rows) : 1;
-			uint32_t view_count = (layer->data.view_count < mode_views) ? layer->data.view_count : mode_views;
+			// CONTENT tile count from the SUBMISSION, not the hardware flag
+			// (#542): the atlas holds exactly the tiles the app submitted,
+			// capped only by physical capacity. No `hardware_3d ? N : 1`
+			// clamp — a hardware/content divergence renders predictably.
+			uint32_t view_count = layer->data.view_count;
 			if (view_count == 0) view_count = 1;
+			if (view_count > XRT_MAX_VIEWS) view_count = XRT_MAX_VIEWS;
+
+			// The main (non-zone) projection layer defines the frame's atlas
+			// content layout (an N×1 grid sized by the submitted imageRect);
+			// zone layers keep the mode-derived tile box (their rect is scaled
+			// into it below), so leave the defaults for them.
+			if (!is_zone) {
+				atlas_cols = view_count;
+				atlas_rows = 1;
+				const struct xrt_rect *r0 = &layer->data.proj.v[0].sub.rect;
+				if (r0->extent.w > 0 && r0->extent.h > 0) {
+					atlas_view_w = (uint32_t)r0->extent.w;
+					atlas_view_h = (uint32_t)r0->extent.h;
+				}
+			}
 			for (uint32_t eye = 0; eye < view_count; eye++) {
 				struct xrt_swapchain *sc = layer->sc_array[eye];
 				if (sc == NULL) {
@@ -3120,21 +3149,18 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					nr.h = 1.0f;
 				}
 
-				// Set viewport for this eye
+				// Set viewport for this eye — always tile-place by the
+				// submission-derived grid (#542). No branch on the hardware
+				// flag: the DP weaves (hardware-3D) or shows the tiles flat
+				// (hardware-2D) per its own mode_3d from request_display_mode.
 				MTLViewport vp;
-				if (!c->hardware_display_3d) {
-					vp.originX = 0;
-					vp.originY = 0;
-					vp.width = c->tile_columns * c->view_width;
-					vp.height = c->tile_rows * c->view_height;
-				} else {
-					// Tiled layout: place each eye in its tile
-					uint32_t tile_x = eye % c->tile_columns;
-					uint32_t tile_y = eye / c->tile_columns;
-					vp.originX = tile_x * c->view_width;
-					vp.originY = tile_y * c->view_height;
-					vp.width = c->view_width;
-					vp.height = c->view_height;
+				{
+					uint32_t tile_x = eye % atlas_cols;
+					uint32_t tile_y = eye / atlas_cols;
+					vp.originX = tile_x * atlas_view_w;
+					vp.originY = tile_y * atlas_view_h;
+					vp.width = atlas_view_w;
+					vp.height = atlas_view_h;
 				}
 				if (is_zone) {
 					// XR_EXT_display_zones: scale the zone rect
@@ -3259,7 +3285,9 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// so the display processor weaves them in stereo just like projection
 		// content. Mirrors d3d11_compositor_layer_window_space + the renderer
 		// window-space pass.
-		uint32_t mode_views_ws = c->hardware_display_3d ? (c->tile_columns * c->tile_rows) : 1;
+		// HUD tiles align with the projection tiles: same submission-derived
+		// grid (#542), independent of the hardware weave-state.
+		uint32_t mode_views_ws = atlas_cols;
 		for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 			struct comp_layer *layer = &c->layer_accum.layers[i];
 			if (layer->data.type != XRT_LAYER_WINDOW_SPACE) {
@@ -3297,8 +3325,8 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			}
 
 			for (uint32_t eye = 0; eye < mode_views_ws; eye++) {
-				uint32_t tile_x = eye % c->tile_columns;
-				uint32_t tile_y = eye / c->tile_columns;
+				uint32_t tile_x = eye % atlas_cols;
+				uint32_t tile_y = eye / atlas_cols;
 
 				// Per-view disparity, graded across the view sweep (#413):
 				// first view = -half, last = +half. Degenerates to the
@@ -3315,12 +3343,10 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				// emits a fullscreen triangle in NDC; the MTLViewport
 				// clamps that to the sub-rect we want filled. This way we
 				// reuse the existing shader without per-quad geometry.
-				float tile_origin_x = c->hardware_display_3d ? (float)(tile_x * c->view_width) : 0.0f;
-				float tile_origin_y = c->hardware_display_3d ? (float)(tile_y * c->view_height) : 0.0f;
-				float tile_w = c->hardware_display_3d ? (float)c->view_width
-				                                       : (float)(c->tile_columns * c->view_width);
-				float tile_h = c->hardware_display_3d ? (float)c->view_height
-				                                       : (float)(c->tile_rows * c->view_height);
+				float tile_origin_x = (float)(tile_x * atlas_view_w);
+				float tile_origin_y = (float)(tile_y * atlas_view_h);
+				float tile_w = (float)atlas_view_w;
+				float tile_h = (float)atlas_view_h;
 
 				MTLViewport vp;
 				vp.originX = tile_origin_x + (ws->x + eye_shift) * tile_w;
@@ -3393,11 +3419,12 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	{
 		const char *trigger = "/tmp/dxr_atlas_trigger";
 		struct stat st;
-		if (c->atlas_texture != nil && c->tile_columns > 0 && c->tile_rows > 0 &&
-		    c->view_width > 0 && c->view_height > 0 && stat(trigger, &st) == 0) {
+		if (c->atlas_texture != nil && atlas_cols > 0 && atlas_rows > 0 &&
+		    atlas_view_w > 0 && atlas_view_h > 0 && stat(trigger, &st) == 0) {
 			unlink(trigger);
-			uint32_t cw = c->tile_columns * c->view_width;
-			uint32_t ch = c->tile_rows * c->view_height;
+			// Submission-derived content region (#542): what the app submitted.
+			uint32_t cw = atlas_cols * atlas_view_w;
+			uint32_t ch = atlas_rows * atlas_view_h;
 			if (cw > (uint32_t)c->atlas_texture.width)  cw = (uint32_t)c->atlas_texture.width;
 			if (ch > (uint32_t)c->atlas_texture.height) ch = (uint32_t)c->atlas_texture.height;
 			size_t pitch = (size_t)cw * 4;
@@ -3439,8 +3466,10 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	if (c->display_processor != NULL && atlas_src != nil) {
 		// Crop atlas to content dims before passing to DP.
 		// The DP expects texture dimensions to match content exactly.
-		uint32_t content_w = c->tile_columns * c->view_width;
-		uint32_t content_h = c->tile_rows * c->view_height;
+		// Content is the submission-derived layout (#542), not the hardware
+		// mode — the DP weaves/flattens these tiles per its own mode_3d.
+		uint32_t content_w = atlas_cols * atlas_view_w;
+		uint32_t content_h = atlas_rows * atlas_view_h;
 
 		// Verify content region fits within atlas
 		if (content_w > c->atlas_width || content_h > c->atlas_height) {
@@ -3450,8 +3479,8 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				        "(vw=%u vh=%u tiles=%ux%u legacy=%d)",
 				        content_w, content_h,
 				        c->atlas_width, c->atlas_height,
-				        c->view_width, c->view_height,
-				        c->tile_columns, c->tile_rows,
+				        atlas_view_w, atlas_view_h,
+				        atlas_cols, atlas_rows,
 				        c->legacy_app_tile_scaling);
 				crop_err_log++;
 			}
@@ -3515,10 +3544,10 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		    c->display_processor,
 		    (__bridge void *)cmd_buf,
 		    (__bridge void *)dp_src,
-		    c->view_width,
-		    c->view_height,
-		    c->tile_columns,
-		    c->tile_rows,
+		    atlas_view_w,
+		    atlas_view_h,
+		    atlas_cols,
+		    atlas_rows,
 		    (uint32_t)MTLPixelFormatBGRA8Unorm,
 		    (__bridge void *)output_texture,
 		    dp_target_w,
