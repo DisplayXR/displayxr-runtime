@@ -13,6 +13,7 @@
  */
 
 #include "sim_display_interface.h"
+#include "sim_display_zone_common.h"
 
 #include "xrt/xrt_display_processor_d3d11.h"
 #include "xrt/xrt_display_metrics.h"
@@ -37,19 +38,56 @@ DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_nominal_z_m_d3d11, "SIM_DISPLAY_NOMINAL_
 // the TileParams cbuffer carries `encode_srgb` (1.0 ⟹ linear atlas, apply the
 // standard sRGB OETF before write; 0.0 ⟹ encoded atlas, passthrough) and a
 // standard-sRGB `srgb_encode()` helper. Every pixel shader prepends this and
-// runs its result through `out_encode()` so the matched-pair invariant holds
+// runs its result through `out_finish()` so the matched-pair invariant holds
 // for either incoming encoding. Kept to standard sRGB only — no vendor curve.
+//
+// ADR-027 wish-tint visualization (CI-testable, off by default): when a wish
+// mask is published AND SIM_DISPLAY_WISH_QUANTIZE != off, `wish_tint_mode`
+// goes non-zero (1=band, 2=cell), the last published wish lives at t1
+// (sim-owned copy — the compositor's SRV is call-scoped), and out_finish()
+// tints the output: faint green (8%) where the QUANTIZED simulated state is
+// 3D, faint magenta (8%) where the raw wish is non-zero but the quantized
+// state is off. The in-shader quantization samples the band/cell CENTER —
+// an approximation of the any-nonzero rule (this is a visualization, not the
+// arbitration). wish_tint_mode == 0 ⟹ exactly the pre-ADR-027 output, so
+// existing CI captures are byte-stable.
 #define SIM_DP_D3D11_CB_AND_ENCODE                                                                                      \
 	"cbuffer TileParams : register(b0) {\n"                                                                        \
 	"  float tile_cols_inv; float tile_rows_inv; float tile_cols; float tile_rows;\n"                              \
 	"  float encode_srgb; float3 _pad;\n"                                                                          \
+	"  float wish_tint_mode; float wish_grid_w; float wish_grid_h; float wish_w;\n"                                \
+	"  float wish_h; float3 _pad2;\n"                                                                              \
 	"};\n"                                                                                                         \
+	"Texture2D wish_tex : register(t1);\n"                                                                         \
 	"float3 srgb_encode(float3 c) {\n"                                                                             \
 	"  c = max(c, 0.0);\n"                                                                                         \
 	"  return (c <= 0.0031308) ? (c * 12.92) : (1.055 * pow(c, 1.0 / 2.4) - 0.055);\n"                             \
 	"}\n"                                                                                                          \
 	"float4 out_encode(float4 color) {\n"                                                                          \
 	"  return (encode_srgb > 0.5) ? float4(srgb_encode(color.rgb), color.a) : color;\n"                            \
+	"}\n"                                                                                                          \
+	"float wish_load(float2 uv) {\n"                                                                               \
+	"  int2 px = int2(clamp(uv.x * wish_w, 0.0, wish_w - 1.0), clamp(uv.y * wish_h, 0.0, wish_h - 1.0));\n"        \
+	"  return wish_tex.Load(int3(px, 0)).r;\n"                                                                     \
+	"}\n"                                                                                                          \
+	"float4 wish_tint(float4 color, float2 uv) {\n"                                                                \
+	"  if (wish_tint_mode < 0.5) { return color; }\n"                                                              \
+	"  float raw = wish_load(uv);\n"                                                                               \
+	"  float cx = floor(uv.x * wish_grid_w);\n"                                                                    \
+	"  float cy = floor(uv.y * wish_grid_h);\n"                                                                    \
+	"  float2 q_uv = (wish_tint_mode < 1.5)\n"                                                                     \
+	"      ? float2((cx + 0.5) / wish_grid_w, uv.y)\n"                                                             \
+	"      : float2((cx + 0.5) / wish_grid_w, (cy + 0.5) / wish_grid_h);\n"                                        \
+	"  float q = wish_load(q_uv);\n"                                                                               \
+	"  if (q > 0.002) {\n"                                                                                         \
+	"    color.rgb = lerp(color.rgb, float3(0.0, 1.0, 0.0), 0.08);\n"                                              \
+	"  } else if (raw > 0.002) {\n"                                                                                \
+	"    color.rgb = lerp(color.rgb, float3(1.0, 0.0, 1.0), 0.08);\n"                                              \
+	"  }\n"                                                                                                        \
+	"  return color;\n"                                                                                            \
+	"}\n"                                                                                                          \
+	"float4 out_finish(float4 color, float2 uv) {\n"                                                               \
+	"  return out_encode(wish_tint(color, uv));\n"                                                                 \
 	"}\n"
 
 
@@ -75,7 +113,7 @@ Texture2D atlas_tex : register(t0);
 SamplerState samp : register(s0);
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
-	return out_encode(atlas_tex.Sample(samp, uv));
+	return out_finish(atlas_tex.Sample(samp, uv), uv);
 }
 )";
 
@@ -91,7 +129,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	float2 right_uv = float2((uv.x + col1) * tile_cols_inv, (uv.y + row1) * tile_rows_inv);
 	float4 left  = atlas_tex.Sample(samp, left_uv);
 	float4 right = atlas_tex.Sample(samp, right_uv);
-	return out_encode(float4(left.r, right.g, right.b, 1.0));
+	return out_finish(float4(left.r, right.g, right.b, 1.0), uv);
 }
 )";
 
@@ -107,7 +145,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	uint row = (uint)eye_index / (uint)tile_cols;
 	float src_u = (eye_u + col) * tile_cols_inv;
 	float src_v = (uv.y + row) * tile_rows_inv;
-	return out_encode(atlas_tex.Sample(samp, float2(src_u, src_v)));
+	return out_finish(atlas_tex.Sample(samp, float2(src_u, src_v)), uv);
 }
 )";
 
@@ -126,7 +164,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	float row = floor(view_index / tile_cols);
 	float atlas_u = (local_u + col) * tile_cols_inv;
 	float atlas_v = (local_v + row) * tile_rows_inv;
-	return out_encode(atlas_tex.Sample(samp, float2(atlas_u, atlas_v)));
+	return out_finish(atlas_tex.Sample(samp, float2(atlas_u, atlas_v)), uv);
 }
 )";
 
@@ -142,7 +180,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	float2 right_uv = float2((uv.x + col1) * tile_cols_inv, (uv.y + row1) * tile_rows_inv);
 	float4 left  = atlas_tex.Sample(samp, left_uv);
 	float4 right = atlas_tex.Sample(samp, right_uv);
-	return out_encode(lerp(left, right, 0.5));
+	return out_finish(lerp(left, right, 0.5), uv);
 }
 )";
 
@@ -152,7 +190,7 @@ SamplerState samp : register(s0);
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	float2 atlas_uv = float2(uv.x * tile_cols_inv, uv.y * tile_rows_inv);
-	return out_encode(atlas_tex.Sample(samp, atlas_uv));
+	return out_finish(atlas_tex.Sample(samp, atlas_uv), uv);
 }
 )";
 
@@ -178,10 +216,10 @@ struct sim_display_processor_d3d11_impl
 	//! set_atlas_encoding). calloc-zeroed ⟹ XRT_ATLAS_ENCODING_ENCODED (Model A).
 	enum xrt_atlas_encoding atlas_encoding;
 
-	//! #224 local-zone test double: simulated hardware zone grid (from
-	//! SIM_DISPLAY_ZONE_GRID="WxH", default 1x1 = global on/off).
-	uint32_t zone_grid_w;
-	uint32_t zone_grid_h;
+	//! #224 local-zone test double: shared env config (SIM_DISPLAY_ZONE_GRID
+	//! / SIM_DISPLAY_ZONE_DUMP / SIM_DISPLAY_WISH_QUANTIZE — see
+	//! sim_display_zone_common.h).
+	struct sim_zone_config zone_cfg;
 	//! Last published screen rect + mask dims, for change-gated logging.
 	int32_t zone_last_x, zone_last_y;
 	uint32_t zone_last_w, zone_last_h;
@@ -190,10 +228,18 @@ struct sim_display_processor_d3d11_impl
 	bool zone_active; //!< A client mask is currently published (not cleared).
 	//! SIM_DISPLAY_ZONE_DUMP=1: CPU OR-downsample readback of each published
 	//! mask into the zone grid (change-gated log). Staging tex lazily sized.
-	bool zone_dump;
 	ID3D11Texture2D *zone_staging;
 	uint32_t zone_staging_w, zone_staging_h;
-	char zone_last_map[257]; //!< Last logged cell map ('0'/'1' row-major).
+	char zone_last_map[SIM_ZONE_MAX_CELLS + 1]; //!< Last logged cell map ('0'/'1' row-major).
+
+	//! ADR-027 wish-tint visualization: sim-owned copy of the last published
+	//! wish (the compositor's SRV is call-scoped per the header contract, so
+	//! publish CopyResource's into this). Bound at t1 by process_atlas when
+	//! SIM_DISPLAY_WISH_QUANTIZE != off. Lazily (re)sized to the mask dims.
+	ID3D11Texture2D *wish_copy;
+	ID3D11ShaderResourceView *wish_copy_srv;
+	uint32_t wish_copy_w, wish_copy_h;
+	bool wish_active; //!< wish_copy holds a live (not cleared) publish.
 };
 
 static inline struct sim_display_processor_d3d11_impl *
@@ -220,6 +266,14 @@ struct tile_params_cb
 	float tile_rows;
 	float encode_srgb; //!< 1.0 ⟹ incoming atlas is LINEAR; apply sRGB OETF on output (ADR-021).
 	float _pad[3];     //!< 16-byte alignment to match the HLSL cbuffer.
+	// ADR-027 wish-tint visualization (appended together with the HLSL
+	// cbuffer in SIM_DP_D3D11_CB_AND_ENCODE — keep the two in sync).
+	float wish_tint_mode; //!< 0 = off (byte-stable output), 1 = band, 2 = cell.
+	float wish_grid_w;    //!< Simulated cell grid (from SIM_DISPLAY_ZONE_GRID).
+	float wish_grid_h;
+	float wish_w;      //!< Wish copy dims in pixels (for integer Load coords).
+	float wish_h;
+	float _pad2[3];    //!< 16-byte alignment to match the HLSL cbuffer.
 };
 
 static void
@@ -278,6 +332,19 @@ sim_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	tile_data.tile_cols = static_cast<float>(tile_columns);
 	tile_data.tile_rows = static_cast<float>(tile_rows);
 	tile_data.encode_srgb = encode_srgb ? 1.0f : 0.0f;
+
+	// ADR-027 wish-tint visualization — active only when a wish is published
+	// AND SIM_DISPLAY_WISH_QUANTIZE != off; otherwise mode 0 keeps the
+	// output byte-identical to pre-ADR-027 (existing CI captures stable).
+	const bool tint_on = sdp->zone_cfg.quantize != SIM_ZONE_QUANTIZE_OFF && sdp->wish_active &&
+	                     sdp->wish_copy_srv != nullptr && sdp->wish_copy_w > 0 && sdp->wish_copy_h > 0;
+	if (tint_on) {
+		tile_data.wish_tint_mode = (sdp->zone_cfg.quantize == SIM_ZONE_QUANTIZE_BAND) ? 1.0f : 2.0f;
+		tile_data.wish_grid_w = static_cast<float>(sdp->zone_cfg.grid_w);
+		tile_data.wish_grid_h = static_cast<float>(sdp->zone_cfg.grid_h);
+		tile_data.wish_w = static_cast<float>(sdp->wish_copy_w);
+		tile_data.wish_h = static_cast<float>(sdp->wish_copy_h);
+	}
 	ctx->UpdateSubresource(sdp->tile_cb, 0, nullptr, &tile_data, 0, 0);
 
 	// Set viewport
@@ -295,6 +362,11 @@ sim_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	ctx->PSSetShader(active_ps, nullptr, 0);
 	ctx->PSSetSamplers(0, 1, &sdp->sampler);
 	ctx->PSSetShaderResources(0, 1, &srv);
+	if (tint_on) {
+		// ADR-027 wish-tint: last published wish copy at t1 (Load-only,
+		// no sampler needed).
+		ctx->PSSetShaderResources(1, 1, &sdp->wish_copy_srv);
+	}
 	ctx->PSSetConstantBuffers(0, 1, &sdp->tile_cb);
 
 	// Set topology and draw fullscreen quad (4 vertices, triangle strip)
@@ -302,9 +374,9 @@ sim_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	ctx->IASetInputLayout(nullptr);
 	ctx->Draw(4, 0);
 
-	// Unbind SRV to prevent D3D11 hazard warnings
-	ID3D11ShaderResourceView *null_srv = nullptr;
-	ctx->PSSetShaderResources(0, 1, &null_srv);
+	// Unbind SRVs to prevent D3D11 hazard warnings
+	ID3D11ShaderResourceView *null_srvs[2] = {nullptr, nullptr};
+	ctx->PSSetShaderResources(0, 2, null_srvs);
 }
 
 
@@ -357,6 +429,12 @@ sim_dp_d3d11_destroy(struct xrt_display_processor_d3d11 *xdp)
 	}
 	if (sdp->zone_staging != nullptr) {
 		sdp->zone_staging->Release();
+	}
+	if (sdp->wish_copy_srv != nullptr) {
+		sdp->wish_copy_srv->Release();
+	}
+	if (sdp->wish_copy != nullptr) {
+		sdp->wish_copy->Release();
 	}
 
 	free(sdp);
@@ -469,17 +547,15 @@ static bool
 sim_dp_d3d11_get_local_zone_caps(struct xrt_display_processor_d3d11 *xdp, struct xrt_dp_local_zone_caps *out_caps)
 {
 	struct sim_display_processor_d3d11_impl *sdp = sim_dp_d3d11(xdp);
-	if (out_caps == nullptr || out_caps->struct_size < sizeof(struct xrt_dp_local_zone_caps)) {
-		// v1 is the minimum shape; a smaller caller struct would mean a
-		// runtime older than this header — impossible in-tree.
+	if (out_caps == nullptr || out_caps->struct_size < XRT_DP_LOCAL_ZONE_CAPS_SIZE_V1) {
+		// The V1 shape is the floor — reject only callers older than the
+		// zone API itself. Comparing against sizeof(*out_caps) here would
+		// wrongly reject OLD (V1) runtimes after the ADR-027 append; the
+		// V1 fields are written always and the appended fields only when
+		// the caller's struct_size covers them (SIM_ZONE_FILL_CAPS).
 		return false;
 	}
-	out_caps->supported = 1;
-	out_caps->zone_grid_width = sdp->zone_grid_w;
-	out_caps->zone_grid_height = sdp->zone_grid_h;
-	out_caps->max_mask_width = 16384;
-	out_caps->max_mask_height = 16384;
-	out_caps->max_update_hz = 0; // unlimited — it's a log line.
+	SIM_ZONE_FILL_CAPS(out_caps, &sdp->zone_cfg);
 	return true;
 }
 
@@ -508,7 +584,7 @@ sim_dp_d3d11_publish_local_zone_mask(struct xrt_display_processor_d3d11 *xdp,
 	                   mask_width != sdp->zone_last_mask_w || mask_height != sdp->zone_last_mask_h;
 	if (geo_changed) {
 		U_LOG_W("SIM ZONE PUBLISH: mask=%ux%u screen=(%d,%d %ux%u) grid=%ux%u seq=%llu", mask_width,
-		        mask_height, screen_x, screen_y, screen_w, screen_h, sdp->zone_grid_w, sdp->zone_grid_h,
+		        mask_height, screen_x, screen_y, screen_w, screen_h, sdp->zone_cfg.grid_w, sdp->zone_cfg.grid_h,
 		        (unsigned long long)seq);
 	}
 	sdp->zone_active = true;
@@ -519,14 +595,6 @@ sim_dp_d3d11_publish_local_zone_mask(struct xrt_display_processor_d3d11 *xdp,
 	sdp->zone_last_mask_w = mask_width;
 	sdp->zone_last_mask_h = mask_height;
 	sdp->zone_last_seq = seq;
-
-	// Optional content readback: OR-downsample the mask into the cell grid
-	// (any non-zero pixel in a cell ⟹ cell is 3D — the arbitration rule from
-	// docs/roadmap/local-3d-zones.md) and log the map when it changes.
-	uint32_t cells = sdp->zone_grid_w * sdp->zone_grid_h;
-	if (!sdp->zone_dump || cells == 0 || cells > 256) {
-		return true;
-	}
 
 	ID3D11Resource *res = nullptr;
 	srv->GetResource(&res);
@@ -539,6 +607,59 @@ sim_dp_d3d11_publish_local_zone_mask(struct xrt_display_processor_d3d11 *xdp,
 		res->Release();
 		return true;
 	}
+
+	// ADR-027 wish-tint visualization: retain the wish past this call by
+	// copying into a sim-owned R8 texture (the header contract makes the
+	// passed SRV call-scoped). Only when the tint can ever show
+	// (SIM_DISPLAY_WISH_QUANTIZE != off) — default off ⟹ zero extra work.
+	if (sdp->zone_cfg.quantize != SIM_ZONE_QUANTIZE_OFF) {
+		if (sdp->wish_copy == nullptr || sdp->wish_copy_w != mask_width || sdp->wish_copy_h != mask_height) {
+			if (sdp->wish_copy_srv != nullptr) {
+				sdp->wish_copy_srv->Release();
+				sdp->wish_copy_srv = nullptr;
+			}
+			if (sdp->wish_copy != nullptr) {
+				sdp->wish_copy->Release();
+				sdp->wish_copy = nullptr;
+			}
+			D3D11_TEXTURE2D_DESC wd = {};
+			wd.Width = mask_width;
+			wd.Height = mask_height;
+			wd.MipLevels = 1;
+			wd.ArraySize = 1;
+			wd.Format = DXGI_FORMAT_R8_UNORM;
+			wd.SampleDesc.Count = 1;
+			wd.Usage = D3D11_USAGE_DEFAULT;
+			wd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			if (SUCCEEDED(device->CreateTexture2D(&wd, nullptr, &sdp->wish_copy)) &&
+			    sdp->wish_copy != nullptr) {
+				if (FAILED(device->CreateShaderResourceView(sdp->wish_copy, nullptr,
+				                                            &sdp->wish_copy_srv))) {
+					sdp->wish_copy->Release();
+					sdp->wish_copy = nullptr;
+					sdp->wish_copy_srv = nullptr;
+				}
+			}
+			sdp->wish_copy_w = mask_width;
+			sdp->wish_copy_h = mask_height;
+		}
+		if (sdp->wish_copy != nullptr) {
+			ctx->CopyResource(sdp->wish_copy, res);
+			sdp->wish_active = true;
+		}
+	}
+
+	// Optional content readback: OR-downsample the mask into the cell grid
+	// (any non-zero pixel in a cell ⟹ cell is 3D — the arbitration rule from
+	// docs/roadmap/local-3d-zones.md; SIM_DISPLAY_WISH_QUANTIZE=band further
+	// collapses columns) and log the map when it changes.
+	uint32_t cells = sdp->zone_cfg.grid_w * sdp->zone_cfg.grid_h;
+	if (!sdp->zone_cfg.dump || cells == 0 || cells > SIM_ZONE_MAX_CELLS) {
+		res->Release();
+		device->Release();
+		return true;
+	}
+
 	if (sdp->zone_staging == nullptr || sdp->zone_staging_w != mask_width || sdp->zone_staging_h != mask_height) {
 		if (sdp->zone_staging != nullptr) {
 			sdp->zone_staging->Release();
@@ -572,31 +693,13 @@ sim_dp_d3d11_publish_local_zone_mask(struct xrt_display_processor_d3d11 *xdp,
 	if (FAILED(ctx->Map(sdp->zone_staging, 0, D3D11_MAP_READ, 0, &mapped))) {
 		return true;
 	}
-	char map[257];
-	for (uint32_t cy = 0; cy < sdp->zone_grid_h; cy++) {
-		uint32_t y0 = (cy * mask_height) / sdp->zone_grid_h;
-		uint32_t y1 = ((cy + 1) * mask_height) / sdp->zone_grid_h;
-		for (uint32_t cx = 0; cx < sdp->zone_grid_w; cx++) {
-			uint32_t x0 = (cx * mask_width) / sdp->zone_grid_w;
-			uint32_t x1 = ((cx + 1) * mask_width) / sdp->zone_grid_w;
-			char bit = '0';
-			for (uint32_t y = y0; y < y1 && bit == '0'; y++) {
-				const uint8_t *row = static_cast<const uint8_t *>(mapped.pData) + (size_t)y * mapped.RowPitch;
-				for (uint32_t x = x0; x < x1; x++) {
-					if (row[x] != 0) {
-						bit = '1';
-						break;
-					}
-				}
-			}
-			map[cy * sdp->zone_grid_w + cx] = bit;
-		}
-	}
-	map[cells] = '\0';
+	char map[SIM_ZONE_MAX_CELLS + 1];
+	bool map_ok = sim_zone_downsample_map(static_cast<const uint8_t *>(mapped.pData), mapped.RowPitch, mask_width,
+	                                      mask_height, &sdp->zone_cfg, map);
 	ctx->Unmap(sdp->zone_staging, 0);
 
-	if (strcmp(map, sdp->zone_last_map) != 0) {
-		U_LOG_W("SIM ZONE CELLS [%ux%u]: %s (seq=%llu)", sdp->zone_grid_w, sdp->zone_grid_h, map,
+	if (map_ok && strcmp(map, sdp->zone_last_map) != 0) {
+		U_LOG_W("SIM ZONE CELLS [%ux%u]: %s (seq=%llu)", sdp->zone_cfg.grid_w, sdp->zone_cfg.grid_h, map,
 		        (unsigned long long)seq);
 		memcpy(sdp->zone_last_map, map, sizeof(map));
 	}
@@ -613,6 +716,7 @@ sim_dp_d3d11_clear_local_zone_mask(struct xrt_display_processor_d3d11 *xdp)
 	}
 	sdp->zone_active = false;
 	sdp->zone_last_map[0] = '\0';
+	sdp->wish_active = false; // tint goes dark; the copy texture stays for reuse
 	return true;
 }
 
@@ -657,23 +761,10 @@ sim_display_processor_d3d11_create(enum sim_display_output_mode mode,
 	sdp->base.clear_local_zone_mask = sim_dp_d3d11_clear_local_zone_mask;
 	sdp->base.set_background_2d = sim_dp_d3d11_set_background_2d; // #491 part 3
 
-	// #224 local-zone test double config (see the zone section above).
-	sdp->zone_grid_w = 1;
-	sdp->zone_grid_h = 1;
-	const char *zone_grid_env = getenv("SIM_DISPLAY_ZONE_GRID");
-	if (zone_grid_env != nullptr && zone_grid_env[0] != '\0') {
-		unsigned gw = 0;
-		unsigned gh = 0;
-		if (sscanf(zone_grid_env, "%ux%u", &gw, &gh) == 2 && gw >= 1 && gh >= 1 && gw <= 256 && gh <= 256) {
-			sdp->zone_grid_w = gw;
-			sdp->zone_grid_h = gh;
-		} else {
-			U_LOG_W("sim_display D3D11: bad SIM_DISPLAY_ZONE_GRID '%s' (want WxH, 1..256) — using 1x1",
-			        zone_grid_env);
-		}
-	}
-	const char *zone_dump_env = getenv("SIM_DISPLAY_ZONE_DUMP");
-	sdp->zone_dump = (zone_dump_env != nullptr && zone_dump_env[0] != '\0' && zone_dump_env[0] != '0');
+	// #224 / ADR-027 local-zone test double config (shared parser — see
+	// sim_display_zone_common.h for the SIM_DISPLAY_ZONE_GRID /
+	// SIM_DISPLAY_ZONE_DUMP / SIM_DISPLAY_WISH_QUANTIZE knobs).
+	sim_zone_config_from_env(&sdp->zone_cfg, "D3D11");
 
 	// Nominal viewer parameters (same defaults as sim_display_hmd_create)
 	sdp->ipd_m = 0.06f;

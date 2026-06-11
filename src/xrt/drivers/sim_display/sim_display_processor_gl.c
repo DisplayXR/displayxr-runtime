@@ -13,6 +13,7 @@
  */
 
 #include "sim_display_interface.h"
+#include "sim_display_zone_common.h"
 
 #include "xrt/xrt_display_processor_gl.h"
 #include "xrt/xrt_display_metrics.h"
@@ -193,6 +194,17 @@ struct sim_display_processor_gl
 	float nominal_x_m;
 	float nominal_y_m;
 	float nominal_z_m;
+
+	//! #224 / ADR-027 local-zone test double (GL port of the D3D11 triple).
+	//! Shared env config + change-gated publish/clear logging; the dump
+	//! readback is a same-context glGetTexImage (see the zone section).
+	struct sim_zone_config zone_cfg;
+	int32_t zone_last_x, zone_last_y;
+	uint32_t zone_last_w, zone_last_h;
+	uint32_t zone_last_mask_w, zone_last_mask_h;
+	uint64_t zone_last_seq;
+	bool zone_active; //!< A client mask is currently published (not cleared).
+	char zone_last_map[SIM_ZONE_MAX_CELLS + 1]; //!< Last logged cell map.
 };
 
 static inline struct sim_display_processor_gl *
@@ -432,6 +444,111 @@ sim_dp_gl_set_background_2d(struct xrt_display_processor_gl *xdp,
  *
  */
 
+/*
+ *
+ * #224 / ADR-027 local 2D/3D zones — GL port of the D3D11 test double.
+ *
+ * Change-gated log lines proving the runtime publishes the right wish at the
+ * right screen anchor (CI-greppable). The publish runs with the runtime's GL
+ * context current (per the vtable contract), so SIM_DISPLAY_ZONE_DUMP gets a
+ * REAL content readback here: a same-context glGetTexImage of the published
+ * R8 texture, OR-downsampled into the simulated cell grid via the shared
+ * helper (SIM_DISPLAY_WISH_QUANTIZE=band collapses columns).
+ *
+ */
+
+static bool
+sim_dp_gl_get_local_zone_caps(struct xrt_display_processor_gl *xdp, struct xrt_dp_local_zone_caps *out_caps)
+{
+	struct sim_display_processor_gl *sdp = sim_dp_gl(xdp);
+	if (out_caps == NULL || out_caps->struct_size < XRT_DP_LOCAL_ZONE_CAPS_SIZE_V1) {
+		// V1 floor only — see the D3D11 variant for the append rationale.
+		return false;
+	}
+	SIM_ZONE_FILL_CAPS(out_caps, &sdp->zone_cfg);
+	return true;
+}
+
+static bool
+sim_dp_gl_publish_local_zone_mask(struct xrt_display_processor_gl *xdp,
+                                  uint32_t mask_tex,
+                                  uint32_t mask_width,
+                                  uint32_t mask_height,
+                                  int32_t screen_x,
+                                  int32_t screen_y,
+                                  uint32_t screen_w,
+                                  uint32_t screen_h,
+                                  uint64_t seq)
+{
+	struct sim_display_processor_gl *sdp = sim_dp_gl(xdp);
+	if (mask_tex == 0 || mask_width == 0 || mask_height == 0) {
+		return false;
+	}
+
+	// Change-gated geometry log (seq ticks every frame — not a change).
+	bool geo_changed = !sdp->zone_active || screen_x != sdp->zone_last_x || screen_y != sdp->zone_last_y ||
+	                   screen_w != sdp->zone_last_w || screen_h != sdp->zone_last_h ||
+	                   mask_width != sdp->zone_last_mask_w || mask_height != sdp->zone_last_mask_h;
+	if (geo_changed) {
+		U_LOG_W("SIM ZONE PUBLISH (GL): mask=%ux%u screen=(%d,%d %ux%u) grid=%ux%u seq=%llu", mask_width,
+		        mask_height, screen_x, screen_y, screen_w, screen_h, sdp->zone_cfg.grid_w, sdp->zone_cfg.grid_h,
+		        (unsigned long long)seq);
+	}
+	sdp->zone_active = true;
+	sdp->zone_last_x = screen_x;
+	sdp->zone_last_y = screen_y;
+	sdp->zone_last_w = screen_w;
+	sdp->zone_last_h = screen_h;
+	sdp->zone_last_mask_w = mask_width;
+	sdp->zone_last_mask_h = mask_height;
+	sdp->zone_last_seq = seq;
+
+	// Optional content readback (desktop GL: glGetTexImage is available —
+	// this TU is excluded on Android/GLES).
+	uint32_t cells = sdp->zone_cfg.grid_w * sdp->zone_cfg.grid_h;
+	if (!sdp->zone_cfg.dump || cells == 0 || cells > SIM_ZONE_MAX_CELLS) {
+		return true;
+	}
+
+	uint8_t *pixels = malloc((size_t)mask_width * mask_height);
+	if (pixels == NULL) {
+		return true;
+	}
+	GLint prev_tex = 0;
+	GLint prev_pack = 4;
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+	glGetIntegerv(GL_PACK_ALIGNMENT, &prev_pack);
+	glBindTexture(GL_TEXTURE_2D, (GLuint)mask_tex);
+	glPixelStorei(GL_PACK_ALIGNMENT, 1);
+	glGetTexImage(GL_TEXTURE_2D, 0, GL_RED, GL_UNSIGNED_BYTE, pixels);
+	glPixelStorei(GL_PACK_ALIGNMENT, prev_pack);
+	glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+
+	char map[SIM_ZONE_MAX_CELLS + 1];
+	if (sim_zone_downsample_map(pixels, mask_width, mask_width, mask_height, &sdp->zone_cfg, map) &&
+	    strcmp(map, sdp->zone_last_map) != 0) {
+		U_LOG_W("SIM ZONE CELLS (GL) [%ux%u]: %s (seq=%llu)", sdp->zone_cfg.grid_w, sdp->zone_cfg.grid_h, map,
+		        (unsigned long long)seq);
+		memcpy(sdp->zone_last_map, map, sizeof(map));
+	}
+	free(pixels);
+	return true;
+}
+
+static bool
+sim_dp_gl_clear_local_zone_mask(struct xrt_display_processor_gl *xdp)
+{
+	struct sim_display_processor_gl *sdp = sim_dp_gl(xdp);
+	if (sdp->zone_active) {
+		U_LOG_W("SIM ZONE CLEAR (GL): client contribution withdrawn (last seq=%llu)",
+		        (unsigned long long)sdp->zone_last_seq);
+	}
+	sdp->zone_active = false;
+	sdp->zone_last_map[0] = '\0';
+	return true;
+}
+
+
 xrt_result_t
 sim_display_processor_gl_create(enum sim_display_output_mode mode,
                                  struct xrt_display_processor_gl **out_xdp)
@@ -453,6 +570,12 @@ sim_display_processor_gl_create(enum sim_display_output_mode mode,
 	sdp->base.is_alpha_native = sim_dp_gl_is_alpha_native;
 	sdp->base.set_chroma_key = sim_dp_gl_set_chroma_key;
 	sdp->base.set_background_2d = sim_dp_gl_set_background_2d; // #491 part 3
+	sdp->base.get_local_zone_caps = sim_dp_gl_get_local_zone_caps;         // #224 / ADR-027
+	sdp->base.publish_local_zone_mask = sim_dp_gl_publish_local_zone_mask; // #224 / ADR-027
+	sdp->base.clear_local_zone_mask = sim_dp_gl_clear_local_zone_mask;     // #224 / ADR-027
+
+	// #224 / ADR-027 zone test double config (shared parser).
+	sim_zone_config_from_env(&sdp->zone_cfg, "GL");
 
 	// Nominal viewer parameters (same defaults as sim_display_hmd_create)
 	sdp->ipd_m = 0.06f;

@@ -253,12 +253,38 @@ struct comp_d3d12_compositor
 	//! any dangling reference via zone_mask_destroy.
 	struct comp_d3d12_zone_mask *frame_wish;
 
-	//! Tier-1 fallback edge state (the base D3D12 DP vtable has no
-	//! zone-publish slots until P4): request_display_mode(true) fired once
+	//! Tier-1 fallback edge state: request_display_mode(true) fired once
 	//! on the zones rising edge ("any zone active => request 3D"); never
 	//! forces 2D on the falling edge (mode restore stays with the V-toggle
-	//! logic).
+	//! logic). P4: only taken for legacy DPs (caps.supported == 0) — a
+	//! zone-capable DP gets the per-frame wish publish instead.
 	bool zones_mode_requested;
+
+	//! #224 / ADR-027 hardware-DP zone leg (P4): cached get_local_zone_caps
+	//! result. 0 = not queried yet, 1 = supported, 2 = legacy DP.
+	int zone_dp_state;
+	//! DP zone caps when zone_dp_state == 1.
+	struct xrt_dp_local_zone_caps zone_dp_caps;
+	//! Published-content generation: bumped on zone_mask_submit, on an
+	//! auto-wish re-raster whose rect set / dims actually changed, and on
+	//! an explicit-frame-wish source change — NOT per frame.
+	uint64_t zone_publish_seq;
+	//! True while this client's mask is published to the DP — drives the
+	//! clear-on-deactivate edge.
+	bool zone_published;
+	//! This frame's resolved wish resource + dims (steady
+	//! PIXEL_SHADER_RESOURCE), set by d3d12_update_zone_wish_state and
+	//! reset at the top of layer_commit. The publish runs AFTER the frame's
+	//! ExecuteCommandLists + fence wait, so the content is GPU-complete —
+	//! exactly the publish contract.
+	ID3D12Resource *zone_publish_res; //!< Borrowed (frame-wish staged / implicit_mask_staged) — not owned.
+	uint32_t zone_publish_w, zone_publish_h;
+	//! Seq-bump caches: last explicit wish pointer actually published, and
+	//! the auto raster's rect set (mirrors d3d11's wish_rects; dims tracked
+	//! via zone_publish_w/h persisting across frames).
+	struct comp_d3d12_zone_mask *zone_frame_wish_last;
+	struct xrt_rect zone_wish_rects[XRT_MAX_LAYERS];
+	uint32_t zone_wish_rect_count;
 
 	//! Flattened Local2D layers (the `twod` source). R8G8B8A8_UNORM render
 	//! target — dedicated, NOT shared with surround_scratch (avoids an
@@ -347,6 +373,11 @@ static bool d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 static ID3D12Resource *d3d12_flatten_backdrop_2d(struct comp_d3d12_compositor *c, uint32_t dst_w, uint32_t dst_h,
                                                  uint32_t *out_w, uint32_t *out_h);
 static void d3d12_release_zone_state(struct comp_d3d12_compositor *c);
+// #224 / ADR-027 hardware-DP zone leg (P4): one-time caps probe + per-frame
+// sideband publish of the wish / sticky mask. Defined with the zone helpers
+// near the bottom; called after each path's fence wait in layer_commit.
+static bool d3d12_zone_dp_supported(struct comp_d3d12_compositor *c);
+static void d3d12_sync_zone_mask_to_dp(struct comp_d3d12_compositor *c);
 // #439 surround-capture probe (DISPLAYXR_SURROUND_CAPTURE); defined with the
 // zone helpers, called after each path's fence wait in layer_commit.
 static void d3d12_maybe_capture_surround_target(struct comp_d3d12_compositor *c,
@@ -1405,16 +1436,23 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// XR_EXT_display_zones tier-1 hardware fallback: the base D3D12 DP
-	// vtable has no zone-publish slots until P4, so "any zone active =>
-	// request 3D" once on the rising edge. No forced 2D on the falling
-	// edge.
-	if (c->zones_frame && !c->zones_mode_requested) {
+	// XR_EXT_display_zones hardware leg (P4). Zone-capable DP: the per-frame
+	// wish publish after each path's fence wait drives the per-region switch
+	// — skip the global fallback. Legacy DP (no zone slots): tier-1 fallback
+	// — "any zone active => request 3D" once on the rising edge, no forced
+	// 2D on the falling edge.
+	if (c->zones_frame && !c->zones_mode_requested && !d3d12_zone_dp_supported(c)) {
 		c->zones_mode_requested = true;
 		comp_d3d12_compositor_request_display_mode(&c->base.base, true);
 	} else if (!c->zones_frame) {
 		c->zones_mode_requested = false;
 	}
+
+	// Reset this frame's resolved wish source — d3d12_update_zone_wish_state
+	// sets it in zones frames; a stale pointer from an earlier frame must
+	// never publish. (zone_publish_w/h persist as the previous raster's dims
+	// for the auto-wish seq dirty-check.)
+	c->zone_publish_res = nullptr;
 
 	// #439 Phase 2: the one canvas authority for this frame. While a zone
 	// mask is active (or Local2D layers are present) this is the client-window
@@ -1775,6 +1813,11 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			WaitForSingleObject(c->fence_event, INFINITE);
 		}
 
+		// #224 / ADR-027 P4: sideband-sync this client's zone state with
+		// the DP — runs post-fence so the staged wish / sticky mask is
+		// GPU-complete when the DP samples it during the call.
+		d3d12_sync_zone_mask_to_dp(c);
+
 		// #439 A/B validation probe (no-op unless DISPLAYXR_SURROUND_CAPTURE
 		// is set + trigger file exists). Runs post-fence: the probe re-arms
 		// the cmd list for its readback, which needs the GPU idle.
@@ -2079,6 +2122,11 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
+	// #224 / ADR-027 P4: sideband-sync this client's zone state with the DP
+	// — runs after the present path's fence wait so the staged wish /
+	// sticky mask is GPU-complete when the DP samples it during the call.
+	d3d12_sync_zone_mask_to_dp(c);
+
 	// Post-compose capture (#210) — runs after the existing fence wait so
 	// the GPU is idle when we reset the compositor's cmd allocator/list
 	// for the readback.
@@ -2120,6 +2168,12 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 	}
 
 	// Destroy display processor
+	// #224 P4: withdraw this client's zone contribution from the vendor's
+	// union before the DP goes away (clear-on-teardown edge).
+	if (c->zone_published && c->display_processor != nullptr) {
+		xrt_display_processor_d3d12_clear_local_zone_mask(c->display_processor);
+		c->zone_published = false;
+	}
 	xrt_display_processor_d3d12_destroy(&c->display_processor);
 
 	if (c->dp_srv_heap != nullptr) {
@@ -3239,6 +3293,90 @@ struct comp_d3d12_zone_mask
 	bool submitted;
 };
 
+// #224 / ADR-027 hardware-DP zone leg (P4) — one-time DP zone-capability
+// probe, cached on the compositor (caller holds c->mutex). Returns true when
+// the DP consumes published zone masks; caps are then in c->zone_dp_caps.
+static bool
+d3d12_zone_dp_supported(struct comp_d3d12_compositor *c)
+{
+	if (c->display_processor == nullptr) {
+		return false;
+	}
+	if (c->zone_dp_state == 0) { // 0 = unqueried, 1 = supported, 2 = legacy
+		struct xrt_dp_local_zone_caps caps = {};
+		caps.struct_size = sizeof(caps);
+		bool ok = xrt_display_processor_d3d12_get_local_zone_caps(c->display_processor, &caps);
+		c->zone_dp_state = (ok && caps.supported != 0) ? 1 : 2;
+		if (c->zone_dp_state == 1) {
+			c->zone_dp_caps = caps;
+			U_LOG_W("D3D12 zone DP: local zones supported, grid %ux%u max_mask %ux%u max_hz %u "
+			        "wish_fractional=%u granularity=%u",
+			        caps.zone_grid_width, caps.zone_grid_height, caps.max_mask_width,
+			        caps.max_mask_height, caps.max_update_hz, caps.wish_fractional,
+			        caps.switch_granularity);
+		}
+	}
+	return c->zone_dp_state == 1;
+}
+
+// Keep the DP's view of this client's zone mask in sync with the
+// compositor's — the D3D12 clone of d3d11_sync_zone_mask_to_dp. Called once
+// per layer_commit AFTER the path's ExecuteCommandLists + fence wait, so
+// whatever staged resource we hand over is GPU-complete and in its steady
+// PIXEL_SHADER_RESOURCE state (the publish contract). Zones frame: the WISH
+// this frame's composite resolved (explicit staged or the auto raster);
+// legacy frame: the sticky submitted mask. No resolvable source drives the
+// clear-on-deactivate edge, once. Caller holds c->mutex.
+static void
+d3d12_sync_zone_mask_to_dp(struct comp_d3d12_compositor *c)
+{
+	if (!d3d12_zone_dp_supported(c)) {
+		return; // legacy DP — tier-1 global fallback path unchanged.
+	}
+
+	ID3D12Resource *res = nullptr;
+	uint32_t mask_w = 0;
+	uint32_t mask_h = 0;
+	if (c->zones_frame) {
+		res = c->zone_publish_res;
+		mask_w = c->zone_publish_w;
+		mask_h = c->zone_publish_h;
+	} else {
+		struct comp_d3d12_zone_mask *mask = c->active_zone_mask;
+		if (mask != nullptr && mask->submitted && mask->staged != nullptr) {
+			res = mask->staged;
+			mask_w = mask->w;
+			mask_h = mask->h;
+		}
+	}
+
+	if (res == nullptr) {
+		if (c->zone_published) {
+			xrt_display_processor_d3d12_clear_local_zone_mask(c->display_processor);
+			c->zone_published = false;
+		}
+		return;
+	}
+
+	// Screen-anchor the mask: client-area origin in physical screen pixels.
+	// No HWND (pure offscreen) → nothing to anchor to; skip the publish.
+	HWND wnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
+	RECT r;
+	POINT origin = {0, 0};
+	if (wnd == nullptr || !GetClientRect(wnd, &r) || r.right <= 0 || r.bottom <= 0 ||
+	    !ClientToScreen(wnd, &origin)) {
+		return;
+	}
+
+	bool ok = xrt_display_processor_d3d12_publish_local_zone_mask(c->display_processor, res, mask_w, mask_h,
+	                                                              (int32_t)origin.x, (int32_t)origin.y,
+	                                                              (uint32_t)r.right, (uint32_t)r.bottom,
+	                                                              c->zone_publish_seq);
+	if (ok) {
+		c->zone_published = true;
+	}
+}
+
 // Release the compositor-owned zone consumables (scratches) and detach any
 // active mask (the oxr handle owns the mask object itself). Idempotent;
 // called from d3d12_compositor_destroy only — NOT from the surround release
@@ -3247,8 +3385,11 @@ static void
 d3d12_release_zone_state(struct comp_d3d12_compositor *c)
 {
 	c->active_zone_mask = nullptr;
-	// XR_EXT_display_zones: drop the frame-wish borrow + frame state.
+	// XR_EXT_display_zones: drop the frame-wish borrow + frame state
+	// (+ the P4 publish-source borrow and seq-dedup cache).
 	c->frame_wish = nullptr;
+	c->zone_frame_wish_last = nullptr;
+	c->zone_publish_res = nullptr;
 	c->zones_frame = false;
 	if (c->surround_scratch != nullptr) {
 		c->surround_scratch->Release();
@@ -3802,6 +3943,18 @@ d3d12_update_zone_wish_state(struct comp_d3d12_compositor *c, uint32_t region_w,
 		std::swap(to_copy[0].Transition.StateBefore, to_copy[0].Transition.StateAfter);
 		std::swap(to_copy[1].Transition.StateBefore, to_copy[1].Transition.StateAfter);
 		c->cmd_list->ResourceBarrier(2, to_copy);
+
+		// P4 publish source + seq: the staged explicit wish. Bump the
+		// generation on a source change (pointer flip; D3D12 masks carry
+		// no author generation, so a same-pointer re-author keeps its seq
+		// — vendors treat same-seq as anchor-only updates).
+		c->zone_publish_res = fw->staged;
+		c->zone_publish_w = fw->w;
+		c->zone_publish_h = fw->h;
+		if (c->zone_frame_wish_last != fw) {
+			c->zone_frame_wish_last = fw;
+			c->zone_publish_seq++;
+		}
 		return fw->staged;
 	}
 
@@ -3813,7 +3966,30 @@ d3d12_update_zone_wish_state(struct comp_d3d12_compositor *c, uint32_t region_w,
 		}
 		rects[rect_count++] = c->layer_accum.layers[i].data.zone_3d.rect;
 	}
-	return d3d12_update_zone_wish_mask(c, rects, rect_count, region_w, region_h);
+	ID3D12Resource *staged = d3d12_update_zone_wish_mask(c, rects, rect_count, region_w, region_h);
+	if (staged != nullptr) {
+		// P4 publish source + seq: the auto raster. It re-records every
+		// zones frame, but identical rect set + dims = identical content —
+		// bump the generation only when something actually changed (or the
+		// source flipped explicit -> auto).
+		bool wish_dirty = c->zone_frame_wish_last != nullptr || c->zone_wish_rect_count != rect_count ||
+		                  c->zone_publish_w != region_w || c->zone_publish_h != region_h;
+		for (uint32_t i = 0; !wish_dirty && i < rect_count; i++) {
+			if (memcmp(&c->zone_wish_rects[i], &rects[i], sizeof(rects[i])) != 0) {
+				wish_dirty = true;
+			}
+		}
+		if (wish_dirty) {
+			c->zone_frame_wish_last = nullptr;
+			memcpy(c->zone_wish_rects, rects, sizeof(rects[0]) * rect_count);
+			c->zone_wish_rect_count = rect_count;
+			c->zone_publish_seq++;
+		}
+		c->zone_publish_res = staged;
+		c->zone_publish_w = region_w;
+		c->zone_publish_h = region_h;
+	}
+	return staged;
 }
 
 // #439 Phase 3 — flatten this frame's Local2D layers into local2d_scratch (the
@@ -4769,6 +4945,7 @@ comp_d3d12_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask_ptr
 
 	mask->submitted = true;
 	c->active_zone_mask = mask;
+	c->zone_publish_seq++; // #224 P4: new content generation for the DP publish
 	return XRT_SUCCESS;
 }
 
@@ -4788,6 +4965,14 @@ comp_d3d12_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_pt
 	}
 	if (c->active_zone_mask == mask) {
 		c->active_zone_mask = nullptr; // revert to rect-surround behavior
+	}
+	// #224 P4: drop the seq-dedup cache (pointer may be reused by a future
+	// alloc) and any per-frame publish source borrowed from this mask.
+	if (c->zone_frame_wish_last == mask) {
+		c->zone_frame_wish_last = nullptr;
+	}
+	if (c->zone_publish_res == mask->staged) {
+		c->zone_publish_res = nullptr;
 	}
 	// The frame that might still reference these resources has fence-waited
 	// before layer_commit returned (the mutex we hold serializes us behind

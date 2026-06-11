@@ -64,6 +64,7 @@ target_include_directories(drv_sim_display_includes INTERFACE sim_display)
 set(SIM_DISPLAY_SOURCES
 	sim_display/sim_display_device.c
 	sim_display/sim_display_interface.h
+	sim_display/sim_display_zone_common.h
 	)
 
 # Vulkan display processor (anaglyph/blend shaders)
