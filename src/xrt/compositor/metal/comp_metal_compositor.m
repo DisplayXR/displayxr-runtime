@@ -135,6 +135,13 @@ struct comp_metal_compositor
 	//! Render pipeline for atlas layer compositing.
 	id<MTLRenderPipelineState> projection_pipeline;
 
+	//! XR_EXT_display_zones (ADR-027): projection-shader variants with
+	//! alpha-over blending for zone draws into the atlas, so overlapping
+	//! zones composite in layer-list order instead of overwriting. Mirrors
+	//! D3D11's blend_premul / blend_alpha pair on the same draw site.
+	id<MTLRenderPipelineState> zone_premult_pipeline;
+	id<MTLRenderPipelineState> zone_unpremult_pipeline;
+
 	//! Render pipeline for fullscreen blit (atlas→target passthrough).
 	id<MTLRenderPipelineState> blit_pipeline;
 
@@ -143,6 +150,10 @@ struct comp_metal_compositor
 
 	//! Depth stencil state.
 	id<MTLDepthStencilState> depth_stencil_state;
+
+	//! Depth disabled (always pass, no write) — zone draws, like D3D11's
+	//! zone branch, must not depth-reject a later overlapping zone.
+	id<MTLDepthStencilState> depth_stencil_state_disabled;
 
 	//! Atlas texture (tile_columns * view_width × tile_rows * view_height).
 	id<MTLTexture> atlas_texture;
@@ -681,6 +692,46 @@ compile_shaders(struct comp_metal_compositor *c)
 		}
 	}
 
+	// Zone alpha-over pipelines (XR_EXT_display_zones, ADR-027): the same
+	// projection shaders + depth attachment, but with "over" blending so
+	// overlapping zones composite in layer-list order (the no-blend rationale
+	// above protects full-canvas projection alpha passthrough; zone draws are
+	// placed sub-rects whose content alpha is the compositing contract —
+	// rule 4). Premultiplied by default; the unpremultiplied variant only
+	// changes the source RGB factor (XR_COMPOSITION_LAYER_UNPREMULTIPLIED_
+	// ALPHA_BIT). Alpha factors are One/OneMinusSrcAlpha in both so the
+	// zone's own transparency survives into the atlas (the unzoned/zoned
+	// alpha drives the desktop show-through downstream).
+	{
+		MTLRenderPipelineDescriptor *zone_desc = [[MTLRenderPipelineDescriptor alloc] init];
+		zone_desc.vertexFunction = proj_vs;
+		zone_desc.fragmentFunction = proj_fs;
+		zone_desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+		zone_desc.colorAttachments[0].blendingEnabled = YES;
+		zone_desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+		zone_desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+		zone_desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+		zone_desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+		zone_desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+
+		c->zone_premult_pipeline = [c->device newRenderPipelineStateWithDescriptor:zone_desc error:&error];
+		if (c->zone_premult_pipeline == nil) {
+			U_LOG_E("Failed to create zone premult pipeline: %s",
+			        error.localizedDescription.UTF8String);
+			[zone_desc release];
+			goto cleanup;
+		}
+
+		zone_desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+		c->zone_unpremult_pipeline = [c->device newRenderPipelineStateWithDescriptor:zone_desc error:&error];
+		[zone_desc release];
+		if (c->zone_unpremult_pipeline == nil) {
+			U_LOG_E("Failed to create zone unpremult pipeline: %s",
+			        error.localizedDescription.UTF8String);
+			goto cleanup;
+		}
+	}
+
 	// Local-2D flatten pipelines (#439 Phase 3) — projection shaders with
 	// alpha blending into the window-sized 2D scratch (no depth attachment).
 	// Premultiplied "over" by default; the unpremultiplied variant only
@@ -769,6 +820,13 @@ compile_shaders(struct comp_metal_compositor *c)
 		ds_desc.depthCompareFunction = MTLCompareFunctionLessEqual;
 		ds_desc.depthWriteEnabled = YES;
 		c->depth_stencil_state = [c->device newDepthStencilStateWithDescriptor:ds_desc];
+		[ds_desc release];
+	}
+	{
+		MTLDepthStencilDescriptor *ds_desc = [[MTLDepthStencilDescriptor alloc] init];
+		ds_desc.depthCompareFunction = MTLCompareFunctionAlways;
+		ds_desc.depthWriteEnabled = NO;
+		c->depth_stencil_state_disabled = [c->device newDepthStencilStateWithDescriptor:ds_desc];
 		[ds_desc release];
 	}
 
@@ -3083,13 +3141,12 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					// (client-window px, top-left — same orientation
 					// as Metal textures) into the tile box; in zones
 					// frames the tile spans the full window, so
-					// scale = tile/window. NOTE (Metal P2): the
-					// projection pipeline draws with blending OFF, so
-					// overlapping zones OVERWRITE in layer order
-					// (one-shot WARN below; a blend pipeline-state
-					// variant rides the P4/renderer follow-up rather
-					// than being authored blind — Metal is code-only
-					// this pass).
+					// scale = tile/window. Zones draw through the
+					// alpha-over pipeline variants below, so
+					// overlapping zones composite in layer-list order
+					// (D3D11 parity; the zones-frame atlas clear is
+					// transparent, so a lone zone lands bit-identical
+					// to the old no-blend write).
 					if (zones_target_w == 0 || zones_target_h == 0) {
 						continue;
 					}
@@ -3103,37 +3160,25 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					if (vp.width <= 0.0 || vp.height <= 0.0) {
 						continue;
 					}
-					static bool zone_overlap_warned = false;
-					if (!zone_overlap_warned && i > 0) {
-						for (uint32_t pz = 0; pz < i && !zone_overlap_warned; pz++) {
-							if (c->layer_accum.layers[pz].data.type !=
-							    XRT_LAYER_ZONE_3D) {
-								continue;
-							}
-							const struct xrt_rect *pr =
-							    &c->layer_accum.layers[pz].data.zone_3d.rect;
-							bool overlap =
-							    pr->offset.w < zr->offset.w + zr->extent.w &&
-							    zr->offset.w < pr->offset.w + pr->extent.w &&
-							    pr->offset.h < zr->offset.h + zr->extent.h &&
-							    zr->offset.h < pr->offset.h + pr->extent.h;
-							if (overlap) {
-								zone_overlap_warned = true;
-								U_LOG_W(
-								    "Metal zones: overlapping zones OVERWRITE "
-								    "in draw order (alpha-over needs a blend "
-								    "pipeline variant — one-time warning)");
-							}
-						}
-					}
 				}
 				vp.znear = 0.0;
 				vp.zfar = 1.0;
 				[encoder setViewport:vp];
 
-				// Set pipeline and textures
-				[encoder setRenderPipelineState:c->projection_pipeline];
-				[encoder setDepthStencilState:c->depth_stencil_state];
+				// Set pipeline and textures. Zone draws blend alpha-over
+				// (premultiplied unless the layer declares straight alpha)
+				// with depth disabled — a later overlapping zone must
+				// neither be depth-rejected nor overwrite (D3D11 parity).
+				if (is_zone) {
+					const bool unpremul =
+					    (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
+					[encoder setRenderPipelineState:(unpremul ? c->zone_unpremult_pipeline
+					                                          : c->zone_premult_pipeline)];
+					[encoder setDepthStencilState:c->depth_stencil_state_disabled];
+				} else {
+					[encoder setRenderPipelineState:c->projection_pipeline];
+					[encoder setDepthStencilState:c->depth_stencil_state];
+				}
 				[encoder setFragmentTexture:src_tex atIndex:0];
 				[encoder setFragmentSamplerState:c->sampler_linear atIndex:0];
 
@@ -3763,12 +3808,18 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	c->depth_texture = nil;
 	[c->projection_pipeline release];
 	c->projection_pipeline = nil;
+	[c->zone_premult_pipeline release];
+	c->zone_premult_pipeline = nil;
+	[c->zone_unpremult_pipeline release];
+	c->zone_unpremult_pipeline = nil;
 	[c->blit_pipeline release];
 	c->blit_pipeline = nil;
 	[c->sampler_linear release];
 	c->sampler_linear = nil;
 	[c->depth_stencil_state release];
 	c->depth_stencil_state = nil;
+	[c->depth_stencil_state_disabled release];
+	c->depth_stencil_state_disabled = nil;
 
 	// 6. Close window synchronously inside @autoreleasepool so the
 	//    NSWindow dealloc (and its frame view cascade) happens NOW,

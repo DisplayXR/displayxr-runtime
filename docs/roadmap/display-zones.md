@@ -5,7 +5,9 @@
 > This doc carries the two living parts: the reference-consumer migration and
 > the implementation phasing. Status: **runtime phases P1–P4 SHIPPED**
 > (extension advertised; D3D11 capture- + Leia-validated, VK/D3D12/GL
-> code-validated, Metal code-only pending a Mac eyeball). Remaining:
+> code-validated, Metal sim- + eyeball-validated 2026-06-11 via the
+> permanent `cube_zones_metal_macos` test app — incl. zone overlap
+> alpha-over, which Metal now does natively). Remaining:
 > Phase 5 (Leia plugin caps + IPC, `displayxr-leia-plugin` repo) and
 > Phase 6 (avatar migration, `displayxr-demo-avatar` repo).
 
@@ -151,9 +153,17 @@ Shipped; extension always advertised, `DISPLAYXR_ZONES` gate removed. The
 "delete the single-rect supersede special case" item resolved conservatively:
 legacy zero-zone behavior is a compatibility contract and stays; the raster
 unification is folded into the per-API wish rasterizers reusing the
-implicit-mask resources. Metal remains code-only until a Mac eyeball. GL
-caveat: the masked composite (and so the wish lerp) exists only on the GL
-window-present path — same pre-existing scope as Local2D on GL.
+implicit-mask resources. Metal validated on a Mac 2026-06-11 (sim_display
+sbs + anaglyph atlas captures + live eyeball) via the permanent
+`cube_zones_metal_macos` test app — caps, per-zone view sizes, zone
+placement per view tile, AUTO wish raster, Tier-2 explicit wish, validate
+bit, M/O interactive toggles. Metal Tier-3 wish is structurally absent
+(no `XrLocal3DZoneRenderTarget*EXT` Metal binding). The Metal overlap
+OVERWRITE limitation found in that pass was fixed same-day: zone draws go
+through dedicated alpha-over pipeline variants (premultiplied / straight
+per layer flags, depth disabled — D3D11 parity). GL caveat: the masked
+composite (and so the wish lerp) exists only on the GL window-present
+path — same pre-existing scope as Local2D on GL.
 
 
 - Mechanical port per the #439 Phase-3 playbook (D3D11 + VK are reference).
