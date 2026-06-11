@@ -51,6 +51,16 @@ static InputState g_inputState;
 static std::mutex g_inputMutex;
 static std::atomic<bool> g_running{true};
 static XrSessionManager* g_xr = nullptr;
+
+// #542 content-pin (validation affordance): freeze the submission-side mode
+// snapshot while hardware mode requests (V / 0-8) still go out — drives a
+// deliberate hardware/content divergence so the decoupled compositors can be
+// exercised (e.g. panel-2D + 2 submitted tiles). Toggle: 'L' key;
+// DXR_CUBE_PIN_CONTENT=1 starts pinned. Toggle flag is atomic (set on the
+// message-pump thread, consumed on the render thread).
+static std::atomic<bool> g_contentPinTogglePending{false};
+static bool g_contentPinned = false;          // render-thread only
+static uint32_t g_contentPinModeIndex = 0;    // render-thread only
 static UINT g_windowWidth = 1280;
 static UINT g_windowHeight = 720;
 
@@ -227,6 +237,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         if (wParam == VK_F11) {
             ToggleFullscreen(hwnd);
+            return 0;
+        }
+        // #542 content-pin: 'L' freezes the submission-side mode snapshot
+        // (handled on the render thread) while V/0-8 hardware requests still
+        // go out — drives a deliberate hardware/content divergence.
+        if (wParam == 'L') {
+            g_contentPinTogglePending.store(true);
             return 0;
         }
         break;
@@ -589,19 +606,50 @@ static void RenderThreadFunc(
         UpdateScene(*renderer, perfStats.deltaTime, xr->spinSpeed);
         PollEvents(*xr);
 
+        // #542 content-pin: resolve the env start-pin once, then any pending
+        // 'L' toggle. While pinned the render/submit path below derives its
+        // layout from the SNAPSHOT mode, not the live one — mode requests keep
+        // flowing, so hardware and content diverge on purpose.
+        {
+            static bool s_pinEnvChecked = false;
+            if (!s_pinEnvChecked && xr->sessionRunning) {
+                s_pinEnvChecked = true;
+                const char *pin = getenv("DXR_CUBE_PIN_CONTENT");
+                if (pin && pin[0] == '1') {
+                    g_contentPinned = true;
+                    g_contentPinModeIndex = xr->currentModeIndex;
+                    LOG_INFO("[#542] content PINNED at start (mode=%u)", g_contentPinModeIndex);
+                }
+            }
+            if (g_contentPinTogglePending.exchange(false)) {
+                g_contentPinned = !g_contentPinned;
+                if (g_contentPinned) {
+                    g_contentPinModeIndex = xr->currentModeIndex;
+                }
+                LOG_INFO("[#542] content %s (snapshot mode=%u, live mode=%u)",
+                    g_contentPinned ? "PINNED" : "UNPINNED",
+                    g_contentPinModeIndex, xr->currentModeIndex);
+            }
+        }
+
         if (xr->sessionRunning) {
             XrFrameState frameState;
             if (BeginFrame(*xr, frameState)) {
-                uint32_t modeViewCount = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount)
-                    ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2;
-                uint32_t tileColumns = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount)
-                    ? xr->renderingModeTileColumns[xr->currentModeIndex] : 2;
-                uint32_t tileRows = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount)
-                    ? xr->renderingModeTileRows[xr->currentModeIndex] : 1;
-                bool monoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[xr->currentModeIndex]);
-                if (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) {
-                    xr->recommendedViewScaleX = xr->renderingModeScaleX[xr->currentModeIndex];
-                    xr->recommendedViewScaleY = xr->renderingModeScaleY[xr->currentModeIndex];
+                // #542 content-pin: the render/submit layout derives from the
+                // pinned snapshot when active, the live mode otherwise.
+                uint32_t contentModeIndex =
+                    (g_contentPinned && g_contentPinModeIndex < xr->renderingModeCount)
+                        ? g_contentPinModeIndex : xr->currentModeIndex;
+                uint32_t modeViewCount = (xr->renderingModeCount > 0 && contentModeIndex < xr->renderingModeCount)
+                    ? xr->renderingModeViewCounts[contentModeIndex] : 2;
+                uint32_t tileColumns = (xr->renderingModeCount > 0 && contentModeIndex < xr->renderingModeCount)
+                    ? xr->renderingModeTileColumns[contentModeIndex] : 2;
+                uint32_t tileRows = (xr->renderingModeCount > 0 && contentModeIndex < xr->renderingModeCount)
+                    ? xr->renderingModeTileRows[contentModeIndex] : 1;
+                bool monoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[contentModeIndex]);
+                if (xr->renderingModeCount > 0 && contentModeIndex < xr->renderingModeCount) {
+                    xr->recommendedViewScaleX = xr->renderingModeScaleX[contentModeIndex];
+                    xr->recommendedViewScaleY = xr->renderingModeScaleY[contentModeIndex];
                 }
                 int eyeCount = monoMode ? 1 : (int)modeViewCount;
                 std::vector<XrCompositionLayerProjectionView> projectionViews(eyeCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
@@ -859,6 +907,12 @@ static void RenderThreadFunc(
                                     xr->renderingModeCount,
                                     xr->renderingModeCount > 0 ? xr->renderingModeDisplay3D[xr->currentModeIndex] : true,
                                     xr->renderingModeCount > 0 ? xr->renderingModeIsRequestable[xr->currentModeIndex] : true);
+                                if (g_contentPinned) {
+                                    wchar_t pinBuf[64];
+                                    swprintf(pinBuf, 64, L"\nCONTENT PINNED [L]: %ux%u x%d",
+                                        tileColumns, tileRows, eyeCount);
+                                    dispText += pinBuf;
+                                }
                                 std::wstring eyeText = FormatEyeTrackingInfo(
                                     xr->eyePositions, (uint32_t)eyeCount,
                                     xr->eyeTrackingActive, xr->isEyeTracking,
