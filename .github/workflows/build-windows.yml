@@ -456,6 +456,96 @@ jobs:
           Write-Host "`nAll DLLs in build directory:"
           Get-ChildItem test_apps/cube_handle_d3d11_win/build/*.dll | ForEach-Object { Write-Host "  $($_.Name)" }
 
+  # D3D11 zones test app — XR_EXT_display_zones exerciser (ADR-027)
+  TestAppCubeZonesD3D11:
+    if: needs.DetectChanges.outputs.test_apps_changed == 'true'
+    runs-on: windows-2022
+    needs: [Runtime, DetectChanges]  # Wait for runtime build to get artifacts
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Download runtime artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: DisplayXR
+          path: runtime
+
+      - name: List runtime artifacts
+        run: |
+          Write-Host "Runtime directory contents:"
+          Get-ChildItem -Recurse runtime | Select-Object FullName
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install OpenXR loader
+        run: |
+          # Download and extract OpenXR SDK
+          $openxrVersion = "1.1.43"
+          $openxrUrl = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$openxrVersion/openxr_loader_windows-$openxrVersion.zip"
+          Write-Host "Downloading OpenXR loader from $openxrUrl"
+          Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
+          Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
+          Write-Host "OpenXR SDK contents:"
+          Get-ChildItem -Recurse openxr_sdk | Select-Object FullName
+
+      - name: Build D3D11 zones test app (cube_zones_d3d11_win)
+        run: |
+          cd test_apps/cube_zones_d3d11_win
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
+          cmake --build build
+
+      - name: Copy required DLLs to test app build
+        run: |
+          # Explicitly use the x64 OpenXR loader DLL
+          $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1
+          if (-not $loaderDll) {
+            # Fallback to any loader if x64 path not found
+            $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1
+          }
+          if ($loaderDll) {
+            Copy-Item $loaderDll.FullName -Destination test_apps/cube_zones_d3d11_win/build/
+            Write-Host "Copied $($loaderDll.FullName) to test app build"
+          } else {
+            Write-Host "Warning: openxr_loader.dll not found"
+          }
+
+          # NOTE: D3DCompiler_47.dll is a Windows system component available since Win8.
+          # We do NOT bundle it - the app will use the system version.
+          # Bundling caused 0xc000007b errors on some systems.
+          Write-Host "Not bundling D3DCompiler_47.dll - will use system version"
+
+      - name: Verify binary architectures
+        run: |
+          Write-Host "=== Checking binary architectures ==="
+          $exe = "test_apps/cube_zones_d3d11_win/build/cube_zones_d3d11_win.exe"
+          $dll = "test_apps/cube_zones_d3d11_win/build/openxr_loader.dll"
+
+          Write-Host "`nEXE architecture:"
+          dumpbin /headers $exe | Select-String -Pattern "machine \(|File Type:"
+
+          Write-Host "`nDLL architecture:"
+          dumpbin /headers $dll | Select-String -Pattern "machine \(|File Type:"
+
+          Write-Host "`nDependencies of EXE:"
+          dumpbin /dependents $exe
+
+          Write-Host "`nDependencies of openxr_loader.dll:"
+          dumpbin /dependents $dll
+
+          Write-Host "`nAll DLLs in build directory:"
+          Get-ChildItem test_apps/cube_zones_d3d11_win/build/*.dll | ForEach-Object { Write-Host "  $($_.Name)" }
+
   # D3D11 hosted test app - Standard OpenXR app (runtime creates window)
   TestAppCubeHostedD3D11:
     if: needs.DetectChanges.outputs.test_apps_changed == 'true'
