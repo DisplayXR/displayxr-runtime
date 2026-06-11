@@ -31,8 +31,8 @@ Decisions made by precedent (no open question):
 ## 3. API (header v3)
 
 ```c
-#define XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT            ((XrStructureType)1000999135)
-#define XR_TYPE_EVENT_DATA_LOCAL_3D_ZONE_VIEW_SIZE_CHANGED_EXT ((XrStructureType)1000999136)
+#define XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT            ((XrStructureType)1000999165)
+#define XR_TYPE_EVENT_DATA_LOCAL_3D_ZONE_VIEW_SIZE_CHANGED_EXT ((XrStructureType)1000999166)
 
 // Post-weave 2D content at a client-window pixel rect, mask-gated:
 // final = M·weave + (1−M)·flatten(local2D layers). Premultiplied alpha unless

@@ -22,11 +22,11 @@
 
 ### 2.1 Header v2 — `XR_EXT_local_3d_zone.h`, SPEC_VERSION 2
 
-Two new Tier-3 binding structs (model: the D3D11 one at type `...132`):
+Two new Tier-3 binding structs (model: the D3D11 one at type `...162`):
 
 ```c
-#define XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D12_EXT  ((XrStructureType)1000999133)
-#define XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_VULKAN_EXT ((XrStructureType)1000999134)
+#define XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D12_EXT  ((XrStructureType)1000999163)
+#define XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_VULKAN_EXT ((XrStructureType)1000999164)
 
 // D3D12: the runtime returns the ID3D12Resource* (R8_UNORM, w×h client px);
 // the app creates its OWN RTV on it (descriptor heaps are app-owned in D3D12).

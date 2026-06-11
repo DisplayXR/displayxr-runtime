@@ -27,17 +27,20 @@ extern "C" {
 #endif
 
 #define XR_EXT_atlas_capture 1
+// SPEC_VERSION 3: XrStructureType values relocated 1000999120..121 ->
+// 1000999170..171 (the old block collided with XR_EXT_workspace_file_dialog,
+// which reserved it first). No struct/field/entry-point changes; consumers
+// only need a header re-sync + rebuild.
 // SPEC_VERSION 2: the runtime appends "_atlas_<viewCount>_<cols>x<rows>.png"
 // (was a flat "_atlas.png" in v1), and the encoded PNG is always opaque
 // (alpha forced to 255). See issue #425.
-#define XR_EXT_atlas_capture_SPEC_VERSION 2
+#define XR_EXT_atlas_capture_SPEC_VERSION 3
 #define XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME "XR_EXT_atlas_capture"
 
-// Reserved 1000999xxx range, next free slot after the workspace block
-// (1000999100..110). Final values reconcile with the Khronos registry before
-// spec freeze.
-#define XR_TYPE_ATLAS_CAPTURE_INFO_EXT   ((XrStructureType)1000999120)
-#define XR_TYPE_ATLAS_CAPTURE_RESULT_EXT ((XrStructureType)1000999121)
+// Reserved 1000999170..171. Final values reconcile with the Khronos registry
+// before spec freeze. Allocation registry: README.md in this directory.
+#define XR_TYPE_ATLAS_CAPTURE_INFO_EXT   ((XrStructureType)1000999170)
+#define XR_TYPE_ATLAS_CAPTURE_RESULT_EXT ((XrStructureType)1000999171)
 
 #define XR_ATLAS_CAPTURE_PATH_MAX_EXT 256
 
