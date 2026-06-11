@@ -261,6 +261,15 @@ android {
             if (project.hasProperty('dxrForceVendoredCjson')) {
                 cmake.arguments "-DCMAKE_DISABLE_FIND_PACKAGE_cJSON=ON"
             }
+
+            // Dev override: build the Kooima math (displayxr-common) from a local
+            // checkout instead of the pinned GIT_TAG, for iterating on the shared
+            // core (e.g. #521). Pass -PdxrCommonSrc=/abs/path/to/displayxr-common.
+            // CMake's FetchContent honors FETCHCONTENT_SOURCE_DIR_<name> to swap
+            // the fetched source for a local dir. No effect when unset.
+            if (project.hasProperty('dxrCommonSrc')) {
+                cmake.arguments "-DFETCHCONTENT_SOURCE_DIR_DISPLAYXR_COMMON=${project.dxrCommonSrc}"
+            }
         }
 
         // Be sure to copy over licenses formatted as required.

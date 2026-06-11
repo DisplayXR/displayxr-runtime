@@ -859,13 +859,26 @@ ipc_try_get_android_view_poses(volatile struct ipc_client_state *ics,
 		head_eyes[1] = (struct xrt_vec3){nx + ipd * 0.5f, ny, nz};
 	}
 
-	// Render input. 2D / mono (view_count == 1): collapse to a CENTERED eye so
-	// the off-axis frustum is symmetric (no off-center crop). 3D: per-eye
-	// off-axis. Gate on the active mode's view_count directly (the cube is an
-	// extension app, so the in-process legacy_app_tile_scaling gate doesn't apply).
+	// Render input. 2D / mono: collapse to a CENTERED eye so the off-axis frustum
+	// is symmetric (no off-center crop / parallax shift). 3D: per-eye off-axis.
+	//
+	// #521: the gate must be the ACTIVE RENDERING MODE's view_count, NOT the
+	// locate's `view_count` param. An extension app locates against its stereo
+	// view-config (always 2 views) and merely *submits* 1 in 2D mode — so
+	// `view_count` stays 2 even in 2D. Gating on it left views[0] as the off-axis
+	// LEFT eye, which the app then presented as its mono 2D image → the cube
+	// rendered shifted. The server head device's active_rendering_mode_index is
+	// NOT reliable in OOP (OUTPUT_MODE doesn't cross IPC), so the client forwards
+	// the active mode's view count in rig->render_view_count. Fall back to the
+	// located view_count when unset (0).
+	uint32_t active_view_count = view_count;
+	if (rig != NULL && rig->render_view_count > 0) {
+		active_view_count = rig->render_view_count;
+	}
+
 	struct xrt_vec3 raw_eyes[XRT_MAX_VIEWS] = {0};
 	uint32_t eye_count;
-	if (view_count == 1) {
+	if (active_view_count == 1) {
 		raw_eyes[0] = (struct xrt_vec3){
 		    0.5f * (head_eyes[0].x + head_eyes[1].x),
 		    0.5f * (head_eyes[0].y + head_eyes[1].y),

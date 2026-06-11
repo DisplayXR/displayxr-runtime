@@ -756,6 +756,13 @@ struct ipc_view_rig_info
 	float half_tan_vfov;            //!< Camera rig only
 	float ipd_factor;               //!< Both rigs
 	float parallax_factor;          //!< Both rigs
+	//! Active rendering mode's view count (1 = mono/2D, 2 = stereo/3D). #521:
+	//! the located view_count is the app's stereo view-config (always 2) and does
+	//! NOT drop to 1 in 2D mode; OUTPUT_MODE doesn't cross IPC, so the server
+	//! can't read the mode from the head device. The client (which owns the
+	//! active mode) forwards it here so the server collapses to a centered eye in
+	//! 2D. 0 = unknown → server falls back to the located view_count.
+	uint32_t render_view_count;
 };
 
 /*!
