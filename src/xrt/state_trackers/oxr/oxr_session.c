@@ -120,6 +120,11 @@ comp_ipc_client_compositor_get_predicted_eye_positions(struct xrt_compositor *xc
 void
 comp_ipc_client_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t mode);
 
+// IPC-client HARDWARE 2D/3D request to the out-of-process DP (#533) — same
+// linkage pattern. The hardware weave-state, decoupled from per-frame content.
+void
+comp_ipc_client_compositor_request_display_mode(struct xrt_compositor *xc, uint32_t enable_3d);
+
 // Same fetch via the SYSTEM compositor (#449) for compositor-less sessions
 // (headless XR_MND_headless clients like the WebXR bridge, which have no
 // xcn). Same linkage pattern as above.
@@ -447,13 +452,24 @@ oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *ses
 
 	// In-process multi compositor path (not used for IPC clients).
 	// IPC clients have an ipc_client_compositor, not a multi_compositor.
-	if (sess->sys->xsysc->xmcc != NULL) {
+	if (sess->sys->xsysc != NULL && sess->sys->xsysc->xmcc != NULL) {
 		struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
 		success = multi_compositor_request_display_mode(mc, enable_3d);
 		if (success) {
 			sess->hardware_display_3d = enable_3d;
 		}
 		return XR_SUCCESS;
+	}
+
+	// Out-of-process IPC client (single-app OOP Android, #533): push the HARDWARE
+	// 2D/3D request to the server DP over IPC. This is the weave-state signal,
+	// decoupled from the per-frame content (the app's submitted view count). Without
+	// it the request was a no-op out-of-process and the runtime had to infer the
+	// hardware mode from the tile count (the old conflation). Bridge-relay sessions
+	// forward to the browser and own no DP.
+	if (!sess->is_bridge_relay) {
+		comp_ipc_client_compositor_request_display_mode(&sess->xcn->base, enable_3d ? 1u : 0u);
+		sess->hardware_display_3d = enable_3d;
 	}
 
 	(void)success;

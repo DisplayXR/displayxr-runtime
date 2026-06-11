@@ -240,6 +240,28 @@ comp_ipc_client_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint
 }
 
 /*
+ * Request the HARDWARE 2D/3D display mode on the out-of-process DP (#533). This
+ * is the hardware weave-state signal, DECOUPLED from the per-frame content (how
+ * many tiles the app submits): the app requests "panel → 2D/3D" here while it
+ * independently submits 1- or 2-tile atlases. Same gating contract as
+ * comp_ipc_client_compositor_set_eye_tracking_mode. Best-effort — no-op on IPC failure.
+ */
+void
+comp_ipc_client_compositor_request_display_mode(struct xrt_compositor *xc, uint32_t enable_3d)
+{
+	if (xc == NULL) {
+		return;
+	}
+
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return;
+	}
+
+	(void)ipc_call_compositor_request_display_mode(icc->ipc_c, enable_3d);
+}
+
+/*
  * Full DP eye-position struct incl. is_tracking, over IPC (#441 Phase 2).
  * Same gating contract as comp_ipc_client_compositor_get_window_metrics:
  * only safe to call when `xc` is an ipc_client_compositor (the OpenXR state

@@ -1590,30 +1590,6 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 
 
 /*!
- * Get tile layout from the active rendering mode of the head device.
- * Defaults to 2 columns, 1 row (stereo) if not available.
- */
-static void
-get_active_tile_layout(struct multi_compositor *mc, uint32_t *out_tile_columns, uint32_t *out_tile_rows)
-{
-	*out_tile_columns = 2;
-	*out_tile_rows = 1;
-
-	struct xrt_device *xdev_head = (mc->xsysd != NULL) ? mc->xsysd->static_roles.head : NULL;
-	if (xdev_head != NULL && xdev_head->hmd != NULL) {
-		uint32_t idx = xdev_head->hmd->active_rendering_mode_index;
-		if (idx < xdev_head->rendering_mode_count) {
-			uint32_t tc = xdev_head->rendering_modes[idx].tile_columns;
-			uint32_t tr = xdev_head->rendering_modes[idx].tile_rows;
-			if (tc > 0 && tr > 0) {
-				*out_tile_columns = tc;
-				*out_tile_rows = tr;
-			}
-		}
-	}
-}
-
-/*!
  * Ensure the atlas intermediate image exists for display processors
  * that prefer packed atlas input. Creates a single image at
  * (tile_columns * per_eye_width x tile_rows * height) so all views can be
@@ -2085,18 +2061,19 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		return;
 	}
 
-	// Sync hardware_display_3d from device's active rendering mode
+	// HARDWARE 2D/3D (the weave-state) is set by multi_compositor_request_display_mode
+	// — the app's xrRequestDisplayRenderingModeEXT, which now crosses IPC out-of-process
+	// (#533). It is DECOUPLED from the per-frame CONTENT (how many tiles the app
+	// submitted): content drives the atlas, mc->hardware_display_3d drives the DP weave.
+	// In-process the device's active rendering mode is the same authority, so sync from
+	// it when the head device is available (no-op out-of-process: head is NULL there, so
+	// the request-set value stands).
 	struct xrt_device *xdev_head = (mc->xsysd != NULL) ? mc->xsysd->static_roles.head : NULL;
 	if (xdev_head != NULL && xdev_head->hmd != NULL) {
 		uint32_t idx = xdev_head->hmd->active_rendering_mode_index;
 		if (idx < xdev_head->rendering_mode_count) {
 			mc->hardware_display_3d = xdev_head->rendering_modes[idx].hardware_display_3d;
 		}
-	}
-
-	// App-submitted mono (viewCount=1) forces 2D path regardless of device mode
-	if (layer->data.view_count == 1) {
-		mc->hardware_display_3d = false;
 	}
 
 	// Runtime-side 2D/3D toggle from qwerty V key
@@ -2140,8 +2117,13 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	}
 #endif
 
-	// Extract per-view info (N-view generalized)
-	uint32_t view_count = mc->hardware_display_3d ? layer->data.view_count : 1;
+	// CONTENT: the atlas holds exactly the tiles the app submitted (1 = 2D, ≥2 = 3D),
+	// independent of the hardware weave-state (#533 decouple). The app submits the
+	// active mode's tile count with per-view imageRects; the DP weaves or shows flat
+	// per mc->hardware_display_3d.
+	uint32_t view_count = layer->data.view_count;
+	if (view_count < 1)
+		view_count = 1;
 	if (view_count > XRT_MAX_VIEWS)
 		view_count = XRT_MAX_VIEWS;
 
@@ -2283,162 +2265,16 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		return;
 	}
 
-	// Mono (2D) path: blit single view directly to target, skip atlas and weaving.
-	// In 2D mode the app submits only one view (viewCount=1). We blit it
-	// directly to the presentation target without atlas packing or
-	// light-field interlacing (weaving).
-	if (!mc->hardware_display_3d) {
-		// Mono + window-space overlays: composite projection + HUD overlays
-		// into an intermediate image, then blit left eye to target.
-		// Works for both app-submitted mono (viewCount=1) and runtime-forced
-		// 2D mode (viewCount=2): composite_layers_to_intermediate() duplicates
-		// the left view for the right eye when only 1 view is submitted.
-		if (has_window_space_layers(mc)) {
-			VkImageView comp_left = VK_NULL_HANDLE, comp_right = VK_NULL_HANDLE;
-			if (composite_layers_to_intermediate(mc, vk, cmd, &comp_left, &comp_right)) {
-				// composite_images[0] is in SHADER_READ_ONLY_OPTIMAL.
-				// Transition it to TRANSFER_SRC, target to TRANSFER_DST.
-				VkImageMemoryBarrier hud_mono_pre[2] = {
-				    {
-				        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-				        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
-				        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-				        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-				        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-				        .image = mc->session_render.composite_images[0],
-				        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-				    },
-				    {
-				        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-				        .srcAccessMask = 0,
-				        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-				        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-				        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-				        .image = ct->images[buffer_index].handle,
-				        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-				    },
-				};
-				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-				                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL,
-				                         2, hud_mono_pre);
+	// #533: 2D is no longer a special-cased mono blit. Both 2D and 3D flow through
+	// the unified atlas → display-processor path below. The app submits the active
+	// mode's tiles (1 for 2D, 2 for 3D) with per-view imageRects; the runtime packs
+	// them into a matching atlas (view_count×1) and hands it to the DP, which weaves
+	// (hardware 3D) or shows the single tile flat (hardware 2D, mode_3d=false). The
+	// window-space HUD is composited in the atlas path too (composite_layers_to_-
+	// intermediate below), so it survives the unification. Content (tile count) and
+	// hardware (mode_3d) are now fully decoupled — the old mono-blit branch is gone.
 
-				uint32_t cw = mc->session_render.composite_width;
-				uint32_t ch = mc->session_render.composite_height;
-
-				VkImageBlit hud_mono_blit = {
-				    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-				    .srcOffsets = {{0, 0, 0}, {(int32_t)cw, (int32_t)ch, 1}},
-				    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-				    .dstOffsets = {{0, 0, 0},
-				                  {(int32_t)framebufferWidth, (int32_t)framebufferHeight, 1}},
-				};
-				vk->vkCmdBlitImage(cmd, mc->session_render.composite_images[0],
-				                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-				                   ct->images[buffer_index].handle,
-				                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &hud_mono_blit,
-				                   VK_FILTER_LINEAR);
-
-				// Post: target TRANSFER_DST → PRESENT_SRC
-				VkImageMemoryBarrier hud_mono_post = {
-				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-				    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-				    .dstAccessMask = 0,
-				    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-				    .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-				    .image = ct->images[buffer_index].handle,
-				    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-				};
-				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-				                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL,
-				                         0, NULL, 1, &hud_mono_post);
-
-				static bool mono_hud_logged = false;
-				if (!mono_hud_logged) {
-					U_LOG_W("[per-session] Mono (2D) + window-space HUD: "
-					        "composited %ux%u -> %ux%u (viewCount=%u)",
-					        cw, ch, framebufferWidth, framebufferHeight,
-					        layer->data.view_count);
-					mono_hud_logged = true;
-				}
-				goto submit_and_present;
-			}
-			// Fallthrough to direct blit if compositing fails
-		}
-
-		bool flip_y = layer->data.flip_y;
-		int src_top = viewOffsetY[0] + (flip_y ? imageHeight : 0);
-		int src_bot = viewOffsetY[0] + (flip_y ? 0 : imageHeight);
-
-		// Pre-barriers: source GENERAL → TRANSFER_SRC, target UNDEFINED → TRANSFER_DST
-		VkImageMemoryBarrier mono_pre[2] = {
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = 0,
-		        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-		        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		        .image = viewImages[0],
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, viewArrayIndices[0], 1},
-		    },
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = 0,
-		        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-		        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		        .image = ct->images[buffer_index].handle,
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-		    },
-		};
-		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-		                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, mono_pre);
-
-		// Blit mono view to fill entire target
-		VkImageBlit mono_blit = {
-		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, viewArrayIndices[0], 1},
-		    .srcOffsets = {{viewOffsetX[0], src_top, 0}, {viewOffsetX[0] + imageWidth, src_bot, 1}},
-		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-		    .dstOffsets = {{0, 0, 0}, {(int32_t)framebufferWidth, (int32_t)framebufferHeight, 1}},
-		};
-		vk->vkCmdBlitImage(cmd, viewImages[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		                   ct->images[buffer_index].handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-		                   &mono_blit, VK_FILTER_LINEAR);
-
-		// Post-barriers: source → GENERAL, target → PRESENT_SRC_KHR
-		VkImageMemoryBarrier mono_post[2] = {
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-		        .dstAccessMask = 0,
-		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-		        .image = viewImages[0],
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, viewArrayIndices[0], 1},
-		    },
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-		        .dstAccessMask = 0,
-		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		        .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-		        .image = ct->images[buffer_index].handle,
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-		    },
-		};
-		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-		                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 2,
-		                         mono_post);
-
-		static bool mono_logged = false;
-		if (!mono_logged) {
-			U_LOG_W("[per-session] Mono (2D) blit: %dx%d -> %ux%u (flip_y=%d)", imageWidth,
-			        imageHeight, framebufferWidth, framebufferHeight, flip_y);
-			mono_logged = true;
-		}
-		goto submit_and_present;
-	}
-
-	// Stereo (3D) path: display processing or SR weaving
+	// Unified display-processor path
 
 	// Get the framebuffer for the current swapchain image
 	VkFramebuffer framebuffer = VK_NULL_HANDLE;
@@ -2465,9 +2301,16 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		// for stereo).
 		// ================================================================
 		{
-			// Get tile layout from active rendering mode
-			uint32_t tile_columns, tile_rows;
-			get_active_tile_layout(mc, &tile_columns, &tile_rows);
+			// #533 decouple: the atlas layout is the CONTENT the app submitted, not
+			// the (out-of-process stale) server rendering mode. The app submits
+			// view_count tiles with per-view imageRects in a horizontal strip — 1
+			// tile (2D) or 2 (3D) — so build a matching view_count×1 atlas. This keeps
+			// the atlas in lockstep with the submission across a 2D⇄3D transition,
+			// even when the hardware flag (flipped on the fast IPC request) briefly
+			// leads the content by a frame — otherwise a stale 2x1 layout × a 2D-sized
+			// tile builds an oversized atlas that overflows the app swapchain.
+			uint32_t tile_columns = view_count > 0 ? view_count : 1;
+			uint32_t tile_rows = 1;
 
 			// Determine blit sources — either composited overlay images or
 			// direct swapchain sub-regions.
