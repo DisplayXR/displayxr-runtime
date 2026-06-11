@@ -3,8 +3,11 @@
 > Design: [ADR-027](../adr/ADR-027-display-zones.md) +
 > [`XR_EXT_display_zones` spec sketch](../specs/extensions/XR_EXT_display_zones.md).
 > This doc carries the two living parts: the reference-consumer migration and
-> the implementation phasing. Status: **design accepted, implementation not
-> started**.
+> the implementation phasing. Status: **runtime phases P1–P4 SHIPPED**
+> (extension advertised; D3D11 capture- + Leia-validated, VK/D3D12/GL
+> code-validated, Metal code-only pending a Mac eyeball). Remaining:
+> Phase 5 (Leia plugin caps + IPC, `displayxr-leia-plugin` repo) and
+> Phase 6 (avatar migration, `displayxr-demo-avatar` repo).
 
 ## Reference consumer: `displayxr-demo-avatar` migration
 
@@ -87,7 +90,13 @@ submit a zone layer** (back-compat is structural, there is no shim code).
 
 ADR-027 + spec sketch + this doc. Docs-only, direct to main.
 
-### Phase 1 — state tracker (this repo, independent PR)
+### Phase 1 — state tracker (this repo) — **DONE**
+
+Shipped as planned. Validation note: the temp `cube_handle_d3d11_win` branch
+asserted the zone-scoped `XrView.fov` **bit-exact** (max delta 0.000000 rad)
+against the app-side `displayxr-common` oracle — equivalence by construction
+held literally (same math core).
+
 
 - Locate-chained `XrDisplayZoneEXT` → per-zone Kooima: apply
   `u_canvas_apply_to_metrics` with the *chained* rect (it already does exactly
@@ -106,7 +115,18 @@ ADR-027 + spec sketch + this doc. Docs-only, direct to main.
   reference per rect (the avatar's math is the oracle). CI selftest + existing
   run scripts prove zero regression.
 
-### Phase 2 — reference compositors (D3D11 + VK)
+### Phase 2 — reference compositors (D3D11 + VK) — **DONE**
+
+Shipped. Implementation notes vs plan: no separate super-atlas object — the
+renderer atlas IS the super-atlas (zones frames make the effective canvas the
+full window, so tiles are window-scaled and zone layers render at sub-tile
+viewports; the stride invariant holds by construction). The auto-wish feather
+is a stepped ClearView/ClearAttachments ring raster (8 × 2 px, max semantics).
+Known VK limitation: the VK renderer is blit-based, so overlapping zones
+OVERWRITE in layer order there (one-shot WARN) — alpha-over needs a VK draw
+path (follow-up). Validated on the Leia DP via atlas captures (zone placement
+per view tile + parallax + overlap alpha-over on D3D11) and wish generations.
+
 
 - `d3d11_effective_canvas` / `vk_effective_canvas` gain the zone term (zone
   frames ⇒ full-client-window effective canvas, like supersede mode today).
@@ -125,14 +145,31 @@ ADR-027 + spec sketch + this doc. Docs-only, direct to main.
   eyeball** (hardware-behavior change ⇒ PR blocks on it). Regression: all
   existing cube_* + a Local2D app unchanged.
 
-### Phase 3 — GL / Metal / D3D12 parity + advertise
+### Phase 3 — GL / Metal / D3D12 parity + advertise — **DONE** (Metal code-only)
+
+Shipped; extension always advertised, `DISPLAYXR_ZONES` gate removed. The
+"delete the single-rect supersede special case" item resolved conservatively:
+legacy zero-zone behavior is a compatibility contract and stays; the raster
+unification is folded into the per-API wish rasterizers reusing the
+implicit-mask resources. Metal remains code-only until a Mac eyeball. GL
+caveat: the masked composite (and so the wish lerp) exists only on the GL
+window-present path — same pre-existing scope as Local2D on GL.
+
 
 - Mechanical port per the #439 Phase-3 playbook (D3D11 + VK are reference).
 - Flip the extension on; delete the single-rect supersede special case where
   the N-rect path subsumes it (keep behavior, kill the branch).
 - **Validation**: `cube_zones_*` per API; Metal code-only until a Mac eyeball.
 
-### Phase 4 — DP contract + sim_display
+### Phase 4 — DP contract + sim_display — **DONE**
+
+Shipped as planned (zone triple on all 5 vtables, caps appends +
+`XRT_DP_LOCAL_ZONE_CAPS_SIZE_V1` floor, per-API compositor publish with the
+tier-1 fallback kept for legacy plugins, sim_display parity +
+`SIM_DISPLAY_WISH_QUANTIZE` tint on the D3D11 variant, selftest zone-caps
+probe — absence never fails). Verified against the installed Leia plugin:
+appended fields read 0 (caller-zeroed append-only contract observed).
+
 
 - Append `wish_fractional` / `switch_granularity` / `reserved[4]` to
   `xrt_dp_local_zone_caps`; port the zone-slot triple to vk / d3d12 / gl /
