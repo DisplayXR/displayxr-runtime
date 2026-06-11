@@ -27,7 +27,10 @@
 
 #ifdef XRT_OS_WINDOWS
 #define WIN32_LEAN_AND_MEAN
+#define COBJMACROS
 #include <windows.h>
+#include <d3d11.h> // WARP device for the headless zone-caps probe (#224 / ADR-027 P4)
+#include "xrt/xrt_display_processor_d3d11.h"
 #endif
 
 
@@ -38,6 +41,92 @@
  */
 
 #ifdef XRT_OS_WINDOWS
+/*!
+ * #224 / ADR-027 P4 — headless zone-caps probe. Creates a D3D11 WARP device
+ * (no GPU / display required), asks the active plug-in's D3D11 DP factory
+ * for a DP with a NULL window handle, queries get_local_zone_caps with a
+ * caller-zeroed struct (struct_size pre-set per the append contract), then
+ * tears everything down.
+ *
+ * Outcome contract: ABSENCE NEVER FAILS — no D3D11 factory, factory
+ * failure, WARP failure, or a DP without the zone slots all leave
+ * zone_caps_probed false with an informational note (an old Leia plug-in on
+ * a user box must pass). Only a present-but-MALFORMED answer (supported > 1,
+ * supported with a zero grid, wish_fractional > 1, switch_granularity out of
+ * range) sets zone_caps_malformed.
+ */
+static void
+probe_zone_caps_d3d11(struct cli_query_result *r, const struct xrt_plugin_iface *iface)
+{
+	// create_dp_d3d11 is a core v2 iface field (the loader rejects
+	// mismatched ABI majors before we get here), so a NULL check suffices.
+	if (iface->create_dp_d3d11 == NULL) {
+		snprintf(r->zone_probe_note, sizeof(r->zone_probe_note),
+		         "not probed: plug-in has no D3D11 DP factory (OK)");
+		return;
+	}
+
+	ID3D11Device *device = NULL;
+	ID3D11DeviceContext *context = NULL;
+	D3D_FEATURE_LEVEL fl;
+	HRESULT hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_WARP, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &device, &fl,
+	                               &context);
+	if (FAILED(hr) || device == NULL || context == NULL) {
+		snprintf(r->zone_probe_note, sizeof(r->zone_probe_note),
+		         "not probed: WARP D3D11 device creation failed (0x%08lx, OK)", (unsigned long)hr);
+		if (context != NULL) {
+			ID3D11DeviceContext_Release(context);
+		}
+		if (device != NULL) {
+			ID3D11Device_Release(device);
+		}
+		return;
+	}
+
+	struct xrt_display_processor_d3d11 *xdp = NULL;
+	xrt_result_t xret = iface->create_dp_d3d11(device, context, NULL, &xdp);
+	if (xret != XRT_SUCCESS || xdp == NULL) {
+		snprintf(r->zone_probe_note, sizeof(r->zone_probe_note),
+		         "not probed: D3D11 DP factory declined (xret=%d, OK)", (int)xret);
+		ID3D11DeviceContext_Release(context);
+		ID3D11Device_Release(device);
+		return;
+	}
+
+	struct xrt_dp_local_zone_caps caps;
+	memset(&caps, 0, sizeof(caps)); // append contract: caller zeroes, then sets struct_size
+	caps.struct_size = (uint32_t)sizeof(caps);
+	bool got = xrt_display_processor_d3d11_get_local_zone_caps(xdp, &caps);
+	if (!got) {
+		snprintf(r->zone_probe_note, sizeof(r->zone_probe_note),
+		         "not probed: DP exposes no zone slots (legacy plug-in, OK)");
+	} else {
+		r->zone_caps_probed = true;
+		r->zone_caps = caps;
+		bool malformed = caps.supported > 1 ||
+		                 (caps.supported == 1 && (caps.zone_grid_width == 0 || caps.zone_grid_height == 0)) ||
+		                 caps.wish_fractional > 1 ||
+		                 caps.switch_granularity > (uint32_t)XRT_DP_SWITCH_GRANULARITY_CELL_GRID;
+		r->zone_caps_malformed = malformed;
+		if (malformed) {
+			snprintf(r->zone_probe_note, sizeof(r->zone_probe_note),
+			         "MALFORMED caps: supported=%u grid=%ux%u wish_fractional=%u granularity=%u",
+			         caps.supported, caps.zone_grid_width, caps.zone_grid_height, caps.wish_fractional,
+			         caps.switch_granularity);
+		} else {
+			snprintf(r->zone_probe_note, sizeof(r->zone_probe_note),
+			         "supported=%u grid=%ux%u max_mask=%ux%u max_hz=%u wish_fractional=%u granularity=%u",
+			         caps.supported, caps.zone_grid_width, caps.zone_grid_height, caps.max_mask_width,
+			         caps.max_mask_height, caps.max_update_hz, caps.wish_fractional,
+			         caps.switch_granularity);
+		}
+	}
+
+	xrt_display_processor_d3d11_destroy(&xdp);
+	ID3D11DeviceContext_Release(context);
+	ID3D11Device_Release(device);
+}
+
 static void
 read_active_runtime(struct cli_query_result *r)
 {
@@ -136,6 +225,17 @@ cli_query_run(struct cli_query_result *r)
 	r->dims_ok = true;
 	r->result_code = CLI_SELFTEST_PASS;
 
+	// #224 / ADR-027 P4 — zone-caps probe, after the display-info checks
+	// passed. Absence never fails; only malformed caps flip the verdict.
+#ifdef XRT_OS_WINDOWS
+	probe_zone_caps_d3d11(r, iface);
+	if (r->zone_caps_malformed) {
+		r->result_code = CLI_SELFTEST_BAD_ZONE_CAPS;
+	}
+#else
+	snprintf(r->zone_probe_note, sizeof(r->zone_probe_note), "not probed: zone-caps probe is Windows-only (OK)");
+#endif
+
 out:
 	xrt_space_overseer_destroy(&xso);
 	xrt_system_devices_destroy(&xsysd);
@@ -193,6 +293,22 @@ eye_default_label(uint32_t def)
 	}
 }
 
+/*!
+ * Decode the advisory switch-granularity value (xrt_dp_switch_granularity).
+ */
+static const char *
+zone_granularity_label(uint32_t g)
+{
+	switch (g) {
+	case 0: return "unknown";
+	case 1: return "global";
+	case 2: return "column-band";
+	case 3: return "row-band";
+	case 4: return "cell-grid";
+	default: return "?";
+	}
+}
+
 void
 cli_query_print_info_text(const struct cli_query_result *r)
 {
@@ -242,6 +358,22 @@ cli_query_print_info_text(const struct cli_query_result *r)
 		PT("  [%u] %-14s views=%u 3d=%c tracked=%c\n", rm->mode_index, rm->mode_name, rm->view_count,
 		   rm->hardware_display_3d ? 'y' : 'n',
 		   (rm->mode_flags & XRT_RENDERING_MODE_FLAG_HAS_TRACKING) ? 'y' : 'n');
+	}
+
+	P(" :: Local zone caps (#224/ADR-027, headless D3D11 WARP probe)\n");
+	if (r->zone_caps_probed) {
+		const struct xrt_dp_local_zone_caps *z = &r->zone_caps;
+		PT("supported:    %u%s\n", z->supported, r->zone_caps_malformed ? "  (MALFORMED — see below)" : "");
+		PT("zone grid:    %ux%u\n", z->zone_grid_width, z->zone_grid_height);
+		PT("max mask:     %ux%u\n", z->max_mask_width, z->max_mask_height);
+		PT("max hz:       %u%s\n", z->max_update_hz, z->max_update_hz == 0 ? " (unlimited)" : "");
+		PT("wish:         fractional=%u granularity=%s (%u)\n", z->wish_fractional,
+		   zone_granularity_label(z->switch_granularity), z->switch_granularity);
+		if (r->zone_caps_malformed) {
+			PT("%s\n", r->zone_probe_note);
+		}
+	} else {
+		PT("%s\n", r->zone_probe_note[0] != '\0' ? r->zone_probe_note : "not evaluated");
 	}
 }
 
@@ -322,6 +454,29 @@ cli_query_print_info_json(const struct cli_query_result *r)
 		cJSON_AddNullToObject(root, "display");
 	}
 
+	// #224 / ADR-027 P4 zone-caps probe.
+	{
+		cJSON *zc = cJSON_AddObjectToObject(root, "zone_caps");
+		cJSON_AddBoolToObject(zc, "probed", r->zone_caps_probed);
+		cJSON_AddStringToObject(zc, "note", r->zone_probe_note[0] != '\0' ? r->zone_probe_note : "not evaluated");
+		if (r->zone_caps_probed) {
+			const struct xrt_dp_local_zone_caps *z = &r->zone_caps;
+			cJSON_AddBoolToObject(zc, "malformed", r->zone_caps_malformed);
+			cJSON_AddNumberToObject(zc, "supported", (double)z->supported);
+			cJSON *g = cJSON_AddObjectToObject(zc, "zone_grid");
+			cJSON_AddNumberToObject(g, "width", (double)z->zone_grid_width);
+			cJSON_AddNumberToObject(g, "height", (double)z->zone_grid_height);
+			cJSON *mm = cJSON_AddObjectToObject(zc, "max_mask");
+			cJSON_AddNumberToObject(mm, "width", (double)z->max_mask_width);
+			cJSON_AddNumberToObject(mm, "height", (double)z->max_mask_height);
+			cJSON_AddNumberToObject(zc, "max_update_hz", (double)z->max_update_hz);
+			cJSON_AddNumberToObject(zc, "wish_fractional", (double)z->wish_fractional);
+			cJSON_AddNumberToObject(zc, "switch_granularity", (double)z->switch_granularity);
+			cJSON_AddStringToObject(zc, "switch_granularity_label",
+			                        zone_granularity_label(z->switch_granularity));
+		}
+	}
+
 	char *out = cJSON_Print(root);
 	if (out != NULL) {
 		printf("%s\n", out);
@@ -398,6 +553,15 @@ build_checks(const struct cli_query_result *r, struct check *out)
 	} else {
 		snprintf(c->detail, sizeof(c->detail), "%s", "not evaluated");
 	}
+
+	// #224 / ADR-027 P4 — zone-caps probe. ABSENCE NEVER FAILS: ok stays
+	// true for legacy plug-ins / no factory / non-Windows; only a
+	// present-but-malformed caps struct fails (BAD_ZONE_CAPS).
+	c = &out[n++];
+	c->name = "zone_caps";
+	c->ok = !r->zone_caps_malformed;
+	snprintf(c->detail, sizeof(c->detail), "%s",
+	         r->zone_probe_note[0] != '\0' ? r->zone_probe_note : "not evaluated");
 
 	return n;
 }

@@ -18,6 +18,7 @@
 
 #include "xrt/xrt_plugin.h"
 #include "xrt/xrt_device.h"
+#include "xrt/xrt_display_zones.h"
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -37,6 +38,11 @@ enum cli_selftest_result
 	CLI_SELFTEST_INIT_FAIL = 1, //!< Instance / system creation failed.
 	CLI_SELFTEST_NO_DP = 2,     //!< No display processor / plug-in discovered.
 	CLI_SELFTEST_BAD_INFO = 3,  //!< Plug-in reported invalid display info.
+	//! Plug-in's get_local_zone_caps returned a MALFORMED struct (#224 /
+	//! ADR-027 P4 probe). NOTE: caps *absence* (legacy plug-in, no D3D11
+	//! factory, probe device failure, non-Windows) never fails — only a
+	//! present-but-invalid answer does.
+	CLI_SELFTEST_BAD_ZONE_CAPS = 4,
 };
 
 /*!
@@ -82,6 +88,20 @@ struct cli_query_result
 
 	/* Vendor-neutral display info (valid iff display_info_ok). */
 	struct xrt_plugin_display_info display_info;
+
+	/* #224 / ADR-027 P4 zone-caps probe (Windows-only: WARP D3D11 device +
+	 * the plug-in's create_dp_d3d11 + get_local_zone_caps, headless).
+	 * probed   — the DP answered the caps query (false ⟹ legacy plug-in /
+	 *            no D3D11 factory / probe device failure / non-Windows;
+	 *            never a failure).
+	 * malformed — the answer violated the contract (supported > 1, a
+	 *            supported DP with a zero grid, wish_fractional > 1,
+	 *            switch_granularity out of range) ⟹ BAD_ZONE_CAPS.
+	 * note     — human-readable probe outcome for the serializers. */
+	bool zone_caps_probed;
+	bool zone_caps_malformed;
+	char zone_probe_note[128];
+	struct xrt_dp_local_zone_caps zone_caps;
 };
 
 /*!

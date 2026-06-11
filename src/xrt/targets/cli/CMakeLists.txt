@@ -35,4 +35,11 @@ target_link_libraries(
 		drv_includes
 	)
 
+# Headless zone-caps probe (#224 / ADR-027 P4): cli_query.c creates a D3D11
+# WARP device on Windows to exercise the plug-in's create_dp_d3d11 +
+# get_local_zone_caps without a GPU/display.
+if(WIN32)
+	target_link_libraries(cli PRIVATE d3d11)
+endif()
+
 install(TARGETS cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

@@ -318,10 +318,36 @@ struct comp_metal_compositor
 	//! clears any dangling reference.
 	struct comp_metal_zone_mask *frame_wish;
 
-	//! Tier-1 fallback edge state (the base Metal DP vtable has no
-	//! zone-publish slots until P4): request_display_mode(true) fired once
+	//! Tier-1 fallback edge state: request_display_mode(true) fired once
 	//! on the zones rising edge; never forces 2D on the falling edge.
+	//! P4: only taken for legacy DPs (caps.supported == 0) — a zone-capable
+	//! DP gets the per-frame wish publish instead.
 	bool zones_mode_requested;
+
+	//! #224 / ADR-027 hardware-DP zone leg (P4): cached get_local_zone_caps
+	//! result. 0 = not queried yet, 1 = supported, 2 = legacy DP.
+	int zone_dp_state;
+	//! DP zone caps when zone_dp_state == 1.
+	struct xrt_dp_local_zone_caps zone_dp_caps;
+	//! Published-content generation: bumped on zone_mask_submit, on an
+	//! auto-wish re-raster (metal_update_zone_wish_mask's dirty path), and
+	//! on an explicit-frame-wish source change — NOT per frame.
+	uint64_t zone_publish_seq;
+	//! True while this client's mask is published to the DP — drives the
+	//! clear-on-deactivate edge.
+	bool zone_published;
+	//! This frame's resolved wish texture + dims, set by
+	//! metal_composite_local_2d in zones frames (the explicit frame wish's
+	//! CPU-uploaded texture or the auto raster) and reset at the top of
+	//! layer_commit. Borrowed, not retained. The publish runs after the
+	//! frame's [cmd_buf commit]; the wish textures are CPU-uploaded
+	//! (replaceRegion, Shared storage), so their content is valid at the
+	//! call regardless of GPU progress.
+	id<MTLTexture> zone_publish_tex;
+	uint32_t zone_publish_w, zone_publish_h;
+	//! Seq-bump cache: last explicit wish pointer actually published (the
+	//! auto raster's dirty-cache lives in wish_rects above).
+	struct comp_metal_zone_mask *zone_frame_wish_last;
 
 	//! XR_EXT_display_zones AUTO wish raster (union of the frame's zone
 	//! rects with a feathered edge), CPU-rasterized like the implicit mask
@@ -2079,6 +2105,7 @@ metal_update_zone_wish_mask(struct comp_metal_compositor *c,
 
 	memcpy(c->wish_rects, rects, sizeof(rects[0]) * rect_count);
 	c->wish_rect_count = rect_count;
+	c->zone_publish_seq++; // #224 P4: new wish content generation for the DP publish
 
 	U_LOG_W("Metal zone wish mask (auto): %ux%u, %u zone rect(s), %u-px feather", w, h, rect_count,
 	        METAL_ZONE_WISH_FEATHER_PX);
@@ -2432,6 +2459,18 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 		             withBytes:fw->author_bytes
 		           bytesPerRow:fw->w];
 		mask_tex = fw->tex;
+
+		// P4 publish source + seq: the explicit wish. Bump the generation
+		// on a source change (pointer flip; Metal masks carry no author
+		// generation, so a same-pointer re-author keeps its seq — vendors
+		// treat same-seq as anchor-only updates).
+		c->zone_publish_tex = fw->tex;
+		c->zone_publish_w = fw->w;
+		c->zone_publish_h = fw->h;
+		if (c->zone_frame_wish_last != fw) {
+			c->zone_frame_wish_last = fw;
+			c->zone_publish_seq++;
+		}
 	} else if (zones_frame) {
 		struct xrt_rect zone_rects[XRT_MAX_LAYERS];
 		uint32_t zone_rect_count = 0;
@@ -2442,6 +2481,19 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 			zone_rects[zone_rect_count++] = c->layer_accum.layers[i].data.zone_3d.rect;
 		}
 		mask_tex = metal_update_zone_wish_mask(c, zone_rects, zone_rect_count, w, h);
+		if (mask_tex != nil) {
+			// P4 publish source + seq: the auto raster (its dirty
+			// re-raster path bumps the generation itself); a source
+			// flip explicit -> auto is new content even when the rect
+			// set is unchanged.
+			if (c->zone_frame_wish_last != NULL) {
+				c->zone_frame_wish_last = NULL;
+				c->zone_publish_seq++;
+			}
+			c->zone_publish_tex = mask_tex;
+			c->zone_publish_w = w;
+			c->zone_publish_h = h;
+		}
 	} else if (c->zone_mask_active != NULL && c->zone_mask_active->submitted) {
 		mask_tex = c->zone_mask_active->tex;
 	} else if (have_local_2d) {
@@ -2582,6 +2634,100 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 	return true;
 }
 
+// #224 / ADR-027 hardware-DP zone leg (P4) — one-time DP zone-capability
+// probe, cached on the compositor. Returns true when the DP consumes
+// published zone masks; caps are then in c->zone_dp_caps.
+static bool
+metal_zone_dp_supported(struct comp_metal_compositor *c)
+{
+	if (c->display_processor == NULL) {
+		return false;
+	}
+	if (c->zone_dp_state == 0) { // 0 = unqueried, 1 = supported, 2 = legacy
+		struct xrt_dp_local_zone_caps caps = {0};
+		caps.struct_size = sizeof(caps);
+		bool ok = xrt_display_processor_metal_get_local_zone_caps(c->display_processor, &caps);
+		c->zone_dp_state = (ok && caps.supported != 0) ? 1 : 2;
+		if (c->zone_dp_state == 1) {
+			c->zone_dp_caps = caps;
+			U_LOG_W("Metal zone DP: local zones supported, grid %ux%u max_mask %ux%u max_hz %u "
+			        "wish_fractional=%u granularity=%u",
+			        caps.zone_grid_width, caps.zone_grid_height, caps.max_mask_width,
+			        caps.max_mask_height, caps.max_update_hz, caps.wish_fractional,
+			        caps.switch_granularity);
+		}
+	}
+	return c->zone_dp_state == 1;
+}
+
+// Keep the DP's view of this client's zone mask in sync with the
+// compositor's — the Metal clone of d3d11_sync_zone_mask_to_dp (CODE-ONLY:
+// needs a Mac eyeball). Called once per layer_commit after [cmd_buf commit];
+// every publishable mask texture on this leg is CPU-uploaded (replaceRegion,
+// Shared storage), so its content is valid at the call regardless of GPU
+// progress. Zones frame: the WISH this frame's composite resolved; legacy
+// frame: the sticky submitted mask. No resolvable source drives the
+// clear-on-deactivate edge, once.
+static void
+metal_sync_zone_mask_to_dp(struct comp_metal_compositor *c)
+{
+	if (!metal_zone_dp_supported(c)) {
+		return; // legacy DP — tier-1 global fallback path unchanged.
+	}
+
+	id<MTLTexture> tex = nil;
+	uint32_t mask_w = 0;
+	uint32_t mask_h = 0;
+	if (c->zones_frame) {
+		tex = c->zone_publish_tex;
+		mask_w = c->zone_publish_w;
+		mask_h = c->zone_publish_h;
+	} else {
+		struct comp_metal_zone_mask *mask = c->zone_mask_active;
+		if (mask != NULL && mask->submitted && mask->tex != nil) {
+			tex = mask->tex;
+			mask_w = mask->w;
+			mask_h = mask->h;
+		}
+	}
+
+	if (tex == nil) {
+		if (c->zone_published) {
+			xrt_display_processor_metal_clear_local_zone_mask(c->display_processor);
+			c->zone_published = false;
+		}
+		return;
+	}
+
+	// Screen-anchor the mask: content-view origin in physical (backing)
+	// screen pixels, top-left convention. Cocoa screen coords are
+	// bottom-left, so flip Y against the primary screen height.
+	// @todo Mac eyeball — code-only, mirrors the backing-scale idiom used
+	// for drawable sizing above; verify the anchor on a real panel.
+	if (c->window == nil || c->window.contentView == nil) {
+		return; // nothing to anchor to — skip the publish.
+	}
+	NSView *cv = c->window.contentView;
+	NSRect content_win = [cv convertRect:cv.bounds toView:nil];
+	NSRect content_scr = [c->window convertRectToScreen:content_win];
+	CGFloat scale = c->window.backingScaleFactor > 0 ? c->window.backingScaleFactor : 1.0;
+	CGFloat screen_h_pts = [[NSScreen mainScreen] frame].size.height;
+	int32_t sx = (int32_t)llround(content_scr.origin.x * scale);
+	int32_t sy = (int32_t)llround((screen_h_pts - (content_scr.origin.y + content_scr.size.height)) * scale);
+	uint32_t sw = (uint32_t)llround(content_scr.size.width * scale);
+	uint32_t sh = (uint32_t)llround(content_scr.size.height * scale);
+	if (sw == 0 || sh == 0) {
+		return;
+	}
+
+	bool ok = xrt_display_processor_metal_publish_local_zone_mask(c->display_processor, (__bridge void *)tex,
+	                                                              mask_w, mask_h, sx, sy, sw, sh,
+	                                                              c->zone_publish_seq);
+	if (ok) {
+		c->zone_published = true;
+	}
+}
+
 static xrt_result_t
 metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -2686,16 +2832,23 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	c->local_2d_last_frame = have_local_2d;
 	c->zones_frame = zones_frame;
 
-	// XR_EXT_display_zones tier-1 hardware fallback: the base Metal DP
-	// vtable has no zone-publish slots until P4, so "any zone active =>
-	// request 3D" once on the rising edge. No forced 2D on the falling
-	// edge.
-	if (zones_frame && !c->zones_mode_requested) {
+	// XR_EXT_display_zones hardware leg (P4). Zone-capable DP: the per-frame
+	// wish publish at the end of this commit drives the per-region switch —
+	// skip the global fallback. Legacy DP (no zone slots): tier-1 fallback —
+	// "any zone active => request 3D" once on the rising edge, no forced 2D
+	// on the falling edge.
+	if (zones_frame && !c->zones_mode_requested && !metal_zone_dp_supported(c)) {
 		c->zones_mode_requested = true;
 		comp_metal_compositor_request_display_mode(&c->base.base, true);
 	} else if (!zones_frame) {
 		c->zones_mode_requested = false;
 	}
+
+	// Reset this frame's resolved wish texture — metal_composite_local_2d
+	// sets it in zones frames; a stale texture from an earlier frame must
+	// never publish. (zone_publish_w/h persist harmlessly; the borrow is
+	// gated on the texture.)
+	c->zone_publish_tex = nil;
 
 	struct u_canvas_rect eff_canvas = metal_effective_canvas(c, output_texture, mask_active);
 
@@ -3494,6 +3647,12 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		[cmd_buf waitUntilCompleted];
 	}
 
+	// #224 / ADR-027 P4: sideband-sync this client's zone state with the DP
+	// — in zones frames this publishes the WISH the composite resolved
+	// (CPU-uploaded textures, content valid independent of GPU progress);
+	// in legacy frames the sticky submitted mask; the clear edge otherwise.
+	metal_sync_zone_mask_to_dp(c);
+
 	// Post-compose capture (#210). Skipped if the intent was projection-
 	// only (consumed earlier once the cmd-buf split lands) or empty.
 	metal_compositor_dispatch_capture(c, cmd_buf, MCP_CAPTURE_MODE_POST_COMPOSE);
@@ -3539,8 +3698,13 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	[c->dp_input_texture release];
 	c->dp_input_texture = nil;
 
-	// 4. Destroy display processor
+	// 4. Destroy display processor — first withdrawing this client's zone
+	// contribution from the vendor's union (#224 P4 clear-on-teardown edge).
 	if (c->display_processor != NULL) {
+		if (c->zone_published) {
+			xrt_display_processor_metal_clear_local_zone_mask(c->display_processor);
+			c->zone_published = false;
+		}
 		xrt_display_processor_metal_destroy(&c->display_processor);
 	}
 
@@ -3558,8 +3722,11 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	// zone_mask_destroy before the session compositor goes away) — only
 	// drop the borrow here.
 	c->zone_mask_active = NULL;
-	// XR_EXT_display_zones: drop the frame-wish borrow + auto-wish raster.
+	// XR_EXT_display_zones: drop the frame-wish borrow + auto-wish raster
+	// (+ the P4 publish-source borrow).
 	c->frame_wish = NULL;
+	c->zone_frame_wish_last = NULL;
+	c->zone_publish_tex = nil;
 	c->zones_frame = false;
 	[c->wish_mask_tex release];
 	c->wish_mask_tex = nil;
@@ -3828,6 +3995,7 @@ comp_metal_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask_ptr
 	             bytesPerRow:mask->w];
 	mask->submitted = true;
 	c->zone_mask_active = mask;
+	c->zone_publish_seq++; // #224 P4: new content generation for the DP publish
 	os_mutex_unlock(&c->mutex);
 
 	U_LOG_I("Zone mask submitted: %ux%u (Metal)", mask->w, mask->h);
@@ -3851,6 +4019,14 @@ comp_metal_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_pt
 	// XR_EXT_display_zones: never leave a dangling frame-wish reference.
 	if (c->frame_wish == mask) {
 		c->frame_wish = NULL;
+	}
+	// #224 P4: drop the seq-dedup cache (pointer may be reused by a future
+	// alloc) and any per-frame publish source borrowed from this mask.
+	if (c->zone_frame_wish_last == mask) {
+		c->zone_frame_wish_last = NULL;
+	}
+	if (c->zone_publish_tex == mask->tex) {
+		c->zone_publish_tex = nil;
 	}
 	os_mutex_unlock(&c->mutex);
 

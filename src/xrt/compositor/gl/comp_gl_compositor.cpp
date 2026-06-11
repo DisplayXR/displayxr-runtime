@@ -372,10 +372,36 @@ struct comp_gl_compositor
 	//! auto-derive from the zone rects. Not owned — zone_mask_destroy
 	//! clears any dangling reference.
 	struct comp_gl_zone_mask *frame_wish;
-	//! Tier-1 fallback edge state (the base GL DP vtable has no
-	//! zone-publish slots until P4): request_display_mode(true) fired once
+	//! Tier-1 fallback edge state: request_display_mode(true) fired once
 	//! on the zones rising edge; never forces 2D on the falling edge.
+	//! P4: only taken for legacy DPs (caps.supported == 0) — a zone-capable
+	//! DP gets the per-frame wish publish instead (gl_sync_zone_mask_to_dp).
 	bool zones_mode_requested;
+	//! #224 / ADR-027 hardware-DP zone leg (P4): cached get_local_zone_caps
+	//! result. 0 = not queried yet, 1 = supported, 2 = legacy DP.
+	int zone_dp_state;
+	//! DP zone caps when zone_dp_state == 1.
+	struct xrt_dp_local_zone_caps zone_dp_caps;
+	//! Published-content generation: bumped on zone_mask_submit, on an
+	//! auto-wish re-raster whose rect set / dims actually changed, and on
+	//! an explicit-frame-wish source change — NOT per frame.
+	uint64_t zone_publish_seq;
+	//! True while this client's mask is published to the DP — drives the
+	//! clear-on-deactivate edge.
+	bool zone_published;
+	//! This frame's resolved wish texture + dims, set by
+	//! gl_composite_local_2d in zones frames (the explicit frame-wish
+	//! authoring texture — same-context, no staging, matching the GL
+	//! zone_mask_submit contract — or the auto raster) and reset at the top
+	//! of layer_commit. The publish runs same-context after the composite,
+	//! so GL command ordering makes the content visible to the DP's calls.
+	GLuint zone_publish_tex;
+	uint32_t zone_publish_w, zone_publish_h;
+	//! Seq-bump caches: last explicit wish pointer actually published, and
+	//! the auto raster's rect set (dims via zone_publish_w/h persisting).
+	struct comp_gl_zone_mask *zone_frame_wish_last;
+	struct xrt_rect zone_wish_rects[XRT_MAX_LAYERS];
+	uint32_t zone_wish_rect_count;
 	//! Masked-composite program (FS_MASKED_COMPOSITE + VS_FULLSCREEN_QUAD).
 	GLuint program_masked_composite;
 	//! Post-weave composite scratch. weave_tex receives the DP weave (the DP
@@ -2084,6 +2110,19 @@ gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint tar
 	if (zones_frame) {
 		if (c->frame_wish != NULL && c->frame_wish->tex != 0) {
 			mask_tex = c->frame_wish->tex;
+
+			// P4 publish source + seq: the explicit wish (the live
+			// authoring texture — same-context, matching the GL
+			// no-staging contract). Bump the generation on a source
+			// change (pointer flip; GL masks carry no author
+			// generation, so a same-pointer re-author keeps its seq).
+			c->zone_publish_tex = mask_tex;
+			c->zone_publish_w = c->frame_wish->w;
+			c->zone_publish_h = c->frame_wish->h;
+			if (c->zone_frame_wish_last != c->frame_wish) {
+				c->zone_frame_wish_last = c->frame_wish;
+				c->zone_publish_seq++;
+			}
 		} else {
 			struct xrt_rect zone_rects[XRT_MAX_LAYERS];
 			uint32_t zone_rect_count = 0;
@@ -2095,6 +2134,30 @@ gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint tar
 				zone_rects[zone_rect_count++] = c->layer_accum.layers[i].data.zone_3d.rect;
 			}
 			mask_tex = gl_update_zone_wish_mask(c, zone_rects, zone_rect_count, output_w, output_h);
+			if (mask_tex != 0) {
+				// P4 publish source + seq: the auto raster — bump the
+				// generation only when the rect set / dims actually
+				// changed (or the source flipped explicit -> auto).
+				bool wish_dirty = c->zone_frame_wish_last != NULL ||
+				                  c->zone_wish_rect_count != zone_rect_count ||
+				                  c->zone_publish_w != output_w || c->zone_publish_h != output_h;
+				for (uint32_t i = 0; !wish_dirty && i < zone_rect_count; i++) {
+					if (memcmp(&c->zone_wish_rects[i], &zone_rects[i], sizeof(zone_rects[i])) !=
+					    0) {
+						wish_dirty = true;
+					}
+				}
+				if (wish_dirty) {
+					c->zone_frame_wish_last = NULL;
+					memcpy(c->zone_wish_rects, zone_rects,
+					       sizeof(zone_rects[0]) * zone_rect_count);
+					c->zone_wish_rect_count = zone_rect_count;
+					c->zone_publish_seq++;
+				}
+				c->zone_publish_tex = mask_tex;
+				c->zone_publish_w = output_w;
+				c->zone_publish_h = output_h;
+			}
 		}
 	} else if (have_explicit) {
 		mask_tex = mask->tex;
@@ -2179,6 +2242,99 @@ gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint tar
 		composite_logged = true;
 	}
 	return true;
+}
+
+// #224 / ADR-027 hardware-DP zone leg (P4) — one-time DP zone-capability
+// probe, cached on the compositor. Returns true when the DP consumes
+// published zone masks; caps are then in c->zone_dp_caps. Requires the
+// compositor's GL context current (like every DP call on this leg).
+static bool
+gl_zone_dp_supported(struct comp_gl_compositor *c)
+{
+	if (c->display_processor == NULL) {
+		return false;
+	}
+	if (c->zone_dp_state == 0) { // 0 = unqueried, 1 = supported, 2 = legacy
+		struct xrt_dp_local_zone_caps caps = {};
+		caps.struct_size = sizeof(caps);
+		bool ok = xrt_display_processor_gl_get_local_zone_caps(c->display_processor, &caps);
+		c->zone_dp_state = (ok && caps.supported != 0) ? 1 : 2;
+		if (c->zone_dp_state == 1) {
+			c->zone_dp_caps = caps;
+			U_LOG_W("GL zone DP: local zones supported, grid %ux%u max_mask %ux%u max_hz %u "
+			        "wish_fractional=%u granularity=%u",
+			        caps.zone_grid_width, caps.zone_grid_height, caps.max_mask_width,
+			        caps.max_mask_height, caps.max_update_hz, caps.wish_fractional,
+			        caps.switch_granularity);
+		}
+	}
+	return c->zone_dp_state == 1;
+}
+
+// Keep the DP's view of this client's zone mask in sync with the
+// compositor's — the GL clone of d3d11_sync_zone_mask_to_dp. Called once per
+// layer_commit while the compositor's GL context is still current (after the
+// present-path composite, before the context restore), so the DP can sample
+// the texture during the call with plain GL command ordering. Zones frame:
+// the WISH this frame's composite resolved (the explicit authoring texture
+// or the auto raster) — 0 on paths that never ran the composite; legacy
+// frame: the sticky submitted mask. No resolvable source drives the
+// clear-on-deactivate edge, once.
+static void
+gl_sync_zone_mask_to_dp(struct comp_gl_compositor *c)
+{
+	if (!gl_zone_dp_supported(c)) {
+		return; // legacy DP — tier-1 global fallback path unchanged.
+	}
+
+	GLuint tex = 0;
+	uint32_t mask_w = 0;
+	uint32_t mask_h = 0;
+	if (c->zones_frame) {
+		tex = c->zone_publish_tex;
+		mask_w = c->zone_publish_w;
+		mask_h = c->zone_publish_h;
+	} else {
+		struct comp_gl_zone_mask *mask = c->active_zone_mask;
+		if (mask != NULL && mask->submitted && mask->tex != 0) {
+			tex = mask->tex;
+			mask_w = mask->w;
+			mask_h = mask->h;
+		}
+	}
+
+	if (tex == 0) {
+		if (c->zone_published) {
+			xrt_display_processor_gl_clear_local_zone_mask(c->display_processor);
+			c->zone_published = false;
+		}
+		return;
+	}
+
+#ifdef XRT_OS_WINDOWS
+	// Screen-anchor the mask: client-area origin in physical screen pixels.
+	// No HWND (offscreen) → nothing to anchor to; skip the publish.
+	HWND wnd = c->hwnd;
+	RECT r;
+	POINT origin = {0, 0};
+	if (wnd == NULL || !GetClientRect(wnd, &r) || r.right <= 0 || r.bottom <= 0 || !ClientToScreen(wnd, &origin)) {
+		return;
+	}
+
+	bool ok = xrt_display_processor_gl_publish_local_zone_mask(c->display_processor, tex, mask_w, mask_h,
+	                                                           (int32_t)origin.x, (int32_t)origin.y,
+	                                                           (uint32_t)r.right, (uint32_t)r.bottom,
+	                                                           c->zone_publish_seq);
+	if (ok) {
+		c->zone_published = true;
+	}
+#else
+	// macOS GL: no screen-anchor helper on this path yet (Windows-first —
+	// comp_gl_window_macos exposes dimensions only, not screen origin);
+	// skip the publish. The clear edge above still runs.
+	(void)mask_w;
+	(void)mask_h;
+#endif
 }
 
 
@@ -2363,17 +2519,24 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	}
 #endif
 
-	// XR_EXT_display_zones tier-1 hardware fallback: the base GL DP vtable
-	// has no zone-publish slots until P4, so "any zone active => request
-	// 3D" once on the rising edge. No forced 2D on the falling edge.
-	// (After the context switch above — same context contract as the V-key
-	// toggle's request_display_mode call.)
-	if (c->zones_frame && !c->zones_mode_requested) {
+	// XR_EXT_display_zones hardware leg (P4). Zone-capable DP: the per-frame
+	// wish publish at the end of this commit drives the per-region switch —
+	// skip the global fallback. Legacy DP (no zone slots): tier-1 fallback —
+	// "any zone active => request 3D" once on the rising edge, no forced 2D
+	// on the falling edge. (After the context switch above — same context
+	// contract as the V-key toggle's request_display_mode call.)
+	if (c->zones_frame && !c->zones_mode_requested && !gl_zone_dp_supported(c)) {
 		c->zones_mode_requested = true;
 		comp_gl_compositor_request_display_mode(&c->base.base, true);
 	} else if (!c->zones_frame) {
 		c->zones_mode_requested = false;
 	}
+
+	// Reset this frame's resolved wish texture — gl_composite_local_2d sets
+	// it in zones frames; a stale name from an earlier frame must never
+	// publish. (zone_publish_w/h persist as the previous raster's dims for
+	// the auto-wish seq dirty-check.)
+	c->zone_publish_tex = 0;
 
 	// Sync hardware_display_3d, tile layout, and per-view dimensions
 	// from device's active rendering mode (MUST be before zero-copy check and blit)
@@ -3017,6 +3180,13 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	if (prev_cull_face) glEnable(GL_CULL_FACE);
 	if (prev_scissor_test) glEnable(GL_SCISSOR_TEST);
 
+	// #224 / ADR-027 P4: sideband-sync this client's zone state with the DP
+	// while our GL context is still current (the DP samples the texture
+	// during the call) — in zones frames this publishes the WISH the
+	// composite just resolved; in legacy frames the sticky submitted mask;
+	// the clear edge otherwise.
+	gl_sync_zone_mask_to_dp(c);
+
 	// Post-compose capture (#210) — runs while our GL context is still
 	// current so glReadPixels from atlas_texture is valid. Skipped if the
 	// intent was projection-only (consumed earlier) or empty.
@@ -3061,6 +3231,13 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	}
 #endif
 
+	// #224 P4: withdraw this client's zone contribution from the vendor's
+	// union before the DP goes away (clear-on-teardown edge; the
+	// compositor's GL context was made current above).
+	if (c->zone_published && c->display_processor != NULL) {
+		xrt_display_processor_gl_clear_local_zone_mask(c->display_processor);
+		c->zone_published = false;
+	}
 	xrt_display_processor_gl_destroy(&c->display_processor);
 
 	// Destroy HUD
@@ -3614,6 +3791,7 @@ comp_gl_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask_ptr)
 	// staged copy needed. Sticky last-submit-wins.
 	m->submitted = true;
 	c->active_zone_mask = m;
+	c->zone_publish_seq++; // #224 P4: new content generation for the DP publish
 	return XRT_SUCCESS;
 }
 
@@ -3631,6 +3809,14 @@ comp_gl_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_ptr)
 	// XR_EXT_display_zones: never leave a dangling frame-wish reference.
 	if (c->frame_wish == m) {
 		c->frame_wish = NULL;
+	}
+	// #224 P4: drop the seq-dedup cache (pointer may be reused by a future
+	// alloc) and any per-frame publish source borrowed from this mask.
+	if (c->zone_frame_wish_last == m) {
+		c->zone_frame_wish_last = NULL;
+	}
+	if (c->zone_publish_tex == m->tex) {
+		c->zone_publish_tex = 0;
 	}
 	if (m->tex != 0) {
 		glDeleteTextures(1, &m->tex);

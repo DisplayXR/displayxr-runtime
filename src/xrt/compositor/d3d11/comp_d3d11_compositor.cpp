@@ -3089,9 +3089,12 @@ d3d11_zone_dp_supported(struct comp_d3d11_compositor *c)
 		c->zone_dp_state = (ok && caps.supported != 0) ? 1 : 2;
 		if (c->zone_dp_state == 1) {
 			c->zone_dp_caps = caps;
-			U_LOG_W("D3D11 zone DP: local zones supported, grid %ux%u max_mask %ux%u max_hz %u",
+			// ADR-027 appends (wish_fractional / switch_granularity) read 0
+			// from pre-append plug-ins — the conservative defaults.
+			U_LOG_W("D3D11 zone DP: local zones supported, grid %ux%u max_mask %ux%u max_hz %u "
+			        "wish_fractional=%u granularity=%u",
 			        caps.zone_grid_width, caps.zone_grid_height, caps.max_mask_width, caps.max_mask_height,
-			        caps.max_update_hz);
+			        caps.max_update_hz, caps.wish_fractional, caps.switch_granularity);
 		}
 	}
 	return c->zone_dp_state == 1;

@@ -209,27 +209,34 @@ struct xrt_display_processor_d3d11
 	                            struct xrt_dp_local_zone_caps *out_caps);
 
 	/*!
-	 * Publish this client's screen-anchored 3D-zone mask (#224 Phase 0).
+	 * Publish this client's screen-anchored 3D-zone mask (#224 Phase 0;
+	 * wish semantics per ADR-027 Decision 5).
 	 *
 	 * Stateless in-process contract: the runtime owns the mask texture (the
-	 * staged XR_EXT_local_3d_zone snapshot — R8_UNORM, client-window pixels,
-	 * non-zero = 3D) and passes an SRV on the session's own D3D11 device; the
-	 * DP samples or copies it DURING this call (the immediate context
-	 * serializes against the runtime's writes), and must not hold the SRV
-	 * past return. @p screen_x/y/w/h anchor the mask's pixel space on the
-	 * panel in physical screen pixels (post-DPI client rect). @p seq is the
-	 * mask CONTENT generation — monotonic, bumped only when the staged mask
-	 * content changes (xrSubmitLocal3DZoneEXT); publishes carrying the same
-	 * seq differ only in the screen anchor, so a vendor evaluates content
+	 * staged XR_EXT_local_3d_zone snapshot or the XR_EXT_display_zones wish
+	 * — R8_UNORM, client-window pixels) and passes an SRV on the session's
+	 * own D3D11 device; the DP samples or copies it DURING this call (the
+	 * immediate context serializes against the runtime's writes), and must
+	 * not hold the SRV past return. @p screen_x/y/w/h anchor the mask's
+	 * pixel space on the panel in physical screen pixels (post-DPI client
+	 * rect). @p seq is the mask CONTENT generation — monotonic, bumped only
+	 * when the published content changes (xrSubmitLocal3DZoneEXT, a wish
+	 * re-raster, an explicit-wish change); publishes carrying the same seq
+	 * differ only in the screen anchor, so a vendor evaluates content
 	 * (downsample, any-nonzero check) once per generation, not per frame.
 	 *
-	 * Downsample-and-arbitrate rule: any non-zero mask pixel overlapping a
+	 * Wish semantics (ADR-027): the published R8 mask is the WISH — per-
+	 * pixel M ∈ [0,1], 1 = panel physically 3D, 0 = flat, intermediate =
+	 * fractional 3D-ness consumed at the DP's discretion (declared via
+	 * @ref xrt_dp_local_zone_caps::wish_fractional). The existing
+	 * downsample-and-arbitrate rule — any non-zero mask pixel overlapping a
 	 * hardware cell ⟹ that cell is 3D (OR union across all connected
-	 * clients) — which makes the 1×1 grid bit-compatible with today's global
-	 * bool arbitration. A vendor admin force-2D override supersedes the
-	 * union. The runtime republishes every frame while a mask is active
-	 * (screen rect tracks the window); vendors coalesce per their
-	 * max_update_hz.
+	 * clients) — is the DEFAULT (conformant) quantization of the wish,
+	 * which makes the 1×1 grid bit-compatible with today's global bool
+	 * arbitration and every boolean Local3DZone mask a valid wish. A vendor
+	 * admin force-2D override supersedes the union. The runtime republishes
+	 * every frame while a mask is active (screen rect tracks the window);
+	 * vendors coalesce per their max_update_hz.
 	 *
 	 * Optional — absent slot or NULL ⟹ not supported (see
 	 * @ref get_local_zone_caps). Appended per ADR-020.
