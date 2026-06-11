@@ -335,6 +335,18 @@ struct comp_gl_compositor
 
 	// --- State ---
 	bool hardware_display_3d;  //!< True when in 3D mode, false = 2D passthrough
+
+	//! Per-frame effective CONTENT layout (#542): the atlas grid actually
+	//! painted and handed to the DP this frame — submission-derived,
+	//! decoupled from hardware_display_3d (which only drives the DP weave,
+	//! HUD, and V-key paths). c->tile_columns/view_width stay the MODE
+	//! layout. eff_views == 0 until the first layer commit computes it.
+	uint32_t eff_views;
+	uint32_t eff_cols;
+	uint32_t eff_rows;
+	uint32_t eff_tile_w;
+	uint32_t eff_tile_h;
+
 	uint64_t last_frame_ns;
 	struct u_hud *hud;          //!< HUD overlay (shared u_hud system)
 	GLuint hud_texture;         //!< GL texture for HUD pixel upload
@@ -1485,8 +1497,15 @@ gl_crop_and_process_dp(struct comp_gl_compositor *c,
 		glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_draw_fbo);
 	}
 
-	uint32_t content_w = c->tile_columns * c->view_width;
-	uint32_t content_h = c->tile_rows * c->view_height;
+	// #542: the DP gets the frame's EFFECTIVE content layout — the grid the
+	// blit passes actually painted (== the mode layout for matched
+	// submissions) — not the mode layout.
+	uint32_t eff_cols = c->eff_cols > 0 ? c->eff_cols : c->tile_columns;
+	uint32_t eff_rows = c->eff_rows > 0 ? c->eff_rows : c->tile_rows;
+	uint32_t eff_tile_w = c->eff_tile_w > 0 ? c->eff_tile_w : c->view_width;
+	uint32_t eff_tile_h = c->eff_tile_h > 0 ? c->eff_tile_h : c->view_height;
+	uint32_t content_w = eff_cols * eff_tile_w;
+	uint32_t content_h = eff_rows * eff_tile_h;
 
 	GLuint dp_tex = atlas_tex;
 
@@ -1540,10 +1559,10 @@ gl_crop_and_process_dp(struct comp_gl_compositor *c,
 	xrt_display_processor_gl_process_atlas(
 	    c->display_processor,
 	    dp_tex,
-	    c->view_width,
-	    c->view_height,
-	    c->tile_columns,
-	    c->tile_rows,
+	    eff_tile_w,
+	    eff_tile_h,
+	    eff_cols,
+	    eff_rows,
 	    GL_RGBA8,
 	    output_w,
 	    output_h,
@@ -2021,8 +2040,13 @@ static void
 gl_dp_weave_to_fbo(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint target_fbo, uint32_t output_w,
                    uint32_t output_h)
 {
-	uint32_t content_w = c->tile_columns * c->view_width;
-	uint32_t content_h = c->tile_rows * c->view_height;
+	// #542: same effective-layout source as gl_crop_and_process_dp.
+	uint32_t eff_cols = c->eff_cols > 0 ? c->eff_cols : c->tile_columns;
+	uint32_t eff_rows = c->eff_rows > 0 ? c->eff_rows : c->tile_rows;
+	uint32_t eff_tile_w = c->eff_tile_w > 0 ? c->eff_tile_w : c->view_width;
+	uint32_t eff_tile_h = c->eff_tile_h > 0 ? c->eff_tile_h : c->view_height;
+	uint32_t content_w = eff_cols * eff_tile_w;
+	uint32_t content_h = eff_rows * eff_tile_h;
 	GLuint dp_tex = atlas_tex;
 
 	if (content_w != c->atlas_tex_width || content_h != c->atlas_tex_height) {
@@ -2057,8 +2081,8 @@ gl_dp_weave_to_fbo(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint target
 	const bool use_canvas = c->canvas.valid && !c->zones_frame;
 	glBindFramebuffer(GL_FRAMEBUFFER, target_fbo);
 	glViewport(0, 0, output_w, output_h);
-	xrt_display_processor_gl_process_atlas(c->display_processor, dp_tex, c->view_width, c->view_height,
-	                                       c->tile_columns, c->tile_rows, GL_RGBA8, output_w, output_h,
+	xrt_display_processor_gl_process_atlas(c->display_processor, dp_tex, eff_tile_w, eff_tile_h,
+	                                       eff_cols, eff_rows, GL_RGBA8, output_w, output_h,
 	                                       use_canvas ? c->canvas.x : 0, use_canvas ? c->canvas.y : 0,
 	                                       use_canvas ? c->canvas.w : 0, use_canvas ? c->canvas.h : 0);
 }
@@ -2364,13 +2388,19 @@ gl_sync_zone_mask_to_dp(struct comp_gl_compositor *c)
 static bool
 gl_compositor_capture_atlas_to_png(struct comp_gl_compositor *c, const char *path)
 {
-	if (c->atlas_texture == 0 || c->tile_columns == 0 || c->tile_rows == 0 ||
-	    c->view_width == 0 || c->view_height == 0) {
+	// #542: capture the frame's effective content region (what the passes
+	// painted), falling back to the mode layout pre-first-commit.
+	uint32_t cap_cols = c->eff_cols > 0 ? c->eff_cols : c->tile_columns;
+	uint32_t cap_rows = c->eff_rows > 0 ? c->eff_rows : c->tile_rows;
+	uint32_t cap_tile_w = c->eff_tile_w > 0 ? c->eff_tile_w : c->view_width;
+	uint32_t cap_tile_h = c->eff_tile_h > 0 ? c->eff_tile_h : c->view_height;
+	if (c->atlas_texture == 0 || cap_cols == 0 || cap_rows == 0 ||
+	    cap_tile_w == 0 || cap_tile_h == 0) {
 		return false;
 	}
 
-	uint32_t content_w = c->tile_columns * c->view_width;
-	uint32_t content_h = c->tile_rows * c->view_height;
+	uint32_t content_w = cap_cols * cap_tile_w;
+	uint32_t content_h = cap_rows * cap_tile_h;
 	if (content_w > c->atlas_tex_width)  content_w = c->atlas_tex_width;
 	if (content_h > c->atlas_tex_height) content_h = c->atlas_tex_height;
 
@@ -2442,6 +2472,75 @@ gl_compositor_dispatch_capture(struct comp_gl_compositor *c, uint32_t mode_filte
  * Layer commit — render atlas and present
  *
  */
+
+// Per-frame effective CONTENT layout (#542) — same policy as the D3D11/D3D12
+// legs: views from the first projection-class layer's view_count (mode grid
+// default; legacy apps keep the hardware-keyed mono clamp); matched → the
+// mode layout (bit-identical), mono → one tile spanning the full content
+// region, divergence → views×1 strip sized by the submitted imageRect,
+// capped to the physical atlas. Decoupled from c->hardware_display_3d,
+// which only drives the DP weave (request_display_mode), HUD, and V-key.
+static void
+gl_compute_effective_layout(struct comp_gl_compositor *c)
+{
+	uint32_t mode_cols = c->tile_columns > 0 ? c->tile_columns : 1;
+	uint32_t mode_rows = c->tile_rows > 0 ? c->tile_rows : 1;
+	uint32_t mode_tiles = mode_cols * mode_rows;
+
+	uint32_t views = mode_tiles;
+	const struct comp_layer *proj_layer = NULL;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_PROJECTION ||
+		    c->layer_accum.layers[i].data.type == XRT_LAYER_PROJECTION_DEPTH ||
+		    c->layer_accum.layers[i].data.type == XRT_LAYER_ZONE_3D) {
+			proj_layer = &c->layer_accum.layers[i];
+			views = proj_layer->data.view_count;
+			break;
+		}
+	}
+	if (views == 0) {
+		views = 1;
+	}
+	if (views > XRT_MAX_VIEWS) {
+		views = XRT_MAX_VIEWS;
+	}
+	if (c->legacy_app_tile_scaling && !c->hardware_display_3d && views > 1) {
+		views = 1;
+	}
+
+	c->eff_views = views;
+	if (views == 1) {
+		c->eff_cols = 1;
+		c->eff_rows = 1;
+		c->eff_tile_w = mode_cols * c->view_width;
+		c->eff_tile_h = mode_rows * c->view_height;
+	} else if (views == mode_tiles) {
+		c->eff_cols = mode_cols;
+		c->eff_rows = mode_rows;
+		c->eff_tile_w = c->view_width;
+		c->eff_tile_h = c->view_height;
+	} else {
+		uint32_t tile_w = (mode_cols * c->view_width) / views;
+		uint32_t tile_h = mode_rows * c->view_height;
+		if (proj_layer != NULL) {
+			const struct xrt_rect *r0 = &proj_layer->data.proj.v[0].sub.rect;
+			if (r0->extent.w > 0 && r0->extent.h > 0) {
+				tile_w = (uint32_t)r0->extent.w;
+				tile_h = (uint32_t)r0->extent.h;
+			}
+		}
+		if (tile_w * views > c->atlas_tex_width && views > 0) {
+			tile_w = c->atlas_tex_width / views;
+		}
+		if (tile_h > c->atlas_tex_height) {
+			tile_h = c->atlas_tex_height;
+		}
+		c->eff_cols = views;
+		c->eff_rows = 1;
+		c->eff_tile_w = tile_w;
+		c->eff_tile_h = tile_h;
+	}
+}
 
 static xrt_result_t
 gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
@@ -2603,6 +2702,12 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 	// HUD is rendered in the window-mode present path (after weave, before swap)
 
+	// Per-frame effective CONTENT layout (#542): tile grid/dims from the
+	// SUBMISSION, decoupled from the hardware weave-state. Feeds the blit
+	// passes, both DP crop helpers, the atlas dump, and the capture path —
+	// they must all agree on the frame's geometry.
+	gl_compute_effective_layout(c);
+
 	// Zero-copy check: can we pass the app's swapchain directly to the DP?
 	bool zero_copy = false;
 	GLuint zc_texture = 0;
@@ -2618,7 +2723,12 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			if (layer->data.type == XRT_LAYER_PROJECTION ||
 			    layer->data.type == XRT_LAYER_PROJECTION_DEPTH) {
 				uint32_t vc = mode->view_count;
-				bool same_sc = (vc > 0 && vc <= XRT_MAX_VIEWS && layer->sc_array[0] != NULL);
+				// #542: a hardware/content divergence frame (submitted
+				// views != mode views) must take the atlas path — the
+				// per-view loops below would read stale proj.v[] slots,
+				// and zero-copy can't re-tile a mismatched submission.
+				bool same_sc = (vc > 0 && vc <= XRT_MAX_VIEWS && layer->data.view_count == vc &&
+				                layer->sc_array[0] != NULL);
 				for (uint32_t v = 1; v < vc && same_sc; v++) {
 					if (layer->sc_array[v] != layer->sc_array[0])
 						same_sc = false;
@@ -2719,11 +2829,11 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			continue;
 		}
 
-		// Use min of compositor's tile count and layer's actual view count
-		// (during mode transitions the app may submit fewer views than the
-		// new tile layout expects)
-		uint32_t mode_views = c->hardware_display_3d ? (c->tile_columns * c->tile_rows) : 1;
-		uint32_t view_count = (layer->data.view_count < mode_views) ? layer->data.view_count : mode_views;
+		// CONTENT tile count from the SUBMISSION-derived effective layout
+		// (#542) — no longer clamped by the hardware weave-state. Per-layer
+		// view counts are still bounded by the frame's placement grid.
+		uint32_t view_count = layer->data.view_count;
+		if (view_count > c->eff_views) view_count = c->eff_views;
 		if (view_count == 0) view_count = 1;
 		for (uint32_t eye = 0; eye < view_count; eye++) {
 
@@ -2747,20 +2857,18 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				nr.h = 1.0f;
 			}
 
-			// Set viewport for this eye in the atlas texture
+			// Set viewport for this eye in the atlas texture — tile-place
+			// by the effective grid (#542). Mono content (views == 1)
+			// gets one tile spanning the full content region; the DP
+			// weaves or flattens per its own mode_3d.
 			uint32_t tbx, tby, tbw, tbh; // per-view tile box
-			if (!c->hardware_display_3d) {
-				tbx = 0;
-				tby = 0;
-				tbw = c->tile_columns * c->view_width;
-				tbh = c->tile_rows * c->view_height;
-			} else {
-				uint32_t tile_x = eye % c->tile_columns;
-				uint32_t tile_y = eye / c->tile_columns;
-				tbx = tile_x * c->view_width;
-				tby = tile_y * c->view_height;
-				tbw = c->view_width;
-				tbh = c->view_height;
+			{
+				uint32_t tile_x = eye % c->eff_cols;
+				uint32_t tile_y = eye / c->eff_cols;
+				tbx = tile_x * c->eff_tile_w;
+				tby = tile_y * c->eff_tile_h;
+				tbw = c->eff_tile_w;
+				tbh = c->eff_tile_h;
 			}
 			if (is_zone) {
 				// XR_EXT_display_zones: scale the zone rect (client-
@@ -2812,9 +2920,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 					        "vp=(%u,%u,%u,%u) view_count=%u hw3d=%d",
 					        eye, gsc->textures[img_idx], img_idx,
 					        nr.x, nr.y, nr.w, nr.h,
-					        eye % c->tile_columns * c->view_width,
-					        eye / c->tile_columns * c->view_height,
-					        c->view_width, c->view_height,
+					        tbx, tby, tbw, tbh,
 					        view_count, c->hardware_display_3d);
 					blit_log++;
 				}
@@ -2875,16 +2981,16 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		GLint loc_ws_tex = glGetUniformLocation(c->program_window_space, "u_texture");
 		GLint loc_ws_src = glGetUniformLocation(c->program_window_space, "u_src_rect");
 
-		uint32_t effective_views = c->hardware_display_3d ? (c->tile_columns * c->tile_rows) : 1;
+		// HUD tiles align with the projection tiles: same effective grid
+		// (#542), independent of the hardware weave-state.
+		uint32_t effective_views = c->eff_views > 0 ? c->eff_views : 1;
 		for (uint32_t eye = 0; eye < effective_views; eye++) {
-			// Set viewport for this eye
-			if (!c->hardware_display_3d) {
-				glViewport(0, 0, c->tile_columns * c->view_width, c->tile_rows * c->view_height);
-			} else {
-				uint32_t tile_x = eye % c->tile_columns;
-				uint32_t tile_y = eye / c->tile_columns;
-				glViewport(tile_x * c->view_width, tile_y * c->view_height,
-				           c->view_width, c->view_height);
+			// Set viewport for this eye in the effective grid
+			{
+				uint32_t tile_x = eye % c->eff_cols;
+				uint32_t tile_y = eye / c->eff_cols;
+				glViewport(tile_x * c->eff_tile_w, tile_y * c->eff_tile_h,
+				           c->eff_tile_w, c->eff_tile_h);
 			}
 
 			// Per-view disparity, graded across the view sweep (#413):
@@ -2923,12 +3029,13 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	// both projection and WS-layer passes have completed.
 	{
 		struct stat _st;
-		if (c->atlas_texture != 0 && c->tile_columns > 0 && c->tile_rows > 0 &&
-		    c->view_width > 0 && c->view_height > 0 &&
+		if (c->atlas_texture != 0 && c->eff_cols > 0 && c->eff_rows > 0 &&
+		    c->eff_tile_w > 0 && c->eff_tile_h > 0 &&
 		    stat("/tmp/dxr_atlas_trigger", &_st) == 0) {
 			unlink("/tmp/dxr_atlas_trigger");
-			uint32_t cw = c->tile_columns * c->view_width;
-			uint32_t ch = c->tile_rows * c->view_height;
+			// Effective content region (#542): what this frame painted.
+			uint32_t cw = c->eff_cols * c->eff_tile_w;
+			uint32_t ch = c->eff_rows * c->eff_tile_h;
 			if (cw > c->atlas_tex_width)  cw = c->atlas_tex_width;
 			if (ch > c->atlas_tex_height) ch = c->atlas_tex_height;
 			size_t row_pitch = (size_t)cw * 4;
@@ -2991,9 +3098,9 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				glBindVertexArray(c->vao_empty);
 				GLint loc_rect = glGetUniformLocation(c->program_blit, "u_src_rect");
 				float sh_w = (c->atlas_tex_width > 0)
-				    ? (float)(c->tile_columns * c->view_width) / (float)c->atlas_tex_width : 1.0f;
+				    ? (float)(c->eff_cols * c->eff_tile_w) / (float)c->atlas_tex_width : 1.0f;
 				float sh_h = (c->atlas_tex_height > 0)
-				    ? (float)(c->tile_rows * c->view_height) / (float)c->atlas_tex_height : 1.0f;
+				    ? (float)(c->eff_rows * c->eff_tile_h) / (float)c->atlas_tex_height : 1.0f;
 				glUniform4f(loc_rect, 0.0f, 0.0f, sh_w, sh_h);
 				GLint loc_flip = glGetUniformLocation(c->program_blit, "u_flip_y");
 				glUniform1f(loc_flip, 0.0f);
@@ -3041,9 +3148,9 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			glBindVertexArray(c->vao_empty);
 			GLint loc_rect = glGetUniformLocation(c->program_blit, "u_src_rect");
 			float used_w = (c->atlas_tex_width > 0)
-			    ? (float)(c->tile_columns * c->view_width) / (float)c->atlas_tex_width : 1.0f;
+			    ? (float)(c->eff_cols * c->eff_tile_w) / (float)c->atlas_tex_width : 1.0f;
 			float used_h = (c->atlas_tex_height > 0)
-			    ? (float)(c->tile_rows * c->view_height) / (float)c->atlas_tex_height : 1.0f;
+			    ? (float)(c->eff_rows * c->eff_tile_h) / (float)c->atlas_tex_height : 1.0f;
 			glUniform4f(loc_rect, 0.0f, 0.0f, used_w, used_h);
 			GLint loc_flip = glGetUniformLocation(c->program_blit, "u_flip_y");
 			glUniform1f(loc_flip, 0.0f);
@@ -3118,9 +3225,9 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			glUseProgram(c->program_blit);
 			GLint loc_rect = glGetUniformLocation(c->program_blit, "u_src_rect");
 			float blit_w = (c->atlas_tex_width > 0)
-			    ? (float)(c->tile_columns * c->view_width) / (float)c->atlas_tex_width : 1.0f;
+			    ? (float)(c->eff_cols * c->eff_tile_w) / (float)c->atlas_tex_width : 1.0f;
 			float blit_h = (c->atlas_tex_height > 0)
-			    ? (float)(c->tile_rows * c->view_height) / (float)c->atlas_tex_height : 1.0f;
+			    ? (float)(c->eff_rows * c->eff_tile_h) / (float)c->atlas_tex_height : 1.0f;
 			glUniform4f(loc_rect, 0.0f, 0.0f, blit_w, blit_h);
 			GLint loc_flip = glGetUniformLocation(c->program_blit, "u_flip_y");
 			glUniform1f(loc_flip, 0.0f);
