@@ -12,7 +12,6 @@ package org.freedesktop.monado.ipc;
 import android.content.Context;
 import android.os.ParcelFileDescriptor;
 import android.os.RemoteException;
-import android.provider.Settings;
 import android.util.Log;
 import android.view.Surface;
 import androidx.annotation.Keep;
@@ -39,10 +38,7 @@ public class MonadoImpl extends IMonado.Stub {
         System.loadLibrary(BuildConfig.SERVICE_LIB_NAME);
     }
 
-    private final Context context;
-
     public MonadoImpl(@NonNull Context context) {
-        this.context = context.getApplicationContext();
         // #510: hand the native side the *original* context (the Service), not the
         // application context. A vendor display-processor plug-in run out-of-process
         // (Leia CNSDK) calls Context#getApplication() during init — that method exists
@@ -84,12 +80,6 @@ public class MonadoImpl extends IMonado.Stub {
             return;
         }
         nativeAppSurface(surface);
-    }
-
-    @Override
-    public boolean canDrawOverOtherApps() {
-        Log.i(TAG, "canDrawOverOtherApps");
-        return Settings.canDrawOverlays(context);
     }
 
     @Override
