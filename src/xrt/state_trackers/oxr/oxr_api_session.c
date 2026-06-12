@@ -1318,21 +1318,30 @@ oxr_xrRequestDisplayModeEXT(XrSession session, XrDisplayModeEXT displayMode)
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "Invalid displayMode %d", (int)displayMode);
 	}
 
-	// Thin wrapper: find first mode matching hardware_display_3d, delegate to unified API
-	struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
-	if (head == NULL) {
-		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE, "No head device available");
-	}
-
+	// #542: HARDWARE-only override for the current mode. A rendering mode is
+	// a complete recipe (layout, view count, scales, default hardware state);
+	// xrRequestDisplayRenderingModeEXT requests one and the hardware follows.
+	// THIS entry point sets the hardware state ALONE — the active mode, the
+	// app's content, and the DP's processing (it weaves or flat-blits per the
+	// atlas it is handed) are untouched. E.g. hardware-2D over an active 3D
+	// mode keeps the weave running with the lens off: the panel shows the
+	// woven atlas flat (blurry), and an app fading its parallax to zero
+	// converges back to a sharp image — the MANUAL tracking-loss transition.
 	bool want_3d = (displayMode == XR_DISPLAY_MODE_3D_EXT);
-	for (uint32_t i = 0; i < head->rendering_mode_count; i++) {
-		if (head->rendering_modes[i].hardware_display_3d == want_3d) {
-			return oxr_xrRequestDisplayRenderingModeEXT(session, i);
-		}
+	bool changed = (sess->hardware_display_3d != want_3d);
+
+	XrResult res = oxr_session_request_display_mode(&log, sess, want_3d);
+	if (res != XR_SUCCESS) {
+		return res;
 	}
 
-	// No matching mode found — fall back to legacy behavior
-	return oxr_session_request_display_mode(&log, sess, want_3d);
+	// oxr_session_request_display_mode records the new state on success;
+	// surface the flip to the app the same way a mode-driven change does.
+	if (changed && sess->hardware_display_3d == want_3d) {
+		oxr_event_push_XrEventDataHardwareDisplayStateChanged(&log, sess, want_3d ? XR_TRUE : XR_FALSE);
+	}
+
+	return XR_SUCCESS;
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL

@@ -722,7 +722,9 @@ typedef struct XrDisplayInfoEXT {
 
 #### XrDisplayModeEXT
 
-> **Deprecated in v10.** `XrDisplayModeEXT` is deprecated in favor of `xrRequestDisplayRenderingModeEXT`, which provides a unified rendering mode API covering both 2D/3D switching and vendor-specific rendering variations. New applications should use `xrRequestDisplayRenderingModeEXT`. `XrDisplayModeEXT` and `xrRequestDisplayModeEXT` remain supported for backward compatibility.
+> **Repurposed in v15.** `XrDisplayModeEXT` names the two physical hardware states for
+> the [hardware-state-only override](#xrrequestdisplaymodeext). Content/mode selection
+> stays with `xrRequestDisplayRenderingModeEXT`; this enum no longer implies a mode switch.
 
 ```c
 typedef enum XrDisplayModeEXT {
@@ -748,13 +750,22 @@ This extension's current (v14) function set (v14 adds no functions — only the 
 | [`xrEnumerateDisplayRenderingModesEXT`](#enumerating-rendering-modes-v8--xrdisplayrenderingmodeinfoext--xrenumeratedisplayrenderingmodesext) | v8 | Enumerate available rendering modes (`XrDisplayRenderingModeInfoEXT`). |
 | [`xrRequestDisplayRenderingModeEXT`](#7-display-rendering-mode-control-v7) | v7 | Request a rendering mode by index (the unified mode-control API). |
 | [`xrRequestEyeTrackingModeEXT`](#new-function-xrrequesteyetrackingmodeext) | v6 | Switch between managed and manual eye tracking. |
-| `xrRequestDisplayModeEXT` | v4 (**deprecated** v10) | Legacy 2D/3D toggle — thin wrapper over `xrRequestDisplayRenderingModeEXT`. |
+| `xrRequestDisplayModeEXT` | v4 (**repurposed** v15) | Hardware-state-only override for the current mode (was a deprecated mode-switching wrapper through v14). |
 
 #### xrRequestDisplayModeEXT
 
-> **Deprecated in v10.** Use `xrRequestDisplayRenderingModeEXT` instead. See [Display Rendering Mode Control (v7)](#7-display-rendering-mode-control-v7) for the unified replacement (and [Enumerating Rendering Modes](#enumerating-rendering-modes-v8--xrdisplayrenderingmodeinfoext--xrenumeratedisplayrenderingmodesext) to discover modes). `xrRequestDisplayModeEXT` remains supported for backward compatibility as a thin wrapper that finds the first mode matching the requested hardware-3D state and delegates.
+> **Repurposed in v15.** Through v14 this function was a deprecated thin wrapper that found
+> the first rendering mode matching the requested hardware state and delegated to
+> `xrRequestDisplayRenderingModeEXT` (i.e. it *switched modes*). As of v15 it is the
+> **hardware-state-only override**: a rendering mode is a complete recipe — layout, view
+> count, scales, **and a default hardware state** — and `xrRequestDisplayRenderingModeEXT`
+> requests a mode with the hardware following automatically. THIS function sets the
+> hardware state **alone**, leaving the active mode, the application's content, and the
+> display processor's atlas processing untouched. No caller of the pre-v15 wrapper
+> behavior existed in the DisplayXR app corpus at the time of the repurpose.
 
-Requests that the runtime switch the display between 2D and 3D modes.
+Requests the physical 2D/3D display state (e.g. the switchable lenticular lens) for the
+**current** rendering mode, without changing the mode.
 
 ```c
 XrResult xrRequestDisplayModeEXT(
@@ -767,29 +778,35 @@ XrResult xrRequestDisplayModeEXT(
 | Parameter | Description |
 |---|---|
 | `session` | A valid `XrSession` handle. |
-| `mode` | The requested display mode (`XR_DISPLAY_MODE_2D_EXT` or `XR_DISPLAY_MODE_3D_EXT`). |
+| `mode` | The requested hardware state (`XR_DISPLAY_MODE_2D_EXT` or `XR_DISPLAY_MODE_3D_EXT`). |
 
 **Return Codes:**
 
 | Code | Meaning |
 |---|---|
-| `XR_SUCCESS` | The mode request was accepted by the runtime. |
-| `XR_ERROR_FEATURE_UNSUPPORTED` | The display does not support mode switching (no enumerated rendering mode reports `hardwareDisplay3D == XR_TRUE`). |
-| `XR_ERROR_SESSION_NOT_RUNNING` | The session is not in a running state. |
+| `XR_SUCCESS` | The hardware-state request was accepted by the runtime. |
+| `XR_ERROR_VALIDATION_FAILURE` | `mode` is not a valid `XrDisplayModeEXT` value. |
 | `XR_ERROR_HANDLE_INVALID` | The session handle is invalid. |
 
 **Semantics:**
 
-- This function is a **request**, not a guarantee. The runtime forwards the request to the
+- **Hardware only.** The active rendering mode (and so the advertised layout, view count
+  and scales), the application's submission, and the display processor's atlas processing
+  are unaffected. The display processor keeps weaving a multi-view atlas or flat-blitting
+  a single-view atlas exactly as the content dictates — only the physical 2D/3D element
+  changes. Requesting `XR_DISPLAY_MODE_2D_EXT` over an active 3D mode therefore shows the
+  *woven* atlas flat (blurry); an application fading its parallax to zero converges back
+  to a sharp image — the building block for app-authored 2D↔3D transitions such as the
+  MANUAL eye-tracking loss flow.
+- **Lifetime of the override.** The override holds until the next
+  `xrRequestDisplayRenderingModeEXT` call, whose mode's default hardware state then
+  applies (re-requesting the current mode index restores its default).
+- A successful state flip is reported via `XrEventDataHardwareDisplayStateChangedEXT`.
+  No `XrEventDataRenderingModeChangedEXT` is fired — the mode did not change.
+- This function is a **request**, not a guarantee. The runtime forwards it to the
   underlying platform SDK via the display processor (some vendors implement it as a
-  preference-based hint, others as direct backlight control). The platform may aggregate
+  preference-based hint, others as direct hardware control). The platform may aggregate
   requests from multiple applications or defer the switch.
-- The function returns `XR_SUCCESS` when the request has been accepted, regardless of
-  whether the display has physically completed the mode change.
-- The application **may** call this function at any time while the session is running.
-- If no enumerated rendering mode reports `hardwareDisplay3D == XR_TRUE` (the display has no 3D
-  mode), this function returns `XR_ERROR_FEATURE_UNSUPPORTED` and has no effect. (`hardwareDisplay3D`
-  is a per-mode field on `XrDisplayRenderingModeInfoEXT`; it is no longer on `XrDisplayInfoEXT`.)
 
 ### Display Mode Switching
 
@@ -2033,7 +2050,8 @@ the property) silently ignore the call — graceful degradation.
 | 10 | 2026-03-12 | David Fattal | Removed `supportsDisplayModeSwitch` (derivable from mode enumeration), renamed `display3D` to `hardwareDisplay3D`, deprecated `xrRequestDisplayModeEXT` in favor of unified `xrRequestDisplayRenderingModeEXT`, added rendering mode and hardware display state change events (`XrEventDataRenderingModeChangedEXT`, `XrEventDataHardwareDisplayStateChangedEXT`). |
 | 11 | 2026-03-20 | David Fattal | Added per-mode tile layout fields to `XrDisplayRenderingModeInfoEXT`: `tileColumns`, `tileRows`, `viewWidthPixels`, `viewHeightPixels`. Enables runtime to describe atlas layout for multi-view rendering modes (e.g., 2x2 quad). |
 | 12 | 2026-03-28 | David Fattal | Removed `hardwareDisplay3D` from `XrDisplayInfoEXT`. It remains available **per-mode** on `XrDisplayRenderingModeInfoEXT` (via `xrEnumerateDisplayRenderingModesEXT`) and is also reported by the `XrEventDataHardwareDisplayStateChangedEXT` event. Also moved `xrSetSharedTextureOutputRectEXT` to the window-binding extension headers. |
-| 13 | 2026-05-18 | David Fattal | Added per-session `isActive` and `isRequestable` fields to `XrDisplayRenderingModeInfoEXT` (#234). `isActive` lets an app learn the current mode from the first enumerate without waiting for an event; `isRequestable` tells a session whether it may request a mode (false for non-controller sessions under a workspace). **Current header version (`XR_EXT_display_info_SPEC_VERSION == 13`).** |
+| 13 | 2026-05-18 | David Fattal | Added per-session `isActive` and `isRequestable` fields to `XrDisplayRenderingModeInfoEXT` (#234). `isActive` lets an app learn the current mode from the first enumerate without waiting for an event; `isRequestable` tells a session whether it may request a mode (false for non-controller sessions under a workspace). |
+| 15 | 2026-06-11 | David Fattal | **Repurposed `xrRequestDisplayModeEXT`** (#542): no longer a deprecated mode-switching wrapper — it now sets the HARDWARE display state alone for the current mode (the mode's layout/content and the DP's atlas processing are untouched; the DP weaves or flat-blits per the atlas it is handed). Override holds until the next mode request. Reported via `XrEventDataHardwareDisplayStateChangedEXT`. No struct/ABI change. **Current header version (`XR_EXT_display_info_SPEC_VERSION == 15`).** |
 
 > The `XR_EXT_display_info_SPEC_VERSION` define in the header is the authoritative current
 > revision. Earlier revision numbers in this table reflect the proposal's editing history and do
@@ -2077,6 +2095,6 @@ The runtime is based on Monado (open-source OpenXR runtime) with native composit
 | **Screen-centered coordinates** | The coordinate frame used by RAW mode eye positions: origin at the physical display center, +X right, +Y up, +Z toward the viewer. Implicit in the returned `XrView.pose.position` — no dedicated reference space needed. |
 | **Nominal viewer position** | A static, design-time expectation of the viewer's position relative to the display. Not tracked; defines the apex of the canonical display pyramid. |
 | **Disparity** | Horizontal shift between left and right eye images, measured as a fraction of window width. Controls perceived depth of window-space layers. |
-| **Display mode** | The operational mode of a tracked 3D display: 2D (standard flat panel) or 3D (light field interlacing active). Historically controlled via `xrRequestDisplayModeEXT` (deprecated in v10). New apps use `xrRequestDisplayRenderingModeEXT` which provides unified control over both 2D/3D switching and vendor-specific rendering variations. |
+| **Display mode** | The physical 2D/3D state of a tracked 3D display's switchable element (e.g. lenticular lens). Follows the active rendering mode's default automatically; `xrRequestDisplayModeEXT` (v15) overrides it alone for the current mode, leaving content and DP processing untouched. |
 | **Display rendering mode** | A vendor-specific rendering variation within 3D mode (e.g., SBS stereo, anaglyph, lenticular). Controlled via `xrRequestDisplayRenderingModeEXT`. Mode 0 is standard; higher indices are vendor-defined. |
 | **Surface binding** | A platform-specific mechanism for the application to provide its own rendering surface to the runtime (`HWND` on Win32; `ANativeWindow*` + Java `Surface` + screen position on Android). |

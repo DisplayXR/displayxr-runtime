@@ -49,23 +49,18 @@ static std::mutex g_inputMutex;
 static std::atomic<bool> g_running{true};
 static XrSessionManager* g_xr = nullptr;
 
-// #542 content-pin (validation affordance): freeze the submission-side mode
-// snapshot while hardware mode requests (V / 0-8) still go out — drives a
-// deliberate hardware/content divergence so the decoupled compositors can be
-// exercised (e.g. panel-2D + 2 submitted tiles). Toggle: 'L' key;
-// DXR_CUBE_PIN_CONTENT=1 starts pinned. Toggle flags are atomic (set on the
+// #542 'H' (validation affordance): toggle the HARDWARE display state alone
+// for the current mode via xrRequestDisplayModeEXT — the mode, the app's
+// content, and the DP's weave/blit processing are untouched. In 3D the panel
+// shows the woven atlas flat (blurry); fading parallax to zero converges
+// back to sharp — the MANUAL tracking-loss transition shape (#522). The
+// runtime auto-clears the override on the next mode request, so the local
+// note resets whenever the mode changes. Toggle flag is atomic (set on the
 // message-pump thread, consumed on the render thread).
-// On top of the pin, two single-axis keys:
-//   'H' = HARDWARE-only: pin content at its current layout, then request the
-//         opposite-hardware mode — only the panel changes.
-//   'J' = CONTENT-only: flip the pinned submission layout to the opposite-
-//         hardware mode's layout — no runtime request, only content changes.
-static std::atomic<bool> g_contentPinTogglePending{false};
 static std::atomic<bool> g_hwToggleRequested{false};
-static std::atomic<bool> g_contentToggleRequested{false};
-static bool g_contentPinned = false;          // render-thread only
-static uint32_t g_contentPinModeIndex = 0;    // render-thread only
-static uint32_t g_lastLive3DModeIndex = UINT32_MAX; // render-thread only
+static bool g_hwOverrideActive = false;       // render-thread only
+static bool g_hwOverride3D = false;           // render-thread only
+static uint32_t g_hwOverrideModeIndex = 0;    // render-thread only
 
 // Set DISPLAYXR_TRANSPARENT_BG=1 in the environment to opt into transparent
 // desktop composition: the HWND is created with WS_EX_NOREDIRECTIONBITMAP +
@@ -267,20 +262,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ToggleFullscreen(hwnd);
             return 0;
         }
-        // #542 content-pin: 'L' freezes the submission-side mode snapshot
-        // (handled on the render thread) while V/0-8 hardware requests still
-        // go out — drives a deliberate hardware/content divergence.
-        // 'H' / 'J' toggle a single axis (hardware-only / content-only).
-        if (wParam == 'L') {
-            g_contentPinTogglePending.store(true);
-            return 0;
-        }
+        // #542: 'H' toggles the HARDWARE display state alone for the current
+        // mode (xrRequestDisplayModeEXT) — handled on the render thread.
         if (wParam == 'H') {
             g_hwToggleRequested.store(true);
-            return 0;
-        }
-        if (wParam == 'J') {
-            g_contentToggleRequested.store(true);
             return 0;
         }
         break;
@@ -639,89 +624,30 @@ static void RenderThreadFunc(
         UpdateScene(*renderer, perfStats.deltaTime, xr->spinSpeed);
         PollEvents(*xr);
 
-        // #542 content-pin: resolve the env start-pin once, then any pending
-        // 'L' toggle. While pinned the render/submit path below derives its
-        // layout from the SNAPSHOT mode, not the live one — mode requests keep
-        // flowing, so hardware and content diverge on purpose.
+        // #542 'H': hardware-state-only toggle for the current mode.
         {
-            static bool s_pinEnvChecked = false;
-            if (!s_pinEnvChecked && xr->sessionRunning) {
-                s_pinEnvChecked = true;
-                const char *pin = getenv("DXR_CUBE_PIN_CONTENT");
-                if (pin && pin[0] == '1') {
-                    g_contentPinned = true;
-                    g_contentPinModeIndex = xr->currentModeIndex;
-                    LOG_INFO("[#542] content PINNED at start (mode=%u)", g_contentPinModeIndex);
-                }
+            // A mode change resets the hardware to the new mode's default —
+            // drop the local override note so the next H starts from there.
+            if (g_hwOverrideActive && xr->currentModeIndex != g_hwOverrideModeIndex) {
+                g_hwOverrideActive = false;
             }
-            if (g_contentPinTogglePending.exchange(false)) {
-                g_contentPinned = !g_contentPinned;
-                if (g_contentPinned) {
-                    g_contentPinModeIndex = xr->currentModeIndex;
-                }
-                LOG_INFO("[#542] content %s (snapshot mode=%u, live mode=%u)",
-                    g_contentPinned ? "PINNED" : "UNPINNED",
-                    g_contentPinModeIndex, xr->currentModeIndex);
-            }
-
-            // Track the most recent live 3D mode for the "back to 3D" direction
-            // of the single-axis toggles (mirrors the runtime's V-key restore).
-            if (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount &&
-                xr->renderingModeDisplay3D[xr->currentModeIndex]) {
-                g_lastLive3DModeIndex = xr->currentModeIndex;
-            }
-            // Resolve a mode whose hardware state is the opposite of `from3d`:
-            // prefer the remembered 3D mode when going back to 3D, else the
-            // first mode on the other side of the hardware flag.
-            auto findOppositeMode = [&](bool from3d) -> int {
-                if (from3d == false && g_lastLive3DModeIndex < xr->renderingModeCount &&
-                    xr->renderingModeDisplay3D[g_lastLive3DModeIndex]) {
-                    return (int)g_lastLive3DModeIndex;
-                }
-                for (uint32_t i = 0; i < xr->renderingModeCount; i++) {
-                    if (xr->renderingModeDisplay3D[i] != from3d) {
-                        return (int)i;
-                    }
-                }
-                return -1;
-            };
-
-            // 'H' — HARDWARE-only: pin content where it is (so it won't follow),
-            // then request the opposite-hardware mode. Only the panel changes.
             if (g_hwToggleRequested.exchange(false)) {
-                if (xr->renderingModeCount > 0 && xr->session != XR_NULL_HANDLE &&
-                    xr->pfnRequestDisplayRenderingModeEXT != nullptr &&
-                    xr->currentModeIndex < xr->renderingModeCount) {
-                    if (!g_contentPinned) {
-                        g_contentPinned = true;
-                        g_contentPinModeIndex = xr->currentModeIndex;
+                if (xr->pfnRequestDisplayModeEXT != nullptr && xr->session != XR_NULL_HANDLE &&
+                    xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) {
+                    bool mode_default_3d = xr->renderingModeDisplay3D[xr->currentModeIndex];
+                    bool cur_3d = g_hwOverrideActive ? g_hwOverride3D : mode_default_3d;
+                    bool want_3d = !cur_3d;
+                    XrResult hres = xr->pfnRequestDisplayModeEXT(xr->session,
+                        want_3d ? XR_DISPLAY_MODE_3D_EXT : XR_DISPLAY_MODE_2D_EXT);
+                    if (XR_SUCCEEDED(hres)) {
+                        g_hwOverrideActive = (want_3d != mode_default_3d);
+                        g_hwOverride3D = want_3d;
+                        g_hwOverrideModeIndex = xr->currentModeIndex;
                     }
-                    bool live3d = xr->renderingModeDisplay3D[xr->currentModeIndex];
-                    int target = findOppositeMode(live3d);
-                    if (target >= 0) {
-                        xr->pfnRequestDisplayRenderingModeEXT(xr->session, (uint32_t)target);
-                        LOG_INFO("[#542] H: hardware-only -> requested mode %d (%s); "
-                            "content stays pinned at mode %u layout",
-                            target, live3d ? "2D" : "3D", g_contentPinModeIndex);
-                    }
-                }
-            }
-
-            // 'J' — CONTENT-only: flip the pinned submission layout to the
-            // opposite-hardware mode's layout. No runtime request goes out.
-            if (g_contentToggleRequested.exchange(false)) {
-                if (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) {
-                    uint32_t cur = (g_contentPinned && g_contentPinModeIndex < xr->renderingModeCount)
-                        ? g_contentPinModeIndex : xr->currentModeIndex;
-                    bool cur3d = xr->renderingModeDisplay3D[cur];
-                    int target = findOppositeMode(cur3d);
-                    if (target >= 0) {
-                        g_contentPinned = true;
-                        g_contentPinModeIndex = (uint32_t)target;
-                        LOG_INFO("[#542] J: content-only -> pinned at mode %d layout (%s); "
-                            "hardware untouched (live mode=%u)",
-                            target, cur3d ? "2D" : "3D", xr->currentModeIndex);
-                    }
+                    LOG_INFO("[#542] H: hardware-only -> %s (mode %u unchanged, rc=0x%x)",
+                        want_3d ? "3D" : "2D", xr->currentModeIndex, (unsigned)hres);
+                } else {
+                    LOG_INFO("[#542] H: xrRequestDisplayModeEXT unavailable");
                 }
             }
         }
@@ -732,23 +658,18 @@ static void RenderThreadFunc(
             if (BeginFrame(*xr, frameState)) {
                 LOG_INFO("[FRAME] BeginFrame OK, shouldRender=%d, displayTime=%lld",
                     frameState.shouldRender, (long long)frameState.predictedDisplayTime);
-                // Get N-view mode info from enumerated rendering modes.
-                // #542 content-pin: the render/submit layout derives from the
-                // pinned snapshot when active, the live mode otherwise.
-                uint32_t contentModeIndex =
-                    (g_contentPinned && g_contentPinModeIndex < xr->renderingModeCount)
-                        ? g_contentPinModeIndex : xr->currentModeIndex;
-                bool monoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[contentModeIndex]);
-                if (xr->renderingModeCount > 0 && contentModeIndex < xr->renderingModeCount) {
-                    xr->recommendedViewScaleX = xr->renderingModeScaleX[contentModeIndex];
-                    xr->recommendedViewScaleY = xr->renderingModeScaleY[contentModeIndex];
+                // Get N-view mode info from enumerated rendering modes
+                bool monoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[xr->currentModeIndex]);
+                if (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) {
+                    xr->recommendedViewScaleX = xr->renderingModeScaleX[xr->currentModeIndex];
+                    xr->recommendedViewScaleY = xr->renderingModeScaleY[xr->currentModeIndex];
                 }
-                uint32_t modeViewCount = (xr->renderingModeCount > 0 && contentModeIndex < xr->renderingModeCount)
-                    ? xr->renderingModeViewCounts[contentModeIndex] : 2;
-                uint32_t tileColumns = (xr->renderingModeCount > 0 && contentModeIndex < xr->renderingModeCount)
-                    ? xr->renderingModeTileColumns[contentModeIndex] : 2;
-                uint32_t tileRows = (xr->renderingModeCount > 0 && contentModeIndex < xr->renderingModeCount)
-                    ? xr->renderingModeTileRows[contentModeIndex] : 1;
+                uint32_t modeViewCount = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount)
+                    ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2;
+                uint32_t tileColumns = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount)
+                    ? xr->renderingModeTileColumns[xr->currentModeIndex] : 2;
+                uint32_t tileRows = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount)
+                    ? xr->renderingModeTileRows[xr->currentModeIndex] : 1;
                 int eyeCount = monoMode ? 1 : (int)modeViewCount;
 
                 // Dynamic arrays for N-view rendering
@@ -1047,11 +968,10 @@ static void RenderThreadFunc(
                                     xr->renderingModeCount,
                                     xr->renderingModeCount > 0 ? xr->renderingModeDisplay3D[xr->currentModeIndex] : true,
                                     xr->renderingModeCount > 0 ? xr->renderingModeIsRequestable[xr->currentModeIndex] : true);
-                                if (g_contentPinned) {
-                                    wchar_t pinBuf[64];
-                                    swprintf(pinBuf, 64, L"\nCONTENT PINNED [L]: %ux%u x%d",
-                                        tileColumns, tileRows, eyeCount);
-                                    dispText += pinBuf;
+                                if (g_hwOverrideActive) {
+                                    dispText += g_hwOverride3D
+                                        ? L"\nHW OVERRIDE [H]: 3D (mode default 2D)"
+                                        : L"\nHW OVERRIDE [H]: 2D (mode default 3D)";
                                 }
                                 std::wstring eyeText = FormatEyeTrackingInfo(
                                     xr->eyePositions, (uint32_t)eyeCount,
@@ -1162,8 +1082,7 @@ static void RenderThreadFunc(
                 }
 
                 // viewCount: 1 for mono (2D mode), 2 for stereo (3D mode)
-                // (#542: follows the content pin, like the render path)
-                uint32_t submitViewCount = (xr->renderingModeCount > 0 && contentModeIndex < xr->renderingModeCount) ? xr->renderingModeViewCounts[contentModeIndex] : 2;
+                uint32_t submitViewCount = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2;
                 // When transparent_bg is on, ask the runtime to honor the cube's
                 // per-pixel alpha when blending the projection layer. Pre-#213
                 // apps default to 0 (no source-alpha blend = treat as opaque).
