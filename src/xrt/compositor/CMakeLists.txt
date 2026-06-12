@@ -82,6 +82,9 @@ if(XRT_HAVE_D3D11)
 		comp_client PRIVATE client/comp_d3d11_client.cpp client/comp_d3d11_client.h
 				    client/comp_d3d11_glue.c
 		)
+	# #551 — the D3D11 client compositor presents a transparent IPC output via
+	# DirectComposition (DCompositionCreateDevice2) on the app's own window.
+	target_link_libraries(comp_client PRIVATE d3d11 dxgi dcomp)
 endif()
 
 if(XRT_HAVE_D3D12)

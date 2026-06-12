@@ -892,6 +892,27 @@ comp_d3d11_service_compositor_export_workspace_sync_fence(struct xrt_compositor 
 void
 comp_d3d11_service_compositor_set_workspace_sync_fence_value(struct xrt_compositor *xc, uint64_t value);
 
+/*!
+ * #551 — export the per-client SHARED transparent-output texture handle (+ its
+ * pixel dims) for the IPC client to import and present transparently via its
+ * own DirectComposition swap chain. Returns false when @p xc is not a D3D11
+ * service compositor or the client did not request a transparent background.
+ */
+bool
+comp_d3d11_service_compositor_export_transparent_output(struct xrt_compositor *xc,
+                                                        xrt_graphics_buffer_handle_t *out_handle,
+                                                        uint32_t *out_width,
+                                                        uint32_t *out_height,
+                                                        uint64_t *out_hwnd);
+
+/*!
+ * #551 — export the service→client transparent-output fence handle (the service
+ * signals it after each weave; the client GPU-waits before presenting).
+ */
+bool
+comp_d3d11_service_compositor_export_transparent_output_fence(struct xrt_compositor *xc,
+                                                              xrt_graphics_sync_handle_t *out_handle);
+
 /*! @} */
 
 

@@ -246,6 +246,27 @@ struct d3d11_client_render_resources
 	wil::com_ptr<ID3D11SamplerState>     ck_sampler;
 	UINT                                  ck_intermediate_w;
 	UINT                                  ck_intermediate_h;
+
+	//! #551 — transparent compositing output for a forced-IPC transparent
+	//! client. The service can't present the app's cross-process window with
+	//! per-pixel alpha (DComp CreateTargetForHwnd is owner-only), so the DP
+	//! weaves into this SHARED NT-handle texture (its RTV reused as
+	//! back_buffer_rtv) instead of a swap chain; the service signals
+	//! transparent_output_fence after the weave; and the CLIENT (which owns the
+	//! window, in the app process) presents it via a transparent
+	//! DirectComposition swap chain so DWM blends the LIVE desktop into the
+	//! alpha-gate holes. Reusable for any IPC app requesting
+	//! transparentBackgroundEnabled (not zones-specific). texture == nullptr ⇒
+	//! ordinary opaque swap-chain present. The fence is the reverse direction
+	//! of workspace_sync_fence (service signals, client waits); both bump once
+	//! per commit, so the value stays in lockstep without per-frame IPC.
+	wil::com_ptr<ID3D11Texture2D>        transparent_output_texture;
+	HANDLE                                transparent_output_texture_handle; //!< NT handle for IPC export
+	wil::com_ptr<ID3D11Fence>            transparent_output_fence;
+	HANDLE                                transparent_output_fence_handle;   //!< NT handle for IPC export
+	uint64_t                              transparent_output_value;          //!< signaled once per commit
+	uint32_t                              transparent_output_w;
+	uint32_t                              transparent_output_h;
 };
 
 
@@ -2632,6 +2653,19 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->ck_ps.reset();
 	res->ck_vs.reset();
 
+	// #551 transparent output: close the source NT handles (DuplicateHandle'd
+	// copies in the client process are unaffected) and release the resources.
+	if (res->transparent_output_texture_handle != nullptr) {
+		CloseHandle(res->transparent_output_texture_handle);
+		res->transparent_output_texture_handle = nullptr;
+	}
+	if (res->transparent_output_fence_handle != nullptr) {
+		CloseHandle(res->transparent_output_fence_handle);
+		res->transparent_output_fence_handle = nullptr;
+	}
+	res->transparent_output_fence.reset();
+	res->transparent_output_texture.reset();
+
 	res->swap_chain.reset();
 
 	if (res->owns_window && res->window != nullptr) {
@@ -2815,6 +2849,61 @@ init_client_render_resources(struct d3d11_service_system *sys,
 	const bool use_transparent =
 	    transparent_hwnd && external_hwnd == nullptr && res->owns_window && !sys->workspace_mode;
 
+	// #551 — transparent compositing output for a cross-process app HWND: the
+	// service can't DComp-present the app's window (owner-only), so instead of
+	// a swap chain we weave into a SHARED texture and let the CLIENT (app
+	// process) present it transparently. Reusable for any IPC app that requests
+	// transparentBackgroundEnabled.
+	const bool use_client_transparent =
+	    transparent_hwnd && external_hwnd != nullptr && !sys->workspace_mode;
+	if (use_client_transparent) {
+		D3D11_TEXTURE2D_DESC od = {};
+		od.Width = actual_width;
+		od.Height = actual_height;
+		od.MipLevels = 1;
+		od.ArraySize = 1;
+		od.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // premultiplied-alpha output the client presents
+		od.SampleDesc.Count = 1;
+		od.Usage = D3D11_USAGE_DEFAULT;
+		od.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+		od.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+		hr = sys->device->CreateTexture2D(&od, nullptr, res->transparent_output_texture.put());
+		if (SUCCEEDED(hr)) {
+			hr = sys->device->CreateRenderTargetView(res->transparent_output_texture.get(), nullptr,
+			                                         res->back_buffer_rtv.put());
+		}
+		wil::com_ptr<IDXGIResource1> dxgi_res1;
+		if (SUCCEEDED(hr)) {
+			hr = res->transparent_output_texture->QueryInterface(IID_PPV_ARGS(dxgi_res1.put()));
+		}
+		if (SUCCEEDED(hr)) {
+			hr = dxgi_res1->CreateSharedHandle(nullptr,
+			                                   DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+			                                   nullptr, &res->transparent_output_texture_handle);
+		}
+		// Service→client fence: service signals after the weave, client waits
+		// before presenting. Reverse direction of workspace_sync_fence.
+		if (SUCCEEDED(hr)) {
+			hr = sys->device->CreateFence(0, D3D11_FENCE_FLAG_SHARED,
+			                              IID_PPV_ARGS(res->transparent_output_fence.put()));
+		}
+		if (SUCCEEDED(hr)) {
+			hr = res->transparent_output_fence->CreateSharedHandle(
+			    nullptr, GENERIC_ALL, nullptr, &res->transparent_output_fence_handle);
+		}
+		if (FAILED(hr)) {
+			U_LOG_E("#551 transparent output: shared texture/fence create failed: 0x%08lx", hr);
+			fini_client_render_resources(res);
+			return XRT_ERROR_D3D11;
+		}
+		res->transparent_output_w = actual_width;
+		res->transparent_output_h = actual_height;
+		res->transparent_output_value = 0;
+		U_LOG_W("#551 transparent output: shared %ux%u texture + service→client fence ready "
+		        "(client presents via DComp; no service swap chain)",
+		        actual_width, actual_height);
+	} else {
+
 	DXGI_SWAP_CHAIN_DESC1 sc_desc = {};
 	sc_desc.Width = actual_width;
 	sc_desc.Height = actual_height;
@@ -2922,6 +3011,8 @@ init_client_render_resources(struct d3d11_service_system *sys,
 	res->swap_chain->GetBuffer(0, IID_PPV_ARGS(back_buffer.put()));
 	sys->device->CreateRenderTargetView(back_buffer.get(), nullptr, res->back_buffer_rtv.put());
 
+	} // end !use_client_transparent (swap-chain path)
+
 	// Create stereo render target texture (side-by-side views)
 	D3D11_TEXTURE2D_DESC atlas_desc = {};
 	atlas_desc.Width = sys->display_width;
@@ -2984,11 +3075,21 @@ init_client_render_resources(struct d3d11_service_system *sys,
 			// the DP runs out-of-process here. Falls back to the legacy
 			// set_chroma_key enable for a DP that predates the new slot.
 			if (transparent_hwnd) {
-				// Prefer the clean compose-under-bg enable (#551); fall back to
-				// the legacy chroma-key enable only for a DP that predates the
-				// slot. The DP logs the resulting transparency path.
-				if (!xrt_display_processor_d3d11_set_transparent_background(res->display_processor,
-				                                                            true)) {
+				// #551 — client_presents: when this client's frames reach the
+				// panel via a transparent DComp present (the #551 client-side
+				// IPC present for an external HWND, or the owns-window DComp
+				// path), DWM blends the LIVE desktop into the alpha-gate holes,
+				// so the DP must NOT compose-under-bg (that bakes a stale
+				// captured desktop = a frame of lag) — alpha-gate only. For an
+				// opaque present the DP owns see-through itself. Fall back to
+				// the legacy chroma-key enable for a DP that predates the slot.
+				bool client_presents = use_client_transparent || use_transparent;
+				bool tp_ok = xrt_display_processor_d3d11_set_transparent_background(
+				    res->display_processor, true, client_presents);
+				U_LOG_W("#551 DP transparency: client_presents=%d slot_present=%d%s",
+				        (int)client_presents, (int)tp_ok,
+				        tp_ok ? "" : " → chroma-key fallback");
+				if (!tp_ok) {
 					xrt_display_processor_d3d11_set_chroma_key(res->display_processor,
 					                                           chroma_key_color, true);
 				}
@@ -10863,6 +10964,16 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 	}
 
+	// #551 — transparent compositing output: no service swap chain. The DP has
+	// weaved (with alpha-gate holes) into the shared output texture; signal the
+	// service→client fence so the CLIENT can GPU-wait then present it via a
+	// transparent DComp swap chain on the app's own window. Bumped once per
+	// commit, in lockstep with the client's wait counter (no per-frame IPC).
+	if (c->render.transparent_output_texture != nullptr && c->render.transparent_output_fence != nullptr) {
+		c->render.transparent_output_value++;
+		sys->context->Signal(c->render.transparent_output_fence.get(), c->render.transparent_output_value);
+	}
+
 	// Present to display
 	if (c->render.swap_chain) {
 		c->render.swap_chain->Present(1, 0);  // VSync
@@ -11033,6 +11144,64 @@ comp_d3d11_service_compositor_set_workspace_sync_fence_value(struct xrt_composit
 	}
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	c->last_signaled_fence_value.store(value, std::memory_order_release);
+}
+
+// #551 — export the shared transparent-output texture handle (+ its dims) for
+// the IPC client to import and present transparently. The IPC machinery
+// DuplicateHandle's the source NT handle into the client process; the source
+// stays owned here and is closed on teardown.
+extern "C" bool
+comp_d3d11_service_compositor_export_transparent_output(struct xrt_compositor *xc,
+                                                        xrt_graphics_buffer_handle_t *out_handle,
+                                                        uint32_t *out_width,
+                                                        uint32_t *out_height,
+                                                        uint64_t *out_hwnd)
+{
+	if (out_handle == nullptr) {
+		return false;
+	}
+	*out_handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return false;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	if (c->render.transparent_output_texture_handle == nullptr) {
+		return false;
+	}
+	*out_handle = (xrt_graphics_buffer_handle_t)c->render.transparent_output_texture_handle;
+	if (out_width != nullptr) {
+		*out_width = c->render.transparent_output_w;
+	}
+	if (out_height != nullptr) {
+		*out_height = c->render.transparent_output_h;
+	}
+	// The app's own window (process-agnostic HWND value) so the client — which
+	// owns it — can CreateTargetForHwnd for the transparent present.
+	if (out_hwnd != nullptr) {
+		HWND wnd = c->render.hwnd != nullptr ? c->render.hwnd : c->app_hwnd;
+		*out_hwnd = (uint64_t)(uintptr_t)wnd;
+	}
+	return true;
+}
+
+// #551 — export the service→client transparent-output fence handle.
+extern "C" bool
+comp_d3d11_service_compositor_export_transparent_output_fence(struct xrt_compositor *xc,
+                                                              xrt_graphics_sync_handle_t *out_handle)
+{
+	if (out_handle == nullptr) {
+		return false;
+	}
+	*out_handle = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return false;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	if (c->render.transparent_output_fence_handle == nullptr) {
+		return false;
+	}
+	*out_handle = (xrt_graphics_sync_handle_t)c->render.transparent_output_fence_handle;
+	return true;
 }
 
 

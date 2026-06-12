@@ -174,6 +174,31 @@ void
 comp_ipc_client_compositor_set_workspace_sync_fence_value(struct xrt_compositor *xc, uint64_t value);
 
 /*!
+ * #551 — fetch the per-client SHARED transparent-output texture handle (+ its
+ * pixel dims) the service weaves into, for the client to present transparently
+ * via its own DirectComposition swap chain. `out_have_output` is false unless
+ * the native compositor is the D3D11 service compositor AND the client
+ * requested a transparent background. Same gating contract as the workspace
+ * fence accessors.
+ */
+xrt_result_t
+comp_ipc_client_compositor_get_transparent_output(struct xrt_compositor *xc,
+                                                  bool *out_have_output,
+                                                  uint32_t *out_width,
+                                                  uint32_t *out_height,
+                                                  uint64_t *out_hwnd,
+                                                  xrt_graphics_buffer_handle_t *out_handle);
+
+/*!
+ * #551 — fetch the service→client transparent-output fence handle (service
+ * signals after each weave; client GPU-waits before presenting).
+ */
+xrt_result_t
+comp_ipc_client_compositor_get_transparent_output_fence(struct xrt_compositor *xc,
+                                                        bool *out_have_fence,
+                                                        xrt_graphics_sync_handle_t *out_handle);
+
+/*!
  * Workspace controller bridges (XR_EXT_spatial_workspace).
  *
  * Thin accessors used by the OpenXR state tracker to dispatch workspace

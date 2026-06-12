@@ -211,11 +211,40 @@ Apps that already use a separate top-level overlay window for transparency (e.g.
 
 The `_handle` and `_texture` modes both apply (any time `windowHandle` is non-NULL with transparency enabled). The `_offscreen` mode is unaffected — there's no HWND.
 
+#### IPC / service path — the **client** owns the transparent present (ADR-029)
+
+Everything above describes **in-process** transparency, where the native
+compositor configures the app's HWND for `DirectComposition`. Under the
+**IPC/service path** (`XRT_FORCE_MODE=ipc`, WebXR/UWP, or any client of
+`displayxr-service.exe`) the compositor and display processor run
+out-of-process, and a process can only create a DComp target / windowed swap
+chain on a window **it owns** — both calls return `E_ACCESSDENIED` on the
+client's HWND. So the *client* owns the transparent present:
+
+1. The service renders the woven, alpha-reconstructed frame into a **shared
+   NT-handle texture** (premultiplied `R8G8B8A8_UNORM`) and signals a
+   **service→client fence**.
+2. The client (in the app's process) imports both, owns a `DirectComposition`
+   device/target/visual on its own HWND, and per `xrEndFrame` GPU-waits the
+   fence, copies the shared texture into its DComp back buffer, and
+   `Present` + `Commit`. DWM blends the `alpha = 0` regions with the **live
+   desktop** — no captured-background lag.
+
+The DP is told the runtime owns the present (`set_transparent_background(…,
+client_presents = true)`) so it runs **only** its post-weave alpha-gate
+(reconstructing `alpha = 0` holes) and does **not** composite a captured desktop
+under the atlas (which would be ≥1 frame stale over IPC). App-side HWND
+requirements are identical to the in-process contract above. **No app code
+changes are needed** to move between in-process and IPC — opting into
+`transparentBackgroundEnabled` is sufficient; the runtime picks the owner of the
+present from the topology.
+
 #### Per-graphics-API support matrix
 
 | Graphics API | Mechanism | Status |
 |---|---|---|
-| D3D11 | `CreateSwapChainForComposition` + `DXGI_ALPHA_MODE_PREMULTIPLIED` + `IDCompositionTarget` bound to the app HWND. The vendor D3D11 DP runs chroma-key fill+strip around its weaving stage. | Shipping (PR #213). |
+| D3D11 (in-process) | `CreateSwapChainForComposition` + `DXGI_ALPHA_MODE_PREMULTIPLIED` + `IDCompositionTarget` bound to the app HWND. The vendor D3D11 DP reconstructs see-through via compose-under-bg (WGC), with chroma-key fill+strip as the fallback. | Shipping (PR #213). |
+| D3D11 (IPC/service) | The **client** owns the DComp present over a shared NT-handle texture + service→client fence; the DP runs `client_presents` mode — post-weave **alpha-gate only**, no captured-background compose, so the live desktop blends with zero lag. See "IPC / service path" above + ADR-029. | Shipping (#551). |
 | D3D12 | Same as D3D11, plus the runtime explicitly passes the back-buffer RTV through to the strip pass (D3D12 has no `OMGetRenderTargets`). | Shipping (PR #213, PR #3a). |
 | Vulkan | Swapchain `compositeAlpha` runtime-selects `VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR` → `INHERIT` → `OPAQUE` based on `caps.supportedCompositeAlpha`. Most Win32 ICDs only expose `OPAQUE`, in which case alpha is dropped at the WSI present and a one-time warning is logged (the chroma-key strip still runs but its alpha output is invisible — the vendor weaver's RGB on a black background is what reaches the screen). The vendor VK DP runs chroma-key fill+strip via SPIR-V shaders compiled offline. | Shipping (PR #3c). |
 | OpenGL | `CreateSwapChainForComposition` + `DXGI_ALPHA_MODE_PREMULTIPLIED` + `IDCompositionTarget`, bridged from GL via `WGL_NV_DX_interop2`. The GL native compositor weaves into an **off-screen interop transit texture** (the proven `_texture`-app interop path), then a **D3D11 fullscreen-triangle shader blit** copies it into the flip-model DComp back buffer (an RTV write) → `Present` + `Commit`. This sidesteps the PR #3b failure, where the DP wove directly into the flip-model back buffer via interop and produced no visible content (the known `WGL_NV_DX_interop2`-into-flip-model incompatibility — `CopyResource` into that back buffer failed too, but RTV writes work). The vendor GL DP runs chroma-key fill+strip around its weaving stage (driven by `set_chroma_key`). Gated on an app-provided HWND with `WS_EX_NOREDIRECTIONBITMAP`; runtime-hosted GL windows are not yet covered. Falls back to opaque `SwapBuffers` if `WGL_NV_DX_interop2`/DComp are unavailable. | Shipping. |

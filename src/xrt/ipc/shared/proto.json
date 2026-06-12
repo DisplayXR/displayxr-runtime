@@ -677,6 +677,23 @@
 		"out_handles": {"type": "xrt_graphics_sync_handle_t"}
 	},
 
+	"compositor_get_transparent_output": {
+		"out": [
+			{"name": "have_output", "type": "bool"},
+			{"name": "width", "type": "uint32_t"},
+			{"name": "height", "type": "uint32_t"},
+			{"name": "hwnd", "type": "uint64_t"}
+		],
+		"out_handles": {"type": "xrt_graphics_buffer_handle_t"}
+	},
+
+	"compositor_get_transparent_output_fence": {
+		"out": [
+			{"name": "have_fence", "type": "bool"}
+		],
+		"out_handles": {"type": "xrt_graphics_sync_handle_t"}
+	},
+
 	"compositor_semaphore_destroy": {
 		"in": [
 			{"name": "id", "type": "uint32_t"}
