@@ -619,6 +619,11 @@ multi_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin
 		// (comp_window_android) pulls the live surface from android_globals.
 		mc->session_render.use_android_surface = true;
 		U_LOG_I("Android: enabling per-session rendering (surface via android_globals)");
+
+		// Counterpart of end_session's on_pause (#563): the DP is cached
+		// across end→begin (#39), so wake the vendor SDK back up. The
+		// weave loop re-enables the 3D backlight on the first frame.
+		xrt_display_processor_on_resume(mc->session_render.display_processor);
 #endif
 		multi_system_compositor_update_session_status(mc->msc, true);
 		mc->state.session_active = true;
@@ -685,6 +690,13 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 			// xrEndSession (displayxr-leia-plugin#39). init_session_render
 			// reuses the cached pair; the real destroy happens at client
 			// teardown.
+			//
+			// But DO pause it: the panel's switchable backlight is
+			// system-global and whatever is behind us (home screen,
+			// picker) is 2D content — without this the screen stays in
+			// physical 3D after the session ends (#563). begin_session
+			// resumes the cached DP and the weave re-enables 3D.
+			xrt_display_processor_on_pause(mc->session_render.display_processor);
 #else
 			// Destroy display processor (owns any vendor SDK handles)
 			xrt_display_processor_destroy(&mc->session_render.display_processor);

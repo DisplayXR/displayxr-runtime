@@ -585,6 +585,17 @@ struct multi_system_compositor
 
 	//! Service for creating per-session render targets (provided by comp_main)
 	struct comp_target_service *target_service;
+
+#ifdef XRT_OS_ANDROID
+	/*!
+	 * #563: last observed android_globals output-surface validity
+	 * (-1 = unknown). The main loop pauses/resumes the clients' display
+	 * processors on transitions so the panel's system-global 3D backlight
+	 * drops to 2D when the app backgrounds WITHOUT ending its session
+	 * (the #528 surface-lost case) and comes back on resume.
+	 */
+	int android_window_valid_state;
+#endif
 };
 
 /*!
