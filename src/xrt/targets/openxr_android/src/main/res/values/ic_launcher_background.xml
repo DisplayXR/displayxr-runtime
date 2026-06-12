@@ -5,5 +5,6 @@
 
     SPDX-License-Identifier: CC-BY-4.0
     -->
-    <color name="ic_launcher_background">#FFFFFF</color>
+    <!-- Dark, so the white DisplayXR logo shows. -->
+    <color name="ic_launcher_background">#000000</color>
 </resources>
