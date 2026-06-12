@@ -2238,6 +2238,48 @@ ipc_handle_compositor_request_display_mode(volatile struct ipc_client_state *ics
 }
 
 xrt_result_t
+ipc_handle_compositor_request_rendering_mode(volatile struct ipc_client_state *ics, uint32_t mode_index)
+{
+	IPC_TRACE_MARKER();
+
+	if (ics->xc == NULL) {
+		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+
+	// CONTENT rendering mode (#553) — the atlas recipe (ADR-028), DECOUPLED
+	// from the hardware 2D/3D channel above. Resolve the index against the
+	// server's head device (the mode-list authority; the per-client
+	// multi_compositor has no xsysd out-of-process) and record the resolved
+	// grid on the per-client compositor so the per-session atlas no longer
+	// has to be derived from the submission.
+	struct ipc_server *s = ics->server;
+	struct xrt_device *head = (s != NULL && s->xsysd != NULL) ? s->xsysd->static_roles.head : NULL;
+	if (head == NULL || mode_index >= head->rendering_mode_count) {
+		U_LOG_W("compositor_request_rendering_mode: invalid mode_index %u (count %u) — ignored",
+		        mode_index, head != NULL ? head->rendering_mode_count : 0);
+		return XRT_SUCCESS;
+	}
+
+	uint32_t tile_columns = head->rendering_modes[mode_index].tile_columns;
+	uint32_t tile_rows = head->rendering_modes[mode_index].tile_rows;
+
+	// Rare lifecycle event (mode switch / session begin+end), not per-frame —
+	// and the line Windows forced-IPC validation greps for.
+	U_LOG_W("CONTENT rendering mode %u arrived over IPC (grid %ux%u)", mode_index, tile_columns, tile_rows);
+
+	// The out-of-process per-client compositor is a comp_multi multi_compositor
+	// only on the Android null+comp_multi service — same cast-validity gate as
+	// the hardware handler above.
+#ifdef XRT_OS_ANDROID
+	struct multi_compositor *mc = multi_compositor((struct xrt_compositor *)ics->xc);
+	if (mc != NULL) {
+		multi_compositor_set_rendering_mode(mc, mode_index, tile_columns, tile_rows);
+	}
+#endif
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
 ipc_handle_compositor_set_performance_level(volatile struct ipc_client_state *ics,
                                             enum xrt_perf_domain domain,
                                             enum xrt_perf_set_level level)

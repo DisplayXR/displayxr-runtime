@@ -2080,6 +2080,27 @@ multi_compositor_request_display_mode(struct multi_compositor *mc, bool enable_3
 }
 
 void
+multi_compositor_set_rendering_mode(struct multi_compositor *mc,
+                                    uint32_t mode_index,
+                                    uint32_t tile_columns,
+                                    uint32_t tile_rows)
+{
+	if (mc == NULL) {
+		return;
+	}
+
+	// #553: the authoritative CONTENT rendering mode (the atlas recipe,
+	// ADR-028) — pure state, deliberately no DP side effects (hardware keeps
+	// its own channel via multi_compositor_request_display_mode). Not gated on
+	// session_render.initialized: the session-begin push may arrive before the
+	// per-session render path spins up, and the value must not be lost.
+	mc->active_mode_index = mode_index;
+	mc->mode_tile_columns = tile_columns > 0 ? tile_columns : 1;
+	mc->mode_tile_rows = tile_rows > 0 ? tile_rows : 1;
+	mc->active_mode_valid = true;
+}
+
+void
 multi_compositor_set_eye_tracking_mode(struct multi_compositor *mc, uint32_t mode)
 {
 	if (mc == NULL || !mc->session_render.initialized) {

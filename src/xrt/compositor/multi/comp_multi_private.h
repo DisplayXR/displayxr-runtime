@@ -152,6 +152,19 @@ struct multi_compositor
 	//! Last known 3D rendering mode index (for V-key toggle restore).
 	uint32_t last_3d_mode_index;
 
+	/*!
+	 * Active CONTENT rendering mode — the atlas recipe (ADR-028, #553).
+	 * In-process this is synced from the head device each frame; out-of-process
+	 * it arrives via compositor_request_rendering_mode over IPC (the server's
+	 * head-device copy is otherwise stale). Orthogonal to hardware_display_3d.
+	 * @{
+	 */
+	bool active_mode_valid;
+	uint32_t active_mode_index;
+	uint32_t mode_tile_columns;
+	uint32_t mode_tile_rows;
+	/*! @} */
+
 	//! Used to implement wait frame, only used for in process.
 	struct os_precise_sleeper frame_sleeper;
 
@@ -671,6 +684,27 @@ multi_compositor_get_window_metrics(struct multi_compositor *mc, struct xrt_wind
  */
 bool
 multi_compositor_request_display_mode(struct multi_compositor *mc, bool enable_3d);
+
+/*!
+ * Record the active CONTENT rendering mode — the atlas recipe (ADR-028, #553).
+ * Pure state, no DP side effects: the hardware 2D/3D state keeps its own
+ * channel (@ref multi_compositor_request_display_mode). Called from the IPC
+ * server handler with the grid already resolved against the server's head
+ * device (the per-client mc has no xsysd out-of-process).
+ *
+ * @param mc           The multi_compositor.
+ * @param mode_index   Active rendering mode index.
+ * @param tile_columns The mode's atlas tile columns.
+ * @param tile_rows    The mode's atlas tile rows.
+ *
+ * @ingroup comp_multi
+ * @private @memberof multi_compositor
+ */
+void
+multi_compositor_set_rendering_mode(struct multi_compositor *mc,
+                                    uint32_t mode_index,
+                                    uint32_t tile_columns,
+                                    uint32_t tile_rows);
 
 /*!
  * Select the eye-tracking control mode (MANAGED=0 / MANUAL=1) on the

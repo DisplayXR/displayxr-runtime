@@ -577,6 +577,12 @@
 		]
 	},
 
+	"compositor_request_rendering_mode": {
+		"in": [
+			{"name": "mode_index", "type": "uint32_t"}
+		]
+	},
+
 	"compositor_get_reference_bounds_rect": {
 		"in": [
 			{"name": "reference_space_type", "type": "enum xrt_reference_space_type"}

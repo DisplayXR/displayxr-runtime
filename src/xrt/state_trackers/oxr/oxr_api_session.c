@@ -1463,6 +1463,12 @@ oxr_xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex)
 	// 3. Update active mode (view_count stays fixed at 2 for STEREO)
 	head->hmd->active_rendering_mode_index = modeIndex;
 
+	// 3b. Out-of-process the head update above is client-local (the proxy
+	// device doesn't cross IPC) — push the CONTENT mode to the server too
+	// (#553), so its multi_compositor can clamp the atlas to the mode grid.
+	// No-op in-process / bridge-relay.
+	oxr_session_push_rendering_mode_ipc(sess, modeIndex);
+
 	// 4. Update recommended view scales
 	struct xrt_system_compositor *xsysc = sess->sys->xsysc;
 	if (xsysc != NULL) {
