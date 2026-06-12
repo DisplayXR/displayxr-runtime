@@ -141,6 +141,39 @@ read_active_runtime(struct cli_query_result *r)
 		r->active_runtime_set = r->active_runtime[0] != '\0';
 	}
 }
+
+//! Fallback for a plug-in that doesn't self-report a version through
+//! xrt_plugin_iface::version: read the installer-written value from
+//! HKLM\Software\DisplayXR\DisplayProcessors\<id>\Version. The discovery
+//! registry is the authoritative install record (the NSI writes Version from
+//! PROJECT_VERSION, and the loader already uses it for skew detection — #461),
+//! so this surfaces a real version even for plug-ins built before adopting the
+//! iface field. Leaves @p out untouched on any miss.
+static void
+read_plugin_version_from_registry(const char *id, char *out, size_t cap)
+{
+	if (id == NULL || id[0] == '\0') {
+		return;
+	}
+	char subkey[256];
+	snprintf(subkey, sizeof(subkey), "Software\\DisplayXR\\DisplayProcessors\\%s", id);
+
+	HKEY key;
+	if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, subkey, 0, KEY_READ | KEY_WOW64_64KEY, &key) != ERROR_SUCCESS) {
+		return;
+	}
+	char buf[128];
+	DWORD len = sizeof(buf);
+	DWORD type = 0;
+	if (RegQueryValueExA(key, "Version", NULL, &type, (LPBYTE)buf, &len) == ERROR_SUCCESS && type == REG_SZ &&
+	    len > 0) {
+		buf[(len < sizeof(buf)) ? len : sizeof(buf) - 1] = '\0'; // RegQueryValueEx may omit the NUL
+		if (buf[0] != '\0') {
+			snprintf(out, cap, "%s", buf);
+		}
+	}
+	RegCloseKey(key);
+}
 #endif
 
 void
@@ -202,6 +235,13 @@ cli_query_run(struct cli_query_result *r)
 	snprintf(r->plugin_name, sizeof(r->plugin_name), "%s", iface->display_name ? iface->display_name : "");
 	snprintf(r->plugin_vendor, sizeof(r->plugin_vendor), "%s", iface->vendor ? iface->vendor : "");
 	snprintf(r->plugin_version, sizeof(r->plugin_version), "%s", iface->version ? iface->version : "");
+#ifdef XRT_OS_WINDOWS
+	// A plug-in that ships no iface version still has an installer-written
+	// Version in its discovery registry key — surface that rather than "?".
+	if (r->plugin_version[0] == '\0') {
+		read_plugin_version_from_registry(r->plugin_id, r->plugin_version, sizeof(r->plugin_version));
+	}
+#endif
 
 	if (iface->get_display_info == NULL) {
 		r->result_code = CLI_SELFTEST_BAD_INFO;
