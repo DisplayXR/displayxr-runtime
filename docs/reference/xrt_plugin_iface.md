@@ -109,17 +109,17 @@ Each factory's signature is owned by `xrt_display_processor_<api>.h` and is unch
 
 **DP semantic contract — hardware vs processing (ADR-028, #542):**
 - `request_display_mode(enable_3d)` is **hardware-only**: drive the physical
-  switchable element (lens hint / backlight) and nothing else. It must NOT
+  switchable element (lens, backlight, …) and nothing else. It must NOT
   select your weave-vs-flat path.
 - Select **weave vs flat-blit from the per-frame atlas grid** handed to
   `process_atlas` (`tile_columns × tile_rows > 1` ⇒ weave, `1×1` ⇒ flat).
-  The runtime guarantees the grid is the active mode's recipe (submissions
-  are clamped to it), so a hardware override leaves your weave running — the
-  panel shows the woven atlas flat, which is the app-authored transition
-  state (e.g. MANUAL tracking-loss: lens off instantly, parallax fades to
-  zero, the image converges back to sharp).
-- Reference port: `displayxr-leia-plugin` PR #45 (all four API variants —
-  including grid-driven eye-position centering for mono content).
+  The same grid should drive any mono-content special-casing (e.g.
+  eye-position centering). The runtime guarantees the grid is the active
+  mode's recipe (submissions are clamped to it), so a hardware override
+  leaves your weave running — the panel shows the woven atlas flat, which is
+  the app-authored transition state (MANUAL tracking-loss: element off
+  instantly, parallax fades to zero, the image converges back to sharp).
+  Per-vendor mechanisms are documented in each vendor's plug-in repo.
 
 **Optional DP-vtable extensions a vendor can implement** (appended slots, gated by the DP `struct_size` per ADR-020 — an older plug-in simply doesn't have them):
 - `get_handoff_color_capability` / `set_atlas_encoding` — ADR-021 color contract.

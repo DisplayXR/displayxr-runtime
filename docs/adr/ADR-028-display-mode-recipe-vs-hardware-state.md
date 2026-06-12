@@ -14,11 +14,11 @@ A 2D↔3D change on a switchable 3D display involves three separable things:
 2. **DP processing** — whether the DP weaves the atlas (multi-view) or
    flat-blits it (single view). Per ADR-007 this lives in the DP, never the
    compositor.
-3. **Hardware state** — the physical switchable element (e.g. the Leia SR
-   lenticular lens) on or off.
+3. **Hardware state** — the physical switchable element (a switchable
+   lens, a backlight, …) on or off.
 
 Historically all three hung off one `hardware_display_3d` flag: the flag drove
-the DP's lens *and* its weave-vs-blit branch, and every native compositor used
+the DP's physical element *and* its weave-vs-blit branch, and every native compositor used
 it to clamp the content tile count (`hardware_3d ? N : 1`). That conflation
 made app-authored transitions inexpressible — most acutely the MANUAL
 eye-tracking loss flow (#522), where an app wants the panel flat *immediately*
@@ -27,7 +27,7 @@ while it fades its stereo content to zero parallax over several frames.
 Two failed shapes preceded this decision (preserved here because the bug class
 recurs — it also produced the Android 2D regression #533 fixed):
 
-- **"Hardware = lens + DP processing":** the hardware request also switched
+- **"Hardware = physical element + DP processing":** the hardware request also switched
   the DP to its flat-blit branch, so a divergence showed a clean single tile —
   destroying the transition (an instant content jump instead of a blur that
   converges as parallax → 0).
@@ -57,13 +57,13 @@ A **rendering mode is a complete recipe**: tile layout, view count, scales,
    compositors clamp the submission to it: `views = min(submitted, mode
    tiles)`; `views == 1` renders one tile spanning the full content region;
    otherwise the mode grid. Submissions never define atlas geometry.
-4. **The DP's `request_display_mode` is hardware-only** (lens hint and
-   nothing else). The DP selects weave vs flat-blit from the **per-frame
+4. **The DP's `request_display_mode` is hardware-only** (the physical
+   element and nothing else). The DP selects weave vs flat-blit from the **per-frame
    atlas grid** handed to `process_atlas` (`tiles > 1` ⇒ weave, `1×1` ⇒
-   blit) — regardless of the lens state.
+   blit) — regardless of the hardware state.
 
 Net effect of the override: hardware-2D over an active 3D mode keeps the
-weave running with the lens off — the panel shows the woven atlas flat
+weave running with the element off — the panel shows the woven atlas flat
 (blurry), and an app fading parallax to zero converges back to a sharp image.
 That blur-to-sharp ramp **is** the MANUAL tracking-loss transition; the
 reverse order (fade first, then flip) also composes.
@@ -83,11 +83,11 @@ views lose nothing) but is the compat path, not the recommendation.
   fenced).
 - The compositor-side `hardware_display_3d` flag survives only for the HUD,
   the V-key mode toggle, and diagnostics. Under an override it reflects the
-  mode's default, not the lens (the lens truth is the DP's
+  mode's default, not the physical state (the hardware truth is the DP's
   `get_hardware_3d_state`).
 - Vendor DPs must keep their processing decision out of the hardware channel
-  (`displayxr-leia-plugin` PR #45 is the reference port; see
-  `docs/reference/xrt_plugin_iface.md`).
+  (contract: `docs/reference/xrt_plugin_iface.md`; per-vendor mechanisms are
+  documented in each vendor's plug-in repo).
 
 ## Known divergences (tracked, not design)
 
@@ -98,7 +98,7 @@ views lose nothing) but is the compat path, not the recommendation.
   `view_count×1` atlas from the submission. Bounded in practice (no zones on
   that path; identical-view over-submission weaves to ≈the original image).
   Retire by plumbing the mode index (or the content grid) over IPC, then
-  adopting the mode clamp there.
+  adopting the mode clamp there (#553).
 - **Metal (`comp_metal_compositor.m`):** still derives the atlas from the
   submission for non-zone layers (the pre-fix model) — carries the
   always-stereo-in-2D bug latently. Port the mode clamp.
