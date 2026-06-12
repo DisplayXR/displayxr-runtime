@@ -2801,13 +2801,19 @@ init_client_render_resources(struct d3d11_service_system *sys,
 	//
 	// Default: flip-model + ALPHA_MODE_IGNORE (#163) — opaque present, no DWM bleed-through.
 	// Transparent opt-in: flip-model + ALPHA_MODE_PREMULTIPLIED via
-	// CreateSwapChainForComposition, bound to the app's HWND through
-	// DirectComposition. DWM blends per-pixel (no chroma key, no
-	// disocclusion fringe, no LWA_COLORKEY required on the plugin side).
-	// Only meaningful when the app owns the HWND and we're not in
-	// workspace/shell mode (workspace path uses a service-owned compositor window).
+	// CreateSwapChainForComposition, bound through DirectComposition.
+	//
+	// #551: DComp's CreateTargetForHwnd can only bind a window THIS process
+	// owns. In the service an app-provided HWND is ALWAYS cross-process, so
+	// that call returns E_ACCESSDENIED and the whole session create fails —
+	// the previous `external_hwnd != nullptr` trigger was structurally dead.
+	// See-through for a vendor DP doesn't need DComp: the DP composites its
+	// weave over the captured desktop (compose-under-bg, from the atlas alpha)
+	// and the opaque present shows it. So restrict the DComp route to a
+	// RUNTIME-owned window (hosted/WebXR); an external app HWND presents opaque
+	// and the DP owns transparency (see set_transparent_background below).
 	const bool use_transparent =
-	    transparent_hwnd && external_hwnd != nullptr && !sys->workspace_mode;
+	    transparent_hwnd && external_hwnd == nullptr && res->owns_window && !sys->workspace_mode;
 
 	DXGI_SWAP_CHAIN_DESC1 sc_desc = {};
 	sc_desc.Width = actual_width;
@@ -2824,9 +2830,12 @@ init_client_render_resources(struct d3d11_service_system *sys,
 		sc_desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
 	}
 	if (transparent_hwnd && !use_transparent) {
-		U_LOG_W("Transparent HWND requested but ignored "
-		        "(external_hwnd=%p, workspace_mode=%d)",
-		        external_hwnd, (int)sys->workspace_mode);
+		// Not an error for an external app HWND: the opaque present is correct
+		// and see-through comes from the DP compose-under-bg (#551), not DComp.
+		U_LOG_W(
+		    "Transparent HWND requested: DComp present skipped "
+		    "(external_hwnd=%p owns_window=%d workspace=%d) — DP owns see-through",
+		    external_hwnd, (int)res->owns_window, (int)sys->workspace_mode);
 	}
 
 	if (use_transparent) {
@@ -2965,6 +2974,26 @@ init_client_render_resources(struct d3d11_service_system *sys,
 			res->display_processor = nullptr;
 		} else {
 			U_LOG_W("D3D11 display processor created via factory for client");
+
+			// #551: enable the DP's transparent compose-under-bg for a
+			// transparent client. The runtime already hands the DP a
+			// premultiplied-transparent atlas; this is the policy signal that
+			// tells the DP to composite its weave over the captured desktop
+			// (chroma-key-free). The app window's capture-exclusion affinity is
+			// set client-side (window-owning process) so this works even though
+			// the DP runs out-of-process here. Falls back to the legacy
+			// set_chroma_key enable for a DP that predates the new slot.
+			if (transparent_hwnd) {
+				// Prefer the clean compose-under-bg enable (#551); fall back to
+				// the legacy chroma-key enable only for a DP that predates the
+				// slot. The DP logs the resulting transparency path.
+				if (!xrt_display_processor_d3d11_set_transparent_background(res->display_processor,
+				                                                            true)) {
+					xrt_display_processor_d3d11_set_chroma_key(res->display_processor,
+					                                           chroma_key_color, true);
+				}
+			}
+
 			// Phase 6.1 (#140): don't call request_display_mode(true)
 			// here — the SR SDK's recalibration cycle causes a multi-
 			// second stretched-left-eye artifact. Let the DP come up in

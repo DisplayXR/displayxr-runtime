@@ -337,6 +337,21 @@ bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd) {
     XrWin32WindowBindingCreateInfoEXT sessionTarget = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT};
     sessionTarget.windowHandle = hwnd;
 
+    // Transparent window output — ON BY DEFAULT for this app (zones
+    // alpha-composite against the desktop by design); DISPLAYXR_TRANSPARENT_BG=0
+    // opts out. The runtime drives the vendor DP's compose-under-background
+    // from the atlas alpha (chroma-key-free) and excludes this window from the
+    // DP's desktop capture — works in-process AND over IPC (#551). The flag
+    // rides xrt_session_info so it reaches both paths identically.
+    {
+        const char* e = getenv("DISPLAYXR_TRANSPARENT_BG");
+        if (e == nullptr || *e == '\0' || *e != '0') {
+            sessionTarget.transparentBackgroundEnabled = XR_TRUE;
+            sessionTarget.chromaKeyColor = 0;
+            LOG_INFO("Transparent background ENABLED (zones default; DISPLAYXR_TRANSPARENT_BG=0 to opt out)");
+        }
+    }
+
     if (xr.hasWin32WindowBindingExt && hwnd) {
         // Chain: sessionInfo -> d3d11Binding -> sessionTarget
         d3d11Binding.next = &sessionTarget;
