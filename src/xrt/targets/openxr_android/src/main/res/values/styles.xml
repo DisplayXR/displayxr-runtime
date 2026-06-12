@@ -11,4 +11,35 @@
         <item name="colorPrimaryDark">@color/colorPrimaryDark</item>
         <item name="colorAccent">@color/colorAccent</item>
     </style>
+
+    <!-- Diagnostics dashboard cards (#558). -->
+    <style name="DashboardCard" parent="Widget.MaterialComponents.CardView">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_marginTop">12dp</item>
+        <item name="cardCornerRadius">8dp</item>
+    </style>
+
+    <style name="DashboardCardBody">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:orientation">vertical</item>
+        <item name="android:padding">12dp</item>
+    </style>
+
+    <style name="DashboardCardTitle">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_marginBottom">4dp</item>
+        <item name="android:textAppearance">@style/TextAppearance.MaterialComponents.Subtitle2</item>
+        <item name="android:textAllCaps">true</item>
+        <item name="android:alpha">0.7</item>
+    </style>
+
+    <style name="DashboardCardMono">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:fontFamily">monospace</item>
+        <item name="android:textSize">12sp</item>
+    </style>
 </resources>
