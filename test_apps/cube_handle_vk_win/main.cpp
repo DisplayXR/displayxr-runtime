@@ -53,11 +53,19 @@ static XrSessionManager* g_xr = nullptr;
 // snapshot while hardware mode requests (V / 0-8) still go out — drives a
 // deliberate hardware/content divergence so the decoupled compositors can be
 // exercised (e.g. panel-2D + 2 submitted tiles). Toggle: 'L' key;
-// DXR_CUBE_PIN_CONTENT=1 starts pinned. Toggle flag is atomic (set on the
+// DXR_CUBE_PIN_CONTENT=1 starts pinned. Toggle flags are atomic (set on the
 // message-pump thread, consumed on the render thread).
+// On top of the pin, two single-axis keys:
+//   'H' = HARDWARE-only: pin content at its current layout, then request the
+//         opposite-hardware mode — only the panel changes.
+//   'J' = CONTENT-only: flip the pinned submission layout to the opposite-
+//         hardware mode's layout — no runtime request, only content changes.
 static std::atomic<bool> g_contentPinTogglePending{false};
+static std::atomic<bool> g_hwToggleRequested{false};
+static std::atomic<bool> g_contentToggleRequested{false};
 static bool g_contentPinned = false;          // render-thread only
 static uint32_t g_contentPinModeIndex = 0;    // render-thread only
+static uint32_t g_lastLive3DModeIndex = UINT32_MAX; // render-thread only
 
 // Set DISPLAYXR_TRANSPARENT_BG=1 in the environment to opt into transparent
 // desktop composition: the HWND is created with WS_EX_NOREDIRECTIONBITMAP +
@@ -262,8 +270,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // #542 content-pin: 'L' freezes the submission-side mode snapshot
         // (handled on the render thread) while V/0-8 hardware requests still
         // go out — drives a deliberate hardware/content divergence.
+        // 'H' / 'J' toggle a single axis (hardware-only / content-only).
         if (wParam == 'L') {
             g_contentPinTogglePending.store(true);
+            return 0;
+        }
+        if (wParam == 'H') {
+            g_hwToggleRequested.store(true);
+            return 0;
+        }
+        if (wParam == 'J') {
+            g_contentToggleRequested.store(true);
             return 0;
         }
         break;
@@ -645,6 +662,67 @@ static void RenderThreadFunc(
                 LOG_INFO("[#542] content %s (snapshot mode=%u, live mode=%u)",
                     g_contentPinned ? "PINNED" : "UNPINNED",
                     g_contentPinModeIndex, xr->currentModeIndex);
+            }
+
+            // Track the most recent live 3D mode for the "back to 3D" direction
+            // of the single-axis toggles (mirrors the runtime's V-key restore).
+            if (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount &&
+                xr->renderingModeDisplay3D[xr->currentModeIndex]) {
+                g_lastLive3DModeIndex = xr->currentModeIndex;
+            }
+            // Resolve a mode whose hardware state is the opposite of `from3d`:
+            // prefer the remembered 3D mode when going back to 3D, else the
+            // first mode on the other side of the hardware flag.
+            auto findOppositeMode = [&](bool from3d) -> int {
+                if (from3d == false && g_lastLive3DModeIndex < xr->renderingModeCount &&
+                    xr->renderingModeDisplay3D[g_lastLive3DModeIndex]) {
+                    return (int)g_lastLive3DModeIndex;
+                }
+                for (uint32_t i = 0; i < xr->renderingModeCount; i++) {
+                    if (xr->renderingModeDisplay3D[i] != from3d) {
+                        return (int)i;
+                    }
+                }
+                return -1;
+            };
+
+            // 'H' — HARDWARE-only: pin content where it is (so it won't follow),
+            // then request the opposite-hardware mode. Only the panel changes.
+            if (g_hwToggleRequested.exchange(false)) {
+                if (xr->renderingModeCount > 0 && xr->session != XR_NULL_HANDLE &&
+                    xr->pfnRequestDisplayRenderingModeEXT != nullptr &&
+                    xr->currentModeIndex < xr->renderingModeCount) {
+                    if (!g_contentPinned) {
+                        g_contentPinned = true;
+                        g_contentPinModeIndex = xr->currentModeIndex;
+                    }
+                    bool live3d = xr->renderingModeDisplay3D[xr->currentModeIndex];
+                    int target = findOppositeMode(live3d);
+                    if (target >= 0) {
+                        xr->pfnRequestDisplayRenderingModeEXT(xr->session, (uint32_t)target);
+                        LOG_INFO("[#542] H: hardware-only -> requested mode %d (%s); "
+                            "content stays pinned at mode %u layout",
+                            target, live3d ? "2D" : "3D", g_contentPinModeIndex);
+                    }
+                }
+            }
+
+            // 'J' — CONTENT-only: flip the pinned submission layout to the
+            // opposite-hardware mode's layout. No runtime request goes out.
+            if (g_contentToggleRequested.exchange(false)) {
+                if (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) {
+                    uint32_t cur = (g_contentPinned && g_contentPinModeIndex < xr->renderingModeCount)
+                        ? g_contentPinModeIndex : xr->currentModeIndex;
+                    bool cur3d = xr->renderingModeDisplay3D[cur];
+                    int target = findOppositeMode(cur3d);
+                    if (target >= 0) {
+                        g_contentPinned = true;
+                        g_contentPinModeIndex = (uint32_t)target;
+                        LOG_INFO("[#542] J: content-only -> pinned at mode %d layout (%s); "
+                            "hardware untouched (live mode=%u)",
+                            target, cur3d ? "2D" : "3D", xr->currentModeIndex);
+                    }
+                }
             }
         }
 
