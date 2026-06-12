@@ -2999,13 +2999,13 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// Submission-derived CONTENT layout (#542): decouple the atlas tile
-	// count/size from the panel HARDWARE weave-state. The atlas holds
-	// exactly what the app submitted (view_count tiles, sized by the
-	// per-view imageRect), independent of c->hardware_display_3d — that flag
-	// drives only the DP weave via request_display_mode. Defaults are the
-	// mode-derived values, so zones frames and the no-projection-layer case
-	// stay byte-identical; the main projection layer overrides them below.
+	// CONTENT layout from the ACTIVE MODE (#542, ADR-028): decouple the atlas
+	// tile count/size from the panel HARDWARE weave-state. The atlas geometry
+	// is the active mode's (the submission clamps down to it below),
+	// independent of c->hardware_display_3d — that flag drives only the DP
+	// weave via request_display_mode. Defaults are the mode-derived values, so
+	// zones frames and the no-projection-layer case stay byte-identical; the
+	// main projection layer applies the mode clamp below.
 	uint32_t atlas_view_w = c->view_width;
 	uint32_t atlas_view_h = c->view_height;
 	uint32_t atlas_cols = c->tile_columns;
@@ -3090,25 +3090,44 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				}
 			}
 
-			// CONTENT tile count from the SUBMISSION, not the hardware flag
-			// (#542): the atlas holds exactly the tiles the app submitted,
-			// capped only by physical capacity. No `hardware_3d ? N : 1`
-			// clamp — a hardware/content divergence renders predictably.
+			// CONTENT recipe is the ACTIVE MODE's (#542, ADR-028 §Decision 3):
+			// the submission clamps DOWN to the mode, never the reverse. An
+			// always-stereo app submits the xrLocateViews max view count even in
+			// a mono mode (the documented compat guarantee), so without this
+			// clamp a 2D mode would render a 2×1 strip instead of mono (the
+			// left-shift bug class ADR-028 documents). The clamp also subsumes
+			// the old legacy-app special case (a 2D mode ⇒ mono). The atlas is
+			// independent of c->hardware_display_3d — that flag drives only the
+			// DP weave via request_display_mode. Mirrors
+			// comp_d3d11_renderer_compute_effective_layout.
 			uint32_t view_count = layer->data.view_count;
 			if (view_count == 0) view_count = 1;
 			if (view_count > XRT_MAX_VIEWS) view_count = XRT_MAX_VIEWS;
 
-			// The main (non-zone) projection layer defines the frame's atlas
-			// content layout (an N×1 grid sized by the submitted imageRect);
-			// zone layers keep the mode-derived tile box (their rect is scaled
-			// into it below), so leave the defaults for them.
+			// Zone layers keep the mode-derived defaults (their rect is scaled
+			// into the mode tile box below), so leave them alone. The mode grid
+			// (c->tile_columns/rows) and per-view dims (c->view_width/height)
+			// are synced from the active rendering mode every frame above.
 			if (!is_zone) {
-				atlas_cols = view_count;
-				atlas_rows = 1;
-				const struct xrt_rect *r0 = &layer->data.proj.v[0].sub.rect;
-				if (r0->extent.w > 0 && r0->extent.h > 0) {
-					atlas_view_w = (uint32_t)r0->extent.w;
-					atlas_view_h = (uint32_t)r0->extent.h;
+				uint32_t mode_cols = c->tile_columns > 0 ? c->tile_columns : 1;
+				uint32_t mode_rows = c->tile_rows > 0 ? c->tile_rows : 1;
+				uint32_t mode_tiles = mode_cols * mode_rows;
+				if (view_count > mode_tiles) {
+					view_count = mode_tiles;
+				}
+				if (view_count == 1) {
+					// Mono: one tile spanning the full content region.
+					atlas_cols = 1;
+					atlas_rows = 1;
+					atlas_view_w = mode_cols * c->view_width;
+					atlas_view_h = mode_rows * c->view_height;
+				} else {
+					// The mode grid; an under-submitting app paints the
+					// first view_count tiles.
+					atlas_cols = mode_cols;
+					atlas_rows = mode_rows;
+					atlas_view_w = c->view_width;
+					atlas_view_h = c->view_height;
 				}
 			}
 			for (uint32_t eye = 0; eye < view_count; eye++) {
@@ -3149,10 +3168,10 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					nr.h = 1.0f;
 				}
 
-				// Set viewport for this eye — always tile-place by the
-				// submission-derived grid (#542). No branch on the hardware
-				// flag: the DP weaves (hardware-3D) or shows the tiles flat
-				// (hardware-2D) per its own mode_3d from request_display_mode.
+				// Set viewport for this eye — tile-place by the mode-derived
+				// grid (#542, ADR-028). No branch on the hardware flag: the DP
+				// weaves (hardware-3D) or shows the tiles flat (hardware-2D)
+				// per its own mode_3d from request_display_mode.
 				MTLViewport vp;
 				{
 					uint32_t tile_x = eye % atlas_cols;
@@ -3285,8 +3304,8 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// so the display processor weaves them in stereo just like projection
 		// content. Mirrors d3d11_compositor_layer_window_space + the renderer
 		// window-space pass.
-		// HUD tiles align with the projection tiles: same submission-derived
-		// grid (#542), independent of the hardware weave-state.
+		// HUD tiles align with the projection tiles: same mode-derived grid
+		// (#542, ADR-028), independent of the hardware weave-state.
 		uint32_t mode_views_ws = atlas_cols;
 		for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 			struct comp_layer *layer = &c->layer_accum.layers[i];
@@ -3422,7 +3441,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		if (c->atlas_texture != nil && atlas_cols > 0 && atlas_rows > 0 &&
 		    atlas_view_w > 0 && atlas_view_h > 0 && stat(trigger, &st) == 0) {
 			unlink(trigger);
-			// Submission-derived content region (#542): what the app submitted.
+			// Mode-derived content region (#542, ADR-028): the active mode's.
 			uint32_t cw = atlas_cols * atlas_view_w;
 			uint32_t ch = atlas_rows * atlas_view_h;
 			if (cw > (uint32_t)c->atlas_texture.width)  cw = (uint32_t)c->atlas_texture.width;
@@ -3466,8 +3485,9 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	if (c->display_processor != NULL && atlas_src != nil) {
 		// Crop atlas to content dims before passing to DP.
 		// The DP expects texture dimensions to match content exactly.
-		// Content is the submission-derived layout (#542), not the hardware
-		// mode — the DP weaves/flattens these tiles per its own mode_3d.
+		// Content is the active-mode layout (#542, ADR-028), orthogonal to the
+		// hardware state — the DP weaves/flattens these tiles per its own
+		// mode_3d (it picks weave vs blit from the tile grid: >1 ⇒ weave).
 		uint32_t content_w = atlas_cols * atlas_view_w;
 		uint32_t content_h = atlas_rows * atlas_view_h;
 
