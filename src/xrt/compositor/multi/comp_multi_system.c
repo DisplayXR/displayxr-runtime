@@ -60,6 +60,10 @@
 #include "comp_d3d11_window.h"
 #endif
 
+#ifdef XRT_OS_ANDROID
+#include "android/android_globals.h"
+#endif
+
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty/qwerty_interface.h"
 #include "xrt/xrt_system.h"
@@ -3032,6 +3036,51 @@ update_session_state_locked(struct multi_system_compositor *msc)
 	}
 }
 
+#ifdef XRT_OS_ANDROID
+/*!
+ * #563: pause/resume the clients' display processors when the published
+ * output surface goes away / comes back (Client.java clearAppSurface /
+ * passAppSurface, the #528 backgrounding case that does NOT end the
+ * session). The panel's switchable 3D backlight is system-global — if the
+ * weave just stops, the screen stays in physical 3D over the 2D home
+ * screen. Session end/begin and client destroy have their own hooks; this
+ * covers the surface-only transition.
+ */
+static void
+android_window_transition_locked(struct multi_system_compositor *msc)
+{
+	struct _ANativeWindow *window = NULL;
+	uint64_t generation = 0;
+	bool valid = false;
+	android_globals_get_window_state(&window, &generation, &valid);
+
+	int state = (valid && window != NULL) ? 1 : 0;
+	if (state == msc->android_window_valid_state) {
+		return;
+	}
+	bool first = msc->android_window_valid_state < 0;
+	msc->android_window_valid_state = state;
+	if (first && state == 1) {
+		return; // startup with a live surface — nothing to resume
+	}
+
+	for (size_t k = 0; k < ARRAY_SIZE(msc->clients); k++) {
+		struct multi_compositor *mc = msc->clients[k];
+		if (mc == NULL || !mc->session_render.initialized ||
+		    mc->session_render.display_processor == NULL) {
+			continue;
+		}
+		if (state == 0) {
+			U_LOG_W("multi: output surface lost — pausing DP (backlight to 2D, #563)");
+			xrt_display_processor_on_pause(mc->session_render.display_processor);
+		} else {
+			U_LOG_W("multi: output surface back — resuming DP (#563)");
+			xrt_display_processor_on_resume(mc->session_render.display_processor);
+		}
+	}
+}
+#endif // XRT_OS_ANDROID
+
 static int
 multi_main_loop(struct multi_system_compositor *msc)
 {
@@ -3099,6 +3148,9 @@ multi_main_loop(struct multi_system_compositor *msc)
 
 		// Make sure that the clients doesn't go away while we transfer layers.
 		os_mutex_lock(&msc->list_and_timing_lock);
+#ifdef XRT_OS_ANDROID
+		android_window_transition_locked(msc);
+#endif
 		transfer_layers_locked(msc, predicted_display_time_ns, frame_id);
 		os_mutex_unlock(&msc->list_and_timing_lock);
 
@@ -3312,6 +3364,9 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
                                     struct xrt_system_compositor **out_xsysc)
 {
 	struct multi_system_compositor *msc = U_TYPED_CALLOC(struct multi_system_compositor);
+#ifdef XRT_OS_ANDROID
+	msc->android_window_valid_state = -1; /* #563: unknown until first loop tick */
+#endif
 	msc->base.create_native_compositor = system_compositor_create_native_compositor;
 	msc->base.destroy = system_compositor_destroy;
 	msc->xmcc.set_state = system_compositor_set_state;
