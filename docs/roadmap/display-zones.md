@@ -200,17 +200,32 @@ appended fields read 0 (caller-zeroed append-only contract observed).
 
 ### Phase 5 — Leia plugin + IPC
 
-- `displayxr-leia-plugin`: report appended caps (`wish_fractional=0`,
-  `switch_granularity` per vendor confirmation — **verify the column-band
-  claim with Leia before pinning values**); zero firmware work required
-  (conformant via the default any-nonzero quantization).
-- IPC: zone rect on the rig-chained locate call (already server-routed since
-  PR #479) + `XRT_LAYER_ZONE_3D` serialization (projection + 16 bytes). The
-  wish-mask cross-process transport is the one genuinely new IPC surface —
-  scoped here, may slip independently (sentinel-paint probe for validation).
-- Validate via `XRT_FORCE_MODE=ipc` with `cube_zones_d3d11_win`, then the
-  workspace path (wish ignored in v1 per ADR-027 — verify it is *inert*, not
-  broken).
+Runtime side **DONE** across #549 (PR #552, workspace composite + zone-scoped
+locate over IPC, Leia-eyeball validated) and the #551 standalone tail:
+
+- IPC: zone rect rides the rig-chained locate call (server-routed since
+  PR #479); `XRT_LAYER_ZONE_3D` serialization shipped with #549. The wish
+  needed **no new cross-process transport**: the service derives the auto
+  wish from the committed zone-3D layers and publishes it screen-anchored to
+  the per-client DP (`service_update_zone_wish_publish`,
+  `comp_d3d11_service.cpp`) — same feathered union raster as in-process. A
+  mask-capable DP demotes the tier-1 global 3D request (the MODE flip stays:
+  the multi-view atlas recipe is the mode's); a DP without the entry keeps
+  tier-1 unchanged.
+- #551 root-cause note (so the wrong framing doesn't persist): the standalone
+  "no eyes / black view-1" was NOT a locate-plumbing gap — the HWND-scoped
+  metrics + zone rebase already worked (`VIEW-RIG IPC: window-scoped via
+  client HWND`, `ZONES IPC: first zone-scoped locate` in the service log).
+  The persistent symptom was `cube_zones_d3d11_win` allocating zone
+  swapchains at the *startup* mode's view count (1-view standalone), pinning
+  every zone submission to one view; fixed by allocating at the max view
+  count across modes and clamping per-frame to the active mode.
+- `displayxr-leia-plugin` (vendor half, PR #44): report appended caps
+  (`wish_fractional=0`, `switch_granularity` per vendor confirmation);
+  zero firmware work required (conformant via the default any-nonzero
+  quantization). Until it lands in the installed plugin, the service publish
+  no-ops and tier-1 covers.
+- Workspace wish verified *inert* (not broken) per ADR-027 v1.
 
 ### Phase 6 — avatar migration (acceptance)
 

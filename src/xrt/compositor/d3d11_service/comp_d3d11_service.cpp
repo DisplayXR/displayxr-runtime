@@ -365,6 +365,24 @@ struct d3d11_service_compositor
 	int64_t fence_window_start_ns;
 	uint32_t fence_waits_queued_in_window;
 	uint32_t fence_stale_views_in_window;
+
+	//! XR_EXT_display_zones (#551) — standalone wish-over-IPC publish state.
+	//! Mirrors the in-process auto-wish raster (comp_d3d11_compositor's
+	//! d3d11_update_zone_wish_mask): an R8_UNORM union-of-zone-rects mask
+	//! with a feathered ring, rasterized at commit on the shared immediate
+	//! context (under sys->render_mutex) and published to this client's DP.
+	//! Workspace mode never touches any of this (wish INERT, ADR-027 v1).
+	wil::com_ptr<ID3D11Texture2D> wish_mask_tex; //!< RENDER_TARGET raster target
+	wil::com_ptr<ID3D11RenderTargetView> wish_mask_rtv;
+	wil::com_ptr<ID3D11Texture2D> wish_mask_staged; //!< SHADER_RESOURCE copy the DP samples
+	wil::com_ptr<ID3D11ShaderResourceView> wish_mask_staged_srv;
+	uint32_t wish_mask_w;
+	uint32_t wish_mask_h;
+	struct xrt_rect wish_rects[XRT_MAX_LAYERS]; //!< last rasterized rects (dirty check)
+	uint32_t wish_rect_count;
+	uint64_t zone_publish_seq;  //!< mask content generation (bumped per re-raster)
+	bool zone_published;        //!< a mask is live at the DP (clear on non-zones frames / teardown)
+	bool zone_mask_dp_rejected; //!< DP rejected the publish — tier-1 hardware request owns the panel
 };
 
 /*!
@@ -8318,9 +8336,9 @@ zones_resolve_src_srv(struct d3d11_service_system *sys,
  * the canvas (window client area) maps onto the slot by a downscale-only
  * factor, and the resulting content dims feed the same slot bookkeeping the
  * projection path uses. The in-process model is comp_d3d11_renderer's
- * XRT_LAYER_ZONE_3D case. The wish stays on the tier-1 global fallback here
- * (workspace wish is INERT in v1 per ADR-027; the standalone wish-over-IPC
- * publish is a scope-split follow-up).
+ * XRT_LAYER_ZONE_3D case. The standalone wish rides
+ * service_update_zone_wish_publish below (#551); workspace wish is INERT in
+ * v1 per ADR-027.
  *
  * Caller MUST hold sys->render_mutex — the shader blits run on the immediate
  * context from the commit thread and would otherwise race the capture-render
@@ -8601,20 +8619,258 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 		acquired[a].sc->images[acquired[a].img].keyed_mutex->ReleaseSync(0);
 	}
 
-	// One-shot breadcrumb so a bug report shows the composite geometry.
-	static bool composite_logged = false;
-	if (!composite_logged) {
-		composite_logged = true;
-		U_LOG_W("ZONES SVC: first zones-frame composite, canvas=%ux%u scale=%.3f zones=%u local2d=%u "
-		        "slot=%ux%u content=%ux%u blits=%u skipped=%u workspace=%d",
-		        canvas_w, canvas_h, scale, zone_count, local2d_count,
-		        slot_w, slot_h, content_w, content_h, blits_done, views_skipped,
-		        sys->workspace_mode ? 1 : 0);
+	// One-shot-per-shape breadcrumb so a bug report shows the composite
+	// geometry. Re-logs when the blit count changes (e.g. a standalone zones
+	// client starting in a 1-view mode picks up the tier-1 mode flip a frame
+	// later and begins submitting every view, #551) — never per-frame.
+	static uint32_t composite_logged_blits = UINT32_MAX;
+	if (composite_logged_blits != blits_done) {
+		composite_logged_blits = blits_done;
+		U_LOG_W(
+		    "ZONES SVC: zones-frame composite, canvas=%ux%u scale=%.3f zones=%u local2d=%u "
+		    "slot=%ux%u content=%ux%u blits=%u skipped=%u workspace=%d",
+		    canvas_w, canvas_h, scale, zone_count, local2d_count, slot_w, slot_h, content_w, content_h,
+		    blits_done, views_skipped, sys->workspace_mode ? 1 : 0);
 	}
 
 	*out_content_view_w = content_w;
 	*out_content_view_h = content_h;
 	return true;
+}
+
+// XR_EXT_display_zones (#551) — standalone wish-over-IPC publish. Mirrors the
+// in-process auto-wish (comp_d3d11_compositor.cpp): same feather geometry, so
+// a zone weaves identically on both paths.
+#define SVC_ZONE_WISH_FEATHER_STEPS 8
+#define SVC_ZONE_WISH_FEATHER_STEP_PX 2
+
+/*!
+ * Whether this client's DP exposes the local-zone-mask entry (vtable slot
+ * present and filled). Decides tier-1 demotion: a mask-capable DP gets the
+ * published wish instead of the global hardware 3D request.
+ */
+static bool
+service_dp_accepts_zone_mask(struct xrt_display_processor_d3d11 *xdp)
+{
+	return xdp != nullptr && XRT_DP_HAS_SLOT(xdp, publish_local_zone_mask) && xdp->publish_local_zone_mask != NULL;
+}
+
+/*!
+ * (Re)rasterize the union of @p rects into the per-client R8_UNORM wish mask
+ * with an inward feathered ring (M ramps 0→1 over STEPS×STEP_PX), then copy
+ * to the SRV-only staged texture the DP samples. Dirty-tracked: an unchanged
+ * rect set returns the existing staged SRV without GPU work. Port of the
+ * in-process d3d11_update_zone_wish_mask.
+ *
+ * Caller MUST hold sys->render_mutex — ClearView/CopyResource run on the
+ * shared immediate context from the commit thread.
+ *
+ * Returns the staged SRV, or nullptr on failure / empty input.
+ */
+static ID3D11ShaderResourceView *
+service_update_zone_wish_mask(struct d3d11_service_system *sys,
+                              struct d3d11_service_compositor *c,
+                              const struct xrt_rect *rects,
+                              uint32_t rect_count,
+                              uint32_t w,
+                              uint32_t h)
+{
+	if (w == 0 || h == 0 || rect_count == 0) {
+		return nullptr;
+	}
+
+	bool dirty = c->wish_mask_tex == nullptr || c->wish_mask_staged_srv == nullptr || c->wish_mask_w != w ||
+	             c->wish_mask_h != h || c->wish_rect_count != rect_count;
+	for (uint32_t i = 0; !dirty && i < rect_count; i++) {
+		if (memcmp(&c->wish_rects[i], &rects[i], sizeof(rects[i])) != 0) {
+			dirty = true;
+		}
+	}
+	if (!dirty) {
+		return c->wish_mask_staged_srv.get();
+	}
+
+	if (c->wish_mask_tex == nullptr || c->wish_mask_w != w || c->wish_mask_h != h) {
+		c->wish_mask_staged_srv.reset();
+		c->wish_mask_staged.reset();
+		c->wish_mask_rtv.reset();
+		c->wish_mask_tex.reset();
+		c->wish_mask_w = 0;
+		c->wish_mask_h = 0;
+
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = w;
+		td.Height = h;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R8_UNORM;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_RENDER_TARGET;
+		HRESULT hr = sys->device->CreateTexture2D(&td, nullptr, c->wish_mask_tex.put());
+		if (SUCCEEDED(hr) && c->wish_mask_tex != nullptr) {
+			hr = sys->device->CreateRenderTargetView(c->wish_mask_tex.get(), nullptr,
+			                                         c->wish_mask_rtv.put());
+		}
+		if (SUCCEEDED(hr) && c->wish_mask_rtv != nullptr) {
+			td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			hr = sys->device->CreateTexture2D(&td, nullptr, c->wish_mask_staged.put());
+		}
+		if (SUCCEEDED(hr) && c->wish_mask_staged != nullptr) {
+			hr = sys->device->CreateShaderResourceView(c->wish_mask_staged.get(), nullptr,
+			                                           c->wish_mask_staged_srv.put());
+		}
+		if (FAILED(hr) || c->wish_mask_staged_srv == nullptr) {
+			U_LOG_E("ZONES SVC: wish mask D3D resource creation failed: 0x%08lx", hr);
+			c->wish_mask_staged_srv.reset();
+			c->wish_mask_staged.reset();
+			c->wish_mask_rtv.reset();
+			c->wish_mask_tex.reset();
+			return nullptr;
+		}
+		c->wish_mask_w = w;
+		c->wish_mask_h = h;
+	}
+
+	const float all_off[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	sys->context->ClearRenderTargetView(c->wish_mask_rtv.get(), all_off);
+
+	wil::com_ptr<ID3D11DeviceContext1> ctx1;
+	HRESULT hr = sys->context->QueryInterface(__uuidof(ID3D11DeviceContext1), ctx1.put_void());
+	if (FAILED(hr) || ctx1 == nullptr) {
+		U_LOG_E("ZONES SVC: wish mask: ID3D11DeviceContext1 unavailable (hr=0x%08lx)", hr);
+		return nullptr;
+	}
+	for (int32_t s = 1; s <= SVC_ZONE_WISH_FEATHER_STEPS; s++) {
+		const float v = (float)s / (float)SVC_ZONE_WISH_FEATHER_STEPS;
+		const float val[4] = {v, 0.0f, 0.0f, 0.0f};
+		for (uint32_t i = 0; i < rect_count; i++) {
+			// Per-zone inset clamp: zones smaller than the feather
+			// collapse the deeper rings onto one core so the center
+			// still reaches M=1.
+			int32_t min_ext = rects[i].extent.w < rects[i].extent.h ? rects[i].extent.w : rects[i].extent.h;
+			int32_t max_inset = (min_ext - 1) / 2;
+			if (max_inset < 0) {
+				max_inset = 0;
+			}
+			int32_t inset = s * SVC_ZONE_WISH_FEATHER_STEP_PX;
+			if (inset > max_inset) {
+				inset = max_inset;
+			}
+			int32_t left = rects[i].offset.w + inset;
+			int32_t top = rects[i].offset.h + inset;
+			int32_t right = rects[i].offset.w + rects[i].extent.w - inset;
+			int32_t bottom = rects[i].offset.h + rects[i].extent.h - inset;
+			if (left < 0) {
+				left = 0;
+			}
+			if (top < 0) {
+				top = 0;
+			}
+			if (right > (int32_t)w) {
+				right = (int32_t)w;
+			}
+			if (bottom > (int32_t)h) {
+				bottom = (int32_t)h;
+			}
+			if (right <= left || bottom <= top) {
+				continue;
+			}
+			D3D11_RECT dr = {left, top, right, bottom};
+			ctx1->ClearView(c->wish_mask_rtv.get(), val, &dr, 1);
+		}
+	}
+
+	sys->context->CopyResource(c->wish_mask_staged.get(), c->wish_mask_tex.get());
+
+	memcpy(c->wish_rects, rects, sizeof(rects[0]) * rect_count);
+	c->wish_rect_count = rect_count;
+	c->zone_publish_seq++; // new wish content generation
+
+	U_LOG_W("ZONES SVC: wish mask (auto): %ux%u, %u zone rect(s), %u-px feather", w, h, rect_count,
+	        SVC_ZONE_WISH_FEATHER_STEPS * SVC_ZONE_WISH_FEATHER_STEP_PX);
+	return c->wish_mask_staged_srv.get();
+}
+
+/*!
+ * Per-commit wish maintenance for the standalone path: on a zones frame,
+ * rasterize the auto wish (union of the frame's zone-3D rects, the same
+ * source the in-process auto path consumes) and publish it screen-anchored
+ * to this client's DP; on a non-zones frame, withdraw a previously published
+ * mask. Workspace mode is fully inert here (ADR-027 v1) — the caller gates.
+ *
+ * If the DP rejects the publish at runtime (slot present but vendor said no),
+ * fall back to the tier-1 global hardware 3D request once — the tier-1 block
+ * skipped it expecting the mask to drive the panel.
+ */
+static void
+service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_service_compositor *c, bool zones_frame)
+{
+	struct xrt_display_processor_d3d11 *dp = c->render.display_processor;
+
+	if (!zones_frame) {
+		if (c->zone_published && dp != nullptr) {
+			std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+			xrt_display_processor_d3d11_clear_local_zone_mask(dp);
+			c->zone_published = false;
+		}
+		return;
+	}
+
+	if (!service_dp_accepts_zone_mask(dp) || c->zone_mask_dp_rejected) {
+		return; // tier-1 global request owns the panel
+	}
+
+	// Screen-anchor: client-area origin in physical screen pixels. No HWND
+	// (hosted/texture client) → nothing to anchor to; skip the publish.
+	HWND wnd = c->render.hwnd != nullptr ? c->render.hwnd : c->app_hwnd;
+	RECT r;
+	POINT origin = {0, 0};
+	if (wnd == nullptr || !IsWindow(wnd) || !GetClientRect(wnd, &r) || r.right <= 0 || r.bottom <= 0 ||
+	    !ClientToScreen(wnd, &origin)) {
+		return;
+	}
+	uint32_t w = (uint32_t)r.right;
+	uint32_t h = (uint32_t)r.bottom;
+
+	struct xrt_rect rects[XRT_MAX_LAYERS];
+	uint32_t rect_count = 0;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count && rect_count < XRT_MAX_LAYERS; i++) {
+		if (c->layer_accum.layers[i].data.type != XRT_LAYER_ZONE_3D) {
+			continue;
+		}
+		rects[rect_count++] = c->layer_accum.layers[i].data.zone_3d.rect;
+	}
+	if (rect_count == 0) {
+		return;
+	}
+
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	ID3D11ShaderResourceView *srv = service_update_zone_wish_mask(sys, c, rects, rect_count, w, h);
+	if (srv == nullptr) {
+		return;
+	}
+
+	// Published every zones commit: the screen anchor follows the window;
+	// seq is the content generation, so a vendor's content evaluation runs
+	// once per re-raster, not once per frame.
+	bool ok = xrt_display_processor_d3d11_publish_local_zone_mask(
+	    dp, sys->context.get(), srv, w, h, (int32_t)origin.x, (int32_t)origin.y, w, h, c->zone_publish_seq);
+	if (ok) {
+		if (!c->zone_published) {
+			U_LOG_W(
+			    "ZONES SVC: wish mask published to the per-client DP "
+			    "(%ux%u @ screen %ld,%ld, %u zone rect(s))",
+			    w, h, origin.x, origin.y, rect_count);
+		}
+		c->zone_published = true;
+	} else if (!c->zone_mask_dp_rejected) {
+		c->zone_mask_dp_rejected = true;
+		U_LOG_W(
+		    "ZONES SVC: DP rejected the wish mask publish — falling back to the "
+		    "tier-1 global 3D request");
+		xrt_display_processor_d3d11_request_display_mode(dp, true);
+	}
 }
 
 
@@ -9037,6 +9293,19 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			got_state = true;
 		}
 
+		// Suppress vendor-poll counter-correction while this client's
+		// published wish mask drives the panel (#551): under a mask the
+		// vendor's GLOBAL 3D state legitimately reads 2D (the lens is
+		// owned per-zone by the mask), so following it would flip the MODE
+		// back to 2D and the next zones frame would re-arm the zones mode
+		// flip — a 1↔0 flap every cooldown interval. Tracking-loss 2D
+		// fallback inside mask regions is the vendor's per-zone business.
+		// Withdrawing the mask (non-zones frames / teardown) re-enables
+		// the poll on the next window.
+		if (got_state && c->zone_published) {
+			got_state = false;
+		}
+
 		if (got_state) {
 			// Suppress vendor-poll detection while an acked-flip is in progress
 			// (#234). During WAITING_ACK / FLIPPING the workspace has written
@@ -9216,7 +9485,16 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				uint32_t prev_idx = zhead->hmd->active_rendering_mode_index;
 				zhead->hmd->active_rendering_mode_index = mode_idx;
 				broadcast_rendering_mode_change(sys, zhead, prev_idx, mode_idx);
-				if (c->render.display_processor != nullptr) {
+				// Tier-1 demotion (#551): a mask-capable DP gets the
+				// published per-zone wish instead of the global hardware
+				// 3D request — the mask drives the panel, exactly like
+				// the in-process path. The MODE flip above stays either
+				// way (the multi-view atlas recipe is the mode's). If the
+				// DP later rejects the publish at runtime, the publish
+				// helper issues this request as the fallback.
+				bool mask_capable = service_dp_accepts_zone_mask(c->render.display_processor) &&
+				                    !c->zone_mask_dp_rejected;
+				if (c->render.display_processor != nullptr && !mask_capable) {
 					xrt_display_processor_d3d11_request_display_mode(
 					    c->render.display_processor, true);
 				}
@@ -9233,9 +9511,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				static bool zones_3d_logged = false;
 				if (!zones_3d_logged) {
 					zones_3d_logged = true;
-					U_LOG_W("ZONES SVC: zones frame on the standalone path — tier-1 global 3D "
-					        "(mode %u -> %u)",
-					        prev_idx, mode_idx);
+					U_LOG_W(
+					    "ZONES SVC: zones frame on the standalone path — %s "
+					    "(mode %u -> %u)",
+					    mask_capable ? "mode flip, panel driven by the published wish"
+					                 : "tier-1 global 3D",
+					    prev_idx, mode_idx);
 				}
 			}
 		}
@@ -9999,6 +10280,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 	}
 
+	// XR_EXT_display_zones (#551): standalone wish-over-IPC publish — the
+	// per-zone Tier-2 leg the tier-1 block above is the fallback for. Runs
+	// on EVERY standalone commit (a non-zones frame withdraws a previously
+	// published mask). Workspace clients stay inert per ADR-027 v1.
+	if (!sys->workspace_mode) {
+		service_update_zone_wish_publish(sys, c, zones_frame);
+	}
+
 	// Render UI layers if any exist and shaders are ready
 	if (has_ui_layers && sys->quad_vs) {
 		// Bind per-client stereo render target
@@ -10270,6 +10559,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		c->pending_workspace_reentry = false;
 
 		if (c->render.display_processor != nullptr) {
+			// Withdraw the standalone zone-mask contribution before the
+			// DP goes away (#551) — workspace mode keeps the wish inert.
+			if (c->zone_published) {
+				xrt_display_processor_d3d11_clear_local_zone_mask(c->render.display_processor);
+				c->zone_published = false;
+			}
 			xrt_display_processor_d3d11_request_display_mode(c->render.display_processor, false);
 			xrt_display_processor_d3d11_destroy(&c->render.display_processor);
 		}
@@ -10629,6 +10924,13 @@ compositor_destroy(struct xrt_compositor *xc)
 			}
 		}
 
+		// Withdraw this client's zone-mask contribution while the DP is
+		// still alive (#551) — equivalent to publishing an all-zero mask.
+		if (c->zone_published && c->render.display_processor != nullptr) {
+			xrt_display_processor_d3d11_clear_local_zone_mask(c->render.display_processor);
+			c->zone_published = false;
+		}
+
 		// Tear down per-client render resources (window, swap chain, DP,
 		// atlas textures / SRVs / RTVs) while still holding render_mutex.
 		fini_client_render_resources(&c->render);
@@ -10650,6 +10952,10 @@ compositor_destroy(struct xrt_compositor *xc)
 			if (sys->active_compositor == c) {
 				sys->active_compositor = nullptr;
 			}
+		}
+		if (c->zone_published && c->render.display_processor != nullptr) {
+			xrt_display_processor_d3d11_clear_local_zone_mask(c->render.display_processor);
+			c->zone_published = false;
 		}
 		fini_client_render_resources(&c->render);
 		if (c->workspace_sync_fence_handle != nullptr) {
