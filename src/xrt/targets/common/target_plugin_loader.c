@@ -1184,10 +1184,11 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 	}
 
 	U_LOG_W(
-	    "plugin loader: active plug-in: id=%s name='%s' vendor='%s' "
+	    "plugin loader: active plug-in: id=%s name='%s' vendor='%s' version='%s' "
 	    "plugin_api=%u probe_order=%u path=%s",
 	    iface->id ? iface->id : e->id, iface->display_name ? iface->display_name : "",
-	    iface->vendor ? iface->vendor : "", plugin_version, e->probe_order, e->binary_path);
+	    iface->vendor ? iface->vendor : "", iface->version ? iface->version : "", plugin_version, e->probe_order,
+	    e->binary_path);
 
 	/* dlopen handle intentionally leaked: the iface's function pointers
 	 * remain reachable into the .so for the process's lifetime. */
