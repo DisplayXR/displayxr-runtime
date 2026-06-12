@@ -1,6 +1,6 @@
 ---
 name: dxr-release
-description: Tag-and-publish a release for any DisplayXR sibling component (shell, leia-plugin, mcp, gauss & modelviewer & mediaplayer demos) FROM the displayxr-runtime hub. Takes an explicit component + version — clones the target repo to a temp dir, tags HEAD, watches the repo's CI, watches the dispatched versions-bump.yml on displayxr-runtime, reports the bump + installer-mirror outcome. NOT for displayxr-runtime itself (use /release) and NOT for the bundle (use /installer-release).
+description: Tag-and-publish a release for any DisplayXR sibling component (shell, leia-plugin, mcp, gauss & modelviewer & mediaplayer & earthview demos) FROM the displayxr-runtime hub. Takes an explicit component + version — clones the target repo to a temp dir, tags HEAD, watches the repo's CI, watches the dispatched versions-bump.yml on displayxr-runtime, reports the bump + installer-mirror outcome. NOT for displayxr-runtime itself (use /release) and NOT for the bundle (use /installer-release).
 ---
 
 # dxr-release — component release driven from the runtime hub
@@ -28,7 +28,7 @@ Spec: [`docs/specs/runtime/versions-json-autobump.md`](../../docs/specs/runtime/
 ```
 /dxr-release <component> <version-spec>
 
-  <component>     shell | leia-plugin (leia) | mcp | gauss (demo-gaussiansplat) | modelviewer (demo-modelviewer) | mediaplayer (demo-mediaplayer)
+  <component>     shell | leia-plugin (leia) | mcp | gauss (demo-gaussiansplat) | modelviewer (demo-modelviewer) | mediaplayer (demo-mediaplayer) | earthview (demo-earthview)
   <version-spec>  vX.Y.Z  |  patch  |  minor  |  major
 ```
 
@@ -53,6 +53,7 @@ from cwd — that's the old cwd-detecting behavior this skill replaced.
 | `gauss` / `demo-gaussiansplat` | `DisplayXR/displayxr-demo-gaussiansplat` | `gauss_demo` | `build-windows.yml` | same repo |
 | `modelviewer` / `demo-modelviewer` | `DisplayXR/displayxr-demo-modelviewer` | `modelviewer_demo` | `build-windows.yml` | same repo |
 | `mediaplayer` / `demo-mediaplayer` | `DisplayXR/displayxr-demo-mediaplayer` | `mediaplayer_demo` | `build-windows.yml` | same repo |
+| `earthview` / `demo-earthview` | `DisplayXR/displayxr-demo-earthview` | `earthview_demo` | `build-macos.yml` | same repo |
 
 `runtime` → tell the user to use `/release` (in-repo). `installer` →
 tell them to use `/installer-release`.
@@ -86,9 +87,10 @@ case "$COMPONENT" in
   gauss|demo-gaussiansplat)      REPO=DisplayXR/displayxr-demo-gaussiansplat; FIELD=gauss_demo; WORKFLOW=build-windows.yml;           REL_REPO=DisplayXR/displayxr-demo-gaussiansplat ;;
   modelviewer|demo-modelviewer)  REPO=DisplayXR/displayxr-demo-modelviewer;   FIELD=modelviewer_demo; WORKFLOW=build-windows.yml;      REL_REPO=DisplayXR/displayxr-demo-modelviewer ;;
   mediaplayer|demo-mediaplayer)  REPO=DisplayXR/displayxr-demo-mediaplayer;   FIELD=mediaplayer_demo; WORKFLOW=build-windows.yml;      REL_REPO=DisplayXR/displayxr-demo-mediaplayer ;;
+  earthview|demo-earthview)      REPO=DisplayXR/displayxr-demo-earthview;     FIELD=earthview_demo;   WORKFLOW=build-macos.yml;       REL_REPO=DisplayXR/displayxr-demo-earthview ;;
   runtime)                       echo "Use /release (in-repo) for the runtime."; exit 1 ;;
   installer)                     echo "Use /installer-release for the bundle.";  exit 1 ;;
-  *)                             echo "Unknown component '$COMPONENT'. One of: shell, leia-plugin, mcp, gauss, modelviewer, mediaplayer."; exit 1 ;;
+  *)                             echo "Unknown component '$COMPONENT'. One of: shell, leia-plugin, mcp, gauss, modelviewer, mediaplayer, earthview."; exit 1 ;;
 esac
 echo "repo=$REPO field=$FIELD workflow=$WORKFLOW"
 ```
