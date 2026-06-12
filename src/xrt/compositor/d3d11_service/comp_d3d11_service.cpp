@@ -2062,6 +2062,7 @@ create_layer_resources(struct d3d11_service_system *sys)
  * @param dst_x Destination X offset in stereo texture
  * @param dst_y Destination Y offset in stereo texture
  * @param is_srgb Whether source is SRGB format (triggers gamma conversion)
+ * @param blend Blend state for the draw; nullptr = opaque overwrite.
  */
 static void
 blit_to_atlas_texture(struct d3d11_service_system *sys,
@@ -2071,7 +2072,8 @@ blit_to_atlas_texture(struct d3d11_service_system *sys,
                        float src_tex_w, float src_tex_h,
                        float dst_x, float dst_y,
                        float dst_w, float dst_h,
-                       bool is_srgb)
+                       bool is_srgb,
+                       ID3D11BlendState *blend = nullptr)
 {
 	// Update blit constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
@@ -2079,6 +2081,21 @@ blit_to_atlas_texture(struct d3d11_service_system *sys,
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to map blit constant buffer: 0x%08lx", hr);
 		return;
+	}
+
+	// NDC mapping + viewport must cover the REAL atlas dims. The atlas is
+	// larger than sys->display_width/height (which track the scaled view
+	// dims, e.g. 1920x1080, while the atlas is created at native panel
+	// pixels, e.g. 3840x2160) — mapping by the display dims clips every
+	// draw at the first tile boundary, so view tiles beyond column 0 can
+	// never be shader-blitted (#549: empty view-1 tile in zones frames).
+	float atlas_w = static_cast<float>(sys->display_width);
+	float atlas_h = static_cast<float>(sys->display_height);
+	if (res->atlas_texture) {
+		D3D11_TEXTURE2D_DESC blit_atlas_desc = {};
+		res->atlas_texture->GetDesc(&blit_atlas_desc);
+		atlas_w = static_cast<float>(blit_atlas_desc.Width);
+		atlas_h = static_cast<float>(blit_atlas_desc.Height);
 	}
 
 	BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
@@ -2090,8 +2107,8 @@ blit_to_atlas_texture(struct d3d11_service_system *sys,
 	cb->dst_offset[1] = dst_y;
 	cb->src_size[0] = src_tex_w;
 	cb->src_size[1] = src_tex_h;
-	cb->dst_size[0] = static_cast<float>(sys->display_width);
-	cb->dst_size[1] = static_cast<float>(sys->display_height);
+	cb->dst_size[0] = atlas_w;
+	cb->dst_size[1] = atlas_h;
 	cb->convert_srgb = is_srgb ? 1.0f : 0.0f;
 	cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
 	cb->quad_mode = 0.0f;
@@ -2116,19 +2133,31 @@ blit_to_atlas_texture(struct d3d11_service_system *sys,
 	ID3D11RenderTargetView *rtvs[] = {res->atlas_rtv.get()};
 	sys->context->OMSetRenderTargets(1, rtvs, nullptr);
 
-	// Set viewport to cover destination region
+	// Viewport covers the full atlas (same dims as the NDC mapping above).
 	D3D11_VIEWPORT vp = {};
 	vp.TopLeftX = 0;
 	vp.TopLeftY = 0;
-	vp.Width = static_cast<float>(sys->display_width);
-	vp.Height = static_cast<float>(sys->display_height);
+	vp.Width = atlas_w;
+	vp.Height = atlas_h;
 	vp.MinDepth = 0.0f;
 	vp.MaxDepth = 1.0f;
 	sys->context->RSSetViewports(1, &vp);
 
-	// Set blend state to opaque (overwrite)
+	// rasterizer_state has ScissorEnable — install a full-atlas scissor
+	// rather than inheriting whatever per-tile rect the combined-atlas pass
+	// left behind (a stale right-half scissor silently clips every draw to
+	// the column-0 tile — #549's empty view-0 tile).
+	D3D11_RECT blit_scissor = {};
+	blit_scissor.left = 0;
+	blit_scissor.top = 0;
+	blit_scissor.right = static_cast<LONG>(atlas_w);
+	blit_scissor.bottom = static_cast<LONG>(atlas_h);
+	sys->context->RSSetScissorRects(1, &blit_scissor);
+
+	// Opaque overwrite unless the caller asked for a blend (zone/Local-2D
+	// alpha-over composites).
 	float blend_factor[4] = {0, 0, 0, 0};
-	sys->context->OMSetBlendState(sys->blend_opaque.get(), blend_factor, 0xFFFFFFFF);
+	sys->context->OMSetBlendState(blend != nullptr ? blend : sys->blend_opaque.get(), blend_factor, 0xFFFFFFFF);
 	sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
 	sys->context->RSSetState(sys->rasterizer_state.get());
 
@@ -2140,6 +2169,15 @@ blit_to_atlas_texture(struct d3d11_service_system *sys,
 	// Clear shader resources to avoid hazards
 	ID3D11ShaderResourceView *null_srv = nullptr;
 	sys->context->PSSetShaderResources(0, 1, &null_srv);
+
+	// Unbind the atlas RTV too. The context is shared with the render
+	// thread, whose content blit binds the per-client atlas as SRV (t0)
+	// BEFORE rebinding its own RTV — leaving the atlas bound as render
+	// target here makes D3D11's hazard resolution silently drop that SRV
+	// bind, so the FIRST tile blit of the next combined-atlas pass samples
+	// null/black (#549: empty view-0 tile under the workspace).
+	ID3D11RenderTargetView *null_rtv = nullptr;
+	sys->context->OMSetRenderTargets(1, &null_rtv, nullptr);
 }
 
 
@@ -3894,10 +3932,10 @@ compositor_layer_window_space(struct xrt_compositor *xc,
 }
 
 /*!
- * Local-2D layer (XR_EXT_local_3d_zone v3, #439 Phase 3). The service
- * consumer is out of scope for v1 (in-process native compositors first —
- * docs/roadmap/unified-2d-3d-phase3-impl.md §2): drop with a one-time WARN;
- * never an error (layers are advisory compositing).
+ * Local-2D layer (XR_EXT_local_3d_zone v3, #439 Phase 3 / #549). Accumulated
+ * like every other layer type; layer_commit's zones composite replicates the
+ * 2D content into every view tile of the per-client atlas (identical position
+ * per view ⟹ zero disparity ⟹ reads flat after the weave).
  */
 static xrt_result_t
 compositor_layer_local_2d(struct xrt_compositor *xc,
@@ -3905,33 +3943,22 @@ compositor_layer_local_2d(struct xrt_compositor *xc,
                           struct xrt_swapchain *xsc,
                           const struct xrt_layer_data *data)
 {
-	static bool warned = false;
-	if (!warned) {
-		warned = true;
-		U_LOG_W("Local-2D layers are not consumed by the D3D11 service compositor yet — dropping (one-time "
-		        "warning)");
-	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+
+	std::lock_guard<std::mutex> lock(c->mutex);
+	comp_layer_accum_local_2d(&c->layer_accum, xsc, data);
 
 	return XRT_SUCCESS;
 }
 
 /*!
- * Zone-3D layer (XR_EXT_display_zones P5, ADR-027). The IPC transport now
- * delivers zone layers here (client serialization + _update_zone_3d_layer),
- * but this compositor cannot yet consume them honestly: its projection path
- * is a single-layer full-tile blit / zero-copy pipeline into the per-client
- * atlas slot (cross-process KeyedMutex/fence sync, DP pass-through) — it has
- * no alpha-over compositing of N placed layers, no transparent-slot
- * semantics, and no auto-wish derivation, all of which a zones frame
- * requires (see comp_d3d11_renderer's XRT_LAYER_ZONE_3D case for the
- * in-process model). Rendering the zone's projection views full-tile would
- * silently ignore the placement rect, so drop with a one-time WARN instead;
- * never an error (layers are advisory compositing).
- *
- * @todo XR_EXT_display_zones P5 tail: zones_frame detection + transparent
- *       slot clear + per-view scaled alpha-over blits at the zone rect +
- *       auto-wish derivation for service-mode clients (the wish stays on
- *       the tier-1 global fallback until then).
+ * Zone-3D layer (XR_EXT_display_zones, ADR-027 / #549). Accumulated here;
+ * layer_commit detects the zones frame and scale-blits each zone's view
+ * tiles to the zone rect inside the per-client atlas slot, alpha-over in
+ * layer-list order (see comp_d3d11_renderer's XRT_LAYER_ZONE_3D case for
+ * the in-process model). The wish stays on the tier-1 global fallback for
+ * service clients (workspace wish is INERT in v1 — wish-over-IPC publish
+ * is the scope-split follow-up).
  */
 static xrt_result_t
 compositor_layer_zone_3d(struct xrt_compositor *xc,
@@ -3939,12 +3966,10 @@ compositor_layer_zone_3d(struct xrt_compositor *xc,
                          struct xrt_swapchain *xsc[XRT_MAX_VIEWS],
                          const struct xrt_layer_data *data)
 {
-	static bool warned = false;
-	if (!warned) {
-		warned = true;
-		U_LOG_W("Zone-3D layer reached the D3D11 service compositor (IPC transport ok) but is not "
-		        "consumed yet — dropping (one-time warning)");
-	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+
+	std::lock_guard<std::mutex> lock(c->mutex);
+	comp_layer_accum_zone_3d(&c->layer_accum, xsc, data);
 
 	return XRT_SUCCESS;
 }
@@ -8126,6 +8151,458 @@ multi_compositor_render(struct d3d11_service_system *sys)
 }
 
 
+/*!
+ * Store the committed content dims on this client's multi-comp slot and flip
+ * `has_first_frame_committed` on the false→true transition so the slot starts
+ * compositing only once the client has actually submitted content (without
+ * this, the multi-comp would draw the slot with uninitialized atlas content
+ * — visible as a black rectangle, or the workspace spinner forever for zones
+ * clients). Also snapshots the per-slot stride for the workspace per-tile
+ * blit (#234, Issue 3): same `atlas / tile_columns` formula the content clamp
+ * uses — write/clamp/read must agree, and capturing here keeps the slot
+ * self-consistent even when sys->tile_columns flips ahead of this slot's next
+ * commit. Shared by the projection blit path and the zones composite (#549).
+ */
+static void
+service_update_slot_content_dims(struct d3d11_service_system *sys,
+                                 struct d3d11_service_compositor *c,
+                                 uint32_t content_view_w,
+                                 uint32_t content_view_h)
+{
+	if (!sys->workspace_mode || sys->multi_comp == nullptr) {
+		return;
+	}
+	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+		if (!sys->multi_comp->clients[s].active ||
+		    sys->multi_comp->clients[s].compositor != c) {
+			continue;
+		}
+		struct d3d11_multi_client_slot *slot = &sys->multi_comp->clients[s];
+		slot->content_view_w = content_view_w;
+		slot->content_view_h = content_view_h;
+
+		if (c->render.atlas_texture) {
+			D3D11_TEXTURE2D_DESC sc_desc = {};
+			c->render.atlas_texture->GetDesc(&sc_desc);
+			uint32_t tc = sys->tile_columns > 0 ? sys->tile_columns : 1;
+			uint32_t tr = sys->tile_rows > 0 ? sys->tile_rows : 1;
+			slot->blit_slot_w = sc_desc.Width / tc;
+			slot->blit_slot_h = sc_desc.Height / tr;
+			slot->blit_tile_columns = tc;
+			slot->blit_tile_rows = tr;
+		}
+
+		if (!slot->has_first_frame_committed) {
+			slot->has_first_frame_committed = true;
+			slot->first_frame_ns = os_monotonic_get_ns();
+		}
+		break;
+	}
+}
+
+/*!
+ * One acquired cross-process image during the zones composite. Acquires are
+ * deduped per (swapchain, image) across the whole pass — a second
+ * AcquireSync(0) on the same image from this thread would self-block.
+ */
+struct zones_acquired_image
+{
+	struct d3d11_service_swapchain *sc;
+	uint32_t img;
+};
+
+/*!
+ * Acquire one zone/Local-2D source image for reading, honoring the same
+ * cross-process sync contract as the projection-layer loop: fence-path
+ * clients get a 0-timeout AcquireSync (the SHARED_KEYEDMUTEX barrier —
+ * `feedback_acquiresync_load_bearing`) plus one queued GPU fence Wait per
+ * commit; legacy clients block up to 4 ms. On failure the caller skips this
+ * placement's blit — the composite draws over a freshly cleared tile, so a
+ * skipped placement is transparent for one frame (layers are advisory), not
+ * stale-reused like the persistent projection slot.
+ */
+static bool
+zones_acquire_image(struct d3d11_service_system *sys,
+                    struct d3d11_service_compositor *c,
+                    struct d3d11_service_swapchain *sc,
+                    uint32_t img,
+                    bool use_fence_path,
+                    uint64_t fence_signaled,
+                    bool *fence_wait_queued,
+                    struct zones_acquired_image *acquired,
+                    uint32_t *acquired_count,
+                    uint32_t acquired_cap)
+{
+	if (!sc->service_created || sc->images[img].keyed_mutex == nullptr) {
+		return true; // No cross-process mutex on this image.
+	}
+	for (uint32_t a = 0; a < *acquired_count; a++) {
+		if (acquired[a].sc == sc && acquired[a].img == img) {
+			return true;
+		}
+	}
+	if (*acquired_count >= acquired_cap) {
+		return false; // Registry full — refuse rather than leak an acquire.
+	}
+	DWORD timeout_ms = use_fence_path ? 0 : 4;
+	HRESULT hr = sc->images[img].keyed_mutex->AcquireSync(0, timeout_ms);
+	if (FAILED(hr) || hr == static_cast<HRESULT>(WAIT_TIMEOUT)) {
+		return false;
+	}
+	if (use_fence_path && !*fence_wait_queued) {
+		sys->context->Wait(c->workspace_sync_fence.get(), fence_signaled);
+		*fence_wait_queued = true;
+	}
+	acquired[*acquired_count].sc = sc;
+	acquired[*acquired_count].img = img;
+	(*acquired_count)++;
+	return true;
+}
+
+/*!
+ * Resolve the SRV to sample a zone/Local-2D source through. Workspace mode
+ * samples raw bytes (the per-client atlas stays gamma-encoded; the multi-comp
+ * pipeline handles color downstream — `feedback_srgb_blit_paths`). Standalone
+ * mode linearizes honest-sRGB sources through an sRGB SRV, mirroring the
+ * projection blit (the DP expects linear input on that path).
+ */
+static ID3D11ShaderResourceView *
+zones_resolve_src_srv(struct d3d11_service_system *sys,
+                      struct d3d11_service_swapchain *sc,
+                      uint32_t img,
+                      const D3D11_TEXTURE2D_DESC *desc,
+                      wil::com_ptr<ID3D11ShaderResourceView> &srgb_srv_out,
+                      bool *out_is_srgb_blit)
+{
+	*out_is_srgb_blit = false;
+	if (!sys->workspace_mode && is_srgb_format(desc->Format)) {
+		D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+		srv_desc.Format = get_srgb_format(desc->Format);
+		srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		srv_desc.Texture2D.MipLevels = 1;
+		srv_desc.Texture2D.MostDetailedMip = 0;
+		if (SUCCEEDED(sys->device->CreateShaderResourceView(
+		        sc->images[img].texture.get(), &srv_desc, srgb_srv_out.put()))) {
+			*out_is_srgb_blit = true;
+			return srgb_srv_out.get();
+		}
+	}
+	return sc->images[img].srv.get();
+}
+
+/*!
+ * XR_EXT_display_zones (#549): zones-frame composite for the service path.
+ * Reconstructs the client window inside the per-client atlas slot: clears the
+ * atlas to premultiplied transparent (transparent-slot semantics — un-placed
+ * canvas alpha-overs the workspace backdrop), then walks the layer list in
+ * order, scale-blitting each zone layer's view-v tile to the zone rect inside
+ * the slot's view-v tile and replicating each Local-2D layer into every view
+ * tile at its rect (identical position per view ⟹ zero disparity ⟹ reads
+ * flat after the whole-panel weave; in zones frames Local-2D is pure 2D
+ * content, no implicit mask). Zone / Local-2D rects are client-window pixels;
+ * the canvas (window client area) maps onto the slot by a downscale-only
+ * factor, and the resulting content dims feed the same slot bookkeeping the
+ * projection path uses. The in-process model is comp_d3d11_renderer's
+ * XRT_LAYER_ZONE_3D case. The wish stays on the tier-1 global fallback here
+ * (workspace wish is INERT in v1 per ADR-027; the standalone wish-over-IPC
+ * publish is a scope-split follow-up).
+ *
+ * Caller MUST hold sys->render_mutex — the shader blits run on the immediate
+ * context from the commit thread and would otherwise race the capture-render
+ * thread's combined-atlas pass. Source acquires are all-or-nothing: any
+ * failed acquire skips the whole pass (returns false; the tile keeps last
+ * frame's composite) rather than clearing and blitting a partial set.
+ *
+ * Returns true with the canvas-derived content dims when the composite ran.
+ */
+static bool
+service_composite_zones_frame(struct d3d11_service_system *sys,
+                              struct d3d11_service_compositor *c,
+                              bool projection_rendered,
+                              uint32_t *out_content_view_w,
+                              uint32_t *out_content_view_h)
+{
+	if (c->render.atlas_texture == nullptr || c->render.atlas_rtv == nullptr ||
+	    sys->blit_vs == nullptr || sys->blit_ps == nullptr) {
+		return false;
+	}
+
+	// Slot stride from the per-client atlas dims — the same
+	// `atlas / tile_columns` formula the projection blit and the multi-comp
+	// read use (`feedback_atlas_stride_invariant`).
+	D3D11_TEXTURE2D_DESC atlas_desc = {};
+	c->render.atlas_texture->GetDesc(&atlas_desc);
+	uint32_t tc = sys->tile_columns > 0 ? sys->tile_columns : 1;
+	uint32_t tr = sys->tile_rows > 0 ? sys->tile_rows : 1;
+	uint32_t slot_w = atlas_desc.Width / tc;
+	uint32_t slot_h = atlas_desc.Height / tr;
+	if (slot_w == 0 || slot_h == 0) {
+		return false;
+	}
+
+	// Zones canvas = the client window's client area (zone / Local-2D rects
+	// are client-window pixels and the composited tile reconstructs the full
+	// window). Fallback when there is no HWND (hosted/texture clients): the
+	// bounding box of all placed rects.
+	uint32_t canvas_w = 0;
+	uint32_t canvas_h = 0;
+	HWND canvas_hwnd = c->render.hwnd != nullptr ? c->render.hwnd : c->app_hwnd;
+	RECT client_rect = {};
+	if (canvas_hwnd != nullptr && IsWindow(canvas_hwnd) && GetClientRect(canvas_hwnd, &client_rect)) {
+		canvas_w = static_cast<uint32_t>(client_rect.right - client_rect.left);
+		canvas_h = static_cast<uint32_t>(client_rect.bottom - client_rect.top);
+	}
+	if (canvas_w == 0 || canvas_h == 0) {
+		int32_t max_r = 0;
+		int32_t max_b = 0;
+		for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+			const struct xrt_layer_data *ld = &c->layer_accum.layers[i].data;
+			const struct xrt_rect *r = nullptr;
+			if (ld->type == XRT_LAYER_ZONE_3D) {
+				r = &ld->zone_3d.rect;
+			} else if (ld->type == XRT_LAYER_LOCAL_2D) {
+				r = &ld->local_2d.rect;
+			}
+			if (r == nullptr) {
+				continue;
+			}
+			if (r->offset.w + (int32_t)r->extent.w > max_r) {
+				max_r = r->offset.w + (int32_t)r->extent.w;
+			}
+			if (r->offset.h + (int32_t)r->extent.h > max_b) {
+				max_b = r->offset.h + (int32_t)r->extent.h;
+			}
+		}
+		canvas_w = max_r > 0 ? (uint32_t)max_r : 0;
+		canvas_h = max_b > 0 ? (uint32_t)max_b : 0;
+	}
+	if (canvas_w == 0 || canvas_h == 0) {
+		return false;
+	}
+
+	// Window px → slot px, downscale only: content can be smaller than the
+	// slot but never larger (same rule as the projection blit's clamp).
+	float scale = 1.0f;
+	if ((float)canvas_w > (float)slot_w) {
+		scale = (float)slot_w / (float)canvas_w;
+	}
+	if ((float)canvas_h * scale > (float)slot_h) {
+		scale = (float)slot_h / (float)canvas_h;
+	}
+	uint32_t content_w = (uint32_t)((float)canvas_w * scale + 0.5f);
+	uint32_t content_h = (uint32_t)((float)canvas_h * scale + 0.5f);
+	if (content_w > slot_w) content_w = slot_w;
+	if (content_h > slot_h) content_h = slot_h;
+
+	uint32_t view_count_cap = sys->hardware_display_3d ? (tc * tr) : 1;
+	if (view_count_cap > XRT_MAX_VIEWS) {
+		view_count_cap = XRT_MAX_VIEWS;
+	}
+
+	uint64_t fence_signaled = c->workspace_sync_fence
+	    ? c->last_signaled_fence_value.load(std::memory_order_acquire)
+	    : 0;
+	bool use_fence_path = c->workspace_sync_fence && fence_signaled != 0;
+	bool fence_wait_queued = false;
+
+	struct zones_acquired_image acquired[XRT_MAX_LAYERS * XRT_MAX_VIEWS];
+	uint32_t acquired_count = 0;
+
+	// Acquire EVERY source image up front, all-or-nothing: the composite
+	// clears the tile before blitting, so a per-view skip would flash that
+	// placement black for a frame (visible blink). Skipping the whole pass
+	// instead keeps last frame's composited tile — the same stale-reuse
+	// semantics the projection path gets from its persistent slot.
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+		uint32_t need_views = 0;
+		if (layer->data.type == XRT_LAYER_ZONE_3D) {
+			need_views = layer->data.view_count;
+			if (need_views > view_count_cap) {
+				need_views = view_count_cap;
+			}
+		} else if (layer->data.type == XRT_LAYER_LOCAL_2D) {
+			need_views = 1;
+		} else {
+			continue;
+		}
+		for (uint32_t v = 0; v < need_views; v++) {
+			struct xrt_swapchain *xsc = layer->sc_array[v];
+			if (xsc == nullptr) {
+				continue;
+			}
+			struct d3d11_service_swapchain *sc = d3d11_service_swapchain_from_xrt(xsc);
+			uint32_t img = layer->data.type == XRT_LAYER_ZONE_3D
+			    ? layer->data.zone_3d.proj.v[v].sub.image_index
+			    : layer->data.local_2d.sub.image_index;
+			if (img >= sc->image_count || sc->images[img].srv == nullptr) {
+				continue;
+			}
+			if (!zones_acquire_image(sys, c, sc, img, use_fence_path, fence_signaled,
+			                         &fence_wait_queued, acquired, &acquired_count,
+			                         ARRAY_SIZE(acquired))) {
+				for (uint32_t a = 0; a < acquired_count; a++) {
+					acquired[a].sc->images[acquired[a].img].keyed_mutex->ReleaseSync(0);
+				}
+				return false;
+			}
+		}
+	}
+
+	// Transparent-slot semantics — cleared only now that every source is
+	// safely acquired. A mixed frame (a projection layer already blitted
+	// this commit) skips the clear and composites the placed layers over
+	// the full-tile content instead.
+	if (!projection_rendered) {
+		float clear_rgba[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+		sys->context->ClearRenderTargetView(c->render.atlas_rtv.get(), clear_rgba);
+	}
+
+	uint32_t zone_count = 0;
+	uint32_t local2d_count = 0;
+	uint32_t blits_done = 0;
+	uint32_t views_skipped = 0;
+	bool src_format_recorded = false;
+
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+
+		if (layer->data.type == XRT_LAYER_ZONE_3D) {
+			const struct xrt_rect *zr = &layer->data.zone_3d.rect;
+			float dst_w = (float)zr->extent.w * scale;
+			float dst_h = (float)zr->extent.h * scale;
+			if (dst_w <= 0.0f || dst_h <= 0.0f) {
+				continue;
+			}
+			ID3D11BlendState *blend =
+			    (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0
+			        ? sys->blend_alpha.get()
+			        : sys->blend_premul.get();
+			uint32_t vc = layer->data.view_count;
+			if (vc > view_count_cap) {
+				vc = view_count_cap;
+			}
+			for (uint32_t v = 0; v < vc; v++) {
+				struct xrt_swapchain *xsc = layer->sc_array[v];
+				if (xsc == nullptr) {
+					views_skipped++;
+					continue;
+				}
+				struct d3d11_service_swapchain *sc = d3d11_service_swapchain_from_xrt(xsc);
+				uint32_t img = layer->data.zone_3d.proj.v[v].sub.image_index;
+				if (img >= sc->image_count || sc->images[img].srv == nullptr) {
+					views_skipped++;
+					continue;
+				}
+				if (!zones_acquire_image(sys, c, sc, img, use_fence_path, fence_signaled,
+				                         &fence_wait_queued, acquired, &acquired_count,
+				                         ARRAY_SIZE(acquired))) {
+					views_skipped++;
+					continue;
+				}
+				D3D11_TEXTURE2D_DESC sd = {};
+				sc->images[img].texture->GetDesc(&sd);
+				// Mixed frames keep the projection layer's flag — it owns
+				// the bulk of the atlas bytes.
+				if (!src_format_recorded && !projection_rendered) {
+					src_format_recorded = true;
+					c->atlas_holds_srgb_bytes = is_srgb_format(sd.Format);
+				}
+				wil::com_ptr<ID3D11ShaderResourceView> srgb_srv;
+				bool srgb_blit = false;
+				ID3D11ShaderResourceView *src_srv =
+				    zones_resolve_src_srv(sys, sc, img, &sd, srgb_srv, &srgb_blit);
+				uint32_t tile_x, tile_y;
+				u_tiling_view_origin(v, tc, slot_w, slot_h, &tile_x, &tile_y);
+				const struct xrt_rect *sr = &layer->data.zone_3d.proj.v[v].sub.rect;
+				blit_to_atlas_texture(sys, &c->render, src_srv,
+				    (float)sr->offset.w, (float)sr->offset.h,
+				    (float)sr->extent.w, (float)sr->extent.h,
+				    (float)sd.Width, (float)sd.Height,
+				    (float)tile_x + (float)zr->offset.w * scale,
+				    (float)tile_y + (float)zr->offset.h * scale,
+				    dst_w, dst_h,
+				    srgb_blit, blend);
+				blits_done++;
+			}
+			if (layer->data.flip_y) {
+				c->atlas_flip_y = true;
+			}
+			zone_count++;
+		} else if (layer->data.type == XRT_LAYER_LOCAL_2D) {
+			const struct xrt_rect *lr = &layer->data.local_2d.rect;
+			float dst_w = (float)lr->extent.w * scale;
+			float dst_h = (float)lr->extent.h * scale;
+			if (dst_w <= 0.0f || dst_h <= 0.0f) {
+				continue;
+			}
+			struct xrt_swapchain *xsc = layer->sc_array[0];
+			if (xsc == nullptr) {
+				continue;
+			}
+			struct d3d11_service_swapchain *sc = d3d11_service_swapchain_from_xrt(xsc);
+			uint32_t img = layer->data.local_2d.sub.image_index;
+			if (img >= sc->image_count || sc->images[img].srv == nullptr) {
+				continue;
+			}
+			if (!zones_acquire_image(sys, c, sc, img, use_fence_path, fence_signaled,
+			                         &fence_wait_queued, acquired, &acquired_count,
+			                         ARRAY_SIZE(acquired))) {
+				continue;
+			}
+			D3D11_TEXTURE2D_DESC sd = {};
+			sc->images[img].texture->GetDesc(&sd);
+			wil::com_ptr<ID3D11ShaderResourceView> srgb_srv;
+			bool srgb_blit = false;
+			ID3D11ShaderResourceView *src_srv =
+			    zones_resolve_src_srv(sys, sc, img, &sd, srgb_srv, &srgb_blit);
+			ID3D11BlendState *blend =
+			    (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0
+			        ? sys->blend_alpha.get()
+			        : sys->blend_premul.get();
+			const struct xrt_rect *sr = &layer->data.local_2d.sub.rect;
+			for (uint32_t v = 0; v < view_count_cap; v++) {
+				uint32_t tile_x, tile_y;
+				u_tiling_view_origin(v, tc, slot_w, slot_h, &tile_x, &tile_y);
+				blit_to_atlas_texture(sys, &c->render, src_srv,
+				    (float)sr->offset.w, (float)sr->offset.h,
+				    (float)sr->extent.w, (float)sr->extent.h,
+				    (float)sd.Width, (float)sd.Height,
+				    (float)tile_x + (float)lr->offset.w * scale,
+				    (float)tile_y + (float)lr->offset.h * scale,
+				    dst_w, dst_h,
+				    srgb_blit, blend);
+				blits_done++;
+			}
+			if (layer->data.flip_y) {
+				c->atlas_flip_y = true;
+			}
+			local2d_count++;
+		}
+	}
+
+	// Release every cross-process mutex the pass acquired.
+	for (uint32_t a = 0; a < acquired_count; a++) {
+		acquired[a].sc->images[acquired[a].img].keyed_mutex->ReleaseSync(0);
+	}
+
+	// One-shot breadcrumb so a bug report shows the composite geometry.
+	static bool composite_logged = false;
+	if (!composite_logged) {
+		composite_logged = true;
+		U_LOG_W("ZONES SVC: first zones-frame composite, canvas=%ux%u scale=%.3f zones=%u local2d=%u "
+		        "slot=%ux%u content=%ux%u blits=%u skipped=%u workspace=%d",
+		        canvas_w, canvas_h, scale, zone_count, local2d_count,
+		        slot_w, slot_h, content_w, content_h, blits_done, views_skipped,
+		        sys->workspace_mode ? 1 : 0);
+	}
+
+	*out_content_view_w = content_w;
+	*out_content_view_h = content_h;
+	return true;
+}
+
+
 static xrt_result_t
 compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -8665,9 +9142,13 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 	// Pre-compute whether there are UI overlay layers (quad/cylinder/equirect/cube)
 	// or window-space layers. Either disables zero-copy because we must blit on
-	// top of the projection content.
+	// top of the projection content. Zone-3D / Local-2D layers
+	// (XR_EXT_display_zones, #549) likewise force the atlas path — the
+	// placed-layer composite has no zero-copy equivalent.
 	bool has_ui_layers = false;
 	bool has_window_space_layers = false;
+	bool zones_frame = false;
+	bool has_local_2d = false;
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		switch (c->layer_accum.layers[i].data.type) {
 		case XRT_LAYER_QUAD:
@@ -8680,16 +9161,24 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		case XRT_LAYER_WINDOW_SPACE:
 			has_window_space_layers = true;
 			break;
+		case XRT_LAYER_ZONE_3D:
+			zones_frame = true;
+			break;
+		case XRT_LAYER_LOCAL_2D:
+			has_local_2d = true;
+			break;
 		default:
 			break;
 		}
-		if (has_ui_layers && has_window_space_layers) break;
 	}
 
 	// Track zero-copy optimization: when all views are rendered into the same
 	// swapchain texture with matching tiling layout, skip the blit and pass the
 	// app's texture directly to the display processor.
 	bool use_zero_copy = false;
+	// Whether a projection layer actually reached the per-client atlas this
+	// commit — decides the zones composite's transparent-slot clear (#549).
+	bool projection_rendered = false;
 	wil::com_ptr<ID3D11ShaderResourceView> zc_srv;
 	ID3D11Texture2D *zc_tex = nullptr;
 	uint32_t zc_view_w = 0, zc_view_h = 0;
@@ -8825,6 +9314,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			view_is_srgb[eye] = is_srgb_format(view_descs[eye].Format);
 		}
 		if (!views_valid) continue;
+		projection_rendered = true;
 
 		// Phase 1 Task 1.2 — drop service-thread KeyedMutex timeout from
 		// 100 ms to a frame-budget value (4 ms, matching the chrome-overlay
@@ -9074,10 +9564,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		if (proj_view_count <= 1) zc_reason = "single_view";
 		else if (has_ui_layers) zc_reason = "ui_layers";
 		else if (has_window_space_layers) zc_reason = "window_space_layers";
+		else if (zones_frame || has_local_2d) zc_reason = "zones_layers";
 		else if (!all_views_zc_eligible) zc_reason = "view_ineligible";
 		else if (sys->workspace_mode) zc_reason = "workspace_mode";
 
-		if (proj_view_count > 1 && !has_ui_layers && !has_window_space_layers && all_views_zc_eligible && !sys->workspace_mode) {
+		if (proj_view_count > 1 && !has_ui_layers && !has_window_space_layers && !zones_frame && !has_local_2d &&
+		    all_views_zc_eligible && !sys->workspace_mode) {
 			// Check all views reference the same swapchain image
 			bool all_same = true;
 			for (uint32_t eye = 1; eye < proj_view_count; eye++) {
@@ -9395,48 +9887,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// projection layer share a swapchain format in practice; pick view 0.
 		c->atlas_holds_srgb_bytes = view_is_srgb[0];
 
-		// Store content dims on multi-comp slot for multi_compositor_render.
-		// Also flip `has_first_frame_committed` on the false→true transition
-		// so the slot starts compositing only once Chrome (or any IPC client)
-		// has actually submitted content. Without this, the multi-comp would
-		// draw the slot with uninitialized atlas content for the 2-3s while
-		// Chrome's WebGL is initializing — visible as a black rectangle.
-		// Mirrors the capture-client `capture_srv` readiness gate.
-		if (sys->workspace_mode && sys->multi_comp != nullptr) {
-			for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
-				if (sys->multi_comp->clients[s].active &&
-				    sys->multi_comp->clients[s].compositor == c) {
-					struct d3d11_multi_client_slot *slot =
-					    &sys->multi_comp->clients[s];
-					slot->content_view_w = content_view_w;
-					slot->content_view_h = content_view_h;
-
-					// Snapshot per-slot stride for the workspace
-					// per-tile blit (#234, Issue 3). Same formula
-					// the clamp at L11385 uses — write/clamp/read
-					// must agree, and capturing here keeps the slot
-					// self-consistent even when sys->tile_columns
-					// flips ahead of this slot's next commit.
-					if (c->render.atlas_texture) {
-						D3D11_TEXTURE2D_DESC sc_desc = {};
-						c->render.atlas_texture->GetDesc(&sc_desc);
-						uint32_t tc = sys->tile_columns > 0 ? sys->tile_columns : 1;
-						uint32_t tr = sys->tile_rows > 0 ? sys->tile_rows : 1;
-						slot->blit_slot_w = sc_desc.Width / tc;
-						slot->blit_slot_h = sc_desc.Height / tr;
-						slot->blit_tile_columns = tc;
-						slot->blit_tile_rows = tr;
-					}
-
-					if (!slot->has_first_frame_committed) {
-						slot->has_first_frame_committed = true;
-						slot->first_frame_ns =
-						    os_monotonic_get_ns();
-					}
-					break;
-				}
-			}
-		}
+		// Store content dims on multi-comp slot for multi_compositor_render
+		// (readiness gate + per-slot stride snapshot — see the helper).
+		service_update_slot_content_dims(sys, c, content_view_w, content_view_h);
 
 		// Release KeyedMutex after reading
 		for (uint32_t eye = 0; eye < proj_view_count; eye++) {
@@ -9449,6 +9902,33 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	}
 
 	profile_s2 = os_monotonic_get_ns(); // Phase 5a — end of projection-layer loop.
+
+	// XR_EXT_display_zones (#549): placed-layer composite into the
+	// per-client atlas slot. A pure zones frame (no projection layer) also
+	// drives the content dims + slot readiness bookkeeping from here — the
+	// projection loop never ran, and without this the workspace slot never
+	// flips has_first_frame_committed (spinner forever).
+	//
+	// Under sys->render_mutex: the composite drives the full shader-blit
+	// state machine (Map on the shared blit_constant_buffer, RTV binds,
+	// draws) on the immediate context from this commit thread, racing the
+	// capture-render thread's combined-atlas pass — the same contention
+	// that forced WINDOW_SPACE layers onto the render thread. Unserialized
+	// this corrupts both passes' constants/state (black/blinking tiles)
+	// and can crash the service. recursive_mutex, so a caller already
+	// holding it is fine.
+	if (zones_frame || has_local_2d) {
+		std::lock_guard<std::recursive_mutex> zones_render_lock(sys->render_mutex);
+		uint32_t zones_content_w = 0;
+		uint32_t zones_content_h = 0;
+		if (service_composite_zones_frame(sys, c, projection_rendered,
+		                                  &zones_content_w, &zones_content_h) &&
+		    !projection_rendered) {
+			content_view_w = zones_content_w;
+			content_view_h = zones_content_h;
+			service_update_slot_content_dims(sys, c, content_view_w, content_view_h);
+		}
+	}
 
 	// Render UI layers if any exist and shaders are ready
 	if (has_ui_layers && sys->quad_vs) {
@@ -9613,6 +10093,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			slot_snap->ws_snapshot_count = 0;
 			uint32_t snap_n = 0;
 			bool saw_projection = false;
+			bool saw_zone = false;
 			for (uint32_t i = 0;
 			     i < c->layer_accum.layer_count && snap_n < XRT_MAX_LAYERS;
 			     i++) {
@@ -9637,6 +10118,37 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					// XrEventDataRenderingModeChangedEXT.
 					uint32_t got_w = l->data.proj.v[0].sub.rect.extent.w;
 					uint32_t got_h = l->data.proj.v[0].sub.rect.extent.h;
+					slot_snap->last_commit_view_w = got_w;
+					slot_snap->last_commit_view_h = got_h;
+					struct d3d11_multi_compositor *mc_ack = sys->multi_comp;
+					if (mc_ack != nullptr &&
+					    mc_ack->mode_flip.phase == MFP_WAITING_ACK &&
+					    !slot_snap->acked_target_mode) {
+						if (slot_snap->pre_flip_view_w != got_w ||
+						    slot_snap->pre_flip_view_h != got_h) {
+							slot_snap->acked_target_mode = true;
+						}
+					}
+				}
+				// XR_EXT_display_zones (#549): a pure zones frame has no
+				// projection layer — source the slot's blend flags + the
+				// acked-flip extents from the first zone layer instead (a
+				// later projection layer still overwrites the flags). The
+				// flags are SYNTHESIZED premultiplied alpha-over, not the
+				// layer's own: the zones composite leaves the un-placed
+				// canvas premultiplied transparent, so the workspace tile
+				// blit must blend against the backdrop regardless of how
+				// the zone content itself was declared. Without the ack
+				// leg a workspace mode flip stalls forever waiting on the
+				// zones client.
+				if (l->data.type == XRT_LAYER_ZONE_3D && !saw_projection && !saw_zone) {
+					saw_zone = true;
+					slot_snap->projection_flags_snapshot =
+					    XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+					slot_snap->projection_flags_valid = true;
+
+					uint32_t got_w = l->data.zone_3d.proj.v[0].sub.rect.extent.w;
+					uint32_t got_h = l->data.zone_3d.proj.v[0].sub.rect.extent.h;
 					slot_snap->last_commit_view_w = got_w;
 					slot_snap->last_commit_view_h = got_h;
 					struct d3d11_multi_compositor *mc_ack = sys->multi_comp;
