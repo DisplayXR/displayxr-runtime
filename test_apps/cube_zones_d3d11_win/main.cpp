@@ -637,21 +637,20 @@ static void TryActivateZones(XrSessionManager& xr, D3D11Renderer& renderer) {
     g_zonesArr[0].clearColor[3] = 1.0f;
 
     // Zone B: right. Reduced view spread + flattened perspective (visibly
-    // different framing), phase +1.5 rad, SEMI-TRANSPARENT dark-blue clear
-    // (premultiplied, alpha 0.55): zones composite alpha-over in layer-list
-    // order with blends expressed through CONTENT alpha (ADR-027 rule 4) —
-    // an opaque background would make the overlap a plain replacement. The
-    // cube itself stays opaque; the background lets zone A (and the desktop,
-    // when not overlapping) show through.
+    // different framing), phase +1.5 rad, FULLY TRANSPARENT clear (premultiplied
+    // RGBA all-zero): the cube floats over the LIVE desktop — the alpha-gate
+    // punches every all-views-α==0 pixel in this zone through to DWM (#551). The
+    // cube itself stays opaque; everything around it is see-through. (Contrast
+    // zone A's opaque tint, which marks its boundary.)
     g_zonesArr[1].zoneId = 2;
     g_zonesArr[1].rect = g_zoneBOverlap ? kZoneBOverlapRect : kZoneBRect;
     g_zonesArr[1].ipdFactor = 0.6f;
     g_zonesArr[1].perspectiveFactor = 0.5f;
     g_zonesArr[1].spinPhase = 1.5f;
-    g_zonesArr[1].clearColor[0] = 0.03f * 0.55f;
-    g_zonesArr[1].clearColor[1] = 0.03f * 0.55f;
-    g_zonesArr[1].clearColor[2] = 0.15f * 0.55f;
-    g_zonesArr[1].clearColor[3] = 0.55f;
+    g_zonesArr[1].clearColor[0] = 0.0f;
+    g_zonesArr[1].clearColor[1] = 0.0f;
+    g_zonesArr[1].clearColor[2] = 0.0f;
+    g_zonesArr[1].clearColor[3] = 0.0f;
 
     for (uint32_t zi = 0; zi < kNumZones; zi++) {
         if (!CreateZoneResources(xr, renderer, g_zonesArr[zi], viewCount)) {
