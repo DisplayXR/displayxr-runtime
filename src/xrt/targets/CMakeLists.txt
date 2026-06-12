@@ -27,6 +27,12 @@ if(XRT_FEATURE_SERVICE AND XRT_FEATURE_OPENXR)
 	endif()
 endif()
 
+# Android diagnostics dashboard JNI bridge (#558) — reuses the CLI's
+# query core, so it needs targets/cli configured.
+if(ANDROID AND XRT_MODULE_CLI)
+	add_subdirectory(diag-lib)
+endif()
+
 # DisplayXR Windows components
 if(WIN32)
 	# (The standalone DisplayXRSwitcher was retired in #378 — its

@@ -26,6 +26,7 @@
 typedef struct cJSON cJSON;
 
 struct xrt_instance;
+struct xrt_instance_info;
 struct xrt_system;
 struct xrt_system_devices;
 struct xrt_space_overseer;
@@ -137,10 +138,12 @@ cli_query_run(struct cli_query_result *out);
 /*!
  * As @ref cli_query_run but leaves the runtime objects alive in @p h; pair
  * with @ref cli_query_teardown. The snapshot in @p out is self-contained
- * either way (no pointers into the live objects).
+ * either way (no pointers into the live objects). @p ii is optional (NULL
+ * on desktop); Android callers must pass one carrying vm + context —
+ * android_instance_base_init dereferences it.
  */
 void
-cli_query_fill(struct cli_query_result *out, struct cli_query_handles *h);
+cli_query_fill(struct cli_query_result *out, struct cli_query_handles *h, const struct xrt_instance_info *ii);
 
 void
 cli_query_teardown(struct cli_query_handles *h);
