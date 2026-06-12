@@ -126,6 +126,17 @@ The app is responsible for its own strategy:
 - Call `xrRequestDisplayRenderingModeEXT(3D_mode)` to resume
 - Animate convergence/IPD back to tracked values
 
+**Recommended transition shape (ADR-028, #542):** the hardware-state override
+`xrRequestDisplayModeEXT(XR_DISPLAY_MODE_2D_EXT)` lets the app drop the panel
+flat **immediately** on loss — for viewer comfort — without changing the
+rendering mode or its own content. The DP keeps weaving the still-stereo
+atlas (the panel shows it flat/blurry), and as the app fades its parallax to
+zero the woven image converges back to sharp. Once converged, the app
+requests the 2D rendering mode (which clears the override) and submits a
+single full-resolution tile. On recovery, the reverse composes the same way:
+request the 3D mode, override to 2D if a soft ramp-in is wanted, fade
+parallax up, then release the override (or simply re-request the mode).
+
 ### What the app sees: MANAGED vs MANUAL comparison
 
 | Aspect | MANAGED | MANUAL |
