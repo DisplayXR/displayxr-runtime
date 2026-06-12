@@ -4,11 +4,12 @@ setlocal enabledelayedexpansion
 :: ============================================================
 :: DisplayXR Local Build Script
 :: Downloads all dependencies on first run, then builds.
-:: Usage: scripts\build_windows.bat [generate|build|installer|test-apps|all]
-::   generate   - CMake generate only
+:: Usage: scripts\build_windows.bat [generate|build|installer|test-apps|vs2022|all]
+::   generate   - CMake generate only (Ninja Multi-Config)
 ::   build      - Build runtime + install
 ::   installer  - Build runtime installer
 ::   test-apps  - Build all test apps
+::   vs2022     - Generate Visual Studio 2022 solution (build_vs2022\XRT.sln)
 ::   all        - Everything (default)
 ::
 :: The DisplayXR Shell ships from a separate repo. Installer download:
@@ -140,6 +141,7 @@ echo.
 if "%TARGET%"=="build" if exist "%REPO%build\build.ninja" goto :do_build
 if "%TARGET%"=="installer" if exist "%REPO%build\build.ninja" goto :do_installer
 if "%TARGET%"=="test-apps" goto :do_test_apps
+if "%TARGET%"=="vs2022" goto :do_vs2022
 
 echo === CMake Generate ===
 cmake -S "%REPO%." -B "%REPO%build" -G "Ninja Multi-Config" ^
@@ -416,6 +418,30 @@ echo Run scripts generated in %PKG%\
 
 echo.
 echo === Test apps done ===
+goto :done
+
+:do_vs2022
+echo.
+echo === Generating Visual Studio 2022 solution ===
+cmake -S "%REPO%." -B "%REPO%build_vs2022" -G "Visual Studio 17 2022" -A x64 ^
+  -DCMAKE_TOOLCHAIN_FILE="%REPO%vcpkg\scripts\buildsystems\vcpkg.cmake" ^
+  -DVCPKG_MANIFEST_FEATURES=gui ^
+  -DCMAKE_INSTALL_PREFIX="%REPO%_package" ^
+  -DXRT_BUILD_INSTALLER=ON ^
+  -DXRT_FEATURE_SERVICE=ON ^
+  -DXRT_FEATURE_HYBRID_MODE=ON ^
+  -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
+
+if %ERRORLEVEL% NEQ 0 (
+    echo VS2022 CMake generate FAILED
+    exit /b 1
+)
+
+echo.
+echo === Visual Studio 2022 solution ready ===
+echo   Solution: %REPO%build_vs2022\XRT.sln
+echo   Open it in Visual Studio 2022 and build the ALL_BUILD or INSTALL target.
+goto :done
 
 :done
 echo.
