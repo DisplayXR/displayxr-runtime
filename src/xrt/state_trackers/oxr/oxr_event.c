@@ -418,7 +418,9 @@ oxr_event_push_XrEventDataRenderingModeChanged(struct oxr_logger *log,
 	changed->currentModeIndex = currentModeIndex;
 	event->result = XR_SUCCESS;
 
-	U_LOG_I("OXR EVENT: Rendering mode changed %u -> %u", previousModeIndex, currentModeIndex);
+	// WARN (not INFO): rare lifecycle event, and the file sink drops INFO
+	// past init — this line is the proof a mode flip reached the client.
+	U_LOG_W("OXR EVENT: Rendering mode changed %u -> %u", previousModeIndex, currentModeIndex);
 
 	lock(inst);
 	push(inst, event);
