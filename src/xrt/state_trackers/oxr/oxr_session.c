@@ -3445,6 +3445,28 @@ oxr_session_create(struct oxr_logger *log,
 		}
 		if (target_info->transparentBackgroundEnabled) {
 			xsi.transparent_background_enabled = true;
+			// #551: exclude the app window from the vendor DP's WGC desktop
+			// capture so the DP composites its weave over the desktop BEHIND
+			// the window (compose-under-bg), not the window's own content.
+			// SetWindowDisplayAffinity must run in the window-OWNING process —
+			// the OpenXR layer runs in the app's process, so this works even
+			// when the DP runs out-of-process in the service for an IPC client
+			// (there the service-side DP gets ACCESS_DENIED and detects this
+			// pre-set affinity instead of falling back to chroma-key, #551).
+			// WDA_EXCLUDEFROMCAPTURE needs Win10 2004+; on older OS the call
+			// fails and the DP keeps chroma-key — graceful.
+			if (target_info->windowHandle) {
+#ifndef WDA_EXCLUDEFROMCAPTURE
+#define WDA_EXCLUDEFROMCAPTURE 0x00000011
+#endif
+				if (!SetWindowDisplayAffinity((HWND)target_info->windowHandle,
+				                              WDA_EXCLUDEFROMCAPTURE)) {
+					U_LOG_W(
+					    "xrCreateSession: SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) "
+					    "failed (err=%lu) — DP compose-under-bg may fall back to chroma-key",
+					    (unsigned long)GetLastError());
+				}
+			}
 		}
 		if (target_info->chromaKeyColor != 0) {
 			xsi.chroma_key_color = target_info->chromaKeyColor;
