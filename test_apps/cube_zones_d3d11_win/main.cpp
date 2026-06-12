@@ -997,8 +997,17 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
             continue;
         }
 
-        // (parenthesized call — windows.h min/max macros are active in this TU)
-        const uint32_t n = (std::min)(viewCountOutput, z.tileCount);
+        // xrLocateViews always reports the MAX view count (identical centered
+        // views in a mono mode) — a well-behaved extension app submits only
+        // the ACTIVE mode's view count (#542: 1 tile in a 2D mode; the
+        // runtime clamps over-submission to the mode regardless, this is the
+        // proper app-side behavior).
+        // (parenthesized calls — windows.h min/max macros are active in this TU)
+        uint32_t activeViewCount = viewCountOutput;
+        if (xr.renderingModeCount > 0 && xr.currentModeIndex < xr.renderingModeCount) {
+            activeViewCount = xr.renderingModeViewCounts[xr.currentModeIndex];
+        }
+        const uint32_t n = (std::min)((std::min)(viewCountOutput, z.tileCount), activeViewCount);
         submitViewCounts[zi] = n;
         projViews[zi].assign(n, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
 
