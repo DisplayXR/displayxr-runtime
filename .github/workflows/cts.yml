@@ -58,7 +58,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout repository and submodules
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: recursive
           lfs: true
@@ -133,7 +133,7 @@ jobs:
       # layers) pinned to the loader version. Cached on the harness script hash.
       - name: Cache CTS build
         id: cts-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: build-cts
           key: cts-${{ runner.os }}-${{ hashFiles('scripts/fetch_build_cts.bat') }}-1.1.43
@@ -193,7 +193,7 @@ jobs:
 
       - name: Upload CTS results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: cts-${{ steps.params.outputs.scope }}-${{ steps.params.outputs.graphics }}
           path: |

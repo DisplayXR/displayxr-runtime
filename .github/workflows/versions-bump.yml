@@ -83,7 +83,7 @@ jobs:
 
       - name: Mint App installation token
         id: app-token
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.DISPLAYXR_APP_ID }}
           private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
@@ -97,7 +97,7 @@ jobs:
             displayxr-website
 
       - name: Checkout main
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: main
           token: ${{ steps.app-token.outputs.token }}
@@ -256,7 +256,7 @@ jobs:
       - name: Notify website to resync
         if: hashFiles('.bump-noop') == '' && (steps.inputs.outputs.field != 'leia_plugin' || steps.abi.outputs.rc == '0')
         continue-on-error: true
-        uses: peter-evans/repository-dispatch@v3
+        uses: peter-evans/repository-dispatch@v4
         with:
           token: ${{ steps.app-token.outputs.token }}
           repository: DisplayXR/displayxr-website

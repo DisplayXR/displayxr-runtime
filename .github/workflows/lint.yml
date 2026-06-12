@@ -35,7 +35,7 @@ jobs:
   shell-path-guard:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: No shell source in runtime tree
         run: |
@@ -60,7 +60,7 @@ jobs:
   vendor-docs-guard:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: No vendor internals docs in runtime tree
         run: |
