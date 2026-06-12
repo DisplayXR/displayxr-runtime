@@ -331,10 +331,20 @@ struct xrt_display_processor_d3d11
 	 * slot or NULL ⟹ the runtime falls back to set_chroma_key. Appended per
 	 * ADR-020 (append-only within a major).
 	 *
-	 * @param xdp      Pointer to self.
-	 * @param enabled  true to composite over the captured desktop.
+	 * @param xdp             Pointer to self.
+	 * @param enabled         true to produce transparent output for see-through.
+	 * @param client_presents true ⟹ the RUNTIME owns a transparent present that
+	 *                        DWM-blends the live desktop into alpha=0 holes (the
+	 *                        in-process transparent swap chain, or the #551
+	 *                        client-side IPC present). The DP must then NOT do
+	 *                        its own compose-under-bg (which would bake a stale
+	 *                        captured desktop and add a frame of lag) — it only
+	 *                        reconstructs alpha (the alpha-gate) so the present
+	 *                        can blend the live desktop. false ⟹ the DP owns
+	 *                        see-through itself (compose-under-bg / chroma-key)
+	 *                        because the final present is opaque.
 	 */
-	void (*set_transparent_background)(struct xrt_display_processor_d3d11 *xdp, bool enabled);
+	void (*set_transparent_background)(struct xrt_display_processor_d3d11 *xdp, bool enabled, bool client_presents);
 };
 
 /*
@@ -661,12 +671,14 @@ xrt_display_processor_d3d11_set_eye_tracking_mode(struct xrt_display_processor_d
  * @public @memberof xrt_display_processor_d3d11
  */
 static inline bool
-xrt_display_processor_d3d11_set_transparent_background(struct xrt_display_processor_d3d11 *xdp, bool enabled)
+xrt_display_processor_d3d11_set_transparent_background(struct xrt_display_processor_d3d11 *xdp,
+                                                       bool enabled,
+                                                       bool client_presents)
 {
 	if (!XRT_DP_HAS_SLOT(xdp, set_transparent_background) || xdp->set_transparent_background == NULL) {
 		return false;
 	}
-	xdp->set_transparent_background(xdp, enabled);
+	xdp->set_transparent_background(xdp, enabled, client_presents);
 	return true;
 }
 

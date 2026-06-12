@@ -398,6 +398,73 @@ comp_ipc_client_compositor_set_workspace_sync_fence_value(struct xrt_compositor 
 	icc->workspace_sync_fence_value = value;
 }
 
+xrt_result_t
+comp_ipc_client_compositor_get_transparent_output(struct xrt_compositor *xc,
+                                                  bool *out_have_output,
+                                                  uint32_t *out_width,
+                                                  uint32_t *out_height,
+                                                  uint64_t *out_hwnd,
+                                                  xrt_graphics_buffer_handle_t *out_handle)
+{
+	if (xc == NULL || out_have_output == NULL || out_width == NULL || out_height == NULL ||
+	    out_hwnd == NULL || out_handle == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_have_output = false;
+	*out_width = 0;
+	*out_height = 0;
+	*out_hwnd = 0;
+	*out_handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	bool have = false;
+	uint32_t w = 0, h = 0;
+	uint64_t wnd = 0;
+	xrt_graphics_buffer_handle_t handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	xrt_result_t xret =
+	    ipc_call_compositor_get_transparent_output(icc->ipc_c, &have, &w, &h, &wnd, &handle, 1);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	*out_have_output = have;
+	*out_width = w;
+	*out_height = h;
+	*out_hwnd = wnd;
+	*out_handle = handle;
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+comp_ipc_client_compositor_get_transparent_output_fence(struct xrt_compositor *xc,
+                                                        bool *out_have_fence,
+                                                        xrt_graphics_sync_handle_t *out_handle)
+{
+	if (xc == NULL || out_have_fence == NULL || out_handle == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_have_fence = false;
+	*out_handle = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	bool have = false;
+	xrt_graphics_sync_handle_t h = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+	xrt_result_t xret = ipc_call_compositor_get_transparent_output_fence(icc->ipc_c, &have, &h, 1);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	*out_have_fence = have;
+	*out_handle = h;
+	return XRT_SUCCESS;
+}
+
 
 /*
  * Workspace controller bridges — thin accessors used by the OpenXR state
