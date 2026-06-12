@@ -271,7 +271,6 @@ class DashboardActivity : AppCompatActivity() {
             return
         }
         val viewer = d.optJSONObject("viewer_m") ?: JSONObject()
-        val scale = d.optJSONObject("recommended_view_scale") ?: JSONObject()
         val isSim = info.optJSONObject("plugin")?.optString("id") == "sim-display"
         view.text =
             buildString {
@@ -283,9 +282,6 @@ class DashboardActivity : AppCompatActivity() {
                 append('\n')
                 append("viewer:   (%.3f, %.3f, %.3f) m".format(
                     viewer.optDouble("x"), viewer.optDouble("y"), viewer.optDouble("z")))
-                append('\n')
-                append("view scale: (%.3f, %.3f)".format(
-                    scale.optDouble("x"), scale.optDouble("y")))
             }
     }
 
@@ -305,6 +301,10 @@ class DashboardActivity : AppCompatActivity() {
                 .append(if (m.optBoolean("hardware_display_3d")) " 3D" else " 2D")
                 .append(if (m.optBoolean("has_tracking")) " tracked" else "")
                 .append(if (m.optBoolean("can_rotate")) " rotatable" else "")
+            val vs = m.optJSONObject("view_scale")
+            if (vs != null) {
+                sb.append(" scale=%.2f×%.2f".format(vs.optDouble("x"), vs.optDouble("y")))
+            }
             if (i < modes.length() - 1) sb.append('\n')
         }
         view.text = sb.toString()

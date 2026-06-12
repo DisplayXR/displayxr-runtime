@@ -394,7 +394,9 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	PT("pixels:       %ux%u\n", i->display_pixel_width, i->display_pixel_height);
 	PT("viewer:       (%.4f, %.4f, %.4f) m\n", (double)i->nominal_viewer_x_m, (double)i->nominal_viewer_y_m,
 	   (double)i->nominal_viewer_z_m);
-	PT("view scale:   (%.3f, %.3f)\n", (double)i->recommended_view_scale_x, (double)i->recommended_view_scale_y);
+	// Baseline hint only — the authoritative scale is per rendering mode (below).
+	PT("view scale:   (%.3f, %.3f) (baseline hint; see per-mode scale)\n", (double)i->recommended_view_scale_x,
+	   (double)i->recommended_view_scale_y);
 	PT("screen pos:   (%d, %d)\n", i->display_screen_left, i->display_screen_top);
 	char et_buf[64];
 	PT("eye-tracking: supported=%s (0x%x) default=%s\n",
@@ -403,10 +405,11 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	PT("modes:        %u\n", r->rendering_mode_count);
 	for (uint32_t m = 0; m < r->rendering_mode_count; m++) {
 		const struct xrt_rendering_mode *rm = &r->rendering_modes[m];
-		PT("  [%u] %-14s views=%u 3d=%c tracked=%c rot=%c\n", rm->mode_index, rm->mode_name, rm->view_count,
-		   rm->hardware_display_3d ? 'y' : 'n',
+		PT("  [%u] %-14s views=%u 3d=%c tracked=%c rot=%c scale=%.3fx%.3f\n", rm->mode_index, rm->mode_name,
+		   rm->view_count, rm->hardware_display_3d ? 'y' : 'n',
 		   (rm->mode_flags & XRT_RENDERING_MODE_FLAG_HAS_TRACKING) ? 'y' : 'n',
-		   (rm->mode_flags & XRT_RENDERING_MODE_FLAG_CAN_ROTATE) ? 'y' : 'n');
+		   (rm->mode_flags & XRT_RENDERING_MODE_FLAG_CAN_ROTATE) ? 'y' : 'n', (double)rm->view_scale_x,
+		   (double)rm->view_scale_y);
 	}
 
 	P(" :: Local zone caps (#224/ADR-027, headless D3D11 WARP probe)\n");
@@ -470,6 +473,9 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 			cJSON_AddBoolToObject(o, "has_tracking",
 			                      (rm->mode_flags & XRT_RENDERING_MODE_FLAG_HAS_TRACKING) != 0);
 			cJSON_AddBoolToObject(o, "can_rotate", (rm->mode_flags & XRT_RENDERING_MODE_FLAG_CAN_ROTATE) != 0);
+			cJSON *vs = cJSON_AddObjectToObject(o, "view_scale");
+			cJSON_AddNumberToObject(vs, "x", (double)rm->view_scale_x);
+			cJSON_AddNumberToObject(vs, "y", (double)rm->view_scale_y);
 			cJSON_AddItemToArray(rms, o);
 		}
 	} else {
