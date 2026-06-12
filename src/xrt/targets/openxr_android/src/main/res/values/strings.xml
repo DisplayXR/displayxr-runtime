@@ -6,4 +6,25 @@
 
 <resources>
     <string name="service_name">DisplayXR</string>
+
+    <!-- Diagnostics dashboard (#558) -->
+    <string name="diag_querying">Querying runtime…</string>
+    <string name="diag_query_failed">Query failed</string>
+    <string name="diag_query_timeout">Query timed out — vendor plug-in init/teardown hang? (see displayxr-leia-plugin#39)</string>
+    <string name="diag_card_selftest">Self-test</string>
+    <string name="diag_card_runtime">Runtime</string>
+    <string name="diag_card_plugin">Active plug-in</string>
+    <string name="diag_card_display">Display</string>
+    <string name="diag_card_modes">Rendering modes (advertised by DP)</string>
+    <string name="diag_card_eye_tracking">Eye tracking</string>
+    <string name="diag_card_live">Live service state</string>
+    <string name="diag_card_android">Android</string>
+    <string name="diag_btn_refresh">Refresh</string>
+    <string name="diag_btn_copy">Copy JSON</string>
+    <string name="diag_btn_share">Share report</string>
+    <string name="diag_btn_shutdown">Shut down runtime</string>
+    <string name="diag_flavor_in_process">in-process runtime</string>
+    <string name="diag_flavor_out_of_process">out-of-process runtime (service)</string>
+    <string name="diag_live_service_not_running">service not running</string>
+    <string name="diag_copied">Report JSON copied to clipboard</string>
 </resources>

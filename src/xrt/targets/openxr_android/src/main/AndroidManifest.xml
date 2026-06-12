@@ -70,6 +70,35 @@
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
 
+        <!--
+            Diagnostics dashboard (#558) replaces the shared android_common
+            AboutActivity as this APK's launcher: on-device displayxr-cli
+            info/selftest snapshot + live service state + the permission
+            fragments hosted as proper cards.
+        -->
+        <activity
+            android:name="org.freedesktop.monado.android_common.AboutActivity"
+            tools:node="remove" />
+        <activity
+            android:name=".DashboardActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+            The diag query runs in its own short-lived process: the native
+            side skips runtime teardown (vendor plug-in destroy can hang,
+            displayxr-leia-plugin#39) and the service self-kills after each
+            reply, so a hang can never wedge the dashboard.
+        -->
+        <service
+            android:name=".DiagQueryService"
+            android:exported="false"
+            android:process=":diag" />
+
         <!-- VR Listener service, for interop with Android VR mode. -->
         <service
             android:name="org.freedesktop.monado.android_common.MonadoVrListener"

@@ -330,7 +330,10 @@ android {
             // as libdxrp200_sim_display.so; gradle packages it into the APK's
             // jniLibs/<abi>/, where the runtime's convention-driven discovery
             // finds it (probe order 200). Issue #496.
-            externalNativeBuild.cmake.targets "openxr_displayxr", "drv_sim_display_plugin"
+            // displayxr-diag = the dashboard's JNI query bridge (#558); its
+            // name doesn't match the libdxrp<NNN>_ plug-in convention, so
+            // discovery never mistakes it for a DP.
+            externalNativeBuild.cmake.targets "openxr_displayxr", "drv_sim_display_plugin", "displayxr-diag"
 
             buildConfigField "boolean", "inProcess", "true"
             resValue "string", "app_name", "DisplayXR"
@@ -339,7 +342,7 @@ android {
             dimension 'deployment'
             applicationIdSuffix '.out_of_process'
             externalNativeBuild.cmake.arguments += "-DXRT_FEATURE_SERVICE=ON"
-            externalNativeBuild.cmake.targets "openxr_displayxr", "displayxr-service", "drv_sim_display_plugin"
+            externalNativeBuild.cmake.targets "openxr_displayxr", "displayxr-service", "drv_sim_display_plugin", "displayxr-diag"
 
             buildConfigField "boolean", "inProcess", "false"
             resValue "string", "app_name", "DisplayXR"
