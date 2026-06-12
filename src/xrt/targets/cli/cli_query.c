@@ -177,7 +177,7 @@ read_plugin_version_from_registry(const char *id, char *out, size_t cap)
 #endif
 
 void
-cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h)
+cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const struct xrt_instance_info *ii)
 {
 	memset(r, 0, sizeof(*r));
 	memset(h, 0, sizeof(*h));
@@ -190,7 +190,8 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h)
 	read_active_runtime(r);
 #endif
 
-	if (xrt_instance_create(NULL, &h->xi) != 0) {
+	// xrt_instance_create takes a non-const ii but only reads it.
+	if (xrt_instance_create((struct xrt_instance_info *)ii, &h->xi) != 0) {
 		return; // instance_ok stays false, result_code = INIT_FAIL
 	}
 	r->instance_ok = true;
@@ -286,7 +287,7 @@ void
 cli_query_run(struct cli_query_result *r)
 {
 	struct cli_query_handles h;
-	cli_query_fill(r, &h);
+	cli_query_fill(r, &h, NULL);
 	cli_query_teardown(&h);
 }
 

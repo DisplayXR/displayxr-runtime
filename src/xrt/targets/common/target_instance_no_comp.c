@@ -95,11 +95,18 @@ xrt_instance_create(struct xrt_instance_info *ii, struct xrt_instance **out_xins
 	tinst->xp = xp;
 
 #ifdef XRT_OS_ANDROID
-	ret = android_instance_base_init(&tinst->android, &tinst->base, ii);
-	if (ret < 0) {
-		xrt_prober_destroy(&xp);
-		free(tinst);
-		return ret;
+	// Match target_instance.c: NULL ii skips the Android base (no
+	// activity lifecycle hookup) and downstream code uses the
+	// android_globals vm/context instead — the service and the diag
+	// bridge (#558) run with a Service context, which
+	// android_lifecycle_callbacks_create rejects.
+	if (ii != NULL) {
+		ret = android_instance_base_init(&tinst->android, &tinst->base, ii);
+		if (ret < 0) {
+			xrt_prober_destroy(&xp);
+			free(tinst);
+			return ret;
+		}
 	}
 #endif // XRT_OS_ANDROID
 
