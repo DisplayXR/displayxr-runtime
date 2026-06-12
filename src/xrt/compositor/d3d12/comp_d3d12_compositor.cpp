@@ -1529,12 +1529,11 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// Per-frame effective CONTENT layout (#542): tile grid/dims from the
-	// SUBMISSION, decoupled from the hardware weave-state. Feeds both
-	// renderer passes, the DP handoffs, and the capture providers — they
-	// must all agree on the frame's geometry.
-	comp_d3d12_renderer_compute_effective_layout(c->renderer, &c->layer_accum, c->hardware_display_3d,
-	                                             &c->eff_layout);
+	// Per-frame effective CONTENT layout (#542): the mode's recipe, with the
+	// submission clamped to it. Feeds both renderer passes, the DP handoffs,
+	// and the capture providers — they must all agree on the frame's
+	// geometry.
+	comp_d3d12_renderer_compute_effective_layout(c->renderer, &c->layer_accum, &c->eff_layout);
 
 	// Zero-copy check: can we pass the app's swapchain directly to the DP?
 	bool zero_copy = false;

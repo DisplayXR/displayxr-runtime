@@ -2474,12 +2474,12 @@ gl_compositor_dispatch_capture(struct comp_gl_compositor *c, uint32_t mode_filte
  */
 
 // Per-frame effective CONTENT layout (#542) — same policy as the D3D11/D3D12
-// legs: views from the first projection-class layer's view_count (mode grid
-// default; legacy apps keep the hardware-keyed mono clamp); matched → the
-// mode layout (bit-identical), mono → one tile spanning the full content
-// region, divergence → views×1 strip sized by the submitted imageRect,
-// capped to the physical atlas. Decoupled from c->hardware_display_3d,
-// which only drives the DP weave (request_display_mode), HUD, and V-key.
+// legs: the content recipe is the ACTIVE MODE's, submissions are clamped to
+// it (always-stereo apps submit identical views in a mono mode; zone layers
+// carry zone-sized imageRects). The hardware weave-state never clamps
+// content — divergence is the hardware-state override
+// (xrRequestDisplayModeEXT), under which this layout keeps following the
+// mode and the DP keeps weaving.
 static void
 gl_compute_effective_layout(struct comp_gl_compositor *c)
 {
@@ -2488,24 +2488,22 @@ gl_compute_effective_layout(struct comp_gl_compositor *c)
 	uint32_t mode_tiles = mode_cols * mode_rows;
 
 	uint32_t views = mode_tiles;
-	const struct comp_layer *proj_layer = NULL;
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		if (c->layer_accum.layers[i].data.type == XRT_LAYER_PROJECTION ||
 		    c->layer_accum.layers[i].data.type == XRT_LAYER_PROJECTION_DEPTH ||
 		    c->layer_accum.layers[i].data.type == XRT_LAYER_ZONE_3D) {
-			proj_layer = &c->layer_accum.layers[i];
-			views = proj_layer->data.view_count;
+			views = c->layer_accum.layers[i].data.view_count;
 			break;
 		}
 	}
 	if (views == 0) {
 		views = 1;
 	}
+	if (views > mode_tiles) {
+		views = mode_tiles;
+	}
 	if (views > XRT_MAX_VIEWS) {
 		views = XRT_MAX_VIEWS;
-	}
-	if (c->legacy_app_tile_scaling && !c->hardware_display_3d && views > 1) {
-		views = 1;
 	}
 
 	c->eff_views = views;
@@ -2514,31 +2512,11 @@ gl_compute_effective_layout(struct comp_gl_compositor *c)
 		c->eff_rows = 1;
 		c->eff_tile_w = mode_cols * c->view_width;
 		c->eff_tile_h = mode_rows * c->view_height;
-	} else if (views == mode_tiles) {
+	} else {
 		c->eff_cols = mode_cols;
 		c->eff_rows = mode_rows;
 		c->eff_tile_w = c->view_width;
 		c->eff_tile_h = c->view_height;
-	} else {
-		uint32_t tile_w = (mode_cols * c->view_width) / views;
-		uint32_t tile_h = mode_rows * c->view_height;
-		if (proj_layer != NULL) {
-			const struct xrt_rect *r0 = &proj_layer->data.proj.v[0].sub.rect;
-			if (r0->extent.w > 0 && r0->extent.h > 0) {
-				tile_w = (uint32_t)r0->extent.w;
-				tile_h = (uint32_t)r0->extent.h;
-			}
-		}
-		if (tile_w * views > c->atlas_tex_width && views > 0) {
-			tile_w = c->atlas_tex_width / views;
-		}
-		if (tile_h > c->atlas_tex_height) {
-			tile_h = c->atlas_tex_height;
-		}
-		c->eff_cols = views;
-		c->eff_rows = 1;
-		c->eff_tile_w = tile_w;
-		c->eff_tile_h = tile_h;
 	}
 }
 

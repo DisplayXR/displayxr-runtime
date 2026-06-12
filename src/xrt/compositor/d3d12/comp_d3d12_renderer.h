@@ -26,15 +26,15 @@ extern "C" {
 
 /*!
  * Per-frame effective CONTENT layout (#542): the atlas tile grid the renderer
- * paints and the DP receives, derived from the app's SUBMISSION — decoupled
- * from the hardware weave-state (which only drives the DP's mode_3d via
- * request_display_mode). Matched submissions reproduce the mode layout
- * exactly; a hardware/content divergence gets a views×1 strip instead of
- * being clamped away. Mirrors comp_d3d11_eff_layout.
+ * paints and the DP receives. The content recipe is the ACTIVE MODE's —
+ * submissions are clamped to it. The hardware weave-state never clamps
+ * content: a divergence is expressed via the hardware-state override
+ * (xrRequestDisplayModeEXT), under which this layout keeps following the
+ * mode and the DP keeps weaving. Mirrors comp_d3d11_eff_layout.
  */
 struct comp_d3d12_eff_layout
 {
-	uint32_t views;  //!< effective view count (post legacy clamp)
+	uint32_t views;  //!< effective view count (submission clamped to mode)
 	uint32_t cols;   //!< atlas tile columns
 	uint32_t rows;   //!< atlas tile rows
 	uint32_t tile_w; //!< per-tile width in pixels
@@ -43,17 +43,15 @@ struct comp_d3d12_eff_layout
 
 /*!
  * Compute the frame's effective content layout from the accumulated layers.
- * Same policy as the D3D11 leg: submission view_count (mode grid default,
- * legacy apps keep the hardware-keyed mono clamp); matched → mode layout,
- * mono → one tile over the full content region, divergence → views×1 strip
- * sized by the submitted imageRect, capped to the physical atlas.
+ * Same policy as the D3D11 leg: views = submission clamped to the mode tile
+ * count (mode default when no projection-class layer); views == 1 spans the
+ * full content region as one tile, otherwise the mode grid.
  *
  * @ingroup comp_d3d12
  */
 void
 comp_d3d12_renderer_compute_effective_layout(struct comp_d3d12_renderer *renderer,
                                              struct comp_layer_accum *layers,
-                                             bool hardware_display_3d,
                                              struct comp_d3d12_eff_layout *out_layout);
 
 /*!

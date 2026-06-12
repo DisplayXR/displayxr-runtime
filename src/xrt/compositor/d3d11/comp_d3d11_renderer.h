@@ -26,15 +26,16 @@ extern "C" {
 
 /*!
  * Per-frame effective CONTENT layout (#542): the atlas tile grid the renderer
- * paints and the DP receives, derived from the app's SUBMISSION — decoupled
- * from the hardware weave-state (which only drives the DP's mode_3d via
- * request_display_mode). Matched submissions reproduce the mode layout
- * exactly; a hardware/content divergence gets a views×1 strip instead of
- * being clamped away.
+ * paints and the DP receives. The content recipe is the ACTIVE MODE's —
+ * submissions are clamped to it (always-stereo apps legitimately submit
+ * identical views in a mono mode; zone layers carry zone-sized imageRects).
+ * The hardware weave-state never clamps content: a divergence is expressed
+ * via the hardware-state override (xrRequestDisplayModeEXT), under which this
+ * layout keeps following the mode and the DP keeps weaving.
  */
 struct comp_d3d11_eff_layout
 {
-	uint32_t views;  //!< effective view count (post legacy clamp)
+	uint32_t views;  //!< effective view count (submission clamped to mode)
 	uint32_t cols;   //!< atlas tile columns
 	uint32_t rows;   //!< atlas tile rows
 	uint32_t tile_w; //!< per-tile width in pixels
@@ -44,20 +45,16 @@ struct comp_d3d11_eff_layout
 /*!
  * Compute the frame's effective content layout from the accumulated layers.
  *
- * views comes from the first projection-class layer's view_count (default:
- * the mode tile grid when none). Legacy apps keep the hardware-keyed mono
- * clamp — they always submit the same views and can't author transitions.
- * When views matches the mode grid the layout IS the mode layout; when it
- * is 1 the single tile spans the full content region (the mono paint box
- * additionally caps to the window target, as before); otherwise a views×1
- * strip sized by the submitted imageRect, capped to the physical atlas.
+ * views = the first projection-class layer's view_count clamped to the mode
+ * tile count (default: the mode tile count when none). views == 1 spans the
+ * full content region as one tile (the mono paint box additionally caps to
+ * the window target, as before); otherwise the mode grid.
  *
  * @ingroup comp_d3d11
  */
 void
 comp_d3d11_renderer_compute_effective_layout(struct comp_d3d11_renderer *renderer,
                                              struct comp_layer_accum *layers,
-                                             bool hardware_display_3d,
                                              struct comp_d3d11_eff_layout *out_layout);
 
 /*!

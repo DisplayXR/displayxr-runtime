@@ -1698,13 +1698,14 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 }
 
 // Per-frame effective CONTENT layout (#542) — same policy as the D3D11 leg
-// (comp_d3d11_renderer_compute_effective_layout): submission view_count, mode
-// grid when matched, views×1 strip sized by the submitted imageRect on a
-// hardware/content divergence, legacy apps keep the hardware-keyed mono clamp.
+// (comp_d3d11_renderer_compute_effective_layout): the content recipe is the
+// ACTIVE MODE's, submissions are clamped to it (always-stereo apps submit
+// identical views in a mono mode; zone layers carry zone-sized imageRects).
+// The hardware weave-state never clamps content — divergence is the
+// hardware-state override, under which this layout keeps following the mode.
 extern "C" void
 comp_d3d12_renderer_compute_effective_layout(struct comp_d3d12_renderer *renderer,
                                              struct comp_layer_accum *layers,
-                                             bool hardware_display_3d,
                                              struct comp_d3d12_eff_layout *out_layout)
 {
 	uint32_t mode_cols = renderer->tile_columns > 0 ? renderer->tile_columns : 1;
@@ -1712,24 +1713,22 @@ comp_d3d12_renderer_compute_effective_layout(struct comp_d3d12_renderer *rendere
 	uint32_t mode_tiles = mode_cols * mode_rows;
 
 	uint32_t views = mode_tiles;
-	const struct comp_layer *proj_layer = NULL;
 	for (uint32_t i = 0; i < layers->layer_count; i++) {
 		if (layers->layers[i].data.type == XRT_LAYER_PROJECTION ||
 		    layers->layers[i].data.type == XRT_LAYER_PROJECTION_DEPTH ||
 		    layers->layers[i].data.type == XRT_LAYER_ZONE_3D) {
-			proj_layer = &layers->layers[i];
-			views = proj_layer->data.view_count;
+			views = layers->layers[i].data.view_count;
 			break;
 		}
 	}
 	if (views == 0) {
 		views = 1;
 	}
+	if (views > mode_tiles) {
+		views = mode_tiles;
+	}
 	if (views > XRT_MAX_VIEWS) {
 		views = XRT_MAX_VIEWS;
-	}
-	if (renderer->legacy_app_tile_scaling && !hardware_display_3d && views > 1) {
-		views = 1;
 	}
 
 	out_layout->views = views;
@@ -1738,32 +1737,11 @@ comp_d3d12_renderer_compute_effective_layout(struct comp_d3d12_renderer *rendere
 		out_layout->rows = 1;
 		out_layout->tile_w = mode_cols * renderer->view_width;
 		out_layout->tile_h = mode_rows * renderer->view_height;
-	} else if (views == mode_tiles) {
+	} else {
 		out_layout->cols = mode_cols;
 		out_layout->rows = mode_rows;
 		out_layout->tile_w = renderer->view_width;
 		out_layout->tile_h = renderer->view_height;
-	} else {
-		uint32_t tile_w = (mode_cols * renderer->view_width) / views;
-		uint32_t tile_h = mode_rows * renderer->view_height;
-		if (proj_layer != NULL) {
-			const struct xrt_rect *r0 = &proj_layer->data.proj.v[0].sub.rect;
-			if (r0->extent.w > 0 && r0->extent.h > 0) {
-				tile_w = static_cast<uint32_t>(r0->extent.w);
-				tile_h = static_cast<uint32_t>(r0->extent.h);
-			}
-		}
-		uint32_t atlas_w = mode_cols * renderer->view_width;
-		if (tile_w * views > atlas_w && views > 0) {
-			tile_w = atlas_w / views;
-		}
-		if (tile_h > renderer->texture_height) {
-			tile_h = renderer->texture_height;
-		}
-		out_layout->cols = views;
-		out_layout->rows = 1;
-		out_layout->tile_w = tile_w;
-		out_layout->tile_h = tile_h;
 	}
 }
 

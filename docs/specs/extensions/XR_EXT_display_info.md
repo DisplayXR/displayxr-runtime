@@ -920,9 +920,10 @@ if (/* a 3D-capable rendering mode exists */ false) {
 
 // Example: mono submission in 2D mode
 if (!displayMode3D) {
-    // xrLocateViews fills an 8-wide buffer; in a 2D mode viewCount comes back 1,
-    // but locate into XRT_MAX_VIEWS regardless and compute the center eye from the
-    // valid entries.
+    // xrLocateViews always reports the MAX view count (so apps size their
+    // arrays once); in a 2D mode every returned view carries the SAME
+    // centered eye pose. Locate into XRT_MAX_VIEWS and use view 0 (or the
+    // centroid — identical in 2D).
     XrView views[8];
     for (uint32_t i = 0; i < 8; i++) views[i] = {XR_TYPE_VIEW};
     uint32_t viewCount = 8;

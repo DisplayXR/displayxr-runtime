@@ -1272,14 +1272,20 @@ comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr)
 	*renderer_ptr = nullptr;
 }
 
-// Per-frame effective CONTENT layout (#542): tile count from the SUBMISSION,
-// decoupled from the hardware weave-state. Computed once per frame and shared
-// by both passes (must agree so window-space layers land on the same per-tile
-// viewports the projection pass painted) and the DP handoff.
+// Per-frame effective CONTENT layout (#542): the content recipe is the
+// ACTIVE MODE's — submissions are clamped to it, never the other way round.
+// Apps express a hardware/content divergence via the hardware-state override
+// (xrRequestDisplayModeEXT), NOT by submitting mismatched view counts: the
+// runtime always reports the max view count from xrLocateViews (identical
+// centered views in a mono mode), so always-stereo apps legitimately submit
+// 2 identical views in 2D mode and must clamp to mono (the documented compat
+// guarantee — and zone layers carry zone-sized imageRects that must never
+// define atlas geometry). Computed once per frame and shared by both passes
+// (must agree so window-space layers land on the same per-tile viewports the
+// projection pass painted) and the DP handoff.
 extern "C" void
 comp_d3d11_renderer_compute_effective_layout(struct comp_d3d11_renderer *renderer,
                                              struct comp_layer_accum *layers,
-                                             bool hardware_display_3d,
                                              struct comp_d3d11_eff_layout *out_layout)
 {
 	uint32_t mode_cols = renderer->tile_columns > 0 ? renderer->tile_columns : 1;
@@ -1287,69 +1293,42 @@ comp_d3d11_renderer_compute_effective_layout(struct comp_d3d11_renderer *rendere
 	uint32_t mode_tiles = mode_cols * mode_rows;
 
 	uint32_t views = mode_tiles;
-	const struct comp_layer *proj_layer = NULL;
 	for (uint32_t i = 0; i < layers->layer_count; i++) {
 		if (layers->layers[i].data.type == XRT_LAYER_PROJECTION ||
 		    layers->layers[i].data.type == XRT_LAYER_PROJECTION_DEPTH ||
 		    layers->layers[i].data.type == XRT_LAYER_ZONE_3D) {
-			proj_layer = &layers->layers[i];
-			views = proj_layer->data.view_count;
+			views = layers->layers[i].data.view_count;
 			break;
 		}
 	}
 	if (views == 0) {
 		views = 1;
 	}
+	if (views > mode_tiles) {
+		views = mode_tiles;
+	}
 	if (views > XRT_MAX_VIEWS) {
 		views = XRT_MAX_VIEWS;
-	}
-	// Legacy apps always submit the same views and can't author transitions
-	// — keep the hardware-keyed mono clamp so V→2D stays mono, not SBS.
-	if (renderer->legacy_app_tile_scaling && !hardware_display_3d && views > 1) {
-		views = 1;
 	}
 
 	out_layout->views = views;
 	if (views == 1) {
 		// Mono content: one tile spanning the full content region (the
 		// paint box additionally caps to the window target — see
-		// get_view_tile_box). In a matched 2D mode (1×1 grid) this IS
-		// the mode layout.
+		// get_view_tile_box). In a 2D mode (1×1 grid) this IS the mode
+		// layout; an under-submitting app in a multi-view mode gets the
+		// same full-region stretch, and the DP flat-blits the 1×1 grid.
 		out_layout->cols = 1;
 		out_layout->rows = 1;
 		out_layout->tile_w = mode_cols * renderer->view_width;
 		out_layout->tile_h = mode_rows * renderer->view_height;
-	} else if (views == mode_tiles) {
-		// Matched submission: the mode layout, unchanged.
+	} else {
+		// The mode layout; an under-submitting app (views < mode_tiles,
+		// e.g. 2 in a quad mode) paints the first `views` tiles.
 		out_layout->cols = mode_cols;
 		out_layout->rows = mode_rows;
 		out_layout->tile_w = renderer->view_width;
 		out_layout->tile_h = renderer->view_height;
-	} else {
-		// Hardware/content divergence: a views×1 strip sized by the
-		// submitted imageRect, capped to the physical atlas so a
-		// mid-transition frame renders predictably instead of
-		// overflowing.
-		uint32_t tile_w = (mode_cols * renderer->view_width) / views;
-		uint32_t tile_h = mode_rows * renderer->view_height;
-		if (proj_layer != NULL) {
-			const struct xrt_rect *r0 = &proj_layer->data.proj.v[0].sub.rect;
-			if (r0->extent.w > 0 && r0->extent.h > 0) {
-				tile_w = static_cast<uint32_t>(r0->extent.w);
-				tile_h = static_cast<uint32_t>(r0->extent.h);
-			}
-		}
-		uint32_t atlas_w = mode_cols * renderer->view_width;
-		if (tile_w * views > atlas_w && views > 0) {
-			tile_w = atlas_w / views;
-		}
-		if (tile_h > renderer->texture_height) {
-			tile_h = renderer->texture_height;
-		}
-		out_layout->cols = views;
-		out_layout->rows = 1;
-		out_layout->tile_w = tile_w;
-		out_layout->tile_h = tile_h;
 	}
 }
 
