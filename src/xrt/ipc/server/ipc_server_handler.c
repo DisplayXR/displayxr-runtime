@@ -2936,6 +2936,49 @@ ipc_handle_system_get_clients(volatile struct ipc_client_state *_ics, struct ipc
 }
 
 xrt_result_t
+ipc_handle_system_get_display_status(volatile struct ipc_client_state *_ics, struct ipc_display_status *out_status)
+{
+	struct ipc_server *s = _ics->server;
+	struct ipc_display_status st = {0};
+
+	struct xrt_device *head = s->xsysd != NULL ? s->xsysd->static_roles.head : NULL;
+	if (head != NULL && head->hmd != NULL) {
+		st.mode_valid = true;
+		st.active_rendering_mode = head->hmd->active_rendering_mode_index;
+	}
+
+	// Live tracking state straight from a display processor (#558). The
+	// Windows D3D11 service owns one system-wide DP; on Android the DP
+	// hangs off whichever client session is rendering, so borrow the first
+	// session's multi_compositor (same per-acquire read the locate path
+	// uses — eyes.valid=false simply means "no DP / nothing rendering").
+	struct xrt_eye_positions eyes = {0};
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc != NULL && comp_d3d11_service_is_d3d11_service(s->xsysc)) {
+		(void)comp_d3d11_service_get_predicted_eye_positions_full(s->xsysc, &eyes);
+	}
+#elif defined(XRT_OS_ANDROID)
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		volatile struct ipc_client_state *ics = &s->threads[i].ics;
+		if (ics->server_thread_index < 0 || ics->xc == NULL) {
+			continue;
+		}
+		struct multi_compositor *mc = multi_compositor((struct xrt_compositor *)ics->xc);
+		if (mc != NULL && multi_compositor_get_predicted_eye_positions(mc, &eyes)) {
+			break;
+		}
+	}
+#endif
+	if (eyes.valid) {
+		st.tracking_valid = true;
+		st.is_tracking = eyes.is_tracking;
+	}
+
+	*out_status = st;
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
 ipc_handle_system_get_properties(volatile struct ipc_client_state *_ics, struct xrt_system_properties *out_properties)
 {
 	struct ipc_server *s = _ics->server;

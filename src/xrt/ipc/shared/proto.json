@@ -41,6 +41,12 @@
 		]
 	},
 
+	"system_get_display_status": {
+		"out": [
+			{"name": "status", "type": "struct ipc_display_status"}
+		]
+	},
+
 	"system_set_primary_client": {
 		"in": [
 			{"name": "id", "type": "uint32_t"}
