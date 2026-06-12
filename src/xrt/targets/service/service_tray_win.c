@@ -26,6 +26,7 @@
 #define IDM_BRIDGE_DISABLE  1021
 #define IDM_BRIDGE_AUTO     1022
 #define IDM_START_ON_LOGIN  1030
+#define IDM_CONTROL_PANEL   1002
 #define IDM_EXIT            1001
 
 // Workspace published-action IDs. Range matches
@@ -180,6 +181,52 @@ bridge_mode_to_id(enum service_child_mode m)
 	}
 }
 
+//! Resolve a binary that ships next to displayxr-service.exe (same Runtime
+//! dir) into @p out. Returns true and a NUL-terminated path on success.
+static bool
+resolve_sibling_exe(const wchar_t *name, wchar_t *out, size_t cap)
+{
+	wchar_t dir[MAX_PATH];
+	DWORD len = GetModuleFileNameW(NULL, dir, ARRAYSIZE(dir));
+	if (len == 0 || len >= ARRAYSIZE(dir)) {
+		return false;
+	}
+	wchar_t *slash = wcsrchr(dir, L'\\');
+	if (slash == NULL) {
+		return false;
+	}
+	*(slash + 1) = L'\0';
+	// dir now ends in a backslash; append the binary name.
+	if (wcscpy_s(out, cap, dir) != 0 || wcscat_s(out, cap, name) != 0) {
+		return false;
+	}
+	return true;
+}
+
+//! True if the Control Panel GUI is installed alongside the service.
+static bool
+control_panel_available(void)
+{
+	wchar_t path[MAX_PATH];
+	return resolve_sibling_exe(L"displayxr-control-panel.exe", path, ARRAYSIZE(path)) &&
+	       GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+//! Launch the sibling Control Panel GUI (best-effort; runs in the user's
+//! session since the service tray itself does).
+static void
+launch_control_panel(void)
+{
+	wchar_t path[MAX_PATH];
+	if (!resolve_sibling_exe(L"displayxr-control-panel.exe", path, ARRAYSIZE(path))) {
+		return;
+	}
+	// ShellExecute "open" is enough — the panel is a normal GUI exe and we
+	// don't need its handle. If it's already open this just brings up a
+	// second instance; the panel is cheap and stateless, so that's fine.
+	ShellExecuteW(NULL, L"open", path, NULL, NULL, SW_SHOWNORMAL);
+}
+
 //! Build and show the tray context menu at the cursor position.
 static void
 show_context_menu(HWND hwnd)
@@ -203,6 +250,15 @@ show_context_menu(HWND hwnd)
 
 	// Main menu
 	HMENU menu = CreatePopupMenu();
+
+	// Control Panel (runtime diagnostics GUI) — top-level entry, shown only
+	// when the panel exe is installed alongside the service. It's a runtime-
+	// level diagnostic, not a workspace-app action, so it lives on the
+	// always-on service tray rather than a workspace controller's submenu.
+	if (control_panel_available()) {
+		AppendMenuW(menu, MF_STRING, IDM_CONTROL_PANEL, L"DisplayXR Control Panel");
+		AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+	}
 
 	// Workspace submenu — only built when a controller binary is detected.
 	// Bare runtime (no controller installed) gets just the Bridge entry,
@@ -333,6 +389,11 @@ tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		case IDM_BRIDGE_DISABLE:
 			s_config.bridge = SERVICE_CHILD_DISABLE;
 			config_changed();
+			break;
+
+		// Open the runtime diagnostics Control Panel
+		case IDM_CONTROL_PANEL:
+			launch_control_panel();
 			break;
 
 		// Start on login toggle
