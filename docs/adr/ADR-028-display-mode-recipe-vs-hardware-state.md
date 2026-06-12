@@ -99,6 +99,3 @@ views lose nothing) but is the compat path, not the recommendation.
   that path; identical-view over-submission weaves to ≈the original image).
   Retire by plumbing the mode index (or the content grid) over IPC, then
   adopting the mode clamp there (#553).
-- **Metal (`comp_metal_compositor.m`):** still derives the atlas from the
-  submission for non-zone layers (the pre-fix model) — carries the
-  always-stereo-in-2D bug latently. Port the mode clamp.
