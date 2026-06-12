@@ -4442,6 +4442,17 @@ service_crop_atlas_for_dp(struct d3d11_service_system *sys,
 
 	uint32_t num_views = sys->tile_columns * sys->tile_rows;
 
+	// Source tile stride MUST be the atlas-derived slot stride — the same
+	// `atlas / tile_columns` formula the write side (projection blit, zones
+	// composite) places tiles with. `sys->view_width/height` track the
+	// SCALED runtime view dims and diverge from the slot stride whenever
+	// the per-client atlas is created at native pixels
+	// (`feedback_atlas_stride_invariant`) — cropping view 1 at the scaled
+	// stride reads empty atlas between the tiles (#549: black view-1 on
+	// the standalone forced-IPC path).
+	uint32_t src_stride_w = atlas_desc.Width / (sys->tile_columns > 0 ? sys->tile_columns : 1);
+	uint32_t src_stride_h = atlas_desc.Height / (sys->tile_rows > 0 ? sys->tile_rows : 1);
+
 	if (flip_y && res->crop_rtv && sys->blit_vs && sys->blit_ps) {
 		// Shader blit path: crop + Y-flip in one pass per view.
 		// Set up pipeline once, then draw N views with different constants.
@@ -4469,7 +4480,7 @@ service_crop_atlas_for_dp(struct d3d11_service_system *sys,
 		for (uint32_t v = 0; v < num_views && v < XRT_MAX_VIEWS; v++) {
 			uint32_t src_tile_x, src_tile_y;
 			u_tiling_view_origin(v, sys->tile_columns,
-			                     sys->view_width, sys->view_height,
+			                     src_stride_w, src_stride_h,
 			                     &src_tile_x, &src_tile_y);
 			uint32_t dst_tile_x, dst_tile_y;
 			u_tiling_view_origin(v, sys->tile_columns,
@@ -4506,9 +4517,13 @@ service_crop_atlas_for_dp(struct d3d11_service_system *sys,
 			sys->context->Draw(4, 0);
 		}
 
-		// Unbind the SRV so the crop texture can be used as input next
+		// Unbind the SRV so the crop texture can be used as input next,
+		// and the RTV so the DP's sample of crop_srv isn't dropped by
+		// hazard resolution (crop texture still bound as render target).
 		ID3D11ShaderResourceView *null_srv = nullptr;
 		sys->context->PSSetShaderResources(0, 1, &null_srv);
+		ID3D11RenderTargetView *null_rtv = nullptr;
+		sys->context->OMSetRenderTargets(1, &null_rtv, nullptr);
 
 		return res->crop_srv.get();
 	}
@@ -4517,7 +4532,7 @@ service_crop_atlas_for_dp(struct d3d11_service_system *sys,
 	for (uint32_t v = 0; v < num_views && v < XRT_MAX_VIEWS; v++) {
 		uint32_t src_tile_x, src_tile_y;
 		u_tiling_view_origin(v, sys->tile_columns,
-		                     sys->view_width, sys->view_height,
+		                     src_stride_w, src_stride_h,
 		                     &src_tile_x, &src_tile_y);
 		uint32_t dst_tile_x, dst_tile_y;
 		u_tiling_view_origin(v, sys->tile_columns,
@@ -9169,6 +9184,60 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			break;
 		default:
 			break;
+		}
+	}
+
+	// XR_EXT_display_zones tier-1 wish fallback (#549): zones clients never
+	// call xrRequestDisplayRenderingModeEXT — in-process the published zone
+	// wish drives the panel, and the wish publish leg is not wired on the
+	// service path yet (scope-split follow-up). Until then, a zones frame
+	// on the STANDALONE path globally requests the 3D mode (the tier-1
+	// semantics), using the same immediate-flip pattern as the app-initiated
+	// branch below. Workspace mode is untouched — the workspace owns the
+	// display mode and zones-client wishes stay inert (ADR-027 v1).
+	if (zones_frame && !sys->workspace_mode && !sys->hardware_display_3d && sys->xsysd != NULL) {
+		struct xrt_device *zhead = sys->xsysd->static_roles.head;
+		if (zhead != nullptr && zhead->hmd != NULL) {
+			// Prefer the last 3D mode; fall back to the first 3D-capable
+			// mode (last_3d_mode_index is only saved on 3D→2D flips).
+			uint32_t mode_idx = zhead->rendering_mode_count; // invalid sentinel
+			if (sys->last_3d_mode_index < zhead->rendering_mode_count &&
+			    zhead->rendering_modes[sys->last_3d_mode_index].hardware_display_3d) {
+				mode_idx = sys->last_3d_mode_index;
+			} else {
+				for (uint32_t m = 0; m < zhead->rendering_mode_count; m++) {
+					if (zhead->rendering_modes[m].hardware_display_3d) {
+						mode_idx = m;
+						break;
+					}
+				}
+			}
+			if (mode_idx < zhead->rendering_mode_count) {
+				uint32_t prev_idx = zhead->hmd->active_rendering_mode_index;
+				zhead->hmd->active_rendering_mode_index = mode_idx;
+				broadcast_rendering_mode_change(sys, zhead, prev_idx, mode_idx);
+				if (c->render.display_processor != nullptr) {
+					xrt_display_processor_d3d11_request_display_mode(
+					    c->render.display_processor, true);
+				}
+				sync_tile_layout(sys);
+				sys->hardware_display_3d = true;
+				// Stamp the post-flip cooldown (same refresh the [force_3d]
+				// re-assert does) — without it the 100 ms vendor 3D-state
+				// poll sees the panel still mid-transition and counter-
+				// corrects back to 2D, re-arming this fallback every frame.
+				int64_t flip_now_ns = os_monotonic_get_ns();
+				sys->cached_3d_state.store(true, std::memory_order_relaxed);
+				sys->last_3d_state_poll_ns.store(flip_now_ns, std::memory_order_release);
+				sys->last_flip_landed_ns.store(flip_now_ns, std::memory_order_release);
+				static bool zones_3d_logged = false;
+				if (!zones_3d_logged) {
+					zones_3d_logged = true;
+					U_LOG_W("ZONES SVC: zones frame on the standalone path — tier-1 global 3D "
+					        "(mode %u -> %u)",
+					        prev_idx, mode_idx);
+				}
+			}
 		}
 	}
 
