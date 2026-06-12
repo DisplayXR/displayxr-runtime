@@ -2088,10 +2088,10 @@ oxr_session_locate_views(struct oxr_logger *log,
 		// inert — the server's headless fast path returns before window
 		// resolution, matching the rig-descriptor policy.
 		//
-		// @todo P5 tail: the wish-mask cross-process transport does NOT
-		// ride this call (roadmap-sanctioned slip) — service-mode wish
-		// stays on the tier-1 global fallback until the service
-		// compositor consumes zone layers.
+		// The wish mask does NOT ride this call: the service derives the
+		// auto wish from the committed zone-3D layers and publishes it to
+		// the per-client DP itself (#551, service_update_zone_wish_publish)
+		// — no extra cross-process transport needed.
 		if (zone != NULL && rig_route_native) {
 			rig_info.zone_valid = 1;
 			rig_info.zone_x_px = zone->rect.offset.x;
@@ -2193,6 +2193,20 @@ oxr_session_locate_views(struct oxr_logger *log,
 				ipc_rig_logged = true;
 				U_LOG_W("VIEW-RIG IPC client: locate ok, rig_applied=%u raw_valid=%u eyes=%u",
 				        reply.rig_applied, reply.raw.valid, reply.raw.eye_count);
+			}
+			// The first locate often lands during DP tracking warmup (the
+			// server falls back to device poses with an empty reply), so the
+			// one-shot above can permanently show zeros. Log the first
+			// SUCCESSFUL rig locate separately so a warmup-only failure is
+			// not mistaken for a persistently dead rig path (#551).
+			static bool ipc_rig_success_logged = false;
+			if (!ipc_rig_success_logged &&
+			    (reply.rig_applied != IPC_VIEW_RIG_NONE || reply.raw.valid != 0)) {
+				ipc_rig_success_logged = true;
+				U_LOG_W(
+				    "VIEW-RIG IPC client: first successful locate, "
+				    "rig_applied=%u raw_valid=%u eyes=%u",
+				    reply.rig_applied, reply.raw.valid, reply.raw.eye_count);
 			}
 		} else {
 			static bool ipc_rig_fail_logged = false;

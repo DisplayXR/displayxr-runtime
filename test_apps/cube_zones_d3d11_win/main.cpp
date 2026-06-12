@@ -608,11 +608,19 @@ static void TryActivateZones(XrSessionManager& xr, D3D11Renderer& renderer) {
     }
     LOG_INFO("[zones] capabilities: supported=1 maxZones3D=%u", caps.maxZones3D);
 
-    // Zones share the session's view COUNT (display modes are session-global);
-    // only per-view dimensions vary by rect.
+    // Zones share the session's view COUNT (display modes are session-global).
+    // Allocate the zone swapchains at the MAX view count across all modes,
+    // not the currently active mode's: standalone the session can start in a
+    // 1-view mode (the service's tier-1 zones fallback flips to a multi-view
+    // mode only at the first zones frame, AFTER these swapchains exist), and
+    // a 1-tile swapchain would pin every zone to 1 view forever (#551). The
+    // per-frame submit clamp to the ACTIVE mode's view count stays.
     uint32_t viewCount = 2;
-    if (xr.renderingModeCount > 0 && xr.currentModeIndex < xr.renderingModeCount) {
-        viewCount = xr.renderingModeViewCounts[xr.currentModeIndex];
+    if (xr.renderingModeCount > 0) {
+        viewCount = 1;
+        for (uint32_t mi = 0; mi < xr.renderingModeCount; mi++) {
+            viewCount = (std::max)(viewCount, xr.renderingModeViewCounts[mi]);
+        }
     }
     if (viewCount < 1) viewCount = 1;
     if (viewCount > 8) viewCount = 8;
@@ -996,6 +1004,30 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
             submitViewCounts[zi] = 0;
             continue;
         }
+        // Don't submit poses the runtime marked invalid (or zero quats from a
+        // not-yet-tracking first frame) — xrEndFrame rejects them with
+        // XR_ERROR_POSE_INVALID. Skipping this zone for the frame is the
+        // correct degradation; the next locate after tracking warmup is valid.
+        const bool orientationValid =
+            (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
+        bool posesUsable = orientationValid;
+        for (uint32_t vi = 0; posesUsable && vi < viewCountOutput && vi < 8; vi++) {
+            const XrQuaternionf& q = zoneViews[vi].pose.orientation;
+            if (q.x == 0.0f && q.y == 0.0f && q.z == 0.0f && q.w == 0.0f) {
+                posesUsable = false;
+            }
+        }
+        if (!posesUsable) {
+            static bool warnedInvalid = false;
+            if (!warnedInvalid) {
+                warnedInvalid = true;
+                LOG_WARN("[zones] zone %u locate returned invalid poses (flags=0x%llx) — "
+                         "skipping submission until tracking is up",
+                         z.zoneId, (unsigned long long)viewState.viewStateFlags);
+            }
+            submitViewCounts[zi] = 0;
+            continue;
+        }
 
         // xrLocateViews always reports the MAX view count (identical centered
         // views in a mono mode) — a well-behaved extension app submits only
@@ -1299,6 +1331,11 @@ static void RenderOneFrame(RenderState& rs) {
     int eyeCount = monoMode ? 1 : (int)modeViewCount;
     std::vector<XrCompositionLayerProjectionView> projectionViews(eyeCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
     bool hudSubmitted = false;
+    // Only submit the projection layer once the locate+render below actually
+    // filled it — a first-frame locate failure (tracking warmup) or a skipped
+    // render otherwise submits default-constructed views whose zero quats the
+    // runtime rejects with XR_ERROR_POSE_INVALID.
+    bool viewsPopulated = false;
 
     if (frameState.shouldRender) {
         if (LocateViews(xr, frameState.predictedDisplayTime,
@@ -1584,6 +1621,7 @@ static void RenderOneFrame(RenderState& rs) {
                         rigViews[monoMode ? 0 : eye].fov :
                         (monoMode ? monoFov : rawViews[safeIdx].fov);
                 }
+                viewsPopulated = true;
 
                 if (rtv) rtv->Release();
 
@@ -1601,6 +1639,15 @@ static void RenderOneFrame(RenderState& rs) {
     }
 
     // Submit frame (fallback path: plain projection, optionally with the HUD).
+    if (!viewsPopulated) {
+        XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
+        endInfo.displayTime = frameState.predictedDisplayTime;
+        endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        endInfo.layerCount = 0;
+        endInfo.layers = nullptr;
+        xrEndFrame(xr.session, &endInfo);
+        return;
+    }
     if (hudSubmitted) {
         float hudAR = (float)HUD_PIXEL_WIDTH / (float)HUD_PIXEL_HEIGHT;
         float windowAR = (g_windowWidth > 0 && g_windowHeight > 0) ? (float)g_windowWidth / (float)g_windowHeight : 1.0f;
