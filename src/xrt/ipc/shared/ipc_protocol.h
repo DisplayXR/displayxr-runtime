@@ -710,6 +710,21 @@ struct ipc_app_state
 	struct xrt_application_info info;
 };
 
+/*!
+ * Session-less runtime status snapshot for diagnostics (#558). Served from
+ * system-level state so a monitor client without a session (e.g. the Android
+ * diag dashboard) can read it.
+ *
+ * @ingroup ipc
+ */
+struct ipc_display_status
+{
+	bool mode_valid;                //!< Head device present; active mode below is meaningful.
+	uint32_t active_rendering_mode; //!< head->hmd->active_rendering_mode_index.
+	bool tracking_valid;            //!< A display processor answered the eye-position query.
+	bool is_tracking;               //!< Live eye-tracking lock (meaningful iff tracking_valid).
+};
+
 
 /*!
  * Arguments for creating swapchains from native images.
