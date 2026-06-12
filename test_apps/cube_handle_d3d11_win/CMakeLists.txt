@@ -12,8 +12,10 @@ if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-# OpenXR headers location
-set(OPENXR_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/../../src/external/openxr_includes")
+# OpenXR headers location. Use CMAKE_CURRENT_SOURCE_DIR (not CMAKE_SOURCE_DIR)
+# so this resolves correctly both standalone and when folded into the main
+# build as an IDE launch target (XRT_VS_LAUNCH_APP).
+set(OPENXR_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../src/external/openxr_includes")
 
 # Find OpenXR loader - multiple strategies
 set(OPENXR_FOUND FALSE)
@@ -60,7 +62,7 @@ endif()
 
 # Strategy 3: Look in parent build directory
 if(NOT OPENXR_FOUND)
-    set(PARENT_BUILD_DIR "${CMAKE_SOURCE_DIR}/../../build")
+    set(PARENT_BUILD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../build")
     if(EXISTS "${PARENT_BUILD_DIR}/src/external/openxr_loader/OpenXRConfig.cmake")
         list(APPEND CMAKE_PREFIX_PATH "${PARENT_BUILD_DIR}/src/external/openxr_loader")
         find_package(OpenXR REQUIRED CONFIG)

@@ -470,6 +470,41 @@ if(WIN32 AND XRT_BUILD_INSTALLER)
 	add_subdirectory(installer)
 endif()
 
+# IDE convenience: optionally fold one test app into this build so it shows up
+# as a launchable startup target (mainly for the Visual Studio solution from
+# `build_windows.bat vs2022`). Empty by default — the Ninja runtime build and
+# build_windows.bat build the test apps as separate projects. With this set,
+# F5 launches the app, which loads this dev runtime + the vendor plug-in + SR
+# SDK, so you can step across all three. The chosen app's CMakeLists must use
+# CMAKE_CURRENT_SOURCE_DIR (not CMAKE_SOURCE_DIR) so it relocates when folded.
+set(XRT_VS_LAUNCH_APP "" CACHE STRING
+	"test_apps/<name> to fold in as an IDE launch target (e.g. cube_handle_d3d11_win); empty = none")
+if(XRT_VS_LAUNCH_APP)
+	if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_apps/${XRT_VS_LAUNCH_APP}/CMakeLists.txt")
+		message(STATUS "Folding test app as IDE launch target: ${XRT_VS_LAUNCH_APP}")
+		add_subdirectory(
+			test_apps/${XRT_VS_LAUNCH_APP}
+			test_apps_launch/${XRT_VS_LAUNCH_APP}
+			)
+		if(TARGET ${XRT_VS_LAUNCH_APP})
+			# F5 uses the freshly-installed dev runtime manifest. Build the
+			# INSTALL target first so this path exists.
+			set_target_properties(
+				${XRT_VS_LAUNCH_APP}
+				PROPERTIES VS_DEBUGGER_ENVIRONMENT
+					   "XR_RUNTIME_JSON=${CMAKE_INSTALL_PREFIX}/DisplayXR_win64.json"
+				)
+			# Make it the solution's default startup project.
+			set_property(DIRECTORY PROPERTY VS_STARTUP_PROJECT ${XRT_VS_LAUNCH_APP})
+		endif()
+	else()
+		message(
+			WARNING
+			"XRT_VS_LAUNCH_APP=${XRT_VS_LAUNCH_APP} not found under test_apps/ — skipping"
+			)
+	endif()
+endif()
+
 ###
 # Keep these lists sorted
 ###

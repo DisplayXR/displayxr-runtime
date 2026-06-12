@@ -430,6 +430,7 @@ cmake -S "%REPO%." -B "%REPO%build_vs2022" -G "Visual Studio 17 2022" -A x64 ^
   -DXRT_BUILD_INSTALLER=ON ^
   -DXRT_FEATURE_SERVICE=ON ^
   -DXRT_FEATURE_HYBRID_MODE=ON ^
+  -DXRT_VS_LAUNCH_APP=cube_handle_d3d11_win ^
   -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
 
 if %ERRORLEVEL% NEQ 0 (
@@ -440,7 +441,9 @@ if %ERRORLEVEL% NEQ 0 (
 echo.
 echo === Visual Studio 2022 solution ready ===
 echo   Solution: %REPO%build_vs2022\XRT.sln
-echo   Open it in Visual Studio 2022 and build the ALL_BUILD or INSTALL target.
+echo   Startup project: cube_handle_d3d11_win (F5 to launch + debug end-to-end).
+echo   Build the INSTALL target once first so XR_RUNTIME_JSON resolves.
+echo   To fold a different app: -DXRT_VS_LAUNCH_APP=cube_handle_vk_win
 goto :done
 
 :done
