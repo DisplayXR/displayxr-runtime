@@ -23,6 +23,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+typedef struct cJSON cJSON;
+
+struct xrt_instance;
+struct xrt_system;
+struct xrt_system_devices;
+struct xrt_space_overseer;
 
 #ifdef __cplusplus
 extern "C" {
@@ -105,6 +111,20 @@ struct cli_query_result
 };
 
 /*!
+ * Live runtime objects created by @ref cli_query_fill, kept so the caller
+ * decides when (or whether) to tear them down. The Android diag bridge
+ * skips teardown entirely — its short-lived process exits instead, because
+ * vendor plug-in destroy can hang (displayxr-leia-plugin#39).
+ */
+struct cli_query_handles
+{
+	struct xrt_instance *xi;
+	struct xrt_system *xsys;
+	struct xrt_system_devices *xsysd;
+	struct xrt_space_overseer *xso;
+};
+
+/*!
  * Run the headless discovery pass and fill @p out. Creates an instance and
  * system devices with NO compositor, runs the real plug-in discovery path,
  * reads display info, then tears everything down. Emits nothing to stdout
@@ -114,7 +134,26 @@ struct cli_query_result
 void
 cli_query_run(struct cli_query_result *out);
 
+/*!
+ * As @ref cli_query_run but leaves the runtime objects alive in @p h; pair
+ * with @ref cli_query_teardown. The snapshot in @p out is self-contained
+ * either way (no pointers into the live objects).
+ */
+void
+cli_query_fill(struct cli_query_result *out, struct cli_query_handles *h);
+
+void
+cli_query_teardown(struct cli_query_handles *h);
+
 /* Serializers — info dump (all fields) and self-test (per-check verdict). */
+
+/* cJSON tree builders (caller owns the returned object); the print_*_json
+ * functions are thin printf wrappers over these. */
+cJSON *
+cli_query_info_to_cjson(const struct cli_query_result *r);
+
+cJSON *
+cli_query_selftest_to_cjson(const struct cli_query_result *r);
 
 void
 cli_query_print_info_text(const struct cli_query_result *r);

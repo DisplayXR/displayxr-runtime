@@ -144,9 +144,10 @@ read_active_runtime(struct cli_query_result *r)
 #endif
 
 void
-cli_query_run(struct cli_query_result *r)
+cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h)
 {
 	memset(r, 0, sizeof(*r));
+	memset(h, 0, sizeof(*h));
 	snprintf(r->runtime_description, sizeof(r->runtime_description), "%s", u_runtime_description);
 	snprintf(r->git_tag, sizeof(r->git_tag), "%s", u_git_tag);
 	r->plugin_abi_version = (uint32_t)XRT_PLUGIN_API_VERSION_CURRENT;
@@ -156,29 +157,24 @@ cli_query_run(struct cli_query_result *r)
 	read_active_runtime(r);
 #endif
 
-	struct xrt_instance *xi = NULL;
-	struct xrt_system *xsys = NULL;
-	struct xrt_system_devices *xsysd = NULL;
-	struct xrt_space_overseer *xso = NULL;
-
-	if (xrt_instance_create(NULL, &xi) != 0) {
+	if (xrt_instance_create(NULL, &h->xi) != 0) {
 		return; // instance_ok stays false, result_code = INIT_FAIL
 	}
 	r->instance_ok = true;
 
-	xrt_result_t xret = xrt_instance_create_system(xi, &xsys, &xsysd, &xso, NULL);
-	if (xret != XRT_SUCCESS || xsysd == NULL) {
+	xrt_result_t xret = xrt_instance_create_system(h->xi, &h->xsys, &h->xsysd, &h->xso, NULL);
+	if (xret != XRT_SUCCESS || h->xsysd == NULL) {
 		r->result_code = CLI_SELFTEST_INIT_FAIL;
-		goto out;
+		return;
 	}
 	r->system_ok = true;
 
 	// The head role is the display-processor-backed device the active
 	// plug-in created through the builder. No head = no display.
-	struct xrt_device *head = xsysd->static_roles.head;
+	struct xrt_device *head = h->xsysd->static_roles.head;
 	if (head == NULL) {
 		r->result_code = CLI_SELFTEST_NO_DP;
-		goto out;
+		return;
 	}
 	r->head_ok = true;
 	snprintf(r->head_str, sizeof(r->head_str), "%s", head->str);
@@ -195,7 +191,7 @@ cli_query_run(struct cli_query_result *r)
 	const struct xrt_plugin_iface *iface = target_plugin_get_active();
 	if (iface == NULL) {
 		r->result_code = CLI_SELFTEST_NO_DP;
-		goto out;
+		return;
 	}
 	r->plugin_ok = true;
 	snprintf(r->plugin_id, sizeof(r->plugin_id), "%s", iface->id ? iface->id : "");
@@ -205,14 +201,14 @@ cli_query_run(struct cli_query_result *r)
 
 	if (iface->get_display_info == NULL) {
 		r->result_code = CLI_SELFTEST_BAD_INFO;
-		goto out;
+		return;
 	}
 
 	struct xrt_plugin_display_info info = {0};
 	info.struct_size = (uint32_t)sizeof(info);
 	if (!iface->get_display_info(target_plugin_get_active_instance(), head, &info)) {
 		r->result_code = CLI_SELFTEST_BAD_INFO;
-		goto out;
+		return;
 	}
 	r->display_info = info;
 	r->display_info_ok = true;
@@ -220,7 +216,7 @@ cli_query_run(struct cli_query_result *r)
 	if (!(info.display_width_m > 0.0f) || !(info.display_height_m > 0.0f) || info.display_pixel_width == 0 ||
 	    info.display_pixel_height == 0) {
 		r->result_code = CLI_SELFTEST_BAD_INFO;
-		goto out;
+		return;
 	}
 	r->dims_ok = true;
 	r->result_code = CLI_SELFTEST_PASS;
@@ -235,12 +231,23 @@ cli_query_run(struct cli_query_result *r)
 #else
 	snprintf(r->zone_probe_note, sizeof(r->zone_probe_note), "not probed: zone-caps probe is Windows-only (OK)");
 #endif
+}
 
-out:
-	xrt_space_overseer_destroy(&xso);
-	xrt_system_devices_destroy(&xsysd);
-	xrt_system_destroy(&xsys);
-	xrt_instance_destroy(&xi);
+void
+cli_query_teardown(struct cli_query_handles *h)
+{
+	xrt_space_overseer_destroy(&h->xso);
+	xrt_system_devices_destroy(&h->xsysd);
+	xrt_system_destroy(&h->xsys);
+	xrt_instance_destroy(&h->xi);
+}
+
+void
+cli_query_run(struct cli_query_result *r)
+{
+	struct cli_query_handles h;
+	cli_query_fill(r, &h);
+	cli_query_teardown(&h);
 }
 
 
@@ -355,9 +362,10 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	PT("modes:        %u\n", r->rendering_mode_count);
 	for (uint32_t m = 0; m < r->rendering_mode_count; m++) {
 		const struct xrt_rendering_mode *rm = &r->rendering_modes[m];
-		PT("  [%u] %-14s views=%u 3d=%c tracked=%c\n", rm->mode_index, rm->mode_name, rm->view_count,
+		PT("  [%u] %-14s views=%u 3d=%c tracked=%c rot=%c\n", rm->mode_index, rm->mode_name, rm->view_count,
 		   rm->hardware_display_3d ? 'y' : 'n',
-		   (rm->mode_flags & XRT_RENDERING_MODE_FLAG_HAS_TRACKING) ? 'y' : 'n');
+		   (rm->mode_flags & XRT_RENDERING_MODE_FLAG_HAS_TRACKING) ? 'y' : 'n',
+		   (rm->mode_flags & XRT_RENDERING_MODE_FLAG_CAN_ROTATE) ? 'y' : 'n');
 	}
 
 	P(" :: Local zone caps (#224/ADR-027, headless D3D11 WARP probe)\n");
@@ -377,8 +385,8 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	}
 }
 
-void
-cli_query_print_info_json(const struct cli_query_result *r)
+cJSON *
+cli_query_info_to_cjson(const struct cli_query_result *r)
 {
 	cJSON *root = cJSON_CreateObject();
 
@@ -420,6 +428,7 @@ cli_query_print_info_json(const struct cli_query_result *r)
 			cJSON_AddBoolToObject(o, "hardware_display_3d", rm->hardware_display_3d);
 			cJSON_AddBoolToObject(o, "has_tracking",
 			                      (rm->mode_flags & XRT_RENDERING_MODE_FLAG_HAS_TRACKING) != 0);
+			cJSON_AddBoolToObject(o, "can_rotate", (rm->mode_flags & XRT_RENDERING_MODE_FLAG_CAN_ROTATE) != 0);
 			cJSON_AddItemToArray(rms, o);
 		}
 	} else {
@@ -477,6 +486,13 @@ cli_query_print_info_json(const struct cli_query_result *r)
 		}
 	}
 
+	return root;
+}
+
+void
+cli_query_print_info_json(const struct cli_query_result *r)
+{
+	cJSON *root = cli_query_info_to_cjson(r);
 	char *out = cJSON_Print(root);
 	if (out != NULL) {
 		printf("%s\n", out);
@@ -584,8 +600,8 @@ cli_query_print_selftest_text(const struct cli_query_result *r)
 	}
 }
 
-void
-cli_query_print_selftest_json(const struct cli_query_result *r)
+cJSON *
+cli_query_selftest_to_cjson(const struct cli_query_result *r)
 {
 	cJSON *root = cJSON_CreateObject();
 
@@ -603,6 +619,13 @@ cli_query_print_selftest_json(const struct cli_query_result *r)
 	cJSON_AddStringToObject(root, "verdict", r->result_code == CLI_SELFTEST_PASS ? "PASS" : "FAIL");
 	cJSON_AddNumberToObject(root, "result_code", (double)r->result_code);
 
+	return root;
+}
+
+void
+cli_query_print_selftest_json(const struct cli_query_result *r)
+{
+	cJSON *root = cli_query_selftest_to_cjson(r);
 	char *out = cJSON_Print(root);
 	if (out != NULL) {
 		printf("%s\n", out);
