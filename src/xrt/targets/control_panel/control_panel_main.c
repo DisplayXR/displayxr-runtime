@@ -24,6 +24,9 @@
 #include <cjson/cJSON.h>
 
 #include <SDL2/SDL.h>
+#ifdef _WIN32
+#include <SDL2/SDL_syswm.h> // real HWND, to size the ImGui window from the client rect
+#endif
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -459,6 +462,12 @@ draw_panel(struct panel_state *s)
 	                         ImGuiWindowFlags_NoSavedSettings;
 	igBegin("DisplayXR Control Panel", NULL, flags);
 
+	// Wrap all text at the window's right edge so long values (device
+	// strings, ActiveRuntime path, self-test details) reflow instead of
+	// clipping. Pos 0.0f tracks the content-region width, so it follows
+	// the window live on resize. Popped before every igEnd() below.
+	igPushTextWrapPos(0.0f);
+
 	if (igButton("Refresh", (ImVec2){0, 0})) {
 		refresh_all(s);
 	}
@@ -475,6 +484,7 @@ draw_panel(struct panel_state *s)
 	if (!s->have_info) {
 		igSpacing();
 		igTextColored(COL_RED, "%s", s->info_err[0] ? s->info_err : "No runtime info.");
+		igPopTextWrapPos();
 		igEnd();
 		return;
 	}
@@ -523,6 +533,11 @@ draw_panel(struct panel_state *s)
 		igText("Physical : %.4f m x %.4f m", s->w_m, s->h_m);
 		igText("Pixels   : %d x %d", s->px, s->py);
 		igText("Viewer   : (%.3f, %.3f, %.3f) m", s->vx, s->vy, s->vz);
+		if (igIsItemHovered(0)) {
+			igSetTooltip("Nominal viewer (eye) position relative to the display centre, "
+			             "in metres (x=right, y=up, z=out toward the user). Drives the "
+			             "Kooima projection default when the app has no head tracking.");
+		}
 		igText("Eye-tracking : %s (0x%x), default %s",
 		       s->et_supported_label[0] ? s->et_supported_label : "?", (unsigned)s->et_modes,
 		       s->et_default_label[0] ? s->et_default_label : "?");
@@ -558,7 +573,12 @@ draw_panel(struct panel_state *s)
 
 	// ---- Tier 1: DP switch ----
 	igSeparatorText("Display-processor switch (PreferredPlugin override)");
-	igText("PreferredPlugin : %s", s->have_preferred ? s->preferred : "<unset>");
+	igText("PreferredPlugin : %s", s->have_preferred ? s->preferred : "<unset> (auto - by probe order)");
+	if (igIsItemHovered(0)) {
+		igSetTooltip("Optional manual override that forces a specific display processor. "
+		             "When unset (the normal state), the runtime auto-selects by probe order; "
+		             "the active plug-in is shown under 'Display processor' above.");
+	}
 	for (int i = 0; i < s->n_dp; i++) {
 		struct dp_row *r = &s->dps[i];
 		igText("%s %s id='%s' (ProbeOrder %d)%s", r->active ? "*" : " ",
@@ -584,6 +604,7 @@ draw_panel(struct panel_state *s)
 		igTextWrapped("%s", s->last_action);
 	}
 
+	igPopTextWrapPos();
 	igEnd();
 }
 
@@ -593,6 +614,64 @@ draw_panel(struct panel_state *s)
  * SDL2 + OpenGL3 host.
  *
  */
+
+//! Everything needed to paint one frame. Passed to the resize event watch so
+//! the panel can repaint *during* Windows' modal move/size loop — that loop
+//! blocks the normal main loop, so without this the content only reflows on
+//! mouse release (it appears to "stretch" mid-drag, then snap-wrap).
+struct frame_ctx
+{
+	SDL_Window *win;
+	ImGuiIO *io;
+	struct panel_state *state;
+	void *hwnd; // HWND on Windows, NULL elsewhere
+};
+
+//! Paint exactly one frame: new ImGui frame (sized from the live client rect on
+//! Windows), the panel, then present.
+static void
+render_frame(struct frame_ctx *c)
+{
+	ImGui_ImplOpenGL3_NewFrame();
+	ImGui_ImplSDL2_NewFrame();
+#ifdef _WIN32
+	// Override the (possibly stale) backend size with the true client rect so
+	// the full-window panel + its wrap edge track live resizes.
+	if (c->hwnd != NULL) {
+		RECT rc;
+		if (GetClientRect((HWND)c->hwnd, &rc) && rc.right > rc.left && rc.bottom > rc.top) {
+			c->io->DisplaySize.x = (float)(rc.right - rc.left);
+			c->io->DisplaySize.y = (float)(rc.bottom - rc.top);
+			c->io->DisplayFramebufferScale.x = 1.0f;
+			c->io->DisplayFramebufferScale.y = 1.0f;
+		}
+	}
+#endif
+	igNewFrame();
+
+	draw_panel(c->state);
+
+	igRender();
+	glViewport(0, 0, (int)c->io->DisplaySize.x, (int)c->io->DisplaySize.y);
+	glClearColor(0.10f, 0.11f, 0.13f, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+	ImGui_ImplOpenGL3_RenderDrawData(igGetDrawData());
+	SDL_GL_SwapWindow(c->win);
+}
+
+//! SDL event watch: fires synchronously as events are *sent*, including from
+//! inside Windows' modal resize loop (where the main loop is blocked).
+//! Repainting on every size change is what makes the panel reflow live while
+//! the user drags the window edge.
+static int SDLCALL
+resize_event_watch(void *userdata, SDL_Event *e)
+{
+	if (e->type == SDL_WINDOWEVENT &&
+	    (e->window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e->window.event == SDL_WINDOWEVENT_EXPOSED)) {
+		render_frame((struct frame_ctx *)userdata);
+	}
+	return 0;
+}
 
 int
 main(int argc, char *argv[])
@@ -669,6 +748,33 @@ main(int argc, char *argv[])
 	// the window paints immediately instead of freezing black on launch.
 	bool did_initial = false;
 
+#ifdef _WIN32
+	// On this HighDPI Win32 path SDL's cached window size doesn't reliably
+	// follow OS resizes, which pinned the ImGui window — and thus the text
+	// wrap edge — to the launch width (text clipped instead of reflowing).
+	// Drive the window size from the real client rect each frame instead.
+	HWND panel_hwnd = NULL;
+	{
+		SDL_SysWMinfo wmi;
+		SDL_VERSION(&wmi.version);
+		if (SDL_GetWindowWMInfo(win, &wmi)) {
+			panel_hwnd = wmi.info.win.window;
+		}
+	}
+#endif
+
+	struct frame_ctx fctx;
+	fctx.win = win;
+	fctx.io = io;
+	fctx.state = &state;
+#ifdef _WIN32
+	fctx.hwnd = panel_hwnd;
+#else
+	fctx.hwnd = NULL;
+#endif
+	// Repaint during the modal move/size loop (live resize).
+	SDL_AddEventWatch(resize_event_watch, &fctx);
+
 	bool running = true;
 	while (running) {
 		SDL_Event e;
@@ -683,18 +789,7 @@ main(int argc, char *argv[])
 			}
 		}
 
-		ImGui_ImplOpenGL3_NewFrame();
-		ImGui_ImplSDL2_NewFrame();
-		igNewFrame();
-
-		draw_panel(&state);
-
-		igRender();
-		glViewport(0, 0, (int)io->DisplaySize.x, (int)io->DisplaySize.y);
-		glClearColor(0.10f, 0.11f, 0.13f, 1.0f);
-		glClear(GL_COLOR_BUFFER_BIT);
-		ImGui_ImplOpenGL3_RenderDrawData(igGetDrawData());
-		SDL_GL_SwapWindow(win);
+		render_frame(&fctx);
 
 		if (!did_initial) {
 			refresh_all(&state);
@@ -702,6 +797,7 @@ main(int argc, char *argv[])
 		}
 	}
 
+	SDL_DelEventWatch(resize_event_watch, &fctx);
 	ImGui_ImplOpenGL3_Shutdown();
 	ImGui_ImplSDL2_Shutdown();
 	igDestroyContext(NULL);
