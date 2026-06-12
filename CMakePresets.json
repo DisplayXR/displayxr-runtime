@@ -12,10 +12,34 @@
             "displayName": "Default (same as service-debug)"
         },
         {
+            "name": ".common",
+            "hidden": true,
+            "toolchainFile": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake",
+            "cacheVariables": {
+                "VCPKG_MANIFEST_FEATURES": "gui",
+                "OpenXR_ROOT": "${sourceDir}/openxr_sdk"
+            }
+        },
+        {
             "name": ".base-ninja",
             "generator": "Ninja",
             "hidden": true,
+            "inherits": ".common",
             "binaryDir": "${sourceDir}/build"
+        },
+        {
+            "name": "vs2022",
+            "displayName": "Visual Studio 2022 solution",
+            "description": "Multi-config VS solution at build_vs2022/. Folds cube_handle_d3d11_win in as the startup target (F5 launches it against this dev runtime). Mirrors `build_windows.bat vs2022`. Needs a prior build_windows.bat run to fetch vcpkg + the OpenXR loader.",
+            "generator": "Visual Studio 17 2022",
+            "architecture": "x64",
+            "inherits": ".common",
+            "binaryDir": "${sourceDir}/build_vs2022",
+            "cacheVariables": {
+                "XRT_FEATURE_SERVICE": "ON",
+                "XRT_FEATURE_HYBRID_MODE": "ON",
+                "XRT_VS_LAUNCH_APP": "cube_handle_d3d11_win"
+            }
         },
         {
             "name": "service-debug",
