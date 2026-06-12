@@ -125,6 +125,12 @@ comp_ipc_client_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint
 void
 comp_ipc_client_compositor_request_display_mode(struct xrt_compositor *xc, uint32_t enable_3d);
 
+// IPC-client CONTENT rendering-mode push to the out-of-process server (#553) —
+// same linkage pattern. The atlas recipe (ADR-028), deliberately a separate
+// channel from the hardware bit above.
+void
+comp_ipc_client_compositor_request_rendering_mode(struct xrt_compositor *xc, uint32_t mode_index);
+
 // Same fetch via the SYSTEM compositor (#449) for compositor-less sessions
 // (headless XR_MND_headless clients like the WebXR bridge, which have no
 // xcn). Same linkage pattern as above.
@@ -477,6 +483,59 @@ oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *ses
 }
 
 void
+oxr_session_push_rendering_mode_ipc(struct oxr_session *sess, uint32_t mode_index)
+{
+	if (sess == NULL || sess->xcn == NULL) {
+		return;
+	}
+
+	// Out-of-process IPC client only (single-app OOP Android, #553): push the
+	// CONTENT rendering mode (the atlas recipe, ADR-028) to the server, where
+	// the per-client multi_compositor records it and clamps the submission to
+	// the mode grid. In-process the head device IS the mode authority and the
+	// compositors read it directly — nothing to push. Deliberately a separate
+	// channel from the hardware 2D/3D request above (the two are orthogonal).
+	// Mirrors oxr_session_request_display_mode's dispatch gating.
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+	if (sess->is_d3d11_native_compositor) {
+		return;
+	}
+#endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+	if (sess->is_d3d12_native_compositor) {
+		return;
+	}
+#endif
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+	if (sess->is_metal_native_compositor) {
+		return;
+	}
+#endif
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+	if (sess->is_gl_native_compositor) {
+		return;
+	}
+#endif
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->is_vk_native_compositor) {
+		return;
+	}
+#endif
+
+	// In-process multi compositor path — head device covers it.
+	if (sess->sys->xsysc != NULL && sess->sys->xsysc->xmcc != NULL) {
+		return;
+	}
+
+	// Bridge-relay sessions forward to the browser and own no server compositor.
+	if (sess->is_bridge_relay) {
+		return;
+	}
+
+	comp_ipc_client_compositor_request_rendering_mode(&sess->xcn->base, mode_index);
+}
+
+void
 oxr_session_set_eye_tracking_mode(struct oxr_session *sess, uint32_t mode)
 {
 	if (sess == NULL || sess->xcn == NULL) {
@@ -798,6 +857,9 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 				struct xrt_rendering_mode *mode = &head->rendering_modes[default_mode];
 				oxr_session_request_display_mode(log, sess, mode->hardware_display_3d);
 				xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, default_mode);
+				// #553: seed the server's CONTENT mode copy before the
+				// first frame (out-of-process only; no-op in-process).
+				oxr_session_push_rendering_mode_ipc(sess, default_mode);
 			} else {
 				oxr_session_request_display_mode(log, sess, true);
 			}
@@ -842,6 +904,9 @@ oxr_session_end(struct oxr_logger *log, struct oxr_session *sess)
 		    !head->rendering_modes[0].hardware_display_3d) {
 			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 0);
 			head->hmd->active_rendering_mode_index = 0;
+			// #553: mirror the reset on the server's CONTENT mode copy
+			// (out-of-process only; no-op in-process).
+			oxr_session_push_rendering_mode_ipc(sess, 0);
 		}
 		oxr_session_request_display_mode(log, sess, false);
 	}

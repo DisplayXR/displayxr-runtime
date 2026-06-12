@@ -91,11 +91,10 @@ views lose nothing) but is the compat path, not the recommendation.
 
 ## Known divergences (tracked, not design)
 
-- **Android single-app OOP (`comp_multi_system.c`, #541):** the active mode
-  does not cross IPC (only the hardware bit does, via
-  `compositor_request_display_mode`), so the server's mode copy is stale and
-  the submission is the only honest geometry signal — that path builds a
-  `view_count×1` atlas from the submission. Bounded in practice (no zones on
-  that path; identical-view over-submission weaves to ≈the original image).
-  Retire by plumbing the mode index (or the content grid) over IPC, then
-  adopting the mode clamp there (#553).
+(The Android single-app OOP divergence was retired by #553: the CONTENT mode
+crosses IPC via `compositor_request_rendering_mode` — mirroring #541's
+hardware-bit message — and `comp_multi_system.c` adopts the mode clamp.)
+
+(The Metal divergence was retired by #556: `comp_metal_compositor.m` adopts the
+mode clamp instead of deriving the atlas from the submission, dropping the
+latent always-stereo-in-2D bug.)

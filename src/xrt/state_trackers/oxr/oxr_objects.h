@@ -937,6 +937,16 @@ XrResult
 oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *sess, bool enable_3d);
 
 /*!
+ * Push the active CONTENT rendering mode (the atlas recipe, ADR-028) to the
+ * out-of-process server (#553). No-op for in-process sessions (the head device
+ * is the mode authority there) and bridge-relay sessions. Deliberately a
+ * separate channel from @ref oxr_session_request_display_mode — mode and
+ * hardware state are orthogonal.
+ */
+void
+oxr_session_push_rendering_mode_ipc(struct oxr_session *sess, uint32_t mode_index);
+
+/*!
  * Push the session's eye-tracking control mode (MANAGED=0 / MANUAL=1) to the
  * display processor (#522). Best-effort policy hint; the DP enacts whatever the
  * vendor advertised. Routed in-process via the native compositor or

@@ -262,6 +262,31 @@ comp_ipc_client_compositor_request_display_mode(struct xrt_compositor *xc, uint3
 }
 
 /*
+ * Push the active CONTENT rendering mode (the atlas recipe, ADR-028) to the
+ * out-of-process server (#553). Deliberately a SEPARATE channel from the
+ * hardware 2D/3D request above — mode is the content recipe, hardware state
+ * is orthogonal. Without this the server's mode copy is stale and the multi
+ * compositor had to derive the atlas grid from the submission (the recurring
+ * bug class ADR-028 documents). Same gating contract as
+ * comp_ipc_client_compositor_request_display_mode. Best-effort — no-op on
+ * IPC failure.
+ */
+void
+comp_ipc_client_compositor_request_rendering_mode(struct xrt_compositor *xc, uint32_t mode_index)
+{
+	if (xc == NULL) {
+		return;
+	}
+
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return;
+	}
+
+	(void)ipc_call_compositor_request_rendering_mode(icc->ipc_c, mode_index);
+}
+
+/*
  * Full DP eye-position struct incl. is_tracking, over IPC (#441 Phase 2).
  * Same gating contract as comp_ipc_client_compositor_get_window_metrics:
  * only safe to call when `xc` is an ipc_client_compositor (the OpenXR state

@@ -2154,15 +2154,45 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	}
 #endif
 
-	// CONTENT: the atlas holds exactly the tiles the app submitted (1 = 2D, ≥2 = 3D),
-	// independent of the hardware weave-state (#533 decouple). The app submits the
-	// active mode's tile count with per-view imageRects; the DP weaves or shows flat
-	// per mc->hardware_display_3d.
-	uint32_t view_count = layer->data.view_count;
-	if (view_count < 1)
-		view_count = 1;
-	if (view_count > XRT_MAX_VIEWS)
-		view_count = XRT_MAX_VIEWS;
+	// CONTENT: the atlas recipe is the active MODE's (ADR-028, #553) — the
+	// submission clamps DOWN to it, mirroring the in-process compositors
+	// (comp_d3d11_renderer_compute_effective_layout). In-process the head
+	// device is the mode authority, so sync the grid from it here (after the
+	// qwerty block, to pick up same-frame V/1-2-3 changes); out-of-process
+	// head is NULL and the mode arrives via compositor_request_rendering_mode
+	// over IPC. Orthogonal to mc->hardware_display_3d (the DP weave-state).
+	if (xdev_head != NULL && xdev_head->hmd != NULL) {
+		uint32_t idx = xdev_head->hmd->active_rendering_mode_index;
+		if (idx < xdev_head->rendering_mode_count) {
+			multi_compositor_set_rendering_mode(mc, idx,
+			                                    xdev_head->rendering_modes[idx].tile_columns,
+			                                    xdev_head->rendering_modes[idx].tile_rows);
+		}
+	}
+
+	uint32_t submitted_views = layer->data.view_count;
+	if (submitted_views < 1)
+		submitted_views = 1;
+	if (submitted_views > XRT_MAX_VIEWS)
+		submitted_views = XRT_MAX_VIEWS;
+
+	// Fallback (no mode has arrived yet): the legacy submission-derived strip.
+	uint32_t mode_cols = mc->active_mode_valid ? mc->mode_tile_columns : submitted_views;
+	uint32_t mode_rows = mc->active_mode_valid ? mc->mode_tile_rows : 1;
+	uint32_t mode_tiles = mode_cols * mode_rows;
+
+	// Clamp: always-stereo apps submit the xrLocateViews max view count even
+	// in mono modes — without the clamp that builds an oversized atlas (the
+	// recurring left-shift bug class ADR-028 documents). The min() also kills
+	// the old 2D⇄3D transition hazard: during the one-frame skew between the
+	// mode flip and the content adapting, the atlas never exceeds what was
+	// actually submitted.
+	uint32_t view_count = submitted_views < mode_tiles ? submitted_views : mode_tiles;
+
+	// Mono → one tile spanning the full content region; otherwise the MODE
+	// grid (an under-submitting app paints the first view_count tiles).
+	uint32_t tile_columns = (view_count == 1) ? 1 : mode_cols;
+	uint32_t tile_rows = (view_count == 1) ? 1 : mode_rows;
 
 	int imageWidth = 0, imageHeight = 0;
 	VkFormat imageFormat = VK_FORMAT_UNDEFINED;
@@ -2338,16 +2368,8 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		// for stereo).
 		// ================================================================
 		{
-			// #533 decouple: the atlas layout is the CONTENT the app submitted, not
-			// the (out-of-process stale) server rendering mode. The app submits
-			// view_count tiles with per-view imageRects in a horizontal strip — 1
-			// tile (2D) or 2 (3D) — so build a matching view_count×1 atlas. This keeps
-			// the atlas in lockstep with the submission across a 2D⇄3D transition,
-			// even when the hardware flag (flipped on the fast IPC request) briefly
-			// leads the content by a frame — otherwise a stale 2x1 layout × a 2D-sized
-			// tile builds an oversized atlas that overflows the app swapchain.
-			uint32_t tile_columns = view_count > 0 ? view_count : 1;
-			uint32_t tile_rows = 1;
+			// The atlas grid (tile_columns × tile_rows) is the MODE's, clamped
+			// to the submission — computed above (ADR-028, #553).
 
 			// Determine blit sources — either composited overlay images or
 			// direct swapchain sub-regions.
