@@ -11,6 +11,7 @@ package org.freedesktop.monado.auxiliary;
 
 import android.app.Activity;
 import android.content.Context;
+import android.graphics.PixelFormat;
 import android.hardware.display.DisplayManager;
 import android.os.Handler;
 import android.os.Looper;
@@ -79,6 +80,27 @@ public class MonadoView extends SurfaceView
         }
         SurfaceHolder surfaceHolder = getHolder();
         surfaceHolder.addCallback(this);
+        // P0 transparency spike (#568): a translucent SurfaceView z-ordered as a
+        // media overlay lets SurfaceFlinger composite the weaved content over the
+        // live screen. Gated on `debug.dxr.transparent` so other apps over this
+        // runtime are unaffected. Layer A drives this from the per-session flag.
+        if (isTransparentSpikeEnabled()) {
+            setZOrderMediaOverlay(true);
+            surfaceHolder.setFormat(PixelFormat.TRANSLUCENT);
+            Log.i(TAG, "MonadoView: TRANSLUCENT media-overlay surface (#568 transparency spike)");
+        }
+    }
+
+    /** Reads the `debug.dxr.transparent` sysprop via the hidden SystemProperties API. */
+    private static boolean isTransparentSpikeEnabled() {
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            String v = (String) sp.getMethod("get", String.class).invoke(null, "debug.dxr.transparent");
+            return v != null && (v.startsWith("1") || v.startsWith("t") || v.startsWith("T")
+                    || v.startsWith("y") || v.startsWith("Y"));
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     @Override

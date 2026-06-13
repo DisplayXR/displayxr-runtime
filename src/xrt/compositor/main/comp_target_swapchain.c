@@ -25,10 +25,30 @@
 #include "android/android_globals.h"
 #include "util/u_time.h"
 #include <android/native_window.h>
+#include <sys/system_properties.h>
 #endif
 
 #include <assert.h>
 #include <stdlib.h>
+
+#ifdef XRT_OS_ANDROID
+/*!
+ * P0 transparency spike (#568): the OOP service has no env block we can set, so
+ * a device sysprop is the dev override. `adb shell setprop debug.dxr.transparent 1`
+ * makes the present surface alpha-capable so SurfaceFlinger composites the
+ * weaved content over the live screen. Layer A will OR this with the real
+ * per-session transparent_background flag.
+ */
+static bool
+android_transparent_requested(void)
+{
+	char value[PROP_VALUE_MAX] = {0};
+	if (__system_property_get("debug.dxr.transparent", value) > 0) {
+		return value[0] == '1' || value[0] == 't' || value[0] == 'T' || value[0] == 'y' || value[0] == 'Y';
+	}
+	return false;
+}
+#endif
 
 
 /*
@@ -768,7 +788,35 @@ comp_target_swapchain_create_images(struct comp_target *ct, const struct comp_ta
 	 * VkSurfaceCapabilitiesKHR structure returned by vkGetPhysicalDeviceSurfaceCapabilitiesKHR for the surface.
 	 */
 	VkCompositeAlphaFlagsKHR composite_alpha = 0;
-	if (surface_caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) {
+	bool want_transparent = false;
+#ifdef XRT_OS_ANDROID
+	want_transparent = android_transparent_requested();
+	// P0/#568: log every advertised bit so we know what the translucent
+	// SurfaceView's VkSurfaceKHR actually exposes on this device. WARN so it
+	// survives the service's default log level.
+	COMP_WARN(ct->c,
+	          "supportedCompositeAlpha: OPAQUE=%d PRE_MULTIPLIED=%d POST_MULTIPLIED=%d INHERIT=%d (transparent requested=%d)",
+	          !!(surface_caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR),
+	          !!(surface_caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR),
+	          !!(surface_caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR),
+	          !!(surface_caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR), want_transparent);
+#endif
+	if (want_transparent) {
+		// Prefer an alpha-preserving mode. Android WSI typically advertises
+		// INHERIT (alpha governed by the SurfaceView's pixel format) and only
+		// rarely PRE_MULTIPLIED; never pick OPAQUE here (it discards alpha).
+		if (surface_caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR) {
+			composite_alpha = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+		} else if (surface_caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) {
+			composite_alpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+		} else if (surface_caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR) {
+			composite_alpha = VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
+		} else {
+			COMP_WARN(ct->c, "Transparency requested but no alpha-capable composite mode; falling back to OPAQUE");
+			composite_alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+		}
+		COMP_WARN(ct->c, "Transparent present: selected compositeAlpha=0x%x", composite_alpha);
+	} else if (surface_caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) {
 		composite_alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
 	} else if (surface_caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) {
 		composite_alpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
