@@ -38,10 +38,14 @@ oxr_xrGetDisplayZoneCapabilitiesEXT(XrSession session, XrDisplayZoneCapabilities
 	// Never errors on an unsupported session — reports supported = false.
 	// Zones need a window-bound native compositor (the same session class
 	// as local-2D layers); maxZones3D is plugin-independent (zone assembly
-	// is compositor-side, ADR-027 Decision 5).
+	// is compositor-side, ADR-027 Decision 5). Out-of-process sessions
+	// (Android OOP, #568) own no in-process native compositor but still
+	// drive a window-bound per-session compositor via the service — the
+	// is_service_mode flag covers that class (sess->xcn is the IPC proxy).
 	const bool window_bound = (sess->is_d3d11_native_compositor || sess->is_d3d12_native_compositor ||
 	                           sess->is_metal_native_compositor || sess->is_gl_native_compositor ||
-	                           sess->has_external_window) &&
+	                           sess->has_external_window ||
+	                           (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode)) &&
 	                          sess->xcn != NULL;
 
 	capabilities->supported = window_bound ? XR_TRUE : XR_FALSE;

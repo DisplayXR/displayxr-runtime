@@ -1298,9 +1298,14 @@ verify_local_2d_layer(struct oxr_session *sess,
 		                 layer_index);
 	}
 
-	// Same session gate as window-space layers: a window-bound native compositor.
+	// Same session gate as window-space layers (verify_window_space_layer): a
+	// window-bound native compositor, an IPC service-mode session (the service
+	// compositor composites server-side — comp_multi on Android OOP, #568), or a
+	// bound external window. Must match the window-space + zones gates.
+	const bool is_ipc_service = sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode;
 	if (!sess->is_d3d11_native_compositor && !sess->is_d3d12_native_compositor &&
-	    !sess->is_metal_native_compositor && !sess->is_gl_native_compositor && !sess->has_external_window) {
+	    !sess->is_metal_native_compositor && !sess->is_gl_native_compositor && !is_ipc_service &&
+	    !sess->has_external_window) {
 		return oxr_error(log, XR_ERROR_LAYER_INVALID,
 		                 "(frameEndInfo->layers[%u]) local-2D layer requires a session created with a "
 		                 "window binding extension",
@@ -1443,9 +1448,16 @@ verify_zones_frame(struct oxr_session *sess,
 		                 first_unchained, zone_count);
 	}
 
-	// Same session gate as local-2D layers: a window-bound native compositor.
-	if (!sess->is_d3d11_native_compositor && !sess->is_d3d12_native_compositor &&
-	    !sess->is_metal_native_compositor && !sess->is_gl_native_compositor && !sess->has_external_window) {
+	// Same session gate as local-2D layers: a window-bound native compositor,
+	// OR an out-of-process service session (Android OOP, #568) whose per-session
+	// compositor is window-bound via the service. Must match the caps-query gate
+	// in oxr_display_zones.c — both admit is_service_mode or the app activates
+	// zones (caps) then has every zones frame rejected here.
+	const bool zones_window_bound =
+	    sess->is_d3d11_native_compositor || sess->is_d3d12_native_compositor ||
+	    sess->is_metal_native_compositor || sess->is_gl_native_compositor || sess->has_external_window ||
+	    (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode);
+	if (!zones_window_bound) {
 		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
 		                 "(frameEndInfo->layers) zone-chained projection layers require a session created "
 		                 "with a window binding extension");

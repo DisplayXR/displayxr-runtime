@@ -346,6 +346,127 @@ find_active_blend_mode(struct multi_compositor **overlay_sorted_clients, size_t 
  * @param[out] out_image_view The VkImageView for rendering
  * @return true if extraction successful
  */
+/*!
+ * Composite LOCAL_2D layers (XR_EXT_local_3d_zone, e.g. the avatar speech
+ * bubble, #568) into the final per-session target, post-weave, by scale-blitting
+ * each layer image into its destination rect. The target's 2D regions (outside
+ * any 3D zone) were cleared transparent by the DP, and the layer carries its own
+ * alpha, so the blit drops the panel in with transparent margins → the live
+ * screen shows through. Recorded into @p cmd after process_atlas; the target
+ * enters and leaves in COLOR_ATTACHMENT_OPTIMAL so the existing post-weave →
+ * PRESENT barrier is unaffected.
+ *
+ * Layers blit in submission order (alpha-replace, not alpha-over): correct for a
+ * single bubble or non-overlapping 2D layers; overlapping layers would need a
+ * blend pass (deferred — not required by the avatar, which composites its panel
+ * and text into one layer).
+ *
+ * @return true if at least one LOCAL_2D layer was blitted.
+ */
+static bool
+composite_local_2d_layers(struct multi_compositor *mc,
+                          struct vk_bundle *vk,
+                          VkCommandBuffer cmd,
+                          VkImage target_image,
+                          uint32_t fb_width,
+                          uint32_t fb_height)
+{
+	bool any = false;
+	for (uint32_t i = 0; i < mc->delivered.layer_count; i++) {
+		struct multi_layer_entry *layer = &mc->delivered.layers[i];
+		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
+			continue;
+		}
+		const struct xrt_layer_local_2d_data *l2d = &layer->data.local_2d;
+		struct xrt_swapchain *xsc = layer->xscs[0];
+		if (xsc == NULL) {
+			continue;
+		}
+		struct comp_swapchain *sc = comp_swapchain(xsc);
+		uint32_t img_idx = l2d->sub.image_index;
+		VkImage src_image = sc->vkic.images[img_idx].handle;
+		if (src_image == VK_NULL_HANDLE) {
+			continue;
+		}
+
+		// Source sub-rect within the layer image; honor flip_y by swapping
+		// the src Y bounds (same convention as the atlas blit above).
+		int src_x0 = l2d->sub.rect.offset.w;
+		int src_y0 = l2d->sub.rect.offset.h;
+		int src_w = l2d->sub.rect.extent.w;
+		int src_h = l2d->sub.rect.extent.h;
+		int src_top = layer->data.flip_y ? (src_y0 + src_h) : src_y0;
+		int src_bot = layer->data.flip_y ? src_y0 : (src_y0 + src_h);
+
+		// Destination rect — window/canvas px (== panel px on Android OOP),
+		// clamped to the target.
+		int dx0 = l2d->rect.offset.w, dy0 = l2d->rect.offset.h;
+		int dx1 = dx0 + l2d->rect.extent.w, dy1 = dy0 + l2d->rect.extent.h;
+		if (dx0 < 0) dx0 = 0;
+		if (dy0 < 0) dy0 = 0;
+		if (dx1 > (int)fb_width) dx1 = (int)fb_width;
+		if (dy1 > (int)fb_height) dy1 = (int)fb_height;
+		if (dx1 <= dx0 || dy1 <= dy0) {
+			continue;
+		}
+
+		uint32_t arr = l2d->sub.array_index;
+
+		// target COLOR_ATTACHMENT → TRANSFER_DST; src GENERAL → TRANSFER_SRC
+		// (overlay/shared images are kept in GENERAL, matching the window-space path).
+		VkImageMemoryBarrier pre[2] = {
+		    {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		     .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		     .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		     .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		     .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		     .image = target_image,
+		     .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}},
+		    {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		     .srcAccessMask = 0,
+		     .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		     .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+		     .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		     .image = src_image,
+		     .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, arr, 1}},
+		};
+		vk->vkCmdPipelineBarrier(cmd,
+		                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, pre);
+
+		VkImageBlit blit = {
+		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, arr, 1},
+		    .srcOffsets = {{src_x0, src_top, 0}, {src_x0 + src_w, src_bot, 1}},
+		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+		    .dstOffsets = {{dx0, dy0, 0}, {dx1, dy1, 1}},
+		};
+		vk->vkCmdBlitImage(cmd, src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target_image,
+		                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+
+		// restore: target → COLOR_ATTACHMENT, src → GENERAL
+		VkImageMemoryBarrier post[2] = {
+		    {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		     .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		     .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		     .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		     .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		     .image = target_image,
+		     .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}},
+		    {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		     .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		     .dstAccessMask = 0,
+		     .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		     .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		     .image = src_image,
+		     .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, arr, 1}},
+		};
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 2, post);
+		any = true;
+	}
+	return any;
+}
+
 static bool
 get_session_layer_view(struct multi_layer_entry *layer,
                        int view_index,
@@ -358,8 +479,12 @@ get_session_layer_view(struct multi_layer_entry *layer,
 {
 	const struct xrt_layer_data *layer_data = &layer->data;
 
-	// Only support projection layers for SR weaving
-	if (layer_data->type != XRT_LAYER_PROJECTION && layer_data->type != XRT_LAYER_PROJECTION_DEPTH) {
+	// Projection layers for SR weaving, plus zone-3D layers (XR_EXT_display_zones,
+	// #568): xrt_layer_zone_3d_data embeds xrt_layer_projection_data as its first
+	// member, and data.proj / data.zone_3d.proj alias the union's first member —
+	// so the per-view proj/sub reads below are byte-identical for ZONE_3D.
+	if (layer_data->type != XRT_LAYER_PROJECTION && layer_data->type != XRT_LAYER_PROJECTION_DEPTH &&
+	    layer_data->type != XRT_LAYER_ZONE_3D) {
 		return false;
 	}
 
@@ -969,11 +1094,14 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
                                  VkImageView *out_left_view,
                                  VkImageView *out_right_view)
 {
-	// Find the projection layer first
+	// Find the projection (or zone-3D) layer first. Zone-3D carries an
+	// embedded projection (XR_EXT_display_zones, #568) and composites the
+	// same way; only the window-space layer path reaches here today.
 	struct multi_layer_entry *proj_layer = NULL;
 	for (uint32_t i = 0; i < mc->delivered.layer_count; i++) {
 		enum xrt_layer_type type = mc->delivered.layers[i].data.type;
-		if (type == XRT_LAYER_PROJECTION || type == XRT_LAYER_PROJECTION_DEPTH) {
+		if (type == XRT_LAYER_PROJECTION || type == XRT_LAYER_PROJECTION_DEPTH ||
+		    type == XRT_LAYER_ZONE_3D) {
 			proj_layer = &mc->delivered.layers[i];
 			break;
 		}
@@ -2087,13 +2215,37 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		return;
 	}
 
-	// Get the first projection layer
+	// Get the first projection (or zone-3D) layer. A zone-3D layer
+	// (XR_EXT_display_zones, #568) carries an embedded projection plus a
+	// placement rect; it renders exactly like a projection here, then the
+	// rect is handed to the DP as the canvas sub-rect (see process_atlas below).
 	struct multi_layer_entry *layer = NULL;
 	for (uint32_t i = 0; i < mc->delivered.layer_count; i++) {
 		enum xrt_layer_type type = mc->delivered.layers[i].data.type;
-		if (type == XRT_LAYER_PROJECTION || type == XRT_LAYER_PROJECTION_DEPTH) {
+		if (type == XRT_LAYER_PROJECTION || type == XRT_LAYER_PROJECTION_DEPTH ||
+		    type == XRT_LAYER_ZONE_3D) {
 			layer = &mc->delivered.layers[i];
 			break;
+		}
+	}
+
+	// One-shot WARN (per layer-type change) naming what the per-session path
+	// selected and, for a zone (XR_EXT_display_zones / #568), its placement
+	// rect — a lifecycle breadcrumb at the same level as the atlas/DP WARNs
+	// below, so zone-on-OOP framing is greppable without the INFO hot path.
+	{
+		static enum xrt_layer_type last_logged = (enum xrt_layer_type)-1;
+		if (layer != NULL && layer->data.type != last_logged) {
+			last_logged = layer->data.type;
+			if (layer->data.type == XRT_LAYER_ZONE_3D) {
+				const struct xrt_rect *zr = &layer->data.zone_3d.rect;
+				U_LOG_W("[per-session] #568 render layer = ZONE_3D id=%u rect=%d,%d %dx%d",
+				        layer->data.zone_3d.zone_id, zr->offset.w, zr->offset.h,
+				        zr->extent.w, zr->extent.h);
+			} else {
+				U_LOG_W("[per-session] #568 render layer = type %d (not a zone)",
+				        (int)layer->data.type);
+			}
 		}
 	}
 
@@ -2535,6 +2687,21 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			xrt_display_processor_set_target_color_view(mc->session_render.display_processor,
 			                                            ct->images[buffer_index].view);
 
+			// Canvas sub-rect: a zone-3D layer (XR_EXT_display_zones, #568)
+			// confines its woven output to a placement rect (e.g. the avatar's
+			// bottom-75% tiger zone); the DP weaves into that band and clears
+			// outside it transparent. A plain projection layer passes 0,0,0,0
+			// → the DP fills the full target (unchanged for every other app).
+			int32_t canvas_x = 0, canvas_y = 0;
+			uint32_t canvas_w = 0, canvas_h = 0;
+			if (layer->data.type == XRT_LAYER_ZONE_3D) {
+				const struct xrt_rect *zr = &layer->data.zone_3d.rect;
+				canvas_x = zr->offset.w;
+				canvas_y = zr->offset.h;
+				canvas_w = (uint32_t)zr->extent.w;
+				canvas_h = (uint32_t)zr->extent.h;
+			}
+
 			// Call display processor with atlas input
 			xrt_display_processor_process_atlas(
 			    mc->session_render.display_processor, cmd,
@@ -2549,7 +2716,14 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			    (VkImage_XDP)ct->images[buffer_index].handle,
 			    framebufferWidth, framebufferHeight,
 			    (VkFormat_XDP)framebufferFormat,
-			    0, 0, 0, 0);
+			    canvas_x, canvas_y, canvas_w, canvas_h);
+
+			// Composite LOCAL_2D layers (e.g. the avatar speech bubble in the
+			// top-25% 2D band, #568) into the woven target. Post-weave so they
+			// land in the 2D regions the DP left transparent; the target stays
+			// in COLOR_ATTACHMENT for the post-weave barrier below.
+			composite_local_2d_layers(mc, vk, cmd, ct->images[buffer_index].handle,
+			                          framebufferWidth, framebufferHeight);
 
 			// Post-weave barrier: target → PRESENT_SRC_KHR (for HUD overlay + present)
 			VkImageMemoryBarrier post_weave = {
@@ -2893,6 +3067,11 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 			case XRT_LAYER_EQUIRECT1: do_equirect1_layer(xc, mc, layer, i); break;
 			case XRT_LAYER_EQUIRECT2: do_equirect2_layer(xc, mc, layer, i); break;
 			case XRT_LAYER_ZONE_3D: do_zone_3d_layer(xc, mc, layer, i); break;
+			case XRT_LAYER_LOCAL_2D:
+				// 2D overlay consumed only by the per-session render path
+				// (blit into the target's 2D region, #568); the shared/
+				// downstream path has no consumer — drop quietly.
+				break;
 			default: U_LOG_E("Unhandled layer type '%i'!", layer->data.type); break;
 			}
 		}
