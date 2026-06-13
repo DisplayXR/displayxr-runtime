@@ -23,6 +23,20 @@
 #include "org.freedesktop.monado.auxiliary.hpp"
 
 #include <android/native_window_jni.h>
+#include <sys/system_properties.h>
+
+// P0 transparency spike (#568): make the OOP overlay window non-opaque so the
+// live screen shows through the weaved content. Layer A replaces this sysprop
+// gate with the per-session transparent_background flag.
+static bool
+android_transparent_requested(void)
+{
+	char value[PROP_VALUE_MAX] = {0};
+	if (__system_property_get("debug.dxr.transparent", value) > 0) {
+		return value[0] == '1' || value[0] == 't' || value[0] == 'T' || value[0] == 'y' || value[0] == 'Y';
+	}
+	return false;
+}
 
 using wrap::android::content::Context;
 using wrap::android::graphics::PixelFormat;
@@ -145,6 +159,12 @@ android_custom_surface_async_start(
 			}
 		}();
 		lp.setTitle(surface_title);
+		if (android_transparent_requested()) {
+			// PixelFormat.TRANSLUCENT == -3; makes the overlay window non-opaque
+			// so SurfaceFlinger blends the SurfaceView's alpha over the screen.
+			lp.object().set("format", (int32_t)-3);
+			U_LOG_W("android_custom_surface: TRANSLUCENT overlay window (#568 transparency spike)");
+		}
 		ret->monadoView = MonadoView::attachToWindow(displayContext, ret.get(), lp);
 		lp.object().set("preferredDisplayModeId", preferred_display_mode_id);
 
