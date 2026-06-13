@@ -1142,11 +1142,15 @@ multi_compositor_layer_local_2d(struct xrt_compositor *xc,
                                 struct xrt_swapchain *xsc,
                                 const struct xrt_layer_data *data)
 {
-	static bool warned = false;
-	if (!warned) {
-		warned = true;
-		U_LOG_W("Local-2D layers are not consumed on the IPC/service path yet — dropping (one-time warning)");
-	}
+	struct multi_compositor *mc = multi_compositor(xc);
+
+	// Enqueue like a window-space layer (single swapchain). The per-session
+	// render path (Android OOP, #568) blits it into the target's 2D region;
+	// the shared/downstream path drops it quietly (comp_multi_system switch).
+	size_t index = mc->progress.layer_count++;
+	mc->progress.layers[index].xdev = xdev;
+	xrt_swapchain_reference(&mc->progress.layers[index].xscs[0], xsc);
+	mc->progress.layers[index].data = *data;
 
 	return XRT_SUCCESS;
 }
