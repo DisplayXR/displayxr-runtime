@@ -1272,6 +1272,19 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 		mc->state.session_active = false;
 	}
 
+	// The display processor can outlive session_render.initialized: the
+	// Android end_session path deliberately caches it across end->begin
+	// (leia-plugin#39), so a client that ended its session before
+	// disconnecting reaches this destroy with initialized == false and the
+	// DP still alive. Destroy it unconditionally — the vendor destroy also
+	// drops the panel's system-global 3D backlight back to 2D (#563); the
+	// initialized-gated block below destroys it for the still-initialized
+	// case (xrt_display_processor_destroy NULLs the pointer, so at most one
+	// of the two calls acts).
+	if (!mc->session_render.initialized && mc->session_render.display_processor != NULL) {
+		xrt_display_processor_destroy(&mc->session_render.display_processor);
+	}
+
 	// Clean up per-session render resources if still initialized
 	if (mc->session_render.initialized) {
 		// Mark as not initialized AND clear the window handle under
