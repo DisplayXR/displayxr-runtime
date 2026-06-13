@@ -62,6 +62,23 @@
 #include "android/android_custom_surface.h"
 #include "android/android_globals.h"
 #include "android/android_main_thread.h"
+#include "xrt/xrt_display_processor_vk.h" // #568: transparent-background alpha-gate
+#include <sys/system_properties.h>
+
+//! #568: transparency is requested via the debug.dxr.transparent sysprop for now
+//! (Layer A will carry a per-session XR_EXT_android_surface_binding flag over IPC).
+//! This is the transparent-texture / alpha-gate path (NOT chroma-key, which is
+//! deprecated): the compositor tells the vendor DP to reconstruct alpha post-weave,
+//! exactly as the Windows transparent-present path does.
+static bool
+android_transparent_requested(void)
+{
+	char value[PROP_VALUE_MAX] = {0};
+	if (__system_property_get("debug.dxr.transparent", value) > 0) {
+		return value[0] == '1' || value[0] == 't' || value[0] == 'T' || value[0] == 'y' || value[0] == 'Y';
+	}
+	return false;
+}
 
 //! Context for marshaling the vendor DP factory call onto the service main thread.
 struct dp_factory_call_ctx
@@ -1847,6 +1864,23 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 			}
 		}
 	}
+
+#ifdef XRT_OS_ANDROID
+	// #568: enable the transparent-background alpha-gate on the vendor DP so the
+	// weaved avatar floats over the live screen (the DP reconstructs alpha that
+	// the weave destroys — the same transparent-texture path as Windows; NOT
+	// chroma-key). Safe on any DP: the wrapper struct_size-gates and no-ops if
+	// the plug-in didn't advertise the xrt_display_processor_vk variant. Covers
+	// both the freshly-created and the cached (#528) DP. On Android the platform
+	// (SurfaceFlinger) always presents, so client_presents = true.
+	if (mc->session_render.display_processor != NULL && android_transparent_requested()) {
+		xrt_display_processor_vk_set_transparent_background(
+		    (struct xrt_display_processor_vk *)mc->session_render.display_processor,
+		    true,  // enabled
+		    true); // client_presents
+		U_LOG_W("#568: requested transparent-background alpha-gate on the Android DP");
+	}
+#endif
 
 	// Create HUD overlay for runtime-owned windows
 	mc->session_render.hud = NULL;
