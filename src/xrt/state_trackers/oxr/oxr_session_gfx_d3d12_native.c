@@ -93,7 +93,6 @@ oxr_session_populate_d3d12_native(struct oxr_logger *log,
                                    void *window_handle,
                                    void *shared_texture_handle,
                                    bool transparent_background,
-                                   uint32_t chroma_key_color,
                                    struct oxr_session *sess)
 {
 	struct xrt_device *xdev = get_role_head(sess->sys);
@@ -113,7 +112,7 @@ oxr_session_populate_d3d12_native(struct oxr_logger *log,
 	xrt_result_t xret = comp_d3d12_compositor_create(
 	    xdev, window_handle, shared_texture_handle,
 	    (void *)next->device, (void *)next->queue,
-	    dp_factory_d3d12, transparent_background, chroma_key_color,
+	    dp_factory_d3d12, transparent_background,
 	    display_screen_left, display_screen_top, &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,

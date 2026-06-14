@@ -2299,7 +2299,6 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
                              void *d3d12_command_queue,
                              void *dp_factory_d3d12,
                              bool transparent_background,
-                             uint32_t chroma_key_color,
                              int32_t display_screen_left,
                              int32_t display_screen_top,
                              struct xrt_compositor_native **out_xc)
@@ -2541,11 +2540,11 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 			U_LOG_W("D3D12 display processor: output format set to %u (target=%p)",
 			        (unsigned)output_fmt, (void *)c->target);
 
-			// Forward session-level transparency config. The DP runs the
-			// chroma-key fill+strip internally when transparent_background
-			// is set; chroma_key_color=0 means the DP picks its own key.
-			xrt_display_processor_d3d12_set_chroma_key(
-			    c->display_processor, chroma_key_color, transparent_background);
+			// Forward session-level transparency (#573 — chroma-key-free).
+			// client_presents=false: the in-process present is opaque, so the
+			// DP owns see-through (compose-under-bg from the atlas alpha).
+			xrt_display_processor_d3d12_set_transparent_background(
+			    c->display_processor, transparent_background, false);
 		}
 	} else {
 		U_LOG_W("No D3D12 display processor factory provided");

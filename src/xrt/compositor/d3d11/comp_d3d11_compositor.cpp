@@ -2022,10 +2022,9 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// HUD overlay (post-processing, always readable)
 	d3d11_render_hud_overlay(c, weaving_done, &eye_pos);
 
-	// Note: post-weave chroma-key alpha conversion now lives inside the
-	// Leia D3D11 display processor (set_chroma_key + ck_run_post_weave_strip
-	// in leia_display_processor_d3d11.cpp). The compositor is vendor-agnostic
-	// for transparency.
+	// Note: transparency (compose-under-bg / alpha-gate) lives inside the
+	// vendor display processor, enabled via set_transparent_background. The
+	// compositor is vendor-agnostic for transparency.
 
 	// Copy composited output into shared texture if active (dual output: window + shared)
 	if (c->has_shared_texture && c->shared_texture != nullptr) {
@@ -2181,7 +2180,6 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
                              void *dp_factory_d3d11,
                              void *shared_texture_handle,
                              bool transparent_background,
-                             uint32_t chroma_key_color,
                              int32_t display_screen_left,
                              int32_t display_screen_top,
                              struct xrt_compositor_native **out_xc)
@@ -2431,11 +2429,11 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			c->display_processor = nullptr;
 		} else {
 			U_LOG_W("D3D11 display processor created via factory");
-			// Forward session-level transparency config. The DP runs the
-			// chroma-key fill+strip internally when transparent_background
-			// is set; chroma_key_color=0 means the DP picks its own key.
-			xrt_display_processor_d3d11_set_chroma_key(
-			    c->display_processor, chroma_key_color, transparent_background);
+			// Forward session-level transparency (#573 — chroma-key-free).
+			// client_presents=false: the in-process present is opaque, so the
+			// DP owns see-through (compose-under-bg from the atlas alpha).
+			xrt_display_processor_d3d11_set_transparent_background(
+			    c->display_processor, transparent_background, false);
 		}
 	} else {
 		U_LOG_W("No D3D11 display processor factory provided");

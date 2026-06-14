@@ -442,7 +442,6 @@ struct comp_gl_compositor
 
 	// --- Transparent-background opt-in plumbing ---
 	bool transparent_background;
-	uint32_t chroma_key_color;
 
 	// --- Transparent-background present path (Windows: DComp + WGL_NV_DX_interop2) ---
 	// See the big comment block above gl_setup_dcomp_present() for the architecture
@@ -4346,7 +4345,6 @@ comp_gl_compositor_create(struct xrt_device *xdev,
                           void *dp_factory_gl,
                           void *shared_texture_handle,
                           bool transparent_background,
-                          uint32_t chroma_key_color,
                           int32_t display_screen_left,
                           int32_t display_screen_top,
                           struct xrt_compositor_native **out_xcn)
@@ -4354,7 +4352,6 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	struct comp_gl_compositor *c = U_TYPED_CALLOC(struct comp_gl_compositor);
 	c->xdev = xdev;
 	c->transparent_background = transparent_background;
-	c->chroma_key_color = chroma_key_color;
 
 	mcp_capture_init(&c->mcp_capture);
 	mcp_capture_install(&c->mcp_capture);
@@ -4539,14 +4536,15 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		xrt_result_t dp_ret = factory(dp_window, &c->display_processor);
 		if (dp_ret == XRT_SUCCESS && c->display_processor != NULL) {
 			U_LOG_W("GL compositor: display processor created via factory");
-			// Forward session-level transparency config (mirrors the D3D11/
-			// D3D12/VK legs). The Leia GL DP runs its chroma-key fill+strip
-			// internally when transparent_background is set, so per-pixel alpha
-			// survives the weaver and composes through DComp; chroma_key_color=0
-			// means the DP picks its own key. No-op on DPs without the slot
-			// (e.g. sim_display, which preserves alpha natively).
-			xrt_display_processor_gl_set_chroma_key(
-			    c->display_processor, c->chroma_key_color, c->transparent_background);
+			// Forward session-level transparency (#573 — chroma-key-free;
+			// mirrors the D3D11/D3D12/VK legs). client_presents=false: the DP
+			// owns see-through (compose-under-bg from the atlas alpha). The GL
+			// compositor's own DComp transparent present (when interop/readback
+			// is up) is independent and blends the live desktop into the fully
+			// transparent border. No-op on DPs without the slot (e.g.
+			// sim_display, which preserves alpha natively).
+			xrt_display_processor_gl_set_transparent_background(
+			    c->display_processor, c->transparent_background, false);
 		} else {
 			U_LOG_W("GL compositor: display processor factory returned %d, using built-in shaders", dp_ret);
 			c->display_processor = NULL;

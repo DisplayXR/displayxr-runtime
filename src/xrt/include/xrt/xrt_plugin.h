@@ -266,10 +266,19 @@ struct xrt_display_claim
  * The flags word + reserved padding exist so future per-mode capabilities are
  * new bits, not new fields — v3 is intended to be the last rendering-mode
  * layout break.
+ *
+ * v3 → v4 history (#573): the chroma-key transparency mechanism was deleted
+ * everywhere. The `set_chroma_key` slot is removed from all five DP vtables (base
+ * + d3d11/d3d12/gl/metal), shifting every slot after it — a layout break. The
+ * D3D12 and GL DP vtables gain `set_transparent_background` (the chroma-key-free
+ * transparency enable the other variants already had), and the extension struct
+ * drops `chromaKeyColor` (XR_EXT_win32_window_binding SPEC_VERSION 7→8). True
+ * transparency (alpha-capable swapchain + transparent present) is the sole path.
  */
 #define XRT_PLUGIN_API_VERSION_1 1
 #define XRT_PLUGIN_API_VERSION_2 2
 #define XRT_PLUGIN_API_VERSION_3 3
+#define XRT_PLUGIN_API_VERSION_4 4
 
 /*!
  * The version the runtime / plug-in is built against at compile time.
@@ -277,7 +286,7 @@ struct xrt_display_claim
  * `*out_plugin_api_version` are rejected by the runtime (ADR-020 rule 3) with a
  * logged error, and the loader falls back to the next plug-in / sim_display.
  */
-#define XRT_PLUGIN_API_VERSION_CURRENT XRT_PLUGIN_API_VERSION_3
+#define XRT_PLUGIN_API_VERSION_CURRENT XRT_PLUGIN_API_VERSION_4
 
 /*!
  * The single exported symbol every plug-in DLL must provide. C linkage,

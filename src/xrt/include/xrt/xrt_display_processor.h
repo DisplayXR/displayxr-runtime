@@ -263,30 +263,6 @@ struct xrt_display_processor
 	bool (*is_self_submitting)(struct xrt_display_processor *xdp);
 
 	/*!
-	 * Inform the DP of session-level transparency configuration.
-	 * Called once at session start when @p transparent_bg_enabled is set on
-	 * the corresponding window-binding extension. DPs that need the
-	 * chroma-key trick (Leia) use this to enable an internal pre-weave
-	 * fill (transparent atlas pixels → key color) and post-weave strip
-	 * (key color → alpha=0). DPs that are alpha_native may treat this as
-	 * a no-op.
-	 *
-	 * @p key_color is honored as an app-supplied override when non-zero
-	 * (matches today's XR_EXT_win32_window_binding.chromaKeyColor); when
-	 * zero, the DP picks its own internal color.
-	 *
-	 * Optional — NULL means the DP doesn't respect transparency requests.
-	 *
-	 * @param xdp                     Pointer to self.
-	 * @param key_color                App-supplied chroma key (0x00BBGGRR);
-	 *                                 0 means DP-picks (recommended).
-	 * @param transparent_bg_enabled  True when transparency was requested.
-	 */
-	void (*set_chroma_key)(struct xrt_display_processor *xdp,
-	                       uint32_t key_color,
-	                       bool transparent_bg_enabled);
-
-	/*!
 	 * Notify the display processor that the host activity has paused
 	 * (backgrounded). Vendor SDKs use this to drop face-tracking
 	 * cameras, dim backlights, and otherwise save power.
@@ -525,8 +501,8 @@ struct xrt_display_processor
  * What is STILL breaking (and trips an assert below): reordering an existing
  * slot, removing one, changing a signature, or inserting anywhere but the end.
  * That is exactly what broke standalone-VK weaving — on_pause/on_resume were
- * inserted mid-struct (before destroy) without a version bump, so the runtime's
- * set_chroma_key call hit a plug-in's destroy. See ADR-020.
+ * inserted mid-struct (before destroy) without a version bump, so a runtime
+ * vtable call landed on the wrong slot (a plug-in's destroy). See ADR-020.
  *
  * If you change anything that trips an assert below, you are making a BREAKING
  * ABI change. In the SAME change you MUST:
@@ -575,19 +551,18 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_display_dimensions)
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_display_pixel_info)       == XRT_DP_BASE_OFF +  7 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, is_alpha_native)              == XRT_DP_BASE_OFF +  8 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, is_self_submitting)           == XRT_DP_BASE_OFF +  9 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_chroma_key)               == XRT_DP_BASE_OFF + 10 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, on_pause)                     == XRT_DP_BASE_OFF + 11 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, on_resume)                    == XRT_DP_BASE_OFF + 12 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, destroy)                      == XRT_DP_BASE_OFF + 13 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_handoff_color_capability) == XRT_DP_BASE_OFF + 14 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_atlas_encoding)            == XRT_DP_BASE_OFF + 15 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_target_color_view)        == XRT_DP_BASE_OFF + 16 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_background_2d)             == XRT_DP_BASE_OFF + 17 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_eye_tracking_mode)         == XRT_DP_BASE_OFF + 18 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_local_zone_caps)           == XRT_DP_BASE_OFF + 19 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, publish_local_zone_mask)       == XRT_DP_BASE_OFF + 20 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, clear_local_zone_mask)         == XRT_DP_BASE_OFF + 21 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor)                                 == XRT_DP_BASE_OFF + 22 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, on_pause)                     == XRT_DP_BASE_OFF + 10 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, on_resume)                    == XRT_DP_BASE_OFF + 11 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, destroy)                      == XRT_DP_BASE_OFF + 12 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_handoff_color_capability) == XRT_DP_BASE_OFF + 13 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_atlas_encoding)            == XRT_DP_BASE_OFF + 14 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_target_color_view)        == XRT_DP_BASE_OFF + 15 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_background_2d)             == XRT_DP_BASE_OFF + 16 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, set_eye_tracking_mode)         == XRT_DP_BASE_OFF + 17 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, get_local_zone_caps)           == XRT_DP_BASE_OFF + 18 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, publish_local_zone_mask)       == XRT_DP_BASE_OFF + 19 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor, clear_local_zone_mask)         == XRT_DP_BASE_OFF + 20 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor)                                 == XRT_DP_BASE_OFF + 21 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -784,22 +759,6 @@ xrt_display_processor_is_self_submitting(struct xrt_display_processor *xdp)
 		return false;
 	}
 	return xdp->is_self_submitting(xdp);
-}
-
-/*!
- * @copydoc xrt_display_processor::set_chroma_key
- * No-op if not supported (function pointer is NULL).
- * @public @memberof xrt_display_processor
- */
-static inline void
-xrt_display_processor_set_chroma_key(struct xrt_display_processor *xdp,
-                                     uint32_t key_color,
-                                     bool transparent_bg_enabled)
-{
-	if (!XRT_DP_HAS_SLOT(xdp, set_chroma_key) || xdp->set_chroma_key == NULL) {
-		return;
-	}
-	xdp->set_chroma_key(xdp, key_color, transparent_bg_enabled);
 }
 
 /*!

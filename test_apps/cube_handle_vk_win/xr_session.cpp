@@ -450,7 +450,6 @@ bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice
         const char *e = getenv("DISPLAYXR_TRANSPARENT_BG");
         if (e != nullptr && *e != '\0' && *e != '0') {
             sessionTarget.transparentBackgroundEnabled = XR_TRUE;
-            sessionTarget.chromaKeyColor = 0; // DP default
             LOG_INFO("Transparent background ENABLED (DISPLAYXR_TRANSPARENT_BG=1)");
         }
     }

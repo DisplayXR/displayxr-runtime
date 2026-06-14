@@ -34,10 +34,11 @@
 _Static_assert(sizeof(XRT_PLUGIN_ENTRYPOINT_NAME) == sizeof("xrtPluginNegotiate"),
                "xrt_plugin: entry-point symbol name changed; coordinate with all plug-in builds");
 
-/* Current API version is the v3 line (per-mode mode_flags on
- * xrt_rendering_mode, #441) — bump deliberately, not by accident. */
-_Static_assert(XRT_PLUGIN_API_VERSION_CURRENT == XRT_PLUGIN_API_VERSION_3,
-               "xrt_plugin: API version current/v3 drift");
+/* Current API version is the v4 line (#573 removed set_chroma_key from all DP
+ * vtables + added set_transparent_background to d3d12/gl) — bump deliberately,
+ * not by accident. */
+_Static_assert(XRT_PLUGIN_API_VERSION_CURRENT == XRT_PLUGIN_API_VERSION_4,
+               "xrt_plugin: API version current/v4 drift");
 
 /*
  * Host iface layout. struct_size must be the first field so plug-ins can

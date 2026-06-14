@@ -37,10 +37,6 @@ extern "C" {
  * @param transparent_background When true (and hwnd != NULL), bind the swapchain via
  *                               DirectComposition with ALPHA_MODE_PREMULTIPLIED for
  *                               desktop transparency. Otherwise opaque (#163 default).
- * @param chroma_key_color When non-zero (and transparent_background is true), enable
- *                         a post-weave shader pass that converts pixels matching this
- *                         RGB (0x00BBGGRR / Win32 COLORREF) to alpha=0. Required when
- *                         the bound display processor strips alpha during weaving.
  * @param display_screen_left Display top-left X in OS screen coords (from xsysc->info,
  *                            populated by the vendor plug-in iface). 0 = primary.
  * @param display_screen_top  Display top-left Y in OS screen coords. 0 = primary.
@@ -57,7 +53,6 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
                              void *dp_factory_d3d11,
                              void *shared_texture_handle,
                              bool transparent_background,
-                             uint32_t chroma_key_color,
                              int32_t display_screen_left,
                              int32_t display_screen_top,
                              struct xrt_compositor_native **out_xc);

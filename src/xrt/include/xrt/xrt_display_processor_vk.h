@@ -66,9 +66,8 @@ struct xrt_display_processor_vk
 	 * fullscreen alpha-gate pass samples the original premultiplied atlas and
 	 * writes (0,0,0,0) wherever every view tile is α==0 (so the platform
 	 * compositor — SurfaceFlinger on Android — shows the live screen through
-	 * the holes), else the woven RGB at α=1. This supersedes
-	 * @ref xrt_display_processor::set_chroma_key as the transparency enable on
-	 * this path; chroma-key is retired for the Vulkan/Android variant.
+	 * the holes), else the woven RGB at α=1. This is the sole transparency
+	 * enable (#573 removed the legacy chroma-key path everywhere).
 	 *
 	 * @p client_presents mirrors the D3D11 slot for symmetry, but on Android it
 	 * is **always true**: SurfaceFlinger composites the runtime's translucent
@@ -80,9 +79,9 @@ struct xrt_display_processor_vk
 	 * @ref xrt_display_processor_d3d11::set_transparent_background; callers on
 	 * Android pass true.
 	 *
-	 * Optional — an absent slot (older plug-in `struct_size`) or NULL ⟹ the
-	 * runtime falls back to @ref xrt_display_processor::set_chroma_key. Appended
-	 * per ADR-020 (append-only within a major; no version bump).
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL ⟹ the DP
+	 * doesn't support transparent output. Appended per ADR-020 (append-only
+	 * within a major).
 	 *
 	 * @param xdp             Pointer to self.
 	 * @param enabled         true to produce transparent output for see-through.
@@ -124,8 +123,7 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_d
  * @copydoc xrt_display_processor_vk::set_transparent_background
  *
  * Returns false if not supported (the plug-in's `base.struct_size` doesn't cover
- * the slot, or the pointer is NULL) — the caller then falls back to
- * @ref xrt_display_processor_set_chroma_key on the base.
+ * the slot, or the pointer is NULL) — the caller then leaves the DP opaque.
  *
  * Unlike @ref XRT_DP_HAS_SLOT (which assumes a direct `struct_size` member), the
  * presence check here reads `xdp->base.struct_size` because the variant embeds

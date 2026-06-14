@@ -3063,7 +3063,6 @@ oxr_session_create_impl(struct oxr_logger *log,
 			                                       (void *)opengl_win32->hDC,
 			                                       shared_texture_handle,
 			                                       xsi->transparent_background_enabled,
-			                                       xsi->chroma_key_color,
 			                                       *out_session);
 		}
 #endif
@@ -3185,8 +3184,7 @@ oxr_session_create_impl(struct oxr_logger *log,
 			}
 			return oxr_session_populate_vk_native(
 			    log, sys, vulkan, window_handle, shared_texture_handle,
-			    xsi->transparent_background_enabled,
-			    xsi->chroma_key_color, *out_session);
+			    xsi->transparent_background_enabled, *out_session);
 		}
 #endif
 
@@ -3288,7 +3286,7 @@ oxr_session_create_impl(struct oxr_logger *log,
 			return oxr_session_populate_d3d11_native(log, sys, d3d11, xsi->external_window_handle,
 			                                          xsi->shared_texture_handle,
 			                                          xsi->transparent_background_enabled,
-			                                          xsi->chroma_key_color, *out_session);
+			                                          *out_session);
 		}
 #else
 		U_LOG_IFL_I(U_LOGGING_INFO, "D3D11 native compositor NOT compiled in (XRT_HAVE_D3D11_NATIVE_COMPOSITOR not defined)");
@@ -3336,7 +3334,7 @@ oxr_session_create_impl(struct oxr_logger *log,
 			return oxr_session_populate_d3d12_native(log, sys, d3d12, xsi->external_window_handle,
 			                                         xsi->shared_texture_handle,
 			                                         xsi->transparent_background_enabled,
-			                                         xsi->chroma_key_color, *out_session);
+			                                         *out_session);
 		}
 #else
 		U_LOG_IFL_I(U_LOGGING_INFO, "D3D12 native compositor NOT compiled in");
@@ -3528,13 +3526,10 @@ oxr_session_create(struct oxr_logger *log,
 				                              WDA_EXCLUDEFROMCAPTURE)) {
 					U_LOG_W(
 					    "xrCreateSession: SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) "
-					    "failed (err=%lu) — DP compose-under-bg may fall back to chroma-key",
+					    "failed (err=%lu) — DP compose-under-bg disabled for this window",
 					    (unsigned long)GetLastError());
 				}
 			}
-		}
-		if (target_info->chromaKeyColor != 0) {
-			xsi.chroma_key_color = target_info->chromaKeyColor;
 		}
 	}
 #endif

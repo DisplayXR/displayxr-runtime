@@ -1005,12 +1005,6 @@ struct xrt_session_info
 	//! on other graphics APIs. Set via XrWin32WindowBindingCreateInfoEXT::transparentBackgroundEnabled.
 	bool transparent_background_enabled;
 
-	//! Optional chroma-key color (0x00BBGGRR) used by the runtime's post-weave
-	//! alpha-conversion shader pass when transparent_background_enabled is true.
-	//! Set via XrWin32WindowBindingCreateInfoEXT::chromaKeyColor. Zero disables
-	//! the pass.
-	uint32_t chroma_key_color;
-
 	//! Readback callback for offscreen compositing (called with composited RGBA pixels)
 	void (*readback_callback)(const uint8_t *pixels, uint32_t w, uint32_t h, void *userdata);
 	//! Userdata passed to readback_callback

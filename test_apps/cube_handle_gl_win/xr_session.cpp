@@ -256,7 +256,6 @@ bool CreateSession(XrSessionManager& xr, HDC hDC, HGLRC hGLRC, HWND hwnd) {
         const char *e = getenv("DISPLAYXR_TRANSPARENT_BG");
         if (e != nullptr && *e != '\0' && *e != '0') {
             sessionTarget.transparentBackgroundEnabled = XR_TRUE;
-            sessionTarget.chromaKeyColor = 0;
             LOG_INFO("Transparent background ENABLED (DISPLAYXR_TRANSPARENT_BG=1)");
         }
     }
