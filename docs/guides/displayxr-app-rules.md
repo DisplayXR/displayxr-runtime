@@ -294,6 +294,24 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
     the broader color-management design is tracked in
     [#409](https://github.com/DisplayXR/displayxr-runtime/issues/409).
 
+- **INV-4.7 — Clear the WHOLE `imageRect` you declare — every pixel the runtime blits must be
+  written.** The compositor copies the *entire* `subImage.imageRect` you report (INV-4.4) into the
+  atlas; it does **not** know which sub-region you actually drew. Any pixel inside that rect you
+  leave unwritten is undefined GPU memory — on MoltenVK that reads as **opaque magenta**, and in
+  transparent-background mode it becomes an opaque fill where you expected the desktop to show.
+  - If you render into only part of a tile (e.g. an avatar confined to the bottom band, the rest
+    meant to be see-through), **clear the full tile to `(0,0,0,0)` first** (a load-op clear, a
+    `vkCmdClearColorImage`, or a full-viewport clear pass) before drawing — exactly as you already
+    clear the rendered region. Don't rely on the runtime to mask it.
+  - Alternatively, **shrink `imageRect` to cover only the pixels you wrote** — then the unwritten
+    area is outside the declared rect and never blitted. (Prefer the clear when the layer's
+    placement/aspect must stay fixed.)
+  - This bites hardest with transparent backgrounds + flat-2D zones (`XR_EXT_local_3d_zone`
+    Local2D): a transparent 2D pixel reveals whatever is woven beneath it, so an unwritten
+    projection band shows through as garbage instead of the desktop. (Runtime hardening for the
+    macOS alpha-native path landed in #568, but clearing the full rect is the portable fix and the
+    app's responsibility.) Ref: `#568`, `#392`.
+
 ---
 
 ## 5. Texture apps: canvas sub-rect + 2D surround
@@ -572,6 +590,7 @@ launcher. The bare runtime ignores manifests — discovery is the workspace laye
 - [ ] `xrLocateViews` into an 8-wide buffer; render/submit `eyeCount` from the active mode, not 2 (INV-3.1)
 - [ ] App swapchain sized once to worst-case atlas (INV-4.2); per-tile = window/canvas × scaleXY, never display (INV-4.3)
 - [ ] Color space: request an **sRGB swapchain** and write a correctly-encoded image (linear render + GPU sRGB-write, or display-referred bytes — not both); linear/UNORM swapchain is not color-managed; data textures always linear (INV-4.6)
+- [ ] Whole declared `imageRect` is written — partial-tile renders clear the full tile to `(0,0,0,0)` first (or shrink the rect); no undefined pixels reach the atlas, esp. transparent-bg (INV-4.7)
 - [ ] (texture) canvas rect set; blit back from `(x,y,w,h)` sub-rect, not origin (INV-5.2); surround cleared on resize (INV-5.6)
 - [ ] (texture) shared surface sized once to worst-case (INV-5.7)
 - [ ] Window-relative Kooima; matrices transposed for DirectX (INV-6.3/6.4)
