@@ -91,7 +91,10 @@ if(XRT_HAVE_D3D11)
 endif()
 
 if(XRT_HAVE_D3D12)
-	target_link_libraries(tests_comp_client_d3d12 PRIVATE comp_client comp_mock)
+	# #573 — comp_d3d12_client.cpp now references the
+	# comp_ipc_client_compositor_get_transparent_output{,_fence} bridge symbols
+	# defined in ipc_client_compositor.c. Add ipc_client (same as d3d11 above).
+	target_link_libraries(tests_comp_client_d3d12 PRIVATE comp_client comp_mock ipc_client)
 endif()
 
 if(XRT_HAVE_VULKAN)
@@ -111,9 +114,15 @@ if(XRT_FEATURE_OPENXR)
 		)
 endif()
 if(_have_opengl_test)
+	# #573 — on Windows comp_gl_win32_client.c references the
+	# comp_ipc_client_compositor_get_transparent_output{,_fence} bridge symbols
+	# defined in ipc_client_compositor.c. Add ipc_client (same as d3d11 above).
 	target_link_libraries(
 		tests_comp_client_opengl PRIVATE comp_client comp_mock aux_ogl SDL2::SDL2
 		)
+	if(WIN32)
+		target_link_libraries(tests_comp_client_opengl PRIVATE ipc_client)
+	endif()
 	target_include_directories(tests_comp_client_opengl PRIVATE SDL2::SDL2)
 endif()
 

@@ -17,6 +17,9 @@
 extern "C" {
 #endif
 
+//! #573 — render-API-agnostic transparent DComp presenter (client/comp_d3d_transparent_present.h).
+struct comp_d3d_transparent_presenter;
+
 struct client_gl_context
 {
 	HDC hDC;
@@ -47,6 +50,20 @@ struct client_gl_win32_compositor
 
 	//! The OpenGL library
 	HMODULE opengl;
+
+	/*!
+	 * #573 — render-API-agnostic transparent DComp presenter. For a forced-IPC
+	 * transparent client the service weaves (with alpha-gate holes) into a shared
+	 * texture; this presenter imports it + the service→client fence and presents it
+	 * via a transparent DirectComposition swap chain on the app's own window so DWM
+	 * blends the LIVE desktop into the holes. NULL for opaque clients. The GL client
+	 * passes NULL device → the helper makes its own D3D11 device (the present is pure
+	 * D3D11 + DComp on shared handles, independent of the app's render API).
+	 */
+	struct comp_d3d_transparent_presenter *transparent;
+
+	//! #573 — saved parent GL layer_commit, wrapped to drive the per-frame present.
+	xrt_result_t (*base_layer_commit)(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle);
 };
 
 /*!
