@@ -13,6 +13,7 @@
 #include "comp_d3d12_client.h"
 
 #include "comp_d3d_common.hpp"
+#include "comp_d3d_transparent_present.h"
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_handles.h"
@@ -48,6 +49,21 @@
 
 using namespace std::chrono_literals;
 using namespace std::chrono;
+
+// #573 — transparent compositing output bridges, defined in
+// src/xrt/ipc/client/ipc_client_compositor.c (resolved at link time so this TU
+// does not pull the IPC client headers). Shared with the D3D11/GL clients.
+extern "C" xrt_result_t
+comp_ipc_client_compositor_get_transparent_output(struct xrt_compositor *xc,
+                                                  bool *out_have_output,
+                                                  uint32_t *out_width,
+                                                  uint32_t *out_height,
+                                                  uint64_t *out_hwnd,
+                                                  xrt_graphics_buffer_handle_t *out_handle);
+extern "C" xrt_result_t
+comp_ipc_client_compositor_get_transparent_output_fence(struct xrt_compositor *xc,
+                                                        bool *out_have_fence,
+                                                        xrt_graphics_sync_handle_t *out_handle);
 
 DEBUG_GET_ONCE_LOG_OPTION(log, "D3D_COMPOSITOR_LOG", U_LOGGING_INFO)
 
@@ -158,6 +174,18 @@ struct client_d3d12_compositor
 	 * The value most recently signaled on the timeline semaphore
 	 */
 	uint64_t timeline_semaphore_value = 0;
+
+	//! ADR-029 (#573) — transparent compositing output present. For a forced-IPC
+	//! transparent client, the service weaves (with alpha-gate holes) into a shared
+	//! texture; this render-API-agnostic presenter imports it + the service→client
+	//! fence and presents it via a transparent DirectComposition swap chain on the
+	//! app's own window, so DWM blends the LIVE desktop into the holes. NULL for
+	//! opaque clients. The D3D12 client passes NULL device → the helper creates its
+	//! own small D3D11 device for the present (the present is pure D3D11 + DComp on
+	//! shared handles, independent of the app's render API).
+	struct comp_d3d_transparent_presenter *transparent = nullptr;
+
+	~client_d3d12_compositor() { comp_d3d_transparent_presenter_destroy(&transparent); }
 };
 
 static_assert(std::is_standard_layout<client_d3d12_compositor>::value);
@@ -987,10 +1015,14 @@ client_d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_syn
 	}
 	if (c->timeline_semaphore) {
 		// We got this from the native compositor, so we can pass it back
-		return xrt_comp_layer_commit_with_semaphore( //
+		xret = xrt_comp_layer_commit_with_semaphore( //
 		    &c->xcn->base,                           //
 		    c->timeline_semaphore.get(),             //
 		    c->timeline_semaphore_value);            //
+		if (xret == XRT_SUCCESS) {
+			comp_d3d_transparent_presenter_present(c->transparent); // #573
+		}
+		return xret;
 	}
 
 	if (c->fence) {
@@ -1011,7 +1043,11 @@ client_d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_syn
 		}
 	}
 
-	return xrt_comp_layer_commit(&c->xcn->base, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
+	xret = xrt_comp_layer_commit(&c->xcn->base, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
+	if (xret == XRT_SUCCESS) {
+		comp_d3d_transparent_presenter_present(c->transparent); // #573
+	}
+	return xret;
 }
 
 
@@ -1176,6 +1212,35 @@ try {
 	if (!c->fence) {
 		D3D_WARN(c, "No sync mechanism for D3D12 was successful!");
 	}
+
+	// ADR-029 (#573) — transparent compositing output. If the service created a
+	// shared output texture for this (transparent) client, hand the shared texture +
+	// service→client fence to the render-API-agnostic presenter, which stands up a
+	// transparent DirectComposition swap chain on the app's own window. The per-frame
+	// present in layer_commit then lets DWM blend the LIVE desktop into the DP's
+	// alpha-gate holes. D3D12 passes NULL device → the helper makes its own D3D11
+	// device for the (pure D3D11+DComp) present. Non-fatal: any failure leaves the
+	// service's opaque present in effect (presenter stays NULL).
+	{
+		bool have_out = false, have_fence = false;
+		uint32_t tw = 0, th = 0;
+		uint64_t hwnd_val = 0;
+		xrt_graphics_buffer_handle_t tex_h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+		xrt_graphics_sync_handle_t fence_h = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+		xrt_result_t oret = comp_ipc_client_compositor_get_transparent_output(
+		    &xcn->base, &have_out, &tw, &th, &hwnd_val, &tex_h);
+		if (oret == XRT_SUCCESS && have_out && tex_h != XRT_GRAPHICS_BUFFER_HANDLE_INVALID &&
+		    hwnd_val != 0) {
+			(void)comp_ipc_client_compositor_get_transparent_output_fence(&xcn->base, &have_fence,
+			                                                             &fence_h);
+			// The presenter consumes (closes) both handles regardless of outcome.
+			c->transparent = comp_d3d_transparent_presenter_create(nullptr, hwnd_val, tw, th, tex_h,
+			                                                       fence_h);
+		} else if (tex_h != XRT_GRAPHICS_BUFFER_HANDLE_INVALID) {
+			CloseHandle((HANDLE)tex_h);
+		}
+	}
+
 	c->base.base.get_swapchain_create_properties = client_d3d12_compositor_get_swapchain_create_properties;
 	c->base.base.create_swapchain = client_d3d12_create_swapchain;
 	c->base.base.create_passthrough = client_d3d12_compositor_passthrough_create;
