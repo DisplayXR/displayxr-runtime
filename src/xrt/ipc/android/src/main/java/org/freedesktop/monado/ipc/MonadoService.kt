@@ -38,10 +38,9 @@ class MonadoService : Service(), Watchdog.ShutdownListener {
         binder = MonadoImpl(this)
         watchdog =
             Watchdog(
-                // The surface always comes from the client (#558 removed the service-side
-                // overlay mode), so stop the service as soon as the client disconnects —
-                // the surface belongs to the client.
-                0,
+                // If the surface comes from client, just stop the service when client disconnected
+                // because the surface belongs to the client.
+                if (binder.canDrawOverOtherApps()) BuildConfig.WATCHDOG_TIMEOUT_MILLISECONDS else 0,
                 this,
             )
         watchdog.startMonitor()

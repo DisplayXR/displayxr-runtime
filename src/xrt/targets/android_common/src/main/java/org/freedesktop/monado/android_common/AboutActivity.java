@@ -10,6 +10,7 @@ package org.freedesktop.monado.android_common;
 
 import android.os.Bundle;
 import android.text.method.LinkMovementMethod;
+import android.view.View;
 import android.widget.ImageView;
 import android.widget.TextView;
 import androidx.appcompat.app.AppCompatActivity;
@@ -74,8 +75,12 @@ public class AboutActivity extends AppCompatActivity {
         VrModeStatus statusFrag = VrModeStatus.newInstance(status);
         fragmentTransaction.add(R.id.statusFrame, statusFrag, null);
 
-        // (The display-over-other-apps fragment that used to mount here was removed
-        // with #558 — the service-side SYSTEM_ALERT_WINDOW overlay mode is gone.)
+        if (!isInProcess) {
+            findViewById(R.id.drawOverOtherAppsFrame).setVisibility(View.VISIBLE);
+            DisplayOverOtherAppsStatusFragment drawOverFragment =
+                    new DisplayOverOtherAppsStatusFragment();
+            fragmentTransaction.replace(R.id.drawOverOtherAppsFrame, drawOverFragment, null);
+        }
 
         if (noticeFragmentProvider != null) {
             Fragment noticeFragment = noticeFragmentProvider.makeNoticeFragment();

@@ -20,12 +20,13 @@ interface IMonado {
 
     /*!
      * Provide the surface we inject into the activity, back to the service.
-     *
-     * The client always owns the surface. The Monado-era canDrawOverOtherApps()
-     * query (service-side SYSTEM_ALERT_WINDOW overlay mode) was removed with
-     * #558 — revert that commit to revive it.
      */
     void passAppSurface(in Surface surface);
+
+    /*!
+     * Asking service whether it has the capbility to draw over other apps or not.
+     */
+    boolean canDrawOverOtherApps();
 
     /*!
      * Tell the service the previously passed app surface was destroyed (e.g. the
