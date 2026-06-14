@@ -88,7 +88,7 @@ comp_d3d_transparent_presenter_create(void *existing_d3d11_device,
 			base->GetImmediateContext(ctx.put());
 			p->context = ctx.query<ID3D11DeviceContext4>();
 		} else {
-			auto dev = xrt::compositor::client::createDevice();
+			auto dev = xrt::auxiliary::d3d::d3d11::createDevice();
 			p->owned_device = dev.first;
 			p->owned_context = dev.second;
 			if (!p->owned_device || !p->owned_context) {
