@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/displayxr-versions.json",
   "runtime":     "v1.17.1",
   "shell":       "v1.7.0",
-  "leia_plugin": "v1.7.1",
+  "leia_plugin": "v1.8.0",
   "mcp_tools":   "v0.4.0",
   "gauss_demo":  "v1.10.0",
   "modelviewer_demo": "v0.11.0",
