@@ -29,6 +29,7 @@
 #ifdef XRT_OS_ANDROID
 #include "android/android_globals.h"
 #include "android/android_custom_surface.h"
+#include <sys/system_properties.h>
 #endif
 
 #include "os/os_time.h"
@@ -1075,8 +1076,23 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 		}
 	}
 
+	// #558 overlay mode: the avatar intentionally backgrounds its Activity
+	// (moveTaskToBack) so the launcher stays the interactive foreground app while
+	// the runtime weaves the tiger into a service-owned TYPE_APPLICATION_OVERLAY
+	// on top. In that mode the ON_PAUSE lifecycle must NOT stop the session — the
+	// overlay is still on-screen, so the client must keep submitting frames. Read
+	// debug.dxr.overlay once (this runs in the client process, same sysprop the
+	// avatar + comp read). When OFF, the normal pause→stopping behavior stands.
+	static int s_overlay_mode = -1;
+	if (s_overlay_mode < 0) {
+		char prop[PROP_VALUE_MAX] = {0};
+		s_overlay_mode =
+		    (__system_property_get("debug.dxr.overlay", prop) > 0 && prop[0] == '1') ? 1 : 0;
+	}
+
 	// Most recent Android activity lifecycle event was OnPause: move toward stopping
-	if (sess->sys->inst->activity_state == XRT_ANDROID_LIVECYCLE_EVENT_ON_PAUSE) {
+	if (s_overlay_mode == 0 &&
+	    sess->sys->inst->activity_state == XRT_ANDROID_LIVECYCLE_EVENT_ON_PAUSE) {
 		if (sess->state == XR_SESSION_STATE_FOCUSED) {
 			U_LOG_I("Activity paused: changing session state FOCUSED->VISIBLE");
 			oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
