@@ -21,6 +21,7 @@
 #include <android/native_window_jni.h>
 
 #include "android/android_globals.h"
+#include "android/android_custom_surface.h"
 #include "android/android_main_thread.h"
 
 #include <chrono>
@@ -182,6 +183,56 @@ Java_org_freedesktop_monado_ipc_MonadoImpl_nativeAppSurface(JNIEnv *env, jobject
 	ANativeWindow *nativeWindow = ANativeWindow_fromSurface(env, surface);
 	android_globals_store_window((struct _ANativeWindow *)nativeWindow);
 	U_LOG_I("service: app surface published: ANativeWindow %p (#528)", (void *)nativeWindow);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_freedesktop_monado_ipc_MonadoImpl_nativeCreateServiceOverlay(JNIEnv *env, jobject thiz)
+{
+	jni::init(env);
+	jni::Object monadoImpl(thiz);
+
+	// Service-owned overlay (#558 revival, P1): when the runtime holds the
+	// "display over other apps" permission the CLIENT skips publishing its
+	// surface (Client.java gate), so the SERVICE must create the on-screen
+	// surface itself. Reuse the existing C surface machinery with the SERVICE
+	// context (a non-Activity Context) — android_custom_surface picks
+	// TYPE_APPLICATION_OVERLAY for it, so the weave floats over the live
+	// launcher (launcher stays the resumed, interactive top app) rather than a
+	// full-screen client Activity that pauses it. debug.dxr.transparent makes
+	// the overlay TRANSLUCENT so the desktop shows through. Idempotent: a second
+	// client connect is a no-op while an overlay already exists.
+	if (android_globals_get_custom_surface() != nullptr) {
+		U_LOG_I("service: overlay already created — skipping");
+		return;
+	}
+
+	struct _JavaVM *vm = android_globals_get_vm();
+	void *context = android_globals_get_context();
+	if (vm == nullptr || context == nullptr) {
+		U_LOG_E("service: cannot create overlay — vm=%p context=%p", (void *)vm, context);
+		return;
+	}
+
+	struct android_custom_surface *cs =
+	    android_custom_surface_async_start(vm, context, /*display_id*/ 0, "DisplayXR",
+	                                       /*preferred_display_mode_id*/ 0);
+	if (cs == nullptr) {
+		U_LOG_E("service: android_custom_surface_async_start failed (overlay mode)");
+		return;
+	}
+
+	ANativeWindow *win = android_custom_surface_wait_get_surface(cs, /*timeout_ms*/ 5000);
+	if (win == nullptr) {
+		U_LOG_E("service: overlay surfaceCreated never fired within 5 s");
+		android_custom_surface_destroy(&cs);
+		return;
+	}
+
+	android_globals_store_window((struct _ANativeWindow *)win);
+	// Keep the custom surface alive + discoverable (process-scoped, like the
+	// in-process path) so the surface stays published for the compositor.
+	android_globals_set_custom_surface(cs);
+	U_LOG_I("service: TYPE_APPLICATION_OVERLAY created, ANativeWindow %p (#558 P1)", (void *)win);
 }
 
 extern "C" JNIEXPORT void JNICALL

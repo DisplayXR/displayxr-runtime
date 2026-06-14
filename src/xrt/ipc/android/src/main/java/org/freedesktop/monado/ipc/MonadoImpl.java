@@ -56,6 +56,15 @@ public class MonadoImpl extends IMonado.Stub {
     public void connect(@NonNull ParcelFileDescriptor parcelFileDescriptor) throws RemoteException {
         int fd = parcelFileDescriptor.getFd();
         Log.i(TAG, "connect: given fd " + fd);
+        // Service-owned overlay (#558 revival, P1): when we hold the
+        // "display over other apps" permission the client skips publishing its
+        // surface, so create our own TYPE_APPLICATION_OVERLAY before the
+        // compositor (started by nativeAddClient) begins polling for a surface.
+        // Idempotent native-side, so repeated connects are safe.
+        if (Settings.canDrawOverlays(context)) {
+            Log.i(TAG, "connect: overlay permission held — creating service overlay");
+            nativeCreateServiceOverlay();
+        }
         if (nativeAddClient(fd) != 0) {
             Log.e(TAG, "Failed to transfer client fd ownership!");
             try {
@@ -127,6 +136,16 @@ public class MonadoImpl extends IMonado.Stub {
      */
     @SuppressWarnings("JavaJniMissingFunction")
     private native void nativeAppSurface(@NonNull Surface surface);
+
+    /**
+     * Native creation of the service-owned TYPE_APPLICATION_OVERLAY surface (#558 revival). Called
+     * on connect when the runtime holds the "display over other apps" permission, so the weave
+     * floats over the live launcher instead of a full-screen client Activity. Idempotent.
+     *
+     * <p>Implementation in `src/xrt/targets/service-lib/service_target.cpp`.
+     */
+    @SuppressWarnings("JavaJniMissingFunction")
+    private native void nativeCreateServiceOverlay();
 
     /**
      * Native handling of the client's surface being destroyed (background → file picker etc.):
