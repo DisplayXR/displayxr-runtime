@@ -773,8 +773,13 @@ static void RenderThreadFunc(
                         // Compute render dims: mono uses full swapchain, stereo uses tile-sized
                         uint32_t renderW, renderH;
                         if (monoMode) {
-                            renderW = windowW;
-                            renderH = windowH;
+                            // 2D: the single view fills the full content region —
+                            // window × the active mode's view scale (#575; same
+                            // window×scale recipe the 3D branch uses). Dropping the
+                            // scale here left the view under-filling the 2D tile →
+                            // content shifted left + right eye black.
+                            renderW = (uint32_t)(windowW * xr->recommendedViewScaleX);
+                            renderH = (uint32_t)(windowH * xr->recommendedViewScaleY);
                             if (renderW > xr->swapchain.width) renderW = xr->swapchain.width;
                             if (renderH > xr->swapchain.height) renderH = xr->swapchain.height;
                         } else {
@@ -947,8 +952,8 @@ static void RenderThreadFunc(
                                     L"XR_EXT_win32_window_binding: NOT AVAILABLE (Vulkan)";
                                 uint32_t dispRenderW, dispRenderH;
                                 if (monoMode) {
-                                    dispRenderW = windowW;
-                                    dispRenderH = windowH;
+                                    dispRenderW = (uint32_t)(windowW * xr->recommendedViewScaleX);
+                                    dispRenderH = (uint32_t)(windowH * xr->recommendedViewScaleY);
                                     if (dispRenderW > xr->swapchain.width) dispRenderW = xr->swapchain.width;
                                     if (dispRenderH > xr->swapchain.height) dispRenderH = xr->swapchain.height;
                                 } else {
