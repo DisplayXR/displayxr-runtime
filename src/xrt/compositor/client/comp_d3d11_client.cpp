@@ -12,6 +12,7 @@
 #include "comp_d3d11_client.h"
 
 #include "comp_d3d_common.hpp"
+#include "comp_d3d_transparent_present.h"
 
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_config_os.h"
@@ -34,9 +35,7 @@
 
 #include <d3d11_1.h>
 #include <d3d11_3.h>
-#include <d3d11_4.h> // #551 ID3D11Fence / ID3D11DeviceContext4 for the transparent present
-#include <dxgi1_2.h> // #551 CreateSwapChainForComposition
-#include <dcomp.h>   // #551 DirectComposition transparent present
+#include <d3d11_4.h> // ID3D11Fence / ID3D11DeviceContext4 (workspace_sync_fence)
 #include <wil/resource.h>
 #include <wil/com.h>
 #include <wil/result_macros.h>
@@ -212,24 +211,17 @@ struct client_d3d11_compositor
 	wil::com_ptr<ID3D11Fence> workspace_sync_fence;
 	uint64_t workspace_sync_fence_value = 0;
 
-	//! #551 — transparent compositing output present. For a forced-IPC
+	//! ADR-029 — transparent compositing output present. For a forced-IPC
 	//! transparent client, the service weaves (with alpha-gate holes) into a
-	//! shared texture; this side imports it + the service→client fence and
+	//! shared texture; this presenter imports it + the service→client fence and
 	//! presents it via a transparent DirectComposition swap chain on the app's
-	//! own window, so DWM blends the LIVE desktop into the holes. Inactive
-	//! (transparent_present == false) for opaque clients — the service presents
-	//! its own swap chain as before. Reusable for any IPC app that requests
-	//! transparentBackgroundEnabled.
-	bool transparent_present = false;
-	HWND transparent_hwnd = nullptr;
-	uint32_t transparent_w = 0, transparent_h = 0;
-	wil::com_ptr<ID3D11Texture2D> transparent_output_texture; //!< imported shared service output
-	wil::com_ptr<ID3D11Fence> transparent_output_fence;       //!< imported service→client fence
-	uint64_t transparent_present_value = 0;                   //!< client wait counter (lockstep w/ service)
-	wil::com_ptr<IDXGISwapChain1> transparent_swapchain;      //!< DComp composition swap chain
-	wil::com_ptr<IDCompositionDevice> transparent_dcomp_device;
-	wil::com_ptr<IDCompositionTarget> transparent_dcomp_target;
-	wil::com_ptr<IDCompositionVisual> transparent_dcomp_visual;
+	//! own window, so DWM blends the LIVE desktop into the holes. NULL for opaque
+	//! clients — the service presents its own swap chain as before. The presenter
+	//! is render-API-agnostic (shared with the D3D12/GL clients); the D3D11 client
+	//! reuses its own @ref app_device for the present.
+	struct comp_d3d_transparent_presenter *transparent = nullptr;
+
+	~client_d3d11_compositor() { comp_d3d_transparent_presenter_destroy(&transparent); }
 };
 
 static_assert(std::is_standard_layout<client_d3d11_compositor>::value);
@@ -973,31 +965,15 @@ client_d3d11_compositor_layer_zone_3d(struct xrt_compositor *xc,
 	return xrt_comp_layer_zone_3d(&c->xcn->base, xdev, xscn, data);
 }
 
-// #551 — per-frame transparent present. Called after the layer-commit RPC
-// returns (the service has weaved + signaled). GPU-wait the service→client
-// fence (lockstep counter, no per-frame IPC), copy the woven shared output into
-// the DComp swap-chain back buffer, and present so DWM blends the LIVE desktop
-// into the alpha-gate holes. No-op for opaque clients.
+// ADR-029 — per-frame transparent present. Called after the layer-commit RPC
+// returns (the service has weaved + signaled). The shared presenter GPU-waits the
+// service→client fence (lockstep counter, no per-frame IPC), copies the woven
+// shared output into the DComp swap-chain back buffer, and presents so DWM blends
+// the LIVE desktop into the alpha-gate holes. No-op for opaque clients.
 static void
 client_d3d11_transparent_present(struct client_d3d11_compositor *c)
 {
-	if (!c->transparent_present || !c->transparent_swapchain || !c->transparent_output_fence) {
-		return;
-	}
-	// Lockstep with the service: it bumps + signals once per commit, we bump +
-	// wait once per commit, so this value always matches the frame just weaved.
-	c->transparent_present_value++;
-	c->fence_context->Wait(c->transparent_output_fence.get(), c->transparent_present_value);
-
-	wil::com_ptr<ID3D11Texture2D> back;
-	if (SUCCEEDED(c->transparent_swapchain->GetBuffer(0, IID_PPV_ARGS(back.put()))) && back) {
-		c->fence_context->CopyResource(back.get(), c->transparent_output_texture.get());
-	}
-	c->transparent_swapchain->Present(1, 0);
-	// Publish the new frame to dwm.exe (cheap delta-state IPC, no GPU work).
-	if (c->transparent_dcomp_device) {
-		c->transparent_dcomp_device->Commit();
-	}
+	comp_d3d_transparent_presenter_present(c->transparent);
 }
 
 static xrt_result_t
@@ -1350,12 +1326,14 @@ try {
 		}
 	}
 
-	// #551 — transparent compositing output. If the service created a shared
-	// output texture for this (transparent) client, import it + the
-	// service→client fence and stand up a transparent DirectComposition swap
-	// chain on the app's own window. The per-frame present in layer_commit then
-	// lets DWM blend the LIVE desktop into the DP's alpha-gate holes. Non-fatal:
-	// any failure leaves the service's opaque present path in effect.
+	// ADR-029 — transparent compositing output. If the service created a shared
+	// output texture for this (transparent) client, hand the shared texture +
+	// service→client fence to the render-API-agnostic presenter, which stands up a
+	// transparent DirectComposition swap chain on the app's own window. The
+	// per-frame present in layer_commit then lets DWM blend the LIVE desktop into
+	// the DP's alpha-gate holes. The D3D11 client reuses its own @ref app_device
+	// for the present. Non-fatal: any failure leaves the service's opaque present
+	// path in effect (presenter stays NULL).
 	{
 		bool have_out = false, have_fence = false;
 		uint32_t tw = 0, th = 0;
@@ -1368,87 +1346,9 @@ try {
 		    hwnd_val != 0) {
 			(void)comp_ipc_client_compositor_get_transparent_output_fence(&xcn->base, &have_fence,
 			                                                             &fence_h);
-			HRESULT hr = c->app_device->OpenSharedResource1(
-			    (HANDLE)tex_h, IID_PPV_ARGS(c->transparent_output_texture.put()));
-			CloseHandle((HANDLE)tex_h); // imported; close our duped copy
-			wil::com_ptr<ID3D11Fence> ofence;
-			if (SUCCEEDED(hr) && have_fence && xrt_graphics_sync_handle_is_valid(fence_h)) {
-				try {
-					ofence = import_fence(*(c->app_device), (HANDLE)fence_h);
-				} catch (...) {
-				}
-			}
-			if (fence_h != XRT_GRAPHICS_SYNC_HANDLE_INVALID) {
-				CloseHandle((HANDLE)fence_h);
-			}
-			if (SUCCEEDED(hr) && ofence) {
-				c->transparent_output_fence = std::move(ofence);
-				HWND hwnd = (HWND)(uintptr_t)hwnd_val;
-				wil::com_ptr<IDXGIDevice> dxgiDev;
-				wil::com_ptr<IDXGIAdapter> adapter;
-				wil::com_ptr<IDXGIFactory2> factory;
-				hr = c->app_device->QueryInterface(IID_PPV_ARGS(dxgiDev.put()));
-				if (SUCCEEDED(hr)) {
-					hr = dxgiDev->GetAdapter(adapter.put());
-				}
-				if (SUCCEEDED(hr)) {
-					hr = adapter->GetParent(IID_PPV_ARGS(factory.put()));
-				}
-				DXGI_SWAP_CHAIN_DESC1 sd = {};
-				sd.Width = tw;
-				sd.Height = th;
-				sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-				sd.SampleDesc.Count = 1;
-				sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-				sd.BufferCount = 2;
-				sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-				sd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
-				if (SUCCEEDED(hr)) {
-					hr = factory->CreateSwapChainForComposition(c->app_device.get(), &sd, nullptr,
-					                                            c->transparent_swapchain.put());
-				}
-				if (SUCCEEDED(hr)) {
-					hr = DCompositionCreateDevice2(
-					    nullptr, IID_PPV_ARGS(c->transparent_dcomp_device.put()));
-				}
-				if (SUCCEEDED(hr)) {
-					hr = c->transparent_dcomp_device->CreateTargetForHwnd(
-					    hwnd, TRUE, c->transparent_dcomp_target.put());
-				}
-				if (SUCCEEDED(hr)) {
-					hr = c->transparent_dcomp_device->CreateVisual(c->transparent_dcomp_visual.put());
-				}
-				if (SUCCEEDED(hr)) {
-					hr = c->transparent_dcomp_visual->SetContent(c->transparent_swapchain.get());
-				}
-				if (SUCCEEDED(hr)) {
-					hr = c->transparent_dcomp_target->SetRoot(c->transparent_dcomp_visual.get());
-				}
-				if (SUCCEEDED(hr)) {
-					hr = c->transparent_dcomp_device->Commit();
-				}
-				if (SUCCEEDED(hr)) {
-					c->transparent_hwnd = hwnd;
-					c->transparent_w = tw;
-					c->transparent_h = th;
-					c->transparent_present = true;
-					U_LOG_W("#551 client transparent present ready (hwnd=%p %ux%u) — DWM "
-					        "blends live desktop into the DP alpha-gate holes",
-					        (void *)hwnd, tw, th);
-				} else {
-					U_LOG_E("#551 client transparent present setup failed: 0x%08lx — service "
-					        "opaque present stays in effect",
-					        hr);
-					c->transparent_swapchain.reset();
-					c->transparent_dcomp_visual.reset();
-					c->transparent_dcomp_target.reset();
-					c->transparent_dcomp_device.reset();
-					c->transparent_output_fence.reset();
-					c->transparent_output_texture.reset();
-				}
-			} else {
-				c->transparent_output_texture.reset();
-			}
+			// The presenter consumes (closes) both handles regardless of outcome.
+			c->transparent = comp_d3d_transparent_presenter_create(c->app_device.get(), hwnd_val, tw,
+			                                                       th, tex_h, fence_h);
 		} else if (tex_h != XRT_GRAPHICS_BUFFER_HANDLE_INVALID) {
 			CloseHandle((HANDLE)tex_h);
 		}

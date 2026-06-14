@@ -75,6 +75,17 @@ endif()
 if(XRT_HAVE_D3D11 OR XRT_HAVE_D3D12)
 	target_link_libraries(comp_client PRIVATE aux_d3d)
 	target_sources(comp_client PRIVATE client/comp_d3d_common.cpp client/comp_d3d_common.hpp)
+	# Render-API-agnostic transparent DirectComposition present for forced-IPC
+	# transparent clients (ADR-029). The client must own the present because a
+	# process cannot create a DComp target on another process's HWND; this helper
+	# imports the service's shared output texture + fence and presents on the app's
+	# window. Shared by the D3D11, D3D12 and GL (win32) client compositors, so it
+	# (and the d3d11/dxgi/dcomp libs it needs) lives in the shared D3D block.
+	target_sources(
+		comp_client PRIVATE client/comp_d3d_transparent_present.cpp
+				    client/comp_d3d_transparent_present.h
+		)
+	target_link_libraries(comp_client PRIVATE d3d11 dxgi dcomp)
 endif()
 
 if(XRT_HAVE_D3D11)
@@ -82,9 +93,6 @@ if(XRT_HAVE_D3D11)
 		comp_client PRIVATE client/comp_d3d11_client.cpp client/comp_d3d11_client.h
 				    client/comp_d3d11_glue.c
 		)
-	# #551 — the D3D11 client compositor presents a transparent IPC output via
-	# DirectComposition (DCompositionCreateDevice2) on the app's own window.
-	target_link_libraries(comp_client PRIVATE d3d11 dxgi dcomp)
 endif()
 
 if(XRT_HAVE_D3D12)
