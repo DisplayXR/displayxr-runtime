@@ -823,8 +823,8 @@ static void RenderOneFrame(RenderState& rs) {
                             bool dispMonoMode = monoMode;
                             uint32_t dispRenderW, dispRenderH;
                             if (dispMonoMode) {
-                                dispRenderW = g_windowWidth;
-                                dispRenderH = g_windowHeight;
+                                dispRenderW = (uint32_t)(g_windowWidth * xr.recommendedViewScaleX);
+                                dispRenderH = (uint32_t)(g_windowHeight * xr.recommendedViewScaleY);
                                 if (dispRenderW > xr.swapchain.width) dispRenderW = xr.swapchain.width;
                                 if (dispRenderH > xr.swapchain.height) dispRenderH = xr.swapchain.height;
                             } else {
@@ -977,8 +977,13 @@ static void RenderOneFrame(RenderState& rs) {
                         // Dynamic render dims based on window size, clamped to swapchain capacity
                         uint32_t renderW, renderH;
                         if (monoMode) {
-                            renderW = g_windowWidth;
-                            renderH = g_windowHeight;
+                            // 2D: the single view fills the full content region —
+                            // window × the active mode's view scale (#575; same
+                            // window×scale recipe the 3D branch uses). Dropping the
+                            // scale here left the view under-filling the 2D tile →
+                            // content shifted left + right eye black.
+                            renderW = (uint32_t)(g_windowWidth * xr.recommendedViewScaleX);
+                            renderH = (uint32_t)(g_windowHeight * xr.recommendedViewScaleY);
                             if (renderW > xr.swapchain.width) renderW = xr.swapchain.width;
                             if (renderH > xr.swapchain.height) renderH = xr.swapchain.height;
                         } else {
