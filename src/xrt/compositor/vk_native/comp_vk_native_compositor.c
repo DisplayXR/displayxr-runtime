@@ -156,6 +156,12 @@ struct comp_vk_native_compositor
 	//! Generic Vulkan display processor (vendor-agnostic weaving).
 	struct xrt_display_processor *display_processor;
 
+	//! Transparent-background present requested at create (XR_EXT_*_window_binding
+	//! transparentBackgroundEnabled). The atlas/DP clear to alpha=0 and the
+	//! present uses a transparent compositeAlpha. Cached for the macOS Local2D
+	//! flat-2D-over-desktop rule (#568) in vk_composite_local_2d.
+	bool transparent_background;
+
 	//! True when display is in 3D mode (weaver active). False = 2D passthrough.
 	bool hardware_display_3d;
 
@@ -3469,6 +3475,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	// transparent background was requested, so app alpha<1 regions survive
 	// to the present (issue #392). Mirrors the DP weave-clear plumbing above.
 	comp_vk_native_renderer_set_transparent(c->renderer, transparent_background);
+	c->transparent_background = transparent_background;
 
 	// Set tile layout from active rendering mode
 	if (c->xdev != NULL && c->xdev->hmd != NULL) {
@@ -4665,7 +4672,30 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 	// XR_EXT_display_zones: zones frames are ALWAYS the hard M-lerp
 	// (final = M·weave + (1−M)·flatten(2D-over)).
 	const bool have_explicit = (emask != NULL && emask->submitted && emask->staged_view != VK_NULL_HANDLE);
-	const bool alpha_over = !zones_frame && !have_explicit;
+	bool alpha_over = !zones_frame && !have_explicit;
+#if defined(XRT_OS_MACOS)
+	// #568 macOS flat-2D-over-desktop: on the alpha-native transparent path the
+	// desktop shows through wherever the final alpha is 0 (the non-opaque
+	// CAMetalLayer composites our premultiplied pixels) — there is NO captured
+	// desktop woven under the 2D (that is the Windows WGC 2D-under path). The
+	// #491 alpha_over composite (frag = twod + (1-twod.a)·weave) reveals the
+	// WEAVE under a transparent flat-2D pixel, so a Local2D zone placed over an
+	// unrendered/transparent-intended projection band instead exposes whatever
+	// the weave holds there (e.g. an app's uninitialized tile) as an opaque
+	// fill — never the desktop. Fall back to the hard M-lerp
+	// (frag = M·weave + (1-M)·twod): the implicit mask is M=1 outside the
+	// Local2D rects (keep the weave) and M=0 inside them, so a flat-2D region
+	// composites 2D-over-transparent — transparent 2D → alpha 0 → desktop,
+	// mirroring how the projection layer's own transparency already reaches the
+	// CAMetalLayer. Gated to the alpha-native + transparent-background case so
+	// opaque presents and chroma-key DPs are untouched; explicit/zones masks
+	// already use the hard lerp. Windows keeps alpha_over (its 2D-under path
+	// supplies the captured desktop), so no cross-platform regression.
+	if (alpha_over && c->transparent_background && c->display_processor != NULL &&
+	    xrt_display_processor_is_alpha_native(c->display_processor)) {
+		alpha_over = false;
+	}
+#endif
 	vk_local2d_composite_draw(&c->local2d, vk, cmd, c->composite_target_fb, dst_w, dst_h,
 	                          c->local2d_scratch_view, mask_view, c->weave_scratch_view, region_w,
 	                          region_h, cx, cy, cw, ch, alpha_over);
@@ -4678,7 +4708,7 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 			logged = true;
 			U_LOG_W("VK Local2D composite: %ux%u region, %u layer(s), %s mask (#491 alpha_over=%d)",
 			        region_w, region_h, rect_count, have_explicit ? "explicit" : "implicit",
-			        !have_explicit);
+			        alpha_over);
 		}
 	}
 
