@@ -12,7 +12,9 @@ package org.freedesktop.monado.auxiliary;
 import android.app.Activity;
 import android.content.Context;
 import android.graphics.PixelFormat;
+import android.graphics.Region;
 import android.hardware.display.DisplayManager;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
@@ -21,6 +23,7 @@ import android.util.Log;
 import android.view.Display;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
+import android.view.ViewTreeObserver;
 import android.view.WindowManager;
 import androidx.annotation.GuardedBy;
 import androidx.annotation.Keep;
@@ -69,6 +72,20 @@ public class MonadoView extends SurfaceView
     // handle input via Activity.dispatchTouchEvent (#499).
     @Nullable private Activity hostActivity = null;
 
+    // #558 P3: when this is a SERVICE-owned overlay (no host Activity) it floats
+    // over the live launcher and must pass touches through WITHOUT
+    // FLAG_NOT_TOUCHABLE (that flag makes Android clamp the window to <=0.80
+    // alpha, which blends away the LeiaSR interlace → the weave looks 2D).
+    // Instead we declare an explicit touchable Region (empty = full passthrough,
+    // full opacity). Guarded; a non-empty region (the tiger silhouette) can be
+    // set later to make just the tiger touchable.
+    private final Object touchableRegionSync = new Object();
+
+    @GuardedBy("touchableRegionSync")
+    private final Region touchableRegion = new Region(); // empty == pass everything through
+
+    private boolean passthroughInstalled = false;
+
     public MonadoView(Context context) {
         super(context);
 
@@ -113,6 +130,136 @@ public class MonadoView extends SurfaceView
             return true; // claim the gesture so we keep receiving MOVE/UP
         }
         return super.onTouchEvent(event);
+    }
+
+    @Override
+    protected void onAttachedToWindow() {
+        super.onAttachedToWindow();
+        // Service-owned overlay (no host Activity): install the passthrough touch
+        // region so the live launcher below stays interactive. In-process
+        // (host Activity present) keeps the full-touchable forward-to-Activity
+        // behavior (#499) untouched.
+        if (hostActivity == null) {
+            installPassthroughTouchRegion();
+        }
+    }
+
+    /**
+     * #558 P3: make this service-owned overlay declare an explicit touchable Region via the hidden
+     * ViewTreeObserver.addOnComputeInternalInsetsListener API, instead of FLAG_NOT_TOUCHABLE.
+     *
+     * <p>FLAG_NOT_TOUCHABLE would make Android clamp this system overlay to &lt;=0.80 window alpha
+     * (anti-tapjacking), and an 0.80 whole-window blend destroys the LeiaSR per-pixel interlace so
+     * the weave looks 2D. A touchable Region carries no such clamp: an EMPTY region means nothing
+     * here is touchable (everything passes through to the launcher) while the window stays fully
+     * opaque so the 3D weave survives. Reflected because the API is {@code @hide} (this file already
+     * relies on reflection for SystemProperties).
+     */
+    private static boolean sHiddenApiExempted = false;
+
+    /**
+     * Lift Android's non-SDK (hidden-API) blocklist for this process so the touch-region reflection
+     * below can see {@code ViewTreeObserver$InternalInsetsInfo.touchableRegion} (blocklisted on
+     * Android 14 → getField throws NoSuchFieldException). Uses the well-known double-reflection
+     * bootstrap (Class.forName + getDeclaredMethod obtained reflectively bypass the caller check)
+     * to call VMRuntime.setHiddenApiExemptions("L"). Same technique Shizuku/LSPosed use.
+     */
+    private static void exemptHiddenApis() {
+        if (sHiddenApiExempted) {
+            return;
+        }
+        sHiddenApiExempted = true;
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            return; // no non-SDK restrictions before Android 9
+        }
+        try {
+            java.lang.reflect.Method forName =
+                    Class.class.getDeclaredMethod("forName", String.class);
+            java.lang.reflect.Method getDeclaredMethod =
+                    Class.class.getDeclaredMethod(
+                            "getDeclaredMethod", String.class, Class[].class);
+            Class<?> vmRuntimeClass = (Class<?>) forName.invoke(null, "dalvik.system.VMRuntime");
+            java.lang.reflect.Method getRuntime =
+                    (java.lang.reflect.Method)
+                            getDeclaredMethod.invoke(vmRuntimeClass, "getRuntime", (Class<?>[]) null);
+            java.lang.reflect.Method setHiddenApiExemptions =
+                    (java.lang.reflect.Method)
+                            getDeclaredMethod.invoke(
+                                    vmRuntimeClass,
+                                    "setHiddenApiExemptions",
+                                    new Class[] {String[].class});
+            Object vmRuntime = getRuntime.invoke(null);
+            setHiddenApiExemptions.invoke(vmRuntime, new Object[] {new String[] {"L"}});
+            Log.i(TAG, "MonadoView: hidden-API exemptions applied (touch-region reflection)");
+        } catch (Throwable t) {
+            Throwable cause = (t instanceof java.lang.reflect.InvocationTargetException
+                            && t.getCause() != null)
+                    ? t.getCause()
+                    : t;
+            Log.w(TAG, "MonadoView: hidden-API exemption failed: " + cause, cause);
+        }
+    }
+
+    private void installPassthroughTouchRegion() {
+        if (passthroughInstalled) {
+            return;
+        }
+        exemptHiddenApis();
+        try {
+            final Class<?> infoCls =
+                    Class.forName("android.view.ViewTreeObserver$InternalInsetsInfo");
+            final Class<?> listenerCls =
+                    Class.forName("android.view.ViewTreeObserver$OnComputeInternalInsetsListener");
+            final java.lang.reflect.Method setTouchableInsets =
+                    infoCls.getMethod("setTouchableInsets", int.class);
+            final java.lang.reflect.Field touchableRegionField =
+                    infoCls.getField("touchableRegion");
+            final int touchableInsetsRegion =
+                    infoCls.getField("TOUCHABLE_INSETS_REGION").getInt(null);
+
+            final Object listener =
+                    java.lang.reflect.Proxy.newProxyInstance(
+                            listenerCls.getClassLoader(),
+                            new Class<?>[] {listenerCls},
+                            (proxy, method, args) -> {
+                                String name = method.getName();
+                                if ("onComputeInternalInsets".equals(name)
+                                        && args != null
+                                        && args.length == 1) {
+                                    Object info = args[0];
+                                    setTouchableInsets.invoke(info, touchableInsetsRegion);
+                                    Region region = (Region) touchableRegionField.get(info);
+                                    if (region != null) {
+                                        synchronized (touchableRegionSync) {
+                                            region.set(touchableRegion);
+                                        }
+                                    }
+                                    return null;
+                                }
+                                if ("hashCode".equals(name)) {
+                                    return System.identityHashCode(proxy);
+                                }
+                                if ("equals".equals(name)) {
+                                    return proxy == (args != null ? args[0] : null);
+                                }
+                                if ("toString".equals(name)) {
+                                    return "MonadoViewPassthroughInsetsListener";
+                                }
+                                return null;
+                            });
+
+            final java.lang.reflect.Method addListener =
+                    ViewTreeObserver.class.getMethod(
+                            "addOnComputeInternalInsetsListener", listenerCls);
+            addListener.invoke(getViewTreeObserver(), listener);
+            passthroughInstalled = true;
+            Log.i(TAG, "MonadoView: passthrough touch region installed (#558 P3)");
+        } catch (Throwable t) {
+            Log.w(
+                    TAG,
+                    "MonadoView: passthrough touch region unavailable; overlay stays fully touchable",
+                    t);
+        }
     }
 
     private MonadoView(Context context, long nativePointer) {
