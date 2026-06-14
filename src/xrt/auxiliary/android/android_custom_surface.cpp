@@ -127,13 +127,13 @@ android_custom_surface_async_start(
 			Display display = dm.getDisplay(display_id);
 			displayContext = ctx.createDisplayContext(display);
 			type = WindowManager_LayoutParams::TYPE_APPLICATION_OVERLAY();
-			// #558 P2: the service overlay has no host Activity to forward touch
-			// to, and it floats over the LIVE launcher — so make it pass touches
-			// straight through (FLAG_NOT_TOUCHABLE). The launcher stays fully
-			// interactive (swipe pages, launch apps) and the tiger is visual-only
-			// on top. (P3 will swap this for a per-silhouette touchable region +
-			// service→client touch forwarding so the tiger is touch-controllable.)
-			flags |= WindowManager_LayoutParams::FLAG_NOT_TOUCHABLE();
+			// #558 P3: the service overlay floats over the LIVE launcher and must
+			// pass touches through. We do NOT use FLAG_NOT_TOUCHABLE — Android
+			// clamps such a system overlay to <=0.80 window alpha (anti-tapjacking),
+			// and an 0.80 whole-window blend destroys the LeiaSR per-pixel interlace
+			// → the weave looks 2D. Instead MonadoView sets an empty touchable
+			// REGION (no flag, no alpha clamp): full passthrough, full-opacity 3D
+			// weave. See MonadoView.installPassthroughTouchRegion().
 		}
 
 		int32_t width = 0;
