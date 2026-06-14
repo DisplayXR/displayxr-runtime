@@ -2163,6 +2163,31 @@ multi_compositor_set_rendering_mode(struct multi_compositor *mc,
 	mc->active_mode_valid = true;
 }
 
+//! @copydoc xrt_compositor::request_display_mode
+//! Vtable dispatch target (#575): the IPC server handler now calls through the
+//! xrt_compositor vtable instead of an XRT_OS_ANDROID-only direct call, so the
+//! Windows D3D11 service can implement the same contract. Delegates to the
+//! existing hardware-channel helper.
+static xrt_result_t
+multi_compositor_vtable_request_display_mode(struct xrt_compositor *xc, bool enable_3d)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	multi_compositor_request_display_mode(mc, enable_3d);
+	return XRT_SUCCESS;
+}
+
+//! @copydoc xrt_compositor::request_rendering_mode
+static xrt_result_t
+multi_compositor_vtable_request_rendering_mode(struct xrt_compositor *xc,
+                                               uint32_t mode_index,
+                                               uint32_t tile_columns,
+                                               uint32_t tile_rows)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	multi_compositor_set_rendering_mode(mc, mode_index, tile_columns, tile_rows);
+	return XRT_SUCCESS;
+}
+
 void
 multi_compositor_set_eye_tracking_mode(struct multi_compositor *mc, uint32_t mode)
 {
@@ -2225,6 +2250,8 @@ multi_compositor_create(struct multi_system_compositor *msc,
 	mc->base.base.set_thread_hint = multi_compositor_set_thread_hint;
 	mc->base.base.get_display_refresh_rate = multi_compositor_get_display_refresh_rate;
 	mc->base.base.request_display_refresh_rate = multi_compositor_request_display_refresh_rate;
+	mc->base.base.request_display_mode = multi_compositor_vtable_request_display_mode;
+	mc->base.base.request_rendering_mode = multi_compositor_vtable_request_rendering_mode;
 	mc->msc = msc;
 	mc->xses = xses;
 	mc->xsi = *xsi;

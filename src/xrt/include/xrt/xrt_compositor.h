@@ -1547,6 +1547,35 @@ struct xrt_compositor
 	 */
 	xrt_result_t (*request_display_refresh_rate)(struct xrt_compositor *xc, float display_refresh_rate_hz);
 
+	/*!
+	 * Request the HARDWARE 2D/3D display state (#533) — the display processor's
+	 * weave-state signal. DECOUPLED from the content/atlas mode below (ADR-028):
+	 * the two channels are orthogonal. Implemented by the server-side per-client
+	 * compositors (multi_compositor, comp_d3d11_service) so an out-of-process
+	 * (IPC) client's xrRequestDisplayRenderingModeEXT drives the DP. May be NULL
+	 * (in-process native compositors drive their DP directly; null compositor).
+	 *
+	 * @param xc         Self pointer
+	 * @param enable_3d  true = 3D weave, false = 2D flat.
+	 */
+	xrt_result_t (*request_display_mode)(struct xrt_compositor *xc, bool enable_3d);
+
+	/*!
+	 * Request the CONTENT rendering mode (the atlas tile grid the app submits
+	 * into, #553/ADR-028) — DECOUPLED from the hardware 2D/3D state above.
+	 * Implemented by the server-side per-client compositors so an IPC client's
+	 * mode selection clamps the per-session atlas to the mode grid. May be NULL.
+	 *
+	 * @param xc            Self pointer
+	 * @param mode_index    Index into the head device's rendering-mode list.
+	 * @param tile_columns  Resolved grid columns for @p mode_index (server-resolved).
+	 * @param tile_rows     Resolved grid rows for @p mode_index.
+	 */
+	xrt_result_t (*request_rendering_mode)(struct xrt_compositor *xc,
+	                                       uint32_t mode_index,
+	                                       uint32_t tile_columns,
+	                                       uint32_t tile_rows);
+
 	/*! @} */
 
 
@@ -2080,6 +2109,43 @@ static inline xrt_result_t
 xrt_comp_request_display_refresh_rate(struct xrt_compositor *xc, float display_refresh_rate_hz)
 {
 	return xc->request_display_refresh_rate(xc, display_refresh_rate_hz);
+}
+
+/*!
+ * @copydoc xrt_compositor::request_display_mode
+ *
+ * Helper for calling through the function pointer. No-op (returns success) when
+ * the compositor doesn't implement it (in-process native, null compositor).
+ *
+ * @public @memberof xrt_compositor
+ */
+static inline xrt_result_t
+xrt_comp_request_display_mode(struct xrt_compositor *xc, bool enable_3d)
+{
+	if (xc->request_display_mode == NULL) {
+		return XRT_SUCCESS;
+	}
+	return xc->request_display_mode(xc, enable_3d);
+}
+
+/*!
+ * @copydoc xrt_compositor::request_rendering_mode
+ *
+ * Helper for calling through the function pointer. No-op (returns success) when
+ * the compositor doesn't implement it.
+ *
+ * @public @memberof xrt_compositor
+ */
+static inline xrt_result_t
+xrt_comp_request_rendering_mode(struct xrt_compositor *xc,
+                                uint32_t mode_index,
+                                uint32_t tile_columns,
+                                uint32_t tile_rows)
+{
+	if (xc->request_rendering_mode == NULL) {
+		return XRT_SUCCESS;
+	}
+	return xc->request_rendering_mode(xc, mode_index, tile_columns, tile_rows);
 }
 
 
