@@ -49,6 +49,7 @@ RULES = {
     "INV-3.1": "Locate into an XRT_MAX_VIEWS (8)-wide buffer; render/submit the active mode's viewCount, never a hardcoded 2.",
     "INV-4.3": "Per-tile render size = window/canvas x scaleXY, never display size.",
     "INV-4.6": "Request an sRGB swapchain (and store a correctly-encoded image); don't double-encode.",
+    "INV-4.7": "Write every pixel of the imageRect you declare — clear partial-tile renders to (0,0,0,0) first (or shrink the rect); undefined pixels read as opaque magenta on MoltenVK and break transparent-bg.",
     "INV-7.x": "Capture via xrCaptureAtlasEXT — never reintroduce an app-side CaptureAtlasRegion* readback.",
     "INV-7.2": "xrCaptureAtlasEXT pathPrefix takes NO extension; the runtime appends _atlas.png.",
     "INV-9.1": "Ship a <exe>.displayxr.json (schema_version=1, name 1-64, type 2d|3d) or the app won't appear in the workspace launcher.",
