@@ -28,6 +28,8 @@
 
 #include "xrt/xrt_handles.h"
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
