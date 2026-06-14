@@ -177,22 +177,19 @@ public class Client implements ServiceConnection {
                                 activity = (Activity) context_;
                             }
 
-                            // The client ALWAYS owns the surface: it attaches a view to its
-                            // own activity and passes the Surface to the service (#510/#528).
-                            // The Monado-era alternative — skip this when the service holds
-                            // SYSTEM_ALERT_WINDOW and draws its own overlay — was removed with
-                            // #558 (comp_window_android never ported the overlay path, so a
-                            // granted permission only produced a black screen). Revert the
-                            // #558 overlay-removal commit to revive it.
-                            if (activity != null) {
-                                Surface surface = attachViewAndGetSurface(activity);
-                                if (surface == null) {
-                                    Log.e(TAG, "Failed to create surface");
-                                    handleFailure();
-                                    return;
-                                }
+                            try {
+                                if (!monado.canDrawOverOtherApps() && activity != null) {
+                                    Surface surface = attachViewAndGetSurface(activity);
+                                    if (surface == null) {
+                                        Log.e(TAG, "Failed to create surface");
+                                        handleFailure();
+                                        return;
+                                    }
 
-                                sendSurfaceIfNew(surface);
+                                    sendSurfaceIfNew(surface);
+                                }
+                            } catch (RemoteException e) {
+                                e.printStackTrace();
                             }
 
                             if (activity != null) {

@@ -18,15 +18,6 @@
  * comp_target_factory are intentionally omitted: the runtime service has no
  * Activity, and the null/service compositor creates this target directly via
  * its comp_target_service, not through a factory.
- *
- * #558 also removed the Java-side remains of the overlay mode (SurfaceManager,
- * IMonado.canDrawOverOtherApps + the Client.java gate, the SYSTEM_ALERT_WINDOW
- * permission and its settings UI) — the gate made a *granted* permission skip
- * the client surface publication against a service that never creates an
- * overlay, i.e. a guaranteed black screen. To revive service-owned
- * presentation (e.g. external/secondary displays per ADR-015), revert the
- * #558 overlay-removal commit and port this file's overlay branch back from
- * Monado upstream.
  */
 
 #include "xrt/xrt_compiler.h"

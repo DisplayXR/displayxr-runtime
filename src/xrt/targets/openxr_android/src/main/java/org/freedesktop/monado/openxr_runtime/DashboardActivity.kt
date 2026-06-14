@@ -29,6 +29,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
 import dagger.hilt.android.AndroidEntryPoint
 import javax.inject.Inject
+import org.freedesktop.monado.android_common.DisplayOverOtherAppsStatusFragment
 import org.freedesktop.monado.android_common.VrModeStatus
 import org.freedesktop.monado.auxiliary.NameAndLogoProvider
 import org.json.JSONObject
@@ -107,6 +108,7 @@ class DashboardActivity : AppCompatActivity() {
 
         if (!BuildConfig.inProcess) {
             findViewById<View>(R.id.cardLive).visibility = View.VISIBLE
+            findViewById<View>(R.id.drawOverOtherAppsFrame).visibility = View.VISIBLE
             // The service shares the activity's (default) process, so a
             // self-kill takes the whole runtime down — same behavior as the
             // legacy About screen's shutdown button.
@@ -115,12 +117,15 @@ class DashboardActivity : AppCompatActivity() {
             shutdown.setOnClickListener { Process.killProcess(Process.myPid()) }
         }
 
-        // Android status fragment (VR listener), hosted in a card frame.
-        // (The display-over-other-apps card was removed with #558 along with
-        // the service-side overlay mode it controlled.)
+        // Android status fragments — the existing android_common logic,
+        // hosted in width-constrained card frames (this IS the fix for the
+        // old corner-jammed overlay-permission UI).
         val tx = supportFragmentManager.beginTransaction()
         val status = VrModeStatus.detectStatus(this, applicationContext.applicationInfo.packageName)
         tx.replace(R.id.statusFrame, VrModeStatus.newInstance(status), null)
+        if (!BuildConfig.inProcess) {
+            tx.replace(R.id.drawOverOtherAppsFrame, DisplayOverOtherAppsStatusFragment(), null)
+        }
         tx.commit()
 
         runQuery()
