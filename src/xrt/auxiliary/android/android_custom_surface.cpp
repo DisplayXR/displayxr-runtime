@@ -109,12 +109,11 @@ android_custom_surface_async_start(
 		Context ctx = Context((jobject)context);
 		Context displayContext;
 		int32_t type = 0;
-		// Not focusable. The overlay stays TOUCHABLE on purpose: it sits on top
-		// of the app to present the (weaved) output, and the NativeActivity's own
-		// window gets no touchable frame in this setup — so the overlay is the
-		// only window that can receive touch. MonadoView forwards every touch to
-		// the host Activity's dispatchTouchEvent, letting an in-process app
-		// (e.g. cube_handle_vk_android) drive input from there (#499).
+		// Not focusable. In-process (TYPE_APPLICATION) the overlay stays TOUCHABLE
+		// on purpose: it sits on top of the app's NativeActivity (which gets no
+		// touchable frame), so it's the only window that can receive touch, and
+		// MonadoView forwards every touch to the host Activity's dispatchTouchEvent
+		// (#499, e.g. cube_handle_vk_android).
 		int32_t flags =
 		    WindowManager_LayoutParams::FLAG_FULLSCREEN() | WindowManager_LayoutParams::FLAG_NOT_FOCUSABLE();
 
@@ -122,11 +121,19 @@ android_custom_surface_async_start(
 			displayContext = ctx;
 			type = WindowManager_LayoutParams::TYPE_APPLICATION();
 		} else {
-			// Out of process mode, determine which display should be used.
+			// Out of process mode (service-owned overlay over the live launcher,
+			// #558). Determine which display should be used.
 			DisplayManager dm = DisplayManager(ctx.getSystemService(Context::DISPLAY_SERVICE()));
 			Display display = dm.getDisplay(display_id);
 			displayContext = ctx.createDisplayContext(display);
 			type = WindowManager_LayoutParams::TYPE_APPLICATION_OVERLAY();
+			// #558 P2: the service overlay has no host Activity to forward touch
+			// to, and it floats over the LIVE launcher — so make it pass touches
+			// straight through (FLAG_NOT_TOUCHABLE). The launcher stays fully
+			// interactive (swipe pages, launch apps) and the tiger is visual-only
+			// on top. (P3 will swap this for a per-silhouette touchable region +
+			// service→client touch forwarding so the tiger is touch-controllable.)
+			flags |= WindowManager_LayoutParams::FLAG_NOT_TOUCHABLE();
 		}
 
 		int32_t width = 0;
