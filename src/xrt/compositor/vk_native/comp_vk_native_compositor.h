@@ -40,10 +40,7 @@ extern "C" {
  * @param shared_texture_handle Shared texture HANDLE for offscreen mode, or NULL.
  * @param transparent_background Request transparent (PRE_MULTIPLIED) compositeAlpha
  *        on the presented swapchain. Forwarded to the display processor as the
- *        chroma-key gate.
- * @param chroma_key_color 0x00BBGGRR. When @p transparent_background is true the
- *        display processor uses this color in its pre-weave fill / post-weave strip
- *        passes. Pass 0 to let the DP pick a content-safe default (magenta).
+ *        transparency enable (set_transparent_background).
  * @param out_xc Pointer to receive the created compositor.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
@@ -61,7 +58,6 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
                                  void *dp_factory_vk,
                                  void *shared_texture_handle,
                                  bool transparent_background,
-                                 uint32_t chroma_key_color,
                                  int32_t display_screen_left,
                                  int32_t display_screen_top,
                                  struct xrt_compositor_native **out_xc);

@@ -605,18 +605,6 @@ sim_dp_is_alpha_native(struct xrt_display_processor *xdp)
 	return true;
 }
 
-static void
-sim_dp_set_chroma_key(struct xrt_display_processor *xdp,
-                      uint32_t key_color,
-                      bool transparent_bg_enabled)
-{
-	(void)key_color;
-	// Alpha-native — no chroma-key fill/strip required. We do honor the
-	// transparent-background bit so the weave render-pass clears the target
-	// to alpha=0 instead of opaque black (issue #392).
-	sim_display_processor(xdp)->transparent_bg = transparent_bg_enabled;
-}
-
 // #491 part 3 — store the runtime's flattened 2D-under backdrop for the next
 // process_atlas. sim_display is a test double (no captured desktop), so it
 // records the handoff rather than compositing pixels; the one-shot WARN proves
@@ -753,7 +741,6 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 	sdp->base.get_render_pass = sim_dp_get_render_pass;
 	sdp->base.get_predicted_eye_positions = sim_dp_get_predicted_eye_positions;
 	sdp->base.is_alpha_native = sim_dp_is_alpha_native;
-	sdp->base.set_chroma_key = sim_dp_set_chroma_key;
 	sdp->base.set_background_2d = sim_dp_set_background_2d; // #491 part 3
 	sdp->base.get_local_zone_caps = sim_dp_get_local_zone_caps;          // #224 / ADR-027
 	sdp->base.publish_local_zone_mask = sim_dp_publish_local_zone_mask;  // #224 / ADR-027

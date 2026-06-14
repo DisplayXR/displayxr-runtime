@@ -146,22 +146,10 @@ struct xrt_display_processor_gl
 	/*!
 	 * Whether this display processor passes per-pixel alpha through to its
 	 * output stage. true for sim_display-style processors; false (or NULL)
-	 * for Leia-style weavers that need the chroma-key trick.
+	 * for Leia-style weavers.
 	 * Optional — NULL means false.
 	 */
 	bool (*is_alpha_native)(struct xrt_display_processor_gl *xdp);
-
-	/*!
-	 * Inform the DP of session-level transparency configuration.
-	 * @p key_color is the app-supplied chroma key (0x00BBGGRR); 0 means
-	 * the DP picks its own internal color. @p transparent_bg_enabled
-	 * tells the DP whether to run its pre-weave fill / post-weave strip
-	 * pass.
-	 * Optional — NULL means the DP doesn't respect transparency requests.
-	 */
-	void (*set_chroma_key)(struct xrt_display_processor_gl *xdp,
-	                       uint32_t key_color,
-	                       bool transparent_bg_enabled);
 
 	/*!
 	 * Destroy this display processor and free all resources.
@@ -302,6 +290,31 @@ struct xrt_display_processor_gl
 	 * @return true if the clear was accepted.
 	 */
 	bool (*clear_local_zone_mask)(struct xrt_display_processor_gl *xdp);
+
+	/*!
+	 * Enable/disable transparent-background output for this client (#573 — the
+	 * GL counterpart of @ref xrt_display_processor_d3d11::set_transparent_background).
+	 * When enabled, the DP composites its weave OVER the captured desktop behind
+	 * the app window (compose-under-background, from the atlas's premultiplied
+	 * alpha) so transparent atlas regions show the desktop. This is the policy
+	 * signal; the runtime separately guarantees the app window is excluded from
+	 * the DP's desktop capture (SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE),
+	 * set from the window-owning process).
+	 *
+	 * This is the sole transparency enable (#573 removed the legacy chroma-key
+	 * path, which on GL had been overloaded as the enable signal). Optional —
+	 * absent slot or NULL ⟹ the DP doesn't support transparent output. Appended
+	 * per ADR-020.
+	 *
+	 * @param xdp             Pointer to self.
+	 * @param enabled         true to produce transparent output for see-through.
+	 * @param client_presents true ⟹ the runtime owns a transparent present that
+	 *                        DWM-blends the live desktop into alpha=0 holes; the DP
+	 *                        then only reconstructs alpha (the alpha-gate), never
+	 *                        composing its own captured-desktop background. false ⟹
+	 *                        the DP owns see-through itself (compose-under-bg).
+	 */
+	void (*set_transparent_background)(struct xrt_display_processor_gl *xdp, bool enabled, bool client_presents);
 };
 
 /*
@@ -341,15 +354,15 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, get_hardware_3d_stat
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, get_display_dimensions)      == XRT_DP_GL_BASE_OFF + 5 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, get_display_pixel_info)      == XRT_DP_GL_BASE_OFF + 6 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, is_alpha_native)             == XRT_DP_GL_BASE_OFF + 7 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, set_chroma_key)              == XRT_DP_GL_BASE_OFF + 8 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, destroy)                     == XRT_DP_GL_BASE_OFF + 9 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, get_handoff_color_capability) == XRT_DP_GL_BASE_OFF + 10 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, set_atlas_encoding)           == XRT_DP_GL_BASE_OFF + 11 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, set_background_2d)            == XRT_DP_GL_BASE_OFF + 12 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, set_eye_tracking_mode)        == XRT_DP_GL_BASE_OFF + 13 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, get_local_zone_caps)          == XRT_DP_GL_BASE_OFF + 14 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, publish_local_zone_mask)      == XRT_DP_GL_BASE_OFF + 15 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, clear_local_zone_mask)        == XRT_DP_GL_BASE_OFF + 16 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, destroy)                     == XRT_DP_GL_BASE_OFF + 8 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, get_handoff_color_capability) == XRT_DP_GL_BASE_OFF + 9 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, set_atlas_encoding)           == XRT_DP_GL_BASE_OFF + 10 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, set_background_2d)            == XRT_DP_GL_BASE_OFF + 11 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, set_eye_tracking_mode)        == XRT_DP_GL_BASE_OFF + 12 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, get_local_zone_caps)          == XRT_DP_GL_BASE_OFF + 13 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, publish_local_zone_mask)      == XRT_DP_GL_BASE_OFF + 14 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, clear_local_zone_mask)        == XRT_DP_GL_BASE_OFF + 15 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, set_transparent_background)   == XRT_DP_GL_BASE_OFF + 16 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_gl)                                == XRT_DP_GL_BASE_OFF + 17 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
@@ -488,19 +501,21 @@ xrt_display_processor_gl_is_alpha_native(struct xrt_display_processor_gl *xdp)
 }
 
 /*!
- * @copydoc xrt_display_processor_gl::set_chroma_key
- * No-op if not supported (function pointer is NULL).
+ * @copydoc xrt_display_processor_gl::set_transparent_background
+ * Returns false if not supported (slot absent or NULL) — the caller then
+ * leaves the DP opaque.
  * @public @memberof xrt_display_processor_gl
  */
-static inline void
-xrt_display_processor_gl_set_chroma_key(struct xrt_display_processor_gl *xdp,
-                                         uint32_t key_color,
-                                         bool transparent_bg_enabled)
+static inline bool
+xrt_display_processor_gl_set_transparent_background(struct xrt_display_processor_gl *xdp,
+                                                    bool enabled,
+                                                    bool client_presents)
 {
-	if (!XRT_DP_HAS_SLOT(xdp, set_chroma_key) || xdp->set_chroma_key == NULL) {
-		return;
+	if (!XRT_DP_HAS_SLOT(xdp, set_transparent_background) || xdp->set_transparent_background == NULL) {
+		return false;
 	}
-	xdp->set_chroma_key(xdp, key_color, transparent_bg_enabled);
+	xdp->set_transparent_background(xdp, enabled, client_presents);
+	return true;
 }
 
 /*!

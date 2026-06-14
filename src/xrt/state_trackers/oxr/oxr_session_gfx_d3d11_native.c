@@ -128,7 +128,6 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
                                    void *window_handle,
                                    void *shared_texture_handle,
                                    bool transparent_background,
-                                   uint32_t chroma_key_color,
                                    struct oxr_session *sess)
 {
 	struct xrt_device *xdev = get_role_head(sess->sys);
@@ -147,7 +146,7 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
 	// Create the D3D11 native compositor
 	xrt_result_t xret = comp_d3d11_compositor_create(
 	    xdev, window_handle, (void *)next->device, dp_factory_d3d11, shared_texture_handle,
-	    transparent_background, chroma_key_color, display_screen_left, display_screen_top, &xcn);
+	    transparent_background, display_screen_left, display_screen_top, &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
 		                 "Failed to create D3D11 native compositor: %d", xret);

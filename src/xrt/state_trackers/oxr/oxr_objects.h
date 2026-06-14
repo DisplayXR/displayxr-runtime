@@ -1491,7 +1491,6 @@ oxr_session_populate_gl_native(struct oxr_logger *log,
                                 void *gl_display,
                                 void *shared_texture_handle,
                                 bool transparent_background,
-                                uint32_t chroma_key_color,
                                 struct oxr_session *sess);
 #endif
 
@@ -1599,7 +1598,6 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
                                 void *window_handle,
                                 void *shared_texture_handle,
                                 bool transparent_background,
-                                uint32_t chroma_key_color,
                                 struct oxr_session *sess);
 #endif
 
@@ -1694,7 +1692,6 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
                                    void *window_handle,
                                    void *shared_texture_handle,
                                    bool transparent_background,
-                                   uint32_t chroma_key_color,
                                    struct oxr_session *sess);
 #endif
 
@@ -1720,7 +1717,6 @@ oxr_session_populate_d3d12_native(struct oxr_logger *log,
                                    void *window_handle,
                                    void *shared_texture_handle,
                                    bool transparent_background,
-                                   uint32_t chroma_key_color,
                                    struct oxr_session *sess);
 #endif
 

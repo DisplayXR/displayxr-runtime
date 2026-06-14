@@ -68,7 +68,6 @@ oxr_session_populate_gl_macos(struct oxr_logger *log,
 	        : NULL,
 	    shared_iosurface,     // IOSurfaceRef for shared texture mode (or NULL for windowed)
 	    /*transparent_background*/ false,  // GL transparent present path is deferred (PR #3b §3b)
-	    /*chroma_key_color*/ 0,
 	    /*display_screen_left*/ 0,   // macOS: NSOpenGLView positioning, no D3D11 window
 	    /*display_screen_top*/ 0,
 	    &xcn);

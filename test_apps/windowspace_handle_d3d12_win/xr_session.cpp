@@ -222,7 +222,6 @@ bool CreateSession(XrSessionManager& xr, ID3D12Device* device, ID3D12CommandQueu
         const char *e = getenv("DISPLAYXR_TRANSPARENT_BG");
         if (e != nullptr && *e != '\0' && *e != '0') {
             sessionTarget.transparentBackgroundEnabled = XR_TRUE;
-            sessionTarget.chromaKeyColor = 0;
             LOG_INFO("Transparent background ENABLED (DISPLAYXR_TRANSPARENT_BG=1)");
         }
     }

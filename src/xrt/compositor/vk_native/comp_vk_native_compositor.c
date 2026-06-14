@@ -23,6 +23,7 @@
 #include "xrt/xrt_vulkan_includes.h"
 #include "xrt/xrt_system.h"
 #include "xrt/xrt_display_processor.h"
+#include "xrt/xrt_display_processor_vk.h"
 
 #include "vk/vk_helpers.h"
 #include "vk/vk_hud_blend.h"
@@ -3115,7 +3116,7 @@ dp_vtable_looks_sane(struct xrt_display_processor *dp)
 	void *fns[] = {
 	    (void *)dp->process_atlas,        (void *)dp->destroy,
 	    (void *)dp->get_display_pixel_info, (void *)dp->get_render_pass,
-	    (void *)dp->get_display_dimensions, (void *)dp->set_chroma_key,
+	    (void *)dp->get_display_dimensions, (void *)dp->set_eye_tracking_mode,
 	};
 	if (dp->process_atlas == NULL || dp->destroy == NULL) {
 		return false; // mandatory slots
@@ -3152,7 +3153,6 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
                                  void *dp_factory_vk,
                                  void *shared_texture_handle,
                                  bool transparent_background,
-                                 uint32_t chroma_key_color,
                                  int32_t display_screen_left,
                                  int32_t display_screen_top,
                                  struct xrt_compositor_native **out_xc)
@@ -3366,12 +3366,13 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		U_LOG_W("No VK display processor factory provided");
 	}
 
-	// Forward transparent_background + chroma_key_color to the display processor.
-	// The DP owns the chroma-key trick (compositor stays vendor-agnostic).
-	// Safe no-op if the DP doesn't implement set_chroma_key or display_processor is NULL.
+	// Forward transparent_background to the display processor (#573 —
+	// chroma-key-free). client_presents=false: the in-process present is
+	// opaque, so the DP owns see-through (alpha-gate / compose-under-bg). Safe
+	// no-op if the DP lacks the slot (sim_display) or display_processor is NULL.
 	if (c->display_processor != NULL) {
-		xrt_display_processor_set_chroma_key(
-		    c->display_processor, chroma_key_color, transparent_background);
+		xrt_display_processor_vk_set_transparent_background(
+		    (struct xrt_display_processor_vk *)c->display_processor, transparent_background, false);
 	}
 
 	// Create output target (VkSwapchainKHR) for presentation.

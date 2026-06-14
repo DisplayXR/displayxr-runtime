@@ -477,17 +477,6 @@ sim_dp_d3d11_is_alpha_native(struct xrt_display_processor_d3d11 *xdp)
 	return true;
 }
 
-static void
-sim_dp_d3d11_set_chroma_key(struct xrt_display_processor_d3d11 *xdp,
-                            uint32_t key_color,
-                            bool transparent_bg_enabled)
-{
-	(void)xdp;
-	(void)key_color;
-	(void)transparent_bg_enabled;
-	// Alpha-native — no chroma-key fill/strip required.
-}
-
 /*
  * ADR-021: this DP samples the atlas and runs the result through out_encode(),
  * which encodes to sRGB when the runtime declares a LINEAR atlas and passes
@@ -753,7 +742,6 @@ sim_display_processor_d3d11_create(enum sim_display_output_mode mode,
 	sdp->base.process_atlas = sim_dp_d3d11_process_atlas;
 	sdp->base.get_predicted_eye_positions = sim_dp_d3d11_get_predicted_eye_positions;
 	sdp->base.is_alpha_native = sim_dp_d3d11_is_alpha_native;
-	sdp->base.set_chroma_key = sim_dp_d3d11_set_chroma_key;
 	sdp->base.get_handoff_color_capability = sim_dp_d3d11_get_handoff_color_capability;
 	sdp->base.set_atlas_encoding = sim_dp_d3d11_set_atlas_encoding;
 	sdp->base.get_local_zone_caps = sim_dp_d3d11_get_local_zone_caps;

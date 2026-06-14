@@ -254,7 +254,6 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
                                 void *window_handle,
                                 void *shared_texture_handle,
                                 bool transparent_background,
-                                uint32_t chroma_key_color,
                                 struct oxr_session *sess)
 {
 	struct xrt_device *xdev = get_role_head(sess->sys);
@@ -320,7 +319,7 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	    next->queueFamilyIndex,
 	    next->queueIndex,
 	    dp_factory_vk, shared_texture_handle,
-	    transparent_background, chroma_key_color,
+	    transparent_background,
 	    display_screen_left, display_screen_top,
 	    &xcn);
 	if (xret != XRT_SUCCESS) {
