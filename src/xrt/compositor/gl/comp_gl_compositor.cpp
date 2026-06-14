@@ -469,6 +469,23 @@ struct comp_gl_compositor
 	ID3D11PixelShader *dcomp_ps;
 	ID3D11SamplerState *dcomp_samp;
 	uint32_t dcomp_present_w, dcomp_present_h;
+
+	// P0.3 (#573) — no-interop readback fallback. When WGL_NV_DX_interop2 is
+	// unavailable (near-extinct hardware), GL can't share a texture with D3D11, so
+	// the weave goes to the default framebuffer (the opaque path) and per frame we
+	// glReadPixels it → upload to this DYNAMIC (CPU-write) D3D11 texture → reuse the
+	// same blit + DComp Present. Lets chroma-key be deleted everywhere. Shares the
+	// dcomp_dx_device/swapchain/target/blit pipeline with the interop path above.
+	bool dcomp_readback_active;          //!< True once the readback present path is wired up.
+	// Dedicated RGBA GL weave target — NOT FBO 0. The window's default framebuffer
+	// has no usable alpha (glReadPixels returns A=1), which would turn the α=0
+	// see-through holes into opaque black; weaving into a real RGBA texture
+	// preserves the premultiplied alpha the DComp present needs.
+	GLuint dcomp_readback_gl_tex;        //!< RGBA8 GL texture the DP weaves into.
+	GLuint dcomp_readback_gl_fbo;        //!< FBO around dcomp_readback_gl_tex.
+	ID3D11Texture2D *dcomp_readback_tex; //!< DYNAMIC RGBA source uploaded each frame.
+	ID3D11ShaderResourceView *dcomp_readback_srv;
+	uint8_t *dcomp_readback_cpu;         //!< glReadPixels CPU target (w*h*4 bytes).
 #endif
 };
 
@@ -553,6 +570,12 @@ gl_destroy_dcomp_present(struct comp_gl_compositor *c)
 		c->pfn_wglDXCloseDeviceNV(c->dcomp_dx_interop_device);
 		c->dcomp_dx_interop_device = NULL;
 	}
+	// P0.3 (#573) — readback fallback resources.
+	if (c->dcomp_readback_gl_fbo != 0) { glDeleteFramebuffers(1, &c->dcomp_readback_gl_fbo); c->dcomp_readback_gl_fbo = 0; }
+	if (c->dcomp_readback_gl_tex != 0) { glDeleteTextures(1, &c->dcomp_readback_gl_tex);     c->dcomp_readback_gl_tex = 0; }
+	if (c->dcomp_readback_srv) { c->dcomp_readback_srv->Release(); c->dcomp_readback_srv = NULL; }
+	if (c->dcomp_readback_tex) { c->dcomp_readback_tex->Release(); c->dcomp_readback_tex = NULL; }
+	if (c->dcomp_readback_cpu) { free(c->dcomp_readback_cpu);      c->dcomp_readback_cpu = NULL; }
 	if (c->dcomp_samp)         { c->dcomp_samp->Release();         c->dcomp_samp = NULL; }
 	if (c->dcomp_ps)           { c->dcomp_ps->Release();           c->dcomp_ps = NULL; }
 	if (c->dcomp_vs)           { c->dcomp_vs->Release();           c->dcomp_vs = NULL; }
@@ -565,37 +588,19 @@ gl_destroy_dcomp_present(struct comp_gl_compositor *c)
 	if (c->dcomp_dx_context)   { c->dcomp_dx_context->Release();   c->dcomp_dx_context = NULL; }
 	if (c->dcomp_dx_device)    { c->dcomp_dx_device->Release();    c->dcomp_dx_device = NULL; }
 	c->dcomp_active = false;
+	c->dcomp_readback_active = false;
 }
 
-// Initialize the DComp + WGL_NV_DX_interop2 present path. Returns false on any
-// failure (caller stays on the opaque SwapBuffers path); always leaves the
-// struct in a consistent torn-down state on false.
+// Shared D3D11 / DComp / blit setup used by BOTH the interop and the no-interop
+// readback present paths (#573 P0.3): a dedicated D3D11 device, a flip-model
+// PREMULTIPLIED composition swapchain bound to the HWND via DirectComposition, and
+// the fullscreen-triangle blit pipeline. The source texture and per-frame upload
+// differ between the two paths and are set up by the callers. Returns false (left
+// torn down) on any failure.
 static bool
-gl_setup_dcomp_present(struct comp_gl_compositor *c, HWND hwnd, uint32_t w, uint32_t h)
+gl_setup_dcomp_common(struct comp_gl_compositor *c, HWND hwnd, uint32_t w, uint32_t h)
 {
-	if (w == 0 || h == 0) {
-		return false;
-	}
-
-	// 1. WGL_NV_DX_interop2 entry points (may already be loaded by the
-	//    shared-texture path; load defensively).
-	if (c->pfn_wglDXOpenDeviceNV == NULL) {
-		c->pfn_wglDXOpenDeviceNV = (PFN_wglDXOpenDeviceNV)wglGetProcAddress("wglDXOpenDeviceNV");
-		c->pfn_wglDXCloseDeviceNV = (PFN_wglDXCloseDeviceNV)wglGetProcAddress("wglDXCloseDeviceNV");
-		c->pfn_wglDXRegisterObjectNV = (PFN_wglDXRegisterObjectNV)wglGetProcAddress("wglDXRegisterObjectNV");
-		c->pfn_wglDXUnregisterObjectNV = (PFN_wglDXUnregisterObjectNV)wglGetProcAddress("wglDXUnregisterObjectNV");
-		c->pfn_wglDXLockObjectsNV = (PFN_wglDXLockObjectsNV)wglGetProcAddress("wglDXLockObjectsNV");
-		c->pfn_wglDXUnlockObjectsNV = (PFN_wglDXUnlockObjectsNV)wglGetProcAddress("wglDXUnlockObjectsNV");
-	}
-	if (c->pfn_wglDXOpenDeviceNV == NULL || c->pfn_wglDXRegisterObjectNV == NULL ||
-	    c->pfn_wglDXLockObjectsNV == NULL || c->pfn_wglDXUnlockObjectsNV == NULL ||
-	    c->pfn_wglDXCloseDeviceNV == NULL || c->pfn_wglDXUnregisterObjectNV == NULL) {
-		U_LOG_W("Transparent GL: WGL_NV_DX_interop2 unavailable on this GPU/driver — "
-		        "staying opaque");
-		return false;
-	}
-
-	// 2. Dedicated D3D11 device for the present bridge.
+	// 1. Dedicated D3D11 device for the present bridge.
 	HRESULT hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0,
 	                               D3D11_SDK_VERSION, &c->dcomp_dx_device, NULL,
 	                               &c->dcomp_dx_context);
@@ -605,62 +610,7 @@ gl_setup_dcomp_present(struct comp_gl_compositor *c, HWND hwnd, uint32_t w, uint
 		return false;
 	}
 
-	// 3. Open the D3D11 device for GL interop.
-	c->dcomp_dx_interop_device = c->pfn_wglDXOpenDeviceNV(c->dcomp_dx_device);
-	if (c->dcomp_dx_interop_device == NULL) {
-		U_LOG_W("Transparent GL: wglDXOpenDeviceNV failed: %lu — staying opaque", GetLastError());
-		gl_destroy_dcomp_present(c);
-		return false;
-	}
-
-	// 4. Off-screen transit texture (RT + SRV) and its GL interop view + FBO.
-	D3D11_TEXTURE2D_DESC td = {};
-	td.Width = w;
-	td.Height = h;
-	td.MipLevels = 1;
-	td.ArraySize = 1;
-	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-	td.SampleDesc.Count = 1;
-	td.Usage = D3D11_USAGE_DEFAULT;
-	td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-	hr = c->dcomp_dx_device->CreateTexture2D(&td, NULL, &c->dcomp_transit_tex);
-	if (FAILED(hr)) {
-		U_LOG_W("Transparent GL: transit CreateTexture2D failed: 0x%08x", (unsigned)hr);
-		gl_destroy_dcomp_present(c);
-		return false;
-	}
-	hr = c->dcomp_dx_device->CreateShaderResourceView(c->dcomp_transit_tex, NULL,
-	                                                  &c->dcomp_transit_srv);
-	if (FAILED(hr)) {
-		U_LOG_W("Transparent GL: transit SRV failed: 0x%08x", (unsigned)hr);
-		gl_destroy_dcomp_present(c);
-		return false;
-	}
-	glGenTextures(1, &c->dcomp_transit_gl_tex);
-	c->dcomp_transit_iop = c->pfn_wglDXRegisterObjectNV(
-	    c->dcomp_dx_interop_device, c->dcomp_transit_tex, c->dcomp_transit_gl_tex,
-	    GL_TEXTURE_2D, WGL_ACCESS_READ_WRITE_NV);
-	if (c->dcomp_transit_iop == NULL) {
-		U_LOG_W("Transparent GL: wglDXRegisterObjectNV(transit) failed: %lu", GetLastError());
-		gl_destroy_dcomp_present(c);
-		return false;
-	}
-	// Build the FBO around the transit GL texture (lock while attaching).
-	glGenFramebuffers(1, &c->dcomp_transit_fbo);
-	c->pfn_wglDXLockObjectsNV(c->dcomp_dx_interop_device, 1, &c->dcomp_transit_iop);
-	glBindFramebuffer(GL_FRAMEBUFFER, c->dcomp_transit_fbo);
-	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-	                       c->dcomp_transit_gl_tex, 0);
-	GLenum fbst = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-	glBindFramebuffer(GL_FRAMEBUFFER, 0);
-	c->pfn_wglDXUnlockObjectsNV(c->dcomp_dx_interop_device, 1, &c->dcomp_transit_iop);
-	if (fbst != GL_FRAMEBUFFER_COMPLETE) {
-		U_LOG_W("Transparent GL: transit FBO incomplete: 0x%x", (unsigned)fbst);
-		gl_destroy_dcomp_present(c);
-		return false;
-	}
-
-	// 5. Flip-model composition swapchain (PREMULTIPLIED alpha).
+	// 2. Flip-model composition swapchain (PREMULTIPLIED alpha).
 	IDXGIFactory2 *factory = NULL;
 	hr = CreateDXGIFactory2(0, __uuidof(IDXGIFactory2), (void **)&factory);
 	if (FAILED(hr) || factory == NULL) {
@@ -686,7 +636,7 @@ gl_setup_dcomp_present(struct comp_gl_compositor *c, HWND hwnd, uint32_t w, uint
 		return false;
 	}
 
-	// 6. Bind the swapchain to the HWND through DirectComposition.
+	// 3. Bind the swapchain to the HWND through DirectComposition.
 	hr = DCompositionCreateDevice2(NULL, __uuidof(IDCompositionDevice),
 	                               (void **)&c->dcomp_device);
 	if (SUCCEEDED(hr)) hr = c->dcomp_device->CreateTargetForHwnd(hwnd, TRUE, &c->dcomp_target);
@@ -700,7 +650,7 @@ gl_setup_dcomp_present(struct comp_gl_compositor *c, HWND hwnd, uint32_t w, uint
 		return false;
 	}
 
-	// 7. Compile the fullscreen-triangle blit pipeline.
+	// 4. Compile the fullscreen-triangle blit pipeline.
 	ID3DBlob *vsb = NULL, *psb = NULL, *err = NULL;
 	hr = D3DCompile(kDcompBlitHLSL, strlen(kDcompBlitHLSL), "dcomp_blit", NULL, NULL,
 	                "vs_main", "vs_5_0", 0, 0, &vsb, &err);
@@ -748,16 +698,194 @@ gl_setup_dcomp_present(struct comp_gl_compositor *c, HWND hwnd, uint32_t w, uint
 
 	c->dcomp_present_w = w;
 	c->dcomp_present_h = h;
+	return true;
+}
+
+// No-interop readback present path (#573 P0.3). For near-extinct hardware/drivers
+// without WGL_NV_DX_interop2: GL can't share a texture with D3D11, so the weave
+// stays on the default framebuffer and each frame we glReadPixels it → upload to a
+// DYNAMIC D3D11 texture → reuse the same DComp blit. Slow (a full CPU round-trip),
+// but it closes the last see-through gap so chroma-key can be deleted everywhere.
+static bool
+gl_setup_dcomp_readback_present(struct comp_gl_compositor *c, HWND hwnd, uint32_t w, uint32_t h)
+{
+	if (w == 0 || h == 0) {
+		return false;
+	}
+	if (!gl_setup_dcomp_common(c, hwnd, w, h)) {
+		return false;
+	}
+
+	// DYNAMIC (CPU-write) source texture + SRV. Uploaded from glReadPixels each
+	// frame; row 0 = GL bottom row, matching the interop transit's orientation so
+	// the existing blit shader's V-flip is correct.
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w;
+	td.Height = h;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DYNAMIC;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+	HRESULT hr = c->dcomp_dx_device->CreateTexture2D(&td, NULL, &c->dcomp_readback_tex);
+	if (FAILED(hr)) {
+		U_LOG_W("Transparent GL: readback CreateTexture2D failed: 0x%08x", (unsigned)hr);
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+	hr = c->dcomp_dx_device->CreateShaderResourceView(c->dcomp_readback_tex, NULL,
+	                                                  &c->dcomp_readback_srv);
+	if (FAILED(hr)) {
+		U_LOG_W("Transparent GL: readback SRV failed: 0x%08x", (unsigned)hr);
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+	c->dcomp_readback_cpu = (uint8_t *)malloc((size_t)w * h * 4);
+	if (c->dcomp_readback_cpu == NULL) {
+		U_LOG_W("Transparent GL: readback CPU buffer alloc failed (%ux%u)", w, h);
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+
+	// Dedicated RGBA8 GL weave target + FBO (alpha-preserving, unlike FBO 0).
+	glGenTextures(1, &c->dcomp_readback_gl_tex);
+	glBindTexture(GL_TEXTURE_2D, c->dcomp_readback_gl_tex);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	glGenFramebuffers(1, &c->dcomp_readback_gl_fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, c->dcomp_readback_gl_fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+	                       c->dcomp_readback_gl_tex, 0);
+	GLenum fbst = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	if (fbst != GL_FRAMEBUFFER_COMPLETE) {
+		U_LOG_W("Transparent GL: readback FBO incomplete: 0x%x", (unsigned)fbst);
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+
+	c->dcomp_readback_active = true;
+	U_LOG_W("Transparent GL: NO-INTEROP readback present path active (%ux%u) — glReadPixels → "
+	        "D3D11 dynamic upload → DComp blit (slow fallback for hardware without "
+	        "WGL_NV_DX_interop2)", w, h);
+	return true;
+}
+
+// Initialize the DComp + WGL_NV_DX_interop2 present path. Returns false on any
+// failure (caller stays on the opaque SwapBuffers path); always leaves the
+// struct in a consistent torn-down state on false. When WGL_NV_DX_interop2 is
+// unavailable (or DISPLAYXR_GL_FORCE_READBACK is set), falls back to the no-interop
+// glReadPixels readback path (#573 P0.3) instead of staying opaque.
+static bool
+gl_setup_dcomp_present(struct comp_gl_compositor *c, HWND hwnd, uint32_t w, uint32_t h)
+{
+	if (w == 0 || h == 0) {
+		return false;
+	}
+
+	// Debug/verification knob: force the no-interop readback path even on hardware
+	// that has WGL_NV_DX_interop2, so the fallback can be exercised on dev GPUs.
+	const char *force_readback = getenv("DISPLAYXR_GL_FORCE_READBACK");
+	if (force_readback != NULL && *force_readback != '\0' && *force_readback != '0') {
+		U_LOG_W("Transparent GL: DISPLAYXR_GL_FORCE_READBACK set — using no-interop readback path");
+		return gl_setup_dcomp_readback_present(c, hwnd, w, h);
+	}
+
+	// 1. WGL_NV_DX_interop2 entry points (may already be loaded by the
+	//    shared-texture path; load defensively).
+	if (c->pfn_wglDXOpenDeviceNV == NULL) {
+		c->pfn_wglDXOpenDeviceNV = (PFN_wglDXOpenDeviceNV)wglGetProcAddress("wglDXOpenDeviceNV");
+		c->pfn_wglDXCloseDeviceNV = (PFN_wglDXCloseDeviceNV)wglGetProcAddress("wglDXCloseDeviceNV");
+		c->pfn_wglDXRegisterObjectNV = (PFN_wglDXRegisterObjectNV)wglGetProcAddress("wglDXRegisterObjectNV");
+		c->pfn_wglDXUnregisterObjectNV = (PFN_wglDXUnregisterObjectNV)wglGetProcAddress("wglDXUnregisterObjectNV");
+		c->pfn_wglDXLockObjectsNV = (PFN_wglDXLockObjectsNV)wglGetProcAddress("wglDXLockObjectsNV");
+		c->pfn_wglDXUnlockObjectsNV = (PFN_wglDXUnlockObjectsNV)wglGetProcAddress("wglDXUnlockObjectsNV");
+	}
+	if (c->pfn_wglDXOpenDeviceNV == NULL || c->pfn_wglDXRegisterObjectNV == NULL ||
+	    c->pfn_wglDXLockObjectsNV == NULL || c->pfn_wglDXUnlockObjectsNV == NULL ||
+	    c->pfn_wglDXCloseDeviceNV == NULL || c->pfn_wglDXUnregisterObjectNV == NULL) {
+		U_LOG_W("Transparent GL: WGL_NV_DX_interop2 unavailable on this GPU/driver — "
+		        "using no-interop readback present path");
+		return gl_setup_dcomp_readback_present(c, hwnd, w, h);
+	}
+
+	// 2. Dedicated D3D11 device + swapchain + DComp bind + blit pipeline (shared).
+	if (!gl_setup_dcomp_common(c, hwnd, w, h)) {
+		return false;
+	}
+
+	// 3. Open the D3D11 device for GL interop.
+	c->dcomp_dx_interop_device = c->pfn_wglDXOpenDeviceNV(c->dcomp_dx_device);
+	if (c->dcomp_dx_interop_device == NULL) {
+		U_LOG_W("Transparent GL: wglDXOpenDeviceNV failed: %lu — staying opaque", GetLastError());
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+
+	// 4. Off-screen transit texture (RT + SRV) and its GL interop view + FBO.
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w;
+	td.Height = h;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+	HRESULT hr = c->dcomp_dx_device->CreateTexture2D(&td, NULL, &c->dcomp_transit_tex);
+	if (FAILED(hr)) {
+		U_LOG_W("Transparent GL: transit CreateTexture2D failed: 0x%08x", (unsigned)hr);
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+	hr = c->dcomp_dx_device->CreateShaderResourceView(c->dcomp_transit_tex, NULL,
+	                                                  &c->dcomp_transit_srv);
+	if (FAILED(hr)) {
+		U_LOG_W("Transparent GL: transit SRV failed: 0x%08x", (unsigned)hr);
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+	glGenTextures(1, &c->dcomp_transit_gl_tex);
+	c->dcomp_transit_iop = c->pfn_wglDXRegisterObjectNV(
+	    c->dcomp_dx_interop_device, c->dcomp_transit_tex, c->dcomp_transit_gl_tex,
+	    GL_TEXTURE_2D, WGL_ACCESS_READ_WRITE_NV);
+	if (c->dcomp_transit_iop == NULL) {
+		U_LOG_W("Transparent GL: wglDXRegisterObjectNV(transit) failed: %lu", GetLastError());
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+	// Build the FBO around the transit GL texture (lock while attaching).
+	glGenFramebuffers(1, &c->dcomp_transit_fbo);
+	c->pfn_wglDXLockObjectsNV(c->dcomp_dx_interop_device, 1, &c->dcomp_transit_iop);
+	glBindFramebuffer(GL_FRAMEBUFFER, c->dcomp_transit_fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+	                       c->dcomp_transit_gl_tex, 0);
+	GLenum fbst = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	c->pfn_wglDXUnlockObjectsNV(c->dcomp_dx_interop_device, 1, &c->dcomp_transit_iop);
+	if (fbst != GL_FRAMEBUFFER_COMPLETE) {
+		U_LOG_W("Transparent GL: transit FBO incomplete: 0x%x", (unsigned)fbst);
+		gl_destroy_dcomp_present(c);
+		return false;
+	}
+
 	c->dcomp_active = true;
 	U_LOG_W("Transparent GL: DComp present path active (%ux%u, FLIP_DISCARD + PREMULTIPLIED + "
 	        "off-screen interop transit + D3D11 blit)", w, h);
 	return true;
 }
 
-// Per-frame: blit the (already GL-woven) transit texture into the current DComp
-// back buffer via a D3D11 fullscreen-triangle draw, then Present + Commit.
+// Shared D3D11 blit-and-present: draw @p srv into the current DComp back buffer via
+// the fullscreen-triangle pipeline, then Present + Commit. Used by both the interop
+// (transit SRV) and readback (dynamic SRV) present paths.
 static void
-gl_dcomp_present_frame(struct comp_gl_compositor *c)
+gl_dcomp_blit_srv_present(struct comp_gl_compositor *c, ID3D11ShaderResourceView *srv)
 {
 	ID3D11Texture2D *bb = NULL;
 	HRESULT hr = c->dcomp_swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&bb);
@@ -784,7 +912,7 @@ gl_dcomp_present_frame(struct comp_gl_compositor *c)
 	ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 	ctx->VSSetShader(c->dcomp_vs, NULL, 0);
 	ctx->PSSetShader(c->dcomp_ps, NULL, 0);
-	ctx->PSSetShaderResources(0, 1, &c->dcomp_transit_srv);
+	ctx->PSSetShaderResources(0, 1, &srv);
 	ctx->PSSetSamplers(0, 1, &c->dcomp_samp);
 	ctx->Draw(3, 0);
 	// Unbind the SRV so the next frame's interop lock isn't held by the context.
@@ -799,6 +927,63 @@ gl_dcomp_present_frame(struct comp_gl_compositor *c)
 		U_LOG_W("Transparent GL: swapchain Present failed: 0x%08x", (unsigned)hr);
 	}
 	c->dcomp_device->Commit();
+}
+
+// Per-frame (interop path): blit the (already GL-woven) transit texture into the
+// current DComp back buffer, then Present + Commit.
+static void
+gl_dcomp_present_frame(struct comp_gl_compositor *c)
+{
+	gl_dcomp_blit_srv_present(c, c->dcomp_transit_srv);
+}
+
+// Per-frame (no-interop readback path): read the woven default framebuffer back to
+// the CPU, upload into the DYNAMIC D3D11 texture, then blit + Present + Commit.
+static void
+gl_dcomp_readback_present_frame(struct comp_gl_compositor *c)
+{
+	const uint32_t w = c->dcomp_present_w, h = c->dcomp_present_h;
+	if (c->dcomp_readback_cpu == NULL || c->dcomp_readback_tex == NULL) {
+		return;
+	}
+
+	// 1. Read the dedicated RGBA weave FBO (bottom-up, alpha preserved — unlike
+	//    FBO 0). Bind it explicitly as the read framebuffer so we don't depend on
+	//    whatever was last bound.
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, c->dcomp_readback_gl_fbo);
+	glReadBuffer(GL_COLOR_ATTACHMENT0);
+	glPixelStorei(GL_PACK_ALIGNMENT, 1);
+	glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, c->dcomp_readback_cpu);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+
+	// 2. Upload to the DYNAMIC texture (respect the driver's row pitch). Row 0 =
+	//    glReadPixels bottom row = the interop transit's orientation, so the blit
+	//    shader's V-flip yields the correct image.
+	D3D11_MAPPED_SUBRESOURCE map = {};
+	HRESULT hr = c->dcomp_dx_context->Map(c->dcomp_readback_tex, 0, D3D11_MAP_WRITE_DISCARD, 0, &map);
+	if (FAILED(hr)) {
+		U_LOG_W("Transparent GL: readback Map failed: 0x%08x", (unsigned)hr);
+		return;
+	}
+	const uint8_t *src = c->dcomp_readback_cpu;
+	uint8_t *dst = (uint8_t *)map.pData;
+	const size_t row_bytes = (size_t)w * 4;
+	for (uint32_t y = 0; y < h; ++y) {
+		memcpy(dst + (size_t)y * map.RowPitch, src + (size_t)y * row_bytes, row_bytes);
+	}
+	c->dcomp_dx_context->Unmap(c->dcomp_readback_tex, 0);
+
+	// 3. Blit + Present through DComp.
+	gl_dcomp_blit_srv_present(c, c->dcomp_readback_srv);
+
+	// Log the per-frame readback cost once (it's the whole reason this path is the
+	// last-resort fallback).
+	static int logged = 0;
+	if (!logged) {
+		logged = 1;
+		U_LOG_W("Transparent GL: readback present active — full %ux%u glReadPixels + CPU upload "
+		        "per frame (no-interop fallback cost)", w, h);
+	}
 }
 #endif // XRT_OS_WINDOWS
 
@@ -3185,7 +3370,21 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		} else
 #endif
 		{
-			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+#ifdef XRT_OS_WINDOWS
+			if (c->dcomp_readback_active) {
+				// No-interop readback path: weave into a dedicated RGBA FBO (NOT
+				// FBO 0, whose default framebuffer drops alpha → opaque-black
+				// holes). Source texture is fixed-size, so clamp present dims.
+				if (present_w != c->dcomp_present_w || present_h != c->dcomp_present_h) {
+					present_w = c->dcomp_present_w;
+					present_h = c->dcomp_present_h;
+				}
+				glBindFramebuffer(GL_FRAMEBUFFER, c->dcomp_readback_gl_fbo);
+			} else
+#endif
+			{
+				glBindFramebuffer(GL_FRAMEBUFFER, 0);
+			}
 		}
 
 		if (c->display_processor != NULL) {
@@ -3233,6 +3432,12 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			gl_dcomp_present_frame(c);
 			// Restore default FBO so other paths see what they expect.
 			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		} else if (c->dcomp_readback_active) {
+			// No-interop transparent path: the weave is in FBO 0; glReadPixels it,
+			// upload to the DYNAMIC texture, then blit + Present through DComp. No
+			// SwapBuffers — DComp owns the (WS_EX_NOREDIRECTIONBITMAP) window.
+			glFlush();
+			gl_dcomp_readback_present_frame(c);
 		} else {
 			SwapBuffers(c->hdc);
 			if (c->owns_window && c->own_window != NULL) {
