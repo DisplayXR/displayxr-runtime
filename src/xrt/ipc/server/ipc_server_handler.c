@@ -859,11 +859,86 @@ ipc_try_get_android_view_poses(volatile struct ipc_client_state *ics,
 			screen_height_m = tmp;
 		}
 	}
-	//! @todo XR_EXT_display_zones P5: rig->zone_* is not applied on this
-	//! display-centric Android path yet — it lacks the window-relative
-	//! metric baseline (display_pixel_* / display_*_m in wm) that
-	//! u_canvas_apply_to_metrics needs. Zone-scoped locates fall back to
-	//! the full-display canvas here.
+	// Full-window meters (post #499 swap), captured BEFORE the zone rebase below
+	// overwrites screen_*_m with the zone meters — the raw canvas channel still
+	// reports the whole window, not the zone.
+	const float canvas_w_m = screen_width_m;
+	const float canvas_h_m = screen_height_m;
+
+	// XR_EXT_display_zones P5 (#570) — zone-scoped locate on Android OOP.
+	// Reframe the Kooima to the zone rect exactly like the in-process
+	// oxr_session.c zone block and the D3D11 server's ipc_try_get_sr_view_poses:
+	// screen = zone meters, render eyes re-expressed relative to the zone centre.
+	// The zone is the bottom-75% band, so u_canvas yields a NEGATIVE
+	// window_center_offset_y_m (zone centre below display centre); subtracting it
+	// from the render eyes below folds the vertical offset into the off-axis FOV
+	// so the framing drops into the band (fixes "rides high / top truncated").
+	float zone_eye_offset_x = 0.0f, zone_eye_offset_y = 0.0f, zone_eye_offset_z = 0.0f;
+	bool zone_applied = false;
+	if (have_wm && rig != NULL && rig->zone_valid != 0 && rig->zone_w_px > 0 && rig->zone_h_px > 0 &&
+	    wm.window_pixel_width > 0 && wm.window_pixel_height > 0) {
+		// Canvas pixel dims in the ZONE's held orientation. The window-metrics
+		// source can report a FIXED orientation while the panel rotates — a
+		// vendor DP (Leia) does this, and the live present-target extent can lag
+		// a rotation (#528) — but the app submits the zone in the CURRENT
+		// orientation. The zone is always a sub-rect of its canvas (zone ⊆
+		// canvas), so if the zone overflows wm's orientation, transpose the
+		// baseline to match. Without this the offset math mixes a landscape zone
+		// with a portrait display centre → wrong-signed vertical offset → the
+		// avatar is framed off-screen.
+		uint32_t canvas_w = wm.window_pixel_width;
+		uint32_t canvas_h = wm.window_pixel_height;
+		if ((uint32_t)(rig->zone_x_px + rig->zone_w_px) > canvas_w ||
+		    (uint32_t)(rig->zone_y_px + rig->zone_h_px) > canvas_h) {
+			uint32_t t = canvas_w;
+			canvas_w = canvas_h;
+			canvas_h = t;
+		}
+		// Square-pixel pitch from the NATIVE panel dims (orientation-invariant),
+		// so the meters baseline matches the (possibly transposed) canvas pixels
+		// regardless of how the metrics source or the #499 swap oriented them.
+		float pitch = 0.0f;
+		if (s->xsysc->info.display_pixel_width > 0 && s->xsysc->info.display_width_m > 0.0f) {
+			pitch = s->xsysc->info.display_width_m / (float)s->xsysc->info.display_pixel_width;
+		}
+		// Only rebase when the data is self-consistent (pitch known, zone fits
+		// the resolved canvas); otherwise fall back to the full-canvas frame.
+		if (pitch > 0.0f && (uint32_t)(rig->zone_x_px + rig->zone_w_px) <= canvas_w &&
+		    (uint32_t)(rig->zone_y_px + rig->zone_h_px) <= canvas_h) {
+			wm.display_pixel_width = canvas_w;
+			wm.display_pixel_height = canvas_h;
+			wm.display_width_m = (float)canvas_w * pitch;
+			wm.display_height_m = (float)canvas_h * pitch;
+			wm.display_screen_left = 0;
+			wm.display_screen_top = 0;
+			wm.window_screen_left = 0;
+			wm.window_screen_top = 0;
+			struct u_canvas_rect zone_canvas = {
+			    .valid = true,
+			    .x = rig->zone_x_px,
+			    .y = rig->zone_y_px,
+			    .w = (uint32_t)rig->zone_w_px,
+			    .h = (uint32_t)rig->zone_h_px,
+			};
+			u_canvas_apply_to_metrics(&wm, &zone_canvas);
+			screen_width_m = wm.window_width_m;   // zone meters → scr below
+			screen_height_m = wm.window_height_m;
+			zone_eye_offset_x = wm.window_center_offset_x_m;
+			zone_eye_offset_y = wm.window_center_offset_y_m;
+			zone_eye_offset_z = wm.window_center_offset_z_m;
+			zone_applied = true;
+			static bool zone_locate_logged = false;
+			if (!zone_locate_logged) {
+				zone_locate_logged = true;
+				IPC_WARN(s,
+				         "ZONES IPC: first zone-scoped locate, rect=(%d,%d %dx%d) px, "
+				         "canvas=%ux%u screen=%.3fx%.3fm offset=(%.4f,%.4f)m",
+				         rig->zone_x_px, rig->zone_y_px, rig->zone_w_px, rig->zone_h_px, canvas_w,
+				         canvas_h, (double)screen_width_m, (double)screen_height_m,
+				         (double)zone_eye_offset_x, (double)zone_eye_offset_y);
+			}
+		}
+	}
 
 	// Eyes: DP-tracked if available (Leia/M2 plugs in here unchanged), else the
 	// nominal viewer + a default IPD. head_eyes is the head's actual L/R pair
@@ -913,18 +988,27 @@ ipc_try_get_android_view_poses(volatile struct ipc_client_state *ics,
 		active_view_count = rig->render_view_count;
 	}
 
+	// Re-express the render eyes relative to the zone centre when a zone is
+	// applied (display-zones P5, #570) — display-local shift, BEFORE the Kooima
+	// compute folds in the rig display_pose. zone_eye_offset_* is (0,0,0) for
+	// non-zone locates, so this is identity then. head_eyes stays unshifted (the
+	// raw face-dot channel below reports it verbatim). Mirrors oxr_session.c.
 	struct xrt_vec3 raw_eyes[XRT_MAX_VIEWS] = {0};
 	uint32_t eye_count;
 	if (active_view_count == 1) {
 		raw_eyes[0] = (struct xrt_vec3){
-		    0.5f * (head_eyes[0].x + head_eyes[1].x),
-		    0.5f * (head_eyes[0].y + head_eyes[1].y),
-		    0.5f * (head_eyes[0].z + head_eyes[1].z),
+		    0.5f * (head_eyes[0].x + head_eyes[1].x) - zone_eye_offset_x,
+		    0.5f * (head_eyes[0].y + head_eyes[1].y) - zone_eye_offset_y,
+		    0.5f * (head_eyes[0].z + head_eyes[1].z) - zone_eye_offset_z,
 		};
 		eye_count = 1;
 	} else {
-		raw_eyes[0] = head_eyes[0];
-		raw_eyes[1] = head_eyes[1];
+		raw_eyes[0] = (struct xrt_vec3){head_eyes[0].x - zone_eye_offset_x,
+		                                head_eyes[0].y - zone_eye_offset_y,
+		                                head_eyes[0].z - zone_eye_offset_z};
+		raw_eyes[1] = (struct xrt_vec3){head_eyes[1].x - zone_eye_offset_x,
+		                                head_eyes[1].y - zone_eye_offset_y,
+		                                head_eyes[1].z - zone_eye_offset_z};
 		eye_count = 2;
 	}
 
@@ -1005,6 +1089,10 @@ ipc_try_get_android_view_poses(volatile struct ipc_client_state *ics,
 		rig_reply->raw.sample_time_ns = sample_time_ns;
 		rig_reply->raw.is_tracking = is_tracking ? 1u : 0u;
 		rig_reply->raw.display_pose = display_pose;
+		// Raw canvas channel reports the FULL window/canvas (the app reads it as
+		// its full surface for tile sizing + its own zone math, NOT the zone
+		// sub-rect). The zone is conveyed separately via the zone chain, so leave
+		// this describing the whole window even when a zone is applied to the FOV.
 		rig_reply->raw.rect_x_px = 0;
 		rig_reply->raw.rect_y_px = 0;
 		rig_reply->raw.rect_w_px =
@@ -1013,8 +1101,8 @@ ipc_try_get_android_view_poses(volatile struct ipc_client_state *ics,
 		rig_reply->raw.rect_h_px =
 		    (have_wm && wm.window_pixel_height > 0) ? (int32_t)wm.window_pixel_height
 		                                            : (int32_t)s->xsysc->info.display_pixel_height;
-		rig_reply->raw.size_w_m = screen_width_m;
-		rig_reply->raw.size_h_m = screen_height_m;
+		rig_reply->raw.size_w_m = canvas_w_m;
+		rig_reply->raw.size_h_m = canvas_h_m;
 		rig_reply->raw.valid = 1;
 		rig_reply->rig_applied = rig_display ? IPC_VIEW_RIG_DISPLAY : IPC_VIEW_RIG_NONE;
 	}
@@ -1034,9 +1122,12 @@ ipc_try_get_android_view_poses(volatile struct ipc_client_state *ics,
 		log_counter = 0;
 		float h = (out_fovs[0].angle_right - out_fovs[0].angle_left) * 180.0f / 3.14159265f;
 		float v = (out_fovs[0].angle_up - out_fovs[0].angle_down) * 180.0f / 3.14159265f;
-		IPC_WARN(s, "android Kooima: views=%u screen=%.3fx%.3fm FOV H=%.1f° V=%.1f° tracking=%d rig=%d",
+		float fov_aspect = (v != 0.0f) ? (h / v) : 0.0f;
+		IPC_WARN(s,
+		         "android Kooima: views=%u screen=%.3fx%.3fm FOV H=%.1f° V=%.1f° "
+		         "fovAspect=%.3f tracking=%d rig=%d zone=%d",
 		         view_count, (double)screen_width_m, (double)screen_height_m, (double)h, (double)v,
-		         (int)is_tracking, (int)rig_display);
+		         (double)fov_aspect, (int)is_tracking, (int)rig_display, (int)zone_applied);
 	}
 
 	return true;
