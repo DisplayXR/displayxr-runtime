@@ -362,6 +362,20 @@ struct d3d11_service_compositor
 	//! apples per-app frame-rate comparison.
 	int64_t last_commit_ns;
 
+	//! App-initiated rendering-mode request (#575). The client's
+	//! xrRequestDisplayRenderingModeEXT crosses IPC into the
+	//! request_rendering_mode / request_display_mode vtable methods, which run
+	//! on the IPC thread and only RECORD the request here. compositor_layer_commit
+	//! (render thread) applies it on the standalone path — driving the per-client
+	//! DP so the hardware SR follows the app's render mode. Without this the IPC
+	//! handlers no-op'd on Windows (Android-only), leaving the app rendering 2D
+	//! mono while the SR stayed 3D (left-shifted single view + black right eye).
+	//! Deferred-apply keeps the per-client DP off the cross-process IPC thread.
+	//! `pending_content_mode` is 0xFFFFFFFF when none; `pending_hw_3d` is
+	//! -1 none / 0 = 2D / 1 = 3D.
+	std::atomic<uint32_t> pending_content_mode{0xFFFFFFFFu};
+	std::atomic<int>      pending_hw_3d{-1};
+
 	//! Phase 2 — per-IPC-client shared `ID3D11Fence` that replaces the
 	//! per-view `IDXGIKeyedMutex::AcquireSync` CPU wait with a GPU-side
 	//! `ID3D11DeviceContext4::Wait`. Created at session-create on the
@@ -9119,6 +9133,65 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 	}
 
+	// App-initiated rendering-mode request over IPC (#575). A standalone
+	// forced-IPC client's xrRequestDisplayRenderingModeEXT crosses IPC into the
+	// request_rendering_mode / request_display_mode vtable methods, which recorded
+	// the request on the IPC thread (pending_content_mode / pending_hw_3d). Apply
+	// it here on the render thread. Without this the per-client DP was never driven
+	// on Windows (the IPC handlers were Android-only), so the app rendered 2D mono
+	// while the SR stayed 3D — the weaver showed a left-shifted single view with a
+	// black right eye (the IPC half of #575). Mirrors the immediate-flip the bridge
+	// relay above does, and what the Android multi_compositor path does via its own
+	// request_display_mode. Gated to standalone: workspace uses the controller's
+	// acked-flip; bridge uses the HWND relay above.
+	if (!sys->workspace_mode && !bridge_live && c->render.display_processor != nullptr &&
+	    sys->xsysd != NULL) {
+		uint32_t req_mode = c->pending_content_mode.exchange(0xFFFFFFFFu, std::memory_order_acq_rel);
+		int req_hw = c->pending_hw_3d.exchange(-1, std::memory_order_acq_rel);
+		struct xrt_device *head = sys->xsysd->static_roles.head;
+
+		if ((req_mode != 0xFFFFFFFFu || req_hw >= 0) && head != nullptr && head->hmd != NULL) {
+			// The app has taken explicit control of the mode — suppress the
+			// one-shot deferred-3D warmup kick so it can't fight the request.
+			c->render.deferred_3d_kicked = true;
+
+			uint32_t prev_idx = head->hmd->active_rendering_mode_index;
+			// Resolve the target hardware state: an explicit hardware request
+			// wins; otherwise follow the requested content mode's hardware_display_3d
+			// (the common no-divergence case).
+			bool want_3d = sys->hardware_display_3d;
+			if (req_mode != 0xFFFFFFFFu && req_mode < head->rendering_mode_count) {
+				want_3d = head->rendering_modes[req_mode].hardware_display_3d;
+				if (prev_idx != req_mode) {
+					// Remember the last 3D mode for later restores (vendor poll, etc.).
+					if (prev_idx < head->rendering_mode_count &&
+					    head->rendering_modes[prev_idx].hardware_display_3d) {
+						sys->last_3d_mode_index = prev_idx;
+					}
+					head->hmd->active_rendering_mode_index = req_mode;
+					broadcast_rendering_mode_change(sys, head, prev_idx, req_mode);
+				}
+			}
+			if (req_hw >= 0) {
+				want_3d = (req_hw != 0);
+			}
+
+			xrt_display_processor_d3d11_request_display_mode(c->render.display_processor, want_3d);
+			sync_tile_layout(sys);
+			sys->hardware_display_3d = want_3d;
+			// Stamp the post-flip cooldown so the 100 ms vendor 3D-state poll
+			// doesn't see the panel mid-transition and counter-correct (same
+			// refresh the deferred-3D kick / zones fallback do).
+			int64_t flip_ns = os_monotonic_get_ns();
+			sys->cached_3d_state.store(want_3d, std::memory_order_relaxed);
+			sys->last_3d_state_poll_ns.store(flip_ns, std::memory_order_release);
+			sys->last_flip_landed_ns.store(flip_ns, std::memory_order_release);
+			U_LOG_W("[app_mode] standalone IPC client requested mode (content=%u hw_req=%d) "
+			        "-> active=%u 3D=%d",
+			        req_mode, req_hw, head->hmd->active_rendering_mode_index, (int)want_3d);
+		}
+	}
+
 	// Runtime-side 2D/3D toggle (V key) + 1/2/3 mode-select — polls qwerty
 	// driver each frame.
 	// Disabled when bridge is active: mode changes go through the HWND
@@ -10883,6 +10956,38 @@ compositor_layer_commit_with_semaphore(struct xrt_compositor *xc,
 	return compositor_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
 }
 
+//! HARDWARE 2D/3D request (#533/#575) — the weave-state signal, decoupled from
+//! the content/atlas mode below. Runs on the IPC thread; only RECORDS the
+//! request. compositor_layer_commit (render thread, standalone path) applies it
+//! to the per-client DP. This is the Windows D3D11-service implementation of the
+//! polymorphic xrt_comp_request_display_mode dispatch that replaces the old
+//! Android-only #ifdef in the IPC handler.
+static xrt_result_t
+compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3d)
+{
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	c->pending_hw_3d.store(enable_3d ? 1 : 0, std::memory_order_release);
+	return XRT_SUCCESS;
+}
+
+//! CONTENT rendering-mode request (#553/#575, ADR-028) — the atlas tile grid the
+//! app submits into, decoupled from the hardware 2D/3D state above. Records the
+//! requested mode index; compositor_layer_commit applies it (active mode index +
+//! sync_tile_layout) on the render thread. tile_columns/tile_rows are resolved
+//! server-side from the head device's mode list, so only the index is needed here.
+static xrt_result_t
+compositor_request_rendering_mode(struct xrt_compositor *xc,
+                                  uint32_t mode_index,
+                                  uint32_t tile_columns,
+                                  uint32_t tile_rows)
+{
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	(void)tile_columns;
+	(void)tile_rows;
+	c->pending_content_mode.store(mode_index, std::memory_order_release);
+	return XRT_SUCCESS;
+}
+
 static void
 compositor_destroy(struct xrt_compositor *xc)
 {
@@ -11387,6 +11492,8 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	c->base.base.layer_passthrough = compositor_layer_passthrough;
 	c->base.base.layer_commit = compositor_layer_commit;
 	c->base.base.layer_commit_with_semaphore = compositor_layer_commit_with_semaphore;
+	c->base.base.request_display_mode = compositor_request_display_mode;
+	c->base.base.request_rendering_mode = compositor_request_rendering_mode;
 	c->base.base.destroy = compositor_destroy;
 
 	// Set up supported formats

@@ -2325,18 +2325,14 @@ ipc_handle_compositor_request_display_mode(volatile struct ipc_client_state *ics
 	}
 
 	// HARDWARE 2D/3D request (#533) — the weave-state signal, DECOUPLED from the
-	// per-frame content (atlas tile count). The out-of-process per-client
-	// compositor is a multi_compositor; forward to its DP. Only the Android
-	// null+comp_multi service reaches the DP this way.
-#ifdef XRT_OS_ANDROID
-	struct multi_compositor *mc = multi_compositor((struct xrt_compositor *)ics->xc);
-	if (mc != NULL) {
-		multi_compositor_request_display_mode(mc, enable_3d != 0u);
-	}
-#else
-	(void)enable_3d;
-#endif
-	return XRT_SUCCESS;
+	// per-frame content (atlas tile count). Dispatch polymorphically through the
+	// compositor vtable (#575): the per-client compositor drives its display
+	// processor — multi_compositor on the Android null+comp_multi service,
+	// comp_d3d11_service on the Windows D3D11 service. No-op for backends that
+	// don't implement it. This replaces the former Android-only #ifdef, which
+	// left Windows standalone forced-IPC clients with the SR stuck at its last
+	// hardware state while the app rendered the other mode.
+	return xrt_comp_request_display_mode((struct xrt_compositor *)ics->xc, enable_3d != 0u);
 }
 
 xrt_result_t
@@ -2369,15 +2365,10 @@ ipc_handle_compositor_request_rendering_mode(volatile struct ipc_client_state *i
 	// and the line Windows forced-IPC validation greps for.
 	U_LOG_W("CONTENT rendering mode %u arrived over IPC (grid %ux%u)", mode_index, tile_columns, tile_rows);
 
-	// The out-of-process per-client compositor is a comp_multi multi_compositor
-	// only on the Android null+comp_multi service — same cast-validity gate as
-	// the hardware handler above.
-#ifdef XRT_OS_ANDROID
-	struct multi_compositor *mc = multi_compositor((struct xrt_compositor *)ics->xc);
-	if (mc != NULL) {
-		multi_compositor_set_rendering_mode(mc, mode_index, tile_columns, tile_rows);
-	}
-#endif
+	// Dispatch the CONTENT mode through the compositor vtable (#575) so each
+	// per-client compositor backend records it (multi_compositor on Android,
+	// comp_d3d11_service on Windows) and clamps its per-session atlas to the grid.
+	xrt_comp_request_rendering_mode((struct xrt_compositor *)ics->xc, mode_index, tile_columns, tile_rows);
 	return XRT_SUCCESS;
 }
 
