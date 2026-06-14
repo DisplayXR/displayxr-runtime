@@ -859,11 +859,23 @@ ipc_try_get_android_view_poses(volatile struct ipc_client_state *ics,
 			screen_height_m = tmp;
 		}
 	}
-	// Full-window meters (post #499 swap), captured BEFORE the zone rebase below
-	// overwrites screen_*_m with the zone meters — the raw canvas channel still
-	// reports the whole window, not the zone.
+	// Full-window meters + pixel dims, captured BEFORE the zone rebase below
+	// overwrites screen_*_m AND wm.window_pixel_* with the zone values — the raw
+	// canvas channel must keep reporting the WHOLE window, not the zone.
+	// (u_canvas_apply_to_metrics sets metrics->window_pixel_{width,height} =
+	// canvas->{w,h}, so reading wm.window_pixel_* after the rebase would leak the
+	// zone dims into the raw rect. The app feeds raw.rect back as the canvas it
+	// re-derives its 75% zone from each frame, so a zone-sized raw rect makes the
+	// zone shrink ×0.75 every frame → the woven band collapses to nothing → the
+	// avatar vanishes. #570.)
 	const float canvas_w_m = screen_width_m;
 	const float canvas_h_m = screen_height_m;
+	const int32_t canvas_w_px = (have_wm && wm.window_pixel_width > 0)
+	                                ? (int32_t)wm.window_pixel_width
+	                                : (int32_t)s->xsysc->info.display_pixel_width;
+	const int32_t canvas_h_px = (have_wm && wm.window_pixel_height > 0)
+	                                ? (int32_t)wm.window_pixel_height
+	                                : (int32_t)s->xsysc->info.display_pixel_height;
 
 	// XR_EXT_display_zones P5 (#570) — zone-scoped locate on Android OOP.
 	// Reframe the Kooima to the zone rect exactly like the in-process
@@ -1093,14 +1105,13 @@ ipc_try_get_android_view_poses(volatile struct ipc_client_state *ics,
 		// its full surface for tile sizing + its own zone math, NOT the zone
 		// sub-rect). The zone is conveyed separately via the zone chain, so leave
 		// this describing the whole window even when a zone is applied to the FOV.
+		// MUST use the pre-zone-rebase pixel dims (canvas_*_px) — wm.window_pixel_*
+		// was overwritten with the ZONE dims by u_canvas_apply_to_metrics above,
+		// and leaking those here collapses the app's zone ×0.75/frame (#570).
 		rig_reply->raw.rect_x_px = 0;
 		rig_reply->raw.rect_y_px = 0;
-		rig_reply->raw.rect_w_px =
-		    (have_wm && wm.window_pixel_width > 0) ? (int32_t)wm.window_pixel_width
-		                                           : (int32_t)s->xsysc->info.display_pixel_width;
-		rig_reply->raw.rect_h_px =
-		    (have_wm && wm.window_pixel_height > 0) ? (int32_t)wm.window_pixel_height
-		                                            : (int32_t)s->xsysc->info.display_pixel_height;
+		rig_reply->raw.rect_w_px = canvas_w_px;
+		rig_reply->raw.rect_h_px = canvas_h_px;
 		rig_reply->raw.size_w_m = canvas_w_m;
 		rig_reply->raw.size_h_m = canvas_h_m;
 		rig_reply->raw.valid = 1;
