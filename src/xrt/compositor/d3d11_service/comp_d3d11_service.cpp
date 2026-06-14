@@ -267,6 +267,17 @@ struct d3d11_client_render_resources
 	uint64_t                              transparent_output_value;          //!< signaled once per commit
 	uint32_t                              transparent_output_w;
 	uint32_t                              transparent_output_h;
+
+	//! Deferred auto-3D for no-zones standalone clients (#140 / no-zones-2D).
+	//! A non-workspace IPC handle app with no zone mask never triggers a 3D
+	//! request (the per-client DP is created mode-neutral to dodge the #140
+	//! stretched-left-eye recalibration artifact), so it inherits whatever
+	//! mode the SR was last left in — 2D when a prior session/sleep left it
+	//! there. `commit_frame_counter` counts standalone commits so the kick is
+	//! deferred past the SR init settle window; `deferred_3d_kicked` makes it
+	//! one-shot. See the deferred-3D block in compositor_layer_commit.
+	uint32_t                              commit_frame_counter;
+	bool                                  deferred_3d_kicked;
 };
 
 
@@ -841,6 +852,15 @@ enum mode_flip_phase
 //! OWN stride snapshot (write/read stay coupled per-slot), the curtain
 //! only needs to mask SR SDK hardware settle (~250 ms ≈ 16 frames).
 #define MFP_HW_CEILING_FRAMES 16
+
+//! Standalone commits a no-zones IPC client must submit before the deferred
+//! auto-3D kick may fire (#140 / no-zones-2D). The kick requests the SR 3D
+//! mode that a plain handle app otherwise never asks for; it MUST be deferred
+//! past the SR SDK's init recalibration window, or the immediate-mode-switch
+//! "stretched-left-eye" artifact (#140) returns. ~90 frames ≈ 1.5 s at 60 Hz
+//! clears the multi-second init cycle with margin. Load-bearing — this is the
+//! knob to raise if the artifact reappears on hardware.
+#define DEFERRED_3D_KICK_FRAMES 90
 
 /*!
  * Per-client slot in the multi-compositor.
@@ -9649,6 +9669,75 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					    prev_idx, mode_idx);
 				}
 			}
+		}
+	}
+
+	// Deferred auto-3D for no-zones standalone clients (#140 / no-zones-2D).
+	// A plain forced-IPC handle app (no zone mask) comes up 2D when the SR was
+	// last left in 2D (prior session / sleep / auto-2D-on-no-viewer). Two
+	// things conspire: (1) the per-client DP is created mode-neutral to dodge
+	// the #140 stretched-left-eye recalibration artifact, so nothing commands
+	// the SR up; and (2) the vendor-3D-state poll *follows* the 2D SR and
+	// DEMOTES this client's active rendering mode to 2D at startup — it never
+	// drives the panel up. A zones client escapes via the tier-1 fallback
+	// above; an explicit xrRequestDisplayRenderingModeEXT app and the V-key
+	// path issue their own requests; a plain handle app does none, so it stays
+	// 2D. The in-process native compositor sidesteps all this (its weaver
+	// auto-3Ds for any 3D-capable mode). Mirror that here: once past the SR
+	// init settle window (DEFERRED_3D_KICK_FRAMES, the #140 guard) and while
+	// the SR is still 2D, FORCE a 3D-capable mode the same way the zones
+	// fallback does — set the mode, broadcast it so the app re-submits at the
+	// 3D layout, request the DP up, and stamp the post-flip cooldown so the
+	// vendor poll doesn't immediately re-demote. The active mode can't be used
+	// as the want-3D signal (the vendor poll already demoted it), so the
+	// trigger is simply "a 3D mode exists and the SR is 2D". One-shot: later
+	// transitions belong to the vendor poll (genuine SR drift) and the
+	// app-initiated / V-key paths.
+	if (!sys->workspace_mode && !bridge_live && !zones_frame && !c->zone_published &&
+	    !c->render.deferred_3d_kicked && c->render.display_processor != nullptr &&
+	    sys->xsysd != NULL) {
+		if (++c->render.commit_frame_counter >= DEFERRED_3D_KICK_FRAMES) {
+			struct xrt_device *head = sys->xsysd->static_roles.head;
+			if (head != nullptr && head->hmd != NULL && !sys->hardware_display_3d) {
+				// Prefer the last 3D mode; fall back to the first 3D-capable
+				// mode (last_3d_mode_index is only saved on 3D→2D flips). Same
+				// selection as the zones tier-1 fallback above.
+				uint32_t mode_idx = head->rendering_mode_count; // invalid sentinel
+				if (sys->last_3d_mode_index < head->rendering_mode_count &&
+				    head->rendering_modes[sys->last_3d_mode_index].hardware_display_3d) {
+					mode_idx = sys->last_3d_mode_index;
+				} else {
+					for (uint32_t m = 0; m < head->rendering_mode_count; m++) {
+						if (head->rendering_modes[m].hardware_display_3d) {
+							mode_idx = m;
+							break;
+						}
+					}
+				}
+				if (mode_idx < head->rendering_mode_count) {
+					uint32_t prev_idx = head->hmd->active_rendering_mode_index;
+					head->hmd->active_rendering_mode_index = mode_idx;
+					broadcast_rendering_mode_change(sys, head, prev_idx, mode_idx);
+					xrt_display_processor_d3d11_request_display_mode(
+					    c->render.display_processor, true);
+					sync_tile_layout(sys);
+					sys->hardware_display_3d = true;
+					// Stamp the post-flip cooldown so the 100 ms vendor 3D-state
+					// poll doesn't see the panel mid-transition and counter-
+					// correct back to 2D (same refresh the zones fallback does).
+					int64_t kick_ns = os_monotonic_get_ns();
+					sys->cached_3d_state.store(true, std::memory_order_relaxed);
+					sys->last_3d_state_poll_ns.store(kick_ns, std::memory_order_release);
+					sys->last_flip_landed_ns.store(kick_ns, std::memory_order_release);
+					U_LOG_W("[deferred_3d] no-zones standalone client past warmup "
+					        "(%u commits), SR was 2D — forcing 3D (mode %u -> %u)",
+					        c->render.commit_frame_counter, prev_idx, mode_idx);
+				}
+			}
+			// One-shot regardless: if the SR was already 3D (nothing to do) or
+			// we just forced it, don't re-poll. A deliberate post-warmup V-2D
+			// is owned by the V-key path, not re-forced here.
+			c->render.deferred_3d_kicked = true;
 		}
 	}
 
