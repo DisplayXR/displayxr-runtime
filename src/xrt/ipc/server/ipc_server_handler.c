@@ -548,9 +548,9 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		have_stereo_state = qwerty_get_view_state(xdevs, XRT_SYSTEM_MAX_DEVICES, &stereo_state);
 	}
 #else
-	struct { bool camera_mode; float cam_spread_factor, cam_parallax_factor, cam_convergence,
-	         cam_half_tan_vfov, disp_spread_factor, disp_parallax_factor,
-	         disp_vHeight, nominal_viewer_z, screen_height_m; } stereo_state = {0};
+	struct { bool camera_mode; float ipd_factor, parallax_factor, inv_convergence_distance,
+	         half_tan_vfov, m2v, virtual_display_height, perspective_factor,
+	         nominal_viewer_z, screen_height_m; } stereo_state = {0};
 	bool have_stereo_state = false;
 #endif
 
