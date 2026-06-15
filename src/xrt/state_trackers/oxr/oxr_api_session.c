@@ -1305,6 +1305,32 @@ oxr_xrGetPlanePolygonBufferEXT(XrPlaneDetectorEXT planeDetector,
 
 #ifdef OXR_HAVE_EXT_display_info
 
+/*!
+ * "A workspace controller currently owns display policy" — the ADR-014 authority
+ * signal, evaluated so it is valid in the APP's OWN process.
+ *
+ * #575: the original gate read only `inst->workspace_controller_active`, which is
+ * a PER-INSTANCE flag set true ONLY inside oxr_xrActivateSpatialWorkspaceEXT — i.e.
+ * exclusively in the workspace controller's (shell's) own process. A separate-
+ * process IPC app (a cube launched by the shell) has its own instance where that
+ * flag is forever false, so the app-side mode-authority gate never fired and the
+ * app's V key (xrRequestDisplayRenderingModeEXT) fell through to the legacy path,
+ * pushing itself a local XrEventDataRenderingModeChangedEXT and corrupting its own
+ * content under the shell. The fix: also honor the server-synced
+ * `info.workspace_mode` (fetched at IPC compositor creation — the shell activates
+ * the workspace BEFORE launching apps, so it is already true when the app connects),
+ * which DOES cross the process boundary.
+ */
+static bool
+oxr_workspace_owns_display_policy(const struct oxr_session *sess)
+{
+	if (sess->sys->inst->workspace_controller_active) {
+		return true; // controller's own process (in-process / same-instance path)
+	}
+	const struct xrt_system_compositor *xsysc = sess->sys->xsysc;
+	return xsysc != NULL && xsysc->info.is_service_mode && xsysc->info.workspace_mode;
+}
+
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrRequestDisplayModeEXT(XrSession session, XrDisplayModeEXT displayMode)
 {
@@ -1377,7 +1403,7 @@ oxr_xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeEXT mode)
 	// (no workspace controller) the lone app owns it; under a workspace only the
 	// active controller does. Mirrors the #518 display-mode authority gate.
 	bool workspace_gated =
-	    sess->sys->inst->workspace_controller_active && !sess->is_active_workspace_controller;
+	    oxr_workspace_owns_display_policy(sess) && !sess->is_active_workspace_controller;
 	if (!workspace_gated) {
 		oxr_session_set_eye_tracking_mode(sess, (uint32_t)mode);
 	}
@@ -1415,7 +1441,7 @@ oxr_xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex)
 	// owns its display mode — otherwise nobody could ever switch 2D<->3D in OOP.
 	if (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode &&
 	    sess->compositor != NULL &&
-	    sess->sys->inst->workspace_controller_active &&
+	    oxr_workspace_owns_display_policy(sess) &&
 	    !sess->is_active_workspace_controller) {
 		return XR_SUCCESS;
 	}
@@ -1553,7 +1579,7 @@ oxr_xrEnumerateDisplayRenderingModesEXT(XrSession session,
 	XrBool32 session_is_requestable = XR_TRUE;
 	if (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode &&
 	    sess->compositor != NULL &&
-	    sess->sys->inst->workspace_controller_active && // #518: only when a workspace is active
+	    oxr_workspace_owns_display_policy(sess) && // #518/#575: only when a workspace owns policy
 	    !sess->is_active_workspace_controller) {
 		session_is_requestable = XR_FALSE;
 	}
