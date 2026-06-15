@@ -477,6 +477,19 @@ endif()
 # F5 launches the app, which loads this dev runtime + the vendor plug-in + SR
 # SDK, so you can step across all three. The chosen app's CMakeLists must use
 # CMAKE_CURRENT_SOURCE_DIR (not CMAKE_SOURCE_DIR) so it relocates when folded.
+#
+# WIP — folding the full test-app project drags in its standalone-only
+# assumptions. Known gaps to close before turning this on by default:
+#   1. test_apps/common FetchContents displayxr-common; in the folded scope the
+#      `displayxr::common` target doesn't resolve (the runtime build also pins
+#      displayxr-common) → "target was not found". Reconcile the two fetches /
+#      reuse the runtime's displayxr::common.
+#   2. The test app's OpenXR import is single-config; under the multi-config VS
+#      generator it errors "IMPORTED_IMPLIB not set … MinSizeRel". Apply the
+#      same all-configs backfill used in targets/webxr_bridge/CMakeLists.txt.
+#   3. openxr_loader.dll isn't copied next to the folded exe (only
+#      build_windows.bat does that today) → add a POST_BUILD copy, and rely on
+#      VS_DEBUGGER_ENVIRONMENT below for XR_RUNTIME_JSON (so F5, not a bare run).
 set(XRT_VS_LAUNCH_APP "" CACHE STRING
 	"test_apps/<name> to fold in as an IDE launch target (e.g. cube_handle_d3d11_win); empty = none")
 if(XRT_VS_LAUNCH_APP)
