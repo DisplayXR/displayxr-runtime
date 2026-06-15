@@ -769,6 +769,7 @@ struct ipc_view_rig_info
 	float perspective_factor;       //!< Display rig only
 	float inv_convergence_distance; //!< Camera rig only
 	float half_tan_vfov;            //!< Camera rig only
+	float m2v;                      //!< Camera rig only — meters→world scale (0/unset → 1.0)
 	float ipd_factor;               //!< Both rigs
 	float parallax_factor;          //!< Both rigs
 	//! Active rendering mode's view count (1 = mono/2D, 2 = stereo/3D). #521:

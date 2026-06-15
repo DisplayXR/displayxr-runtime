@@ -2264,6 +2264,7 @@ ipc_syscomp_set_workspace_view_rig(struct xrt_system_compositor *xsc, const stru
 		wire.perspective_factor = rig->perspective_factor;
 		wire.inv_convergence_distance = rig->inv_convergence_distance;
 		wire.half_tan_vfov = rig->half_tan_vfov;
+		wire.m2v = rig->m2v;
 		wire.ipd_factor = rig->ipd_factor;
 		wire.parallax_factor = rig->parallax_factor;
 	}

@@ -1451,6 +1451,9 @@ oxr_session_set_workspace_view_rig(struct oxr_logger *log, struct oxr_session *s
 		out.parallax_factor = view_rig_clampf(crig->parallaxFactor, 0.0f, 1.0f, &clamped);
 		out.inv_convergence_distance = view_rig_clampf(crig->convergenceDiopters, 0.0f, 20.0f, &clamped);
 		out.half_tan_vfov = tanf(view_rig_clampf(crig->verticalFov, 0.01f, 3.13f, &clamped) * 0.5f);
+		out.m2v = crig->metersToVirtual > 0.0f
+		              ? view_rig_clampf(crig->metersToVirtual, 0.0001f, 100000.0f, &clamped)
+		              : 1.0f;
 		if (clamped) {
 			U_LOG_W("xrSetWorkspaceViewRigEXT: camera rig value(s) out of range — clamped");
 		}
@@ -2139,6 +2142,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 			rig_info.perspective_factor = sess->view_rig.perspective_factor;
 			rig_info.inv_convergence_distance = sess->view_rig.inv_convergence_distance;
 			rig_info.half_tan_vfov = sess->view_rig.half_tan_vfov;
+			rig_info.m2v = sess->view_rig.m2v;
 			rig_info.ipd_factor = sess->view_rig.ipd_factor;
 			rig_info.parallax_factor = sess->view_rig.parallax_factor;
 		}

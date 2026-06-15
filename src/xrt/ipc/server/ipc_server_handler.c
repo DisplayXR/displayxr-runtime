@@ -622,6 +622,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 			    .perspective_factor = ws_rig.perspective_factor,
 			    .inv_convergence_distance = ws_rig.inv_convergence_distance,
 			    .half_tan_vfov = ws_rig.half_tan_vfov,
+			    .m2v = ws_rig.m2v,
 			    .ipd_factor = ws_rig.ipd_factor,
 			    .parallax_factor = ws_rig.parallax_factor,
 			    // #575 (workspace leg): the controller override replaces the app's
@@ -703,6 +704,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 			    .parallax_factor = rig->parallax_factor,
 			    .inv_convergence_distance = rig->inv_convergence_distance,
 			    .half_tan_vfov = rig->half_tan_vfov,
+			    .m2v = rig->m2v,
 			};
 		} else {
 			ct = (dxr_camera3d_tunables){
