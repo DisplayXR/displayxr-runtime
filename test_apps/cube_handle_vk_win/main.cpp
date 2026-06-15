@@ -736,6 +736,10 @@ static void RenderThreadFunc(
                                 cameraRig.convergenceDiopters = inputSnapshot.viewParams.invConvergenceDistance;
                                 cameraRig.verticalFov =
                                     2.0f * atanf(CAMERA_HALF_TAN_VFOV / inputSnapshot.viewParams.zoomFactor);
+                                // metersToVirtual carries the eye scale the C-toggle
+                                // converter derived from the display rig, so the
+                                // camera rig reproduces the display rig exactly.
+                                cameraRig.metersToVirtual = inputSnapshot.viewParams.cameraM2v;
                                 locateInfo.next = &cameraRig;
                             } else {
                                 displayRig.pose = rigPose;
@@ -749,6 +753,16 @@ static void RenderThreadFunc(
                         }
                         xrLocateViews(xr->session, &locateInfo, &viewState, 8, &viewCount, rawViews);
                         LOG_INFO("[FRAME] Raw LocateViews done");
+
+                        // Capture the runtime's resolved CANVAS size (the window
+                        // client area in meters) into g_inputState so next frame's
+                        // snapshot feeds the C-toggle / SPACE-reset converter the
+                        // physical_height_m the rig math runs on.
+                        if (g_hasViewRigExt && rawProbe.canvasSizeMeters.height > 0.0f) {
+                            std::lock_guard<std::mutex> lock(g_inputMutex);
+                            g_inputState.canvasWidthM = rawProbe.canvasSizeMeters.width;
+                            g_inputState.canvasHeightM = rawProbe.canvasSizeMeters.height;
+                        }
 
                         // XR_EXT_view_rig raw-channel verification (#396 W7):
                         // one-shot proof the raw channel reports the DP's full
@@ -1597,6 +1611,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Set virtual display height (app units). 0.24 = 4x the 0.06m cube height.
     g_inputState.viewParams.virtualDisplayHeight = 0.24f;
+    g_inputState.initialVirtualDisplayHeight = g_inputState.viewParams.virtualDisplayHeight; // SPACE-reset target
     g_inputState.renderingModeCount = xr.renderingModeCount;
 
     std::thread renderThread(RenderThreadFunc, hwnd, &xr, &vkRenderer,
