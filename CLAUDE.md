@@ -80,6 +80,8 @@ Specs: `docs/specs/extensions/`. Eye-tracking MANAGED vs MANUAL contract: `docs/
 Languages: C11 (core), C++17 (where needed), Python 3.6+ (build scripts).
 
 ### Windows (preferred on a Leia SR machine — iterate locally, not via CI)
+
+**One-line dev environment (from source).** `scripts\dev-setup.bat` (elevated) is the dev mirror of the user bundle installer: it builds the runtime, registers the ABI-matched sim-display (and `--leia` builds+registers the Leia plug-in from source), points the machine's active OpenXR runtime at the dev build, and generates the VS solution — fresh clone to debuggable in one command. `--leia` / `--leia=release` / `--all` / `--no-vs` / `--no-active-runtime` / `--clean`. (Contrast `scripts\setup-displayxr.bat`, which *downloads released* installers instead of building.) The granular `build_windows.bat` targets below are what it orchestrates:
 ```bat
 scripts\build_windows.bat all        REM generate + runtime + installer + test apps
 scripts\build_windows.bat build      REM runtime only (fastest iteration)
