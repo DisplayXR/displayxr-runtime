@@ -1080,14 +1080,16 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 	// (moveTaskToBack) so the launcher stays the interactive foreground app while
 	// the runtime weaves the tiger into a service-owned TYPE_APPLICATION_OVERLAY
 	// on top. In that mode the ON_PAUSE lifecycle must NOT stop the session — the
-	// overlay is still on-screen, so the client must keep submitting frames. Read
-	// debug.dxr.overlay once (this runs in the client process, same sysprop the
-	// avatar + comp read). When OFF, the normal pause→stopping behavior stands.
+	// overlay is still on-screen, so the client must keep submitting frames. This
+	// runs in the CLIENT process, so overlay mode is THIS app's own choice: it's
+	// per-app via the app's manifest flag (com.displayxr.overlay_mode), with
+	// debug.dxr.overlay as a dev force-all override. When OFF, the normal
+	// pause→stopping behavior stands. Resolved once.
 	static int s_overlay_mode = -1;
 	if (s_overlay_mode < 0) {
 		char prop[PROP_VALUE_MAX] = {0};
-		s_overlay_mode =
-		    (__system_property_get("debug.dxr.overlay", prop) > 0 && prop[0] == '1') ? 1 : 0;
+		bool force = __system_property_get("debug.dxr.overlay", prop) > 0 && prop[0] == '1';
+		s_overlay_mode = (force || android_globals_self_declares_overlay()) ? 1 : 0;
 	}
 
 	// Most recent Android activity lifecycle event was OnPause: move toward stopping

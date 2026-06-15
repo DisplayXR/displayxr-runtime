@@ -192,19 +192,10 @@ Java_org_freedesktop_monado_ipc_MonadoImpl_nativeCreateServiceOverlay(JNIEnv *en
 	jni::init(env);
 	jni::Object monadoImpl(thiz);
 
-	// #558: only create a service overlay in OVERLAY MODE (debug.dxr.overlay).
-	// The "display over other apps" permission alone is NOT enough — a normal app
-	// (e.g. cube_handle_vk_android) publishes its own client surface and must
-	// render into its own window; creating a service overlay for it would steal
-	// the screen + eat input + leave a stray overlay flashing on close. Overlay
-	// mode is the avatar's opt-in switch (the same sysprop the client session +
-	// plugin read), so gate creation on it; default (unset) → ordinary windowed app.
-	{
-		char prop[PROP_VALUE_MAX] = {};
-		if (!(__system_property_get("debug.dxr.overlay", prop) > 0 && prop[0] == '1')) {
-			return;
-		}
-	}
+	// The overlay-mode gate now lives in MonadoImpl.canDrawOverOtherApps (per-app,
+	// from the connecting client's manifest); connect() only calls this in overlay
+	// mode, so no sysprop gate here — that would wrongly block a per-app overlay
+	// app whenever debug.dxr.overlay is unset (#558 per-app).
 
 	// Service-owned overlay (#558 revival, P1): when the runtime holds the
 	// "display over other apps" permission the CLIENT skips publishing its
@@ -261,11 +252,9 @@ Java_org_freedesktop_monado_ipc_MonadoImpl_nativeCreateServiceOverlay(JNIEnv *en
 	U_LOG_I("service: TYPE_APPLICATION_OVERLAY created, ANativeWindow %p (#558 P1)", (void *)win);
 }
 
-// #558: true when overlay mode is enabled (debug.dxr.overlay). MonadoImpl gates
-// "the service owns the on-screen surface" on this AND the draw-over-apps
-// permission — so a normal app (permission happens to be granted, but overlay
-// mode off) publishes its own client surface and renders in its own window
-// instead of being handed a service overlay (which left it black + input-dead).
+// #558: the debug.dxr.overlay sysprop is now a DEV FORCE-ALL override (forces
+// every client into overlay mode). The normal per-app decision is in
+// MonadoImpl.canDrawOverOtherApps (the connecting app's manifest flag).
 extern "C" JNIEXPORT jboolean JNICALL
 Java_org_freedesktop_monado_ipc_MonadoImpl_nativeOverlayModeEnabled(JNIEnv * /*env*/,
                                                                     jobject /*thiz*/)
@@ -273,6 +262,16 @@ Java_org_freedesktop_monado_ipc_MonadoImpl_nativeOverlayModeEnabled(JNIEnv * /*e
 	char prop[PROP_VALUE_MAX] = {};
 	return (__system_property_get("debug.dxr.overlay", prop) > 0 && prop[0] == '1') ? JNI_TRUE
 	                                                                                 : JNI_FALSE;
+}
+
+// #558 per-app: publish the per-session overlay decision to the service-process
+// globals so the compositor + vendor DP plug-in see it (keep-3D-while-bg) without
+// re-reading a global sysprop. Set by MonadoImpl.connect from the client's manifest.
+extern "C" JNIEXPORT void JNICALL
+Java_org_freedesktop_monado_ipc_MonadoImpl_nativeSetOverlayMode(JNIEnv * /*env*/, jobject /*thiz*/,
+                                                                jboolean enabled)
+{
+	android_globals_set_overlay_mode(enabled == JNI_TRUE);
 }
 
 // #558: authoritative teardown of the service-owned overlay, called from
