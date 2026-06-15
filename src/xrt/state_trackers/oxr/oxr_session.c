@@ -1569,10 +1569,10 @@ oxr_session_locate_views(struct oxr_logger *log,
 	bool have_view_state = qwerty_get_view_state(
 	    sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count, &view_state);
 	if (should_log) {
-		U_LOG_I("VIEW STATE: have=%d cam=%d spread=%.3f conv=%.2f disp_spread=%.3f disp_vH=%.2f",
-		        have_view_state, view_state.camera_mode,
-		        view_state.cam_spread_factor, view_state.cam_convergence,
-		        view_state.disp_spread_factor, view_state.disp_vHeight);
+		U_LOG_I("VIEW STATE: have=%d cam=%d ipd=%.3f conv=%.2f vH=%.2f persp=%.2f m2v=%.2f",
+		        have_view_state, view_state.camera_mode, view_state.ipd_factor,
+		        view_state.inv_convergence_distance, view_state.virtual_display_height,
+		        view_state.perspective_factor, view_state.m2v);
 	}
 #else
 	struct { bool camera_mode; float cam_spread_factor, cam_parallax_factor, cam_convergence,
@@ -1979,10 +1979,11 @@ oxr_session_locate_views(struct oxr_logger *log,
 						};
 					} else {
 						ct = (dxr_camera3d_tunables){
-						    .ipd_factor = view_state.cam_spread_factor,
-						    .parallax_factor = view_state.cam_parallax_factor,
-						    .inv_convergence_distance = view_state.cam_convergence,
-						    .half_tan_vfov = view_state.cam_half_tan_vfov,
+						    .ipd_factor = view_state.ipd_factor,
+						    .parallax_factor = view_state.parallax_factor,
+						    .inv_convergence_distance = view_state.inv_convergence_distance,
+						    .half_tan_vfov = view_state.half_tan_vfov,
+						    .m2v = view_state.m2v,
 						};
 					}
 					struct dxr_xrt_view cam_views[XRT_MAX_VIEWS];
@@ -2007,10 +2008,10 @@ oxr_session_locate_views(struct oxr_logger *log,
 						dt.perspective_factor = sess->view_rig.perspective_factor;
 						dt.virtual_display_height = sess->view_rig.virtual_display_height;
 					} else if (have_view_state && !sess->has_external_window) {
-						dt.ipd_factor = view_state.disp_spread_factor;
-						dt.parallax_factor = view_state.disp_parallax_factor;
-						dt.perspective_factor = 1.0f;
-						dt.virtual_display_height = view_state.disp_vHeight;
+						dt.ipd_factor = view_state.ipd_factor;
+						dt.parallax_factor = view_state.parallax_factor;
+						dt.perspective_factor = view_state.perspective_factor;
+						dt.virtual_display_height = view_state.virtual_display_height;
 					} else {
 						dt.virtual_display_height = screen_height_m; // identity m2v
 					}

@@ -1597,13 +1597,13 @@ metal_compositor_render_hud(struct comp_metal_compositor *c, float dt,
 		struct qwerty_view_state ss;
 		if (qwerty_get_view_state(c->xsysd->xdevs, c->xsysd->xdev_count, &ss)) {
 			data.camera_mode = ss.camera_mode;
-			data.cam_spread_factor = ss.cam_spread_factor;
-			data.cam_parallax_factor = ss.cam_parallax_factor;
-			data.cam_convergence = ss.cam_convergence;
-			data.cam_half_tan_vfov = ss.cam_half_tan_vfov;
-			data.disp_spread_factor = ss.disp_spread_factor;
-			data.disp_parallax_factor = ss.disp_parallax_factor;
-			data.disp_vHeight = ss.disp_vHeight;
+			data.ipd_factor = ss.ipd_factor;
+			data.parallax_factor = ss.parallax_factor;
+			data.inv_convergence_distance = ss.inv_convergence_distance;
+			data.half_tan_vfov = ss.half_tan_vfov;
+			data.m2v = ss.m2v;
+			data.virtual_display_height = ss.virtual_display_height;
+			data.perspective_factor = ss.perspective_factor;
 			data.nominal_viewer_z = ss.nominal_viewer_z;
 			data.screen_height_m = ss.screen_height_m;
 		}
