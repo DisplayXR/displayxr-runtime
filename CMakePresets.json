@@ -30,15 +30,14 @@
         {
             "name": "vs2022",
             "displayName": "Visual Studio 2022 solution",
-            "description": "Multi-config VS solution at build_vs2022/. Folds cube_handle_d3d11_win in as the startup target (F5 launches it against this dev runtime). Mirrors `build_windows.bat vs2022`. Needs a prior build_windows.bat run to fetch vcpkg + the OpenXR loader.",
+            "description": "Multi-config VS solution at build_vs2022/. Mirrors `build_windows.bat vs2022`. Needs a prior build_windows.bat run to fetch vcpkg + the OpenXR loader. Set displayxr-service/displayxr-cli as the startup project to debug. (Folding a test app in as a one-click F5 target via XRT_VS_LAUNCH_APP is WIP.)",
             "generator": "Visual Studio 17 2022",
             "architecture": "x64",
             "inherits": ".common",
             "binaryDir": "${sourceDir}/build_vs2022",
             "cacheVariables": {
                 "XRT_FEATURE_SERVICE": "ON",
-                "XRT_FEATURE_HYBRID_MODE": "ON",
-                "XRT_VS_LAUNCH_APP": "cube_handle_d3d11_win"
+                "XRT_FEATURE_HYBRID_MODE": "ON"
             }
         },
         {
