@@ -49,6 +49,11 @@
 #include <stdio.h>
 #include <math.h>
 
+#ifdef XRT_OS_WINDOWS
+#include <windows.h>
+#include <timeapi.h> // timeBeginPeriod / timeEndPeriod
+#endif
+
 /*
  * Stub for the post-destroy dispatch table.
  *
@@ -159,6 +164,11 @@ oxr_instance_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 	// Mutex goes last.
 	os_mutex_destroy(&inst->sessions_mutex);
 	os_mutex_destroy(&inst->event.mutex);
+
+#ifdef XRT_OS_WINDOWS
+	// Balance the timeBeginPeriod(1) raised in oxr_instance_create. (#589)
+	timeEndPeriod(1);
+#endif
 
 	// Keep the allocation alive as a tombstone so that post-destroy
 	// reads from the stale XrInstance handle don't fault.  Free the
@@ -339,6 +349,17 @@ oxr_instance_create(struct oxr_logger *log,
 		        u_version_major, u_version_minor, u_version_patch, u_git_tag,
 		        path[0] ? path : L"<unknown>", env ? env : L"<unset>");
 	}
+
+	// Raise the process timer resolution to 1ms for the in-process runtime's
+	// lifetime. Windows' default ~15.6ms tick quantizes every Sleep()/wait in
+	// the frame loop, so in-process frame pacing (and any app-side sleep in the
+	// same process) overshoots by up to a full tick — fine for a smooth display
+	// but enough to blow the OpenXR CTS Timed_Pipelined_Frame_Submission overhead
+	// budget (avg frame time must stay < 1.5x the predicted display period). The
+	// IPC server already does this (ipc_server_process.c); mirror it here so the
+	// in-process path gets the same precise pacing. Balanced in oxr_instance_destroy.
+	// (#589)
+	timeBeginPeriod(1);
 #endif
 
 	inst->extensions = *extensions; // Sets the enabled extensions.

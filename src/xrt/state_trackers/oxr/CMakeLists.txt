@@ -118,7 +118,9 @@ if(ANDROID)
 endif()
 
 if(WIN32)
-	target_link_libraries(st_oxr PRIVATE kernel32)
+	# winmm: timeBeginPeriod/timeEndPeriod — 1ms timer resolution for in-process
+	# frame pacing (see oxr_instance.c, #589).
+	target_link_libraries(st_oxr PRIVATE kernel32 winmm)
 
 	# VK native compositor support (direct Vulkan, no multi-compositor)
 	if(XRT_HAVE_VULKAN AND TARGET comp_vk_native)
