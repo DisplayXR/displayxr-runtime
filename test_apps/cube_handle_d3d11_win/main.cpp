@@ -22,7 +22,6 @@
 #include "xr_session.h"
 #include "projection_depth.h"
 #include "atlas_capture.h"
-#include <dxr_view_math.h>  // display<->camera rig converters (disturbance-free C-toggle test)
 
 #include <chrono>
 #include <cmath>
@@ -62,22 +61,10 @@ static bool g_inSizeMove = false;  // True while user is dragging/resizing the w
 static const uint32_t HUD_PIXEL_WIDTH = 380;
 static const uint32_t HUD_PIXEL_HEIGHT = 470;
 static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18°) → 36° vFOV
-// Camera-rig meters→world scale (XrCameraRigEXT::metersToVirtual). The C-toggle
-// converter (TryRigRoundtripToggle) derives this from the display rig so the
-// camera rig reproduces the display rig's eye scaling exactly; default 1.0.
-static float g_cameraM2v = 1.0f;
-
-// The runtime's resolved CANVAS size in meters (XrViewDisplayRawEXT::canvasSizeMeters),
-// captured each frame. The Kooima/rig math runs on the canvas (window client area),
-// NOT the full display — so the C-toggle converter must use the canvas height as
-// physical_height_m, else display<->camera diverge in any non-fullscreen window
-// (perspective + pose). 0 = not captured yet (falls back to full display size).
-static float g_canvasWidthM = 0.0f;
-static float g_canvasHeightM = 0.0f;
-
-// Initial virtual display height, snapshotted at startup. SPACE resets the rig
-// to exactly this initial display-centric state (see ResetToInitialState).
-static float g_initialVHeight = 0.24f;
+// Disturbance-free C toggle + absolute SPACE reset live in displayxr-common
+// (common/rig_mode.{h,cpp}, driven by UpdateInputState/UpdateCameraMovement).
+// The app only feeds InputState the canvas size + initial vHeight and submits
+// XrCameraRigEXT::metersToVirtual = viewParams.cameraM2v (see below).
 static const float HUD_WIDTH_FRACTION = 0.30f;
 
 // Fullscreen state
@@ -223,145 +210,12 @@ static void ToggleFullscreen(HWND hwnd) {
     }
 }
 
-// Disturbance-free rig round-trip test ('C' key).
-//
-// Instead of the shared input handler's behavior (C flips cameraMode and RESETS
-// the camera params to arbitrary defaults — a visible pop), C here converts the
-// CURRENT rig into its exact equivalent in the OTHER parameterization using the
-// shipped displayxr-common converters, then renders through that rig. Because
-// display→camera is always exact and camera→display is exact for the
-// (compatible) camera rig display→camera produces, the rendered view does not
-// change across the toggle — and display→camera→display is an identity, so
-// pressing C repeatedly never moves the cube, for ANY starting display rig
-// (change ipd / parallax / perspective / vHeight / pose first and it still
-// holds). Manually perturbing the camera rig into a non-compatible convergence
-// is the one case that legitimately can't round-trip (the display rig pins
-// convergence to the display plane); the returned residual flags it.
-//
-// Returns false if display info isn't available yet — caller falls back to the
-// plain shared toggle.
-static bool TryRigRoundtripToggle() {
-    if (g_xr == nullptr || g_xr->displayHeightM <= 0.0f || g_xr->nominalViewerZ <= 0.0f) {
-        return false;
-    }
-    InputState& st = g_inputState;
-
-    // Use the CANVAS size the runtime resolved (window client area in meters),
-    // NOT the full display — the rig math runs on the canvas, so in any
-    // non-fullscreen window the window "is" the display. Fall back to the full
-    // display size until the first raw-channel capture lands.
-    const float physH = (g_canvasHeightM > 0.0f) ? g_canvasHeightM : g_xr->displayHeightM;
-    const float physW = (g_canvasWidthM > 0.0f) ? g_canvasWidthM : g_xr->displayWidthM;
-
-    dxr_rig_display_info info;
-    info.physical_height_m = physH;
-    info.aspect = physW / physH;
-    info.nominal_distance_m = g_xr->nominalViewerZ;
-
-    // Current rig pose — same construction as the per-frame rigPose in the
-    // locate loop (orientation from yaw/pitch, position from cameraPos). The
-    // converters preserve orientation and only translate the pose, so yaw/pitch
-    // stay put and we write back position only.
-    XMFLOAT4 rq;
-    XMStoreFloat4(&rq, XMQuaternionRotationRollPitchYaw(st.pitch, st.yaw, 0.0f));
-    const dxr_quat q = {rq.x, rq.y, rq.z, rq.w};
-    const dxr_vec3 pos = {st.cameraPosX, st.cameraPosY, st.cameraPosZ};
-
-    if (!st.cameraMode) {
-        // Display → camera.
-        dxr_display_rig disp;
-        disp.pose.orientation = q;
-        disp.pose.position = pos;
-        disp.virtual_display_height = st.viewParams.virtualDisplayHeight / st.viewParams.scaleFactor;
-        disp.ipd_factor = st.viewParams.ipdFactor;
-        disp.parallax_factor = st.viewParams.parallaxFactor;
-        disp.perspective_factor = st.viewParams.perspectiveFactor;
-
-        dxr_camera_rig cam;
-        dxr_view_rig_display_to_camera(&disp, &info, &cam);
-
-        st.viewParams.invConvergenceDistance = cam.inv_convergence_distance;
-        st.viewParams.zoomFactor = CAMERA_HALF_TAN_VFOV / cam.half_tan_vfov;
-        g_cameraM2v = cam.m2v;
-        st.viewParams.ipdFactor = cam.ipd_factor;
-        st.viewParams.parallaxFactor = cam.parallax_factor;
-        st.cameraPosX = cam.pose.position.x;
-        st.cameraPosY = cam.pose.position.y;
-        st.cameraPosZ = cam.pose.position.z;
-        st.cameraMode = true;
-        LOG_INFO("rig C-toggle DISPLAY->CAMERA: convergence=%.4f zoom=%.4f m2v=%.4f pos=(%.3f,%.3f,%.3f)",
-                 st.viewParams.invConvergenceDistance, st.viewParams.zoomFactor, g_cameraM2v,
-                 st.cameraPosX, st.cameraPosY, st.cameraPosZ);
-    } else {
-        // Camera → display.
-        dxr_camera_rig cam;
-        cam.pose.orientation = q;
-        cam.pose.position = pos;
-        cam.ipd_factor = st.viewParams.ipdFactor;
-        cam.parallax_factor = st.viewParams.parallaxFactor;
-        cam.inv_convergence_distance = st.viewParams.invConvergenceDistance;
-        cam.half_tan_vfov = CAMERA_HALF_TAN_VFOV / st.viewParams.zoomFactor;
-        cam.m2v = g_cameraM2v;
-
-        dxr_display_rig disp;
-        const float residual = dxr_view_rig_camera_to_display(&cam, &info, &disp);
-
-        // Preserve the user's display-mode scaleFactor: the rig submits
-        // virtualDisplayHeight/scaleFactor, so scale the converter's vH up by it.
-        st.viewParams.virtualDisplayHeight = disp.virtual_display_height * st.viewParams.scaleFactor;
-        st.viewParams.perspectiveFactor = disp.perspective_factor;
-        st.viewParams.ipdFactor = disp.ipd_factor;
-        st.viewParams.parallaxFactor = disp.parallax_factor;
-        st.cameraPosX = disp.pose.position.x;
-        st.cameraPosY = disp.pose.position.y;
-        st.cameraPosZ = disp.pose.position.z;
-        st.cameraMode = false;
-        LOG_INFO("rig C-toggle CAMERA->DISPLAY: vH=%.4f persp=%.4f pos=(%.3f,%.3f,%.3f) residual=%.5f (0=exact)",
-                 st.viewParams.virtualDisplayHeight, st.viewParams.perspectiveFactor,
-                 st.cameraPosX, st.cameraPosY, st.cameraPosZ, residual);
-    }
-    return true;
-}
-
-// SPACE = hard reset to the app's initial state: display-centric rig, pose at
-// origin (0,0,0) / identity orientation, the original vHeight, and every other
-// tunable at its default. Deliberately dumb and absolute (no conversion, no
-// dependence on the current rig) so there is no room for drift — the cube
-// always snaps back to exactly the launch view. Replaces the shared handler's
-// reset, which left g_cameraM2v / cameraMode stale (skewed-cube bug).
-static void ResetToInitialState() {
-    InputState& st = g_inputState;
-    st.cameraMode = false;                 // display-centric
-    st.cameraPosX = 0.0f;                   // pose at origin
-    st.cameraPosY = 0.0f;
-    st.cameraPosZ = 0.0f;
-    st.yaw = 0.0f;                          // identity orientation
-    st.pitch = 0.0f;
-    st.viewParams = ViewParams{};           // ipd/parallax/perspective/scale=1, conv=0.5, zoom=1
-    st.viewParams.virtualDisplayHeight = g_initialVHeight;
-    g_cameraM2v = 1.0f;                     // app-local camera scale back to identity
-    // Cancel any in-flight pose animation so it can't drive the pose post-reset.
-    st.resetViewRequested = false;
-    st.transitioning = false;
-    st.teleportAnimating = false;
-    st.animateEnabled = false;
-    st.animationActive = false;
-    LOG_INFO("rig RESET (SPACE): display-centric, pose (0,0,0)/identity, vHeight=%.4f", g_initialVHeight);
-}
-
 // Window procedure (runs on main thread — single-threaded, no locking needed)
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    // 'C' = disturbance-free rig round-trip (see TryRigRoundtripToggle). Handle
-    // it before the shared UpdateInputState, which would otherwise reset the
-    // camera params. Falls through to the shared toggle if display info isn't up.
-    if (msg == WM_KEYDOWN && wParam == 'C' && TryRigRoundtripToggle()) {
-        return 0;
-    }
-    // SPACE = hard reset to the initial display-centric state (drift-free).
-    if (msg == WM_KEYDOWN && wParam == VK_SPACE) {
-        ResetToInitialState();
-        return 0;
-    }
+    // C (disturbance-free rig toggle) and SPACE (absolute reset) are handled by
+    // the shared displayxr-common input path: UpdateInputState sets the request,
+    // UpdateCameraMovement runs the rig_mode conversion / reset using the canvas
+    // size + initial vHeight the render loop feeds into InputState.
     UpdateInputState(g_inputState, msg, wParam, lParam);
 
     switch (msg) {
@@ -894,7 +748,7 @@ static void RenderOneFrame(RenderState& rs) {
                             // metersToVirtual carries the eye scale the C-toggle
                             // converter derived from the display rig, so the
                             // camera rig reproduces the display rig exactly.
-                            cameraRig.metersToVirtual = g_cameraM2v;
+                            cameraRig.metersToVirtual = g_inputState.viewParams.cameraM2v;
                             locateInfo.next = &cameraRig;
                         } else {
                             displayRig.pose = rigPose;
@@ -914,8 +768,8 @@ static void RenderOneFrame(RenderState& rs) {
                     // Kooima/rig math runs on, which the C-toggle converter must
                     // match. Fullscreen → canvas == display; windowed → smaller.
                     if (g_hasViewRigExt && rawProbe.canvasSizeMeters.height > 0.0f) {
-                        g_canvasWidthM = rawProbe.canvasSizeMeters.width;
-                        g_canvasHeightM = rawProbe.canvasSizeMeters.height;
+                        g_inputState.canvasWidthM = rawProbe.canvasSizeMeters.width;
+                        g_inputState.canvasHeightM = rawProbe.canvasSizeMeters.height;
                     }
 
                     // XR_EXT_view_rig raw-channel verification (#396 W7): one-shot
@@ -1036,7 +890,7 @@ static void RenderOneFrame(RenderState& rs) {
                                 wchar_t vhBuf[64];
                                 if (g_inputState.cameraMode) {
                                     float tanHFOV = CAMERA_HALF_TAN_VFOV / g_inputState.viewParams.zoomFactor;
-                                    swprintf(vhBuf, 64, L"\ntanHFOV: %.3f  m2v: %.3f", tanHFOV, g_cameraM2v);
+                                    swprintf(vhBuf, 64, L"\ntanHFOV: %.3f  m2v: %.3f", tanHFOV, g_inputState.viewParams.cameraM2v);
                                 } else {
                                     float hudM2v = 1.0f;
                                     if (g_inputState.viewParams.virtualDisplayHeight > 0.0f && xr.displayHeightM > 0.0f)
@@ -1572,7 +1426,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Set virtual display height (app units). 0.24 = 4x the 0.06m cube height.
     g_inputState.viewParams.virtualDisplayHeight = 0.24f;
-    g_initialVHeight = g_inputState.viewParams.virtualDisplayHeight; // SPACE-reset target
+    g_inputState.initialVirtualDisplayHeight = g_inputState.viewParams.virtualDisplayHeight; // SPACE-reset target
     g_inputState.nominalViewerZ = xr.nominalViewerZ;
     g_inputState.renderingModeCount = xr.renderingModeCount;
 
