@@ -33,6 +33,16 @@ App Swapchain          Compositor              Display Processor        Target S
 3. **Display processor** receives the cropped atlas + tile layout (`tile_columns`, `tile_rows`), extracts views, and produces the final interlaced/weaved output into the target swapchain
 4. **Compositor** presents the target swapchain to the display
 
+**Crop is the default; zero-copy is the exception.** Because the swapchain is the worst-case
+envelope, the per-frame content normally occupies only its top-left sub-rect, so step 2 must
+**always** crop — *unless* the app's submission exactly fills the swapchain at the active
+mode's tiling, the one case where the compositor may hand the swapchain straight to the DP.
+That case is decided solely by `u_tiling_can_zero_copy()` and, by construction, only occurs
+for a full-screen window in the mode that hits the per-dim worst case in both dimensions
+(on the Windows Leia DP: 2D only; on Android: never). See
+[ADR-030](../../adr/ADR-030-crop-before-dp-zero-copy-only-when-swapchain-equals-atlas.md) and
+[Multiview Tiling — Zero-copy eligibility](multiview-tiling.md#zero-copy-eligibility--the-single-rule).
+
 See [Multiview Tiling — Compositor-Side Contract](multiview-tiling.md) for the full crop-blit algorithm.
 
 ## Canvas Concept

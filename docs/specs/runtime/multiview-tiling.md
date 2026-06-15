@@ -130,7 +130,7 @@ Commit `fc5f82ff1` + follow-up fixes (`febd2fd05`, `c4cd31b1e`, `735e6dfa8`, `91
 - `recommended_view_scale_x = min(scaleX across all modes)` set in `target_instance.c`
 - Apps compute swapchain size as `max(tileColumns[i] * scaleX[i] * displayPixelWidth)` across all modes for width, similar for height
 - Legacy apps (no `XR_EXT_display_info`): max taken over modes 0 and 1 only; special compromise scale logic for `view_count == 2 && scaleX <= 0.5 && scaleY <= 0.5` -> uses 0.5x1.0
-- Zero-copy passthrough: when app's swapchain matches mode's atlas dimensions exactly, compositor skips atlas blit
+- Zero-copy passthrough: gated solely by `u_tiling_can_zero_copy()` — see [Zero-copy eligibility — the single rule](#zero-copy-eligibility--the-single-rule) for the normative contract
 
 ### Phase D: Extended `xrt_rendering_mode` struct
 
@@ -249,15 +249,33 @@ content_height = tile_rows * view_height      (for active mode)
 
 In stereo mode (e.g., 2×1 tiles at half-height views), the content region is smaller than the swapchain. The content occupies the top-left corner of the swapchain image.
 
-### Compositors must crop before passing to the DP
+### Compositors must crop before passing to the DP (crop is the default; zero-copy is the exception)
 
-The display processor (DP) has **no knowledge of swapchain dimensions** — it expects a texture whose dimensions match the content exactly. Every compositor must:
+The display processor (DP) has **no knowledge of swapchain dimensions** — it expects a texture whose dimensions match the content exactly. **Cropping to content is the mandatory default path; zero-copy is a narrow optimization, not the other way around.** Every compositor must:
 
-1. Compute `content_w = tile_columns * view_width` and `content_h = tile_rows * view_height`
-2. If `content_w == atlas_tex_width && content_h == atlas_tex_height`: pass the atlas directly (no copy needed — this is the common case for 2D mode)
-3. If content is smaller than the atlas: **blit/copy** the valid content region `(0, 0, content_w, content_h)` into a correctly-sized intermediate texture, then pass that to the DP
+1. Compute `content_w = tile_columns * view_width` and `content_h = tile_rows * view_height` for the **active** mode.
+2. **Crop** the valid content region `(0, 0, content_w, content_h)` into a correctly-sized intermediate texture and pass that to the DP — **unless** the zero-copy predicate below is true.
 
-This crop step is performed lazily — the intermediate texture is only created when content dims differ from atlas dims, and is recreated when content dims change (e.g., on mode switch).
+This crop step is performed lazily — the intermediate texture is only created when content dims differ from the swapchain dims, and is recreated when content dims change (e.g., on mode switch).
+
+#### Zero-copy eligibility — the single rule
+
+Skipping the crop and handing the app's swapchain image straight to the DP is valid in **exactly one case**: the app's submitted layout equals the active mode's atlas **and** fills the swapchain. This is decided **solely** by the shared predicate `u_tiling_can_zero_copy()` (`auxiliary/util/u_tiling.h`), which requires **all** of:
+
+- `submitted view_count == mode->view_count` (the #542 divergence guard — a hardware/content mismatch frame must crop; zero-copy cannot re-tile a mismatched submission),
+- `swapchain_w == mode->atlas_width_pixels && swapchain_h == mode->atlas_height_pixels`, and
+- every view's sub-rect matches its expected tile origin and size.
+
+**No compositor may add its own zero-copy proxy** — not a view-count threshold, not coupling to the hardware 2D/3D flag, not a mode-index check. If the predicate is false, **crop**. (Historically the D3D11 service path gated zero-copy on `proj_view_count > 1` coupled to `hardware_display_3d`; that ad-hoc proxy is the root of the #575 forced-IPC 2D left-shift and is removed in favour of this rule.)
+
+##### Why it's a rare coincidence, and which mode triggers it
+
+The swapchain is the **per-dimension worst case across all modes, assuming full-screen** (see [Swapchain images are worst-case sized](#swapchain-images-are-worst-case-sized)). So the per-frame content equals it **only when both** (a) the window is full-screen — a windowed app renders `view = window × scale`, strictly smaller than the `display × scale` envelope, so it *always* crops — **and** (b) the active mode hits the per-dim worst case in **both** width and height. Which mode (if any) qualifies is therefore **DP- and platform-specific**:
+
+- **Windows Leia DP:** 2D = `1×1 @ 1.0×1.0`, 3D = `2×1 @ 0.5×0.5`. Envelope = `max(W, 2·0.5W) × max(H, 0.5H) = W × H`. The only mode filling it in both dims is **2D** (3D is half-height ⇒ `W × 0.5H`, always smaller ⇒ always crops). ⇒ zero-copy fires only for **full-screen 2D**.
+- **Android Leia DP:** modes (e.g. 3D `0.75×0.75`) never reach the envelope ⇒ zero-copy **never** fires; it always crops.
+
+See [ADR-030](../../adr/ADR-030-crop-before-dp-zero-copy-only-when-swapchain-equals-atlas.md) for the decision record.
 
 ### DP-side dimension guarantee
 
