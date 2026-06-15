@@ -261,6 +261,20 @@ Java_org_freedesktop_monado_ipc_MonadoImpl_nativeCreateServiceOverlay(JNIEnv *en
 	U_LOG_I("service: TYPE_APPLICATION_OVERLAY created, ANativeWindow %p (#558 P1)", (void *)win);
 }
 
+// #558: true when overlay mode is enabled (debug.dxr.overlay). MonadoImpl gates
+// "the service owns the on-screen surface" on this AND the draw-over-apps
+// permission — so a normal app (permission happens to be granted, but overlay
+// mode off) publishes its own client surface and renders in its own window
+// instead of being handed a service overlay (which left it black + input-dead).
+extern "C" JNIEXPORT jboolean JNICALL
+Java_org_freedesktop_monado_ipc_MonadoImpl_nativeOverlayModeEnabled(JNIEnv * /*env*/,
+                                                                    jobject /*thiz*/)
+{
+	char prop[PROP_VALUE_MAX] = {};
+	return (__system_property_get("debug.dxr.overlay", prop) > 0 && prop[0] == '1') ? JNI_TRUE
+	                                                                                 : JNI_FALSE;
+}
+
 // #558: authoritative teardown of the service-owned overlay, called from
 // MonadoImpl.shutdown() (← MonadoService.onDestroy) when the runtime service is
 // going away. Runs on the service main thread (JNI-attached), so it reliably
