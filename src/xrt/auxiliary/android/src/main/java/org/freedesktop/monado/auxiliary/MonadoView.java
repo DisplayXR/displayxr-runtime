@@ -346,15 +346,29 @@ public class MonadoView extends SurfaceView
      */
     @Keep
     public static void removeFromWindow(@NonNull MonadoView view) {
-        Handler handler = new Handler(Looper.getMainLooper());
-        handler.post(
-                () -> {
-                    Log.d(TAG, "Start removing view from window");
-                    WindowManager wm =
-                            (WindowManager)
-                                    view.getContext().getSystemService(Context.WINDOW_SERVICE);
-                    wm.removeView(view);
-                });
+        // #558: when we're already on the UI thread (e.g. the service's onDestroy →
+        // MonadoImpl.shutdown → nativeDestroyServiceOverlay), use removeViewImmediate:
+        // it detaches the view synchronously. Plain removeView() only *schedules*
+        // the removal for the next looper traversal — which never runs when the
+        // service's MainLooper is shutting down, so the overlay's last frame stays
+        // frozen on the launcher. Off the UI thread, post a normal removeView.
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            Log.d(TAG, "Removing view from window (immediate)");
+            WindowManager wm =
+                    (WindowManager) view.getContext().getSystemService(Context.WINDOW_SERVICE);
+            wm.removeViewImmediate(view);
+        } else {
+            new Handler(Looper.getMainLooper())
+                    .post(
+                            () -> {
+                                Log.d(TAG, "Start removing view from window");
+                                WindowManager wm =
+                                        (WindowManager)
+                                                view.getContext()
+                                                        .getSystemService(Context.WINDOW_SERVICE);
+                                wm.removeView(view);
+                            });
+        }
     }
 
     @NonNull @Keep
