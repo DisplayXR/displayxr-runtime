@@ -74,6 +74,10 @@ static float g_cameraM2v = 1.0f;
 // (perspective + pose). 0 = not captured yet (falls back to full display size).
 static float g_canvasWidthM = 0.0f;
 static float g_canvasHeightM = 0.0f;
+
+// Initial virtual display height, snapshotted at startup. SPACE resets the rig
+// to exactly this initial display-centric state (see ResetToInitialState).
+static float g_initialVHeight = 0.24f;
 static const float HUD_WIDTH_FRACTION = 0.30f;
 
 // Fullscreen state
@@ -319,12 +323,43 @@ static bool TryRigRoundtripToggle() {
     return true;
 }
 
+// SPACE = hard reset to the app's initial state: display-centric rig, pose at
+// origin (0,0,0) / identity orientation, the original vHeight, and every other
+// tunable at its default. Deliberately dumb and absolute (no conversion, no
+// dependence on the current rig) so there is no room for drift — the cube
+// always snaps back to exactly the launch view. Replaces the shared handler's
+// reset, which left g_cameraM2v / cameraMode stale (skewed-cube bug).
+static void ResetToInitialState() {
+    InputState& st = g_inputState;
+    st.cameraMode = false;                 // display-centric
+    st.cameraPosX = 0.0f;                   // pose at origin
+    st.cameraPosY = 0.0f;
+    st.cameraPosZ = 0.0f;
+    st.yaw = 0.0f;                          // identity orientation
+    st.pitch = 0.0f;
+    st.viewParams = ViewParams{};           // ipd/parallax/perspective/scale=1, conv=0.5, zoom=1
+    st.viewParams.virtualDisplayHeight = g_initialVHeight;
+    g_cameraM2v = 1.0f;                     // app-local camera scale back to identity
+    // Cancel any in-flight pose animation so it can't drive the pose post-reset.
+    st.resetViewRequested = false;
+    st.transitioning = false;
+    st.teleportAnimating = false;
+    st.animateEnabled = false;
+    st.animationActive = false;
+    LOG_INFO("rig RESET (SPACE): display-centric, pose (0,0,0)/identity, vHeight=%.4f", g_initialVHeight);
+}
+
 // Window procedure (runs on main thread — single-threaded, no locking needed)
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     // 'C' = disturbance-free rig round-trip (see TryRigRoundtripToggle). Handle
     // it before the shared UpdateInputState, which would otherwise reset the
     // camera params. Falls through to the shared toggle if display info isn't up.
     if (msg == WM_KEYDOWN && wParam == 'C' && TryRigRoundtripToggle()) {
+        return 0;
+    }
+    // SPACE = hard reset to the initial display-centric state (drift-free).
+    if (msg == WM_KEYDOWN && wParam == VK_SPACE) {
+        ResetToInitialState();
         return 0;
     }
     UpdateInputState(g_inputState, msg, wParam, lParam);
@@ -1537,6 +1572,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Set virtual display height (app units). 0.24 = 4x the 0.06m cube height.
     g_inputState.viewParams.virtualDisplayHeight = 0.24f;
+    g_initialVHeight = g_inputState.viewParams.virtualDisplayHeight; // SPACE-reset target
     g_inputState.nominalViewerZ = xr.nominalViewerZ;
     g_inputState.renderingModeCount = xr.renderingModeCount;
 
