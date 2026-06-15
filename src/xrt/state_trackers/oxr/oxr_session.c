@@ -1738,10 +1738,17 @@ oxr_session_locate_views(struct oxr_logger *log,
 			if (sinfo->nominal_viewer_z_m > 0.0f) {
 				float ipd_m = sess->ipd_meters;
 				eye_count = 2;
-				adj_eyes[0] = (struct xrt_eye_position){
-				    -ipd_m / 2.0f, sinfo->nominal_viewer_y_m, sinfo->nominal_viewer_z_m};
-				adj_eyes[1] = (struct xrt_eye_position){
-				    ipd_m / 2.0f, sinfo->nominal_viewer_y_m, sinfo->nominal_viewer_z_m};
+				// Untracked → the eye sits at the REFERENCE: directly in front
+				// of the display centre at the nominal distance, i.e. (0,0,Nz).
+				// nominal_y must NOT leak into the eye: an eye lateral offset
+				// shears the frustum (dy = (eye_y - 0)*invd), so a non-zero
+				// nominal_y would tilt the untracked frustum vertically — a
+				// residual Y shift the display rig (convergence-locked) cannot
+				// reproduce, so the camera/display rigs would disagree.
+				// nominal_y belongs only to the parallax / zero-parallax pivot
+				// (the `nominal` vector below), never to the eye position.
+				adj_eyes[0] = (struct xrt_eye_position){-ipd_m / 2.0f, 0.0f, sinfo->nominal_viewer_z_m};
+				adj_eyes[1] = (struct xrt_eye_position){ipd_m / 2.0f, 0.0f, sinfo->nominal_viewer_z_m};
 				have_eye_positions = true;
 				if (should_log) {
 					U_LOG_I("Nominal eyes: [0]=(%.4f,%.4f,%.4f) [1]=(%.4f,%.4f,%.4f), IPD=%.1fmm",
