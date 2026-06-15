@@ -62,9 +62,19 @@ cmake --build "$BUILD_DIR"
 # /opt/homebrew/opt/jsoncpp/lib/libjsoncpp.26.dylib dependency, which
 # breaks redistribution (Unity/Unreal apps that bundle the loader fail
 # on end-user machines without Homebrew jsoncpp). See issue #205.
-if [ ! -f "$OPENXR_DIR/lib/libopenxr_loader.dylib" ]; then
+# Treat the install as cached only when BOTH the dylib AND the CMake package
+# config exist. A partial install — e.g. an interrupted `cmake --install` that
+# left libopenxr_loader.dylib but no lib/cmake/openxr/OpenXRConfig.cmake — used
+# to satisfy a dylib-only guard, so the rebuild was skipped and the broken tree
+# persisted. Without the config, every test app's `find_package(OpenXR CONFIG)`
+# fails and falls through to an include-less fallback imported target, so the
+# displayxr_common math lib can't find <openxr/openxr.h> and the build dies.
+# OpenXRConfig.cmake is the last artifact `cmake --install` writes, so gating on
+# it makes a partial install self-heal instead of poisoning every build. (#575)
+if [ ! -f "$OPENXR_DIR/lib/libopenxr_loader.dylib" ] || \
+   [ ! -f "$OPENXR_DIR/lib/cmake/openxr/OpenXRConfig.cmake" ]; then
   echo "=== Building OpenXR loader ==="
-  rm -rf /tmp/openxr-sdk
+  rm -rf /tmp/openxr-sdk "$OPENXR_DIR"   # wipe any partial/corrupt prior install
   git clone --depth 1 --branch "release-$OPENXR_VERSION" \
     https://github.com/KhronosGroup/OpenXR-SDK-Source.git /tmp/openxr-sdk
 
