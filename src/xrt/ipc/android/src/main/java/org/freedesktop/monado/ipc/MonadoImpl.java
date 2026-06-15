@@ -109,6 +109,11 @@ public class MonadoImpl extends IMonado.Stub {
 
     public void shutdown() {
         Log.i(TAG, "shutdown");
+        // #558: authoritatively tear down the service-owned overlay before the
+        // server stops, so its last weaved frame doesn't linger frozen on the
+        // launcher when the service is destroyed. Idempotent + no-op when there's
+        // no overlay (non-overlay sessions).
+        nativeDestroyServiceOverlay();
         nativeShutdownServer();
     }
 
@@ -146,6 +151,14 @@ public class MonadoImpl extends IMonado.Stub {
      */
     @SuppressWarnings("JavaJniMissingFunction")
     private native void nativeCreateServiceOverlay();
+
+    /**
+     * Destroy the service-owned overlay (#558). Called from {@link #shutdown()} when
+     * the runtime service is going away, so the overlay's last frame doesn't linger
+     * frozen on the launcher. Idempotent.
+     */
+    @SuppressWarnings("JavaJniMissingFunction")
+    private native void nativeDestroyServiceOverlay();
 
     /**
      * Native handling of the client's surface being destroyed (background → file picker etc.):

@@ -246,6 +246,28 @@ Java_org_freedesktop_monado_ipc_MonadoImpl_nativeCreateServiceOverlay(JNIEnv *en
 	U_LOG_I("service: TYPE_APPLICATION_OVERLAY created, ANativeWindow %p (#558 P1)", (void *)win);
 }
 
+// #558: authoritative teardown of the service-owned overlay, called from
+// MonadoImpl.shutdown() (← MonadoService.onDestroy) when the runtime service is
+// going away. Runs on the service main thread (JNI-attached), so it reliably
+// removes the MonadoView even when the IPC last-client-disconnect teardown races
+// the Android service-shutdown lifecycle (onUnbind/onPrepareShutdown), which on
+// some ROMs orphaned the overlay and left a frozen frame on the launcher.
+// Idempotent: a no-op once the surface is gone (e.g. the IPC path got there first).
+extern "C" JNIEXPORT void JNICALL
+Java_org_freedesktop_monado_ipc_MonadoImpl_nativeDestroyServiceOverlay(JNIEnv *env, jobject thiz)
+{
+	jni::init(env);
+	struct android_custom_surface *cs =
+	    (struct android_custom_surface *)android_globals_get_custom_surface();
+	if (cs == nullptr) {
+		return;
+	}
+	android_globals_set_custom_surface(nullptr);
+	android_globals_clear_window();
+	android_custom_surface_destroy(&cs);
+	U_LOG_I("service: TYPE_APPLICATION_OVERLAY destroyed on shutdown (#558)");
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_org_freedesktop_monado_ipc_MonadoImpl_nativeClearAppSurface(JNIEnv *env, jobject thiz)
 {

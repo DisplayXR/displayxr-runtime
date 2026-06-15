@@ -22,11 +22,6 @@
 #include "d3d11_service/comp_d3d11_service.h"
 #endif
 
-#ifdef XRT_OS_ANDROID
-#include "android/android_globals.h"
-#include "android/android_custom_surface.h"
-#endif
-
 #ifndef XRT_OS_WINDOWS
 
 #include <unistd.h>
@@ -200,29 +195,11 @@ common_shutdown(volatile struct ipc_client_state *ics)
 #endif
 		}
 	}
-
-#ifdef XRT_OS_ANDROID
-	// #558 service overlay: when the LAST client disconnects (e.g. the avatar's
-	// task is swiped away from recents), tear down the service-owned
-	// TYPE_APPLICATION_OVERLAY so its last weaved frame clears off the launcher
-	// instead of lingering frozen on top. The overlay was kept process-wide for
-	// reuse across client restarts, but that persisted surface also stalls a
-	// reconnecting client (the stale-overlay stall, #558) — destroying it on the
-	// last disconnect fixes both; the next client recreates a fresh overlay.
-	// connected_client_count was decremented above (read here lock-free, like the
-	// exit_when_idle check). Clear the globals BEFORE destroying so a racing
-	// reconnect recreates rather than grabbing a half-torn surface.
-	if (ics->server->global_state.connected_client_count == 0) {
-		struct android_custom_surface *cs =
-		    (struct android_custom_surface *)android_globals_get_custom_surface();
-		if (cs != NULL) {
-			IPC_WARN(ics->server, "Last client disconnected — tearing down service overlay (#558)");
-			android_globals_set_custom_surface(NULL);
-			android_globals_clear_window();
-			android_custom_surface_destroy(&cs);
-		}
-	}
-#endif
+	// #558 service-overlay teardown is NOT done here: tearing it down on the IPC
+	// client thread races the Android service-shutdown lifecycle and posts an
+	// async removeView to a dying MainLooper, leaving a frozen frame. It's handled
+	// authoritatively from MonadoImpl.shutdown() (← MonadoService.onDestroy, on the
+	// main thread) via nativeDestroyServiceOverlay() instead.
 }
 
 
