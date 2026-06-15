@@ -2209,6 +2209,7 @@ struct oxr_view_rig_state
 	// Camera-rig tunables.
 	float inv_convergence_distance;
 	float half_tan_vfov;
+	float m2v; //!< meters→world scale on the eye (XrCameraRigEXT::metersToVirtual; 0/unset → 1.0)
 
 	// Shared tunables.
 	float ipd_factor;

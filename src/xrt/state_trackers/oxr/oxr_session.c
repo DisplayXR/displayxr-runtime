@@ -1394,6 +1394,10 @@ view_rig_update_from_chain(struct oxr_session *sess, const XrViewLocateInfo *vie
 		rig->inv_convergence_distance = view_rig_clampf(crig->convergenceDiopters, 0.0f, 20.0f, &clamped);
 		float vfov = view_rig_clampf(crig->verticalFov, 0.01f, 3.13f, &clamped);
 		rig->half_tan_vfov = tanf(vfov * 0.5f);
+		// metersToVirtual 0/unset → 1.0 (pre-v3 behavior: world unit == meter).
+		rig->m2v = crig->metersToVirtual > 0.0f
+		               ? view_rig_clampf(crig->metersToVirtual, 0.0001f, 100000.0f, &clamped)
+		               : 1.0f;
 	} else {
 		rig->type = OXR_VIEW_RIG_DISPLAY;
 		rig->pose = (struct xrt_pose){
@@ -1966,6 +1970,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 						    .parallax_factor = sess->view_rig.parallax_factor,
 						    .inv_convergence_distance = sess->view_rig.inv_convergence_distance,
 						    .half_tan_vfov = sess->view_rig.half_tan_vfov,
+						    .m2v = sess->view_rig.m2v,
 						};
 					} else {
 						ct = (dxr_camera3d_tunables){

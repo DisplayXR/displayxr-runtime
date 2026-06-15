@@ -20,7 +20,7 @@ set(DISPLAYXR_XRT_INCLUDE_DIR "${_dxr_xrt_includes}" CACHE PATH "" FORCE)
 FetchContent_Declare(
 	displayxr_common
 	GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-	GIT_TAG v1.0.1
+	GIT_TAG v1.0.2
 	GIT_SHALLOW TRUE
 	)
 FetchContent_MakeAvailable(displayxr_common)

@@ -47,7 +47,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_view_rig 1
-#define XR_EXT_view_rig_SPEC_VERSION 2
+#define XR_EXT_view_rig_SPEC_VERSION 3
 #define XR_EXT_VIEW_RIG_EXTENSION_NAME "XR_EXT_view_rig"
 
 // Reserved 1000999xxx range, next free block after mcp_tools (…130-132).
@@ -84,6 +84,12 @@ typedef struct XrDisplayRigEXT {
  * inverse convergence distance the math consumes; verticalFov converts to
  * half-tan at the boundary). Out-of-range values are clamped (one-shot WARN),
  * never rejected.
+ *
+ * metersToVirtual (spec v3) scales tracked head motion (meters) into the app's
+ * world units in the modelview; with it, convergenceDiopters is the inverse
+ * convergence distance in WORLD units (it reduces to 1/m when
+ * metersToVirtual == 1). 0 (or unset) is treated as 1.0, preserving the
+ * pre-v3 behavior where one world unit was implicitly one meter.
  */
 typedef struct XrCameraRigEXT {
     XrStructureType          type;   //!< Must be XR_TYPE_CAMERA_RIG_EXT
@@ -91,8 +97,9 @@ typedef struct XrCameraRigEXT {
     XrPosef pose;                  //!< camera pose in the locate space
     float   ipdFactor;             //!< [0,1] multiplies view-pose spread about the center
     float   parallaxFactor;        //!< [0,1] lerps eye centroid toward nominal viewer
-    float   convergenceDiopters;   //!< 1/m to the convergence plane; 0 = infinity
+    float   convergenceDiopters;   //!< 1/(convergence distance in world units); 0 = infinity
     float   verticalFov;           //!< radians, full vertical angle
+    float   metersToVirtual;       //!< meters→world scale on the eye; 0/unset = 1.0 (spec v3)
 } XrCameraRigEXT;
 
 // ---- Result: app chains this on XrViewState::next; runtime fills it. ----
