@@ -57,6 +57,7 @@
 #include <unistd.h>
 
 #include "view_params.h"
+#include "rig_mode.h"
 #include "projection_depth.h"
 #include "atlas_capture.h"
 #include "xr_window_space_hud.h"
@@ -188,6 +189,10 @@ struct InputState {
     // Camera vs display mode toggle (C key)
     bool cameraMode = false;
     float nominalViewerZ = 0.5f;  // Cached from runtime for camera-mode init
+    bool rigModeToggleRequested = false;
+    float canvasWidthM = 0.0f;
+    float canvasHeightM = 0.0f;
+    float initialVirtualDisplayHeight = 0.0f;
 
     // Eye tracking mode toggle (T key)
     bool eyeTrackingModeToggleRequested = false;
@@ -1912,23 +1917,7 @@ static void PumpMacOSEvents() {
                         g_input.captureAtlasRequested = true;
                     }
                     else if (ch == 'c' && !isRepeat) {
-                        g_input.cameraMode = !g_input.cameraMode;
-                        if (g_input.cameraMode) {
-                            g_input.cameraPosX = 0.0f;
-                            g_input.cameraPosY = 0.0f;
-                            g_input.cameraPosZ = g_input.nominalViewerZ;
-                            g_input.yaw = 0.0f;
-                            g_input.pitch = 0.0f;
-                            if (g_input.nominalViewerZ > 0.0f)
-                                g_input.viewParams.invConvergenceDistance = 1.0f / g_input.nominalViewerZ;
-                            g_input.viewParams.zoomFactor = 1.0f;
-                        } else {
-                            g_input.cameraPosX = 0.0f;
-                            g_input.cameraPosY = 0.0f;
-                            g_input.cameraPosZ = 0.0f;
-                            g_input.yaw = 0.0f;
-                            g_input.pitch = 0.0f;
-                        }
+                        g_input.rigModeToggleRequested = true;
                     }
                     else if (ch >= '0' && ch <= '8' && !isRepeat) {
                         g_input.absoluteRenderingModeRequested = (int32_t)(ch - '0');
@@ -1969,23 +1958,35 @@ static void PumpMacOSEvents() {
 // ============================================================================
 
 static void UpdateCameraMovement(InputState& state, float deltaTime, float displayHeightM = 0.0f) {
+    // Absolute SPACE reset — snap back to the initial DISPLAY-centric state via
+    // the shared helper (display rig, pose origin/identity, initial vHeight,
+    // every tunable default incl. cameraM2v=1).
     if (state.resetViewRequested) {
-        state.yaw = state.pitch = 0.0f;
-        float savedVDH = state.viewParams.virtualDisplayHeight;
-        bool savedCameraMode = state.cameraMode;
-        state.viewParams = ViewParams{};
-        state.viewParams.virtualDisplayHeight = savedVDH;
-        state.cameraMode = savedCameraMode;
-        if (state.cameraMode) {
-            state.cameraPosX = 0.0f;
-            state.cameraPosY = 0.0f;
-            state.cameraPosZ = state.nominalViewerZ;
-            if (state.nominalViewerZ > 0.0f)
-                state.viewParams.invConvergenceDistance = 1.0f / state.nominalViewerZ;
-        } else {
-            state.cameraPosX = state.cameraPosY = state.cameraPosZ = 0.0f;
-        }
         state.resetViewRequested = false;
+        float pos[3] = {state.cameraPosX, state.cameraPosY, state.cameraPosZ};
+        dxr::RigResetToInitial(state.viewParams, state.cameraMode, pos, state.yaw, state.pitch,
+                               state.initialVirtualDisplayHeight);
+        state.cameraPosX = pos[0];
+        state.cameraPosY = pos[1];
+        state.cameraPosZ = pos[2];
+        return;
+    }
+
+    // Disturbance-free rig round-trip toggle (C key) — delegate to the shared
+    // converter so macOS and Windows apps behave identically. Pass the same
+    // orientation quaternion the app submits to the runtime, plus the CANVAS
+    // size the runtime renders into (NOT the full display).
+    if (state.rigModeToggleRequested) {
+        state.rigModeToggleRequested = false;
+        XrQuaternionf rq;
+        quat_from_yaw_pitch(state.yaw, state.pitch, &rq);
+        const float quat[4] = {rq.x, rq.y, rq.z, rq.w};
+        float pos[3] = {state.cameraPosX, state.cameraPosY, state.cameraPosZ};
+        dxr::RigToggleMode(state.viewParams, state.cameraMode, pos, quat, state.canvasWidthM,
+                           state.canvasHeightM, state.nominalViewerZ, displayHeightM);
+        state.cameraPosX = pos[0];
+        state.cameraPosY = pos[1];
+        state.cameraPosZ = pos[2];
         return;
     }
 
@@ -3539,6 +3540,7 @@ int main() {
     }
 
     g_input.viewParams.virtualDisplayHeight = 0.24f;
+    g_input.initialVirtualDisplayHeight = g_input.viewParams.virtualDisplayHeight;
     g_input.nominalViewerZ = xr.nominalViewerZ;
 
     LOG_INFO("=== Entering main loop ===");
@@ -3713,6 +3715,7 @@ int main() {
                             cameraRig.convergenceDiopters = g_input.viewParams.invConvergenceDistance;
                             cameraRig.verticalFov =
                                 2.0f * atanf(CAMERA_HALF_TAN_VFOV / g_input.viewParams.zoomFactor);
+                            cameraRig.metersToVirtual = g_input.viewParams.cameraM2v;
                             locateInfo.next = &cameraRig;
                         } else {
                             displayRig.pose = rigPose;
@@ -3735,6 +3738,14 @@ int main() {
                         (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) &&
                         (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT))
                     {
+                        // Cache the runtime's CANVAS size (meters) from the raw
+                        // probe so the C-key rig round-trip toggle converts
+                        // against what the runtime actually renders into.
+                        if (useRig && viewRigRaw.canvasSizeMeters.height > 0.0f) {
+                            g_input.canvasWidthM = viewRigRaw.canvasSizeMeters.width;
+                            g_input.canvasHeightM = viewRigRaw.canvasSizeMeters.height;
+                        }
+
                         // Save display-space eye positions for the HUD. Under
                         // the rig, views[] carries render-ready world eyes —
                         // the raw channel (XrViewDisplayRawEXT) keeps the HUD

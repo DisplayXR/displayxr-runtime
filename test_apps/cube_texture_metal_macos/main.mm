@@ -56,6 +56,7 @@
 // stb_image implementation TU lives in displayxr::common (stb_image_impl_macos.cpp) — declarations only here (#396 W4).
 #include "stb_image.h"
 #include "view_params.h"
+#include "rig_mode.h"
 #include "xr_window_space_hud.h"
 #include "hud_renderer_macos.h"
 #include <openxr/XR_EXT_display_info.h>
@@ -820,6 +821,14 @@ struct InputState {
     int32_t absoluteRenderingModeRequested = -1; // 0-8 keys; -1 = none
     bool cameraMode = false;
     float nominalViewerZ = 0.5f;
+    // Disturbance-free rig round-trip (C) + absolute reset (SPACE) — delegated
+    // to the shared displayxr-common helper (common/rig_mode.{h,cpp}). The C key
+    // sets the request; the conversion runs in UpdateCameraMovement using the
+    // CANVAS size + initial vHeight fed in below.
+    bool rigModeToggleRequested = false;
+    float canvasWidthM = 0.0f;
+    float canvasHeightM = 0.0f;
+    float initialVirtualDisplayHeight = 0.0f;
 };
 static InputState g_input;
 static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18deg) -> 36deg vFOV
@@ -1459,20 +1468,9 @@ static void PumpMacOSEvents()
                         g_input.cycleRenderingModeRequested = true;
                     }
                     else if (ch == 'c' && !isRepeat) {
-                        g_input.cameraMode = !g_input.cameraMode;
-                        if (g_input.cameraMode) {
-                            g_input.cameraPosX = 0.0f;
-                            g_input.cameraPosY = 0.0f;
-                            g_input.cameraPosZ = g_input.nominalViewerZ;
-                            g_input.yaw = 0.0f;
-                            g_input.pitch = 0.0f;
-                            if (g_input.nominalViewerZ > 0.0f)
-                                g_input.viewParams.invConvergenceDistance = 1.0f / g_input.nominalViewerZ;
-                        } else {
-                            g_input.cameraPosX = g_input.cameraPosY = g_input.cameraPosZ = 0.0f;
-                            g_input.yaw = 0.0f;
-                            g_input.pitch = 0.0f;
-                        }
+                        // Disturbance-free rig round-trip — the conversion runs
+                        // in UpdateCameraMovement (it has the canvas size).
+                        g_input.rigModeToggleRequested = true;
                     }
                     else if (ch >= '0' && ch <= '8' && !isRepeat) {
                         g_input.absoluteRenderingModeRequested = (int32_t)(ch - '0');
@@ -1518,23 +1516,35 @@ static void PumpMacOSEvents()
 // ============================================================================
 
 static void UpdateCameraMovement(InputState& state, float deltaTime, float displayHeightM = 0.0f) {
+    // Absolute SPACE reset — snap back to the initial DISPLAY-centric state via
+    // the shared helper (display rig, pose origin/identity, initial vHeight,
+    // every tunable default incl. cameraM2v=1).
     if (state.resetViewRequested) {
-        state.yaw = state.pitch = 0.0f;
-        float savedVDH = state.viewParams.virtualDisplayHeight;
-        bool savedCameraMode = state.cameraMode;
-        state.viewParams = ViewParams{};
-        state.viewParams.virtualDisplayHeight = savedVDH;
-        state.cameraMode = savedCameraMode;
-        if (state.cameraMode) {
-            state.cameraPosX = 0.0f;
-            state.cameraPosY = 0.0f;
-            state.cameraPosZ = state.nominalViewerZ;
-            if (state.nominalViewerZ > 0.0f)
-                state.viewParams.invConvergenceDistance = 1.0f / state.nominalViewerZ;
-        } else {
-            state.cameraPosX = state.cameraPosY = state.cameraPosZ = 0.0f;
-        }
         state.resetViewRequested = false;
+        float pos[3] = {state.cameraPosX, state.cameraPosY, state.cameraPosZ};
+        dxr::RigResetToInitial(state.viewParams, state.cameraMode, pos, state.yaw, state.pitch,
+                               state.initialVirtualDisplayHeight);
+        state.cameraPosX = pos[0];
+        state.cameraPosY = pos[1];
+        state.cameraPosZ = pos[2];
+        return;
+    }
+
+    // Disturbance-free rig round-trip toggle (C key) — delegate to the shared
+    // converter so macOS and Windows apps behave identically. Pass the same
+    // orientation quaternion the app submits to the runtime, plus the CANVAS
+    // size the runtime renders into (NOT the full display).
+    if (state.rigModeToggleRequested) {
+        state.rigModeToggleRequested = false;
+        XrQuaternionf rq;
+        quat_from_yaw_pitch(state.yaw, state.pitch, &rq);
+        const float quat[4] = {rq.x, rq.y, rq.z, rq.w};
+        float pos[3] = {state.cameraPosX, state.cameraPosY, state.cameraPosZ};
+        dxr::RigToggleMode(state.viewParams, state.cameraMode, pos, quat, state.canvasWidthM,
+                           state.canvasHeightM, state.nominalViewerZ, displayHeightM);
+        state.cameraPosX = pos[0];
+        state.cameraPosY = pos[1];
+        state.cameraPosZ = pos[2];
         return;
     }
 
@@ -2187,6 +2197,7 @@ int main(int argc, char **argv)
     // mode 1 (default of app.currentModeIndex).
 
     g_input.viewParams.virtualDisplayHeight = 0.24f;
+    g_input.initialVirtualDisplayHeight = g_input.viewParams.virtualDisplayHeight;
     g_input.nominalViewerZ = app.nominalViewerZ;
 
     LOG_INFO("Entering main loop... (ESC to quit, drag to rotate, WASD to move, Space to reset)");
@@ -2393,6 +2404,10 @@ int main(int argc, char **argv)
                 cameraRig.convergenceDiopters = g_input.viewParams.invConvergenceDistance;
                 cameraRig.verticalFov =
                     2.0f * atanf(CAMERA_HALF_TAN_VFOV / g_input.viewParams.zoomFactor);
+                // metersToVirtual carries the eye scale the C-toggle converter
+                // derived from the display rig, so the camera rig reproduces the
+                // display rig exactly.
+                cameraRig.metersToVirtual = g_input.viewParams.cameraM2v;
                 locateInfo.next = &cameraRig;
             } else {
                 displayRig.pose = rigPose;
@@ -2408,6 +2423,14 @@ int main(int argc, char **argv)
 
         uint32_t viewCount = 0;
         xrLocateViews(app.session, &locateInfo, &viewState, (uint32_t)views.size(), &viewCount, views.data());
+
+        // Capture the runtime's resolved CANVAS size (the window client area in
+        // meters) — the physical_height_m the Kooima/rig math runs on, which the
+        // C-toggle converter must match (windowed → smaller than the display).
+        if (useRig && viewRigRaw.canvasSizeMeters.height > 0.0f) {
+            g_input.canvasWidthM = viewRigRaw.canvasSizeMeters.width;
+            g_input.canvasHeightM = viewRigRaw.canvasSizeMeters.height;
+        }
 
         // XR_EXT_view_rig raw channel (#396 W7): one-shot proof canvasRectPx
         // reports this texture app's canvas SUB-RECT (the output rect), not

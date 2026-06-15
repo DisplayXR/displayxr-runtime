@@ -1353,6 +1353,14 @@ static void RenderOneFrame(RenderState& rs) {
             XrView rawViews[8];
             for (uint32_t vi = 0; vi < 8; vi++) rawViews[vi] = {XR_TYPE_VIEW};
 
+            // XR_EXT_view_rig raw channel: chain XrViewDisplayRawEXT so the
+            // runtime reports the resolved canvas size in meters — fed into
+            // InputState below for the C-toggle / SPACE-reset converter.
+            XrViewDisplayRawEXT rawProbe = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+            if (g_hasViewRigExt) {
+                viewState.next = &rawProbe;
+            }
+
             // XR_EXT_view_rig: drive the runtime rig matching the app's
             // current mode with the app's tunables — the runtime owns the
             // window/canvas resolve + the Kooima math and returns
@@ -1379,6 +1387,10 @@ static void RenderOneFrame(RenderState& rs) {
                     cameraRig.convergenceDiopters = g_inputState.viewParams.invConvergenceDistance;
                     cameraRig.verticalFov =
                         2.0f * atanf(CAMERA_HALF_TAN_VFOV / g_inputState.viewParams.zoomFactor);
+                    // metersToVirtual carries the eye scale the C-toggle
+                    // converter derived from the display rig, so the camera
+                    // rig reproduces the display rig exactly.
+                    cameraRig.metersToVirtual = g_inputState.viewParams.cameraM2v;
                     locateInfo.next = &cameraRig;
                 } else {
                     displayRig.pose = rigPose;
@@ -1392,6 +1404,14 @@ static void RenderOneFrame(RenderState& rs) {
             }
 
             xrLocateViews(xr.session, &locateInfo, &viewState, 8, &viewCount, rawViews);
+
+            // Capture the runtime's resolved CANVAS size (the window client
+            // area in meters) so the C-toggle / SPACE-reset converter runs the
+            // rig math on the right physical_height_m.
+            if (g_hasViewRigExt && rawProbe.canvasSizeMeters.height > 0.0f) {
+                g_inputState.canvasWidthM = rawProbe.canvasSizeMeters.width;
+                g_inputState.canvasHeightM = rawProbe.canvasSizeMeters.height;
+            }
 
             // Max per-tile capacity from swapchain
             uint32_t maxTileW = tileColumns > 0 ? xr.swapchain.width / tileColumns : xr.swapchain.width;
@@ -1847,6 +1867,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Set virtual display height (app units) for the fallback rig path.
     g_inputState.viewParams.virtualDisplayHeight = 0.24f;
+    g_inputState.initialVirtualDisplayHeight = g_inputState.viewParams.virtualDisplayHeight; // SPACE-reset target
     g_inputState.nominalViewerZ = xr.nominalViewerZ;
     g_inputState.renderingModeCount = xr.renderingModeCount;
 
