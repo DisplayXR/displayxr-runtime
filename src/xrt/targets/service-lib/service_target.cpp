@@ -202,7 +202,18 @@ Java_org_freedesktop_monado_ipc_MonadoImpl_nativeCreateServiceOverlay(JNIEnv *en
 	// the overlay TRANSLUCENT so the desktop shows through. Idempotent: a second
 	// client connect is a no-op while an overlay already exists.
 	if (android_globals_get_custom_surface() != nullptr) {
-		U_LOG_I("service: overlay already created — skipping");
+		// #558 stale-overlay-stall fix: the service overlay persists across client
+		// (avatar) restarts — its MonadoView + surface stay attached to the service
+		// window — but the PRIOR client's compositor released its ANativeWindow ref
+		// and the published window was left stale/invalid, so a NEW client's
+		// comp_window_android_init_swapchain stalls polling for a valid window
+		// (previously only a runtime reinstall, which kills the service, cleared it).
+		// Re-publish a fresh ANativeWindow ref from the live overlay surface for the
+		// new client instead of skipping.
+		struct android_custom_surface *cs =
+		    (struct android_custom_surface *)android_globals_get_custom_surface();
+		android_custom_surface_refresh_window(cs);
+		U_LOG_I("service: overlay reused — refreshed window for new client (#558)");
 		return;
 	}
 
