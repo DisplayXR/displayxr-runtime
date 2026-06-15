@@ -61,8 +61,8 @@ public class MonadoImpl extends IMonado.Stub {
         // surface, so create our own TYPE_APPLICATION_OVERLAY before the
         // compositor (started by nativeAddClient) begins polling for a surface.
         // Idempotent native-side, so repeated connects are safe.
-        if (Settings.canDrawOverlays(context)) {
-            Log.i(TAG, "connect: overlay permission held — creating service overlay");
+        if (canDrawOverOtherApps()) {
+            Log.i(TAG, "connect: overlay mode — creating service overlay");
             nativeCreateServiceOverlay();
         }
         if (nativeAddClient(fd) != 0) {
@@ -97,8 +97,15 @@ public class MonadoImpl extends IMonado.Stub {
 
     @Override
     public boolean canDrawOverOtherApps() {
-        Log.i(TAG, "canDrawOverOtherApps");
-        return Settings.canDrawOverlays(context);
+        // #558: this means "the SERVICE owns the on-screen surface (overlay mode)",
+        // which both the client (whether to publish its own surface, Client.java)
+        // and the service watchdog (MonadoService) key on. That requires BOTH the
+        // draw-over-apps permission AND overlay mode (debug.dxr.overlay) — the
+        // permission alone is not enough, or a normal app (permission granted but
+        // not overlay mode) would skip its surface and get a blank service overlay.
+        boolean overlay = Settings.canDrawOverlays(context) && nativeOverlayModeEnabled();
+        Log.i(TAG, "canDrawOverOtherApps (overlay mode) = " + overlay);
+        return overlay;
     }
 
     @Override
@@ -159,6 +166,10 @@ public class MonadoImpl extends IMonado.Stub {
      */
     @SuppressWarnings("JavaJniMissingFunction")
     private native void nativeDestroyServiceOverlay();
+
+    /** True when overlay mode (debug.dxr.overlay) is enabled — see canDrawOverOtherApps. */
+    @SuppressWarnings("JavaJniMissingFunction")
+    private native boolean nativeOverlayModeEnabled();
 
     /**
      * Native handling of the client's surface being destroyed (background → file picker etc.):
