@@ -59,6 +59,7 @@ Full reference: `docs/architecture/extension-vs-legacy.md`. `_handle` and `_text
 ### Key notes
 - Compositor vtable has 56 methods — use the `comp_base` helper for boilerplate.
 - **Two distinct swapchains** and the **canvas concept** (view dims + Kooima projection use canvas size, not display size): `docs/specs/runtime/swapchain-model.md`.
+- **Crop before the DP is the law; zero-copy is the rare exception.** The app swapchain is worst-case-sized across all modes (ADR-010), so the compositor must crop to the active mode's content dims before `process_atlas()` — *unless* the submission exactly fills the swapchain (`u_tiling_can_zero_copy()` is the *sole* gate; no per-call-site proxies like `view_count>1` or hardware-flag coupling). That coincidence only happens full-screen in the worst-case-filling mode (Windows Leia: 2D only; Android: never). ADR-030 + `docs/specs/runtime/multiview-tiling.md#zero-copy-eligibility--the-single-rule`.
 
 ### Vendor plug-in integration
 Vendor display drivers ship as **plug-in DLLs** from their own repos (ADR-019). `DisplayXR-LeiaSR.dll` (from `displayxr-leia-plugin`'s `src/drv_leia/`, entry point `xrtPluginNegotiate`) loads at `xrCreateInstance` via registry-driven discovery on Windows / JSON-manifest discovery on POSIX (`target_plugin_loader.c`). The runtime DLL has zero SR or `sim_display_*` identifiers in its link line (ADR-019 §2.1; CI-asserted in `build-windows.yml`). Eye tracking and display dimensions come through `iface->get_display_info` → `xrt_plugin_display_info` — no direct runtime → vendor call.
