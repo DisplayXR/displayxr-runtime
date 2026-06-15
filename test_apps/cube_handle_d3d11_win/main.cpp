@@ -22,6 +22,7 @@
 #include "xr_session.h"
 #include "projection_depth.h"
 #include "atlas_capture.h"
+#include <dxr_view_math.h>  // display<->camera rig converters (disturbance-free C-toggle test)
 
 #include <chrono>
 #include <cmath>
@@ -61,6 +62,10 @@ static bool g_inSizeMove = false;  // True while user is dragging/resizing the w
 static const uint32_t HUD_PIXEL_WIDTH = 380;
 static const uint32_t HUD_PIXEL_HEIGHT = 470;
 static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18°) → 36° vFOV
+// Camera-rig meters→world scale (XrCameraRigEXT::metersToVirtual). The C-toggle
+// converter (TryRigRoundtripToggle) derives this from the display rig so the
+// camera rig reproduces the display rig's eye scaling exactly; default 1.0.
+static float g_cameraM2v = 1.0f;
 static const float HUD_WIDTH_FRACTION = 0.30f;
 
 // Fullscreen state
@@ -206,8 +211,107 @@ static void ToggleFullscreen(HWND hwnd) {
     }
 }
 
+// Disturbance-free rig round-trip test ('C' key).
+//
+// Instead of the shared input handler's behavior (C flips cameraMode and RESETS
+// the camera params to arbitrary defaults — a visible pop), C here converts the
+// CURRENT rig into its exact equivalent in the OTHER parameterization using the
+// shipped displayxr-common converters, then renders through that rig. Because
+// display→camera is always exact and camera→display is exact for the
+// (compatible) camera rig display→camera produces, the rendered view does not
+// change across the toggle — and display→camera→display is an identity, so
+// pressing C repeatedly never moves the cube, for ANY starting display rig
+// (change ipd / parallax / perspective / vHeight / pose first and it still
+// holds). Manually perturbing the camera rig into a non-compatible convergence
+// is the one case that legitimately can't round-trip (the display rig pins
+// convergence to the display plane); the returned residual flags it.
+//
+// Returns false if display info isn't available yet — caller falls back to the
+// plain shared toggle.
+static bool TryRigRoundtripToggle() {
+    if (g_xr == nullptr || g_xr->displayHeightM <= 0.0f || g_xr->nominalViewerZ <= 0.0f) {
+        return false;
+    }
+    InputState& st = g_inputState;
+
+    dxr_rig_display_info info;
+    info.physical_height_m = g_xr->displayHeightM;
+    info.aspect = g_xr->displayWidthM / g_xr->displayHeightM;
+    info.nominal_distance_m = g_xr->nominalViewerZ;
+
+    // Current rig pose — same construction as the per-frame rigPose in the
+    // locate loop (orientation from yaw/pitch, position from cameraPos). The
+    // converters preserve orientation and only translate the pose, so yaw/pitch
+    // stay put and we write back position only.
+    XMFLOAT4 rq;
+    XMStoreFloat4(&rq, XMQuaternionRotationRollPitchYaw(st.pitch, st.yaw, 0.0f));
+    const dxr_quat q = {rq.x, rq.y, rq.z, rq.w};
+    const dxr_vec3 pos = {st.cameraPosX, st.cameraPosY, st.cameraPosZ};
+
+    if (!st.cameraMode) {
+        // Display → camera.
+        dxr_display_rig disp;
+        disp.pose.orientation = q;
+        disp.pose.position = pos;
+        disp.virtual_display_height = st.viewParams.virtualDisplayHeight / st.viewParams.scaleFactor;
+        disp.ipd_factor = st.viewParams.ipdFactor;
+        disp.parallax_factor = st.viewParams.parallaxFactor;
+        disp.perspective_factor = st.viewParams.perspectiveFactor;
+
+        dxr_camera_rig cam;
+        dxr_view_rig_display_to_camera(&disp, &info, &cam);
+
+        st.viewParams.invConvergenceDistance = cam.inv_convergence_distance;
+        st.viewParams.zoomFactor = CAMERA_HALF_TAN_VFOV / cam.half_tan_vfov;
+        g_cameraM2v = cam.m2v;
+        st.viewParams.ipdFactor = cam.ipd_factor;
+        st.viewParams.parallaxFactor = cam.parallax_factor;
+        st.cameraPosX = cam.pose.position.x;
+        st.cameraPosY = cam.pose.position.y;
+        st.cameraPosZ = cam.pose.position.z;
+        st.cameraMode = true;
+        LOG_INFO("rig C-toggle DISPLAY->CAMERA: convergence=%.4f zoom=%.4f m2v=%.4f pos=(%.3f,%.3f,%.3f)",
+                 st.viewParams.invConvergenceDistance, st.viewParams.zoomFactor, g_cameraM2v,
+                 st.cameraPosX, st.cameraPosY, st.cameraPosZ);
+    } else {
+        // Camera → display.
+        dxr_camera_rig cam;
+        cam.pose.orientation = q;
+        cam.pose.position = pos;
+        cam.ipd_factor = st.viewParams.ipdFactor;
+        cam.parallax_factor = st.viewParams.parallaxFactor;
+        cam.inv_convergence_distance = st.viewParams.invConvergenceDistance;
+        cam.half_tan_vfov = CAMERA_HALF_TAN_VFOV / st.viewParams.zoomFactor;
+        cam.m2v = g_cameraM2v;
+
+        dxr_display_rig disp;
+        const float residual = dxr_view_rig_camera_to_display(&cam, &info, &disp);
+
+        // Preserve the user's display-mode scaleFactor: the rig submits
+        // virtualDisplayHeight/scaleFactor, so scale the converter's vH up by it.
+        st.viewParams.virtualDisplayHeight = disp.virtual_display_height * st.viewParams.scaleFactor;
+        st.viewParams.perspectiveFactor = disp.perspective_factor;
+        st.viewParams.ipdFactor = disp.ipd_factor;
+        st.viewParams.parallaxFactor = disp.parallax_factor;
+        st.cameraPosX = disp.pose.position.x;
+        st.cameraPosY = disp.pose.position.y;
+        st.cameraPosZ = disp.pose.position.z;
+        st.cameraMode = false;
+        LOG_INFO("rig C-toggle CAMERA->DISPLAY: vH=%.4f persp=%.4f pos=(%.3f,%.3f,%.3f) residual=%.5f (0=exact)",
+                 st.viewParams.virtualDisplayHeight, st.viewParams.perspectiveFactor,
+                 st.cameraPosX, st.cameraPosY, st.cameraPosZ, residual);
+    }
+    return true;
+}
+
 // Window procedure (runs on main thread — single-threaded, no locking needed)
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    // 'C' = disturbance-free rig round-trip (see TryRigRoundtripToggle). Handle
+    // it before the shared UpdateInputState, which would otherwise reset the
+    // camera params. Falls through to the shared toggle if display info isn't up.
+    if (msg == WM_KEYDOWN && wParam == 'C' && TryRigRoundtripToggle()) {
+        return 0;
+    }
     UpdateInputState(g_inputState, msg, wParam, lParam);
 
     switch (msg) {
@@ -737,6 +841,10 @@ static void RenderOneFrame(RenderState& rs) {
                             cameraRig.convergenceDiopters = g_inputState.viewParams.invConvergenceDistance;
                             cameraRig.verticalFov =
                                 2.0f * atanf(CAMERA_HALF_TAN_VFOV / g_inputState.viewParams.zoomFactor);
+                            // metersToVirtual carries the eye scale the C-toggle
+                            // converter derived from the display rig, so the
+                            // camera rig reproduces the display rig exactly.
+                            cameraRig.metersToVirtual = g_cameraM2v;
                             locateInfo.next = &cameraRig;
                         } else {
                             displayRig.pose = rigPose;
@@ -869,7 +977,7 @@ static void RenderOneFrame(RenderState& rs) {
                                 wchar_t vhBuf[64];
                                 if (g_inputState.cameraMode) {
                                     float tanHFOV = CAMERA_HALF_TAN_VFOV / g_inputState.viewParams.zoomFactor;
-                                    swprintf(vhBuf, 64, L"\ntanHFOV: %.3f", tanHFOV);
+                                    swprintf(vhBuf, 64, L"\ntanHFOV: %.3f  m2v: %.3f", tanHFOV, g_cameraM2v);
                                 } else {
                                     float hudM2v = 1.0f;
                                     if (g_inputState.viewParams.virtualDisplayHeight > 0.0f && xr.displayHeightM > 0.0f)
