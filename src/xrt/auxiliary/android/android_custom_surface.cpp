@@ -127,13 +127,16 @@ android_custom_surface_async_start(
 			Display display = dm.getDisplay(display_id);
 			displayContext = ctx.createDisplayContext(display);
 			type = WindowManager_LayoutParams::TYPE_APPLICATION_OVERLAY();
-			// #558 P3: the service overlay floats over the LIVE launcher and must
-			// pass touches through. We do NOT use FLAG_NOT_TOUCHABLE — Android
-			// clamps such a system overlay to <=0.80 window alpha (anti-tapjacking),
-			// and an 0.80 whole-window blend destroys the LeiaSR per-pixel interlace
-			// → the weave looks 2D. Instead MonadoView sets an empty touchable
-			// REGION (no flag, no alpha clamp): full passthrough, full-opacity 3D
-			// weave. See MonadoView.installPassthroughTouchRegion().
+			// #558: the service overlay floats over the LIVE launcher, so it MUST
+			// pass touches through — otherwise it eats every tap (launcher, system
+			// dialogs like the battery-optimization prompt, everything). The
+			// per-region touchable API that would pass-through-except-the-tiger is
+			// @hide and this ROM blocks the reflection bypass, so use
+			// FLAG_NOT_TOUCHABLE (full passthrough). Android clamps such an overlay
+			// to <=0.80 window alpha (anti-tapjacking) — that only DIMS the weave; it
+			// does NOT flatten the 3D (the earlier "flat" was MANAGED NoFaceMode,
+			// since fixed). Tiger touch comes from a separate small input overlay.
+			flags |= WindowManager_LayoutParams::FLAG_NOT_TOUCHABLE();
 		}
 
 		int32_t width = 0;
