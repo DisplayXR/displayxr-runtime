@@ -405,6 +405,31 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		}
 	}
 
+	// #575: render input — 2D / mono collapses to a CENTERED eye so the
+	// off-axis Kooima frustum is symmetric and matches the centered pose oxr
+	// derives for mono (active_view_count==1). The gate is the ACTIVE mode's
+	// view count, forwarded by the client in rig->render_view_count (the
+	// located view_count is the app's stereo view-config — always 2 for Leia —
+	// and does NOT drop in 2D). This is the Windows D3D11-service analogue of
+	// the #521 collapse already in ipc_try_get_android_view_poses; without it
+	// the SR path returned the per-eye (off-axis) fovs[0], oxr centroided the
+	// pose but kept fovs[0] → center origin + left-eye frustum → 2D left-shift.
+	// The raw channel above already reported the verbatim per-eye set, so
+	// collapsing the render pair here doesn't affect the app's HUD face-dots.
+	{
+		uint32_t active_view_count = view_count;
+		if (rig != NULL && rig->render_view_count > 0) {
+			active_view_count = rig->render_view_count;
+		}
+		if (active_view_count == 1 && eye_count > 1) {
+			raw_eyes[0] = (struct xrt_vec3){
+			    0.5f * (raw_eyes[0].x + raw_eyes[1].x),
+			    0.5f * (raw_eyes[0].y + raw_eyes[1].y),
+			    0.5f * (raw_eyes[0].z + raw_eyes[1].z)};
+			eye_count = 1;
+		}
+	}
+
 	// Transform eyes to window-local frame:
 	// 1. Subtract window position (eye relative to window center)
 	// 2. If rotated, apply inverse rotation (eye in window's local space)
@@ -599,6 +624,15 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 			    .half_tan_vfov = ws_rig.half_tan_vfov,
 			    .ipd_factor = ws_rig.ipd_factor,
 			    .parallax_factor = ws_rig.parallax_factor,
+			    // #575 (workspace leg): the controller override replaces the app's
+			    // rig GEOMETRY, but the app's active-mode view count is NOT geometry
+			    // — it's the 2D/3D collapse signal ipc_try_get_sr_view_poses needs to
+			    // fold the render eyes to a CENTERED eye in 2D. Dropping it (leaving
+			    // it 0) makes the server fall back to the located view_count (always
+			    // 2) → no collapse → left-eye fov paired with the centroid pose →
+			    // the mild workspace 2D left-shift (same root cause as the standalone
+			    // leg). Carry the app's forwarded value through the override.
+			    .render_view_count = (rig != NULL) ? rig->render_view_count : 0,
 			};
 			rig = &ws_override;
 		}
@@ -773,6 +807,19 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		         compositor_owns_window, workspace_mode, is_workspace_controller_session,
 		         is_appcontainer_app, use_qwerty_head,
 		         (const char *)ics->client_state.info.application_name);
+	}
+
+	// #575/#533: for the 2D collapse (eye_count==1) duplicate the centered eye
+	// into the surplus eye_world entries the client reads up to view_count.
+	// oxr's mono path averages view_eye_world[0..nc) (nc = DP eye count = 2) to
+	// derive XrView.pose; without the duplication the surplus stays 0 and the
+	// centroid is HALF the centered eye → asset ~2x zoomed + shifted. Mirrors
+	// the Android path's duplication. (out_fovs/out_poses are duplicated by
+	// fill_surplus_view_poses below.)
+	if (rig_reply != NULL && eye_count > 0) {
+		for (uint32_t i = eye_count; i < XRT_MAX_VIEWS; i++) {
+			rig_reply->eye_world[i] = rig_reply->eye_world[eye_count - 1];
+		}
 	}
 
 	fill_surplus_view_poses(xdev, eye_count, view_count, out_fovs, out_poses);
