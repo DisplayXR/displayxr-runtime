@@ -23,26 +23,27 @@ extern "C" {
 struct xrt_pose;
 
 /*!
- * Snapshot of qwerty view tuning state.
- * Each mode (camera/display) has its own independent variable set.
- * Camera mode: ipd_factor, parallax_factor, convergence, half_tan_vfov.
- * Display mode: ipd_factor, parallax_factor, vHeight (perspective always 1.0).
+ * Snapshot of the qwerty controller's SINGLE active view rig (unified shape,
+ * matching the XR_EXT_view_rig tunables). `camera_mode` selects which rig is
+ * active and therefore which type-specific fields the consumer reads:
+ * camera → inv_convergence_distance, half_tan_vfov, m2v; display →
+ * virtual_display_height, perspective_factor. ipd_factor / parallax_factor are
+ * shared. The legacy dual camera/display carrier set was retired in favor of
+ * this single active rig (the V-toggle converts between rigs via the canonical
+ * dxr_view_rig converters).
  * @ingroup drv_qwerty
  */
 struct qwerty_view_state
 {
-	bool camera_mode; //!< true=camera (default), false=display
+	bool camera_mode; //!< true=camera rig active (default), false=display rig active
 
-	// Camera-centric variables
-	float cam_spread_factor;      //!< [0.01,1] default 1.0 (= cam_parallax always)
-	float cam_parallax_factor; //!< [0.01,1] default 1.0 (= cam_ipd always)
-	float cam_convergence;     //!< [0,2] diopters, default 0.5
-	float cam_half_tan_vfov;   //!< default 0.3249 — derived only, not user-adjustable
-
-	// Display-centric variables
-	float disp_spread_factor;      //!< [0.01,1] default 1.0 (= disp_parallax always)
-	float disp_parallax_factor; //!< [0.01,1] default 1.0 (= disp_ipd always)
-	float disp_vHeight;         //!< [0.1,10] meters, default 1.3
+	float ipd_factor;               //!< [0.01,1] shared
+	float parallax_factor;          //!< [0.01,1] shared
+	float inv_convergence_distance; //!< camera: 1/world-units convergence
+	float half_tan_vfov;            //!< camera: tan(vFOV/2)
+	float m2v;                      //!< camera: meters→world scale
+	float virtual_display_height;   //!< display: app units
+	float perspective_factor;       //!< display: qwerty always 1.0
 
 	// Hardware config
 	float nominal_viewer_z; //!< meters (e.g. 0.6 from sim_display)

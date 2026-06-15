@@ -71,15 +71,17 @@ struct u_hud_data
 	float vdisp_x, vdisp_y, vdisp_z;               //!< Virtual display position (m)
 	float forward_x, forward_y, forward_z;         //!< Head forward direction
 
-	// Stereo controls (dual camera/display state)
-	bool camera_mode;                //!< true=camera, false=display
-	float cam_spread_factor;            //!< Camera: IPD factor [0.01,1]
-	float cam_parallax_factor;       //!< Camera: parallax factor [0.01,1]
-	float cam_convergence;           //!< Camera: convergence in diopters [0,2]
-	float cam_half_tan_vfov;         //!< Camera: half_tan_vfov (derived)
-	float disp_spread_factor;           //!< Display: IPD factor [0.01,1]
-	float disp_parallax_factor;      //!< Display: parallax factor [0.01,1]
-	float disp_vHeight;              //!< Display: virtual display height (m) [0.1,10]
+	// Single active view rig (unified shape; matches qwerty_view_state). The
+	// dual camera/display carrier set was retired — camera_mode selects which
+	// type-specific fields are meaningful.
+	bool camera_mode;                //!< true=camera rig active, false=display rig active
+	float ipd_factor;                //!< IPD factor [0.01,1] (shared)
+	float parallax_factor;           //!< parallax factor [0.01,1] (shared)
+	float inv_convergence_distance;  //!< Camera: 1/world-units convergence [0,2]
+	float half_tan_vfov;             //!< Camera: tan(vFOV/2) (derived)
+	float m2v;                       //!< Camera: meters→world scale
+	float virtual_display_height;    //!< Display: virtual display height [0.1,10]
+	float perspective_factor;        //!< Display: perspective factor
 	float nominal_viewer_z;          //!< Hardware: nominal viewer distance (m)
 	float screen_height_m;           //!< Hardware: screen height (m)
 

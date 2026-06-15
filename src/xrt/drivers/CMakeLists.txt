@@ -32,7 +32,10 @@ if(XRT_BUILD_DRIVER_QWERTY)
 	endif()
 
 	add_library(drv_qwerty STATIC ${QWERTY_SOURCES})
-	target_link_libraries(drv_qwerty PRIVATE xrt-interfaces aux_util)
+	# aux_math (PUBLIC displayxr::math_xrt) provides the canonical rig converters
+	# (dxr_view_rig_*) + dxr_view_math.h, used by the qwerty V-toggle to switch
+	# camera<->display with no disturbance.
+	target_link_libraries(drv_qwerty PRIVATE xrt-interfaces aux_util aux_math)
 	if(XRT_HAVE_SDL2)
 		target_link_libraries(drv_qwerty PRIVATE SDL2::SDL2)
 	endif()

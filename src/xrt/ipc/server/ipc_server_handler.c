@@ -708,10 +708,11 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 			};
 		} else {
 			ct = (dxr_camera3d_tunables){
-			    .ipd_factor = stereo_state.cam_spread_factor,
-			    .parallax_factor = stereo_state.cam_parallax_factor,
-			    .inv_convergence_distance = stereo_state.cam_convergence,
-			    .half_tan_vfov = stereo_state.cam_half_tan_vfov,
+			    .ipd_factor = stereo_state.ipd_factor,
+			    .parallax_factor = stereo_state.parallax_factor,
+			    .inv_convergence_distance = stereo_state.inv_convergence_distance,
+			    .half_tan_vfov = stereo_state.half_tan_vfov,
+			    .m2v = stereo_state.m2v,
 			};
 		}
 		struct dxr_xrt_view cam_views[XRT_MAX_VIEWS];
@@ -761,10 +762,10 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 			// rather than identity m2v, otherwise the P-key toggle from
 			// camera mode would land on a default-height display and
 			// shift the convergence plane.
-			dt.ipd_factor = stereo_state.disp_spread_factor;
-			dt.parallax_factor = stereo_state.disp_parallax_factor;
-			dt.perspective_factor = 1.0f;
-			dt.virtual_display_height = stereo_state.disp_vHeight;
+			dt.ipd_factor = stereo_state.ipd_factor;
+			dt.parallax_factor = stereo_state.parallax_factor;
+			dt.perspective_factor = stereo_state.perspective_factor;
+			dt.virtual_display_height = stereo_state.virtual_display_height;
 		} else {
 			dt.virtual_display_height = screen_height_m; // identity m2v
 		}

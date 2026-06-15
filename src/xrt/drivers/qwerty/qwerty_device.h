@@ -55,6 +55,7 @@ struct qwerty_system
 	float cam_parallax_factor; //!< [0.01,1] default 1.0 (= cam_ipd always)
 	float cam_convergence;     //!< [0,2] diopters, default 0.5
 	float cam_half_tan_vfov;   //!< default 0.3249 — derived only, not user-adjustable
+	float cam_m2v;             //!< meters→world scale, default 1.0 (qwerty perspective is always 1)
 
 	// Display-centric state (user adjusts when camera_mode=false)
 	float disp_spread_factor;      //!< [0.01,1] default 1.0 (= disp_parallax always)

@@ -24,6 +24,8 @@
 #include "qwerty_device.h"
 #include "qwerty_interface.h"
 
+#include "dxr_view_math.h" // canonical display<->camera rig converters
+
 #include <stdio.h>
 #include <assert.h>
 
@@ -646,6 +648,7 @@ qwerty_system_create(struct qwerty_hmd *qhmd,
 	qs->cam_parallax_factor = 1.0f;
 	qs->cam_convergence = 0.5f;      // 0.5 diopters = 2m convergence
 	qs->cam_half_tan_vfov = 0.3249f; // tan(18 deg) -> 36 deg vFOV
+	qs->cam_m2v = 1.0f;              // world unit == meter for the legacy/qwerty camera
 
 	// Display-centric defaults
 	qs->disp_spread_factor = 1.0f;
@@ -1071,43 +1074,48 @@ qwerty_toggle_camera_mode(struct qwerty_system *qs)
 
 	struct xrt_pose *pose = &qs->hmd->base.pose;
 
-	// Compute forward direction from current orientation
-	struct xrt_vec3 fwd_in = {0, 0, -1};
-	struct xrt_vec3 fwd;
-	math_quat_rotate_vec3(&pose->orientation, &fwd_in, &fwd);
+	// Switch rigs through the canonical converters (displayxr::common) so the
+	// toggle is visually disturbance-free in BOTH directions. This replaces the
+	// previous hand-rolled camera->display half-conversion and, crucially, the
+	// display->camera RESET to arbitrary defaults (0.5 diopters / 36 deg vFOV).
+	// aspect is unused by the converters; nominal/screen come from the hardware.
+	dxr_rig_display_info info = {qs->screen_height_m, 1.0f, qs->nominal_viewer_z};
 
 	if (qs->camera_mode) {
-		// Camera -> Display: derive display state from camera state
-		float conv_dist = (qs->cam_convergence > 0.001f) ? (1.0f / qs->cam_convergence) : 1000.0f;
-
-		// Display position = camera position + forward * convergence_distance
-		struct xrt_vec3 disp_pos = {
-		    pose->position.x + fwd.x * conv_dist,
-		    pose->position.y + fwd.y * conv_dist,
-		    pose->position.z + fwd.z * conv_dist,
+		// Camera -> Display.
+		dxr_camera_rig cam = {
+		    .pose = {{pose->orientation.x, pose->orientation.y, pose->orientation.z, pose->orientation.w},
+		             {pose->position.x, pose->position.y, pose->position.z}},
+		    .ipd_factor = qs->cam_spread_factor,
+		    .parallax_factor = qs->cam_parallax_factor,
+		    .inv_convergence_distance = qs->cam_convergence,
+		    .half_tan_vfov = qs->cam_half_tan_vfov,
+		    .m2v = qs->cam_m2v,
 		};
-
-		// Derive vHeight from camera FOV and convergence distance
-		qs->disp_vHeight = clampf(2.0f * qs->cam_half_tan_vfov * conv_dist, 0.1f, 10.0f);
-
-		// IPD/parallax: keep current display values (independent per mode)
-
-		// Move HMD to display position
-		pose->position = disp_pos;
+		dxr_display_rig disp;
+		dxr_view_rig_camera_to_display(&cam, &info, &disp);
+		qs->disp_vHeight = clampf(disp.virtual_display_height, 0.1f, 10.0f);
+		qs->disp_spread_factor = disp.ipd_factor;
+		qs->disp_parallax_factor = disp.parallax_factor;
+		pose->position = (struct xrt_vec3){disp.pose.position.x, disp.pose.position.y, disp.pose.position.z};
 	} else {
-		// Display -> Camera: reset to camera defaults
-		float cam_distance = 2.0f; // 1 / 0.5 diopters
-		qs->cam_convergence = 0.5f;
-		qs->cam_half_tan_vfov = 0.3249f;
-
-		// Move HMD backward by default camera distance
-		struct xrt_vec3 cam_pos = {
-		    pose->position.x - fwd.x * cam_distance,
-		    pose->position.y - fwd.y * cam_distance,
-		    pose->position.z - fwd.z * cam_distance,
+		// Display -> Camera (was a reset; now a faithful conversion).
+		dxr_display_rig disp = {
+		    .pose = {{pose->orientation.x, pose->orientation.y, pose->orientation.z, pose->orientation.w},
+		             {pose->position.x, pose->position.y, pose->position.z}},
+		    .virtual_display_height = qs->disp_vHeight,
+		    .ipd_factor = qs->disp_spread_factor,
+		    .parallax_factor = qs->disp_parallax_factor,
+		    .perspective_factor = 1.0f,
 		};
-
-		pose->position = cam_pos;
+		dxr_camera_rig cam;
+		dxr_view_rig_display_to_camera(&disp, &info, &cam);
+		qs->cam_convergence = clampf(cam.inv_convergence_distance, 0.0f, 2.0f);
+		qs->cam_half_tan_vfov = cam.half_tan_vfov;
+		qs->cam_m2v = cam.m2v;
+		qs->cam_spread_factor = cam.ipd_factor;
+		qs->cam_parallax_factor = cam.parallax_factor;
+		pose->position = (struct xrt_vec3){cam.pose.position.x, cam.pose.position.y, cam.pose.position.z};
 	}
 
 	qs->camera_mode = !qs->camera_mode;
@@ -1169,6 +1177,7 @@ qwerty_reset_view_state(struct qwerty_system *qs)
 	qs->cam_parallax_factor = 1.0f;
 	qs->cam_convergence = 0.5f;
 	qs->cam_half_tan_vfov = 0.3249f;
+	qs->cam_m2v = 1.0f;
 
 	qs->disp_spread_factor = 1.0f;
 	qs->disp_parallax_factor = 1.0f;
@@ -1207,16 +1216,17 @@ qwerty_get_view_state(struct xrt_device **xdevs, size_t xdev_count, struct qwert
 		return false;
 	}
 
+	// Emit the single ACTIVE rig (unified shape). Shared ipd/parallax come from
+	// the active mode's spread/parallax; the type-specific fields are carried so
+	// the consumer can pick the relevant subset by camera_mode.
 	out->camera_mode = qs->camera_mode;
-
-	out->cam_spread_factor = qs->cam_spread_factor;
-	out->cam_parallax_factor = qs->cam_parallax_factor;
-	out->cam_convergence = qs->cam_convergence;
-	out->cam_half_tan_vfov = qs->cam_half_tan_vfov;
-
-	out->disp_spread_factor = qs->disp_spread_factor;
-	out->disp_parallax_factor = qs->disp_parallax_factor;
-	out->disp_vHeight = qs->disp_vHeight;
+	out->ipd_factor = qs->camera_mode ? qs->cam_spread_factor : qs->disp_spread_factor;
+	out->parallax_factor = qs->camera_mode ? qs->cam_parallax_factor : qs->disp_parallax_factor;
+	out->inv_convergence_distance = qs->cam_convergence;
+	out->half_tan_vfov = qs->cam_half_tan_vfov;
+	out->m2v = qs->cam_m2v;
+	out->virtual_display_height = qs->disp_vHeight;
+	out->perspective_factor = 1.0f; // qwerty display rig is always perspective 1
 
 	out->nominal_viewer_z = qs->nominal_viewer_z;
 	out->screen_height_m = qs->screen_height_m;
