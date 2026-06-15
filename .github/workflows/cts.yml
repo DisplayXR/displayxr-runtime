@@ -227,6 +227,36 @@ jobs:
           }
           Write-Host "CTS passed."
 
+      # Surface the frame-pacing numbers Timed_Pipelined_Frame_Submission prints
+      # so we can trend the runner's effective frame timing instead of only
+      # learning about it when the hard 50%-overhead assertion trips. The
+      # overhead factor is (avg frame time / predicted display period) - 1; the
+      # CTS hard-fails at >= 50%. We warn at >= 40% as an early signal that the
+      # hosted runner's timer/scheduling jitter is creeping toward the cliff
+      # (see #589 for why this test is timer-granularity sensitive on Windows).
+      - name: Report frame-timing metrics
+        if: always()
+        shell: pwsh
+        run: |
+          $log = "$env:TEMP\cts_ci_console.log"
+          if (-not (Test-Path $log)) { Write-Host "No CTS console log to scrape metrics from."; exit 0 }
+          $lines = Get-Content $log |
+            Select-String -Pattern 'Average (xrWaitFrame|time spent|predicted|xrBeginFrame)|Overhead score'
+          if (-not $lines) { Write-Host "No Timed_Pipelined_Frame_Submission metrics in console log."; exit 0 }
+          "## CTS frame-timing (Timed_Pipelined_Frame_Submission)" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          '```' | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          $lines | ForEach-Object { $_.Line.Trim() | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY | Write-Host }
+          '```' | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          $oh = ($lines | Where-Object { $_.Line -match 'Overhead score\s*:\s*([-0-9.]+)%' } | Select-Object -First 1)
+          if ($oh -and $oh.Line -match 'Overhead score\s*:\s*([-0-9.]+)%') {
+            $pct = [double]$Matches[1]
+            if ($pct -ge 40.0) {
+              Write-Host "::warning::CTS frame overhead ${pct}% is within 10pts of the 50% hard-fail (timer/scheduling jitter — see #589)"
+            } else {
+              Write-Host "CTS frame overhead ${pct}% — healthy margin under the 50% cap."
+            }
+          }
+
       - name: Upload CTS results
         if: always()
         uses: actions/upload-artifact@v6
