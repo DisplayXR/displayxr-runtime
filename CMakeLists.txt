@@ -482,6 +482,15 @@ set(XRT_VS_LAUNCH_APP "" CACHE STRING
 if(XRT_VS_LAUNCH_APP)
 	if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_apps/${XRT_VS_LAUNCH_APP}/CMakeLists.txt")
 		message(STATUS "Folding test app as IDE launch target: ${XRT_VS_LAUNCH_APP}")
+		# The test apps install a workspace manifest via displayxr_install_manifest,
+		# defined by displayxr-common (FetchContent'd by test_apps/common) in the
+		# standalone build. In the folded build that helper isn't defined; the
+		# manifest sidecar is only for shell/workspace discovery and isn't needed
+		# for an IDE launch target, so provide a no-op fallback if it's missing.
+		if(NOT COMMAND displayxr_install_manifest)
+			function(displayxr_install_manifest)
+			endfunction()
+		endif()
 		add_subdirectory(
 			test_apps/${XRT_VS_LAUNCH_APP}
 			test_apps_launch/${XRT_VS_LAUNCH_APP}
