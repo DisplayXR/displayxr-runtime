@@ -42,6 +42,12 @@
 static bool
 android_transparent_requested(void)
 {
+	// #558 per-app: transparency follows overlay mode (an overlay app is see-through;
+	// a normal app is opaque) — set per-session by the runtime in android_globals.
+	// debug.dxr.transparent stays as a dev force override.
+	if (android_globals_get_overlay_mode()) {
+		return true;
+	}
 	char value[PROP_VALUE_MAX] = {0};
 	if (__system_property_get("debug.dxr.transparent", value) > 0) {
 		return value[0] == '1' || value[0] == 't' || value[0] == 'T' || value[0] == 'y' || value[0] == 'Y';

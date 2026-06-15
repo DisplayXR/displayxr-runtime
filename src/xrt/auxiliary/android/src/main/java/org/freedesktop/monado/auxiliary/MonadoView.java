@@ -97,14 +97,15 @@ public class MonadoView extends SurfaceView
         }
         SurfaceHolder surfaceHolder = getHolder();
         surfaceHolder.addCallback(this);
-        // P0 transparency spike (#568): a translucent SurfaceView z-ordered as a
-        // media overlay lets SurfaceFlinger composite the weaved content over the
-        // live screen. Gated on `debug.dxr.transparent` so other apps over this
-        // runtime are unaffected. Layer A drives this from the per-session flag.
-        if (isTransparentSpikeEnabled()) {
+        // A translucent SurfaceView z-ordered as a media overlay lets SurfaceFlinger
+        // composite the weaved content over the live screen (#568). This view is only
+        // created as a SERVICE-owned overlay (no host Activity) for a per-app overlay
+        // (see-through) app (#558), so make it translucent in that case; debug.dxr.transparent
+        // stays as a dev force override for the in-Activity path.
+        if (hostActivity == null || isTransparentSpikeEnabled()) {
             setZOrderMediaOverlay(true);
             surfaceHolder.setFormat(PixelFormat.TRANSLUCENT);
-            Log.i(TAG, "MonadoView: TRANSLUCENT media-overlay surface (#568 transparency spike)");
+            Log.i(TAG, "MonadoView: TRANSLUCENT media-overlay surface (#558 overlay / #568)");
         }
     }
 

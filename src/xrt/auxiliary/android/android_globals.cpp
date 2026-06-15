@@ -10,7 +10,9 @@
 #include "android_globals.h"
 
 #include <stddef.h>
+#include <atomic>
 #include <mutex>
+#include <jni.h>
 #include <wrap/android.app.h>
 
 /*!
@@ -150,4 +152,73 @@ android_globals_get_context()
 {
 	return android_globals.context.isNull() ? android_globals.activity.getHandle()
 	                                        : android_globals.context.getHandle();
+}
+
+// #558 per-app overlay mode: service-process flag set by MonadoImpl from the
+// connecting client's manifest, read by the vendor DP plug-in.
+static std::atomic<bool> android_overlay_mode{false};
+
+void
+android_globals_set_overlay_mode(bool enabled)
+{
+	android_overlay_mode.store(enabled, std::memory_order_release);
+}
+
+bool
+android_globals_get_overlay_mode(void)
+{
+	return android_overlay_mode.load(std::memory_order_acquire);
+}
+
+bool
+android_globals_self_declares_overlay(void)
+{
+	// Query this process's own package manifest metadata once; cache the result
+	// (-1 uncomputed, 0 no, 1 yes). Used in the APP process where the connecting
+	// app is this process (e.g. oxr_session keep-alive).
+	static std::atomic<int> cached{-1};
+	int c = cached.load(std::memory_order_acquire);
+	if (c >= 0) {
+		return c != 0;
+	}
+	int result = 0; // default false, also on any JNI failure
+	jobject ctx = (jobject)android_globals_get_context();
+	if (android_globals.vm != nullptr && ctx != nullptr) {
+		JNIEnv *env = jni::env();
+		if (env != nullptr) {
+			jclass ctxCls = env->GetObjectClass(ctx);
+			jmethodID mGetPkgName = env->GetMethodID(ctxCls, "getPackageName", "()Ljava/lang/String;");
+			jmethodID mGetPM =
+			    env->GetMethodID(ctxCls, "getPackageManager", "()Landroid/content/pm/PackageManager;");
+			jstring pkg = (jstring)env->CallObjectMethod(ctx, mGetPkgName);
+			jobject pm = env->CallObjectMethod(ctx, mGetPM);
+			if (pkg != nullptr && pm != nullptr) {
+				jclass pmCls = env->GetObjectClass(pm);
+				jmethodID mGetAppInfo = env->GetMethodID(
+				    pmCls, "getApplicationInfo",
+				    "(Ljava/lang/String;I)Landroid/content/pm/ApplicationInfo;");
+				const jint GET_META_DATA = 0x00000080;
+				jobject ai = env->CallObjectMethod(pm, mGetAppInfo, pkg, GET_META_DATA);
+				if (env->ExceptionCheck()) {
+					env->ExceptionClear();
+				} else if (ai != nullptr) {
+					jclass aiCls = env->GetObjectClass(ai);
+					jfieldID fMeta = env->GetFieldID(aiCls, "metaData", "Landroid/os/Bundle;");
+					jobject bundle = env->GetObjectField(ai, fMeta);
+					if (bundle != nullptr) {
+						jclass bCls = env->GetObjectClass(bundle);
+						jmethodID mGetBool =
+						    env->GetMethodID(bCls, "getBoolean", "(Ljava/lang/String;Z)Z");
+						jstring key = env->NewStringUTF("com.displayxr.overlay_mode");
+						result = env->CallBooleanMethod(bundle, mGetBool, key, JNI_FALSE) ? 1 : 0;
+					}
+				}
+			}
+			if (env->ExceptionCheck()) {
+				env->ExceptionClear();
+			}
+		}
+	}
+	cached.store(result, std::memory_order_release);
+	return result != 0;
 }

@@ -10,7 +10,11 @@
 package org.freedesktop.monado.ipc;
 
 import android.content.Context;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageManager;
+import android.os.Binder;
 import android.os.ParcelFileDescriptor;
+import android.os.Process;
 import android.os.RemoteException;
 import android.provider.Settings;
 import android.util.Log;
@@ -61,7 +65,12 @@ public class MonadoImpl extends IMonado.Stub {
         // surface, so create our own TYPE_APPLICATION_OVERLAY before the
         // compositor (started by nativeAddClient) begins polling for a surface.
         // Idempotent native-side, so repeated connects are safe.
-        if (canDrawOverOtherApps()) {
+        boolean overlay = canDrawOverOtherApps();
+        // Propagate the per-session decision to the service-process globals so the
+        // compositor + vendor DP plug-in (keep-3D-while-backgrounded) see it without
+        // re-reading a global sysprop (#558 per-app).
+        nativeSetOverlayMode(overlay);
+        if (overlay) {
             Log.i(TAG, "connect: overlay mode — creating service overlay");
             nativeCreateServiceOverlay();
         }
@@ -95,17 +104,61 @@ public class MonadoImpl extends IMonado.Stub {
         nativeAppSurface(surface);
     }
 
+    // Cached overlay decision from the last resolved client connect, returned for
+    // in-process callers (the service watchdog calls canDrawOverOtherApps() from
+    // MonadoService, where Binder.getCallingUid() is our own uid, not the client's).
+    private volatile boolean cachedClientOverlay = false;
+
     @Override
     public boolean canDrawOverOtherApps() {
-        // #558: this means "the SERVICE owns the on-screen surface (overlay mode)",
-        // which both the client (whether to publish its own surface, Client.java)
-        // and the service watchdog (MonadoService) key on. That requires BOTH the
-        // draw-over-apps permission AND overlay mode (debug.dxr.overlay) — the
-        // permission alone is not enough, or a normal app (permission granted but
-        // not overlay mode) would skip its surface and get a blank service overlay.
-        boolean overlay = Settings.canDrawOverlays(context) && nativeOverlayModeEnabled();
+        // #558: "the SERVICE owns the on-screen surface (overlay mode)" — both the
+        // client (whether to publish its own surface, Client.java) and the service
+        // watchdog (MonadoService) key on this. Requires the draw-over-apps
+        // permission AND that the connecting app opted into overlay mode. Overlay
+        // mode is now PER-APP: the app declares
+        //   <meta-data android:name="com.displayxr.overlay_mode" android:value="true"/>
+        // so a normal app (cube) renders in its own window while an overlay app
+        // (avatar) gets the service overlay — without a global toggle. debug.dxr.overlay
+        // stays as a dev FORCE-ALL override.
+        if (!Settings.canDrawOverlays(context)) {
+            return false;
+        }
+        boolean overlay = callerDeclaresOverlay() || nativeOverlayModeEnabled();
         Log.i(TAG, "canDrawOverOtherApps (overlay mode) = " + overlay);
         return overlay;
+    }
+
+    // True if the calling client's package declares the overlay-mode manifest flag.
+    // Resolves the live binder caller; in-process calls (watchdog) reuse the cached
+    // value from the most recent client resolution.
+    private boolean callerDeclaresOverlay() {
+        int uid = Binder.getCallingUid();
+        if (uid == Process.myUid()) {
+            return cachedClientOverlay; // in-process (watchdog) — use the last client's value
+        }
+        boolean wants = packageDeclaresOverlay(uid);
+        cachedClientOverlay = wants;
+        return wants;
+    }
+
+    private boolean packageDeclaresOverlay(int uid) {
+        PackageManager pm = context.getPackageManager();
+        String[] pkgs = pm.getPackagesForUid(uid);
+        if (pkgs == null) {
+            return false;
+        }
+        for (String pkg : pkgs) {
+            try {
+                ApplicationInfo ai = pm.getApplicationInfo(pkg, PackageManager.GET_META_DATA);
+                if (ai.metaData != null
+                        && ai.metaData.getBoolean("com.displayxr.overlay_mode", false)) {
+                    return true;
+                }
+            } catch (PackageManager.NameNotFoundException e) {
+                // try the next package sharing this uid
+            }
+        }
+        return false;
     }
 
     @Override
@@ -167,9 +220,13 @@ public class MonadoImpl extends IMonado.Stub {
     @SuppressWarnings("JavaJniMissingFunction")
     private native void nativeDestroyServiceOverlay();
 
-    /** True when overlay mode (debug.dxr.overlay) is enabled — see canDrawOverOtherApps. */
+    /** True when the debug.dxr.overlay dev force-all override is set — see canDrawOverOtherApps. */
     @SuppressWarnings("JavaJniMissingFunction")
     private native boolean nativeOverlayModeEnabled();
+
+    /** Publish the per-session overlay decision to the service-process globals (#558 per-app). */
+    @SuppressWarnings("JavaJniMissingFunction")
+    private native void nativeSetOverlayMode(boolean enabled);
 
     /**
      * Native handling of the client's surface being destroyed (background → file picker etc.):

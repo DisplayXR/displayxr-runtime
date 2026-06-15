@@ -128,6 +128,29 @@ android_globals_set_custom_surface(void *custom_surface);
 void *
 android_globals_get_custom_surface(void);
 
+/*!
+ * Per-session overlay mode (#558 per-app). Set by the runtime service
+ * (MonadoImpl, from the connecting client's manifest) in the SERVICE process;
+ * read by the vendor display-processor plug-in to decide keep-3D-while-
+ * backgrounded. Process-local — only meaningful in the service process.
+ * @ingroup aux_android
+ */
+void
+android_globals_set_overlay_mode(bool enabled);
+
+bool
+android_globals_get_overlay_mode(void);
+
+/*!
+ * True if THIS process's own package declares
+ * `<meta-data android:name="com.displayxr.overlay_mode" android:value="true"/>`.
+ * Read in the APP process (the OpenXR client) — e.g. oxr_session keep-alive —
+ * where the connecting app IS this process. Queried once via JNI and cached.
+ * @ingroup aux_android
+ */
+bool
+android_globals_self_declares_overlay(void);
+
 #ifdef __cplusplus
 }
 #endif
