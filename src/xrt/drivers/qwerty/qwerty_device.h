@@ -62,6 +62,16 @@ struct qwerty_system
 	float disp_parallax_factor; //!< [0.01,1] default 1.0 (= disp_ipd always)
 	float disp_vHeight;         //!< [0.1,10] meters, default 1.3
 
+	// P-toggle smooth transition: on toggle, the active rig starts at the
+	// converter-equivalent of the previous rig (disturbance-free first frame)
+	// and then animates all tunables to the NEW mode's DEFAULTS over a short
+	// duration. These hold the per-toggle start snapshot + timer.
+	bool rig_animating;
+	uint64_t rig_anim_start_ns;
+	float anim_from_convergence, anim_from_half_tan_vfov, anim_from_m2v;
+	float anim_from_spread; //!< = parallax (kept equal)
+	float anim_from_vHeight;
+
 	// Hardware config (set by target builder)
 	float nominal_viewer_z; //!< meters (e.g. 0.6 from sim_display)
 	float screen_height_m;  //!< meters (e.g. 0.194 from sim_display)
