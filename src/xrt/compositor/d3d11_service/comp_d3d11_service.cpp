@@ -10812,6 +10812,36 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// Render HUD overlay (post-weave, pre-present)
 	d3d11_service_render_hud(sys, &c->render, weaving_done, &eye_pos);
 
+	// Standalone forced-IPC atlas capture. The workspace trigger poll lives in
+	// multi_compositor_render() (workspace-only); a standalone client returns
+	// before that branch and never reaches it. Poll the SAME trigger file here
+	// on the per-client render path so a forced-IPC standalone app's per-client
+	// atlas is capturable with the same
+	// %TEMP%\workspace_screenshot_atlas_<vc>_<cols>x<rows>.png filename — the
+	// existing read-the-PNG workflow keeps working unchanged. Gated to
+	// !workspace_mode by code position (past the workspace early-return above),
+	// so it never double-fires with the workspace poll. PROJECTION_ONLY captures
+	// sys->active_compositor (set to this client at the top of the commit),
+	// reading its content-sized crop_texture / per-client atlas_texture — both
+	// freshly written this frame by service_crop_atlas_for_dp() above.
+	{
+		static char ss_trigger[MAX_PATH] = {};
+		static char ss_prefix[MAX_PATH] = {};
+		if (!ss_trigger[0]) {
+			const char *tmp = getenv("TEMP");
+			if (!tmp)
+				tmp = "C:\\Temp";
+			snprintf(ss_trigger, sizeof(ss_trigger), "%s\\workspace_screenshot_trigger", tmp);
+			snprintf(ss_prefix, sizeof(ss_prefix), "%s\\workspace_screenshot", tmp);
+		}
+		if (GetFileAttributesA(ss_trigger) != INVALID_FILE_ATTRIBUTES) {
+			DeleteFileA(ss_trigger);
+			struct ipc_capture_result dummy = {};
+			comp_d3d11_service_capture_frame(&sys->base, ss_prefix, IPC_CAPTURE_FLAG_PROJECTION_ONLY,
+			                                 &dummy);
+		}
+	}
+
 	// Phase 1 diagnostic — same env-gated [PRESENT_NS] used for the
 	// workspace multi-comp swap chain. In standalone mode this fires
 	// per client per frame against THIS client's own swap chain. Tagged
