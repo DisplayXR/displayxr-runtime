@@ -1120,6 +1120,18 @@ qwerty_toggle_camera_mode(struct qwerty_system *qs)
 
 	qs->camera_mode = !qs->camera_mode;
 
+	// The converter above set the NEW mode's params to the disturbance-free
+	// equivalent of the previous rig (so frame 0 matches the current view).
+	// Snapshot that as the animation start; qwerty_advance_rig_anim then lerps
+	// it to the new mode's DEFAULTS over QWERTY_RIG_ANIM_DUR_S (smooth, no pop).
+	qs->anim_from_convergence = qs->cam_convergence;
+	qs->anim_from_half_tan_vfov = qs->cam_half_tan_vfov;
+	qs->anim_from_m2v = qs->cam_m2v;
+	qs->anim_from_spread = qs->camera_mode ? qs->cam_spread_factor : qs->disp_spread_factor;
+	qs->anim_from_vHeight = qs->disp_vHeight;
+	qs->rig_animating = true;
+	qs->rig_anim_start_ns = os_monotonic_get_ns();
+
 	// Reset controllers to mode-appropriate default positions (attached to head)
 	if (qs->lctrl) {
 		reset_controller_for_mode(qs, qs->lctrl, true);
@@ -1128,13 +1140,14 @@ qwerty_toggle_camera_mode(struct qwerty_system *qs)
 		reset_controller_for_mode(qs, qs->rctrl, false);
 	}
 
-	U_LOG_W("Qwerty: view mode -> %s (derived from previous state)",
-	        qs->camera_mode ? "Camera" : "Display");
+	U_LOG_W("Qwerty: view mode -> %s (smooth transition to %s defaults)",
+	        qs->camera_mode ? "Camera" : "Display", qs->camera_mode ? "camera" : "display");
 }
 
 void
 qwerty_adjust_view_factor(struct qwerty_system *qs, float multiplier)
 {
+	qs->rig_animating = false; // manual adjust cancels an in-flight P-toggle transition
 	if (qs->camera_mode) {
 		float v = clampf(qs->cam_spread_factor * multiplier, 0.01f, 1.0f);
 		qs->cam_spread_factor = v;
@@ -1154,6 +1167,7 @@ qwerty_adjust_convergence(struct qwerty_system *qs, float direction)
 	if (!qs->camera_mode) {
 		return; // No-op in display mode
 	}
+	qs->rig_animating = false; // manual adjust cancels an in-flight P-toggle transition
 	qs->cam_convergence = clampf(qs->cam_convergence + direction * 0.05f, 0.0f, 2.0f);
 	U_LOG_I("Qwerty: Convergence = %.2f diopters", qs->cam_convergence);
 }
@@ -1164,6 +1178,7 @@ qwerty_adjust_vheight(struct qwerty_system *qs, float multiplier)
 	if (qs->camera_mode) {
 		return; // No-op in camera mode
 	}
+	qs->rig_animating = false; // manual adjust cancels an in-flight P-toggle transition
 	qs->disp_vHeight = clampf(qs->disp_vHeight * multiplier, 0.1f, 10.0f);
 	U_LOG_I("Qwerty: vHeight = %.2f m", qs->disp_vHeight);
 }
@@ -1183,12 +1198,49 @@ qwerty_reset_view_state(struct qwerty_system *qs)
 	qs->disp_parallax_factor = 1.0f;
 	qs->disp_vHeight = 1.3f;
 
+	qs->rig_animating = false;
+
 	if (qs->hmd != NULL) {
 		qs->hmd->base.pose.position = QWERTY_HMD_CAMERA_POS;
 		qs->hmd->base.pose.orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
 	}
 
 	U_LOG_W("Qwerty: view state reset to camera defaults");
+}
+
+// Advance the P-toggle smooth transition: lerp the active rig's tunables from
+// the per-toggle start snapshot to the active mode's DEFAULTS (smoothstep over
+// QWERTY_RIG_ANIM_DUR_S). Time-based and idempotent, so it is safe to call from
+// every qwerty_get_view_state reader within a frame.
+#define QWERTY_RIG_ANIM_DUR_S 0.4f
+static void
+qwerty_advance_rig_anim(struct qwerty_system *qs)
+{
+	if (!qs->rig_animating) {
+		return;
+	}
+	float elapsed = (float)((double)(os_monotonic_get_ns() - qs->rig_anim_start_ns) * 1e-9);
+	float t = elapsed / QWERTY_RIG_ANIM_DUR_S;
+	if (t >= 1.0f) {
+		t = 1.0f;
+	}
+	float s = t * t * (3.0f - 2.0f * t); // smoothstep
+	if (qs->camera_mode) {
+		// → camera defaults (0.5 dp convergence, 0.3249 half-tan vFOV, m2v 1, spread 1)
+		qs->cam_convergence = qs->anim_from_convergence + (0.5f - qs->anim_from_convergence) * s;
+		qs->cam_half_tan_vfov = qs->anim_from_half_tan_vfov + (0.3249f - qs->anim_from_half_tan_vfov) * s;
+		qs->cam_m2v = qs->anim_from_m2v + (1.0f - qs->anim_from_m2v) * s;
+		qs->cam_spread_factor = qs->anim_from_spread + (1.0f - qs->anim_from_spread) * s;
+		qs->cam_parallax_factor = qs->cam_spread_factor;
+	} else {
+		// → display defaults (vHeight 1.3 m, spread 1; perspective stays 1)
+		qs->disp_vHeight = qs->anim_from_vHeight + (1.3f - qs->anim_from_vHeight) * s;
+		qs->disp_spread_factor = qs->anim_from_spread + (1.0f - qs->anim_from_spread) * s;
+		qs->disp_parallax_factor = qs->disp_spread_factor;
+	}
+	if (t >= 1.0f) {
+		qs->rig_animating = false;
+	}
 }
 
 bool
@@ -1215,6 +1267,8 @@ qwerty_get_view_state(struct xrt_device **xdevs, size_t xdev_count, struct qwert
 	if (qs == NULL) {
 		return false;
 	}
+
+	qwerty_advance_rig_anim(qs); // step the P-toggle smooth transition (time-based)
 
 	// Emit the single ACTIVE rig (unified shape). Shared ipd/parallax come from
 	// the active mode's spread/parallax; the type-specific fields are carried so
