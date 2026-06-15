@@ -66,6 +66,14 @@ static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18°) → 36° 
 // converter (TryRigRoundtripToggle) derives this from the display rig so the
 // camera rig reproduces the display rig's eye scaling exactly; default 1.0.
 static float g_cameraM2v = 1.0f;
+
+// The runtime's resolved CANVAS size in meters (XrViewDisplayRawEXT::canvasSizeMeters),
+// captured each frame. The Kooima/rig math runs on the canvas (window client area),
+// NOT the full display — so the C-toggle converter must use the canvas height as
+// physical_height_m, else display<->camera diverge in any non-fullscreen window
+// (perspective + pose). 0 = not captured yet (falls back to full display size).
+static float g_canvasWidthM = 0.0f;
+static float g_canvasHeightM = 0.0f;
 static const float HUD_WIDTH_FRACTION = 0.30f;
 
 // Fullscreen state
@@ -234,9 +242,16 @@ static bool TryRigRoundtripToggle() {
     }
     InputState& st = g_inputState;
 
+    // Use the CANVAS size the runtime resolved (window client area in meters),
+    // NOT the full display — the rig math runs on the canvas, so in any
+    // non-fullscreen window the window "is" the display. Fall back to the full
+    // display size until the first raw-channel capture lands.
+    const float physH = (g_canvasHeightM > 0.0f) ? g_canvasHeightM : g_xr->displayHeightM;
+    const float physW = (g_canvasWidthM > 0.0f) ? g_canvasWidthM : g_xr->displayWidthM;
+
     dxr_rig_display_info info;
-    info.physical_height_m = g_xr->displayHeightM;
-    info.aspect = g_xr->displayWidthM / g_xr->displayHeightM;
+    info.physical_height_m = physH;
+    info.aspect = physW / physH;
     info.nominal_distance_m = g_xr->nominalViewerZ;
 
     // Current rig pose — same construction as the per-frame rigPose in the
@@ -858,6 +873,15 @@ static void RenderOneFrame(RenderState& rs) {
                     }
 
                     xrLocateViews(xr.session, &locateInfo, &viewState, 8, &viewCount, rawViews);
+
+                    // Capture the runtime's resolved CANVAS size (the window
+                    // client area in meters) — this is the physical_height_m the
+                    // Kooima/rig math runs on, which the C-toggle converter must
+                    // match. Fullscreen → canvas == display; windowed → smaller.
+                    if (g_hasViewRigExt && rawProbe.canvasSizeMeters.height > 0.0f) {
+                        g_canvasWidthM = rawProbe.canvasSizeMeters.width;
+                        g_canvasHeightM = rawProbe.canvasSizeMeters.height;
+                    }
 
                     // XR_EXT_view_rig raw-channel verification (#396 W7): one-shot
                     // proof the raw channel reports the DP's full per-view set.
