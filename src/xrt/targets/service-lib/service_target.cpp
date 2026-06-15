@@ -19,6 +19,7 @@
 
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
+#include <sys/system_properties.h>
 
 #include "android/android_globals.h"
 #include "android/android_custom_surface.h"
@@ -190,6 +191,20 @@ Java_org_freedesktop_monado_ipc_MonadoImpl_nativeCreateServiceOverlay(JNIEnv *en
 {
 	jni::init(env);
 	jni::Object monadoImpl(thiz);
+
+	// #558: only create a service overlay in OVERLAY MODE (debug.dxr.overlay).
+	// The "display over other apps" permission alone is NOT enough — a normal app
+	// (e.g. cube_handle_vk_android) publishes its own client surface and must
+	// render into its own window; creating a service overlay for it would steal
+	// the screen + eat input + leave a stray overlay flashing on close. Overlay
+	// mode is the avatar's opt-in switch (the same sysprop the client session +
+	// plugin read), so gate creation on it; default (unset) → ordinary windowed app.
+	{
+		char prop[PROP_VALUE_MAX] = {};
+		if (!(__system_property_get("debug.dxr.overlay", prop) > 0 && prop[0] == '1')) {
+			return;
+		}
+	}
 
 	// Service-owned overlay (#558 revival, P1): when the runtime holds the
 	// "display over other apps" permission the CLIENT skips publishing its
