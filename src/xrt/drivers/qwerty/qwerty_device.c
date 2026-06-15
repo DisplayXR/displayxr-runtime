@@ -1121,16 +1121,14 @@ qwerty_toggle_camera_mode(struct qwerty_system *qs)
 	qs->camera_mode = !qs->camera_mode;
 
 	// The converter above set the NEW mode's params to the disturbance-free
-	// equivalent of the previous rig (so frame 0 matches the current view).
-	// Snapshot that as the animation start; qwerty_advance_rig_anim then lerps
-	// it to the new mode's DEFAULTS over QWERTY_RIG_ANIM_DUR_S (smooth, no pop).
-	qs->anim_from_convergence = qs->cam_convergence;
-	qs->anim_from_half_tan_vfov = qs->cam_half_tan_vfov;
-	qs->anim_from_m2v = qs->cam_m2v;
-	qs->anim_from_spread = qs->camera_mode ? qs->cam_spread_factor : qs->disp_spread_factor;
-	qs->anim_from_vHeight = qs->disp_vHeight;
-	qs->rig_animating = true;
-	qs->rig_anim_start_ns = os_monotonic_get_ns();
+	// equivalent of the previous rig — frame 0 matches the current view exactly,
+	// and that IS the toggle: no easing afterward. Repeated P just ping-pongs the
+	// same view (display<->camera<->display is an identity with the v1.0.4
+	// converter), so there is no visible change. The known per-mode defaults
+	// (0.5 dp / 36° vFOV / m2v 1 for camera; vHeight 1.3 for display) apply only
+	// at the initial camera-centric startup; a toggle preserves the current look.
+	// Cancel any in-flight animation (e.g. left over from a manual adjust path).
+	qs->rig_animating = false;
 
 	// Reset controllers to mode-appropriate default positions (attached to head)
 	if (qs->lctrl) {
@@ -1140,8 +1138,8 @@ qwerty_toggle_camera_mode(struct qwerty_system *qs)
 		reset_controller_for_mode(qs, qs->rctrl, false);
 	}
 
-	U_LOG_W("Qwerty: view mode -> %s (smooth transition to %s defaults)",
-	        qs->camera_mode ? "Camera" : "Display", qs->camera_mode ? "camera" : "display");
+	U_LOG_W("Qwerty: view mode -> %s (disturbance-free, no transition)",
+	        qs->camera_mode ? "Camera" : "Display");
 }
 
 void
