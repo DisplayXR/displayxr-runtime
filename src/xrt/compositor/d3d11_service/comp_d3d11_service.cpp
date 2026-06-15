@@ -4348,16 +4348,22 @@ d3d11_service_render_hud(struct d3d11_service_system *sys,
  * When content is smaller than atlas (legacy compromise scale), copies
  * each view's content region to a content-sized staging texture.
  * Returns the SRV to pass to process_atlas().
+ *
+ * @param tile_columns,tile_rows  The EFFECTIVE per-frame grid (what was packed
+ *        this frame), NOT sys->tile_columns — see #575 / ADR-030. For a mono
+ *        frame this is 1×1 even when the content rendering mode is still 3D.
  */
 static ID3D11ShaderResourceView *
 service_crop_atlas_for_dp(struct d3d11_service_system *sys,
                           struct d3d11_client_render_resources *res,
                           uint32_t content_view_w,
                           uint32_t content_view_h,
+                          uint32_t tile_columns,
+                          uint32_t tile_rows,
                           bool flip_y)
 {
-	uint32_t expected_w = sys->tile_columns * content_view_w;
-	uint32_t expected_h = sys->tile_rows * content_view_h;
+	uint32_t expected_w = tile_columns * content_view_w;
+	uint32_t expected_h = tile_rows * content_view_h;
 
 	// Content fills the full atlas — pass directly (only when no flip needed)
 	if (!flip_y && expected_w == sys->display_width && expected_h == sys->display_height) {
@@ -4409,7 +4415,7 @@ service_crop_atlas_for_dp(struct d3d11_service_system *sys,
 	uint32_t src_tex_w = atlas_desc.Width;
 	uint32_t src_tex_h = atlas_desc.Height;
 
-	uint32_t num_views = sys->tile_columns * sys->tile_rows;
+	uint32_t num_views = tile_columns * tile_rows;
 
 	// Source tile stride MUST be the atlas-derived slot stride — the same
 	// `atlas / tile_columns` formula the write side (projection blit, zones
@@ -4418,9 +4424,11 @@ service_crop_atlas_for_dp(struct d3d11_service_system *sys,
 	// the per-client atlas is created at native pixels
 	// (`feedback_atlas_stride_invariant`) — cropping view 1 at the scaled
 	// stride reads empty atlas between the tiles (#549: black view-1 on
-	// the standalone forced-IPC path).
-	uint32_t src_stride_w = atlas_desc.Width / (sys->tile_columns > 0 ? sys->tile_columns : 1);
-	uint32_t src_stride_h = atlas_desc.Height / (sys->tile_rows > 0 ? sys->tile_rows : 1);
+	// the standalone forced-IPC path). Uses the EFFECTIVE per-frame grid
+	// (#575): for a mono frame num_views==1, so only tile 0 (the real
+	// content) is read — never the stale tile 1 of a still-3D content mode.
+	uint32_t src_stride_w = atlas_desc.Width / (tile_columns > 0 ? tile_columns : 1);
+	uint32_t src_stride_h = atlas_desc.Height / (tile_rows > 0 ? tile_rows : 1);
 
 	if (flip_y && res->crop_rtv && sys->blit_vs && sys->blit_ps) {
 		// Shader blit path: crop + Y-flip in one pass per view.
@@ -4448,11 +4456,11 @@ service_crop_atlas_for_dp(struct d3d11_service_system *sys,
 
 		for (uint32_t v = 0; v < num_views && v < XRT_MAX_VIEWS; v++) {
 			uint32_t src_tile_x, src_tile_y;
-			u_tiling_view_origin(v, sys->tile_columns,
+			u_tiling_view_origin(v, tile_columns,
 			                     src_stride_w, src_stride_h,
 			                     &src_tile_x, &src_tile_y);
 			uint32_t dst_tile_x, dst_tile_y;
-			u_tiling_view_origin(v, sys->tile_columns,
+			u_tiling_view_origin(v, tile_columns,
 			                     content_view_w, content_view_h,
 			                     &dst_tile_x, &dst_tile_y);
 
@@ -9364,6 +9372,44 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				}
 				got_state = false; // skip the legacy counter-correction below
 			}
+			// #575 follow-up — STANDALONE re-assert (mirrors the workspace
+			// force_3d above). The SR SDK auto-demotes to 2D on eye-tracking
+			// loss but NEVER auto-promotes back, so FOLLOWING it (the branch
+			// below) leaves a standalone forced-IPC app stuck in 2D after
+			// tracking returns (unfocus→refocus). The shell never sees this
+			// because it re-asserts the controller's desired state here; do the
+			// same for standalone. Gate on sys->hardware_display_3d — the app's
+			// intended hardware mode, set only by its explicit
+			// xrRequestDisplayRenderingModeEXT — so a genuine user V→2D (which
+			// leaves it false) is NOT overridden. Re-assert 3D + skip the follow
+			// so the intent is never corrupted; persisting the request across
+			// polls means the panel returns to 3D the instant the SR can weave
+			// again (tracking regained). Cooldown-refreshed so we don't hammer.
+			if (!sys->workspace_mode && !bridge_live && got_state &&
+			    c->render.display_processor != nullptr && sys->hardware_display_3d &&
+			    !vendor_is_3d && !pending_flip && !in_cooldown) {
+				U_LOG_W("[force_3d] standalone vendor drifted to 2D (app wants 3D) — re-asserting 3D");
+				xrt_display_processor_d3d11_request_display_mode(c->render.display_processor, true);
+				// If the content rendering mode also drifted to 2D (e.g. a prior
+				// demote before this re-assert was reached), restore the app's
+				// last 3D mode so it re-submits a 3D atlas.
+				struct xrt_device *rhead = sys->xsysd ? sys->xsysd->static_roles.head : nullptr;
+				if (rhead != nullptr && rhead->hmd != NULL) {
+					uint32_t cur = rhead->hmd->active_rendering_mode_index;
+					bool cur_is_3d = cur < rhead->rendering_mode_count &&
+					                 rhead->rendering_modes[cur].hardware_display_3d;
+					if (!cur_is_3d && sys->last_3d_mode_index < rhead->rendering_mode_count &&
+					    rhead->rendering_modes[sys->last_3d_mode_index].hardware_display_3d) {
+						rhead->hmd->active_rendering_mode_index = sys->last_3d_mode_index;
+						broadcast_rendering_mode_change(sys, rhead, cur, sys->last_3d_mode_index);
+					}
+				}
+				sync_tile_layout(sys);
+				sys->cached_3d_state.store(true, std::memory_order_relaxed);
+				sys->last_3d_state_poll_ns.store(now_ns, std::memory_order_release);
+				sys->last_flip_landed_ns.store(now_ns, std::memory_order_release);
+				got_state = false; // skip the follow below
+			}
 			if (vendor_is_3d != sys->hardware_display_3d && !pending_flip && !in_cooldown && got_state) {
 				U_LOG_W("Vendor SDK hardware 3D state changed: %s → %s",
 				        sys->hardware_display_3d ? "3D" : "2D",
@@ -9612,6 +9658,19 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	ID3D11Texture2D *zc_tex = nullptr;
 	uint32_t zc_view_w = 0, zc_view_h = 0;
 
+	// #575 / ADR-030: the number of views ACTUALLY packed into the atlas this
+	// frame (set from the projection layer's proj_view_count below). The atlas
+	// recipe — and therefore the grid handed to the DP — must follow what was
+	// packed, NOT the global sys->tile_columns: that tracks the CONTENT
+	// rendering-mode grid, which is decoupled from the hardware 2D/3D state
+	// (ADR-028) and can lag it. A mono frame (1 view) packed while
+	// sys->tile_columns is still 2 (3D content mode) must be cropped + handed
+	// to the DP as a 1×1 atlas, or the DP weaves mono content → left-shift +
+	// tracking (the IPC half of #575). 0 = no projection layer this frame
+	// (e.g. a pure zones frame) → keep sys->tile_columns. This is the
+	// per-client analogue of the in-process eff_layout.
+	uint32_t eff_view_count = 0;
+
 	// Actual content dimensions from submitted rects - defaults to sys values,
 	// overwritten per projection layer (may differ for legacy compromise-scale apps)
 	uint32_t content_view_w = sys->view_width;
@@ -9691,6 +9750,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			proj_view_count = 1;
 		if (proj_view_count > XRT_MAX_VIEWS)
 			proj_view_count = XRT_MAX_VIEWS;
+
+		// #575: remember what this frame actually packed (see eff_view_count
+		// decl). The handoff/crop below derive their grid from this, not the
+		// possibly-lagging sys->tile_columns.
+		eff_view_count = proj_view_count;
 
 		// Extract per-view swapchains, textures, and image indices
 		struct d3d11_service_swapchain *view_scs[XRT_MAX_VIEWS] = {};
@@ -9990,14 +10054,23 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		for (uint32_t e = 0; e < proj_view_count; e++) {
 			if (!view_zc_eligible[e]) { all_views_zc_eligible = false; break; }
 		}
-		if (proj_view_count <= 1) zc_reason = "single_view";
-		else if (has_ui_layers) zc_reason = "ui_layers";
+		// ADR-030: zero-copy eligibility is governed SOLELY by
+		// u_tiling_can_zero_copy() below (submission fills the swapchain at the
+		// mode's tiling) — NOT by a view-count proxy. The old `proj_view_count
+		// > 1` gate excluded the one Windows case where zero-copy is legitimate
+		// (full-screen 2D: 1×1 @ 1.0×1.0 fills the worst-case envelope) and
+		// coupled the decision to the hardware 2D/3D flag. These remaining
+		// guards are NOT proxies — they mean "there's extra compositing to do,
+		// so a straight passthrough is impossible": UI/window-space/zones
+		// layers to blend, a view unsafe to read without a mutex, or workspace
+		// mode (Stage 2 composes N clients; per-client passthrough doesn't apply).
+		if (has_ui_layers) zc_reason = "ui_layers";
 		else if (has_window_space_layers) zc_reason = "window_space_layers";
 		else if (zones_frame || has_local_2d) zc_reason = "zones_layers";
 		else if (!all_views_zc_eligible) zc_reason = "view_ineligible";
 		else if (sys->workspace_mode) zc_reason = "workspace_mode";
 
-		if (proj_view_count > 1 && !has_ui_layers && !has_window_space_layers && !zones_frame && !has_local_2d &&
+		if (!has_ui_layers && !has_window_space_layers && !zones_frame && !has_local_2d &&
 		    all_views_zc_eligible && !sys->workspace_mode) {
 			// Check all views reference the same swapchain image
 			bool all_same = true;
@@ -10805,6 +10878,21 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	}
 
 
+	// #575 / ADR-030: the grid handed to the DP follows what was actually
+	// packed this frame, NOT the global sys->tile_columns. When only one view
+	// was packed (hardware 2D), the atlas is 1×1 regardless of a still-3D
+	// content rendering mode (ADR-028 decouples hardware from content). Without
+	// this, a mono frame with sys->tile_columns==2 is cropped to a 2-tile
+	// atlas (tile 1 = stale) and process_atlas() weaves mono content → the
+	// forced-IPC 2D left-shift + "weird tracking". eff_view_count==0 (no
+	// projection layer, e.g. a pure zones frame) keeps the mode grid.
+	uint32_t eff_tile_columns = sys->tile_columns;
+	uint32_t eff_tile_rows = sys->tile_rows;
+	if (eff_view_count == 1) {
+		eff_tile_columns = 1;
+		eff_tile_rows = 1;
+	}
+
 	// Select display processor input: zero-copy from app's swapchain, or atlas.
 	// The DP expects the atlas texture to be exactly content-sized
 	// (2*view_width x view_height for SBS). When a legacy/compromise-scale app
@@ -10819,8 +10907,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		input_view_w = zc_view_w;
 		input_view_h = zc_view_h;
 	} else {
-		// Crop atlas to content dims (mirrors d3d11_crop_atlas_for_dp in in-process path)
-		input_srv = service_crop_atlas_for_dp(sys, &c->render, content_view_w, content_view_h, c->atlas_flip_y);
+		// Crop atlas to content dims (mirrors d3d11_crop_atlas_for_dp in in-process path).
+		// Pass the EFFECTIVE per-frame grid, not sys->tile_columns (#575).
+		input_srv = service_crop_atlas_for_dp(sys, &c->render, content_view_w, content_view_h,
+		                                      eff_tile_columns, eff_tile_rows, c->atlas_flip_y);
 		input_view_w = content_view_w;
 		input_view_h = content_view_h;
 	}
@@ -10850,18 +10940,27 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 		// Canvas = (0,0,0,0): IPC hosted apps always own the full window,
 		// so canvas equals back buffer — no sub-rect needed.
-		static bool logged_dp = false;
-		if (!logged_dp) {
-			logged_dp = true;
-			U_LOG_W("DP HANDOFF: input_view=%ux%u tiles=%ux%u bb=%ux%u content=%ux%u zc=%d flip_y=%d",
-			        input_view_w, input_view_h, sys->tile_columns, sys->tile_rows,
+		// Re-arm the one-shot whenever the effective grid or hardware state
+		// changes, so the toggle frame (3D→2D) reprints instead of staying
+		// silent on the warmup-frame snapshot (#575 debugging).
+		static uint32_t logged_dp_cols = 0, logged_dp_rows = 0;
+		static int logged_dp_hw = -1;
+		if (logged_dp_cols != eff_tile_columns || logged_dp_rows != eff_tile_rows ||
+		    logged_dp_hw != (int)sys->hardware_display_3d) {
+			logged_dp_cols = eff_tile_columns;
+			logged_dp_rows = eff_tile_rows;
+			logged_dp_hw = (int)sys->hardware_display_3d;
+			U_LOG_W("DP HANDOFF: input_view=%ux%u eff_tiles=%ux%u sys_tiles=%ux%u bb=%ux%u "
+			        "content=%ux%u eff_vc=%u hw3d=%d zc=%d flip_y=%d",
+			        input_view_w, input_view_h, eff_tile_columns, eff_tile_rows,
+			        sys->tile_columns, sys->tile_rows,
 			        back_buffer_width, back_buffer_height,
-			        content_view_w, content_view_h,
-			        (int)use_zero_copy, (int)c->atlas_flip_y);
+			        content_view_w, content_view_h, eff_view_count,
+			        (int)sys->hardware_display_3d, (int)use_zero_copy, (int)c->atlas_flip_y);
 		}
 		xrt_display_processor_d3d11_process_atlas(
 		    c->render.display_processor, sys->context.get(), input_srv,
-		    input_view_w, input_view_h, sys->tile_columns, sys->tile_rows,
+		    input_view_w, input_view_h, eff_tile_columns, eff_tile_rows,
 		    // ADR-021: per-client single-layer weave is always Model A passthrough
 		    // (one client → nothing to blend). No set_atlas_encoding call ⟹ the DP
 		    // keeps its ENCODED default. Pass the real atlas format here.
@@ -10873,7 +10972,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		wil::com_ptr<ID3D11Resource> back_buffer;
 		c->render.back_buffer_rtv->GetResource(back_buffer.put());
 		if (use_zero_copy && zc_tex) {
-			D3D11_BOX src_box = {0, 0, 0, sys->tile_columns * input_view_w, sys->tile_rows * input_view_h, 1};
+			D3D11_BOX src_box = {0, 0, 0, eff_tile_columns * input_view_w, eff_tile_rows * input_view_h, 1};
 			sys->context->CopySubresourceRegion(
 			    back_buffer.get(), 0, 0, 0, 0,
 			    zc_tex, 0, &src_box);
