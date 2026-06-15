@@ -2170,8 +2170,14 @@ int main(int argc, char **argv)
             uint32_t maxTileH = tileRows > 0 ? app.swapchain.height / tileRows : app.swapchain.height;
             uint32_t renderW, renderH;
             if (!display3D) {
-                renderW = g_windowW;
-                renderH = g_windowH;
+                // 2D: the single view fills the full content region — window ×
+                // the active mode's view scale (#575; same window×scale recipe
+                // the 3D branch uses). Dropping the scale left the view
+                // under-filling the 2D tile → content shifted left + right eye
+                // black on DPs whose 2D scale != 1.0. (No-op on sim_display's
+                // 1.0×1.0 2D, but keeps the recipe identical to d3d11/vk/gl/d3d12.)
+                renderW = (uint32_t)(g_windowW * scaleX);
+                renderH = (uint32_t)(g_windowH * scaleY);
                 if (renderW > app.swapchain.width) renderW = app.swapchain.width;
                 if (renderH > app.swapchain.height) renderH = app.swapchain.height;
             } else {
