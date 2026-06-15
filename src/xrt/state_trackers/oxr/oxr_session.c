@@ -1573,8 +1573,8 @@ oxr_session_locate_views(struct oxr_logger *log,
 		        view_state.perspective_factor, view_state.m2v);
 	}
 #else
-	struct { bool camera_mode; float cam_spread_factor, cam_parallax_factor, cam_convergence,
-	         cam_half_tan_vfov, disp_spread_factor, disp_parallax_factor, disp_vHeight,
+	struct { bool camera_mode; float ipd_factor, parallax_factor, inv_convergence_distance,
+	         half_tan_vfov, m2v, virtual_display_height, perspective_factor,
 	         nominal_viewer_z, screen_height_m; } view_state = {0};
 	bool have_view_state = false;
 #endif
