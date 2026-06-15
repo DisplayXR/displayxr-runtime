@@ -163,6 +163,10 @@ if(ANDROID)
 	target_sources(
 		ipc_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_mainloop_android.c
 		)
+	# ipc_server_per_client_thread.c tears down the #558 service overlay on the
+	# last client disconnect — it calls aux_android directly, so link it here
+	# (ipc_shared links it PRIVATE, which doesn't propagate to ipc_server).
+	target_link_libraries(ipc_server PRIVATE aux_android)
 	target_link_libraries(
 		ipc_shared
 		PUBLIC ${ANDROID_LIBRARY}
