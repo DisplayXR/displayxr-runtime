@@ -639,6 +639,32 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		}
 	}
 
+	// #595: route the legacy qwerty debug state through the SAME ipc_view_rig_info
+	// structure the extension apps use, so the server, the in-process oxr_session.c
+	// path, and the qwerty toggle all share ONE Kooima-input resolution — input
+	// drift (nominal / H / tunables) becomes structurally impossible. When no rig
+	// is already present (a chained descriptor or the workspace override above both
+	// take precedence) and the runtime owns the qwerty head, synthesize a rig from
+	// stereo_state and let the single rig branch below drive the math. The pose is
+	// the qwerty head pose, so the pose-substitution below is a self-assign. The
+	// #575 collapse already ran upstream (eye_count is fixed before this call), so
+	// render_view_count / zone fields are left 0 — they are not consumed past it.
+	struct ipc_view_rig_info rig_synth;
+	if (rig == NULL && have_stereo_state && use_qwerty_head) {
+		rig_synth = (struct ipc_view_rig_info){
+		    .rig_type = stereo_state.camera_mode ? IPC_VIEW_RIG_CAMERA : IPC_VIEW_RIG_DISPLAY,
+		    .pose = {display_ori, display_pos},
+		    .virtual_display_height = stereo_state.virtual_display_height,
+		    .perspective_factor = stereo_state.perspective_factor,
+		    .inv_convergence_distance = stereo_state.inv_convergence_distance,
+		    .half_tan_vfov = stereo_state.half_tan_vfov,
+		    .m2v = stereo_state.m2v,
+		    .ipd_factor = stereo_state.ipd_factor,
+		    .parallax_factor = stereo_state.parallax_factor,
+		};
+		rig = &rig_synth;
+	}
+
 	// XR_EXT_view_rig (#396 W7): a chained rig drives the math below in
 	// place of the qwerty debug state — its pose replaces the qwerty/zero
 	// display pose, its tunables take the corresponding branch regardless
@@ -676,19 +702,17 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 
 	// Nominal viewer = the parallax-lerp target. The runtime owns the window on
 	// this path (headless bridge relays returned earlier), so it holds the full
-	// Kooima input set — INCLUDING the real nominal in xsysc->info. Use it for
-	// the legacy qwerty path too, not just chained rigs: qwerty_toggle_camera_mode
+	// Kooima input set — INCLUDING the real nominal in xsysc->info. The legacy
+	// qwerty path now flows through a synthesized rig (#595), so rig_display ||
+	// rig_camera is true whenever a Kooima compute runs (chained, workspace
+	// override, or qwerty) — one condition, one nominal. qwerty_toggle_camera_mode
 	// resolves the display<->camera equivalent against this SAME nominal
 	// (qs->nominal_viewer_z, seeded from the same pdi as xsysc->info), so the
-	// render must match it or the P-toggle shifts. Passing NULL here defaulted the
-	// converter to 0.5 while the toggle used 0.6 — the WebXR toggle shift, and the
-	// sole reason this server path diverged from the in-process oxr_session.c path
-	// (which always passes the real nominal). legacy_qwerty_kooima mirrors the
-	// exact condition under which the branches below consume stereo_state tunables.
+	// render matches it and the P-toggle is shift-free. (Passing NULL here once
+	// defaulted the converter to 0.5 while the toggle used 0.6 — the old WebXR
+	// toggle shift, the sole reason this path diverged from oxr_session.c.)
 	struct xrt_vec3 nominal_viewer = {0.0f, s->xsysc->info.nominal_viewer_y_m, s->xsysc->info.nominal_viewer_z_m};
-	const bool legacy_qwerty_kooima = have_stereo_state && use_qwerty_head;
-	const struct xrt_vec3 *rig_nominal =
-	    (rig_display || rig_camera || legacy_qwerty_kooima) ? &nominal_viewer : NULL;
+	const struct xrt_vec3 *rig_nominal = (rig_display || rig_camera) ? &nominal_viewer : NULL;
 
 	if (rig_reply != NULL) {
 		rig_reply->raw.display_pose = display_pose;
@@ -696,9 +720,11 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		    rig_camera ? IPC_VIEW_RIG_CAMERA : (rig_display ? IPC_VIEW_RIG_DISPLAY : IPC_VIEW_RIG_NONE);
 	}
 
-	if (rig_camera || (have_stereo_state && stereo_state.camera_mode && use_qwerty_head && !rig_display)) {
+	if (rig_camera) {
 		// CAMERA-CENTRIC PATH (canonical camera3d math, shared core)
-		// In workspace mode, app sessions take this path with qwerty pose as
+		// rig_camera is set either by a chained XrCameraRigEXT or by the qwerty
+		// synthesis above (#595) — both feed `rig`, one tunable source. In
+		// workspace mode, app sessions take this path with the qwerty pose as
 		// the camera position. qwerty_toggle_camera_mode preserves the
 		// convergence plane across the P-key toggle: cam->disp moves the
 		// qwerty pose forward by 1/cam_convergence and sets disp_vHeight
@@ -706,25 +732,13 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		// the convergence plane in camera mode coincide. Both paths must
 		// be reachable in workspace mode for app sessions or the toggle becomes
 		// asymmetric (works in non-workspace mode, no-op in workspace mode).
-		dxr_camera3d_tunables ct;
-		if (rig_camera) {
-			// Chained XrCameraRigEXT — descriptor tunables, not qwerty.
-			ct = (dxr_camera3d_tunables){
-			    .ipd_factor = rig->ipd_factor,
-			    .parallax_factor = rig->parallax_factor,
-			    .inv_convergence_distance = rig->inv_convergence_distance,
-			    .half_tan_vfov = rig->half_tan_vfov,
-			    .m2v = rig->m2v,
-			};
-		} else {
-			ct = (dxr_camera3d_tunables){
-			    .ipd_factor = stereo_state.ipd_factor,
-			    .parallax_factor = stereo_state.parallax_factor,
-			    .inv_convergence_distance = stereo_state.inv_convergence_distance,
-			    .half_tan_vfov = stereo_state.half_tan_vfov,
-			    .m2v = stereo_state.m2v,
-			};
-		}
+		dxr_camera3d_tunables ct = (dxr_camera3d_tunables){
+		    .ipd_factor = rig->ipd_factor,
+		    .parallax_factor = rig->parallax_factor,
+		    .inv_convergence_distance = rig->inv_convergence_distance,
+		    .half_tan_vfov = rig->half_tan_vfov,
+		    .m2v = rig->m2v,
+		};
 		struct dxr_xrt_view cam_views[XRT_MAX_VIEWS];
 		dxr_xrt_camera3d_compute_views(raw_eyes, eye_count, rig_nominal, &scr, &ct,
 		                               &display_pose, cam_views);
@@ -760,22 +774,16 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 
 		dxr_display3d_tunables dt = dxr_display3d_default_tunables();
 		if (rig_display) {
-			// Chained XrDisplayRigEXT — lifts the identity-m2v forcing
-			// for non-qwerty clients too, exactly like in-process.
+			// Chained XrDisplayRigEXT or the qwerty synthesis above (#595) —
+			// both feed `rig`. Lifts the identity-m2v forcing for non-qwerty
+			// clients too, exactly like in-process. For the qwerty case this
+			// carries disp_vHeight (the user-tuned virtual display size) so the
+			// P-key toggle from camera mode lands on the matching display height
+			// instead of shifting the convergence plane.
 			dt.ipd_factor = rig->ipd_factor;
 			dt.parallax_factor = rig->parallax_factor;
 			dt.perspective_factor = rig->perspective_factor;
 			dt.virtual_display_height = rig->virtual_display_height;
-		} else if (have_stereo_state && use_qwerty_head) {
-			// Same gate as the camera-centric branch: workspace clients must
-			// see disp_vHeight (the user-tuned virtual display size)
-			// rather than identity m2v, otherwise the P-key toggle from
-			// camera mode would land on a default-height display and
-			// shift the convergence plane.
-			dt.ipd_factor = stereo_state.ipd_factor;
-			dt.parallax_factor = stereo_state.parallax_factor;
-			dt.perspective_factor = stereo_state.perspective_factor;
-			dt.virtual_display_height = stereo_state.virtual_display_height;
 		} else {
 			dt.virtual_display_height = screen_height_m; // identity m2v
 		}
@@ -811,8 +819,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		IPC_WARN(s, "IPC SR: mode=%s display=(%.2f,%.2f,%.2f) FOV H=%.1f° V=%.1f°"
 		         " pose[0]=(%.3f,%.3f,%.3f) pose[1]=(%.3f,%.3f,%.3f)"
 		         " owns_win=%d workspace=%d workspace_host=%d appc=%d use_qwerty=%d app='%s'",
-		         (have_stereo_state && stereo_state.camera_mode && use_qwerty_head)
-		             ? "camera" : "display",
+		         rig_camera ? "camera" : "display",
 		         display_pos.x, display_pos.y, display_pos.z,
 		         left_h, left_v,
 		         out_poses[0].position.x, out_poses[0].position.y, out_poses[0].position.z,
