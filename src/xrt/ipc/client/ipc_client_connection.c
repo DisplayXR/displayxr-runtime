@@ -91,11 +91,67 @@ ipc_client_socket_connect(struct ipc_connection *ipc_c, struct _JavaVM *vm, void
 
 #elif defined(XRT_OS_WINDOWS)
 
+// Total time we are willing to keep retrying a busy pipe before giving up, and
+// the per-attempt WaitNamedPipe timeout used between retries.
+#define IPC_CONNECT_BUSY_TOTAL_MS 5000
+#define IPC_CONNECT_BUSY_WAIT_MS 500
+
+/*!
+ * Open the service comm pipe, retrying on ERROR_PIPE_BUSY.
+ *
+ * The server mainloop only posts the next listening pipe instance *after* it
+ * finishes handling the previous connection, so when several clients connect at
+ * once (e.g. a workspace launching multiple apps) some race into the gap and
+ * get ERROR_PIPE_BUSY (231). The canonical Win32 client dance for that is to
+ * WaitNamedPipe() for an instance to free up and retry, bounded by a deadline,
+ * instead of failing xrCreateInstance outright. See issue #603.
+ *
+ * On failure the original GetLastError() is preserved so callers can still tell
+ * "server not running" (ERROR_FILE_NOT_FOUND, drives the auto-launch fallback)
+ * apart from "server up but saturated" (ERROR_PIPE_BUSY).
+ */
+static HANDLE
+ipc_open_pipe_busy_retry(struct ipc_connection *ipc_c, const char *pipe_name)
+{
+	DWORD waited_ms = 0;
+	for (int attempt = 1;; attempt++) {
+		HANDLE pipe_inst =
+		    CreateFileA(pipe_name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+		if (pipe_inst != INVALID_HANDLE_VALUE) {
+			if (waited_ms > 0) {
+				// Leave a breadcrumb that the busy-retry path recovered a
+				// concurrent connect that would previously have failed (#603).
+				IPC_INFO(ipc_c, "Pipe %s was busy, connected after ~%u ms (attempt %d)",
+				         pipe_name, waited_ms, attempt);
+			}
+			return pipe_inst;
+		}
+
+		DWORD err = GetLastError();
+		if (err != ERROR_PIPE_BUSY) {
+			// Server-down or a genuine error: hand back with the error intact.
+			SetLastError(err);
+			return INVALID_HANDLE_VALUE;
+		}
+
+		if (waited_ms >= IPC_CONNECT_BUSY_TOTAL_MS) {
+			IPC_ERROR(ipc_c, "Pipe %s still busy after %u ms, giving up", pipe_name, waited_ms);
+			SetLastError(ERROR_PIPE_BUSY);
+			return INVALID_HANDLE_VALUE;
+		}
+
+		// Block until an instance frees up, then retry. WaitNamedPipe returning
+		// FALSE (its own timeout) is fine — we just loop until the deadline.
+		WaitNamedPipeA(pipe_name, IPC_CONNECT_BUSY_WAIT_MS);
+		waited_ms += IPC_CONNECT_BUSY_WAIT_MS;
+	}
+}
+
 #if defined(NO_XRT_SERVICE_LAUNCH) || !defined(XRT_SERVICE_EXECUTABLE)
 static HANDLE
 ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 {
-	HANDLE pipe_inst = CreateFileA(pipe_name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+	HANDLE pipe_inst = ipc_open_pipe_busy_retry(ipc_c, pipe_name);
 	if (pipe_inst == INVALID_HANDLE_VALUE) {
 		DWORD err = GetLastError();
 		IPC_ERROR(ipc_c, "Connect to %s failed: %d %s", pipe_name, err, ipc_winerror(err));
@@ -107,7 +163,7 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 static HANDLE
 ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 {
-	HANDLE pipe_inst = CreateFileA(pipe_name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+	HANDLE pipe_inst = ipc_open_pipe_busy_retry(ipc_c, pipe_name);
 	if (pipe_inst != INVALID_HANDLE_VALUE) {
 		return pipe_inst;
 	}
@@ -192,7 +248,11 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 			break;
 		}
 		err = GetLastError();
-		if (err != ERROR_FILE_NOT_FOUND || WaitForSingleObject(pi.hProcess, 100) != WAIT_TIMEOUT) {
+		// Keep waiting while the freshly-launched service is still spinning up
+		// its pipe (FILE_NOT_FOUND) or is momentarily saturated (PIPE_BUSY), as
+		// long as the service process is still alive.
+		if ((err != ERROR_FILE_NOT_FOUND && err != ERROR_PIPE_BUSY) ||
+		    WaitForSingleObject(pi.hProcess, 100) != WAIT_TIMEOUT) {
 			IPC_ERROR(ipc_c, "Connect to %s failed: %d %s", pipe_name, err, ipc_winerror(err));
 			break;
 		}
