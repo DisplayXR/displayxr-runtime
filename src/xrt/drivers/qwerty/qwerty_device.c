@@ -1133,8 +1133,6 @@ qwerty_toggle_camera_mode(struct qwerty_system *qs)
 	// converter), so there is no visible change. The known per-mode defaults
 	// (0.5 dp / 36° vFOV / m2v 1 for camera; vHeight 1.3 for display) apply only
 	// at the initial camera-centric startup; a toggle preserves the current look.
-	// Cancel any in-flight animation (e.g. left over from a manual adjust path).
-	qs->rig_animating = false;
 
 	// Reset controllers to mode-appropriate default positions (attached to head)
 	if (qs->lctrl) {
@@ -1151,7 +1149,6 @@ qwerty_toggle_camera_mode(struct qwerty_system *qs)
 void
 qwerty_adjust_view_factor(struct qwerty_system *qs, float multiplier)
 {
-	qs->rig_animating = false; // manual adjust cancels an in-flight P-toggle transition
 	if (qs->camera_mode) {
 		float v = clampf(qs->cam_spread_factor * multiplier, 0.01f, 1.0f);
 		qs->cam_spread_factor = v;
@@ -1171,20 +1168,21 @@ qwerty_adjust_convergence(struct qwerty_system *qs, float direction)
 	if (!qs->camera_mode) {
 		return; // No-op in display mode
 	}
-	qs->rig_animating = false; // manual adjust cancels an in-flight P-toggle transition
-	// Comfort clamp: never let the zero-parallax plane come NEARER than the
-	// nominal viewing distance. Beyond that, far content's disparity exceeds the
-	// IPD and the eyes DIVERGE (the display-equivalent ipd_factor = ipd*m2v*invd*N
-	// goes > 1). invd <= 1/(m2v*N) caps that; since cam_spread <= 1, it guarantees
-	// the comfort factor (= cam_spread*m2v*invd*N) <= cam_spread <= 1. Conservative
-	// (assumes content at infinity) but right for a generic legacy driver that
-	// doesn't know scene depth; a depth-budget policy could relax it.
-	float conv_max = (qs->cam_m2v > 0.0f && qs->nominal_viewer_z > 0.0f)
-	                     ? 1.0f / (qs->cam_m2v * qs->nominal_viewer_z)
-	                     : 2.0f;
+	// Comfort clamp via the SHARED gate (one comfort definition across runtime +
+	// demos): never let the zero-parallax plane come nearer than the comfort
+	// limit, else far content's disparity exceeds the IPD and the eyes DIVERGE
+	// (display-equivalent ipd = ipd*m2v*invd*N > 1). dxr_rig_max_convergence =
+	// 1/(max(1,ipd)*m2v*N); qwerty's spread <= 1 so this is the nominal-distance
+	// cap 1/(m2v*N). Conservative (assumes content at infinity); a depth-aware
+	// caller could pass a scene far plane to relax it.
+	float conv_max = 2.0f;
+	if (qs->cam_m2v > 0.0f && qs->nominal_viewer_z > 0.0f) {
+		dxr_rig_display_info info = {qs->screen_height_m, 1.0f, qs->nominal_viewer_z};
+		dxr_camera_rig cam = {.ipd_factor = qs->cam_spread_factor, .m2v = qs->cam_m2v};
+		conv_max = dxr_rig_max_convergence(&cam, &info, 0.0f);
+	}
 	qs->cam_convergence = clampf(qs->cam_convergence + direction * 0.05f, 0.0f, conv_max);
-	U_LOG_I("Qwerty: Convergence = %.2f diopters (max %.2f = nominal-distance comfort limit)",
-	        qs->cam_convergence, conv_max);
+	U_LOG_I("Qwerty: Convergence = %.2f diopters (max %.2f = comfort limit)", qs->cam_convergence, conv_max);
 }
 
 void
@@ -1193,7 +1191,6 @@ qwerty_adjust_vheight(struct qwerty_system *qs, float multiplier)
 	if (qs->camera_mode) {
 		return; // No-op in camera mode
 	}
-	qs->rig_animating = false; // manual adjust cancels an in-flight P-toggle transition
 	qs->disp_vHeight = clampf(qs->disp_vHeight * multiplier, 0.1f, 10.0f);
 	U_LOG_I("Qwerty: vHeight = %.2f m", qs->disp_vHeight);
 }
@@ -1214,49 +1211,12 @@ qwerty_reset_view_state(struct qwerty_system *qs)
 	qs->disp_vHeight = 1.3f;
 	qs->disp_perspective = 1.0f;
 
-	qs->rig_animating = false;
-
 	if (qs->hmd != NULL) {
 		qs->hmd->base.pose.position = QWERTY_HMD_CAMERA_POS;
 		qs->hmd->base.pose.orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
 	}
 
 	U_LOG_W("Qwerty: view state reset to camera defaults");
-}
-
-// Advance the P-toggle smooth transition: lerp the active rig's tunables from
-// the per-toggle start snapshot to the active mode's DEFAULTS (smoothstep over
-// QWERTY_RIG_ANIM_DUR_S). Time-based and idempotent, so it is safe to call from
-// every qwerty_get_view_state reader within a frame.
-#define QWERTY_RIG_ANIM_DUR_S 0.4f
-static void
-qwerty_advance_rig_anim(struct qwerty_system *qs)
-{
-	if (!qs->rig_animating) {
-		return;
-	}
-	float elapsed = (float)((double)(os_monotonic_get_ns() - qs->rig_anim_start_ns) * 1e-9);
-	float t = elapsed / QWERTY_RIG_ANIM_DUR_S;
-	if (t >= 1.0f) {
-		t = 1.0f;
-	}
-	float s = t * t * (3.0f - 2.0f * t); // smoothstep
-	if (qs->camera_mode) {
-		// → camera defaults (0.5 dp convergence, 0.3249 half-tan vFOV, m2v 1, spread 1)
-		qs->cam_convergence = qs->anim_from_convergence + (0.5f - qs->anim_from_convergence) * s;
-		qs->cam_half_tan_vfov = qs->anim_from_half_tan_vfov + (0.3249f - qs->anim_from_half_tan_vfov) * s;
-		qs->cam_m2v = qs->anim_from_m2v + (1.0f - qs->anim_from_m2v) * s;
-		qs->cam_spread_factor = qs->anim_from_spread + (1.0f - qs->anim_from_spread) * s;
-		qs->cam_parallax_factor = qs->cam_spread_factor;
-	} else {
-		// → display defaults (vHeight 1.3 m, spread 1; perspective stays 1)
-		qs->disp_vHeight = qs->anim_from_vHeight + (1.3f - qs->anim_from_vHeight) * s;
-		qs->disp_spread_factor = qs->anim_from_spread + (1.0f - qs->anim_from_spread) * s;
-		qs->disp_parallax_factor = qs->disp_spread_factor;
-	}
-	if (t >= 1.0f) {
-		qs->rig_animating = false;
-	}
 }
 
 bool
@@ -1283,8 +1243,6 @@ qwerty_get_view_state(struct xrt_device **xdevs, size_t xdev_count, struct qwert
 	if (qs == NULL) {
 		return false;
 	}
-
-	qwerty_advance_rig_anim(qs); // step the P-toggle smooth transition (time-based)
 
 	// Emit the single ACTIVE rig (unified shape). Shared ipd/parallax come from
 	// the active mode's spread/parallax; the type-specific fields are carried so
