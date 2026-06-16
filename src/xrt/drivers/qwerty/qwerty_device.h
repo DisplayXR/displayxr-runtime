@@ -61,6 +61,8 @@ struct qwerty_system
 	float disp_spread_factor;      //!< [0.01,1] default 1.0 (= disp_parallax always)
 	float disp_parallax_factor; //!< [0.01,1] default 1.0 (= disp_ipd always)
 	float disp_vHeight;         //!< [0.1,10] meters, default 1.3
+	float disp_perspective;     //!< [0.1,10] default 1.0; set to the camera→display
+	                            //!< converted perspective on P (so P is seamless)
 
 	// P-toggle smooth transition: on toggle, the active rig starts at the
 	// converter-equivalent of the previous rig (disturbance-free first frame)
