@@ -458,6 +458,23 @@ endif()
 # Descend into the source
 ###
 
+# Visual Studio (multi-config) co-location: scatter-free build tree.
+# The VS generator puts each target in its own <target>/<Config>/ dir, so
+# displayxr-service.exe ends up WITHOUT DisplayXRClient.dll next to it and
+# preload_runtime_core_dll() (target_plugin_loader.c) can't pin the runtime
+# core → plug-in import of it fails → no display processor → the service
+# exits with XRT_ERROR_DEVICE_CREATION_FAILED when run from the build tree
+# (F5 in the solution). Co-locate every exe + DLL per-config so the build
+# tree mirrors the installed _package/bin layout and runs as-is. Ninja +
+# install are unaffected (this only triggers for the VS generator).
+if(CMAKE_GENERATOR MATCHES "Visual Studio")
+	foreach(_cfg Debug Release RelWithDebInfo MinSizeRel)
+		string(TOUPPER "${_cfg}" _CFG)
+		set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${_CFG} "${CMAKE_BINARY_DIR}/bin/${_cfg}")
+		set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${_CFG} "${CMAKE_BINARY_DIR}/bin/${_cfg}")
+	endforeach()
+endif()
+
 add_subdirectory(src)
 
 if(BUILD_TESTING)
