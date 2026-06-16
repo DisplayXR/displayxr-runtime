@@ -55,7 +55,7 @@ REM versions.json) — no COMPONENT_PINKEY override needed for the flat schema.
 
 REM Demo components installed by --with-demos (prebuilt release assets only).
 REM Mirrors DEMO_COMPONENTS in scripts\lib\components.sh; keep in sync.
-set "DEMO_COMPONENTS=gauss_demo modelviewer_demo mediaplayer_demo"
+set "DEMO_COMPONENTS=gauss_demo modelviewer_demo mediaplayer_demo avatar_demo earthview_demo"
 
 set "COMPONENT_REPO_modelviewer_demo=DisplayXR/displayxr-demo-modelviewer"
 set "COMPONENT_EXE_modelviewer_demo=DisplayXRModelViewerSetup-*.exe"
@@ -64,6 +64,14 @@ set "COMPONENT_MARKER_modelviewer_demo=HKLM\Software\DisplayXR\Demos\ModelViewer
 set "COMPONENT_REPO_mediaplayer_demo=DisplayXR/displayxr-demo-mediaplayer"
 set "COMPONENT_EXE_mediaplayer_demo=DisplayXRMediaPlayerSetup-*.exe"
 set "COMPONENT_MARKER_mediaplayer_demo=HKLM\Software\DisplayXR\Demos\MediaPlayer"
+
+set "COMPONENT_REPO_avatar_demo=DisplayXR/displayxr-demo-avatar"
+set "COMPONENT_EXE_avatar_demo=DisplayXRAvatarSetup-*.exe"
+set "COMPONENT_MARKER_avatar_demo=HKLM\Software\DisplayXR\Demos\Avatar"
+
+set "COMPONENT_REPO_earthview_demo=DisplayXR/displayxr-demo-earthview"
+set "COMPONENT_EXE_earthview_demo=DisplayXREarthViewSetup-*.exe"
+set "COMPONENT_MARKER_earthview_demo=HKLM\Software\DisplayXR\Demos\EarthView"
 
 REM --- Default flag state ---
 set "WITH_MCP=0"
