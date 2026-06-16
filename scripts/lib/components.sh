@@ -88,7 +88,7 @@ COMPONENT_INSTALL_MARKER_WINDOWS_gauss_demo="HKLM\\Software\\DisplayXR\\Demos\\G
 # Space-separated; add a demo here once it ships a release installer that CI
 # attaches on a v* tag. The `setup-displayxr.bat` mirror keeps its own copy of
 # this list — keep both in sync.
-DEMO_COMPONENTS="gauss_demo modelviewer_demo mediaplayer_demo avatar_demo earthview_demo"
+DEMO_COMPONENTS="gauss_demo modelviewer_demo mediaplayer_demo avatar_demo"
 
 # --- modelviewer_demo ---
 # glTF 2.0 PBR model viewer demo (displayxr-demo-modelviewer). Dual-platform:
@@ -123,17 +123,6 @@ COMPONENT_PKG_MACOS_avatar_demo="DisplayXRAvatar-*.pkg"
 COMPONENT_EXE_WINDOWS_avatar_demo="DisplayXRAvatarSetup-*.exe"
 COMPONENT_INSTALL_MARKER_MACOS_avatar_demo="/Applications/3D Avatar.app"
 COMPONENT_INSTALL_MARKER_WINDOWS_avatar_demo="HKLM\\Software\\DisplayXR\\Demos\\Avatar"
-
-# --- earthview_demo ---
-# EarthView demo (displayxr-demo-earthview). 3D Tiles globe renderer on the 3D
-# display via the OpenXR extension wire protocol — no vendor SR SDK. Both
-# installers (macOS .pkg + Windows .exe) are built + attached by CI on a v*
-# tag. The macOS app installs to "EarthView.app".
-COMPONENT_REPO_earthview_demo="DisplayXR/displayxr-demo-earthview"
-COMPONENT_PKG_MACOS_earthview_demo="DisplayXREarthView-*.pkg"
-COMPONENT_EXE_WINDOWS_earthview_demo="DisplayXREarthViewSetup-*.exe"
-COMPONENT_INSTALL_MARKER_MACOS_earthview_demo="/Applications/EarthView.app"
-COMPONENT_INSTALL_MARKER_WINDOWS_earthview_demo="HKLM\\Software\\DisplayXR\\Demos\\EarthView"
 
 # Helper: look up a per-component field for the current platform.
 #   $1 = component name (runtime, shell, leia_plugin, mcp_tools, gauss_demo)
