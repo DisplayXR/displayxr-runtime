@@ -1172,8 +1172,19 @@ qwerty_adjust_convergence(struct qwerty_system *qs, float direction)
 		return; // No-op in display mode
 	}
 	qs->rig_animating = false; // manual adjust cancels an in-flight P-toggle transition
-	qs->cam_convergence = clampf(qs->cam_convergence + direction * 0.05f, 0.0f, 2.0f);
-	U_LOG_I("Qwerty: Convergence = %.2f diopters", qs->cam_convergence);
+	// Comfort clamp: never let the zero-parallax plane come NEARER than the
+	// nominal viewing distance. Beyond that, far content's disparity exceeds the
+	// IPD and the eyes DIVERGE (the display-equivalent ipd_factor = ipd*m2v*invd*N
+	// goes > 1). invd <= 1/(m2v*N) caps that; since cam_spread <= 1, it guarantees
+	// the comfort factor (= cam_spread*m2v*invd*N) <= cam_spread <= 1. Conservative
+	// (assumes content at infinity) but right for a generic legacy driver that
+	// doesn't know scene depth; a depth-budget policy could relax it.
+	float conv_max = (qs->cam_m2v > 0.0f && qs->nominal_viewer_z > 0.0f)
+	                     ? 1.0f / (qs->cam_m2v * qs->nominal_viewer_z)
+	                     : 2.0f;
+	qs->cam_convergence = clampf(qs->cam_convergence + direction * 0.05f, 0.0f, conv_max);
+	U_LOG_I("Qwerty: Convergence = %.2f diopters (max %.2f = nominal-distance comfort limit)",
+	        qs->cam_convergence, conv_max);
 }
 
 void
