@@ -674,11 +674,21 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 	dxr_screen scr = {screen_width_m, screen_height_m};
 	struct xrt_pose display_pose = {display_ori, display_pos};
 
-	// Rig locates get the real nominal viewer (the parallax lerp target),
-	// matching the in-process path; legacy locates keep the NULL/0.5m
-	// default they have always used.
+	// Nominal viewer = the parallax-lerp target. The runtime owns the window on
+	// this path (headless bridge relays returned earlier), so it holds the full
+	// Kooima input set — INCLUDING the real nominal in xsysc->info. Use it for
+	// the legacy qwerty path too, not just chained rigs: qwerty_toggle_camera_mode
+	// resolves the display<->camera equivalent against this SAME nominal
+	// (qs->nominal_viewer_z, seeded from the same pdi as xsysc->info), so the
+	// render must match it or the P-toggle shifts. Passing NULL here defaulted the
+	// converter to 0.5 while the toggle used 0.6 — the WebXR toggle shift, and the
+	// sole reason this server path diverged from the in-process oxr_session.c path
+	// (which always passes the real nominal). legacy_qwerty_kooima mirrors the
+	// exact condition under which the branches below consume stereo_state tunables.
 	struct xrt_vec3 nominal_viewer = {0.0f, s->xsysc->info.nominal_viewer_y_m, s->xsysc->info.nominal_viewer_z_m};
-	const struct xrt_vec3 *rig_nominal = (rig_display || rig_camera) ? &nominal_viewer : NULL;
+	const bool legacy_qwerty_kooima = have_stereo_state && use_qwerty_head;
+	const struct xrt_vec3 *rig_nominal =
+	    (rig_display || rig_camera || legacy_qwerty_kooima) ? &nominal_viewer : NULL;
 
 	if (rig_reply != NULL) {
 		rig_reply->raw.display_pose = display_pose;
