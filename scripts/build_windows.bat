@@ -4,11 +4,12 @@ setlocal enabledelayedexpansion
 :: ============================================================
 :: DisplayXR Local Build Script
 :: Downloads all dependencies on first run, then builds.
-:: Usage: scripts\build_windows.bat [generate|build|installer|test-apps|all]
-::   generate   - CMake generate only
+:: Usage: scripts\build_windows.bat [generate|build|installer|test-apps|vs2022|all]
+::   generate   - CMake generate only (Ninja Multi-Config)
 ::   build      - Build runtime + install
 ::   installer  - Build runtime installer
 ::   test-apps  - Build all test apps
+::   vs2022     - Generate Visual Studio 2022 solution (build_vs2022\XRT.sln)
 ::   all        - Everything (default)
 ::
 :: The DisplayXR Shell ships from a separate repo. Installer download:
@@ -140,6 +141,7 @@ echo.
 if "%TARGET%"=="build" if exist "%REPO%build\build.ninja" goto :do_build
 if "%TARGET%"=="installer" if exist "%REPO%build\build.ninja" goto :do_installer
 if "%TARGET%"=="test-apps" goto :do_test_apps
+if "%TARGET%"=="vs2022" goto :do_vs2022
 
 echo === CMake Generate ===
 cmake -S "%REPO%." -B "%REPO%build" -G "Ninja Multi-Config" ^
@@ -416,6 +418,37 @@ echo Run scripts generated in %PKG%\
 
 echo.
 echo === Test apps done ===
+goto :done
+
+:do_vs2022
+echo.
+echo === Generating Visual Studio 2022 solution ===
+cmake -S "%REPO%." -B "%REPO%build_vs2022" -G "Visual Studio 17 2022" -A x64 ^
+  -DCMAKE_TOOLCHAIN_FILE="%REPO%vcpkg\scripts\buildsystems\vcpkg.cmake" ^
+  -DVCPKG_MANIFEST_FEATURES=gui ^
+  -DCMAKE_INSTALL_PREFIX="%REPO%_package" ^
+  -DXRT_BUILD_INSTALLER=ON ^
+  -DXRT_FEATURE_SERVICE=ON ^
+  -DXRT_FEATURE_HYBRID_MODE=ON ^
+  -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
+
+if %ERRORLEVEL% NEQ 0 (
+    echo VS2022 CMake generate FAILED
+    exit /b 1
+)
+
+echo.
+echo === Visual Studio 2022 solution ready ===
+echo   Solution: %REPO%build_vs2022\XRT.sln
+echo   Build the INSTALL target, then set displayxr-service (or displayxr-cli)
+echo   as the startup project to debug the runtime + plug-in + SR SDK.
+echo   To debug a test app: build it with `build_windows.bat test-apps` and
+echo   launch _package\run_cube_handle_d3d11_win.bat (sets XR_RUNTIME_JSON +
+echo   has openxr_loader.dll beside the exe); attach VS, or add a debug profile
+echo   pointing at that exe with the same env.
+echo   (Folding a test app in as a one-click F5 target: WIP, see issue/PR notes
+echo   — set -DXRT_VS_LAUNCH_APP=cube_handle_d3d11_win once that lands.)
+goto :done
 
 :done
 echo.

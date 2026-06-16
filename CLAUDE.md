@@ -80,6 +80,8 @@ Specs: `docs/specs/extensions/`. Eye-tracking MANAGED vs MANUAL contract: `docs/
 Languages: C11 (core), C++17 (where needed), Python 3.6+ (build scripts).
 
 ### Windows (preferred on a Leia SR machine — iterate locally, not via CI)
+
+**One-line dev environment (from source).** `scripts\dev-setup.bat` (elevated) is the dev mirror of the user bundle installer: it builds the runtime, registers the ABI-matched sim-display (and `--leia` builds+registers the Leia plug-in from source), points the machine's active OpenXR runtime at the dev build, and generates the VS solution — fresh clone to debuggable in one command. `--leia` / `--leia=release` / `--all` / `--no-vs` / `--no-active-runtime` / `--clean`. (Contrast `scripts\setup-displayxr.bat`, which *downloads released* installers instead of building.) The granular `build_windows.bat` targets below are what it orchestrates:
 ```bat
 scripts\build_windows.bat all        REM generate + runtime + installer + test apps
 scripts\build_windows.bat build      REM runtime only (fastest iteration)
@@ -201,6 +203,14 @@ _package\run_cube_handle_d3d11_win.bat
 **Which DLL loaded?** Every `xrCreateInstance` logs a WARN line near the top of `%LOCALAPPDATA%\DisplayXR\DisplayXR_<exe>.<pid>_<ts>.log` — search `loaded from:` for the authoritative path. Full dev-iteration reference: `docs/getting-started/building.md`.
 
 After a rebuild, copy runtime binaries into `C:\Program Files\DisplayXR\Runtime` (registry discovery finds it); only run the installer when the installer itself changed.
+
+**From-source builds need a registered display processor (Windows).** Windows plug-in discovery is **registry-only** (`HKLM\Software\DisplayXR\DisplayProcessors`) — there's no adjacent-dir / `XRT_PLUGIN_SEARCH_PATH` fallback like POSIX has. `build_windows.bat` builds the sim-display plug-in DLL but does **not** register it, so a pure from-source runtime finds no DP and `xrt_instance_create_system` fails (`XRT_ERROR_DEVICE_CREATION_FAILED` / app "Failed to initialize OpenXR"). Register the freshly-built (ABI-matched) plug-in once, from an **elevated** prompt:
+```bat
+scripts\register_dev_plugin.bat            REM dev sim-display (fallback, no hardware)
+scripts\register_dev_plugin.bat leia C:\path\to\DisplayXR-LeiaSR.dll   REM dev Leia plug-in (ProbeOrder 50)
+scripts\register_dev_plugin.bat list       REM displayxr-cli dp list
+```
+A from-source runtime that's **ahead of the released ABI** will ABI-reject an *installed* (released) vendor plug-in — register your **dev-built** plug-in instead. (POSIX dev builds don't need this: the loader finds plug-ins next to the runtime.)
 
 ### Headless diagnostics (`displayxr-cli`)
 `displayxr-cli` runs the runtime **without a compositor/GPU/window** — it exercises the real plug-in discovery + display-processor path in-process (`target_instance_no_comp`), so it's the fastest way to check "did the runtime start, find a DP, and get sane display info?" without launching an app.

@@ -458,6 +458,23 @@ endif()
 # Descend into the source
 ###
 
+# Visual Studio (multi-config) co-location: scatter-free build tree.
+# The VS generator puts each target in its own <target>/<Config>/ dir, so
+# displayxr-service.exe ends up WITHOUT DisplayXRClient.dll next to it and
+# preload_runtime_core_dll() (target_plugin_loader.c) can't pin the runtime
+# core → plug-in import of it fails → no display processor → the service
+# exits with XRT_ERROR_DEVICE_CREATION_FAILED when run from the build tree
+# (F5 in the solution). Co-locate every exe + DLL per-config so the build
+# tree mirrors the installed _package/bin layout and runs as-is. Ninja +
+# install are unaffected (this only triggers for the VS generator).
+if(CMAKE_GENERATOR MATCHES "Visual Studio")
+	foreach(_cfg Debug Release RelWithDebInfo MinSizeRel)
+		string(TOUPPER "${_cfg}" _CFG)
+		set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${_CFG} "${CMAKE_BINARY_DIR}/bin/${_cfg}")
+		set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${_CFG} "${CMAKE_BINARY_DIR}/bin/${_cfg}")
+	endforeach()
+endif()
+
 add_subdirectory(src)
 
 if(BUILD_TESTING)
@@ -468,6 +485,63 @@ endif()
 # DisplayXR Windows installer
 if(WIN32 AND XRT_BUILD_INSTALLER)
 	add_subdirectory(installer)
+endif()
+
+# IDE convenience: optionally fold one test app into this build so it shows up
+# as a launchable startup target (mainly for the Visual Studio solution from
+# `build_windows.bat vs2022`). Empty by default — the Ninja runtime build and
+# build_windows.bat build the test apps as separate projects. With this set,
+# F5 launches the app, which loads this dev runtime + the vendor plug-in + SR
+# SDK, so you can step across all three. The chosen app's CMakeLists must use
+# CMAKE_CURRENT_SOURCE_DIR (not CMAKE_SOURCE_DIR) so it relocates when folded.
+#
+# WIP — folding the full test-app project drags in its standalone-only
+# assumptions. Known gaps to close before turning this on by default:
+#   1. test_apps/common FetchContents displayxr-common; in the folded scope the
+#      `displayxr::common` target doesn't resolve (the runtime build also pins
+#      displayxr-common) → "target was not found". Reconcile the two fetches /
+#      reuse the runtime's displayxr::common.
+#   2. The test app's OpenXR import is single-config; under the multi-config VS
+#      generator it errors "IMPORTED_IMPLIB not set … MinSizeRel". Apply the
+#      same all-configs backfill used in targets/webxr_bridge/CMakeLists.txt.
+#   3. openxr_loader.dll isn't copied next to the folded exe (only
+#      build_windows.bat does that today) → add a POST_BUILD copy, and rely on
+#      VS_DEBUGGER_ENVIRONMENT below for XR_RUNTIME_JSON (so F5, not a bare run).
+set(XRT_VS_LAUNCH_APP "" CACHE STRING
+	"test_apps/<name> to fold in as an IDE launch target (e.g. cube_handle_d3d11_win); empty = none")
+if(XRT_VS_LAUNCH_APP)
+	if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_apps/${XRT_VS_LAUNCH_APP}/CMakeLists.txt")
+		message(STATUS "Folding test app as IDE launch target: ${XRT_VS_LAUNCH_APP}")
+		# The test apps install a workspace manifest via displayxr_install_manifest,
+		# defined by displayxr-common (FetchContent'd by test_apps/common) in the
+		# standalone build. In the folded build that helper isn't defined; the
+		# manifest sidecar is only for shell/workspace discovery and isn't needed
+		# for an IDE launch target, so provide a no-op fallback if it's missing.
+		if(NOT COMMAND displayxr_install_manifest)
+			function(displayxr_install_manifest)
+			endfunction()
+		endif()
+		add_subdirectory(
+			test_apps/${XRT_VS_LAUNCH_APP}
+			test_apps_launch/${XRT_VS_LAUNCH_APP}
+			)
+		if(TARGET ${XRT_VS_LAUNCH_APP})
+			# F5 uses the freshly-installed dev runtime manifest. Build the
+			# INSTALL target first so this path exists.
+			set_target_properties(
+				${XRT_VS_LAUNCH_APP}
+				PROPERTIES VS_DEBUGGER_ENVIRONMENT
+					   "XR_RUNTIME_JSON=${CMAKE_INSTALL_PREFIX}/DisplayXR_win64.json"
+				)
+			# Make it the solution's default startup project.
+			set_property(DIRECTORY PROPERTY VS_STARTUP_PROJECT ${XRT_VS_LAUNCH_APP})
+		endif()
+	else()
+		message(
+			WARNING
+			"XRT_VS_LAUNCH_APP=${XRT_VS_LAUNCH_APP} not found under test_apps/ — skipping"
+			)
+	endif()
 endif()
 
 ###

@@ -26,6 +26,41 @@ if(NOT OpenXR_FOUND)
 	endif()
 endif()
 
+# The prebuilt OpenXR SDK's config package declares the loader target for a
+# single configuration (RelWithDebInfo only). Multi-config generators (the
+# Visual Studio one in particular) hard-error when generating any other
+# configuration of a consumer: "IMPORTED_IMPLIB not set for ... MinSizeRel".
+# Backfill every configuration this build generates from whichever implib the
+# package did declare — the loader is a plain prebuilt DLL, so one binary
+# serves all configs.
+if(TARGET OpenXR::openxr_loader)
+	get_target_property(_xr_implib OpenXR::openxr_loader IMPORTED_IMPLIB)
+	get_target_property(_xr_dll OpenXR::openxr_loader IMPORTED_LOCATION)
+	get_target_property(_xr_configs OpenXR::openxr_loader IMPORTED_CONFIGURATIONS)
+	if(NOT _xr_implib AND _xr_configs)
+		list(GET _xr_configs 0 _xr_cfg0)
+		get_target_property(_xr_implib OpenXR::openxr_loader IMPORTED_IMPLIB_${_xr_cfg0})
+		get_target_property(_xr_dll OpenXR::openxr_loader IMPORTED_LOCATION_${_xr_cfg0})
+	endif()
+	if(_xr_implib)
+		foreach(_xr_cfg ${CMAKE_CONFIGURATION_TYPES} ${CMAKE_BUILD_TYPE})
+			string(TOUPPER "${_xr_cfg}" _xr_cfg_uc)
+			get_target_property(_xr_have OpenXR::openxr_loader IMPORTED_IMPLIB_${_xr_cfg_uc})
+			if(NOT _xr_have)
+				set_property(
+					TARGET OpenXR::openxr_loader APPEND
+					PROPERTY IMPORTED_CONFIGURATIONS ${_xr_cfg_uc}
+					)
+				set_target_properties(
+					OpenXR::openxr_loader
+					PROPERTIES IMPORTED_IMPLIB_${_xr_cfg_uc} "${_xr_implib}"
+						   IMPORTED_LOCATION_${_xr_cfg_uc} "${_xr_dll}"
+					)
+			endif()
+		endforeach()
+	endif()
+endif()
+
 if(NOT OpenXR_FOUND)
 	message(STATUS "webxr_bridge: OpenXR loader not found, skipping displayxr-webxr-bridge")
 	return()
@@ -54,8 +89,12 @@ target_link_libraries(displayxr-webxr-bridge PRIVATE
 install(TARGETS displayxr-webxr-bridge RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # Copy the OpenXR loader DLL next to the exe in the build tree so it can
-# be run from _package/bin/ after install.
+# be run from _package/bin/ after install. _xr_dll was resolved above from
+# whichever IMPORTED_LOCATION(_<CONFIG>) the package/fallback declared.
 get_target_property(_loader_dll OpenXR::openxr_loader IMPORTED_LOCATION)
+if(NOT _loader_dll AND _xr_dll)
+	set(_loader_dll "${_xr_dll}")
+endif()
 if(_loader_dll)
 	add_custom_command(TARGET displayxr-webxr-bridge POST_BUILD
 		COMMAND ${CMAKE_COMMAND} -E copy_if_different
