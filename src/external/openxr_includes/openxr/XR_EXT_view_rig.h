@@ -95,8 +95,11 @@ typedef struct XrCameraRigEXT {
     XrStructureType          type;   //!< Must be XR_TYPE_CAMERA_RIG_EXT
     const void* XR_MAY_ALIAS next;
     XrPosef pose;                  //!< camera pose in the locate space
-    float   ipdFactor;             //!< [0,1] multiplies view-pose spread about the center
-    float   parallaxFactor;        //!< [0,1] lerps eye centroid toward nominal viewer
+    float   ipdFactor;             //!< ABSOLUTE eye-separation scale (>= 0; any positive — a stereo
+                                   //!< camera's inter-axial is not bounded to natural IPD). NOT the
+                                   //!< display rig's relative [0,1] factor. Divergence comfort is
+                                   //!< guarded on convergence, not by bounding this.
+    float   parallaxFactor;        //!< ABSOLUTE parallax scale (>= 0); not the [0,1] display factor
     float   convergenceDiopters;   //!< 1/(convergence distance in world units); 0 = infinity
     float   verticalFov;           //!< radians, full vertical angle
     float   metersToVirtual;       //!< meters→world scale on the eye; 0/unset = 1.0 (spec v3)

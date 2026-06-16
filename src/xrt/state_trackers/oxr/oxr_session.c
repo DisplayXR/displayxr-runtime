@@ -1391,8 +1391,16 @@ view_rig_update_from_chain(struct oxr_session *sess, const XrViewLocateInfo *vie
 		    {crig->pose.orientation.x, crig->pose.orientation.y, crig->pose.orientation.z,
 		     crig->pose.orientation.w},
 		    {crig->pose.position.x, crig->pose.position.y, crig->pose.position.z}};
-		rig->ipd_factor = view_rig_clampf(crig->ipdFactor, 0.0f, 1.0f, &clamped);
-		rig->parallax_factor = view_rig_clampf(crig->parallaxFactor, 0.0f, 1.0f, &clamped);
+		// Camera-rig ipd/parallax are ABSOLUTE eye-separation / parallax scales (a
+		// stereo camera's inter-axial can be any positive value — miniature or
+		// giant scenes, or the display-rig equivalent of a zoomed virtual display
+		// where es>1). They are NOT the display rig's relative [0,1] comfort
+		// factor, so do not clamp them to [0,1] (that truncated the converted
+		// rig and shifted the camera<->display toggle). Allow any positive value;
+		// divergence comfort is guarded on convergence (comfort_factor =
+		// ipd*m2v*invd*N), the correct quantity — not by bounding ipd here.
+		rig->ipd_factor = view_rig_clampf(crig->ipdFactor, 0.0f, 1.0e4f, &clamped);
+		rig->parallax_factor = view_rig_clampf(crig->parallaxFactor, 0.0f, 1.0e4f, &clamped);
 		rig->inv_convergence_distance = view_rig_clampf(crig->convergenceDiopters, 0.0f, 20.0f, &clamped);
 		float vfov = view_rig_clampf(crig->verticalFov, 0.01f, 3.13f, &clamped);
 		rig->half_tan_vfov = tanf(vfov * 0.5f);
@@ -1449,8 +1457,12 @@ oxr_session_set_workspace_view_rig(struct oxr_logger *log, struct oxr_session *s
 		    {crig->pose.orientation.x, crig->pose.orientation.y, crig->pose.orientation.z,
 		     crig->pose.orientation.w},
 		    {crig->pose.position.x, crig->pose.position.y, crig->pose.position.z}};
-		out.ipd_factor = view_rig_clampf(crig->ipdFactor, 0.0f, 1.0f, &clamped);
-		out.parallax_factor = view_rig_clampf(crig->parallaxFactor, 0.0f, 1.0f, &clamped);
+		// Camera-rig ipd/parallax are ABSOLUTE scales (any positive value), NOT
+		// the display rig's relative [0,1] comfort factor — see the matching note
+		// above. Bounding them to [0,1] truncated the converted rig and shifted
+		// the toggle; comfort is guarded on convergence, not ipd.
+		out.ipd_factor = view_rig_clampf(crig->ipdFactor, 0.0f, 1.0e4f, &clamped);
+		out.parallax_factor = view_rig_clampf(crig->parallaxFactor, 0.0f, 1.0e4f, &clamped);
 		out.inv_convergence_distance = view_rig_clampf(crig->convergenceDiopters, 0.0f, 20.0f, &clamped);
 		out.half_tan_vfov = tanf(view_rig_clampf(crig->verticalFov, 0.01f, 3.13f, &clamped) * 0.5f);
 		out.m2v = crig->metersToVirtual > 0.0f
