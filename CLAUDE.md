@@ -91,6 +91,8 @@ scripts\build_windows.bat generate   REM CMake generate only
 ```
 First run downloads deps (vcpkg, OpenXR loader). Requires VS 2022 (C++ workload), Ninja, Vulkan SDK, GitHub CLI. Outputs to `_package/` (runtime) and `test_apps/*/build/`. Always build through this script — never call cmake/ninja directly on Windows.
 
+**Debugging in Visual Studio:** `scripts\build_windows.bat vs2022` generates `build_vs2022\XRT.sln`. The VS (Debug) build is a **separate tree** from the Ninja/`_package` (Release) one, so you must repoint the active OpenXR runtime at it before debugging. Full manual flow (generate → build → repoint `ActiveRuntime` + register the VS sim-display → F5 `displayxr-service` or attach to an app): `docs/getting-started/debugging-in-visual-studio.md`.
+
 ### macOS
 ```bash
 # brew install cmake ninja eigen vulkan-sdk
