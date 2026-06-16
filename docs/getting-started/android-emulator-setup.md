@@ -114,12 +114,12 @@ build steps. The condensed version:
 cd /c/displayxr-leia-plugin && scripts/build-android.sh
 
 # Drop into runtime APK's jniLibs/<ABI>/
-mkdir -p /c/openxr-3d-display/src/xrt/targets/openxr_android/src/main/jniLibs/arm64-v8a
+mkdir -p /c/displayxr-runtime/src/xrt/targets/openxr_android/src/main/jniLibs/arm64-v8a
 cp build-android/src/drv_leia_android/libdxrp050_leia_cnsdk.so \
-   /c/openxr-3d-display/src/xrt/targets/openxr_android/src/main/jniLibs/arm64-v8a/
+   /c/displayxr-runtime/src/xrt/targets/openxr_android/src/main/jniLibs/arm64-v8a/
 
 # Runtime + test app
-cd /c/openxr-3d-display
+cd /c/displayxr-runtime
 ./gradlew.bat :src:xrt:targets:openxr_android:assembleInProcessDebug --rerun-tasks
 ./gradlew.bat :test_apps:cube_handle_vk_android:assembleDebug
 ```
