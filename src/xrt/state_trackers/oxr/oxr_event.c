@@ -478,11 +478,20 @@ oxr_event_push_XrEventDataLocal3DZoneViewSizeChanged(struct oxr_logger *log,
 	changed->recommendedImageRectHeight = recommendedImageRectHeight;
 	event->result = XR_SUCCESS;
 
-	// Fires only on actual dim change (mask activation / deactivation /
-	// window resize) — one-off lifecycle edge, WARN tier (#439 Q4, #441
-	// precedent).
-	U_LOG_W("OXR EVENT: Local-3D-zone view size changed: %ux%u", recommendedImageRectWidth,
-	        recommendedImageRectHeight);
+	// Fires on every actual dim change. Originally assumed a one-off lifecycle
+	// edge (mask activation / window resize) → WARN tier (#439 Q4, #441). But a
+	// P6 content-fit zone (e.g. the avatar tracking its silhouette) renegotiates
+	// size continuously — several times a second — so a per-change WARN is log
+	// bloat (CLAUDE.md: never spam WARN). Log the first renegotiation at WARN for
+	// visibility, then stay silent; the advisory event itself still fires on
+	// every change, so consumers are unaffected.
+	static bool warned_zone_view_resize = false;
+	if (!warned_zone_view_resize) {
+		warned_zone_view_resize = true;
+		U_LOG_W("OXR EVENT: Local-3D-zone view size changed: %ux%u "
+		        "(first renegotiation; subsequent size changes are not logged)",
+		        recommendedImageRectWidth, recommendedImageRectHeight);
+	}
 
 	lock(inst);
 	push(inst, event);
