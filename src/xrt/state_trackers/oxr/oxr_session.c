@@ -1634,13 +1634,26 @@ oxr_session_locate_views(struct oxr_logger *log,
 	// structures the extension apps use, so in-process / IPC / qwerty-toggle
 	// all share one Kooima-input resolution and input drift (nominal / H /
 	// tunables) is structurally impossible. When nothing is chained, synthesize
-	// an oxr_view_rig_state from the qwerty view_state and set rig_camera /
-	// rig_display — the single rig branch below then handles it. A chained
-	// descriptor always wins. The external-window gate is preserved: a legacy
-	// app that owns its own window keeps falling through to the identity-m2v
-	// display fallback (the runtime doesn't own that head).
+	// an oxr_view_rig_state from the qwerty view_state; the compute branch below
+	// reads its tunables via active_rig. A chained descriptor always wins. The
+	// external-window gate is preserved: a legacy app that owns its own window
+	// keeps falling through to the identity-m2v display fallback (the runtime
+	// doesn't own that head).
+	//
+	// IMPORTANT: the qwerty path is NOT a chained descriptor — it deliberately
+	// does NOT set rig_camera / rig_display. Those flags mean "an extension rig
+	// is chained" and drive extension-only machinery the qwerty path must keep
+	// out of: the rig_active world_head pose override (which reads
+	// sess->view_rig.pose, NOT this local synthesis — setting rig_active here
+	// fed it a zero-orientation quat → xrLocateViews/xrEndFrame POSE_INVALID →
+	// frames rejected, white window) and the XR_EXT_view_rig IPC route. The
+	// qwerty path keeps the qwerty device pose for world_head exactly as before;
+	// only the Kooima tunables are unified. The separate qwerty_camera /
+	// qwerty_display selectors gate the compute branch.
 	struct oxr_view_rig_state qwerty_rig = {0};
 	const struct oxr_view_rig_state *active_rig = NULL;
+	bool qwerty_camera = false;
+	bool qwerty_display = false;
 	if (rig_camera || rig_display) {
 		active_rig = &sess->view_rig;
 	} else if (have_view_state && !sess->has_external_window) {
@@ -1653,11 +1666,11 @@ oxr_session_locate_views(struct oxr_logger *log,
 		    .m2v = view_state.m2v,
 		    .virtual_display_height = view_state.virtual_display_height,
 		    .perspective_factor = view_state.perspective_factor,
-		    // pose intentionally unset — display_pose is built from world_head_* below
+		    // pose unused — qwerty keeps the device pose for world_head below
 		};
 		active_rig = &qwerty_rig;
-		rig_camera = view_state.camera_mode;
-		rig_display = !view_state.camera_mode;
+		qwerty_camera = view_state.camera_mode;
+		qwerty_display = !view_state.camera_mode;
 	}
 
 	// XR_EXT_display_zones (ADR-027): a zone-scoped locate chains an
@@ -2017,12 +2030,12 @@ oxr_session_locate_views(struct oxr_logger *log,
 				    {world_head_pos.x, world_head_pos.y, world_head_pos.z}};
 
 				// Camera-centric path: canonical camera3d math (shared core).
-				// rig_camera is set either by a chained XrCameraRigEXT (#396 W7)
-				// or by the qwerty synthesis above — both feed active_rig, so a
-				// single tunable source drives the compute. The chained
-				// descriptor takes it regardless of has_external_window (the
-				// qwerty synthesis already excluded that case).
-				if (rig_camera) {
+				// Entered by a chained XrCameraRigEXT (#396 W7) or the qwerty
+				// synthesis above — both feed active_rig, so a single tunable
+				// source drives the compute. The chained descriptor takes it
+				// regardless of has_external_window (the qwerty synthesis already
+				// excluded that case).
+				if (rig_camera || qwerty_camera) {
 					dxr_camera3d_tunables ct = (dxr_camera3d_tunables){
 					    .ipd_factor = active_rig->ipd_factor,
 					    .parallax_factor = active_rig->parallax_factor,
@@ -2044,7 +2057,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 				} else {
 					// Display-centric (Kooima) path: canonical display3d math (shared core)
 					dxr_display3d_tunables dt = dxr_display3d_default_tunables();
-					if (rig_display) {
+					if (rig_display || qwerty_display) {
 						// Chained XrDisplayRigEXT (#396 W7) or the qwerty
 						// synthesis above (both feed active_rig) — lifts the
 						// identity-m2v forcing for external windows too.
@@ -2066,7 +2079,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 					}
 					have_kooima_fov = true;
 
-					if (rig_display) {
+					if (rig_display || qwerty_display) {
 						for (uint32_t ei = 0; ei < eye_count; ei++) {
 							view_eye_world[ei] = disp_views[ei].eye_world;
 						}
