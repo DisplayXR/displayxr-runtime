@@ -654,6 +654,7 @@ qwerty_system_create(struct qwerty_hmd *qhmd,
 	qs->disp_spread_factor = 1.0f;
 	qs->disp_parallax_factor = 1.0f;
 	qs->disp_vHeight = 1.3f; // 1.3m
+	qs->disp_perspective = 1.0f;
 
 	// Hardware config defaults (overridden by target builder)
 	qs->nominal_viewer_z = 0.6f;  // meters
@@ -1095,6 +1096,11 @@ qwerty_toggle_camera_mode(struct qwerty_system *qs)
 		dxr_display_rig disp;
 		dxr_view_rig_camera_to_display(&cam, &info, &disp);
 		qs->disp_vHeight = clampf(disp.virtual_display_height, 0.1f, 10.0f);
+		// Carry the converted perspective — it is NOT 1.0 for the camera default
+		// (e.g. 0.5 dp / 36° vFOV → ~0.50 at the legacy panel/distance). Dropping
+		// it made the display rig snap to its own persp=1 default instead of the
+		// camera-equivalent, i.e. a visible jump on P.
+		qs->disp_perspective = clampf(disp.perspective_factor, 0.1f, 10.0f);
 		qs->disp_spread_factor = disp.ipd_factor;
 		qs->disp_parallax_factor = disp.parallax_factor;
 		pose->position = (struct xrt_vec3){disp.pose.position.x, disp.pose.position.y, disp.pose.position.z};
@@ -1106,7 +1112,7 @@ qwerty_toggle_camera_mode(struct qwerty_system *qs)
 		    .virtual_display_height = qs->disp_vHeight,
 		    .ipd_factor = qs->disp_spread_factor,
 		    .parallax_factor = qs->disp_parallax_factor,
-		    .perspective_factor = 1.0f,
+		    .perspective_factor = qs->disp_perspective,
 		};
 		dxr_camera_rig cam;
 		dxr_view_rig_display_to_camera(&disp, &info, &cam);
@@ -1195,6 +1201,7 @@ qwerty_reset_view_state(struct qwerty_system *qs)
 	qs->disp_spread_factor = 1.0f;
 	qs->disp_parallax_factor = 1.0f;
 	qs->disp_vHeight = 1.3f;
+	qs->disp_perspective = 1.0f;
 
 	qs->rig_animating = false;
 
@@ -1278,7 +1285,7 @@ qwerty_get_view_state(struct xrt_device **xdevs, size_t xdev_count, struct qwert
 	out->half_tan_vfov = qs->cam_half_tan_vfov;
 	out->m2v = qs->cam_m2v;
 	out->virtual_display_height = qs->disp_vHeight;
-	out->perspective_factor = 1.0f; // qwerty display rig is always perspective 1
+	out->perspective_factor = qs->disp_perspective; // converted from the camera rig on P (not fixed 1)
 
 	out->nominal_viewer_z = qs->nominal_viewer_z;
 	out->screen_height_m = qs->screen_height_m;
