@@ -91,7 +91,9 @@ get_pipe_server_pid(const char *pipe_name)
 	return pid;
 }
 
-static bool
+// Returns 0 on success, else the Win32 error from CreateNamedPipeA (notably
+// ERROR_PIPE_BUSY when the IPC_MAX_CLIENTS instance ceiling is reached).
+static DWORD
 create_pipe_instance(struct ipc_server_mainloop *ml, bool first)
 {
 	SECURITY_ATTRIBUTES sa{};
@@ -156,13 +158,14 @@ create_pipe_instance(struct ipc_server_mainloop *ml, bool first)
 	}
 
 	if (ml->pipe_handle != INVALID_HANDLE_VALUE) {
-		return true;
+		return 0;
 	}
 
 	DWORD err = GetLastError();
 	if (err == ERROR_PIPE_BUSY) {
-		U_LOG_W("CreateNamedPipeA failed: %d %s An existing client must disconnect first!", err,
-		        ipc_winerror(err));
+		// At the IPC_MAX_CLIENTS instance ceiling. Not fatal here — the caller
+		// (create_another_pipe_instance) defers re-arming and throttles the
+		// log, so we don't spam a warning every poll while at capacity.
 	} else {
 		U_LOG_E("CreateNamedPipeA failed: %d %s", err, ipc_winerror(err));
 		if (err == ERROR_ACCESS_DENIED && first) {
@@ -182,15 +185,43 @@ create_pipe_instance(struct ipc_server_mainloop *ml, bool first)
 		}
 	}
 
-	return false;
+	return err;
 }
 
 static void
 create_another_pipe_instance(struct ipc_server *vs, struct ipc_server_mainloop *ml)
 {
-	if (!create_pipe_instance(ml, false)) {
-		ipc_server_handle_failure(vs);
+	// Single-threaded mainloop, one server per process, so a function-local
+	// static is enough to throttle the at-capacity log to once per transition.
+	static bool at_capacity_logged = false;
+
+	DWORD err = create_pipe_instance(ml, false);
+	if (err == 0) {
+		if (at_capacity_logged) {
+			U_LOG_W("IPC: a client disconnected, listener re-armed (accepting connections again)");
+			at_capacity_logged = false;
+		}
+		return;
 	}
+
+	if (err == ERROR_PIPE_BUSY) {
+		// All IPC_MAX_CLIENTS pipe instances are live (max concurrent clients
+		// reached). This is transient backpressure, not a server failure:
+		// release the listener for now and let a later poll re-arm it once a
+		// client disconnects and frees an instance. Connecting clients retry on
+		// ERROR_PIPE_BUSY (see ipc_client_connection.c), so a connect in this
+		// window waits instead of taking the whole service down with it.
+		ml->pipe_handle = nullptr;
+		if (!at_capacity_logged) {
+			U_LOG_W("IPC at capacity (%d concurrent clients); deferring new listener until one "
+			        "disconnects",
+			        IPC_MAX_CLIENTS);
+			at_capacity_logged = true;
+		}
+		return;
+	}
+
+	ipc_server_handle_failure(vs);
 }
 
 static void
@@ -275,7 +306,7 @@ ipc_server_mainloop_init(struct ipc_server_mainloop *ml)
 		goto err;
 	}
 
-	if (!create_pipe_instance(ml, true)) {
+	if (create_pipe_instance(ml, true) != 0) {
 		U_LOG_E("CreateNamedPipeA \"%s\" first instance failed, see above.", ml->pipe_name);
 		goto err;
 	}
