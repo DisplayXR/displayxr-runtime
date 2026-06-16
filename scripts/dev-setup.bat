@@ -28,8 +28,8 @@ REM GitHub CLI. --leia also needs gh auth (fetches the SR SDK) + a Leia repo.
 REM ============================================================
 
 set "SCRIPT_DIR=%~dp0"
-REM Resolve the repo root to a clean absolute path.
-pushd "%SCRIPT_DIR%.." && set "REPO=!CD!" && popd
+REM Resolve the repo root to a clean absolute path (no pushd/!CD! timing deps).
+for %%I in ("%SCRIPT_DIR%..") do set "REPO=%%~fI"
 
 REM --- defaults ---
 set "WANT_LEIA="
