@@ -1415,8 +1415,13 @@ view_rig_update_from_chain(struct oxr_session *sess, const XrViewLocateInfo *vie
 		     drig->pose.orientation.w},
 		    {drig->pose.position.x, drig->pose.position.y, drig->pose.position.z}};
 		rig->virtual_display_height = view_rig_clampf(drig->virtualDisplayHeight, 0.01f, 1000.0f, &clamped);
-		rig->ipd_factor = view_rig_clampf(drig->ipdFactor, 0.0f, 1.0f, &clamped);
-		rig->parallax_factor = view_rig_clampf(drig->parallaxFactor, 0.0f, 1.0f, &clamped);
+		// ipd/parallax are NOT clamped to [0,1] here while we are validating the
+		// rig math/transition: a near-convergence camera rig converts to a display
+		// rig with ipd > 1, and truncating it would mask whether the converter is
+		// exact. Comfort is enforced upstream (convergence clamp), not by bounding
+		// the display ipd. (Was [0,1]; widened to the camera-rig range.)
+		rig->ipd_factor = view_rig_clampf(drig->ipdFactor, 0.0f, 1.0e4f, &clamped);
+		rig->parallax_factor = view_rig_clampf(drig->parallaxFactor, 0.0f, 1.0e4f, &clamped);
 		rig->perspective_factor = view_rig_clampf(drig->perspectiveFactor, 0.1f, 10.0f, &clamped);
 	}
 
@@ -1480,8 +1485,9 @@ oxr_session_set_workspace_view_rig(struct oxr_logger *log, struct oxr_session *s
 		     drig->pose.orientation.w},
 		    {drig->pose.position.x, drig->pose.position.y, drig->pose.position.z}};
 		out.virtual_display_height = view_rig_clampf(drig->virtualDisplayHeight, 0.01f, 1000.0f, &clamped);
-		out.ipd_factor = view_rig_clampf(drig->ipdFactor, 0.0f, 1.0f, &clamped);
-		out.parallax_factor = view_rig_clampf(drig->parallaxFactor, 0.0f, 1.0f, &clamped);
+		// Not clamped to [0,1] — see the matching note in oxr_session_set_view_rig.
+		out.ipd_factor = view_rig_clampf(drig->ipdFactor, 0.0f, 1.0e4f, &clamped);
+		out.parallax_factor = view_rig_clampf(drig->parallaxFactor, 0.0f, 1.0e4f, &clamped);
 		out.perspective_factor = view_rig_clampf(drig->perspectiveFactor, 0.1f, 10.0f, &clamped);
 		if (clamped) {
 			U_LOG_W("xrSetWorkspaceViewRigEXT: display rig value(s) out of range — clamped");
