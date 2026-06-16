@@ -1630,6 +1630,36 @@ oxr_session_locate_views(struct oxr_logger *log,
 	}
 #endif
 
+	// #595: route the legacy qwerty debug state through the SAME view_rig
+	// structures the extension apps use, so in-process / IPC / qwerty-toggle
+	// all share one Kooima-input resolution and input drift (nominal / H /
+	// tunables) is structurally impossible. When nothing is chained, synthesize
+	// an oxr_view_rig_state from the qwerty view_state and set rig_camera /
+	// rig_display — the single rig branch below then handles it. A chained
+	// descriptor always wins. The external-window gate is preserved: a legacy
+	// app that owns its own window keeps falling through to the identity-m2v
+	// display fallback (the runtime doesn't own that head).
+	struct oxr_view_rig_state qwerty_rig = {0};
+	const struct oxr_view_rig_state *active_rig = NULL;
+	if (rig_camera || rig_display) {
+		active_rig = &sess->view_rig;
+	} else if (have_view_state && !sess->has_external_window) {
+		qwerty_rig = (struct oxr_view_rig_state){
+		    .type = view_state.camera_mode ? OXR_VIEW_RIG_CAMERA : OXR_VIEW_RIG_DISPLAY,
+		    .ipd_factor = view_state.ipd_factor,
+		    .parallax_factor = view_state.parallax_factor,
+		    .inv_convergence_distance = view_state.inv_convergence_distance,
+		    .half_tan_vfov = view_state.half_tan_vfov,
+		    .m2v = view_state.m2v,
+		    .virtual_display_height = view_state.virtual_display_height,
+		    .perspective_factor = view_state.perspective_factor,
+		    // pose intentionally unset — display_pose is built from world_head_* below
+		};
+		active_rig = &qwerty_rig;
+		rig_camera = view_state.camera_mode;
+		rig_display = !view_state.camera_mode;
+	}
+
 	// XR_EXT_display_zones (ADR-027): a zone-scoped locate chains an
 	// XrDisplayZoneEXT on XrViewLocateInfo — the zone rect IS the canvas
 	// for this locate's Kooima framing (applied to the window metrics
@@ -1987,30 +2017,19 @@ oxr_session_locate_views(struct oxr_logger *log,
 				    {world_head_pos.x, world_head_pos.y, world_head_pos.z}};
 
 				// Camera-centric path: canonical camera3d math (shared core).
-				// A chained XrCameraRigEXT (#396 W7) takes it regardless of
-				// has_external_window — the explicit rig descriptor is the
-				// knowledge the external-window forcing substituted for.
-				if (rig_camera ||
-				    (have_view_state && view_state.camera_mode &&
-				     !sess->has_external_window)) {
-					dxr_camera3d_tunables ct;
-					if (rig_camera) {
-						ct = (dxr_camera3d_tunables){
-						    .ipd_factor = sess->view_rig.ipd_factor,
-						    .parallax_factor = sess->view_rig.parallax_factor,
-						    .inv_convergence_distance = sess->view_rig.inv_convergence_distance,
-						    .half_tan_vfov = sess->view_rig.half_tan_vfov,
-						    .m2v = sess->view_rig.m2v,
-						};
-					} else {
-						ct = (dxr_camera3d_tunables){
-						    .ipd_factor = view_state.ipd_factor,
-						    .parallax_factor = view_state.parallax_factor,
-						    .inv_convergence_distance = view_state.inv_convergence_distance,
-						    .half_tan_vfov = view_state.half_tan_vfov,
-						    .m2v = view_state.m2v,
-						};
-					}
+				// rig_camera is set either by a chained XrCameraRigEXT (#396 W7)
+				// or by the qwerty synthesis above — both feed active_rig, so a
+				// single tunable source drives the compute. The chained
+				// descriptor takes it regardless of has_external_window (the
+				// qwerty synthesis already excluded that case).
+				if (rig_camera) {
+					dxr_camera3d_tunables ct = (dxr_camera3d_tunables){
+					    .ipd_factor = active_rig->ipd_factor,
+					    .parallax_factor = active_rig->parallax_factor,
+					    .inv_convergence_distance = active_rig->inv_convergence_distance,
+					    .half_tan_vfov = active_rig->half_tan_vfov,
+					    .m2v = active_rig->m2v,
+					};
 					struct dxr_xrt_view cam_views[XRT_MAX_VIEWS];
 					dxr_xrt_camera3d_compute_views(raw_eyes, eye_count, &nominal, &scr, &ct,
 					                               &display_pose, cam_views);
@@ -2026,17 +2045,13 @@ oxr_session_locate_views(struct oxr_logger *log,
 					// Display-centric (Kooima) path: canonical display3d math (shared core)
 					dxr_display3d_tunables dt = dxr_display3d_default_tunables();
 					if (rig_display) {
-						// Chained XrDisplayRigEXT (#396 W7) — lifts the
+						// Chained XrDisplayRigEXT (#396 W7) or the qwerty
+						// synthesis above (both feed active_rig) — lifts the
 						// identity-m2v forcing for external windows too.
-						dt.ipd_factor = sess->view_rig.ipd_factor;
-						dt.parallax_factor = sess->view_rig.parallax_factor;
-						dt.perspective_factor = sess->view_rig.perspective_factor;
-						dt.virtual_display_height = sess->view_rig.virtual_display_height;
-					} else if (have_view_state && !sess->has_external_window) {
-						dt.ipd_factor = view_state.ipd_factor;
-						dt.parallax_factor = view_state.parallax_factor;
-						dt.perspective_factor = view_state.perspective_factor;
-						dt.virtual_display_height = view_state.virtual_display_height;
+						dt.ipd_factor = active_rig->ipd_factor;
+						dt.parallax_factor = active_rig->parallax_factor;
+						dt.perspective_factor = active_rig->perspective_factor;
+						dt.virtual_display_height = active_rig->virtual_display_height;
 					} else {
 						dt.virtual_display_height = screen_height_m; // identity m2v
 					}
@@ -2051,8 +2066,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 					}
 					have_kooima_fov = true;
 
-					if (rig_display ||
-					    (have_view_state && !sess->has_external_window)) {
+					if (rig_display) {
 						for (uint32_t ei = 0; ei < eye_count; ei++) {
 							view_eye_world[ei] = disp_views[ei].eye_world;
 						}
