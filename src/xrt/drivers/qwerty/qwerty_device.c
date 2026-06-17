@@ -1082,9 +1082,14 @@ qwerty_toggle_camera_mode(struct qwerty_system *qs)
 	// aspect is unused by the converters; nominal/screen come from the hardware.
 	dxr_rig_display_info info = {qs->screen_height_m, 1.0f, qs->nominal_viewer_z};
 
+	// Route the conversion through the shared dxr_rig_toggle so qwerty and the
+	// app-side rig_mode wrapper share one toggle definition; only the
+	// qwerty_system<->rig field mapping (and qwerty's display-rig clamps) is local.
+	struct dxr_rig in = {0}, out = {0};
 	if (qs->camera_mode) {
 		// Camera -> Display.
-		dxr_camera_rig cam = {
+		in.type = DXR_RIG_CAMERA;
+		in.u.camera = (dxr_camera_rig){
 		    .pose = {{pose->orientation.x, pose->orientation.y, pose->orientation.z, pose->orientation.w},
 		             {pose->position.x, pose->position.y, pose->position.z}},
 		    .ipd_factor = qs->cam_spread_factor,
@@ -1093,8 +1098,8 @@ qwerty_toggle_camera_mode(struct qwerty_system *qs)
 		    .half_tan_vfov = qs->cam_half_tan_vfov,
 		    .m2v = qs->cam_m2v,
 		};
-		dxr_display_rig disp;
-		dxr_view_rig_camera_to_display(&cam, &info, &disp);
+		dxr_rig_toggle(&in, &info, &out);
+		const dxr_display_rig disp = out.u.display;
 		qs->disp_vHeight = clampf(disp.virtual_display_height, 0.1f, 10.0f);
 		// Carry the converted perspective — it is NOT 1.0 for the camera default
 		// (e.g. 0.5 dp / 36° vFOV → ~0.50 at the legacy panel/distance). Dropping
@@ -1106,7 +1111,8 @@ qwerty_toggle_camera_mode(struct qwerty_system *qs)
 		pose->position = (struct xrt_vec3){disp.pose.position.x, disp.pose.position.y, disp.pose.position.z};
 	} else {
 		// Display -> Camera (was a reset; now a faithful conversion).
-		dxr_display_rig disp = {
+		in.type = DXR_RIG_DISPLAY;
+		in.u.display = (dxr_display_rig){
 		    .pose = {{pose->orientation.x, pose->orientation.y, pose->orientation.z, pose->orientation.w},
 		             {pose->position.x, pose->position.y, pose->position.z}},
 		    .virtual_display_height = qs->disp_vHeight,
@@ -1114,8 +1120,8 @@ qwerty_toggle_camera_mode(struct qwerty_system *qs)
 		    .parallax_factor = qs->disp_parallax_factor,
 		    .perspective_factor = qs->disp_perspective,
 		};
-		dxr_camera_rig cam;
-		dxr_view_rig_display_to_camera(&disp, &info, &cam);
+		dxr_rig_toggle(&in, &info, &out);
+		const dxr_camera_rig cam = out.u.camera;
 		qs->cam_convergence = clampf(cam.inv_convergence_distance, 0.0f, 2.0f);
 		qs->cam_half_tan_vfov = cam.half_tan_vfov;
 		qs->cam_m2v = cam.m2v;
@@ -1150,10 +1156,21 @@ void
 qwerty_adjust_view_factor(struct qwerty_system *qs, float multiplier)
 {
 	if (qs->camera_mode) {
-		float v = clampf(qs->cam_spread_factor * multiplier, 0.01f, 1.0f);
+		// The display rig clamps IPD/parallax to [0,1], but the camera rig's comfort
+		// is defined on its DISPLAY-centric equivalent, not on the camera factor
+		// itself: camera->display rescales by f = m2v*invd*N, so the display
+		// equivalent of cam_spread is cam_spread*f. Clamp to [0.01, M] where M = 1/f
+		// is the camera factor whose display equivalent is exactly 1 — the canonical
+		// dual of qwerty_adjust_convergence's clamp. dxr_rig_max_ipd_factor derives M
+		// from the live cam params (>1 for far convergence, <1 for near, +inf for
+		// convergence→infinity → effectively unbounded; clampf tolerates HUGE_VALF).
+		dxr_rig_display_info info = {qs->screen_height_m, 1.0f, qs->nominal_viewer_z};
+		dxr_camera_rig cam = {.inv_convergence_distance = qs->cam_convergence, .m2v = qs->cam_m2v};
+		float ipd_max = dxr_rig_max_ipd_factor(&cam, &info);
+		float v = clampf(qs->cam_spread_factor * multiplier, 0.01f, ipd_max);
 		qs->cam_spread_factor = v;
 		qs->cam_parallax_factor = v;
-		U_LOG_I("Qwerty: Camera IPD/Parallax = %.3f", v);
+		U_LOG_I("Qwerty: Camera IPD/Parallax = %.3f (max %.3f = display-equiv 1)", v, ipd_max);
 	} else {
 		float v = clampf(qs->disp_spread_factor * multiplier, 0.01f, 1.0f);
 		qs->disp_spread_factor = v;
