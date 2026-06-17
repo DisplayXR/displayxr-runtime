@@ -234,6 +234,67 @@ Uninstall: `sudo "/Library/Application Support/DisplayXR/uninstall.sh"` — remo
 >
 > Notarization is tracked in [#280](https://github.com/DisplayXR/displayxr-runtime/issues/280) (macOS) and [#281](https://github.com/DisplayXR/displayxr-runtime/issues/281) (Windows). Both ship today as unsigned-with-workaround.
 
+## Debugging in Visual Studio
+
+`scripts\build_windows.bat vs2022` generates `build_vs2022\XRT.sln` (the
+quickstart's `dev-setup.bat` runs this for you). Two things to understand first:
+
+- **There are two build trees.** `dev-setup.bat` / `build_windows.bat build`
+  produce the **Ninja, Release** runtime (`build\` → `_package\`); `vs2022`
+  produces a **separate VS, Debug** tree (`build_vs2022\`). The active OpenXR
+  runtime (`HKLM\Software\Khronos\OpenXR\1\ActiveRuntime`) decides which one apps
+  load — after `dev-setup.bat` that's `_package`, so **you must repoint it at the
+  VS build before debugging there.**
+- **Co-location.** The VS build puts every binary together in
+  `build_vs2022\bin\<cfg>\` (mirroring `_package\bin`), so the service finds the
+  runtime core DLL when run from the build tree.
+
+### Steps
+
+```bat
+:: 1. generate, then open build_vs2022\XRT.sln and build ALL_BUILD (Debug)
+scripts\build_windows.bat vs2022
+
+:: 2. point the active runtime at the VS build (ELEVATED). Uses the dev manifest
+::    the VS build already generates — nothing to hand-write/paste.
+scripts\setup-vs-runtime.bat            REM Debug, sim-display
+scripts\setup-vs-runtime.bat --restore  REM undo (restore previous runtime)
+
+:: 3. verify
+build_vs2022\bin\Debug\displayxr-cli.exe selftest
+```
+
+Then in VS set **`displayxr-service`** as the startup project and **F5** —
+breakpoints in the runtime, compositor, and plug-in bind. To debug an app too,
+launch it (from a **non-elevated** prompt — see the elevated-terminal caveat
+above) and use **Debug ▸ Attach to Process**. (The test apps are separate CMake
+projects, so they're not in `XRT.sln`.)
+
+### Real Leia weaving in the debugger (not just sim)
+
+The SR SDK ships **Release-only**, so a *Debug* plug-in CRT-mismatches it. Build
+the whole stack **RelWithDebInfo** (Release CRT + PDBs):
+
+```bat
+:: build XRT.sln in RelWithDebInfo, then ELEVATED:
+scripts\setup-vs-runtime.bat RelWithDebInfo --leia
+```
+
+`--leia` builds the Leia plug-in against this checkout (ABI/CRT-matched) and
+registers it ahead of sim-display; it falls back to sim if the build/load fails.
+
+### Gotchas
+
+- **"Failed to initialize OpenXR"** — `ActiveRuntime` points at a missing
+  manifest. Re-run `setup-vs-runtime.bat` (don't hand-write the JSON — pasted
+  `reg`/`echo` get smart-quoted and a typo'd path breaks it).
+- **"No tests ran" running a project in `XRT.sln`** — the `tests_comp_*` projects
+  are hidden Catch2 cases, not the sample apps.
+- **Purple/blank on the wrong monitor** — sim-display fallback, not Leia (the
+  `dev-setup --leia` plug-in was built against the *Release* runtime, so the
+  *Debug* runtime rejects it). Use the RelWithDebInfo `--leia` flow for real
+  weaving. `…\DisplayXR_<exe>.*.log` shows which DP loaded / was rejected.
+
 ## Running Tests
 
 ```bash
