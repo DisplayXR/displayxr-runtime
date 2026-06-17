@@ -80,9 +80,17 @@ The website's [Get Started](https://displayxr.org/getting-started) page walks th
 ### Build from source
 
 ```bash
-# Windows — auto-fetches vcpkg + OpenXR loader (no vendor SDK; Leia ships as a separate plug-in)
+# Windows — one command (ELEVATED prompt): build + register sim-display + set active runtime + VS solution
+scripts\dev-setup.bat                 # add --leia to also build+register the Leia SR plug-in from source
+scripts\build_windows.bat test-apps   # then build the test apps
+_package\run_cube_handle_d3d11_win.bat
+
+# ...or build only, auto-fetching vcpkg + OpenXR loader (no vendor SDK; Leia ships as a separate plug-in):
 scripts\build_windows.bat all
 # Outputs: _package/DisplayXRSetup-*.exe (installer) + _package/bin/
+# NOTE: a from-source build must register the sim-display plug-in before it runs
+# (Windows discovery is registry-only). dev-setup.bat does this; standalone, run
+# `scripts\register_dev_plugin.bat` once from an elevated prompt.
 
 # macOS — runtime + sim-display plug-in + .pkg installer
 brew install cmake ninja eigen vulkan-sdk && ./scripts/build_macos.sh --installer

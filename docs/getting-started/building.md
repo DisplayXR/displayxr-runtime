@@ -1,5 +1,49 @@
 # Building DisplayXR
 
+## Developer quickstart (build from source)
+
+Fresh clone → a runtime you can run test apps against, in one command.
+
+**Windows** (run the one-liner from an **elevated** prompt — it writes the registry):
+```bat
+git clone https://github.com/DisplayXR/displayxr-runtime && cd displayxr-runtime
+scripts\dev-setup.bat                  REM build runtime + register sim-display + set active runtime + VS solution
+scripts\dev-setup.bat --leia           REM ...also build + register the Leia SR plug-in from source
+```
+Then run a test app (from a **non-elevated** prompt):
+```bat
+scripts\build_windows.bat test-apps
+_package\run_cube_handle_d3d11_win.bat
+```
+
+Prefer the explicit steps? Same result:
+```bat
+scripts\build_windows.bat all          REM 1. build runtime + installer + test apps
+scripts\register_dev_plugin.bat        REM 2. register the sim-display plug-in (ELEVATED) — REQUIRED, see note
+scripts\register_dev_plugin.bat leia C:\path\to\DisplayXR-LeiaSR.dll   REM (optional) register a dev-built Leia plug-in
+_package\run_cube_handle_d3d11_win.bat REM 3. run a test app
+```
+
+> **The step everyone misses on Windows:** building from source produces the
+> sim-display plug-in DLL but does **not** register it, and Windows plug-in
+> discovery is **registry-only** (`HKLM\Software\DisplayXR\DisplayProcessors`).
+> Without step 2 the runtime starts but finds no display processor and fails
+> with `XRT_ERROR_DEVICE_CREATION_FAILED` / "Failed to initialize OpenXR".
+> `dev-setup.bat` and `register_dev_plugin.bat` do this for you. (POSIX/macOS
+> needs no registration — the loader finds plug-ins next to the runtime.)
+
+**macOS:**
+```bash
+brew install cmake ninja eigen vulkan-sdk
+git clone https://github.com/DisplayXR/displayxr-runtime && cd displayxr-runtime
+./scripts/build_macos.sh               # runtime + sim-display + test apps
+_package/DisplayXR-macOS/run_cube_handle_metal.sh   # run a test app (sim-display found automatically)
+```
+
+To **debug in Visual Studio**, see [Debugging in Visual Studio](debugging-in-visual-studio.md).
+The rest of this doc is reference (prerequisites, CMake options, the loader /
+`ActiveRuntime` mechanism, vendor displays).
+
 ## Prerequisites
 
 ### Windows
