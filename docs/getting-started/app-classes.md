@@ -63,6 +63,29 @@ So `NULL` is the **Hosted** path (not Handle) — that's the case that makes the
 
 ## Which Class Should I Use?
 
+**Quick chooser:**
+- You create your own OS window (HWND/NSView)? → **Handle**
+- Something else must own the final surface — or you need offscreen / capture / streaming? → **Texture**
+- You want the runtime to create the window + targets (simplest, standard OpenXR, WebXR)? → **Hosted**
+- Multiple apps in one shared spatial workspace? → that's the **shell over IPC** — you still write a *Handle* app; IPC is transparent.
+
+Mixing 2D and 3D is **orthogonal** to this choice — any class submits layers + a mask ([Mixing 2D and 3D](#mixing-2d-and-3d-in-one-app)).
+
+| If you're building… | Use | Why |
+|---|---|---|
+| A native 3D viewer / CAD / medical / data-viz app with its **own window + UI** | **Handle** | You own window lifecycle, input, and chrome; the runtime weaves into your window. |
+| A 3D app in **Unity or Unreal** | **Handle** | The engine plugins integrate as Handle — the game window is the app's own window. |
+| A standalone DisplayXR **demo / game** with its own window | **Handle** | What `cube_handle_*` and the gaussian-splat / model-viewer / media-player demos do. |
+| A **mixed 2D/3D** app — 3D viewport inside 2D panels/toolbars | **Handle** + 3D layer + Local2D layer + mask | Layout is layers+mask; Handle gives you the window. (See [Mixing 2D and 3D](#mixing-2d-and-3d-in-one-app).) |
+| An app that must **capture / record / stream** the composited frame | **Texture** | You own the texture, so you can read it back / encode it. |
+| A host or framework that can hand the runtime a **shared texture but not its own OS window** (offscreen embedding) | **Texture** | Present-ownership without a window binding; `texture + mask` if it also mixes 2D/3D. |
+| A **standard, portable OpenXR app** you want to "just work" with minimal DisplayXR-specific code | **Hosted** | The runtime creates the window + targets; simplest integration. |
+| **WebXR** content in the browser | **Hosted** | Chrome's built-in WebXR runs as a hosted app (+ optional WebXR Bridge for `session.displayXR`). |
+| A quick **prototype / test harness** where the window doesn't matter | **Hosted** | Pass `NULL`; the runtime owns everything. |
+| **Multiple apps in a spatial workspace** (the Shell) | **Handle**, run under the shell | The shell launches Handle apps and runs them over IPC transparently — you don't target IPC yourself. |
+
+The bullets below add detail per class.
+
 - **Building a native app with your own window?** Use **Handle**. You create and manage the window, pass the handle (HWND, NSView) to the runtime via `XR_EXT_win32_window_binding` or `XR_EXT_cocoa_window_binding`. Most control, best for apps that need to own their window lifecycle.
 
 - **Need the app, engine, or browser to own the swapchain?** Use **Texture** — for present-ownership: offscreen rendering, frame capture/streaming, or an engine/browser that must hold its own surface. You create and own the window (and pass its handle) and provide a shared texture; the runtime composites into it and uses your HWND for display-processor position tracking.
