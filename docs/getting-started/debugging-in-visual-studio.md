@@ -140,10 +140,12 @@ scripts\setup-vs-runtime.bat --restore
   `dev-setup --leia` was built against the *Ninja/Release* runtime, so the
   *VS/Debug* runtime ABI-rejects it and falls back to sim-display, which opens on
   the primary monitor. Check `%LOCALAPPDATA%\DisplayXR\DisplayXR_<exe>.*.log` for
-  which DP loaded / was rejected. For real Leia weaving inside a VS debug session
-  you must build the Leia plug-in **Debug against this runtime checkout** and
-  register that DLL (`scripts\register_dev_plugin.bat leia <path-to-debug-dll>`);
-  otherwise sim-display on the desktop is expected.
+  which DP loaded / was rejected. For real Leia weaving inside a VS debug session,
+  build the solution in **RelWithDebInfo** and run
+  `scripts\setup-vs-runtime.bat RelWithDebInfo --leia` (see *Real Leia weaving in
+  the debugger* above) — it builds the plug-in ABI/CRT-matched to this runtime and
+  registers it ahead of sim. (Don't use Debug for Leia: the SR SDK is Release-only.)
+  Otherwise sim-display on the desktop is expected.
 
 ## Why not just one build?
 
