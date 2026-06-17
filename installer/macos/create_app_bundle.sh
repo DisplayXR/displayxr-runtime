@@ -86,6 +86,18 @@ cp "$RUNTIME_LIB" "$APP_BUNDLE/Contents/Resources/lib/"
 cp "$ARTIFACT_DIR"/lib/libopenxr_loader* "$APP_BUNDLE/Contents/Resources/lib/"
 cp "$ARTIFACT_DIR/lib/libvulkan.1.dylib" "$APP_BUNDLE/Contents/Resources/lib/"
 cp "$ARTIFACT_DIR/lib/libMoltenVK.dylib" "$APP_BUNDLE/Contents/Resources/lib/"
+# cJSON: the runtime dylib carries a @rpath/libcjson.1.dylib dependency
+# (retargeted by build_macos.sh/build_installer.sh), resolved here via the
+# runtime's @loader_path rpath → Resources/lib/. Without bundling it the
+# .app fails to load the runtime on a clean (no-Homebrew) machine.
+if [ -f "$ARTIFACT_DIR/lib/libcjson.1.dylib" ]; then
+    cp -L "$ARTIFACT_DIR/lib/libcjson.1.dylib" "$APP_BUNDLE/Contents/Resources/lib/"
+else
+    BREW_PREFIX="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
+    [ -f "$BREW_PREFIX/lib/libcjson.1.dylib" ] && \
+        cp -L "$BREW_PREFIX/lib/libcjson.1.dylib" "$APP_BUNDLE/Contents/Resources/lib/" || \
+        echo "Warning: libcjson.1.dylib not found; .app may not load runtime on a clean machine"
+fi
 
 # --- Resources: manifests with paths relative to .app bundle ---
 cat > "$APP_BUNDLE/Contents/Resources/openxr_displayxr.json" <<EOF

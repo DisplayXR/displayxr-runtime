@@ -253,9 +253,13 @@ cp "$ROOT/test_apps/common/textures/"*.jpg "$PKG_DIR/bin/textures/" 2>/dev/null 
 # Copy OpenXR loader
 cp "$OPENXR_DIR"/lib/libopenxr_loader*.dylib "$PKG_DIR/lib/"
 
-# Bundle Vulkan loader and MoltenVK from Homebrew
+# Bundle Vulkan loader, MoltenVK, and cJSON from Homebrew. cJSON is a
+# direct dependency of both the runtime and the sim-display plug-in
+# (target_plugin_loader.c parses the JSON manifests with it); without
+# bundling it the .pkg keeps an absolute /opt/homebrew (or /usr/local on
+# Intel) dependency and won't load on a clean machine.
 BREW_PREFIX="$(brew --prefix)"
-for lib in libvulkan.1.dylib libMoltenVK.dylib; do
+for lib in libvulkan.1.dylib libMoltenVK.dylib libcjson.1.dylib; do
   if [ -f "$BREW_PREFIX/lib/$lib" ]; then
     cp -L "$BREW_PREFIX/lib/$lib" "$PKG_DIR/lib/"
   else
@@ -288,21 +292,33 @@ chmod u+w "$PKG_DIR/lib/libMoltenVK.dylib" 2>/dev/null || true
 install_name_tool -id @rpath/libMoltenVK.dylib "$PKG_DIR/lib/libMoltenVK.dylib" 2>/dev/null || true
 codesign --force --sign - "$PKG_DIR/lib/libMoltenVK.dylib" 2>/dev/null || true
 
-# Retarget the runtime + sim-display plug-in's Vulkan dependency from
-# the Homebrew absolute path to @rpath/libvulkan.1.dylib. The @rpath
+chmod u+w "$PKG_DIR/lib/libcjson.1.dylib" 2>/dev/null || true
+install_name_tool -id @rpath/libcjson.1.dylib "$PKG_DIR/lib/libcjson.1.dylib" 2>/dev/null || true
+codesign --force --sign - "$PKG_DIR/lib/libcjson.1.dylib" 2>/dev/null || true
+
+# Retarget the runtime + sim-display plug-in's Vulkan and cJSON
+# dependencies from the Homebrew absolute path to @rpath. The source
+# prefix is $BREW_PREFIX (/opt/homebrew on Apple Silicon, /usr/local on
+# Intel) so the -change matches on both architectures. The @rpath
 # entries below give dyld the right hint:
-#   runtime  → @loader_path        (libvulkan.1.dylib lives next to it)
-#   plug-in  → @loader_path/../..  (libvulkan.1.dylib is two levels up)
+#   runtime  → @loader_path        (the bundled dylibs live next to it)
+#   plug-in  → @loader_path/../..  (the bundled dylibs are two levels up)
 chmod u+w "$PKG_DIR/lib/$RUNTIME_BASENAME" 2>/dev/null || true
-install_name_tool -change /opt/homebrew/opt/vulkan-loader/lib/libvulkan.1.dylib \
+install_name_tool -change "$BREW_PREFIX/opt/vulkan-loader/lib/libvulkan.1.dylib" \
                           @rpath/libvulkan.1.dylib \
+                          "$PKG_DIR/lib/$RUNTIME_BASENAME" 2>/dev/null || true
+install_name_tool -change "$BREW_PREFIX/opt/cjson/lib/libcjson.1.dylib" \
+                          @rpath/libcjson.1.dylib \
                           "$PKG_DIR/lib/$RUNTIME_BASENAME" 2>/dev/null || true
 codesign --force --sign - "$PKG_DIR/lib/$RUNTIME_BASENAME" 2>/dev/null || true
 
 if [ -f "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimDisplay.dylib" ]; then
   chmod u+w "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimDisplay.dylib"
-  install_name_tool -change /opt/homebrew/opt/vulkan-loader/lib/libvulkan.1.dylib \
+  install_name_tool -change "$BREW_PREFIX/opt/vulkan-loader/lib/libvulkan.1.dylib" \
                             @rpath/libvulkan.1.dylib \
+                            "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimDisplay.dylib" 2>/dev/null || true
+  install_name_tool -change "$BREW_PREFIX/opt/cjson/lib/libcjson.1.dylib" \
+                            @rpath/libcjson.1.dylib \
                             "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimDisplay.dylib" 2>/dev/null || true
   codesign --force --sign - "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimDisplay.dylib" 2>/dev/null || true
 fi
