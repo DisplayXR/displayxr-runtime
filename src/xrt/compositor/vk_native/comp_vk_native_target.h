@@ -113,6 +113,17 @@ VkFormat
 comp_vk_native_target_get_format(struct comp_vk_native_target *target);
 
 /*!
+ * Get the target's image-set generation (#602). Bumped each time the target
+ * image set is (re)created — the compositor forwards it to the display
+ * processor so caches keyed by the target VkImage handle can be invalidated
+ * across a swapchain/DComp-bridge rebuild (Vulkan recycles freed handles).
+ *
+ * @ingroup comp_vk_native
+ */
+uint32_t
+comp_vk_native_target_get_generation(struct comp_vk_native_target *target);
+
+/*!
  * Resize the target swapchain.
  *
  * @param target The target.

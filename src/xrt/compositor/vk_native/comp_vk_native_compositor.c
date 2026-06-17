@@ -917,16 +917,43 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 
 				if (c->target != NULL) {
 					comp_vk_native_target_resize(c->target, new_width, new_height);
+					// #602: drain the GPU after recreating the swapchain. The
+					// steady-state per-frame path no longer calls
+					// vkDeviceWaitIdle (it used to, incidentally, via the
+					// renderer resize), so without this an in-flight frame can
+					// present/sample a just-destroyed swapchain image →
+					// VK_ERROR_DEVICE_LOST. Window resizes are rare, so the
+					// stall here is fine.
+					c->vk.vkDeviceWaitIdle(c->vk.device);
+					// #602: tell the DP its target-handle-keyed caches are
+					// stale — the resize recreated the target images and
+					// Vulkan can recycle the freed handles, so the DP's strip
+					// framebuffer cache could otherwise alias a destroyed
+					// image and fault the device. Safe to destroy DP objects
+					// here: the device was just drained above.
+					if (c->display_processor != NULL) {
+						xrt_display_processor_vk_notify_target_recreated(
+						    (struct xrt_display_processor_vk *)c->display_processor,
+						    comp_vk_native_target_get_generation(c->target));
+					}
 				}
 				c->settings.preferred.width = new_width;
 				c->settings.preferred.height = new_height;
 
-				uint32_t new_vw = new_width / 2;
-				uint32_t new_vh = new_height;
-				uint32_t tc, tr;
-				comp_vk_native_renderer_get_tile_layout(c->renderer, &tc, &tr);
-				comp_vk_native_renderer_resize(c->renderer, new_vw, new_vh,
-				                                tc * new_vw, tr * new_vh);
+				// #602: the atlas is owned by layer_commit for extension apps
+				// (it allocates the stable mode atlas and derives the scaled
+				// content view every frame). Only legacy apps — which skip the
+				// layer_commit view resize — need the window-derived atlas
+				// resize here. Driving it for extension apps fed a raw window
+				// height the high-water then ratcheted on (→ device loss).
+				if (c->legacy_app_tile_scaling) {
+					uint32_t new_vw = new_width / 2;
+					uint32_t new_vh = new_height;
+					uint32_t tc, tr;
+					comp_vk_native_renderer_get_tile_layout(c->renderer, &tc, &tr);
+					comp_vk_native_renderer_resize(c->renderer, new_vw, new_vh,
+					                                tc * new_vw, tr * new_vh);
+				}
 			}
 		}
 	}
@@ -952,16 +979,28 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 
 			if (c->target != NULL) {
 				comp_vk_native_target_resize(c->target, new_width, new_height);
+				// #602: drain after swapchain recreate (see Windows branch).
+				c->vk.vkDeviceWaitIdle(c->vk.device);
+				// #602: invalidate DP target-handle-keyed caches (see Windows branch).
+				if (c->display_processor != NULL) {
+					xrt_display_processor_vk_notify_target_recreated(
+					    (struct xrt_display_processor_vk *)c->display_processor,
+					    comp_vk_native_target_get_generation(c->target));
+				}
 			}
 			c->settings.preferred.width = new_width;
 			c->settings.preferred.height = new_height;
 
-			uint32_t new_vw = new_width / 2;
-			uint32_t new_vh = new_height;
-			uint32_t tc, tr;
-			comp_vk_native_renderer_get_tile_layout(c->renderer, &tc, &tr);
-			comp_vk_native_renderer_resize(c->renderer, new_vw, new_vh,
-			                                tc * new_vw, tr * new_vh);
+			// #602: extension apps' atlas is owned by layer_commit; only legacy
+			// apps need the window-derived resize here (see Windows branch).
+			if (c->legacy_app_tile_scaling) {
+				uint32_t new_vw = new_width / 2;
+				uint32_t new_vh = new_height;
+				uint32_t tc, tr;
+				comp_vk_native_renderer_get_tile_layout(c->renderer, &tc, &tr);
+				comp_vk_native_renderer_resize(c->renderer, new_vw, new_vh,
+				                                tc * new_vw, tr * new_vh);
+			}
 		}
 	}
 #endif

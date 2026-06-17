@@ -1366,18 +1366,63 @@ comp_vk_native_renderer_resize(struct comp_vk_native_renderer *r,
 
 	if (new_view_width < 64) new_view_width = 64;
 	if (new_view_height < 64) new_view_height = 64;
+	if (new_atlas_width < 64) new_atlas_width = 64;
+	if (new_atlas_height < 64) new_atlas_height = 64;
 
-	uint32_t cur_atlas_w = r->tile_columns * r->view_width;
-	uint32_t cur_atlas_h = r->tile_rows * r->view_height;
-	if (new_view_width == r->view_width && new_view_height == r->view_height &&
-	    new_atlas_width == cur_atlas_w && new_atlas_height == cur_atlas_h) {
+	// #602: decouple the atlas ALLOCATION (worst-case, stable) from the
+	// per-frame content VIEW dims. Content-fit display zones (ADR-027)
+	// renegotiate view dims ~6x/sec; previously every change tore down and
+	// rebuilt the atlas image behind a full vkDeviceWaitIdle — a per-frame GPU
+	// stall — and the no-op guard never held while a content-fit canvas was
+	// active (it compared the full mode-atlas width against tile_columns *
+	// content view_width). Instead allocate the atlas once at the worst case
+	// (the mode atlas, passed by layer_commit) and let content pack top-left
+	// into a sub-rect; vk_crop_atlas_for_dp rect-crops it back out, and the
+	// draw/zone/capture paths place tiles by the per-frame effective layout,
+	// not the allocation. While the requested allocation FITS the current one
+	// we only update the view bookkeeping in place — no stall, no recreate.
+	//
+	// The allocation request must be the mode atlas (the stable worst case);
+	// the window-resize branch in begin_frame no longer drives a window-derived
+	// atlas (that fed a raw window height the high-water then ratcheted on, →
+	// out-of-bounds tiles → VK_ERROR_DEVICE_LOST). High-water-mark — never
+	// shrink — so it converges and stops firing.
+	bool have_atlas = r->atlas_image != VK_NULL_HANDLE;
+
+	uint32_t grow_w = new_atlas_width;
+	uint32_t grow_h = new_atlas_height;
+	if (have_atlas) {
+		if (r->atlas_alloc_width > grow_w) grow_w = r->atlas_alloc_width;
+		if (r->atlas_alloc_height > grow_h) grow_h = r->atlas_alloc_height;
+	}
+
+	// Defensive: content must fit the allocation — tiles pack into the atlas,
+	// so a view wider/taller than alloc/tiles would draw out of bounds. Clamp
+	// the stored view dims (these drive the effective layout, crop, and DP
+	// handoff). With the mode-atlas allocation this never triggers for normal
+	// content-fit (views stay <= the per-eye texture); it's a safety net.
+	if (r->tile_columns != 0 && new_view_width * r->tile_columns > grow_w)
+		new_view_width = grow_w / r->tile_columns;
+	if (r->tile_rows != 0 && new_view_height * r->tile_rows > grow_h)
+		new_view_height = grow_h / r->tile_rows;
+
+	bool fits = have_atlas && grow_w == r->atlas_alloc_width && grow_h == r->atlas_alloc_height;
+	if (fits) {
+		r->view_width = new_view_width;
+		r->view_height = new_view_height;
+		r->texture_height = new_view_height;
 		return XRT_SUCCESS;
 	}
 
-	vk->vkDeviceWaitIdle(vk->device);
-	destroy_atlas_resources(r);
+	// Genuine grow: first allocation or a display-mode change. Rare, so the
+	// one-time device-idle stall here is fine; the steady-state content-fit
+	// path fits the branch above and never reaches here.
+	if (have_atlas) {
+		vk->vkDeviceWaitIdle(vk->device);
+		destroy_atlas_resources(r);
+	}
 
-	return create_atlas_resources(r, new_view_width, new_view_height, new_atlas_width, new_atlas_height);
+	return create_atlas_resources(r, new_view_width, new_view_height, grow_w, grow_h);
 }
 
 void
