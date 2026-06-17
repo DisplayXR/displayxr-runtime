@@ -50,6 +50,18 @@ cp "$ARTIFACT_DIR/lib/libvulkan.1.dylib" "$RUNTIME_ROOT/lib/"
 cp "$ARTIFACT_DIR/lib/libMoltenVK.dylib" "$RUNTIME_ROOT/lib/"
 cp "$ARTIFACT_DIR/share/vulkan/icd.d/MoltenVK_icd.json" "$RUNTIME_ROOT/share/vulkan/icd.d/"
 
+# cJSON is a direct dependency of the runtime + plug-in. build_macos.sh
+# bundles it into the artifact's lib/; fall back to Homebrew for older
+# artifacts built before that change.
+BREW_PREFIX="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
+if [ -f "$ARTIFACT_DIR/lib/libcjson.1.dylib" ]; then
+    cp -L "$ARTIFACT_DIR/lib/libcjson.1.dylib" "$RUNTIME_ROOT/lib/"
+elif [ -f "$BREW_PREFIX/lib/libcjson.1.dylib" ]; then
+    cp -L "$BREW_PREFIX/lib/libcjson.1.dylib" "$RUNTIME_ROOT/lib/"
+else
+    echo "Warning: libcjson.1.dylib not found; installed runtime may keep an absolute Homebrew dependency"
+fi
+
 # Defensive Vulkan rpath fixup. `scripts/build_macos.sh` already runs
 # the equivalent install_name_tool steps against the artifact dir, but
 # repeat here to be robust against external callers that hand us an
@@ -71,11 +83,23 @@ chmod u+w "$RUNTIME_ROOT/lib/libMoltenVK.dylib"
 install_name_tool -id @rpath/libMoltenVK.dylib "$RUNTIME_ROOT/lib/libMoltenVK.dylib" 2>/dev/null || true
 codesign --force --sign - "$RUNTIME_ROOT/lib/libMoltenVK.dylib" 2>/dev/null || true
 
+if [ -f "$RUNTIME_ROOT/lib/libcjson.1.dylib" ]; then
+  chmod u+w "$RUNTIME_ROOT/lib/libcjson.1.dylib"
+  install_name_tool -id @rpath/libcjson.1.dylib "$RUNTIME_ROOT/lib/libcjson.1.dylib" 2>/dev/null || true
+  codesign --force --sign - "$RUNTIME_ROOT/lib/libcjson.1.dylib" 2>/dev/null || true
+fi
+
+# Retarget the runtime's Vulkan + cJSON deps from the Homebrew absolute
+# path ($BREW_PREFIX is /opt/homebrew on Apple Silicon, /usr/local on
+# Intel) to @rpath.
 chmod u+w "$RUNTIME_ROOT/lib/$RUNTIME_BASENAME"
-install_name_tool -change /opt/homebrew/opt/vulkan-loader/lib/libvulkan.1.dylib \
+install_name_tool -change "$BREW_PREFIX/opt/vulkan-loader/lib/libvulkan.1.dylib" \
                           @rpath/libvulkan.1.dylib \
                           "$RUNTIME_ROOT/lib/$RUNTIME_BASENAME" 2>/dev/null || true
-# Runtime needs @loader_path so it can resolve @rpath/libvulkan.1.dylib
+install_name_tool -change "$BREW_PREFIX/opt/cjson/lib/libcjson.1.dylib" \
+                          @rpath/libcjson.1.dylib \
+                          "$RUNTIME_ROOT/lib/$RUNTIME_BASENAME" 2>/dev/null || true
+# Runtime needs @loader_path so it can resolve @rpath/lib*.dylib
 # from its own directory. Idempotent: install_name_tool warns + exits 0
 # if the rpath is already there.
 install_name_tool -add_rpath @loader_path "$RUNTIME_ROOT/lib/$RUNTIME_BASENAME" 2>/dev/null || true
@@ -108,10 +132,9 @@ cp "$PLUGIN_SRC" "$PLUGIN_PAYLOAD_DIR/"
 # runtime is at @loader_path/../.. (.../lib/).
 PAYLOAD_PLUGIN="$PLUGIN_PAYLOAD_DIR/DisplayXR-SimDisplay.dylib"
 chmod u+w "$PAYLOAD_PLUGIN"
-# Drop every existing rpath that points into a build/_package tree;
-# keep only system rpaths (Homebrew cjson etc. — install_name_tool is
-# a no-op on those). We can't enumerate negatively, so just delete the
-# known dev-iteration rpaths if present and let any survivor warn.
+# Drop every existing rpath that points into a build/_package tree.
+# We can't enumerate negatively, so just delete the known dev-iteration
+# rpaths if present and let any survivor warn.
 for r in $(otool -l "$PAYLOAD_PLUGIN" 2>/dev/null \
            | awk '/LC_RPATH/{f=1} f && /path /{print $2; f=0}' \
            | grep -E '^/.*displayxr-runtime/.*build|@loader_path' || true); do
@@ -119,12 +142,15 @@ for r in $(otool -l "$PAYLOAD_PLUGIN" 2>/dev/null \
 done
 install_name_tool -add_rpath "@loader_path/../.." "$PAYLOAD_PLUGIN" 2>/dev/null || true
 
-# Defensive Vulkan -change on the embedded plug-in (same idempotent
-# fixup applied to the runtime above). @loader_path/../.. above doubles
-# as the rpath that resolves @rpath/libvulkan.1.dylib to
-# .../lib/libvulkan.1.dylib at the install location.
-install_name_tool -change /opt/homebrew/opt/vulkan-loader/lib/libvulkan.1.dylib \
+# Defensive Vulkan + cJSON -change on the embedded plug-in (same
+# idempotent fixup applied to the runtime above). @loader_path/../..
+# above doubles as the rpath that resolves @rpath/lib*.dylib to
+# .../lib/lib*.dylib at the install location.
+install_name_tool -change "$BREW_PREFIX/opt/vulkan-loader/lib/libvulkan.1.dylib" \
                           @rpath/libvulkan.1.dylib \
+                          "$PAYLOAD_PLUGIN" 2>/dev/null || true
+install_name_tool -change "$BREW_PREFIX/opt/cjson/lib/libcjson.1.dylib" \
+                          @rpath/libcjson.1.dylib \
                           "$PAYLOAD_PLUGIN" 2>/dev/null || true
 # Re-sign after all install_name_tool ops to avoid SIGKILL at dlopen.
 codesign --force --sign - "$PAYLOAD_PLUGIN" 2>/dev/null || true
