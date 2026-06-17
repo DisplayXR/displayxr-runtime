@@ -87,6 +87,30 @@ plug-in bind because the loaded DLLs are your VS build with matching PDBs.
 > a one-click **F5 the app** target (instead of attach), see the experimental
 > `XRT_VS_LAUNCH_APP` fold in the root `CMakeLists.txt` — not on by default yet.
 
+## Real Leia weaving in the debugger (not just sim)
+
+The steps above run on **sim-display**. To debug against the actual Leia plug-in
+on a Leia display, the plug-in must be built with a **matching CRT**: the SR SDK
+ships **Release-only**, so a *Debug* plug-in CRT-mismatches it. Use
+**RelWithDebInfo** for the whole stack (Release CRT + PDBs):
+
+```bat
+REM 1) build the solution in RelWithDebInfo (not Debug) in XRT.sln
+REM 2) then, elevated:
+scripts\setup-vs-runtime.bat RelWithDebInfo --leia
+```
+
+`--leia` clones/locates the sibling `displayxr-leia-plugin`, builds it **against
+this runtime checkout** in the same config (so it's ABI- and CRT-matched), and
+registers it at `leia-sr` (ProbeOrder 50 — wins over sim-display). F5
+`displayxr-service` (RelWithDebInfo) and breakpoints in the runtime *and* the
+plug-in bind. If the plug-in build or load fails it stays on sim-display so you
+can still debug the runtime.
+
+> Why not Debug for Leia? Debug links the Debug CRT; the prebuilt SR SDK is
+> Release CRT — mixing them crashes on the first CRT object that crosses. Debug
+> is fine for **sim-only** debugging (no SR SDK in the loaded plug-in).
+
 ## Restore the previous runtime
 
 ```bat
