@@ -42,41 +42,31 @@ build tree.
 
 ## Step 2 — point the active runtime at the VS build (once per config)
 
-Run from an **elevated** `cmd` **at the repo root**:
+The VS build already **generates** a dev runtime manifest at
+`build_vs2022\<cfg>\openxr_displayxr-dev.json` whose `library_path` points at the
+build-tree `DisplayXRClient.dll`. Just make it the active runtime and register
+the VS-built sim-display — run the committed helper from an **elevated** prompt:
 
 ```bat
-REM repo root -> absolute path
-set "REPO=%CD%"
-set "CFG=Debug"
-set "BIN=%REPO%\build_vs2022\bin\%CFG%"
-
-REM 1) Write a runtime manifest JSON pointing at the VS-built core DLL.
-REM    (forward slashes are JSON-safe and valid for LoadLibrary on Windows)
-set "CORE=%BIN%/DisplayXRClient.dll"
-set "CORE=%CORE:\=/%"
-> "%REPO%\build_vs2022\openxr_vs_%CFG%.json" echo {"file_format_version":"1.0.0","runtime":{"library_path":"%CORE%"}}
-
-REM 2) Make it the active OpenXR runtime (backs nothing up — see "Restore" below).
-reg add "HKLM\Software\Khronos\OpenXR\1" /v ActiveRuntime /t REG_SZ /d "%REPO%\build_vs2022\openxr_vs_%CFG%.json" /f
-
-REM 3) Register the VS-built sim-display plug-in (ABI-matched to this build).
-reg add "HKLM\Software\DisplayXR\DisplayProcessors\sim-display" /v Binary      /t REG_SZ    /d "%BIN%\DisplayXR-SimDisplay.dll" /f
-reg add "HKLM\Software\DisplayXR\DisplayProcessors\sim-display" /v ProbeOrder  /t REG_DWORD /d 200 /f
-reg add "HKLM\Software\DisplayXR\DisplayProcessors\sim-display" /v DisplayName /t REG_SZ    /d "Simulated 3D Display (VS Debug)" /f
+scripts\setup-vs-runtime.bat            REM Debug (default)
+scripts\setup-vs-runtime.bat Release
+scripts\setup-vs-runtime.bat --restore  REM put the previous active runtime back
 ```
+
+> **Do not hand-write the JSON or paste `reg`/`echo` commands from chat/Slack** —
+> they smart-quote straight quotes into `"` `"`, which the shell rejects, and a
+> mistyped path leaves `ActiveRuntime` pointing at a file that doesn't exist
+> (→ "Failed to initialize OpenXR"). The script uses the manifest the build
+> already generated, so there's nothing to mis-paste.
 
 Verify:
 
 ```bat
-build_vs2022\bin\Debug\displayxr-cli.exe dp list
 build_vs2022\bin\Debug\displayxr-cli.exe selftest
 ```
 
-`selftest` should pass, listing the sim-display you just registered. (If
-`DisplayXR-SimDisplay.dll` isn't directly in `bin\Debug\`, search the tree:
-`where /r build_vs2022\bin\Debug DisplayXR-SimDisplay.dll` and use that path.)
-
-For a **Release** debug session, repeat step 2 with `set "CFG=Release"`.
+`selftest` should pass and list the sim-display. For a **Release** session, build
+`ALL_BUILD` in Release and run `scripts\setup-vs-runtime.bat Release`.
 
 ## Step 3 — debug
 
@@ -99,14 +89,37 @@ plug-in bind because the loaded DLLs are your VS build with matching PDBs.
 
 ## Restore the previous runtime
 
-To go back to the installed / Ninja runtime, point `ActiveRuntime` back at it
-(e.g. the installer's manifest, or your `_package\DisplayXR_win64.json`):
-
 ```bat
-reg add "HKLM\Software\Khronos\OpenXR\1" /v ActiveRuntime /t REG_SZ /d "%CD%\_package\DisplayXR_win64.json" /f
+scripts\setup-vs-runtime.bat --restore
 ```
 
-(Or re-run `scripts\dev-setup.bat`, which sets the active runtime to `_package`.)
+(Or re-run `scripts\dev-setup.bat`, which sets the active runtime back to
+`_package`.)
+
+## Troubleshooting
+
+- **"Failed to initialize OpenXR" after step 2** — `ActiveRuntime` points at a
+  manifest that doesn't exist (a mis-pasted/hand-written JSON). Re-run
+  `scripts\setup-vs-runtime.bat`, which uses the build-generated manifest.
+- **Run apps from a NON-elevated terminal.** The bundled OpenXR loader *ignores*
+  `XR_RUNTIME_JSON` in elevated processes and falls back to `ActiveRuntime`. So
+  `run_cube_*.bat` launched from an admin prompt won't use its own `XR_RUNTIME_JSON`
+  — it uses whatever `ActiveRuntime` is. (Step 2's `ActiveRuntime` repoint is what
+  makes elevated launches work too.)
+- **"No tests ran" when you Run a project in `XRT.sln`** — the `tests_comp_*`
+  projects are Catch2 unit tests, and the relevant case is hidden (`[.]`), so it
+  needs explicit selection. Those aren't the sample/cube apps — the cube apps are
+  separate CMake projects and **aren't in `XRT.sln`** (debug them via *Attach to
+  Process*, above).
+- **App runs but shows a purple/blank screen on the wrong monitor** — you're on
+  **sim-display** (the fallback), not Leia. The Leia plug-in registered by
+  `dev-setup --leia` was built against the *Ninja/Release* runtime, so the
+  *VS/Debug* runtime ABI-rejects it and falls back to sim-display, which opens on
+  the primary monitor. Check `%LOCALAPPDATA%\DisplayXR\DisplayXR_<exe>.*.log` for
+  which DP loaded / was rejected. For real Leia weaving inside a VS debug session
+  you must build the Leia plug-in **Debug against this runtime checkout** and
+  register that DLL (`scripts\register_dev_plugin.bat leia <path-to-debug-dll>`);
+  otherwise sim-display on the desktop is expected.
 
 ## Why not just one build?
 
