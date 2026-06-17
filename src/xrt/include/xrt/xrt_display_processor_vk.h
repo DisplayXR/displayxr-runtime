@@ -91,6 +91,32 @@ struct xrt_display_processor_vk
 	 *                        background.
 	 */
 	void (*set_transparent_background)(struct xrt_display_processor_vk *xdp, bool enabled, bool client_presents);
+
+	/*!
+	 * Notify the DP that the compositor's target image set was (re)created
+	 * (#602) — e.g. a window resize rebuilt the swapchain / DComp-bridge ring.
+	 * Any cache the DP keys by the target VkImage handle MUST be invalidated
+	 * here: Vulkan recycles freed image handles, so a cache entry keyed by a
+	 * now-destroyed image can alias a fresh image of the same handle and fault
+	 * the device when rendered through (observed as VK_ERROR_DEVICE_LOST in the
+	 * compositor's next queue submit). Leia's post-weave alpha-gate "strip"
+	 * framebuffer cache is exactly such a cache.
+	 *
+	 * Called on the compositor's frame thread immediately after the resize, with
+	 * the device idle (the compositor `vkDeviceWaitIdle`s as part of the target
+	 * rebuild), so the DP may destroy VkFramebuffer / VkImageView objects
+	 * synchronously inside this call. @p generation is monotonic; a DP that
+	 * already flushed for it can no-op (the call is idempotent).
+	 *
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL ⟹ the DP
+	 * keeps no target-handle-keyed cache and needs no notification. Appended
+	 * after @ref set_transparent_background per ADR-020 (append-only within a
+	 * major; no version bump — gated by the variant's `base.struct_size`).
+	 *
+	 * @param xdp         Pointer to self.
+	 * @param generation  Monotonic target image-set generation.
+	 */
+	void (*notify_target_recreated)(struct xrt_display_processor_vk *xdp, uint32_t generation);
 };
 
 /*
@@ -115,8 +141,9 @@ struct xrt_display_processor_vk
  */
 // clang-format off
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, base) == 0, XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_transparent_background) == sizeof(struct xrt_display_processor), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_transparent_background) == sizeof(struct xrt_display_processor) + 0 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, notify_target_recreated)    == sizeof(struct xrt_display_processor) + 1 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 2 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -146,6 +173,29 @@ xrt_display_processor_vk_set_transparent_background(struct xrt_display_processor
 	}
 	xdp->set_transparent_background(xdp, enabled, client_presents);
 	return true;
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::notify_target_recreated
+ *
+ * No-op if not supported (the plug-in's `base.struct_size` doesn't cover the
+ * slot, or the pointer is NULL). Like @ref
+ * xrt_display_processor_vk_set_transparent_background, the presence check reads
+ * `xdp->base.struct_size` because the variant embeds the base — see ADR-020.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline void
+xrt_display_processor_vk_notify_target_recreated(struct xrt_display_processor_vk *xdp, uint32_t generation)
+{
+	if (xdp == NULL) {
+		return;
+	}
+	const char *slot_end = (const char *)&xdp->notify_target_recreated + sizeof(xdp->notify_target_recreated);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size || xdp->notify_target_recreated == NULL) {
+		return;
+	}
+	xdp->notify_target_recreated(xdp, generation);
 }
 
 #ifdef __cplusplus

@@ -84,6 +84,14 @@ struct comp_vk_native_target
 	uint32_t width;
 	uint32_t height;
 
+	//! #602: monotonic counter bumped every time the target image set is
+	//! (re)created (window resize → swapchain / DComp-bridge ring rebuild).
+	//! The display processor watches this to invalidate any cache it keeps
+	//! keyed by the target VkImage handle — Vulkan recycles freed image
+	//! handles, so a stale cache entry can otherwise alias a destroyed image
+	//! and fault the device on use.
+	uint32_t generation;
+
 	//! Surface format.
 	VkFormat format;
 
@@ -1336,6 +1344,7 @@ comp_vk_native_target_resize(struct comp_vk_native_target *target,
 		target->height = height;
 		target->dcomp_ring_idx = 0;
 		target->current_index = 0;
+		target->generation++; // #602: image set rebuilt — invalidate DP caches.
 		target->dcomp_dcomp_device->Commit();
 		return XRT_SUCCESS;
 	}
@@ -1356,5 +1365,15 @@ comp_vk_native_target_resize(struct comp_vk_native_target *target,
 	target->width = width;
 	target->height = height;
 
-	return create_swapchain(target);
+	xrt_result_t scres = create_swapchain(target);
+	if (scres == XRT_SUCCESS) {
+		target->generation++; // #602: image set rebuilt — invalidate DP caches.
+	}
+	return scres;
+}
+
+uint32_t
+comp_vk_native_target_get_generation(struct comp_vk_native_target *target)
+{
+	return target->generation;
 }

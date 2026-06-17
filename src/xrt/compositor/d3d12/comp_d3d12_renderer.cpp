@@ -352,8 +352,15 @@ struct comp_d3d12_renderer
 	uint32_t tile_columns;
 	uint32_t tile_rows;
 
-	//! Actual atlas texture height (tile_rows * view_height).
+	//! Actual atlas content height (tile_rows * view_height).
 	uint32_t texture_height;
+
+	//! #602: ALLOCATED atlas resource extent (high-water-mark, worst-case).
+	//! The content region (tile_columns*view_width x tile_rows*view_height)
+	//! packs top-left into this; content-fit zones shrink the content per
+	//! frame without reallocating. d3d12_crop_atlas_for_dp rect-crops it out.
+	uint32_t atlas_alloc_width;
+	uint32_t atlas_alloc_height;
 
 	//! When true, view dims are fixed at legacy compromise scale and
 	//! set_tile_layout must not recompute them.
@@ -442,13 +449,24 @@ log_dred_state(ID3D12Device *device, const char *context)
 static xrt_result_t
 create_atlas_texture(struct comp_d3d12_renderer *r, ID3D12Device *device, uint32_t width, uint32_t height)
 {
+	(void)height; // atlas height derives from r->view_height (set by the caller)
+
+	// #602 high-water-mark: allocate at the worst case seen so far and never
+	// shrink, so content-fit zones that only change the content extent reuse
+	// this resource (the resize() fast-path skips us entirely while it fits).
+	// Content packs top-left; d3d12_crop_atlas_for_dp rect-crops it back out.
+	uint32_t content_w = r->tile_columns * width;       // Atlas: tile_columns views across
+	uint32_t content_h = r->tile_rows * r->view_height; // Atlas: tile_rows views tall
+	uint32_t alloc_w = content_w > r->atlas_alloc_width ? content_w : r->atlas_alloc_width;
+	uint32_t alloc_h = content_h > r->atlas_alloc_height ? content_h : r->atlas_alloc_height;
+
 	D3D12_HEAP_PROPERTIES heap_props = {};
 	heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
 
 	D3D12_RESOURCE_DESC res_desc = {};
 	res_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-	res_desc.Width = r->tile_columns * width; // Atlas: tile_columns views across
-	res_desc.Height = r->tile_rows * r->view_height; // Atlas: tile_rows views tall
+	res_desc.Width = alloc_w;
+	res_desc.Height = alloc_h;
 	res_desc.DepthOrArraySize = 1;
 	res_desc.MipLevels = 1;
 	res_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -485,6 +503,9 @@ create_atlas_texture(struct comp_d3d12_renderer *r, ID3D12Device *device, uint32
 
 	D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = r->srv_heap->GetCPUDescriptorHandleForHeapStart();
 	device->CreateShaderResourceView(r->atlas_texture, &srv_desc, srv_cpu);
+
+	r->atlas_alloc_width = alloc_w;
+	r->atlas_alloc_height = alloc_h;
 
 	return XRT_SUCCESS;
 }
@@ -1835,18 +1856,35 @@ comp_d3d12_renderer_resize(struct comp_d3d12_renderer *renderer,
 
 	uint32_t new_texture_height = renderer->tile_rows * new_view_height;
 
-	if (new_view_width == renderer->view_width &&
-	    new_view_height == renderer->view_height &&
-	    new_texture_height == renderer->texture_height) {
+	// #602: decouple the atlas ALLOCATION (high-water-mark) from the per-frame
+	// content VIEW dims. Content-fit display zones (ADR-027) renegotiate view
+	// dims ~6x/sec; previously every change Release()'d and rebuilt the atlas
+	// resource (per-frame COM churn). Instead the content packs top-left into a
+	// stable, never-shrinking allocation; d3d12_crop_atlas_for_dp rect-crops it
+	// back out, and the draw places tiles by the effective layout. While the
+	// content fits the current allocation we only update bookkeeping in place.
+	uint32_t req_w = renderer->tile_columns * new_view_width;
+	uint32_t req_h = new_texture_height;
+	bool have_atlas = renderer->atlas_texture != nullptr;
+	bool fits = have_atlas && req_w <= renderer->atlas_alloc_width &&
+	            req_h <= renderer->atlas_alloc_height;
+	if (fits) {
+		renderer->view_width = new_view_width;
+		renderer->view_height = new_view_height;
+		renderer->texture_height = new_texture_height;
 		return XRT_SUCCESS;
 	}
 
-	U_LOG_W("D3D12 renderer resize: view %ux%u -> %ux%u, tex_h %u -> %u",
-	        renderer->view_width, renderer->view_height,
-	        new_view_width, new_view_height,
+	// TEMP #602 instrumentation — counts genuine atlas (re)allocations; should
+	// stay tiny (≈ startup/warmup) and NOT climb per-frame. Remove before merge.
+	static uint32_t s_realloc_count = 0;
+	U_LOG_W("#602 D3D12 atlas (re)alloc #%u: view %ux%u -> %ux%u, tex_h %u -> %u", ++s_realloc_count,
+	        renderer->view_width, renderer->view_height, new_view_width, new_view_height,
 	        renderer->texture_height, new_texture_height);
 
-	// Release existing atlas texture
+	// Genuine grow (first allocation / display-mode change / content larger
+	// than any seen before). Release the old resource and recreate; the
+	// high-water-mark logic in create_atlas_texture never shrinks.
 	if (renderer->atlas_texture != nullptr) {
 		renderer->atlas_texture->Release();
 		renderer->atlas_texture = nullptr;

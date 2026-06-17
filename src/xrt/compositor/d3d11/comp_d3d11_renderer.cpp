@@ -141,8 +141,15 @@ struct comp_d3d11_renderer
 	uint32_t tile_rows;
 
 	//! Texture height (may be > view_height to accommodate mono/2D mode).
-	//! The atlas texture is tile_columns*view_width x texture_height.
+	//! The atlas texture content region is tile_columns*view_width x texture_height.
 	uint32_t texture_height;
+
+	//! #602: ALLOCATED atlas texture extent (high-water-mark, worst-case). The
+	//! content region (tile_columns*view_width x texture_height) packs top-left
+	//! into this; content-fit zones shrink the content per frame without
+	//! reallocating. d3d11_crop_atlas_for_dp rect-crops the content back out.
+	uint32_t atlas_alloc_width;
+	uint32_t atlas_alloc_height;
 
 	//! When true, view dims are fixed at legacy compromise scale and
 	//! set_tile_layout must not recompute them.
@@ -629,6 +636,8 @@ create_resources(struct comp_d3d11_renderer *r)
 		U_LOG_E("Failed to create atlas texture: 0x%08x", hr);
 		return XRT_ERROR_D3D;
 	}
+	r->atlas_alloc_width = texDesc.Width;
+	r->atlas_alloc_height = texDesc.Height;
 
 	U_LOG_W("Created atlas texture: %ux%u (view=%ux%u, tiles=%ux%u, tex_h=%u)",
 	        texDesc.Width, texDesc.Height, r->view_width, r->view_height,
@@ -1677,19 +1686,44 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 	uint32_t min_h = (new_target_height > atlas_h) ? new_target_height : atlas_h;
 	uint32_t new_texture_height = (min_h > new_view_height) ? min_h : new_view_height;
 
-	// Skip if unchanged
-	if (new_view_width == renderer->view_width &&
-	    new_view_height == renderer->view_height &&
-	    new_texture_height == renderer->texture_height) {
+	// #602: decouple the atlas ALLOCATION (high-water-mark, worst-case) from
+	// the per-frame content VIEW dims. Content-fit display zones (ADR-027)
+	// renegotiate view dims ~6x/sec; previously every change Release()'d and
+	// rebuilt the atlas/SRV/RTV/depth (per-frame COM churn). Instead the
+	// content (tile_columns*view_width x texture_height) packs top-left into a
+	// stable, never-shrinking allocation; d3d11_crop_atlas_for_dp rect-crops
+	// it back out, and the draw path places tiles by the effective layout, not
+	// the allocation. While the content fits the current allocation we only
+	// update the view bookkeeping in place — no Release/recreate.
+	uint32_t req_w = renderer->tile_columns * new_view_width;
+	uint32_t req_h = new_texture_height;
+	bool have_atlas = renderer->atlas_texture != nullptr;
+	bool fits = have_atlas && req_w <= renderer->atlas_alloc_width &&
+	            req_h <= renderer->atlas_alloc_height;
+	if (fits) {
+		renderer->view_width = new_view_width;
+		renderer->view_height = new_view_height;
+		renderer->texture_height = new_texture_height;
 		return XRT_SUCCESS;
 	}
 
 	auto internals = get_internals(renderer->c);
 
-	U_LOG_W("Renderer resize: view %ux%u -> %ux%u, tex_h %u -> %u",
-	        renderer->view_width, renderer->view_height,
-	        new_view_width, new_view_height,
-	        renderer->texture_height, new_texture_height);
+	// Genuine grow: first allocation, a display-mode change, or content larger
+	// than any seen before. High-water-mark — never shrink — so this converges
+	// (content-fit is window-bounded) and stops firing after warmup.
+	uint32_t grow_w = req_w;
+	uint32_t grow_h = req_h;
+	if (have_atlas) {
+		if (renderer->atlas_alloc_width > grow_w) grow_w = renderer->atlas_alloc_width;
+		if (renderer->atlas_alloc_height > grow_h) grow_h = renderer->atlas_alloc_height;
+	}
+
+	// TEMP #602 instrumentation — counts genuine atlas (re)allocations; should
+	// stay tiny (≈ startup/warmup) and NOT climb per-frame. Remove before merge.
+	static uint32_t s_realloc_count = 0;
+	U_LOG_W("#602 D3D11 atlas (re)alloc #%u: %ux%u (view %ux%u, tex_h %u)", ++s_realloc_count, grow_w, grow_h,
+	        new_view_width, new_view_height, new_texture_height);
 
 	// Release existing resources
 #define SAFE_RELEASE(x)                                                                                                \
@@ -1711,10 +1745,11 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 	renderer->view_height = new_view_height;
 	renderer->texture_height = new_texture_height;
 
-	// Recreate atlas texture (tile_columns * view_width)
+	// Recreate atlas texture at the grown (worst-case) allocation; content
+	// packs top-left into it.
 	D3D11_TEXTURE2D_DESC texDesc = {};
-	texDesc.Width = renderer->tile_columns * new_view_width;
-	texDesc.Height = new_texture_height;
+	texDesc.Width = grow_w;
+	texDesc.Height = grow_h;
 	texDesc.MipLevels = 1;
 	texDesc.ArraySize = 1;
 	texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1727,6 +1762,8 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 		U_LOG_E("Failed to recreate atlas texture: 0x%08x", hr);
 		return XRT_ERROR_D3D;
 	}
+	renderer->atlas_alloc_width = texDesc.Width;
+	renderer->atlas_alloc_height = texDesc.Height;
 
 	// Recreate SRV
 	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
@@ -1764,8 +1801,8 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 		return XRT_ERROR_D3D;
 	}
 
-	U_LOG_W("Renderer resized: atlas texture now %ux%u (view=%ux%u, tiles=%ux%u, tex_h=%u)",
-	        renderer->tile_columns * new_view_width, new_texture_height,
+	U_LOG_W("Renderer resized: atlas alloc now %ux%u (view=%ux%u, tiles=%ux%u, tex_h=%u)",
+	        grow_w, grow_h,
 	        new_view_width, new_view_height,
 	        renderer->tile_columns, renderer->tile_rows, new_texture_height);
 
