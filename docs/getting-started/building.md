@@ -295,6 +295,35 @@ registers it ahead of sim-display; it falls back to sim if the build/load fails.
   *Debug* runtime rejects it). Use the RelWithDebInfo `--leia` flow for real
   weaving. `…\DisplayXR_<exe>.*.log` shows which DP loaded / was rejected.
 
+### Alternative: VS Code (CMake Tools)
+
+Prefer VS Code over the Visual Studio IDE? It debugs the **Ninja** build (no
+`XRT.sln`) via the CMake Tools extension and the in-tree `CMakePresets.json`.
+
+1. **Extensions:** install *CMake Tools* and *C/C++* (Microsoft). Prereqs are the
+   same as above (VS 2022 **Build Tools** for the MSVC compiler, Ninja, Vulkan
+   SDK, GitHub CLI). Run `scripts\build_windows.bat build` once first so vcpkg and
+   the OpenXR loader are fetched (the presets reference them).
+2. **Open the repo folder.** CMake Tools picks up `CMakePresets.json`; choose the
+   **"Debug service"** configure preset (Ninja, `CMAKE_BUILD_TYPE=Debug`, with the
+   vcpkg toolchain + `OpenXR_ROOT` already wired). **Configure**, then build the
+   **`install`** target → a Debug runtime + sim-display land in `_package\`.
+3. **Activate it (elevated, once):** `scripts\register_dev_plugin.bat` registers
+   the `_package` sim-display, and point the active runtime at the Debug build:
+   `reg add "HKLM\Software\Khronos\OpenXR\1" /v ActiveRuntime /t REG_SZ /d "%CD%\_package\DisplayXR_win64.json" /f` (or just `scripts\dev-setup.bat --no-vs`,
+   which builds + registers + activates in one shot — Release, fine for stepping
+   the runtime). Verify: `_package\bin\displayxr-cli.exe selftest`.
+4. **Debug:** add a launch config (`.vscode/launch.json`, `type: cppvsdbg`) that
+   either launches `${command:cmake.launchTargetPath}` (e.g. `displayxr-cli` with
+   `args: ["selftest"]`, or `displayxr-service`) or **attaches** to a running app /
+   `displayxr-service`. Breakpoints in the runtime + plug-in bind. For real Leia
+   weaving the same RelWithDebInfo/CRT rule applies — build the *Release service*
+   preset and register a RelWithDebInfo Leia plug-in (`scripts\register_dev_plugin.bat leia <dll>`).
+
+> The Visual Studio (`XRT.sln`) flow above is the primary, best-tested path;
+> VS Code is the lighter-weight alternative and shares the same registry /
+> active-runtime mechanics.
+
 ## Running Tests
 
 ```bash
