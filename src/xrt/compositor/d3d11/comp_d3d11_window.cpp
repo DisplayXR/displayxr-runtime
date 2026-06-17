@@ -250,6 +250,18 @@ static void set_fullscreen(HWND hWnd, bool fullscreen);
 // (WM_USER + 101) was WM_WORKSPACE_LAUNCH_APP — removed in #376; the
 // browse + launch affordance is controller-owned now.
 #define WM_WORKSPACE_SET_CAPTURE   (WM_USER + 102) //!< Phase 2.K: wParam=enabled (0/1).
+// Private "really destroy the HWND now" message, posted ONLY by
+// comp_d3d11_window_destroy() during orderly compositor teardown — i.e. AFTER
+// the display processor (and its SR weaver, which subclasses this HWND) has
+// already been destroyed. A user-initiated WM_CLOSE (ESC / window X button)
+// must NOT DestroyWindow inline: doing so re-enters the still-attached SR
+// weaver's subclass proc during WM_DESTROY and access-violates (GL path,
+// blender session-exit crash). Instead WM_CLOSE only sets should_exit, which
+// the compositor surfaces to the app as a frame-loop error → xrDestroySession
+// → DP destroyed first → comp_d3d11_window_destroy posts THIS message → safe
+// DestroyWindow with no weaver attached. WM_APP is in a separate range from the
+// WM_USER ids above so it can't collide with a relayed app/window message.
+#define WM_DXR_DESTROY_WINDOW       (WM_APP + 1)
 
 // spec_version 24: when a key/char message is PostMessage'd to a composited IPC
 // app, the runtime stamps the current modifier mask into spare lParam bits so
@@ -502,7 +514,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		break;
 
 	case WM_CLOSE:
-		U_LOG_W("D3D11 window: WM_CLOSE received");
+		U_LOG_W("D3D11 window: WM_CLOSE received (signalling exit; not destroying inline)");
 		// Switch workspace DP to 2D mode (lens off) before closing.
 		// This runs on the window thread and works even with no active clients.
 		{
@@ -515,9 +527,22 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				U_LOG_W("D3D11 window: switched workspace DP to 2D on close");
 			}
 		}
+		// Request shutdown only. should_exit makes comp_d3d11_window_is_valid()
+		// return false, which the compositor surfaces to the app's frame loop as
+		// an error → the app calls xrDestroySession → the compositor destroys the
+		// display processor (detaching the SR weaver's HWND subclass) and THEN
+		// calls comp_d3d11_window_destroy(), which posts WM_DXR_DESTROY_WINDOW to
+		// actually tear the HWND down. DestroyWindow here (with the weaver still
+		// subclassing the window) would re-enter the weaver during WM_DESTROY and
+		// crash — see the WM_DXR_DESTROY_WINDOW note above.
 		InterlockedExchange(&w->should_exit, TRUE);
+		return 0;
+
+	case WM_DXR_DESTROY_WINDOW:
+		// Orderly teardown only (posted by comp_d3d11_window_destroy after the DP
+		// is gone). Safe to destroy the HWND now: no weaver subclass is attached.
 		DestroyWindow(hWnd);
-		break;
+		return 0;
 
 	case WM_DESTROY:
 		PostQuitMessage(0);
@@ -1094,7 +1119,9 @@ window_release(struct comp_d3d11_window *w)
  * Window thread function.
  *
  * Creates the window, runs the message loop, and cleans up the window class
- * on exit. The compositor thread signals shutdown by posting WM_CLOSE.
+ * on exit. The compositor thread tears the HWND down by posting
+ * WM_DXR_DESTROY_WINDOW (via comp_d3d11_window_destroy); a user WM_CLOSE only
+ * sets should_exit and lets that orderly path run.
  */
 static DWORD WINAPI
 window_thread_func(LPVOID param)
@@ -1331,19 +1358,24 @@ comp_d3d11_window_destroy(struct comp_d3d11_window **window)
 
 	U_LOG_W("D3D11 window: Destroying window");
 
-	// Ask the window thread to close: WM_CLOSE -> DestroyWindow -> WM_DESTROY ->
-	// PostQuitMessage breaks its message loop, after which it frees its own
-	// resources and votes via window_release().
+	// Ask the window thread to destroy the HWND: WM_DXR_DESTROY_WINDOW ->
+	// DestroyWindow -> WM_DESTROY -> PostQuitMessage breaks its message loop,
+	// after which it frees its own resources and votes via window_release().
+	// We post the private destroy message (NOT WM_CLOSE): WM_CLOSE is the
+	// user-close signal and no longer destroys the HWND inline (it would re-enter
+	// the SR weaver's window subclass and crash). This call is the orderly
+	// teardown path and only runs after the compositor has already destroyed the
+	// display processor, so the weaver is detached and DestroyWindow is safe.
 	InterlockedExchange(&w->should_exit, TRUE);
 	if (w->hwnd != NULL) {
-		PostMessageW(w->hwnd, WM_CLOSE, 0, 0);
+		PostMessageW(w->hwnd, WM_DXR_DESTROY_WINDOW, 0, 0);
 	}
 
 	// Wait so the caller (compositor teardown) knows the window is gone before it
-	// releases the D3D device the thread renders with. The WM_CLOSE handler
-	// switches the DP to 2D and runs DestroyWindow, which synchronously re-enters
-	// the window proc (it reads w back from GWLP_USERDATA), so under the CTS's
-	// heavy create/destroy churn this can take a while — allow a generous timeout.
+	// releases the D3D device the thread renders with. WM_DXR_DESTROY_WINDOW runs
+	// DestroyWindow, which synchronously re-enters the window proc (it reads w
+	// back from GWLP_USERDATA), so under the CTS's heavy create/destroy churn this
+	// can take a while — allow a generous timeout.
 	// If it still hasn't exited we proceed anyway: window_release() guarantees we
 	// never free w while the thread is alive (whoever finishes last frees), which
 	// eliminates the use-after-free ACCESS_VIOLATION that crashed the CTS run.

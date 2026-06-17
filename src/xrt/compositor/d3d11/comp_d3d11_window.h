@@ -115,7 +115,12 @@ comp_d3d11_window_create(uint32_t width,
 /*!
  * Destroy the self-owned window.
  *
- * Posts WM_CLOSE to the window thread and waits for it to exit.
+ * Posts the private WM_DXR_DESTROY_WINDOW message to the window thread and waits
+ * for it to exit. MUST be called only after the compositor's display processor
+ * has been destroyed (the SR weaver subclasses this HWND; destroying the window
+ * while it is still attached re-enters the weaver and crashes). A user-initiated
+ * WM_CLOSE (ESC / window X) does NOT destroy the window — it only sets
+ * should_exit so the app tears down through this orderly path.
  * Can be called from any thread.
  *
  * @param window Pointer to window handle (set to NULL after destruction)
