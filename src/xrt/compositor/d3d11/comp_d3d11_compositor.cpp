@@ -2438,6 +2438,14 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			// DP owns see-through (compose-under-bg from the atlas alpha).
 			xrt_display_processor_d3d11_set_transparent_background(
 			    c->display_processor, transparent_background, false);
+			// #68: tell the DP whether the app self-presents only the canvas (a
+			// _texture app blits its shared texture's canvas to its own window)
+			// vs the runtime presenting the full target (handle apps). The DP
+			// uses this + its zones state to skip the compose-under-bg desktop-UV
+			// remap that would otherwise magnify the captured desktop. Replaces
+			// the DISPLAYXR_ZONES_TEXTURE_FIX prototype env flag.
+			xrt_display_processor_d3d11_set_shared_texture_present(
+			    c->display_processor, c->has_shared_texture);
 		}
 	} else {
 		U_LOG_W("No D3D11 display processor factory provided");
