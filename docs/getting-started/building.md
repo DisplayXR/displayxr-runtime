@@ -47,9 +47,14 @@ The rest of this doc is reference (prerequisites, CMake options, the loader /
 ## Prerequisites
 
 ### Windows
-- Visual Studio 2022
+- Visual Studio 2022 (with the **C++ workload**; gives you MSVC + the VS generator)
 - CMake
-- Ninja
+- Ninja — **install via `winget install Ninja-build.Ninja`.** `scripts\build_windows.bat`
+  locates Ninja only on `PATH` / at the winget install path; the copy bundled with VS's
+  "CMake" component is **not** picked up, so the script's `where ninja` check fails if Ninja
+  was installed any other way (or not at all).
+- Vulkan SDK — `winget install KhronosGroup.VulkanSDK`
+- GitHub CLI — `winget install GitHub.cli` then `gh auth login` (the script fetches the OpenXR loader)
 - Vendor display SDK — optional (see [Vendor SDK](#vendor-sdk) below). The **sim_display** driver works without any vendor SDK, providing a simulated 3D display with WASD + mouse eye control.
 
 ### macOS
@@ -104,6 +109,33 @@ cmake --build .
 ```
 Builds the runtime with sim_display as the in-tree vendor-neutral
 display processor. No vendor SDK is needed at build time.
+
+### Build troubleshooting (Windows)
+
+The build is correct, but a couple of *environment* issues can make a clean clone look
+broken. All of these succeed on a retry / clean reconfigure — they are not code defects.
+
+- **`LINK : fatal error LNK1105: cannot close file '…\*.lib'; error code 1224`** (or random
+  link/`Detecting CXX compiler ABI info - failed` failures) — a real-time **antivirus / EDR
+  scanner** is holding a just-written file open while MSVC's parallel build races to use it
+  (`1224` = `ERROR_USER_MAPPED_FILE`). It is **not** specific to any folder. Fixes: add the
+  build tree (and ideally `%TEMP%`) to your AV's real-time-scan exclusions, or just re-run
+  `scripts\build_windows.bat all` — the Ninja build is incremental and resumes where it
+  stopped.
+- **A test app fails with `LNK1120: NN unresolved externals` on `xr*` symbols** (e.g.
+  `xrCreateSwapchain`, `xrEndFrame`) — the app linked against a **wrong-architecture**
+  `openxr_loader.lib`. This happens when a per-app CMake configure was interrupted (so the
+  compiler ABI / `CMAKE_SIZEOF_VOID_P` wasn't detected) and `FindOpenXR` fell back to a
+  **stale machine-wide OpenXR SDK** (e.g. a hand-installed `C:\dev\openxr_sdk` that ships both
+  `Win32\` and `x64\`). Fixes: delete the offending `test_apps\<app>\build\` folder and
+  re-run `scripts\build_windows.bat test-apps`; and remove/rename any stale machine-level
+  OpenXR SDK (the script supplies its own versioned loader and passes `-DOpenXR_ROOT`).
+- **`ninja not found`** even though Ninja seems installed — see the Ninja prerequisite above;
+  install it with `winget install Ninja-build.Ninja` (the VS-bundled Ninja is not used).
+- **VS solution builds but apps fail at runtime** ("Failed to initialize OpenXR") — the VS
+  (Debug) tree and the Ninja (`_package`, Release) tree are separate; after building
+  `XRT.sln` you **must** repoint the active runtime with **`scripts\setup-vs-runtime.bat`**.
+  See [Debugging in Visual Studio](#debugging-in-visual-studio).
 
 ## Vendor displays
 
