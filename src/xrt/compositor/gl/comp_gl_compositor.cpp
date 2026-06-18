@@ -4548,8 +4548,14 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 
 			// #68: tell the DP whether the app self-presents only the canvas
 			// (texture app) vs the runtime presenting the full target (handle).
+			// has_shared_texture is Windows-only (WGL_NV_DX_interop2); on other
+			// platforms GL has no shared-texture present → always false.
+			bool gl_shared_texture_present = false;
+#ifdef XRT_OS_WINDOWS
+			gl_shared_texture_present = c->has_shared_texture;
+#endif
 			xrt_display_processor_gl_set_shared_texture_present(
-			    c->display_processor, c->has_shared_texture);
+			    c->display_processor, gl_shared_texture_present);
 		} else {
 			U_LOG_W("GL compositor: display processor factory returned %d, using built-in shaders", dp_ret);
 			c->display_processor = NULL;
