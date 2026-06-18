@@ -69,7 +69,28 @@ about window/texture ownership, not region expression.
    surround handling) and the three entry points; bump the extension spec version. Record
    the decision as a new ADR; add a one-line forward pointer to it from ADR-027.
 
-## 4. Risks / notes
+## 4. Backend coverage — which backends the shim touches (and why)
+
+The shim only matters where a **working bespoke surround path** exists that real apps depend
+on. That is exactly **D3D11, D3D12, Metal** — all three have `*_blit_surround_strips` (a real
+per-frame surround fill) and shipping `cube_texture_*` apps that use it. Those are the three
+backends the shim covers (Metal verified; D3D11/D3D12 pending Windows validation).
+
+- **GL and VK_native do NOT need the shim.** Their `comp_*_set_surround_2d` only *stores* the
+  handle and logs `"(open + blit pending)"` — there is no import, no strip blit, no composite
+  of the surround. They register it and ignore it, and there are no GL/VK **texture apps**
+  (only `cube_handle_gl_*` / `cube_handle_vk_*`). There is no working behaviour to preserve, so
+  there is nothing to shim. (Both already have the unified composite — `gl_composite_local_2d`
+  / `vk_composite_local_2d` + `*_update_zone_wish_mask` — they just never wired surround to it.)
+- **Android needs nothing.** The Android OOP runtime uses the `vk_native` compositor (the
+  service path), and there is no Android texture app or Android surround code (only
+  `cube_handle_vk_android`). Covered by "VK = stub".
+- **Future GL/VK surround → canonical, not a shim.** If a GL or VK texture app ever needs a 2D
+  region, implement it **directly through `XR_EXT_display_zones` / the existing unified
+  composite from day one** — skip the bespoke-strip-blit-then-shim cycle entirely. New backends
+  never grow a bespoke surround path to deprecate; that is the point of converging on zones.
+
+## 5. Risks / notes
 
 - **Feathered vs hard canvas edge.** The shim's synthetic mask uses the zone wish-mask
   raster (feathered edge), so the canvas/surround boundary is a soft blend rather than the
