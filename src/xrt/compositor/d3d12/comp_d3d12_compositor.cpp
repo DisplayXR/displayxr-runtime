@@ -2548,6 +2548,12 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 			// DP owns see-through (compose-under-bg from the atlas alpha).
 			xrt_display_processor_d3d12_set_transparent_background(
 			    c->display_processor, transparent_background, false);
+
+			// #68: tell the DP whether the app self-presents only the canvas
+			// (texture app) vs the runtime presenting the full target (handle).
+			// Used + zones state to skip the compose-under-bg desktop-UV remap.
+			xrt_display_processor_d3d12_set_shared_texture_present(
+			    c->display_processor, c->has_shared_texture);
 		}
 	} else {
 		U_LOG_W("No D3D12 display processor factory provided");

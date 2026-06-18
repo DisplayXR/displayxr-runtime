@@ -4545,6 +4545,11 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 			// sim_display, which preserves alpha natively).
 			xrt_display_processor_gl_set_transparent_background(
 			    c->display_processor, c->transparent_background, false);
+
+			// #68: tell the DP whether the app self-presents only the canvas
+			// (texture app) vs the runtime presenting the full target (handle).
+			xrt_display_processor_gl_set_shared_texture_present(
+			    c->display_processor, c->has_shared_texture);
 		} else {
 			U_LOG_W("GL compositor: display processor factory returned %d, using built-in shaders", dp_ret);
 			c->display_processor = NULL;
