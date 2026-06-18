@@ -1,7 +1,12 @@
-# Workspace Controller Registration (Windows)
+# Workspace Controller Registration
 
-**Status:** Stable. Implemented in
-`src/xrt/targets/service/service_workspace_registry.{c,h}`.
+**Status:** Stable on Windows (registry-backed). POSIX (macOS / Linux)
+uses a parallel **JSON-manifest** discovery, implemented in the same
+`src/xrt/targets/service/service_workspace_registry.{c,h}` behind the
+`XRT_OS_WINDOWS` split. The *contract semantics* (id, binary, display
+name, capabilities, actions, enumerate + lookup) are identical across
+platforms; only the storage backend differs. See **POSIX discovery**
+below for the macOS/Linux schema and search roots.
 
 This document is the contract between the DisplayXR runtime and any
 **workspace app** that wants to drive the multi-window spatial shell
@@ -206,6 +211,62 @@ active controller's `DisplayName` as the submenu parent. A future
 multi-controller chooser (when more than one is registered) will live
 in the tray and toggle `service.json::workspace_binary` between
 registered ids.
+
+## POSIX discovery (macOS / Linux)
+
+There is no registry on POSIX, so a controller registers by dropping a
+`<id>.json` **manifest** into a well-known directory — exactly the model
+the display-processor plug-in loader uses (`target_plugin_loader.c`).
+`service_workspace_registry_enumerate()` / `_lookup()` scan these dirs,
+parse each `*.json`, and skip any whose `binary` does not exist on disk.
+
+### Manifest schema (`file_format_version` `"1.0"`)
+
+```json
+{
+  "file_format_version": "1.0",
+  "controller": {
+    "id": "shell",
+    "binary": "/Applications/DisplayXR Shell.app/Contents/MacOS/displayxr-shell",
+    "display_name": "DisplayXR Shell",
+    "vendor": "DisplayXR",
+    "version": "1.2.3",
+    "uninstall_string": "",
+    "supports_file_dialog": true,
+    "actions": [
+      { "label": "Enable Workspace", "type": "lifecycle:enable" },
+      { "label": "",                 "type": "separator" },
+      { "label": "Disable Workspace", "type": "lifecycle:disable" }
+    ]
+  }
+}
+```
+
+- `id` is optional; it defaults to the manifest filename minus `.json`
+  (so `shell.json` → id `shell`), mirroring the plug-in loader's
+  `<probe_order>-<id>.json` convention.
+- `binary` is required and must be an absolute path to an existing
+  regular file, or the entry is skipped.
+- `supports_file_dialog` maps to `WORKSPACE_CAPABILITY_FILE_DIALOG`.
+- `actions[]` follows the same keep/skip rules as Windows: a
+  `"separator"` needs no label; every other `type` needs both `label`
+  and `type`. `Type` values are identical to the Windows table above.
+
+### Search roots (priority order; per-user shadows system)
+
+1. `$XRT_WORKSPACE_CONTROLLER_PATH` — dev override, colon-separated list
+   of dirs (like `XRT_PLUGIN_SEARCH_PATH`).
+2. **macOS:** `~/Library/Application Support/DisplayXR/WorkspaceControllers/`
+   **Linux:** `$XDG_DATA_HOME/DisplayXR/WorkspaceControllers/` (or
+   `~/.local/share/DisplayXR/WorkspaceControllers/`).
+3. **macOS:** `/Library/Application Support/DisplayXR/WorkspaceControllers/`
+   **Linux:** `/usr/local/share/displayxr/WorkspaceControllers/`,
+   `/usr/share/displayxr/WorkspaceControllers/`.
+
+The first manifest seen for a given `id` wins, so a per-user install
+shadows a system-wide one. A macOS `.pkg` installer drops its manifest
+into root #3; a dev build can point `XRT_WORKSPACE_CONTROLLER_PATH` at a
+build-tree dir.
 
 ## Reference implementation
 

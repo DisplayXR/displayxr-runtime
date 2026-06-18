@@ -15,6 +15,15 @@ target_link_libraries(
 		target_instance
 	)
 
+# Workspace-controller discovery is cross-platform: registry-backed on Windows,
+# JSON-manifest-backed on POSIX (mirrors the plug-in loader). The minimal macOS
+# service orchestration in main.c uses the POSIX path to find + spawn a
+# registered controller (e.g. the macOS shell).
+target_sources(displayxr-service PRIVATE
+	service_workspace_registry.c
+	service_workspace_registry.h
+)
+
 # Delay-load Vulkan so the service can start on systems where it is absent.
 # The D3D11 service compositor path never calls into Vulkan functions, so the
 # delay-loaded DLL is never triggered. This mirrors the same pattern used by
@@ -35,8 +44,6 @@ if(WIN32)
 		service_orchestrator.h
 		service_tray_win.c
 		service_tray_win.h
-		service_workspace_registry.c
-		service_workspace_registry.h
 		service_resources.rc
 	)
 	target_link_libraries(displayxr-service PRIVATE shell32 ws2_32)
