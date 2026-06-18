@@ -331,6 +331,25 @@ struct xrt_display_processor_d3d11
 	 *                        because the final present is opaque.
 	 */
 	void (*set_transparent_background)(struct xrt_display_processor_d3d11 *xdp, bool enabled, bool client_presents);
+
+	/*!
+	 * Tell the DP whether the on-screen presentation shows ONLY the canvas
+	 * (the app self-presents its shared texture's canvas sub-region to its own
+	 * window) vs the whole weave target (handle apps, where the runtime presents
+	 * the full swapchain). A `_texture` app blits the shared texture and Presents
+	 * itself, and for a zones frame the canvas IS the whole window — so the DP's
+	 * compose-under-bg desktop-UV remap (which assumes the window shows the whole
+	 * panel-sized target) must be skipped or the captured desktop is magnified
+	 * (#68). Handle apps keep the remap. Set once at DP setup from the
+	 * compositor's `has_shared_texture`.
+	 *
+	 * Optional — absent slot or NULL ⟹ the DP assumes the full target is
+	 * presented (legacy behavior). Appended per ADR-020 (append-only).
+	 *
+	 * @param xdp      Pointer to self.
+	 * @param enabled  true ⟹ the app self-presents a shared texture (canvas-only).
+	 */
+	void (*set_shared_texture_present)(struct xrt_display_processor_d3d11 *xdp, bool enabled);
 };
 
 /*
@@ -381,7 +400,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, clear_local_zone_
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_background_2d)            == XRT_DP_D3D11_BASE_OFF + 14 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_eye_tracking_mode)        == XRT_DP_D3D11_BASE_OFF + 15 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_transparent_background)    == XRT_DP_D3D11_BASE_OFF + 16 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 17 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_shared_texture_present)    == XRT_DP_D3D11_BASE_OFF + 17 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 18 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -648,6 +668,24 @@ xrt_display_processor_d3d11_set_transparent_background(struct xrt_display_proces
 		return false;
 	}
 	xdp->set_transparent_background(xdp, enabled, client_presents);
+	return true;
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::set_shared_texture_present
+ *
+ * Helper for calling through the function pointer. Returns false if the slot is
+ * absent (older plug-in) or NULL — the DP then keeps its full-target assumption.
+ *
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_set_shared_texture_present(struct xrt_display_processor_d3d11 *xdp, bool enabled)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, set_shared_texture_present) || xdp->set_shared_texture_present == NULL) {
+		return false;
+	}
+	xdp->set_shared_texture_present(xdp, enabled);
 	return true;
 }
 
