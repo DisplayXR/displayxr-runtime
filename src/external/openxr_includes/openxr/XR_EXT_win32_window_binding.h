@@ -122,6 +122,15 @@ typedef struct XrCompositionLayerWindowSpaceEXT {
 } XrCompositionLayerWindowSpaceEXT;
 
 // ---- Canvas Sub-Rect (Shared Texture Output Rect) ----
+//
+// DEPRECATED (use XR_EXT_display_zones): xrSetSharedTextureOutputRectEXT,
+// xrSetSharedTextureSurround2DEXT, and xrSetSharedTextureSurround2DFenceEXT
+// express a strict special case of the display-zones model — an output rect is
+// one 3D zone, a 2D surround is one XrCompositionLayerLocal2DEXT zone covering
+// the complement. Migrate to XR_EXT_display_zones (ADR-027). Existing apps keep
+// working (runtime translation shim, DISPLAYXR_SURROUND_SHIM); these entry
+// points will be removed in a future spec version. See
+// docs/roadmap/surround-zones-deprecation.md.
 
 /*!
  * @brief Set the canvas sub-rect within the app's window where 3D content appears.

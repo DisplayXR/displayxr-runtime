@@ -332,6 +332,33 @@ struct xrt_layer_window_space_data
 
 **`xrt_comp_layer_window_space()`** — Inline helper (`src/xrt/include/xrt/xrt_compositor.h:1865`) that dispatches a window-space layer through the compositor's vtable.
 
+> ## ⚠️ DEPRECATED — §3.5–3.7 (output rect + 2D surround)
+>
+> **`xrSetSharedTextureOutputRectEXT` (§3.5), `xrSetSharedTextureSurround2DEXT` (§3.6),
+> and `xrSetSharedTextureSurround2DFenceEXT` (§3.7) are deprecated** in favour of
+> [`XR_EXT_display_zones`](XR_EXT_display_zones.md) (ADR-027). They express a strict
+> special case of the zones model:
+>
+> - an **output rect** is exactly **one 3D zone** covering that sub-rect, and
+> - a **2D surround** is exactly **one `XrCompositionLayerLocal2DEXT` zone** covering the
+>   complement.
+>
+> Display-zones is the canonical, more general mechanism (N 3D zones + M 2D zones + a
+> per-pixel wish mask), and a texture app gets identical capability through it (verified:
+> `cube_zones_texture_metal_macos` / `cube_zones_texture_d3d11_win`).
+>
+> **Migration:** submit one zone-chained projection layer for the former output rect and a
+> `XrCompositionLayerLocal2DEXT` for the former surround region. See the display-zones spec
+> for the frame recipe.
+>
+> **Backward compatibility:** existing surround/output-rect apps keep working unchanged. A
+> runtime **translation shim** (gated `DISPLAYXR_SURROUND_SHIM`, off by default during the
+> transition) internally rewrites the legacy calls into the synthetic zone + Local2D form
+> and routes them through the canonical composite, so the bespoke surround code can be
+> removed once the shim is validated as the sole path. These entry points will be **removed
+> in a future spec version**; new apps must use display-zones. Tracking: deprecation note
+> `docs/roadmap/surround-zones-deprecation.md`.
+
 ### 3.5 xrSetSharedTextureOutputRectEXT
 
 For `_texture` apps (shared texture mode), the 3D canvas may be a sub-rect of the app's window — for example, a 3D viewport surrounded by toolbars in a Unity or Unreal editor. The runtime needs this rect to compute correct interlacing alignment (see [§2.4](#24-the-phase-alignment-problem)) and to size views and Kooima projection based on canvas dimensions rather than window size.
