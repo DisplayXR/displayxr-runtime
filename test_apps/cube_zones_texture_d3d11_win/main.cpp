@@ -74,6 +74,8 @@
 #include <wrl/client.h>
 #include <d3dcompiler.h> // zone edge-fade pass (content-alpha feather) + blit shader
 #include <d3d11_1.h>
+#include <dcomp.h>       // #68 (A) — transparent present: DComp visual over the desktop
+#pragma comment(lib, "dcomp.lib")
 
 #include "logging.h"
 #include "input_handler.h"
@@ -148,6 +150,12 @@ static ComPtr<ID3D11VertexShader> g_blitVS;
 static ComPtr<ID3D11PixelShader> g_blitPS;
 static ComPtr<ID3D11SamplerState> g_blitSampler;
 static ComPtr<ID3D11Buffer> g_blitParamsCB;
+
+// #68 (A) — DirectComposition objects for the transparent present. Must outlive
+// the window: a composition swapchain alone is invisible without a visual tree.
+static ComPtr<IDCompositionDevice> g_dcompDevice;
+static ComPtr<IDCompositionTarget> g_dcompTarget;
+static ComPtr<IDCompositionVisual> g_dcompVisual;
 
 // Autonomous-verification dump (DXR_TEXDUMP). "1" or empty-but-present →
 // default %TEMP%\zones_texture_readback.png; any other value is the literal
@@ -2093,6 +2101,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     // Create the app-side DXGI window swapchain (texture mode owns presentation).
+    // #68 (A): in transparent mode the window is WS_EX_NOREDIRECTIONBITMAP, which
+    // can't host a CreateSwapChainForHwnd swapchain — it needs a COMPOSITION
+    // swapchain placed in a DirectComposition visual so the OS blends the shared
+    // texture's alpha against the LIVE desktop (real see-through, no captured-bg
+    // hack). Opaque mode keeps the plain ForHwnd swapchain.
+    const bool g_transparentPresent = TransparentBackgroundEnabled();
     ComPtr<IDXGISwapChain1> appSwapchain;
     {
         DXGI_SWAP_CHAIN_DESC1 scd = {};
@@ -2103,14 +2117,42 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         scd.BufferCount = 2;
         scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        HRESULT hr = renderer.dxgiFactory->CreateSwapChainForHwnd(
-            renderer.device.Get(), hwnd, &scd, nullptr, nullptr, &appSwapchain);
-        if (FAILED(hr)) {
-            LOG_ERROR("Failed to create app swapchain: 0x%08x", hr);
-            CleanupD3D11(renderer);
-            CleanupOpenXR(xr);
-            ShutdownLogging();
-            return 1;
+        HRESULT hr;
+        if (g_transparentPresent) {
+            // Premultiplied alpha — the zones submit premultiplied RGBA and the DP
+            // gate emits premultiplied (alpha=0 ⟹ fully transparent → live desktop).
+            scd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+            hr = renderer.dxgiFactory->CreateSwapChainForComposition(
+                renderer.device.Get(), &scd, nullptr, &appSwapchain);
+            if (SUCCEEDED(hr)) {
+                ComPtr<IDXGIDevice> dxgiDevice;
+                hr = renderer.device.As(&dxgiDevice);
+                if (SUCCEEDED(hr)) hr = DCompositionCreateDevice(
+                    dxgiDevice.Get(), IID_PPV_ARGS(&g_dcompDevice));
+                if (SUCCEEDED(hr)) hr = g_dcompDevice->CreateTargetForHwnd(hwnd, TRUE, &g_dcompTarget);
+                if (SUCCEEDED(hr)) hr = g_dcompDevice->CreateVisual(&g_dcompVisual);
+                if (SUCCEEDED(hr)) hr = g_dcompVisual->SetContent(appSwapchain.Get());
+                if (SUCCEEDED(hr)) hr = g_dcompTarget->SetRoot(g_dcompVisual.Get());
+                if (SUCCEEDED(hr)) hr = g_dcompDevice->Commit();
+            }
+            if (FAILED(hr)) {
+                LOG_ERROR("Transparent (DComp) present setup failed: 0x%08x", hr);
+                CleanupD3D11(renderer);
+                CleanupOpenXR(xr);
+                ShutdownLogging();
+                return 1;
+            }
+            LOG_INFO("#68 (A): transparent DComp present active — alpha=0 shows the live desktop");
+        } else {
+            hr = renderer.dxgiFactory->CreateSwapChainForHwnd(
+                renderer.device.Get(), hwnd, &scd, nullptr, nullptr, &appSwapchain);
+            if (FAILED(hr)) {
+                LOG_ERROR("Failed to create app swapchain: 0x%08x", hr);
+                CleanupD3D11(renderer);
+                CleanupOpenXR(xr);
+                ShutdownLogging();
+                return 1;
+            }
         }
     }
     ComPtr<ID3D11RenderTargetView> appBackBufferRTV;
