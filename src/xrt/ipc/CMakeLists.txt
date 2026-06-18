@@ -174,9 +174,14 @@ elseif(XRT_HAVE_LINUX)
 		)
 elseif(APPLE)
 	target_sources(
-		ipc_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_mainloop_macos.c
+		ipc_server
+		PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_mainloop_macos.c
+			# AppKit pump so the macOS service's main thread can service the
+			# compositor's render-thread NSWindow creation (shell Tier 1, #48).
+			${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_macos_appkit.m
+			${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_macos_appkit.h
 		)
-	target_link_libraries(ipc_server PRIVATE "-framework CoreFoundation")
+	target_link_libraries(ipc_server PRIVATE "-framework CoreFoundation" "-framework Cocoa")
 elseif(WIN32)
 	target_sources(
 		ipc_server

@@ -29,3 +29,22 @@ if(ANDROID)
 		)
 	target_link_libraries(comp_null PRIVATE aux_android)
 endif()
+
+# macOS out-of-process present path (shell Tier 1, #48): the null compositor is
+# the service's system compositor on macOS, driving a per-session
+# comp_target_swapchain that presents to a runtime-owned NSWindow via a MoltenVK
+# CAMetalLayer surface (comp_window_macos). Same "shared main/ sources not built
+# elsewhere in the lightweight fork" situation as Android, so compile them here.
+if(APPLE)
+	target_sources(
+		comp_null
+		PRIVATE
+			${CMAKE_CURRENT_SOURCE_DIR}/../main/comp_target_swapchain.c
+			${CMAKE_CURRENT_SOURCE_DIR}/../main/comp_window_macos.m
+			${CMAKE_CURRENT_SOURCE_DIR}/../main/comp_window_macos.h
+		)
+	target_link_libraries(
+		comp_null
+		PRIVATE "-framework Cocoa" "-framework QuartzCore" "-framework Metal"
+		)
+endif()

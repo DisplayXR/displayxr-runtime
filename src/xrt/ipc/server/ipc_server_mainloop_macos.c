@@ -24,6 +24,7 @@
 
 #include "shared/ipc_shmem.h"
 #include "server/ipc_server.h"
+#include "server/ipc_server_macos_appkit.h"
 
 #include <stdlib.h>
 #include <unistd.h>
@@ -207,6 +208,12 @@ ipc_server_mainloop_poll(struct ipc_server *vs, struct ipc_server_mainloop *ml)
 
 	struct kevent events[NUM_POLL_EVENTS];
 	struct timespec timeout = {NO_SLEEP_SEC, NO_SLEEP_NSEC};
+
+	// Service the main-thread GCD queue + AppKit so the compositor's
+	// render-thread NSWindow creation (dispatch_sync to the main queue in
+	// comp_window_macos) can complete instead of deadlocking. Cheap when idle.
+	// (Shell Tier 1, #48 — the macOS service owns the present window.)
+	ipc_server_macos_pump_main_thread();
 
 	// No sleeping, returns immediately.
 	int ret = kevent(ml->kqueue_fd, NULL, 0, events, NUM_POLL_EVENTS, &timeout);

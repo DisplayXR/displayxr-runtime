@@ -34,6 +34,9 @@
 #ifdef XRT_OS_ANDROID
 #include "main/comp_window_android.h"
 #endif
+#ifdef XRT_OS_MACOS
+#include "main/comp_window_macos.h"
+#endif
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_device.h"
 
@@ -87,6 +90,12 @@ static const char *instance_extensions_common[] = {
     // service's system compositor on Android and presents per-session via
     // comp_window_android → vkCreateAndroidSurfaceKHR.
     VK_KHR_ANDROID_SURFACE_EXTENSION_NAME,                  //
+#endif
+#ifdef XRT_OS_MACOS
+    // Out-of-process present path (macOS shell, Tier 1): the null compositor is
+    // the service's system compositor on macOS and presents per-session via
+    // comp_window_macos → vkCreateMetalSurfaceEXT (MoltenVK).
+    VK_EXT_METAL_SURFACE_EXTENSION_NAME,                    //
 #endif
 };
 
@@ -828,6 +837,103 @@ null_target_service_get_vk_android(struct comp_target_service *service)
 
 #endif // XRT_OS_ANDROID
 
+#if defined(XRT_OS_MACOS)
+
+/*!
+ * Service callback (macOS shell, Tier 1): create the per-session present target.
+ *
+ * Unlike Android, macOS cannot pass an NSView across process boundaries, so the
+ * single-app OOP path has the service create + own the NSWindow (the hosted
+ * model). @p external_window_handle is therefore ignored. The macOS comp_target
+ * (@ref comp_window_macos) builds the NSWindow + CAMetalLayer in its
+ * init_post_vulkan and creates a MoltenVK VkSurfaceKHR over it. Mirrors
+ * @ref null_target_service_create_from_window_android otherwise.
+ */
+static xrt_result_t
+null_target_service_create_from_window_macos(struct comp_target_service *service,
+                                             void *external_window_handle,
+                                             struct comp_target **out_target)
+{
+	(void)external_window_handle; // service owns the window on macOS
+	struct null_compositor *nc = (struct null_compositor *)service->context;
+
+	// Up-cast: comp_target_swapchain reads ct->c->base.vk, at offset 0 in both
+	// comp_compositor and null_compositor (shared comp_base).
+	struct comp_compositor *c_alias = (struct comp_compositor *)nc;
+
+	struct comp_target *ct = comp_window_macos_create(c_alias);
+	if (ct == NULL) {
+		NULL_ERROR(nc, "macOS: failed to allocate per-session comp_target");
+		return XRT_ERROR_ALLOCATION;
+	}
+
+	// Pre-create fake pacing BEFORE create_images so comp_target_swapchain does
+	// not read ct->c->frame_interval_ns (wrong offset across the cast above).
+	{
+		struct comp_target_swapchain *cts = (struct comp_target_swapchain *)ct;
+		if (cts->upc == NULL) {
+			int64_t now_ns = os_monotonic_get_ns();
+			u_pc_fake_create(nc->settings.frame_interval_ns, now_ns, &cts->upc);
+		}
+	}
+
+	uint32_t w = nc->sys_info.display_pixel_width;
+	uint32_t h = nc->sys_info.display_pixel_height;
+	if (w == 0 || h == 0) {
+		w = 1920;
+		h = 1080;
+	}
+
+	if (!comp_target_init_post_vulkan(ct, w, h)) {
+		NULL_ERROR(nc, "macOS: failed to init post-vulkan for per-session target");
+		comp_target_destroy(&ct);
+		return XRT_ERROR_VULKAN;
+	}
+
+	struct comp_target_create_images_info info = {
+	    .extent = {.width = w, .height = h},
+	    .image_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+	    .color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+	    .present_mode = VK_PRESENT_MODE_FIFO_KHR,
+	    .format_count = 4,
+	    .formats =
+	        {
+	            VK_FORMAT_R8G8B8A8_UNORM,
+	            VK_FORMAT_B8G8R8A8_UNORM,
+	            VK_FORMAT_R8G8B8A8_SRGB,
+	            VK_FORMAT_B8G8R8A8_SRGB,
+	        },
+	};
+
+	comp_target_create_images(ct, &info);
+
+	if (!comp_target_has_images(ct)) {
+		NULL_ERROR(nc, "macOS: failed to create swapchain images for per-session target");
+		comp_target_destroy(&ct);
+		return XRT_ERROR_VULKAN;
+	}
+
+	NULL_INFO(nc, "macOS: created per-session present target (%ux%u)", ct->width, ct->height);
+	*out_target = ct;
+	return XRT_SUCCESS;
+}
+
+static void
+null_target_service_destroy_target_macos(struct comp_target_service *service, struct comp_target **target)
+{
+	(void)service;
+	comp_target_destroy(target);
+}
+
+static struct vk_bundle *
+null_target_service_get_vk_macos(struct comp_target_service *service)
+{
+	struct null_compositor *nc = (struct null_compositor *)service->context;
+	return get_vk(nc);
+}
+
+#endif // XRT_OS_MACOS
+
 /*!
  * Initialize the target service on a null compositor.
  * Called during compositor creation after Vulkan init.
@@ -845,6 +951,13 @@ null_compositor_init_target_service(struct null_compositor *nc)
 	nc->target_service.create_from_window = null_target_service_create_from_window_android;
 	nc->target_service.destroy_target = null_target_service_destroy_target_android;
 	nc->target_service.get_vk = null_target_service_get_vk_android;
+	nc->target_service.context = nc;
+#elif defined(XRT_OS_MACOS)
+	// Out-of-process macOS present path (shell Tier 1, #48). Runtime owns the
+	// NSWindow (macOS can't pass an NSView across process boundaries).
+	nc->target_service.create_from_window = null_target_service_create_from_window_macos;
+	nc->target_service.destroy_target = null_target_service_destroy_target_macos;
+	nc->target_service.get_vk = null_target_service_get_vk_macos;
 	nc->target_service.context = nc;
 #endif
 }
