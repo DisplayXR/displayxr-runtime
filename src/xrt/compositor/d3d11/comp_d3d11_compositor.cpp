@@ -253,6 +253,20 @@ struct comp_d3d11_compositor
 	//! layer_commit, beside local_2d_last_frame.
 	bool zones_frame;
 
+	//! Surround→zones translation shim (DISPLAYXR_SURROUND_SHIM, default off,
+	//! deprecation transition for XR_EXT_win32_window_binding §3.5–3.7). When
+	//! a legacy texture app registers a surround + output rect but submits no
+	//! mask / Local2D / zones, the shim synthesizes a canvas-rect 3D-zone mask
+	//! and routes the surround through the unified mask composite (the surround
+	//! becomes the 2D source) instead of the bespoke strip blit — so the
+	//! canonical zones path serves legacy apps and the strip code can later be
+	//! deleted. Deliberately NOT folded into the zone/Local2D mask gate: the DP
+	//! must still weave into the canvas SUB-RECT (the app's atlas is
+	//! canvas-sized), so only the post-weave composite is rerouted — it spans
+	//! the window region with the mask M=1 inside the canvas. Set once under
+	//! c->mutex at the top of layer_commit, beside zones_frame.
+	bool surround_shim_active;
+
 	//! Explicit per-frame wish (XrDisplayZonesFrameEndInfoEXT.wishMask),
 	//! handed in via comp_d3d11_compositor_zones_set_frame_wish before
 	//! layer_commit and consumed by that commit (cleared at its end).
@@ -393,6 +407,10 @@ d3d11_composite_surround_shader(struct comp_d3d11_compositor *c,
                                 uint32_t ch);
 static bool
 d3d11_surround_shader_enabled(void);
+// Surround→zones translation shim toggle (DISPLAYXR_SURROUND_SHIM, default off);
+// deprecation transition for XR_EXT_win32_window_binding §3.5–3.7. Defined below.
+static bool
+d3d11_surround_shim_enabled(void);
 static void
 d3d11_maybe_capture_surround_target(struct comp_d3d11_compositor *c,
                                     ID3D11Texture2D *dst,
@@ -1575,6 +1593,32 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// race the frame.
 	const struct u_canvas_rect eff_canvas = d3d11_effective_canvas(c);
 
+	// Surround→zones shim (deprecation transition): a legacy texture app with a
+	// registered surround + output rect but no real mask / Local2D / zones is
+	// routed through the unified composite (canvas = synthetic 3D zone, surround
+	// = 2D source) instead of the bespoke strip blit. Default off — opt-in via
+	// DISPLAYXR_SURROUND_SHIM. Deliberately NOT folded into the zone/Local2D mask
+	// gate: the DP must still weave into the canvas SUB-RECT (eff_canvas stays
+	// c->canvas, the app's atlas is canvas-sized), so only the post-weave
+	// composite is rerouted — d3d11_composite_zone_mask spans the window region
+	// (where region_w/region_h come from the HWND) with the mask M=1 inside the
+	// canvas. Mirror of the gate inside d3d11_composite_zone_mask, computed here
+	// so the early-return there can admit the shim frame.
+	const bool d3d11_mask_active_this_frame =
+	    c->zones_frame || (c->active_zone_mask != nullptr && c->active_zone_mask->submitted) || have_local_2d;
+	c->surround_shim_active = d3d11_surround_shim_enabled() && !d3d11_mask_active_this_frame &&
+	                          c->surround_2d.valid && c->surround_texture != nullptr &&
+	                          c->surround_mutex != nullptr && c->canvas.valid;
+	if (c->surround_shim_active) {
+		static bool shim_logged = false;
+		if (!shim_logged) {
+			shim_logged = true;
+			U_LOG_W("Surround→zones shim ACTIVE: legacy surround routed through the "
+			        "unified mask composite (canvas %ux%u) — bespoke strip blit bypassed",
+			        c->canvas.w, c->canvas.h);
+		}
+	}
+
 	// XR_EXT_display_zones: resolve the frame's wish source BEFORE the DP
 	// sideband sync and the post-weave lerp — both consume the same staged
 	// SRV (the ADR's no-drift property).
@@ -2740,6 +2784,23 @@ d3d11_surround_shader_enabled(void)
 	return cached != 0;
 }
 
+// Surround→zones translation shim gate (DISPLAYXR_SURROUND_SHIM). Default off:
+// legacy surround apps keep the bespoke strip blit (zero behavioural change).
+// Opt-in routes them through the canonical mask composite (d3d11_composite_zone_mask)
+// so the path can be validated before the bespoke surround code is removed. Env
+// override now; a HKLM/Capabilities registry gate is the product follow-up
+// (deprecation doc). Mirror of metal_surround_shim_enabled.
+static bool
+d3d11_surround_shim_enabled(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char *e = getenv("DISPLAYXR_SURROUND_SHIM");
+		cached = (e != nullptr && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+	}
+	return cached != 0;
+}
+
 // #439 Phase 0 validation probe — env-gated (DISPLAYXR_SURROUND_CAPTURE=1)
 // file-trigger dump of the final surround-composited target. The normal
 // POST_COMPOSE capture reads the renderer ATLAS, which the surround pass never
@@ -2784,6 +2845,12 @@ d3d11_maybe_capture_surround_target(struct comp_d3d11_compositor *c,
 // (typically c->shared_texture for _texture apps). Called after the DP
 // has weaved into dst's canvas sub-rect. Acquires the surround
 // KeyedMutex on key 0 around the copies.
+//
+// DEPRECATED (XR_EXT_win32_window_binding §3.5–3.7 → XR_EXT_display_zones):
+// the surround → zones translation shim (d3d11_surround_shim_enabled) routes
+// legacy surround apps through d3d11_composite_zone_mask instead of this strip
+// blit. This bespoke path is retained as the default until the shim is
+// validated as the sole composite path, after which it is deleted.
 //
 // Strip layout:
 //
@@ -3907,7 +3974,14 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	const bool zones_frame = c->zones_frame;
 	const bool have_explicit = !zones_frame && (mask != nullptr && mask->submitted);
 	const bool have_local_2d = c->local_2d_last_frame;
-	if ((!zones_frame && !have_explicit && !have_local_2d) || dst == nullptr || c->renderer == nullptr) {
+	// Surround→zones shim (deprecation transition): when active, this frame has
+	// no zones / explicit mask / Local2D, but the legacy output rect IS treated
+	// as a synthetic single 3D zone (M=1 inside the canvas, feathered edge) with
+	// the registered surround as the 2D source — so the composite resolves to
+	// M·weave + (1−M)·surround, the strip-blit result via the canonical path.
+	const bool surround_shim = c->surround_shim_active;
+	if ((!zones_frame && !have_explicit && !have_local_2d && !surround_shim) || dst == nullptr ||
+	    c->renderer == nullptr) {
 		return false;
 	}
 
@@ -3953,6 +4027,19 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		               : c->wish_mask_staged_srv;
 	} else if (have_explicit) {
 		mask_srv = mask->staged_srv;
+	} else if (surround_shim) {
+		// Surround→zones shim: the legacy output rect IS a single 3D zone.
+		// Raster it as the wish mask (M=1 inside the canvas, feathered edge)
+		// at the window region; the surround branch below fills the 2D scratch
+		// from the registered surround, so the masked composite resolves to
+		// M·weave + (1−M)·surround — the strip-blit result via the unified path.
+		// Rect is in window-region coords (same anchor as c->canvas / the mask).
+		struct xrt_rect canvas_rect;
+		canvas_rect.offset.w = c->canvas.x;
+		canvas_rect.offset.h = c->canvas.y;
+		canvas_rect.extent.w = (int32_t)c->canvas.w;
+		canvas_rect.extent.h = (int32_t)c->canvas.h;
+		mask_srv = d3d11_update_zone_wish_mask(c, &canvas_rect, 1, region_w, region_h);
 	} else {
 		struct xrt_rect rects[XRT_MAX_LAYERS];
 		uint32_t rect_count = 0;
