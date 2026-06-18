@@ -1091,32 +1091,55 @@ ipc_try_get_android_view_poses(volatile struct ipc_client_state *ics,
 		eye_count = 2;
 	}
 
-	// A chained XR_EXT_view_rig DISPLAY descriptor (the cube's orbit camera)
-	// supplies the world-space display pose + tunables; otherwise identity pose
-	// with default display tunables. CAMERA rigs aren't expected on this path —
-	// treat anything but DISPLAY as no-rig display-centric.
+	// A chained XR_EXT_view_rig descriptor supplies the world-space rig pose +
+	// tunables. DISPLAY rigs (the cube's orbit camera) run display-centric math;
+	// CAMERA rigs (EarthView's fly camera) run the camera-centric math so the
+	// convergence (zero-parallax) plane sits at 1/convergenceDiopters, NOT pinned
+	// to the display plane. The display3d fallback ignored the camera rig's
+	// inv_convergence_distance, collapsing the convergence onto the nominal
+	// viewing distance — the ~2x-too-close ZDP on Android (the Windows D3D11
+	// server + the in-process oxr_session.c both already branch on camera vs
+	// display; this path was the lone holdout).
 	const bool rig_display = rig != NULL && rig->rig_type == IPC_VIEW_RIG_DISPLAY;
-	struct xrt_vec3 display_pos = rig_display ? rig->pose.position : (struct xrt_vec3){0, 0, 0};
-	struct xrt_quat display_ori = rig_display ? rig->pose.orientation : (struct xrt_quat)XRT_QUAT_IDENTITY;
+	const bool rig_camera = rig != NULL && rig->rig_type == IPC_VIEW_RIG_CAMERA;
+	const bool rig_any = rig_display || rig_camera;
+	struct xrt_vec3 display_pos = rig_any ? rig->pose.position : (struct xrt_vec3){0, 0, 0};
+	struct xrt_quat display_ori = rig_any ? rig->pose.orientation : (struct xrt_quat)XRT_QUAT_IDENTITY;
 
 	dxr_screen scr = {screen_width_m, screen_height_m};
 	struct xrt_pose display_pose = {display_ori, display_pos};
 
 	struct xrt_vec3 nominal_viewer = {0.0f, s->xsysc->info.nominal_viewer_y_m, s->xsysc->info.nominal_viewer_z_m};
-	const struct xrt_vec3 *rig_nominal = rig_display ? &nominal_viewer : NULL;
+	const struct xrt_vec3 *rig_nominal = rig_any ? &nominal_viewer : NULL;
 
-	dxr_display3d_tunables dt = dxr_display3d_default_tunables();
-	if (rig_display) {
-		dt.ipd_factor = rig->ipd_factor;
-		dt.parallax_factor = rig->parallax_factor;
-		dt.perspective_factor = rig->perspective_factor;
-		dt.virtual_display_height = rig->virtual_display_height;
+	struct dxr_xrt_view rig_views[XRT_MAX_VIEWS];
+	if (rig_camera) {
+		// CAMERA-CENTRIC PATH — canonical camera3d math (mirrors the D3D11/SR
+		// server ipc_try_get_sr_view_poses and oxr_session.c in-process). The
+		// convergence plane = 1/inv_convergence_distance; screen height only sets
+		// the FOV aspect, never the convergence.
+		dxr_camera3d_tunables ct = (dxr_camera3d_tunables){
+		    .ipd_factor = rig->ipd_factor,
+		    .parallax_factor = rig->parallax_factor,
+		    .inv_convergence_distance = rig->inv_convergence_distance,
+		    .half_tan_vfov = rig->half_tan_vfov,
+		    .m2v = rig->m2v,
+		};
+		dxr_xrt_camera3d_compute_views(raw_eyes, eye_count, rig_nominal, &scr, &ct, &display_pose,
+		                               rig_views);
 	} else {
-		dt.virtual_display_height = screen_height_m; // identity m2v
+		dxr_display3d_tunables dt = dxr_display3d_default_tunables();
+		if (rig_display) {
+			dt.ipd_factor = rig->ipd_factor;
+			dt.parallax_factor = rig->parallax_factor;
+			dt.perspective_factor = rig->perspective_factor;
+			dt.virtual_display_height = rig->virtual_display_height;
+		} else {
+			dt.virtual_display_height = screen_height_m; // identity m2v
+		}
+		dxr_xrt_display3d_compute_views(raw_eyes, eye_count, rig_nominal, &scr, &dt, &display_pose,
+		                                rig_views);
 	}
-
-	struct dxr_xrt_view disp_views[XRT_MAX_VIEWS];
-	dxr_xrt_display3d_compute_views(raw_eyes, eye_count, rig_nominal, &scr, &dt, &display_pose, disp_views);
 
 	out_head_relation->relation_flags =
 	    (enum xrt_space_relation_flags)(XRT_SPACE_RELATION_POSITION_VALID_BIT |
@@ -1131,16 +1154,16 @@ ipc_try_get_android_view_poses(volatile struct ipc_client_state *ics,
 	struct xrt_quat inv_ori;
 	math_quat_invert(&display_ori, &inv_ori);
 	for (uint32_t i = 0; i < eye_count; i++) {
-		out_fovs[i] = disp_views[i].fov;
+		out_fovs[i] = rig_views[i].fov;
 		struct xrt_vec3 diff = {
-		    disp_views[i].eye_world.x - display_pos.x,
-		    disp_views[i].eye_world.y - display_pos.y,
-		    disp_views[i].eye_world.z - display_pos.z,
+		    rig_views[i].eye_world.x - display_pos.x,
+		    rig_views[i].eye_world.y - display_pos.y,
+		    rig_views[i].eye_world.z - display_pos.z,
 		};
 		math_quat_rotate_vec3(&inv_ori, &diff, &out_poses[i].position);
 		out_poses[i].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
 		if (rig_reply != NULL) {
-			rig_reply->eye_world[i] = disp_views[i].eye_world;
+			rig_reply->eye_world[i] = rig_views[i].eye_world;
 		}
 	}
 
@@ -1182,7 +1205,8 @@ ipc_try_get_android_view_poses(volatile struct ipc_client_state *ics,
 		rig_reply->raw.size_w_m = canvas_w_m;
 		rig_reply->raw.size_h_m = canvas_h_m;
 		rig_reply->raw.valid = 1;
-		rig_reply->rig_applied = rig_display ? IPC_VIEW_RIG_DISPLAY : IPC_VIEW_RIG_NONE;
+		rig_reply->rig_applied =
+		    rig_camera ? IPC_VIEW_RIG_CAMERA : (rig_display ? IPC_VIEW_RIG_DISPLAY : IPC_VIEW_RIG_NONE);
 	}
 
 	fill_surplus_view_poses(head, eye_count, view_count, out_fovs, out_poses);
