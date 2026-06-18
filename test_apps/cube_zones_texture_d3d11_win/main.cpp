@@ -12,6 +12,14 @@
  * composited into its window. The display-zones submission logic (the thing
  * under test) is unchanged from cube_zones_d3d11_win.
  *
+ * ⚠️ KNOWN GAP (PR #610, real-weaver only): on a real Leia weave the taller
+ * opaque Zone A renders BLACK after the weave — the texture path hands the DP
+ * the worst-case-sized shared texture as the target with the canvas as a top-
+ * left sub-rect, and the weaver loses that zone's content. sim_display (SBS)
+ * tiles the atlas and masks this, so a PASS under sim/CI is NOT a real-weave
+ * assertion. Pre-existing texture+zones bug; fix tracked separately. See
+ * docs/roadmap/surround-zones-deprecation.md §5.
+ *
  * Texture-mode deltas from the handle app:
  *  - Creates a shared D3D11 texture (MISC_SHARED) sized to the worst-case
  *    atlas (same sizing as cube_texture_d3d11_win) and passes its NT HANDLE +

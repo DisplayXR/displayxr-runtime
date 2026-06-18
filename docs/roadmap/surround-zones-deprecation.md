@@ -92,6 +92,22 @@ backends the shim covers (Metal verified; D3D11/D3D12 pending Windows validation
 
 ## 5. Risks / notes
 
+- **⚠️ CONFIRMED BUG — texture + zones on a real weaver loses an opaque sub-rect zone.**
+  Surfaced by `cube_zones_texture_d3d11_win` on the Leia SR machine (PR #610): with a real
+  lenticular weave, the taller **opaque** Zone A renders **black** after the weave, while
+  Zone B + the Local2D strip composite fine. Localized (handle vs texture, same DP, same
+  rects): the **handle** path hands the DP `target == canvas` and weaves both zones; the
+  **texture/shared-texture** path hands the DP the **worst-case-sized shared texture as the
+  target** with the canvas as a top-left **sub-rect** (`dp_target = output_texture dims`,
+  identical on D3D11 `comp_d3d11_compositor.cpp` and Metal `comp_metal_compositor.m:3610`),
+  and the weaver loses content for a zone reaching the far edge of that sub-rect. This is
+  exactly the ADR-027-flagged "shared-texture worst-case-sizing interaction" risk. It is
+  **pre-existing** (independent of the shim) and only shows on a **real weaver** — `sim_display`
+  in SBS mode tiles the atlas and masks it, so the Mac/CI parity pass is **not** a real-weave
+  assertion. **Migrating texture apps from surround to zones requires this fixed first.**
+  Fix direction: weave into a **canvas-sized** target (like the handle path) and place the
+  result into the shared texture at `(canvas.x, canvas.y)`, preserving the `canvas_offset`
+  the DP needs for interlace **phase**. Tracked separately (runtime-DP-contract / Leia weaver).
 - **Feathered vs hard canvas edge.** The shim's synthetic mask uses the zone wish-mask
   raster (feathered edge), so the canvas/surround boundary is a soft blend rather than the
   hard strip edge. This matches zones aesthetics and is acceptable; flagged here so it is
