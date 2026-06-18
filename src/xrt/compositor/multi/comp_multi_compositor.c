@@ -623,13 +623,15 @@ multi_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin
 			U_LOG_I("Session has shared IOSurface %p, will use zero-copy rendering",
 			        mc->session_render.shared_texture_handle);
 		} else {
-			// No external view — create the runtime's window now.
-			// This runs on the main thread (xrBeginSession), which is
-			// required for NSWindow creation on macOS.
-			xrt_result_t xret = comp_target_service_init_main_target(mc->msc->target_service);
-			if (xret != XRT_SUCCESS) {
-				U_LOG_E("Failed to init macOS main target: %d", xret);
-			}
+			// No external view — the service owns the window (shell Tier 1,
+			// #48). Engage per-session rendering; the macOS comp_target
+			// (comp_window_macos) creates the runtime-owned NSWindow +
+			// CAMetalLayer in init_post_vulkan. Mirrors the Android
+			// use_android_surface signal. (The dead init_main_target vtable
+			// slot — never assigned anywhere — was the old, non-functional
+			// path here.)
+			mc->session_render.use_macos_surface = true;
+			U_LOG_I("macOS: enabling per-session rendering (service-owned NSWindow)");
 		}
 #endif
 
@@ -690,6 +692,11 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 			mc->session_render.external_window_handle = NULL;
 			mc->session_render.readback_callback = NULL;
 			mc->session_render.shared_texture_handle = NULL;
+			// macOS (#48): unlike Android (which keeps use_android_surface true
+			// across end→begin via the session_active gate), the service-owned
+			// window is cheap to recreate, so clear it here like the handle
+			// fields — begin_session re-sets it on the next session.
+			mc->session_render.use_macos_surface = false;
 			os_mutex_unlock(&mc->msc->list_and_timing_lock);
 
 			struct vk_bundle *vk = comp_target_service_get_vk(mc->msc->target_service);
@@ -1587,9 +1594,11 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 
 	// No external window handle, readback callback, or shared texture - use shared native compositor.
 	// On Android (#510) the surface arrives out-of-band via android_globals, so use_android_surface
-	// is the signal to proceed even though all the handle fields are NULL.
+	// is the signal to proceed even though all the handle fields are NULL. On macOS (#48) the service
+	// owns the NSWindow, so use_macos_surface plays the same role.
 	if (mc->session_render.external_window_handle == NULL && mc->session_render.readback_callback == NULL &&
-	    mc->session_render.shared_texture_handle == NULL && !mc->session_render.use_android_surface) {
+	    mc->session_render.shared_texture_handle == NULL && !mc->session_render.use_android_surface &&
+	    !mc->session_render.use_macos_surface) {
 		U_LOG_I("init_session_render: no window handle, readback callback, or shared texture, using shared "
 		        "compositor");
 		return false;

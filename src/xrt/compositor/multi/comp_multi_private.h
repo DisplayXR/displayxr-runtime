@@ -264,6 +264,12 @@ struct multi_compositor
 		//! android_globals. (#510)
 		bool use_android_surface;
 
+		//! macOS out-of-process (shell Tier 1, #48): macOS can't pass an
+		//! NSView across process boundaries, so the service creates + owns
+		//! the NSWindow. When true, per-session rendering engages and the
+		//! macOS comp_target builds its own runtime-owned window.
+		bool use_macos_surface;
+
 		//! Per-session render target (VkSwapchain from external HWND)
 		struct comp_target *target;
 
@@ -646,7 +652,8 @@ static inline bool
 multi_compositor_has_session_render(struct multi_compositor *mc)
 {
 	return mc->session_render.external_window_handle != NULL || mc->session_render.readback_callback != NULL ||
-	       mc->session_render.shared_texture_handle != NULL || mc->session_render.use_android_surface;
+	       mc->session_render.shared_texture_handle != NULL || mc->session_render.use_android_surface ||
+	       mc->session_render.use_macos_surface;
 }
 
 /*!
