@@ -315,6 +315,17 @@ struct xrt_display_processor_gl
 	 *                        the DP owns see-through itself (compose-under-bg).
 	 */
 	void (*set_transparent_background)(struct xrt_display_processor_gl *xdp, bool enabled, bool client_presents);
+
+	/*!
+	 * Tell the DP whether the on-screen presentation shows ONLY the canvas (a
+	 * `_texture` app self-presents its shared texture's canvas to its own window)
+	 * vs the whole weave target (handle apps). For a zones frame the canvas IS the
+	 * window, so the DP's compose-under-bg desktop-UV remap must be skipped or the
+	 * captured desktop is magnified (#68). Set once at DP setup from the
+	 * compositor's `has_shared_texture`. Optional — absent slot or NULL ⟹ assume
+	 * full target presented. Appended per ADR-020 (append-only).
+	 */
+	void (*set_shared_texture_present)(struct xrt_display_processor_gl *xdp, bool enabled);
 };
 
 /*
@@ -363,7 +374,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, get_local_zone_caps)
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, publish_local_zone_mask)      == XRT_DP_GL_BASE_OFF + 14 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, clear_local_zone_mask)        == XRT_DP_GL_BASE_OFF + 15 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, set_transparent_background)   == XRT_DP_GL_BASE_OFF + 16 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_gl)                                == XRT_DP_GL_BASE_OFF + 17 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, set_shared_texture_present)   == XRT_DP_GL_BASE_OFF + 17 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_gl)                                == XRT_DP_GL_BASE_OFF + 18 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -515,6 +527,22 @@ xrt_display_processor_gl_set_transparent_background(struct xrt_display_processor
 		return false;
 	}
 	xdp->set_transparent_background(xdp, enabled, client_presents);
+	return true;
+}
+
+/*!
+ * @copydoc xrt_display_processor_gl::set_shared_texture_present
+ * Returns false if not supported (slot absent or NULL) — the DP then assumes the
+ * full weave target is presented.
+ * @public @memberof xrt_display_processor_gl
+ */
+static inline bool
+xrt_display_processor_gl_set_shared_texture_present(struct xrt_display_processor_gl *xdp, bool enabled)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, set_shared_texture_present) || xdp->set_shared_texture_present == NULL) {
+		return false;
+	}
+	xdp->set_shared_texture_present(xdp, enabled);
 	return true;
 }
 
