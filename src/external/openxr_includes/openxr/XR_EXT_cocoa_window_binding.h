@@ -112,6 +112,14 @@ typedef struct XrCocoaWindowBindingCreateInfoEXT {
 
 // ---- Canvas Sub-Rect (Shared Texture Output Rect) ----
 
+// DEPRECATED (use XR_EXT_display_zones): xrSetSharedTextureOutputRectEXT and
+// xrSetSharedTextureSurround2DEXT express a strict special case of the
+// display-zones model (output rect = one 3D zone; 2D surround = one
+// XrCompositionLayerLocal2DEXT zone covering the complement). Migrate to
+// XR_EXT_display_zones (ADR-027). Existing apps keep working (runtime
+// translation shim, DISPLAYXR_SURROUND_SHIM); removed in a future spec version.
+// See docs/roadmap/surround-zones-deprecation.md.
+
 /*!
  * @brief Set the canvas sub-rect within the app's view where 3D content appears.
  *
