@@ -323,6 +323,16 @@ struct comp_metal_compositor
 	//! for metal_effective_canvas); the wish drives the post-weave lerp.
 	bool zones_frame;
 
+	//! Surround→zones translation shim (DISPLAYXR_SURROUND_SHIM, default off,
+	//! deprecation transition for XR_EXT_win32_window_binding §3.5–3.7). When
+	//! a legacy texture app registers a surround + output rect but submits no
+	//! mask / Local2D / zones, the shim synthesizes a canvas-rect 3D-zone mask
+	//! and routes the surround through the unified mask composite (the surround
+	//! becomes the 2D source) instead of the bespoke strip blit — so the
+	//! canonical zones path serves legacy apps and the strip code can later be
+	//! deleted. Resolved per frame; counts as mask_active.
+	bool surround_shim_active;
+
 	//! Explicit per-frame wish (XrDisplayZonesFrameEndInfoEXT.wishMask) set
 	//! via comp_metal_compositor_zones_set_frame_wish before commit; NULL =
 	//! auto-derive from the zone rects. Not owned — zone_mask_destroy
@@ -1797,6 +1807,28 @@ metal_compositor_dispatch_capture(struct comp_metal_compositor *c,
 // the whole worst-case surface); D3D11 is retrofitted separately in #464.
 // Src coords == dst coords (1:1, both window-anchored top-left).
 //
+// DEPRECATED (XR_EXT_win32_window_binding §3.5–3.7 → XR_EXT_display_zones):
+// the surround → zones translation shim (metal_surround_shim_enabled) routes
+// legacy surround apps through metal_composite_local_2d instead of this strip
+// blit. This bespoke path is retained as the default until the shim is
+// validated as the sole composite path, after which it is deleted.
+
+// Surround→zones translation shim gate (DISPLAYXR_SURROUND_SHIM). Default off:
+// legacy surround apps keep the bespoke strip blit (zero behavioural change).
+// Opt-in routes them through the canonical mask composite so the path can be
+// validated before the bespoke surround code is removed. Env override now; a
+// HKLM/Capabilities registry gate is the product follow-up (deprecation doc).
+static bool
+metal_surround_shim_enabled(void)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		const char *e = getenv("DISPLAYXR_SURROUND_SHIM");
+		enabled = (e != NULL && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+	}
+	return enabled == 1;
+}
+
 // Skips any zero-area strip. Strict pixel-format equality between surround
 // and dst is required for copyFromTexture — logs once and skips on mismatch.
 static void
@@ -2565,6 +2597,18 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 			rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
 		}
 		mask_tex = metal_update_implicit_mask(c, rects, rect_count, w, h);
+	} else if (c->surround_shim_active) {
+		// Surround→zones shim: the legacy output rect IS a single 3D zone.
+		// Raster it as the wish mask (M=1 inside the canvas, feathered edge);
+		// the !have_local_2d && !zones_frame branch below fills the 2D scratch
+		// from the registered surround, so the masked composite resolves to
+		// M·weave + (1−M)·surround — the strip-blit result via the unified path.
+		struct xrt_rect canvas_rect;
+		canvas_rect.offset.w = c->canvas.x;
+		canvas_rect.offset.h = c->canvas.y;
+		canvas_rect.extent.w = (int32_t)c->canvas.w;
+		canvas_rect.extent.h = (int32_t)c->canvas.h;
+		mask_tex = metal_update_zone_wish_mask(c, &canvas_rect, 1, w, h);
 	}
 	if (mask_tex == nil) {
 		return false;
@@ -2887,6 +2931,28 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	    (c->zone_mask_active != NULL && c->zone_mask_active->submitted) || have_local_2d || zones_frame;
 	c->local_2d_last_frame = have_local_2d;
 	c->zones_frame = zones_frame;
+
+	// Surround→zones shim (deprecation transition): a legacy texture app with a
+	// registered surround + output rect but no real mask / Local2D / zones is
+	// routed through the unified composite (canvas = synthetic 3D zone, surround
+	// = 2D source) instead of the bespoke strip blit. Default off — opt-in via
+	// DISPLAYXR_SURROUND_SHIM. Deliberately NOT folded into mask_active: the DP
+	// must still weave into the canvas SUB-RECT (eff_canvas stays c->canvas, the
+	// app's atlas is canvas-sized), so only the post-weave composite is rerouted
+	// — it spans the window with the mask M=1 inside the canvas. framebufferOnly
+	// outputs (runtime-owned windows) fail the composite's readability check and
+	// harmlessly fall back to strips.
+	c->surround_shim_active = metal_surround_shim_enabled() && !mask_active && c->surround_2d.valid &&
+	                          c->surround_texture != nil && c->canvas.valid;
+	if (c->surround_shim_active) {
+		static bool shim_logged = false;
+		if (!shim_logged) {
+			shim_logged = true;
+			U_LOG_W("Surround→zones shim ACTIVE: legacy surround routed through the "
+			        "unified mask composite (canvas %dx%d) — bespoke strip blit bypassed",
+			        (int)c->canvas.w, (int)c->canvas.h);
+		}
+	}
 
 	// XR_EXT_display_zones hardware leg (P4). Zone-capable DP: the per-frame
 	// wish publish at the end of this commit drives the per-region switch —
@@ -3606,6 +3672,18 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	if (mask_active) {
 		did_masked_composite =
 		    metal_composite_local_2d(c, cmd_buf, output_texture, &eff_canvas, have_local_2d);
+	} else if (c->surround_shim_active) {
+		// Surround→zones shim: composite over the window rect (the surround
+		// extent), NOT the canvas sub-rect — the DP wove into c->canvas, the
+		// shim mask is M=1 there, and the surround fills the (1−M) complement.
+		struct u_canvas_rect win = {0};
+		win.valid = true;
+		win.x = 0;
+		win.y = 0;
+		win.w = c->surround_2d.w;
+		win.h = c->surround_2d.h;
+		did_masked_composite =
+		    metal_composite_local_2d(c, cmd_buf, output_texture, &win, /*have_local_2d=*/false);
 	}
 
 	// Spec v6 surround blit: fill non-canvas pixels of the output from the
