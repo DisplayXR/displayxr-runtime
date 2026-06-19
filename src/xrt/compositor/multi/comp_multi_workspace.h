@@ -106,6 +106,98 @@ comp_multi_workspace_chrome_get(struct xrt_compositor *target_xc,
 void
 comp_multi_workspace_chrome_clear(struct xrt_compositor *target_xc);
 
+
+/*
+ *
+ * Session-global cursor (#48 Phase 2, spec_version 13).
+ *
+ */
+
+/*!
+ * Session-global cursor sprite, set by the controller via xrSetWorkspaceCursorEXT.
+ * Composited topmost over the content. v1 is flat at the screen plane (the depth
+ * fields are stored for the deferred per-eye-disparity Tier-2 work; only @ref
+ * over_window dimming is applied in v1).
+ *
+ * @ingroup comp_multi
+ */
+struct comp_multi_cursor_state
+{
+	float hot_x;       //!< Sprite UV X [0,1] of the click point.
+	float hot_y;       //!< Sprite UV Y [0,1].
+	float size_meters; //!< Physical size (width = height).
+	bool visible;      //!< False = hidden even if a swapchain is set.
+	float hit_z_m;     //!< Hit depth for disparity (v1: stored, unused).
+	bool over_window;  //!< Dim the cursor when over a window.
+};
+
+//! Set/replace the cursor sprite swapchain (strong ref; NULL or !visible = hide).
+void
+comp_multi_workspace_set_cursor(struct xrt_swapchain *xsc, float hot_x, float hot_y, float size_meters, bool visible);
+
+//! Update the cursor's hit depth + over-window state (xrSetWorkspaceCursorDepthEXT).
+void
+comp_multi_workspace_set_cursor_depth(float hit_z_m, bool over_window);
+
+//! Render-side lookup. Returns true + the (registry-owned) sprite swapchain + state if visible.
+bool
+comp_multi_workspace_get_cursor(struct xrt_swapchain **out_xsc, struct comp_multi_cursor_state *out);
+
+//! Latest pointer position in target framebuffer pixels (top-left origin). The
+//! macOS AppKit pump writes it on mouse move; the cursor composite reads it.
+void
+comp_multi_workspace_set_pointer_px(int32_t x, int32_t y);
+void
+comp_multi_workspace_get_pointer_px(int32_t *out_x, int32_t *out_y);
+
+
+/*
+ *
+ * Session-global overlays (#48 Phase 2, spec_version 17/21).
+ *
+ */
+
+//! Max concurrent keyed overlays (taskbar/toast/launcher); matches the D3D11 cap.
+#define COMP_MULTI_WORKSPACE_MAX_OVERLAYS 16
+
+/*!
+ * One controller overlay (e.g. taskbar), docked at a normalized display anchor.
+ * Composited at z = 0 (zero disparity) — flat by design, so v1 is fully correct.
+ *
+ * @ingroup comp_multi
+ */
+struct comp_multi_overlay_state
+{
+	uint32_t overlay_id;          //!< Keyed-map slot.
+	float anchor_x, anchor_y;     //!< Normalized display dock point [0,1].
+	float pivot_x, pivot_y;       //!< Normalized sprite UV mapped onto the anchor.
+	float size_w_m, size_h_m;     //!< Physical overlay extent in meters.
+	bool stereo_sbs;              //!< Side-by-side stereo overlay (v1: left half only).
+};
+
+//! Upsert (or, if !visible / NULL xsc, remove) the overlay keyed by @p overlay_id.
+void
+comp_multi_workspace_set_overlay(uint32_t overlay_id,
+                                 struct xrt_swapchain *xsc,
+                                 float anchor_x,
+                                 float anchor_y,
+                                 float pivot_x,
+                                 float pivot_y,
+                                 float size_w_m,
+                                 float size_h_m,
+                                 bool visible,
+                                 bool stereo_sbs);
+
+/*!
+ * Copy the current overlays (id-ascending) into the caller's parallel arrays for
+ * the render path. Returns the count written (<= @p max). The returned swapchains
+ * stay alive for the frame via the registry's references.
+ */
+uint32_t
+comp_multi_workspace_copy_overlays(struct comp_multi_overlay_state *out_states,
+                                   struct xrt_swapchain **out_xscs,
+                                   uint32_t max);
+
 #ifdef __cplusplus
 }
 #endif

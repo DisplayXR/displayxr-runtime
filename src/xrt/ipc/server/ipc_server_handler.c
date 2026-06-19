@@ -3566,6 +3566,11 @@ ipc_handle_workspace_set_cursor_depth(volatile struct ipc_client_state *_ics,
 	// Per-frame; never log here (would flood the service log).
 	comp_d3d11_service_workspace_set_cursor_depth(s->xsysc, hit_z_m, over_window != 0, dim_factor);
 	return XRT_SUCCESS;
+#elif defined(XRT_OS_MACOS)
+	(void)s;
+	(void)dim_factor; // v1 cursor is flat; dim not yet applied.
+	comp_multi_workspace_set_cursor_depth(hit_z_m, over_window != 0);
+	return XRT_SUCCESS;
 #else
 	(void)s;
 	(void)hit_z_m;
@@ -4639,6 +4644,17 @@ ipc_handle_workspace_set_cursor(volatile struct ipc_client_state *_ics,
 	                                                info->hot_x, info->hot_y,
 	                                                info->size_meters,
 	                                                info->visible != 0);
+#elif defined(XRT_OS_MACOS)
+	(void)s;
+	if (info == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct xrt_swapchain *xsc = NULL;
+	if (info->swapchain_id != UINT32_MAX && info->swapchain_id < IPC_MAX_CLIENT_SWAPCHAINS) {
+		xsc = (struct xrt_swapchain *)_ics->xscs[info->swapchain_id];
+	}
+	comp_multi_workspace_set_cursor(xsc, info->hot_x, info->hot_y, info->size_meters, info->visible != 0);
+	return XRT_SUCCESS;
 #else
 	(void)s;
 	(void)info;
@@ -4669,6 +4685,19 @@ ipc_handle_workspace_set_overlay(volatile struct ipc_client_state *_ics,
 	                                                 info->size_w_m, info->size_h_m,
 	                                                 info->visible != 0,
 	                                                 info->stereo_sbs != 0);
+#elif defined(XRT_OS_MACOS)
+	(void)s;
+	if (info == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct xrt_swapchain *xsc = NULL;
+	if (info->swapchain_id != UINT32_MAX && info->swapchain_id < IPC_MAX_CLIENT_SWAPCHAINS) {
+		xsc = (struct xrt_swapchain *)_ics->xscs[info->swapchain_id];
+	}
+	comp_multi_workspace_set_overlay(info->overlay_id, xsc, info->anchor_x, info->anchor_y, info->pivot_x,
+	                                 info->pivot_y, info->size_w_m, info->size_h_m, info->visible != 0,
+	                                 info->stereo_sbs != 0);
+	return XRT_SUCCESS;
 #else
 	(void)s;
 	(void)info;

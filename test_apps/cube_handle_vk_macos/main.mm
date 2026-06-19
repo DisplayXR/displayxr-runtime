@@ -1593,6 +1593,26 @@ static void ClearVkImageToColor(VkDevice device, VkQueue queue, VkCommandPool po
     vkFreeCommandBuffers(device, pool, 1, &cmd);
 }
 
+// Workspace self-test (#48 Phase 2): acquire image 0 of a controller swapchain,
+// clear it to a solid color, release. Leaves it GENERAL (see ClearVkImageToColor).
+static void FillWorkspaceSwapchain(XrSwapchain sc, VkDevice device, VkQueue queue, VkCommandPool pool,
+    float r, float g, float b, float a) {
+    uint32_t n = 0;
+    xrEnumerateSwapchainImages(sc, 0, &n, nullptr);
+    if (n == 0) return;
+    std::vector<XrSwapchainImageVulkanKHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+    xrEnumerateSwapchainImages(sc, n, &n, (XrSwapchainImageBaseHeader*)imgs.data());
+    uint32_t idx = 0;
+    XrSwapchainImageAcquireInfo acq = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    if (!XR_SUCCEEDED(xrAcquireSwapchainImage(sc, &acq, &idx))) return;
+    XrSwapchainImageWaitInfo wait = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wait.timeout = XR_INFINITE_DURATION;
+    xrWaitSwapchainImage(sc, &wait);
+    ClearVkImageToColor(device, queue, pool, imgs[idx].image, r, g, b, a);
+    XrSwapchainImageReleaseInfo rel = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(sc, &rel);
+}
+
 static void CleanupVkRenderer(VkRenderer& renderer) {
     if (renderer.device == VK_NULL_HANDLE) return;
     vkDeviceWaitIdle(renderer.device);
@@ -3123,6 +3143,57 @@ int main() {
                 lay.widthAsFractionOfWindow = 0.8f;
                 XrResult lret = pfnSetLayout(xr.session, selfId, &lay);
                 LOG_INFO("[chrome-test] set chrome layout: %d", (int)lret);
+            }
+
+            // --- Phase 2: session-global overlay (green bar, bottom-center) + cursor (magenta) ---
+            PFN_xrCreateWorkspaceOverlaySwapchainEXT pfnCreateOverlay = nullptr;
+            PFN_xrSetWorkspaceOverlayEXT pfnSetOverlay = nullptr;
+            PFN_xrCreateWorkspaceCursorSwapchainEXT pfnCreateCursor = nullptr;
+            PFN_xrSetWorkspaceCursorEXT pfnSetCursor = nullptr;
+            xrGetInstanceProcAddr(xr.instance, "xrCreateWorkspaceOverlaySwapchainEXT",
+                (PFN_xrVoidFunction*)&pfnCreateOverlay);
+            xrGetInstanceProcAddr(xr.instance, "xrSetWorkspaceOverlayEXT", (PFN_xrVoidFunction*)&pfnSetOverlay);
+            xrGetInstanceProcAddr(xr.instance, "xrCreateWorkspaceCursorSwapchainEXT",
+                (PFN_xrVoidFunction*)&pfnCreateCursor);
+            xrGetInstanceProcAddr(xr.instance, "xrSetWorkspaceCursorEXT", (PFN_xrVoidFunction*)&pfnSetCursor);
+
+            if (pfnCreateOverlay && pfnSetOverlay) {
+                XrWorkspaceOverlaySwapchainCreateInfoEXT oci = {XR_TYPE_WORKSPACE_OVERLAY_SWAPCHAIN_CREATE_INFO_EXT};
+                oci.format = (int64_t)VK_FORMAT_R8G8B8A8_UNORM;
+                oci.width = 256; oci.height = 48; oci.sampleCount = 1; oci.mipCount = 1;
+                XrSwapchain ovSc = XR_NULL_HANDLE;
+                XrResult ocr = pfnCreateOverlay(xr.session, &oci, &ovSc);
+                LOG_INFO("[chrome-test] create overlay swapchain: %d", (int)ocr);
+                if (XR_SUCCEEDED(ocr) && ovSc != XR_NULL_HANDLE) {
+                    FillWorkspaceSwapchain(ovSc, vkDevice, graphicsQueue, vkRenderer.commandPool,
+                        0.10f, 0.80f, 0.30f, 0.90f); // green
+                    XrWorkspaceOverlayInfoEXT oin = {XR_TYPE_WORKSPACE_OVERLAY_INFO_EXT};
+                    oin.swapchain = ovSc;
+                    oin.anchor = {0.5f, 0.95f};   // bottom-center of display
+                    oin.pivot = {0.5f, 1.0f};     // sprite bottom-center on the anchor
+                    oin.sizeMeters = {0.12f, 0.025f};
+                    oin.visible = XR_TRUE;
+                    oin.overlayId = 0;
+                    LOG_INFO("[chrome-test] set overlay: %d", (int)pfnSetOverlay(xr.session, &oin));
+                }
+            }
+            if (pfnCreateCursor && pfnSetCursor) {
+                XrWorkspaceCursorSwapchainCreateInfoEXT cci2 = {XR_TYPE_WORKSPACE_CURSOR_SWAPCHAIN_CREATE_INFO_EXT};
+                cci2.format = (int64_t)VK_FORMAT_R8G8B8A8_UNORM;
+                cci2.width = 32; cci2.height = 32; cci2.sampleCount = 1; cci2.mipCount = 1;
+                XrSwapchain curSc = XR_NULL_HANDLE;
+                XrResult ccr = pfnCreateCursor(xr.session, &cci2, &curSc);
+                LOG_INFO("[chrome-test] create cursor swapchain: %d", (int)ccr);
+                if (XR_SUCCEEDED(ccr) && curSc != XR_NULL_HANDLE) {
+                    FillWorkspaceSwapchain(curSc, vkDevice, graphicsQueue, vkRenderer.commandPool,
+                        0.95f, 0.10f, 0.85f, 0.95f); // magenta
+                    XrWorkspaceCursorInfoEXT cin = {XR_TYPE_WORKSPACE_CURSOR_INFO_EXT};
+                    cin.swapchain = curSc;
+                    cin.hotSpot = {0.0f, 0.0f}; // top-left hot point
+                    cin.sizeMeters = 0.012f;
+                    cin.visible = XR_TRUE;
+                    LOG_INFO("[chrome-test] set cursor: %d", (int)pfnSetCursor(xr.session, &cin));
+                }
             }
         } else {
             LOG_WARN("[chrome-test] workspace chrome PFNs not all resolved - skipping");
