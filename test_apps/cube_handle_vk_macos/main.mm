@@ -2774,6 +2774,21 @@ static void PollForwardedInput(AppXrSession& xr) {
     if (XR_FAILED(r)) {
         return;
     }
+
+    // A successful enumerate means this is an IPC/service session (it returns
+    // XR_ERROR_FEATURE_UNSUPPORTED in-process, and fails before the session is
+    // begun). In service mode the service owns the on-screen render window and
+    // ignores the app's cocoa-bound view, so the app's own window is redundant
+    // and stays blank — hide it once (#48). Main thread (called from main loop).
+    static bool hidRedundantWindow = false;
+    if (!hidRedundantWindow) {
+        hidRedundantWindow = true;
+        if (g_window != nil) {
+            [g_window orderOut:nil];
+            [g_window setIsVisible:NO];
+            LOG_INFO("Service mode: hid the app's redundant window (service owns the render window)");
+        }
+    }
     for (uint32_t i = 0; i < count; i++) {
         const XrWorkspaceInputEventEXT& e = events[i];
         switch (e.eventType) {
