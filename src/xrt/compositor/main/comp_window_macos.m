@@ -147,6 +147,14 @@ create_window_on_main_thread(struct comp_window_macos *cwm, uint32_t width, uint
 		return;
 	}
 
+	// NSWindow defaults releasedWhenClosed=YES, but the struct holds the window
+	// as an unretained pointer (retained only by NSApp's window list). If the user
+	// clicks the title-bar close button, AppKit would release the window, leaving
+	// cwm->window dangling → comp_window_macos_destroy's [w close] then crashes in
+	// objc_msgSend (#48). Keep the runtime in control of the lifetime: the window
+	// is torn down explicitly in destroy.
+	[cwm->window setReleasedWhenClosed:NO];
+
 	[cwm->window setTitle:@"DisplayXR — Service Compositor"];
 
 	CompWindowMacosView *v = [[CompWindowMacosView alloc] initWithFrame:frame];
