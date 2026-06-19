@@ -30,6 +30,7 @@
 #include <openxr/XR_EXT_display_info.h>
 #include <openxr/XR_EXT_atlas_capture.h>
 #include <openxr/XR_EXT_view_rig.h>
+#include <openxr/XR_EXT_spatial_workspace.h>
 
 #include <cmath>
 #include <csignal>
@@ -1697,6 +1698,73 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
     return true;
 }
 
+// Apply a scroll-wheel tick to the view params. Shared by the in-process NSEvent
+// path and the OOP forwarded-input path (#48). mods bits: 0=SHIFT, 1=CTRL, 2=ALT
+// (the XR_EXT_spatial_workspace wire convention).
+static void ApplyScrollFactor(float dy, uint32_t mods) {
+    float factor = (dy > 0) ? 1.1f : (1.0f / 1.1f);
+    bool shift = (mods & (1u << 0)) != 0;
+    bool ctrl  = (mods & (1u << 1)) != 0;
+    bool alt   = (mods & (1u << 2)) != 0;
+    if (shift) {
+        g_input.viewParams.ipdFactor *= factor;
+        if (g_input.viewParams.ipdFactor < 0.0f) g_input.viewParams.ipdFactor = 0.0f;
+        if (g_input.viewParams.ipdFactor > 1.0f) g_input.viewParams.ipdFactor = 1.0f;
+    } else if (ctrl) {
+        g_input.viewParams.parallaxFactor *= factor;
+        if (g_input.viewParams.parallaxFactor < 0.0f) g_input.viewParams.parallaxFactor = 0.0f;
+        if (g_input.viewParams.parallaxFactor > 1.0f) g_input.viewParams.parallaxFactor = 1.0f;
+    } else if (alt) {
+        if (g_input.cameraMode) {
+            g_input.viewParams.invConvergenceDistance *= factor;
+            if (g_input.viewParams.invConvergenceDistance < 0.1f) g_input.viewParams.invConvergenceDistance = 0.1f;
+            if (g_input.viewParams.invConvergenceDistance > 10.0f) g_input.viewParams.invConvergenceDistance = 10.0f;
+        } else {
+            g_input.viewParams.perspectiveFactor *= factor;
+            if (g_input.viewParams.perspectiveFactor < 0.1f) g_input.viewParams.perspectiveFactor = 0.1f;
+            if (g_input.viewParams.perspectiveFactor > 10.0f) g_input.viewParams.perspectiveFactor = 10.0f;
+        }
+    } else {
+        if (g_input.cameraMode) {
+            g_input.viewParams.zoomFactor *= factor;
+            if (g_input.viewParams.zoomFactor < 0.1f) g_input.viewParams.zoomFactor = 0.1f;
+            if (g_input.viewParams.zoomFactor > 10.0f) g_input.viewParams.zoomFactor = 10.0f;
+        } else {
+            g_input.viewParams.scaleFactor *= factor;
+            if (g_input.viewParams.scaleFactor < 0.1f) g_input.viewParams.scaleFactor = 0.1f;
+            if (g_input.viewParams.scaleFactor > 10.0f) g_input.viewParams.scaleFactor = 10.0f;
+        }
+    }
+}
+
+// Apply a printable-character key to g_input. Shared by the in-process NSEvent
+// path and the OOP forwarded-input path (#48). Mirrors the per-character cases of
+// the NSEvent KeyDown/KeyUp handlers (mode keys v/0-8, WASD/EQ camera, etc.).
+static void ApplyCharKey(unichar ch, bool isDown, bool isRepeat) {
+    if (isDown) {
+        if (ch == 27) { g_running = false; }
+        else if (ch == 'w') { g_input.keyW = true; }
+        else if (ch == 'a') { g_input.keyA = true; }
+        else if (ch == 's') { g_input.keyS = true; }
+        else if (ch == 'd') { g_input.keyD = true; }
+        else if (ch == 'e') { g_input.keyE = true; }
+        else if (ch == 'q') { g_input.keyQ = true; }
+        else if (ch == ' ') { g_input.resetViewRequested = true; }
+        else if (ch == 'v' && !isRepeat) { g_input.cycleRenderingModeRequested = true; }
+        else if (ch == 't' && !isRepeat) { g_input.eyeTrackingModeToggleRequested = true; }
+        else if ((ch == 'i' || ch == 'I') && !isRepeat) { g_input.captureAtlasRequested = true; }
+        else if (ch == 'c' && !isRepeat) { g_input.rigModeToggleRequested = true; }
+        else if (ch >= '0' && ch <= '8' && !isRepeat) { g_input.absoluteRenderingModeRequested = (int32_t)(ch - '0'); }
+    } else {
+        if (ch == 'w') g_input.keyW = false;
+        else if (ch == 'a') g_input.keyA = false;
+        else if (ch == 's') g_input.keyS = false;
+        else if (ch == 'd') g_input.keyD = false;
+        else if (ch == 'e') g_input.keyE = false;
+        else if (ch == 'q') g_input.keyQ = false;
+    }
+}
+
 static void PumpMacOSEvents() {
     // Track whether left-click started in content area vs title bar.
     // Title bar drags should move the window, not rotate the scene.
@@ -1727,38 +1795,12 @@ static void PumpMacOSEvents() {
                     if (g_input.pitch < -1.4f) g_input.pitch = -1.4f;
                 }
             } else if (type == NSEventTypeScrollWheel) {
-                float dy = (float)[event scrollingDeltaY];
-                float factor = (dy > 0) ? 1.1f : (1.0f / 1.1f);
-                NSUInteger scrollMods = [event modifierFlags];
-                if (scrollMods & NSEventModifierFlagShift) {
-                    g_input.viewParams.ipdFactor *= factor;
-                    if (g_input.viewParams.ipdFactor < 0.0f) g_input.viewParams.ipdFactor = 0.0f;
-                    if (g_input.viewParams.ipdFactor > 1.0f) g_input.viewParams.ipdFactor = 1.0f;
-                } else if (scrollMods & NSEventModifierFlagControl) {
-                    g_input.viewParams.parallaxFactor *= factor;
-                    if (g_input.viewParams.parallaxFactor < 0.0f) g_input.viewParams.parallaxFactor = 0.0f;
-                    if (g_input.viewParams.parallaxFactor > 1.0f) g_input.viewParams.parallaxFactor = 1.0f;
-                } else if (scrollMods & NSEventModifierFlagOption) {
-                    if (g_input.cameraMode) {
-                        g_input.viewParams.invConvergenceDistance *= factor;
-                        if (g_input.viewParams.invConvergenceDistance < 0.1f) g_input.viewParams.invConvergenceDistance = 0.1f;
-                        if (g_input.viewParams.invConvergenceDistance > 10.0f) g_input.viewParams.invConvergenceDistance = 10.0f;
-                    } else {
-                        g_input.viewParams.perspectiveFactor *= factor;
-                        if (g_input.viewParams.perspectiveFactor < 0.1f) g_input.viewParams.perspectiveFactor = 0.1f;
-                        if (g_input.viewParams.perspectiveFactor > 10.0f) g_input.viewParams.perspectiveFactor = 10.0f;
-                    }
-                } else {
-                    if (g_input.cameraMode) {
-                        g_input.viewParams.zoomFactor *= factor;
-                        if (g_input.viewParams.zoomFactor < 0.1f) g_input.viewParams.zoomFactor = 0.1f;
-                        if (g_input.viewParams.zoomFactor > 10.0f) g_input.viewParams.zoomFactor = 10.0f;
-                    } else {
-                        g_input.viewParams.scaleFactor *= factor;
-                        if (g_input.viewParams.scaleFactor < 0.1f) g_input.viewParams.scaleFactor = 0.1f;
-                        if (g_input.viewParams.scaleFactor > 10.0f) g_input.viewParams.scaleFactor = 10.0f;
-                    }
-                }
+                NSUInteger sm = [event modifierFlags];
+                uint32_t mods = 0;
+                if (sm & NSEventModifierFlagShift) mods |= 1u << 0;
+                if (sm & NSEventModifierFlagControl) mods |= 1u << 1;
+                if (sm & NSEventModifierFlagOption) mods |= 1u << 2;
+                ApplyScrollFactor((float)[event scrollingDeltaY], mods);
             } else if (type == NSEventTypeKeyDown) {
                 // Cmd+Ctrl+F fullscreen toggle (keyCode 3 = 'f', ignores character remapping)
                 NSUInteger mods = [event modifierFlags];
@@ -1771,47 +1813,21 @@ static void PumpMacOSEvents() {
                 else if ([[event characters] length] > 0) {
                     unichar ch = tolower([[event characters] characterAtIndex:0]);
                     bool isRepeat = [event isARepeat];
-                    if (ch == 27) { g_running = false; }
-                    else if (ch == 'w') { g_input.keyW = true; }
-                    else if (ch == 'a') { g_input.keyA = true; }
-                    else if (ch == 's') { g_input.keyS = true; }
-                    else if (ch == 'd') { g_input.keyD = true; }
-                    else if (ch == 'e') { g_input.keyE = true; }
-                    else if (ch == 'q') { g_input.keyQ = true; }
-                    else if (ch == ' ') { g_input.resetViewRequested = true; }
-                    else if ([event keyCode] == 48 /* kVK_Tab */ && !isRepeat &&
-                             ([event modifierFlags] & NSEventModifierFlagShift)) {
+                    if ([event keyCode] == 48 /* kVK_Tab */ && !isRepeat &&
+                        ([event modifierFlags] & NSEventModifierFlagShift)) {
                         // SHIFT+TAB so bare TAB stays free for the workspace shell's
                         // focus-cycle binding (matches the Windows test apps).
                         // NSEvent.characters returns 0x19 (NSBackTabCharacter) for
                         // SHIFT+TAB, not '\t' — gate on the hardware keyCode.
                         g_input.hudVisible = !g_input.hudVisible;
-                    }
-                    else if (ch == 'v' && !isRepeat) {
-                        g_input.cycleRenderingModeRequested = true;
-                    }
-                    else if (ch == 't' && !isRepeat) {
-                        g_input.eyeTrackingModeToggleRequested = true;
-                    }
-                    else if ((ch == 'i' || ch == 'I') && !isRepeat) {
-                        g_input.captureAtlasRequested = true;
-                    }
-                    else if (ch == 'c' && !isRepeat) {
-                        g_input.rigModeToggleRequested = true;
-                    }
-                    else if (ch >= '0' && ch <= '8' && !isRepeat) {
-                        g_input.absoluteRenderingModeRequested = (int32_t)(ch - '0');
+                    } else {
+                        ApplyCharKey(ch, true, isRepeat);
                     }
                 }
             } else if (type == NSEventTypeKeyUp) {
                 if ([[event characters] length] > 0) {
                     unichar ch = tolower([[event characters] characterAtIndex:0]);
-                    if (ch == 'w') g_input.keyW = false;
-                    else if (ch == 'a') g_input.keyA = false;
-                    else if (ch == 's') g_input.keyS = false;
-                    else if (ch == 'd') g_input.keyD = false;
-                    else if (ch == 'e') g_input.keyE = false;
-                    else if (ch == 'q') g_input.keyQ = false;
+                    ApplyCharKey(ch, false, false);
                 }
             }
 
@@ -1941,6 +1957,12 @@ struct AppXrSession {
     bool hasAtlasCaptureExt = false;
     bool hasViewRigExt = false;  // XR_EXT_view_rig (#396 W7)
     PFN_xrCaptureAtlasEXT pfnCaptureAtlasEXT = nullptr;
+
+    // XR_EXT_spatial_workspace (#48): when running OOP via the service, the
+    // service window owns keyboard/mouse focus, so the app polls forwarded input
+    // events here instead of its own (unfocused) NSWindow.
+    bool hasSpatialWorkspaceExt = false;
+    PFN_xrEnumerateWorkspaceInputEventsEXT pfnEnumerateWorkspaceInputEventsEXT = nullptr;
     // Enumerated rendering mode info. currentModeIndex is initialized to mode 1
     // as a fallback for runtimes that don't expose isActive; v13+ runtimes
     // replace it via the enumerate step (initial-mode-sync, #234/#239).
@@ -1995,6 +2017,9 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         if (strcmp(ext.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
             xr.hasViewRigExt = true;
         }
+        if (strcmp(ext.extensionName, XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME) == 0) {
+            xr.hasSpatialWorkspaceExt = true;
+        }
     }
 
     if (!hasVulkan) {
@@ -2022,6 +2047,10 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (xr.hasViewRigExt) {
         enabledExtensions.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
     }
+    if (xr.hasSpatialWorkspaceExt) {
+        enabledExtensions.push_back(XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME);
+    }
+    LOG_INFO("XR_EXT_spatial_workspace: %s", xr.hasSpatialWorkspaceExt ? "available" : "not available");
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(createInfo.applicationInfo.applicationName, "SimCubeExtMacOS", XR_MAX_APPLICATION_NAME_SIZE);
@@ -2090,6 +2119,14 @@ static bool InitializeOpenXR(AppXrSession& xr) {
             xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasEXT",
                 (PFN_xrVoidFunction*)&xr.pfnCaptureAtlasEXT);
             LOG_INFO("xrCaptureAtlasEXT: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
+        }
+
+        // XR_EXT_spatial_workspace (#48): forwarded keyboard/mouse for the OOP route.
+        if (xr.hasSpatialWorkspaceExt) {
+            xrGetInstanceProcAddr(xr.instance, "xrEnumerateWorkspaceInputEventsEXT",
+                (PFN_xrVoidFunction*)&xr.pfnEnumerateWorkspaceInputEventsEXT);
+            LOG_INFO("xrEnumerateWorkspaceInputEventsEXT: %s",
+                xr.pfnEnumerateWorkspaceInputEventsEXT ? "resolved" : "NULL");
         }
 
         // Load eye tracking mode request function pointer
@@ -2719,6 +2756,66 @@ static void SignalHandler(int sig) {
     g_running = false;
 }
 
+// Poll keyboard/mouse forwarded by the service over IPC (#48). When the app runs
+// OOP, the service window owns input focus, so the app's own NSWindow gets no
+// events — these arrive via XR_EXT_spatial_workspace instead and drive the SAME
+// g_input state the in-process NSEvent path does. No-op in-process (the enumerate
+// call requires an IPC-mode session and returns an error otherwise).
+static void PollForwardedInput(AppXrSession& xr) {
+    if (xr.pfnEnumerateWorkspaceInputEventsEXT == nullptr) {
+        return;
+    }
+    // Drag origin for left-button camera rotation; INT32_MIN = not dragging.
+    static int32_t lastDragX = INT32_MIN, lastDragY = INT32_MIN;
+
+    XrWorkspaceInputEventEXT events[16];
+    uint32_t count = 0;
+    XrResult r = xr.pfnEnumerateWorkspaceInputEventsEXT(xr.session, 16, &count, events);
+    if (XR_FAILED(r)) {
+        return;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        const XrWorkspaceInputEventEXT& e = events[i];
+        switch (e.eventType) {
+        case XR_WORKSPACE_INPUT_EVENT_KEY_EXT:
+            // Producer encodes the lowercased Unicode character in vkCode.
+            ApplyCharKey((unichar)e.key.vkCode, e.key.isDown != 0, false);
+            break;
+        case XR_WORKSPACE_INPUT_EVENT_POINTER_MOTION_EXT: {
+            bool leftHeld = (e.pointerMotion.buttonMask & 1u) != 0;
+            int32_t cx = e.pointerMotion.cursorX, cy = e.pointerMotion.cursorY;
+            if (leftHeld) {
+                if (lastDragX != INT32_MIN) {
+                    // Cursor is window-space (y-up): the y delta is the negation
+                    // of NSEvent.deltaY, so pitch ADDS dy to match the in-process
+                    // sign (yaw matches deltaX directly).
+                    float dx = (float)(cx - lastDragX);
+                    float dy = (float)(cy - lastDragY);
+                    g_input.yaw   -= dx * 0.005f;
+                    g_input.pitch += dy * 0.005f;
+                    if (g_input.pitch > 1.4f) g_input.pitch = 1.4f;
+                    if (g_input.pitch < -1.4f) g_input.pitch = -1.4f;
+                }
+                lastDragX = cx;
+                lastDragY = cy;
+            } else {
+                lastDragX = INT32_MIN; // button released between motion events
+            }
+            break;
+        }
+        case XR_WORKSPACE_INPUT_EVENT_POINTER_EXT:
+            if (e.pointer.button == 1 && e.pointer.isDown == 0) {
+                lastDragX = INT32_MIN; // left mouse up ends the drag
+            }
+            break;
+        case XR_WORKSPACE_INPUT_EVENT_SCROLL_EXT:
+            ApplyScrollFactor(e.scroll.deltaY, e.scroll.modifiers);
+            break;
+        default: break;
+        }
+    }
+}
+
 int main() {
     // Ensure logs appear immediately even when piped
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -2913,6 +3010,7 @@ int main() {
 
     while (g_running && !xr.exitRequested) {
         PumpMacOSEvents();
+        PollForwardedInput(xr); // OOP: keyboard/mouse forwarded by the service (#48)
 
         auto now = std::chrono::high_resolution_clock::now();
         float deltaTime = std::chrono::duration<float>(now - lastTime).count();

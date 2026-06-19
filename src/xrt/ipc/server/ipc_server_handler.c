@@ -52,6 +52,12 @@
 #include "xrt/xrt_display_metrics.h" // struct xrt_eye_positions (DP-tracked eyes; Leia M2)
 #endif
 
+#if defined(XRT_OS_MACOS)
+// macOS service input forwarding (#48): drain the generic queue fed by the
+// AppKit pump's NSEvent capture (ipc_server_macos_appkit.m).
+#include "ipc_server_input_queue.h"
+#endif
+
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) || defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS)
 // Shared Kooima rig math (#396 W7): same displayxr-common core as the
 // in-process oxr_session.c path and every app/engine consumer. Both server-side
@@ -2474,6 +2480,22 @@ ipc_handle_compositor_request_rendering_mode(volatile struct ipc_client_state *i
 	// per-client compositor backend records it (multi_compositor on Android,
 	// comp_d3d11_service on Windows) and clamps its per-session atlas to the grid.
 	xrt_comp_request_rendering_mode((struct xrt_compositor *)ics->xc, mode_index, tile_columns, tile_rows);
+
+#if defined(XRT_OS_MACOS)
+	// macOS single-process service (#48): the per-session render path
+	// (render_session_to_own_target, comp_multi_system.c) syncs the CONTENT grid,
+	// the hardware 2D/3D weave-state, AND the DP's output composition FROM the head
+	// device's active rendering mode — it treats the device as the authority "as
+	// in-process", because unlike Android's OOP runtime the service shares the
+	// process with the real head device (mc->xsysd is non-NULL). So the recorded
+	// grid above is re-derived from the device every frame; drive the device here
+	// (mirroring the in-process oxr_xrRequestDisplayRenderingModeEXT path) so the
+	// requested mode actually reaches the DP. XRT_DEVICE_PROPERTY_OUTPUT_MODE also
+	// switches sim_display's output weave (2D / anaglyph / SBS / quad). (Windows
+	// uses the D3D11 service's own mode path; Android records on mc with no device
+	// sync — both already work, so this is scoped to macOS.)
+	xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)mode_index);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -4031,6 +4053,13 @@ ipc_handle_workspace_enumerate_input_events(volatile struct ipc_client_state *_i
 	}
 	bool ok = comp_d3d11_service_workspace_drain_input_events(s->xsysc, capacity, out_batch);
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
+#elif defined(XRT_OS_MACOS)
+	// macOS null+comp_multi service (#48): the AppKit pump captures NSEvents from
+	// the service-owned window into the generic input queue; drain it here so the
+	// client app can poll forwarded keyboard/mouse via xrEnumerateWorkspaceInputEventsEXT.
+	(void)s;
+	ipc_server_input_queue_drain(capacity, out_batch);
+	return XRT_SUCCESS;
 #else
 	(void)s;
 	(void)capacity;

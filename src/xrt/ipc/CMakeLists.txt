@@ -180,6 +180,10 @@ elseif(APPLE)
 			# compositor's render-thread NSWindow creation (shell Tier 1, #48).
 			${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_macos_appkit.m
 			${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_macos_appkit.h
+			# Generic input-event queue: AppKit pump captures NSEvents → IPC
+			# handler drains → client app polls (keyboard/mouse forwarding, #48).
+			${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_input_queue.c
+			${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_input_queue.h
 		)
 	target_link_libraries(ipc_server PRIVATE "-framework CoreFoundation" "-framework Cocoa")
 	# The macOS handler's DP-sourced server-side Kooima (#48) includes
