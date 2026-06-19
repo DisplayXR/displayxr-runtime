@@ -1031,21 +1031,37 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 		}
 	}
 
+	// The ACTIVE rendering mode's view count (1 = 2D/mono, 2 = stereo, 4 = Quad).
+	// NOT the locate's `view_count` param: an extension app locates against its
+	// stereo view-config (always >=2) and merely *submits* fewer in 2D, so
+	// `view_count` doesn't track the mode. The client forwards the active mode's
+	// view count in rig->render_view_count (OUTPUT_MODE doesn't cross IPC); for
+	// non-rig locates the server head device's active mode is authoritative. Used
+	// below to size the per-view eye set and the 2D mono-collapse.
+	uint32_t active_view_count = view_count;
+	if (rig != NULL && rig->render_view_count > 0) {
+		active_view_count = rig->render_view_count;
+	} else if (head != NULL && head->hmd != NULL && head->rendering_mode_count > 0 &&
+	           head->hmd->active_rendering_mode_index < head->rendering_mode_count) {
+		active_view_count = head->rendering_modes[head->hmd->active_rendering_mode_index].view_count;
+	}
+
 	// Eyes: DP-tracked if available (Leia/M2 plugs in here unchanged), else the
-	// nominal viewer + a default IPD. head_eyes is the head's actual L/R pair
-	// (reported verbatim in the raw block for the app's HUD); raw_eyes is the
-	// render input (collapsed to a centered eye for 2D below).
-	struct xrt_vec3 head_eyes[2];
-	uint32_t head_eye_count = 2;
+	// nominal viewer layout. head_eyes is the head's per-view eye set (N entries —
+	// nothing special about 2 views in DXR: Quad is 4 views with an elevated upper
+	// row); raw_eyes is the render input (collapsed to a centered eye for 2D).
+	// The DP owns the per-view optical layout; the runtime never synthesizes it.
+	struct xrt_vec3 head_eyes[XRT_MAX_VIEWS];
+	uint32_t head_eye_count = 0;
 	bool is_tracking = false;
 	int64_t sample_time_ns = 0;
 	struct xrt_eye_positions eyes = {0};
 	bool have_dp_eyes = multi_compositor_get_predicted_eye_positions(mc, &eyes) && eyes.valid && eyes.count > 0;
 	if (have_dp_eyes) {
-		uint32_t i1 = (eyes.count >= 2) ? 1 : 0;
-		head_eyes[0] = (struct xrt_vec3){eyes.eyes[0].x, eyes.eyes[0].y, eyes.eyes[0].z};
-		head_eyes[1] = (struct xrt_vec3){eyes.eyes[i1].x, eyes.eyes[i1].y, eyes.eyes[i1].z};
-		head_eye_count = (eyes.count >= 2) ? 2 : 1;
+		head_eye_count = (eyes.count < XRT_MAX_VIEWS) ? eyes.count : XRT_MAX_VIEWS;
+		for (uint32_t i = 0; i < head_eye_count; i++) {
+			head_eyes[i] = (struct xrt_vec3){eyes.eyes[i].x, eyes.eyes[i].y, eyes.eyes[i].z};
+		}
 		is_tracking = eyes.is_tracking;
 		sample_time_ns = eyes.timestamp_ns;
 	} else {
@@ -1058,35 +1074,31 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 		if (nz <= 0.0f) {
 			nz = 0.6f; // sane default if the DP left it unset
 		}
-		head_eyes[0] = (struct xrt_vec3){nx - ipd * 0.5f, ny, nz};
-		head_eyes[1] = (struct xrt_vec3){nx + ipd * 0.5f, ny, nz};
+		// One nominal eye per active view. The device's per-view eye offsets carry
+		// the optical layout (sim fills N: views 0-1 stereo, 2-3 elevated for Quad;
+		// they're absolute display-space eyes). Fall back to a stereo pair around
+		// the nominal viewer when the device exposes none (or for 2-view modes).
+		head_eye_count = (active_view_count < XRT_MAX_VIEWS) ? active_view_count : XRT_MAX_VIEWS;
+		if (head_eye_count < 2) {
+			head_eye_count = 2; // always keep a head pair for the raw channel
+		}
+		bool have_offsets = head != NULL && head->hmd != NULL &&
+		                    (head->hmd->view_eye_offsets[1].x != 0.0f ||
+		                     head->hmd->view_eye_offsets[1].y != 0.0f);
+		for (uint32_t i = 0; i < head_eye_count; i++) {
+			if (have_offsets) {
+				const struct xrt_vec3 *o = &head->hmd->view_eye_offsets[i];
+				head_eyes[i] = (struct xrt_vec3){nx + o->x, o->y, o->z > 0.0f ? o->z : nz};
+			} else {
+				head_eyes[i] =
+				    (struct xrt_vec3){nx + ((i & 1u) ? ipd * 0.5f : -ipd * 0.5f), ny, nz};
+			}
+		}
 	}
 
 	// Render input. 2D / mono: collapse to a CENTERED eye so the off-axis frustum
 	// is symmetric (no off-center crop / parallax shift). 3D: per-eye off-axis.
 	//
-	// #521: the gate must be the ACTIVE RENDERING MODE's view_count, NOT the
-	// locate's `view_count` param. An extension app locates against its stereo
-	// view-config (always 2 views) and merely *submits* 1 in 2D mode — so
-	// `view_count` stays 2 even in 2D. Gating on it left views[0] as the off-axis
-	// LEFT eye, which the app then presented as its mono 2D image → the cube
-	// rendered shifted. The server head device's active_rendering_mode_index is
-	// NOT reliable in OOP (OUTPUT_MODE doesn't cross IPC), so the client forwards
-	// the active mode's view count in rig->render_view_count. Fall back to the
-	// located view_count when unset (0).
-	uint32_t active_view_count = view_count;
-	if (rig != NULL && rig->render_view_count > 0) {
-		active_view_count = rig->render_view_count;
-	} else if (head != NULL && head->hmd != NULL && head->rendering_mode_count > 0 &&
-	           head->hmd->active_rendering_mode_index < head->rendering_mode_count) {
-		// Legacy / non-rig locates (e.g. device_get_view_poses on macOS) carry no
-		// render_view_count over IPC. The server head device IS the real display
-		// device here (not a proxy), and a legacy app never switches modes over
-		// IPC, so its active rendering mode is authoritative: read the active
-		// mode's view count directly to drive the 2D mono-collapse below.
-		active_view_count = head->rendering_modes[head->hmd->active_rendering_mode_index].view_count;
-	}
-
 	// Re-express the render eyes relative to the zone centre when a zone is
 	// applied (display-zones P5, #570) — display-local shift, BEFORE the Kooima
 	// compute folds in the rig display_pose. zone_eye_offset_* is (0,0,0) for
@@ -1095,20 +1107,30 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 	struct xrt_vec3 raw_eyes[XRT_MAX_VIEWS] = {0};
 	uint32_t eye_count;
 	if (active_view_count == 1) {
-		raw_eyes[0] = (struct xrt_vec3){
-		    0.5f * (head_eyes[0].x + head_eyes[1].x) - zone_eye_offset_x,
-		    0.5f * (head_eyes[0].y + head_eyes[1].y) - zone_eye_offset_y,
-		    0.5f * (head_eyes[0].z + head_eyes[1].z) - zone_eye_offset_z,
-		};
+		// 2D / mono: collapse the head pair to a centered eye.
+		uint32_t nc = head_eye_count < 2 ? head_eye_count : 2;
+		struct xrt_vec3 c = {0, 0, 0};
+		for (uint32_t i = 0; i < nc; i++) {
+			c.x += head_eyes[i].x;
+			c.y += head_eyes[i].y;
+			c.z += head_eyes[i].z;
+		}
+		float inv = nc > 0 ? 1.0f / (float)nc : 1.0f;
+		raw_eyes[0] = (struct xrt_vec3){c.x * inv - zone_eye_offset_x, c.y * inv - zone_eye_offset_y,
+		                                c.z * inv - zone_eye_offset_z};
 		eye_count = 1;
 	} else {
-		raw_eyes[0] = (struct xrt_vec3){head_eyes[0].x - zone_eye_offset_x,
-		                                head_eyes[0].y - zone_eye_offset_y,
-		                                head_eyes[0].z - zone_eye_offset_z};
-		raw_eyes[1] = (struct xrt_vec3){head_eyes[1].x - zone_eye_offset_x,
-		                                head_eyes[1].y - zone_eye_offset_y,
-		                                head_eyes[1].z - zone_eye_offset_z};
-		eye_count = 2;
+		// N-view: one render eye per active view (2 stereo, 4 Quad, …). The DP's
+		// per-view layout already encodes the elevated rows; just rebase by the zone.
+		eye_count = active_view_count < head_eye_count ? active_view_count : head_eye_count;
+		if (eye_count > XRT_MAX_VIEWS) {
+			eye_count = XRT_MAX_VIEWS;
+		}
+		for (uint32_t i = 0; i < eye_count; i++) {
+			raw_eyes[i] = (struct xrt_vec3){head_eyes[i].x - zone_eye_offset_x,
+			                                head_eyes[i].y - zone_eye_offset_y,
+			                                head_eyes[i].z - zone_eye_offset_z};
+		}
 	}
 
 	// A chained XR_EXT_view_rig descriptor supplies the world-space rig pose +
@@ -1205,9 +1227,14 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 	// face-dot the app HUD reads), plus the display plane + canvas. Reported
 	// independent of the 2D render collapse above.
 	if (rig_reply != NULL) {
-		rig_reply->raw.eyes[0] = head_eyes[0];
-		rig_reply->raw.eyes[1] = head_eyes[1];
-		rig_reply->raw.eye_count = head_eye_count;
+		uint32_t raw_n = head_eye_count;
+		if (raw_n > XRT_MAX_VIEWS) {
+			raw_n = XRT_MAX_VIEWS;
+		}
+		for (uint32_t i = 0; i < raw_n; i++) {
+			rig_reply->raw.eyes[i] = head_eyes[i];
+		}
+		rig_reply->raw.eye_count = raw_n;
 		rig_reply->raw.sample_time_ns = sample_time_ns;
 		rig_reply->raw.is_tracking = is_tracking ? 1u : 0u;
 		rig_reply->raw.display_pose = display_pose;
