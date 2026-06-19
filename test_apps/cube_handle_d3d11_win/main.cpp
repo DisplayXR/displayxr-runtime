@@ -535,27 +535,13 @@ static void RenderOneFrame(RenderState& rs) {
         g_inputState.fullscreenToggleRequested = false;
     }
 
-    // Handle rendering mode requests (V=cycle next, 0-8=jump absolute).
-    // Single source of truth: the runtime owns the current mode. Keypresses
-    // are REQUESTS — we call xrRequestDisplayRenderingModeEXT and let the
-    // XrEventDataRenderingModeChangedEXT event update xr.currentModeIndex.
-    // Render paths and HUD read xr.currentModeIndex directly.
-    if (g_inputState.cycleRenderingModeRequested) {
-        g_inputState.cycleRenderingModeRequested = false;
-        if (xr.pfnRequestDisplayRenderingModeEXT && xr.session != XR_NULL_HANDLE &&
-            xr.renderingModeCount > 0) {
-            uint32_t next = (xr.currentModeIndex + 1) % xr.renderingModeCount;
-            xr.pfnRequestDisplayRenderingModeEXT(xr.session, next);
-        }
-    }
-    if (g_inputState.absoluteRenderingModeRequested >= 0) {
-        uint32_t target = (uint32_t)g_inputState.absoluteRenderingModeRequested;
-        g_inputState.absoluteRenderingModeRequested = -1;
-        if (xr.pfnRequestDisplayRenderingModeEXT && xr.session != XR_NULL_HANDLE &&
-            target < xr.renderingModeCount) {
-            xr.pfnRequestDisplayRenderingModeEXT(xr.session, target);
-        }
-    }
+    // Handle rendering mode requests (V=cycle next, 0-8=jump absolute) through
+    // the shared ModeSwitch sequencer: it consumes the request flags, eases the
+    // stereo disparity (viewParams.ipdFactor) around the switch, and issues
+    // xrRequestDisplayRenderingModeEXT on the right frame. The runtime still owns
+    // the current mode; the XrEventDataRenderingModeChangedEXT event updates
+    // xr.currentModeIndex, which render paths and the HUD read directly.
+    XrSessionUpdateModeSwitch(xr, g_inputState, rs.perfStats->deltaTime);
 
     // #228 Tier 1 smoke test: 'B' fires xrRequestFilePickerEXT and prints
     // the immediate return code. The completion event (success/cancel +
