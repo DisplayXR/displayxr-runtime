@@ -40,6 +40,7 @@
 // stb_image implementation TU lives in displayxr::common (stb_image_impl_macos.cpp) — declarations only here (#396 W4).
 #include "stb_image.h"
 #include "view_params.h"
+#include "mode_switch.h" // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (inline on macOS)
 #include "rig_mode.h"
 #include "atlas_capture.h"
 #include "xr_window_space_hud.h"
@@ -758,6 +759,10 @@ struct InputState {
     bool captureAtlasRequested = false;
 };
 static InputState g_input;
+// Smooth 2D<->3D disparity ramp, driven inline (macOS has its own AppXrSession/
+// InputState, not the Windows-only XrSessionManager helper).
+static dxr::ModeSwitch g_modeSwitch;
+static bool g_modeSwitchConfigured = false;
 static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18deg) -> 36deg vFOV
 
 // HUD window-space layer (XR_EXT_window_space_layer): replaces the legacy
@@ -923,9 +928,13 @@ static void PumpMacOSEvents()
                 float factor = (dy > 0) ? 1.1f : (1.0f / 1.1f);
                 NSUInteger scrollMods = [event modifierFlags];
                 if (scrollMods & NSEventModifierFlagShift) {
-                    g_input.viewParams.ipdFactor *= factor;
-                    if (g_input.viewParams.ipdFactor < 0.0f) g_input.viewParams.ipdFactor = 0.0f;
-                    if (g_input.viewParams.ipdFactor > 1.0f) g_input.viewParams.ipdFactor = 1.0f;
+                    // Edit steadyIpdFactor (the ModeSwitch ramp target); seed
+                    // ipdFactor in lockstep for the idle/non-ramp render path.
+                    float v = g_input.viewParams.steadyIpdFactor * factor;
+                    if (v < 0.0f) v = 0.0f;
+                    if (v > 1.0f) v = 1.0f;
+                    g_input.viewParams.steadyIpdFactor = v;
+                    g_input.viewParams.ipdFactor = v;
                 } else if (scrollMods & NSEventModifierFlagControl) {
                     g_input.viewParams.parallaxFactor *= factor;
                     if (g_input.viewParams.parallaxFactor < 0.0f) g_input.viewParams.parallaxFactor = 0.0f;
@@ -1637,25 +1646,47 @@ int main(int argc, char **argv)
         PumpMacOSEvents();
         PollEvents(app);
 
-        // Handle rendering mode requests (V=cycle next, 0-8=jump absolute).
-        // Single source of truth: the runtime owns the current mode. Keypresses
-        // are REQUESTS — we call xrRequestDisplayRenderingModeEXT and let the
-        // XrEventDataRenderingModeChangedEXT event update app.currentModeIndex.
-        // Render paths and HUD read app.currentModeIndex directly.
-        if (g_input.cycleRenderingModeRequested) {
-            g_input.cycleRenderingModeRequested = false;
-            if (app.pfnRequestDisplayRenderingModeEXT && app.session != XR_NULL_HANDLE &&
-                app.renderingModeCount > 0) {
-                uint32_t next = (app.currentModeIndex + 1) % app.renderingModeCount;
-                app.pfnRequestDisplayRenderingModeEXT(app.session, next);
-            }
+        // Rendering mode requests (V=cycle next, 0-8=jump absolute) through the
+        // dxr::ModeSwitch sequencer: it eases g_input.viewParams.ipdFactor around
+        // the switch and fires xrRequestDisplayRenderingModeEXT on the right frame.
+        // The runtime owns the current mode; the XrEventDataRenderingModeChangedEXT
+        // event updates app.currentModeIndex (render paths + HUD read it directly).
+        if (!g_modeSwitchConfigured) {
+            g_modeSwitch.configure(0.18f, dxr::ModeSwitchEasing::SmoothStep);
+            g_modeSwitchConfigured = true;
         }
-        if (g_input.absoluteRenderingModeRequested >= 0) {
-            uint32_t target = (uint32_t)g_input.absoluteRenderingModeRequested;
-            g_input.absoluteRenderingModeRequested = -1;
-            if (app.pfnRequestDisplayRenderingModeEXT && app.session != XR_NULL_HANDLE &&
-                target < app.renderingModeCount) {
-                app.pfnRequestDisplayRenderingModeEXT(app.session, target);
+        {
+            const float steady = g_input.viewParams.steadyIpdFactor;
+            auto vcOf = [&](uint32_t m) -> uint32_t {
+                return (m < app.renderingModeCount && app.renderingModeViewCounts[m] > 0)
+                           ? app.renderingModeViewCounts[m] : 1;
+            };
+            int32_t target = -1;
+            if (g_input.cycleRenderingModeRequested) {
+                g_input.cycleRenderingModeRequested = false;
+                if (app.renderingModeCount > 0)
+                    target = (int32_t)((app.currentModeIndex + 1) % app.renderingModeCount);
+            }
+            if (g_input.absoluteRenderingModeRequested >= 0) {
+                int32_t a = g_input.absoluteRenderingModeRequested;
+                g_input.absoluteRenderingModeRequested = -1;
+                if ((uint32_t)a < app.renderingModeCount) target = a;
+            }
+            if (target >= 0 && app.session != XR_NULL_HANDLE && app.pfnRequestDisplayRenderingModeEXT) {
+                const float curIpd = g_modeSwitch.active() ? g_modeSwitch.ipd() : steady;
+                g_modeSwitch.request((uint32_t)target, vcOf((uint32_t)target),
+                                     app.currentModeIndex, vcOf(app.currentModeIndex),
+                                     curIpd, steady);
+            }
+            if (g_modeSwitch.active()) {
+                float ipd = steady; bool fire = false; uint32_t mode = app.currentModeIndex;
+                g_modeSwitch.update(dt, &ipd, &fire, &mode);
+                g_input.viewParams.ipdFactor = ipd;
+                if (fire && mode != app.currentModeIndex && app.session != XR_NULL_HANDLE &&
+                    app.pfnRequestDisplayRenderingModeEXT)
+                    app.pfnRequestDisplayRenderingModeEXT(app.session, mode);
+            } else {
+                g_input.viewParams.ipdFactor = steady;
             }
         }
 
