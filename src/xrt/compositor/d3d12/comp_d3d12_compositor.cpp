@@ -1489,11 +1489,21 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// if submit/destroy race the frame.
 	const struct u_canvas_rect eff_canvas = d3d12_effective_canvas(c);
 
-	// Get target dimensions
+	// Get target (window) dimensions for mono viewport sizing + zone-rect
+	// placement scale. In shared-texture mode (no target) use the canvas dims
+	// when available — zone rects are window-pixel, so the zones placement
+	// scale (tile/target) must divide by the WINDOW, not the display-sized
+	// shared texture (mirrors the D3D11 leg; without this `else if` branch
+	// zones scale ~display/window too small and overlap at the origin — #613).
+	// The DP weave target stays the shared-texture dims (computed separately
+	// from c->shared_texture below).
 	uint32_t tgt_width = c->settings.preferred.width;
 	uint32_t tgt_height = c->settings.preferred.height;
 	if (c->target != nullptr) {
 		comp_d3d12_target_get_dimensions(c->target, &tgt_width, &tgt_height);
+	} else if (eff_canvas.valid && eff_canvas.w > 0 && eff_canvas.h > 0) {
+		tgt_width = eff_canvas.w;
+		tgt_height = eff_canvas.h;
 	}
 
 	// Sync renderer view dims from active mode — set_tile_layout derives
