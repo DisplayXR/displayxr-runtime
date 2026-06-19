@@ -194,6 +194,42 @@ struct xrt_swapchain *
 comp_d3d11_client_get_inner_xrt_swapchain(struct xrt_swapchain *xsc);
 #endif
 
+// Forward decl from compositor/client/comp_vk_client.c (#48). A Vulkan session
+// that also acts as a workspace controller (creating chrome/cursor/overlay
+// swapchains) wraps them in client_vk_swapchain — unwrap to the inner
+// ipc_client_swapchain so the dispatch reads the right swapchain id.
+struct xrt_swapchain *
+comp_vk_client_get_inner_xrt_swapchain(struct xrt_swapchain *xsc);
+
+/*!
+ * Unwrap a workspace swapchain (chrome/cursor/overlay) to the inner native
+ * (IPC) swapchain whose id the runtime looks up. The client compositor wraps
+ * swapchains per graphics API: D3D11 on Windows, Vulkan on a VK session. A pure
+ * WORKSPACE_CONTROLLER session skips API wrapping (already native) → passthrough.
+ * Metal is added with the macOS shell (Metal binding); a Metal controller would
+ * extend the branch below.
+ */
+static struct xrt_swapchain *
+workspace_unwrap_client_swapchain(struct oxr_session *sess, struct xrt_swapchain *xsc)
+{
+	if (xsc == NULL) {
+		return NULL;
+	}
+#ifdef _WIN32
+	struct xrt_swapchain *d = comp_d3d11_client_get_inner_xrt_swapchain(xsc);
+	if (d != NULL) {
+		return d;
+	}
+#endif
+	if (sess != NULL && sess->gfx_ext == OXR_SESSION_GRAPHICS_EXT_VULKAN) {
+		struct xrt_swapchain *v = comp_vk_client_get_inner_xrt_swapchain(xsc);
+		if (v != NULL) {
+			return v;
+		}
+	}
+	return xsc; // WORKSPACE_CONTROLLER / already-native.
+}
+
 
 /*
  * Helpers
@@ -1076,13 +1112,7 @@ oxr_xrCreateWorkspaceClientChromeSwapchainEXT(XrSession session,
 	// (id 0 IS valid — first slot in the controller's xscs[] table). On
 	// non-Windows there's no D3D11 wrapper to unwrap, so the swapchain is
 	// already the ipc_client form.
-	struct xrt_swapchain *inner = sc->swapchain;
-#ifdef _WIN32
-	struct xrt_swapchain *unwrapped = comp_d3d11_client_get_inner_xrt_swapchain(inner);
-	if (unwrapped != NULL) {
-		inner = unwrapped;
-	}
-#endif
+	struct xrt_swapchain *inner = workspace_unwrap_client_swapchain(sess, sc->swapchain);
 	uint32_t swapchain_id = comp_ipc_client_compositor_get_swapchain_id(inner);
 
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_register_chrome_swapchain(
@@ -1110,13 +1140,7 @@ oxr_xrDestroyWorkspaceClientChromeSwapchainEXT(XrSwapchain swapchain)
 	// swapchain. The runtime is tolerant of a missing entry — if the swapchain
 	// was never registered (e.g. created via xrCreateSwapchain directly), the
 	// unregister is a no-op there. Same _WIN32 gate as the create path.
-	struct xrt_swapchain *inner = sc->swapchain;
-#ifdef _WIN32
-	struct xrt_swapchain *unwrapped = comp_d3d11_client_get_inner_xrt_swapchain(inner);
-	if (unwrapped != NULL) {
-		inner = unwrapped;
-	}
-#endif
+	struct xrt_swapchain *inner = workspace_unwrap_client_swapchain(sc->sess, sc->swapchain);
 	uint32_t swapchain_id = comp_ipc_client_compositor_get_swapchain_id(inner);
 	if (session_is_ipc_client(sc->sess)) {
 		(void)comp_ipc_client_compositor_workspace_unregister_chrome_swapchain(
@@ -1326,13 +1350,7 @@ oxr_xrSetWorkspaceCursorEXT(XrSession session, const XrWorkspaceCursorInfoEXT *i
 	if (info->swapchain != XR_NULL_HANDLE) {
 		struct oxr_swapchain *sc = NULL;
 		OXR_VERIFY_SWAPCHAIN_AND_INIT_LOG(&log, info->swapchain, sc, "xrSetWorkspaceCursorEXT");
-		struct xrt_swapchain *inner = sc->swapchain;
-#ifdef _WIN32
-		struct xrt_swapchain *unwrapped = comp_d3d11_client_get_inner_xrt_swapchain(inner);
-		if (unwrapped != NULL) {
-			inner = unwrapped;
-		}
-#endif
+		struct xrt_swapchain *inner = workspace_unwrap_client_swapchain(sc->sess, sc->swapchain);
 		ipc_info.swapchain_id = comp_ipc_client_compositor_get_swapchain_id(inner);
 	}
 
@@ -1480,13 +1498,7 @@ oxr_xrSetWorkspaceOverlayEXT(XrSession session, const XrWorkspaceOverlayInfoEXT 
 	if (info->swapchain != XR_NULL_HANDLE) {
 		struct oxr_swapchain *sc = NULL;
 		OXR_VERIFY_SWAPCHAIN_AND_INIT_LOG(&log, info->swapchain, sc, "xrSetWorkspaceOverlayEXT");
-		struct xrt_swapchain *inner = sc->swapchain;
-#ifdef _WIN32
-		struct xrt_swapchain *unwrapped = comp_d3d11_client_get_inner_xrt_swapchain(inner);
-		if (unwrapped != NULL) {
-			inner = unwrapped;
-		}
-#endif
+		struct xrt_swapchain *inner = workspace_unwrap_client_swapchain(sc->sess, sc->swapchain);
 		ipc_info.swapchain_id = comp_ipc_client_compositor_get_swapchain_id(inner);
 	}
 

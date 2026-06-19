@@ -1544,6 +1544,55 @@ static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
     vkQueueSubmit(renderer.graphicsQueue, 1, &submitInfo, renderer.frameFence);
 }
 
+// Workspace chrome self-test (#48): one-shot clear of a chrome swapchain image
+// to a solid RGBA color, leaving it in VK_IMAGE_LAYOUT_GENERAL — the layout the
+// service's chrome composite expects shared cross-process images to rest in.
+static void ClearVkImageToColor(VkDevice device, VkQueue queue, VkCommandPool pool,
+    VkImage image, float r, float g, float b, float a) {
+    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = pool;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(device, &ai, &cmd) != VK_SUCCESS) return;
+
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+
+    VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkImageMemoryBarrier toDst = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toDst.srcAccessMask = 0;
+    toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toDst.image = image;
+    toDst.subresourceRange = range;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &toDst);
+
+    VkClearColorValue color = {{r, g, b, a}};
+    vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
+
+    VkImageMemoryBarrier toGeneral = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toGeneral.dstAccessMask = 0;
+    toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    toGeneral.image = image;
+    toGeneral.subresourceRange = range;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue);
+    vkFreeCommandBuffers(device, pool, 1, &cmd);
+}
+
 static void CleanupVkRenderer(VkRenderer& renderer) {
     if (renderer.device == VK_NULL_HANDLE) return;
     vkDeviceWaitIdle(renderer.device);
@@ -2995,6 +3044,89 @@ int main() {
         }
     } else {
         LOG_WARN("Failed to create HUD swapchain - HUD disabled");
+    }
+
+    // === Workspace chrome self-test (#48) ===
+    // With DXR_WORKSPACE_CHROME=1, act as a minimal workspace controller and
+    // decorate our OWN window with a title bar, to exercise the macOS chrome
+    // composite path (comp_multi_workspace + session_render_chrome_overlay)
+    // end-to-end without a separate controller app. The real shell is a separate
+    // controller; this is the runtime-side verification vehicle.
+    XrSwapchain chromeSwapchain = XR_NULL_HANDLE;
+    if (xr.hasSpatialWorkspaceExt && getenv("DXR_WORKSPACE_CHROME") != nullptr) {
+        PFN_xrActivateSpatialWorkspaceEXT pfnActivate = nullptr;
+        PFN_xrEnumerateWorkspaceClientsEXT pfnEnumClients = nullptr;
+        PFN_xrCreateWorkspaceClientChromeSwapchainEXT pfnCreateChrome = nullptr;
+        PFN_xrSetWorkspaceClientChromeLayoutEXT pfnSetLayout = nullptr;
+        xrGetInstanceProcAddr(xr.instance, "xrActivateSpatialWorkspaceEXT", (PFN_xrVoidFunction*)&pfnActivate);
+        xrGetInstanceProcAddr(xr.instance, "xrEnumerateWorkspaceClientsEXT", (PFN_xrVoidFunction*)&pfnEnumClients);
+        xrGetInstanceProcAddr(xr.instance, "xrCreateWorkspaceClientChromeSwapchainEXT",
+            (PFN_xrVoidFunction*)&pfnCreateChrome);
+        xrGetInstanceProcAddr(xr.instance, "xrSetWorkspaceClientChromeLayoutEXT",
+            (PFN_xrVoidFunction*)&pfnSetLayout);
+
+        if (pfnActivate && pfnEnumClients && pfnCreateChrome && pfnSetLayout) {
+            XrResult wret = pfnActivate(xr.session);
+            LOG_INFO("[chrome-test] activate workspace: %d", (int)wret);
+
+            // Single client → our own id is clients[0].
+            uint32_t cc = 0;
+            pfnEnumClients(xr.session, 0, &cc, nullptr);
+            XrWorkspaceClientId selfId = 0;
+            if (cc > 0) {
+                std::vector<XrWorkspaceClientId> ids(cc);
+                if (XR_SUCCEEDED(pfnEnumClients(xr.session, cc, &cc, ids.data())) && cc > 0) {
+                    selfId = ids[0];
+                }
+            }
+            LOG_INFO("[chrome-test] self client id=%llu (count=%u)", (unsigned long long)selfId, cc);
+
+            const uint32_t CW = 512, CH = 64;
+            XrWorkspaceChromeSwapchainCreateInfoEXT cci = {XR_TYPE_WORKSPACE_CHROME_SWAPCHAIN_CREATE_INFO_EXT};
+            cci.format = (int64_t)VK_FORMAT_R8G8B8A8_UNORM;
+            cci.width = CW;
+            cci.height = CH;
+            cci.sampleCount = 1;
+            cci.mipCount = 1;
+            XrResult cret = pfnCreateChrome(xr.session, selfId, &cci, &chromeSwapchain);
+            LOG_INFO("[chrome-test] create chrome swapchain: %d", (int)cret);
+
+            if (XR_SUCCEEDED(cret) && chromeSwapchain != XR_NULL_HANDLE) {
+                uint32_t n = 0;
+                xrEnumerateSwapchainImages(chromeSwapchain, 0, &n, nullptr);
+                std::vector<XrSwapchainImageVulkanKHR> cimgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+                xrEnumerateSwapchainImages(chromeSwapchain, n, &n, (XrSwapchainImageBaseHeader*)cimgs.data());
+                uint32_t idx = 0;
+                XrSwapchainImageAcquireInfo acq = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+                if (n > 0 && XR_SUCCEEDED(xrAcquireSwapchainImage(chromeSwapchain, &acq, &idx))) {
+                    XrSwapchainImageWaitInfo wait = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+                    wait.timeout = XR_INFINITE_DURATION;
+                    xrWaitSwapchainImage(chromeSwapchain, &wait);
+                    // Opaque cyan-ish bar so it reads clearly over the cube.
+                    ClearVkImageToColor(vkDevice, graphicsQueue, vkRenderer.commandPool,
+                        cimgs[idx].image, 0.10f, 0.55f, 0.90f, 0.90f);
+                    XrSwapchainImageReleaseInfo rel = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                    xrReleaseSwapchainImage(chromeSwapchain, &rel);
+                    LOG_INFO("[chrome-test] chrome image %u cleared + released", idx);
+                }
+
+                // A title bar glued to the window's top edge, 80% width.
+                XrWorkspaceChromeLayoutEXT lay = {XR_TYPE_WORKSPACE_CHROME_LAYOUT_EXT};
+                lay.poseInClient.orientation.w = 1.0f;
+                lay.poseInClient.position.x = 0.0f;
+                lay.poseInClient.position.y = -0.02f; // 2 cm below the top edge
+                lay.poseInClient.position.z = 0.0f;
+                lay.sizeMeters.width = 0.20f;
+                lay.sizeMeters.height = 0.03f;
+                lay.followsWindowOrient = XR_FALSE;
+                lay.anchorToWindowTopEdge = XR_TRUE;
+                lay.widthAsFractionOfWindow = 0.8f;
+                XrResult lret = pfnSetLayout(xr.session, selfId, &lay);
+                LOG_INFO("[chrome-test] set chrome layout: %d", (int)lret);
+            }
+        } else {
+            LOG_WARN("[chrome-test] workspace chrome PFNs not all resolved - skipping");
+        }
     }
 
     g_input.viewParams.virtualDisplayHeight = 0.24f;

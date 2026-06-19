@@ -394,6 +394,16 @@ struct multi_compositor
 		float hud_smoothed_frame_time_ms;
 		//! @}
 
+		//! @name Workspace chrome overlay (#48)
+		//! Alpha-blend pipeline + a controller-submitted chrome swapchain
+		//! (title pill etc.) composited post-weave over this client's content,
+		//! like the HUD. Looked up from comp_multi_workspace by this mc's
+		//! compositor pointer; sibling of @ref hud_blend.
+		//! @{
+		struct vk_hud_blend chrome_blend;
+		bool chrome_blend_initialized;
+		//! @}
+
 		//! Saved device output mode before 2D switch (-1 = none saved)
 		int saved_output_mode;
 

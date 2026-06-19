@@ -40,6 +40,7 @@
 
 #include "multi/comp_multi_private.h"
 #include "multi/comp_multi_interface.h"
+#include "multi/comp_multi_workspace.h"
 #include "main/comp_target.h"
 
 // Per-session rendering support (Phase 4)
@@ -2176,6 +2177,138 @@ session_render_hud_overlay(struct multi_compositor *mc,
 }
 
 /*!
+ * Composite the workspace controller's chrome (e.g. a title pill) over this
+ * client's woven content, post-weave, as a flat alpha-blended 2D overlay — the
+ * same model as @ref session_render_hud_overlay (#48). The chrome swapchain is
+ * registered by the controller through the workspace IPC handlers and looked up
+ * here by this client's compositor pointer (== @p ics->xc). v1 is axis-aligned
+ * and zero-disparity (flat at the screen plane); per-eye / perspective chrome is
+ * the deferred Tier-2 work the D3D11 monolith does.
+ *
+ * Layout mirrors the HUD: the chrome source goes GENERAL → SHADER_READ_ONLY →
+ * GENERAL (shared cross-process images rest in GENERAL between uses, see
+ * @ref composite_local_2d_layers); the target is taken/left in PRESENT_SRC by
+ * @ref vk_hud_blend_draw.
+ */
+static void
+session_render_chrome_overlay(struct multi_compositor *mc,
+                              struct vk_bundle *vk,
+                              VkCommandBuffer cmd,
+                              VkImage swapchain_image,
+                              VkImageView swapchain_view,
+                              uint32_t fb_width,
+                              uint32_t fb_height)
+{
+	// Look up chrome registered for this client compositor (== ics->xc).
+	struct xrt_swapchain *chrome_xsc = NULL;
+	struct comp_multi_chrome_layout layout;
+	if (!comp_multi_workspace_chrome_get(&mc->base.base, &chrome_xsc, &layout)) {
+		return; // No chrome for this client — the common case.
+	}
+
+	struct comp_swapchain *sc = comp_swapchain(chrome_xsc);
+	if (sc == NULL || sc->vkic.image_count == 0) {
+		return;
+	}
+	// Single-image chrome contract (matches the D3D11 service, which samples
+	// images[0]): the controller renders its chrome once into image 0.
+	VkImage chrome_image = sc->vkic.images[0].handle;
+	uint32_t chrome_w = sc->vkic.info.width;
+	uint32_t chrome_h = sc->vkic.info.height;
+	if (chrome_image == VK_NULL_HANDLE || chrome_w == 0 || chrome_h == 0) {
+		return;
+	}
+
+	// Lazy-init the chrome blend pipeline (sibling of hud_blend).
+	if (!mc->session_render.chrome_blend_initialized) {
+		if (!vk_hud_blend_init(&mc->session_render.chrome_blend, vk, mc->session_render.target->format)) {
+			U_LOG_E("[chrome] Failed to init alpha-blend pipeline");
+			return;
+		}
+		mc->session_render.chrome_blend_initialized = true;
+		U_LOG_W("[chrome] Workspace chrome blend pipeline initialized");
+	}
+
+	// Display dims (meters) → pixels-per-meter on this window. Prefer the DP,
+	// fall back to the system compositor info — exactly like the HUD path.
+	float disp_w_m = 0.0f, disp_h_m = 0.0f;
+	if (mc->session_render.display_processor != NULL) {
+		float dw = 0.0f, dh = 0.0f;
+		if (xrt_display_processor_get_display_dimensions(mc->session_render.display_processor, &dw, &dh)) {
+			disp_w_m = dw;
+			disp_h_m = dh;
+		}
+	}
+	if (disp_w_m <= 0.0f || disp_h_m <= 0.0f) {
+		const struct xrt_system_compositor_info *info = &mc->msc->base.info;
+		disp_w_m = info->display_width_m;
+		disp_h_m = info->display_height_m;
+	}
+	if (disp_w_m <= 0.0f || disp_h_m <= 0.0f) {
+		return; // Can't map meters → pixels.
+	}
+	float px_per_m_x = (float)fb_width / disp_w_m;
+	float px_per_m_y = (float)fb_height / disp_h_m;
+
+	// Chrome extent in meters (fraction-of-window width if the controller asked).
+	float chrome_w_m =
+	    (layout.width_as_fraction_of_window > 0.0f) ? disp_w_m * layout.width_as_fraction_of_window : layout.size_w_m;
+	float chrome_h_m = layout.size_h_m;
+	if (chrome_w_m <= 0.0f || chrome_h_m <= 0.0f) {
+		return;
+	}
+
+	// Center in window-local meters. Top-edge anchor: pose.y is an offset from
+	// the window's top edge (matches the D3D11 service convention).
+	float cx_m = layout.pose_in_client.position.x;
+	float cy_m = layout.anchor_to_window_top_edge ? (disp_h_m * 0.5f + layout.pose_in_client.position.y)
+	                                               : layout.pose_in_client.position.y;
+
+	// Window-local meters → target pixels (origin at center; +y up → -y down).
+	float cx_px = (float)fb_width * 0.5f + cx_m * px_per_m_x;
+	float cy_px = (float)fb_height * 0.5f - cy_m * px_per_m_y;
+	float w_px = chrome_w_m * px_per_m_x;
+	float h_px = chrome_h_m * px_per_m_y;
+
+	int32_t dst_x = (int32_t)(cx_px - w_px * 0.5f);
+	int32_t dst_y = (int32_t)(cy_px - h_px * 0.5f);
+	uint32_t dst_w = (uint32_t)(w_px + 0.5f);
+	uint32_t dst_h = (uint32_t)(h_px + 0.5f);
+	if (dst_w == 0 || dst_h == 0) {
+		return;
+	}
+
+	// Chrome source GENERAL → SHADER_READ_ONLY (the blend samples it).
+	VkImageMemoryBarrier to_src = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = 0,
+	    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+	    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	    .image = chrome_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+	                         NULL, 0, NULL, 1, &to_src);
+
+	vk_hud_blend_draw(&mc->session_render.chrome_blend, vk, cmd, swapchain_view, swapchain_image, fb_width,
+	                   fb_height, chrome_image, chrome_w, chrome_h, dst_x, dst_y, dst_w, dst_h);
+
+	// Restore chrome source → GENERAL for the controller's next frame.
+	VkImageMemoryBarrier to_general = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	    .dstAccessMask = 0,
+	    .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+	    .image = chrome_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
+	                         NULL, 0, NULL, 1, &to_general);
+}
+
+/*!
  * Render a single per-session client to its own comp_target using display processing.
  *
  * @param mc The multi_compositor with per-session rendering
@@ -2783,6 +2916,13 @@ submit_and_present:
 	session_render_hud_overlay(mc, vk, cmd, ct->images[buffer_index].handle,
 	                           ct->images[buffer_index].view,
 	                           framebufferWidth, framebufferHeight);
+
+	// Workspace chrome (title pill etc.) the controller registered for this
+	// client — composited post-weave over the HUD, flat at the screen plane
+	// (#48). No-op (single map lookup) when no controller decorated this client.
+	session_render_chrome_overlay(mc, vk, cmd, ct->images[buffer_index].handle,
+	                              ct->images[buffer_index].view,
+	                              framebufferWidth, framebufferHeight);
 
 	// End command buffer
 	ret = vk->vkEndCommandBuffer(cmd);
