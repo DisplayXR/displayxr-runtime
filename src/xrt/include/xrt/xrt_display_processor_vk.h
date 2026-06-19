@@ -117,6 +117,28 @@ struct xrt_display_processor_vk
 	 * @param generation  Monotonic target image-set generation.
 	 */
 	void (*notify_target_recreated)(struct xrt_display_processor_vk *xdp, uint32_t generation);
+
+	/*!
+	 * Tell the DP whether the on-screen presentation shows ONLY the canvas (the
+	 * app self-presents its shared texture's canvas sub-region to its own window)
+	 * vs the whole weave target (handle apps, where the runtime presents the full
+	 * swapchain). The Vulkan port of the D3D11 slot (#68): a `_texture` app blits
+	 * the shared texture and Presents itself, and for a zones frame the canvas IS
+	 * the whole window — so the DP's compose-under-bg desktop-UV remap (which
+	 * assumes the window shows the whole panel-sized target) must be skipped for a
+	 * `shared_texture_present && zone_active` frame, or the captured desktop is
+	 * magnified. Handle apps (full-window present) keep the remap. Set once at DP
+	 * setup from the compositor's `has_shared_texture`.
+	 *
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL ⟹ the DP
+	 * assumes the full target is presented (legacy behavior). Appended after
+	 * @ref notify_target_recreated per ADR-020 (append-only within a major; no
+	 * version bump — gated by the variant's `base.struct_size`).
+	 *
+	 * @param xdp      Pointer to self.
+	 * @param enabled  true ⟹ the app self-presents a shared texture (canvas-only).
+	 */
+	void (*set_shared_texture_present)(struct xrt_display_processor_vk *xdp, bool enabled);
 };
 
 /*
@@ -143,7 +165,8 @@ struct xrt_display_processor_vk
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, base) == 0, XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_transparent_background) == sizeof(struct xrt_display_processor) + 0 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, notify_target_recreated)    == sizeof(struct xrt_display_processor) + 1 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 2 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_shared_texture_present) == sizeof(struct xrt_display_processor) + 2 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 3 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -196,6 +219,31 @@ xrt_display_processor_vk_notify_target_recreated(struct xrt_display_processor_vk
 		return;
 	}
 	xdp->notify_target_recreated(xdp, generation);
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::set_shared_texture_present
+ *
+ * Returns false if not supported (the plug-in's `base.struct_size` doesn't cover
+ * the slot, or the pointer is NULL) — the DP then keeps its full-target
+ * assumption (no remap skip). Like the wrappers above, the presence check reads
+ * `xdp->base.struct_size` because the variant embeds the base — see ADR-020.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_set_shared_texture_present(struct xrt_display_processor_vk *xdp, bool enabled)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end =
+	    (const char *)&xdp->set_shared_texture_present + sizeof(xdp->set_shared_texture_present);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size || xdp->set_shared_texture_present == NULL) {
+		return false;
+	}
+	xdp->set_shared_texture_present(xdp, enabled);
+	return true;
 }
 
 #ifdef __cplusplus

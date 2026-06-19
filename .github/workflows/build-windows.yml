@@ -838,6 +838,42 @@ jobs:
             Copy-Item $loaderDll.FullName -Destination test_apps/cube_handle_vk_win/build/
           }
 
+      - name: Build VK texture-zones parity test app (cube_zones_texture_vk_win)
+        run: |
+          cd test_apps/cube_zones_texture_vk_win
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
+          cmake --build build
+
+      - name: Copy required DLLs (cube_zones_texture_vk_win)
+        run: |
+          $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1
+          if (-not $loaderDll) {
+            $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1
+          }
+          if ($loaderDll) {
+            Copy-Item $loaderDll.FullName -Destination test_apps/cube_zones_texture_vk_win/build/
+          }
+
+      - name: Verify binary architectures (cube_zones_texture_vk_win)
+        run: |
+          Write-Host "=== Checking binary architectures ==="
+          $exe = "test_apps/cube_zones_texture_vk_win/build/cube_zones_texture_vk_win.exe"
+          $dll = "test_apps/cube_zones_texture_vk_win/build/openxr_loader.dll"
+
+          Write-Host "`nEXE architecture:"
+          dumpbin /headers $exe | Select-String -Pattern "machine \(|File Type:"
+
+          Write-Host "`nDLL architecture:"
+          dumpbin /headers $dll | Select-String -Pattern "machine \(|File Type:"
+
+          Write-Host "`nDependencies of EXE:"
+          dumpbin /dependents $exe
+
+          Write-Host "`nAll DLLs in build directory:"
+          Get-ChildItem test_apps/cube_zones_texture_vk_win/build/*.dll | ForEach-Object { Write-Host "  $($_.Name)" }
+
   # D3D11 texture test app (offscreen shared texture mode)
   TestAppCubeTextureD3D11:
     if: needs.DetectChanges.outputs.test_apps_changed == 'true'
