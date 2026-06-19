@@ -889,12 +889,20 @@ void RenderScene(
     // Set render targets
     cmdList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
 
-    // Clear only on first eye (clear==true)
+    // Clear DEPTH always — the shared depth buffer must be fresh for every tile.
+    // In the display-zones path the caller pre-clears the tile COLOR to the zone
+    // color and calls with clear==false; without an unconditional depth clear the
+    // cube renders against stale depth from the previous view/frame and z-fails
+    // into a dark partial "shadow" (#613). The depth resource stays in DEPTH_WRITE
+    // (never transitioned), so this is valid regardless of the color-clear flag.
+    cmdList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+        1.0f, 0, 0, nullptr);
+
+    // Clear COLOR only on the first eye / fresh tile (clear==true). When false the
+    // caller (display-zones ClearZoneImage) already cleared the tile to its zone color.
     if (clear) {
         float clearColor[4] = {0.05f, 0.05f, 0.25f, 1.0f};
         cmdList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
-        cmdList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
-            1.0f, 0, 0, nullptr);
     }
 
     // Set viewport and scissor with offset for SBS rendering
