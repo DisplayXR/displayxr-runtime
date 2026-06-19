@@ -595,9 +595,19 @@ import_shared_d3d11_texture(struct comp_vk_native_compositor *c, void *shared_ha
 		return false;
 	}
 
-	// We need the display pixel dimensions from the device
-	uint32_t width = c->settings.preferred.width;
-	uint32_t height = c->settings.preferred.height;
+	// Size the VkImage to match the app's shared texture exactly. The app sizes
+	// it to the display-native worst-case atlas (ADR-010 — display pixels), and
+	// `settings.preferred` isn't populated yet at import time (the HWND/screen
+	// sizing runs later in create), so reading it here gives 0 → a 1920x1080
+	// guess that aliases only a sub-rect of the real 3840x2160 texture and weaves
+	// the content squished into a corner (#613). Use the head device's native
+	// screen dimensions — the same source the app's displayPixelWidth/Height
+	// comes from — mirroring the macOS path that reads the actual IOSurface size.
+	uint32_t width = 0, height = 0;
+	if (c->xdev != NULL && c->xdev->hmd != NULL) {
+		width = c->xdev->hmd->screens[0].w_pixels;
+		height = c->xdev->hmd->screens[0].h_pixels;
+	}
 	if (width == 0 || height == 0) {
 		width = 1920;
 		height = 1080;
@@ -3412,6 +3422,14 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	if (c->display_processor != NULL) {
 		xrt_display_processor_vk_set_transparent_background(
 		    (struct xrt_display_processor_vk *)c->display_processor, transparent_background, false);
+
+		// #613 / #68 — tell the DP whether the app self-presents only the canvas
+		// (shared-texture apps) vs the full target (handle apps). Gates the
+		// compose-under-bg desktop-UV remap skip for `_texture` zones frames so
+		// the captured desktop isn't magnified. Set once here; safe no-op if the
+		// DP lacks the slot (sim_display / older plug-in).
+		xrt_display_processor_vk_set_shared_texture_present(
+		    (struct xrt_display_processor_vk *)c->display_processor, c->has_shared_texture);
 	}
 
 	// Create output target (VkSwapchainKHR) for presentation.
