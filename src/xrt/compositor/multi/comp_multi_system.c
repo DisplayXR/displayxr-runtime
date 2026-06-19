@@ -2275,6 +2275,34 @@ session_display_dims_m(struct multi_compositor *mc, float *out_w_m, float *out_h
 }
 
 /*!
+ * Public window-dims query for the workspace IPC layer (macOS get_window_pose).
+ *
+ * In the macOS OOP single-app model the content client fills the display, so
+ * its "window" IS the display — and the chrome composite
+ * (@ref session_render_chrome_overlay) places chrome against the same display
+ * dims. Returning those dims here keeps the controller's pill sizing
+ * (win_w * fraction) consistent with where the runtime composites it. The pose
+ * is identity at the origin (the composite ignores per-client window pose in
+ * the single-app model; true multi-window placement is Tier-2, #59).
+ */
+bool
+comp_multi_workspace_get_client_window_dims(struct xrt_compositor *xc,
+                                            struct xrt_pose *out_pose,
+                                            float *out_w_m,
+                                            float *out_h_m)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL) {
+		return false;
+	}
+	if (out_pose != NULL) {
+		struct xrt_pose ident = XRT_POSE_IDENTITY;
+		*out_pose = ident;
+	}
+	return session_display_dims_m(mc, out_w_m, out_h_m);
+}
+
+/*!
  * Composite the workspace controller's chrome (e.g. a title pill) over this
  * client's woven content, post-weave, as a flat alpha-blended 2D overlay (#48).
  * The chrome swapchain is registered by the controller through the workspace IPC

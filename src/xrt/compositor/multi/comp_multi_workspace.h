@@ -106,6 +106,19 @@ comp_multi_workspace_chrome_get(struct xrt_compositor *target_xc,
 void
 comp_multi_workspace_chrome_clear(struct xrt_compositor *target_xc);
 
+/*!
+ * Window-dims query for the macOS workspace get_window_pose IPC handler. In the
+ * single-app OOP model the client fills the display, so this returns the display
+ * dims as the client's window size and an identity pose. Returns false if @p xc
+ * is not a multi_compositor or display dims are unavailable. Defined in
+ * comp_multi_system.c (alongside the chrome composite that uses the same dims).
+ */
+bool
+comp_multi_workspace_get_client_window_dims(struct xrt_compositor *xc,
+                                            struct xrt_pose *out_pose,
+                                            float *out_w_m,
+                                            float *out_h_m);
+
 
 /*
  *
