@@ -1490,7 +1490,12 @@ static void RenderScene(
         // Draw textured cube
         {
             const float cubeSize = 0.3f;
-            const float cubeHeight = 1.6f;
+            // Display-centered: the 3D-display camera sits at the nominal viewer
+            // (eye Y=0 in front of the screen), so content lives near Y=0, not at
+            // VR standing height. cubeSize/2 rests it on the Y=0 grid floor, like
+            // the cube_handle_* apps. (The old 1.6 put it ~38° above an 18.5°
+            // vertical frame → off-screen in service mode.)
+            const float cubeHeight = cubeSize / 2.0f;
 
             float rot[16], scl[16], trans[16], model[16], tmp[16];
             mat4_rotation_y(rot, renderer.cubeRotation);
