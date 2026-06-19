@@ -184,6 +184,19 @@ struct comp_d3d11_window
 	//! Set on button-down inside rect, cleared on button-up.
 	bool mouse_press_in_content;
 
+	//! Software double-click synthesis (WndProc thread only — no atomics).
+	//! The runtime re-injects every forwarded click via SendInput (for Raw-Input
+	//! apps), and those synthetic events poison the OS's per-window double-click
+	//! tracker, so CS_DBLCLKS on the workspace window never yields a reliable
+	//! WM_*BUTTONDBLCLK. Instead we detect the double-click ourselves from the
+	//! real (non-injected) forwarded click stream and post a synthetic
+	//! WM_*BUTTONDBLCLK to the focused app. Tracks the previous forwarded DOWN.
+	DWORD last_click_time_ms; //!< GetMessageTime() of the previous forwarded DOWN.
+	int last_click_x;         //!< Workspace-client X of that DOWN.
+	int last_click_y;         //!< Workspace-client Y of that DOWN.
+	uint32_t last_click_button; //!< 1=L,2=R,3=M of that DOWN (0 = none yet).
+	HWND last_click_target;   //!< HWND that DOWN was forwarded to.
+
 	//! The HWND the most recent button-DOWN was forwarded to, or NULL if it
 	//! was not forwarded (cursor outside the focused window's rect — i.e. a
 	//! click on an unfocused window). Captured at WndProc time, BEFORE the
@@ -972,8 +985,47 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 						app_x = rel_x;
 						app_y = rel_y;
 					}
+					// Software double-click synthesis. The OS can't pair our
+					// double-clicks (SendInput re-injection poisons its per-window
+					// dblclk tracker), so we detect the second click ourselves from
+					// the real forwarded DOWN stream and promote its message to
+					// WM_*BUTTONDBLCLK — matching the down/up/dblclk/up sequence a
+					// CS_DBLCLKS window delivers. Apps reading WM_LBUTTONDBLCLK
+					// (e.g. earthview's double-click-to-orbit) then work in-shell.
+					UINT post_msg = message;
+					if (is_button_down) {
+						DWORD now = (DWORD)GetMessageTime();
+						int cxd = GetSystemMetrics(SM_CXDOUBLECLK) / 2;
+						int cyd = GetSystemMetrics(SM_CYDOUBLECLK) / 2;
+						int dx = workspace_x - w->last_click_x;
+						int dy = workspace_y - w->last_click_y;
+						bool is_dbl =
+						    w->last_click_button == evt_button &&
+						    w->last_click_target == fwd &&
+						    (now - w->last_click_time_ms) <= GetDoubleClickTime() &&
+						    dx >= -cxd && dx <= cxd && dy >= -cyd && dy <= cyd;
+						if (is_dbl) {
+							switch (evt_button) {
+							case 1: post_msg = WM_LBUTTONDBLCLK; break;
+							case 2: post_msg = WM_RBUTTONDBLCLK; break;
+							case 3: post_msg = WM_MBUTTONDBLCLK; break;
+							default: break;
+							}
+							// Consume the pair so a triple-click's third press
+							// starts a fresh single click (standard behavior).
+							w->last_click_button = 0;
+							w->last_click_target = NULL;
+						} else {
+							w->last_click_time_ms = now;
+							w->last_click_x = workspace_x;
+							w->last_click_y = workspace_y;
+							w->last_click_button = evt_button;
+							w->last_click_target = fwd;
+						}
+					}
+
 					// PostMessage: works for classic Win32 apps (test apps)
-					PostMessage(fwd, message, wParam, MAKELPARAM(app_x, app_y));
+					PostMessage(fwd, post_msg, wParam, MAKELPARAM(app_x, app_y));
 
 					// Record where a button-DOWN was actually forwarded so
 					// the render-loop click handler can tell whether the hit
