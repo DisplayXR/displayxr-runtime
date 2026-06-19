@@ -1770,8 +1770,15 @@ static bool
 ensure_session_atlas_image(struct multi_compositor *mc, struct vk_bundle *vk, int per_eye_width, int height,
                          uint32_t tile_columns, uint32_t tile_rows, VkFormat format)
 {
-	if (mc->session_render.flip_initialized && mc->session_render.flip_width == per_eye_width &&
-	    mc->session_render.flip_height == height && mc->session_render.flip_format == format) {
+	// Cache on the ATLAS dimensions, not the per-tile dims: different grids can
+	// share a per-tile size but need a different atlas (e.g. Anaglyph 2x1 →
+	// 2*W x H vs Cropped SBS 1x2 → W x 2*H, both per-tile WxH). Keying on per-tile
+	// W/H alone kept the stale atlas across such a mode switch → mistiled output
+	// after cycling V (#48).
+	uint32_t atlas_width = tile_columns * (uint32_t)per_eye_width;
+	uint32_t atlas_height = tile_rows * (uint32_t)height;
+	if (mc->session_render.flip_initialized && mc->session_render.flip_width == (int)atlas_width &&
+	    mc->session_render.flip_height == (int)atlas_height && mc->session_render.flip_format == format) {
 		return true;
 	}
 
@@ -1786,8 +1793,6 @@ ensure_session_atlas_image(struct multi_compositor *mc, struct vk_bundle *vk, in
 		mc->session_render.flip_initialized = false;
 	}
 
-	uint32_t atlas_width = tile_columns * (uint32_t)per_eye_width;
-	uint32_t atlas_height = tile_rows * (uint32_t)height;
 	VkExtent2D extent = {atlas_width, atlas_height};
 	VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
 	VkImageSubresourceRange range = {
@@ -1811,8 +1816,8 @@ ensure_session_atlas_image(struct multi_compositor *mc, struct vk_bundle *vk, in
 		return false;
 	}
 
-	mc->session_render.flip_width = per_eye_width;
-	mc->session_render.flip_height = height;
+	mc->session_render.flip_width = (int)atlas_width;
+	mc->session_render.flip_height = (int)atlas_height;
 	mc->session_render.flip_format = format;
 	mc->session_render.flip_initialized = true;
 
@@ -2614,6 +2619,33 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 			                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL,
 			                         pre_count, pre_barriers);
+
+			// Clear the atlas when the submission doesn't cover every tile (#48):
+			// on a mode switch the grid can grow (e.g. → Quad 2x2) a frame before
+			// the app catches up and submits all N views, leaving the surplus tiles
+			// UNDEFINED → a one-frame magenta flash. Clear to opaque black so the
+			// uncovered tiles are benign until the app fills them. Skipped in the
+			// common fully-covered case to avoid a per-frame clear.
+			if (view_count < tile_columns * tile_rows) {
+				VkClearColorValue clear = {.float32 = {0.0f, 0.0f, 0.0f, 1.0f}};
+				VkImageSubresourceRange clear_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+				vk->vkCmdClearColorImage(cmd, mc->session_render.flip_sbs_image,
+				                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &clear_range);
+				// Order the clear before the per-tile blits (both TRANSFER writes to
+				// the same image, overlapping regions).
+				VkImageMemoryBarrier clear_barrier = {
+				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+				    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+				    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				    .image = mc->session_render.flip_sbs_image,
+				    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+				};
+				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
+				                         &clear_barrier);
+			}
 
 			// Blit each view into its tile position in the atlas
 			for (uint32_t v = 0; v < view_count; v++) {
