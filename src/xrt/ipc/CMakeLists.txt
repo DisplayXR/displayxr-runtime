@@ -182,6 +182,13 @@ elseif(APPLE)
 			${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_macos_appkit.h
 		)
 	target_link_libraries(ipc_server PRIVATE "-framework CoreFoundation" "-framework Cocoa")
+	# The macOS handler's DP-sourced server-side Kooima (#48) includes
+	# multi/comp_multi_private.h, which pulls in the Vulkan headers; aux_vk
+	# exposes ${Vulkan_INCLUDE_DIR} publicly. (Android gets these via the NDK
+	# sysroot; Windows uses the D3D11 service compositor instead.)
+	if(XRT_HAVE_VULKAN)
+		target_link_libraries(ipc_server PRIVATE aux_vk)
+	endif()
 elseif(WIN32)
 	target_sources(
 		ipc_server

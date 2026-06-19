@@ -2429,11 +2429,20 @@ oxr_session_locate_views(struct oxr_logger *log,
 		// Do the magical space relation dance here.
 		struct xrt_space_relation result = {0};
 
-		// Workspace IPC sessions and bridge-relay sessions: the server already
-		// computed display-relative view poses (via display-centric Kooima
-		// with DP eye tracking). Skip the T_base_head transform which adds a
-		// spurious Y offset from the qwerty device's world-space position.
-		if ((sess->has_external_window || sess->is_bridge_relay) && !have_eyes && !have_eye_override) {
+		// Service-mode (OOP) sessions: the server already computed
+		// display-relative view poses (via display-centric Kooima with DP eye
+		// tracking — ipc_try_get_sr_view_poses on Windows, ipc_try_get_oop_view_poses
+		// on Android/macOS). Skip the T_base_head transform, which would re-add a
+		// spurious Y offset from the head device's world-space tracked pose (the
+		// qwerty standing height of 1.6 m). Handle/texture apps matched this via
+		// has_external_window already; hosted apps (no external window) own no HWND
+		// yet still get display-relative server poses, so key on service mode too.
+		// (#48: macOS hosted OOP — Android has no qwerty so T_base_head was already
+		// identity there; this is a no-op for it.)
+		bool server_display_relative =
+		    sess->has_external_window || sess->is_bridge_relay ||
+		    (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode);
+		if (server_display_relative && !have_eyes && !have_eye_override) {
 			// Use server poses directly (display-relative)
 			result.pose = view_pose;
 			result.relation_flags = T_base_head.relation_flags;
