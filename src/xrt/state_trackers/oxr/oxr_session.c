@@ -1750,12 +1750,6 @@ oxr_session_locate_views(struct oxr_logger *log,
 		}
 	}
 
-	// is_service_mode: out-of-process (IPC) session. Used below to apply the
-	// client-computed Kooima FOV on the generic null+comp_multi server path,
-	// where get_view_poses returns the raw device FOV instead of a 3D-adjusted
-	// one (unlike the D3D11 service compositor). See the FOV save/restore gate.
-	bool is_service_mode = sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode;
-
 	// Get device pose for 3D world-space computation (qwerty = virtual display)
 	// Bridge-relay sessions (headless, XR_EXT_display_info) forward raw
 	// DP-tracked eye positions to a browser app; treat them like handle
@@ -2331,7 +2325,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 	if (!ipc_rig_done) {
 		struct xrt_fov kooima_fovs[XRT_MAX_VIEWS];
 		uint32_t fov_save_count = (active_view_count < view_count) ? active_view_count : view_count;
-		if (have_kooima_fov && (have_view_state || rig_active || is_service_mode)) {
+		if (have_kooima_fov && (have_view_state || rig_active)) {
 			for (uint32_t ei = 0; ei < fov_save_count; ei++) {
 				kooima_fovs[ei] = fovs[ei];
 			}
@@ -2347,16 +2341,11 @@ oxr_session_locate_views(struct oxr_logger *log,
 		    poses);
 		OXR_CHECK_XRET(log, sess, xret, xrt_device_get_view_poses);
 
-		// Restore client-side Kooima FOVs when the client has local 3D state
-		// (non-IPC qwerty), a chained view rig, OR is a service-mode (OOP)
-		// session. The D3D11 *service* compositor computes 3D-adjusted Kooima
-		// FOVs server-side and returns them via get_view_poses (so the original
-		// code trusted IPC blindly), but the generic null+comp_multi server path
-		// (macOS/Android, #48) returns the raw device FOV — degenerate here, e.g.
-		// a ~2° vertical sliver that hides all geometry. The client already
-		// computed a correct Kooima FOV from the same display dims + (tracked or
-		// nominal) eyes, so use it. On D3D11 the two match, so this is safe.
-		if (have_kooima_fov && (have_view_state || rig_active || is_service_mode)) {
+		// Restore client-side Kooima FOVs only when the client has local
+		// 3D state (non-IPC mode) or a chained view rig. In IPC mode, the
+		// server already computes 3D-adjusted Kooima FOVs and returns them
+		// via get_view_poses — don't override those.
+		if (have_kooima_fov && (have_view_state || rig_active)) {
 			for (uint32_t ei = 0; ei < fov_save_count; ei++) {
 				fovs[ei] = kooima_fovs[ei];
 			}
