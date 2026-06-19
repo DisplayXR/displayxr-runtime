@@ -56,6 +56,10 @@
 // macOS service input forwarding (#48): drain the generic queue fed by the
 // AppKit pump's NSEvent capture (ipc_server_macos_appkit.m).
 #include "ipc_server_input_queue.h"
+// macOS workspace chrome (#48): the generic comp_multi chrome registry the
+// per-session render path composites from (the cross-platform analogue of the
+// D3D11 monolith's per-slot chrome storage).
+#include "multi/comp_multi_workspace.h"
 #endif
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) || defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS)
@@ -4385,6 +4389,28 @@ ipc_handle_workspace_capture_frame(volatile struct ipc_client_state *_ics,
 // dispatches to comp_d3d11_service. Layout has the same client_id→slot
 // resolution.
 
+#if defined(XRT_OS_MACOS)
+// Resolve a canonical workspace client id to its per-session compositor
+// (== ics->xc == the multi_compositor the render path keys chrome by, #48). The
+// macOS service hands the controller canonical ids from EnumerateWorkspaceClients,
+// so no 1000+slot normalization is needed here (that is the D3D11-only form).
+static struct xrt_compositor *
+macos_workspace_find_client_xc(struct ipc_server *s, uint32_t client_id)
+{
+	struct xrt_compositor *xc = NULL;
+	os_mutex_lock(&s->global_state.lock);
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		volatile struct ipc_client_state *ics = &s->threads[i].ics;
+		if (ics->client_state.id == client_id && ics->server_thread_index >= 0 && ics->xc != NULL) {
+			xc = (struct xrt_compositor *)ics->xc;
+			break;
+		}
+	}
+	os_mutex_unlock(&s->global_state.lock);
+	return xc;
+}
+#endif
+
 xrt_result_t
 ipc_handle_workspace_register_chrome_swapchain(volatile struct ipc_client_state *_ics,
                                                uint32_t client_id,
@@ -4445,6 +4471,28 @@ ipc_handle_workspace_register_chrome_swapchain(volatile struct ipc_client_state 
 	IPC_INFO(s, "Workspace: register_chrome_swapchain client_id=%u swapchain_id=%u → slot=%d",
 	         client_id, swapchain_id, slot);
 	return comp_d3d11_service_workspace_register_chrome_swapchain_by_slot(s->xsysc, slot, client_id, swapchain_id, xsc);
+#elif defined(XRT_OS_MACOS)
+	// Generic comp_multi path (#48): store the controller's chrome swapchain in
+	// the chrome registry, keyed by the *target* client's compositor; the
+	// per-session render path composites it (no D3D11 monolith / slots here).
+	if (swapchain_id >= IPC_MAX_CLIENT_SWAPCHAINS) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct xrt_swapchain *xsc = (struct xrt_swapchain *)_ics->xscs[swapchain_id];
+	if (xsc == NULL) {
+		IPC_WARN(s, "Workspace: register_chrome_swapchain - swapchain %u not bound", swapchain_id);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	if (target_xc == NULL) {
+		// Client may not be bound yet — controller retries.
+		IPC_WARN(s, "Workspace: register_chrome_swapchain - client %u not bound yet", client_id);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	IPC_INFO(s, "Workspace: register_chrome_swapchain client_id=%u swapchain_id=%u (macOS comp_multi)",
+	         client_id, swapchain_id);
+	comp_multi_workspace_chrome_register(target_xc, swapchain_id, xsc);
+	return XRT_SUCCESS;
 #else
 	(void)s;
 	(void)client_id;
@@ -4464,6 +4512,10 @@ ipc_handle_workspace_unregister_chrome_swapchain(volatile struct ipc_client_stat
 	}
 	IPC_INFO(s, "Workspace: unregister_chrome_swapchain swapchain_id=%u", swapchain_id);
 	return comp_d3d11_service_workspace_unregister_chrome_swapchain(s->xsysc, swapchain_id);
+#elif defined(XRT_OS_MACOS)
+	IPC_INFO(s, "Workspace: unregister_chrome_swapchain swapchain_id=%u (macOS)", swapchain_id);
+	comp_multi_workspace_chrome_unregister_by_id(swapchain_id);
+	return XRT_SUCCESS;
 #else
 	(void)s;
 	(void)swapchain_id;
@@ -4510,6 +4562,28 @@ ipc_handle_workspace_set_chrome_layout(volatile struct ipc_client_state *_ics,
 	}
 
 	return comp_d3d11_service_workspace_set_chrome_layout_by_slot(s->xsysc, slot, layout);
+#elif defined(XRT_OS_MACOS)
+	if (layout == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	if (target_xc == NULL) {
+		IPC_WARN(s, "Workspace: set_chrome_layout - client %u not found", client_id);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	// Translate the IPC wire layout into the compositor-local form (keeps
+	// comp_multi free of ipc_protocol.h).
+	struct comp_multi_chrome_layout cml = {
+	    .pose_in_client = layout->pose_in_client,
+	    .size_w_m = layout->size_w_m,
+	    .size_h_m = layout->size_h_m,
+	    .follows_window_orient = layout->follows_window_orient != 0,
+	    .depth_bias_meters = layout->depth_bias_meters,
+	    .anchor_to_window_top_edge = layout->anchor_to_window_top_edge != 0,
+	    .width_as_fraction_of_window = layout->width_as_fraction_of_window,
+	};
+	comp_multi_workspace_chrome_set_layout(target_xc, &cml);
+	return XRT_SUCCESS;
 #else
 	(void)s;
 	(void)client_id;
@@ -4640,6 +4714,17 @@ ipc_handle_workspace_update_chrome_layer_pose(volatile struct ipc_client_state *
 	}
 
 	return comp_d3d11_service_workspace_update_chrome_layer_pose_by_slot(s->xsysc, slot, pose_in_client);
+#elif defined(XRT_OS_MACOS)
+	if (pose_in_client == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	if (target_xc == NULL) {
+		// Per-frame call — quieter than set_chrome_layout (no warn).
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	comp_multi_workspace_chrome_update_pose(target_xc, pose_in_client);
+	return XRT_SUCCESS;
 #else
 	(void)s;
 	(void)client_id;

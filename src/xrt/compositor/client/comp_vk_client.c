@@ -55,6 +55,23 @@ to_native_swapchain(struct xrt_swapchain *xsc)
 }
 
 /*!
+ * Public unwrap for the workspace EXT path (oxr_workspace.c, #48): reach the
+ * inner native (IPC) swapchain from a Vulkan client swapchain so the runtime
+ * can read its IPC swapchain id. Mirrors comp_d3d11_client_get_inner_xrt_swapchain.
+ * A VK session that also acts as a workspace controller (creating chrome/cursor/
+ * overlay swapchains) needs this — its swapchains are client_vk_swapchain-wrapped,
+ * unlike a pure WORKSPACE_CONTROLLER session whose swapchains are already native.
+ */
+struct xrt_swapchain *
+comp_vk_client_get_inner_xrt_swapchain(struct xrt_swapchain *xsc)
+{
+	if (xsc == NULL) {
+		return NULL;
+	}
+	return &client_vk_swapchain(xsc)->xscn->base;
+}
+
+/*!
  * Down-cast helper.
  *
  * @private @memberof client_vk_compositor
