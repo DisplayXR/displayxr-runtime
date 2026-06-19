@@ -11,10 +11,25 @@
 
 #include "ipc_server_macos_appkit.h"
 #include "ipc_server_input_queue.h"
+#include "multi/comp_multi_workspace.h" // cursor pointer-position publish (#48 Phase 2)
 #include "shared/ipc_protocol.h"
 
 #include <stdbool.h>
 #include <ctype.h>
+
+// Publish the latest pointer position in target framebuffer pixels (top-left
+// origin) for the service-side workspace cursor composite (#48). NSEvent's
+// locationInWindow is in points with a bottom-left origin; convert via the
+// window's backing scale + content-view height to pixel / top-left space.
+static void
+publish_pointer_px(NSEvent *event, NSPoint p)
+{
+	NSWindow *win = [event window];
+	CGFloat scale = (win != nil) ? [win backingScaleFactor] : 1.0;
+	NSView *cv = (win != nil) ? [win contentView] : nil;
+	CGFloat h_pts = (cv != nil) ? cv.bounds.size.height : 0.0;
+	comp_multi_workspace_set_pointer_px((int32_t)(p.x * scale), (int32_t)((h_pts - p.y) * scale));
+}
 
 // Translate an NSEvent (service-window input) into a wire input event and queue
 // it for the IPC handler to forward to the client app (#48). Mirrors the Windows
@@ -64,6 +79,7 @@ queue_ns_input_event(NSEvent *event)
 	case NSEventTypeRightMouseDown:
 	case NSEventTypeRightMouseUp: {
 		NSPoint p = [event locationInWindow];
+		publish_pointer_px(event, p);
 		ev.event_type = IPC_WORKSPACE_INPUT_EVENT_POINTER;
 		ev.u.pointer.button =
 		    (type == NSEventTypeRightMouseDown || type == NSEventTypeRightMouseUp) ? 2u : 1u;
@@ -79,6 +95,7 @@ queue_ns_input_event(NSEvent *event)
 	case NSEventTypeLeftMouseDragged:
 	case NSEventTypeRightMouseDragged: {
 		NSPoint p = [event locationInWindow];
+		publish_pointer_px(event, p);
 		uint32_t button_mask = (uint32_t)[NSEvent pressedMouseButtons];
 		ev.event_type = IPC_WORKSPACE_INPUT_EVENT_POINTER_MOTION;
 		ev.u.pointer_motion.cursor_x = (int64_t)p.x;
