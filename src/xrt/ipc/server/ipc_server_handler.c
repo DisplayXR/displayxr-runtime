@@ -60,6 +60,11 @@
 // per-session render path composites from (the cross-platform analogue of the
 // D3D11 monolith's per-slot chrome storage).
 #include "multi/comp_multi_workspace.h"
+// Forward decl: the canonical-id → per-session compositor resolver is defined
+// lower in this file (alongside the chrome RPC handlers) but is also used by
+// the earlier get_window_pose handler.
+static struct xrt_compositor *
+macos_workspace_find_client_xc(struct ipc_server *s, uint32_t client_id);
 #endif
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) || defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS)
@@ -3776,6 +3781,18 @@ ipc_handle_workspace_get_window_pose(volatile struct ipc_client_state *_ics,
 	    s->xsysc, (struct xrt_compositor *)target_ics->xc, out_pose, out_width_m, out_height_m);
 
 	os_mutex_unlock(&s->global_state.lock);
+	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
+#elif defined(XRT_OS_MACOS)
+	// macOS OOP single-app model: the client fills the display, so its window
+	// IS the display. Return the display dims (consistent with where the chrome
+	// composite, session_render_chrome_overlay, places chrome) + an identity
+	// pose. This unblocks the shell's per-client chrome sizing (#61); true
+	// per-client window placement is Tier-2 (#59).
+	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	if (target_xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	bool ok = comp_multi_workspace_get_client_window_dims(target_xc, out_pose, out_width_m, out_height_m);
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
 #else
 	(void)s;
