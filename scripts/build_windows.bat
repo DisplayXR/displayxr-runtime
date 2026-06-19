@@ -279,6 +279,15 @@ if exist "%REPO%test_apps\cube_texture_d3d12_win\CMakeLists.txt" (
     if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_texture_d3d12_win\build\" >nul
 )
 
+:: cube_zones_texture_d3d12_win (#613 — native-D3D12 zones texture parity app)
+if exist "%REPO%test_apps\cube_zones_texture_d3d12_win\CMakeLists.txt" (
+    echo --- cube_zones_texture_d3d12_win ---
+    cmake -S "%REPO%\test_apps\cube_zones_texture_d3d12_win" -B "%REPO%\test_apps\cube_zones_texture_d3d12_win\build" -G Ninja ^
+        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
+    cmake --build "%REPO%\test_apps\cube_zones_texture_d3d12_win\build" || set TESTAPP_FAILED=1
+    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_zones_texture_d3d12_win\build\" >nul
+)
+
 :: workspace_minimal_d3d11_win (XR_EXT_spatial_workspace smoke test)
 if exist "%REPO%test_apps\workspace_minimal_d3d11_win\CMakeLists.txt" (
     echo --- workspace_minimal_d3d11_win ---
@@ -397,6 +406,21 @@ for %%A in (cube_zones_texture_vk_win) do (
             echo @echo off
             echo set "XR_RUNTIME_JSON=%RT_JSON%"
             echo set "DISPLAYXR_ZONES=1"
+            echo set "PATH=%PKG%\bin;%%PATH%%"
+            echo "%REPO%test_apps\%%A\build\%%A.exe" %%*
+        )
+    )
+)
+:: Non-Vulkan zones app — disable VK implicit layers (no app VkInstance) AND set
+:: the zones dev gate so the runtime advertises XR_EXT_display_zones (#613). NOT
+:: in the generic loop above, which omits the zones gate.
+for %%A in (cube_zones_texture_d3d12_win) do (
+    if exist "%REPO%test_apps\%%A\build\%%A.exe" (
+        > "%PKG%\run_%%A.bat" (
+            echo @echo off
+            echo set "XR_RUNTIME_JSON=%RT_JSON%"
+            echo set "DISPLAYXR_ZONES=1"
+            echo set "VK_LOADER_LAYERS_DISABLE=*"
             echo set "PATH=%PKG%\bin;%%PATH%%"
             echo "%REPO%test_apps\%%A\build\%%A.exe" %%*
         )
