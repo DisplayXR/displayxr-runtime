@@ -43,18 +43,19 @@
 #include "d3d11_service/comp_d3d11_service.h"
 #endif
 
-#ifdef XRT_OS_ANDROID
-// Out-of-process Android (#510): the per-client compositor is a multi_compositor;
-// the server pulls its live present-target extent for the client's Kooima and
-// runs the server-side Kooima for the null+comp_multi path (no D3D11 service).
+#if defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS)
+// Out-of-process non-D3D11 service path (Android #510, macOS #48): the per-client
+// compositor is a multi_compositor; the server pulls its live present-target
+// extent for the client's Kooima and runs the server-side Kooima for the
+// null+comp_multi path (no D3D11 service).
 #include "multi/comp_multi_private.h"
 #include "xrt/xrt_display_metrics.h" // struct xrt_eye_positions (DP-tracked eyes; Leia M2)
 #endif
 
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) || defined(XRT_OS_ANDROID)
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) || defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS)
 // Shared Kooima rig math (#396 W7): same displayxr-common core as the
 // in-process oxr_session.c path and every app/engine consumer. Both server-side
-// Kooima paths (D3D11 service on Windows, null+comp_multi on Android) use it.
+// Kooima paths (D3D11 service on Windows, null+comp_multi on Android/macOS) use it.
 #include "displayxr_math_xrt.h"
 #endif
 
@@ -139,7 +140,7 @@ validate_device_id(volatile struct ipc_client_state *ics, int64_t device_id, str
 	} while (0)
 
 
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) || defined(XRT_OS_ANDROID)
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) || defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS)
 /*!
  * Fill surplus view slots [from, view_count) with valid poses.
  *
@@ -175,7 +176,7 @@ fill_surplus_view_poses(struct xrt_device *xdev,
 		}
 	}
 }
-#endif // D3D11 service || Android — fill_surplus_view_poses
+#endif // D3D11 service || Android || macOS — fill_surplus_view_poses
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 /*!
@@ -848,18 +849,23 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 }
 #endif // XRT_HAVE_D3D11_SERVICE_COMPOSITOR
 
-#ifdef XRT_OS_ANDROID
+#if defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS)
 /*!
- * Server-side Kooima for the out-of-process Android path (#510).
+ * Server-side Kooima for the out-of-process null+comp_multi path (Android #510,
+ * macOS #48).
  *
- * On Android the runtime service runs the null compositor + comp_multi (NOT the
- * D3D11 service compositor), so ipc_try_get_sr_view_poses above is compiled out.
- * This is its analogue for the null+comp_multi path: it computes orientation-
- * aware, render-ready off-axis FOVs + head-local poses via the SAME shared
- * displayxr-common Kooima core (dxr_xrt_display3d_compute_views) used by the
- * D3D11 server and the in-process oxr_session.c path. Without it,
- * ipc_handle_session_locate_views_rig falls back to xrt_device_get_view_poses →
- * sim_display's FIXED landscape device FOV (portrait stretched, 2D off-center).
+ * On Android and macOS the runtime service runs the null compositor + comp_multi
+ * (NOT the D3D11 service compositor), so ipc_try_get_sr_view_poses above is
+ * compiled out. This is its analogue for the null+comp_multi path: it computes
+ * orientation-aware, render-ready off-axis FOVs + head-local poses via the SAME
+ * shared displayxr-common Kooima core (dxr_xrt_display3d_compute_views) used by
+ * the D3D11 server and the in-process oxr_session.c path — sourcing eye
+ * positions from the generic xrt_display_processor (multi_compositor_get_-
+ * predicted_eye_positions / the system-compositor nominal viewer), NOT the
+ * device get_view_poses. Without it, the locate handlers fall back to
+ * xrt_device_get_view_poses → sim_display's device FOV, which on macOS is
+ * contaminated by the qwerty standing head pose (1.6 m → a steep vertical
+ * sliver) and on Android is the FIXED landscape FOV (portrait stretched).
  *
  * Inputs mirror the in-process block (oxr_session.c:1512-1797):
  *   - screen meters: the head display dims from xrt_system_compositor_info.
@@ -872,7 +878,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
  * Returns true on success; false → caller's legacy device-poses fallback.
  */
 static bool
-ipc_try_get_android_view_poses(volatile struct ipc_client_state *ics,
+ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
                                struct xrt_device *head,
                                const struct xrt_vec3 *fallback_eye_relation,
                                int64_t at_timestamp_ns,
@@ -906,7 +912,7 @@ ipc_try_get_android_view_poses(volatile struct ipc_client_state *ics,
 		static bool logged_no_dims = false;
 		if (!logged_no_dims) {
 			logged_no_dims = true;
-			IPC_WARN(s, "android Kooima: no display dims from xsysc, using legacy poses");
+			IPC_WARN(s, "oop Kooima: no display dims from xsysc, using legacy poses");
 		}
 		return false;
 	}
@@ -1065,6 +1071,14 @@ ipc_try_get_android_view_poses(volatile struct ipc_client_state *ics,
 	uint32_t active_view_count = view_count;
 	if (rig != NULL && rig->render_view_count > 0) {
 		active_view_count = rig->render_view_count;
+	} else if (head != NULL && head->hmd != NULL && head->rendering_mode_count > 0 &&
+	           head->hmd->active_rendering_mode_index < head->rendering_mode_count) {
+		// Legacy / non-rig locates (e.g. device_get_view_poses on macOS) carry no
+		// render_view_count over IPC. The server head device IS the real display
+		// device here (not a proxy), and a legacy app never switches modes over
+		// IPC, so its active rendering mode is authoritative: read the active
+		// mode's view count directly to drive the 2D mono-collapse below.
+		active_view_count = head->rendering_modes[head->hmd->active_rendering_mode_index].view_count;
 	}
 
 	// Re-express the render eyes relative to the zone centre when a zone is
@@ -1215,7 +1229,7 @@ ipc_try_get_android_view_poses(volatile struct ipc_client_state *ics,
 	static bool first_call = true;
 	if (first_call) {
 		first_call = false;
-		IPC_WARN(s, "android Kooima: FIRST CALL view_count=%u dp_eyes=%d screen=%.3fx%.3fm win_px=%ux%u",
+		IPC_WARN(s, "oop Kooima: FIRST CALL view_count=%u dp_eyes=%d screen=%.3fx%.3fm win_px=%ux%u",
 		         view_count, (int)have_dp_eyes, (double)screen_width_m, (double)screen_height_m,
 		         (unsigned)wm.window_pixel_width, (unsigned)wm.window_pixel_height);
 	}
@@ -1226,7 +1240,7 @@ ipc_try_get_android_view_poses(volatile struct ipc_client_state *ics,
 		float v = (out_fovs[0].angle_up - out_fovs[0].angle_down) * 180.0f / 3.14159265f;
 		float fov_aspect = (v != 0.0f) ? (h / v) : 0.0f;
 		IPC_WARN(s,
-		         "android Kooima: views=%u screen=%.3fx%.3fm FOV H=%.1f° V=%.1f° "
+		         "oop Kooima: views=%u screen=%.3fx%.3fm FOV H=%.1f° V=%.1f° "
 		         "fovAspect=%.3f tracking=%d rig=%d zone=%d",
 		         view_count, (double)screen_width_m, (double)screen_height_m, (double)h, (double)v,
 		         (double)fov_aspect, (int)is_tracking, (int)rig_display, (int)zone_applied);
@@ -1234,7 +1248,7 @@ ipc_try_get_android_view_poses(volatile struct ipc_client_state *ics,
 
 	return true;
 }
-#endif // XRT_OS_ANDROID
+#endif // XRT_OS_ANDROID || XRT_OS_MACOS
 
 
 static xrt_result_t
@@ -5292,6 +5306,13 @@ ipc_handle_device_get_view_poses(volatile struct ipc_client_state *ics,
 	                               view_count, NULL, NULL, &reply.head_relation, fovs, poses)) {
 		reply.result = XRT_SUCCESS;
 	} else
+#elif defined(XRT_OS_MACOS)
+	// Out-of-process macOS (#48): DP-sourced server-side Kooima (see
+	// ipc_handle_device_get_view_poses_2 for the rationale).
+	if (ipc_try_get_oop_view_poses(ics, xdev, fallback_eye_relation, at_timestamp_ns, view_count, NULL, NULL,
+	                               &reply.head_relation, fovs, poses)) {
+		reply.result = XRT_SUCCESS;
+	} else
 #endif
 	{
 		// Fall back to device view poses
@@ -5360,6 +5381,17 @@ ipc_handle_device_get_view_poses_2(volatile struct ipc_client_state *ics,
 	                               out_info->poses)) {
 		return XRT_SUCCESS;
 	}
+#elif defined(XRT_OS_MACOS)
+	// Out-of-process macOS (#48): null+comp_multi service path. Legacy apps locate
+	// via the non-rig device_get_view_poses, so route them through the same
+	// DP-sourced server-side Kooima as the rig path — otherwise the fallback below
+	// runs sim_display's device get_view_poses, whose head pose is contaminated by
+	// the qwerty standing height (1.6 m → a steep vertical sliver FOV). (Android
+	// keeps the device fallback here; its OOP apps use the rig locate path.)
+	if (ipc_try_get_oop_view_poses(ics, xdev, default_eye_relation, at_timestamp_ns, view_count, NULL, NULL,
+	                               &out_info->head_relation, out_info->fovs, out_info->poses)) {
+		return XRT_SUCCESS;
+	}
 #endif
 
 	// Fall back to device view poses
@@ -5409,11 +5441,11 @@ ipc_handle_session_locate_views_rig(volatile struct ipc_client_state *ics,
 	                               out_info->fovs, out_info->poses)) {
 		return XRT_SUCCESS;
 	}
-#elif defined(XRT_OS_ANDROID)
-	// Out-of-process Android (#510): the service runs null+comp_multi, not the
-	// D3D11 service compositor, so run the server-side Kooima for that path.
-	if (ipc_try_get_android_view_poses(ics, head, &fallback_eye_relation, at_timestamp_ns, view_count, rig,
-	                                   out_info, &out_info->head_relation, out_info->fovs, out_info->poses)) {
+#elif defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS)
+	// Out-of-process Android (#510) / macOS (#48): the service runs null+comp_multi,
+	// not the D3D11 service compositor, so run the server-side Kooima for that path.
+	if (ipc_try_get_oop_view_poses(ics, head, &fallback_eye_relation, at_timestamp_ns, view_count, rig,
+	                               out_info, &out_info->head_relation, out_info->fovs, out_info->poses)) {
 		return XRT_SUCCESS;
 	}
 #else
