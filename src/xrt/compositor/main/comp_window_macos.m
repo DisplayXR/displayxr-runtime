@@ -112,7 +112,28 @@ create_window_on_main_thread(struct comp_window_macos *cwm, uint32_t width, uint
 		[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 	}
 
-	NSRect frame = NSMakeRect(100, 100, width, height);
+	// Size the window to the MAIN DISPLAY's full aspect ratio, not the passed
+	// dims. The display processor weaves a full-display atlas (physical pixels,
+	// e.g. 3024x1964 = 1.54:1) and presents it into this surface; if the window
+	// aspect differs the content is non-uniformly scaled (vertical squish). The
+	// sim's visible-frame dims (which exclude menu bar / dock) and the
+	// 1920x1080 fallback both have the wrong aspect — NSScreen.frame is the full
+	// display (its point aspect == the physical-pixel aspect == the atlas
+	// aspect), so derive the window shape from it. Fit to ~85% of the screen
+	// height so the title bar stays reachable. (#48 aspect fix.)
+	CGFloat win_w = (CGFloat)width;
+	CGFloat win_h = (CGFloat)height;
+	NSScreen *screen = [NSScreen mainScreen];
+	if (screen != nil) {
+		NSRect sf = screen.frame;
+		if (sf.size.width > 0 && sf.size.height > 0) {
+			CGFloat aspect = sf.size.width / sf.size.height;
+			win_h = sf.size.height * 0.85;
+			win_w = win_h * aspect;
+		}
+	}
+
+	NSRect frame = NSMakeRect(100, 100, win_w, win_h);
 	NSWindowStyleMask style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable |
 	                          NSWindowStyleMaskMiniaturizable;
 
@@ -142,7 +163,7 @@ create_window_on_main_thread(struct comp_window_macos *cwm, uint32_t width, uint
 
 	CGFloat scale = cwm->window.backingScaleFactor;
 	cwm->metal_layer.contentsScale = scale;
-	cwm->metal_layer.drawableSize = CGSizeMake(width * scale, height * scale);
+	cwm->metal_layer.drawableSize = CGSizeMake(win_w * scale, win_h * scale);
 
 	[cwm->window makeKeyAndOrderFront:nil];
 	[NSApp activateIgnoringOtherApps:YES];
