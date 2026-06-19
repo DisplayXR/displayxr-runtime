@@ -1779,6 +1779,40 @@ oxr_session_locate_views(struct oxr_logger *log,
 
 	bool have_eyes = got_eye_positions && eye_pos.valid;
 
+	// #615 eye-set/mode coherence guard at a rendering-mode switch.
+	//
+	// At a 2D->3D switch the runtime flips the active mode to N views on the
+	// request frame, but the DP's predicted-eye set lags by up to one frame:
+	// it still reports the single centered 2D eye (count=1, sep=0) for one
+	// locate before catching up to N tracked eyes. Consuming that stale set in
+	// an N-view mode leaves the surplus view(s) without a tracked eye, so they
+	// fall back to device-default (full-disparity, off-axis) FOV below — a
+	// one-frame full-disparity snap the app's per-frame IPD ramp can't absorb.
+	// It's a race (DP update vs mode flip), hence intermittent (issue #615).
+	//
+	// Hold coherence: when the DP under-reports for the active mode, duplicate
+	// the last reported eye into the surplus slots so every view renders from
+	// the (centered) mono eye — a flat frame that matches the just-ended 2D
+	// state. The next frame the DP delivers N eyes and the ramp proceeds from
+	// flat. The mode's view count is untouched (atlas recipe = the MODE); only
+	// the eye-set is made consistent with it for the lagging frame.
+	if (have_eyes && eye_pos.count >= 1 && eye_pos.count < active_view_count &&
+	    active_view_count <= XRT_MAX_VIEWS) {
+		uint32_t under = eye_pos.count;
+		for (uint32_t ei = under; ei < active_view_count; ei++) {
+			eye_pos.eyes[ei] = eye_pos.eyes[under - 1];
+		}
+		eye_pos.count = active_view_count;
+		static bool warned_coherence_guard = false;
+		if (!warned_coherence_guard) {
+			warned_coherence_guard = true;
+			U_LOG_W("#615: DP under-reported %u eye(s) for a %u-view mode at a mode "
+			        "switch; duplicating last eye into surplus slot(s) to hold "
+			        "coherence (avoids a one-frame full-disparity snap). Logged once.",
+			        under, active_view_count);
+		}
+	}
+
 	// Kooima FOV computation (vendor-neutral)
 	// Works with either tracked eye positions or nominal viewer position
 	{
