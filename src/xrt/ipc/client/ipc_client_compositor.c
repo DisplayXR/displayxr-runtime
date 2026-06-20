@@ -467,6 +467,160 @@ comp_ipc_client_compositor_get_transparent_output_fence(struct xrt_compositor *x
 
 
 /*
+ * XR_EXT_weave bridges (#625) — the window-bound synchronous weave service.
+ * Thin accessors the OpenXR state tracker (oxr_weave.c) forward-declares and
+ * the runtime DLL links at runtime; same pattern as the transparent-output
+ * bridges above. The DP weaves server-side (ADR-007 / ADR-019); these only
+ * marshal the wire.
+ */
+xrt_result_t
+comp_ipc_client_compositor_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd)
+{
+	if (xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_weave_bind_window(icc->ipc_c, hwnd);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
+                                        xrt_graphics_buffer_handle_t in_handle,
+                                        bool in_is_dxgi,
+                                        int32_t rect_x,
+                                        int32_t rect_y,
+                                        uint32_t rect_w,
+                                        uint32_t rect_h,
+                                        const float *eyes_xyz,
+                                        uint32_t eye_count,
+                                        bool *out_have_output,
+                                        uint32_t *out_width,
+                                        uint32_t *out_height,
+                                        uint64_t *out_fence_value)
+{
+	if (xc == NULL || out_have_output == NULL || out_width == NULL || out_height == NULL ||
+	    out_fence_value == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_have_output = false;
+	*out_width = 0;
+	*out_height = 0;
+	*out_fence_value = 0;
+
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	struct ipc_arg_weave_submit args = {0};
+	args.rect_x = rect_x;
+	args.rect_y = rect_y;
+	args.rect_w = rect_w;
+	args.rect_h = rect_h;
+	if (eye_count > XRT_MAX_VIEWS) {
+		eye_count = XRT_MAX_VIEWS;
+	}
+	args.eye_count = eye_count;
+	for (uint32_t i = 0; eyes_xyz != NULL && i < eye_count; i++) {
+		args.eyes[i].x = eyes_xyz[i * 3 + 0];
+		args.eyes[i].y = eyes_xyz[i * 3 + 1];
+		args.eyes[i].z = eyes_xyz[i * 3 + 2];
+	}
+
+	xrt_graphics_buffer_handle_t handle = in_handle;
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+	// DXGI handles are identified by setting their lower bit to 1 during
+	// transfer (same convention as swapchain_import).
+	if (in_is_dxgi && handle != XRT_GRAPHICS_BUFFER_HANDLE_INVALID) {
+		handle = (void *)((size_t)handle | 1);
+	}
+#else
+	(void)in_is_dxgi;
+#endif
+
+	bool have = false;
+	uint32_t w = 0, h = 0;
+	uint64_t fv = 0;
+	// Generated arg order: in args, then in_handles (handles, count), then out
+	// args. This copies the handle, it does not consume it.
+	xrt_result_t xret = ipc_call_weave_submit(icc->ipc_c, &args, &handle, 1, &have, &w, &h, &fv);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	*out_have_output = have;
+	*out_width = w;
+	*out_height = h;
+	*out_fence_value = fv;
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+comp_ipc_client_compositor_weave_get_output(struct xrt_compositor *xc,
+                                            bool *out_have_output,
+                                            uint32_t *out_width,
+                                            uint32_t *out_height,
+                                            xrt_graphics_buffer_handle_t *out_handle)
+{
+	if (xc == NULL || out_have_output == NULL || out_width == NULL || out_height == NULL ||
+	    out_handle == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_have_output = false;
+	*out_width = 0;
+	*out_height = 0;
+	*out_handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	bool have = false;
+	uint32_t w = 0, h = 0;
+	xrt_graphics_buffer_handle_t handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	xrt_result_t xret = ipc_call_weave_get_output(icc->ipc_c, &have, &w, &h, &handle, 1);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	*out_have_output = have;
+	*out_width = w;
+	*out_height = h;
+	*out_handle = handle;
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+comp_ipc_client_compositor_weave_get_fence(struct xrt_compositor *xc,
+                                           bool *out_have_fence,
+                                           xrt_graphics_sync_handle_t *out_handle)
+{
+	if (xc == NULL || out_have_fence == NULL || out_handle == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_have_fence = false;
+	*out_handle = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	bool have = false;
+	xrt_graphics_sync_handle_t h = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+	xrt_result_t xret = ipc_call_weave_get_fence(icc->ipc_c, &have, &h, 1);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	*out_have_fence = have;
+	*out_handle = h;
+	return XRT_SUCCESS;
+}
+
+
+/*
  * Workspace controller bridges — thin accessors used by the OpenXR state
  * tracker's XR_EXT_spatial_workspace implementation. The state tracker does
  * not pull ipc_client headers; it forward-declares these wrappers and the

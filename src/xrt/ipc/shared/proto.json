@@ -706,6 +706,41 @@
 		"out_handles": {"type": "xrt_graphics_sync_handle_t"}
 	},
 
+	"weave_bind_window": {
+		"in": [
+			{"name": "hwnd", "type": "uint64_t"}
+		]
+	},
+
+	"weave_submit": {
+		"in": [
+			{"name": "args", "type": "struct ipc_arg_weave_submit"}
+		],
+		"out": [
+			{"name": "have_output", "type": "bool"},
+			{"name": "width", "type": "uint32_t"},
+			{"name": "height", "type": "uint32_t"},
+			{"name": "fence_value", "type": "uint64_t"}
+		],
+		"in_handles": {"type": "xrt_graphics_buffer_handle_t"}
+	},
+
+	"weave_get_output": {
+		"out": [
+			{"name": "have_output", "type": "bool"},
+			{"name": "width", "type": "uint32_t"},
+			{"name": "height", "type": "uint32_t"}
+		],
+		"out_handles": {"type": "xrt_graphics_buffer_handle_t"}
+	},
+
+	"weave_get_fence": {
+		"out": [
+			{"name": "have_fence", "type": "bool"}
+		],
+		"out_handles": {"type": "xrt_graphics_sync_handle_t"}
+	},
+
 	"compositor_semaphore_destroy": {
 		"in": [
 			{"name": "id", "type": "uint32_t"}

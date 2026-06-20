@@ -497,6 +497,11 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrGetDisplayZoneRecommendedViewSizeEXT, EXT_display_zones);
 #endif
 
+#ifdef OXR_HAVE_EXT_weave
+	ENTRY_IF_EXT(xrWeaveBindWindowEXT, EXT_weave);
+	ENTRY_IF_EXT(xrWeaveSubmitEXT, EXT_weave);
+#endif
+
 #ifdef OXR_HAVE_EXT_workspace_file_dialog
 	ENTRY_IF_EXT(xrRequestFilePickerEXT, EXT_workspace_file_dialog);
 	ENTRY_IF_EXT(xrGetFilePickerRequestEXT, EXT_workspace_file_dialog);

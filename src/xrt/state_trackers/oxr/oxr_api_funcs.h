@@ -1049,6 +1049,16 @@ oxr_xrGetDisplayZoneRecommendedViewSizeEXT(XrSession session,
                                            XrExtent2Di *recommendedViewSize);
 #endif
 
+#ifdef OXR_HAVE_EXT_weave
+//! OpenXR API function @ep{xrWeaveBindWindowEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrWeaveBindWindowEXT(XrSession session, void *windowHandle);
+
+//! OpenXR API function @ep{xrWeaveSubmitEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrWeaveSubmitEXT(XrSession session, const XrWeaveSubmitInfoEXT *submitInfo, XrWeaveOutputEXT *output);
+#endif
+
 #ifdef OXR_HAVE_EXT_conformance_automation
 //! OpenXR API function @ep{xrSetInputDeviceActiveEXT}
 XRAPI_ATTR XrResult XRAPI_CALL

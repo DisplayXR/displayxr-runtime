@@ -199,6 +199,48 @@ comp_ipc_client_compositor_get_transparent_output_fence(struct xrt_compositor *x
                                                         xrt_graphics_sync_handle_t *out_handle);
 
 /*!
+ * XR_EXT_weave bridges (#625) — the window-bound synchronous weave service.
+ * The OpenXR state tracker (oxr_weave.c) forward-declares these and the runtime
+ * DLL links them; only valid when `xc` is an ipc_client_compositor (service
+ * path). The DP weaves server-side (ADR-007 / ADR-019).
+ *
+ * @c weave_bind_window registers the present-owner's HWND for DP phase-snap.
+ * @c weave_submit hands a pre-weave SBS texture (in_handle) + a window-relative
+ *   rect across per frame and returns the weaved dims + the fence wait value.
+ * @c weave_get_output / @c weave_get_fence fetch the persistent server-allocated
+ *   weaved-texture handle + fence handle ONCE (the caller caches them).
+ */
+xrt_result_t
+comp_ipc_client_compositor_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd);
+
+xrt_result_t
+comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
+                                        xrt_graphics_buffer_handle_t in_handle,
+                                        bool in_is_dxgi,
+                                        int32_t rect_x,
+                                        int32_t rect_y,
+                                        uint32_t rect_w,
+                                        uint32_t rect_h,
+                                        const float *eyes_xyz,
+                                        uint32_t eye_count,
+                                        bool *out_have_output,
+                                        uint32_t *out_width,
+                                        uint32_t *out_height,
+                                        uint64_t *out_fence_value);
+
+xrt_result_t
+comp_ipc_client_compositor_weave_get_output(struct xrt_compositor *xc,
+                                            bool *out_have_output,
+                                            uint32_t *out_width,
+                                            uint32_t *out_height,
+                                            xrt_graphics_buffer_handle_t *out_handle);
+
+xrt_result_t
+comp_ipc_client_compositor_weave_get_fence(struct xrt_compositor *xc,
+                                           bool *out_have_fence,
+                                           xrt_graphics_sync_handle_t *out_handle);
+
+/*!
  * Workspace controller bridges (XR_EXT_spatial_workspace).
  *
  * Thin accessors used by the OpenXR state tracker to dispatch workspace
