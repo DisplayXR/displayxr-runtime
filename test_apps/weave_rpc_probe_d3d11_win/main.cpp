@@ -1,0 +1,545 @@
+// Copyright 2026, DisplayXR
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  XR_EXT_weave probe (#625) — native, browser-free Step-0 harness.
+ *
+ * A present-owner that exercises the window-bound synchronous weave service end
+ * to end with zero browser:
+ *
+ *   1. Creates its own OS window + a transparent DirectComposition swap chain.
+ *   2. Brings up a forced-IPC OpenXR session bound to that window
+ *      (XR_EXT_win32_window_binding, transparent, no shared texture).
+ *   3. xrWeaveBindWindowEXT(window) once for DP phase-snap.
+ *   4. Builds a known pre-weave SBS test texture (left half red, right half blue)
+ *      as a keyed-mutex shared texture.
+ *   5. Per frame: xrWeaveSubmitEXT(sbs, windowRelativeRect) → weaved shared
+ *      texture + fence; GPU-waits the fence; presents the weaved handback via its
+ *      own DComp swap chain. Logs the per-frame round-trip latency.
+ *
+ * The DP does ALL weaving inside the runtime (ADR-007 / ADR-019). The weave is
+ * confined to a centred sub-rect; outside the rect the output stays transparent,
+ * so DComp shows the desktop and the sub-rect honouring is visible.
+ *
+ * Autonomous capture: `touch %TEMP%\weave_probe_trigger` dumps the weaved output
+ * to %TEMP%\weave_probe_output.bmp (the weave doesn't run inside
+ * multi_compositor_render, so the workspace screenshot trigger won't catch it).
+ *
+ * Run forced-IPC: set XRT_FORCE_MODE=ipc process-level, start displayxr-service,
+ * then launch this exe.
+ */
+
+#include "xr_session.h"
+#include "logging.h"
+
+#include <d3d11_4.h>
+#include <dxgi1_3.h>
+#include <dcomp.h>
+#include <wrl/client.h>
+
+#include <cstdint>
+#include <cstdio>
+#include <string>
+#include <vector>
+
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "dcomp.lib")
+
+using Microsoft::WRL::ComPtr;
+
+// ---- Layout constants -------------------------------------------------------
+static const uint32_t kWinW = 1280;
+static const uint32_t kWinH = 720;
+static const uint32_t kRectW = 640; //!< weaved sub-rect (per-view = kRectW)
+static const uint32_t kRectH = 360;
+
+// ---- Global D3D / window state ----------------------------------------------
+static HWND g_hwnd = nullptr;
+static bool g_quit = false;
+static bool g_resized = false;
+
+static ComPtr<ID3D11Device5> g_device;
+static ComPtr<ID3D11DeviceContext4> g_context;
+
+static ComPtr<IDCompositionDevice> g_dcompDevice;
+static ComPtr<IDCompositionTarget> g_dcompTarget;
+static ComPtr<IDCompositionVisual> g_dcompVisual;
+static ComPtr<IDXGISwapChain1> g_swapChain;
+
+// Pre-weave SBS input (keyed-mutex shared texture).
+static ComPtr<ID3D11Texture2D> g_sbsTex;
+static ComPtr<IDXGIKeyedMutex> g_sbsMutex;
+static HANDLE g_sbsHandle = nullptr; //!< NT handle passed to xrWeaveSubmitEXT
+
+// Weaved output handback (opened from the runtime's exported handles).
+static ComPtr<ID3D11Texture2D> g_weavedTex;
+static ComPtr<ID3D11Fence> g_weaveFence;
+static uint32_t g_weavedW = 0, g_weavedH = 0;
+
+// ---- Win32 window -----------------------------------------------------------
+static LRESULT CALLBACK
+WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	switch (msg) {
+	case WM_CLOSE: g_quit = true; return 0;
+	case WM_DESTROY: PostQuitMessage(0); return 0;
+	case WM_SIZE:
+		if (wParam != SIZE_MINIMIZED) {
+			g_resized = true;
+		}
+		return 0;
+	case WM_KEYDOWN:
+		if (wParam == VK_ESCAPE) {
+			g_quit = true;
+		}
+		return 0;
+	default: return DefWindowProc(hwnd, msg, wParam, lParam);
+	}
+}
+
+static bool
+CreateAppWindow(HINSTANCE hInst)
+{
+	WNDCLASSEXW wc = {sizeof(WNDCLASSEXW)};
+	wc.lpfnWndProc = WndProc;
+	wc.hInstance = hInst;
+	wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+	wc.lpszClassName = L"DXRWeaveRpcProbe";
+	RegisterClassExW(&wc);
+
+	RECT r = {0, 0, (LONG)kWinW, (LONG)kWinH};
+	AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, FALSE, WS_EX_NOREDIRECTIONBITMAP);
+	// WS_EX_NOREDIRECTIONBITMAP: required for a DComp-presented (alpha) window.
+	g_hwnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP, wc.lpszClassName, L"DisplayXR Weave RPC Probe (#625)",
+	                         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
+	                         nullptr, nullptr, hInst, nullptr);
+	if (!g_hwnd) {
+		LOG_ERROR("CreateWindowEx failed: %lu", GetLastError());
+		return false;
+	}
+	ShowWindow(g_hwnd, SW_SHOW);
+	return true;
+}
+
+// ---- D3D11 device on the OpenXR-required adapter -----------------------------
+static bool
+CreateDeviceOnAdapter(LUID luid)
+{
+	ComPtr<IDXGIFactory1> factory;
+	if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+		LOG_ERROR("CreateDXGIFactory1 failed");
+		return false;
+	}
+	ComPtr<IDXGIAdapter1> adapter, chosen;
+	for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++) {
+		DXGI_ADAPTER_DESC1 d = {};
+		adapter->GetDesc1(&d);
+		if (d.AdapterLuid.LowPart == luid.LowPart && d.AdapterLuid.HighPart == luid.HighPart) {
+			chosen = adapter;
+			break;
+		}
+	}
+	ComPtr<ID3D11Device> dev;
+	ComPtr<ID3D11DeviceContext> ctx;
+	D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_1;
+	UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT; // DComp needs BGRA support
+	HRESULT hr = D3D11CreateDevice(chosen.Get(), chosen ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
+	                               nullptr, flags, &fl, 1, D3D11_SDK_VERSION, &dev, nullptr, &ctx);
+	if (FAILED(hr)) {
+		LOG_ERROR("D3D11CreateDevice failed: 0x%08lx", hr);
+		return false;
+	}
+	if (FAILED(dev.As(&g_device)) || FAILED(ctx.As(&g_context))) {
+		LOG_ERROR("ID3D11Device5/Context4 not available");
+		return false;
+	}
+	return true;
+}
+
+// ---- DirectComposition transparent swap chain (caller-owned present) ---------
+static bool
+CreateCompositionSwapChain(uint32_t w, uint32_t h)
+{
+	ComPtr<IDXGIDevice> dxgiDevice;
+	g_device.As(&dxgiDevice);
+	ComPtr<IDXGIAdapter> adapter;
+	dxgiDevice->GetAdapter(&adapter);
+	ComPtr<IDXGIFactory2> factory;
+	adapter->GetParent(IID_PPV_ARGS(&factory));
+
+	DXGI_SWAP_CHAIN_DESC1 sd = {};
+	sd.Width = w;
+	sd.Height = h;
+	sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	sd.SampleDesc.Count = 1;
+	sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+	sd.BufferCount = 2;
+	sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+	sd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+	HRESULT hr = factory->CreateSwapChainForComposition(g_device.Get(), &sd, nullptr, &g_swapChain);
+	if (FAILED(hr)) {
+		LOG_ERROR("CreateSwapChainForComposition failed: 0x%08lx", hr);
+		return false;
+	}
+
+	if (!g_dcompDevice) {
+		hr = DCompositionCreateDevice(dxgiDevice.Get(), IID_PPV_ARGS(&g_dcompDevice));
+		if (FAILED(hr)) {
+			LOG_ERROR("DCompositionCreateDevice failed: 0x%08lx", hr);
+			return false;
+		}
+		hr = g_dcompDevice->CreateTargetForHwnd(g_hwnd, TRUE, &g_dcompTarget);
+		if (FAILED(hr)) {
+			LOG_ERROR("CreateTargetForHwnd failed: 0x%08lx", hr);
+			return false;
+		}
+		g_dcompDevice->CreateVisual(&g_dcompVisual);
+	}
+	g_dcompVisual->SetContent(g_swapChain.Get());
+	g_dcompTarget->SetRoot(g_dcompVisual.Get());
+	g_dcompDevice->Commit();
+	return true;
+}
+
+// ---- Pre-weave SBS test texture (left red / right blue, keyed mutex) ---------
+static bool
+CreateSbsTexture()
+{
+	const uint32_t w = kRectW * 2; // two views side by side
+	const uint32_t h = kRectH;
+
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w;
+	td.Height = h;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+	if (FAILED(g_device->CreateTexture2D(&td, nullptr, &g_sbsTex))) {
+		LOG_ERROR("SBS CreateTexture2D failed");
+		return false;
+	}
+	if (FAILED(g_sbsTex.As(&g_sbsMutex))) {
+		LOG_ERROR("SBS texture has no keyed mutex");
+		return false;
+	}
+	ComPtr<IDXGIResource1> res1;
+	if (FAILED(g_sbsTex.As(&res1)) ||
+	    FAILED(res1->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr,
+	                                    &g_sbsHandle))) {
+		LOG_ERROR("SBS CreateSharedHandle failed");
+		return false;
+	}
+
+	// Fill: left half red, right half blue (R8G8B8A8, opaque).
+	std::vector<uint32_t> pixels((size_t)w * h);
+	for (uint32_t y = 0; y < h; y++) {
+		for (uint32_t x = 0; x < w; x++) {
+			// 0xAABBGGRR memory layout for R8G8B8A8_UNORM.
+			pixels[(size_t)y * w + x] = (x < w / 2) ? 0xFF0000FFu /*red*/ : 0xFFFF0000u /*blue*/;
+		}
+	}
+	D3D11_TEXTURE2D_DESC sd = td;
+	sd.Usage = D3D11_USAGE_STAGING;
+	sd.BindFlags = 0;
+	sd.MiscFlags = 0;
+	sd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+	ComPtr<ID3D11Texture2D> staging;
+	if (FAILED(g_device->CreateTexture2D(&sd, nullptr, &staging))) {
+		LOG_ERROR("SBS staging create failed");
+		return false;
+	}
+	D3D11_MAPPED_SUBRESOURCE m = {};
+	if (FAILED(g_context->Map(staging.Get(), 0, D3D11_MAP_WRITE, 0, &m))) {
+		LOG_ERROR("SBS staging map failed");
+		return false;
+	}
+	for (uint32_t y = 0; y < h; y++) {
+		memcpy((uint8_t *)m.pData + (size_t)y * m.RowPitch, &pixels[(size_t)y * w], (size_t)w * 4);
+	}
+	g_context->Unmap(staging.Get(), 0);
+
+	// Write into the shared texture under the keyed mutex, then hand it to the
+	// service (key 0 = "producer done"). After this one write the content is
+	// static; the service re-acquires key 0 each weave_submit.
+	if (g_sbsMutex->AcquireSync(0, 1000) != S_OK) {
+		LOG_ERROR("SBS AcquireSync failed");
+		return false;
+	}
+	g_context->CopyResource(g_sbsTex.Get(), staging.Get());
+	g_context->Flush();
+	g_sbsMutex->ReleaseSync(0);
+	LOG_INFO("Pre-weave SBS texture ready (%ux%u, L=red R=blue, NT handle=%p)", w, h, g_sbsHandle);
+	return true;
+}
+
+// ---- Open the runtime's exported weaved texture + fence ----------------------
+static bool
+OpenWeavedHandback(const XrWeaveOutputEXT &out)
+{
+	g_weavedTex.Reset();
+	g_weaveFence.Reset();
+	if (out.weavedTexture != nullptr) {
+		HRESULT hr = g_device->OpenSharedResource1((HANDLE)out.weavedTexture, IID_PPV_ARGS(&g_weavedTex));
+		CloseHandle((HANDLE)out.weavedTexture); // caller owns the duplicated handle
+		if (FAILED(hr)) {
+			LOG_ERROR("OpenSharedResource1(weaved) failed: 0x%08lx", hr);
+			return false;
+		}
+	}
+	if (out.fence != nullptr) {
+		HRESULT hr = g_device->OpenSharedFence((HANDLE)out.fence, IID_PPV_ARGS(&g_weaveFence));
+		CloseHandle((HANDLE)out.fence);
+		if (FAILED(hr)) {
+			LOG_ERROR("OpenSharedFence failed: 0x%08lx", hr);
+			return false;
+		}
+	}
+	g_weavedW = out.width;
+	g_weavedH = out.height;
+	LOG_INFO("Opened weaved handback: %ux%u (tex=%p fence=%p)", g_weavedW, g_weavedH, (void *)g_weavedTex.Get(),
+	         (void *)g_weaveFence.Get());
+	return true;
+}
+
+// ---- Autonomous capture: dump the weaved texture to a BMP on file trigger ----
+static void
+MaybeDumpWeaved()
+{
+	char trig[MAX_PATH], outp[MAX_PATH];
+	const char *tmp = getenv("TEMP");
+	if (!tmp) {
+		tmp = "C:\\Temp";
+	}
+	snprintf(trig, sizeof(trig), "%s\\weave_probe_trigger", tmp);
+	if (GetFileAttributesA(trig) == INVALID_FILE_ATTRIBUTES || !g_weavedTex) {
+		return;
+	}
+	DeleteFileA(trig);
+	snprintf(outp, sizeof(outp), "%s\\weave_probe_output.bmp", tmp);
+
+	D3D11_TEXTURE2D_DESC td = {};
+	g_weavedTex->GetDesc(&td);
+	D3D11_TEXTURE2D_DESC sd = td;
+	sd.Usage = D3D11_USAGE_STAGING;
+	sd.BindFlags = 0;
+	sd.MiscFlags = 0;
+	sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	ComPtr<ID3D11Texture2D> staging;
+	if (FAILED(g_device->CreateTexture2D(&sd, nullptr, &staging))) {
+		return;
+	}
+	g_context->CopyResource(staging.Get(), g_weavedTex.Get());
+	g_context->Flush();
+	D3D11_MAPPED_SUBRESOURCE m = {};
+	if (FAILED(g_context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m))) {
+		return;
+	}
+	const uint32_t w = td.Width, h = td.Height;
+	const uint32_t rowBytes = w * 3;
+	const uint32_t padded = (rowBytes + 3) & ~3u;
+	const uint32_t imgSize = padded * h;
+#pragma pack(push, 1)
+	struct {
+		uint16_t bfType;
+		uint32_t bfSize;
+		uint16_t r1, r2;
+		uint32_t bfOff;
+		uint32_t biSize;
+		int32_t biW, biH;
+		uint16_t biPlanes, biBpp;
+		uint32_t biComp, biImg;
+		int32_t biXppm, biYppm;
+		uint32_t biClr, biImp;
+	} hdr = {};
+#pragma pack(pop)
+	hdr.bfType = 0x4D42;
+	hdr.bfOff = sizeof(hdr);
+	hdr.bfSize = sizeof(hdr) + imgSize;
+	hdr.biSize = 40;
+	hdr.biW = (int32_t)w;
+	hdr.biH = (int32_t)h; // bottom-up
+	hdr.biPlanes = 1;
+	hdr.biBpp = 24;
+	hdr.biImg = imgSize;
+	FILE *f = fopen(outp, "wb");
+	if (f) {
+		fwrite(&hdr, sizeof(hdr), 1, f);
+		std::vector<uint8_t> row(padded, 0);
+		for (int32_t y = (int32_t)h - 1; y >= 0; y--) {
+			const uint8_t *src = (const uint8_t *)m.pData + (size_t)y * m.RowPitch;
+			for (uint32_t x = 0; x < w; x++) {
+				// R8G8B8A8 src -> BGR bmp
+				row[x * 3 + 0] = src[x * 4 + 2];
+				row[x * 3 + 1] = src[x * 4 + 1];
+				row[x * 3 + 2] = src[x * 4 + 0];
+			}
+			fwrite(row.data(), padded, 1, f);
+		}
+		fclose(f);
+		LOG_INFO("Dumped weaved output to %s (%ux%u)", outp, w, h);
+	}
+	g_context->Unmap(staging.Get(), 0);
+}
+
+// -----------------------------------------------------------------------------
+int WINAPI
+wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
+{
+	InitializeLogging("weave_rpc_probe_d3d11_win");
+	LOG_INFO("=== XR_EXT_weave probe (#625) starting ===");
+
+	XrSessionManager xr;
+	if (!InitializeOpenXR(xr)) {
+		return 1;
+	}
+	LUID luid = {};
+	if (!GetD3D11GraphicsRequirements(xr, &luid)) {
+		return 1;
+	}
+	if (!CreateAppWindow(hInst)) {
+		return 1;
+	}
+	if (!CreateDeviceOnAdapter(luid)) {
+		return 1;
+	}
+	if (!CreateCompositionSwapChain(kWinW, kWinH)) {
+		return 1;
+	}
+	if (!CreateSbsTexture()) {
+		return 1;
+	}
+	if (!CreateSession(xr, g_device.Get(), g_hwnd)) {
+		return 1;
+	}
+
+	// Pump events until the session is running (PollEvents calls xrBeginSession
+	// on READY).
+	LOG_INFO("Waiting for session to start...");
+	for (int i = 0; i < 2000 && !xr.sessionRunning && !g_quit; i++) {
+		MSG msg;
+		while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+		}
+		PollEvents(xr);
+		Sleep(2);
+	}
+	if (!xr.sessionRunning) {
+		LOG_ERROR("Session never reached running state");
+		return 1;
+	}
+
+	// Bind the present-owner window for DP phase-snap.
+	XrResult br = g_pfnWeaveBindWindow(xr.session, (void *)g_hwnd);
+	LogXrResult("xrWeaveBindWindowEXT", br);
+	if (XR_FAILED(br)) {
+		return 1;
+	}
+
+	LARGE_INTEGER freq;
+	QueryPerformanceFrequency(&freq);
+	double latSum = 0.0;
+	uint32_t latCount = 0;
+	uint64_t frame = 0;
+	bool haveHandback = false;
+
+	LOG_INFO("Entering weave loop (ESC / close to quit)...");
+	while (!g_quit && !xr.exitRequested) {
+		MSG msg;
+		while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+		}
+		PollEvents(xr);
+
+		if (g_resized) {
+			g_resized = false;
+			RECT rc = {};
+			GetClientRect(g_hwnd, &rc);
+			uint32_t cw = (uint32_t)(rc.right - rc.left), ch = (uint32_t)(rc.bottom - rc.top);
+			if (cw > 0 && ch > 0) {
+				g_weavedTex.Reset();
+				g_swapChain->ResizeBuffers(0, cw, ch, DXGI_FORMAT_UNKNOWN, 0);
+				haveHandback = false; // force re-open of the resized weaved output
+			}
+		}
+
+		// Centre the weaved sub-rect in the current client area.
+		RECT rc = {};
+		GetClientRect(g_hwnd, &rc);
+		int32_t cw = rc.right - rc.left, ch = rc.bottom - rc.top;
+		uint32_t rw = (uint32_t)min((int32_t)kRectW, cw);
+		uint32_t rh = (uint32_t)min((int32_t)kRectH, ch);
+		int32_t rx = (cw - (int32_t)rw) / 2;
+		int32_t ry = (ch - (int32_t)rh) / 2;
+
+		XrWeaveSubmitInfoEXT in = {XR_TYPE_WEAVE_SUBMIT_INFO_EXT};
+		in.inputTexture = (void *)g_sbsHandle;
+		in.inputIsDxgi = XR_FALSE;
+		in.rect.offset.x = rx;
+		in.rect.offset.y = ry;
+		in.rect.extent.width = (int32_t)rw;
+		in.rect.extent.height = (int32_t)rh;
+		in.eyeCount = 0; // Phase 1: eyes unused; the DP's tracked eyes drive.
+
+		XrWeaveOutputEXT out = {XR_TYPE_WEAVE_OUTPUT_EXT};
+
+		LARGE_INTEGER t0, t1;
+		QueryPerformanceCounter(&t0);
+		XrResult sr = g_pfnWeaveSubmit(xr.session, &in, &out);
+		QueryPerformanceCounter(&t1);
+
+		if (XR_FAILED(sr)) {
+			LogXrResult("xrWeaveSubmitEXT", sr);
+			Sleep(100);
+			continue;
+		}
+
+		double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
+		latSum += ms;
+		latCount++;
+
+		if (!haveHandback || out.weavedTexture != nullptr) {
+			if (!OpenWeavedHandback(out)) {
+				Sleep(100);
+				continue;
+			}
+			haveHandback = true;
+		}
+
+		// GPU-wait the service's signal, then present the weaved texture.
+		if (g_weaveFence) {
+			g_context->Wait(g_weaveFence.Get(), out.fenceValue);
+		}
+		if (g_weavedTex && g_swapChain) {
+			ComPtr<ID3D11Texture2D> back;
+			if (SUCCEEDED(g_swapChain->GetBuffer(0, IID_PPV_ARGS(&back)))) {
+				g_context->CopyResource(back.Get(), g_weavedTex.Get());
+			}
+			g_swapChain->Present(1, 0);
+			if (g_dcompDevice) {
+				g_dcompDevice->Commit();
+			}
+		}
+
+		MaybeDumpWeaved();
+
+		if ((frame % 120) == 0 && latCount > 0) {
+			LOG_INFO("weave round-trip: last=%.3f ms, avg=%.3f ms (%u frames), out=%ux%u rect=%d,%d %ux%u",
+			         ms, latSum / latCount, latCount, out.width, out.height, rx, ry, rw, rh);
+		}
+		frame++;
+	}
+
+	if (latCount > 0) {
+		LOG_INFO("=== weave probe done: %u frames, avg round-trip %.3f ms ===", latCount, latSum / latCount);
+	}
+	CleanupOpenXR(xr);
+	ShutdownLogging();
+	return 0;
+}

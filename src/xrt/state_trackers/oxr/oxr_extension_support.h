@@ -637,6 +637,22 @@
 
 
 /*
+ * XR_EXT_weave
+ *
+ * Hand-added DisplayXR extension (generate_oxr_ext_support.py knows nothing of
+ * the DisplayXR blocks — keep them when regenerating). Win32-only: the weave
+ * service is implemented on the D3D11 service compositor (#625).
+ */
+#if defined(XR_EXT_weave) && defined(XR_USE_PLATFORM_WIN32)
+#define OXR_HAVE_EXT_weave
+#define OXR_EXTENSION_SUPPORT_EXT_weave(_) \
+    _(EXT_weave, EXT_WEAVE)
+#else
+#define OXR_EXTENSION_SUPPORT_EXT_weave(_)
+#endif
+
+
+/*
  * XR_EXT_workspace_file_dialog
  */
 #if defined(XR_EXT_workspace_file_dialog) && defined(XR_USE_PLATFORM_WIN32)
@@ -1142,6 +1158,7 @@
     OXR_EXTENSION_SUPPORT_EXT_local_3d_zone(_) \
     OXR_EXTENSION_SUPPORT_EXT_view_rig(_) \
     OXR_EXTENSION_SUPPORT_EXT_display_zones(_) \
+    OXR_EXTENSION_SUPPORT_EXT_weave(_) \
     OXR_EXTENSION_SUPPORT_EXT_workspace_file_dialog(_) \
     OXR_EXTENSION_SUPPORT_EXT_mcp_tools(_) \
     OXR_EXTENSION_SUPPORT_BD_controller_interaction(_) \

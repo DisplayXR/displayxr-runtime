@@ -913,6 +913,61 @@ bool
 comp_d3d11_service_compositor_export_transparent_output_fence(struct xrt_compositor *xc,
                                                               xrt_graphics_sync_handle_t *out_handle);
 
+/*!
+ * XR_EXT_weave (#625) — window-bound synchronous weave service. An ADDITIVE
+ * path, distinct from the steady swapchain frame loop: the caller (a
+ * present-owner) hands a pre-weave SBS texture + a window-relative rect, the DP
+ * weaves the sub-rect into a server-allocated output texture, and the caller
+ * presents the result itself. The DP does ALL weaving (ADR-007 / ADR-019); this
+ * is wire plumbing + the texture/fence handback (generalizes the #551
+ * transparent-output handback to a caller input texture + an output sub-rect).
+ *
+ * All four return false when @p xc is not a D3D11 service compositor.
+ *
+ * @c weave_bind_window stores the present-owner's HWND for DP phase-snap.
+ */
+bool
+comp_d3d11_service_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd);
+
+/*!
+ * Import the caller's pre-weave SBS texture, run the DP weave into the
+ * (server-allocated, bound-window-sized) output texture confined to @p rect_*
+ * via canvas_offset/size, signal the output fence, and return the output dims +
+ * the fence value the caller waits on. Synchronous. @p eyes is carried but
+ * UNUSED in Phase 1 — the DP's tracked eyes drive the weave.
+ */
+bool
+comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
+                               xrt_graphics_buffer_handle_t in_handle,
+                               bool in_is_dxgi,
+                               int32_t rect_x,
+                               int32_t rect_y,
+                               uint32_t rect_w,
+                               uint32_t rect_h,
+                               const struct xrt_vec3 *eyes,
+                               uint32_t eye_count,
+                               uint32_t *out_width,
+                               uint32_t *out_height,
+                               uint64_t *out_fence_value);
+
+/*!
+ * Export the persistent server-allocated weaved-output texture handle (+ dims)
+ * for the caller to import once and present each frame. Returns false until the
+ * first successful @ref comp_d3d11_service_weave_submit has allocated it.
+ */
+bool
+comp_d3d11_service_weave_export_output(struct xrt_compositor *xc,
+                                       xrt_graphics_buffer_handle_t *out_handle,
+                                       uint32_t *out_width,
+                                       uint32_t *out_height);
+
+/*!
+ * Export the service→caller weave fence handle (the service signals it after
+ * each weave; the caller GPU-waits before presenting).
+ */
+bool
+comp_d3d11_service_weave_export_fence(struct xrt_compositor *xc, xrt_graphics_sync_handle_t *out_handle);
+
 /*! @} */
 
 

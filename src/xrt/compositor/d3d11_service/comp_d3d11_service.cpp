@@ -256,6 +256,26 @@ struct d3d11_client_render_resources
 	uint32_t                              transparent_output_w;
 	uint32_t                              transparent_output_h;
 
+	//! XR_EXT_weave (#625) — ADDITIVE window-bound synchronous weave service.
+	//! Distinct from the steady swap-chain path above: a present-owner hands a
+	//! pre-weave SBS texture + a window-relative rect and the DP weaves the
+	//! sub-rect into weave_output_texture (its RTV bound as the process_atlas
+	//! target), confined via canvas_offset/size. The caller imports
+	//! weave_output_texture + weave_fence (exported once) and presents itself.
+	//! Allocated lazily on the first weave_submit, re-allocated on resize.
+	//! weave_hwnd is the bound window for DP phase-snap. The fence is
+	//! service-signals / caller-waits (like transparent_output_fence) and bumps
+	//! once per submit.
+	HWND                                 weave_hwnd;
+	wil::com_ptr<ID3D11Texture2D>        weave_output_texture;
+	wil::com_ptr<ID3D11RenderTargetView> weave_output_rtv;
+	HANDLE                                weave_output_handle; //!< NT handle for IPC export
+	wil::com_ptr<ID3D11Fence>            weave_fence;
+	HANDLE                                weave_fence_handle;  //!< NT handle for IPC export
+	uint64_t                              weave_fence_value;   //!< signaled once per submit
+	uint32_t                              weave_output_w;
+	uint32_t                              weave_output_h;
+
 	//! Deferred auto-3D for no-zones standalone clients (#140 / no-zones-2D).
 	//! A non-workspace IPC handle app with no zone mask never triggers a 3D
 	//! request (the per-client DP is created mode-neutral to dodge the #140
@@ -2679,6 +2699,19 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	}
 	res->transparent_output_fence.reset();
 	res->transparent_output_texture.reset();
+
+	// #625 weave service: close the source NT handles + release resources.
+	if (res->weave_output_handle != nullptr) {
+		CloseHandle(res->weave_output_handle);
+		res->weave_output_handle = nullptr;
+	}
+	if (res->weave_fence_handle != nullptr) {
+		CloseHandle(res->weave_fence_handle);
+		res->weave_fence_handle = nullptr;
+	}
+	res->weave_output_rtv.reset();
+	res->weave_output_texture.reset();
+	res->weave_fence.reset();
 
 	res->swap_chain.reset();
 
@@ -11308,6 +11341,293 @@ comp_d3d11_service_compositor_export_transparent_output_fence(struct xrt_composi
 		return false;
 	}
 	*out_handle = (xrt_graphics_sync_handle_t)c->render.transparent_output_fence_handle;
+	return true;
+}
+
+
+/*
+ * XR_EXT_weave (#625) — window-bound synchronous weave service. ADDITIVE: these
+ * never run inside multi_compositor_render or the per-client commit and never
+ * Present. They reuse the per-client display processor (created bound to the
+ * caller's window in init_client_render_resources, so its phase reference is
+ * already the caller's window) and the #551 server-allocated shared-NThandle
+ * texture + fence handback idiom, generalized to a caller INPUT texture + an
+ * output sub-rect. The DP does all weaving (ADR-007 / ADR-019).
+ */
+
+//! (Re)allocate the server-owned weaved-output texture + RTV (+ the persistent
+//! fence on first use) sized to @p w × @p h. Caller holds sys->render_mutex.
+static bool
+weave_ensure_output(struct d3d11_service_compositor *c, uint32_t w, uint32_t h)
+{
+	struct d3d11_service_system *sys = c->sys;
+	if (c->render.weave_output_texture != nullptr && c->render.weave_output_w == w &&
+	    c->render.weave_output_h == h) {
+		return true; // already sized
+	}
+
+	// Tear down the old output texture/RTV/handle (fence is kept across resize —
+	// its value must stay monotonic for the caller's GPU wait).
+	if (c->render.weave_output_handle != nullptr) {
+		CloseHandle(c->render.weave_output_handle);
+		c->render.weave_output_handle = nullptr;
+	}
+	c->render.weave_output_rtv.reset();
+	c->render.weave_output_texture.reset();
+
+	D3D11_TEXTURE2D_DESC od = {};
+	od.Width = w;
+	od.Height = h;
+	od.MipLevels = 1;
+	od.ArraySize = 1;
+	od.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // premultiplied-alpha output the caller presents
+	od.SampleDesc.Count = 1;
+	od.Usage = D3D11_USAGE_DEFAULT;
+	od.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+	od.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+	HRESULT hr = sys->device->CreateTexture2D(&od, nullptr, c->render.weave_output_texture.put());
+	if (SUCCEEDED(hr)) {
+		hr = sys->device->CreateRenderTargetView(c->render.weave_output_texture.get(), nullptr,
+		                                         c->render.weave_output_rtv.put());
+	}
+	wil::com_ptr<IDXGIResource1> dxgi_res1;
+	if (SUCCEEDED(hr)) {
+		hr = c->render.weave_output_texture->QueryInterface(IID_PPV_ARGS(dxgi_res1.put()));
+	}
+	if (SUCCEEDED(hr)) {
+		hr = dxgi_res1->CreateSharedHandle(nullptr,
+		                                   DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr,
+		                                   &c->render.weave_output_handle);
+	}
+	// Service→caller fence: signaled after each weave, caller waits before present.
+	if (SUCCEEDED(hr) && c->render.weave_fence == nullptr) {
+		hr = sys->device->CreateFence(0, D3D11_FENCE_FLAG_SHARED, IID_PPV_ARGS(c->render.weave_fence.put()));
+		if (SUCCEEDED(hr)) {
+			hr = c->render.weave_fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr,
+			                                               &c->render.weave_fence_handle);
+		}
+	}
+	if (FAILED(hr)) {
+		U_LOG_E("#625 weave: output texture/fence create failed: 0x%08lx", hr);
+		if (c->render.weave_output_handle != nullptr) {
+			CloseHandle(c->render.weave_output_handle);
+			c->render.weave_output_handle = nullptr;
+		}
+		c->render.weave_output_rtv.reset();
+		c->render.weave_output_texture.reset();
+		return false;
+	}
+	c->render.weave_output_w = w;
+	c->render.weave_output_h = h;
+	U_LOG_W("#625 weave: server output %ux%u shared texture + service→caller fence ready", w, h);
+	return true;
+}
+
+extern "C" bool
+comp_d3d11_service_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd)
+{
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return false;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	c->render.weave_hwnd = (HWND)(uintptr_t)hwnd;
+	// Ensure the panel is in 3D mode so the DP actually weaves (a present-owner
+	// that only drives weave_submit never goes through the steady mode path).
+	if (c->render.display_processor != nullptr) {
+		xrt_display_processor_d3d11_request_display_mode(c->render.display_processor, true);
+	}
+	U_LOG_W("#625 weave: bound present-owner window hwnd=%p", (void *)c->render.weave_hwnd);
+	return true;
+}
+
+extern "C" bool
+comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
+                               xrt_graphics_buffer_handle_t in_handle,
+                               bool in_is_dxgi,
+                               int32_t rect_x,
+                               int32_t rect_y,
+                               uint32_t rect_w,
+                               uint32_t rect_h,
+                               const struct xrt_vec3 *eyes,
+                               uint32_t eye_count,
+                               uint32_t *out_width,
+                               uint32_t *out_height,
+                               uint64_t *out_fence_value)
+{
+	// Phase 1: eyes are carried on the wire but UNUSED — the DP's tracked eyes
+	// drive the weave (process_atlas takes no eye params by design).
+	(void)eyes;
+	(void)eye_count;
+
+	if (out_width != nullptr) {
+		*out_width = 0;
+	}
+	if (out_height != nullptr) {
+		*out_height = 0;
+	}
+	if (out_fence_value != nullptr) {
+		*out_fence_value = 0;
+	}
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return false;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	struct d3d11_service_system *sys = c->sys;
+	if (sys == nullptr || c->render.display_processor == nullptr) {
+		return false;
+	}
+	HANDLE in = (HANDLE)in_handle;
+	if (in == nullptr || in == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+
+	// Serialize with the render thread — sys->context is the (non-thread-safe)
+	// immediate context shared with multi_compositor_render.
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+
+	// Output is sized to the bound window's client area so the weave phase is
+	// correct at the window's absolute screen position; the sub-rect is confined
+	// via canvas_offset/size. Fall back to the per-client window, then the rect.
+	uint32_t win_w = 0, win_h = 0;
+	HWND wnd = c->render.weave_hwnd != nullptr ? c->render.weave_hwnd : c->render.hwnd;
+	if (wnd != nullptr) {
+		RECT cr = {};
+		if (GetClientRect(wnd, &cr)) {
+			win_w = (uint32_t)(cr.right - cr.left);
+			win_h = (uint32_t)(cr.bottom - cr.top);
+		}
+	}
+	if (win_w == 0 || win_h == 0) {
+		win_w = (rect_x > 0 ? (uint32_t)rect_x : 0) + rect_w;
+		win_h = (rect_y > 0 ? (uint32_t)rect_y : 0) + rect_h;
+	}
+	if (win_w == 0 || win_h == 0) {
+		return false;
+	}
+
+	if (!weave_ensure_output(c, win_w, win_h)) {
+		return false;
+	}
+
+	// Import the caller's pre-weave SBS input texture (NT or legacy DXGI handle).
+	wil::com_ptr<ID3D11Texture2D> in_tex;
+	HRESULT hr;
+	if (in_is_dxgi) {
+		hr = sys->device->OpenSharedResource(in, IID_PPV_ARGS(in_tex.put()));
+	} else {
+		hr = sys->device->OpenSharedResource1(in, IID_PPV_ARGS(in_tex.put()));
+	}
+	if (FAILED(hr) || !in_tex) {
+		U_LOG_E("#625 weave: OpenSharedResource(%s) failed: 0x%08lx", in_is_dxgi ? "DXGI" : "NT", hr);
+		return false;
+	}
+
+	D3D11_TEXTURE2D_DESC idesc = {};
+	in_tex->GetDesc(&idesc);
+
+	wil::com_ptr<ID3D11ShaderResourceView> in_srv;
+	D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+	sd.Format = idesc.Format;
+	sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	sd.Texture2D.MipLevels = 1;
+	hr = sys->device->CreateShaderResourceView(in_tex.get(), &sd, in_srv.put());
+	if (FAILED(hr)) {
+		U_LOG_E("#625 weave: CreateShaderResourceView failed: 0x%08lx", hr);
+		return false;
+	}
+
+	// Input sync: the caller signals key 0 ("done writing") via IDXGIKeyedMutex.
+	// The service does not import caller fences (compositor_import_fence is a
+	// stub), so the keyed mutex is the input-ready guarantee.
+	wil::com_ptr<IDXGIKeyedMutex> in_km;
+	(void)in_tex->QueryInterface(IID_PPV_ARGS(in_km.put()));
+	bool acquired = false;
+	if (in_km) {
+		hr = in_km->AcquireSync(0, 1000);
+		if (FAILED(hr) || hr == static_cast<HRESULT>(WAIT_TIMEOUT)) {
+			U_LOG_W("#625 weave: input AcquireSync failed/timed out: 0x%08lx", hr);
+			return false;
+		}
+		acquired = true;
+	}
+
+	// Pre-weave content is side-by-side stereo: 2 columns × 1 row, per-view dims
+	// = half width × full height. The DP weaves into the bound RTV, confined to
+	// the sub-rect via canvas_offset/size at the correct absolute phase.
+	uint32_t view_w = idesc.Width / 2;
+	uint32_t view_h = idesc.Height;
+
+	ID3D11RenderTargetView *rtvs[] = {c->render.weave_output_rtv.get()};
+	sys->context->OMSetRenderTargets(1, rtvs, nullptr);
+	xrt_display_processor_d3d11_process_atlas(c->render.display_processor, sys->context.get(), in_srv.get(),
+	                                          view_w, view_h, /*tile_columns*/ 2, /*tile_rows*/ 1,
+	                                          DXGI_FORMAT_R8G8B8A8_UNORM, win_w, win_h, rect_x, rect_y, rect_w,
+	                                          rect_h);
+
+	if (acquired && in_km) {
+		in_km->ReleaseSync(0);
+	}
+
+	// Signal the fence and flush so the GPU work + signal are submitted (there is
+	// no Present to flush this standalone path), then the caller's Wait completes.
+	c->render.weave_fence_value++;
+	sys->context->Signal(c->render.weave_fence.get(), c->render.weave_fence_value);
+	sys->context->Flush();
+
+	if (out_width != nullptr) {
+		*out_width = win_w;
+	}
+	if (out_height != nullptr) {
+		*out_height = win_h;
+	}
+	if (out_fence_value != nullptr) {
+		*out_fence_value = c->render.weave_fence_value;
+	}
+	return true;
+}
+
+extern "C" bool
+comp_d3d11_service_weave_export_output(struct xrt_compositor *xc,
+                                      xrt_graphics_buffer_handle_t *out_handle,
+                                      uint32_t *out_width,
+                                      uint32_t *out_height)
+{
+	if (out_handle == nullptr) {
+		return false;
+	}
+	*out_handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return false;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	if (c->render.weave_output_handle == nullptr) {
+		return false;
+	}
+	*out_handle = (xrt_graphics_buffer_handle_t)c->render.weave_output_handle;
+	if (out_width != nullptr) {
+		*out_width = c->render.weave_output_w;
+	}
+	if (out_height != nullptr) {
+		*out_height = c->render.weave_output_h;
+	}
+	return true;
+}
+
+extern "C" bool
+comp_d3d11_service_weave_export_fence(struct xrt_compositor *xc, xrt_graphics_sync_handle_t *out_handle)
+{
+	if (out_handle == nullptr) {
+		return false;
+	}
+	*out_handle = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return false;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	if (c->render.weave_fence_handle == nullptr) {
+		return false;
+	}
+	*out_handle = (xrt_graphics_sync_handle_t)c->render.weave_fence_handle;
 	return true;
 }
 

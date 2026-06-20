@@ -234,6 +234,15 @@ if exist "%REPO%test_apps\cube_zones_texture_d3d11_win\CMakeLists.txt" (
     if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_zones_texture_d3d11_win\build\" >nul
 )
 
+:: weave_rpc_probe_d3d11_win (XR_EXT_weave probe, #625)
+if exist "%REPO%test_apps\weave_rpc_probe_d3d11_win\CMakeLists.txt" (
+    echo --- weave_rpc_probe_d3d11_win ---
+    cmake -S "%REPO%\test_apps\weave_rpc_probe_d3d11_win" -B "%REPO%\test_apps\weave_rpc_probe_d3d11_win\build" -G Ninja ^
+        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
+    cmake --build "%REPO%\test_apps\weave_rpc_probe_d3d11_win\build" || set TESTAPP_FAILED=1
+    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\weave_rpc_probe_d3d11_win\build\" >nul
+)
+
 :: cube_hosted_d3d11_win
 if exist "%REPO%test_apps\cube_hosted_d3d11_win\CMakeLists.txt" (
     echo --- cube_hosted_d3d11_win ---

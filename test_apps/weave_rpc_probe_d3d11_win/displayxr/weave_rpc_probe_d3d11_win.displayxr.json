@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "name": "Weave RPC Probe D3D11",
+  "id": "weave-rpc-probe-d3d11",
+  "type": "3d",
+  "category": "test",
+  "display_mode": "auto",
+  "description": "XR_EXT_weave probe (#625): a browser-free present-owner that drives the window-bound synchronous weave service. Binds its window, hands the runtime a pre-weave SBS texture + a window-relative rect per frame via xrWeaveSubmitEXT, and presents the weaved handback via its own DirectComposition swap chain. Validates the DP weave round-trip and per-frame latency with zero browser.",
+  "icon": "icon.png",
+  "icon_3d": "icon_sbs.png",
+  "icon_3d_layout": "sbs-lr"
+}

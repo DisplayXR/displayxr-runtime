@@ -5301,6 +5301,151 @@ ipc_handle_compositor_get_transparent_output_fence(volatile struct ipc_client_st
 	return XRT_SUCCESS;
 }
 
+/*
+ * XR_EXT_weave (#625) — window-bound synchronous weave service. The DP weaves
+ * server-side (ADR-007 / ADR-019); these handlers only marshal the wire to the
+ * D3D11 service compositor's additive weave entry points. D3D11-service-only,
+ * exactly as the transparent-output path above.
+ */
+xrt_result_t
+ipc_handle_weave_bind_window(volatile struct ipc_client_state *ics, uint64_t hwnd)
+{
+	IPC_TRACE_MARKER();
+
+	if (ics->xc == NULL) {
+		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (!comp_d3d11_service_weave_bind_window(ics->xc, hwnd)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return XRT_SUCCESS;
+#else
+	(void)hwnd;
+	return XRT_ERROR_FEATURE_UNSUPPORTED;
+#endif
+}
+
+xrt_result_t
+ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
+                        const struct ipc_arg_weave_submit *args,
+                        bool *out_have_output,
+                        uint32_t *out_width,
+                        uint32_t *out_height,
+                        uint64_t *out_fence_value,
+                        const xrt_graphics_buffer_handle_t *handles,
+                        uint32_t handle_count)
+{
+	IPC_TRACE_MARKER();
+
+	*out_have_output = false;
+	*out_width = 0;
+	*out_height = 0;
+	*out_fence_value = 0;
+
+	if (ics->xc == NULL || handle_count < 1) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// Decode the DXGI-vs-NT low-bit tag (same convention as swapchain_import).
+	xrt_graphics_buffer_handle_t in_handle = handles[0];
+	bool in_is_dxgi = false;
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+	if ((size_t)in_handle & 1) {
+		in_handle = (HANDLE)((size_t)in_handle - 1);
+		in_is_dxgi = true;
+	}
+#endif
+
+	uint32_t w = 0, h = 0;
+	uint64_t fv = 0;
+	bool ok = comp_d3d11_service_weave_submit( //
+	    ics->xc, in_handle, in_is_dxgi,        //
+	    args->rect_x, args->rect_y, args->rect_w, args->rect_h, args->eyes, args->eye_count, &w, &h, &fv);
+	if (!ok) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_have_output = true;
+	*out_width = w;
+	*out_height = h;
+	*out_fence_value = fv;
+	return XRT_SUCCESS;
+#else
+	(void)args;
+	(void)handles;
+	return XRT_ERROR_FEATURE_UNSUPPORTED;
+#endif
+}
+
+xrt_result_t
+ipc_handle_weave_get_output(volatile struct ipc_client_state *ics,
+                            bool *out_have_output,
+                            uint32_t *out_width,
+                            uint32_t *out_height,
+                            uint32_t max_handle_count,
+                            xrt_graphics_buffer_handle_t *out_handles,
+                            uint32_t *out_handle_count)
+{
+	IPC_TRACE_MARKER();
+
+	*out_have_output = false;
+	*out_width = 0;
+	*out_height = 0;
+	*out_handle_count = 0;
+
+	if (ics->xc == NULL || max_handle_count < 1) {
+		return XRT_SUCCESS;
+	}
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	xrt_graphics_buffer_handle_t h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	uint32_t w = 0, ht = 0;
+	if (comp_d3d11_service_weave_export_output(ics->xc, &h, &w, &ht)) {
+		out_handles[0] = h;
+		*out_handle_count = 1;
+		*out_have_output = true;
+		*out_width = w;
+		*out_height = ht;
+	}
+#else
+	(void)out_handles;
+#endif
+
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_weave_get_fence(volatile struct ipc_client_state *ics,
+                           bool *out_have_fence,
+                           uint32_t max_handle_count,
+                           xrt_graphics_sync_handle_t *out_handles,
+                           uint32_t *out_handle_count)
+{
+	IPC_TRACE_MARKER();
+
+	*out_have_fence = false;
+	*out_handle_count = 0;
+
+	if (ics->xc == NULL || max_handle_count < 1) {
+		return XRT_SUCCESS;
+	}
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	xrt_graphics_sync_handle_t h = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+	if (comp_d3d11_service_weave_export_fence(ics->xc, &h)) {
+		out_handles[0] = h;
+		*out_handle_count = 1;
+		*out_have_fence = true;
+	}
+#else
+	(void)out_handles;
+#endif
+
+	return XRT_SUCCESS;
+}
+
 xrt_result_t
 ipc_handle_compositor_semaphore_destroy(volatile struct ipc_client_state *ics, uint32_t id)
 {

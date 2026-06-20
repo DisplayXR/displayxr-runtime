@@ -2355,6 +2355,21 @@ struct oxr_session
 	} display_zones;
 #endif
 
+#ifdef OXR_HAVE_EXT_weave
+	//! XR_EXT_weave (#625): per-session weave-service bookkeeping. The weaved
+	//! output texture + fence are runtime-allocated and persistent (re-used
+	//! across frames), so their shared HANDLEs are handed to the caller ONCE —
+	//! on the first xrWeaveSubmitEXT and again whenever the output is
+	//! re-allocated (window resize → dims change). @c exported latches the
+	//! one-shot; @c last_w/last_h detect the resize re-export.
+	struct
+	{
+		bool exported;
+		uint32_t last_w;
+		uint32_t last_h;
+	} weave;
+#endif
+
 	//! True if this session has successfully called xrActivateSpatialWorkspaceEXT
 	//! and is currently the active workspace controller (#234).
 	//! Workspace controllers are graphics-bound IPC sessions (typically the

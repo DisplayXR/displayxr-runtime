@@ -37,7 +37,8 @@ Rules:
 | 1000999160–166 | `XR_EXT_local_3d_zone` | relocated from 130–136 (collided with mcp_tools) — spec v4 |
 | 1000999170–171 | `XR_EXT_atlas_capture` | relocated from 120–121 (collided with workspace_file_dialog) — spec v3 |
 | 1000999180 | `XR_EXT_macos_gl_binding` | relocated from 1000999010 (collided with display_info) — spec v2 |
-| 1000999190+ | **next free** | |
+| 1000999190–191 | `XR_EXT_weave` | 190 = `XR_TYPE_WEAVE_SUBMIT_INFO_EXT`, 191 = `XR_TYPE_WEAVE_OUTPUT_EXT` (#625) |
+| 1000999200+ | **next free** | |
 
 `XR_EXT_android_surface_binding` defines no `1000999xxx` values in this
 directory as of this writing; if it gains any, claim a decade here first.
