@@ -933,8 +933,10 @@ comp_d3d11_service_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd);
  * Import the caller's pre-weave SBS texture, run the DP weave into the
  * (server-allocated, bound-window-sized) output texture confined to @p rect_*
  * via canvas_offset/size, signal the output fence, and return the output dims +
- * the fence value the caller waits on. Synchronous. @p eyes is carried but
- * UNUSED in Phase 1 — the DP's tracked eyes drive the weave.
+ * the fence value the caller waits on. Synchronous. Also returns the DP's
+ * current tracked eye positions in @p out_eyes — the interlace is DP-internal
+ * (reads the vendor tracker), so eyes flow OUT for the caller's off-axis
+ * (look-around) rendering, not in.
  */
 bool
 comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
@@ -944,11 +946,10 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                int32_t rect_y,
                                uint32_t rect_w,
                                uint32_t rect_h,
-                               const struct xrt_vec3 *eyes,
-                               uint32_t eye_count,
                                uint32_t *out_width,
                                uint32_t *out_height,
-                               uint64_t *out_fence_value);
+                               uint64_t *out_fence_value,
+                               struct xrt_eye_positions *out_eyes);
 
 /*!
  * Export the persistent server-allocated weaved-output texture handle (+ dims)

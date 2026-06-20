@@ -67,10 +67,15 @@ static ComPtr<IDCompositionTarget> g_dcompTarget;
 static ComPtr<IDCompositionVisual> g_dcompVisual;
 static ComPtr<IDXGISwapChain1> g_swapChain;
 
-// Pre-weave SBS input (keyed-mutex shared texture).
+// Pre-weave SBS input (keyed-mutex shared texture), re-rendered off-axis each
+// frame from the runtime's returned tracked eyes (look-around).
 static ComPtr<ID3D11Texture2D> g_sbsTex;
+static ComPtr<ID3D11RenderTargetView> g_sbsRtv;
 static ComPtr<IDXGIKeyedMutex> g_sbsMutex;
 static HANDLE g_sbsHandle = nullptr; //!< NT handle passed to xrWeaveSubmitEXT
+// Latest tracked per-eye horizontal position (metres, display space) returned by
+// the previous weave_submit; drives this frame's off-axis parallax. [0]=L [1]=R.
+static float g_lastEyeX[2] = {0.0f, 0.0f};
 
 // Weaved output handback (opened from the runtime's exported handles).
 static ComPtr<ID3D11Texture2D> g_weavedTex;
@@ -202,7 +207,7 @@ CreateCompositionSwapChain(uint32_t w, uint32_t h)
 	return true;
 }
 
-// ---- Pre-weave SBS test texture (left red / right blue, keyed mutex) ---------
+// ---- Pre-weave SBS texture (keyed-mutex shared, render-target) ---------------
 static bool
 CreateSbsTexture()
 {
@@ -217,10 +222,14 @@ CreateSbsTexture()
 	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 	td.SampleDesc.Count = 1;
 	td.Usage = D3D11_USAGE_DEFAULT;
-	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET; // RTV for per-frame ClearView
 	td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
 	if (FAILED(g_device->CreateTexture2D(&td, nullptr, &g_sbsTex))) {
 		LOG_ERROR("SBS CreateTexture2D failed");
+		return false;
+	}
+	if (FAILED(g_device->CreateRenderTargetView(g_sbsTex.Get(), nullptr, &g_sbsRtv))) {
+		LOG_ERROR("SBS CreateRenderTargetView failed");
 		return false;
 	}
 	if (FAILED(g_sbsTex.As(&g_sbsMutex))) {
@@ -234,47 +243,54 @@ CreateSbsTexture()
 		LOG_ERROR("SBS CreateSharedHandle failed");
 		return false;
 	}
-
-	// Fill: left half red, right half blue (R8G8B8A8, opaque).
-	std::vector<uint32_t> pixels((size_t)w * h);
-	for (uint32_t y = 0; y < h; y++) {
-		for (uint32_t x = 0; x < w; x++) {
-			// 0xAABBGGRR memory layout for R8G8B8A8_UNORM.
-			pixels[(size_t)y * w + x] = (x < w / 2) ? 0xFF0000FFu /*red*/ : 0xFFFF0000u /*blue*/;
-		}
-	}
-	D3D11_TEXTURE2D_DESC sd = td;
-	sd.Usage = D3D11_USAGE_STAGING;
-	sd.BindFlags = 0;
-	sd.MiscFlags = 0;
-	sd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-	ComPtr<ID3D11Texture2D> staging;
-	if (FAILED(g_device->CreateTexture2D(&sd, nullptr, &staging))) {
-		LOG_ERROR("SBS staging create failed");
-		return false;
-	}
-	D3D11_MAPPED_SUBRESOURCE m = {};
-	if (FAILED(g_context->Map(staging.Get(), 0, D3D11_MAP_WRITE, 0, &m))) {
-		LOG_ERROR("SBS staging map failed");
-		return false;
-	}
-	for (uint32_t y = 0; y < h; y++) {
-		memcpy((uint8_t *)m.pData + (size_t)y * m.RowPitch, &pixels[(size_t)y * w], (size_t)w * 4);
-	}
-	g_context->Unmap(staging.Get(), 0);
-
-	// Write into the shared texture under the keyed mutex, then hand it to the
-	// service (key 0 = "producer done"). After this one write the content is
-	// static; the service re-acquires key 0 each weave_submit.
-	if (g_sbsMutex->AcquireSync(0, 1000) != S_OK) {
-		LOG_ERROR("SBS AcquireSync failed");
-		return false;
-	}
-	g_context->CopyResource(g_sbsTex.Get(), staging.Get());
-	g_context->Flush();
-	g_sbsMutex->ReleaseSync(0);
-	LOG_INFO("Pre-weave SBS texture ready (%ux%u, L=red R=blue, NT handle=%p)", w, h, g_sbsHandle);
+	LOG_INFO("Pre-weave SBS render target ready (%ux%u, NT handle=%p)", w, h, g_sbsHandle);
 	return true;
+}
+
+// Render the pre-weave SBS pair off-axis for the two eyes (shader-free, via
+// ClearView). Each view shows a near (red) + far (green) square on a gray bg;
+// each square shifts horizontally by -k*eye.x, with the near square's k larger,
+// so head motion produces depth-ordered parallax (look-around) and the L/R eye
+// difference produces stereo disparity. The whole SBS is what the DP weaves.
+static void
+RenderSbsLookAround(float eyeLx, float eyeRx)
+{
+	if (!g_sbsRtv || !g_sbsMutex) {
+		return;
+	}
+	// Producer side of the keyed-mutex handshake (key 0 = "done writing"); the
+	// service AcquireSync(0)s the same texture inside weave_submit. Must release
+	// BEFORE weave_submit or the service's same-key acquire would block.
+	if (g_sbsMutex->AcquireSync(0, 1000) != S_OK) {
+		return;
+	}
+	const float bg[4] = {0.10f, 0.10f, 0.12f, 1.0f};
+	const float farCol[4] = {0.15f, 0.80f, 0.20f, 1.0f}; // green, "far"
+	const float nearCol[4] = {0.90f, 0.20f, 0.15f, 1.0f}; // red, "near"
+	const float kFar = 200.0f;  // px shift per metre of eye x  (small parallax)
+	const float kNear = 900.0f; // larger parallax → reads as nearer
+	const int32_t vw = (int32_t)kRectW, vh = (int32_t)kRectH;
+	const float eyeX[2] = {eyeLx, eyeRx};
+
+	// Background: clear the whole SBS.
+	g_context->ClearView(g_sbsRtv.Get(), bg, nullptr, 0);
+
+	for (int v = 0; v < 2; v++) {
+		const int32_t ox = v * vw; // this view's left edge in the SBS
+		// Far square (240x180), centred, parallax -kFar*eye.x.
+		int32_t fcx = ox + vw / 2 + (int32_t)(-kFar * eyeX[v]);
+		int32_t fcy = vh / 2;
+		D3D11_RECT farR = {fcx - 120, fcy - 90, fcx + 120, fcy + 90};
+		g_context->ClearView(g_sbsRtv.Get(), farCol, &farR, 1);
+		// Near square (120x120), centred, parallax -kNear*eye.x (moves more).
+		int32_t ncx = ox + vw / 2 + (int32_t)(-kNear * eyeX[v]);
+		int32_t ncy = vh / 2;
+		D3D11_RECT nearR = {ncx - 60, ncy - 60, ncx + 60, ncy + 60};
+		g_context->ClearView(g_sbsRtv.Get(), nearCol, &nearR, 1);
+	}
+
+	g_context->Flush(); // ensure writes are submitted before the service reads
+	g_sbsMutex->ReleaseSync(0);
 }
 
 // ---- Open the runtime's exported weaved texture + fence ----------------------
@@ -478,6 +494,10 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		int32_t rx = (cw - (int32_t)rw) / 2;
 		int32_t ry = (ch - (int32_t)rh) / 2;
 
+		// Render this frame's pre-weave SBS pair off-axis from the eyes the
+		// runtime returned LAST frame (look-around / virtual-camera motion).
+		RenderSbsLookAround(g_lastEyeX[0], g_lastEyeX[1]);
+
 		XrWeaveSubmitInfoEXT in = {XR_TYPE_WEAVE_SUBMIT_INFO_EXT};
 		in.inputTexture = (void *)g_sbsHandle;
 		in.inputIsDxgi = XR_FALSE;
@@ -485,7 +505,6 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		in.rect.offset.y = ry;
 		in.rect.extent.width = (int32_t)rw;
 		in.rect.extent.height = (int32_t)rh;
-		in.eyeCount = 0; // Phase 1: eyes unused; the DP's tracked eyes drive.
 
 		XrWeaveOutputEXT out = {XR_TYPE_WEAVE_OUTPUT_EXT};
 
@@ -503,6 +522,12 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
 		latSum += ms;
 		latCount++;
+
+		// Feed the returned tracked eyes into next frame's off-axis render.
+		if (out.eyesValid == XR_TRUE && out.eyeCount >= 2) {
+			g_lastEyeX[0] = out.eyes[0].x;
+			g_lastEyeX[1] = out.eyes[1].x;
+		}
 
 		if (!haveHandback || out.weavedTexture != nullptr) {
 			if (!OpenWeavedHandback(out)) {
@@ -530,8 +555,10 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		MaybeDumpWeaved();
 
 		if ((frame % 120) == 0 && latCount > 0) {
-			LOG_INFO("weave round-trip: last=%.3f ms, avg=%.3f ms (%u frames), out=%ux%u rect=%d,%d %ux%u",
-			         ms, latSum / latCount, latCount, out.width, out.height, rx, ry, rw, rh);
+			LOG_INFO("weave round-trip: last=%.3f ms, avg=%.3f ms (%u frames), out=%ux%u rect=%d,%d %ux%u "
+			         "eyes(valid=%d track=%d n=%u L.x=%.4f R.x=%.4f)",
+			         ms, latSum / latCount, latCount, out.width, out.height, rx, ry, rw, rh,
+			         out.eyesValid, out.eyesTracking, out.eyeCount, g_lastEyeX[0], g_lastEyeX[1]);
 		}
 		frame++;
 	}

@@ -11448,17 +11448,11 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                int32_t rect_y,
                                uint32_t rect_w,
                                uint32_t rect_h,
-                               const struct xrt_vec3 *eyes,
-                               uint32_t eye_count,
                                uint32_t *out_width,
                                uint32_t *out_height,
-                               uint64_t *out_fence_value)
+                               uint64_t *out_fence_value,
+                               struct xrt_eye_positions *out_eyes)
 {
-	// Phase 1: eyes are carried on the wire but UNUSED — the DP's tracked eyes
-	// drive the weave (process_atlas takes no eye params by design).
-	(void)eyes;
-	(void)eye_count;
-
 	if (out_width != nullptr) {
 		*out_width = 0;
 	}
@@ -11467,6 +11461,9 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	}
 	if (out_fence_value != nullptr) {
 		*out_fence_value = 0;
+	}
+	if (out_eyes != nullptr) {
+		*out_eyes = {};
 	}
 	if (xc == nullptr || xc->destroy != compositor_destroy) {
 		return false;
@@ -11582,6 +11579,12 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	}
 	if (out_fence_value != nullptr) {
 		*out_fence_value = c->render.weave_fence_value;
+	}
+	// Hand back the DP's current tracked eyes so the caller drives its off-axis
+	// (look-around) projection for the NEXT pre-weave frame. The interlace
+	// itself is DP-internal — this is the only eye flow, and it's OUT.
+	if (out_eyes != nullptr) {
+		xrt_display_processor_d3d11_get_predicted_eye_positions(c->render.display_processor, out_eyes);
 	}
 	return true;
 }

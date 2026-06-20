@@ -67,21 +67,24 @@ Browser present-ownership is one of the few cases satisfying (1): the weave happ
 // once: bind Chrome's window so the DP can phase-snap on move/resize
 session.displayXR.bindWindow(browserWindowHandle)   // reuses XR_EXT_{win32,cocoa}_window_binding
 
-// per frame, per weaved element — a GPU handle round-trip, both ways zero-copy:
-weavedHandle = session.displayXR.weave(preWeaveHandle, windowRelativeRect, eyes)
+// per frame, per weaved element — a GPU handle round-trip, both ways zero-copy.
+// Returns the weaved handle AND the current tracked eyes (see below):
+{ weavedHandle, eyes } = session.displayXR.weave(preWeaveHandle, windowRelativeRect)
 ```
 
 - **`preWeaveHandle`** — shared GPU handle to the element's pre-weave stereo content (SBS `<canvas>` / WebGL FBO).
 - **`windowRelativeRect`** — the element's device-pixel rect *within the window*. DXR combines it with the HWND-tracked window position to get the absolute-screen phase, so dragging/resizing the Chrome window re-snaps phase automatically.
-- **`eyes`** — current eye poses (existing Chapter 1 bridge feed). `weave()` **composes with**, does not replace, the Chapter 1 metadata.
-- DXR routes `{handle, rect, eyes, window-position}` to the DP, which weaves at the correct phase and returns a weaved shared handle the browser composites at that rect and presents.
+- **`eyes` flow *out*, not in.** The interlace itself is the **DP's** job and reads the **vendor's own eye tracker** internally — the page feeds it nothing for the weave. What the page needs eyes *for* is its **own off-axis (asymmetric-frustum / Kooima) projection**: as the viewer's head moves, the page must re-render its pre-weave stereo pair with frusta skewed to the new eye positions (virtual-camera motion / look-around). So `weave()` **returns** the runtime's current tracked eyes, and the page renders the **next** frame's pair from them. (Equivalently, an OpenXR-session present-owner gets the same eyes via `xrLocateViews`; the return value is what makes the *session-less* caller work.)
+- DXR routes `{handle, rect, window-position}` to the DP, which weaves at the correct phase, returns the weaved shared handle the browser composites at that rect, and hands back the tracked eyes for the next frame.
 
 ```
 browser (present-owner)                 DXR (runtime/service)           DP (vendor plug-in)
   bindWindow(handle)        ──────────▶  track window move/resize  ──▶  phase-snap source
-  export pre-weave canvas   ──handle──▶  weave(handle, rect, eyes)  ──▶  weave at window-
+  export pre-weave canvas   ──handle──▶  weave(handle, rect)        ──▶  weave at window-
     as shared GPU handle                                                  position + rect phase
-  composite weaved quad     ◀─handle──   return weaved shared handle ◀──  weaved texture
+  composite weaved quad     ◀─handle──   return weaved handle       ◀──  weaved texture
+  off-axis render next      ◀──eyes───   + current tracked eyes     ◀──  vendor eye tracker
+    frame from eyes
     at rect, present
 ```
 
@@ -110,7 +113,7 @@ So we reuse the texture + window-binding + display-zones machinery wholesale rat
 Order of work, smallest testable first:
 
 **Step 0 — DXR weave RPC (in-tree, no browser).** Add a window-bound one-shot weave service to `displayxr-service`:
-`bindWindow(handle)` + `weave(shared_handle, window_relative_rect, eyes) → weaved_shared_handle`. It imports the handle, runs the **DP** weave at the phase derived from window-position + rect, and exports the weaved handle. This is the load-bearing new runtime capability — a synchronous weave *service* distinct from the steady swapchain frame loop, and it reuses the existing texture + window-binding + DP `process_atlas`/weave paths. **Testable with zero browser:** a tiny native client hands it a known SBS texture + rect + eyes and checks the weaved output on **real 3D-display hardware (Windows)**. First milestone. Phase-0 audit + gap analysis: [`webxr-weave-rpc-step0-gap-analysis.md`](webxr-weave-rpc-step0-gap-analysis.md) (issue #625).
+`bindWindow(handle)` + `weave(shared_handle, window_relative_rect) → {weaved_shared_handle, tracked_eyes}`. It imports the handle, runs the **DP** weave at the phase derived from window-position + rect, exports the weaved handle, and returns the DP's current tracked eyes for the caller's off-axis (look-around) rendering (eyes flow out, not in — the interlace reads the vendor tracker internally; see §2.3). A synchronous weave *service* distinct from the steady swapchain frame loop, reusing the existing texture + window-binding + DP `process_atlas`/weave paths. **Testable with zero browser:** a tiny native client hands it a known SBS texture + rect, presents the weaved output, and renders look-around from the returned eyes on **real 3D-display hardware (Windows)**. First milestone. **Shipped:** `XR_EXT_weave` (`xrWeaveBindWindowEXT` + `xrWeaveSubmitEXT`) + the `weave_rpc_probe_d3d11_win` harness; hardware-validated on Leia. Phase-0 audit + gap analysis: [`webxr-weave-rpc-step0-gap-analysis.md`](webxr-weave-rpc-step0-gap-analysis.md) (issue #625).
 
 **Step A — CEF host as browser stand-in (no host-side weave).** Fork `cefsimple` in **offscreen-render (OSR)** mode; `OnAcceleratedPaint` hands a **shared D3D11 texture of the composited page** — zero-copy, public CEF API, no source changes. The host exports the zone sub-rect handle, **drives the Step-0 RPC** (the real DP through the real contract — *not* a host-side weave shader), composites the returned handle, and presents. Because CEF owns present in OSR, z-order is correct (the weave replaces the flat canvas in the composited page). Validates the full round-trip + phase/position under scroll/zoom on a Chromium-faithful engine.
 
@@ -132,7 +135,7 @@ So the right artifact for (4) is the **minimal rebasable patch of §2.4 Step B**
 
 ### 2.6 Sequencing
 
-1. **DXR weave RPC** (§2.4 Step 0) — window-bound `bindWindow` + `weave(handle, rect, eyes)`; validate the DP round-trip **and its per-frame latency** headless on real 3D-display hardware, no browser.
+1. **DXR weave RPC** (§2.4 Step 0) — window-bound `bindWindow` + `weave(handle, rect) → {weaved, eyes}`; validate the DP round-trip, look-around from the returned eyes, **and its per-frame latency** headless on real 3D-display hardware, no browser. ✅ shipped (`XR_EXT_weave`, hw-validated).
 2. **CEF OSR host** (§2.4 Step A) — drive that RPC from `OnAcceleratedPaint`; solve phase/position under scroll/zoom on a Chromium-faithful engine.
 3. **Minimal rebasable Chromium patch** (§2.4 Step B) — window binding + canvas `SharedImage` handle export + the RPC call + the `bindWindow`/`weave` JS surface; test in `content_shell`; ship to our users via a patched distribution; serve as the reference impl.
 4. **Standards push, in parallel** (non-engineering) — a WICG explainer/spec for a non-immersive 3D-display WebXR module, backed by the demos from steps 1–3 and a hardware-install-base narrative.

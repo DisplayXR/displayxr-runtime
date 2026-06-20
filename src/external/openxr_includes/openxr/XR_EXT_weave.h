@@ -35,9 +35,14 @@
  * the correct phase; dragging / resizing the window re-snaps phase
  * automatically (that is why the window must be bound).
  *
- * Phase 1 (#625): @c eyes is carried on the wire but UNUSED — the DP's real
- * tracked eyes drive the weave, which is correct for hardware validation.
- * Making @c eyes drive the weave is a later phase.
+ * Eyes flow runtime -> caller, not caller -> weave. The interlace itself is the
+ * DP's (vendor's) job and reads the vendor's own eye tracker internally — the
+ * caller feeds it nothing for that. What the caller needs eyes FOR is its own
+ * off-axis (asymmetric-frustum / Kooima) projection: as the viewer's head
+ * moves, the present-owner must re-render its pre-weave stereo pair with frusta
+ * skewed to the new eye positions (virtual-camera motion / look-around). So
+ * xrWeaveSubmitEXT RETURNS the runtime's current tracked eye positions in
+ * XrWeaveOutputEXT; the caller renders the NEXT frame's pair from them.
  *
  * Availability: this runtime implements the weave service only on the
  * out-of-process (service / IPC) path. An in-process session reports
@@ -86,8 +91,6 @@ typedef struct XrWeaveSubmitInfoEXT {
     void*                    inputTexture; //!< pre-weave SBS shared texture HANDLE (keyed-mutex)
     XrBool32                 inputIsDxgi;  //!< XR_TRUE for a legacy global DXGI handle (else NT handle)
     XrRect2Di                rect;         //!< window-relative sub-rect, device px (y-down)
-    uint32_t                 eyeCount;     //!< number of valid entries in eyes[] (Phase 1: unused)
-    XrVector3f               eyes[XR_WEAVE_MAX_EYES_EXT]; //!< eye positions; DP's tracked eyes drive in Phase 1
 } XrWeaveSubmitInfoEXT;
 
 /*!
@@ -116,6 +119,14 @@ typedef struct XrWeaveOutputEXT {
     uint32_t           height;        //!< weaved texture height (bound-window client height)
     void*              fence;         //!< shared sync HANDLE (runtime→caller), or NULL on steady-state frames
     uint64_t           fenceValue;    //!< value the caller waits the fence to before presenting this frame
+    //! Current tracked eye positions (display-space, metres) the caller uses to
+    //! drive its off-axis projection for the NEXT pre-weave frame (look-around).
+    //! eyesValid is XR_FALSE until the tracker has a sample; eyesTracking is
+    //! XR_FALSE when the position is a fallback (no live lock) but still usable.
+    uint32_t           eyeCount;
+    XrVector3f         eyes[XR_WEAVE_MAX_EYES_EXT];
+    XrBool32           eyesValid;
+    XrBool32           eyesTracking;
 } XrWeaveOutputEXT;
 
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveBindWindowEXT)(

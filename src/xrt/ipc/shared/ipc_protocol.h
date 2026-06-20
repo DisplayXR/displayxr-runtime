@@ -737,10 +737,10 @@ struct ipc_arg_swapchain_from_native
 /*!
  * XR_EXT_weave over IPC (#625): per-frame weave_submit arguments. The pre-weave
  * input texture rides as an in_handle (xrt_graphics_buffer_handle_t); this POD
- * carries the window-relative output sub-rect + the eye positions.
- *
- * Phase 1: @c eyes is carried but UNUSED — the DP's tracked eyes drive the
- * weave. (Making eyes drive the weave is a later phase.)
+ * carries the window-relative output sub-rect. The interlace is DP-internal
+ * (reads the vendor's own eye tracker), so nothing eye-related travels in;
+ * weave_submit RETURNS the tracked eyes (struct xrt_eye_positions) for the
+ * caller's off-axis rendering.
  *
  * @ingroup ipc
  */
@@ -750,8 +750,6 @@ struct ipc_arg_weave_submit
 	int32_t rect_y;  //!< Sub-rect top, bound-window client pixels (y-down)
 	uint32_t rect_w; //!< Sub-rect width in pixels
 	uint32_t rect_h; //!< Sub-rect height in pixels
-	uint32_t eye_count;
-	struct xrt_vec3 eyes[XRT_MAX_VIEWS];
 };
 
 /*!

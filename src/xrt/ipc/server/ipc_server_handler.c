@@ -5334,6 +5334,7 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
                         uint32_t *out_width,
                         uint32_t *out_height,
                         uint64_t *out_fence_value,
+                        struct xrt_eye_positions *out_eyes,
                         const xrt_graphics_buffer_handle_t *handles,
                         uint32_t handle_count)
 {
@@ -5343,6 +5344,7 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	*out_width = 0;
 	*out_height = 0;
 	*out_fence_value = 0;
+	U_ZERO(out_eyes);
 
 	if (ics->xc == NULL || handle_count < 1) {
 		return XRT_ERROR_IPC_FAILURE;
@@ -5361,9 +5363,10 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 
 	uint32_t w = 0, h = 0;
 	uint64_t fv = 0;
+	struct xrt_eye_positions eyes = {0};
 	bool ok = comp_d3d11_service_weave_submit( //
 	    ics->xc, in_handle, in_is_dxgi,        //
-	    args->rect_x, args->rect_y, args->rect_w, args->rect_h, args->eyes, args->eye_count, &w, &h, &fv);
+	    args->rect_x, args->rect_y, args->rect_w, args->rect_h, &w, &h, &fv, &eyes);
 	if (!ok) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -5371,6 +5374,7 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	*out_width = w;
 	*out_height = h;
 	*out_fence_value = fv;
+	*out_eyes = eyes;
 	return XRT_SUCCESS;
 #else
 	(void)args;
