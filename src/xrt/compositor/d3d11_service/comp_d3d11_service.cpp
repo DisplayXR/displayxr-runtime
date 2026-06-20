@@ -11423,6 +11423,62 @@ weave_ensure_output(struct d3d11_service_compositor *c, uint32_t w, uint32_t h)
 	return true;
 }
 
+//! XR_EXT_weave (#625): a present-owner drives only weave_submit — it never runs
+//! the per-client commit, so it misses the no-zones-standalone deferred force-3D
+//! (the vendor poll otherwise follows the SR's 2D state and the panel never goes
+//! 3D → the SR eye tracker collapses the eye pair, no look-around). Mirror that
+//! kick here, but SELF-HEALING (re-assert whenever the SR is 2D past the warmup
+//! window) rather than one-shot: a present-owner has no V-key, so any 2D is
+//! always "force back to 3D". Caller holds sys->render_mutex.
+static void
+weave_force_3d_if_needed(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	if (sys->workspace_mode || c->render.display_processor == nullptr || sys->xsysd == NULL) {
+		return;
+	}
+	// Settle window past SR init (#140 guard), reusing the standalone counter.
+	if (++c->render.commit_frame_counter < DEFERRED_3D_KICK_FRAMES) {
+		return;
+	}
+	if (sys->hardware_display_3d) {
+		return; // already 3D — nothing to do
+	}
+	struct xrt_device *head = sys->xsysd->static_roles.head;
+	if (head == nullptr || head->hmd == NULL) {
+		return;
+	}
+	// Prefer the last 3D mode; else the first 3D-capable mode.
+	uint32_t mode_idx = head->rendering_mode_count;
+	if (sys->last_3d_mode_index < head->rendering_mode_count &&
+	    head->rendering_modes[sys->last_3d_mode_index].hardware_display_3d) {
+		mode_idx = sys->last_3d_mode_index;
+	} else {
+		for (uint32_t m = 0; m < head->rendering_mode_count; m++) {
+			if (head->rendering_modes[m].hardware_display_3d) {
+				mode_idx = m;
+				break;
+			}
+		}
+	}
+	if (mode_idx >= head->rendering_mode_count) {
+		return;
+	}
+	uint32_t prev_idx = head->hmd->active_rendering_mode_index;
+	head->hmd->active_rendering_mode_index = mode_idx;
+	broadcast_rendering_mode_change(sys, head, prev_idx, mode_idx);
+	xrt_display_processor_d3d11_request_display_mode(c->render.display_processor, true);
+	sync_tile_layout(sys);
+	sys->hardware_display_3d = true;
+	// Stamp the post-flip cooldown so the 100 ms vendor 3D-state poll doesn't see
+	// the panel mid-transition and counter-correct back to 2D.
+	int64_t kick_ns = os_monotonic_get_ns();
+	sys->cached_3d_state.store(true, std::memory_order_relaxed);
+	sys->last_3d_state_poll_ns.store(kick_ns, std::memory_order_release);
+	sys->last_flip_landed_ns.store(kick_ns, std::memory_order_release);
+	U_LOG_W("[weave_3d] present-owner: SR was 2D — forcing 3D (mode %u -> %u) so the eye tracker locks",
+	        prev_idx, mode_idx);
+}
+
 extern "C" bool
 comp_d3d11_service_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd)
 {
@@ -11431,11 +11487,9 @@ comp_d3d11_service_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd)
 	}
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	c->render.weave_hwnd = (HWND)(uintptr_t)hwnd;
-	// Ensure the panel is in 3D mode so the DP actually weaves (a present-owner
-	// that only drives weave_submit never goes through the steady mode path).
-	if (c->render.display_processor != nullptr) {
-		xrt_display_processor_d3d11_request_display_mode(c->render.display_processor, true);
-	}
+	// NB: do NOT force 3D here — that would fire before the SR init settle window
+	// (#140 premature-flip → vendor poll demotes it). weave_force_3d_if_needed()
+	// in weave_submit does it deferred + self-healing once frames are flowing.
 	U_LOG_W("#625 weave: bound present-owner window hwnd=%p", (void *)c->render.weave_hwnd);
 	return true;
 }
@@ -11481,6 +11535,10 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// Serialize with the render thread — sys->context is the (non-thread-safe)
 	// immediate context shared with multi_compositor_render.
 	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+
+	// Keep the panel in 3D so the vendor eye tracker locks (look-around). A
+	// present-owner never runs the per-client commit that normally does this.
+	weave_force_3d_if_needed(sys, c);
 
 	// Output is sized to the bound window's client area so the weave phase is
 	// correct at the window's absolute screen position; the sub-rect is confined
