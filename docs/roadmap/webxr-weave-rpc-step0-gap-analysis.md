@@ -95,13 +95,18 @@ rect** (one 3D zone). The handback + fence mechanics are reused as-is.
   `xrLocateViews` (`src/xrt/state_trackers/oxr/oxr_session.c:1724`) so the app renders matching
   off-axis frusta. Eyes never travel app → DP.
 
-webxr-support.md §2.3 lists `eyes` as a `weave()` parameter (fed from the Chapter-1 bridge). To make
-caller-supplied eyes actually drive the weave, the DP needs a way to override its tracked-eye
-snapshot — a new entry or an injection point.
+webxr-support.md §2.3 originally listed `eyes` as a `weave()` *input*. That framing was wrong
+(see the corrected §2.3): the interlace is DP-internal and reads the vendor tracker, so the
+caller feeds it nothing for the weave.
 
-**Decision (issue #625):** Phase 1 keeps `eyes` **on the wire** but **unused** — the DP's real
-tracked eyes drive the weave, which is correct for hardware validation. Making `eyes` drive the
-weave is **Phase 2** (its own DP-override design).
+**Decision (issue #625) — corrected in Phase 2:** eyes flow **runtime → caller**, matching the
+existing `DP → app` direction above. `weave()` **returns** the DP's current tracked eyes (read
+via `get_predicted_eye_positions`) so the present-owner drives its **own** off-axis (Kooima)
+projection for the next pre-weave frame — virtual-camera motion / look-around. Phase 1 carried a
+vestigial caller→weave `eyes` input (unused); **Phase 2 removed it and added the eye *return*** to
+the handback (`XrWeaveOutputEXT` / `weave_submit` out). For an OpenXR-session present-owner the
+same eyes are already available via `xrLocateViews`; the return value is what makes a
+*session-less* caller (CEF) work.
 
 ---
 

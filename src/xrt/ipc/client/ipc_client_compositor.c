@@ -494,21 +494,21 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         int32_t rect_y,
                                         uint32_t rect_w,
                                         uint32_t rect_h,
-                                        const float *eyes_xyz,
-                                        uint32_t eye_count,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
-                                        uint64_t *out_fence_value)
+                                        uint64_t *out_fence_value,
+                                        struct xrt_eye_positions *out_eyes)
 {
 	if (xc == NULL || out_have_output == NULL || out_width == NULL || out_height == NULL ||
-	    out_fence_value == NULL) {
+	    out_fence_value == NULL || out_eyes == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	*out_have_output = false;
 	*out_width = 0;
 	*out_height = 0;
 	*out_fence_value = 0;
+	U_ZERO(out_eyes);
 
 	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
 	if (icc == NULL || icc->ipc_c == NULL) {
@@ -520,15 +520,6 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	args.rect_y = rect_y;
 	args.rect_w = rect_w;
 	args.rect_h = rect_h;
-	if (eye_count > XRT_MAX_VIEWS) {
-		eye_count = XRT_MAX_VIEWS;
-	}
-	args.eye_count = eye_count;
-	for (uint32_t i = 0; eyes_xyz != NULL && i < eye_count; i++) {
-		args.eyes[i].x = eyes_xyz[i * 3 + 0];
-		args.eyes[i].y = eyes_xyz[i * 3 + 1];
-		args.eyes[i].z = eyes_xyz[i * 3 + 2];
-	}
 
 	xrt_graphics_buffer_handle_t handle = in_handle;
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
@@ -544,9 +535,10 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	bool have = false;
 	uint32_t w = 0, h = 0;
 	uint64_t fv = 0;
+	struct xrt_eye_positions eyes = {0};
 	// Generated arg order: in args, then in_handles (handles, count), then out
 	// args. This copies the handle, it does not consume it.
-	xrt_result_t xret = ipc_call_weave_submit(icc->ipc_c, &args, &handle, 1, &have, &w, &h, &fv);
+	xrt_result_t xret = ipc_call_weave_submit(icc->ipc_c, &args, &handle, 1, &have, &w, &h, &fv, &eyes);
 	if (xret != XRT_SUCCESS) {
 		return xret;
 	}
@@ -554,6 +546,7 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	*out_width = w;
 	*out_height = h;
 	*out_fence_value = fv;
+	*out_eyes = eyes;
 	return XRT_SUCCESS;
 }
 

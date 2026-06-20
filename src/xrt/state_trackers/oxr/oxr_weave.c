@@ -31,6 +31,7 @@
 
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_handles.h"
+#include "xrt/xrt_display_metrics.h"
 
 #include <openxr/XR_EXT_weave.h>
 
@@ -55,12 +56,11 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         int32_t rect_y,
                                         uint32_t rect_w,
                                         uint32_t rect_h,
-                                        const float *eyes_xyz,
-                                        uint32_t eye_count,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
-                                        uint64_t *out_fence_value);
+                                        uint64_t *out_fence_value,
+                                        struct xrt_eye_positions *out_eyes);
 
 xrt_result_t
 comp_ipc_client_compositor_weave_get_output(struct xrt_compositor *xc,
@@ -133,27 +133,15 @@ oxr_xrWeaveSubmitEXT(XrSession session, const XrWeaveSubmitInfoEXT *submitInfo, 
 		                 "out-of-process (service) path");
 	}
 
-	// Phase 1: eyes are carried on the wire but unused — the DP's tracked eyes
-	// drive the weave. Flatten to xyz triplets for the bridge regardless.
-	uint32_t eye_count = submitInfo->eyeCount;
-	if (eye_count > XR_WEAVE_MAX_EYES_EXT) {
-		eye_count = XR_WEAVE_MAX_EYES_EXT;
-	}
-	float eyes_xyz[XR_WEAVE_MAX_EYES_EXT * 3] = {0};
-	for (uint32_t i = 0; i < eye_count; i++) {
-		eyes_xyz[i * 3 + 0] = submitInfo->eyes[i].x;
-		eyes_xyz[i * 3 + 1] = submitInfo->eyes[i].y;
-		eyes_xyz[i * 3 + 2] = submitInfo->eyes[i].z;
-	}
-
 	bool have_out = false;
 	uint32_t w = 0, h = 0;
 	uint64_t fence_value = 0;
+	struct xrt_eye_positions eyes = {0};
 	xrt_result_t xret = comp_ipc_client_compositor_weave_submit(
 	    &sess->xcn->base, (xrt_graphics_buffer_handle_t)submitInfo->inputTexture,
 	    submitInfo->inputIsDxgi == XR_TRUE, submitInfo->rect.offset.x, submitInfo->rect.offset.y,
-	    (uint32_t)submitInfo->rect.extent.width, (uint32_t)submitInfo->rect.extent.height, eyes_xyz,
-	    eye_count, &have_out, &w, &h, &fence_value);
+	    (uint32_t)submitInfo->rect.extent.width, (uint32_t)submitInfo->rect.extent.height, &have_out, &w, &h,
+	    &fence_value, &eyes);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
 		                 "xrWeaveSubmitEXT: weave failed (xrt_result=%d)", (int)xret);
@@ -166,6 +154,22 @@ oxr_xrWeaveSubmitEXT(XrSession session, const XrWeaveSubmitInfoEXT *submitInfo, 
 	output->height = h;
 	output->fence = NULL;
 	output->fenceValue = fence_value;
+
+	// Eyes flow OUT: the caller renders its NEXT pre-weave frame's off-axis
+	// projection from these tracked positions (look-around). The interlace
+	// itself is DP-internal.
+	uint32_t ec = eyes.count;
+	if (ec > XR_WEAVE_MAX_EYES_EXT) {
+		ec = XR_WEAVE_MAX_EYES_EXT;
+	}
+	output->eyeCount = ec;
+	for (uint32_t i = 0; i < ec; i++) {
+		output->eyes[i].x = eyes.eyes[i].x;
+		output->eyes[i].y = eyes.eyes[i].y;
+		output->eyes[i].z = eyes.eyes[i].z;
+	}
+	output->eyesValid = eyes.valid ? XR_TRUE : XR_FALSE;
+	output->eyesTracking = eyes.is_tracking ? XR_TRUE : XR_FALSE;
 
 	bool need_export = !sess->weave.exported || w != sess->weave.last_w || h != sess->weave.last_h;
 	if (have_out && w != 0 && h != 0 && need_export) {

@@ -221,12 +221,11 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         int32_t rect_y,
                                         uint32_t rect_w,
                                         uint32_t rect_h,
-                                        const float *eyes_xyz,
-                                        uint32_t eye_count,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
-                                        uint64_t *out_fence_value);
+                                        uint64_t *out_fence_value,
+                                        struct xrt_eye_positions *out_eyes);
 
 xrt_result_t
 comp_ipc_client_compositor_weave_get_output(struct xrt_compositor *xc,
