@@ -305,13 +305,24 @@ struct comp_gl_compositor
 	ID3D11Device *dx_device;
 	ID3D11DeviceContext *dx_context;
 	ID3D11Texture2D *dx_shared_texture;
-	HANDLE dx_interop_device;      //!< wglDXOpenDeviceNV handle
-	HANDLE dx_interop_object;      //!< wglDXRegisterObjectNV handle
-	GLuint shared_gl_texture;      //!< GL texture mapped to D3D11 shared texture
+	//! CPU staging for the GL→D3D readback bridge (see gl_shared_readback_upload).
+	//! The shared-texture present path weaves into a plain GL render texture, then
+	//! glReadPixels the woven region and UpdateSubresource it into the app's
+	//! shared D3D texture — the WGL_NV_DX_interop2 write-BACK into the shared
+	//! surface is unreliable on this stack. Grown on demand, freed at destroy.
+	uint8_t *shared_readback_cpu;
+	size_t shared_readback_cap;
+	GLuint shared_gl_texture;      //!< Plain GL render texture for the shared-texture weave
+	//! Dedicated FBO with shared_gl_texture attached. MUST be distinct from
+	//! c->fbo: the DP crop helpers temporarily rebind c->fbo's attachment to the
+	//! atlas texture, so reusing c->fbo as the present target would clobber where
+	//! the weave/composite lands (and is also required so gl_composite_local_2d
+	//! can lerp into the shared target while its internal crop uses c->fbo).
+	GLuint shared_present_fbo;
 	uint32_t shared_width;
 	uint32_t shared_height;
 
-	// WGL_NV_DX_interop2 function pointers
+	// WGL_NV_DX_interop2 function pointers (used by the DComp transit path)
 	PFN_wglDXOpenDeviceNV pfn_wglDXOpenDeviceNV;
 	PFN_wglDXCloseDeviceNV pfn_wglDXCloseDeviceNV;
 	PFN_wglDXRegisterObjectNV pfn_wglDXRegisterObjectNV;
@@ -1755,6 +1766,48 @@ gl_crop_and_process_dp(struct comp_gl_compositor *c,
 	    use_canvas ? c->canvas.w : 0,
 	    use_canvas ? c->canvas.h : 0);
 }
+
+#ifdef XRT_OS_WINDOWS
+// GL→D3D shared-texture bridge. The runtime weaves into a WGL_NV_DX_interop2 GL
+// render target, but the interop write-BACK into the D3D resource is unreliable
+// on this stack (GL's view fills, the D3D surface stays empty). So mirror the
+// no-interop DComp readback path: glReadPixels the woven (w×h) region of the
+// currently-bound FBO and UpdateSubresource it into the app's shared texture.
+// MUST be called while the interop FBO is still bound (GL owns the locked
+// object). glReadPixels row 0 = GL bottom, uploaded to D3D row 0 (top) → the
+// content is bottom-up in the shared texture; the app's present-blit V-flips.
+static void
+gl_shared_readback_upload(struct comp_gl_compositor *c, uint32_t w, uint32_t h)
+{
+	if (w == 0 || h == 0 || c->dx_shared_texture == NULL || c->dx_context == NULL) {
+		return;
+	}
+	if (w > c->shared_width) w = c->shared_width;
+	if (h > c->shared_height) h = c->shared_height;
+
+	size_t need = (size_t)w * h * 4;
+	if (c->shared_readback_cap < need || c->shared_readback_cpu == NULL) {
+		free(c->shared_readback_cpu);
+		c->shared_readback_cpu = (uint8_t *)malloc(need);
+		c->shared_readback_cap = c->shared_readback_cpu != NULL ? need : 0;
+	}
+	if (c->shared_readback_cpu == NULL) {
+		return;
+	}
+
+	glReadBuffer(GL_COLOR_ATTACHMENT0);
+	glPixelStorei(GL_PACK_ALIGNMENT, 1);
+	glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, c->shared_readback_cpu);
+
+	// Upload into the top-left w×h sub-rect of the shared texture. The app reads
+	// that same sub-rect (and V-flips, since the rows are GL bottom-up).
+	D3D11_BOX box = {0, 0, 0, w, h, 1};
+	c->dx_context->UpdateSubresource(c->dx_shared_texture, 0, &box, c->shared_readback_cpu,
+	                                 (UINT)(w * 4), 0);
+	// Flush so the app's separate present device sees the upload this frame.
+	c->dx_context->Flush();
+}
+#endif
 
 
 /*
@@ -3228,59 +3281,87 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	GLuint atlas_for_present = zero_copy ? zc_texture : c->atlas_texture;
 #ifdef XRT_OS_WINDOWS
 	if (c->has_shared_texture) {
-		// Shared texture mode: render into the DX-interop GL texture
-		if (c->pfn_wglDXLockObjectsNV(c->dx_interop_device, 1, &c->dx_interop_object)) {
-			glBindFramebuffer(GL_FRAMEBUFFER, c->fbo);
-			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-			                        c->shared_gl_texture, 0);
+		// Shared-texture present: weave into the dedicated GL render target
+		// (shared_present_fbo → shared_gl_texture), then bridge the result into
+		// the app's shared D3D surface via gl_shared_readback_upload
+		// (glReadPixels → UpdateSubresource). The WGL_NV_DX_interop2 write-back
+		// is bypassed — unreliable on this stack.
+		glBindFramebuffer(GL_FRAMEBUFFER, c->shared_present_fbo);
 
-			if (c->display_processor != NULL) {
-				// DP target: use canvas dims for texture apps.
-				// XR_EXT_display_zones: zones frames span the full
-				// shared surface (the output rect is inert — the
-				// gl_crop_and_process_dp canvas args are already
-				// zones-gated).
-				//! @todo P3 follow-up: the GL masked composite (and so
-				//! the zones wish lerp) only runs on the window-present
-				//! path — the shared-texture/IOSurface paths weave the
-				//! zone-placed atlas but skip the post-weave wish
-				//! composite (same pre-existing scope as Local2D).
-				uint32_t dp_w = c->shared_width;
-				uint32_t dp_h = c->shared_height;
-				if (c->canvas.valid && !c->zones_frame && c->canvas.w > 0 && c->canvas.h > 0) {
-					dp_w = c->canvas.w;
-					dp_h = c->canvas.h;
+		// Clear the whole render target to transparent first: in a zones frame
+		// the composite/weave only paints the window sub-rect viewport, so the
+		// surround must read through to the desktop (alpha 0) rather than show
+		// stale pixels from a prior frame.
+		glDisable(GL_SCISSOR_TEST);
+		glViewport(0, 0, c->shared_width, c->shared_height);
+		glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+		glClear(GL_COLOR_BUFFER_BIT);
+
+		if (c->display_processor != NULL) {
+			// DP target dims: canvas for texture apps; the full surface
+			// otherwise.
+			uint32_t dp_w = c->shared_width;
+			uint32_t dp_h = c->shared_height;
+			if (c->canvas.valid && !c->zones_frame && c->canvas.w > 0 && c->canvas.h > 0) {
+				dp_w = c->canvas.w;
+				dp_h = c->canvas.h;
+			} else if (c->zones_frame) {
+				// XR_EXT_display_zones: the zone PLACEMENT (layer_commit)
+				// scales zone rects into the atlas tile by tile/window, so
+				// the weave OUTPUT must be the window client dims too — NOT
+				// the full shared surface. Mirrors the VK leg (dp_target =
+				// settings.preferred = window dims) and the window-present
+				// path.
+				RECT zrc;
+				if (c->hwnd != NULL && GetClientRect(c->hwnd, &zrc) &&
+				    zrc.right > 0 && zrc.bottom > 0) {
+					dp_w = (uint32_t)zrc.right;
+					dp_h = (uint32_t)zrc.bottom;
 				}
-				// Crop atlas to content dims, then pass to DP
-				gl_crop_and_process_dp(c, atlas_for_present, dp_w, dp_h);
-			} else {
-				// No display processor: simple blit
-				glViewport(0, 0, c->shared_width, c->shared_height);
-				glUseProgram(c->program_blit);
-				glBindVertexArray(c->vao_empty);
-				GLint loc_rect = glGetUniformLocation(c->program_blit, "u_src_rect");
-				float sh_w = (c->atlas_tex_width > 0)
-				    ? (float)(c->eff_cols * c->eff_tile_w) / (float)c->atlas_tex_width : 1.0f;
-				float sh_h = (c->atlas_tex_height > 0)
-				    ? (float)(c->eff_rows * c->eff_tile_h) / (float)c->atlas_tex_height : 1.0f;
-				glUniform4f(loc_rect, 0.0f, 0.0f, sh_w, sh_h);
-				GLint loc_flip = glGetUniformLocation(c->program_blit, "u_flip_y");
-				glUniform1f(loc_flip, 0.0f);
-				glActiveTexture(GL_TEXTURE0);
-				glBindTexture(GL_TEXTURE_2D, atlas_for_present);
-				GLint loc_out_tex = glGetUniformLocation(c->program_blit, "u_texture");
-				glUniform1i(loc_out_tex, 0);
-				glDrawArrays(GL_TRIANGLES, 0, 3);
 			}
 
-			glFlush();
+			// Run the #439/#491/zones masked composite (transparency +
+			// Local2D + zone wish) INTO the dedicated present FBO, exactly
+			// like the window-present path. This is what makes the surround
+			// see-through and composites the 2D zones — the plain weave is
+			// opaque. Falls back to the plain weave when no composite is
+			// needed (the helper returns false). Both land in
+			// shared_present_fbo (distinct from the c->fbo the crop reuses).
+			if (!gl_composite_local_2d(c, atlas_for_present, c->shared_present_fbo, dp_w, dp_h)) {
+				gl_crop_and_process_dp(c, atlas_for_present, dp_w, dp_h);
+			}
 
-			// Restore FBO to not target shared texture
-			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
-			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+			// Bridge the woven (dp_w×dp_h) region into the app's shared
+			// texture. Re-bind the present FBO: the composite/crop bind their
+			// own FBOs internally. (The zone-wish publish to the DP happens
+			// once at the end of layer_commit via gl_sync_zone_mask_to_dp,
+			// which consumes the zone_publish_tex this composite resolved.)
+			glBindFramebuffer(GL_FRAMEBUFFER, c->shared_present_fbo);
+			gl_shared_readback_upload(c, dp_w, dp_h);
+		} else {
+			// No display processor: simple blit.
+			glViewport(0, 0, c->shared_width, c->shared_height);
+			glUseProgram(c->program_blit);
+			glBindVertexArray(c->vao_empty);
+			GLint loc_rect = glGetUniformLocation(c->program_blit, "u_src_rect");
+			float sh_w = (c->atlas_tex_width > 0)
+			    ? (float)(c->eff_cols * c->eff_tile_w) / (float)c->atlas_tex_width : 1.0f;
+			float sh_h = (c->atlas_tex_height > 0)
+			    ? (float)(c->eff_rows * c->eff_tile_h) / (float)c->atlas_tex_height : 1.0f;
+			glUniform4f(loc_rect, 0.0f, 0.0f, sh_w, sh_h);
+			GLint loc_flip = glGetUniformLocation(c->program_blit, "u_flip_y");
+			glUniform1f(loc_flip, 0.0f);
+			glActiveTexture(GL_TEXTURE0);
+			glBindTexture(GL_TEXTURE_2D, atlas_for_present);
+			GLint loc_out_tex = glGetUniformLocation(c->program_blit, "u_texture");
+			glUniform1i(loc_out_tex, 0);
+			glDrawArrays(GL_TRIANGLES, 0, 3);
 
-			c->pfn_wglDXUnlockObjectsNV(c->dx_interop_device, 1, &c->dx_interop_object);
+			// Bridge the full surface into the app's shared texture.
+			gl_shared_readback_upload(c, c->shared_width, c->shared_height);
 		}
+
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	} else
 #endif
 #ifdef __APPLE__
@@ -3581,16 +3662,18 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	if (c->backdrop_scratch_fbo) glDeleteFramebuffers(1, &c->backdrop_scratch_fbo);
 
 #ifdef XRT_OS_WINDOWS
-	// Clean up D3D11 interop resources
+	// Clean up D3D11 shared-texture present resources (readback bridge; no interop).
 	if (c->has_shared_texture) {
-		if (c->dx_interop_object && c->pfn_wglDXUnregisterObjectNV) {
-			c->pfn_wglDXUnregisterObjectNV(c->dx_interop_device, c->dx_interop_object);
+		if (c->shared_present_fbo) {
+			glDeleteFramebuffers(1, &c->shared_present_fbo);
 		}
 		if (c->shared_gl_texture) {
 			glDeleteTextures(1, &c->shared_gl_texture);
 		}
-		if (c->dx_interop_device && c->pfn_wglDXCloseDeviceNV) {
-			c->pfn_wglDXCloseDeviceNV(c->dx_interop_device);
+		if (c->shared_readback_cpu) {
+			free(c->shared_readback_cpu);
+			c->shared_readback_cpu = NULL;
+			c->shared_readback_cap = 0;
 		}
 		if (c->dx_shared_texture) {
 			c->dx_shared_texture->Release();
@@ -4397,35 +4480,27 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		return XRT_ERROR_OPENGL;
 	}
 
-	// Set up D3D11 interop if shared texture handle provided
+	// Set up the GL→D3D shared-texture present path if a handle was provided.
+	// NOTE: this does NOT use WGL_NV_DX_interop2 to weave directly into the
+	// shared surface. GL interop write-BACK into the app's shared D3D texture
+	// is unreliable on this stack (the GL render target fills, but the bytes
+	// never reach the D3D resource — owned or opened, RGBA or BGRA). Instead we
+	// weave into a plain GL render texture and bridge the result into the
+	// shared surface with glReadPixels → UpdateSubresource (gl_shared_readback_upload),
+	// mirroring the runtime's no-interop DComp readback present path.
 	if (shared_texture_handle != NULL) {
-		// Load WGL_NV_DX_interop2 function pointers
-		c->pfn_wglDXOpenDeviceNV = (PFN_wglDXOpenDeviceNV)wglGetProcAddress("wglDXOpenDeviceNV");
-		c->pfn_wglDXCloseDeviceNV = (PFN_wglDXCloseDeviceNV)wglGetProcAddress("wglDXCloseDeviceNV");
-		c->pfn_wglDXRegisterObjectNV = (PFN_wglDXRegisterObjectNV)wglGetProcAddress("wglDXRegisterObjectNV");
-		c->pfn_wglDXUnregisterObjectNV = (PFN_wglDXUnregisterObjectNV)wglGetProcAddress("wglDXUnregisterObjectNV");
-		c->pfn_wglDXLockObjectsNV = (PFN_wglDXLockObjectsNV)wglGetProcAddress("wglDXLockObjectsNV");
-		c->pfn_wglDXUnlockObjectsNV = (PFN_wglDXUnlockObjectsNV)wglGetProcAddress("wglDXUnlockObjectsNV");
-
-		if (!c->pfn_wglDXOpenDeviceNV || !c->pfn_wglDXRegisterObjectNV ||
-		    !c->pfn_wglDXLockObjectsNV || !c->pfn_wglDXUnlockObjectsNV) {
-			U_LOG_E("WGL_NV_DX_interop2 not available — shared texture requires NVIDIA or AMD GPU");
-			free(c);
-			return XRT_ERROR_OPENGL;
-		}
-
-		// Create D3D11 device for interop
+		// D3D11 device used only to open + upload the app's shared texture.
 		HRESULT hr = D3D11CreateDevice(
 		    NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
 		    NULL, 0, D3D11_SDK_VERSION,
 		    &c->dx_device, NULL, &c->dx_context);
 		if (FAILED(hr)) {
-			U_LOG_E("Failed to create D3D11 device for GL interop: 0x%08x", hr);
+			U_LOG_E("Failed to create D3D11 device for GL shared texture: 0x%08x", hr);
 			free(c);
 			return XRT_ERROR_OPENGL;
 		}
 
-		// Open the shared D3D11 texture
+		// Open the app's shared D3D11 texture (its present surface).
 		hr = c->dx_device->OpenSharedResource(
 		    (HANDLE)shared_texture_handle,
 		    __uuidof(ID3D11Texture2D), (void **)&c->dx_shared_texture);
@@ -4443,36 +4518,27 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		c->shared_width = desc.Width;
 		c->shared_height = desc.Height;
 
-		// Register D3D11 device with WGL
-		c->dx_interop_device = c->pfn_wglDXOpenDeviceNV(c->dx_device);
-		if (!c->dx_interop_device) {
-			U_LOG_E("wglDXOpenDeviceNV failed: %lu", GetLastError());
-			c->dx_shared_texture->Release();
-			c->dx_context->Release();
-			c->dx_device->Release();
-			free(c);
-			return XRT_ERROR_OPENGL;
-		}
-
-		// Create GL texture and map it to the D3D11 shared texture
+		// Plain GL render texture the runtime weaves into (no interop). The
+		// woven region is read back and uploaded to dx_shared_texture each frame.
 		glGenTextures(1, &c->shared_gl_texture);
-		c->dx_interop_object = c->pfn_wglDXRegisterObjectNV(
-		    c->dx_interop_device, c->dx_shared_texture,
-		    c->shared_gl_texture, GL_TEXTURE_2D, WGL_ACCESS_READ_WRITE_NV);
-		if (!c->dx_interop_object) {
-			U_LOG_E("wglDXRegisterObjectNV failed: %lu", GetLastError());
-			glDeleteTextures(1, &c->shared_gl_texture);
-			c->pfn_wglDXCloseDeviceNV(c->dx_interop_device);
-			c->dx_shared_texture->Release();
-			c->dx_context->Release();
-			c->dx_device->Release();
-			free(c);
-			return XRT_ERROR_OPENGL;
-		}
+		glBindTexture(GL_TEXTURE_2D, c->shared_gl_texture);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)c->shared_width,
+		             (GLsizei)c->shared_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glBindTexture(GL_TEXTURE_2D, 0);
+
+		// Dedicated present FBO (see shared_present_fbo): NOT c->fbo, which the
+		// DP crop reuses and would clobber.
+		glGenFramebuffers(1, &c->shared_present_fbo);
+		glBindFramebuffer(GL_FRAMEBUFFER, c->shared_present_fbo);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+		                        c->shared_gl_texture, 0);
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
 		c->has_shared_texture = true;
-		U_LOG_W("D3D11/GL interop initialized: shared texture %ux%u mapped to GL texture %u",
-		         c->shared_width, c->shared_height, c->shared_gl_texture);
+		U_LOG_W("GL shared-texture present: %ux%u (glReadPixels readback bridge)",
+		         c->shared_width, c->shared_height);
 	}
 #elif defined(__APPLE__)
 	// macOS: create window/context via NSOpenGLView helper
