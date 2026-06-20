@@ -59,42 +59,62 @@ Weaving interleaves L/R views at the **subpixel** level, and **weave phase is lo
 
 Browser present-ownership is one of the few cases satisfying (1): the weave happens **locally, same GPU → same panel, native-res, no transport**. That is precisely why it works where streaming fails.
 
-### 2.3 The target API — `session.displayXR.weave()`
+### 2.3 The target API — a window-bound weave session + per-element `weave()`
 
-Extend the `session.displayXR` namespace (Chapter 1) with a frame-path call:
+**The browser never weaves** (see §2.4). It hands DXR a texture handle and gets a weaved handle back; the **DP weaves inside DXR**, exactly as for a native app. Because weave phase is locked to the element's absolute screen position, the DP must also track the **browser window's** moves/resizes (Leia *phase-snaps* the interlace to the window's panel position). So the page establishes a **weave session bound to the browser's OS window handle**, then weaves per element:
 
 ```
-weavedTexture = session.displayXR.weave(srcStereoTexture, screenRect, eyes)
+// once: bind Chrome's window so the DP can phase-snap on move/resize
+session.displayXR.bindWindow(browserWindowHandle)   // reuses XR_EXT_{win32,cocoa}_window_binding
+
+// per frame, per weaved element — a GPU handle round-trip, both ways zero-copy:
+weavedHandle = session.displayXR.weave(preWeaveHandle, windowRelativeRect, eyes)
 ```
 
-- **`srcStereoTexture`** — the page's pre-weave stereo content (e.g. SBS in a `<canvas>` / WebGL FBO).
-- **`screenRect`** — the element's absolute **device-pixel** rect on the physical panel (so phase is correct).
-- **`eyes`** — current eye positions; head-tracked weave, sourced from the existing bridge eye-pose feed. `weave()` **composes with**, does not replace, the Chapter 1 metadata.
-- The browser composites the returned weaved texture into the page at `screenRect` and presents locally.
+- **`preWeaveHandle`** — shared GPU handle to the element's pre-weave stereo content (SBS `<canvas>` / WebGL FBO).
+- **`windowRelativeRect`** — the element's device-pixel rect *within the window*. DXR combines it with the HWND-tracked window position to get the absolute-screen phase, so dragging/resizing the Chrome window re-snaps phase automatically.
+- **`eyes`** — current eye poses (existing Chapter 1 bridge feed). `weave()` **composes with**, does not replace, the Chapter 1 metadata.
+- DXR routes `{handle, rect, eyes, window-position}` to the DP, which weaves at the correct phase and returns a weaved shared handle the browser composites at that rect and presents.
+
+```
+browser (present-owner)                 DXR (runtime/service)           DP (vendor plug-in)
+  bindWindow(handle)        ──────────▶  track window move/resize  ──▶  phase-snap source
+  export pre-weave canvas   ──handle──▶  weave(handle, rect, eyes)  ──▶  weave at window-
+    as shared GPU handle                                                  position + rect phase
+  composite weaved quad     ◀─handle──   return weaved shared handle ◀──  weaved texture
+    at rect, present
+```
+
+**Relationship to a texture-class app — it *is* one.** Architecturally this is a [texture-class app](../getting-started/app-classes.md): a present-owner that owns its OS window (passes the real window handle for DP position tracking / phase-snap), hands the runtime pre-weave textures for canvas sub-rects, lets the DP weave them, and composites/presents itself. A texture app **already** submits any number of 2D + 3D zones with z-order and transparency via [display-zones](display-zones.md) — so the browser adds **no new capability**. It differs only in:
+1. **Who authors the zone layout, and how often.** The zones are driven **live by the DOM compositor** — they scroll/move/zoom every frame at positions chosen by web content, not by the app author. Occlusion and the 2D surround are the DOM itself (layout rect → 3D zone; everything else → 2D).
+2. **The process boundary** — the weave is a **cross-process per-frame RPC** to the service, not an in-process texture compositor.
+
+So we reuse the texture + window-binding + display-zones machinery wholesale rather than inventing a new path. The genuinely new engineering is the per-frame weave RPC and the DOM-driven dynamic-zone bookkeeping.
 
 **What falls out for free:**
-- **Mixed 2D/3D comes from the DOM**, not app-side zone machinery. The page's HTML *is* the 2D surround; the weaved `<canvas>` *is* the 3D zone. Browser layout already composites "flat content around one special element," so the [display-zones](display-zones.md) result is expressed as ordinary page layout. Layout rect → 3D zone; everything else → 2D.
+- **Mixed 2D/3D comes from the DOM**, not app-side zone machinery (point 1 above).
 - **Reach.** Any three.js / WebGL / WebGPU developer adds 3D with one call — no native build, no OpenXR, no installer. This is how content *volume* happens.
 
 **Why it's hard (and needs real browser cooperation):**
-1. **Phase/position under async compositing.** Scroll, window drag, and zoom move the element's physical-panel position every frame. If the browser composites the weave even one device-pixel off from the `screenRect` the weave assumed, the lattice misaligns and the 3D collapses. Chromium's compositor (Viz) is async/threaded, so "weave-assumed position == final composited position" is the core engineering problem.
+1. **Phase/position under async compositing.** Scroll, window drag, and zoom move the element every frame. If Viz composites the weaved quad even one device-pixel off from the `windowRelativeRect` DXR weaved for, the lattice misaligns and the 3D collapses — so the rect must be the *committed* compositor position, and window moves must reach the DP (via the bound handle) to re-snap phase.
 2. **DPI / fractional zoom** — CSS px ≠ canvas backing store ≠ device px; weave needs device-pixel-exact alignment.
-3. **Zero-copy GPU texture access** — the page's canvas/WebGL backing texture must be shared with the weaver without a CPU copy. Earlier texture attempts were slow precisely because they were CPU readback / cross-process copies; the only viable version is a shared GPU handle (Windows: DXGI/NT shared handle + keyed mutex). Stock Chrome does not expose that handle to an outside process — **this is the cooperation that requires a Chromium change.**
+3. **Zero-copy GPU handle access** — the page's canvas/WebGL backing must be shared as a GPU handle, never a CPU copy (earlier attempts were slow precisely because they were CPU readback). The round-trip is shared-handle both ways (Windows: DXGI/NT shared handle + keyed mutex). Stock Chrome does not expose that handle to an outside process — **this is the cooperation that requires a Chromium change.**
 
-### 2.4 Implementation path — straight to Chromium patches
+### 2.4 Implementation path — DXR weave RPC first; the browser never weaves
 
-We go **directly to GPU-texture-level Chromium work** — no OS-overlay intermediate.
+**The browser must never contain weave code.** Weaving is **vendor** code — each DP's calibrated, per-display shader. Embedding it in the browser would mean every display vendor ships and maintains a weave shader *inside every browser*, which breaks vendor isolation (ADR-019: all vendor code stays behind the plug-in; the runtime DLL itself carries zero vendor identifiers) and ADR-007 (only the DP weaves). So the browser only ever **hands DXR a texture handle and gets a weaved handle back** — the DP weaves inside DXR, behind DXR's generic API, exactly as for native apps. The browser stays 100% vendor-agnostic.
 
-> **Rejected: OS-overlay compositing.** A transparent always-on-top window weaving over a page-reserved rect (the avatar-overlay technique) needs no browser changes, but it gives **wrong z-order** (the overlay floats above all page content — no dropdown/header/scrollbar can occlude it), **scroll-chase latency**, and only a **companion renderer** rather than the page's own WebGL. It is a dead end for true inline 3D, so we skip it.
+> **Rejected: weaving inside the browser** (e.g. a Viz compositor pass) — would require every vendor's weaver in every browser. Non-starter.
+> **Rejected: OS-overlay compositing** — a transparent always-on-top window over a page-reserved rect (avatar-overlay technique) gives **wrong z-order** (no DOM element can occlude it), **scroll-chase latency**, and only a **companion renderer** rather than the page's own WebGL.
 
-**Step A — CEF prototype harness (Chromium-faithful, no source fork).** Use **CEF (Chromium Embedded Framework)** in **offscreen-render (OSR)** mode. Its `OnAcceleratedPaint` callback hands a **shared D3D11 texture of the fully-composited page** — zero-copy, no source changes:
-1. Page draws its stereo SBS pair into the zone canvas.
-2. CEF hands the whole-page texture via `OnAcceleratedPaint`.
-3. Crop the zone sub-rect, weave it (phase = its known screen rect), composite back, present.
+Order of work, smallest testable first:
 
-Because *you* own present in OSR, this is present-ownership working as intended, and z-order is correct (the weave replaces the flat canvas in the composited page). It's Chromium, so it represents the eventual real-Chrome target, and `OnAcceleratedPaint` *is* the cooperation hook as public API. **This validates the `weave()` contract zero-copy** before touching upstream Chromium.
+**Step 0 — DXR weave RPC (in-tree, no browser).** Add a window-bound one-shot weave service to `displayxr-service`:
+`bindWindow(handle)` + `weave(shared_handle, window_relative_rect, eyes) → weaved_shared_handle`. It imports the handle, runs the **DP** weave at the phase derived from window-position + rect, and exports the weaved handle. This is the load-bearing new runtime capability — a synchronous weave *service* distinct from the steady swapchain frame loop, and it reuses the existing texture + window-binding + DP `process_atlas`/weave paths. **Testable with zero browser:** a tiny native client hands it a known SBS texture + rect + eyes and checks the weaved output on a **Leia SR Windows box**. First milestone.
 
-**Step B — minimal, rebasable Chromium patch.** A small patch series — expose the page's canvas/WebGL SharedImage handle to the weaver + a flagged `session.displayXR.weave` — kept rebasable against Chrome's release cadence. This is **both** the way we ship inline 3D to our own users (a patched Chromium/CEF distribution) **and** the reference implementation a standards proposal needs. Deliberately *not* a maintained product fork (see §2.5).
+**Step A — CEF host as browser stand-in (no host-side weave).** Fork `cefsimple` in **offscreen-render (OSR)** mode; `OnAcceleratedPaint` hands a **shared D3D11 texture of the composited page** — zero-copy, public CEF API, no source changes. The host exports the zone sub-rect handle, **drives the Step-0 RPC** (the real DP through the real contract — *not* a host-side weave shader), composites the returned handle, and presents. Because CEF owns present in OSR, z-order is correct (the weave replaces the flat canvas in the composited page). Validates the full round-trip + phase/position under scroll/zoom on a Chromium-faithful engine.
+
+**Step B — minimal, rebasable Chromium patch (vendor-free).** Bind Chrome's window handle to the weave session (reuse `XR_EXT_{win32,cocoa}_window_binding`), export each weaved canvas's `SharedImage` as a shared handle, call the **same Step-0 RPC**, composite the returned quad in Viz at its committed rect. Test in **`content_shell`** (the minimal Chromium embedder — builds far faster than full `chrome`), then `chrome`, on a Leia panel. The patch contains only **handle export/import + the RPC call + the JS surface (`bindWindow`/`weave`)** — zero vendor code, zero weave shader in Chromium. Kept rebasable against Chrome's release cadence; it is **both** how we ship inline 3D to our own users (a patched Chromium/CEF distribution) **and** the reference implementation a standards proposal needs. Deliberately *not* a maintained product fork (see §2.5).
 
 ### 2.5 Adoption — does a Chromium fork accelerate browser-owner uptake?
 
@@ -112,8 +132,9 @@ So the right artifact for (4) is the **minimal rebasable patch of §2.4 Step B**
 
 ### 2.6 Sequencing
 
-1. **CEF OSR prototype** (§2.4 Step A) — validate `session.displayXR.weave(canvas)` zero-copy on a Chromium-faithful engine; solve phase/position under scroll/zoom.
-2. **Minimal rebasable Chromium patch** (§2.4 Step B) — SharedImage handle exposure + flagged `weave`; ship to our users via a patched distribution; serve as the reference impl.
-3. **Standards push, in parallel** (non-engineering) — a WICG explainer/spec for a non-immersive 3D-display WebXR module, backed by the demos from steps 1–2 and a hardware-install-base narrative.
+1. **DXR weave RPC** (§2.4 Step 0) — window-bound `bindWindow` + `weave(handle, rect, eyes)`; validate the DP round-trip **and its per-frame latency** headless on a Leia box, no browser.
+2. **CEF OSR host** (§2.4 Step A) — drive that RPC from `OnAcceleratedPaint`; solve phase/position under scroll/zoom on a Chromium-faithful engine.
+3. **Minimal rebasable Chromium patch** (§2.4 Step B) — window binding + canvas `SharedImage` handle export + the RPC call + the `bindWindow`/`weave` JS surface; test in `content_shell`; ship to our users via a patched distribution; serve as the reference impl.
+4. **Standards push, in parallel** (non-engineering) — a WICG explainer/spec for a non-immersive 3D-display WebXR module, backed by the demos from steps 1–3 and a hardware-install-base narrative.
 
-**One-line takeaway:** the patch makes the *demo* and the *product* possible; the **spec + hardware story** is what makes browser owners adopt. Spend engineering on a small rebasable patch + CEF harness, and put the weight behind standards.
+**One-line takeaway:** the DXR weave RPC + patch make the *demo* and the *product* possible; the **spec + hardware story** is what makes browser owners adopt. Spend engineering on the weave RPC + a small rebasable patch + CEF harness, and put the weight behind standards.
