@@ -212,16 +212,56 @@ common_shutdown(volatile struct ipc_client_state *ics)
 #ifndef XRT_OS_WINDOWS // Unix (Linux, Android, macOS)
 
 /*!
+ * Read exactly @p size bytes from the client socket into @p buf, looping over
+ * partial reads. SOCK_STREAM has no message boundaries, so a single recv() can
+ * return fewer bytes than requested when a peer's framed message arrives in
+ * fragments under load — the old code treated that short read as a fatal
+ * "invalid packet" and tore the connection down, which surfaced on the client
+ * as a spurious IPC failure. Returns false on EOF or a real error. See #61.
+ */
+static bool
+recv_exact(volatile struct ipc_client_state *ics, void *buf, size_t size, int flags)
+{
+	uint8_t *bytes = (uint8_t *)buf;
+	size_t got = 0;
+
+	while (got < size) {
+		// MSG_PEEK does not consume, so it always restarts from the head of
+		// the buffer: peek the full amount into the front of buf each pass
+		// rather than advancing the offset.
+		void *dst = (flags & MSG_PEEK) ? (void *)bytes : (void *)(bytes + got);
+		size_t want = (flags & MSG_PEEK) ? size : (size - got);
+
+		ssize_t len = recv(ics->imc.ipc_handle, dst, want, flags);
+		if (len < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			IPC_ERROR(ics->server, "recv() failed: '%s'.", strerror(errno));
+			return false;
+		}
+		if (len == 0) {
+			// Peer closed the connection.
+			return false;
+		}
+
+		got = (flags & MSG_PEEK) ? (size_t)len : got + (size_t)len;
+	}
+
+	return true;
+}
+
+/*!
  * Common dispatch logic shared by all Unix client loops.
  * Returns true if the loop should continue, false to break.
  */
 static bool
 unix_dispatch_command(volatile struct ipc_client_state *ics)
 {
-	// Peek the first 4 bytes to get the command type
+	// Peek the first 4 bytes to get the command type (looped so a fragmented
+	// header doesn't read as a truncated command).
 	enum ipc_command cmd;
-	ssize_t len = recv(ics->imc.ipc_handle, &cmd, sizeof(cmd), MSG_PEEK);
-	if (len != sizeof(cmd)) {
+	if (!recv_exact(ics, &cmd, sizeof(cmd), MSG_PEEK | MSG_WAITALL)) {
 		IPC_ERROR(ics->server, "Invalid command received.");
 		return false;
 	}
@@ -232,11 +272,11 @@ unix_dispatch_command(volatile struct ipc_client_state *ics)
 		return false;
 	}
 
-	// Read the whole command now that we know its size
+	// Read the whole command now that we know its size (looped over partial
+	// reads — a short read here is mid-message data, not a bad packet).
 	uint8_t buf[IPC_BUF_SIZE] = {0};
 
-	len = recv(ics->imc.ipc_handle, &buf, cmd_size, 0);
-	if (len != (ssize_t)cmd_size) {
+	if (!recv_exact(ics, buf, cmd_size, 0)) {
 		IPC_ERROR(ics->server, "Invalid packet received, disconnecting client.");
 		return false;
 	}
