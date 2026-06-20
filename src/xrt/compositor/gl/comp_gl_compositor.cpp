@@ -295,6 +295,13 @@ struct comp_gl_compositor
 	bool owns_window;
 	bool has_shared_iosurface;
 	GLuint iosurface_gl_texture;    //!< GL texture backed by shared IOSurface
+	//! Dedicated FBO with iosurface_gl_texture attached. MUST be distinct from
+	//! c->fbo: the DP crop helpers temporarily rebind c->fbo's attachment to the
+	//! atlas texture, so reusing c->fbo as the present target would clobber where
+	//! the weave/composite lands (also required so gl_composite_local_2d can lerp
+	//! into the IOSurface target while its internal crop uses c->fbo). Windows
+	//! parity: shared_present_fbo.
+	GLuint iosurface_present_fbo;
 	uint32_t iosurface_width;
 	uint32_t iosurface_height;
 #endif
@@ -3366,26 +3373,55 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 #endif
 #ifdef __APPLE__
 	if (c->has_shared_iosurface) {
-		// Shared IOSurface mode: render into the IOSurface
-		glBindFramebuffer(GL_FRAMEBUFFER, c->fbo);
-		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-		                        GL_TEXTURE_RECTANGLE, c->iosurface_gl_texture, 0);
+		// Shared IOSurface mode: render into the IOSurface via its dedicated
+		// FBO. Unlike the Windows D3D path, the GL→IOSurface write is direct
+		// (the GL texture IS the IOSurface backing) — no readback bridge
+		// needed. But the zones present must mirror the Windows leg otherwise:
+		// dedicated FBO (the DP crop clobbers c->fbo), a transparent clear, the
+		// window-dims zone weave, and the masked composite (for see-through +
+		// Local2D). Content stays GL bottom-up; the app's blit must NOT flip Y.
+		glBindFramebuffer(GL_FRAMEBUFFER, c->iosurface_present_fbo);
+
+		// Clear the whole IOSurface to transparent first: in a zones frame the
+		// composite/weave only paints the window sub-rect viewport, so the
+		// surround must read through (alpha 0), not show stale pixels.
+		glDisable(GL_SCISSOR_TEST);
+		glViewport(0, 0, c->iosurface_width, c->iosurface_height);
+		glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+		glClear(GL_COLOR_BUFFER_BIT);
 
 		if (c->display_processor != NULL) {
-			// DP target: use canvas dims for texture apps.
-			// XR_EXT_display_zones: zones frames span the full surface
-			// (output rect inert; see the shared-texture @todo above).
+			// DP target dims: canvas for texture apps; the full surface
+			// otherwise.
 			uint32_t dp_w = c->iosurface_width;
 			uint32_t dp_h = c->iosurface_height;
 			if (c->canvas.valid && !c->zones_frame && c->canvas.w > 0 && c->canvas.h > 0) {
 				dp_w = c->canvas.w;
 				dp_h = c->canvas.h;
+			} else if (c->zones_frame) {
+				// XR_EXT_display_zones: the zone PLACEMENT (layer_commit)
+				// scales zone rects into the atlas tile by tile/window, so
+				// the weave OUTPUT must be the window client dims too — NOT
+				// the full IOSurface. Parity with the Windows shared path.
+				uint32_t win_w = 0, win_h = 0;
+				comp_gl_window_macos_get_dimensions(c->macos_window, &win_w, &win_h);
+				if (win_w > 0 && win_h > 0) {
+					dp_w = win_w;
+					dp_h = win_h;
+				}
 			}
-			// Crop atlas to content dims, then pass to DP
-			gl_crop_and_process_dp(c, atlas_for_present, dp_w, dp_h);
+
+			// Run the #439/#491/zones masked composite (transparency +
+			// Local2D + zone wish) INTO the dedicated IOSurface FBO, exactly
+			// like the window-present path. Falls back to the plain weave when
+			// no composite is needed (the helper returns false). The zone-wish
+			// publish to the DP happens once at end of layer_commit via
+			// gl_sync_zone_mask_to_dp, which consumes the resolved wish.
+			if (!gl_composite_local_2d(c, atlas_for_present, c->iosurface_present_fbo, dp_w, dp_h)) {
+				gl_crop_and_process_dp(c, atlas_for_present, dp_w, dp_h);
+			}
 		} else {
 			// No display processor: simple blit, no Y-flip.
-			// Content stays GL bottom-up; app's blit shader must NOT flip Y.
 			glViewport(0, 0, c->iosurface_width, c->iosurface_height);
 			glUseProgram(c->program_blit);
 			glBindVertexArray(c->vao_empty);
@@ -3406,9 +3442,6 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 		glFlush();
 
-		// Restore FBO
-		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-		                        GL_TEXTURE_RECTANGLE, 0, 0);
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	} else
 #endif
@@ -3700,6 +3733,9 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 		DestroyWindow(c->hwnd);
 	}
 #elif defined(__APPLE__)
+	if (c->iosurface_present_fbo) {
+		glDeleteFramebuffers(1, &c->iosurface_present_fbo);
+	}
 	if (c->iosurface_gl_texture) {
 		glDeleteTextures(1, &c->iosurface_gl_texture);
 	}
@@ -4565,6 +4601,16 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		c->iosurface_gl_texture = io_tex;
 		c->iosurface_width = io_w;
 		c->iosurface_height = io_h;
+
+		// Dedicated present FBO (see iosurface_present_fbo): NOT c->fbo, which
+		// the DP crop reuses and would clobber. The IOSurface is a
+		// GL_TEXTURE_RECTANGLE.
+		glGenFramebuffers(1, &c->iosurface_present_fbo);
+		glBindFramebuffer(GL_FRAMEBUFFER, c->iosurface_present_fbo);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+		                        GL_TEXTURE_RECTANGLE, c->iosurface_gl_texture, 0);
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
 		c->has_shared_iosurface = true;
 	} else if (window_handle != NULL) {
 		// App provided an NSView — set up external
