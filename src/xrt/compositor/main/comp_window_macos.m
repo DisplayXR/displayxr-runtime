@@ -66,6 +66,26 @@
 @end
 
 /*!
+ * Borderless NSWindow subclass for the full-screen workspace surface (#61). A
+ * plain borderless NSWindow returns canBecomeKeyWindow = NO, so it would never
+ * become key and the AppKit pump would receive no input. Override it so the
+ * title-bar-less full-screen workspace window can focus + forward input.
+ */
+@interface CompWindowMacosWindow : NSWindow
+@end
+
+@implementation CompWindowMacosWindow
+- (BOOL)canBecomeKeyWindow
+{
+	return YES;
+}
+- (BOOL)canBecomeMainWindow
+{
+	return YES;
+}
+@end
+
+/*!
  * A macOS present target.
  *
  * @implements comp_target_swapchain
@@ -121,31 +141,44 @@ create_window_on_main_thread(struct comp_window_macos *cwm, uint32_t width, uint
 	// display (its point aspect == the physical-pixel aspect == the atlas
 	// aspect), so derive the window shape from it. Fit to ~85% of the screen
 	// height so the title bar stays reachable. (#48 aspect fix.)
+	// Full-screen workspace surface (#61): cover the WHOLE main display at native
+	// resolution. The single-app OOP model assumes the client fills the display —
+	// the runtime composites workspace chrome / overlays / cursor display-relative
+	// and the controller's hit-test uses the display dims — so a smaller floating
+	// window made the rendered pill, the hit-test quad, and the cursor-pixel
+	// mapping disagree. A full-display window makes all three consistent and
+	// matches Windows. NSScreen.frame is the full display (point aspect == the
+	// physical-pixel atlas aspect, so no squish).
 	CGFloat win_w = (CGFloat)width;
 	CGFloat win_h = (CGFloat)height;
 	NSScreen *screen = [NSScreen mainScreen];
 	if (screen != nil) {
 		NSRect sf = screen.frame;
 		if (sf.size.width > 0 && sf.size.height > 0) {
-			CGFloat aspect = sf.size.width / sf.size.height;
-			win_h = sf.size.height * 0.85;
-			win_w = win_h * aspect;
+			win_w = sf.size.width;
+			win_h = sf.size.height;
 		}
 	}
 
-	NSRect frame = NSMakeRect(100, 100, win_w, win_h);
-	NSWindowStyleMask style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable |
-	                          NSWindowStyleMaskMiniaturizable;
+	NSRect frame = (screen != nil) ? screen.frame : NSMakeRect(0, 0, win_w, win_h);
+	// Borderless so there is no title bar over the workspace chrome; the subclass
+	// restores key-window eligibility a borderless window loses.
+	NSWindowStyleMask style = NSWindowStyleMaskBorderless;
 
-	cwm->window = [[NSWindow alloc] initWithContentRect:frame
-	                                          styleMask:style
-	                                            backing:NSBackingStoreBuffered
-	                                              defer:NO];
+	cwm->window = [[CompWindowMacosWindow alloc] initWithContentRect:frame
+	                                                       styleMask:style
+	                                                         backing:NSBackingStoreBuffered
+	                                                           defer:NO];
 	if (cwm->window == nil) {
 		U_LOG_E("comp_window_macos: failed to create NSWindow");
 		*out_success = false;
 		return;
 	}
+
+	// Float above the menu bar so the chrome pill (just inside the top edge) is
+	// visible + clickable; hide the menu bar + dock while the workspace is up.
+	[cwm->window setLevel:NSMainMenuWindowLevel + 1];
+	[NSApp setPresentationOptions:NSApplicationPresentationAutoHideMenuBar | NSApplicationPresentationAutoHideDock];
 
 	// NSWindow defaults releasedWhenClosed=YES, but the struct holds the window
 	// as an unretained pointer (retained only by NSApp's window list). If the user
@@ -173,8 +206,17 @@ create_window_on_main_thread(struct comp_window_macos *cwm, uint32_t width, uint
 	cwm->metal_layer.contentsScale = scale;
 	cwm->metal_layer.drawableSize = CGSizeMake(win_w * scale, win_h * scale);
 
+	// Deliver bare mouse-moved events (no button held) so the workspace gets hover
+	// motion, not just clicks/drags (#61).
+	[cwm->window setAcceptsMouseMovedEvents:YES];
+
 	[cwm->window makeKeyAndOrderFront:nil];
 	[NSApp activateIgnoringOtherApps:YES];
+
+	// Hide the OS cursor (#61): the workspace renders its own cursor sprite, so the
+	// system arrow would double up (matches Windows). Mouse position still tracked
+	// via the per-cycle CGEventGetLocation poll in the AppKit pump.
+	CGDisplayHideCursor(kCGDirectMainDisplay);
 
 	*out_success = true;
 }
@@ -272,6 +314,10 @@ comp_window_macos_destroy(struct comp_target *ct)
 	struct comp_window_macos *cwm = (struct comp_window_macos *)ct;
 
 	comp_target_swapchain_cleanup(&cwm->base);
+
+	// Restore the OS cursor + menu bar/dock hidden while the workspace was up (#61).
+	CGDisplayShowCursor(kCGDirectMainDisplay);
+	[NSApp setPresentationOptions:NSApplicationPresentationDefault];
 
 	if (cwm->window != nil) {
 		NSWindow *w = cwm->window;

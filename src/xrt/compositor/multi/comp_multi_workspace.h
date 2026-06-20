@@ -107,6 +107,23 @@ void
 comp_multi_workspace_chrome_clear(struct xrt_compositor *target_xc);
 
 /*!
+ * Set the minimized/hidden state for a managed content client (#61). When hidden,
+ * the macOS per-session render path renders a black "desktop canvas" plus the
+ * workspace overlays/cursor instead of the client's content, so the taskbar stays
+ * visible while the app is minimized. Uses find-or-add: may be called before chrome
+ * is registered for @p target_xc.
+ */
+void
+comp_multi_workspace_set_window_visibility(struct xrt_compositor *target_xc, bool visible);
+
+/*!
+ * Query whether @p target_xc is currently hidden/minimized (#61). Returns false if
+ * no state is registered for the client.
+ */
+bool
+comp_multi_workspace_is_window_hidden(struct xrt_compositor *target_xc);
+
+/*!
  * Window-dims query for the macOS workspace get_window_pose IPC handler. In the
  * single-app OOP model the client fills the display, so this returns the display
  * dims as the client's window size and an identity pose. Returns false if @p xc

@@ -106,6 +106,24 @@ get_orchestrator_workspace_pid(void)
 	return s_workspace_pid_provider ? s_workspace_pid_provider() : 0;
 }
 
+// The effective workspace-controller pid for input/command authorization. The
+// orchestrator only knows a pid for a controller it SPAWNED (Windows Ctrl+Space
+// trampoline). A manually-launched controller — the macOS shell (#61), and any
+// dev/CLI-launched shell — instead registers itself via xrActivateWorkspaceEXT,
+// which sets s->workspace_controller_pid. Prefer that activate-registered pid and
+// fall back to the orchestrator's. On Windows both agree (the orchestrator spawns
+// the shell, which then activates), so this is a no-op there; on macOS it closes
+// the otherwise-open input gate so the controller — not a content app polling
+// xrEnumerateWorkspaceInputEventsEXT — owns the forwarded input stream.
+static unsigned long
+effective_workspace_controller_pid(struct ipc_server *s)
+{
+	if (s != NULL && s->workspace_controller_pid != 0) {
+		return s->workspace_controller_pid;
+	}
+	return get_orchestrator_workspace_pid();
+}
+
 static ipc_server_workspace_supports_file_dialog_fn s_workspace_file_dialog_provider = NULL;
 
 void
@@ -3731,6 +3749,17 @@ ipc_handle_workspace_set_window_visibility(volatile struct ipc_client_state *_ic
 
 	os_mutex_unlock(&s->global_state.lock);
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
+#elif defined(XRT_OS_MACOS)
+	// macOS OOP: record the minimized/hidden state in the workspace registry. The
+	// per-session render path (render_per_session_clients_locked) reads it and
+	// renders a black desktop canvas + overlays for a hidden client instead of
+	// skipping it, so the taskbar stays visible while minimized (#61).
+	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	if (target_xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	comp_multi_workspace_set_window_visibility(target_xc, visible);
+	return XRT_SUCCESS;
 #else
 	(void)s;
 	(void)client_id;
@@ -4089,7 +4118,9 @@ ipc_handle_workspace_enumerate_input_events(volatile struct ipc_client_state *_i
 {
 	struct ipc_server *s = _ics->server;
 
-	unsigned long expected_pid = get_orchestrator_workspace_pid();
+	// Use the activate-registered controller pid (macOS shell, #61) so a content
+	// app polling this same global queue can't steal the controller's input.
+	unsigned long expected_pid = effective_workspace_controller_pid(s);
 	unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
 	if (expected_pid != 0 && caller_pid != expected_pid) {
 		return XRT_ERROR_NOT_AUTHORIZED;
