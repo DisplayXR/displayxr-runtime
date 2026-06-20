@@ -30,7 +30,7 @@ These are standard OpenXR apps (including WebXR apps on Windows) that:
 - Create swapchains once with fixed dimensions
 - Cannot adapt when the runtime switches modes (e.g., 3D <-> 2D via qwerty device)
 
-> **WebXR pages can escape the legacy limitation** without modifying the runtime or Chrome. The [WebXR Bridge v2](../../roadmap/webxr-bridge-v2-plan.md) ships a Chrome extension + a small native sideband that exposes display info and rendering-mode events to the JS page. The page can then override its `XRWebGLLayer` framebuffer dimensions to match the current mode, replacing the legacy compromise at runtime. The OpenXR session itself stays legacy — the override is purely at the WebXR layer.
+> **WebXR pages can escape the legacy limitation** without modifying the runtime or Chrome. The [WebXR Bridge v2](../../roadmap/webxr-support.md) ships a Chrome extension + a small native sideband that exposes display info and rendering-mode events to the JS page. The page can then override its `XRWebGLLayer` framebuffer dimensions to match the current mode, replacing the legacy compromise at runtime. The OpenXR session itself stays legacy — the override is purely at the WebXR layer.
 
 The problem: `recommendedImageRectWidth/Height` is computed once at `xrGetSystem` time using `recommended_view_scale_x/y`. Currently this is set to the **minimum scale across all modes** (0.5x0.5 for both a typical hardware DP and sim_display), which means:
 - In 3D mode (SBS, 0.5x0.5): tiles fit correctly

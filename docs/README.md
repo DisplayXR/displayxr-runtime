@@ -139,7 +139,7 @@ Design docs, status trackers, and plans — some shipped, some in progress. Afte
 - [Workspace Activation Auth Handshake](roadmap/spatial-workspace-auth-handshake.md) — Phase 2.0 prep: orchestrator-PID match replaces the brand-coupled `application_name == "displayxr-shell"` check
 - [Phase 2 Audit](roadmap/spatial-workspace-extensions-phase2-audit.md) — line-by-line classification of the remaining `shell` mentions in `comp_d3d11_service.cpp`
 - [Per-App MCP Tools & Workspace Aggregator](roadmap/per-app-mcp-tools.md) — apps register their own MCP tools via `XR_EXT_mcp_tools`; one-connection `--target workspace` aggregator with `<app-id>__<tool>` namespacing
-- [WebXR Bridge v2 Plan](roadmap/webxr-bridge-v2-plan.md) — metadata/control sideband for Chrome's native WebXR
+- [WebXR Support — Status & Roadmap](roadmap/webxr-support.md) — shipped Bridge v2 metadata sideband + the inline-3D (`session.displayXR.weave()`) roadmap via Chromium patches
 - [Display Zones](roadmap/display-zones.md) — N 3D zones + 2D zones + wish mask: avatar migration + phased plan (ADR-027)
 - [Display Spatial Model](roadmap/display-spatial-model.md) — displays in the spatial graph (#46)
 - [Multi-Display Single Machine](roadmap/multi-display-single-machine.md) — multiple displays, one machine (#69)

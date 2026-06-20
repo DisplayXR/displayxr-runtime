@@ -62,6 +62,6 @@ All documents in `docs/roadmap/` describe planned features that are not yet impl
 - [Display Spatial Model](display-spatial-model.md) — displays in the spatial graph
 - [Multi-Display Single Machine](multi-display-single-machine.md) — multiple displays, one machine
 - [Multi-Display Networked](multi-display-networked.md) — displays across the network
-- [Browser Inline 3D Strategy](browser-inline-3d-strategy.md) — `session.displayXR.weave()`, present-ownership in the browser, prototyping routes, and the fork-vs-standards path to browser-owner adoption
+- [WebXR Support — Status & Roadmap](webxr-support.md) — shipped Bridge v2 metadata sideband + the inline-3D (`session.displayXR.weave()`) roadmap, prototyping via Chromium patches, and the fork-vs-standards adoption path
 - [XR_VIEW_CONFIGURATION_PRIMARY_MULTIVIEW](XR_VIEW_CONFIGURATION_PRIMARY_MULTIVIEW.md) — Khronos multiview proposal
 - [MCP Spec](https://github.com/DisplayXR/displayxr-mcp/blob/main/docs/mcp-spec.md) — AI-native runtime: expose live spatial state and control to agents over Model Context Protocol (extracted to [`DisplayXR/displayxr-mcp`](https://github.com/DisplayXR/displayxr-mcp))

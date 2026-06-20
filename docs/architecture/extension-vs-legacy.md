@@ -18,7 +18,7 @@ Orthogonal to the [four app classes](../getting-started/app-classes.md), apps ar
   - A DisplayXR-aware `_hosted` app enables `XR_EXT_display_info` → **extension app**
   - A generic OpenXR `_hosted` app (e.g. WebXR, third-party) → **legacy app**
 
-> **Note on WebXR pages.** Chrome's native WebXR implementation does not enable `XR_EXT_display_info`, so a WebXR session is always a legacy app at the OpenXR level. However, a DisplayXR-aware web page can install the [WebXR Bridge v2](../roadmap/webxr-bridge-v2-plan.md) Chrome extension to read display info and rendering-mode events via a metadata sideband and override its `XRWebGLLayer` framebuffer dimensions — effectively behaving like an extension app from the developer's perspective while its underlying OpenXR session remains legacy. The runtime does not need to distinguish these cases; the legacy compromise branch still fires and is simply ignored by the page.
+> **Note on WebXR pages.** Chrome's native WebXR implementation does not enable `XR_EXT_display_info`, so a WebXR session is always a legacy app at the OpenXR level. However, a DisplayXR-aware web page can install the [WebXR Bridge v2](../roadmap/webxr-support.md) Chrome extension to read display info and rendering-mode events via a metadata sideband and override its `XRWebGLLayer` framebuffer dimensions — effectively behaving like an extension app from the developer's perspective while its underlying OpenXR session remains legacy. The runtime does not need to distinguish these cases; the legacy compromise branch still fires and is simply ignored by the page.
 
 ## Legacy App Compromise Scaling
 
