@@ -3390,9 +3390,24 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			// #439 Phase 3: when this frame carries Local2D layers or an
 			// active submitted mask, run the post-weave masked composite
 			// (DP weaves into weave_tex, then lerp M*weave+(1-M)*twod into the
-			// window). Otherwise the DP weaves straight to the window — the
+			// present target). Otherwise the DP weaves straight to it — the
 			// pre-Phase-3 path, byte-identical.
-			if (!gl_composite_local_2d(c, atlas_for_present, 0, present_w, present_h)) {
+			//
+			// The masked composite must lerp into the FBO bound just above —
+			// the off-screen DComp transit FBO on the transparent path, the
+			// readback FBO on the no-interop path, or FBO 0 (the window) on the
+			// opaque path. Passing a hardcoded 0 here was only accidentally
+			// correct for the opaque path: on the transparent DComp path it
+			// wrote the zones composite into the window default framebuffer
+			// (invisible on a WS_EX_NOREDIRECTIONBITMAP window) while the DComp
+			// present blitted the still-stale transit FBO — a static on-screen
+			// image even as the app submitted fresh frames (#613). The plain
+			// projection path (gl_crop_and_process_dp) already weaves into the
+			// bound FBO, which is why a non-zones transparent GL window animated.
+			GLint present_target_fbo = 0;
+			glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &present_target_fbo);
+			if (!gl_composite_local_2d(c, atlas_for_present, (GLuint)present_target_fbo, present_w,
+			                           present_h)) {
 				gl_crop_and_process_dp(c, atlas_for_present, present_w, present_h);
 			}
 		} else {
