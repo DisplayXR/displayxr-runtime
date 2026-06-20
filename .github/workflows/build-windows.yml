@@ -832,6 +832,57 @@ jobs:
             Copy-Item $loaderDll.FullName -Destination test_apps/cube_zones_gl_win/build/
           }
 
+  # GL/D3D11 hybrid texture-class zones parity app (#613). GL renders the zones;
+  # the shared composite target is a D3D11 KMT texture the app present-blits.
+  TestAppCubeZonesTextureGL:
+    if: needs.DetectChanges.outputs.test_apps_changed == 'true'
+    runs-on: windows-2022
+    needs: [Runtime, DetectChanges]
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Download runtime artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: DisplayXR
+          path: runtime
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install OpenXR loader
+        run: |
+          $openxrVersion = "1.1.43"
+          $openxrUrl = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$openxrVersion/openxr_loader_windows-$openxrVersion.zip"
+          Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
+          Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
+
+      - name: Build OpenGL texture-zones test app (cube_zones_texture_gl_win)
+        run: |
+          cd test_apps/cube_zones_texture_gl_win
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
+          cmake --build build
+
+      - name: Copy required DLLs
+        run: |
+          $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1
+          if (-not $loaderDll) {
+            $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1
+          }
+          if ($loaderDll) {
+            Copy-Item $loaderDll.FullName -Destination test_apps/cube_zones_texture_gl_win/build/
+          }
+
   # Vulkan test app with XR_EXT_win32_window_binding (requires Vulkan SDK)
   TestAppCubeHandleVK:
     if: needs.DetectChanges.outputs.test_apps_changed == 'true'
