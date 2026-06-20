@@ -5323,7 +5323,7 @@ ipc_handle_weave_bind_window(volatile struct ipc_client_state *ics, uint64_t hwn
 	return XRT_SUCCESS;
 #else
 	(void)hwnd;
-	return XRT_ERROR_FEATURE_UNSUPPORTED;
+	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 #endif
 }
 
@@ -5379,7 +5379,7 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 #else
 	(void)args;
 	(void)handles;
-	return XRT_ERROR_FEATURE_UNSUPPORTED;
+	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 #endif
 }
 
