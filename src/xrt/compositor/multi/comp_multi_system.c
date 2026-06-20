@@ -2482,9 +2482,15 @@ session_render_workspace_cursor(struct multi_compositor *mc,
  * @param mc The multi_compositor with per-session rendering
  * @param vk The Vulkan bundle
  * @param display_time_ns The display timestamp
+ * @param force_black When true the client is workspace-minimized (#61): skip all
+ *        content/view/atlas work and present a black desktop canvas, keeping only
+ *        the session-global overlays/cursor (taskbar) at the submit_and_present pass.
  */
 static void
-render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, int64_t display_time_ns)
+render_session_to_own_target(struct multi_compositor *mc,
+                             struct vk_bundle *vk,
+                             int64_t display_time_ns,
+                             bool force_black)
 {
 	struct comp_target *ct = mc->session_render.target;
 
@@ -2513,6 +2519,13 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		recreate_session_swapchain(mc, vk);
 		// Re-read ct since create_images updates it in place
 		ct = mc->session_render.target;
+	}
+
+	// Workspace-minimized client (#61): skip all content/view/atlas work and jump
+	// straight to acquiring + clearing the target to black. The overlays/cursor are
+	// composited at submit_and_present so the taskbar remains visible.
+	if (force_black) {
+		goto black_canvas;
 	}
 
 	// Must have at least one layer
@@ -2701,6 +2714,8 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	}
 #endif
 
+black_canvas:; // force_black (minimized) jumps here, skipping all content/view setup
+
 	// Establish frame pacing so the per-session comp_target_swapchain has a
 	// valid current_frame_id before acquire/present. render_session_to_own_target
 	// is the only consumer of this target, so it must drive pacing itself —
@@ -2792,6 +2807,42 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("[per-session] Failed to begin command buffer: %s", vk_result_string(ret));
 		return;
+	}
+
+	// Workspace-minimized desktop canvas (#61): clear the swapchain image to black,
+	// leave it in PRESENT_SRC_KHR (the layout submit_and_present's overlay composite
+	// and present expect), then composite only the session-global overlays/cursor.
+	if (force_black) {
+		VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		VkImageMemoryBarrier to_dst = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = 0,
+		    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		    .image = ct->images[buffer_index].handle,
+		    .subresourceRange = range,
+		};
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                         0, 0, NULL, 0, NULL, 1, &to_dst);
+
+		VkClearColorValue black = {.float32 = {0.0f, 0.0f, 0.0f, 1.0f}};
+		vk->vkCmdClearColorImage(cmd, ct->images[buffer_index].handle,
+		                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+
+		VkImageMemoryBarrier to_present = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		    .dstAccessMask = 0,
+		    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		    .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+		    .image = ct->images[buffer_index].handle,
+		    .subresourceRange = range,
+		};
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1,
+		                         &to_present);
+		goto submit_and_present;
 	}
 
 	// #533: 2D is no longer a special-cased mono blit. Both 2D and 3D flow through
@@ -3081,16 +3132,22 @@ submit_and_present:
 	// HUD overlay (post-weave, always readable).
 	// Render for all per-session windows (self-owned and app-provided),
 	// matching the D3D11 compositor which renders HUD for all sessions.
-	session_render_hud_overlay(mc, vk, cmd, ct->images[buffer_index].handle,
-	                           ct->images[buffer_index].view,
-	                           framebufferWidth, framebufferHeight);
+	// A minimized client (#61) shows neither the app HUD nor its own title pill
+	// over the black desktop canvas — only the session-global overlays/cursor.
+	if (!force_black) {
+		session_render_hud_overlay(mc, vk, cmd, ct->images[buffer_index].handle,
+		                           ct->images[buffer_index].view,
+		                           framebufferWidth, framebufferHeight);
 
-	// Workspace chrome (per-client title pill), then the session-global overlays
-	// (taskbar/launcher z=0) and the cursor (topmost) — all composited post-weave
-	// over the HUD, flat (#48). Each is a no-op when nothing is registered.
-	session_render_chrome_overlay(mc, vk, cmd, ct->images[buffer_index].handle,
-	                              ct->images[buffer_index].view,
-	                              framebufferWidth, framebufferHeight);
+		// Workspace chrome (per-client title pill), composited post-weave over the
+		// HUD, flat (#48). A no-op when no chrome is registered for this client.
+		session_render_chrome_overlay(mc, vk, cmd, ct->images[buffer_index].handle,
+		                              ct->images[buffer_index].view,
+		                              framebufferWidth, framebufferHeight);
+	}
+
+	// Session-global overlays (taskbar/launcher z=0) and the cursor (topmost) —
+	// these stay visible even for a minimized client so the taskbar persists.
 	session_render_workspace_overlays(mc, vk, cmd, ct->images[buffer_index].handle,
 	                                  ct->images[buffer_index].view,
 	                                  framebufferWidth, framebufferHeight);
@@ -3191,8 +3248,14 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 			continue;
 		}
 
-		// Skip if no active/delivered frame
-		if (!mc->delivered.active || mc->delivered.layer_count == 0) {
+		// A workspace-minimized client (#61) renders a black desktop canvas plus
+		// the session-global overlays/cursor — NOT its content — so the taskbar
+		// stays visible while minimized. The client app doesn't know it's
+		// minimized, so it keeps submitting frames; force the black canvas
+		// regardless of delivered state. A non-hidden client with no delivered
+		// frame is skipped as before.
+		bool hidden = comp_multi_workspace_is_window_hidden(&mc->base.base);
+		if (!hidden && (!mc->delivered.active || mc->delivered.layer_count == 0)) {
 			continue;
 		}
 
@@ -3218,8 +3281,8 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 		}
 #endif
 
-		// Render this session to its own target
-		render_session_to_own_target(mc, vk, display_time_ns);
+		// Render this session to its own target (black canvas + overlays if hidden)
+		render_session_to_own_target(mc, vk, display_time_ns, hidden);
 
 		// Retire the delivered frame for this session
 		int64_t now_ns = os_monotonic_get_ns();

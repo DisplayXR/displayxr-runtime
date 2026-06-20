@@ -24,6 +24,7 @@ struct chrome_entry
 	uint32_t swapchain_id;            //!< Controller-side IPC swapchain id (unregister key).
 	struct comp_multi_chrome_layout layout;
 	bool layout_valid;
+	bool hidden; //!< Client minimized by the workspace controller (#61): render black canvas + overlays.
 };
 
 // One process-global table; the service is a single process. The mutex is
@@ -186,6 +187,38 @@ comp_multi_workspace_chrome_clear(struct xrt_compositor *target_xc)
 		free_entry_locked(e);
 	}
 	os_mutex_unlock(&g_lock);
+}
+
+void
+comp_multi_workspace_set_window_visibility(struct xrt_compositor *target_xc, bool visible)
+{
+	if (target_xc == NULL) {
+		return;
+	}
+	ensure_lock();
+	os_mutex_lock(&g_lock);
+	// find_or_add: a client may be minimized before/without chrome being
+	// registered; the slot then just carries the hidden flag (xsc/layout stay
+	// empty so chrome_get is a no-op).
+	struct chrome_entry *e = find_or_add_locked(target_xc);
+	if (e != NULL) {
+		e->hidden = !visible;
+	}
+	os_mutex_unlock(&g_lock);
+}
+
+bool
+comp_multi_workspace_is_window_hidden(struct xrt_compositor *target_xc)
+{
+	bool hidden = false;
+	ensure_lock();
+	os_mutex_lock(&g_lock);
+	struct chrome_entry *e = find_locked(target_xc);
+	if (e != NULL) {
+		hidden = e->hidden;
+	}
+	os_mutex_unlock(&g_lock);
+	return hidden;
 }
 
 
