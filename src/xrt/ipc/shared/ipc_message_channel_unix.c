@@ -83,23 +83,43 @@ ipc_message_channel_close(struct ipc_message_channel *imc)
 xrt_result_t
 ipc_send(struct ipc_message_channel *imc, const void *data, size_t size)
 {
-	struct msghdr msg = {0};
-	struct iovec iov = {0};
+	// SOCK_STREAM does not preserve message boundaries and a single sendmsg()
+	// may transfer fewer bytes than requested when the send buffer is under
+	// pressure (e.g. a workspace controller pipelining many small messages per
+	// tick alongside a render thread's swapchain traffic). Loop until the whole
+	// message is on the wire — a short send that we treated as success would
+	// desync the peer's framed reads and tear the connection down. See #61.
+	const uint8_t *bytes = (const uint8_t *)data;
+	size_t sent = 0;
 
-	iov.iov_base = (void *)data;
-	iov.iov_len = size;
+	while (sent < size) {
+		struct iovec iov = {0};
+		struct msghdr msg = {0};
 
-	msg.msg_name = NULL;
-	msg.msg_namelen = 0;
-	msg.msg_iov = &iov;
-	msg.msg_iovlen = 1;
-	msg.msg_flags = 0;
+		iov.iov_base = (void *)(bytes + sent);
+		iov.iov_len = size - sent;
 
-	ssize_t ret = sendmsg(imc->ipc_handle, &msg, MSG_NOSIGNAL);
-	if (ret < 0) {
-		int code = errno;
-		IPC_ERROR(imc, "sendmsg(%i) failed: '%i' '%s'!", imc->ipc_handle, code, strerror(code));
-		return XRT_ERROR_IPC_FAILURE;
+		msg.msg_name = NULL;
+		msg.msg_namelen = 0;
+		msg.msg_iov = &iov;
+		msg.msg_iovlen = 1;
+		msg.msg_flags = 0;
+
+		ssize_t ret = sendmsg(imc->ipc_handle, &msg, MSG_NOSIGNAL);
+		if (ret < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			int code = errno;
+			IPC_ERROR(imc, "sendmsg(%i) failed: '%i' '%s'!", imc->ipc_handle, code, strerror(code));
+			return XRT_ERROR_IPC_FAILURE;
+		}
+		if (ret == 0) {
+			IPC_ERROR(imc, "sendmsg(%i) sent 0 bytes (%i of %i)!", imc->ipc_handle, (int)sent, (int)size);
+			return XRT_ERROR_IPC_FAILURE;
+		}
+
+		sent += (size_t)ret;
 	}
 
 	return XRT_SUCCESS;
@@ -108,31 +128,46 @@ ipc_send(struct ipc_message_channel *imc, const void *data, size_t size)
 xrt_result_t
 ipc_receive(struct ipc_message_channel *imc, void *out_data, size_t size)
 {
-	// wait for the response
-	struct iovec iov = {0};
-	struct msghdr msg = {0};
+	// SOCK_STREAM gives no message-boundary guarantee: a single recvmsg() can
+	// return fewer bytes than the framed reply, with the remainder still in
+	// flight. Loop until the whole reply has arrived. Bailing out on the first
+	// short read (as this used to) would leave the unread tail in the socket
+	// and desync every subsequent call on the connection. See #61.
+	uint8_t *bytes = (uint8_t *)out_data;
+	size_t received = 0;
 
-	iov.iov_base = out_data;
-	iov.iov_len = size;
+	while (received < size) {
+		struct iovec iov = {0};
+		struct msghdr msg = {0};
 
-	msg.msg_name = 0;
-	msg.msg_namelen = 0;
-	msg.msg_iov = &iov;
-	msg.msg_iovlen = 1;
-	msg.msg_flags = 0;
+		iov.iov_base = bytes + received;
+		iov.iov_len = size - received;
 
-	ssize_t len = recvmsg(imc->ipc_handle, &msg, MSG_NOSIGNAL);
+		msg.msg_name = 0;
+		msg.msg_namelen = 0;
+		msg.msg_iov = &iov;
+		msg.msg_iovlen = 1;
+		msg.msg_flags = 0;
 
-	if (len < 0) {
-		int code = errno;
-		IPC_ERROR(imc, "recvmsg(%i) failed: '%i' '%s'!", (int)imc->ipc_handle, code, strerror(code));
-		return XRT_ERROR_IPC_FAILURE;
-	}
+		ssize_t len = recvmsg(imc->ipc_handle, &msg, MSG_NOSIGNAL);
 
-	if ((size_t)len != size) {
-		IPC_ERROR(imc, "recvmsg(%i) failed: wrong size '%i', expected '%i'!", (int)imc->ipc_handle, (int)len,
-		          (int)size);
-		return XRT_ERROR_IPC_FAILURE;
+		if (len < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			int code = errno;
+			IPC_ERROR(imc, "recvmsg(%i) failed: '%i' '%s'!", (int)imc->ipc_handle, code, strerror(code));
+			return XRT_ERROR_IPC_FAILURE;
+		}
+
+		if (len == 0) {
+			// Orderly shutdown by the peer before the full reply arrived.
+			IPC_ERROR(imc, "recvmsg(%i) failed: connection closed, got '%i' of '%i' bytes!",
+			          (int)imc->ipc_handle, (int)received, (int)size);
+			return XRT_ERROR_IPC_FAILURE;
+		}
+
+		received += (size_t)len;
 	}
 
 	return XRT_SUCCESS;
