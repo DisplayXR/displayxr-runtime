@@ -57,7 +57,11 @@ about window/texture ownership, not region expression.
      apps keep the bespoke strips. **Opt-in ON** → shim engages (one-time
      `Surround→zones shim ACTIVE` log). This is the validation switch.
    - **Status:** Metal done + verified (`cube_texture_metal_macos`, flag-on routes through
-     the unified path, flag-off unchanged). D3D11 / D3D12 mirror the same pattern.
+     the unified path, flag-off unchanged). **D3D11 + D3D12 validated on real Leia SR
+     hardware** (2026-06-21): flag-off renders the bespoke strips, flag-on logs the one-time
+     `Surround→zones shim ACTIVE` WARN and routes through the unified mask composite, opaque
+     BGRA texture-app content correct in both, feathered canvas edge as expected. All three
+     backends with a working bespoke surround path are now shim-validated.
    - **Product gate follow-up:** promote the env override to a
      `HKLM\Software\DisplayXR\Capabilities\…` registry gate (per the registry-over-env-var
      convention) before flipping the default.
@@ -107,9 +111,13 @@ backends the shim covers (Metal verified; D3D11/D3D12 pending Windows validation
   all correct — **the earlier "weave into a canvas-sized target" hypothesis was wrong**
   (`DISPLAYXR_TRANSPARENT_BG=0` and the surround app both weave fine into the same
   worst-case-sized target). `sim_display` SBS has no gate, which is why Mac/CI didn't surface
-  it. **Follow-ups (in leia#66):** needs a real-weave 3D eyeball before merge; **D3D12 and GL
-  variants carry the same hardcoded R8G8B8A8_UNORM strip format** (D3D12 also bakes it into
-  the strip PSO) — same latent bug for BGRA texture apps, each needs its own fix + validation.
+  it. **Resolved:** the **D3D12** variant has the same fix (Leia-plugin commit `5b4f74e`,
+  mirror of the D3D11 #66 change — uses the back-buffer's actual `DXGI_FORMAT` for both the
+  strip texture desc and the strip PSO RTV format; on `main`). The **GL** variant is **not
+  affected** — its `ck_ensure_strip_source` populates the strip via `glBlitFramebuffer` (a
+  format-converting blit), not a format-identical `CopyResource`, so the byte-order mismatch
+  cannot occur. Opaque BGRA texture-app content confirmed correct on D3D11 + D3D12 during the
+  2026-06-21 Leia shim validation (no black zone).
 - **Feathered vs hard canvas edge.** The shim's synthetic mask uses the zone wish-mask
   raster (feathered edge), so the canvas/surround boundary is a soft blend rather than the
   hard strip edge. This matches zones aesthetics and is acceptable; flagged here so it is
