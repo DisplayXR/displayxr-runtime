@@ -16,23 +16,32 @@
  * Metal -> GL deltas (everything else — zones / Local2D / wish-mask /
  * cocoa-binding+sharedIOSurface / IOSurface sizing / main loop / events / HUD /
  * MCP / IOSurface->PNG readback — is identical to the Metal leg):
- *  - GL graphics binding: XrGraphicsBindingOpenGLMacOSEXT (cglContext from the
- *    NSOpenGLContext), with XrCocoaWindowBindingCreateInfoEXT (carrying the
- *    on-screen NSView + the shared IOSurface) chained on `.next`, plus
- *    xrGetOpenGLGraphicsRequirementsKHR. XR_EXT_macos_gl_binding is REQUIRED.
- *  - NSOpenGLView / NSOpenGLContext (GL 4.1 Core) instead of a CAMetalLayer.
+ *  - GL graphics binding: XrGraphicsBindingOpenGLMacOSEXT (cglContext from an
+ *    OFFSCREEN NSOpenGLContext), with XrCocoaWindowBindingCreateInfoEXT
+ *    (carrying the on-screen CAMetalLayer-backed NSView + the shared IOSurface)
+ *    chained on `.next`, plus xrGetOpenGLGraphicsRequirementsKHR.
+ *    XR_EXT_macos_gl_binding is REQUIRED.
+ *  - GL is used ONLY for rendering the cube into the OpenXR GL swapchains. The
+ *    GL context is OFFSCREEN (standalone NSOpenGLContext, no on-screen
+ *    drawable); the runtime's offscreen GL compositor context share-groups with
+ *    it so the GL swapchain textures stay valid. All cube/zone rendering makes
+ *    this context current and renders into FBOs.
  *  - GLSL + FBO rendering instead of MSL render passes; matrices use the GL
  *    [-1,1] clip convention.
- *  - Present: the app maps the runtime-composited IOSurface as a
- *    GL_TEXTURE_RECTANGLE (CGLTexImageIOSurface2D) and blits it to the default
- *    framebuffer, then flushBuffer.
+ *  - Present: the ON-SCREEN view is a CAMetalLayer-backed NSView (copied from
+ *    cube_zones_texture_metal_macos). Each frame the app imports the shared
+ *    IOSurface as a read-only MTLTexture and blits it into the layer's
+ *    nextDrawable via a tiny Metal blit pipeline (the on-screen
+ *    NSOpenGLView/flushBuffer present is BROKEN on macOS — no see-through, frame
+ *    stalls — so Metal does the present exactly like the Metal sibling). The
+ *    layer is non-opaque so alpha-0 IOSurface regions show the desktop.
  *
  * Texture-mode deltas from a handle app:
  *  - Creates a shared IOSurface sized to the worst-case atlas (same sizing as
  *    cube_texture_metal_macos) and chains it as
  *    XrCocoaWindowBindingCreateInfoEXT.sharedIOSurface on xrCreateSession.
  *  - The APP owns presentation: each frame it blits the IOSurface into its own
- *    GL default framebuffer and presents. The runtime does NOT present.
+ *    CAMetalLayer drawable and presents. The runtime does NOT present.
  *  - When a zones frame is active the GL compositor composites the full-
  *    window multi-zone super-atlas DIRECTLY into the shared IOSurface (the
  *    declared output rect is superseded by zones → full window), so NO
@@ -79,9 +88,10 @@
 #import <Cocoa/Cocoa.h>
 #import <OpenGL/OpenGL.h>
 #import <OpenGL/gl3.h>
+#import <Metal/Metal.h>             // present: blit the shared IOSurface into a CAMetalLayer
 #import <IOSurface/IOSurface.h>
 #import <IOSurface/IOSurfaceObjC.h>
-#import <QuartzCore/QuartzCore.h>   // needed by displayxr::common atlas_capture flash helper
+#import <QuartzCore/QuartzCore.h>   // CAMetalLayer present + atlas_capture flash helper
 
 #define XR_USE_GRAPHICS_API_OPENGL
 #include <openxr/openxr.h>
@@ -411,32 +421,48 @@ void main() {
 }
 )GLSL";
 
-// --- Blit/present shader: fullscreen triangle sampling the shared IOSurface ---
-// Texture-mode present: the app maps the runtime-composited IOSurface as a
-// GL_TEXTURE_RECTANGLE and blits it to the default framebuffer.
-static const char *g_blitVertexShader = R"GLSL(
-#version 410 core
-uniform vec2 uTexSize; // IOSurface pixel dims, for TEXTURE_RECTANGLE UVs
-out vec2 vUV;
-void main() {
-    // id 0,1,2 -> a fullscreen triangle covering the [0,1] UV box.
-    vec2 uv = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
-    // PRESENT Y: GL composite is bottom-up; no flip. If inverted at runtime,
-    // flip vUV.y here (e.g. vUV = vec2(uv.x, 1.0 - uv.y) * uTexSize).
-    vUV = uv * uTexSize; // pixel coords for sampler2DRect
-    gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0);
-}
-)GLSL";
+// NB: present is done via Metal (CAMetalLayer), not GL — see MetalPresenter and
+// g_metalBlitShaderSource below. The on-screen NSOpenGLView/flushBuffer present
+// is BROKEN on macOS, so GL is used ONLY to render the cube into the swapchains.
 
-static const char *g_blitFragmentShader = R"GLSL(
-#version 410 core
-uniform sampler2DRect uTex;
-in vec2 vUV;
-out vec4 fragColor;
-void main() {
-    fragColor = texture(uTex, vUV);
+// --- Metal Shading Language blit shader (present-only) ---
+// Lifted verbatim from cube_zones_texture_metal_macos: a fullscreen triangle
+// that samples the shared IOSurface (imported as a read MTLTexture) into the
+// CAMetalLayer drawable.
+static const char *g_metalBlitShaderSource = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+
+struct BlitParams {
+    float2 uv_scale;  // (regionW/surfaceW, regionH/surfaceH)
+    float2 uv_offset; // (regionX/surfaceW, regionY/surfaceH)
+};
+
+struct BlitVertexOut {
+    float4 position [[position]];
+    float2 uv;
+};
+
+vertex BlitVertexOut blit_vertex(uint vid [[vertex_id]],
+                                 constant BlitParams &params [[buffer(0)]])
+{
+    BlitVertexOut out;
+    out.uv = float2((vid << 1) & 2, vid & 2);
+    out.position = float4(out.uv * 2.0 - 1.0, 0.0, 1.0);
+    // NO Y-flip: the runtime's GL compositor writes the IOSurface bottom-up, so
+    // sampling top-down (Metal's default) already shows it right-side-up. (The
+    // Metal sibling flips here because Metal renders top-down.)
+    out.uv = params.uv_offset + out.uv * params.uv_scale; // sample region of IOSurface
+    return out;
 }
-)GLSL";
+
+fragment float4 blit_fragment(BlitVertexOut in [[stage_in]],
+                                texture2d<float> tex [[texture(0)]],
+                                sampler samp [[sampler(0)]])
+{
+    return tex.sample(samp, in.uv);
+}
+)MSL";
 
 // ============================================================================
 // Vertex data structures
@@ -574,7 +600,6 @@ struct GLRenderer {
     GLuint cubeProgram;
     GLuint gridProgram;
     GLuint fadeProgram;   //!< zone content-alpha edge fade
-    GLuint blitProgram;   //!< texture-mode IOSurface -> default-framebuffer present
 
     // Cube uniforms
     GLint cubeLocMVP, cubeLocModel, cubeLocTexSize;
@@ -586,10 +611,6 @@ struct GLRenderer {
     // Fade uniforms
     GLint fadeLocTilePx, fadeLocFeatherPx;
     GLuint fadeVAO;       //!< attribute-less; bound for the fullscreen-triangle draw
-
-    // Blit/present uniforms
-    GLint blitLocTex, blitLocTexSize;
-    GLuint blitVAO;       //!< attribute-less; bound for the fullscreen-triangle draw
 
     // Geometry
     GLuint cubeVAO, cubeVBO, cubeEBO;
@@ -694,18 +715,6 @@ static bool InitRenderer(GLRenderer &r)
     r.fadeLocTilePx = glGetUniformLocation(r.fadeProgram, "uTilePx");
     r.fadeLocFeatherPx = glGetUniformLocation(r.fadeProgram, "uFeatherPx");
     glGenVertexArrays(1, &r.fadeVAO);
-
-    // Compile blit/present shaders
-    GLuint blitVS = CompileShader(GL_VERTEX_SHADER, g_blitVertexShader);
-    GLuint blitFS = CompileShader(GL_FRAGMENT_SHADER, g_blitFragmentShader);
-    if (!blitVS || !blitFS) return false;
-    r.blitProgram = LinkProgram(blitVS, blitFS);
-    glDeleteShader(blitVS);
-    glDeleteShader(blitFS);
-    if (!r.blitProgram) return false;
-    r.blitLocTex = glGetUniformLocation(r.blitProgram, "uTex");
-    r.blitLocTexSize = glGetUniformLocation(r.blitProgram, "uTexSize");
-    glGenVertexArrays(1, &r.blitVAO);
 
     // Cube VAO
     glGenVertexArrays(1, &r.cubeVAO);
@@ -946,9 +955,9 @@ static void RenderScene(GLRenderer &r, GLuint targetTex, uint32_t targetW, uint3
 // so the app just presents the whole surface region. No 2D surround needed.
 
 static IOSurfaceRef g_ioSurface = NULL;
+static id<MTLTexture> g_ioSurfaceReadTexture = nil;  //!< blit-source view of g_ioSurface
 static uint32_t g_ioSurfaceWidth = 1920;
 static uint32_t g_ioSurfaceHeight = 1080;
-static GLuint g_presentTex = 0;  //!< lazily-created GL_TEXTURE_RECTANGLE over g_ioSurface
 
 // Autonomous-verification dump path (DXR_TEXDUMP). "1" or empty-but-present →
 // default /tmp/zones_texture_readback.png; any other value is the literal path;
@@ -958,22 +967,19 @@ static bool g_texDumpEnabled = false;
 static bool g_texDumpDone = false;          //!< one-shot at the warmup frame gate
 static const long kTexDumpFrame = 150;      //!< matches the macOS capture convention
 
-// Framebuffer capture (preferred over the CPU IOSurface readback): a CPU
-// IOSurfaceLock of a surface the runtime wrote via GL can race the GPU (the GL
-// compositor only glFlush()es, not glFinish()), so the lock often reads zeros
-// even when the on-screen present is correct. Instead we glReadPixels the app's
-// BACK buffer right after the present blit — GL-synchronized in our own context
-// and exactly "what's on screen". Set by the trigger, consumed inside the blit.
-static bool g_fbCaptureReq = false;
-static std::string g_fbCapturePath;
-
 // ============================================================================
 // Globals
 // ============================================================================
 
 static volatile bool g_running = true;
 static NSWindow *g_window = nil;
-static NSOpenGLView *g_glView = nil;
+// ON-SCREEN view is a CAMetalLayer-backed NSView (present is done via Metal —
+// see header). It is passed as XrCocoaWindowBindingCreateInfoEXT.viewHandle.
+static NSView *g_metalView = nil;
+// OFFSCREEN GL context — no on-screen drawable. Its CGLContextObj is passed as
+// XrGraphicsBindingOpenGLMacOSEXT.cglContext; the runtime's offscreen GL
+// compositor context share-groups with it, so the swapchain GL textures stay
+// valid. All cube/zone GL rendering makes THIS context current.
 static NSOpenGLContext *g_glContext = nil;
 
 // Input state (mirrors cube_handle_vk_macos)
@@ -1129,8 +1135,22 @@ static void SignalHandler(int)
 }
 
 // ============================================================================
-// macOS window creation (NSOpenGLView-backed, GL 4.1 Core)
+// macOS window creation (CAMetalLayer-backed NSView for present + offscreen GL)
 // ============================================================================
+
+// On-screen view backed by a CAMetalLayer (copied from the Metal sibling). GL
+// renders OFFSCREEN; Metal presents into this layer.
+@interface AppMetalView : NSView
+@end
+
+@implementation AppMetalView
+- (CALayer *)makeBackingLayer {
+    return [CAMetalLayer layer];
+}
+- (BOOL)wantsUpdateLayer {
+    return YES;
+}
+@end
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 @end
@@ -1184,13 +1204,33 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height)
         g_windowDelegate = [[AppWindowDelegate alloc] init];
         [g_window setDelegate:g_windowDelegate];
 
-        // Create NSOpenGLView with a core 4.1 profile context
+        // ON-SCREEN view: CAMetalLayer-backed (copied from the Metal sibling).
+        // Metal presents the runtime-composited IOSurface into this layer.
+        g_metalView = [[AppMetalView alloc] initWithFrame:frame];
+        [g_metalView setWantsLayer:YES];
+
+        // Set Retina scale so CAMetalLayer produces pixel-resolution drawables,
+        // and make the layer non-opaque so alpha-0 IOSurface regions show the
+        // desktop (see-through zones).
+        CAMetalLayer *metalLayer = (CAMetalLayer *)[g_metalView layer];
+        if (metalLayer) {
+            metalLayer.contentsScale = [g_window backingScaleFactor];
+            metalLayer.opaque = NO;
+        }
+
+        [g_window setContentView:g_metalView];
+        [g_window makeKeyAndOrderFront:nil];
+        [NSApp activateIgnoringOtherApps:YES];
+
+        // OFFSCREEN GL context (GL 4.1 Core) — NO on-screen drawable (the view
+        // is Metal now). Its CGLContextObj is passed to the runtime as the GL
+        // binding; all cube/zone rendering makes this context current and
+        // renders into FBOs / swapchain textures, never to a window.
         NSOpenGLPixelFormatAttribute attrs[] = {
             NSOpenGLPFAOpenGLProfile, NSOpenGLProfileVersion4_1Core,
             NSOpenGLPFAColorSize, 24,
             NSOpenGLPFAAlphaSize, 8,
             NSOpenGLPFADepthSize, 24,
-            NSOpenGLPFADoubleBuffer,
             NSOpenGLPFAAccelerated,
             0
         };
@@ -1199,20 +1239,12 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height)
             LOG_ERROR("Failed to create NSOpenGLPixelFormat");
             return false;
         }
-
-        g_glView = [[NSOpenGLView alloc] initWithFrame:frame pixelFormat:pixelFormat];
-        if (!g_glView) {
-            LOG_ERROR("Failed to create NSOpenGLView");
+        g_glContext = [[NSOpenGLContext alloc] initWithFormat:pixelFormat shareContext:nil];
+        if (!g_glContext) {
+            LOG_ERROR("Failed to create offscreen NSOpenGLContext");
             return false;
         }
-
-        [g_glView setWantsBestResolutionOpenGLSurface:YES];
-        g_glContext = [g_glView openGLContext];
         [g_glContext makeCurrentContext];
-
-        [g_window setContentView:g_glView];
-        [g_window makeKeyAndOrderFront:nil];
-        [NSApp activateIgnoringOtherApps:YES];
 
         // Pump events so the window appears
         NSEvent *event;
@@ -1224,18 +1256,82 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height)
         }
     }
 
-    if (g_window == nil || g_glView == nil || g_glContext == nil) {
+    if (g_window == nil || g_metalView == nil || g_glContext == nil) {
         LOG_ERROR("Failed to create macOS window");
         return false;
     }
 
-    LOG_INFO("Created macOS window (%ux%u) with NSOpenGLView (GL 4.1 Core)", width, height);
+    LOG_INFO("Created macOS window (%ux%u): CAMetalLayer present view + offscreen GL 4.1 Core", width, height);
     return true;
 }
 
 // ============================================================================
 // Texture-mode IOSurface: create, present (blit to drawable), readback dump
 // ============================================================================
+
+// ============================================================================
+// Metal present (CAMetalLayer) — GL is render-only; Metal does the present.
+// Device/queue/blit-pipeline + IOSurface read texture lifted from the Metal
+// sibling (cube_zones_texture_metal_macos).
+// ============================================================================
+
+// Blit params struct mirrored on the CPU side (must match the MSL BlitParams).
+struct BlitParams {
+    float uv_scale[2];
+    float uv_offset[2];
+};
+
+struct MetalPresenter {
+    id<MTLDevice>              device;
+    id<MTLCommandQueue>        commandQueue;
+    id<MTLLibrary>             library;
+    id<MTLRenderPipelineState> blitPipeline;
+    id<MTLSamplerState>        sampler;
+};
+static MetalPresenter g_present;
+
+static bool InitMetalPresenter(MetalPresenter &p)
+{
+    p.device = MTLCreateSystemDefaultDevice();
+    if (!p.device) {
+        LOG_ERROR("No Metal device available for present");
+        return false;
+    }
+    LOG_INFO("Metal present device: %s", p.device.name.UTF8String);
+
+    p.commandQueue = [p.device newCommandQueue];
+
+    NSError *error = nil;
+    p.library = [p.device newLibraryWithSource:[NSString stringWithUTF8String:g_metalBlitShaderSource]
+                                      options:nil
+                                        error:&error];
+    if (!p.library) {
+        LOG_ERROR("Metal blit shader compilation failed: %s", error.localizedDescription.UTF8String);
+        return false;
+    }
+
+    {
+        MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
+        desc.vertexFunction = [p.library newFunctionWithName:@"blit_vertex"];
+        desc.fragmentFunction = [p.library newFunctionWithName:@"blit_fragment"];
+        desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        p.blitPipeline = [p.device newRenderPipelineStateWithDescriptor:desc error:&error];
+        if (!p.blitPipeline) {
+            LOG_ERROR("Metal blit pipeline creation failed: %s", error.localizedDescription.UTF8String);
+            return false;
+        }
+    }
+
+    {
+        MTLSamplerDescriptor *desc = [[MTLSamplerDescriptor alloc] init];
+        desc.minFilter = MTLSamplerMinMagFilterLinear;
+        desc.magFilter = MTLSamplerMinMagFilterLinear;
+        p.sampler = [p.device newSamplerStateWithDescriptor:desc];
+    }
+
+    LOG_INFO("Metal presenter initialized");
+    return true;
+}
 
 static bool CreateIOSurface(uint32_t width, uint32_t height)
 {
@@ -1255,93 +1351,84 @@ static bool CreateIOSurface(uint32_t width, uint32_t height)
     g_ioSurfaceWidth = width;
     g_ioSurfaceHeight = height;
 
+    // Read-only Metal texture view for blitting the IOSurface to the drawable.
+    MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                    width:width
+                                                                                   height:height
+                                                                                mipmapped:NO];
+    desc.usage = MTLTextureUsageShaderRead;
+    desc.storageMode = MTLStorageModeShared;
+    g_ioSurfaceReadTexture = [g_present.device newTextureWithDescriptor:desc
+                                                             iosurface:g_ioSurface
+                                                                 plane:0];
+    if (g_ioSurfaceReadTexture == nil) {
+        LOG_ERROR("Failed to create read texture from IOSurface");
+        CFRelease(g_ioSurface);
+        g_ioSurface = NULL;
+        return false;
+    }
+
     LOG_INFO("Created shared IOSurface: %ux%u, BGRA8, id=%u", width, height,
              IOSurfaceGetID(g_ioSurface));
     return true;
 }
 
-// Present: map the runtime-composited IOSurface as a GL_TEXTURE_RECTANGLE in
-// the app's own on-screen context and blit it to the default framebuffer. For
-// the zones path the whole window region of the surface carries the multi-zone
-// composite (output rect superseded by zones), so we present it 1:1.
-static void BlitIOSurfaceToDefaultFramebuffer(GLRenderer &r)
+// Present: blit the runtime-composited IOSurface into the app's own
+// CAMetalLayer drawable. For the zones path the whole window region of the
+// surface carries the multi-zone composite (output rect superseded by zones),
+// so we present the full window region (clamped to the worst-case surface).
+// Lifted verbatim from cube_zones_texture_metal_macos.
+static void BlitIOSurfaceToDrawable(MetalPresenter &p, CAMetalLayer *metalLayer)
 {
-    if (g_ioSurface == NULL || g_glContext == nil) return;
-
-    [g_glContext makeCurrentContext];
-
-    if (g_presentTex == 0) {
-        glGenTextures(1, &g_presentTex);
+    // CAMetalLayer needs a device + format to vend drawables. Configure lazily
+    // on first present.
+    if (metalLayer.device == nil) {
+        metalLayer.device = p.device;
+        metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     }
 
-    glBindTexture(GL_TEXTURE_RECTANGLE, g_presentTex);
-    CGLError cglErr = CGLTexImageIOSurface2D(
-        CGLGetCurrentContext(), GL_TEXTURE_RECTANGLE, GL_RGBA8,
-        (GLsizei)g_ioSurfaceWidth, (GLsizei)g_ioSurfaceHeight,
-        GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, g_ioSurface, 0);
-    if (cglErr != kCGLNoError) {
-        static bool warned = false;
-        if (!warned) {
-            warned = true;
-            LOG_WARN("CGLTexImageIOSurface2D failed (0x%x)", (unsigned)cglErr);
-        }
-    }
-    glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    id<CAMetalDrawable> drawable = [metalLayer nextDrawable];
+    if (drawable == nil) return;
 
-    // Default framebuffer, viewport in backing pixels.
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    GLsizei vpW = (GLsizei)g_windowW;
-    GLsizei vpH = (GLsizei)g_windowH;
-    if (g_glView != nil) {
-        NSRect backing = [g_glView convertRectToBacking:[g_glView bounds]];
-        if (backing.size.width > 0 && backing.size.height > 0) {
-            vpW = (GLsizei)backing.size.width;
-            vpH = (GLsizei)backing.size.height;
-        }
-    }
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_SCISSOR_TEST);
-    glDisable(GL_BLEND);
-    glViewport(0, 0, vpW, vpH);
-    glClearColor(0.08f, 0.08f, 0.1f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
+    MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+    rpd.colorAttachments[0].texture = drawable.texture;
+    rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+    // Clear alpha 0 so the non-opaque layer shows the desktop where the zones
+    // composite is transparent (see-through).
+    rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
 
-    glUseProgram(r.blitProgram);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_RECTANGLE, g_presentTex);
-    glUniform1i(r.blitLocTex, 0);
-    glUniform2f(r.blitLocTexSize, (float)g_ioSurfaceWidth, (float)g_ioSurfaceHeight);
+    id<MTLCommandBuffer> cmdBuf = [p.commandQueue commandBuffer];
+    id<MTLRenderCommandEncoder> enc = [cmdBuf renderCommandEncoderWithDescriptor:rpd];
 
-    glBindVertexArray(r.blitVAO);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-    glBindVertexArray(0);
-    glUseProgram(0);
-    glBindTexture(GL_TEXTURE_RECTANGLE, 0);
+    if (g_ioSurfaceReadTexture != nil) {
+        float drawW = (float)drawable.texture.width;
+        float drawH = (float)drawable.texture.height;
+        float ioW = (float)g_ioSurfaceWidth;
+        float ioH = (float)g_ioSurfaceHeight;
 
-    // GPU-synchronized capture of the presented frame (see g_fbCaptureReq). Read
-    // GL_BACK before flushBuffer; glReadPixels finishes the prior draw so this is
-    // exactly the composited IOSurface as sampled on screen (alpha included).
-    if (g_fbCaptureReq) {
-        g_fbCaptureReq = false;
-        glReadBuffer(GL_BACK);
-        std::vector<uint8_t> px((size_t)vpW * vpH * 4);
-        glPixelStorei(GL_PACK_ALIGNMENT, 1);
-        glReadPixels(0, 0, vpW, vpH, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
-        // glReadPixels is bottom-up; stb wants top-down — flip rows.
-        std::vector<uint8_t> flipped((size_t)vpW * vpH * 4);
-        for (GLsizei y = 0; y < vpH; y++) {
-            memcpy(flipped.data() + (size_t)y * vpW * 4,
-                   px.data() + (size_t)(vpH - 1 - y) * vpW * 4,
-                   (size_t)vpW * 4);
-        }
-        int ok = stbi_write_png(g_fbCapturePath.c_str(), (int)vpW, (int)vpH, 4,
-                                flipped.data(), (int)(vpW * 4));
-        LOG_WARN("FRAMEBUFFER CAPTURE %s: %s (%dx%d)",
-                 ok ? "DUMPED" : "FAILED", g_fbCapturePath.c_str(), (int)vpW, (int)vpH);
+        // Full window region, clamped to the worst-case IOSurface. The zones
+        // composite fills the window rect, so present it whole (top-left
+        // anchored, 1:1).
+        float vpW = (drawW < ioW) ? drawW : ioW;
+        float vpH = (drawH < ioH) ? drawH : ioH;
+        BlitParams blitParams = {
+            { (ioW > 0) ? vpW / ioW : 1.0f, (ioH > 0) ? vpH / ioH : 1.0f },
+            { 0.0f, 0.0f }
+        };
+
+        MTLViewport vp = {0.0, 0.0, (double)vpW, (double)vpH, 0.0, 1.0};
+        [enc setViewport:vp];
+        [enc setRenderPipelineState:p.blitPipeline];
+        [enc setVertexBytes:&blitParams length:sizeof(blitParams) atIndex:0];
+        [enc setFragmentTexture:g_ioSurfaceReadTexture atIndex:0];
+        [enc setFragmentSamplerState:p.sampler atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     }
 
-    [g_glContext flushBuffer];
+    [enc endEncoding];
+    [cmdBuf presentDrawable:drawable];
+    [cmdBuf commit];
 }
 
 // Autonomous verification: read the shared IOSurface back to a PNG. This is
@@ -1395,33 +1482,29 @@ static void DumpIOSurfaceToPNG(const char *path)
 //     dump on demand to /tmp/dxr_atlas.png).
 static void PresentAndMaybeDump(GLRenderer &renderer)
 {
-    // Arm captures BEFORE the blit — the framebuffer grab happens inside it.
-    // NB: a SEPARATE trigger from the runtime's /tmp/dxr_atlas_trigger (which the
-    // GL compositor consumes to dump its pre-DP atlas to /tmp/dxr_atlas.png), so
-    // the two captures don't race for the same file.
-    bool triggerDump = (access("/tmp/gl_app_trigger", F_OK) == 0);
-    if (triggerDump) {
-        unlink("/tmp/gl_app_trigger");
-        g_fbCaptureReq = true;
-        g_fbCapturePath = "/tmp/gl_app_present.png";
-    }
-    bool warmupDump =
-        (g_texDumpEnabled && !g_texDumpDone && g_frameCounter >= kTexDumpFrame);
-    if (warmupDump && !triggerDump) {
-        g_fbCaptureReq = true;
-        g_fbCapturePath = g_texDumpPath;
+    (void)renderer;  // GL renders the cube; Metal does the present.
+
+    // Present: blit the runtime-composited IOSurface into the CAMetalLayer
+    // drawable (Metal-coherent present — the on-screen GL present was broken).
+    CAMetalLayer *metalLayer = (CAMetalLayer *)[g_metalView layer];
+    if (metalLayer) {
+        BlitIOSurfaceToDrawable(g_present, metalLayer);
     }
 
-    BlitIOSurfaceToDefaultFramebuffer(renderer);
-
-    // Secondary CPU IOSurface readback (diagnostic; may race the GPU — see note
-    // on g_fbCaptureReq). Kept so the two paths can be compared.
-    if (warmupDump) {
+    // One-shot DXR_TEXDUMP at the warmup gate (HUD/zones are active by then).
+    // CPU IOSurface readback works under Metal-coherent present.
+    if (g_texDumpEnabled && !g_texDumpDone && g_frameCounter >= kTexDumpFrame) {
         g_texDumpDone = true;
         DumpIOSurfaceToPNG(g_texDumpPath.c_str());
     }
-    if (triggerDump) {
-        DumpIOSurfaceToPNG("/tmp/gl_app_iosurface.png");
+
+    // On-demand file-trigger convention (matches the macOS atlas trigger). NB:
+    // a SEPARATE trigger from the runtime's /tmp/dxr_atlas_trigger (which the GL
+    // compositor consumes to dump its pre-DP atlas to /tmp/dxr_atlas.png), so
+    // the two captures don't race for the same file.
+    if (access("/tmp/gl_app_trigger", F_OK) == 0) {
+        unlink("/tmp/gl_app_trigger");
+        DumpIOSurfaceToPNG("/tmp/gl_app_present.png");
     }
 }
 
@@ -1917,12 +2000,12 @@ static bool CreateSession(AppXrSession &app, GLRenderer &r)
     XrCocoaWindowBindingCreateInfoEXT cocoaBinding = {};
     cocoaBinding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT;
     cocoaBinding.next = nullptr;
-    cocoaBinding.viewHandle = (__bridge void *)g_glView;
+    cocoaBinding.viewHandle = (__bridge void *)g_metalView;
     // TEXTURE-MODE MARKER: hand the runtime our shared IOSurface so it
     // composites into it (the runtime does NOT present — the app does). The
-    // real NSView is still passed for DP screen-space position tracking, as in
-    // cube_texture_metal_macos. The IOSurface is created before xrCreateSession
-    // in main().
+    // real (CAMetalLayer-backed) NSView is still passed for DP screen-space
+    // position tracking, as in cube_texture_metal_macos. The IOSurface is
+    // created before xrCreateSession in main().
     cocoaBinding.sharedIOSurface = (void *)g_ioSurface;
     LOG_INFO("Texture mode: chaining sharedIOSurface=%p with viewHandle=%p",
              (void *)g_ioSurface, cocoaBinding.viewHandle);
@@ -1935,12 +2018,12 @@ static bool CreateSession(AppXrSession &app, GLRenderer &r)
         const char *e = getenv("DISPLAYXR_TRANSPARENT_BG");
         if (e == nullptr || *e != '0') {
             cocoaBinding.transparentBackgroundEnabled = XR_TRUE;
-            // Make our app-owned NSWindow non-opaque too — the runtime only
-            // configures the layer it presents into for app-provided views;
-            // the NSWindow alpha is the app's responsibility.
-            if (g_glView != nil && g_glView.window != nil) {
-                [g_glView.window setOpaque:NO];
-                [g_glView.window setBackgroundColor:[NSColor clearColor]];
+            // Make our app-owned NSWindow non-opaque too — the app presents via
+            // its own CAMetalLayer (set non-opaque at creation), and the
+            // NSWindow alpha is the app's responsibility.
+            if (g_metalView != nil && g_metalView.window != nil) {
+                [g_metalView.window setOpaque:NO];
+                [g_metalView.window setBackgroundColor:[NSColor clearColor]];
             }
             LOG_INFO("Transparent background ENABLED (zones default; DISPLAYXR_TRANSPARENT_BG=0 to opt out)");
         }
@@ -3065,10 +3148,17 @@ int main(int argc, char **argv)
     // Make our context current for renderer init
     [g_glContext makeCurrentContext];
 
-    // Initialize OpenGL renderer
+    // Initialize OpenGL renderer (cube rendering only — offscreen)
     GLRenderer renderer = {};
     if (!InitRenderer(renderer)) {
         LOG_ERROR("Failed to initialize OpenGL renderer");
+        return 1;
+    }
+
+    // Initialize the Metal presenter (present-only path; also owns the MTLDevice
+    // that backs the IOSurface read texture, so init it before CreateIOSurface).
+    if (!InitMetalPresenter(g_present)) {
+        LOG_ERROR("Failed to initialize Metal presenter");
         return 1;
     }
 
@@ -3180,6 +3270,26 @@ int main(int argc, char **argv)
 
         PumpMacOSEvents();
         PollEvents(app);
+
+        // Cube rendering runs in the offscreen GL context; AppKit/Metal present
+        // can leave a different context current, so re-make ours current each
+        // frame before any GL call.
+        [g_glContext makeCurrentContext];
+
+        // Freeze-monitor heartbeat: report loop rate every ~2s so a stall (loop
+        // hang) is visible in the log even when the on-screen swap is the thing
+        // that froze. (Diagnostic — see #629 macOS present validation.)
+        {
+            static auto hbLast = now;
+            static long hbFrame = 0;
+            float hbDt = std::chrono::duration<float>(now - hbLast).count();
+            if (hbDt >= 2.0f) {
+                LOG_WARN("HEARTBEAT: frame=%ld loop_fps=%.1f", g_frameCounter,
+                         (double)(g_frameCounter - hbFrame) / hbDt);
+                hbLast = now;
+                hbFrame = g_frameCounter;
+            }
+        }
 
         // Handle rendering mode requests (V=cycle next, 0-8=jump absolute).
         // Single source of truth: the runtime owns the current mode. Keypresses
@@ -3542,7 +3652,7 @@ int main(int argc, char **argv)
                         if (XR_SUCCEEDED(cr)) {
                             LOG_INFO("Atlas capture requested -> %s_atlas_%u_%ux%u.png",
                                      prefix.c_str(), tileColumns * tileRows, tileColumns, tileRows);
-                            dxr_capture::TriggerCaptureFlash((__bridge void*)g_glView);
+                            dxr_capture::TriggerCaptureFlash((__bridge void*)g_metalView);
                         } else {
                             LOG_WARN("xrCaptureAtlasEXT failed: 0x%x", (unsigned)cr);
                         }
@@ -3791,10 +3901,7 @@ int main(int argc, char **argv)
         xrDestroyInstance(app.instance);
 
     // Texture-mode shared IOSurface.
-    if (g_presentTex != 0) {
-        glDeleteTextures(1, &g_presentTex);
-        g_presentTex = 0;
-    }
+    g_ioSurfaceReadTexture = nil;
     if (g_ioSurface != NULL) {
         CFRelease(g_ioSurface);
         g_ioSurface = NULL;

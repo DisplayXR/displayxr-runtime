@@ -292,6 +292,7 @@ comp_gl_window_macos_setup_external(void *ns_view,
 
 xrt_result_t
 comp_gl_window_macos_create_offscreen(void *app_cgl_ctx,
+                                       void *app_view_handle,
                                        struct comp_gl_window_macos **out_win)
 {
 	struct comp_gl_window_macos *win = U_TYPED_CALLOC(struct comp_gl_window_macos);
@@ -300,7 +301,12 @@ comp_gl_window_macos_create_offscreen(void *app_cgl_ctx,
 	}
 
 	win->window = nil;
-	win->view = nil;
+	// Retain the app's real on-screen view (if provided) ONLY so get_dimensions /
+	// get_screen_position can measure the app's window backing — the offscreen GL
+	// context renders into the shared IOSurface and has no drawable of its own.
+	// Without this the weave output falls back to the worst-case IOSurface size,
+	// mis-placing zones (the layout is window-space, per the texture-app contract).
+	win->view = (NSView *)app_view_handle;
 	win->owns_window = false;
 
 	// Create offscreen GL context via CGL directly (no NSView needed).

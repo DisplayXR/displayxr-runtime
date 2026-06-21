@@ -4579,9 +4579,13 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 #elif defined(__APPLE__)
 	// macOS: create window/context via NSOpenGLView helper
 	if (shared_texture_handle != NULL) {
-		// Shared IOSurface mode: offscreen GL context, render into IOSurface
+		// Shared IOSurface mode: offscreen GL context, render into IOSurface.
+		// Pass the app's real on-screen view (window_handle) so get_dimensions
+		// reports the app's window backing — the zones weave output must match
+		// the window-space zone layout, not the worst-case IOSurface (mirrors the
+		// Metal compositor, which measures the app's bound view).
 		xrt_result_t xret = comp_gl_window_macos_create_offscreen(
-		    gl_context, &c->macos_window);
+		    gl_context, window_handle, &c->macos_window);
 		if (xret != XRT_SUCCESS) {
 			free(c);
 			return XRT_ERROR_OPENGL;

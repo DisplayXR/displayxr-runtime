@@ -93,6 +93,7 @@ target_link_libraries(cube_zones_texture_gl_macos PRIVATE
     displayxr::common
     OpenXR::openxr_loader
     "-framework OpenGL"
+    "-framework Metal"
     "-framework Foundation"
     "-framework Cocoa"
     "-framework QuartzCore"
