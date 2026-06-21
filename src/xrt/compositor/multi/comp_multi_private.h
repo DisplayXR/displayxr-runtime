@@ -646,6 +646,26 @@ struct multi_system_compositor
 	bool shared_surface_initialized; //!< True once the shared window + resources exist.
 	struct comp_target *shared_target;             //!< The one full-screen NSWindow target.
 	struct xrt_display_processor *shared_dp;       //!< The one DP that weaves the combined atlas.
+
+	//! Per-image render rings for the one shared target (mirrors session_render).
+	VkCommandPool shared_cmd_pool;
+	VkCommandBuffer *shared_cmd_buffers;
+	VkFence *shared_fences;
+	uint32_t shared_buffer_count;
+	int shared_fenced_buffer;
+	VkRenderPass shared_render_pass;
+	VkFramebuffer *shared_framebuffers;
+
+	//! The ONE combined stereo atlas (tile_columns × per-eye-display, tile_rows=1)
+	//! that every client composites into before the single DP weave.
+	VkImage shared_atlas_image;
+	VkDeviceMemory shared_atlas_memory;
+	VkImageView shared_atlas_view;
+	int shared_atlas_w, shared_atlas_h; //!< Full atlas dims (tiles * per-eye).
+	int shared_eye_w, shared_eye_h;     //!< Per-eye tile dims (the display px).
+	VkFormat shared_atlas_format;
+	bool shared_atlas_initialized;
+	bool shared_swapchain_needs_recreate;
 	//! @}
 #endif
 };

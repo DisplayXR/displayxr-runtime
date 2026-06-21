@@ -76,6 +76,11 @@
 
 #include <math.h>
 #include <stdio.h>
+
+#ifdef XRT_OS_MACOS
+// Shared spatial surface gate (#59): one full-screen window for all apps.
+DEBUG_GET_ONCE_BOOL_OPTION(shared_surface, "DISPLAYXR_SHARED_SURFACE", false)
+#endif
 #include <assert.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -2356,7 +2361,14 @@ comp_multi_workspace_set_client_window_pose(struct xrt_compositor *xc,
 {
 #ifdef XRT_OS_MACOS
 	struct multi_compositor *mc = multi_compositor(xc);
-	if (mc == NULL || pose == NULL || mc->session_render.target == NULL) {
+	if (mc == NULL || pose == NULL) {
+		return false;
+	}
+	// In the shared-surface model (#59) there is no per-client NSWindow; the stored
+	// px-rect drives WHERE this client composites into the combined atlas. Still
+	// store it below, but skip the per-client NSWindow reposition (no target).
+	bool shared = mc->msc->shared_surface_enabled;
+	if (!shared && mc->session_render.target == NULL) {
 		return false;
 	}
 
@@ -2427,12 +2439,14 @@ comp_multi_workspace_set_client_window_pose(struct xrt_compositor *xc,
 	// (#59). Record the target + timestamp; the render thread applies it once the
 	// size has settled (no newer pose for ~150 ms) — coalescing the glide into a
 	// single recreate, the macOS analogue of the Windows defer-during-size-move.
-	mc->session_render.resize_x = x_px;
-	mc->session_render.resize_y = y_px;
-	mc->session_render.resize_w = w_px;
-	mc->session_render.resize_h = h_px;
-	mc->session_render.resize_request_ns = os_monotonic_get_ns();
-	mc->session_render.resize_pending = true;
+	if (!shared) {
+		mc->session_render.resize_x = x_px;
+		mc->session_render.resize_y = y_px;
+		mc->session_render.resize_w = w_px;
+		mc->session_render.resize_h = h_px;
+		mc->session_render.resize_request_ns = os_monotonic_get_ns();
+		mc->session_render.resize_pending = true;
+	}
 	return true;
 #else
 	(void)xc;
@@ -3403,6 +3417,631 @@ submit_and_present:
 
 }
 
+#ifdef XRT_OS_MACOS
+/*
+ * ============================================================================
+ * Shared spatial surface (#59) — the macOS analogue of the Windows D3D11
+ * monolith (comp_d3d11_service.cpp::multi_compositor_render).
+ *
+ * Instead of one NSWindow per client, the service owns ONE full-screen window
+ * and composites every client app into ONE combined stereo atlas at its 3D
+ * pose, then performs ONE display-processor weave and ONE present. M1: flat
+ * (window at panel depth, each client's internal stereo preserved). M2 adds
+ * per-eye parallax; M3 adds chrome/cursor/overlays floating above each window.
+ * ============================================================================
+ */
+
+/*!
+ * Lazily create the one shared full-screen target, its render rings, and the
+ * one display processor. Mirrors multi_compositor_init_session_render but the
+ * resources live on the multi_system_compositor (not a client).
+ */
+static bool
+shared_surface_init(struct multi_system_compositor *msc, struct vk_bundle *vk)
+{
+	if (msc->shared_surface_initialized) {
+		return true;
+	}
+	if (msc->target_service == NULL) {
+		U_LOG_E("[#59] no target service for shared surface");
+		return false;
+	}
+
+	// macOS: the service creates + owns the full-screen NSWindow; the handle arg
+	// is ignored (null_target_service_create_from_window_macos).
+	xrt_result_t ret = comp_target_service_create(msc->target_service, NULL, &msc->shared_target);
+	if (ret != XRT_SUCCESS || msc->shared_target == NULL) {
+		U_LOG_E("[#59] failed to create shared full-screen target: %d", ret);
+		return false;
+	}
+	struct comp_target *ct = msc->shared_target;
+	U_LOG_W("[#59] created shared full-screen target %ux%u fmt=%d (%u images)", ct->width, ct->height,
+	        ct->format, ct->image_count);
+
+	uint32_t image_count = ct->image_count;
+
+	// Command pool + per-image command buffers + fences (signaled).
+	VkResult vr;
+	VkCommandPoolCreateInfo pool_info = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+	    .queueFamilyIndex = vk->main_queue->family_index,
+	    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+	};
+	vr = vk->vkCreateCommandPool(vk->device, &pool_info, NULL, &msc->shared_cmd_pool);
+	if (vr != VK_SUCCESS) {
+		U_LOG_E("[#59] failed to create shared command pool: %d", vr);
+		return false;
+	}
+
+	msc->shared_cmd_buffers = U_TYPED_ARRAY_CALLOC(VkCommandBuffer, image_count);
+	msc->shared_fences = U_TYPED_ARRAY_CALLOC(VkFence, image_count);
+	if (msc->shared_cmd_buffers == NULL || msc->shared_fences == NULL) {
+		U_LOG_E("[#59] failed to allocate shared cmd/fence arrays");
+		return false;
+	}
+
+	VkCommandBufferAllocateInfo cb_alloc_info = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+	    .commandPool = msc->shared_cmd_pool,
+	    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+	    .commandBufferCount = image_count,
+	};
+	vr = vk->vkAllocateCommandBuffers(vk->device, &cb_alloc_info, msc->shared_cmd_buffers);
+	if (vr != VK_SUCCESS) {
+		U_LOG_E("[#59] failed to allocate shared command buffers: %d", vr);
+		return false;
+	}
+
+	VkFenceCreateInfo fence_info = {
+	    .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+	    .flags = VK_FENCE_CREATE_SIGNALED_BIT,
+	};
+	for (uint32_t i = 0; i < image_count; i++) {
+		vr = vk->vkCreateFence(vk->device, &fence_info, NULL, &msc->shared_fences[i]);
+		if (vr != VK_SUCCESS) {
+			U_LOG_E("[#59] failed to create shared fence %u: %d", i, vr);
+			return false;
+		}
+	}
+	msc->shared_buffer_count = image_count;
+	msc->shared_fenced_buffer = -1;
+
+	// Render pass (single color attachment) + framebuffers — used by a
+	// self-submitting DP that targets the swapchain image (matches per-session).
+	VkAttachmentDescription color_attachment = {
+	    .format = ct->format,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+	    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+	    .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+	    .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+	    .initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	};
+	VkAttachmentReference color_ref = {.attachment = 0, .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+	VkSubpassDescription subpass = {
+	    .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+	    .colorAttachmentCount = 1,
+	    .pColorAttachments = &color_ref,
+	};
+	VkRenderPassCreateInfo rp_info = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+	    .attachmentCount = 1,
+	    .pAttachments = &color_attachment,
+	    .subpassCount = 1,
+	    .pSubpasses = &subpass,
+	};
+	vr = vk->vkCreateRenderPass(vk->device, &rp_info, NULL, &msc->shared_render_pass);
+	if (vr == VK_SUCCESS) {
+		msc->shared_framebuffers = U_TYPED_ARRAY_CALLOC(VkFramebuffer, image_count);
+		if (msc->shared_framebuffers != NULL) {
+			for (uint32_t i = 0; i < image_count; i++) {
+				VkFramebufferCreateInfo fb_info = {
+				    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+				    .renderPass = msc->shared_render_pass,
+				    .attachmentCount = 1,
+				    .pAttachments = &ct->images[i].view,
+				    .width = ct->width,
+				    .height = ct->height,
+				    .layers = 1,
+				};
+				if (vk->vkCreateFramebuffer(vk->device, &fb_info, NULL,
+				                            &msc->shared_framebuffers[i]) != VK_SUCCESS) {
+					msc->shared_framebuffers[i] = VK_NULL_HANDLE;
+				}
+			}
+		}
+	}
+
+	// The one display processor that weaves the combined atlas.
+	xrt_dp_factory_vk_fn_t factory = (xrt_dp_factory_vk_fn_t)msc->base.info.dp_factory_vk;
+	if (factory != NULL) {
+		xrt_result_t dp_ret = factory(vk,                                         // vk_bundle
+		                              (void *)(uintptr_t)msc->shared_cmd_pool,    // cmd_pool
+		                              NULL,                                        // window_handle (service-owned)
+		                              (int32_t)ct->format,                         // target_format
+		                              &msc->shared_dp);
+		if (dp_ret != XRT_SUCCESS) {
+			U_LOG_W("[#59] shared DP factory failed: %d (no weave)", dp_ret);
+			msc->shared_dp = NULL;
+		} else {
+			U_LOG_W("[#59] created shared display processor");
+		}
+	}
+
+	msc->shared_surface_initialized = true;
+	U_LOG_W("[#59] shared surface initialized");
+	return true;
+}
+
+/*!
+ * Ensure the one combined stereo atlas exists at (tile_columns*eye_w) × eye_h.
+ */
+static bool
+shared_ensure_atlas(struct multi_system_compositor *msc,
+                    struct vk_bundle *vk,
+                    int eye_w,
+                    int eye_h,
+                    uint32_t tile_columns,
+                    VkFormat format)
+{
+	int atlas_w = (int)tile_columns * eye_w;
+	int atlas_h = eye_h;
+	if (msc->shared_atlas_initialized && msc->shared_atlas_w == atlas_w && msc->shared_atlas_h == atlas_h &&
+	    msc->shared_atlas_format == format) {
+		return true;
+	}
+	if (msc->shared_atlas_initialized) {
+		if (msc->shared_atlas_view != VK_NULL_HANDLE)
+			vk->vkDestroyImageView(vk->device, msc->shared_atlas_view, NULL);
+		if (msc->shared_atlas_image != VK_NULL_HANDLE)
+			vk->vkDestroyImage(vk->device, msc->shared_atlas_image, NULL);
+		if (msc->shared_atlas_memory != VK_NULL_HANDLE)
+			vk->vkFreeMemory(vk->device, msc->shared_atlas_memory, NULL);
+		msc->shared_atlas_initialized = false;
+	}
+
+	VkExtent2D extent = {(uint32_t)atlas_w, (uint32_t)atlas_h};
+	VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+	VkResult ret =
+	    vk_create_image_simple(vk, extent, format, usage, &msc->shared_atlas_memory, &msc->shared_atlas_image);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("[#59] failed to create combined atlas: %s", vk_result_string(ret));
+		return false;
+	}
+	VkImageSubresourceRange range = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1};
+	ret = vk_create_view(vk, msc->shared_atlas_image, VK_IMAGE_VIEW_TYPE_2D, format, range, &msc->shared_atlas_view);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("[#59] failed to create combined atlas view: %s", vk_result_string(ret));
+		return false;
+	}
+	msc->shared_atlas_w = atlas_w;
+	msc->shared_atlas_h = atlas_h;
+	msc->shared_eye_w = eye_w;
+	msc->shared_eye_h = eye_h;
+	msc->shared_atlas_format = format;
+	msc->shared_atlas_initialized = true;
+	U_LOG_W("[#59] combined atlas %dx%d (per-eye %dx%d, %u tiles) fmt=%d", atlas_w, atlas_h, eye_w, eye_h,
+	        tile_columns, format);
+	return true;
+}
+
+//! One client's resolved placement + content for the combined-atlas pass.
+struct shared_client_render
+{
+	struct multi_compositor *mc;
+	struct multi_layer_entry *layer;
+	uint32_t view_count;
+	float pose_z;
+	int slot; // stable tie-break (msc->clients index) so equal-z order is deterministic
+	int win_x, win_y, win_w, win_h; // top-left display px
+};
+
+//! Painter's order: far (larger z) first so nearer windows overwrite. Equal z
+//! tie-breaks on the stable client slot — otherwise qsort can swap two
+//! overlapping same-z windows frame to frame, which reads as a blink.
+static int
+shared_client_sort(const void *a, const void *b)
+{
+	const struct shared_client_render *ca = a;
+	const struct shared_client_render *cb = b;
+	if (ca->pose_z > cb->pose_z)
+		return -1;
+	if (ca->pose_z < cb->pose_z)
+		return 1;
+	return (ca->slot < cb->slot) ? -1 : (ca->slot > cb->slot) ? 1 : 0;
+}
+
+/*!
+ * Composite every active client into the one combined atlas, weave once, present
+ * once. The macOS shared-surface analogue of render_per_session_clients_locked.
+ */
+static void
+render_shared_surface_locked(struct multi_system_compositor *msc, int64_t display_time_ns)
+{
+	COMP_TRACE_MARKER();
+
+	struct vk_bundle *vk = comp_target_service_get_vk(msc->target_service);
+	if (vk == NULL) {
+		return;
+	}
+
+	// Collect the clients to composite this frame (active, visible, with content).
+	struct shared_client_render order[MULTI_MAX_CLIENTS];
+	uint32_t order_count = 0;
+	for (size_t k = 0; k < ARRAY_SIZE(msc->clients); k++) {
+		struct multi_compositor *mc = msc->clients[k];
+		if (mc == NULL) {
+			continue;
+		}
+		// A minimized client (#61) contributes nothing to the surface; the
+		// taskbar/overlays draw at the combined pass below regardless.
+		if (comp_multi_workspace_is_window_hidden(&mc->base.base)) {
+			continue;
+		}
+		if (!mc->delivered.active || mc->delivered.layer_count == 0) {
+			continue;
+		}
+		struct multi_layer_entry *layer = NULL;
+		for (uint32_t i = 0; i < mc->delivered.layer_count; i++) {
+			enum xrt_layer_type t = mc->delivered.layers[i].data.type;
+			if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH || t == XRT_LAYER_ZONE_3D) {
+				layer = &mc->delivered.layers[i];
+				break;
+			}
+		}
+		if (layer == NULL) {
+			continue;
+		}
+
+		struct shared_client_render *e = &order[order_count++];
+		e->mc = mc;
+		e->layer = layer;
+		e->slot = (int)k;
+		uint32_t vc = layer->data.view_count;
+		if (vc < 1)
+			vc = 1;
+		if (vc > XRT_MAX_VIEWS)
+			vc = XRT_MAX_VIEWS;
+		e->view_count = vc;
+
+		// Placement: stored display px-rect from the controller (set_window_pose),
+		// else fall back to the full display (a lone app fills the surface).
+		struct xrt_pose pose = XRT_POSE_IDENTITY;
+		float wm = 0.0f, hm = 0.0f;
+		if (comp_multi_workspace_load_window_pose(&mc->base.base, &pose, &wm, &hm)) {
+			e->pose_z = pose.position.z;
+		} else {
+			e->pose_z = 0.0f;
+		}
+		int wx = 0, wy = 0, ww = 0, wh = 0;
+		if (!comp_multi_workspace_load_window_px_rect(&mc->base.base, &wx, &wy, &ww, &wh) || ww <= 0 ||
+		    wh <= 0) {
+			wx = 0;
+			wy = 0;
+			ww = msc->base.info.display_pixel_width;
+			wh = msc->base.info.display_pixel_height;
+		}
+		e->win_x = wx;
+		e->win_y = wy;
+		e->win_w = ww;
+		e->win_h = wh;
+	}
+
+	// Lazy-init the shared window/DP once a client is present. Avoids creating a
+	// full-screen window with nothing to show.
+	if (order_count == 0 && !msc->shared_surface_initialized) {
+		return;
+	}
+	if (!shared_surface_init(msc, vk)) {
+		return;
+	}
+
+	// Painter's sort (far first).
+	if (order_count > 1) {
+		qsort(order, order_count, sizeof(order[0]), shared_client_sort);
+	}
+
+	struct comp_target *ct = msc->shared_target;
+
+	// Per-eye tile = the display; combined atlas = 2 tiles (stereo) side by side.
+	int eye_w = (int)msc->base.info.display_pixel_width;
+	int eye_h = (int)msc->base.info.display_pixel_height;
+	if (eye_w <= 0 || eye_h <= 0) {
+		eye_w = (int)ct->width;
+		eye_h = (int)ct->height;
+	}
+	const uint32_t tile_columns = 2; // M1: always stereo
+	const uint32_t tile_rows = 1;
+
+	// Atlas format: a SINGLE stable format (the target's) so the atlas is created
+	// once, never per-frame. Clients can submit different swapchain formats (two
+	// identical cubes can land on SRGB vs UNORM); vkCmdBlitImage converts each into
+	// the atlas. Keying recreation on a per-client format made the atlas thrash
+	// (rebuild every frame → full-screen blink) because the painter order — and
+	// thus which client is order[0] — alternates frame to frame.
+	VkFormat atlas_format = ct->format;
+	if (!shared_ensure_atlas(msc, vk, eye_w, eye_h, tile_columns, atlas_format)) {
+		return;
+	}
+
+	// Wait for the previous frame's fence on whatever buffer we'll reuse.
+	if (msc->shared_fenced_buffer >= 0) {
+		vk->vkWaitForFences(vk->device, 1, &msc->shared_fences[msc->shared_fenced_buffer], VK_TRUE, UINT64_MAX);
+		msc->shared_fenced_buffer = -1;
+	}
+
+	// Frame pacing (the shared target is the only consumer; it must drive pacing).
+	{
+		int64_t frame_id = -1, wake = 0, desired = 0, slop = 0, predicted = 0;
+		comp_target_calc_frame_pacing(ct, &frame_id, &wake, &desired, &slop, &predicted);
+		int64_t now_ns = os_monotonic_get_ns();
+		comp_target_mark_wake_up(ct, frame_id, now_ns);
+		comp_target_mark_begin(ct, frame_id, now_ns);
+	}
+
+	uint32_t buffer_index = 0;
+	VkResult ret = comp_target_acquire(ct, &buffer_index);
+	if (ret == VK_ERROR_OUT_OF_DATE_KHR || ret == VK_ERROR_SURFACE_LOST_KHR) {
+		U_LOG_W("[#59] shared acquire %s, skipping frame", vk_result_string(ret));
+		return;
+	}
+	if (ret != VK_SUCCESS && ret != VK_SUBOPTIMAL_KHR) {
+		U_LOG_E("[#59] shared acquire failed: %s", vk_result_string(ret));
+		return;
+	}
+	if (buffer_index >= msc->shared_buffer_count) {
+		U_LOG_E("[#59] shared buffer_index %u out of range", buffer_index);
+		return;
+	}
+
+	vk->vkResetFences(vk->device, 1, &msc->shared_fences[buffer_index]);
+
+	uint32_t fb_w = ct->width, fb_h = ct->height;
+	VkFormat fb_fmt = ct->format;
+	VkFramebuffer framebuffer =
+	    (msc->shared_framebuffers != NULL) ? msc->shared_framebuffers[buffer_index] : VK_NULL_HANDLE;
+
+	VkCommandBuffer cmd = msc->shared_cmd_buffers[buffer_index];
+	vk->vkResetCommandBuffer(cmd, 0);
+	VkCommandBufferBeginInfo begin_info = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	if (vk->vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) {
+		return;
+	}
+
+	VkImageSubresourceRange atlas_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+	// Atlas → TRANSFER_DST, then clear to the spatial-desktop backdrop (#1a1a1a).
+	VkImageMemoryBarrier atlas_to_dst = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = 0,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .image = msc->shared_atlas_image,
+	    .subresourceRange = atlas_range,
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
+	                         NULL, 1, &atlas_to_dst);
+
+	VkClearColorValue backdrop = {.float32 = {0.1f, 0.1f, 0.1f, 1.0f}};
+	vk->vkCmdClearColorImage(cmd, msc->shared_atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &backdrop, 1,
+	                         &atlas_range);
+	// Order the clear before the per-client blits (both TRANSFER writes to the atlas).
+	VkImageMemoryBarrier clear_barrier = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .image = msc->shared_atlas_image,
+	    .subresourceRange = atlas_range,
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
+	                         NULL, 1, &clear_barrier);
+
+	// Blit each client's content into its window px-rect, per eye, into the atlas.
+	for (uint32_t c = 0; c < order_count; c++) {
+		struct shared_client_render *e = &order[c];
+		bool flip_y = e->layer->data.flip_y;
+
+		// Resolve the per-view source images for this client.
+		VkImage src_img[XRT_MAX_VIEWS];
+		uint32_t src_arr[XRT_MAX_VIEWS];
+		int src_x[XRT_MAX_VIEWS], src_y[XRT_MAX_VIEWS], src_w[XRT_MAX_VIEWS], src_h[XRT_MAX_VIEWS];
+		bool ok = true;
+		for (uint32_t v = 0; v < e->view_count; v++) {
+			int tw = 0, th = 0;
+			VkFormat fmt = VK_FORMAT_UNDEFINED;
+			VkImageView iv = VK_NULL_HANDLE;
+			VkImage im = VK_NULL_HANDLE;
+			uint32_t ai = 0;
+			if (!get_session_layer_view(e->layer, v, &tw, &th, &fmt, &iv, &im, &ai)) {
+				ok = false;
+				break;
+			}
+			src_img[v] = im;
+			src_arr[v] = ai;
+			src_x[v] = e->layer->data.proj.v[v].sub.rect.offset.w;
+			src_y[v] = e->layer->data.proj.v[v].sub.rect.offset.h;
+			src_w[v] = tw;
+			src_h[v] = th;
+		}
+		if (!ok) {
+			continue;
+		}
+
+		// Pre-barrier the unique source images GENERAL → TRANSFER_SRC.
+		VkImage uniq[XRT_MAX_VIEWS];
+		uint32_t uniq_arr[XRT_MAX_VIEWS];
+		uint32_t uniq_n = 0;
+		for (uint32_t v = 0; v < e->view_count; v++) {
+			bool found = false;
+			for (uint32_t u = 0; u < uniq_n; u++) {
+				if (uniq[u] == src_img[v] && uniq_arr[u] == src_arr[v]) {
+					found = true;
+					break;
+				}
+			}
+			if (!found) {
+				uniq[uniq_n] = src_img[v];
+				uniq_arr[uniq_n] = src_arr[v];
+				uniq_n++;
+			}
+		}
+		VkImageMemoryBarrier pre[XRT_MAX_VIEWS];
+		for (uint32_t u = 0; u < uniq_n; u++) {
+			pre[u] = (VkImageMemoryBarrier){
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = 0,
+			    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+			    .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+			    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			    .image = uniq[u],
+			    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, uniq_arr[u], 1},
+			};
+		}
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+		                         0, NULL, 0, NULL, uniq_n, pre);
+
+		// Per eye: blit this client's view into its window rect of that eye's tile.
+		// M1 is flat — same dst rect for both eyes; the client's own two views
+		// preserve its internal stereo (window sits on the panel plane).
+		for (uint32_t eye = 0; eye < tile_columns; eye++) {
+			uint32_t v = (eye < e->view_count) ? eye : (e->view_count - 1);
+			int dst_x0 = (int)eye * eye_w + e->win_x;
+			int dst_y0 = e->win_y;
+			int dst_x1 = dst_x0 + e->win_w;
+			int dst_y1 = dst_y0 + e->win_h;
+			int s_top = src_y[v] + (flip_y ? src_h[v] : 0);
+			int s_bot = src_y[v] + (flip_y ? 0 : src_h[v]);
+			VkImageBlit blit = {
+			    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, src_arr[v], 1},
+			    .srcOffsets = {{src_x[v], s_top, 0}, {src_x[v] + src_w[v], s_bot, 1}},
+			    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+			    .dstOffsets = {{dst_x0, dst_y0, 0}, {dst_x1, dst_y1, 1}},
+			};
+			vk->vkCmdBlitImage(cmd, src_img[v], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			                   msc->shared_atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+			                   VK_FILTER_LINEAR);
+		}
+
+		// Post-barrier the unique sources back to GENERAL (shared cross-proc rest).
+		VkImageMemoryBarrier post[XRT_MAX_VIEWS];
+		for (uint32_t u = 0; u < uniq_n; u++) {
+			post[u] = (VkImageMemoryBarrier){
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+			    .dstAccessMask = 0,
+			    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+			    .image = uniq[u],
+			    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, uniq_arr[u], 1},
+			};
+		}
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+		                         0, 0, NULL, 0, NULL, uniq_n, post);
+	}
+
+	// Atlas → SHADER_READ for the weave.
+	VkImageMemoryBarrier atlas_to_read = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	    .image = msc->shared_atlas_image,
+	    .subresourceRange = atlas_range,
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL,
+	                         0, NULL, 1, &atlas_to_read);
+
+	// Target → COLOR_ATTACHMENT for the weave.
+	VkImageMemoryBarrier pre_weave = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = 0,
+	    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .image = ct->images[buffer_index].handle,
+	    .subresourceRange = atlas_range,
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                         0, 0, NULL, 0, NULL, 1, &pre_weave);
+
+	if (msc->shared_dp != NULL) {
+		xrt_display_processor_set_target_color_view(msc->shared_dp, ct->images[buffer_index].view);
+		xrt_display_processor_process_atlas(msc->shared_dp, cmd,
+		                                    (VkImage_XDP)msc->shared_atlas_image, msc->shared_atlas_view,
+		                                    (uint32_t)eye_w, (uint32_t)eye_h, tile_columns, tile_rows,
+		                                    (VkFormat_XDP)atlas_format, framebuffer,
+		                                    (VkImage_XDP)ct->images[buffer_index].handle, fb_w, fb_h,
+		                                    (VkFormat_XDP)fb_fmt, 0, 0, 0, 0);
+	}
+
+	// Target → PRESENT_SRC.
+	VkImageMemoryBarrier post_weave = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	    .dstAccessMask = 0,
+	    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+	    .image = ct->images[buffer_index].handle,
+	    .subresourceRange = atlas_range,
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &post_weave);
+
+	if (vk->vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+		return;
+	}
+
+	VkSemaphore wait_sem = ct->semaphores.present_complete;
+	VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	VkSemaphore signal_sem = ct->semaphores.render_complete;
+	VkSubmitInfo submit_info = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .waitSemaphoreCount = (wait_sem != VK_NULL_HANDLE) ? 1 : 0,
+	    .pWaitSemaphores = (wait_sem != VK_NULL_HANDLE) ? &wait_sem : NULL,
+	    .pWaitDstStageMask = (wait_sem != VK_NULL_HANDLE) ? &wait_stage : NULL,
+	    .commandBufferCount = 1,
+	    .pCommandBuffers = &cmd,
+	    .signalSemaphoreCount = (signal_sem != VK_NULL_HANDLE) ? 1 : 0,
+	    .pSignalSemaphores = (signal_sem != VK_NULL_HANDLE) ? &signal_sem : NULL,
+	};
+	ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, msc->shared_fences[buffer_index]);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("[#59] shared submit failed: %s", vk_result_string(ret));
+		return;
+	}
+
+	// Cross-device shared memory has no GPU-level sync between app and compositor
+	// devices (same rationale as the per-session path) — wait before present.
+	vk->vkWaitForFences(vk->device, 1, &msc->shared_fences[buffer_index], VK_TRUE, UINT64_MAX);
+	msc->shared_fenced_buffer = -1;
+
+	ret = comp_target_present(ct, vk->main_queue->queue, buffer_index, 0, display_time_ns, 0);
+	if (ret == VK_ERROR_OUT_OF_DATE_KHR || ret == VK_ERROR_SURFACE_LOST_KHR) {
+		U_LOG_W("[#59] shared present %s", vk_result_string(ret));
+	} else if (ret != VK_SUCCESS && ret != VK_SUBOPTIMAL_KHR) {
+		U_LOG_E("[#59] shared present failed: %s", vk_result_string(ret));
+	}
+
+	// NOTE: do NOT retire the delivered frames here. Unlike the per-session path
+	// (where each client owns a swapchain that persists its last present), the
+	// shared surface rebuilds ONE atlas every compositor frame. Retiring would
+	// clear `delivered`, so any client that did not submit a brand-new frame this
+	// tick would fall back to backdrop → a per-window blink. Leaving `delivered`
+	// sticky (the native compositor's model — it is overwritten on the next
+	// delivery) means every placed client always has content to composite; a
+	// frozen/slow client simply re-shows its last frame, exactly like a real
+	// desktop window.
+}
+#endif // XRT_OS_MACOS
+
 /*!
  * Render all per-session clients to their own targets.
  * Called after xrt_comp_layer_commit() for sessions with external window handles.
@@ -3527,8 +4166,17 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 		// old swapchain's BufferQueue connection (VK_ERROR_NATIVE_WINDOW_IN_USE_KHR storm)
 		// and pointlessly rebuilds a target no layers will reach. begin_session flips
 		// session_active back on and the next pass re-inits from the then-current surface.
-		if (mc->state.session_active && multi_compositor_has_session_render(mc) &&
-		    !mc->session_render.initialized && !mc->session_render.window_close_exit_sent) {
+		bool skip_session_render_init = false;
+#ifdef XRT_OS_MACOS
+		// Shared spatial surface (#59): every client composites into ONE
+		// service-owned full-screen window, so the per-client NSWindow/target/DP
+		// is never created. The shared surface reads each client's delivered
+		// frames directly (deliver_any_frames below still runs).
+		skip_session_render_init = mc->msc->shared_surface_enabled;
+#endif
+		if (!skip_session_render_init && mc->state.session_active &&
+		    multi_compositor_has_session_render(mc) && !mc->session_render.initialized &&
+		    !mc->session_render.window_close_exit_sent) {
 			multi_compositor_init_session_render(mc);
 		}
 
@@ -3952,7 +4600,16 @@ multi_main_loop(struct multi_system_compositor *msc)
 		// Render per-session clients to their own targets (Phase 4)
 		// These sessions were skipped in transfer_layers_locked and render separately
 		os_mutex_lock(&msc->list_and_timing_lock);
-		render_per_session_clients_locked(msc, predicted_display_time_ns);
+#ifdef XRT_OS_MACOS
+		if (msc->shared_surface_enabled) {
+			// Shared spatial surface (#59): composite every client into ONE
+			// full-screen window + combined atlas → one weave → one present.
+			render_shared_surface_locked(msc, predicted_display_time_ns);
+		} else
+#endif
+		{
+			render_per_session_clients_locked(msc, predicted_display_time_ns);
+		}
 		os_mutex_unlock(&msc->list_and_timing_lock);
 
 		// Re-lock the thread for check in while statement.
@@ -4175,6 +4832,18 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 
 	// Store the target service for per-session rendering (Phase 3)
 	msc->target_service = target_service;
+
+#ifdef XRT_OS_MACOS
+	// Shared spatial surface (#59): when enabled, every client app composites into
+	// ONE full-screen window as a 3D spatial window (the macOS analogue of the
+	// Windows D3D11 monolith), instead of one NSWindow per app. Off by default
+	// while the merge is verified; flip on with DISPLAYXR_SHARED_SURFACE=1.
+	msc->shared_surface_enabled = debug_get_bool_option_shared_surface();
+	msc->shared_fenced_buffer = -1;
+	if (msc->shared_surface_enabled) {
+		U_LOG_W("[#59] shared spatial surface ENABLED (single full-screen window)");
+	}
+#endif
 
 	msc->sessions.active_count = 0;
 	msc->sessions.state = do_warm_start ? MULTI_SYSTEM_STATE_INIT_WARM_START : MULTI_SYSTEM_STATE_STOPPED;
