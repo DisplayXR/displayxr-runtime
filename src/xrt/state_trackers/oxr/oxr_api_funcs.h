@@ -1057,6 +1057,13 @@ oxr_xrWeaveBindWindowEXT(XrSession session, void *windowHandle);
 //! OpenXR API function @ep{xrWeaveSubmitEXT}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrWeaveSubmitEXT(XrSession session, const XrWeaveSubmitInfoEXT *submitInfo, XrWeaveOutputEXT *output);
+
+//! OpenXR API function @ep{xrWeaveSnapWindowRectEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrWeaveSnapWindowRectEXT(XrSession session,
+                            const XrRect2Di *originRect,
+                            const XrRect2Di *targetRect,
+                            XrRect2Di *snappedRect);
 #endif
 
 #ifdef OXR_HAVE_EXT_conformance_automation

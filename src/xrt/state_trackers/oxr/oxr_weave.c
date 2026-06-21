@@ -74,6 +74,16 @@ comp_ipc_client_compositor_weave_get_fence(struct xrt_compositor *xc,
                                            bool *out_have_fence,
                                            xrt_graphics_sync_handle_t *out_handle);
 
+xrt_result_t
+comp_ipc_client_compositor_weave_snap_window_rect(struct xrt_compositor *xc,
+                                                  int32_t origin_x,
+                                                  int32_t origin_y,
+                                                  int32_t target_x,
+                                                  int32_t target_y,
+                                                  bool *out_snapped,
+                                                  int32_t *out_snapped_x,
+                                                  int32_t *out_snapped_y);
+
 //! IPC sessions hold a native-compositor handle (the IPC client compositor) but
 //! none of the in-process native-compositor flags are set. Mirrors oxr_capture.c.
 static bool
@@ -195,6 +205,48 @@ oxr_xrWeaveSubmitEXT(XrSession session, const XrWeaveSubmitInfoEXT *submitInfo, 
 		sess->weave.last_h = h;
 	}
 
+	return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrWeaveSnapWindowRectEXT(XrSession session,
+                             const XrRect2Di *originRect,
+                             const XrRect2Di *targetRect,
+                             XrRect2Di *snappedRect)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrWeaveSnapWindowRectEXT");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_weave);
+	OXR_VERIFY_ARG_NOT_NULL(&log, originRect);
+	OXR_VERIFY_ARG_NOT_NULL(&log, targetRect);
+	OXR_VERIFY_ARG_NOT_NULL(&log, snappedRect);
+
+	if (!session_is_ipc(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrWeaveSnapWindowRectEXT: the weave service is only available on the "
+		                 "out-of-process (service) path");
+	}
+
+	// Only the top-left is phase-snapped; the size passes through unchanged.
+	// On no DP snap support the bridge returns the target unchanged, so the
+	// result is always a valid rect.
+	bool snapped = false;
+	int32_t sx = targetRect->offset.x, sy = targetRect->offset.y;
+	xrt_result_t xret = comp_ipc_client_compositor_weave_snap_window_rect(
+	    &sess->xcn->base, originRect->offset.x, originRect->offset.y, targetRect->offset.x, targetRect->offset.y,
+	    &snapped, &sx, &sy);
+	if (xret != XRT_SUCCESS) {
+		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
+		                 "xrWeaveSnapWindowRectEXT: snap failed (xrt_result=%d)", (int)xret);
+	}
+
+	snappedRect->offset.x = sx;
+	snappedRect->offset.y = sy;
+	snappedRect->extent = targetRect->extent;
 	return XR_SUCCESS;
 }
 

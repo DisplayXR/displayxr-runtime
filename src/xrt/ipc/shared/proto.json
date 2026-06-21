@@ -742,6 +742,20 @@
 		"out_handles": {"type": "xrt_graphics_sync_handle_t"}
 	},
 
+	"weave_snap_window_rect": {
+		"in": [
+			{"name": "origin_x", "type": "int32_t"},
+			{"name": "origin_y", "type": "int32_t"},
+			{"name": "target_x", "type": "int32_t"},
+			{"name": "target_y", "type": "int32_t"}
+		],
+		"out": [
+			{"name": "snapped", "type": "bool"},
+			{"name": "snapped_x", "type": "int32_t"},
+			{"name": "snapped_y", "type": "int32_t"}
+		]
+	},
+
 	"compositor_semaphore_destroy": {
 		"in": [
 			{"name": "id", "type": "uint32_t"}
