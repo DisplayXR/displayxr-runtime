@@ -284,6 +284,60 @@ comp_window_macos_init_swapchain(struct comp_target *ct, uint32_t width, uint32_
 	return true;
 }
 
+//! Reposition + resize the NSWindow on the main thread. @p x,y,w,h are top-left
+//! display pixels; AppKit frames are bottom-left points, so flip Y and divide by
+//! the backing scale. Update the CAMetalLayer drawableSize to the pixel size.
+static void
+set_window_rect_on_main_thread(struct comp_window_macos *cwm, int32_t x, int32_t y, int32_t w, int32_t h)
+{
+	if (cwm->window == nil || w <= 0 || h <= 0) {
+		return;
+	}
+
+	NSScreen *screen = [cwm->window screen];
+	if (screen == nil) {
+		screen = [NSScreen mainScreen];
+	}
+	CGFloat scale = [cwm->window backingScaleFactor];
+	if (scale <= 0.0) {
+		scale = 1.0;
+	}
+
+	CGFloat win_x_pt = (CGFloat)x / scale;
+	CGFloat win_w_pt = (CGFloat)w / scale;
+	CGFloat win_h_pt = (CGFloat)h / scale;
+	// AppKit origin is the window's BOTTOM edge, measured from the display bottom.
+	// The pixel rect's top edge is y px from the display top, so its bottom edge is
+	// (y + h) px from the top → screen_height − (y + h) points from the bottom.
+	CGFloat screen_h_pt = (screen != nil) ? screen.frame.size.height : (win_h_pt);
+	CGFloat screen_y0_pt = (screen != nil) ? screen.frame.origin.y : 0.0;
+	CGFloat win_y_pt = screen_y0_pt + screen_h_pt - ((CGFloat)(y + h) / scale);
+
+	NSRect frame = NSMakeRect(win_x_pt, win_y_pt, win_w_pt, win_h_pt);
+	[cwm->window setFrame:frame display:YES];
+
+	if (cwm->metal_layer != nil) {
+		cwm->metal_layer.contentsScale = scale;
+		cwm->metal_layer.drawableSize = CGSizeMake((CGFloat)w, (CGFloat)h);
+	}
+}
+
+void
+comp_window_macos_set_window_rect(struct comp_target *ct, int32_t x, int32_t y, int32_t w, int32_t h)
+{
+	if (ct == NULL) {
+		return;
+	}
+	struct comp_window_macos *cwm = (struct comp_window_macos *)ct;
+	if ([NSThread isMainThread]) {
+		set_window_rect_on_main_thread(cwm, x, y, w, h);
+	} else {
+		dispatch_sync(dispatch_get_main_queue(), ^{
+			set_window_rect_on_main_thread(cwm, x, y, w, h);
+		});
+	}
+}
+
 static void
 comp_window_macos_flush(struct comp_target *ct)
 {

@@ -136,6 +136,72 @@ comp_multi_workspace_get_client_window_dims(struct xrt_compositor *xc,
                                             float *out_w_m,
                                             float *out_h_m);
 
+/*!
+ * Tier-2 window placement (#59). Set the per-client window pose: reposition and
+ * resize the client's runtime-owned NSWindow into a display sub-rect so multiple
+ * apps tile instead of stacking full-screen. Backs the macOS
+ * xrSetWorkspaceClientWindowPoseEXT handler. Computes the pixel rect from @p pose
+ * (display-center origin, meters, +y up) using the display's pixel density,
+ * stores it (so get_window_dims echoes it back to the controller and the cursor
+ * composite can map global cursor px into the window), repositions the NSWindow
+ * on the main thread and flags the per-session swapchain for recreation at the
+ * new size. Defined in comp_multi_system.c (needs session_render + comp_window_macos).
+ * Returns false if @p xc is not a placeable per-session client.
+ */
+bool
+comp_multi_workspace_set_client_window_pose(struct xrt_compositor *xc,
+                                            const struct xrt_pose *pose,
+                                            float width_m,
+                                            float height_m);
+
+/*!
+ * Store the per-client window placement in the registry (pose + meters + the
+ * derived top-left-origin display-pixel rect). Called by
+ * @ref comp_multi_workspace_set_client_window_pose. Find-or-add: a client may be
+ * posed before chrome is registered.
+ */
+void
+comp_multi_workspace_store_window_pose(struct xrt_compositor *target_xc,
+                                       const struct xrt_pose *pose,
+                                       float width_m,
+                                       float height_m,
+                                       int32_t px_x,
+                                       int32_t px_y,
+                                       int32_t px_w,
+                                       int32_t px_h);
+
+/*!
+ * Ask a managed content client to exit (macOS chrome close button / DELETE key,
+ * #59). Pushes XRT_SESSION_EVENT_EXIT_REQUEST to the client's per-session
+ * compositor; its xrPollEvent surfaces XR_SESSION_STATE_EXITING and the app
+ * leaves its frame loop cleanly. Returns false if @p target_xc is not a
+ * placeable per-session client. Defined in comp_multi_system.c.
+ */
+bool
+comp_multi_workspace_request_client_exit(struct xrt_compositor *target_xc);
+
+/*!
+ * Load a previously stored window pose/dims. Returns false if @p target_xc has
+ * not been placed yet (no set_window_pose has arrived).
+ */
+bool
+comp_multi_workspace_load_window_pose(struct xrt_compositor *target_xc,
+                                      struct xrt_pose *out_pose,
+                                      float *out_w_m,
+                                      float *out_h_m);
+
+/*!
+ * Load the stored top-left-origin display-pixel rect for @p target_xc (the
+ * NSWindow's position on the display). The cursor composite uses it to convert
+ * the global cursor px into window-local px. Returns false if not placed.
+ */
+bool
+comp_multi_workspace_load_window_px_rect(struct xrt_compositor *target_xc,
+                                         int32_t *out_x,
+                                         int32_t *out_y,
+                                         int32_t *out_w,
+                                         int32_t *out_h);
+
 
 /*
  *

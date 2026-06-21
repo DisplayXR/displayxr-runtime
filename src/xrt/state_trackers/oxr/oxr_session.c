@@ -1029,11 +1029,12 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 	// commit rendered content to the screen. This is the only place
 	// where the app's main thread calls into the runtime each frame.
 	extern void oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count, struct xrt_device *head,
-	                                  bool legacy_app, bool external_window);
+	                                  bool legacy_app, bool external_window, bool exiting, bool service_mode);
 	struct xrt_device *head_dev = GET_XDEV_BY_ROLE(sess->sys, head);
 	bool legacy = sess->sys->xsysc != NULL && sess->sys->xsysc->info.legacy_app_tile_scaling;
+	bool svc_mode = sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode;
 	oxr_macos_pump_events(sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count, head_dev, legacy,
-	                      sess->has_external_window);
+	                      sess->has_external_window, sess->exiting, svc_mode);
 
 	// Check if macOS window was closed (close button or Escape key).
 	// For the Vulkan multi compositor this is also handled via

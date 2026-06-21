@@ -49,8 +49,21 @@ extern void oxr_macos_set_window_closed(void);
  */
 void
 oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count, struct xrt_device *head,
-                      bool legacy_app, bool external_window)
+                      bool legacy_app, bool external_window, bool exiting, bool service_mode)
 {
+	// Skip the qwerty pump (which walks xdevs and derefs tracking_origin) when:
+	//  - the session is exiting: its devices are being torn down (#59 close path); or
+	//  - this is an out-of-process / IPC client: qwerty lives SERVER-side, so the
+	//    client's xdevs are IPC proxies — running qwerty over them does nothing
+	//    useful and races their churn (a server-side resize/event can rebuild the
+	//    proxy list mid-poll, leaving a dangling tracking_origin → SIGSEGV, #59).
+	// Input + mode switching reach an OOP client over IPC, not via local qwerty.
+	// Null the list so both qwerty blocks below no-op; the window pump (event drain,
+	// Escape detect, CATransaction flush) still runs.
+	if (exiting || service_mode) {
+		xdevs = NULL;
+		xdev_count = 0;
+	}
 	@autoreleasepool {
 		if (NSApp == nil) {
 			return;

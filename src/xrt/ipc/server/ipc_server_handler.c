@@ -3693,6 +3693,19 @@ ipc_handle_workspace_set_window_pose(volatile struct ipc_client_state *_ics,
 	os_mutex_unlock(&s->global_state.lock);
 
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
+#elif defined(XRT_OS_MACOS)
+	// Tier-2 (#59): reposition + resize the client's runtime-owned NSWindow into a
+	// display sub-rect so multiple apps tile instead of stacking full-screen. The
+	// shell's grid/drag/resize layout primitives all funnel here through the same
+	// xrSetWorkspaceClientWindowPoseEXT path the Windows monolith uses.
+	IPC_INFO(s, "Workspace: set_window_pose client_id=%u pos=(%.3f,%.3f,%.3f) size=%.3fx%.3f (macOS)",
+	         client_id, pose->position.x, pose->position.y, pose->position.z, width_m, height_m);
+	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	if (target_xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	bool ok = comp_multi_workspace_set_client_window_pose(target_xc, pose, width_m, height_m);
+	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
 #else
 	(void)s;
 	(void)client_id;
@@ -4219,6 +4232,16 @@ ipc_handle_workspace_request_client_exit(volatile struct ipc_client_state *_ics,
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	return comp_d3d11_service_workspace_request_exit_by_slot(s->xsysc, slot);
+#elif defined(XRT_OS_MACOS)
+	// macOS OOP (#59): resolve the canonical client id to its per-session
+	// compositor and push an exit request — the chrome close (X) button / DELETE
+	// key path. The window-close global never fires in this route (the service
+	// pump doesn't track NSWindows), so this is the app-quit mechanism.
+	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	if (target_xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return comp_multi_workspace_request_client_exit(target_xc) ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
 #else
 	(void)s;
 	(void)client_id;

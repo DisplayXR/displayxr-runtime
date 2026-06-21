@@ -65,6 +65,10 @@
 #include "android/android_globals.h"
 #endif
 
+#ifdef XRT_OS_MACOS
+#include "main/comp_window_macos.h" // per-session NSWindow reposition/resize (#59)
+#endif
+
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty/qwerty_interface.h"
 #include "xrt/xrt_system.h"
@@ -2275,6 +2279,37 @@ session_display_dims_m(struct multi_compositor *mc, float *out_w_m, float *out_h
 }
 
 /*!
+ * Physical size, in meters, of THIS client's window surface (Tier-2, #59). The
+ * display's pixel density is uniform, so window_meters = window_px ÷ display
+ * px-per-meter. The Tier-1 workspace composites used the full display meters with
+ * the window's framebuffer px, which over-sized chrome/overlays/cursor once a
+ * window tiled to a sub-rect (px_per_m came out as window_px ÷ display_m instead
+ * of the true display density). Falls back to the full display dims when px info
+ * is missing (a full-display Tier-1 window then reads identical to before).
+ */
+static bool
+session_window_dims_m(struct multi_compositor *mc, uint32_t fb_w, uint32_t fb_h, float *out_w_m, float *out_h_m)
+{
+	float disp_w_m = 0.0f, disp_h_m = 0.0f;
+	if (!session_display_dims_m(mc, &disp_w_m, &disp_h_m)) {
+		return false;
+	}
+	const struct xrt_system_compositor_info *info = &mc->msc->base.info;
+	uint32_t disp_px_w = info->display_pixel_width;
+	uint32_t disp_px_h = info->display_pixel_height;
+	if (disp_px_w == 0 || disp_px_h == 0 || fb_w == 0 || fb_h == 0) {
+		*out_w_m = disp_w_m;
+		*out_h_m = disp_h_m;
+		return true;
+	}
+	float px_per_m_x = (float)disp_px_w / disp_w_m;
+	float px_per_m_y = (float)disp_px_h / disp_h_m;
+	*out_w_m = (float)fb_w / px_per_m_x;
+	*out_h_m = (float)fb_h / px_per_m_y;
+	return true;
+}
+
+/*!
  * Public window-dims query for the workspace IPC layer (macOS get_window_pose).
  *
  * In the macOS OOP single-app model the content client fills the display, so
@@ -2295,11 +2330,137 @@ comp_multi_workspace_get_client_window_dims(struct xrt_compositor *xc,
 	if (mc == NULL) {
 		return false;
 	}
+	// Tier-2 (#59): if the controller has placed this client, echo the stored
+	// pose + window meters so its chrome sizing and hit-testing match the actual
+	// tiled NSWindow. Until then, fall back to the Tier-1 full-display window.
+	if (comp_multi_workspace_load_window_pose(xc, out_pose, out_w_m, out_h_m)) {
+		return true;
+	}
 	if (out_pose != NULL) {
 		struct xrt_pose ident = XRT_POSE_IDENTITY;
 		*out_pose = ident;
 	}
 	return session_display_dims_m(mc, out_w_m, out_h_m);
+}
+
+/*!
+ * Tier-2 window placement (#59): reposition + resize this client's NSWindow to a
+ * display sub-rect. See the header for the contract. Lives here (not
+ * comp_multi_workspace.c) because it needs session_render + the macOS comp_target.
+ */
+bool
+comp_multi_workspace_set_client_window_pose(struct xrt_compositor *xc,
+                                            const struct xrt_pose *pose,
+                                            float width_m,
+                                            float height_m)
+{
+#ifdef XRT_OS_MACOS
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || pose == NULL || mc->session_render.target == NULL) {
+		return false;
+	}
+
+	// Clamp to a sane minimum so a degenerate pose can't make a zero-size window.
+	if (width_m < 0.02f) {
+		width_m = 0.02f;
+	}
+	if (height_m < 0.02f) {
+		height_m = 0.02f;
+	}
+
+	// Display geometry from the system compositor info (same fallback the D3D11
+	// service's slot_pose_to_pixel_rect uses).
+	const struct xrt_system_compositor_info *info = &mc->msc->base.info;
+	float disp_w_m = info->display_width_m;
+	float disp_h_m = info->display_height_m;
+	int32_t disp_px_w = (int32_t)info->display_pixel_width;
+	int32_t disp_px_h = (int32_t)info->display_pixel_height;
+	if (disp_w_m <= 0.0f || disp_h_m <= 0.0f || disp_px_w <= 0 || disp_px_h <= 0) {
+		disp_px_w = 3024;
+		disp_px_h = 1964;
+		disp_w_m = 0.301f;
+		disp_h_m = 0.196f;
+	}
+
+	float px_per_m_x = (float)disp_px_w / disp_w_m;
+	float px_per_m_y = (float)disp_px_h / disp_h_m;
+
+	float w_px_f = width_m * px_per_m_x;
+	float h_px_f = height_m * px_per_m_y;
+
+	// ASPECT CLAMP (#59). These content apps render at a FIXED display aspect (one
+	// worst-case swapchain, Kooima projection for the display) and do not reflow to
+	// the window — so presenting that display-aspect content into a window of a
+	// different aspect stretches it (a 2-column grid makes each window ~half the
+	// display aspect → content squished ~2x horizontally). Fit the window to the
+	// display aspect INSIDE the controller's requested rect (letterbox by shrinking
+	// the window, centered) so content stays undistorted. get_pose echoes these
+	// clamped dims, so chrome/cursor/hit-test all stay coherent with what's drawn.
+	// (Filling the whole tile with content letterboxed INSIDE a full-size window is
+	// a nicer follow-up that needs the DP to target a swapchain sub-rect.)
+	float disp_aspect = (float)disp_px_w / (float)disp_px_h;
+	float req_aspect = (h_px_f > 0.0f) ? (w_px_f / h_px_f) : disp_aspect;
+	if (req_aspect > disp_aspect) {
+		w_px_f = h_px_f * disp_aspect; // too wide → shrink width
+	} else {
+		h_px_f = w_px_f / disp_aspect; // too tall → shrink height
+	}
+
+	int32_t w_px = (int32_t)(w_px_f + 0.5f);
+	int32_t h_px = (int32_t)(h_px_f + 0.5f);
+	// Keep the window centered on the controller's requested center (top-left-origin
+	// display pixels; matches slot_pose_to_pixel_rect, +y up).
+	float center_px_x = (float)disp_px_w * 0.5f + pose->position.x * px_per_m_x;
+	float center_px_y = (float)disp_px_h * 0.5f - pose->position.y * px_per_m_y;
+	int32_t x_px = (int32_t)(center_px_x - (float)w_px * 0.5f + 0.5f);
+	int32_t y_px = (int32_t)(center_px_y - (float)h_px * 0.5f + 0.5f);
+
+	// Store the CLAMPED dims (meters derived back from the clamped px) so the
+	// controller's chrome sizing + hit-test match the actual window.
+	float clamped_w_m = (float)w_px / px_per_m_x;
+	float clamped_h_m = (float)h_px / px_per_m_y;
+	comp_multi_workspace_store_window_pose(xc, pose, clamped_w_m, clamped_h_m, x_px, y_px, w_px, h_px);
+
+	// DEFER the actual reposition + resize. A layout glide / drag sends a fresh
+	// pose every frame; applying (NSWindow resize + MoltenVK swapchain recreate)
+	// on each one churns the surface and destabilizes every session seconds later
+	// (#59). Record the target + timestamp; the render thread applies it once the
+	// size has settled (no newer pose for ~150 ms) — coalescing the glide into a
+	// single recreate, the macOS analogue of the Windows defer-during-size-move.
+	mc->session_render.resize_x = x_px;
+	mc->session_render.resize_y = y_px;
+	mc->session_render.resize_w = w_px;
+	mc->session_render.resize_h = h_px;
+	mc->session_render.resize_request_ns = os_monotonic_get_ns();
+	mc->session_render.resize_pending = true;
+	return true;
+#else
+	(void)xc;
+	(void)pose;
+	(void)width_m;
+	(void)height_m;
+	return false;
+#endif
+}
+
+/*!
+ * Ask a managed content client to exit (#59). Mirrors the macOS window-close path
+ * in multi_compositor_wait_frame: push XRT_SESSION_EVENT_EXIT_REQUEST to the
+ * client's per-session compositor so its xrPollEvent transitions to EXITING and
+ * the app leaves its loop cleanly.
+ */
+bool
+comp_multi_workspace_request_client_exit(struct xrt_compositor *target_xc)
+{
+	struct multi_compositor *mc = multi_compositor(target_xc);
+	if (mc == NULL) {
+		return false;
+	}
+	union xrt_session_event xse = XRT_STRUCT_INIT;
+	xse.type = XRT_SESSION_EVENT_EXIT_REQUEST;
+	xrt_result_t r = multi_compositor_push_event(mc, &xse);
+	U_LOG_W("[#59] request_client_exit → push EXIT_REQUEST (ret=%d)", (int)r);
+	return r == XRT_SUCCESS;
 }
 
 /*!
@@ -2341,8 +2502,11 @@ session_render_chrome_overlay(struct multi_compositor *mc,
 		return;
 	}
 
+	// Window-relative dims (#59): chrome is sized/positioned in window-local meters,
+	// so use THIS window's physical size (derived from its framebuffer px), not the
+	// full display. For a full-display Tier-1 window these are identical.
 	float disp_w_m = 0.0f, disp_h_m = 0.0f;
-	if (!session_display_dims_m(mc, &disp_w_m, &disp_h_m)) {
+	if (!session_window_dims_m(mc, fb_width, fb_height, &disp_w_m, &disp_h_m)) {
 		return;
 	}
 	float px_per_m_x = (float)fb_width / disp_w_m;
@@ -2394,8 +2558,10 @@ session_render_workspace_overlays(struct multi_compositor *mc,
 		return;
 	}
 
+	// Window-relative dims (#59) so overlay sizes use the true display density even
+	// when this window is a tiled sub-rect; docked at the window's normalized anchor.
 	float disp_w_m = 0.0f, disp_h_m = 0.0f;
-	if (!session_display_dims_m(mc, &disp_w_m, &disp_h_m) || !ensure_workspace_blend(mc, vk)) {
+	if (!session_window_dims_m(mc, fb_width, fb_height, &disp_w_m, &disp_h_m) || !ensure_workspace_blend(mc, vk)) {
 		return;
 	}
 	float px_per_m_x = (float)fb_width / disp_w_m;
@@ -2458,7 +2624,7 @@ session_render_workspace_cursor(struct multi_compositor *mc,
 	}
 
 	float disp_w_m = 0.0f, disp_h_m = 0.0f;
-	if (!session_display_dims_m(mc, &disp_w_m, &disp_h_m) || !ensure_workspace_blend(mc, vk)) {
+	if (!session_window_dims_m(mc, fb_width, fb_height, &disp_w_m, &disp_h_m) || !ensure_workspace_blend(mc, vk)) {
 		return;
 	}
 	float px_per_m_x = (float)fb_width / disp_w_m;
@@ -2469,6 +2635,20 @@ session_render_workspace_cursor(struct multi_compositor *mc,
 
 	int32_t px = 0, py = 0;
 	comp_multi_workspace_get_pointer_px(&px, &py);
+	// The pointer is in GLOBAL display px; this window's surface is a sub-rect at
+	// (win_x,win_y) px (#59). Convert to window-local px. No stored rect (Tier-1
+	// full-display) → offset 0, identical to before.
+	int32_t win_x = 0, win_y = 0;
+	(void)comp_multi_workspace_load_window_px_rect(&mc->base.base, &win_x, &win_y, NULL, NULL);
+	px -= win_x;
+	py -= win_y;
+	// CLIP: only the window the pointer is actually over draws the sprite. Without
+	// this every tiled window blits a sprite at its own offset (the blend clamps to
+	// the framebuffer), so each window shows a stray "ghost" cursor — and with the
+	// OS cursor hidden the user ends up aiming at a ghost in the wrong window (#59).
+	if (px < 0 || py < 0 || px >= (int32_t)fb_width || py >= (int32_t)fb_height) {
+		return;
+	}
 	// Hotspot: the sprite's hot point sits at the pointer.
 	int32_t dst_x = px - (int32_t)(cur.hot_x * size_px);
 	int32_t dst_y = py - (int32_t)(cur.hot_y * size_px);
@@ -3247,6 +3427,31 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 		if (mc == NULL || !mc->session_render.initialized) {
 			continue;
 		}
+
+#ifdef XRT_OS_MACOS
+		// Tier-2 deferred window placement (#59): apply a pending set_window_pose
+		// once its size has settled (no newer pose for ~150 ms). Coalesces a layout
+		// glide's per-frame poses into a single NSWindow resize + swapchain
+		// recreate; recreating on every glide frame churns MoltenVK and tears down
+		// every session a few seconds later. The reposition/resize + drawableSize
+		// happen on the main thread inside comp_window_macos_set_window_rect; the
+		// recreate flag drives the next acquire to rebuild at the new surface size.
+		if (mc->session_render.resize_pending) {
+			uint64_t now_ns = os_monotonic_get_ns();
+			const uint64_t settle_ns = (uint64_t)150 * 1000 * 1000; // 150 ms
+			if (now_ns - mc->session_render.resize_request_ns >= settle_ns) {
+				comp_window_macos_set_window_rect(
+				    mc->session_render.target, mc->session_render.resize_x,
+				    mc->session_render.resize_y, mc->session_render.resize_w,
+				    mc->session_render.resize_h);
+				mc->session_render.swapchain_needs_recreate = true;
+				mc->session_render.resize_pending = false;
+				U_LOG_W("[#59] applied settled window rect (%d,%d %dx%d)",
+				        mc->session_render.resize_x, mc->session_render.resize_y,
+				        mc->session_render.resize_w, mc->session_render.resize_h);
+			}
+		}
+#endif
 
 		// A workspace-minimized client (#61) renders a black desktop canvas plus
 		// the session-global overlays/cursor — NOT its content — so the taskbar

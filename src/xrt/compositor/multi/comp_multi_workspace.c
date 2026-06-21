@@ -25,6 +25,19 @@ struct chrome_entry
 	struct comp_multi_chrome_layout layout;
 	bool layout_valid;
 	bool hidden; //!< Client minimized by the workspace controller (#61): render black canvas + overlays.
+
+	//! @name Tier-2 window placement (#59)
+	//! The pose the controller set via xrSetWorkspaceClientWindowPoseEXT plus the
+	//! derived top-left-origin display-pixel rect of the NSWindow. Until the first
+	//! set_window_pose arrives @ref win_pose_valid is false and the client fills the
+	//! whole display (Tier-1 default).
+	//! @{
+	bool win_pose_valid;
+	struct xrt_pose win_pose;
+	float win_w_m;
+	float win_h_m;
+	int32_t win_px_x, win_px_y, win_px_w, win_px_h;
+	//! @}
 };
 
 // One process-global table; the service is a single process. The mutex is
@@ -219,6 +232,91 @@ comp_multi_workspace_is_window_hidden(struct xrt_compositor *target_xc)
 	}
 	os_mutex_unlock(&g_lock);
 	return hidden;
+}
+
+void
+comp_multi_workspace_store_window_pose(struct xrt_compositor *target_xc,
+                                       const struct xrt_pose *pose,
+                                       float width_m,
+                                       float height_m,
+                                       int32_t px_x,
+                                       int32_t px_y,
+                                       int32_t px_w,
+                                       int32_t px_h)
+{
+	if (target_xc == NULL || pose == NULL) {
+		return;
+	}
+	ensure_lock();
+	os_mutex_lock(&g_lock);
+	struct chrome_entry *e = find_or_add_locked(target_xc);
+	if (e != NULL) {
+		e->win_pose = *pose;
+		e->win_w_m = width_m;
+		e->win_h_m = height_m;
+		e->win_px_x = px_x;
+		e->win_px_y = px_y;
+		e->win_px_w = px_w;
+		e->win_px_h = px_h;
+		e->win_pose_valid = true;
+	}
+	os_mutex_unlock(&g_lock);
+}
+
+bool
+comp_multi_workspace_load_window_pose(struct xrt_compositor *target_xc,
+                                      struct xrt_pose *out_pose,
+                                      float *out_w_m,
+                                      float *out_h_m)
+{
+	bool found = false;
+	ensure_lock();
+	os_mutex_lock(&g_lock);
+	struct chrome_entry *e = find_locked(target_xc);
+	if (e != NULL && e->win_pose_valid) {
+		if (out_pose != NULL) {
+			*out_pose = e->win_pose;
+		}
+		if (out_w_m != NULL) {
+			*out_w_m = e->win_w_m;
+		}
+		if (out_h_m != NULL) {
+			*out_h_m = e->win_h_m;
+		}
+		found = true;
+	}
+	os_mutex_unlock(&g_lock);
+	return found;
+}
+
+bool
+comp_multi_workspace_load_window_px_rect(struct xrt_compositor *target_xc,
+                                         int32_t *out_x,
+                                         int32_t *out_y,
+                                         int32_t *out_w,
+                                         int32_t *out_h)
+{
+	bool found = false;
+	ensure_lock();
+	os_mutex_lock(&g_lock);
+	struct chrome_entry *e = find_locked(target_xc);
+	if (e != NULL && e->win_pose_valid) {
+		if (out_x != NULL) {
+			*out_x = e->win_px_x;
+		}
+		if (out_y != NULL) {
+			*out_y = e->win_px_y;
+		}
+		if (out_w != NULL) {
+			*out_w = e->win_px_w;
+		}
+		if (out_h != NULL) {
+			*out_h = e->win_px_h;
+		}
+		found = true;
+	}
+	os_mutex_unlock(&g_lock);
+	return found;
 }
 
 
