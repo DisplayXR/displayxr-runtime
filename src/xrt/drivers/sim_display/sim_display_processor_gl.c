@@ -98,7 +98,11 @@ static const char *FS_ANAGLYPH =
     "    vec2 uv_right = vec2((v_uv.x + col) * u_tile_cols_inv, (v_uv.y + row) * u_tile_rows_inv);\n"
     "    vec4 left = texture(u_texture, uv_left);\n"
     "    vec4 right = texture(u_texture, uv_right);\n"
-    "    fragColor = vec4(left.r, right.g, right.b, 1.0);\n"
+    // Preserve alpha (max of both eyes) so translucent/transparent-background
+    // regions survive the anaglyph mix — parity with the VK anaglyph.frag and
+    // the Metal anaglyph_fragment (issue #392 / #630). Forcing alpha to 1.0
+    // here turned premultiplied translucent 3D-zone backgrounds opaque.
+    "    fragColor = vec4(left.r, right.g, right.b, max(left.a, right.a));\n"
     "}\n";
 
 //! Squeezed SBS: left tile on left half, right tile on right half, no crop.
