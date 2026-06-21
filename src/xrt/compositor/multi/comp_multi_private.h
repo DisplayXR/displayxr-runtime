@@ -410,6 +410,20 @@ struct multi_compositor
 		//! True if window-close exit request has been pushed (avoids duplicates)
 		bool window_close_exit_sent;
 
+		//! @name Tier-2 deferred window placement (macOS, #59)
+		//! xrSetWorkspaceClientWindowPoseEXT stores the target pixel rect + a
+		//! request timestamp here; the per-session render thread applies it
+		//! (reposition + drawable resize + swapchain recreate) only once the size
+		//! has settled (~150 ms with no newer pose). A layout glide fires set_pose
+		//! every frame, and recreating the MoltenVK swapchain on each one churns
+		//! the surface and destabilizes every session a few seconds later — so the
+		//! glide is coalesced into a single recreate at its end.
+		//! @{
+		bool resize_pending;
+		uint64_t resize_request_ns;
+		int32_t resize_x, resize_y, resize_w, resize_h;
+		//! @}
+
 		//! True if per-session resources are initialized
 		bool initialized;
 	} session_render;
@@ -611,6 +625,28 @@ struct multi_system_compositor
 	 * (the #528 surface-lost case) and comes back on resume.
 	 */
 	int android_window_valid_state;
+#endif
+
+#ifdef XRT_OS_MACOS
+	/*!
+	 * @name Shared spatial surface (#59, the spatial-desktop re-architecture)
+	 *
+	 * The Windows D3D11 service composites every client app into ONE full-screen
+	 * window as a 3D spatial window (`comp_d3d11_service.cpp::multi_compositor_render`).
+	 * macOS originally rendered one NSWindow per client (`render_session_to_own_target`),
+	 * which is not a spatial desktop (windows are independent OS windows that
+	 * overlap). This is the macOS analogue of the D3D11 monolith: ONE service-owned
+	 * full-screen window + ONE combined stereo atlas into which each client's content
+	 * is blitted at its 3D pose (per-eye parallax), then ONE display-processor weave
+	 * and ONE present. Built behind @ref shared_surface_enabled while the legacy
+	 * per-session path stays the default; flip the gate once the merge is verified.
+	 * @{
+	 */
+	bool shared_surface_enabled;     //!< Gate: route rendering through the shared surface.
+	bool shared_surface_initialized; //!< True once the shared window + resources exist.
+	struct comp_target *shared_target;             //!< The one full-screen NSWindow target.
+	struct xrt_display_processor *shared_dp;       //!< The one DP that weaves the combined atlas.
+	//! @}
 #endif
 };
 

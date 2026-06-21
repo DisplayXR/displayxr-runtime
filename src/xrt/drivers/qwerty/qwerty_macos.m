@@ -38,7 +38,11 @@ find_qwerty_system(struct xrt_device **xdevs, size_t xdev_count)
 {
 	struct xrt_device *xdev = NULL;
 	for (size_t i = 0; i < xdev_count; i++) {
-		if (xdevs[i] == NULL) {
+		// Guard tracking_origin: an out-of-process content client's xdevs are IPC
+		// proxies that may have no tracking origin, and during session exit they
+		// can be partially torn down while xrPollEvent still pumps this — derefing
+		// tracking_origin->name then crashes (#59). Skip such devices.
+		if (xdevs[i] == NULL || xdevs[i]->tracking_origin == NULL) {
 			continue;
 		}
 		const char *tracker_name = xdevs[i]->tracking_origin->name;

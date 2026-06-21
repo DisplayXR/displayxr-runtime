@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -36,6 +38,20 @@ struct comp_target;
  */
 struct comp_target *
 comp_window_macos_create(struct comp_compositor *c);
+
+/*!
+ * Tier-2 window placement (#59): reposition and resize the runtime-owned NSWindow
+ * to a display sub-rect so multiple workspace clients tile instead of stacking
+ * full-screen. @p x,y,w,h are top-left-origin display PIXELS (the same space the
+ * Windows service uses); this converts them to AppKit points (bottom-left origin)
+ * for the NSWindow frame and updates the CAMetalLayer drawableSize to the pixel
+ * size on the main thread. The caller (comp_multi) flags the per-session swapchain
+ * for recreation so the next frame rebuilds at the new surface size.
+ *
+ * @ingroup comp_main
+ */
+void
+comp_window_macos_set_window_rect(struct comp_target *ct, int32_t x, int32_t y, int32_t w, int32_t h);
 
 #ifdef __cplusplus
 }

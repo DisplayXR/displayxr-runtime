@@ -13,6 +13,7 @@
 #include "ipc_server_input_queue.h"
 #include "multi/comp_multi_workspace.h" // cursor pointer-position publish (#48 Phase 2)
 #include "shared/ipc_protocol.h"
+#include "util/u_logging.h"
 
 #include <stdbool.h>
 #include <ctype.h>
@@ -165,6 +166,23 @@ ipc_server_macos_pump_main_thread(void)
 		                                   untilDate:nil
 		                                      inMode:NSDefaultRunLoopMode
 		                                     dequeue:YES]) != nil) {
+			// Workspace kill-switch (#59): the service window is a borderless
+			// full-screen surface that hides the menu bar + dock and owns the
+			// display, so there is no OS affordance to escape if something wedges.
+			// Esc here tears the whole workspace down (the service is the root —
+			// exiting drops every client's IPC connection so they shut down too).
+			// This is the macOS dev analogue of the Windows Ctrl+Space shell
+			// toggle until a real global hotkey is ported. Cmd+Q does the same.
+			if ([event type] == NSEventTypeKeyDown) {
+				bool is_escape = ([event keyCode] == 53);
+				bool is_cmd_q = (([event modifierFlags] & NSEventModifierFlagCommand) != 0) &&
+				                [[event charactersIgnoringModifiers] isEqualToString:@"q"];
+				if (is_escape || is_cmd_q) {
+					U_LOG_W("Workspace: %s — terminating service (workspace kill-switch)",
+					        is_escape ? "Escape" : "Cmd+Q");
+					exit(0);
+				}
+			}
 			bool swallow = queue_ns_input_event(event);
 			if (!swallow) {
 				[NSApp sendEvent:event];
