@@ -2400,23 +2400,18 @@ comp_multi_workspace_set_client_window_pose(struct xrt_compositor *xc,
 	float w_px_f = width_m * px_per_m_x;
 	float h_px_f = height_m * px_per_m_y;
 
-	// ASPECT CLAMP (#59). These content apps render at a FIXED display aspect (one
-	// worst-case swapchain, Kooima projection for the display) and do not reflow to
-	// the window — so presenting that display-aspect content into a window of a
-	// different aspect stretches it (a 2-column grid makes each window ~half the
-	// display aspect → content squished ~2x horizontally). Fit the window to the
-	// display aspect INSIDE the controller's requested rect (letterbox by shrinking
-	// the window, centered) so content stays undistorted. get_pose echoes these
-	// clamped dims, so chrome/cursor/hit-test all stay coherent with what's drawn.
-	// (Filling the whole tile with content letterboxed INSIDE a full-size window is
-	// a nicer follow-up that needs the DP to target a swapchain sub-rect.)
+	// ASPECT FIT (#59), Windows-parity. These content apps render at a FIXED display
+	// aspect and do not reflow, so the window must match that aspect or content
+	// stretches. The Windows D3D11 service keeps the controller's WIDTH and sets
+	// window_height = window_width / content_aspect (comp_d3d11_service.cpp ~L5924).
+	// Mirror that: ALWAYS preserve the requested width and derive the height. This
+	// is what keeps the rendered window width identical to the width the controller
+	// built its chrome texture for — deriving height never moves the width, so the
+	// chrome can't be squished into a narrower-than-its-texture rect (the old code
+	// shrank the width when the request was "too wide", which diverged the two and
+	// caused the chrome squish + hover drift).
 	float disp_aspect = (float)disp_px_w / (float)disp_px_h;
-	float req_aspect = (h_px_f > 0.0f) ? (w_px_f / h_px_f) : disp_aspect;
-	if (req_aspect > disp_aspect) {
-		w_px_f = h_px_f * disp_aspect; // too wide → shrink width
-	} else {
-		h_px_f = w_px_f / disp_aspect; // too tall → shrink height
-	}
+	h_px_f = w_px_f / disp_aspect;
 
 	int32_t w_px = (int32_t)(w_px_f + 0.5f);
 	int32_t h_px = (int32_t)(h_px_f + 0.5f);
@@ -3702,6 +3697,239 @@ shared_client_sort(const void *a, const void *b)
 	return (ca->slot < cb->slot) ? -1 : (ca->slot > cb->slot) ? 1 : 0;
 }
 
+//! Chrome depth offset (meters, toward the viewer) relative to its window. 0 =
+//! coplanar with the window: the pill carries exactly the window's depth (no
+//! extra disparity of its own), so its detailed text/buttons don't fringe in
+//! front of the flat pill background. A small positive value would float it
+//! slightly ahead, but that reads as odd anaglyph fringing on the chrome detail.
+#define SHARED_CHROME_DEPTH_BIAS_M 0.0f
+
+/*!
+ * Ensure the M3 chrome/overlay/cursor blend pipeline and the atlas-wide
+ * framebuffer exist (the framebuffer is rebuilt when the atlas view changes).
+ */
+static bool
+shared_ensure_chrome_blend(struct multi_system_compositor *msc, struct vk_bundle *vk)
+{
+	if (!msc->shared_chrome_blend_initialized) {
+		if (!vk_hud_blend_init(&msc->shared_chrome_blend, vk, msc->shared_atlas_format)) {
+			U_LOG_E("[#59] failed to init shared chrome blend");
+			return false;
+		}
+		msc->shared_chrome_blend_initialized = true;
+	}
+	if (msc->shared_atlas_fb == VK_NULL_HANDLE || msc->shared_atlas_fb_view != msc->shared_atlas_view) {
+		if (msc->shared_atlas_fb != VK_NULL_HANDLE) {
+			vk->vkDestroyFramebuffer(vk->device, msc->shared_atlas_fb, NULL);
+			msc->shared_atlas_fb = VK_NULL_HANDLE;
+		}
+		VkFramebufferCreateInfo fb_info = {
+		    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+		    .renderPass = msc->shared_chrome_blend.render_pass,
+		    .attachmentCount = 1,
+		    .pAttachments = &msc->shared_atlas_view,
+		    .width = (uint32_t)msc->shared_atlas_w,
+		    .height = (uint32_t)msc->shared_atlas_h,
+		    .layers = 1,
+		};
+		if (vk->vkCreateFramebuffer(vk->device, &fb_info, NULL, &msc->shared_atlas_fb) != VK_SUCCESS) {
+			U_LOG_E("[#59] failed to create atlas framebuffer");
+			return false;
+		}
+		msc->shared_atlas_fb_view = msc->shared_atlas_view;
+	}
+	return true;
+}
+
+/*!
+ * Alpha-blend one decoration source image into the combined atlas (atlas must be
+ * COLOR_ATTACHMENT_OPTIMAL on entry/exit). The dst rect is clamped to [clip_x0,
+ * clip_x1) × [clip_y0, clip_y1) — the eye's tile — so a decoration can't bleed
+ * into the other eye or off the atlas. The cross-process source rests in GENERAL.
+ */
+static void
+shared_blend_into_atlas(struct multi_system_compositor *msc,
+                        struct vk_bundle *vk,
+                        VkCommandBuffer cmd,
+                        VkImage src_image,
+                        int dst_x,
+                        int dst_y,
+                        int dst_w,
+                        int dst_h,
+                        int clip_x0,
+                        int clip_x1,
+                        int clip_y0,
+                        int clip_y1)
+{
+	if (src_image == VK_NULL_HANDLE || dst_w <= 0 || dst_h <= 0) {
+		return;
+	}
+	// Clamp the dst rect to the clip (eye tile). vk_hud_blend maps the full source
+	// across the dst rect, so clamping squishes a decoration that overhangs the
+	// tile edge — acceptable; chrome/overlays normally sit well inside the tile.
+	int x0 = dst_x < clip_x0 ? clip_x0 : dst_x;
+	int y0 = dst_y < clip_y0 ? clip_y0 : dst_y;
+	int x1 = dst_x + dst_w > clip_x1 ? clip_x1 : dst_x + dst_w;
+	int y1 = dst_y + dst_h > clip_y1 ? clip_y1 : dst_y + dst_h;
+	if (x1 - x0 < 1 || y1 - y0 < 1) {
+		return;
+	}
+
+	VkImageMemoryBarrier to_src = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = 0,
+	    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+	    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	    .image = src_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+	                         NULL, 0, NULL, 1, &to_src);
+
+	vk_hud_blend_draw_no_layout(&msc->shared_chrome_blend, vk, cmd, msc->shared_atlas_fb,
+	                            (uint32_t)msc->shared_atlas_w, (uint32_t)msc->shared_atlas_h, src_image, x0, y0,
+	                            (uint32_t)(x1 - x0), (uint32_t)(y1 - y0));
+
+	VkImageMemoryBarrier to_general = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	    .dstAccessMask = 0,
+	    .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+	    .image = src_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
+	                         NULL, 0, NULL, 1, &to_general);
+}
+
+/*!
+ * M3: composite the workspace decorations into the combined atlas, per eye,
+ * BEFORE the weave so they carry 3D depth. Chrome floats above each window (its
+ * window pose + a depth bias, projected per eye); session-global overlays
+ * (taskbar/launcher) and the cursor are flat at the panel (z = 0, identical both
+ * eyes). The atlas must be COLOR_ATTACHMENT_OPTIMAL on entry/exit.
+ */
+static void
+shared_composite_decorations(struct multi_system_compositor *msc,
+                             struct vk_bundle *vk,
+                             VkCommandBuffer cmd,
+                             const struct shared_client_render *order,
+                             uint32_t order_count,
+                             const struct xrt_eye_positions *eye_pos,
+                             int eye_w,
+                             int eye_h,
+                             float px_per_m_x,
+                             float px_per_m_y,
+                             uint32_t tile_columns)
+{
+	if (!shared_ensure_chrome_blend(msc, vk)) {
+		return;
+	}
+
+	// Per-client chrome (the title pill), floating above its window in 3D.
+	for (uint32_t c = 0; c < order_count; c++) {
+		const struct shared_client_render *e = &order[c];
+		if (!e->placed) {
+			continue;
+		}
+		struct xrt_swapchain *chrome_xsc = NULL;
+		struct comp_multi_chrome_layout layout;
+		if (!comp_multi_workspace_chrome_get(&e->mc->base.base, &chrome_xsc, &layout)) {
+			continue;
+		}
+		struct comp_swapchain *sc = comp_swapchain(chrome_xsc);
+		if (sc == NULL || sc->vkic.image_count == 0) {
+			continue;
+		}
+		VkImage chrome_img = sc->vkic.images[0].handle;
+		if (chrome_img == VK_NULL_HANDLE) {
+			continue;
+		}
+
+		// Chrome extent + center in WORLD meters (window pose + window-local offset).
+		float chrome_w_m = (layout.width_as_fraction_of_window > 0.0f)
+		                       ? e->win_w_m * layout.width_as_fraction_of_window
+		                       : layout.size_w_m;
+		float chrome_h_m = layout.size_h_m;
+		if (chrome_w_m <= 0.0f || chrome_h_m <= 0.0f) {
+			continue;
+		}
+		float cx_world = e->pose_x + layout.pose_in_client.position.x;
+		float cy_local = layout.anchor_to_window_top_edge
+		                     ? (e->win_h_m * 0.5f + layout.pose_in_client.position.y)
+		                     : layout.pose_in_client.position.y;
+		float cy_world = e->pose_y + cy_local;
+		float cz_world = e->pose_z + SHARED_CHROME_DEPTH_BIAS_M; // float above the window
+
+		for (uint32_t eye = 0; eye < tile_columns; eye++) {
+			uint32_t ei = (eye < eye_pos->count) ? eye : (eye_pos->count - 1);
+			int rx, ry, rw, rh;
+			shared_project_rect_for_eye(cx_world, cy_world, cz_world, chrome_w_m, chrome_h_m,
+			                            eye_pos->eyes[ei].x, eye_pos->eyes[ei].y, eye_pos->eyes[ei].z,
+			                            eye_w, eye_h, px_per_m_x, px_per_m_y, &rx, &ry, &rw, &rh);
+			int tile_x0 = (int)eye * eye_w;
+			shared_blend_into_atlas(msc, vk, cmd, chrome_img, tile_x0 + rx, ry, rw, rh, tile_x0,
+			                        tile_x0 + eye_w, 0, eye_h);
+		}
+	}
+
+	// Session-global overlays (taskbar/launcher), flat at z = 0 in both eye tiles.
+	{
+		struct comp_multi_overlay_state states[COMP_MULTI_WORKSPACE_MAX_OVERLAYS];
+		struct xrt_swapchain *xscs[COMP_MULTI_WORKSPACE_MAX_OVERLAYS];
+		uint32_t n = comp_multi_workspace_copy_overlays(states, xscs, COMP_MULTI_WORKSPACE_MAX_OVERLAYS);
+		for (uint32_t i = 0; i < n; i++) {
+			struct comp_swapchain *sc = comp_swapchain(xscs[i]);
+			if (sc == NULL || sc->vkic.image_count == 0) {
+				continue;
+			}
+			VkImage img = sc->vkic.images[0].handle;
+			if (img == VK_NULL_HANDLE) {
+				continue;
+			}
+			int ow = (int)(states[i].size_w_m * px_per_m_x + 0.5f);
+			int oh = (int)(states[i].size_h_m * px_per_m_y + 0.5f);
+			if (ow < 1 || oh < 1) {
+				continue;
+			}
+			int base_x = (int)(states[i].anchor_x * (float)eye_w - states[i].pivot_x * (float)ow);
+			int base_y = (int)(states[i].anchor_y * (float)eye_h - states[i].pivot_y * (float)oh);
+			for (uint32_t eye = 0; eye < tile_columns; eye++) {
+				int tile_x0 = (int)eye * eye_w;
+				shared_blend_into_atlas(msc, vk, cmd, img, tile_x0 + base_x, base_y, ow, oh,
+				                        tile_x0, tile_x0 + eye_w, 0, eye_h);
+			}
+		}
+	}
+
+	// Session-global cursor, topmost, at the tracked pointer (flat, z = 0).
+	{
+		struct xrt_swapchain *cur_xsc = NULL;
+		struct comp_multi_cursor_state cur;
+		if (comp_multi_workspace_get_cursor(&cur_xsc, &cur)) {
+			struct comp_swapchain *sc = comp_swapchain(cur_xsc);
+			if (sc != NULL && sc->vkic.image_count > 0) {
+				VkImage img = sc->vkic.images[0].handle;
+				int size_px = (int)(cur.size_meters * px_per_m_x + 0.5f);
+				int32_t pxg = 0, pyg = 0;
+				comp_multi_workspace_get_pointer_px(&pxg, &pyg);
+				if (img != VK_NULL_HANDLE && size_px >= 1 && pxg >= 0 && pxg < eye_w && pyg >= 0 &&
+				    pyg < eye_h) {
+					int dx = pxg - (int)(cur.hot_x * (float)size_px);
+					int dy = pyg - (int)(cur.hot_y * (float)size_px);
+					for (uint32_t eye = 0; eye < tile_columns; eye++) {
+						int tile_x0 = (int)eye * eye_w;
+						shared_blend_into_atlas(msc, vk, cmd, img, tile_x0 + dx, dy, size_px,
+						                        size_px, tile_x0, tile_x0 + eye_w, 0, eye_h);
+					}
+				}
+			}
+		}
+	}
+}
+
 /*!
  * Composite every active client into the one combined atlas, weave once, present
  * once. The macOS shared-surface analogue of render_per_session_clients_locked.
@@ -4062,18 +4290,37 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 		                         0, 0, NULL, 0, NULL, uniq_n, post);
 	}
 
+	// M3: composite the workspace decorations (chrome/overlays/cursor) into the
+	// atlas BEFORE the weave so they carry 3D depth. The blend renders into the
+	// atlas as a color attachment, so transition TRANSFER_DST → COLOR_ATTACHMENT
+	// first; shared_composite_decorations leaves it in COLOR_ATTACHMENT.
+	VkImageMemoryBarrier atlas_to_color = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .image = msc->shared_atlas_image,
+	    .subresourceRange = atlas_range,
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+	                         0, NULL, 0, NULL, 1, &atlas_to_color);
+
+	shared_composite_decorations(msc, vk, cmd, order, order_count, &eye_pos, eye_w, eye_h, px_per_m_x, px_per_m_y,
+	                             tile_columns);
+
 	// Atlas → SHADER_READ for the weave.
 	VkImageMemoryBarrier atlas_to_read = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 	    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 	    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 	    .image = msc->shared_atlas_image,
 	    .subresourceRange = atlas_range,
 	};
-	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL,
-	                         0, NULL, 1, &atlas_to_read);
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &atlas_to_read);
 
 	// Target → COLOR_ATTACHMENT for the weave.
 	VkImageMemoryBarrier pre_weave = {
