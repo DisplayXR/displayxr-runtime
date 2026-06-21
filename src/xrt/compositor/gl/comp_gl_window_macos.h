@@ -63,13 +63,19 @@ comp_gl_window_macos_setup_external(void *ns_view,
  * Used for shared-texture mode where the compositor renders into an
  * IOSurface rather than presenting to a window.
  *
- * @param app_cgl_ctx  App's CGLContextObj for share-group texture sharing (may be NULL).
- * @param out_win      Pointer to receive the handle.
+ * @param app_cgl_ctx   App's CGLContextObj for share-group texture sharing (may be NULL).
+ * @param app_view_handle App's real on-screen NSView (the cocoa-binding viewHandle, may be
+ *                        NULL). Retained only so comp_gl_window_macos_get_dimensions /
+ *                        _get_screen_position can measure the app's window backing — the
+ *                        offscreen GL context has no drawable of its own. Mirrors the Metal
+ *                        compositor measuring the app's bound view in texture/IOSurface mode.
+ * @param out_win       Pointer to receive the handle.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
  */
 xrt_result_t
 comp_gl_window_macos_create_offscreen(void *app_cgl_ctx,
+                                       void *app_view_handle,
                                        struct comp_gl_window_macos **out_win);
 
 /*!
