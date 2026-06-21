@@ -151,6 +151,13 @@ cmake -B "$ROOT/test_apps/cube_zones_texture_metal_macos/build" \
   -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
 cmake --build "$ROOT/test_apps/cube_zones_texture_metal_macos/build"
 
+echo "=== Building cube_zones_texture_gl_macos ==="
+cmake -B "$ROOT/test_apps/cube_zones_texture_gl_macos/build" \
+  -S "$ROOT/test_apps/cube_zones_texture_gl_macos" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
+cmake --build "$ROOT/test_apps/cube_zones_texture_gl_macos/build"
+
 # Step 3c: Build hosted (runtime-managed) test apps
 echo "=== Building cube_hosted_metal_macos ==="
 cmake -B "$ROOT/test_apps/cube_hosted_metal_macos/build" \
