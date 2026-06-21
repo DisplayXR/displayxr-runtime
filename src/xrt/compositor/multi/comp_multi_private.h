@@ -666,6 +666,14 @@ struct multi_system_compositor
 	VkFormat shared_atlas_format;
 	bool shared_atlas_initialized;
 	bool shared_swapchain_needs_recreate;
+
+	//! Chrome/overlay/cursor alpha-blend into the combined atlas (M3): one blend
+	//! pipeline + an atlas-wide framebuffer, composited per-eye (depth-biased for
+	//! chrome) BEFORE the weave so the decorations float above each window in 3D.
+	struct vk_hud_blend shared_chrome_blend;
+	bool shared_chrome_blend_initialized;
+	VkFramebuffer shared_atlas_fb;        //!< Color attachment is the combined atlas.
+	VkImageView shared_atlas_fb_view;     //!< The atlas view the fb was built for (recreate key).
 	//! @}
 #endif
 };
