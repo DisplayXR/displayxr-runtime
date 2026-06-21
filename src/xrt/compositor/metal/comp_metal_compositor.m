@@ -30,6 +30,7 @@
 #include "xrt/xrt_display_processor_metal.h"
 #include "xrt/xrt_system.h"
 
+#include "util/u_capability.h"
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 #include "util/u_time.h"
@@ -1813,18 +1814,19 @@ metal_compositor_dispatch_capture(struct comp_metal_compositor *c,
 // blit. This bespoke path is retained as the default until the shim is
 // validated as the sole composite path, after which it is deleted.
 
-// Surround→zones translation shim gate (DISPLAYXR_SURROUND_SHIM). Default off:
-// legacy surround apps keep the bespoke strip blit (zero behavioural change).
-// Opt-in routes them through the canonical mask composite so the path can be
-// validated before the bespoke surround code is removed. Env override now; a
-// HKLM/Capabilities registry gate is the product follow-up (deprecation doc).
+// Surround→zones translation shim gate. As of #634 Step 3 the shim is the DEFAULT
+// path: a legacy surround + output-rect frame is routed through the canonical mask
+// composite instead of the bespoke strip blit, so the bespoke surround code can be
+// removed once first-party apps migrate to zones. Precedence (u_capability_enabled):
+// DISPLAYXR_SURROUND_SHIM env (dev override) > the Capabilities/SurroundShim/Enabled
+// marker (admin force-OFF kill-switch) > default ON. Set either to 0 to fall back to
+// the bespoke strips. Mirror of d3d11_surround_shim_enabled / d3d12_surround_shim_enabled.
 static bool
 metal_surround_shim_enabled(void)
 {
 	static int enabled = -1;
 	if (enabled < 0) {
-		const char *e = getenv("DISPLAYXR_SURROUND_SHIM");
-		enabled = (e != NULL && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+		enabled = u_capability_enabled("DISPLAYXR_SURROUND_SHIM", "SurroundShim", true) ? 1 : 0;
 	}
 	return enabled == 1;
 }

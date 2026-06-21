@@ -53,20 +53,27 @@ about window/texture ownership, not region expression.
    into the canvas **sub-rect** (the app's atlas is canvas-sized); only the post-weave
    composite is rerouted, spanning the window with the mask M=1 inside the canvas, so the
    result is `M·weave + (1−M)·surround` — the strip-blit result via the canonical path.
-   - **Gate:** `DISPLAYXR_SURROUND_SHIM`, **default OFF** → zero behavioural change; legacy
-     apps keep the bespoke strips. **Opt-in ON** → shim engages (one-time
-     `Surround→zones shim ACTIVE` log). This is the validation switch.
+   - **Gate:** `u_capability_enabled("DISPLAYXR_SURROUND_SHIM", "SurroundShim", true)`,
+     **default ON** (since Step 3) → legacy surround routes through the unified composite
+     (one-time `Surround→zones shim ACTIVE` log). Precedence: env var (dev override) >
+     `HKLM\Software\DisplayXR\Capabilities\SurroundShim\Enabled` REG_DWORD (admin
+     force-OFF kill-switch) > default ON. Set either to `0` to fall back to the bespoke strips.
    - **Status:** Metal done + verified (`cube_texture_metal_macos`, flag-on routes through
      the unified path, flag-off unchanged). **D3D11 + D3D12 validated on real Leia SR
      hardware** (2026-06-21): flag-off renders the bespoke strips, flag-on logs the one-time
      `Surround→zones shim ACTIVE` WARN and routes through the unified mask composite, opaque
      BGRA texture-app content correct in both, feathered canvas edge as expected. All three
      backends with a working bespoke surround path are now shim-validated.
-   - **Product gate follow-up:** promote the env override to a
-     `HKLM\Software\DisplayXR\Capabilities\…` registry gate (per the registry-over-env-var
-     convention) before flipping the default.
-3. **Flip default ON** once the shim is validated on all three backends + real hardware
-   (Leia SR) — the canonical path now serves legacy apps unconditionally.
+   - **Product gate follow-up (done, Step 3):** the env override was promoted to the shared
+     `u_capability_enabled()` helper (`auxiliary/util/u_capability.{c,h}`) reading the
+     `Capabilities\SurroundShim\Enabled` marker, per the registry-over-env-var convention.
+3. **Flip default ON** (code-complete): all three gates default ON via `u_capability_enabled`;
+   the canonical path now serves legacy apps unconditionally unless force-disabled. Precedence
+   matrix validated on real Leia SR hardware 2026-06-21 (D3D11 + D3D12: default→ACTIVE,
+   env=0→bespoke, registry=0→bespoke, registry=1→ACTIVE). No installer change needed — the
+   marker is read-if-present (default is in code). *Pending before merge:* the standard
+   hardware eyeball; Metal default-flip still needs a macOS eyeball (the shim path itself was
+   already verified on Metal).
 4. **Migrate first-party apps** off the surround calls to native zones submission (the
    `cube_texture_*` apps, any editor/host integrations).
 5. **Delete** the bespoke surround code (strip blit, surround shader, keyed-mutex/fence
