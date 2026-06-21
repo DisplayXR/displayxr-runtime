@@ -5451,6 +5451,42 @@ ipc_handle_weave_get_fence(volatile struct ipc_client_state *ics,
 }
 
 xrt_result_t
+ipc_handle_weave_snap_window_rect(volatile struct ipc_client_state *ics,
+                                  int32_t origin_x,
+                                  int32_t origin_y,
+                                  int32_t target_x,
+                                  int32_t target_y,
+                                  bool *out_snapped,
+                                  int32_t *out_snapped_x,
+                                  int32_t *out_snapped_y)
+{
+	IPC_TRACE_MARKER();
+
+	// Default = no-op snap (the caller keeps its proposed target).
+	*out_snapped = false;
+	*out_snapped_x = target_x;
+	*out_snapped_y = target_y;
+
+	if (ics->xc == NULL) {
+		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	int32_t sx = target_x, sy = target_y;
+	if (comp_d3d11_service_weave_snap_window_rect(ics->xc, origin_x, origin_y, target_x, target_y, &sx, &sy)) {
+		*out_snapped = true;
+		*out_snapped_x = sx;
+		*out_snapped_y = sy;
+	}
+	return XRT_SUCCESS;
+#else
+	(void)origin_x;
+	(void)origin_y;
+	return XRT_SUCCESS;
+#endif
+}
+
+xrt_result_t
 ipc_handle_compositor_semaphore_destroy(volatile struct ipc_client_state *ics, uint32_t id)
 {
 	if (ics->xc == NULL) {

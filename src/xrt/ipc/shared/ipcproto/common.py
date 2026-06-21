@@ -108,6 +108,7 @@ class Arg:
 
     # Keep all these synchronized with the definitions in the JSON Schema.
     SCALAR_TYPES = set(("uint32_t",
+                        "int32_t",
                         "int64_t",
                         "uint64_t",
                         "bool",
