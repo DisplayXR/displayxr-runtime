@@ -3632,10 +3632,60 @@ struct shared_client_render
 	struct multi_compositor *mc;
 	struct multi_layer_entry *layer;
 	uint32_t view_count;
-	float pose_z;
 	int slot; // stable tie-break (msc->clients index) so equal-z order is deterministic
-	int win_x, win_y, win_w, win_h; // top-left display px
+	bool placed;                     // true if the controller has set a window pose
+	float pose_x, pose_y, pose_z;    // window center in meters (display-center origin, +y up, +z toward viewer)
+	float win_w_m, win_h_m;          // window size in meters (aspect-clamped)
+	int win_x, win_y, win_w, win_h;  // M1 / unplaced fallback: top-left display px
 };
+
+/*!
+ * Project a window's center pose (meters, display-center origin) through one eye
+ * onto the display plane (Z=0), returning a top-left display-px rect. M2 port of
+ * the D3D11 slot_pose_to_pixel_rect_for_eye: a window at z>0 (toward the viewer)
+ * scales up and parallax-shifts per eye so it floats in front of the panel; z=0
+ * gives both eyes the same rect (window on the panel). px_per_m_{x,y} convert
+ * meters→display px; disp_px_{w,h} are the per-eye display dims.
+ */
+static void
+shared_project_rect_for_eye(float pose_x,
+                            float pose_y,
+                            float pose_z,
+                            float win_w_m,
+                            float win_h_m,
+                            float eye_x,
+                            float eye_y,
+                            float eye_z,
+                            int disp_px_w,
+                            int disp_px_h,
+                            float px_per_m_x,
+                            float px_per_m_y,
+                            int *out_x,
+                            int *out_y,
+                            int *out_w,
+                            int *out_h)
+{
+	float wx = pose_x, wy = pose_y, w_m = win_w_m, h_m = win_h_m;
+	if (fabsf(pose_z) > 0.0001f && eye_z > 0.01f) {
+		float denom = eye_z - pose_z;
+		if (fabsf(denom) < 0.001f) {
+			denom = (denom >= 0.0f) ? 0.001f : -0.001f;
+		}
+		float scale = eye_z / denom;
+		wx = eye_x + scale * (pose_x - eye_x);
+		wy = eye_y + scale * (pose_y - eye_y);
+		w_m *= scale;
+		h_m *= scale;
+	}
+	int w_px = (int)(w_m * px_per_m_x + 0.5f);
+	int h_px = (int)(h_m * px_per_m_y + 0.5f);
+	float center_px_x = (float)disp_px_w * 0.5f + wx * px_per_m_x;
+	float center_px_y = (float)disp_px_h * 0.5f - wy * px_per_m_y; // +y up → -y down
+	*out_x = (int)(center_px_x - (float)w_px * 0.5f + 0.5f);
+	*out_y = (int)(center_px_y - (float)h_px * 0.5f + 0.5f);
+	*out_w = w_px;
+	*out_h = h_px;
+}
 
 //! Painter's order: far (larger z) first so nearer windows overwrite. Equal z
 //! tie-breaks on the stable client slot — otherwise qsort can swap two
@@ -3705,14 +3755,21 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 			vc = XRT_MAX_VIEWS;
 		e->view_count = vc;
 
-		// Placement: stored display px-rect from the controller (set_window_pose),
-		// else fall back to the full display (a lone app fills the surface).
+		// Placement: the controller's window pose in meters (set_window_pose)
+		// drives per-eye projection (M2). Fall back to the full display px-rect
+		// for an unplaced lone app (M1 behavior, flat at the panel).
 		struct xrt_pose pose = XRT_POSE_IDENTITY;
 		float wm = 0.0f, hm = 0.0f;
-		if (comp_multi_workspace_load_window_pose(&mc->base.base, &pose, &wm, &hm)) {
+		if (comp_multi_workspace_load_window_pose(&mc->base.base, &pose, &wm, &hm) && wm > 0.0f && hm > 0.0f) {
+			e->placed = true;
+			e->pose_x = pose.position.x;
+			e->pose_y = pose.position.y;
 			e->pose_z = pose.position.z;
+			e->win_w_m = wm;
+			e->win_h_m = hm;
 		} else {
-			e->pose_z = 0.0f;
+			e->placed = false;
+			e->pose_x = e->pose_y = e->pose_z = 0.0f;
 		}
 		int wx = 0, wy = 0, ww = 0, wh = 0;
 		if (!comp_multi_workspace_load_window_px_rect(&mc->base.base, &wx, &wy, &ww, &wh) || ww <= 0 ||
@@ -3764,6 +3821,31 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	if (!shared_ensure_atlas(msc, vk, eye_w, eye_h, tile_columns, atlas_format)) {
 		return;
 	}
+
+	// Per-eye parallax inputs (M2): the predicted eye positions from the one
+	// display processor, with a nominal 64 mm IPD @ display nominal-z fallback
+	// when no eye tracker has lock (sim has none). px-per-meter converts the
+	// projected window meters into display px.
+	struct xrt_eye_positions eye_pos = {0};
+	if (msc->shared_dp != NULL) {
+		(void)xrt_display_processor_get_predicted_eye_positions(msc->shared_dp, &eye_pos);
+	}
+	if (!eye_pos.valid || eye_pos.count < 2) {
+		float nom_y = (msc->base.info.nominal_viewer_y_m != 0.0f) ? msc->base.info.nominal_viewer_y_m : 0.0f;
+		float nom_z = (msc->base.info.nominal_viewer_z_m > 0.0f) ? msc->base.info.nominal_viewer_z_m : 0.6f;
+		eye_pos.eyes[0] = (struct xrt_eye_position){-0.032f, nom_y, nom_z};
+		eye_pos.eyes[1] = (struct xrt_eye_position){0.032f, nom_y, nom_z};
+		eye_pos.count = 2;
+		eye_pos.valid = true;
+	}
+	float disp_w_m = msc->base.info.display_width_m;
+	float disp_h_m = msc->base.info.display_height_m;
+	if (disp_w_m <= 0.0f || disp_h_m <= 0.0f) {
+		disp_w_m = 0.301f;
+		disp_h_m = 0.196f;
+	}
+	float px_per_m_x = (float)eye_w / disp_w_m;
+	float px_per_m_y = (float)eye_h / disp_h_m;
 
 	// Wait for the previous frame's fence on whatever buffer we'll reuse.
 	if (msc->shared_fenced_buffer >= 0) {
@@ -3908,21 +3990,55 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 		                         0, NULL, 0, NULL, uniq_n, pre);
 
 		// Per eye: blit this client's view into its window rect of that eye's tile.
-		// M1 is flat — same dst rect for both eyes; the client's own two views
-		// preserve its internal stereo (window sits on the panel plane).
+		// M2: a placed window projects its center pose through each eye onto the
+		// panel (Z=0), so z>0 windows float in front with crossed disparity. An
+		// unplaced lone app uses the flat full-display px-rect (M1). The client's
+		// own two views still supply its internal stereo.
 		for (uint32_t eye = 0; eye < tile_columns; eye++) {
 			uint32_t v = (eye < e->view_count) ? eye : (e->view_count - 1);
-			int dst_x0 = (int)eye * eye_w + e->win_x;
-			int dst_y0 = e->win_y;
-			int dst_x1 = dst_x0 + e->win_w;
-			int dst_y1 = dst_y0 + e->win_h;
-			int s_top = src_y[v] + (flip_y ? src_h[v] : 0);
-			int s_bot = src_y[v] + (flip_y ? 0 : src_h[v]);
+			int rx = e->win_x, ry = e->win_y, rw = e->win_w, rh = e->win_h;
+			if (e->placed) {
+				uint32_t ei = (eye < eye_pos.count) ? eye : (eye_pos.count - 1);
+				shared_project_rect_for_eye(e->pose_x, e->pose_y, e->pose_z, e->win_w_m,
+				                            e->win_h_m, eye_pos.eyes[ei].x, eye_pos.eyes[ei].y,
+				                            eye_pos.eyes[ei].z, eye_w, eye_h, px_per_m_x,
+				                            px_per_m_y, &rx, &ry, &rw, &rh);
+			}
+			if (rw <= 0 || rh <= 0) {
+				continue;
+			}
+			// Full (unclipped) destination span within this eye's tile.
+			int tile_x0 = (int)eye * eye_w;
+			float fdx0 = (float)(tile_x0 + rx);
+			float fdy0 = (float)ry;
+			float fdx1 = fdx0 + (float)rw;
+			float fdy1 = fdy0 + (float)rh;
+			// Source span (flip_y maps top↔bottom).
+			float fsx0 = (float)src_x[v];
+			float fsx1 = (float)(src_x[v] + src_w[v]);
+			float fsy0 = (float)(src_y[v] + (flip_y ? src_h[v] : 0));
+			float fsy1 = (float)(src_y[v] + (flip_y ? 0 : src_h[v]));
+			// Clip the destination to the tile bounds (a projected/edge window can
+			// overflow its tile or the atlas — an out-of-bounds vkCmdBlitImage dst
+			// is invalid usage). Map the clip back into the source proportionally.
+			float cdx0 = fmaxf(fdx0, (float)tile_x0);
+			float cdx1 = fminf(fdx1, (float)(tile_x0 + eye_w));
+			float cdy0 = fmaxf(fdy0, 0.0f);
+			float cdy1 = fminf(fdy1, (float)eye_h);
+			if (cdx1 - cdx0 < 1.0f || cdy1 - cdy0 < 1.0f) {
+				continue;
+			}
+			float ux0 = (cdx0 - fdx0) / (fdx1 - fdx0), ux1 = (cdx1 - fdx0) / (fdx1 - fdx0);
+			float uy0 = (cdy0 - fdy0) / (fdy1 - fdy0), uy1 = (cdy1 - fdy0) / (fdy1 - fdy0);
+			int nsx0 = (int)(fsx0 + ux0 * (fsx1 - fsx0) + 0.5f);
+			int nsx1 = (int)(fsx0 + ux1 * (fsx1 - fsx0) + 0.5f);
+			int nsy0 = (int)(fsy0 + uy0 * (fsy1 - fsy0) + 0.5f);
+			int nsy1 = (int)(fsy0 + uy1 * (fsy1 - fsy0) + 0.5f);
 			VkImageBlit blit = {
 			    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, src_arr[v], 1},
-			    .srcOffsets = {{src_x[v], s_top, 0}, {src_x[v] + src_w[v], s_bot, 1}},
+			    .srcOffsets = {{nsx0, nsy0, 0}, {nsx1, nsy1, 1}},
 			    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-			    .dstOffsets = {{dst_x0, dst_y0, 0}, {dst_x1, dst_y1, 1}},
+			    .dstOffsets = {{(int)cdx0, (int)cdy0, 0}, {(int)cdx1, (int)cdy1, 1}},
 			};
 			vk->vkCmdBlitImage(cmd, src_img[v], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 			                   msc->shared_atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
