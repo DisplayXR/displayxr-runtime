@@ -638,11 +638,10 @@ struct multi_system_compositor
 	 * overlap). This is the macOS analogue of the D3D11 monolith: ONE service-owned
 	 * full-screen window + ONE combined stereo atlas into which each client's content
 	 * is blitted at its 3D pose (per-eye parallax), then ONE display-processor weave
-	 * and ONE present. Built behind @ref shared_surface_enabled while the legacy
-	 * per-session path stays the default; flip the gate once the merge is verified.
+	 * and ONE present. This is the only macOS service render path; the legacy
+	 * per-NSWindow path (`render_session_to_own_target`) has been removed.
 	 * @{
 	 */
-	bool shared_surface_enabled;     //!< Gate: route rendering through the shared surface.
 	bool shared_surface_initialized; //!< True once the shared window + resources exist.
 	struct comp_target *shared_target;             //!< The one full-screen NSWindow target.
 	struct xrt_display_processor *shared_dp;       //!< The one DP that weaves the combined atlas.

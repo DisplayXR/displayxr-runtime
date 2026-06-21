@@ -77,10 +77,6 @@
 #include <math.h>
 #include <stdio.h>
 
-#ifdef XRT_OS_MACOS
-// Shared spatial surface gate (#59): one full-screen window for all apps.
-DEBUG_GET_ONCE_BOOL_OPTION(shared_surface, "DISPLAYXR_SHARED_SURFACE", false)
-#endif
 #include <assert.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -356,6 +352,9 @@ find_active_blend_mode(struct multi_compositor **overlay_sorted_clients, size_t 
  * @param[out] out_image_view The VkImageView for rendering
  * @return true if extraction successful
  */
+// Legacy per-session helper (see the #ifndef block below) — guarded out on macOS,
+// which composites every client into the one shared surface instead.
+#ifndef XRT_OS_MACOS
 /*!
  * Composite LOCAL_2D layers (XR_EXT_local_3d_zone, e.g. the avatar speech
  * bubble, #568) into the final per-session target, post-weave, by scale-blitting
@@ -476,6 +475,7 @@ composite_local_2d_layers(struct multi_compositor *mc,
 	}
 	return any;
 }
+#endif // !XRT_OS_MACOS
 
 static bool
 get_session_layer_view(struct multi_layer_entry *layer,
@@ -523,6 +523,14 @@ get_session_layer_view(struct multi_layer_entry *layer,
 	return (*out_image_view != VK_NULL_HANDLE);
 }
 
+// The per-session compositor helpers below (composite-into-atlas, swapchain
+// recreate, HUD, workspace chrome/overlay/cursor, and render_session_to_own_target)
+// implement the legacy one-NSWindow-per-client path. macOS now composites every
+// client into ONE shared full-screen surface (see render_shared_surface_locked),
+// so this whole path is compiled only for the non-macOS OOP service (Android,
+// and Windows where it is unused in favor of the D3D11 monolith). Guarding it out
+// on macOS keeps the macOS binary free of the dead legacy path.
+#ifndef XRT_OS_MACOS
 /*!
  * Initialize intermediate composite resources for pre-display-processing layer compositing.
  * Creates a tiled atlas image, per-eye views, render pass, framebuffers,
@@ -2260,6 +2268,7 @@ workspace_blend_layer(struct multi_compositor *mc,
 	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
 	                         NULL, 0, NULL, 1, &to_general);
 }
+#endif // !XRT_OS_MACOS
 
 //! Display dims (meters) for this session, DP-first with system-info fallback
 //! (matches the HUD). Returns false if neither yields valid dims.
@@ -2283,6 +2292,7 @@ session_display_dims_m(struct multi_compositor *mc, float *out_w_m, float *out_h
 	return true;
 }
 
+#ifndef XRT_OS_MACOS
 /*!
  * Physical size, in meters, of THIS client's window surface (Tier-2, #59). The
  * display's pixel density is uniform, so window_meters = window_px ÷ display
@@ -2313,6 +2323,7 @@ session_window_dims_m(struct multi_compositor *mc, uint32_t fb_w, uint32_t fb_h,
 	*out_h_m = (float)fb_h / px_per_m_y;
 	return true;
 }
+#endif // !XRT_OS_MACOS
 
 /*!
  * Public window-dims query for the workspace IPC layer (macOS get_window_pose).
@@ -2365,12 +2376,9 @@ comp_multi_workspace_set_client_window_pose(struct xrt_compositor *xc,
 		return false;
 	}
 	// In the shared-surface model (#59) there is no per-client NSWindow; the stored
-	// px-rect drives WHERE this client composites into the combined atlas. Still
-	// store it below, but skip the per-client NSWindow reposition (no target).
-	bool shared = mc->msc->shared_surface_enabled;
-	if (!shared && mc->session_render.target == NULL) {
-		return false;
-	}
+	// px-rect drives WHERE this client composites into the combined atlas. The
+	// shared surface is the only macOS path now, so there is never a per-client
+	// target — store the pose below without any NSWindow reposition.
 
 	// Clamp to a sane minimum so a degenerate pose can't make a zero-size window.
 	if (width_m < 0.02f) {
@@ -2428,20 +2436,9 @@ comp_multi_workspace_set_client_window_pose(struct xrt_compositor *xc,
 	float clamped_h_m = (float)h_px / px_per_m_y;
 	comp_multi_workspace_store_window_pose(xc, pose, clamped_w_m, clamped_h_m, x_px, y_px, w_px, h_px);
 
-	// DEFER the actual reposition + resize. A layout glide / drag sends a fresh
-	// pose every frame; applying (NSWindow resize + MoltenVK swapchain recreate)
-	// on each one churns the surface and destabilizes every session seconds later
-	// (#59). Record the target + timestamp; the render thread applies it once the
-	// size has settled (no newer pose for ~150 ms) — coalescing the glide into a
-	// single recreate, the macOS analogue of the Windows defer-during-size-move.
-	if (!shared) {
-		mc->session_render.resize_x = x_px;
-		mc->session_render.resize_y = y_px;
-		mc->session_render.resize_w = w_px;
-		mc->session_render.resize_h = h_px;
-		mc->session_render.resize_request_ns = os_monotonic_get_ns();
-		mc->session_render.resize_pending = true;
-	}
+	// In the shared-surface model the stored px-rect alone drives where this client
+	// composites into the combined atlas — there is no per-client NSWindow to
+	// reposition/resize, so no deferred-resize bookkeeping is needed here.
 	return true;
 #else
 	(void)xc;
@@ -2472,6 +2469,7 @@ comp_multi_workspace_request_client_exit(struct xrt_compositor *target_xc)
 	return r == XRT_SUCCESS;
 }
 
+#ifndef XRT_OS_MACOS
 /*!
  * Composite the workspace controller's chrome (e.g. a title pill) over this
  * client's woven content, post-weave, as a flat alpha-blended 2D overlay (#48).
@@ -3411,6 +3409,7 @@ submit_and_present:
 #endif
 
 }
+#endif // !XRT_OS_MACOS
 
 #ifdef XRT_OS_MACOS
 /*
@@ -3567,6 +3566,98 @@ shared_surface_init(struct multi_system_compositor *msc, struct vk_bundle *vk)
 	msc->shared_surface_initialized = true;
 	U_LOG_W("[#59] shared surface initialized");
 	return true;
+}
+
+/*!
+ * Tear down everything shared_surface_init / shared_ensure_atlas /
+ * shared_ensure_chrome_blend created. Called from system_compositor_destroy once
+ * the render thread has stopped, while the Vulkan device (owned by the native
+ * compositor) and the target service are both still alive. Mirrors the per-session
+ * fini ordering in multi_compositor_destroy. Idempotent: every handle is checked
+ * and cleared so a second call is a no-op.
+ */
+static void
+shared_surface_fini(struct multi_system_compositor *msc)
+{
+	struct vk_bundle *vk = (msc->target_service != NULL) ? comp_target_service_get_vk(msc->target_service) : NULL;
+
+	// The render thread is stopped, but the last present's GPU work may still be
+	// in flight; wait before destroying anything it could reference.
+	if (vk != NULL) {
+		vk->vkDeviceWaitIdle(vk->device);
+	}
+
+	// Display processor first (owns any vendor SDK handles); NULLs the pointer.
+	if (msc->shared_dp != NULL) {
+		xrt_display_processor_destroy(&msc->shared_dp);
+	}
+
+	// M3 decorations: the atlas-wide framebuffer references the blend's render
+	// pass, so destroy the framebuffer before the blend pipeline.
+	if (vk != NULL && msc->shared_atlas_fb != VK_NULL_HANDLE) {
+		vk->vkDestroyFramebuffer(vk->device, msc->shared_atlas_fb, NULL);
+		msc->shared_atlas_fb = VK_NULL_HANDLE;
+		msc->shared_atlas_fb_view = VK_NULL_HANDLE;
+	}
+	if (vk != NULL && msc->shared_chrome_blend_initialized) {
+		vk_hud_blend_fini(&msc->shared_chrome_blend, vk);
+		msc->shared_chrome_blend_initialized = false;
+	}
+
+	// The one combined stereo atlas (view + image + memory).
+	if (vk != NULL && msc->shared_atlas_initialized) {
+		if (msc->shared_atlas_view != VK_NULL_HANDLE)
+			vk->vkDestroyImageView(vk->device, msc->shared_atlas_view, NULL);
+		if (msc->shared_atlas_image != VK_NULL_HANDLE)
+			vk->vkDestroyImage(vk->device, msc->shared_atlas_image, NULL);
+		if (msc->shared_atlas_memory != VK_NULL_HANDLE)
+			vk->vkFreeMemory(vk->device, msc->shared_atlas_memory, NULL);
+		msc->shared_atlas_view = VK_NULL_HANDLE;
+		msc->shared_atlas_image = VK_NULL_HANDLE;
+		msc->shared_atlas_memory = VK_NULL_HANDLE;
+		msc->shared_atlas_initialized = false;
+	}
+
+	// Per-image render rings: fences, framebuffers, render pass, command pool.
+	if (vk != NULL && msc->shared_fences != NULL) {
+		for (uint32_t i = 0; i < msc->shared_buffer_count; i++) {
+			if (msc->shared_fences[i] != VK_NULL_HANDLE)
+				vk->vkDestroyFence(vk->device, msc->shared_fences[i], NULL);
+		}
+	}
+	free(msc->shared_fences);
+	msc->shared_fences = NULL;
+
+	// Command buffers are freed when the pool is destroyed below; just drop the array.
+	free(msc->shared_cmd_buffers);
+	msc->shared_cmd_buffers = NULL;
+
+	if (vk != NULL && msc->shared_framebuffers != NULL) {
+		for (uint32_t i = 0; i < msc->shared_buffer_count; i++) {
+			if (msc->shared_framebuffers[i] != VK_NULL_HANDLE)
+				vk->vkDestroyFramebuffer(vk->device, msc->shared_framebuffers[i], NULL);
+		}
+	}
+	free(msc->shared_framebuffers);
+	msc->shared_framebuffers = NULL;
+
+	if (vk != NULL && msc->shared_render_pass != VK_NULL_HANDLE) {
+		vk->vkDestroyRenderPass(vk->device, msc->shared_render_pass, NULL);
+		msc->shared_render_pass = VK_NULL_HANDLE;
+	}
+	if (vk != NULL && msc->shared_cmd_pool != VK_NULL_HANDLE) {
+		vk->vkDestroyCommandPool(vk->device, msc->shared_cmd_pool, NULL);
+		msc->shared_cmd_pool = VK_NULL_HANDLE;
+	}
+	msc->shared_buffer_count = 0;
+	msc->shared_fenced_buffer = -1;
+
+	// The one full-screen NSWindow target (created + owned via the target service).
+	if (msc->shared_target != NULL && msc->target_service != NULL) {
+		comp_target_service_destroy(msc->target_service, &msc->shared_target);
+	}
+
+	msc->shared_surface_initialized = false;
 }
 
 /*!
@@ -4405,9 +4496,11 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 }
 #endif // XRT_OS_MACOS
 
+#ifndef XRT_OS_MACOS
 /*!
  * Render all per-session clients to their own targets.
  * Called after xrt_comp_layer_commit() for sessions with external window handles.
+ * macOS uses render_shared_surface_locked instead (one shared full-screen surface).
  *
  * @param msc The multi system compositor
  * @param display_time_ns The predicted display time
@@ -4496,6 +4589,7 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 		multi_compositor_retire_delivered_locked(mc, now_ns);
 	}
 }
+#endif // !XRT_OS_MACOS
 
 
 
@@ -4534,8 +4628,9 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 		// Shared spatial surface (#59): every client composites into ONE
 		// service-owned full-screen window, so the per-client NSWindow/target/DP
 		// is never created. The shared surface reads each client's delivered
-		// frames directly (deliver_any_frames below still runs).
-		skip_session_render_init = mc->msc->shared_surface_enabled;
+		// frames directly (deliver_any_frames below still runs). This is the only
+		// macOS service render path now (the legacy per-NSWindow path is removed).
+		skip_session_render_init = true;
 #endif
 		if (!skip_session_render_init && mc->state.session_active &&
 		    multi_compositor_has_session_render(mc) && !mc->session_render.initialized &&
@@ -4964,15 +5059,13 @@ multi_main_loop(struct multi_system_compositor *msc)
 		// These sessions were skipped in transfer_layers_locked and render separately
 		os_mutex_lock(&msc->list_and_timing_lock);
 #ifdef XRT_OS_MACOS
-		if (msc->shared_surface_enabled) {
-			// Shared spatial surface (#59): composite every client into ONE
-			// full-screen window + combined atlas → one weave → one present.
-			render_shared_surface_locked(msc, predicted_display_time_ns);
-		} else
+		// Shared spatial surface (#59): composite every client into ONE
+		// full-screen window + combined atlas → one weave → one present. This is
+		// the only macOS service render path (the legacy per-NSWindow path is gone).
+		render_shared_surface_locked(msc, predicted_display_time_ns);
+#else
+		render_per_session_clients_locked(msc, predicted_display_time_ns);
 #endif
-		{
-			render_per_session_clients_locked(msc, predicted_display_time_ns);
-		}
 		os_mutex_unlock(&msc->list_and_timing_lock);
 
 		// Re-lock the thread for check in while statement.
@@ -5133,6 +5226,13 @@ system_compositor_destroy(struct xrt_system_compositor *xsc)
 	// Destroy the render thread first, destroy also stops the thread.
 	os_thread_helper_destroy(&msc->oth);
 
+#ifdef XRT_OS_MACOS
+	// Free the shared spatial surface resources (#59) now that the render thread
+	// is stopped but BEFORE the native compositor (which owns the Vulkan device)
+	// and the target service go away.
+	shared_surface_fini(msc);
+#endif
+
 	u_paf_destroy(&msc->upaf);
 
 	xrt_comp_native_destroy(&msc->xcn);
@@ -5197,15 +5297,12 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 	msc->target_service = target_service;
 
 #ifdef XRT_OS_MACOS
-	// Shared spatial surface (#59): when enabled, every client app composites into
-	// ONE full-screen window as a 3D spatial window (the macOS analogue of the
-	// Windows D3D11 monolith), instead of one NSWindow per app. Off by default
-	// while the merge is verified; flip on with DISPLAYXR_SHARED_SURFACE=1.
-	msc->shared_surface_enabled = debug_get_bool_option_shared_surface();
+	// Shared spatial surface (#59) is the only macOS service render path: every
+	// client app composites into ONE full-screen window as a 3D spatial window
+	// (the macOS analogue of the Windows D3D11 monolith), instead of one NSWindow
+	// per app. The legacy per-NSWindow path has been removed.
 	msc->shared_fenced_buffer = -1;
-	if (msc->shared_surface_enabled) {
-		U_LOG_W("[#59] shared spatial surface ENABLED (single full-screen window)");
-	}
+	U_LOG_W("[#59] shared spatial surface (single full-screen window)");
 #endif
 
 	msc->sessions.active_count = 0;
