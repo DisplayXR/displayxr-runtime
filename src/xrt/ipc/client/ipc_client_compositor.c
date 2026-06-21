@@ -612,6 +612,42 @@ comp_ipc_client_compositor_weave_get_fence(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
+xrt_result_t
+comp_ipc_client_compositor_weave_snap_window_rect(struct xrt_compositor *xc,
+                                                  int32_t origin_x,
+                                                  int32_t origin_y,
+                                                  int32_t target_x,
+                                                  int32_t target_y,
+                                                  bool *out_snapped,
+                                                  int32_t *out_snapped_x,
+                                                  int32_t *out_snapped_y)
+{
+	if (xc == NULL || out_snapped == NULL || out_snapped_x == NULL || out_snapped_y == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	// Default = no-op snap (caller keeps the proposed target).
+	*out_snapped = false;
+	*out_snapped_x = target_x;
+	*out_snapped_y = target_y;
+
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	bool snapped = false;
+	int32_t sx = target_x, sy = target_y;
+	xrt_result_t xret = ipc_call_weave_snap_window_rect(icc->ipc_c, origin_x, origin_y, target_x, target_y,
+	                                                    &snapped, &sx, &sy);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	*out_snapped = snapped;
+	*out_snapped_x = sx;
+	*out_snapped_y = sy;
+	return XRT_SUCCESS;
+}
+
 
 /*
  * Workspace controller bridges — thin accessors used by the OpenXR state

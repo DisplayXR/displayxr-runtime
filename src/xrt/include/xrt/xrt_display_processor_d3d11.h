@@ -350,6 +350,40 @@ struct xrt_display_processor_d3d11
 	 * @param enabled  true ⟹ the app self-presents a shared texture (canvas-only).
 	 */
 	void (*set_shared_texture_present)(struct xrt_display_processor_d3d11 *xdp, bool enabled);
+
+	/*!
+	 * Snap a proposed window rect to the nearest interlace-phase-aligned
+	 * screen position (window-drag phase lock, #625 / XR_EXT_weave). A
+	 * present-owner that moves its own window must keep the woven interlace
+	 * locked to the panel phase as the window travels, or the lenticular
+	 * subpixels shift under the lenses and the 3D collapses into crosstalk
+	 * jitter. The vendor owns the snap math + lens parameters (ADR-019), so
+	 * the runtime passes the drag-start origin top-left and the proposed
+	 * target top-left (absolute screen pixels — the phase is absolute) and
+	 * the DP returns the phase-snapped top-left. Only the top-left is
+	 * snapped; the caller keeps the size unchanged.
+	 *
+	 * Optional — absent slot (older plug-in `struct_size`) or NULL ⟹ no
+	 * snap support; the runtime then leaves the window at @p target_x/y.
+	 * Appended per ADR-020 (append-only within a major).
+	 *
+	 * @param      xdp       Pointer to self.
+	 * @param      origin_x  Drag-start window left, absolute screen px.
+	 * @param      origin_y  Drag-start window top, absolute screen px.
+	 * @param      target_x  Proposed window left, absolute screen px.
+	 * @param      target_y  Proposed window top, absolute screen px.
+	 * @param[out] out_x     Phase-snapped window left, absolute screen px.
+	 * @param[out] out_y     Phase-snapped window top, absolute screen px.
+	 * @return true if a snap was produced (out_x/out_y valid); false ⟹ the
+	 *         caller uses target_x/target_y unchanged.
+	 */
+	bool (*snap_window_rect)(struct xrt_display_processor_d3d11 *xdp,
+	                         int32_t origin_x,
+	                         int32_t origin_y,
+	                         int32_t target_x,
+	                         int32_t target_y,
+	                         int32_t *out_x,
+	                         int32_t *out_y);
 };
 
 /*
@@ -401,7 +435,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_background_2d
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_eye_tracking_mode)        == XRT_DP_D3D11_BASE_OFF + 15 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_transparent_background)    == XRT_DP_D3D11_BASE_OFF + 16 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_shared_texture_present)    == XRT_DP_D3D11_BASE_OFF + 17 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 18 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, snap_window_rect)              == XRT_DP_D3D11_BASE_OFF + 18 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 19 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -687,6 +722,30 @@ xrt_display_processor_d3d11_set_shared_texture_present(struct xrt_display_proces
 	}
 	xdp->set_shared_texture_present(xdp, enabled);
 	return true;
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::snap_window_rect
+ *
+ * Helper for calling through the function pointer. Returns false (and leaves
+ * out_x/out_y untouched) if the slot is absent (older plug-in) or NULL — the
+ * caller then keeps target_x/target_y unchanged.
+ *
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_snap_window_rect(struct xrt_display_processor_d3d11 *xdp,
+                                             int32_t origin_x,
+                                             int32_t origin_y,
+                                             int32_t target_x,
+                                             int32_t target_y,
+                                             int32_t *out_x,
+                                             int32_t *out_y)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, snap_window_rect) || xdp->snap_window_rect == NULL) {
+		return false;
+	}
+	return xdp->snap_window_rect(xdp, origin_x, origin_y, target_x, target_y, out_x, out_y);
 }
 
 /*!

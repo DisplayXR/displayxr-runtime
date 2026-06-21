@@ -47,6 +47,25 @@
  * Availability: this runtime implements the weave service only on the
  * out-of-process (service / IPC) path. An in-process session reports
  * XR_ERROR_FEATURE_UNSUPPORTED.
+ *
+ * Window-drag phase lock (issue #625). A present-owner that moves its own
+ * window must keep the woven interlace phase-locked to the panel as the window
+ * travels, or the lenticular subpixels shift under the lenses and the 3D
+ * collapses into crosstalk jitter. The DP snaps the window to the nearest
+ * phase-aligned screen position; the snap math + lens parameters are the
+ * vendor's (ADR-019), so they never leave the DP. The present-owner intercepts
+ * WM_WINDOWPOSCHANGING, hands the runtime the drag-start origin rect + the
+ * proposed target rect, and applies the returned phase-snapped rect before the
+ * OS commits the move:
+ *
+ *   // on WM_ENTERSIZEMOVE: remember the drag-start window rect (origin).
+ *   // on WM_WINDOWPOSCHANGING (proposed pos = target):
+ *   XrRect2Di snapped = {};
+ *   xrWeaveSnapWindowRectEXT(session, &origin, &target, &snapped);
+ *   pos->x = snapped.offset.x; pos->y = snapped.offset.y;  // apply
+ *
+ * Only the rect's offset (top-left) is snapped; the extent passes through
+ * unchanged. This is a synchronous, GPU-free query — no texture, no fence.
  */
 #ifndef XR_EXT_WEAVE_H
 #define XR_EXT_WEAVE_H 1
@@ -59,7 +78,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_weave 1
-#define XR_EXT_weave_SPEC_VERSION 1
+#define XR_EXT_weave_SPEC_VERSION 2
 #define XR_EXT_WEAVE_EXTENSION_NAME "XR_EXT_weave"
 
 // Reserved 1000999190..191. Final values reconcile with the Khronos registry
@@ -135,6 +154,9 @@ typedef XrResult (XRAPI_PTR *PFN_xrWeaveBindWindowEXT)(
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveSubmitEXT)(
     XrSession session, const XrWeaveSubmitInfoEXT* submitInfo, XrWeaveOutputEXT* output);
 
+typedef XrResult (XRAPI_PTR *PFN_xrWeaveSnapWindowRectEXT)(
+    XrSession session, const XrRect2Di* originRect, const XrRect2Di* targetRect, XrRect2Di* snappedRect);
+
 #ifndef XR_NO_PROTOTYPES
 
 //! Bind the present-owner's window (HWND on Windows) so the DP phase-snaps the
@@ -149,6 +171,19 @@ XRAPI_ATTR XrResult XRAPI_CALL xrWeaveBindWindowEXT(
 //! presenting. Reports XR_ERROR_FEATURE_UNSUPPORTED on an in-process session.
 XRAPI_ATTR XrResult XRAPI_CALL xrWeaveSubmitEXT(
     XrSession session, const XrWeaveSubmitInfoEXT* submitInfo, XrWeaveOutputEXT* output);
+
+//! Snap a proposed window rect to the nearest interlace-phase-aligned screen
+//! position so the woven 3D stays locked while the present-owner drags its
+//! window. @c originRect is the drag-start window rect; @c targetRect is the
+//! proposed (OS-requested) rect; both in absolute screen pixels (the phase is
+//! absolute). On return @c snappedRect->offset is the phase-snapped top-left and
+//! @c snappedRect->extent equals @c targetRect->extent (size is not snapped).
+//! GPU-free and synchronous. If the DP can't snap (no vendor support, panel in
+//! 2D), @c snappedRect is copied from @c targetRect (a no-op snap) and the call
+//! still returns XR_SUCCESS. Reports XR_ERROR_FEATURE_UNSUPPORTED on an
+//! in-process session.
+XRAPI_ATTR XrResult XRAPI_CALL xrWeaveSnapWindowRectEXT(
+    XrSession session, const XrRect2Di* originRect, const XrRect2Di* targetRect, XrRect2Di* snappedRect);
 
 #endif /* !XR_NO_PROTOTYPES */
 

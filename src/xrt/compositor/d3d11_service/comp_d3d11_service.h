@@ -969,6 +969,24 @@ comp_d3d11_service_weave_export_output(struct xrt_compositor *xc,
 bool
 comp_d3d11_service_weave_export_fence(struct xrt_compositor *xc, xrt_graphics_sync_handle_t *out_handle);
 
+/*!
+ * Snap a proposed window rect to the nearest interlace-phase-aligned screen
+ * position (window-drag phase lock, #625). Forwards the drag-start origin
+ * top-left + the proposed target top-left (absolute screen pixels) to the DP's
+ * @ref xrt_display_processor_d3d11::snap_window_rect and returns the snapped
+ * top-left. The snap math + lens params stay vendor-internal (ADR-019). Returns
+ * false when @p xc is not a D3D11 service compositor or the DP has no snap
+ * support — the caller then uses @p target_x/@p target_y unchanged.
+ */
+bool
+comp_d3d11_service_weave_snap_window_rect(struct xrt_compositor *xc,
+                                          int32_t origin_x,
+                                          int32_t origin_y,
+                                          int32_t target_x,
+                                          int32_t target_y,
+                                          int32_t *out_x,
+                                          int32_t *out_y);
+
 /*! @} */
 
 

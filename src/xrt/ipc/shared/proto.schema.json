@@ -11,6 +11,7 @@
             "type": "string",
             "enum": [
                 "uint32_t",
+                "int32_t",
                 "int64_t",
                 "uint64_t",
                 "bool",

@@ -11692,6 +11692,44 @@ comp_d3d11_service_weave_export_fence(struct xrt_compositor *xc, xrt_graphics_sy
 	return true;
 }
 
+extern "C" bool
+comp_d3d11_service_weave_snap_window_rect(struct xrt_compositor *xc,
+                                          int32_t origin_x,
+                                          int32_t origin_y,
+                                          int32_t target_x,
+                                          int32_t target_y,
+                                          int32_t *out_x,
+                                          int32_t *out_y)
+{
+	if (out_x == nullptr || out_y == nullptr) {
+		return false;
+	}
+	// Default = no-op snap (caller keeps the proposed target).
+	*out_x = target_x;
+	*out_y = target_y;
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return false;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	if (c->render.display_processor == nullptr) {
+		return false;
+	}
+
+	// The snap drives the vendor SR weaver's phase math, which reads the same
+	// (non-thread-safe) immediate context as the render thread — serialize with
+	// it just like weave_submit does.
+	std::lock_guard<std::recursive_mutex> lock(c->sys->render_mutex);
+
+	int32_t sx = target_x, sy = target_y;
+	if (!xrt_display_processor_d3d11_snap_window_rect(c->render.display_processor, origin_x, origin_y, target_x,
+	                                                  target_y, &sx, &sy)) {
+		return false; // DP has no snap support — caller uses the target unchanged
+	}
+	*out_x = sx;
+	*out_y = sy;
+	return true;
+}
+
 
 /*
  *
