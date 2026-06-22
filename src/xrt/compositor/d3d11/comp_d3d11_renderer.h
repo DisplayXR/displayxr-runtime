@@ -279,8 +279,7 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
  * Phase 0 (rect path, @p mask_srv == NULL): derives a hard mask from the
  * canvas sub-rect: pixels INSIDE the canvas keep the weave (the pixel shader
  * discards), pixels OUTSIDE are written from @p twod_srv at 1:1. With a point
- * sampler + opaque output this is pixel-identical to the rectangular
- * strip-copy surround it generalizes.
+ * sampler + opaque output this is a hard-edged 1:1 fill of the non-canvas region.
  *
  * Phase 1 (authored-mask path, @p mask_srv != NULL): samples the scalar mask
  * M and lerps M·weave + (1−M)·twod per pixel — soft edges work, so the weave
@@ -296,7 +295,7 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
  * @param dst_texture Weave target (ID3D11Texture2D*) — holds the weave; a
  *        temporary RTV is created on it.
  * @param twod_srv The 2D layer (ID3D11ShaderResourceView*): an SRV-capable
- *        scratch copy of the app surround texture, region-sized.
+ *        scratch copy of the 2D source (Local2D / zones content), region-sized.
  * @param mask_srv Authored scalar mask (R8_UNORM SRV), or NULL for the
  *        Phase 0 analytic rect path.
  * @param weave_srv SRV snapshot of dst's region (weave readable for the

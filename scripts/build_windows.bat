@@ -279,24 +279,6 @@ if exist "%REPO%test_apps\cube_zones_gl_win\CMakeLists.txt" (
     if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_zones_gl_win\build\" >nul
 )
 
-:: cube_texture_d3d11_win
-if exist "%REPO%test_apps\cube_texture_d3d11_win\CMakeLists.txt" (
-    echo --- cube_texture_d3d11_win ---
-    cmake -S "%REPO%\test_apps\cube_texture_d3d11_win" -B "%REPO%\test_apps\cube_texture_d3d11_win\build" -G Ninja ^
-        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_texture_d3d11_win\build" || set TESTAPP_FAILED=1
-    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_texture_d3d11_win\build\" >nul
-)
-
-:: cube_texture_d3d12_win
-if exist "%REPO%test_apps\cube_texture_d3d12_win\CMakeLists.txt" (
-    echo --- cube_texture_d3d12_win ---
-    cmake -S "%REPO%\test_apps\cube_texture_d3d12_win" -B "%REPO%\test_apps\cube_texture_d3d12_win\build" -G Ninja ^
-        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_texture_d3d12_win\build" || set TESTAPP_FAILED=1
-    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_texture_d3d12_win\build\" >nul
-)
-
 :: cube_zones_texture_d3d12_win (#613 — native-D3D12 zones texture parity app)
 if exist "%REPO%test_apps\cube_zones_texture_d3d12_win\CMakeLists.txt" (
     echo --- cube_zones_texture_d3d12_win ---
@@ -403,7 +385,7 @@ set "PKG=%REPO%_package"
 :: SR SDK deps (SimulatedRealityVulkanBeta.dll, etc.) resolve without requiring
 :: the installer to have run — important for third-party devs cloning the repo
 :: and iterating against the dev-build runtime via XR_RUNTIME_JSON.
-for %%A in (cube_handle_d3d11_win cube_zones_d3d11_win cube_zones_texture_d3d11_win cube_hosted_d3d11_win cube_handle_d3d12_win cube_handle_gl_win cube_texture_d3d11_win cube_texture_d3d12_win workspace_minimal_d3d11_win windowspace_handle_d3d11_win windowspace_handle_d3d12_win windowspace_handle_gl_win) do (
+for %%A in (cube_handle_d3d11_win cube_zones_d3d11_win cube_zones_texture_d3d11_win cube_hosted_d3d11_win cube_handle_d3d12_win cube_handle_gl_win workspace_minimal_d3d11_win windowspace_handle_d3d11_win windowspace_handle_d3d12_win windowspace_handle_gl_win) do (
     if exist "%REPO%test_apps\%%A\build\%%A.exe" (
         > "%PKG%\run_%%A.bat" (
             echo @echo off

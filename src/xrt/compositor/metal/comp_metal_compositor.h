@@ -88,42 +88,6 @@ bool
 comp_metal_compositor_get_window_metrics(struct xrt_compositor *xc,
                                          struct xrt_window_metrics *out_metrics);
 
-/*!
- * Set the output rect within the app's window where the shared texture
- * is displayed. Used for canvas-aware Kooima FOV and view sizing.
- *
- * @param xc  The compositor.
- * @param x   Left edge in window client-area pixels.
- * @param y   Top edge in window client-area pixels.
- * @param w   Width in pixels.
- * @param h   Height in pixels.
- */
-void
-comp_metal_compositor_set_output_rect(struct xrt_compositor *xc,
-                                       int32_t x, int32_t y,
-                                       uint32_t w, uint32_t h);
-
-/*!
- * Register a window-sized 2D IOSurface for the surround region (Spec v6).
- *
- * Pass shared_handle == NULL to clear. The handle is an IOSurfaceRef cast
- * to void*. The registered dims must equal the IOSurface's own dims and
- * track the window backing size (#464 window-clamped model — the app
- * re-registers on window resize); the per-frame strip blit fills only the
- * window rect minus the canvas, never the whole worst-case shared surface.
- * The surface's pixel format must match the multiview shared IOSurface.
- *
- * Lifetime is held by CFRetain; the IOSurface is cache-coherent between
- * app CPU writes and compositor GPU reads, so no fence / use-count
- * protocol is needed in-process. See comp_d3d11_compositor_set_surround_2d
- * for the cross-platform semantics (D3D11 still enforces the pre-#464
- * worst-case dims contract).
- */
-void
-comp_metal_compositor_set_surround_2d(struct xrt_compositor *xc,
-                                       void *shared_handle,
-                                       uint32_t w, uint32_t h);
-
 /*
  * XR_EXT_local_3d_zone — authored 2D/3D mask consumer (#439 Phase 3; mirrors
  * the D3D11 entry points from Phase 1, comp_d3d11_compositor.h).

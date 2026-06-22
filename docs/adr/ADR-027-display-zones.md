@@ -5,6 +5,11 @@ issues: [439, 396]
 ---
 # ADR-027: Display Zones — decoupled mixed 2D/3D layout, per-zone rig, wish mask
 
+> **Update (ADR-031):** the legacy 2D-surround / `xrSetSharedTextureOutputRectEXT`
+> mechanism this ADR contrasts against (Context, Consequences) has since been **removed** —
+> display-zones is now the sole region paradigm for all app classes. The surround references
+> below are accurate history; see ADR-031 + `docs/roadmap/surround-zones-deprecation.md`.
+
 ## Context
 
 The current composition model couples three concerns into one object chain:
