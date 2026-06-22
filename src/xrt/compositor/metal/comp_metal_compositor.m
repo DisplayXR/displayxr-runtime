@@ -258,9 +258,6 @@ struct comp_metal_compositor
 	//! System compositor info (for display dimensions, nominal viewer).
 	const struct xrt_system_compositor_info *sys_info;
 
-	//! Canvas output rect for shared-texture apps.
-	struct u_canvas_rect canvas;
-
 	/*
 	 * XR_EXT_local_3d_zone consumer state (#439 Phase 3).
 	 */
@@ -1801,7 +1798,7 @@ metal_effective_canvas(struct comp_metal_compositor *c,
                        bool mask_active)
 {
 	if (!mask_active) {
-		return c->canvas;
+		return (struct u_canvas_rect){0};
 	}
 
 	struct u_canvas_rect r = {0};
@@ -3434,12 +3431,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// just whatever the AppKit background draws — i.e. solid grey).
 	// Only relevant when both a shared IOSurface AND an external view are
 	// present (the editor preview / Unity standalone path).
-	//
-	// Skipped once the app declares a canvas rect: a _texture app owns
-	// presentation (it blits the IOSurface into its view itself, per the
-	// Cocoa binding spec's Texture mode) — mirroring here would fight the
-	// app over the layer's nextDrawable.
-	if (c->shared_texture != nil && c->metal_layer != nil && !c->owns_window && !c->canvas.valid) {
+	if (c->shared_texture != nil && c->metal_layer != nil && !c->owns_window) {
 		id<CAMetalDrawable> mirror = [c->metal_layer nextDrawable];
 		if (mirror != nil) {
 			id<MTLBlitCommandEncoder> blit = [cmd_buf blitCommandEncoder];
@@ -4280,20 +4272,12 @@ comp_metal_compositor_get_window_metrics(struct xrt_compositor *xc,
 		out_metrics->window_center_offset_y_m = offset_y_m;
 
 		out_metrics->valid = true;
-		// #439: an active mask supersedes the canvas — the window metrics
-		// already describe the window, so skip the canvas override.
-		if (!metal_mask_is_active(c)) {
-			u_canvas_apply_to_metrics(out_metrics, &c->canvas);
-		}
 		return true;
 	}
 
 	// Fallback: delegate to display processor (ext/shared path)
 	if (c->display_processor != NULL) {
 		bool ok = xrt_display_processor_metal_get_window_metrics(c->display_processor, out_metrics);
-		if (ok && !metal_mask_is_active(c)) {
-			u_canvas_apply_to_metrics(out_metrics, &c->canvas);
-		}
 		return ok;
 	}
 
