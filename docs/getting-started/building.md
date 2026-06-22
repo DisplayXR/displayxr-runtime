@@ -45,6 +45,9 @@ _package\run_cube_handle_d3d11_win.bat REM 3. run a test app
 > ```bat
 > _package\bin\displayxr-cli.exe selftest   REM PASS = DP found & ABI-matched; FAIL dumps the reason
 > ```
+> The runtime also logs the underlying cause (`negotiate returned …`, which
+> plug-in was rejected) to its per-process log at
+> `%LOCALAPPDATA%\DisplayXR\DisplayXR_<exe>.<pid>_<timestamp>.log`.
 
 **macOS:**
 ```bash
