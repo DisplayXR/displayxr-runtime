@@ -4181,6 +4181,17 @@ ipc_handle_workspace_pointer_capture_set(volatile struct ipc_client_state *_ics,
 	}
 	bool ok = comp_d3d11_service_workspace_pointer_capture_set(s->xsysc, enabled, button);
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
+#elif defined(XRT_OS_MACOS)
+	// macOS has no OS-level pointer capture to toggle: the appkit pump already
+	// publishes POINTER_MOTION every cycle from a global CGEventGetLocation poll
+	// (carrying the pressed-button mask), so a gesture's motion flows whether or
+	// not the cursor is over the window — capture is implicit. The controller's
+	// drag/resize/rotate gestures gate their start on this call succeeding, so
+	// accept it as a no-op rather than failing (which would dead-end every drag).
+	(void)s;
+	(void)enabled;
+	(void)button;
+	return XRT_SUCCESS;
 #else
 	(void)s;
 	(void)enabled;
@@ -4954,6 +4965,17 @@ ipc_handle_workspace_set_client_style(volatile struct ipc_client_state *_ics,
 	return comp_d3d11_service_set_client_style_by_slot(s->xsysc, slot, style)
 	           ? XRT_SUCCESS
 	           : XRT_ERROR_IPC_FAILURE;
+#elif defined(XRT_OS_MACOS)
+	// macOS shared surface: per the infra/look-and-feel split, per-client window
+	// styling (focus glow, corner radius, edge feather) is rendered by the
+	// workspace controller itself as its own chrome/overlay layers — the runtime
+	// only composites them. So the runtime stores/renders nothing here; accept the
+	// controller's per-tick style push as a no-op instead of failing it (which
+	// would spam the controller's log every frame).
+	(void)s;
+	(void)client_id;
+	(void)style;
+	return XRT_SUCCESS;
 #else
 	(void)s;
 	(void)client_id;
