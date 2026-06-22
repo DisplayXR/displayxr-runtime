@@ -240,6 +240,7 @@ add_library(
 	comp_multi STATIC multi/comp_multi_compositor.c multi/comp_multi_interface.h
 			  multi/comp_multi_private.h multi/comp_multi_system.c
 			  multi/comp_multi_workspace.c multi/comp_multi_workspace.h
+			  multi/comp_multi_content_blend.c multi/comp_multi_content_blend.h
 	)
 target_link_libraries(
 	comp_multi

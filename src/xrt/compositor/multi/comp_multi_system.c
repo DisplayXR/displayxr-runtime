@@ -3598,6 +3598,11 @@ shared_surface_fini(struct multi_system_compositor *msc)
 		vk_hud_blend_fini(&msc->shared_chrome_blend, vk);
 		msc->shared_chrome_blend_initialized = false;
 	}
+	// Task 9 content composite: owns its own render pass + pipeline (no fb).
+	if (vk != NULL && msc->shared_content_blend_initialized) {
+		comp_multi_content_blend_fini(&msc->shared_content_blend, vk);
+		msc->shared_content_blend_initialized = false;
+	}
 
 	// The one combined stereo atlas (view + image + memory).
 	if (vk != NULL && msc->shared_atlas_initialized) {
@@ -3823,6 +3828,29 @@ shared_ensure_chrome_blend(struct multi_system_compositor *msc, struct vk_bundle
 			return false;
 		}
 		msc->shared_atlas_fb_view = msc->shared_atlas_view;
+	}
+	return true;
+}
+
+/*!
+ * Ensure the rounded-corner content-composite pipeline (Task 9) and the
+ * atlas-wide framebuffer it renders into are ready. Reuses shared_ensure_chrome_blend
+ * to (re)build msc->shared_atlas_fb — the content pipeline's render pass is
+ * render-pass-compatible with the chrome blend's (same single color attachment,
+ * format, samples), so the same framebuffer serves both.
+ */
+static bool
+shared_ensure_content_blend(struct multi_system_compositor *msc, struct vk_bundle *vk)
+{
+	if (!shared_ensure_chrome_blend(msc, vk)) {
+		return false;
+	}
+	if (!msc->shared_content_blend_initialized) {
+		if (!comp_multi_content_blend_init(&msc->shared_content_blend, vk, msc->shared_atlas_format)) {
+			U_LOG_E("[#59] failed to init shared content blend");
+			return false;
+		}
+		msc->shared_content_blend_initialized = true;
 	}
 	return true;
 }
@@ -4226,160 +4254,12 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	VkClearColorValue backdrop = {.float32 = {0.1f, 0.1f, 0.1f, 1.0f}};
 	vk->vkCmdClearColorImage(cmd, msc->shared_atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &backdrop, 1,
 	                         &atlas_range);
-	// Order the clear before the per-client blits (both TRANSFER writes to the atlas).
-	VkImageMemoryBarrier clear_barrier = {
-	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-	    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	    .image = msc->shared_atlas_image,
-	    .subresourceRange = atlas_range,
-	};
-	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
-	                         NULL, 1, &clear_barrier);
-
-	// Blit each client's content into its window px-rect, per eye, into the atlas.
-	for (uint32_t c = 0; c < order_count; c++) {
-		struct shared_client_render *e = &order[c];
-		bool flip_y = e->layer->data.flip_y;
-
-		// Resolve the per-view source images for this client.
-		VkImage src_img[XRT_MAX_VIEWS];
-		uint32_t src_arr[XRT_MAX_VIEWS];
-		int src_x[XRT_MAX_VIEWS], src_y[XRT_MAX_VIEWS], src_w[XRT_MAX_VIEWS], src_h[XRT_MAX_VIEWS];
-		bool ok = true;
-		for (uint32_t v = 0; v < e->view_count; v++) {
-			int tw = 0, th = 0;
-			VkFormat fmt = VK_FORMAT_UNDEFINED;
-			VkImageView iv = VK_NULL_HANDLE;
-			VkImage im = VK_NULL_HANDLE;
-			uint32_t ai = 0;
-			if (!get_session_layer_view(e->layer, v, &tw, &th, &fmt, &iv, &im, &ai)) {
-				ok = false;
-				break;
-			}
-			src_img[v] = im;
-			src_arr[v] = ai;
-			src_x[v] = e->layer->data.proj.v[v].sub.rect.offset.w;
-			src_y[v] = e->layer->data.proj.v[v].sub.rect.offset.h;
-			src_w[v] = tw;
-			src_h[v] = th;
-		}
-		if (!ok) {
-			continue;
-		}
-
-		// Pre-barrier the unique source images GENERAL → TRANSFER_SRC.
-		VkImage uniq[XRT_MAX_VIEWS];
-		uint32_t uniq_arr[XRT_MAX_VIEWS];
-		uint32_t uniq_n = 0;
-		for (uint32_t v = 0; v < e->view_count; v++) {
-			bool found = false;
-			for (uint32_t u = 0; u < uniq_n; u++) {
-				if (uniq[u] == src_img[v] && uniq_arr[u] == src_arr[v]) {
-					found = true;
-					break;
-				}
-			}
-			if (!found) {
-				uniq[uniq_n] = src_img[v];
-				uniq_arr[uniq_n] = src_arr[v];
-				uniq_n++;
-			}
-		}
-		VkImageMemoryBarrier pre[XRT_MAX_VIEWS];
-		for (uint32_t u = 0; u < uniq_n; u++) {
-			pre[u] = (VkImageMemoryBarrier){
-			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-			    .srcAccessMask = 0,
-			    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-			    .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-			    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-			    .image = uniq[u],
-			    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, uniq_arr[u], 1},
-			};
-		}
-		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-		                         0, NULL, 0, NULL, uniq_n, pre);
-
-		// Per eye: blit this client's view into its window rect of that eye's tile.
-		// M2: a placed window projects its center pose through each eye onto the
-		// panel (Z=0), so z>0 windows float in front with crossed disparity. An
-		// unplaced lone app uses the flat full-display px-rect (M1). The client's
-		// own two views still supply its internal stereo.
-		for (uint32_t eye = 0; eye < tile_columns; eye++) {
-			uint32_t v = (eye < e->view_count) ? eye : (e->view_count - 1);
-			int rx = e->win_x, ry = e->win_y, rw = e->win_w, rh = e->win_h;
-			if (e->placed) {
-				uint32_t ei = (eye < eye_pos.count) ? eye : (eye_pos.count - 1);
-				shared_project_rect_for_eye(e->pose_x, e->pose_y, e->pose_z, e->win_w_m,
-				                            e->win_h_m, eye_pos.eyes[ei].x, eye_pos.eyes[ei].y,
-				                            eye_pos.eyes[ei].z, eye_w, eye_h, px_per_m_x,
-				                            px_per_m_y, &rx, &ry, &rw, &rh);
-			}
-			if (rw <= 0 || rh <= 0) {
-				continue;
-			}
-			// Full (unclipped) destination span within this eye's tile.
-			int tile_x0 = (int)eye * eye_w;
-			float fdx0 = (float)(tile_x0 + rx);
-			float fdy0 = (float)ry;
-			float fdx1 = fdx0 + (float)rw;
-			float fdy1 = fdy0 + (float)rh;
-			// Source span (flip_y maps top↔bottom).
-			float fsx0 = (float)src_x[v];
-			float fsx1 = (float)(src_x[v] + src_w[v]);
-			float fsy0 = (float)(src_y[v] + (flip_y ? src_h[v] : 0));
-			float fsy1 = (float)(src_y[v] + (flip_y ? 0 : src_h[v]));
-			// Clip the destination to the tile bounds (a projected/edge window can
-			// overflow its tile or the atlas — an out-of-bounds vkCmdBlitImage dst
-			// is invalid usage). Map the clip back into the source proportionally.
-			float cdx0 = fmaxf(fdx0, (float)tile_x0);
-			float cdx1 = fminf(fdx1, (float)(tile_x0 + eye_w));
-			float cdy0 = fmaxf(fdy0, 0.0f);
-			float cdy1 = fminf(fdy1, (float)eye_h);
-			if (cdx1 - cdx0 < 1.0f || cdy1 - cdy0 < 1.0f) {
-				continue;
-			}
-			float ux0 = (cdx0 - fdx0) / (fdx1 - fdx0), ux1 = (cdx1 - fdx0) / (fdx1 - fdx0);
-			float uy0 = (cdy0 - fdy0) / (fdy1 - fdy0), uy1 = (cdy1 - fdy0) / (fdy1 - fdy0);
-			int nsx0 = (int)(fsx0 + ux0 * (fsx1 - fsx0) + 0.5f);
-			int nsx1 = (int)(fsx0 + ux1 * (fsx1 - fsx0) + 0.5f);
-			int nsy0 = (int)(fsy0 + uy0 * (fsy1 - fsy0) + 0.5f);
-			int nsy1 = (int)(fsy0 + uy1 * (fsy1 - fsy0) + 0.5f);
-			VkImageBlit blit = {
-			    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, src_arr[v], 1},
-			    .srcOffsets = {{nsx0, nsy0, 0}, {nsx1, nsy1, 1}},
-			    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-			    .dstOffsets = {{(int)cdx0, (int)cdy0, 0}, {(int)cdx1, (int)cdy1, 1}},
-			};
-			vk->vkCmdBlitImage(cmd, src_img[v], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-			                   msc->shared_atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-			                   VK_FILTER_LINEAR);
-		}
-
-		// Post-barrier the unique sources back to GENERAL (shared cross-proc rest).
-		VkImageMemoryBarrier post[XRT_MAX_VIEWS];
-		for (uint32_t u = 0; u < uniq_n; u++) {
-			post[u] = (VkImageMemoryBarrier){
-			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-			    .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-			    .dstAccessMask = 0,
-			    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-			    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-			    .image = uniq[u],
-			    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, uniq_arr[u], 1},
-			};
-		}
-		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-		                         0, 0, NULL, 0, NULL, uniq_n, post);
-	}
-
-	// M3: composite the workspace decorations (chrome/overlays/cursor) into the
-	// atlas BEFORE the weave so they carry 3D depth. The blend renders into the
-	// atlas as a color attachment, so transition TRANSFER_DST → COLOR_ATTACHMENT
-	// first; shared_composite_decorations leaves it in COLOR_ATTACHMENT.
+	// Atlas → COLOR_ATTACHMENT for the content + decoration passes (the backdrop
+	// clear above was the atlas's only TRANSFER write). Content composites with a
+	// rounded-rect + edge-feather shader (Task 9) instead of a hard vkCmdBlitImage,
+	// so each window's corners match the shell's rounded focus ring and its edges
+	// feather into the backdrop. The decorations (chrome/overlays/cursor) follow in
+	// the same COLOR_ATTACHMENT layout.
 	VkImageMemoryBarrier atlas_to_color = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -4391,6 +4271,196 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	};
 	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
 	                         0, NULL, 0, NULL, 1, &atlas_to_color);
+
+	// Composite each client's content into its window rect, per eye, with rounded
+	// corners + feathered edges. ONE render pass over the whole atlas so overlapping
+	// windows blend in painter (far→near, already-sorted) submission order; every
+	// content source image must therefore be SHADER_READ before the pass begins.
+	if (shared_ensure_content_blend(msc, vk)) {
+		// Corner radius matches the shell focus ring (fh*0.045) so the content
+		// corners are concentric with it; feather is ~2 px of the window height,
+		// capped at the radius (Windows caps so feather_band = feather/ry ≤ 1).
+		const float CONTENT_CORNER_RADIUS_FRAC = 0.045f;
+		const float CONTENT_FEATHER_PX = 2.0f;
+
+		// Collect the unique (image, array-layer) content sources across all
+		// clients and transition them GENERAL → SHADER_READ in one batch (barriers
+		// can't sit inside the render pass).
+		VkImage uniq[COMP_MULTI_CONTENT_BLEND_MAX_IMAGES];
+		uint32_t uniq_arr[COMP_MULTI_CONTENT_BLEND_MAX_IMAGES];
+		uint32_t uniq_n = 0;
+		for (uint32_t c = 0; c < order_count; c++) {
+			struct shared_client_render *e = &order[c];
+			for (uint32_t v = 0; v < e->view_count; v++) {
+				int tw = 0, th = 0;
+				VkFormat fmt = VK_FORMAT_UNDEFINED;
+				VkImageView iv = VK_NULL_HANDLE;
+				VkImage im = VK_NULL_HANDLE;
+				uint32_t ai = 0;
+				if (!get_session_layer_view(e->layer, v, &tw, &th, &fmt, &iv, &im, &ai)) {
+					continue;
+				}
+				bool found = false;
+				for (uint32_t u = 0; u < uniq_n; u++) {
+					if (uniq[u] == im && uniq_arr[u] == ai) {
+						found = true;
+						break;
+					}
+				}
+				if (!found && uniq_n < COMP_MULTI_CONTENT_BLEND_MAX_IMAGES) {
+					uniq[uniq_n] = im;
+					uniq_arr[uniq_n] = ai;
+					uniq_n++;
+				}
+			}
+		}
+		if (uniq_n > 0) {
+			VkImageMemoryBarrier pre[COMP_MULTI_CONTENT_BLEND_MAX_IMAGES];
+			for (uint32_t u = 0; u < uniq_n; u++) {
+				pre[u] = (VkImageMemoryBarrier){
+				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				    .srcAccessMask = 0,
+				    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+				    .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+				    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				    .image = uniq[u],
+				    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, uniq_arr[u], 1},
+				};
+			}
+			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+			                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL,
+			                         uniq_n, pre);
+		}
+
+		comp_multi_content_blend_begin(&msc->shared_content_blend, vk, cmd, msc->shared_atlas_fb,
+		                               (uint32_t)msc->shared_atlas_w, (uint32_t)msc->shared_atlas_h);
+		// Per client (far→near), per eye: project the window rect, clip it to the
+		// eye tile, remap the source sub-rect, and draw with rounded-rect coverage.
+		// M2: a placed window projects its center pose through each eye onto the
+		// panel (Z=0), so z>0 windows float toward the viewer; an unplaced lone app
+		// uses the flat full-display px-rect (M1). The client's own views supply
+		// its internal stereo.
+		for (uint32_t c = 0; c < order_count; c++) {
+			struct shared_client_render *e = &order[c];
+			bool flip_y = e->layer->data.flip_y;
+			float corner_aspect = (e->win_h_m > 0.0f) ? (e->win_w_m / e->win_h_m) : 1.0f;
+			float win_h_px = (float)(e->win_h > 0 ? e->win_h : eye_h);
+			float edge_feather = CONTENT_FEATHER_PX / win_h_px;
+			if (edge_feather > CONTENT_CORNER_RADIUS_FRAC) {
+				edge_feather = CONTENT_CORNER_RADIUS_FRAC;
+			}
+
+			for (uint32_t eye = 0; eye < tile_columns; eye++) {
+				uint32_t v = (eye < e->view_count) ? eye : (e->view_count - 1);
+				int tw = 0, th = 0;
+				VkFormat fmt = VK_FORMAT_UNDEFINED;
+				VkImageView iv = VK_NULL_HANDLE;
+				VkImage im = VK_NULL_HANDLE;
+				uint32_t ai = 0;
+				if (!get_session_layer_view(e->layer, v, &tw, &th, &fmt, &iv, &im, &ai)) {
+					continue;
+				}
+				int sx = e->layer->data.proj.v[v].sub.rect.offset.w;
+				int sy = e->layer->data.proj.v[v].sub.rect.offset.h;
+				// Full source image dims for UV normalization (the sub-rect is a
+				// tile within the worst-case swapchain image).
+				struct comp_swapchain *sc = comp_swapchain(e->layer->xscs[v]);
+				float img_w = (float)sc->vkic.info.width;
+				float img_h = (float)sc->vkic.info.height;
+				if (img_w <= 0.0f || img_h <= 0.0f) {
+					continue;
+				}
+
+				int rx = e->win_x, ry = e->win_y, rw = e->win_w, rh = e->win_h;
+				if (e->placed) {
+					uint32_t ei = (eye < eye_pos.count) ? eye : (eye_pos.count - 1);
+					shared_project_rect_for_eye(e->pose_x, e->pose_y, e->pose_z, e->win_w_m,
+					                            e->win_h_m, eye_pos.eyes[ei].x,
+					                            eye_pos.eyes[ei].y, eye_pos.eyes[ei].z, eye_w,
+					                            eye_h, px_per_m_x, px_per_m_y, &rx, &ry, &rw, &rh);
+				}
+				if (rw <= 0 || rh <= 0) {
+					continue;
+				}
+				int tile_x0 = (int)eye * eye_w;
+				float fdx0 = (float)(tile_x0 + rx);
+				float fdy0 = (float)ry;
+				float fdx1 = fdx0 + (float)rw;
+				float fdy1 = fdy0 + (float)rh;
+				// Source span (flip_y maps top↔bottom → negative src_uv_scale.y).
+				float fsx0 = (float)sx;
+				float fsx1 = (float)(sx + tw);
+				float fsy0 = (float)(sy + (flip_y ? th : 0));
+				float fsy1 = (float)(sy + (flip_y ? 0 : th));
+				// Clip the destination to the tile bounds; a projected/edge window
+				// can overflow its tile or the atlas. Map the clip back into the
+				// source proportionally; the window-local UV domain (ux/uy) keeps the
+				// rounded corners at the window's real corners even when clipped.
+				float cdx0 = fmaxf(fdx0, (float)tile_x0);
+				float cdx1 = fminf(fdx1, (float)(tile_x0 + eye_w));
+				float cdy0 = fmaxf(fdy0, 0.0f);
+				float cdy1 = fminf(fdy1, (float)eye_h);
+				if (cdx1 - cdx0 < 1.0f || cdy1 - cdy0 < 1.0f) {
+					continue;
+				}
+				float ux0 = (cdx0 - fdx0) / (fdx1 - fdx0), ux1 = (cdx1 - fdx0) / (fdx1 - fdx0);
+				float uy0 = (cdy0 - fdy0) / (fdy1 - fdy0), uy1 = (cdy1 - fdy0) / (fdy1 - fdy0);
+				float nsx0 = fsx0 + ux0 * (fsx1 - fsx0);
+				float nsx1 = fsx0 + ux1 * (fsx1 - fsx0);
+				float nsy0 = fsy0 + uy0 * (fsy1 - fsy0);
+				float nsy1 = fsy0 + uy1 * (fsy1 - fsy0);
+
+				struct comp_multi_content_pc pc = {
+				    .src_uv_off = {nsx0 / img_w, nsy0 / img_h},
+				    .src_uv_scale = {(nsx1 - nsx0) / img_w, (nsy1 - nsy0) / img_h},
+				    .win_uv_off = {ux0, uy0},
+				    .win_uv_scale = {ux1 - ux0, uy1 - uy0},
+				    .corner_radius = CONTENT_CORNER_RADIUS_FRAC,
+				    .corner_aspect = corner_aspect,
+				    .edge_feather = edge_feather,
+				    ._pad = 0.0f,
+				};
+				comp_multi_content_blend_draw(&msc->shared_content_blend, vk, cmd, im, ai, fmt, &pc,
+				                              (int32_t)cdx0, (int32_t)cdy0,
+				                              (uint32_t)(cdx1 - cdx0), (uint32_t)(cdy1 - cdy0));
+			}
+		}
+		comp_multi_content_blend_end(&msc->shared_content_blend, vk, cmd);
+
+		// Restore the cross-process sources to GENERAL (their rest layout).
+		if (uniq_n > 0) {
+			VkImageMemoryBarrier post[COMP_MULTI_CONTENT_BLEND_MAX_IMAGES];
+			for (uint32_t u = 0; u < uniq_n; u++) {
+				post[u] = (VkImageMemoryBarrier){
+				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+				    .dstAccessMask = 0,
+				    .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+				    .image = uniq[u],
+				    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, uniq_arr[u], 1},
+				};
+			}
+			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL,
+			                         uniq_n, post);
+		}
+	}
+
+	// Make content's color-attachment writes visible to the decoration render pass
+	// (both render into the atlas as a color attachment, in separate render passes).
+	VkImageMemoryBarrier atlas_content_to_deco = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .image = msc->shared_atlas_image,
+	    .subresourceRange = atlas_range,
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1,
+	                         &atlas_content_to_deco);
 
 	shared_composite_decorations(msc, vk, cmd, order, order_count, &eye_pos, eye_w, eye_h, px_per_m_x, px_per_m_y,
 	                             tile_columns);

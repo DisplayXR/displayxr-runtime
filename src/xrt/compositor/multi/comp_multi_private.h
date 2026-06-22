@@ -37,6 +37,7 @@
 // (comp_multi always links aux_vk, so Vulkan is always available)
 #include "xrt/xrt_vulkan_includes.h"
 #include "vk/vk_hud_blend.h"
+#include "multi/comp_multi_content_blend.h"
 
 #include "render/render_interface.h"
 
@@ -673,6 +674,13 @@ struct multi_system_compositor
 	bool shared_chrome_blend_initialized;
 	VkFramebuffer shared_atlas_fb;        //!< Color attachment is the combined atlas.
 	VkImageView shared_atlas_fb_view;     //!< The atlas view the fb was built for (recreate key).
+
+	//! Rounded-corner + edge-feather content composite (Task 9): a dedicated
+	//! SDF pipeline that replaces the hard vkCmdBlitImage content copy so window
+	//! corners match the shell's rounded focus ring. Composites into the same
+	//! shared_atlas_fb (render-pass compatible with shared_chrome_blend).
+	struct comp_multi_content_blend shared_content_blend;
+	bool shared_content_blend_initialized;
 	//! @}
 #endif
 };
