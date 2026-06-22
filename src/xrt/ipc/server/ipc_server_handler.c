@@ -941,6 +941,10 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 	// unknown — the Kooima needs a real physical size.
 	float screen_width_m = s->xsysc->info.display_width_m;
 	float screen_height_m = s->xsysc->info.display_height_m;
+	// #59 per-window Kooima: when a workspace window pose is applied (macOS shared
+	// surface), the render eyes are rebased to the window centre so the off-axis
+	// frustum looks THROUGH the tiled window (set below). 0 = display-centric.
+	float win_eye_offset_x = 0.0f, win_eye_offset_y = 0.0f, win_eye_offset_z = 0.0f;
 	if (screen_width_m <= 0.0f || screen_height_m <= 0.0f) {
 		static bool logged_no_dims = false;
 		if (!logged_no_dims) {
@@ -965,6 +969,35 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 			screen_height_m = tmp;
 		}
 	}
+
+#ifdef XRT_OS_MACOS
+	// Shared spatial surface (#59) PER-WINDOW Kooima. Each client composites into a
+	// TILED window, not the full display, so the Kooima screen must be the WINDOW's
+	// physical size — otherwise the client renders for the wide display aspect and a
+	// tall window squishes the blit. Use the controller-placed window pose: its
+	// width/height become the screen, and its centre (display-centric metres) rebases
+	// the render eyes below so the off-axis frustum looks THROUGH the window. This is
+	// the macOS analogue of the Windows per-client window-metrics path
+	// (ipc_try_get_sr_view_poses, screen = wm.window_*_m + window_center_offset). The
+	// shared surface's per-eye rect placement (shared_project_rect_for_eye) handles
+	// the window's POSITION parallax separately; the two are complementary (content-
+	// through-window perspective here, window-in-space placement there), exactly like
+	// D3D11's slot_pose_to_pixel_rect_for_eye + window-metrics Kooima. An unplaced
+	// window (no set_window_pose yet) keeps the display-centric fallback above.
+	{
+		struct xrt_pose wpose = XRT_STRUCT_INIT;
+		float ww_m = 0.0f, wh_m = 0.0f;
+		if (comp_multi_workspace_load_window_pose(ics->xc, &wpose, &ww_m, &wh_m) && ww_m > 0.0f &&
+		    wh_m > 0.0f) {
+			screen_width_m = ww_m;
+			screen_height_m = wh_m;
+			win_eye_offset_x = wpose.position.x;
+			win_eye_offset_y = wpose.position.y;
+			win_eye_offset_z = wpose.position.z;
+		}
+	}
+#endif
+
 	// Full-window meters + pixel dims, captured BEFORE the zone rebase below
 	// overwrites screen_*_m AND wm.window_pixel_* with the zone values — the raw
 	// canvas channel must keep reporting the WHOLE window, not the zone.
@@ -1143,8 +1176,9 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 			c.z += head_eyes[i].z;
 		}
 		float inv = nc > 0 ? 1.0f / (float)nc : 1.0f;
-		raw_eyes[0] = (struct xrt_vec3){c.x * inv - zone_eye_offset_x, c.y * inv - zone_eye_offset_y,
-		                                c.z * inv - zone_eye_offset_z};
+		raw_eyes[0] = (struct xrt_vec3){c.x * inv - zone_eye_offset_x - win_eye_offset_x,
+		                                c.y * inv - zone_eye_offset_y - win_eye_offset_y,
+		                                c.z * inv - zone_eye_offset_z - win_eye_offset_z};
 		eye_count = 1;
 	} else {
 		// N-view: one render eye per active view (2 stereo, 4 Quad, …). The DP's
@@ -1154,9 +1188,9 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 			eye_count = XRT_MAX_VIEWS;
 		}
 		for (uint32_t i = 0; i < eye_count; i++) {
-			raw_eyes[i] = (struct xrt_vec3){head_eyes[i].x - zone_eye_offset_x,
-			                                head_eyes[i].y - zone_eye_offset_y,
-			                                head_eyes[i].z - zone_eye_offset_z};
+			raw_eyes[i] = (struct xrt_vec3){head_eyes[i].x - zone_eye_offset_x - win_eye_offset_x,
+			                                head_eyes[i].y - zone_eye_offset_y - win_eye_offset_y,
+			                                head_eyes[i].z - zone_eye_offset_z - win_eye_offset_z};
 		}
 	}
 
