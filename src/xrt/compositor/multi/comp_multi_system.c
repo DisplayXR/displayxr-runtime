@@ -2408,19 +2408,14 @@ comp_multi_workspace_set_client_window_pose(struct xrt_compositor *xc,
 	float w_px_f = width_m * px_per_m_x;
 	float h_px_f = height_m * px_per_m_y;
 
-	// ASPECT FIT (#59), Windows-parity. These content apps render at a FIXED display
-	// aspect and do not reflow, so the window must match that aspect or content
-	// stretches. The Windows D3D11 service keeps the controller's WIDTH and sets
-	// window_height = window_width / content_aspect (comp_d3d11_service.cpp ~L5924).
-	// Mirror that: ALWAYS preserve the requested width and derive the height. This
-	// is what keeps the rendered window width identical to the width the controller
-	// built its chrome texture for — deriving height never moves the width, so the
-	// chrome can't be squished into a narrower-than-its-texture rect (the old code
-	// shrank the width when the request was "too wide", which diverged the two and
-	// caused the chrome squish + hover drift).
-	float disp_aspect = (float)disp_px_w / (float)disp_px_h;
-	h_px_f = w_px_f / disp_aspect;
-
+	// Honor the controller's requested WIDTH and HEIGHT verbatim. Window sizing and
+	// aspect policy are the workspace controller's look-and-feel job, not the
+	// runtime's (which only provides the infra). The shell sizes windows to fill
+	// most of the display (a 1×2 grid cell is ~0.81×display-height tall); the old
+	// code instead forced height = width / display_aspect, which HALVED that and
+	// made vertical resize a no-op (the requested height was discarded). Width is
+	// still taken as-requested, so the chrome texture (sized to the window width)
+	// is never squished — only the bogus height override is gone.
 	int32_t w_px = (int32_t)(w_px_f + 0.5f);
 	int32_t h_px = (int32_t)(h_px_f + 0.5f);
 	// Keep the window centered on the controller's requested center (top-left-origin
