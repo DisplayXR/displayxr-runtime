@@ -1,0 +1,682 @@
+// Copyright 2025, Leia Inc.
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  Rounded-corner + edge-feather content composite pipeline (macOS).
+ * @author David Fattal
+ * @ingroup comp_multi
+ */
+
+#include "comp_multi_content_blend.h"
+
+#ifdef XRT_OS_MACOS
+
+#include "util/u_logging.h"
+
+#include <string.h>
+
+/*
+ * Embedded SPIR-V, compiled offline with glslangValidator (no CMake shader
+ * build step — same pattern as vk_hud_blend).
+ *
+ * Vertex (content.vert): fullscreen triangle, no vertex buffer.
+ *   v_uv = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
+ *   gl_Position = vec4(v_uv * 2.0 - 1.0, 0.0, 1.0);
+ *
+ * Fragment (content.frag): sample content over a source sub-rect, modulate
+ * output alpha by rounded-rect SDF coverage x aspect-correct edge feather
+ * (faithful port of d3d11_service_shaders.h:766-832, all-four-corners). See
+ * comp_multi_content_blend.h for the push-constant layout.
+ */
+
+// clang-format off
+static const uint32_t content_vert_spv[] = {
+	0x07230203, 0x00010000, 0x0008000b, 0x0000002b, 0x00000000, 0x00020011, 0x00000001,
+	0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e,
+	0x00000000, 0x00000001, 0x0008000f, 0x00000000, 0x00000004, 0x6e69616d, 0x00000000,
+	0x00000009, 0x0000000c, 0x0000001d, 0x00030003, 0x00000002, 0x000001c2, 0x00040005,
+	0x00000004, 0x6e69616d, 0x00000000, 0x00040005, 0x00000009, 0x76755f76, 0x00000000,
+	0x00060005, 0x0000000c, 0x565f6c67, 0x65747265, 0x646e4978, 0x00007865, 0x00060005,
+	0x0000001b, 0x505f6c67, 0x65567265, 0x78657472, 0x00000000, 0x00060006, 0x0000001b,
+	0x00000000, 0x505f6c67, 0x7469736f, 0x006e6f69, 0x00070006, 0x0000001b, 0x00000001,
+	0x505f6c67, 0x746e696f, 0x657a6953, 0x00000000, 0x00070006, 0x0000001b, 0x00000002,
+	0x435f6c67, 0x4470696c, 0x61747369, 0x0065636e, 0x00070006, 0x0000001b, 0x00000003,
+	0x435f6c67, 0x446c6c75, 0x61747369, 0x0065636e, 0x00030005, 0x0000001d, 0x00000000,
+	0x00040047, 0x00000009, 0x0000001e, 0x00000000, 0x00040047, 0x0000000c, 0x0000000b,
+	0x0000002a, 0x00030047, 0x0000001b, 0x00000002, 0x00050048, 0x0000001b, 0x00000000,
+	0x0000000b, 0x00000000, 0x00050048, 0x0000001b, 0x00000001, 0x0000000b, 0x00000001,
+	0x00050048, 0x0000001b, 0x00000002, 0x0000000b, 0x00000003, 0x00050048, 0x0000001b,
+	0x00000003, 0x0000000b, 0x00000004, 0x00020013, 0x00000002, 0x00030021, 0x00000003,
+	0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006,
+	0x00000002, 0x00040020, 0x00000008, 0x00000003, 0x00000007, 0x0004003b, 0x00000008,
+	0x00000009, 0x00000003, 0x00040015, 0x0000000a, 0x00000020, 0x00000001, 0x00040020,
+	0x0000000b, 0x00000001, 0x0000000a, 0x0004003b, 0x0000000b, 0x0000000c, 0x00000001,
+	0x0004002b, 0x0000000a, 0x0000000e, 0x00000001, 0x0004002b, 0x0000000a, 0x00000010,
+	0x00000002, 0x00040017, 0x00000017, 0x00000006, 0x00000004, 0x00040015, 0x00000018,
+	0x00000020, 0x00000000, 0x0004002b, 0x00000018, 0x00000019, 0x00000001, 0x0004001c,
+	0x0000001a, 0x00000006, 0x00000019, 0x0006001e, 0x0000001b, 0x00000017, 0x00000006,
+	0x0000001a, 0x0000001a, 0x00040020, 0x0000001c, 0x00000003, 0x0000001b, 0x0004003b,
+	0x0000001c, 0x0000001d, 0x00000003, 0x0004002b, 0x0000000a, 0x0000001e, 0x00000000,
+	0x0004002b, 0x00000006, 0x00000020, 0x40000000, 0x0004002b, 0x00000006, 0x00000022,
+	0x3f800000, 0x0004002b, 0x00000006, 0x00000025, 0x00000000, 0x00040020, 0x00000029,
+	0x00000003, 0x00000017, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003,
+	0x000200f8, 0x00000005, 0x0004003d, 0x0000000a, 0x0000000d, 0x0000000c, 0x000500c4,
+	0x0000000a, 0x0000000f, 0x0000000d, 0x0000000e, 0x000500c7, 0x0000000a, 0x00000011,
+	0x0000000f, 0x00000010, 0x0004006f, 0x00000006, 0x00000012, 0x00000011, 0x0004003d,
+	0x0000000a, 0x00000013, 0x0000000c, 0x000500c7, 0x0000000a, 0x00000014, 0x00000013,
+	0x00000010, 0x0004006f, 0x00000006, 0x00000015, 0x00000014, 0x00050050, 0x00000007,
+	0x00000016, 0x00000012, 0x00000015, 0x0003003e, 0x00000009, 0x00000016, 0x0004003d,
+	0x00000007, 0x0000001f, 0x00000009, 0x0005008e, 0x00000007, 0x00000021, 0x0000001f,
+	0x00000020, 0x00050050, 0x00000007, 0x00000023, 0x00000022, 0x00000022, 0x00050083,
+	0x00000007, 0x00000024, 0x00000021, 0x00000023, 0x00050051, 0x00000006, 0x00000026,
+	0x00000024, 0x00000000, 0x00050051, 0x00000006, 0x00000027, 0x00000024, 0x00000001,
+	0x00070050, 0x00000017, 0x00000028, 0x00000026, 0x00000027, 0x00000025, 0x00000022,
+	0x00050041, 0x00000029, 0x0000002a, 0x0000001d, 0x0000001e, 0x0003003e, 0x0000002a,
+	0x00000028, 0x000100fd, 0x00010038,
+};
+
+static const uint32_t content_frag_spv[] = {
+	0x07230203, 0x00010000, 0x0008000b, 0x00000112, 0x00000000, 0x00020011, 0x00000001,
+	0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e,
+	0x00000000, 0x00000001, 0x0007000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000,
+	0x00000013, 0x00000107, 0x00030010, 0x00000004, 0x00000007, 0x00030003, 0x00000002,
+	0x000001c2, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000, 0x00030005, 0x00000009,
+	0x00767573, 0x00030005, 0x0000000a, 0x00004350, 0x00060006, 0x0000000a, 0x00000000,
+	0x5f637273, 0x6f5f7675, 0x00006666, 0x00070006, 0x0000000a, 0x00000001, 0x5f637273,
+	0x735f7675, 0x656c6163, 0x00000000, 0x00060006, 0x0000000a, 0x00000002, 0x5f6e6977,
+	0x6f5f7675, 0x00006666, 0x00070006, 0x0000000a, 0x00000003, 0x5f6e6977, 0x735f7675,
+	0x656c6163, 0x00000000, 0x00070006, 0x0000000a, 0x00000004, 0x6e726f63, 0x725f7265,
+	0x75696461, 0x00000073, 0x00070006, 0x0000000a, 0x00000005, 0x6e726f63, 0x615f7265,
+	0x63657073, 0x00000074, 0x00070006, 0x0000000a, 0x00000006, 0x65676465, 0x6165665f,
+	0x72656874, 0x00000000, 0x00050006, 0x0000000a, 0x00000007, 0x6461705f, 0x00000000,
+	0x00030005, 0x0000000c, 0x00006370, 0x00040005, 0x00000013, 0x76755f76, 0x00000000,
+	0x00030005, 0x0000001c, 0x00000063, 0x00040005, 0x00000020, 0x65745f75, 0x00000078,
+	0x00030005, 0x00000024, 0x00000077, 0x00030005, 0x0000002f, 0x00007972, 0x00040005,
+	0x00000034, 0x65707361, 0x00007463, 0x00030005, 0x0000003b, 0x00007872, 0x00060005,
+	0x0000003f, 0x6e726f63, 0x615f7265, 0x6168706c, 0x00000000, 0x00050005, 0x00000043,
+	0x635f6e69, 0x656e726f, 0x00000072, 0x00030005, 0x0000004a, 0x00006463, 0x00040005,
+	0x000000d0, 0x646e6162, 0x00000000, 0x00060005, 0x000000e4, 0x74616566, 0x5f726568,
+	0x68706c61, 0x00000061, 0x00030005, 0x000000ef, 0x00007864, 0x00030005, 0x000000f8,
+	0x00007964, 0x00040005, 0x00000107, 0x6f635f6f, 0x0000006c, 0x00030047, 0x0000000a,
+	0x00000002, 0x00050048, 0x0000000a, 0x00000000, 0x00000023, 0x00000000, 0x00050048,
+	0x0000000a, 0x00000001, 0x00000023, 0x00000008, 0x00050048, 0x0000000a, 0x00000002,
+	0x00000023, 0x00000010, 0x00050048, 0x0000000a, 0x00000003, 0x00000023, 0x00000018,
+	0x00050048, 0x0000000a, 0x00000004, 0x00000023, 0x00000020, 0x00050048, 0x0000000a,
+	0x00000005, 0x00000023, 0x00000024, 0x00050048, 0x0000000a, 0x00000006, 0x00000023,
+	0x00000028, 0x00050048, 0x0000000a, 0x00000007, 0x00000023, 0x0000002c, 0x00040047,
+	0x00000013, 0x0000001e, 0x00000000, 0x00040047, 0x00000020, 0x00000021, 0x00000000,
+	0x00040047, 0x00000020, 0x00000022, 0x00000000, 0x00040047, 0x00000107, 0x0000001e,
+	0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016,
+	0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000002, 0x00040020,
+	0x00000008, 0x00000007, 0x00000007, 0x000a001e, 0x0000000a, 0x00000007, 0x00000007,
+	0x00000007, 0x00000007, 0x00000006, 0x00000006, 0x00000006, 0x00000006, 0x00040020,
+	0x0000000b, 0x00000009, 0x0000000a, 0x0004003b, 0x0000000b, 0x0000000c, 0x00000009,
+	0x00040015, 0x0000000d, 0x00000020, 0x00000001, 0x0004002b, 0x0000000d, 0x0000000e,
+	0x00000000, 0x00040020, 0x0000000f, 0x00000009, 0x00000007, 0x00040020, 0x00000012,
+	0x00000001, 0x00000007, 0x0004003b, 0x00000012, 0x00000013, 0x00000001, 0x0004002b,
+	0x0000000d, 0x00000015, 0x00000001, 0x00040017, 0x0000001a, 0x00000006, 0x00000004,
+	0x00040020, 0x0000001b, 0x00000007, 0x0000001a, 0x00090019, 0x0000001d, 0x00000006,
+	0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x0003001b,
+	0x0000001e, 0x0000001d, 0x00040020, 0x0000001f, 0x00000000, 0x0000001e, 0x0004003b,
+	0x0000001f, 0x00000020, 0x00000000, 0x0004002b, 0x0000000d, 0x00000025, 0x00000002,
+	0x0004002b, 0x0000000d, 0x00000029, 0x00000003, 0x00040020, 0x0000002e, 0x00000007,
+	0x00000006, 0x0004002b, 0x0000000d, 0x00000030, 0x00000004, 0x00040020, 0x00000031,
+	0x00000009, 0x00000006, 0x0004002b, 0x0000000d, 0x00000035, 0x00000005, 0x0004002b,
+	0x00000006, 0x00000039, 0x3a83126f, 0x0004002b, 0x00000006, 0x00000040, 0x3f800000,
+	0x00020014, 0x00000041, 0x00040020, 0x00000042, 0x00000007, 0x00000041, 0x0003002a,
+	0x00000041, 0x00000044, 0x0004002b, 0x00000006, 0x00000046, 0x00000000, 0x0004002b,
+	0x00000006, 0x0000004b, 0xbf800000, 0x00040015, 0x0000004c, 0x00000020, 0x00000000,
+	0x0004002b, 0x0000004c, 0x0000004d, 0x00000000, 0x0004002b, 0x0000004c, 0x00000054,
+	0x00000001, 0x00030029, 0x00000041, 0x000000ca, 0x0004002b, 0x0000000d, 0x000000d1,
+	0x00000006, 0x0004002b, 0x00000006, 0x000000dd, 0x3ca3d70a, 0x00040020, 0x00000106,
+	0x00000003, 0x0000001a, 0x0004003b, 0x00000106, 0x00000107, 0x00000003, 0x00040017,
+	0x00000108, 0x00000006, 0x00000003, 0x00050036, 0x00000002, 0x00000004, 0x00000000,
+	0x00000003, 0x000200f8, 0x00000005, 0x0004003b, 0x00000008, 0x00000009, 0x00000007,
+	0x0004003b, 0x0000001b, 0x0000001c, 0x00000007, 0x0004003b, 0x00000008, 0x00000024,
+	0x00000007, 0x0004003b, 0x0000002e, 0x0000002f, 0x00000007, 0x0004003b, 0x0000002e,
+	0x00000034, 0x00000007, 0x0004003b, 0x0000002e, 0x0000003b, 0x00000007, 0x0004003b,
+	0x0000002e, 0x0000003f, 0x00000007, 0x0004003b, 0x00000042, 0x00000043, 0x00000007,
+	0x0004003b, 0x0000002e, 0x0000004a, 0x00000007, 0x0004003b, 0x0000002e, 0x000000d0,
+	0x00000007, 0x0004003b, 0x0000002e, 0x000000d5, 0x00000007, 0x0004003b, 0x0000002e,
+	0x000000e4, 0x00000007, 0x0004003b, 0x0000002e, 0x000000ef, 0x00000007, 0x0004003b,
+	0x0000002e, 0x000000f8, 0x00000007, 0x00050041, 0x0000000f, 0x00000010, 0x0000000c,
+	0x0000000e, 0x0004003d, 0x00000007, 0x00000011, 0x00000010, 0x0004003d, 0x00000007,
+	0x00000014, 0x00000013, 0x00050041, 0x0000000f, 0x00000016, 0x0000000c, 0x00000015,
+	0x0004003d, 0x00000007, 0x00000017, 0x00000016, 0x00050085, 0x00000007, 0x00000018,
+	0x00000014, 0x00000017, 0x00050081, 0x00000007, 0x00000019, 0x00000011, 0x00000018,
+	0x0003003e, 0x00000009, 0x00000019, 0x0004003d, 0x0000001e, 0x00000021, 0x00000020,
+	0x0004003d, 0x00000007, 0x00000022, 0x00000009, 0x00050057, 0x0000001a, 0x00000023,
+	0x00000021, 0x00000022, 0x0003003e, 0x0000001c, 0x00000023, 0x00050041, 0x0000000f,
+	0x00000026, 0x0000000c, 0x00000025, 0x0004003d, 0x00000007, 0x00000027, 0x00000026,
+	0x0004003d, 0x00000007, 0x00000028, 0x00000013, 0x00050041, 0x0000000f, 0x0000002a,
+	0x0000000c, 0x00000029, 0x0004003d, 0x00000007, 0x0000002b, 0x0000002a, 0x00050085,
+	0x00000007, 0x0000002c, 0x00000028, 0x0000002b, 0x00050081, 0x00000007, 0x0000002d,
+	0x00000027, 0x0000002c, 0x0003003e, 0x00000024, 0x0000002d, 0x00050041, 0x00000031,
+	0x00000032, 0x0000000c, 0x00000030, 0x0004003d, 0x00000006, 0x00000033, 0x00000032,
+	0x0003003e, 0x0000002f, 0x00000033, 0x00050041, 0x00000031, 0x00000036, 0x0000000c,
+	0x00000035, 0x0004003d, 0x00000006, 0x00000037, 0x00000036, 0x0006000c, 0x00000006,
+	0x00000038, 0x00000001, 0x00000004, 0x00000037, 0x0007000c, 0x00000006, 0x0000003a,
+	0x00000001, 0x00000028, 0x00000038, 0x00000039, 0x0003003e, 0x00000034, 0x0000003a,
+	0x0004003d, 0x00000006, 0x0000003c, 0x0000002f, 0x0004003d, 0x00000006, 0x0000003d,
+	0x00000034, 0x00050088, 0x00000006, 0x0000003e, 0x0000003c, 0x0000003d, 0x0003003e,
+	0x0000003b, 0x0000003e, 0x0003003e, 0x0000003f, 0x00000040, 0x0003003e, 0x00000043,
+	0x00000044, 0x0004003d, 0x00000006, 0x00000045, 0x0000002f, 0x000500ba, 0x00000041,
+	0x00000047, 0x00000045, 0x00000046, 0x000300f7, 0x00000049, 0x00000000, 0x000400fa,
+	0x00000047, 0x00000048, 0x00000049, 0x000200f8, 0x00000048, 0x0003003e, 0x0000004a,
+	0x0000004b, 0x00050041, 0x0000002e, 0x0000004e, 0x00000024, 0x0000004d, 0x0004003d,
+	0x00000006, 0x0000004f, 0x0000004e, 0x0004003d, 0x00000006, 0x00000050, 0x0000003b,
+	0x000500b8, 0x00000041, 0x00000051, 0x0000004f, 0x00000050, 0x000300f7, 0x00000053,
+	0x00000000, 0x000400fa, 0x00000051, 0x00000052, 0x00000053, 0x000200f8, 0x00000052,
+	0x00050041, 0x0000002e, 0x00000055, 0x00000024, 0x00000054, 0x0004003d, 0x00000006,
+	0x00000056, 0x00000055, 0x0004003d, 0x00000006, 0x00000057, 0x0000002f, 0x000500b8,
+	0x00000041, 0x00000058, 0x00000056, 0x00000057, 0x000200f9, 0x00000053, 0x000200f8,
+	0x00000053, 0x000700f5, 0x00000041, 0x00000059, 0x00000051, 0x00000048, 0x00000058,
+	0x00000052, 0x000300f7, 0x0000005b, 0x00000000, 0x000400fa, 0x00000059, 0x0000005a,
+	0x0000006a, 0x000200f8, 0x0000005a, 0x0004003d, 0x00000006, 0x0000005c, 0x0000003b,
+	0x00050041, 0x0000002e, 0x0000005d, 0x00000024, 0x0000004d, 0x0004003d, 0x00000006,
+	0x0000005e, 0x0000005d, 0x00050083, 0x00000006, 0x0000005f, 0x0000005c, 0x0000005e,
+	0x0004003d, 0x00000006, 0x00000060, 0x0000003b, 0x00050088, 0x00000006, 0x00000061,
+	0x0000005f, 0x00000060, 0x0004003d, 0x00000006, 0x00000062, 0x0000002f, 0x00050041,
+	0x0000002e, 0x00000063, 0x00000024, 0x00000054, 0x0004003d, 0x00000006, 0x00000064,
+	0x00000063, 0x00050083, 0x00000006, 0x00000065, 0x00000062, 0x00000064, 0x0004003d,
+	0x00000006, 0x00000066, 0x0000002f, 0x00050088, 0x00000006, 0x00000067, 0x00000065,
+	0x00000066, 0x00050050, 0x00000007, 0x00000068, 0x00000061, 0x00000067, 0x0006000c,
+	0x00000006, 0x00000069, 0x00000001, 0x00000042, 0x00000068, 0x0003003e, 0x0000004a,
+	0x00000069, 0x000200f9, 0x0000005b, 0x000200f8, 0x0000006a, 0x00050041, 0x0000002e,
+	0x0000006b, 0x00000024, 0x0000004d, 0x0004003d, 0x00000006, 0x0000006c, 0x0000006b,
+	0x0004003d, 0x00000006, 0x0000006d, 0x0000003b, 0x00050083, 0x00000006, 0x0000006e,
+	0x00000040, 0x0000006d, 0x000500ba, 0x00000041, 0x0000006f, 0x0000006c, 0x0000006e,
+	0x000300f7, 0x00000071, 0x00000000, 0x000400fa, 0x0000006f, 0x00000070, 0x00000071,
+	0x000200f8, 0x00000070, 0x00050041, 0x0000002e, 0x00000072, 0x00000024, 0x00000054,
+	0x0004003d, 0x00000006, 0x00000073, 0x00000072, 0x0004003d, 0x00000006, 0x00000074,
+	0x0000002f, 0x000500b8, 0x00000041, 0x00000075, 0x00000073, 0x00000074, 0x000200f9,
+	0x00000071, 0x000200f8, 0x00000071, 0x000700f5, 0x00000041, 0x00000076, 0x0000006f,
+	0x0000006a, 0x00000075, 0x00000070, 0x000300f7, 0x00000078, 0x00000000, 0x000400fa,
+	0x00000076, 0x00000077, 0x00000088, 0x000200f8, 0x00000077, 0x00050041, 0x0000002e,
+	0x00000079, 0x00000024, 0x0000004d, 0x0004003d, 0x00000006, 0x0000007a, 0x00000079,
+	0x0004003d, 0x00000006, 0x0000007b, 0x0000003b, 0x00050083, 0x00000006, 0x0000007c,
+	0x00000040, 0x0000007b, 0x00050083, 0x00000006, 0x0000007d, 0x0000007a, 0x0000007c,
+	0x0004003d, 0x00000006, 0x0000007e, 0x0000003b, 0x00050088, 0x00000006, 0x0000007f,
+	0x0000007d, 0x0000007e, 0x0004003d, 0x00000006, 0x00000080, 0x0000002f, 0x00050041,
+	0x0000002e, 0x00000081, 0x00000024, 0x00000054, 0x0004003d, 0x00000006, 0x00000082,
+	0x00000081, 0x00050083, 0x00000006, 0x00000083, 0x00000080, 0x00000082, 0x0004003d,
+	0x00000006, 0x00000084, 0x0000002f, 0x00050088, 0x00000006, 0x00000085, 0x00000083,
+	0x00000084, 0x00050050, 0x00000007, 0x00000086, 0x0000007f, 0x00000085, 0x0006000c,
+	0x00000006, 0x00000087, 0x00000001, 0x00000042, 0x00000086, 0x0003003e, 0x0000004a,
+	0x00000087, 0x000200f9, 0x00000078, 0x000200f8, 0x00000088, 0x00050041, 0x0000002e,
+	0x00000089, 0x00000024, 0x0000004d, 0x0004003d, 0x00000006, 0x0000008a, 0x00000089,
+	0x0004003d, 0x00000006, 0x0000008b, 0x0000003b, 0x000500b8, 0x00000041, 0x0000008c,
+	0x0000008a, 0x0000008b, 0x000300f7, 0x0000008e, 0x00000000, 0x000400fa, 0x0000008c,
+	0x0000008d, 0x0000008e, 0x000200f8, 0x0000008d, 0x00050041, 0x0000002e, 0x0000008f,
+	0x00000024, 0x00000054, 0x0004003d, 0x00000006, 0x00000090, 0x0000008f, 0x0004003d,
+	0x00000006, 0x00000091, 0x0000002f, 0x00050083, 0x00000006, 0x00000092, 0x00000040,
+	0x00000091, 0x000500ba, 0x00000041, 0x00000093, 0x00000090, 0x00000092, 0x000200f9,
+	0x0000008e, 0x000200f8, 0x0000008e, 0x000700f5, 0x00000041, 0x00000094, 0x0000008c,
+	0x00000088, 0x00000093, 0x0000008d, 0x000300f7, 0x00000096, 0x00000000, 0x000400fa,
+	0x00000094, 0x00000095, 0x000000a6, 0x000200f8, 0x00000095, 0x0004003d, 0x00000006,
+	0x00000097, 0x0000003b, 0x00050041, 0x0000002e, 0x00000098, 0x00000024, 0x0000004d,
+	0x0004003d, 0x00000006, 0x00000099, 0x00000098, 0x00050083, 0x00000006, 0x0000009a,
+	0x00000097, 0x00000099, 0x0004003d, 0x00000006, 0x0000009b, 0x0000003b, 0x00050088,
+	0x00000006, 0x0000009c, 0x0000009a, 0x0000009b, 0x00050041, 0x0000002e, 0x0000009d,
+	0x00000024, 0x00000054, 0x0004003d, 0x00000006, 0x0000009e, 0x0000009d, 0x0004003d,
+	0x00000006, 0x0000009f, 0x0000002f, 0x00050083, 0x00000006, 0x000000a0, 0x00000040,
+	0x0000009f, 0x00050083, 0x00000006, 0x000000a1, 0x0000009e, 0x000000a0, 0x0004003d,
+	0x00000006, 0x000000a2, 0x0000002f, 0x00050088, 0x00000006, 0x000000a3, 0x000000a1,
+	0x000000a2, 0x00050050, 0x00000007, 0x000000a4, 0x0000009c, 0x000000a3, 0x0006000c,
+	0x00000006, 0x000000a5, 0x00000001, 0x00000042, 0x000000a4, 0x0003003e, 0x0000004a,
+	0x000000a5, 0x000200f9, 0x00000096, 0x000200f8, 0x000000a6, 0x00050041, 0x0000002e,
+	0x000000a7, 0x00000024, 0x0000004d, 0x0004003d, 0x00000006, 0x000000a8, 0x000000a7,
+	0x0004003d, 0x00000006, 0x000000a9, 0x0000003b, 0x00050083, 0x00000006, 0x000000aa,
+	0x00000040, 0x000000a9, 0x000500ba, 0x00000041, 0x000000ab, 0x000000a8, 0x000000aa,
+	0x000300f7, 0x000000ad, 0x00000000, 0x000400fa, 0x000000ab, 0x000000ac, 0x000000ad,
+	0x000200f8, 0x000000ac, 0x00050041, 0x0000002e, 0x000000ae, 0x00000024, 0x00000054,
+	0x0004003d, 0x00000006, 0x000000af, 0x000000ae, 0x0004003d, 0x00000006, 0x000000b0,
+	0x0000002f, 0x00050083, 0x00000006, 0x000000b1, 0x00000040, 0x000000b0, 0x000500ba,
+	0x00000041, 0x000000b2, 0x000000af, 0x000000b1, 0x000200f9, 0x000000ad, 0x000200f8,
+	0x000000ad, 0x000700f5, 0x00000041, 0x000000b3, 0x000000ab, 0x000000a6, 0x000000b2,
+	0x000000ac, 0x000300f7, 0x000000b5, 0x00000000, 0x000400fa, 0x000000b3, 0x000000b4,
+	0x000000b5, 0x000200f8, 0x000000b4, 0x00050041, 0x0000002e, 0x000000b6, 0x00000024,
+	0x0000004d, 0x0004003d, 0x00000006, 0x000000b7, 0x000000b6, 0x0004003d, 0x00000006,
+	0x000000b8, 0x0000003b, 0x00050083, 0x00000006, 0x000000b9, 0x00000040, 0x000000b8,
+	0x00050083, 0x00000006, 0x000000ba, 0x000000b7, 0x000000b9, 0x0004003d, 0x00000006,
+	0x000000bb, 0x0000003b, 0x00050088, 0x00000006, 0x000000bc, 0x000000ba, 0x000000bb,
+	0x00050041, 0x0000002e, 0x000000bd, 0x00000024, 0x00000054, 0x0004003d, 0x00000006,
+	0x000000be, 0x000000bd, 0x0004003d, 0x00000006, 0x000000bf, 0x0000002f, 0x00050083,
+	0x00000006, 0x000000c0, 0x00000040, 0x000000bf, 0x00050083, 0x00000006, 0x000000c1,
+	0x000000be, 0x000000c0, 0x0004003d, 0x00000006, 0x000000c2, 0x0000002f, 0x00050088,
+	0x00000006, 0x000000c3, 0x000000c1, 0x000000c2, 0x00050050, 0x00000007, 0x000000c4,
+	0x000000bc, 0x000000c3, 0x0006000c, 0x00000006, 0x000000c5, 0x00000001, 0x00000042,
+	0x000000c4, 0x0003003e, 0x0000004a, 0x000000c5, 0x000200f9, 0x000000b5, 0x000200f8,
+	0x000000b5, 0x000200f9, 0x00000096, 0x000200f8, 0x00000096, 0x000200f9, 0x00000078,
+	0x000200f8, 0x00000078, 0x000200f9, 0x0000005b, 0x000200f8, 0x0000005b, 0x0004003d,
+	0x00000006, 0x000000c6, 0x0000004a, 0x000500be, 0x00000041, 0x000000c7, 0x000000c6,
+	0x00000046, 0x000300f7, 0x000000c9, 0x00000000, 0x000400fa, 0x000000c7, 0x000000c8,
+	0x000000c9, 0x000200f8, 0x000000c8, 0x0003003e, 0x00000043, 0x000000ca, 0x0004003d,
+	0x00000006, 0x000000cb, 0x0000004a, 0x000500ba, 0x00000041, 0x000000cc, 0x000000cb,
+	0x00000040, 0x000300f7, 0x000000ce, 0x00000000, 0x000400fa, 0x000000cc, 0x000000cd,
+	0x000000ce, 0x000200f8, 0x000000cd, 0x000100fc, 0x000200f8, 0x000000ce, 0x00050041,
+	0x00000031, 0x000000d2, 0x0000000c, 0x000000d1, 0x0004003d, 0x00000006, 0x000000d3,
+	0x000000d2, 0x000500ba, 0x00000041, 0x000000d4, 0x000000d3, 0x00000046, 0x000300f7,
+	0x000000d7, 0x00000000, 0x000400fa, 0x000000d4, 0x000000d6, 0x000000dc, 0x000200f8,
+	0x000000d6, 0x00050041, 0x00000031, 0x000000d8, 0x0000000c, 0x000000d1, 0x0004003d,
+	0x00000006, 0x000000d9, 0x000000d8, 0x0004003d, 0x00000006, 0x000000da, 0x0000002f,
+	0x00050088, 0x00000006, 0x000000db, 0x000000d9, 0x000000da, 0x0003003e, 0x000000d5,
+	0x000000db, 0x000200f9, 0x000000d7, 0x000200f8, 0x000000dc, 0x0003003e, 0x000000d5,
+	0x000000dd, 0x000200f9, 0x000000d7, 0x000200f8, 0x000000d7, 0x0004003d, 0x00000006,
+	0x000000de, 0x000000d5, 0x0003003e, 0x000000d0, 0x000000de, 0x0004003d, 0x00000006,
+	0x000000df, 0x0000004a, 0x00050083, 0x00000006, 0x000000e0, 0x00000040, 0x000000df,
+	0x0004003d, 0x00000006, 0x000000e1, 0x000000d0, 0x00050088, 0x00000006, 0x000000e2,
+	0x000000e0, 0x000000e1, 0x0008000c, 0x00000006, 0x000000e3, 0x00000001, 0x0000002b,
+	0x000000e2, 0x00000046, 0x00000040, 0x0003003e, 0x0000003f, 0x000000e3, 0x000200f9,
+	0x000000c9, 0x000200f8, 0x000000c9, 0x000200f9, 0x00000049, 0x000200f8, 0x00000049,
+	0x0003003e, 0x000000e4, 0x00000040, 0x0004003d, 0x00000041, 0x000000e5, 0x00000043,
+	0x000400a8, 0x00000041, 0x000000e6, 0x000000e5, 0x000300f7, 0x000000e8, 0x00000000,
+	0x000400fa, 0x000000e6, 0x000000e7, 0x000000e8, 0x000200f8, 0x000000e7, 0x00050041,
+	0x00000031, 0x000000e9, 0x0000000c, 0x000000d1, 0x0004003d, 0x00000006, 0x000000ea,
+	0x000000e9, 0x000500ba, 0x00000041, 0x000000eb, 0x000000ea, 0x00000046, 0x000200f9,
+	0x000000e8, 0x000200f8, 0x000000e8, 0x000700f5, 0x00000041, 0x000000ec, 0x000000e6,
+	0x00000049, 0x000000eb, 0x000000e7, 0x000300f7, 0x000000ee, 0x00000000, 0x000400fa,
+	0x000000ec, 0x000000ed, 0x000000ee, 0x000200f8, 0x000000ed, 0x00050041, 0x0000002e,
+	0x000000f0, 0x00000024, 0x0000004d, 0x0004003d, 0x00000006, 0x000000f1, 0x000000f0,
+	0x00050041, 0x0000002e, 0x000000f2, 0x00000024, 0x0000004d, 0x0004003d, 0x00000006,
+	0x000000f3, 0x000000f2, 0x00050083, 0x00000006, 0x000000f4, 0x00000040, 0x000000f3,
+	0x0007000c, 0x00000006, 0x000000f5, 0x00000001, 0x00000025, 0x000000f1, 0x000000f4,
+	0x0004003d, 0x00000006, 0x000000f6, 0x00000034, 0x00050085, 0x00000006, 0x000000f7,
+	0x000000f5, 0x000000f6, 0x0003003e, 0x000000ef, 0x000000f7, 0x00050041, 0x0000002e,
+	0x000000f9, 0x00000024, 0x00000054, 0x0004003d, 0x00000006, 0x000000fa, 0x000000f9,
+	0x00050041, 0x0000002e, 0x000000fb, 0x00000024, 0x00000054, 0x0004003d, 0x00000006,
+	0x000000fc, 0x000000fb, 0x00050083, 0x00000006, 0x000000fd, 0x00000040, 0x000000fc,
+	0x0007000c, 0x00000006, 0x000000fe, 0x00000001, 0x00000025, 0x000000fa, 0x000000fd,
+	0x0003003e, 0x000000f8, 0x000000fe, 0x0004003d, 0x00000006, 0x000000ff, 0x000000ef,
+	0x0004003d, 0x00000006, 0x00000100, 0x000000f8, 0x0007000c, 0x00000006, 0x00000101,
+	0x00000001, 0x00000025, 0x000000ff, 0x00000100, 0x00050041, 0x00000031, 0x00000102,
+	0x0000000c, 0x000000d1, 0x0004003d, 0x00000006, 0x00000103, 0x00000102, 0x00050088,
+	0x00000006, 0x00000104, 0x00000101, 0x00000103, 0x0008000c, 0x00000006, 0x00000105,
+	0x00000001, 0x0000002b, 0x00000104, 0x00000046, 0x00000040, 0x0003003e, 0x000000e4,
+	0x00000105, 0x000200f9, 0x000000ee, 0x000200f8, 0x000000ee, 0x0004003d, 0x0000001a,
+	0x00000109, 0x0000001c, 0x0008004f, 0x00000108, 0x0000010a, 0x00000109, 0x00000109,
+	0x00000000, 0x00000001, 0x00000002, 0x0004003d, 0x00000006, 0x0000010b, 0x0000003f,
+	0x0004003d, 0x00000006, 0x0000010c, 0x000000e4, 0x00050085, 0x00000006, 0x0000010d,
+	0x0000010b, 0x0000010c, 0x00050051, 0x00000006, 0x0000010e, 0x0000010a, 0x00000000,
+	0x00050051, 0x00000006, 0x0000010f, 0x0000010a, 0x00000001, 0x00050051, 0x00000006,
+	0x00000110, 0x0000010a, 0x00000002, 0x00070050, 0x0000001a, 0x00000111, 0x0000010e,
+	0x0000010f, 0x00000110, 0x0000010d, 0x0003003e, 0x00000107, 0x00000111, 0x000100fd,
+	0x00010038,
+};
+// clang-format on
+
+
+bool
+comp_multi_content_blend_init(struct comp_multi_content_blend *blend, struct vk_bundle *vk, VkFormat atlas_fmt)
+{
+	VkResult ret;
+
+	VkShaderModuleCreateInfo vert_ci = {
+	    .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+	    .codeSize = sizeof(content_vert_spv),
+	    .pCode = content_vert_spv,
+	};
+	ret = vk->vkCreateShaderModule(vk->device, &vert_ci, NULL, &blend->vert_mod);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("[content blend] Failed to create vert shader: %d", ret);
+		return false;
+	}
+
+	VkShaderModuleCreateInfo frag_ci = {
+	    .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+	    .codeSize = sizeof(content_frag_spv),
+	    .pCode = content_frag_spv,
+	};
+	ret = vk->vkCreateShaderModule(vk->device, &frag_ci, NULL, &blend->frag_mod);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("[content blend] Failed to create frag shader: %d", ret);
+		return false;
+	}
+
+	// Linear sampler — source sub-rect rarely aligns to dst pixels.
+	VkSamplerCreateInfo samp_ci = {
+	    .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+	    .magFilter = VK_FILTER_LINEAR,
+	    .minFilter = VK_FILTER_LINEAR,
+	    .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+	    .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+	};
+	ret = vk->vkCreateSampler(vk->device, &samp_ci, NULL, &blend->sampler);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("[content blend] Failed to create sampler: %d", ret);
+		return false;
+	}
+
+	VkDescriptorSetLayoutBinding binding = {
+	    .binding = 0,
+	    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	    .descriptorCount = 1,
+	    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+	};
+	VkDescriptorSetLayoutCreateInfo dsl_ci = {
+	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+	    .bindingCount = 1,
+	    .pBindings = &binding,
+	};
+	ret = vk->vkCreateDescriptorSetLayout(vk->device, &dsl_ci, NULL, &blend->desc_layout);
+	if (ret != VK_SUCCESS) {
+		return false;
+	}
+
+	// Pipeline layout with the fragment push-constant block.
+	VkPushConstantRange pc_range = {
+	    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+	    .offset = 0,
+	    .size = sizeof(struct comp_multi_content_pc),
+	};
+	VkPipelineLayoutCreateInfo pl_ci = {
+	    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+	    .setLayoutCount = 1,
+	    .pSetLayouts = &blend->desc_layout,
+	    .pushConstantRangeCount = 1,
+	    .pPushConstantRanges = &pc_range,
+	};
+	ret = vk->vkCreatePipelineLayout(vk->device, &pl_ci, NULL, &blend->pipe_layout);
+	if (ret != VK_SUCCESS) {
+		return false;
+	}
+
+	VkDescriptorPoolSize pool_size = {
+	    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	    COMP_MULTI_CONTENT_BLEND_MAX_IMAGES,
+	};
+	VkDescriptorPoolCreateInfo dp_ci = {
+	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+	    .maxSets = COMP_MULTI_CONTENT_BLEND_MAX_IMAGES,
+	    .poolSizeCount = 1,
+	    .pPoolSizes = &pool_size,
+	};
+	ret = vk->vkCreateDescriptorPool(vk->device, &dp_ci, NULL, &blend->desc_pool);
+	if (ret != VK_SUCCESS) {
+		return false;
+	}
+
+	// Render pass: single color attachment, LOAD/STORE, COLOR_ATTACHMENT in/out
+	// (the atlas is already in COLOR_ATTACHMENT_OPTIMAL when content composites).
+	VkAttachmentDescription att = {
+	    .format = atlas_fmt,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+	    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+	    .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+	    .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+	    .initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	};
+	VkAttachmentReference ref = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+	VkSubpassDescription sub = {
+	    .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+	    .colorAttachmentCount = 1,
+	    .pColorAttachments = &ref,
+	};
+	VkRenderPassCreateInfo rp_ci = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+	    .attachmentCount = 1,
+	    .pAttachments = &att,
+	    .subpassCount = 1,
+	    .pSubpasses = &sub,
+	};
+	ret = vk->vkCreateRenderPass(vk->device, &rp_ci, NULL, &blend->render_pass);
+	if (ret != VK_SUCCESS) {
+		return false;
+	}
+
+	// Graphics pipeline: fullscreen triangle, SrcAlpha/InvSrcAlpha blend (the
+	// fragment shader's coverage drives source alpha), dynamic viewport/scissor.
+	VkPipelineShaderStageCreateInfo stages[2] = {
+	    {
+	        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+	        .stage = VK_SHADER_STAGE_VERTEX_BIT,
+	        .module = blend->vert_mod,
+	        .pName = "main",
+	    },
+	    {
+	        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+	        .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+	        .module = blend->frag_mod,
+	        .pName = "main",
+	    },
+	};
+
+	VkPipelineVertexInputStateCreateInfo vi = {.sType =
+	                                                VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+	VkPipelineInputAssemblyStateCreateInfo ia = {
+	    .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+	    .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+	VkPipelineViewportStateCreateInfo vps = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+	                                         .viewportCount = 1,
+	                                         .scissorCount = 1};
+	VkPipelineRasterizationStateCreateInfo rs = {
+	    .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+	    .polygonMode = VK_POLYGON_MODE_FILL,
+	    .cullMode = VK_CULL_MODE_NONE,
+	    .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+	    .lineWidth = 1.0f};
+	VkPipelineMultisampleStateCreateInfo ms = {.sType =
+	                                               VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+	                                           .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+	VkPipelineColorBlendAttachmentState blend_att = {
+	    .blendEnable = VK_TRUE,
+	    // Leave the atlas alpha untouched (same rationale as vk_hud_blend) — the
+	    // weave/present path may treat alpha as window transparency.
+	    .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT,
+	    .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+	    .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+	    .colorBlendOp = VK_BLEND_OP_ADD,
+	    .srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+	    .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+	    .alphaBlendOp = VK_BLEND_OP_ADD};
+	VkPipelineColorBlendStateCreateInfo cb = {.sType =
+	                                              VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+	                                          .attachmentCount = 1,
+	                                          .pAttachments = &blend_att};
+	VkPipelineDepthStencilStateCreateInfo ds = {
+	    .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+	VkDynamicState dyn_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+	VkPipelineDynamicStateCreateInfo dyn = {.sType =
+	                                            VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+	                                        .dynamicStateCount = 2,
+	                                        .pDynamicStates = dyn_states};
+
+	VkGraphicsPipelineCreateInfo pipe_ci = {
+	    .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+	    .stageCount = 2,
+	    .pStages = stages,
+	    .pVertexInputState = &vi,
+	    .pInputAssemblyState = &ia,
+	    .pViewportState = &vps,
+	    .pRasterizationState = &rs,
+	    .pMultisampleState = &ms,
+	    .pDepthStencilState = &ds,
+	    .pColorBlendState = &cb,
+	    .pDynamicState = &dyn,
+	    .layout = blend->pipe_layout,
+	    .renderPass = blend->render_pass,
+	    .subpass = 0,
+	};
+	ret = vk->vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &pipe_ci, NULL, &blend->pipeline);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("[content blend] Failed to create pipeline: %d", ret);
+		return false;
+	}
+
+	blend->initialized = true;
+	return true;
+}
+
+/*!
+ * Cached descriptor set for a (content image, array-layer) source, created (with
+ * a 2D view selecting the layer in the image's native format) on first sight.
+ */
+static VkDescriptorSet
+get_or_create_image_desc(
+    struct comp_multi_content_blend *blend, struct vk_bundle *vk, VkImage src_image, uint32_t array_layer, VkFormat src_fmt)
+{
+	for (uint32_t i = 0; i < blend->image_count; i++) {
+		if (blend->cached_images[i].image == src_image &&
+		    blend->cached_images[i].array_layer == array_layer) {
+			return blend->cached_images[i].desc_set;
+		}
+	}
+
+	if (blend->image_count >= COMP_MULTI_CONTENT_BLEND_MAX_IMAGES) {
+		U_LOG_E("[content blend] image cache exhausted (max=%u)", COMP_MULTI_CONTENT_BLEND_MAX_IMAGES);
+		return VK_NULL_HANDLE;
+	}
+
+	VkImageViewCreateInfo view_ci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+	    .image = src_image,
+	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+	    .format = src_fmt,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, array_layer, 1},
+	};
+	VkImageView view = VK_NULL_HANDLE;
+	if (vk->vkCreateImageView(vk->device, &view_ci, NULL, &view) != VK_SUCCESS) {
+		U_LOG_E("[content blend] CreateImageView failed");
+		return VK_NULL_HANDLE;
+	}
+
+	VkDescriptorSetAllocateInfo ds_ai = {
+	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+	    .descriptorPool = blend->desc_pool,
+	    .descriptorSetCount = 1,
+	    .pSetLayouts = &blend->desc_layout,
+	};
+	VkDescriptorSet desc_set = VK_NULL_HANDLE;
+	if (vk->vkAllocateDescriptorSets(vk->device, &ds_ai, &desc_set) != VK_SUCCESS) {
+		vk->vkDestroyImageView(vk->device, view, NULL);
+		U_LOG_E("[content blend] AllocateDescriptorSets failed");
+		return VK_NULL_HANDLE;
+	}
+
+	VkDescriptorImageInfo img_info = {
+	    .sampler = blend->sampler,
+	    .imageView = view,
+	    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	};
+	VkWriteDescriptorSet write = {
+	    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+	    .dstSet = desc_set,
+	    .dstBinding = 0,
+	    .descriptorCount = 1,
+	    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	    .pImageInfo = &img_info,
+	};
+	vk->vkUpdateDescriptorSets(vk->device, 1, &write, 0, NULL);
+
+	blend->cached_images[blend->image_count].image = src_image;
+	blend->cached_images[blend->image_count].array_layer = array_layer;
+	blend->cached_images[blend->image_count].view = view;
+	blend->cached_images[blend->image_count].desc_set = desc_set;
+	blend->image_count++;
+	return desc_set;
+}
+
+void
+comp_multi_content_blend_begin(
+    struct comp_multi_content_blend *blend, struct vk_bundle *vk, VkCommandBuffer cmd, VkFramebuffer fb, uint32_t fb_w, uint32_t fb_h)
+{
+	if (!blend->initialized || fb == VK_NULL_HANDLE) {
+		return;
+	}
+
+	VkRenderPassBeginInfo rp_bi = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+	    .renderPass = blend->render_pass,
+	    .framebuffer = fb,
+	    .renderArea = {{0, 0}, {fb_w, fb_h}},
+	};
+	vk->vkCmdBeginRenderPass(cmd, &rp_bi, VK_SUBPASS_CONTENTS_INLINE);
+	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, blend->pipeline);
+}
+
+void
+comp_multi_content_blend_draw(struct comp_multi_content_blend *blend,
+                              struct vk_bundle *vk,
+                              VkCommandBuffer cmd,
+                              VkImage src_image,
+                              uint32_t array_layer,
+                              VkFormat src_fmt,
+                              const struct comp_multi_content_pc *pc,
+                              int32_t dst_x,
+                              int32_t dst_y,
+                              uint32_t dst_w,
+                              uint32_t dst_h)
+{
+	if (!blend->initialized || src_image == VK_NULL_HANDLE || dst_w == 0 || dst_h == 0) {
+		return;
+	}
+
+	VkDescriptorSet desc_set = get_or_create_image_desc(blend, vk, src_image, array_layer, src_fmt);
+	if (desc_set == VK_NULL_HANDLE) {
+		return;
+	}
+
+	VkViewport vp = {(float)dst_x, (float)dst_y, (float)dst_w, (float)dst_h, 0.0f, 1.0f};
+	vk->vkCmdSetViewport(cmd, 0, 1, &vp);
+	VkRect2D scissor = {{dst_x, dst_y}, {dst_w, dst_h}};
+	vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+	vk->vkCmdPushConstants(cmd, blend->pipe_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+	                       sizeof(struct comp_multi_content_pc), pc);
+	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, blend->pipe_layout, 0, 1, &desc_set, 0,
+	                            NULL);
+	vk->vkCmdDraw(cmd, 3, 1, 0, 0);
+}
+
+void
+comp_multi_content_blend_end(struct comp_multi_content_blend *blend, struct vk_bundle *vk, VkCommandBuffer cmd)
+{
+	if (!blend->initialized) {
+		return;
+	}
+	vk->vkCmdEndRenderPass(cmd);
+}
+
+void
+comp_multi_content_blend_fini(struct comp_multi_content_blend *blend, struct vk_bundle *vk)
+{
+	if (!blend->initialized) {
+		return;
+	}
+
+	for (uint32_t i = 0; i < blend->image_count; i++) {
+		vk->vkDestroyImageView(vk->device, blend->cached_images[i].view, NULL);
+		// Descriptor sets freed implicitly with the pool.
+	}
+
+	if (blend->pipeline != VK_NULL_HANDLE) {
+		vk->vkDestroyPipeline(vk->device, blend->pipeline, NULL);
+	}
+	if (blend->render_pass != VK_NULL_HANDLE) {
+		vk->vkDestroyRenderPass(vk->device, blend->render_pass, NULL);
+	}
+	if (blend->pipe_layout != VK_NULL_HANDLE) {
+		vk->vkDestroyPipelineLayout(vk->device, blend->pipe_layout, NULL);
+	}
+	if (blend->desc_pool != VK_NULL_HANDLE) {
+		vk->vkDestroyDescriptorPool(vk->device, blend->desc_pool, NULL);
+	}
+	if (blend->desc_layout != VK_NULL_HANDLE) {
+		vk->vkDestroyDescriptorSetLayout(vk->device, blend->desc_layout, NULL);
+	}
+	if (blend->sampler != VK_NULL_HANDLE) {
+		vk->vkDestroySampler(vk->device, blend->sampler, NULL);
+	}
+	if (blend->vert_mod != VK_NULL_HANDLE) {
+		vk->vkDestroyShaderModule(vk->device, blend->vert_mod, NULL);
+	}
+	if (blend->frag_mod != VK_NULL_HANDLE) {
+		vk->vkDestroyShaderModule(vk->device, blend->frag_mod, NULL);
+	}
+
+	memset(blend, 0, sizeof(*blend));
+}
+
+#endif // XRT_OS_MACOS
