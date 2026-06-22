@@ -137,12 +137,6 @@ struct comp_d3d11_compositor
 	//! True if shared texture mode is active.
 	bool has_shared_texture;
 
-	//! Canvas output rect for shared-texture apps.
-	//! When valid, it flows to the DP as the weave sub-rect via the
-	//! process_atlas canvas params (#85) and drives view dims + Kooima
-	//! metrics. Superseded by an active zone mask (#439 Phase 2) — read
-	//! through d3d11_effective_canvas() on every frame-path site.
-	struct u_canvas_rect canvas;
 
 	//! Active authored zone mask (#439 Phase 1, XR_EXT_local_3d_zone). Set by
 	//! comp_d3d11_compositor_zone_mask_submit (sticky, last-submit-wins),
@@ -370,7 +364,8 @@ d3d11_update_zone_wish_state(struct comp_d3d11_compositor *c);
 // #439 Phase 2: an active zone mask supersedes the canvas output rect —
 // the weave region, view dims, Kooima metrics, and composite region all
 // become the client-window rect (top-left anchored per #464). With no mask
-// this returns c->canvas verbatim, so the no-mask path is unchanged.
+// this returns an invalid rect, so readers fall back to full-window/target
+// dims, leaving the no-mask path unchanged.
 // Returning a *valid* window rect (not just "invalid") matters on the
 // shared-texture path: the texture is display-sized worst-case, so an
 // invalid canvas there would fall back to display dims — the window rect
@@ -387,7 +382,7 @@ d3d11_effective_canvas(struct comp_d3d11_compositor *c)
 	// definition (each zone rect is its own canvas; the output rect is
 	// inert) — same supersede geometry as the mask/Local2D rules below.
 	if (!c->zones_frame && c->active_zone_mask == nullptr && !c->local_2d_last_frame) {
-		return c->canvas;
+		return {};
 	}
 	struct u_canvas_rect win = {};
 	HWND wnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
@@ -1511,7 +1506,8 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 	// #439 Phase 2: the one canvas authority for this frame. While a zone
 	// mask is active this is the client-window rect (the mask supersedes
-	// the output rect); otherwise it is c->canvas unchanged. Computed once
+	// the output rect); otherwise it is an invalid rect (readers fall back
+	// to full-window/target dims). Computed once
 	// under c->mutex (held for this whole function) so the weave region,
 	// view dims, and composite all see the same rect even if submit/destroy
 	// race the frame.
@@ -2096,7 +2092,6 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	c->own_window = nullptr;
 	c->owns_window = false;
 	c->app_hwnd = nullptr;
-	c->canvas = {};
 	c->hardware_display_3d = true;
 	c->last_3d_mode_index = 1;
 
@@ -3491,7 +3486,7 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 
 	// Resolve the `twod` source + a window-sized weave snapshot scratch.
 	ID3D11ShaderResourceView *twod_srv = nullptr;
-	if (zones_frame || have_local_2d) {
+	if (zones_frame || have_local_2d || have_explicit) {
 		// #439 Phase 3: flatten the Local2D layers into a runtime-owned RT
 		// scratch. The flatten write, the weave snapshot, and the lerp all
 		// operate on plain UNORM bytes (sRGB-passthrough), so both scratches
@@ -3514,9 +3509,8 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		}
 		twod_srv = c->local2d_scratch_srv;
 	} else {
-		// An explicit submitted mask with no Local2D layers has no 2D pixel
-		// source (the 2D region is expressed via Local2D layers / zones now).
-		// Nothing to composite — leave the weave untouched.
+		// Unreachable: the early-out gate already returns false unless one of
+		// zones_frame / have_local_2d / have_explicit is set. Defensive only.
 		return false;
 	}
 
@@ -3918,8 +3912,7 @@ comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc,
 
 	// Shared-texture (texture-app) sessions carry the app's window in
 	// app_hwnd (c->hwnd stays null — no swapchain on it). Their metrics
-	// come from that window, then u_canvas_apply_to_metrics below rewrites
-	// them to the canvas sub-rect — the documented model (swapchain-model.md:
+	// come from that window — the documented model (swapchain-model.md:
 	// view dims + Kooima projection use canvas size, not display size).
 	// Without this, texture sessions had NO window metrics at all and the
 	// runtime-side Kooima (rig path, raw channel, legacy-2D fovs) ran
@@ -4005,14 +3998,6 @@ comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc,
 	out_metrics->window_center_offset_y_m = offset_y_m;
 
 	out_metrics->valid = true;
-
-	// #439 Phase 2: the effective canvas, not c->canvas — while a zone mask
-	// is active this is the window rect, so the apply is a no-op by
-	// construction and the Kooima/adaptive-FOV metrics follow the
-	// window-spanning weave region. (Unlocked read, same as the rest of this
-	// function — the pointer check in d3d11_effective_canvas is benign.)
-	const struct u_canvas_rect eff_canvas = d3d11_effective_canvas(c);
-	u_canvas_apply_to_metrics(out_metrics, &eff_canvas);
 
 	return true;
 }

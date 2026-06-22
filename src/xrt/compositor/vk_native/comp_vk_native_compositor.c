@@ -215,9 +215,6 @@ struct comp_vk_native_compositor
 	VkDeviceMemory dp_input_memory;
 	uint32_t dp_input_width, dp_input_height;
 
-	//! Canvas output rect for shared-texture apps.
-	struct u_canvas_rect canvas;
-
 
 	//! Alpha-blend pipeline for window-space (HUD) layers rendered per-tile
 	//! INTO the atlas pre-weave (matches d3d11/d3d12/metal/gl). Lazy-init
@@ -2321,13 +2318,9 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 					uint32_t new_vh = mode->view_height_pixels;
 					uint32_t new_aw = mode->atlas_width_pixels;
 					uint32_t new_ah = mode->atlas_height_pixels;
-					if (c->canvas.valid) {
-						u_tiling_compute_canvas_view(mode, c->canvas.w, c->canvas.h,
-						                             &new_vw, &new_vh);
-					}
 #if defined(XRT_OS_WINDOWS) || defined(__APPLE__)
-					else if (!c->owns_window && c->settings.preferred.width > 0 &&
-					         c->settings.preferred.height > 0) {
+					if (!c->owns_window && c->settings.preferred.width > 0 &&
+					    c->settings.preferred.height > 0) {
 						// Handle app: window may be smaller than the display,
 						// so scale view dims to the actual window client area
 						// (matches the D3D11/D3D12 path) — keeps the atlas
@@ -2581,13 +2574,8 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &shared_fb);
 			}
 
-			// DP target: use canvas dims for texture apps
 			uint32_t dp_target_w = tgt_width;
 			uint32_t dp_target_h = tgt_height;
-			if (c->canvas.valid && c->canvas.w > 0 && c->canvas.h > 0) {
-				dp_target_w = c->canvas.w;
-				dp_target_h = c->canvas.h;
-			}
 
 			// #491 part 3 — flatten this frame's 2D-under layers PRE-weave (into
 			// backdrop_scratch) and hand them to the DP so it composites
@@ -2634,10 +2622,10 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			    (VkImage_XDP)c->shared_image,
 			    dp_target_w, dp_target_h,
 			    (VkFormat_XDP)view_format,
-			    c->canvas.valid ? c->canvas.x : 0,
-			    c->canvas.valid ? c->canvas.y : 0,
-			    c->canvas.valid ? c->canvas.w : 0,
-			    c->canvas.valid ? c->canvas.h : 0);
+			    0,
+			    0,
+			    0,
+			    0);
 
 			if (dp_self_submits) {
 				// DP owns its own submit — nothing left for us to do this
@@ -2897,10 +2885,10 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				    (VkImage_XDP)(uintptr_t)target_image,
 				    tgt_width, tgt_height,
 				    (VkFormat_XDP)comp_vk_native_target_get_format(c->target),
-				    c->canvas.valid ? c->canvas.x : 0,
-				    c->canvas.valid ? c->canvas.y : 0,
-				    c->canvas.valid ? c->canvas.w : 0,
-				    c->canvas.valid ? c->canvas.h : 0);
+				    0,
+				    0,
+				    0,
+				    0);
 
 				if (dp_self_submits) {
 					// DP owned the post-weave submit. The vendor weave's
@@ -3745,7 +3733,6 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	out_metrics->window_center_offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
 
 	out_metrics->valid = true;
-	u_canvas_apply_to_metrics(out_metrics, &c->canvas);
 	return true;
 #elif defined(XRT_OS_MACOS)
 	// Compute compositor-side from the live NSView — own window (hosted) or
@@ -3827,7 +3814,6 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	out_metrics->window_center_offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
 
 	out_metrics->valid = true;
-	u_canvas_apply_to_metrics(out_metrics, &c->canvas);
 	return true;
 #else
 	// Android: report the LIVE (orientation-aware) target surface extent in
@@ -3855,7 +3841,6 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	out_metrics->window_orientation = (struct xrt_quat){0, 0, 0, 1};
 	// Meters left 0 (see above) — the caller derives them from xsysc->info.
 	out_metrics->valid = true;
-	u_canvas_apply_to_metrics(out_metrics, &c->canvas);
 	return true;
 #endif
 }
@@ -4137,7 +4122,7 @@ vk_effective_canvas(struct comp_vk_native_compositor *c)
 	// definition (each zone rect is its own canvas; the output rect is
 	// inert) — same supersede geometry as the mask/Local2D rules.
 	if (!c->zones_frame && c->active_zone_mask == NULL && !c->local_2d_last_frame) {
-		return c->canvas;
+		return (struct u_canvas_rect){0};
 	}
 	struct u_canvas_rect win = {0};
 #ifdef XRT_OS_WINDOWS

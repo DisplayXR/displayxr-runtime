@@ -376,10 +376,6 @@ struct comp_gl_compositor
 	uint32_t last_3d_mode_index;       //!< Last 3D mode index (for V-key toggle restore)
 	bool legacy_app_tile_scaling;      //!< True if app is legacy (gates 1/2/3 key mode selection)
 
-	//! Canvas output rect for shared-texture apps.
-	struct u_canvas_rect canvas;
-
-
 	// --- #439 Phase 3 — Local2D / zone-mask consumer (full net-new GL leg) ---
 	//! Active authored zone mask (XR_EXT_local_3d_zone). Set by zone_mask_submit
 	//! (sticky, last-submit-wins), cleared on that mask's destroy. NOT owned.
@@ -1751,10 +1747,8 @@ gl_crop_and_process_dp(struct comp_gl_compositor *c,
 		dp_tex = c->dp_input_texture;
 	}
 
-	// Pass (possibly cropped) texture to DP.
-	// XR_EXT_display_zones: in a zones frame the output rect is inert —
-	// pass no canvas (0s) so the DP weaves the full client window.
-	const bool use_canvas = c->canvas.valid && !c->zones_frame;
+	// Pass (possibly cropped) texture to DP. Canvas params are always 0 — the
+	// DP weaves the full client window (sub-rects are expressed as 3D zones now).
 	glViewport(0, 0, output_w, output_h);
 	xrt_display_processor_gl_process_atlas(
 	    c->display_processor,
@@ -1766,10 +1760,10 @@ gl_crop_and_process_dp(struct comp_gl_compositor *c,
 	    GL_RGBA8,
 	    output_w,
 	    output_h,
-	    use_canvas ? c->canvas.x : 0,
-	    use_canvas ? c->canvas.y : 0,
-	    use_canvas ? c->canvas.w : 0,
-	    use_canvas ? c->canvas.h : 0);
+	    0,
+	    0,
+	    0,
+	    0);
 }
 
 #ifdef XRT_OS_WINDOWS
@@ -2318,15 +2312,12 @@ gl_dp_weave_to_fbo(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint target
 		dp_tex = c->dp_input_texture;
 	}
 
-	// XR_EXT_display_zones: in a zones frame the output rect is inert —
-	// pass no canvas (0s) so the DP weaves the full client window.
-	const bool use_canvas = c->canvas.valid && !c->zones_frame;
+	// Canvas params are always 0 — the DP weaves the full client window.
 	glBindFramebuffer(GL_FRAMEBUFFER, target_fbo);
 	glViewport(0, 0, output_w, output_h);
 	xrt_display_processor_gl_process_atlas(c->display_processor, dp_tex, eff_tile_w, eff_tile_h,
 	                                       eff_cols, eff_rows, GL_RGBA8, output_w, output_h,
-	                                       use_canvas ? c->canvas.x : 0, use_canvas ? c->canvas.y : 0,
-	                                       use_canvas ? c->canvas.w : 0, use_canvas ? c->canvas.h : 0);
+	                                       0, 0, 0, 0);
 }
 
 // #439 Phase 3 — the post-weave masked composite. Runs INSTEAD of the plain
@@ -2887,15 +2878,8 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			if (!c->legacy_app_tile_scaling && mode->view_width_pixels > 0) {
 				c->view_width = mode->view_width_pixels;
 				c->view_height = mode->view_height_pixels;
-				// XR_EXT_display_zones: a zones frame spans the full
-				// client window (the output rect is inert) — view dims
-				// follow the window branch below.
-				if (c->canvas.valid && !c->zones_frame) {
-					u_tiling_compute_canvas_view(mode, c->canvas.w, c->canvas.h,
-					                             &c->view_width, &c->view_height);
-				}
 #if defined(XRT_OS_WINDOWS) || defined(__APPLE__)
-				else if (!c->owns_window || c->zones_frame) {
+				if (!c->owns_window || c->zones_frame) {
 					// Handle app: window may be smaller than the display,
 					// so scale view dims to the actual window client area
 					// (matches the D3D11/D3D12 path) — keeps the atlas content
@@ -3307,10 +3291,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			// otherwise.
 			uint32_t dp_w = c->shared_width;
 			uint32_t dp_h = c->shared_height;
-			if (c->canvas.valid && !c->zones_frame && c->canvas.w > 0 && c->canvas.h > 0) {
-				dp_w = c->canvas.w;
-				dp_h = c->canvas.h;
-			} else if (c->zones_frame) {
+			if (c->zones_frame) {
 				// XR_EXT_display_zones: the zone PLACEMENT (layer_commit)
 				// scales zone rects into the atlas tile by tile/window, so
 				// the weave OUTPUT must be the window client dims too — NOT
@@ -3393,10 +3374,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			// otherwise.
 			uint32_t dp_w = c->iosurface_width;
 			uint32_t dp_h = c->iosurface_height;
-			if (c->canvas.valid && !c->zones_frame && c->canvas.w > 0 && c->canvas.h > 0) {
-				dp_w = c->canvas.w;
-				dp_h = c->canvas.h;
-			} else if (c->zones_frame) {
+			if (c->zones_frame) {
 				// XR_EXT_display_zones: the zone PLACEMENT (layer_commit)
 				// scales zone rects into the atlas tile by tile/window, so
 				// the weave OUTPUT must be the window client dims too — NOT
@@ -4363,11 +4341,6 @@ comp_gl_compositor_get_window_metrics(struct xrt_compositor *xc,
 	out_metrics->window_center_offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
 
 	out_metrics->valid = true;
-	// XR_EXT_display_zones: a zones frame supersedes the canvas (the output
-	// rect is inert) — the metrics already describe the window.
-	if (!c->zones_frame) {
-		u_canvas_apply_to_metrics(out_metrics, &c->canvas);
-	}
 	return true;
 #elif defined(__APPLE__)
 	if (!c->sys_info_set || c->macos_window == NULL) {
@@ -4423,11 +4396,6 @@ comp_gl_compositor_get_window_metrics(struct xrt_compositor *xc,
 	out_metrics->window_center_offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
 
 	out_metrics->valid = true;
-	// XR_EXT_display_zones: a zones frame supersedes the canvas (the output
-	// rect is inert) — the metrics already describe the window.
-	if (!c->zones_frame) {
-		u_canvas_apply_to_metrics(out_metrics, &c->canvas);
-	}
 	return true;
 #else
 	(void)c;

@@ -43,17 +43,17 @@ struct u_canvas_rect
 };
 
 /*!
- * Apply canvas output rect to window metrics.
+ * Reframe window metrics to a sub-rect canvas.
  *
- * When a shared-texture app has set an output rect, the "window" fields in
- * xrt_window_metrics should reflect the canvas (output rect), not the full
- * window client area. This ensures Kooima FOV uses the correct aspect ratio.
+ * Overrides the "window" fields in xrt_window_metrics with the canvas sub-rect
+ * so Kooima FOV/aspect are computed for that rect, not the full client area.
+ * No-op if canvas->valid is false.
  *
- * Call this after populating raw window metrics from the OS, before returning
- * from get_window_metrics(). No-op if canvas->valid is false.
+ * Used by the display-zones locate path (oxr_session / ipc_server_handler) to
+ * frame each 3D zone's off-axis projection to the zone's window-px rect.
  *
  * @param metrics   Window metrics to adjust in-place.
- * @param canvas    Canvas sub-rect (window/zone-derived).
+ * @param canvas    Sub-rect to reframe to (e.g. a zone rect).
  */
 static inline void
 u_canvas_apply_to_metrics(struct xrt_window_metrics *metrics,

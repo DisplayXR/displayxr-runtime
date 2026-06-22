@@ -175,9 +175,6 @@ struct comp_d3d12_compositor
 	float legacy_view_scale_x;
 	float legacy_view_scale_y;
 
-	//! Canvas output rect for shared-texture apps.
-	struct u_canvas_rect canvas;
-
 	//! Lazily allocated intermediate resource for cropping atlas to content dims.
 	ID3D12Resource *dp_input_resource;
 
@@ -349,7 +346,8 @@ static void d3d12_sync_zone_mask_to_dp(struct comp_d3d12_compositor *c);
 // #439 Phase 2: an active zone mask supersedes the canvas output rect —
 // the weave region, view dims, Kooima metrics, and composite region all
 // become the client-window rect (top-left anchored per #464). With no mask
-// this returns c->canvas verbatim, so the no-mask path is unchanged.
+// this returns an invalid rect, so readers fall back to full-window/target
+// dims, leaving the no-mask path unchanged.
 // Returning a *valid* window rect (not just "invalid") matters on the
 // shared-texture path: the texture is display-sized worst-case, so an
 // invalid canvas there would fall back to display dims — the window rect
@@ -364,7 +362,7 @@ d3d12_effective_canvas(struct comp_d3d12_compositor *c)
 	// definition (each zone rect is its own canvas; the output rect is
 	// inert) — same supersede geometry as the mask/Local2D rules.
 	if (!c->zones_frame && c->active_zone_mask == nullptr && !c->local_2d_last_frame) {
-		return c->canvas;
+		return {};
 	}
 	struct u_canvas_rect win = {};
 	HWND wnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
@@ -1435,8 +1433,8 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 	// #439 Phase 2: the one canvas authority for this frame. While a zone
 	// mask is active (or Local2D layers are present) this is the client-window
-	// rect (it supersedes the output rect); otherwise it is c->canvas
-	// unchanged. Computed once under c->mutex (held for this whole function)
+	// rect (it supersedes the output rect); otherwise it is an invalid rect
+	// (readers fall back to full-window/target dims). Computed once under c->mutex (held for this whole function)
 	// so the weave region, view dims, and composite all see the same rect even
 	// if submit/destroy race the frame.
 	const struct u_canvas_rect eff_canvas = d3d12_effective_canvas(c);
@@ -2645,8 +2643,7 @@ comp_d3d12_compositor_get_window_metrics(struct xrt_compositor *xc,
 		memset(out_metrics, 0, sizeof(*out_metrics));
 
 		// Shared-texture (texture-app) sessions carry the app's window in
-		// app_hwnd (c->hwnd stays null); u_canvas_apply_to_metrics below
-		// rewrites the result to the canvas sub-rect.
+		// app_hwnd (c->hwnd stays null); their metrics come from that window.
 		HWND metrics_hwnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
 		if (c->display_processor == nullptr || metrics_hwnd == nullptr) {
 			return false;
@@ -2716,14 +2713,6 @@ comp_d3d12_compositor_get_window_metrics(struct xrt_compositor *xc,
 
 		out_metrics->valid = true;
 	}
-
-	// #439 Phase 2: the active zone mask supersedes the canvas — the
-	// Kooima/adaptive-FOV metrics follow the same authority as the
-	// weave region. (This path doesn't take c->mutex; the canvas/mask
-	// fields are pointer-sized reads updated under the lock in another
-	// function — the pointer check in d3d12_effective_canvas is benign.)
-	const struct u_canvas_rect eff_canvas = d3d12_effective_canvas(c);
-	u_canvas_apply_to_metrics(out_metrics, &eff_canvas);
 
 	return true;
 }
