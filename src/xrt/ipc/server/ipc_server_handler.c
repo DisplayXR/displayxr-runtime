@@ -4463,6 +4463,24 @@ ipc_handle_workspace_get_client_info(volatile struct ipc_client_state *_ics,
 			}
 		}
 	}
+#elif defined(XRT_OS_MACOS)
+	// macOS shared surface: like the D3D11 path above, report session_visible
+	// from the WORKSPACE minimize state, not the xrSession lifecycle flag. A
+	// freshly-connected OOP client sits in a non-VISIBLE session state until the
+	// compositor promotes it, so its raw session_visible is false even while it
+	// renders on the shared surface. That made the controller's focus
+	// eligibility (isVisible) reject it, so TAB / cold-start auto-focus never
+	// seeded — the user had to click a window first (the click path bypasses the
+	// visibility gate). Report visible = !hidden so a connected, non-minimized
+	// window is focusable; a minimized one (set_window_visibility) still reports
+	// false and TAB skips it. (#59/#61)
+	{
+		struct xrt_compositor *target_xc = NULL;
+		if (ipc_server_get_client_xc(s, client_id, &target_xc) == XRT_SUCCESS &&
+		    target_xc != NULL) {
+			out_state->session_visible = !comp_multi_workspace_is_window_hidden(target_xc);
+		}
+	}
 #endif
 
 	return XRT_SUCCESS;
