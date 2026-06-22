@@ -28,7 +28,7 @@ app itself, which is the same regardless of where it lives.
 Resolve these; if any is missing or ambiguous, **ask the user** (AskUserQuestion) before scaffolding:
 - **name** — snake_case app stem (e.g. `photo_viewer`). The exe/target/manifest derive from it.
 - **class** — `handle` (owns its window; the default and simplest) | `texture` (weaved 3D in a
-  canvas sub-rect + optional 2D surround) | `hosted` (runtime creates the window).
+  regions expressed via `XR_EXT_display_zones`; the shared texture receives the runtime's zones composite) | `hosted` (runtime creates the window).
 - **api** — `d3d11` | `d3d12` | `gl` | `vk` | `metal`.
 - **platform** — `win` | `macos`.
 - **location** — default `test_apps/<name>_<class>_<api>_<platform>/` (in-tree). Ask if the user

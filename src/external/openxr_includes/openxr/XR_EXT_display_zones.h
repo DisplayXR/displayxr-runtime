@@ -26,10 +26,10 @@
  *
  * A frame is a ZONES FRAME iff >= 1 projection layer carries an
  * XrDisplayZoneEXT chain. In a zones frame every projection layer must carry
- * one (all-or-none, else XR_ERROR_VALIDATION_FAILURE); the canvas output rect
- * (xrSetSharedTextureOutputRectEXT), the sticky xrSubmitLocal3DZoneEXT mask,
- * and the implicit-mask-from-Local2D rule are all inert (ignored, not an
- * error). Zero-zone frames behave per XR_EXT_local_3d_zone v3 verbatim —
+ * one (all-or-none, else XR_ERROR_VALIDATION_FAILURE); the former output-rect
+ * path, the sticky xrSubmitLocal3DZoneEXT mask, and the implicit-mask-from-
+ * Local2D rule are all inert (ignored, not an error). Zero-zone frames behave
+ * per XR_EXT_local_3d_zone v3 verbatim —
  * back-compat is structural, nothing is deprecated.
  *
  * Requires XR_EXT_local_3d_zone (>= v4) + XR_EXT_view_rig (>= v2).

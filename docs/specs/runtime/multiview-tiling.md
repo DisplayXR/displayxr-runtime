@@ -42,7 +42,7 @@ Five spatial concepts matter for view sizing:
 | Class | Canvas definition |
 |-------|------------------|
 | `_handle` (handle) | Canvas = window client area. The app provides a window via `XR_EXT_*_window_binding`; the entire client area is 3D content. |
-| `_texture` (texture) | Canvas = output rect — the sub-rect where the app places the shared texture in its window. May be a fraction of the window. |
+| `_texture` (texture) | Canvas = window client area (full), or one 3D zone via `XR_EXT_display_zones`. The legacy output-rect setter that confined the canvas to a sub-rect was removed (ADR-031). |
 | `_hosted` (hosted) | Canvas = window. The runtime owns the window, so the full window is 3D content. |
 
 For `_handle` and `_hosted` apps, canvas and window dimensions typically match (or are trivially derived). For `_texture` apps, the canvas can be arbitrarily smaller than both the window and the display — this is the case that requires special handling.

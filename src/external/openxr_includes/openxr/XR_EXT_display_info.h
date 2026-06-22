@@ -329,7 +329,7 @@ typedef struct XrEventDataHardwareDisplayStateChangedEXT {
     XrBool32                    hardwareDisplay3D;
 } XrEventDataHardwareDisplayStateChangedEXT;
 
-// xrSetSharedTextureOutputRectEXT moved to XR_EXT_win32_window_binding.h / XR_EXT_cocoa_window_binding.h (v12)
+// xrSetSharedTextureOutputRectEXT was removed (ADR-031); display-zones (XR_EXT_display_zones) is the sole region paradigm
 
 // ---- v14: Per-Mode Tracking Capability + Tracking-State Event (#441) ----
 

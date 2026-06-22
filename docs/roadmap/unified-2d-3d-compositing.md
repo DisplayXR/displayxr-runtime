@@ -3,7 +3,9 @@
 **Status:** design draft (June 2026). Pre-implementation.
 **Scope:** the in-process native compositors (D3D11/D3D12/GL/VK on Windows first; Metal/macOS tracks behind). Collapses the `handle` / `texture` app classes into one pipeline with orthogonal options, generalizes the rectangular 2D-surround into an arbitrary alpha mask, and unifies that mask with the hardware-zone mask of [#224 local-3d-zones](local-3d-zones.md).
 **Audience:** DisplayXR runtime contributors; extension authors; engine-plugin and demo owners (the D3D12 + VK consumers — see §8).
-**Supersedes (conceptually):** the app-class taxonomy in [app-classes.md](../getting-started/app-classes.md) and the rect-only model of [surround-2d-rollout.md](surround-2d-rollout.md), without breaking either.
+**Supersedes (conceptually):** the app-class taxonomy in [app-classes.md](../getting-started/app-classes.md) and the former rect-only 2D-surround model, without breaking either.
+
+> **SUPERSEDED (ADR-031).** The 2D-surround path this doc describes as co-existing with the unified mask was **removed** ([ADR-031](../adr/), issue #634); [display-zones](../adr/ADR-027-display-zones.md) (`XR_EXT_display_zones`) is now the canonical and sole region paradigm. This document is retained as the design rationale for the unified mask / Local2D model that display-zones builds on — read it for the *why*, not as a current spec of the surround mechanism. Migration history: [surround-zones-deprecation.md](surround-zones-deprecation.md).
 
 ---
 
@@ -25,7 +27,7 @@ and the "classes" are two **orthogonal options** bolted onto it:
 | **2D region = rect complement** | — | `texture` + surround (today) | — |
 | **2D region = arbitrary alpha mask** | *the goal* | *the goal* | *the goal* |
 
-The unification: collapse `class` into **{who presents} × {2D/3D region}**, and generalize the region from "nothing / a rectangle" to "an arbitrary premultiplied-alpha mask." The existing rectangular 2D-surround (`d3d11_blit_surround_strips`, [surround-2d-rollout.md](surround-2d-rollout.md)) is **literally the rectangular special case** of the general operation.
+The unification: collapse `class` into **{who presents} × {2D/3D region}**, and generalize the region from "nothing / a rectangle" to "an arbitrary premultiplied-alpha mask." The former rectangular 2D-surround (`d3d11_blit_surround_strips`, since removed per [ADR-031](../adr/)) was **literally the rectangular special case** of the general operation.
 
 ### 1.1 The two axes are independent — keep them that way
 
@@ -192,7 +194,7 @@ Replace the shared-texture surround side-channel with the app submitting a **pos
 
 D3D11 is Phases 0–2's pathfinder (most complete; cheapest to iterate). **D3D12, VK, and GL on Windows must follow shortly after — they are not afterthoughts:**
 
-- **D3D12 — all engine plugins.** Unity/Unreal integrations render through the D3D12 native compositor. The mask composite must reach D3D12 (fence-synced, mirroring the surround D3D12 fence path already shipping per [surround-2d-rollout.md](surround-2d-rollout.md)) for any engine-plugin app to use local 2D/3D.
+- **D3D12 — all engine plugins.** Unity/Unreal integrations render through the D3D12 native compositor. The mask composite must reach D3D12 (fence-synced, mirroring the former surround D3D12 fence path) for any engine-plugin app to use local 2D/3D.
 - **VK — all demos.** Every DisplayXR demo (`displayxr-demo-*`, the Gaussian-splat / media-player line) is Vulkan. The mask composite on `vk_native` gates the demos adopting the feature.
 - **GL — Windows parity.** Round out the Windows matrix.
 
@@ -215,7 +217,7 @@ Per-API sync primitive for the shared 2D source (when app-presented): D3D11 keye
 ## 10. Cross-references
 
 - [local-3d-zones.md](local-3d-zones.md) — the hardware-consumer leg of the shared mask; `XR_EXT_local_3d_zone` authoring API (#224).
-- [surround-2d-rollout.md](surround-2d-rollout.md) — the rectangular special case this generalizes; per-API sync-primitive precedent (#225-adjacent).
+- [surround-zones-deprecation.md](surround-zones-deprecation.md) — the now-removed rectangular 2D-surround this generalized (ADR-031, #634); retains the per-API sync-primitive precedent and migration history.
 - [app-classes.md](../getting-started/app-classes.md) — the taxonomy this reframes as present-ownership × region.
 - `comp_d3d11_compositor.cpp` — weave-target-as-parameter: offscreen shared-texture path (`:1521`), windowed path (`:1581`), rect surround (`d3d11_blit_surround_strips`), DP-crop (#431, `903cfffa5`).
 - `comp_d3d11_renderer.cpp:466–473` — the `dst.a` / compose-under-bg "over" rule the §4.2 output-alpha rule must honor (#225).
