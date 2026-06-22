@@ -25,49 +25,21 @@ extern "C" {
 /*!
  * Canvas output rect — the sub-rect of the app's window where 3D content appears.
  *
- * For _ext apps: canvas = window client area (no output_rect needed).
+ * For _ext apps: canvas = window client area.
  * For _shared apps: canvas = wherever the app places the shared texture.
  * For _rt apps: canvas = window (runtime-owned).
  *
- * Set via xrSetSharedTextureOutputRectEXT (part of XR_EXT_win32_window_binding
- * and XR_EXT_cocoa_window_binding).
+ * Derived from the window/zone geometry. (The legacy app-facing setter
+ * xrSetSharedTextureOutputRectEXT was removed in ADR-031 — a sub-rect is now
+ * expressed as one 3D zone via XR_EXT_display_zones.)
  */
 struct u_canvas_rect
 {
-	bool valid;     //!< True if output rect has been set
+	bool valid;     //!< True if a sub-rect canvas is set (else full window)
 	int32_t x;      //!< Left edge in window client-area pixels
 	int32_t y;      //!< Top edge in window client-area pixels
 	uint32_t w;     //!< Canvas width in pixels
 	uint32_t h;     //!< Canvas height in pixels
-};
-
-/*!
- * 2D surround shared texture — full-window mono buffer whose pixels OUTSIDE
- * the canvas sub-rect are blitted into the target swapchain each frame.
- *
- * Set via xrSetSharedTextureSurround2DEXT (spec v6 addition to
- * XR_EXT_win32_window_binding / XR_EXT_cocoa_window_binding). Pairs with
- * struct u_canvas_rect — the canvas is "where 3D goes," the surround is
- * "what fills the rest." See docs/specs/extensions/XR_EXT_win32_window_binding.md §3.6.
- *
- * The handle is a D3D11/D3D12 NT HANDLE on Windows, an IOSurfaceRef cast
- * to void* on macOS. The compositor opens it on registration and releases
- * on clear / replace / session teardown. The runtime does a 1:1 blit with
- * scissor-rects around the canvas hole, no scaling.
- *
- * Dimensions contract (#464): the target model is WINDOW-sized — dims equal
- * the HWND/NSView client-area backing dimensions, the fill is clamped to
- * the window rect, and the app re-registers on resize. The Metal compositor
- * implements this; D3D11/D3D12 currently still enforce the legacy
- * worst-case contract (dims == shared-texture dims, display-extent
- * over-fill) pending the #464 retrofit.
- */
-struct u_surround_2d_handle
-{
-	bool valid;             //!< True if a surround texture has been registered
-	void *shared_handle;    //!< NT HANDLE (Win) / IOSurfaceRef (Mac), or NULL
-	uint32_t w;             //!< Texture width in pixels (window rect on Metal; see #464 note)
-	uint32_t h;             //!< Texture height in pixels (window rect on Metal; see #464 note)
 };
 
 /*!
@@ -81,7 +53,7 @@ struct u_surround_2d_handle
  * from get_window_metrics(). No-op if canvas->valid is false.
  *
  * @param metrics   Window metrics to adjust in-place.
- * @param canvas    Canvas output rect (from xrSetSharedTextureOutputRectEXT).
+ * @param canvas    Canvas sub-rect (window/zone-derived).
  */
 static inline void
 u_canvas_apply_to_metrics(struct xrt_window_metrics *metrics,

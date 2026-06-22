@@ -37,9 +37,11 @@ reuses, rather than replaces:
   tiers, verbatim — referenced per-frame from the `xrEndFrame` chain instead
   of the sticky `xrSubmitLocal3DZoneEXT` channel.
 
-The current single-canvas behaviors (`xrSetSharedTextureOutputRectEXT`,
-Local2D + supersede rule, single-canvas view_rig) are the degenerate
-single-zone case and keep working unchanged (§6).
+The single-canvas behaviors (the former `xrSetSharedTextureOutputRectEXT` /
+surround path — now **removed** in favour of zones, ADR-031 — plus the Local2D +
+supersede rule and single-canvas view_rig) are the degenerate single-zone case
+(§6). The Local2D/view_rig legacy frames keep working; the output-rect/surround
+entry points are gone and map onto one 3D zone + Local2D zones.
 
 ## 2. Motivation
 
@@ -187,9 +189,8 @@ A frame is a **zones frame** iff ≥ 1 projection layer carries an
 1. **All-or-none.** Every projection layer in a zones frame must carry a zone
    chain, else `xrEndFrame` returns `XR_ERROR_VALIDATION_FAILURE`. Other layer
    types (quad, Local2D, window-space) are unaffected.
-2. **Legacy state is inert, not an error.** In a zones frame the canvas output
-   rect (`xrSetSharedTextureOutputRectEXT`) is ignored (each zone rect is its
-   canvas), the sticky `xrSubmitLocal3DZoneEXT` mask is ignored, and the
+2. **Legacy state is inert, not an error.** In a zones frame each zone rect is
+   its own canvas, the sticky `xrSubmitLocal3DZoneEXT` mask is ignored, and the
    implicit-mask-from-Local2D-rects rule is off (Local2D layers are pure 2D
    content). This permits frame-by-frame migration.
 3. **Atomicity** (inherited from #439): zone layers + Local2D layers + the
@@ -233,7 +234,7 @@ window→panel mapping is the plugin's job (vendor isolation, ADR-019).
 | Today (legacy frame — no zone chains) | Display-zones equivalent | Old path still works? |
 |---|---|---|
 | `_handle` full-window app + `XrDisplayRigEXT` per-locate | One zone: rect = full client window, same rig; auto wish = full window | Yes — an unchained locate frames the session canvas, verbatim view_rig v2 |
-| `xrSetSharedTextureOutputRectEXT(x,y,w,h)` + surround-2D textures | One zone: rect = (x,y,w,h); surround content as Local2D layers covering the remainder | Yes — legacy frames keep output-rect + surround semantics untouched |
+| Former `xrSetSharedTextureOutputRectEXT(x,y,w,h)` + surround-2D textures (**removed**, ADR-031) | One zone: rect = (x,y,w,h); surround content as Local2D layers covering the remainder | N/A — these entry points are removed; express the region directly as one 3D zone + Local2D zones |
 | Local2D frame: explicit mask + 2D layers, supersede → full window | One full-window zone + the same Local2D layers + the same mask object as `wishMask` | Yes — supersede fires only in legacy frames |
 | Implicit mask = union of Local2D rects (M = 0 inside) | Zone rects state the 3D region directly; auto wish = union of zone rects | Yes (legacy frames); rule off in zones frames |
 | `xrSubmitLocal3DZoneEXT` sticky mask | Per-frame `wishMask` in the frame-end chain | Yes — sticky path live in legacy frames; inert in zones frames |

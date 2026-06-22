@@ -3,7 +3,7 @@
 | Property | Value |
 |----------|-------|
 | Extension Name | `XR_EXT_win32_window_binding` |
-| Spec Version | 6 |
+| Spec Version | 8 |
 | Type Values | `XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT` (1000999001), `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT` (1000999002) |
 | Author | Leia Inc. |
 | Platform | Windows (Win32). Linux/Android reserved for future use. |
@@ -103,7 +103,7 @@ This is why the extension requires the actual **window handle** (HWND), not just
 
 - The display processor needs to query the window's screen-space position each frame to compute the correct interlacing origin
 - Some advanced vendor display processors go further: they hook `WM_WINDOWPOSCHANGING` on the HWND to **snap** window drag positions to phase-aligned coordinates, preventing crosstalk jitter during drag. This is an optional vendor optimization — without it, 3D quality degrades during drag but is correct at rest. (For one vendor's implementation, see [Leia window phase snapping](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/docs/window-phase-snapping.md).)
-- For `_texture` apps where the 3D canvas is a sub-rect of the window (e.g., a 3D viewport surrounded by 2D UI), the canvas offset and size from `xrSetSharedTextureOutputRectEXT` flow through the compositor to the display processor's `process_atlas()` call as `canvas_offset_x/y` and `canvas_width/height`, enabling correct phase alignment without any hidden windows. The app's real HWND is passed directly to the display processor at init time.
+- For `_texture` apps where the 3D canvas is a sub-rect of the window (e.g., a 3D viewport surrounded by 2D UI), the canvas offset and size of each 3D zone (declared via [`XR_EXT_display_zones`](XR_EXT_display_zones.md)) flow through the compositor to the display processor's `process_atlas()` call as `canvas_offset_x/y` and `canvas_width/height`, enabling correct phase alignment without any hidden windows. The app's real HWND is passed directly to the display processor at init time.
 
 A texture handle or screen coordinate alone would not allow the display processor to track position changes or hook window messages.
 
@@ -123,7 +123,7 @@ The two concepts are inseparable: window-space layers only make sense when there
 
 ```c
 #define XR_EXT_win32_window_binding                          1
-#define XR_EXT_win32_window_binding_SPEC_VERSION             5
+#define XR_EXT_win32_window_binding_SPEC_VERSION             8
 #define XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME           "XR_EXT_win32_window_binding"
 #define XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT         ((XrStructureType)1000999001)
 #define XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT     ((XrStructureType)1000999002)
@@ -137,7 +137,8 @@ The two concepts are inseparable: window-space layers only make sense when there
 | 4 | `transparentBackgroundEnabled` — runtime configures DComp / DXGI for per-pixel desktop transparency. |
 | 5 | `chromaKeyColor` — optional app-supplied chroma-key override. `0` = runtime DP picks its own default. |
 | 6 | `xrSetSharedTextureSurround2DEXT` — register a full-window 2D shared texture for the non-canvas region. Enables apps with a fixed 3D zone (sub-rect canvas) to deliver full-resolution 2D content for the surrounding area. See [§3.6](#36-xrsetsharedtexturesurround2dext). |
-| 7 | `xrSetSharedTextureSurround2DFenceEXT` — D3D12 variant of §3.6 that uses `ID3D12Fence` for producer→consumer sync. D3D12-native shared resources do not reliably expose `IDXGIKeyedMutex`, so the spec-v6 API does not work for D3D12 apps. See [§3.7](#37-xrsetsharedtexturesurround2dfenceext). |
+| 7 | `xrSetSharedTextureSurround2DFenceEXT` — D3D12 variant of §3.6 that uses `ID3D12Fence` for producer→consumer sync. D3D12-native shared resources do not reliably expose `IDXGIKeyedMutex`, so the spec-v6 API does not work for D3D12 apps. *(Removed in v8.)* |
+| 8 | Removed `xrSetSharedTextureOutputRectEXT` + `xrSetSharedTextureSurround2DEXT` + `xrSetSharedTextureSurround2DFenceEXT` — superseded by [`XR_EXT_display_zones`](XR_EXT_display_zones.md) (ADR-031). See [`docs/roadmap/surround-zones-deprecation.md`](../../roadmap/surround-zones-deprecation.md). |
 
 ### 3.2 XrWin32WindowBindingCreateInfoEXT
 
@@ -174,12 +175,12 @@ typedef struct XrWin32WindowBindingCreateInfoEXT {
 | Mode | `windowHandle` | `sharedTextureHandle` | App class | Behavior |
 |------|:-:|:-:|---|---|
 | **Handle** | HWND | NULL | `_handle` | Runtime renders directly into the app's window |
-| **Texture** | HWND | HANDLE | `_texture` | Runtime composites into the shared texture at the canvas sub-rect declared via `xrSetSharedTextureOutputRectEXT` (see [§3.5](#35-xrsetsharedtextureoutputrectext) for the read-back contract). The HWND is still required — the display processor needs it for screen-space position tracking and phase alignment. The app blits the shared texture's canvas sub-rect into its window. |
+| **Texture** | HWND | HANDLE | `_texture` | Runtime composites the multi-zone result (3D zones + Local2D zones, declared via [`XR_EXT_display_zones`](XR_EXT_display_zones.md)) into the shared texture. The HWND is still required — the display processor needs it for screen-space position tracking and phase alignment. The app blits the shared texture into its window. |
 | **Offscreen** | NULL | NULL | — | `readbackCallback` receives composited pixels. No window, no phase alignment. |
 
-> **Important for `_texture` apps:** You **must** provide a valid `windowHandle` even though the runtime renders into the shared texture, not the window. Without the HWND, the display processor cannot compute correct interlacing alignment (see [§2.4](#24-the-phase-alignment-problem)). Additionally, call `xrSetSharedTextureOutputRectEXT` (see [§3.5](#35-xrsetsharedtextureoutputrectext)) to tell the runtime where within the window the 3D canvas appears.
+> **Important for `_texture` apps:** You **must** provide a valid `windowHandle` even though the runtime renders into the shared texture, not the window. Without the HWND, the display processor cannot compute correct interlacing alignment (see [§2.4](#24-the-phase-alignment-problem)).
 >
-> **Filling the area around the canvas:** Pixels of the target swapchain *outside* the canvas sub-rect are undefined by default — the runtime only writes the canvas region. To fill the surrounding window area with full-resolution 2D content (UI, toolbars, chrome), register a second shared texture via `xrSetSharedTextureSurround2DEXT` (see [§3.6](#36-xrsetsharedtexturesurround2dext)). This is the canonical path for apps on displays with a fixed hardware 3D zone, where the canvas is constrained to a specific sub-rect and the rest of the window needs ordinary 2D pixels.
+> **Expressing 2D/3D regions:** Where the 3D canvas appears within the window — and any 2D regions around it — is declared via [`XR_EXT_display_zones`](XR_EXT_display_zones.md): one `XrDisplayZoneEXT` per 3D region and one `XrCompositionLayerLocal2DEXT` per 2D region. The runtime composites all zones into the shared texture and the app presents the full composite. (The legacy `xrSetSharedTextureOutputRectEXT` / surround entry points were removed in spec v8 — see [§3.5](#35-region-expression--removed-in-v8-use-xr_ext_display_zones).)
 
 **Fallback when absent:**
 
@@ -332,322 +333,27 @@ struct xrt_layer_window_space_data
 
 **`xrt_comp_layer_window_space()`** — Inline helper (`src/xrt/include/xrt/xrt_compositor.h:1865`) that dispatches a window-space layer through the compositor's vtable.
 
-> ## ⚠️ DEPRECATED — §3.5–3.7 (output rect + 2D surround)
+### 3.5 Region expression — REMOVED in v8 (use `XR_EXT_display_zones`)
+
+> **Removed in spec v8 (ADR-031).** The three shared-texture region entry points —
+> `xrSetSharedTextureOutputRectEXT`, `xrSetSharedTextureSurround2DEXT`, and
+> `xrSetSharedTextureSurround2DFenceEXT` — and the bespoke 2D-surround / output-rect
+> mechanism are **deleted**. [`XR_EXT_display_zones`](XR_EXT_display_zones.md) is now the
+> sole paradigm for expressing 2D/3D regions, including the degenerate single-region cases
+> these calls used to cover:
 >
-> **`xrSetSharedTextureOutputRectEXT` (§3.5), `xrSetSharedTextureSurround2DEXT` (§3.6),
-> and `xrSetSharedTextureSurround2DFenceEXT` (§3.7) are deprecated** in favour of
-> [`XR_EXT_display_zones`](XR_EXT_display_zones.md) (ADR-027). They express a strict
-> special case of the zones model:
+> - the former **output rect** is exactly **one 3D zone** (`XrDisplayZoneEXT`) covering that
+>   sub-rect, and
+> - the former **2D surround** is exactly **one `XrCompositionLayerLocal2DEXT` zone** covering
+>   the complement.
 >
-> - an **output rect** is exactly **one 3D zone** covering that sub-rect, and
-> - a **2D surround** is exactly **one `XrCompositionLayerLocal2DEXT` zone** covering the
->   complement.
->
-> Display-zones is the canonical, more general mechanism (N 3D zones + M 2D zones + a
-> per-pixel wish mask), and a texture app gets identical capability through it (verified:
-> `cube_zones_texture_metal_macos` / `cube_zones_texture_d3d11_win`).
->
-> **Migration:** submit one zone-chained projection layer for the former output rect and a
-> `XrCompositionLayerLocal2DEXT` for the former surround region. See the display-zones spec
-> for the frame recipe.
->
-> **Backward compatibility:** existing surround/output-rect apps keep working unchanged. A
-> runtime **translation shim** (gated `DISPLAYXR_SURROUND_SHIM`, off by default during the
-> transition) internally rewrites the legacy calls into the synthetic zone + Local2D form
-> and routes them through the canonical composite, so the bespoke surround code can be
-> removed once the shim is validated as the sole path. These entry points will be **removed
-> in a future spec version**; new apps must use display-zones. Tracking: deprecation note
-> `docs/roadmap/surround-zones-deprecation.md`.
-
-### 3.5 xrSetSharedTextureOutputRectEXT
-
-For `_texture` apps (shared texture mode), the 3D canvas may be a sub-rect of the app's window — for example, a 3D viewport surrounded by toolbars in a Unity or Unreal editor. The runtime needs this rect to compute correct interlacing alignment (see [§2.4](#24-the-phase-alignment-problem)) and to size views and Kooima projection based on canvas dimensions rather than window size.
-
-```c
-typedef XrResult (XRAPI_PTR *PFN_xrSetSharedTextureOutputRectEXT)(
-    XrSession session, int32_t x, int32_t y, uint32_t width, uint32_t height);
-```
-
-**Parameters:**
-
-| Parameter | Description |
-|-----------|-------------|
-| `session` | The session. Must have been created with a window binding. |
-| `x` | Left edge of the canvas, in HWND client-area pixels. |
-| `y` | Top edge of the canvas, in HWND client-area pixels. |
-| `width` | Canvas width in pixels. |
-| `height` | Canvas height in pixels. |
-
-**Returns:** `XR_SUCCESS` on success.
-
-**Valid Usage:**
-- The session **must** have been created with `XrWin32WindowBindingCreateInfoEXT` (or `XrCocoaWindowBindingCreateInfoEXT` on macOS).
-- Call this whenever the canvas position or size changes (e.g., on window resize, view layout change, or editor panel dock/undock).
-- For static layouts, a single call after session creation is sufficient.
-- When this function is never called, the runtime assumes the full window client area is the canvas.
-
-**Example (Unity editor with toolbar):**
-
-```c
-// Canvas is the 3D viewport, offset below a 40px toolbar
-xrSetSharedTextureOutputRectEXT(session,
-    0,       // x: flush left
-    40,      // y: below toolbar
-    1920,    // width: full window width
-    1040);   // height: window height minus toolbar
-```
-
-**Loaded at runtime via:**
-
-```c
-PFN_xrSetSharedTextureOutputRectEXT pfnSetOutputRect = NULL;
-xrGetInstanceProcAddr(instance, "xrSetSharedTextureOutputRectEXT",
-    (PFN_xrVoidFunction*)&pfnSetOutputRect);
-```
-
-**Read-back contract:**
-
-The runtime writes the composited/weaved output into the shared texture at offset `(x, y)` (HWND client-area pixels, matching the call arguments), sized `width × height`. The rest of the shared texture is undefined.
-
-The app's blit must sample from that same `(x, y, width, height)` sub-rect of the shared texture. Suggested UV math:
-
-```
-uvScale  = (width  / sharedTextureW, height / sharedTextureH)
-uvOffset = (x      / sharedTextureW, y      / sharedTextureH)
-sampled  = texture.Sample(smp, uvOffset + uv * uvScale)
-```
-
-The contract is symmetric: the app sends `(x, y, w, h)`; the runtime writes `(w × h)` at `(x, y)`; the app reads `(w × h)` from `(x, y)`.
-
-This is required because vendor weavers compute lenticular phase from the viewport's screen-space position. Writing at `(x, y)` keeps the on-display pixel position of the weaved output stable regardless of the shared texture's dimensions (which are typically worst-case display-sized and may differ from the HWND client area), and the symmetric read-back reproduces the same HWND coords. Apps that sample from origin will render in the wrong place and exhibit crosstalk on lenticular displays.
-
-### 3.6 xrSetSharedTextureSurround2DEXT
-
-For `_texture` apps whose 3D canvas is a sub-rect of the window — typically constrained by a display with a fixed hardware 3D zone (e.g. a centered viewport on a panel where the surrounding pixels are 2D-native) — this function registers a 2D shared texture whose pixels outside the canvas sub-rect are blitted into the destination the display processor weaves into each frame.
-
-The 3D canvas (set via `xrSetSharedTextureOutputRectEXT`) is still weaved by the display processor and overwrites whatever the surround texture contains in that sub-rect. The surround texture exclusively provides the *non*-canvas pixels.
-
-> **Allocation size vs. content (important — this is what the runtime actually enforces).**
-> The surround texture's **registered dimensions must equal the multiview shared texture's
-> dimensions** (the worst-case-atlas size from [ADR-010](../../adr/ADR-010-shared-app-iosurface-worst-case-sized.md),
-> i.e. `max over modes of (tileColumns·viewScaleX·displayPixelWidth) × (tileRows·viewScaleY·displayPixelHeight)`),
-> **not** the HWND client area. The strip-blit copies via `CopySubresourceRegion` into the
-> shared texture and requires `surround.dims == sharedTexture.dims`; a mismatch is logged once
-> and the blit is **silently skipped** (`comp_d3d11_compositor.cpp` → `d3d11_blit_surround_strips`).
-> Sizing the surround to the worst-case atlas lets it be allocated **once** and survive window
-> resizes without a destroy/recreate cycle.
->
-> The **content** the app writes, however, must be aligned to the HWND client area
-> pixel-for-pixel (1:1, no scaling), occupying the top-left `clientWidth × clientHeight` region
-> of the texture, and must be **redrawn when the HWND resizes**. The app only ever presents that
-> window-sized region (it reads back `clientWidth/sharedWidth × clientHeight/sharedHeight` of the
-> shared texture), so surround pixels beyond the client area are never displayed. The canvas
-> sub-rect (set via `xrSetSharedTextureOutputRectEXT`) is carved out of this region by the
-> strip-blit and owned by the display processor.
-
-```c
-typedef XrResult (XRAPI_PTR *PFN_xrSetSharedTextureSurround2DEXT)(
-    XrSession session,
-    void*     sharedTextureHandle,
-    uint32_t  width,
-    uint32_t  height);
-```
-
-**Parameters:**
-
-| Parameter | Description |
-|-----------|-------------|
-| `session` | The session. Must have been created with `XrWin32WindowBindingCreateInfoEXT`. |
-| `sharedTextureHandle` | Shared D3D11/D3D12 NT `HANDLE` for the 2D surround texture, or `NULL` to clear. |
-| `width` | Texture width in pixels. Must equal the **multiview shared texture** width (worst-case atlas, per ADR-010), *not* the HWND client-area width. |
-| `height` | Texture height in pixels. Must equal the **multiview shared texture** height (worst-case atlas, per ADR-010), *not* the HWND client-area height. |
-
-**Returns:**
-
-| Result | Meaning |
-|---|---|
-| `XR_SUCCESS` | Texture registered (or cleared if `sharedTextureHandle == NULL`). |
-| `XR_ERROR_FUNCTION_UNSUPPORTED` | Extension not enabled or runtime build predates spec v6. |
-| `XR_ERROR_VALIDATION_FAILURE` | `width × height` does not match the registered multiview shared-texture dimensions. |
-| `XR_ERROR_HANDLE_INVALID` | Runtime could not `OpenSharedResource` on the handle. |
-
-**Valid Usage:**
-- Session must have been created with `XrWin32WindowBindingCreateInfoEXT` (or `XrCocoaWindowBindingCreateInfoEXT` on macOS).
-- The handle must be a D3D11 or D3D12 NT handle (`CreateSharedHandle` flow). DXGI legacy shared handles are not supported.
-- The texture's pixel format must be `DXGI_FORMAT_R8G8B8A8_UNORM` or `DXGI_FORMAT_R8G8B8A8_UNORM_SRGB`. The runtime opens both UNORM and UNORM_SRGB SRVs on the underlying resource and selects at sample time based on the texture's actual format, matching the color-space handling pattern documented in [`compositor-pipeline.md`](../../architecture/compositor-pipeline.md#color-space-handling-d3d11-service-compositor).
-- The texture must include `D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX` (D3D12: `D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER` as appropriate) so the runtime can synchronize via `IDXGIKeyedMutex`.
-- The synchronization key is **0**: app `AcquireSync(0)` before writing, `ReleaseSync(0)` when done; runtime `AcquireSync(0)` before sampling, `ReleaseSync(0)` after submitting the frame. Symmetric to the multiview shared texture.
-- Call with `sharedTextureHandle = NULL` to disable the surround blit. Non-canvas pixels of the target swapchain then fall back to undefined (the spec v5 behavior).
-- On window resize (`WM_SIZE` triggers a new HWND client size), the surround texture does **not** need to be reallocated or re-registered — it is sized to the worst-case atlas (which does not change) and allocated once. The app simply redraws its 2D content into the top-left `newClientWidth × newClientHeight` region (1:1, window-aligned) on the next frame, and updates the canvas rect via `xrSetSharedTextureOutputRectEXT`. (This is the reason the surround is worst-case-sized rather than HWND-sized: it avoids a per-resize destroy/recreate.)
-
-**Loaded at runtime via:**
-
-```c
-PFN_xrSetSharedTextureSurround2DEXT pfnSetSurround2D = NULL;
-xrGetInstanceProcAddr(instance, "xrSetSharedTextureSurround2DEXT",
-    (PFN_xrVoidFunction*)&pfnSetSurround2D);
-```
-
-**Pipeline integration:**
-
-Per frame, after the display processor's `process_atlas()` writes the weaved output into the canvas sub-rect of the target swapchain, the compositor runs a **surround blit pass**:
-
-```
-for each pixel (px, py) in the target swapchain:
-    if (px, py) is INSIDE the canvas rect from xrSetSharedTextureOutputRectEXT:
-        leave the DP's weaved output as-is
-    else:
-        sample surround_texture at (px, py)  // 1:1 mapping
-        write to target swapchain at (px, py)
-```
-
-The 1:1 mapping is enforced by the size-equality requirement — the surround texture dimensions equal the destination (multiview shared texture) dimensions, so `CopySubresourceRegion` of the non-canvas strips needs no scaling, UV math, or filtering. The app writes its content window-aligned into the top-left client-area region; pixels of the surround outside that region are copied but never presented (the app reads back only the client-area region).
-
-The compositor scissor-rects the blit to the four non-canvas regions (top strip / bottom strip / left strip / right strip), or equivalently runs a shader-blit with a "skip the canvas rect" branch. Implementation choice is per-graphics-API.
-
-**Example (Unity editor with fixed-zone display):**
-
-```c
-// At session start, after creating the multiview shared texture and HWND:
-
-// 1. Tell the runtime where the 3D canvas is (set by hardware constraint).
-xrSetSharedTextureOutputRectEXT(session, zoneX, zoneY, zoneW, zoneH);
-
-// 2. Allocate a 2D shared texture for the surround UI, sized to the WORST-CASE
-//    atlas (== the multiview shared texture), NOT the window. Allocated once;
-//    survives resizes without recreate.
-HANDLE surroundHandle = CreateD3D11SharedKeyedMutexTexture(
-    sharedTexWidth, sharedTexHeight, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
-
-// 3. Register it with the runtime at the shared-texture dimensions.
-pfnSetSurround2D(session, surroundHandle, sharedTexWidth, sharedTexHeight);
-
-// Per frame: Unity writes its 2D viewport chrome (toolbars, panels, status bar)
-// into the TOP-LEFT windowClientWidth x windowClientHeight region of the surround
-// texture (1:1, window-aligned), acquire/release key 0. The runtime samples it
-// after weave and blits the non-canvas strips into the destination. On resize, just
-// redraw into the new client-area region — no reallocation, no re-registration.
-```
-
-**Read-back contract:**
-
-There is no read-back. The surround texture is **input only** — the runtime reads it, the app writes it, the data never round-trips. (Contrast with the multiview shared texture, where the runtime writes the canvas region and the app reads it back to present.) Apps must blit the runtime-produced output to their window themselves; the surround texture is unrelated to that read-back.
-
-**Interaction with `xrSetSharedTextureOutputRectEXT`:**
-
-The two functions are independent and can be called in any order. The canvas rect is queried each frame at submit time, so changing it between frames is supported. If the canvas rect is changed mid-session, the surround blit boundary changes correspondingly on the next frame — no need to re-register the surround texture.
-
-If `xrSetSharedTextureOutputRectEXT` is never called, the canvas defaults to the full window, and the surround region is empty. Registering a surround texture in that case is legal but has no effect.
-
-**Fallback when not called:**
-
-If the app never calls this function, the runtime preserves the spec v5 behavior: non-canvas pixels of the target swapchain are undefined. Apps with `canvas == window` (most handle apps) are unaffected and need not call this function.
-
-### 3.7 xrSetSharedTextureSurround2DFenceEXT
-
-D3D12-only variant of [§3.6](#36-xrsetsharedtexturesurround2dext) that uses an `ID3D12Fence` (shared NT handle) for producer→consumer synchronization instead of `IDXGIKeyedMutex`.
-
-**Motivation.** D3D12-native shared resources — those created via `D3D12_HEAP_FLAG_SHARED` + `ID3D12Device::CreateSharedHandle` — do not reliably expose `IDXGIKeyedMutex` when re-opened via `ID3D12Device::OpenSharedHandle`. `QueryInterface(__uuidof(IDXGIKeyedMutex))` returns `E_NOINTERFACE` on common Windows/driver combinations (verified on NVIDIA RTX, default Windows 11 drivers, 2026-05). Spec v6's keyed-mutex contract therefore fails for D3D12 apps that allocate the surround texture on their own D3D12 device.
-
-`ID3D12Fence` is the canonical D3D12 cross-process sync primitive, is shareable via `CreateSharedHandle`, and integrates cleanly with `ID3D12CommandQueue::Wait` / `Signal`. No keyed-mutex semantics are needed: the runtime only reads from the surround texture, so a producer-signal + consumer-wait pair is sufficient.
-
-```c
-typedef XrResult (XRAPI_PTR *PFN_xrSetSharedTextureSurround2DFenceEXT)(
-    XrSession session,
-    void*     sharedTextureHandle,
-    uint32_t  width,
-    uint32_t  height,
-    void*     sharedFenceHandle,
-    uint64_t  awaitFenceValue);
-```
-
-**Parameters:**
-
-| Parameter | Description |
-|-----------|-------------|
-| `session` | The session. Must have been created with `XrWin32WindowBindingCreateInfoEXT`. |
-| `sharedTextureHandle` | Shared D3D12 texture NT `HANDLE`, or `NULL` to clear. |
-| `width` | Texture width in pixels. Must equal the dst-swapchain width seen by the strip blit. |
-| `height` | Texture height in pixels. |
-| `sharedFenceHandle` | Shared `ID3D12Fence` NT `HANDLE`. Ignored when `sharedTextureHandle == NULL`. |
-| `awaitFenceValue` | Fence value the runtime should wait on before reading the surround texture this frame. Must monotonically increase across calls. |
-
-**Returns:**
-
-| Result | Meaning |
-|---|---|
-| `XR_SUCCESS` | Registered (or cleared if `sharedTextureHandle == NULL`). |
-| `XR_ERROR_FUNCTION_UNSUPPORTED` | Runtime predates spec v7 or current compositor is not D3D12 native. |
-| `XR_ERROR_HANDLE_INVALID` | Either handle could not be opened. |
-| `XR_ERROR_VALIDATION_FAILURE` | Dimension mismatch with the opened texture. |
-
-**Valid usage:**
-- Session must have been created with `XrWin32WindowBindingCreateInfoEXT` and the graphics binding must be D3D12.
-- The texture must be created with `D3D12_HEAP_FLAG_SHARED` + a render-target-capable resource flag; NT handle is obtained via `ID3D12Device::CreateSharedHandle`.
-- The fence must be created with `D3D12_FENCE_FLAG_SHARED`; NT handle is obtained via the same `CreateSharedHandle` call.
-- Texture format must match the dst the strip blit writes into (for `_texture` apps this is the multiview shared texture's format; `DXGI_FORMAT_B8G8R8A8_UNORM` is the canonical choice).
-- `awaitFenceValue` must be strictly greater than the previous frame's value once steady state begins. The first call may use any value (the fence's `GetCompletedValue()` starts at 0, so the runtime's queue wait returns immediately for the seed call).
-- The app must `ID3D12CommandQueue::Signal(fence, awaitFenceValue)` **after** the frame's surround render submission and **before** the matching `xrEndFrame`, so the runtime's wait can resolve.
-- Mutually exclusive with [§3.6](#36-xrsetsharedtexturesurround2dext) on the same session — calling one clears the other's registration.
-
-**Pipeline integration:**
-
-Per frame:
-```
-app:                                  runtime (at xrEndFrame):
-  Reset() + Record(surround render)
-  ExecuteCommandLists(cmdList)
-  commandQueue->Signal(fence, N)
-  xrSetSharedTextureSurround2DFenceEXT(
-      session, texH, w, h, fenceH, N)
-                                      commandQueue->Wait(fence, N)
-                                      Record(strip blit) into c->cmd_list
-                                      ExecuteCommandLists(c->cmd_list)
-                                      // blit waits for app's Signal(fence,N)
-                                      // before reading surround texture
-```
-
-The runtime caches `(textureHandle, fenceHandle)` by pointer equality on first call. Subsequent calls with the same handles only update `awaitFenceValue` (no re-open, no extra `OpenSharedHandle` cost). Passing different handle values triggers a re-registration cycle and clears the cached opens.
-
-**Worked example (D3D12 app with 60% canvas + animated 2D surround):**
-
-```c
-// At session start:
-PFN_xrSetSharedTextureSurround2DFenceEXT pfnSetSurround2DFence = NULL;
-xrGetInstanceProcAddr(instance, "xrSetSharedTextureSurround2DFenceEXT",
-    (PFN_xrVoidFunction*)&pfnSetSurround2DFence);
-
-ID3D12Resource* surroundTex = NULL;
-device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_SHARED, &texDesc,
-    D3D12_RESOURCE_STATE_COMMON, NULL, IID_PPV_ARGS(&surroundTex));
-HANDLE surroundTexH;
-device->CreateSharedHandle(surroundTex, NULL, GENERIC_ALL, NULL, &surroundTexH);
-
-ID3D12Fence* surroundFence = NULL;
-device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&surroundFence));
-HANDLE surroundFenceH;
-device->CreateSharedHandle(surroundFence, NULL, GENERIC_ALL, NULL, &surroundFenceH);
-
-uint64_t fenceValue = 0;
-pfnSetSurround2DFence(session, surroundTexH, w, h, surroundFenceH, fenceValue);
-                                                 // seed: await=0, GetCompletedValue()==0,
-                                                 // first wait returns immediately
-xrSetSharedTextureOutputRectEXT(session, cx, cy, cw, ch);  // canvas 60%
-
-// Per frame:
-//   1. Record surround pattern into cmdList (RENDER_TARGET barrier, draw, COMMON barrier)
-//   2. cmdList->Close(); commandQueue->ExecuteCommandLists(1, &cmdList);
-//   3. fenceValue++; commandQueue->Signal(surroundFence, fenceValue);
-//   4. pfnSetSurround2DFence(session, surroundTexH, w, h, surroundFenceH, fenceValue);
-//   5. xrEndFrame(...);   // runtime queue-waits for surroundFence >= fenceValue,
-                              // then runs the strip blit
-```
-
-**Read-back contract:** identical to §3.6 — the surround texture is input only.
-
-**Interaction with the canvas rect:** identical to §3.6.
-
-**Fallback when not called:** identical to §3.6.
+> See the degenerate single-zone mapping in [`XR_EXT_display_zones` §6](XR_EXT_display_zones.md)
+> for the exact translation, and
+> [`docs/roadmap/surround-zones-deprecation.md`](../../roadmap/surround-zones-deprecation.md)
+> for the deprecation history. Display-zones is the canonical, more general mechanism (N 3D
+> zones + M 2D zones + a per-pixel wish mask); a `_texture` app gets identical capability
+> through it (verified: `cube_zones_texture_d3d11_win` / `cube_zones_texture_d3d12_win` /
+> `cube_zones_texture_metal_macos`).
 
 ---
 
@@ -1205,19 +911,18 @@ The current API surface is intentionally minimal: a window handle, an optional s
 
 - **Async readiness signal for shared textures** — A vendor that needs the runtime to wait on a sync primitive (fence, keyed mutex, IOSurface-style sync) before reading the shared texture could declare a sync object via a `next`-chain struct. Today's contract is "app must have finished writing before submitting the frame"; this would let vendors opt into stricter ordering. Apps that don't supply one keep working.
 
-- **Multi-canvas / picture-in-picture** — `xrSetSharedTextureOutputRectEXT` could grow a sibling that takes an array of disjoint canvas rects (e.g. `xrSetSharedTextureOutputRectsEXT`). Each rect would carry its own read-back region and per-rect Kooima parameters. Single-canvas apps unaffected.
+- **Multi-canvas / picture-in-picture** — multiple disjoint 3D canvas rects, each with its own per-rect Kooima parameters, are expressed today via multiple `XrDisplayZoneEXT` 3D zones under [`XR_EXT_display_zones`](XR_EXT_display_zones.md). Single-canvas apps simply declare one zone.
 
 - **Per-canvas rendering hints** — Eventually we may want to mark canvases with usage hints (`PRIMARY_3D`, `OVERLAY_2D`, `READBACK_ONLY`) so the runtime can pick a fast path on a per-canvas basis. Optional, defaulted.
 
 - **Vendor-private next chains** — The OpenXR `next`-chain is the established mechanism for vendors to attach driver-specific state without polluting the core extension. New vendors with truly unusual needs (e.g. an external swapchain handle, a hardware overlay plane) hook in there.
 
-These directions are listed for transparency about where the API could evolve. **They are not commitments.** None of them require changing the existing functions or struct layouts; the current spec version (3) is intended to be stable for apps shipping today, and any future additions will appear as new spec versions and new symbols rather than as redefinitions.
+These directions are listed for transparency about where the API could evolve. **They are not commitments.** None of them require changing the existing functions or struct layouts; the current spec version (8) is intended to be stable for apps shipping today, and any future additions will appear as new spec versions and new symbols rather than as redefinitions.
 
 ### 9.3 Architectural invariants (won't change)
 
 These are guarantees current apps and vendors can rely on:
 
 - The window handle / view handle is the runtime's source of truth for screen-space position. Phase, DPI, and monitor routing flow from it.
-- Canvas coordinates passed to `xrSetSharedTextureOutputRectEXT` are in HWND/NSView client-area pixels. They are never re-interpreted by the runtime as fractional, normalized, or screen coordinates.
-- The read-back contract is symmetric: the app sends `(x, y, w, h)`; the runtime writes `(w × h)` at `(x, y)` in the shared texture; the app reads `(w × h)` from `(x, y)`.
+- Zone canvas coordinates (`XrDisplayZoneEXT` under [`XR_EXT_display_zones`](XR_EXT_display_zones.md)) are in HWND/NSView client-area pixels. They are never re-interpreted by the runtime as fractional, normalized, or screen coordinates.
 - Vendor-specific weaving lives in the vendor's display processor (see [ADR-007](../../adr/ADR-007-compositor-never-weaves.md)). Apps and runtime compositors are vendor-blind.

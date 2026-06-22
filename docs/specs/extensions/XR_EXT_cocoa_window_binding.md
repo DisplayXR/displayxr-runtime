@@ -3,7 +3,7 @@
 | Property | Value |
 |----------|-------|
 | Extension Name | `XR_EXT_cocoa_window_binding` |
-| Spec Version | 6 |
+| Spec Version | 7 |
 | Type Values | `XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT` (1000999004), `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT` (1000999002) |
 | Author | Leia Inc. |
 | Platform | macOS (Cocoa / AppKit). |
@@ -97,10 +97,10 @@ typedef struct XrCocoaWindowBindingCreateInfoEXT {
 | Mode | `viewHandle` | `sharedIOSurface` | App class | Behavior |
 |------|:-:|:-:|---|---|
 | **Handle** | NSView* | NULL | `_handle` | Runtime renders directly into the app's view |
-| **Texture** | NSView* | IOSurfaceRef | `_texture` | Runtime composites into the shared IOSurface at the canvas sub-rect declared via `xrSetSharedTextureOutputRectEXT` (see [`XR_EXT_win32_window_binding` §3.5](XR_EXT_win32_window_binding.md#35-xrsetsharedtextureoutputrectext) for the read-back contract). The NSView is still required for screen-space position tracking and phase alignment. The app blits the IOSurface's canvas sub-rect into its view — or the full window region when a 2D surround is registered (see §xrSetSharedTextureSurround2DEXT). |
+| **Texture** | NSView* | IOSurfaceRef | `_texture` | Runtime composites the multi-zone result (3D zones + Local2D zones, declared via [`XR_EXT_display_zones`](XR_EXT_display_zones.md)) into the shared IOSurface. The NSView is still required for screen-space position tracking and phase alignment. The app blits the IOSurface into its view. |
 | **Offscreen** | NULL | NULL | — | `readbackCallback` receives composited pixels. No view, no phase alignment. |
 
-> **Important for `_texture` apps:** You **must** provide a valid `viewHandle` even though the runtime renders into the shared IOSurface, not the view. Without it, the display processor cannot compute correct interlacing alignment (see [XR_EXT_win32_window_binding §2.4](XR_EXT_win32_window_binding.md#24-the-phase-alignment-problem)). Additionally, call `xrSetSharedTextureOutputRectEXT` to tell the runtime where within the view the 3D canvas appears.
+> **Important for `_texture` apps:** You **must** provide a valid `viewHandle` even though the runtime renders into the shared IOSurface, not the view. Without it, the display processor cannot compute correct interlacing alignment (see [XR_EXT_win32_window_binding §2.4](XR_EXT_win32_window_binding.md#24-the-phase-alignment-problem)). Where the 3D canvas appears within the view — and any 2D regions around it — is declared via [`XR_EXT_display_zones`](XR_EXT_display_zones.md) (one `XrDisplayZoneEXT` per 3D region, one `XrCompositionLayerLocal2DEXT` per 2D region).
 
 **Valid Usage:**
 - `type` **must** be `XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT`.
@@ -113,23 +113,18 @@ typedef struct XrCocoaWindowBindingCreateInfoEXT {
 
 Shared with `XR_EXT_win32_window_binding`. See that extension's spec for the full definition.
 
-### xrSetSharedTextureOutputRectEXT
+### Region expression — REMOVED in v7 (use `XR_EXT_display_zones`)
 
-Sets the canvas sub-rect within the NSView where 3D content appears. Coordinates are relative to the view bounds. See [`XR_EXT_win32_window_binding` §3.5](XR_EXT_win32_window_binding.md) for the full API reference — the function signature and semantics are identical across platforms.
-
-### xrSetSharedTextureSurround2DEXT (Spec v6)
-
-Registers a **window-sized** 2D shared texture (`IOSurfaceRef`) whose pixels outside the canvas sub-rect are blitted into the target swapchain each frame. The function signature, lifecycle, and core semantics match the Win32 form — see [`XR_EXT_win32_window_binding` §3.6](XR_EXT_win32_window_binding.md#36-xrsetsharedtexturesurround2dext) for the full API reference — with the sizing/synchronization deltas below.
-
-**Cocoa-specific deltas:**
-
-- `sharedTextureHandle` is an `IOSurfaceRef` cast to `void*` (matching how the multiview `sharedIOSurface` field is handled in `XrCocoaWindowBindingCreateInfoEXT`).
-- Synchronization: the runtime retains the `IOSurfaceRef` (`CFRetain`) for the registration's lifetime and releases it on clear / replace / session teardown. IOSurface is cache-coherent between the app's CPU writes (under `IOSurfaceLock*`) and the runtime's GPU reads, so no keyed-mutex/fence handshake is required in-process. A use-count + Mach-port protocol is the cross-process follow-up.
-- Pixel format must **match the multiview shared IOSurface's format** (`'BGRA'` → `MTLPixelFormatBGRA8Unorm` in practice) — the strip blit is a region copy and requires strict format equality. A mismatch is logged once and the blit is skipped.
-- **Texture dimensions must match the NSView's `convertRectToBacking:` size** in physical pixels (post-Retina scale) — i.e. the **window rect**, not the worst-case shared-IOSurface size. Re-register on window resize (the surround is window-sized, so resize means a new IOSurface + a new `xrSetSharedTextureSurround2DEXT` call; the previous registration is released atomically on replace).
-- **Window-clamped fill ([#464](https://github.com/DisplayXR/displayxr-runtime/issues/464)):** the runtime fills only the registered window rect minus the canvas (window-anchored at the top-left of the worst-case shared surface), never the full worst-case extent. This deliberately diverges from the current Win32/D3D11 implementation (which still enforces the worst-case-dims contract and over-fills); #464 retrofits D3D11/D3D12 to this model.
-
-The native-Metal compositor path honors the surround texture — the surround blit pass lives in `compositor/metal/` (`metal_blit_surround_strips`). The Vulkan-via-MoltenVK path (`compositor/vk_native/`) is a follow-up.
+> **Removed in spec v7 (ADR-031).** The `xrSetSharedTextureOutputRectEXT` and
+> `xrSetSharedTextureSurround2DEXT` entry points (Cocoa never had the D3D12 `…FenceEXT`
+> variant) and the bespoke 2D-surround / output-rect mechanism are **deleted**.
+> [`XR_EXT_display_zones`](XR_EXT_display_zones.md) is now the sole paradigm for expressing
+> 2D/3D regions, including the degenerate single-region cases these calls used to cover (the
+> former output rect = one `XrDisplayZoneEXT` 3D zone; the former 2D surround = one
+> `XrCompositionLayerLocal2DEXT` zone covering the complement). See the degenerate single-zone
+> mapping in [`XR_EXT_display_zones` §6](XR_EXT_display_zones.md) and
+> [`docs/roadmap/surround-zones-deprecation.md`](../../roadmap/surround-zones-deprecation.md)
+> for the deprecation history. Parity verified by `cube_zones_texture_metal_macos`.
 
 ---
 
@@ -244,5 +239,6 @@ The Cocoa binding tracks `XR_EXT_win32_window_binding` for forward-compatibility
 | 2 | 2025-09-20 | David Fattal | Added readbackCallback for offscreen mode |
 | 3 | 2026-01-10 | David Fattal | Added sharedIOSurface for zero-copy Metal texture sharing. Fixed type value collision (1000999003 → 1000999004). |
 | 4 | 2026-04-24 | David Fattal | Read-back contract clarified: runtime writes the canvas region at `(x, y)` (not origin) in the shared IOSurface, matching `xrSetSharedTextureOutputRectEXT` args. Apps must sample at `uvOffset + uv * uvScale`. See ADR-010. |
-| 6 | 2026-05-28 | David Fattal | Added `xrSetSharedTextureSurround2DEXT` (parity with `XR_EXT_win32_window_binding` v6). Lets `_texture` apps register a full-view 2D IOSurface whose pixels outside the canvas sub-rect are blitted into the target swapchain each frame. Enables apps on fixed-3D-zone displays to fill the surround region with full-resolution 2D content. |
+| 6 | 2026-05-28 | David Fattal | Added `xrSetSharedTextureSurround2DEXT` (parity with `XR_EXT_win32_window_binding` v6). Lets `_texture` apps register a full-view 2D IOSurface whose pixels outside the canvas sub-rect are blitted into the target swapchain each frame. Enables apps on fixed-3D-zone displays to fill the surround region with full-resolution 2D content. *(Removed in v7.)* |
+| 7 | 2026-06-21 | David Fattal | Removed `xrSetSharedTextureOutputRectEXT` + `xrSetSharedTextureSurround2DEXT` — superseded by [`XR_EXT_display_zones`](XR_EXT_display_zones.md) (ADR-031). See [`docs/roadmap/surround-zones-deprecation.md`](../../roadmap/surround-zones-deprecation.md). |
 | 6 (erratum) | 2026-06-06 | David Fattal | Surround deltas corrected to match the shipped Metal implementation (#406): pixel format must match the multiview shared IOSurface (not "must be RGBA8Unorm"); dims are confirmed window-sized with re-register-on-resize; fill is window-clamped per #464 (window rect minus canvas, never the worst-case extent); sync is CFRetain + coherent IOSurface (no fence/use-count in-process). No version bump — text aligned to behavior, no ABI change. |

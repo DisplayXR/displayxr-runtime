@@ -25,23 +25,24 @@ There is **one** window-binding extension per platform
 you hand the runtime a *window* or a *shared GPU surface*. That knob defines the three app
 classes:
 
-| Class | window handle | shared texture | canvas | 2D surround |
-|---|---|---|---|---|
-| `_handle` | **real** HWND/NSView | NULL | implicitly the full window | n/a |
-| `_texture` | real HWND/NSView | **non-NULL** | a sub-rect (defaults to full client area) | optional |
-| `_hosted` | **NULL** (runtime creates one) | NULL | full window | n/a |
+| Class | window handle | shared texture | regions |
+|---|---|---|---|
+| `_handle` | **real** HWND/NSView | NULL | implicitly the full window (one full-window 3D zone) |
+| `_texture` | real HWND/NSView | **non-NULL** | declared via display-zones (3D zones + Local2D zones) |
+| `_hosted` | **NULL** (runtime creates one) | NULL | full window |
 
 **On the "handle = special case of texture" framing you asked about:** the *visual/geometric*
-claim is correct and worth teaching — _a full-window canvas with no surround is exactly the
-weave a handle app produces._ But the *architectural* subset claim is backwards: in code a
-handle app does **less** (renders straight into its window), while a texture app does **more**
-(adds a shared-surface round-trip + canvas rect + optional surround). So teach it as:
+claim is correct and worth teaching — _a single full-window 3D zone is exactly the weave a
+handle app produces._ But the *architectural* subset claim is backwards: in code a handle app
+does **less** (renders straight into its window), while a texture app does **more** (adds a
+shared-surface round-trip + display-zones region declaration). So teach it as:
 
 > "All classes use the same binding struct. **Handle**: give the runtime your window, it
-> renders into it. **Texture**: give the runtime a shared surface, it renders the weaved
-> *canvas* into a sub-rect of it, you blit that back into your own window — which unlocks
-> confining 3D to a sub-rect and filling the 2D area around it. **Hosted**: give it no window
-> at all. The full-window/no-surround texture config *is* the handle case, geometrically."
+> renders into it. **Texture**: give the runtime a shared surface, it composites your
+> display-zones (3D zones + Local2D zones) into it, you blit that back into your own window —
+> which unlocks confining 3D to a sub-rect and filling the 2D area around it. **Hosted**: give
+> it no window at all. The single-full-window-3D-zone texture config *is* the handle case,
+> geometrically."
 
 The compositor's 3-way branch makes this concrete:
 `src/xrt/compositor/d3d11/comp_d3d11_compositor.cpp:1613-1648` — handle **and** texture both
@@ -314,70 +315,49 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
 
 ---
 
-## 5. Texture apps: canvas sub-rect + 2D surround
+## 5. Texture apps: express regions via display-zones
 
-### 5a. Canvas sub-rect — `xrSetSharedTextureOutputRectEXT`
+A `_texture`-class app hands the runtime a shared GPU surface (shared texture / IOSurface) and a
+real HWND/NSView. The runtime composites its **multi-zone result** into that surface and the app
+blits the full composite to its window. Where the 3D content lives, and what 2D content surrounds
+it, is expressed entirely through [`XR_EXT_display_zones`](../specs/extensions/XR_EXT_display_zones.md)
+— **not** the legacy output-rect/surround entry points, which were **removed** (ADR-031; see
+[`docs/roadmap/surround-zones-deprecation.md`](../roadmap/surround-zones-deprecation.md)).
 
-- **INV-5.1 — Declare where the weaved 3D lives inside your window.**
-  ```c
-  xrSetSharedTextureOutputRectEXT(session, int32_t x, int32_t y, uint32_t w, uint32_t h);
-  ```
-  `(x,y,w,h)` in client-area pixels. **Never called → runtime assumes the full client area**
-  (the handle-app geometry). Flows to the DP as `canvas_offset_x/y` + `canvas_width/height`.
-  Ref: header `XR_EXT_win32_window_binding.h:161`; example
-  `test_apps/cube_texture_d3d11_win/main.cpp:471-483`; re-issue on resize
-  `cube_texture_metal_macos/main.mm:1868`.
+Authoring pattern: one `XrDisplayZoneEXT` per 3D region (chained onto the projection layer for
+that zone), one `XrCompositionLayerLocal2DEXT` per 2D region, and an optional per-pixel `wishMask`.
+Both 3D-zone projection layers and Local2D layers are submitted **transparent** — a zone confines
+its own content by definition, so there is no full-window backer. Reference apps:
+`cube_zones_texture_d3d11_win`, `cube_zones_texture_d3d12_win`, `cube_zones_texture_metal_macos`.
 
-- **INV-5.2 — The runtime writes the canvas at `(x,y)` in your shared surface, not at origin —
-  blit back from that same sub-rect.** Vendor weavers compute lenticular phase from screen-space
-  position, so the offset is load-bearing.
-  ```
-  uvScale  = (w / sharedTexW, h / sharedTexH)
-  uvOffset = (x / sharedTexW, y / sharedTexH)
-  ```
-  Sampling from origin → wrong placement + crosstalk. Ref: `cube_texture_d3d11_win/main.cpp:505-508`;
-  `ADR-010` "Read-Back Contract".
+- **INV-5.1 — Express the 3D region as a zone, not an output rect.** Declare the canvas sub-rect
+  where weaved 3D appears with an `XrDisplayZoneEXT` (client-area pixels), one per 3D zone. The
+  zone's offset/size flow to the DP as `canvas_offset_x/y` + `canvas_width/height`; vendor weavers
+  compute lenticular phase from that screen-space position, so the offset is load-bearing. A
+  single full-window 3D zone is the degenerate handle-app geometry. Ref:
+  [`XR_EXT_display_zones.md`](../specs/extensions/XR_EXT_display_zones.md); reference app
+  `cube_zones_texture_d3d11_win`.
 
-- **INV-5.3 — View dims & Kooima use canvas size, not window size, for `_texture` apps.**
-  Ref: `multiview-tiling.md:38,50`; `swapchain-model.md:40-44`.
+- **INV-5.2 — The shared surface is worst-case-sized (ADR-010); present the full composite.**
+  Allocate the shared surface **once** at the worst-case atlas size (INV-4.2 formula:
+  `max over modes of tileColumns×viewScale×displayPixels`), never resize it — a 2560×1440 BGRA8
+  surface is ~14 MB. The runtime composites every zone into it and the app reads it back / blits
+  it to its window. The zone rects (not the surface) are what change on resize. Ref: `ADR-010`.
 
-### 5b. 2D surround — `xrSetSharedTextureSurround2DEXT` (D3D11) / `…Surround2DFenceEXT` (D3D12)
+- **INV-5.3 — Express 2D regions as Local2D zones, submitted transparent.** Each 2D region
+  outside (or beside) a 3D zone is one `XrCompositionLayerLocal2DEXT`, written with correct alpha
+  so it composites over/under weaved content per the zone-layer rules. There is no separate
+  "surround" surface and no strip-blit — the runtime composites Local2D and 3D zones together.
+  Ref: `cube_zones_texture_d3d11_win`; zone-layer composition rules in
+  [`XR_EXT_display_zones.md`](../specs/extensions/XR_EXT_display_zones.md).
 
-- **INV-5.4 — The surround = the 2D pixels *outside* the canvas; the compositor strip-blits the
-  non-canvas region 1:1.** Input only, no read-back. Apps whose canvas == full window don't need
-  it. **Size it like the multiview shared texture (worst-case atlas), not the HWND** — the
-  compositor requires `surround.dims == sharedTexture.dims` for the `CopySubresourceRegion`
-  strip-blit (a mismatch is logged once and silently skipped — `comp_d3d11_compositor.cpp`
-  `d3d11_blit_surround_strips`). Allocate + register **once**; on resize you do **not**
-  reallocate or re-register — just redraw your 2D content into the top-left
-  `clientWidth × clientHeight` region (window-aligned, 1:1) and update the canvas rect. The app
-  only presents that client-area region, so surround pixels beyond it are never shown.
-  Ref: `cube_texture_d3d11_win/main.cpp:1145-1147,1178-1180`; spec §3.6 (corrected).
-  ```c
-  // D3D11:  PFN_xrSetSharedTextureSurround2DEXT(session, void* handle, uint32_t w, uint32_t h)
-  // D3D12:  PFN_xrSetSharedTextureSurround2DFenceEXT(session, void* handle, w, h,
-  //                                                  void* fenceHandle, uint64_t awaitFenceValue)
-  ```
-  Ref: header `XR_EXT_win32_window_binding.h:223,299`.
+- **INV-5.4 — Whole `imageRect` written, esp. for transparent Local2D.** As in INV-4.7, clear the
+  full declared rect (or shrink the rect) so no undefined pixels reach a transparent 2D zone and
+  reveal woven content beneath. Ref: `#568`, `#392`.
 
-- **INV-5.5 — Two variants exist because of D3D12 shared-resource limits.** D3D11 synchronizes
-  via `IDXGIKeyedMutex` (acquire/release key 0). D3D12-native shared textures often can't expose
-  a keyed mutex (`QueryInterface` → `E_NOINTERFACE`), so D3D12 uses a shared `ID3D12Fence`:
-  `Signal(fence, N)` after rendering the surround, pass `N` as `awaitFenceValue` (must be
-  strictly increasing), runtime does `Wait(fence, N)` before the strip blit. Signal before
-  `xrEndFrame`. Ref: D3D11 `cube_texture_d3d11_win/main.cpp:320-321,370,415,1178-1180`; D3D12
-  `cube_texture_d3d12_win/main.cpp:481-509,725-730`.
-
-- **INV-5.6 — Clear the surround registration with a NULL handle on resize/shutdown.** Ref:
-  `cube_texture_d3d11_win/main.cpp:1300`, `cube_texture_d3d12_win/main.cpp:1666`.
-
-### 5c. Shared-surface sizing
-
-- **INV-5.7 — Allocate the shared surface once at worst-case atlas size; never resize it.** Same
-  formula as INV-4.2 (`max over modes of tileColumns×viewScale×displayPixels`). A 2560×1440 BGRA8
-  surface is ~14 MB — over-allocation is negligible, and it removed the old
-  `xrUpdateSharedSurfaceEXT` API. The canvas rect (not the surface) is what changes on resize.
-  Ref: `ADR-010`; `cube_texture_d3d11_win/main.cpp:1082-1088`.
+- **INV-5.5 — View dims & Kooima use the 3D zone's canvas size, not the full window.** Feeding the
+  full window/display size into Kooima for a zoned `_texture` app gives wrong perspective/aspect.
+  Ref: `multiview-tiling.md`; `swapchain-model.md`.
 
 ---
 
@@ -591,8 +571,8 @@ launcher. The bare runtime ignores manifests — discovery is the workspace laye
 - [ ] App swapchain sized once to worst-case atlas (INV-4.2); per-tile = window/canvas × scaleXY, never display (INV-4.3)
 - [ ] Color space: request an **sRGB swapchain** and write a correctly-encoded image (linear render + GPU sRGB-write, or display-referred bytes — not both); linear/UNORM swapchain is not color-managed; data textures always linear (INV-4.6)
 - [ ] Whole declared `imageRect` is written — partial-tile renders clear the full tile to `(0,0,0,0)` first (or shrink the rect); no undefined pixels reach the atlas, esp. transparent-bg (INV-4.7)
-- [ ] (texture) canvas rect set; blit back from `(x,y,w,h)` sub-rect, not origin (INV-5.2); surround cleared on resize (INV-5.6)
-- [ ] (texture) shared surface sized once to worst-case (INV-5.7)
+- [ ] (texture) regions declared via display-zones — 3D zones + Local2D zones, not output-rect/surround (INV-5.1/5.3)
+- [ ] (texture) shared surface sized once to worst-case; full composite presented (INV-5.2)
 - [ ] Window-relative Kooima; matrices transposed for DirectX (INV-6.3/6.4)
 - [ ] Capture via `xrCaptureAtlasEXT`, prefix without extension, mono-guarded; no app-side readback (INV-7.1/7.2/7.3)
 - [ ] Full mip chain + trilinear on every backend (INV-7.5)
@@ -603,27 +583,20 @@ launcher. The bare runtime ignores manifests — discovery is the workspace laye
 
 ## 12. Discrepancy resolutions (history)
 
-The three spec-vs-code discrepancies found during research have been resolved:
+The spec-vs-code discrepancies found during research have been resolved (or made moot by the
+surround→display-zones removal):
 
-1. **Surround texture size — RESOLVED (spec corrected).** The contract is: **content** is
-   HWND-client-area-aligned, 1:1, redrawn on resize; **allocation** is the worst-case-atlas size
-   (= the multiview shared texture), allocated/registered once to avoid a destroy/recreate on
-   every resize. The spec's old "must equal HWND client area / re-register on resize /
-   `XR_ERROR_VALIDATION_FAILURE`" language was wrong (the runtime checks against the shared-texture
-   dims and *skips* on mismatch, it never rejects). `XR_EXT_win32_window_binding.md` §3.6 was
-   updated to match the shipped runtime + this contract. See INV-5.4.
+1. **Output-rect + 2D-surround mechanism — REMOVED (ADR-031), supersedes the old surround
+   discrepancies.** Earlier research had surfaced two surround-specific discrepancies (Windows
+   surround-texture sizing vs. the spec, and the macOS `cube_texture_metal_macos` window-clamped
+   fill divergence under [#464](https://github.com/DisplayXR/displayxr-runtime/issues/464)). Both
+   are moot: the entire output-rect/surround API (`xrSetSharedTextureOutputRectEXT`,
+   `xrSetSharedTextureSurround2DEXT`, `xrSetSharedTextureSurround2DFenceEXT`) was **removed** in
+   favour of [`XR_EXT_display_zones`](../specs/extensions/XR_EXT_display_zones.md) — see §5,
+   ADR-031, and [`docs/roadmap/surround-zones-deprecation.md`](../roadmap/surround-zones-deprecation.md).
+   The canonical texture-class parity apps are now `cube_zones_texture_{d3d11_win,d3d12_win,metal_macos}`.
 
-2. **macOS `cube_texture_metal_macos` divergence — RESOLVED
-   ([#406](https://github.com/DisplayXR/displayxr-runtime/issues/406)).** The macOS sample now
-   binds real-view + shared-IOSurface (Texture mode) and registers the 2D surround via
-   `xrSetSharedTextureSurround2DEXT`, so the "real handle + shared surface + surround" model in
-   §5 is accurate on both platforms. One deliberate platform delta: the **Metal surround is
-   window-clamped per [#464](https://github.com/DisplayXR/displayxr-runtime/issues/464)** — the
-   app registers a *window-sized* surround IOSurface (re-registered on resize) and the runtime
-   fills only the window rect minus the canvas. INV-5.4/5.7's "worst-case size" wording remains
-   **Windows-accurate** until the #464 D3D11/D3D12 retrofit lands.
-
-3. **Stale `XR_EXT_display_info.md` examples — RESOLVED, plus a full v13 spec refresh.** The
+2. **Stale `XR_EXT_display_info.md` examples — RESOLVED, plus a full v13 spec refresh.** The
    view-count hardcoding (`XrView views[2]` / `for (eye<2)`) was fixed to the `XRT_MAX_VIEWS`(8)-wide
    / active-mode-count pattern across all example blocks, with banners pointing here + to the test
    apps as authoritative. Beyond the examples, the spec was brought up to the v13 header: bumped

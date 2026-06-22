@@ -6,20 +6,17 @@
  * @author David Fattal
  * @ingroup comp_d3d11
  *
- * Composites a full-window 2D layer over the weaved 3D output, gated by a
- * per-pixel region mask. Replaces the rectangular strip-copy surround
- * (d3d11_blit_surround_strips) with the general mechanism from
- * docs/roadmap/unified-2d-3d-compositing.md §4.
+ * Composites a 2D layer (Local2D / display-zones content) over the weaved 3D
+ * output, gated by a per-pixel region mask. This is the general 2D-over-3D
+ * mechanism from docs/roadmap/unified-2d-3d-compositing.md §4.
  *
- * PHASE 0 (this file): the mask is derived analytically from the canvas
- * rect — pixels INSIDE the canvas keep the weave (discard), pixels OUTSIDE
- * are written from the 2D layer at 1:1. With matching DXGI formats + a point
- * sampler + an opaque (no-blend) output state this is pixel-identical to the
- * CopySubresourceRegion strip copy it replaces. Validation: §6 of the plan
- * doc (unified-2d-3d-phase0-impl.md) — A/B capture diff behind
- * DISPLAYXR_SURROUND_SHADER.
+ * RECT-MASK PATH (`use_rect_mask` true): the mask is derived analytically from
+ * the canvas rect — pixels INSIDE the canvas keep the weave (discard), pixels
+ * OUTSIDE are written from the 2D layer at 1:1. With matching DXGI formats + a
+ * point sampler + an opaque (no-blend) output state this is a hard-edged 1:1
+ * fill of the non-canvas region.
  *
- * PHASE 1+ (later): `use_rect_mask` goes false; `mask_tex` (a separate scalar
+ * AUTHORED-MASK PATH: `use_rect_mask` goes false; `mask_tex` (a separate scalar
  * R8 channel, NOT the 2D layer's alpha — see §4.0 of the spec) supplies M in
  * [0,1], and the discard becomes the mask-lerp
  *     final = M·weave + (1-M)·twod        (both rgb and a)

@@ -43,7 +43,7 @@ Pick the exact match; if none exists, pick the same **class+platform** (swap API
 | class \ target | win | macos |
 |---|---|---|
 | **handle** | d3d11 → `cube_handle_d3d11_win` · d3d12 → `cube_handle_d3d12_win` · gl → `cube_handle_gl_win` · vk → `cube_handle_vk_win` | gl → `cube_handle_gl_macos` · metal → `cube_handle_metal_macos` · vk → `cube_handle_vk_macos` |
-| **texture** | d3d11 → `cube_texture_d3d11_win` · d3d12 → `cube_texture_d3d12_win` | metal → `cube_texture_metal_macos` |
+| **texture** | d3d11 → `cube_zones_texture_d3d11_win` · d3d12 → `cube_zones_texture_d3d12_win` | metal → `cube_zones_texture_metal_macos` |
 | **hosted** | d3d11 → `cube_hosted_d3d11_win` | metal → `cube_hosted_metal_macos` |
 
 ## Procedure

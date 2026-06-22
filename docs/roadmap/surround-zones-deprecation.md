@@ -1,13 +1,15 @@
 # Deprecating the 2D-surround / output-rect path in favour of display-zones
 
-**Status:** In progress (deprecation + translation shim landed; removal pending migration).
+**Status:** DONE — the output-rect/surround entry points + bespoke surround code are removed;
+display-zones is the sole region paradigm. Runtime spec bumps: `XR_EXT_win32_window_binding` v8,
+`XR_EXT_cocoa_window_binding` v7. Decision recorded as **ADR-031**.
 **Owner:** runtime.
-**Refs:** ADR-027 (display zones), `XR_EXT_display_zones`, `XR_EXT_win32_window_binding` §3.5–3.7.
+**Refs:** ADR-031 (removal decision), ADR-027 (display zones), `XR_EXT_display_zones`,
+`XR_EXT_win32_window_binding`, `XR_EXT_cocoa_window_binding`.
 
-> This is the working design note. Once the migration is complete and confirmed, the
-> *decision* is recorded as a new ADR (supersession of the surround mechanism); this doc
-> becomes that ADR's background. Do **not** rewrite ADR-027 to remove the surround — it
-> added zones, it didn't decide to remove surround.
+> This doc now serves as **ADR-031's background** — the decision to remove the surround /
+> output-rect mechanism in favour of display-zones is recorded there. ADR-027 was left intact
+> (it added zones; it didn't decide to remove surround).
 
 ## 1. Why
 
@@ -74,11 +76,15 @@ about window/texture ownership, not region expression.
    marker is read-if-present (default is in code). *Pending before merge:* the standard
    hardware eyeball; Metal default-flip still needs a macOS eyeball (the shim path itself was
    already verified on Metal).
-4. **Migrate first-party apps** off the surround calls to native zones submission (the
-   `cube_texture_*` apps, any editor/host integrations).
-5. **Delete** the bespoke surround code (strip blit, surround shader, keyed-mutex/fence
-   surround handling) and the three entry points; bump the extension spec version. Record
-   the decision as a new ADR; add a one-line forward pointer to it from ADR-027.
+4. **Migrate first-party apps** off the surround calls to native zones submission (done): the
+   canonical texture-class parity apps are now `cube_zones_texture_{d3d11_win,d3d12_win,metal_macos}`;
+   the legacy `cube_texture_*` surround apps were retired.
+5. **Delete** (done — Step 5, branch `feat/634-step5-delete-surround`): the bespoke surround code
+   (strip blit, surround shader, keyed-mutex/fence surround handling, the `DISPLAYXR_SURROUND_SHIM`
+   translation shim) and the three entry points (`xrSetSharedTextureOutputRectEXT`,
+   `xrSetSharedTextureSurround2DEXT`, `xrSetSharedTextureSurround2DFenceEXT`) are removed; the
+   extension spec versions are bumped (`XR_EXT_win32_window_binding` v8, `XR_EXT_cocoa_window_binding`
+   v7). The decision is recorded as **ADR-031**, with a forward pointer added from ADR-027.
 
 ## 4. Backend coverage — which backends the shim touches (and why)
 
@@ -135,5 +141,6 @@ backends the shim covers (Metal verified; D3D11/D3D12 pending Windows validation
 - **framebufferOnly outputs.** Runtime-owned-window drawables (hosted) are not readable by
   the composite; the shim harmlessly falls back to the bespoke strips for those. Surround is
   a texture-app feature in practice, so this is not a regression.
-- **External apps.** The entry points stay ABI-present until the removal step; the spec
-  banner + header annotations warn new apps off. Removal is gated on the spec-version bump.
+- **External apps.** The entry points are now removed (Step 5); the spec-version bump
+  (`XR_EXT_win32_window_binding` v8, `XR_EXT_cocoa_window_binding` v7) signals it. Any
+  unmigrated external app must move to display-zones.

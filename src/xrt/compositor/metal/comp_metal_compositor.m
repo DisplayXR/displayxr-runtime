@@ -30,7 +30,6 @@
 #include "xrt/xrt_display_processor_metal.h"
 #include "xrt/xrt_system.h"
 
-#include "util/u_capability.h"
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 #include "util/u_time.h"
@@ -262,15 +261,6 @@ struct comp_metal_compositor
 	//! Canvas output rect for shared-texture apps.
 	struct u_canvas_rect canvas;
 
-	//! 2D surround IOSurface handle (Spec v6).
-	struct u_surround_2d_handle surround_2d;
-
-	//! Retained IOSurfaceRef backing the 2D surround (NULL when unregistered).
-	IOSurfaceRef surround_iosurface;
-
-	//! Metal texture wrapping surround_iosurface (MRR — explicit release).
-	id<MTLTexture> surround_texture;
-
 	/*
 	 * XR_EXT_local_3d_zone consumer state (#439 Phase 3).
 	 */
@@ -323,16 +313,6 @@ struct comp_metal_compositor
 	//! canvas is the full client window (zones frames count as mask_active
 	//! for metal_effective_canvas); the wish drives the post-weave lerp.
 	bool zones_frame;
-
-	//! Surround→zones translation shim (DISPLAYXR_SURROUND_SHIM, default off,
-	//! deprecation transition for XR_EXT_win32_window_binding §3.5–3.7). When
-	//! a legacy texture app registers a surround + output rect but submits no
-	//! mask / Local2D / zones, the shim synthesizes a canvas-rect 3D-zone mask
-	//! and routes the surround through the unified mask composite (the surround
-	//! becomes the 2D source) instead of the bespoke strip blit — so the
-	//! canonical zones path serves legacy apps and the strip code can later be
-	//! deleted. Resolved per frame; counts as mask_active.
-	bool surround_shim_active;
 
 	//! Explicit per-frame wish (XrDisplayZonesFrameEndInfoEXT.wishMask) set
 	//! via comp_metal_compositor_zones_set_frame_wish before commit; NULL =
@@ -418,20 +398,6 @@ metal_mask_is_active(struct comp_metal_compositor *c)
 {
 	return (c->zone_mask_active != NULL && c->zone_mask_active->submitted) || c->local_2d_last_frame ||
 	       c->zones_frame;
-}
-
-// Release the 2D surround resources (texture wrap + retained IOSurface).
-// Single choke point for clear / replace / destroy — keeps the MRR
-// retain/release pairing auditable.
-static void
-metal_release_surround(struct comp_metal_compositor *c)
-{
-	[c->surround_texture release];
-	c->surround_texture = nil;
-	if (c->surround_iosurface != NULL) {
-		CFRelease(c->surround_iosurface);
-		c->surround_iosurface = NULL;
-	}
 }
 
 /*
@@ -1785,153 +1751,6 @@ metal_compositor_dispatch_capture(struct comp_metal_compositor *c,
 	u_capture_intent_complete(&c->capture_intent, &c->mcp_capture, ok);
 }
 
-// Blit non-canvas pixels of the surround IOSurface into the dst texture
-// (the shared IOSurface for _texture apps). Called after the DP has weaved
-// into dst's canvas sub-rect.
-//
-// Strip layout (same as d3d11_blit_surround_strips):
-//
-//   +---------------------------------+
-//   |              TOP                |   (0, 0) -> (fw, cy)
-//   +------+--------------------+-----+
-//   | LEFT |   <canvas-region>  | RGT |   LEFT  (0, cy) -> (cx, cy+ch)
-//   |      |    (untouched —    |     |   RIGHT (cx+cw, cy) -> (fw, cy+ch)
-//   |      |     DP wrote here) |     |
-//   +------+--------------------+-----+
-//   |             BOTTOM              |   (0, cy+ch) -> (fw, fh)
-//   +---------------------------------+
-//
-// WINDOW-CLAMPED fill (#464): the fill extent (fw, fh) is the registered
-// surround dims — the window backing rect — clamped to dst, anchored at
-// (0,0) in the worst-case-sized dst. This deliberately diverges from the
-// current D3D11 strips (which require surround.dims == dst.dims and fill
-// the whole worst-case surface); D3D11 is retrofitted separately in #464.
-// Src coords == dst coords (1:1, both window-anchored top-left).
-//
-// DEPRECATED (XR_EXT_win32_window_binding §3.5–3.7 → XR_EXT_display_zones):
-// the surround → zones translation shim (metal_surround_shim_enabled) routes
-// legacy surround apps through metal_composite_local_2d instead of this strip
-// blit. This bespoke path is retained as the default until the shim is
-// validated as the sole composite path, after which it is deleted.
-
-// Surround→zones translation shim gate. As of #634 Step 3 the shim is the DEFAULT
-// path: a legacy surround + output-rect frame is routed through the canonical mask
-// composite instead of the bespoke strip blit, so the bespoke surround code can be
-// removed once first-party apps migrate to zones. Precedence (u_capability_enabled):
-// DISPLAYXR_SURROUND_SHIM env (dev override) > the Capabilities/SurroundShim/Enabled
-// marker (admin force-OFF kill-switch) > default ON. Set either to 0 to fall back to
-// the bespoke strips. Mirror of d3d11_surround_shim_enabled / d3d12_surround_shim_enabled.
-static bool
-metal_surround_shim_enabled(void)
-{
-	static int enabled = -1;
-	if (enabled < 0) {
-		enabled = u_capability_enabled("DISPLAYXR_SURROUND_SHIM", "SurroundShim", true) ? 1 : 0;
-	}
-	return enabled == 1;
-}
-
-// Skips any zero-area strip. Strict pixel-format equality between surround
-// and dst is required for copyFromTexture — logs once and skips on mismatch.
-static void
-metal_blit_surround_strips(struct comp_metal_compositor *c,
-                           id<MTLCommandBuffer> cmd_buf,
-                           id<MTLTexture> dst,
-                           uint32_t dst_w,
-                           uint32_t dst_h,
-                           int32_t cx,
-                           int32_t cy,
-                           uint32_t cw,
-                           uint32_t ch)
-{
-	if (!c->surround_2d.valid || c->surround_texture == nil || dst == nil) {
-		return;
-	}
-
-	if (c->surround_texture.pixelFormat != dst.pixelFormat) {
-		static bool fmt_logged = false;
-		if (!fmt_logged) {
-			U_LOG_W("Metal surround 2D: format mismatch — surround=%lu, target=%lu. "
-			        "Surround blit skipped; the surround IOSurface must use the same "
-			        "pixel format as the multiview shared IOSurface.",
-			        (unsigned long)c->surround_texture.pixelFormat,
-			        (unsigned long)dst.pixelFormat);
-			fmt_logged = true;
-		}
-		return;
-	}
-
-	// Window-clamped fill extent (#464): surround dims ARE the window rect.
-	uint32_t fw = (c->surround_2d.w < dst_w) ? c->surround_2d.w : dst_w;
-	uint32_t fh = (c->surround_2d.h < dst_h) ? c->surround_2d.h : dst_h;
-	if (fw == 0 || fh == 0) {
-		return;
-	}
-
-	// Clamp canvas to the fill extent in case the app submitted a
-	// degenerate rect (or a one-frame resize race left canvas and surround
-	// dims briefly inconsistent — harmless, just clamp).
-	uint32_t cx_u = (cx < 0) ? 0u : (uint32_t)cx;
-	uint32_t cy_u = (cy < 0) ? 0u : (uint32_t)cy;
-	if (cx_u > fw) cx_u = fw;
-	if (cy_u > fh) cy_u = fh;
-	uint32_t cright = (cx_u + cw > fw) ? fw : cx_u + cw;
-	uint32_t cbottom = (cy_u + ch > fh) ? fh : cy_u + ch;
-
-	id<MTLBlitCommandEncoder> blit = [cmd_buf blitCommandEncoder];
-
-	// Top strip: full fill width, y in [0, cy_u).
-	if (cy_u > 0) {
-		[blit copyFromTexture:c->surround_texture
-		          sourceSlice:0
-		          sourceLevel:0
-		         sourceOrigin:MTLOriginMake(0, 0, 0)
-		           sourceSize:MTLSizeMake(fw, cy_u, 1)
-		            toTexture:dst
-		     destinationSlice:0
-		     destinationLevel:0
-		    destinationOrigin:MTLOriginMake(0, 0, 0)];
-	}
-	// Bottom strip: full fill width, y in [cbottom, fh).
-	if (cbottom < fh) {
-		[blit copyFromTexture:c->surround_texture
-		          sourceSlice:0
-		          sourceLevel:0
-		         sourceOrigin:MTLOriginMake(0, cbottom, 0)
-		           sourceSize:MTLSizeMake(fw, fh - cbottom, 1)
-		            toTexture:dst
-		     destinationSlice:0
-		     destinationLevel:0
-		    destinationOrigin:MTLOriginMake(0, cbottom, 0)];
-	}
-	// Left strip: x in [0, cx_u), y in [cy_u, cbottom).
-	if (cx_u > 0 && cbottom > cy_u) {
-		[blit copyFromTexture:c->surround_texture
-		          sourceSlice:0
-		          sourceLevel:0
-		         sourceOrigin:MTLOriginMake(0, cy_u, 0)
-		           sourceSize:MTLSizeMake(cx_u, cbottom - cy_u, 1)
-		            toTexture:dst
-		     destinationSlice:0
-		     destinationLevel:0
-		    destinationOrigin:MTLOriginMake(0, cy_u, 0)];
-	}
-	// Right strip: x in [cright, fw), y in [cy_u, cbottom).
-	if (cright < fw && cbottom > cy_u) {
-		[blit copyFromTexture:c->surround_texture
-		          sourceSlice:0
-		          sourceLevel:0
-		         sourceOrigin:MTLOriginMake(cright, cy_u, 0)
-		           sourceSize:MTLSizeMake(fw - cright, cbottom - cy_u, 1)
-		            toTexture:dst
-		     destinationSlice:0
-		     destinationLevel:0
-		    destinationOrigin:MTLOriginMake(cright, cy_u, 0)];
-	}
-
-	[blit endEncoding];
-}
-
 /*
  *
  * Local 2D/3D zone consumer (#439 Phase 3)
@@ -1940,9 +1759,8 @@ metal_blit_surround_strips(struct comp_metal_compositor *c,
 
 /*!
  * Best available client-window backing dimensions. Order: the bound NSView's
- * backing size (handle + texture apps pass a real view), the registered
- * surround dims (#464 window-clamped contract), the active mask dims, the
- * output texture itself (handle apps: drawable == window).
+ * backing size (handle + texture apps pass a real view), the active mask dims,
+ * the output texture itself (handle apps: drawable == window).
  */
 static bool
 metal_window_backing_dims(struct comp_metal_compositor *c,
@@ -1957,11 +1775,6 @@ metal_window_backing_dims(struct comp_metal_compositor *c,
 			*out_h = (uint32_t)backing.size.height;
 			return true;
 		}
-	}
-	if (c->surround_2d.valid && c->surround_2d.w > 0 && c->surround_2d.h > 0) {
-		*out_w = c->surround_2d.w;
-		*out_h = c->surround_2d.h;
-		return true;
 	}
 	if (c->zone_mask_active != NULL && c->zone_mask_active->w > 0 && c->zone_mask_active->h > 0) {
 		*out_w = c->zone_mask_active->w;
@@ -2474,12 +2287,10 @@ metal_flatten_backdrop_2d(struct comp_metal_compositor *c,
  * The Metal Local-2D consumer (#439 Phase 3, impl doc §4 steps 2/4/5):
  * resolve the frame's mask (explicit staged, else implicit from layer
  * rects), flatten the accumulated Local2D layers into the 2D scratch
- * (premultiplied over, list order; legacy surround snapshot when the mask
- * is explicit but no layers were submitted), snapshot the weave, then
- * mask-lerp {2D, mask, weave} into the output's window rect.
+ * (premultiplied over, list order), snapshot the weave, then mask-lerp
+ * {2D, mask, weave} into the output's window rect.
  *
- * Returns true when the masked composite ran (the legacy surround strips
- * must then be skipped — layers/mask supersede the surround).
+ * Returns true when the masked composite ran.
  */
 static bool
 metal_composite_local_2d(struct comp_metal_compositor *c,
@@ -2599,18 +2410,6 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 			rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
 		}
 		mask_tex = metal_update_implicit_mask(c, rects, rect_count, w, h);
-	} else if (c->surround_shim_active) {
-		// Surround→zones shim: the legacy output rect IS a single 3D zone.
-		// Raster it as the wish mask (M=1 inside the canvas, feathered edge);
-		// the !have_local_2d && !zones_frame branch below fills the 2D scratch
-		// from the registered surround, so the masked composite resolves to
-		// M·weave + (1−M)·surround — the strip-blit result via the unified path.
-		struct xrt_rect canvas_rect;
-		canvas_rect.offset.w = c->canvas.x;
-		canvas_rect.offset.h = c->canvas.y;
-		canvas_rect.extent.w = (int32_t)c->canvas.w;
-		canvas_rect.extent.h = (int32_t)c->canvas.h;
-		mask_tex = metal_update_zone_wish_mask(c, &canvas_rect, 1, w, h);
 	}
 	if (mask_tex == nil) {
 		return false;
@@ -2649,34 +2448,9 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 		[enc endEncoding];
 	}
 
-	// Legacy 2D source: an explicit mask with no Local2D layers this frame
-	// composites against the registered surround (impl doc §4 step 4).
-	// Layers, when present, SUPERSEDE the surround entirely.
-	// XR_EXT_display_zones: zones frames never fall back to the surround —
-	// with zero Local2D layers the scratch stays transparent and the
-	// feathered edge lerps the weave toward the desktop.
-	if (!have_local_2d && !zones_frame) {
-		if (c->surround_texture != nil && c->surround_2d.valid &&
-		    c->surround_texture.pixelFormat == c->local2d_scratch.pixelFormat) {
-			uint32_t cw = c->surround_2d.w < w ? c->surround_2d.w : w;
-			uint32_t ch = c->surround_2d.h < h ? c->surround_2d.h : h;
-			if (cw > 0 && ch > 0) {
-				id<MTLBlitCommandEncoder> blit = [cmd_buf blitCommandEncoder];
-				[blit copyFromTexture:c->surround_texture
-				          sourceSlice:0
-				          sourceLevel:0
-				         sourceOrigin:MTLOriginMake(0, 0, 0)
-				           sourceSize:MTLSizeMake(cw, ch, 1)
-				            toTexture:c->local2d_scratch
-				     destinationSlice:0
-				     destinationLevel:0
-				    destinationOrigin:MTLOriginMake(0, 0, 0)];
-				[blit endEncoding];
-			}
-		}
-		// else: scratch stays transparent — where M=0 with no 2D
-		// coverage, final.a → 0 and the desktop shows through (Q2).
-	}
+	// With no Local2D layers this frame the 2D scratch stays transparent —
+	// where M=0 with no 2D coverage, final.a → 0 and the desktop shows
+	// through (Q2).
 
 	// Snapshot the weave (the DP just wrote output_texture).
 	{
@@ -2933,28 +2707,6 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	    (c->zone_mask_active != NULL && c->zone_mask_active->submitted) || have_local_2d || zones_frame;
 	c->local_2d_last_frame = have_local_2d;
 	c->zones_frame = zones_frame;
-
-	// Surround→zones shim (deprecation transition): a legacy texture app with a
-	// registered surround + output rect but no real mask / Local2D / zones is
-	// routed through the unified composite (canvas = synthetic 3D zone, surround
-	// = 2D source) instead of the bespoke strip blit. Default off — opt-in via
-	// DISPLAYXR_SURROUND_SHIM. Deliberately NOT folded into mask_active: the DP
-	// must still weave into the canvas SUB-RECT (eff_canvas stays c->canvas, the
-	// app's atlas is canvas-sized), so only the post-weave composite is rerouted
-	// — it spans the window with the mask M=1 inside the canvas. framebufferOnly
-	// outputs (runtime-owned windows) fail the composite's readability check and
-	// harmlessly fall back to strips.
-	c->surround_shim_active = metal_surround_shim_enabled() && !mask_active && c->surround_2d.valid &&
-	                          c->surround_texture != nil && c->canvas.valid;
-	if (c->surround_shim_active) {
-		static bool shim_logged = false;
-		if (!shim_logged) {
-			shim_logged = true;
-			U_LOG_W("Surround→zones shim ACTIVE: legacy surround routed through the "
-			        "unified mask composite (canvas %dx%d) — bespoke strip blit bypassed",
-			        (int)c->canvas.w, (int)c->canvas.h);
-		}
-	}
 
 	// XR_EXT_display_zones hardware leg (P4). Zone-capable DP: the per-frame
 	// wish publish at the end of this commit drives the per-region switch —
@@ -3667,109 +3419,9 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// #439 Phase 3 — masked 2D/3D composite. When a mask is active
 	// (explicit submitted mask, or implicit from this frame's Local2D
 	// layer rects) the post-weave output is mask-lerped against the
-	// flattened Local2D layers (or the legacy surround when the mask is
-	// explicit and no layers were submitted). Layers/mask supersede the
-	// surround strips entirely.
-	bool did_masked_composite = false;
+	// flattened Local2D layers. Layers/mask are the 2D authority.
 	if (mask_active) {
-		did_masked_composite =
-		    metal_composite_local_2d(c, cmd_buf, output_texture, &eff_canvas, have_local_2d);
-	} else if (c->surround_shim_active) {
-		// Surround→zones shim: composite over the window rect (the surround
-		// extent), NOT the canvas sub-rect — the DP wove into c->canvas, the
-		// shim mask is M=1 there, and the surround fills the (1−M) complement.
-		struct u_canvas_rect win = {0};
-		win.valid = true;
-		win.x = 0;
-		win.y = 0;
-		win.w = c->surround_2d.w;
-		win.h = c->surround_2d.h;
-		did_masked_composite =
-		    metal_composite_local_2d(c, cmd_buf, output_texture, &win, /*have_local_2d=*/false);
-	}
-
-	// Spec v6 surround blit: fill non-canvas pixels of the output from the
-	// app-supplied 2D surround IOSurface (no-op if
-	// xrSetSharedTextureSurround2DEXT was never called). Window-clamped
-	// fill per #464. One call site covers both the DP path and the no-DP
-	// fallback — they converge on output_texture. (In fallback mode the
-	// canvas region holds the full-target stretched atlas — consistent
-	// with the fallback's existing canvas-ignorance.) Skipped when the
-	// masked composite ran — the mask/layers are the 2D authority (#439).
-	if (!did_masked_composite) {
-		metal_blit_surround_strips(c, cmd_buf, output_texture,
-		                           (uint32_t)output_texture.width,
-		                           (uint32_t)output_texture.height,
-		                           c->canvas.valid ? c->canvas.x : 0,
-		                           c->canvas.valid ? c->canvas.y : 0,
-		                           c->canvas.valid ? c->canvas.w : (uint32_t)output_texture.width,
-		                           c->canvas.valid ? c->canvas.h : (uint32_t)output_texture.height);
-	}
-
-	// Surround composite capture probe — env-gated (DISPLAYXR_SURROUND_CAPTURE=1)
-	// file-trigger dump of the post-surround output. The atlas trigger above
-	// reads the pre-DP atlas, which the surround pass never touches, so
-	// validating the surround needs this dedicated probe (mirrors
-	// d3d11_maybe_capture_surround_target). Trigger: /tmp/dxr_surround_trigger
-	// → /tmp/dxr_surround.png. Default-off, zero per-frame cost when unset.
-	{
-		static int surround_cap_enabled = -1;
-		if (surround_cap_enabled < 0) {
-			const char *e = getenv("DISPLAYXR_SURROUND_CAPTURE");
-			surround_cap_enabled = (e != NULL && e[0] != '\0' && e[0] != '0') ? 1 : 0;
-		}
-		struct stat surround_cap_st;
-		if (surround_cap_enabled && output_texture != nil &&
-		    stat("/tmp/dxr_surround_trigger", &surround_cap_st) == 0) {
-			unlink("/tmp/dxr_surround_trigger");
-			uint32_t cw = (uint32_t)output_texture.width;
-			uint32_t ch = (uint32_t)output_texture.height;
-			size_t pitch = (size_t)cw * 4;
-			size_t bytes = pitch * ch;
-			id<MTLBuffer> stg = [c->device newBufferWithLength:bytes
-			                                           options:MTLResourceStorageModeShared];
-			if (stg != nil) {
-				// Flush pending encodings (incl. the surround strips)
-				// so the readback observes the final composite.
-				[cmd_buf commit];
-				[cmd_buf waitUntilCompleted];
-
-				id<MTLCommandBuffer> bcb = [c->command_queue commandBuffer];
-				id<MTLBlitCommandEncoder> bl = [bcb blitCommandEncoder];
-				[bl copyFromTexture:output_texture
-				          sourceSlice:0
-				          sourceLevel:0
-				         sourceOrigin:MTLOriginMake(0, 0, 0)
-				           sourceSize:MTLSizeMake(cw, ch, 1)
-				             toBuffer:stg
-				    destinationOffset:0
-				 destinationBytesPerRow:pitch
-				destinationBytesPerImage:bytes];
-				[bl endEncoding];
-				[bcb commit];
-				[bcb waitUntilCompleted];
-
-				uint8_t *src = (uint8_t *)stg.contents;
-				uint8_t *out = malloc(bytes);
-				if (out != NULL) {
-					for (size_t i = 0; i < bytes; i += 4) {
-						out[i + 0] = src[i + 2];
-						out[i + 1] = src[i + 1];
-						out[i + 2] = src[i + 0];
-						out[i + 3] = src[i + 3];
-					}
-					stbi_write_png("/tmp/dxr_surround.png", (int)cw, (int)ch, 4, out,
-					               (int)pitch);
-					free(out);
-					U_LOG_W("Surround composite capture written -> /tmp/dxr_surround.png");
-				}
-				[stg release];
-
-				// The committed cmd_buf is dead — the HUD/present
-				// remainder of this frame needs a fresh one.
-				cmd_buf = [c->command_queue commandBuffer];
-			}
-		}
+		metal_composite_local_2d(c, cmd_buf, output_texture, &eff_canvas, have_local_2d);
 	}
 
 	// HUD overlay (post-weave, before present)
@@ -3887,7 +3539,6 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 		CFRelease(c->shared_iosurface);
 		c->shared_iosurface = NULL;
 	}
-	metal_release_surround(c);
 
 	// 4b. Release #439 zone-mask consumer resources. The active explicit
 	// mask itself is owned by its oxr handle (destroyed via
@@ -4030,7 +3681,7 @@ comp_metal_swapchain_get_texture(struct xrt_swapchain *xsc, uint32_t index)
  *
  * Tier 1/2 author into the CPU-canonical buffer; submit uploads to the
  * R8Unorm texture (sticky, last-submit-wins). All entry points take the
- * compositor mutex (cheap; matches set_output_rect / set_surround_2d).
+ * compositor mutex (cheap).
  *
  */
 
@@ -4647,85 +4298,6 @@ comp_metal_compositor_get_window_metrics(struct xrt_compositor *xc,
 	}
 
 	return false;
-}
-
-void
-comp_metal_compositor_set_output_rect(struct xrt_compositor *xc,
-                                       int32_t x, int32_t y,
-                                       uint32_t w, uint32_t h)
-{
-	struct comp_metal_compositor *c = metal_comp(xc);
-	c->canvas = (struct u_canvas_rect){.valid = true, .x = x, .y = y, .w = w, .h = h};
-}
-
-void
-comp_metal_compositor_set_surround_2d(struct xrt_compositor *xc,
-                                       void *shared_handle,
-                                       uint32_t w, uint32_t h)
-{
-	struct comp_metal_compositor *c = metal_comp(xc);
-
-	// Release previous registration first (no-op on first call). Covers
-	// both the NULL-handle clear path and replace-on-resize.
-	metal_release_surround(c);
-
-	if (shared_handle == NULL) {
-		c->surround_2d = (struct u_surround_2d_handle){0};
-		U_LOG_I("Metal surround 2D cleared");
-		return;
-	}
-
-	// The handle is an in-process IOSurfaceRef — same convention as the
-	// multiview sharedIOSurface field. CFRetain guarantees lifetime; the
-	// IOSurface is cache-coherent between the app's CPU writes (under
-	// IOSurfaceLock) and our GPU reads, so no fence/use-count protocol is
-	// needed in-process. Cross-process (Mach-port lookup + use-count) is
-	// the follow-up when an out-of-process consumer shows up.
-	IOSurfaceRef surface = (IOSurfaceRef)shared_handle;
-	CFRetain(surface);
-	c->surround_iosurface = surface;
-
-	// Registered dims must be self-consistent with the surface. Per #464
-	// the surround is WINDOW-sized (the app re-registers on resize) — it
-	// is deliberately NOT required to match the worst-case shared
-	// IOSurface; the strip blit clamps its fill extent to these dims.
-	size_t sw = IOSurfaceGetWidth(surface);
-	size_t sh = IOSurfaceGetHeight(surface);
-	if (sw != w || sh != h) {
-		U_LOG_E("Metal surround 2D: registration dims (%ux%u) do not match "
-		        "IOSurface dims (%zux%zu)",
-		        w, h, sw, sh);
-		metal_release_surround(c);
-		c->surround_2d = (struct u_surround_2d_handle){0};
-		return;
-	}
-
-	uint32_t fourcc = IOSurfaceGetPixelFormat(surface);
-	MTLPixelFormat format = iosurface_fourcc_to_metal_format(fourcc);
-	MTLTextureDescriptor *desc =
-	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
-	                                                       width:sw
-	                                                      height:sh
-	                                                   mipmapped:NO];
-	desc.usage = MTLTextureUsageShaderRead;
-	desc.storageMode = MTLStorageModeShared;
-	c->surround_texture = [c->device newTextureWithDescriptor:desc
-	                                                 iosurface:surface
-	                                                     plane:0];
-	if (c->surround_texture == nil) {
-		U_LOG_E("Metal surround 2D: failed to wrap IOSurface (%zux%zu, fourcc=0x%08x)",
-		        sw, sh, fourcc);
-		metal_release_surround(c);
-		c->surround_2d = (struct u_surround_2d_handle){0};
-		return;
-	}
-
-	c->surround_2d.valid = true;
-	c->surround_2d.shared_handle = shared_handle;
-	c->surround_2d.w = w;
-	c->surround_2d.h = h;
-	U_LOG_I("Metal surround 2D registered: handle=%p %ux%u format=%lu",
-	        shared_handle, w, h, (unsigned long)format);
 }
 
 bool

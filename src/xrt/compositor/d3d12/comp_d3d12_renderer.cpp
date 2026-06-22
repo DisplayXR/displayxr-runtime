@@ -324,7 +324,7 @@ struct comp_d3d12_renderer
 	ID3D12PipelineState *composite_pso_bgra; // DXGI_FORMAT_B8G8R8A8_UNORM
 
 	//! Shader-visible 3-slot SRV heap for the composite pass
-	//! (t0 = 2D surround, t1 = authored mask, t2 = weave snapshot).
+	//! (t0 = 2D source, t1 = authored mask, t2 = weave snapshot).
 	//! SRVs are written fresh on every composite call.
 	ID3D12DescriptorHeap *composite_srv_heap;
 
@@ -1936,7 +1936,7 @@ comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
 	auto *cmd_list = static_cast<ID3D12GraphicsCommandList *>(cmd_list_ptr);
 
 	// Write the 3 SRVs fresh into the dedicated shader-visible heap
-	// (t0 = 2D surround scratch, t1 = authored mask staged copy, t2 = weave
+	// (t0 = 2D source scratch, t1 = authored mask staged copy, t2 = weave
 	// snapshot scratch). Formats come from each resource — the scratches are
 	// runtime-created with concrete formats, the mask is R8_UNORM.
 	ID3D12Resource *srcs[3] = {

@@ -57,66 +57,18 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
                              int32_t display_screen_top,
                              struct xrt_compositor_native **out_xc);
 
-/*!
- * Set the output rect within the app's client area where the shared
- * texture will be displayed. The runtime positions the hidden SR weaver
- * window at this sub-rect for correct interlacing alignment.
- *
- * Only meaningful in shared-texture mode with an app HWND.
- * Call when the blit viewport changes (e.g. on window resize).
- *
- * @param xc The compositor.
- * @param x  Left edge in client-area pixels.
- * @param y  Top edge in client-area pixels.
- * @param w  Width in pixels.
- * @param h  Height in pixels.
- *
- * @ingroup comp_d3d11
- */
-void
-comp_d3d11_compositor_set_output_rect(struct xrt_compositor *xc,
-                                       int32_t x, int32_t y,
-                                       uint32_t w, uint32_t h);
-
-/*!
- * Register a full-window 2D shared texture for the surround region (Spec v6).
- *
- * Pairs with comp_d3d11_compositor_set_output_rect: the canvas rect tells
- * the runtime where to weave 3D content, this call tells it where to find
- * 2D pixels for the rest of the target swapchain. The compositor blits
- * non-canvas pixels from this texture into the target each frame.
- *
- * Pass shared_handle == NULL to clear the surround (falls back to undefined
- * non-canvas pixels — the pre-v6 behavior).
- *
- * Texture format: DXGI_FORMAT_R8G8B8A8_UNORM or *_UNORM_SRGB. Synchronization
- * uses IDXGIKeyedMutex on key 0. Dimensions must equal the HWND client area.
- *
- * @param xc            The compositor.
- * @param shared_handle D3D11 shared NT HANDLE, or NULL to clear.
- * @param w             Texture width in pixels.
- * @param h             Texture height in pixels.
- *
- * @ingroup comp_d3d11
- */
-void
-comp_d3d11_compositor_set_surround_2d(struct xrt_compositor *xc,
-                                       void *shared_handle,
-                                       uint32_t w, uint32_t h);
-
 /*
  * XR_EXT_local_3d_zone — authored 2D/3D mask consumer (Phase 1 of unified
  * 2D/3D compositing, docs/roadmap/unified-2d-3d-phase1-impl.md §3–§5).
  *
- * The oxr handlers forward here; the mask generalizes the surround path's
- * rect-derived 2D region to an arbitrary scalar mask (the Phase-0 shader's
- * use_rect_mask = 0 path). Each function takes/returns an opaque per-mask
- * pointer owned by the compositor (an R8_UNORM texture + views).
+ * The oxr handlers forward here; the mask expresses an arbitrary scalar 2D/3D
+ * region (the Phase-0 shader's use_rect_mask = 0 path). Each function
+ * takes/returns an opaque per-mask pointer owned by the compositor (an
+ * R8_UNORM texture + views).
  *
  * Submission is sticky, last-submit-wins: zone_mask_submit snapshots the
- * mask and makes it THE active mask until a later submit or its destroy
- * (destroy reverts the compositor to the rect-surround behavior). The mask
- * and the 2D layer are window-sized (client-window pixels, #464); the
+ * mask and makes it THE active mask until a later submit or its destroy. The
+ * mask and the 2D layer are window-sized (client-window pixels, #464); the
  * consumer composites the window region at the top-left anchor of the
  * worst-case surface and never writes beyond it.
  */

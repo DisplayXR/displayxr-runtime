@@ -17,7 +17,14 @@ We initially sized the IOSurface to match the canvas (the sub-rect of the window
 
 **IOSurface = swapchain size (worst-case atlas across all rendering modes), allocated once at session creation.**
 
-The canvas rect is communicated separately via `xrSetSharedTextureOutputRectEXT` (part of the [window binding extensions](../specs/extensions/XR_EXT_win32_window_binding.md#35-xrsetsharedtextureoutputrectext)), which the compositor uses for Kooima FOV calculation and view sizing. The IOSurface itself never needs to be resized.
+The canvas rect (which the compositor uses for Kooima FOV calculation and view sizing) is derived from the window/zone geometry. The IOSurface itself never needs to be resized.
+
+> **Update (ADR-031):** this ADR originally communicated the canvas rect via the app-facing
+> `xrSetSharedTextureOutputRectEXT` setter. That entry point (and the 2D-surround calls) were
+> **removed** when display-zones became the sole region paradigm — a sub-rect is now expressed
+> as one 3D zone (`XR_EXT_display_zones`), and the canvas defaults to the full window. **The
+> decision here is unchanged** (the shared surface is still worst-case-sized and never resized);
+> only the output-rect-centric mechanism prose below is historical. See ADR-031.
 
 ## Rationale
 

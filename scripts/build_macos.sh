@@ -137,13 +137,6 @@ cmake -B "$ROOT/test_apps/cube_zones_vk_macos/build" \
 cmake --build "$ROOT/test_apps/cube_zones_vk_macos/build"
 
 # Step 3b: Build texture (shared-texture) test apps
-echo "=== Building cube_texture_metal_macos ==="
-cmake -B "$ROOT/test_apps/cube_texture_metal_macos/build" \
-  -S "$ROOT/test_apps/cube_texture_metal_macos" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
-cmake --build "$ROOT/test_apps/cube_texture_metal_macos/build"
-
 echo "=== Building cube_zones_texture_metal_macos ==="
 cmake -B "$ROOT/test_apps/cube_zones_texture_metal_macos/build" \
   -S "$ROOT/test_apps/cube_zones_texture_metal_macos" -G Ninja \
@@ -196,7 +189,7 @@ echo "=== Packaging artifacts ==="
 PKG_DIR="$ROOT/_package/DisplayXR-macOS"
 # Clean managed directories only (preserve user-added files like run_bridge_host.sh)
 rm -rf "$PKG_DIR/lib" "$PKG_DIR/bin" "$PKG_DIR/share" 2>/dev/null || true
-rm -f "$PKG_DIR/openxr_displayxr.json" "$PKG_DIR/run_cube_handle_vk.sh" "$PKG_DIR/run_cube_handle_metal.sh" "$PKG_DIR/run_cube_handle_gl.sh" "$PKG_DIR/run_cube_texture_metal.sh" "$PKG_DIR/run_cube_zones_texture_metal.sh" "$PKG_DIR/run_cube_hosted_metal.sh" "$PKG_DIR/run_gaussian_splatting_handle_vk.sh" 2>/dev/null || true
+rm -f "$PKG_DIR/openxr_displayxr.json" "$PKG_DIR/run_cube_handle_vk.sh" "$PKG_DIR/run_cube_handle_metal.sh" "$PKG_DIR/run_cube_handle_gl.sh" "$PKG_DIR/run_cube_zones_texture_metal.sh" "$PKG_DIR/run_cube_hosted_metal.sh" "$PKG_DIR/run_gaussian_splatting_handle_vk.sh" 2>/dev/null || true
 # Also clean up old-named scripts
 rm -f "$PKG_DIR/run_cube_rt_vk.sh" "$PKG_DIR/run_cube_ext_vk.sh" "$PKG_DIR/run_cube_rt_metal.sh" "$PKG_DIR/run_cube_ext_metal.sh" "$PKG_DIR/run_cube_rt_gl.sh" "$PKG_DIR/run_cube_ext_gl.sh" "$PKG_DIR/run_cube_shared_metal.sh" "$PKG_DIR/run_cube_shared_gl.sh" "$PKG_DIR/run_cube_shared_vk.sh" "$PKG_DIR/run_cube_metal_ext.sh" "$PKG_DIR/run_gaussian_splatting_ext_vk.sh" "$PKG_DIR/run_sim_cube.sh" "$PKG_DIR/run_sim_cube_ext.sh" "$PKG_DIR/run_sim_3dgs_ext.sh" 2>/dev/null || true
 mkdir -p "$PKG_DIR/lib"
@@ -255,7 +248,6 @@ cp "$ROOT/test_apps/cube_handle_metal_macos/build/cube_handle_metal_macos" "$PKG
 cp "$ROOT/test_apps/cube_zones_metal_macos/build/cube_zones_metal_macos" "$PKG_DIR/bin/" 2>/dev/null || true
 cp "$ROOT/test_apps/cube_zones_vk_macos/build/cube_zones_vk_macos" "$PKG_DIR/bin/" 2>/dev/null || true
 cp "$ROOT/test_apps/cube_handle_gl_macos/build/cube_handle_gl_macos" "$PKG_DIR/bin/" 2>/dev/null || true
-cp "$ROOT/test_apps/cube_texture_metal_macos/build/cube_texture_metal_macos" "$PKG_DIR/bin/" 2>/dev/null || true
 cp "$ROOT/test_apps/cube_zones_texture_metal_macos/build/cube_zones_texture_metal_macos" "$PKG_DIR/bin/" 2>/dev/null || true
 cp "$ROOT/test_apps/cube_hosted_metal_macos/build/cube_hosted_metal_macos" "$PKG_DIR/bin/" 2>/dev/null || true
 cp "$ROOT/test_apps/cube_hosted_legacy_metal_macos/build/cube_hosted_legacy_metal_macos" "$PKG_DIR/bin/" 2>/dev/null || true
@@ -345,7 +337,6 @@ install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_handle_m
 install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_zones_metal_macos" 2>/dev/null || true
 install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_zones_vk_macos" 2>/dev/null || true
 install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_handle_gl_macos" 2>/dev/null || true
-install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_texture_metal_macos" 2>/dev/null || true
 install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_zones_texture_metal_macos" 2>/dev/null || true
 install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_hosted_metal_macos" 2>/dev/null || true
 install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_hosted_legacy_metal_macos" 2>/dev/null || true
@@ -361,7 +352,7 @@ install_name_tool -add_rpath @loader_path "$PKG_DIR"/lib/libopenxr_loader*.dylib
 codesign --force --sign - "$PKG_DIR/lib/$RUNTIME_BASENAME" 2>/dev/null || true
 codesign --force --sign - "$PKG_DIR"/lib/libopenxr_loader*.dylib 2>/dev/null || true
 for app in cube_handle_vk_macos cube_handle_metal_macos cube_handle_gl_macos \
-           cube_zones_metal_macos cube_zones_vk_macos cube_texture_metal_macos \
+           cube_zones_metal_macos cube_zones_vk_macos \
            cube_hosted_metal_macos \
            cube_hosted_legacy_metal_macos cube_hosted_legacy_gl_macos \
            cube_hosted_legacy_vk_macos; do
@@ -459,19 +450,6 @@ echo "Starting cube_handle_gl_macos (OpenGL, window handle) with $SIM_DISPLAY_OU
 exec "$DIR/bin/cube_handle_gl_macos" "$@"
 SCRIPT
 chmod +x "$PKG_DIR/run_cube_handle_gl.sh"
-
-# Create run script for Metal texture test app
-cat > "$PKG_DIR/run_cube_texture_metal.sh" <<'SCRIPT'
-#!/bin/bash
-DIR="$(cd "$(dirname "$0")" && pwd)"
-export XR_RUNTIME_JSON="$DIR/openxr_displayxr.json"
-export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
-export XRT_PLUGIN_SEARCH_PATH="$DIR/lib/displayxr/plugins"
-export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
-echo "Starting cube_texture_metal_macos (Metal, real view + shared IOSurface + 2D surround) with $SIM_DISPLAY_OUTPUT output..."
-exec "$DIR/bin/cube_texture_metal_macos" "$@"
-SCRIPT
-chmod +x "$PKG_DIR/run_cube_texture_metal.sh"
 
 cat > "$PKG_DIR/run_cube_zones_texture_metal.sh" <<'SCRIPT'
 #!/bin/bash
@@ -579,7 +557,6 @@ echo "Run directly:"
 echo "  $PKG_DIR/run_cube_handle_vk.sh"
 echo "  $PKG_DIR/run_cube_handle_metal.sh"
 echo "  $PKG_DIR/run_cube_handle_gl.sh"
-echo "  $PKG_DIR/run_cube_texture_metal.sh"
 echo "  $PKG_DIR/run_cube_hosted_metal.sh"
 echo "  $PKG_DIR/run_cube_hosted_legacy_metal.sh"
 echo "  $PKG_DIR/run_cube_hosted_legacy_gl.sh"

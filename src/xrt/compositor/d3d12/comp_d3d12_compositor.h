@@ -161,55 +161,6 @@ comp_d3d12_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc,
                                                    uint32_t view_w,
                                                    uint32_t view_h);
 
-/*!
- * Set canvas output rect for shared-texture apps.
- *
- * @ingroup comp_d3d12
- */
-void
-comp_d3d12_compositor_set_output_rect(struct xrt_compositor *xc,
-                                       int32_t x, int32_t y,
-                                       uint32_t w, uint32_t h);
-
-/*!
- * Register a full-window 2D shared texture for the surround region (Spec v6).
- *
- * Pass shared_handle == NULL to clear. See
- * comp_d3d11_compositor_set_surround_2d for the full contract — D3D12 form
- * is symmetric (NT HANDLE via ID3D12Device::OpenSharedHandle, KeyedMutex
- * on key 0).
- *
- * @ingroup comp_d3d12
- */
-void
-comp_d3d12_compositor_set_surround_2d(struct xrt_compositor *xc,
-                                       void *shared_handle,
-                                       uint32_t w, uint32_t h);
-
-/*!
- * Register a full-window 2D shared texture for the surround region using
- * ID3D12Fence-based producer→consumer sync (Spec v7). Pair this with an
- * app-side `commandQueue->Signal(fence, await_fence_value)` after the
- * surround render submission each frame; the compositor will
- * `commandQueue->Wait(fence, await_fence_value)` on its own queue before
- * the strip blit.
- *
- * Called every frame to update await_fence_value. Texture + fence handles
- * are opened once and cached by handle equality. Pass shared_handle == NULL
- * to clear (fence handle ignored).
- *
- * Mutually exclusive with comp_d3d12_compositor_set_surround_2d on the same
- * compositor — calling one clears the other's registration.
- *
- * @ingroup comp_d3d12
- */
-void
-comp_d3d12_compositor_set_surround_2d_fence(struct xrt_compositor *xc,
-                                              void *shared_texture_handle,
-                                              uint32_t w, uint32_t h,
-                                              void *shared_fence_handle,
-                                              uint64_t await_fence_value);
-
 /*
  * XR_EXT_local_3d_zone — authored 2D/3D mask consumer, D3D12 leg (#439).
  * Contracts + the D3D11 porting reference:

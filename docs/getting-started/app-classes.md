@@ -7,7 +7,7 @@ DisplayXR supports four ways for an application to integrate with the runtime, d
 | Class | Suffix | Description | Compositor path |
 |-------|--------|-------------|----------------|
 | **Handle** | `_handle` | App provides its own window handle via `XR_EXT_*_window_binding` | Native compositor directly in-process |
-| **Texture** | `_texture` | App provides a shared texture **and its own window handle**; runtime weaves the 3D **canvas sub-rect** into the shared texture. App declares the sub-rect (`xrSetSharedTextureOutputRectEXT`) and may fill the surrounding 2D area (`xrSetSharedTextureSurround2DEXT`) | Native compositor directly in-process |
+| **Texture** | `_texture` | App provides a shared texture **and its own window handle**; runtime composites its display-zones result (3D zones + Local2D zones) into the shared texture. App declares regions via [`XR_EXT_display_zones`](../specs/extensions/XR_EXT_display_zones.md) — `XrDisplayZoneEXT` (3D) + `XrCompositionLayerLocal2DEXT` (2D) | Native compositor directly in-process |
 | **Hosted** | `_hosted` | Runtime creates window and rendering targets (standard OpenXR/WebXR) | Native compositor directly in-process |
 | **IPC/Service** | _(internal)_ | Out-of-process via client compositor → IPC → server multi-compositor. Used internally by the shell and WebXR — apps don't need to target this directly. | Client compositor → IPC → multi-compositor → native compositor in server |
 
@@ -44,10 +44,10 @@ For **HUD-style 2D over the whole weave** (status bars, overlays in window-pixel
 space rather than a masked region), submit `XrCompositionLayerWindowSpaceEXT`
 layers — see `windowspace_handle_*` test apps.
 
-The older **Texture-class "2D surround"** (`xrSetSharedTextureSurround2DEXT`)
-predates this and is now a special case of the same idea; prefer the Local2D
-layer + mask for new apps. Texture class remains the right choice when the
-app/engine **must own the swapchain** (present-ownership) — see below.
+The older Texture-class "2D surround" entry points predated this and were
+**removed** (ADR-031) — a 2D surround is just one Local2D zone, so use the
+display-zones Local2D layer + mask. Texture class remains the right choice when
+the app/engine **must own the swapchain** (present-ownership) — see below.
 
 ## Who passes the window handle?
 
@@ -89,9 +89,9 @@ The bullets below add detail per class.
 - **Building a native app with your own window?** Use **Handle**. You create and manage the window, pass the handle (HWND, NSView) to the runtime via `XR_EXT_win32_window_binding` or `XR_EXT_cocoa_window_binding`. Most control, best for apps that need to own their window lifecycle.
 
 - **Need the app, engine, or browser to own the swapchain?** Use **Texture** — for present-ownership: offscreen rendering, frame capture/streaming, or an engine/browser that must hold its own surface. You create and own the window (and pass its handle) and provide a shared texture; the runtime composites into it and uses your HWND for display-processor position tracking.
-  - To embed 3D in a 2D UI, **don't reach for Texture's `xrSetSharedTextureSurround2DEXT` first** — prefer the Local2D layer + mask ([Mixing 2D and 3D](#mixing-2d-and-3d-in-one-app)), which works for Handle apps too. `texture + mask` is also supported; the legacy surround side-channel remains for present-owning apps that haven't migrated.
+  - To embed 3D in a 2D UI, declare regions via **display-zones** — a 3D zone for the 3D region, a Local2D layer + mask for the 2D region ([Mixing 2D and 3D](#mixing-2d-and-3d-in-one-app)). This works for Handle apps too. (The legacy `xrSetSharedTextureSurround2DEXT` / output-rect side-channel was removed — ADR-031.)
 
-  Full contract: [`XR_EXT_win32_window_binding`](../specs/extensions/XR_EXT_win32_window_binding.md) §3.5 (output rect), §3.6/§3.7 (legacy 2D surround).
+  Full contract: [`XR_EXT_display_zones`](../specs/extensions/XR_EXT_display_zones.md); window binding: [`XR_EXT_win32_window_binding`](../specs/extensions/XR_EXT_win32_window_binding.md).
 
 - **Building a standard OpenXR app?** Use **Hosted**. The runtime creates everything — window, swapchains, rendering targets. This is the standard OpenXR path and the simplest integration. Also the path for WebXR content.
 

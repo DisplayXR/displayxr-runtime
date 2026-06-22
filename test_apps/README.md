@@ -46,8 +46,8 @@ cube_{class}_{api}_{platform}
 
 | App | API | Description |
 |-----|-----|-------------|
-| `cube_texture_d3d11_win` | D3D11 | App provides offscreen textures, runtime composites. |
-| `cube_texture_d3d12_win` | D3D12 | D3D12 texture path. |
+| `cube_zones_texture_d3d11_win` | D3D11 | App provides offscreen textures, runtime composites the multi-zone (XR_EXT_display_zones) atlas. |
+| `cube_zones_texture_d3d12_win` | D3D12 | D3D12 texture path (display-zones parity). |
 
 ### Windows — Hosted Apps
 
@@ -76,7 +76,7 @@ cube_{class}_{api}_{platform}
 
 | App | API | Description |
 |-----|-----|-------------|
-| `cube_texture_metal_macos` | Metal | App provides Metal textures, runtime composites. |
+| `cube_zones_texture_metal_macos` | Metal | App provides Metal textures, runtime composites the multi-zone (XR_EXT_display_zones) atlas. |
 | `cube_hosted_metal_macos` | Metal | Runtime creates window and targets. |
 
 ### macOS — Legacy Apps

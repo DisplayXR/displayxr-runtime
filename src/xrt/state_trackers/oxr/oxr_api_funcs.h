@@ -976,35 +976,6 @@ XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSubmitMCPToolResultEXT(XrSession session, uint64_t callId, XrBool32 success, const char *resultJson);
 #endif
 
-// xrSetSharedTextureOutputRectEXT — canvas sub-rect, part of window binding extensions
-#if defined(OXR_HAVE_EXT_win32_window_binding) || defined(OXR_HAVE_EXT_cocoa_window_binding)
-//! OpenXR API function @ep{xrSetSharedTextureOutputRectEXT}
-XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetSharedTextureOutputRectEXT(XrSession session,
-                                     int32_t x, int32_t y,
-                                     uint32_t width, uint32_t height);
-
-//! OpenXR API function @ep{xrSetSharedTextureSurround2DEXT}
-//! Spec v6 addition: registers a full-window 2D shared texture whose pixels
-//! outside the canvas sub-rect are blitted into the target swapchain.
-XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetSharedTextureSurround2DEXT(XrSession session,
-                                     void *sharedTextureHandle,
-                                     uint32_t width, uint32_t height);
-
-//! OpenXR API function @ep{xrSetSharedTextureSurround2DFenceEXT}
-//! Spec v7 addition: D3D12 variant of surround registration using an
-//! ID3D12Fence (shared NT handle) for producer→consumer sync, since
-//! IDXGIKeyedMutex is not reliably available on D3D12-native shared
-//! resources. Called per-frame to update the await fence value.
-XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetSharedTextureSurround2DFenceEXT(XrSession session,
-                                          void *sharedTextureHandle,
-                                          uint32_t width, uint32_t height,
-                                          void *sharedFenceHandle,
-                                          uint64_t awaitFenceValue);
-#endif
-
 #ifdef OXR_HAVE_EXT_local_3d_zone
 //! OpenXR API function @ep{xrGetLocal3DZoneCapabilitiesEXT}
 XRAPI_ATTR XrResult XRAPI_CALL
