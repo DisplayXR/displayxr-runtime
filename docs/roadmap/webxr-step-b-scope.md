@@ -86,9 +86,13 @@ mapping each to `file:line`:
 - **The window HWND + committed rect.** Where to get the top-level HWND (for
   `bindWindow` + phase-snap) and the canvas's committed device-pixel rect (Blink
   layout → compositor).
-**Exit:** a written design doc (`webxr-step-b-design.md`) pinning every seam +
-the chosen process boundary + the handle-export strategy + the smallest-diff plan.
-**This is the most important phase — it decides feasibility and diff size.**
+**Exit:** a written design doc ([`webxr-step-b-design.md`](webxr-step-b-design.md))
+pinning every seam + the chosen process boundary + the handle-export strategy + the
+smallest-diff plan. **This is the most important phase — it decides feasibility and
+diff size.** ✅ **Delivered** — key finding: the GPU sandbox forces the weave RPC
+client into an unsandboxed process (browser, then a utility process), bridged to the
+GPU-process texture via DXGI shared handles; canvas-SI export is avoided by copying
+into an owned keyed-mutex input (the CEF-host pattern).
 
 ### B2 — Minimal hardcoded weave (no JS)
 Prove the pipe with zero JS API: hardcode "weave the first canvas on the page" —
