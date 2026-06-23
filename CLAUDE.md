@@ -278,7 +278,7 @@ Optional per-app pose (`--pose x,y,z,width_m,height_m` before each app path):
 ```
 **Launching from Claude Code:** use `displayxr-shell.exe` with `run_in_background: true` and `timeout: 600000` (see the shell-mode launch section above + `_package\run_shell_*.bat`).
 
-**Shell controls:** left-click=focus, title-bar drag=move, edge drag=resize, right-click=focus+forward to app, double-click title bar=maximize/restore, scroll=resize, Ctrl+1-4=layout presets, TAB=cycle focus, DELETE=close app, ESC=dismiss, V=toggle 2D/3D, WASD/left-drag=app input. Title-bar buttons: close (X), minimize (—).
+**Shell controls:** left-click=focus, title-bar drag=move, edge drag=resize, right-click=focus+forward to app, double-click title bar=maximize/restore, scroll=resize, Ctrl+1=grid layout, Ctrl+2=immersive layout, Ctrl+3=billboard toggle (all windows face the viewer; a layout preset exits it), TAB=cycle focus, DELETE=close app, ESC=dismiss, V=toggle 2D/3D, WASD/left-drag=app input. Title-bar buttons: close (X), minimize (—).
 
 ## Autonomous capture & debugging
 
