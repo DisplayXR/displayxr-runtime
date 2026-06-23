@@ -150,6 +150,26 @@ ipc_server_macos_pump_main_thread(void)
 			inited = true;
 		}
 
+		// Keep the workspace surface as the ACTIVE app so keyboard events reach
+		// it. keyDown is delivered only to the frontmost app's key window, but a
+		// client launched after the service grabs frontmost on its own startup
+		// (every Cocoa app calls activateIgnoringOtherApps), which steals key-window
+		// status from the surface — so TAB (and any controller key) was silently
+		// dropped until the user clicked the surface to re-key it (mouse events,
+		// unlike keyDown, route to the window under the cursor regardless of key
+		// status, which is why click-to-focus worked but TAB did not). The surface
+		// is a borderless full-screen desktop replacement that owns the display
+		// until the Esc/Cmd+Q kill-switch, so reclaim activation whenever we've
+		// lost it; once active this is a no-op. (#59/#48)
+		if (![NSApp isActive]) {
+			[NSApp activateIgnoringOtherApps:YES];
+			NSWindow *kw = [NSApp keyWindow];
+			if (kw == nil) {
+				kw = [[NSApp windows] firstObject];
+			}
+			[kw makeKeyAndOrderFront:nil];
+		}
+
 		// Drain the main dispatch queue (this is what unblocks the comp_multi
 		// render thread's dispatch_sync that creates the NSWindow) plus any
 		// AppKit runloop sources, non-blocking.
