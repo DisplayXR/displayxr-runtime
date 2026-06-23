@@ -171,6 +171,50 @@ comp_multi_workspace_store_window_pose(struct xrt_compositor *target_xc,
                                        int32_t px_h);
 
 /*!
+ * Per-client style pushed by the workspace controller via xrSetWorkspaceClientStyleEXT
+ * (#59 Task 10). The compositor applies the focus tint to the focused client's
+ * content edge — the macOS analogue of the D3D11 service's per-slot style. The
+ * controller toggles @ref focus_glow_intensity by focus state (0 = unfocused).
+ */
+struct comp_multi_client_style
+{
+	bool valid;
+	float corner_radius;        //!< Fraction of window height; 0 = use compositor default.
+	float edge_feather_meters;  //!< Soft alpha falloff width in meters; 0 = use compositor default.
+	float focus_glow_color[4];  //!< RGBA tint (applied when intensity > 0).
+	float focus_glow_intensity; //!< Multiplier on color.a; 0 = no tint (unfocused / disabled).
+};
+
+/*!
+ * Store the controller-pushed per-client style for @p target_xc (find-or-add).
+ * Read back by the content compositing loop via @ref comp_multi_workspace_get_client_style.
+ */
+void
+comp_multi_workspace_set_client_style(struct xrt_compositor *target_xc,
+                                      const struct comp_multi_client_style *style);
+
+/*!
+ * Track which client currently holds workspace focus (#59 Task 10). @p target_xc
+ * == NULL clears focus. The compositor gates the focus tint on this, mirroring the
+ * D3D11 service's focused_slot — the controller pushes a glow style for every
+ * windowed client, but only the focused one is tinted.
+ */
+void
+comp_multi_workspace_set_focused_client(struct xrt_compositor *target_xc);
+
+//! True if @p target_xc is the currently focused client.
+bool
+comp_multi_workspace_is_focused(struct xrt_compositor *target_xc);
+
+/*!
+ * Load the stored per-client style. Returns false (and leaves @p out_style
+ * untouched) if no style has been pushed for @p target_xc.
+ */
+bool
+comp_multi_workspace_get_client_style(struct xrt_compositor *target_xc,
+                                      struct comp_multi_client_style *out_style);
+
+/*!
  * Ask a managed content client to exit (macOS chrome close button / DELETE key,
  * #59). Pushes XRT_SESSION_EVENT_EXIT_REQUEST to the client's per-session
  * compositor; its xrPollEvent surfaces XR_SESSION_STATE_EXITING and the app
