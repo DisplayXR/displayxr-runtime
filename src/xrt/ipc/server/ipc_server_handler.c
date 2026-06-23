@@ -984,6 +984,8 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 	// through-window perspective here, window-in-space placement there), exactly like
 	// D3D11's slot_pose_to_pixel_rect_for_eye + window-metrics Kooima. An unplaced
 	// window (no set_window_pose yet) keeps the display-centric fallback above.
+	struct xrt_quat win_orient = {0.0f, 0.0f, 0.0f, 1.0f};
+	bool win_has_orientation = false;
 	{
 		struct xrt_pose wpose = XRT_STRUCT_INIT;
 		float ww_m = 0.0f, wh_m = 0.0f;
@@ -994,6 +996,18 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 			win_eye_offset_x = wpose.position.x;
 			win_eye_offset_y = wpose.position.y;
 			win_eye_offset_z = wpose.position.z;
+			// #59 Task 10: a ROTATED window (shell rotate gesture). The render
+			// eyes must be re-expressed in the window's LOCAL (un-rotated) frame
+			// so the client renders flat content whose parallax matches the tilt;
+			// the compositor's projected-quad placement (shared_project_quad_for_eye)
+			// then tilts that flat content geometrically. This is the second half
+			// of the 2-stage Kooima — the exact analogue of the Windows D3D11 path
+			// (ipc_try_get_sr_view_poses applying inv(win_orient) to the eye delta).
+			// Without it the client renders for an axis-aligned window and the quad
+			// warp distorts the content.
+			win_orient = wpose.orientation;
+			win_has_orientation = (fabsf(win_orient.x) > 0.0001f || fabsf(win_orient.y) > 0.0001f ||
+			                       fabsf(win_orient.z) > 0.0001f || fabsf(win_orient.w - 1.0f) > 0.0001f);
 		}
 	}
 #endif
@@ -1193,6 +1207,23 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 			                                head_eyes[i].z - zone_eye_offset_z - win_eye_offset_z};
 		}
 	}
+
+#ifdef XRT_OS_MACOS
+	// #59 Task 10: rotate the (window-centre-relative) render eyes into the
+	// window's LOCAL frame by the inverse window orientation — the eyes above are
+	// already centre-relative (win_eye_offset subtracted), so this is exactly the
+	// Windows `inv_q * delta`. The client then renders flat window content with
+	// tilt-correct parallax; the compositor's quad places it in space.
+	if (win_has_orientation) {
+		struct xrt_quat inv_q;
+		math_quat_invert(&win_orient, &inv_q);
+		for (uint32_t i = 0; i < eye_count; i++) {
+			struct xrt_vec3 r;
+			math_quat_rotate_vec3(&inv_q, &raw_eyes[i], &r);
+			raw_eyes[i] = r;
+		}
+	}
+#endif
 
 	// A chained XR_EXT_view_rig descriptor supplies the world-space rig pose +
 	// tunables. DISPLAY rigs (the cube's orbit camera) run display-centric math;

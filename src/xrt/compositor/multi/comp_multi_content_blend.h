@@ -56,6 +56,25 @@ struct comp_multi_content_pc
 	float _pad;            //!< Padding to 48 bytes.
 };
 
+/*!
+ * Per-draw push constants for the ROTATED (quad) path. Layout (std430
+ * push_constant) MUST match quad.vert / quad.frag exactly. Unlike the
+ * axis-aligned struct above, the window-local UV domain isn't derived from a
+ * dynamic viewport — the 4 pre-projected corner positions carry both the screen
+ * placement (NDC + perspective W) and, via a fixed TL/BL/TR/BR vertex layout,
+ * the canonical [0,1] window-local UV the rounded-rect SDF runs in.
+ */
+struct comp_multi_content_pc_quad
+{
+	float corners[4][4];   //!< Per corner (NDC.x, NDC.y, depth_ndc, W), order TL,BL,TR,BR.
+	float src_uv_off[2];   //!< Source sample sub-rect origin (normalized; flip baked into scale.y).
+	float src_uv_scale[2]; //!< Source sample sub-rect extent (normalized).
+	float corner_radius;   //!< |radius| as a fraction of window HEIGHT (0 = sharp).
+	float corner_aspect;   //!< win_w_m / win_h_m (aspect-correct corners + feather).
+	float edge_feather;    //!< Feather width as a fraction of window HEIGHT (0 = off).
+	float use_src_alpha;   //!< >0.5 = modulate by texture alpha (chrome pill); else opaque coverage.
+};
+
 struct comp_multi_content_blend
 {
 	VkRenderPass render_pass;
@@ -66,6 +85,15 @@ struct comp_multi_content_blend
 	VkSampler sampler;
 	VkShaderModule vert_mod;
 	VkShaderModule frag_mod;
+
+	//! Rotated-window (quad) variant: a second pipeline sharing the render pass,
+	//! sampler and descriptor cache, with its own VERTEX|FRAGMENT push-constant
+	//! layout + TRIANGLE_STRIP quad shaders. Built lazily on first rotated draw.
+	VkPipeline quad_pipeline;
+	VkPipelineLayout quad_pipe_layout;
+	VkShaderModule quad_vert_mod;
+	VkShaderModule quad_frag_mod;
+	bool quad_initialized;
 
 	//! Cache of (VkImage, array-layer) → VkImageView + VkDescriptorSet.
 	struct
@@ -118,6 +146,30 @@ comp_multi_content_blend_draw(struct comp_multi_content_blend *blend,
                               int32_t dst_y,
                               uint32_t dst_w,
                               uint32_t dst_h);
+
+/*!
+ * Composite one ROTATED (quad) content/chrome rect. @p pc carries the 4
+ * pre-projected corner positions (NDC + per-corner W), the source sub-rect and
+ * corner/feather params. @p scissor_* clips the rasterized quad to the eye tile
+ * (a tilted quad can spill past its tile/atlas edges). The quad pipeline + its
+ * push-constant layout are lazily built on first call. Must be called between
+ * begin and end; binds the quad pipeline itself, so it freely interleaves with
+ * comp_multi_content_blend_draw in the same render pass (painter order).
+ */
+void
+comp_multi_content_blend_draw_quad(struct comp_multi_content_blend *blend,
+                                   struct vk_bundle *vk,
+                                   VkCommandBuffer cmd,
+                                   VkImage src_image,
+                                   uint32_t array_layer,
+                                   VkFormat src_fmt,
+                                   const struct comp_multi_content_pc_quad *pc,
+                                   int32_t scissor_x,
+                                   int32_t scissor_y,
+                                   uint32_t scissor_w,
+                                   uint32_t scissor_h,
+                                   uint32_t atlas_w,
+                                   uint32_t atlas_h);
 
 //! End the render pass begun by comp_multi_content_blend_begin.
 void

@@ -3721,6 +3721,8 @@ struct shared_client_render
 	int slot; // stable tie-break (msc->clients index) so equal-z order is deterministic
 	bool placed;                     // true if the controller has set a window pose
 	float pose_x, pose_y, pose_z;    // window center in meters (display-center origin, +y up, +z toward viewer)
+	struct xrt_quat pose_q;          // window orientation (shell rotate gesture: yaw+pitch); identity = axis-aligned
+	bool rotated;                    // true if pose_q is non-identity → project as a tilted quad (Task 10)
 	float win_w_m, win_h_m;          // window size in meters (aspect-clamped)
 	int win_x, win_y, win_w, win_h;  // M1 / unplaced fallback: top-left display px
 };
@@ -3771,6 +3773,113 @@ shared_project_rect_for_eye(float pose_x,
 	*out_y = (int)(center_px_y - (float)h_px * 0.5f + 0.5f);
 	*out_w = w_px;
 	*out_h = h_px;
+}
+
+//! True when @p q is (approximately) the identity quaternion — the axis-aligned
+//! fast path applies. Same 1e-4 tolerance as the D3D11 service's quat_is_identity.
+static inline bool
+shared_quat_is_identity(const struct xrt_quat *q)
+{
+	return fabsf(q->x) < 0.0001f && fabsf(q->y) < 0.0001f && fabsf(q->z) < 0.0001f &&
+	       fabsf(q->w - 1.0f) < 0.0001f;
+}
+
+/*!
+ * Project one 3D world point through @p eye onto the panel plane (Z=0), returning
+ * display pixel coords. Mirror of the D3D11 service project_point_for_eye.
+ */
+static inline void
+shared_project_point_for_eye(float px,
+                             float py,
+                             float pz,
+                             float eye_x,
+                             float eye_y,
+                             float eye_z,
+                             float disp_px_w,
+                             float disp_px_h,
+                             float px_per_m_x,
+                             float px_per_m_y,
+                             float *out_px_x,
+                             float *out_px_y)
+{
+	if (fabsf(pz) > 0.0001f && eye_z > 0.01f) {
+		float denom = eye_z - pz;
+		if (fabsf(denom) < 0.001f) {
+			denom = (denom >= 0.0f) ? 0.001f : -0.001f;
+		}
+		float scale = eye_z / denom;
+		px = eye_x + scale * (px - eye_x);
+		py = eye_y + scale * (py - eye_y);
+	}
+	*out_px_x = disp_px_w * 0.5f + px * px_per_m_x;
+	*out_px_y = disp_px_h * 0.5f - py * px_per_m_y; // +y up → -y down
+}
+
+/*!
+ * Project the 4 corners of a rotated window (orientation @p q about its center
+ * pose, size win_w_m × win_h_m) through @p eye onto the panel, and emit them as
+ * clip-space NDC (against the FULL atlas) + per-corner W for perspective-correct
+ * interpolation. Corner order TL, BL, TR, BR matches the quad shader's win-local
+ * UV LUT. @p tile_x0 offsets the eye tile within the combined atlas (col 0 = left,
+ * col 1 = right). Faithful port of the D3D11 compute_projected_quad_corners.
+ *
+ * The window-local corners are rotated by @p q, translated to the window center,
+ * projected per-eye, converted from atlas px → NDC. W = (eye_z - corner_world_z)
+ * so a tilted window foreshortens correctly. out_corners is laid out as the quad
+ * push-constant's corners[4][4] = {ndc.x, ndc.y, depth_ndc(0), W}.
+ */
+static void
+shared_project_quad_for_eye(float pose_x,
+                            float pose_y,
+                            float pose_z,
+                            const struct xrt_quat *q,
+                            float win_w_m,
+                            float win_h_m,
+                            float eye_x,
+                            float eye_y,
+                            float eye_z,
+                            int tile_x0,
+                            int disp_px_w,
+                            int disp_px_h,
+                            int atlas_w,
+                            int atlas_h,
+                            float px_per_m_x,
+                            float px_per_m_y,
+                            float out_corners[4][4])
+{
+	float hw = win_w_m * 0.5f;
+	float hh = win_h_m * 0.5f;
+	// Window-local corners: TL, BL, TR, BR (matches quad.vert win_uv LUT).
+	struct xrt_vec3 local[4] = {
+	    {-hw, +hh, 0.0f}, // TL
+	    {-hw, -hh, 0.0f}, // BL
+	    {+hw, +hh, 0.0f}, // TR
+	    {+hw, -hh, 0.0f}, // BR
+	};
+	for (int i = 0; i < 4; i++) {
+		struct xrt_vec3 world;
+		math_quat_rotate_vec3(q, &local[i], &world);
+		world.x += pose_x;
+		world.y += pose_y;
+		world.z += pose_z;
+
+		float w = eye_z - world.z; // perspective W (>0 in front of the eye)
+		if (w < 0.01f) {
+			w = 0.01f;
+		}
+
+		float dpx = 0.0f, dpy = 0.0f;
+		shared_project_point_for_eye(world.x, world.y, world.z, eye_x, eye_y, eye_z, (float)disp_px_w,
+		                             (float)disp_px_h, px_per_m_x, px_per_m_y, &dpx, &dpy);
+		// Atlas px (eye tile) → NDC against the full atlas. Vulkan NDC y=-1 is the
+		// viewport top, and dpy grows downward, so no extra y-flip is needed.
+		float atlas_px_x = (float)tile_x0 + dpx;
+		float atlas_px_y = dpy;
+		out_corners[i][0] = atlas_px_x / (float)atlas_w * 2.0f - 1.0f;
+		out_corners[i][1] = atlas_px_y / (float)atlas_h * 2.0f - 1.0f;
+		out_corners[i][2] = 0.0f; // depth_ndc (no hardware depth test here)
+		out_corners[i][3] = w;
+	}
 }
 
 //! Painter's order: far (larger z) first so nearer windows overwrite. Equal z
@@ -3970,12 +4079,90 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 		if (chrome_w_m <= 0.0f || chrome_h_m <= 0.0f) {
 			continue;
 		}
-		float cx_world = e->pose_x + layout.pose_in_client.position.x;
-		float cy_local = layout.anchor_to_window_top_edge
-		                     ? (e->win_h_m * 0.5f + layout.pose_in_client.position.y)
-		                     : layout.pose_in_client.position.y;
-		float cy_world = e->pose_y + cy_local;
-		float cz_world = e->pose_z + SHARED_CHROME_DEPTH_BIAS_M; // float above the window
+		// Chrome center in WINDOW-LOCAL meters (the pill floats above the window's
+		// top edge, in the window's own frame). For a rotated window the chrome
+		// follows the orientation: rotate this local offset by the window quat and
+		// project the pill as a tilted quad (Task 10); for an axis-aligned window
+		// the local offset is already world-relative (identity rotation).
+		float clx = layout.pose_in_client.position.x;
+		float cly = layout.anchor_to_window_top_edge
+		                ? (e->win_h_m * 0.5f + layout.pose_in_client.position.y)
+		                : layout.pose_in_client.position.y;
+		float clz = layout.pose_in_client.position.z + SHARED_CHROME_DEPTH_BIAS_M;
+
+		if (e->rotated) {
+			// Rotate the window-local chrome offset into world, keep the window
+			// orientation for the pill plane (coplanar with the window).
+			struct xrt_vec3 loff = {clx, cly, clz};
+			struct xrt_vec3 woff;
+			math_quat_rotate_vec3(&e->pose_q, &loff, &woff);
+			float ccx = e->pose_x + woff.x;
+			float ccy = e->pose_y + woff.y;
+			float ccz = e->pose_z + woff.z;
+
+			// One render pass over both eyes (barriers must wrap, not nest, the pass).
+			if (shared_ensure_content_blend(msc, vk)) {
+				VkImageMemoryBarrier to_read = {
+				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				    .srcAccessMask = 0,
+				    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+				    .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+				    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				    .image = chrome_img,
+				    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+				};
+				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+				                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0,
+				                         NULL, 1, &to_read);
+				comp_multi_content_blend_begin(&msc->shared_content_blend, vk, cmd,
+				                               msc->shared_atlas_fb, (uint32_t)msc->shared_atlas_w,
+				                               (uint32_t)msc->shared_atlas_h);
+				for (uint32_t eye = 0; eye < tile_columns; eye++) {
+					uint32_t ei = (eye < eye_pos->count) ? eye : (eye_pos->count - 1);
+					int tile_x0 = (int)eye * eye_w;
+					float corners[4][4];
+					shared_project_quad_for_eye(ccx, ccy, ccz, &e->pose_q, chrome_w_m, chrome_h_m,
+					                            eye_pos->eyes[ei].x, eye_pos->eyes[ei].y,
+					                            eye_pos->eyes[ei].z, tile_x0, eye_w, eye_h,
+					                            (int)msc->shared_atlas_w, (int)msc->shared_atlas_h,
+					                            px_per_m_x, px_per_m_y, corners);
+					// Chrome pill: the shell texture carries the capsule shape in
+					// alpha, so no runtime rounding/feather (use_src_alpha = 1).
+					struct comp_multi_content_pc_quad pcq = {
+					    .src_uv_off = {0.0f, 0.0f},
+					    .src_uv_scale = {1.0f, 1.0f},
+					    .corner_radius = 0.0f,
+					    .corner_aspect = 0.0f,
+					    .edge_feather = 0.0f,
+					    .use_src_alpha = 1.0f,
+					};
+					memcpy(pcq.corners, corners, sizeof(corners));
+					comp_multi_content_blend_draw_quad(&msc->shared_content_blend, vk, cmd,
+					                                   chrome_img, 0, sc->vkic.info.format, &pcq,
+					                                   tile_x0, 0, (uint32_t)eye_w, (uint32_t)eye_h,
+					                                   (uint32_t)msc->shared_atlas_w,
+					                                   (uint32_t)msc->shared_atlas_h);
+				}
+				comp_multi_content_blend_end(&msc->shared_content_blend, vk, cmd);
+				VkImageMemoryBarrier to_general = {
+				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+				    .dstAccessMask = 0,
+				    .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+				    .image = chrome_img,
+				    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+				};
+				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+				                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL,
+				                         1, &to_general);
+			}
+			continue;
+		}
+
+		float cx_world = e->pose_x + clx;
+		float cy_world = e->pose_y + cly;
+		float cz_world = e->pose_z + clz;
 
 		for (uint32_t eye = 0; eye < tile_columns; eye++) {
 			uint32_t ei = (eye < eye_pos->count) ? eye : (eye_pos->count - 1);
@@ -4107,11 +4294,15 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 			e->pose_x = pose.position.x;
 			e->pose_y = pose.position.y;
 			e->pose_z = pose.position.z;
+			e->pose_q = pose.orientation;
+			e->rotated = !shared_quat_is_identity(&pose.orientation);
 			e->win_w_m = wm;
 			e->win_h_m = hm;
 		} else {
 			e->placed = false;
 			e->pose_x = e->pose_y = e->pose_z = 0.0f;
+			e->pose_q = (struct xrt_quat){0.0f, 0.0f, 0.0f, 1.0f};
+			e->rotated = false;
 		}
 		int wx = 0, wy = 0, ww = 0, wh = 0;
 		if (!comp_multi_workspace_load_window_px_rect(&mc->base.base, &wx, &wy, &ww, &wh) || ww <= 0 ||
@@ -4368,6 +4559,43 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 				float img_w = (float)sc->vkic.info.width;
 				float img_h = (float)sc->vkic.info.height;
 				if (img_w <= 0.0f || img_h <= 0.0f) {
+					continue;
+				}
+
+				int tile_x0_e = (int)eye * eye_w;
+
+				// Rotated window (Task 10): project the tilted window-local corners
+				// per eye into a perspective quad (mirrors the D3D11 quad_mode path).
+				// The whole window maps to win-local UV [0,1], so the rounded-corner
+				// SDF stays at the window's real corners under tilt. The eye-tile
+				// scissor confines the quad; no proportional source remap is needed
+				// (the source sub-rect spans the full window). Only for placed
+				// windows — an unplaced lone app is axis-aligned by definition.
+				if (e->rotated && e->placed) {
+					uint32_t ei = (eye < eye_pos.count) ? eye : (eye_pos.count - 1);
+					float corners[4][4];
+					shared_project_quad_for_eye(e->pose_x, e->pose_y, e->pose_z, &e->pose_q,
+					                            e->win_w_m, e->win_h_m, eye_pos.eyes[ei].x,
+					                            eye_pos.eyes[ei].y, eye_pos.eyes[ei].z, tile_x0_e,
+					                            eye_w, eye_h, (int)msc->shared_atlas_w,
+					                            (int)msc->shared_atlas_h, px_per_m_x, px_per_m_y,
+					                            corners);
+					// Source sub-rect → normalized UV with flip baked into scale.y.
+					float so_y = (float)(flip_y ? sy + th : sy);
+					float ss_y = (float)(flip_y ? -th : th);
+					struct comp_multi_content_pc_quad pcq = {
+					    .src_uv_off = {(float)sx / img_w, so_y / img_h},
+					    .src_uv_scale = {(float)tw / img_w, ss_y / img_h},
+					    .corner_radius = CONTENT_CORNER_RADIUS_FRAC,
+					    .corner_aspect = corner_aspect,
+					    .edge_feather = edge_feather,
+					    .use_src_alpha = 0.0f, // content is opaque; coverage only
+					};
+					memcpy(pcq.corners, corners, sizeof(corners));
+					comp_multi_content_blend_draw_quad(
+					    &msc->shared_content_blend, vk, cmd, im, ai, fmt, &pcq, tile_x0_e, 0,
+					    (uint32_t)eye_w, (uint32_t)eye_h, (uint32_t)msc->shared_atlas_w,
+					    (uint32_t)msc->shared_atlas_h);
 					continue;
 				}
 
