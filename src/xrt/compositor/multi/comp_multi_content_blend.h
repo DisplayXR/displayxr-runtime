@@ -53,7 +53,8 @@ struct comp_multi_content_pc
 	float corner_radius;   //!< |radius| as a fraction of window HEIGHT (0 = sharp).
 	float corner_aspect;   //!< win_w_m / win_h_m (aspect-correct corners + feather).
 	float edge_feather;    //!< Feather width as a fraction of window HEIGHT (0 = off).
-	float _pad;            //!< Padding to 48 bytes.
+	float glow_intensity;  //!< Focus tint strength; 0 = no tint (unfocused / disabled).
+	float glow_color[4];   //!< Focus tint RGB + A multiplier (controller XrWorkspaceClientStyleEXT).
 };
 
 /*!
@@ -73,6 +74,8 @@ struct comp_multi_content_pc_quad
 	float corner_aspect;   //!< win_w_m / win_h_m (aspect-correct corners + feather).
 	float edge_feather;    //!< Feather width as a fraction of window HEIGHT (0 = off).
 	float use_src_alpha;   //!< >0.5 = modulate by texture alpha (chrome pill); else opaque coverage.
+	float glow_color[4];   //!< Focus tint RGB + A multiplier (content only).
+	float glow_intensity;  //!< Focus tint strength; 0 = no tint.
 };
 
 struct comp_multi_content_blend

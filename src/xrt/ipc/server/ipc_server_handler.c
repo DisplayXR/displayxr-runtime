@@ -4001,6 +4001,9 @@ ipc_handle_workspace_set_focused_client(volatile struct ipc_client_state *_ics, 
 		if (s->xsysc != NULL) {
 			comp_d3d11_service_set_focused_slot(s->xsysc, -1);
 		}
+#elif defined(XRT_OS_MACOS)
+		// #59 Task 10: clear the focus tint (no client tinted).
+		comp_multi_workspace_set_focused_client(NULL);
 #endif
 		return XRT_SUCCESS;
 	}
@@ -4069,6 +4072,13 @@ ipc_handle_workspace_set_focused_client(volatile struct ipc_client_state *_ics, 
 		}
 		os_mutex_unlock(&s->global_state.lock);
 		comp_d3d11_service_set_focused_slot(s->xsysc, mc_slot);
+	}
+#elif defined(XRT_OS_MACOS)
+	// #59 Task 10: mirror the focus change into the compositor's focus-tint gate.
+	// The macOS shell passes canonical client ids (no 1000+slot form), so resolve
+	// the focused client's per-session compositor directly.
+	if (xret == XRT_SUCCESS) {
+		comp_multi_workspace_set_focused_client(macos_workspace_find_client_xc(s, client_id));
 	}
 #endif
 
@@ -5049,15 +5059,29 @@ ipc_handle_workspace_set_client_style(volatile struct ipc_client_state *_ics,
 	           ? XRT_SUCCESS
 	           : XRT_ERROR_IPC_FAILURE;
 #elif defined(XRT_OS_MACOS)
-	// macOS shared surface: per the infra/look-and-feel split, per-client window
-	// styling (focus glow, corner radius, edge feather) is rendered by the
-	// workspace controller itself as its own chrome/overlay layers — the runtime
-	// only composites them. So the runtime stores/renders nothing here; accept the
-	// controller's per-tick style push as a no-op instead of failing it (which
-	// would spam the controller's log every frame).
-	(void)s;
-	(void)client_id;
-	(void)style;
+	// macOS shared surface (#59 Task 10): store the controller's per-client style.
+	// The content compositing loop applies the focus tint to the focused client's
+	// edge — the macOS analogue of the D3D11 service per-slot style, which renders
+	// the glow on the content quad (so it follows the window's tilt for free). The
+	// controller toggles focus_glow_intensity by focus state, so no separate focus
+	// tracking is needed. (This supersedes the earlier shell-side overlay ring,
+	// which couldn't rotate with the window.)
+	if (s == NULL || style == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	if (target_xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct comp_multi_client_style cstyle = {
+	    .valid = true,
+	    .corner_radius = style->corner_radius,
+	    .edge_feather_meters = style->edge_feather_meters,
+	    .focus_glow_color = {style->focus_glow_color[0], style->focus_glow_color[1],
+	                         style->focus_glow_color[2], style->focus_glow_color[3]},
+	    .focus_glow_intensity = style->focus_glow_intensity,
+	};
+	comp_multi_workspace_set_client_style(target_xc, &cstyle);
 	return XRT_SUCCESS;
 #else
 	(void)s;

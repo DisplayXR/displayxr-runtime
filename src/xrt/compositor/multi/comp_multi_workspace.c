@@ -38,6 +38,9 @@ struct chrome_entry
 	float win_h_m;
 	int32_t win_px_x, win_px_y, win_px_w, win_px_h;
 	//! @}
+
+	//! Controller-pushed per-client style (#59 Task 10): focus tint + corner/feather.
+	struct comp_multi_client_style style;
 };
 
 // One process-global table; the service is a single process. The mutex is
@@ -261,6 +264,66 @@ comp_multi_workspace_store_window_pose(struct xrt_compositor *target_xc,
 		e->win_pose_valid = true;
 	}
 	os_mutex_unlock(&g_lock);
+}
+
+void
+comp_multi_workspace_set_client_style(struct xrt_compositor *target_xc,
+                                      const struct comp_multi_client_style *style)
+{
+	if (target_xc == NULL || style == NULL) {
+		return;
+	}
+	ensure_lock();
+	os_mutex_lock(&g_lock);
+	struct chrome_entry *e = find_or_add_locked(target_xc);
+	if (e != NULL) {
+		e->style = *style;
+		e->style.valid = true;
+	}
+	os_mutex_unlock(&g_lock);
+}
+
+// Process-global focused client (the service is a single process). Read in the
+// content loop, written by the workspace set_focused handler.
+static struct xrt_compositor *g_focused_xc = NULL;
+
+void
+comp_multi_workspace_set_focused_client(struct xrt_compositor *target_xc)
+{
+	ensure_lock();
+	os_mutex_lock(&g_lock);
+	g_focused_xc = target_xc;
+	os_mutex_unlock(&g_lock);
+}
+
+bool
+comp_multi_workspace_is_focused(struct xrt_compositor *target_xc)
+{
+	if (target_xc == NULL) {
+		return false;
+	}
+	ensure_lock();
+	os_mutex_lock(&g_lock);
+	bool focused = (g_focused_xc == target_xc);
+	os_mutex_unlock(&g_lock);
+	return focused;
+}
+
+bool
+comp_multi_workspace_get_client_style(struct xrt_compositor *target_xc, struct comp_multi_client_style *out_style)
+{
+	bool found = false;
+	ensure_lock();
+	os_mutex_lock(&g_lock);
+	struct chrome_entry *e = find_locked(target_xc);
+	if (e != NULL && e->style.valid) {
+		if (out_style != NULL) {
+			*out_style = e->style;
+		}
+		found = true;
+	}
+	os_mutex_unlock(&g_lock);
+	return found;
 }
 
 bool

@@ -4541,6 +4541,38 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 				edge_feather = CONTENT_CORNER_RADIUS_FRAC;
 			}
 
+			// Focus tint (#59 Task 10, Windows parity): when the controller's pushed
+			// style enables a glow (it toggles intensity by focus), fade the content
+			// toward the glow color across the feather band. Widen the feather to the
+			// style's band so the highlight reads as a soft glow rather than a 2 px
+			// line — capped at the corner radius (Windows caps feather/ry ≤ 1). The
+			// tint follows the window's tilt for free because it rides the content
+			// quad (axis-aligned or projected). Replaces the old shell overlay ring.
+			float glow_color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+			float glow_intensity = 0.0f;
+			// Tint only the FOCUSED client (the controller pushes a glow style for
+			// every windowed client; the runtime gates on focus, like D3D11).
+			if (comp_multi_workspace_is_focused(&e->mc->base.base)) {
+				struct comp_multi_client_style st;
+				if (comp_multi_workspace_get_client_style(&e->mc->base.base, &st) &&
+				    st.focus_glow_intensity > 0.0f) {
+					glow_intensity = st.focus_glow_intensity;
+					glow_color[0] = st.focus_glow_color[0];
+					glow_color[1] = st.focus_glow_color[1];
+					glow_color[2] = st.focus_glow_color[2];
+					glow_color[3] = st.focus_glow_color[3];
+					if (st.edge_feather_meters > 0.0f && e->win_h_m > 0.0f) {
+						float sf = st.edge_feather_meters / e->win_h_m;
+						if (sf > edge_feather) {
+							edge_feather = sf;
+						}
+						if (edge_feather > CONTENT_CORNER_RADIUS_FRAC) {
+							edge_feather = CONTENT_CORNER_RADIUS_FRAC;
+						}
+					}
+				}
+			}
+
 			for (uint32_t eye = 0; eye < tile_columns; eye++) {
 				uint32_t v = (eye < e->view_count) ? eye : (e->view_count - 1);
 				int tw = 0, th = 0;
@@ -4590,6 +4622,8 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 					    .corner_aspect = corner_aspect,
 					    .edge_feather = edge_feather,
 					    .use_src_alpha = 0.0f, // content is opaque; coverage only
+					    .glow_color = {glow_color[0], glow_color[1], glow_color[2], glow_color[3]},
+					    .glow_intensity = glow_intensity,
 					};
 					memcpy(pcq.corners, corners, sizeof(corners));
 					comp_multi_content_blend_draw_quad(
@@ -4646,7 +4680,8 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 				    .corner_radius = CONTENT_CORNER_RADIUS_FRAC,
 				    .corner_aspect = corner_aspect,
 				    .edge_feather = edge_feather,
-				    ._pad = 0.0f,
+				    .glow_intensity = glow_intensity,
+				    .glow_color = {glow_color[0], glow_color[1], glow_color[2], glow_color[3]},
 				};
 				comp_multi_content_blend_draw(&msc->shared_content_blend, vk, cmd, im, ai, fmt, &pc,
 				                              (int32_t)cdx0, (int32_t)cdy0,
