@@ -2904,6 +2904,17 @@ black_canvas:; // force_black (minimized) jumps here, skipping all content/view 
 	// without this, comp_target_swapchain_present asserts current_frame_id > 0.
 	// (#510: first path to actually exercise comp_window_android present.)
 	{
+#ifdef XRT_OS_ANDROID
+		// Feed the target's pacer the AChoreographer vsync timing before
+		// predicting (closed-loop pacing, #510). In-process compositors call
+		// update_timings every frame; this OOP per-session path omitted it, so
+		// the real vblank never reached the fake pacer and its present phase
+		// drifted → 30 Hz lock. Android-only: it exists solely to drive the
+		// Choreographer vblank feed; Windows/macOS self-owned-window targets
+		// have no such source and never called this here before.
+		comp_target_update_timings(ct);
+#endif
+
 		int64_t frame_id = -1;
 		int64_t wake_up_ns = 0, desired_present_ns = 0, present_slop_ns = 0, predicted_display_ns = 0;
 		comp_target_calc_frame_pacing(ct, &frame_id, &wake_up_ns, &desired_present_ns, &present_slop_ns,
