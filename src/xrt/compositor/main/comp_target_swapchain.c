@@ -25,6 +25,8 @@
 #include "android/android_globals.h"
 #include "util/u_time.h"
 #include <android/native_window.h>
+#include <android/choreographer.h>
+#include <android/looper.h>
 #include <sys/system_properties.h>
 #endif
 
@@ -79,6 +81,23 @@ android_transparent_requested(void)
  */
 DEBUG_GET_ONCE_NUM_OPTION(preferred_at_least_image_count, "XRT_COMPOSITOR_PREFERRED_IMAGE_COUNT", 2)
 DEBUG_GET_ONCE_BOOL_OPTION(use_present_wait, "XRT_COMPOSITOR_USE_PRESENT_WAIT", false)
+/*
+ * Android closed-loop pacing (#510). The fake compositor pacer is open-loop on
+ * Android (no VK_EXT_display_control / VK_GOOGLE_display_timing), so its present
+ * phase grid drifts out of alignment with the real display and the compositor
+ * lands just-after vblank every frame → FIFO shows every 2nd vblank = 30 Hz
+ * (measured via SurfaceFlinger --latency: steady 33.4 ms on a 60 Hz panel). A
+ * surface recreate (minimize/maximize) re-aligns the phase, hence the workaround.
+ *
+ * When on (default), an AChoreographer thread feeds real vsync timestamps into
+ * the pacer via the existing u_pc_update_vblank_from_display_control plumbing —
+ * the same closed-loop mechanism direct mode uses — so the present phase tracks
+ * the display and the compositor hits 60 Hz at cold start without a swipe. Set
+ * debug.xrt.DXR_ANDROID_VSYNC_PACING=0 to fall back to the open-loop behavior.
+ */
+#ifdef XRT_OS_ANDROID
+DEBUG_GET_ONCE_BOOL_OPTION(android_vsync_pacing, "DXR_ANDROID_VSYNC_PACING", true)
+#endif
 
 static inline struct vk_bundle *
 get_vk(struct comp_target_swapchain *cts)
@@ -613,6 +632,80 @@ create_vblank_event_thread(struct comp_target *ct)
 }
 #endif
 
+#ifdef XRT_OS_ANDROID
+/*
+ * Closed-loop pacing for Android: an AChoreographer callback delivers real vsync
+ * timestamps (CLOCK_MONOTONIC ns, same clock as os_monotonic_get_ns), which we
+ * stash in cts->vblank.last_vblank_ns. comp_target_swapchain_update_timings()
+ * (called per-frame from the compositor thread) then feeds it to the pacer via
+ * do_update_timings_vblank_thread → u_pc_update_vblank_from_display_control,
+ * exactly like the VK_EXT_display_control path. See DXR_ANDROID_VSYNC_PACING.
+ */
+static void
+android_vsync_frame_cb(int64_t frameTimeNanos, void *data)
+{
+	struct comp_target_swapchain *cts = (struct comp_target_swapchain *)data;
+
+	os_thread_helper_lock(&cts->vblank.event_thread);
+	cts->vblank.last_vblank_ns = frameTimeNanos;
+	bool running = os_thread_helper_is_running_locked(&cts->vblank.event_thread);
+	os_thread_helper_unlock(&cts->vblank.event_thread);
+
+	// Re-arm for the next vsync as long as the thread is alive.
+	if (running) {
+		AChoreographer_postFrameCallback64(AChoreographer_getInstance(), android_vsync_frame_cb, data);
+	}
+}
+
+static void *
+run_android_vsync_thread(void *ptr)
+{
+	struct comp_target *ct = (struct comp_target *)ptr;
+	struct comp_target_swapchain *cts = (struct comp_target_swapchain *)ct;
+
+	os_thread_helper_name(&cts->vblank.event_thread, "Android VSync");
+	U_TRACE_SET_THREAD_NAME("Android VSync");
+
+	// AChoreographer is bound to the calling thread's looper.
+	ALooper *looper = ALooper_prepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);
+	AChoreographer *chor = looper != NULL ? AChoreographer_getInstance() : NULL;
+	if (chor == NULL) {
+		COMP_ERROR(ct->c, "Android VSync: no Choreographer; pacing stays open-loop");
+		return NULL;
+	}
+
+	AChoreographer_postFrameCallback64(chor, android_vsync_frame_cb, cts);
+
+	for (;;) {
+		os_thread_helper_lock(&cts->vblank.event_thread);
+		bool running = os_thread_helper_is_running_locked(&cts->vblank.event_thread);
+		os_thread_helper_unlock(&cts->vblank.event_thread);
+		if (!running) {
+			break;
+		}
+		// Dispatches the frame callbacks; wakes at least every 100 ms to re-check running.
+		ALooper_pollOnce(100, NULL, NULL, NULL);
+	}
+
+	return NULL;
+}
+
+static bool
+create_android_vsync_thread(struct comp_target *ct)
+{
+	struct comp_target_swapchain *cts = (struct comp_target_swapchain *)ct;
+
+	int thread_ret = os_thread_helper_start(&cts->vblank.event_thread, run_android_vsync_thread, ct);
+	if (thread_ret != 0) {
+		COMP_ERROR(ct->c, "Failed to start Android VSync thread");
+		return false;
+	}
+
+	cts->vblank.has_started = true;
+	return true;
+}
+#endif // XRT_OS_ANDROID
+
 static void
 target_fini_semaphores(struct comp_target_swapchain *cts)
 {
@@ -903,6 +996,16 @@ comp_target_swapchain_create_images(struct comp_target *ct, const struct comp_ta
 	} else if (!cts->has_logged_vblank_info) {
 		cts->has_logged_vblank_info = true;
 		COMP_INFO(ct->c, "Not using vblank event thread!");
+	}
+#endif
+
+#ifdef XRT_OS_ANDROID
+	// Closed-loop pacing via AChoreographer (#510). Started once and kept across
+	// swapchain recreations (the vsync source is the display, not the swapchain).
+	if (debug_get_bool_option_android_vsync_pacing() && !cts->vblank.has_started) {
+		if (create_android_vsync_thread(ct)) {
+			COMP_INFO(ct->c, "Started Android VSync (Choreographer) pacing thread!");
+		}
 	}
 #endif
 
