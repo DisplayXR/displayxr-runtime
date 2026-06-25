@@ -46,6 +46,93 @@ publish_pointer_px(NSEvent *event, NSPoint p)
 	comp_multi_workspace_set_pointer_px(px, py);
 }
 
+// A workspace/controller key is reserved for the shell and never forwarded to a
+// content app: TAB / ESC / DELETE / F11 / arrows / [ ] and any Ctrl-chord. Plain
+// keys (letters, digits, space, WASD, mode keys v/0-8) are "content" keys and go
+// to the focused app. (#61: mirrors the Windows split, where the compositor
+// window keeps workspace chords and the focused app HWND gets the rest.)
+static bool
+is_workspace_key(uint32_t vk, uint32_t mods)
+{
+	if (mods & (1u << 1)) { // bit1 = CTRL (ipc_protocol.h modifiers layout)
+		return true;
+	}
+	switch (vk) {
+	case 0x09: // VK_TAB    — cycle focus
+	case 0x1B: // VK_ESCAPE — restore maximized
+	case 0x2E: // VK_DELETE — close window
+	case 0x7A: // VK_F11     — maximize toggle
+	case 0x25: // VK_LEFT
+	case 0x26: // VK_UP
+	case 0x27: // VK_RIGHT
+	case 0x28: // VK_DOWN
+	case 0xDB: // VK_OEM_4 [ — step Z back
+	case 0xDD: // VK_OEM_6 ] — step Z fwd
+		return true;
+	default: return false;
+	}
+}
+
+// Route one wire input event to the right per-target queue(s) (#61). The
+// workspace controller always receives pointer buttons / motion / keys (it owns
+// focus-on-mousedown, chrome/taskbar/launcher hit-testing, hover, and the
+// workspace chords); content pointer/motion ALSO forward to the window under the
+// cursor, and scroll routes EXCLUSIVELY (content scroll → app, workspace scroll →
+// controller-resize — the fix for "the shell resizes on every scroll"). While
+// the launcher band has grabbed input or a controller drag/resize gesture holds
+// pointer capture, everything goes to the controller only. Keyboard follows the
+// focused window, not the cursor. With no controller registered (bare
+// XRT_FORCE_MODE=ipc app, no shell), hit-test/focus are NULL so every event lands
+// on the controller queue, which that lone app drains — preserving the old path.
+static void
+route_input_event(const struct ipc_workspace_input_event *ev)
+{
+	bool grab = ipc_server_input_queue_input_grabbed();
+	bool cap = ipc_server_input_queue_pointer_captured();
+
+	switch (ev->event_type) {
+	case IPC_WORKSPACE_INPUT_EVENT_KEY:
+		ipc_server_input_queue_push(IPC_INPUT_TARGET_CONTROLLER, ev);
+		if (!grab && !is_workspace_key(ev->u.key.vk_code, ev->u.key.modifiers)) {
+			void *app = comp_multi_workspace_get_focused_client();
+			if (app != NULL) {
+				ipc_server_input_queue_push(app, ev);
+			}
+		}
+		break;
+	case IPC_WORKSPACE_INPUT_EVENT_SCROLL:
+		if (grab || cap) {
+			ipc_server_input_queue_push(IPC_INPUT_TARGET_CONTROLLER, ev);
+		} else {
+			void *app = comp_multi_workspace_hit_test_window_px(
+			    (int32_t)ev->u.scroll.cursor_x, (int32_t)ev->u.scroll.cursor_y);
+			ipc_server_input_queue_push(app != NULL ? app : IPC_INPUT_TARGET_CONTROLLER, ev);
+		}
+		break;
+	case IPC_WORKSPACE_INPUT_EVENT_POINTER:
+		ipc_server_input_queue_push(IPC_INPUT_TARGET_CONTROLLER, ev);
+		if (!grab && !cap) {
+			void *app = comp_multi_workspace_hit_test_window_px(
+			    (int32_t)ev->u.pointer.cursor_x, (int32_t)ev->u.pointer.cursor_y);
+			if (app != NULL) {
+				ipc_server_input_queue_push(app, ev);
+			}
+		}
+		break;
+	case IPC_WORKSPACE_INPUT_EVENT_POINTER_MOTION:
+		ipc_server_input_queue_push(IPC_INPUT_TARGET_CONTROLLER, ev);
+		if (!grab && !cap) {
+			void *app = comp_multi_workspace_hit_test_window_px(
+			    (int32_t)ev->u.pointer_motion.cursor_x, (int32_t)ev->u.pointer_motion.cursor_y);
+			if (app != NULL) {
+				ipc_server_input_queue_push(app, ev);
+			}
+		}
+		break;
+	default: ipc_server_input_queue_push(IPC_INPUT_TARGET_CONTROLLER, ev); break;
+	}
+}
+
 // Translate an NSEvent (service-window input) into a wire input event and queue
 // it for the IPC handler to forward to the client app (#48). Mirrors the Windows
 // D3D11 service WndProc producer. Keyboard is reported as the lowercased Unicode
@@ -122,7 +209,7 @@ queue_ns_input_event(NSEvent *event)
 			        (ev.u.key.vk_code >= 32 && ev.u.key.vk_code < 127) ? (char)ev.u.key.vk_code : '?',
 			        ev.u.key.modifiers);
 		}
-		ipc_server_input_queue_push(&ev);
+		route_input_event(&ev);
 		return true;
 	}
 	case NSEventTypeLeftMouseDown:
@@ -141,7 +228,7 @@ queue_ns_input_event(NSEvent *event)
 		ev.u.pointer.cursor_x = (int64_t)px;
 		ev.u.pointer.cursor_y = (int64_t)py;
 		ev.u.pointer.modifiers = mods;
-		ipc_server_input_queue_push(&ev);
+		route_input_event(&ev);
 		return false; // also let AppKit handle it (window focus/drag)
 	}
 	case NSEventTypeMouseMoved:
@@ -164,7 +251,7 @@ queue_ns_input_event(NSEvent *event)
 		ev.u.scroll.cursor_x = (int64_t)px;
 		ev.u.scroll.cursor_y = (int64_t)py;
 		ev.u.scroll.modifiers = mods;
-		ipc_server_input_queue_push(&ev);
+		route_input_event(&ev);
 		return false;
 	}
 	default: return false;
@@ -279,7 +366,7 @@ ipc_server_macos_pump_main_thread(void)
 					mev.u.pointer_motion.cursor_x = (int64_t)px;
 					mev.u.pointer_motion.cursor_y = (int64_t)py;
 					mev.u.pointer_motion.button_mask = (uint32_t)[NSEvent pressedMouseButtons];
-					ipc_server_input_queue_push(&mev);
+					route_input_event(&mev);
 				}
 			}
 		}
