@@ -81,11 +81,47 @@ queue_ns_input_event(NSEvent *event)
 		if ([chars length] == 0) {
 			return false; // modifier-only / dead key — nothing to forward
 		}
-		unichar ch = (unichar)tolower([chars characterAtIndex:0]);
+		unichar raw = [chars characterAtIndex:0];
+		uint32_t vk;
+		// #61: translate macOS arrow / function keys into the Windows VK_* codes the
+		// controller's handlers expect (launcher arrows, F11 maximize, etc.). macOS
+		// delivers these as NS*FunctionKey unicode values (0xF7xx), not VK codes.
+		switch (raw) {
+		case 0xF700: vk = 0x26; break; // NSUpArrowFunctionKey    → VK_UP
+		case 0xF701: vk = 0x28; break; // NSDownArrowFunctionKey  → VK_DOWN
+		case 0xF702: vk = 0x25; break; // NSLeftArrowFunctionKey  → VK_LEFT
+		case 0xF703: vk = 0x27; break; // NSRightArrowFunctionKey → VK_RIGHT
+		case 0xF70E: vk = 0x7A; break; // NSF11FunctionKey        → VK_F11
+		default: {
+			unichar ch = raw;
+			// ONLY when Control is held does charactersIgnoringModifiers sometimes
+			// return the ASCII control char (Ctrl+L→0x0C); map THOSE back to letters
+			// so the controller's letter chords match. Gating on Control is essential
+			// — otherwise Return (0x0D), Tab (0x09) etc. would be corrupted into
+			// letters ('m', 'i', …), which broke Enter-to-launch + TAB.
+			bool ctrl_held = (mods & (1u << 1)) != 0;
+			if (ctrl_held && ch >= 1 && ch <= 26) {
+				ch = (unichar)(ch + 'a' - 1);
+			}
+			vk = (uint32_t)tolower(ch);
+			break;
+		}
+		}
 		ev.event_type = IPC_WORKSPACE_INPUT_EVENT_KEY;
-		ev.u.key.vk_code = (uint32_t)ch;
+		ev.u.key.vk_code = vk;
 		ev.u.key.is_down = (type == NSEventTypeKeyDown) ? 1u : 0u;
 		ev.u.key.modifiers = mods;
+		// Optional one-shot-per-press key diagnostic (gated; helps confirm chord
+		// delivery from a headless test). Off unless DXR_KEY_DEBUG is set.
+		static int s_key_dbg = -1;
+		if (s_key_dbg < 0) {
+			s_key_dbg = (getenv("DXR_KEY_DEBUG") != NULL) ? 1 : 0;
+		}
+		if (s_key_dbg && type == NSEventTypeKeyDown) {
+			U_LOG_W("[key] vk=0x%02x ('%c') mods=0x%x", ev.u.key.vk_code,
+			        (ev.u.key.vk_code >= 32 && ev.u.key.vk_code < 127) ? (char)ev.u.key.vk_code : '?',
+			        ev.u.key.modifiers);
+		}
 		ipc_server_input_queue_push(&ev);
 		return true;
 	}

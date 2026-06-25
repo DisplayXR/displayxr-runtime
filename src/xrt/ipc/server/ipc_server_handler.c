@@ -3491,6 +3491,14 @@ ipc_handle_workspace_activate(volatile struct ipc_client_state *_ics)
 		comp_d3d11_service_ensure_workspace_window(s->xsysc);
 #endif
 
+#ifdef XRT_OS_MACOS
+		// #61: keep the shared spatial surface rendering (empty backdrop + DXR
+		// splash + launcher band) while the controller is connected, even with no
+		// content app — wakes the render thread (the macOS analogue of eagerly
+		// creating the workspace window above).
+		comp_multi_system_set_workspace_active(s->xsysc, true);
+#endif
+
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 		// Force-reset to 3D (mode 1) on every workspace activate (#234).
 		// Use the direct DP-force helper instead of routing through the
@@ -3527,6 +3535,10 @@ ipc_handle_workspace_deactivate(volatile struct ipc_client_state *_ics)
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 		comp_d3d11_service_deactivate_workspace(s->xsysc);
+#endif
+#ifdef XRT_OS_MACOS
+		// #61: let the shared-surface render thread idle again (no controller).
+		comp_multi_system_set_workspace_active(s->xsysc, false);
 #endif
 	}
 

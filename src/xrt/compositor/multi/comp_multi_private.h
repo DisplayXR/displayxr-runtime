@@ -596,6 +596,17 @@ struct multi_system_compositor
 	} sessions;
 
 	/*!
+	 * #61 (macOS): true while a workspace controller (the shell) is connected.
+	 * A controller never xrBeginSession's, so it doesn't bump sessions.active_count
+	 * — but the shared spatial surface must still render (empty backdrop + DXR
+	 * splash + launcher band). Set by the workspace activate/deactivate handler via
+	 * @ref comp_multi_system_set_workspace_active, which also wakes the render
+	 * thread. Read under XRT_OS_MACOS in update_session_state_locked +
+	 * render_shared_surface_locked. Protected by oth. Unused on other platforms.
+	 */
+	bool workspace_active;
+
+	/*!
 	 * This mutex protects the list of client compositor
 	 * and the rendering timings on it.
 	 */
