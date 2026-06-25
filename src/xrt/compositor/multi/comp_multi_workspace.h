@@ -33,10 +33,24 @@
 
 struct xrt_compositor;
 struct xrt_swapchain;
+struct xrt_system_compositor;
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/*!
+ * #61 (macOS): mark the workspace controller as active/inactive on the shared
+ * system compositor and wake its render thread. The macOS shared spatial surface
+ * renders an empty backdrop + DXR splash + launcher band while a controller is
+ * connected, even with no active content app session (a controller never
+ * xrBeginSession's). Called from the IPC workspace activate / deactivate handlers.
+ * No-op / unused on other platforms (defined under XRT_OS_MACOS).
+ *
+ * @ingroup comp_multi
+ */
+void
+comp_multi_system_set_workspace_active(struct xrt_system_compositor *xsc, bool active);
 
 /*!
  * Compositor-local mirror of the controller's chrome layout — the subset the

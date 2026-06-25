@@ -4330,8 +4330,12 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	}
 
 	// Lazy-init the shared window/DP once a client is present. Avoids creating a
-	// full-screen window with nothing to show.
-	if (order_count == 0 && !msc->shared_surface_initialized) {
+	// full-screen window with nothing to show. #61: a connected workspace
+	// controller (the shell) submits no content yet still wants the surface up —
+	// an empty spatial desktop must show its backdrop + splash + launcher band. So
+	// also init when a workspace controller is active, not only when a content
+	// client is rendering.
+	if (order_count == 0 && !msc->shared_surface_initialized && !msc->workspace_active) {
 		return;
 	}
 	if (!shared_surface_init(msc, vk)) {
@@ -5225,6 +5229,20 @@ update_session_state_locked(struct multi_system_compositor *msc)
 	    .meta_body_tracking_calibration_enabled = false,
 	};
 
+	// #61: on macOS the shared spatial surface must keep rendering (empty backdrop
+	// + DXR splash + launcher band) while a workspace CONTROLLER (the shell) is
+	// connected, even with no active content app session — otherwise the render
+	// thread sleeps and no window ever appears. A controller never xrBeginSession's
+	// so it doesn't bump active_count; the activate handler sets workspace_active
+	// (and wakes this thread). macOS-only: elsewhere effective_active ==
+	// active_count, so the state machine is unchanged.
+	uint64_t effective_active = msc->sessions.active_count;
+#ifdef XRT_OS_MACOS
+	if (msc->workspace_active) {
+		effective_active = 1;
+	}
+#endif
+
 	switch (msc->sessions.state) {
 	case MULTI_SYSTEM_STATE_INIT_WARM_START:
 		// Produce at least one frame on init.
@@ -5234,7 +5252,7 @@ update_session_state_locked(struct multi_system_compositor *msc)
 		break;
 
 	case MULTI_SYSTEM_STATE_STOPPED:
-		if (msc->sessions.active_count == 0) {
+		if (effective_active == 0) {
 			break;
 		}
 
@@ -5244,7 +5262,7 @@ update_session_state_locked(struct multi_system_compositor *msc)
 		break;
 
 	case MULTI_SYSTEM_STATE_RUNNING:
-		if (msc->sessions.active_count > 0) {
+		if (effective_active > 0) {
 			break;
 		}
 
@@ -5254,7 +5272,7 @@ update_session_state_locked(struct multi_system_compositor *msc)
 
 	case MULTI_SYSTEM_STATE_STOPPING:
 		// Just in case
-		if (msc->sessions.active_count > 0) {
+		if (effective_active > 0) {
 			msc->sessions.state = MULTI_SYSTEM_STATE_RUNNING;
 			U_LOG_D("Restarting native session, %u active app session(s).",
 			        (uint32_t)msc->sessions.active_count);
@@ -5606,6 +5624,23 @@ multi_system_compositor_update_session_status(struct multi_system_compositor *ms
 
 	os_thread_helper_unlock(&msc->oth);
 }
+
+#ifdef XRT_OS_MACOS
+void
+comp_multi_system_set_workspace_active(struct xrt_system_compositor *xsc, bool active)
+{
+	if (xsc == NULL) {
+		return;
+	}
+	struct multi_system_compositor *msc = multi_system_compositor(xsc);
+	os_thread_helper_lock(&msc->oth);
+	msc->workspace_active = active;
+	// Wake the render thread so it (re)starts the shared-surface session even with
+	// no active content app (#61: empty spatial desktop + DXR splash + launcher).
+	os_thread_helper_signal_locked(&msc->oth);
+	os_thread_helper_unlock(&msc->oth);
+}
+#endif
 
 xrt_result_t
 comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
