@@ -20,13 +20,19 @@
 extern "C" {
 #endif
 
+struct ipc_server;
+
 /*!
  * Service the main thread's GCD queue + AppKit event queue, non-blocking.
  * Lazily bootstraps NSApplication on first call. Safe to call every poll
  * iteration; cheap when idle. Must be called from the main thread.
+ *
+ * @p s is the IPC server (for the workspace lifecycle hotkeys, #61): Ctrl+Space
+ * toggles the workspace controller (spawn when absent / SIGTERM when present),
+ * read from `s->workspace_controller_pid`. May be NULL (hotkeys become no-ops).
  */
 void
-ipc_server_macos_pump_main_thread(void);
+ipc_server_macos_pump_main_thread(struct ipc_server *s);
 
 #ifdef __cplusplus
 }

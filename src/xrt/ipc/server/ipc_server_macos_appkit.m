@@ -8,15 +8,24 @@
  */
 
 #import <Cocoa/Cocoa.h>
+#import <Carbon/Carbon.h> // RegisterEventHotKey — system-wide Ctrl+Space toggle (#61)
 
 #include "ipc_server_macos_appkit.h"
 #include "ipc_server_input_queue.h"
+#include "server/ipc_server.h"           // struct ipc_server::workspace_controller_pid (#61 lifecycle)
 #include "multi/comp_multi_workspace.h" // cursor pointer-position publish (#48 Phase 2)
 #include "shared/ipc_protocol.h"
 #include "util/u_logging.h"
 
 #include <stdbool.h>
 #include <ctype.h>
+#include <signal.h> // SIGTERM the controller on Ctrl+Space toggle (#61)
+#include <spawn.h>  // posix_spawn the workspace controller (#61)
+#include <stdlib.h> // getenv
+#include <string.h> // strerror
+#include <time.h>   // nanosleep (Cmd+Q grace period)
+
+extern char **environ;
 
 // Convert an NSEvent locationInWindow (points, bottom-left origin) to target
 // framebuffer pixels (top-left origin) via the window's backing scale +
@@ -258,8 +267,90 @@ queue_ns_input_event(NSEvent *event)
 	}
 }
 
+// Spawn the workspace controller (shell). The macOS analogue of the Windows
+// service_orchestrator's spawn_workspace (#61): the service is the persistent
+// root, and Ctrl+Space launches the controller on demand when none is running.
+// DISPLAYXR_SHELL_PATH points at the controller binary (or a dev launcher script
+// that sets the controller's env — XR_RUNTIME_JSON etc. — and execs it); the
+// child inherits the service's environment. Productization can move this to the
+// POSIX workspace-controller registry (service_workspace_registry) like Windows
+// reads HKLM. No-op with a warning if the path is unset/unspawnable.
+static void
+spawn_workspace_controller(void)
+{
+	const char *path = getenv("DISPLAYXR_SHELL_PATH");
+	if (path == NULL || path[0] == '\0') {
+		U_LOG_W("Workspace: Ctrl+Space but DISPLAYXR_SHELL_PATH is unset — cannot spawn the controller");
+		return;
+	}
+	char *const argv[] = {(char *)path, NULL};
+	pid_t pid = 0;
+	int rc = posix_spawn(&pid, path, NULL, NULL, argv, environ);
+	if (rc != 0) {
+		U_LOG_W("Workspace: failed to spawn controller '%s': %s", path, strerror(rc));
+		return;
+	}
+	U_LOG_W("Workspace: Ctrl+Space — spawned controller '%s' (pid %d)", path, (int)pid);
+}
+
+// TOGGLE the workspace controller (#61): SIGTERM it when running (its handler
+// runs the cleanup that kills the apps it launched, then it exits and the IPC
+// disconnect resets workspace_controller_pid → the next toggle spawns again);
+// spawn it when absent. Mirrors the Windows service_orchestrator Ctrl+Space.
+static void
+do_workspace_toggle(struct ipc_server *s)
+{
+	unsigned long ctrl_pid = (s != NULL) ? s->workspace_controller_pid : 0;
+	if (ctrl_pid != 0) {
+		U_LOG_W("Workspace: toggle — SIGTERM controller (pid %lu)", ctrl_pid);
+		kill((pid_t)ctrl_pid, SIGTERM);
+	} else {
+		spawn_workspace_controller();
+	}
+}
+
+// System-wide Ctrl+Space toggle (#61). The service window is created lazily only
+// once a client connects, so before the controller exists there is NO window to
+// receive NSEvents — the toggle must be a GLOBAL hotkey (the macOS analogue of
+// the Windows orchestrator's RegisterHotKey), which fires regardless of focus or
+// whether the app has any window. The Carbon handler just sets a flag; the pump
+// (which holds the ipc_server) performs the toggle.
+static volatile bool g_toggle_requested = false;
+
+static OSStatus
+toggle_hotkey_handler(EventHandlerCallRef next, EventRef evt, void *user)
+{
+	(void)next;
+	(void)evt;
+	(void)user;
+	g_toggle_requested = true;
+	return noErr;
+}
+
+static void
+install_toggle_hotkey(void)
+{
+	static bool installed = false;
+	if (installed) {
+		return;
+	}
+	installed = true;
+	EventTypeSpec spec = {kEventClassKeyboard, kEventHotKeyPressed};
+	InstallApplicationEventHandler(toggle_hotkey_handler, 1, &spec, NULL, NULL);
+	EventHotKeyRef ref;
+	// Primary: Ctrl+Space (Windows parity). On systems where the OS owns
+	// Ctrl+Space for "Select the previous input source", this registration is
+	// shadowed and won't fire — the fallback below covers that.
+	EventHotKeyID id1 = {.signature = 'DXR1', .id = 1};
+	RegisterEventHotKey(kVK_Space, controlKey, id1, GetApplicationEventTarget(), 0, &ref);
+	// Fallback: Ctrl+Option+Space (conflict-free) → same toggle.
+	EventHotKeyID id2 = {.signature = 'DXR2', .id = 2};
+	RegisterEventHotKey(kVK_Space, controlKey | optionKey, id2, GetApplicationEventTarget(), 0, &ref);
+	U_LOG_W("Workspace: registered toggle hotkey Ctrl+Space (fallback Ctrl+Option+Space)");
+}
+
 void
-ipc_server_macos_pump_main_thread(void)
+ipc_server_macos_pump_main_thread(struct ipc_server *s)
 {
 	@autoreleasepool {
 		static bool inited = false;
@@ -270,7 +361,18 @@ ipc_server_macos_pump_main_thread(void)
 				[NSApplication sharedApplication];
 				[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 			}
+			// System-wide Ctrl+Space toggle — must be a global hotkey because the
+			// service has no window (hence no key responder) until a controller
+			// connects (#61).
+			install_toggle_hotkey();
 			inited = true;
+		}
+
+		// Service the global toggle hotkey (set by the Carbon handler). Done here,
+		// holding the ipc_server, so spawn/SIGTERM can read workspace_controller_pid.
+		if (g_toggle_requested) {
+			g_toggle_requested = false;
+			do_workspace_toggle(s);
 		}
 
 		// Keep the workspace surface as the ACTIVE app so keyboard events reach
@@ -282,9 +384,17 @@ ipc_server_macos_pump_main_thread(void)
 		// unlike keyDown, route to the window under the cursor regardless of key
 		// status, which is why click-to-focus worked but TAB did not). The surface
 		// is a borderless full-screen desktop replacement that owns the display
-		// until the Esc/Cmd+Q kill-switch, so reclaim activation whenever we've
-		// lost it; once active this is a no-op. (#59/#48)
-		if (![NSApp isActive]) {
+		// while a controller is up, so reclaim activation whenever we've lost it;
+		// once active this is a no-op. (#59/#48)
+		//
+		// #61: ONLY while the workspace is active (a controller connected). With no
+		// controller the surface window is hidden (see the render gate) and the
+		// service is a background daemon — reclaiming activation here would steal
+		// focus from the user's desktop apps AND makeKeyAndOrderFront would re-show
+		// the window we just hid. Ctrl+Space (a global hotkey) respawns the
+		// controller, which sets workspace_mode and re-shows the surface.
+		bool workspace_up = (s != NULL) && s->workspace_mode;
+		if (workspace_up && ![NSApp isActive]) {
 			[NSApp activateIgnoringOtherApps:YES];
 			NSWindow *kw = [NSApp keyWindow];
 			if (kw == nil) {
@@ -309,20 +419,26 @@ ipc_server_macos_pump_main_thread(void)
 		                                   untilDate:nil
 		                                      inMode:NSDefaultRunLoopMode
 		                                     dequeue:YES]) != nil) {
-			// Workspace kill-switch (#59): the service window is a borderless
-			// full-screen surface that hides the menu bar + dock and owns the
-			// display, so there is no OS affordance to escape if something wedges.
-			// Esc here tears the whole workspace down (the service is the root —
-			// exiting drops every client's IPC connection so they shut down too).
-			// This is the macOS dev analogue of the Windows Ctrl+Space shell
-			// toggle until a real global hotkey is ported. Cmd+Q does the same.
+			// Cmd+Q — graceful FULL shutdown escape hatch (#61). SIGTERM the
+			// controller first (so its launched apps are cleaned up rather than
+			// orphaned on the abrupt IPC drop), give it a brief moment, then exit
+			// the service. Reachable once the surface window exists (a controller is
+			// up). ESC is NO LONGER a kill-switch — it flows through to the
+			// controller (restore-maximized / launcher-close). The Ctrl+Space toggle
+			// is a global hotkey (above), not handled here, since the service may
+			// have no window yet.
 			if ([event type] == NSEventTypeKeyDown) {
-				bool is_escape = ([event keyCode] == 53);
-				bool is_cmd_q = (([event modifierFlags] & NSEventModifierFlagCommand) != 0) &&
-				                [[event charactersIgnoringModifiers] isEqualToString:@"q"];
-				if (is_escape || is_cmd_q) {
-					U_LOG_W("Workspace: %s — terminating service (workspace kill-switch)",
-					        is_escape ? "Escape" : "Cmd+Q");
+				NSUInteger mf = [event modifierFlags];
+				bool cmd = (mf & NSEventModifierFlagCommand) != 0;
+				bool is_q = [[event charactersIgnoringModifiers] isEqualToString:@"q"];
+				if (cmd && is_q) {
+					U_LOG_W("Workspace: Cmd+Q — terminating service");
+					unsigned long ctrl_pid = (s != NULL) ? s->workspace_controller_pid : 0;
+					if (ctrl_pid != 0) {
+						kill((pid_t)ctrl_pid, SIGTERM);
+						struct timespec ts = {0, 300 * 1000 * 1000}; // 300 ms for shell cleanup
+						nanosleep(&ts, NULL);
+					}
 					exit(0);
 				}
 			}

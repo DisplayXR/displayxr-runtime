@@ -338,6 +338,36 @@ comp_window_macos_set_window_rect(struct comp_target *ct, int32_t x, int32_t y, 
 	}
 }
 
+//! Show/hide the full-screen surface window (#61). When the workspace controller
+//! goes away (Ctrl+Space toggle-off / shell exit) the service keeps running but
+//! must drop its borderless full-screen window so the macOS desktop returns —
+//! otherwise the last (empty backdrop) frame sits on top as a black screen with
+//! no menu bar/dock to escape. orderFront brings it back when a controller
+//! reconnects. Runs on the main thread (AppKit).
+void
+comp_window_macos_set_visible(struct comp_target *ct, bool visible)
+{
+	if (ct == NULL) {
+		return;
+	}
+	struct comp_window_macos *cwm = (struct comp_window_macos *)ct;
+	void (^work)(void) = ^{
+		if (cwm->window == nil) {
+			return;
+		}
+		if (visible) {
+			[cwm->window makeKeyAndOrderFront:nil];
+		} else {
+			[cwm->window orderOut:nil];
+		}
+	};
+	if ([NSThread isMainThread]) {
+		work();
+	} else {
+		dispatch_sync(dispatch_get_main_queue(), work);
+	}
+}
+
 static void
 comp_window_macos_flush(struct comp_target *ct)
 {

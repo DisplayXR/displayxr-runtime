@@ -655,6 +655,7 @@ struct multi_system_compositor
 	 * @{
 	 */
 	bool shared_surface_initialized; //!< True once the shared window + resources exist.
+	bool shared_window_visible;      //!< #61: full-screen window currently shown (orderFront) vs hidden (orderOut).
 	struct comp_target *shared_target;             //!< The one full-screen NSWindow target.
 	struct xrt_display_processor *shared_dp;       //!< The one DP that weaves the combined atlas.
 
