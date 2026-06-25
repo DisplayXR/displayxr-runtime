@@ -260,6 +260,27 @@ comp_multi_workspace_load_window_px_rect(struct xrt_compositor *target_xc,
                                          int32_t *out_w,
                                          int32_t *out_h);
 
+/*!
+ * #61 input routing: hit-test a display-pixel cursor position (top-left origin)
+ * against the placed window rects. Returns the target compositor of the topmost
+ * (nearest-to-viewer, largest pose.z) placed, visible window whose pixel rect
+ * contains @p x,@p y — or NULL if the cursor is over no window (chrome floats
+ * above the top edge, so it falls outside every content rect → NULL → controller).
+ * The macOS AppKit router uses this to forward content pointer/scroll/motion to
+ * the right client while routing workspace input to the controller.
+ */
+struct xrt_compositor *
+comp_multi_workspace_hit_test_window_px(int32_t x, int32_t y);
+
+/*!
+ * #61 input routing: the content client currently holding workspace focus (the
+ * value last set via @ref comp_multi_workspace_set_focused_client), or NULL. The
+ * AppKit router forwards content keystrokes to this client (keyboard follows
+ * focus, not the cursor).
+ */
+struct xrt_compositor *
+comp_multi_workspace_get_focused_client(void);
+
 
 /*
  *

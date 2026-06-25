@@ -22,6 +22,10 @@
 #include "d3d11_service/comp_d3d11_service.h"
 #endif
 
+#ifdef XRT_OS_MACOS
+#include "ipc_server_input_queue.h" // #61: drop a client's input-routing queue on destroy
+#endif
+
 #ifndef XRT_OS_WINDOWS
 
 #include <unistd.h>
@@ -564,6 +568,14 @@ ipc_server_client_destroy_session_and_compositor(volatile struct ipc_client_stat
 	// ours, and the render thread cannot reach the freed swapchain
 	// because the slot was already unregistered under render_mutex
 	// during xrt_comp_destroy.
+
+	// #61 (macOS): drop this client's input-routing queue before the compositor
+	// pointer (its key) is freed and potentially reused for a new client, which
+	// would otherwise inherit stale forwarded events. The compositor pointer value
+	// is still a valid key here even though xrt_comp_destroy frees the object.
+#ifdef XRT_OS_MACOS
+	ipc_server_input_queue_drop((void *)ics->xc);
+#endif
 
 	// Cast away volatile.
 	xrt_comp_destroy((struct xrt_compositor **)&ics->xc);

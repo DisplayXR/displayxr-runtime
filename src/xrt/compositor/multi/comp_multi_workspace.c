@@ -309,6 +309,48 @@ comp_multi_workspace_is_focused(struct xrt_compositor *target_xc)
 	return focused;
 }
 
+struct xrt_compositor *
+comp_multi_workspace_get_focused_client(void)
+{
+	ensure_lock();
+	os_mutex_lock(&g_lock);
+	struct xrt_compositor *f = g_focused_xc;
+	os_mutex_unlock(&g_lock);
+	return f;
+}
+
+struct xrt_compositor *
+comp_multi_workspace_hit_test_window_px(int32_t x, int32_t y)
+{
+	struct xrt_compositor *best = NULL;
+	float best_z = -1.0e30f;
+	ensure_lock();
+	os_mutex_lock(&g_lock);
+	for (int i = 0; i < CHROME_MAX_ENTRIES; i++) {
+		struct chrome_entry *e = &g_entries[i];
+		// Only placed, visible windows are hit-test targets. A minimized
+		// (hidden) window renders as a black canvas and must not swallow input.
+		if (e->target_xc == NULL || !e->win_pose_valid || e->hidden) {
+			continue;
+		}
+		if (x < e->win_px_x || x >= e->win_px_x + e->win_px_w) {
+			continue;
+		}
+		if (y < e->win_px_y || y >= e->win_px_y + e->win_px_h) {
+			continue;
+		}
+		// Topmost = nearest to viewer = largest pose.z (the painter pass draws
+		// far→near, so the largest-z window is on top). >= so a later equal-z
+		// slot wins deterministically.
+		if (e->win_pose.position.z >= best_z) {
+			best_z = e->win_pose.position.z;
+			best = e->target_xc;
+		}
+	}
+	os_mutex_unlock(&g_lock);
+	return best;
+}
+
 bool
 comp_multi_workspace_get_client_style(struct xrt_compositor *target_xc, struct comp_multi_client_style *out_style)
 {

@@ -3643,6 +3643,13 @@ ipc_handle_workspace_set_input_grab(volatile struct ipc_client_state *_ics, bool
 	IPC_INFO(s, "Workspace: set_input_grab %s", grab ? "true" : "false");
 	comp_d3d11_service_set_input_grab(s->xsysc, grab);
 	return XRT_SUCCESS;
+#elif defined(XRT_OS_MACOS)
+	// #61: the launcher band grabs all input. Flag the AppKit router so every
+	// event goes to the controller queue only (no content forwarding) until the
+	// band closes and the shell releases the grab.
+	(void)s;
+	ipc_server_input_queue_set_input_grab(grab);
+	return XRT_SUCCESS;
 #else
 	(void)s;
 	(void)grab;
@@ -4218,13 +4225,16 @@ ipc_handle_workspace_enumerate_input_events(volatile struct ipc_client_state *_i
 {
 	struct ipc_server *s = _ics->server;
 
-	// Use the activate-registered controller pid (macOS shell, #61) so a content
-	// app polling this same global queue can't steal the controller's input.
 	unsigned long expected_pid = effective_workspace_controller_pid(s);
 	unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
+#ifndef XRT_OS_MACOS
+	// Single shared queue (Windows/Android): the activate-registered controller
+	// pid gates the drain so a content app can't steal the controller's input.
+	// macOS has per-client queues (#61), so it keys by caller below instead.
 	if (expected_pid != 0 && caller_pid != expected_pid) {
 		return XRT_ERROR_NOT_AUTHORIZED;
 	}
+#endif
 
 	if (out_batch == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
@@ -4238,11 +4248,22 @@ ipc_handle_workspace_enumerate_input_events(volatile struct ipc_client_state *_i
 	bool ok = comp_d3d11_service_workspace_drain_input_events(s->xsysc, capacity, out_batch);
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
 #elif defined(XRT_OS_MACOS)
-	// macOS null+comp_multi service (#48): the AppKit pump captures NSEvents from
-	// the service-owned window into the generic input queue; drain it here so the
-	// client app can poll forwarded keyboard/mouse via xrEnumerateWorkspaceInputEventsEXT.
-	(void)s;
-	ipc_server_input_queue_drain(capacity, out_batch);
+	// macOS null+comp_multi service (#48/#61): the AppKit router hit-tests each
+	// NSEvent and pushes it onto a per-target queue. Each client drains only its
+	// own: the workspace controller drains the controller queue (NULL key); a
+	// content app drains the queue keyed by its own per-session compositor. With
+	// no controller registered (bare XRT_FORCE_MODE=ipc app, no shell) the router
+	// can't hit-test/focus anything, so all events land on the controller queue —
+	// drain that for everyone, preserving the original single-queue behavior.
+	void *key;
+	if (expected_pid == 0) {
+		key = IPC_INPUT_TARGET_CONTROLLER;
+	} else if (caller_pid == expected_pid) {
+		key = IPC_INPUT_TARGET_CONTROLLER; // controller drains the workspace queue
+	} else {
+		key = (void *)_ics->xc; // content app drains its own routed queue
+	}
+	ipc_server_input_queue_drain(key, capacity, out_batch);
 	return XRT_SUCCESS;
 #else
 	(void)s;
@@ -4272,12 +4293,15 @@ ipc_handle_workspace_pointer_capture_set(volatile struct ipc_client_state *_ics,
 	// macOS has no OS-level pointer capture to toggle: the appkit pump already
 	// publishes POINTER_MOTION every cycle from a global CGEventGetLocation poll
 	// (carrying the pressed-button mask), so a gesture's motion flows whether or
-	// not the cursor is over the window — capture is implicit. The controller's
-	// drag/resize/rotate gestures gate their start on this call succeeding, so
-	// accept it as a no-op rather than failing (which would dead-end every drag).
+	// not the cursor is over the window. But we DO record the capture state (#61
+	// input routing): while a controller drag/resize/rotate gesture holds capture,
+	// the router must send all pointer/scroll/motion to the controller only — even
+	// when the cursor passes over a content window — so the gesture isn't stolen
+	// by content forwarding. The shell enables capture at gesture start and
+	// disables it at gesture end.
 	(void)s;
-	(void)enabled;
 	(void)button;
+	ipc_server_input_queue_set_pointer_capture(enabled);
 	return XRT_SUCCESS;
 #else
 	(void)s;
