@@ -4335,11 +4335,27 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	// an empty spatial desktop must show its backdrop + splash + launcher band. So
 	// also init when a workspace controller is active, not only when a content
 	// client is rendering.
-	if (order_count == 0 && !msc->shared_surface_initialized && !msc->workspace_active) {
-		return;
+	// Show the full-screen surface only while a workspace controller or content
+	// client is present; hide it (and skip rendering the empty backdrop) when the
+	// controller goes away so the macOS desktop returns. The service stays running
+	// as a daemon — Ctrl+Space respawns the controller, which re-shows the surface.
+	// Without this, toggling the shell off left the borderless full-screen window
+	// up showing its last (empty) frame as a black screen with no way to escape.
+	bool should_show = (order_count > 0) || msc->workspace_active;
+	if (!should_show && !msc->shared_surface_initialized) {
+		return; // nothing to show yet, never initialized
 	}
 	if (!shared_surface_init(msc, vk)) {
 		return;
+	}
+	if (should_show != msc->shared_window_visible) {
+		comp_window_macos_set_visible(msc->shared_target, should_show);
+		msc->shared_window_visible = should_show;
+		U_LOG_W("[#61] shared surface window %s (controller %s, %u client(s))",
+		        should_show ? "shown" : "hidden", msc->workspace_active ? "active" : "gone", order_count);
+	}
+	if (!should_show) {
+		return; // idle: window hidden, desktop visible — don't render the backdrop
 	}
 
 	// Painter's sort (far first).

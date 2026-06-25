@@ -185,7 +185,10 @@ elseif(APPLE)
 			${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_input_queue.c
 			${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_input_queue.h
 		)
-	target_link_libraries(ipc_server PRIVATE "-framework CoreFoundation" "-framework Cocoa")
+	# Carbon: RegisterEventHotKey for the system-wide Ctrl+Space workspace toggle
+	# (the service has no window before a controller connects, so the toggle can't
+	# be an NSEvent — it must be a global hotkey, #61).
+	target_link_libraries(ipc_server PRIVATE "-framework CoreFoundation" "-framework Cocoa" "-framework Carbon")
 	# The macOS handler's DP-sourced server-side Kooima (#48) includes
 	# multi/comp_multi_private.h, which pulls in the Vulkan headers; aux_vk
 	# exposes ${Vulkan_INCLUDE_DIR} publicly. (Android gets these via the NDK

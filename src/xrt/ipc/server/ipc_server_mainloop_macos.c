@@ -213,7 +213,7 @@ ipc_server_mainloop_poll(struct ipc_server *vs, struct ipc_server_mainloop *ml)
 	// render-thread NSWindow creation (dispatch_sync to the main queue in
 	// comp_window_macos) can complete instead of deadlocking. Cheap when idle.
 	// (Shell Tier 1, #48 — the macOS service owns the present window.)
-	ipc_server_macos_pump_main_thread();
+	ipc_server_macos_pump_main_thread(vs);
 
 	// No sleeping, returns immediately.
 	int ret = kevent(ml->kqueue_fd, NULL, 0, events, NUM_POLL_EVENTS, &timeout);
