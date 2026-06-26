@@ -4208,6 +4208,95 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 			}
 			int base_x = (int)(states[i].anchor_x * (float)eye_w - states[i].pivot_x * (float)ow);
 			int base_y = (int)(states[i].anchor_y * (float)eye_h - states[i].pivot_y * (float)oh);
+
+			if (states[i].stereo_sbs) {
+				// Side-by-side stereo overlay (e.g. the 3D launcher band): the
+				// source image is two halves — left half = left-eye content,
+				// right half = right-eye content — each stretched to the full
+				// overlay footprint per eye. The placement rect is identical in
+				// both eye tiles (flat at z = 0); only the SAMPLED source half
+				// differs, so 3D pop comes from the controller's per-eye content,
+				// not geometric disparity of the band itself. The mono
+				// shared_blend_into_atlas path can't sub-sample the source, so
+				// route through the quad content-blend pipeline (it carries
+				// src_uv + use_src_alpha) as a flat (W = 1) axis-aligned quad —
+				// the chrome-pill treatment, minus the tilt. Mirror of the D3D11
+				// service stereo_sbs src-rect split (comp_d3d11_service.cpp).
+				if (!shared_ensure_content_blend(msc, vk)) {
+					continue;
+				}
+				VkImageMemoryBarrier ov_to_read = {
+				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				    .srcAccessMask = 0,
+				    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+				    .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+				    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				    .image = img,
+				    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+				};
+				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+				                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1,
+				                         &ov_to_read);
+				comp_multi_content_blend_begin(&msc->shared_content_blend, vk, cmd, msc->shared_atlas_fb,
+				                               (uint32_t)msc->shared_atlas_w, (uint32_t)msc->shared_atlas_h);
+				for (uint32_t eye = 0; eye < tile_columns; eye++) {
+					int tile_x0 = (int)eye * eye_w;
+					// Flat axis-aligned quad over the (clipped) overlay rect, in
+					// atlas px → NDC against the full atlas. W = 1 (no perspective),
+					// depth = 0. Corner order TL, BL, TR, BR matches the quad
+					// shader's win-local UV LUT (see shared_project_quad_for_eye).
+					float lx = (float)(tile_x0 + base_x);
+					float rx = lx + (float)ow;
+					float ty = (float)base_y;
+					float by = ty + (float)oh;
+					float aw = (float)msc->shared_atlas_w;
+					float ah = (float)msc->shared_atlas_h;
+#define NDX(px) ((px) / aw * 2.0f - 1.0f)
+#define NDY(px) ((px) / ah * 2.0f - 1.0f)
+					struct comp_multi_content_pc_quad pcq = {
+					    .corners =
+					        {
+					            {NDX(lx), NDY(ty), 0.0f, 1.0f}, // TL
+					            {NDX(lx), NDY(by), 0.0f, 1.0f}, // BL
+					            {NDX(rx), NDY(ty), 0.0f, 1.0f}, // TR
+					            {NDX(rx), NDY(by), 0.0f, 1.0f}, // BR
+					        },
+					    // Sample the matching half: eye 0 → left [0,0.5], eye 1 →
+					    // right [0.5,1]. The controller normalizes sbs-rl/tb/bt to
+					    // canonical left-half=left-eye, so the runtime is always lr.
+					    .src_uv_off = {(float)eye * 0.5f, 0.0f},
+					    .src_uv_scale = {0.5f, 1.0f},
+					    .corner_radius = 0.0f,
+					    .corner_aspect = 0.0f,
+					    .edge_feather = 0.0f,
+					    .use_src_alpha = 1.0f, // overlays are alpha sprites (scrim/tiles)
+					    .glow_color = {0.0f, 0.0f, 0.0f, 0.0f},
+					    .glow_intensity = 0.0f,
+					};
+#undef NDX
+#undef NDY
+					comp_multi_content_blend_draw_quad(&msc->shared_content_blend, vk, cmd, img, 0,
+					                                   sc->vkic.info.format, &pcq, tile_x0, 0,
+					                                   (uint32_t)eye_w, (uint32_t)eye_h,
+					                                   (uint32_t)msc->shared_atlas_w,
+					                                   (uint32_t)msc->shared_atlas_h);
+				}
+				comp_multi_content_blend_end(&msc->shared_content_blend, vk, cmd);
+				VkImageMemoryBarrier ov_to_general = {
+				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+				    .dstAccessMask = 0,
+				    .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+				    .image = img,
+				    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+				};
+				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+				                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1,
+				                         &ov_to_general);
+				continue;
+			}
+
 			for (uint32_t eye = 0; eye < tile_columns; eye++) {
 				int tile_x0 = (int)eye * eye_w;
 				shared_blend_into_atlas(msc, vk, cmd, img, tile_x0 + base_x, base_y, ow, oh,
