@@ -237,3 +237,77 @@ injection point, copy the canvas texture into an owned shared input, drive
 substitute it at `DrawTextureQuad` — a known SBS canvas shows real glasses-free 3D
 through `content_shell` on Leia. This validates Seam A (owned-input copy) + the RPC
 + the browser↔GPU bridge + Seam B composite end-to-end — the riskiest milestone.
+
+---
+
+## 7. B2c implementation notes (added during build — corrects §3 Seam B)
+
+B0/B1/B2a/B2b are done + Leia-validated (branch `displayxr-inline-3d` in
+`C:\src\chromium\src`). The B2c spike found a **correction to the Seam-B plan**:
+
+**The substitution cannot happen in `SkiaRenderer::DrawTextureQuad`.** That runs on
+the **compositor (display) thread**, which has **no** access to the `ID3D11Device`,
+`SharedImageManager`, `SharedImageFactory`, or the immediate context — those are
+GPU-thread-only members of **`SkiaOutputSurfaceImplOnGpu`**
+(`components/viz/service/display_embedder/skia_output_surface_impl.h:73`;
+private members `skia_output_surface_impl_on_gpu.h:500-502`). `DrawTextureQuad`
+only records a deferred display list; textures resolve later on the GPU thread.
+
+**So all D3D work moves to `SkiaOutputSurfaceImplOnGpu` (GPU main thread)** — the
+same thread the B2b Mojo remote was bound on (`PostCompositorThreadCreated`).
+`SkiaRenderer` only tags the target quad + ferries handles across the boundary.
+
+**Device identity:** in content_shell's default Ganesh-GL/ANGLE Viz, the canvas
+SharedImage textures, the DComp device, and the `D3DImageBackingFactory` all share
+**one** `ID3D11Device` = `GetDirectCompositionD3D11Device()`
+(`ui/gl/direct_composition_support.cc:827`; via ANGLE,
+`gpu_init.cc:976-979`) → CopyResource is same-device. (Breaks under Graphite-Dawn:
+`shared_context_state.cc:1400-1401`; not our build.)
+
+**The 6-step GPU-thread path (all pinned to M150):**
+1. **Tag quad / ferry handles** — `SkiaRenderer::DrawTextureQuad`
+   (`skia_renderer.cc:2619`), compositor thread. No D3D here.
+2. **Grab canvas D3D tex** — `shared_image_representation_factory_->ProduceOverlay(
+   mailbox)` → `BeginScopedReadAccess()` → `GetDCLayerOverlayImage()` (wraps the
+   `ID3D11Texture2D`). `d3d_image_representation.h:124`. (`GetD3D11Texture()` only
+   exists on `VideoImageRepresentation`, not generic — use Overlay.)
+3. **Copy region → owned keyed-mutex input; weave RPC** via the Mojo remote
+   (GPU main thread).
+4. **GPU-wait woven fence** — `gfx::D3DSharedFence::CreateFromUnownedHandle(h)`
+   (`ui/gfx/win/d3d_shared_fence.h:54`) → `WaitD3D11(GetDirectCompositionD3D11Device())`
+   (`d3d_shared_fence.cc:225-269`; opens fence + queues `ID3D11DeviceContext4::Wait`
+   internally — Viz needn't expose the context).
+5. **Import woven HANDLE as SharedImage** — wrap in `gfx::GpuMemoryBufferHandle`
+   type `DXGI_SHARED_HANDLE` (`gfx::DXGIHandle`), call
+   `shared_image_factory_->CreateSharedImage(mailbox, si_info, is_thread_safe,
+   handle)` → `D3DImageBackingFactory::CreateSharedImage`
+   (`d3d_image_backing_factory.cc:828-899`) → `DXGISharedHandleManager::
+   GetOrCreateSharedHandleState` (`:861-863`).
+6. **Substitute SkImage** — `ProduceSkia(woven_mailbox, context_state_,
+   {DISPLAY_READ})->BeginScopedReadAccess()->promise_image_texture()`
+   (mirrors `image_context_impl.cc:398-468`); swap the woven mailbox into the
+   tagged quad's `ImageContextImpl` so the existing `MakePromiseSkImage`
+   (`skia_output_surface_impl.h:142`) fulfills from the woven backing.
+
+**mojom extension (B2c):** `WeaveSubmit(gfx.mojom.DXGIHandle texture,
+gfx.mojom.Rect rect) => (DisplayXRWeaveResult? result)` with `{DXGIHandle woven,
+DXGIHandle fence, uint64 fence_value, uint32 w/h, array eyes, bool eyes_valid}`.
+Browser `DisplayXRWeaverImpl::WeaveSubmit` drives the real `xrWeaveSubmitEXT` on the
+B2a session and returns the result. (`gfx.mojom.DXGIHandle`:
+`ui/gfx/mojom/native_handle_types.mojom`, `[EnableIf=is_win]`, typemap
+`ui/gfx/mojom/BUILD.gn` — add `//ui/gfx/mojom` to the mojom deps.)
+
+**Slicing (validate incrementally, not big-bang):**
+- **B2c.1** — prove the full GPU-thread pipe with a **synthetic** input: GPU thread
+  creates an owned keyed-mutex input (test pattern), drives the real
+  `xrWeaveSubmitEXT` via the bridge, imports the woven result, fence-waits,
+  substitutes for the canvas quad. If the canvas region shows the woven synthetic
+  content in 3D, the hard pipe (handle marshalling both ways + real weave + fence +
+  import + substitute) is proven.
+- **B2c.2** — replace the synthetic input with the **real** canvas texture (step 2).
+
+**Identify the canvas quad** (B2 hardcode): largest `TextureDrawQuad` in the frame,
+or tag via `texture_layer_impl.cc:182` + `surface_aggregator.cc:1470-1484`.
+
+**Open:** keyed-mutex (woven tex) vs the separate fence — wait the fence *before*
+the draw, independent of the keyed-mutex acquire `D3DImageBacking` read-access does.
