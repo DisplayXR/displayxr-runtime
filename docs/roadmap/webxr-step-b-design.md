@@ -311,3 +311,50 @@ or tag via `texture_layer_impl.cc:182` + `surface_aggregator.cc:1470-1484`.
 
 **Open:** keyed-mutex (woven tex) vs the separate fence — wait the fence *before*
 the draw, independent of the keyed-mutex acquire `D3DImageBacking` read-access does.
+
+---
+
+## 8. B2c.1 build status (2026-06-26) — pipe proven, blocked on a runtime -2
+
+B2c.1 is **code-complete** on the Chromium patch branch `displayxr-inline-3d`
+(commit `1f110e06893a`) and the full pipe is **proven firing end-to-end** on the
+Leia box, with one **runtime-side** blocker remaining (not a patch bug).
+
+**Wired exactly per §7:** `WeaveSubmit(DXGIHandle,Rect)=>(result)` `[Sync]` mojom;
+browser `DisplayXRWeaverImpl` → real `xrWeaveSubmitEXT` on the B2a session;
+GPU-side `DisplayXRWeaveGpu` (impl of new `viz::DisplayXRWeaveProvider`, registered
+in `ShellContentGpuClient::PostCompositorThreadCreated`) owns the Mojo remote + a
+keyed-mutex synthetic SBS input; `SkiaRenderer::DrawTextureQuad` tags the canvas
+quad; `SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute` (Ganesh **and** Graphite
+paths) imports the woven handle + fence-waits + redirects the tagged
+`ImageContextImpl` via an override mailbox.
+
+**Launch prerequisites discovered (all required to even reach the weave):**
+- Forward `--enable-inline-3d` to child processes (`AppendExtraCommandLineSwitches`)
+  — else the GPU/Viz process never registers the provider / tags the quad.
+- content_shell uses **Graphite-Dawn**, not Ganesh → the substitution had to be
+  added to the graphite branch of `FinishPaintCurrentFrame` too.
+- content_shell defaults to **delegated compositing + DComp overlays**, so
+  `SkiaRenderer` never draws the canvas quad. Run with
+  `--disable-direct-composition` (and `--disable-features=CalculateNativeWin-
+  Occlusion,DelegatedCompositing`) so Viz draws quads via `SkiaRenderer`.
+- In this env content_shell rendered file:// / data: URLs as empty documents;
+  inject the canvas via CDP (`--remote-debugging-port` + `document.write`).
+
+**Proven (logs):** DrawTextureQuad tags the canvas → provider found → synthetic
+SBS input created → Mojo `[Sync]` → browser → `xrWeaveSubmitEXT` called with a
+valid non-null NT handle + window-relative rect (content_shell and the service
+both High integrity, so handle duplication is fine).
+
+**Blocker (runtime, not Chromium):** `xrWeaveSubmitEXT` returns **-2
+(`XR_ERROR_RUNTIME_FAILURE`)** every call. `comp_d3d11_service_weave_submit`
+silent-returns `false` **before** any of its `U_LOG_E` points (no
+`OpenSharedResource` / "server output" in the service log) — i.e. either the IPC
+handle transport, or a silent early-return (prime suspect:
+`c->render.display_processor == nullptr` for a present-owner session that never
+runs a frame loop). The CEF host (Step A) drove `weave_submit` fine **without**
+`xrBeginSession`, so it is not a missing begin. **Next step:** add a service-side
+log at the `comp_d3d11_service_weave_submit` entry (which early-return fires; the
+`in` handle value) — pinpoints DP-null vs handle-null — then the
+import/fence/substitute path runs and the **Leia eyeball** (B2c.1 success
+criterion: each eye a different solid color across the canvas) can be done.
