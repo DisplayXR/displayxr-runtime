@@ -37,12 +37,19 @@
 extern "C" {
 #endif
 
-//! Max distinct (image, array-layer) sources cached for descriptor sets.
+//! Max distinct content (image, array-layer) sources tracked by the caller's
+//! GENERAL<->SHADER_READ barrier batch (sized in comp_multi_system.c too).
 #define COMP_MULTI_CONTENT_BLEND_MAX_IMAGES 64
+
+//! Max distinct (image, array-layer) views cached internally (content + HUD).
+#define COMP_MULTI_CONTENT_BLEND_MAX_VIEWS 128
+
+//! Max distinct (content image+layer, HUD image) descriptor sets cached.
+#define COMP_MULTI_CONTENT_BLEND_MAX_DESCS 128
 
 /*!
  * Per-draw push constants. Layout (std430 push_constant) MUST match
- * content.frag exactly — offsets 0,8,16,24,32,36,40,44.
+ * content.frag exactly — offsets 0,8,16,24,32,36,40,44,48,64,80,96,100.
  */
 struct comp_multi_content_pc
 {
@@ -55,6 +62,13 @@ struct comp_multi_content_pc
 	float edge_feather;    //!< Feather width as a fraction of window HEIGHT (0 = off).
 	float glow_intensity;  //!< Focus tint strength; 0 = no tint (unfocused / disabled).
 	float glow_color[4];   //!< Focus tint RGB + A multiplier (controller XrWorkspaceClientStyleEXT).
+	// HUD compose (XR_EXT_window_space_layer), sampled from binding 1 OVER the
+	// content in window-local UV, BEFORE corner/feather/glow. std430 float[4]
+	// has scalar stride 4 so these match the C arrays byte-for-byte.
+	float hud_dst_rect[4]; //!< HUD placement in window-local [0,1] UV (xy = origin, zw = size).
+	float hud_src_rect[4]; //!< HUD source UV (xy = origin, zw = size; signed h = flip_y).
+	float hud_present;     //!< >0.5 = compose the HUD from binding 1; else skip.
+	float hud_premul;      //!< >0.5 = HUD is premultiplied; else straight alpha.
 };
 
 /*!
@@ -76,6 +90,12 @@ struct comp_multi_content_pc_quad
 	float use_src_alpha;   //!< >0.5 = modulate by texture alpha (chrome pill); else opaque coverage.
 	float glow_color[4];   //!< Focus tint RGB + A multiplier (content only).
 	float glow_intensity;  //!< Focus tint strength; 0 = no tint.
+	// HUD compose — identical semantics to comp_multi_content_pc (binding 1,
+	// window-local UV via v_win_uv). Chrome/overlay quads pass hud_present = 0.
+	float hud_dst_rect[4]; //!< HUD placement in window-local [0,1] UV (xy = origin, zw = size).
+	float hud_src_rect[4]; //!< HUD source UV (xy = origin, zw = size; signed h = flip_y).
+	float hud_present;     //!< >0.5 = compose the HUD from binding 1; else skip.
+	float hud_premul;      //!< >0.5 = HUD is premultiplied; else straight alpha.
 };
 
 struct comp_multi_content_blend
@@ -98,15 +118,28 @@ struct comp_multi_content_blend
 	VkShaderModule quad_frag_mod;
 	bool quad_initialized;
 
-	//! Cache of (VkImage, array-layer) → VkImageView + VkDescriptorSet.
+	//! Cache of (VkImage, array-layer) → VkImageView, shared by content and HUD
+	//! sources (a HUD image is just another sampled source, at array-layer 0).
 	struct
 	{
 		VkImage image;
 		uint32_t array_layer;
 		VkImageView view;
+	} cached_views[COMP_MULTI_CONTENT_BLEND_MAX_VIEWS];
+	uint32_t view_count;
+
+	//! Cache of (content image+layer, HUD image) → 2-binding VkDescriptorSet
+	//! (binding 0 = content view, binding 1 = HUD view). When a draw has no HUD
+	//! the content image is self-bound at binding 1 (hud_present = 0 in the PC),
+	//! so the key's hud_image equals the content image — no dummy texture needed.
+	struct
+	{
+		VkImage content_image;
+		uint32_t content_layer;
+		VkImage hud_image;
 		VkDescriptorSet desc_set;
-	} cached_images[COMP_MULTI_CONTENT_BLEND_MAX_IMAGES];
-	uint32_t image_count;
+	} cached_descs[COMP_MULTI_CONTENT_BLEND_MAX_DESCS];
+	uint32_t desc_count;
 
 	bool initialized;
 };
@@ -135,7 +168,10 @@ comp_multi_content_blend_begin(
  * src_fmt identify the content source (sampled via a cached view of that layer);
  * @p pc carries the source sub-rect, window-local UV domain and corner/feather
  * params; @p dst_* is the atlas-px destination rect (already tile-clipped).
- * Must be called between begin and end.
+ * @p hud_image / @p hud_fmt identify the HUD source bound at binding 1 (its
+ * image must be SHADER_READ for the pass); pass VK_NULL_HANDLE when this draw
+ * has no HUD (the content image is then self-bound at binding 1 and pc.hud_present
+ * must be 0). Must be called between begin and end.
  */
 void
 comp_multi_content_blend_draw(struct comp_multi_content_blend *blend,
@@ -144,6 +180,8 @@ comp_multi_content_blend_draw(struct comp_multi_content_blend *blend,
                               VkImage src_image,
                               uint32_t array_layer,
                               VkFormat src_fmt,
+                              VkImage hud_image,
+                              VkFormat hud_fmt,
                               const struct comp_multi_content_pc *pc,
                               int32_t dst_x,
                               int32_t dst_y,
@@ -166,6 +204,8 @@ comp_multi_content_blend_draw_quad(struct comp_multi_content_blend *blend,
                                    VkImage src_image,
                                    uint32_t array_layer,
                                    VkFormat src_fmt,
+                                   VkImage hud_image,
+                                   VkFormat hud_fmt,
                                    const struct comp_multi_content_pc_quad *pc,
                                    int32_t scissor_x,
                                    int32_t scissor_y,

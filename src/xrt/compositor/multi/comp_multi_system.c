@@ -4149,7 +4149,8 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 					};
 					memcpy(pcq.corners, corners, sizeof(corners));
 					comp_multi_content_blend_draw_quad(&msc->shared_content_blend, vk, cmd,
-					                                   chrome_img, 0, sc->vkic.info.format, &pcq,
+					                                   chrome_img, 0, sc->vkic.info.format,
+					                                   VK_NULL_HANDLE, VK_FORMAT_UNDEFINED, &pcq,
 					                                   tile_x0, 0, (uint32_t)eye_w, (uint32_t)eye_h,
 					                                   (uint32_t)msc->shared_atlas_w,
 					                                   (uint32_t)msc->shared_atlas_h);
@@ -4186,6 +4187,12 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 			                        tile_x0 + eye_w, 0, eye_h);
 		}
 	}
+
+	// Per-client window-space HUD layers (XR_EXT_window_space_layer) are NOT a
+	// separate decoration pass anymore: they are baked INTO the content draw in
+	// render_shared_surface_locked (binding 1 of comp_multi_content_blend), so the
+	// HUD shares the window's rounded-corner clip, focus glow (OVER the HUD) and
+	// rotation for free — the Windows D3D11 model (d3d11_service_shaders.h:854-914).
 
 	// Session-global overlays (taskbar/launcher), flat at z = 0 in both eye tiles.
 	{
@@ -4276,7 +4283,8 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 #undef NDX
 #undef NDY
 					comp_multi_content_blend_draw_quad(&msc->shared_content_blend, vk, cmd, img, 0,
-					                                   sc->vkic.info.format, &pcq, tile_x0, 0,
+					                                   sc->vkic.info.format, VK_NULL_HANDLE,
+					                                   VK_FORMAT_UNDEFINED, &pcq, tile_x0, 0,
 					                                   (uint32_t)eye_w, (uint32_t)eye_h,
 					                                   (uint32_t)msc->shared_atlas_w,
 					                                   (uint32_t)msc->shared_atlas_h);
@@ -4329,6 +4337,54 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 			}
 		}
 	}
+}
+
+/*!
+ * Find a client's first XR_EXT_window_space_layer HUD source — the layer the
+ * macOS shared surface composites into binding 1 of the content shader (so the
+ * HUD shares the window's rounded-corner clip, focus glow and rotation, the
+ * Windows D3D11 model). Returns the VkImage (VK_NULL_HANDLE if the client has no
+ * usable window-space layer this frame) and fills @p out_fmt / @p out_ws /
+ * @p out_flip. The HUD is always a 2D, layer-0 image.
+ */
+static VkImage
+shared_find_client_hud(const struct shared_client_render *e,
+                       VkFormat *out_fmt,
+                       const struct xrt_layer_window_space_data **out_ws,
+                       bool *out_flip,
+                       float *out_premul)
+{
+	*out_fmt = VK_FORMAT_UNDEFINED;
+	*out_ws = NULL;
+	*out_flip = false;
+	*out_premul = 0.0f;
+	struct multi_compositor *mc = e->mc;
+	for (uint32_t li = 0; li < mc->delivered.layer_count; li++) {
+		const struct multi_layer_entry *wl = &mc->delivered.layers[li];
+		if (wl->data.type != XRT_LAYER_WINDOW_SPACE) {
+			continue;
+		}
+		struct xrt_swapchain *wxsc = wl->xscs[0];
+		struct comp_swapchain *wsc = (wxsc != NULL) ? comp_swapchain(wxsc) : NULL;
+		const struct xrt_layer_window_space_data *ws = &wl->data.window_space;
+		if (wsc == NULL || ws->sub.image_index >= wsc->vkic.image_count) {
+			return VK_NULL_HANDLE;
+		}
+		VkImage wim = wsc->vkic.images[ws->sub.image_index].handle;
+		if (wim == VK_NULL_HANDLE) {
+			return VK_NULL_HANDLE;
+		}
+		*out_fmt = wsc->vkic.info.format;
+		*out_ws = ws;
+		*out_flip = wl->data.flip_y;
+		// Premultiplied unless the app asked for BLEND_TEXTURE_SOURCE_ALPHA_BIT
+		// (straight alpha) — same convention as the D3D11 service (comp_d3d11_
+		// service.cpp:6921). The cube HUD sets that bit, so premul = 0 (straight).
+		*out_premul = (wl->data.flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) == 0 ? 1.0f
+		                                                                                            : 0.0f;
+		return wim;
+	}
+	return VK_NULL_HANDLE;
 }
 
 /*!
@@ -4624,6 +4680,28 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 					uniq_n++;
 				}
 			}
+			// The client's window-space HUD image (binding 1) is sampled in the
+			// same render pass, so it needs the same GENERAL → SHADER_READ
+			// transition; collect it (array-layer 0) alongside the content.
+			VkFormat hud_fmt = VK_FORMAT_UNDEFINED;
+			const struct xrt_layer_window_space_data *hud_ws = NULL;
+			bool hud_flip = false;
+			float hud_premul = 0.0f;
+			VkImage hud_im = shared_find_client_hud(e, &hud_fmt, &hud_ws, &hud_flip, &hud_premul);
+			if (hud_im != VK_NULL_HANDLE) {
+				bool found = false;
+				for (uint32_t u = 0; u < uniq_n; u++) {
+					if (uniq[u] == hud_im && uniq_arr[u] == 0) {
+						found = true;
+						break;
+					}
+				}
+				if (!found && uniq_n < COMP_MULTI_CONTENT_BLEND_MAX_IMAGES) {
+					uniq[uniq_n] = hud_im;
+					uniq_arr[uniq_n] = 0;
+					uniq_n++;
+				}
+			}
 		}
 		if (uniq_n > 0) {
 			VkImageMemoryBarrier pre[COMP_MULTI_CONTENT_BLEND_MAX_IMAGES];
@@ -4693,6 +4771,46 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 				}
 			}
 
+			// First window-space HUD layer for this client — composited INTO the
+			// content draw (binding 1) so it shares the window's rounded-corner
+			// clip, the focus glow (applied OVER it) and rotation. Mirrors the
+			// D3D11 monolith HUD compose (d3d11_service_shaders.h:854-914,
+			// comp_d3d11_service.cpp ~7318): hud_dst_rect lives in window-local
+			// [0,1] UV — the shader's uv01 (axis) / v_win_uv (quad) domain.
+			VkFormat hud_fmt = VK_FORMAT_UNDEFINED;
+			const struct xrt_layer_window_space_data *hud_ws = NULL;
+			bool hud_flip = false;
+			float hud_premul = 0.0f;
+			VkImage hud_img = shared_find_client_hud(e, &hud_fmt, &hud_ws, &hud_flip, &hud_premul);
+			// Source sub-rect → normalized UV (flip baked into signed height).
+			float hud_src_u = hud_ws ? hud_ws->sub.norm_rect.x : 0.0f;
+			float hud_src_v = hud_ws ? (hud_flip ? hud_ws->sub.norm_rect.y + hud_ws->sub.norm_rect.h
+			                                     : hud_ws->sub.norm_rect.y)
+			                         : 0.0f;
+			float hud_src_w = hud_ws ? hud_ws->sub.norm_rect.w : 0.0f;
+			float hud_src_h = hud_ws ? (hud_flip ? -hud_ws->sub.norm_rect.h : hud_ws->sub.norm_rect.h) : 0.0f;
+			// Fill the HUD push-constant fields of a content PC (axis or quad —
+			// same field names). Per-eye disparity shifts the HUD in window-local
+			// UV (3D only): eye 0 → -disparity/2, eye 1 → +disparity/2.
+#define SHARED_SET_HUD_PC(PCV)                                                                                       \
+	do {                                                                                                       \
+		if (hud_ws != NULL) {                                                                               \
+			float es = (tile_columns > 1) ? ((eye == 0) ? -hud_ws->disparity * 0.5f                     \
+			                                            : hud_ws->disparity * 0.5f)                      \
+			                              : 0.0f;                                                          \
+			(PCV).hud_dst_rect[0] = hud_ws->x + es;                                                     \
+			(PCV).hud_dst_rect[1] = hud_ws->y;                                                          \
+			(PCV).hud_dst_rect[2] = hud_ws->width;                                                      \
+			(PCV).hud_dst_rect[3] = hud_ws->height;                                                     \
+			(PCV).hud_src_rect[0] = hud_src_u;                                                          \
+			(PCV).hud_src_rect[1] = hud_src_v;                                                          \
+			(PCV).hud_src_rect[2] = hud_src_w;                                                          \
+			(PCV).hud_src_rect[3] = hud_src_h;                                                          \
+			(PCV).hud_present = 1.0f;                                                                   \
+			(PCV).hud_premul = hud_premul;                                                              \
+		}                                                                                                  \
+	} while (0)
+
 			for (uint32_t eye = 0; eye < tile_columns; eye++) {
 				uint32_t v = (eye < e->view_count) ? eye : (e->view_count - 1);
 				int tw = 0, th = 0;
@@ -4746,9 +4864,10 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 					    .glow_intensity = glow_intensity,
 					};
 					memcpy(pcq.corners, corners, sizeof(corners));
+					SHARED_SET_HUD_PC(pcq);
 					comp_multi_content_blend_draw_quad(
-					    &msc->shared_content_blend, vk, cmd, im, ai, fmt, &pcq, tile_x0_e, 0,
-					    (uint32_t)eye_w, (uint32_t)eye_h, (uint32_t)msc->shared_atlas_w,
+					    &msc->shared_content_blend, vk, cmd, im, ai, fmt, hud_img, hud_fmt, &pcq,
+					    tile_x0_e, 0, (uint32_t)eye_w, (uint32_t)eye_h, (uint32_t)msc->shared_atlas_w,
 					    (uint32_t)msc->shared_atlas_h);
 					continue;
 				}
@@ -4803,10 +4922,12 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 				    .glow_intensity = glow_intensity,
 				    .glow_color = {glow_color[0], glow_color[1], glow_color[2], glow_color[3]},
 				};
-				comp_multi_content_blend_draw(&msc->shared_content_blend, vk, cmd, im, ai, fmt, &pc,
-				                              (int32_t)cdx0, (int32_t)cdy0,
+				SHARED_SET_HUD_PC(pc);
+				comp_multi_content_blend_draw(&msc->shared_content_blend, vk, cmd, im, ai, fmt,
+				                              hud_img, hud_fmt, &pc, (int32_t)cdx0, (int32_t)cdy0,
 				                              (uint32_t)(cdx1 - cdx0), (uint32_t)(cdy1 - cdy0));
 			}
+#undef SHARED_SET_HUD_PC
 		}
 		comp_multi_content_blend_end(&msc->shared_content_blend, vk, cmd);
 
@@ -5240,6 +5361,16 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 				// (blit into the target's 2D region, #568); the shared/
 				// downstream path has no consumer — drop quietly.
 				break;
+#ifdef XRT_OS_MACOS
+			case XRT_LAYER_WINDOW_SPACE:
+				// Window-space HUD: composited INTO the macOS shared-surface
+				// content draw (binding 1 of comp_multi_content_blend, in
+				// render_shared_surface_locked), not in this per-layer transfer.
+				// Drop quietly here so it doesn't spam the log per-frame. Windows
+				// handles it inline in the D3D11 monolith; other platforms still
+				// fall to the default below (unchanged).
+				break;
+#endif
 			default: U_LOG_E("Unhandled layer type '%i'!", layer->data.type); break;
 			}
 		}
