@@ -316,6 +316,8 @@ the draw, independent of the keyed-mutex acquire `D3DImageBacking` read-access d
 
 ## 8. B2c.1 build status (2026-06-26) — pipe proven, blocked on a runtime -2
 
+> **Update: the runtime -2 is RESOLVED — see [§9](#9-b2c1-runtime--2--root-caused--fixed-2026-06-26).** This section is the point-in-time build status that led to the diagnosis.
+
 B2c.1 is **code-complete** on the Chromium patch branch `displayxr-inline-3d`
 (commit `1f110e06893a`) and the full pipe is **proven firing end-to-end** on the
 Leia box, with one **runtime-side** blocker remaining (not a patch bug).
@@ -358,3 +360,50 @@ log at the `comp_d3d11_service_weave_submit` entry (which early-return fires; th
 `in` handle value) — pinpoints DP-null vs handle-null — then the
 import/fence/substitute path runs and the **Leia eyeball** (B2c.1 success
 criterion: each eye a different solid color across the canvas) can be done.
+
+---
+
+## 9. B2c.1 runtime -2 — ROOT-CAUSED + FIXED (2026-06-26)
+
+The -2 is a **runtime DP-availability bug, gated on workspace mode** — *not* the
+IPC handle transport. Diagnosed by instrumenting every silent early-return in
+`comp_d3d11_service_weave_submit` and reproducing the weave with two **browser-
+free** present-owners (the `weave_rpc_probe_d3d11_win` test app and the Step-A CEF
+host), which fire the same `xrWeaveSubmitEXT` RPC deterministically (no dependence
+on a browser compositor producing frames — content_shell would not composite under
+the headless automation harness, so it was a poor diagnosis vehicle).
+
+**Findings (service-side `#625 weave_submit ENTRY` log):**
+- The present-owner session reaches `weave_submit` with a **valid** `in_handle`
+  and a bound `weave_hwnd` — handle transport is fine, `bindWindow` is fine.
+- `c->render.display_processor == nullptr` **iff `workspace_mode == 1`.** The per-
+  client DP is created in `init_client_render_resources` **only when no workspace
+  is active** (`dp_fac != NULL && !sys->workspace_mode`) — a second per-client DP
+  while a workspace is up makes the SR SDK recalibrate its weaver. So a present-
+  owner that connects *while the spatial shell is active* has no per-client DP and
+  `weave_submit` hit its `sys/DP-null` early-return → false → -2.
+- In **non-workspace** mode the per-client DP exists and the weave **succeeds**
+  end-to-end (CEF host: 50+ submits, no early-returns, `process_atlas` runs).
+
+**The original B2c.1 -2 happened because the spatial shell was running** (workspace
+mode active) when content_shell connected.
+
+**Fix** (`comp_d3d11_service_weave_submit`): when `c->render.display_processor` is
+null, fall back to the **shared multi-compositor DP** (`sys->multi_comp->
+display_processor`) instead of failing. `process_atlas` takes the output dims +
+sub-rect explicitly, so it weaves the present-owner's own window-sized handback
+regardless of which DP instance drives it; the render thread and `weave_submit`
+both run `process_atlas` under `sys->render_mutex`, so the shared DP is serialized
+(no concurrent immediate-context use). Lowest-risk option — **creates no new DP**,
+so zero SR-recalibration risk to the active workspace. (Phase caveat: the shared
+DP's interlace phase references the workspace window. Phase-independent for the
+synthetic SBS test pattern; real content phase-snaps via `xrWeaveSnapWindowRectEXT`
+— a B2c.2 follow-up if a window-bound phase is needed.)
+
+**Validated** (deterministic, both modes) with `weave_rpc_probe_d3d11_win`: in
+workspace mode the new `per-client DP absent … using the shared multi-compositor
+DP` path engages, `process_atlas weave: vp=(240,100 640x360)` runs, the probe logs
+no failure, and the captured woven output (`%TEMP%\weave_probe_output.bmp`) shows
+the synthetic SBS confined to the requested sub-rect. Non-workspace mode is
+unchanged (per-client DP, no fallback log). The runtime block is cleared; the live
+**Leia eyeball** of the 3D effect remains a human step.
