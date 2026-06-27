@@ -407,3 +407,53 @@ no failure, and the captured woven output (`%TEMP%\weave_probe_output.bmp`) show
 the synthetic SBS confined to the requested sub-rect. Non-workspace mode is
 unchanged (per-client DP, no fallback log). The runtime block is cleared; the live
 **Leia eyeball** of the 3D effect remains a human step.
+
+---
+
+## 10. B2c.2 — real canvas texture substituted (2026-06-27)
+
+B2c.2 swaps the B2c.1 synthetic test-pattern input for the **real tagged canvas
+texture**, so the woven 3D is the page's own canvas pixels. **Code-complete +
+builds clean** on `displayxr-inline-3d` (commit `656af477c0d3c`). Implements §7
+step 2, with two corrections to the §7 plan found during the build:
+
+- **Device identity is a non-issue on the default config.** content_shell's
+  Graphite-Dawn runs the **D3D11 backend** (`kSkiaGraphiteDawnUseD3D12` is
+  default-off) which **shares ANGLE's D3D11 device** (`dawn_context_provider.cc`
+  "Share D3D11 device with ANGLE"), so the canvas SharedImage, DComp, and
+  `context_state_->GetD3D11Device()` are **one device X**. The weave input is now
+  allocated on device X (the provider dropped its private device), making the
+  `CopySubresourceRegion` a legal same-device copy.
+- **`ProduceOverlay` can't be used as-is.** A normal 2D canvas SI is
+  `DISPLAY_READ`-only (no `SCANOUT`), and the manager's `ProduceOverlay` hard-
+  enforces SCANOUT. Added a Win-only **`ProduceOverlayForWeave`** (SharedImage
+  `Manager` + `RepresentationFactory`) = `ProduceOverlay` minus the SCANOUT gate;
+  it still yields the D3D overlay representation whose `GetDCLayerOverlayImage()`
+  exposes the canvas `ID3D11Texture2D`. (`EnforceSharedImageUsage` is non-fatal —
+  `DumpWithoutCrashing` — but would fire per-frame, hence the dedicated variant.)
+
+Flow: Viz `MaybeWeaveSubstitute` → `ProduceOverlayForWeave(target->mailbox())` →
+`BeginScopedReadAccess()` → `GetDCLayerOverlayImage()->d3d11_video_texture()` →
+`WeaveCanvas(deviceX, canvas_tex, slice, src, window)`; the provider copies the
+canvas sub-rect into the keyed-mutex input (format taken from the canvas desc so
+the copy is always legal) and drives the **unchanged** Mojo weave RPC / woven
+import / fence-wait / substitute. Test page (`%TEMP%\inject_b2c1.py`) now paints
+left-GREEN / right-MAGENTA SBS (deliberately ≠ the synthetic red/blue) so a
+successful eyeball proves canvas provenance.
+
+**Live Leia eyeball: PENDING — blocked on content_shell frame production, not on
+the B2c.2 code.** This session the full pipe came up live (browser weave client
+`D3D11=1 … weave=1`, `xrWeaveBindWindowEXT(hwnd=…) -> 0 — B2a PASSED`, `B2c GPU
+weave provider registered`) and the SBS canvas injected (CDP, 2050×1620), but
+**content_shell produced zero compositor frames** (`window.__t`/rAF stuck at 0;
+the page was visible+non-hidden but the compositor never ticked). Foreground +
+resize-nudge, `Page.startScreencast`, and `Emulation.setFocusEmulationEnabled`
+all failed to drive a frame (Windows foreground-lock denies a High-harness
+`SetForegroundWindow`). This is the same content_shell-won't-composite-under-
+automation wall §9 documents — there the runtime weave was validated with the
+synthetic `weave_rpc_probe` instead, but the **canvas-read** path that *is* B2c.2
+can only be exercised through `content_shell`. The eyeball needs a **genuinely
+interactive desktop launch** (user double-clicks `%TEMP%\run_b2c1.bat`, runs
+`%TEMP%\inject_b2c1.py`, clicks the window) so the window gets real foreground and
+the compositor ticks — that interactive path is what produced "continuous rAF" in
+the B2c.1 build session (§7 note 4).
