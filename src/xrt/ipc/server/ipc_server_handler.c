@@ -138,6 +138,24 @@ orchestrator_workspace_supports_file_dialog(void)
 	return s_workspace_file_dialog_provider ? s_workspace_file_dialog_provider() : false;
 }
 
+static ipc_server_workspace_summon_fn s_workspace_summon_provider = NULL;
+
+void
+ipc_server_set_workspace_summon_provider(ipc_server_workspace_summon_fn fn)
+{
+	s_workspace_summon_provider = fn;
+}
+
+bool
+ipc_server_request_workspace_summon(void)
+{
+	if (s_workspace_summon_provider == NULL) {
+		return false;
+	}
+	s_workspace_summon_provider();
+	return true;
+}
+
 
 /*
  *

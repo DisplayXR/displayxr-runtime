@@ -98,6 +98,11 @@ struct comp_window_macos
 	NSWindow *window;
 	NSView *view;
 	CAMetalLayer *metal_layer;
+
+	//! Whether we currently have the OS cursor hidden (workspace renders its own
+	//! sprite). Tracked so hide/show stay balanced across show/hide/destroy and
+	//! the desktop cursor reappears the instant the surface is hidden (#61).
+	bool cursor_hidden;
 };
 
 
@@ -215,8 +220,11 @@ create_window_on_main_thread(struct comp_window_macos *cwm, uint32_t width, uint
 
 	// Hide the OS cursor (#61): the workspace renders its own cursor sprite, so the
 	// system arrow would double up (matches Windows). Mouse position still tracked
-	// via the per-cycle CGEventGetLocation poll in the AppKit pump.
+	// via the per-cycle CGEventGetLocation poll in the AppKit pump. Balanced by
+	// comp_window_macos_set_visible(false) / _destroy so the desktop cursor returns
+	// when the surface is hidden.
 	CGDisplayHideCursor(kCGDirectMainDisplay);
+	cwm->cursor_hidden = true;
 
 	*out_success = true;
 }
@@ -357,8 +365,20 @@ comp_window_macos_set_visible(struct comp_target *ct, bool visible)
 		}
 		if (visible) {
 			[cwm->window makeKeyAndOrderFront:nil];
+			// Re-hide the OS cursor while the workspace surface is up.
+			if (!cwm->cursor_hidden) {
+				CGDisplayHideCursor(kCGDirectMainDisplay);
+				cwm->cursor_hidden = true;
+			}
 		} else {
 			[cwm->window orderOut:nil];
+			// Restore the desktop cursor the instant the surface is hidden —
+			// otherwise it stays hidden (Ctrl+Space-close left no cursor until a
+			// click forced a refresh). #61.
+			if (cwm->cursor_hidden) {
+				CGDisplayShowCursor(kCGDirectMainDisplay);
+				cwm->cursor_hidden = false;
+			}
 		}
 	};
 	if ([NSThread isMainThread]) {
@@ -400,7 +420,10 @@ comp_window_macos_destroy(struct comp_target *ct)
 	comp_target_swapchain_cleanup(&cwm->base);
 
 	// Restore the OS cursor + menu bar/dock hidden while the workspace was up (#61).
-	CGDisplayShowCursor(kCGDirectMainDisplay);
+	if (cwm->cursor_hidden) {
+		CGDisplayShowCursor(kCGDirectMainDisplay);
+		cwm->cursor_hidden = false;
+	}
 	[NSApp setPresentationOptions:NSApplicationPresentationDefault];
 
 	if (cwm->window != nil) {

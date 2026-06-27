@@ -130,6 +130,20 @@ service_orchestrator_get_workspace_pid(void);
 bool
 service_orchestrator_get_workspace_supports_file_dialog(void);
 
+/*!
+ * Summon (spawn-if-absent) the registered workspace controller on demand.
+ * Idempotent — a no-op when the controller is already running. Registered as
+ * the IPC server's workspace-summon provider so macOS UI surfaces (the menu-bar
+ * status item / Ctrl+Space hotkey, #61) launch the controller through the same
+ * registry-discovery + crash-respawn path as startup.
+ *
+ * macOS-only: defined in the `XRT_OS_MACOS` orchestrator branch. The Windows
+ * orchestrator summons via its own Ctrl+Space trampoline and never references
+ * this symbol; the POSIX-stub platforms (Linux/Android) have no orchestrator.
+ */
+void
+service_orchestrator_summon_workspace(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1180,6 +1180,7 @@ static bool s_shutting_down = false;
 static pthread_t s_watch_thread;
 static bool s_watch_started = false;
 static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_cv = PTHREAD_COND_INITIALIZER;
 
 
 /*
@@ -1332,60 +1333,78 @@ do_spawn_locked(void)
 	return true;
 }
 
-//! Watcher: blocks in waitpid on the controller, respawns on unexpected exit.
-//! One persistent thread owns the watch→respawn loop for the orchestrator's
-//! lifetime.
+//! Watcher: the SOLE reaper of the controller child. One persistent thread that
+//! sleeps on the condvar when no controller is running, wakes when one is
+//! spawned, blocks in waitpid on it, and — only in ENABLE mode — respawns it on
+//! exit. In AUTO/DISABLE a close or crash returns to the off state (the next
+//! summon brings it back), matching the Windows on-demand model. Started lazily
+//! on the first spawn; joined on shutdown.
 static void *
 watch_thread_func(void *param)
 {
 	(void)param;
 
+	pthread_mutex_lock(&s_lock);
 	for (;;) {
-		pthread_mutex_lock(&s_lock);
+		// Sleep until there's a controller to watch (a spawn signals us), or
+		// we're tearing down.
+		while (s_workspace_pid <= 0 && !s_shutting_down) {
+			pthread_cond_wait(&s_cv, &s_lock);
+		}
+		if (s_shutting_down) {
+			break;
+		}
+
 		pid_t pid = s_workspace_pid;
 		pthread_mutex_unlock(&s_lock);
 
-		if (pid <= 0) {
-			break;
-		}
-
 		int status = 0;
 		pid_t r = waitpid(pid, &status, 0);
+
+		pthread_mutex_lock(&s_lock);
 		if (r < 0 && errno == EINTR) {
+			continue; // interrupted — re-evaluate
+		}
+		// A newer summon may have replaced the pid while we were waiting; if so,
+		// just loop and watch the current generation.
+		if (pid != s_workspace_pid) {
 			continue;
 		}
 
-		pthread_mutex_lock(&s_lock);
 		s_workspace_running = false;
+		s_workspace_pid = 0;
 
-		// Stop watching if we're tearing down, the controller was disabled,
-		// or it was unregistered.
-		if (s_shutting_down || s_cfg.workspace == SERVICE_CHILD_DISABLE || !s_workspace_available) {
-			pthread_mutex_unlock(&s_lock);
+		if (s_shutting_down) {
 			break;
 		}
 
-		OW("Workspace controller process exited — respawning");
-		pthread_mutex_unlock(&s_lock);
-
-		// Brief settle before respawn so a controller that crashes on launch
-		// can't spin a tight fork loop.
-		os_nanosleep(1000 * 1000 * 1000); // 1 s
-
-		pthread_mutex_lock(&s_lock);
-		if (s_shutting_down || s_cfg.workspace == SERVICE_CHILD_DISABLE || !s_workspace_available) {
+		// Crash-respawn ONLY in ENABLE (always-on). In AUTO the controller is
+		// summoned on demand (Ctrl+Space / status item) and a close or crash
+		// returns to the off state — the next summon relaunches it. DISABLE never
+		// respawns.
+		if (s_workspace_available && s_cfg.workspace == SERVICE_CHILD_ENABLE) {
+			OW("Workspace controller exited — respawning (ENABLE mode)");
+			// Brief settle so a controller that crashes on launch can't spin a
+			// tight fork loop.
 			pthread_mutex_unlock(&s_lock);
-			break;
+			os_nanosleep(1000 * 1000 * 1000); // 1 s
+			pthread_mutex_lock(&s_lock);
+			if (!s_shutting_down && s_workspace_available &&
+			    s_cfg.workspace == SERVICE_CHILD_ENABLE) {
+				(void)do_spawn_locked();
+			}
+		} else {
+			OW("Workspace controller exited — staying off (summon to relaunch)");
 		}
-		(void)do_spawn_locked();
-		pthread_mutex_unlock(&s_lock);
 	}
+	pthread_mutex_unlock(&s_lock);
 
 	return NULL;
 }
 
-//! Spawn the controller (if available + not already running) and start the
-//! watcher once. Caller must NOT hold s_lock.
+//! Spawn the controller (if available + not already running), starting the
+//! watcher on the first spawn and waking it on every spawn. Caller must NOT hold
+//! s_lock.
 static void
 spawn_workspace(void)
 {
@@ -1399,6 +1418,11 @@ spawn_workspace(void)
 	if (need_watcher) {
 		s_watch_started = true;
 	}
+	if (ok) {
+		// Wake the watcher to waitpid the new child (no-op on the very first
+		// spawn — the watcher then starts already seeing s_workspace_pid > 0).
+		pthread_cond_signal(&s_cv);
+	}
 	pthread_mutex_unlock(&s_lock);
 
 	if (need_watcher) {
@@ -1411,19 +1435,25 @@ spawn_workspace(void)
 	}
 }
 
-//! SIGTERM the controller and reap it. Caller must NOT hold s_lock.
+//! SIGTERM the controller. The watcher (sole reaper) waitpids it and clears
+//! state; it does not respawn in AUTO/DISABLE. Caller must NOT hold s_lock.
+//!
+//! Targets s_workspace_pid directly rather than gating on s_workspace_running:
+//! the watcher zeroes s_workspace_pid the instant it reaps a child, so a
+//! non-zero pid means "a child we believe is alive" — killing an
+//! already-dead pid is a harmless ESRCH. This avoids a race where a transient
+//! running=false window (e.g. mid-respawn) would skip the kill and orphan the
+//! controller.
 static void
 terminate_workspace(void)
 {
 	pthread_mutex_lock(&s_lock);
-	pid_t pid = s_workspace_running ? s_workspace_pid : 0;
-	s_workspace_running = false;
+	pid_t pid = s_workspace_pid;
 	pthread_mutex_unlock(&s_lock);
 
 	if (pid > 0) {
 		kill(pid, SIGTERM);
-		waitpid(pid, NULL, 0);
-		OW("Terminated workspace controller (PID %ld)", (long)pid);
+		OW("Sent SIGTERM to workspace controller (PID %ld)", (long)pid);
 	}
 }
 
@@ -1436,13 +1466,15 @@ apply_workspace_mode(enum service_child_mode mode)
 
 	switch (mode) {
 	case SERVICE_CHILD_ENABLE:
-	case SERVICE_CHILD_AUTO:
-		// macOS interim: AUTO collapses to spawn-at-init. On Windows AUTO means
-		// "wait for the Ctrl+Space hotkey"; that hotkey is the deferred Piece 3
-		// (TCC-gated, main-thread hazard). Until it lands, spawning at init for
-		// both ENABLE and AUTO is what makes "launch only the service → shell
-		// appears" work with the default (AUTO) config.
+		// Always-on: spawn now; the watcher respawns it on exit.
 		spawn_workspace();
+		break;
+
+	case SERVICE_CHILD_AUTO:
+		// On-demand (Windows parity): do NOT spawn at init. The controller is
+		// summoned via Ctrl+Space / the menu-bar status item, and a close or
+		// crash returns to the off state. This keeps the service running with the
+		// shell off — menu bar visible — until the user summons it.
 		break;
 
 	case SERVICE_CHILD_DISABLE:
@@ -1457,6 +1489,15 @@ apply_workspace_mode(enum service_child_mode mode)
  * Public API
  *
  */
+
+void
+service_orchestrator_summon_workspace(void)
+{
+	// Idempotent: spawn_workspace() no-ops when a controller is already running
+	// or none is registered. This is the on-demand AUTO trigger (Ctrl+Space /
+	// menu-bar status item) — in AUTO the controller is not spawned at init.
+	spawn_workspace();
+}
 
 bool
 service_orchestrator_init(const struct service_config *cfg)
@@ -1494,8 +1535,13 @@ service_orchestrator_shutdown(void)
 	pthread_mutex_lock(&s_lock);
 	s_shutting_down = true;
 	bool join = s_watch_started;
+	// Wake the watcher if it's sleeping on the condvar (no controller running),
+	// so it observes s_shutting_down and exits for the join below.
+	pthread_cond_signal(&s_cv);
 	pthread_mutex_unlock(&s_lock);
 
+	// SIGTERM the controller; the watcher reaps it (sole reaper) and, seeing
+	// s_shutting_down, exits without respawning.
 	terminate_workspace();
 
 	if (join) {

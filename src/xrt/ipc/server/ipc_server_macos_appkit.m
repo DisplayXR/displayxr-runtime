@@ -12,6 +12,7 @@
 
 #include "ipc_server_macos_appkit.h"
 #include "ipc_server_input_queue.h"
+#include "displayxr_logo_white_png.h" // embedded menu-bar status-item icon (#61)
 #include "server/ipc_server.h"           // struct ipc_server::workspace_controller_pid (#61 lifecycle)
 #include "multi/comp_multi_workspace.h" // cursor pointer-position publish (#48 Phase 2)
 #include "shared/ipc_protocol.h"
@@ -305,7 +306,12 @@ do_workspace_toggle(struct ipc_server *s)
 		U_LOG_W("Workspace: toggle — SIGTERM controller (pid %lu)", ctrl_pid);
 		kill((pid_t)ctrl_pid, SIGTERM);
 	} else {
-		spawn_workspace_controller();
+		// Prefer the orchestrator's registry-discovery + crash-respawn path
+		// (#61); fall back to the dev DISPLAYXR_SHELL_PATH spawn when ipc_server
+		// has no summon provider (sdl_test, non-orchestrator hosts).
+		if (!ipc_server_request_workspace_summon()) {
+			spawn_workspace_controller();
+		}
 	}
 }
 
@@ -349,6 +355,128 @@ install_toggle_hotkey(void)
 	U_LOG_W("Workspace: registered toggle hotkey Ctrl+Space (fallback Ctrl+Option+Space)");
 }
 
+// macOS menu-bar status item (#61, Piece 3). A visible, discoverable surface for
+// the spatial shell: it shows whether a workspace controller is running, lets the
+// user summon one ("Open Workspace" → the orchestrator's registry-discovery +
+// crash-respawn path via ipc_server_request_workspace_summon), and quits the
+// service GRACEFULLY ("Quit" → raise SIGTERM → the kqueue EVFILT_SIGNAL path →
+// service_orchestrator_shutdown, which reaps the controller — no orphan).
+// Complements the global Ctrl+Space hotkey with a no-TCC, always-visible control.
+@interface DXRStatusTarget : NSObject <NSMenuDelegate>
+{
+@public
+	struct ipc_server *server;
+	NSMenuItem *statusLine; // owned by the menu
+	NSMenuItem *openItem;   // owned by the menu
+}
+@end
+
+@implementation DXRStatusTarget
+- (void)openWorkspace:(id)sender
+{
+	(void)sender;
+	if (!ipc_server_request_workspace_summon()) {
+		U_LOG_W("Workspace: 'Open Workspace' clicked but no summon provider is registered");
+	}
+}
+- (void)quitService:(id)sender
+{
+	(void)sender;
+	// Graceful: SIGTERM ourselves so the mainloop's EVFILT_SIGNAL handler stops
+	// the server and main() runs service_orchestrator_shutdown(), which SIGTERMs
+	// the managed controller. (Unlike Cmd+Q's exit(0), this can't orphan it.)
+	U_LOG_W("Workspace: status-item Quit — graceful service shutdown");
+	raise(SIGTERM);
+}
+- (void)menuNeedsUpdate:(NSMenu *)menu
+{
+	(void)menu;
+	unsigned long pid = (server != NULL) ? server->workspace_controller_pid : 0;
+	if (pid != 0) {
+		statusLine.title = [NSString stringWithFormat:@"Workspace: running (PID %lu)", pid];
+		[openItem setEnabled:NO];
+	} else {
+		statusLine.title = @"Workspace: stopped";
+		[openItem setEnabled:YES];
+	}
+}
+@end
+
+// Retained for the process lifetime (MRC). The menu's delegate is an assign
+// reference, so s_status_target must keep the target alive.
+static DXRStatusTarget *s_status_target = nil;
+static NSStatusItem *s_status_item = nil;
+
+// Build the menu-bar status item + menu. Main thread; called once.
+static void
+install_status_item(struct ipc_server *s)
+{
+	if (s_status_item != nil) {
+		return;
+	}
+
+	s_status_target = [[DXRStatusTarget alloc] init];
+	s_status_target->server = s;
+
+	s_status_item = [[[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength] retain];
+	// Persist the user-chosen position. New status items are inserted next to the
+	// notch (leftmost of the third-party area), where a crowded menu bar can hide
+	// them behind the notch; with an autosaveName, macOS remembers wherever the
+	// user ⌘-drags the item, across relaunches.
+	s_status_item.autosaveName = @"DisplayXRService";
+	// Icon-only, using the embedded DisplayXR logo (the macOS analogue of the
+	// Windows tray icon, which embeds displayxr_white.ico). Marked as a template
+	// image so macOS tints it for light/dark menu bars from its alpha — compact,
+	// takes far less width than a text label.
+	NSData *logo_data = [NSData dataWithBytes:displayxr_logo_white_png
+	                                   length:displayxr_logo_white_png_len];
+	NSImage *logo = [[[NSImage alloc] initWithData:logo_data] autorelease];
+	if (logo != nil) {
+		logo.template = YES;
+		// Fit the menu-bar height (~18 pt tall), preserving aspect.
+		NSSize px = logo.size;
+		CGFloat h = 18.0;
+		CGFloat w = (px.height > 0.0) ? (h * px.width / px.height) : h;
+		logo.size = NSMakeSize(w, h);
+		s_status_item.button.image = logo;
+		s_status_item.button.imagePosition = NSImageOnly;
+	} else {
+		// Fallback if the embedded image fails to decode for any reason.
+		s_status_item.button.title = @"DisplayXR";
+	}
+
+	NSMenu *menu = [[NSMenu alloc] init];
+	menu.autoenablesItems = NO; // we control enabled state in menuNeedsUpdate:
+	menu.delegate = s_status_target;
+
+	NSMenuItem *status = [[[NSMenuItem alloc] initWithTitle:@"Workspace: starting…"
+	                                                 action:nil
+	                                          keyEquivalent:@""] autorelease];
+	[status setEnabled:NO];
+	[menu addItem:status];
+	s_status_target->statusLine = status;
+
+	NSMenuItem *open = [[[NSMenuItem alloc] initWithTitle:@"Open Workspace"
+	                                               action:@selector(openWorkspace:)
+	                                        keyEquivalent:@""] autorelease];
+	open.target = s_status_target;
+	[menu addItem:open];
+	s_status_target->openItem = open;
+
+	[menu addItem:[NSMenuItem separatorItem]];
+
+	NSMenuItem *quit = [[[NSMenuItem alloc] initWithTitle:@"Quit DisplayXR Service"
+	                                               action:@selector(quitService:)
+	                                        keyEquivalent:@"q"] autorelease];
+	quit.target = s_status_target;
+	[menu addItem:quit];
+
+	s_status_item.menu = menu; // status item retains the menu; menu retains items
+	[menu release];
+
+	U_LOG_W("Workspace: installed menu-bar status item (#61)");
+}
+
 void
 ipc_server_macos_pump_main_thread(struct ipc_server *s)
 {
@@ -361,10 +489,17 @@ ipc_server_macos_pump_main_thread(struct ipc_server *s)
 				[NSApplication sharedApplication];
 				[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 			}
+			// Complete the AppKit launch sequence. We drive the run loop manually
+			// (no [NSApp run]) for the compositor window, but the system status bar
+			// only shows an NSStatusItem once the app has finished launching —
+			// finishLaunching is the documented non-blocking way to do that.
+			[NSApp finishLaunching];
 			// System-wide Ctrl+Space toggle — must be a global hotkey because the
 			// service has no window (hence no key responder) until a controller
 			// connects (#61).
 			install_toggle_hotkey();
+			// Menu-bar status item (#61, Piece 3) — visible presence + Open/Quit.
+			install_status_item(s);
 			inited = true;
 		}
 
