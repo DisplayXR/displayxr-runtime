@@ -39,25 +39,6 @@ wil::com_ptr<ID3D12Device>
 createDevice(const wil::com_ptr<IDXGIAdapter> &adapter = nullptr, u_logging_level log_level = U_LOGGING_INFO);
 
 /**
- * @brief Create command lists for a resource transitioning to/from app control
- *
- * @param device D3D12 device
- * @param command_allocator
- * @param resource image
- * @param bits Swapchain usage bits
- * @param[out] out_acquire_command_list Command list to populate for xrAcquireSwapchainImage
- * @param[out] out_release_command_list Command list to populate for xrReleaseSwapchainImage
- * @return HRESULT
- */
-HRESULT
-createCommandLists(ID3D12Device &device,
-                   ID3D12CommandAllocator &command_allocator,
-                   ID3D12Resource &resource,
-                   enum xrt_swapchain_usage_bits bits,
-                   wil::com_ptr<ID3D12CommandList> out_acquire_command_list,
-                   wil::com_ptr<ID3D12CommandList> out_release_command_list);
-
-/**
  * @brief Create a command list for image resource copying
  *
  * @param device D3D12 device

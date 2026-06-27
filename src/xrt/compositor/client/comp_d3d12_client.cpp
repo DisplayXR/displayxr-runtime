@@ -67,7 +67,6 @@ comp_ipc_client_compositor_get_transparent_output_fence(struct xrt_compositor *x
 
 DEBUG_GET_ONCE_LOG_OPTION(log, "D3D_COMPOSITOR_LOG", U_LOGGING_INFO)
 
-DEBUG_GET_ONCE_BOOL_OPTION(barriers, "D3D12_COMPOSITOR_BARRIERS", false);
 DEBUG_GET_ONCE_BOOL_OPTION(compositor_copy, "D3D12_COMPOSITOR_COPY", true);
 
 /*!
@@ -231,22 +230,6 @@ struct client_d3d12_swapchain_data
 	//! Images used by the application
 	std::vector<wil::com_ptr<ID3D12Resource>> app_images;
 
-	//! Command list per-image to put the resource in a state for acquire (@ref appResourceState) from @ref
-	//! compositorResourceState
-	std::vector<wil::com_ptr<ID3D12CommandList>> commandsToApp;
-
-	//! Command list per-image to put the resource in a state for composition (@ref compositorResourceState) from
-	//! @ref appResourceState
-	std::vector<wil::com_ptr<ID3D12CommandList>> commandsToCompositor;
-
-	//! State we hand over the image in, and expect it back in.
-	D3D12_RESOURCE_STATES appResourceState = D3D12_RESOURCE_STATE_RENDER_TARGET;
-
-	//! State the compositor wants the image in before use.
-	D3D12_RESOURCE_STATES compositorResourceState = D3D12_RESOURCE_STATE_COMMON;
-
-	std::vector<D3D12_RESOURCE_STATES> state;
-
 	/*!
 	 * Optional app to compositor copy mechanism, used as a workaround for d3d12 -> Vulkan interop issues
 	 */
@@ -333,45 +316,6 @@ formatMessage(DWORD err, char (&buf)[N])
  *
  */
 
-static xrt_result_t
-client_d3d12_swapchain_barrier_to_app(client_d3d12_swapchain *sc, uint32_t index)
-{
-	auto *data = sc->data.get();
-	if (data->commandsToApp.empty()) {
-		// We have decided not to use barriers here
-		return XRT_SUCCESS;
-	}
-	if (data->state[index] == data->appResourceState) {
-		D3D_INFO(sc->c, "Image %" PRId32 " is already in the right state", index);
-		return XRT_SUCCESS;
-	}
-	if (data->state[index] == data->compositorResourceState) {
-		D3D_INFO(sc->c, "Acquiring image %" PRId32, index);
-		std::array<ID3D12CommandList *, 1> commandLists{{data->commandsToApp[index].get()}};
-		sc->c->app_queue->ExecuteCommandLists(1, commandLists.data());
-		data->state[index] = data->appResourceState;
-		return XRT_SUCCESS;
-	}
-	D3D_WARN(sc->c, "Image %" PRId32 " is in an unknown state", index);
-	return XRT_ERROR_D3D12;
-}
-
-static xrt_result_t
-client_d3d12_swapchain_barrier_to_compositor(client_d3d12_swapchain *sc, uint32_t index)
-{
-	auto *data = sc->data.get();
-
-	if (data->commandsToCompositor.empty()) {
-		// We have decided not to use barriers here
-		return XRT_SUCCESS;
-	}
-
-	std::array<ID3D12CommandList *, 1> commandLists{{data->commandsToCompositor[index].get()}};
-	sc->c->app_queue->ExecuteCommandLists(1, commandLists.data());
-	data->state[index] = data->compositorResourceState;
-	return XRT_SUCCESS;
-}
-
 static void
 client_d3d12_swapchain_scale_rect(struct xrt_swapchain *xsc, xrt_normalized_rect *inOutRect)
 {
@@ -427,16 +371,15 @@ client_d3d12_swapchain_wait_image(struct xrt_swapchain *xsc, int64_t timeout_ns,
 static xrt_result_t
 client_d3d12_swapchain_barrier_image(struct xrt_swapchain *xsc, enum xrt_barrier_direction direction, uint32_t index)
 {
-	struct client_d3d12_swapchain *sc = as_client_d3d12_swapchain(xsc);
-	xrt_result_t xret;
-
-	switch (direction) {
-	case XRT_BARRIER_TO_APP: xret = client_d3d12_swapchain_barrier_to_app(sc, index); break;
-	case XRT_BARRIER_TO_COMP: xret = client_d3d12_swapchain_barrier_to_compositor(sc, index); break;
-	default: assert(false);
-	}
-
-	return xret;
+	// No-op: imported images are transitioned COMMON -> app resource state once
+	// at swapchain creation, and the server-creates-swapchain model owns the
+	// compositor-side state. Per-image acquire/release transition barriers were
+	// an optional, default-off debug mechanism (D3D12_COMPOSITOR_BARRIERS) that
+	// has been removed.
+	(void)xsc;
+	(void)direction;
+	(void)index;
+	return XRT_SUCCESS;
 }
 
 static xrt_result_t
@@ -594,44 +537,6 @@ try {
 	}
 
 	D3D12_RESOURCE_STATES appResourceState = d3d_convert_usage_bits_to_d3d12_app_resource_state(xinfo.bits);
-	D3D12_RESOURCE_STATES compositorResourceState = D3D12_RESOURCE_STATE_COMMON;
-
-	data->appResourceState = appResourceState;
-	data->compositorResourceState = compositorResourceState;
-
-	data->state.resize(image_count, appResourceState);
-
-	if (debug_get_bool_option_barriers()) {
-		D3D_INFO(c, "Will use barriers at runtime");
-		data->commandsToApp.reserve(image_count);
-		data->commandsToCompositor.reserve(image_count);
-
-		// Make the command lists to transition imported images
-		for (uint32_t i = 0; i < image_count; ++i) {
-			wil::com_ptr<ID3D12CommandList> commandsToApp;
-			wil::com_ptr<ID3D12CommandList> commandsToCompositor;
-
-			D3D_INFO(c, "Creating command lists for image %" PRId32, i);
-			HRESULT hr = xrt::auxiliary::d3d::d3d12::createCommandLists( //
-			    *(c->device),                                            // device
-			    *(c->command_allocator),                                 // command_allocator
-			    *(data->app_images[i]),                                  // resource
-			    xinfo.bits,                                              // bits
-			    commandsToApp,                                           // out_acquire_command_list
-			    commandsToCompositor);                                   // out_release_command_list
-			if (!SUCCEEDED(hr)) {
-				char buf[kErrorBufSize];
-				formatMessage(hr, buf);
-				D3D_ERROR(c, "Error creating command list: %s", buf);
-				U_LOG_W("[#151] d3d12 createCommandLists FAILED [%u]: hr=0x%08lx msg=%s",
-				        i, (unsigned long)hr, buf);
-				return XRT_ERROR_D3D12;
-			}
-
-			data->commandsToApp.emplace_back(std::move(commandsToApp));
-			data->commandsToCompositor.emplace_back(std::move(commandsToCompositor));
-		}
-	}
 
 	// Transition imported images from COMMON to app resource state
 	{
@@ -640,8 +545,6 @@ try {
 		barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
 		barrier.Transition.StateAfter = appResourceState;
 		barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-
-		data->state.resize(image_count, barrier.Transition.StateAfter);
 
 		std::vector<D3D12_RESOURCE_BARRIER> barriers;
 		for (const auto &image : data->app_images) {
