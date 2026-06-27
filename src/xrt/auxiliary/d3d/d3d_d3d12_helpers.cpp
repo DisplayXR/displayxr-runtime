@@ -37,49 +37,6 @@ createDevice(const wil::com_ptr<IDXGIAdapter> &adapter, u_logging_level log_leve
 
 
 HRESULT
-createCommandLists(ID3D12Device &device,
-                   ID3D12CommandAllocator &command_allocator,
-                   ID3D12Resource &resource,
-                   enum xrt_swapchain_usage_bits bits,
-                   wil::com_ptr<ID3D12CommandList> out_acquire_command_list,
-                   wil::com_ptr<ID3D12CommandList> out_release_command_list)
-{
-
-	//! @todo do we need to set queue access somehow?
-	wil::com_ptr<ID3D12GraphicsCommandList> acquireCommandList;
-	RETURN_IF_FAILED(device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &command_allocator, nullptr,
-	                                          IID_PPV_ARGS(acquireCommandList.put())));
-
-	D3D12_RESOURCE_STATES appResourceState = d3d_convert_usage_bits_to_d3d12_app_resource_state(bits);
-
-	/// @todo No idea if this is right, might depend on whether it's the compute or graphics compositor!
-	D3D12_RESOURCE_STATES compositorResourceState = D3D12_RESOURCE_STATE_GENERIC_READ;
-
-	D3D12_RESOURCE_BARRIER barrier{};
-	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	barrier.Transition.pResource = &resource;
-	barrier.Transition.StateBefore = compositorResourceState;
-	barrier.Transition.StateAfter = appResourceState;
-	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-
-	acquireCommandList->ResourceBarrier(1, &barrier);
-	RETURN_IF_FAILED(acquireCommandList->Close());
-
-	wil::com_ptr<ID3D12GraphicsCommandList> releaseCommandList;
-	RETURN_IF_FAILED(device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &command_allocator, nullptr,
-	                                          IID_PPV_ARGS(releaseCommandList.put())));
-	barrier.Transition.StateBefore = appResourceState;
-	barrier.Transition.StateAfter = compositorResourceState;
-
-	releaseCommandList->ResourceBarrier(1, &barrier);
-	RETURN_IF_FAILED(releaseCommandList->Close());
-
-	out_acquire_command_list = std::move(acquireCommandList);
-	out_release_command_list = std::move(releaseCommandList);
-	return S_OK;
-}
-
-HRESULT
 createCommandListImageCopy(ID3D12Device &device,
                            ID3D12CommandAllocator &command_allocator,
                            ID3D12Resource &resource_src,
