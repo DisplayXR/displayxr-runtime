@@ -171,6 +171,11 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 
 #else // !XRT_OS_WINDOWS
 
+#ifdef XRT_OS_MACOS
+#include "service_config.h"
+#include "service_orchestrator.h"
+#endif
+
 int
 main(int argc, char *argv[])
 {
@@ -185,6 +190,22 @@ main(int argc, char *argv[])
 			break;
 		}
 	}
+
+#ifdef XRT_OS_MACOS
+	// macOS orchestrator (#61): discover + auto-spawn the workspace controller
+	// (the shell) and respawn it on crash, mirroring the Windows orchestrator.
+	// Spawn happens at init, before the blocking ipc_server_main loop.
+	struct service_config cfg;
+	service_config_load(&cfg);
+	service_orchestrator_init(&cfg);
+
+	// Let the IPC server authenticate workspace_activate against the
+	// orchestrator-spawned controller's PID (0 → manual mode, first-claim wins)
+	// and gate the file-picker on the controller's advertised capability.
+	ipc_server_set_workspace_pid_provider(service_orchestrator_get_workspace_pid);
+	ipc_server_set_workspace_supports_file_dialog_provider(
+	    service_orchestrator_get_workspace_supports_file_dialog);
+#endif
 
 	struct ipc_server_main_info ismi = {
 	    .udgci =
@@ -203,6 +224,11 @@ main(int argc, char *argv[])
 	int ret = ipc_server_main(argc, argv, &ismi);
 
 	u_metrics_close();
+
+#ifdef XRT_OS_MACOS
+	// Terminate the managed workspace controller + join the watcher thread.
+	service_orchestrator_shutdown();
+#endif
 
 	return ret;
 }

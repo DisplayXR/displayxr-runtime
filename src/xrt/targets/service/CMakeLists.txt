@@ -49,6 +49,21 @@ if(WIN32)
 	target_link_libraries(displayxr-service PRIVATE shell32 ws2_32)
 endif()
 
+# macOS orchestrator (#61): the service auto-spawns + crash-respawns the
+# registered workspace controller (the shell) via posix_spawn, mirroring the
+# Windows orchestrator. service_config.c (cross-platform JSON config) and
+# service_orchestrator.c (its macOS #elif block) are otherwise only in the
+# Windows link line above. service_workspace_registry.c is already added
+# unconditionally near the top of this file.
+if(APPLE)
+	target_sources(displayxr-service PRIVATE
+		service_config.c
+		service_config.h
+		service_orchestrator.c
+		service_orchestrator.h
+	)
+endif()
+
 install(TARGETS displayxr-service RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(XRT_HAVE_SYSTEMD)
