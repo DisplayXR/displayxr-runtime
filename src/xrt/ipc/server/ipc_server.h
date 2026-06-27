@@ -590,6 +590,32 @@ typedef bool (*ipc_server_workspace_supports_file_dialog_fn)(void);
 void
 ipc_server_set_workspace_supports_file_dialog_provider(ipc_server_workspace_supports_file_dialog_fn fn);
 
+/*!
+ * Function pointer the IPC server calls to summon (spawn-if-absent) the
+ * registered workspace controller on demand. The standalone service registers
+ * the orchestrator's spawn entry point here so UI surfaces inside ipc_server
+ * (the macOS menu-bar status item / Ctrl+Space hotkey, #61) can launch the
+ * controller through the same registry-discovery + crash-respawn path as
+ * startup, rather than an ad-hoc spawn. Idempotent: a no-op when the controller
+ * is already running.
+ */
+typedef void (*ipc_server_workspace_summon_fn)(void);
+
+/*!
+ * Register the workspace-summon provider. Same lifetime model as
+ * `ipc_server_set_workspace_pid_provider`. Pass NULL to clear.
+ */
+void
+ipc_server_set_workspace_summon_provider(ipc_server_workspace_summon_fn fn);
+
+/*!
+ * Invoke the registered workspace-summon provider, if any. Returns true if a
+ * provider was registered and called, false if none is set (caller may fall
+ * back to a dev spawn path). Safe to call from the main thread.
+ */
+bool
+ipc_server_request_workspace_summon(void);
+
 /*
  *
  * Helpers

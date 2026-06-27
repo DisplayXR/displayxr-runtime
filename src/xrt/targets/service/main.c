@@ -205,6 +205,10 @@ main(int argc, char *argv[])
 	ipc_server_set_workspace_pid_provider(service_orchestrator_get_workspace_pid);
 	ipc_server_set_workspace_supports_file_dialog_provider(
 	    service_orchestrator_get_workspace_supports_file_dialog);
+
+	// Let the macOS menu-bar status item / Ctrl+Space hotkey summon the
+	// controller through the orchestrator's registry-discovery + respawn path.
+	ipc_server_set_workspace_summon_provider(service_orchestrator_summon_workspace);
 #endif
 
 	struct ipc_server_main_info ismi = {
