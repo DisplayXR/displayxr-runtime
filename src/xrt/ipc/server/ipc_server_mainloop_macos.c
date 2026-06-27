@@ -39,6 +39,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <signal.h>
 #include <assert.h>
 #include <limits.h>
 
@@ -138,6 +139,33 @@ init_listen_socket(struct ipc_server_mainloop *ml)
 	return fd;
 }
 
+//! Empty handler for SIGTERM/SIGINT. The EVFILT_SIGNAL kevent registered below
+//! is what actually drives graceful shutdown; this handler exists only to (a)
+//! suppress the default terminate action so the kqueue event can be processed
+//! instead of the process dying mid-loop, and (b) — being a *caught* signal —
+//! make posix_spawn'd children reset these to SIG_DFL (POSIX resets caught
+//! signals to default in the child), so the orchestrator's kill(child, SIGTERM)
+//! during shutdown still terminates respawned controllers.
+static void
+macos_shutdown_signal_handler(int sig)
+{
+	(void)sig;
+}
+
+//! Install the empty handler for the shutdown signals. Process-wide; safe to
+//! call from the main thread before the kqueue loop starts.
+static void
+install_shutdown_signal_handlers(void)
+{
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = macos_shutdown_signal_handler;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0; // no SA_RESTART — the poll is non-blocking anyway.
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGINT, &sa, NULL);
+}
+
 static int
 init_kqueue(struct ipc_server_mainloop *ml)
 {
@@ -149,7 +177,14 @@ init_kqueue(struct ipc_server_mainloop *ml)
 
 	ml->kqueue_fd = ret;
 
-	struct kevent changes[2];
+	// Catch SIGTERM/SIGINT so a background (non-TTY) service shuts down
+	// gracefully — the mainloop returns, ipc_server_main returns, and main()
+	// reaches service_orchestrator_shutdown() to terminate the managed
+	// workspace controller instead of orphaning it. The stdin path below only
+	// covers interactive (TTY) sessions.
+	install_shutdown_signal_handlers();
+
+	struct kevent changes[4];
 	int nchanges = 0;
 
 	// Monitor stdin for shutdown (like the Linux epoll path).
@@ -158,6 +193,14 @@ init_kqueue(struct ipc_server_mainloop *ml)
 		EV_SET(&changes[nchanges], 0 /* stdin */, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
 		nchanges++;
 	}
+
+	// Monitor SIGTERM + SIGINT via kqueue. EVFILT_SIGNAL records the signal
+	// even though the handler above caught it, so the poll loop sees it and
+	// stops the server cleanly.
+	EV_SET(&changes[nchanges], SIGTERM, EVFILT_SIGNAL, EV_ADD | EV_ENABLE, 0, 0, NULL);
+	nchanges++;
+	EV_SET(&changes[nchanges], SIGINT, EVFILT_SIGNAL, EV_ADD | EV_ENABLE, 0, 0, NULL);
+	nchanges++;
 
 	// Monitor the listen socket for new connections.
 	EV_SET(&changes[nchanges], ml->listen_socket, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
@@ -224,6 +267,14 @@ ipc_server_mainloop_poll(struct ipc_server *vs, struct ipc_server_mainloop *ml)
 	}
 
 	for (int i = 0; i < ret; i++) {
+		// Check the filter before treating ident as an fd — for EVFILT_SIGNAL
+		// the ident is the signal number, which can collide with fd values.
+		if (events[i].filter == EVFILT_SIGNAL) {
+			U_LOG_I("Received signal %ld — shutting down gracefully", (long)events[i].ident);
+			ipc_server_handle_shutdown_signal(vs);
+			return;
+		}
+
 		int fd = (int)events[i].ident;
 
 		// If we get data on stdin, stop.
