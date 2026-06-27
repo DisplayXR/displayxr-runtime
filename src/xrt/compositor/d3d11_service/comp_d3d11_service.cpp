@@ -11524,8 +11524,49 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	}
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	struct d3d11_service_system *sys = c->sys;
-	if (sys == nullptr || c->render.display_processor == nullptr) {
+	if (sys == nullptr) {
 		return false;
+	}
+
+	// #625: choose the display processor that performs the weave. A standalone
+	// present-owner (the WebXR / inline-3D browser bridge, the CEF host, the weave
+	// probe) gets its OWN per-client DP in init_client_render_resources — but ONLY
+	// when no spatial workspace is active. When a workspace IS active that per-
+	// client DP is deliberately skipped (a second per-client DP makes the SR SDK
+	// recalibrate its weaver — see the comment in init_client_render_resources), so
+	// `c->render.display_processor` is null here even though the session is a valid
+	// window-bound present-owner. A present-owner can legitimately connect while a
+	// workspace is up (e.g. a browser opened alongside the spatial shell), so fall
+	// back to the shared multi-compositor DP rather than failing the weave with
+	// XR_ERROR_RUNTIME_FAILURE. process_atlas takes the output dims + sub-rect
+	// explicitly and weaves into the present-owner's own window-sized handback
+	// texture, so the result is correct regardless of which DP instance drives it.
+	// (The shared DP's interlace phase references the workspace window; that is
+	// phase-independent for a uniform-colour test pattern and the caller phase-
+	// snaps real content via xrWeaveSnapWindowRectEXT.) The render thread and this
+	// path both run process_atlas under sys->render_mutex, so sharing the DP is
+	// serialized — no concurrent immediate-context / DP use.
+	struct xrt_display_processor_d3d11 *dp = c->render.display_processor;
+	bool dp_is_shared = false;
+	if (dp == nullptr && sys->multi_comp != nullptr) {
+		dp = sys->multi_comp->display_processor;
+		dp_is_shared = (dp != nullptr);
+	}
+	if (dp == nullptr) {
+		static std::atomic_flag s_warned = ATOMIC_FLAG_INIT;
+		if (!s_warned.test_and_set()) {
+			U_LOG_W("#625 weave_submit: no display processor available (per-client and shared "
+			        "multi-compositor DP both null, workspace_mode=%d) — weave unavailable",
+			        (int)sys->workspace_mode);
+		}
+		return false;
+	}
+	if (dp_is_shared) {
+		static std::atomic_flag s_logged = ATOMIC_FLAG_INIT;
+		if (!s_logged.test_and_set()) {
+			U_LOG_W("#625 weave_submit: per-client DP absent (spatial workspace active) — driving the "
+			        "present-owner weave through the shared multi-compositor DP");
+		}
 	}
 	HANDLE in = (HANDLE)in_handle;
 	if (in == nullptr || in == INVALID_HANDLE_VALUE) {
@@ -11614,7 +11655,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 
 	ID3D11RenderTargetView *rtvs[] = {c->render.weave_output_rtv.get()};
 	sys->context->OMSetRenderTargets(1, rtvs, nullptr);
-	xrt_display_processor_d3d11_process_atlas(c->render.display_processor, sys->context.get(), in_srv.get(),
+	xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), in_srv.get(),
 	                                          view_w, view_h, /*tile_columns*/ 2, /*tile_rows*/ 1,
 	                                          DXGI_FORMAT_R8G8B8A8_UNORM, win_w, win_h, rect_x, rect_y, rect_w,
 	                                          rect_h);
@@ -11642,7 +11683,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// (look-around) projection for the NEXT pre-weave frame. The interlace
 	// itself is DP-internal — this is the only eye flow, and it's OUT.
 	if (out_eyes != nullptr) {
-		xrt_display_processor_d3d11_get_predicted_eye_positions(c->render.display_processor, out_eyes);
+		xrt_display_processor_d3d11_get_predicted_eye_positions(dp, out_eyes);
 	}
 	return true;
 }
