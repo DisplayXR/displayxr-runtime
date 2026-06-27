@@ -10,6 +10,7 @@
 #include "service_tray_win.h"
 #include "service_workspace_registry.h"
 
+#include "xrt/xrt_config_os.h"
 #include "util/u_debug.h"
 #include "util/u_logging.h"
 
@@ -1132,9 +1133,461 @@ service_orchestrator_shutdown(void)
 	}
 }
 
-#else // !XRT_OS_WINDOWS
+#elif defined(XRT_OS_MACOS)
 
-// Stubs for non-Windows platforms
+/*
+ *
+ * macOS orchestrator — auto-spawn + crash-respawn the workspace controller.
+ *
+ * Pieces 1+2 of the macOS spatial-shell port (#61): discover a registered
+ * workspace controller (cross-platform service_workspace_registry), posix_spawn
+ * it with "--service-managed", and respawn it on crash via a waitpid watcher
+ * thread. None of this touches the main thread, so it is safe w.r.t. the
+ * kqueue/AppKit main-thread-ownership hazard (only the deferred Piece 3 global
+ * Ctrl+Space hotkey would re-enter that). The WebXR-bridge trampoline (also
+ * Windows-only today) is intentionally not ported here — the macOS bridge mode
+ * stays a no-op for now.
+ *
+ */
+
+#include "os/os_time.h"
+
+#include <spawn.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+
+extern char **environ;
+
+
+/*
+ *
+ * Static state — guarded by s_lock.
+ *
+ */
+
+static struct service_config s_cfg;
+static struct workspace_controller_entry s_workspace_active = {0};
+static bool s_workspace_available = false;
+static pid_t s_workspace_pid = 0;
+static bool s_workspace_running = false;
+static bool s_shutting_down = false;
+static pthread_t s_watch_thread;
+static bool s_watch_started = false;
+static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
+
+
+/*
+ *
+ * Helpers
+ *
+ */
+
+//! Existence check that excludes directories.
+static bool
+regular_file_exists(const char *path)
+{
+	struct stat st;
+	return path != NULL && path[0] != '\0' && stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+//! Returns true if @p s contains a path separator — used to distinguish a
+//! dev-mode absolute-path override from a registered-id reference in
+//! cfg->workspace_binary.
+static bool
+looks_like_path(const char *s)
+{
+	return s != NULL && strchr(s, '/') != NULL;
+}
+
+//! Detect which workspace controller (if any) the orchestrator will spawn.
+//! Sets s_workspace_available + s_workspace_active. Mirrors the Windows
+//! selection order:
+//!  1. cfg->workspace_binary with a path separator → dev-mode absolute path
+//!     override; use it directly without scanning manifests.
+//!  2. Else enumerate the JSON-manifest registry. If empty → none available.
+//!  3. Else, if cfg->workspace_binary is a non-empty id, prefer that entry;
+//!     fall through to first if not registered.
+//!  4. Else pick the first registered entry.
+static void
+detect_workspace_controller(const struct service_config *cfg)
+{
+	memset(&s_workspace_active, 0, sizeof(s_workspace_active));
+	s_workspace_available = false;
+
+	// 1. Dev-mode absolute-path override.
+	if (looks_like_path(cfg->workspace_binary)) {
+		if (!regular_file_exists(cfg->workspace_binary)) {
+			OW("Workspace controller dev-override binary not found: %s", cfg->workspace_binary);
+			return;
+		}
+		snprintf(s_workspace_active.id, sizeof(s_workspace_active.id), "dev");
+		snprintf(s_workspace_active.binary, sizeof(s_workspace_active.binary), "%s",
+		         cfg->workspace_binary);
+		snprintf(s_workspace_active.display_name, sizeof(s_workspace_active.display_name),
+		         "Workspace Controller (dev)");
+		s_workspace_available = true;
+		OW("Workspace controller (dev override): %s", s_workspace_active.binary);
+		return;
+	}
+
+	// 2. Manifest enumeration.
+	struct workspace_controller_entry entries[WORKSPACE_REGISTRY_MAX_ENTRIES];
+	int n = service_workspace_registry_enumerate(entries, WORKSPACE_REGISTRY_MAX_ENTRIES);
+	if (n <= 0) {
+		OW("No workspace controllers registered "
+		   "(~/Library/Application Support/DisplayXR/WorkspaceControllers empty); "
+		   "running in standalone-platform mode");
+		return;
+	}
+
+	// 3. Preferred-id match.
+	int picked = 0;
+	if (cfg->workspace_binary[0] != '\0') {
+		bool found = false;
+		for (int i = 0; i < n; i++) {
+			if (strcmp(entries[i].id, cfg->workspace_binary) == 0) {
+				picked = i;
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			OW("Preferred workspace controller id '%s' not registered; falling back to '%s'",
+			   cfg->workspace_binary, entries[0].id);
+		}
+	}
+
+	// 4. Commit selection.
+	s_workspace_active = entries[picked];
+	s_workspace_available = true;
+	OW("Workspace controller detected: %s (id=%s binary=%s)", s_workspace_active.display_name,
+	   s_workspace_active.id, s_workspace_active.binary);
+}
+
+//! Build a NULL-terminated child environment = a copy of the service's own
+//! environ plus DISPLAYXR_WORKSPACE_SESSION=1 (skipped if already present).
+//! The service is expected to already carry the runtime-discovery env
+//! (XR_RUNTIME_JSON, XRT_PLUGIN_SEARCH_PATH, DYLD_LIBRARY_PATH, VK_ICD_FILENAMES
+//! / VK_DRIVER_FILES) so the spawned controller inherits it. Returns NULL on OOM
+//! (caller falls back to plain environ). Free with free().
+static char **
+build_child_envp(void)
+{
+	static const char *session_var = "DISPLAYXR_WORKSPACE_SESSION=1";
+
+	int count = 0;
+	bool have_session = false;
+	for (char **e = environ; *e != NULL; e++) {
+		count++;
+		if (strncmp(*e, "DISPLAYXR_WORKSPACE_SESSION=", 28) == 0) {
+			have_session = true;
+		}
+	}
+
+	int extra = have_session ? 0 : 1;
+	char **envp = (char **)malloc(sizeof(char *) * (size_t)(count + extra + 1));
+	if (envp == NULL) {
+		return NULL;
+	}
+
+	int i = 0;
+	for (char **e = environ; *e != NULL; e++) {
+		envp[i++] = *e;
+	}
+	if (!have_session) {
+		envp[i++] = (char *)session_var;
+	}
+	envp[i] = NULL;
+	return envp;
+}
+
+//! posix_spawn the active controller with "--service-managed". Caller holds
+//! s_lock. On success sets s_workspace_pid + s_workspace_running.
+static bool
+do_spawn_locked(void)
+{
+	char *argv[] = {s_workspace_active.binary, (char *)"--service-managed", NULL};
+
+	char **envp = build_child_envp();
+	pid_t pid = 0;
+	int rc = posix_spawn(&pid, s_workspace_active.binary, NULL, NULL, argv,
+	                     envp != NULL ? envp : environ);
+	free(envp);
+
+	if (rc != 0) {
+		OW("Failed to spawn workspace controller '%s': %s", s_workspace_active.binary,
+		   strerror(rc));
+		return false;
+	}
+
+	s_workspace_pid = pid;
+	s_workspace_running = true;
+	OW("Launched workspace controller (PID %ld)", (long)pid);
+	return true;
+}
+
+//! Watcher: blocks in waitpid on the controller, respawns on unexpected exit.
+//! One persistent thread owns the watch→respawn loop for the orchestrator's
+//! lifetime.
+static void *
+watch_thread_func(void *param)
+{
+	(void)param;
+
+	for (;;) {
+		pthread_mutex_lock(&s_lock);
+		pid_t pid = s_workspace_pid;
+		pthread_mutex_unlock(&s_lock);
+
+		if (pid <= 0) {
+			break;
+		}
+
+		int status = 0;
+		pid_t r = waitpid(pid, &status, 0);
+		if (r < 0 && errno == EINTR) {
+			continue;
+		}
+
+		pthread_mutex_lock(&s_lock);
+		s_workspace_running = false;
+
+		// Stop watching if we're tearing down, the controller was disabled,
+		// or it was unregistered.
+		if (s_shutting_down || s_cfg.workspace == SERVICE_CHILD_DISABLE || !s_workspace_available) {
+			pthread_mutex_unlock(&s_lock);
+			break;
+		}
+
+		OW("Workspace controller process exited — respawning");
+		pthread_mutex_unlock(&s_lock);
+
+		// Brief settle before respawn so a controller that crashes on launch
+		// can't spin a tight fork loop.
+		os_nanosleep(1000 * 1000 * 1000); // 1 s
+
+		pthread_mutex_lock(&s_lock);
+		if (s_shutting_down || s_cfg.workspace == SERVICE_CHILD_DISABLE || !s_workspace_available) {
+			pthread_mutex_unlock(&s_lock);
+			break;
+		}
+		(void)do_spawn_locked();
+		pthread_mutex_unlock(&s_lock);
+	}
+
+	return NULL;
+}
+
+//! Spawn the controller (if available + not already running) and start the
+//! watcher once. Caller must NOT hold s_lock.
+static void
+spawn_workspace(void)
+{
+	pthread_mutex_lock(&s_lock);
+	if (!s_workspace_available || s_workspace_running) {
+		pthread_mutex_unlock(&s_lock);
+		return;
+	}
+	bool ok = do_spawn_locked();
+	bool need_watcher = ok && !s_watch_started;
+	if (need_watcher) {
+		s_watch_started = true;
+	}
+	pthread_mutex_unlock(&s_lock);
+
+	if (need_watcher) {
+		if (pthread_create(&s_watch_thread, NULL, watch_thread_func, NULL) != 0) {
+			OW("Failed to start workspace watcher thread");
+			pthread_mutex_lock(&s_lock);
+			s_watch_started = false;
+			pthread_mutex_unlock(&s_lock);
+		}
+	}
+}
+
+//! SIGTERM the controller and reap it. Caller must NOT hold s_lock.
+static void
+terminate_workspace(void)
+{
+	pthread_mutex_lock(&s_lock);
+	pid_t pid = s_workspace_running ? s_workspace_pid : 0;
+	s_workspace_running = false;
+	pthread_mutex_unlock(&s_lock);
+
+	if (pid > 0) {
+		kill(pid, SIGTERM);
+		waitpid(pid, NULL, 0);
+		OW("Terminated workspace controller (PID %ld)", (long)pid);
+	}
+}
+
+static void
+apply_workspace_mode(enum service_child_mode mode)
+{
+	if (!s_workspace_available) {
+		return;
+	}
+
+	switch (mode) {
+	case SERVICE_CHILD_ENABLE:
+	case SERVICE_CHILD_AUTO:
+		// macOS interim: AUTO collapses to spawn-at-init. On Windows AUTO means
+		// "wait for the Ctrl+Space hotkey"; that hotkey is the deferred Piece 3
+		// (TCC-gated, main-thread hazard). Until it lands, spawning at init for
+		// both ENABLE and AUTO is what makes "launch only the service → shell
+		// appears" work with the default (AUTO) config.
+		spawn_workspace();
+		break;
+
+	case SERVICE_CHILD_DISABLE:
+		terminate_workspace();
+		break;
+	}
+}
+
+
+/*
+ *
+ * Public API
+ *
+ */
+
+bool
+service_orchestrator_init(const struct service_config *cfg)
+{
+	pthread_mutex_lock(&s_lock);
+	s_cfg = *cfg;
+	s_shutting_down = false;
+	pthread_mutex_unlock(&s_lock);
+
+	// Detect before applying — apply_workspace_mode early-returns when no
+	// controller is registered, leaving the runtime a standalone OpenXR + WebXR
+	// platform with no spatial-desktop features.
+	detect_workspace_controller(cfg);
+
+	apply_workspace_mode(cfg->workspace);
+	return true;
+}
+
+void
+service_orchestrator_apply_config(const struct service_config *cfg)
+{
+	pthread_mutex_lock(&s_lock);
+	enum service_child_mode old_workspace = s_cfg.workspace;
+	s_cfg = *cfg;
+	pthread_mutex_unlock(&s_lock);
+
+	if (cfg->workspace != old_workspace) {
+		apply_workspace_mode(cfg->workspace);
+	}
+}
+
+void
+service_orchestrator_shutdown(void)
+{
+	pthread_mutex_lock(&s_lock);
+	s_shutting_down = true;
+	bool join = s_watch_started;
+	pthread_mutex_unlock(&s_lock);
+
+	terminate_workspace();
+
+	if (join) {
+		pthread_join(s_watch_thread, NULL);
+		pthread_mutex_lock(&s_lock);
+		s_watch_started = false;
+		pthread_mutex_unlock(&s_lock);
+	}
+}
+
+bool
+service_orchestrator_is_workspace_available(void)
+{
+	return s_workspace_available;
+}
+
+void
+service_orchestrator_refresh_workspace_controller(void)
+{
+	bool was_available = s_workspace_available;
+	detect_workspace_controller(&s_cfg);
+
+	// If availability just flipped (controller installed / uninstalled while the
+	// service was running), re-apply the current workspace mode so a newly
+	// registered controller spawns, or a removed one is torn down.
+	// apply_workspace_mode early-returns when !s_workspace_available, so both
+	// transitions are safe.
+	if (was_available != s_workspace_available) {
+		apply_workspace_mode(s_cfg.workspace);
+	}
+}
+
+const char *
+service_orchestrator_get_workspace_display_name(void)
+{
+	return s_workspace_active.display_name;
+}
+
+const struct workspace_controller_entry *
+service_orchestrator_get_workspace_entry(void)
+{
+	return s_workspace_available ? &s_workspace_active : NULL;
+}
+
+void
+service_orchestrator_dispatch_controller_action(const char *action_name)
+{
+	if (!s_workspace_available) {
+		OW("dispatch_controller_action: no workspace controller registered");
+		return;
+	}
+	if (action_name == NULL || action_name[0] == '\0') {
+		OW("dispatch_controller_action: empty action name");
+		return;
+	}
+
+	char *argv[] = {s_workspace_active.binary, (char *)"--workspace-action", (char *)action_name,
+	                NULL};
+	char **envp = build_child_envp();
+	pid_t pid = 0;
+	int rc = posix_spawn(&pid, s_workspace_active.binary, NULL, NULL, argv,
+	                     envp != NULL ? envp : environ);
+	free(envp);
+
+	if (rc != 0) {
+		OW("dispatch_controller_action: posix_spawn failed for '%s': %s",
+		   s_workspace_active.binary, strerror(rc));
+		return;
+	}
+
+	// Fire-and-forget — the controller is responsible for singleton forwarding.
+	// Detach so the child never becomes a zombie (we never waitpid it here).
+	OW("Dispatched controller action: %s --workspace-action %s", s_workspace_active.binary,
+	   action_name);
+}
+
+unsigned long
+service_orchestrator_get_workspace_pid(void)
+{
+	return s_workspace_running ? (unsigned long)s_workspace_pid : 0;
+}
+
+bool
+service_orchestrator_get_workspace_supports_file_dialog(void)
+{
+	return s_workspace_available &&
+	       (s_workspace_active.capabilities & WORKSPACE_CAPABILITY_FILE_DIALOG) != 0;
+}
+
+#else // !XRT_OS_WINDOWS && !XRT_OS_MACOS
+
+// Stubs for other platforms (Linux, Android)
 
 bool
 service_orchestrator_init(const struct service_config *cfg)
