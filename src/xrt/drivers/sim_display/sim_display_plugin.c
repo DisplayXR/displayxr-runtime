@@ -172,8 +172,9 @@ sim_display_plugin_probe_displays(struct xrt_plugin_instance *inst,
 #if defined(_WIN32)
 		c->supported_apis |= XRT_DP_API_BIT_D3D11 | XRT_DP_API_BIT_D3D12;
 #endif
-#if !defined(XRT_OS_ANDROID)
-		// Desktop-GL DP only; Android is VK-only (no GL processor built).
+#if !defined(XRT_OS_ANDROID) && defined(XRT_HAVE_OPENGL)
+		// Desktop-GL DP only; Android is VK-only and a headless Linux build
+		// without GL dev libs compiles no GL processor (XRT_HAVE_OPENGL off).
 		c->supported_apis |= XRT_DP_API_BIT_GL;
 #endif
 #if defined(__APPLE__)
@@ -228,7 +229,7 @@ static struct xrt_plugin_iface g_sim_display_iface = {
     .create_dp_d3d12 = NULL,
 #endif
 
-#if !defined(XRT_OS_ANDROID)
+#if !defined(XRT_OS_ANDROID) && defined(XRT_HAVE_OPENGL)
     .create_dp_gl = sim_display_dp_factory_gl,
 #else
     .create_dp_gl = NULL,
