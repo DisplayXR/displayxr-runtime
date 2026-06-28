@@ -70,7 +70,9 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(displayxr_common)
 
-add_executable(cube_hosted_legacy_vk_linux main.cpp)
+# stb_image_impl.cpp supplies the stb_image definition on Linux (displayxr::common
+# only ships a macOS-gated impl TU; main.cpp is declarations-only). See that file.
+add_executable(cube_hosted_legacy_vk_linux main.cpp stb_image_impl.cpp)
 
 target_include_directories(cube_hosted_legacy_vk_linux PRIVATE
     ${OPENXR_INCLUDE_DIR}
