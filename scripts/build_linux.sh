@@ -14,7 +14,10 @@
 #
 # Prerequisites (Debian/Ubuntu):
 #   sudo apt-get install -y build-essential cmake ninja-build pkg-config \
-#       libvulkan-dev vulkan-validationlayers libeigen3-dev libcjson-dev
+#       libvulkan-dev vulkan-validationlayers glslang-tools \
+#       libeigen3-dev libcjson-dev
+#   # glslang-tools provides glslangValidator, required at configure time to
+#   # compile the null compositor's SPIR-V (cmake/SPIR-V.cmake).
 #   # optional (enables the legacy udev VR prober — NOT needed for selftest):
 #   sudo apt-get install -y libudev-dev
 #
