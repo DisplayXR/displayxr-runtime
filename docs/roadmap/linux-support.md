@@ -66,19 +66,31 @@ OS detection, `aux/os`, the POSIX plug-in loader, the sim_display display
 processor, and that the runtime starts and reports valid display info — all
 hardware-free, no GPU/window/loader.
 
-**Delivered here:**
+**Delivered & CI-verified green** on `ubuntu-latest` (`displayxr-cli selftest`
+passes: instance + system + head device + active plug-in `sim-display` ABI v4 +
+display info `0.3440m x 0.1940m, 1920x1080 px`):
 - `scripts/build_linux.sh` — builds the runtime, `displayxr-cli`, and the
   sim_display plug-in; stages the plug-in + a JSON manifest; runs
   `displayxr-cli selftest` (the exact hardware-free gate CI runs) + `info`.
-- `CMakeLists.txt` — relaxed `find_package(udev REQUIRED)` → `find_package(udev)`
-  so a box without `libudev-dev` configures (the legacy VR prober gated by
-  `XRT_HAVE_LIBUDEV` simply turns off; the display processor comes from the
-  plug-in loader, not udev).
+- `.github/workflows/build-linux.yml` — non-required dev-loop job
+  (`workflow_dispatch` + `linux*` branches); `ubuntu-latest` is the box that
+  gets Phase 0 green. Promote to a required PR check once stable.
+- `CMakeLists.txt` — (a) relaxed `find_package(udev REQUIRED)` → optional so a
+  box without `libudev-dev` configures (`XRT_HAVE_LIBUDEV` just turns off; the DP
+  comes from the plug-in loader, not udev); (b) `CMAKE_POSITION_INDEPENDENT_CODE
+  ON` on Linux so static libs (incl. the FetchContent'd `displayxr_mcp`) link
+  into the runtime `.so`.
+- `src/xrt/drivers/CMakeLists.txt` + `sim_display_plugin.c` — gate the desktop-GL
+  display processor (source, `aux_ogl` link, plug-in factory) on `XRT_HAVE_OPENGL`
+  (no-op on Win/macOS, dropped on a headless Linux box with no GL); route Linux
+  through the Android-style self-contained plug-in model (static-link aux, no
+  runtime-DLL import — the version script hides all aux symbols but
+  `xrtPluginNegotiate`).
 
-**Done when:** `./scripts/build_linux.sh` exits green with a passing
-`displayxr-cli selftest` on a stock Ubuntu box. `displayxr-cli` links the
-no-compositor instance (`target_instance_no_comp`), so Phase 0 needs neither a
-native compositor nor the OpenXR loader.
+All five changes are guarded to be no-ops off Linux; Windows/macOS/Android CI
+stayed green on the merge. `displayxr-cli` links the no-compositor instance
+(`target_instance_no_comp`), so Phase 0 needs neither a native compositor nor the
+OpenXR loader.
 
 **Follow-ups (small, after first green):** add a Linux job to `build-linux.yml`
 running this script as a required check; add an install rule that drops the
