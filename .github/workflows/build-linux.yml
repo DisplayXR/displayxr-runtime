@@ -44,5 +44,8 @@ jobs:
             libeigen3-dev libcjson-dev libudev-dev \
             libxcb1-dev libxcb-randr0-dev libx11-xcb-dev
 
-      - name: Build + headless selftest
-        run: ./scripts/build_linux.sh
+      - name: Build + headless selftest + test app
+        # --apps also builds the OpenXR loader (from source) + the
+        # cube_hosted_legacy_vk_linux test app, compile-validating the Phase 1b
+        # bring-up vehicle. CI has no display, so the app isn't run here.
+        run: ./scripts/build_linux.sh --apps

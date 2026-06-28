@@ -29,6 +29,10 @@
 #   ./scripts/build_linux.sh             # in-process headless build + selftest
 #   ./scripts/build_linux.sh --service   # also build displayxr-service (IPC)
 #   ./scripts/build_linux.sh --no-test   # build only, skip the selftest run
+#   ./scripts/build_linux.sh --apps      # also build the OpenXR loader + the
+#                                        # cube_hosted_legacy_vk_linux test app
+#                                        # (Phase 1b on-screen bring-up; needs a
+#                                        # GPU + X server to actually run)
 
 set -euo pipefail
 
@@ -37,13 +41,18 @@ BUILD_DIR="$ROOT/build"
 
 SERVICE_MODE=OFF
 RUN_TEST=ON
+BUILD_APPS=OFF
 for arg in "$@"; do
   case "$arg" in
     --service) SERVICE_MODE=ON ;;
     --no-test) RUN_TEST=OFF ;;
+    --apps) BUILD_APPS=ON ;;
     *) echo "Unknown arg: $arg" >&2; exit 2 ;;
   esac
 done
+
+OPENXR_DIR="$BUILD_DIR/_openxr"
+OPENXR_VERSION="1.1.43"
 
 # Step 1: Configure + build the runtime, the CLI, and the sim_display plug-in.
 #
@@ -124,4 +133,57 @@ if [ "$RUN_TEST" = "ON" ]; then
 else
   echo "Run the headless gate manually:"
   echo "  XRT_PLUGIN_SEARCH_PATH=$PLUGIN_DIR $CLI_BIN selftest"
+fi
+
+# Step 5: optionally build the OpenXR loader + the hosted Vulkan cube test app.
+# Unlike the headless cli (which links the no-comp instance directly), a test app
+# is a real OpenXR client and links the loader. This is the Phase 1b on-screen
+# bring-up vehicle — it needs a GPU + running X server to actually present.
+if [ "$BUILD_APPS" = "ON" ]; then
+  # Step 5a: OpenXR loader (built from source, cached in $OPENXR_DIR).
+  if [ ! -f "$OPENXR_DIR/lib/libopenxr_loader.so" ] || \
+     [ ! -f "$OPENXR_DIR/lib/cmake/openxr/OpenXRConfig.cmake" ]; then
+    echo "=== Building OpenXR loader $OPENXR_VERSION ==="
+    rm -rf /tmp/openxr-sdk-linux "$OPENXR_DIR"
+    git clone --depth 1 --branch "release-$OPENXR_VERSION" \
+      https://github.com/KhronosGroup/OpenXR-SDK-Source.git /tmp/openxr-sdk-linux
+    cmake -B /tmp/openxr-sdk-linux/build -S /tmp/openxr-sdk-linux -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX="$OPENXR_DIR" \
+      -DBUILD_TESTS=OFF -DBUILD_CONFORMANCE_TESTS=OFF \
+      -DBUILD_WITH_SYSTEM_JSONCPP=OFF
+    cmake --build /tmp/openxr-sdk-linux/build
+    cmake --install /tmp/openxr-sdk-linux/build
+  else
+    echo "=== OpenXR loader already built at $OPENXR_DIR ==="
+  fi
+
+  # Step 5b: hosted (legacy) Vulkan cube — runtime self-creates the XCB window.
+  APP=cube_hosted_legacy_vk_linux
+  APP_DIR="$ROOT/test_apps/$APP"
+  echo "=== Building $APP ==="
+  cmake -B "$APP_DIR/build" -S "$APP_DIR" -G Ninja \
+    -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
+  cmake --build "$APP_DIR/build"
+
+  # Step 5c: run script — dev runtime manifest + sim-display plug-in + loader.
+  RUN="$BUILD_DIR/run_${APP}.sh"
+  cat > "$RUN" <<EOF
+#!/bin/bash
+# Run $APP against the dev runtime build. Hosted: the runtime self-creates the
+# XCB window, so this needs a running X server (DISPLAY set) + a Vulkan GPU.
+# OXR_ENABLE_VK_NATIVE_COMPOSITOR=1 selects the native Vulkan compositor path;
+# SIM_DISPLAY_OUTPUT picks the sim-display weave (anaglyph/sbs/...).
+export XR_RUNTIME_JSON="$BUILD_DIR/openxr_displayxr-dev.json"
+export LD_LIBRARY_PATH="$OPENXR_DIR/lib:\${LD_LIBRARY_PATH:-}"
+export XRT_PLUGIN_SEARCH_PATH="$PLUGIN_DIR"
+export OXR_ENABLE_VK_NATIVE_COMPOSITOR="\${OXR_ENABLE_VK_NATIVE_COMPOSITOR:-1}"
+export SIM_DISPLAY_OUTPUT="\${SIM_DISPLAY_OUTPUT:-anaglyph}"
+exec "$APP_DIR/build/$APP" "\$@"
+EOF
+  chmod +x "$RUN"
+  echo ""
+  echo "Built $APP. Run on a Linux box with a GPU + display:"
+  echo "  $RUN"
 fi
