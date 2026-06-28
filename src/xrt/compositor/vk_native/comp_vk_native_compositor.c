@@ -64,6 +64,10 @@
 #include <IOSurface/IOSurface.h>
 #endif
 
+#ifdef XRT_OS_LINUX
+#include "vk_native/comp_vk_native_window_xcb.h"
+#endif
+
 #include <string.h>
 #include <math.h>
 
@@ -131,6 +135,19 @@ struct comp_vk_native_compositor
 #ifdef XRT_OS_MACOS
 	//! macOS window helper (self-owned or external view).
 	struct comp_vk_native_window_macos *macos_window;
+
+	//! True if we created the window ourselves.
+	bool owns_window;
+#endif
+
+#ifdef XRT_OS_LINUX
+	//! XCB window helper (self-owned; hosted class only in Phase 1).
+	struct comp_vk_native_window_xcb *xcb_window;
+
+	//! Connection + window id handed to the target as the type-erased hwnd.
+	//! Stored here (outlives the target) so the surface's borrowed connection
+	//! stays valid for the target's lifetime.
+	struct comp_vk_native_xcb_handle xcb_handle;
 
 	//! True if we created the window ourselves.
 	bool owns_window;
@@ -877,6 +894,14 @@ vk_compositor_wait_frame(struct xrt_compositor *xc,
 	}
 #endif
 
+#ifdef XRT_OS_LINUX
+	if (c->owns_window && c->xcb_window != NULL &&
+	    !comp_vk_native_window_xcb_is_valid(c->xcb_window)) {
+		U_LOG_I("Window closed - signaling session exit");
+		return XRT_ERROR_IPC_FAILURE;
+	}
+#endif
+
 	int64_t period_ns = (int64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate);
 
 	c->frame_id++;
@@ -981,6 +1006,47 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 			// CAMetalLayer drawableSize — sync it to the live view
 			// bounds before recreating the swapchain (#524).
 			comp_vk_native_window_macos_sync_drawable_size(c->macos_window);
+
+			if (c->target != NULL) {
+				comp_vk_native_target_resize(c->target, new_width, new_height);
+				// #602: drain after swapchain recreate (see Windows branch).
+				c->vk.vkDeviceWaitIdle(c->vk.device);
+				// #602: invalidate DP target-handle-keyed caches (see Windows branch).
+				if (c->display_processor != NULL) {
+					xrt_display_processor_vk_notify_target_recreated(
+					    (struct xrt_display_processor_vk *)c->display_processor,
+					    comp_vk_native_target_get_generation(c->target));
+				}
+			}
+			c->settings.preferred.width = new_width;
+			c->settings.preferred.height = new_height;
+
+			// #602: extension apps' atlas is owned by layer_commit; only legacy
+			// apps need the window-derived resize here (see Windows branch).
+			if (c->legacy_app_tile_scaling) {
+				uint32_t new_vw = new_width / 2;
+				uint32_t new_vh = new_height;
+				uint32_t tc, tr;
+				comp_vk_native_renderer_get_tile_layout(c->renderer, &tc, &tr);
+				comp_vk_native_renderer_resize(c->renderer, new_vw, new_vh,
+				                                tc * new_vw, tr * new_vh);
+			}
+		}
+	}
+#endif
+
+#ifdef XRT_OS_LINUX
+	if (c->xcb_window != NULL) {
+		uint32_t new_width = 0, new_height = 0;
+		comp_vk_native_window_xcb_get_dimensions(c->xcb_window, &new_width, &new_height);
+
+		if (new_width > 0 && new_height > 0 &&
+		    (new_width != c->settings.preferred.width ||
+		     new_height != c->settings.preferred.height)) {
+
+			U_LOG_I("Window resized: %ux%u -> %ux%u",
+			        c->settings.preferred.width, c->settings.preferred.height,
+			        new_width, new_height);
 
 			if (c->target != NULL) {
 				comp_vk_native_target_resize(c->target, new_width, new_height);
@@ -2318,7 +2384,7 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 					uint32_t new_vh = mode->view_height_pixels;
 					uint32_t new_aw = mode->atlas_width_pixels;
 					uint32_t new_ah = mode->atlas_height_pixels;
-#if defined(XRT_OS_WINDOWS) || defined(__APPLE__)
+#if defined(XRT_OS_WINDOWS) || defined(__APPLE__) || defined(XRT_OS_LINUX)
 					if (!c->owns_window && c->settings.preferred.width > 0 &&
 					    c->settings.preferred.height > 0) {
 						// Handle app: window may be smaller than the display,
@@ -3114,6 +3180,12 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	}
 #endif
 
+#ifdef XRT_OS_LINUX
+	if (c->xcb_window != NULL) {
+		comp_vk_native_window_xcb_destroy(&c->xcb_window);
+	}
+#endif
+
 	// Destroy command pool (we created it for the display processor factory)
 	if (c->cmd_pool != VK_NULL_HANDLE) {
 		vk->vkDestroyCommandPool(vk->device, c->cmd_pool, NULL);
@@ -3319,6 +3391,42 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	}
 #endif
 
+#ifdef XRT_OS_LINUX
+	// Phase 1: hosted class only — the runtime self-creates an XCB window.
+	// App-provided X11 windows (handle/texture) need XR_EXT_xlib_window_binding
+	// (Phase 3); until then hwnd is expected to be NULL here.
+	if (hwnd != NULL) {
+		U_LOG_W("VK native (Linux): app-provided window not supported yet "
+		        "(needs XR_EXT_xlib_window_binding) — self-creating instead");
+	}
+	if (shared_texture_handle != NULL) {
+		c->xcb_window = NULL;
+		U_LOG_I("Offscreen mode — no window (shared texture)");
+		hwnd = NULL;
+	} else {
+		uint32_t win_w = xdev->hmd->screens[0].w_pixels;
+		uint32_t win_h = xdev->hmd->screens[0].h_pixels;
+		if (win_w == 0 || win_h == 0) {
+			win_w = 1920;
+			win_h = 1080;
+		}
+		U_LOG_I("Creating self-owned XCB window (%ux%u)", win_w, win_h);
+		xrt_result_t xret = comp_vk_native_window_xcb_create(
+		    win_w, win_h, transparent_background, &c->xcb_window);
+		if (xret != XRT_SUCCESS) {
+			U_LOG_E("Failed to create self-owned XCB window");
+			free(c);
+			return xret;
+		}
+		c->owns_window = true;
+		// Hand the connection + window id to the target via the type-erased
+		// hwnd. c->xcb_handle lives in the compositor, so the connection the
+		// surface borrows stays valid for the target's lifetime.
+		comp_vk_native_window_xcb_get_handle(c->xcb_window, &c->xcb_handle);
+		hwnd = &c->xcb_handle;
+	}
+#endif
+
 	// Initialize settings
 	memset(&c->settings, 0, sizeof(c->settings));
 	c->settings.preferred.width = xdev->hmd->screens[0].w_pixels;
@@ -3357,6 +3465,17 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		IOSurfaceRef surface = (IOSurfaceRef)shared_texture_handle;
 		c->settings.preferred.width = (uint32_t)IOSurfaceGetWidth(surface);
 		c->settings.preferred.height = (uint32_t)IOSurfaceGetHeight(surface);
+	}
+#endif
+
+#ifdef XRT_OS_LINUX
+	if (c->xcb_window != NULL) {
+		uint32_t xw = 0, xh = 0;
+		comp_vk_native_window_xcb_get_dimensions(c->xcb_window, &xw, &xh);
+		if (xw > 0 && xh > 0) {
+			c->settings.preferred.width = xw;
+			c->settings.preferred.height = xh;
+		}
 	}
 #endif
 
@@ -3431,10 +3550,16 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 #ifdef XRT_OS_MACOS
 	    || c->owns_window
 #endif
+#ifdef XRT_OS_LINUX
+	    || c->owns_window
+#endif
 	) {
 		void *target_hwnd = hwnd;
 #ifdef XRT_OS_WINDOWS
 		if (target_hwnd == NULL) target_hwnd = c->hwnd;
+#endif
+#ifdef XRT_OS_LINUX
+		if (target_hwnd == NULL && c->xcb_window != NULL) target_hwnd = &c->xcb_handle;
 #endif
 		xrt_result_t xret = comp_vk_native_target_create(c, target_hwnd,
 		                                                  c->settings.preferred.width,
@@ -3533,7 +3658,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	}
 
 	// Create HUD overlay for runtime-owned windows
-#if defined(XRT_OS_WINDOWS) || defined(XRT_OS_MACOS)
+#if defined(XRT_OS_WINDOWS) || defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX)
 	if (c->owns_window) {
 		u_hud_create(&c->hud, c->settings.preferred.width);
 	}
@@ -3804,6 +3929,82 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	int32_t win_left = 0, win_top = 0;
 	if (comp_vk_native_window_macos_get_screen_position(
 	        c->macos_window, &win_left, &win_top)) {
+		win_center_px_x = (float)(win_left - disp_left) + (float)win_px_w / 2.0f;
+		win_center_px_y = (float)(win_top - disp_top) + (float)win_px_h / 2.0f;
+	}
+	out_metrics->window_screen_left = win_left;
+	out_metrics->window_screen_top = win_top;
+
+	out_metrics->window_center_offset_x_m = (win_center_px_x - disp_center_px_x) * pixel_size_x;
+	out_metrics->window_center_offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
+
+	out_metrics->valid = true;
+	return true;
+#elif defined(XRT_OS_LINUX)
+	// Mirror the macOS path: window metrics from the live XCB window. Display
+	// info from the DP (pixel info + dims) when available, else from sys_info;
+	// window size + screen position from XCB (X11 exposes absolute window pos,
+	// so window-relative 3D tracks window moves — the reason XCB precedes
+	// Wayland in the Linux plan).
+	if (c->xcb_window == NULL) {
+		return false;
+	}
+
+	uint32_t disp_px_w = 0, disp_px_h = 0;
+	int32_t disp_left = 0, disp_top = 0;
+	float disp_w_m = 0.0f, disp_h_m = 0.0f;
+	bool have_disp = false;
+	if (c->display_processor != NULL &&
+	    xrt_display_processor_get_display_pixel_info(
+	        c->display_processor, &disp_px_w, &disp_px_h,
+	        &disp_left, &disp_top) &&
+	    disp_px_w > 0 && disp_px_h > 0 &&
+	    xrt_display_processor_get_display_dimensions(
+	        c->display_processor, &disp_w_m, &disp_h_m) &&
+	    disp_w_m > 0.0f && disp_h_m > 0.0f) {
+		have_disp = true;
+	}
+	if (!have_disp && c->sys_info_set &&
+	    c->sys_info.display_pixel_width > 0 && c->sys_info.display_pixel_height > 0 &&
+	    c->sys_info.display_width_m > 0.0f && c->sys_info.display_height_m > 0.0f) {
+		disp_px_w = c->sys_info.display_pixel_width;
+		disp_px_h = c->sys_info.display_pixel_height;
+		disp_left = c->sys_info.display_screen_left;
+		disp_top = c->sys_info.display_screen_top;
+		disp_w_m = c->sys_info.display_width_m;
+		disp_h_m = c->sys_info.display_height_m;
+		have_disp = true;
+	}
+	if (!have_disp) {
+		return false;
+	}
+
+	uint32_t win_px_w = 0, win_px_h = 0;
+	comp_vk_native_window_xcb_get_dimensions(c->xcb_window, &win_px_w, &win_px_h);
+	if (win_px_w == 0 || win_px_h == 0) return false;
+
+	float pixel_size_x = disp_w_m / (float)disp_px_w;
+	float pixel_size_y = disp_h_m / (float)disp_px_h;
+
+	out_metrics->display_width_m = disp_w_m;
+	out_metrics->display_height_m = disp_h_m;
+	out_metrics->display_pixel_width = disp_px_w;
+	out_metrics->display_pixel_height = disp_px_h;
+	out_metrics->display_screen_left = disp_left;
+	out_metrics->display_screen_top = disp_top;
+
+	out_metrics->window_pixel_width = win_px_w;
+	out_metrics->window_pixel_height = win_px_h;
+
+	out_metrics->window_width_m = (float)win_px_w * pixel_size_x;
+	out_metrics->window_height_m = (float)win_px_h * pixel_size_y;
+
+	float disp_center_px_x = (float)disp_px_w / 2.0f;
+	float disp_center_px_y = (float)disp_px_h / 2.0f;
+	float win_center_px_x = disp_center_px_x;
+	float win_center_px_y = disp_center_px_y;
+	int32_t win_left = 0, win_top = 0;
+	if (comp_vk_native_window_xcb_get_screen_position(c->xcb_window, &win_left, &win_top)) {
 		win_center_px_x = (float)(win_left - disp_left) + (float)win_px_w / 2.0f;
 		win_center_px_y = (float)(win_top - disp_top) + (float)win_px_h / 2.0f;
 	}

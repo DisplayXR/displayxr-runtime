@@ -38,6 +38,15 @@
 #include "android/android_globals.h"
 #endif
 
+#ifdef XRT_OS_LINUX
+// X11/XCB present path: vkCreateXcbSurfaceKHR from a connection + window id
+// carried in struct comp_vk_native_xcb_handle. (VK_USE_PLATFORM_XCB_KHR is
+// defined by CMake via xrt_config_vulkan.h when XRT_HAVE_XCB.)
+#include <vulkan/vulkan_xcb.h>
+#include <xcb/xcb.h>
+#include "comp_vk_native_window_xcb.h"
+#endif
+
 #define DCOMP_RING 2 // Number of shared back-buffers in the bridge ring
 
 // Upper bound on swapchain images we track. The driver may create more than
@@ -880,6 +889,53 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 	                                          target->surface, &present_support);
 	if (!present_support) {
 		U_LOG_E("Queue family does not support presentation to Android surface");
+		vk->vkDestroySurfaceKHR(vk->instance, target->surface, NULL);
+		free(target);
+		return XRT_ERROR_VULKAN;
+	}
+#elif defined(XRT_OS_LINUX)
+	// hwnd is a struct comp_vk_native_xcb_handle* carrying both the
+	// xcb_connection_t* and the xcb_window_t (a single void* can't hold both).
+	if (hwnd == NULL) {
+		U_LOG_E("VK native target: XCB handle is NULL on Linux");
+		free(target);
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	const struct comp_vk_native_xcb_handle *xcb_handle =
+	    (const struct comp_vk_native_xcb_handle *)hwnd;
+
+	PFN_vkCreateXcbSurfaceKHR pfnCreateXcbSurface = vk->vkCreateXcbSurfaceKHR;
+	if (pfnCreateXcbSurface == NULL) {
+		pfnCreateXcbSurface = (PFN_vkCreateXcbSurfaceKHR)
+		    vk->vkGetInstanceProcAddr(vk->instance, "vkCreateXcbSurfaceKHR");
+	}
+	if (pfnCreateXcbSurface == NULL) {
+		U_LOG_E("vkCreateXcbSurfaceKHR not available — VK_KHR_xcb_surface must be enabled");
+		free(target);
+		return XRT_ERROR_VULKAN;
+	}
+
+	VkXcbSurfaceCreateInfoKHR surface_ci = {
+	    .sType = VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR,
+	    .pNext = NULL,
+	    .flags = 0,
+	    .connection = (xcb_connection_t *)xcb_handle->connection,
+	    .window = (xcb_window_t)xcb_handle->window,
+	};
+
+	VkResult res = pfnCreateXcbSurface(vk->instance, &surface_ci, NULL, &target->surface);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("Failed to create XCB surface: %d", res);
+		free(target);
+		return XRT_ERROR_VULKAN;
+	}
+
+	VkBool32 present_support = VK_FALSE;
+	vk->vkGetPhysicalDeviceSurfaceSupportKHR(vk->physical_device,
+	                                          queue_family_index,
+	                                          target->surface, &present_support);
+	if (!present_support) {
+		U_LOG_E("Queue family does not support presentation to XCB surface");
 		vk->vkDestroySurfaceKHR(vk->instance, target->surface, NULL);
 		free(target);
 		return XRT_ERROR_VULKAN;

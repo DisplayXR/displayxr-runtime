@@ -15,9 +15,13 @@
 # Prerequisites (Debian/Ubuntu):
 #   sudo apt-get install -y build-essential cmake ninja-build pkg-config \
 #       libvulkan-dev vulkan-validationlayers glslang-tools \
-#       libeigen3-dev libcjson-dev
+#       libeigen3-dev libcjson-dev \
+#       libxcb1-dev libxcb-randr0-dev libx11-xcb-dev
 #   # glslang-tools provides glslangValidator, required at configure time to
 #   # compile the null compositor's SPIR-V (cmake/SPIR-V.cmake).
+#   # libxcb*-dev enables XRT_HAVE_XCB → the native Vulkan compositor builds on
+#   # Linux with the VK_KHR_xcb_surface present path (Phase 1). Without it the
+#   # runtime still builds headless (Phase 0) but has no on-screen compositor.
 #   # optional (enables the legacy udev VR prober — NOT needed for selftest):
 #   sudo apt-get install -y libudev-dev
 #

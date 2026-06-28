@@ -5,7 +5,7 @@
 # Native Vulkan compositor library
 #
 
-if((WIN32 OR APPLE OR ANDROID) AND XRT_HAVE_VULKAN)
+if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE_VULKAN)
 	# XR_EXT_display_zones alpha-over draw path (ADR-027): zone layers draw
 	# through a blend pipeline instead of vkCmdBlitImage.
 	spirv_shaders(
@@ -69,6 +69,16 @@ if((WIN32 OR APPLE OR ANDROID) AND XRT_HAVE_VULKAN)
 		# Surface-lifecycle re-sync reads the live ANativeWindow published by the
 		# SurfaceView callbacks via android_globals_* (#507).
 		target_link_libraries(comp_vk_native PRIVATE aux_android)
+	endif()
+
+	if(XRT_HAVE_LINUX AND XRT_HAVE_XCB)
+		# Linux X11 present path (Phase 1): self-created XCB window + VK_KHR_xcb_surface.
+		# XCB_{LIBRARIES,INCLUDE_DIRS} come from the top-level pkg_check_modules(XCB ...).
+		target_sources(comp_vk_native PRIVATE
+			comp_vk_native_window_xcb.c
+			comp_vk_native_window_xcb.h)
+		target_include_directories(comp_vk_native PRIVATE ${XCB_INCLUDE_DIRS})
+		target_link_libraries(comp_vk_native PRIVATE ${XCB_LIBRARIES})
 	endif()
 
 	# Qwerty include path for runtime-side 2D/3D toggle polling

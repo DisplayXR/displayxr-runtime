@@ -123,6 +123,13 @@ static const char *required_vk_instance_extensions[] = {
     // compositor fails target creation at xrCreateSession.
     VK_KHR_SURFACE_EXTENSION_NAME,         //
     VK_KHR_ANDROID_SURFACE_EXTENSION_NAME, //
+#elif defined(VK_KHR_xcb_surface) && defined(XRT_OS_LINUX)
+    // VK native compositor on Linux needs VkSurfaceKHR via VK_KHR_xcb_surface
+    // (xcb_connection_t + xcb_window_t -> VkSurfaceKHR in comp_vk_native_target).
+    // Without this the instance-level vkCreateXcbSurfaceKHR PFN is never loaded
+    // and the compositor fails target creation at xrCreateSession.
+    VK_KHR_SURFACE_EXTENSION_NAME,      //
+    VK_KHR_XCB_SURFACE_EXTENSION_NAME,  //
 #endif
 };
 

@@ -41,7 +41,8 @@ jobs:
           sudo apt-get install -y \
             build-essential cmake ninja-build pkg-config \
             libvulkan-dev vulkan-validationlayers glslang-tools \
-            libeigen3-dev libcjson-dev libudev-dev
+            libeigen3-dev libcjson-dev libudev-dev \
+            libxcb1-dev libxcb-randr0-dev libx11-xcb-dev
 
       - name: Build + headless selftest
         run: ./scripts/build_linux.sh
