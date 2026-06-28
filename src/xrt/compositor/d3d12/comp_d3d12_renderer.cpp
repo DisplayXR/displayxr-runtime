@@ -1535,9 +1535,27 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 			// UNORM sample (see the other SRV site): no sRGB auto-decode; the
 			// app's display-referred bytes pass through to the DP unchanged.
 			srv_desc.Format = d3d_dxgi_format_to_unorm_sample(src_desc.Format);
-			srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-			srv_desc.Texture2D.MipLevels = 1;
 			srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			// Honor the projection view's array layer. Under single-pass-instanced
+			// the app submits ONE swapchain with viewCount=2 and per-view
+			// subImage.imageArrayIndex 0 (left) / 1 (right) — both eyes live in
+			// array slices of a 2-layer (DepthOrArraySize>1) texture. A plain
+			// TEXTURE2D SRV always views slice 0, so both eyes would sample the
+			// left image (flat output). View the array and pin the slice to the
+			// view's array_index. Multi-pass (single-layer, array_index 0) takes
+			// the TEXTURE2D path unchanged.
+			uint32_t array_index = layer->data.proj.v[vi].sub.array_index;
+			if (src_desc.DepthOrArraySize > 1) {
+				srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+				srv_desc.Texture2DArray.MostDetailedMip = 0;
+				srv_desc.Texture2DArray.MipLevels = 1;
+				srv_desc.Texture2DArray.FirstArraySlice = array_index;
+				srv_desc.Texture2DArray.ArraySize = 1;
+				srv_desc.Texture2DArray.PlaneSlice = 0;
+			} else {
+				srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+				srv_desc.Texture2D.MipLevels = 1;
+			}
 
 			D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = renderer->srv_heap->GetCPUDescriptorHandleForHeapStart();
 			srv_cpu.ptr += renderer->srv_descriptor_size * srv_slot;
