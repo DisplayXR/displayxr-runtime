@@ -4,6 +4,20 @@ set -e
 
 echo "=== DisplayXR Uninstaller ==="
 
+# Stop + remove the service LaunchAgent (macOS spatial shell, #61) before
+# deleting its binary, so launchd isn't left pointing at a missing program.
+AGENT="/Library/LaunchAgents/com.displayxr.service.plist"
+if [ -f "$AGENT" ]; then
+    echo "Stopping + removing DisplayXR service LaunchAgent..."
+    CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
+    if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ]; then
+        CONSOLE_UID="$(id -u "$CONSOLE_USER" 2>/dev/null || true)"
+        [ -n "$CONSOLE_UID" ] && launchctl bootout "gui/$CONSOLE_UID" "$AGENT" 2>/dev/null || true
+    fi
+    sudo rm -f "$AGENT"
+fi
+pkill -x displayxr-service 2>/dev/null || true
+
 echo "Removing DisplayXR runtime..."
 # This recursive delete covers the runtime dylib, the
 # DisplayXR-SimDisplay.dylib plug-in under lib/displayxr/plugins/,

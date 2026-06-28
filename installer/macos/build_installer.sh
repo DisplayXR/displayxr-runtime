@@ -196,6 +196,63 @@ EOF
 cp "$SCRIPT_DIR/uninstall.sh" "$RUNTIME_ROOT/"
 chmod +x "$RUNTIME_ROOT/uninstall.sh"
 
+# --- Service binary + LaunchAgent (macOS spatial shell, #61) ---
+# The installed spatial shell (DisplayXRShell .pkg) attaches to displayxr-service
+# as an IPC client. Ship the service (built HYBRID by build_macos.sh --installer)
+# and a system LaunchAgent that auto-starts it in the user's GUI session at login
+# — the macOS parallel of Windows' HKLM\...\Run autostart. Present only when the
+# artifact came from a SERVICE build; a non-service .pkg ships runtime-only.
+SERVICE_SRC="$ARTIFACT_DIR/bin/displayxr-service"
+if [ -f "$SERVICE_SRC" ]; then
+    mkdir -p "$RUNTIME_ROOT/bin"
+    cp "$SERVICE_SRC" "$RUNTIME_ROOT/bin/displayxr-service"
+    chmod 0755 "$RUNTIME_ROOT/bin/displayxr-service"
+    # Re-sign defensively (a tar round-trip in CI can drop the signature).
+    codesign --force --sign - "$RUNTIME_ROOT/bin/displayxr-service" 2>/dev/null || true
+
+    LAUNCHAGENT_DIR="$WORK_DIR/payload-runtime/Library/LaunchAgents"
+    mkdir -p "$LAUNCHAGENT_DIR"
+    # The service's bundled Vulkan loader needs the runtime's MoltenVK ICD (in a
+    # private path the loader doesn't search), so the agent sets VK_ICD_FILENAMES.
+    # KeepAlive keeps the always-on orchestrator up; ProcessType Interactive +
+    # the gui/<uid> bootstrap (postinstall) put it in the Aqua session so its
+    # menu-bar status item shows.
+    cat > "$LAUNCHAGENT_DIR/com.displayxr.service.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.displayxr.service</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$INSTALL_PREFIX/bin/displayxr-service</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>VK_ICD_FILENAMES</key>
+        <string>$INSTALL_PREFIX/share/vulkan/icd.d/MoltenVK_icd.json</string>
+        <key>VK_DRIVER_FILES</key>
+        <string>$INSTALL_PREFIX/share/vulkan/icd.d/MoltenVK_icd.json</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/displayxr-service.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/displayxr-service.err.log</string>
+</dict>
+</plist>
+PLIST
+    echo "Staged displayxr-service + LaunchAgent into the runtime payload."
+else
+    echo "Note: displayxr-service not in artifact (non-SERVICE build); .pkg ships runtime only."
+fi
+
 # --- 2. Build runtime component pkg ---
 echo "--- Building runtime component ---"
 pkgbuild --root "$WORK_DIR/payload-runtime" \

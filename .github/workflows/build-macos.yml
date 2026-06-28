@@ -197,12 +197,24 @@ jobs:
             echo "::error::DisplayXR-SimDisplay.dylib missing from .pkg payload — runtime would have no display processor on a clean install (#274)."
             MISSING=1
           fi
+          # #61: the .pkg must ship the service binary + its auto-start
+          # LaunchAgent, or the installed spatial shell has nothing to attach to
+          # as an IPC client (blank window). build_macos.sh --installer builds
+          # HYBRID, so the service is always expected here.
+          if ! grep -q 'DisplayXR/bin/displayxr-service' "$EXPAND_DIR/files"; then
+            echo "::error::displayxr-service missing from .pkg payload — the installed spatial shell could not attach as an IPC client (#61)."
+            MISSING=1
+          fi
+          if ! grep -q 'LaunchAgents/com.displayxr.service.plist' "$EXPAND_DIR/files"; then
+            echo "::error::com.displayxr.service.plist (service auto-start LaunchAgent) missing from .pkg payload (#61)."
+            MISSING=1
+          fi
           if [ "$MISSING" -ne 0 ]; then
             echo "Payload listing:"
             cat "$EXPAND_DIR/files"
             exit 1
           fi
-          echo "PASS: .pkg payload contains plug-in + manifest."
+          echo "PASS: .pkg payload contains plug-in + manifest + service + LaunchAgent."
 
       - name: Upload installer
         uses: actions/upload-artifact@v6
