@@ -33,18 +33,10 @@ endif()
 # macOS out-of-process present path (shell Tier 1, #48): the null compositor is
 # the service's system compositor on macOS, driving a per-session
 # comp_target_swapchain that presents to a runtime-owned NSWindow via a MoltenVK
-# CAMetalLayer surface (comp_window_macos). Same "shared main/ sources not built
-# elsewhere in the lightweight fork" situation as Android, so compile them here.
+# CAMetalLayer surface (comp_window_macos). Those shared sources now live in the
+# comp_macos_window static lib (compositor/CMakeLists.txt) because comp_multi
+# needs them too in a --service build; link it here instead of compiling them
+# directly (the Cocoa/QuartzCore/Metal frameworks come transitively).
 if(APPLE)
-	target_sources(
-		comp_null
-		PRIVATE
-			${CMAKE_CURRENT_SOURCE_DIR}/../main/comp_target_swapchain.c
-			${CMAKE_CURRENT_SOURCE_DIR}/../main/comp_window_macos.m
-			${CMAKE_CURRENT_SOURCE_DIR}/../main/comp_window_macos.h
-		)
-	target_link_libraries(
-		comp_null
-		PRIVATE "-framework Cocoa" "-framework QuartzCore" "-framework Metal"
-		)
+	target_link_libraries(comp_null PRIVATE comp_macos_window)
 endif()
