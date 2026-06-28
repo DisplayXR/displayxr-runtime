@@ -457,3 +457,66 @@ interactive desktop launch** (user double-clicks `%TEMP%\run_b2c1.bat`, runs
 `%TEMP%\inject_b2c1.py`, clicks the window) so the window gets real foreground and
 the compositor ticks — that interactive path is what produced "continuous rAF" in
 the B2c.1 build session (§7 note 4).
+
+---
+
+## 11. content_shell "zero compositor frames" — ROOT-CAUSED + FIXED (2026-06-28)
+
+The §9/§10 "content_shell won't composite under automation" wall was **not** a
+foreground/automation limitation — it was a **launch-flag bug**, now fixed. The
+window composites fine when launched by the agent (no human foreground needed).
+
+**Diagnosis (decoupled, agent-driven via CDP on a synthetic rAF/timer counter):**
+- A `setInterval` timer counter vs a `requestAnimationFrame` counter, read over
+  CDP, cleanly separates "renderer wedged" from "begin-frames dead." With a
+  corrected launch the rAF counter climbs ~60/s and `Page.captureScreenshot`
+  returns real PNG bytes — all with `document.hasFocus()===false`. **Foreground
+  is not required.** (The earlier "needs a human at the desktop" belief was a red
+  herring; it was masked by a probe bug — the CDP reply nests `result.result.value`,
+  and an early probe read `result.value` → always `None` → false "zero frames".)
+
+**Two independent causes, both fixed:**
+1. **`--run-all-compositor-stages-before-draw` WEDGES the renderer.** This is the
+   web-test (RunWebTests) synchronous-compositor switch: it makes Blink's main
+   thread block in `BeginMainFrame` waiting for an **externally-issued** BeginFrame
+   that only the web-test harness sends. content_shell run normally never issues it
+   → the renderer goes unresponsive (even `Runtime.evaluate` never returns) → zero
+   frames. **Fix: remove the flag.** This was the dominant blocker — `run_b2c1.bat`
+   already disabled occlusion (cause #2) but still failed because of this flag.
+2. **`CalculateNativeWinOcclusion` (default-on) halts frames** for a window
+   launched non-foreground (agent launch): Windows marks it occluded → the
+   compositor stops after the first paint (the "body bg painted once then frozen"
+   symptom). **Fix: `--disable-features=CalculateNativeWinOcclusion`** (already in
+   `run_b2c1.bat`).
+
+`--disable-direct-composition` is **safe** for frame production (60 fps confirmed) —
+it is *not* a frame killer; the earlier suspicion was the same probe-parser bug.
+
+**Verified** (corrected `run_b2c1.bat`, `--enable-inline-3d`, agent launch, CDP
+canvas inject): the real injected SBS canvas's own rAF (`window.__t`) climbs ~60/s
+at **both High and Medium integrity**. The net-service crash-loop in the log is
+**unrelated** to compositing (it is why `file://` loads empty → we CDP-inject; it
+does not affect begin-frames).
+
+**Fix applied:** dropped `--run-all-compositor-stages-before-draw` from the launch
+(`%TEMP%\run_b2c1.bat`).
+
+### 11.1 NEW wall exposed downstream — the weave substitution crashes when it fires
+
+With frames now flowing, a **distinct** failure surfaced: when `--enable-inline-3d`
+is on **and `displayxr-service` is live** (so the B2c.2 substitution actually runs
+on the real canvas), a Chromium process dies — Windows "Application Error"
+(`0xC0000022`), the log ends abruptly right after `B2c GPU weave provider
+registered`, and `window.__t` stays 0 (begin-frames stop with the crash).
+Attribution is clean:
+- weave dormant (service down, or `--enable-inline-3d` removed) → `window.__t`
+  climbs to thousands, **no crash**, raw SBS visible (eyeballed: L=green/R=magenta);
+- weave engaged (service up + `--enable-inline-3d`) → crash.
+
+So the frame blocker (this section's subject) is fully resolved; the weave-fires
+crash is a **B2c.2 code bug**, the next thing to debug. Leading hypothesis: the
+real-canvas path (`ProduceOverlayForWeave` → `GetDCLayerOverlayImage()` →
+`d3d11_video_texture()`, §10) interacts badly with `--disable-direct-composition`
+(DComp overlay rep absent/null when DComp is off) — needs a procdump/cdb capture of
+the dying process (browser vs GPU) to confirm. WER recorded no `content_shell.exe`
+fault, consistent with a Crashpad-suppressed / fast-exit child.
