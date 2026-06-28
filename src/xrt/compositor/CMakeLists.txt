@@ -204,6 +204,37 @@ endif()
 # and null compositor use.
 
 ###
+# Shared macOS window utility (MoltenVK CAMetalLayer NSWindow + the per-session
+# comp_target_swapchain it drives).
+#
+# Parallels comp_win32_window below: both comp_null (per-session present path,
+# #48) and comp_multi (shared-surface visibility toggle via
+# comp_window_macos_set_visible, #61) depend on this helper. A --service
+# openxr_displayxr.dylib links comp_multi WITHOUT comp_null, so the helper can't
+# live only inside comp_null or that link fails with an undefined
+# comp_window_macos_set_visible. Build it once here so every consumer links it.
+# Defined before add_subdirectory(null) so comp_null can link it.
+if(APPLE)
+	add_library(
+		comp_macos_window STATIC
+		main/comp_window_macos.m
+		main/comp_window_macos.h
+		main/comp_target_swapchain.c
+		)
+	target_link_libraries(
+		comp_macos_window
+		PUBLIC xrt-interfaces
+		PRIVATE aux_util
+			aux_os
+			aux_vk
+			"-framework Cocoa"
+			"-framework QuartzCore"
+			"-framework Metal"
+		)
+	target_include_directories(comp_macos_window PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+endif()
+
+###
 # Null compositor
 #
 
@@ -261,6 +292,14 @@ endif()
 # Link comp_multi to shared Win32 window for self-owned window creation
 if(WIN32)
 	target_link_libraries(comp_multi PRIVATE comp_win32_window)
+endif()
+
+# Link comp_multi to the shared macOS window helper for shared-surface
+# visibility toggling (comp_window_macos_set_visible, #61). Without this a
+# --service openxr_displayxr.dylib (which links comp_multi but not comp_null)
+# fails to link with an undefined comp_window_macos_set_visible.
+if(APPLE)
+	target_link_libraries(comp_multi PRIVATE comp_macos_window)
 endif()
 
 ###
