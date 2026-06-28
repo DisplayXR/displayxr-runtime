@@ -1,0 +1,47 @@
+name: Build Linux
+
+# Linux bring-up dev loop (docs/roadmap/linux-support.md, issue #660).
+#
+# DELIBERATELY NOT a required check yet. It does NOT run on every PR or on
+# pushes to main — only on manual dispatch and on `linux*` branches — so it
+# can't gate unrelated work while the port is in progress. GitHub's
+# ubuntu-latest runner IS the Linux box we use to get Phase 0 green; promote
+# this to a PR-triggered required check (with the DetectChanges docs_only
+# short-circuit the macOS/Windows jobs use) only once it passes reliably.
+#
+# Phase 0 scope: configure + build the runtime + displayxr-cli + the
+# sim_display plug-in, then run `displayxr-cli selftest` — the hardware-free
+# gate that exercises plug-in discovery + the display-processor path with no
+# GPU, window, or OpenXR loader. There is no native presentation compositor on
+# Linux yet (Phase 1), so no test apps are built here.
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - 'linux'
+      - 'linux-**'
+      - 'feature/linux-**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  Selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libvulkan-dev vulkan-validationlayers \
+            libeigen3-dev libcjson-dev libudev-dev
+
+      - name: Build + headless selftest
+        run: ./scripts/build_linux.sh

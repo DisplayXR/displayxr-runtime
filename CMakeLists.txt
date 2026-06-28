@@ -190,7 +190,12 @@ endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	set(XRT_HAVE_LINUX YES)
-	find_package(udev REQUIRED)
+	# udev drives ONLY the legacy VR device prober (gated by XRT_HAVE_LIBUDEV,
+	# DEPENDS UDEV_FOUND below). A 3D-display runtime discovers its display
+	# processor through the plug-in loader, not udev, so a missing libudev must
+	# NOT fail configure — degrade to the no-udev prober path instead. Was
+	# `REQUIRED`; relaxed for the Linux bring-up. See docs/roadmap/linux-support.md.
+	find_package(udev)
 	if(PKGCONFIG_FOUND)
 		pkg_check_modules(XCB xcb xcb-randr x11-xcb)
 	endif()

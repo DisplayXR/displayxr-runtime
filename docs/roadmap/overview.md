@@ -13,6 +13,7 @@ Stripped Monado from 500+ files to ~150. Removed 34 VR drivers and the Vulkan se
 - Drivers: vendor display-processor plug-ins (e.g. a lenticular hardware DP), plus in-tree sim_display (simulation) and qwerty (keyboard/mouse)
 - Four app classes: handle, texture, hosted, IPC
 - Custom OpenXR extensions: `XR_EXT_display_info`, `XR_EXT_win32_window_binding`, `XR_EXT_cocoa_window_binding`
+- Platforms: Windows, macOS, and Android ship for most features; **Linux is in progress** (headless substrate first, then an in-process Vulkan/XCB compositor — see [Linux Support](linux-support.md))
 
 ### Stabilization (M3 + M4) — In Progress (~60%)
 
@@ -62,6 +63,7 @@ All documents in `docs/roadmap/` describe planned features that are not yet impl
 - [Display Spatial Model](display-spatial-model.md) — displays in the spatial graph
 - [Multi-Display Single Machine](multi-display-single-machine.md) — multiple displays, one machine
 - [Multi-Display Networked](multi-display-networked.md) — displays across the network
+- [Linux Support](linux-support.md) — the fourth platform: headless substrate bring-up (Phase 0), then in-process Vulkan/XCB compositor, service/IPC path, and a window-binding extension
 - [WebXR Support — Status & Roadmap](webxr-support.md) — shipped Bridge v2 metadata sideband + the inline-3D (`session.displayXR.weave()`) roadmap, prototyping via Chromium patches, and the fork-vs-standards adoption path
 - [XR_VIEW_CONFIGURATION_PRIMARY_MULTIVIEW](XR_VIEW_CONFIGURATION_PRIMARY_MULTIVIEW.md) — Khronos multiview proposal
 - [MCP Spec](https://github.com/DisplayXR/displayxr-mcp/blob/main/docs/mcp-spec.md) — AI-native runtime: expose live spatial state and control to agents over Model Context Protocol (extracted to [`DisplayXR/displayxr-mcp`](https://github.com/DisplayXR/displayxr-mcp))
