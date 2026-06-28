@@ -105,17 +105,35 @@ absolute screen position, which the display processor needs every frame for
 interlacing-phase tracking; Wayland has no clean answer, so it's the harder
 second target.
 
-- Add `LINUX`/`UNIX` to the `vk_native` CMake gate
-  (`compositor/CMakeLists.txt:339`, `vk_native/CMakeLists.txt:8`).
-- Add a `VK_KHR_xcb_surface` branch to the `#else` in
-  `comp_vk_native_target.cpp:887` (PFN already loaded); wire matching
-  resize/swapchain-recreate (`comp_vk_native_compositor.c`).
-- Write `comp_vk_native_window_xcb` for the `_hosted` class (runtime
-  self-creates the window — no new extension needed yet).
-- First runnable target: `cube_hosted_vk_linux`, sim_display DP.
+**Phase 1a — compile-green on Linux CI ✅ (done).** All of `comp_vk_native`
+(including the new XCB window helper + the XCB surface arm) compiles and links
+into `openxr_displayxr.so` on `ubuntu-latest`, headless selftest still green:
+- Both `vk_native` CMake gates enabled on `(XRT_HAVE_LINUX AND XRT_HAVE_XCB)`
+  (the inner `vk_native/CMakeLists.txt` **and** the outer
+  `add_subdirectory(vk_native)` in `compositor/CMakeLists.txt` — both needed).
+- `comp_vk_native_target.cpp` — `VK_KHR_xcb_surface` arm replacing the
+  unconditional-fail `#else` (uses the already-loaded `vk->vkCreateXcbSurfaceKHR`).
+- `comp_vk_native_window_xcb.{c,h}` — new self-created XCB window helper for the
+  hosted class (connect/create/map, `WM_DELETE_WINDOW` close, `ConfigureNotify`
+  resize, `translate_coordinates` screen position). Exposes connection + window
+  via `comp_vk_native_xcb_handle` since `vkCreateXcbSurfaceKHR` needs both.
+- `comp_vk_native_compositor.c` — Linux arms for struct fields, hosted
+  self-create, seed/resize dims, validity, destroy, target-create gate,
+  `get_window_metrics`, HUD, handle-app view scaling.
+- `oxr_vulkan.c` — advertises `VK_KHR_surface` + `VK_KHR_xcb_surface` so the
+  app's instance can build an XCB surface.
+- `build-linux.yml` / `build_linux.sh` — `libxcb*-dev` enables `XRT_HAVE_XCB`.
+
+**Phase 1b — on-screen present (pending Linux hardware).** CI has no display, so
+the XCB path compiles but isn't exercised at runtime. Validate on a real Linux +
+GPU box: a Vulkan app on the VK-native path renders into the runtime-created XCB
+window with sim_display weaving (anaglyph/SBS). Likely follow-ups surfaced only
+at runtime: confirm the VK-native compositor path is selected
+(`OXR_ENABLE_VK_NATIVE_COMPOSITOR`), swapchain format/extent on real drivers, and
+resize. First runnable target: a `cube_hosted_vk_linux` test app (not yet built).
 
 **Done when:** a hosted cube renders into a runtime-created XCB window with
-sim_display weaving (e.g. anaglyph/SBS output).
+sim_display weaving.
 
 ### Phase 2 — Service / IPC path
 

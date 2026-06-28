@@ -64,7 +64,14 @@
 #include <IOSurface/IOSurface.h>
 #endif
 
-#ifdef XRT_OS_LINUX
+// Desktop Linux (X11/XCB present path). Android also defines XRT_OS_LINUX, so the
+// XCB code must be gated on "Linux AND NOT Android" — Android uses the
+// VK_KHR_android_surface path, not XCB. See docs/roadmap/linux-support.md.
+#if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+#define XRT_OS_LINUX_DESKTOP
+#endif
+
+#ifdef XRT_OS_LINUX_DESKTOP
 #include "vk_native/comp_vk_native_window_xcb.h"
 #endif
 
@@ -140,7 +147,7 @@ struct comp_vk_native_compositor
 	bool owns_window;
 #endif
 
-#ifdef XRT_OS_LINUX
+#ifdef XRT_OS_LINUX_DESKTOP
 	//! XCB window helper (self-owned; hosted class only in Phase 1).
 	struct comp_vk_native_window_xcb *xcb_window;
 
@@ -894,7 +901,7 @@ vk_compositor_wait_frame(struct xrt_compositor *xc,
 	}
 #endif
 
-#ifdef XRT_OS_LINUX
+#ifdef XRT_OS_LINUX_DESKTOP
 	if (c->owns_window && c->xcb_window != NULL &&
 	    !comp_vk_native_window_xcb_is_valid(c->xcb_window)) {
 		U_LOG_I("Window closed - signaling session exit");
@@ -1035,7 +1042,7 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 	}
 #endif
 
-#ifdef XRT_OS_LINUX
+#ifdef XRT_OS_LINUX_DESKTOP
 	if (c->xcb_window != NULL) {
 		uint32_t new_width = 0, new_height = 0;
 		comp_vk_native_window_xcb_get_dimensions(c->xcb_window, &new_width, &new_height);
@@ -2384,7 +2391,7 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 					uint32_t new_vh = mode->view_height_pixels;
 					uint32_t new_aw = mode->atlas_width_pixels;
 					uint32_t new_ah = mode->atlas_height_pixels;
-#if defined(XRT_OS_WINDOWS) || defined(__APPLE__) || defined(XRT_OS_LINUX)
+#if defined(XRT_OS_WINDOWS) || defined(__APPLE__) || defined(XRT_OS_LINUX_DESKTOP)
 					if (!c->owns_window && c->settings.preferred.width > 0 &&
 					    c->settings.preferred.height > 0) {
 						// Handle app: window may be smaller than the display,
@@ -3180,7 +3187,7 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	}
 #endif
 
-#ifdef XRT_OS_LINUX
+#ifdef XRT_OS_LINUX_DESKTOP
 	if (c->xcb_window != NULL) {
 		comp_vk_native_window_xcb_destroy(&c->xcb_window);
 	}
@@ -3391,7 +3398,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	}
 #endif
 
-#ifdef XRT_OS_LINUX
+#ifdef XRT_OS_LINUX_DESKTOP
 	// Phase 1: hosted class only — the runtime self-creates an XCB window.
 	// App-provided X11 windows (handle/texture) need XR_EXT_xlib_window_binding
 	// (Phase 3); until then hwnd is expected to be NULL here.
@@ -3468,7 +3475,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	}
 #endif
 
-#ifdef XRT_OS_LINUX
+#ifdef XRT_OS_LINUX_DESKTOP
 	if (c->xcb_window != NULL) {
 		uint32_t xw = 0, xh = 0;
 		comp_vk_native_window_xcb_get_dimensions(c->xcb_window, &xw, &xh);
@@ -3550,7 +3557,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 #ifdef XRT_OS_MACOS
 	    || c->owns_window
 #endif
-#ifdef XRT_OS_LINUX
+#ifdef XRT_OS_LINUX_DESKTOP
 	    || c->owns_window
 #endif
 	) {
@@ -3558,7 +3565,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 #ifdef XRT_OS_WINDOWS
 		if (target_hwnd == NULL) target_hwnd = c->hwnd;
 #endif
-#ifdef XRT_OS_LINUX
+#ifdef XRT_OS_LINUX_DESKTOP
 		if (target_hwnd == NULL && c->xcb_window != NULL) target_hwnd = &c->xcb_handle;
 #endif
 		xrt_result_t xret = comp_vk_native_target_create(c, target_hwnd,
@@ -3658,7 +3665,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	}
 
 	// Create HUD overlay for runtime-owned windows
-#if defined(XRT_OS_WINDOWS) || defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX)
+#if defined(XRT_OS_WINDOWS) || defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
 	if (c->owns_window) {
 		u_hud_create(&c->hud, c->settings.preferred.width);
 	}
@@ -3940,7 +3947,7 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 
 	out_metrics->valid = true;
 	return true;
-#elif defined(XRT_OS_LINUX)
+#elif defined(XRT_OS_LINUX_DESKTOP)
 	// Mirror the macOS path: window metrics from the live XCB window. Display
 	// info from the DP (pixel info + dims) when available, else from sys_info;
 	// window size + screen position from XCB (X11 exposes absolute window pos,

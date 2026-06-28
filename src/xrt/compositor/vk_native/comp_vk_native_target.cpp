@@ -38,7 +38,13 @@
 #include "android/android_globals.h"
 #endif
 
-#ifdef XRT_OS_LINUX
+// Desktop Linux (X11/XCB). Android also defines XRT_OS_LINUX but uses
+// VK_KHR_android_surface, so the XCB path is gated on "Linux AND NOT Android".
+#if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+#define XRT_OS_LINUX_DESKTOP
+#endif
+
+#ifdef XRT_OS_LINUX_DESKTOP
 // X11/XCB present path: vkCreateXcbSurfaceKHR from a connection + window id
 // carried in struct comp_vk_native_xcb_handle. (VK_USE_PLATFORM_XCB_KHR is
 // defined by CMake via xrt_config_vulkan.h when XRT_HAVE_XCB.)
@@ -893,7 +899,7 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 		free(target);
 		return XRT_ERROR_VULKAN;
 	}
-#elif defined(XRT_OS_LINUX)
+#elif defined(XRT_OS_LINUX_DESKTOP)
 	// hwnd is a struct comp_vk_native_xcb_handle* carrying both the
 	// xcb_connection_t* and the xcb_window_t (a single void* can't hold both).
 	if (hwnd == NULL) {
