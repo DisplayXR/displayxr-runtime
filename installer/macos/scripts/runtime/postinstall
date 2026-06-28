@@ -27,4 +27,23 @@ register_active_runtime() {
 register_active_runtime /etc/xdg/openxr/1
 register_active_runtime /usr/local/share/openxr/1
 
+# Auto-start the DisplayXR service (macOS spatial shell, #61). The LaunchAgent
+# has RunAtLoad so it starts at the next login regardless; bootstrapping it into
+# the console user's GUI domain here also brings it up immediately after install
+# (no logout needed). postinstall runs as root, so we target gui/<console-uid>.
+# Skipped cleanly on a runtime-only (non-service) .pkg where the agent is absent.
+AGENT="/Library/LaunchAgents/com.displayxr.service.plist"
+if [ -f "$AGENT" ]; then
+    CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
+    if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ]; then
+        CONSOLE_UID="$(id -u "$CONSOLE_USER" 2>/dev/null || true)"
+        if [ -n "$CONSOLE_UID" ]; then
+            # bootout first so a re-install reloads the new plist (idempotent).
+            launchctl bootout "gui/$CONSOLE_UID" "$AGENT" 2>/dev/null || true
+            launchctl bootstrap "gui/$CONSOLE_UID" "$AGENT" 2>/dev/null || true
+            launchctl enable "gui/$CONSOLE_UID/com.displayxr.service" 2>/dev/null || true
+        fi
+    fi
+fi
+
 exit 0

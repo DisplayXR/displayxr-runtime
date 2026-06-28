@@ -34,6 +34,16 @@ for arg in "$@"; do
   esac
 done
 
+# The macOS .pkg must ship a service-capable runtime so the installed spatial
+# shell can attach as an IPC client (it sets DISPLAYXR_WORKSPACE_SESSION=1).
+# Build HYBRID — in-process by default (standalone apps keep their own window),
+# IPC only for workspace sessions — and stage displayxr-service into the .pkg
+# (a LaunchAgent added by build_installer.sh auto-starts it at login).
+if [ "$BUILD_INSTALLER" = "ON" ]; then
+  SERVICE_MODE=ON
+  HYBRID_MODE=ON
+fi
+
 # Detect macOS SDK (CMake may pick a stale sysroot otherwise)
 MACOS_SDK="$(xcrun --show-sdk-path 2>/dev/null)"
 
@@ -358,6 +368,35 @@ for app in cube_handle_vk_macos cube_handle_metal_macos cube_handle_gl_macos \
            cube_hosted_legacy_vk_macos; do
   [ -f "$PKG_DIR/bin/$app" ] && codesign --force --sign - "$PKG_DIR/bin/$app" 2>/dev/null || true
 done
+
+# Stage the service binary (the always-on server/orchestrator) when this is a
+# SERVICE build. The installed spatial shell attaches to it as an IPC client,
+# and a LaunchAgent (added by installer/macos/build_installer.sh) auto-starts it
+# at login. It links the bundled Vulkan loader + cJSON, so retarget those from
+# Homebrew absolute paths to @rpath, resolved from @executable_path/../lib (next
+# to the runtime dylib). MoltenVK is loaded via the ICD, not linked directly.
+SERVICE_BIN="$BUILD_DIR/src/xrt/targets/service/displayxr-service"
+if [ "$SERVICE_MODE" = "ON" ] && [ -f "$SERVICE_BIN" ]; then
+  cp "$SERVICE_BIN" "$PKG_DIR/bin/displayxr-service"
+  chmod u+w "$PKG_DIR/bin/displayxr-service"
+  install_name_tool -change "$BREW_PREFIX/opt/vulkan-loader/lib/libvulkan.1.dylib" \
+                            @rpath/libvulkan.1.dylib \
+                            "$PKG_DIR/bin/displayxr-service" 2>/dev/null || true
+  install_name_tool -change "$BREW_PREFIX/opt/cjson/lib/libcjson.1.dylib" \
+                            @rpath/libcjson.1.dylib \
+                            "$PKG_DIR/bin/displayxr-service" 2>/dev/null || true
+  # Drop dev-tree rpaths (Homebrew Cellar, /tmp) and add the install-tree one.
+  for r in $(otool -l "$PKG_DIR/bin/displayxr-service" \
+             | awk '/LC_RPATH/{f=1} f && /path /{print $2; f=0}'); do
+    case "$r" in
+      /opt/homebrew/*|/usr/local/*|/tmp/*)
+        install_name_tool -delete_rpath "$r" "$PKG_DIR/bin/displayxr-service" 2>/dev/null || true ;;
+    esac
+  done
+  install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/displayxr-service" 2>/dev/null || true
+  codesign --force --sign - "$PKG_DIR/bin/displayxr-service" 2>/dev/null || true
+  echo "Staged displayxr-service (SERVICE build) into _package bin/"
+fi
 
 # Create MoltenVK ICD manifest
 cat > "$PKG_DIR/share/vulkan/icd.d/MoltenVK_icd.json" <<EOF
