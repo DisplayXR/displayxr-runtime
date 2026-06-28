@@ -214,9 +214,14 @@ if [ -f "$SERVICE_SRC" ]; then
     mkdir -p "$LAUNCHAGENT_DIR"
     # The service's bundled Vulkan loader needs the runtime's MoltenVK ICD (in a
     # private path the loader doesn't search), so the agent sets VK_ICD_FILENAMES.
-    # KeepAlive keeps the always-on orchestrator up; ProcessType Interactive +
-    # the gui/<uid> bootstrap (postinstall) put it in the Aqua session so its
-    # menu-bar status item shows.
+    # ProcessType Interactive + the gui/<uid> bootstrap (postinstall) put it in
+    # the Aqua session so its menu-bar status item shows.
+    #
+    # KeepAlive = {SuccessfulExit = false}: relaunch only on a crash (non-zero
+    # exit / signal death), NOT on a clean quit. Both user-quit paths exit 0 —
+    # Cmd+Q calls exit(0), and the menu-bar "Quit" raises SIGTERM which the
+    # service catches and shuts down gracefully (main_loop returns 0). Plain
+    # KeepAlive=true would respawn the service the instant the user quit it.
     cat > "$LAUNCHAGENT_DIR/com.displayxr.service.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -238,7 +243,10 @@ if [ -f "$SERVICE_SRC" ]; then
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>StandardOutPath</key>
