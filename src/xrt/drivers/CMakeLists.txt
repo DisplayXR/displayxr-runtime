@@ -190,19 +190,28 @@ list(APPEND ENABLED_DRIVERS drv_sim_display)
 # resolves because it's evaluated at generate time, when the target exists).
 if(XRT_FEATURE_OPENXR)
 add_library(drv_sim_display_plugin SHARED ${SIM_DISPLAY_SOURCES} sim_display/sim_display_plugin.c)
-if(ANDROID)
-	# Android plug-in model: a self-contained .so that STATIC-links aux.
-	# The ADR-019 Option-C aux-export boundary (below) exists to keep a
-	# single file log sink / u_var registry per process on Windows — but
-	# Android logging is logcat (process-global via the kernel), so
-	# per-plug-in aux state is harmless. Hence NO XRT_USING_RUNTIME_DLL
-	# (xrt_api.h §: static-linkers MUST NOT define it — it would turn
-	# XRT_API_FUNC into dllimport and is a no-op on ELF anyway) and NO link
-	# against the runtime .so. aux_ogl is omitted — the GL DP is excluded on
-	# Android (VK-only). The runtime + plug-in .so's co-locate in the APK's
-	# lib dir and the loader preloads siblings by absolute path (#333).
+if(ANDROID OR XRT_HAVE_LINUX)
+	# Self-contained plug-in model: a .so that STATIC-links aux and does NOT
+	# link the runtime .so. The ADR-019 Option-C aux-export boundary (the else
+	# branch) exists to keep a single file log sink / u_var registry per process
+	# on Windows via a runtime-DLL import lib — but on ELF the plugin_exports
+	# version script below hides every symbol except xrtPluginNegotiate, so the
+	# statically-linked aux copies can't interpose the runtime's: same net
+	# effect, no import lib needed. (Android: logcat is process-global anyway.)
+	# Hence NO XRT_USING_RUNTIME_DLL (xrt_api.h §: static-linkers MUST NOT define
+	# it — it would turn XRT_API_FUNC into dllimport and is a no-op on ELF) and
+	# NO link against the runtime .so. aux_ogl is omitted (Android is VK-only;
+	# headless Linux has no GL DP — gated on XRT_HAVE_OPENGL above). aux_vk is
+	# added below under XRT_HAVE_VULKAN. The runtime + plug-in .so's co-locate
+	# (APK lib dir on Android; the plug-in search dir on Linux) and the loader
+	# preloads siblings by path (#333). See docs/roadmap/linux-support.md.
 	target_link_libraries(drv_sim_display_plugin PRIVATE
 		xrt-interfaces aux_util aux_os drv_includes)
+	if(NOT ANDROID AND XRT_HAVE_OPENGL)
+		# Non-Android desktop GL build: the GL DP is compiled in, so it needs
+		# aux_ogl. (Headless Linux without GL skips this, matching the static lib.)
+		target_link_libraries(drv_sim_display_plugin PRIVATE aux_ogl)
+	endif()
 else()
 	target_compile_definitions(drv_sim_display_plugin PRIVATE XRT_USING_RUNTIME_DLL)
 	target_link_libraries(
