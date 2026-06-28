@@ -151,6 +151,15 @@ else()
 	target_compile_definitions(xrt-pthreads INTERFACE _GNU_SOURCE)
 endif()
 
+# Linux links every static lib — including the FetchContent'd displayxr_mcp —
+# into the runtime shared object (openxr_displayxr.so), which requires -fPIC
+# across all of them. macOS is PIC by default and Windows DLLs don't need it, so
+# scope this to Linux. Must be set BEFORE the FetchContent target is created so
+# it inherits the property. See docs/roadmap/linux-support.md.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+	set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
 FetchContent_MakeAvailable(displayxr_mcp)
 
 if(NOT WIN32)
