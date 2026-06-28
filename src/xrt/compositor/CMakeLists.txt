@@ -336,7 +336,7 @@ endif()
 ###
 # Native Vulkan compositor (direct submit, no multi-compositor)
 #
-if((WIN32 OR APPLE OR ANDROID) AND XRT_HAVE_VULKAN)
+if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE_VULKAN)
 	add_subdirectory(vk_native)
 endif()
 
