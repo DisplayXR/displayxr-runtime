@@ -106,7 +106,11 @@ endif()
 # Android has no desktop GL native compositor (it uses the VK DP), and the
 # processor's GLAD/ogl_api.h calls don't exist under GLES. Excluding it keeps
 # the Android sim_display plug-in (libdxrp200_sim_display.so) VK-only.
-if(NOT ANDROID)
+# Also gated on XRT_HAVE_OPENGL: on Windows/macOS desktop GL is always found, so
+# this is unchanged there; on a headless Linux box without GL dev libs (and with
+# no GL native compositor — Phase 1 is Vulkan) it drops the unbuildable GL DP
+# rather than failing on the missing glad/gl.h. See docs/roadmap/linux-support.md.
+if(NOT ANDROID AND XRT_HAVE_OPENGL)
 	list(APPEND SIM_DISPLAY_SOURCES
 		sim_display/sim_display_processor_gl.c)
 endif()
@@ -119,10 +123,11 @@ if(APPLE)
 endif()
 
 add_library(drv_sim_display STATIC ${SIM_DISPLAY_SOURCES})
-# aux_ogl is only needed by the desktop-GL display processor, which is excluded
-# on Android above — so don't drag GLES into the Android (VK-only) build.
+# aux_ogl is only needed by the desktop-GL display processor (gated on
+# NOT ANDROID AND XRT_HAVE_OPENGL above) — keep this link in lockstep so a
+# headless Linux build without GL doesn't drag in GL/GLES aux.
 target_link_libraries(drv_sim_display PRIVATE xrt-interfaces aux_util aux_os PUBLIC drv_includes)
-if(NOT ANDROID)
+if(NOT ANDROID AND XRT_HAVE_OPENGL)
 	target_link_libraries(drv_sim_display PRIVATE aux_ogl)
 endif()
 
