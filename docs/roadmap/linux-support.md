@@ -125,12 +125,21 @@ into `openxr_displayxr.so` on `ubuntu-latest`, headless selftest still green:
 - `build-linux.yml` / `build_linux.sh` — `libxcb*-dev` enables `XRT_HAVE_XCB`.
 
 **Phase 1b — on-screen present (pending Linux hardware).** CI has no display, so
-the XCB path compiles but isn't exercised at runtime. Validate on a real Linux +
-GPU box: a Vulkan app on the VK-native path renders into the runtime-created XCB
-window with sim_display weaving (anaglyph/SBS). Likely follow-ups surfaced only
-at runtime: confirm the VK-native compositor path is selected
-(`OXR_ENABLE_VK_NATIVE_COMPOSITOR`), swapchain format/extent on real drivers, and
-resize. First runnable target: a `cube_hosted_vk_linux` test app (not yet built).
+the XCB path compiles but isn't exercised at runtime. The bring-up vehicle —
+`test_apps/cube_hosted_legacy_vk_linux` (hosted legacy Vulkan cube; `main.cpp`
+shared verbatim with the macOS peer) — is scaffolded and **compile-validated on
+CI** (`build_linux.sh --apps` builds the OpenXR loader + the app). It's hosted, so
+the runtime self-creates the XCB window — no window-binding extension needed.
+Validate on a real Linux + GPU box:
+```
+./scripts/build_linux.sh --apps      # build runtime + loader + app
+./build/run_cube_hosted_legacy_vk_linux.sh   # needs DISPLAY + a Vulkan GPU
+```
+Likely follow-ups surfaced only at runtime: confirm the VK-native compositor path
+is selected (`OXR_ENABLE_VK_NATIVE_COMPOSITOR`), swapchain format/extent on real
+drivers, and resize. A non-legacy (extension) `cube_hosted_vk_linux` and a
+handle-class app (`XR_EXT_xlib_window_binding`, Phase 3) follow once first-light
+is confirmed.
 
 **Done when:** a hosted cube renders into a runtime-created XCB window with
 sim_display weaving.
