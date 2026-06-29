@@ -195,6 +195,8 @@ Full spec: `docs/specs/runtime/versions-json-autobump.md`.
 
 **Issue rules:** runtime dev issues → this repo; shell dev issues → `displayxr-shell-pvt`; user-facing shell bugs → `displayxr-shell-releases` (triage → file dev issue on shell-pvt if actionable). Never dual-create across repos. External contributors PR directly against this repo.
 
+**Demo-repo dev-build rule (when working in `displayxr-demo-*` from this hub).** Each demo's Windows/macOS dev-build scripts must **auto-provision the OpenXR loader**, pinned to the same spec rev as that repo's vendored `openxr_includes/` headers (`XR_CURRENT_API_VERSION`) — never hardcode an SDK path (`C:/dev/openxr_sdk`, `C:/VulkanSDK/<ver>`); Vulkan comes from the `VULKAN_SDK` env. Keep three pins equal per repo: CI (`build-windows.yml`) == dev script == header rev. This is a **dev clone-and-build** concern only — released installers always provisioned the loader via CI, so they were never affected. `displayxr-demo-mediaplayer` is the reference (CMake `FetchContent`); avatar/gaussiansplat/modelviewer/earthview were retrofitted (mid-2026) after shipping with hardcoded paths. Each demo's own `CLAUDE.md` carries this rule.
+
 ## Running & testing locally
 
 ### Running without installing
