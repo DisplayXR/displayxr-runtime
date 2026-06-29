@@ -100,15 +100,22 @@ is easy to get wrong).
 - **View config is `PRIMARY_STEREO` for *everyone* — that is not the difference.**
   The runtime only ever advertises `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO`
   (`oxr_system.c`), and `xrLocateViews` always returns `view_count` = the **MAX
-  across all modes** (e.g. 8), not 2 (`oxr_session.c`; `xrEndFrame` then accepts a
-  projection `viewCount` matching *any* mode's `view_count` — `oxr_session_frame_end.c`).
+  across all modes** (e.g. 4 — `sim_display`'s Quad mode), not 2 (`oxr_session.c`;
+  `xrEndFrame` then accepts a projection `viewCount` matching *any* mode's
+  `view_count` — `oxr_session_frame_end.c`).
   - A **native handle app (cube)** renders the active mode's **N views as tiles
     into one worst-case-sized swapchain** (multiview tiling, ADR-010) and submits an
     N-view projection layer with per-tile `imageRect`.
   - A **built Unity app** renders **only 2 eyes** (per-eye swapchains, or SPI
-    `arraySize=2`) and submits a **2-view** layer; the Display Processor synthesises
-    the extra 4/8 views downstream. (N-view rendering exists only in the plugin's
-    editor standalone preview, which runs its own hookless OpenXR session.)
+    `arraySize=2`) and submits a **2-view** layer. **There is no view synthesis
+    downstream** — nothing reconstructs additional views from those 2 eyes, so a
+    built Unity app can only drive modes whose `view_count ≤ 2`; a mode with more
+    views (e.g. `sim_display`'s 2×2 Quad, `view_count = 4`) requires the app to
+    render all N tiles itself, which Unity cannot. (The runtime *does* synthesise
+    per-tile **viewer poses** — not pixels — so a native/extension app can render
+    the N views; see `sim_display_device.c`. True N-view *rendering* in the Unity
+    stack exists only in the plugin's editor standalone preview, which runs its own
+    hookless OpenXR session.)
   So a 2D↔3D mode switch does **not** change Unity's render resolution — only the
   atlas tiling / `imageRect` it's composited into.
 - **SPI:** when Unity uses `arraySize=2`, the eyes are array **layers** 0/1
@@ -126,7 +133,7 @@ is easy to get wrong).
 | Window ownership | app owns one window; nothing else presents to it | Unity owns + presents to its **main** window; overlay is a *second* window |
 | Readback | none | `readbackCallback` returns composited pixels |
 | View configuration type | `PRIMARY_STEREO` | `PRIMARY_STEREO` (same — *not* the difference) |
-| Views the app renders | the active mode's **N** (2/4/8) as **tiles in one** worst-case swapchain | **always 2** eyes; DP synthesises 4/8 downstream |
+| Views the app renders | the active mode's **N** (e.g. 2, or 4 in Quad) as **tiles in one** worst-case swapchain | **always 2** eyes; **no view synthesis** → limited to `view_count ≤ 2` modes |
 | Per-view render resolution | **adaptive** — each view at `window × scaleXY` of the active mode | **fixed** — per-eye swapchains sized once at session start; `scaleXY` not applied per frame (ADR-006 "legacy compromise") |
 | Compositor code (atlas blit / crop / DP weave) | shared | shared (fed differently) |
 
