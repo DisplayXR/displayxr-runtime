@@ -501,22 +501,39 @@ does not affect begin-frames).
 **Fix applied:** dropped `--run-all-compositor-stages-before-draw` from the launch
 (`%TEMP%\run_b2c1.bat`).
 
-### 11.1 NEW wall exposed downstream — the weave substitution crashes when it fires
+### 11.1 NEW wall exposed downstream — the weave path STALLS when it fires (not a crash)
 
-With frames now flowing, a **distinct** failure surfaced: when `--enable-inline-3d`
-is on **and `displayxr-service` is live** (so the B2c.2 substitution actually runs
-on the real canvas), a Chromium process dies — Windows "Application Error"
-(`0xC0000022`), the log ends abruptly right after `B2c GPU weave provider
-registered`, and `window.__t` stays 0 (begin-frames stop with the crash).
-Attribution is clean:
+With frames now flowing, a **distinct** failure surfaced. Attribution is clean:
 - weave dormant (service down, or `--enable-inline-3d` removed) → `window.__t`
-  climbs to thousands, **no crash**, raw SBS visible (eyeballed: L=green/R=magenta);
-- weave engaged (service up + `--enable-inline-3d`) → crash.
+  climbs to thousands, raw SBS visible (eyeballed: L=green/R=magenta), stable;
+- weave engaged (service **up** + `--enable-inline-3d`) → `window.__t` frozen at 0,
+  the log ends right after `B2c GPU weave provider registered`, frame production
+  stops permanently.
 
-So the frame blocker (this section's subject) is fully resolved; the weave-fires
-crash is a **B2c.2 code bug**, the next thing to debug. Leading hypothesis: the
-real-canvas path (`ProduceOverlayForWeave` → `GetDCLayerOverlayImage()` →
-`d3d11_video_texture()`, §10) interacts badly with `--disable-direct-composition`
-(DComp overlay rep absent/null when DComp is off) — needs a procdump/cdb capture of
-the dying process (browser vs GPU) to confirm. WER recorded no `content_shell.exe`
-fault, consistent with a Crashpad-suppressed / fast-exit child.
+**It is a hang/stall, NOT a crash** (the "Application Error" dialog was a red
+herring — a stray orphan-crash dialog from a prior teardown). Proven by procdump
+(`%TEMP%\gpu_hang.dmp`, `browser_hang.dmp`) + cdb (`gpu_stacks.txt`,
+`browser_stacks.txt`) while hung:
+- **All processes alive** (browser, GPU, renderers, service). WER recorded no fault.
+- **GPU process entirely idle** — `VizCompositorThread` parked on
+  `NtRemoveIoCompletion` (waiting for work), GPU main in its normal `GpuMain` wait.
+  No weave/Mojo-Sync/fence frames anywhere. So the GPU is **not** deadlocked in the
+  B2c substitution; it is idle because **no begin-frames are arriving**.
+- **Browser `CrBrowserMain` (UI thread) idle** in `MessagePumpForUI::DoRunLoop`
+  (normal message loop) — also **not** blocked in the weave.
+- The one weave-related block: a **DisplayXRClient.dll background thread stuck in
+  `ConnectNamedPipe`** (`KERNELBASE!ConnectNamedPipe` ← `DisplayXRClient!…`),
+  i.e. the **runtime's IPC client is waiting for the service to connect a named
+  pipe that never connects** — the present-owner / weave handback channel setup
+  stalls when the weave session goes live.
+
+So the frame-production blocker (this section's subject) is fully resolved. The
+weave-fires stall lives in the **runtime/service IPC layer** (DisplayXRClient ↔
+displayxr-service present-owner/weave channel), *not* in the Chromium B2c.2 code and
+*not* in the compositor. Next step (a runtime-side session — out of scope for the
+"don't touch the runtime" frame-blocker task): dump `displayxr-service` while hung
+and find why it never connects back the present-owner/weave pipe for a
+browser-hosted present-owner that connects while idle (candidate factors: present-
+owner acceptance gating, the per-client-DP / `init_client_render_resources` path,
+or an integrity/`ConnectNamedPipe` handshake mismatch). The net-service crash-loop
+is unrelated (present in the working runs too).
