@@ -253,6 +253,30 @@ struct comp_d3d11_window
 	//! built-in default. >= 0 is the controller's table size.
 	struct { uint32_t vk; uint32_t mods; } reserved_keys[WORKSPACE_RESERVED_KEYS_MAX];
 	volatile LONG reserved_key_count;
+
+	//! #667: Ctrl-chord arbitration state. All fields are touched ONLY on the
+	//! window thread (WndProc + its WM_TIMER), so no atomics are needed.
+	//!
+	//! Keyboard forwarding is eager — each key is PostMessage'd to the focused app
+	//! the instant it arrives. The bare Ctrl-down of a shell chord (Ctrl+L, etc.)
+	//! is never in reserved_keys[] (that table matches the *terminating* key), so
+	//! it would reach the app before the chord completes. When the controller
+	//! reserves any Ctrl chord, we instead buffer the Ctrl(+modifier) prefix and
+	//! only forward it once the next key proves it is NOT a shell chord (or on
+	//! Ctrl-up / a DXR_KB_FLUSH_TIMEOUT_MS timeout, so a lone Ctrl still reaches
+	//! apps that want it). Set by comp_d3d11_window_set_reserved_keys.
+	//!
+	//! kb_has_ctrl_reserved crosses threads (written by the service/IPC thread in
+	//! set_reserved_keys, read by the window thread) so it's a volatile LONG
+	//! accessed via Interlocked, like reserved_key_count. The rest are touched only
+	//! on the window thread.
+	volatile LONG kb_has_ctrl_reserved; //!< Any reserved chord uses the CTRL mod bit.
+	bool kb_buf_active;               //!< A Ctrl-prefix is buffered, awaiting the next key.
+	bool kb_ctrl_held_forwarded;      //!< Ctrl was flushed and is now a held, forwarded key.
+	int kb_buf_count;                 //!< Number of buffered modifier-down events.
+	struct { UINT msg; WPARAM vk; LPARAM lp; } kb_buf[4]; //!< Buffered down events (Ctrl[, Shift, Alt]).
+	int kb_suppress_up_count;         //!< Number of pending KEYUPs to swallow.
+	uint8_t kb_suppress_up[4];        //!< vks whose UP is swallowed (their DOWN was discarded as a chord prefix).
 };
 
 // Forward declarations
@@ -287,6 +311,15 @@ static void set_fullscreen(HWND hWnd, bool fullscreen);
 // KEEP IN SYNC with the decoder in oxr_workspace_modal_win32.c.
 #define DXR_FWD_KEY_MARKER_BIT  (1u << 28)
 #define DXR_FWD_KEY_MODS_SHIFT  25
+
+// #667: timer id for the lone-Ctrl flush. While a controller reserves Ctrl
+// chords, the WndProc buffers the bare Ctrl-down instead of forwarding it eagerly
+// (so a Ctrl+L chord's Ctrl prefix never reaches the app and jerks e.g. a UE
+// pawn's MoveUp). A held lone Ctrl with no following key must still reach the app,
+// so a one-shot ~150ms timer flushes the buffer. See the kb_* state on the window
+// struct and the arbitration block in wnd_proc.
+#define DXR_KB_FLUSH_TIMER     0x0D11
+#define DXR_KB_FLUSH_TIMEOUT_MS 150
 
 /*!
  * Push an input event into the ring buffer (WndProc thread only).
@@ -425,6 +458,80 @@ is_workspace_reserved_key(struct comp_d3d11_window *w, WPARAM vk)
 		}
 	}
 	return false;
+}
+
+// ---- #667: Ctrl-chord arbitration helpers (window thread only) ----
+
+static inline bool
+kb_is_ctrl(WPARAM vk)
+{
+	return vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL;
+}
+
+static inline bool
+kb_is_modifier(WPARAM vk)
+{
+	return kb_is_ctrl(vk) || vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT ||
+	       vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU;
+}
+
+//! Forward one buffered down event to the focused app, mirroring the regular
+//! forwarding path in wnd_proc (modifier-stamped PostMessage, or the input ring
+//! for capture clients).
+static void
+kb_forward_one(struct comp_d3d11_window *w, HWND fwd, bool is_capture, UINT msg, WPARAM vk, LPARAM lp)
+{
+	if (is_capture) {
+		input_ring_push(w, msg, (uint64_t)vk, (int64_t)lp, -1, -1);
+	} else {
+		LPARAM out = lp | DXR_FWD_KEY_MARKER_BIT |
+		             ((LPARAM)(workspace_compute_modifiers() & 0x7u) << DXR_FWD_KEY_MODS_SHIFT);
+		PostMessage(fwd, msg, vk, out);
+	}
+}
+
+//! Flush the buffered Ctrl-prefix to the app (real Ctrl combo, lone-Ctrl tap, or
+//! timeout). Ctrl is now a held, forwarded key — its repeats/up forward normally.
+static void
+kb_flush(struct comp_d3d11_window *w, HWND fwd, bool is_capture)
+{
+	for (int i = 0; i < w->kb_buf_count; i++) {
+		kb_forward_one(w, fwd, is_capture, w->kb_buf[i].msg, w->kb_buf[i].vk, w->kb_buf[i].lp);
+	}
+	w->kb_buf_count = 0;
+	w->kb_buf_active = false;
+	w->kb_ctrl_held_forwarded = true;
+	KillTimer(w->hwnd, DXR_KB_FLUSH_TIMER);
+}
+
+//! Discard the buffered Ctrl-prefix (a shell chord completed — the prefix must
+//! never reach the app). Remember each buffered down's vk so its matching KEYUP is
+//! swallowed too (otherwise the app sees an unbalanced key-up).
+static void
+kb_discard(struct comp_d3d11_window *w)
+{
+	for (int i = 0; i < w->kb_buf_count; i++) {
+		if (w->kb_suppress_up_count < (int)(sizeof(w->kb_suppress_up))) {
+			w->kb_suppress_up[w->kb_suppress_up_count++] = (uint8_t)w->kb_buf[i].vk;
+		}
+	}
+	w->kb_buf_count = 0;
+	w->kb_buf_active = false;
+	KillTimer(w->hwnd, DXR_KB_FLUSH_TIMER);
+}
+
+//! Reset all arbitration state (focus loss / teardown) — drop any buffered prefix
+//! and pending up-suppressions so nothing is stuck across an Alt+Tab.
+static void
+kb_reset(struct comp_d3d11_window *w)
+{
+	if (w->kb_buf_active) {
+		KillTimer(w->hwnd, DXR_KB_FLUSH_TIMER);
+	}
+	w->kb_buf_active = false;
+	w->kb_buf_count = 0;
+	w->kb_suppress_up_count = 0;
+	w->kb_ctrl_held_forwarded = false;
 }
 
 /*!
@@ -643,6 +750,72 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				                     message, wParam, lParam, &handled);
 			}
 #endif
+			// #667: Ctrl-chord arbitration. Buffer the bare Ctrl(+modifier) prefix
+			// of a potential shell chord instead of forwarding it eagerly, so it
+			// never drives the app (e.g. a UE pawn's Ctrl→MoveUp) before the chord's
+			// terminating key disambiguates. Only engaged when the controller
+			// reserves a Ctrl chord; otherwise Ctrl passes straight through.
+			if (InterlockedCompareExchange(&w->kb_has_ctrl_reserved, 0, 0)) {
+				const int kb_cap = (int)(sizeof(w->kb_buf) / sizeof(w->kb_buf[0]));
+				if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) {
+					if (kb_is_ctrl(wParam)) {
+						if (w->kb_ctrl_held_forwarded) {
+							// Already flushed/held — forward normally below.
+						} else if (w->kb_buf_active) {
+							return 0; // autorepeat / redundant Ctrl-down
+						} else if (w->kb_buf_count < kb_cap) {
+							w->kb_buf[w->kb_buf_count].msg = message;
+							w->kb_buf[w->kb_buf_count].vk = wParam;
+							w->kb_buf[w->kb_buf_count].lp = lParam;
+							w->kb_buf_count++;
+							w->kb_buf_active = true;
+							SetTimer(hWnd, DXR_KB_FLUSH_TIMER, DXR_KB_FLUSH_TIMEOUT_MS, NULL);
+							return 0;
+						}
+						// buffer full (shouldn't happen) — fall through, forward.
+					} else if (w->kb_buf_active && kb_is_modifier(wParam)) {
+						// May be Ctrl+Shift+<key> — hold the extra modifier too.
+						if (w->kb_buf_count < kb_cap) {
+							w->kb_buf[w->kb_buf_count].msg = message;
+							w->kb_buf[w->kb_buf_count].vk = wParam;
+							w->kb_buf[w->kb_buf_count].lp = lParam;
+							w->kb_buf_count++;
+							return 0;
+						}
+						kb_flush(w, fwd, is_capture != 0); // buffer full — flush, fall through
+					} else if (w->kb_buf_active) {
+						// Terminating non-modifier key. If it completes a reserved
+						// shell chord, drop the buffered prefix (never forward);
+						// otherwise flush the prefix so the app sees the full combo.
+						// Either way fall through: the reserved check below consumes
+						// a reserved key (return 0) or forwards a non-reserved one.
+						if (is_workspace_reserved_key(w, wParam)) {
+							kb_discard(w);
+						} else {
+							kb_flush(w, fwd, is_capture != 0);
+						}
+					}
+				} else if (message == WM_KEYUP || message == WM_SYSKEYUP) {
+					// Swallow the UP of a modifier whose DOWN was discarded as a
+					// chord prefix (keeps the app's key state balanced).
+					for (int i = 0; i < w->kb_suppress_up_count; i++) {
+						if (w->kb_suppress_up[i] == (uint8_t)wParam) {
+							w->kb_suppress_up[i] = w->kb_suppress_up[--w->kb_suppress_up_count];
+							return 0;
+						}
+					}
+					if (kb_is_ctrl(wParam)) {
+						if (w->kb_buf_active) {
+							// Lone Ctrl tap (or aborted chord) — deliver the real
+							// Ctrl to the app, then forward this UP below.
+							kb_flush(w, fwd, is_capture != 0);
+							w->kb_ctrl_held_forwarded = false;
+						} else if (w->kb_ctrl_held_forwarded) {
+							w->kb_ctrl_held_forwarded = false;
+						}
+					}
+				}
+			}
 			if (is_workspace_reserved_key(w, wParam)) {
 				// Controller-reserved chord (or built-in default: bare
 				// TAB/DELETE/ESC/[/]) → emitted on the public ring above but
@@ -728,6 +901,26 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 #endif
 	} break;
 
+	case WM_TIMER:
+		// #667: a buffered lone Ctrl was held with no following key — deliver it
+		// to the focused app so apps that bind Ctrl still get it.
+		if (wParam == DXR_KB_FLUSH_TIMER) {
+			if (w->kb_buf_active) {
+				HWND fwd = (HWND)InterlockedCompareExchangePointer(
+				    (volatile PVOID *)&w->input_forward_hwnd, NULL, NULL);
+				LONG is_capture = InterlockedCompareExchange(&w->input_forward_is_capture, 0, 0);
+				if (fwd != NULL) {
+					kb_flush(w, fwd, is_capture != 0);
+				} else {
+					kb_reset(w); // no target — drop it
+				}
+			} else {
+				KillTimer(hWnd, DXR_KB_FLUSH_TIMER);
+			}
+			return 0;
+		}
+		break;
+
 	// Focus change: let qwerty clear any latched modifier/button state.
 	// Alt+Tab can swallow the matching KEYUP once focus leaves, leaving
 	// e.g. the right controller stuck-active on re-entry. Fall through
@@ -736,6 +929,11 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_KILLFOCUS:
 	case WM_SETFOCUS:
 	case WM_ACTIVATE:
+		// #667: drop any half-buffered Ctrl-prefix when focus leaves so nothing
+		// is stuck across an Alt+Tab (the matching key-up may never arrive).
+		if (message == WM_KILLFOCUS) {
+			kb_reset(w);
+		}
 #ifdef XRT_BUILD_DRIVER_QWERTY
 		if (w->qwerty_enabled && w->xsysd != NULL) {
 			qwerty_process_win32(w->xsysd->xdevs, w->xsysd->xdev_count,
@@ -1584,7 +1782,9 @@ comp_d3d11_window_set_reserved_keys(struct comp_d3d11_window *window,
 		return;
 	}
 	if (count == 0 || vks == NULL || mods == NULL) {
-		// Restore the built-in default policy.
+		// Restore the built-in default policy. The built-in default reserves no
+		// Ctrl chord, so disengage Ctrl-prefix buffering (#667).
+		InterlockedExchange(&window->kb_has_ctrl_reserved, 0);
 		InterlockedExchange(&window->reserved_key_count, -1);
 		U_LOG_W("D3D11 window: reserved keys reset to built-in default");
 		return;
@@ -1595,10 +1795,17 @@ comp_d3d11_window_set_reserved_keys(struct comp_d3d11_window *window,
 	// Fill the table BEFORE publishing the count: the WndProc reader keys off
 	// reserved_key_count, so the array must be fully written when the count
 	// becomes visible. InterlockedExchange of the count is the publish barrier.
+	LONG has_ctrl = 0;
 	for (uint32_t i = 0; i < count; i++) {
 		window->reserved_keys[i].vk = vks[i];
 		window->reserved_keys[i].mods = mods[i];
+		// #667: Ctrl mod bit (bit 1) → engage Ctrl-prefix buffering in WndProc.
+		if (mods[i] & 0x2u) {
+			has_ctrl = 1;
+		}
 	}
+	// Publish the buffering gate before the count barrier below.
+	InterlockedExchange(&window->kb_has_ctrl_reserved, has_ctrl);
 	MemoryBarrier();
 	InterlockedExchange(&window->reserved_key_count, (LONG)count);
 	U_LOG_W("D3D11 window: controller registered %u reserved key chord(s)", count);
