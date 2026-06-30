@@ -24,6 +24,22 @@
 !endif
 
 ;--------------------------------
+; Code signing (SIGN_CMD passed from CMake; empty = unsigned build).
+; !finalize signs the installer .exe and !uninstfinalize signs the
+; embedded uninstaller stub, both at makensis time. The uninstaller
+; MUST be signed here: it is compiled into the installer at build time
+; and extracted on the user's machine, so signing the finished installer
+; afterwards cannot reach it. SIGN_CMD carries no secret — on a
+; signing-capable build machine it points at the configured signer;
+; elsewhere it is empty and the build is unsigned.
+!ifdef SIGN_CMD
+	!if "${SIGN_CMD}" != ""
+		!finalize '${SIGN_CMD} "%1"'
+		!uninstfinalize '${SIGN_CMD} "%1"'
+	!endif
+!endif
+
+;--------------------------------
 ; General Attributes
 
 Name "DisplayXR ${VERSION}"
