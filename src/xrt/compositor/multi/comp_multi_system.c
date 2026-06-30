@@ -63,6 +63,8 @@
 
 #ifdef XRT_OS_ANDROID
 #include "android/android_globals.h"
+#include "android/android_perf_hint.h" // ADPF perf-hint session (#663)
+#include <unistd.h>                     // gettid()
 #endif
 
 #ifdef XRT_OS_MACOS
@@ -84,6 +86,43 @@
 
 #ifdef XRT_GRAPHICS_SYNC_HANDLE_IS_FD
 #include <unistd.h>
+#endif
+
+#ifdef XRT_OS_ANDROID
+/*
+ * Android OOP present-loop diagnostics + DVFS hints (#663).
+ *
+ * DXR_ANDROID_PRESENT_TS  — throttled (every 120 frames) "OOP_PRESENT_TS" line that
+ *   splits the per-session present loop into acquire / record(+weave) / submit /
+ *   gpu_wait / present, so the app's "end" phase can be attributed to IPC vs weave
+ *   vs present without guessing. Default on; the log is throttled so it's not
+ *   per-frame log bloat.
+ * DXR_ANDROID_ADPF        — install an Android Dynamic Performance Framework hint
+ *   session on the render thread so the scheduler keeps big cores unparked (the
+ *   ~13 ms "wait" DVFS core-parking stall #646 documents). Default on; set 0 to
+ *   revert, mirroring #646's DXR_ANDROID_VSYNC_PACING.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(android_present_ts, "DXR_ANDROID_PRESENT_TS", true)
+DEBUG_GET_ONCE_BOOL_OPTION(android_adpf, "DXR_ANDROID_ADPF", true)
+/*
+ * DXR_ANDROID_PIPELINE_WEAVE — pipeline the per-session weave by ONE frame (#663).
+ * The OOP present loop blocks the render thread on a synchronous vkWaitForFences
+ * for the weave's GPU completion before presenting (the cross-device read-completion
+ * guard at the end of render_session_to_own_target). On the NP02J that wait is the
+ * dominant ~13 ms cost and, being on the critical path every frame, leaves the GPU
+ * idle between bursts → it DVFS-downclocks → the weave runs slow → ~34 fps.
+ *
+ * When on (default), the wait is DEFERRED to the top of the next frame via the
+ * existing fenced_buffer machinery: frame N presents immediately (GPU-ordered by the
+ * render_complete semaphore) and frame N's weave overlaps the compositor's pacing
+ * wait_frame sleep, so the GPU stays fed and clocked. Correctness is preserved — the
+ * next frame's command buffer (which reuses the single atlas/intermediate images and
+ * re-reads the app's shared images) is only recorded AFTER the deferred wait confirms
+ * the previous frame's GPU work finished, so no read/write race is introduced; the
+ * pipeline depth stays at exactly 1. Set debug.xrt.DXR_ANDROID_PIPELINE_WEAVE=0 to
+ * restore the synchronous wait.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(android_pipeline_weave, "DXR_ANDROID_PIPELINE_WEAVE", true)
 #endif
 
 
@@ -2681,6 +2720,16 @@ render_session_to_own_target(struct multi_compositor *mc,
 		return;
 	}
 
+#ifdef XRT_OS_ANDROID
+	// Per-stage present-loop timestamps (#663). Captured every frame (cheap),
+	// reduced into a throttled OOP_PRESENT_TS log at the present stage so the
+	// app's "end" phase can be split into acquire / record(+weave) / submit /
+	// gpu_wait / present. Only the normal (non-early-return) path logs — error
+	// /skip returns don't pollute the steady-state numbers.
+	int64_t ts_entry = os_monotonic_get_ns();
+	int64_t ts_acq0 = 0, ts_acq1 = 0, ts_submit0 = 0, ts_submit1 = 0, ts_gpu1 = 0;
+#endif
+
 	// Recreate swapchain if flagged (from previous frame's VK_SUBOPTIMAL_KHR)
 #ifdef XRT_OS_WINDOWS
 	if (mc->session_render.swapchain_needs_recreate &&
@@ -2926,6 +2975,9 @@ black_canvas:; // force_black (minimized) jumps here, skipping all content/view 
 
 	// Acquire the next swapchain image from the per-session target
 	uint32_t buffer_index = 0;
+#ifdef XRT_OS_ANDROID
+	ts_acq0 = os_monotonic_get_ns();
+#endif
 	VkResult ret = comp_target_acquire(ct, &buffer_index);
 	if (ret == VK_ERROR_OUT_OF_DATE_KHR) {
 		U_LOG_W("[per-session] Swapchain out of date, recreating now");
@@ -2962,6 +3014,10 @@ black_canvas:; // force_black (minimized) jumps here, skipping all content/view 
 		U_LOG_E("[per-session] buffer_index %u out of range (max %u)", buffer_index, mc->session_render.buffer_count);
 		return;
 	}
+
+#ifdef XRT_OS_ANDROID
+	ts_acq1 = os_monotonic_get_ns(); // acquire done; command-buffer recording starts
+#endif
 
 	// Reset fence for current buffer
 	ret = vk->vkResetFences(vk->device, 1, &mc->session_render.fences[buffer_index]);
@@ -3372,24 +3428,58 @@ submit_and_present:
 	    .pSignalSemaphores = (signal_sem != VK_NULL_HANDLE) ? &signal_sem : NULL,
 	};
 
+#ifdef XRT_OS_ANDROID
+	ts_submit0 = os_monotonic_get_ns(); // record (per-tile blit + weave + overlays) done
+#endif
 	ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, mc->session_render.fences[buffer_index]);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("[per-session] Failed to submit per-session render: %s", vk_result_string(ret));
 		return;
 	}
+#ifdef XRT_OS_ANDROID
+	ts_submit1 = os_monotonic_get_ns(); // submit returned; GPU wait starts
+#endif
 
-	// CRITICAL: Wait for GPU work to complete before returning.
-	// With cross-device external memory sharing (null compositor + VK app),
-	// there is no GPU-level synchronization between Device A (compositor) and
-	// Device B (app). Without this wait, the compositor's GPU read of shared
-	// images may still be in-flight when the app starts writing to the same
-	// images for the next frame, causing VK_ERROR_DEVICE_LOST on Intel.
-	// GL apps don't hit this because GL has implicit driver-level sync.
-	ret = vk->vkWaitForFences(vk->device, 1, &mc->session_render.fences[buffer_index], VK_TRUE, UINT64_MAX);
-	if (ret != VK_SUCCESS) {
-		U_LOG_E("[per-session] Failed to wait for render fence: %s", vk_result_string(ret));
+	// CRITICAL: the compositor's GPU read of the app's shared images (and reuse of
+	// the single atlas/intermediate images) must complete before the next frame
+	// overwrites them. With cross-device external memory sharing (null compositor +
+	// VK app) there is no GPU-level sync between Device A (compositor) and Device B
+	// (app): a still-in-flight read when the app starts writing the same images
+	// causes VK_ERROR_DEVICE_LOST on Intel. GL apps don't hit this (implicit sync).
+	//
+	// Two ways to provide that guarantee:
+	//  - Synchronous (default off Android / all other platforms): block here on the
+	//    fence, so the read is done before this function returns.
+	//  - Deferred-by-one-frame (#663, Android default): present now (GPU-ordered by
+	//    the render_complete semaphore) and wait for THIS fence at the TOP of the
+	//    next frame, before that frame records/submits any work that reuses the
+	//    images. Either way the previous frame's GPU read is guaranteed complete
+	//    before reuse; the deferred form just lets the weave overlap the pacing
+	//    sleep so the GPU stays clocked (see DXR_ANDROID_PIPELINE_WEAVE). Pipeline
+	//    depth is exactly 1, so no extra image buffering is required.
+	bool defer_fence_wait = false;
+#ifdef XRT_OS_ANDROID
+	defer_fence_wait = debug_get_bool_option_android_pipeline_weave();
+#endif
+
+	if (defer_fence_wait) {
+		// Hand the fence to the next frame's top-of-loop deferred wait.
+		mc->session_render.fenced_buffer = (int32_t)buffer_index;
+	} else {
+		ret = vk->vkWaitForFences(vk->device, 1, &mc->session_render.fences[buffer_index], VK_TRUE,
+		                          UINT64_MAX);
+		if (ret != VK_SUCCESS) {
+			U_LOG_E("[per-session] Failed to wait for render fence: %s", vk_result_string(ret));
+		}
+		mc->session_render.fenced_buffer = -1; // Fence already waited, no deferred wait needed
 	}
-	mc->session_render.fenced_buffer = -1; // Fence already waited, no deferred wait needed
+
+#ifdef XRT_OS_ANDROID
+	// With pipelining this marks "submitted + presented" (the GPU weave finishes
+	// asynchronously and is awaited at the next frame's top); without it, the GPU
+	// weave is already complete here. Either way it bounds the synchronous portion.
+	ts_gpu1 = os_monotonic_get_ns();
+#endif
 
 	// Present the image (GPU work is complete, semaphore already signaled)
 	ret = comp_target_present(ct, vk->main_queue->queue, buffer_index, 0, display_time_ns, 0);
@@ -3407,6 +3497,29 @@ submit_and_present:
 	} else if (ret != VK_SUCCESS) {
 		U_LOG_E("[per-session] Failed to present per-session target: %s", vk_result_string(ret));
 	}
+
+#ifdef XRT_OS_ANDROID
+	// Throttled per-stage split of the present loop (#663). One line every 120
+	// frames (never per-frame — see CLAUDE.md debug-logging rules). Lets the app's
+	// ~12–18 ms "end" phase be attributed: acquire (FIFO/double-buffer stall) vs
+	// record(+weave CPU) vs gpu_wait (synchronous weave GPU) vs present.
+	if (debug_get_bool_option_android_present_ts()) {
+		static uint32_t ts_frame_count = 0;
+		if ((ts_frame_count++ % 120) == 0 && ts_acq0 != 0 && ts_gpu1 != 0) {
+			int64_t t_acquire = ts_acq1 - ts_acq0;
+			int64_t t_record = ts_submit0 - ts_acq1;
+			int64_t t_submit = ts_submit1 - ts_submit0;
+			int64_t t_gpu_wait = ts_gpu1 - ts_submit1;
+			int64_t t_present = os_monotonic_get_ns() - ts_gpu1;
+			int64_t t_total = os_monotonic_get_ns() - ts_entry;
+			U_LOG_W("OOP_PRESENT_TS frame %u | acquire %.2f + record %.2f + submit %.2f + "
+			        "gpu_wait %.2f + present %.2f = total %.2f ms",
+			        ts_frame_count - 1, t_acquire / 1e6, t_record / 1e6, t_submit / 1e6,
+			        t_gpu_wait / 1e6, t_present / 1e6, t_total / 1e6);
+		}
+	}
+#endif
+
 #ifdef XRT_OS_WINDOWS
 	// Signal WM_PAINT handler that frame is done
 	if (mc->session_render.owns_window && mc->session_render.own_window != NULL) {
@@ -5590,6 +5703,20 @@ multi_main_loop(struct multi_system_compositor *msc)
 	struct os_precise_sleeper sleeper = {0};
 	os_precise_sleeper_init(&sleeper);
 
+#ifdef XRT_OS_ANDROID
+	// ADPF hint session on THIS render thread (#663). This is the single thread that
+	// does predict → wait → transfer → render → weave → present per frame, so it is
+	// the correct DVFS target: reporting its actual work duration each frame keeps
+	// the big cores unparked under a steady touch-free workload (the ~13 ms "wait"
+	// stall). NULL-safe if ADPF is unavailable (device API < 33), and gated behind
+	// debug.xrt.DXR_ANDROID_ADPF (default on) so it's revertible like #646's pacing.
+	struct android_perf_hint_session *perf_hint = NULL;
+	if (debug_get_bool_option_android_adpf()) {
+		// Initial target = 60 Hz; refined per-frame from predicted_display_period_ns.
+		perf_hint = android_perf_hint_session_create((int32_t)gettid(), 16666666);
+	}
+#endif
+
 	// Protect the thread state and the sessions state.
 	os_thread_helper_lock(&msc->oth);
 
@@ -5633,6 +5760,14 @@ multi_main_loop(struct multi_system_compositor *msc)
 		int64_t now_ns = os_monotonic_get_ns();
 		int64_t diff_ns = predicted_display_time_ns - now_ns;
 
+#ifdef XRT_OS_ANDROID
+		// ADPF: the real per-frame work starts now (after the pacer wait). Track the
+		// scheduler's target to the predicted display period so the hint stays valid
+		// across refresh-rate changes.
+		int64_t adpf_work_start_ns = now_ns;
+		android_perf_hint_session_update_target(perf_hint, predicted_display_period_ns);
+#endif
+
 		// Now we know the diff, broadcast to pacers.
 		broadcast_timings_to_pacers(msc, predicted_display_time_ns, predicted_display_period_ns, diff_ns);
 
@@ -5661,6 +5796,12 @@ multi_main_loop(struct multi_system_compositor *msc)
 #endif
 		os_mutex_unlock(&msc->list_and_timing_lock);
 
+#ifdef XRT_OS_ANDROID
+		// ADPF: close the loop — report how long this frame's work actually took
+		// (wait-return → present complete) so the scheduler can size the clocks.
+		android_perf_hint_session_report_actual(perf_hint, os_monotonic_get_ns() - adpf_work_start_ns);
+#endif
+
 		// Re-lock the thread for check in while statement.
 		os_thread_helper_lock(&msc->oth);
 	}
@@ -5679,6 +5820,10 @@ multi_main_loop(struct multi_system_compositor *msc)
 	os_thread_helper_unlock(&msc->oth);
 
 	os_precise_sleeper_deinit(&sleeper);
+
+#ifdef XRT_OS_ANDROID
+	android_perf_hint_session_destroy(perf_hint);
+#endif
 
 	return 0;
 }
