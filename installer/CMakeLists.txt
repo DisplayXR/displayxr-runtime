@@ -41,7 +41,12 @@ endif()
 # Passed through to makensis, where the .nsi uses it in !uninstfinalize
 # (and !finalize) to sign the uninstaller stub that is embedded at build
 # time. No cert/secret lives in this repo.
-set(SIGN_CMD "$ENV{SIGN_CMD}" CACHE STRING "Code-signing command for installer/uninstaller (empty = unsigned)")
+#
+# FORCE so the live SIGN_CMD env always wins on reconfigure: a plain CACHE
+# var is seeded only on the first configure, so a build tree first configured
+# with SIGN_CMD unset would keep caching "" even after SIGN_CMD is later set,
+# silently leaving the embedded uninstaller unsigned (#664 validation).
+set(SIGN_CMD "$ENV{SIGN_CMD}" CACHE STRING "Code-signing command for installer/uninstaller (empty = unsigned)" FORCE)
 
 # Generate version header for NSIS
 configure_file(
