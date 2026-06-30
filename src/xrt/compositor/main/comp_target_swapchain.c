@@ -79,7 +79,17 @@ android_transparent_requested(void)
  * probably want 3, but most compositors on Linux sets the minImageCount
  * to 3 anyways so we get what we want.
  */
+#ifdef XRT_OS_ANDROID
+// Triple-buffer the Android OOP present chain (#663). On Android this swapchain is
+// FIFO (vsync) and the only comp_target_swapchain consumer is the OOP per-session
+// present target (comp_window_android): with just 2 images, missing one vblank
+// blocks the render thread a full period on acquire (the ~2× vblank stall). A 3rd
+// image lets the loop keep a frame in flight. select_image_count() still clamps to
+// the surface's reported max, so this is safe where the surface only allows 2.
+DEBUG_GET_ONCE_NUM_OPTION(preferred_at_least_image_count, "XRT_COMPOSITOR_PREFERRED_IMAGE_COUNT", 3)
+#else
 DEBUG_GET_ONCE_NUM_OPTION(preferred_at_least_image_count, "XRT_COMPOSITOR_PREFERRED_IMAGE_COUNT", 2)
+#endif
 DEBUG_GET_ONCE_BOOL_OPTION(use_present_wait, "XRT_COMPOSITOR_USE_PRESENT_WAIT", false)
 /*
  * Android closed-loop pacing (#510). The fake compositor pacer is open-loop on
