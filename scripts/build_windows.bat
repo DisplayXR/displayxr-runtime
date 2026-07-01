@@ -180,12 +180,46 @@ if "%TARGET%"=="build" goto :done
 :: 5. Build installer
 :: ============================================================
 :do_installer
+:: ── Code signing (gated on %SIGN_CMD%) ──────────────────────────────
+:: Signing is OFF unless SIGN_CMD is set in the environment. It is set
+:: only on a signing-capable build machine, where SIGN_CMD points at the
+:: configured code-signing tool. This repo carries NO cert and NO signing
+:: secret — just this "honor SIGN_CMD if present" hook. A clone without
+:: SIGN_CMD builds unsigned, exactly as before.
+::
+:: The inner DLLs/EXEs MUST be signed here, BEFORE makensis packs them —
+:: Smart App Control checks the binaries extracted at install/load time,
+:: so signing the finished installer alone is not enough.
+if defined SIGN_CMD (
+    echo === Signing runtime binaries [SIGN_CMD set] ===
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%REPO%scripts\sign-release.ps1" -Path "%REPO%_package\bin" -SignCmd "%SIGN_CMD%"
+    REM 'if errorlevel 1' reads the live exit code; %ERRORLEVEL% would be
+    REM parse-time-expanded inside this parenthesized block (always stale).
+    if errorlevel 1 (
+        echo Binary signing FAILED
+        exit /b 1
+    )
+) else (
+    echo === Signing skipped [SIGN_CMD not set] - installer will be UNSIGNED ===
+)
+
 echo.
 echo === Building installer ===
 cmake --build "%REPO%build" --config Release --target installer
 
 if %ERRORLEVEL% NEQ 0 (
     echo Installer build FAILED - continuing with test apps...
+)
+
+:: Sign the installer .exe itself (the NSIS uninstaller is signed at
+:: makensis time via !uninstfinalize in DisplayXRInstaller.nsi).
+if defined SIGN_CMD (
+    echo === Signing installer .exe ===
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%REPO%scripts\sign-release.ps1" -Path "%REPO%_package" -SignCmd "%SIGN_CMD%"
+    if errorlevel 1 (
+        echo Installer signing FAILED
+        exit /b 1
+    )
 )
 
 if "%TARGET%"=="installer" goto :done

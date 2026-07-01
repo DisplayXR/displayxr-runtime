@@ -180,8 +180,64 @@ CI_CONC="${S#completed/}"
 ```
 
 ### Step 3.3: Branch on outcome
-- `success` → Phase 4
+- `success` → Phase 3.5
 - else → STOP, report failed jobs via `gh run view "$RUN_ID" -R "$REPO" --log-failed`. No rollback — tags are sticky; user retries with a new tag.
+
+---
+
+## PHASE 3.5: CODE-SIGN THE COMPONENT INSTALLER (capability-gated)
+
+Same model as the runtime's `/release` skill: GitHub-hosted CI builds the
+component **unsigned** (the code-signing key is held on a build machine and
+isn't available to cloud CI runners, and no secret lives in these public
+repos). A signed release is produced by a **local signed build on a
+signing-capable machine** that replaces the CI asset. No-ops cleanly without
+signing capability.
+
+This matters most for **leia-plugin** — its vendor plug-in DLL is in the
+load path of every app that uses that display, so Smart App Control blocks
+it unsigned. Demos with Windows installers are next; `mcp` ships DLLs too.
+
+### Step 3.5.1: Capability check
+```bash
+if [ -z "$SIGN_CMD" ] || ! uname -s | grep -qiE 'mingw|msys|cygwin|windows'; then
+  echo "⚠  SIGNING SKIPPED for $COMPONENT — no signing capability here."
+  echo "   Release ships the UNSIGNED CI installer. Re-run /dxr-release"
+  echo "   $COMPONENT $NEW_TAG on a signing-capable build machine (SIGN_CMD set)."
+  SIGNED=no   # continue — do not fail the release
+else
+  SIGNED=yes
+fi
+```
+
+### Step 3.5.2: Local signed build + asset replace (only if SIGNED=yes)
+Requires the component repo to carry the same `SIGN_CMD`-gated build
+plumbing as the runtime (sign inner binaries before NSIS, sign the
+installer, `!uninstfinalize` the uninstaller).
+
+**Plumbing status:** `leia-plugin` has it (`scripts/build-windows.bat`).
+Demos / `mcp` do not yet — for those, set `SIGNED=no` with a note and
+continue (track per #664).
+
+```bash
+cd "$WORK/repo"
+git checkout "$NEW_TAG"
+# Component-specific build entry point (note the hyphen for leia-plugin).
+case "$COMPONENT" in
+  leia-plugin|leia) cmd //c "scripts\\build-windows.bat all" ;;
+  *) echo "No SIGN_CMD plumbing for $COMPONENT yet — skipping signing"; SIGNED=no ;;
+esac
+SIGNED_EXE=$(ls _package/*Setup-*.exe 2>/dev/null | head -1)
+powershell -NoProfile -Command "(Get-AuthenticodeSignature '$SIGNED_EXE').Status" # must be 'Valid'
+
+CI_EXE=$(gh release view "$NEW_TAG" -R "$REPO" --json assets \
+           --jq '.assets[].name | select(test("Setup-.*\\.exe$"))')
+[ -n "$CI_EXE" ] && gh release delete-asset "$NEW_TAG" "$CI_EXE" --yes -R "$REPO"
+gh release upload "$NEW_TAG" "$SIGNED_EXE" --clobber -R "$REPO"
+```
+
+If a component has **no** SIGN_CMD plumbing yet, set `SIGNED=no` with a note
+naming the component, and continue. Never upload an unverified binary.
 
 ---
 

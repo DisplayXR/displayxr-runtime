@@ -300,6 +300,95 @@ user can audit at a glance.
 
 ---
 
+## PHASE 4.5: CODE-SIGN THE WINDOWS INSTALLER (capability-gated)
+
+GitHub-hosted CI builds the installer **unsigned** — the code-signing key
+is held on a build machine and isn't available to cloud CI runners, and no
+cert/secret is kept in this public repo. So signed releases are produced by
+a **local signed build on a signing-capable machine** and that signed
+installer **replaces** the CI asset. This phase no-ops cleanly for anyone
+without signing capability (the release just ships the unsigned CI
+installer, exactly as before).
+
+Why the installer must be rebuilt locally rather than re-signed in place:
+SAC checks the **DLLs extracted from the installer at load time**, so the
+inner binaries must be signed **before** NSIS packs them. You cannot fix
+that by re-signing the finished `.exe` — hence a full local signed build.
+
+### Step 4.5.1: Capability check
+The gate is the `SIGN_CMD` environment variable, which is set **only** on
+a signing-capable Windows build machine, where `SIGN_CMD` points at the
+configured code-signing tool. It is the same variable `build_windows.bat`
+honors.
+
+```bash
+# Must be a Windows host AND have SIGN_CMD set.
+if [ -z "$SIGN_CMD" ] || ! uname -s | grep -qiE 'mingw|msys|cygwin|windows'; then
+  echo "⚠  SIGNING SKIPPED — no signing capability on this machine."
+  echo "   The release will ship the UNSIGNED CI installer. To produce a"
+  echo "   signed installer, re-run /release on a signing-capable build"
+  echo "   machine (where SIGN_CMD is set)."
+  SIGNED=no
+  # Continue to Phase 5 — do NOT fail the release.
+else
+  SIGNED=yes
+fi
+```
+
+If `SIGNED=no`, skip straight to Phase 5 and carry the warning into the
+final report.
+
+### Step 4.5.2: Local signed build (only if SIGNED=yes)
+Build the runtime + installer locally at the tagged commit. With
+`SIGN_CMD` set, `build_windows.bat` signs every inner binary before NSIS
+packs them, signs the installer `.exe`, and the `.nsi` signs the embedded
+uninstaller — the whole chain.
+
+```bash
+git fetch --tags --quiet
+git checkout [FULL_TAG]            # build the exact released commit
+cmd //c "scripts\\build_windows.bat all"
+```
+
+The signed installer lands at `_package\DisplayXRSetup-[VERSION].*.exe`
+(local build number, so the filename may differ from CI's). Verify the
+signature actually took:
+
+```bash
+SIGNED_EXE=$(ls _package/DisplayXRSetup-*.exe | head -1)
+powershell -NoProfile -Command "(Get-AuthenticodeSignature '$SIGNED_EXE').Status" # must print 'Valid'
+```
+If the status is not `Valid`, STOP and report — do not upload an
+unsigned/invalid binary over a release.
+
+### Step 4.5.3: Replace the CI asset on the release
+Delete the unsigned CI installer from the release and upload the signed
+one. (Names may differ by build number, so delete by the CI asset's
+actual name, then upload the local file.)
+
+```bash
+CI_EXE=$(gh release view [FULL_TAG] --repo DisplayXR/displayxr-runtime \
+           --json assets --jq '.assets[].name | select(test("^DisplayXRSetup-.*\\.exe$"))')
+[ -n "$CI_EXE" ] && gh release delete-asset [FULL_TAG] "$CI_EXE" --yes \
+  --repo DisplayXR/displayxr-runtime
+gh release upload [FULL_TAG] "$SIGNED_EXE" --clobber \
+  --repo DisplayXR/displayxr-runtime
+```
+
+Restore the working tree afterwards: `git checkout main`.
+
+### Step 4.5.4: Scope note
+This phase signs **only the runtime installer**. The vendor plug-in,
+the Unity plug-in, demos, and the shell are signed by **their own**
+release flows (`/dxr-release <component>`, the Unity repo's `/release`,
+etc.) — each carries the same `SIGN_CMD`-gated step. The Unreal plug-in
+is signed inside its own local package step. A user installing the full
+stack gets every layer signed only when each component was released from
+a signing-capable machine. Carry into the report which layers this run
+covered (runtime only).
+
+---
+
 ## PHASE 5: WRITE CURATED RELEASE NOTES
 
 Since the CI workflows now attach artifacts to the release directly via
@@ -386,6 +475,8 @@ Release [FULL_TAG] published successfully!
 
 Build:     Windows CI run #RUN_ID — Runtime + cube test apps passed
            [list any pre-existing-broken jobs here, with note that they don't affect the artifact]
+Signing:   [SIGNED=yes → "runtime installer signed (EV) and re-uploaded over the CI asset"]
+           [SIGNED=no  → "⚠ UNSIGNED — released from a non-signing machine; re-run /release on a signing-capable build machine to ship a signed installer"]
 Release:   https://github.com/DisplayXR/displayxr-runtime/releases/tag/[FULL_TAG]
 Assets:    DisplayXRSetup-X.Y.Z.BUILD.exe (~N MB)
            DisplayXR-Installer-X.Y.Z.pkg (~N MB)  [or "skipped — macOS run did not produce .pkg"]

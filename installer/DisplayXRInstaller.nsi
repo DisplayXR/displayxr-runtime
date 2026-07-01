@@ -24,13 +24,51 @@
 !endif
 
 ;--------------------------------
+; Code signing (SIGN_CMD passed from CMake; empty = unsigned build).
+; SIGN_CMD carries no secret — on a signing-capable build machine it points at
+; the configured signer; elsewhere it is empty and the build is unsigned.
+;
+; The installer .exe is signed via !finalize. The UNINSTALLER is signed via a
+; two-pass build instead of !uninstfinalize: !uninstfinalize is unreliable —
+; the uninstaller NSIS writes at install time is a self-copy of the (signed)
+; installer's exe header, so it inherits the INSTALLER's cert-table pointer,
+; which can dangle past the smaller uninstaller file => effectively unsigned
+; (signtool even refuses to re-sign it, 0x800700C1). This installer's
+; !uninstfinalize happened to survive, but leia/shell's did not (#664); use
+; the robust path here too.
+;
+; Two-pass (canonical NSIS recipe, kept in-script so the CMake `installer`
+; target needs no change): compile an INNER installer whose only job is to
+; WriteUninstaller to %TEMP% and Quit; run it; sign that %TEMP%\Uninstall.exe;
+; then File-include the pre-signed uninstaller in the real pass. INNER is
+; RequestExecutionLevel user so it never triggers UAC when run from makensis
+; on a non-elevated build host.
+!ifndef INNER
+	!ifdef SIGN_CMD
+		!if "${SIGN_CMD}" != ""
+			!finalize '${SIGN_CMD} "%1"'
+			!makensis '-DINNER "-DVERSION=${VERSION}" "-DVERSION_MAJOR=${VERSION_MAJOR}" "-DVERSION_MINOR=${VERSION_MINOR}" "-DVERSION_PATCH=${VERSION_PATCH}" "-DBUILD_NUM=${BUILD_NUM}" "-DSOURCE_DIR=${SOURCE_DIR}" "-DBIN_DIR=${BIN_DIR}" "-DOUTPUT_DIR=${OUTPUT_DIR}" "${__FILE__}"' = 0
+			!system '"$%TEMP%\DisplayXRSetup_inner.exe"' = 2
+			!system '${SIGN_CMD} "$%TEMP%\Uninstall.exe"' = 0
+			!define USE_PRESIGNED_UNINST
+		!endif
+	!endif
+!endif
+
+;--------------------------------
 ; General Attributes
 
 Name "DisplayXR ${VERSION}"
-OutFile "${OUTPUT_DIR}\DisplayXRSetup-${VERSION}.${BUILD_NUM}.exe"
+!ifdef INNER
+	; Throwaway inner installer: only emits the uninstaller to %TEMP%.
+	OutFile "$%TEMP%\DisplayXRSetup_inner.exe"
+	RequestExecutionLevel user
+!else
+	OutFile "${OUTPUT_DIR}\DisplayXRSetup-${VERSION}.${BUILD_NUM}.exe"
+	RequestExecutionLevel admin
+!endif
 InstallDir "$PROGRAMFILES64\DisplayXR\Runtime"
 InstallDirRegKey HKLM "Software\DisplayXR\Runtime" "InstallPath"
-RequestExecutionLevel admin
 ShowInstDetails show
 ShowUninstDetails show
 
@@ -734,8 +772,14 @@ Section "DisplayXR Runtime" SecRuntime
 	; Broadcast environment change to running applications
 	SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
 
-	; Write uninstaller
+	; Write uninstaller. In a signed build, install the pre-signed uninstaller
+	; produced by the inner pass (two-pass signing — see the code-signing block
+	; in the header). Otherwise (unsigned build / CI) write it normally.
+!ifdef USE_PRESIGNED_UNINST
+	File "/oname=Uninstall.exe" "$%TEMP%\Uninstall.exe"
+!else
 	WriteUninstaller "$INSTDIR\Uninstall.exe"
+!endif
 
 	; Add to Add/Remove Programs
 	WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXR" \
@@ -1083,6 +1127,14 @@ SectionEnd
 ; Installer Functions
 
 Function .onInit
+!ifdef INNER
+	; Inner pass only: emit the uninstaller to %TEMP% (the binary that gets
+	; signed and File-included by the real pass) then bail — no UI, no install.
+	; This whole path is absent from the real installer.
+	SetSilent silent
+	WriteUninstaller "$%TEMP%\Uninstall.exe"
+	Quit
+!endif
 	; Check for 64-bit Windows
 	${IfNot} ${RunningX64}
 		MessageBox MB_ICONSTOP "DisplayXR requires 64-bit Windows."

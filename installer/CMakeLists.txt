@@ -34,6 +34,20 @@ if(NOT DEFINED BUILD_NUM)
 	set(BUILD_NUM "0")
 endif()
 
+# Optional code-signing command, sourced from the SIGN_CMD environment
+# variable at configure time. Empty on any machine without it (clones,
+# GitHub-hosted CI) -> the installer + uninstaller build unsigned. On a
+# signing-capable build machine SIGN_CMD points at the configured signer.
+# Passed through to makensis, where the .nsi uses it in !uninstfinalize
+# (and !finalize) to sign the uninstaller stub that is embedded at build
+# time. No cert/secret lives in this repo.
+#
+# FORCE so the live SIGN_CMD env always wins on reconfigure: a plain CACHE
+# var is seeded only on the first configure, so a build tree first configured
+# with SIGN_CMD unset would keep caching "" even after SIGN_CMD is later set,
+# silently leaving the embedded uninstaller unsigned (#664 validation).
+set(SIGN_CMD "$ENV{SIGN_CMD}" CACHE STRING "Code-signing command for installer/uninstaller (empty = unsigned)" FORCE)
+
 # Generate version header for NSIS
 configure_file(
 	"${CMAKE_CURRENT_SOURCE_DIR}/Version.nsh.in"
@@ -57,6 +71,7 @@ add_custom_target(installer
 		"/DBIN_DIR=${DISPLAYXR_BIN_DIR}"
 		"/DSOURCE_DIR=${CMAKE_SOURCE_DIR}"
 		"/DOUTPUT_DIR=${CMAKE_INSTALL_PREFIX}"
+		"/DSIGN_CMD=${SIGN_CMD}"
 		"${CMAKE_CURRENT_SOURCE_DIR}/DisplayXRInstaller.nsi"
 	WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
 	COMMENT "Building DisplayXR installer..."
