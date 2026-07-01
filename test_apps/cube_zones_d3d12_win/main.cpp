@@ -68,8 +68,8 @@ static const wchar_t* WINDOW_TITLE = L"D3D12 Cube Zones — XR_EXT_display_zones
 // Global state (main thread + render thread)
 static std::atomic<bool> g_running{true};
 static XrSessionManager* g_xr = nullptr;
-static UINT g_windowWidth = 1280;
-static UINT g_windowHeight = 720;
+static UINT g_windowWidth = 936;   // #672: match Unity's portrait multi-zone window
+static UINT g_windowHeight = 1712;
 
 // Fullscreen state
 static bool g_fullscreen = false;
@@ -107,11 +107,11 @@ struct DisplayZone {
 };
 static DisplayZone g_zonesArr[kNumZones];
 
-// #672 repro geometry: two equal, ADJACENT zones spanning the full window
-// width (mirrors the reporter's A=(0,565)468x1147 + B=(468,565)468x1147 —
-// adjacent, filling the width — so no geometry difference vs the Unity case).
-static const XrRect2Di kZoneARect = {{0, 90}, {640, 540}};
-static const XrRect2Di kZoneBRect = {{640, 90}, {640, 540}};
+// #672 isolation: EXACT Unity multi-zone geometry — 936x1712 portrait window,
+// two tall bottom-band zones, zone B pinned to the right edge. Reproduces the
+// Unity provider's layout to test whether zone B drops on geometry alone.
+static const XrRect2Di kZoneARect = {{0, 565}, {468, 1147}};
+static const XrRect2Di kZoneBRect = {{468, 565}, {468, 1147}};
 
 // Zone-owned RTV descriptor heap (TEXTURE2DARRAY slice RTVs). Separate from
 // renderer.rtvHeap (the main-swapchain RTVs) so zone slice views don't collide.

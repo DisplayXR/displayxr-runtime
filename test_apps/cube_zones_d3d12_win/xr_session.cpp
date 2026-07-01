@@ -285,10 +285,15 @@ bool CreateSession(XrSessionManager& xr, ID3D12Device* device, ID3D12CommandQueu
     // lets the Leia DP pick its default magenta (used only if WGC bg-capture
     // fails and the DP falls back to the chroma-key trick).
     {
+        // Match main.cpp's TransparentBackgroundEnabled() — ON BY DEFAULT (=0 opts
+        // out). Must agree with the WINDOW's WS_EX_NOREDIRECTIONBITMAP choice: a
+        // transparent window + opaque binding makes the runtime use the opaque
+        // swapchain path (opaque black floor) instead of the DComp transparent
+        // path — the two defaults MUST stay in lockstep.
         const char *e = getenv("DISPLAYXR_TRANSPARENT_BG");
-        if (e != nullptr && *e != '\0' && *e != '0') {
+        if (e == nullptr || *e == '\0' || *e != '0') {
             sessionTarget.transparentBackgroundEnabled = XR_TRUE;
-            LOG_INFO("Transparent background ENABLED (DISPLAYXR_TRANSPARENT_BG=1)");
+            LOG_INFO("Transparent background ENABLED (default; DISPLAYXR_TRANSPARENT_BG=0 opts out)");
         }
     }
 
