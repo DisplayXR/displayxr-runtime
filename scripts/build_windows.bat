@@ -295,6 +295,15 @@ if exist "%REPO%test_apps\cube_handle_d3d12_win\CMakeLists.txt" (
     if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_handle_d3d12_win\build\" >nul
 )
 
+:: cube_zones_d3d12_win (#672 — native-D3D12 zones ARRAY/SPI-stereo repro app)
+if exist "%REPO%test_apps\cube_zones_d3d12_win\CMakeLists.txt" (
+    echo --- cube_zones_d3d12_win ---
+    cmake -S "%REPO%\test_apps\cube_zones_d3d12_win" -B "%REPO%\test_apps\cube_zones_d3d12_win\build" -G Ninja ^
+        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
+    cmake --build "%REPO%\test_apps\cube_zones_d3d12_win\build" || set TESTAPP_FAILED=1
+    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_zones_d3d12_win\build\" >nul
+)
+
 :: cube_handle_gl_win
 if exist "%REPO%test_apps\cube_handle_gl_win\CMakeLists.txt" (
     echo --- cube_handle_gl_win ---
@@ -457,7 +466,7 @@ for %%A in (cube_zones_texture_vk_win) do (
 :: Non-Vulkan zones app — disable VK implicit layers (no app VkInstance) AND set
 :: the zones dev gate so the runtime advertises XR_EXT_display_zones (#613). NOT
 :: in the generic loop above, which omits the zones gate.
-for %%A in (cube_zones_texture_d3d12_win cube_zones_gl_win cube_zones_texture_gl_win) do (
+for %%A in (cube_zones_d3d12_win cube_zones_texture_d3d12_win cube_zones_gl_win cube_zones_texture_gl_win) do (
     if exist "%REPO%test_apps\%%A\build\%%A.exe" (
         > "%PKG%\run_%%A.bat" (
             echo @echo off
