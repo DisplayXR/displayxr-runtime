@@ -1281,6 +1281,117 @@ d3d12_compositor_capture_atlas_to_png(struct comp_d3d12_compositor *c, const cha
 	return ok;
 }
 
+// #672 diag: capture the WOVEN back buffer (post-DP output) to PNG. Unlike the
+// atlas capture (pre-weave), this shows what the display processor actually
+// produced — the interlaced panel image — so a zone dropped by the WEAVE (not
+// by compositing) is visible. File-triggered: touch %TEMP%\dxr_woven_trigger,
+// output %TEMP%\dxr_woven.png. back_buffer must be in PRESENT state on entry
+// (post-Present); left in PRESENT on exit.
+static bool
+d3d12_capture_backbuffer_to_png(struct comp_d3d12_compositor *c,
+                                ID3D12Resource *back_buffer,
+                                const char *path)
+{
+	if (back_buffer == nullptr || c->device == nullptr) {
+		return false;
+	}
+	D3D12_RESOURCE_DESC bd = back_buffer->GetDesc();
+	uint32_t w = (uint32_t)bd.Width, h = (uint32_t)bd.Height;
+	bool bgra = (bd.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+	             bd.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+
+	const UINT64 align = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+	UINT64 row_pitch = ((UINT64)w * 4 + align - 1) & ~(align - 1);
+	UINT64 rb_bytes = row_pitch * h;
+
+	D3D12_HEAP_PROPERTIES heap_props = {};
+	heap_props.Type = D3D12_HEAP_TYPE_READBACK;
+	D3D12_RESOURCE_DESC rb_desc = {};
+	rb_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	rb_desc.Width = rb_bytes;
+	rb_desc.Height = 1;
+	rb_desc.DepthOrArraySize = 1;
+	rb_desc.MipLevels = 1;
+	rb_desc.Format = DXGI_FORMAT_UNKNOWN;
+	rb_desc.SampleDesc.Count = 1;
+	rb_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+	ID3D12Resource *readback = nullptr;
+	if (FAILED(c->device->CreateCommittedResource(
+	        &heap_props, D3D12_HEAP_FLAG_NONE, &rb_desc,
+	        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+	        IID_PPV_ARGS(&readback))) || readback == nullptr) {
+		return false;
+	}
+
+	c->cmd_allocator->Reset();
+	c->cmd_list->Reset(c->cmd_allocator, nullptr);
+
+	D3D12_RESOURCE_BARRIER b = {};
+	b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	b.Transition.pResource = back_buffer;
+	b.Transition.Subresource = 0;
+	b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+	b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	c->cmd_list->ResourceBarrier(1, &b);
+
+	D3D12_TEXTURE_COPY_LOCATION src_loc = {};
+	src_loc.pResource = back_buffer;
+	src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	src_loc.SubresourceIndex = 0;
+	D3D12_TEXTURE_COPY_LOCATION dst_loc = {};
+	dst_loc.pResource = readback;
+	dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	dst_loc.PlacedFootprint.Footprint.Format = bd.Format;
+	dst_loc.PlacedFootprint.Footprint.Width = w;
+	dst_loc.PlacedFootprint.Footprint.Height = h;
+	dst_loc.PlacedFootprint.Footprint.Depth = 1;
+	dst_loc.PlacedFootprint.Footprint.RowPitch = (UINT)row_pitch;
+	D3D12_BOX src_box = {0, 0, 0, w, h, 1};
+	c->cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &src_box);
+
+	std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+	c->cmd_list->ResourceBarrier(1, &b);
+	c->cmd_list->Close();
+	ID3D12CommandList *lists[] = {c->cmd_list};
+	c->command_queue->ExecuteCommandLists(1, lists);
+	gpu_wait_idle(c);
+
+	bool ok = false;
+	void *mapped = nullptr;
+	D3D12_RANGE read_range = {0, (SIZE_T)rb_bytes};
+	if (SUCCEEDED(readback->Map(0, &read_range, &mapped)) && mapped != nullptr) {
+		size_t tight_pitch = (size_t)w * 4;
+		uint8_t *tight = (uint8_t *)malloc(tight_pitch * h);
+		if (tight != nullptr) {
+			const uint8_t *rb = (const uint8_t *)mapped;
+			for (uint32_t y = 0; y < h; y++) {
+				memcpy(tight + (size_t)y * tight_pitch,
+				       rb + (size_t)y * row_pitch, tight_pitch);
+			}
+			if (bgra) {
+				for (size_t i = 0; i < (size_t)w * h; i++) {
+					uint8_t t = tight[i * 4 + 0];
+					tight[i * 4 + 0] = tight[i * 4 + 2];
+					tight[i * 4 + 2] = t;
+				}
+			}
+			// #672: keep real alpha when DXR_CAPTURE_KEEP_ALPHA is set, so a
+			// zone the post-weave alpha-gate wrongly zeroed (→ transparent →
+			// invisible on panel) is distinguishable from opaque woven content.
+			if (getenv("DXR_CAPTURE_KEEP_ALPHA") == nullptr) {
+				u_image_force_opaque_rgba8(tight, w, h, tight_pitch);
+			}
+			ok = stbi_write_png(path, (int)w, (int)h, 4, tight, (int)tight_pitch) != 0;
+			free(tight);
+		}
+		D3D12_RANGE empty = {0, 0};
+		readback->Unmap(0, &empty);
+	}
+	readback->Release();
+	return ok;
+}
+
 // Run the capture readback if the per-frame intent matches @p mode_filter.
 static void
 d3d12_compositor_dispatch_capture(struct comp_d3d12_compositor *c, uint32_t mode_filter)
@@ -2011,6 +2122,26 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// DP path returns early; mirror the fallback path's call site so the
 		// capture surface works regardless of which weave path ran.
 		d3d12_compositor_dispatch_capture(c, MCP_CAPTURE_MODE_POST_COMPOSE);
+
+		// #672 diag: file-triggered WOVEN back-buffer capture (post-DP). Shows
+		// the actual panel image, so a zone dropped by the weave is visible.
+		{
+			const char *tmp = getenv("TEMP");
+			if (tmp != nullptr) {
+				char trig[512];
+				snprintf(trig, sizeof(trig), "%s\\dxr_woven_trigger", tmp);
+				FILE *tf = fopen(trig, "rb");
+				if (tf != nullptr) {
+					fclose(tf);
+					remove(trig);
+					char out[512];
+					snprintf(out, sizeof(out), "%s\\dxr_woven.png", tmp);
+					bool wok = d3d12_capture_backbuffer_to_png(c, back_buffer, out);
+					U_LOG_W("#672 woven back-buffer capture %s -> %s",
+					        wok ? "OK" : "FAILED", out);
+				}
+			}
+		}
 
 		return XRT_SUCCESS;
 	}
