@@ -140,6 +140,11 @@ shell_capture*.png
 # just a local backup / working copy. NEVER commit its contents.
 .secrets/
 
+# Local, per-device config (signing endpoints, dev overrides). Machine-
+# specific and may hold connection details — never commit.
+.env.local
+.env*.local
+
 # Leia CNSDK plug-in binaries dropped into the runtime APK jniLibs by
 # displayxr-leia-plugin's build-android.sh (vendor build artifacts, #499).
 src/xrt/targets/openxr_android/src/main/jniLibs/
