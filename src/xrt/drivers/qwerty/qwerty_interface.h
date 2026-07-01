@@ -125,6 +125,20 @@ qwerty_process_macos(struct xrt_device **xdevs,
                      void *ns_event_ptr);
 #endif
 
+#if defined(__linux__) && !defined(__ANDROID__)
+/*!
+ * Process an X11 XEvent (key/button/motion) from the runtime's compositor
+ * window and drive the qwerty HMD (camera) + display/rendering-mode toggles.
+ * Desktop-Linux equivalent of qwerty_process_win32 / qwerty_process_macos.
+ *
+ * @param xevent_ptr An XEvent* cast to void* (avoids leaking Xlib headers here).
+ *
+ * @ingroup drv_qwerty
+ */
+void
+qwerty_process_xlib(struct xrt_device **xdevs, size_t xdev_count, void *xevent_ptr);
+#endif
+
 /*!
  * Create all qwerty devices.
  *

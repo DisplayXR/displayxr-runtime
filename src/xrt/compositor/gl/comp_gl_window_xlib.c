@@ -96,7 +96,8 @@ comp_gl_window_xlib_create(void *app_display,
 	swa.colormap = cmap;
 	swa.background_pixel = 0;
 	swa.border_pixel = 0;
-	swa.event_mask = StructureNotifyMask | KeyPressMask;
+	swa.event_mask = StructureNotifyMask | KeyPressMask | KeyReleaseMask |
+	                 ButtonPressMask | ButtonReleaseMask | PointerMotionMask;
 
 	Window win = XCreateWindow(dpy, root, 0, 0, width, height, 0, vi->depth,
 	                           InputOutput, vi->visual,
@@ -275,6 +276,23 @@ comp_gl_window_xlib_is_valid(struct comp_gl_window_xlib *win)
 	}
 	pump(win);
 	return win->valid;
+}
+
+void
+comp_gl_window_xlib_pump_input(struct comp_gl_window_xlib *win,
+                               comp_gl_window_xlib_input_cb cb,
+                               void *ctx)
+{
+	if (win == NULL || win->dpy == NULL || cb == NULL) {
+		return;
+	}
+	const long mask = KeyPressMask | KeyReleaseMask | ButtonPressMask |
+	                  ButtonReleaseMask | PointerMotionMask;
+	XEvent ev;
+	// Only this window's input events — leaves the app's (on the shared Display) alone.
+	while (XCheckWindowEvent(win->dpy, win->window, mask, &ev)) {
+		cb(ctx, &ev);
+	}
 }
 
 void

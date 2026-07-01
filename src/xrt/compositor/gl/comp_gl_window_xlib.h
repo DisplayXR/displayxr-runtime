@@ -112,6 +112,20 @@ comp_gl_window_xlib_get_screen_position(struct comp_gl_window_xlib *win,
 bool
 comp_gl_window_xlib_is_valid(struct comp_gl_window_xlib *win);
 
+//! Callback for a captured input XEvent (passed as void* to avoid Xlib headers
+//! in the caller). @p ctx is the value handed to comp_gl_window_xlib_pump_input.
+typedef void (*comp_gl_window_xlib_input_cb)(void *ctx, void *xevent);
+
+/*!
+ * Drain this window's pending keyboard/mouse events and hand each to @p cb.
+ * Only events for the compositor's own window are pulled (the app's Display is
+ * shared), so the app's own events are never consumed. Call once per frame.
+ */
+void
+comp_gl_window_xlib_pump_input(struct comp_gl_window_xlib *win,
+                               comp_gl_window_xlib_input_cb cb,
+                               void *ctx);
+
 /*!
  * Destroy the window helper and release resources. Does NOT close the borrowed
  * app Display connection.

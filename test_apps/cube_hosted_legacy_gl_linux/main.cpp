@@ -580,9 +580,11 @@ static void RenderScene(GLRenderer &r, GLuint targetTex, uint32_t targetW, uint3
         // --- Draw cube ---
         {
             float model[16], rotation[16], translation[16], scale[16], tmp[16];
-            mat4_scaling(scale, 0.3f);
+            mat4_scaling(scale, 0.4f);
             mat4_rotation_y(rotation, r.cubeRotation);
-            mat4_translation(translation, 0.0f, 1.6f, -2.0f);
+            // At the qwerty HMD's default eye height (y=1.6) so it's centered in
+            // view; WASDQE/arrows/RMB then fly the camera around it.
+            mat4_translation(translation, 0.0f, 1.6f, -1.5f);
             mat4_multiply(tmp, rotation, scale);
             mat4_multiply(model, translation, tmp);
 

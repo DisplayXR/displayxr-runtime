@@ -306,7 +306,13 @@ option_with_deps(XRT_INSTALL_SYSTEMD_UNIT_FILES "Install user unit files for sys
 option_with_deps(XRT_INSTALL_ABSOLUTE_SYSTEMD_UNIT_FILES "Use an absolute path to monado-system in installed user unit files for systemd socket activation" DEPENDS XRT_HAVE_SYSTEMD)
 
 # Drivers to build
-option_with_deps(XRT_BUILD_DRIVER_QWERTY "Enable Qwerty driver" DEPENDS "XRT_HAVE_SDL2 OR WIN32 OR APPLE")
+# option_with_deps forbids parens/AND in a DEPENDS item, so precompute the
+# desktop-Linux+X11 case (native GL compositor drives qwerty via qwerty_xlib, #660).
+set(XRT_QWERTY_LINUX_X11 OFF)
+if(XRT_HAVE_LINUX AND X11_FOUND AND NOT ANDROID)
+	set(XRT_QWERTY_LINUX_X11 ON)
+endif()
+option_with_deps(XRT_BUILD_DRIVER_QWERTY "Enable Qwerty driver" DEPENDS "XRT_HAVE_SDL2 OR WIN32 OR APPLE OR XRT_QWERTY_LINUX_X11")
 set(XRT_IPC_MSG_SOCK_FILENAME displayxr_comp_ipc CACHE STRING "Service socket filename")
 set(XRT_IPC_SERVICE_PID_FILENAME displayxr.pid CACHE STRING "Service pidfile filename")
 set(XRT_OXR_RUNTIME_SUFFIX displayxr CACHE STRING "OpenXR client library suffix")

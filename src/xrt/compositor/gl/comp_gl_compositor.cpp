@@ -2781,10 +2781,30 @@ gl_compute_effective_layout(struct comp_gl_compositor *c)
 	}
 }
 
+#if defined(XRT_OS_LINUX) && defined(XRT_BUILD_DRIVER_QWERTY)
+// Forward one captured X11 input event from the compositor window to the qwerty
+// devices (WASDQE camera + RMB look + V/1/2/3 mode hotkeys). See comp_gl_window_xlib.
+static void
+gl_xlib_input_forward(void *ctx, void *xevent)
+{
+	struct comp_gl_compositor *c = (struct comp_gl_compositor *)ctx;
+	if (c->xsysd != NULL) {
+		qwerty_process_xlib(c->xsysd->xdevs, c->xsysd->xdev_count, xevent);
+	}
+}
+#endif
+
 static xrt_result_t
 gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
 	struct comp_gl_compositor *c = gl_comp(xc);
+
+#if defined(XRT_OS_LINUX) && defined(XRT_BUILD_DRIVER_QWERTY)
+	// Drain this frame's keyboard/mouse from the compositor window into qwerty.
+	if (c->xlib_window != NULL && c->xsysd != NULL) {
+		comp_gl_window_xlib_pump_input(c->xlib_window, gl_xlib_input_forward, c);
+	}
+#endif
 
 	// Capture-intent poll — see u_capture_intent.h. Consumed at the
 	// projection-done boundary (PROJECTION_ONLY) or end of frame

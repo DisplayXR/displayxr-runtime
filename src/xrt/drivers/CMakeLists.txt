@@ -31,6 +31,12 @@ if(XRT_BUILD_DRIVER_QWERTY)
 		list(APPEND QWERTY_SOURCES qwerty/qwerty_macos.m)
 	endif()
 
+	# On desktop Linux, add the X11 input handler for the native GL compositor
+	# window (WASDQE camera + RMB look + V/1/2/3 mode hotkeys). (#660)
+	if(XRT_HAVE_LINUX AND NOT ANDROID AND X11_FOUND)
+		list(APPEND QWERTY_SOURCES qwerty/qwerty_xlib.c)
+	endif()
+
 	add_library(drv_qwerty STATIC ${QWERTY_SOURCES})
 	# aux_math (PUBLIC displayxr::math_xrt) provides the canonical rig converters
 	# (dxr_view_rig_*) + dxr_view_math.h, used by the qwerty V-toggle to switch
@@ -41,6 +47,9 @@ if(XRT_BUILD_DRIVER_QWERTY)
 	endif()
 	if(APPLE)
 		target_link_libraries(drv_qwerty PRIVATE "-framework Cocoa" "-framework Carbon")
+	endif()
+	if(XRT_HAVE_LINUX AND NOT ANDROID AND X11_FOUND)
+		target_link_libraries(drv_qwerty PRIVATE X11::X11)
 	endif()
 	list(APPEND ENABLED_DRIVERS qwerty)
 
