@@ -394,6 +394,15 @@ if exist "%REPO%test_apps\cube_zones_texture_vk_win\CMakeLists.txt" (
     if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_zones_texture_vk_win\build\" >nul
 )
 
+:: cube_zones_vk_win (#673 — native-Vulkan zones ARRAY/SPI-stereo app; needs Vulkan SDK)
+if exist "%REPO%test_apps\cube_zones_vk_win\CMakeLists.txt" (
+    echo --- cube_zones_vk_win ---
+    cmake -S "%REPO%\test_apps\cube_zones_vk_win" -B "%REPO%\test_apps\cube_zones_vk_win\build" -G Ninja ^
+        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
+    cmake --build "%REPO%\test_apps\cube_zones_vk_win\build" || set TESTAPP_FAILED=1
+    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_zones_vk_win\build\" >nul
+)
+
 :: windowspace_handle_vk_win (#389, needs Vulkan SDK)
 if exist "%REPO%test_apps\windowspace_handle_vk_win\CMakeLists.txt" (
     echo --- windowspace_handle_vk_win ---
@@ -451,8 +460,8 @@ for %%A in (cube_handle_vk_win windowspace_handle_vk_win) do (
     )
 )
 :: Vulkan zones app — implicit layers enabled (app owns its VkInstance) AND the
-:: zones dev gate set so the runtime advertises XR_EXT_display_zones (#613).
-for %%A in (cube_zones_texture_vk_win) do (
+:: zones dev gate set so the runtime advertises XR_EXT_display_zones (#613/#673).
+for %%A in (cube_zones_texture_vk_win cube_zones_vk_win) do (
     if exist "%REPO%test_apps\%%A\build\%%A.exe" (
         > "%PKG%\run_%%A.bat" (
             echo @echo off
