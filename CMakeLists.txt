@@ -208,6 +208,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	if(PKGCONFIG_FOUND)
 		pkg_check_modules(XCB xcb xcb-randr x11-xcb)
 	endif()
+	# X11 (Xlib) for the native GL compositor's GLX present path (Phase 1b-GL).
+	# GLX itself comes from find_package(OpenGL) above (OpenGL::GLX /
+	# OpenGL_GLX_FOUND). Not REQUIRED — a headless/GL-less box still builds.
+	find_package(X11)
 endif()
 
 # This one is named differently because that's what CTest uses

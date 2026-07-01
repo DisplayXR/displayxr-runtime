@@ -3118,8 +3118,40 @@ oxr_session_create_impl(struct oxr_logger *log,
 		}
 
 		OXR_SESSION_ALLOCATE_AND_INIT(log, sys, OXR_SESSION_GRAPHICS_EXT_XLIB_GL, *out_session);
+
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+		// Desktop Linux: route GL apps through the native GL compositor (Xlib/GLX,
+		// bypasses Vulkan). The compositor's GLX context shares the app's context
+		// so it samples swapchain textures directly — no external-memory FD interop
+		// (what makes the software/llvmpipe path viable). Mirrors the Win32 path.
+		if (oxr_gl_native_compositor_supported(sys)) {
+			xrt_result_t xret = xrt_system_create_session(sys->xsys, xsi, &(*out_session)->xs, NULL);
+			if (xret == XRT_ERROR_MULTI_SESSION_NOT_IMPLEMENTED) {
+				return oxr_error(log, XR_ERROR_LIMIT_REACHED, "Per instance multi-session not supported.");
+			}
+			if (xret != XRT_SUCCESS) {
+				return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "Failed to create xrt_session! '%i'", xret);
+			}
+			// Hosted class: window_handle NULL → the compositor self-creates the
+			// X11/GLX window. gl_context = app's GLXContext, gl_display = xDisplay.
+			return oxr_session_populate_gl_native(log, sys, NULL,
+			                                      (void *)opengl_xlib->glxContext,
+			                                      (void *)opengl_xlib->xDisplay,
+			                                      NULL /*shared_texture*/,
+			                                      xsi->transparent_background_enabled,
+			                                      *out_session);
+		}
+#endif
+
+#ifdef XRT_HAVE_GL_XLIB_CLIENT
+		// Legacy Monado GLX client path (shares via GL_EXT_memory_object_fd).
 		OXR_CREATE_XRT_SESSION_AND_NATIVE_COMPOSITOR(log, xsi, *out_session);
 		return oxr_session_populate_gl_xlib(log, sys, opengl_xlib, *out_session);
+#else
+		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
+		                 "GL native compositor unavailable (OXR_ENABLE_GL_NATIVE_COMPOSITOR=0) and the "
+		                 "legacy GLX client compositor is not built on this runtime");
+#endif
 	}
 #endif
 

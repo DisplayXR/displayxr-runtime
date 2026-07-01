@@ -186,4 +186,37 @@ EOF
   echo ""
   echo "Built $APP. Run on a Linux box with a GPU + display:"
   echo "  $RUN"
+
+  # Step 5d: hosted (legacy) OpenGL cube — native GL compositor + GLX present
+  # (Phase 1b-GL). Unlike the VK path, the GL compositor shares the app's GL
+  # context (no external-memory FD interop), so it runs on SOFTWARE GL (llvmpipe)
+  # under WSLg — the run script defaults LIBGL_ALWAYS_SOFTWARE=1 for that case.
+  GLAPP=cube_hosted_legacy_gl_linux
+  GLAPP_DIR="$ROOT/test_apps/$GLAPP"
+  echo "=== Building $GLAPP ==="
+  cmake -B "$GLAPP_DIR/build" -S "$GLAPP_DIR" -G Ninja \
+    -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
+  cmake --build "$GLAPP_DIR/build"
+
+  GLRUN="$BUILD_DIR/run_${GLAPP}.sh"
+  cat > "$GLRUN" <<EOF
+#!/bin/bash
+# Run $GLAPP against the dev runtime build. Hosted: the runtime self-creates the
+# X11/GLX window, so this needs a running X server (DISPLAY set). Because the GL
+# compositor shares the app's GL context (no external-memory interop), it runs on
+# SOFTWARE GL — LIBGL_ALWAYS_SOFTWARE=1 forces llvmpipe (unset it for a real GPU).
+# OXR_ENABLE_GL_NATIVE_COMPOSITOR=1 selects the native GL compositor path.
+export XR_RUNTIME_JSON="$BUILD_DIR/openxr_displayxr-dev.json"
+export LD_LIBRARY_PATH="$OPENXR_DIR/lib:\${LD_LIBRARY_PATH:-}"
+export XRT_PLUGIN_SEARCH_PATH="$PLUGIN_DIR"
+export OXR_ENABLE_GL_NATIVE_COMPOSITOR="\${OXR_ENABLE_GL_NATIVE_COMPOSITOR:-1}"
+export LIBGL_ALWAYS_SOFTWARE="\${LIBGL_ALWAYS_SOFTWARE:-1}"
+export SIM_DISPLAY_OUTPUT="\${SIM_DISPLAY_OUTPUT:-anaglyph}"
+exec "$GLAPP_DIR/build/$GLAPP" "\$@"
+EOF
+  chmod +x "$GLRUN"
+  echo ""
+  echo "Built $GLAPP. Run on a Linux box with an X server (software GL OK):"
+  echo "  $GLRUN"
 fi

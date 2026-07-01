@@ -37,6 +37,11 @@ target_include_directories(comp_gl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../aux
 if(APPLE)
 	target_compile_definitions(comp_gl PRIVATE GL_SILENCE_DEPRECATION)
 	target_sources(comp_gl PRIVATE comp_gl_window_macos.h comp_gl_window_macos.m)
+elseif(XRT_HAVE_LINUX AND NOT ANDROID AND X11_FOUND AND OpenGL_GLX_FOUND)
+	# Desktop Linux (X11/GLX) native GL present path — self-created window whose
+	# GLX context shares the app's context (no external-memory FD interop, so it
+	# runs on software/llvmpipe). See docs/roadmap/linux-support.md (Phase 1b-GL).
+	target_sources(comp_gl PRIVATE comp_gl_window_xlib.h comp_gl_window_xlib.c)
 endif()
 
 # Platform-specific linking
@@ -48,6 +53,8 @@ if(WIN32)
 		)
 elseif(APPLE)
 	target_link_libraries(comp_gl PRIVATE "-framework OpenGL" "-framework Cocoa" "-framework IOSurface")
+elseif(XRT_HAVE_LINUX AND NOT ANDROID AND X11_FOUND AND OpenGL_GLX_FOUND)
+	target_link_libraries(comp_gl PRIVATE OpenGL::GL OpenGL::GLX X11::X11)
 endif()
 
 # Qwerty include path for runtime-side 2D/3D toggle polling

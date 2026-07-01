@@ -33,6 +33,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if !defined(XRT_OS_WINDOWS) && !defined(__APPLE__)
+// Desktop Linux: this plug-in .so carries its own copy of the GLAD dispatch
+// table (aux_ogl/xrt-external-glad is an INTERFACE lib compiled into every
+// consumer) and is dlopen'd RTLD_LOCAL, so the runtime's gladLoad never reaches
+// it. Load our copy from the current GLX context before any gl* call. (#660)
+extern void (*glXGetProcAddressARB(const unsigned char *procName))(void);
+static GLADapiproc
+sim_gl_glad_loader(void *userptr, const char *name)
+{
+	(void)userptr;
+	return (GLADapiproc)glXGetProcAddressARB((const unsigned char *)name);
+}
+#endif
+
 DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_nominal_z_m_gl, "SIM_DISPLAY_NOMINAL_Z_M", 0.60f)
 
 
@@ -554,6 +568,16 @@ sim_display_processor_gl_create(enum sim_display_output_mode mode,
 	if (sdp == NULL) {
 		return XRT_ERROR_ALLOCATION;
 	}
+
+#if !defined(XRT_OS_WINDOWS) && !defined(__APPLE__)
+	// Load THIS .so's GLAD dispatch (see note at sim_gl_glad_loader). The caller
+	// (comp_gl compositor) has made a GL context current before invoking us.
+	if (gladLoadGLUserPtr(sim_gl_glad_loader, NULL) == 0) {
+		U_LOG_E("sim_display GL: gladLoadGLUserPtr failed — no current GLX context?");
+		free(sdp);
+		return XRT_ERROR_VULKAN;
+	}
+#endif
 
 	// ADR-020 rule 1: advertise the vtable size (calloc zeroed reserved_0).
 	sdp->base.struct_size = (uint32_t)sizeof(struct xrt_display_processor_gl);

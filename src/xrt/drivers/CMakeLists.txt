@@ -211,6 +211,13 @@ if(ANDROID OR XRT_HAVE_LINUX)
 		# Non-Android desktop GL build: the GL DP is compiled in, so it needs
 		# aux_ogl. (Headless Linux without GL skips this, matching the static lib.)
 		target_link_libraries(drv_sim_display_plugin PRIVATE aux_ogl)
+		if(NOT APPLE AND X11_FOUND AND OpenGL_GLX_FOUND)
+			# This plug-in .so carries its OWN GLAD dispatch table (aux_ogl is an
+			# INTERFACE lib compiled into every consumer) and is dlopen'd RTLD_LOCAL,
+			# so the runtime's gladLoad can't reach it — the GL DP self-loads GLAD
+			# via glXGetProcAddressARB, which needs GLX at link. (#660, Phase 1b-GL)
+			target_link_libraries(drv_sim_display_plugin PRIVATE OpenGL::GLX)
+		endif()
 	endif()
 else()
 	target_compile_definitions(drv_sim_display_plugin PRIVATE XRT_USING_RUNTIME_DLL)

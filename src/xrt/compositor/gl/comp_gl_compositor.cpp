@@ -88,6 +88,24 @@ static const IID IID_ID3D11Texture2D_local = {
 #include <OpenGL/OpenGL.h>
 #include <OpenGL/gl3.h>
 #include "comp_gl_window_macos.h"
+#elif defined(XRT_OS_LINUX)
+// Desktop Linux (X11/GLX). Android also defines XRT_OS_LINUX but is matched by
+// the earlier XRT_OS_ANDROID arm. GL entry points come via GLAD (exactly like
+// Windows) so ALL GL code in the process — compositor, sim_display DP, u_hud,
+// aux_ogl — shares one consistently-loaded dispatch table (loaded once in the
+// create path via gladLoadGLUserPtr). All GLX/Xlib lives in comp_gl_window_xlib.c
+// so its headers never leak their macros into this large TU; the only GLX symbol
+// referenced directly here is glXGetProcAddressARB, forward-declared for the
+// GLAD loader.
+#include "ogl/ogl_api.h"
+#include "comp_gl_window_xlib.h"
+extern "C" void (*glXGetProcAddressARB(const unsigned char *procName))(void);
+static GLADapiproc
+gl_xlib_glad_loader(void *userptr, const char *name)
+{
+	(void)userptr;
+	return (GLADapiproc)glXGetProcAddressARB((const unsigned char *)name);
+}
 #endif
 
 /*
@@ -304,6 +322,9 @@ struct comp_gl_compositor
 	GLuint iosurface_present_fbo;
 	uint32_t iosurface_width;
 	uint32_t iosurface_height;
+#elif defined(XRT_OS_LINUX)
+	struct comp_gl_window_xlib *xlib_window; //!< X11/GLX window helper (hosted)
+	bool owns_window;
 #endif
 
 	// --- Shared texture (D3D11 interop via WGL_NV_DX_interop2, Windows only) ---
@@ -1201,6 +1222,11 @@ gl_compositor_create_swapchain(struct xrt_compositor *xc,
 #elif defined(__APPLE__)
 	CGLContextObj prev_cgl_ctx = CGLGetCurrentContext();
 	comp_gl_window_macos_make_current(c->macos_window);
+#elif defined(XRT_OS_LINUX)
+	void *prev_glx_dpy = NULL, *prev_glx_ctx = NULL;
+	unsigned long prev_glx_draw = 0;
+	comp_gl_window_xlib_save_current(&prev_glx_dpy, &prev_glx_draw, &prev_glx_ctx);
+	comp_gl_window_xlib_make_current(c->xlib_window);
 #endif
 
 	uint32_t image_count = 3;
@@ -1276,6 +1302,8 @@ gl_compositor_create_swapchain(struct xrt_compositor *xc,
 	if (prev_cgl_ctx != NULL) {
 		CGLSetCurrentContext(prev_cgl_ctx);
 	}
+#elif defined(XRT_OS_LINUX)
+	comp_gl_window_xlib_restore_current(prev_glx_dpy, prev_glx_draw, prev_glx_ctx);
 #endif
 
 	return XRT_SUCCESS;
@@ -2794,6 +2822,11 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 #elif defined(__APPLE__)
 	CGLContextObj prev_cgl_ctx = CGLGetCurrentContext();
 	comp_gl_window_macos_make_current(c->macos_window);
+#elif defined(XRT_OS_LINUX)
+	void *prev_glx_dpy = NULL, *prev_glx_ctx = NULL;
+	unsigned long prev_glx_draw = 0;
+	comp_gl_window_xlib_save_current(&prev_glx_dpy, &prev_glx_draw, &prev_glx_ctx);
+	comp_gl_window_xlib_make_current(c->xlib_window);
 #endif
 
 	// Save and set GL state — the app may have left depth test, blend, etc. on
@@ -3440,6 +3473,8 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		}
 #elif defined(__APPLE__)
 		comp_gl_window_macos_get_dimensions(c->macos_window, &present_w, &present_h);
+#elif defined(XRT_OS_LINUX)
+		comp_gl_window_xlib_get_dimensions(c->xlib_window, &present_w, &present_h);
 #endif
 
 		// Bind the present target. Default WGL path: FBO 0 (window default
@@ -3552,6 +3587,8 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		// eglSwapBuffers(c->egl_display, c->egl_surface);
 #elif defined(__APPLE__)
 		comp_gl_window_macos_swap_buffers(c->macos_window);
+#elif defined(XRT_OS_LINUX)
+		comp_gl_window_xlib_swap_buffers(c->xlib_window);
 #endif
 	}
 
@@ -3611,6 +3648,8 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	if (prev_cgl_ctx != NULL) {
 		CGLSetCurrentContext(prev_cgl_ctx);
 	}
+#elif defined(XRT_OS_LINUX)
+	comp_gl_window_xlib_restore_current(prev_glx_dpy, prev_glx_draw, prev_glx_ctx);
 #endif
 
 	return XRT_SUCCESS;
@@ -3717,6 +3756,10 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	}
 	if (c->macos_window != NULL) {
 		comp_gl_window_macos_destroy(&c->macos_window);
+	}
+#elif defined(XRT_OS_LINUX)
+	if (c->xlib_window != NULL) {
+		comp_gl_window_xlib_destroy(&c->xlib_window);
 	}
 #endif
 
@@ -4397,6 +4440,60 @@ comp_gl_compositor_get_window_metrics(struct xrt_compositor *xc,
 
 	out_metrics->valid = true;
 	return true;
+#elif defined(XRT_OS_LINUX)
+	if (!c->sys_info_set || c->xlib_window == NULL) {
+		return false;
+	}
+
+	float disp_w_m = c->sys_info.display_width_m;
+	float disp_h_m = c->sys_info.display_height_m;
+	uint32_t disp_px_w = c->sys_info.display_pixel_width;
+	uint32_t disp_px_h = c->sys_info.display_pixel_height;
+	if (disp_px_w == 0 || disp_px_h == 0 || disp_w_m <= 0 || disp_h_m <= 0) {
+		return false;
+	}
+
+	uint32_t win_px_w = 0, win_px_h = 0;
+	comp_gl_window_xlib_get_dimensions(c->xlib_window, &win_px_w, &win_px_h);
+	if (win_px_w == 0 || win_px_h == 0) {
+		return false;
+	}
+
+	float pixel_size_x = disp_w_m / (float)disp_px_w;
+	float pixel_size_y = disp_h_m / (float)disp_px_h;
+
+	out_metrics->display_width_m = disp_w_m;
+	out_metrics->display_height_m = disp_h_m;
+	out_metrics->display_pixel_width = disp_px_w;
+	out_metrics->display_pixel_height = disp_px_h;
+	out_metrics->display_screen_left = 0;
+	out_metrics->display_screen_top = 0;
+
+	out_metrics->window_pixel_width = win_px_w;
+	out_metrics->window_pixel_height = win_px_h;
+
+	out_metrics->window_width_m = (float)win_px_w * pixel_size_x;
+	out_metrics->window_height_m = (float)win_px_h * pixel_size_y;
+
+	// Real on-screen position when available (window-relative 3D tracks window
+	// moves), else centred. Mirrors the VK native / macOS paths (#524).
+	float disp_center_px_x = (float)disp_px_w / 2.0f;
+	float disp_center_px_y = (float)disp_px_h / 2.0f;
+	float win_center_px_x = disp_center_px_x;
+	float win_center_px_y = disp_center_px_y;
+	int32_t win_left = 0, win_top = 0;
+	if (comp_gl_window_xlib_get_screen_position(c->xlib_window, &win_left, &win_top)) {
+		win_center_px_x = (float)win_left + (float)win_px_w / 2.0f;
+		win_center_px_y = (float)win_top + (float)win_px_h / 2.0f;
+	}
+	out_metrics->window_screen_left = win_left;
+	out_metrics->window_screen_top = win_top;
+
+	out_metrics->window_center_offset_x_m = (win_center_px_x - disp_center_px_x) * pixel_size_x;
+	out_metrics->window_center_offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
+
+	out_metrics->valid = true;
+	return true;
 #else
 	(void)c;
 	return false;
@@ -4438,6 +4535,10 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	HGLRC caller_hglrc = wglGetCurrentContext();
 #elif defined(__APPLE__)
 	CGLContextObj caller_cgl_ctx = CGLGetCurrentContext();
+#elif defined(XRT_OS_LINUX)
+	void *caller_glx_dpy = NULL, *caller_glx_ctx = NULL;
+	unsigned long caller_glx_draw = 0;
+	comp_gl_window_xlib_save_current(&caller_glx_dpy, &caller_glx_draw, &caller_glx_ctx);
 #endif
 
 	// Platform-specific context/window setup
@@ -4570,6 +4671,37 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		comp_gl_window_macos_make_current(c->macos_window);
 	}
 	(void)gl_display;
+#elif defined(XRT_OS_LINUX)
+	// Desktop Linux: self-create an X11/GLX window (hosted class). The
+	// compositor's GLX context SHARES the app's context (gl_context) on the
+	// app's Display (gl_display), so it samples the app's swapchain textures
+	// directly — no external-memory FD interop (what makes software/llvmpipe
+	// viable where the VK native path needs external_fd support).
+	(void)shared_texture_handle; // no GL shared-texture present path on Linux
+	{
+		xrt_result_t xret = comp_gl_window_xlib_create(
+		    gl_display, gl_context, width, height, &c->xlib_window);
+		if (xret != XRT_SUCCESS) {
+			free(c);
+			return XRT_ERROR_OPENGL;
+		}
+		c->owns_window = true;
+		if (!comp_gl_window_xlib_make_current(c->xlib_window)) {
+			U_LOG_E("GL/Xlib: failed to make compositor context current");
+			free(c);
+			return XRT_ERROR_OPENGL;
+		}
+		// Load the process-wide GLAD dispatch NOW (context is current) so the
+		// compositor, sim_display DP, u_hud and aux_ogl all resolve their gl*
+		// pointers. Without this every glad_gl* call is a NULL-pointer crash.
+		if (gladLoadGLUserPtr(gl_xlib_glad_loader, NULL) == 0) {
+			U_LOG_E("GL/Xlib: gladLoadGLUserPtr failed to load GL functions");
+			free(c);
+			return XRT_ERROR_OPENGL;
+		}
+		U_LOG_W("GL/Xlib: compositor context current + GLAD loaded (GL_VERSION=%s)",
+		        (const char *)glGetString(GL_VERSION));
+	}
 #else
 	(void)shared_texture_handle;
 #endif
@@ -4705,6 +4837,10 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	if (caller_cgl_ctx != NULL) {
 		CGLSetCurrentContext(caller_cgl_ctx);
 	}
+#elif defined(XRT_OS_LINUX)
+	// Restore the caller's context; if none was current, the app's own
+	// glXMakeCurrent on its render thread is authoritative, so leave it be.
+	comp_gl_window_xlib_restore_current(caller_glx_dpy, caller_glx_draw, caller_glx_ctx);
 #endif
 
 	U_LOG_W("Native OpenGL compositor created: %ux%u", width, height);

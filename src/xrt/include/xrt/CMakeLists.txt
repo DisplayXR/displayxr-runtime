@@ -44,7 +44,11 @@ if(XRT_HAVE_OPENGLES)
 	set(XR_USE_GRAPHICS_API_OPENGL_ES ON)
 endif()
 
-if(XRT_HAVE_OPENGL_GLX AND XRT_HAVE_XLIB)
+if((XRT_HAVE_OPENGL_GLX AND XRT_HAVE_XLIB)
+   OR (XRT_HAVE_LINUX AND NOT ANDROID AND X11_FOUND AND OpenGL_GLX_FOUND))
+	# Desktop-Linux native GL compositor uses the Xlib/GLX graphics binding
+	# (XrGraphicsBindingOpenGLXlibKHR). Enabled even though the legacy GLX client
+	# path (XRT_HAVE_OPENGL_GLX) stays removed. See docs/roadmap/linux-support.md.
 	set(XR_USE_PLATFORM_XLIB ON)
 endif()
 
