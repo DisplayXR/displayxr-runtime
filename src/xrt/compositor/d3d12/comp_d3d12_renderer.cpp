@@ -1570,12 +1570,21 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 			uint32_t tile_y = (tile_idx / layout->cols) * layout->tile_h;
 
 			if (draw_log) {
+				// #672 diag: DepthOrArraySize + array_index expose the
+				// SPI/array source path; zone rect exposes per-zone
+				// placement (a same-rect for two zones = a real collision).
 				U_LOG_W("D3D12 renderer: blit layer=%u view=%u, src=%p (%llux%u), "
-				        "sub_rect=(%.0f,%.0f %.0fx%.0f), tile=(%u,%u), view=%ux%u",
+				        "sub_rect=(%.0f,%.0f %.0fx%.0f), tile=(%u,%u), view=%ux%u, "
+				        "is_zone=%d arraySize=%u array_index=%u zone_rect=(%d,%d %dx%d)",
 				        li, vi, (void *)src_resource,
 				        (unsigned long long)src_desc.Width, (unsigned)src_desc.Height,
 				        src_x, src_y, src_w, src_h,
-				        tile_x, tile_y, layout->tile_w, layout->tile_h);
+				        tile_x, tile_y, layout->tile_w, layout->tile_h,
+				        (int)is_zone, (unsigned)src_desc.DepthOrArraySize, array_index,
+				        is_zone ? layer->data.zone_3d.rect.offset.w : 0,
+				        is_zone ? layer->data.zone_3d.rect.offset.h : 0,
+				        is_zone ? layer->data.zone_3d.rect.extent.w : 0,
+				        is_zone ? layer->data.zone_3d.rect.extent.h : 0);
 			}
 
 			// Mono content: clamp viewport to window dims (matching D3D11)
@@ -1636,6 +1645,21 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 			scissor.right = tile_x + vp_w;
 			scissor.bottom = tile_y + vp_h;
 			cmd_list->RSSetScissorRects(1, &scissor);
+
+			if (draw_log && is_zone) {
+				// #672 diag: the FINAL viewport is what actually places
+				// the zone in the shared tile — two zones with the same
+				// tile base but DIFFERENT final vp.x are correctly
+				// separated (no collision); identical final vp = real bug.
+				U_LOG_W("D3D12 renderer: zone layer=%u view=%u FINAL vp=(%.1f,%.1f %.1fx%.1f) "
+				        "scissor=(%ld,%ld..%ld,%ld) blend=%s",
+				        li, vi, vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height,
+				        (long)scissor.left, (long)scissor.top, (long)scissor.right,
+				        (long)scissor.bottom,
+				        (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT)
+				            ? "alpha"
+				            : "premul");
+			}
 
 			// Bind SRV and root constants, draw fullscreen quad
 			cmd_list->SetGraphicsRootDescriptorTable(0, gpu_srv);
