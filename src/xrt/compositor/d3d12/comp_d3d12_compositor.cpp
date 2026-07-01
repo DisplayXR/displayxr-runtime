@@ -1264,7 +1264,11 @@ d3d12_compositor_capture_atlas_to_png(struct comp_d3d12_compositor *c, const cha
 			}
 			// Swapchain alpha is undefined for display output — force opaque
 			// so the PNG doesn't render fully transparent/black (issue #425).
-			u_image_force_opaque_rgba8(tight, content_w, content_h, tight_pitch);
+			// #672 diag: DXR_CAPTURE_KEEP_ALPHA=1 preserves the real atlas
+			// alpha so transparency (zone bg / margins alpha=0) can be verified.
+			if (getenv("DXR_CAPTURE_KEEP_ALPHA") == nullptr) {
+				u_image_force_opaque_rgba8(tight, content_w, content_h, tight_pitch);
+			}
 			ok = stbi_write_png(path, (int)content_w, (int)content_h, 4,
 			                    tight, (int)tight_pitch) != 0;
 			free(tight);
