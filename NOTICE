@@ -1,0 +1,12 @@
+DisplayXR Runtime
+Copyright (c) 2024-2026 Leia, Inc. and the DisplayXR project contributors
+
+This software is a fork of Monado (https://monado.freedesktop.org/),
+Copyright (c) Collabora, Ltd. and the Monado contributors.
+
+The DisplayXR Runtime, including its Monado-derived portions, is licensed under
+the Boost Software License 1.0 (BSL-1.0); see the LICENSE file and the
+SPDX-License-Identifier header carried by each source file. Individual files may
+bear additional copyright notices and other permissive licenses (Apache-2.0,
+MIT, BSD-2-Clause, BSD-3-Clause, CC0-1.0, Zlib) as indicated in their headers and
+in the LICENSES/ directory.
