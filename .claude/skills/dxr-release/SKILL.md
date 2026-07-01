@@ -188,56 +188,74 @@ CI_CONC="${S#completed/}"
 ## PHASE 3.5: CODE-SIGN THE COMPONENT INSTALLER (capability-gated)
 
 Same model as the runtime's `/release` skill: GitHub-hosted CI builds the
-component **unsigned** (the code-signing key is held on a build machine and
-isn't available to cloud CI runners, and no secret lives in these public
-repos). A signed release is produced by a **local signed build on a
-signing-capable machine** that replaces the CI asset. No-ops cleanly without
-signing capability.
+component **unsigned** (no secret lives in these public repos). A signed
+release is produced by building on a Windows host and signing via the
+operator's configured capability, then replacing the CI asset. No-ops
+cleanly when nothing is configured.
 
 This matters most for **leia-plugin** — its vendor plug-in DLL is in the
 load path of every app that uses that display, so Smart App Control blocks
 it unsigned. Demos with Windows installers are next; `mcp` ships DLLs too.
 
-### Step 3.5.1: Capability check
+### Step 3.5.1: Resolve the signing method
+Two methods (both need a Windows host); neither names a signing endpoint in
+these repos:
+- **Remote** — `$DXR_SIGN_HOOK` (a local executable that signs a folder in place).
+- **Local** — `$SIGN_CMD` (a per-file signer the component's build honors).
+
 ```bash
-if [ -z "$SIGN_CMD" ] || ! uname -s | grep -qiE 'mingw|msys|cygwin|windows'; then
+WINHOST=$(uname -s | grep -qiE 'mingw|msys|cygwin|windows' && echo yes || echo no)
+if [ -n "$DXR_SIGN_HOOK" ] && [ -x "$DXR_SIGN_HOOK" ] && [ "$WINHOST" = yes ]; then
+  SIGN_METHOD=remote; SIGNED=yes
+elif [ -n "$SIGN_CMD" ] && [ "$WINHOST" = yes ]; then
+  SIGN_METHOD=local;  SIGNED=yes
+else
   echo "⚠  SIGNING SKIPPED for $COMPONENT — no signing capability here."
   echo "   Release ships the UNSIGNED CI installer. Re-run /dxr-release"
-  echo "   $COMPONENT $NEW_TAG on a signing-capable build machine (SIGN_CMD set)."
-  SIGNED=no   # continue — do not fail the release
-else
-  SIGNED=yes
+  echo "   $COMPONENT $NEW_TAG on a Windows build host with DXR_SIGN_HOOK or SIGN_CMD set."
+  SIGN_METHOD=none; SIGNED=no   # continue — do not fail the release
 fi
 ```
 
-### Step 3.5.2: Local signed build + asset replace (only if SIGNED=yes)
-Requires the component repo to carry the same `SIGN_CMD`-gated build
-plumbing as the runtime (sign inner binaries before NSIS, sign the
-installer, `!uninstfinalize` the uninstaller).
-
-**Plumbing status:** `leia-plugin` has it (`scripts/build-windows.bat`).
-Demos / `mcp` do not yet — for those, set `SIGNED=no` with a note and
-continue (track per #664).
+### Step 3.5.2: Build + sign + replace asset (only if SIGNED=yes)
+Requires the component repo to carry the `SIGN_CMD`-gated build plumbing
+(sign inner binaries before NSIS, sign the installer, `!uninstfinalize` the
+uninstaller). **Plumbing status:** `leia-plugin` has it
+(`scripts/build-windows.bat`); demos / `mcp` do not yet — for those set
+`SIGNED=no` and continue (track per #664).
 
 ```bash
 cd "$WORK/repo"
 git checkout "$NEW_TAG"
+
 # Component-specific build entry point (note the hyphen for leia-plugin).
 case "$COMPONENT" in
-  leia-plugin|leia) cmd //c "scripts\\build-windows.bat all" ;;
-  *) echo "No SIGN_CMD plumbing for $COMPONENT yet — skipping signing"; SIGNED=no ;;
+  leia-plugin|leia) SCRIPT="scripts\\build-windows.bat" ;;
+  *) echo "No signing plumbing for $COMPONENT yet — skipping"; SIGNED=no ;;
 esac
-SIGNED_EXE=$(ls _package/*Setup-*.exe 2>/dev/null | head -1)
-powershell -NoProfile -Command "(Get-AuthenticodeSignature '$SIGNED_EXE').Status" # must be 'Valid'
 
-CI_EXE=$(gh release view "$NEW_TAG" -R "$REPO" --json assets \
-           --jq '.assets[].name | select(test("Setup-.*\\.exe$"))')
-[ -n "$CI_EXE" ] && gh release delete-asset "$NEW_TAG" "$CI_EXE" --yes -R "$REPO"
-gh release upload "$NEW_TAG" "$SIGNED_EXE" --clobber -R "$REPO"
+if [ "$SIGNED" = yes ] && [ "$SIGN_METHOD" = remote ]; then
+  cmd //c "$SCRIPT build"                        # UNSIGNED (SIGN_CMD unset)
+  "$DXR_SIGN_HOOK" _package/bin                  # sign inner binaries in place, remotely
+  cmd //c "$SCRIPT installer"                    # NSIS packs the now-signed bins
+  mkdir -p _sign && cp _package/*Setup-*.exe _sign/ \
+    && "$DXR_SIGN_HOOK" _sign && cp _sign/*.exe _package/   # sign the installer .exe
+  # remote mode: NSIS uninstaller unsigned — see /release Step 4.5.2b caveat.
+elif [ "$SIGNED" = yes ]; then                   # SIGN_METHOD=local
+  cmd //c "$SCRIPT all"                          # full local signing incl. uninstaller
+fi
+
+if [ "$SIGNED" = yes ]; then
+  SIGNED_EXE=$(ls _package/*Setup-*.exe 2>/dev/null | head -1)
+  powershell -NoProfile -Command "(Get-AuthenticodeSignature '$SIGNED_EXE').Status" # must be 'Valid'
+  CI_EXE=$(gh release view "$NEW_TAG" -R "$REPO" --json assets \
+             --jq '.assets[].name | select(test("Setup-.*\\.exe$"))')
+  [ -n "$CI_EXE" ] && gh release delete-asset "$NEW_TAG" "$CI_EXE" --yes -R "$REPO"
+  gh release upload "$NEW_TAG" "$SIGNED_EXE" --clobber -R "$REPO"
+fi
 ```
 
-If a component has **no** SIGN_CMD plumbing yet, set `SIGNED=no` with a note
-naming the component, and continue. Never upload an unverified binary.
+Never upload an unverified binary. If verification isn't `Valid`, STOP.
 
 ---
 

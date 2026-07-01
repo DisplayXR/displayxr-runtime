@@ -302,57 +302,80 @@ user can audit at a glance.
 
 ## PHASE 4.5: CODE-SIGN THE WINDOWS INSTALLER (capability-gated)
 
-GitHub-hosted CI builds the installer **unsigned** — the code-signing key
-is held on a build machine and isn't available to cloud CI runners, and no
-cert/secret is kept in this public repo. So signed releases are produced by
-a **local signed build on a signing-capable machine** and that signed
-installer **replaces** the CI asset. This phase no-ops cleanly for anyone
-without signing capability (the release just ships the unsigned CI
-installer, exactly as before).
+GitHub-hosted CI builds the installer **unsigned** (no cert/secret is kept in
+this public repo). A signed release is produced by building on a Windows host
+and signing via whatever capability the operator's environment provides, then
+**replacing** the CI asset. This phase no-ops cleanly when no signing is
+configured (the release ships the unsigned CI installer, exactly as before).
 
-Why the installer must be rebuilt locally rather than re-signed in place:
-SAC checks the **DLLs extracted from the installer at load time**, so the
-inner binaries must be signed **before** NSIS packs them. You cannot fix
-that by re-signing the finished `.exe` — hence a full local signed build.
+Why the installer is (re)built rather than re-signed in place: SAC checks the
+**DLLs extracted from the installer at load time**, so the inner binaries must
+be signed **before** NSIS packs them — you can't fix that by re-signing the
+finished `.exe`.
 
-### Step 4.5.1: Capability check
-The gate is the `SIGN_CMD` environment variable, which is set **only** on
-a signing-capable Windows build machine, where `SIGN_CMD` points at the
-configured code-signing tool. It is the same variable `build_windows.bat`
-honors.
+### Step 4.5.1: Resolve the signing method
+Two methods, resolved in order. **Both require a Windows host** (the installer
+build needs MSVC + NSIS). Neither puts any signing endpoint or secret in this
+repo — the operator's environment supplies it.
+
+- **Remote** — `$DXR_SIGN_HOOK` points at a local, operator-provided executable
+  that signs a *folder of binaries in place*. It encapsulates the signing
+  endpoint (this repo names nothing). Use when the build host has no local
+  signer of its own.
+- **Local** — `$SIGN_CMD` is a per-file signer available on the build host
+  (the variable `build_windows.bat` honors).
 
 ```bash
-# Must be a Windows host AND have SIGN_CMD set.
-if [ -z "$SIGN_CMD" ] || ! uname -s | grep -qiE 'mingw|msys|cygwin|windows'; then
-  echo "⚠  SIGNING SKIPPED — no signing capability on this machine."
-  echo "   The release will ship the UNSIGNED CI installer. To produce a"
-  echo "   signed installer, re-run /release on a signing-capable build"
-  echo "   machine (where SIGN_CMD is set)."
-  SIGNED=no
-  # Continue to Phase 5 — do NOT fail the release.
+WINHOST=$(uname -s | grep -qiE 'mingw|msys|cygwin|windows' && echo yes || echo no)
+if [ -n "$DXR_SIGN_HOOK" ] && [ -x "$DXR_SIGN_HOOK" ] && [ "$WINHOST" = yes ]; then
+  SIGN_METHOD=remote; SIGNED=yes
+elif [ -n "$SIGN_CMD" ] && [ "$WINHOST" = yes ]; then
+  SIGN_METHOD=local;  SIGNED=yes
 else
-  SIGNED=yes
+  echo "⚠  SIGNING SKIPPED — no signing capability on this machine."
+  echo "   The release will ship the UNSIGNED CI installer. To sign, re-run"
+  echo "   /release on a Windows build host with either DXR_SIGN_HOOK (remote)"
+  echo "   or SIGN_CMD (local) configured."
+  SIGN_METHOD=none; SIGNED=no
 fi
 ```
 
 If `SIGNED=no`, skip straight to Phase 5 and carry the warning into the
 final report.
 
-### Step 4.5.2: Local signed build (only if SIGNED=yes)
-Build the runtime + installer locally at the tagged commit. With
-`SIGN_CMD` set, `build_windows.bat` signs every inner binary before NSIS
-packs them, signs the installer `.exe`, and the `.nsi` signs the embedded
-uninstaller — the whole chain.
-
+Always build the exact released commit first:
 ```bash
 git fetch --tags --quiet
-git checkout [FULL_TAG]            # build the exact released commit
+git checkout [FULL_TAG]
+```
+
+### Step 4.5.2a: Local signed build (SIGN_METHOD=local)
+With `SIGN_CMD` set, `build_windows.bat` signs every inner binary before NSIS
+packs them, signs the installer `.exe`, and the `.nsi` signs the embedded
+uninstaller — the whole chain.
+```bash
 cmd //c "scripts\\build_windows.bat all"
 ```
 
+### Step 4.5.2b: Remote signed build via the hook (SIGN_METHOD=remote)
+Build unsigned, sign the inner binaries through the hook (one batch), then let
+NSIS pack the now-signed binaries, and finally sign the installer `.exe`:
+```bash
+cmd //c "scripts\\build_windows.bat build"      # _package\bin, UNSIGNED (SIGN_CMD unset)
+"$DXR_SIGN_HOOK" _package/bin                    # sign inner binaries in place, remotely
+cmd //c "scripts\\build_windows.bat installer"   # NSIS packs the now-signed bins
+mkdir -p _sign && cp _package/DisplayXRSetup-*.exe _sign/ \
+  && "$DXR_SIGN_HOOK" _sign && cp _sign/*.exe _package/   # sign the installer .exe
+```
+**Remote-mode caveat:** the NSIS **uninstaller** is *not* signed in this mode
+(its `!uninstfinalize` needs a local per-file `SIGN_CMD` during makensis; the
+hook is per-folder/out-of-process). The uninstaller isn't in the app load
+path, so this is an accepted interim gap — use the **local** `SIGN_CMD` method
+for full-fidelity signing including the uninstaller. Note it in the report.
+
+### Step 4.5.2c: Verify the installer signature
 The signed installer lands at `_package\DisplayXRSetup-[VERSION].*.exe`
-(local build number, so the filename may differ from CI's). Verify the
-signature actually took:
+(local build number, so the filename may differ from CI's). Verify:
 
 ```bash
 SIGNED_EXE=$(ls _package/DisplayXRSetup-*.exe | head -1)
@@ -381,11 +404,10 @@ Restore the working tree afterwards: `git checkout main`.
 This phase signs **only the runtime installer**. The vendor plug-in,
 the Unity plug-in, demos, and the shell are signed by **their own**
 release flows (`/dxr-release <component>`, the Unity repo's `/release`,
-etc.) — each carries the same `SIGN_CMD`-gated step. The Unreal plug-in
-is signed inside its own local package step. A user installing the full
-stack gets every layer signed only when each component was released from
-a signing-capable machine. Carry into the report which layers this run
-covered (runtime only).
+etc.) — each carries the same `DXR_SIGN_HOOK` (remote) / `SIGN_CMD` (local)
+gate. A user installing the full stack gets every layer signed only when
+each component was released with signing configured. Carry into the report
+which layers this run covered (runtime only) and by which method.
 
 ---
 
@@ -475,8 +497,9 @@ Release [FULL_TAG] published successfully!
 
 Build:     Windows CI run #RUN_ID — Runtime + cube test apps passed
            [list any pre-existing-broken jobs here, with note that they don't affect the artifact]
-Signing:   [SIGNED=yes → "runtime installer signed (EV) and re-uploaded over the CI asset"]
-           [SIGNED=no  → "⚠ UNSIGNED — released from a non-signing machine; re-run /release on a signing-capable build machine to ship a signed installer"]
+Signing:   [remote → "runtime installer signed via DXR_SIGN_HOOK and re-uploaded over the CI asset (uninstaller unsigned in remote mode)"]
+           [local  → "runtime installer fully signed (incl. uninstaller) via local SIGN_CMD and re-uploaded"]
+           [none   → "⚠ UNSIGNED — released from a non-signing machine; re-run /release on a Windows build host with DXR_SIGN_HOOK or SIGN_CMD set"]
 Release:   https://github.com/DisplayXR/displayxr-runtime/releases/tag/[FULL_TAG]
 Assets:    DisplayXRSetup-X.Y.Z.BUILD.exe (~N MB)
            DisplayXR-Installer-X.Y.Z.pkg (~N MB)  [or "skipped — macOS run did not produce .pkg"]
