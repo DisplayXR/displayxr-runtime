@@ -197,6 +197,51 @@ Confirm:
 
 ---
 
+## PHASE 4.5: CODE-SIGN THE BUNDLE .EXE (capability-gated)
+
+The bundle wraps **already-signed** component installers (each signed at its
+own release), so it only needs its own outer `.exe` signed — a simple post-hoc
+**single-file** sign, no inner-binary handling and no rebuild. (signtool on a
+finished NSIS `.exe` is safe; that's ordinary. Only *rcedit* corrupts NSIS.)
+CI builds it unsigned; a signed release is produced by signing the `.exe` and
+re-uploading. No signing endpoint is named here.
+
+Resolve the method (a single-file sign needs no build, so **remote works from
+any host** incl. the Mac):
+- **Remote** — `$DXR_SIGN_HOOK` (a local executable that signs a folder in place).
+- **Local** — `$SIGN_CMD` (per-file signer; needs a Windows host for signtool).
+
+```bash
+if [ -n "$DXR_SIGN_HOOK" ] && [ -x "$DXR_SIGN_HOOK" ]; then
+  SIGN_METHOD=remote; SIGNED=yes
+elif [ -n "$SIGN_CMD" ] && uname -s | grep -qiE 'mingw|msys|cygwin|windows'; then
+  SIGN_METHOD=local;  SIGNED=yes
+else
+  echo "⚠  BUNDLE UNSIGNED — set DXR_SIGN_HOOK (remote) or SIGN_CMD (local, Windows) to sign."
+  SIGN_METHOD=none; SIGNED=no
+fi
+
+if [ "$SIGNED" = yes ]; then
+  D=$(mktemp -d)
+  EXE=$(gh release view "$TAG" -R DisplayXR/displayxr-installer --json assets \
+         --jq '.assets[].name | select(test("DisplayXRBundle-.*\\.exe$"))')
+  gh release download "$TAG" -R DisplayXR/displayxr-installer -p "$EXE" -D "$D"
+  if [ "$SIGN_METHOD" = remote ]; then
+    "$DXR_SIGN_HOOK" "$D"                      # signs (+verifies) via the runner
+  else
+    $SIGN_CMD "$D/$EXE"                        # bash word-splits SIGN_CMD; then verify:
+    powershell -NoProfile -Command "if((Get-AuthenticodeSignature '$D\\$EXE').Status -ne 'Valid'){exit 1}"
+  fi
+  gh release upload "$TAG" "$D/$EXE" --clobber -R DisplayXR/displayxr-installer
+  echo "Bundle .exe signed and re-uploaded ($SIGN_METHOD)."
+fi
+```
+
+Only the Windows `.exe` is covered; the macOS `.pkg` uses an Apple Developer ID
+cert + notarization (separate track). Carry `SIGNED`/`SIGN_METHOD` into the report.
+
+---
+
 ## PHASE 5: REPORT
 
 ```
@@ -214,6 +259,7 @@ Release:    https://github.com/DisplayXR/displayxr-installer/releases/tag/$TAG
 Assets:     DisplayXRBundle-X.Y.Z.pkg (~N MB)
             DisplayXRBundle-X.Y.Z.exe (~N MB)
 Prerelease: true/false
+Signing:    [remote/local → "bundle .exe signed and re-uploaded"] | [none → "⚠ bundle UNSIGNED — set DXR_SIGN_HOOK / SIGN_CMD"]  (macOS .pkg: unsigned, TODO)
 
 Source of truth verification:
   installer/versions.json == runtime/versions.json    ✓
@@ -236,9 +282,13 @@ STOP.
   (versions.json across runtime + installer) is continuous; the
   bundle release is the punctuation that says "users go install
   this now."
-- v1 ships unsigned per `project_meta_installer_284`. The skill
-  does NOT codesign anything. If/when signing lands, it'll be a CI
-  step inside publish-bundle.yml, not a skill responsibility.
+- Bundle `.exe` signing is a **post-hoc skill step** (Phase 4.5), not a CI
+  step — the signing key can't live on GitHub-hosted CI, and the org runner
+  isn't reachable from `displayxr-installer`'s CI. The skill signs the
+  finished `.exe` via `$DXR_SIGN_HOOK` (remote) or `$SIGN_CMD` (local) and
+  re-uploads. The wrapped component installers are already signed at their
+  own releases, so no inner-binary handling is needed. macOS `.pkg` signing
+  (Apple Developer ID + notarization) is still TODO.
 - Don't bump component pins by hand in installer's versions.json —
   the file is auto-mirrored from runtime. If you find yourself
   wanting to, you're working around the system. Investigate why
