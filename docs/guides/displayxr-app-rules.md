@@ -313,6 +313,21 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
     macOS alpha-native path landed in #568, but clearing the full rect is the portable fix and the
     app's responsibility.) Ref: `#568`, `#392`.
 
+- **INV-4.8 — Layered (array) swapchains are allowed; address views by `imageArrayIndex`, and
+  clear depth PER SLICE.** Instead of the tiled atlas (INV-4.4), an app MAY submit a single
+  `arraySize = N` swapchain and render view `vi` into array slice `vi` — the single-pass-instanced
+  layout engines use. Then set `subImage.imageArrayIndex = vi` and `imageRect` to the whole slice
+  (offset `{0,0}`); do **not** also tile by `imageRect`. The runtime honors either layout on every
+  backend ([ADR-032](../adr/ADR-032-array-layered-swapchains-first-class.md)); a layered swapchain
+  only drives modes whose `view_count <= arraySize` (arrays don't scale to N-view light-field —
+  that stays tiled).
+  - **Depth must be cleared per slice.** Every slice renders full-viewport into the *same* depth
+    buffer, so a once-per-frame clear lets slice 1 z-test against slice 0's depth and the other
+    eye's geometry punches a shadow through (a subtle right-eye shadow). Clear depth at the start of
+    **each** slice's render (D3D11/D3D12 `ClearDepthStencilView`, GL `glClear(GL_DEPTH_BUFFER_BIT)`,
+    VK render-pass `loadOp = CLEAR` per per-slice framebuffer). Tiled views are immune — their tile
+    viewports occupy disjoint depth regions and share one clear. Ref: `#613`, `#681`.
+
 ---
 
 ## 5. Texture apps: express regions via display-zones

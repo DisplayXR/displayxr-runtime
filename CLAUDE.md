@@ -372,6 +372,7 @@ See `docs/README.md` for the full index. By task:
 | Add a new display vendor | `docs/guides/vendor-plugin-onboarding.md` → `docs/reference/xrt_plugin_iface.md` + `docs/specs/runtime/plugin-discovery.md` |
 | `xrt_plugin_iface` callbacks | `docs/reference/xrt_plugin_iface.md` |
 | Multiview tiling / atlas layout | `docs/specs/runtime/multiview-tiling.md` |
+| Array (layered/SPI) vs tiled swapchains — first-class on all backends | `docs/adr/ADR-032-array-layered-swapchains-first-class.md` → `docs/specs/runtime/swapchain-model.md` |
 | Extension API (display_info, window bindings) | `docs/specs/extensions/XR_EXT_display_info.md` |
 | Why an architectural decision was made | `docs/adr/` |
 | Write / scaffold / lint a DisplayXR app | `docs/guides/displayxr-app-rules.md` (+ `/new-displayxr-app`, `scripts/check_displayxr_app.py`) |

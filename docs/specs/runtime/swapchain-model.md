@@ -39,6 +39,10 @@ compositor. Consequently a layered submission never satisfies
 path; one atlas blit per frame is the floor for array content, matching every
 PC-VR runtime.
 
+Rationale, per-backend mechanism, and the app-side authoring rules (including the
+per-slice depth clear): [ADR-032](../../adr/ADR-032-array-layered-swapchains-first-class.md)
+and [displayxr-app-rules INV-4.8](../../guides/displayxr-app-rules.md).
+
 ### Target Swapchain
 
 - **Allocated by**: the compositor
