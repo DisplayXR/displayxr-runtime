@@ -18,7 +18,9 @@ setlocal enabledelayedexpansion
 
 set REPO=%~dp0..\
 set OPENXR_VERSION=1.1.43
-set VULKAN_SDK=C:\VulkanSDK\1.4.341.1
+:: Honor a pre-set VULKAN_SDK (the LunarG installer / a build runner exports it,
+:: possibly a different version) before falling back to the dev-box default.
+if not defined VULKAN_SDK set "VULKAN_SDK=C:\VulkanSDK\1.4.341.1"
 set OPENXR_SDK=%REPO%openxr_sdk
 set NINJA_DIR=%LOCALAPPDATA%\Microsoft\WinGet\Packages\Ninja-build.Ninja_Microsoft.Winget.Source_8wekyb3d8bbwe
 
@@ -57,7 +59,7 @@ if not defined VCVARS (
 
 call "%VCVARS%" >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
-    echo ERROR: vcvars64.bat failed: %VCVARS%
+    echo ERROR: vcvars64.bat failed: !VCVARS!
     exit /b 1
 )
 
