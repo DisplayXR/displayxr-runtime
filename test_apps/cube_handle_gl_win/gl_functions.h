@@ -87,6 +87,7 @@ typedef void (APIENTRY *PFNGLVERTEXATTRIBPOINTERPROC)(GLuint index, GLint size, 
 typedef void (APIENTRY *PFNGLGENFRAMEBUFFERSPROC)(GLsizei n, GLuint* framebuffers);
 typedef void (APIENTRY *PFNGLBINDFRAMEBUFFERPROC)(GLenum target, GLuint framebuffer);
 typedef void (APIENTRY *PFNGLFRAMEBUFFERTEXTURE2DPROC)(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level);
+typedef void (APIENTRY *PFNGLFRAMEBUFFERTEXTURELAYERPROC)(GLenum target, GLenum attachment, GLuint texture, GLint level, GLint layer);
 typedef GLenum (APIENTRY *PFNGLCHECKFRAMEBUFFERSTATUSPROC)(GLenum target);
 typedef void (APIENTRY *PFNGLDELETEFRAMEBUFFERSPROC)(GLsizei n, const GLuint* framebuffers);
 typedef void (APIENTRY *PFNGLGENRENDERBUFFERSPROC)(GLsizei n, GLuint* renderbuffers);
@@ -131,6 +132,7 @@ extern PFNGLVERTEXATTRIBPOINTERPROC glVertexAttribPointer_;
 extern PFNGLGENFRAMEBUFFERSPROC glGenFramebuffers_;
 extern PFNGLBINDFRAMEBUFFERPROC glBindFramebuffer_;
 extern PFNGLFRAMEBUFFERTEXTURE2DPROC glFramebufferTexture2D_;
+extern PFNGLFRAMEBUFFERTEXTURELAYERPROC glFramebufferTextureLayer_;
 extern PFNGLCHECKFRAMEBUFFERSTATUSPROC glCheckFramebufferStatus_;
 extern PFNGLDELETEFRAMEBUFFERSPROC glDeleteFramebuffers_;
 extern PFNGLGENRENDERBUFFERSPROC glGenRenderbuffers_;

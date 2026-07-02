@@ -74,6 +74,19 @@ static bool TransparentBackgroundEnabled() {
     return e;
 }
 
+// DISPLAYXR_ARRAY_LAYOUT=1 submits the projection as a LAYERED / single-pass-
+// instanced swapchain (arraySize=2, each view in array slice imageArrayIndex)
+// instead of the default TILED atlas. Exercises the runtime's per-view
+// array-slice sampling; only drives view_count<=2 modes. Default off (tiled).
+static bool ArrayLayoutEnabled() {
+    static const bool e = []() {
+        const char *v = getenv("DISPLAYXR_ARRAY_LAYOUT");
+        return v != nullptr && *v != '\0' && *v != '0';
+    }();
+    return e;
+}
+static const uint32_t kArraySlices = 2; // stereo
+
 // #439 Phase 3 — handle + mask + Local2D layer modes (§8 cases 2/3/4), GL leg.
 // DXR_LOCAL2D_PANEL=1 (case 3, implicit mask) / +DXR_LOCAL2D_MASK=1 (case 2,
 // explicit Tier-2 island mask) / +DXR_LOCAL2D_PANEL2=1 (case 4, second
@@ -648,6 +661,10 @@ static void RenderThreadFunc(
                     xr->recommendedViewScaleY = xr->renderingModeScaleY[xr->currentModeIndex];
                 }
                 int eyeCount = monoMode ? 1 : (int)modeViewCount;
+                // Layered swapchains hold arraySize slices — cap the view count.
+                if (ArrayLayoutEnabled() && eyeCount > (int)xr->swapchain.arraySize) {
+                    eyeCount = (int)xr->swapchain.arraySize;
+                }
                 std::vector<XrCompositionLayerProjectionView> projectionViews(eyeCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
 
                 if (frameState.shouldRender) {
@@ -724,8 +741,12 @@ static void RenderThreadFunc(
                         }
 
                         // Max per-tile capacity from swapchain
-                        uint32_t maxTileW = tileColumns > 0 ? xr->swapchain.width / tileColumns : xr->swapchain.width;
-                        uint32_t maxTileH = tileRows > 0 ? xr->swapchain.height / tileRows : xr->swapchain.height;
+                        // ARRAY: each slice is a full per-view image, so the cap
+                        // is the whole swapchain image, not a sub-tile of it.
+                        uint32_t maxTileW = renderer->arrayLayout ? xr->swapchain.width
+                            : (tileColumns > 0 ? xr->swapchain.width / tileColumns : xr->swapchain.width);
+                        uint32_t maxTileH = renderer->arrayLayout ? xr->swapchain.height
+                            : (tileRows > 0 ? xr->swapchain.height / tileRows : xr->swapchain.height);
 
                         // Compute render dims: mono uses full swapchain, stereo uses tile size
                         uint32_t renderW, renderH;
@@ -828,17 +849,20 @@ static void RenderThreadFunc(
                                     projMatrix = xr->projMatrices[eye];
                                 }
 
-                                // Tile-aware viewport: place each view in the correct tile position
+                                // TILED: place each view at its tile viewport.
+                                // ARRAY: render into array slice `eye` at (0,0).
+                                const bool arrayLayout = renderer->arrayLayout;
                                 uint32_t tileX = monoMode ? 0 : (eye % tileColumns);
                                 uint32_t tileY = monoMode ? 0 : (eye / tileColumns);
-                                uint32_t vpX = tileX * renderW;
-                                uint32_t vpY = tileY * renderH;
+                                uint32_t vpX = arrayLayout ? 0 : (tileX * renderW);
+                                uint32_t vpY = arrayLayout ? 0 : (tileY * renderH);
 
                                 RenderScene(*renderer, imageIndex,
                                     vpX, vpY,
                                     renderW, renderH,
                                     viewMatrix, projMatrix,
-                                    useAppProjection ? 1.0f : inputSnapshot.viewParams.scaleFactor);
+                                    useAppProjection ? 1.0f : inputSnapshot.viewParams.scaleFactor,
+                                    0.03f, 0.0f, 0.06f, /*slice*/ (uint32_t)eye);
 
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                                 projectionViews[eye].subImage.swapchain = xr->swapchain.swapchain;
@@ -849,7 +873,7 @@ static void RenderThreadFunc(
                                     (int32_t)renderW,
                                     (int32_t)renderH
                                 };
-                                projectionViews[eye].subImage.imageArrayIndex = 0;
+                                projectionViews[eye].subImage.imageArrayIndex = arrayLayout ? (uint32_t)eye : 0;
                                 projectionViews[eye].pose = monoMode ? monoPose : rawViews[eye < (int)viewCount ? eye : 0].pose;
                                 projectionViews[eye].fov = useAppProjection ?
                                     stereoViews[monoMode ? 0 : eye].fov :
@@ -1258,7 +1282,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    if (!CreateSwapchain(xr)) {
+    if (!CreateSwapchain(xr, ArrayLayoutEnabled() ? kArraySlices : 1)) {
         LOG_ERROR("Swapchain creation failed");
         CleanupOpenXR(xr);
         wglMakeCurrent(nullptr, nullptr);
@@ -1297,7 +1321,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
 
         if (!CreateSwapchainFBOs(glRenderer, textures.data(), count,
-            xr.swapchain.width, xr.swapchain.height)) {
+            xr.swapchain.width, xr.swapchain.height, xr.swapchain.arraySize)) {
             LOG_ERROR("Failed to create FBOs for swapchain");
             CleanupGLRenderer(glRenderer);
             CleanupOpenXR(xr);

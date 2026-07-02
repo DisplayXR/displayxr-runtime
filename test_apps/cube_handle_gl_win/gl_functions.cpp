@@ -37,6 +37,7 @@ PFNGLVERTEXATTRIBPOINTERPROC glVertexAttribPointer_ = nullptr;
 PFNGLGENFRAMEBUFFERSPROC glGenFramebuffers_ = nullptr;
 PFNGLBINDFRAMEBUFFERPROC glBindFramebuffer_ = nullptr;
 PFNGLFRAMEBUFFERTEXTURE2DPROC glFramebufferTexture2D_ = nullptr;
+PFNGLFRAMEBUFFERTEXTURELAYERPROC glFramebufferTextureLayer_ = nullptr;
 PFNGLCHECKFRAMEBUFFERSTATUSPROC glCheckFramebufferStatus_ = nullptr;
 PFNGLDELETEFRAMEBUFFERSPROC glDeleteFramebuffers_ = nullptr;
 PFNGLGENRENDERBUFFERSPROC glGenRenderbuffers_ = nullptr;
@@ -86,6 +87,7 @@ bool LoadGLFunctions() {
     LOAD_GL(glGenFramebuffers, PFNGLGENFRAMEBUFFERSPROC);
     LOAD_GL(glBindFramebuffer, PFNGLBINDFRAMEBUFFERPROC);
     LOAD_GL(glFramebufferTexture2D, PFNGLFRAMEBUFFERTEXTURE2DPROC);
+    LOAD_GL(glFramebufferTextureLayer, PFNGLFRAMEBUFFERTEXTURELAYERPROC);
     LOAD_GL(glCheckFramebufferStatus, PFNGLCHECKFRAMEBUFFERSTATUSPROC);
     LOAD_GL(glDeleteFramebuffers, PFNGLDELETEFRAMEBUFFERSPROC);
     LOAD_GL(glGenRenderbuffers, PFNGLGENRENDERBUFFERSPROC);
