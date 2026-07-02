@@ -1,1 +1,10 @@
-* @dfattal
+# Code owners for displayxr-runtime.
+#
+# Reviews are owned by the project maintainers team, not an individual, so that
+# review authority tracks the project's stewardship rather than a single person.
+# During incubation the team is small; it broadens toward a Technical Steering
+# Committee as adoption grows (see the extensions repo's GOVERNANCE.md).
+#
+# NOTE: @DisplayXR/maintainers must exist as a GitHub team with write access to
+# this repo for CODEOWNERS-based review requests to route correctly.
+* @DisplayXR/maintainers

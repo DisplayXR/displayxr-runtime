@@ -28,6 +28,16 @@ Open issues at [github.com/DisplayXR/displayxr-runtime/issues](https://github.co
 
 See the [vendor plug-in onboarding guide](docs/guides/vendor-plugin-onboarding.md). Vendors ship a plug-in DLL from their own repo — the runtime discovers it at `xrCreateInstance` and never carries vendor code or SDK identifiers in its link line (ADR-019). Zero compositor changes required. The [Leia SR plug-in](https://github.com/DisplayXR/displayxr-leia-plugin) is the canonical example; new vendors follow the same pattern.
 
+### Developer Certificate of Origin (sign-off)
+
+Contributions are accepted under the [Developer Certificate of Origin](DCO) (DCO 1.1). By signing off, you certify that you wrote the patch or otherwise have the right to submit it under the project's license. Add a `Signed-off-by` line to every commit:
+
+```
+Signed-off-by: Your Name <you@example.com>
+```
+
+`git commit -s` adds it automatically. The name and email must match your commit author identity.
+
 ### License
 
-Boost Software License 1.0. By contributing, you agree your code is licensed under BSL-1.0.
+The runtime is licensed under the **Boost Software License 1.0** (BSL-1.0), inherited from its Monado origin; original, DisplayXR-authored components — notably the `XR_EXT_*` extension headers — are **Apache-2.0** (chosen for its explicit patent grant, on the path to Khronos ratification). The `SPDX-License-Identifier` header in each file is authoritative. By contributing, you agree your contribution is licensed under the license indicated in the file(s) you touch.
