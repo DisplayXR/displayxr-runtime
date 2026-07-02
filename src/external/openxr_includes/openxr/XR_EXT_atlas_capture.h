@@ -1,5 +1,13 @@
 // Copyright 2026, DisplayXR
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
+//
+// PROVISIONAL — the XR_EXT_* identifiers in this header are NOT registered
+// with the Khronos OpenXR registry. They are provisional placeholders used
+// during DisplayXR incubation and will be re-registered — and may be renamed
+// (e.g. to a registered XR_<AUTHORID>_ prefix) — through the official Khronos
+// process on the EXT -> KHR path. Do not treat these names or numeric values
+// as stable. See GOVERNANCE.md.
+//
 /*!
  * @file
  * @brief  Header for XR_EXT_atlas_capture extension

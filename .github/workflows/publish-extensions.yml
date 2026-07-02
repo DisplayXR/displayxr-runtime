@@ -94,6 +94,14 @@ jobs:
           - [Getting Started](https://github.com/DisplayXR/displayxr-runtime/tree/main/docs/getting-started) — build and integrate with DisplayXR
           - [displayxr-runtime](https://github.com/DisplayXR/displayxr-runtime) — the OpenXR runtime
 
+          ## Provisional naming
+
+          The `XR_EXT_*` identifiers are **provisional** — they are not registered in the Khronos OpenXR registry. They are placeholders used during DisplayXR incubation and will be re-registered (and may be renamed to a registered `XR_<AUTHORID>_` prefix) through the official Khronos process on the EXT → KHR path. Do not treat the names or numeric values as stable. See [GOVERNANCE.md](GOVERNANCE.md).
+
+          ## License
+
+          [Apache-2.0](LICENSE). These headers are original, DisplayXR-authored extension definitions — the same license the Khronos OpenXR headers use, chosen for its explicit patent grant on the path to Khronos ratification. The per-file `SPDX-License-Identifier` is authoritative.
+
           ## Auto-Published
 
           These headers are automatically synced from `displayxr-runtime/src/external/openxr_includes/openxr/XR_EXT_*.h` on every push to main. Do not edit directly — changes will be overwritten.
