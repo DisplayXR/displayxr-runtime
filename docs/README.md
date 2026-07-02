@@ -1,5 +1,7 @@
 # DisplayXR Documentation
 
+> **New to the project?** Read **[ORIENTATION.md](ORIENTATION.md)** first — a top-down, plain-language tour of what DisplayXR is, why it's built this way, and where every doc lives. This page below is the role-based jump table.
+
 ## Who are you?
 
 | **App developer** | **OXR contributor** | **DXR core contributor** | **Vendor contributor** |
@@ -114,6 +116,10 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-025](adr/ADR-025-android-vendor-dp-out-of-process.md) — Android vendor DP out-of-process
 - [ADR-026](adr/ADR-026-orientation-aware-view-scaling.md) — Orientation-aware view scaling
 - [ADR-027](adr/ADR-027-display-zones.md) — Display zones: decoupled mixed 2D/3D layout, per-zone rig, wish mask
+- [ADR-028](adr/ADR-028-display-mode-recipe-vs-hardware-state.md) — Display mode recipe vs. hardware state (2D⇄3D as two independent signals)
+- [ADR-029](adr/ADR-029-client-owned-transparent-ipc-present.md) — Client-owned transparent IPC present
+- [ADR-030](adr/ADR-030-crop-before-dp-zero-copy-only-when-swapchain-equals-atlas.md) — Crop before the DP; zero-copy only when the swapchain equals the atlas
+- [ADR-031](adr/ADR-031-remove-surround-output-rect-zones-sole-region-model.md) — Remove surround/output-rect; display zones as the sole region model
 
 ---
 
