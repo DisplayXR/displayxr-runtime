@@ -50,6 +50,7 @@ PFNGLUNIFORM1IPROC glUniform1i_ = nullptr;
 PFNGLGENERATEMIPMAPPROC glGenerateMipmap_ = nullptr;
 PFNGLBLENDFUNCSEPARATEPROC glBlendFuncSeparate_ = nullptr;
 PFNGLUNIFORM2FPROC glUniform2f_ = nullptr;
+PFNGLFRAMEBUFFERTEXTURELAYERPROC glFramebufferTextureLayer_ = nullptr;
 
 PFNWGLCREATECONTEXTATTRIBSARBPROC wglCreateContextAttribsARB_ = nullptr;
 
@@ -101,6 +102,7 @@ bool LoadGLFunctions() {
     LOAD_GL(glGenerateMipmap, PFNGLGENERATEMIPMAPPROC);
     LOAD_GL(glBlendFuncSeparate, PFNGLBLENDFUNCSEPARATEPROC);
     LOAD_GL(glUniform2f, PFNGLUNIFORM2FPROC);
+    LOAD_GL(glFramebufferTextureLayer, PFNGLFRAMEBUFFERTEXTURELAYERPROC);
 
     // WGL extensions (optional — may already be loaded for context creation)
     wglCreateContextAttribsARB_ = (PFNWGLCREATECONTEXTATTRIBSARBPROC)wglGetProcAddress("wglCreateContextAttribsARB");

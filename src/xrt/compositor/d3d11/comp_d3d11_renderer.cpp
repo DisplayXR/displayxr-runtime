@@ -32,6 +32,7 @@ struct LayerConstants
 	float post_transform[4]; // xy = offset, zw = scale
 	float color_scale[4];    // Color multiplier
 	float color_bias[4];     // Color offset
+	float array_params[4];   // x = array slice (imageArrayIndex) for layered swapchains; yzw pad
 };
 
 /*!
@@ -88,6 +89,10 @@ struct comp_d3d11_renderer
 
 	//! Pixel shader for projection layers.
 	ID3D11PixelShader *projection_ps;
+
+	//! Pixel shader for projection layers from LAYERED (array) swapchains
+	//! (Texture2DArray; selects the view's imageArrayIndex slice).
+	ID3D11PixelShader *projection_ps_array;
 
 	//! Vertex shader for quad layers.
 	ID3D11VertexShader *quad_vs;
@@ -236,6 +241,41 @@ struct VS_OUTPUT
 float4 PSMain(VS_OUTPUT input) : SV_Target
 {
     float4 color = layer_tex.Sample(layer_samp, input.uv);
+    color = color * color_scale + color_bias;
+    return color;
+}
+)";
+
+// Projection pixel shader variant for LAYERED (array) swapchains. Under
+// single-pass-instanced the app submits ONE swapchain with arraySize=2 and two
+// projection views referencing subImage.imageArrayIndex 0 (left) / 1 (right).
+// The whole-array Texture2DArray SRV (FirstArraySlice=0, ArraySize=N) is bound;
+// this shader selects the requested slice via array_params.x. A plain Texture2D
+// shader (above) always views slice 0, so both eyes would sample the left image
+// (flat output) — this is the D3D11 analog of the D3D12 #656 fix. Single-layer
+// swapchains keep the Texture2D path unchanged.
+static const char *projection_ps_array_source = R"(
+cbuffer LayerCB : register(b0)
+{
+    float4x4 mvp;
+    float4 post_transform;
+    float4 color_scale;
+    float4 color_bias;
+    float4 array_params;   // x = array slice
+};
+
+Texture2DArray layer_tex : register(t0);
+SamplerState layer_samp : register(s0);
+
+struct VS_OUTPUT
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+float4 PSMain(VS_OUTPUT input) : SV_Target
+{
+    float4 color = layer_tex.Sample(layer_samp, float3(input.uv, array_params.x));
     color = color * color_scale + color_bias;
     return color;
 }
@@ -521,6 +561,21 @@ create_shaders(struct comp_d3d11_renderer *r)
 	blob->Release();
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create pixel shader: 0x%08x", hr);
+		return XRT_ERROR_D3D;
+	}
+
+	// Compile layered (array) projection pixel shader variant
+	xret = compile_shader(internals->device, projection_ps_array_source, "PSMain", "ps_5_0", &blob);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_E("Failed to compile array projection pixel shader");
+		return xret;
+	}
+
+	hr = internals->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+	                                           &r->projection_ps_array);
+	blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create array projection pixel shader: 0x%08x", hr);
 		return XRT_ERROR_D3D;
 	}
 
@@ -830,7 +885,9 @@ render_projection_layer(struct comp_d3d11_renderer *r,
 	struct xrt_layer_projection_view_data *view_data = &layer->data.proj.v[view_index];
 	uint32_t image_index = view_data->sub.image_index;
 
-	// Get the D3D11 swapchain's SRV for this image
+	// Get the D3D11 swapchain's SRV for this image. For layered (array)
+	// swapchains this is a whole-array Texture2DArray SRV (all slices);
+	// for single-layer swapchains it is a Texture2D SRV.
 	ID3D11ShaderResourceView *srv = static_cast<ID3D11ShaderResourceView *>(
 	    comp_d3d11_swapchain_get_srv(xsc, image_index));
 	if (srv == nullptr) {
@@ -838,13 +895,27 @@ render_projection_layer(struct comp_d3d11_renderer *r,
 		return;
 	}
 
+	// Honor the projection view's array layer (subImage.imageArrayIndex).
+	// Under single-pass-instanced the app submits ONE arraySize>1 swapchain
+	// with per-view array_index 0/1; a Texture2D sample always views slice 0
+	// (flat output). When the swapchain is layered, use the Texture2DArray
+	// shader variant and select the slice via the constant buffer. This
+	// mirrors the D3D12 #656 fix. Single-layer swapchains (array_index 0)
+	// keep the Texture2D path unchanged.
+	uint32_t array_size = comp_d3d11_swapchain_get_array_size(xsc);
+	bool is_layered = array_size > 1;
+
 	// Set projection shaders explicitly (must be done per-draw because quad layer
 	// rendering switches to quad shaders, and those persist to the next projection layer)
 	internals->context->VSSetShader(r->projection_vs, nullptr, 0);
-	internals->context->PSSetShader(r->projection_ps, nullptr, 0);
+	internals->context->PSSetShader(is_layered ? r->projection_ps_array : r->projection_ps, nullptr, 0);
 
 	// Update constant buffer
 	LayerConstants constants = {};
+
+	// Array slice for the layered (Texture2DArray) shader variant; ignored by
+	// the Texture2D shader. Non-array swapchains report array_index 0.
+	constants.array_params[0] = is_layered ? static_cast<float>(view_data->sub.array_index) : 0.0f;
 
 	// Identity MVP (fullscreen quad)
 	memset(constants.mvp, 0, sizeof(constants.mvp));
@@ -1267,6 +1338,7 @@ comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr)
 	SAFE_RELEASE(r->composite_vs);
 	SAFE_RELEASE(r->quad_ps);
 	SAFE_RELEASE(r->quad_vs);
+	SAFE_RELEASE(r->projection_ps_array);
 	SAFE_RELEASE(r->projection_ps);
 	SAFE_RELEASE(r->projection_vs);
 	SAFE_RELEASE(r->depth_dsv);

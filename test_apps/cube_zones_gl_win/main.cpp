@@ -85,6 +85,20 @@ static bool TransparentBackgroundEnabled() {
     return e;
 }
 
+// DISPLAYXR_ARRAY_LAYOUT=1 switches each zone from the default horizontally
+// TILED single-slice swapchain to the ARRAY / single-pass-instanced layout
+// (arraySize=viewCount, per-view size, each view rendered into array slice vi
+// via glFramebufferTextureLayer, submitted imageArrayIndex=vi). Exercises the
+// GL compositor's per-view array-slice sampling — the same content must weave
+// with disparity in both layouts. Default off (tiled).
+static bool ArrayLayoutEnabled() {
+    static const bool e = []() {
+        const char *v = getenv("DISPLAYXR_ARRAY_LAYOUT");
+        return v != nullptr && *v != '\0' && *v != '0';
+    }();
+    return e;
+}
+
 // ---------------------------------------------------------------------------
 // XR_EXT_display_zones state
 // ---------------------------------------------------------------------------
@@ -588,17 +602,21 @@ static bool CreateZoneResources(XrSessionManager& xr, GLRenderer& renderer,
     z.tileCount = viewCount;
     z.format = xr.swapchain.format; // same encoding as the main projection swapchain
 
+    const bool arrayLayout = ArrayLayoutEnabled();
+
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
     sci.format = z.format;
     sci.sampleCount = 1;
-    sci.width = z.tileW * z.tileCount;
+    // ARRAY: one per-view image with `viewCount` slices. TILED: one wide image.
+    sci.width = arrayLayout ? z.tileW : (z.tileW * z.tileCount);
     sci.height = z.tileH;
     sci.faceCount = 1;
-    sci.arraySize = 1;
+    sci.arraySize = arrayLayout ? z.tileCount : 1;
     sci.mipCount = 1;
     if (XR_FAILED(xrCreateSwapchain(xr.session, &sci, &z.swapchain))) {
-        LOG_ERROR("[zones] zone %u: xrCreateSwapchain failed (%ux%u)", z.zoneId, sci.width, sci.height);
+        LOG_ERROR("[zones] zone %u: xrCreateSwapchain failed (%ux%u arraySize=%u)",
+                  z.zoneId, sci.width, sci.height, sci.arraySize);
         return false;
     }
 
@@ -613,14 +631,18 @@ static bool CreateZoneResources(XrSessionManager& xr, GLRenderer& renderer,
 
     std::vector<GLuint> texIds(n);
     for (uint32_t i = 0; i < n; i++) texIds[i] = z.images[i].image;
-    if (!CreateZoneFBOs(z.gl, texIds.data(), n, z.tileW * z.tileCount, z.tileH)) {
+    // ARRAY: per-view-sized FBOs (fullW = tileW, arraySize slices). TILED: wide.
+    const uint32_t fboFullW = arrayLayout ? z.tileW : (z.tileW * z.tileCount);
+    if (!CreateZoneFBOs(z.gl, texIds.data(), n, fboFullW, z.tileH,
+                        arrayLayout ? z.tileCount : 1)) {
         LOG_ERROR("[zones] zone %u: FBO creation failed", z.zoneId);
         return false;
     }
 
-    LOG_INFO("[zones] zone %u: rect %d,%d %dx%d -> swapchain %ux%u (%u tiles of %ux%u)",
+    LOG_INFO("[zones] zone %u: rect %d,%d %dx%d -> %s swapchain %ux%u arraySize=%u (%u views of %ux%u)",
              z.zoneId, z.rect.offset.x, z.rect.offset.y, z.rect.extent.width, z.rect.extent.height,
-             z.tileW * z.tileCount, z.tileH, z.tileCount, z.tileW, z.tileH);
+             arrayLayout ? "ARRAY" : "TILED", sci.width, sci.height, sci.arraySize,
+             z.tileCount, z.tileW, z.tileH);
     return true;
 }
 
@@ -880,6 +902,7 @@ static void RenderZonesFrame(XrSessionManager& xr, GLRenderer& renderer,
         const float savedRotation = renderer.cubeRotation;
         renderer.cubeRotation += z.spinPhase;
 
+        const bool arrayLayout = z.gl.arrayLayout;
         for (uint32_t vi = 0; vi < n; vi++) {
             const XMMATRIX viewMatrix = ColumnMajorToXMMatrix(rigViews[vi].view_matrix);
             const XMMATRIX projMatrix = ColumnMajorToXMMatrix(rigViews[vi].projection_matrix);
@@ -888,15 +911,18 @@ static void RenderZonesFrame(XrSessionManager& xr, GLRenderer& renderer,
             // fully transparent. HARD GOTCHA (#613): depth clears every tile
             // UNCONDITIONALLY inside RenderZoneTile (color clear is the passed
             // clearColor) — the cube would otherwise z-fail into a dark shadow.
+            // ARRAY layout renders view vi into array slice vi (tileX ignored).
             RenderZoneTile(renderer, z.gl, imageIndex,
                            /*tileX*/ vi, z.tileW, z.tileH,
                            viewMatrix, projMatrix,
-                           z.clearColor, /*cubeY*/ 0.03f);
+                           z.clearColor, /*cubeY*/ 0.03f, /*cubeZ*/ 0.0f,
+                           /*cubeSize*/ 0.06f, /*slice*/ vi);
 
             projViews[zi][vi].subImage.swapchain = z.swapchain;
-            projViews[zi][vi].subImage.imageRect.offset = {(int32_t)(vi * z.tileW), 0};
+            // ARRAY: full image at slice vi. TILED: tile vi in the wide image.
+            projViews[zi][vi].subImage.imageRect.offset = {arrayLayout ? 0 : (int32_t)(vi * z.tileW), 0};
             projViews[zi][vi].subImage.imageRect.extent = {(int32_t)z.tileW, (int32_t)z.tileH};
-            projViews[zi][vi].subImage.imageArrayIndex = 0;
+            projViews[zi][vi].subImage.imageArrayIndex = arrayLayout ? vi : 0;
             projViews[zi][vi].pose = zoneViews[vi].pose;
             projViews[zi][vi].fov = rigViews[vi].fov;
         }
@@ -909,7 +935,8 @@ static void RenderZonesFrame(XrSessionManager& xr, GLRenderer& renderer,
         if (g_wishMode != 1) {
             for (uint32_t vi = 0; vi < n; vi++) {
                 DrawZoneEdgeFade(renderer, z.gl, imageIndex,
-                                 /*tileX*/ vi, z.tileW, z.tileH, ZoneEdgeFadePx());
+                                 /*tileX*/ vi, z.tileW, z.tileH, ZoneEdgeFadePx(),
+                                 /*slice*/ vi);
             }
         }
 

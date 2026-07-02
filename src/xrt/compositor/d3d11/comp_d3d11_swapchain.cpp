@@ -574,6 +574,13 @@ comp_d3d11_swapchain_get_dimensions(struct xrt_swapchain *xsc, uint32_t *out_w, 
 	*out_h = sc->info.height;
 }
 
+extern "C" uint32_t
+comp_d3d11_swapchain_get_array_size(struct xrt_swapchain *xsc)
+{
+	struct comp_d3d11_swapchain *sc = d3d11_sc(xsc);
+	return sc->info.array_size > 0 ? sc->info.array_size : 1;
+}
+
 /*!
  * Wait for GPU completion of all commands submitted up to the most recent
  * xrReleaseSwapchainImage for this swapchain.

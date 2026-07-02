@@ -348,6 +348,22 @@ static bool TransparentBackgroundEnabled() {
     return enabled;
 }
 
+// DISPLAYXR_ARRAY_LAYOUT=1 switches each zone from the default horizontally
+// TILED single-slice swapchain (arraySize=1, width=tileW*viewCount, view vi at
+// imageRect x=vi*tileW, imageArrayIndex=0) to the ARRAY / single-pass-instanced
+// layout (arraySize=viewCount, width=tileW, view vi rendered into array slice vi
+// via a TEXTURE2DARRAY RTV, submitted imageArrayIndex=vi, imageRect {0,0}).
+// This exercises the runtime's per-view array-slice sampling (the D3D11 analog
+// of the D3D12 #656 fix) — the same content must weave with disparity in both
+// layouts. Default off (tiled), matching this app's original behavior.
+static bool ArrayLayoutEnabled() {
+    static const bool enabled = []() {
+        const char* v = getenv("DISPLAYXR_ARRAY_LAYOUT");
+        return v != nullptr && *v != '\0' && *v != '0';
+    }();
+    return enabled;
+}
+
 // Create the application window
 static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     const bool transparent = TransparentBackgroundEnabled();
@@ -550,19 +566,27 @@ static bool CreateZoneResources(XrSessionManager& xr, D3D11Renderer& renderer,
     z.tileCount = viewCount;
     z.format = xr.swapchain.format; // same encoding as the main projection swapchain
 
+    const bool arrayLayout = ArrayLayoutEnabled();
+
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
     sci.format = z.format;
     sci.sampleCount = 1;
-    sci.width = z.tileW * z.tileCount;
+    // ARRAY: one per-view-sized image with `viewCount` slices. TILED: one wide
+    // image holding `viewCount` tiles side by side.
+    sci.width = arrayLayout ? z.tileW : (z.tileW * z.tileCount);
     sci.height = z.tileH;
     sci.faceCount = 1;
-    sci.arraySize = 1;
+    sci.arraySize = arrayLayout ? z.tileCount : 1;
     sci.mipCount = 1;
     if (XR_FAILED(xrCreateSwapchain(xr.session, &sci, &z.swapchain))) {
-        LOG_ERROR("[zones] zone %u: xrCreateSwapchain failed (%ux%u)", z.zoneId, sci.width, sci.height);
+        LOG_ERROR("[zones] zone %u: xrCreateSwapchain failed (%ux%u arraySize=%u)",
+                  z.zoneId, sci.width, sci.height, sci.arraySize);
         return false;
     }
+    LOG_INFO("[zones] zone %u: %s swapchain %ux%u arraySize=%u (tile %ux%u, %u views)",
+             z.zoneId, arrayLayout ? "ARRAY" : "TILED", sci.width, sci.height, sci.arraySize,
+             z.tileW, z.tileH, z.tileCount);
 
     uint32_t n = 0;
     xrEnumerateSwapchainImages(z.swapchain, 0, &n, nullptr);
@@ -573,18 +597,21 @@ static bool CreateZoneResources(XrSessionManager& xr, D3D11Renderer& renderer,
         return false;
     }
 
+    // Depth is per-view-sized in ARRAY layout (each slice rendered full-viewport),
+    // full-width in TILED layout (all tiles share one wide target).
     ID3D11Texture2D* depthTex = nullptr;
     ID3D11DepthStencilView* dsv = nullptr;
-    if (!CreateDepthStencilView(renderer, z.tileW * z.tileCount, z.tileH, &depthTex, &dsv)) {
+    const uint32_t depthW = arrayLayout ? z.tileW : (z.tileW * z.tileCount);
+    if (!CreateDepthStencilView(renderer, depthW, z.tileH, &depthTex, &dsv)) {
         LOG_ERROR("[zones] zone %u: depth buffer creation failed", z.zoneId);
         return false;
     }
     z.depthTex.Attach(depthTex);
     z.depthDSV.Attach(dsv);
 
-    LOG_INFO("[zones] zone %u: rect %d,%d %dx%d -> swapchain %ux%u (%u tiles of %ux%u)",
+    LOG_INFO("[zones] zone %u: rect %d,%d %dx%d -> %s (%u views of %ux%u)",
              z.zoneId, z.rect.offset.x, z.rect.offset.y, z.rect.extent.width, z.rect.extent.height,
-             z.tileW * z.tileCount, z.tileH, z.tileCount, z.tileW, z.tileH);
+             arrayLayout ? "ARRAY layout" : "TILED layout", z.tileCount, z.tileW, z.tileH);
     return true;
 }
 
@@ -1069,14 +1096,17 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
         wi.timeout = XR_INFINITE_DURATION;
         xrWaitSwapchainImage(z.swapchain, &wi);
 
-        ID3D11RenderTargetView* rtv = nullptr;
-        CreateRenderTargetView(renderer, z.images[imageIndex].texture,
-                               static_cast<DXGI_FORMAT>(z.format), &rtv);
+        const bool arrayLayout = ArrayLayoutEnabled();
 
-        // Per-zone clear (premultiplied RGBA). Zone A is opaque; zone B's
-        // semi-transparent background demonstrates the alpha-over composite
-        // (the cube geometry itself renders opaque in both).
-        renderer.context->ClearRenderTargetView(rtv, z.clearColor);
+        // TILED: one RTV over the whole wide image (each view drawn at a tile
+        // viewport). ARRAY: one RTV per slice (TEXTURE2DARRAY, FirstArraySlice=vi),
+        // each view drawn full-viewport into its slice. Clear once per RTV.
+        ID3D11RenderTargetView* rtv = nullptr; // TILED shared RTV
+        if (!arrayLayout) {
+            CreateRenderTargetView(renderer, z.images[imageIndex].texture,
+                                   static_cast<DXGI_FORMAT>(z.format), &rtv);
+            renderer.context->ClearRenderTargetView(rtv, z.clearColor);
+        }
         renderer.context->ClearDepthStencilView(z.depthDSV.Get(),
             D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
 
@@ -1085,8 +1115,28 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
         renderer.cubeRotation += z.spinPhase;
 
         for (uint32_t vi = 0; vi < n; vi++) {
+            // Select the render target + viewport for this view.
+            ID3D11RenderTargetView* viewRtv = rtv; // TILED default
+            ID3D11RenderTargetView* sliceRtv = nullptr;
+            if (arrayLayout) {
+                // Per-slice TEXTURE2DARRAY RTV pinned to slice vi.
+                D3D11_RENDER_TARGET_VIEW_DESC rd = {};
+                rd.Format = static_cast<DXGI_FORMAT>(z.format);
+                rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+                rd.Texture2DArray.MipSlice = 0;
+                rd.Texture2DArray.FirstArraySlice = vi;
+                rd.Texture2DArray.ArraySize = 1;
+                if (FAILED(renderer.device->CreateRenderTargetView(
+                        z.images[imageIndex].texture, &rd, &sliceRtv))) {
+                    LOG_ERROR("[zones] zone %u view %u: array RTV creation failed", z.zoneId, vi);
+                    continue;
+                }
+                renderer.context->ClearRenderTargetView(sliceRtv, z.clearColor);
+                viewRtv = sliceRtv;
+            }
+
             D3D11_VIEWPORT vp = {};
-            vp.TopLeftX = (FLOAT)(vi * z.tileW);
+            vp.TopLeftX = arrayLayout ? 0.0f : (FLOAT)(vi * z.tileW);
             vp.TopLeftY = 0.0f;
             vp.Width = (FLOAT)z.tileW;
             vp.Height = (FLOAT)z.tileH;
@@ -1095,15 +1145,18 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
 
             const XMMATRIX viewMatrix = ColumnMajorToXMMatrix(rigViews[vi].view_matrix);
             const XMMATRIX projMatrix = ColumnMajorToXMMatrix(rigViews[vi].projection_matrix);
-            RenderScene(renderer, rtv, z.depthDSV.Get(), z.tileW, z.tileH,
+            RenderScene(renderer, viewRtv, z.depthDSV.Get(), z.tileW, z.tileH,
                         viewMatrix, projMatrix, 1.0f, 0.03f);
 
             projViews[zi][vi].subImage.swapchain = z.swapchain;
-            projViews[zi][vi].subImage.imageRect.offset = {(int32_t)(vi * z.tileW), 0};
+            // ARRAY: full image at slice vi. TILED: tile vi within the wide image.
+            projViews[zi][vi].subImage.imageRect.offset = {arrayLayout ? 0 : (int32_t)(vi * z.tileW), 0};
             projViews[zi][vi].subImage.imageRect.extent = {(int32_t)z.tileW, (int32_t)z.tileH};
-            projViews[zi][vi].subImage.imageArrayIndex = 0;
+            projViews[zi][vi].subImage.imageArrayIndex = arrayLayout ? vi : 0;
             projViews[zi][vi].pose = zoneViews[vi].pose;
             projViews[zi][vi].fov = rigViews[vi].fov;
+
+            if (sliceRtv) sliceRtv->Release();
         }
 
         renderer.cubeRotation = savedRotation;
@@ -1122,14 +1175,30 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
         // belong to AUTO / Tier-3, whose wish feathers M inward to 0.
         if (g_wishMode != 1) {
             for (uint32_t vi = 0; vi < n; vi++) {
+                ID3D11RenderTargetView* fadeRtv = rtv; // TILED shared RTV
+                ID3D11RenderTargetView* sliceRtv = nullptr;
+                if (arrayLayout) {
+                    D3D11_RENDER_TARGET_VIEW_DESC rd = {};
+                    rd.Format = static_cast<DXGI_FORMAT>(z.format);
+                    rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+                    rd.Texture2DArray.MipSlice = 0;
+                    rd.Texture2DArray.FirstArraySlice = vi;
+                    rd.Texture2DArray.ArraySize = 1;
+                    if (FAILED(renderer.device->CreateRenderTargetView(
+                            z.images[imageIndex].texture, &rd, &sliceRtv))) {
+                        continue;
+                    }
+                    fadeRtv = sliceRtv;
+                }
                 D3D11_VIEWPORT vp = {};
-                vp.TopLeftX = (FLOAT)(vi * z.tileW);
+                vp.TopLeftX = arrayLayout ? 0.0f : (FLOAT)(vi * z.tileW);
                 vp.TopLeftY = 0.0f;
                 vp.Width = (FLOAT)z.tileW;
                 vp.Height = (FLOAT)z.tileH;
                 vp.MaxDepth = 1.0f;
                 renderer.context->RSSetViewports(1, &vp);
-                DrawZoneEdgeFade(renderer, rtv, z.tileW, z.tileH);
+                DrawZoneEdgeFade(renderer, fadeRtv, z.tileW, z.tileH);
+                if (sliceRtv) sliceRtv->Release();
             }
         }
 

@@ -11,6 +11,34 @@ Each compositor maintains two distinct, unrelated swapchains. Understanding this
 - **Content**: the app renders a tiled atlas of views into this swapchain
 - **Flow direction**: app → compositor (input)
 
+#### View addressing: tiled vs layered (array) swapchains
+
+`XrSwapchainSubImage` exposes **two** ways to address a per-view image, and the
+runtime honors whichever the app submits on **every** graphics API:
+
+- **Tiled** (`arraySize = 1`): views packed side-by-side in one image; each view
+  is addressed by `imageRect.offset`/`extent`. This is the layout native and
+  tool apps use, and the only layout that can host `view_count > 2` light-field
+  content.
+- **Layered / array** (`arraySize = N`): one texture-array swapchain whose slices
+  hold the per-view images; each view is addressed by `imageArrayIndex` (with
+  `imageRect` selecting a sub-rect *within* the slice). This is what engine
+  single-pass-instanced stereo (Unity SPI, Unreal Instanced Stereo) and every
+  PC-VR runtime produce, and is capped at the engine's efficient multiview count
+  (typically 2).
+
+Both are first-class on D3D11, D3D12, Vulkan, OpenGL, and Metal — the compositor
+selects the array slice at the per-view atlas-blit sampling site (D3D12/D3D11:
+`Texture2DArray` SRV; Vulkan: `baseArrayLayer`; GL: `sampler2DArray` layer; Metal:
+per-slice 2D texture view). The two addressing modes are orthogonal (a layered
+submission may still use `imageRect`). The **display-processor contract is
+unchanged** either way: the DP always receives a single flat tiled atlas (see
+`process_atlas` below) — array resolution happens entirely upstream, in the
+compositor. Consequently a layered submission never satisfies
+`u_tiling_can_zero_copy()` (slices ≠ tiles), so it always takes the crop/blit
+path; one atlas blit per frame is the floor for array content, matching every
+PC-VR runtime.
+
 ### Target Swapchain
 
 - **Allocated by**: the compositor

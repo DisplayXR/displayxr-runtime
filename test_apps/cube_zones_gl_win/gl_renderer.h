@@ -58,10 +58,16 @@ struct GLRenderer {
 // the per-zone ID3D11DepthStencilView + per-image RTV the D3D11 app builds.
 // ---------------------------------------------------------------------------
 struct GLZoneResources {
-    std::vector<GLuint> fbos;   // one per swapchain image
+    // TILED: one FBO per swapchain image (whole wide GL_TEXTURE_2D image).
+    // ARRAY: one FBO per (image, slice) — index [image*arraySize + slice] —
+    // each attaching one layer of the GL_TEXTURE_2D_ARRAY via
+    // glFramebufferTextureLayer.
+    std::vector<GLuint> fbos;
     GLuint depthRBO = 0;
-    uint32_t fullW = 0;         // tileW * tileCount
+    uint32_t fullW = 0;         // TILED: tileW*tileCount; ARRAY: tileW (per-view)
     uint32_t fullH = 0;
+    bool arrayLayout = false;
+    uint32_t arraySize = 1;     // number of array slices (ARRAY layout)
 };
 
 // Initialize OpenGL renderer (create shaders, geometry)
@@ -72,10 +78,15 @@ bool CreateSwapchainFBOs(GLRenderer& renderer,
     const GLuint* images, uint32_t count,
     uint32_t width, uint32_t height);
 
-// Create per-zone FBOs + depth for a horizontally tiled zone swapchain.
+// Create per-zone FBOs + depth for a zone swapchain. TILED (arraySize<=1):
+// one FBO per image over a horizontally tiled GL_TEXTURE_2D (fullWidth =
+// tileW*tileCount). ARRAY (arraySize>1): fullWidth = tileW (per-view), one FBO
+// per (image, slice) attaching the GL_TEXTURE_2D_ARRAY layer via
+// glFramebufferTextureLayer.
 bool CreateZoneFBOs(GLZoneResources& zr,
     const GLuint* images, uint32_t count,
-    uint32_t fullWidth, uint32_t fullHeight);
+    uint32_t fullWidth, uint32_t fullHeight,
+    uint32_t arraySize = 1);
 
 void DestroyZoneFBOs(GLZoneResources& zr);
 
@@ -106,6 +117,8 @@ void RenderScene(
 //
 // clearColor: pointer to 4 premultiplied RGBA floats, or nullptr to skip the
 //             color clear for this tile (depth still clears).
+// slice: array layer to render into (ARRAY layout). Ignored (tile placed by
+// tileX) in TILED layout.
 void RenderZoneTile(
     GLRenderer& renderer,
     GLZoneResources& zr,
@@ -117,7 +130,8 @@ void RenderZoneTile(
     const float* clearColor,        // nullptr = skip color clear (depth still cleared)
     float cubeY = 0.03f,
     float cubeZ = 0.0f,
-    float cubeSize = 0.06f
+    float cubeSize = 0.06f,
+    uint32_t slice = 0
 );
 
 // Content-alpha edge fade (ADR-027 rule 4): multiply the current tile's dst
@@ -131,7 +145,8 @@ void DrawZoneEdgeFade(
     uint32_t imageIndex,
     uint32_t tileX,
     uint32_t tileW, uint32_t tileH,
-    float featherPx
+    float featherPx,
+    uint32_t slice = 0
 );
 
 // Cleanup

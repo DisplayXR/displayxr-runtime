@@ -358,14 +358,44 @@ bool CreateSwapchainFBOs(GLRenderer& renderer,
 
 bool CreateZoneFBOs(GLZoneResources& zr,
     const GLuint* images, uint32_t count,
-    uint32_t fullWidth, uint32_t fullHeight)
+    uint32_t fullWidth, uint32_t fullHeight,
+    uint32_t arraySize)
 {
     zr.fullW = fullWidth;
     zr.fullH = fullHeight;
+    zr.arrayLayout = arraySize > 1;
+    zr.arraySize = zr.arrayLayout ? arraySize : 1;
 
+    // Depth is sized to the render extent: the per-view tile (== fullWidth in
+    // ARRAY layout) or the whole wide image (TILED layout).
     glGenRenderbuffers_(1, &zr.depthRBO);
     glBindRenderbuffer_(GL_RENDERBUFFER, zr.depthRBO);
     glRenderbufferStorage_(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, fullWidth, fullHeight);
+
+    if (zr.arrayLayout) {
+        // One FBO per (image, slice), attaching one array layer as the color
+        // target via glFramebufferTextureLayer (GL_TEXTURE_2D_ARRAY images).
+        zr.fbos.resize((size_t)count * zr.arraySize);
+        glGenFramebuffers_((GLsizei)zr.fbos.size(), zr.fbos.data());
+        for (uint32_t i = 0; i < count; i++) {
+            for (uint32_t s = 0; s < zr.arraySize; s++) {
+                const size_t fi = (size_t)i * zr.arraySize + s;
+                glBindFramebuffer_(GL_FRAMEBUFFER, zr.fbos[fi]);
+                glFramebufferTextureLayer_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                           images[i], 0, (GLint)s);
+                glFramebufferRenderbuffer_(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                           GL_RENDERBUFFER, zr.depthRBO);
+                if (glCheckFramebufferStatus_(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+                    LOG_ERROR("[zones] zone ARRAY FBO incomplete for image %u slice %u", i, s);
+                    return false;
+                }
+            }
+        }
+        glBindFramebuffer_(GL_FRAMEBUFFER, 0);
+        LOG_INFO("[zones] created %u ARRAY zone FBOs (%u images x %u slices, %ux%u)",
+                 (unsigned)zr.fbos.size(), count, zr.arraySize, fullWidth, fullHeight);
+        return true;
+    }
 
     zr.fbos.resize(count);
     glGenFramebuffers_(count, zr.fbos.data());
@@ -533,11 +563,15 @@ void RenderZoneTile(
     const float* clearColor,
     float cubeY,
     float cubeZ,
-    float cubeSize
+    float cubeSize,
+    uint32_t slice
 ) {
-    glBindFramebuffer_(GL_FRAMEBUFFER, zr.fbos[imageIndex]);
+    // ARRAY: per-(image,slice) FBO, view drawn full-viewport into slice.
+    // TILED: per-image FBO, view drawn at its tile-column viewport.
+    const size_t fboIdx = zr.arrayLayout ? ((size_t)imageIndex * zr.arraySize + slice) : imageIndex;
+    glBindFramebuffer_(GL_FRAMEBUFFER, zr.fbos[fboIdx]);
 
-    const uint32_t vpX = tileX * tileW;
+    const uint32_t vpX = zr.arrayLayout ? 0 : (tileX * tileW);
     glViewport(vpX, 0, tileW, tileH);
     glScissor(vpX, 0, tileW, tileH);
     glEnable(GL_SCISSOR_TEST);
@@ -589,13 +623,15 @@ void DrawZoneEdgeFade(
     uint32_t imageIndex,
     uint32_t tileX,
     uint32_t tileW, uint32_t tileH,
-    float featherPx
+    float featherPx,
+    uint32_t slice
 ) {
     if (featherPx <= 0.0f) return;          // DXR_ZONES_FADE_PX=0 disables
     if (!EnsureEdgeFadePass(renderer)) return;
 
-    glBindFramebuffer_(GL_FRAMEBUFFER, zr.fbos[imageIndex]);
-    const uint32_t vpX = tileX * tileW;
+    const size_t fboIdx = zr.arrayLayout ? ((size_t)imageIndex * zr.arraySize + slice) : imageIndex;
+    glBindFramebuffer_(GL_FRAMEBUFFER, zr.fbos[fboIdx]);
+    const uint32_t vpX = zr.arrayLayout ? 0 : (tileX * tileW);
     glViewport(vpX, 0, tileW, tileH);
     glScissor(vpX, 0, tileW, tileH);
     glEnable(GL_SCISSOR_TEST);

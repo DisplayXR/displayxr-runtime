@@ -1185,7 +1185,46 @@ metal_compositor_create_swapchain(struct xrt_compositor *xc,
 	MTLPixelFormat format = xrt_format_to_metal(info->format);
 	uint32_t bpp = metal_format_bytes_per_pixel(format);
 
+	// Layered (arraySize>1) swapchains cannot be backed by a single-plane
+	// IOSurface — a MTLTextureType2DArray needs `array_size` slices and an
+	// IOSurface is a single 2D plane. Under single-pass-instanced the app
+	// renders both eyes into slices 0/1 of one array texture and submits two
+	// projection views with imageArrayIndex 0/1; the compositor samples the
+	// slice (see the compose pass). Cross-API (Vulkan/MoltenVK) import of a
+	// layered swapchain is not a supported path, so array swapchains skip the
+	// IOSurface and allocate a plain array texture — the Metal native app gets
+	// the id<MTLTexture> directly via comp_metal_swapchain_get_texture().
+	const bool layered = info->array_size > 1;
+
 	for (uint32_t i = 0; i < msc->image_count; i++) {
+		MTLTextureDescriptor *desc = [MTLTextureDescriptor
+		    texture2DDescriptorWithPixelFormat:format
+		                                width:info->width
+		                               height:info->height
+		                            mipmapped:(info->mip_count > 1) ? YES : NO];
+		// PixelFormatView lets the compositor sample an sRGB swapchain through a
+		// UNORM view (sRGB passthrough — see the compose pass) without the GPU
+		// auto-decoding sRGB->linear. The app's own render target keeps the sRGB
+		// format, so its encoding (if any) is unchanged.
+		desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
+		             MTLTextureUsagePixelFormatView;
+		desc.storageMode = MTLStorageModeShared;
+
+		if (layered) {
+			desc.textureType = MTLTextureType2DArray;
+			desc.arrayLength = info->array_size;
+			msc->iosurfaces[i] = NULL;
+			msc->images[i] = [c->device newTextureWithDescriptor:desc];
+			if (msc->images[i] == nil) {
+				U_LOG_E("Failed to create layered swapchain image %u", i);
+				metal_swapchain_destroy(&msc->base.base);
+				return XRT_ERROR_ALLOCATION;
+			}
+			// No IOSurface native handle for layered swapchains.
+			msc->base.images[i].handle = (xrt_graphics_buffer_handle_t)0;
+			continue;
+		}
+
 		// Create IOSurface backing for cross-API sharing (Vulkan import)
 		NSDictionary *props = @{
 			(id)kIOSurfaceWidth: @(info->width),
@@ -1202,23 +1241,6 @@ metal_compositor_create_swapchain(struct xrt_compositor *xc,
 		msc->iosurfaces[i] = surface;
 
 		// Create MTLTexture from IOSurface (shared storage required)
-		MTLTextureDescriptor *desc = [MTLTextureDescriptor
-		    texture2DDescriptorWithPixelFormat:format
-		                                width:info->width
-		                               height:info->height
-		                            mipmapped:(info->mip_count > 1) ? YES : NO];
-		// PixelFormatView lets the compositor sample an sRGB swapchain through a
-		// UNORM view (sRGB passthrough — see the compose pass) without the GPU
-		// auto-decoding sRGB->linear. The app's own render target keeps the sRGB
-		// format, so its encoding (if any) is unchanged.
-		desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
-		             MTLTextureUsagePixelFormatView;
-		desc.storageMode = MTLStorageModeShared;
-		if (info->array_size > 1) {
-			desc.textureType = MTLTextureType2DArray;
-			desc.arrayLength = info->array_size;
-		}
-
 		msc->images[i] = [c->device newTextureWithDescriptor:desc
 		                                           iosurface:surface
 		                                               plane:0];
@@ -2963,13 +2985,29 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				if (src_tex == nil) {
 					continue;
 				}
-				// sRGB passthrough: sample an app sRGB swapchain through a UNORM
-				// view so the GPU does not auto-decode sRGB->linear; the DP wants
-				// display-referred bytes. No-op for UNORM. Mirrors GL/D3D/VK.
+				// Select the array slice (imageArrayIndex) AND apply sRGB->UNORM
+				// passthrough in one view. Under single-pass-instanced the app
+				// submits an arraySize>1 texture with per-view slice 0/1; a plain
+				// 2D bind samples slice 0 for both eyes (flat output). A 2D view
+				// pinned to the slice binds correctly to the texture2d<float>
+				// shader — the Metal analog of the D3D12 #656 fix (mirrors
+				// D3D11/GL/VK). The sRGB->UNORM sample avoids the GPU
+				// auto-decoding sRGB->linear; the DP wants display-referred bytes
+				// (no-op for UNORM).
 				{
-					MTLPixelFormat unorm_fmt = metal_srgb_to_unorm(src_tex.pixelFormat);
-					if (unorm_fmt != src_tex.pixelFormat) {
-						id<MTLTexture> v = [src_tex newTextureViewWithPixelFormat:unorm_fmt];
+					MTLPixelFormat view_fmt = metal_srgb_to_unorm(src_tex.pixelFormat);
+					if (src_tex.textureType == MTLTextureType2DArray) {
+						uint32_t array_index = layer->data.proj.v[eye].sub.array_index;
+						id<MTLTexture> v = [src_tex
+						    newTextureViewWithPixelFormat:view_fmt
+						                      textureType:MTLTextureType2D
+						                           levels:NSMakeRange(0, src_tex.mipmapLevelCount)
+						                           slices:NSMakeRange(array_index, 1)];
+						if (v != nil) {
+							src_tex = v;
+						}
+					} else if (view_fmt != src_tex.pixelFormat) {
+						id<MTLTexture> v = [src_tex newTextureViewWithPixelFormat:view_fmt];
 						if (v != nil) {
 							src_tex = v;
 						}
