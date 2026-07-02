@@ -302,112 +302,105 @@ user can audit at a glance.
 
 ## PHASE 4.5: CODE-SIGN THE WINDOWS INSTALLER (capability-gated)
 
-GitHub-hosted CI builds the installer **unsigned** (no cert/secret is kept in
-this public repo). A signed release is produced by building on a Windows host
-and signing via whatever capability the operator's environment provides, then
-**replacing** the CI asset. This phase no-ops cleanly when no signing is
-configured (the release ships the unsigned CI installer, exactly as before).
+GitHub-hosted CI builds the installer **unsigned** (no cert/secret lives in this
+public repo — contributor PRs and pushes stay unsigned by design). A signed
+release is produced by the **self-hosted signing runner** (the box that holds
+the DigiCert EV cert): it rebuilds the tagged commit with the box-local signer,
+signs the whole chain (inner binaries → installer `.exe` → the NSIS
+uninstaller), and returns the signed installer as an artifact this skill uploads
+over the CI asset. **This box needs no Windows toolchain and holds no secret** —
+it only dispatches the runner workflow and re-uploads the result, so `/release`
+runs from macOS/Linux/Windows alike. If the runner is unreachable, the release
+still ships the unsigned CI installer (signing is never a gate on publishing).
 
-Why the installer is (re)built rather than re-signed in place: SAC checks the
+Why the runner rebuilds (rather than re-signing the CI `.exe`): SAC checks the
 **DLLs extracted from the installer at load time**, so the inner binaries must
-be signed **before** NSIS packs them — you can't fix that by re-signing the
-finished `.exe`.
+be signed **before** NSIS packs them; and the two-pass signed uninstaller needs
+makensis to run on the cert machine. Both are only possible where the cert is.
 
-### Step 4.5.1: Resolve the signing method
-Two methods, resolved in order. **Both require a Windows host** (the installer
-build needs MSVC + NSIS). Neither puts any signing endpoint or secret in this
-repo — the operator's environment supplies it.
-
-- **Remote** — `$DXR_SIGN_HOOK` points at a local, operator-provided executable
-  that signs a *folder of binaries in place*. It encapsulates the signing
-  endpoint (this repo names nothing). Use when the build host has no local
-  signer of its own.
-- **Local** — `$SIGN_CMD` is a per-file signer available on the build host
-  (the variable `build_windows.bat` honors).
+### Step 4.5.1: Resolve signing capability (OS-agnostic)
+The capability is simply *"can this box dispatch the signing runner?"* — no
+Windows host required. The runner workflow (`build-signed-release.yml`) and the
+cert live in the provider repo `$DXR_SIGN_REPO` (default `LeiaInc/codesign-runner`);
+this repo names no endpoint. To swap signers set `DXR_SIGN_REPO` to another repo
+implementing the same workflow; lose the provider and the release ships unsigned.
+Contract + fallbacks: `docs/specs/runtime/release-signing.md`.
 
 ```bash
-WINHOST=$(uname -s | grep -qiE 'mingw|msys|cygwin|windows' && echo yes || echo no)
-if [ -n "$DXR_SIGN_HOOK" ] && [ -x "$DXR_SIGN_HOOK" ] && [ "$WINHOST" = yes ]; then
-  SIGN_METHOD=remote; SIGNED=yes
-elif [ -n "$SIGN_CMD" ] && [ "$WINHOST" = yes ]; then
-  SIGN_METHOD=local;  SIGNED=yes
+SIGN_REPO="${DXR_SIGN_REPO:-LeiaInc/codesign-runner}"
+if gh workflow view build-signed-release.yml -R "$SIGN_REPO" >/dev/null 2>&1; then
+  SIGNED=yes
 else
-  echo "⚠  SIGNING SKIPPED — no signing capability on this machine."
+  echo "⚠  SIGNING SKIPPED — no access to the signing runner ($SIGN_REPO)."
   echo "   The release will ship the UNSIGNED CI installer. To sign, re-run"
-  echo "   /release on a Windows build host with either DXR_SIGN_HOOK (remote)"
-  echo "   or SIGN_CMD (local) configured."
-  SIGN_METHOD=none; SIGNED=no
+  echo "   /release from a box whose gh auth can dispatch that workflow."
+  SIGNED=no
 fi
 ```
 
-If `SIGNED=no`, skip straight to Phase 5 and carry the warning into the
-final report.
+If `SIGNED=no`, skip straight to Phase 5 and carry the warning into the report.
 
-Always build the exact released commit first:
+### Step 4.5.2: Dispatch the runner build, wait, fetch the signed installer
 ```bash
-git fetch --tags --quiet
-git checkout [FULL_TAG]
+SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+gh workflow run build-signed-release.yml -R "$SIGN_REPO" \
+   -f component=runtime -f repo=DisplayXR/displayxr-runtime -f ref=[FULL_TAG]
+
+# Locate the run we just dispatched.
+SIGN_RUN=""
+for _ in $(seq 1 20); do
+  SIGN_RUN=$(gh run list -R "$SIGN_REPO" --workflow build-signed-release.yml \
+              --event workflow_dispatch --limit 8 --json databaseId,createdAt \
+              --jq "[.[]|select(.createdAt>=\"$SINCE\")]|sort_by(.createdAt)|last|.databaseId // empty")
+  [ -n "$SIGN_RUN" ] && break; sleep 5
+done
+[ -n "$SIGN_RUN" ] || { echo "Could not locate the signing run — ship unsigned"; SIGNED=no; }
+
+# Wait for it (runtime build is slow — allow ~30 min).
+[ "$SIGNED" = yes ] && gh run watch "$SIGN_RUN" -R "$SIGN_REPO" --interval 30 --exit-status \
+  || { echo "Signing run failed — ship the unsigned CI asset, flag in report"; SIGNED=no; }
+
+# Download the signed installer.
+if [ "$SIGNED" = yes ]; then
+  rm -rf _signed && gh run download "$SIGN_RUN" -R "$SIGN_REPO" -n signed-installer -D _signed
+  SIGNED_EXE=$(ls _signed/DisplayXRSetup-*.exe 2>/dev/null | head -1)
+  [ -n "$SIGNED_EXE" ] || { echo "No signed installer in the artifact — ship unsigned"; SIGNED=no; }
+fi
 ```
 
-### Step 4.5.2a: Local signed build (SIGN_METHOD=local)
-With `SIGN_CMD` set, `build_windows.bat` signs every inner binary before NSIS
-packs them, signs the installer `.exe`, and the `.nsi` signs the embedded
-uninstaller — the whole chain.
-```bash
-cmd //c "scripts\\build_windows.bat all"
-```
-
-### Step 4.5.2b: Remote signed build via the hook (SIGN_METHOD=remote)
-Build unsigned, sign the inner binaries through the hook (one batch), then let
-NSIS pack the now-signed binaries, and finally sign the installer `.exe`:
-```bash
-cmd //c "scripts\\build_windows.bat build"      # _package\bin, UNSIGNED (SIGN_CMD unset)
-"$DXR_SIGN_HOOK" _package/bin                    # sign inner binaries in place, remotely
-cmd //c "scripts\\build_windows.bat installer"   # NSIS packs the now-signed bins
-mkdir -p _sign && cp _package/DisplayXRSetup-*.exe _sign/ \
-  && "$DXR_SIGN_HOOK" _sign && cp _sign/*.exe _package/   # sign the installer .exe
-```
-**Remote-mode caveat:** the NSIS **uninstaller** is *not* signed in this mode
-(its `!uninstfinalize` needs a local per-file `SIGN_CMD` during makensis; the
-hook is per-folder/out-of-process). The uninstaller isn't in the app load
-path, so this is an accepted interim gap — use the **local** `SIGN_CMD` method
-for full-fidelity signing including the uninstaller. Note it in the report.
-
-### Step 4.5.2c: Verify the installer signature
-The signed installer lands at `_package\DisplayXRSetup-[VERSION].*.exe`
-(local build number, so the filename may differ from CI's). Verify:
-
-```bash
-SIGNED_EXE=$(ls _package/DisplayXRSetup-*.exe | head -1)
-powershell -NoProfile -Command "(Get-AuthenticodeSignature '$SIGNED_EXE').Status" # must print 'Valid'
-```
-If the status is not `Valid`, STOP and report — do not upload an
-unsigned/invalid binary over a release.
+The runner already fail-closed-verifies `Status=Valid` AND signer contains
+`Leia` before uploading the artifact, so a returned installer is trustworthy.
+(On a Windows box you may re-verify locally with `Get-AuthenticodeSignature`;
+elsewhere trust the runner's gate.)
 
 ### Step 4.5.3: Replace the CI asset on the release
-Delete the unsigned CI installer from the release and upload the signed
-one. (Names may differ by build number, so delete by the CI asset's
-actual name, then upload the local file.)
-
 ```bash
-CI_EXE=$(gh release view [FULL_TAG] --repo DisplayXR/displayxr-runtime \
-           --json assets --jq '.assets[].name | select(test("^DisplayXRSetup-.*\\.exe$"))')
-[ -n "$CI_EXE" ] && gh release delete-asset [FULL_TAG] "$CI_EXE" --yes \
-  --repo DisplayXR/displayxr-runtime
-gh release upload [FULL_TAG] "$SIGNED_EXE" --clobber \
-  --repo DisplayXR/displayxr-runtime
+if [ "$SIGNED" = yes ]; then
+  CI_EXE=$(gh release view [FULL_TAG] --repo DisplayXR/displayxr-runtime \
+             --json assets --jq '.assets[].name | select(test("^DisplayXRSetup-.*\\.exe$"))')
+  [ -n "$CI_EXE" ] && gh release delete-asset [FULL_TAG] "$CI_EXE" --yes \
+    --repo DisplayXR/displayxr-runtime
+  gh release upload [FULL_TAG] "$SIGNED_EXE" --clobber \
+    --repo DisplayXR/displayxr-runtime
+fi
 ```
-
-Restore the working tree afterwards: `git checkout main`.
+No local checkout to restore — nothing was built or checked out on this box.
 
 ### Step 4.5.4: Scope note
-This phase signs **only the runtime installer**. The vendor plug-in,
-the Unity plug-in, demos, and the shell are signed by **their own**
-release flows (`/dxr-release <component>`, the Unity repo's `/release`,
-etc.) — each carries the same `DXR_SIGN_HOOK` (remote) / `SIGN_CMD` (local)
-gate. A user installing the full stack gets every layer signed only when
-each component was released with signing configured. Carry into the report
-which layers this run covered (runtime only) and by which method.
+This phase signs **only the runtime installer**. The vendor plug-in, the Unity
+plug-in, demos, and the shell are signed by **their own** release flows
+(`/dxr-release <component>`, the Unity repo's `/release`, etc.) — each dispatches
+the same `build-signed-release.yml` on the signing runner. A user installing the
+full stack gets every layer signed only when each component was released with
+the runner reachable. Report which layers this run covered (runtime only).
+
+### Step 4.5.5: Legacy local-Windows fallback (offline / runner down)
+If the signing runner is unavailable but you're on a Windows build host that has
+the cert locally, the pre-runner path still works: `git checkout [FULL_TAG]`,
+`cmd //c "scripts\\build_windows.bat all"` with `SIGN_CMD` set (full-chain local
+signing incl. uninstaller), verify `Get-AuthenticodeSignature … = Valid`, then
+the Step 4.5.3 asset swap. This is the only path that does **not** need the
+runner — use it only when the runner can't be reached.
 
 ---
 
@@ -497,9 +490,8 @@ Release [FULL_TAG] published successfully!
 
 Build:     Windows CI run #RUN_ID — Runtime + cube test apps passed
            [list any pre-existing-broken jobs here, with note that they don't affect the artifact]
-Signing:   [remote → "runtime installer signed via DXR_SIGN_HOOK and re-uploaded over the CI asset (uninstaller unsigned in remote mode)"]
-           [local  → "runtime installer fully signed (incl. uninstaller) via local SIGN_CMD and re-uploaded"]
-           [none   → "⚠ UNSIGNED — released from a non-signing machine; re-run /release on a Windows build host with DXR_SIGN_HOOK or SIGN_CMD set"]
+Signing:   [signed → "runtime installer built + signed on the signing runner (full chain incl. uninstaller, run $SIGN_RUN), re-uploaded over the CI asset"]
+           [none   → "⚠ UNSIGNED — signing runner unreachable; re-run /release from a box whose gh can dispatch build-signed-release.yml on the signing runner"]
 Release:   https://github.com/DisplayXR/displayxr-runtime/releases/tag/[FULL_TAG]
 Assets:    DisplayXRSetup-X.Y.Z.BUILD.exe (~N MB)
            DisplayXR-Installer-X.Y.Z.pkg (~N MB)  [or "skipped — macOS run did not produce .pkg"]

@@ -182,6 +182,18 @@ To make them invocable from *any* directory (not just a runtime checkout), `scri
 
 Full spec: `docs/specs/runtime/versions-json-autobump.md`.
 
+### Release code-signing
+CI builds are **unsigned** (contributors need no signing access). Signed
+releases are produced by a **signing provider** — a repo (`$DXR_SIGN_REPO`,
+default private `LeiaInc/codesign-runner`) that owns the EV cert on a self-hosted
+runner and exposes `build-signed-release.yml` (build+sign a component) and
+`sign-artifact` (sign a folder). The `/release`, `/dxr-release`, and
+`/installer-release` skills dispatch it, download the signed artifact, and
+replace the unsigned CI asset — so they run from **any OS** (no local Windows,
+no local secret). Signing never gates publishing: if the provider is unreachable
+the release ships unsigned; swap providers by setting `DXR_SIGN_REPO`. Full
+spec: `docs/specs/runtime/release-signing.md`.
+
 ## Repos & issue routing
 
 | Repo | Visibility | Contents |

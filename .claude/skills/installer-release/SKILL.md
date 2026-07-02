@@ -200,45 +200,71 @@ Confirm:
 ## PHASE 4.5: CODE-SIGN THE BUNDLE .EXE (capability-gated)
 
 The bundle wraps **already-signed** component installers (each signed at its
-own release), so it only needs its own outer `.exe` signed — a simple post-hoc
+own release), so it only needs its own outer `.exe` signed — a post-hoc
 **single-file** sign, no inner-binary handling and no rebuild. (signtool on a
-finished NSIS `.exe` is safe; that's ordinary. Only *rcedit* corrupts NSIS.)
-CI builds it unsigned; a signed release is produced by signing the `.exe` and
-re-uploading. No signing endpoint is named here.
+finished NSIS `.exe` is safe/ordinary; only *rcedit* corrupts NSIS.) So unlike
+components (which rebuild on the runner), the bundle uses the provider's
+folder-sign workflow **`sign-artifact`** — the same primitive `sign-hook.sh`
+wraps, dispatched inline here so it needs **no local hook file and no Windows
+host** (runs from the Mac). Full contract + how to swap providers:
+`docs/specs/runtime/release-signing.md`.
 
-Resolve the method (a single-file sign needs no build, so **remote works from
-any host** incl. the Mac):
-- **Remote** — `$DXR_SIGN_HOOK` (a local executable that signs a folder in place).
-- **Local** — `$SIGN_CMD` (per-file signer; needs a Windows host for signtool).
-
+### Step 4.5.1: Resolve capability (OS-agnostic)
 ```bash
-if [ -n "$DXR_SIGN_HOOK" ] && [ -x "$DXR_SIGN_HOOK" ]; then
-  SIGN_METHOD=remote; SIGNED=yes
-elif [ -n "$SIGN_CMD" ] && uname -s | grep -qiE 'mingw|msys|cygwin|windows'; then
-  SIGN_METHOD=local;  SIGNED=yes
+SIGN_REPO="${DXR_SIGN_REPO:-LeiaInc/codesign-runner}"
+if gh workflow view sign-artifact -R "$SIGN_REPO" >/dev/null 2>&1; then
+  SIGNED=yes
 else
-  echo "⚠  BUNDLE UNSIGNED — set DXR_SIGN_HOOK (remote) or SIGN_CMD (local, Windows) to sign."
-  SIGN_METHOD=none; SIGNED=no
+  echo "⚠  BUNDLE UNSIGNED — no access to the signing provider ($SIGN_REPO)."
+  echo "   The release ships the unsigned CI bundle. Set DXR_SIGN_REPO to a repo"
+  echo "   implementing 'sign-artifact', or re-run from a box with provider access."
+  SIGNED=no
 fi
+```
 
+### Step 4.5.2: Download → dispatch `sign-artifact` → re-upload
+```bash
 if [ "$SIGNED" = yes ]; then
   D=$(mktemp -d)
   EXE=$(gh release view "$TAG" -R DisplayXR/displayxr-installer --json assets \
          --jq '.assets[].name | select(test("DisplayXRBundle-.*\\.exe$"))')
-  gh release download "$TAG" -R DisplayXR/displayxr-installer -p "$EXE" -D "$D"
-  if [ "$SIGN_METHOD" = remote ]; then
-    "$DXR_SIGN_HOOK" "$D"                      # signs (+verifies) via the runner
+  gh release download "$TAG" -R DisplayXR/displayxr-installer -p "$EXE" -D "$D/in"
+
+  # Zip the finished .exe and hand it to the provider's folder-sign workflow.
+  ( cd "$D/in" && zip -qr "$D/unsigned.zip" . )
+  TMP="sign-bundle-$(date +%s)-$$"
+  gh release create "$TMP" -R "$SIGN_REPO" --prerelease --title "$TMP" \
+     --notes "temp bundle-signing payload (auto-deleted)" "$D/unsigned.zip"
+  SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  gh workflow run sign-artifact -R "$SIGN_REPO" -f release_tag="$TMP"
+
+  RID=""
+  for _ in $(seq 1 20); do
+    RID=$(gh run list -R "$SIGN_REPO" --workflow sign-artifact --event workflow_dispatch \
+            --limit 8 --json databaseId,createdAt \
+            --jq "[.[]|select(.createdAt>=\"$SINCE\")]|sort_by(.createdAt)|last|.databaseId // empty")
+    [ -n "$RID" ] && break; sleep 4
+  done
+  if [ -n "$RID" ] && gh run watch "$RID" -R "$SIGN_REPO" --interval 15 --exit-status; then
+    gh run download "$RID" -R "$SIGN_REPO" -n signed -D "$D/out"
+    ( cd "$D/out" && unzip -qo signed.zip -d "$D/signed" 2>/dev/null || true )
+    SIGNED_EXE=$(ls "$D/signed/$EXE" 2>/dev/null || ls "$D/out"/**/"$EXE" 2>/dev/null | head -1)
+    if [ -n "$SIGNED_EXE" ]; then
+      gh release upload "$TAG" "$SIGNED_EXE" --clobber -R DisplayXR/displayxr-installer
+      echo "Bundle .exe signed on the provider runner and re-uploaded."
+    else
+      echo "⚠ signed .exe not returned — leaving the unsigned CI bundle."; SIGNED=no
+    fi
   else
-    $SIGN_CMD "$D/$EXE"                        # bash word-splits SIGN_CMD; then verify:
-    powershell -NoProfile -Command "if((Get-AuthenticodeSignature '$D\\$EXE').Status -ne 'Valid'){exit 1}"
+    echo "⚠ sign-artifact run failed/absent — leaving the unsigned CI bundle."; SIGNED=no
   fi
-  gh release upload "$TAG" "$D/$EXE" --clobber -R DisplayXR/displayxr-installer
-  echo "Bundle .exe signed and re-uploaded ($SIGN_METHOD)."
+  # Always clean up the temp signing release/tag on the provider.
+  gh release delete "$TMP" -R "$SIGN_REPO" --yes --cleanup-tag >/dev/null 2>&1 || true
 fi
 ```
 
 Only the Windows `.exe` is covered; the macOS `.pkg` uses an Apple Developer ID
-cert + notarization (separate track). Carry `SIGNED`/`SIGN_METHOD` into the report.
+cert + notarization (separate track). Carry `SIGNED` into the report.
 
 ---
 
@@ -259,7 +285,7 @@ Release:    https://github.com/DisplayXR/displayxr-installer/releases/tag/$TAG
 Assets:     DisplayXRBundle-X.Y.Z.pkg (~N MB)
             DisplayXRBundle-X.Y.Z.exe (~N MB)
 Prerelease: true/false
-Signing:    [remote/local → "bundle .exe signed and re-uploaded"] | [none → "⚠ bundle UNSIGNED — set DXR_SIGN_HOOK / SIGN_CMD"]  (macOS .pkg: unsigned, TODO)
+Signing:    [signed → "bundle .exe signed on the provider runner (run $RID) and re-uploaded"] | [none → "⚠ bundle UNSIGNED — provider unreachable; set DXR_SIGN_REPO or ship unsigned"]  (macOS .pkg: unsigned, TODO)
 
 Source of truth verification:
   installer/versions.json == runtime/versions.json    ✓
@@ -283,12 +309,16 @@ STOP.
   bundle release is the punctuation that says "users go install
   this now."
 - Bundle `.exe` signing is a **post-hoc skill step** (Phase 4.5), not a CI
-  step — the signing key can't live on GitHub-hosted CI, and the org runner
-  isn't reachable from `displayxr-installer`'s CI. The skill signs the
-  finished `.exe` via `$DXR_SIGN_HOOK` (remote) or `$SIGN_CMD` (local) and
-  re-uploads. The wrapped component installers are already signed at their
-  own releases, so no inner-binary handling is needed. macOS `.pkg` signing
-  (Apple Developer ID + notarization) is still TODO.
+  step — the signing key can't live on GitHub-hosted CI, and the provider
+  runner isn't reachable from `displayxr-installer`'s CI. The skill dispatches
+  the provider's `sign-artifact` workflow (`$DXR_SIGN_REPO`, default
+  `LeiaInc/codesign-runner`) to sign the finished `.exe`, then re-uploads —
+  OS-agnostic, no local hook file. The wrapped component installers are already
+  signed at their own releases, so no inner-binary handling is needed. Lose the
+  provider → the release ships unsigned (gate fails, flagged in the report);
+  swap providers by setting `DXR_SIGN_REPO`. Full contract:
+  `docs/specs/runtime/release-signing.md`. macOS `.pkg` signing (Apple
+  Developer ID + notarization) is still TODO.
 - Don't bump component pins by hand in installer's versions.json —
   the file is auto-mirrored from runtime. If you find yourself
   wanting to, you're working around the system. Investigate why
