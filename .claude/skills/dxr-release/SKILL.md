@@ -188,66 +188,96 @@ CI_CONC="${S#completed/}"
 ## PHASE 3.5: CODE-SIGN THE COMPONENT INSTALLER (capability-gated)
 
 Same model as the runtime's `/release` skill: GitHub-hosted CI builds the
-component **unsigned** (no secret lives in these public repos). A signed
-release is produced by building on a Windows host and signing via the
-operator's configured capability, then replacing the CI asset. No-ops
-cleanly when nothing is configured.
+component **unsigned** (contributor PRs/pushes stay unsigned by design; no
+secret lives in these public repos). A signed release is produced by the
+**self-hosted signing runner** — it rebuilds the tagged commit with the
+box-local EV signer (full chain: inner binaries → installer `.exe` → the NSIS
+uninstaller) and returns the signed installer as an artifact this skill uploads
+over the CI asset. **This box needs no Windows toolchain and holds no secret**
+— it only dispatches the runner and re-uploads, so `/dxr-release` runs from any
+OS. If the runner is unreachable, the release ships the unsigned CI installer
+(signing never gates publishing).
 
-This matters most for **leia-plugin** — its vendor plug-in DLL is in the
-load path of every app that uses that display, so Smart App Control blocks
-it unsigned. Demos with Windows installers are next; `mcp` ships DLLs too.
+This matters most for **leia-plugin** — its vendor plug-in DLL is in the load
+path of every app that uses that display, so Smart App Control blocks it
+unsigned. Demos with Windows installers are next; `mcp` ships DLLs too.
 
-### Step 3.5.1: Resolve the signing method
-Two methods (both need a Windows host); neither names a signing endpoint in
-these repos:
-- **Remote** — `$DXR_SIGN_HOOK` (a local executable that signs a folder in place).
-- **Local** — `$SIGN_CMD` (a per-file signer the component's build honors).
+The per-component build recipe lives in the runner workflow
+(`build-signed-release.yml` on `$DXR_SIGN_REPO`, default `LeiaInc/codesign-runner`)
+— a single source of truth — so this skill only names the component + ref, not
+build commands. Swap signers by setting `DXR_SIGN_REPO`; lose the provider and
+the release ships unsigned. Contract: `docs/specs/runtime/release-signing.md`.
+
+### Step 3.5.1: Resolve signing capability (OS-agnostic)
+The capability is *"can this box dispatch the signing runner?"* — no Windows
+host, no local secret.
 
 ```bash
-WINHOST=$(uname -s | grep -qiE 'mingw|msys|cygwin|windows' && echo yes || echo no)
-if [ -n "$DXR_SIGN_HOOK" ] && [ -x "$DXR_SIGN_HOOK" ] && [ "$WINHOST" = yes ]; then
-  SIGN_METHOD=remote; SIGNED=yes
-elif [ -n "$SIGN_CMD" ] && [ "$WINHOST" = yes ]; then
-  SIGN_METHOD=local;  SIGNED=yes
+SIGN_REPO="${DXR_SIGN_REPO:-LeiaInc/codesign-runner}"
+if gh workflow view build-signed-release.yml -R "$SIGN_REPO" >/dev/null 2>&1; then
+  SIGNED=yes
 else
-  echo "⚠  SIGNING SKIPPED for $COMPONENT — no signing capability here."
-  echo "   Release ships the UNSIGNED CI installer. Re-run /dxr-release"
-  echo "   $COMPONENT $NEW_TAG on a Windows build host with DXR_SIGN_HOOK or SIGN_CMD set."
-  SIGN_METHOD=none; SIGNED=no   # continue — do not fail the release
+  echo "⚠  SIGNING SKIPPED for $COMPONENT — no access to the signing runner ($SIGN_REPO)."
+  echo "   Release ships the UNSIGNED CI installer. Re-run /dxr-release $COMPONENT $NEW_TAG"
+  echo "   from a box whose gh auth can dispatch that workflow."
+  SIGNED=no   # continue — do not fail the release
 fi
 ```
 
-### Step 3.5.2: Build + sign + replace asset (only if SIGNED=yes)
-Requires the component repo to carry the `SIGN_CMD`-gated build plumbing
-(sign inner binaries before NSIS, sign the installer, `!uninstfinalize` the
-uninstaller). **Plumbing status:** `leia-plugin` has it
-(`scripts/build-windows.bat`); demos / `mcp` do not yet — for those set
-`SIGNED=no` and continue (track per #664).
+**earthview is macOS-only for signing purposes:** its release asset is a macOS
+`.pkg`, which the Windows EV runner cannot sign (that needs an Apple Developer
+ID + `productsign` on a Mac — a separate flow). Force `SIGNED=no` for it:
+```bash
+case "$COMPONENT" in earthview|demo-earthview)
+  echo "earthview ships a macOS .pkg — Windows EV runner N/A. SIGNED=no."; SIGNED=no ;; esac
+```
+
+### Step 3.5.2: Normalize the component name for the workflow
+The workflow expects canonical names (`runtime|leia-plugin|mcp|gauss|modelviewer|mediaplayer|avatar`).
+Map the skill's aliases:
+```bash
+case "$COMPONENT" in
+  leia|leia-plugin)              COMP=leia-plugin ;;
+  gauss|demo-gaussiansplat)      COMP=gauss ;;
+  modelviewer|demo-modelviewer)  COMP=modelviewer ;;
+  avatar|demo-avatar)            COMP=avatar ;;
+  mediaplayer|demo-mediaplayer)  COMP=mediaplayer ;;
+  mcp)                           COMP=mcp ;;
+  *)                             COMP="$COMPONENT" ;;
+esac
+```
+
+### Step 3.5.3: Dispatch the runner build, wait, fetch + replace the asset (only if SIGNED=yes)
 
 ```bash
-cd "$WORK/repo"
-git checkout "$NEW_TAG"
+if [ "$SIGNED" = yes ]; then
+  SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  gh workflow run build-signed-release.yml -R "$SIGN_REPO" \
+     -f component="$COMP" -f repo="$REPO" -f ref="$NEW_TAG"
 
-# Component-specific build entry point (note the hyphen for leia-plugin).
-case "$COMPONENT" in
-  leia-plugin|leia) SCRIPT="scripts\\build-windows.bat" ;;
-  *) echo "No signing plumbing for $COMPONENT yet — skipping"; SIGNED=no ;;
-esac
-
-if [ "$SIGNED" = yes ] && [ "$SIGN_METHOD" = remote ]; then
-  cmd //c "$SCRIPT build"                        # UNSIGNED (SIGN_CMD unset)
-  "$DXR_SIGN_HOOK" _package/bin                  # sign inner binaries in place, remotely
-  cmd //c "$SCRIPT installer"                    # NSIS packs the now-signed bins
-  mkdir -p _sign && cp _package/*Setup-*.exe _sign/ \
-    && "$DXR_SIGN_HOOK" _sign && cp _sign/*.exe _package/   # sign the installer .exe
-  # remote mode: NSIS uninstaller unsigned — see /release Step 4.5.2b caveat.
-elif [ "$SIGNED" = yes ]; then                   # SIGN_METHOD=local
-  cmd //c "$SCRIPT all"                          # full local signing incl. uninstaller
+  SIGN_RUN=""
+  for _ in $(seq 1 20); do
+    SIGN_RUN=$(gh run list -R "$SIGN_REPO" --workflow build-signed-release.yml \
+                --event workflow_dispatch --limit 8 --json databaseId,createdAt \
+                --jq "[.[]|select(.createdAt>=\"$SINCE\")]|sort_by(.createdAt)|last|.databaseId // empty")
+    [ -n "$SIGN_RUN" ] && break; sleep 5
+  done
+  [ -n "$SIGN_RUN" ] || { echo "Could not locate the signing run — ship unsigned"; SIGNED=no; }
 fi
 
 if [ "$SIGNED" = yes ]; then
-  SIGNED_EXE=$(ls _package/*Setup-*.exe 2>/dev/null | head -1)
-  powershell -NoProfile -Command "(Get-AuthenticodeSignature '$SIGNED_EXE').Status" # must be 'Valid'
+  gh run watch "$SIGN_RUN" -R "$SIGN_REPO" --interval 30 --exit-status \
+    || { echo "Signing run failed — ship unsigned CI asset, flag in report"; SIGNED=no; }
+fi
+
+if [ "$SIGNED" = yes ]; then
+  rm -rf _signed && gh run download "$SIGN_RUN" -R "$SIGN_REPO" -n signed-installer -D _signed
+  SIGNED_EXE=$(ls _signed/*Setup-*.exe 2>/dev/null | head -1)
+  [ -n "$SIGNED_EXE" ] || { echo "No signed installer in the artifact — ship unsigned"; SIGNED=no; }
+fi
+
+if [ "$SIGNED" = yes ]; then
+  # The runner already fail-closed-verified Status=Valid AND signer=Leia.
   CI_EXE=$(gh release view "$NEW_TAG" -R "$REPO" --json assets \
              --jq '.assets[].name | select(test("Setup-.*\\.exe$"))')
   [ -n "$CI_EXE" ] && gh release delete-asset "$NEW_TAG" "$CI_EXE" --yes -R "$REPO"
@@ -255,7 +285,8 @@ if [ "$SIGNED" = yes ]; then
 fi
 ```
 
-Never upload an unverified binary. If verification isn't `Valid`, STOP.
+No local checkout, no local build, no Windows toolchain — the temp clone from
+Phase 1 is only used for the tag; signing happens entirely on the runner.
 
 ---
 
@@ -331,6 +362,8 @@ Release $NEW_TAG published successfully!
 Component:   $COMPONENT  ($REPO)
 CI:          run $RUN_ID — $CI_CONC
 Release:     https://github.com/$REL_REPO/releases/tag/$NEW_TAG
+Signing:     [signed → "installer built + signed on the signing runner (full chain incl. uninstaller, run $SIGN_RUN), re-uploaded over the CI asset"]
+             [none   → "⚠ UNSIGNED — signing runner unreachable / earthview macOS .pkg; ships the unsigned CI asset"]
 
 Auto-bump:
   versions.json[$FIELD] = $NEW_TAG   via $RT_BUMP_SHA on displayxr-runtime/main
