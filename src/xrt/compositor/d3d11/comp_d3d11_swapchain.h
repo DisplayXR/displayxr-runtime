@@ -87,6 +87,18 @@ void
 comp_d3d11_swapchain_get_dimensions(struct xrt_swapchain *xsc, uint32_t *out_w, uint32_t *out_h);
 
 /*!
+ * Get the array (layer) size of a swapchain (XrSwapchainCreateInfo.arraySize).
+ * Returns 1 for non-layered swapchains.
+ *
+ * @param xsc The swapchain.
+ * @return The number of array layers (>= 1).
+ *
+ * @ingroup comp_d3d11
+ */
+uint32_t
+comp_d3d11_swapchain_get_array_size(struct xrt_swapchain *xsc);
+
+/*!
  * Wait for GPU completion of all commands submitted up to the most recent
  * xrReleaseSwapchainImage for this swapchain.
  *

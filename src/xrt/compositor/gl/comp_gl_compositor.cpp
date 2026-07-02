@@ -138,6 +138,10 @@ struct comp_gl_swapchain
 	uint32_t image_count;
 	struct xrt_swapchain_create_info info;
 
+	//! GL texture target: GL_TEXTURE_2D for single-layer swapchains,
+	//! GL_TEXTURE_2D_ARRAY for layered (arraySize>1) swapchains.
+	GLenum target;
+
 	int32_t acquired_index;
 	int32_t waited_index;
 	uint32_t last_released_index;
@@ -178,6 +182,23 @@ static const char *FS_BLIT =
     "void main() {\n"
     "    vec2 uv = u_src_rect.xy + v_uv * u_src_rect.zw;\n"
     "    fragColor = texture(u_texture, uv);\n"
+    "}\n";
+
+//! Fragment shader: blit one layer of an ARRAY texture to the atlas. Under
+//! single-pass-instanced the app submits ONE arraySize>1 (GL_TEXTURE_2D_ARRAY)
+//! swapchain with per-view imageArrayIndex 0 (left) / 1 (right); u_layer selects
+//! the slice. This is the GL analog of the D3D12 #656 / D3D11 array fix — a plain
+//! sampler2D always views layer 0 (flat output).
+static const char *FS_BLIT_ARRAY =
+    "#version 330 core\n"
+    "in vec2 v_uv;\n"
+    "out vec4 fragColor;\n"
+    "uniform sampler2DArray u_texture;\n"
+    "uniform vec4 u_src_rect;\n" // x, y, w, h in normalized coords
+    "uniform float u_layer;\n"   // array slice (imageArrayIndex)
+    "void main() {\n"
+    "    vec2 uv = u_src_rect.xy + v_uv * u_src_rect.zw;\n"
+    "    fragColor = texture(u_texture, vec3(uv, u_layer));\n"
     "}\n";
 
 //! Vertex shader: positioned quad for window-space layers.
@@ -263,6 +284,7 @@ struct comp_gl_compositor
 
 	// --- GL resources ---
 	GLuint program_blit;      //!< Shader for blitting eye to atlas texture
+	GLuint program_blit_array; //!< Blit shader for LAYERED (array) swapchains (sampler2DArray)
 	GLuint program_window_space; //!< Window-space layer (positioned quad)
 	GLuint vao_empty;         //!< Empty VAO for vertex-shader-generated fullscreen quad
 	GLuint fbo;               //!< Framebuffer for rendering into atlas texture
@@ -1215,19 +1237,31 @@ gl_compositor_create_swapchain(struct xrt_compositor *xc,
 	sc->waited_index = -1;
 	sc->last_released_index = 0;
 
-	// Create GL textures
+	// Create GL textures. Layered (arraySize>1) swapchains allocate a
+	// GL_TEXTURE_2D_ARRAY with `array_size` slices — under single-pass-instanced
+	// the app renders the two eyes into slices 0/1 of one array texture and
+	// submits them as two projection views with imageArrayIndex 0/1. Non-layered
+	// swapchains keep the GL_TEXTURE_2D path unchanged.
 	GLenum internal_format = xrt_format_to_gl_internal(info->format);
+	uint32_t array_size = info->array_size > 0 ? info->array_size : 1;
+	sc->target = array_size > 1 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
 	glGenTextures(image_count, sc->textures);
 
 	for (uint32_t i = 0; i < image_count; i++) {
-		glBindTexture(GL_TEXTURE_2D, sc->textures[i]);
-		glTexImage2D(GL_TEXTURE_2D, 0, internal_format,
-		             info->width, info->height, 0,
-		             GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glBindTexture(sc->target, sc->textures[i]);
+		if (sc->target == GL_TEXTURE_2D_ARRAY) {
+			glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, internal_format,
+			             info->width, info->height, array_size, 0,
+			             GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		} else {
+			glTexImage2D(GL_TEXTURE_2D, 0, internal_format,
+			             info->width, info->height, 0,
+			             GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		}
+		glTexParameteri(sc->target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(sc->target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(sc->target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(sc->target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
 		// sRGB passthrough: apps write display-referred bytes into the sRGB
 		// swapchain image (typically with GL_FRAMEBUFFER_SRGB off). When the
@@ -1240,14 +1274,14 @@ gl_compositor_create_swapchain(struct xrt_compositor *xc,
 		// pass through). Only the in-process native GL path samples these
 		// textures, so this never affects app-side rendering.
 		if (internal_format == GL_SRGB8_ALPHA8 && gl_has_srgb_decode_ext()) {
-			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SRGB_DECODE_EXT, GL_SKIP_DECODE_EXT);
+			glTexParameteri(sc->target, GL_TEXTURE_SRGB_DECODE_EXT, GL_SKIP_DECODE_EXT);
 		}
 
 		// Store GL texture name in the swapchain_gl images array
 		// (this is what the state tracker reads via xrt_swapchain_gl)
 		sc->base.images[i] = sc->textures[i];
 	}
-	glBindTexture(GL_TEXTURE_2D, 0);
+	glBindTexture(sc->target, 0);
 
 	// Set up vtable
 	sc->base.base.destroy = gl_swapchain_destroy;
@@ -3022,6 +3056,13 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	GLint loc_flip_atlas = glGetUniformLocation(c->program_blit, "u_flip_y");
 	glUniform1f(loc_flip_atlas, 0.0f);
 
+	// Uniform locations for the LAYERED (array) blit variant, used per-draw when
+	// a swapchain has arraySize>1 (see the per-eye branch below).
+	GLint loc_tex_arr = glGetUniformLocation(c->program_blit_array, "u_texture");
+	GLint loc_rect_arr = glGetUniformLocation(c->program_blit_array, "u_src_rect");
+	GLint loc_layer_arr = glGetUniformLocation(c->program_blit_array, "u_layer");
+	GLint loc_flip_arr = glGetUniformLocation(c->program_blit_array, "u_flip_y");
+
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
 
@@ -3111,10 +3152,26 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				glViewport(tbx, tby, tbw, tbh);
 			}
 
+			// Honor the projection view's array layer (imageArrayIndex).
+			// Layered swapchains sample the requested slice via the
+			// sampler2DArray variant; single-layer swapchains keep the
+			// sampler2D path. Program is selected per-draw (arrays are rare).
+			const bool layered = gsc->target == GL_TEXTURE_2D_ARRAY;
 			glActiveTexture(GL_TEXTURE0);
-			glBindTexture(GL_TEXTURE_2D, gsc->textures[img_idx]);
-			glUniform1i(loc_tex, 0);
-			glUniform4f(loc_rect, nr.x, nr.y, nr.w, nr.h);
+			if (layered) {
+				uint32_t array_index = layer->data.proj.v[eye].sub.array_index;
+				glUseProgram(c->program_blit_array);
+				glUniform1f(loc_flip_arr, 0.0f);
+				glBindTexture(GL_TEXTURE_2D_ARRAY, gsc->textures[img_idx]);
+				glUniform1i(loc_tex_arr, 0);
+				glUniform4f(loc_rect_arr, nr.x, nr.y, nr.w, nr.h);
+				glUniform1f(loc_layer_arr, (float)array_index);
+			} else {
+				glUseProgram(c->program_blit);
+				glBindTexture(GL_TEXTURE_2D, gsc->textures[img_idx]);
+				glUniform1i(loc_tex, 0);
+				glUniform4f(loc_rect, nr.x, nr.y, nr.w, nr.h);
+			}
 
 			// One-shot diagnostic: log blit params for both eyes
 			{
@@ -3654,6 +3711,7 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	if (c->dp_input_texture) glDeleteTextures(1, &c->dp_input_texture);
 	if (c->dp_crop_fbo) glDeleteFramebuffers(1, &c->dp_crop_fbo);
 	if (c->program_blit) glDeleteProgram(c->program_blit);
+	if (c->program_blit_array) glDeleteProgram(c->program_blit_array);
 	if (c->program_window_space) glDeleteProgram(c->program_window_space);
 	if (c->program_masked_composite) glDeleteProgram(c->program_masked_composite);
 	if (c->vao_empty) glDeleteVertexArrays(1, &c->vao_empty);
@@ -3900,6 +3958,7 @@ gl_init_resources(struct comp_gl_compositor *c, uint32_t width, uint32_t height)
 
 	// Compile shaders
 	c->program_blit = create_program(VS_FULLSCREEN_QUAD, FS_BLIT);
+	c->program_blit_array = create_program(VS_FULLSCREEN_QUAD, FS_BLIT_ARRAY);
 	c->program_window_space = create_program(VS_WINDOW_SPACE, FS_TEXTURED);
 	// #439 Phase 3 — masked 2D-over-3D composite (flatten reuses program_window_space).
 	c->program_masked_composite = create_program(VS_FULLSCREEN_QUAD, FS_MASKED_COMPOSITE);
