@@ -57,7 +57,7 @@ if not defined VCVARS (
 
 call "%VCVARS%" >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
-    echo ERROR: vcvars64.bat failed: %VCVARS%
+    echo ERROR: vcvars64.bat failed: !VCVARS!
     exit /b 1
 )
 
