@@ -1,4 +1,4 @@
-# Copyright 2026, Leia Inc.
+# Copyright 2026, The DisplayXR Project
 # SPDX-License-Identifier: BSL-1.0
 
 # JNI bridge for the Android diagnostics dashboard (#558). Runs the

@@ -1,4 +1,4 @@
-// Copyright 2026, DisplayXR / Leia Inc.
+// Copyright 2026, The DisplayXR Project
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file

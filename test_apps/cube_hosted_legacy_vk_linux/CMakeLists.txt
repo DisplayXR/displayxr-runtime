@@ -1,4 +1,4 @@
-# Copyright 2026, Leia Inc.
+# Copyright 2026, The DisplayXR Project
 # SPDX-License-Identifier: BSL-1.0
 #
 # Linux hosted (legacy) Vulkan cube — the first on-screen bring-up target for the

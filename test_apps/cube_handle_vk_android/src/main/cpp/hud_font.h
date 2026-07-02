@@ -1,4 +1,4 @@
-// Copyright 2026, Leia Inc.
+// Copyright 2026, The DisplayXR Project
 // SPDX-License-Identifier: BSL-1.0
 //
 // hud_font — crisp antialiased HUD text for cube_handle_vk_android (#499).

@@ -1,4 +1,4 @@
-# Copyright 2026, Leia Inc.
+# Copyright 2026, The DisplayXR Project
 # SPDX-License-Identifier: BSL-1.0
 #
 # Emit a C source file containing the bytes of INPUT_FILE as a named array.

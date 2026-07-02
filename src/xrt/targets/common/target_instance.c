@@ -1,5 +1,5 @@
 // Copyright 2020-2024, Collabora, Ltd.
-// Copyright 2025, Leia Inc.
+// Copyright 2025, The DisplayXR Project
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file

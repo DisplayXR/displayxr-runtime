@@ -1,4 +1,4 @@
-// Copyright 2025, Leia Inc.
+// Copyright 2025, The DisplayXR Project
 // SPDX-License-Identifier: BSL-1.0
 // Copied from DisplayXR SDK reference example (parallax_toggle)
 

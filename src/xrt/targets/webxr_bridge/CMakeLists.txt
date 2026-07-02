@@ -1,4 +1,4 @@
-# Copyright 2026, Leia Inc.
+# Copyright 2026, The DisplayXR Project
 # SPDX-License-Identifier: BSL-1.0
 #
 # displayxr-webxr-bridge — tiny OpenXR client that coexists with Chrome's
