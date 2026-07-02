@@ -218,12 +218,20 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
 	# does NOT link openxr_loader (the loader loads US) and (on this
 	# branch) no longer imports pthreadVC3; these install rules exist
 	# only for the downstream-consumer convenience surface.
-	if(DEFINED OpenXR_ROOT AND EXISTS "${OpenXR_ROOT}/x64/bin/openxr_loader.dll")
-		install(
-			FILES "${OpenXR_ROOT}/x64/bin/openxr_loader.dll"
-			DESTINATION ${CMAKE_INSTALL_BINDIR}
-			COMPONENT Runtime
-			)
+	if(DEFINED OpenXR_ROOT)
+		# Normalize backslashes → forward slashes. A native Windows OpenXR_ROOT
+		# (e.g. build_windows.bat's short-path copy C:\dev\openxr_sdk_1.1.43)
+		# otherwise lands verbatim in the generated cmake_install.cmake, where
+		# CMake reads \d, \o … as invalid escape sequences and aborts the install
+		# with "Syntax error in cmake code" (strict on newer CMake).
+		file(TO_CMAKE_PATH "${OpenXR_ROOT}" _oxr_root)
+		if(EXISTS "${_oxr_root}/x64/bin/openxr_loader.dll")
+			install(
+				FILES "${_oxr_root}/x64/bin/openxr_loader.dll"
+				DESTINATION ${CMAKE_INSTALL_BINDIR}
+				COMPONENT Runtime
+				)
+		endif()
 	endif()
 	# pthreadVC3 (C-only, no C++ exception unwind) and cjson are what
 	# displayxr-shell.exe v1.2.5 dynamically imports. Source from the
