@@ -313,6 +313,22 @@ static bool TransparentBackgroundEnabled() {
     return e;
 }
 
+// DISPLAYXR_ARRAY_LAYOUT=1 submits the projection as a LAYERED / single-pass-
+// instanced swapchain (arraySize=2: each view in array slice imageArrayIndex)
+// instead of the default TILED atlas (views packed side-by-side by imageRect).
+// This exercises the runtime's per-view array-slice sampling — the same content
+// must weave with disparity either way. It only drives view_count<=2 modes (the
+// array has 2 slices), so mode 1/2 (SBS/2D) work; a >2-view mode is capped to 2.
+// Default off (tiled). Mirrors the cube_zones_*_win DISPLAYXR_ARRAY_LAYOUT toggle.
+static bool ArrayLayoutEnabled() {
+    static const bool e = []() {
+        const char *v = getenv("DISPLAYXR_ARRAY_LAYOUT");
+        return v != nullptr && *v != '\0' && *v != '0';
+    }();
+    return e;
+}
+static const uint32_t kArraySlices = 2; // stereo
+
 // Create the application window
 static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     const bool transparent = TransparentBackgroundEnabled();
@@ -674,6 +690,12 @@ static void RenderOneFrame(RenderState& rs) {
                     xr.recommendedViewScaleY = xr.renderingModeScaleY[xr.currentModeIndex];
                 }
                 int eyeCount = monoMode ? 1 : (int)modeViewCount;
+                // Layered swapchains hold arraySize slices, so array mode can
+                // only submit that many views — cap to it (a >2-view mode is
+                // driven as its first 2 views).
+                if (ArrayLayoutEnabled() && eyeCount > (int)xr.swapchain.arraySize) {
+                    eyeCount = (int)xr.swapchain.arraySize;
+                }
                 std::vector<XrCompositionLayerProjectionView> projectionViews(eyeCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
             bool hudSubmitted = false;
 
@@ -961,11 +983,6 @@ static void RenderOneFrame(RenderState& rs) {
                     if (AcquireSwapchainImage(xr, imageIndex)) {
                         ID3D11Texture2D* swapchainTexture = (*rs.swapchainImages)[imageIndex].texture;
 
-                        ID3D11RenderTargetView* rtv = nullptr;
-                        CreateRenderTargetView(renderer, swapchainTexture,
-                            static_cast<DXGI_FORMAT>(xr.swapchain.format), &rtv);
-
-                        // Clear entire color+depth once before eye loop.
                         // Transparent mode (DISPLAYXR_TRANSPARENT_BG=1): clear to
                         // RGBA(0,0,0,0) so the Leia DP's compose-under-bg pass
                         // shows the desktop wherever the cube didn't draw.
@@ -977,7 +994,17 @@ static void RenderOneFrame(RenderState& rs) {
                             clearColor[0] = 0.05f; clearColor[1] = 0.05f;
                             clearColor[2] = 0.25f; clearColor[3] = 1.0f;
                         }
-                        renderer.context->ClearRenderTargetView(rtv, clearColor);
+
+                        // TILED: one shared RTV over the whole atlas image, cleared
+                        // once (each view is drawn at its tile viewport). ARRAY: a
+                        // per-slice RTV is created + cleared inside the eye loop.
+                        const bool arrayLayout = ArrayLayoutEnabled();
+                        ID3D11RenderTargetView* rtv = nullptr;
+                        if (!arrayLayout) {
+                            CreateRenderTargetView(renderer, swapchainTexture,
+                                static_cast<DXGI_FORMAT>(xr.swapchain.format), &rtv);
+                            renderer.context->ClearRenderTargetView(rtv, clearColor);
+                        }
                         renderer.context->ClearDepthStencilView(rs.depthDSV.Get(),
                             D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
 
@@ -996,16 +1023,51 @@ static void RenderOneFrame(RenderState& rs) {
                         } else {
                             renderW = (uint32_t)(g_windowWidth * xr.recommendedViewScaleX);
                             renderH = (uint32_t)(g_windowHeight * xr.recommendedViewScaleY);
-                            if (renderW > maxTileW) renderW = maxTileW;
-                            if (renderH > maxTileH) renderH = maxTileH;
+                            // ARRAY: each slice is a full per-view image, so the
+                            // cap is the whole swapchain image, not a sub-tile.
+                            uint32_t capW = arrayLayout ? xr.swapchain.width : maxTileW;
+                            uint32_t capH = arrayLayout ? xr.swapchain.height : maxTileH;
+                            if (renderW > capW) renderW = capW;
+                            if (renderH > capH) renderH = capH;
                         }
 
                         for (int eye = 0; eye < eyeCount; eye++) {
                             uint32_t tileX = monoMode ? 0 : (eye % tileColumns);
                             uint32_t tileY = monoMode ? 0 : (eye / tileColumns);
+
+                            // ARRAY: render into array slice `eye` via a per-slice
+                            // TEXTURE2DARRAY RTV at a full (0,0) viewport. TILED:
+                            // draw into this view's tile of the shared RTV.
+                            ID3D11RenderTargetView* viewRtv = rtv;
+                            ID3D11RenderTargetView* sliceRtv = nullptr;
+                            if (arrayLayout) {
+                                D3D11_RENDER_TARGET_VIEW_DESC rd = {};
+                                rd.Format = static_cast<DXGI_FORMAT>(xr.swapchain.format);
+                                rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+                                rd.Texture2DArray.MipSlice = 0;
+                                rd.Texture2DArray.FirstArraySlice = (UINT)eye;
+                                rd.Texture2DArray.ArraySize = 1;
+                                if (FAILED(renderer.device->CreateRenderTargetView(
+                                        swapchainTexture, &rd, &sliceRtv))) {
+                                    LOG_ERROR("array RTV creation failed for slice %d", eye);
+                                    continue;
+                                }
+                                renderer.context->ClearRenderTargetView(sliceRtv, clearColor);
+                                // Each slice is rendered full-viewport into the SAME
+                                // shared depth buffer, so depth MUST be cleared per
+                                // slice — otherwise slice 1 z-tests against slice 0's
+                                // depth and the other eye's cube punches a shadow
+                                // through (the #613 gotcha). TILED views don't need
+                                // this: their tile viewports occupy disjoint depth
+                                // regions, cleared once before the loop.
+                                renderer.context->ClearDepthStencilView(rs.depthDSV.Get(),
+                                    D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+                                viewRtv = sliceRtv;
+                            }
+
                             D3D11_VIEWPORT vp = {};
-                            vp.TopLeftX = (FLOAT)(tileX * renderW);
-                            vp.TopLeftY = (FLOAT)(tileY * renderH);
+                            vp.TopLeftX = arrayLayout ? 0.0f : (FLOAT)(tileX * renderW);
+                            vp.TopLeftY = arrayLayout ? 0.0f : (FLOAT)(tileY * renderH);
                             vp.Width = (FLOAT)renderW;
                             vp.Height = (FLOAT)renderH;
                             vp.MaxDepth = 1.0f;
@@ -1025,7 +1087,7 @@ static void RenderOneFrame(RenderState& rs) {
                                 projMatrix = xr.projMatrices[vi];
                             }
 
-                            RenderScene(renderer, rtv, rs.depthDSV.Get(),
+                            RenderScene(renderer, viewRtv, rs.depthDSV.Get(),
                                 renderW, renderH,
                                 viewMatrix, projMatrix,
                                 useAppProjection ? 1.0f : g_inputState.viewParams.scaleFactor,
@@ -1033,20 +1095,24 @@ static void RenderOneFrame(RenderState& rs) {
 
                             projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                             projectionViews[eye].subImage.swapchain = xr.swapchain.swapchain;
+                            // ARRAY: full image at slice `eye`. TILED: this view's tile.
                             projectionViews[eye].subImage.imageRect.offset = {
-                                (int32_t)(tileX * renderW), (int32_t)(tileY * renderH)
+                                arrayLayout ? 0 : (int32_t)(tileX * renderW),
+                                arrayLayout ? 0 : (int32_t)(tileY * renderH)
                             };
                             projectionViews[eye].subImage.imageRect.extent = {
                                 (int32_t)renderW,
                                 (int32_t)renderH
                             };
-                            projectionViews[eye].subImage.imageArrayIndex = 0;
+                            projectionViews[eye].subImage.imageArrayIndex = arrayLayout ? (uint32_t)eye : 0;
 
                             int safeIdx = (eye < (int)viewCount) ? eye : 0;
                             projectionViews[eye].pose = monoMode ? monoPose : rawViews[safeIdx].pose;
                             projectionViews[eye].fov = useAppProjection ?
                                 stereoViews[monoMode ? 0 : eye].fov :
                                 (monoMode ? monoFov : rawViews[safeIdx].fov);
+
+                            if (sliceRtv) sliceRtv->Release();
                         }
 
                         if (rtv) rtv->Release();
@@ -1343,8 +1409,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    // Create single swapchain at native display resolution
-    if (!CreateSwapchain(xr)) {
+    // Create the projection swapchain — tiled by default, or a layered/array
+    // swapchain (arraySize=2) when DISPLAYXR_ARRAY_LAYOUT=1.
+    if (!CreateSwapchain(xr, ArrayLayoutEnabled() ? kArraySlices : 1)) {
         LOG_ERROR("Swapchain creation failed");
         CleanupOpenXR(xr);
         if (hudOk) CleanupHudRenderer(hudRenderer);

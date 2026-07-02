@@ -1132,6 +1132,13 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
                     continue;
                 }
                 renderer.context->ClearRenderTargetView(sliceRtv, z.clearColor);
+                // Each slice renders full-viewport into the SAME shared depth
+                // buffer, so depth MUST be cleared per slice — otherwise slice 1
+                // z-tests against slice 0's depth and the other eye's cube punches
+                // a shadow through (#613). TILED tiles occupy disjoint depth
+                // regions and share the single pre-loop clear.
+                renderer.context->ClearDepthStencilView(z.depthDSV.Get(),
+                    D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
                 viewRtv = sliceRtv;
             }
 

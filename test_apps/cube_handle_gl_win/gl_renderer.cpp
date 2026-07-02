@@ -291,12 +291,41 @@ bool InitializeGLRenderer(GLRenderer& renderer) {
 
 bool CreateSwapchainFBOs(GLRenderer& renderer,
     const GLuint* images, uint32_t count,
-    uint32_t width, uint32_t height)
+    uint32_t width, uint32_t height,
+    uint32_t arraySize)
 {
-    // Create depth renderbuffer (single SBS swapchain)
+    renderer.arrayLayout = arraySize > 1;
+    renderer.arraySize = renderer.arrayLayout ? arraySize : 1;
+
+    // Depth renderbuffer sized to the render extent (per-view in ARRAY, whole
+    // atlas in TILED — both equal to the passed width/height).
     glGenRenderbuffers_(1, &renderer.depthRBO);
     glBindRenderbuffer_(GL_RENDERBUFFER, renderer.depthRBO);
     glRenderbufferStorage_(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, width, height);
+
+    if (renderer.arrayLayout) {
+        // One FBO per (image, slice), attaching one GL_TEXTURE_2D_ARRAY layer.
+        renderer.fbos.resize((size_t)count * renderer.arraySize);
+        glGenFramebuffers_((GLsizei)renderer.fbos.size(), renderer.fbos.data());
+        for (uint32_t i = 0; i < count; i++) {
+            for (uint32_t s = 0; s < renderer.arraySize; s++) {
+                const size_t fi = (size_t)i * renderer.arraySize + s;
+                glBindFramebuffer_(GL_FRAMEBUFFER, renderer.fbos[fi]);
+                glFramebufferTextureLayer_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                           images[i], 0, (GLint)s);
+                glFramebufferRenderbuffer_(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                           GL_RENDERBUFFER, renderer.depthRBO);
+                if (glCheckFramebufferStatus_(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+                    LOG_ERROR("ARRAY FBO incomplete for image %u slice %u", i, s);
+                    return false;
+                }
+            }
+        }
+        glBindFramebuffer_(GL_FRAMEBUFFER, 0);
+        LOG_INFO("Created %u ARRAY FBOs (%u images x %u slices, %ux%u)",
+                 (unsigned)renderer.fbos.size(), count, renderer.arraySize, width, height);
+        return true;
+    }
 
     // Create one FBO per swapchain image
     renderer.fbos.resize(count);
@@ -348,9 +377,13 @@ void RenderScene(
     float zoomScale,
     float cubeY,
     float cubeZ,
-    float cubeSize
+    float cubeSize,
+    uint32_t slice
 ) {
-    glBindFramebuffer_(GL_FRAMEBUFFER, renderer.fbos[imageIndex]);
+    const size_t fboIdx = renderer.arrayLayout
+        ? ((size_t)imageIndex * renderer.arraySize + slice)
+        : imageIndex;
+    glBindFramebuffer_(GL_FRAMEBUFFER, renderer.fbos[fboIdx]);
 
     // TODO: If the swapchain format is GL_SRGB8_ALPHA8, we may need
     // glEnable(GL_FRAMEBUFFER_SRGB) here for correct linear-to-sRGB conversion.
