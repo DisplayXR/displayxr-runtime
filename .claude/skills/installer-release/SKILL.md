@@ -211,11 +211,11 @@ host** (runs from the Mac). Full contract + how to swap providers:
 
 ### Step 4.5.1: Resolve capability (OS-agnostic)
 ```bash
-SIGN_REPO="${DXR_SIGN_REPO:-LeiaInc/codesign-runner}"
-if gh workflow view sign-artifact -R "$SIGN_REPO" >/dev/null 2>&1; then
+SIGN_REPO="${DXR_SIGN_REPO}"   # local env only; the public repo names no provider
+if [ -n "$SIGN_REPO" ] && gh workflow view sign-artifact -R "$SIGN_REPO" >/dev/null 2>&1; then
   SIGNED=yes
 else
-  echo "⚠  BUNDLE UNSIGNED — no access to the signing provider ($SIGN_REPO)."
+  echo "⚠  BUNDLE UNSIGNED — DXR_SIGN_REPO unset in the env, or the provider is unreachable."
   echo "   The release ships the unsigned CI bundle. Set DXR_SIGN_REPO to a repo"
   echo "   implementing 'sign-artifact', or re-run from a box with provider access."
   SIGNED=no
@@ -311,12 +311,13 @@ STOP.
 - Bundle `.exe` signing is a **post-hoc skill step** (Phase 4.5), not a CI
   step — the signing key can't live on GitHub-hosted CI, and the provider
   runner isn't reachable from `displayxr-installer`'s CI. The skill dispatches
-  the provider's `sign-artifact` workflow (`$DXR_SIGN_REPO`, default
-  `LeiaInc/codesign-runner`) to sign the finished `.exe`, then re-uploads —
+  the provider's `sign-artifact` workflow on the repo named by the
+  `DXR_SIGN_REPO` **local env var** (this public repo hardcodes no provider path)
+  to sign the finished `.exe`, then re-uploads —
   OS-agnostic, no local hook file. The wrapped component installers are already
-  signed at their own releases, so no inner-binary handling is needed. Lose the
-  provider → the release ships unsigned (gate fails, flagged in the report);
-  swap providers by setting `DXR_SIGN_REPO`. Full contract:
+  signed at their own releases, so no inner-binary handling is needed. Unset env
+  → the release ships unsigned (gate fails, flagged in the report);
+  swap providers by pointing `DXR_SIGN_REPO` elsewhere. Full contract:
   `docs/specs/runtime/release-signing.md`. macOS `.pkg` signing (Apple
   Developer ID + notarization) is still TODO.
 - Don't bump component pins by hand in installer's versions.json —

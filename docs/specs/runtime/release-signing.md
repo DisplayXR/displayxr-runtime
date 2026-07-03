@@ -16,9 +16,10 @@ the signer is unavailable or changes. This is the contract the `/release`,
   Release. **Signing never gates publishing** — if the provider is unreachable
   the release still ships the unsigned CI installer, with a warning.
 
-The current provider is the private **`LeiaInc/codesign-runner`** (DigiCert EV,
-subject `Leia, Inc.`). Nothing in the public repos names it beyond the default
-below.
+The provider repo is supplied **out-of-band** via the `DXR_SIGN_REPO` local env
+var (`export DXR_SIGN_REPO=<owner/repo>` on the release machine). The public
+repos hardcode **no** provider path — unset the env var and releases ship
+unsigned. (The active provider is a private repo owning a DigiCert EV cert.)
 
 ## Why signed releases rebuild (not re-sign the CI `.exe`)
 
@@ -64,8 +65,8 @@ the entire "switch signers" operation.
 Each skill probes reachability before signing and degrades gracefully:
 
 ```bash
-SIGN_REPO="${DXR_SIGN_REPO:-LeiaInc/codesign-runner}"
-if gh workflow view build-signed-release.yml -R "$SIGN_REPO" >/dev/null 2>&1; then
+SIGN_REPO="${DXR_SIGN_REPO}"   # local env only; the public repo names no provider
+if [ -n "$SIGN_REPO" ] && gh workflow view build-signed-release.yml -R "$SIGN_REPO" >/dev/null 2>&1; then
   SIGNED=yes          # provider reachable → sign
 else
   SIGNED=no           # provider gone → ship the unsigned CI installer, warn
