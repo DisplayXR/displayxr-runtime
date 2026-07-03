@@ -124,7 +124,22 @@ cd "$WORK/repo"
 ### Step 1.4: Pre-flight on the clone
 ```bash
 git fetch origin --tags --quiet
-git rev-parse "$NEW_TAG" 2>/dev/null && { echo "Tag $NEW_TAG already exists on $REPO"; exit 1; }
+SIGN_ONLY=0
+if git rev-parse "$NEW_TAG" >/dev/null 2>&1; then
+  # unity: an existing tag means the release was ALREADY cut — commonly by a
+  # direct `v*` tag push on the displayxr-unity repo (its build-native.yml then
+  # publishes the .tgz + upm UNSIGNED, since CI holds no cert). Don't error;
+  # switch to SIGN-ONLY: skip Phase 2 (marker+tag) and Phase 3 (CI watch) and go
+  # straight to Step 3.5.0 to sign + re-inject the DLL into the existing release.
+  # Makes `/dxr-release unity vX.Y.Z` idempotent regardless of WHERE it was cut.
+  # (For every other component an existing tag stays a hard error — no post-hoc
+  # sign path.)
+  if [ "$COMPONENT" = unity ]; then
+    SIGN_ONLY=1; echo "unity $NEW_TAG already released — SIGN-ONLY mode (sign + re-inject the existing release)."
+  else
+    echo "Tag $NEW_TAG already exists on $REPO"; exit 1
+  fi
+fi
 PREV_TAG=$(git tag --sort=-creatordate | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
 # Clone defaults to the default branch (main) — no branch check needed.
 ```
@@ -132,6 +147,9 @@ PREV_TAG=$(git tag --sort=-creatordate | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | h
 ---
 
 ## PHASE 2: MARKER COMMIT + TAG
+
+**Skip this entire phase when `SIGN_ONLY=1`** (unity, release already cut) — the
+tag + release already exist; jump straight to Phase 3.5.
 
 Create an **empty** "Release vX.Y.Z" marker commit on the sibling's
 `main` and tag THAT commit — same pattern as `/release` on the runtime
@@ -165,6 +183,9 @@ Phase 6 only if you want `git log` for the report.
 ---
 
 ## PHASE 3: WATCH THE REPO'S CI
+
+**Skip this entire phase when `SIGN_ONLY=1`** (unity, release already cut) — its
+CI already ran and published the release; go straight to Phase 3.5.
 
 ### Step 3.1: Find the tag's CI run
 ```bash
@@ -231,6 +252,12 @@ into both channels. Signing never gates publishing: any failure leaves the
 unsigned CI release and is flagged in the report. If `COMPONENT=unity`, run this
 block and then **skip the rest of Phase 3.5 and all of Phase 4** (Unity has no
 `versions.json` field) — go straight to the Phase 6 report.
+
+This block runs identically whether the release was **cut by this skill** (fresh
+tag) or **cut directly on the displayxr-unity repo** (`SIGN_ONLY=1`) — either way
+the `.tgz` asset + `upm` branch already exist, and we just sign + re-inject. So
+signing a directly-released Unity version = re-run `/dxr-release unity <that
+version>`; it detects the existing release and signs it in place.
 
 ```bash
 if [ "$COMPONENT" = unity ]; then
