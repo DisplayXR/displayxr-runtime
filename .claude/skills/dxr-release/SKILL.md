@@ -1,6 +1,6 @@
 ---
 name: dxr-release
-description: Tag-and-publish a release for any DisplayXR sibling component (shell, leia-plugin, mcp, gauss & modelviewer & mediaplayer & avatar & earthview demos) FROM the displayxr-runtime hub. Takes an explicit component + version — clones the target repo to a temp dir, tags HEAD, watches the repo's CI, watches the dispatched versions-bump.yml on displayxr-runtime, reports the bump + installer-mirror outcome. NOT for displayxr-runtime itself (use /release) and NOT for the bundle (use /installer-release).
+description: Tag-and-publish a release for any DisplayXR sibling component (shell, leia-plugin, mcp, gauss & modelviewer & mediaplayer & avatar & earthview demos, unity plugin) FROM the displayxr-runtime hub. Takes an explicit component + version — clones the target repo to a temp dir, tags HEAD, watches the repo's CI, watches the dispatched versions-bump.yml on displayxr-runtime, reports the bump + installer-mirror outcome. Unity is special-cased: its prebuilt displayxr_unity.dll is signed via the sign-artifact folder hook and re-injected into the .tgz + upm branch (no versions-bump). NOT for displayxr-runtime itself (use /release) and NOT for the bundle (use /installer-release).
 ---
 
 # dxr-release — component release driven from the runtime hub
@@ -28,7 +28,7 @@ Spec: [`docs/specs/runtime/versions-json-autobump.md`](../../docs/specs/runtime/
 ```
 /dxr-release <component> <version-spec>
 
-  <component>     shell | leia-plugin (leia) | mcp | gauss (demo-gaussiansplat) | modelviewer (demo-modelviewer) | mediaplayer (demo-mediaplayer) | avatar (demo-avatar) | earthview (demo-earthview)
+  <component>     shell | leia-plugin (leia) | mcp | gauss (demo-gaussiansplat) | modelviewer (demo-modelviewer) | mediaplayer (demo-mediaplayer) | avatar (demo-avatar) | earthview (demo-earthview) | unity
   <version-spec>  vX.Y.Z  |  patch  |  minor  |  major
 ```
 
@@ -38,6 +38,7 @@ Examples:
 /dxr-release leia-plugin patch
 /dxr-release shell minor
 /dxr-release gauss v1.4.4
+/dxr-release unity v1.25.0
 ```
 
 If no component is given, **STOP** and ask which component. Do not guess
@@ -55,6 +56,14 @@ from cwd — that's the old cwd-detecting behavior this skill replaced.
 | `mediaplayer` / `demo-mediaplayer` | `DisplayXR/displayxr-demo-mediaplayer` | `mediaplayer_demo` | `build-windows.yml` | same repo |
 | `avatar` / `demo-avatar` | `DisplayXR/displayxr-demo-avatar` | `avatar_demo` | `build-windows.yml` | same repo |
 | `earthview` / `demo-earthview` | `DisplayXR/displayxr-demo-earthview` | `earthview_demo` | `build-macos.yml` | same repo |
+| `unity` | `DisplayXR/displayxr-unity` | *(none — not pinned)* | `build-native.yml` | same repo |
+
+**Unity is special** — it ships a prebuilt `displayxr_unity.dll` (not an
+installer) in a UPM `.tgz` release asset **and** on the `upm` git branch, has
+**no** `versions.json` field (installed via UPM directly), and signs via the
+provider's **`sign-artifact`** folder hook (send DLL → sign → re-inject), not
+`build-signed-release.yml`. See the Unity branch in Phase 3.5. The macOS
+`.bundle` stays unsigned (separate Apple track).
 
 `runtime` → tell the user to use `/release` (in-repo). `installer` →
 tell them to use `/installer-release`.
@@ -90,10 +99,12 @@ case "$COMPONENT" in
   mediaplayer|demo-mediaplayer)  REPO=DisplayXR/displayxr-demo-mediaplayer;   FIELD=mediaplayer_demo; WORKFLOW=build-windows.yml;      REL_REPO=DisplayXR/displayxr-demo-mediaplayer ;;
   avatar|demo-avatar)            REPO=DisplayXR/displayxr-demo-avatar;        FIELD=avatar_demo;      WORKFLOW=build-windows.yml;      REL_REPO=DisplayXR/displayxr-demo-avatar ;;
   earthview|demo-earthview)      REPO=DisplayXR/displayxr-demo-earthview;     FIELD=earthview_demo;   WORKFLOW=build-macos.yml;       REL_REPO=DisplayXR/displayxr-demo-earthview ;;
+  unity)                         REPO=DisplayXR/displayxr-unity;              FIELD="";               WORKFLOW=build-native.yml;      REL_REPO=DisplayXR/displayxr-unity ;;
   runtime)                       echo "Use /release (in-repo) for the runtime."; exit 1 ;;
   installer)                     echo "Use /installer-release for the bundle.";  exit 1 ;;
-  *)                             echo "Unknown component '$COMPONENT'. One of: shell, leia-plugin, mcp, gauss, modelviewer, mediaplayer, avatar, earthview."; exit 1 ;;
+  *)                             echo "Unknown component '$COMPONENT'. One of: shell, leia-plugin, mcp, gauss, modelviewer, mediaplayer, avatar, earthview, unity."; exit 1 ;;
 esac
+# FIELD="" (unity) → no versions.json entry; skip the Phase 4 versions-bump watch.
 echo "repo=$REPO field=$FIELD workflow=$WORKFLOW"
 ```
 
@@ -208,7 +219,88 @@ The per-component build recipe lives in the runner workflow
 build commands. Swap signers by setting `DXR_SIGN_REPO`; lose the provider and
 the release ships unsigned. Contract: `docs/specs/runtime/release-signing.md`.
 
+### Step 3.5.0: Unity — sign the prebuilt DLL via `sign-artifact`, then re-inject
+
+Unity is NOT an installer: it ships a prebuilt **`displayxr_unity.dll`** in both
+the UPM **`.tgz`** release asset and the **`upm`** git branch (CI produced both
+UNSIGNED). There's no NSIS chain to rebuild, so we don't use
+`build-signed-release.yml`. Instead **send just the DLL to the provider's
+`sign-artifact` folder hook** (no rebuild, no PAT, no local toolchain — the same
+primitive `sign-hook.sh` / `/installer-release` use) and re-inject the signed DLL
+into both channels. Signing never gates publishing: any failure leaves the
+unsigned CI release and is flagged in the report. If `COMPONENT=unity`, run this
+block and then **skip the rest of Phase 3.5 and all of Phase 4** (Unity has no
+`versions.json` field) — go straight to the Phase 6 report.
+
+```bash
+if [ "$COMPONENT" = unity ]; then
+  SIGN_REPO="${DXR_SIGN_REPO:-LeiaInc/codesign-runner}"
+  VER="${NEW_TAG#v}"
+  TGZ="com.displayxr.unity-${VER}.tgz"
+  DLL_REL="Runtime/Plugins/Windows/x64/displayxr_unity.dll"
+  UNITY_SIGNED=no
+
+  if ! gh workflow view sign-artifact -R "$SIGN_REPO" >/dev/null 2>&1; then
+    echo "⚠ SIGNING SKIPPED for unity — no access to the signing runner ($SIGN_REPO). Ships unsigned."
+  else
+    D=$(mktemp -d)
+    gh release download "$NEW_TAG" -R "$REPO" -p "$TGZ" -D "$D"       # the just-released .tgz
+    mkdir -p "$D/x"; tar xzf "$D/$TGZ" -C "$D/x"
+    PKGDIR=$(ls -d "$D"/x/com.displayxr.unity-* | head -1)
+    DLL="$PKGDIR/$DLL_REL"
+    if [ ! -f "$DLL" ]; then
+      echo "⚠ $DLL_REL not found in $TGZ — ships unsigned."
+    else
+      mkdir -p "$D/in"; cp "$DLL" "$D/in/"                            # fold ONLY the DLL into a sign folder
+      ( cd "$D/in" && zip -qr "$D/unsigned.zip" . )
+      TMP="sign-unity-$(date +%s)-$$"
+      gh release create "$TMP" -R "$SIGN_REPO" --prerelease --title "$TMP" \
+         --notes "temp unity-signing payload (auto-deleted)" "$D/unsigned.zip"
+      SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      gh workflow run sign-artifact -R "$SIGN_REPO" -f release_tag="$TMP"
+      RID=""
+      for _ in $(seq 1 20); do
+        RID=$(gh run list -R "$SIGN_REPO" --workflow sign-artifact --event workflow_dispatch \
+                --limit 8 --json databaseId,createdAt \
+                --jq "[.[]|select(.createdAt>=\"$SINCE\")]|sort_by(.createdAt)|last|.databaseId // empty")
+        [ -n "$RID" ] && break; sleep 4
+      done
+      SIGNED_DLL=""
+      if [ -n "$RID" ] && gh run watch "$RID" -R "$SIGN_REPO" --interval 15 --exit-status; then
+        gh run download "$RID" -R "$SIGN_REPO" -n signed -D "$D/out"
+        ( cd "$D/out" && unzip -qo signed.zip -d "$D/signed" 2>/dev/null || true )
+        SIGNED_DLL=$(ls "$D/signed/displayxr_unity.dll" 2>/dev/null | head -1)
+      fi
+      gh release delete "$TMP" -R "$SIGN_REPO" --yes --cleanup-tag >/dev/null 2>&1 || true
+
+      if [ -z "$SIGNED_DLL" ]; then
+        echo "⚠ sign-artifact did not return a signed DLL — ships unsigned."
+      else
+        # Channel 1 — repack the .tgz with the signed DLL, re-upload over the asset.
+        cp "$SIGNED_DLL" "$DLL"
+        ( cd "$D/x" && tar czf "$D/$TGZ" "$(basename "$PKGDIR")" )
+        gh release upload "$NEW_TAG" "$D/$TGZ" --clobber -R "$REPO"
+        # Channel 2 — put the signed DLL on the `upm` branch + move its version tag.
+        # Uses the Phase-1 clone (cwd = the repo). CI already force-pushed `upm`
+        # with the unsigned DLL; we layer the signed one on top and force-push.
+        git fetch origin upm --quiet && git checkout -B upm origin/upm
+        cp "$SIGNED_DLL" "$DLL_REL"; git add -f "$DLL_REL"
+        git commit -q -m "Sign displayxr_unity.dll for ${NEW_TAG} (Leia EV)" || echo "(upm already signed)"
+        git push -f origin upm
+        git tag -f "upm/${NEW_TAG}" && git push -f origin "upm/${NEW_TAG}"
+        UNITY_SIGNED=yes
+        echo "✅ unity: signed displayxr_unity.dll re-injected into the .tgz asset + upm branch (Valid/Leia)."
+      fi
+    fi
+    rm -rf "$D"
+  fi
+  # Verify (optional, if on Windows): Get-AuthenticodeSignature on the re-uploaded DLL.
+  # Unity has no versions.json field → SKIP Steps 3.5.1–3.5.3 and Phase 4; go to Phase 6.
+fi
+```
+
 ### Step 3.5.1: Resolve signing capability (OS-agnostic)
+*(installer components — skipped for unity, handled in Step 3.5.0)*
 The capability is *"can this box dispatch the signing runner?"* — no Windows
 host, no local secret.
 
@@ -291,6 +383,12 @@ Phase 1 is only used for the tag; signing happens entirely on the runner.
 ---
 
 ## PHASE 4: WATCH THE DISPATCHED versions-bump RUN
+
+**Skip this phase entirely when `FIELD` is empty** (e.g. `unity`, which has no
+`versions.json` entry and dispatches no bump) — go straight to Phase 6:
+```bash
+[ -z "$FIELD" ] && { echo "No versions.json field for $COMPONENT — no bump to watch; skipping to report."; SKIP_BUMP=1; }
+```
 
 ```bash
 BUMP_RUN=""
