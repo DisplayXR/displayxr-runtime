@@ -3,7 +3,7 @@
   "runtime":     "v1.27.0",
   "shell":       "v1.10.0",
   "leia_plugin": "v1.11.1",
-  "mcp_tools":   "v0.4.1",
+  "mcp_tools":   "v0.4.2",
   "gauss_demo":  "v1.14.0",
   "modelviewer_demo": "v0.13.0",
   "mediaplayer_demo": "v1.3.0",
