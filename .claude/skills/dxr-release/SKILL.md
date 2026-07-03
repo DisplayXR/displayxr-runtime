@@ -280,7 +280,9 @@ if [ "$COMPONENT" = unity ]; then
       echo "⚠ $DLL_REL not found in $TGZ — ships unsigned."
     else
       mkdir -p "$D/in"; cp "$DLL" "$D/in/"                            # fold ONLY the DLL into a sign folder
-      ( cd "$D/in" && zip -qr "$D/unsigned.zip" . )
+      # portable zip: git-bash on Windows has no `zip` — fall back to PowerShell.
+      if command -v zip >/dev/null; then ( cd "$D/in" && zip -qr "$D/unsigned.zip" . )
+      else powershell -NoProfile -Command "Compress-Archive -Path '$(cygpath -w "$D/in")\*' -DestinationPath '$(cygpath -w "$D/unsigned.zip")' -Force"; fi
       TMP="sign-unity-$(date +%s)-$$"
       gh release create "$TMP" -R "$SIGN_REPO" --prerelease --title "$TMP" \
          --notes "temp unity-signing payload (auto-deleted)" "$D/unsigned.zip"
@@ -296,7 +298,9 @@ if [ "$COMPONENT" = unity ]; then
       SIGNED_DLL=""
       if [ -n "$RID" ] && gh run watch "$RID" -R "$SIGN_REPO" --interval 15 --exit-status; then
         gh run download "$RID" -R "$SIGN_REPO" -n signed -D "$D/out"
-        ( cd "$D/out" && unzip -qo signed.zip -d "$D/signed" 2>/dev/null || true )
+        # portable unzip (git-bash on Windows has no `unzip`).
+        if command -v unzip >/dev/null; then ( cd "$D/out" && unzip -qo signed.zip -d "$D/signed" 2>/dev/null || true )
+        else powershell -NoProfile -Command "Expand-Archive -Path '$(cygpath -w "$D/out/signed.zip")' -DestinationPath '$(cygpath -w "$D/signed")' -Force"; fi
         SIGNED_DLL=$(ls "$D/signed/displayxr_unity.dll" 2>/dev/null | head -1)
       fi
       gh release delete "$TMP" -R "$SIGN_REPO" --yes --cleanup-tag >/dev/null 2>&1 || true

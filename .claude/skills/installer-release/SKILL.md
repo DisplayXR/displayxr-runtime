@@ -231,7 +231,9 @@ if [ "$SIGNED" = yes ]; then
   gh release download "$TAG" -R DisplayXR/displayxr-installer -p "$EXE" -D "$D/in"
 
   # Zip the finished .exe and hand it to the provider's folder-sign workflow.
-  ( cd "$D/in" && zip -qr "$D/unsigned.zip" . )
+  # portable zip: git-bash on Windows has no `zip` — fall back to PowerShell.
+  if command -v zip >/dev/null; then ( cd "$D/in" && zip -qr "$D/unsigned.zip" . )
+  else powershell -NoProfile -Command "Compress-Archive -Path '$(cygpath -w "$D/in")\*' -DestinationPath '$(cygpath -w "$D/unsigned.zip")' -Force"; fi
   TMP="sign-bundle-$(date +%s)-$$"
   gh release create "$TMP" -R "$SIGN_REPO" --prerelease --title "$TMP" \
      --notes "temp bundle-signing payload (auto-deleted)" "$D/unsigned.zip"
@@ -247,7 +249,9 @@ if [ "$SIGNED" = yes ]; then
   done
   if [ -n "$RID" ] && gh run watch "$RID" -R "$SIGN_REPO" --interval 15 --exit-status; then
     gh run download "$RID" -R "$SIGN_REPO" -n signed -D "$D/out"
-    ( cd "$D/out" && unzip -qo signed.zip -d "$D/signed" 2>/dev/null || true )
+    # portable unzip (git-bash on Windows has no `unzip`).
+    if command -v unzip >/dev/null; then ( cd "$D/out" && unzip -qo signed.zip -d "$D/signed" 2>/dev/null || true )
+    else powershell -NoProfile -Command "Expand-Archive -Path '$(cygpath -w "$D/out/signed.zip")' -DestinationPath '$(cygpath -w "$D/signed")' -Force"; fi
     SIGNED_EXE=$(ls "$D/signed/$EXE" 2>/dev/null || ls "$D/out"/**/"$EXE" 2>/dev/null | head -1)
     if [ -n "$SIGNED_EXE" ]; then
       gh release upload "$TAG" "$SIGNED_EXE" --clobber -R DisplayXR/displayxr-installer
