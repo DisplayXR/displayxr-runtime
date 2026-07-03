@@ -235,10 +235,11 @@ path of every app that uses that display, so Smart App Control blocks it
 unsigned. Demos with Windows installers are next; `mcp` ships DLLs too.
 
 The per-component build recipe lives in the runner workflow
-(`build-signed-release.yml` on `$DXR_SIGN_REPO`, default `LeiaInc/codesign-runner`)
-— a single source of truth — so this skill only names the component + ref, not
-build commands. Swap signers by setting `DXR_SIGN_REPO`; lose the provider and
-the release ships unsigned. Contract: `docs/specs/runtime/release-signing.md`.
+(`build-signed-release.yml` on the provider repo named by the `DXR_SIGN_REPO`
+**local env var** — this public repo names no provider path) — a single source of
+truth — so this skill only names the component + ref, not build commands. Set
+`DXR_SIGN_REPO` in your env to sign (unset → unsigned); point it elsewhere to swap
+signers. Contract: `docs/specs/runtime/release-signing.md`.
 
 ### Step 3.5.0: Unity — sign the prebuilt DLL via `sign-artifact`, then re-inject
 
@@ -261,7 +262,7 @@ version>`; it detects the existing release and signs it in place.
 
 ```bash
 if [ "$COMPONENT" = unity ]; then
-  SIGN_REPO="${DXR_SIGN_REPO:-LeiaInc/codesign-runner}"
+  SIGN_REPO="${DXR_SIGN_REPO}"   # local env only; unset -> unsigned (public repo names no provider)
   VER="${NEW_TAG#v}"
   TGZ="com.displayxr.unity-${VER}.tgz"
   DLL_REL="Runtime/Plugins/Windows/x64/displayxr_unity.dll"
@@ -332,11 +333,11 @@ The capability is *"can this box dispatch the signing runner?"* — no Windows
 host, no local secret.
 
 ```bash
-SIGN_REPO="${DXR_SIGN_REPO:-LeiaInc/codesign-runner}"
-if gh workflow view build-signed-release.yml -R "$SIGN_REPO" >/dev/null 2>&1; then
+SIGN_REPO="${DXR_SIGN_REPO}"   # local env only; the public repo names no provider
+if [ -n "$SIGN_REPO" ] && gh workflow view build-signed-release.yml -R "$SIGN_REPO" >/dev/null 2>&1; then
   SIGNED=yes
 else
-  echo "⚠  SIGNING SKIPPED for $COMPONENT — no access to the signing runner ($SIGN_REPO)."
+  echo "⚠  SIGNING SKIPPED for $COMPONENT — DXR_SIGN_REPO unset in the env, or the runner is unreachable."
   echo "   Release ships the UNSIGNED CI installer. Re-run /dxr-release $COMPONENT $NEW_TAG"
   echo "   from a box whose gh auth can dispatch that workflow."
   SIGNED=no   # continue — do not fail the release

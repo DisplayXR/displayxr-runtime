@@ -184,9 +184,10 @@ Full spec: `docs/specs/runtime/versions-json-autobump.md`.
 
 ### Release code-signing
 CI builds are **unsigned** (contributors need no signing access). Signed
-releases are produced by a **signing provider** — a repo (`$DXR_SIGN_REPO`,
-default private `LeiaInc/codesign-runner`) that owns the EV cert on a self-hosted
-runner and exposes `build-signed-release.yml` (build+sign a component) and
+releases are produced by a **signing provider** — a repo named by the
+`DXR_SIGN_REPO` **local env var** (this public repo hardcodes no provider path;
+`export DXR_SIGN_REPO=<owner/repo>` on the release machine) that owns the EV cert
+on a self-hosted runner and exposes `build-signed-release.yml` (build+sign a component) and
 `sign-artifact` (sign a folder). The `/release`, `/dxr-release`, and
 `/installer-release` skills dispatch it, download the signed artifact, and
 replace the unsigned CI asset — so they run from **any OS** (no local Windows,

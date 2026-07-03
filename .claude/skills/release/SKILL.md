@@ -321,17 +321,18 @@ makensis to run on the cert machine. Both are only possible where the cert is.
 ### Step 4.5.1: Resolve signing capability (OS-agnostic)
 The capability is simply *"can this box dispatch the signing runner?"* — no
 Windows host required. The runner workflow (`build-signed-release.yml`) and the
-cert live in the provider repo `$DXR_SIGN_REPO` (default `LeiaInc/codesign-runner`);
-this repo names no endpoint. To swap signers set `DXR_SIGN_REPO` to another repo
-implementing the same workflow; lose the provider and the release ships unsigned.
+cert live in the provider repo named by the **`DXR_SIGN_REPO` env var**, which
+you set in your **local environment** (`export DXR_SIGN_REPO=<owner/repo>`) — this
+public repo hardcodes no provider path. Unset → ships unsigned. To swap signers,
+point `DXR_SIGN_REPO` at another repo implementing the same workflow.
 Contract + fallbacks: `docs/specs/runtime/release-signing.md`.
 
 ```bash
-SIGN_REPO="${DXR_SIGN_REPO:-LeiaInc/codesign-runner}"
-if gh workflow view build-signed-release.yml -R "$SIGN_REPO" >/dev/null 2>&1; then
+SIGN_REPO="${DXR_SIGN_REPO}"   # local env only; the public repo names no provider
+if [ -n "$SIGN_REPO" ] && gh workflow view build-signed-release.yml -R "$SIGN_REPO" >/dev/null 2>&1; then
   SIGNED=yes
 else
-  echo "⚠  SIGNING SKIPPED — no access to the signing runner ($SIGN_REPO)."
+  echo "⚠  SIGNING SKIPPED — DXR_SIGN_REPO unset in the env, or the runner is unreachable."
   echo "   The release will ship the UNSIGNED CI installer. To sign, re-run"
   echo "   /release from a box whose gh auth can dispatch that workflow."
   SIGNED=no
