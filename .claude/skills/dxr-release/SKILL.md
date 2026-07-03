@@ -343,16 +343,32 @@ else
 fi
 ```
 
-**earthview is macOS-only for signing purposes:** its release asset is a macOS
-`.pkg`, which the Windows EV runner cannot sign (that needs an Apple Developer
-ID + `productsign` on a Mac — a separate flow). Force `SIGNED=no` for it:
+**earthview signs its WINDOWS installer (not its macOS `.pkg`).** earthview ships
+BOTH a `DisplayXREarthViewSetup-*.exe` (Windows, from `build-windows.yml`) and a
+macOS `.pkg` (from `build-macos.yml` — the workflow this skill watches in Phase 3).
+The Windows installer IS signable — it has an `earthview` component in
+`build-signed-release.yml` (cesium-native + ezvcpkg + OpenXR-loader build on the
+runner) — so it goes through the normal Step 3.5.1–3.5.3 flow. Only the macOS
+`.pkg` stays unsigned (needs Apple Developer ID + `productsign` on a Mac — a
+separate flow); the fail-closed verify only inspects the `.exe`, so the unsigned
+`.pkg` never blocks. **No `SIGNED=no` override** — earthview signs like any other
+Windows installer.
+
+**earthview race guard:** Phase 3 waits on `build-macos.yml`, so
+`build-windows.yml` (which attaches the UNSIGNED `.exe` via softprops) may still
+be running when we sign. In Step 3.5.3, before replacing the asset, wait for the
+tag's Windows CI run to finish so its upload can't clobber the signed one:
 ```bash
-case "$COMPONENT" in earthview|demo-earthview)
-  echo "earthview ships a macOS .pkg — Windows EV runner N/A. SIGNED=no."; SIGNED=no ;; esac
+if [ "$COMPONENT" = earthview ] || [ "$COMPONENT" = demo-earthview ]; then
+  WIN_RUN=$(gh run list -R "$REPO" --workflow build-windows.yml --branch "$NEW_TAG" \
+              --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+  [ -n "$WIN_RUN" ] && gh run watch "$WIN_RUN" -R "$REPO" --interval 20 --exit-status 2>/dev/null \
+     || echo "(earthview: no/failed build-windows run for $NEW_TAG — proceeding; the signed --clobber upload is last-writer)"
+fi
 ```
 
 ### Step 3.5.2: Normalize the component name for the workflow
-The workflow expects canonical names (`runtime|leia-plugin|mcp|gauss|modelviewer|mediaplayer|avatar`).
+The workflow expects canonical names (`runtime|leia-plugin|mcp|gauss|modelviewer|mediaplayer|avatar|earthview`).
 Map the skill's aliases:
 ```bash
 case "$COMPONENT" in
@@ -361,6 +377,7 @@ case "$COMPONENT" in
   modelviewer|demo-modelviewer)  COMP=modelviewer ;;
   avatar|demo-avatar)            COMP=avatar ;;
   mediaplayer|demo-mediaplayer)  COMP=mediaplayer ;;
+  earthview|demo-earthview)      COMP=earthview ;;
   mcp)                           COMP=mcp ;;
   *)                             COMP="$COMPONENT" ;;
 esac
