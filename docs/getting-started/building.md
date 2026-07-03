@@ -24,13 +24,46 @@ scripts\register_dev_plugin.bat leia C:\path\to\DisplayXR-LeiaSR.dll   REM (opti
 _package\run_cube_handle_d3d11_win.bat REM 3. run a test app
 ```
 
-> **The step everyone misses on Windows:** building from source produces the
-> sim-display plug-in DLL but does **not** register it, and Windows plug-in
-> discovery is **registry-only** (`HKLM\Software\DisplayXR\DisplayProcessors`).
-> Without step 2 the runtime starts but finds no display processor and fails
-> with `XRT_ERROR_DEVICE_CREATION_FAILED` / "Failed to initialize OpenXR".
-> `dev-setup.bat` and `register_dev_plugin.bat` do this for you. (POSIX/macOS
-> needs no registration — the loader finds plug-ins next to the runtime.)
+> **Windows requires an explicit plug-in registration step.** Building from
+> source produces the sim-display plug-in DLL but does **not** register it, and
+> Windows plug-in discovery is **registry-only**
+> (`HKLM\Software\DisplayXR\DisplayProcessors`). Without step 2 the runtime
+> starts but finds no display processor and fails with
+> `XRT_ERROR_DEVICE_CREATION_FAILED` / "Failed to initialize OpenXR".
+> `dev-setup.bat` and `register_dev_plugin.bat` perform this registration for
+> you. (POSIX/macOS needs no registration — the loader finds plug-ins next to
+> the runtime.)
+>
+> **A registered plug-in can still fail this check.** If you previously ran the
+> released installer, an older `sim-display` / `leia-sr` is registered — but a
+> from-source runtime built ahead of that release **ABI-rejects** it
+> (`negotiate returned -17` in the log, "no registered plug-in claimed the
+> system"), producing the *same* `XRT_ERROR_DEVICE_CREATION_FAILED` / "Failed to
+> initialize OpenXR". A registered plug-in is not necessarily an ABI-matched one.
+> The fix is the same — register your freshly-built plug-in (step 2), which
+> overwrites the stale entry. Diagnose headlessly first:
+> ```bat
+> _package\bin\displayxr-cli.exe selftest   REM PASS = DP found & ABI-matched; FAIL dumps the reason
+> ```
+> The runtime also logs the underlying cause (`negotiate returned …`, which
+> plug-in was rejected) to its per-process log at
+> `%LOCALAPPDATA%\DisplayXR\DisplayXR_<exe>.<pid>_<timestamp>.log`.
+>
+> **An elevated prompt re-triggers the same failure even after a correct
+> registration.** Registration is machine-wide and permanent
+> (`HKLM\Software\DisplayXR\DisplayProcessors`) — it is *not* per-session. But
+> *which runtime loads* is: `run_*.bat` points `XR_RUNTIME_JSON` at your
+> from-source runtime, and the Khronos loader **silently ignores
+> `XR_RUNTIME_JSON` in an elevated/admin process** (see
+> [Elevated terminal caveat](#elevated-terminal-caveat)), falling back to the
+> *installed* runtime via `HKLM\Software\Khronos\OpenXR\1\ActiveRuntime`. That
+> older runtime then ABI-rejects your freshly-registered plug-in, failing with
+> `XRT_ERROR_DEVICE_CREATION_FAILED` / "Failed to initialize OpenXR" — so it
+> looks like the registration "only applied to the one prompt where you ran it".
+> It didn't.
+> Either **run test apps from a non-elevated prompt** (so `XR_RUNTIME_JSON` is
+> honored), or run `scripts\dev-setup.bat` once so `ActiveRuntime` points at your
+> dev build and *every* app — any prompt, no env var needed — loads it.
 
 **macOS:**
 ```bash
