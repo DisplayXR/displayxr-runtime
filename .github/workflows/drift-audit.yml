@@ -1,0 +1,56 @@
+name: drift-audit
+
+# Cross-repo drift audit (epic #691 / child #695). Runs scripts/drift_audit.py
+# against the whole org via the `gh` CLI: FetchContent pins vs latest tags,
+# displayxr-common pin spread, vendored-spec staleness, the openxr_includes
+# API-version matrix, the demo three-pins rule, and prose version drift.
+#
+# Weekly (and on demand) so the whole #691 class of drift can't silently
+# recur between audits.
+#
+# TOKEN: reading private org repos (displayxr-shell-pvt) and opening issues on
+# *other* repos both need more than the default GITHUB_TOKEN. Set an org-scoped
+# PAT as the `DRIFT_AUDIT_TOKEN` secret. Without it the run still works but
+# silently skips repos the default token can't reach (the script degrades to
+# "could not fetch … skipped" notes rather than failing).
+
+on:
+  schedule:
+    - cron: '0 7 * * 1'   # Mondays 07:00 UTC
+  workflow_dispatch:
+    inputs:
+      emit_issues:
+        description: 'Open/update issues on offending repos (else dry-run)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: drift-audit
+  cancel-in-progress: false
+
+jobs:
+  drift-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Run drift audit
+        env:
+          # Prefer the org-scoped PAT; fall back to the default token.
+          GH_TOKEN: ${{ secrets.DRIFT_AUDIT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          # schedule -> emit issues; manual dispatch honours the input.
+          if [ "${{ github.event_name }}" = "schedule" ] || \
+             [ "${{ github.event.inputs.emit_issues }}" = "true" ]; then
+            python3 scripts/drift_audit.py --emit-issues
+          else
+            python3 scripts/drift_audit.py --dry-run
+          fi
