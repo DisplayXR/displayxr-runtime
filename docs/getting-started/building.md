@@ -73,7 +73,7 @@ git clone https://github.com/DisplayXR/displayxr-runtime && cd displayxr-runtime
 _package/DisplayXR-macOS/run_cube_handle_metal.sh   # run a test app (sim-display found automatically)
 ```
 
-To **debug in Visual Studio**, see [Debugging in Visual Studio](debugging-in-visual-studio.md).
+To **debug in Visual Studio**, see [Debugging in Visual Studio](#debugging-in-visual-studio).
 The rest of this doc is reference (prerequisites, CMake options, the loader /
 `ActiveRuntime` mechanism, vendor displays).
 

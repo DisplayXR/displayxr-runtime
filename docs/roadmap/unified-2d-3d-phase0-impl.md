@@ -1,7 +1,7 @@
 # Phase 0 — D3D11 masked-composite mechanism (implementation plan)
 
 **Branch:** `feature/unified-2d-3d-compositing` (worktree `.claude/worktrees/unified-2d3d`)
-**Spec:** [`docs/roadmap/unified-2d-3d-compositing.md`](docs/roadmap/unified-2d-3d-compositing.md) §4, §6 (Phase 0). Epic #439.
+**Spec:** [`unified-2d-3d-compositing.md`](unified-2d-3d-compositing.md) §4, §6 (Phase 0). Epic #439.
 **Goal:** stand up the general masked-2D-over-3D composite as a runtime-compiled shader pass, prove it **pixel-identical** to today's rectangular `d3d11_blit_surround_strips`, behind an opt-in toggle. Zero default behavioral change.
 
 **STATUS (BUILT + VALIDATED, 2026-06-05, Leia machine):** compiled clean on Windows first try; §6 A/B capture diff run on Leia hardware — **outside-canvas max diff = 0 across 8,064,000 pixels** (byte-identical, no sRGB tolerance needed: all views UNORM), inside-canvas weave alive under the shader path (66 k pixels differ between two shader-mode captures seconds apart → the discard isn't stomping the 3D region), boundary crisp at exactly the canvas rect. `displayxr-cli selftest` passes; default path (env unset) unchanged. Fixes applied during the Windows pass: format-parity check + strip-identical canvas clamping in `d3d11_composite_surround_shader`, CB-map-failure bail, RTV unbind after the composite draw. Live-display eyeball user-confirmed. **Phase 0 complete — ready for PR/merge.**

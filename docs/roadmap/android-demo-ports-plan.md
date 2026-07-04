@@ -103,7 +103,7 @@ upside* — runs on parts with weak/absent int64). **No runtime impact.**
 > the Windows + macOS legs first (where it's verifiable), then redo the android
 > rig to match.** The android rig experiments were reverted; PR #26 stays at the
 > raw-`xrLocateViews` v1 (renders only once the rig path is settled). The
-> mediaplayer leg is taken up next (see `mediaplayer-android-port-prompt.md`).
+> mediaplayer leg is taken up next.
 
 ### 1. modelviewer → `displayxr-demo-modelviewer` (rig paused — see note above)
 - `android/` leg = harness only (Gradle bootstrap, `NativeActivity`,
