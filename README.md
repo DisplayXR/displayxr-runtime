@@ -100,8 +100,15 @@ brew install cmake ninja eigen vulkan-sdk && ./scripts/build_macos.sh --installe
 #  from terminal bypasses Gatekeeper. Notarization tracked in issues #280/#281.)
 
 # Run a dev build without installing
-XR_RUNTIME_JSON=./build/Release/openxr_displayxr-dev.json ./your_openxr_app
+XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./your_openxr_app
 ```
+
+> **Windows from-source builds must register the sim-display plug-in once.**
+> Windows plug-in discovery is registry-only — `build_windows.bat` builds the
+> sim-display DLL but does not register it, so a pure from-source runtime finds
+> no display processor and app startup fails. `dev-setup.bat` registers it for
+> you; if you ran `build_windows.bat` standalone, run
+> **`scripts\register_dev_plugin.bat`** once from an elevated prompt.
 
 See [Building DisplayXR](docs/getting-started/building.md) for full instructions and CMake options.
 
@@ -110,7 +117,7 @@ See [Building DisplayXR](docs/getting-started/building.md) for full instructions
 No 3D display required. The **sim_display** driver provides a simulated tracked display with WASD + mouse eye position control:
 
 ```bash
-XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./build/test_apps/cube_handle_vk_macos/cube_handle_vk_macos
+XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./test_apps/cube_handle_vk_macos/build/cube_handle_vk_macos
 ```
 
 ## Documentation
