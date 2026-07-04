@@ -4,9 +4,10 @@ This guide walks a new 3D-display vendor from zero to a shipping DisplayXR-compa
 
 If you're maintaining a vendor integration that was historically in-tree (the way `drv_leia` was before #263), see the [legacy in-tree guide](../archive/vendor-integration-historical.md) — kept for historical context. Everything below assumes the post-#263 model.
 
-> **Canonical examples** (Leia SR is used throughout as the *example vendor* — substitute your own vendor name, SDK, and `<id>`)
-> - [`DisplayXR/displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin) — a full worked vendor integration (the first vendor on the platform); the recommended starting point. Fork the repo, swap `drv_leia/` for `drv_<your-vendor>/`, point the installer at your `<id>`.
-> - `src/xrt/drivers/sim_display/sim_display_plugin.c` (in this repo) — vendor-neutral software-only plug-in. Smaller, no vendor SDK, useful as a minimal-shape reference.
+> **Where to start**
+> - [`DisplayXR/displayxr-vendor-template`](https://github.com/DisplayXR/displayxr-vendor-template) — **the recommended starting point.** A buildable, ABI-correct, **vendor-SDK-free** starter kit: it's a plug-in skeleton (`drv_example`, D3D11 + Vulkan stub weavers) that consumes only the public runtime ABI (pinned via FetchContent). Generate a repo from it, rename `drv_example` → `drv_<vendor>`, replace the stub weave. See [§3](#3-building-from-the-template).
+> - [`DisplayXR/displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin) — a **full worked vendor integration** (the first vendor on the platform) to read for reference. It builds against a proprietary vendor SDK, so it's not a clean *starting* point — use it to see how a real weaver, eye-tracking listener, and installer come together.
+> - `src/xrt/drivers/sim_display/sim_display_plugin.c` (in this repo) — the runtime's in-tree neutral reference. Smaller, no vendor SDK; useful as a minimal-shape reference (can't be forked as a standalone plug-in repo — that's what the template is for).
 
 ## 1. What you ship
 
@@ -69,22 +70,46 @@ If your plug-in dynamically imports any of these, they resolve through standard 
 
 ## 3. Building from the template
 
-The fastest path:
+The fastest path is to generate your repo from
+[`displayxr-vendor-template`](https://github.com/DisplayXR/displayxr-vendor-template)
+— a **vendor-SDK-free** starter kit that already builds against the pinned runtime
+ABI (D3D11 + Vulkan stub weavers, installer, CI):
 
 ```bash
-gh repo fork DisplayXR/displayxr-leia-plugin --clone=true --remote=true displayxr-vendor-XXX-plugin
+gh repo create <your-org>/displayxr-vendor-XXX-plugin \
+    --template DisplayXR/displayxr-vendor-template --private --clone
 cd displayxr-vendor-XXX-plugin
+scripts\build-windows.bat all          # builds the example plug-in as-is, no SDK
 ```
 
-Then:
+That first build works with **no vendor SDK** — confirm it's green before you
+touch anything, so you have a known-good baseline. Then make it yours:
 
-1. **Rename `src/drv_leia/` → `src/drv_<vendor>/`** and replace its contents with your SDK glue: device init, hardware probe, weaver per-API, eye tracking listener.
-2. **Rewrite `src/drv_<vendor>/<vendor>_plugin.c`** against `xrt_plugin_iface` — see the [iface reference](../reference/xrt_plugin_iface.md) for which callbacks are required vs optional and what each one must produce.
-3. **Update `CMakeLists.txt`** — rename the `add_library(DisplayXR-LeiaSR SHARED …)` target to `DisplayXR-<YourVendor>`. The `XRT_USING_RUNTIME_DLL` + linker settings stay the same.
-4. **Update `installer/DisplayXR<YourVendor>Installer.nsi`** — change the registry `<id>` from `leia-sr` to your own, the install dir from `LeiaSR` to your vendor name, and the `DisplayName` / `Vendor` strings.
-5. **Update `scripts/build-windows.bat`** — point the vendor SDK download URL at your vendor's SDK release artifact. Replace the `LEIASR_SDKROOT` env-var with `<VENDOR>_SDKROOT`.
+1. **Rename `src/drv_example/` → `src/drv_<vendor>/`** and replace the stub
+   contents with your SDK glue: device init, hardware probe, weaver per-API, eye
+   tracking listener.
+2. **Rewrite `src/drv_<vendor>/example_plugin.c`** against `xrt_plugin_iface` —
+   see the [iface reference](../reference/xrt_plugin_iface.md) for which callbacks
+   are required vs optional and what each one must produce. The stub already
+   returns a valid vtable; swap the bodies.
+3. **Replace the stub weave** in `example_processor_d3d11.cpp` /
+   `example_processor_vk.c` with your real `process_atlas` — this is the one
+   function that makes the plug-in yours.
+4. **Update `CMakeLists.txt`** — rename the `DisplayXR-ExampleVendor` target to
+   `DisplayXR-<YourVendor>`. The `XRT_USING_RUNTIME_DLL` + linker settings and the
+   `DXR_RUNTIME_GIT_TAG` pin stay as-is (bump the pin only when you adopt a newer
+   runtime ABI major).
+5. **Update `installer/DisplayXRExampleVendorInstaller.nsi`** — change the registry
+   `<id>` to your own, the install dir from `ExampleVendor` to your vendor name, and
+   the `DisplayName` / `Vendor` strings.
+6. **Add your SDK to `scripts/build-windows.bat`** if you need one — the template
+   builds with none, so add the download/`<VENDOR>_SDKROOT` wiring only when your
+   weaver depends on a proprietary library.
 
-The runtime `FetchContent` setup at the top of the plug-in repo's `CMakeLists.txt` does NOT need editing — your plug-in still consumes the same runtime ABI.
+The runtime `FetchContent` setup at the top of `CMakeLists.txt` does NOT need
+editing — your plug-in consumes the same runtime ABI. (Read
+[`displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin) as a
+full worked example of steps 1–3 against a real SDK.)
 
 ## 4. Discovery contract
 
