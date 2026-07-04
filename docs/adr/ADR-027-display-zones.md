@@ -10,6 +10,24 @@ issues: [439, 396]
 > display-zones is now the sole region paradigm for all app classes. The surround references
 > below are accurate history; see ADR-031 + `docs/roadmap/surround-zones-deprecation.md`.
 
+> **Taxonomy note (2026-07, #696):** this decision also **narrows the `_texture`
+> app class**. Making display-zones the region paradigm for *every* class means
+> content-handoff (`handle` / `texture` / `hosted` / `ipc`) and region paradigm
+> (zones + mask) are now **orthogonal axes** — texture is no longer "how you weave
+> a sub-rect," it is just present-ownership handoff for a producer with no window
+> the runtime can weave into (CEF, WebXR bridge, decode target). Two consequences
+> to record: (1) in test-app naming `zones` is a **feature modifier, not a class**
+> — `cube_zones_*` is a *handle* app exercising zones, `cube_zones_texture_*` a
+> *texture* app exercising zones; there is no `zones/` group. (2) For an
+> out-of-process texture producer, the DP still needs an **on-screen HWND as a
+> position/phase anchor** (drag phase-snap + canvas-scoped Kooima via
+> `get_window_metrics`), *not* as a render target — shared-texture mode creates no
+> swapchain and never presents (`comp_d3d11_compositor.cpp:2103,2251-2333`); the
+> NULL-HWND path exists but degrades to display-scoped Kooima + no phase-snap.
+> Decoupling that position channel from the HWND (an on-screen target-rect binding
+> for genuinely windowless producers) is designed separately in **#697**. See
+> `docs/getting-started/app-classes.md` for the app-facing framing.
+
 ## Context
 
 The current composition model couples three concerns into one object chain:

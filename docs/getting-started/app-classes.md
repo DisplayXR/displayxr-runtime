@@ -2,12 +2,30 @@
 
 DisplayXR supports four ways for an application to integrate with the runtime, differing in who owns the window and rendering targets.
 
+## Two orthogonal axes
+
+App integration is described by **two independent choices**, not one — conflating
+them is the historical source of confusion (see [ADR-027](../adr/ADR-027-display-zones.md)):
+
+1. **Content-handoff class — *how content reaches the runtime*.**
+   `handle` / `texture` / `hosted` / `ipc`. This is the only thing "class" means:
+   who owns the window and the final surface.
+2. **Region paradigm — *how a mixed 2D/3D layout is expressed*.**
+   Declarative [display-zones](../specs/extensions/XR_EXT_display_zones.md)
+   (N 3D zones + 2D zones + wish mask) — and this works **across every class**.
+
+These axes are independent: a `handle` app and a `texture` app both mix 2D and 3D
+the same way (zones + mask). **Texture is a content-handoff mechanism, not a region
+mechanism** — its original reason to exist (weave a sub-rect via output-rect +
+surround in a passed texture) was superseded by display-zones and the legacy
+side-channel removed ([ADR-031](../adr/ADR-031-remove-surround-output-rect-zones-sole-region-model.md)).
+
 ## The Four Classes
 
 | Class | Suffix | Description | Compositor path |
 |-------|--------|-------------|----------------|
 | **Handle** | `_handle` | App provides its own window handle via `XR_EXT_*_window_binding` | Native compositor directly in-process |
-| **Texture** | `_texture` | App provides a shared texture **and its own window handle**; runtime composites its display-zones result (3D zones + Local2D zones) into the shared texture. App declares regions via [`XR_EXT_display_zones`](../specs/extensions/XR_EXT_display_zones.md) — `XrDisplayZoneEXT` (3D) + `XrCompositionLayerLocal2DEXT` (2D) | Native compositor directly in-process |
+| **Texture** | `_texture` | **Present-ownership handoff** for a producer that has no window the runtime can weave into — an offscreen browser composite (CEF), a WebXR bridge surface, a decode/capture target. App provides a shared texture; the runtime's display processor weaves **into that texture** and the app presents it. Regions (if the app mixes 2D/3D) are declared with [`XR_EXT_display_zones`](../specs/extensions/XR_EXT_display_zones.md) exactly as any other class — texture is **not** itself a region mechanism | Native compositor directly in-process |
 | **Hosted** | `_hosted` | Runtime creates window and rendering targets (standard OpenXR/WebXR) | Native compositor directly in-process |
 | **IPC/Service** | _(internal)_ | Out-of-process via client compositor → IPC → server multi-compositor. Used internally by the shell and WebXR — apps don't need to target this directly. | Client compositor → IPC → multi-compositor → native compositor in server |
 
@@ -56,10 +74,39 @@ A frequent point of confusion — the in-process classes differ in **who owns th
 | Class | App passes to runtime | Compositor's window |
 |-------|-----------------------|---------------------|
 | **Handle** | the app's **real** window handle | uses the app's window |
-| **Texture** | the app's **real** window handle (+ a shared texture) | offscreen / shared texture; the HWND is only for DP position tracking |
+| **Texture** | the app's **real** window handle (+ a shared texture) | offscreen / shared texture; the HWND is only a **position/phase anchor** for the display processor, not a render target |
 | **Hosted** | **NULL** | the runtime creates its **own** window at native resolution |
 
-So `NULL` is the **Hosted** path (not Handle) — that's the case that makes the runtime self-create a window. The display processor *always* receives a real handle: the app's for Handle/Texture, the runtime's self-created window for Hosted. Authoritative branch: the window-handling block in `*_compositor_create` (e.g. `src/xrt/compositor/d3d11/comp_d3d11_compositor.cpp`).
+So `NULL` is the **Hosted** path (not Handle) — that's the case that makes the runtime self-create a window. The display processor *normally* receives a real handle: the app's for Handle/Texture, the runtime's self-created window for Hosted. Authoritative branch: the window-handling block in `*_compositor_create` (e.g. `src/xrt/compositor/d3d11/comp_d3d11_compositor.cpp`).
+
+### The HWND is a position/phase anchor — and for texture it is *already optional*
+
+The handle a class passes is **content delivery for Handle/Hosted, but for Texture
+it is a position channel only** — never a render target. Verified in code
+(`comp_d3d11_compositor.cpp`): in shared-texture mode the compositor creates **no
+swapchain and never presents** (`c->hwnd = nullptr` at :2103; the DXGI target is
+skipped at :2251-2257, *"offscreen shared texture mode"*). The display processor
+weaves **into the app's shared texture** and the **app presents it** (:2326-2333,
+feature #68). The HWND (`app_hwnd`) is passed to the DP purely for
+position/phase tracking (`dp_hwnd = c->hwnd ? c->hwnd : c->app_hwnd`, :2313).
+
+A **NULL-HWND offscreen path already exists** (:2107) — so a texture app supplying
+the HWND is *optional in the implementation*, not mandatory. But dropping it
+degrades two position-only jobs, not just one:
+
+1. **Drag phase-snap** — the vendor DP subclasses the HWND's `WndProc` to snap
+   interlace phase to absolute screen position on window drag; without a window →
+   stutter/crosstalk while moving.
+2. **Window metrics → canvas-scoped Kooima** — `get_window_metrics` returns false
+   with no handle (:3920-3922), so runtime-side Kooima falls back **display-scoped
+   instead of canvas-scoped** (#396 W7) — a framing change, not just a glitch.
+
+So a genuinely windowless / out-of-process producer (WebXR, CEF, engine offscreen)
+can already hand off a texture, but loses window-relative projection and phase
+alignment because both are sourced from an HWND. The clean fix — an on-screen
+target-rect channel replacing the HWND for both position jobs — is designed in
+**[#697](https://github.com/DisplayXR/displayxr-runtime/issues/697)**
+(windowless target-rect binding).
 
 ## Which Class Should I Use?
 
@@ -88,7 +135,7 @@ The bullets below add detail per class.
 
 - **Building a native app with your own window?** Use **Handle**. You create and manage the window, pass the handle (HWND, NSView) to the runtime via `XR_EXT_win32_window_binding` or `XR_EXT_cocoa_window_binding`. Most control, best for apps that need to own their window lifecycle.
 
-- **Need the app, engine, or browser to own the swapchain?** Use **Texture** — for present-ownership: offscreen rendering, frame capture/streaming, or an engine/browser that must hold its own surface. You create and own the window (and pass its handle) and provide a shared texture; the runtime composites into it and uses your HWND for display-processor position tracking.
+- **Need the app, engine, or browser to own the swapchain?** Use **Texture** — for present-ownership: offscreen rendering, frame capture/streaming, or an engine/browser that must hold its own surface. You provide a shared texture; the DP weaves into it and you present it. You *should* also pass an on-screen HWND — it's the DP's position/phase anchor (drag phase-snap + canvas-scoped Kooima), **not** a render target, and it is optional in code (see [above](#the-hwnd-is-a-positionphase-anchor--and-for-texture-it-is-already-optional)) — but a fully windowless producer degrades until [#697](https://github.com/DisplayXR/displayxr-runtime/issues/697) lands.
   - To embed 3D in a 2D UI, declare regions via **display-zones** — a 3D zone for the 3D region, a Local2D layer + mask for the 2D region ([Mixing 2D and 3D](#mixing-2d-and-3d-in-one-app)). This works for Handle apps too. (The legacy `xrSetSharedTextureSurround2DEXT` / output-rect side-channel was removed — ADR-031.)
 
   Full contract: [`XR_EXT_display_zones`](../specs/extensions/XR_EXT_display_zones.md); window binding: [`XR_EXT_win32_window_binding`](../specs/extensions/XR_EXT_win32_window_binding.md).
