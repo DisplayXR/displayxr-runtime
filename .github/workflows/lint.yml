@@ -57,6 +57,27 @@ jobs:
           fi
           echo "Runtime tree is shell-source-free. ✓"
 
+  docs-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: ADR index is up to date
+        # The docs/README.md ADR list + docs/adr/README.md are generated from
+        # docs/adr/ADR-*.md. A new ADR that isn't re-indexed fails here (this is
+        # exactly how ADR-032 drifted out of the index — epic #691 item 10).
+        # Regenerate locally with: python3 scripts/gen_adr_index.py
+        run: python3 scripts/gen_adr_index.py --check
+
+      - name: No dead relative doc links
+        # Flags README-referenced paths that don't exist on disk (moved specs,
+        # pruned roadmap docs still linked, a stale ADR filename).
+        run: python3 scripts/check_doc_paths.py
+
   vendor-docs-guard:
     runs-on: ubuntu-latest
     steps:
