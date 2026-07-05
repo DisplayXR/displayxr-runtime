@@ -34,6 +34,30 @@ written anytime.
   against the dev runtime and confirm it presents/weaves. Gated on runtime
   **Phase 1b** (on-screen present proven). Don't block build-green work on it.
 
+## Two demo shapes — check this FIRST (it decides most of the work)
+
+The five demos split into two structures, and it changes the port from "one CMake
+line" to "author a new entry point." All ports 2026-07 landed build-green; the
+split was: **mediaplayer = shared-src; avatar / modelviewer / gaussiansplat /
+earthview = per-platform.**
+
+- **Shared-src (mediaplayer only):** one cross-platform `src/` (SDL harness) with
+  a thin per-OS window shim. The Linux port really is "pure build tooling" — a
+  CMake `else → linux` arm + the loader fallback. This is the *exception*.
+- **Per-platform (the other four):** `macos/main.mm` (Cocoa) + `windows/main.cpp`
+  (Win32) with the Vulkan+OpenXR bootstrap **inside** each, and **no shared
+  cross-platform main**. There is nothing for a CMake arm to point at, so you
+  **author a new `linux/<demo>_handle_vk_linux/main.cpp` from scratch**: a compact
+  **hosted-NULL** OpenXR+Vulkan harness that drives the demo's shared renderer lib
+  (`ModelRenderer` / `gs_renderer` / `TileRenderer`). Scaffold it from the
+  runtime's `test_apps/cube_handle_vk_linux` (or `cube_hosted_legacy_vk_linux`),
+  strip the cube's own VkRenderer + MoltenVK-portability bits, and wire in the
+  demo's renderer (whose `renderEye()` usually takes a swapchain `VkImage`
+  directly — no framebuffer machinery). Windowing = hosted-NULL for build-green;
+  vendor `XR_EXT_xlib_window_binding.h` and leave a `TODO(Phase 3b)` to switch to
+  the real app-owned window once hardware validation happens. **This new main is
+  the bulk of the work, not the build tooling.**
+
 ## Recipe (mirror the demo's `build_macos.sh`)
 
 Each demo already has `scripts/build_macos.sh` that builds the runtime-agnostic
@@ -111,6 +135,46 @@ Confirmed on **demo #1, mediaplayer** (mediaplayer#30, 4 CI iterations):
 - **Loader/header pin drift is org-wide:** the loader is pinned `1.1.43` while
   vendored headers are newer (`1.1.51`) in several repos incl. the runtime. Keep
   `1.1.43` for the loader unless you're deliberately bumping all three pins.
+
+Confirmed across the **4-demo batch** (avatar #22, modelviewer #41, gaussiansplat
+#61, earthview — all build-green, 1–4 CI iterations each):
+
+- **GCC-vs-Clang flag/header gotchas are the #1 recurring failure.** Third-party
+  libs demote warnings under `if(NOT MSVC)` assuming Clang, which breaks GCC:
+  - Niantic **SPZ** `splat-types.h` uses `std::sort` without `#include <algorithm>`
+    (libc++ hides it on mac); the patch was MSVC-only → hoist the include-injection
+    to **all** toolchains. (gaussiansplat)
+  - **tinyusdz** `-Wthread-safety-negative` is Clang-only → GCC errors on the
+    unknown flag. Gate it to `CMAKE_CXX_COMPILER_ID MATCHES "Clang"` (still catches
+    AppleClang) + `-Wno-error` on `GNU`. (modelviewer)
+  - General rule: any Clang-only `-W…` flag or transitively-included header will
+    surface on GCC. Gate on the compiler ID, not `NOT MSVC`.
+- **`displayxr::common` builds on Linux, but its stb impl TUs are Win/APPLE-gated
+  — BOTH of them.** A per-platform demo's `linux/` exe must supply whichever it
+  uses: `stb_image_impl_linux.cpp` (models/textures) and/or
+  `stb_image_write_impl.cpp` (e.g. `TileRenderer::dumpColorTarget` → `stbi_write_png`,
+  earthview). One-line TU each (`#define STB_..._IMPLEMENTATION` + the header;
+  resolves via common's propagated include dir). tinygltf's `NO_STB_IMAGE` avoids
+  double-definition.
+- **cesium / vcpkg-source-build demos** (earthview) need more than the base apt
+  list: `libcurl4-openssl-dev libssl-dev zlib1g-dev` **plus the ezvcpkg build
+  toolchain** `autoconf automake autoconf-archive libtool nasm zip unzip tar`
+  (curl/openssl/draco/ktx build from source and hard-fail without them). Reuse the
+  mac/win `EZVCPKG_BASEDIR` + `actions/cache` (`/home/runner/.ezvcpkg`).
+- **Window-space-layer mirror is often N/A.** A per-platform demo whose Linux leg
+  is modeled on the *macOS* harness usually doesn't reference
+  `XrCompositionLayerWindowSpaceEXT` (it's a Windows-only HUD in some demos) — and
+  demos linking `displayxr::common`'s `xr_window_space_hud.h` get the struct from
+  `openxr_includes/` for free. Only add the interim `#ifndef` mirror if the compile
+  actually needs it.
+- **Merge mechanics:** demo `main` is protected (1 review; CI-green alone doesn't
+  satisfy it). Open a PR so the Win/macOS/Android/lint checks run (they only fire
+  on `pull_request`, not `linux*` branches), wait for green, then
+  `gh pr merge <n> --admin --squash --delete-branch`. Build Linux is non-required
+  and does not re-run on `main` (validated on the PR).
+- **`.bat` CRLF trap:** `git add -A` can sweep a CRLF→LF renormalization of
+  `scripts/*.bat` that `.gitattributes` forces to CRLF — stage intended files
+  explicitly, or revert the incidental `.bat` churn before committing.
 
 Runtime-tree apps (e.g. `test_apps/*`) additionally hit — usually N/A for demos:
 
