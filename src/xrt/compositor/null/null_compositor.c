@@ -97,6 +97,14 @@ static const char *instance_extensions_common[] = {
     // comp_window_macos → vkCreateMetalSurfaceEXT (MoltenVK).
     VK_EXT_METAL_SURFACE_EXTENSION_NAME,                    //
 #endif
+#if defined(VK_KHR_xcb_surface) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+    // Desktop Linux (#660 Phase 2): the service's out-of-process window-present
+    // arm is not wired yet (no comp_window_xcb comp_target, and
+    // null_compositor_init_target_service has no Linux branch — Phase 1b
+    // hardware work). Advertise VK_KHR_xcb_surface now so the service's
+    // VkInstance can build an XCB surface once that arm lands.
+    VK_KHR_XCB_SURFACE_EXTENSION_NAME,                      //
+#endif
 };
 
 static const char *required_device_extensions[] = {

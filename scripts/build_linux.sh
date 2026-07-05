@@ -1,12 +1,13 @@
 #!/bin/bash
-# Build the DisplayXR runtime on Linux — PHASE 0 (headless bring-up).
+# Build the DisplayXR runtime on Linux (docs/roadmap/linux-support.md, #660).
 #
-# This is the Linux mirror of build_macos.sh / build_windows.bat, but scoped to
-# Phase 0 of the Linux port (docs/roadmap/linux-support.md): get the runtime to
-# CONFIGURE, BUILD, and pass `displayxr-cli selftest` — the hardware-free gate
-# that exercises plug-in discovery + the display-processor path WITHOUT a GPU,
-# window, or OpenXR loader. There is no native presentation compositor on Linux
-# yet (Phase 1), so the test apps are intentionally not built here.
+# This is the Linux mirror of build_macos.sh / build_windows.bat. The default
+# invocation is the Phase 0 headless gate: CONFIGURE, BUILD, and pass
+# `displayxr-cli selftest` — hardware-free, exercising plug-in discovery + the
+# display-processor path WITHOUT a GPU, window, or OpenXR loader. --apps adds
+# the Phase 1 on-screen bring-up vehicle; --service adds the Phase 2 service /
+# IPC build (displayxr-service + the IPC-client runtime — build-green only on a
+# headless box; the IPC round-trip needs a display, Phase 1b).
 #
 # What this proves: OS detection, aux/os (threading/time), the POSIX plug-in
 # loader (JSON manifest → dlopen), the sim_display display processor, and that
@@ -80,6 +81,26 @@ CLI_BIN="$(find "$BUILD_DIR/src/xrt/targets/cli" -maxdepth 1 -name displayxr-cli
 if [ -z "$CLI_BIN" ]; then
   echo "ERROR: displayxr-cli not found under $BUILD_DIR/src/xrt/targets/cli/" >&2
   exit 1
+fi
+
+# Phase 2 (#660): in a --service build, assert the service executable and the
+# IPC-client runtime actually linked. CI has no display, so build-green IS the
+# Phase 2 gate — the IPC round-trip is validated on hardware (Phase 1b).
+SERVICE_BIN=""
+if [ "$SERVICE_MODE" = "ON" ]; then
+  SERVICE_BIN="$(find "$BUILD_DIR/src/xrt/targets/service" -maxdepth 1 -name displayxr-service -type f | head -1)"
+  if [ -z "$SERVICE_BIN" ]; then
+    echo "ERROR: displayxr-service not found under $BUILD_DIR/src/xrt/targets/service/" >&2
+    exit 1
+  fi
+  RUNTIME_SO="$(find "$BUILD_DIR/src/xrt/targets/openxr" -name "openxr_displayxr.so*" -type f | head -1)"
+  if [ -z "$RUNTIME_SO" ]; then
+    echo "ERROR: IPC-client runtime .so not found under $BUILD_DIR/src/xrt/targets/openxr/" >&2
+    exit 1
+  fi
+  echo "Service build artifacts OK:"
+  echo "  displayxr-service:    $SERVICE_BIN"
+  echo "  IPC-client runtime:   $RUNTIME_SO"
 fi
 
 # On Linux the plug-in target is OUTPUT_NAME "DisplayXR-SimDisplay" PREFIX ""

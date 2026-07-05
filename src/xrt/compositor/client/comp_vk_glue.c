@@ -33,6 +33,11 @@ const char *xrt_gfx_vk_instance_extensions = VK_KHR_EXTERNAL_FENCE_CAPABILITIES_
     // VK native compositor on Android needs VkSurfaceKHR via VK_KHR_android_surface
     " " VK_KHR_SURFACE_EXTENSION_NAME
     " " VK_KHR_ANDROID_SURFACE_EXTENSION_NAME
+#elif defined(VK_KHR_xcb_surface) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+    // VK native compositor on desktop Linux needs VkSurfaceKHR via VK_KHR_xcb_surface
+    // (xcb_connection_t + xcb_window_t -> VkSurfaceKHR in comp_vk_native_target).
+    " " VK_KHR_SURFACE_EXTENSION_NAME
+    " " VK_KHR_XCB_SURFACE_EXTENSION_NAME
 #endif
     ;
 
@@ -47,6 +52,11 @@ const char *xrt_gfx_vk_device_extensions = VK_KHR_DEDICATED_ALLOCATION_EXTENSION
 // Platform version of "external_memory"
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
     " " VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME
+#if defined(VK_KHR_xcb_surface) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+    // VK native compositor on desktop Linux presents on the app's VkDevice via a
+    // swapchain over the XCB surface (comp_vk_native_target)
+    " " VK_KHR_SWAPCHAIN_EXTENSION_NAME
+#endif
 
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_AHARDWAREBUFFER)
     " " VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME

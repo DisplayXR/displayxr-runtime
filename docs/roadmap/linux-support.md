@@ -1,7 +1,8 @@
 # Linux Support
 
-Status: **Phase 0 in progress** (headless bring-up). Windows, macOS, and Android
-ship today; Linux is the remaining platform.
+Status: **Phase 0 ✅ · Phase 1a ✅ · Phase 2a ✅ (all build-green on CI); Phase
+1b/2b on-screen validation pending Linux+GPU hardware.** Windows, macOS, and
+Android ship today; Linux is the remaining platform.
 
 ## TL;DR
 
@@ -146,15 +147,54 @@ sim_display weaving.
 
 ### Phase 2 — Service / IPC path
 
-Mostly already wired (Linux mainloop, unix sockets, SCM_RIGHTS, systemd). The
-service compositor reuses Phase 1's window backend, so it **depends on Phase 1**.
+**Phase 2a — build-green on Linux CI ✅ (done).** `displayxr-service` + the
+IPC-client runtime compile on `ubuntu-latest` (`./scripts/build_linux.sh
+--service`, CI `Service` job in `build-linux.yml`). The substrate needed no new
+platform arms — the service CMake gate (`targets/CMakeLists.txt`), the Linux
+IPC mainloop (`ipc_server_mainloop_linux.c`), the VK client compositor
+(`comp_vk_client.c`, platform-neutral), the IPC-client runtime target
+(`XRT_FEATURE_IPC_CLIENT`, auto-ON with service), and the service
+system-compositor factory (`target_instance.c`, null compositor by default off
+Windows) were all already fence-free on Linux. Delivered on top:
 
-- Stand up `displayxr-service` (`./scripts/build_linux.sh --service`) and a
-  client with `XRT_FORCE_MODE=ipc`; validate swapchain-image fd-passing over the
-  unix socket.
-- The Linux service orchestrator is currently no-op stubs
-  (`service_orchestrator.c:1634+`) — fine for MVP (the shell is deferred even on
-  macOS): just `ipc_server_main` + manual/systemd start, no child auto-spawn.
+- Extension-list arms (desktop-Linux-guarded, no-op elsewhere):
+  `comp_vk_glue.c` instance list gains `VK_KHR_surface` + `VK_KHR_xcb_surface`
+  (the `xrGetVulkanInstanceExtensionsKHR` answer — without it an enable1 VK
+  app's instance can't build the XCB surface); the FD device-extension arms in
+  `comp_vk_glue.c` **and** `oxr_vulkan.c` gain `VK_KHR_swapchain` (they were the
+  only arms missing it — the vk_native compositor presents on the app's
+  VkDevice); `null_compositor.c` `instance_extensions_common` gains
+  `VK_KHR_xcb_surface` (service-side VkInstance, ready for the window arm).
+- `build_linux.sh --service` now asserts `displayxr-service` + the IPC-client
+  `openxr_displayxr.so` actually linked; headless selftest still runs.
+
+**Correction to the earlier sketch:** the service does *not* reuse the Phase 1
+vk_native window backend. Its system compositor is **null + comp_multi + the
+DP plug-in weave** (macOS is the exact analog); vk_native is instantiated
+in-process only (`oxr_session_gfx_vk_native.c`). The DP-weave path is
+platform-neutral and needs no VkSurface.
+
+**Phase 2b — on-screen out-of-process present (pending Linux hardware, with
+Phase 1b).** Validate with `displayxr-service` + a client under
+`XRT_FORCE_MODE=ipc` (swapchain-image fd-passing over the unix socket). Known
+gaps to wire when a display exists, all mirroring the macOS arms:
+
+1. **No `comp_window_xcb` comp_target** — `compositor/main/` only has
+   `comp_window_android.c` / `comp_window_macos.m`. A Linux service-owned
+   window target should reuse the Phase 1 XCB helper
+   (`comp_vk_native_window_xcb.c`).
+2. **`null_compositor_init_target_service` has no Linux arm**
+   (`null_compositor.c`, WIN32/ANDROID/MACOS only) —
+   `create_from_window` stays NULL, so the service can't own a present window.
+3. **`ipc_server_handler.c` server-side present/Kooima block is fenced
+   `XRT_OS_ANDROID || XRT_OS_MACOS`** (the `comp_multi_private.h` include and
+   the ~500-line block at 903-1394, plus sibling fence sites) — extend with
+   `XRT_OS_LINUX_DESKTOP` and mirror the APPLE `aux_vk` link in
+   `ipc/CMakeLists.txt`.
+4. The Linux service orchestrator stubs (`service_orchestrator.c:1634+`) are
+   fine for MVP (no child auto-spawn) — note they aren't even compiled on
+   Linux; `targets/service/CMakeLists.txt` has no Linux source arm and
+   `main.c`'s non-macOS path never calls them.
 
 **Done when:** a handle/hosted app runs out-of-process against
 `displayxr-service` on Linux.

@@ -9,11 +9,15 @@ name: Build Linux
 # this to a PR-triggered required check (with the DetectChanges docs_only
 # short-circuit the macOS/Windows jobs use) only once it passes reliably.
 #
-# Phase 0 scope: configure + build the runtime + displayxr-cli + the
-# sim_display plug-in, then run `displayxr-cli selftest` — the hardware-free
-# gate that exercises plug-in discovery + the display-processor path with no
-# GPU, window, or OpenXR loader. There is no native presentation compositor on
-# Linux yet (Phase 1), so no test apps are built here.
+# Selftest job (Phase 0/1): configure + build the runtime + displayxr-cli +
+# the sim_display plug-in, run `displayxr-cli selftest` (the hardware-free gate
+# that exercises plug-in discovery + the display-processor path with no GPU,
+# window, or OpenXR loader), and compile the Phase 1b bring-up test app.
+#
+# Service job (Phase 2, #660): the same build with XRT_FEATURE_SERVICE=ON —
+# compiles displayxr-service + the IPC-client runtime (client VK compositor,
+# ipc_client/ipc_server, comp_multi). CI has no display, so build-green is the
+# Phase 2 gate; the IPC round-trip is hardware work (Phase 1b).
 
 on:
   workflow_dispatch: {}
@@ -49,3 +53,26 @@ jobs:
         # cube_hosted_legacy_vk_linux test app, compile-validating the Phase 1b
         # bring-up vehicle. CI has no display, so the app isn't run here.
         run: ./scripts/build_linux.sh --apps
+
+  Service:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libvulkan-dev vulkan-validationlayers glslang-tools \
+            libeigen3-dev libcjson-dev libudev-dev \
+            libxcb1-dev libxcb-randr0-dev libx11-xcb-dev
+
+      - name: Build service + IPC-client runtime (headless selftest)
+        # XRT_FEATURE_SERVICE=ON: displayxr-service + the IPC-client runtime
+        # (client VK compositor + ipc_client/ipc_server + comp_multi). The
+        # selftest still runs (displayxr-cli links target_instance_no_comp,
+        # independent of service mode). Build-green only — no display on CI.
+        run: ./scripts/build_linux.sh --service

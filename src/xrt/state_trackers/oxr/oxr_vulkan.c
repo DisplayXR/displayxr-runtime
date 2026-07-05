@@ -152,6 +152,11 @@ static const char *required_vk_device_extensions[] = {
 // Platform version of "external_memory"
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+#if defined(VK_KHR_xcb_surface) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+    // VK native compositor on desktop Linux presents on the app's VkDevice via a
+    // swapchain over the XCB surface (comp_vk_native_target)
+    VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+#endif
 
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_AHARDWAREBUFFER)
     VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
