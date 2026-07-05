@@ -4,11 +4,11 @@ Five test applications that demonstrate the **window-handle binding** and **disp
 
 | App | Graphics API | Platform | Directory |
 |-----|-------------|----------|-----------|
-| `cube_handle_d3d11_win` | D3D11 | Windows | `test_apps/cube_handle_d3d11_win/` |
-| `cube_handle_vk_win` | Vulkan | Windows | `test_apps/cube_handle_vk_win/` |
-| `cube_handle_gl_win` | OpenGL | Windows | `test_apps/cube_handle_gl_win/` |
-| `cube_handle_d3d12_win` | D3D12 | Windows | `test_apps/cube_handle_d3d12_win/` |
-| `cube_handle_vk_macos` | Vulkan | macOS | `test_apps/cube_handle_vk_macos/` |
+| `cube_handle_d3d11_win` | D3D11 | Windows | `test_apps/handle/cube_handle_d3d11_win/` |
+| `cube_handle_vk_win` | Vulkan | Windows | `test_apps/handle/cube_handle_vk_win/` |
+| `cube_handle_gl_win` | OpenGL | Windows | `test_apps/handle/cube_handle_gl_win/` |
+| `cube_handle_d3d12_win` | D3D12 | Windows | `test_apps/handle/cube_handle_d3d12_win/` |
+| `cube_handle_vk_macos` | Vulkan | macOS | `test_apps/handle/cube_handle_vk_macos/` |
 
 ## OpenXR Extensions Demonstrated
 

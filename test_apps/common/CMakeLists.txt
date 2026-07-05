@@ -4,6 +4,15 @@
 cmake_minimum_required(VERSION 3.21)
 project(sr_common LANGUAGES C CXX)
 
+# Idempotency guard. Each app pulls the shared scaffolding in with its own
+# add_subdirectory(<...>/common ...), so when many apps are aggregated under one
+# configure (the platform-aware aggregator in ../CMakeLists.txt) this file is
+# entered once per app. The FetchContent population dedups on its own, but a
+# second add_library(sr_common) would collide. Skip everything if the shims are
+# already defined — the first entry wins and every later app reuses them. In the
+# standalone per-app build the target never pre-exists, so this is a no-op there.
+if(NOT TARGET sr_common)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -49,3 +58,5 @@ target_include_directories(sr_common_base INTERFACE
 
 add_library(sr_common INTERFACE)
 target_link_libraries(sr_common INTERFACE sr_common_base)
+
+endif() # NOT TARGET sr_common

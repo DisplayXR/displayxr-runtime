@@ -97,7 +97,7 @@ scripts\build_windows.bat test-apps
 
 Or build individually:
 ```bash
-cd test_apps\cube_handle_d3d11_win
+cd test_apps\handle\cube_handle_d3d11_win
 mkdir build && cd build
 cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT=path\to\openxr_sdk
 cmake --build .
@@ -113,7 +113,7 @@ Point `XR_RUNTIME_JSON` at the dev build:
 
 ```bash
 # macOS
-XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./test_apps/cube_handle_metal_macos/build/cube_handle_metal_macos
+XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./test_apps/handle/cube_handle_metal_macos/build/cube_handle_metal_macos
 ```
 
 On Windows, use the generated run scripts in `_package/`:
@@ -126,7 +126,7 @@ _package\run_cube_handle_d3d11_win.bat
 The [DisplayXR Shell](https://github.com/DisplayXR/displayxr-shell-releases) launches standard handle apps and manages multi-app compositing via IPC transparently — no app changes needed:
 
 ```bash
-_package\bin\displayxr-shell.exe test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe
+_package\bin\displayxr-shell.exe test_apps\handle\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe
 ```
 
 ## Shared Code

@@ -13,7 +13,7 @@
 #   XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json \
 #   DYLD_LIBRARY_PATH=/tmp/openxr-install/lib \
 #   SIM_DISPLAY_OUTPUT=anaglyph \
-#   ./test_apps/cube_handle_vk_macos/build/cube_handle_vk_macos
+#   ./test_apps/build/bin/cube_handle_vk_macos
 
 set -e
 
@@ -110,86 +110,15 @@ else
   echo "=== OpenXR loader already built at $OPENXR_DIR ==="
 fi
 
-# Step 3: Build handle (window-handle) test apps
-echo "=== Building cube_handle_vk_macos ==="
-cmake -B "$ROOT/test_apps/cube_handle_vk_macos/build" \
-  -S "$ROOT/test_apps/cube_handle_vk_macos" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
-cmake --build "$ROOT/test_apps/cube_handle_vk_macos/build"
-
-echo "=== Building cube_handle_metal_macos ==="
-cmake -B "$ROOT/test_apps/cube_handle_metal_macos/build" \
-  -S "$ROOT/test_apps/cube_handle_metal_macos" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
-cmake --build "$ROOT/test_apps/cube_handle_metal_macos/build"
-
-echo "=== Building cube_handle_gl_macos ==="
-cmake -B "$ROOT/test_apps/cube_handle_gl_macos/build" \
-  -S "$ROOT/test_apps/cube_handle_gl_macos" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
-cmake --build "$ROOT/test_apps/cube_handle_gl_macos/build"
-
-echo "=== Building cube_zones_metal_macos ==="
-cmake -B "$ROOT/test_apps/cube_zones_metal_macos/build" \
-  -S "$ROOT/test_apps/cube_zones_metal_macos" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
-cmake --build "$ROOT/test_apps/cube_zones_metal_macos/build"
-
-echo "=== Building cube_zones_vk_macos ==="
-cmake -B "$ROOT/test_apps/cube_zones_vk_macos/build" \
-  -S "$ROOT/test_apps/cube_zones_vk_macos" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
-cmake --build "$ROOT/test_apps/cube_zones_vk_macos/build"
-
-# Step 3b: Build texture (shared-texture) test apps
-echo "=== Building cube_zones_texture_metal_macos ==="
-cmake -B "$ROOT/test_apps/cube_zones_texture_metal_macos/build" \
-  -S "$ROOT/test_apps/cube_zones_texture_metal_macos" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
-cmake --build "$ROOT/test_apps/cube_zones_texture_metal_macos/build"
-
-echo "=== Building cube_zones_texture_gl_macos ==="
-cmake -B "$ROOT/test_apps/cube_zones_texture_gl_macos/build" \
-  -S "$ROOT/test_apps/cube_zones_texture_gl_macos" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
-cmake --build "$ROOT/test_apps/cube_zones_texture_gl_macos/build"
-
-# Step 3c: Build hosted (runtime-managed) test apps
-echo "=== Building cube_hosted_metal_macos ==="
-cmake -B "$ROOT/test_apps/cube_hosted_metal_macos/build" \
-  -S "$ROOT/test_apps/cube_hosted_metal_macos" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
-cmake --build "$ROOT/test_apps/cube_hosted_metal_macos/build"
-
-# Step 3c2: Build legacy hosted test apps
-echo "=== Building cube_hosted_legacy_metal_macos ==="
-cmake -B "$ROOT/test_apps/cube_hosted_legacy_metal_macos/build" \
-  -S "$ROOT/test_apps/cube_hosted_legacy_metal_macos" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
-cmake --build "$ROOT/test_apps/cube_hosted_legacy_metal_macos/build"
-
-echo "=== Building cube_hosted_legacy_gl_macos ==="
-cmake -B "$ROOT/test_apps/cube_hosted_legacy_gl_macos/build" \
-  -S "$ROOT/test_apps/cube_hosted_legacy_gl_macos" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
-cmake --build "$ROOT/test_apps/cube_hosted_legacy_gl_macos/build"
-
-echo "=== Building cube_hosted_legacy_vk_macos ==="
-cmake -B "$ROOT/test_apps/cube_hosted_legacy_vk_macos/build" \
-  -S "$ROOT/test_apps/cube_hosted_legacy_vk_macos" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
-cmake --build "$ROOT/test_apps/cube_hosted_legacy_vk_macos/build"
+# Step 3: Build ALL macOS test apps in one shot through the globbing aggregator
+# (test_apps/CMakeLists.txt discovers every <class>/<app>/CMakeLists.txt and
+# gates on the dir-name suffix, so a _macos app on disk can never be silently
+# skipped the way the old hand-maintained per-app list allowed — #692 items 1-3).
+# Every app binary lands in test_apps/build/bin/.
+echo "=== Building macOS test apps (aggregate) ==="
+cmake -B "$ROOT/test_apps/build" -S "$ROOT/test_apps" -G Ninja   -DCMAKE_BUILD_TYPE=Debug   -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
+cmake --build "$ROOT/test_apps/build"
+TA_BIN="$ROOT/test_apps/build/bin"
 
 # 3DGS demo source moved to DisplayXR/displayxr-demo-gaussiansplat
 # (master plan Step 2, 2026-05). Build it from that repo separately.
@@ -253,17 +182,11 @@ else
 fi
 
 # Copy test app binaries
-cp "$ROOT/test_apps/cube_handle_vk_macos/build/cube_handle_vk_macos" "$PKG_DIR/bin/"
-cp "$ROOT/test_apps/cube_handle_metal_macos/build/cube_handle_metal_macos" "$PKG_DIR/bin/" 2>/dev/null || true
-cp "$ROOT/test_apps/cube_zones_metal_macos/build/cube_zones_metal_macos" "$PKG_DIR/bin/" 2>/dev/null || true
-cp "$ROOT/test_apps/cube_zones_vk_macos/build/cube_zones_vk_macos" "$PKG_DIR/bin/" 2>/dev/null || true
-cp "$ROOT/test_apps/cube_handle_gl_macos/build/cube_handle_gl_macos" "$PKG_DIR/bin/" 2>/dev/null || true
-cp "$ROOT/test_apps/cube_zones_texture_metal_macos/build/cube_zones_texture_metal_macos" "$PKG_DIR/bin/" 2>/dev/null || true
-cp "$ROOT/test_apps/cube_hosted_metal_macos/build/cube_hosted_metal_macos" "$PKG_DIR/bin/" 2>/dev/null || true
-cp "$ROOT/test_apps/cube_hosted_legacy_metal_macos/build/cube_hosted_legacy_metal_macos" "$PKG_DIR/bin/" 2>/dev/null || true
-cp "$ROOT/test_apps/cube_hosted_legacy_gl_macos/build/cube_hosted_legacy_gl_macos" "$PKG_DIR/bin/" 2>/dev/null || true
-cp "$ROOT/test_apps/cube_hosted_legacy_vk_macos/build/cube_hosted_legacy_vk_macos" "$PKG_DIR/bin/" 2>/dev/null || true
-# Copy texture files for handle apps
+# Stage every built app binary (executables land directly in test_apps/build/bin).
+for _b in "$TA_BIN"/*; do
+  [ -f "$_b" ] && [ -x "$_b" ] && cp "$_b" "$PKG_DIR/bin/" 2>/dev/null || true
+done
+
 mkdir -p "$PKG_DIR/bin/textures"
 cp "$ROOT/test_apps/common/textures/"*.jpg "$PKG_DIR/bin/textures/" 2>/dev/null || true
 
@@ -342,16 +265,9 @@ fi
 
 # Fix rpaths
 install_name_tool -add_rpath @loader_path "$PKG_DIR/lib/$RUNTIME_BASENAME" 2>/dev/null || true
-install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_handle_vk_macos" 2>/dev/null || true
-install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_handle_metal_macos" 2>/dev/null || true
-install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_zones_metal_macos" 2>/dev/null || true
-install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_zones_vk_macos" 2>/dev/null || true
-install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_handle_gl_macos" 2>/dev/null || true
-install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_zones_texture_metal_macos" 2>/dev/null || true
-install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_hosted_metal_macos" 2>/dev/null || true
-install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_hosted_legacy_metal_macos" 2>/dev/null || true
-install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_hosted_legacy_gl_macos" 2>/dev/null || true
-install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_hosted_legacy_vk_macos" 2>/dev/null || true
+for _b in "$PKG_DIR/bin/"cube_*; do
+  [ -f "$_b" ] && install_name_tool -add_rpath @executable_path/../lib "$_b" 2>/dev/null || true
+done
 install_name_tool -add_rpath @loader_path "$PKG_DIR"/lib/libopenxr_loader*.dylib 2>/dev/null || true
 
 # Re-sign every artifact we touched with install_name_tool. The
@@ -361,12 +277,8 @@ install_name_tool -add_rpath @loader_path "$PKG_DIR"/lib/libopenxr_loader*.dylib
 # gets a chance to fire.
 codesign --force --sign - "$PKG_DIR/lib/$RUNTIME_BASENAME" 2>/dev/null || true
 codesign --force --sign - "$PKG_DIR"/lib/libopenxr_loader*.dylib 2>/dev/null || true
-for app in cube_handle_vk_macos cube_handle_metal_macos cube_handle_gl_macos \
-           cube_zones_metal_macos cube_zones_vk_macos \
-           cube_hosted_metal_macos \
-           cube_hosted_legacy_metal_macos cube_hosted_legacy_gl_macos \
-           cube_hosted_legacy_vk_macos; do
-  [ -f "$PKG_DIR/bin/$app" ] && codesign --force --sign - "$PKG_DIR/bin/$app" 2>/dev/null || true
+for _app in "$PKG_DIR/bin/"cube_*; do
+  [ -f "$_app" ] && codesign --force --sign - "$_app" 2>/dev/null || true
 done
 
 # Stage the service binary (the always-on server/orchestrator) when this is a
@@ -608,4 +520,4 @@ echo "  DYLD_LIBRARY_PATH=$OPENXR_DIR/lib \\"
 echo "  VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json \\"
 echo "  VK_DRIVER_FILES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json \\"
 echo "  SIM_DISPLAY_OUTPUT=anaglyph \\"
-echo "  $ROOT/test_apps/cube_handle_vk_macos/build/cube_handle_vk_macos"
+echo "  $ROOT/test_apps/build/bin/cube_handle_vk_macos"

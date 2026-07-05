@@ -243,176 +243,22 @@ if not exist "%OPENXR_SDK_SHORT%\x64\lib\openxr_loader.lib" (
 :: Use the known x64 openxr_loader.dll path directly
 set LOADER_DLL=%OPENXR_SDK%\x64\bin\openxr_loader.dll
 
-:: cube_handle_d3d11_win
-if exist "%REPO%test_apps\cube_handle_d3d11_win\CMakeLists.txt" (
-    echo --- cube_handle_d3d11_win ---
-    cmake -S "%REPO%\test_apps\cube_handle_d3d11_win" -B "%REPO%\test_apps\cube_handle_d3d11_win\build" -G Ninja ^
-        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_handle_d3d11_win\build" || set TESTAPP_FAILED=1
-    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_handle_d3d11_win\build\" >nul
-)
 
-:: cube_zones_d3d11_win (XR_EXT_display_zones exerciser)
-if exist "%REPO%test_apps\cube_zones_d3d11_win\CMakeLists.txt" (
-    echo --- cube_zones_d3d11_win ---
-    cmake -S "%REPO%\test_apps\cube_zones_d3d11_win" -B "%REPO%\test_apps\cube_zones_d3d11_win\build" -G Ninja ^
-        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_zones_d3d11_win\build" || set TESTAPP_FAILED=1
-    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_zones_d3d11_win\build\" >nul
-)
 
-:: cube_zones_texture_d3d11_win (texture-class XR_EXT_display_zones parity test)
-if exist "%REPO%test_apps\cube_zones_texture_d3d11_win\CMakeLists.txt" (
-    echo --- cube_zones_texture_d3d11_win ---
-    cmake -S "%REPO%\test_apps\cube_zones_texture_d3d11_win" -B "%REPO%\test_apps\cube_zones_texture_d3d11_win\build" -G Ninja ^
-        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_zones_texture_d3d11_win\build" || set TESTAPP_FAILED=1
-    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_zones_texture_d3d11_win\build\" >nul
-)
-
-:: weave_rpc_probe_d3d11_win (XR_EXT_weave probe, #625)
-if exist "%REPO%test_apps\weave_rpc_probe_d3d11_win\CMakeLists.txt" (
-    echo --- weave_rpc_probe_d3d11_win ---
-    cmake -S "%REPO%\test_apps\weave_rpc_probe_d3d11_win" -B "%REPO%\test_apps\weave_rpc_probe_d3d11_win\build" -G Ninja ^
-        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\weave_rpc_probe_d3d11_win\build" || set TESTAPP_FAILED=1
-    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\weave_rpc_probe_d3d11_win\build\" >nul
-)
-
-:: cube_hosted_d3d11_win
-if exist "%REPO%test_apps\cube_hosted_d3d11_win\CMakeLists.txt" (
-    echo --- cube_hosted_d3d11_win ---
-    cmake -S "%REPO%\test_apps\cube_hosted_d3d11_win" -B "%REPO%\test_apps\cube_hosted_d3d11_win\build" -G Ninja ^
-        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_hosted_d3d11_win\build" || set TESTAPP_FAILED=1
-    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_hosted_d3d11_win\build\" >nul
-)
-
-:: cube_handle_d3d12_win
-if exist "%REPO%test_apps\cube_handle_d3d12_win\CMakeLists.txt" (
-    echo --- cube_handle_d3d12_win ---
-    cmake -S "%REPO%\test_apps\cube_handle_d3d12_win" -B "%REPO%\test_apps\cube_handle_d3d12_win\build" -G Ninja ^
-        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_handle_d3d12_win\build" || set TESTAPP_FAILED=1
-    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_handle_d3d12_win\build\" >nul
-)
-
-:: cube_zones_d3d12_win (#672 — native-D3D12 zones ARRAY/SPI-stereo repro app)
-if exist "%REPO%test_apps\cube_zones_d3d12_win\CMakeLists.txt" (
-    echo --- cube_zones_d3d12_win ---
-    cmake -S "%REPO%\test_apps\cube_zones_d3d12_win" -B "%REPO%\test_apps\cube_zones_d3d12_win\build" -G Ninja ^
-        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_zones_d3d12_win\build" || set TESTAPP_FAILED=1
-    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_zones_d3d12_win\build\" >nul
-)
-
-:: cube_handle_gl_win
-if exist "%REPO%test_apps\cube_handle_gl_win\CMakeLists.txt" (
-    echo --- cube_handle_gl_win ---
-    cmake -S "%REPO%\test_apps\cube_handle_gl_win" -B "%REPO%\test_apps\cube_handle_gl_win\build" -G Ninja ^
-        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_handle_gl_win\build" || set TESTAPP_FAILED=1
-    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_handle_gl_win\build\" >nul
-)
-
-:: cube_zones_gl_win (#613 — native-GL handle-class zones parity app)
-if exist "%REPO%test_apps\cube_zones_gl_win\CMakeLists.txt" (
-    echo --- cube_zones_gl_win ---
-    cmake -S "%REPO%\test_apps\cube_zones_gl_win" -B "%REPO%\test_apps\cube_zones_gl_win\build" -G Ninja ^
-        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_zones_gl_win\build" || set TESTAPP_FAILED=1
-    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_zones_gl_win\build\" >nul
-)
-
-:: cube_zones_texture_d3d12_win (#613 — native-D3D12 zones texture parity app)
-if exist "%REPO%test_apps\cube_zones_texture_d3d12_win\CMakeLists.txt" (
-    echo --- cube_zones_texture_d3d12_win ---
-    cmake -S "%REPO%\test_apps\cube_zones_texture_d3d12_win" -B "%REPO%\test_apps\cube_zones_texture_d3d12_win\build" -G Ninja ^
-        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_zones_texture_d3d12_win\build" || set TESTAPP_FAILED=1
-    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_zones_texture_d3d12_win\build\" >nul
-)
-
-:: cube_zones_texture_gl_win (#613 — GL/D3D11 hybrid zones texture parity app)
-if exist "%REPO%test_apps\cube_zones_texture_gl_win\CMakeLists.txt" (
-    echo --- cube_zones_texture_gl_win ---
-    cmake -S "%REPO%\test_apps\cube_zones_texture_gl_win" -B "%REPO%\test_apps\cube_zones_texture_gl_win\build" -G Ninja ^
-        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_zones_texture_gl_win\build" || set TESTAPP_FAILED=1
-    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_zones_texture_gl_win\build\" >nul
-)
-
-:: workspace_minimal_d3d11_win (XR_EXT_spatial_workspace smoke test)
-if exist "%REPO%test_apps\workspace_minimal_d3d11_win\CMakeLists.txt" (
-    echo --- workspace_minimal_d3d11_win ---
-    cmake -S "%REPO%\test_apps\workspace_minimal_d3d11_win" -B "%REPO%\test_apps\workspace_minimal_d3d11_win\build" -G Ninja ^
-        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\workspace_minimal_d3d11_win\build" || set TESTAPP_FAILED=1
-    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\workspace_minimal_d3d11_win\build\" >nul
-)
-
-:: windowspace_handle_d3d11_win (#389)
-if exist "%REPO%test_apps\windowspace_handle_d3d11_win\CMakeLists.txt" (
-    echo --- windowspace_handle_d3d11_win ---
-    cmake -S "%REPO%\test_apps\windowspace_handle_d3d11_win" -B "%REPO%\test_apps\windowspace_handle_d3d11_win\build" -G Ninja ^
-        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\windowspace_handle_d3d11_win\build" || set TESTAPP_FAILED=1
-    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\windowspace_handle_d3d11_win\build\" >nul
-)
-
-:: windowspace_handle_d3d12_win (#389)
-if exist "%REPO%test_apps\windowspace_handle_d3d12_win\CMakeLists.txt" (
-    echo --- windowspace_handle_d3d12_win ---
-    cmake -S "%REPO%\test_apps\windowspace_handle_d3d12_win" -B "%REPO%\test_apps\windowspace_handle_d3d12_win\build" -G Ninja ^
-        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\windowspace_handle_d3d12_win\build" || set TESTAPP_FAILED=1
-    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\windowspace_handle_d3d12_win\build\" >nul
-)
-
-:: windowspace_handle_gl_win (#389)
-if exist "%REPO%test_apps\windowspace_handle_gl_win\CMakeLists.txt" (
-    echo --- windowspace_handle_gl_win ---
-    cmake -S "%REPO%\test_apps\windowspace_handle_gl_win" -B "%REPO%\test_apps\windowspace_handle_gl_win\build" -G Ninja ^
-        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\windowspace_handle_gl_win\build" || set TESTAPP_FAILED=1
-    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\windowspace_handle_gl_win\build\" >nul
-)
-
-:: cube_handle_vk_win (needs Vulkan SDK)
-if exist "%REPO%test_apps\cube_handle_vk_win\CMakeLists.txt" (
-    echo --- cube_handle_vk_win ---
-    cmake -S "%REPO%\test_apps\cube_handle_vk_win" -B "%REPO%\test_apps\cube_handle_vk_win\build" -G Ninja ^
-        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_handle_vk_win\build" || set TESTAPP_FAILED=1
-    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_handle_vk_win\build\" >nul
-)
-
-:: cube_zones_texture_vk_win (#613 Phase 1 — VK/D3D11 hybrid zones texture parity app; needs Vulkan SDK)
-if exist "%REPO%test_apps\cube_zones_texture_vk_win\CMakeLists.txt" (
-    echo --- cube_zones_texture_vk_win ---
-    cmake -S "%REPO%\test_apps\cube_zones_texture_vk_win" -B "%REPO%\test_apps\cube_zones_texture_vk_win\build" -G Ninja ^
-        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_zones_texture_vk_win\build" || set TESTAPP_FAILED=1
-    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_zones_texture_vk_win\build\" >nul
-)
-
-:: cube_zones_vk_win (#673 — native-Vulkan zones ARRAY/SPI-stereo app; needs Vulkan SDK)
-if exist "%REPO%test_apps\cube_zones_vk_win\CMakeLists.txt" (
-    echo --- cube_zones_vk_win ---
-    cmake -S "%REPO%\test_apps\cube_zones_vk_win" -B "%REPO%\test_apps\cube_zones_vk_win\build" -G Ninja ^
-        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_zones_vk_win\build" || set TESTAPP_FAILED=1
-    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_zones_vk_win\build\" >nul
-)
-
-:: windowspace_handle_vk_win (#389, needs Vulkan SDK)
-if exist "%REPO%test_apps\windowspace_handle_vk_win\CMakeLists.txt" (
-    echo --- windowspace_handle_vk_win ---
-    cmake -S "%REPO%\test_apps\windowspace_handle_vk_win" -B "%REPO%\test_apps\windowspace_handle_vk_win\build" -G Ninja ^
-        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\windowspace_handle_vk_win\build" || set TESTAPP_FAILED=1
-    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\windowspace_handle_vk_win\build\" >nul
-)
+:: Build ALL test apps for this platform in one shot via the globbing aggregator
+:: (test_apps\CMakeLists.txt discovers every <class>\<app>\CMakeLists.txt and
+:: gates on the dir-name suffix, so an app on disk can never be silently skipped
+:: the way the old hand-maintained per-app list let cube_zones_texture_* drift
+:: out — #692 items 1-3). Every exe lands in test_apps\build\bin\.
+set "TA_BIN=%REPO%test_apps\build\bin"
+echo --- configuring test_apps aggregate ---
+cmake -S "%REPO%test_apps" -B "%REPO%test_apps\build" -G Ninja ^
+    -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%" || set TESTAPP_FAILED=1
+echo --- building test_apps aggregate ---
+cmake --build "%REPO%test_apps\build" || set TESTAPP_FAILED=1
+:: Drop the OpenXR loader beside the exes so the run-scripts work against the dev
+:: build without the installer having run.
+if defined LOADER_DLL if exist "%TA_BIN%" copy /Y "%LOADER_DLL%" "%TA_BIN%\" >nul
 
 :: Any per-app configure/build failure above set TESTAPP_FAILED — fail the
 :: script instead of silently exiting 0 (the silent form hid real breakage).
@@ -432,64 +278,31 @@ echo === Generating run scripts ===
 set "RT_JSON=%REPO%build\Release\openxr_displayxr-dev.json"
 set "PKG=%REPO%_package"
 
-:: Run scripts for standalone test apps (each sets XR_RUNTIME_JSON to dev build).
-:: Non-Vulkan apps also disable Vulkan implicit layers to prevent crashes from
-:: buggy third-party layers (e.g., FPS Monitor). See issue #105.
-:: All scripts prepend _package\bin to PATH so the runtime DLL's delay-loaded
-:: SR SDK deps (SimulatedRealityVulkanBeta.dll, etc.) resolve without requiring
-:: the installer to have run — important for third-party devs cloning the repo
-:: and iterating against the dev-build runtime via XR_RUNTIME_JSON.
-for %%A in (cube_handle_d3d11_win cube_zones_d3d11_win cube_zones_texture_d3d11_win cube_hosted_d3d11_win cube_handle_d3d12_win cube_handle_gl_win workspace_minimal_d3d11_win windowspace_handle_d3d11_win windowspace_handle_d3d12_win windowspace_handle_gl_win) do (
-    if exist "%REPO%test_apps\%%A\build\%%A.exe" (
-        > "%PKG%\run_%%A.bat" (
+:: Generate one run_<app>.bat per built exe. Env is DERIVED from the app name,
+:: matching the rule documented in test_apps\apps.cmake (single source of truth):
+::   * name contains "zones" -> set DISPLAYXR_ZONES=1 (advertise XR_EXT_display_zones)
+::   * name contains "_vk"   -> Vulkan app owns its VkInstance; keep implicit layers.
+::                              Every other app disables them (#105).
+:: All scripts prepend _package\bin to PATH so the runtime DLL's delay-loaded SR
+:: SDK deps resolve without the installer having run. Looping over the built exes
+:: (not a hand list) is why a new app never lacks a run-script.
+if exist "%TA_BIN%" (
+    for %%E in ("%TA_BIN%\*.exe") do (
+        set "APP=%%~nE"
+        set "ISZONES="
+        set "ISVK="
+        if not "!APP:zones=!"=="!APP!" set "ISZONES=1"
+        if not "!APP:_vk=!"=="!APP!" set "ISVK=1"
+        > "%PKG%\run_!APP!.bat" (
             echo @echo off
             echo set "XR_RUNTIME_JSON=%RT_JSON%"
-            echo set "VK_LOADER_LAYERS_DISABLE=*"
+            if defined ISZONES echo set "DISPLAYXR_ZONES=1"
+            if not defined ISVK echo set "VK_LOADER_LAYERS_DISABLE=*"
             echo set "PATH=%PKG%\bin;%%PATH%%"
-            echo "%REPO%test_apps\%%A\build\%%A.exe" %%*
+            echo "%%E" %%*
         )
     )
 )
-:: Vulkan app — don't disable implicit layers (app needs them for its own VkInstance).
-for %%A in (cube_handle_vk_win windowspace_handle_vk_win) do (
-    if exist "%REPO%test_apps\%%A\build\%%A.exe" (
-        > "%PKG%\run_%%A.bat" (
-            echo @echo off
-            echo set "XR_RUNTIME_JSON=%RT_JSON%"
-            echo set "PATH=%PKG%\bin;%%PATH%%"
-            echo "%REPO%test_apps\%%A\build\%%A.exe" %%*
-        )
-    )
-)
-:: Vulkan zones app — implicit layers enabled (app owns its VkInstance) AND the
-:: zones dev gate set so the runtime advertises XR_EXT_display_zones (#613/#673).
-for %%A in (cube_zones_texture_vk_win cube_zones_vk_win) do (
-    if exist "%REPO%test_apps\%%A\build\%%A.exe" (
-        > "%PKG%\run_%%A.bat" (
-            echo @echo off
-            echo set "XR_RUNTIME_JSON=%RT_JSON%"
-            echo set "DISPLAYXR_ZONES=1"
-            echo set "PATH=%PKG%\bin;%%PATH%%"
-            echo "%REPO%test_apps\%%A\build\%%A.exe" %%*
-        )
-    )
-)
-:: Non-Vulkan zones app — disable VK implicit layers (no app VkInstance) AND set
-:: the zones dev gate so the runtime advertises XR_EXT_display_zones (#613). NOT
-:: in the generic loop above, which omits the zones gate.
-for %%A in (cube_zones_d3d12_win cube_zones_texture_d3d12_win cube_zones_gl_win cube_zones_texture_gl_win) do (
-    if exist "%REPO%test_apps\%%A\build\%%A.exe" (
-        > "%PKG%\run_%%A.bat" (
-            echo @echo off
-            echo set "XR_RUNTIME_JSON=%RT_JSON%"
-            echo set "DISPLAYXR_ZONES=1"
-            echo set "VK_LOADER_LAYERS_DISABLE=*"
-            echo set "PATH=%PKG%\bin;%%PATH%%"
-            echo "%REPO%test_apps\%%A\build\%%A.exe" %%*
-        )
-    )
-)
-
 
 :: Run script for the WebXR Bridge v2 host (in-tree target, installed into _package)
 if exist "%PKG%\bin\displayxr-webxr-bridge.exe" (
@@ -513,7 +326,7 @@ if exist "%PKG%\bin\displayxr-webxr-bridge.exe" (
     echo echo XR_RUNTIME_JSON=%%XR_RUNTIME_JSON%%
     echo echo DISPLAYXR_WORKSPACE_SESSION=%%DISPLAYXR_WORKSPACE_SESSION%%
     echo if "%%~1"=="" (
-    echo     "%REPO%test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe"
+    echo     "%TA_BIN%\cube_handle_d3d11_win.exe"
     echo ^) else (
     echo     "%%~1"
     echo ^)
@@ -525,9 +338,9 @@ if exist "%PKG%\bin\displayxr-webxr-bridge.exe" (
     echo set "XR_RUNTIME_JSON=%RT_JSON%"
     echo set "DISPLAYXR_WORKSPACE_SESSION=1"
     echo echo Starting two shell apps...
-    echo start "" cmd /c "set XR_RUNTIME_JSON=%RT_JSON%^&^& set DISPLAYXR_WORKSPACE_SESSION=1^&^& "%REPO%test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe""
+    echo start "" cmd /c "set XR_RUNTIME_JSON=%RT_JSON%^&^& set DISPLAYXR_WORKSPACE_SESSION=1^&^& "%TA_BIN%\cube_handle_d3d11_win.exe""
     echo timeout /t 3 /nobreak ^>nul
-    echo start "" cmd /c "set XR_RUNTIME_JSON=%RT_JSON%^&^& set DISPLAYXR_WORKSPACE_SESSION=1^&^& "%REPO%test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe""
+    echo start "" cmd /c "set XR_RUNTIME_JSON=%RT_JSON%^&^& set DISPLAYXR_WORKSPACE_SESSION=1^&^& "%TA_BIN%\cube_handle_d3d11_win.exe""
     echo echo Both apps launched. Press any key to exit.
     echo pause ^>nul
 )

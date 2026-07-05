@@ -111,7 +111,7 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   *before* OpenXR init and pass it at session creation via the binding struct
   (`XrWin32WindowBindingCreateInfoEXT` / `XrCocoaWindowBindingCreateInfoEXT`). Hosted apps pass
   NULL and the runtime self-creates a native-resolution window.
-  Ref: `test_apps/cube_handle_d3d11_win/main.cpp:675`, `xr_session.cpp:193-194`.
+  Ref: `test_apps/handle/cube_handle_d3d11_win/main.cpp:675`, `xr_session.cpp:193-194`.
 
 - **INV-1.2 — The texture vs handle difference is one field.** A texture app sets
   `sharedTextureHandle` (D3D11/D3D12) / `sharedIOSurface` (Cocoa) **and still passes its real
@@ -127,7 +127,7 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   creation). It returns static properties: `displaySizeMeters`,
   `nominalViewerPositionInDisplaySpace` (~`{0,0,0.65}`), `recommendedViewScaleX/Y`,
   `displayPixelWidth/Height`. These are **static** — do **not** re-query or change them on
-  resize. Ref: `test_apps/cube_handle_d3d11_win/xr_session.cpp:173-185`; header
+  resize. Ref: `test_apps/handle/cube_handle_d3d11_win/xr_session.cpp:173-185`; header
   `src/external/openxr_includes/openxr/XR_EXT_display_info.h:46-55` (SPEC_VERSION 13).
 
 - **INV-2.2 — `hardwareDisplay3D` is per-mode, not on `XrDisplayInfoEXT`.** It moved to
@@ -139,7 +139,7 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   `modeIndex`, `viewCount`, `viewScaleX/Y`, `tileColumns`, `tileRows`, `viewWidthPixels`,
   `viewHeightPixels`, `hardwareDisplay3D`, and (v13) `isActive` + `isRequestable`. Read
   `isActive` at startup to learn the runtime's current mode without waiting for an event.
-  Ref: `test_apps/cube_handle_d3d11_win/xr_session.cpp:324-327`.
+  Ref: `test_apps/handle/cube_handle_d3d11_win/xr_session.cpp:324-327`.
 
 - **INV-2.4 — The runtime owns the active mode; you *request*, never *set*.** Key presses are
   requests via `xrRequestDisplayRenderingModeEXT`. Update your local `currentModeIndex` **only**
@@ -209,11 +209,11 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
     int safeIdx = (eye < (int)viewCount) ? eye : 0;        // never read past valid region
     EndFrame(..., projectionViews.data(), eyeCount);        // submit eyeCount, not 2
     ```
-    (`test_apps/cube_handle_d3d11_win/main.cpp:404-415,719,761,791-793`)
+    (`test_apps/handle/cube_handle_d3d11_win/main.cpp:404-415,719,761,791-793`)
 
 - **INV-3.2 — Use dynamic/`XRT_MAX_VIEWS`-sized arrays for projection views.** Allocate
   `std::vector<XrCompositionLayerProjectionView>(eyeCount, ...)` each frame. Ref:
-  `main.cpp:412`; VK equivalent `test_apps/cube_handle_vk_win/main.cpp:537,566`.
+  `main.cpp:412`; VK equivalent `test_apps/handle/cube_handle_vk_win/main.cpp:537,566`.
 
 ---
 
@@ -248,7 +248,7 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
     if (renderW > maxTileW) renderW = maxTileW;
     if (renderH > maxTileH) renderH = maxTileH;
     ```
-    (`test_apps/cube_handle_d3d11_win/main.cpp:705-717`; VK `cube_handle_vk_win/main.cpp:368-382`)
+    (`test_apps/handle/cube_handle_d3d11_win/main.cpp:705-717`; VK `cube_handle_vk_win/main.cpp:368-382`)
     For a `_texture` app, substitute **canvas** size for window size.
 
 - **INV-4.4 — Lay tiles top-left, report the exact subImage rect.** Tile `(col,row) = (eye %

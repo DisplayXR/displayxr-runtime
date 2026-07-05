@@ -80,7 +80,7 @@ adb uninstall com.displayxr.cube_handle_vk_android 2>/dev/null
 
 # Install both
 adb install -r src/xrt/targets/openxr_android/build/outputs/apk/inProcess/debug/openxr_android-inProcess-debug.apk
-adb install -r test_apps/cube_handle_vk_android/build/outputs/apk/debug/cube_handle_vk_android-debug.apk
+adb install -r test_apps/handle/cube_handle_vk_android/build/outputs/apk/debug/cube_handle_vk_android-debug.apk
 ```
 
 ### Launch + watch

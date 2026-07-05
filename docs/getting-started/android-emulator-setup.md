@@ -135,7 +135,7 @@ shows both `openxr_displayxr.so` and `libdxrp050_leia_cnsdk.so`.
 ```bash
 ADB="$LOCALAPPDATA/Android/Sdk/platform-tools/adb.exe"
 "$ADB" install -r src/xrt/targets/openxr_android/build/outputs/apk/inProcess/debug/openxr_android-inProcess-debug.apk
-"$ADB" install -r test_apps/cube_handle_vk_android/build/outputs/apk/debug/cube_handle_vk_android-debug.apk
+"$ADB" install -r test_apps/handle/cube_handle_vk_android/build/outputs/apk/debug/cube_handle_vk_android-debug.apk
 ```
 
 ### 4. Run + observe

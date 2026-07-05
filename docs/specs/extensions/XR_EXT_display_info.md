@@ -2076,8 +2076,8 @@ A complete reference implementation is available in the [DisplayXR runtime](http
 | Display processor interface | `src/xrt/include/xrt/xrt_display_processor.h` |
 | Vendor integration (plug-in DLL, ADR-019) | [`displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin) |
 | Simulator driver | `src/xrt/drivers/sim_display/` |
-| D3D11 test application (Win32) | `test_apps/cube_handle_d3d11_win/` |
-| Metal test application (macOS) | `test_apps/cube_handle_metal_macos/` |
+| D3D11 test application (Win32) | `test_apps/handle/cube_handle_d3d11_win/` |
+| Metal test application (macOS) | `test_apps/handle/cube_handle_metal_macos/` |
 | Common Kooima projection | `test_apps/common/xr_session_common.cpp` |
 
 The runtime is based on Monado (open-source OpenXR runtime) with native compositors per graphics API (D3D11, D3D12, Metal, OpenGL, Vulkan). Vendor display processing is abstracted via the `xrt_display_processor` interface — see `docs/guides/vendor-plugin-onboarding.md`.

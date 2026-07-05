@@ -15,7 +15,7 @@ if [[ "$(uname)" != "Darwin" ]]; then exit 0; fi
 cd "$(dirname "$0")/../.."
 ROOT="$(pwd)"
 ADAPTER="$ROOT/build/_deps/displayxr_mcp-build/displayxr-mcp"
-APP="$ROOT/test_apps/cube_handle_metal_macos/build/cube_handle_metal_macos"
+APP="$ROOT/test_apps/handle/cube_handle_metal_macos/build/cube_handle_metal_macos"
 RUNTIME_JSON="$ROOT/build/openxr_displayxr-dev.json"
 for f in "$ADAPTER" "$APP" "$RUNTIME_JSON"; do
 	[[ -e "$f" ]] || { echo "FAIL: missing $f"; exit 1; }

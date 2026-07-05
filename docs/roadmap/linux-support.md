@@ -127,7 +127,7 @@ into `openxr_displayxr.so` on `ubuntu-latest`, headless selftest still green:
 
 **Phase 1b — on-screen present (pending Linux hardware).** CI has no display, so
 the XCB path compiles but isn't exercised at runtime. The bring-up vehicle —
-`test_apps/cube_hosted_legacy_vk_linux` (hosted legacy Vulkan cube; `main.cpp`
+`test_apps/legacy/cube_hosted_legacy_vk_linux` (hosted legacy Vulkan cube; `main.cpp`
 shared verbatim with the macOS peer) — is scaffolded and **compile-validated on
 CI** (`build_linux.sh --apps` builds the OpenXR loader + the app). It's hosted, so
 the runtime self-creates the XCB window — no window-binding extension needed.

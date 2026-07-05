@@ -88,5 +88,5 @@ architecture.
   current symmetric validation path needs none. Tracked as follow-up.
 - Files (runtime, vendor-neutral): `xrt_device.h` (flag), `util/u_tiling.h` (oriented
   worst-case helper), `targets/common/target_instance.c` (call site); reference app
-  `test_apps/cube_handle_vk_android`. The matching plug-in-side changes ship in the vendor
+  `test_apps/handle/cube_handle_vk_android`. The matching plug-in-side changes ship in the vendor
   plug-in's own repo per ADR-019.

@@ -884,11 +884,11 @@ the [`displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin
 
 | Directory | Description |
 |-----------|-------------|
-| `test_apps/cube_handle_d3d11_win/` | D3D11 test app using `XR_EXT_win32_window_binding` with WM_PAINT drag handling |
-| `test_apps/cube_handle_vk_win/` | Vulkan variant |
-| `test_apps/cube_handle_gl_win/` | OpenGL variant |
-| `test_apps/cube_handle_d3d12_win/` | D3D12 variant |
-| `test_apps/cube_hosted_d3d11_win/` | Standard OpenXR test app (no window binding, uses shared compositor) |
+| `test_apps/handle/cube_handle_d3d11_win/` | D3D11 test app using `XR_EXT_win32_window_binding` with WM_PAINT drag handling |
+| `test_apps/handle/cube_handle_vk_win/` | Vulkan variant |
+| `test_apps/handle/cube_handle_gl_win/` | OpenGL variant |
+| `test_apps/handle/cube_handle_d3d12_win/` | D3D12 variant |
+| `test_apps/hosted/cube_hosted_d3d11_win/` | Standard OpenXR test app (no window binding, uses shared compositor) |
 | `test_apps/common/` | Shared utilities: window manager, D3D11 renderer, HUD renderer, text overlay, input handler |
 
 ---

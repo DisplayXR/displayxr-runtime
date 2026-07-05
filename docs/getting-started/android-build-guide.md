@@ -117,7 +117,7 @@ git checkout feat/cube-handle-vk-android-frame-loop
 ./gradlew :test_apps:cube_handle_vk_android:assembleDebug
 
 # APK output:
-# test_apps/cube_handle_vk_android/build/outputs/apk/debug/cube_handle_vk_android-debug.apk
+# test_apps/handle/cube_handle_vk_android/build/outputs/apk/debug/cube_handle_vk_android-debug.apk
 ```
 
 The test app does loader init → `xrCreateInstance` → `xrGetSystem` → `xrCreateVulkanInstanceKHR` → `xrCreateVulkanDeviceKHR` → `xrCreateSession` → per-view swapchains → frame loop with red/blue clear color. It's the canonical OpenXR-runtime smoke test.
@@ -129,7 +129,7 @@ adb uninstall org.freedesktop.monado.openxr_runtime.in_process 2>/dev/null
 adb uninstall com.displayxr.cube_handle_vk_android 2>/dev/null
 
 adb install -r src/xrt/targets/openxr_android/build/outputs/apk/inProcess/debug/openxr_android-inProcess-debug.apk
-adb install -r test_apps/cube_handle_vk_android/build/outputs/apk/debug/cube_handle_vk_android-debug.apk
+adb install -r test_apps/handle/cube_handle_vk_android/build/outputs/apk/debug/cube_handle_vk_android-debug.apk
 ```
 
 Verify the runtime is registered:

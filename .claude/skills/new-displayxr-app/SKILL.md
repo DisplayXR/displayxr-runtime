@@ -31,8 +31,10 @@ Resolve these; if any is missing or ambiguous, **ask the user** (AskUserQuestion
   regions expressed via `XR_EXT_display_zones`; the shared texture receives the runtime's zones composite) | `hosted` (runtime creates the window).
 - **api** — `d3d11` | `d3d12` | `gl` | `vk` | `metal`.
 - **platform** — `win` | `macos`.
-- **location** — default `test_apps/<name>_<class>_<api>_<platform>/` (in-tree). Ask if the user
-  wants it elsewhere / standalone.
+- **location** — default `test_apps/<class>/<name>_<class>_<api>_<platform>/` (in-tree; apps are
+  grouped by **handoff class** folder — `handle/ hosted/ texture/ legacy/ probes/` — with `zones`
+  a feature-name modifier, not a folder, so `cube_zones_*` go under `handle/` and
+  `cube_zones_texture_*` under `texture/`). Ask if the user wants it elsewhere / standalone.
 
 Target name follows the convention `cube_*`-style: `<name>_<class>_<api>_<platform>`.
 
@@ -52,8 +54,9 @@ Pick the exact match; if none exists, pick the same **class+platform** (swap API
    `F-*` foundations as binding for the code you produce. Also read `§8` (folder layout) and `§9`
    (manifest) closely; you implement them here.
 
-2. **Copy the reference app** into the target dir and rename. From the repo root:
-   `cp -R test_apps/<reference> test_apps/<target>` (or into the chosen location). Then rename
+2. **Copy the reference app** into the target dir and rename. From the repo root, into the target's
+   **class** folder: `cp -R test_apps/<refclass>/<reference> test_apps/<class>/<target>` (the
+   reference-app map row IS its class — `handle`/`texture`/`hosted`). Then rename
    files and in-file identifiers from the reference stem to `<target>` (the `APP_NAME`/`#define`,
    window title, CMake `project()`/target name, `resource.rc` strings, `*.manifest` name, the
    `displayxr/<stem>.displayxr.json` filename). Do NOT rewrite the OpenXR/session/render plumbing —
@@ -75,7 +78,12 @@ Pick the exact match; if none exists, pick the same **class+platform** (swap API
 5. **Wire CMake** (per `§8`/INV-8.1–8.4). The cloned `CMakeLists.txt` already finds the OpenXR
    loader, links `sr_common[_base]`, copies the loader DLL/assets, and calls
    `displayxr_install_manifest(<target> "${CMAKE_CURRENT_SOURCE_DIR}/displayxr")` — just retarget
-   the names. If in-tree, add `add_subdirectory(<target>)` to `test_apps/CMakeLists.txt`.
+   the names. **No `add_subdirectory` step:** `test_apps/CMakeLists.txt` is a globbing aggregator
+   that discovers `<class>/<app>/CMakeLists.txt` and gates on the dir-name suffix, so an app placed
+   under the right class folder is picked up automatically (that's the #692 anti-orphaning fix).
+   The clone's own `add_subdirectory(../common ...)` must become `../../common` now that the app
+   sits one level deeper under `<class>/` (the aggregate adds `common` once; the re-add is a
+   guarded no-op).
 
 6. **Lint until clean.** Run `python3 scripts/check_displayxr_app.py <target-dir>` and fix every
    ERROR (and address WARNs or explain them). Re-run until it passes. This is the gate — do not
