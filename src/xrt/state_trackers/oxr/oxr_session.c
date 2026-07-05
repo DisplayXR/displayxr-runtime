@@ -26,6 +26,13 @@
 
 #endif // XRT_HAVE_VULKAN
 
+#if defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+// comp_vk_native_xlib_handle — the Display*/Window pair from
+// XR_EXT_xlib_window_binding, packed for comp_vk_native_compositor_create's
+// single type-erased window-handle param.
+#include "vk_native/comp_vk_native_window_xcb.h"
+#endif
+
 #ifdef XRT_OS_ANDROID
 #include "android/android_globals.h"
 #include "android/android_custom_surface.h"
@@ -3294,6 +3301,22 @@ oxr_session_create_impl(struct oxr_logger *log,
 			}
 			// Shared texture (IOSurface) is now handled by VK native compositor
 			// via VK_EXT_metal_objects import.
+#endif
+
+#if defined(OXR_HAVE_EXT_xlib_window_binding)
+			// On desktop Linux, extract from xlib_window_binding.
+			// vkCreateXcbSurfaceKHR needs both the Display-derived connection
+			// and the Window, so pack the pair into a comp_vk_native_xlib_handle;
+			// comp_vk_native_compositor_create copies the fields synchronously,
+			// so stack lifetime is fine.
+			struct comp_vk_native_xlib_handle xlib_handle = {0};
+			const XrXlibWindowBindingCreateInfoEXT *xlib_binding = OXR_GET_INPUT_FROM_CHAIN(
+			    createInfo, XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_EXT, XrXlibWindowBindingCreateInfoEXT);
+			if (xlib_binding != NULL && xlib_binding->xDisplay != NULL && xlib_binding->window != 0) {
+				xlib_handle.display = (void *)xlib_binding->xDisplay;
+				xlib_handle.window = (unsigned long)xlib_binding->window;
+				window_handle = &xlib_handle;
+			}
 #endif
 
 			xrt_result_t xret = xrt_system_create_session(

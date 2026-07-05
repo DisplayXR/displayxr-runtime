@@ -17,6 +17,7 @@
 #pragma once
 
 #include "xrt/xrt_config_build.h"
+#include "xrt/xrt_config_os.h"
 #include "xrt/xrt_openxr_includes.h"
 
 // beginning of GENERATED defines - do not modify - used by scripts
@@ -546,6 +547,22 @@
     _(EXT_cocoa_window_binding, EXT_COCOA_WINDOW_BINDING)
 #else
 #define OXR_EXTENSION_SUPPORT_EXT_cocoa_window_binding(_)
+#endif
+
+
+/*
+ * XR_EXT_xlib_window_binding
+ *
+ * Desktop Linux only — Android also defines XRT_OS_LINUX but has no X11, so
+ * gate on "Linux AND NOT Android" (the XRT_OS_LINUX_DESKTOP pattern). Not
+ * gated on XR_USE_PLATFORM_XLIB, which tracks GLX (removed from this runtime).
+ */
+#if defined(XR_EXT_xlib_window_binding) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+#define OXR_HAVE_EXT_xlib_window_binding
+#define OXR_EXTENSION_SUPPORT_EXT_xlib_window_binding(_) \
+    _(EXT_xlib_window_binding, EXT_XLIB_WINDOW_BINDING)
+#else
+#define OXR_EXTENSION_SUPPORT_EXT_xlib_window_binding(_)
 #endif
 
 
@@ -1151,6 +1168,7 @@
     OXR_EXTENSION_SUPPORT_EXT_win32_appcontainer_compatible(_) \
     OXR_EXTENSION_SUPPORT_EXT_win32_window_binding(_) \
     OXR_EXTENSION_SUPPORT_EXT_cocoa_window_binding(_) \
+    OXR_EXTENSION_SUPPORT_EXT_xlib_window_binding(_) \
     OXR_EXTENSION_SUPPORT_EXT_macos_gl_binding(_) \
     OXR_EXTENSION_SUPPORT_EXT_display_info(_) \
     OXR_EXTENSION_SUPPORT_EXT_spatial_workspace(_) \

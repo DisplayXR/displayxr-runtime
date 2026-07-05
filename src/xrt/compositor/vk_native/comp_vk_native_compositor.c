@@ -148,7 +148,8 @@ struct comp_vk_native_compositor
 #endif
 
 #ifdef XRT_OS_LINUX_DESKTOP
-	//! XCB window helper (self-owned; hosted class only in Phase 1).
+	//! XCB window helper (self-owned, hosted class). NULL when the app
+	//! supplied its own window via XR_EXT_xlib_window_binding (handle class).
 	struct comp_vk_native_window_xcb *xcb_window;
 
 	//! Connection + window id handed to the target as the type-erased hwnd.
@@ -1043,9 +1044,15 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 #endif
 
 #ifdef XRT_OS_LINUX_DESKTOP
-	if (c->xcb_window != NULL) {
+	{
 		uint32_t new_width = 0, new_height = 0;
-		comp_vk_native_window_xcb_get_dimensions(c->xcb_window, &new_width, &new_height);
+		if (c->xcb_window != NULL) {
+			comp_vk_native_window_xcb_get_dimensions(c->xcb_window, &new_width, &new_height);
+		} else if (!c->owns_window && c->xcb_handle.connection != NULL) {
+			// App-provided window (XR_EXT_xlib_window_binding): poll the live
+			// geometry — no helper tracking ConfigureNotify for this window.
+			comp_vk_native_window_xcb_query_geometry(&c->xcb_handle, &new_width, &new_height);
+		}
 
 		if (new_width > 0 && new_height > 0 &&
 		    (new_width != c->settings.preferred.width ||
@@ -3399,14 +3406,28 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 #endif
 
 #ifdef XRT_OS_LINUX_DESKTOP
-	// Phase 1: hosted class only — the runtime self-creates an XCB window.
-	// App-provided X11 windows (handle/texture) need XR_EXT_xlib_window_binding
-	// (Phase 3); until then hwnd is expected to be NULL here.
+	// hwnd is a struct comp_vk_native_xlib_handle* when the app supplied its
+	// own X11 window via XR_EXT_xlib_window_binding (handle class, Phase 3);
+	// NULL for hosted (runtime self-creates an XCB window, Phase 1).
 	if (hwnd != NULL) {
-		U_LOG_W("VK native (Linux): app-provided window not supported yet "
-		        "(needs XR_EXT_xlib_window_binding) — self-creating instead");
-	}
-	if (shared_texture_handle != NULL) {
+		const struct comp_vk_native_xlib_handle *xlib =
+		    (const struct comp_vk_native_xlib_handle *)hwnd;
+		// Convert the Xlib display to its XCB connection (libX11-xcb) and
+		// hand the target the same comp_vk_native_xcb_handle the hosted path
+		// uses — the surface / metrics / resize plumbing downstream is shared.
+		xrt_result_t xret = comp_vk_native_window_xcb_wrap_app_window(
+		    xlib->display, xlib->window, &c->xcb_handle);
+		if (xret != XRT_SUCCESS) {
+			U_LOG_E("Failed to derive XCB connection from app-provided Xlib display");
+			free(c);
+			return xret;
+		}
+		c->xcb_window = NULL;
+		c->owns_window = false;
+		hwnd = &c->xcb_handle;
+		U_LOG_I("Using app-provided X11 window 0x%lx (XR_EXT_xlib_window_binding)",
+		        xlib->window);
+	} else if (shared_texture_handle != NULL) {
 		c->xcb_window = NULL;
 		U_LOG_I("Offscreen mode — no window (shared texture)");
 		hwnd = NULL;
@@ -3480,6 +3501,15 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		uint32_t xw = 0, xh = 0;
 		comp_vk_native_window_xcb_get_dimensions(c->xcb_window, &xw, &xh);
 		if (xw > 0 && xh > 0) {
+			c->settings.preferred.width = xw;
+			c->settings.preferred.height = xh;
+		}
+	} else if (!c->owns_window && c->xcb_handle.connection != NULL) {
+		// App-provided window (XR_EXT_xlib_window_binding) — no helper
+		// tracking ConfigureNotify, so query the live size directly.
+		uint32_t xw = 0, xh = 0;
+		if (comp_vk_native_window_xcb_query_geometry(&c->xcb_handle, &xw, &xh) &&
+		    xw > 0 && xh > 0) {
 			c->settings.preferred.width = xw;
 			c->settings.preferred.height = xh;
 		}

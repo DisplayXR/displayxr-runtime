@@ -1,8 +1,8 @@
 # Linux Support
 
-Status: **Phase 0 ✅ · Phase 1a ✅ · Phase 2a ✅ (all build-green on CI); Phase
-1b/2b on-screen validation pending Linux+GPU hardware.** Windows, macOS, and
-Android ship today; Linux is the remaining platform.
+Status: **Phase 0 ✅ · Phase 1a ✅ · Phase 2a ✅ · Phase 3a ✅ (all build-green
+on CI); Phase 1b/2b/3b on-screen validation pending Linux+GPU hardware.**
+Windows, macOS, and Android ship today; Linux is the remaining platform.
 
 ## TL;DR
 
@@ -138,9 +138,9 @@ Validate on a real Linux + GPU box:
 ```
 Likely follow-ups surfaced only at runtime: confirm the VK-native compositor path
 is selected (`OXR_ENABLE_VK_NATIVE_COMPOSITOR`), swapchain format/extent on real
-drivers, and resize. A non-legacy (extension) `cube_hosted_vk_linux` and a
-handle-class app (`XR_EXT_xlib_window_binding`, Phase 3) follow once first-light
-is confirmed.
+drivers, and resize. A non-legacy (extension) `cube_hosted_vk_linux` follows once
+first-light is confirmed. The handle-class app now exists —
+`cube_handle_vk_linux` (`XR_EXT_xlib_window_binding`, Phase 3a below).
 
 **Done when:** a hosted cube renders into a runtime-created XCB window with
 sim_display weaving.
@@ -199,12 +199,45 @@ gaps to wire when a display exists, all mirroring the macOS arms:
 **Done when:** a handle/hosted app runs out-of-process against
 `displayxr-service` on Linux.
 
-### Phase 3 (defer) — `XR_EXT_xlib_window_binding`
+### Phase 3 — `XR_EXT_xlib_window_binding`
 
-Needed only when real `_handle`/`_texture` apps bring their own window. Define
-`XrXlibWindowBindingCreateInfoEXT` (`Display*` + `Window`) and the oxr plumbing,
-mirroring `XR_EXT_win32_window_binding`. The per-frame window-position contract
-is the conceptual hard part on Wayland; X11/XCB supplies it cleanly.
+**Phase 3a — extension + app-window path, build-green on CI ✅ (done, #660).**
+`_handle` apps can bring their own X11 window. Delivered:
+
+- **Extension** — `XR_EXT_xlib_window_binding.h` (spec:
+  `docs/specs/extensions/XR_EXT_xlib_window_binding.md`).
+  `XrXlibWindowBindingCreateInfoEXT { type, next, Display* xDisplay, Window
+  window }`, type value 1000999200 (decade 200–209 claimed in the openxr_includes
+  README registry). Xlib API in, XCB inside: the runtime converts via
+  `XGetXCBConnection()` (libX11-xcb) and reuses the Phase 1
+  `comp_vk_native_xcb_handle` + XCB surface arm unchanged. Texture-class
+  handoff, transparency, and window-space layers are explicit spec-v1
+  non-goals.
+- **oxr** — registered in `oxr_extension_support.h` (gated `XRT_OS_LINUX &&
+  !XRT_OS_ANDROID` — NOT `XR_USE_PLATFORM_XLIB`, which tracks the removed GLX);
+  consumed in `oxr_session.c`'s Vulkan branch, packing the pair into
+  `comp_vk_native_xlib_handle` for the compositor's type-erased hwnd param.
+- **Compositor** — `comp_vk_native_compositor.c`'s Linux window block gains the
+  app-window arm (`owns_window=false`, no self-create); the new
+  `comp_vk_native_window_xcb_wrap_app_window()` derives the XCB connection, and
+  `..._query_geometry()` seeds + per-frame-polls the swapchain extent for
+  app windows (no ConfigureNotify — the app owns event selection).
+- **st_oxr Linux CMake arm** — Phase 1 built `comp_vk_native` but never wired
+  it into st_oxr on Linux (`XRT_HAVE_VK_NATIVE_COMPOSITOR` was Windows/
+  macOS/Android-only), so no Linux app could actually reach the in-process
+  compositor. Fixed — this arm is load-bearing for hosted (Phase 1b) too.
+- **Validation vehicle** — `test_apps/cube_handle_vk_linux` (app-owned Xlib
+  window + the binding; render path shared with the hosted legacy cube), built
+  by `build_linux.sh --apps` on CI. Deps: `libx11-dev` (Xlib) on top of the
+  existing `libx11-xcb-dev`.
+
+**Phase 3b — on-screen validation (pending Linux+GPU hardware, with Phase
+1b).** Run `./build/run_cube_handle_vk_linux.sh` on a real box: confirm the
+runtime presents into the app's window, resize tracking via the geometry poll,
+and the window-position channel for interlacing phase (window metrics currently
+take the display-scoped fallback for app windows). The per-frame
+window-position contract is the conceptual hard part on Wayland; X11/XCB
+supplies it cleanly.
 
 ## Decisions
 

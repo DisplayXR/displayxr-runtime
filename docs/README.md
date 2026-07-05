@@ -31,6 +31,7 @@ Build apps for 3D displays using the OpenXR standard.
 - [XR_EXT_display_info](specs/extensions/XR_EXT_display_info.md) — display properties, eye tracking, rendering modes
 - [XR_EXT_win32_window_binding](specs/extensions/XR_EXT_win32_window_binding.md) — app-provided Win32 HWND
 - [XR_EXT_cocoa_window_binding](specs/extensions/XR_EXT_cocoa_window_binding.md) — app-provided Cocoa NSView
+- [XR_EXT_xlib_window_binding](specs/extensions/XR_EXT_xlib_window_binding.md) — app-provided X11 window (desktop Linux)
 - [XR_EXT_spatial_workspace](specs/extensions/XR_EXT_spatial_workspace.md) — workspace controller surface (shell-style apps)
 - [XR_EXT_display_zones](specs/extensions/XR_EXT_display_zones.md) — N 3D zones + 2D zones + wish mask (design sketch, ADR-027)
 - [Kooima Projection](architecture/kooima-projection.md) — N-view Kooima math and projection pipelines

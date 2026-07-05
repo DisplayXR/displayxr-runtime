@@ -30,7 +30,9 @@ extern "C" {
  * following the same pattern as the D3D11 native compositor.
  *
  * @param xdev The device we are displaying to.
- * @param hwnd The window handle from XR_EXT_win32_window_binding (or NULL for own window).
+ * @param hwnd The window handle from XR_EXT_win32_window_binding / an NSView from
+ *        XR_EXT_cocoa_window_binding / a struct comp_vk_native_xlib_handle* from
+ *        XR_EXT_xlib_window_binding on desktop Linux (or NULL for own window).
  * @param vk_instance The app's VkInstance.
  * @param vk_physical_device The app's VkPhysicalDevice.
  * @param vk_device The app's VkDevice.

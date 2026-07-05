@@ -17,12 +17,15 @@
 #   sudo apt-get install -y build-essential cmake ninja-build pkg-config \
 #       libvulkan-dev vulkan-validationlayers glslang-tools \
 #       libeigen3-dev libcjson-dev \
-#       libxcb1-dev libxcb-randr0-dev libx11-xcb-dev
+#       libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev
 #   # glslang-tools provides glslangValidator, required at configure time to
 #   # compile the null compositor's SPIR-V (cmake/SPIR-V.cmake).
 #   # libxcb*-dev enables XRT_HAVE_XCB → the native Vulkan compositor builds on
 #   # Linux with the VK_KHR_xcb_surface present path (Phase 1). Without it the
 #   # runtime still builds headless (Phase 0) but has no on-screen compositor.
+#   # libx11-dev + libx11-xcb-dev supply Xlib + XGetXCBConnection — the runtime
+#   # converts an app-provided Xlib window (XR_EXT_xlib_window_binding, Phase 3)
+#   # to its XCB connection, and the handle-class test app opens an X11 window.
 #   # optional (enables the legacy udev VR prober — NOT needed for selftest):
 #   sudo apt-get install -y libudev-dev
 #
@@ -31,9 +34,11 @@
 #   ./scripts/build_linux.sh --service   # also build displayxr-service (IPC)
 #   ./scripts/build_linux.sh --no-test   # build only, skip the selftest run
 #   ./scripts/build_linux.sh --apps      # also build the OpenXR loader + the
-#                                        # cube_hosted_legacy_vk_linux test app
-#                                        # (Phase 1b on-screen bring-up; needs a
-#                                        # GPU + X server to actually run)
+#                                        # test apps: cube_hosted_legacy_vk_linux
+#                                        # (hosted, Phase 1b) and cube_handle_vk_linux
+#                                        # (handle, XR_EXT_xlib_window_binding,
+#                                        # Phase 3); running them needs a GPU + X
+#                                        # server
 
 set -euo pipefail
 
@@ -179,21 +184,24 @@ if [ "$BUILD_APPS" = "ON" ]; then
     echo "=== OpenXR loader already built at $OPENXR_DIR ==="
   fi
 
-  # Step 5b: hosted (legacy) Vulkan cube — runtime self-creates the XCB window.
-  APP=cube_hosted_legacy_vk_linux
-  APP_DIR="$ROOT/test_apps/$APP"
-  echo "=== Building $APP ==="
-  cmake -B "$APP_DIR/build" -S "$APP_DIR" -G Ninja \
-    -DCMAKE_BUILD_TYPE=Debug \
-    -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
-  cmake --build "$APP_DIR/build"
+  # Step 5b: build the Vulkan cube test apps + per-app run scripts.
+  #   cube_hosted_legacy_vk_linux — hosted: runtime self-creates the XCB window.
+  #   cube_handle_vk_linux        — handle: app creates its own X11 window and
+  #                                 passes it via XR_EXT_xlib_window_binding.
+  for APP in cube_hosted_legacy_vk_linux cube_handle_vk_linux; do
+    APP_DIR="$ROOT/test_apps/$APP"
+    echo "=== Building $APP ==="
+    cmake -B "$APP_DIR/build" -S "$APP_DIR" -G Ninja \
+      -DCMAKE_BUILD_TYPE=Debug \
+      -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
+    cmake --build "$APP_DIR/build"
 
-  # Step 5c: run script — dev runtime manifest + sim-display plug-in + loader.
-  RUN="$BUILD_DIR/run_${APP}.sh"
-  cat > "$RUN" <<EOF
+    # Run script — dev runtime manifest + sim-display plug-in + loader.
+    RUN="$BUILD_DIR/run_${APP}.sh"
+    cat > "$RUN" <<EOF
 #!/bin/bash
-# Run $APP against the dev runtime build. Hosted: the runtime self-creates the
-# XCB window, so this needs a running X server (DISPLAY set) + a Vulkan GPU.
+# Run $APP against the dev runtime build. Needs a running X server (DISPLAY
+# set) + a Vulkan GPU.
 # OXR_ENABLE_VK_NATIVE_COMPOSITOR=1 selects the native Vulkan compositor path;
 # SIM_DISPLAY_OUTPUT picks the sim-display weave (anaglyph/sbs/...).
 export XR_RUNTIME_JSON="$BUILD_DIR/openxr_displayxr-dev.json"
@@ -203,8 +211,9 @@ export OXR_ENABLE_VK_NATIVE_COMPOSITOR="\${OXR_ENABLE_VK_NATIVE_COMPOSITOR:-1}"
 export SIM_DISPLAY_OUTPUT="\${SIM_DISPLAY_OUTPUT:-anaglyph}"
 exec "$APP_DIR/build/$APP" "\$@"
 EOF
-  chmod +x "$RUN"
-  echo ""
-  echo "Built $APP. Run on a Linux box with a GPU + display:"
-  echo "  $RUN"
+    chmod +x "$RUN"
+    echo ""
+    echo "Built $APP. Run on a Linux box with a GPU + display:"
+    echo "  $RUN"
+  done
 fi

@@ -16,6 +16,8 @@
 #include <string.h>
 
 #include <xcb/xcb.h>
+#include <X11/Xlib-xcb.h> // XGetXCBConnection (libX11-xcb) — Xlib→XCB bridge for
+                          // app-provided windows (XR_EXT_xlib_window_binding).
 
 struct comp_vk_native_window_xcb
 {
@@ -138,6 +140,52 @@ comp_vk_native_window_xcb_get_handle(struct comp_vk_native_window_xcb *win,
 	}
 	out_handle->connection = win->connection;
 	out_handle->window = (uint32_t)win->window;
+}
+
+xrt_result_t
+comp_vk_native_window_xcb_wrap_app_window(void *xdisplay,
+                                          unsigned long xwindow,
+                                          struct comp_vk_native_xcb_handle *out_handle)
+{
+	if (xdisplay == NULL || xwindow == 0 || out_handle == NULL) {
+		return XRT_ERROR_COMPOSITOR_NOT_SUPPORTED;
+	}
+
+	xcb_connection_t *conn = XGetXCBConnection((Display *)xdisplay);
+	if (conn == NULL || xcb_connection_has_error(conn)) {
+		U_LOG_E("XGetXCBConnection failed for app-provided Display %p", xdisplay);
+		return XRT_ERROR_COMPOSITOR_NOT_SUPPORTED;
+	}
+
+	out_handle->connection = conn;
+	out_handle->window = (uint32_t)xwindow;
+	return XRT_SUCCESS;
+}
+
+bool
+comp_vk_native_window_xcb_query_geometry(const struct comp_vk_native_xcb_handle *handle,
+                                         uint32_t *out_width,
+                                         uint32_t *out_height)
+{
+	if (handle == NULL || handle->connection == NULL || handle->window == 0) {
+		return false;
+	}
+
+	xcb_connection_t *conn = (xcb_connection_t *)handle->connection;
+	xcb_get_geometry_cookie_t cookie = xcb_get_geometry(conn, (xcb_drawable_t)handle->window);
+	xcb_get_geometry_reply_t *reply = xcb_get_geometry_reply(conn, cookie, NULL);
+	if (reply == NULL) {
+		return false;
+	}
+
+	if (out_width != NULL) {
+		*out_width = reply->width;
+	}
+	if (out_height != NULL) {
+		*out_height = reply->height;
+	}
+	free(reply);
+	return true;
 }
 
 void

@@ -11,13 +11,15 @@ root `CLAUDE.md` and the platform port in [`docs/roadmap/linux-support.md`](../r
    the Phase 1 `vk_native` + `VK_KHR_xcb_surface` path. No renderer work.
 2. **Every demo is a _handle_ app, NOT hosted.** All five create their own
    OS window (`CreateWindowEx` / `NSWindow`) and pass its handle via
-   `XR_EXT_win32_window_binding` / `XR_EXT_cocoa_window_binding`. On Linux there
-   is no equivalent yet, so a **faithful port depends on runtime Phase 3**
-   (`XR_EXT_xlib_window_binding` + the compositor's app-provided-window branch).
-   Until Phase 3 lands, a demo can only run on Linux via a **hosted-NULL fallback**
-   (pass no window; the runtime self-creates one) — acceptable as an interim
-   "does it render" check, but it diverges from the win/mac windowed behavior and
-   won't exercise window positioning / the workspace model.
+   `XR_EXT_win32_window_binding` / `XR_EXT_cocoa_window_binding`. The Linux
+   equivalent **landed with runtime Phase 3a** (#660):
+   `XR_EXT_xlib_window_binding` (`Display*` + `Window` at xrCreateSession) +
+   the compositor's app-provided-window branch — spec at
+   `docs/specs/extensions/XR_EXT_xlib_window_binding.md`, working example at
+   `test_apps/cube_handle_vk_linux`. So faithful ports are unblocked at the
+   API level; on-screen behavior is still pending Phase 3b hardware
+   validation. The **hosted-NULL fallback** (pass no window; the runtime
+   self-creates one) remains a valid interim "does it render" check.
 
 So a demo port = **build tooling + an app-side Linux windowing arm**. The
 windowing arm is the part gated on Phase 3; the build tooling (below) can be
@@ -97,10 +99,12 @@ Confirmed on **demo #1, mediaplayer** (mediaplayer#30, 4 CI iterations):
 - **`XrCompositionLayerWindowSpaceEXT` lives ONLY in the cocoa/win32 binding
   headers.** A demo that submits a window-space layer needs a Linux arm of its
   `XrCommon.h` that mirrors the wire-shared `#ifndef`-guarded struct. This is an
-  **interim** — swap it for the real Linux binding header when **Phase 3**
-  (`XR_EXT_xlib_window_binding`) lands: vendor the header, add `kWindowBindingExt`
+  **interim** — swap it for the real Linux binding header now that **Phase 3a**
+  (`XR_EXT_xlib_window_binding`) has landed (note: spec v1 does NOT declare the
+  window-space layer struct, so keep the `#ifndef`-guarded mirror until a later
+  spec revision adopts it): vendor the header, add `kWindowBindingExt`
   + the binding branch in `XrSession.cpp`, and extract the SDL window handle in
-  `Window.cpp`. Leave a `TODO(Phase 3)` at each interim site.
+  `Window.cpp` (`SDL_GetWindowProperties` → X11 display + window props).
 - **`_handle` media path can silently compile out:** if the FFmpeg/X11/Wayland/ALSA
   dev pkgs are missing, the decode path is `#if 0`-ed away with no error. The CI job
   must **assert `pkg-config` found them** (fail loudly), not just build.

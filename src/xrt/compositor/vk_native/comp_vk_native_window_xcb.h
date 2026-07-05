@@ -43,7 +43,51 @@ struct comp_vk_native_xcb_handle
 	uint32_t window;
 };
 
+/*!
+ * App-provided Xlib window (XR_EXT_xlib_window_binding, Phase 3), passed
+ * type-erased as the `hwnd` param of comp_vk_native_compositor_create. The
+ * compositor copies the fields synchronously during create, so the caller may
+ * stack-allocate this.
+ *
+ * `display` is an Xlib `Display *` and `window` a `Window` (XID); kept as a
+ * void pointer and an unsigned long so includers don't need the Xlib headers.
+ */
+struct comp_vk_native_xlib_handle
+{
+	void *display;
+	unsigned long window;
+};
+
 struct comp_vk_native_window_xcb;
+
+/*!
+ * Wrap an app-provided Xlib window (XR_EXT_xlib_window_binding) into the XCB
+ * surface handle the target consumes. Derives the XCB connection from the Xlib
+ * display via XGetXCBConnection() (libX11-xcb) — the connection is borrowed
+ * from (and owned by) the app's Display, so nothing is destroyed on teardown.
+ *
+ * @param xdisplay   Xlib `Display *` supplied by the app.
+ * @param xwindow    X11 `Window` (XID) supplied by the app.
+ * @param out_handle Receives the connection + window id for the VK target.
+ *
+ * @return XRT_SUCCESS on success, error code otherwise.
+ */
+xrt_result_t
+comp_vk_native_window_xcb_wrap_app_window(void *xdisplay,
+                                          unsigned long xwindow,
+                                          struct comp_vk_native_xcb_handle *out_handle);
+
+/*!
+ * Query the current pixel size of any window reachable through @p handle via
+ * xcb_get_geometry (works for app-provided windows, which have no
+ * comp_vk_native_window_xcb helper tracking ConfigureNotify).
+ *
+ * @return true if the geometry could be queried.
+ */
+bool
+comp_vk_native_window_xcb_query_geometry(const struct comp_vk_native_xcb_handle *handle,
+                                         uint32_t *out_width,
+                                         uint32_t *out_height);
 
 /*!
  * Create a self-owned X11 window (hosted class).
