@@ -38,11 +38,6 @@ add_subdirectory(tracking)
 # Util library.
 add_subdirectory(util)
 
-# Vive helper library.
-if(XRT_MODULE_AUX_VIVE)
-	add_subdirectory(vive)
-endif()
-
 # Android library.
 if(ANDROID)
 	add_subdirectory(android)

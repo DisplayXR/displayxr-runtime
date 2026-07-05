@@ -4,7 +4,6 @@
 # Order matters.
 add_subdirectory(include)
 add_subdirectory(auxiliary)
-add_subdirectory(tracking)
 add_subdirectory(drivers)
 if(XRT_MODULE_COMPOSITOR)
 	add_subdirectory(compositor)
