@@ -14,7 +14,7 @@ hard structural mistakes are errors.
 
 Usage:
     check_displayxr_app.py <app-dir>            # lint one app
-    check_displayxr_app.py test_apps/cube_handle_d3d11_win
+    check_displayxr_app.py test_apps/handle/cube_handle_d3d11_win
     check_displayxr_app.py <dir> --strict       # warnings also fail (exit 1)
     check_displayxr_app.py --list-rules         # print the rule catalog
 

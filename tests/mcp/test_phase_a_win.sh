@@ -34,7 +34,7 @@ for cand in \
 		break
 	fi
 done
-APP="$ROOT/test_apps/cube_handle_d3d11_win/build/cube_handle_d3d11_win.exe"
+APP="$ROOT/test_apps/handle/cube_handle_d3d11_win/build/cube_handle_d3d11_win.exe"
 RUNTIME_JSON="$ROOT/build/Release/openxr_displayxr-dev.json"
 
 if [[ -z "$ADAPTER" ]]; then

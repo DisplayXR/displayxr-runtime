@@ -1,59 +1,90 @@
 # Copyright 2025, The DisplayXR Project
 # SPDX-License-Identifier: BSL-1.0
 #
-# Parent CMakeLists.txt for test applications
-# Build from this directory to build all test apps at once
+# Platform-aware aggregator for the DisplayXR test apps.
 #
-# Apps:
-#   cube_hosted_d3d11_win      - Hosted mode (runtime creates window, D3D11)
-#   cube_handle_d3d11_win      - Handle mode (app provides window handle, D3D11)
-#   cube_zones_d3d11_win       - XR_EXT_display_zones exerciser (N 3D zones + Local2D strip + wish mask, D3D11)
-#   cube_handle_d3d12_win      - Handle mode (app provides window handle, D3D12)
-#   cube_zones_d3d12_win       - XR_EXT_display_zones exerciser, ARRAY/SPI stereo layout (repro for #672, D3D12)
-#   cube_handle_vk_win         - Handle mode (app provides window handle, Vulkan)
-#   cube_zones_vk_win          - XR_EXT_display_zones exerciser, ARRAY/SPI stereo layout (VK leg of #673)
-#   cube_handle_gl_win         - Handle mode (app provides window handle, OpenGL)
-#   cube_zones_texture_d3d11_win - XR_EXT_display_zones TEXTURE-class parity test (shared texture receives the multi-zone composite, D3D11)
-#   weave_rpc_probe_d3d11_win   - XR_EXT_weave probe (#625): browser-free present-owner driving the window-bound synchronous weave service (D3D11)
-#   cube_hosted_legacy_d3d11_win - Legacy hosted mode (no XR_EXT_display_info, D3D11)
-#   cube_hosted_legacy_d3d12_win - Legacy hosted mode (no XR_EXT_display_info, D3D12)
-#   cube_hosted_legacy_vk_win   - Legacy hosted mode (no XR_EXT_display_info, Vulkan)
-#   cube_hosted_legacy_gl_win   - Legacy hosted mode (no XR_EXT_display_info, OpenGL)
+# Build every test app for the current platform at once:
+#   cmake -S test_apps -B test_apps/build -G Ninja -DOpenXR_ROOT=<sdk>
+#   cmake --build test_apps/build
+# All app executables land in test_apps/build/bin/.
+#
+# The app list is DISCOVERED, not hardcoded: this file globs every
+# <class>/<app>/CMakeLists.txt and gates each on its dir-name suffix
+# (_win→WIN32, _macos→APPLE, _android→ANDROID, _linux→Linux) via
+# dxr_testapp_platform_ok() from apps.cmake. That is what makes the "app on disk
+# that no build list references" failure mode (#692 item 1) structurally
+# impossible — there is no list to drift out of sync. Layout (#692 item 3):
+#
+#   test_apps/
+#     apps.cmake                      # classification + gating + run-env rule
+#     common/                         # shared scaffolding (added once, below)
+#     handle/   cube_handle_*  cube_zones_*            # zones = FEATURE modifier
+#     hosted/   cube_hosted_*
+#     texture/  cube_zones_texture_*
+#     legacy/   cube_hosted_legacy_*
+#     probes/   windowspace_* workspace_* weave_*
+#
+# Leaf dir names are unchanged from the flat layout, so run-script names,
+# _package\run_*.bat muscle memory, and doc links all survive.
 
 cmake_minimum_required(VERSION 3.21)
-project(test_apps LANGUAGES CXX)
+project(displayxr_test_apps LANGUAGES C CXX)
 
-# Only build on Windows
-if(NOT WIN32)
-    message(STATUS "Test apps are Windows-only, skipping")
+# Each app find_package(OpenXR)s for itself; the aggregate just needs a hint that
+# the SDK is locatable. Windows/CI pass -DOpenXR_ROOT; macOS passes
+# -DCMAKE_PREFIX_PATH at the OpenXR install. Accept either (or an already-found
+# package) so the aggregate works uniformly on both build scripts.
+if(NOT (OpenXR_FOUND OR DEFINED OpenXR_ROOT OR DEFINED CMAKE_PREFIX_PATH))
+    message(STATUS "OpenXR not found — pass -DOpenXR_ROOT or -DCMAKE_PREFIX_PATH. Skipping test apps.")
     return()
 endif()
 
-# Build OpenXR test apps (require OpenXR loader)
-if(OpenXR_FOUND OR DEFINED OpenXR_ROOT)
-    add_subdirectory(cube_hosted_d3d11_win)
-    add_subdirectory(cube_handle_d3d11_win)
-    add_subdirectory(cube_zones_d3d11_win)
-    add_subdirectory(cube_handle_d3d12_win)
-    add_subdirectory(cube_zones_d3d12_win)
-    add_subdirectory(cube_handle_vk_win)
-    add_subdirectory(cube_zones_vk_win)
-    add_subdirectory(cube_handle_gl_win)
-    add_subdirectory(cube_zones_gl_win)
-    add_subdirectory(cube_zones_texture_d3d11_win)
-    add_subdirectory(weave_rpc_probe_d3d11_win)
-    add_subdirectory(cube_hosted_legacy_d3d11_win)
-    add_subdirectory(cube_hosted_legacy_d3d12_win)
-    add_subdirectory(cube_hosted_legacy_vk_win)
-    add_subdirectory(cube_hosted_legacy_gl_win)
-    add_subdirectory(workspace_minimal_d3d11_win)
-    # Window-space layer test apps (#389): submit N XrCompositionLayerWindowSpaceEXT
-    # layers, no 3D scene, to verify the multi-layer flicker/drop fix per API.
-    add_subdirectory(windowspace_handle_d3d11_win)
-    add_subdirectory(windowspace_handle_d3d12_win)
-    add_subdirectory(windowspace_handle_vk_win)
-    add_subdirectory(windowspace_handle_gl_win)
-else()
-    message(STATUS "OpenXR not found, skipping OpenXR test apps")
-    message(STATUS "To build them, set OpenXR_ROOT or install OpenXR SDK")
-endif()
+include(${CMAKE_CURRENT_SOURCE_DIR}/apps.cmake)
+
+# Shared scaffolding — added ONCE at the aggregate root. Each app also does its
+# own add_subdirectory(<...>/common ...) for the standalone per-app build; under
+# this aggregate that re-entry is a guarded no-op (common/CMakeLists.txt).
+add_subdirectory(common)
+
+# Uniform output dir so every app exe (and the loader the build script drops
+# beside them) share one location the run-scripts can point at.
+set(_dxr_testapps_bin "${CMAKE_BINARY_DIR}/bin")
+
+file(GLOB _dxr_app_cmakelists RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
+     "${CMAKE_CURRENT_SOURCE_DIR}/*/*/CMakeLists.txt")
+
+set(_dxr_built "")
+set(_dxr_skipped "")
+foreach(_rel ${_dxr_app_cmakelists})
+    get_filename_component(_appdir "${_rel}" DIRECTORY)   # <class>/<app>
+    get_filename_component(_app "${_appdir}" NAME)        # <app>
+    dxr_testapp_platform_ok("${_app}" _ok)
+    if(NOT _ok)
+        list(APPEND _dxr_skipped "${_app}")
+        continue()
+    endif()
+    add_subdirectory("${_appdir}")
+    if(TARGET ${_app})
+        set_target_properties(${_app} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${_dxr_testapps_bin}")
+        # Each app embeds its manifest with a RELATIVE /MANIFESTINPUT: (the
+        # spaces-in-path mt.exe workaround), which the linker resolves against
+        # its cwd — the app's own binary dir in a STANDALONE build, but the
+        # aggregate BUILD ROOT here. Re-anchor it to the app's binary dir
+        # (build/<class>/<app>, i.e. _appdir relative to the build root) so the
+        # copied manifest is found. Generic — no per-app CMakeLists change, and
+        # standalone builds never run this loop so they are unaffected.
+        get_target_property(_lf ${_app} LINK_FLAGS)
+        if(_lf AND _lf MATCHES "/MANIFESTINPUT:")
+            string(REPLACE "/MANIFESTINPUT:" "/MANIFESTINPUT:${_appdir}/" _lf "${_lf}")
+            set_target_properties(${_app} PROPERTIES LINK_FLAGS "${_lf}")
+        endif()
+        list(APPEND _dxr_built "${_app}")
+    endif()
+endforeach()
+
+list(LENGTH _dxr_built _dxr_n)
+message(STATUS "DisplayXR test apps: ${_dxr_n} app(s) for this platform → ${_dxr_testapps_bin}")
+foreach(_a ${_dxr_built})
+    message(STATUS "  + ${_a}")
+endforeach()

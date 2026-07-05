@@ -259,10 +259,10 @@ Only fill in the `create_dp_<api>` factories your SDK actually supports. NULL me
 The runtime ships standalone cube apps under `test_apps/`. Install your plug-in (via your installer), then launch any of:
 
 ```
-test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe
-test_apps\cube_handle_d3d12_win\build\cube_handle_d3d12_win.exe
-test_apps\cube_handle_gl_win\build\cube_handle_gl_win.exe
-test_apps\cube_handle_vk_win\build\cube_handle_vk_win.exe
+test_apps\handle\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe
+test_apps\handle\cube_handle_d3d12_win\build\cube_handle_d3d12_win.exe
+test_apps\handle\cube_handle_gl_win\build\cube_handle_gl_win.exe
+test_apps\handle\cube_handle_vk_win\build\cube_handle_vk_win.exe
 ```
 
 The cube renders through your weaver per API. The per-process runtime log (`%LOCALAPPDATA%\DisplayXR\DisplayXR_<exe>.<pid>_<ts>.log`) shows which plug-in claimed the system:

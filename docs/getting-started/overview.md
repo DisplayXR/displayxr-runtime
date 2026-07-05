@@ -58,7 +58,7 @@ See the [formal extension specifications](../specs/) for full details.
 You don't need a 3D display to develop against DisplayXR. The **sim_display** driver provides a simulated tracked 3D display with keyboard-controlled eye position, letting you test the full OpenXR pipeline on any machine:
 
 ```bash
-XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./build/test_apps/cube_handle_vk_macos/cube_handle_vk_macos
+XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./build/test_apps/handle/cube_handle_vk_macos/cube_handle_vk_macos
 ```
 
 Use WASD + mouse to move the simulated eye position and observe perspective-correct stereo rendering.

@@ -155,7 +155,7 @@ to the model.
 - **The `outOfProcess` flavor becomes the supported/production target on Android;
   `inProcess` is retained as a dev-only iteration aid.** Docs and the app-authoring
   guidance should state this; the in-process vendor-SDK-aar escape hatch in
-  `test_apps/cube_handle_vk_android/build.gradle` (the vendor-SDK-dir conditional) is
+  `test_apps/handle/cube_handle_vk_android/build.gradle` (the vendor-SDK-dir conditional) is
   dev-only and is removed once the out-of-process vendor DP is validated
   (remove-last; see #510).
 - **Vendor `<queries>` and the thin vendor-SDK client move to the runtime service

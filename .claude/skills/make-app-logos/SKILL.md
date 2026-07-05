@@ -11,7 +11,7 @@ description: |
          [category=app] [description="..."] [crop-nudge=DX,DY] [wait=2]
          [snapshot-ms=N] [--register]
   Examples:
-    /make-app-logos test_apps/cube_handle_d3d11_win/build/cube_handle_d3d11_win.exe name="Cube D3D11"
+    /make-app-logos test_apps/handle/cube_handle_d3d11_win/build/cube_handle_d3d11_win.exe name="Cube D3D11"
     /make-app-logos C:/apps/photo.exe name="Photo" args="C:/pics/sample.jpg" --register
 allowed-tools: Read, Grep, Glob, Bash, Edit, Write
 ---

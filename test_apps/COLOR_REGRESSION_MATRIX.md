@@ -23,7 +23,7 @@ The cube test apps select their color swapchain via `DXR_SWAPCHAIN_ENCODING`
 Set it process-level (the runtime DLL has its own static-CRT env block; use a real
 env var, not a run-script line):
 ```cmd
-set DXR_SWAPCHAIN_ENCODING=srgb && test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe
+set DXR_SWAPCHAIN_ENCODING=srgb && test_apps\handle\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe
 ```
 
 ## Matrix

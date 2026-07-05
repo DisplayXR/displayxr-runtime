@@ -265,7 +265,7 @@ service and launch the app with `XRT_FORCE_MODE=ipc` (read by the runtime DLL;
 this is exactly what `webxr_bridge` sets via `force_ipc_mode_env()`):
 ```cmd
 _package\bin\displayxr-service.exe                            REM D3D11 service compositor
-set XRT_FORCE_MODE=ipc && test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe
+set XRT_FORCE_MODE=ipc && test_apps\build\bin\cube_handle_d3d11_win.exe
 ```
 The app then creates a `client_d3d11_compositor` (`server-creates-swapchain`
 model), `is_service_mode` flips true, and `is_*_native_compositor` stays false —

@@ -184,7 +184,7 @@ build_apks() {
 # ----- install + launch + grep -----------------------------------------------
 
 RUNTIME_APK="$RUNTIME_ROOT/src/xrt/targets/openxr_android/build/outputs/apk/inProcess/debug/openxr_android-inProcess-debug.apk"
-TEST_APK="$RUNTIME_ROOT/test_apps/cube_handle_vk_android/build/outputs/apk/debug/cube_handle_vk_android-debug.apk"
+TEST_APK="$RUNTIME_ROOT/test_apps/handle/cube_handle_vk_android/build/outputs/apk/debug/cube_handle_vk_android-debug.apk"
 TEST_PKG="com.displayxr.cube_handle_vk_android"
 SENTINEL="ANDROID_POC_SENTINEL xrCreateInstance=XR_SUCCESS"
 

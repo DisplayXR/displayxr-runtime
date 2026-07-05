@@ -1,8 +1,8 @@
 # Tutorial: Your First Handle App (D3D11 on Windows)
 
-This tutorial walks through building a `_handle` app — an app that creates its own window and passes it to DisplayXR for stereo rendering. We annotate the [`cube_handle_d3d11_win`](../../test_apps/cube_handle_d3d11_win/) test app as a working reference.
+This tutorial walks through building a `_handle` app — an app that creates its own window and passes it to DisplayXR for stereo rendering. We annotate the [`cube_handle_d3d11_win`](../../test_apps/handle/cube_handle_d3d11_win/) test app as a working reference.
 
-> **Reference code:** `test_apps/cube_handle_d3d11_win/` — a complete, buildable D3D11 handle app.
+> **Reference code:** `test_apps/handle/cube_handle_d3d11_win/` — a complete, buildable D3D11 handle app.
 
 ## Prerequisites
 

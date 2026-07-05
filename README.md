@@ -117,7 +117,7 @@ See [Building DisplayXR](docs/getting-started/building.md) for full instructions
 No 3D display required. The **sim_display** driver provides a simulated tracked display with WASD + mouse eye position control:
 
 ```bash
-XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./test_apps/cube_handle_vk_macos/build/cube_handle_vk_macos
+XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./test_apps/build/bin/cube_handle_vk_macos
 ```
 
 ## Documentation
