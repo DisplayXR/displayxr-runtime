@@ -63,25 +63,61 @@ same shape with three swaps:
 ### apt deps (Debian/Ubuntu)
 
 ```
+# Base (every demo):
 build-essential cmake ninja-build pkg-config \
-libvulkan-dev vulkan-validationlayers glslang-tools \
-libxcb1-dev libxcb-randr0-dev libx11-xcb-dev   # only if the app itself opens an X window
+libvulkan-dev vulkan-validationlayers glslang-tools
+
+# If the OpenXR loader is built from source with GL/EGL headers present
+# (SDL-from-source pulls them in) — see the GLX-flip gotcha below:
+libxcb-glx0-dev libxxf86vm-dev
+
+# For a _handle demo that opens its OWN window (SDL) + decodes media:
+libx11-dev libxcb1-dev libxcb-randr0-dev libx11-xcb-dev \
+libwayland-dev libasound2-dev \
+libavcodec-dev libavformat-dev libavutil-dev libswscale-dev   # FFmpeg, mediaplayer
 ```
 
-Most demos are hosted-style (the runtime owns the window), so they don't link
-xcb themselves — only the runtime does.
+**The demos are _handle_ apps** (they open their own window — see the two facts
+above), so they DO link a window/graphics toolkit (usually SDL) themselves. The
+faithful Linux window arm is Phase-3-gated; until then they run hosted-NULL.
 
 ## Gotchas already hit (bake into every port)
 
+Confirmed on **demo #1, mediaplayer** (mediaplayer#30, 4 CI iterations):
+
+- **A FetchContent-retrofit demo needs almost nothing.** The mechanical part is a
+  CMake `else → linux` arm + the loader `find_package → FetchContent` fallback,
+  both already platform-agnostic. The classic runtime-tree gotchas below are often
+  **N/A in demo repos** — they use `__linux__` (not `XRT_OS_LINUX`), vendor stb
+  unconditionally, and let SDL supply the window handle. Check before "fixing."
+- **GLX-flip (new, subtle):** installing GL/EGL headers (needed to build SDL3 from
+  source) makes the OpenXR-SDK-Source loader build **detect GLX** → it pulls in
+  `<xcb/glx.h>` and gfxwrapper links `Xxf86vm`. Fix: add `libxcb-glx0-dev
+  libxxf86vm-dev`. The runtime CI never hits this (it installs no GL headers).
+- **`XrCompositionLayerWindowSpaceEXT` lives ONLY in the cocoa/win32 binding
+  headers.** A demo that submits a window-space layer needs a Linux arm of its
+  `XrCommon.h` that mirrors the wire-shared `#ifndef`-guarded struct. This is an
+  **interim** — swap it for the real Linux binding header when **Phase 3**
+  (`XR_EXT_xlib_window_binding`) lands: vendor the header, add `kWindowBindingExt`
+  + the binding branch in `XrSession.cpp`, and extract the SDL window handle in
+  `Window.cpp`. Leave a `TODO(Phase 3)` at each interim site.
+- **`_handle` media path can silently compile out:** if the FFmpeg/X11/Wayland/ALSA
+  dev pkgs are missing, the decode path is `#if 0`-ed away with no error. The CI job
+  must **assert `pkg-config` found them** (fail loudly), not just build.
+- **Loader/header pin drift is org-wide:** the loader is pinned `1.1.43` while
+  vendored headers are newer (`1.1.51`) in several repos incl. the runtime. Keep
+  `1.1.43` for the loader unless you're deliberately bumping all three pins.
+
+Runtime-tree apps (e.g. `test_apps/*`) additionally hit — usually N/A for demos:
+
 - **stb / single-header impls:** `displayxr::common` ships some impl TUs
   macOS-gated (e.g. `stb_image_impl_macos.cpp`). If the shared `main.cpp` is
-  declarations-only, add a small Linux impl TU (`#define STB_IMAGE_IMPLEMENTATION`)
-  — else undefined `stbi_*` at link. (runtime `cube_hosted_legacy_vk_linux` did this.)
-- **`XRT_OS_LINUX` ≠ desktop Linux:** Android also defines it. Any "desktop
-  Linux, not Android" code must gate on `defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)`.
-- **POSIX arms usually already exist:** executable-path (`/proc/self/exe`),
-  `usleep`, etc. are often already behind the macOS/Windows `#else`. Check before
-  adding.
+  declarations-only, add a Linux impl TU (`#define STB_IMAGE_IMPLEMENTATION`).
+- **`XRT_OS_LINUX` ≠ desktop Linux:** Android also defines it. Runtime code gates on
+  `defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)` (the `XRT_OS_LINUX_DESKTOP`
+  macro). Demo repos usually use plain `__linux__`, which is fine there.
+- **POSIX arms usually already exist:** `/proc/self/exe`, `usleep`, etc. are often
+  already behind the macOS/Windows `#else`. Check before adding.
 - **Loader-image conflicts:** pin `XR_RUNTIME_JSON` and share one `libvulkan`
   image; don't let a system-installed runtime shadow the dev build.
 
