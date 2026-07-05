@@ -55,12 +55,16 @@ cd ~/displayxr/displayxr-runtime
 scrot -u /tmp/cube-hosted.png        # active window  (or: scrot /tmp/cube-hosted.png)
 ```
 
+`anaglyph` (red/cyan) is the default and the easiest "is it stereo" check on a
+normal monitor — use it for every test. `--output=sbs` (side-by-side) is an
+optional alternative if you'd rather see the two views directly.
+
 | # | Command | Phase | PASS means |
 |---|---|---|---|
 | 1 | `run_linux_demo.sh cube-hosted` | 1b | A window opens; a spinning textured cube renders; with `--output=anaglyph` you see red/cyan stereo separation; no crash; closes cleanly on window-close. |
 | 2 | `run_linux_demo.sh cube-handle` | 3b | Same, but the app supplies its own X11 window — the log shows the **xlib window-binding** path (`XR_EXT_xlib_window_binding`), not hosted self-create. |
 | 3 | *(service/IPC — below)* | 2b | The cube renders driven by the out-of-process `displayxr-service`. |
-| 4 | `run_linux_demo.sh mediaplayer --output=sbs` | demo | Demo content renders in a window with SBS/anaglyph stereo; no crash. |
+| 4 | `run_linux_demo.sh mediaplayer` | demo | Demo content renders in a window with anaglyph (red/cyan) stereo; no crash. |
 | 5 | `run_linux_demo.sh gaussiansplat` | demo | " |
 | 6 | `run_linux_demo.sh modelviewer` | demo | " |
 | 7 | `run_linux_demo.sh avatar` | demo | " |
