@@ -4,13 +4,24 @@ How to bring a `displayxr-demo-*` (or any standalone OpenXR app) to Linux,
 correct-by-construction. Companion to the **Demo-repo dev-build rule** in the
 root `CLAUDE.md` and the platform port in [`docs/roadmap/linux-support.md`](../roadmap/linux-support.md).
 
-## The good news: every demo is Vulkan
+## Two facts that shape every port
 
-Audited 2026-06 — all five demos (`avatar`, `earthview`, `gaussiansplat`,
-`mediaplayer`, `modelviewer`) render with Vulkan (`*_vulkan_utils` /
-`VulkanRenderer` / `tile_renderer`). So **no OpenGL-on-Linux compositor backend
-is required** — every demo rides the Phase 1 `vk_native` + `VK_KHR_xcb_surface`
-path. A demo port is therefore **pure build tooling**, not renderer work.
+1. **Every demo is Vulkan** (`*_vulkan_utils` / `VulkanRenderer` / `tile_renderer`)
+   — so **no OpenGL-on-Linux compositor backend is required**; every demo rides
+   the Phase 1 `vk_native` + `VK_KHR_xcb_surface` path. No renderer work.
+2. **Every demo is a _handle_ app, NOT hosted.** All five create their own
+   OS window (`CreateWindowEx` / `NSWindow`) and pass its handle via
+   `XR_EXT_win32_window_binding` / `XR_EXT_cocoa_window_binding`. On Linux there
+   is no equivalent yet, so a **faithful port depends on runtime Phase 3**
+   (`XR_EXT_xlib_window_binding` + the compositor's app-provided-window branch).
+   Until Phase 3 lands, a demo can only run on Linux via a **hosted-NULL fallback**
+   (pass no window; the runtime self-creates one) — acceptable as an interim
+   "does it render" check, but it diverges from the win/mac windowed behavior and
+   won't exercise window positioning / the workspace model.
+
+So a demo port = **build tooling + an app-side Linux windowing arm**. The
+windowing arm is the part gated on Phase 3; the build tooling (below) can be
+written anytime.
 
 ## Two halves — do the first now, the second on hardware
 
