@@ -239,6 +239,32 @@ take the display-scoped fallback for app windows). The per-frame
 window-position contract is the conceptual hard part on Wayland; X11/XCB
 supplies it cleanly.
 
+### Testing on a Linux box (on-screen / Phase 1b–3b)
+
+Needs a Vulkan GPU + an X server (X11 session or XWayland). No Leia hardware —
+sim-display weaves anaglyph/SBS to a normal monitor. One command:
+
+```
+./scripts/run_linux_demo.sh cube-hosted            # Phase 1b: runtime makes the window
+./scripts/run_linux_demo.sh cube-handle            # Phase 3b: app passes its own X11 window
+./scripts/run_linux_demo.sh mediaplayer --output=sbs   # a demo (sibling ../displayxr-demo-*)
+```
+
+It builds the runtime (`build_linux.sh --apps`), wires `XR_RUNTIME_JSON` +
+`XRT_PLUGIN_SEARCH_PATH` at that build, and delegates to the target's own run
+script. Service/IPC (Phase 2b): `./scripts/build_linux.sh --service`, start
+`displayxr-service`, run a client with `XRT_FORCE_MODE=ipc`.
+
+### Phase 4 — Packaging / installer (follow-up, blocked on 1b–3b)
+
+Linux is dev-scripts-only today (Windows has NSIS, macOS a `.pkg`). Once on-screen
+is proven, package the runtime + sim-display so users install without building:
+register the OpenXR `ActiveRuntime` (XDG `~/.config/openxr/1/active_runtime.json`
+or `/etc/xdg/openxr/1/`), drop the plug-in + JSON into a DisplayProcessors root
+(`/usr/share/displayxr/DisplayProcessors` or XDG data), + a systemd user unit for
+the service. Staged: **tarball + `install.sh` (MVP)** → `.deb` → demo AppImages.
+Full scope: #705.
+
 ## Decisions
 
 - **XCB first, Wayland later** — window-position queryability (above).
