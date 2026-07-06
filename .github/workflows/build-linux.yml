@@ -43,7 +43,8 @@ jobs:
         # GL/EGL dev libs flip XRT_HAVE_OPENGL/XRT_HAVE_EGL ON so CI configures
         # like a real desktop (aux_ogl + GL client bindings get compiled) and
         # enforces the comp_gl platform gate — comp_gl has no Linux branch, so
-        # un-gating it would fail this build (#709).
+        # un-gating it would fail this build (#709). Xrandr/Xxf86vm: once GL is
+        # found, the OpenXR SDK's openxr-gfxwrapper links them.
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -51,7 +52,7 @@ jobs:
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libeigen3-dev libcjson-dev libudev-dev \
             libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev \
-            libgl1-mesa-dev libegl1-mesa-dev
+            libgl1-mesa-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev
 
       - name: Build + headless selftest + test app
         # --apps also builds the OpenXR loader (from source) + the test apps:
@@ -69,7 +70,8 @@ jobs:
           submodules: recursive
 
       - name: Install dependencies
-        # GL/EGL dev libs: same rationale as the Selftest job (#709).
+        # GL/EGL (+Xrandr/Xxf86vm) dev libs: same rationale as the Selftest
+        # job (#709).
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -77,7 +79,7 @@ jobs:
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libeigen3-dev libcjson-dev libudev-dev \
             libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev \
-            libgl1-mesa-dev libegl1-mesa-dev
+            libgl1-mesa-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev
 
       - name: Build service + IPC-client runtime (headless selftest)
         # XRT_FEATURE_SERVICE=ON: displayxr-service + the IPC-client runtime
