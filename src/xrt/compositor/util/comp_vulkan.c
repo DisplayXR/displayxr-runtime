@@ -222,9 +222,15 @@ create_instance(struct vk_bundle *vk, const struct comp_vulkan_arguments *vk_arg
 	VkInstanceCreateFlags instance_flags = 0;
 
 	// MoltenVK is a Vulkan portability driver — must opt in to enumerate it.
+	// CANDIDATE PATCH (#706 Linux validation): guard on the macro so this
+	// MoltenVK-only opt-in compiles out on headers that don't define it (e.g.
+	// Ubuntu's Vulkan-Headers v204). Portability enumeration is not needed on
+	// Linux/desktop drivers; it stays active on macOS where MoltenVK defines it.
+#ifdef VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME
 	if (u_string_list_contains(instance_ext_list, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
 		instance_flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
 	}
+#endif
 
 	VkInstanceCreateInfo instance_info = {
 	    .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
