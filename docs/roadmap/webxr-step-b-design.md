@@ -737,3 +737,75 @@ off-axis frusta built from the runtime's tracked eyes.
   this frame and, after the loop, destroys the woven SharedImage + erases every
   `displayxr_weave_state_` entry not seen this frame (the map otherwise grows
   unbounded and leaks woven SharedImages across canvas resize / mailbox churn).
+
+---
+
+## 13. B4 — real `chrome` port + the disproven per-element premise (2026-07-06)
+
+B4 moved the patch from `content_shell` to the real `chrome` target to get the
+per-element glasses-free eyeball `content_shell` architecturally can't reach (it
+flattens the page). The chrome port **works and is wired end-to-end**; the
+per-element weave **does not fire**, and the reason invalidates the Seam-B premise.
+Checkpoint commit: `displayxr-inline-3d` @ `c1753d518a77b`.
+
+### 13.1 The chrome port (works)
+The `cc` / `components/viz` / `gpu` / `third_party/blink` changes are
+layer-agnostic and already compile into `chrome`; only six `content/shell`-only
+files needed a home. They were extracted into a **shared `components/displayxr/`
+component** (`common` weave mojom, `browser` weave client + weaver/service mojom
+impls, `gpu` provider), consumed by *both* `content_shell` and `chrome`. The three
+`Shell*` hook sites were mirrored onto the chrome embedder:
+- `ChromeBrowserMainParts::PostBrowserStart` → weave-client init, but **deferred
+  to a delayed UI-thread task** (chrome shows its first window via a posted task,
+  so at `PostBrowserStart` the HWND exists but isn't visible yet; the one-shot
+  `bindWindow` needs a visible top-level window — content_shell got away with a
+  synchronous call because it shows its window synchronously).
+- `ChromeContentBrowserClient` → `BindGpuHostReceiver` (GPU→browser weave bridge)
+  + `AppendExtraCommandLineSwitches` (forward `--enable-inline-3d`) +
+  `PopulateChromeFrameBinders` (`blink::mojom::DisplayXRService` frame binder).
+- `ChromeContentGpuClient::PostCompositorThreadCreated` → GPU weave provider.
+
+**Validated live on Leia (`--enable-inline-3d --enable-blink-features=DisplayXRInline3D`):**
+weave-client init, `xrWeaveBindWindowEXT -> 0`, GPU provider registered,
+`XR_EXT_display_info` query, `isSessionSupported('inline-3d')` → `true` (full
+DisplayXRService mojom round-trip), `XRDisplayLayer` constructs + tags the canvas
+(`layer:true, targetOk:true`). No `IPC_IGNORE_VERSION`, no integrity mismatch
+(Medium chrome via explorer-handoff matched the Medium service).
+
+### 13.2 The finding — chrome never gives the canvas a taggable SkiaRenderer quad
+Instrumenting `SkiaRenderer::DrawTextureQuad` (does a tagged quad reach it?) and
+`SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute` (any tagged `ImageContext`?)
+with a late-window + unconditional-on-`weave_target` throttle showed **the canvas
+never becomes a distinct `SkiaRenderer` `TextureDrawQuad`** — `weave_target=1`
+*never* logged, `MaybeWeaveSubstitute` always `tagged=0`. Cross-checked with CDP
+`LayerTree`:
+
+| Scenario | Result |
+|---|---|
+| Sub-page **2D** canvas | Squashed into the page content layer — no canvas compositing layer, no canvas quad. |
+| Sub-page **WebGL** canvas | Same — folded into the page layer (even GPU-backed). |
+| `will-change:transform` (verified applied) | Creates a compositing layer but **still** no canvas `TextureDrawQuad`. |
+| **Full-window** WebGL canvas | **Zero** `DrawTextureQuad` calls — drawn via the overlay/root path, bypassing `SkiaRenderer`. |
+| Whole web-contents at `SkiaRenderer` | One ~`1800×1200` `kTextureContent` quad (pre-composited) + scrollbars. |
+
+**So the §3/§4/§7 Seam-B premise — "real chrome's renderer submits per-element
+quads to Viz, so the tag reaches the per-canvas quad" — is false.** On Windows
+chrome a canvas element is either (a) squashed into the page content layer (its
+pixels rasterized into the page, never a `TextureLayer`/`TextureDrawQuad`), or
+(b) promoted to a **DirectComposition overlay** (its own surface, but composited
+by the system — never a `SkiaRenderer::DrawTextureQuad`). In neither case does the
+tag-at-`DrawTextureQuad` + substitute-woven-`SkImage` seam ever run for the canvas.
+(`content_shell`'s B2c.2 eyeball only passed because its UI-compositor-in-GPU
+*flattens* the full-window canvas into the single quad `SkiaRenderer` draws — a
+quirk, not the per-element path.)
+
+### 13.3 Redesign direction (Seam B, open)
+The weave substitution must move to where chrome *actually* isolates a canvas —
+the **`OverlayProcessorWin` / `DCLayerOverlay`** path. In default DComp mode chrome
+promotes an accelerated canvas/WebGL element to its own overlay surface; that
+per-element surface (not a `SkiaRenderer` quad) is the natural weave target. Next
+step is to add overlay-path logging to confirm the inline-3d canvas becomes a
+distinct `DCLayerOverlay`, then design the substitution there (import the woven
+texture as the overlay's content). This replaces the `SkiaRenderer::DrawTextureQuad`
+seam for chrome; the browser↔GPU Mojo bridge, the weave client, the JS surface,
+and the shared component are all unaffected. **B4 paused here for that redesign.**
