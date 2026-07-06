@@ -1820,6 +1820,10 @@ static bool CreateVulkanInstance(AppXrSession& xr, VkInstance& vkInstance) {
     vkEnumerateInstanceExtensionProperties(nullptr, &availExtCount, availExts.data());
 
     bool hasPortabilityEnum = false;
+    // CANDIDATE PATCH (#706 Linux validation): MoltenVK-only portability
+    // enumeration; guard on the macro so it compiles out where Vulkan headers
+    // don't define it (e.g. Ubuntu Vulkan-Headers v204). Not needed on Linux.
+#ifdef VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME
     for (const auto& ext : availExts) {
         if (strcmp(ext.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0) {
             hasPortabilityEnum = true;
@@ -1830,6 +1834,7 @@ static bool CreateVulkanInstance(AppXrSession& xr, VkInstance& vkInstance) {
         extensionNames.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
         LOG_INFO("  Adding VK_KHR_portability_enumeration for MoltenVK");
     }
+#endif
 
     std::vector<const char*> extensionPtrs;
     for (auto& name : extensionNames) {
@@ -1850,9 +1855,11 @@ static bool CreateVulkanInstance(AppXrSession& xr, VkInstance& vkInstance) {
     createInfo.pApplicationInfo = &appInfo;
     createInfo.enabledExtensionCount = (uint32_t)extensionPtrs.size();
     createInfo.ppEnabledExtensionNames = extensionPtrs.data();
+#ifdef VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
     if (hasPortabilityEnum) {
         createInfo.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
     }
+#endif
 
     VK_CHECK(vkCreateInstance(&createInfo, nullptr, &vkInstance));
     LOG_INFO("Vulkan instance created");

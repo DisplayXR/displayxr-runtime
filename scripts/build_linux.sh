@@ -190,7 +190,16 @@ if [ "$BUILD_APPS" = "ON" ]; then
   #                                 passes it via XR_EXT_xlib_window_binding.
   for APP in cube_hosted_legacy_vk_linux cube_handle_vk_linux; do
     APP_DIR="$ROOT/test_apps/$APP"
-    echo "=== Building $APP ==="
+    # CANDIDATE PATCH (#706 Linux validation): the apps aren't all flat under
+    # test_apps/ — cube_hosted_legacy_vk_linux lives in test_apps/legacy/. Fall
+    # back to a nested lookup when the flat path is absent.
+    if [ ! -d "$APP_DIR" ]; then
+      APP_DIR="$(find "$ROOT/test_apps" -type d -name "$APP" | head -1)"
+    fi
+    if [ -z "$APP_DIR" ] || [ ! -f "$APP_DIR/CMakeLists.txt" ]; then
+      echo "ERROR: test app source for '$APP' not found under $ROOT/test_apps" >&2; exit 1
+    fi
+    echo "=== Building $APP (src: $APP_DIR) ==="
     cmake -B "$APP_DIR/build" -S "$APP_DIR" -G Ninja \
       -DCMAKE_BUILD_TYPE=Debug \
       -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
