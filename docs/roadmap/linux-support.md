@@ -279,9 +279,16 @@ Full scope: #705.
 ## Decisions
 
 - **XCB first, Wayland later** — window-position queryability (above).
-- **sim_display is the bring-up display processor** for all phases — the vendor
-  plug-in (Leia SR) has no Linux DP yet, and the plug-in ABI is platform-neutral
-  so no ABI work is required.
+- **sim_display is the bring-up display processor** for all phases — the plug-in
+  ABI is platform-neutral so no ABI work was required. The vendor plug-in now
+  has a **Linux arm scaffold** (leia-plugin#82, Track A of leia-plugin#81):
+  `DisplayXR-LeiaSR.so` with a **stub weaver** (passthrough SBS blit), built
+  against runtime v1.28.0, CI-validated on Ubuntu 22.04/24.04/26.04
+  (discovery + ABI-green `displayxr-cli selftest`). The SDK-facing seam is
+  fixed by the plug-in repo's `docs/leia-linux-sdk-contract.md` (PROPOSED);
+  real weaving lands with Track B when the LeiaSR Linux SDK ships. The stub
+  probe declines unless `DXR_LEIA_FORCE_PROBE=1`, so sim_display remains the
+  default DP on hardware-less boxes.
 - **Hybrid mode is out of scope** — `XRT_FEATURE_HYBRID_MODE` is fenced to
   `WIN32 OR APPLE` (`CMakeLists.txt:262`); Linux uses plain in-process or plain
   service mode.
