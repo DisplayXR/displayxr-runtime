@@ -88,12 +88,6 @@ static const IID IID_ID3D11Texture2D_local = {
 #include <OpenGL/OpenGL.h>
 #include <OpenGL/gl3.h>
 #include "comp_gl_window_macos.h"
-#elif defined(XRT_OS_LINUX)
-// Linux desktop: GLAD-provided GL types via the EGL path (mirrors Android).
-// CANDIDATE PATCH (#706 Linux validation) — the original block had no Linux
-// branch, so GL types were undefined and this TU failed to compile.
-#include "ogl/ogl_api.h"
-#include "ogl/egl_api.h"
 #endif
 
 /*
@@ -332,14 +326,6 @@ struct comp_gl_compositor
 	GLuint iosurface_present_fbo;
 	uint32_t iosurface_width;
 	uint32_t iosurface_height;
-#elif defined(XRT_OS_LINUX)
-	// Linux desktop platform context (EGL path, mirrors Android) + owns_window.
-	// CANDIDATE PATCH (#706 Linux validation) — the original struct had no Linux
-	// branch, so owns_window (used unguarded at the HUD-overlay sites) was undeclared.
-	void *egl_display;   //!< EGLDisplay
-	void *egl_context;   //!< EGLContext
-	void *egl_surface;   //!< EGLSurface
-	bool owns_window;
 #endif
 
 	// --- Shared texture (D3D11 interop via WGL_NV_DX_interop2, Windows only) ---

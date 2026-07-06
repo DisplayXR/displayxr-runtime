@@ -43,8 +43,12 @@ path (Phase 2), then a window-binding extension for app-owned windows (Phase 3).
      surface-create has a literal Linux-fails `#else` returning
      `XRT_ERROR_DEVICE_CREATION_FAILED` (`comp_vk_native_target.cpp:887-891`).
      No `VK_KHR_xcb/xlib/wayland_surface` code exists.
-   - `gl` configures on Linux (`XRT_HAVE_OPENGL`) but has no GLX/EGL-on-X11
-     window path — GLX was deliberately removed (`CMakeLists.txt:215`).
+   - `gl` is gated off on Linux entirely (`(WIN32 OR APPLE) AND XRT_HAVE_OPENGL`,
+     #709 — it used to configure on bare `XRT_HAVE_OPENGL`): it has no
+     GLX/EGL-on-X11 window path — GLX was deliberately removed
+     (`CMakeLists.txt:215`) — and nothing on Linux links it. Linux is
+     Vulkan-only; the GL *client* bindings in `comp_client` are separate and
+     unaffected.
 2. **No self-created window for the `_hosted` class.** Only `comp_window_macos`
    and `comp_window_android` survive — no `comp_window_xcb/wayland/direct`.
 3. **No Linux window-binding extension.** Only `XR_EXT_win32_window_binding` and

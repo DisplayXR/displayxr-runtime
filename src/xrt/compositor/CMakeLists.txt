@@ -343,7 +343,11 @@ endif()
 ###
 # Native OpenGL compositor (bypasses Vulkan entirely)
 #
-if(XRT_HAVE_OPENGL)
+# Win32 + macOS only: those are the only platforms that link it (st_oxr's
+# XRT_HAVE_GL_NATIVE_COMPOSITOR arms). Linux is Vulkan-only — no GL window
+# backend exists (#709) — and Android uses GLES (XRT_HAVE_OPENGL is never
+# set there).
+if((WIN32 OR APPLE) AND XRT_HAVE_OPENGL)
 	add_subdirectory(gl)
 endif()
 
