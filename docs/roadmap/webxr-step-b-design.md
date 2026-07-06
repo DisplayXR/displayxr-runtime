@@ -441,22 +441,14 @@ import / fence-wait / substitute. Test page (`%TEMP%\inject_b2c1.py`) now paints
 left-GREEN / right-MAGENTA SBS (deliberately ≠ the synthetic red/blue) so a
 successful eyeball proves canvas provenance.
 
-**Live Leia eyeball: PENDING — blocked on content_shell frame production, not on
-the B2c.2 code.** This session the full pipe came up live (browser weave client
-`D3D11=1 … weave=1`, `xrWeaveBindWindowEXT(hwnd=…) -> 0 — B2a PASSED`, `B2c GPU
-weave provider registered`) and the SBS canvas injected (CDP, 2050×1620), but
-**content_shell produced zero compositor frames** (`window.__t`/rAF stuck at 0;
-the page was visible+non-hidden but the compositor never ticked). Foreground +
-resize-nudge, `Page.startScreencast`, and `Emulation.setFocusEmulationEnabled`
-all failed to drive a frame (Windows foreground-lock denies a High-harness
-`SetForegroundWindow`). This is the same content_shell-won't-composite-under-
-automation wall §9 documents — there the runtime weave was validated with the
-synthetic `weave_rpc_probe` instead, but the **canvas-read** path that *is* B2c.2
-can only be exercised through `content_shell`. The eyeball needs a **genuinely
-interactive desktop launch** (user double-clicks `%TEMP%\run_b2c1.bat`, runs
-`%TEMP%\inject_b2c1.py`, clicks the window) so the window gets real foreground and
-the compositor ticks — that interactive path is what produced "continuous rAF" in
-the B2c.1 build session (§7 note 4).
+**Live Leia eyeball: ✅ PASSED (2026-07-04).** The full pipe came up live
+(`xrWeaveBindWindowEXT -> 0 — B2a PASSED`, `B2c GPU weave provider registered`,
+`B2c.2 weave target found; driving canvas weave`, `B2c.2 canvas weave input ready`),
+the service wove every frame (`leia_dp_d3d11_process_atlas weave: target=2058x1745
+view=1029x1745`), and the user confirmed the real green/magenta SBS canvas rendered
+as **glasses-free 3D with correct opposite-eye parallax** on the Leia panel. The
+"blocked on frame production" wall below (§11) was resolved; the working recipe is
+**about:blank + `IPC_IGNORE_VERSION=1` + Medium-integrity launch** (see §11.1).
 
 ---
 
@@ -501,14 +493,48 @@ does not affect begin-frames).
 **Fix applied:** dropped `--run-all-compositor-stages-before-draw` from the launch
 (`%TEMP%\run_b2c1.bat`).
 
-### 11.1 NEW wall exposed downstream — the weave path STALLS when it fires (not a crash)
+### 11.1 The "weave freeze" — RESOLVED: it was `file://` + a version-gate, NOT the weave (2026-07-04)
 
-With frames now flowing, a **distinct** failure surfaced. Attribution is clean:
+> **RESOLUTION (read this first; the investigation below reached a WRONG conclusion
+> that this corrects).** The apparent "weave engaged → frames freeze" was **two
+> unrelated environment issues, neither in the weave/GPU code**:
+>
+> 1. **`file://` loads as an empty document in this env → it never composites.**
+>    Every "frozen" run loaded `file:///…/b2c1.html`; every "working" run loaded
+>    `about:blank`. The injected canvas in an empty-`file://` document produces zero
+>    frames (`window.__t` stuck at 0); the same canvas in `about:blank` runs at
+>    ~60 fps **with the weave provider live**. Fix: load `about:blank` + CDP-inject.
+>    (The all-processes-idle dumps below are of `file://` runs — they were idle
+>    because the empty doc never produced a frame, *not* because the GPU weave
+>    provider suppressed BeginFrames. The "provider registration perturbs Viz"
+>    hypothesis is WRONG.)
+> 2. **`xrCreateInstance` `-2` = an IPC version-gate reject.** Deployed
+>    `DisplayXRClient.dll` (v1.26.2-**18**) is newer than the running
+>    `displayxr-service.exe` (v1.26.2-**3**) — a prior session copied the DLL to
+>    Program Files but couldn't overwrite the service .exe (Administrators ACL). The
+>    runtime says so: `ipc_client_check_git_tag … Set IPC_IGNORE_VERSION=1`. Set
+>    `IPC_IGNORE_VERSION=1` (ABI is append-only per ADR-020) → the weave IPC connects.
+>    (Also: content_shell must run **Medium** integrity to match the Medium service,
+>    else the service's `OpenProcess(PROCESS_DUP_HANDLE)` on content_shell is
+>    `Access denied` → a *different* `-2`.)
+>
+> **Working recipe → live weave + eyeball PASSED:** `about:blank` +
+> `set IPC_IGNORE_VERSION=1` + explorer-handoff (Medium) launch with
+> `--enable-inline-3d` and the §11 frame flags (NO `--run-all-compositor-stages-
+> before-draw`). `%TEMP%\run_b2c1_aboutblank.bat`. Permanent fix: deploy a matching
+> `displayxr-service.exe` to Program Files (elevated) so `IPC_IGNORE_VERSION` isn't
+> needed, and change `run_b2c1.bat` to load `about:blank`.
+
+--- historical investigation (conclusion superseded by the RESOLUTION above) ---
+
+With frames now flowing, a failure *appeared* distinct. What looked like clean
+attribution was actually confounded by the `file://`-vs-`about:blank` difference:
 - weave dormant (service down, or `--enable-inline-3d` removed) → `window.__t`
   climbs to thousands, raw SBS visible (eyeballed: L=green/R=magenta), stable;
 - weave engaged (service **up** + `--enable-inline-3d`) → `window.__t` frozen at 0,
   the log ends right after `B2c GPU weave provider registered`, frame production
-  stops permanently.
+  stops permanently.  *(← these "weave engaged" runs all loaded `file://`; that,
+  not the weave, is why they froze.)*
 
 **It is a hang/stall, NOT a crash** (the "Application Error" dialog was a red
 herring — a stray orphan-crash dialog from a prior teardown). Proven by procdump
@@ -527,13 +553,187 @@ herring — a stray orphan-crash dialog from a prior teardown). Proven by procdu
   pipe that never connects** — the present-owner / weave handback channel setup
   stalls when the weave session goes live.
 
-So the frame-production blocker (this section's subject) is fully resolved. The
-weave-fires stall lives in the **runtime/service IPC layer** (DisplayXRClient ↔
-displayxr-service present-owner/weave channel), *not* in the Chromium B2c.2 code and
-*not* in the compositor. Next step (a runtime-side session — out of scope for the
-"don't touch the runtime" frame-blocker task): dump `displayxr-service` while hung
-and find why it never connects back the present-owner/weave pipe for a
-browser-hosted present-owner that connects while idle (candidate factors: present-
-owner acceptance gating, the per-client-DP / `init_client_render_resources` path,
-or an integrity/`ConnectNamedPipe` handshake mismatch). The net-service crash-loop
-is unrelated (present in the working runs too).
+So the frame-production blocker (this section's subject) is fully resolved.
+
+**Deeper diagnosis (2026-07 dump session) — it is a begin-frame SCHEDULER STALL,
+not a deadlock and not the runtime IPC.** Dumped all four processes while hung
+(`%TEMP%\{gpu_hang2,rend_hang2,browser_hang,svc_hang}.dmp` + `*_stacks.txt`):
+- **Every process is IDLE, none blocked on a lock or a sync call.** Renderer
+  `Compositor` thread parked in `GetQueuedCompletionStatus` (awaiting a BeginFrame),
+  GPU `VizCompositorThread` parked on `NtRemoveIoCompletion`, browser `CrBrowserMain`
+  in its normal `MessagePumpForUI::DoRunLoop`, service per-client IPC thread in
+  `ReadFile` (awaiting the next RPC). The renderer main thread stays CDP-responsive
+  (`window.__t` reads return) — only rAF/BeginFrames have stopped.
+- **The `ConnectNamedPipe`-in-DisplayXRClient frame was a RED HERRING** — it is
+  normal runtime-client infrastructure, not the weave channel (the weave path is
+  pure synchronous RPC over the existing client connection, `oxr_weave.c` →
+  `comp_ipc_client_compositor_weave_*`; no second pipe is created).
+- **The freeze is gated on `--enable-inline-3d` (GPU weave provider registered) +
+  service up — NOT on the weave client succeeding.** Reproduced with
+  `xrCreateInstance` *failing* (`-2`, no weave session at all) → still `__t=0`.
+  With the service **down** (same flags, provider still registers) → `__t` climbs
+  to 121, frames fine. So the GPU-side substitution path (active once the provider
+  is registered and the service is reachable) stalls the frame pipeline on/after the
+  first frame; with **`--disable-gpu-vsync --disable-frame-rate-limit`** the
+  unthrottled begin-frame source waits on the previous frame's presentation ack, so
+  a single broken/never-completing frame parks the whole pipeline permanently.
+
+**Leading hypothesis:** the B2c `MaybeWeaveSubstitute` / `DrawTextureQuad`-tag path,
+when the provider is live, breaks the tagged frame's presentation-feedback (or never
+completes that frame), and the unthrottled scheduler never schedules the next
+BeginFrame → all processes idle. **NOT** a runtime/service bug (service is idle and
+innocent), **NOT** a crash (the `0xC0000022` Application Errors are teardown/orphan
+artifacts of the net-service crash-loop, unrelated).
+
+**Sharper symptom:** the renderer never fires rAF **even once** (`window.__t` stays
+at exactly 0 — not "climbs then stops"), i.e. the renderer receives **zero**
+BeginFrames from the moment the GPU weave provider registers with the service up. So
+the stall is at/near **Viz frame-sink bring-up or the provider registration in
+`ShellContentGpuClient::PostCompositorThreadCreated`**, not a mid-stream frame that
+fails to complete.
+
+**Hypothesis TESTED + DISPROVEN (2026-07):** dropping `--disable-gpu-vsync
+--disable-frame-rate-limit` (timer-driven BeginFrames, not presentation-ack-gated)
+did **not** help — `__t` still stuck at 0. So it is not a presentation-feedback stall
+on frame N; frame 0 never starts.
+
+**Next steps (Chromium B2c side — code-level, NOT black-box; black-box repro only
+spams the `0xC0000022` dialogs and yields no new signal):**
+1. Add logs at `ShellContentGpuClient::PostCompositorThreadCreated` (provider
+   registration) and the earliest Viz frame-sink / BeginFrameSource setup to see what
+   the provider registration touches that could suppress the first BeginFrame — the
+   provider is process-global and registered on the GPU compositor thread; suspect it
+   perturbs Viz init only when the service is reachable (the `service up` gate).
+2. Log `SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute` + the `DrawTextureQuad` tag
+   site; confirm whether they even run (they may not, if frame 0 never happens).
+3. Bisect the B2c patch: does the freeze appear with the provider registered but the
+   substitution hook disabled? That isolates "registration perturbs Viz" vs
+   "substitution stalls the frame."
+Also worth noting: `xrCreateInstance` in the browser weave client returns **-2 even
+with the service up** on the Medium/explorer launches — a separate B2a-vs-service
+connect issue to run down (integrity/handshake), though it is NOT the cause of the
+frame freeze (freeze happens regardless).
+
+**Root cause of the `-2` FOUND (content_shell runtime log,
+`%LOCALAPPDATA%\DisplayXR\DisplayXR_content_shell.exe.*.log`):**
+```
+[oxr_instance_create] DisplayXR runtime … loaded from …\DisplayXRClient.dll
+[ipc_receive] ReadFile from pipe … failed: 109 The pipe has been ended.
+[ipc_client_setup_shm] Failed to retrieve shm fd!
+XR_ERROR_RUNTIME_FAILURE in xrCreateInstance: Failed to create instance '-1'
+```
+So `xrCreateInstance` **connects to the service**, then the **shared-memory-fd
+handshake breaks** (`ERROR_BROKEN_PIPE`/109 during `ipc_client_setup_shm`) — a
+handle-duplication / integrity failure between content_shell and the service. Seen
+at High content_shell + Medium service (mismatch) *and* on Medium/explorer launches,
+so it is not purely integrity — the shm handshake for a browser-hosted client is
+failing. **But the frame freeze is decoupled from this** — the freeze's common
+factor across all frozen runs is merely that content_shell **establishes the IPC
+connection** to displayxr-service (the weave client's `xrCreateInstance`), which is
+absent when the service is down or `--enable-inline-3d` is off (both of which give
+flowing frames). To confirm client-connection vs GPU-provider as the freeze source,
+a `DXR_WEAVE_SKIP_CLIENT=1` env gate was added to `displayxr_weave_client.cc`
+(disables the browser client while the GPU provider still registers); bisection
+result pending a rebuild.
+
+---
+
+## 12. B3 — the JS surface (WebXR `inline-3d`) + head-tracking + teardown
+
+B2c wove a page's own hand-painted SBS canvas. B3 makes inline-3D a *real* WebXR
+session: a JS surface, two head-tracked eye views with off-axis projections, and
+proper feature detection + teardown. All on the Chromium branch
+`displayxr-inline-3d`; the four seams from §3 are unchanged.
+
+**Standing constraint — per-element eyeball is deferred to real chrome (B4).**
+`content_shell` flattens the whole page (canvas included) into **one** GPU-side
+web-contents `TextureDrawQuad` (proven by a PID+pointer trace: the renderer tags
+its cc layer tree, but `AppendQuads` runs in the GPU process on a *different*
+`TextureLayerImpl` that never gets the per-canvas bit). So the per-element cc tag
+can't cross the renderer→GPU flatten boundary here; it is correct-by-construction
+for standard chrome (renderer submits per-element quads straight to Viz). B3 is
+validated here by compile-green + numeric CDP checks + the negative control; the
+glasses-free per-element eyeball lands at B4.
+
+### 12.1 B3a–B3c (recap)
+- **B3a** — an explicit per-element `weave_target` bool flows
+  `cc::TextureLayer` → `TextureLayerImpl` → `TextureDrawQuad` → `quads.mojom`
+  (both getter + `Read`, since cc runs in the renderer and the quad serializes
+  renderer→Viz) → `SkiaRenderer::DrawTextureQuad`. `DisplayXRInline3D`
+  RuntimeEnabledFeature (experimental). The tag must also be carried pending→active
+  in `TextureLayerImpl::MovePropertiesToActiveLayer` (it flips after the canvas
+  first composites).
+- **B3b** — `navigator.xr.requestSession('inline-3d')` is a Blink-local **sensorless
+  inline** session (no device/vr mojo). `XRDisplayLayer` (a `ScriptWrappable`, *not*
+  an `XRCompositionLayer` — the weave is cc-tag-driven, so the Layers backend is
+  skipped) tags its target canvas via `HTMLCanvasElement::SetInline3D` →
+  `TextureLayer::SetWeaveTarget`. `V8EnumToSessionMode` collapses `inline-3d` → the
+  device `kInline` mode.
+- **B3c** — Seam-D per-element committed rect via
+  `ExternalUseClient::ImageContext::weave_rect` (set in `DrawTextureQuad` from
+  `quad_to_target_transform.MapRect(visible_rect)`); `MaybeWeaveSubstitute` loops
+  every tagged context with per-target woven/fence state in a
+  `base::flat_map<Mailbox, DisplayXRWeaveTargetState>` keyed by the source canvas
+  mailbox.
+
+### 12.2 B3d — two head-tracked eye views with off-axis (Kooima) projections
+The session now produces **two** `XRView`s whose projections are window-relative
+off-axis frusta built from the runtime's tracked eyes.
+
+- **`is_inline_3d` threading (Blink).** `V8EnumToSessionMode` erases the inline-3d
+  distinction, so `requestSession` captures `mode.AsEnum() == kInline3d` *before*
+  the collapse and carries a bool on `PendingRequestSessionQuery` →
+  `CreateSensorlessInlineSession` → `CreateSession` → the `XRSession` ctor.
+- **Two views (`XRSession::UpdateInlineView`).** When `is_inline_3d_` and eyes +
+  element geometry are available, emplace two `XRViewData` (left = index 0 / left
+  canvas half, right = index 1 / right half — matching `XRDisplayLayer::getViewport`)
+  instead of the single mono view; `getViewerPose` returns both automatically
+  (`XRViewerPose` iterates `session()->views()`). Falls back to the mono view until
+  eyes arrive (and as the negative control).
+- **Off-axis projection + per-eye pose.** Each eye sets *both* halves of the
+  display-centric Kooima decomposition on its `XRViewData` (an `XRViewGeometry`):
+  `UpdateProjectionMatrixFromFoV(up,down,left,right,near,far)` for the asymmetric
+  frustum, and `SetMojoFromView(translate(eye))` placing the eye at its tracked
+  display-space position. Head motion moves the eye → shifts both the pose and the
+  frustum skew → glasses-free look-around. Math ports
+  `docs/architecture/kooima-projection.md` §7 + "Windowed Mode" (the element is the
+  physical window; its rect projected through each eye gives the four half-angles).
+- **Eyes → JS: a new *blink-accessible* `DisplayXRService` mojom.** The tracked eyes
+  already return on every weave RPC (`DisplayXRWeaveResult.eyes`) but were discarded.
+  **Hard layering constraint:** Blink cannot depend on the `content/shell` weave
+  mojom, so a new interface lives at
+  `third_party/blink/public/mojom/xr/displayxr_service.mojom`
+  (`IsInline3DSupported() => (bool)`, `GetLatestEyes() => (array<float> eyes, bool
+  valid, DisplayXRDisplayInfo)`), a `mojom_component` consumed by both content/shell
+  (regular variant) and the xr module (`_blink` variant), mirroring how the xr module
+  already reaches `device::mojom::blink::VRService`. It is bound frame-scoped via the
+  `BrowserInterfaceBroker` (`ShellContentBrowserClient::
+  RegisterBrowserInterfaceBindersForFrame`, `RustTestService` pattern), gated on
+  `--enable-inline-3d`. The renderer's inline-3d session pulls `GetLatestEyes` each
+  animation frame (async, one-frame-lagged cache) and builds the projections from it.
+- **Browser cache + geometry.** `DisplayXRWeaveClient` caches the latest eyes +
+  committed weave rect (written from `DisplayXRWeaverImpl::WeaveSubmit`), queries the
+  physical display dimensions once via `XR_EXT_display_info`
+  (`xrGetSystemProperties`), and converts the window-relative weave rect to a
+  **display-space element rect** (bound-window client origin + committed rect) so the
+  renderer's window-relative Kooima is exact. (Multi-monitor origin mapping is a B4
+  refinement; the weave display is assumed to host the window, the same assumption
+  `bindWindow`'s phase-snap makes.)
+
+### 12.3 B3e — feature detection, teardown, prune
+- **`isSessionSupported('inline-3d')`.** Previously always `true` (inline-3d
+  collapses to plain inline, which "is always supported"). Now special-cased before
+  the collapse to route through `DisplayXRService::IsInline3DSupported()`, which
+  returns the browser's real session/weave-live state. **Negative control:** without
+  `--enable-inline-3d` the browser never binds the service → the renderer remote
+  disconnects → resolves `false`; the GPU weave provider is never registered either,
+  so a still-created inline-3d session is inert (mono fallback, canvas tag drives
+  nothing).
+- **Teardown untag.** `XRSession` now tracks its live `XRDisplayLayer`s and calls
+  `close()` (the sole untag hook: `SetInline3D(false)` → `SetWeaveTarget(false)`) on
+  each from `ForceEnd`, so ending the session stops the weave and the GPU sees the
+  source mailbox untagged next frame.
+- **GPU state prune.** `MaybeWeaveSubstitute` now records the source mailboxes tagged
+  this frame and, after the loop, destroys the woven SharedImage + erases every
+  `displayxr_weave_state_` entry not seen this frame (the map otherwise grows
+  unbounded and leaks woven SharedImages across canvas resize / mailbox churn).
