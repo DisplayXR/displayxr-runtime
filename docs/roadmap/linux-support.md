@@ -1,8 +1,11 @@
 # Linux Support
 
-Status: **Phase 0 ✅ · Phase 1a ✅ · Phase 2a ✅ · Phase 3a ✅ (all build-green
-on CI); Phase 1b/2b/3b on-screen validation pending Linux+GPU hardware.**
-Windows, macOS, and Android ship today; Linux is the remaining platform.
+Status: **Phase 0/1/3 ✅ hardware-validated on Linux** — the hosted and handle
+(`XR_EXT_xlib_window_binding`) sessions bring up the native Vulkan/XCB compositor
+and render the stereo cube on real Vulkan+X11 hardware (Ubuntu 22.04, RTX 3080 +
+AMD Renoir; #708 / #706). **Phase 2 (service/IPC)** builds on hardware; the
+out-of-process IPC round-trip on-screen is the one bit still to confirm. Next:
+packaging (#705). Windows, macOS, and Android ship today.
 
 ## TL;DR
 
