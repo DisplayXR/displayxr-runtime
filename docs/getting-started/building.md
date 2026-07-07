@@ -104,6 +104,20 @@ brew install cmake ninja eigen vulkan-sdk
 
 Builds the runtime, OpenXR loader, and test apps. The macOS Vulkan native compositor runs via MoltenVK over a CAMetalLayer-backed surface (see `cube_handle_vk_macos`); an earlier `VK_ERROR_EXTENSION_NOT_PRESENT` runtime failure was a MoltenVK-era issue that has since been resolved. The remaining macOS-Vulkan dev gotcha is a two-`libvulkan` loader-image conflict (the dev build's image vs the installed runtime's) — share one loader image / pin `XR_RUNTIME_JSON` to avoid it.
 
+### Linux
+```bash
+./scripts/build_linux.sh              # headless build + selftest (deps list in the script header)
+./scripts/build_linux.sh --service    # + displayxr-service / IPC
+./scripts/package_linux.sh            # tarball + install.sh (user-level install, #705)
+```
+
+`package_linux.sh` emits `dist/displayxr-runtime-linux-<arch>-<ver>.tar.gz`; its
+`install.sh` registers the OpenXR ActiveRuntime (`~/.config/openxr/1/`), the
+sim-display display processor (`~/.local/share/DisplayXR/DisplayProcessors/`),
+and a systemd `--user` unit — no root. `sudo ./install.sh --system` for
+machine-wide. Dev iteration without installing stays `XR_RUNTIME_JSON` +
+`XRT_PLUGIN_SEARCH_PATH` per `docs/roadmap/linux-support.md`.
+
 ### Windows (recommended)
 ```bat
 scripts\build_windows.bat all

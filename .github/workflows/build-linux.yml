@@ -64,6 +64,59 @@ jobs:
         # run here; compile+link green is the gate.
         run: ./scripts/build_linux.sh --apps
 
+  # Packaging gate (#705): build in the NEXT-LTS container, produce the
+  # tarball, run the tarball's own install.sh (user-level), and prove the
+  # installed tree works end-to-end — selftest resolving the runtime + plug-in
+  # purely from the installed XDG paths (no XRT_PLUGIN_SEARCH_PATH).
+  Package:
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    steps:
+      - name: Install dependencies
+        # Container runs as root — no sudo binary; hosted-runner parity shim.
+        run: |
+          SUDO=""; [ "$(id -u)" != 0 ] && SUDO=sudo
+          $SUDO apt-get update
+          $SUDO apt-get install -y \
+            build-essential cmake ninja-build pkg-config git \
+            libvulkan-dev vulkan-validationlayers glslang-tools \
+            libeigen3-dev libcjson-dev libudev-dev \
+            libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
+
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0 # git describe needs tags for the tarball version
+
+      - name: Build + package
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          ./scripts/build_linux.sh --service --no-test
+          ./scripts/package_linux.sh --no-build
+
+      - name: Install from tarball + selftest from installed paths
+        run: |
+          export HOME="${HOME:-/root}"
+          tar -C /tmp -xzf dist/displayxr-runtime-linux-*.tar.gz
+          cd /tmp/displayxr-runtime-linux-*/
+          ./install.sh
+          # The real gate: NO XRT_PLUGIN_SEARCH_PATH — discovery must come
+          # from the installed XDG DisplayProcessors root.
+          unset XRT_PLUGIN_SEARCH_PATH
+          "$HOME/.local/share/displayxr/bin/displayxr-cli" info
+          "$HOME/.local/share/displayxr/bin/displayxr-cli" selftest
+          ./uninstall.sh
+          # Uninstall must leave no ActiveRuntime behind.
+          test ! -f "$HOME/.config/openxr/1/active_runtime.json"
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: displayxr-runtime-linux-tarball
+          path: dist/displayxr-runtime-linux-*.tar.gz
+          if-no-files-found: error
+
   Service:
     runs-on: ubuntu-latest
     steps:
