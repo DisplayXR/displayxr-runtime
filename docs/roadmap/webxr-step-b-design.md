@@ -799,13 +799,76 @@ tag-at-`DrawTextureQuad` + substitute-woven-`SkImage` seam ever run for the canv
 *flattens* the full-window canvas into the single quad `SkiaRenderer` draws — a
 quirk, not the per-element path.)
 
-### 13.3 Redesign direction (Seam B, open)
-The weave substitution must move to where chrome *actually* isolates a canvas —
-the **`OverlayProcessorWin` / `DCLayerOverlay`** path. In default DComp mode chrome
-promotes an accelerated canvas/WebGL element to its own overlay surface; that
-per-element surface (not a `SkiaRenderer` quad) is the natural weave target. Next
-step is to add overlay-path logging to confirm the inline-3d canvas becomes a
-distinct `DCLayerOverlay`, then design the substitution there (import the woven
-texture as the overlay's content). This replaces the `SkiaRenderer::DrawTextureQuad`
-seam for chrome; the browser↔GPU Mojo bridge, the weave client, the JS surface,
-and the shared component are all unaffected. **B4 paused here for that redesign.**
+### 13.3 Redesign direction — the CEF sub-rect model (Seam B, open)
+
+**Reframing from the proven Step-A reference.** The `displayxr-cef-host` (Step A)
+*did* weave per-element inline-3D on Leia, and re-reading its source
+(`src/weave_compositor.cpp`, `src/cef_client.cpp`) shows **why**, and why Step B's
+seam was wrong. CEF ran in **offscreen-rendering (OSR)** mode: Chromium composited
+the **whole page** — the 2D surround *and* the canvas's flat SBS pixels, already
+squashed together — into one shared texture and handed it to the host via
+`OnAcceleratedPaint(shared_texture_handle)` → `pageTex`. The host was then an
+**external compositor**: per element per frame it `CopySubresourceRegion`'d the
+element's sub-rect **out of the finished page texture** (`weave_compositor.cpp:294`),
+wove that rectangle, drew the page base into its own back buffer, composited each
+woven sub-rect back over it, and **presented to its own window**
+(`:254–344`). Element rects came from JS via the host bridge; weaves were
+serialized per element (submit → wait → copy → blit) so accumulation-vs-serialize
+(§5 #1) never mattered.
+
+**The takeaway that inverts Seam B:** the CEF host **never needed the canvas to be
+a distinct quad.** The canvas SBS was *baked into the page texture at its rect* —
+exactly the "squash" §13.2 documents in chrome — and the host simply weaved a
+**rectangle of the finished page**. Step B instead tried to substitute a woven
+`SkImage` for the canvas's *own* `TextureDrawQuad` inside Viz (Seam A/B), which
+requires a per-canvas quad chrome never produces. The `1800×1200 kTextureContent`
+quad §13.2 kept finding **is** CEF's `pageTex` (the composited web-contents).
+
+**So the redesign is to transplant the CEF external-compositor flow *into* Viz,**
+not to chase the DComp-overlay path (an earlier draft of this section suggested
+`OverlayProcessorWin`/`DCLayerOverlay`; the CEF model is simpler, proven, and
+sidesteps the compositing-mode fight entirely):
+
+1. **Element rects → Viz via `CompositorFrameMetadata` (kills Seam-D staleness).**
+   `XRDisplayLayer` reports its canvas's window-relative device-px rect
+   (`getBoundingClientRect × DSF`) into the renderer's `CompositorFrameMetadata`
+   (a new `inline_3d_rects` list). This is the Chromium-native equivalent of the
+   CEF host's JS-reported rects, and it arrives at Viz **atomically with the frame**
+   whose pixels it describes — so the rect always matches the composited page (the
+   §3 Seam-D "one-frame-stale → lattice collapse" hazard disappears; no need to read
+   a quad transform). Replaces the B3a `weave_target` cc/quads.mojom tag plumbing.
+2. **Post-paint copy → weave → composite in Viz (the CEF `Composite` loop).** In
+   `SkiaOutputSurfaceImplOnGpu`, **after** the frame's quads are painted (the
+   composited page with the flat SBS canvas is now in the output target) and
+   **before** `SwapBuffers`, for each `inline_3d_rects` entry:
+   `CopySubresourceRegion` the output-target sub-rect → owned keyed-mutex SBS input
+   → `xrWeaveSubmitEXT` (via the unchanged Mojo bridge) → fence-wait → draw the
+   woven texture back over the output at that rect. This mirrors
+   `weave_compositor.cpp` step-for-step (page base already present in the target;
+   overlay each woven sub-rect). Replaces the per-quad tag + `MaybeWeaveSubstitute`
+   at `DrawTextureQuad`.
+3. **Present unchanged** — chrome's normal `SwapBuffers`.
+
+**Reused as-is:** the browser↔GPU Mojo weave bridge, the OpenXR weave client +
+present-owner session (`bindWindow`), `EnsureSbsInput`/keyed-mutex input, the
+woven-handle import + `D3DSharedFence` wait, the shared `components/displayxr/`
+component, and the JS surface (`XRDisplayLayer`, `inline-3d` session, feature
+detect). **Changed:** `XRDisplayLayer` reports a rect into `CompositorFrameMetadata`
+instead of tagging a cc `TextureLayer`; the GPU weave moves from
+`DrawTextureQuad`-substitution to a post-paint output-target overlay loop.
+**Dropped:** the B3a `weave_target` bool on `cc::TextureLayer` / `TextureLayerImpl`
+/ `TextureDrawQuad` / `quads.mojom`, and the `ImageContext` tag / `MaybeWeave
+Substitute` substitution path.
+
+**Open sub-questions for the redesign build:**
+- Output-target readback: confirm `SkiaOutputSurfaceImplOnGpu` can `CopySubresource
+  Region` a sub-rect of the current output D3D texture on the GPU thread post-paint
+  (the CEF host copied from an off-DOM `pageTex`; here the source is the live output
+  render target — may need a scratch copy to avoid a read/write hazard on the same
+  target).
+- Drawing the woven texture back: draw it as a final Skia/D3D quad into the output
+  target at the rect (simplest), vs a DComp overlay visual (only if the readback
+  hazard forces it).
+- 2-view geometry (B3d) is unaffected — once eyes flow from a firing weave, the
+  existing `UpdateInline3DViews` path activates; B4c look-around then becomes
+  testable.
