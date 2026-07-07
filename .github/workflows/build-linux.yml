@@ -1,13 +1,10 @@
 name: Build Linux
 
-# Linux bring-up dev loop (docs/roadmap/linux-support.md, issue #660).
-#
-# DELIBERATELY NOT a required check yet. It does NOT run on every PR or on
-# pushes to main — only on manual dispatch and on `linux*` branches — so it
-# can't gate unrelated work while the port is in progress. GitHub's
-# ubuntu-latest runner IS the Linux box we use to get Phase 0 green; promote
-# this to a PR-triggered required check (with the DetectChanges docs_only
-# short-circuit the macOS/Windows jobs use) only once it passes reliably.
+# Linux CI (docs/roadmap/linux-support.md, issue #660) — PROMOTED to a
+# PR-triggered required check (#660 CI-promotion task): runs on every PR like
+# build-windows.yml / build-macos.yml, with the same DetectChanges docs_only
+# short-circuit so doc-only PRs report success in seconds without building.
+# Required contexts (main-protection ruleset): Selftest, Service, Package.
 #
 # Selftest job (Phase 0/1): configure + build the runtime + displayxr-cli +
 # the sim_display plug-in, run `displayxr-cli selftest` (the hardware-free gate
@@ -18,24 +15,62 @@ name: Build Linux
 # compiles displayxr-service + the IPC-client runtime (client VK compositor,
 # ipc_client/ipc_server, comp_multi). CI has no display, so build-green is the
 # Phase 2 gate; the IPC round-trip is hardware work (Phase 1b).
+#
+# Package job (#705): build in the ubuntu:26.04 container, produce the
+# tarball, install from it, and gate on selftest resolving everything from
+# the installed XDG paths.
 
 on:
   workflow_dispatch: {}
-  push:
-    branches:
-      - 'linux'
-      - 'linux-**'
-      - 'feature/linux-**'
+  pull_request: {}
 
+# Cancel any in-progress run for the same PR (or branch) when a new
+# push comes in. Only the latest commit's CI completes.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  Selftest:
+  DetectChanges:
     runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.filter.outputs.docs_only }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Full clone — the diff below uses pull_request.base.sha, which can
+          # be older than the merge commit's first parent. Shallow clones miss
+          # those refs and the diff fails with "fatal: bad object".
+          fetch-depth: 0
+      - id: filter
+        run: |
+          # Same docs_only rule as build-windows.yml: heavy jobs still RUN (to
+          # report the required status) but skip their expensive steps.
+          # workflow_dispatch always builds.
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "Detected non-PR trigger — docs_only=false"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD)
+          NON_DOC=$(echo "$CHANGED" | grep -vE '^(docs/|.*\.md$|LICENSE$|\.github/ISSUE_TEMPLATE/)' || true)
+          if [ -z "$NON_DOC" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Detected docs_only=$(grep ^docs_only= "$GITHUB_OUTPUT" | cut -d= -f2)"
+
+  Selftest:
+    needs: DetectChanges
+    runs-on: ubuntu-latest
+    steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — reporting success without building."
+
+      - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         with:
           submodules: recursive
 
@@ -47,6 +82,7 @@ jobs:
         # SDK build (--apps loader provisioning) additionally links
         # Xrandr/Xxf86vm (gfxwrapper) and includes xcb/glx.h (loader
         # XR_USE_PLATFORM_XCB path) — hence the last three packages.
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -62,6 +98,7 @@ jobs:
         # cube_handle_vk_linux (Phase 3 handle class — app-owned X11 window via
         # XR_EXT_xlib_window_binding). CI has no display, so the apps aren't
         # run here; compile+link green is the gate.
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./scripts/build_linux.sh --apps
 
   # Packaging gate (#705): build in the NEXT-LTS container, produce the
@@ -69,11 +106,17 @@ jobs:
   # installed tree works end-to-end — selftest resolving the runtime + plug-in
   # purely from the installed XDG paths (no XRT_PLUGIN_SEARCH_PATH).
   Package:
+    needs: DetectChanges
     runs-on: ubuntu-latest
     container: ubuntu:26.04
     steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — reporting success without building."
+
       - name: Install dependencies
         # Container runs as root — no sudo binary; hosted-runner parity shim.
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           SUDO=""; [ "$(id -u)" != 0 ] && SUDO=sudo
           $SUDO apt-get update
@@ -85,17 +128,20 @@ jobs:
             libgl1-mesa-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
 
       - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         with:
           submodules: recursive
           fetch-depth: 0 # git describe needs tags for the tarball version
 
       - name: Build + package
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           ./scripts/build_linux.sh --service --no-test
           ./scripts/package_linux.sh --no-build
 
       - name: Install from tarball + selftest from installed paths
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           export HOME="${HOME:-/root}"
           tar -C /tmp -xzf dist/displayxr-runtime-linux-*.tar.gz
@@ -111,6 +157,7 @@ jobs:
           test ! -f "$HOME/.config/openxr/1/active_runtime.json"
 
       - name: Upload tarball artifact
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: displayxr-runtime-linux-tarball
@@ -118,15 +165,22 @@ jobs:
           if-no-files-found: error
 
   Service:
+    needs: DetectChanges
     runs-on: ubuntu-latest
     steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — reporting success without building."
+
       - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         with:
           submodules: recursive
 
       - name: Install dependencies
         # GL/EGL (+Xrandr/Xxf86vm) dev libs: same rationale as the Selftest
         # job (#709).
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -141,4 +195,5 @@ jobs:
         # (client VK compositor + ipc_client/ipc_server + comp_multi). The
         # selftest still runs (displayxr-cli links target_instance_no_comp,
         # independent of service mode). Build-green only — no display on CI.
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./scripts/build_linux.sh --service
