@@ -1213,6 +1213,12 @@ metal_compositor_create_swapchain(struct xrt_compositor *xc,
 		if (layered) {
 			desc.textureType = MTLTextureType2DArray;
 			desc.arrayLength = info->array_size;
+			// Layered swapchains have no IOSurface backing (below) and no CPU
+			// access path — keep them GPU-private. Shared-storage render
+			// targets also break Unity's Metal RenderSurface machinery when a
+			// client wraps slice views as XR render targets (the editor SEGVs
+			// creating the surface's main texture — displayxr-unity#204).
+			desc.storageMode = MTLStorageModePrivate;
 			msc->iosurfaces[i] = NULL;
 			msc->images[i] = [c->device newTextureWithDescriptor:desc];
 			if (msc->images[i] == nil) {

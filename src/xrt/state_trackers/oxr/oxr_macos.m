@@ -69,6 +69,21 @@ oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count, struct xrt
 			return;
 		}
 
+		// External-window sessions (the app supplied the NSView, e.g. the Unity
+		// display provider): the HOST APP owns the event loop. Draining NSApp
+		// here dequeues the host's own events and [NSApp sendEvent:] dispatches
+		// them REENTRANTLY from inside the host's frame callback (xrPollEvent is
+		// called from Unity's LateUpdate) — the Unity editor throws and aborts.
+		// Skip the drain, qwerty, and window-close tracking entirely (the host
+		// delivers input and owns window lifetime); keep the CATransaction
+		// flush + CFRunLoop tick below — that is what commits the compositor's
+		// background-thread drawable presents. (displayxr-unity#204 bring-up.)
+		if (external_window && !service_mode) {
+			[CATransaction flush];
+			CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.001, false);
+			return;
+		}
+
 		// When running inside a host app (external_window == true),
 		// collect keyboard/mouse events so we can re-inject them
 		// after processing.  This lets the runtime see all events
