@@ -30,6 +30,13 @@ struct comp_vk_native_window_macos;
  *
  * @param width                 Requested window width in points.
  * @param height                Requested window height in points.
+ * @param screen_left           Window left edge in top-down global coordinates
+ *                              (origin = primary screen top-left) — the 3D
+ *                              panel position the vendor plug-in reports via
+ *                              xsysc->info.display_screen_left. (0, 0) means
+ *                              primary screen. Positions outside every
+ *                              NSScreen fall back to the primary. #715.
+ * @param screen_top            Window top edge, same space as @p screen_left.
  * @param transparent_background When true, the NSWindow + CAMetalLayer are
  *                              configured non-opaque (clear background) so the
  *                              desktop shows through alpha < 1 regions.
@@ -40,6 +47,8 @@ struct comp_vk_native_window_macos;
 xrt_result_t
 comp_vk_native_window_macos_create(uint32_t width,
                                     uint32_t height,
+                                    int32_t screen_left,
+                                    int32_t screen_top,
                                     bool transparent_background,
                                     struct comp_vk_native_window_macos **out_win);
 

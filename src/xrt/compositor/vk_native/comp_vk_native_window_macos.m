@@ -66,16 +66,62 @@ ensure_ns_app(void)
 	}
 }
 
+/*!
+ * Compute the AppKit frame origin for a window whose top-left should sit at
+ * (@p screen_left, @p screen_top) in top-down global coordinates — origin at
+ * the top-left of the primary screen, the space the vendor plug-in reports
+ * the 3D panel position in (Windows convention: (0, 0) = primary). AppKit is
+ * bottom-up, so flip against the primary screen height and pick the screen
+ * containing the point for logging/fallback. #715.
+ */
+static NSRect
+frame_for_display_position(int32_t screen_left, int32_t screen_top, uint32_t width, uint32_t height)
+{
+	NSScreen *primary = [NSScreen screens].firstObject; // origin (0,0) in AppKit global space
+	if (primary == nil) {
+		return NSMakeRect(100, 100, width, height);
+	}
+
+	CGFloat primary_h = primary.frame.size.height;
+	NSPoint top_left = NSMakePoint((CGFloat)screen_left, primary_h - (CGFloat)screen_top);
+	NSRect frame = NSMakeRect(top_left.x, top_left.y - (CGFloat)height, width, height);
+
+	// Find the screen containing the requested top-left; if no screen does,
+	// the plug-in value is bogus for this desktop layout — fall back to the
+	// primary screen rather than opening an unreachable off-screen window.
+	NSScreen *target = nil;
+	for (NSScreen *s in [NSScreen screens]) {
+		// NSPointInRect excludes the top edge in a bottom-up rect, so probe
+		// one point inside the window instead of the exact corner.
+		if (NSPointInRect(NSMakePoint(top_left.x, top_left.y - 1), s.frame)) {
+			target = s;
+			break;
+		}
+	}
+	if (target == nil) {
+		U_LOG_W("VK native macOS: display position (%d, %d) is outside every screen — "
+		        "falling back to the primary screen",
+		        (int)screen_left, (int)screen_top);
+		return NSMakeRect(100, 100, width, height);
+	}
+
+	U_LOG_I("VK native macOS: placing window at (%d, %d) on screen '%s'", (int)screen_left, (int)screen_top,
+	        [target.localizedName UTF8String]);
+	return frame;
+}
+
 static void
 create_window_on_main_thread(struct comp_vk_native_window_macos *win,
                               uint32_t width,
                               uint32_t height,
+                              int32_t screen_left,
+                              int32_t screen_top,
                               bool transparent_background,
                               bool *out_success)
 {
 	ensure_ns_app();
 
-	NSRect frame = NSMakeRect(100, 100, width, height);
+	NSRect frame = frame_for_display_position(screen_left, screen_top, width, height);
 	NSWindowStyleMask style = NSWindowStyleMaskTitled |
 	                          NSWindowStyleMaskClosable |
 	                          NSWindowStyleMaskResizable |
@@ -136,6 +182,8 @@ create_window_on_main_thread(struct comp_vk_native_window_macos *win,
 xrt_result_t
 comp_vk_native_window_macos_create(uint32_t width,
                                     uint32_t height,
+                                    int32_t screen_left,
+                                    int32_t screen_top,
                                     bool transparent_background,
                                     struct comp_vk_native_window_macos **out_win)
 {
@@ -146,10 +194,12 @@ comp_vk_native_window_macos_create(uint32_t width,
 
 	__block bool success = false;
 	if ([NSThread isMainThread]) {
-		create_window_on_main_thread(win, width, height, transparent_background, &success);
+		create_window_on_main_thread(win, width, height, screen_left, screen_top, transparent_background,
+		                             &success);
 	} else {
 		dispatch_sync(dispatch_get_main_queue(), ^{
-			create_window_on_main_thread(win, width, height, transparent_background, &success);
+			create_window_on_main_thread(win, width, height, screen_left, screen_top,
+			                             transparent_background, &success);
 		});
 	}
 

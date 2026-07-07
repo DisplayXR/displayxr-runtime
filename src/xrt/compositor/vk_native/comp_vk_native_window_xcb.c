@@ -49,6 +49,8 @@ intern_atom(xcb_connection_t *conn, const char *name)
 xrt_result_t
 comp_vk_native_window_xcb_create(uint32_t width,
                                  uint32_t height,
+                                 int32_t screen_left,
+                                 int32_t screen_top,
                                  bool transparent_background,
                                  struct comp_vk_native_window_xcb **out_win)
 {
@@ -99,14 +101,31 @@ comp_vk_native_window_xcb_create(uint32_t width,
 	    XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_KEY_PRESS,
 	};
 
+	// Position on the 3D display. The vendor plug-in publishes the panel's
+	// top-left in root-window coordinates through
+	// xsysc->info.display_screen_left/top and the compositor forwards it here
+	// (Windows reference: comp_d3d11_window.cpp). (0, 0) means primary
+	// monitor (sim_display default or unknown panel). #715.
 	xcb_create_window(conn,
 	                  XCB_COPY_FROM_PARENT, // depth
 	                  win->window, screen->root,
-	                  0, 0, (uint16_t)width, (uint16_t)height,
+	                  (int16_t)screen_left, (int16_t)screen_top, (uint16_t)width, (uint16_t)height,
 	                  0,                                 // border
 	                  XCB_WINDOW_CLASS_INPUT_OUTPUT,
 	                  screen->root_visual,
 	                  value_mask, value_list);
+
+	// WM_NORMAL_HINTS with USPosition|PPosition, so the window manager treats
+	// the create-time position as intentional instead of auto-placing the
+	// window (ICCCM §4.1.2.3; GNOME/Mutter auto-places without this).
+	{
+		uint32_t hints[18] = {0};
+		hints[0] = 1 | 4; // USPosition | PPosition
+		hints[1] = (uint32_t)screen_left;
+		hints[2] = (uint32_t)screen_top;
+		xcb_change_property(conn, XCB_PROP_MODE_REPLACE, win->window, XCB_ATOM_WM_NORMAL_HINTS,
+		                    XCB_ATOM_WM_SIZE_HINTS, 32, 18, hints);
+	}
 
 	// Title.
 	const char *title = "DisplayXR";
@@ -123,9 +142,18 @@ comp_vk_native_window_xcb_create(uint32_t width,
 	}
 
 	xcb_map_window(conn, win->window);
+
+	// Re-assert the position after mapping — many WMs (Mutter included)
+	// ignore the create-time x/y of a freshly mapped toplevel, but honor a
+	// post-map ConfigureRequest (this is what `xdotool windowmove` sends).
+	{
+		const uint32_t coords[2] = {(uint32_t)screen_left, (uint32_t)screen_top};
+		xcb_configure_window(conn, win->window, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, coords);
+	}
 	xcb_flush(conn);
 
-	U_LOG_I("XCB: created %ux%u window 0x%08x", width, height, (unsigned)win->window);
+	U_LOG_I("XCB: created %ux%u window 0x%08x at (%d, %d)", width, height, (unsigned)win->window,
+	        (int)screen_left, (int)screen_top);
 
 	*out_win = win;
 	return XRT_SUCCESS;

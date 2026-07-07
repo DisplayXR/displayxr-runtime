@@ -77,6 +77,8 @@
 
 #include <string.h>
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #ifdef XRT_OS_WINDOWS
 #include <windows.h>
@@ -3257,6 +3259,33 @@ dp_vtable_looks_sane(struct xrt_display_processor *dp)
 	return true;
 }
 
+#if defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
+/*!
+ * Manual override for the self-owned window position: DXR_WINDOW_POS="x,y"
+ * (top-down desktop pixels), checked BEFORE the plug-in-reported display
+ * position. For dev boxes and DPs with no real panel position — sim_display
+ * reports (0, 0) = primary by convention. #715.
+ */
+static void
+apply_window_pos_override(int32_t *left, int32_t *top)
+{
+	const char *e = getenv("DXR_WINDOW_POS");
+	if (e == NULL || e[0] == '\0') {
+		return;
+	}
+	int x = 0;
+	int y = 0;
+	if (sscanf(e, "%d,%d", &x, &y) == 2) {
+		U_LOG_W("DXR_WINDOW_POS=%s overrides plug-in display position (%d, %d)", e, (int)*left, (int)*top);
+		*left = (int32_t)x;
+		*top = (int32_t)y;
+	} else {
+		U_LOG_W("DXR_WINDOW_POS='%s' malformed — expected 'x,y'; using plug-in display position", e);
+	}
+}
+#endif
+
+
 /*
  *
  * Exported functions
@@ -3389,9 +3418,14 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			win_w = 1920;
 			win_h = 1080;
 		}
-		U_LOG_I("Creating self-owned macOS window (%ux%u)", win_w, win_h);
+		// Open on the 3D panel at the plug-in-reported position (as the
+		// Windows arm does), with the DXR_WINDOW_POS env override winning. #715.
+		int32_t win_left = display_screen_left;
+		int32_t win_top = display_screen_top;
+		apply_window_pos_override(&win_left, &win_top);
+		U_LOG_I("Creating self-owned macOS window (%ux%u at %d,%d)", win_w, win_h, win_left, win_top);
 		xrt_result_t xret = comp_vk_native_window_macos_create(
-		    win_w, win_h, transparent_background, &c->macos_window);
+		    win_w, win_h, win_left, win_top, transparent_background, &c->macos_window);
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to create self-owned macOS window");
 			free(c);
@@ -3438,9 +3472,14 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			win_w = 1920;
 			win_h = 1080;
 		}
-		U_LOG_I("Creating self-owned XCB window (%ux%u)", win_w, win_h);
+		// Open on the 3D panel at the plug-in-reported position (as the
+		// Windows arm does), with the DXR_WINDOW_POS env override winning. #715.
+		int32_t win_left = display_screen_left;
+		int32_t win_top = display_screen_top;
+		apply_window_pos_override(&win_left, &win_top);
+		U_LOG_I("Creating self-owned XCB window (%ux%u at %d,%d)", win_w, win_h, win_left, win_top);
 		xrt_result_t xret = comp_vk_native_window_xcb_create(
-		    win_w, win_h, transparent_background, &c->xcb_window);
+		    win_w, win_h, win_left, win_top, transparent_background, &c->xcb_window);
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to create self-owned XCB window");
 			free(c);

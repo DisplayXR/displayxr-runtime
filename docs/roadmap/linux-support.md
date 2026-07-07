@@ -156,6 +156,20 @@ first-light is confirmed. The handle-class app now exists —
 **Done when:** a hosted cube renders into a runtime-created XCB window with
 sim_display weaving.
 
+**Window placement on multi-monitor boxes (#715).** The self-owned XCB window
+opens at the 3D panel's desktop position, mirroring the Windows reference
+(`comp_d3d11_window.cpp`): the vendor plug-in reports the panel top-left via
+`xrt_plugin_display_info` → `xsysc->info.display_screen_left/top`, the
+compositor forwards it into `comp_vk_native_window_xcb_create`, and the helper
+asks for it three ways (create-time x/y, `WM_NORMAL_HINTS` US/PPosition, and a
+post-map `ConfigureRequest` — the same move `xdotool windowmove` sends, since
+WMs like Mutter auto-place fresh toplevels otherwise). (0, 0) means primary
+monitor — the sim_display convention and the unknown-panel fallback. Manual
+override, checked **before** the plug-in value (dev boxes, sim_display):
+`DXR_WINDOW_POS=x,y` in top-down desktop pixels, e.g. `DXR_WINDOW_POS=1920,0`.
+The same knob and plug-in plumbing apply to the macOS vk_native self-owned
+window (`comp_vk_native_window_macos.m`).
+
 ### Phase 2 — Service / IPC path
 
 **Phase 2a — build-green on Linux CI ✅ (done).** `displayxr-service` + the
