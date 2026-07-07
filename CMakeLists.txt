@@ -208,6 +208,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	if(PKGCONFIG_FOUND)
 		pkg_check_modules(XCB xcb xcb-randr x11-xcb)
 	endif()
+	# X11 (Xlib) for the native GL compositor's GLX present path (Phase 1b-GL).
+	# GLX itself comes from find_package(OpenGL) above (OpenGL::GLX /
+	# OpenGL_GLX_FOUND). Not REQUIRED — a headless/GL-less box still builds.
+	find_package(X11)
 endif()
 
 # This one is named differently because that's what CTest uses
@@ -274,6 +278,13 @@ option_with_deps(XRT_FEATURE_TRACING "Enable debug tracing on supported platform
 option_with_deps(XRT_FEATURE_WINDOW_PEEK "Enable a window that displays the content of the HMD on screen" DEPENDS XRT_HAVE_SDL2)
 option_with_deps(XRT_FEATURE_DEBUG_GUI "Enable debug window to be used" DEPENDS XRT_HAVE_SDL2)
 option_with_deps(XRT_FEATURE_HYBRID_MODE "Enable hybrid in-process/IPC mode (native compositor for normal apps, IPC for sandboxed apps)" DEFAULT OFF DEPENDS "WIN32 OR APPLE" XRT_MODULE_IPC XRT_FEATURE_OPENXR "XRT_HAVE_D3D11 OR APPLE")
+# Opt-in software-GL present path on desktop Linux: a GLX compositor that shares
+# the app's GL context (no external-memory FD interop) so it renders on software
+# GL (llvmpipe) with NO GPU — for CI / headless / WSL. Default OFF: production
+# Linux uses the Vulkan/XCB native compositor (needs a GPU, see #709). No effect
+# on Windows/macOS/Android. When ON, arms XR_USE_PLATFORM_XLIB, builds comp_gl on
+# Linux, and enables the Xlib GL native compositor + XR_EXT_xlib_window_binding.
+option(XRT_FEATURE_GL_LINUX_SOFTWARE "Enable the opt-in software-GL (GLX/llvmpipe) present path on desktop Linux (no-GPU CI/headless); default OFF = Vulkan/XCB" OFF)
 
 if (XRT_FEATURE_SERVICE)
 	# Disable the client debug gui by default for out-of-proc -
@@ -302,7 +313,13 @@ option_with_deps(XRT_INSTALL_SYSTEMD_UNIT_FILES "Install user unit files for sys
 option_with_deps(XRT_INSTALL_ABSOLUTE_SYSTEMD_UNIT_FILES "Use an absolute path to monado-system in installed user unit files for systemd socket activation" DEPENDS XRT_HAVE_SYSTEMD)
 
 # Drivers to build
-option_with_deps(XRT_BUILD_DRIVER_QWERTY "Enable Qwerty driver" DEPENDS "XRT_HAVE_SDL2 OR WIN32 OR APPLE")
+# option_with_deps forbids parens/AND in a DEPENDS item, so precompute the
+# desktop-Linux+X11 case (native GL compositor drives qwerty via qwerty_xlib, #660).
+set(XRT_QWERTY_LINUX_X11 OFF)
+if(XRT_HAVE_LINUX AND X11_FOUND AND NOT ANDROID)
+	set(XRT_QWERTY_LINUX_X11 ON)
+endif()
+option_with_deps(XRT_BUILD_DRIVER_QWERTY "Enable Qwerty driver" DEPENDS "XRT_HAVE_SDL2 OR WIN32 OR APPLE OR XRT_QWERTY_LINUX_X11")
 set(XRT_IPC_MSG_SOCK_FILENAME displayxr_comp_ipc CACHE STRING "Service socket filename")
 set(XRT_IPC_SERVICE_PID_FILENAME displayxr.pid CACHE STRING "Service pidfile filename")
 set(XRT_OXR_RUNTIME_SUFFIX displayxr CACHE STRING "OpenXR client library suffix")

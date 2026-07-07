@@ -77,7 +77,11 @@ if(XRT_HAVE_OPENGL OR XRT_HAVE_OPENGLES)
 endif()
 
 if(XRT_HAVE_OPENGL_GLX AND XRT_HAVE_XLIB)
+	# Legacy Monado GLX *client* compositor path (shares images via
+	# GL_EXT_memory_object_fd). Removed on this runtime; the marker lets
+	# oxr_session.c fall back to it only when actually compiled.
 	target_sources(st_oxr PRIVATE oxr_session_gfx_gl_xlib.c)
+	target_compile_definitions(st_oxr PRIVATE XRT_HAVE_GL_XLIB_CLIENT)
 endif()
 
 if(XRT_HAVE_EGL)
@@ -210,6 +214,22 @@ if(WIN32 AND XRT_HAVE_OPENGL)
 		target_sources(st_oxr PRIVATE oxr_session_gfx_gl_native.c)
 		target_link_libraries(st_oxr PRIVATE comp_gl)
 		target_compile_definitions(st_oxr PRIVATE XRT_HAVE_GL_NATIVE_COMPOSITOR)
+	endif()
+endif()
+
+# Desktop-Linux OpenGL apps route through the native GL compositor (Xlib/GLX),
+# bypassing Vulkan — the compositor shares the app's GL context so there's no
+# external-memory FD interop, which is what lets it run on software/llvmpipe
+# (the Vulkan native path needs external_fd support the software driver lacks).
+# See docs/roadmap/linux-support.md (Phase 1b-GL).
+if(XRT_FEATURE_GL_LINUX_SOFTWARE AND XRT_HAVE_LINUX AND NOT ANDROID AND XRT_HAVE_OPENGL AND X11_FOUND AND OpenGL_GLX_FOUND)
+	if(TARGET comp_gl)
+		target_sources(st_oxr PRIVATE oxr_session_gfx_gl_native.c)
+		target_link_libraries(st_oxr PRIVATE comp_gl)
+		target_compile_definitions(st_oxr PRIVATE XRT_HAVE_GL_NATIVE_COMPOSITOR)
+		# oxr_session.c's Xlib GL dispatch needs the Xlib/GLX types.
+		target_include_directories(st_oxr PRIVATE ${X11_INCLUDE_DIR})
+		target_link_libraries(st_oxr PRIVATE OpenGL::GLX X11::X11)
 	endif()
 endif()
 

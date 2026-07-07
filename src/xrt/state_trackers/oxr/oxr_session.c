@@ -3125,8 +3125,60 @@ oxr_session_create_impl(struct oxr_logger *log,
 		}
 
 		OXR_SESSION_ALLOCATE_AND_INIT(log, sys, OXR_SESSION_GRAPHICS_EXT_XLIB_GL, *out_session);
+
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+		// Desktop Linux: route GL apps through the native GL compositor (Xlib/GLX,
+		// bypasses Vulkan). The compositor's GLX context shares the app's context
+		// so it samples swapchain textures directly — no external-memory FD interop
+		// (what makes the software/llvmpipe path viable). Mirrors the Win32 path.
+		if (oxr_gl_native_compositor_supported(sys)) {
+			xrt_result_t xret = xrt_system_create_session(sys->xsys, xsi, &(*out_session)->xs, NULL);
+			if (xret == XRT_ERROR_MULTI_SESSION_NOT_IMPLEMENTED) {
+				return oxr_error(log, XR_ERROR_LIMIT_REACHED, "Per instance multi-session not supported.");
+			}
+			if (xret != XRT_SUCCESS) {
+				return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "Failed to create xrt_session! '%i'", xret);
+			}
+			// Handle class (XR_EXT_xlib_window_binding): the app provides its own
+			// X11 Window and the runtime renders into it. Absent (or window==0),
+			// window_handle stays NULL → the compositor self-creates the X11/GLX
+			// window (hosted class). The Window XID is passed as an opaque void*;
+			// the GL compositor's Linux branch casts it back. gl_context = app's
+			// GLXContext, gl_display = xDisplay (shared for GLX context sharing).
+			void *ext_window_handle = NULL;
+			const XrXlibWindowBindingCreateInfoEXT *xlib_binding = OXR_GET_INPUT_FROM_CHAIN(
+			    createInfo, XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_EXT, XrXlibWindowBindingCreateInfoEXT);
+			if (xlib_binding != NULL && xlib_binding->window != 0) {
+				ext_window_handle = (void *)(uintptr_t)xlib_binding->window;
+			}
+			XrResult ret = oxr_session_populate_gl_native(log, sys, ext_window_handle,
+			                                              (void *)opengl_xlib->glxContext,
+			                                              (void *)opengl_xlib->xDisplay,
+			                                              NULL /*shared_texture*/,
+			                                              xsi->transparent_background_enabled,
+			                                              *out_session);
+			// Handle class: mark the app-owned window so view-locate/eye handling
+			// matches the win32/cocoa window-binding paths (windowed app mode).
+			if (ret == XR_SUCCESS && ext_window_handle != NULL) {
+				(*out_session)->has_external_window = true;
+				struct xrt_device *head = GET_XDEV_BY_ROLE((*out_session)->sys, head);
+				if (head != NULL) {
+					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_EXT_APP_MODE, 1);
+				}
+			}
+			return ret;
+		}
+#endif
+
+#ifdef XRT_HAVE_GL_XLIB_CLIENT
+		// Legacy Monado GLX client path (shares via GL_EXT_memory_object_fd).
 		OXR_CREATE_XRT_SESSION_AND_NATIVE_COMPOSITOR(log, xsi, *out_session);
 		return oxr_session_populate_gl_xlib(log, sys, opengl_xlib, *out_session);
+#else
+		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
+		                 "GL native compositor unavailable (OXR_ENABLE_GL_NATIVE_COMPOSITOR=0) and the "
+		                 "legacy GLX client compositor is not built on this runtime");
+#endif
 	}
 #endif
 
@@ -3706,6 +3758,25 @@ oxr_session_create(struct oxr_logger *log,
 		}
 	} else {
 		U_LOG_W("No cocoa window binding found in session create chain");
+	}
+#endif
+
+// Software-GL path only (XRT_FEATURE_GL_LINUX_SOFTWARE): parse
+// XR_EXT_xlib_window_binding into xsi.external_window_handle so the GL native
+// compositor's handle class gets has_external_window (raw eye positions +
+// qwerty disabled), mirroring the win32/cocoa paths. The default Vulkan/XCB
+// build handles this binding via its own routing (see the Vulkan graphics
+// binding block above), so this is intentionally scoped to GL builds and never
+// alters the default path. MUST also gate on XR_USE_PLATFORM_XLIB: macOS and
+// Windows also define XRT_HAVE_GL_NATIVE_COMPOSITOR, but XrXlibWindowBindingCreateInfoEXT
+// is Linux-only (its header guards the struct on __linux__ && !__ANDROID__).
+#if defined(XRT_HAVE_GL_NATIVE_COMPOSITOR) && defined(XR_USE_PLATFORM_XLIB)
+	{
+		const XrXlibWindowBindingCreateInfoEXT *xlib_target_info = OXR_GET_INPUT_FROM_CHAIN(
+		    createInfo, XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_EXT, XrXlibWindowBindingCreateInfoEXT);
+		if (xlib_target_info != NULL && xlib_target_info->window != 0) {
+			xsi.external_window_handle = (void *)(uintptr_t)xlib_target_info->window;
+		}
 	}
 #endif
 

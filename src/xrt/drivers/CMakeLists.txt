@@ -31,6 +31,12 @@ if(XRT_BUILD_DRIVER_QWERTY)
 		list(APPEND QWERTY_SOURCES qwerty/qwerty_macos.m)
 	endif()
 
+	# On desktop Linux, add the X11 input handler for the native GL compositor
+	# window (WASDQE camera + RMB look + V/1/2/3 mode hotkeys). (#660)
+	if(XRT_HAVE_LINUX AND NOT ANDROID AND X11_FOUND)
+		list(APPEND QWERTY_SOURCES qwerty/qwerty_xlib.c)
+	endif()
+
 	add_library(drv_qwerty STATIC ${QWERTY_SOURCES})
 	# aux_math (PUBLIC displayxr::math_xrt) provides the canonical rig converters
 	# (dxr_view_rig_*) + dxr_view_math.h, used by the qwerty V-toggle to switch
@@ -41,6 +47,9 @@ if(XRT_BUILD_DRIVER_QWERTY)
 	endif()
 	if(APPLE)
 		target_link_libraries(drv_qwerty PRIVATE "-framework Cocoa" "-framework Carbon")
+	endif()
+	if(XRT_HAVE_LINUX AND NOT ANDROID AND X11_FOUND)
+		target_link_libraries(drv_qwerty PRIVATE X11::X11)
 	endif()
 	list(APPEND ENABLED_DRIVERS qwerty)
 
@@ -211,6 +220,13 @@ if(ANDROID OR XRT_HAVE_LINUX)
 		# Non-Android desktop GL build: the GL DP is compiled in, so it needs
 		# aux_ogl. (Headless Linux without GL skips this, matching the static lib.)
 		target_link_libraries(drv_sim_display_plugin PRIVATE aux_ogl)
+		if(NOT APPLE AND X11_FOUND AND OpenGL_GLX_FOUND)
+			# This plug-in .so carries its OWN GLAD dispatch table (aux_ogl is an
+			# INTERFACE lib compiled into every consumer) and is dlopen'd RTLD_LOCAL,
+			# so the runtime's gladLoad can't reach it — the GL DP self-loads GLAD
+			# via glXGetProcAddressARB, which needs GLX at link. (#660, Phase 1b-GL)
+			target_link_libraries(drv_sim_display_plugin PRIVATE OpenGL::GLX)
+		endif()
 	endif()
 else()
 	target_compile_definitions(drv_sim_display_plugin PRIVATE XRT_USING_RUNTIME_DLL)

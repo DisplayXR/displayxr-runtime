@@ -44,7 +44,14 @@ if(XRT_HAVE_OPENGLES)
 	set(XR_USE_GRAPHICS_API_OPENGL_ES ON)
 endif()
 
-if(XRT_HAVE_OPENGL_GLX AND XRT_HAVE_XLIB)
+if((XRT_HAVE_OPENGL_GLX AND XRT_HAVE_XLIB)
+   OR (XRT_HAVE_LINUX AND NOT ANDROID AND X11_FOUND AND OpenGL_GLX_FOUND))
+	# Desktop-Linux native GL compositor uses the Xlib/GLX graphics binding
+	# (XrGraphicsBindingOpenGLXlibKHR). Enabled even though the legacy GLX client
+	# path (XRT_HAVE_OPENGL_GLX) stays removed. See docs/roadmap/linux-support.md.
+	# NOTE: left unconditional (not gated on XRT_FEATURE_GL_LINUX_SOFTWARE) so the
+	# default Vulkan/XCB build's XR_EXT_xlib_window_binding path is unaffected; the
+	# GL compositor is gated separately via comp_gl + XRT_HAVE_GL_NATIVE_COMPOSITOR.
 	set(XR_USE_PLATFORM_XLIB ON)
 endif()
 

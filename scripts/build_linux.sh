@@ -48,11 +48,18 @@ BUILD_DIR="$ROOT/build"
 SERVICE_MODE=OFF
 RUN_TEST=ON
 BUILD_APPS=OFF
+# Opt-in software-GL (GLX/llvmpipe) present path. Default OFF → the default Linux
+# build is Vulkan/XCB (production, needs a GPU). --gl switches to the GL path
+# (comp_gl on Linux + Xlib GL binding), which runs on software GL for no-GPU
+# CI/headless/WSL. See XRT_FEATURE_GL_LINUX_SOFTWARE in the top-level CMakeLists.
+GL_SOFTWARE=OFF
 for arg in "$@"; do
   case "$arg" in
     --service) SERVICE_MODE=ON ;;
     --no-test) RUN_TEST=OFF ;;
     --apps) BUILD_APPS=ON ;;
+    --gl) GL_SOFTWARE=ON ;;
+    --no-gl) GL_SOFTWARE=OFF ;;
     *) echo "Unknown arg: $arg" >&2; exit 2 ;;
   esac
 done
@@ -68,6 +75,7 @@ OPENXR_VERSION="1.1.43"
 echo "=== Configuring DisplayXR runtime (Linux, SERVICE=$SERVICE_MODE) ==="
 cmake -B "$BUILD_DIR" -S "$ROOT" -G Ninja \
   -DCMAKE_BUILD_TYPE=Debug \
+  -DXRT_FEATURE_GL_LINUX_SOFTWARE=$GL_SOFTWARE \
   -DXRT_FEATURE_SERVICE=$SERVICE_MODE \
   -DXRT_MODULE_CLI=ON \
   -DXRT_BUILD_DRIVER_QWERTY=OFF \
@@ -225,4 +233,46 @@ EOF
     echo "Built $APP. Run on a Linux box with a GPU + display:"
     echo "  $RUN"
   done
+
+  # Software-GL test apps — only under the opt-in GL path (--gl). The VK apps
+  # above always build; these are skipped otherwise since comp_gl + the Xlib GL
+  # binding aren't compiled into the runtime unless XRT_FEATURE_GL_LINUX_SOFTWARE.
+  # The GL compositor shares the app's GL context (no external-memory FD interop)
+  # so it presents on SOFTWARE GL (llvmpipe) — the run scripts default
+  # LIBGL_ALWAYS_SOFTWARE=1 (unset it for a real GPU).
+  if [ "$GL_SOFTWARE" = "ON" ]; then
+    for GLAPP in cube_hosted_legacy_gl_linux cube_handle_gl_linux; do
+      GLAPP_DIR="$ROOT/test_apps/$GLAPP"
+      if [ ! -d "$GLAPP_DIR" ]; then
+        GLAPP_DIR="$(find "$ROOT/test_apps" -type d -name "$GLAPP" | head -1)"
+      fi
+      if [ -z "$GLAPP_DIR" ] || [ ! -f "$GLAPP_DIR/CMakeLists.txt" ]; then
+        echo "ERROR: GL test app '$GLAPP' not found under $ROOT/test_apps" >&2; exit 1
+      fi
+      echo "=== Building $GLAPP (src: $GLAPP_DIR) ==="
+      cmake -B "$GLAPP_DIR/build" -S "$GLAPP_DIR" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Debug \
+        -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
+      cmake --build "$GLAPP_DIR/build"
+
+      GLRUN="$BUILD_DIR/run_${GLAPP}.sh"
+      cat > "$GLRUN" <<EOF
+#!/bin/bash
+# Run $GLAPP against the dev runtime build (software-GL path). Needs a running X
+# server (DISPLAY set). LIBGL_ALWAYS_SOFTWARE=1 forces llvmpipe (unset for a GPU).
+# OXR_ENABLE_GL_NATIVE_COMPOSITOR=1 selects the native GL compositor path.
+export XR_RUNTIME_JSON="$BUILD_DIR/openxr_displayxr-dev.json"
+export LD_LIBRARY_PATH="$OPENXR_DIR/lib:\${LD_LIBRARY_PATH:-}"
+export XRT_PLUGIN_SEARCH_PATH="$PLUGIN_DIR"
+export OXR_ENABLE_GL_NATIVE_COMPOSITOR="\${OXR_ENABLE_GL_NATIVE_COMPOSITOR:-1}"
+export LIBGL_ALWAYS_SOFTWARE="\${LIBGL_ALWAYS_SOFTWARE:-1}"
+export SIM_DISPLAY_OUTPUT="\${SIM_DISPLAY_OUTPUT:-anaglyph}"
+exec "$GLAPP_DIR/build/$GLAPP" "\$@"
+EOF
+      chmod +x "$GLRUN"
+      echo ""
+      echo "Built $GLAPP. Run on a Linux box with an X server (software GL OK):"
+      echo "  $GLRUN"
+    done
+  fi
 fi
