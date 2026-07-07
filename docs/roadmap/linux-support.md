@@ -266,15 +266,23 @@ It builds the runtime (`build_linux.sh --apps`), wires `XR_RUNTIME_JSON` +
 script. Service/IPC (Phase 2b): `./scripts/build_linux.sh --service`, start
 `displayxr-service`, run a client with `XRT_FORCE_MODE=ipc`.
 
-### Phase 4 — Packaging / installer (follow-up, blocked on 1b–3b)
+### Phase 4 — Packaging / installer (#705 — tarball MVP SHIPPED)
 
-Linux is dev-scripts-only today (Windows has NSIS, macOS a `.pkg`). Once on-screen
-is proven, package the runtime + sim-display so users install without building:
-register the OpenXR `ActiveRuntime` (XDG `~/.config/openxr/1/active_runtime.json`
-or `/etc/xdg/openxr/1/`), drop the plug-in + JSON into a DisplayProcessors root
-(`/usr/share/displayxr/DisplayProcessors` or XDG data), + a systemd user unit for
-the service. Staged: **tarball + `install.sh` (MVP)** → `.deb` → demo AppImages.
-Full scope: #705.
+The MVP stage landed: `scripts/package_linux.sh` produces
+`dist/displayxr-runtime-linux-<arch>-<version>.tar.gz` (runtime `.so` +
+`displayxr-cli` + `displayxr-service` + sim-display plug-in + install scripts),
+and its `install.sh` (from `scripts/linux/`) does a **user-level, no-root**
+install: runtime tree → `$XDG_DATA_HOME/displayxr`, OpenXR `ActiveRuntime` →
+`$XDG_CONFIG_HOME/openxr/1/active_runtime.json`, plug-in + manifest →
+`$XDG_DATA_HOME/DisplayXR/DisplayProcessors/` (the shared discovery root — a
+vendor plug-in installer drops its own `.so` + manifest alongside, lower
+probe-order wins), and a systemd `--user` unit for `displayxr-service`
+(gracefully skipped without a user bus). `sudo ./install.sh --system` targets
+`/usr/local` + `/etc/xdg/openxr/1/` (no unit, v1). CI's `Package` job
+(`build-linux.yml`) builds in the **26.04 container**, installs from the
+tarball, and gates on `displayxr-cli selftest` resolving everything from the
+installed XDG paths only. Remaining staged scope (#705): `.deb` → demo
+AppImages.
 
 ## Decisions
 
