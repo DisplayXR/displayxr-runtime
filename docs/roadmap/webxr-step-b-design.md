@@ -872,3 +872,47 @@ Substitute` substitution path.
 - 2-view geometry (B3d) is unaffected — once eyes flow from a firing weave, the
   existing `UpdateInline3DViews` path activates; B4c look-around then becomes
   testable.
+
+### 13.4 B4b — implemented + eyeball PASSED (2026-07-07)
+
+The §13.3 CEF sub-rect model is **built and validated end-to-end in real `chrome`**
+(branch `displayxr-inline-3d`, commits `33a7971ff5fa8` + cleanup `14efab4d45aaa`).
+Per-element weave fires: the bordered canvas is glasses-free 3D while the 2D chrome
+stays flat — the boundary `content_shell` (page-flatten) could not reach.
+
+**As-built vs §13.3.** Rect transport is exactly as designed:
+`XRDisplayLayer` → `XRSession::ReportInline3DRects` (getBoundingClientRect × DSF) →
+`FrameWidget::SetInline3DRects` → `LayerTreeHost` commit-state →
+`CompositorFrameMetadata::inline_3d_rects` (new field + `array<gfx.mojom.Rect>` mojom +
+traits) → `SurfaceAggregator` → `AggregatedFrame` → `Display::DrawAndSwap` →
+`SkiaOutputSurface::SetInline3DRects` → GPU-thread `MaybeWeaveOutput`. The B3a
+`weave_target` cc/quads.mojom tag + the `DrawTextureQuad` substitution were **removed**.
+The **readback** differs from the §13.3 "output-target sub-rect copy": Graphite is
+async-only for readback and a GPU-created SharedImage came back as a `CompoundImageBacking`
+(no `ProduceOverlay`), so the GPU loop does `SkSurface::readPixels` on the composited
+output sub-rect and hands the CPU BGRA to a new `DisplayXRWeaveProvider::WeavePixels`
+(CPU pixels → intermediate DEFAULT texture → `CopyResource` into the keyed-mutex input —
+`UpdateSubresource` directly into the shared texture invalidates its NT handle). The
+woven texture is drawn back with a Skia `drawImageRect`, holding the read accesses alive
+across the flush+submit.
+
+**Blink gates that had to open for inline-3d to animate** (a sensorless inline session
+has no XRWebGLLayer base layer): treat a registered `XRDisplayLayer` as a valid render
+state (`MaybeRequestFrame`), bypass the focus gate (`XRFrameProvider::ProcessScheduledFrame`
+— a glasses-free display must weave unfocused, and gating it stalls the loop headless), and
+add a minimal inline-3d `OnFrame` path (callbacks + rect report, no layer/transport submit).
+
+**Validation-only launch flags — each a follow-up, NOT the design:**
+`--force_high_performance_gpu` (this is a dual-GPU laptop; the service uses the NVIDIA
+adapter and cross-adapter NT-handle sharing fails E_INVALIDARG on the Intel iGPU — the
+final blocker); `--disable-features=TreesInViz` (chrome's default forwards the frame to Viz
+via `LayerContext::UpdateDisplayTreeFrom`, which carries only `tracked_element_rects` —
+follow-up: plumb `inline_3d_rects` through LayerContext); `--disable-features=SkiaGraphite`
+(CPU readback needs Ganesh synchronous `readPixels` — follow-up: Graphite async readback /
+zero-copy D3D texture).
+
+**Note on the DP, not the patch:** dumping the input (perfect SBS) and the woven output
+(mono left-view) showed the Leia DP was in **2D mode** (`SR D3D11 display mode switched to
+2D`) at that moment — 2D↔3D is tracking-driven, so it interlaces to real 3D only when a
+face is tracked. Interlacing is the DP's job; the Chromium patch delivers the correct SBS
+and composites the woven result regardless.
