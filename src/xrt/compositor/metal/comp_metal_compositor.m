@@ -2663,7 +2663,23 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	} else {
 		drawable = [c->metal_layer nextDrawable];
 		if (drawable == nil) {
+			// One-shot diagnostic (displayxr-unity#204 bring-up): a permanently
+			// nil drawable means presents never reach the WindowServer.
+			static int s_nil_logged = 0;
+			if (!s_nil_logged) {
+				s_nil_logged = 1;
+				U_LOG_W("layer_commit: nextDrawable nil (layer=%p device=%p size=%.0fx%.0f window=%p onscreen=%d)",
+				        (void *)c->metal_layer, (void *)c->metal_layer.device,
+				        c->metal_layer.drawableSize.width, c->metal_layer.drawableSize.height,
+				        (void *)c->view.window, c->view.window != nil ? (int)[c->view.window isVisible] : -1);
+			}
 			return XRT_SUCCESS; // Non-fatal, skip this frame
+		}
+		static int s_first_drawable_logged = 0;
+		if (!s_first_drawable_logged) {
+			s_first_drawable_logged = 1;
+			U_LOG_W("layer_commit: first drawable OK (size=%.0fx%.0f)",
+			        c->metal_layer.drawableSize.width, c->metal_layer.drawableSize.height);
 		}
 		output_texture = drawable.texture;
 	}
