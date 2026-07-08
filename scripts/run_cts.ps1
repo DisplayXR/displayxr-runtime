@@ -64,7 +64,38 @@ Write-Output "SNAPSHOT $Plugin ProbeOrder = $origProbe"
 # Both CTS layers: the runtime-conformance validation layer (requested via -L)
 # and the conformance_test_layer (== conformance_test.dll; validApiLayer requests
 # it itself). Register both as Explicit so the elevated loader can find them.
-$layerJsons  = @("$base\XrApiLayer_runtime_conformance.json", "$base\XrApiLayer_conformance_test_layer.json")
+#
+# Discover each manifest instead of hardcoding a path: openxr-cts-1.1.44+ moved
+# the layer JSON copy from conformance_cli's binary dir to each layer's own
+# TARGET_FILE_DIR (Khronos MR 3576-era CMake change) — the old
+# .../conformance_cli/XrApiLayer_*.json paths no longer exist, so the loader
+# reported "failed to find layer" -> XR_ERROR_API_LAYER_NOT_PRESENT (#726). The
+# manifest's library_path is "./<dll>" (same-dir relative), so we must register
+# the copy that sits next to the built DLL; pick the one whose sibling DLL exists.
+$ctsBuild = "$wt\build-cts\build"
+function Resolve-LayerManifest {
+  param([string]$JsonName, [string]$DllName)
+  $hits = @(Get-ChildItem -Path $ctsBuild -Recurse -Filter $JsonName -File -ErrorAction SilentlyContinue)
+  foreach ($h in $hits) {
+    if (Test-Path (Join-Path $h.DirectoryName $DllName)) { return $h.FullName }
+  }
+  # Fall back to the first hit (prefer a RelWithDebInfo copy) even if we can't
+  # confirm the sibling DLL, so failures surface as a loader error not a silent skip.
+  $rel = $hits | Where-Object { $_.FullName -match 'RelWithDebInfo' } | Select-Object -First 1
+  if ($rel) { return $rel.FullName }
+  if ($hits.Count) { return $hits[0].FullName }
+  return $null
+}
+$layerJsons = @()
+if ($ConformanceLayer) {
+  $runtimeConf = Resolve-LayerManifest 'XrApiLayer_runtime_conformance.json' 'XrApiLayer_runtime_conformance.dll'
+  $testLayer   = Resolve-LayerManifest 'XrApiLayer_conformance_test_layer.json' 'conformance_test.dll'
+  foreach ($m in @($runtimeConf, $testLayer)) { if ($m) { $layerJsons += $m } }
+  if (-not $runtimeConf) { throw "could not locate XrApiLayer_runtime_conformance.json under $ctsBuild" }
+  if (-not $testLayer)   { throw "could not locate XrApiLayer_conformance_test_layer.json under $ctsBuild" }
+  Write-Output "RESOLVED runtime-conformance layer manifest: $runtimeConf"
+  Write-Output "RESOLVED conformance-test layer manifest:    $testLayer"
+}
 $explicitKey  = "$xrKey\ApiLayers\Explicit"
 $explicitKeyPreexisted = Test-Path $explicitKey
 $preRegistered = @{}
@@ -101,8 +132,13 @@ try {
   # doesn't repeatedly take over the display.
   $env:XRT_COMPOSITOR_START_WINDOWED = "true"
 
+  # OpenXR-CTS renamed the API-version CLI arg `--apiVersion` -> `--minApiVersion`
+  # in openxr-cts-1.1.44+ (Khronos CHANGELOG.CTS.md, internal MR 3576). Under
+  # 1.1.51 the old spelling is rejected as an "Unrecognised token" and
+  # conformance_cli exits (code 2) before running a single test — no result XML,
+  # which surfaced as the bogus "crashed before writing results" in #726.
   $cliArgs = @(
-    $TestSpec, "-G", $Graphics, "--apiVersion", $ApiVersion,
+    $TestSpec, "-G", $Graphics, "--minApiVersion", $ApiVersion,
     "--reporter", "ctsxml::out=$xml",
     "--reporter", "console::out=$console"
   )
