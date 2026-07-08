@@ -903,13 +903,31 @@ state (`MaybeRequestFrame`), bypass the focus gate (`XRFrameProvider::ProcessSch
 add a minimal inline-3d `OnFrame` path (callbacks + rect report, no layer/transport submit).
 
 **Validation-only launch flags — each a follow-up, NOT the design:**
-`--force_high_performance_gpu` (this is a dual-GPU laptop; the service uses the NVIDIA
-adapter and cross-adapter NT-handle sharing fails E_INVALIDARG on the Intel iGPU — the
-final blocker); `--disable-features=TreesInViz` (chrome's default forwards the frame to Viz
+`--disable-features=TreesInViz` (chrome's default forwards the frame to Viz
 via `LayerContext::UpdateDisplayTreeFrom`, which carries only `tracked_element_rects` —
 follow-up: plumb `inline_3d_rects` through LayerContext); `--disable-features=SkiaGraphite`
 (CPU readback needs Ganesh synchronous `readPixels` — follow-up: Graphite async readback /
 zero-copy D3D texture).
+
+**`--force_high_performance_gpu` RETIRED (2026-07-07) — blocker #5 resolved.** This is a
+dual-GPU laptop: the service creates the NT-shared keyed-mutex weave input on the runtime's
+adapter (the high-performance NVIDIA RTX 3080, LUID `…0001b9d9`, selected by
+`xrGetD3D11GraphicsRequirementsKHR`), while chrome's GPU process defaulted to the Intel iGPU
+— so the service's `OpenSharedResource(NT)` on that handle failed cross-adapter
+(`E_INVALIDARG` / `0x80070057`). The manual `--force_high_performance_gpu` aligned them.
+That is now **automatic under `--enable-inline-3d`**: the existing DisplayXR block in
+`ContentBrowserClient::AppendExtraCommandLineSwitches`
+(`chrome_content_browser_client.cc` + `shell_content_browser_client.cc`) appends the
+`FORCE_HIGH_PERFORMANCE_GPU` driver-bug workaround switch
+(`gpu::GpuDriverBugWorkaroundTypeToString(gpu::FORCE_HIGH_PERFORMANCE_GPU)`) to the
+**gpu-process** child command line — provably equivalent to the flag (the underscore
+`--force_high_performance_gpu` is that workaround name copied through by
+`gpu_process_host.cc`; both converge on `FORCE_HIGH_PERFORMANCE_GPU` → ANGLE `EGL_HIGH_POWER`
+/ Dawn `HighPerformance` adapter selection). **Verified:** with the flag removed, the GPU
+weave device's adapter LUID logged `…0001b9d9` (== runtime) and the weave fired
+(`leia_dp_d3d11_process_atlas weave: vp=(374,920 1810x1054)`) with zero `0x80070057`. The
+LUID-exact `--use-adapter-luid` path is an unneeded generalization — the runtime always
+prefers the high-performance adapter, so forcing high-performance matches it by construction.
 
 **Note on the DP, not the patch:** dumping the input (perfect SBS) and the woven output
 (mono left-view) showed the Leia DP was in **2D mode** (`SR D3D11 display mode switched to
