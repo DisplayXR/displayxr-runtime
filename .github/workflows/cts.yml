@@ -112,7 +112,7 @@ jobs:
 
       - name: Install OpenXR loader
         run: |
-          $openxrVersion = "1.1.51"
+          $openxrVersion = "1.1.43"
           $openxrUrl = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$openxrVersion/openxr_loader_windows-$openxrVersion.zip"
           Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
           Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
@@ -172,7 +172,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: build-cts
-          key: cts-${{ runner.os }}-${{ hashFiles('scripts/fetch_build_cts.bat') }}-1.1.51
+          key: cts-${{ runner.os }}-${{ hashFiles('scripts/fetch_build_cts.bat') }}-1.1.43
 
       - name: Build CTS
         if: steps.cts-cache.outputs.cache-hit != 'true'
