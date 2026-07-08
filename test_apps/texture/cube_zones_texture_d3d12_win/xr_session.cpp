@@ -20,6 +20,13 @@ ZoneMaskHarness g_zone;
 bool g_hasDisplayZonesExt = false;
 DisplayZonesHarness g_zones;
 
+// INV-1.3 (#715): 3D panel top-left in virtual-desktop pixels (top-down,
+// origin = primary top-left); (0,0) = primary/unknown. Filled from the
+// XrDisplayDesktopPositionEXT chain in InitializeOpenXR; app-local because the
+// shared XrSessionManager (displayxr-common) doesn't carry this field yet.
+int32_t g_displayScreenLeft = 0;
+int32_t g_displayScreenTop = 0;
+
 // Helper macro for XR error checking with logging
 #define XR_CHECK(call) \
     do { \
@@ -214,7 +221,13 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
         XrDisplayInfoEXT displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
         XrEyeTrackingModeCapabilitiesEXT eyeCaps = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT};
+        // INV-1.3: panel desktop position, so the app window can be moved onto
+        // the 3D panel instead of the primary monitor (spec v16, #715).
+        // Chained at the tail of the existing chain.
+        XrDisplayDesktopPositionEXT desktopPos = {};
+        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT;
         displayInfo.next = &eyeCaps;
+        eyeCaps.next = &desktopPos;
         sysProps.next = &displayInfo;
         XrResult diResult = xrGetSystemProperties(xr.instance, xr.systemId, &sysProps);
         if (XR_SUCCEEDED(diResult)) {
@@ -229,6 +242,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
             xr.displayPixelHeight = displayInfo.displayPixelHeight;
             xr.supportedEyeTrackingModes = (uint32_t)eyeCaps.supportedModes;
             xr.defaultEyeTrackingMode = (uint32_t)eyeCaps.defaultMode;
+            g_displayScreenLeft = desktopPos.left;
+            g_displayScreenTop = desktopPos.top;
+            LOG_INFO("Display desktop position: (%d, %d)", g_displayScreenLeft, g_displayScreenTop);
             LOG_INFO("Display info: scale=%.3fx%.3f, size=%.3fx%.3fm, pixels=%ux%u, nominal=(%.0f,%.0f,%.0f)mm",
                 xr.recommendedViewScaleX, xr.recommendedViewScaleY,
                 xr.displayWidthM, xr.displayHeightM,

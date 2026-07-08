@@ -1069,7 +1069,7 @@ static void SignalHandler(int)
 static AppDelegate *g_appDelegate = nil;
 static AppWindowDelegate *g_windowDelegate = nil;
 
-static bool CreateMacOSWindow(uint32_t width, uint32_t height)
+static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLeft, int32_t screenTop)
 {
     @autoreleasepool {
         [NSApplication sharedApplication];
@@ -1078,7 +1078,17 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height)
         g_appDelegate = [[AppDelegate alloc] init];
         [NSApp setDelegate:g_appDelegate];
 
+        // INV-1.3: open on the 3D panel (#715). (screenLeft, screenTop) is the
+        // panel top-left in top-down global coordinates (origin = primary
+        // top-left, XrDisplayDesktopPositionEXT); flip into AppKit's bottom-up
+        // space. (0,0) = primary — the titled window is auto-constrained below
+        // the menu bar, so it is always a safe create position.
         NSRect frame = NSMakeRect(100, 100, width, height);
+        NSScreen *primary = [NSScreen screens].firstObject;
+        if (primary != nil) {
+            CGFloat topY = primary.frame.size.height - (CGFloat)screenTop;
+            frame = NSMakeRect((CGFloat)screenLeft, topY - (CGFloat)height, width, height);
+        }
         NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                            NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
 
@@ -1347,6 +1357,9 @@ struct AppXrSession {
     float nominalViewerX, nominalViewerY, nominalViewerZ;
     uint32_t displayPixelWidth, displayPixelHeight;
     float recommendedViewScaleX, recommendedViewScaleY;
+    // v16 XrDisplayDesktopPositionEXT — 3D panel top-left in virtual-desktop
+    // pixels (top-down, origin = primary top-left); (0,0) = primary/unknown.
+    int32_t displayScreenLeft, displayScreenTop;
     PFN_xrRequestDisplayModeEXT pfnRequestDisplayModeEXT;
     PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingModeEXT;
     PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT;
@@ -1492,8 +1505,13 @@ static bool InitializeOpenXR(AppXrSession &app)
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
         XrDisplayInfoEXT displayInfo = {};
         displayInfo.type = XR_TYPE_DISPLAY_INFO_EXT;
+        // INV-1.3: panel desktop position, so the window below opens on the
+        // 3D panel instead of the primary monitor (spec v16, #715).
+        XrDisplayDesktopPositionEXT desktopPos = {};
+        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT;
         if (app.hasDisplayInfoExt) {
             sysProps.next = &displayInfo;
+            displayInfo.next = &desktopPos;
         }
         if (XR_SUCCEEDED(xrGetSystemProperties(app.instance, app.systemId, &sysProps))) {
             memcpy(app.systemName, sysProps.systemName, sizeof(app.systemName));
@@ -1508,6 +1526,9 @@ static bool InitializeOpenXR(AppXrSession &app)
                 app.displayPixelHeight = displayInfo.displayPixelHeight;
                 app.recommendedViewScaleX = displayInfo.recommendedViewScaleX;
                 app.recommendedViewScaleY = displayInfo.recommendedViewScaleY;
+                app.displayScreenLeft = desktopPos.left;
+                app.displayScreenTop = desktopPos.top;
+                LOG_INFO("Display desktop position: (%d, %d)", app.displayScreenLeft, app.displayScreenTop);
                 LOG_INFO("Display pixels: %ux%u", app.displayPixelWidth, app.displayPixelHeight);
                 LOG_INFO("Display info: %.3fx%.3f m, scale=%.2fx%.2f, nominal=(%.3f,%.3f,%.3f)",
                     app.displayWidthM, app.displayHeightM,
@@ -2711,16 +2732,19 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // Create the macOS window (app-owned)
-    if (!CreateMacOSWindow(1512, 823)) {
-        LOG_ERROR("Failed to create macOS window");
-        return 1;
-    }
-
-    // Initialize OpenXR
+    // Initialize OpenXR FIRST — xrGetSystemProperties needs only instance +
+    // system id, and returns the panel desktop position the window below is
+    // created at (INV-1.3 ordering: instance → system → properties → window
+    // → session).
     AppXrSession app = {};
     if (!InitializeOpenXR(app)) {
         LOG_ERROR("Failed to initialize OpenXR");
+        return 1;
+    }
+
+    // Create the macOS window (app-owned) on the 3D panel
+    if (!CreateMacOSWindow(1512, 823, app.displayScreenLeft, app.displayScreenTop)) {
+        LOG_ERROR("Failed to create macOS window");
         return 1;
     }
 

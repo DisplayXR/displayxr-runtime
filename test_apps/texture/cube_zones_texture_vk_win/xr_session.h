@@ -40,6 +40,12 @@
 #include <string>
 #include <vector>
 
+// INV-1.3 (#715): 3D panel top-left in virtual-desktop pixels (top-down,
+// origin = primary top-left); (0,0) = primary/unknown. Filled by
+// InitializeOpenXR from the XrDisplayDesktopPositionEXT chain (spec v16).
+extern int32_t g_displayScreenLeft;
+extern int32_t g_displayScreenTop;
+
 // XR_EXT_view_rig available + enabled on the instance.
 extern bool g_hasViewRigExt;
 

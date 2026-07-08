@@ -9,8 +9,11 @@
  * and passes it to the runtime via XR_EXT_xlib_window_binding — the Phase 3
  * validation vehicle for app-provided windows on desktop Linux
  * (docs/roadmap/linux-support.md, #660). Adapted from
- * cube_hosted_legacy_vk_linux; the render path (fixed SBS, no
- * XR_EXT_display_info) is unchanged — the delta is the window + binding.
+ * cube_hosted_legacy_vk_linux; the render path (fixed 2-view SBS, no mode
+ * adaptation) is unchanged — the delta is the window + binding.
+ * XR_EXT_display_info is enabled (when present) solely for the INV-1.3 panel
+ * desktop-position query (#715), which also moves view sizing off the
+ * legacy-compromise path.
  *
  * The app owns the X event loop (pumped once per frame) and the window
  * lifecycle; the runtime derives its XCB connection from the app's Display
@@ -18,6 +21,7 @@
  */
 
 #include <X11/Xlib.h> // before the extension header so it sees real Xlib types
+#include <X11/Xutil.h> // XSizeHints for INV-1.3 window placement
 
 #include <vulkan/vulkan.h>
 
@@ -25,6 +29,7 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_EXT_xlib_window_binding.h>
+#include <openxr/XR_EXT_display_info.h>
 
 #include <cmath>
 #include <csignal>
@@ -83,21 +88,37 @@ static Display* g_xDisplay = nullptr;
 static ::Window g_xWindow = 0;
 static Atom g_wmDeleteWindow = 0;
 
-static bool CreateAppWindow(uint32_t width, uint32_t height) {
+static bool CreateAppWindow(uint32_t width, uint32_t height, int32_t screenLeft, int32_t screenTop) {
     g_xDisplay = XOpenDisplay(nullptr);
     if (g_xDisplay == nullptr) {
         LOG_ERROR("XOpenDisplay failed — is DISPLAY set?");
         return false;
     }
 
+    // INV-1.3: open on the 3D panel (#715). (screenLeft, screenTop) is the
+    // panel top-left in virtual-desktop pixels (top-down, origin = primary
+    // top-left, XrDisplayDesktopPositionEXT); (0,0) = primary/unknown is a
+    // safe create position either way.
     int screen = DefaultScreen(g_xDisplay);
     g_xWindow = XCreateSimpleWindow(
         g_xDisplay, RootWindow(g_xDisplay, screen),
-        0, 0, width, height, 0,
+        screenLeft, screenTop, width, height, 0,
         BlackPixel(g_xDisplay, screen), BlackPixel(g_xDisplay, screen));
     if (g_xWindow == 0) {
         LOG_ERROR("XCreateSimpleWindow failed");
         return false;
+    }
+
+    // WM_NORMAL_HINTS with USPosition|PPosition, so the window manager treats
+    // the create-time position as intentional instead of auto-placing the
+    // window (ICCCM §4.1.2.3; GNOME/Mutter auto-places without this). Mirrors
+    // the runtime's own hosted-window placement (comp_vk_native_window_xcb.c).
+    {
+        XSizeHints hints = {};
+        hints.flags = USPosition | PPosition;
+        hints.x = screenLeft;
+        hints.y = screenTop;
+        XSetWMNormalHints(g_xDisplay, g_xWindow, &hints);
     }
 
     XStoreName(g_xDisplay, g_xWindow, "Cube Handle VK (DisplayXR)");
@@ -110,7 +131,14 @@ static bool CreateAppWindow(uint32_t width, uint32_t height) {
     XMapWindow(g_xDisplay, g_xWindow);
     XFlush(g_xDisplay);
 
-    LOG_INFO("Created app-owned X11 window 0x%lx (%ux%u)", g_xWindow, width, height);
+    // Re-assert the position after mapping — many WMs (Mutter included)
+    // ignore the create-time x/y of a freshly mapped toplevel, but honor a
+    // post-map ConfigureRequest (this is what `xdotool windowmove` sends).
+    XMoveWindow(g_xDisplay, g_xWindow, screenLeft, screenTop);
+    XFlush(g_xDisplay);
+
+    LOG_INFO("Created app-owned X11 window 0x%lx (%ux%u) at (%d, %d)",
+             g_xWindow, width, height, screenLeft, screenTop);
     return true;
 }
 
@@ -1775,6 +1803,11 @@ struct AppXrSession {
     // Per-view dimensions from recommendedImageRectWidth/Height (set once at init)
     uint32_t viewWidth = 0;
     uint32_t viewHeight = 0;
+
+    // v16 XrDisplayDesktopPositionEXT — 3D panel top-left in virtual-desktop
+    // pixels (top-down, origin = primary top-left); (0,0) = primary/unknown.
+    int32_t displayScreenLeft = 0;
+    int32_t displayScreenTop = 0;
 };
 
 static bool InitializeOpenXR(AppXrSession& xr) {
@@ -1788,12 +1821,16 @@ static bool InitializeOpenXR(AppXrSession& xr) {
 
     bool hasVulkan = false;
     bool hasXlibBinding = false;
+    bool hasDisplayInfo = false;
     for (const auto& ext : extensions) {
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) {
             hasVulkan = true;
         }
         if (strcmp(ext.extensionName, XR_EXT_XLIB_WINDOW_BINDING_EXTENSION_NAME) == 0) {
             hasXlibBinding = true;
+        }
+        if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) {
+            hasDisplayInfo = true;
         }
     }
 
@@ -1816,6 +1853,15 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     std::vector<const char*> enabledExtensions;
     enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
     enabledExtensions.push_back(XR_EXT_XLIB_WINDOW_BINDING_EXTENSION_NAME);
+    if (hasDisplayInfo) {
+        // Enabled for the INV-1.3 panel desktop-position query below (#715).
+        // NOTE: enabling XR_EXT_display_info also switches the runtime's view
+        // sizing off the legacy-app compromise path — the app still renders a
+        // fixed 2-view SBS at whatever dimensions xrEnumerateViewConfigurationViews
+        // reports at init, and does not adapt to later mode changes.
+        enabledExtensions.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+        LOG_INFO("XR_EXT_display_info: AVAILABLE (enabled for panel position)");
+    }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(createInfo.applicationInfo.applicationName, "CubeHandleVkLinux",
@@ -1834,6 +1880,23 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     XrSystemGetInfo systemInfo = {XR_TYPE_SYSTEM_GET_INFO};
     systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     XR_CHECK(xrGetSystem(xr.instance, &systemInfo, &xr.systemId));
+
+    // INV-1.3: panel desktop position, so the window opens on the 3D panel
+    // instead of the primary monitor (spec v16, #715). The runtime fills the
+    // chained struct only when XR_EXT_display_info is enabled; the zero-init
+    // (0,0) = primary is the safe fallback either way.
+    if (hasDisplayInfo) {
+        XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
+        XrDisplayDesktopPositionEXT desktopPos = {};
+        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT;
+        sysProps.next = &desktopPos;
+        if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sysProps))) {
+            xr.displayScreenLeft = desktopPos.left;
+            xr.displayScreenTop = desktopPos.top;
+            LOG_INFO("Display desktop position: (%d, %d)",
+                     xr.displayScreenLeft, xr.displayScreenTop);
+        }
+    }
 
     uint32_t viewCount = 0;
     XR_CHECK(xrEnumerateViewConfigurationViews(xr.instance, xr.systemId, xr.viewConfigType, 0, &viewCount, nullptr));
@@ -2300,18 +2363,21 @@ int main() {
 
     LOG_INFO("=== Cube Handle VK Linux (XR_EXT_xlib_window_binding) ===");
 
-    // Create the app-owned X11 window first — it is passed to the runtime at
-    // xrCreateSession via XR_EXT_xlib_window_binding.
-    if (!CreateAppWindow(1600, 900)) {
-        LOG_ERROR("X11 window creation failed");
-        return 1;
-    }
-
-    // Initialize OpenXR
+    // Initialize OpenXR FIRST — xrGetSystemProperties needs only instance +
+    // system id, and returns the panel desktop position the window below is
+    // created at (INV-1.3 ordering: instance → system → properties → window
+    // → session).
     AppXrSession xr = {};
     if (!InitializeOpenXR(xr)) {
         LOG_ERROR("OpenXR initialization failed");
-        DestroyAppWindow();
+        return 1;
+    }
+
+    // Create the app-owned X11 window on the 3D panel — it is passed to the
+    // runtime at xrCreateSession via XR_EXT_xlib_window_binding.
+    if (!CreateAppWindow(1600, 900, xr.displayScreenLeft, xr.displayScreenTop)) {
+        LOG_ERROR("X11 window creation failed");
+        CleanupOpenXR(xr);
         return 1;
     }
 
