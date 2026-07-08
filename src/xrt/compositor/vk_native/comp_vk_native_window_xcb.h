@@ -99,6 +99,18 @@ comp_vk_native_window_xcb_query_geometry(const struct comp_vk_native_xcb_handle 
  *                               via xsysc->info.display_screen_left. (0, 0)
  *                               means primary monitor (Windows convention,
  *                               comp_d3d11_window.cpp). #715.
+ *
+ *                               These coordinates now also resolve the target
+ *                               RandR MONITOR (the monitor whose origin matches,
+ *                               else the one containing the point), and the
+ *                               window is fullscreened onto it via EWMH
+ *                               _NET_WM_FULLSCREEN_MONITORS. That is the
+ *                               WM-cooperative, size-independent placement path:
+ *                               mutter/GNOME discard the create-x/y +
+ *                               USPosition + ConfigureRequest for an oversized
+ *                               toplevel, so raw coordinates alone don't place
+ *                               the window (#715). Set DXR_WINDOW_FULLSCREEN=0
+ *                               to opt out and keep plain windowed placement.
  * @param screen_top             Window top edge in root-window pixels.
  * @param transparent_background Reserved; X11 ARGB-visual transparency is not
  *                               wired in Phase 1 (desktop WSI usually exposes
