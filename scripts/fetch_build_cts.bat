@@ -10,15 +10,17 @@ setlocal enabledelayedexpansion
 :: a developer/CI harness, not a runtime artifact.
 ::
 :: Usage: scripts\fetch_build_cts.bat
-::   Pin via CTS_TAG below. This tracks the last conformance rev the
-::   runtime passes clean (1.1.43.0) — it lags the *shipped* loader
-::   (1.1.51) on purpose: openxr-cts-1.1.51.0 crashes the runtime
-::   mid-run (runtime#726). Bump only once that's resolved.
+::   Pin via CTS_TAG below. Tracks the shipped loader (1.1.51, #724).
+::   NOTE: openxr-cts-1.1.44+ renamed the CLI arg --apiVersion ->
+::   --minApiVersion (Khronos MR 3576); run_cts.ps1 was updated to
+::   match (#726). The earlier "1.1.51 crashes the runtime mid-run"
+::   was a misdiagnosis — conformance_cli rejected the stale arg and
+::   exited before running any test (no result XML).
 :: Output: build-cts\build\...\conformance_cli.exe (path echoed at end).
 :: ============================================================
 
 set REPO=%~dp0..\
-set CTS_TAG=openxr-cts-1.1.43.0
+set CTS_TAG=openxr-cts-1.1.51.0
 set CTS_ROOT=%REPO%build-cts
 set CTS_SRC=%CTS_ROOT%\OpenXR-CTS
 set CTS_BUILD=%CTS_ROOT%\build
