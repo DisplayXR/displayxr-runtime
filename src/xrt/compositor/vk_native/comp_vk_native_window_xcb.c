@@ -16,6 +16,8 @@
 #include <string.h>
 
 #include <xcb/xcb.h>
+#include <xcb/randr.h>    // xcb_randr_get_monitors — resolve the target monitor
+                          // INDEX from the plug-in-reported panel position (#715).
 #include <X11/Xlib-xcb.h> // XGetXCBConnection (libX11-xcb) — Xlib→XCB bridge for
                           // app-provided windows (XR_EXT_xlib_window_binding).
 
@@ -44,6 +46,68 @@ intern_atom(xcb_connection_t *conn, const char *name)
 	xcb_atom_t atom = reply ? reply->atom : XCB_ATOM_NONE;
 	free(reply);
 	return atom;
+}
+
+/*!
+ * Resolve the RandR monitor INDEX that owns the panel position
+ * (@p screen_left, @p screen_top), for the _NET_WM_FULLSCREEN_MONITORS request.
+ *
+ * mutter (and other EWMH WMs) discard client-requested window geometry for an
+ * oversized toplevel, so #716's create-x/y + USPosition + ConfigureRequest are
+ * no-ops on GNOME/XWayland — the window lands on whichever monitor happens to
+ * fit it (#715, George's DS1 report). Targeting by monitor index instead is
+ * WM-cooperative and size-independent.
+ *
+ * Prefers a monitor whose origin exactly matches (left, top); falls back to the
+ * monitor CONTAINING the point (so a `DXR_WINDOW_POS` override still resolves to
+ * the right output). @p out_name_atom receives the monitor's RandR name atom for
+ * logging (XCB_ATOM_NONE if unavailable).
+ *
+ * @return the 0-based monitor index, or -1 if RandR is unavailable / no monitor
+ *         resolves (caller then skips fullscreen and keeps windowed placement).
+ */
+static int
+resolve_monitor_index(xcb_connection_t *conn,
+                      xcb_window_t root,
+                      int32_t screen_left,
+                      int32_t screen_top,
+                      xcb_atom_t *out_name_atom)
+{
+	if (out_name_atom != NULL) {
+		*out_name_atom = XCB_ATOM_NONE;
+	}
+
+	xcb_randr_get_monitors_cookie_t cookie = xcb_randr_get_monitors(conn, root, 1 /* active only */);
+	xcb_randr_get_monitors_reply_t *reply = xcb_randr_get_monitors_reply(conn, cookie, NULL);
+	if (reply == NULL) {
+		return -1; // RandR unavailable / too old.
+	}
+
+	int exact_idx = -1;
+	int contains_idx = -1;
+	xcb_atom_t exact_name = XCB_ATOM_NONE;
+	xcb_atom_t contains_name = XCB_ATOM_NONE;
+
+	xcb_randr_monitor_info_iterator_t it = xcb_randr_get_monitors_monitors_iterator(reply);
+	for (int idx = 0; it.rem; xcb_randr_monitor_info_next(&it), idx++) {
+		const xcb_randr_monitor_info_t *m = it.data;
+		if (exact_idx < 0 && m->x == (int16_t)screen_left && m->y == (int16_t)screen_top) {
+			exact_idx = idx;
+			exact_name = m->name;
+		}
+		if (contains_idx < 0 && screen_left >= m->x && screen_left < m->x + (int32_t)m->width &&
+		    screen_top >= m->y && screen_top < m->y + (int32_t)m->height) {
+			contains_idx = idx;
+			contains_name = m->name;
+		}
+	}
+	free(reply);
+
+	int chosen = exact_idx >= 0 ? exact_idx : contains_idx;
+	if (out_name_atom != NULL) {
+		*out_name_atom = exact_idx >= 0 ? exact_name : contains_name;
+	}
+	return chosen;
 }
 
 xrt_result_t
@@ -141,6 +205,32 @@ comp_vk_native_window_xcb_create(uint32_t width,
 		                    XCB_ATOM_ATOM, 32, 1, &win->atom_wm_delete_window);
 	}
 
+	// EWMH fullscreen-on-monitor: the WM-cooperative, size-independent way to
+	// place the weave surface on the 3D panel. mutter discards the create-x/y +
+	// USPosition + ConfigureRequest above for an oversized toplevel (#715,
+	// George's DS1 report), so target the panel's RandR monitor INDEX instead.
+	// DXR_WINDOW_FULLSCREEN=0 opts out (debugging on well-behaved WMs).
+	int fullscreen_monitor = -1;
+	xcb_atom_t monitor_name = XCB_ATOM_NONE;
+	const char *fs_env = getenv("DXR_WINDOW_FULLSCREEN");
+	const bool fullscreen_enabled = (fs_env == NULL) || (strcmp(fs_env, "0") != 0);
+	if (fullscreen_enabled) {
+		fullscreen_monitor = resolve_monitor_index(conn, screen->root, screen_left, screen_top, &monitor_name);
+		if (fullscreen_monitor < 0) {
+			U_LOG_W("XCB: no RandR monitor at (%d, %d) — skipping fullscreen, using windowed placement",
+			        (int)screen_left, (int)screen_top);
+		} else {
+			// Mark fullscreen BEFORE map so the WM manages it fullscreen from
+			// the start (EWMH _NET_WM_STATE, set as a property pre-map).
+			xcb_atom_t net_wm_state = intern_atom(conn, "_NET_WM_STATE");
+			xcb_atom_t net_wm_state_fullscreen = intern_atom(conn, "_NET_WM_STATE_FULLSCREEN");
+			if (net_wm_state != XCB_ATOM_NONE && net_wm_state_fullscreen != XCB_ATOM_NONE) {
+				xcb_change_property(conn, XCB_PROP_MODE_REPLACE, win->window, net_wm_state,
+				                    XCB_ATOM_ATOM, 32, 1, &net_wm_state_fullscreen);
+			}
+		}
+	}
+
 	xcb_map_window(conn, win->window);
 
 	// Re-assert the position after mapping — many WMs (Mutter included)
@@ -150,10 +240,56 @@ comp_vk_native_window_xcb_create(uint32_t width,
 		const uint32_t coords[2] = {(uint32_t)screen_left, (uint32_t)screen_top};
 		xcb_configure_window(conn, win->window, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, coords);
 	}
+
+	// _NET_WM_FULLSCREEN_MONITORS → root: pin the fullscreen window to the
+	// resolved monitor index. Single-monitor fullscreen ⇒ all four edges = the
+	// target index; data32[4]=1 is source "application" (EWMH). SUBSTRUCTURE_
+	// REDIRECT|NOTIFY is the mask the WM listens on for these root messages.
+	if (fullscreen_monitor >= 0) {
+		xcb_atom_t net_fs_monitors = intern_atom(conn, "_NET_WM_FULLSCREEN_MONITORS");
+		if (net_fs_monitors != XCB_ATOM_NONE) {
+			xcb_client_message_event_t ev = {0};
+			ev.response_type = XCB_CLIENT_MESSAGE;
+			ev.format = 32;
+			ev.window = win->window;
+			ev.type = net_fs_monitors;
+			ev.data.data32[0] = (uint32_t)fullscreen_monitor; // top
+			ev.data.data32[1] = (uint32_t)fullscreen_monitor; // bottom
+			ev.data.data32[2] = (uint32_t)fullscreen_monitor; // left
+			ev.data.data32[3] = (uint32_t)fullscreen_monitor; // right
+			ev.data.data32[4] = 1;                            // source: application
+			xcb_send_event(conn, 0, screen->root,
+			               XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT | XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,
+			               (const char *)&ev);
+		}
+	}
 	xcb_flush(conn);
 
-	U_LOG_I("XCB: created %ux%u window 0x%08x at (%d, %d)", width, height, (unsigned)win->window,
-	        (int)screen_left, (int)screen_top);
+	if (fullscreen_monitor >= 0) {
+		// Resolve the RandR monitor name for a human-readable breadcrumb; WARN
+		// so it's visible without XRT_LOG=info (parity with the plug-in's #92
+		// "RandR panel position overrides backend" line).
+		char name_buf[64] = "?";
+		if (monitor_name != XCB_ATOM_NONE) {
+			xcb_get_atom_name_reply_t *nr =
+			    xcb_get_atom_name_reply(conn, xcb_get_atom_name(conn, monitor_name), NULL);
+			if (nr != NULL) {
+				int n = xcb_get_atom_name_name_length(nr);
+				if (n > (int)sizeof(name_buf) - 1) {
+					n = (int)sizeof(name_buf) - 1;
+				}
+				memcpy(name_buf, xcb_get_atom_name_name(nr), (size_t)n);
+				name_buf[n] = '\0';
+				free(nr);
+			}
+		}
+		U_LOG_W("XCB: created %ux%u window 0x%08x at (%d, %d), fullscreen on RandR monitor #%d (%s)", width,
+		        height, (unsigned)win->window, (int)screen_left, (int)screen_top, fullscreen_monitor,
+		        name_buf);
+	} else {
+		U_LOG_I("XCB: created %ux%u window 0x%08x at (%d, %d)", width, height, (unsigned)win->window,
+		        (int)screen_left, (int)screen_top);
+	}
 
 	*out_win = win;
 	return XRT_SUCCESS;
