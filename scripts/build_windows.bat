@@ -17,7 +17,7 @@ setlocal enabledelayedexpansion
 :: ============================================================
 
 set REPO=%~dp0..\
-set OPENXR_VERSION=1.1.43
+set OPENXR_VERSION=1.1.51
 :: Honor a pre-set VULKAN_SDK (the LunarG installer / a build runner exports it,
 :: possibly a different version) before falling back to the dev-box default.
 if not defined VULKAN_SDK set "VULKAN_SDK=C:\VulkanSDK\1.4.341.1"

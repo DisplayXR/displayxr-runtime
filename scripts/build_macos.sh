@@ -20,7 +20,7 @@ set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$ROOT/build"
 OPENXR_DIR="/tmp/openxr-install"
-OPENXR_VERSION="1.1.43"
+OPENXR_VERSION="1.1.51"
 
 # Parse arguments
 SERVICE_MODE=OFF

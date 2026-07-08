@@ -58,7 +58,7 @@ for arg in "$@"; do
 done
 
 OPENXR_DIR="$BUILD_DIR/_openxr"
-OPENXR_VERSION="1.1.43"
+OPENXR_VERSION="1.1.51"
 
 # Step 1: Configure + build the runtime, the CLI, and the sim_display plug-in.
 #

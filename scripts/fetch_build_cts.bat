@@ -10,12 +10,12 @@ setlocal enabledelayedexpansion
 :: a developer/CI harness, not a runtime artifact.
 ::
 :: Usage: scripts\fetch_build_cts.bat
-::   Pin via CTS_TAG below; matches the runtime's OpenXR loader (1.1.43).
+::   Pin via CTS_TAG below; matches the runtime's OpenXR loader (1.1.51).
 :: Output: build-cts\build\...\conformance_cli.exe (path echoed at end).
 :: ============================================================
 
 set REPO=%~dp0..\
-set CTS_TAG=openxr-cts-1.1.43.0
+set CTS_TAG=openxr-cts-1.1.51.0
 set CTS_ROOT=%REPO%build-cts
 set CTS_SRC=%CTS_ROOT%\OpenXR-CTS
 set CTS_BUILD=%CTS_ROOT%\build
