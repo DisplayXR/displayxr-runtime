@@ -30,7 +30,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_display_info 1
-#define XR_EXT_display_info_SPEC_VERSION 15
+#define XR_EXT_display_info_SPEC_VERSION 16
 #define XR_EXT_DISPLAY_INFO_EXTENSION_NAME "XR_EXT_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
@@ -61,6 +61,35 @@ typedef struct XrDisplayInfoEXT {
     uint32_t                    displayPixelWidth;          //!< Native display panel width in pixels (0 if unknown)
     uint32_t                    displayPixelHeight;         //!< Native display panel height in pixels (0 if unknown)
 } XrDisplayInfoEXT;
+
+// ---- v16: Display desktop position ----
+
+#define XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT ((XrStructureType)1000999210)
+
+/*!
+ * @brief Desktop position of the 3D display, returned by xrGetSystemProperties
+ * (v16 addition).
+ *
+ * When chained to XrSystemProperties (typically via XrDisplayInfoEXT's next
+ * pointer), the runtime fills in the 3D panel's top-left corner in OS
+ * virtual-desktop coordinates: top-down pixels with the origin at the primary
+ * monitor's top-left (Windows virtual-screen / X11 root-window convention).
+ * (0, 0) means the panel is the primary monitor or its position is unknown.
+ *
+ * Applications that create their own window (the handle/texture classes)
+ * should create it at this position so the content opens on the 3D panel
+ * rather than the primary monitor — the window-relative weave can only
+ * produce correct 3D on the panel itself. Hosted-class apps need not care:
+ * the runtime self-creates its window there. See runtime issue #715.
+ *
+ * @extends XrSystemProperties
+ */
+typedef struct XrDisplayDesktopPositionEXT {
+    XrStructureType             type;       //!< Must be XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT
+    void* XR_MAY_ALIAS          next;       //!< Pointer to next structure in chain
+    int32_t                     left;       //!< Panel left edge in virtual-desktop pixels
+    int32_t                     top;        //!< Panel top edge in virtual-desktop pixels
+} XrDisplayDesktopPositionEXT;
 
 /*!
  * @brief Hardware display state for xrRequestDisplayModeEXT (v15 repurpose).

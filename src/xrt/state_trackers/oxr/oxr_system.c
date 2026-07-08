@@ -714,6 +714,20 @@ oxr_system_get_properties(struct oxr_logger *log, struct oxr_system *sys, XrSyst
 		display_info->displayPixelHeight = info ? info->display_pixel_height : 0;
 	}
 
+	// v16: 3D panel desktop position, so handle/texture-class apps can create
+	// their window on the panel instead of the primary monitor (#715). Same
+	// value the runtime uses to place its own hosted window.
+	XrDisplayDesktopPositionEXT *desktop_pos = NULL;
+	if (sys->inst->extensions.EXT_display_info) {
+		desktop_pos = OXR_GET_OUTPUT_FROM_CHAIN(properties, XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT,
+		                                        XrDisplayDesktopPositionEXT);
+	}
+
+	if (desktop_pos) {
+		desktop_pos->left = info ? info->display_screen_left : 0;
+		desktop_pos->top = info ? info->display_screen_top : 0;
+	}
+
 	XrEyeTrackingModeCapabilitiesEXT *eye_caps = OXR_GET_OUTPUT_FROM_CHAIN(
 	    properties, XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT, XrEyeTrackingModeCapabilitiesEXT);
 	if (eye_caps) {

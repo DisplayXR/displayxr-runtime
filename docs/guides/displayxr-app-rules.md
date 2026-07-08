@@ -118,6 +118,16 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   window** (used by the display processor for position/phase tracking). Don't drop the HWND
   when you go texture-mode. Ref: `test_apps/cube_texture_d3d11_win/xr_session.cpp:193-194`.
 
+- **INV-1.3 (advisory) — Create your window ON the 3D panel, not wherever the OS defaults.**
+  On multi-monitor systems (laptop + external 3D panel — the deployment shape) a
+  `CW_USEDEFAULT` window opens on the primary monitor, where the weave cannot produce 3D.
+  Chain `XrDisplayDesktopPositionEXT` (spec v16) onto `XrSystemProperties` and create your
+  window at the returned `left/top` (virtual-desktop pixels, top-down; `(0,0)` = primary or
+  unknown — either way a safe create position). This refines the INV-1.1 ordering: create
+  instance → get system → `xrGetSystemProperties` → **create window at the reported
+  position** → create session with the binding. Hosted apps need none of this — the runtime
+  places its own window (#715).
+
 ---
 
 ## 2. Display info & rendering modes (`XR_EXT_display_info`)
