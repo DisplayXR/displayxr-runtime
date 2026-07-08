@@ -201,10 +201,50 @@ struct DisplayZone {
     uint32_t tileW = 0;             //!< per-view tile width (= recommended view width)
     uint32_t tileH = 0;             //!< per-view tile height
     uint32_t tileCount = 0;         //!< view tiles in the horizontally tiled swapchain
+    bool sliced = false;            //!< #727: array-slice route vs horizontal-tile route
     std::vector<XrSwapchainImageD3D12KHR> images;
     int rtvBaseIndex = 0;           //!< base index of this zone's RTVs in renderer.rtvHeap
 };
 static DisplayZone g_zonesArr[kNumZones];
+// Zones actually activated this run = min(kNumZones, caps.maxZones3D). Some DPs
+// (e.g. Leia SR 1.0.6, grid 1x1) support only ONE 3D zone; rather than falling
+// back to the non-zones path, run with the zones we can — a single full-window-ish
+// zone matches issue #727's "one full-window display zone supplies the canvas".
+static uint32_t g_activeZones = kNumZones;
+
+// #727 experiment: choose how each zone submits its stereo pair to the runtime.
+//   TILED  (default): one swapchain (arraySize=1) tileW*viewCount wide; view vi
+//                      lands at imageRect.offset.x = vi*tileW, imageArrayIndex=0.
+//   SLICED (DXR_ZONE_ROUTE=sliced): one array swapchain (arraySize=viewCount);
+//                      view vi lands in array slice vi (imageArrayIndex=vi,
+//                      imageRect.offset={0,0}) — the #727 path (Unity SPI-style).
+// Both converge to an identical flat side-by-side atlas inside the runtime (the
+// projection blit de-arrays slices into tiles, #656), so this toggle A/B-tests
+// whether the DP weaves the two identically. Env read once.
+static bool ZoneSlicedRoute() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("DXR_ZONE_ROUTE");
+        cached = (v != nullptr && (strcmp(v, "sliced") == 0 || strcmp(v, "SLICED") == 0 ||
+                                   strcmp(v, "1") == 0)) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+// #727 decisive probe: DXR_SLICE_COLORS=1 paints each view a solid color
+// (view 0 = BLUE, view 1 = RED) instead of the cube, so the woven readback is
+// unambiguous — a correct stereo weave interlaces blue/red (with a tracked face
+// in front of the panel; the Leia DP returns left-view-only = flat blue when no
+// valid face is present), while a mono collapse is flat blue regardless. The
+// pre-DP atlas (DP input) should always be a clean [blue|red] side-by-side.
+static bool ZoneSliceColors() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("DXR_SLICE_COLORS");
+        cached = (v != nullptr && v[0] != '\0' && v[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
 
 static const XrRect2Di kZoneARect        = {{0, 180}, {640, 540}};
 static const XrRect2Di kZoneBRect        = {{700, 180}, {520, 360}};
@@ -1143,6 +1183,32 @@ static int AppendImageRTVs(D3D12Renderer& renderer, ID3D12Resource** images,
     return base;
 }
 
+// #727 sliced route: append TEXTURE2DARRAY slice RTVs for an array swapchain.
+// For each image, `arraySize` RTVs (one per slice, ArraySize=1). Slice s of
+// image i lives at base + i*arraySize + s. Mirrors AppendImageRTVs but each RTV
+// views a single array layer so RenderScene can target one eye's slice.
+static int AppendArraySliceRTVs(D3D12Renderer& renderer, ID3D12Resource** images,
+                                uint32_t count, uint32_t arraySize, DXGI_FORMAT fmt) {
+    int base = (int)renderer.rtvCount;
+    D3D12_CPU_DESCRIPTOR_HANDLE h = renderer.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += (SIZE_T)renderer.rtvCount * renderer.rtvDescriptorSize;
+    for (uint32_t i = 0; i < count; i++) {
+        for (uint32_t s = 0; s < arraySize; s++) {
+            D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+            rtvDesc.Format = fmt;
+            rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+            rtvDesc.Texture2DArray.MipSlice = 0;
+            rtvDesc.Texture2DArray.FirstArraySlice = s;
+            rtvDesc.Texture2DArray.ArraySize = 1;
+            rtvDesc.Texture2DArray.PlaneSlice = 0;
+            renderer.device->CreateRenderTargetView(images[i], &rtvDesc, h);
+            h.ptr += renderer.rtvDescriptorSize;
+        }
+    }
+    renderer.rtvCount += count * arraySize;
+    return base;
+}
+
 // Create one zone's swapchain, sized per xrGetDisplayZoneRecommendedViewSizeEXT,
 // horizontally tiled per view, and register its image RTVs in renderer.rtvHeap.
 static bool CreateZoneResources(XrSessionManager& xr, D3D12Renderer& renderer,
@@ -1157,19 +1223,22 @@ static bool CreateZoneResources(XrSessionManager& xr, D3D12Renderer& renderer,
     z.tileW = (uint32_t)rec.width;
     z.tileH = (uint32_t)rec.height;
     z.tileCount = viewCount;
+    z.sliced = ZoneSlicedRoute();       // #727: array-slice vs horizontal-tile submission
     z.format = xr.swapchain.format; // same encoding as the main projection swapchain
 
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
     sci.format = z.format;
     sci.sampleCount = 1;
-    sci.width = z.tileW * z.tileCount;
+    // SLICED: single tile wide, viewCount array layers. TILED: viewCount tiles wide, 1 layer.
+    sci.width = z.sliced ? z.tileW : (z.tileW * z.tileCount);
     sci.height = z.tileH;
     sci.faceCount = 1;
-    sci.arraySize = 1;
+    sci.arraySize = z.sliced ? z.tileCount : 1;
     sci.mipCount = 1;
     if (XR_FAILED(xrCreateSwapchain(xr.session, &sci, &z.swapchain))) {
-        LOG_ERROR("[zones] zone %u: xrCreateSwapchain failed (%ux%u)", z.zoneId, sci.width, sci.height);
+        LOG_ERROR("[zones] zone %u: xrCreateSwapchain failed (%ux%u arraySize=%u)",
+                  z.zoneId, sci.width, sci.height, sci.arraySize);
         return false;
     }
 
@@ -1182,15 +1251,20 @@ static bool CreateZoneResources(XrSessionManager& xr, D3D12Renderer& renderer,
         return false;
     }
 
-    // Append this zone's image RTVs to the adopted big RTV heap (does NOT
-    // recreate it — the main-swapchain RTVs must survive).
+    // Append this zone's RTVs to the adopted big RTV heap (does NOT recreate it —
+    // the main-swapchain RTVs must survive). SLICED gets one RTV per (image,slice);
+    // TILED gets one TEXTURE2D RTV per image.
     std::vector<ID3D12Resource*> textures(n);
     for (uint32_t i = 0; i < n; i++) textures[i] = z.images[i].texture;
-    z.rtvBaseIndex = AppendImageRTVs(renderer, textures.data(), n, (DXGI_FORMAT)z.format);
+    z.rtvBaseIndex = z.sliced
+        ? AppendArraySliceRTVs(renderer, textures.data(), n, z.tileCount, (DXGI_FORMAT)z.format)
+        : AppendImageRTVs(renderer, textures.data(), n, (DXGI_FORMAT)z.format);
 
-    LOG_INFO("[zones] zone %u: rect %d,%d %dx%d -> swapchain %ux%u (%u tiles of %ux%u, rtvBase=%d)",
+    LOG_INFO("[zones] zone %u: rect %d,%d %dx%d -> %s swapchain %ux%u arraySize=%u "
+             "(%u views of %ux%u, %u images, rtvBase=%d)",
              z.zoneId, z.rect.offset.x, z.rect.offset.y, z.rect.extent.width, z.rect.extent.height,
-             z.tileW * z.tileCount, z.tileH, z.tileCount, z.tileW, z.tileH, z.rtvBaseIndex);
+             z.sliced ? "SLICED" : "TILED", sci.width, sci.height, sci.arraySize,
+             z.tileCount, z.tileW, z.tileH, n, z.rtvBaseIndex);
     return true;
 }
 
@@ -1338,9 +1412,12 @@ static bool EnsureEdgeFadePass(D3D12Renderer& renderer) {
 // Clear a zone tile's RTV to the zone's premultiplied clear color (incl alpha).
 // `rtvIndex` is the per-zone image RTV in renderer.rtvHeap; clears the whole
 // tiled image (all view tiles share one clear).
-static void ClearZoneImage(D3D12Renderer& renderer, DisplayZone& z, int rtvIndex) {
+// Clears the single RTV at rtvIndex to the zone color. Caller passes the backing
+// image resource (rtvIndex→image is not 1:1 in the sliced route) and, for a
+// sliced zone, calls once per slice RTV; a tiled zone clears its whole image once.
+static void ClearZoneImage(D3D12Renderer& renderer, DisplayZone& z,
+                           ID3D12Resource* rt, int rtvIndex) {
     if (!EnsureZoneCmdResources(renderer)) return;
-    ID3D12Resource* rt = z.images[rtvIndex - z.rtvBaseIndex].texture;
 
     g_zoneCmdAlloc->Reset();
     g_zoneCmdList->Reset(g_zoneCmdAlloc.Get(), nullptr);
@@ -1364,12 +1441,45 @@ static void ClearZoneImage(D3D12Renderer& renderer, DisplayZone& z, int rtvIndex
     ZoneCmdSubmitAndWait(renderer);
 }
 
-// Multiply a zone tile's RGBA by the edge ramp via the fade PSO (dst *= f).
-static void DrawZoneEdgeFade(D3D12Renderer& renderer, DisplayZone& z, int rtvIndex,
-                             uint32_t tileX, uint32_t tileW, uint32_t tileH) {
+// #727 slice-color probe: fill one view's rectangle in `rt` with a solid color
+// via a scissored ClearRenderTargetView. `vpX` is the view's x-origin (vi*tileW
+// tiled, 0 for a per-slice sliced RTV); the rect scopes the clear to this view
+// so tiled tile-0/tile-1 (or sliced slice-0/slice-1) get distinct colors.
+static void PaintViewColor(D3D12Renderer& renderer, ID3D12Resource* rt, int rtvIndex,
+                           uint32_t vpX, uint32_t tileW, uint32_t tileH, const float color[4]) {
+    if (!EnsureZoneCmdResources(renderer)) return;
+
+    g_zoneCmdAlloc->Reset();
+    g_zoneCmdList->Reset(g_zoneCmdAlloc.Get(), nullptr);
+
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = rt;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    g_zoneCmdList->ResourceBarrier(1, &barrier);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = renderer.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    rtvHandle.ptr += (SIZE_T)rtvIndex * renderer.rtvDescriptorSize;
+    D3D12_RECT rect = {(LONG)vpX, 0, (LONG)(vpX + tileW), (LONG)tileH};
+    g_zoneCmdList->ClearRenderTargetView(rtvHandle, color, 1, &rect);
+
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    g_zoneCmdList->ResourceBarrier(1, &barrier);
+
+    ZoneCmdSubmitAndWait(renderer);
+}
+
+// Multiply a zone view's RGBA by the edge ramp via the fade PSO (dst *= f).
+// `rt` is the backing image; `vpX` is the view's x-origin within it (vi*tileW
+// for tiled, 0 for a per-slice sliced RTV).
+static void DrawZoneEdgeFade(D3D12Renderer& renderer, DisplayZone& z,
+                             ID3D12Resource* rt, int rtvIndex,
+                             uint32_t vpX, uint32_t tileW, uint32_t tileH) {
     if (ZoneEdgeFadePx() <= 0.0f) return; // DXR_ZONES_FADE_PX=0 disables
     if (!EnsureEdgeFadePass(renderer)) return;
-    ID3D12Resource* rt = z.images[rtvIndex - z.rtvBaseIndex].texture;
 
     g_zoneCmdAlloc->Reset();
     g_zoneCmdList->Reset(g_zoneCmdAlloc.Get(), g_fadePSO.Get());
@@ -1387,13 +1497,13 @@ static void DrawZoneEdgeFade(D3D12Renderer& renderer, DisplayZone& z, int rtvInd
     g_zoneCmdList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
     D3D12_VIEWPORT vp = {};
-    vp.TopLeftX = (FLOAT)(tileX * tileW);
+    vp.TopLeftX = (FLOAT)vpX;
     vp.TopLeftY = 0.0f;
     vp.Width = (FLOAT)tileW;
     vp.Height = (FLOAT)tileH;
     vp.MaxDepth = 1.0f;
     g_zoneCmdList->RSSetViewports(1, &vp);
-    D3D12_RECT scissor = {(LONG)(tileX * tileW), 0, (LONG)(tileX * tileW + tileW), (LONG)tileH};
+    D3D12_RECT scissor = {(LONG)vpX, 0, (LONG)(vpX + tileW), (LONG)tileH};
     g_zoneCmdList->RSSetScissorRects(1, &scissor);
 
     g_zoneCmdList->SetGraphicsRootSignature(g_fadeRootSig.Get());
@@ -1456,7 +1566,7 @@ static bool ApplyTier3FreeformWish(XrSessionManager& xr, D3D12Renderer& renderer
     const int kRings = 8;
     const int kRingStep = 3;  // px per ring (window pixels)
     const int kFeather = 24;  // solid-core inset
-    for (uint32_t zi = 0; zi < kNumZones; zi++) {
+    for (uint32_t zi = 0; zi < g_activeZones; zi++) {
         const XrRect2Di& zr = g_zonesArr[zi].rect;
         for (int step = 0; step <= kRings; step++) {
             const bool core = (step == kRings);
@@ -1551,8 +1661,8 @@ static void ApplyWishAuthoring(XrSessionManager& xr, D3D12Renderer& renderer) {
     if (g_wishMode == 1) {
         if (!EnsureWishMask(xr)) return;
         XrRect2Di rects[kNumZones];
-        for (uint32_t zi = 0; zi < kNumZones; zi++) rects[zi] = g_zonesArr[zi].rect;
-        XrResult r = g_zone.pfnSetRects(g_zone.mask, kNumZones, rects);
+        for (uint32_t zi = 0; zi < g_activeZones; zi++) rects[zi] = g_zonesArr[zi].rect;
+        XrResult r = g_zone.pfnSetRects(g_zone.mask, g_activeZones, rects);
         if (XR_FAILED(r)) {
             LOG_ERROR("[zones] xrSetLocal3DZoneFromRectsEXT failed (0x%x)", (unsigned)r);
         }
@@ -1617,12 +1727,16 @@ static void TryActivateZones(XrSessionManager& xr, D3D12Renderer& renderer) {
         g_hasDisplayZonesExt = false;
         return;
     }
-    if (caps.maxZones3D < kNumZones) {
-        LOG_ERROR("[zones] maxZones3D=%u < %u — zones path disabled", caps.maxZones3D, kNumZones);
+    if (caps.maxZones3D < 1) {
+        LOG_ERROR("[zones] maxZones3D=%u < 1 — zones path disabled", caps.maxZones3D);
         g_hasDisplayZonesExt = false;
         return;
     }
-    LOG_INFO("[zones] capabilities: supported=1 maxZones3D=%u", caps.maxZones3D);
+    // Run with what the DP supports (clamp to kNumZones). One zone is enough to
+    // exercise the shared-texture 3D weave for the #727 tiled-vs-sliced A/B.
+    g_activeZones = (caps.maxZones3D < kNumZones) ? caps.maxZones3D : kNumZones;
+    LOG_INFO("[zones] capabilities: supported=1 maxZones3D=%u -> activeZones=%u",
+             caps.maxZones3D, g_activeZones);
 
     // Zones share the session's view COUNT (display modes are session-global).
     // Allocate the zone swapchains at the MAX view count across all modes, not
@@ -1666,7 +1780,7 @@ static void TryActivateZones(XrSessionManager& xr, D3D12Renderer& renderer) {
     g_zonesArr[1].clearColor[2] = 0.0f;
     g_zonesArr[1].clearColor[3] = 0.0f;
 
-    for (uint32_t zi = 0; zi < kNumZones; zi++) {
+    for (uint32_t zi = 0; zi < g_activeZones; zi++) {
         if (!CreateZoneResources(xr, renderer, g_zonesArr[zi], viewCount)) {
             g_hasDisplayZonesExt = false;
             return;
@@ -1701,7 +1815,7 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
     std::vector<XrCompositionLayerProjectionView> projViews[kNumZones];
     uint32_t submitViewCounts[kNumZones] = {};
 
-    for (uint32_t zi = 0; zi < kNumZones; zi++) {
+    for (uint32_t zi = 0; zi < g_activeZones; zi++) {
         DisplayZone& z = g_zonesArr[zi];
 
         rigStructs[zi] = {XR_TYPE_DISPLAY_RIG_EXT};
@@ -1802,30 +1916,59 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
         xrWaitSwapchainImage(z.swapchain, &wi);
 
         ID3D12Resource* zoneTex = z.images[imageIndex].texture;
-        const int rtvIndex = z.rtvBaseIndex + (int)imageIndex;
+        // #727: per-view RTV + x-origin differ by route. SLICED renders each
+        // view into array slice vi (own RTV, x-origin 0); TILED renders every
+        // view into one RTV at x-origin vi*tileW.
+        auto viewRtv = [&](uint32_t vi) -> int {
+            return z.sliced ? z.rtvBaseIndex + (int)(imageIndex * z.tileCount + vi)
+                            : z.rtvBaseIndex + (int)imageIndex;
+        };
+        auto viewVpX = [&](uint32_t vi) -> uint32_t {
+            return z.sliced ? 0u : (vi * z.tileW);
+        };
+
+        const bool sliceColors = ZoneSliceColors();
 
         // Per-zone clear (premultiplied RGBA, incl alpha). Zone A is opaque;
         // zone B's transparent {0,0,0,0} clear punches the unzoned-around-cube
         // pixels through to the desktop. RenderScene can't do this (fixed clear
         // color), so a dedicated clear pass authors it; the cube is then drawn
-        // with clear=false.
-        ClearZoneImage(renderer, z, rtvIndex);
+        // with clear=false. TILED clears the whole image via its one RTV; SLICED
+        // must clear each slice's RTV. The slice-color probe fills each view
+        // solidly below, so it needs no pre-clear.
+        if (!sliceColors) {
+            if (z.sliced) {
+                for (uint32_t vi = 0; vi < n; vi++)
+                    ClearZoneImage(renderer, z, zoneTex, viewRtv(vi));
+            } else {
+                ClearZoneImage(renderer, z, zoneTex, viewRtv(0));
+            }
+        }
 
         // Per-zone spin phase on the shared rotation (restored after render).
         const float savedRotation = renderer.cubeRotation;
         renderer.cubeRotation += z.spinPhase;
 
         for (uint32_t vi = 0; vi < n; vi++) {
-            const XMMATRIX viewMatrix = ColumnMajorToXMMatrix(rigViews[vi].view_matrix);
-            const XMMATRIX projMatrix = ColumnMajorToXMMatrix(rigViews[vi].projection_matrix);
-            RenderScene(renderer, zoneTex, rtvIndex,
-                        vi * z.tileW, 0, z.tileW, z.tileH,
-                        viewMatrix, projMatrix, 1.0f, /*clear=*/false, 0.03f);
+            if (sliceColors) {
+                // #727 probe: view 0 = BLUE, view 1 = RED (opaque). A correct
+                // stereo weave interlaces the two; a mono collapse is flat blue.
+                static const float kBlue[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+                static const float kRed[4]  = {1.0f, 0.0f, 0.0f, 1.0f};
+                PaintViewColor(renderer, zoneTex, viewRtv(vi), viewVpX(vi),
+                               z.tileW, z.tileH, (vi == 0) ? kBlue : kRed);
+            } else {
+                const XMMATRIX viewMatrix = ColumnMajorToXMMatrix(rigViews[vi].view_matrix);
+                const XMMATRIX projMatrix = ColumnMajorToXMMatrix(rigViews[vi].projection_matrix);
+                RenderScene(renderer, zoneTex, viewRtv(vi),
+                            viewVpX(vi), 0, z.tileW, z.tileH,
+                            viewMatrix, projMatrix, 1.0f, /*clear=*/false, 0.03f);
+            }
 
             projViews[zi][vi].subImage.swapchain = z.swapchain;
-            projViews[zi][vi].subImage.imageRect.offset = {(int32_t)(vi * z.tileW), 0};
+            projViews[zi][vi].subImage.imageRect.offset = {(int32_t)viewVpX(vi), 0};
             projViews[zi][vi].subImage.imageRect.extent = {(int32_t)z.tileW, (int32_t)z.tileH};
-            projViews[zi][vi].subImage.imageArrayIndex = 0;
+            projViews[zi][vi].subImage.imageArrayIndex = z.sliced ? vi : 0;
             projViews[zi][vi].pose = zoneViews[vi].pose;
             projViews[zi][vi].fov = rigViews[vi].fov;
         }
@@ -1836,10 +1979,11 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
         // rendered RGBA at its tile edges so the zone blends softly into
         // whatever is behind it — desktop OR another zone. Skipped in wish
         // mode 1 (Tier-2 hard rects): content faded inside a hard-M=1 band
-        // weaves to opaque black, not the desktop.
-        if (g_wishMode != 1) {
+        // weaves to opaque black, not the desktop. Also skipped for the
+        // slice-color probe (want solid, un-feathered fields).
+        if (!sliceColors && g_wishMode != 1) {
             for (uint32_t vi = 0; vi < n; vi++) {
-                DrawZoneEdgeFade(renderer, z, rtvIndex, vi, z.tileW, z.tileH);
+                DrawZoneEdgeFade(renderer, z, zoneTex, viewRtv(vi), viewVpX(vi), z.tileW, z.tileH);
             }
         }
 
@@ -1853,7 +1997,7 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
     const XrCompositionLayerBaseHeader* layers[kNumZones + 1] = {};
     uint32_t layerCount = 0;
 
-    for (uint32_t zi = 0; zi < kNumZones; zi++) {
+    for (uint32_t zi = 0; zi < g_activeZones; zi++) {
         if (submitViewCounts[zi] == 0) continue;
         projLayers[zi] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
         projLayers[zi].next = &zoneStructs[zi]; // SAME instance as the locate chain
@@ -1926,6 +2070,24 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
     }
 
     xrEndFrame(xr.session, &endInfo);
+
+    // #727: one-shot capture of the runtime's PROJECTION-ONLY atlas — the DP
+    // INPUT (post per-tile blit, pre-weave), which is face-independent. Fired at
+    // the same gate as the woven DXR_TEXDUMP so both artifacts reflect the same
+    // frame. Lands in Pictures\DisplayXR\<app>-<N>_atlas_2_2x1.png. Manual 'I'
+    // still works too. Uses the max submitted view count as the atlas columns.
+    {
+        static long zoneFrames = 0;
+        static bool dpInputCaptured = false;
+        zoneFrames++;
+        uint32_t cols = 0;
+        for (uint32_t zi = 0; zi < g_activeZones; zi++)
+            cols = (submitViewCounts[zi] > cols) ? submitViewCounts[zi] : cols;
+        if (!dpInputCaptured && zoneFrames >= kTexDumpFrame && cols > 1) {
+            dpInputCaptured = true;
+            dxr_capture::RequestRuntimeAtlasCapture(xr, APP_NAME, cols, 1, rs.hwnd);
+        }
+    }
 
     // Texture-mode present + autonomous verification: the runtime composited the
     // full-window multi-zone super-atlas into our shared texture (output rect
@@ -2386,7 +2548,7 @@ static void RenderOneFrame(RenderState& rs) {
 
 // Destroy the zone/strip/wish resources (before session teardown).
 static void CleanupZones() {
-    for (uint32_t zi = 0; zi < kNumZones; zi++) {
+    for (uint32_t zi = 0; zi < g_activeZones; zi++) {
         DisplayZone& z = g_zonesArr[zi];
         if (z.swapchain != XR_NULL_HANDLE) {
             xrDestroySwapchain(z.swapchain);
@@ -2713,10 +2875,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             ShutdownLogging();
             return 1;
         }
-        // Reserve headroom for two zone swapchains (each ≤ a few images);
-        // 32 descriptors of headroom is ample.
+        // Reserve headroom for the zone swapchains' RTVs. #727 SLICED route needs
+        // (images × viewCount) RTVs per zone vs (images) for TILED; 64 covers both.
         if (!AdoptBigRtvHeap(renderer, textures.data(), count,
-                (DXGI_FORMAT)xr.swapchain.format, 32)) {
+                (DXGI_FORMAT)xr.swapchain.format, 64)) {
             LOG_ERROR("Failed to adopt big RTV heap");
             CleanupOpenXR(xr);
             if (hudOk) CleanupHudRenderer(hudRenderer);
