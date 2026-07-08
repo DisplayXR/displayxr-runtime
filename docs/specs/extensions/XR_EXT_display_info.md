@@ -718,6 +718,46 @@ typedef struct XrDisplayInfoEXT {
 - All returned values are static display properties that do not change during the runtime's
   lifetime.
 
+#### XrDisplayDesktopPositionEXT (v16)
+
+Chained to `XrSystemProperties` (typically via `XrDisplayInfoEXT.next`) to return the 3D
+panel's desktop position — its top-left corner in OS virtual-desktop coordinates: top-down
+pixels, origin at the primary monitor's top-left (the Windows virtual-screen / X11
+root-window convention). `(0, 0)` means the panel is the primary monitor or its position is
+unknown.
+
+| Member | Type | Description |
+|---|---|---|
+| `type` | `XrStructureType` | Must be `XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT` (`1000999210`). |
+| `next` | `void*` | Pointer to next structure in the chain, or `NULL`. |
+| `left` | `int32_t` | Panel left edge in virtual-desktop pixels. |
+| `top` | `int32_t` | Panel top edge in virtual-desktop pixels. |
+
+```c
+typedef struct XrDisplayDesktopPositionEXT {
+    XrStructureType             type;
+    void* XR_MAY_ALIAS          next;
+    int32_t                     left;
+    int32_t                     top;
+} XrDisplayDesktopPositionEXT;
+```
+
+**Why it exists:** applications that create their own window (the handle/texture app
+classes) **should** create it at this position so the content opens on the 3D panel rather
+than the primary monitor on multi-monitor systems — the window-relative weave can only
+produce correct 3D on the panel itself. Hosted-class apps need not query it: the runtime
+self-creates its window at this position. The value is available before session creation
+(`xrGetSystemProperties` needs only the instance and system id), so the query slots
+naturally between `xrGetSystem` and native window creation. It is the same value the
+vendor plug-in reports to the runtime for its own hosted-window placement (#715).
+
+**Valid Usage:**
+- `type` **must** be `XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT`.
+- The application **must** have enabled the `XR_EXT_display_info` extension at instance
+  creation.
+- The position is a static property for the lifetime of the runtime instance; display
+  topology changes (monitor hotplug, rearrangement) are not reported dynamically in v16.
+
 ### New Enums
 
 #### XrDisplayModeEXT
@@ -2052,7 +2092,8 @@ the property) silently ignore the call — graceful degradation.
 | 11 | 2026-03-20 | David Fattal | Added per-mode tile layout fields to `XrDisplayRenderingModeInfoEXT`: `tileColumns`, `tileRows`, `viewWidthPixels`, `viewHeightPixels`. Enables runtime to describe atlas layout for multi-view rendering modes (e.g., 2x2 quad). |
 | 12 | 2026-03-28 | David Fattal | Removed `hardwareDisplay3D` from `XrDisplayInfoEXT`. It remains available **per-mode** on `XrDisplayRenderingModeInfoEXT` (via `xrEnumerateDisplayRenderingModesEXT`) and is also reported by the `XrEventDataHardwareDisplayStateChangedEXT` event. Also moved `xrSetSharedTextureOutputRectEXT` to the window-binding extension headers. |
 | 13 | 2026-05-18 | David Fattal | Added per-session `isActive` and `isRequestable` fields to `XrDisplayRenderingModeInfoEXT` (#234). `isActive` lets an app learn the current mode from the first enumerate without waiting for an event; `isRequestable` tells a session whether it may request a mode (false for non-controller sessions under a workspace). |
-| 15 | 2026-06-11 | David Fattal | **Repurposed `xrRequestDisplayModeEXT`** (#542): no longer a deprecated mode-switching wrapper — it now sets the HARDWARE display state alone for the current mode (the mode's layout/content and the DP's atlas processing are untouched; the DP weaves or flat-blits per the atlas it is handed). Override holds until the next mode request. Reported via `XrEventDataHardwareDisplayStateChangedEXT`. No struct/ABI change. **Current header version (`XR_EXT_display_info_SPEC_VERSION == 15`).** |
+| 15 | 2026-06-11 | David Fattal | **Repurposed `xrRequestDisplayModeEXT`** (#542): no longer a deprecated mode-switching wrapper — it now sets the HARDWARE display state alone for the current mode (the mode's layout/content and the DP's atlas processing are untouched; the DP weaves or flat-blits per the atlas it is handed). Override holds until the next mode request. Reported via `XrEventDataHardwareDisplayStateChangedEXT`. No struct/ABI change. |
+| 16 | 2026-07-07 | David Fattal | Added `XrDisplayDesktopPositionEXT` (`1000999210`, new chained struct — additive, no ABI change to existing structs): the 3D panel's top-left in virtual-desktop pixels, chained to `XrSystemProperties`, so handle/texture-class apps can create their window on the panel on multi-monitor systems (#715). **Current header version (`XR_EXT_display_info_SPEC_VERSION == 16`).** |
 
 > The `XR_EXT_display_info_SPEC_VERSION` define in the header is the authoritative current
 > revision. Earlier revision numbers in this table reflect the proposal's editing history and do
