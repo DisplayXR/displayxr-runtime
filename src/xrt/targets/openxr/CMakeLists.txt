@@ -220,7 +220,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
 	# only for the downstream-consumer convenience surface.
 	if(DEFINED OpenXR_ROOT)
 		# Normalize backslashes → forward slashes. A native Windows OpenXR_ROOT
-		# (e.g. build_windows.bat's short-path copy C:\dev\openxr_sdk_1.1.43)
+		# (e.g. build_windows.bat's short-path copy C:\dev\openxr_sdk_1.1.51)
 		# otherwise lands verbatim in the generated cmake_install.cmake, where
 		# CMake reads \d, \o … as invalid escape sequences and aborts the install
 		# with "Syntax error in cmake code" (strict on newer CMake).

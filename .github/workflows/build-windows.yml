@@ -144,7 +144,7 @@ jobs:
           # loader can't be found via find_package or OpenXR_ROOT — which
           # drops both the bridge and the install(FILES openxr_loader.dll)
           # rule from the build, leaving the installer without those files.
-          $openxrVersion = "1.1.43"
+          $openxrVersion = "1.1.51"
           $openxrUrl = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$openxrVersion/openxr_loader_windows-$openxrVersion.zip"
           Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
           Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
@@ -397,7 +397,7 @@ jobs:
 
       - name: Install OpenXR loader
         run: |
-          $openxrVersion = "1.1.43"
+          $openxrVersion = "1.1.51"
           $openxrUrl = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$openxrVersion/openxr_loader_windows-$openxrVersion.zip"
           Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
           Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
