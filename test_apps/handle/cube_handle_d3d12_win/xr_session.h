@@ -14,6 +14,12 @@
 #include <openxr/XR_EXT_view_rig.h>
 #include <openxr/XR_EXT_local_3d_zone.h>
 
+// INV-1.3 (#715): 3D panel top-left in virtual-desktop pixels (top-down,
+// origin = primary top-left); (0,0) = primary/unknown. Filled by
+// InitializeOpenXR from the XrDisplayDesktopPositionEXT chain (spec v16).
+extern int32_t g_displayScreenLeft;
+extern int32_t g_displayScreenTop;
+
 // XR_EXT_view_rig (#396 W7) available + enabled on the instance. App-local
 // (not on the shared XrSessionManager); promote to xr_session_common when
 // more consumers adopt it.

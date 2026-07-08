@@ -1367,6 +1367,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
+    // INV-1.3: open on the 3D panel (#715) — one-shot move to the panel's
+    // desktop position reported by xrGetSystemProperties (virtual-screen
+    // coords, top-down; (0,0) = primary/unknown is safe), BEFORE
+    // xrCreateSession so the display processor tracks the window on the
+    // panel from the start.
+    SetWindowPos(hwnd, nullptr, g_displayScreenLeft, g_displayScreenTop, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+
     // Get Vulkan graphics requirements (must be called before creating Vulkan instance per spec)
     if (!GetVulkanGraphicsRequirements(xr)) {
         LOG_ERROR("Failed to get Vulkan graphics requirements");

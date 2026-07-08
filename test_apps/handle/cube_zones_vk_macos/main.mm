@@ -1752,7 +1752,7 @@ static void CleanupVkRenderer(VkRenderer& renderer) {
 static AppDelegate *g_appDelegate = nil;
 static AppWindowDelegate *g_windowDelegate = nil;
 
-static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
+static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLeft, int32_t screenTop) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
@@ -1760,7 +1760,17 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
         g_appDelegate = [[AppDelegate alloc] init];
         [NSApp setDelegate:g_appDelegate];
 
+        // INV-1.3: open on the 3D panel (#715). (screenLeft, screenTop) is the
+        // panel top-left in top-down global coordinates (origin = primary
+        // top-left, XrDisplayDesktopPositionEXT); flip into AppKit's bottom-up
+        // space. (0,0) = primary — the titled window is auto-constrained below
+        // the menu bar, so it is always a safe create position.
         NSRect frame = NSMakeRect(100, 100, width, height);
+        NSScreen *primary = [NSScreen screens].firstObject;
+        if (primary != nil) {
+            CGFloat topY = primary.frame.size.height - (CGFloat)screenTop;
+            frame = NSMakeRect((CGFloat)screenLeft, topY - (CGFloat)height, width, height);
+        }
         NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                            NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
 
@@ -2048,6 +2058,10 @@ struct AppXrSession {
     bool hasDisplayInfoExt = false;
     float recommendedViewScaleX = 1.0f;
     float recommendedViewScaleY = 1.0f;
+    // v16 XrDisplayDesktopPositionEXT — 3D panel top-left in virtual-desktop
+    // pixels (top-down, origin = primary top-left); (0,0) = primary/unknown.
+    int32_t displayScreenLeft = 0;
+    int32_t displayScreenTop = 0;
     float displayWidthM = 0.0f;
     float displayHeightM = 0.0f;
     float nominalViewerX = 0.0f;
@@ -2195,7 +2209,12 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         displayInfo.type = XR_TYPE_DISPLAY_INFO_EXT;
         XrEyeTrackingModeCapabilitiesEXT eyeCaps = {};
         eyeCaps.type = (XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT;
+        // INV-1.3: panel desktop position, so the window opens on the 3D panel
+        // instead of the primary monitor (spec v16, #715). Chained at the tail.
+        XrDisplayDesktopPositionEXT desktopPos = {};
+        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT;
         displayInfo.next = &eyeCaps;
+        eyeCaps.next = &desktopPos;
         sysProps.next = &displayInfo;
         if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sysProps))) {
             xr.recommendedViewScaleX = displayInfo.recommendedViewScaleX;
@@ -2209,6 +2228,9 @@ static bool InitializeOpenXR(AppXrSession& xr) {
             xr.displayPixelHeight = displayInfo.displayPixelHeight;
             xr.supportedEyeTrackingModes = (uint32_t)eyeCaps.supportedModes;
             xr.defaultEyeTrackingMode = (uint32_t)eyeCaps.defaultMode;
+            xr.displayScreenLeft = desktopPos.left;
+            xr.displayScreenTop = desktopPos.top;
+            LOG_INFO("Display desktop position: (%d, %d)", xr.displayScreenLeft, xr.displayScreenTop);
             LOG_INFO("Display pixels: %ux%u", xr.displayPixelWidth, xr.displayPixelHeight);
             LOG_INFO("Display info: %.3fx%.3f m, scale=%.2fx%.2f, nominal=(%.3f,%.3f,%.3f)",
                 xr.displayWidthM, xr.displayHeightM,
@@ -3387,10 +3409,20 @@ int main() {
     // (set during xrEnumerateDisplayRenderingModesEXT). Fallback is mode 1
     // (default of xr.currentModeIndex).
 
-    // Step 1: Create the macOS window FIRST (app owns it)
+    // Step 1: Initialize OpenXR FIRST — xrGetSystemProperties needs only
+    // instance + system id, and returns the panel desktop position the window
+    // below is created at (INV-1.3 ordering: instance → system → properties
+    // → window → session).
+    AppXrSession xr = {};
+    if (!InitializeOpenXR(xr)) {
+        LOG_ERROR("OpenXR initialization failed");
+        return 1;
+    }
+
+    // Step 2: Create the macOS window (app owns it) on the 3D panel
     g_windowW = 1280;
     g_windowH = 720;
-    if (!CreateMacOSWindow(g_windowW, g_windowH)) {
+    if (!CreateMacOSWindow(g_windowW, g_windowH, xr.displayScreenLeft, xr.displayScreenTop)) {
         LOG_ERROR("Failed to create macOS window");
         return 1;
     }
@@ -3404,13 +3436,6 @@ int main() {
         g_windowH = (uint32_t)(contentSize.height * backingScale);
         LOG_INFO("Window drawable size: %ux%u (points: %.0fx%.0f, scale: %.1f)",
                  g_windowW, g_windowH, contentSize.width, contentSize.height, (float)backingScale);
-    }
-
-    // Step 2: Initialize OpenXR
-    AppXrSession xr = {};
-    if (!InitializeOpenXR(xr)) {
-        LOG_ERROR("OpenXR initialization failed");
-        return 1;
     }
 
     if (!GetVulkanGraphicsRequirements(xr)) {
