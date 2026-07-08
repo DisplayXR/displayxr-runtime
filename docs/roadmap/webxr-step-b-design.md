@@ -737,3 +737,182 @@ off-axis frusta built from the runtime's tracked eyes.
   this frame and, after the loop, destroys the woven SharedImage + erases every
   `displayxr_weave_state_` entry not seen this frame (the map otherwise grows
   unbounded and leaks woven SharedImages across canvas resize / mailbox churn).
+
+---
+
+## 13. B4 — real `chrome` port + the disproven per-element premise (2026-07-06)
+
+B4 moved the patch from `content_shell` to the real `chrome` target to get the
+per-element glasses-free eyeball `content_shell` architecturally can't reach (it
+flattens the page). The chrome port **works and is wired end-to-end**; the
+per-element weave **does not fire**, and the reason invalidates the Seam-B premise.
+Checkpoint commit: `displayxr-inline-3d` @ `c1753d518a77b`.
+
+### 13.1 The chrome port (works)
+The `cc` / `components/viz` / `gpu` / `third_party/blink` changes are
+layer-agnostic and already compile into `chrome`; only six `content/shell`-only
+files needed a home. They were extracted into a **shared `components/displayxr/`
+component** (`common` weave mojom, `browser` weave client + weaver/service mojom
+impls, `gpu` provider), consumed by *both* `content_shell` and `chrome`. The three
+`Shell*` hook sites were mirrored onto the chrome embedder:
+- `ChromeBrowserMainParts::PostBrowserStart` → weave-client init, but **deferred
+  to a delayed UI-thread task** (chrome shows its first window via a posted task,
+  so at `PostBrowserStart` the HWND exists but isn't visible yet; the one-shot
+  `bindWindow` needs a visible top-level window — content_shell got away with a
+  synchronous call because it shows its window synchronously).
+- `ChromeContentBrowserClient` → `BindGpuHostReceiver` (GPU→browser weave bridge)
+  + `AppendExtraCommandLineSwitches` (forward `--enable-inline-3d`) +
+  `PopulateChromeFrameBinders` (`blink::mojom::DisplayXRService` frame binder).
+- `ChromeContentGpuClient::PostCompositorThreadCreated` → GPU weave provider.
+
+**Validated live on Leia (`--enable-inline-3d --enable-blink-features=DisplayXRInline3D`):**
+weave-client init, `xrWeaveBindWindowEXT -> 0`, GPU provider registered,
+`XR_EXT_display_info` query, `isSessionSupported('inline-3d')` → `true` (full
+DisplayXRService mojom round-trip), `XRDisplayLayer` constructs + tags the canvas
+(`layer:true, targetOk:true`). No `IPC_IGNORE_VERSION`, no integrity mismatch
+(Medium chrome via explorer-handoff matched the Medium service).
+
+### 13.2 The finding — chrome never gives the canvas a taggable SkiaRenderer quad
+Instrumenting `SkiaRenderer::DrawTextureQuad` (does a tagged quad reach it?) and
+`SkiaOutputSurfaceImplOnGpu::MaybeWeaveSubstitute` (any tagged `ImageContext`?)
+with a late-window + unconditional-on-`weave_target` throttle showed **the canvas
+never becomes a distinct `SkiaRenderer` `TextureDrawQuad`** — `weave_target=1`
+*never* logged, `MaybeWeaveSubstitute` always `tagged=0`. Cross-checked with CDP
+`LayerTree`:
+
+| Scenario | Result |
+|---|---|
+| Sub-page **2D** canvas | Squashed into the page content layer — no canvas compositing layer, no canvas quad. |
+| Sub-page **WebGL** canvas | Same — folded into the page layer (even GPU-backed). |
+| `will-change:transform` (verified applied) | Creates a compositing layer but **still** no canvas `TextureDrawQuad`. |
+| **Full-window** WebGL canvas | **Zero** `DrawTextureQuad` calls — drawn via the overlay/root path, bypassing `SkiaRenderer`. |
+| Whole web-contents at `SkiaRenderer` | One ~`1800×1200` `kTextureContent` quad (pre-composited) + scrollbars. |
+
+**So the §3/§4/§7 Seam-B premise — "real chrome's renderer submits per-element
+quads to Viz, so the tag reaches the per-canvas quad" — is false.** On Windows
+chrome a canvas element is either (a) squashed into the page content layer (its
+pixels rasterized into the page, never a `TextureLayer`/`TextureDrawQuad`), or
+(b) promoted to a **DirectComposition overlay** (its own surface, but composited
+by the system — never a `SkiaRenderer::DrawTextureQuad`). In neither case does the
+tag-at-`DrawTextureQuad` + substitute-woven-`SkImage` seam ever run for the canvas.
+(`content_shell`'s B2c.2 eyeball only passed because its UI-compositor-in-GPU
+*flattens* the full-window canvas into the single quad `SkiaRenderer` draws — a
+quirk, not the per-element path.)
+
+### 13.3 Redesign direction — the CEF sub-rect model (Seam B, open)
+
+**Reframing from the proven Step-A reference.** The `displayxr-cef-host` (Step A)
+*did* weave per-element inline-3D on Leia, and re-reading its source
+(`src/weave_compositor.cpp`, `src/cef_client.cpp`) shows **why**, and why Step B's
+seam was wrong. CEF ran in **offscreen-rendering (OSR)** mode: Chromium composited
+the **whole page** — the 2D surround *and* the canvas's flat SBS pixels, already
+squashed together — into one shared texture and handed it to the host via
+`OnAcceleratedPaint(shared_texture_handle)` → `pageTex`. The host was then an
+**external compositor**: per element per frame it `CopySubresourceRegion`'d the
+element's sub-rect **out of the finished page texture** (`weave_compositor.cpp:294`),
+wove that rectangle, drew the page base into its own back buffer, composited each
+woven sub-rect back over it, and **presented to its own window**
+(`:254–344`). Element rects came from JS via the host bridge; weaves were
+serialized per element (submit → wait → copy → blit) so accumulation-vs-serialize
+(§5 #1) never mattered.
+
+**The takeaway that inverts Seam B:** the CEF host **never needed the canvas to be
+a distinct quad.** The canvas SBS was *baked into the page texture at its rect* —
+exactly the "squash" §13.2 documents in chrome — and the host simply weaved a
+**rectangle of the finished page**. Step B instead tried to substitute a woven
+`SkImage` for the canvas's *own* `TextureDrawQuad` inside Viz (Seam A/B), which
+requires a per-canvas quad chrome never produces. The `1800×1200 kTextureContent`
+quad §13.2 kept finding **is** CEF's `pageTex` (the composited web-contents).
+
+**So the redesign is to transplant the CEF external-compositor flow *into* Viz,**
+not to chase the DComp-overlay path (an earlier draft of this section suggested
+`OverlayProcessorWin`/`DCLayerOverlay`; the CEF model is simpler, proven, and
+sidesteps the compositing-mode fight entirely):
+
+1. **Element rects → Viz via `CompositorFrameMetadata` (kills Seam-D staleness).**
+   `XRDisplayLayer` reports its canvas's window-relative device-px rect
+   (`getBoundingClientRect × DSF`) into the renderer's `CompositorFrameMetadata`
+   (a new `inline_3d_rects` list). This is the Chromium-native equivalent of the
+   CEF host's JS-reported rects, and it arrives at Viz **atomically with the frame**
+   whose pixels it describes — so the rect always matches the composited page (the
+   §3 Seam-D "one-frame-stale → lattice collapse" hazard disappears; no need to read
+   a quad transform). Replaces the B3a `weave_target` cc/quads.mojom tag plumbing.
+2. **Post-paint copy → weave → composite in Viz (the CEF `Composite` loop).** In
+   `SkiaOutputSurfaceImplOnGpu`, **after** the frame's quads are painted (the
+   composited page with the flat SBS canvas is now in the output target) and
+   **before** `SwapBuffers`, for each `inline_3d_rects` entry:
+   `CopySubresourceRegion` the output-target sub-rect → owned keyed-mutex SBS input
+   → `xrWeaveSubmitEXT` (via the unchanged Mojo bridge) → fence-wait → draw the
+   woven texture back over the output at that rect. This mirrors
+   `weave_compositor.cpp` step-for-step (page base already present in the target;
+   overlay each woven sub-rect). Replaces the per-quad tag + `MaybeWeaveSubstitute`
+   at `DrawTextureQuad`.
+3. **Present unchanged** — chrome's normal `SwapBuffers`.
+
+**Reused as-is:** the browser↔GPU Mojo weave bridge, the OpenXR weave client +
+present-owner session (`bindWindow`), `EnsureSbsInput`/keyed-mutex input, the
+woven-handle import + `D3DSharedFence` wait, the shared `components/displayxr/`
+component, and the JS surface (`XRDisplayLayer`, `inline-3d` session, feature
+detect). **Changed:** `XRDisplayLayer` reports a rect into `CompositorFrameMetadata`
+instead of tagging a cc `TextureLayer`; the GPU weave moves from
+`DrawTextureQuad`-substitution to a post-paint output-target overlay loop.
+**Dropped:** the B3a `weave_target` bool on `cc::TextureLayer` / `TextureLayerImpl`
+/ `TextureDrawQuad` / `quads.mojom`, and the `ImageContext` tag / `MaybeWeave
+Substitute` substitution path.
+
+**Open sub-questions for the redesign build:**
+- Output-target readback: confirm `SkiaOutputSurfaceImplOnGpu` can `CopySubresource
+  Region` a sub-rect of the current output D3D texture on the GPU thread post-paint
+  (the CEF host copied from an off-DOM `pageTex`; here the source is the live output
+  render target — may need a scratch copy to avoid a read/write hazard on the same
+  target).
+- Drawing the woven texture back: draw it as a final Skia/D3D quad into the output
+  target at the rect (simplest), vs a DComp overlay visual (only if the readback
+  hazard forces it).
+- 2-view geometry (B3d) is unaffected — once eyes flow from a firing weave, the
+  existing `UpdateInline3DViews` path activates; B4c look-around then becomes
+  testable.
+
+### 13.4 B4b — implemented + eyeball PASSED (2026-07-07)
+
+The §13.3 CEF sub-rect model is **built and validated end-to-end in real `chrome`**
+(branch `displayxr-inline-3d`, commits `33a7971ff5fa8` + cleanup `14efab4d45aaa`).
+Per-element weave fires: the bordered canvas is glasses-free 3D while the 2D chrome
+stays flat — the boundary `content_shell` (page-flatten) could not reach.
+
+**As-built vs §13.3.** Rect transport is exactly as designed:
+`XRDisplayLayer` → `XRSession::ReportInline3DRects` (getBoundingClientRect × DSF) →
+`FrameWidget::SetInline3DRects` → `LayerTreeHost` commit-state →
+`CompositorFrameMetadata::inline_3d_rects` (new field + `array<gfx.mojom.Rect>` mojom +
+traits) → `SurfaceAggregator` → `AggregatedFrame` → `Display::DrawAndSwap` →
+`SkiaOutputSurface::SetInline3DRects` → GPU-thread `MaybeWeaveOutput`. The B3a
+`weave_target` cc/quads.mojom tag + the `DrawTextureQuad` substitution were **removed**.
+The **readback** differs from the §13.3 "output-target sub-rect copy": Graphite is
+async-only for readback and a GPU-created SharedImage came back as a `CompoundImageBacking`
+(no `ProduceOverlay`), so the GPU loop does `SkSurface::readPixels` on the composited
+output sub-rect and hands the CPU BGRA to a new `DisplayXRWeaveProvider::WeavePixels`
+(CPU pixels → intermediate DEFAULT texture → `CopyResource` into the keyed-mutex input —
+`UpdateSubresource` directly into the shared texture invalidates its NT handle). The
+woven texture is drawn back with a Skia `drawImageRect`, holding the read accesses alive
+across the flush+submit.
+
+**Blink gates that had to open for inline-3d to animate** (a sensorless inline session
+has no XRWebGLLayer base layer): treat a registered `XRDisplayLayer` as a valid render
+state (`MaybeRequestFrame`), bypass the focus gate (`XRFrameProvider::ProcessScheduledFrame`
+— a glasses-free display must weave unfocused, and gating it stalls the loop headless), and
+add a minimal inline-3d `OnFrame` path (callbacks + rect report, no layer/transport submit).
+
+**Validation-only launch flags — each a follow-up, NOT the design:**
+`--force_high_performance_gpu` (this is a dual-GPU laptop; the service uses the NVIDIA
+adapter and cross-adapter NT-handle sharing fails E_INVALIDARG on the Intel iGPU — the
+final blocker); `--disable-features=TreesInViz` (chrome's default forwards the frame to Viz
+via `LayerContext::UpdateDisplayTreeFrom`, which carries only `tracked_element_rects` —
+follow-up: plumb `inline_3d_rects` through LayerContext); `--disable-features=SkiaGraphite`
+(CPU readback needs Ganesh synchronous `readPixels` — follow-up: Graphite async readback /
+zero-copy D3D texture).
+
+**Note on the DP, not the patch:** dumping the input (perfect SBS) and the woven output
+(mono left-view) showed the Leia DP was in **2D mode** (`SR D3D11 display mode switched to
+2D`) at that moment — 2D↔3D is tracking-driven, so it interlaces to real 3D only when a
+face is tracked. Interlacing is the DP's job; the Chromium patch delivers the correct SBS
+and composites the woven result regardless.
