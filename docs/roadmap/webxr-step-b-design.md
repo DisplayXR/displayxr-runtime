@@ -902,12 +902,33 @@ state (`MaybeRequestFrame`), bypass the focus gate (`XRFrameProvider::ProcessSch
 — a glasses-free display must weave unfocused, and gating it stalls the loop headless), and
 add a minimal inline-3d `OnFrame` path (callbacks + rect report, no layer/transport submit).
 
-**Validation-only launch flags — each a follow-up, NOT the design:**
-`--disable-features=TreesInViz` (chrome's default forwards the frame to Viz
-via `LayerContext::UpdateDisplayTreeFrom`, which carries only `tracked_element_rects` —
-follow-up: plumb `inline_3d_rects` through LayerContext); `--disable-features=SkiaGraphite`
-(CPU readback needs Ganesh synchronous `readPixels` — follow-up: Graphite async readback /
-zero-copy D3D texture).
+**Validation-only launch flags — a follow-up, NOT the design:**
+`--disable-features=SkiaGraphite` (the post-paint CPU readback uses Ganesh's synchronous
+`SkSurface::readPixels`, which Graphite lacks — follow-up: Graphite blocking-async readback /
+zero-copy D3D texture). Note `--disable-direct-composition` is still present but is a
+**separate output-device concern, not Graphite**: the readback needs the GL output device's
+readable backbuffer `SkSurface`; the DComp output device presents per-overlay with no single
+composited surface to read, so retiring it needs the zero-copy D3D path, independent of the
+Ganesh↔Graphite change.
+
+**`--disable-features=TreesInViz` RETIRED (2026-07-08) — inline_3d_rects plumbed through
+LayerContext.** Chrome's default `TreesInVizInClientProcess()` forwards each frame to Viz as a
+`LayerContext` display-tree update (`LayerTreeUpdate`) that carried `latency_info` +
+`tracked_element_rects` but **not** `inline_3d_rects`; on the Viz side
+`MakeCompositorFrameMetadata` then rebuilt metadata with an empty `inline_3d_rects`
+(`active_tree()->inline_3d_rects()` is never populated on the Viz-side tree), so
+`MaybeWeaveOutput` saw no rects and never wove. Fixed by carrying `inline_3d_rects` through the
+update, mirroring `tracked_element_rects` exactly: a new `array<gfx.mojom.Rect> inline_3d_rects`
+on `LayerTreeUpdate`; the param threaded through `LayerContext::UpdateDisplayTreeFrom` (+ base
+virtual + viz/fake/test impls) and `LayerTreeHostImpl::UpdateDisplayTree` (the client passes
+`compositor_frame.metadata.inline_3d_rects`); applied in `LayerContextImpl` via a new
+`LayerTreeHostImpl::set_inline_3d_rects_from_client` / `inline_3d_rects_from_client_` member;
+and read back in `MakeCompositorFrameMetadata`'s `trees_in_viz_in_viz_process` branch (the
+renderer-side branch keeps reading `active_tree()->inline_3d_rects()`). **Verified:** with
+`--disable-features=TreesInViz` removed, the weave fires end-to-end (service
+`leia_dp_d3d11_process_atlas weave: target=2593x1974 vp=(374,920 1810x1054)`, zero
+`0x80070057`) and the inline canvas is glasses-free 3D (user eyeball). Chromium branch
+`displayxr-inline-3d` commit `6578f2719c16f`.
 
 **`--force_high_performance_gpu` RETIRED (2026-07-07) — blocker #5 resolved.** This is a
 dual-GPU laptop: the service creates the NT-shared keyed-mutex weave input on the runtime's
