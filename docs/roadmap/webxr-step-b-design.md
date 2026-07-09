@@ -931,11 +931,55 @@ removed, `MaybeWeaveRootRenderPass: DComp root pass 2593x1974 rects=1` fires, `c
 ready 1810x1054`, the service weaves (`leia_dp_d3d11_process_atlas weave: target=2593x1974
 vp=(374,920 1810x1054)`) with zero `0x80070057`, and the inline canvas is glasses-free 3D (user
 eyeball). GL path (flag present) re-verified unchanged. Chromium branch `displayxr-inline-3d` commit
-`485518796a94c`. A true zero-copy D3D-texture path (skip the CPU readback via `CopySubresourceRegion`
-of the root backing's `ID3D11Texture2D`) remains an optional efficiency follow-up, not a correctness
-requirement. **All frame-path and output-device launch flags are now retired** — `run_b4.bat` is just
+`485518796a94c`. The GPU-resident weave that removes the CPU readback landed later as **B4d**
+(§13.5). **All frame-path and output-device launch flags are now retired** — `run_b4.bat` is just
 `--enable-inline-3d --enable-blink-features=DisplayXRInline3D
 --disable-features=CalculateNativeWinOcclusion,DelegatedCompositing`.
+
+### 13.5 B4d — GPU-resident weave (skip the per-frame CPU readback), 2026-07-09
+
+The DComp weave path read each inline-3D sub-rect back to CPU (`SkSurface::readPixels` on Ganesh,
+`asyncRescaleAndReadPixelsAndSubmit` on Graphite) and re-uploaded it via
+`DisplayXRWeaveProvider::WeavePixels` — a synchronous GPU→CPU→GPU roundtrip **on the compositor's GPU
+thread every frame**. The megabytes are not the point; the *sync readback stalls the GPU pipeline*,
+which is invisible for a single small element but is a latency/scaling liability for the
+multi-element, high-res spatial-desktop product. B4d makes the copy GPU-resident.
+
+**Design.** `WeaveCompositedSurface` gained a `prefer_zero_copy` arg (`true` from
+`MaybeWeaveRootRenderPass`, the D3D-backed DComp root pass; `false` from `MaybeWeaveOutput`, the GL
+`--disable-direct-composition` path, which keeps the `WeavePixels` readback — the ANGLE backbuffer
+has no extractable texture). On the zero-copy path, per rect: Skia-copy the composited sub-rect from
+the output `SkSurface` into an **owned scratch `D3DImageBacking`** (`makeImageSnapshot` +
+`drawImageRect`, a GPU-only copy), `ProduceOverlayForWeave` its `ID3D11Texture2D`, and hand that to
+the already-present (previously dead) provider primitive `WeaveCanvas`, which
+`CopySubresourceRegion`s it straight into the keyed-mutex weave input. No CPU pixels, no readback
+stall. There is **no read/write hazard with the root backing's open write access** — we snapshot the
+output surface (exactly as `readPixels` already did) and only `ProduceOverlay` a *separate* scratch
+mailbox. Any zero-copy step failing falls back to `WeavePixels` for that rect (still correct).
+
+**Two structural gotchas under Graphite-Dawn** (both cost a build; the "clean" route the B4c note
+imagined — `ProduceOverlay(root_mailbox) -> d3d11_video_texture()` — is a dead end because the DComp
+root backing is a `DXGISwapChainImageBacking`/`DCompSurfaceImageBacking` whose overlay image is the
+swap chain / DComp surface, `kDCompVisualContent`, not a raw texture):
+- **A `SCANOUT` scratch is not sampleable.** `SCANOUT` passes `ProduceOverlay`'s manager gate but
+  forces `want_dcomp_texture` (`d3d_image_backing_factory.cc`), so the overlay image is a DComp visual
+  (`kDCompVisualContent`), not a raw `ID3D11Texture2D`. So the scratch is **non-SCANOUT**, read via
+  **`ProduceOverlayForWeave`** — `ProduceOverlay` minus the `SCANOUT` enforcement — restored to
+  `SharedImageManager`/`SharedImageRepresentationFactory` (it shipped in B2c.2 `656af477`, was removed
+  as dead code in B4b `14efab4d`, and is the *only* way to get a raw texture out of a Viz SharedImage).
+- **A plain `DISPLAY`-only scratch has no overlay.** Under Graphite-Dawn a `DISPLAY_READ|DISPLAY_WRITE`
+  image is claimed by `WrappedSkImageBackingFactory` (no overlay representation → `ProduceOverlay`
+  null) before `D3DImageBackingFactory`. Adding **`CPU_READ`** usage (in D3D's supported set, absent
+  from WrappedSkImage's Graphite set and DComp's, and *not* a `want_dcomp_texture` trigger) routes the
+  scratch to a plain, overlay-exposable `D3DImageBacking` (`kD3D11Texture`).
+
+**Verified 2026-07-09** (Chromium `displayxr-inline-3d` commit `44d39f2d939ba`): DComp run logs
+`weave: GPU-resident scratch path (no CPU readback)` + `canvas tex …` (WeaveCanvas ran) + service
+`leia_dp_d3d11_process_atlas weave: target=2593x1974 vp=(374,920 1810x1054)`, zero `0x80070057`, user
+eyeball glasses-free 3D. GL run (`--disable-direct-composition`) unchanged: `WeavePixels` fallback,
+GPU-resident marker + root-pass hook absent. The change is scoped to `WeaveCompositedSurface`
+(`skia_output_surface_impl_on_gpu.{h,cc}`) plus the two additive Win-only `ProduceOverlayForWeave`
+methods; the GL path's correctness is untouched.
 
 **`--disable-features=SkiaGraphite` RETIRED (2026-07-08) — Graphite-compatible readback.**
 `MaybeWeaveOutput` read the composited output sub-rect via synchronous `SkSurface::readPixels`,
