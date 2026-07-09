@@ -902,14 +902,32 @@ state (`MaybeRequestFrame`), bypass the focus gate (`XRFrameProvider::ProcessSch
 — a glasses-free display must weave unfocused, and gating it stalls the loop headless), and
 add a minimal inline-3d `OnFrame` path (callbacks + rect report, no layer/transport submit).
 
-**Validation-only launch flags — a follow-up, NOT the design:**
-`--disable-features=SkiaGraphite` (the post-paint CPU readback uses Ganesh's synchronous
-`SkSurface::readPixels`, which Graphite lacks — follow-up: Graphite blocking-async readback /
-zero-copy D3D texture). Note `--disable-direct-composition` is still present but is a
-**separate output-device concern, not Graphite**: the readback needs the GL output device's
-readable backbuffer `SkSurface`; the DComp output device presents per-overlay with no single
-composited surface to read, so retiring it needs the zero-copy D3D path, independent of the
-Ganesh↔Graphite change.
+**Only remaining launch flag — a follow-up, NOT the design: `--disable-direct-composition`.**
+It is a **separate output-device concern** (not Ganesh↔Graphite): `MaybeWeaveOutput` reads the
+composited output sub-rect, which requires the GL output device's readable backbuffer
+`SkSurface`. With DirectComposition the output device is `SkiaOutputDeviceDComp`, which presents
+per-overlay with no single composited surface to read, so `MaybeWeaveOutput`'s guards bail and
+nothing weaves. **Verified 2026-07-08:** with `--disable-direct-composition` removed the weave
+client still binds the window (`xrWeaveBindWindowEXT -> 0`) but no frame weaves (no
+`process_atlas`), while the page keeps animating (`window.__t` climbs) — so it is specifically
+the output-surface read, not frame production. Retiring it needs the zero-copy D3D-texture path
+(weave the output texture's sub-rect directly, skipping the CPU readback), independent of the
+two flags retired below.
+
+**`--disable-features=SkiaGraphite` RETIRED (2026-07-08) — Graphite-compatible readback.**
+`MaybeWeaveOutput` read the composited output sub-rect via synchronous `SkSurface::readPixels`,
+which exists only on Ganesh; Graphite has no sync readback, so B4b forced Ganesh. Now
+dual-backend: on Graphite, `context_state_->FlushGraphiteRecorder()` then the blocking-async
+`GraphiteSharedContext::asyncRescaleAndReadPixelsAndSubmit` (submit + wait) of the sub-rect into
+a local `WeaveReadPixelsContext`, feeding `async_result->data(0)`/`rowBytes(0)` to `WeavePixels`
+(which already tolerates an arbitrary stride via its DEFAULT upload texture); Ganesh keeps the
+sync `readPixels`. Mirrors `SkiaOutputDeviceOffscreen::ReadbackForTesting`; the woven draw-back
++ `FlushSurface` + submit were already backend-agnostic. **Verified:** with the flag removed
+`SystemInfo.getInfo` reports `skia_graphite: enabled_on` (Graphite is the live backend, so the
+new path runs), the weave fires end-to-end (service `leia_dp_d3d11_process_atlas weave:
+target=2593x1974 vp=(374,920 1810x1054)`, zero `0x80070057`, chrome `canvas weave input ready
+1810x1054`) and the inline canvas is glasses-free 3D (user eyeball). Chromium branch
+`displayxr-inline-3d` commit `7db14cade7986`.
 
 **`--disable-features=TreesInViz` RETIRED (2026-07-08) — inline_3d_rects plumbed through
 LayerContext.** Chrome's default `TreesInVizInClientProcess()` forwards each frame to Viz as a
