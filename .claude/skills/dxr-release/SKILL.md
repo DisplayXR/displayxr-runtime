@@ -65,6 +65,15 @@ provider's **`sign-artifact`** folder hook (send DLL → sign → re-inject), no
 `build-signed-release.yml`. See the Unity branch in Phase 3.5. The macOS
 `.bundle` stays unsigned (separate Apple track).
 
+**Unity's version of record is in-tree (`package.json` `version`)** — not
+`versions.json`, not the tag alone. It's what the website's org-sync generator
+reads for `/platform-support` and what UPM consumers resolve. So the unity
+release path (Phase 2) commits a **real** version bump as its marker, and the
+sign block reconciles `main` when a release was cut by a direct tag; a website
+`org-changed` dispatch refreshes the site (no `versions.json` bump fires for
+unity). Consequence of getting this wrong: the site shows the previous version
+even though the `.tgz`/`upm` carry the new one.
+
 `runtime` → tell the user to use `/release` (in-repo). `installer` →
 tell them to use `/installer-release`.
 
@@ -151,15 +160,45 @@ PREV_TAG=$(git tag --sort=-creatordate | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | h
 **Skip this entire phase when `SIGN_ONLY=1`** (unity, release already cut) — the
 tag + release already exist; jump straight to Phase 3.5.
 
-Create an **empty** "Release vX.Y.Z" marker commit on the sibling's
-`main` and tag THAT commit — same pattern as `/release` on the runtime
-and the Unity/Unreal plugin repos, so every repo's history shows an
-obvious release boundary (which release got which commits). Empty
-commit = no version content = no drift vector.
+Create a "Release vX.Y.Z" marker commit on the sibling's `main` and tag
+THAT commit — same pattern as `/release` on the runtime, so every repo's
+history shows an obvious release boundary (which release got which
+commits). For most components the marker is **empty** (no version content
+= no drift vector) — their version lives in `versions.json` (bumped by the
+dispatch) or is derived from the tag at build time.
+
+**Unity is the exception — its marker MUST bump the in-tree version.**
+Unlike every other component, Unity's version of record is
+`package.json`'s `version` field: it's what the website's org-sync
+generator reads for the `/platform-support` dashboard and what UPM
+consumers resolve. `build-native.yml` patches the version into the `.tgz`
+asset and the `upm` branch **from the tag**, but never commits that bump
+back to `main` — so an empty marker leaves `main` (and therefore the
+website) showing the *previous* version. So for unity the marker is a
+**real** commit that bumps `package.json` (and prepends a `CHANGELOG.md`
+stub) to the release version, tagged as the release. This is not drift —
+the in-tree version IS unity's source of truth.
 
 ```bash
-git commit --allow-empty -m "Release $NEW_TAG"
-# Retry once if main moved underneath us (the empty commit rebases trivially).
+if [ "$COMPONENT" = unity ]; then
+  VER="${NEW_TAG#v}"
+  jq --arg v "$VER" '.version = $v' package.json > package.json.tmp && mv package.json.tmp package.json
+  if [ -f CHANGELOG.md ]; then
+    # Insert a stub entry before the first "## [" heading (keeps the file title),
+    # seeded with the commits since the previous tag — curate afterwards if wanted.
+    ENTRY="## [$VER] - $(date +%F)
+$(git log --oneline --no-merges "$PREV_TAG..HEAD" 2>/dev/null | sed 's/^/- /')
+"
+    awk -v e="$ENTRY" 'BEGIN{d=0} /^## \[/&&!d{print e; d=1} {print} END{if(!d)print e}' CHANGELOG.md > CHANGELOG.md.tmp && mv CHANGELOG.md.tmp CHANGELOG.md
+    git add CHANGELOG.md
+  fi
+  git add package.json
+  git commit -m "Release $NEW_TAG"                    # real bump commit = the marker
+else
+  git commit --allow-empty -m "Release $NEW_TAG"      # empty marker (version lives elsewhere)
+fi
+# Retry once if main moved underneath us (empty commit rebases trivially; the
+# unity bump may need a re-apply — `git pull --rebase` handles both).
 git push origin HEAD:main || (git pull --rebase origin main && git push origin HEAD:main)
 git tag -a "$NEW_TAG" -m "$NEW_TAG
 
@@ -167,6 +206,10 @@ Commits since $PREV_TAG:
 $(git log --oneline --no-merges "$PREV_TAG..HEAD" 2>/dev/null | head -20)"
 git push origin "$NEW_TAG"
 ```
+
+For unity, `build-native.yml`'s "Verify package.json version matches tag"
+step then becomes a no-op (main already matches) instead of a silent
+working-tree-only patch.
 
 Notes:
 - The marker push fires the sibling's regular main-push CI alongside
@@ -264,6 +307,28 @@ version>`; it detects the existing release and signs it in place.
 if [ "$COMPONENT" = unity ]; then
   SIGN_REPO="${DXR_SIGN_REPO}"   # local env only; unset -> unsigned (public repo names no provider)
   VER="${NEW_TAG#v}"
+
+  # ── Reconcile main's in-tree version ──────────────────────────────────────
+  # Runs for BOTH paths. On the fresh-tag path Phase 2 already bumped main, so
+  # this is a no-op. On the SIGN_ONLY path (release cut by a DIRECT `v*` tag on
+  # displayxr-unity — Phase 2 skipped) main's package.json was never bumped and
+  # no release marker exists, so the website's /platform-support shows the OLD
+  # version even though the .tgz/upm branch carry the new one (build-native.yml
+  # patches those from the tag but never commits back to main). Push a forward
+  # bump + marker so main is authoritative for the org-sync generator.
+  git fetch origin main --quiet 2>/dev/null || true
+  MAIN_VER=$(git show origin/main:package.json 2>/dev/null | jq -r .version 2>/dev/null)
+  if [ -n "$MAIN_VER" ] && [ "$MAIN_VER" != "$VER" ]; then
+    echo "main package.json=$MAIN_VER but tag=$VER — pushing forward bump + marker."
+    git checkout -B main origin/main --quiet
+    jq --arg v "$VER" '.version = $v' package.json > package.json.tmp && mv package.json.tmp package.json
+    git add package.json
+    git commit -m "Release $NEW_TAG (post-tag version reconcile)"
+    git push origin HEAD:main || (git pull --rebase origin main && git push origin HEAD:main)
+    echo "✓ main package.json bumped to $VER (CHANGELOG left for manual curation on this path)."
+    UNITY_MAIN_RECONCILED=yes   # surface in the Phase 6 report
+  fi
+
   TGZ="com.displayxr.unity-${VER}.tgz"
   DLL_REL="Runtime/Plugins/Windows/x64/displayxr_unity.dll"
   UNITY_SIGNED=no
@@ -326,6 +391,12 @@ if [ "$COMPONENT" = unity ]; then
     fi
     rm -rf "$D"
   fi
+  # Refresh the website now — unity fires no versions-bump, so nothing else kicks
+  # the site's org-sync. Best-effort; the daily cron catches it otherwise. (Needs
+  # a gh token with access to displayxr-website; the direct-push flow already has it.)
+  gh api repos/DisplayXR/displayxr-website/dispatches -f event_type=org-changed >/dev/null 2>&1 \
+    && echo "✓ fired org-changed at displayxr-website (regenerates the unity version on /platform-support)" \
+    || echo "(could not dispatch org-changed to displayxr-website — the daily cron will catch up)"
   # Verify (optional, if on Windows): Get-AuthenticodeSignature on the re-uploaded DLL.
   # Unity has no versions.json field → SKIP Steps 3.5.1–3.5.3 and Phase 4; go to Phase 6.
 fi
@@ -511,6 +582,12 @@ CI:          run $RUN_ID — $CI_CONC
 Release:     https://github.com/$REL_REPO/releases/tag/$NEW_TAG
 Signing:     [signed → "installer built + signed on the signing runner (full chain incl. uninstaller, run $SIGN_RUN), re-uploaded over the CI asset"]
              [none   → "⚠ UNSIGNED — signing runner unreachable / earthview macOS .pkg; ships the unsigned CI asset"]
+             [unity  → "displayxr_unity.dll signed + re-injected into the .tgz + upm branch" | "⚠ unity ships unsigned"]
+
+[unity only — Version (in-tree, no versions.json):
+  package.json version = $VER on displayxr-unity/main   (marker "Release $NEW_TAG")
+  [if UNITY_MAIN_RECONCILED=yes: "⚠ tag was cut directly on displayxr-unity — main was behind; pushed a post-tag reconcile bump. Prefer cutting unity releases THROUGH this skill so the bump + CHANGELOG land in the release marker."]
+  website: org-changed dispatched → /platform-support regenerates the version]
 
 Auto-bump:
   versions.json[$FIELD] = $NEW_TAG   via $RT_BUMP_SHA on displayxr-runtime/main
@@ -544,5 +621,17 @@ cadence from the runtime, where curated notes are the norm).
   map above, add a `versions.json` field on runtime, add the
   `DispatchVersionsBump` step to the new repo's CI per
   `docs/specs/runtime/versions-json-autobump.md` §"Sibling-side snippets".
+- **In-tree version = the marker must bump it.** Most components' version lives
+  in `versions.json` (dispatch-bumped) or is derived from the tag at build time,
+  so an *empty* release marker is correct. But a component whose version of
+  record is a committed file — unity's `package.json` `version`, unreal's
+  `.uplugin` `VersionName` — must have that file **bumped in the release
+  marker**, or the website's org-sync generator (which reads those files on
+  `main`) shows the previous version even though the release asset is current.
+  The unity path does this (Phase 2 bump + Phase-3.5 reconcile + website
+  dispatch); replicate the pattern for any future in-tree-versioned component.
+  (Unreal is released by its own on-Windows `/release`, not this skill — but the
+  same bump-on-release rule applies there. Website generator source of truth:
+  `displayxr-website/scripts/sync-org.mjs` + `docs/org-sync.md`.)
 - Tags are sticky. Deleting a tag also deletes its GH Release. Prefer
   fixing forward with a patch release.
