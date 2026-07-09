@@ -274,10 +274,22 @@ struct StripLayer {
 static StripLayer g_strip;
 
 // Zones activation: created a few frames in, once the session runs.
+// #727: DXR_ZONES_ACTIVATE_AT=N overrides the default frame-10 gate — N=1
+// mirrors the Unity plugin, which publishes its zone from the very first
+// frame (its mono flip lands exactly at the first zone-mask publish, so
+// activation timing relative to session/weaver init is a live suspect).
 static bool g_zonesActive = false;
 static bool g_zonesAttempted = false;
 static long g_zonesFrameCounter = 0;
-static const long kZonesActivationFrame = 10;
+static long ZonesActivationFrame() {
+    static long cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("DXR_ZONES_ACTIVATE_AT");
+        long n = (v != nullptr) ? atol(v) : 0;
+        cached = (n >= 1) ? n : 10;
+    }
+    return cached;
+}
 
 // Wish modes (M key): 0 AUTO, 1 explicit Tier-2 rects, 2 explicit Tier-3
 // feathered render-target mask.
@@ -965,6 +977,24 @@ static void PresentAndMaybeDump(RenderState& rs) {
     if (g_texDumpEnabled && !g_texDumpDone && g_texFrameCounter >= kTexDumpFrame) {
         g_texDumpDone = true;
         DumpSharedTextureToPNG(renderer, g_texDumpPath.c_str());
+    }
+
+    // #727: DXR_TEXDUMP_FRAMES=N — additionally dump the woven texture on each
+    // of the FIRST N frames (…_f000.png, _f001.png, …), mirroring the Unity
+    // plugin's per-frame capture so a sharp good→mono transition (e.g. at zone
+    // activation) is visible frame-by-frame. Requires DXR_TEXDUMP for the path.
+    if (g_texDumpEnabled) {
+        static long dumpFirstN = -1;
+        if (dumpFirstN < 0) {
+            const char* v = getenv("DXR_TEXDUMP_FRAMES");
+            dumpFirstN = (v != nullptr) ? atol(v) : 0;
+        }
+        if (g_texFrameCounter <= dumpFirstN) {
+            char path[MAX_PATH];
+            snprintf(path, sizeof(path), "%s_f%03ld.png",
+                     g_texDumpPath.c_str(), g_texFrameCounter - 1);
+            DumpSharedTextureToPNG(renderer, path);
+        }
     }
 }
 
@@ -2194,7 +2224,7 @@ static void RenderOneFrame(RenderState& rs) {
     // ---- zones path -------------------------------------------------------
     g_zonesFrameCounter++;
     if (g_hasDisplayZonesExt && !g_zonesActive && !g_zonesAttempted &&
-        g_zonesFrameCounter >= kZonesActivationFrame) {
+        g_zonesFrameCounter >= ZonesActivationFrame()) {
         TryActivateZones(xr, renderer);
     }
     if (g_zonesActive && g_hasDisplayZonesExt) {
