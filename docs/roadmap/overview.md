@@ -13,7 +13,7 @@ Stripped Monado from 500+ files to ~150. Removed 34 VR drivers and the Vulkan se
 - Drivers: vendor display-processor plug-ins (e.g. a lenticular hardware DP), plus in-tree sim_display (simulation) and qwerty (keyboard/mouse)
 - Four app classes: handle, texture, hosted, IPC
 - Custom OpenXR extensions: `XR_EXT_display_info`, `XR_EXT_win32_window_binding`, `XR_EXT_cocoa_window_binding`
-- Platforms: Windows, macOS, and Android ship for most features; **Linux is in progress** (headless substrate first, then an in-process Vulkan/XCB compositor — see [Linux Support](linux-support.md))
+- Platforms: Windows, macOS, and Android ship for most features; **Linux is hardware-validated in Preview** (Vulkan-only X11/XCB compositor, code-complete + rendering on real hardware, not yet GA — tarball only; see [Linux Support](linux-support.md))
 
 ### Stabilization (M3 + M4) — In Progress (~60%)
 

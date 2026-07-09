@@ -105,6 +105,9 @@ brew install cmake ninja eigen vulkan-sdk
 Builds the runtime, OpenXR loader, and test apps. The macOS Vulkan native compositor runs via MoltenVK over a CAMetalLayer-backed surface (see `cube_handle_vk_macos`); an earlier `VK_ERROR_EXTENSION_NOT_PRESENT` runtime failure was a MoltenVK-era issue that has since been resolved. The remaining macOS-Vulkan dev gotcha is a two-`libvulkan` loader-image conflict (the dev build's image vs the installed runtime's) — share one loader image / pin `XR_RUNTIME_JSON` to avoid it.
 
 ### Linux
+
+> **Preview — hardware-validated on NVIDIA / Ubuntu 22.04, pre-GA.** Linux is Vulkan-only (native compositor over an X11/XCB surface) and distributed as a user-level tarball; no installer asset ships on releases yet. Phase status: `docs/roadmap/linux-support.md`.
+
 ```bash
 ./scripts/build_linux.sh              # headless build + selftest (deps list in the script header)
 ./scripts/build_linux.sh --service    # + displayxr-service / IPC

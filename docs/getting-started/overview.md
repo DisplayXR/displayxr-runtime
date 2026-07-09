@@ -69,6 +69,6 @@ The diagram above shows the in-process path — a single app talking directly to
 
 ## Next Steps
 
-- [Building DisplayXR](building.md) — build instructions for Windows and macOS
+- [Building DisplayXR](building.md) — build instructions for Windows, macOS, and Linux
 - [App Classes](app-classes.md) — understand the four ways an app can integrate with DisplayXR
 - [Your First Handle App](first-handle-app.md) — tutorial walkthrough

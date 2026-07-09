@@ -8,6 +8,7 @@
 
 [![Build Windows](https://github.com/DisplayXR/displayxr-runtime/actions/workflows/build-windows.yml/badge.svg)](https://github.com/DisplayXR/displayxr-runtime/actions/workflows/build-windows.yml)
 [![Build macOS](https://github.com/DisplayXR/displayxr-runtime/actions/workflows/build-macos.yml/badge.svg)](https://github.com/DisplayXR/displayxr-runtime/actions/workflows/build-macos.yml)
+[![Build Linux](https://github.com/DisplayXR/displayxr-runtime/actions/workflows/build-linux.yml/badge.svg)](https://github.com/DisplayXR/displayxr-runtime/actions/workflows/build-linux.yml)
 [![License: BSL-1.0](https://img.shields.io/badge/License-BSL--1.0-blue.svg)](LICENSE)
 
 An open-source [OpenXR](https://www.khronos.org/openxr/) runtime for spatial displays — 3D monitors and laptops with tracked stereo and multiview lightfield display technology.
@@ -34,13 +35,15 @@ App (any graphics API)
 
 Every graphics API gets its own native compositor — no Vulkan intermediary, no interop overhead. Vendor-specific processing (interlacing, lenticular weaving) is isolated in the display processor layer.
 
-| API | Windows | macOS |
-|-----|---------|-------|
-| D3D11 | Shipping | — |
-| D3D12 | Shipping | — |
-| Metal | — | Shipping |
-| OpenGL | Shipping | Shipping |
-| Vulkan | Shipping | Shipping |
+| API | Windows | macOS | Linux |
+|-----|---------|-------|-------|
+| D3D11 | Shipping | — | — |
+| D3D12 | Shipping | — | — |
+| Metal | — | Shipping | — |
+| OpenGL | Shipping | Shipping | — |
+| Vulkan | Shipping | Shipping | Preview |
+
+Linux is **Vulkan-only** (native compositor over an X11/XCB surface) and in **Preview** — hardware-validated on NVIDIA / Ubuntu 22.04, not yet GA. See [Linux Support](docs/roadmap/linux-support.md).
 
 ## Quick Start
 
@@ -68,12 +71,14 @@ Downloads each component's installer from its GitHub Releases page (versions pin
 
 For full control, install each component directly from its release page. Order: runtime → Shell → Leia plug-in → MCP Tools.
 
-| Component | Windows | macOS |
-|---|---|---|
-| **DisplayXR Runtime** (required) | [`DisplayXRSetup-*.exe`](https://github.com/DisplayXR/displayxr-runtime/releases) | [`DisplayXR-Installer-*.pkg`](https://github.com/DisplayXR/displayxr-runtime/releases) |
-| **DisplayXR Shell** (optional, spatial workspace UX) | [`DisplayXRShellSetup-*.exe`](https://github.com/DisplayXR/displayxr-shell-releases/releases) | — (deferred) |
-| **Leia SR plug-in** (Leia hardware only) | [`DisplayXRLeiaSRSetup-*.exe`](https://github.com/DisplayXR/displayxr-leia-plugin/releases) | — (vendor SDK is Windows-only) |
-| **MCP Tools** (optional, AI-agent / voice control) | [`DisplayXRMCPSetup-*.exe`](https://github.com/DisplayXR/displayxr-mcp/releases) | — (future) |
+| Component | Windows | macOS | Linux |
+|---|---|---|---|
+| **DisplayXR Runtime** (required) | [`DisplayXRSetup-*.exe`](https://github.com/DisplayXR/displayxr-runtime/releases) | [`DisplayXR-Installer-*.pkg`](https://github.com/DisplayXR/displayxr-runtime/releases) | tarball ([`package_linux.sh`](scripts/package_linux.sh)) — Preview |
+| **DisplayXR Shell** (optional, spatial workspace UX) | [`DisplayXRShellSetup-*.exe`](https://github.com/DisplayXR/displayxr-shell-releases/releases) | — (deferred) | — (not ported) |
+| **Leia SR plug-in** (Leia hardware only) | [`DisplayXRLeiaSRSetup-*.exe`](https://github.com/DisplayXR/displayxr-leia-plugin/releases) | — (vendor SDK is Windows-only) | — (in progress) |
+| **MCP Tools** (optional, AI-agent / voice control) | [`DisplayXRMCPSetup-*.exe`](https://github.com/DisplayXR/displayxr-mcp/releases) | — (future) | — (future) |
+
+On Linux the runtime installs from a user-level tarball (`scripts/package_linux.sh` → `dist/*.tar.gz` with `install.sh`); there is no released installer yet.
 
 The website's [Get Started](https://displayxr.org/getting-started) page walks through the manual flow end-to-end with verification steps.
 
@@ -149,6 +154,7 @@ XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./test_apps/build/bin/cube_han
 | [displayxr-mcp](https://github.com/DisplayXR/displayxr-mcp) | Embeddable MCP server framework + **DisplayXR MCP Tools** installer (end-user opt-in for agent / voice control) |
 | [displayxr-demo-gaussiansplat](https://github.com/DisplayXR/displayxr-demo-gaussiansplat) | 3D Gaussian Splatting reference demo |
 | [displayxr-unity](https://github.com/DisplayXR/displayxr-unity) | Unity engine plugin (UPM package) |
+| [displayxr-unity-samples](https://github.com/DisplayXR/displayxr-unity-samples) | Unity sample projects + shared installer (consolidates the archived `displayxr-unity-test*` repos) |
 | [displayxr-unreal](https://github.com/DisplayXR/displayxr-unreal) | Unreal Engine plugin |
 | [displayxr-common](https://github.com/DisplayXR/displayxr-common) | Generalized off-axis frustum projection math library (`displayxr::math` + `displayxr::common`) |
 

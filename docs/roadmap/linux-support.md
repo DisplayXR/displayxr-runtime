@@ -1,15 +1,18 @@
 # Linux Support
 
-Status: **Phase 1/3 ✅ hardware-validated** — hosted + handle
-(`XR_EXT_xlib_window_binding`) sessions bring up the native Vulkan/XCB compositor
-and render the stereo cube on real Vulkan+X11 hardware (Ubuntu 22.04, RTX 3080;
-#708 / #706). **Phase 2 (service/IPC): partial** — IPC connects and runs a full
-session lifecycle, but the service-side compositor renders nothing yet (no Vulkan
-bundle) → **#710**. **Demos:** build-green in CI (24.04) but several fail to build
-on a real Ubuntu 22.04 desktop (GCC 11 / ffmpeg 4.4) — modelviewer renders;
-mediaplayer/gaussiansplat/earthview build-fail; avatar partial (see #706 + the
-per-demo issues). Next: fix those + Phase 2 (#710) + packaging (#705). Windows,
-macOS, and Android ship today.
+Status: **Preview — code-complete + hardware-validated, not yet GA.** Phases 0/1a/2a/3a
+are code-complete on `main`; hosted + handle (`XR_EXT_xlib_window_binding`) sessions
+bring up the native Vulkan/XCB compositor and render the stereo cube on real Vulkan+X11
+hardware (Ubuntu 22.04, RTX 3080 + Acer SpatialLabs DS1; #708 / #706), and the **Track B
+real srSDK Vulkan weave is HW-validated on the DS1** (lens enables). Runtime **v1.28.0**
+is the first tag with complete Linux support. Distribution = user-level **tarball** via
+`scripts/package_linux.sh` (#705/#713) — no installer asset ships on releases. **CI:** a
+tri-LTS matrix (Ubuntu 22.04/24.04/26.04) is a required check on the runtime and all 5
+demos (#714/#722); all 5 demos are build-green on real 22.04/24.04/26.04 desktops.
+**Still open:** Phase 2b service-side render (**#710**), windowed-3D phase origin
+(**#729/#730**, twin of Windows #85), the deployment target (Ubuntu 26.04 + Intel Arc,
+blocked on hardware), and the Track B shippable re-pin onto a merged `sr-sdk-v*` tag.
+Windows, macOS, and Android ship today.
 
 ## TL;DR
 

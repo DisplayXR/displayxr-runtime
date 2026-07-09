@@ -19,7 +19,7 @@
 Build apps for 3D displays using the OpenXR standard.
 
 - **[Getting Started](getting-started/overview.md)** — what is DisplayXR, architecture, sim_display
-- **[Building](getting-started/building.md)** — build instructions for Windows and macOS
+- **[Building](getting-started/building.md)** — build instructions for Windows, macOS, and Linux
 - **[Android Build Guide](getting-started/android-build-guide.md)** — Lume Pad-class hardware: vendor SDK setup, Gradle, install
 - **[Android Bring-Up Checklist](getting-started/android-bringup-checklist.md)** — A→B→C→D step-by-step test plan for first hardware install
 - **[App Classes](getting-started/app-classes.md)** — handle, texture, hosted, IPC — which one to use

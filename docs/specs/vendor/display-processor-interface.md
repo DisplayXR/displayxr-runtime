@@ -121,4 +121,4 @@ All APIs should use **`process_views`**, not `process_stereo`:
 - GL display processor interface added
 - sim_display Vulkan processor updated to accept SBS input
 - All existing implementations updated
-- CI passes on Windows and macOS
+- CI passes on Windows, macOS, and Linux

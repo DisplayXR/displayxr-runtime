@@ -24,7 +24,7 @@ git clang-format    # Format only your changes (preferred)
 cd build && ctest
 ```
 
-Ensure your changes build cleanly on both Windows and macOS. CI runs automatically on PRs.
+Ensure your changes build cleanly on Windows, macOS, and Linux. CI runs automatically on PRs.
 
 ---
 

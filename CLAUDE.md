@@ -4,9 +4,9 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 
 ## Overview
 
-DisplayXR is a lightweight standalone OpenXR runtime purpose-built for 3D displays (originally forked from **Monado**). It implements the Khronos OpenXR API on Windows, macOS, and Android. The runtime is vendor-agnostic — any 3D display vendor integrates via a plug-in DLL; **Leia SR** is the first integration.
+DisplayXR is a lightweight standalone OpenXR runtime purpose-built for 3D displays (originally forked from **Monado**). It implements the Khronos OpenXR API on Windows, macOS, Linux, and Android. The runtime is vendor-agnostic — any 3D display vendor integrates via a plug-in DLL; **Leia SR** is the first integration.
 
-**Current state:** native compositors ship for all major graphics APIs (D3D11, D3D12, Metal, OpenGL, Vulkan). The display extensions and the vendor plug-in extraction are complete. The spatial shell ships on Windows (macOS port deferred). Full status: [milestone tracker](https://github.com/DisplayXR/displayxr-runtime/milestones).
+**Current state:** native compositors ship for all major graphics APIs (D3D11, D3D12, Metal, OpenGL, Vulkan). The display extensions and the vendor plug-in extraction are complete. The spatial shell ships on Windows (macOS port deferred). Linux (X11/XCB, Vulkan-only compositor) is **hardware-validated but pre-GA** — code-complete on `main` and rendering on real Vulkan+X11 hardware, distributed as a tarball via `scripts/package_linux.sh` (no installer asset ships yet). Full status: [milestone tracker](https://github.com/DisplayXR/displayxr-runtime/milestones) · [Linux Support](docs/roadmap/linux-support.md).
 
 ## Architecture
 
@@ -101,6 +101,16 @@ First run downloads deps (vcpkg, OpenXR loader). Requires VS 2022 (C++ workload)
 ./scripts/build_macos.sh
 ```
 Builds runtime, OpenXR loader, test apps. The macOS Vulkan native compositor runs via MoltenVK over a CAMetalLayer-backed surface (`cube_handle_vk_macos`); an earlier `VK_ERROR_EXTENSION_NOT_PRESENT` failure was a MoltenVK-era issue since resolved. The one dev gotcha is the two-`libvulkan` loader-image conflict (dev build vs installed runtime) — see `docs/getting-started/building.md` and pin `XR_RUNTIME_JSON` / share one loader image.
+
+### Linux (Preview — HW-validated on NVIDIA/Ubuntu 22.04, pre-GA)
+```bash
+# apt deps listed in the script header (Vulkan, XCB, glslang, …)
+./scripts/build_linux.sh              # headless build + selftest
+./scripts/build_linux.sh --service    # + displayxr-service / IPC
+./scripts/build_linux.sh --apps       # + test apps (cube_hosted/handle vk_linux)
+./scripts/package_linux.sh            # dist/*.tar.gz + user-level install.sh (#705)
+```
+Linux is **Vulkan-only** — a native Vulkan compositor presents over an X11/XCB surface (`comp_vk_native_window_xcb.c`); no D3D/Metal/GL backend. Apps pass their window via `XR_EXT_xlib_window_binding`. Full walkthrough: `docs/getting-started/building.md` § *Linux*; status + phases: `docs/roadmap/linux-support.md`. **Guard convention:** desktop-Linux code must gate on **`XRT_OS_LINUX_DESKTOP`** (`= XRT_OS_LINUX && !XRT_OS_ANDROID`) — a bare `XRT_OS_LINUX` also matches Android and will pull desktop-only symbols into the Android build.
 
 ### Standard CMake
 ```bash
@@ -207,6 +217,8 @@ spec: `docs/specs/runtime/release-signing.md`.
 | `displayxr-leia-plugin` | Public | Leia SR DP plug-in source + `DisplayXRLeiaSRSetup-*.exe`. |
 | `displayxr-extensions` | Public | OpenXR extension headers, auto-synced from this repo. |
 | `displayxr-demo-*` | Public | Standalone demos (independent evolution; no source-mirror). |
+| `displayxr-unity` | Public | Unity engine plug-in (UPM package `com.displayxr.unity`); dev issues here. Coupled to the runtime only by the OpenXR extension wire protocol. |
+| `displayxr-unity-samples` | Public | Unity sample projects (birp-multipass, urp/hdrp-singlepass-ui, desktop-avatar) + a single shared NSIS installer. Signed `v1.0.0` ships 4 per-sample installers. **Releases are NOT in `versions.json` / the meta-bundle / `/dxr-release`.** Consolidates the four **archived** `displayxr-unity-test*` repos (now redirect). |
 
 **Issue rules:** runtime dev issues → this repo; shell dev issues → `displayxr-shell-pvt`; user-facing shell bugs → `displayxr-shell-releases` (triage → file dev issue on shell-pvt if actionable). Never dual-create across repos. External contributors PR directly against this repo.
 
