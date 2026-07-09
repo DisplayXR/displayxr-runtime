@@ -1826,18 +1826,29 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			uint32_t dp_target_w = static_cast<uint32_t>(st_desc.Width);
 			uint32_t dp_target_h = static_cast<uint32_t>(st_desc.Height);
 
+			// Log the first 5 frames AND every canvas-validity flip. The flip
+			// log matters: apps that activate zones lazily (e.g. the zones
+			// test apps, frame ~10) flip invalid→valid AFTER the first-5
+			// window, so a first-5-only log makes the steady-state weave look
+			// like the full-frame fallback when it is actually zone-confined
+			// (#727 was mis-triaged off exactly that artifact).
 			static uint32_t pa_log = 0;
-			if (pa_log < 5) {
+			static int pa_prev_valid = -1;
+			const int pa_valid = eff_canvas.valid ? 1 : 0;
+			if (pa_log < 5 || pa_valid != pa_prev_valid) {
 				U_LOG_W("process_atlas: view=%ux%u tiles=%ux%u dp_target=%ux%u "
-				        "canvas=(%d,%d %ux%u)",
+				        "canvas=(%d,%d %ux%u)%s",
 				        view_width, view_height, tile_columns, tile_rows,
 				        dp_target_w, dp_target_h,
 				        eff_canvas.valid ? eff_canvas.x : -1,
 				        eff_canvas.valid ? eff_canvas.y : -1,
 				        eff_canvas.valid ? eff_canvas.w : 0,
-				        eff_canvas.valid ? eff_canvas.h : 0);
+				        eff_canvas.valid ? eff_canvas.h : 0,
+				        (pa_prev_valid != -1 && pa_valid != pa_prev_valid)
+				            ? " [canvas validity CHANGED]" : "");
 				pa_log++;
 			}
+			pa_prev_valid = pa_valid;
 
 			// #491 part 3 — flatten the 2D-under layers PRE-weave (records into
 			// the open cmd_list, leaves backdrop_scratch in PSR) and hand the

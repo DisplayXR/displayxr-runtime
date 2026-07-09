@@ -246,6 +246,19 @@ static bool ZoneSliceColors() {
     return cached != 0;
 }
 
+// #727 Unity-mirror config: DXR_ZONES_FULLWIN=1 runs a SINGLE zone covering the
+// whole client window (no strip, no zone B) — the shape the Unity plugin submits
+// (one full-window zone supplies the canvas). Combine with DXR_ZONE_ROUTE /
+// DXR_SLICE_COLORS to A/B exactly that configuration.
+static bool ZonesFullWindow() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("DXR_ZONES_FULLWIN");
+        cached = (v != nullptr && v[0] != '\0' && v[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 static const XrRect2Di kZoneARect        = {{0, 180}, {640, 540}};
 static const XrRect2Di kZoneBRect        = {{700, 180}, {520, 360}};
 static const XrRect2Di kZoneBOverlapRect = {{400, 300}, {520, 360}};
@@ -1780,6 +1793,24 @@ static void TryActivateZones(XrSessionManager& xr, D3D12Renderer& renderer) {
     g_zonesArr[1].clearColor[2] = 0.0f;
     g_zonesArr[1].clearColor[3] = 0.0f;
 
+    // #727 Unity-mirror: one zone spanning the whole client window, no strip,
+    // no zone B — matches the Unity plugin's forced full-window zone so the
+    // runtime/DP see the identical zones shape (full-window canvas, wish
+    // evaluates 3D everywhere).
+    const bool fullwin = ZonesFullWindow();
+    if (fullwin) {
+        g_activeZones = 1;
+        RECT cr = {};
+        if (xr.windowHandle != nullptr && GetClientRect(xr.windowHandle, &cr) &&
+            cr.right > 0 && cr.bottom > 0) {
+            g_zonesArr[0].rect = {{0, 0}, {(int32_t)cr.right, (int32_t)cr.bottom}};
+        } else {
+            g_zonesArr[0].rect = {{0, 0}, {(int32_t)g_windowWidth, (int32_t)g_windowHeight}};
+        }
+        LOG_INFO("[zones] DXR_ZONES_FULLWIN=1 — single full-window zone %dx%d, no strip",
+                 g_zonesArr[0].rect.extent.width, g_zonesArr[0].rect.extent.height);
+    }
+
     for (uint32_t zi = 0; zi < g_activeZones; zi++) {
         if (!CreateZoneResources(xr, renderer, g_zonesArr[zi], viewCount)) {
             g_hasDisplayZonesExt = false;
@@ -1787,19 +1818,20 @@ static void TryActivateZones(XrSessionManager& xr, D3D12Renderer& renderer) {
         }
     }
 
-    if (!CreateAndFillStrip(xr, renderer)) {
+    if (!fullwin && !CreateAndFillStrip(xr, renderer)) {
         g_hasDisplayZonesExt = false;
         return;
     }
 
     g_zonesActive = true;
     LOG_INFO("[zones] ACTIVE: zone A %d,%d %dx%d + zone B %d,%d %dx%d + strip %d,%d %dx%d "
-             "(views=%u, wish mode 0 AUTO, validate=%d) — M=wish mode, O=overlap toggle",
-             kZoneARect.offset.x, kZoneARect.offset.y, kZoneARect.extent.width, kZoneARect.extent.height,
+             "(views=%u, activeZones=%u, fullwin=%d, wish mode 0 AUTO, validate=%d) — M=wish mode, O=overlap toggle",
+             g_zonesArr[0].rect.offset.x, g_zonesArr[0].rect.offset.y,
+             g_zonesArr[0].rect.extent.width, g_zonesArr[0].rect.extent.height,
              g_zonesArr[1].rect.offset.x, g_zonesArr[1].rect.offset.y,
              g_zonesArr[1].rect.extent.width, g_zonesArr[1].rect.extent.height,
              kStripRect.offset.x, kStripRect.offset.y, kStripRect.extent.width, kStripRect.extent.height,
-             viewCount, ZonesValidateEnabled() ? 1 : 0);
+             viewCount, g_activeZones, (int)fullwin, ZonesValidateEnabled() ? 1 : 0);
 }
 
 // Per-frame zones path: zone-scoped locate, per-zone render, submit
