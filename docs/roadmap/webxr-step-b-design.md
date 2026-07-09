@@ -860,15 +860,16 @@ instead of tagging a cc `TextureLayer`; the GPU weave moves from
 / `TextureDrawQuad` / `quads.mojom`, and the `ImageContext` tag / `MaybeWeave
 Substitute` substitution path.
 
-**Open sub-questions for the redesign build:**
-- Output-target readback: confirm `SkiaOutputSurfaceImplOnGpu` can `CopySubresource
-  Region` a sub-rect of the current output D3D texture on the GPU thread post-paint
-  (the CEF host copied from an off-DOM `pageTex`; here the source is the live output
-  render target — may need a scratch copy to avoid a read/write hazard on the same
-  target).
-- Drawing the woven texture back: draw it as a final Skia/D3D quad into the output
-  target at the rect (simplest), vs a DComp overlay visual (only if the readback
-  hazard forces it).
+**Open sub-questions for the redesign build (all now resolved — see §13.4):**
+- Output-target readback: **resolved.** The composited output is read via
+  `SkSurface::readPixels` (Ganesh) / `asyncRescaleAndReadPixelsAndSubmit` (Graphite)
+  from the surface being painted — the GL output-device surface under
+  `--disable-direct-composition`, or the **root render-pass backing surface** under
+  DComp (a readable swap-chain-backed image). The read happens before the woven
+  draw-back, so there is no read/write hazard and no scratch copy is needed.
+- Drawing the woven texture back: **resolved** — drawn as a final Skia
+  `drawImageRect` (`kSrc`, nearest) into the same surface at the rect, held alive
+  across the flush+submit. No DComp overlay visual was needed.
 - 2-view geometry (B3d) is unaffected — once eyes flow from a firing weave, the
   existing `UpdateInline3DViews` path activates; B4c look-around then becomes
   testable.
@@ -902,17 +903,39 @@ state (`MaybeRequestFrame`), bypass the focus gate (`XRFrameProvider::ProcessSch
 — a glasses-free display must weave unfocused, and gating it stalls the loop headless), and
 add a minimal inline-3d `OnFrame` path (callbacks + rect report, no layer/transport submit).
 
-**Only remaining launch flag — a follow-up, NOT the design: `--disable-direct-composition`.**
-It is a **separate output-device concern** (not Ganesh↔Graphite): `MaybeWeaveOutput` reads the
-composited output sub-rect, which requires the GL output device's readable backbuffer
-`SkSurface`. With DirectComposition the output device is `SkiaOutputDeviceDComp`, which presents
-per-overlay with no single composited surface to read, so `MaybeWeaveOutput`'s guards bail and
-nothing weaves. **Verified 2026-07-08:** with `--disable-direct-composition` removed the weave
-client still binds the window (`xrWeaveBindWindowEXT -> 0`) but no frame weaves (no
-`process_atlas`), while the page keeps animating (`window.__t` climbs) — so it is specifically
-the output-surface read, not frame production. Retiring it needs the zero-copy D3D-texture path
-(weave the output texture's sub-rect directly, skipping the CPU readback), independent of the
-two flags retired below.
+**`--disable-direct-composition` RETIRED (2026-07-09) — weave on the DComp root render-pass.**
+This was the last launch-flag crutch, and the earlier framing (it "needs the zero-copy D3D-texture
+path") turned out to be wrong. The root cause was **where** the weave hook lived, not CPU-vs-GPU
+copy. `MaybeWeaveOutput` ran only from `FinishPaintCurrentFrame` — the **GL output-device** path,
+which `--disable-direct-composition` forces (`SkiaOutputDeviceGL` with a readable backbuffer
+`SkSurface`). Under chrome's default DirectComposition, `renderer_allocates_images = true`, so the
+composited page (2D chrome + each inline-3d canvas's flat SBS, squashed together — the CEF `pageTex`
+equivalent) is drawn into the **root render-pass backing** via `FinishPaintRenderPass`, a writable
+window-sized Skia surface; the output-device surface is never painted
+(`SkiaOutputDeviceDComp::BeginPaint` is `NOTIMPLEMENTED`). So `MaybeWeaveOutput`'s
+`scoped_output_device_paint_->sk_surface()` guard bailed and nothing wove — exactly the "binds the
+window but no `process_atlas`" symptom observed on 2026-07-08.
+
+The root render-pass backing is a readable Skia surface (under DComp it is `root_buffer_queue_`-managed
+with `scanout_dcomp_surface = false`, i.e. a swap-chain-backed image, **not** a write-only DComp
+surface), so the **same** composited-sub-rect readback+weave loop serves both output devices — no
+zero-copy D3D-texture path was needed. Fix (`skia_output_surface_impl_on_gpu.{h,cc}`): the weave
+loop was extracted into `WeaveCompositedSurface(output, out_canvas)`; `MaybeWeaveOutput` (GL) still
+delegates to it unchanged, and a new `MaybeWeaveRootRenderPass` hook in `FinishPaintRenderPass`
+(both the Ganesh `DrawDDL` and Graphite `insertRecording` branches) runs it on the window-sized
+(`== size_`), `is_overlay` root pass. Non-root overlay passes are element-sized and skipped, and the
+two paths are mutually exclusive (under GL the root uses `BeginPaintCurrentFrame`, so the render-pass
+hook never matches — no double-weave; verified: `MaybeWeaveRootRenderPass` is **absent** from the GL
+run's log and present in the DComp run's). **Verified 2026-07-09:** with `--disable-direct-composition`
+removed, `MaybeWeaveRootRenderPass: DComp root pass 2593x1974 rects=1` fires, `canvas weave input
+ready 1810x1054`, the service weaves (`leia_dp_d3d11_process_atlas weave: target=2593x1974
+vp=(374,920 1810x1054)`) with zero `0x80070057`, and the inline canvas is glasses-free 3D (user
+eyeball). GL path (flag present) re-verified unchanged. Chromium branch `displayxr-inline-3d` commit
+`485518796a94c`. A true zero-copy D3D-texture path (skip the CPU readback via `CopySubresourceRegion`
+of the root backing's `ID3D11Texture2D`) remains an optional efficiency follow-up, not a correctness
+requirement. **All frame-path and output-device launch flags are now retired** — `run_b4.bat` is just
+`--enable-inline-3d --enable-blink-features=DisplayXRInline3D
+--disable-features=CalculateNativeWinOcclusion,DelegatedCompositing`.
 
 **`--disable-features=SkiaGraphite` RETIRED (2026-07-08) — Graphite-compatible readback.**
 `MaybeWeaveOutput` read the composited output sub-rect via synchronous `SkSurface::readPixels`,
