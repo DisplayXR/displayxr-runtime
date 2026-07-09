@@ -902,14 +902,71 @@ state (`MaybeRequestFrame`), bypass the focus gate (`XRFrameProvider::ProcessSch
 — a glasses-free display must weave unfocused, and gating it stalls the loop headless), and
 add a minimal inline-3d `OnFrame` path (callbacks + rect report, no layer/transport submit).
 
-**Validation-only launch flags — each a follow-up, NOT the design:**
-`--force_high_performance_gpu` (this is a dual-GPU laptop; the service uses the NVIDIA
-adapter and cross-adapter NT-handle sharing fails E_INVALIDARG on the Intel iGPU — the
-final blocker); `--disable-features=TreesInViz` (chrome's default forwards the frame to Viz
-via `LayerContext::UpdateDisplayTreeFrom`, which carries only `tracked_element_rects` —
-follow-up: plumb `inline_3d_rects` through LayerContext); `--disable-features=SkiaGraphite`
-(CPU readback needs Ganesh synchronous `readPixels` — follow-up: Graphite async readback /
-zero-copy D3D texture).
+**Only remaining launch flag — a follow-up, NOT the design: `--disable-direct-composition`.**
+It is a **separate output-device concern** (not Ganesh↔Graphite): `MaybeWeaveOutput` reads the
+composited output sub-rect, which requires the GL output device's readable backbuffer
+`SkSurface`. With DirectComposition the output device is `SkiaOutputDeviceDComp`, which presents
+per-overlay with no single composited surface to read, so `MaybeWeaveOutput`'s guards bail and
+nothing weaves. **Verified 2026-07-08:** with `--disable-direct-composition` removed the weave
+client still binds the window (`xrWeaveBindWindowEXT -> 0`) but no frame weaves (no
+`process_atlas`), while the page keeps animating (`window.__t` climbs) — so it is specifically
+the output-surface read, not frame production. Retiring it needs the zero-copy D3D-texture path
+(weave the output texture's sub-rect directly, skipping the CPU readback), independent of the
+two flags retired below.
+
+**`--disable-features=SkiaGraphite` RETIRED (2026-07-08) — Graphite-compatible readback.**
+`MaybeWeaveOutput` read the composited output sub-rect via synchronous `SkSurface::readPixels`,
+which exists only on Ganesh; Graphite has no sync readback, so B4b forced Ganesh. Now
+dual-backend: on Graphite, `context_state_->FlushGraphiteRecorder()` then the blocking-async
+`GraphiteSharedContext::asyncRescaleAndReadPixelsAndSubmit` (submit + wait) of the sub-rect into
+a local `WeaveReadPixelsContext`, feeding `async_result->data(0)`/`rowBytes(0)` to `WeavePixels`
+(which already tolerates an arbitrary stride via its DEFAULT upload texture); Ganesh keeps the
+sync `readPixels`. Mirrors `SkiaOutputDeviceOffscreen::ReadbackForTesting`; the woven draw-back
++ `FlushSurface` + submit were already backend-agnostic. **Verified:** with the flag removed
+`SystemInfo.getInfo` reports `skia_graphite: enabled_on` (Graphite is the live backend, so the
+new path runs), the weave fires end-to-end (service `leia_dp_d3d11_process_atlas weave:
+target=2593x1974 vp=(374,920 1810x1054)`, zero `0x80070057`, chrome `canvas weave input ready
+1810x1054`) and the inline canvas is glasses-free 3D (user eyeball). Chromium branch
+`displayxr-inline-3d` commit `7db14cade7986`.
+
+**`--disable-features=TreesInViz` RETIRED (2026-07-08) — inline_3d_rects plumbed through
+LayerContext.** Chrome's default `TreesInVizInClientProcess()` forwards each frame to Viz as a
+`LayerContext` display-tree update (`LayerTreeUpdate`) that carried `latency_info` +
+`tracked_element_rects` but **not** `inline_3d_rects`; on the Viz side
+`MakeCompositorFrameMetadata` then rebuilt metadata with an empty `inline_3d_rects`
+(`active_tree()->inline_3d_rects()` is never populated on the Viz-side tree), so
+`MaybeWeaveOutput` saw no rects and never wove. Fixed by carrying `inline_3d_rects` through the
+update, mirroring `tracked_element_rects` exactly: a new `array<gfx.mojom.Rect> inline_3d_rects`
+on `LayerTreeUpdate`; the param threaded through `LayerContext::UpdateDisplayTreeFrom` (+ base
+virtual + viz/fake/test impls) and `LayerTreeHostImpl::UpdateDisplayTree` (the client passes
+`compositor_frame.metadata.inline_3d_rects`); applied in `LayerContextImpl` via a new
+`LayerTreeHostImpl::set_inline_3d_rects_from_client` / `inline_3d_rects_from_client_` member;
+and read back in `MakeCompositorFrameMetadata`'s `trees_in_viz_in_viz_process` branch (the
+renderer-side branch keeps reading `active_tree()->inline_3d_rects()`). **Verified:** with
+`--disable-features=TreesInViz` removed, the weave fires end-to-end (service
+`leia_dp_d3d11_process_atlas weave: target=2593x1974 vp=(374,920 1810x1054)`, zero
+`0x80070057`) and the inline canvas is glasses-free 3D (user eyeball). Chromium branch
+`displayxr-inline-3d` commit `6578f2719c16f`.
+
+**`--force_high_performance_gpu` RETIRED (2026-07-07) — blocker #5 resolved.** This is a
+dual-GPU laptop: the service creates the NT-shared keyed-mutex weave input on the runtime's
+adapter (the high-performance NVIDIA RTX 3080, LUID `…0001b9d9`, selected by
+`xrGetD3D11GraphicsRequirementsKHR`), while chrome's GPU process defaulted to the Intel iGPU
+— so the service's `OpenSharedResource(NT)` on that handle failed cross-adapter
+(`E_INVALIDARG` / `0x80070057`). The manual `--force_high_performance_gpu` aligned them.
+That is now **automatic under `--enable-inline-3d`**: the existing DisplayXR block in
+`ContentBrowserClient::AppendExtraCommandLineSwitches`
+(`chrome_content_browser_client.cc` + `shell_content_browser_client.cc`) appends the
+`FORCE_HIGH_PERFORMANCE_GPU` driver-bug workaround switch
+(`gpu::GpuDriverBugWorkaroundTypeToString(gpu::FORCE_HIGH_PERFORMANCE_GPU)`) to the
+**gpu-process** child command line — provably equivalent to the flag (the underscore
+`--force_high_performance_gpu` is that workaround name copied through by
+`gpu_process_host.cc`; both converge on `FORCE_HIGH_PERFORMANCE_GPU` → ANGLE `EGL_HIGH_POWER`
+/ Dawn `HighPerformance` adapter selection). **Verified:** with the flag removed, the GPU
+weave device's adapter LUID logged `…0001b9d9` (== runtime) and the weave fired
+(`leia_dp_d3d11_process_atlas weave: vp=(374,920 1810x1054)`) with zero `0x80070057`. The
+LUID-exact `--use-adapter-luid` path is an unneeded generalization — the runtime always
+prefers the high-performance adapter, so forcing high-performance matches it by construction.
 
 **Note on the DP, not the patch:** dumping the input (perfect SBS) and the woven output
 (mono left-view) showed the Leia DP was in **2D mode** (`SR D3D11 display mode switched to
