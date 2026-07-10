@@ -133,6 +133,8 @@ Order of work, smallest testable first:
 
 So the right artifact for (4) is the **minimal rebasable patch of §2.4 Step B**, not a product fork (running a browser = rebasing Chrome's ~4-week cadence + security treadmill + signing + auto-update — a dedicated team). The realistic **early adopters are the other Chromium-derived browsers** (Edge, Brave, Arc, Opera, Vivaldi) — they can cherry-pick a clean patch far more readily than Google will originate a spec.
 
+**Shipping that patch to *our own* users = a bounded "DisplayXR Browser" developer preview**, not a maintained daily driver: a signed, branded static Chromium build (the Step-B inline-3D patch) that renders the whole web normally and weaves glasses-free 3D on DisplayXR hardware, with an explicit preview/security policy that avoids the treadmill above. Full packaging plan, repo strategy (`displayxr-browser` for the build, `displayxr-web` for the three.js samples/SDK), maintenance policy, and phased implementation: [`displayxr-browser-preview.md`](displayxr-browser-preview.md). This preview + its demos are also the **evidence packet** levers (2)+(3) depend on.
+
 ### 2.6 Sequencing
 
 1. **DXR weave RPC** (§2.4 Step 0) — window-bound `bindWindow` + `weave(handle, rect) → {weaved, eyes}`; validate the DP round-trip, look-around from the returned eyes, **and its per-frame latency** headless on real 3D-display hardware, no browser. ✅ shipped (`XR_EXT_weave`, hw-validated).
