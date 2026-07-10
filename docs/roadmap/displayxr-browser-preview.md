@@ -15,11 +15,13 @@ distribution" — the one adoption goal that is fully in our control). The deliv
 - **In scope:** a signed, branded, installable Chromium build that renders the whole web normally
   and weaves glasses-free 3D for `inline-3d` WebXR pages on DisplayXR hardware; a first-run that
   provisions/detects the runtime + display plug-in; a GitHub Release + a site download.
-- **Explicitly out of scope (the treadmill):** a promise to track Chrome's ~4-week security cadence
-  indefinitely, Widevine DRM, Google Sync/Safe-Browsing, and silent auto-update. These are what make
-  "run a browser" a dedicated-team commitment (`webxr-support.md` §2.5); the preview framing is how we
-  capture the upside — dev adoption, demos, the evidence that drives the hardware + standards
-  narrative — without it.
+- **Commitment (bounded):** rebase ~monthly onto each Chrome **stable milestone** (§6) — mechanical
+  because the patch is small and touches a known file set.
+- **Explicitly out of scope (the treadmill):** Chrome's *mid-cycle security* cadence (the ~1–2-week
+  dot-releases between milestones — we track milestones monthly, not those), Widevine DRM, Google
+  Sync/Safe-Browsing, and silent auto-update. These are what make "run a browser" a dedicated-team
+  commitment (`webxr-support.md` §2.5); the monthly-milestone + preview framing captures the upside —
+  dev adoption, demos, the evidence that drives the hardware + standards narrative — without it.
 
 **Why a preview, not a product fork:** `webxr-support.md` §2.4/§2.5 already concluded the fork should
 be *"deliberately not a maintained product fork"* — it is simultaneously (a) how we deliver inline-3D
@@ -96,20 +98,25 @@ Naming note: `displayxr-web` = the *web content/SDK* surface (distinct from `dis
 
 ## 6. Maintenance policy — the load-bearing decision
 
-The preview lives or dies on a *bounded* commitment. Proposed policy (adjust before first ship):
+The preview lives or dies on a *bounded* commitment. **Decision (locked):**
 
-- **Pin to a Chrome *stable* milestone**, not tip-of-tree. Rebase the patch on a **chosen cadence**
-  (e.g. every 2–3 milestones, or quarterly) — explicitly **not** every 4-week release.
-- **Security posture = preview disclaimer.** The download page and first-run state plainly: *"Developer
-  preview. Not maintained to Chrome's security cadence — do not use for sensitive browsing; use your
-  primary browser for banking/etc."* This is the honest, defensible stance for a demo build and it
-  retires the duty-of-care objection.
-- **Update = manual.** A "check for updates" action that points at the latest GitHub Release. No silent
-  Omaha-style updater (that is its own subsystem + a stronger security promise than a preview should
-  make).
-- **EOL clause.** State that the preview may lag or pause between rebases; it is a showcase, not a
-  supported product. If/when a Chromium-derived browser (Edge/Brave) or upstream adopts the module, the
-  preview's job is done.
+- **Pin to a Chrome *stable* milestone; rebase ~monthly** — track each new stable milestone
+  (Chrome's cadence is ~4 weeks), not tip-of-tree and not every mid-cycle dot-release. The inline-3D
+  patch is small and touches a known, enumerated file set (§5), so a milestone rebase is mechanical —
+  roughly a monthly `fetch → apply patches → resolve any drift → build → verify weave → sign → release`
+  pass. **Honest caveat that keeps the disclaimer mandatory:** monthly milestone rebases do **not**
+  pick up Chrome's *out-of-band security patches* (shipped every ~1–2 weeks between milestones), so
+  the build is always some days-to-weeks behind on security fixes.
+- **Security posture = preview disclaimer (non-negotiable, stays regardless of cadence).** The download
+  page and first-run state plainly: *"Developer preview. Rebased ~monthly onto Chrome stable, but not
+  maintained to Chrome's mid-cycle security cadence — do not use for sensitive browsing; use your
+  primary browser for banking/etc."* Honest, defensible, and it retires the duty-of-care objection.
+- **Update = lightweight version check, not silent auto-update.** On launch, check the GitHub Releases
+  API for a newer preview and surface a "new version available → download" prompt (no silent install).
+  A monthly release cadence makes this check meaningful without standing up an Omaha-style updater
+  (heavy, and a stronger security promise than a preview should make).
+- **EOL clause.** The preview may lag or pause between rebases; it is a showcase, not a supported
+  product. If/when a Chromium-derived browser (Edge/Brave) or upstream adopts the module, its job is done.
 
 ## 7. Platform scope
 
