@@ -979,17 +979,28 @@ static void PresentAndMaybeDump(RenderState& rs) {
         DumpSharedTextureToPNG(renderer, g_texDumpPath.c_str());
     }
 
-    // #727: DXR_TEXDUMP_FRAMES=N — additionally dump the woven texture on each
-    // of the FIRST N frames (…_f000.png, _f001.png, …), mirroring the Unity
-    // plugin's per-frame capture so a sharp good→mono transition (e.g. at zone
-    // activation) is visible frame-by-frame. Requires DXR_TEXDUMP for the path.
+    // #727: DXR_TEXDUMP_FRAMES=N or A-B — additionally dump the woven texture
+    // per-frame (…_fNNN.png): N dumps the first N frames; "A-B" dumps frames
+    // A..B inclusive (to bracket a good→mono transition that lands later than
+    // the warmup). Requires DXR_TEXDUMP for the path.
     if (g_texDumpEnabled) {
-        static long dumpFirstN = -1;
-        if (dumpFirstN < 0) {
+        static long dumpFrom = -1, dumpTo = -1;
+        if (dumpFrom < 0) {
+            dumpFrom = 0;
+            dumpTo = 0;
             const char* v = getenv("DXR_TEXDUMP_FRAMES");
-            dumpFirstN = (v != nullptr) ? atol(v) : 0;
+            if (v != nullptr) {
+                const char* dash = strchr(v, '-');
+                if (dash != nullptr) {
+                    dumpFrom = atol(v);
+                    dumpTo = atol(dash + 1);
+                } else {
+                    dumpFrom = 1;
+                    dumpTo = atol(v);
+                }
+            }
         }
-        if (g_texFrameCounter <= dumpFirstN) {
+        if (g_texFrameCounter >= dumpFrom && g_texFrameCounter <= dumpTo) {
             char path[MAX_PATH];
             snprintf(path, sizeof(path), "%s_f%03ld.png",
                      g_texDumpPath.c_str(), g_texFrameCounter - 1);
