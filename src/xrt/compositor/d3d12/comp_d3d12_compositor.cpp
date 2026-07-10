@@ -138,6 +138,11 @@ struct comp_d3d12_compositor
 	//! True if shared texture mode is active (offscreen rendering).
 	bool has_shared_texture;
 
+	//! #727 dual-tap diagnostics (DXR_WEAVE_TAP): a post-composite dump is
+	//! pending for this frame; index names the output file.
+	bool tap_postcomposite_pending;
+	long tap_postcomposite_idx;
+
 	//! D3D12 display processor.
 	struct xrt_display_processor_d3d12 *display_processor;
 
@@ -1285,11 +1290,14 @@ d3d12_compositor_capture_atlas_to_png(struct comp_d3d12_compositor *c, const cha
 // atlas capture (pre-weave), this shows what the display processor actually
 // produced — the interlaced panel image — so a zone dropped by the WEAVE (not
 // by compositing) is visible. File-triggered: touch %TEMP%\dxr_woven_trigger,
-// output %TEMP%\dxr_woven.png. back_buffer must be in PRESENT state on entry
-// (post-Present); left in PRESENT on exit.
+// output %TEMP%\dxr_woven.png. back_buffer must be in `entry_state` on entry
+// (PRESENT for the post-Present capture; COMMON for the #727 weave taps);
+// left in `entry_state` on exit. Resets + reuses c->cmd_list, so the caller
+// must have executed any recorded-but-unsubmitted work first.
 static bool
 d3d12_capture_backbuffer_to_png(struct comp_d3d12_compositor *c,
                                 ID3D12Resource *back_buffer,
+                                D3D12_RESOURCE_STATES entry_state,
                                 const char *path)
 {
 	if (back_buffer == nullptr || c->device == nullptr) {
@@ -1331,7 +1339,7 @@ d3d12_capture_backbuffer_to_png(struct comp_d3d12_compositor *c,
 	b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 	b.Transition.pResource = back_buffer;
 	b.Transition.Subresource = 0;
-	b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+	b.Transition.StateBefore = entry_state;
 	b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
 	c->cmd_list->ResourceBarrier(1, &b);
 
@@ -1880,6 +1888,40 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 			c->cmd_list->ResourceBarrier(2, barriers);
 
+			// #727 dual tap: DXR_WEAVE_TAP=N dumps the shared texture right
+			// after the DP weave (pre zone-mask composite) and again after
+			// the composite, for the first N DP frames — splits a mono
+			// verdict between the weave and the composite. Costly (full
+			// GPU flush + readback + PNG per tap); diagnostics only.
+			// %TEMP%\dxr_tap_fNNN_{a_postweave,b_postcomposite}.png
+			static long tap_total = -1;
+			if (tap_total < 0) {
+				const char *tv = getenv("DXR_WEAVE_TAP");
+				tap_total = (tv != nullptr) ? atol(tv) : 0;
+			}
+			static long tap_frame = 0;
+			const bool tap_this = tap_frame < tap_total;
+			const long tap_idx = tap_frame;
+			tap_frame++;
+			const char *tap_tmp = getenv("TEMP");
+
+			if (tap_this && tap_tmp != nullptr) {
+				// Flush the recorded weave so the texture holds its output.
+				c->cmd_list->Close();
+				ID3D12CommandList *tap_lists[] = {c->cmd_list};
+				c->command_queue->ExecuteCommandLists(1, tap_lists);
+				gpu_wait_idle(c);
+				char tap_path[MAX_PATH];
+				snprintf(tap_path, sizeof(tap_path),
+				         "%s\\dxr_tap_f%03ld_a_postweave.png", tap_tmp, tap_idx);
+				d3d12_capture_backbuffer_to_png(c, c->shared_texture,
+				                                D3D12_RESOURCE_STATE_COMMON, tap_path);
+				// Re-arm the cmd list for the composite below (the capture
+				// helper leaves it closed+executed).
+				c->cmd_allocator->Reset();
+				c->cmd_list->Reset(c->cmd_allocator, nullptr);
+			}
+
 			// #439 / ADR-027: an authored zone mask or Local2D layers
 			// composite the 2D/3D regions of the shared texture. dst is in
 			// COMMON (just transitioned above); leave it in COMMON after.
@@ -1889,6 +1931,13 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			    c, c->shared_texture, st_rtv.ptr,
 			    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON,
 			    dp_target_w, dp_target_h, &eff_canvas);
+
+			// #727 dual tap, second point: after the composite lands (needs
+			// the close/execute/fence below to have run — defer via flag).
+			if (tap_this && tap_tmp != nullptr) {
+				c->tap_postcomposite_pending = true;
+				c->tap_postcomposite_idx = tap_idx;
+			}
 
 		} else if (atlas_resource != nullptr) {
 			// No DP: raw copy atlas to shared texture (2D mode fallback)
@@ -1926,6 +1975,20 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		if (c->fence->GetCompletedValue() < c->fence_value) {
 			c->fence->SetEventOnCompletion(c->fence_value, c->fence_event);
 			WaitForSingleObject(c->fence_event, INFINITE);
+		}
+
+		// #727 dual tap, second point: composite is GPU-complete here.
+		if (c->tap_postcomposite_pending) {
+			c->tap_postcomposite_pending = false;
+			const char *tap_tmp2 = getenv("TEMP");
+			if (tap_tmp2 != nullptr) {
+				char tap_path[MAX_PATH];
+				snprintf(tap_path, sizeof(tap_path),
+				         "%s\\dxr_tap_f%03ld_b_postcomposite.png", tap_tmp2,
+				         c->tap_postcomposite_idx);
+				d3d12_capture_backbuffer_to_png(c, c->shared_texture,
+				                                D3D12_RESOURCE_STATE_COMMON, tap_path);
+			}
 		}
 
 		// #224 / ADR-027 P4: sideband-sync this client's zone state with
@@ -2147,7 +2210,8 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					remove(trig);
 					char out[512];
 					snprintf(out, sizeof(out), "%s\\dxr_woven.png", tmp);
-					bool wok = d3d12_capture_backbuffer_to_png(c, back_buffer, out);
+					bool wok = d3d12_capture_backbuffer_to_png(c, back_buffer,
+				                                           D3D12_RESOURCE_STATE_PRESENT, out);
 					U_LOG_W("#672 woven back-buffer capture %s -> %s",
 					        wok ? "OK" : "FAILED", out);
 				}
@@ -2481,6 +2545,8 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	c->shared_texture = nullptr;
 	c->shared_texture_rtv_heap = nullptr;
 	c->has_shared_texture = false;
+	c->tap_postcomposite_pending = false;
+	c->tap_postcomposite_idx = 0;
 	if (shared_texture_handle != nullptr) {
 		HANDLE st_handle = static_cast<HANDLE>(shared_texture_handle);
 		hr = c->device->OpenSharedHandle(
