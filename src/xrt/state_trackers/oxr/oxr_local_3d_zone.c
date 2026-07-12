@@ -140,7 +140,7 @@ oxr_local_3d_zone_destroy_cb(struct oxr_logger *log, struct oxr_handle_base *hb)
  */
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrGetLocal3DZoneCapabilitiesEXT(XrSession session, XrLocal3DZoneCapabilitiesDXR *capabilities)
+oxr_xrGetLocal3DZoneCapabilitiesDXR(XrSession session, XrLocal3DZoneCapabilitiesDXR *capabilities)
 {
 	OXR_TRACE_MARKER();
 
@@ -228,7 +228,7 @@ oxr_xrGetLocal3DZoneCapabilitiesEXT(XrSession session, XrLocal3DZoneCapabilities
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrCreateLocal3DZoneMaskEXT(XrSession session,
+oxr_xrCreateLocal3DZoneMaskDXR(XrSession session,
                                const XrLocal3DZoneMaskCreateInfoDXR *createInfo,
                                XrLocal3DZoneMaskDXR *mask)
 {
@@ -323,7 +323,7 @@ oxr_xrCreateLocal3DZoneMaskEXT(XrSession session,
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetLocal3DZoneWholeWindowEXT(XrLocal3DZoneMaskDXR mask, XrBool32 enable3D)
+oxr_xrSetLocal3DZoneWholeWindowDXR(XrLocal3DZoneMaskDXR mask, XrBool32 enable3D)
 {
 	OXR_TRACE_MARKER();
 
@@ -384,7 +384,7 @@ oxr_xrSetLocal3DZoneWholeWindowEXT(XrLocal3DZoneMaskDXR mask, XrBool32 enable3D)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetLocal3DZoneFromRectsEXT(XrLocal3DZoneMaskDXR mask, uint32_t rectCount, const XrRect2Di *rects)
+oxr_xrSetLocal3DZoneFromRectsDXR(XrLocal3DZoneMaskDXR mask, uint32_t rectCount, const XrRect2Di *rects)
 {
 	OXR_TRACE_MARKER();
 
@@ -460,7 +460,7 @@ oxr_xrSetLocal3DZoneFromRectsEXT(XrLocal3DZoneMaskDXR mask, uint32_t rectCount, 
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrAcquireLocal3DZoneRenderTargetEXT(XrLocal3DZoneMaskDXR mask, void *binding)
+oxr_xrAcquireLocal3DZoneRenderTargetDXR(XrLocal3DZoneMaskDXR mask, void *binding)
 {
 	OXR_TRACE_MARKER();
 
@@ -569,7 +569,7 @@ oxr_xrAcquireLocal3DZoneRenderTargetEXT(XrLocal3DZoneMaskDXR mask, void *binding
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSubmitLocal3DZoneEXT(XrLocal3DZoneMaskDXR mask)
+oxr_xrSubmitLocal3DZoneDXR(XrLocal3DZoneMaskDXR mask)
 {
 	OXR_TRACE_MARKER();
 
@@ -623,7 +623,7 @@ oxr_xrSubmitLocal3DZoneEXT(XrLocal3DZoneMaskDXR mask)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrDestroyLocal3DZoneMaskEXT(XrLocal3DZoneMaskDXR mask)
+oxr_xrDestroyLocal3DZoneMaskDXR(XrLocal3DZoneMaskDXR mask)
 {
 	OXR_TRACE_MARKER();
 

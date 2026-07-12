@@ -124,7 +124,7 @@ translate_info(struct oxr_logger *log,
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrRequestFilePickerEXT(XrSession session,
+oxr_xrRequestFilePickerDXR(XrSession session,
                            const XrFilePickerInfoDXR *info,
                            XrAsyncRequestIdDXR *requestId)
 {
@@ -228,7 +228,7 @@ oxr_xrRequestFilePickerEXT(XrSession session,
  */
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrGetFilePickerRequestEXT(XrSession session,
+oxr_xrGetFilePickerRequestDXR(XrSession session,
                               XrAsyncRequestIdDXR requestId,
                               uint32_t *outClientId,
                               XrFilePickerInfoDXR *outInfo)
@@ -297,7 +297,7 @@ oxr_xrGetFilePickerRequestEXT(XrSession session,
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrCompleteFilePickerEXT(XrSession session,
+oxr_xrCompleteFilePickerDXR(XrSession session,
                             XrAsyncRequestIdDXR requestId,
                             XrFilePickerResultDXR result,
                             const char *path)

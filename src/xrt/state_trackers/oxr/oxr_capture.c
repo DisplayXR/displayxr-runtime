@@ -252,7 +252,7 @@ capture_ipc(struct oxr_logger *log,
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrCaptureAtlasEXT(XrSession session, const XrAtlasCaptureInfoDXR *info, XrAtlasCaptureResultDXR *result)
+oxr_xrCaptureAtlasDXR(XrSession session, const XrAtlasCaptureInfoDXR *info, XrAtlasCaptureResultDXR *result)
 {
 	OXR_TRACE_MARKER();
 

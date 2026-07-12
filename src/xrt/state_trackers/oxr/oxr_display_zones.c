@@ -26,7 +26,7 @@
 #ifdef OXR_HAVE_DXR_display_zones
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrGetDisplayZoneCapabilitiesEXT(XrSession session, XrDisplayZoneCapabilitiesDXR *capabilities)
+oxr_xrGetDisplayZoneCapabilitiesDXR(XrSession session, XrDisplayZoneCapabilitiesDXR *capabilities)
 {
 	OXR_TRACE_MARKER();
 
@@ -55,7 +55,7 @@ oxr_xrGetDisplayZoneCapabilitiesEXT(XrSession session, XrDisplayZoneCapabilities
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrGetDisplayZoneRecommendedViewSizeEXT(XrSession session,
+oxr_xrGetDisplayZoneRecommendedViewSizeDXR(XrSession session,
                                            const XrRect2Di *zoneRect,
                                            XrExtent2Di *recommendedViewSize)
 {

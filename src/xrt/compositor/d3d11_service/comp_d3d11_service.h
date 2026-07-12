@@ -803,7 +803,7 @@ comp_d3d11_service_workspace_file_picker_result(struct xrt_system_compositor *xs
  * the broadcast / per-slot ack / DP flip are properly sequenced with curtain
  * masking. Returns true if the request was accepted; false if the system
  * doesn't have a multi-compositor (caller should fall back to the legacy
- * immediate path). Called from oxr_xrRequestDisplayRenderingModeEXT when
+ * immediate path). Called from oxr_xrRequestDisplayRenderingModeDXR when
  * the calling session is a workspace controller — keeps the controller's
  * legitimate mode authority but ensures the catch-up window is masked.
  */

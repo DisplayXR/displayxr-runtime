@@ -2962,7 +2962,7 @@ struct xrt_system_compositor
 	 * should fall back to the legacy immediate mode update.
 	 *
 	 * Set by `comp_d3d11_service` during system compositor creation.
-	 * Called from `oxr_xrRequestDisplayRenderingModeEXT` when the calling
+	 * Called from `oxr_xrRequestDisplayRenderingModeDXR` when the calling
 	 * session is a workspace controller (compositor==NULL && service_mode);
 	 * the controller has legitimate mode authority but the immediate flip
 	 * would expose the raw-atlas glitch (#234) — routing through this hook
@@ -2983,7 +2983,7 @@ struct xrt_system_compositor
 	 * NULL on backends without multi-compositor support.
 	 *
 	 * Set by `comp_d3d11_service` during system compositor creation. Called
-	 * from `oxr_xrSetWorkspaceViewRigEXT` when the calling session is the
+	 * from `oxr_xrSetWorkspaceViewRigDXR` when the calling session is the
 	 * active workspace controller. Returns true if accepted.
 	 */
 	bool (*set_workspace_view_rig)(struct xrt_system_compositor *xsc, const struct xrt_view_rig *rig);

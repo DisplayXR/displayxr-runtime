@@ -274,7 +274,7 @@ xret_to_xr_result(struct oxr_logger *log, xrt_result_t xret, const char *label)
  */
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrActivateSpatialWorkspaceEXT(XrSession session)
+oxr_xrActivateSpatialWorkspaceDXR(XrSession session)
 {
 	OXR_TRACE_MARKER();
 
@@ -305,7 +305,7 @@ oxr_xrActivateSpatialWorkspaceEXT(XrSession session)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrDeactivateSpatialWorkspaceEXT(XrSession session)
+oxr_xrDeactivateSpatialWorkspaceDXR(XrSession session)
 {
 	OXR_TRACE_MARKER();
 
@@ -329,7 +329,7 @@ oxr_xrDeactivateSpatialWorkspaceEXT(XrSession session)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrGetSpatialWorkspaceStateEXT(XrSession session, XrBool32 *out_active)
+oxr_xrGetSpatialWorkspaceStateDXR(XrSession session, XrBool32 *out_active)
 {
 	OXR_TRACE_MARKER();
 
@@ -360,7 +360,7 @@ oxr_xrGetSpatialWorkspaceStateEXT(XrSession session, XrBool32 *out_active)
  */
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrAddWorkspaceCaptureClientEXT(XrSession session,
+oxr_xrAddWorkspaceCaptureClientDXR(XrSession session,
                                    uint64_t nativeWindow,
                                    const char *nameOptional,
                                    XrWorkspaceClientId *outClientId)
@@ -403,7 +403,7 @@ oxr_xrAddWorkspaceCaptureClientEXT(XrSession session,
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrRemoveWorkspaceCaptureClientEXT(XrSession session, XrWorkspaceClientId clientId)
+oxr_xrRemoveWorkspaceCaptureClientDXR(XrSession session, XrWorkspaceClientId clientId)
 {
 	OXR_TRACE_MARKER();
 
@@ -463,7 +463,7 @@ xrt_pose_to_xr_pose(const struct xrt_pose *in, XrPosef *out)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetWorkspaceClientWindowPoseEXT(XrSession session,
+oxr_xrSetWorkspaceClientWindowPoseDXR(XrSession session,
                                       XrWorkspaceClientId clientId,
                                       const XrPosef *pose,
                                       float widthMeters,
@@ -501,7 +501,7 @@ oxr_xrSetWorkspaceClientWindowPoseEXT(XrSession session,
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrGetWorkspaceClientWindowPoseEXT(XrSession session,
+oxr_xrGetWorkspaceClientWindowPoseDXR(XrSession session,
                                       XrWorkspaceClientId clientId,
                                       XrPosef *outPose,
                                       float *outWidthMeters,
@@ -542,7 +542,7 @@ oxr_xrGetWorkspaceClientWindowPoseEXT(XrSession session,
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetWorkspaceClientVisibilityEXT(XrSession session, XrWorkspaceClientId clientId, XrBool32 visible)
+oxr_xrSetWorkspaceClientVisibilityDXR(XrSession session, XrWorkspaceClientId clientId, XrBool32 visible)
 {
 	OXR_TRACE_MARKER();
 
@@ -573,7 +573,7 @@ oxr_xrSetWorkspaceClientVisibilityEXT(XrSession session, XrWorkspaceClientId cli
  */
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetWorkspaceFocusedClientEXT(XrSession session, XrWorkspaceClientId clientId)
+oxr_xrSetWorkspaceFocusedClientDXR(XrSession session, XrWorkspaceClientId clientId)
 {
 	OXR_TRACE_MARKER();
 
@@ -600,7 +600,7 @@ oxr_xrSetWorkspaceFocusedClientEXT(XrSession session, XrWorkspaceClientId client
  */
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetWorkspaceReservedKeysEXT(XrSession session,
+oxr_xrSetWorkspaceReservedKeysDXR(XrSession session,
                                   uint32_t keyCount,
                                   const XrWorkspaceReservedKeyDXR *keys)
 {
@@ -645,7 +645,7 @@ oxr_xrSetWorkspaceReservedKeysEXT(XrSession session,
  */
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetWorkspaceInputGrabEXT(XrSession session, XrBool32 grab)
+oxr_xrSetWorkspaceInputGrabDXR(XrSession session, XrBool32 grab)
 {
 	OXR_TRACE_MARKER();
 
@@ -666,7 +666,7 @@ oxr_xrSetWorkspaceInputGrabEXT(XrSession session, XrBool32 grab)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrGetWorkspaceFocusedClientEXT(XrSession session, XrWorkspaceClientId *outClientId)
+oxr_xrGetWorkspaceFocusedClientDXR(XrSession session, XrWorkspaceClientId *outClientId)
 {
 	OXR_TRACE_MARKER();
 
@@ -697,7 +697,7 @@ oxr_xrGetWorkspaceFocusedClientEXT(XrSession session, XrWorkspaceClientId *outCl
  */
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetWorkspaceClientFrameRateCapEXT(XrSession session, XrWorkspaceClientId clientId, float maxFps)
+oxr_xrSetWorkspaceClientFrameRateCapDXR(XrSession session, XrWorkspaceClientId clientId, float maxFps)
 {
 	OXR_TRACE_MARKER();
 
@@ -733,7 +733,7 @@ oxr_xrSetWorkspaceClientFrameRateCapEXT(XrSession session, XrWorkspaceClientId c
  */
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrEnumerateWorkspaceInputEventsEXT(XrSession session,
+oxr_xrEnumerateWorkspaceInputEventsDXR(XrSession session,
                                        uint32_t capacityInput,
                                        uint32_t *countOutput,
                                        XrWorkspaceInputEventDXR *events)
@@ -772,7 +772,7 @@ oxr_xrEnumerateWorkspaceInputEventsEXT(XrSession session,
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrEnableWorkspacePointerCaptureEXT(XrSession session, uint32_t button)
+oxr_xrEnableWorkspacePointerCaptureDXR(XrSession session, uint32_t button)
 {
 	OXR_TRACE_MARKER();
 
@@ -792,7 +792,7 @@ oxr_xrEnableWorkspacePointerCaptureEXT(XrSession session, uint32_t button)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrDisableWorkspacePointerCaptureEXT(XrSession session)
+oxr_xrDisableWorkspacePointerCaptureDXR(XrSession session)
 {
 	OXR_TRACE_MARKER();
 
@@ -817,7 +817,7 @@ oxr_xrDisableWorkspacePointerCaptureEXT(XrSession session)
  */
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrCaptureWorkspaceFrameEXT(XrSession session,
+oxr_xrCaptureWorkspaceFrameDXR(XrSession session,
                                const XrWorkspaceCaptureRequestDXR *request,
                                XrWorkspaceCaptureResultDXR *result)
 {
@@ -880,7 +880,7 @@ oxr_xrCaptureWorkspaceFrameEXT(XrSession session,
  */
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrEnumerateWorkspaceClientsEXT(XrSession session,
+oxr_xrEnumerateWorkspaceClientsDXR(XrSession session,
                                    uint32_t capacityInput,
                                    uint32_t *countOutput,
                                    XrWorkspaceClientId *clientIds)
@@ -916,7 +916,7 @@ oxr_xrEnumerateWorkspaceClientsEXT(XrSession session,
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrGetWorkspaceClientInfoEXT(XrSession session,
+oxr_xrGetWorkspaceClientInfoDXR(XrSession session,
                                 XrWorkspaceClientId clientId,
                                 XrWorkspaceClientInfoDXR *info)
 {
@@ -978,7 +978,7 @@ oxr_xrGetWorkspaceClientInfoEXT(XrSession session,
  */
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrRequestWorkspaceClientExitEXT(XrSession session, XrWorkspaceClientId clientId)
+oxr_xrRequestWorkspaceClientExitDXR(XrSession session, XrWorkspaceClientId clientId)
 {
 	OXR_TRACE_MARKER();
 
@@ -1004,7 +1004,7 @@ oxr_xrRequestWorkspaceClientExitEXT(XrSession session, XrWorkspaceClientId clien
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrRequestWorkspaceClientFullscreenEXT(XrSession session, XrWorkspaceClientId clientId, XrBool32 fullscreen)
+oxr_xrRequestWorkspaceClientFullscreenDXR(XrSession session, XrWorkspaceClientId clientId, XrBool32 fullscreen)
 {
 	OXR_TRACE_MARKER();
 
@@ -1040,7 +1040,7 @@ oxr_xrRequestWorkspaceClientFullscreenEXT(XrSession session, XrWorkspaceClientId
  */
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrCreateWorkspaceClientChromeSwapchainEXT(XrSession session,
+oxr_xrCreateWorkspaceClientChromeSwapchainDXR(XrSession session,
                                               XrWorkspaceClientId clientId,
                                               const XrWorkspaceChromeSwapchainCreateInfoDXR *createInfo,
                                               XrSwapchain *swapchain)
@@ -1127,7 +1127,7 @@ oxr_xrCreateWorkspaceClientChromeSwapchainEXT(XrSession session,
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrDestroyWorkspaceClientChromeSwapchainEXT(XrSwapchain swapchain)
+oxr_xrDestroyWorkspaceClientChromeSwapchainDXR(XrSwapchain swapchain)
 {
 	OXR_TRACE_MARKER();
 
@@ -1173,7 +1173,7 @@ chrome_layout_xr_to_ipc(const XrWorkspaceChromeLayoutDXR *in,
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetWorkspaceClientChromeLayoutEXT(XrSession session,
+oxr_xrSetWorkspaceClientChromeLayoutDXR(XrSession session,
                                         XrWorkspaceClientId clientId,
                                         const XrWorkspaceChromeLayoutDXR *layout)
 {
@@ -1225,7 +1225,7 @@ oxr_xrSetWorkspaceClientChromeLayoutEXT(XrSession session,
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrUpdateWorkspaceClientChromeLayerPoseEXT(XrSession session,
+oxr_xrUpdateWorkspaceClientChromeLayerPoseDXR(XrSession session,
                                               XrWorkspaceClientId clientId,
                                               const XrPosef *poseInClient)
 {
@@ -1258,7 +1258,7 @@ oxr_xrUpdateWorkspaceClientChromeLayerPoseEXT(XrSession session,
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrCreateWorkspaceCursorSwapchainEXT(XrSession session,
+oxr_xrCreateWorkspaceCursorSwapchainDXR(XrSession session,
                                          const XrWorkspaceCursorSwapchainCreateInfoDXR *createInfo,
                                          XrSwapchain *swapchain)
 {
@@ -1318,7 +1318,7 @@ oxr_xrCreateWorkspaceCursorSwapchainEXT(XrSession session,
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetWorkspaceCursorEXT(XrSession session, const XrWorkspaceCursorInfoDXR *info)
+oxr_xrSetWorkspaceCursorDXR(XrSession session, const XrWorkspaceCursorInfoDXR *info)
 {
 	OXR_TRACE_MARKER();
 
@@ -1366,7 +1366,7 @@ oxr_xrSetWorkspaceCursorEXT(XrSession session, const XrWorkspaceCursorInfoDXR *i
  * per-eye disparity. Cursor screen position stays runtime-owned.
  */
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetWorkspaceCursorDepthEXT(XrSession session, const XrWorkspaceCursorDepthDXR *info)
+oxr_xrSetWorkspaceCursorDepthDXR(XrSession session, const XrWorkspaceCursorDepthDXR *info)
 {
 	OXR_TRACE_MARKER();
 
@@ -1401,7 +1401,7 @@ oxr_xrSetWorkspaceCursorDepthEXT(XrSession session, const XrWorkspaceCursorDepth
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrCreateWorkspaceOverlaySwapchainEXT(XrSession session,
+oxr_xrCreateWorkspaceOverlaySwapchainDXR(XrSession session,
                                           const XrWorkspaceOverlaySwapchainCreateInfoDXR *createInfo,
                                           XrSwapchain *swapchain)
 {
@@ -1461,7 +1461,7 @@ oxr_xrCreateWorkspaceOverlaySwapchainEXT(XrSession session,
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetWorkspaceOverlayEXT(XrSession session, const XrWorkspaceOverlayInfoDXR *info)
+oxr_xrSetWorkspaceOverlayDXR(XrSession session, const XrWorkspaceOverlayInfoDXR *info)
 {
 	OXR_TRACE_MARKER();
 
@@ -1507,7 +1507,7 @@ oxr_xrSetWorkspaceOverlayEXT(XrSession session, const XrWorkspaceOverlayInfoDXR 
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrAcquireWorkspaceWakeupEventEXT(XrSession session, uint64_t *outNativeHandle)
+oxr_xrAcquireWorkspaceWakeupEventDXR(XrSession session, uint64_t *outNativeHandle)
 {
 	OXR_TRACE_MARKER();
 
@@ -1571,7 +1571,7 @@ client_style_xr_to_ipc(const XrWorkspaceClientStyleDXR *xr, struct ipc_workspace
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetWorkspaceClientStyleEXT(XrSession session,
+oxr_xrSetWorkspaceClientStyleDXR(XrSession session,
                                  XrWorkspaceClientId clientId,
                                  const XrWorkspaceClientStyleDXR *style)
 {

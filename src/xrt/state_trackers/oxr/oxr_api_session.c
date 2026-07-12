@@ -1310,7 +1310,7 @@ oxr_xrGetPlanePolygonBufferEXT(XrPlaneDetectorEXT planeDetector,
  * signal, evaluated so it is valid in the APP's OWN process.
  *
  * #575: the original gate read only `inst->workspace_controller_active`, which is
- * a PER-INSTANCE flag set true ONLY inside oxr_xrActivateSpatialWorkspaceEXT — i.e.
+ * a PER-INSTANCE flag set true ONLY inside oxr_xrActivateSpatialWorkspaceDXR — i.e.
  * exclusively in the workspace controller's (shell's) own process. A separate-
  * process IPC app (a cube launched by the shell) has its own instance where that
  * flag is forever false, so the app-side mode-authority gate never fired and the
@@ -1332,7 +1332,7 @@ oxr_workspace_owns_display_policy(const struct oxr_session *sess)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrRequestDisplayModeEXT(XrSession session, XrDisplayModeDXR displayMode)
+oxr_xrRequestDisplayModeDXR(XrSession session, XrDisplayModeDXR displayMode)
 {
 	OXR_TRACE_MARKER();
 
@@ -1371,7 +1371,7 @@ oxr_xrRequestDisplayModeEXT(XrSession session, XrDisplayModeDXR displayMode)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeDXR mode)
+oxr_xrRequestEyeTrackingModeDXR(XrSession session, XrEyeTrackingModeDXR mode)
 {
 	OXR_TRACE_MARKER();
 
@@ -1411,7 +1411,7 @@ oxr_xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeDXR mode)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex)
+oxr_xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex)
 {
 	OXR_TRACE_MARKER();
 
@@ -1517,7 +1517,7 @@ oxr_xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetWorkspaceViewRigEXT(XrSession session, const void *rig)
+oxr_xrSetWorkspaceViewRigDXR(XrSession session, const void *rig)
 {
 	OXR_TRACE_MARKER();
 
@@ -1542,7 +1542,7 @@ oxr_xrSetWorkspaceViewRigEXT(XrSession session, const void *rig)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrEnumerateDisplayRenderingModesEXT(XrSession session,
+oxr_xrEnumerateDisplayRenderingModesDXR(XrSession session,
                                         uint32_t modeCapacityInput,
                                         uint32_t *modeCountOutput,
                                         XrDisplayRenderingModeInfoDXR *modes)
@@ -1573,7 +1573,7 @@ oxr_xrEnumerateDisplayRenderingModesEXT(XrSession session,
 	}
 
 	// `isRequestable` per session (v13): the gate in
-	// oxr_xrRequestDisplayRenderingModeEXT drops non-controller sessions
+	// oxr_xrRequestDisplayRenderingModeDXR drops non-controller sessions
 	// running under workspace mode. Mirror that gate here so apps can
 	// passively learn whether their request would be a no-op.
 	XrBool32 session_is_requestable = XR_TRUE;

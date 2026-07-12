@@ -82,7 +82,7 @@ oxr_mcp_tools_set_capture_handler(oxr_mcp_capture_fn fn, void *userdata);
  * its next layer_commit poll (the next xrEndFrame), does the GPU readback, and
  * writes the PNG to @p path. This is the non-blocking sibling of the MCP
  * @c capture_frame tool's blocking handler: it must NOT block here because
- * @ref oxr_xrCaptureAtlasEXT runs on the app's own xrEndFrame thread, which is
+ * @ref oxr_xrCaptureAtlasDXR runs on the app's own xrEndFrame thread, which is
  * also the thread that drives the in-process compositor's layer_commit —
  * blocking it would deadlock the very poll we are waiting on.
  *

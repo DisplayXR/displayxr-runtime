@@ -363,7 +363,7 @@ The workspace controller is the sole authority on display rendering mode
 (2D vs 3D, tile layout) for the clients it hosts. App-driven attempts
 to change mode from a workspace client are silently no-opped.
 
-**Enforcement (single point):** `oxr_api_session.c::oxr_xrRequestDisplayRenderingModeEXT`
+**Enforcement (single point):** `oxr_api_session.c::oxr_xrRequestDisplayRenderingModeDXR`
 returns `XR_SUCCESS` without state change when the calling session is a
 workspace client (`sys->xsysc->info.is_service_mode && sess->compositor != NULL`).
 `xrRequestDisplayModeDXR` is a thin wrapper and inherits the gate.

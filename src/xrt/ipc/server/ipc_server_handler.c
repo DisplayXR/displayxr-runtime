@@ -2626,7 +2626,7 @@ ipc_handle_compositor_request_rendering_mode(volatile struct ipc_client_state *i
 	// in-process", because unlike Android's OOP runtime the service shares the
 	// process with the real head device (mc->xsysd is non-NULL). So the recorded
 	// grid above is re-derived from the device every frame; drive the device here
-	// (mirroring the in-process oxr_xrRequestDisplayRenderingModeEXT path) so the
+	// (mirroring the in-process oxr_xrRequestDisplayRenderingModeDXR path) so the
 	// requested mode actually reaches the DP. XRT_DEVICE_PROPERTY_OUTPUT_MODE also
 	// switches sim_display's output weave (2D / anaglyph / SBS / quad). (Windows
 	// uses the D3D11 service's own mode path; Android records on mc with no device

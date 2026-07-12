@@ -176,9 +176,16 @@ def build_rules(mapping):
     rules = []
     # 1. Exact header-harvested symbols (types, functions, enums), longest
     #    first so e.g. PFN_xrFooEXT rewrites before xrFooEXT.
+    #    Function symbols (xrFooEXT) get a RELAXED lookbehind that permits a
+    #    preceding underscore chain: the oxr state tracker (and consumers)
+    #    wrap our entry points as oxr_xrFooEXT / some_prefix_xrFooEXT, which a
+    #    strict identifier boundary would skip — while upstream wrappers
+    #    (oxr_xrCreateHandTrackerEXT, …) stay safe because the symbol list
+    #    contains only OUR functions.
     for old in sorted(mapping["exact_symbols"], key=len, reverse=True):
         new = mapping["exact_symbols"][old]
-        rules.append((re.compile(rf"{LB}{re.escape(old)}{LA}"), new))
+        lb = r"(?<![A-Za-z0-9])" if old.startswith("xr") else LB
+        rules.append((re.compile(rf"{lb}{re.escape(old)}{LA}"), new))
 
     for name in mapping["allowlist"]:
         up = name.upper()
@@ -266,8 +273,9 @@ def cmd_verify(args):
         frag_pats.append(re.compile(rf"{LB}(?:XR_|OXR_HAVE_|"
                                     rf"OXR_EXTENSION_SUPPORT_)?EXT_"
                                     rf"(?:{name}(?![a-z0-9])|{up}(?![A-Z0-9]))"))
-    sym_pats = [re.compile(rf"{LB}{re.escape(s)}{LA}")
-                for s in mapping["exact_symbols"]]
+    sym_pats = [re.compile(
+        rf"{r'(?<![A-Za-z0-9])' if s.startswith('xr') else LB}"
+        rf"{re.escape(s)}{LA}") for s in mapping["exact_symbols"]]
     old_blk = mapping["struct_type_block"]["old"]
     num_pat = re.compile(rf"(?<![0-9]){old_blk}(?=[0-9]{{3}})")
 

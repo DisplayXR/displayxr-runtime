@@ -192,7 +192,7 @@ The compositor (or display processor) checks for state changes each frame and pu
 **Workspace authority (#233/#234 interaction):** vendor-initiated MANAGED transitions are
 **hardware display state** changes, NOT rendering-mode requests. They flow through the
 DP→runtime event path above and do not pass through (or get blocked by) the
-workspace-controller mode-authority gate in `oxr_xrRequestDisplayRenderingModeEXT`. Under a
+workspace-controller mode-authority gate in `oxr_xrRequestDisplayRenderingModeDXR`. Under a
 workspace, the vendor still owns the panel's 2D/3D weave decision globally; the shell
 observes the resulting events like any other session.
 
