@@ -6,7 +6,8 @@
 // Khronos OpenXR registry: extension numbers and XrStructureType values sit
 // in a provisional experimental block (1004999xxx) pending official
 // assignment. Extension names are expected to be stable; numeric values are
-// not. SPEC_VERSION restarted at 1 on the XR_EXT_* -> XR_DXR_* rename.
+// not. SPEC_VERSION continues the pre-rename XR_EXT_* numbering (the
+// interface history did not restart with the name).
 // See GOVERNANCE.md.
 //
 /*!
@@ -56,7 +57,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_view_rig 1
-#define XR_DXR_view_rig_SPEC_VERSION 1
+#define XR_DXR_view_rig_SPEC_VERSION 3
 #define XR_DXR_VIEW_RIG_EXTENSION_NAME "XR_DXR_view_rig"
 
 // Reserved 1004999xxx range, next free block after mcp_tools (…130-132).
