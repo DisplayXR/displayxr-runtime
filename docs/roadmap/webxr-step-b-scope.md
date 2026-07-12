@@ -4,7 +4,7 @@ Step B replaces the CEF offscreen-render **stand-in** (Step A,
 [`displayxr-cef-host`](https://github.com/DisplayXR/displayxr-cef-host)) with a
 real, minimal, **vendor-free** patch *inside Chromium*, so an ordinary web page
 can make a canvas element glasses-free 3D by driving the **same shipped weave RPC**
-(`XR_EXT_weave`). Background + sequencing: [`webxr-support.md`](webxr-support.md)
+(`XR_DXR_weave`). Background + sequencing: [`webxr-support.md`](webxr-support.md)
 §2.4 Step B / §2.6. Proposed JS surface: [`webxr-displayxr-explainer.md`](webxr-displayxr-explainer.md).
 
 This is a **multi-week, Chromium-expertise + build-infra** effort. This doc scopes
@@ -18,8 +18,8 @@ the build + a research spike) rather than patching blind.
    eye tracking, and per-display calibration stay behind the OS runtime / vendor
    plug-in (ADR-007 / ADR-019). If a change would put a weave shader or vendor SDK
    in Chromium, it is wrong by construction.
-2. **Reuse the shipped `XR_EXT_weave` RPC unchanged where possible.**
-   `xrWeaveBindWindowEXT` + `xrWeaveSubmitEXT` + `xrWeaveSnapWindowRectEXT` are
+2. **Reuse the shipped `XR_DXR_weave` RPC unchanged where possible.**
+   `xrWeaveBindWindowDXR` + `xrWeaveSubmitDXR` + `xrWeaveSnapWindowRectDXR` are
    shipped (runtime v1.24.0). The patch is a *client* of that contract — the same
    one the CEF host already proves end-to-end. Extend the RPC only if a genuine gap
    appears (flag it, don't assume it).
@@ -33,9 +33,9 @@ the build + a research spike) rather than patching blind.
 
 ## What Step B reuses (already shipped + hardware-validated)
 
-- **The weave RPC** (`XR_EXT_weave`): `bindWindow(hwnd)` once, then per element per
+- **The weave RPC** (`XR_DXR_weave`): `bindWindow(hwnd)` once, then per element per
   frame `weave(sharedHandle, rect) → {wovenHandle, fence, eyes}`; window-drag phase
-  lock via `xrWeaveSnapWindowRectEXT`. The DP weaves; the caller never does.
+  lock via `xrWeaveSnapWindowRectDXR`. The DP weaves; the caller never does.
 - **The CEF host as the executable reference** (`displayxr-cef-host`): the exact
   client flow Step B re-creates inside Chromium — extract a canvas sub-rect's SBS
   pair, submit, GPU-wait the fence, composite the woven sub-rect at the committed
@@ -96,7 +96,7 @@ into an owned keyed-mutex input (the CEF-host pattern).
 
 ### B2 — Minimal hardcoded weave (no JS)
 Prove the pipe with zero JS API: hardcode "weave the first canvas on the page" —
-export its SharedImage as a shared handle, call `xrWeaveSubmitEXT`, GPU-wait, and
+export its SharedImage as a shared handle, call `xrWeaveSubmitDXR`, GPU-wait, and
 composite the woven quad in Viz at a hardcoded (or layout-derived) rect, in
 `content_shell` on Leia. **Exit:** a known SBS canvas shows real glasses-free 3D
 through `content_shell`, weaved by the DP. **Riskiest technical milestone** — it
@@ -112,7 +112,7 @@ the host's multi-element model). Off-axis projection driven by the RPC-returned 
 ### B4 — `chrome` + hardening + rebasability
 Move from `content_shell` to `chrome`. Flag it (runtime feature flag, off by
 default). Handle scroll / zoom / window-drag committed-rect tracking + phase-snap
-(`xrWeaveSnapWindowRectEXT`), DPI / fractional-zoom device-pixel-exact alignment
+(`xrWeaveSnapWindowRectDXR`), DPI / fractional-zoom device-pixel-exact alignment
 (one pixel of drift collapses the lattice). Keep the diff minimal + isolated;
 document the rebase story. **Exit:** flagged `chrome` build on Leia; a clean,
 rebasable patch suitable as the standards reference implementation.

@@ -50,7 +50,7 @@ Four classes (handle, texture, hosted, IPC) — full reference: `docs/getting-st
 - `_handle` / `_texture` / `_hosted` → in-process `compositor/{d3d11,d3d12,metal,gl,vk_native}/`
 - `_ipc` → `compositor/client/` → `ipc/` → `compositor/multi/` → native compositor (out-of-process)
 - **Window handle:** `_handle` and `_texture` pass the app's **real** HWND (texture also passes a shared texture; its HWND is used for DP position tracking); `_hosted` passes **NULL** → the runtime self-creates a window at native res. The display processor always gets a real HWND — the app's, or the runtime's for hosted. (Branch: window-handling block in `*_compositor_create`.)
-- **Engine apps (Unity, etc.) hook + inject the window binding — NOT obvious.** Unity is not a DisplayXR-native app: it drives OpenXR via its own plugin and never calls `XR_EXT_win32_window_binding`. The DisplayXR Unity plugin (`unity-3d-display`, ships as `displayxr_unity.dll`) **hooks `xrCreateSession` and injects** an `XrWin32WindowBindingCreateInfoEXT` pointing at a **plugin-created child overlay window** over Unity's main HWND (default opaque = `WS_CHILD`; transparent #57 = top-level `WS_POPUP`). So Unity-standalone-D3D12 runs on the **in-process native** `comp_d3d12_compositor` as a `_handle` app (selected by `oxr_d3d12_native_compositor_supported`) — the overlay is the HWND, not a window the app made for the runtime, and the runtime's own `E_ACCESSDENIED → WS_CHILD` swapchain fallback is *not* what makes the child. But it is **not** a drop-in cube equivalent: Unity submits as a **fixed-resolution, always-2-view legacy-compromise** app (per-eye swapchains sized once at session start; `scaleXY` not applied per-frame), so the compositor *code* is shared but *fed differently* than a native handle app's adaptive per-mode tiles. **There is no view synthesis anywhere** — a built Unity app renders and submits exactly its 2 views, so it can only drive modes whose `view_count ≤ 2`; a mode with more views (e.g. `sim_display`'s 2×2 Quad, `view_count = 4`) requires the app to render all N tiles itself, which Unity cannot. (The runtime synthesises per-tile *viewer poses*, not pixels, so native/extension apps can render the N views.) The plugin no longer computes Kooima — it chains `XR_EXT_view_rig` onto `xrLocateViews`. (Unity under the shell instead takes the client→IPC→D3D11-service route.) Full trace + why-the-overlay: `docs/architecture/unity-d3d12-app-path.md`.
+- **Engine apps (Unity, etc.) hook + inject the window binding — NOT obvious.** Unity is not a DisplayXR-native app: it drives OpenXR via its own plugin and never calls `XR_DXR_win32_window_binding`. The DisplayXR Unity plugin (`unity-3d-display`, ships as `displayxr_unity.dll`) **hooks `xrCreateSession` and injects** an `XrWin32WindowBindingCreateInfoDXR` pointing at a **plugin-created child overlay window** over Unity's main HWND (default opaque = `WS_CHILD`; transparent #57 = top-level `WS_POPUP`). So Unity-standalone-D3D12 runs on the **in-process native** `comp_d3d12_compositor` as a `_handle` app (selected by `oxr_d3d12_native_compositor_supported`) — the overlay is the HWND, not a window the app made for the runtime, and the runtime's own `E_ACCESSDENIED → WS_CHILD` swapchain fallback is *not* what makes the child. But it is **not** a drop-in cube equivalent: Unity submits as a **fixed-resolution, always-2-view legacy-compromise** app (per-eye swapchains sized once at session start; `scaleXY` not applied per-frame), so the compositor *code* is shared but *fed differently* than a native handle app's adaptive per-mode tiles. **There is no view synthesis anywhere** — a built Unity app renders and submits exactly its 2 views, so it can only drive modes whose `view_count ≤ 2`; a mode with more views (e.g. `sim_display`'s 2×2 Quad, `view_count = 4`) requires the app to render all N tiles itself, which Unity cannot. (The runtime synthesises per-tile *viewer poses*, not pixels, so native/extension apps can render the N views.) The plugin no longer computes Kooima — it chains `XR_DXR_view_rig` onto `xrLocateViews`. (Unity under the shell instead takes the client→IPC→D3D11-service route.) Full trace + why-the-overlay: `docs/architecture/unity-d3d12-app-path.md`.
 - **Texture class = content-handoff, NOT a region mechanism (#696).** Handoff class (`handle`/`texture`/`hosted`/`ipc`) and region paradigm (display-zones) are **orthogonal axes** — every class mixes 2D/3D the same way (zones + mask). `_texture` is present-ownership handoff for a producer with no window the runtime can weave into (CEF, WebXR bridge, decode/capture target). **Verified:** in shared-texture mode the compositor creates **no swapchain and never presents** (`comp_d3d11_compositor.cpp:2103` `c->hwnd=nullptr`; `:2251-2257` DXGI target skipped, "offscreen shared texture mode") — the DP weaves **into the app's shared texture** and the **app presents it** (`:2326-2333`, #68). The app's HWND is a **position/phase anchor** the DP uses (`dp_hwnd = c->hwnd?c->hwnd:c->app_hwnd`, `:2313`), never a render target, and is **already optional in code** (NULL-HWND path at `:2107`) — dropping it costs drag phase-snap + canvas-scoped Kooima (`get_window_metrics` false at `:3920-3922` → display-scoped fallback, #396 W7). Decoupling that channel from the HWND = #697. The legacy output-rect/surround entry points and bespoke surround mechanism were **removed** (ADR-031); display-zones is the sole region paradigm (ADR-027). Current mechanism smoke-test apps (don't rename/prune yet, #696): `cube_zones_texture_{d3d11_win,d3d12_win,metal_macos}`.
 - Test app naming: `cube_{class}_{api}_{platform}` (e.g. `cube_handle_metal_macos`, `cube_zones_texture_d3d11_win`).
 
@@ -68,12 +68,12 @@ Vendor display drivers ship as **plug-in DLLs** from their own repos (ADR-019). 
 - Vendor onboarding: `docs/guides/vendor-plugin-onboarding.md`
 
 ### Custom OpenXR extensions
-- `XR_EXT_win32_window_binding` — app passes HWND to runtime
-- `XR_EXT_cocoa_window_binding` — app passes NSWindow to runtime
-- `XR_EXT_xlib_window_binding` — app passes X11 Display*/Window to runtime (desktop Linux)
-- `XR_EXT_display_info` — display dimensions, eye-tracking modes
+- `XR_DXR_win32_window_binding` — app passes HWND to runtime
+- `XR_DXR_cocoa_window_binding` — app passes NSWindow to runtime
+- `XR_DXR_xlib_window_binding` — app passes X11 Display*/Window to runtime (desktop Linux)
+- `XR_DXR_display_info` — display dimensions, eye-tracking modes
 - `XR_EXT_android_surface_binding` — Android surface binding
-- `XR_EXT_mcp_tools` — app registers its own MCP tools (agent control surface); event-queue dispatch via `XrEventDataMCPToolCallEXT`
+- `XR_DXR_mcp_tools` — app registers its own MCP tools (agent control surface); event-queue dispatch via `XrEventDataMCPToolCallDXR`
 
 Specs: `docs/specs/extensions/`. Eye-tracking MANAGED vs MANUAL contract: `docs/specs/vendor/eye-tracking-modes.md`.
 
@@ -110,7 +110,7 @@ Builds runtime, OpenXR loader, test apps. The macOS Vulkan native compositor run
 ./scripts/build_linux.sh --apps       # + test apps (cube_hosted/handle vk_linux)
 ./scripts/package_linux.sh            # dist/*.tar.gz + user-level install.sh (#705)
 ```
-Linux is **Vulkan-only** — a native Vulkan compositor presents over an X11/XCB surface (`comp_vk_native_window_xcb.c`); no D3D/Metal/GL backend. Apps pass their window via `XR_EXT_xlib_window_binding`. Full walkthrough: `docs/getting-started/building.md` § *Linux*; status + phases: `docs/roadmap/linux-support.md`. **Guard convention:** desktop-Linux code must gate on **`XRT_OS_LINUX_DESKTOP`** (`= XRT_OS_LINUX && !XRT_OS_ANDROID`) — a bare `XRT_OS_LINUX` also matches Android and will pull desktop-only symbols into the Android build.
+Linux is **Vulkan-only** — a native Vulkan compositor presents over an X11/XCB surface (`comp_vk_native_window_xcb.c`); no D3D/Metal/GL backend. Apps pass their window via `XR_DXR_xlib_window_binding`. Full walkthrough: `docs/getting-started/building.md` § *Linux*; status + phases: `docs/roadmap/linux-support.md`. **Guard convention:** desktop-Linux code must gate on **`XRT_OS_LINUX_DESKTOP`** (`= XRT_OS_LINUX && !XRT_OS_ANDROID`) — a bare `XRT_OS_LINUX` also matches Android and will pull desktop-only symbols into the Android build.
 
 ### Standard CMake
 ```bash
@@ -257,7 +257,7 @@ A from-source runtime that's **ahead of the released ABI** will ABI-reject an *i
 Both use registry discovery on Windows (so they pick up whatever plug-in is installed — Leia SR or sim-display), `XRT_PLUGIN_SEARCH_PATH` on POSIX.
 
 ### Simulating eye tracking without hardware
-sim_display honestly advertises **no** eye tracking (per-mode `has_tracking=false`, `supportedModes=0`) — `SIM_DISPLAY_FAKE_TRACKING=1` re-enables MANUAL_BIT + tracked 3D modes, and `SIM_DISPLAY_FAKE_TRACKING_PERIOD_MS=N` square-waves `is_tracking` to exercise tracking-loss edges + `XrEventDataEyeTrackingStateChangedEXT` (look for `OXR EVENT: Eye tracking state changed` WARN lines). Works in-process and via `XRT_FORCE_MODE=ipc`. Contract: `docs/specs/vendor/eye-tracking-modes.md`; design: ADR-022.
+sim_display honestly advertises **no** eye tracking (per-mode `has_tracking=false`, `supportedModes=0`) — `SIM_DISPLAY_FAKE_TRACKING=1` re-enables MANUAL_BIT + tracked 3D modes, and `SIM_DISPLAY_FAKE_TRACKING_PERIOD_MS=N` square-waves `is_tracking` to exercise tracking-loss edges + `XrEventDataEyeTrackingStateChangedDXR` (look for `OXR EVENT: Eye tracking state changed` WARN lines). Works in-process and via `XRT_FORCE_MODE=ipc`. Contract: `docs/specs/vendor/eye-tracking-modes.md`; design: ADR-022.
 
 ### Windows test apps
 `scripts\build_windows.bat test-apps` builds apps and generates run scripts in `_package/` that set `XR_RUNTIME_JSON` to the dev build.
@@ -282,7 +282,7 @@ set XRT_FORCE_MODE=ipc && test_apps\build\bin\cube_handle_d3d11_win.exe
 ```
 The app then creates a `client_d3d11_compositor` (`server-creates-swapchain`
 model), `is_service_mode` flips true, and `is_*_native_compositor` stays false —
-so e.g. `xrCaptureAtlasEXT` routes through the IPC branch, not the in-process
+so e.g. `xrCaptureAtlasDXR` routes through the IPC branch, not the in-process
 one. (`XRT_FORCE_MODE=ipc` must be set process-level via the env, not the run
 script, since the DLL has its own static-CRT environment block.)
 
@@ -387,7 +387,7 @@ See `docs/README.md` for the full index. By task:
 | `xrt_plugin_iface` callbacks | `docs/reference/xrt_plugin_iface.md` |
 | Multiview tiling / atlas layout | `docs/specs/runtime/multiview-tiling.md` |
 | Array (layered/SPI) vs tiled swapchains — first-class on all backends | `docs/adr/ADR-032-array-layered-swapchains-first-class.md` → `docs/specs/runtime/swapchain-model.md` |
-| Extension API (display_info, window bindings) | `docs/specs/extensions/XR_EXT_display_info.md` |
+| Extension API (display_info, window bindings) | `docs/specs/extensions/XR_DXR_display_info.md` |
 | Why an architectural decision was made | `docs/adr/` |
 | Write / scaffold / lint a DisplayXR app | `docs/guides/displayxr-app-rules.md` (+ `/new-displayxr-app`, `scripts/check_displayxr_app.py`) |
 | Legacy vs extension app differences | `docs/architecture/extension-vs-legacy.md` |
@@ -400,7 +400,7 @@ See `docs/README.md` for the full index. By task:
 | Kooima projection math | `docs/architecture/kooima-projection.md` |
 | Compositor pipeline | `docs/architecture/compositor-pipeline.md` |
 | Swapchain model / canvas | `docs/specs/runtime/swapchain-model.md` |
-| Mixed 2D/3D zones (N 3D zones + 2D zones + wish mask) | `docs/adr/ADR-027-display-zones.md` → `docs/specs/extensions/XR_EXT_display_zones.md`, `docs/roadmap/display-zones.md` |
+| Mixed 2D/3D zones (N 3D zones + 2D zones + wish mask) | `docs/adr/ADR-027-display-zones.md` → `docs/specs/extensions/XR_DXR_display_zones.md`, `docs/roadmap/display-zones.md` |
 | Workspace ↔ runtime contract / boundary | `docs/architecture/separation-of-concerns.md`, `docs/roadmap/workspace-runtime-contract.md` |
 | Vendor-specific docs | `docs/vendors/README.md` (index) — internals live in each vendor's plug-in repo; `sim_display` docs stay in-tree |
 | 3D capture pipeline | `docs/roadmap/3d-capture.md` |

@@ -5,7 +5,7 @@
  * @brief  Local 2D/3D zone types shared across the display processor
  *         interface (#224, docs/roadmap/local-3d-zones.md).
  *
- * The hardware-consumer leg of the shared XR_EXT_local_3d_zone mask: the
+ * The hardware-consumer leg of the shared XR_DXR_local_3d_zone mask: the
  * runtime publishes the authored, screen-anchored 3D-zone mask to the vendor
  * display processor so switchable-lens panels can track which window regions
  * are 3D. The struct below is the capability half of that contract; the

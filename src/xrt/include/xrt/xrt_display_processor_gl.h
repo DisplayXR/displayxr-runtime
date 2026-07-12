@@ -242,7 +242,7 @@ struct xrt_display_processor_gl
 	 * anchor the mask's pixel space on the panel in physical screen pixels
 	 * (post-DPI client rect). @p seq is the mask CONTENT generation —
 	 * monotonic, bumped only when the published content changes
-	 * (xrSubmitLocal3DZoneEXT, a wish re-raster, an explicit-wish change);
+	 * (xrSubmitLocal3DZoneDXR, a wish re-raster, an explicit-wish change);
 	 * same-seq publishes differ only in the screen anchor, so a vendor
 	 * evaluates content once per generation.
 	 *

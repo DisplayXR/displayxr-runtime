@@ -7,7 +7,7 @@
  * Self-contained single-file app that renders a spinning cube + grid floor
  * via Metal + OpenXR. Mirrors cube_vk_macos but uses Metal natively.
  *
- * Legacy variant: does NOT enable XR_EXT_display_info. Relies on runtime
+ * Legacy variant: does NOT enable XR_DXR_display_info. Relies on runtime
  * defaults and recommendedImageRectWidth for swapchain sizing.
  *
  * No windowing code — the runtime's compositor creates its own window.
@@ -736,7 +736,7 @@ static bool InitializeOpenXR(AppXrSession &app)
         return false;
     }
 
-    // Legacy: NOT enabling XR_EXT_display_info
+    // Legacy: NOT enabling XR_DXR_display_info
     std::vector<const char*> enabledExts = {XR_KHR_METAL_ENABLE_EXTENSION_NAME};
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(createInfo.applicationInfo.applicationName, "MetalCubeOpenXR",
@@ -809,7 +809,7 @@ static bool CreateSession(AppXrSession &app, MetalRenderer &r)
     app.sessionRunning = false;
     app.exitRequested = false;
 
-    // Legacy: no rendering mode enumeration (XR_EXT_display_info not enabled)
+    // Legacy: no rendering mode enumeration (XR_DXR_display_info not enabled)
 
     return true;
 }
@@ -920,7 +920,7 @@ static void PollEvents(AppXrSession &app)
             }
             break;
         }
-        // Legacy app: no rendering mode events (XR_EXT_display_info not enabled)
+        // Legacy app: no rendering mode events (XR_DXR_display_info not enabled)
         default: break;
         }
         event = {XR_TYPE_EVENT_DATA_BUFFER};

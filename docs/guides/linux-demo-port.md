@@ -11,11 +11,11 @@ root `CLAUDE.md` and the platform port in [`docs/roadmap/linux-support.md`](../r
    the Phase 1 `vk_native` + `VK_KHR_xcb_surface` path. No renderer work.
 2. **Every demo is a _handle_ app, NOT hosted.** All five create their own
    OS window (`CreateWindowEx` / `NSWindow`) and pass its handle via
-   `XR_EXT_win32_window_binding` / `XR_EXT_cocoa_window_binding`. The Linux
+   `XR_DXR_win32_window_binding` / `XR_DXR_cocoa_window_binding`. The Linux
    equivalent **landed with runtime Phase 3a** (#660):
-   `XR_EXT_xlib_window_binding` (`Display*` + `Window` at xrCreateSession) +
+   `XR_DXR_xlib_window_binding` (`Display*` + `Window` at xrCreateSession) +
    the compositor's app-provided-window branch — spec at
-   `docs/specs/extensions/XR_EXT_xlib_window_binding.md`, working example at
+   `docs/specs/extensions/XR_DXR_xlib_window_binding.md`, working example at
    `test_apps/cube_handle_vk_linux`. So faithful ports are unblocked at the
    API level; on-screen behavior is still pending Phase 3b hardware
    validation. The **hosted-NULL fallback** (pass no window; the runtime
@@ -54,7 +54,7 @@ earthview = per-platform.**
   strip the cube's own VkRenderer + MoltenVK-portability bits, and wire in the
   demo's renderer (whose `renderEye()` usually takes a swapchain `VkImage`
   directly — no framebuffer machinery). Windowing = hosted-NULL for build-green;
-  vendor `XR_EXT_xlib_window_binding.h` and leave a `TODO(Phase 3b)` to switch to
+  vendor `XR_DXR_xlib_window_binding.h` and leave a `TODO(Phase 3b)` to switch to
   the real app-owned window once hardware validation happens. **This new main is
   the bulk of the work, not the build tooling.**
 
@@ -120,11 +120,11 @@ Confirmed on **demo #1, mediaplayer** (mediaplayer#30, 4 CI iterations):
   source) makes the OpenXR-SDK-Source loader build **detect GLX** → it pulls in
   `<xcb/glx.h>` and gfxwrapper links `Xxf86vm`. Fix: add `libxcb-glx0-dev
   libxxf86vm-dev`. The runtime CI never hits this (it installs no GL headers).
-- **`XrCompositionLayerWindowSpaceEXT` lives ONLY in the cocoa/win32 binding
+- **`XrCompositionLayerWindowSpaceDXR` lives ONLY in the cocoa/win32 binding
   headers.** A demo that submits a window-space layer needs a Linux arm of its
   `XrCommon.h` that mirrors the wire-shared `#ifndef`-guarded struct. This is an
   **interim** — swap it for the real Linux binding header now that **Phase 3a**
-  (`XR_EXT_xlib_window_binding`) has landed (note: spec v1 does NOT declare the
+  (`XR_DXR_xlib_window_binding`) has landed (note: spec v1 does NOT declare the
   window-space layer struct, so keep the `#ifndef`-guarded mirror until a later
   spec revision adopts it): vendor the header, add `kWindowBindingExt`
   + the binding branch in `XrSession.cpp`, and extract the SDL window handle in
@@ -163,7 +163,7 @@ Confirmed across the **4-demo batch** (avatar #22, modelviewer #41, gaussianspla
   mac/win `EZVCPKG_BASEDIR` + `actions/cache` (`/home/runner/.ezvcpkg`).
 - **Window-space-layer mirror is often N/A.** A per-platform demo whose Linux leg
   is modeled on the *macOS* harness usually doesn't reference
-  `XrCompositionLayerWindowSpaceEXT` (it's a Windows-only HUD in some demos) — and
+  `XrCompositionLayerWindowSpaceDXR` (it's a Windows-only HUD in some demos) — and
   demos linking `displayxr::common`'s `xr_window_space_hud.h` get the struct from
   `openxr_includes/` for free. Only add the interim `#ifndef` mirror if the compile
   actually needs it.

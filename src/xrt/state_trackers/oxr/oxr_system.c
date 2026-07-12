@@ -146,13 +146,13 @@ oxr_system_fill_in(
 	float view_scale_x = info->recommended_view_scale_x;
 	float view_scale_y = info->recommended_view_scale_y;
 
-#ifdef OXR_HAVE_EXT_display_info
-	// Legacy app compromise: apps without XR_EXT_display_info can't adapt to
+#ifdef OXR_HAVE_DXR_display_info
+	// Legacy app compromise: apps without XR_DXR_display_info can't adapt to
 	// mode changes, so we pick a compromise view scale that works across 2D and 3D.
 	// If the default 3D mode has 2 views with scaleX/Y <= 0.5 (typical SBS),
 	// use 0.5x1.0 so the app renders full-height tiles. The compositor will
 	// downscale Y for 3D and stretch X for 2D.
-	if (!inst->extensions.EXT_display_info) {
+	if (!inst->extensions.DXR_display_info) {
 		// Engine OpenXR plug-ins (Unity, Unreal) create a throwaway probe
 		// instance with ZERO extensions before the real one. Such an
 		// instance can never create a session (no graphics binding /
@@ -210,7 +210,7 @@ oxr_system_fill_in(
 				        "rendering, this instance cannot create a session",
 				        view_scale_x, view_scale_y);
 			} else {
-				U_LOG_I("Instance without XR_EXT_display_info: compromise view "
+				U_LOG_I("Instance without XR_DXR_display_info: compromise view "
 				        "scale %.2fx%.2f provisioned (3D mode '%s' is %.2fx%.2f); "
 				        "a LEGACY-session WARN fires at xrCreateSession if used",
 				        view_scale_x, view_scale_y, mode3d->mode_name,
@@ -218,7 +218,7 @@ oxr_system_fill_in(
 			}
 		}
 	}
-#endif // OXR_HAVE_EXT_display_info
+#endif // OXR_HAVE_DXR_display_info
 
 	for (uint32_t i = 0; i < view_count; ++i) {
 		uint32_t w_max = info->views[i].max.width_pixels;
@@ -695,10 +695,10 @@ oxr_system_get_properties(struct oxr_logger *log, struct oxr_system *sys, XrSyst
 	}
 #endif // OXR_HAVE_META_body_tracking_calibration
 
-#ifdef OXR_HAVE_EXT_display_info
-	XrDisplayInfoEXT *display_info = NULL;
-	if (sys->inst->extensions.EXT_display_info) {
-		display_info = OXR_GET_OUTPUT_FROM_CHAIN(properties, XR_TYPE_DISPLAY_INFO_EXT, XrDisplayInfoEXT);
+#ifdef OXR_HAVE_DXR_display_info
+	XrDisplayInfoDXR *display_info = NULL;
+	if (sys->inst->extensions.DXR_display_info) {
+		display_info = OXR_GET_OUTPUT_FROM_CHAIN(properties, XR_TYPE_DISPLAY_INFO_DXR, XrDisplayInfoDXR);
 	}
 
 	if (display_info) {
@@ -717,10 +717,10 @@ oxr_system_get_properties(struct oxr_logger *log, struct oxr_system *sys, XrSyst
 	// v16: 3D panel desktop position, so handle/texture-class apps can create
 	// their window on the panel instead of the primary monitor (#715). Same
 	// value the runtime uses to place its own hosted window.
-	XrDisplayDesktopPositionEXT *desktop_pos = NULL;
-	if (sys->inst->extensions.EXT_display_info) {
-		desktop_pos = OXR_GET_OUTPUT_FROM_CHAIN(properties, XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT,
-		                                        XrDisplayDesktopPositionEXT);
+	XrDisplayDesktopPositionDXR *desktop_pos = NULL;
+	if (sys->inst->extensions.DXR_display_info) {
+		desktop_pos = OXR_GET_OUTPUT_FROM_CHAIN(properties, XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR,
+		                                        XrDisplayDesktopPositionDXR);
 	}
 
 	if (desktop_pos) {
@@ -728,15 +728,15 @@ oxr_system_get_properties(struct oxr_logger *log, struct oxr_system *sys, XrSyst
 		desktop_pos->top = info ? info->display_screen_top : 0;
 	}
 
-	XrEyeTrackingModeCapabilitiesEXT *eye_caps = OXR_GET_OUTPUT_FROM_CHAIN(
-	    properties, XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT, XrEyeTrackingModeCapabilitiesEXT);
+	XrEyeTrackingModeCapabilitiesDXR *eye_caps = OXR_GET_OUTPUT_FROM_CHAIN(
+	    properties, XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR, XrEyeTrackingModeCapabilitiesDXR);
 	if (eye_caps) {
 		eye_caps->supportedModes =
-		    (XrEyeTrackingModeCapabilityFlagsEXT)(info ? info->supported_eye_tracking_modes : 0);
+		    (XrEyeTrackingModeCapabilityFlagsDXR)(info ? info->supported_eye_tracking_modes : 0);
 		eye_caps->defaultMode =
-		    (XrEyeTrackingModeEXT)(info ? info->default_eye_tracking_mode : 0);
+		    (XrEyeTrackingModeDXR)(info ? info->default_eye_tracking_mode : 0);
 	}
-#endif // OXR_HAVE_EXT_display_info
+#endif // OXR_HAVE_DXR_display_info
 
 	return XR_SUCCESS;
 }

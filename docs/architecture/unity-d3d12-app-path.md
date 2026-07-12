@@ -2,7 +2,7 @@
 
 How a **Unity** D3D12 app reaches the runtime. This is **not obvious** because Unity
 is not a DisplayXR-native app — it uses its own OpenXR plugin and never calls
-`XR_EXT_win32_window_binding` itself. The DisplayXR Unity plugin
+`XR_DXR_win32_window_binding` itself. The DisplayXR Unity plugin
 (`unity-3d-display`, ships as `displayxr_unity.dll`) bridges the gap by **hooking
 `xrCreateSession` and injecting a window binding pointing at a plugin-created
 overlay window**. The same pattern applies to any general engine integrated via a
@@ -20,7 +20,7 @@ Unity D3D12 (standalone, the default) runs on the **same in-process native D3D12
 compositor** as `cube_handle_d3d12_win`, as a `_handle`-class app — but it is *not*
 a drop-in equivalent. Two things differ:
 1. **Upstream binding:** the HWND handed to the runtime is a **plugin-created child
-   overlay window**, supplied via a **hook-injected** `XR_EXT_win32_window_binding`
+   overlay window**, supplied via a **hook-injected** `XR_DXR_win32_window_binding`
    — not a window the app made for the runtime, and not the IPC/service path.
 2. **Submission model:** Unity is a **fixed-resolution, always-2-view
    legacy-compromise** app (per-eye swapchains sized once; `scaleXY` not applied per
@@ -57,7 +57,7 @@ DisplayXR's hook sits in the middle and, **before** calling the real
      client rect. **This is the "HWND with a child."**
    - **Transparent (#57):** a top-level `WS_POPUP | WS_EX_NOREDIRECTIONBITMAP`
      overlay; Unity is cloaked + moved off-screen; DComp alpha compositing.
-3. **Injects** an `XrWin32WindowBindingCreateInfoEXT` onto the end of the
+3. **Injects** an `XrWin32WindowBindingCreateInfoDXR` onto the end of the
    `xrCreateSession` next-chain with `windowHandle = the overlay HWND` (plus a
    `readbackCallback` and the `transparentBackgroundEnabled` flag).
 4. Calls the real `xrCreateSession`.
@@ -128,7 +128,7 @@ is easy to get wrong).
 | | `cube_handle_d3d12_win` | Unity D3D12 (standalone) |
 |---|---|---|
 | Who calls `xrCreateSession` | the app itself | Unity's OpenXR plugin; **DisplayXR hooks it** |
-| `XR_EXT_win32_window_binding` | app fills it with its own HWND | plugin **injects** it |
+| `XR_DXR_win32_window_binding` | app fills it with its own HWND | plugin **injects** it |
 | HWND handed to the runtime | a clean window made **for the runtime** | a **child overlay** over Unity's main window |
 | Window ownership | app owns one window; nothing else presents to it | Unity owns + presents to its **main** window; overlay is a *second* window |
 | Readback | none | `readbackCallback` returns composited pixels |
@@ -143,7 +143,7 @@ A native handle app renders adaptive per-mode tiles; Unity is effectively a
 reconciled by the compositor at `layer_commit`/`xrEndFrame`. (On the **D3D11**
 service path Unity reconciles the atlas itself in `displayxr_d3d11_backend.cpp`; on
 **D3D12** the runtime compositor does the per-view blit.) The plugin also no longer
-computes Kooima — it chains an `XR_EXT_view_rig` descriptor onto `xrLocateViews`
+computes Kooima — it chains an `XR_DXR_view_rig` descriptor onto `xrLocateViews`
 and consumes the runtime's render-ready views.
 
 **Why the overlay is necessary** (all because Unity is a general engine, not a
@@ -158,7 +158,7 @@ bespoke DisplayXR app):
    would fight it. A separate overlay **stacked on top** lets the runtime own the
    screen while Unity's own present stays hidden behind it.
 3. **Unity won't emit the window binding.** Unity's OpenXR plugin knows nothing
-   about `XR_EXT_win32_window_binding` / 3D-display weaving. The only way to get
+   about `XR_DXR_win32_window_binding` / 3D-display weaving. The only way to get
    the binding + the right HWND into `xrCreateSession` is the hook + injection.
 
 A cube app has none of these constraints: it's written for DisplayXR, creates one

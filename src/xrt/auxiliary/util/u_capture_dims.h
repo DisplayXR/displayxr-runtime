@@ -8,14 +8,14 @@
  * The static @c xrt_system_compositor_info carries the NOMINAL atlas / view
  * dims (display-sized). When an app window differs from the display, the
  * in-process compositor renders — and captures — at window-scaled dims that
- * live only inside the compositor's renderer. xrCaptureAtlasEXT runs in the
+ * live only inside the compositor's renderer. xrCaptureAtlasDXR runs in the
  * state tracker (a layer above the compositor) and cannot reach those dims, so
  * it would report the nominal dims, disagreeing with the captured PNG (#431).
  *
  * This tiny registry bridges the gap without a compositor↔state-tracker edge:
  * it lives in aux_util (below both). The active in-process native compositor
  * registers a pull-callback at creation; the state tracker queries it when
- * filling @c XrAtlasCaptureResultEXT. Compositors that don't register (or a
+ * filling @c XrAtlasCaptureResultDXR. Compositors that don't register (or a
  * not-yet-sized renderer) leave the query returning false, so the caller falls
  * back to the nominal dims.
  *

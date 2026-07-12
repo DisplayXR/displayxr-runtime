@@ -209,7 +209,7 @@ makeAutoStereo(canvas, drawSceneForView);   // detects, sessions, renders, done
 
 ## How it maps to the implementation (vendor-agnostic)
 
-Under the hood this rides the **DXR weave RPC** (`XR_EXT_weave`): `bindWindow(handle)`
+Under the hood this rides the **DXR weave RPC** (`XR_DXR_weave`): `bindWindow(handle)`
 once, then per element per frame `weave(stereoPairHandle, elementRect) → {wovenHandle,
 trackedEyes}`. The browser:
 
@@ -221,7 +221,7 @@ trackedEyes}`. The browser:
 The **display processor (vendor plug-in) does all weaving and reads the vendor's own
 eye tracker** — the browser passes it nothing vendor-specific and contains no weave
 code (ADR-007 / ADR-019). Window moves reach the runtime through the bound handle so
-it re-snaps the interlace phase (`xrWeaveSnapWindowRectEXT`). This contract is already
+it re-snaps the interlace phase (`xrWeaveSnapWindowRectDXR`). This contract is already
 implemented and hardware-validated end-to-end via a CEF offscreen-render host that is
 byte-for-byte a Chromium compositor; Step B is the minimal Chromium patch that swaps
 the CEF host for `content_shell` / `chrome` calling the *same* RPC.

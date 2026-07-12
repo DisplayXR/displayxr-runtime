@@ -19,7 +19,7 @@
 #include <xcb/randr.h>    // xcb_randr_get_monitors — resolve the target monitor
                           // INDEX from the plug-in-reported panel position (#715).
 #include <X11/Xlib-xcb.h> // XGetXCBConnection (libX11-xcb) — Xlib→XCB bridge for
-                          // app-provided windows (XR_EXT_xlib_window_binding).
+                          // app-provided windows (XR_DXR_xlib_window_binding).
 
 struct comp_vk_native_window_xcb
 {

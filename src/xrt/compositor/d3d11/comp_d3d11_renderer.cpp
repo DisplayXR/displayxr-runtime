@@ -1356,7 +1356,7 @@ comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr)
 // Per-frame effective CONTENT layout (#542): the content recipe is the
 // ACTIVE MODE's — submissions are clamped to it, never the other way round.
 // Apps express a hardware/content divergence via the hardware-state override
-// (xrRequestDisplayModeEXT), NOT by submitting mismatched view counts: the
+// (xrRequestDisplayModeDXR), NOT by submitting mismatched view counts: the
 // runtime always reports the max view count from xrLocateViews (identical
 // centered views in a mono mode), so always-stereo apps legitimately submit
 // 2 identical views in 2D mode and must clamp to mono (the documented compat
@@ -1414,7 +1414,7 @@ comp_d3d11_renderer_compute_effective_layout(struct comp_d3d11_renderer *rendere
 }
 
 // Compute the per-view tile box for either pass — the box set_view_viewport
-// covers, and the box a zone rect scales into (XR_EXT_display_zones).
+// covers, and the box a zone rect scales into (XR_DXR_display_zones).
 static void
 get_view_tile_box(struct comp_d3d11_renderer *renderer,
                   uint32_t view_index,
@@ -1477,7 +1477,7 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 {
 	auto internals = get_internals(renderer->c);
 
-	// XR_EXT_display_zones (ADR-027): a zones frame composes N placed zone
+	// XR_DXR_display_zones (ADR-027): a zones frame composes N placed zone
 	// layers into the window-spanning atlas — the unzoned area must weave
 	// to nothing (transparent), not the dark-blue debug clear, so the
 	// feathered wish edge blends toward the desktop.
@@ -1543,7 +1543,7 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 				break;
 
 			case XRT_LAYER_ZONE_3D: {
-				// XR_EXT_display_zones: scaled-blit this zone's view
+				// XR_DXR_display_zones: scaled-blit this zone's view
 				// tile into the view tile box at the zone rect
 				// (client-window px scaled into tile coordinates —
 				// in zones frames the tile spans the full window).

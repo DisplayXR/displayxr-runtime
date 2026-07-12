@@ -1,6 +1,6 @@
 name: Publish Extension Headers
 
-# Auto-publishes XR_EXT_*.h headers to DisplayXR/displayxr-extensions
+# Auto-publishes XR_DXR_*.h headers to DisplayXR/displayxr-extensions
 # whenever they change on main. Authenticates via the DisplayXR Publish
 # Bot GitHub App (see org secrets DISPLAYXR_APP_ID + DISPLAYXR_APP_PRIVATE_KEY).
 
@@ -8,7 +8,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'src/external/openxr_includes/openxr/XR_EXT_*.h'
+      - 'src/external/openxr_includes/openxr/XR_DXR_*.h'
       - '.github/workflows/publish-extensions.yml'
   workflow_dispatch: {}
 
@@ -39,12 +39,16 @@ jobs:
       - name: Copy headers
         run: |
           mkdir -p extensions-repo/include/openxr
-          # Prune stale XR_EXT_*.h so header DELETIONS in the runtime propagate
-          # to the mirror (cp alone only adds/overwrites). Only touches the
-          # auto-synced XR_EXT_* set; hand-maintained headers in the mirror
+          # Prune stale XR_DXR_*.h so header DELETIONS in the runtime propagate
+          # to the mirror (cp alone only adds/overwrites). The XR_EXT_*.h prune
+          # is kept PERMANENTLY: it cleaned the mirror of the pre-rename
+          # XR_EXT_* set on the first post-rename sync and is idempotent — do
+          # not remove it (every XR_EXT_*.h ever in the mirror was
+          # DisplayXR-authored). Hand-maintained headers in the mirror
           # (openxr.h, XR_MNDX_*.h, …) are left alone.
           rm -f extensions-repo/include/openxr/XR_EXT_*.h
-          cp src/external/openxr_includes/openxr/XR_EXT_*.h extensions-repo/include/openxr/
+          rm -f extensions-repo/include/openxr/XR_DXR_*.h
+          cp src/external/openxr_includes/openxr/XR_DXR_*.h extensions-repo/include/openxr/
           echo "Copied headers:"
           ls -la extensions-repo/include/openxr/
 
@@ -61,15 +65,15 @@ jobs:
 
           | Header | Extension | Description |
           |--------|-----------|-------------|
-          | [`XR_EXT_display_info.h`](include/openxr/XR_EXT_display_info.h) | `XR_EXT_display_info` | Display dimensions, eye-tracking modes, and the data needed for asymmetric (Kooima) projection |
+          | [`XR_DXR_display_info.h`](include/openxr/XR_DXR_display_info.h) | `XR_DXR_display_info` | Display dimensions, eye-tracking modes, and the data needed for asymmetric (Kooima) projection |
 
           ## App window binding
 
           | Header | Extension | Description |
           |--------|-----------|-------------|
-          | [`XR_EXT_win32_window_binding.h`](include/openxr/XR_EXT_win32_window_binding.h) | `XR_EXT_win32_window_binding` | App-provided HWND, shared texture, canvas sub-rect |
-          | [`XR_EXT_cocoa_window_binding.h`](include/openxr/XR_EXT_cocoa_window_binding.h) | `XR_EXT_cocoa_window_binding` | App-provided NSView, IOSurface sharing |
-          | [`XR_EXT_macos_gl_binding.h`](include/openxr/XR_EXT_macos_gl_binding.h) | `XR_EXT_macos_gl_binding` | macOS OpenGL graphics binding |
+          | [`XR_DXR_win32_window_binding.h`](include/openxr/XR_DXR_win32_window_binding.h) | `XR_DXR_win32_window_binding` | App-provided HWND, shared texture, canvas sub-rect |
+          | [`XR_DXR_cocoa_window_binding.h`](include/openxr/XR_DXR_cocoa_window_binding.h) | `XR_DXR_cocoa_window_binding` | App-provided NSView, IOSurface sharing |
+          | [`XR_DXR_macos_gl_binding.h`](include/openxr/XR_DXR_macos_gl_binding.h) | `XR_DXR_macos_gl_binding` | macOS OpenGL graphics binding |
 
           ## Workspace controller surface
 
@@ -77,7 +81,7 @@ jobs:
 
           | Header | Extension | Description |
           |--------|-----------|-------------|
-          | [`XR_EXT_spatial_workspace.h`](include/openxr/XR_EXT_spatial_workspace.h) | `XR_EXT_spatial_workspace` | Multi-app composition: window pose, hit-test, capture, overlay, modal input grab |
+          | [`XR_DXR_spatial_workspace.h`](include/openxr/XR_DXR_spatial_workspace.h) | `XR_DXR_spatial_workspace` | Multi-app composition: window pose, hit-test, capture, overlay, modal input grab |
 
           ## Usage
 
@@ -96,7 +100,7 @@ jobs:
 
           ## Provisional naming
 
-          The `XR_EXT_*` identifiers are **provisional** — they are not registered in the Khronos OpenXR registry. They are placeholders used during DisplayXR incubation and will be re-registered (and may be renamed to a registered `XR_<AUTHORID>_` prefix) through the official Khronos process on the EXT → KHR path. Do not treat the names or numeric values as stable. See [GOVERNANCE.md](GOVERNANCE.md).
+          `DXR` is DisplayXR's Khronos-registered OpenXR author ID. The `XR_DXR_*` extensions themselves are **provisional** — they are not yet registered in the Khronos OpenXR registry: extension numbers and `XrStructureType` values sit in a provisional experimental block (`1004999xxx`) pending official assignment. Extension names are expected to be stable; numeric values are not. (These extensions previously shipped under provisional `XR_EXT_*` names; `SPEC_VERSION` restarted at 1 on the rename.) See [GOVERNANCE.md](GOVERNANCE.md).
 
           ## License
 
@@ -104,7 +108,7 @@ jobs:
 
           ## Auto-Published
 
-          These headers are automatically synced from `displayxr-runtime/src/external/openxr_includes/openxr/XR_EXT_*.h` on every push to main. Do not edit directly — changes will be overwritten.
+          These headers are automatically synced from `displayxr-runtime/src/external/openxr_includes/openxr/XR_DXR_*.h` on every push to main. Do not edit directly — changes will be overwritten.
           READMEEOF
 
       - name: Commit and push if changed

@@ -30,9 +30,9 @@ extern "C" {
  * following the same pattern as the D3D11 native compositor.
  *
  * @param xdev The device we are displaying to.
- * @param hwnd The window handle from XR_EXT_win32_window_binding / an NSView from
- *        XR_EXT_cocoa_window_binding / a struct comp_vk_native_xlib_handle* from
- *        XR_EXT_xlib_window_binding on desktop Linux (or NULL for own window).
+ * @param hwnd The window handle from XR_DXR_win32_window_binding / an NSView from
+ *        XR_DXR_cocoa_window_binding / a struct comp_vk_native_xlib_handle* from
+ *        XR_DXR_xlib_window_binding on desktop Linux (or NULL for own window).
  * @param vk_instance The app's VkInstance.
  * @param vk_physical_device The app's VkPhysicalDevice.
  * @param vk_device The app's VkDevice.
@@ -179,7 +179,7 @@ uint32_t
 comp_vk_native_compositor_get_queue_family(struct comp_vk_native_compositor *c);
 
 /*
- * XR_EXT_local_3d_zone — authored 2D/3D mask consumer, VK leg.
+ * XR_DXR_local_3d_zone — authored 2D/3D mask consumer, VK leg.
  * Contracts + scoping (the composite consumer rides with Phase 3 — handle
  * apps have no 2D source before the xrEndFrame 2D layer):
  * docs/roadmap/unified-2d-3d-crossapi-impl.md §4.
@@ -256,9 +256,9 @@ void
 comp_vk_native_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask);
 
 /*!
- * XR_EXT_display_zones (ADR-027): set the frame's explicit wish for the next
+ * XR_DXR_display_zones (ADR-027): set the frame's explicit wish for the next
  * layer_commit — @p mask is the compositor-side mask state of the
- * XrLocal3DZoneMaskEXT referenced via XrDisplayZonesFrameEndInfoEXT.wishMask
+ * XrLocal3DZoneMaskDXR referenced via XrDisplayZonesFrameEndInfoDXR.wishMask
  * (oxr_local_3d_zone_ext::comp_mask), or NULL to auto-derive the wish from
  * the frame's zone rects. Called by oxr on every zones frame before
  * xrt_comp_layer_commit; consumed by that commit. No-op outside zones frames.
@@ -271,7 +271,7 @@ comp_vk_native_compositor_zones_set_frame_wish(struct xrt_compositor *xc, void *
 /*!
  * #439 Phase 3 Q4 — current recommended per-view render size (renderer view
  * dims, recomputed each frame from the effective canvas). The oxr frame-end
- * poll fires XrEventDataLocal3DZoneViewSizeChangedEXT when this changes.
+ * poll fires XrEventDataLocal3DZoneViewSizeChangedDXR when this changes.
  *
  * @ingroup comp_vk_native
  */

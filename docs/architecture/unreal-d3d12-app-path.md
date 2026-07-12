@@ -82,12 +82,12 @@ The plugin is a first-class HMD plugin, registered ahead of UE's own OpenXR HMD:
 3. **Drives real OpenXR.** Full `xrCreateInstance` / `xrGetSystem` / `xrCreateSession`
    (D3D12 graphics binding + Win32 window binding) / `xrCreateSwapchain` /
    `xrWaitFrame` / `xrBeginFrame` / `xrEndFrame` / `xrLocateViews`. It enables
-   `XR_EXT_display_info`, `XR_EXT_win32_window_binding`, `XR_KHR_D3D12_enable`, and
-   the atlas-capture extension. Because it enables `XR_EXT_display_info`, the runtime
+   `XR_DXR_display_info`, `XR_DXR_win32_window_binding`, `XR_KHR_D3D12_enable`, and
+   the atlas-capture extension. Because it enables `XR_DXR_display_info`, the runtime
    treats it as an **extension app**, not a legacy app (contrast Unity).
 4. **Creates the window binding** — a `WS_CHILD` overlay over the game window (see
    [Window handling](#window-handling)), bound via the same
-   `XR_EXT_win32_window_binding` the cube fills.
+   `XR_DXR_win32_window_binding` the cube fills.
 
 ### Runtime side (this repo)
 
@@ -112,7 +112,7 @@ Unlike Unity's fixed 2-view submission, UE renders the active mode's **N tiles**
 itself:
 
 - **View count is data-driven from the display's modes.** The plugin reads
-  `xrEnumerateDisplayRenderingModesEXT` into a `FDisplayXRViewConfig`
+  `xrEnumerateDisplayRenderingModesDXR` into a `FDisplayXRViewConfig`
   (`tileColumns`/`tileRows`/`viewScaleX`/`viewScaleY`), and
   `GetDesiredNumberOfViews()` returns `CachedViewConfig.GetViewCount()`
   (= `tileColumns × tileRows`), clamped to ≥ 2 only because UE requires ≥ 2 for stereo
@@ -140,7 +140,7 @@ DXGI one-swapchain-per-HWND constraint Unity does, and solves it the **same** wa
   takes the child-window branch (`DisplayXRCompositor.cpp:265-269`).
 - `CreateChildWindow()` makes a `WS_CHILD | WS_VISIBLE` window of class
   `DisplayXROverlay` over the game HWND (`DisplayXRCompositor.cpp:825-836`), and the
-  **child** HWND (not the parent) is bound via `XR_EXT_win32_window_binding`
+  **child** HWND (not the parent) is bound via `XR_DXR_win32_window_binding`
   (`SessionHWND = ChildHWND`, `:271`). The child's WndProc returns `HTTRANSPARENT`
   for hit-testing and the compositor keeps it sized to the parent each frame.
 
@@ -158,8 +158,8 @@ what makes this child — the plugin creates it explicitly, just as the Unity pl
 | Views rendered | active mode's **N** as tiles | **N** (`cols × rows`), all rendered | **always 2** eyes |
 | Per-view resolution | **adaptive** per mode | **adaptive** per mode (live window) | **fixed** at session start |
 | View synthesis | none | **none** (renders all N) | none — but **can't drive `view_count > 2` modes** |
-| Projection | runtime Kooima | **own off-axis** from runtime eye positions | runtime via chained `XR_EXT_view_rig` |
-| `XR_EXT_display_info` | enabled (extension app) | **enabled** (extension app) | not enabled → legacy compromise |
+| Projection | runtime Kooima | **own off-axis** from runtime eye positions | runtime via chained `XR_DXR_view_rig` |
+| `XR_DXR_display_info` | enabled (extension app) | **enabled** (extension app) | not enabled → legacy compromise |
 | Window binding | clean runtime-owned HWND | game HWND → **`WS_CHILD` overlay** | main HWND → **`WS_CHILD`/`WS_POPUP` overlay** |
 | Atlas assembly | runtime compositor | **UE renderer draws into runtime swapchain** (zero-copy) | D3D12: runtime blits / D3D11: plugin builds atlas |
 

@@ -1,16 +1,17 @@
 // Copyright 2025, The DisplayXR Project
 // SPDX-License-Identifier: Apache-2.0
 //
-// PROVISIONAL — the XR_EXT_* identifiers in this header are NOT registered
-// with the Khronos OpenXR registry. They are provisional placeholders used
-// during DisplayXR incubation and will be re-registered — and may be renamed
-// (e.g. to a registered XR_<AUTHORID>_ prefix) — through the official Khronos
-// process on the EXT -> KHR path. Do not treat these names or numeric values
-// as stable. See GOVERNANCE.md.
+// PROVISIONAL — DXR is DisplayXR's Khronos-registered OpenXR author ID, but
+// the XR_DXR_* extensions in this header are NOT yet registered in the
+// Khronos OpenXR registry: extension numbers and XrStructureType values sit
+// in a provisional experimental block (1004999xxx) pending official
+// assignment. Extension names are expected to be stable; numeric values are
+// not. SPEC_VERSION restarted at 1 on the XR_EXT_* -> XR_DXR_* rename.
+// See GOVERNANCE.md.
 //
 /*!
  * @file
- * @brief  Header for XR_EXT_win32_window_binding extension
+ * @brief  Header for XR_DXR_win32_window_binding extension
  * @author David Fattal
  * @ingroup external_openxr
  *
@@ -27,8 +28,8 @@
  * - Zero-copy shared texture: windowHandle=NULL + sharedTextureHandle →
  *   runtime composites into a shared D3D11/D3D12 texture (HANDLE)
  */
-#ifndef XR_EXT_WIN32_WINDOW_BINDING_H
-#define XR_EXT_WIN32_WINDOW_BINDING_H 1
+#ifndef XR_DXR_WIN32_WINDOW_BINDING_H
+#define XR_DXR_WIN32_WINDOW_BINDING_H 1
 
 #include <openxr/openxr.h>
 #include <stdint.h>
@@ -37,19 +38,19 @@
 extern "C" {
 #endif
 
-#define XR_EXT_win32_window_binding 1
-#define XR_EXT_win32_window_binding_SPEC_VERSION 8
-#define XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME "XR_EXT_win32_window_binding"
+#define XR_DXR_win32_window_binding 1
+#define XR_DXR_win32_window_binding_SPEC_VERSION 1
+#define XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME "XR_DXR_win32_window_binding"
 
 // Use a value in the vendor extension range (1000000000+)
 // This should be replaced with an official Khronos-assigned value if the extension is standardized
-#define XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT ((XrStructureType)1000999001)
-#define XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT ((XrStructureType)1000999002)
+#define XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR ((XrStructureType)1004999001)
+#define XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR ((XrStructureType)1004999002)
 
 /*!
  * @brief Callback for offscreen readback mode (CPU fallback).
  *
- * When set in XrWin32WindowBindingCreateInfoEXT with windowHandle=NULL,
+ * When set in XrWin32WindowBindingCreateInfoDXR with windowHandle=NULL,
  * the runtime delivers composited RGBA pixels via this callback each frame.
  *
  * @param pixels   Pointer to RGBA pixel data (width * height * 4 bytes)
@@ -77,8 +78,8 @@ typedef void (*PFN_xrReadbackCallback)(
  *
  * @extends XrSessionCreateInfo
  */
-typedef struct XrWin32WindowBindingCreateInfoEXT {
-    XrStructureType             type;                  //!< Must be XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT
+typedef struct XrWin32WindowBindingCreateInfoDXR {
+    XrStructureType             type;                  //!< Must be XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR
     const void* XR_MAY_ALIAS    next;                  //!< Pointer to next structure in chain
 #ifdef _WIN32
     void*                       windowHandle;          //!< HWND of the target window (Windows only)
@@ -98,7 +99,7 @@ typedef struct XrWin32WindowBindingCreateInfoEXT {
     //! Transparency is carried by the swapchain's per-pixel alpha and a transparent
     //! present (SPEC_VERSION 8, #573 removed the legacy chromaKeyColor field).
     XrBool32                    transparentBackgroundEnabled;
-} XrWin32WindowBindingCreateInfoEXT;
+} XrWin32WindowBindingCreateInfoDXR;
 
 /*!
  * @brief Composition layer positioned in fractional window coordinates.
@@ -112,12 +113,12 @@ typedef struct XrWin32WindowBindingCreateInfoEXT {
  * (passes through the weaver like any other layer).
  *
  * This layer type is only valid when the session was created with
- * XrWin32WindowBindingCreateInfoEXT (i.e., rendering to an application-provided window).
+ * XrWin32WindowBindingCreateInfoDXR (i.e., rendering to an application-provided window).
  *
  * @extends XrFrameEndInfo (submitted as a composition layer)
  */
-typedef struct XrCompositionLayerWindowSpaceEXT {
-    XrStructureType             type;       //!< Must be XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT
+typedef struct XrCompositionLayerWindowSpaceDXR {
+    XrStructureType             type;       //!< Must be XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR
     const void* XR_MAY_ALIAS    next;       //!< Pointer to next structure in chain
     XrCompositionLayerFlags     layerFlags; //!< e.g. XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
     XrSwapchainSubImage         subImage;   //!< Source swapchain + rect
@@ -127,10 +128,10 @@ typedef struct XrCompositionLayerWindowSpaceEXT {
     float                       height;     //!< Fraction of window height [0..1]
     float                       disparity;  //!< Horizontal shift, fraction of window width.
                                             //!< 0 = screen depth, negative = toward viewer
-} XrCompositionLayerWindowSpaceEXT;
+} XrCompositionLayerWindowSpaceDXR;
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // XR_EXT_WIN32_WINDOW_BINDING_H
+#endif // XR_DXR_WIN32_WINDOW_BINDING_H

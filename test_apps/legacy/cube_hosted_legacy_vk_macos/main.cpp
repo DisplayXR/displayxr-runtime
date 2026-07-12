@@ -8,7 +8,7 @@
  * via Vulkan + OpenXR. Designed for the sim_display driver on macOS but
  * works on any platform with a Vulkan-capable OpenXR runtime.
  *
- * Legacy variant: does NOT enable XR_EXT_display_info. Relies on runtime
+ * Legacy variant: does NOT enable XR_DXR_display_info. Relies on runtime
  * defaults and recommendedImageRectWidth for swapchain sizing.
  *
  * No windowing code — the runtime's compositor creates its own window.
@@ -1725,7 +1725,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         return false;
     }
 
-    // Legacy: NOT enabling XR_EXT_display_info
+    // Legacy: NOT enabling XR_DXR_display_info
     std::vector<const char*> enabledExtensions;
     enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
 
@@ -1987,7 +1987,7 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     XR_CHECK(xrCreateSession(xr.instance, &sessionInfo, &xr.session));
     LOG_INFO("Session created");
 
-    // Legacy: no rendering mode enumeration (XR_EXT_display_info not enabled)
+    // Legacy: no rendering mode enumeration (XR_DXR_display_info not enabled)
 
     return true;
 }
@@ -2092,7 +2092,7 @@ static bool PollEvents(AppXrSession& xr) {
         case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
             xr.exitRequested = true;
             break;
-        // Legacy app: no rendering mode events (XR_EXT_display_info not enabled)
+        // Legacy app: no rendering mode events (XR_DXR_display_info not enabled)
         default:
             break;
         }

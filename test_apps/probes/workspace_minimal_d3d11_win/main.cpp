@@ -3,7 +3,7 @@
 //
 // workspace_minimal_d3d11_win
 //
-// Minimal validation client for XR_EXT_spatial_workspace (Phase 2.A + 2.C
+// Minimal validation client for XR_DXR_spatial_workspace (Phase 2.A + 2.C
 // + 2.D + 2.F + 2.I-prequel). Creates an instance + session, resolves all
 // 24 extension PFNs, and walks through:
 //   activate -> get-state ->
@@ -41,7 +41,7 @@
 
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-#include <openxr/XR_EXT_spatial_workspace.h>
+#include <openxr/XR_DXR_spatial_workspace.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -95,21 +95,21 @@ run_workspace_test()
 
 	bool workspace_listed = false;
 	for (const auto &p : props) {
-		if (std::strcmp(p.extensionName, XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME) == 0) {
+		if (std::strcmp(p.extensionName, XR_DXR_SPATIAL_WORKSPACE_EXTENSION_NAME) == 0) {
 			workspace_listed = true;
 			std::printf("[enumerate                                ] found %s v%u\n", p.extensionName,
 			            p.extensionVersion);
 		}
 	}
 	if (!workspace_listed) {
-		std::printf("FAIL: runtime did not advertise %s\n", XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME);
+		std::printf("FAIL: runtime did not advertise %s\n", XR_DXR_SPATIAL_WORKSPACE_EXTENSION_NAME);
 		return XR_ERROR_RUNTIME_FAILURE;
 	}
 
 	// 2. Create instance with the workspace extension and D3D11 binding.
 	const char *enabled_exts[] = {
 	    XR_KHR_D3D11_ENABLE_EXTENSION_NAME,
-	    XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME,
+	    XR_DXR_SPATIAL_WORKSPACE_EXTENSION_NAME,
 	};
 	XrInstanceCreateInfo instInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
 	instInfo.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
@@ -123,72 +123,72 @@ run_workspace_test()
 	CHECK_XR(xrCreateInstance(&instInfo, &instance), "xrCreateInstance");
 
 	// 3. Resolve all 24 extension PFNs (must be non-null when the extension is enabled).
-	PFN_xrActivateSpatialWorkspaceEXT pfnActivate = nullptr;
-	PFN_xrDeactivateSpatialWorkspaceEXT pfnDeactivate = nullptr;
-	PFN_xrGetSpatialWorkspaceStateEXT pfnGetState = nullptr;
-	PFN_xrAddWorkspaceCaptureClientEXT pfnAddCapture = nullptr;
-	PFN_xrRemoveWorkspaceCaptureClientEXT pfnRemoveCapture = nullptr;
-	PFN_xrSetWorkspaceClientWindowPoseEXT pfnSetClientPose = nullptr;
-	PFN_xrGetWorkspaceClientWindowPoseEXT pfnGetClientPose = nullptr;
-	PFN_xrSetWorkspaceClientVisibilityEXT pfnSetClientVisibility = nullptr;
-	PFN_xrSetWorkspaceCursorDepthEXT pfnSetCursorDepth = nullptr; // spec_version 22
-	PFN_xrSetWorkspaceFocusedClientEXT pfnSetFocused = nullptr;
-	PFN_xrGetWorkspaceFocusedClientEXT pfnGetFocused = nullptr;
-	PFN_xrEnumerateWorkspaceInputEventsEXT pfnEnumInputEvents = nullptr;
-	PFN_xrEnableWorkspacePointerCaptureEXT pfnEnableCapture = nullptr;
-	PFN_xrDisableWorkspacePointerCaptureEXT pfnDisableCapture = nullptr;
-	PFN_xrCaptureWorkspaceFrameEXT pfnCaptureFrame = nullptr;
-	PFN_xrEnumerateWorkspaceClientsEXT pfnEnumClients = nullptr;
-	PFN_xrGetWorkspaceClientInfoEXT pfnGetClientInfo = nullptr;
+	PFN_xrActivateSpatialWorkspaceDXR pfnActivate = nullptr;
+	PFN_xrDeactivateSpatialWorkspaceDXR pfnDeactivate = nullptr;
+	PFN_xrGetSpatialWorkspaceStateDXR pfnGetState = nullptr;
+	PFN_xrAddWorkspaceCaptureClientDXR pfnAddCapture = nullptr;
+	PFN_xrRemoveWorkspaceCaptureClientDXR pfnRemoveCapture = nullptr;
+	PFN_xrSetWorkspaceClientWindowPoseDXR pfnSetClientPose = nullptr;
+	PFN_xrGetWorkspaceClientWindowPoseDXR pfnGetClientPose = nullptr;
+	PFN_xrSetWorkspaceClientVisibilityDXR pfnSetClientVisibility = nullptr;
+	PFN_xrSetWorkspaceCursorDepthDXR pfnSetCursorDepth = nullptr; // spec_version 22
+	PFN_xrSetWorkspaceFocusedClientDXR pfnSetFocused = nullptr;
+	PFN_xrGetWorkspaceFocusedClientDXR pfnGetFocused = nullptr;
+	PFN_xrEnumerateWorkspaceInputEventsDXR pfnEnumInputEvents = nullptr;
+	PFN_xrEnableWorkspacePointerCaptureDXR pfnEnableCapture = nullptr;
+	PFN_xrDisableWorkspacePointerCaptureDXR pfnDisableCapture = nullptr;
+	PFN_xrCaptureWorkspaceFrameDXR pfnCaptureFrame = nullptr;
+	PFN_xrEnumerateWorkspaceClientsDXR pfnEnumClients = nullptr;
+	PFN_xrGetWorkspaceClientInfoDXR pfnGetClientInfo = nullptr;
 	// Phase 2.K additions (spec_version 6).
-	PFN_xrRequestWorkspaceClientExitEXT pfnRequestExit = nullptr;
-	PFN_xrRequestWorkspaceClientFullscreenEXT pfnRequestFullscreen = nullptr;
+	PFN_xrRequestWorkspaceClientExitDXR pfnRequestExit = nullptr;
+	PFN_xrRequestWorkspaceClientFullscreenDXR pfnRequestFullscreen = nullptr;
 	// Phase 2.C controller-owned chrome (spec_version 7) + event-driven
 	// wakeup (spec_version 8) + per-client style (spec_version 9).
-	PFN_xrCreateWorkspaceClientChromeSwapchainEXT pfnCreateChromeSwapchain = nullptr;
-	PFN_xrDestroyWorkspaceClientChromeSwapchainEXT pfnDestroyChromeSwapchain = nullptr;
-	PFN_xrSetWorkspaceClientChromeLayoutEXT pfnSetChromeLayout = nullptr;
-	PFN_xrAcquireWorkspaceWakeupEventEXT pfnAcquireWakeupEvent = nullptr;
-	PFN_xrSetWorkspaceClientStyleEXT pfnSetClientStyle = nullptr;
+	PFN_xrCreateWorkspaceClientChromeSwapchainDXR pfnCreateChromeSwapchain = nullptr;
+	PFN_xrDestroyWorkspaceClientChromeSwapchainDXR pfnDestroyChromeSwapchain = nullptr;
+	PFN_xrSetWorkspaceClientChromeLayoutDXR pfnSetChromeLayout = nullptr;
+	PFN_xrAcquireWorkspaceWakeupEventDXR pfnAcquireWakeupEvent = nullptr;
+	PFN_xrSetWorkspaceClientStyleDXR pfnSetClientStyle = nullptr;
 
 	struct PfnLookup {
 		const char *name;
 		PFN_xrVoidFunction *out;
 	};
 	PfnLookup lookups[] = {
-	    {"xrActivateSpatialWorkspaceEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnActivate)},
-	    {"xrDeactivateSpatialWorkspaceEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnDeactivate)},
-	    {"xrGetSpatialWorkspaceStateEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnGetState)},
-	    {"xrAddWorkspaceCaptureClientEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnAddCapture)},
-	    {"xrRemoveWorkspaceCaptureClientEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnRemoveCapture)},
-	    {"xrSetWorkspaceClientWindowPoseEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetClientPose)},
-	    {"xrGetWorkspaceClientWindowPoseEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnGetClientPose)},
-	    {"xrSetWorkspaceClientVisibilityEXT",
+	    {"xrActivateSpatialWorkspaceDXR", reinterpret_cast<PFN_xrVoidFunction *>(&pfnActivate)},
+	    {"xrDeactivateSpatialWorkspaceDXR", reinterpret_cast<PFN_xrVoidFunction *>(&pfnDeactivate)},
+	    {"xrGetSpatialWorkspaceStateDXR", reinterpret_cast<PFN_xrVoidFunction *>(&pfnGetState)},
+	    {"xrAddWorkspaceCaptureClientDXR", reinterpret_cast<PFN_xrVoidFunction *>(&pfnAddCapture)},
+	    {"xrRemoveWorkspaceCaptureClientDXR", reinterpret_cast<PFN_xrVoidFunction *>(&pfnRemoveCapture)},
+	    {"xrSetWorkspaceClientWindowPoseDXR", reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetClientPose)},
+	    {"xrGetWorkspaceClientWindowPoseDXR", reinterpret_cast<PFN_xrVoidFunction *>(&pfnGetClientPose)},
+	    {"xrSetWorkspaceClientVisibilityDXR",
 	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetClientVisibility)},
-	    {"xrSetWorkspaceCursorDepthEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetCursorDepth)},
-	    {"xrSetWorkspaceFocusedClientEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetFocused)},
-	    {"xrGetWorkspaceFocusedClientEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnGetFocused)},
-	    {"xrEnumerateWorkspaceInputEventsEXT",
+	    {"xrSetWorkspaceCursorDepthDXR", reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetCursorDepth)},
+	    {"xrSetWorkspaceFocusedClientDXR", reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetFocused)},
+	    {"xrGetWorkspaceFocusedClientDXR", reinterpret_cast<PFN_xrVoidFunction *>(&pfnGetFocused)},
+	    {"xrEnumerateWorkspaceInputEventsDXR",
 	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnEnumInputEvents)},
-	    {"xrEnableWorkspacePointerCaptureEXT",
+	    {"xrEnableWorkspacePointerCaptureDXR",
 	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnEnableCapture)},
-	    {"xrDisableWorkspacePointerCaptureEXT",
+	    {"xrDisableWorkspacePointerCaptureDXR",
 	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnDisableCapture)},
-	    {"xrCaptureWorkspaceFrameEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnCaptureFrame)},
-	    {"xrEnumerateWorkspaceClientsEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnEnumClients)},
-	    {"xrGetWorkspaceClientInfoEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnGetClientInfo)},
-	    {"xrRequestWorkspaceClientExitEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnRequestExit)},
-	    {"xrRequestWorkspaceClientFullscreenEXT",
+	    {"xrCaptureWorkspaceFrameDXR", reinterpret_cast<PFN_xrVoidFunction *>(&pfnCaptureFrame)},
+	    {"xrEnumerateWorkspaceClientsDXR", reinterpret_cast<PFN_xrVoidFunction *>(&pfnEnumClients)},
+	    {"xrGetWorkspaceClientInfoDXR", reinterpret_cast<PFN_xrVoidFunction *>(&pfnGetClientInfo)},
+	    {"xrRequestWorkspaceClientExitDXR", reinterpret_cast<PFN_xrVoidFunction *>(&pfnRequestExit)},
+	    {"xrRequestWorkspaceClientFullscreenDXR",
 	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnRequestFullscreen)},
-	    {"xrCreateWorkspaceClientChromeSwapchainEXT",
+	    {"xrCreateWorkspaceClientChromeSwapchainDXR",
 	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnCreateChromeSwapchain)},
-	    {"xrDestroyWorkspaceClientChromeSwapchainEXT",
+	    {"xrDestroyWorkspaceClientChromeSwapchainDXR",
 	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnDestroyChromeSwapchain)},
-	    {"xrSetWorkspaceClientChromeLayoutEXT",
+	    {"xrSetWorkspaceClientChromeLayoutDXR",
 	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetChromeLayout)},
-	    {"xrAcquireWorkspaceWakeupEventEXT",
+	    {"xrAcquireWorkspaceWakeupEventDXR",
 	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnAcquireWakeupEvent)},
-	    {"xrSetWorkspaceClientStyleEXT",
+	    {"xrSetWorkspaceClientStyleDXR",
 	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetClientStyle)},
 	};
 	for (const auto &l : lookups) {
@@ -260,7 +260,7 @@ run_workspace_test()
 
 	// 5. Walk the workspace lifecycle.
 	XrResult activate_r = pfnActivate(session);
-	std::printf("[xrActivateSpatialWorkspaceEXT             ] %s\n", xr_result_str(activate_r));
+	std::printf("[xrActivateSpatialWorkspaceDXR             ] %s\n", xr_result_str(activate_r));
 
 	if (activate_r == XR_ERROR_FEATURE_UNSUPPORTED) {
 		std::printf("INFO: standalone launch — workspace orchestrator did not authorize this PID.\n");
@@ -278,7 +278,7 @@ run_workspace_test()
 
 	// Authorized path — exercise the full surface.
 	XrBool32 active = XR_FALSE;
-	CHECK_XR(pfnGetState(session, &active), "xrGetSpatialWorkspaceStateEXT");
+	CHECK_XR(pfnGetState(session, &active), "xrGetSpatialWorkspaceStateDXR");
 	std::printf("INFO: workspace active = %s\n", active ? "XR_TRUE" : "XR_FALSE");
 
 	HWND target = FindWindowA(nullptr, "Calculator");
@@ -293,7 +293,7 @@ run_workspace_test()
 
 	XrWorkspaceClientId clientId = XR_NULL_WORKSPACE_CLIENT_ID;
 	CHECK_XR(pfnAddCapture(session, (uint64_t)(uintptr_t)target, "workspace_minimal smoke test", &clientId),
-	         "xrAddWorkspaceCaptureClientEXT");
+	         "xrAddWorkspaceCaptureClientDXR");
 	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
 		std::printf("FAIL: clientId is XR_NULL_WORKSPACE_CLIENT_ID after add\n");
 		xrDestroySession(session);
@@ -310,12 +310,12 @@ run_workspace_test()
 		testPose.orientation.w = 1.0f; // identity
 		testPose.position.z = 0.5f;     // 0.5m in front of display center
 		XrResult sr = pfnSetClientPose(session, clientId, &testPose, 0.20f, 0.15f);
-		std::printf("[xrSetWorkspaceClientWindowPoseEXT          ] %s\n", xr_result_str(sr));
+		std::printf("[xrSetWorkspaceClientWindowPoseDXR          ] %s\n", xr_result_str(sr));
 
 		XrPosef readback = {};
 		float w = 0.0f, h = 0.0f;
 		XrResult gr = pfnGetClientPose(session, clientId, &readback, &w, &h);
-		std::printf("[xrGetWorkspaceClientWindowPoseEXT          ] %s\n", xr_result_str(gr));
+		std::printf("[xrGetWorkspaceClientWindowPoseDXR          ] %s\n", xr_result_str(gr));
 		if (gr == XR_SUCCESS) {
 			std::printf("INFO: readback pos=(%.3f,%.3f,%.3f) size=%.3fx%.3f\n", readback.position.x,
 			            readback.position.y, readback.position.z, w, h);
@@ -325,27 +325,27 @@ run_workspace_test()
 		// runtime (no canonical IPC id), and the visibility handler routes
 		// 1000+slot ids to the by-slot setter — both calls must succeed.
 		CHECK_XR(pfnSetClientVisibility(session, clientId, XR_FALSE),
-		         "xrSetWorkspaceClientVisibilityEXT(FALSE)");
+		         "xrSetWorkspaceClientVisibilityDXR(FALSE)");
 		CHECK_XR(pfnSetClientVisibility(session, clientId, XR_TRUE),
-		         "xrSetWorkspaceClientVisibilityEXT(TRUE)");
+		         "xrSetWorkspaceClientVisibilityDXR(TRUE)");
 
 		// Cursor-depth smoke (spec_version 22): the runtime raycast +
-		// xrWorkspaceHitTestEXT were removed; the controller now owns the
+		// xrWorkspaceHitTestDXR were removed; the controller now owns the
 		// hit-test and pushes cursor depth each frame. Push one sample and
 		// confirm the entrypoint resolves + accepts a well-formed struct.
-		XrWorkspaceCursorDepthEXT depth = {};
-		depth.type = XR_TYPE_WORKSPACE_CURSOR_DEPTH_EXT;
+		XrWorkspaceCursorDepthDXR depth = {};
+		depth.type = XR_TYPE_WORKSPACE_CURSOR_DEPTH_DXR;
 		depth.hitZMeters = 0.05f;
 		depth.overWindow = XR_TRUE;
 		XrResult hr = pfnSetCursorDepth(session, &depth);
-		std::printf("[xrSetWorkspaceCursorDepthEXT(0.05,over)    ] %s\n", xr_result_str(hr));
+		std::printf("[xrSetWorkspaceCursorDepthDXR(0.05,over)    ] %s\n", xr_result_str(hr));
 
 		// Phase 2.D: focus + drain + pointer-capture smoke.
 		// Set focus to the captured client, then read it back and assert.
-		CHECK_XR(pfnSetFocused(session, clientId), "xrSetWorkspaceFocusedClientEXT");
+		CHECK_XR(pfnSetFocused(session, clientId), "xrSetWorkspaceFocusedClientDXR");
 		XrWorkspaceClientId focused = XR_NULL_WORKSPACE_CLIENT_ID;
-		CHECK_XR(pfnGetFocused(session, &focused), "xrGetWorkspaceFocusedClientEXT");
-		std::printf("[xrGetWorkspaceFocusedClientEXT(roundtrip)] focused=%u expected=%u\n",
+		CHECK_XR(pfnGetFocused(session, &focused), "xrGetWorkspaceFocusedClientDXR");
+		std::printf("[xrGetWorkspaceFocusedClientDXR(roundtrip)] focused=%u expected=%u\n",
 		            (unsigned)focused, (unsigned)clientId);
 		if (focused != clientId) {
 			std::printf("FAIL: focused-client roundtrip mismatch (got %u, set %u)\n",
@@ -357,12 +357,12 @@ run_workspace_test()
 		// human has pressed anything during the smoke window.
 		uint32_t event_count = 0xFFFFFFFFu;
 		XrResult er = pfnEnumInputEvents(session, 0, &event_count, nullptr);
-		std::printf("[xrEnumerateWorkspaceInputEventsEXT(0)     ] %s count=%u\n",
+		std::printf("[xrEnumerateWorkspaceInputEventsDXR(0)     ] %s count=%u\n",
 		            xr_result_str(er), (unsigned)event_count);
 
 		// Pointer-capture toggle: enable then disable. Both should succeed.
-		CHECK_XR(pfnEnableCapture(session, 1), "xrEnableWorkspacePointerCaptureEXT");
-		CHECK_XR(pfnDisableCapture(session), "xrDisableWorkspacePointerCaptureEXT");
+		CHECK_XR(pfnEnableCapture(session, 1), "xrEnableWorkspacePointerCaptureDXR");
+		CHECK_XR(pfnDisableCapture(session), "xrDisableWorkspacePointerCaptureDXR");
 
 		// Phase 2.K: orientation rendering smoke. Push a 30° yaw to the
 		// captured client so a visual atlas screenshot can confirm tilted
@@ -392,21 +392,21 @@ run_workspace_test()
 		// target; the test passes if at least one of each fires.
 		{
 			CHECK_XR(pfnEnableCapture(session, 1),
-			         "xrEnableWorkspacePointerCaptureEXT(for drain count)");
+			         "xrEnableWorkspacePointerCaptureDXR(for drain count)");
 			uint32_t motion = 0, tick = 0, focus = 0, key = 0, ptr = 0, scroll = 0;
 			ULONGLONG start = GetTickCount64();
 			while (GetTickCount64() - start < 2000) {
-				XrWorkspaceInputEventEXT batch[16] = {};
+				XrWorkspaceInputEventDXR batch[16] = {};
 				uint32_t got = 0;
 				if (pfnEnumInputEvents(session, 16, &got, batch) == XR_SUCCESS) {
 					for (uint32_t i = 0; i < got; i++) {
 						switch (batch[i].eventType) {
-						case XR_WORKSPACE_INPUT_EVENT_POINTER_MOTION_EXT: motion++; break;
-						case XR_WORKSPACE_INPUT_EVENT_FRAME_TICK_EXT:     tick++;   break;
-						case XR_WORKSPACE_INPUT_EVENT_FOCUS_CHANGED_EXT:  focus++;  break;
-						case XR_WORKSPACE_INPUT_EVENT_KEY_EXT:            key++;    break;
-						case XR_WORKSPACE_INPUT_EVENT_POINTER_EXT:        ptr++;    break;
-						case XR_WORKSPACE_INPUT_EVENT_SCROLL_EXT:         scroll++; break;
+						case XR_WORKSPACE_INPUT_EVENT_POINTER_MOTION_DXR: motion++; break;
+						case XR_WORKSPACE_INPUT_EVENT_FRAME_TICK_DXR:     tick++;   break;
+						case XR_WORKSPACE_INPUT_EVENT_FOCUS_CHANGED_DXR:  focus++;  break;
+						case XR_WORKSPACE_INPUT_EVENT_KEY_DXR:            key++;    break;
+						case XR_WORKSPACE_INPUT_EVENT_POINTER_DXR:        ptr++;    break;
+						case XR_WORKSPACE_INPUT_EVENT_SCROLL_DXR:         scroll++; break;
 						default: break;
 						}
 					}
@@ -414,7 +414,7 @@ run_workspace_test()
 				Sleep(16);
 			}
 			CHECK_XR(pfnDisableCapture(session),
-			         "xrDisableWorkspacePointerCaptureEXT(after drain count)");
+			         "xrDisableWorkspacePointerCaptureDXR(after drain count)");
 			std::printf("[Phase 2.K drain counts (2s window)         ] "
 			            "motion=%u tick=%u focus=%u key=%u ptr=%u scroll=%u\n",
 			            motion, tick, focus, key, ptr, scroll);
@@ -430,13 +430,13 @@ run_workspace_test()
 		// XR_NULL_WORKSPACE_CLIENT_ID returns XR_ERROR_VALIDATION_FAILURE.
 		{
 			XrResult fr = pfnRequestFullscreen(session, clientId, XR_TRUE);
-			std::printf("[xrRequestWorkspaceClientFullscreenEXT(TRUE)] %s\n", xr_result_str(fr));
+			std::printf("[xrRequestWorkspaceClientFullscreenDXR(TRUE)] %s\n", xr_result_str(fr));
 			Sleep(400); // give the runtime's fullscreen animation a moment
 			fr = pfnRequestFullscreen(session, clientId, XR_FALSE);
-			std::printf("[xrRequestWorkspaceClientFullscreenEXT(FALSE)] %s\n", xr_result_str(fr));
+			std::printf("[xrRequestWorkspaceClientFullscreenDXR(FALSE)] %s\n", xr_result_str(fr));
 
 			XrResult bad = pfnRequestFullscreen(session, XR_NULL_WORKSPACE_CLIENT_ID, XR_FALSE);
-			std::printf("[xrRequestWorkspaceClientFullscreenEXT(NULL)] %s (expect VALIDATION_FAILURE)\n",
+			std::printf("[xrRequestWorkspaceClientFullscreenDXR(NULL)] %s (expect VALIDATION_FAILURE)\n",
 			            xr_result_str(bad));
 		}
 
@@ -445,7 +445,7 @@ run_workspace_test()
 		// Layout-preset semantics moved to the workspace controller in
 		// Phase 2.G — the runtime no longer hosts apply_layout_preset or
 		// the Ctrl+1..3 dispatch. Controllers express layouts as a sequence
-		// of per-client xrSetWorkspaceClientWindowPoseEXT calls. The shell
+		// of per-client xrSetWorkspaceClientWindowPoseDXR calls. The shell
 		// (src/xrt/targets/shell/main.c) is the reference implementation;
 		// here we just demonstrate the pattern for one client to keep the
 		// smoke test runnable without a multi-client orchestrator.
@@ -479,8 +479,8 @@ run_workspace_test()
 			constexpr uint32_t kChromeWidth  = 256;
 			constexpr uint32_t kChromeHeight = 32;
 
-			XrWorkspaceChromeSwapchainCreateInfoEXT chromeCi = {
-			    XR_TYPE_WORKSPACE_CHROME_SWAPCHAIN_CREATE_INFO_EXT};
+			XrWorkspaceChromeSwapchainCreateInfoDXR chromeCi = {
+			    XR_TYPE_WORKSPACE_CHROME_SWAPCHAIN_CREATE_INFO_DXR};
 			chromeCi.format = kSrgbFormat;
 			chromeCi.width = kChromeWidth;
 			chromeCi.height = kChromeHeight;
@@ -488,7 +488,7 @@ run_workspace_test()
 			chromeCi.mipCount = 1;
 			XrSwapchain chromeSwapchain = XR_NULL_HANDLE;
 			XrResult ccr = pfnCreateChromeSwapchain(session, clientId, &chromeCi, &chromeSwapchain);
-			std::printf("[xrCreateWorkspaceClientChromeSwapchainEXT  ] %s "
+			std::printf("[xrCreateWorkspaceClientChromeSwapchainDXR  ] %s "
 			            "(expect RUNTIME_FAILURE: capture clients carry no chrome)\n",
 			            xr_result_str(ccr));
 			if (ccr == XR_SUCCESS) {
@@ -497,7 +497,7 @@ run_workspace_test()
 				std::printf("INFO: chrome-on-capture unexpectedly supported — update this "
 				            "smoke to walk the full chrome loop.\n");
 				CHECK_XR(pfnDestroyChromeSwapchain(chromeSwapchain),
-				         "xrDestroyWorkspaceClientChromeSwapchainEXT");
+				         "xrDestroyWorkspaceClientChromeSwapchainDXR");
 			} else if (ccr != XR_ERROR_RUNTIME_FAILURE) {
 				std::printf("FAIL: expected RUNTIME_FAILURE for chrome on a capture client\n");
 				return ccr;
@@ -511,7 +511,7 @@ run_workspace_test()
 			// arriving inside this synchronous smoke window.
 			uint64_t wakeup = 0;
 			CHECK_XR(pfnAcquireWakeupEvent(session, &wakeup),
-			         "xrAcquireWorkspaceWakeupEventEXT");
+			         "xrAcquireWorkspaceWakeupEventDXR");
 			if (wakeup == 0) {
 				std::printf("FAIL: wakeup handle is NULL after XR_SUCCESS return\n");
 			} else {
@@ -520,7 +520,7 @@ run_workspace_test()
 				                 : (wr == WAIT_TIMEOUT)    ? "WAIT_TIMEOUT"
 				                 : (wr == WAIT_FAILED)     ? "WAIT_FAILED"
 				                                           : "<other>";
-				std::printf("[xrAcquireWorkspaceWakeupEventEXT(handle ok)] WaitForSingleObject(0ms)=%s\n",
+				std::printf("[xrAcquireWorkspaceWakeupEventDXR(handle ok)] WaitForSingleObject(0ms)=%s\n",
 				            wstr);
 				CloseHandle(reinterpret_cast<HANDLE>(wakeup));
 			}
@@ -530,7 +530,7 @@ run_workspace_test()
 		// sample style with edge feather + focus glow, then a NULL reset.
 		// All three calls should return XR_SUCCESS.
 		{
-			XrWorkspaceClientStyleEXT style = {XR_TYPE_WORKSPACE_CLIENT_STYLE_EXT};
+			XrWorkspaceClientStyleDXR style = {XR_TYPE_WORKSPACE_CLIENT_STYLE_DXR};
 			style.cornerRadius = 0.06f;
 			style.edgeFeatherMeters = 0.003f;
 			style.focusGlowColor[0] = 0.30f;
@@ -540,15 +540,15 @@ run_workspace_test()
 			style.focusGlowIntensity = 0.85f;
 			style.focusGlowFalloffMeters = 0.012f;
 			XrResult sr1 = pfnSetClientStyle(session, clientId, &style);
-			std::printf("[xrSetWorkspaceClientStyleEXT(sample)       ] %s\n", xr_result_str(sr1));
+			std::printf("[xrSetWorkspaceClientStyleDXR(sample)       ] %s\n", xr_result_str(sr1));
 
 			// NULL style → reset to runtime defaults.
 			XrResult sr2 = pfnSetClientStyle(session, clientId, nullptr);
-			std::printf("[xrSetWorkspaceClientStyleEXT(NULL=reset)   ] %s\n", xr_result_str(sr2));
+			std::printf("[xrSetWorkspaceClientStyleDXR(NULL=reset)   ] %s\n", xr_result_str(sr2));
 
 			// Validation: NULL clientId must be rejected.
 			XrResult sr3 = pfnSetClientStyle(session, XR_NULL_WORKSPACE_CLIENT_ID, &style);
-			std::printf("[xrSetWorkspaceClientStyleEXT(NULL clientId)] %s (expect VALIDATION_FAILURE)\n",
+			std::printf("[xrSetWorkspaceClientStyleDXR(NULL clientId)] %s (expect VALIDATION_FAILURE)\n",
 			            xr_result_str(sr3));
 		}
 
@@ -563,21 +563,21 @@ run_workspace_test()
 		// connected) exercises the fill + info path below.
 		uint32_t client_count = 0;
 		CHECK_XR(pfnEnumClients(session, 0, &client_count, nullptr),
-		         "xrEnumerateWorkspaceClientsEXT(count)");
-		std::printf("[xrEnumerateWorkspaceClientsEXT(0)         ] count=%u\n",
+		         "xrEnumerateWorkspaceClientsDXR(count)");
+		std::printf("[xrEnumerateWorkspaceClientsDXR(0)         ] count=%u\n",
 		            (unsigned)client_count);
 		if (client_count > 0 && client_count <= 8) {
 			XrWorkspaceClientId ids[8] = {};
 			uint32_t got = 0;
 			CHECK_XR(pfnEnumClients(session, client_count, &got, ids),
-			         "xrEnumerateWorkspaceClientsEXT(fill)");
-			std::printf("[xrEnumerateWorkspaceClientsEXT(fill)      ] got=%u\n",
+			         "xrEnumerateWorkspaceClientsDXR(fill)");
+			std::printf("[xrEnumerateWorkspaceClientsDXR(fill)      ] got=%u\n",
 			            (unsigned)got);
 			if (got > 0 && ids[0] != XR_NULL_WORKSPACE_CLIENT_ID) {
-				XrWorkspaceClientInfoEXT cinfo = {XR_TYPE_WORKSPACE_CLIENT_INFO_EXT};
+				XrWorkspaceClientInfoDXR cinfo = {XR_TYPE_WORKSPACE_CLIENT_INFO_DXR};
 				CHECK_XR(pfnGetClientInfo(session, ids[0], &cinfo),
-				         "xrGetWorkspaceClientInfoEXT");
-				std::printf("[xrGetWorkspaceClientInfoEXT(id=%u)        ] name=\"%s\" pid=%llu z=%u "
+				         "xrGetWorkspaceClientInfoDXR");
+				std::printf("[xrGetWorkspaceClientInfoDXR(id=%u)        ] name=\"%s\" pid=%llu z=%u "
 				            "focused=%u visible=%u\n",
 				            (unsigned)ids[0], cinfo.name, (unsigned long long)cinfo.pid,
 				            (unsigned)cinfo.zOrder, (unsigned)cinfo.isFocused,
@@ -586,14 +586,14 @@ run_workspace_test()
 		}
 
 		// Capture-client introspection: enumerate doesn't list captures, but
-		// xrGetWorkspaceClientInfoEXT must resolve the 1000+slot id the
+		// xrGetWorkspaceClientInfoDXR must resolve the 1000+slot id the
 		// controller got from add — name/pid/visible/focused are filled from
 		// the compositor slot (captures have no IPC client_state).
 		{
-			XrWorkspaceClientInfoEXT cinfo = {XR_TYPE_WORKSPACE_CLIENT_INFO_EXT};
+			XrWorkspaceClientInfoDXR cinfo = {XR_TYPE_WORKSPACE_CLIENT_INFO_DXR};
 			CHECK_XR(pfnGetClientInfo(session, clientId, &cinfo),
-			         "xrGetWorkspaceClientInfoEXT(capture)");
-			std::printf("[xrGetWorkspaceClientInfoEXT(capture id=%u)] name=\"%s\" pid=%llu "
+			         "xrGetWorkspaceClientInfoDXR(capture)");
+			std::printf("[xrGetWorkspaceClientInfoDXR(capture id=%u)] name=\"%s\" pid=%llu "
 			            "focused=%u visible=%u\n",
 			            (unsigned)clientId, cinfo.name, (unsigned long long)cinfo.pid,
 			            (unsigned)cinfo.isFocused, (unsigned)cinfo.isVisible);
@@ -609,13 +609,13 @@ run_workspace_test()
 		// runtime-failure as a valid outcome here; the goal is to prove
 		// dispatch reached the IPC layer.
 		{
-			XrWorkspaceCaptureRequestEXT req = {XR_TYPE_WORKSPACE_CAPTURE_REQUEST_EXT};
+			XrWorkspaceCaptureRequestDXR req = {XR_TYPE_WORKSPACE_CAPTURE_REQUEST_DXR};
 			std::snprintf(req.pathPrefix, sizeof(req.pathPrefix),
 			              "%s\\workspace_smoke_capture", std::getenv("TEMP") ? std::getenv("TEMP") : ".");
-			req.flags = XR_WORKSPACE_CAPTURE_FLAG_ATLAS_BIT_EXT;
-			XrWorkspaceCaptureResultEXT cres = {XR_TYPE_WORKSPACE_CAPTURE_RESULT_EXT};
+			req.flags = XR_WORKSPACE_CAPTURE_FLAG_ATLAS_BIT_DXR;
+			XrWorkspaceCaptureResultDXR cres = {XR_TYPE_WORKSPACE_CAPTURE_RESULT_DXR};
 			XrResult cr = pfnCaptureFrame(session, &req, &cres);
-			std::printf("[xrCaptureWorkspaceFrameEXT(%s)] %s atlas=%ux%u eye=%ux%u\n",
+			std::printf("[xrCaptureWorkspaceFrameDXR(%s)] %s atlas=%ux%u eye=%ux%u\n",
 			            req.pathPrefix, xr_result_str(cr),
 			            (unsigned)cres.atlasWidth, (unsigned)cres.atlasHeight,
 			            (unsigned)cres.eyeWidth, (unsigned)cres.eyeHeight);
@@ -623,7 +623,7 @@ run_workspace_test()
 
 		// Clear focus before removing the captured client to keep state tidy.
 		CHECK_XR(pfnSetFocused(session, XR_NULL_WORKSPACE_CLIENT_ID),
-		         "xrSetWorkspaceFocusedClientEXT(clear)");
+		         "xrSetWorkspaceFocusedClientDXR(clear)");
 	}
 
 	// Phase 2.K: request_client_exit against the synthetic capture client.
@@ -634,18 +634,18 @@ run_workspace_test()
 	// must return XR_ERROR_VALIDATION_FAILURE.
 	{
 		XrResult bad = pfnRequestExit(session, XR_NULL_WORKSPACE_CLIENT_ID);
-		std::printf("[xrRequestWorkspaceClientExitEXT(NULL)      ] %s (expect VALIDATION_FAILURE)\n",
+		std::printf("[xrRequestWorkspaceClientExitDXR(NULL)      ] %s (expect VALIDATION_FAILURE)\n",
 		            xr_result_str(bad));
 		XrResult er = pfnRequestExit(session, clientId);
-		std::printf("[xrRequestWorkspaceClientExitEXT(client=%u)] %s\n",
+		std::printf("[xrRequestWorkspaceClientExitDXR(client=%u)] %s\n",
 		            (unsigned)clientId, xr_result_str(er));
 	}
 
 	XrResult rmr = pfnRemoveCapture(session, clientId);
-	std::printf("[xrRemoveWorkspaceCaptureClientEXT(post-exit)] %s (best-effort; "
+	std::printf("[xrRemoveWorkspaceCaptureClientDXR(post-exit)] %s (best-effort; "
 	            "exit above already removed the slot)\n", xr_result_str(rmr));
 
-	CHECK_XR(pfnDeactivate(session), "xrDeactivateSpatialWorkspaceEXT");
+	CHECK_XR(pfnDeactivate(session), "xrDeactivateSpatialWorkspaceDXR");
 
 	xrDestroySession(session);
 	xrDestroyInstance(instance);
@@ -657,7 +657,7 @@ run_workspace_test()
 int
 main()
 {
-	std::printf("workspace_minimal_d3d11_win — XR_EXT_spatial_workspace smoke test\n");
+	std::printf("workspace_minimal_d3d11_win — XR_DXR_spatial_workspace smoke test\n");
 	XrResult r = run_workspace_test();
 	if (XR_FAILED(r)) {
 		std::printf("RESULT: FAIL (%s)\n", xr_result_str(r));

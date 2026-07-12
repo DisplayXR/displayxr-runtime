@@ -5,7 +5,7 @@ issues: [439, 396]
 ---
 # ADR-027: Display Zones — decoupled mixed 2D/3D layout, per-zone rig, wish mask
 
-> **Update (ADR-031):** the legacy 2D-surround / `xrSetSharedTextureOutputRectEXT`
+> **Update (ADR-031):** the legacy 2D-surround / `xrSetSharedTextureOutputRectDXR`
 > mechanism this ADR contrasts against (Context, Consequences) has since been **removed** —
 > display-zones is now the sole region paradigm for all app classes. The surround references
 > below are accurate history; see ADR-031 + `docs/roadmap/surround-zones-deprecation.md`.
@@ -32,9 +32,9 @@ issues: [439, 396]
 
 The current composition model couples three concerns into one object chain:
 
-- `XR_EXT_view_rig` frames **one** canvas (the full window for `_handle` apps; a
-  texture sub-rect via `xrSetSharedTextureOutputRectEXT` for `_texture` apps).
-- `XR_EXT_local_3d_zone` supplies 2D content (`XrCompositionLayerLocal2DEXT`)
+- `XR_DXR_view_rig` frames **one** canvas (the full window for `_handle` apps; a
+  texture sub-rect via `xrSetSharedTextureOutputRectDXR` for `_texture` apps).
+- `XR_DXR_local_3d_zone` supplies 2D content (`XrCompositionLayerLocal2DDXR`)
   and the 2D/3D mask — but per the #439 Phase 2 **supersede rule**, any active
   mask (explicit or implicit-from-Local2D-rects) snaps the weave region, view
   dimensions, and projection metrics to the **full client window**, with the
@@ -63,7 +63,7 @@ physically switch to 3D.
    runtime-side; only the rect changes per zone) and returns render-ready
    `XrView{pose, fov}` per zone.
 2. **2D zones (M)**: each = `{window-px rect, flat swapchain}`, composited
-   flat. This is exactly today's `XrCompositionLayerLocal2DEXT`, reused
+   flat. This is exactly today's `XrCompositionLayerLocal2DDXR`, reused
    verbatim.
 3. **Wish mask (1)**: per-pixel M ∈ [0,1] (1 = panel physically 3D, 0 = flat,
    intermediate = fractional 3D-ness at the DP's discretion), authored at any
@@ -84,13 +84,13 @@ multi-window story.
 ### Zones mode is per-frame; the supersede rule becomes the legacy-frame rule
 
 A frame is a **zones frame** iff at least one projection layer carries an
-`XrDisplayZoneEXT` chain (see the [spec sketch]). In a zones frame:
+`XrDisplayZoneDXR` chain (see the [spec sketch]). In a zones frame:
 
-- The canvas output rect (`xrSetSharedTextureOutputRectEXT`) is **ignored** —
+- The canvas output rect (`xrSetSharedTextureOutputRectDXR`) is **ignored** —
   there is no single canvas to supersede; each zone's rect is its canvas. The
   supersede rule's job ("mask is the sole selector over a known weave region")
   is subsumed by zone rects being explicit.
-- The sticky legacy mask (`xrSubmitLocal3DZoneEXT`) is **ignored for that
+- The sticky legacy mask (`xrSubmitLocal3DZoneDXR`) is **ignored for that
   frame** (not an error — this enables frame-by-frame migration).
 - The implicit-mask-from-Local2D-rects rule is **off**: Local2D layers in a
   zones frame are pure 2D content; the wish derives from the 3D-zone rects (or
@@ -101,7 +101,7 @@ A frame is a **zones frame** iff at least one projection layer carries an
   "full window" would silently recreate the ambiguity this ADR kills.
 
 A frame with **zero** zone-chained projection layers behaves per
-`XR_EXT_local_3d_zone` v3 verbatim — supersede rule, implicit mask, sticky
+`XR_DXR_local_3d_zone` v3 verbatim — supersede rule, implicit mask, sticky
 submit, all unchanged. **Back-compat is structural, not emulated**; nothing is
 deprecated.
 
@@ -113,7 +113,7 @@ case (the avatar) needs zero mask code, and the rig/wish planes cannot drift.
 Explicit: the app references an authored mask per frame for transitions,
 feathering, and partial-weave effects.
 
-The explicit-wish carrier is the **existing `XrLocal3DZoneMaskEXT`**,
+The explicit-wish carrier is the **existing `XrLocal3DZoneMaskDXR`**,
 unmodified — it already has the right physics: window-space, any-resolution,
 R8_UNORM (already M ∈ [0,1]), three authoring tiers (whole-window / rect-list /
 freeform render target with D3D11/D3D12/Vulkan bindings). Re-inventing it would
@@ -128,7 +128,7 @@ side-channel) and is hardware-only — it no longer gates compositor blending
 Decoupling lets an app weave 3D content into a region its wish leaves flat
 (garbled on glass). Mitigations, in order: (1) the auto-mask default makes the
 inconsistent state impossible unless the app opts into an explicit mask;
-(2) `XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_EXT` — the runtime cross-checks
+(2) `XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_DXR` — the runtime cross-checks
 zone rects vs mask coverage, locate-rect vs submit-rect, and zoneId pairing,
 emitting one-shot WARNs per violation class (clamp-and-warn, never per-frame
 reject, per the ADR-024 validation philosophy); (3) a **resolved/effective-mask
@@ -139,7 +139,7 @@ no consumer.
 
 ### Decision 3 — submission shape: composition-layer-chained
 
-A 3D zone is declared by one struct, `XrDisplayZoneEXT{zoneId, rect}`, valid at
+A 3D zone is declared by one struct, `XrDisplayZoneDXR{zoneId, rect}`, valid at
 **two chain points**:
 
 - `XrViewLocateInfo::next` — a **zone-scoped locate**: Kooima frames to `rect`;
@@ -165,20 +165,20 @@ an app-chosen `uint32_t`, unique among the frame's 3D zones, existing so
 validate mode can pair locates with submissions, so logs/captures can name
 zones, and so the reserved effective-mask readback has a stable referent.
 
-### Decision 4 — extension structure: new `XR_EXT_display_zones`, unified by composition
+### Decision 4 — extension structure: new `XR_DXR_display_zones`, unified by composition
 
-A new extension, **requiring** `XR_EXT_local_3d_zone` (≥ v3) and
-`XR_EXT_view_rig` (≥ v2), that **reuses their types** rather than superseding
+A new extension, **requiring** `XR_DXR_local_3d_zone` (≥ v3) and
+`XR_DXR_view_rig` (≥ v2), that **reuses their types** rather than superseding
 them with fresh declarations:
 
 | Concern | Carrier | New or reused |
 |---|---|---|
-| 3D zone geometry + identity | `XrDisplayZoneEXT` | **new** (the only genuinely new concept) |
-| Per-zone view framing | `XrDisplayRigEXT` / `XrCameraRigEXT`, per-locate | reused verbatim |
-| Per-zone raw readback | `XrViewDisplayRawEXT` (`canvasRectPx`/`canvasSizeMeters` report the zone) | reused verbatim |
-| 2D zone | `XrCompositionLayerLocal2DEXT` | reused verbatim |
-| Explicit wish mask | `XrLocal3DZoneMaskEXT` + its 3 authoring tiers | reused verbatim |
-| Per-frame wish reference + flags | `XrDisplayZonesFrameEndInfoEXT` on `XrFrameEndInfo::next` | **new** |
+| 3D zone geometry + identity | `XrDisplayZoneDXR` | **new** (the only genuinely new concept) |
+| Per-zone view framing | `XrDisplayRigDXR` / `XrCameraRigDXR`, per-locate | reused verbatim |
+| Per-zone raw readback | `XrViewDisplayRawDXR` (`canvasRectPx`/`canvasSizeMeters` report the zone) | reused verbatim |
+| 2D zone | `XrCompositionLayerLocal2DDXR` | reused verbatim |
+| Explicit wish mask | `XrLocal3DZoneMaskDXR` + its 3 authoring tiers | reused verbatim |
+| Per-frame wish reference + flags | `XrDisplayZonesFrameEndInfoDXR` on `XrFrameEndInfo::next` | **new** |
 
 Rationale over a `local_3d_zone` v4 major bump: migration cost (an app's 2D and
 mask code is byte-identical to today's), implementation cost (the runtime's
@@ -187,11 +187,11 @@ interpretation changes in zones mode), and it keeps `local_3d_zone` v3 fully
 alive for single-canvas apps instead of deprecating a months-old extension.
 The cost — apps enable three extensions instead of one — is one line of code.
 
-New surface in full: `XrDisplayZoneCapabilitiesEXT`, `XrDisplayZoneEXT`,
-`XrDisplayZonesFrameEndInfoEXT`, `XrEventDataDisplayZoneMetricsChangedEXT`,
-`xrGetDisplayZoneCapabilitiesEXT`, `xrGetDisplayZoneRecommendedViewSizeEXT`.
-Type values 1000999150–153. Header-level sketch:
-`docs/specs/extensions/XR_EXT_display_zones.md`.
+New surface in full: `XrDisplayZoneCapabilitiesDXR`, `XrDisplayZoneDXR`,
+`XrDisplayZonesFrameEndInfoDXR`, `XrEventDataDisplayZoneMetricsChangedDXR`,
+`xrGetDisplayZoneCapabilitiesDXR`, `xrGetDisplayZoneRecommendedViewSizeDXR`.
+Type values 1004999150–153. Header-level sketch:
+`docs/specs/extensions/XR_DXR_display_zones.md`.
 
 Scope rules: extension-app classes only (like `local_3d_zone`); view count per
 zone = the session's view count (display modes are session-global — zones vary
@@ -289,7 +289,7 @@ lenticular column/row bands that extend beyond the window into the surround),
 MAY coalesce updates, and MAY ignore components the firmware cannot express.
 The runtime and app MUST NOT assume the physical state equals the wish. No
 panel-cell geometry leaks into the app API beyond the existing advisory
-`hardwareZoneGridWidth/Height` in `XrLocal3DZoneCapabilitiesEXT`; the reserved
+`hardwareZoneGridWidth/Height` in `XrLocal3DZoneCapabilitiesDXR`; the reserved
 effective-state readback is the future pressure valve for apps that need to
 know.
 
@@ -300,7 +300,7 @@ is already a no-op for workspace clients). Consistently: **a workspace
 client's wish is ignored in v1** — zone *rendering* (per-zone rigs and rects)
 still works inside the client's tile; only the hardware wish is inert.
 Clipping each client's wish to its tile and merging across clients is reserved
-for v2. `xrSetWorkspaceViewRigEXT` overrides apply **per zone** — the override
+for v2. `xrSetWorkspaceViewRigDXR` overrides apply **per zone** — the override
 substitutes rig tunables on every zone-scoped locate; zone rects stay app-owned
 (controllers own visual policy; apps own their internal layout).
 
@@ -309,7 +309,7 @@ substitutes rig tunables on every zone-scoped locate; zone rects stay app-owned
 - The avatar migrates: one 3D zone (bottom-75% rect + display rig), one Local2D
   bubble, no mask object (auto wish), app-side Kooima deleted. Walkthrough +
   phased plan: `docs/roadmap/display-zones.md`.
-- `xrSetSharedTextureOutputRectEXT` + surround-2D, Local2D v3, and single-
+- `xrSetSharedTextureOutputRectDXR` + surround-2D, Local2D v3, and single-
   canvas view_rig remain the documented path for single-canvas apps; each maps
   onto the new model as a degenerate single-zone case (mapping table in the
   spec sketch). The supersede special-case code is eventually *subsumed* by the
@@ -320,7 +320,7 @@ substitutes rig tunables on every zone-scoped locate; zone rects stay app-owned
   pays today whenever Local2D is active. Zone swapchains are fixed-size; an
   animating rect is scaled-blitted (precedent: ADR-010 worst-case sizing),
   trading sharpness — apps wanting 1:1 recreate on resize, prompted by
-  `XrEventDataDisplayZoneMetricsChangedEXT` + `xrGetDisplayZoneRecommendedViewSizeEXT`.
+  `XrEventDataDisplayZoneMetricsChangedDXR` + `xrGetDisplayZoneRecommendedViewSizeDXR`.
 - IPC: the zone rect rides the rig-chained locate (already server-routed); the
   zone layer serializes like projection + 16 bytes; the wish mask is the one
   genuinely new cross-process surface and may slip independently.
@@ -335,19 +335,19 @@ substitutes rig tunables on every zone-scoped locate; zone rects stay app-owned
   naturally, but the shared-texture worst-case-sizing interaction needs its own
   check during compositor implementation.
 - Pre-existing `XrStructureType` collisions in the extension range
-  (local_3d_zone vs mcp_tools at 1000999130–132; atlas_capture vs
-  workspace_file_dialog at 1000999120–121; macos_gl_binding vs display_info at
-  1000999010) — independent of this design (the 150+ block is clean); resolved
+  (local_3d_zone vs mcp_tools at 1004999130–132; atlas_capture vs
+  workspace_file_dialog at 1004999120–121; macos_gl_binding vs display_info at
+  1004999010) — independent of this design (the 150+ block is clean); resolved
   by the relocation + the allocation registry in
   `src/external/openxr_includes/openxr/README.md`.
 
 ## References
 
-- Spec sketch: `docs/specs/extensions/XR_EXT_display_zones.md`. Migration note
+- Spec sketch: `docs/specs/extensions/XR_DXR_display_zones.md`. Migration note
   + phased plan: `docs/roadmap/display-zones.md`.
 - Supersede rule being generalized:
-  `src/external/openxr_includes/openxr/XR_EXT_local_3d_zone.h` (§ around
-  `xrSubmitLocal3DZoneEXT`, #439 Phase 2).
+  `src/external/openxr_includes/openxr/XR_DXR_local_3d_zone.h` (§ around
+  `xrSubmitLocal3DZoneDXR`, #439 Phase 2).
 - Invariants held: ADR-007 (compositor never weaves), ADR-019 (vendor
   isolation), ADR-020 (append-only plugin ABI), ADR-024 (Kooima runtime-side,
   per-locate rigs).
@@ -358,4 +358,4 @@ substitutes rig tunables on every zone-scoped locate; zone rects stay app-owned
 - History: #439 (Local2D phases), #396 W7 (view rig), #491 (alpha-over /
   2D-under tail).
 
-[spec sketch]: ../specs/extensions/XR_EXT_display_zones.md
+[spec sketch]: ../specs/extensions/XR_DXR_display_zones.md

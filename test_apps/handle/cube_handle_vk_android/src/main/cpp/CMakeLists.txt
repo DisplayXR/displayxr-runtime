@@ -46,7 +46,7 @@ target_include_directories(cube_handle_vk_android PRIVATE
     "${CMAKE_SOURCE_DIR}/../../../../../../src/external/stb")
 
 # DisplayXR's in-tree OpenXR headers provide the custom XR_EXT_* extensions
-# (XR_EXT_display_info etc.) the loader AAR's stock headers don't ship. Placed
+# (XR_DXR_display_info etc.) the loader AAR's stock headers don't ship. Placed
 # BEFORE the AAR's -isystem headers so <openxr/...> resolves here — this is the
 # same header set the runtime is built against and that the Windows / macOS
 # cubes use (via displayxr_common), so core OpenXR stays consistent.

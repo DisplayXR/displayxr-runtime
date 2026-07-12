@@ -1,10 +1,10 @@
-# XR_EXT_cocoa_window_binding
+# XR_DXR_cocoa_window_binding
 
 | Property | Value |
 |----------|-------|
-| Extension Name | `XR_EXT_cocoa_window_binding` |
+| Extension Name | `XR_DXR_cocoa_window_binding` |
 | Spec Version | 7 |
-| Type Values | `XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT` (1000999004), `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT` (1000999002) |
+| Type Values | `XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR` (1004999004), `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR` (1004999002) |
 | Author | Leia Inc. |
 | Platform | macOS (Cocoa / AppKit). |
 
@@ -12,48 +12,48 @@
 
 ## 1. Overview
 
-`XR_EXT_cocoa_window_binding` is the macOS counterpart to `XR_EXT_win32_window_binding`. It allows an OpenXR application to provide its own `NSView*` (backed by a `CAMetalLayer`) to the runtime when creating a session. When present, the runtime renders into the application's view instead of creating its own window.
+`XR_DXR_cocoa_window_binding` is the macOS counterpart to `XR_DXR_win32_window_binding`. It allows an OpenXR application to provide its own `NSView*` (backed by a `CAMetalLayer`) to the runtime when creating a session. When present, the runtime renders into the application's view instead of creating its own window.
 
 The target use case is **desktop 3D light field displays** on macOS, where the application controls the window lifecycle, input handling, and event loop.
 
-**Header:** `src/external/openxr_includes/openxr/XR_EXT_cocoa_window_binding.h`
+**Header:** `src/external/openxr_includes/openxr/XR_DXR_cocoa_window_binding.h`
 
 ---
 
 ## 2. Motivation
 
-Same as `XR_EXT_win32_window_binding` — desktop 3D displays are monitors, not headsets. The application needs to own its window for input handling, multi-app compositing, and hybrid 2D/3D UI. On macOS, the runtime uses Metal (via MoltenVK for Vulkan apps) and needs a `CAMetalLayer`-backed view to render into.
+Same as `XR_DXR_win32_window_binding` — desktop 3D displays are monitors, not headsets. The application needs to own its window for input handling, multi-app compositing, and hybrid 2D/3D UI. On macOS, the runtime uses Metal (via MoltenVK for Vulkan apps) and needs a `CAMetalLayer`-backed view to render into.
 
-**Phase alignment note:** Lenticular displays compute interlacing patterns from the content's screen-space position. The display processor needs the NSView to track its position on the physical display each frame. On Windows, advanced vendors hook `WM_WINDOWPOSCHANGING` to snap window drag to phase-aligned coordinates (see [XR_EXT_win32_window_binding §2.4](XR_EXT_win32_window_binding.md)). macOS equivalents (e.g., `NSWindowDelegate` position tracking) are a future item for vendor SDKs that support macOS. For IOSurface-based `_texture` apps, the canvas sub-rect from `xrSetSharedTextureOutputRectEXT` flows through the compositor to the display processor's `process_atlas()` call as `canvas_offset_x/y` and `canvas_width/height`, enabling correct phase correction. The app's real NSView is passed directly to the display processor -- no hidden windows are involved.
+**Phase alignment note:** Lenticular displays compute interlacing patterns from the content's screen-space position. The display processor needs the NSView to track its position on the physical display each frame. On Windows, advanced vendors hook `WM_WINDOWPOSCHANGING` to snap window drag to phase-aligned coordinates (see [XR_DXR_win32_window_binding §2.4](XR_DXR_win32_window_binding.md)). macOS equivalents (e.g., `NSWindowDelegate` position tracking) are a future item for vendor SDKs that support macOS. For IOSurface-based `_texture` apps, the canvas sub-rect from `xrSetSharedTextureOutputRectDXR` flows through the compositor to the display processor's `process_atlas()` call as `canvas_offset_x/y` and `canvas_width/height`, enabling correct phase correction. The app's real NSView is passed directly to the display processor -- no hidden windows are involved.
 
 ---
 
 ## 3. New Enum Constants
 
 ```c
-#define XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT ((XrStructureType)1000999004)
+#define XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR ((XrStructureType)1004999004)
 ```
 
 This extension also uses the shared window-space composition layer type:
 
 ```c
-#define XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT ((XrStructureType)1000999002)
+#define XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR ((XrStructureType)1004999002)
 ```
 
-> **Note:** The type value was changed from `1000999003` to `1000999004` in the docs refactor
-> to resolve a collision with `XR_TYPE_DISPLAY_INFO_EXT`.
+> **Note:** The type value was changed from `1004999003` to `1004999004` in the docs refactor
+> to resolve a collision with `XR_TYPE_DISPLAY_INFO_DXR`.
 
 ---
 
 ## 4. New Structures
 
-### XrCocoaWindowBindingCreateInfoEXT
+### XrCocoaWindowBindingCreateInfoDXR
 
 Chained to `XrSessionCreateInfo` (via the graphics binding's `next` pointer) to provide an external view handle for session rendering on macOS.
 
 | Member | Type | Description |
 |---|---|---|
-| `type` | `XrStructureType` | Must be `XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT`. |
+| `type` | `XrStructureType` | Must be `XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR`. |
 | `next` | `const void*` | Pointer to next structure in the chain, or `NULL`. |
 | `viewHandle` | `void*` | `NSView*` with `CAMetalLayer` backing, or `NULL` for offscreen mode. |
 | `readbackCallback` | `PFN_xrReadbackCallback` | Callback receiving composited RGBA pixels (offscreen mode), or `NULL`. |
@@ -65,7 +65,7 @@ Chained to `XrSessionCreateInfo` (via the graphics binding's `next` pointer) to 
 typedef void (*PFN_xrReadbackCallback)(
     const uint8_t *pixels, uint32_t width, uint32_t height, void *userdata);
 
-typedef struct XrCocoaWindowBindingCreateInfoEXT {
+typedef struct XrCocoaWindowBindingCreateInfoDXR {
     XrStructureType          type;
     const void* XR_MAY_ALIAS next;
     void*                    viewHandle;
@@ -73,7 +73,7 @@ typedef struct XrCocoaWindowBindingCreateInfoEXT {
     void*                    readbackUserdata;
     void*                    sharedIOSurface;
     XrBool32                 transparentBackgroundEnabled; // v5
-} XrCocoaWindowBindingCreateInfoEXT;
+} XrCocoaWindowBindingCreateInfoDXR;
 ```
 
 ### Transparent Background (v5)
@@ -97,32 +97,32 @@ typedef struct XrCocoaWindowBindingCreateInfoEXT {
 | Mode | `viewHandle` | `sharedIOSurface` | App class | Behavior |
 |------|:-:|:-:|---|---|
 | **Handle** | NSView* | NULL | `_handle` | Runtime renders directly into the app's view |
-| **Texture** | NSView* | IOSurfaceRef | `_texture` | Runtime composites the multi-zone result (3D zones + Local2D zones, declared via [`XR_EXT_display_zones`](XR_EXT_display_zones.md)) into the shared IOSurface. The NSView is still required for screen-space position tracking and phase alignment. The app blits the IOSurface into its view. |
+| **Texture** | NSView* | IOSurfaceRef | `_texture` | Runtime composites the multi-zone result (3D zones + Local2D zones, declared via [`XR_DXR_display_zones`](XR_DXR_display_zones.md)) into the shared IOSurface. The NSView is still required for screen-space position tracking and phase alignment. The app blits the IOSurface into its view. |
 | **Offscreen** | NULL | NULL | — | `readbackCallback` receives composited pixels. No view, no phase alignment. |
 
-> **Important for `_texture` apps:** You **must** provide a valid `viewHandle` even though the runtime renders into the shared IOSurface, not the view. Without it, the display processor cannot compute correct interlacing alignment (see [XR_EXT_win32_window_binding §2.4](XR_EXT_win32_window_binding.md#24-the-phase-alignment-problem)). Where the 3D canvas appears within the view — and any 2D regions around it — is declared via [`XR_EXT_display_zones`](XR_EXT_display_zones.md) (one `XrDisplayZoneEXT` per 3D region, one `XrCompositionLayerLocal2DEXT` per 2D region).
+> **Important for `_texture` apps:** You **must** provide a valid `viewHandle` even though the runtime renders into the shared IOSurface, not the view. Without it, the display processor cannot compute correct interlacing alignment (see [XR_DXR_win32_window_binding §2.4](XR_DXR_win32_window_binding.md#24-the-phase-alignment-problem)). Where the 3D canvas appears within the view — and any 2D regions around it — is declared via [`XR_DXR_display_zones`](XR_DXR_display_zones.md) (one `XrDisplayZoneDXR` per 3D region, one `XrCompositionLayerLocal2DDXR` per 2D region).
 
 **Valid Usage:**
-- `type` **must** be `XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT`.
+- `type` **must** be `XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR`.
 - If `viewHandle` is non-NULL, it **must** point to a valid `NSView` whose `-makeBackingLayer` returns a `CAMetalLayer`.
 - The view **must** remain valid for the lifetime of the `XrSession`.
 - The application **must** run the `NSApplication` event loop on the main thread.
 - The application **must not** remove the view from its superview before calling `xrDestroySession`.
 
-### XrCompositionLayerWindowSpaceEXT
+### XrCompositionLayerWindowSpaceDXR
 
-Shared with `XR_EXT_win32_window_binding`. See that extension's spec for the full definition.
+Shared with `XR_DXR_win32_window_binding`. See that extension's spec for the full definition.
 
-### Region expression — REMOVED in v7 (use `XR_EXT_display_zones`)
+### Region expression — REMOVED in v7 (use `XR_DXR_display_zones`)
 
-> **Removed in spec v7 (ADR-031).** The `xrSetSharedTextureOutputRectEXT` and
+> **Removed in spec v7 (ADR-031).** The `xrSetSharedTextureOutputRectDXR` and
 > `xrSetSharedTextureSurround2DEXT` entry points (Cocoa never had the D3D12 `…FenceEXT`
 > variant) and the bespoke 2D-surround / output-rect mechanism are **deleted**.
-> [`XR_EXT_display_zones`](XR_EXT_display_zones.md) is now the sole paradigm for expressing
+> [`XR_DXR_display_zones`](XR_DXR_display_zones.md) is now the sole paradigm for expressing
 > 2D/3D regions, including the degenerate single-region cases these calls used to cover (the
-> former output rect = one `XrDisplayZoneEXT` 3D zone; the former 2D surround = one
-> `XrCompositionLayerLocal2DEXT` zone covering the complement). See the degenerate single-zone
-> mapping in [`XR_EXT_display_zones` §6](XR_EXT_display_zones.md) and
+> former output rect = one `XrDisplayZoneDXR` 3D zone; the former 2D surround = one
+> `XrCompositionLayerLocal2DDXR` zone covering the complement). See the degenerate single-zone
+> mapping in [`XR_DXR_display_zones` §6](XR_DXR_display_zones.md) and
 > [`docs/roadmap/surround-zones-deprecation.md`](../../roadmap/surround-zones-deprecation.md)
 > for the deprecation history. Parity verified by `cube_zones_texture_metal_macos`.
 
@@ -184,8 +184,8 @@ vkBinding.device = vkDevice;
 vkBinding.queueFamilyIndex = graphicsQueueFamily;
 vkBinding.queueIndex = 0;
 
-XrCocoaWindowBindingCreateInfoEXT cocoaBinding = {
-    XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT};
+XrCocoaWindowBindingCreateInfoDXR cocoaBinding = {
+    XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR};
 cocoaBinding.viewHandle = (__bridge void *)view;
 cocoaBinding.readbackCallback = NULL;
 cocoaBinding.readbackUserdata = NULL;
@@ -207,9 +207,9 @@ xrCreateSession(instance, &sessionInfo, &session);
 
 | Extension | Relationship |
 |---|---|
-| `XR_EXT_win32_window_binding` | Windows counterpart — mutually exclusive (one per platform). Shares `XrCompositionLayerWindowSpaceEXT`. |
+| `XR_DXR_win32_window_binding` | Windows counterpart — mutually exclusive (one per platform). Shares `XrCompositionLayerWindowSpaceDXR`. |
 | `XR_EXT_android_surface_binding` | Android counterpart (planned, not yet implemented). |
-| `XR_EXT_display_info` | Independent. Can be used alone (runtime-managed window) or together (app-owned view + display geometry + mode control). |
+| `XR_DXR_display_info` | Independent. Can be used alone (runtime-managed window) or together (app-owned view + display geometry + mode control). |
 
 ---
 
@@ -229,7 +229,7 @@ The Metal compositor is the primary path on macOS. The Vulkan path works via Mol
 
 ## 9. Forward Compatibility
 
-The Cocoa binding tracks `XR_EXT_win32_window_binding` for forward-compatibility intent. See [`XR_EXT_win32_window_binding §9.2`](XR_EXT_win32_window_binding.md#92-forward-compatibility-roadmap-additive-only) for the additive-only roadmap (DPI hints, async readiness, multi-canvas, vendor-private next chains) and [§9.3](XR_EXT_win32_window_binding.md#93-architectural-invariants-wont-change) for the architectural invariants apps can rely on. Any extension that lands on Win32 lands on Cocoa with parity unless explicitly noted.
+The Cocoa binding tracks `XR_DXR_win32_window_binding` for forward-compatibility intent. See [`XR_DXR_win32_window_binding §9.2`](XR_DXR_win32_window_binding.md#92-forward-compatibility-roadmap-additive-only) for the additive-only roadmap (DPI hints, async readiness, multi-canvas, vendor-private next chains) and [§9.3](XR_DXR_win32_window_binding.md#93-architectural-invariants-wont-change) for the architectural invariants apps can rely on. Any extension that lands on Win32 lands on Cocoa with parity unless explicitly noted.
 
 ## 10. Revision History
 
@@ -237,8 +237,8 @@ The Cocoa binding tracks `XR_EXT_win32_window_binding` for forward-compatibility
 |---|---|---|---|
 | 1 | 2025-06-15 | David Fattal | Initial version with viewHandle |
 | 2 | 2025-09-20 | David Fattal | Added readbackCallback for offscreen mode |
-| 3 | 2026-01-10 | David Fattal | Added sharedIOSurface for zero-copy Metal texture sharing. Fixed type value collision (1000999003 → 1000999004). |
-| 4 | 2026-04-24 | David Fattal | Read-back contract clarified: runtime writes the canvas region at `(x, y)` (not origin) in the shared IOSurface, matching `xrSetSharedTextureOutputRectEXT` args. Apps must sample at `uvOffset + uv * uvScale`. See ADR-010. |
-| 6 | 2026-05-28 | David Fattal | Added `xrSetSharedTextureSurround2DEXT` (parity with `XR_EXT_win32_window_binding` v6). Lets `_texture` apps register a full-view 2D IOSurface whose pixels outside the canvas sub-rect are blitted into the target swapchain each frame. Enables apps on fixed-3D-zone displays to fill the surround region with full-resolution 2D content. *(Removed in v7.)* |
-| 7 | 2026-06-21 | David Fattal | Removed `xrSetSharedTextureOutputRectEXT` + `xrSetSharedTextureSurround2DEXT` — superseded by [`XR_EXT_display_zones`](XR_EXT_display_zones.md) (ADR-031). See [`docs/roadmap/surround-zones-deprecation.md`](../../roadmap/surround-zones-deprecation.md). |
+| 3 | 2026-01-10 | David Fattal | Added sharedIOSurface for zero-copy Metal texture sharing. Fixed type value collision (1004999003 → 1004999004). |
+| 4 | 2026-04-24 | David Fattal | Read-back contract clarified: runtime writes the canvas region at `(x, y)` (not origin) in the shared IOSurface, matching `xrSetSharedTextureOutputRectDXR` args. Apps must sample at `uvOffset + uv * uvScale`. See ADR-010. |
+| 6 | 2026-05-28 | David Fattal | Added `xrSetSharedTextureSurround2DEXT` (parity with `XR_DXR_win32_window_binding` v6). Lets `_texture` apps register a full-view 2D IOSurface whose pixels outside the canvas sub-rect are blitted into the target swapchain each frame. Enables apps on fixed-3D-zone displays to fill the surround region with full-resolution 2D content. *(Removed in v7.)* |
+| 7 | 2026-06-21 | David Fattal | Removed `xrSetSharedTextureOutputRectDXR` + `xrSetSharedTextureSurround2DEXT` — superseded by [`XR_DXR_display_zones`](XR_DXR_display_zones.md) (ADR-031). See [`docs/roadmap/surround-zones-deprecation.md`](../../roadmap/surround-zones-deprecation.md). |
 | 6 (erratum) | 2026-06-06 | David Fattal | Surround deltas corrected to match the shipped Metal implementation (#406): pixel format must match the multiview shared IOSurface (not "must be RGBA8Unorm"); dims are confirmed window-sized with re-register-on-resize; fill is window-clamped per #464 (window rect minus canvas, never the worst-case extent); sync is CFRetain + coherent IOSurface (no fence/use-count in-process). No version bump — text aligned to behavior, no ABI change. |

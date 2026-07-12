@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Cube Zones (OpenGL) — XR_EXT_display_zones exerciser (ADR-027)
+ * @brief  Cube Zones (OpenGL) — XR_DXR_display_zones exerciser (ADR-027)
  *
  * Cloned from cube_handle_gl_win (GL render) + cube_zones_d3d11_win (zones
  * logic) for #613.
@@ -19,23 +19,23 @@
  *  - Local2D strip (top)      : rect {0,0,1280,180}, always on, filled once
  *    with a CPU-generated checker + label band.
  *
- * Each zone owns ONE swapchain sized per xrGetDisplayZoneRecommendedViewSizeEXT,
+ * Each zone owns ONE swapchain sized per xrGetDisplayZoneRecommendedViewSizeDXR,
  * horizontally tiled per view (width = recSize.width * viewCount); each frame
- * runs a zone-scoped locate (XrDisplayZoneEXT + XrDisplayRigEXT chained on
+ * runs a zone-scoped locate (XrDisplayZoneDXR + XrDisplayRigDXR chained on
  * XrViewLocateInfo) and submits [projA, projB, strip] with the SAME zone
  * structs chained on the projection layers.
  *
  * Keys (zones mode):
  *  - M : cycle wish mode — 0 AUTO (no frame-end info) / 1 explicit Tier-2
  *        rects. Wish mode 2 (Tier-3 freeform render target) is STUBBED on GL:
- *        XR_EXT_local_3d_zone has no OpenGL render-target binding struct, so M
+ *        XR_DXR_local_3d_zone has no OpenGL render-target binding struct, so M
  *        skips mode 2 and falls back to AUTO (same as the Vulkan zones app).
  *  - O : toggle zone B between its home rect and a rect overlapping zone A.
  *  - V : cycle display rendering mode (2D/3D).
- *  - DXR_ZONES_VALIDATE=1 : chain XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_EXT.
+ *  - DXR_ZONES_VALIDATE=1 : chain XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_DXR.
  *  - DXR_ZONES_FADE_PX=N  : content-alpha edge feather width (default 16; 0 off).
  *
- * When the runtime doesn't advertise XR_EXT_display_zones (DISPLAYXR_ZONES=1)
+ * When the runtime doesn't advertise XR_DXR_display_zones (DISPLAYXR_ZONES=1)
  * the app logs an error once and keeps running as a plain single-projection
  * cube (graceful degrade).
  */
@@ -65,7 +65,7 @@ using namespace DirectX;
 static const char* APP_NAME = "cube_zones_gl_win";
 
 static const wchar_t* WINDOW_CLASS = L"DXRCubeZonesGLClass";
-static const wchar_t* WINDOW_TITLE = L"OpenGL Cube Zones — XR_EXT_display_zones";
+static const wchar_t* WINDOW_TITLE = L"OpenGL Cube Zones — XR_DXR_display_zones";
 
 // Global state (shared between main thread and render thread)
 static InputState g_inputState;
@@ -100,7 +100,7 @@ static bool ArrayLayoutEnabled() {
 }
 
 // ---------------------------------------------------------------------------
-// XR_EXT_display_zones state
+// XR_DXR_display_zones state
 // ---------------------------------------------------------------------------
 
 static const uint32_t kNumZones = 2;
@@ -172,7 +172,7 @@ static float ZoneEdgeFadePx() {
 
 // ---------------------------------------------------------------------------
 
-// XR_EXT_view_rig: per-view staging container for the consumed render-ready
+// XR_DXR_view_rig: per-view staging container for the consumed render-ready
 // views (matrices column-major).
 struct RigView {
     float view_matrix[16];
@@ -587,13 +587,13 @@ static bool CreateAndFillStrip(XrSessionManager& xr) {
 }
 
 // Create one zone's swapchain + per-image FBOs + depth, sized per
-// xrGetDisplayZoneRecommendedViewSizeEXT, horizontally tiled per view.
+// xrGetDisplayZoneRecommendedViewSizeDXR, horizontally tiled per view.
 static bool CreateZoneResources(XrSessionManager& xr, GLRenderer& renderer,
                                 DisplayZone& z, uint32_t viewCount) {
     XrExtent2Di rec = {};
     XrResult r = g_zones.pfnGetViewSize(xr.session, &z.rect, &rec);
     if (XR_FAILED(r) || rec.width <= 0 || rec.height <= 0) {
-        LOG_ERROR("[zones] zone %u: xrGetDisplayZoneRecommendedViewSizeEXT failed (0x%x, %dx%d)",
+        LOG_ERROR("[zones] zone %u: xrGetDisplayZoneRecommendedViewSizeDXR failed (0x%x, %dx%d)",
                   z.zoneId, (unsigned)r, rec.width, rec.height);
         return false;
     }
@@ -651,10 +651,10 @@ static bool CreateZoneResources(XrSessionManager& xr, GLRenderer& renderer,
 static void TryActivateZones(XrSessionManager& xr, GLRenderer& renderer) {
     g_zonesAttempted = true;
 
-    XrDisplayZoneCapabilitiesEXT caps = {XR_TYPE_DISPLAY_ZONE_CAPABILITIES_EXT};
+    XrDisplayZoneCapabilitiesDXR caps = {XR_TYPE_DISPLAY_ZONE_CAPABILITIES_DXR};
     XrResult r = g_zones.pfnGetCaps(xr.session, &caps);
     if (XR_FAILED(r) || !caps.supported) {
-        LOG_ERROR("[zones] xrGetDisplayZoneCapabilitiesEXT: rc=0x%x supported=%d — zones path disabled",
+        LOG_ERROR("[zones] xrGetDisplayZoneCapabilitiesDXR: rc=0x%x supported=%d — zones path disabled",
                   (unsigned)r, (int)caps.supported);
         g_hasDisplayZonesExt = false;
         return;
@@ -727,12 +727,12 @@ static void TryActivateZones(XrSessionManager& xr, GLRenderer& renderer) {
 static bool EnsureWishMask(XrSessionManager& xr) {
     if (g_zone.mask != XR_NULL_HANDLE) return true;
     if (!g_zone.pfnCreate) return false;
-    XrLocal3DZoneMaskCreateInfoEXT mci = {(XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_EXT};
+    XrLocal3DZoneMaskCreateInfoDXR mci = {(XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_DXR};
     mci.maskWidth = 0;
     mci.maskHeight = 0;
     XrResult r = g_zone.pfnCreate(xr.session, &mci, &g_zone.mask);
     if (XR_FAILED(r)) {
-        LOG_ERROR("[zones] xrCreateLocal3DZoneMaskEXT failed (0x%x)", (unsigned)r);
+        LOG_ERROR("[zones] xrCreateLocal3DZoneMaskDXR failed (0x%x)", (unsigned)r);
         g_zone.mask = XR_NULL_HANDLE;
         return false;
     }
@@ -749,7 +749,7 @@ static void ApplyWishAuthoring(XrSessionManager& xr) {
         for (uint32_t zi = 0; zi < kNumZones; zi++) rects[zi] = g_zonesArr[zi].rect;
         XrResult r = g_zone.pfnSetRects(g_zone.mask, kNumZones, rects);
         if (XR_FAILED(r)) {
-            LOG_ERROR("[zones] xrSetLocal3DZoneFromRectsEXT failed (0x%x)", (unsigned)r);
+            LOG_ERROR("[zones] xrSetLocal3DZoneFromRectsDXR failed (0x%x)", (unsigned)r);
         }
     }
 }
@@ -771,7 +771,7 @@ static void HandleZoneKeys(XrSessionManager& xr) {
         g_wishMode = (g_wishMode + 1) % 3;
         if (g_wishMode == 2) {
             // GL Tier-3 STUB: no OpenGL render-target binding struct exists in
-            // XR_EXT_local_3d_zone, so wish mode 2 is impractical to wire.
+            // XR_DXR_local_3d_zone, so wish mode 2 is impractical to wire.
             // Skip straight to AUTO (matches the Vulkan zones app).
             LOG_WARN("[zones] wish mode 2 (Tier-3) unsupported on GL — falling back to AUTO");
             g_wishMode = 0;
@@ -799,22 +799,22 @@ static void HandleZoneKeys(XrSessionManager& xr) {
 // [projA, projB, strip] with the zone structs chained on the projections.
 static void RenderZonesFrame(XrSessionManager& xr, GLRenderer& renderer,
                              const XrFrameState& frameState) {
-    XrDisplayZoneEXT zoneStructs[kNumZones];
-    XrDisplayRigEXT rigStructs[kNumZones];
+    XrDisplayZoneDXR zoneStructs[kNumZones];
+    XrDisplayRigDXR rigStructs[kNumZones];
     std::vector<XrCompositionLayerProjectionView> projViews[kNumZones];
     uint32_t submitViewCounts[kNumZones] = {};
 
     for (uint32_t zi = 0; zi < kNumZones; zi++) {
         DisplayZone& z = g_zonesArr[zi];
 
-        rigStructs[zi] = {XR_TYPE_DISPLAY_RIG_EXT};
+        rigStructs[zi] = {XR_TYPE_DISPLAY_RIG_DXR};
         rigStructs[zi].pose = {{0, 0, 0, 1}, {0, 0, 0}};
         rigStructs[zi].virtualDisplayHeight = kZoneVirtualDisplayHeight;
         rigStructs[zi].ipdFactor = z.ipdFactor;
         rigStructs[zi].parallaxFactor = 1.0f;
         rigStructs[zi].perspectiveFactor = z.perspectiveFactor;
 
-        zoneStructs[zi] = {XR_TYPE_DISPLAY_ZONE_EXT};
+        zoneStructs[zi] = {XR_TYPE_DISPLAY_ZONE_DXR};
         zoneStructs[zi].next = &rigStructs[zi];
         zoneStructs[zi].zoneId = z.zoneId;
         zoneStructs[zi].rect = z.rect;
@@ -946,7 +946,7 @@ static void RenderZonesFrame(XrSessionManager& xr, GLRenderer& renderer,
 
     // Layer list: [projA (zone A chained), projB (zone B chained), strip].
     XrCompositionLayerProjection projLayers[kNumZones];
-    XrCompositionLayerLocal2DEXT stripLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+    XrCompositionLayerLocal2DDXR stripLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR};
     const XrCompositionLayerBaseHeader* layers[kNumZones + 1] = {};
     uint32_t layerCount = 0;
 
@@ -1005,7 +1005,7 @@ static void RenderZonesFrame(XrSessionManager& xr, GLRenderer& renderer,
     // Per-frame wish reference: absent in AUTO (mode 0) unless validation is
     // requested; in mode 1 the mask is the frame's wish, atomic with the layer
     // set.
-    XrDisplayZonesFrameEndInfoEXT zonesEnd = {(XrStructureType)XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_EXT};
+    XrDisplayZonesFrameEndInfoDXR zonesEnd = {(XrStructureType)XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_DXR};
     zonesEnd.flags = 0;
     zonesEnd.wishMask = XR_NULL_HANDLE;
     bool chainZonesEnd = false;
@@ -1014,7 +1014,7 @@ static void RenderZonesFrame(XrSessionManager& xr, GLRenderer& renderer,
         chainZonesEnd = true;
     }
     if (ZonesValidateEnabled()) {
-        zonesEnd.flags |= XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_EXT;
+        zonesEnd.flags |= XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_DXR;
         chainZonesEnd = true;
     }
     if (chainZonesEnd) {
@@ -1088,7 +1088,7 @@ static void RenderFallbackFrame(XrSessionManager& xr, GLRenderer& renderer,
 
             const bool useAppProjection =
                 xr.hasDisplayInfoExt && xr.displayWidthM > 0.0f && g_hasViewRigExt;
-            XrDisplayRigEXT displayRig = {XR_TYPE_DISPLAY_RIG_EXT};
+            XrDisplayRigDXR displayRig = {XR_TYPE_DISPLAY_RIG_DXR};
             XrPosef rigPose = {{0, 0, 0, 1}, {0, 0, 0}};
             if (useAppProjection) {
                 XMVECTOR rigOri = XMQuaternionRotationRollPitchYaw(
@@ -1318,7 +1318,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         MessageBox(nullptr, L"Failed to initialize logging", L"Warning", MB_OK | MB_ICONWARNING);
     }
 
-    LOG_INFO("=== Cube Zones (OpenGL, XR_EXT_display_zones) ===");
+    LOG_INFO("=== Cube Zones (OpenGL, XR_DXR_display_zones) ===");
     LOG_INFO("Two 3D zones + Local2D strip + wish mask (ADR-027)");
     LOG_INFO("Runtime dev gate: DISPLAYXR_ZONES=1 must be set for the runtime to advertise the extension");
 

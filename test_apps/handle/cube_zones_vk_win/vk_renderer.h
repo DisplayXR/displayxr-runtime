@@ -5,7 +5,7 @@
  * @brief  Vulkan rendering for cube and grid
  *
  * Cloned from cube_handle_vk_win's vk_renderer and extended for
- * XR_EXT_display_zones with the ARRAY / single-pass-instanced (SPI) stereo
+ * XR_DXR_display_zones with the ARRAY / single-pass-instanced (SPI) stereo
  * layout: the base single-swapchain path (framebuffers[2]) is unchanged; a
  * ZoneArrayFramebuffers set + RenderSceneToZoneLayer() let each display zone
  * render into its OWN arraySize=2 OpenXR Vulkan swapchain, one view per array
@@ -122,7 +122,7 @@ void RenderScene(
 void CleanupVkRenderer(VkRenderer& renderer);
 
 // ---------------------------------------------------------------------------
-// XR_EXT_display_zones: per-zone ARRAY / single-pass-instanced framebuffer set
+// XR_DXR_display_zones: per-zone ARRAY / single-pass-instanced framebuffer set
 // ---------------------------------------------------------------------------
 //
 // Each display zone owns ONE OpenXR Vulkan swapchain created with arraySize = 2

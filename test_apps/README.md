@@ -8,7 +8,7 @@ DisplayXR supports three app classes, differing in who owns the window and rende
 
 | Class | Description | When to use |
 |-------|-------------|-------------|
-| **Handle** (`_handle`) | App creates its own window and passes the handle (HWND, NSView) to the runtime via `XR_EXT_win32_window_binding` or `XR_EXT_cocoa_window_binding`. | Native apps that need full control over their window. Most common class. |
+| **Handle** (`_handle`) | App creates its own window and passes the handle (HWND, NSView) to the runtime via `XR_DXR_win32_window_binding` or `XR_DXR_cocoa_window_binding`. | Native apps that need full control over their window. Most common class. |
 | **Texture** (`_texture`) | App renders to offscreen textures, runtime composites into its own window. | Apps embedding 3D content in a larger 2D UI. |
 | **Hosted** (`_hosted`) | Runtime creates everything — window, swapchains, rendering targets. Standard OpenXR path. | Simplest integration. Also the path for WebXR content. |
 
@@ -18,8 +18,8 @@ All three classes use a native compositor in-process — no IPC, no server proce
 
 Each class has **extension** and **legacy** variants:
 
-- **Extension apps** (default) use `XR_EXT_display_info` to query display properties, select rendering modes (2D/stereo/multiview), and control tile layout.
-- **Legacy apps** (`_legacy` suffix) don't use `XR_EXT_display_info`. The runtime auto-detects them and computes tile scaling via a compromise formula. This is the path for unmodified OpenXR apps and WebXR content.
+- **Extension apps** (default) use `XR_DXR_display_info` to query display properties, select rendering modes (2D/stereo/multiview), and control tile layout.
+- **Legacy apps** (`_legacy` suffix) don't use `XR_DXR_display_info`. The runtime auto-detects them and computes tile scaling via a compromise formula. This is the path for unmodified OpenXR apps and WebXR content.
 
 ## Naming Convention
 
@@ -46,7 +46,7 @@ cube_{class}_{api}_{platform}
 
 | App | API | Description |
 |-----|-----|-------------|
-| `cube_zones_texture_d3d11_win` | D3D11 | App provides offscreen textures, runtime composites the multi-zone (XR_EXT_display_zones) atlas. |
+| `cube_zones_texture_d3d11_win` | D3D11 | App provides offscreen textures, runtime composites the multi-zone (XR_DXR_display_zones) atlas. |
 | `cube_zones_texture_d3d12_win` | D3D12 | D3D12 texture path (display-zones parity). |
 
 ### Windows — Hosted Apps
@@ -55,7 +55,7 @@ cube_{class}_{api}_{platform}
 |-----|-----|-------------|
 | `cube_hosted_d3d11_win` | D3D11 | Runtime creates window and targets. Simplest path. |
 
-### Windows — Legacy Apps (no XR_EXT_display_info)
+### Windows — Legacy Apps (no XR_DXR_display_info)
 
 | App | API | Description |
 |-----|-----|-------------|
@@ -76,7 +76,7 @@ cube_{class}_{api}_{platform}
 
 | App | API | Description |
 |-----|-----|-------------|
-| `cube_zones_texture_metal_macos` | Metal | App provides Metal textures, runtime composites the multi-zone (XR_EXT_display_zones) atlas. |
+| `cube_zones_texture_metal_macos` | Metal | App provides Metal textures, runtime composites the multi-zone (XR_DXR_display_zones) atlas. |
 | `cube_hosted_metal_macos` | Metal | Runtime creates window and targets. |
 
 ### macOS — Legacy Apps

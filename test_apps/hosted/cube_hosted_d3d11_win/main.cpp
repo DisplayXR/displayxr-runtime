@@ -4,7 +4,7 @@
  * @file
  * @brief  SR Cube OpenXR - Standard OpenXR mode (DisplayXR creates window)
  *
- * This application demonstrates OpenXR without the XR_EXT_win32_window_binding extension.
+ * This application demonstrates OpenXR without the XR_DXR_win32_window_binding extension.
  * DisplayXR will create its own window for rendering.
  *
  * Input is handled by DisplayXR's qwerty driver:

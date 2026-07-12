@@ -1488,7 +1488,7 @@ void CleanupVkRenderer(VkRenderer& renderer) {
 }
 
 // ---------------------------------------------------------------------------
-// XR_EXT_display_zones: per-zone ARRAY / single-pass-instanced framebuffers
+// XR_DXR_display_zones: per-zone ARRAY / single-pass-instanced framebuffers
 // ---------------------------------------------------------------------------
 
 bool CreateZoneArrayFramebuffers(VkRenderer& renderer, ZoneArrayFramebuffers& fb,

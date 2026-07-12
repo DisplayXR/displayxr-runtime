@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  SR Cube OpenXR Ext - OpenXR with XR_EXT_win32_window_binding extension
+ * @brief  SR Cube OpenXR Ext - OpenXR with XR_DXR_win32_window_binding extension
  *
- * This application demonstrates OpenXR with the XR_EXT_win32_window_binding extension.
+ * This application demonstrates OpenXR with the XR_DXR_win32_window_binding extension.
  * The application creates and controls its own window for rendering.
  */
 
@@ -45,7 +45,7 @@ static bool g_running = true;
 static XrSessionManager* g_xr = nullptr;
 
 // #542 'H' (validation affordance): toggle the HARDWARE display state alone
-// for the current mode via xrRequestDisplayModeEXT — the mode, the app's
+// for the current mode via xrRequestDisplayModeDXR — the mode, the app's
 // content, and the DP's weave/blit processing are untouched. In 3D the panel
 // shows the woven atlas flat (blurry); fading parallax to zero converges
 // back to sharp — the MANUAL tracking-loss transition shape (#522). The
@@ -64,7 +64,7 @@ static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18°) → 36° 
 // Disturbance-free C toggle + absolute SPACE reset live in displayxr-common
 // (common/rig_mode.{h,cpp}, driven by UpdateInputState/UpdateCameraMovement).
 // The app only feeds InputState the canvas size + initial vHeight and submits
-// XrCameraRigEXT::metersToVirtual = viewParams.cameraM2v (see below).
+// XrCameraRigDXR::metersToVirtual = viewParams.cameraM2v (see below).
 static const float HUD_WIDTH_FRACTION = 0.30f;
 
 // Fullscreen state
@@ -98,7 +98,7 @@ struct L2DPanel {
 static L2DPanel g_panel1, g_panel2, g_backdrop;
 static XrRect2Di g_panel1Rect, g_panel2Rect, g_backdropRect;
 
-// XR_EXT_view_rig (#396 W7 dogfood): the app chains a rig descriptor on every
+// XR_DXR_view_rig (#396 W7 dogfood): the app chains a rig descriptor on every
 // xrLocateViews and consumes the runtime's render-ready XrView{pose, fov}
 // directly — the per-frame Kooima generation (display3d_resolve_window_rect +
 // *_compute_views) is deleted; only clip policy stays app-side. Per-view
@@ -278,7 +278,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         // #542: 'H' toggles the HARDWARE display state alone for the current
-        // mode (xrRequestDisplayModeEXT) — handled in RenderOneFrame.
+        // mode (xrRequestDisplayModeDXR) — handled in RenderOneFrame.
         if (wParam == 'H') {
             g_hwToggleRequested = true;
             return 0;
@@ -554,20 +554,20 @@ static void RenderOneFrame(RenderState& rs) {
     // Handle rendering mode requests (V=cycle next, 0-8=jump absolute) through
     // the shared ModeSwitch sequencer: it consumes the request flags, eases the
     // stereo disparity (viewParams.ipdFactor) around the switch, and issues
-    // xrRequestDisplayRenderingModeEXT on the right frame. The runtime still owns
-    // the current mode; the XrEventDataRenderingModeChangedEXT event updates
+    // xrRequestDisplayRenderingModeDXR on the right frame. The runtime still owns
+    // the current mode; the XrEventDataRenderingModeChangedDXR event updates
     // xr.currentModeIndex, which render paths and the HUD read directly.
     XrSessionUpdateModeSwitch(xr, g_inputState, rs.perfStats->deltaTime);
 
-    // #228 Tier 1 smoke test: 'B' fires xrRequestFilePickerEXT and prints
+    // #228 Tier 1 smoke test: 'B' fires xrRequestFilePickerDXR and prints
     // the immediate return code. The completion event (success/cancel +
-    // path) lands later through PollEvents → XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_EXT.
+    // path) lands later through PollEvents → XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_DXR.
     //
     // ------------------------------------------------------------------
     // CI / headless smoke-test hook for #228.
     // ------------------------------------------------------------------
     // Setting `DISPLAYXR_AUTOFIRE_FILE_PICKER=1` in this app's
-    // environment causes ONE xrRequestFilePickerEXT call to fire
+    // environment causes ONE xrRequestFilePickerDXR call to fire
     // automatically ~300 frames after the session enters running
     // state (≈5 s at 60 Hz), without any keypress. The flag is reset
     // after the first fire — there is no per-frame call cost.
@@ -600,18 +600,18 @@ static void RenderOneFrame(RenderState& rs) {
     if (g_inputState.filePickerRequestRequested) {
         g_inputState.filePickerRequestRequested = false;
         if (xr.pfnRequestFilePickerEXT && xr.session != XR_NULL_HANDLE) {
-            XrFilePickerInfoEXT info = {XR_TYPE_FILE_PICKER_INFO_EXT};
+            XrFilePickerInfoDXR info = {XR_TYPE_FILE_PICKER_INFO_DXR};
             info.next = nullptr;
-            info.mode = XR_FILE_PICKER_MODE_OPEN_EXT;
-            info.flags = XR_FILE_PICKER_FLAG_NONE_EXT;
+            info.mode = XR_FILE_PICKER_MODE_OPEN_DXR;
+            info.flags = XR_FILE_PICKER_FLAG_NONE_DXR;
             strncpy_s(info.title, "Smoke test (#228)", _TRUNCATE);
             strncpy_s(info.defaultPath, "C:\\", _TRUNCATE);
             info.filterCount = 1;
             strncpy_s(info.filters[0].description, "Images", _TRUNCATE);
             strncpy_s(info.filters[0].extensions, "*.png;*.jpg", _TRUNCATE);
-            XrAsyncRequestIdEXT rid = XR_NULL_ASYNC_REQUEST_ID_EXT;
+            XrAsyncRequestIdDXR rid = XR_NULL_ASYNC_REQUEST_ID_DXR;
             XrResult fr = xr.pfnRequestFilePickerEXT(xr.session, &info, &rid);
-            LOG_INFO("[#228] xrRequestFilePickerEXT -> rc=0x%x requestId=%llu",
+            LOG_INFO("[#228] xrRequestFilePickerDXR -> rc=0x%x requestId=%llu",
                 (unsigned)fr, (unsigned long long)rid);
             if (XR_SUCCEEDED(fr)) {
                 // Feed the shared PollEvents completion state machine
@@ -622,7 +622,7 @@ static void RenderOneFrame(RenderState& rs) {
                 xr.filePickerHasResult = false;
             }
         } else {
-            LOG_INFO("[#228] xrRequestFilePickerEXT not available (ext missing or PFN NULL)");
+            LOG_INFO("[#228] xrRequestFilePickerDXR not available (ext missing or PFN NULL)");
         }
     }
 
@@ -630,11 +630,11 @@ static void RenderOneFrame(RenderState& rs) {
     if (g_inputState.eyeTrackingModeToggleRequested) {
         g_inputState.eyeTrackingModeToggleRequested = false;
         if (xr.pfnRequestEyeTrackingModeEXT && xr.session != XR_NULL_HANDLE) {
-            XrEyeTrackingModeEXT newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_EXT)
-                ? XR_EYE_TRACKING_MODE_MANUAL_EXT : XR_EYE_TRACKING_MODE_MANAGED_EXT;
+            XrEyeTrackingModeDXR newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_DXR)
+                ? XR_EYE_TRACKING_MODE_MANUAL_DXR : XR_EYE_TRACKING_MODE_MANAGED_DXR;
             XrResult etResult = xr.pfnRequestEyeTrackingModeEXT(xr.session, newMode);
             LOG_INFO("Eye tracking mode -> %s (%s)",
-                newMode == XR_EYE_TRACKING_MODE_MANUAL_EXT ? "MANUAL" : "MANAGED",
+                newMode == XR_EYE_TRACKING_MODE_MANUAL_DXR ? "MANUAL" : "MANAGED",
                 XR_SUCCEEDED(etResult) ? "OK" : "unsupported");
         }
     }
@@ -654,7 +654,7 @@ static void RenderOneFrame(RenderState& rs) {
                 bool cur_3d = g_hwOverrideActive ? g_hwOverride3D : mode_default_3d;
                 bool want_3d = !cur_3d;
                 XrResult hres = xr.pfnRequestDisplayModeEXT(xr.session,
-                    want_3d ? XR_DISPLAY_MODE_3D_EXT : XR_DISPLAY_MODE_2D_EXT);
+                    want_3d ? XR_DISPLAY_MODE_3D_DXR : XR_DISPLAY_MODE_2D_DXR);
                 if (XR_SUCCEEDED(hres)) {
                     g_hwOverrideActive = (want_3d != mode_default_3d);
                     g_hwOverride3D = want_3d;
@@ -663,7 +663,7 @@ static void RenderOneFrame(RenderState& rs) {
                 LOG_INFO("[#542] H: hardware-only -> %s (mode %u unchanged, rc=0x%x)",
                     want_3d ? "3D" : "2D", xr.currentModeIndex, (unsigned)hres);
             } else {
-                LOG_INFO("[#542] H: xrRequestDisplayModeEXT unavailable");
+                LOG_INFO("[#542] H: xrRequestDisplayModeDXR unavailable");
             }
         }
     }
@@ -716,17 +716,17 @@ static void RenderOneFrame(RenderState& rs) {
                     XrView rawViews[8];
                     for (uint32_t vi = 0; vi < 8; vi++) rawViews[vi] = {XR_TYPE_VIEW};
 
-                    // XR_EXT_view_rig raw-channel verification (#396 W7): chain
-                    // XrViewDisplayRawEXT so the runtime reports the DP's full
+                    // XR_DXR_view_rig raw-channel verification (#396 W7): chain
+                    // XrViewDisplayRawDXR so the runtime reports the DP's full
                     // per-view eye set. Logged once below to confirm
                     // eyeCountOutput == viewCount with sane positions (esp. in
                     // >2-view modes, where the DP — not the runtime — fills N).
-                    XrViewDisplayRawEXT rawProbe = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+                    XrViewDisplayRawDXR rawProbe = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
                     if (g_hasViewRigExt) {
                         viewState.next = &rawProbe;
                     }
 
-                    // XR_EXT_view_rig (#396 W7): drive the runtime rig matching
+                    // XR_DXR_view_rig (#396 W7): drive the runtime rig matching
                     // the app's current mode (C selects the rig) with the app's
                     // tunables — the runtime owns the window/canvas resolve and
                     // the Kooima math, and returns render-ready XrView{pose, fov}.
@@ -735,8 +735,8 @@ static void RenderOneFrame(RenderState& rs) {
                     const bool useAppProjection =
                         xr.hasDisplayInfoExt && xr.displayWidthM > 0.0f && g_hasViewRigExt;
                     const bool rigCamera = useAppProjection && g_inputState.cameraMode;
-                    XrCameraRigEXT cameraRig = {XR_TYPE_CAMERA_RIG_EXT};
-                    XrDisplayRigEXT displayRig = {XR_TYPE_DISPLAY_RIG_EXT};
+                    XrCameraRigDXR cameraRig = {XR_TYPE_CAMERA_RIG_DXR};
+                    XrDisplayRigDXR displayRig = {XR_TYPE_DISPLAY_RIG_DXR};
                     XrPosef rigPose = {{0, 0, 0, 1}, {0, 0, 0}};
                     if (useAppProjection) {
                         XMVECTOR rigOri = XMQuaternionRotationRollPitchYaw(
@@ -780,7 +780,7 @@ static void RenderOneFrame(RenderState& rs) {
                         g_inputState.canvasHeightM = rawProbe.canvasSizeMeters.height;
                     }
 
-                    // XR_EXT_view_rig raw-channel verification (#396 W7): one-shot
+                    // XR_DXR_view_rig raw-channel verification (#396 W7): one-shot
                     // proof the raw channel reports the DP's full per-view set.
                     if (g_hasViewRigExt) {
                         static int rawLogged = 0;
@@ -837,15 +837,15 @@ static void RenderOneFrame(RenderState& rs) {
                             sessionText += L"\nSession: ";
                             sessionText += FormatSessionState((int)xr.sessionState);
                             std::wstring modeText = xr.hasWin32WindowBindingExt ?
-                                L"XR_EXT_win32_window_binding: ACTIVE (D3D11)" :
-                                L"XR_EXT_win32_window_binding: NOT AVAILABLE (D3D11)";
+                                L"XR_DXR_win32_window_binding: ACTIVE (D3D11)" :
+                                L"XR_DXR_win32_window_binding: NOT AVAILABLE (D3D11)";
                             modeText += g_inputState.cameraMode ?
                                 L"\nKooima: Camera-Centric [C=Toggle]" :
                                 L"\nKooima: Display-Centric [C=Toggle]";
                             modeText += g_hasViewRigExt ?
                                 (g_inputState.cameraMode ?
-                                    L"\nView rig: RUNTIME camera rig (XR_EXT_view_rig)" :
-                                    L"\nView rig: RUNTIME display rig (XR_EXT_view_rig)") :
+                                    L"\nView rig: RUNTIME camera rig (XR_DXR_view_rig)" :
+                                    L"\nView rig: RUNTIME display rig (XR_DXR_view_rig)") :
                                 L"\nView rig: unavailable (legacy views)";
 
                             // Dynamic render dims matching the actual viewport computation
@@ -1118,7 +1118,7 @@ static void RenderOneFrame(RenderState& rs) {
                         if (rtv) rtv->Release();
 
                         // 'I' key: snapshot the multi-view atlas to a PNG via the
-                        // runtime (XR_EXT_atlas_capture). Skipped for mono (1×1).
+                        // runtime (XR_DXR_atlas_capture). Skipped for mono (1×1).
                         if (g_inputState.captureAtlasRequested) {
                             g_inputState.captureAtlasRequested = false;
                             dxr_capture::RequestRuntimeAtlasCapture(
@@ -1179,8 +1179,8 @@ static void RenderOneFrame(RenderState& rs) {
 
                     if (ok && g_l2dMask && g_zone.available && g_zone.pfnCreate && g_zone.pfnSetRects &&
                         g_zone.pfnSubmit) {
-                        XrLocal3DZoneMaskCreateInfoEXT mci = {
-                            (XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_EXT};
+                        XrLocal3DZoneMaskCreateInfoDXR mci = {
+                            (XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_DXR};
                         mci.maskWidth = 0; // runtime picks the window backing size
                         mci.maskHeight = 0;
                         ok = XR_SUCCEEDED(g_zone.pfnCreate(xr.session, &mci, &g_zone.mask));
@@ -1221,12 +1221,12 @@ static void RenderOneFrame(RenderState& rs) {
                 projLayer.viewCount = (uint32_t)eyeCount;
                 projLayer.views = projectionViews.data();
 
-                XrCompositionLayerLocal2DEXT panel1Layer = {
-                    (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
-                XrCompositionLayerLocal2DEXT panel2Layer = {
-                    (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
-                XrCompositionLayerLocal2DEXT backdropLayer = {
-                    (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+                XrCompositionLayerLocal2DDXR panel1Layer = {
+                    (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR};
+                XrCompositionLayerLocal2DDXR panel2Layer = {
+                    (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR};
+                XrCompositionLayerLocal2DDXR backdropLayer = {
+                    (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR};
                 const XrCompositionLayerBaseHeader* layers[4] = {nullptr, nullptr, nullptr, nullptr};
                 uint32_t layerCount = 0;
 
@@ -1304,7 +1304,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     LOG_INFO("=== SR Cube OpenXR Ext Application ===");
-    LOG_INFO("OpenXR with XR_EXT_win32_window_binding extension");
+    LOG_INFO("OpenXR with XR_DXR_win32_window_binding extension");
     LOG_INFO("Application creates and controls its own window");
 
     // #439 Phase 3 — handle + mask + Local2D layer modes (§8 cases 2/3/4).
@@ -1331,7 +1331,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
-    // Create window FIRST (needed for XR_EXT_win32_window_binding)
+    // Create window FIRST (needed for XR_DXR_win32_window_binding)
     HWND hwnd = CreateAppWindow(hInstance, g_windowWidth, g_windowHeight);
     if (!hwnd) {
         LOG_ERROR("Failed to create window");
@@ -1361,11 +1361,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Check for session target extension
     if (!xr.hasWin32WindowBindingExt) {
-        LOG_WARN("XR_EXT_win32_window_binding not available - runtime will create its own window");
-        MessageBox(hwnd, L"XR_EXT_win32_window_binding extension not available.\nRuntime will create its own window.",
+        LOG_WARN("XR_DXR_win32_window_binding not available - runtime will create its own window");
+        MessageBox(hwnd, L"XR_DXR_win32_window_binding extension not available.\nRuntime will create its own window.",
             L"Warning", MB_OK | MB_ICONWARNING);
     } else {
-        LOG_INFO("XR_EXT_win32_window_binding extension is available - using app window");
+        LOG_INFO("XR_DXR_win32_window_binding extension is available - using app window");
     }
 
     // Get the required GPU adapter LUID from OpenXR
@@ -1395,8 +1395,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         LOG_WARN("HUD renderer init failed - HUD will not be displayed");
     }
 
-    // Create OpenXR session WITH window handle (XR_EXT_win32_window_binding)
-    LOG_INFO("Creating OpenXR session with XR_EXT_win32_window_binding (HWND: 0x%p)...", hwnd);
+    // Create OpenXR session WITH window handle (XR_DXR_win32_window_binding)
+    LOG_INFO("Creating OpenXR session with XR_DXR_win32_window_binding (HWND: 0x%p)...", hwnd);
     if (!CreateSession(xr, renderer.device.Get(), hwnd)) {
         LOG_ERROR("OpenXR session creation failed");
         MessageBox(hwnd, L"Failed to create OpenXR session", L"Error", MB_OK | MB_ICONERROR);
@@ -1477,7 +1477,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     LOG_INFO("");
     LOG_INFO("=== Entering main loop ===");
-    LOG_INFO("XR rendering happens in the application window (XR_EXT_win32_window_binding)");
+    LOG_INFO("XR rendering happens in the application window (XR_DXR_win32_window_binding)");
     LOG_INFO("Single-threaded: message pump + render on the main thread (WM_PAINT during drag/resize)");
     LOG_INFO("Controls: WASD=Fly, QE=Up/Down, Mouse=Look, Space/DblClick=Reset, P=Parallax, V=Mode, SHIFT+TAB=HUD, F11=Fullscreen, ESC=Quit");
     LOG_INFO("");

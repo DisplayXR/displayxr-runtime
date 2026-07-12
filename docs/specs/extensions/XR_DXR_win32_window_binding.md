@@ -1,10 +1,10 @@
-# XR_EXT_win32_window_binding
+# XR_DXR_win32_window_binding
 
 | Property | Value |
 |----------|-------|
-| Extension Name | `XR_EXT_win32_window_binding` |
+| Extension Name | `XR_DXR_win32_window_binding` |
 | Spec Version | 8 |
-| Type Values | `XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT` (1000999001), `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT` (1000999002) |
+| Type Values | `XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR` (1004999001), `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR` (1004999002) |
 | Author | Leia Inc. |
 | Platform | Windows (Win32). Linux/Android reserved for future use. |
 
@@ -12,7 +12,7 @@
 
 ## 1. Overview
 
-`XR_EXT_win32_window_binding` allows an OpenXR application to provide its own window handle (HWND on Windows) to the runtime when creating a session. When present, the runtime renders into the application's window instead of creating its own, and the application retains control of input, lifecycle, and the message pump. The extension also defines `XrCompositionLayerWindowSpaceEXT`, a composition layer type positioned in fractional window coordinates for HUD/UI overlays that scale automatically with the window.
+`XR_DXR_win32_window_binding` allows an OpenXR application to provide its own window handle (HWND on Windows) to the runtime when creating a session. When present, the runtime renders into the application's window instead of creating its own, and the application retains control of input, lifecycle, and the message pump. The extension also defines `XrCompositionLayerWindowSpaceDXR`, a composition layer type positioned in fractional window coordinates for HUD/UI overlays that scale automatically with the window.
 
 The target use case is **desktop 3D light field displays** (autostereoscopic monitors) where the user interacts via keyboard, mouse, and gamepad rather than VR controllers.
 
@@ -103,7 +103,7 @@ This is why the extension requires the actual **window handle** (HWND), not just
 
 - The display processor needs to query the window's screen-space position each frame to compute the correct interlacing origin
 - Some advanced vendor display processors go further: they hook `WM_WINDOWPOSCHANGING` on the HWND to **snap** window drag positions to phase-aligned coordinates, preventing crosstalk jitter during drag. This is an optional vendor optimization — without it, 3D quality degrades during drag but is correct at rest. (For one vendor's implementation, see [Leia window phase snapping](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/docs/window-phase-snapping.md).)
-- For `_texture` apps where the 3D canvas is a sub-rect of the window (e.g., a 3D viewport surrounded by 2D UI), the canvas offset and size of each 3D zone (declared via [`XR_EXT_display_zones`](XR_EXT_display_zones.md)) flow through the compositor to the display processor's `process_atlas()` call as `canvas_offset_x/y` and `canvas_width/height`, enabling correct phase alignment without any hidden windows. The app's real HWND is passed directly to the display processor at init time.
+- For `_texture` apps where the 3D canvas is a sub-rect of the window (e.g., a 3D viewport surrounded by 2D UI), the canvas offset and size of each 3D zone (declared via [`XR_DXR_display_zones`](XR_DXR_display_zones.md)) flow through the compositor to the display processor's `process_atlas()` call as `canvas_offset_x/y` and `canvas_width/height`, enabling correct phase alignment without any hidden windows. The app's real HWND is passed directly to the display processor at init time.
 
 A texture handle or screen coordinate alone would not allow the display processor to track position changes or hook window messages.
 
@@ -111,7 +111,7 @@ A texture handle or screen coordinate alone would not allow the display processo
 
 In standard OpenXR, every composition layer is positioned in 3D space relative to a reference space. "Window coordinates" have no meaning because the runtime may not even have a window.
 
-When a session is created with `XR_EXT_win32_window_binding`, a contract is established: a window exists, it has pixel dimensions, and those dimensions are known to the runtime. This makes fractional window coordinates meaningful and allows `XrCompositionLayerWindowSpaceEXT` to position a HUD overlay as "30% from the left edge, 70% of the window width" — coordinates that automatically adapt when the window is resized.
+When a session is created with `XR_DXR_win32_window_binding`, a contract is established: a window exists, it has pixel dimensions, and those dimensions are known to the runtime. This makes fractional window coordinates meaningful and allows `XrCompositionLayerWindowSpaceDXR` to position a HUD overlay as "30% from the left edge, 70% of the window width" — coordinates that automatically adapt when the window is resized.
 
 The two concepts are inseparable: window-space layers only make sense when there is a window, and session targeting is what guarantees there is one.
 
@@ -122,11 +122,11 @@ The two concepts are inseparable: window-space layers only make sense when there
 ### 3.1 Defines
 
 ```c
-#define XR_EXT_win32_window_binding                          1
-#define XR_EXT_win32_window_binding_SPEC_VERSION             8
-#define XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME           "XR_EXT_win32_window_binding"
-#define XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT         ((XrStructureType)1000999001)
-#define XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT     ((XrStructureType)1000999002)
+#define XR_DXR_win32_window_binding                          1
+#define XR_DXR_win32_window_binding_SPEC_VERSION             8
+#define XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME           "XR_DXR_win32_window_binding"
+#define XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR         ((XrStructureType)1004999001)
+#define XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR     ((XrStructureType)1004999002)
 ```
 
 **Spec version history:**
@@ -138,13 +138,13 @@ The two concepts are inseparable: window-space layers only make sense when there
 | 5 | `chromaKeyColor` — optional app-supplied chroma-key override. `0` = runtime DP picks its own default. |
 | 6 | `xrSetSharedTextureSurround2DEXT` — register a full-window 2D shared texture for the non-canvas region. Enables apps with a fixed 3D zone (sub-rect canvas) to deliver full-resolution 2D content for the surrounding area. See [§3.6](#36-xrsetsharedtexturesurround2dext). |
 | 7 | `xrSetSharedTextureSurround2DFenceEXT` — D3D12 variant of §3.6 that uses `ID3D12Fence` for producer→consumer sync. D3D12-native shared resources do not reliably expose `IDXGIKeyedMutex`, so the spec-v6 API does not work for D3D12 apps. *(Removed in v8.)* |
-| 8 | Removed `xrSetSharedTextureOutputRectEXT` + `xrSetSharedTextureSurround2DEXT` + `xrSetSharedTextureSurround2DFenceEXT` — superseded by [`XR_EXT_display_zones`](XR_EXT_display_zones.md) (ADR-031). See [`docs/roadmap/surround-zones-deprecation.md`](../../roadmap/surround-zones-deprecation.md). |
+| 8 | Removed `xrSetSharedTextureOutputRectDXR` + `xrSetSharedTextureSurround2DEXT` + `xrSetSharedTextureSurround2DFenceEXT` — superseded by [`XR_DXR_display_zones`](XR_DXR_display_zones.md) (ADR-031). See [`docs/roadmap/surround-zones-deprecation.md`](../../roadmap/surround-zones-deprecation.md). |
 
-### 3.2 XrWin32WindowBindingCreateInfoEXT
+### 3.2 XrWin32WindowBindingCreateInfoDXR
 
 ```c
-typedef struct XrWin32WindowBindingCreateInfoEXT {
-    XrStructureType             type;                          // Must be XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT
+typedef struct XrWin32WindowBindingCreateInfoDXR {
+    XrStructureType             type;                          // Must be XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR
     const void* XR_MAY_ALIAS    next;                          // Pointer to next structure in chain
     void*                       windowHandle;                  // HWND of the app's window, or NULL
     PFN_xrReadbackCallback      readbackCallback;              // Offscreen readback callback, or NULL
@@ -152,7 +152,7 @@ typedef struct XrWin32WindowBindingCreateInfoEXT {
     void*                       sharedTextureHandle;           // Shared D3D11/D3D12 texture HANDLE, or NULL
     XrBool32                    transparentBackgroundEnabled;  // SPEC v4: transparent desktop composition opt-in
     uint32_t                    chromaKeyColor;                // SPEC v5: optional chroma-key override (0x00BBGGRR), 0 = DP picks
-} XrWin32WindowBindingCreateInfoEXT;
+} XrWin32WindowBindingCreateInfoDXR;
 ```
 
 **Chaining:** This structure is placed in the `next` chain of `XrSessionCreateInfo` (via the graphics binding's `next` pointer).
@@ -161,7 +161,7 @@ typedef struct XrWin32WindowBindingCreateInfoEXT {
 
 | Field | Description |
 |-------|-------------|
-| `type` | Must be `XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT` |
+| `type` | Must be `XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR` |
 | `next` | `NULL` or pointer to next structure in chain |
 | `windowHandle` | App's window handle (`HWND`). **Required for all modes that need correct interlacing** — the display processor uses it to determine screen-space position (see [§2.4](#24-the-phase-alignment-problem)). Must remain valid for the session's lifetime. |
 | `readbackCallback` | If non-NULL, the runtime delivers composited RGBA pixels via this callback each frame (CPU offscreen mode). |
@@ -175,12 +175,12 @@ typedef struct XrWin32WindowBindingCreateInfoEXT {
 | Mode | `windowHandle` | `sharedTextureHandle` | App class | Behavior |
 |------|:-:|:-:|---|---|
 | **Handle** | HWND | NULL | `_handle` | Runtime renders directly into the app's window |
-| **Texture** | HWND | HANDLE | `_texture` | Runtime composites the multi-zone result (3D zones + Local2D zones, declared via [`XR_EXT_display_zones`](XR_EXT_display_zones.md)) into the shared texture. The HWND is still required — the display processor needs it for screen-space position tracking and phase alignment. The app blits the shared texture into its window. |
+| **Texture** | HWND | HANDLE | `_texture` | Runtime composites the multi-zone result (3D zones + Local2D zones, declared via [`XR_DXR_display_zones`](XR_DXR_display_zones.md)) into the shared texture. The HWND is still required — the display processor needs it for screen-space position tracking and phase alignment. The app blits the shared texture into its window. |
 | **Offscreen** | NULL | NULL | — | `readbackCallback` receives composited pixels. No window, no phase alignment. |
 
 > **Important for `_texture` apps:** You **must** provide a valid `windowHandle` even though the runtime renders into the shared texture, not the window. Without the HWND, the display processor cannot compute correct interlacing alignment (see [§2.4](#24-the-phase-alignment-problem)).
 >
-> **Expressing 2D/3D regions:** Where the 3D canvas appears within the window — and any 2D regions around it — is declared via [`XR_EXT_display_zones`](XR_EXT_display_zones.md): one `XrDisplayZoneEXT` per 3D region and one `XrCompositionLayerLocal2DEXT` per 2D region. The runtime composites all zones into the shared texture and the app presents the full composite. (The legacy `xrSetSharedTextureOutputRectEXT` / surround entry points were removed in spec v8 — see [§3.5](#35-region-expression--removed-in-v8-use-xr_ext_display_zones).)
+> **Expressing 2D/3D regions:** Where the 3D canvas appears within the window — and any 2D regions around it — is declared via [`XR_DXR_display_zones`](XR_DXR_display_zones.md): one `XrDisplayZoneDXR` per 3D region and one `XrCompositionLayerLocal2DDXR` per 2D region. The runtime composites all zones into the shared texture and the app presents the full composite. (The legacy `xrSetSharedTextureOutputRectDXR` / surround entry points were removed in spec v8 — see [§3.5](#35-region-expression--removed-in-v8-use-xr_ext_display_zones).)
 
 **Fallback when absent:**
 
@@ -251,11 +251,11 @@ present from the topology.
 | OpenGL | `CreateSwapChainForComposition` + `DXGI_ALPHA_MODE_PREMULTIPLIED` + `IDCompositionTarget`, bridged from GL via `WGL_NV_DX_interop2`. The GL native compositor weaves into an **off-screen interop transit texture** (the proven `_texture`-app interop path), then a **D3D11 fullscreen-triangle shader blit** copies it into the flip-model DComp back buffer (an RTV write) → `Present` + `Commit`. This sidesteps the PR #3b failure, where the DP wove directly into the flip-model back buffer via interop and produced no visible content (the known `WGL_NV_DX_interop2`-into-flip-model incompatibility — `CopyResource` into that back buffer failed too, but RTV writes work). The vendor GL DP runs chroma-key fill+strip around its weaving stage (driven by `set_chroma_key`). Gated on an app-provided HWND with `WS_EX_NOREDIRECTIONBITMAP`; runtime-hosted GL windows are not yet covered. Falls back to opaque `SwapBuffers` if `WGL_NV_DX_interop2`/DComp are unavailable. | Shipping. |
 | Metal (macOS) | `CAMetalLayer.isOpaque = NO` + `NSWindow` non-opaque. App is responsible for the `NSWindow.opaque` flag. | Shipping (PR #4). |
 
-### 3.3 XrCompositionLayerWindowSpaceEXT
+### 3.3 XrCompositionLayerWindowSpaceDXR
 
 ```c
-typedef struct XrCompositionLayerWindowSpaceEXT {
-    XrStructureType             type;       // Must be XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT
+typedef struct XrCompositionLayerWindowSpaceDXR {
+    XrStructureType             type;       // Must be XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR
     const void* XR_MAY_ALIAS    next;       // Pointer to next structure in chain
     XrCompositionLayerFlags     layerFlags; // e.g. XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
     XrSwapchainSubImage         subImage;   // Source swapchain + rect
@@ -264,14 +264,14 @@ typedef struct XrCompositionLayerWindowSpaceEXT {
     float                       width;      // Fraction of window width  [0..1]
     float                       height;     // Fraction of window height [0..1]
     float                       disparity;  // Horizontal shift, fraction of window width
-} XrCompositionLayerWindowSpaceEXT;
+} XrCompositionLayerWindowSpaceDXR;
 ```
 
 **Fields:**
 
 | Field | Description |
 |-------|-------------|
-| `type` | Must be `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT` |
+| `type` | Must be `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR` |
 | `next` | `NULL` or pointer to next structure in chain |
 | `layerFlags` | Standard composition layer flags. Use `XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT` for alpha-blended overlays. |
 | `subImage` | Identifies the source swapchain, image index, and sub-rectangle to sample from |
@@ -279,7 +279,7 @@ typedef struct XrCompositionLayerWindowSpaceEXT {
 | `width`, `height` | Size of the layer as a fraction of the window dimensions |
 | `disparity` | Horizontal pixel shift between left and right eye views, expressed as a fraction of window width. `0.0` = at screen depth, negative values push toward the viewer |
 
-**Validity requirement:** The session must have been created with `XrWin32WindowBindingCreateInfoEXT` providing a valid window handle. Submitting this layer type on a session without a target window is undefined behavior.
+**Validity requirement:** The session must have been created with `XrWin32WindowBindingCreateInfoDXR` providing a valid window handle. Submitting this layer type on a session without a target window is undefined behavior.
 
 **Rendering behavior:**
 
@@ -333,21 +333,21 @@ struct xrt_layer_window_space_data
 
 **`xrt_comp_layer_window_space()`** — Inline helper (`src/xrt/include/xrt/xrt_compositor.h:1865`) that dispatches a window-space layer through the compositor's vtable.
 
-### 3.5 Region expression — REMOVED in v8 (use `XR_EXT_display_zones`)
+### 3.5 Region expression — REMOVED in v8 (use `XR_DXR_display_zones`)
 
 > **Removed in spec v8 (ADR-031).** The three shared-texture region entry points —
-> `xrSetSharedTextureOutputRectEXT`, `xrSetSharedTextureSurround2DEXT`, and
+> `xrSetSharedTextureOutputRectDXR`, `xrSetSharedTextureSurround2DEXT`, and
 > `xrSetSharedTextureSurround2DFenceEXT` — and the bespoke 2D-surround / output-rect
-> mechanism are **deleted**. [`XR_EXT_display_zones`](XR_EXT_display_zones.md) is now the
+> mechanism are **deleted**. [`XR_DXR_display_zones`](XR_DXR_display_zones.md) is now the
 > sole paradigm for expressing 2D/3D regions, including the degenerate single-region cases
 > these calls used to cover:
 >
-> - the former **output rect** is exactly **one 3D zone** (`XrDisplayZoneEXT`) covering that
+> - the former **output rect** is exactly **one 3D zone** (`XrDisplayZoneDXR`) covering that
 >   sub-rect, and
-> - the former **2D surround** is exactly **one `XrCompositionLayerLocal2DEXT` zone** covering
+> - the former **2D surround** is exactly **one `XrCompositionLayerLocal2DDXR` zone** covering
 >   the complement.
 >
-> See the degenerate single-zone mapping in [`XR_EXT_display_zones` §6](XR_EXT_display_zones.md)
+> See the degenerate single-zone mapping in [`XR_DXR_display_zones` §6](XR_DXR_display_zones.md)
 > for the exact translation, and
 > [`docs/roadmap/surround-zones-deprecation.md`](../../roadmap/surround-zones-deprecation.md)
 > for the deprecation history. Display-zones is the canonical, more general mechanism (N 3D
@@ -370,9 +370,9 @@ HWND myWindow = CreateWindowEx(
     NULL, NULL, hInstance, NULL);
 ShowWindow(myWindow, SW_SHOW);
 
-// 2. Chain XrWin32WindowBindingCreateInfoEXT to xrCreateSession
-XrWin32WindowBindingCreateInfoEXT targetInfo = {
-    .type = XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT,
+// 2. Chain XrWin32WindowBindingCreateInfoDXR to xrCreateSession
+XrWin32WindowBindingCreateInfoDXR targetInfo = {
+    .type = XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR,
     .next = NULL,
     .windowHandle = (void*)myWindow,
 };
@@ -442,8 +442,8 @@ xrCreateSwapchain(session, &hudSwapchainInfo, &hudSwapchain);
 // Each frame: render text into HUD swapchain, then submit both layers
 XrCompositionLayerProjection projLayer = { /* ... 3D scene ... */ };
 
-XrCompositionLayerWindowSpaceEXT hudLayer = {
-    .type = XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT,
+XrCompositionLayerWindowSpaceDXR hudLayer = {
+    .type = XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR,
     .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
     .subImage = {
         .swapchain = hudSwapchain,
@@ -515,7 +515,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 ### 4.4 Fallback Behavior
 
-When the `XrWin32WindowBindingCreateInfoEXT` structure is absent from the `next` chain (or `windowHandle` is NULL), the runtime uses its pre-existing behavior:
+When the `XrWin32WindowBindingCreateInfoDXR` structure is absent from the `next` chain (or `windowHandle` is NULL), the runtime uses its pre-existing behavior:
 
 | Condition | Render Path |
 |-----------|-------------|
@@ -535,14 +535,14 @@ End-to-end path from the application to the display:
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │  Application                                                          │
-│    xrCreateSession(XrWin32WindowBindingCreateInfoEXT { windowHandle })     │
+│    xrCreateSession(XrWin32WindowBindingCreateInfoDXR { windowHandle })     │
 │    xrEndFrame(projectionLayer + optional windowSpaceLayer)            │
 └────────────────────────────────┬─────────────────────────────────────┘
                                  |
                                  v
 ┌──────────────────────────────────────────────────────────────────────┐
 │  oxr_session.c : oxr_session_create()                                 │
-│    - Parses XrWin32WindowBindingCreateInfoEXT from next chain              │
+│    - Parses XrWin32WindowBindingCreateInfoDXR from next chain              │
 │    - Stores HWND in xrt_session_info.external_window_handle           │
 └────────────────────────────────┬─────────────────────────────────────┘
                                  |
@@ -695,7 +695,7 @@ Only size-dependent resources (stereo texture, SRV, RTV, depth texture, DSV) are
 | Quarter display | 0.25 | ~94% pixels |
 | Minimum (64x64) | Clamped | Maximum |
 
-**Single-swapchain path (ext apps):** The ext test apps create one swapchain at native display pixel resolution (`displayPixelWidth` x `displayPixelHeight` from `XR_EXT_display_info`) and render both stereo views side-by-side into it using viewport offsets. Both `projectionViews[0]` and `projectionViews[1]` reference the same swapchain with different `imageRect` offsets. When the runtime detects that both views reference the same swapchain and image index, it skips the internal SBS blit and passes the application's texture directly to the weaver. This eliminates one full-resolution GPU copy per frame.
+**Single-swapchain path (ext apps):** The ext test apps create one swapchain at native display pixel resolution (`displayPixelWidth` x `displayPixelHeight` from `XR_DXR_display_info`) and render both stereo views side-by-side into it using viewport offsets. Both `projectionViews[0]` and `projectionViews[1]` reference the same swapchain with different `imageRect` offsets. When the runtime detects that both views reference the same swapchain and image index, it skips the internal SBS blit and passes the application's texture directly to the weaver. This eliminates one full-resolution GPU copy per frame.
 
 ### 5.7 Lenticular Phase-Aligned Window Snapping
 
@@ -803,7 +803,7 @@ The D3D11 immediate device context is **single-threaded by design**. Application
 
 | File | Purpose |
 |------|---------|
-| `src/external/openxr_includes/openxr/XR_EXT_win32_window_binding.h` | Extension header: struct definitions, type constants, defines |
+| `src/external/openxr_includes/openxr/XR_DXR_win32_window_binding.h` | Extension header: struct definitions, type constants, defines |
 
 ### Core Interfaces
 
@@ -816,8 +816,8 @@ The D3D11 immediate device context is **single-threaded by design**. Application
 
 | File | Purpose |
 |------|---------|
-| `src/xrt/state_trackers/oxr/oxr_session.c` | Parses `XrWin32WindowBindingCreateInfoEXT`, window-adaptive Kooima FOV, eye tracking integration |
-| `src/xrt/state_trackers/oxr/oxr_session_frame_end.c` | Handles `XrCompositionLayerWindowSpaceEXT` submission |
+| `src/xrt/state_trackers/oxr/oxr_session.c` | Parses `XrWin32WindowBindingCreateInfoDXR`, window-adaptive Kooima FOV, eye tracking integration |
+| `src/xrt/state_trackers/oxr/oxr_session_frame_end.c` | Handles `XrCompositionLayerWindowSpaceDXR` submission |
 | `src/xrt/state_trackers/oxr/oxr_session_gfx_d3d11_native.c` | D3D11 native session creation path |
 | `src/xrt/state_trackers/oxr/oxr_extension_support.h` | Extension registration |
 
@@ -884,7 +884,7 @@ the [`displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin
 
 | Directory | Description |
 |-----------|-------------|
-| `test_apps/handle/cube_handle_d3d11_win/` | D3D11 test app using `XR_EXT_win32_window_binding` with WM_PAINT drag handling |
+| `test_apps/handle/cube_handle_d3d11_win/` | D3D11 test app using `XR_DXR_win32_window_binding` with WM_PAINT drag handling |
 | `test_apps/handle/cube_handle_vk_win/` | Vulkan variant |
 | `test_apps/handle/cube_handle_gl_win/` | OpenGL variant |
 | `test_apps/handle/cube_handle_d3d12_win/` | D3D12 variant |
@@ -899,19 +899,19 @@ the [`displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin
 
 - **Multi-app simultaneous testing** — Validate two per-session apps rendering to different windows at the same time
 - **Async weaving** — Replace `vkQueueWaitIdle()` with fence-based synchronization for better throughput
-- **WebXR / browser integration** — Browser passes canvas backing surface as window handle via `XR_EXT_win32_window_binding`; requires browser vendor cooperation
+- **WebXR / browser integration** — Browser passes canvas backing surface as window handle via `XR_DXR_win32_window_binding`; requires browser vendor cooperation
 - **Linux / Android platform support** — Extend `windowHandle` to accept XCB/Wayland/ANativeWindow handles
-- **Khronos standardization** — Propose `XR_EXT_win32_window_binding` for inclusion in the OpenXR specification
+- **Khronos standardization** — Propose `XR_DXR_win32_window_binding` for inclusion in the OpenXR specification
 
 ### 9.2 Forward-compatibility roadmap (additive only)
 
 The current API surface is intentionally minimal: a window handle, an optional shared texture, and a canvas rect with a symmetric read-back contract. We expect this to remain the public contract indefinitely. The items below describe **possible additive extensions** that future display vendors might motivate. None of them break existing apps; each is either a new function, a new `next`-chain struct, or a new field with a back-compatible default.
 
-- **DPI / monitor hint** — A vendor whose weaver depends on physical pixel density (beyond what `GetDpiForWindow(HWND)` already conveys) could attach an `XrDisplayMonitorHintEXT` struct to the next chain of `XrWin32WindowBindingCreateInfoEXT`. Default behaviour stays as today: runtime queries DPI from the HWND's monitor.
+- **DPI / monitor hint** — A vendor whose weaver depends on physical pixel density (beyond what `GetDpiForWindow(HWND)` already conveys) could attach an `XrDisplayMonitorHintEXT` struct to the next chain of `XrWin32WindowBindingCreateInfoDXR`. Default behaviour stays as today: runtime queries DPI from the HWND's monitor.
 
 - **Async readiness signal for shared textures** — A vendor that needs the runtime to wait on a sync primitive (fence, keyed mutex, IOSurface-style sync) before reading the shared texture could declare a sync object via a `next`-chain struct. Today's contract is "app must have finished writing before submitting the frame"; this would let vendors opt into stricter ordering. Apps that don't supply one keep working.
 
-- **Multi-canvas / picture-in-picture** — multiple disjoint 3D canvas rects, each with its own per-rect Kooima parameters, are expressed today via multiple `XrDisplayZoneEXT` 3D zones under [`XR_EXT_display_zones`](XR_EXT_display_zones.md). Single-canvas apps simply declare one zone.
+- **Multi-canvas / picture-in-picture** — multiple disjoint 3D canvas rects, each with its own per-rect Kooima parameters, are expressed today via multiple `XrDisplayZoneDXR` 3D zones under [`XR_DXR_display_zones`](XR_DXR_display_zones.md). Single-canvas apps simply declare one zone.
 
 - **Per-canvas rendering hints** — Eventually we may want to mark canvases with usage hints (`PRIMARY_3D`, `OVERLAY_2D`, `READBACK_ONLY`) so the runtime can pick a fast path on a per-canvas basis. Optional, defaulted.
 
@@ -924,5 +924,5 @@ These directions are listed for transparency about where the API could evolve. *
 These are guarantees current apps and vendors can rely on:
 
 - The window handle / view handle is the runtime's source of truth for screen-space position. Phase, DPI, and monitor routing flow from it.
-- Zone canvas coordinates (`XrDisplayZoneEXT` under [`XR_EXT_display_zones`](XR_EXT_display_zones.md)) are in HWND/NSView client-area pixels. They are never re-interpreted by the runtime as fractional, normalized, or screen coordinates.
+- Zone canvas coordinates (`XrDisplayZoneDXR` under [`XR_DXR_display_zones`](XR_DXR_display_zones.md)) are in HWND/NSView client-area pixels. They are never re-interpreted by the runtime as fractional, normalized, or screen coordinates.
 - Vendor-specific weaving lives in the vendor's display processor (see [ADR-007](../../adr/ADR-007-compositor-never-weaves.md)). Apps and runtime compositors are vendor-blind.

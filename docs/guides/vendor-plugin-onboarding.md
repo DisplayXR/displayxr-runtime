@@ -219,7 +219,7 @@ If it doesn't, document the SDK as a hard prereq in your installer's pre-install
 
 `xrt_plugin_display_info.supported_eye_tracking_modes` is a bitmask:
 - bit 0 (`0x1`) — `MANAGED` (vendor SDK predicts eye positions; the runtime queries them per frame)
-- bit 1 (`0x2`) — `MANUAL` (the app submits eye positions via `XR_EXT_display_info`)
+- bit 1 (`0x2`) — `MANUAL` (the app submits eye positions via `XR_DXR_display_info`)
 
 Declare both bits if your SDK supports both modes; declare just one if not. A typical hardware DP is `MANAGED`-only. Declare `0` if your display has no eye tracker at all — sim-display does this (its positions are nominal, not tracked). The `default_eye_tracking_mode` field picks which mode the runtime uses for sessions that don't explicitly opt in.
 
@@ -235,7 +235,7 @@ bitmask in the **vendor-provided (MUST set)** section:
 
 The runtime forces the app-visible `isTracking` to false whenever the active mode is
 untracked, and surfaces the flag to apps via the chained
-`XrDisplayRenderingModeTrackingInfoEXT` (header v14). **Consistency rule:**
+`XrDisplayRenderingModeTrackingInfoDXR` (header v14). **Consistency rule:**
 `supported_eye_tracking_modes != 0` ⇔ at least one mode sets `HAS_TRACKING` — the runtime
 logs a one-shot WARN at init if violated. Full contract:
 `docs/specs/vendor/eye-tracking-modes.md`.
@@ -292,6 +292,6 @@ Document your implementation internals in your plug-in repo's `docs/`, then add 
 - [Plug-in iface reference](../reference/xrt_plugin_iface.md) — per-method contract for `xrt_plugin_iface`
 - [Plug-in discovery spec](../specs/runtime/plugin-discovery.md) — registry / JSON manifest formats, env var overrides
 - [ADR-019](../adr/ADR-019-vendor-plugin-aux-boundary.md) — why the runtime DLL holds zero vendor identifiers and how the aux import-library boundary works
-- [`XR_EXT_display_info` spec](../specs/extensions/XR_EXT_display_info.md) — display info + eye-tracking mode contract
+- [`XR_DXR_display_info` spec](../specs/extensions/XR_DXR_display_info.md) — display info + eye-tracking mode contract
 - [Eye tracking modes spec](../specs/vendor/eye-tracking-modes.md) — MANAGED vs MANUAL contract
 - [Legacy in-tree integration model](../archive/vendor-integration-historical.md) — historical reference for the pre-#263 in-tree integration shape

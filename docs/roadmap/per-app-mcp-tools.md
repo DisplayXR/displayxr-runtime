@@ -1,7 +1,7 @@
 # Per-App MCP Tools & Workspace Aggregator
 
 **Status:** design draft (June 2026). Pre-implementation.
-**Scope:** three repos — `displayxr-mcp` (framework v0.4.0 + adapter aggregator), `displayxr-runtime` (new `XR_EXT_mcp_tools` extension + Phase A tool tagging), `displayxr-shell-pvt` (tool tagging + `list_windows` pid). Plus an additive amendment to the [app manifest spec](../specs/runtime/displayxr-app-manifest.md) (§3.4 `id`).
+**Scope:** three repos — `displayxr-mcp` (framework v0.4.0 + adapter aggregator), `displayxr-runtime` (new `XR_DXR_mcp_tools` extension + Phase A tool tagging), `displayxr-shell-pvt` (tool tagging + `list_windows` pid). Plus an additive amendment to the [app manifest spec](../specs/runtime/displayxr-app-manifest.md) (§3.4 `id`).
 **Audience:** runtime contributors; app/demo authors who want agent-drivable apps; Unity/Unreal plugin owners.
 **Builds on:** the post-extraction MCP architecture (Phase A handle-app introspection in `oxr_mcp_tools.c`, Phase B workspace tools in shell-pvt, named-pipe-per-host topology, `Capabilities\MCP` registry gate).
 
@@ -67,7 +67,7 @@ workspace__<tool-name>       workspace__list_apps      (aggregator built-ins)
 The prefix is the app's **id**, a stable machine slug matching `^[a-z0-9][a-z0-9-]{0,31}$`:
 
 - **Declared in the manifest** as the new optional `id` field ([manifest spec §3.4](../specs/runtime/displayxr-app-manifest.md)) — so launchers and agents know it pre-launch.
-- **Declared at runtime** via `xrSetMCPAppInfoEXT` (§4) — the **authoritative** value; no filesystem lookup, works for registered-mode manifests (which do NOT sit next to the exe), works for engine apps (the Unity plugin fills it from its manifest-settings asset).
+- **Declared at runtime** via `xrSetMCPAppInfoDXR` (§4) — the **authoritative** value; no filesystem lookup, works for registered-mode manifests (which do NOT sit next to the exe), works for engine apps (the Unity plugin fills it from its manifest-settings asset).
 - `scripts/check_displayxr_app.py` gains an INV rule asserting the two match.
 
 Rejected alternatives: slugified `name` (display names are mutable branding, slugification is unstable); runtime reading the sidecar manifest (breaks for registered mode; pushes launcher-domain manifest knowledge into the runtime DLL — a layering violation); reverse-DNS ids (`com-displayxr-mediaplayer__play_pause` burns agent context for no benefit at this ecosystem size).
@@ -88,28 +88,28 @@ Pid-in-every-prefix was rejected: unambiguous but churns the tool list on every 
 
 ---
 
-## 4. Axis 1 — `XR_EXT_mcp_tools` (app-defined tools)
+## 4. Axis 1 — `XR_DXR_mcp_tools` (app-defined tools)
 
 ### 4.1 API sketch
 
 ```c
 // Once per session, before registering tools. appId matches manifest `id`.
-typedef struct XrMCPAppInfoEXT {
-    XrStructureType    type;                 // XR_TYPE_MCP_APP_INFO_EXT
+typedef struct XrMCPAppInfoDXR {
+    XrStructureType    type;                 // XR_TYPE_MCP_APP_INFO_DXR
     const void        *next;
     char               appId[32];            // ^[a-z0-9][a-z0-9-]{0,31}$
-} XrMCPAppInfoEXT;
-XrResult xrSetMCPAppInfoEXT(XrSession session, const XrMCPAppInfoEXT *info);
+} XrMCPAppInfoDXR;
+XrResult xrSetMCPAppInfoDXR(XrSession session, const XrMCPAppInfoDXR *info);
 
-typedef struct XrMCPToolInfoEXT {
-    XrStructureType    type;                 // XR_TYPE_MCP_TOOL_INFO_EXT
+typedef struct XrMCPToolInfoDXR {
+    XrStructureType    type;                 // XR_TYPE_MCP_TOOL_INFO_DXR
     const void        *next;
     const char        *name;                 // bare name; runtime/aggregator prefixes
     const char        *description;          // shown to the agent — write it well
     const char        *inputSchemaJson;      // JSON Schema (object), UTF-8
-} XrMCPToolInfoEXT;
-XrResult xrRegisterMCPToolEXT(XrSession session, const XrMCPToolInfoEXT *tool);
-XrResult xrUnregisterMCPToolEXT(XrSession session, const char *name);
+} XrMCPToolInfoDXR;
+XrResult xrRegisterMCPToolDXR(XrSession session, const XrMCPToolInfoDXR *tool);
+XrResult xrUnregisterMCPToolDXR(XrSession session, const char *name);
 ```
 
 ### 4.2 Dispatch: event queue, not callbacks
@@ -118,22 +118,22 @@ The MCP transport thread never calls into app code. Tool invocations ride OpenXR
 
 ```c
 // Event payloads are fixed-size, so args use the OpenXR two-call idiom.
-typedef struct XrEventDataMCPToolCallEXT {
-    XrStructureType    type;                 // XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_EXT
+typedef struct XrEventDataMCPToolCallDXR {
+    XrStructureType    type;                 // XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_DXR
     const void        *next;
     XrSession          session;
     uint64_t           callId;
     char               toolName[64];
     uint32_t           argsSize;             // bytes incl. NUL
-} XrEventDataMCPToolCallEXT;
+} XrEventDataMCPToolCallDXR;
 
-XrResult xrGetMCPToolCallArgsEXT(XrSession session, uint64_t callId,
+XrResult xrGetMCPToolCallArgsDXR(XrSession session, uint64_t callId,
                                  uint32_t capacity, uint32_t *countOutput, char *buffer);
-XrResult xrSubmitMCPToolResultEXT(XrSession session, uint64_t callId,
+XrResult xrSubmitMCPToolResultDXR(XrSession session, uint64_t callId,
                                   XrBool32 success, const char *resultJson);
 ```
 
-Flow: transport thread receives `tools/call` → trampoline enqueues the request, parks the JSON-RPC id pending → app sees the event in its normal `xrPollEvent` pump → executes → `xrSubmitMCPToolResultEXT` completes the pending request. MCP is async JSON-RPC; a parked request costs nothing.
+Flow: transport thread receives `tools/call` → trampoline enqueues the request, parks the JSON-RPC id pending → app sees the event in its normal `xrPollEvent` pump → executes → `xrSubmitMCPToolResultDXR` completes the pending request. MCP is async JSON-RPC; a parked request costs nothing.
 
 ### 4.3 Lifecycle & failure rules
 
@@ -155,7 +155,7 @@ With ~12 Phase A tools per app process, shell + 4 apps ≈ 60 tools, mostly four
 ```c
 enum mcp_tool_group {
     MCP_TOOL_GROUP_DIAGNOSTIC = 0,   // Phase A introspection, selftest, tail_log
-    MCP_TOOL_GROUP_APP        = 1,   // registered via XR_EXT_mcp_tools
+    MCP_TOOL_GROUP_APP        = 1,   // registered via XR_DXR_mcp_tools
     MCP_TOOL_GROUP_WORKSPACE  = 2,   // shell Phase B
     MCP_TOOL_GROUP_CAPTURE    = 3,   // capture_frame — the verification primitive
 };
@@ -249,7 +249,7 @@ Unchanged trust model. App tools execute **in the app, with the app's privileges
 | Phase | Repo | Deliverable | Usable result |
 |---|---|---|---|
 | **P0** | `displayxr-mcp` | v0.4.0: list_changed, groups, multi-instance, aggregator (§7) | One-connection shell + Phase A aggregation, today's tools |
-| **P1** | `displayxr-runtime` | `XR_EXT_mcp_tools` (spec + impl + header sync), Phase A tools tagged `DIAGNOSTIC`/`CAPTURE`, re-pin v0.4.0; manifest spec §3.4; linter INV rule | Apps define tools; reachable via `--target pid:N` and the aggregator |
+| **P1** | `displayxr-runtime` | `XR_DXR_mcp_tools` (spec + impl + header sync), Phase A tools tagged `DIAGNOSTIC`/`CAPTURE`, re-pin v0.4.0; manifest spec §3.4; linter INV rule | Apps define tools; reachable via `--target pid:N` and the aggregator |
 | **P1′** | shell-pvt | Tag tools `WORKSPACE`/`CAPTURE`; `list_windows` + pid; re-pin v0.4.0 | Clean default exposure |
 | **P2** | demos | `displayxr-demo-mediaplayer` (play_pause, open_file, seek, slideshow) + model-viewer demo (load_model, rotate, list/run animations) adopt the extension | The agent-drives-the-workspace demo |
 | **P3** | runtime + Unity plugin | Declarative `mcp` manifest block (pre-launch tool discovery); C# binding | Engine apps + launcher-visible tooling |
@@ -258,7 +258,7 @@ P0 → P1 order is hard (P1 re-pins v0.4.0); P1 vs P1′ is parallel; P2 needs P
 
 ## 10. Open questions
 
-1. **Per-tool timeout override** — `next`-chained on `XrMCPToolInfoEXT`, or a fixed 5 s until proven insufficient? (Lean: fixed until a real tool needs more; `load_model` on a big file is the likely first customer.)
+1. **Per-tool timeout override** — `next`-chained on `XrMCPToolInfoDXR`, or a fixed 5 s until proven insufficient? (Lean: fixed until a real tool needs more; `load_model` on a big file is the likely first customer.)
 2. **Result size cap** — per-PID pipe already moves capture PNGs; do app tools get the same ceiling or a smaller one (app JSON results should be small; images should go through `capture_frame`)?
 3. **Aggregator exposure flips at runtime** — `workspace__expose_diagnostics` meta-tool vs restart-with-flag only. (Lean: flag only in P0; meta-tool if agents actually need it.)
 4. **`hosted` apps** — same extension works (session exists); confirm nothing in the hosted window path assumes no app event consumers.

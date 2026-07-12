@@ -17,7 +17,7 @@
 #define XR_USE_GRAPHICS_API_METAL
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-#include <openxr/XR_EXT_display_info.h>
+#include <openxr/XR_DXR_display_info.h>
 
 #include <cmath>
 #include <csignal>
@@ -695,8 +695,8 @@ struct AppXrSession {
     bool sessionRunning;
     bool exitRequested;
 
-    // Rendering mode enumeration (XR_EXT_display_info)
-    PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT = nullptr;
+    // Rendering mode enumeration (XR_DXR_display_info)
+    PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateDisplayRenderingModesEXT = nullptr;
     uint32_t displayPixelWidth = 0, displayPixelHeight = 0;
     uint32_t renderingModeCount = 0;
     uint32_t renderingModeTileColumns[8] = {};
@@ -733,7 +733,7 @@ static bool InitializeOpenXR(AppXrSession &app)
         LOG_INFO("  %s v%u", e.extensionName, e.extensionVersion);
         if (strcmp(e.extensionName, XR_KHR_METAL_ENABLE_EXTENSION_NAME) == 0)
             hasMetalEnable = true;
-        if (strcmp(e.extensionName, "XR_EXT_display_info") == 0)
+        if (strcmp(e.extensionName, "XR_DXR_display_info") == 0)
             hasDisplayInfoExt = true;
     }
 
@@ -745,7 +745,7 @@ static bool InitializeOpenXR(AppXrSession &app)
     // Create instance
     std::vector<const char*> enabledExts = {XR_KHR_METAL_ENABLE_EXTENSION_NAME};
     if (hasDisplayInfoExt)
-        enabledExts.push_back("XR_EXT_display_info");
+        enabledExts.push_back("XR_DXR_display_info");
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(createInfo.applicationInfo.applicationName, "MetalCubeOpenXR",
             XR_MAX_APPLICATION_NAME_SIZE);
@@ -766,7 +766,7 @@ static bool InitializeOpenXR(AppXrSession &app)
     // Query display pixel dimensions for swapchain sizing
     {
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
-        XrDisplayInfoEXT displayInfo = {XR_TYPE_DISPLAY_INFO_EXT};
+        XrDisplayInfoDXR displayInfo = {XR_TYPE_DISPLAY_INFO_DXR};
         sysProps.next = &displayInfo;
         if (XR_SUCCEEDED(xrGetSystemProperties(app.instance, app.systemId, &sysProps))) {
             app.displayPixelWidth = displayInfo.displayPixelWidth;
@@ -826,7 +826,7 @@ static bool CreateSession(AppXrSession &app, MetalRenderer &r)
     app.exitRequested = false;
 
     // Get rendering mode enumeration function pointer
-    xrGetInstanceProcAddr(app.instance, "xrEnumerateDisplayRenderingModesEXT",
+    xrGetInstanceProcAddr(app.instance, "xrEnumerateDisplayRenderingModesDXR",
         (PFN_xrVoidFunction*)&app.pfnEnumerateDisplayRenderingModesEXT);
 
     // Enumerate rendering modes for tile layout info
@@ -834,9 +834,9 @@ static bool CreateSession(AppXrSession &app, MetalRenderer &r)
         uint32_t modeCount = 0;
         XrResult enumRes = app.pfnEnumerateDisplayRenderingModesEXT(app.session, 0, &modeCount, nullptr);
         if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
-            std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
+            std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
             for (uint32_t i = 0; i < modeCount; i++) {
-                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
                 modes[i].next = nullptr;
             }
             enumRes = app.pfnEnumerateDisplayRenderingModesEXT(app.session, modeCount, &modeCount, modes.data());
@@ -977,15 +977,15 @@ static void PollEvents(AppXrSession &app)
             }
             break;
         }
-        case XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT: {
-            auto *rmc = (XrEventDataRenderingModeChangedEXT *)&event;
+        case XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
+            auto *rmc = (XrEventDataRenderingModeChangedDXR *)&event;
             app.currentModeIndex = rmc->currentModeIndex;
             LOG_INFO("Rendering mode changed: %u -> %u", rmc->previousModeIndex, rmc->currentModeIndex);
             break;
         }
-        case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT: {
+        case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR: {
             // Edge-triggered tracking loss/recovery (#441 v14) — log-only here.
-            auto *ets = (XrEventDataEyeTrackingStateChangedEXT *)&event;
+            auto *ets = (XrEventDataEyeTrackingStateChangedDXR *)&event;
             LOG_INFO("Eye tracking state changed: isTracking=%s mode=%u",
                 ets->isTracking == XR_TRUE ? "YES" : "NO", (uint32_t)ets->activeMode);
             break;

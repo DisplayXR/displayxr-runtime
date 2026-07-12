@@ -208,7 +208,7 @@ def build_rules(mapping):
 
     # 4. Struct-type numeric block relocation: Khronos extension #999 is
     #    unassigned and collidable; move to a high experimental block. Only
-    #    DisplayXR uses the 1000999xxx values, incl. hardcoded copies in
+    #    DisplayXR uses the 1004999xxx values, incl. hardcoded copies in
     #    non-C consumers (Unity C# bindings).
     old_blk = mapping["struct_type_block"]["old"]
     new_blk = mapping["struct_type_block"]["new"]

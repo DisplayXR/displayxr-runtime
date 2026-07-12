@@ -2,17 +2,17 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Cube Zones D3D12 — XR_EXT_display_zones exerciser (ADR-027),
+ * @brief  Cube Zones D3D12 — XR_DXR_display_zones exerciser (ADR-027),
  *         ARRAY / single-pass-instanced (SPI) stereo layout.
  *
  * Native-D3D12 HANDLE-class parity of cube_zones_d3d11_win: creates its own
- * HWND and passes it via XR_EXT_win32_window_binding (the runtime owns
+ * HWND and passes it via XR_DXR_win32_window_binding (the runtime owns
  * presentation), then submits TWO 3D display zones each frame — but, unlike
  * every existing cube_zones_* app (which tile the per-view images horizontally
  * inside a single-slice swapchain), this app uses the ARRAY layout:
  *
  *   - each zone owns ONE swapchain created with arraySize = 2, width = tileW,
- *     height = tileH (per-view size from xrGetDisplayZoneRecommendedViewSizeEXT);
+ *     height = tileH (per-view size from xrGetDisplayZoneRecommendedViewSizeDXR);
  *   - each swapchain image is a single ID3D12Resource with DepthOrArraySize==2;
  *   - view vi is rendered full-viewport into array slice vi via an RTV built
  *     with D3D12_RTV_DIMENSION_TEXTURE2DARRAY (FirstArraySlice=vi, ArraySize=1);
@@ -30,11 +30,11 @@
  *     0.6 + perspectiveFactor 0.5 (visibly different framing), spin phase
  *     +1.5 rad, fully-transparent clear (cube floats over the desktop).
  *
- * Wish mode is AUTO (XrDisplayZonesFrameEndInfoEXT chained with
+ * Wish mode is AUTO (XrDisplayZonesFrameEndInfoDXR chained with
  * wishMask = XR_NULL_HANDLE → the runtime auto-derives the wish from the zone
  * rects). Set DXR_ZONES_VALIDATE=1 to also chain the validate bit.
  *
- * When the runtime doesn't advertise XR_EXT_display_zones (P2 dev gate:
+ * When the runtime doesn't advertise XR_DXR_display_zones (P2 dev gate:
  * DISPLAYXR_ZONES=1) the app logs an error once and submits empty frames.
  */
 
@@ -63,7 +63,7 @@ using Microsoft::WRL::ComPtr;
 static const char* APP_NAME = "cube_zones_d3d12_win";
 
 static const wchar_t* WINDOW_CLASS = L"DXRCubeZonesD3D12Class";
-static const wchar_t* WINDOW_TITLE = L"D3D12 Cube Zones — XR_EXT_display_zones (array/SPI)";
+static const wchar_t* WINDOW_TITLE = L"D3D12 Cube Zones — XR_DXR_display_zones (array/SPI)";
 
 // Global state (main thread + render thread)
 static std::atomic<bool> g_running{true};
@@ -77,7 +77,7 @@ static RECT g_savedWindowRect = {};
 static DWORD g_savedWindowStyle = 0;
 
 // ---------------------------------------------------------------------------
-// XR_EXT_display_zones state
+// XR_DXR_display_zones state
 // ---------------------------------------------------------------------------
 
 static const uint32_t kNumZones = 2;
@@ -134,7 +134,7 @@ static bool ZonesValidateEnabled() {
 }
 
 // ---------------------------------------------------------------------------
-// XR_EXT_view_rig helpers (consume the runtime's render-ready XrView{pose,fov})
+// XR_DXR_view_rig helpers (consume the runtime's render-ready XrView{pose,fov})
 // ---------------------------------------------------------------------------
 
 // Per-view staging container (matrices column-major).
@@ -336,7 +336,7 @@ static bool CreateZoneResources(XrSessionManager& xr, D3D12Renderer& renderer,
     XrExtent2Di rec = {};
     XrResult r = g_zones.pfnGetViewSize(xr.session, &z.rect, &rec);
     if (XR_FAILED(r) || rec.width <= 0 || rec.height <= 0) {
-        LOG_ERROR("[zones] zone %u: xrGetDisplayZoneRecommendedViewSizeEXT failed (0x%x, %dx%d)",
+        LOG_ERROR("[zones] zone %u: xrGetDisplayZoneRecommendedViewSizeDXR failed (0x%x, %dx%d)",
                   z.zoneId, (unsigned)r, rec.width, rec.height);
         return false;
     }
@@ -418,10 +418,10 @@ static bool CreateZoneResources(XrSessionManager& xr, D3D12Renderer& renderer,
 static void TryActivateZones(XrSessionManager& xr, D3D12Renderer& renderer) {
     g_zonesAttempted = true;
 
-    XrDisplayZoneCapabilitiesEXT caps = {XR_TYPE_DISPLAY_ZONE_CAPABILITIES_EXT};
+    XrDisplayZoneCapabilitiesDXR caps = {XR_TYPE_DISPLAY_ZONE_CAPABILITIES_DXR};
     XrResult r = g_zones.pfnGetCaps(xr.session, &caps);
     if (XR_FAILED(r) || !caps.supported) {
-        LOG_ERROR("[zones] xrGetDisplayZoneCapabilitiesEXT: rc=0x%x supported=%d — zones path disabled",
+        LOG_ERROR("[zones] xrGetDisplayZoneCapabilitiesDXR: rc=0x%x supported=%d — zones path disabled",
                   (unsigned)r, (int)caps.supported);
         g_hasDisplayZonesExt = false;
         return;
@@ -521,22 +521,22 @@ static void RenderZonesFrame(XrSessionManager& xr, D3D12Renderer& renderer,
                              const XrFrameState& frameState) {
     // Per-zone locate + submit data. The zone structs are chained at BOTH
     // points (locate and xrEndFrame) — same instances within the frame.
-    XrDisplayZoneEXT zoneStructs[kNumZones];
-    XrDisplayRigEXT rigStructs[kNumZones];
+    XrDisplayZoneDXR zoneStructs[kNumZones];
+    XrDisplayRigDXR rigStructs[kNumZones];
     std::vector<XrCompositionLayerProjectionView> projViews[kNumZones];
     uint32_t submitViewCounts[kNumZones] = {};
 
     for (uint32_t zi = 0; zi < kNumZones; zi++) {
         DisplayZone& z = g_zonesArr[zi];
 
-        rigStructs[zi] = {XR_TYPE_DISPLAY_RIG_EXT};
+        rigStructs[zi] = {XR_TYPE_DISPLAY_RIG_DXR};
         rigStructs[zi].pose = {{0, 0, 0, 1}, {0, 0, 0}};
         rigStructs[zi].virtualDisplayHeight = kZoneVirtualDisplayHeight;
         rigStructs[zi].ipdFactor = z.ipdFactor;
         rigStructs[zi].parallaxFactor = 1.0f;
         rigStructs[zi].perspectiveFactor = z.perspectiveFactor;
 
-        zoneStructs[zi] = {XR_TYPE_DISPLAY_ZONE_EXT};
+        zoneStructs[zi] = {XR_TYPE_DISPLAY_ZONE_DXR};
         zoneStructs[zi].next = &rigStructs[zi];
         zoneStructs[zi].zoneId = z.zoneId;
         zoneStructs[zi].rect = z.rect;
@@ -677,8 +677,8 @@ static void RenderZonesFrame(XrSessionManager& xr, D3D12Renderer& renderer,
 
     // Per-frame wish reference: AUTO (wishMask = XR_NULL_HANDLE → the runtime
     // auto-derives the wish from the zone rects). Chained on FrameEndInfo.next.
-    XrDisplayZonesFrameEndInfoEXT zonesEnd = {(XrStructureType)XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_EXT};
-    zonesEnd.flags = ZonesValidateEnabled() ? XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_EXT : 0;
+    XrDisplayZonesFrameEndInfoDXR zonesEnd = {(XrStructureType)XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_DXR};
+    zonesEnd.flags = ZonesValidateEnabled() ? XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_DXR : 0;
     zonesEnd.wishMask = XR_NULL_HANDLE;
     endInfo.next = &zonesEnd;
 
@@ -742,7 +742,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (!InitializeLogging(APP_NAME)) {
         MessageBox(nullptr, L"Failed to initialize logging", L"Warning", MB_OK | MB_ICONWARNING);
     }
-    LOG_INFO("=== Cube Zones D3D12 (XR_EXT_display_zones, array/SPI) ===");
+    LOG_INFO("=== Cube Zones D3D12 (XR_DXR_display_zones, array/SPI) ===");
 
     HWND hwnd = CreateAppWindow(hInstance, g_windowWidth, g_windowHeight);
     if (!hwnd) {

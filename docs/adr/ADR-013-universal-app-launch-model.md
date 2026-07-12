@@ -5,7 +5,7 @@
 
 ## Context
 
-The 3D shell needs to host OpenXR apps as 3D windows. Developers should write normal handle apps (create HWND, use `XR_EXT_win32_window_binding` + `XR_EXT_display_info`, do their own Kooima projection) and have them work automatically in the shell with zero code changes.
+The 3D shell needs to host OpenXR apps as 3D windows. Developers should write normal handle apps (create HWND, use `XR_DXR_win32_window_binding` + `XR_DXR_display_info`, do their own Kooima projection) and have them work automatically in the shell with zero code changes.
 
 Previously considered approaches:
 - Separate app classes (handle vs IPC) — friction, two code paths
@@ -37,7 +37,7 @@ The hidden HWND proxy pattern delivers resize information via the standard Win32
 
 ```c
 HWND hwnd = CreateWindow(...);
-// xrCreateSession with XR_EXT_win32_window_binding (passes HWND)
+// xrCreateSession with XR_DXR_win32_window_binding (passes HWND)
 // Main loop:
 //   WM_SIZE → update window dims for Kooima
 //   xrLocateViews → window-relative eyes
@@ -57,7 +57,7 @@ bool u_sandbox_should_use_ipc(void) {
 ```
 
 In shell mode, the runtime:
-1. Receives HWND from `XR_EXT_win32_window_binding`
+1. Receives HWND from `XR_DXR_win32_window_binding`
 2. Hides it: `ShowWindow(hwnd, SW_HIDE)`
 3. Passes HWND value to service via IPC session creation
 4. Creates IPC client compositor (not native)

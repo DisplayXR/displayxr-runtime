@@ -14,7 +14,7 @@ It is a **mechanism**, independent of any window-placement policy. It backs ever
 (see [Consumers](#consumers)); the spatial **workspace** is one of them, layered on top via a
 `workspace_mode` flag. Where windows go, how they animate, and what chrome looks like is the controller's
 policy — see [separation-of-concerns.md](separation-of-concerns.md) and the
-[`XR_EXT_spatial_workspace`](../specs/extensions/XR_EXT_spatial_workspace.md) surface. For the **single-app
+[`XR_DXR_spatial_workspace`](../specs/extensions/XR_DXR_spatial_workspace.md) surface. For the **single-app
 (in-process)** pipeline, see [compositor-pipeline.md](compositor-pipeline.md).
 
 ## Topology
@@ -93,7 +93,7 @@ The multi-compositor is shared by every out-of-process consumer; `workspace_mode
 workspace-specific composition (controller poses, chrome, per-tile alpha):
 
 - **Spatial workspace** (the DisplayXR Shell and other workspace controllers) — `workspace_mode = true`;
-  windows placed via [`XR_EXT_spatial_workspace`](../specs/extensions/XR_EXT_spatial_workspace.md).
+  windows placed via [`XR_DXR_spatial_workspace`](../specs/extensions/XR_DXR_spatial_workspace.md).
 - **Plain service-mode IPC apps** — the `_ipc` app class: one or more app processes connect to a single
   runtime service and composite through the same path, with no workspace controller.
 - **WebXR bridge** — bridges browser WebXR sessions through the `d3d11_service` compositor.

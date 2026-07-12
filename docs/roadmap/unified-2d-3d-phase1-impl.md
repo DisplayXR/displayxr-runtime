@@ -1,4 +1,4 @@
-# Phase 1 — opt-in authored mask via `XR_EXT_local_3d_zone` (compositor-consumer leg)
+# Phase 1 — opt-in authored mask via `XR_DXR_local_3d_zone` (compositor-consumer leg)
 
 **Branch:** `feature/unified-2d-3d-phase1` (worktree `.claude/worktrees/unified-2d3d-p1`), off `main` post-Phase-0.
 **Spec:** [`unified-2d-3d-compositing.md`](unified-2d-3d-compositing.md) §5, §6 (Phase 1); the authoring API is from [`local-3d-zones.md`](local-3d-zones.md). Epic #439.
@@ -12,7 +12,7 @@
 
 Phase 1 = **generalize the post-weave 2D region from a rectangle to an arbitrary authored mask**, opt-in, with the existing 2D source (the surround texture). Concretely:
 
-- New extension **`XR_EXT_local_3d_zone`** (the tiered mask-authoring API, shared with the hardware leg — §5 of the spec). oxr mask object + handlers.
+- New extension **`XR_DXR_local_3d_zone`** (the tiered mask-authoring API, shared with the hardware leg — §5 of the spec). oxr mask object + handlers.
 - The authored scalar mask flows to the **D3D11 compositor consumer** (the Phase-0 shader's `use_rect_mask = 0` path).
 - **Fallback:** no mask → Phase-0 rect-derived behavior, byte-for-byte. Zero regression (the env/opt-in gate stays).
 
@@ -59,25 +59,25 @@ Cost: +2 copies/frame vs Phase 0's +1 (weave + mask). Both evaporate in Phase 3 
 
 > **sRGB note (carried from Phase 0 §4):** all views UNORM, point sampler. The lerp is in the view's numeric space — keep `weave_scratch` / `surround_scratch` UNORM so the math matches the bytes; the mask is R8_UNORM scalar.
 
-> **Window-sized inputs, NOT display-sized (#464) — load-bearing.** The shared texture is allocated worst-case/display-sized (ADR-010, kept), but the 2D content is **window-proportional** (the mask + 2D layer are authored in client-window pixels; the app renders + reads back at window size). Do **NOT** inherit the rect-surround's "fill the whole worst-case surface" assumption (`surround_2d.w == dst_w`). The composite must operate on the **window rect** (window minus canvas), positioned at the window anchor inside the worst-case surface; sample the mask/2D at window resolution; leave the rest of the surface untouched. Concretely: the composite viewport/scissor + the mask/2D scratch dims are **window-sized**, not `dst` (surface)-sized. This avoids the over-fill in #464 and keeps the mask coordinate space coherent with `XrLocal3DZoneMaskCreateInfoEXT` (client-window pixels).
+> **Window-sized inputs, NOT display-sized (#464) — load-bearing.** The shared texture is allocated worst-case/display-sized (ADR-010, kept), but the 2D content is **window-proportional** (the mask + 2D layer are authored in client-window pixels; the app renders + reads back at window size). Do **NOT** inherit the rect-surround's "fill the whole worst-case surface" assumption (`surround_2d.w == dst_w`). The composite must operate on the **window rect** (window minus canvas), positioned at the window anchor inside the worst-case surface; sample the mask/2D at window resolution; leave the rest of the surface untouched. Concretely: the composite viewport/scissor + the mask/2D scratch dims are **window-sized**, not `dst` (surface)-sized. This avoids the over-fill in #464 and keeps the mask coordinate space coherent with `XrLocal3DZoneMaskCreateInfoDXR` (client-window pixels).
 
-## 4. The mask object + authoring (oxr) — `XR_EXT_local_3d_zone`
+## 4. The mask object + authoring (oxr) — `XR_DXR_local_3d_zone`
 
 The extension (header drafted alongside this doc) defines a mask handle and three authoring tiers (from local-3d-zones §"runtime piece"):
 
-- **Tier 1** `xrSetLocal3DZoneWholeWindowEXT(mask, enable)` — all-3D / all-2D; the degenerate case, one call.
-- **Tier 2** `xrSetLocal3DZoneFromRectsEXT(mask, count, rects)` — runtime rasterizes rects into the mask texture (a single rect reproduces Phase 0).
-- **Tier 3** `xrAcquireLocal3DZoneRenderTargetEXT(mask, &binding)` — app draws arbitrary alpha into the mask (API-typed binding; D3D11 first).
+- **Tier 1** `xrSetLocal3DZoneWholeWindowDXR(mask, enable)` — all-3D / all-2D; the degenerate case, one call.
+- **Tier 2** `xrSetLocal3DZoneFromRectsDXR(mask, count, rects)` — runtime rasterizes rects into the mask texture (a single rect reproduces Phase 0).
+- **Tier 3** `xrAcquireLocal3DZoneRenderTargetDXR(mask, &binding)` — app draws arbitrary alpha into the mask (API-typed binding; D3D11 first).
 
 oxr work:
-1. **Extension registration** — `XR_EXT_local_3d_zone.h`; `oxr_extension_support.h` (`OXR_HAVE_EXT_local_3d_zone` + `OXR_EXTENSION_SUPPORT_EXT_local_3d_zone` + master-list entry ~`:1089`); `oxr_api_negotiate.c` `ENTRY_IF_EXT(...)` for each function.
-2. **Mask handle object** — `XrLocal3DZoneMaskEXT` backed by an oxr struct owning a runtime-allocated scalar R8 GPU texture (client-window px) + an SRV. New `oxr_local_3d_zone.c` (handlers) beside `oxr_session.c`; model the handle lifecycle on an existing oxr object.
+1. **Extension registration** — `XR_DXR_local_3d_zone.h`; `oxr_extension_support.h` (`OXR_HAVE_DXR_local_3d_zone` + `OXR_EXTENSION_SUPPORT_DXR_local_3d_zone` + master-list entry ~`:1089`); `oxr_api_negotiate.c` `ENTRY_IF_EXT(...)` for each function.
+2. **Mask handle object** — `XrLocal3DZoneMaskDXR` backed by an oxr struct owning a runtime-allocated scalar R8 GPU texture (client-window px) + an SRV. New `oxr_local_3d_zone.c` (handlers) beside `oxr_session.c`; model the handle lifecycle on an existing oxr object.
 3. **Tier rasterization** — Tiers 1/2 rasterize into the mask texture via a tiny runtime shader (or `ClearView`/rect fills); Tier 3 hands back the D3D11 RTV on the mask texture.
-4. **Caps** — `xrGetLocal3DZoneCapabilitiesEXT` reports `supported = true` for the **compositor consumer** even with no hardware zones (the hardware grid fields come with the DP-publish leg later). The compositor samples the mask at full resolution (spec §9 Q1 decision).
+4. **Caps** — `xrGetLocal3DZoneCapabilitiesDXR` reports `supported = true` for the **compositor consumer** even with no hardware zones (the hardware grid fields come with the DP-publish leg later). The compositor samples the mask at full resolution (spec §9 Q1 decision).
 
 ## 5. Mask → compositor delivery + atomicity (Q3)
 
-The mask object's SRV must reach the D3D11 compositor at composite time. Path: the session holds the active mask; `xrSetSharedTextureOutputRectEXT`-style plumbing carries the mask SRV (or its shared handle, in-process direct) to `comp_d3d11_compositor`, mirroring how `canvas` / `surround_2d` already flow. **Atomic per frame (spec §9 Q3):** the mask, the 2D layer, and the 3D layers are consumed as one `xrEndFrame` set — `xrSubmitLocal3DZoneEXT` stages the mask for the *next* frame submission, and the compositor reads the staged mask coherently with that frame's weave. Define the staging so a Tier-3 mask update and the frame can't tear.
+The mask object's SRV must reach the D3D11 compositor at composite time. Path: the session holds the active mask; `xrSetSharedTextureOutputRectDXR`-style plumbing carries the mask SRV (or its shared handle, in-process direct) to `comp_d3d11_compositor`, mirroring how `canvas` / `surround_2d` already flow. **Atomic per frame (spec §9 Q3):** the mask, the 2D layer, and the 3D layers are consumed as one `xrEndFrame` set — `xrSubmitLocal3DZoneDXR` stages the mask for the *next* frame submission, and the compositor reads the staged mask coherently with that frame's weave. Define the staging so a Tier-3 mask update and the frame can't tear.
 
 ## 6. Validation (Windows / Leia)
 
@@ -90,7 +90,7 @@ Confirm soft-edge AA (a Tier-3 gradient mask) shows a clean 2D↔3D blend, no in
 
 ## 7. Done-when
 
-- [x] `XR_EXT_local_3d_zone` registered; `displayxr-cli selftest` still passes.
+- [x] `XR_DXR_local_3d_zone` registered; `displayxr-cli selftest` still passes.
 - [x] Tiers 1–3 author a mask; the D3D11 consumer lerps it (soft edges work — Tier-3 radial gradient validated on-glass).
 - [x] No-mask path byte-identical to Phase 0 (zero regression — strip vs shader A/B capture diff 0 through the extended pass signature).
 - [x] Tier-2-single-rect == Phase-0 rect output (capture diff 0 in the window 2D region; beyond-window untouched per #464 — Phase-0 fills the display extent there, the zone path deliberately doesn't).
@@ -113,13 +113,13 @@ The oxr layer **compiles + links on macOS** (`./scripts/build_macos.sh`): the pe
    `#define OXR_XR_DEBUG_LOCAL3DZONE (*(uint64_t *)"oxrl3dz\0")`
 2. **`oxr_objects.h`** — forward-decl `struct oxr_local_3d_zone_mask;` (near :133); define the struct (model on `oxr_plane_detector_ext` @ :3246 — first member `struct oxr_handle_base handle;`, then `struct oxr_session *sess;`, dims, tier state, and an opaque `void *comp_mask;` the compositor owns); add the `oxr_local_3d_zone_mask_to_openxr()` inline (model @ :406, `XRT_CAST_PTR_TO_OXR_HANDLE`).
 3. **`oxr_api_funcs.h`** (after the surround decls, ~:985) — the 7 `XRAPI_ATTR XrResult XRAPI_CALL oxr_xr<Fn>EXT(...)` prototypes.
-4. **`oxr_extension_support.h`** — add the `XR_EXT_local_3d_zone` block (model the `EXT_atlas_capture` block @ :577) **and** the master-list line `OXR_EXTENSION_SUPPORT_EXT_local_3d_zone(_) \` (after `EXT_mcp_tools` @ ~:1092).
-5. **`oxr_api_negotiate.c`** (after the atlas block @ :476) — `#ifdef OXR_HAVE_EXT_local_3d_zone` + `ENTRY_IF_EXT(xr<Fn>EXT, EXT_local_3d_zone);` ×7.
+4. **`oxr_extension_support.h`** — add the `XR_DXR_local_3d_zone` block (model the `DXR_atlas_capture` block @ :577) **and** the master-list line `OXR_EXTENSION_SUPPORT_DXR_local_3d_zone(_) \` (after `DXR_mcp_tools` @ ~:1092).
+5. **`oxr_api_negotiate.c`** (after the atlas block @ :476) — `#ifdef OXR_HAVE_DXR_local_3d_zone` + `ENTRY_IF_EXT(xr<Fn>EXT, DXR_local_3d_zone);` ×7.
 6. **`comp_d3d11_compositor.h`** (beside `comp_d3d11_compositor_set_surround_2d` @ :108, extern "C") — declare the entry points the handlers forward to:
    `comp_d3d11_compositor_zone_mask_create / _set_rects / _set_whole / _acquire_rt / _submit / _destroy` (signatures TBD with the consumer wiring).
 7. **`oxr_local_3d_zone.c`** (NEW) — the 7 `oxr_xr*EXT` handlers (`OXR_VERIFY_SESSION_AND_INIT_LOG`; create uses `OXR_ALLOCATE_HANDLE_OR_RETURN(&log, mask, OXR_XR_DEBUG_LOCAL3DZONE, oxr_local_3d_zone_destroy_cb, &sess->handle)`), the destroy_cb (model @ oxr_api_session.c:926), and the D3D11-guarded forwarding (model the surround handler @ oxr_api_session.c:1591 — `#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR` + `sess->is_d3d11_native_compositor` branch, else `XR_ERROR_FEATURE_UNSUPPORTED`). `#include "d3d11/comp_d3d11_compositor.h"` under the guard.
 8. **`CMakeLists.txt`** (the oxr source list, ~:45) — add `oxr_local_3d_zone.c`.
 
-Then `./scripts/build_macos.sh` → fix errors → commit green. Caps query (`xrGetLocal3DZoneCapabilitiesEXT`) reports `supported = TRUE`, `hardwareZoneGridWidth/Height = 0` (compositor-only, no hardware-zone DP yet).
+Then `./scripts/build_macos.sh` → fix errors → commit green. Caps query (`xrGetLocal3DZoneCapabilitiesDXR`) reports `supported = TRUE`, `hardwareZoneGridWidth/Height = 0` (compositor-only, no hardware-zone DP yet).
 
 > **Recommendation:** execute this appendix in a **fresh session** — it's a contained, mechanical-but-sizable build-and-verify task, and a clean context budget makes the macOS build-iterate loop crisp. Everything needed is here + in §1–8. The Windows boundary is reached when `build_macos.sh` is green and the D3D11 entry points in (6) are declared-but-unimplemented.

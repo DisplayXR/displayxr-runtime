@@ -1,6 +1,6 @@
 # OpenXR Extensions for Tracked 3D Displays
 
-## Formal Proposal for XR_EXT_win32_window_binding, XR_EXT_android_surface_binding, XR_EXT_cocoa_window_binding, and XR_EXT_display_info
+## Formal Proposal for XR_DXR_win32_window_binding, XR_EXT_android_surface_binding, XR_DXR_cocoa_window_binding, and XR_DXR_display_info
 
 | Field | Value |
 |---|---|
@@ -9,7 +9,7 @@
 | **Date** | 2026-02-13 |
 | **Revision** | 0.2 |
 | **Status** | Draft — proposed for Khronos OpenXR Working Group review |
-| **Extension Names** | `XR_EXT_win32_window_binding`, `XR_EXT_android_surface_binding`, `XR_EXT_cocoa_window_binding`, `XR_EXT_display_info` |
+| **Extension Names** | `XR_DXR_win32_window_binding`, `XR_EXT_android_surface_binding`, `XR_DXR_cocoa_window_binding`, `XR_DXR_display_info` |
 | **OpenXR Version** | 1.0 |
 | **Extension Type** | Instance extensions |
 | **Dependencies** | OpenXR 1.0 core |
@@ -75,10 +75,10 @@ This proposal introduces four independent but complementary extensions:
 
 | Extension | Purpose |
 |---|---|
-| `XR_EXT_win32_window_binding` | App provides a Win32 HWND for runtime rendering; enables windowed mode, multi-app, app-controlled input, and window-space overlay layers. |
+| `XR_DXR_win32_window_binding` | App provides a Win32 HWND for runtime rendering; enables windowed mode, multi-app, app-controlled input, and window-space overlay layers. |
 | `XR_EXT_android_surface_binding` | App provides an Android `ANativeWindow` for runtime rendering; the Android counterpart to the Win32 window binding. |
-| `XR_EXT_cocoa_window_binding` | App provides a Cocoa `NSView*` (with `CAMetalLayer` backing) for runtime rendering on macOS. |
-| `XR_EXT_display_info` | Runtime exposes physical display geometry, nominal viewer position, recommended render scale, and display mode switching capability. Provides `xrRequestDisplayModeEXT` for 2D/3D mode control, `xrRequestEyeTrackingModeEXT` for managed/manual eye tracking selection, and `xrRequestDisplayRenderingModeEXT` for vendor-specific rendering mode switching. In RAW mode, `xrLocateViews` returns screen-centered eye positions regardless of the reference space parameter. |
+| `XR_DXR_cocoa_window_binding` | App provides a Cocoa `NSView*` (with `CAMetalLayer` backing) for runtime rendering on macOS. |
+| `XR_DXR_display_info` | Runtime exposes physical display geometry, nominal viewer position, recommended render scale, and display mode switching capability. Provides `xrRequestDisplayModeDXR` for 2D/3D mode control, `xrRequestEyeTrackingModeDXR` for managed/manual eye tracking selection, and `xrRequestDisplayRenderingModeDXR` for vendor-specific rendering mode switching. In RAW mode, `xrLocateViews` returns screen-centered eye positions regardless of the reference space parameter. |
 
 Together they form a minimal, complete interface for tracked 3D display rendering through
 OpenXR across desktop, mobile, and macOS platforms.
@@ -98,13 +98,13 @@ displays. See [OPEN 4](#open-issues) in the Issues section.
     Application
         │
         ├── xrCreateInstance()
-        │       enable "XR_EXT_win32_window_binding"   (Win32)
+        │       enable "XR_DXR_win32_window_binding"   (Win32)
         │         — or "XR_EXT_android_surface_binding" (Android)
-        │         — or "XR_EXT_cocoa_window_binding"   (macOS)
-        │       enable "XR_EXT_display_info"
+        │         — or "XR_DXR_cocoa_window_binding"   (macOS)
+        │       enable "XR_DXR_display_info"
         │
         ├── xrGetSystemProperties()
-        │       ◄── XrDisplayInfoEXT (chained)
+        │       ◄── XrDisplayInfoDXR (chained)
         │           • displaySizeMeters
         │           • nominalViewerPositionInDisplaySpace
         │           • recommendedViewScaleX / Y
@@ -113,7 +113,7 @@ displays. See [OPEN 4](#open-issues) in the Issues section.
         ├── xrCreateSession()
         │       XrSessionCreateInfo
         │        └── next: XrGraphicsBindingD3D11KHR          (Win32)
-        │        │            └── next: XrWin32WindowBindingCreateInfoEXT
+        │        │            └── next: XrWin32WindowBindingCreateInfoDXR
         │        │                       • windowHandle = app HWND
         │        └── next: XrGraphicsBindingVulkanKHR          (Android)
         │        │            └── next: XrAndroidSurfaceBindingCreateInfoEXT
@@ -121,15 +121,15 @@ displays. See [OPEN 4](#open-issues) in the Issues section.
         │        │                       • surface = Java Surface jobject
         │        │                       • screenOffsetX/Y = position on display
         │        └── next: XrGraphicsBindingVulkanKHR          (macOS)
-        │                    └── next: XrCocoaWindowBindingCreateInfoEXT
+        │                    └── next: XrCocoaWindowBindingCreateInfoDXR
         │                               • viewHandle = app NSView* (CAMetalLayer)
         │
         │   ┌── Session READY → runtime auto-requests 3D mode (if supported)
         │
-        ├── xrRequestDisplayModeEXT(session, mode)     [optional override]
-        │       XR_DISPLAY_MODE_3D_EXT  /  XR_DISPLAY_MODE_2D_EXT
+        ├── xrRequestDisplayModeDXR(session, mode)     [optional override]
+        │       XR_DISPLAY_MODE_3D_DXR  /  XR_DISPLAY_MODE_2D_DXR
         │
-        ├── xrRequestDisplayRenderingModeEXT(session, modeIndex)  [optional]
+        ├── xrRequestDisplayRenderingModeDXR(session, modeIndex)  [optional]
         │       mode 0 = standard, 1+ = vendor-defined
         │
         ├── xrLocateViews(space = LOCAL)
@@ -139,7 +139,7 @@ displays. See [OPEN 4](#open-issues) in the Issues section.
         │
         ├── xrEndFrame()
         │       submit XrCompositionLayerProjection (in LOCAL space)
-        │       submit XrCompositionLayerWindowSpaceEXT (HUD overlay)
+        │       submit XrCompositionLayerWindowSpaceDXR (HUD overlay)
         │
         │   ┌── Session STOPPING → runtime auto-requests 2D mode (if supported)
         │
@@ -170,8 +170,8 @@ zero-parallax depth, stereo comfort, and content framing. Stereo rendering is th
 
 | Condition | Default Mode |
 |---|---|
-| `XR_EXT_display_info` not enabled | RENDER_READY |
-| `XR_EXT_display_info` enabled | RAW |
+| `XR_DXR_display_info` not enabled | RENDER_READY |
+| `XR_DXR_display_info` enabled | RAW |
 
 In RAW mode the application builds its own projection (typically Kooima off-axis frustum)
 from the eye positions and display geometry. This gives engines full control over the
@@ -185,18 +185,18 @@ This mode is suitable for legacy apps and WebXR.
 
 The three extensions are **independent**:
 
-- An application can use `XR_EXT_win32_window_binding` (or its Android counterpart) alone
+- An application can use `XR_DXR_win32_window_binding` (or its Android counterpart) alone
   to render into its own window/surface with RENDER_READY views (no display geometry needed).
-- An application can use `XR_EXT_display_info` alone to get display geometry, RAW eye
+- An application can use `XR_DXR_display_info` alone to get display geometry, RAW eye
   positions, and display mode control while letting the runtime manage the display surface.
-- Using a window/surface binding together with `XR_EXT_display_info` gives full control:
+- Using a window/surface binding together with `XR_DXR_display_info` gives full control:
   app-owned rendering surface + app-owned camera model + display mode switching.
-- `XR_EXT_win32_window_binding` and `XR_EXT_android_surface_binding` are **mutually
+- `XR_DXR_win32_window_binding` and `XR_EXT_android_surface_binding` are **mutually
   exclusive** platform variants — an application uses one or the other, never both.
 
 ---
 
-## 3. Extension 1: XR_EXT_win32_window_binding
+## 3. Extension 1: XR_DXR_win32_window_binding
 
 ### IP Status
 
@@ -204,9 +204,9 @@ No known IP claims.
 
 ### Name Strings
 
-- Extension name: `XR_EXT_win32_window_binding`
+- Extension name: `XR_DXR_win32_window_binding`
 - Spec version: 1
-- Extension name define: `XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME`
+- Extension name define: `XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME`
 
 ### Overview
 
@@ -226,8 +226,8 @@ application's window instead of creating its own display surface.
 ### New Enum Constants
 
 ```c
-#define XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT  ((XrStructureType)1000999001)
-#define XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT    ((XrStructureType)1000999002)
+#define XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR  ((XrStructureType)1004999001)
+#define XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR    ((XrStructureType)1004999002)
 ```
 
 > **Note**: These values use the vendor extension range. They would be replaced with
@@ -235,34 +235,34 @@ application's window instead of creating its own display surface.
 
 ### New Structures
 
-#### XrWin32WindowBindingCreateInfoEXT
+#### XrWin32WindowBindingCreateInfoDXR
 
 Chained to `XrSessionCreateInfo` (via the graphics binding's `next` pointer) to provide
 an external window handle for session rendering.
 
 | Member | Type | Description |
 |---|---|---|
-| `type` | `XrStructureType` | Must be `XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT`. |
+| `type` | `XrStructureType` | Must be `XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR`. |
 | `next` | `const void*` | Pointer to next structure in the chain, or `NULL`. |
 | `windowHandle` | `void*` | The Win32 `HWND` of the target window. Must be a valid, visible window handle. |
 
 ```c
-typedef struct XrWin32WindowBindingCreateInfoEXT {
+typedef struct XrWin32WindowBindingCreateInfoDXR {
     XrStructureType             type;
     const void* XR_MAY_ALIAS    next;
     void*                       windowHandle;
-} XrWin32WindowBindingCreateInfoEXT;
+} XrWin32WindowBindingCreateInfoDXR;
 ```
 
 **Valid Usage:**
-- `type` **must** be `XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT`.
+- `type` **must** be `XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR`.
 - `windowHandle` **must** be a valid Win32 `HWND` that the application owns.
 - The window **must** remain valid for the lifetime of the `XrSession`.
 - The application **must** service the window's message pump on the thread that created
   the window. Failure to pump messages will stall rendering.
 - The application **must not** destroy the window before calling `xrDestroySession`.
 
-#### XrCompositionLayerWindowSpaceEXT
+#### XrCompositionLayerWindowSpaceDXR
 
 A composition layer type for content positioned in fractional window coordinates. The
 layer is composited into both eye views with an optional per-eye horizontal disparity
@@ -270,7 +270,7 @@ shift.
 
 | Member | Type | Description |
 |---|---|---|
-| `type` | `XrStructureType` | Must be `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT`. |
+| `type` | `XrStructureType` | Must be `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR`. |
 | `next` | `const void*` | Pointer to next structure in the chain, or `NULL`. |
 | `layerFlags` | `XrCompositionLayerFlags` | Composition flags (e.g., `XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT`). |
 | `subImage` | `XrSwapchainSubImage` | Source swapchain and image rectangle. |
@@ -281,7 +281,7 @@ shift.
 | `disparity` | `float` | Horizontal shift per eye as a fraction of window width. `0` = screen depth (zero parallax); negative = toward viewer. See [Disparity Guidance](#disparity-guidance). |
 
 ```c
-typedef struct XrCompositionLayerWindowSpaceEXT {
+typedef struct XrCompositionLayerWindowSpaceDXR {
     XrStructureType             type;
     const void* XR_MAY_ALIAS    next;
     XrCompositionLayerFlags     layerFlags;
@@ -291,12 +291,12 @@ typedef struct XrCompositionLayerWindowSpaceEXT {
     float                       width;
     float                       height;
     float                       disparity;
-} XrCompositionLayerWindowSpaceEXT;
+} XrCompositionLayerWindowSpaceDXR;
 ```
 
 **Valid Usage:**
-- `type` **must** be `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT`.
-- The session **must** have been created with `XrWin32WindowBindingCreateInfoEXT`.
+- `type` **must** be `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR`.
+- The session **must** have been created with `XrWin32WindowBindingCreateInfoDXR`.
 - `subImage.swapchain` **must** be a valid `XrSwapchain`.
 - `x`, `y`, `width`, `height` **should** define a region within `[0, 1]` window-space
   coordinates. The runtime **may** clamp values outside this range.
@@ -332,14 +332,14 @@ application — there is no single correct value.
 ### New Functions
 
 None. This extension operates entirely through structure chaining:
-- `XrWin32WindowBindingCreateInfoEXT` chains to `XrSessionCreateInfo`.
-- `XrCompositionLayerWindowSpaceEXT` is submitted as a composition layer in `xrEndFrame`.
+- `XrWin32WindowBindingCreateInfoDXR` chains to `XrSessionCreateInfo`.
+- `XrCompositionLayerWindowSpaceDXR` is submitted as a composition layer in `xrEndFrame`.
 
 ### Interactions
 
 - **Requires** a Win32 platform binding extension (`XR_KHR_D3D11_enable` or
   `XR_KHR_opengl_enable`) for the graphics binding in the session creation chain.
-- **Does not require** `XR_EXT_display_info`, but they are complementary.
+- **Does not require** `XR_DXR_display_info`, but they are complementary.
 - When the window is resized, the runtime **must** adjust its rendering surface
   accordingly. The application should recompute render resolution using the display info
   scale factors if available.
@@ -350,7 +350,7 @@ None. This extension operates entirely through structure chaining:
 // 1. Enable the extension at instance creation
 std::vector<const char*> extensions = {
     XR_KHR_D3D11_ENABLE_EXTENSION_NAME,
-    XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME,
+    XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME,
 };
 
 XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -363,8 +363,8 @@ xrCreateInstance(&createInfo, &instance);
 XrGraphicsBindingD3D11KHR d3d11Binding = {XR_TYPE_GRAPHICS_BINDING_D3D11_KHR};
 d3d11Binding.device = d3d11Device;
 
-XrWin32WindowBindingCreateInfoEXT windowBinding = {
-    XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT};
+XrWin32WindowBindingCreateInfoDXR windowBinding = {
+    XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR};
 windowBinding.windowHandle = hwnd;  // Application-owned HWND
 
 // Chain: sessionInfo -> d3d11Binding -> windowBinding
@@ -385,8 +385,8 @@ XrGraphicsBindingOpenGLWin32KHR glBinding = {
 glBinding.hDC = hDC;
 glBinding.hGLRC = hGLRC;
 
-XrWin32WindowBindingCreateInfoEXT windowBinding = {
-    XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT};
+XrWin32WindowBindingCreateInfoDXR windowBinding = {
+    XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR};
 windowBinding.windowHandle = hwnd;
 
 // Chain: sessionInfo -> glBinding -> windowBinding
@@ -405,8 +405,8 @@ xrCreateSession(instance, &sessionInfo, &session);
 // Render HUD content to a dedicated swapchain, then submit it as a
 // window-space layer alongside the main projection layer.
 
-XrCompositionLayerWindowSpaceEXT hudLayer = {};
-hudLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT;
+XrCompositionLayerWindowSpaceDXR hudLayer = {};
+hudLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR;
 hudLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
 hudLayer.subImage.swapchain = hudSwapchain;
 hudLayer.subImage.imageRect.offset = {0, 0};
@@ -451,7 +451,7 @@ No known IP claims.
 
 ### Overview
 
-This extension is the Android counterpart to `XR_EXT_win32_window_binding`. It allows an
+This extension is the Android counterpart to `XR_DXR_win32_window_binding`. It allows an
 OpenXR application to provide its own Android rendering surface to the runtime via the
 session creation chain. When provided, the runtime renders into the application's surface
 instead of managing its own display output.
@@ -475,12 +475,12 @@ correct light field interlacing.
   to OpenXR stereo content.
 - **Window-space overlays**: HUD and status overlays positioned in fractional surface
   coordinates, automatically adapting to surface resize (using
-  `XrCompositionLayerWindowSpaceEXT`).
+  `XrCompositionLayerWindowSpaceDXR`).
 
 ### New Enum Constants
 
 ```c
-#define XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_EXT  ((XrStructureType)1000999005)
+#define XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_EXT  ((XrStructureType)1004999005)
 ```
 
 > **Note**: This value uses the vendor extension range. It would be replaced with an
@@ -537,15 +537,15 @@ typedef struct XrAndroidSurfaceBindingCreateInfoEXT {
 
 None. This extension operates entirely through structure chaining:
 - `XrAndroidSurfaceBindingCreateInfoEXT` chains to `XrSessionCreateInfo`.
-- `XrCompositionLayerWindowSpaceEXT` (defined in `XR_EXT_win32_window_binding`) is
+- `XrCompositionLayerWindowSpaceDXR` (defined in `XR_DXR_win32_window_binding`) is
   platform-independent and works with Android surface bindings as well.
 
 ### Interactions
 
 - **Requires** an Android-compatible graphics binding extension (`XR_KHR_vulkan_enable` or
   `XR_KHR_opengl_es_enable`) for the graphics binding in the session creation chain.
-- **Does not require** `XR_EXT_display_info`, but they are complementary.
-- **Mutually exclusive** with `XR_EXT_win32_window_binding` — an application uses one or
+- **Does not require** `XR_DXR_display_info`, but they are complementary.
+- **Mutually exclusive** with `XR_DXR_win32_window_binding` — an application uses one or
   the other based on platform.
 - When the surface is resized (e.g., orientation change), the runtime **must** adjust its
   rendering surface accordingly.
@@ -628,7 +628,7 @@ xrCreateSession(instance, &sessionInfo, &session);
 
 ---
 
-## 5. Extension 3: XR_EXT_display_info
+## 5. Extension 3: XR_DXR_display_info
 
 ### IP Status
 
@@ -636,9 +636,9 @@ No known IP claims.
 
 ### Name Strings
 
-- Extension name: `XR_EXT_display_info`
+- Extension name: `XR_DXR_display_info`
 - Spec version: 14
-- Extension name define: `XR_EXT_DISPLAY_INFO_EXTENSION_NAME`
+- Extension name define: `XR_DXR_DISPLAY_INFO_EXTENSION_NAME`
 
 ### Overview
 
@@ -652,9 +652,9 @@ With this information the application can:
 - Build its own camera model (Kooima off-axis projection) from raw tracked eye positions.
 - Compute render resolution dynamically as the window/surface resizes.
 - Locate views and submit layers using LOCAL space (RAW mode returns screen-relative positions).
-- Enumerate rendering modes (`xrEnumerateDisplayRenderingModesEXT`) — including each mode's view
+- Enumerate rendering modes (`xrEnumerateDisplayRenderingModesDXR`) — including each mode's view
   count, tile layout, view scale, hardware-3D state, and (per session) which mode is active and
-  which are requestable — and request a mode via `xrRequestDisplayRenderingModeEXT`.
+  which are requestable — and request a mode via `xrRequestDisplayRenderingModeDXR`.
 - Choose between managed and manual eye tracking.
 
 This extension is **platform-independent**. It works on any platform that supports OpenXR,
@@ -663,9 +663,9 @@ regardless of the graphics API or windowing system in use.
 ### New Enum Constants
 
 ```c
-#define XR_TYPE_DISPLAY_INFO_EXT              ((XrStructureType)1000999003)
-#define XR_DISPLAY_MODE_2D_EXT                0
-#define XR_DISPLAY_MODE_3D_EXT                1
+#define XR_TYPE_DISPLAY_INFO_DXR              ((XrStructureType)1004999003)
+#define XR_DISPLAY_MODE_2D_DXR                0
+#define XR_DISPLAY_MODE_3D_DXR                1
 ```
 
 > **Note**: These values use the vendor extension range. They would be replaced with
@@ -673,13 +673,13 @@ regardless of the graphics API or windowing system in use.
 
 ### New Structures
 
-#### XrDisplayInfoEXT
+#### XrDisplayInfoDXR
 
 Chained to `XrSystemProperties` to return physical display information.
 
 | Member | Type | Description |
 |---|---|---|
-| `type` | `XrStructureType` | Must be `XR_TYPE_DISPLAY_INFO_EXT`. |
+| `type` | `XrStructureType` | Must be `XR_TYPE_DISPLAY_INFO_DXR`. |
 | `next` | `void*` | Pointer to next structure in the chain, or `NULL`. |
 | `displaySizeMeters` | `XrExtent2Df` | Physical display rectangle size in meters (`width`, `height`). |
 | `nominalViewerPositionInDisplaySpace` | `XrVector3f` | Design-time expected viewer position relative to display center (meters). Defines the apex of the canonical display pyramid. See [Nominal Viewer Position](#nominal-viewer-position). |
@@ -688,16 +688,16 @@ Chained to `XrSystemProperties` to return physical display information.
 | `displayPixelWidth` | `uint32_t` | Native display panel width in pixels (0 if unknown). |
 | `displayPixelHeight` | `uint32_t` | Native display panel height in pixels (0 if unknown). |
 
-> **Note:** `hardwareDisplay3D` was removed from `XrDisplayInfoEXT` in v12. It is now a per-mode
-> field on `XrDisplayRenderingModeInfoEXT` (and is also reported by the
-> `XrEventDataHardwareDisplayStateChangedEXT` event). Query it via
-> `xrEnumerateDisplayRenderingModesEXT` — see
+> **Note:** `hardwareDisplay3D` was removed from `XrDisplayInfoDXR` in v12. It is now a per-mode
+> field on `XrDisplayRenderingModeInfoDXR` (and is also reported by the
+> `XrEventDataHardwareDisplayStateChangedDXR` event). Query it via
+> `xrEnumerateDisplayRenderingModesDXR` — see
 > [Enumerating Rendering Modes](#enumerating-rendering-modes-v8--xrdisplayrenderingmodeinfoext--xrenumeratedisplayrenderingmodesext).
 > Likewise, the modern way to learn the view count, tile layout, per-view scale, active mode, and
-> which modes are requestable is the same enumeration API — not fields on `XrDisplayInfoEXT`.
+> which modes are requestable is the same enumeration API — not fields on `XrDisplayInfoDXR`.
 
 ```c
-typedef struct XrDisplayInfoEXT {
+typedef struct XrDisplayInfoDXR {
     XrStructureType             type;
     void* XR_MAY_ALIAS          next;
     XrExtent2Df                 displaySizeMeters;
@@ -706,21 +706,21 @@ typedef struct XrDisplayInfoEXT {
     float                       recommendedViewScaleY;
     uint32_t                    displayPixelWidth;
     uint32_t                    displayPixelHeight;
-} XrDisplayInfoEXT;
+} XrDisplayInfoDXR;
 ```
 
 **Valid Usage:**
-- `type` **must** be `XR_TYPE_DISPLAY_INFO_EXT`.
-- The application **must** have enabled the `XR_EXT_display_info` extension at instance
+- `type` **must** be `XR_TYPE_DISPLAY_INFO_DXR`.
+- The application **must** have enabled the `XR_DXR_display_info` extension at instance
   creation.
 - The runtime fills in all fields when `xrGetSystemProperties` is called with this
   structure chained to `XrSystemProperties`.
 - All returned values are static display properties that do not change during the runtime's
   lifetime.
 
-#### XrDisplayDesktopPositionEXT (v16)
+#### XrDisplayDesktopPositionDXR (v16)
 
-Chained to `XrSystemProperties` (typically via `XrDisplayInfoEXT.next`) to return the 3D
+Chained to `XrSystemProperties` (typically via `XrDisplayInfoDXR.next`) to return the 3D
 panel's desktop position — its top-left corner in OS virtual-desktop coordinates: top-down
 pixels, origin at the primary monitor's top-left (the Windows virtual-screen / X11
 root-window convention). `(0, 0)` means the panel is the primary monitor or its position is
@@ -728,18 +728,18 @@ unknown.
 
 | Member | Type | Description |
 |---|---|---|
-| `type` | `XrStructureType` | Must be `XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT` (`1000999210`). |
+| `type` | `XrStructureType` | Must be `XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR` (`1004999210`). |
 | `next` | `void*` | Pointer to next structure in the chain, or `NULL`. |
 | `left` | `int32_t` | Panel left edge in virtual-desktop pixels. |
 | `top` | `int32_t` | Panel top edge in virtual-desktop pixels. |
 
 ```c
-typedef struct XrDisplayDesktopPositionEXT {
+typedef struct XrDisplayDesktopPositionDXR {
     XrStructureType             type;
     void* XR_MAY_ALIAS          next;
     int32_t                     left;
     int32_t                     top;
-} XrDisplayDesktopPositionEXT;
+} XrDisplayDesktopPositionDXR;
 ```
 
 **Why it exists:** applications that create their own window (the handle/texture app
@@ -752,53 +752,53 @@ naturally between `xrGetSystem` and native window creation. It is the same value
 vendor plug-in reports to the runtime for its own hosted-window placement (#715).
 
 **Valid Usage:**
-- `type` **must** be `XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT`.
-- The application **must** have enabled the `XR_EXT_display_info` extension at instance
+- `type` **must** be `XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR`.
+- The application **must** have enabled the `XR_DXR_display_info` extension at instance
   creation.
 - The position is a static property for the lifetime of the runtime instance; display
   topology changes (monitor hotplug, rearrangement) are not reported dynamically in v16.
 
 ### New Enums
 
-#### XrDisplayModeEXT
+#### XrDisplayModeDXR
 
-> **Repurposed in v15.** `XrDisplayModeEXT` names the two physical hardware states for
+> **Repurposed in v15.** `XrDisplayModeDXR` names the two physical hardware states for
 > the [hardware-state-only override](#xrrequestdisplaymodeext). Content/mode selection
-> stays with `xrRequestDisplayRenderingModeEXT`; this enum no longer implies a mode switch.
+> stays with `xrRequestDisplayRenderingModeDXR`; this enum no longer implies a mode switch.
 
 ```c
-typedef enum XrDisplayModeEXT {
-    XR_DISPLAY_MODE_2D_EXT = 0,
-    XR_DISPLAY_MODE_3D_EXT = 1,
-} XrDisplayModeEXT;
+typedef enum XrDisplayModeDXR {
+    XR_DISPLAY_MODE_2D_DXR = 0,
+    XR_DISPLAY_MODE_3D_DXR = 1,
+} XrDisplayModeDXR;
 ```
 
 | Value | Meaning |
 |---|---|
-| `XR_DISPLAY_MODE_2D_EXT` | Standard 2D display mode. Switchable optics or backlight are disabled; the display behaves as a conventional flat panel. |
-| `XR_DISPLAY_MODE_3D_EXT` | Tracked 3D display mode. Switchable optics or backlight are enabled; the display produces glasses-free 3D imagery via light field interlacing. |
+| `XR_DISPLAY_MODE_2D_DXR` | Standard 2D display mode. Switchable optics or backlight are disabled; the display behaves as a conventional flat panel. |
+| `XR_DISPLAY_MODE_3D_DXR` | Tracked 3D display mode. Switchable optics or backlight are enabled; the display produces glasses-free 3D imagery via light field interlacing. |
 
 ### New Functions
 
 This extension's current (v14) function set (v14 adds no functions — only the chained
-`XrDisplayRenderingModeTrackingInfoEXT` struct and the
-`XrEventDataEyeTrackingStateChangedEXT` event; see
+`XrDisplayRenderingModeTrackingInfoDXR` struct and the
+`XrEventDataEyeTrackingStateChangedDXR` event; see
 [Per-Mode Tracking Capability + Tracking-State Event (v14)](#7c-per-mode-tracking-capability--tracking-state-event-v14)):
 
 | Function | Added | Purpose |
 |---|---|---|
-| [`xrEnumerateDisplayRenderingModesEXT`](#enumerating-rendering-modes-v8--xrdisplayrenderingmodeinfoext--xrenumeratedisplayrenderingmodesext) | v8 | Enumerate available rendering modes (`XrDisplayRenderingModeInfoEXT`). |
-| [`xrRequestDisplayRenderingModeEXT`](#7-display-rendering-mode-control-v7) | v7 | Request a rendering mode by index (the unified mode-control API). |
-| [`xrRequestEyeTrackingModeEXT`](#new-function-xrrequesteyetrackingmodeext) | v6 | Switch between managed and manual eye tracking. |
-| `xrRequestDisplayModeEXT` | v4 (**repurposed** v15) | Hardware-state-only override for the current mode (was a deprecated mode-switching wrapper through v14). |
+| [`xrEnumerateDisplayRenderingModesDXR`](#enumerating-rendering-modes-v8--xrdisplayrenderingmodeinfoext--xrenumeratedisplayrenderingmodesext) | v8 | Enumerate available rendering modes (`XrDisplayRenderingModeInfoDXR`). |
+| [`xrRequestDisplayRenderingModeDXR`](#7-display-rendering-mode-control-v7) | v7 | Request a rendering mode by index (the unified mode-control API). |
+| [`xrRequestEyeTrackingModeDXR`](#new-function-xrrequesteyetrackingmodeext) | v6 | Switch between managed and manual eye tracking. |
+| `xrRequestDisplayModeDXR` | v4 (**repurposed** v15) | Hardware-state-only override for the current mode (was a deprecated mode-switching wrapper through v14). |
 
-#### xrRequestDisplayModeEXT
+#### xrRequestDisplayModeDXR
 
 > **Repurposed in v15.** Through v14 this function was a deprecated thin wrapper that found
 > the first rendering mode matching the requested hardware state and delegated to
-> `xrRequestDisplayRenderingModeEXT` (i.e. it *switched modes*). As of v15 it is the
+> `xrRequestDisplayRenderingModeDXR` (i.e. it *switched modes*). As of v15 it is the
 > **hardware-state-only override**: a rendering mode is a complete recipe — layout, view
-> count, scales, **and a default hardware state** — and `xrRequestDisplayRenderingModeEXT`
+> count, scales, **and a default hardware state** — and `xrRequestDisplayRenderingModeDXR`
 > requests a mode with the hardware following automatically. THIS function sets the
 > hardware state **alone**, leaving the active mode, the application's content, and the
 > display processor's atlas processing untouched. No caller of the pre-v15 wrapper
@@ -808,9 +808,9 @@ Requests the physical 2D/3D display state (e.g. the switchable lenticular lens) 
 **current** rendering mode, without changing the mode.
 
 ```c
-XrResult xrRequestDisplayModeEXT(
+XrResult xrRequestDisplayModeDXR(
     XrSession           session,
-    XrDisplayModeEXT    mode);
+    XrDisplayModeDXR    mode);
 ```
 
 **Parameters:**
@@ -818,14 +818,14 @@ XrResult xrRequestDisplayModeEXT(
 | Parameter | Description |
 |---|---|
 | `session` | A valid `XrSession` handle. |
-| `mode` | The requested hardware state (`XR_DISPLAY_MODE_2D_EXT` or `XR_DISPLAY_MODE_3D_EXT`). |
+| `mode` | The requested hardware state (`XR_DISPLAY_MODE_2D_DXR` or `XR_DISPLAY_MODE_3D_DXR`). |
 
 **Return Codes:**
 
 | Code | Meaning |
 |---|---|
 | `XR_SUCCESS` | The hardware-state request was accepted by the runtime. |
-| `XR_ERROR_VALIDATION_FAILURE` | `mode` is not a valid `XrDisplayModeEXT` value. |
+| `XR_ERROR_VALIDATION_FAILURE` | `mode` is not a valid `XrDisplayModeDXR` value. |
 | `XR_ERROR_HANDLE_INVALID` | The session handle is invalid. |
 
 **Semantics:**
@@ -834,15 +834,15 @@ XrResult xrRequestDisplayModeEXT(
   and scales), the application's submission, and the display processor's atlas processing
   are unaffected. The display processor keeps weaving a multi-view atlas or flat-blitting
   a single-view atlas exactly as the content dictates — only the physical 2D/3D element
-  changes. Requesting `XR_DISPLAY_MODE_2D_EXT` over an active 3D mode therefore shows the
+  changes. Requesting `XR_DISPLAY_MODE_2D_DXR` over an active 3D mode therefore shows the
   *woven* atlas flat (blurry); an application fading its parallax to zero converges back
   to a sharp image — the building block for app-authored 2D↔3D transitions such as the
   MANUAL eye-tracking loss flow.
 - **Lifetime of the override.** The override holds until the next
-  `xrRequestDisplayRenderingModeEXT` call, whose mode's default hardware state then
+  `xrRequestDisplayRenderingModeDXR` call, whose mode's default hardware state then
   applies (re-requesting the current mode index restores its default).
-- A successful state flip is reported via `XrEventDataHardwareDisplayStateChangedEXT`.
-  No `XrEventDataRenderingModeChangedEXT` is fired — the mode did not change.
+- A successful state flip is reported via `XrEventDataHardwareDisplayStateChangedDXR`.
+  No `XrEventDataRenderingModeChangedDXR` is fired — the mode did not change.
 - This function is a **request**, not a guarantee. The runtime forwards it to the
   underlying platform SDK via the display processor (some vendors implement it as a
   preference-based hint, others as direct hardware control). The platform may aggregate
@@ -856,16 +856,16 @@ The runtime manages display mode transitions automatically as part of the sessio
 lifecycle:
 
 - When the session transitions to the **READY** state, the runtime **automatically
-  requests** `XR_DISPLAY_MODE_3D_EXT` on displays that support mode switching.
+  requests** `XR_DISPLAY_MODE_3D_DXR` on displays that support mode switching.
 - When the session transitions to the **STOPPING** state (or is destroyed), the runtime
-  **automatically requests** `XR_DISPLAY_MODE_2D_EXT`.
+  **automatically requests** `XR_DISPLAY_MODE_2D_DXR`.
 
-This ensures correct behavior for applications that never call `xrRequestDisplayModeEXT`:
+This ensures correct behavior for applications that never call `xrRequestDisplayModeDXR`:
 the display enters 3D mode when the XR session starts and returns to 2D mode when it ends.
 
 #### Explicit Override
 
-The application **may** call `xrRequestDisplayModeEXT` at any time during the session to
+The application **may** call `xrRequestDisplayModeDXR` at any time during the session to
 override the automatic behavior. Use cases include:
 
 - Temporarily switching to 2D mode for a settings menu or 2D video playback.
@@ -892,7 +892,7 @@ significant quality improvement for 2D content.
   field interlacing (weaving), since 2D mode does not use the lenticular optics.
 
 **Application responsibilities:**
-- Detect 2D mode (via a prior call to `xrRequestDisplayModeEXT` or an application toggle).
+- Detect 2D mode (via a prior call to `xrRequestDisplayModeDXR` or an application toggle).
 - Create or reuse a swapchain at full window/display resolution for the mono view.
 - Render a single view using a center-eye camera position and full-resolution viewport.
 - Submit `viewCount == 1` with the single projection view to `xrEndFrame`.
@@ -906,23 +906,23 @@ significant quality improvement for 2D content.
 
 #### Implementation Notes
 
-The runtime translates `xrRequestDisplayModeEXT` into the appropriate vendor SDK call via the
+The runtime translates `xrRequestDisplayModeDXR` into the appropriate vendor SDK call via the
 display processor's `set_property` method. Vendor implementations vary — a preference-based
 hint aggregated across applications, or direct hardware (backlight/optics) control. For the
 concrete per-platform mapping of the first vendor integration, see
 [Leia display mode switching](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/docs/display-mode-switching.md).
 
 This abstraction also operates through:
-- `XrDisplayInfoEXT` chaining to `xrGetSystemProperties`.
-- `xrRequestDisplayModeEXT` for explicit display mode control.
+- `XrDisplayInfoDXR` chaining to `xrGetSystemProperties`.
+- `xrRequestDisplayModeDXR` for explicit display mode control.
 
 ### New Event Types (v10)
 
 Two new event types are delivered via `xrPollEvent` to notify applications of asynchronous state changes:
 
-- **`XrEventDataRenderingModeChangedEXT`** — fired when the active display rendering mode changes (e.g., after a call to `xrRequestDisplayRenderingModeEXT` completes, or when the runtime changes modes autonomously). Applications that need to react to rendering mode transitions (e.g., reconfigure swapchains or shaders) should poll for this event.
+- **`XrEventDataRenderingModeChangedDXR`** — fired when the active display rendering mode changes (e.g., after a call to `xrRequestDisplayRenderingModeDXR` completes, or when the runtime changes modes autonomously). Applications that need to react to rendering mode transitions (e.g., reconfigure swapchains or shaders) should poll for this event.
 
-- **`XrEventDataHardwareDisplayStateChangedEXT`** — fired when the hardware 3D display state changes (e.g., the switchable lenses or backlight are enabled or disabled). Applications can use this event to update their UI or rendering pipeline in response to system-level display state changes.
+- **`XrEventDataHardwareDisplayStateChangedDXR`** — fired when the hardware 3D display state changes (e.g., the switchable lenses or backlight are enabled or disabled). Applications can use this event to update their UI or rendering pipeline in response to system-level display state changes.
 
 ### Example Code: Querying Display Mode Support and Requesting 2D
 
@@ -933,29 +933,29 @@ Two new event types are delivered via `xrPollEvent` to notify applications of as
 > [`docs/guides/displayxr-app-rules.md`](../../guides/displayxr-app-rules.md):
 > 1. **View arrays must be `XRT_MAX_VIEWS` (8)-sized, not `[2]`**, and render loops must be
 >    bounded by the **active mode's `viewCount`**, not a hardcoded 2 (quad modes have 4 views).
-> 2. **`hardwareDisplay3D` is no longer a field on `XrDisplayInfoEXT`** (v13). It lives per-mode on
->    `XrDisplayRenderingModeInfoEXT` and on the `XrEventDataHardwareDisplayStateChangedEXT` event.
-> 3. **`xrRequestDisplayModeEXT` / `XR_DISPLAY_MODE_*_EXT` are deprecated** in favor of
->    `xrRequestDisplayRenderingModeEXT(session, modeIndex)` driven by mode enumeration; mode changes
->    are *requests* — update local state only on `XrEventDataRenderingModeChangedEXT`.
+> 2. **`hardwareDisplay3D` is no longer a field on `XrDisplayInfoDXR`** (v13). It lives per-mode on
+>    `XrDisplayRenderingModeInfoDXR` and on the `XrEventDataHardwareDisplayStateChangedDXR` event.
+> 3. **`xrRequestDisplayModeDXR` / `XR_DISPLAY_MODE_*_EXT` are deprecated** in favor of
+>    `xrRequestDisplayRenderingModeDXR(session, modeIndex)` driven by mode enumeration; mode changes
+>    are *requests* — update local state only on `XrEventDataRenderingModeChangedDXR`.
 
 ```cpp
 // Query display capabilities
 XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
-XrDisplayInfoEXT displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
+XrDisplayInfoDXR displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
 sysProps.next = &displayInfo;
 xrGetSystemProperties(instance, systemId, &sysProps);
 
-// NOTE (v13): hardwareDisplay3D is NOT on XrDisplayInfoEXT anymore — enumerate
-// rendering modes (xrEnumerateDisplayRenderingModesEXT) and read it per-mode on
-// XrDisplayRenderingModeInfoEXT. The pseudo-code below uses the DEPRECATED
-// xrRequestDisplayModeEXT API; the current path is xrRequestDisplayRenderingModeEXT
-// (request a mode index, then react to XrEventDataRenderingModeChangedEXT).
+// NOTE (v13): hardwareDisplay3D is NOT on XrDisplayInfoDXR anymore — enumerate
+// rendering modes (xrEnumerateDisplayRenderingModesDXR) and read it per-mode on
+// XrDisplayRenderingModeInfoDXR. The pseudo-code below uses the DEPRECATED
+// xrRequestDisplayModeDXR API; the current path is xrRequestDisplayRenderingModeDXR
+// (request a mode index, then react to XrEventDataRenderingModeChangedDXR).
 if (/* a 3D-capable rendering mode exists */ false) {
     // Example (deprecated API shown for historical context only):
-    //   xrRequestDisplayModeEXT(session, XR_DISPLAY_MODE_2D_EXT);   // -> request a 2D mode index
+    //   xrRequestDisplayModeDXR(session, XR_DISPLAY_MODE_2D_DXR);   // -> request a 2D mode index
     //   ... user interacts with 2D menu ...
-    //   xrRequestDisplayModeEXT(session, XR_DISPLAY_MODE_3D_EXT);   // -> request a 3D mode index
+    //   xrRequestDisplayModeDXR(session, XR_DISPLAY_MODE_3D_DXR);   // -> request a 3D mode index
 }
 
 // Example: mono submission in 2D mode
@@ -1075,7 +1075,7 @@ renderHeight = (uint32_t)(windowHeight * recommendedViewScaleY)
 
 ### RAW Mode
 
-When `XR_EXT_display_info` is enabled, `xrLocateViews()` returns views in **RAW mode**:
+When `XR_DXR_display_info` is enabled, `xrLocateViews()` returns views in **RAW mode**:
 
 - `XrView.pose.position` — the physical eye center in screen-centered coordinates
   (origin at display center, +X right, +Y up, +Z toward viewer).
@@ -1105,7 +1105,7 @@ and `(eyeX, eyeY, eyeZ)` is the eye position from `XrView.pose.position` (screen
 
 ### RENDER_READY Mode
 
-When `XR_EXT_display_info` is **not** enabled (or when explicitly overridden), the runtime
+When `XR_DXR_display_info` is **not** enabled (or when explicitly overridden), the runtime
 returns views in **RENDER_READY mode**:
 
 - `XrView.pose` — view pose with convergence and comfort adjustments applied by the
@@ -1122,9 +1122,9 @@ returned `XrFovf` using the standard OpenXR projection formula.
 ### Example Code: Querying Display Info
 
 ```cpp
-// Chain XrDisplayInfoEXT to XrSystemProperties
+// Chain XrDisplayInfoDXR to XrSystemProperties
 XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
-XrDisplayInfoEXT displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
+XrDisplayInfoDXR displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
 sysProps.next = &displayInfo;
 
 xrGetSystemProperties(instance, systemId, &sysProps);
@@ -1136,15 +1136,15 @@ float scaleX = displayInfo.recommendedViewScaleX;             // e.g. 0.5
 float scaleY = displayInfo.recommendedViewScaleY;             // e.g. 1.0
 XrVector3f nominalPos = displayInfo.nominalViewerPositionInDisplaySpace;
 // nominalPos ~ {0.0, 0.0, 0.65}
-// NOTE (v13): hardwareDisplay3D is NOT on XrDisplayInfoEXT — read it per-mode on
-// XrDisplayRenderingModeInfoEXT (via xrEnumerateDisplayRenderingModesEXT) or from the
-// XrEventDataHardwareDisplayStateChangedEXT event.
+// NOTE (v13): hardwareDisplay3D is NOT on XrDisplayInfoDXR — read it per-mode on
+// XrDisplayRenderingModeInfoDXR (via xrEnumerateDisplayRenderingModesDXR) or from the
+// XrEventDataHardwareDisplayStateChangedDXR event.
 ```
 
 ### Example Code: Locating Views in RAW Mode
 
 ```cpp
-// In RAW mode (XR_EXT_display_info enabled), xrLocateViews returns
+// In RAW mode (XR_DXR_display_info enabled), xrLocateViews returns
 // screen-centered eye positions regardless of the space parameter.
 // Use LOCAL space for both view location and layer submission.
 XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
@@ -1177,7 +1177,7 @@ xrLocateViews(session, &locateInfo, &viewState, 8, &viewCount, views);
 > budget, or near/far planes in ways that a fixed runtime function cannot anticipate.
 
 This function computes the off-axis projection matrix from a tracked eye position and the
-physical display geometry, both obtained from `XR_EXT_display_info`:
+physical display geometry, both obtained from `XR_DXR_display_info`:
 
 ```cpp
 Matrix4x4 ComputeKooimaProjection(
@@ -1274,7 +1274,7 @@ if (frameState.shouldRender) {
     for (uint32_t i = 0; i < 8; i++) views[i] = {XR_TYPE_VIEW};
     xrLocateViews(session, &locateInfo, &viewState, 8, &viewCount, views);
     // Number of views to actually render/submit = the ACTIVE mode's viewCount
-    // (from the enumerated XrDisplayRenderingModeInfoEXT), not necessarily viewCount.
+    // (from the enumerated XrDisplayRenderingModeInfoDXR), not necessarily viewCount.
     uint32_t renderViewCount = activeMode.viewCount;  // 1 (mono) / 2 (SBS) / 4 (quad)
 
     // --- Compute dynamic render resolution ---
@@ -1336,8 +1336,8 @@ if (frameState.shouldRender) {
     projLayer.viewCount = renderViewCount;
     projLayer.views = projViews;
 
-    XrCompositionLayerWindowSpaceEXT hudLayer = {};
-    hudLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT;
+    XrCompositionLayerWindowSpaceDXR hudLayer = {};
+    hudLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR;
     hudLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
     hudLayer.subImage.swapchain = hudSwapchain;
     hudLayer.subImage.imageRect = {{0,0}, {(int32_t)hudW, (int32_t)hudH}};
@@ -1374,17 +1374,17 @@ All extensions require OpenXR 1.0 and depend on core concepts: `XrInstance`, `Xr
 
 | Extension | Platform Requirement |
 |---|---|
-| `XR_EXT_win32_window_binding` | **Win32 only**. Requires a Win32 platform graphics binding (`XR_KHR_D3D11_enable` or `XR_KHR_opengl_enable`). |
+| `XR_DXR_win32_window_binding` | **Win32 only**. Requires a Win32 platform graphics binding (`XR_KHR_D3D11_enable` or `XR_KHR_opengl_enable`). |
 | `XR_EXT_android_surface_binding` | **Android only**. Requires an Android-compatible graphics binding (`XR_KHR_vulkan_enable` or `XR_KHR_opengl_es_enable`). |
-| `XR_EXT_display_info` | **Platform-independent**. Works on any platform with a tracked 3D display. |
+| `XR_DXR_display_info` | **Platform-independent**. Works on any platform with a tracked 3D display. |
 
 ### Graphics API Interactions
 
 **Win32:**
-- **`XR_KHR_D3D11_enable`**: `XrWin32WindowBindingCreateInfoEXT` chains to
+- **`XR_KHR_D3D11_enable`**: `XrWin32WindowBindingCreateInfoDXR` chains to
   `XrGraphicsBindingD3D11KHR.next`. The runtime creates a D3D11 swap chain on the
   provided HWND.
-- **`XR_KHR_opengl_enable`**: `XrWin32WindowBindingCreateInfoEXT` chains to
+- **`XR_KHR_opengl_enable`**: `XrWin32WindowBindingCreateInfoDXR` chains to
   `XrGraphicsBindingOpenGLWin32KHR.next`. The runtime renders using the provided OpenGL
   context and the window's device context.
 
@@ -1398,25 +1398,25 @@ All extensions require OpenXR 1.0 and depend on core concepts: `XrInstance`, `Xr
 
 ### Cross-Extension Interaction
 
-The window/surface binding extensions and `XR_EXT_display_info` are **independent**:
+The window/surface binding extensions and `XR_DXR_display_info` are **independent**:
 
 - No extension requires any other.
-- Enabling a window/surface binding together with `XR_EXT_display_info` gives the
+- Enabling a window/surface binding together with `XR_DXR_display_info` gives the
   application full control: app-owned rendering surface + app-owned camera model +
   display mode switching.
 - Enabling only a window/surface binding allows app-owned rendering surface with
   runtime-owned stereo views (RENDER_READY).
-- Enabling only `XR_EXT_display_info` allows display geometry queries, RAW eye
+- Enabling only `XR_DXR_display_info` allows display geometry queries, RAW eye
   positions, and display mode control while the runtime manages the display surface.
-- `XR_EXT_win32_window_binding` and `XR_EXT_android_surface_binding` are **mutually
+- `XR_DXR_win32_window_binding` and `XR_EXT_android_surface_binding` are **mutually
   exclusive** platform variants.
 
 ### Interaction with XR_KHR_composition_layer_quad
 
-`XrCompositionLayerWindowSpaceEXT` and `XrCompositionLayerQuad` serve different purposes:
+`XrCompositionLayerWindowSpaceDXR` and `XrCompositionLayerQuad` serve different purposes:
 
 - `XrCompositionLayerQuad` positions content in 3D space (meters, in an XrSpace).
-- `XrCompositionLayerWindowSpaceEXT` positions content in fractional window/surface
+- `XrCompositionLayerWindowSpaceDXR` positions content in fractional window/surface
   coordinates, automatically adapting to resize. It is the natural choice for HUD overlays
   on tracked 3D displays. This layer type works with both Win32 and Android surface
   bindings.
@@ -1449,8 +1449,8 @@ runtime, backward-compatible SDK rule:
 
 The OpenXR driver should build against the **latest** vendor SDK but **check API
 availability at runtime** and degrade gracefully when features are not supported by the
-installed runtime. The `XR_EXT_display_info` extension's capability reporting
-(`XrDisplayInfoEXT`, `XrEyeTrackingModeCapabilitiesEXT`) reflects only what the device
+installed runtime. The `XR_DXR_display_info` extension's capability reporting
+(`XrDisplayInfoDXR`, `XrEyeTrackingModeCapabilitiesDXR`) reflects only what the device
 actually supports, not the full SDK API surface.
 
 See the archived **Vendor Integration Guide** (`docs/archive/vendor-integration-historical.md` §13)
@@ -1479,7 +1479,7 @@ and makes the API simpler.
 The runtime already knows the window size and controls swapchain dimensions. However,
 exposing scale factors to the application provides better separation of concern in windowed
 mode: the application knows its own window dimensions (it owns the window via
-`XR_EXT_win32_window_binding`), so a simple multiply gives the optimal texture size without
+`XR_DXR_win32_window_binding`), so a simple multiply gives the optimal texture size without
 the runtime needing to track window resize events, recompute the ratio of window size to
 monitor native resolution, and re-scale the vendor SDK's recommended render size. The app-side
 formula `windowWidth * scaleX` is trivial, deterministic, and requires no runtime round-trip.
@@ -1493,7 +1493,7 @@ performance scaling.
 *Problem*: How should the display's coordinate frame be exposed? Options: (a) a new
 reference space type, or (b) implicit via RAW mode behavior.
 
-*Resolution*: **No new reference space**. In RAW mode (`XR_EXT_display_info` enabled),
+*Resolution*: **No new reference space**. In RAW mode (`XR_DXR_display_info` enabled),
 `xrLocateViews` returns eye positions in screen-centered coordinates regardless of the
 reference space parameter. The display coordinate frame (origin at display center, +X right,
 +Y up, +Z toward viewer) is implicit in the returned positions. Applications pass LOCAL
@@ -1516,7 +1516,7 @@ avoids adding a new API entry point and leverages the existing `next` chain mech
 
 **RESOLVED 4: Where to chain the window binding struct.**
 
-*Problem*: `XrWin32WindowBindingCreateInfoEXT` could chain directly to
+*Problem*: `XrWin32WindowBindingCreateInfoDXR` could chain directly to
 `XrSessionCreateInfo.next` or to the graphics binding's `next` pointer.
 
 *Resolution*: **Chain to the graphics binding**. The window handle is logically associated
@@ -1569,21 +1569,21 @@ exactly the flexibility that motivated the RAW mode design.
 
 **RESOLVED 7: Platform variants for window/surface binding.**
 
-*Problem*: `XR_EXT_win32_window_binding` is Win32-specific. How should other
+*Problem*: `XR_DXR_win32_window_binding` is Win32-specific. How should other
 platforms provide equivalent functionality?
 
 *Resolution*: **Per-platform surface binding extensions.** Each platform extension
 follows the same structural pattern — chain a platform-specific surface handle to the
-graphics binding at session creation. The `XrCompositionLayerWindowSpaceEXT` layer type
+graphics binding at session creation. The `XrCompositionLayerWindowSpaceDXR` layer type
 is platform-independent and works with all surface binding variants.
 
 Implemented:
 - `XR_EXT_android_surface_binding` (with `ANativeWindow*` + Java `Surface`)
-- `XR_EXT_cocoa_window_binding` (with `NSView*` backed by `CAMetalLayer`)
+- `XR_DXR_cocoa_window_binding` (with `NSView*` backed by `CAMetalLayer`)
 
 Future platforms would follow the same pattern:
 - `XR_EXT_wayland_surface_binding` (with `wl_surface*`)
-- `XR_EXT_xlib_window_binding` (with X11 `Window`)
+- `XR_DXR_xlib_window_binding` (with X11 `Window`)
 
 ---
 
@@ -1595,10 +1595,10 @@ this capability, and if so, how?
 
 *Resolution*: **Capability flag + request function with automatic lifecycle.**
 
-- `XrDisplayInfoEXT` includes `hardwareDisplay3D` (`XrBool32`) so the application
+- `XrDisplayInfoDXR` includes `hardwareDisplay3D` (`XrBool32`) so the application
   can discover whether the display is a hardware 3D display capable of mode switching. Not all tracked 3D displays support
   switching — some are always-3D — so the capability must be queryable.
-- `xrRequestDisplayModeEXT(session, mode)` allows explicit mode control. The function is
+- `xrRequestDisplayModeDXR(session, mode)` allows explicit mode control. The function is
   a **request** (not a hard set) because the underlying platform may aggregate preferences
   across applications (some vendors implement it as a preference-based hint) or may defer the switch.
 - The runtime automatically requests 3D mode when the session becomes READY and 2D mode
@@ -1625,7 +1625,7 @@ this capability, and if so, how?
 The current design assumes a single tracked 3D display per system. Multi-display scenarios
 (e.g., multiple tracked monitors in a workstation) would require:
 - A way to enumerate multiple displays per system.
-- Per-display `XrDisplayInfoEXT` queries.
+- Per-display `XrDisplayInfoDXR` queries.
 - Possibly per-display DISPLAY spaces.
 
 This is out of scope for the initial extension but should be considered in future revisions.
@@ -1709,7 +1709,7 @@ existing OpenXR contract already handles this transparently:
 
 - `xrLocateViews` always returns poses regardless of whether tracking hardware is present.
   For a non-tracked display, the runtime returns static default poses (e.g., standard 63 mm
-  IPD at the nominal viewer position, which is already part of `XrDisplayInfoEXT`).
+  IPD at the nominal viewer position, which is already part of `XrDisplayInfoDXR`).
 - `XrViewState` flags (`XR_VIEW_STATE_POSITION_TRACKED_BIT`,
   `XR_VIEW_STATE_ORIENTATION_TRACKED_BIT`) already signal whether the returned poses are
   actively tracked or fallback values. Applications that care can check these flags.
@@ -1730,62 +1730,62 @@ tracking loss themselves (e.g., custom transition animations, UI overlays).
 
 ### New Types
 
-#### `XrEyeTrackingModeEXT` — Mode Enum
+#### `XrEyeTrackingModeDXR` — Mode Enum
 
 ```c
-typedef enum XrEyeTrackingModeEXT {
-    XR_EYE_TRACKING_MODE_MANAGED_EXT  = 0,  // default: SDK handles smoothing
-    XR_EYE_TRACKING_MODE_MANUAL_EXT   = 1,  // app handles tracking loss
-    XR_EYE_TRACKING_MODE_MAX_ENUM_EXT = 0x7FFFFFFF
-} XrEyeTrackingModeEXT;
+typedef enum XrEyeTrackingModeDXR {
+    XR_EYE_TRACKING_MODE_MANAGED_DXR  = 0,  // default: SDK handles smoothing
+    XR_EYE_TRACKING_MODE_MANUAL_DXR   = 1,  // app handles tracking loss
+    XR_EYE_TRACKING_MODE_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrEyeTrackingModeDXR;
 ```
 
 `MANAGED = 0` ensures zero-init defaults to current behavior for legacy apps.
 
-#### `XrEyeTrackingModeCapabilityFlagsEXT` — Capability Bitmask
+#### `XrEyeTrackingModeCapabilityFlagsDXR` — Capability Bitmask
 
 ```c
-typedef XrFlags64 XrEyeTrackingModeCapabilityFlagsEXT;
-XR_EYE_TRACKING_MODE_CAPABILITY_NONE_EXT       = 0            // no tracking
-XR_EYE_TRACKING_MODE_CAPABILITY_MANAGED_BIT_EXT = 0x00000001
-XR_EYE_TRACKING_MODE_CAPABILITY_MANUAL_BIT_EXT  = 0x00000002
+typedef XrFlags64 XrEyeTrackingModeCapabilityFlagsDXR;
+XR_EYE_TRACKING_MODE_CAPABILITY_NONE_DXR       = 0            // no tracking
+XR_EYE_TRACKING_MODE_CAPABILITY_MANAGED_BIT_DXR = 0x00000001
+XR_EYE_TRACKING_MODE_CAPABILITY_MANUAL_BIT_DXR  = 0x00000002
 ```
 
 A runtime that supports both modes sets `supportedModes = MANAGED_BIT | MANUAL_BIT`.
 A display with no eye tracking sets `supportedModes = 0`.
 
-#### `XrEyeTrackingModeCapabilitiesEXT` — Extends `XrSystemProperties`
+#### `XrEyeTrackingModeCapabilitiesDXR` — Extends `XrSystemProperties`
 
 ```c
-typedef struct XrEyeTrackingModeCapabilitiesEXT {
-    XrStructureType                        type;           // XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT
+typedef struct XrEyeTrackingModeCapabilitiesDXR {
+    XrStructureType                        type;           // XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR
     void* XR_MAY_ALIAS                     next;
-    XrEyeTrackingModeCapabilityFlagsEXT    supportedModes; // bitmask
-    XrEyeTrackingModeEXT                   defaultMode;    // mode used if app never requests one
-} XrEyeTrackingModeCapabilitiesEXT;
+    XrEyeTrackingModeCapabilityFlagsDXR    supportedModes; // bitmask
+    XrEyeTrackingModeDXR                   defaultMode;    // mode used if app never requests one
+} XrEyeTrackingModeCapabilitiesDXR;
 ```
 
-Chained to `XrSystemProperties` alongside `XrDisplayInfoEXT`. If `supportedModes == 0`,
+Chained to `XrSystemProperties` alongside `XrDisplayInfoDXR`. If `supportedModes == 0`,
 the display has no eye tracking; `defaultMode` is undefined and
-`xrRequestEyeTrackingModeEXT` returns `XR_ERROR_FEATURE_UNSUPPORTED` for any mode.
+`xrRequestEyeTrackingModeDXR` returns `XR_ERROR_FEATURE_UNSUPPORTED` for any mode.
 
-#### `XrViewEyeTrackingStateEXT` — Extends `XrViewState`
+#### `XrViewEyeTrackingStateDXR` — Extends `XrViewState`
 
 ```c
-typedef struct XrViewEyeTrackingStateEXT {
-    XrStructureType           type;       // XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT
+typedef struct XrViewEyeTrackingStateDXR {
+    XrStructureType           type;       // XR_TYPE_VIEW_EYE_TRACKING_STATE_DXR
     void* XR_MAY_ALIAS        next;
     XrBool32                  isTracking; // XR_TRUE if eyes are actively tracked
-    XrEyeTrackingModeEXT     activeMode; // currently active mode
-} XrViewEyeTrackingStateEXT;
+    XrEyeTrackingModeDXR     activeMode; // currently active mode
+} XrViewEyeTrackingStateDXR;
 ```
 
 Opt-in: only populated if the app chains this struct to `XrViewState` in `xrLocateViews`.
 
-### New Function: `xrRequestEyeTrackingModeEXT`
+### New Function: `xrRequestEyeTrackingModeDXR`
 
 ```c
-XrResult xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeEXT mode);
+XrResult xrRequestEyeTrackingModeDXR(XrSession session, XrEyeTrackingModeDXR mode);
 ```
 
 **Return codes:**
@@ -1821,7 +1821,7 @@ XrResult xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeEXT mod
 - `isTracking` flips immediately on tracking loss — no grace period hiding
 - Vendor continues returning valid eye positions without animation: actual tracked
   positions if the tracker still sees the viewer, or last known position if not
-- No automatic 2D/3D switching — app calls `xrRequestDisplayRenderingModeEXT` explicitly
+- No automatic 2D/3D switching — app calls `xrRequestDisplayRenderingModeDXR` explicitly
 - App uses `isTracking` + the still-valid eye positions to design its own transitions
 
 See `docs/specs/vendor/eye-tracking-modes.md` for the full MANAGED/MANUAL contract.
@@ -1829,8 +1829,8 @@ See `docs/specs/vendor/eye-tracking-modes.md` for the full MANAGED/MANUAL contra
 ### Backward Compatibility
 
 - Apps compiled against v5 are unaffected: new structs/function are opt-in
-- `MANAGED = 0` means apps that never call `xrRequestEyeTrackingModeEXT` get unchanged behavior
-- `XrViewEyeTrackingStateEXT` is only populated if chained by the app
+- `MANAGED = 0` means apps that never call `xrRequestEyeTrackingModeDXR` get unchanged behavior
+- `XrViewEyeTrackingStateDXR` is only populated if chained by the app
 
 ### Vendor Examples
 
@@ -1851,27 +1851,27 @@ Tracking capability is not uniform across a display's rendering modes. A vendor 
 a **"2D tracked"** mode (content presented in 2D while the viewer remains eye-tracked, e.g.
 for head-coupled UI) alongside the default tracked 3D mode and fully untracked export modes
 (side-by-side, anaglyph). v13 and earlier could only express tracking capability
-system-wide via `XrEyeTrackingModeCapabilitiesEXT.supportedModes`.
+system-wide via `XrEyeTrackingModeCapabilitiesDXR.supportedModes`.
 
-Separately, MANUAL-mode apps had to poll `XrViewEyeTrackingStateEXT.isTracking` every
+Separately, MANUAL-mode apps had to poll `XrViewEyeTrackingStateDXR.isTracking` every
 `xrLocateViews` to detect tracking loss; an edge-triggered event is the right primitive.
 
-### `XrDisplayRenderingModeTrackingInfoEXT` — chained per enumerated mode
+### `XrDisplayRenderingModeTrackingInfoDXR` — chained per enumerated mode
 
 ```c
-#define XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_EXT ((XrStructureType)1000999012)
+#define XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_DXR ((XrStructureType)1004999012)
 
-typedef struct XrDisplayRenderingModeTrackingInfoEXT {
-    XrStructureType    type;        // XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_EXT
+typedef struct XrDisplayRenderingModeTrackingInfoDXR {
+    XrStructureType    type;        // XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_DXR
     void* XR_MAY_ALIAS next;
     XrBool32           hasTracking; // mode consumes live eye tracking
-} XrDisplayRenderingModeTrackingInfoEXT;
+} XrDisplayRenderingModeTrackingInfoDXR;
 ```
 
 The application chains one instance to the `next` pointer of **each**
-`XrDisplayRenderingModeInfoEXT` element it wants the capability for, before calling
-`xrEnumerateDisplayRenderingModesEXT`, **and pre-sets each element's `type` to
-`XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT`** (standard OpenXR input convention). The
+`XrDisplayRenderingModeInfoDXR` element it wants the capability for, before calling
+`xrEnumerateDisplayRenderingModesDXR`, **and pre-sets each element's `type` to
+`XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR`** (standard OpenXR input convention). The
 type value is the opt-in handshake: v13-and-earlier binaries leave `type`/`next`
 uninitialized (the runtime always overwrote them), so the runtime only walks the chain of
 elements carrying the correct input type — and keeps nulling `next` for everyone else,
@@ -1879,37 +1879,37 @@ exactly as in v13. The runtime fills `hasTracking` for every chained element.
 
 > **Why a chained struct, not a field append — layout-freeze policy.** The runtime's
 > enumerate fill writes array elements with its own compiled struct stride. Appending
-> fields to `XrDisplayRenderingModeInfoEXT` (as v12/v13 did) silently corrupts memory in
+> fields to `XrDisplayRenderingModeInfoDXR` (as v12/v13 did) silently corrupts memory in
 > application binaries compiled against an older header — there is no version handshake on
-> the app ABI to reject them cleanly. **`XrDisplayRenderingModeInfoEXT` is therefore frozen
+> the app ABI to reject them cleanly. **`XrDisplayRenderingModeInfoDXR` is therefore frozen
 > at its v13 layout; all future per-mode fields MUST be added as chained structs.** This is
 > the canonical OpenXR pattern for extending enumerated output structs.
 
 **Semantics:**
 
 - `hasTracking == XR_FALSE` on the active mode forces
-  `XrViewEyeTrackingStateEXT.isTracking = XR_FALSE`, regardless of tracker state. The
+  `XrViewEyeTrackingStateDXR.isTracking = XR_FALSE`, regardless of tracker state. The
   runtime derives: `isTracking = activeMode.hasTracking && dp.is_tracking`.
 - `xrLocateViews` still ALWAYS returns fully populated views in every mode — in untracked
   modes positions derive from the nominal viewer (or whatever the vendor chooses).
-- Consistency rule: `XrEyeTrackingModeCapabilitiesEXT.supportedModes != 0` ⇔ at least one
+- Consistency rule: `XrEyeTrackingModeCapabilitiesDXR.supportedModes != 0` ⇔ at least one
   rendering mode reports `hasTracking == XR_TRUE`.
-- `xrRequestEyeTrackingModeEXT` remains a session-level preference validated against
+- `xrRequestEyeTrackingModeDXR` remains a session-level preference validated against
   `supportedModes` only; requesting MANAGED/MANUAL while an untracked mode is active is
   valid and latent.
 
-### `XrEventDataEyeTrackingStateChangedEXT` — tracking-state edge event
+### `XrEventDataEyeTrackingStateChangedDXR` — tracking-state edge event
 
 ```c
-#define XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT ((XrStructureType)1000999013)
+#define XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR ((XrStructureType)1004999013)
 
-typedef struct XrEventDataEyeTrackingStateChangedEXT {
-    XrStructureType          type;       // XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT
+typedef struct XrEventDataEyeTrackingStateChangedDXR {
+    XrStructureType          type;       // XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR
     const void* XR_MAY_ALIAS next;
     XrSession                session;
     XrBool32                 isTracking; // new state
-    XrEyeTrackingModeEXT     activeMode; // session's MANAGED/MANUAL preference at edge time
-} XrEventDataEyeTrackingStateChangedEXT;
+    XrEyeTrackingModeDXR     activeMode; // session's MANAGED/MANUAL preference at edge time
+} XrEventDataEyeTrackingStateChangedDXR;
 ```
 
 Queued on **every edge of the derived `isTracking` value** — DP-reported tracking
@@ -1921,7 +1921,7 @@ never locate views receive no events.
 
 ### Backward Compatibility
 
-- v13-and-earlier binaries: `XrDisplayRenderingModeInfoEXT` layout unchanged; apps that
+- v13-and-earlier binaries: `XrDisplayRenderingModeInfoDXR` layout unchanged; apps that
   don't chain see exactly v13 behavior. The new event type is never delivered to apps that
   don't recognize it any differently than other unhandled events (apps skip unknown
   `xrPollEvent` results by design).
@@ -1945,10 +1945,10 @@ Different 3D display vendors support multiple rendering variations — for examp
 side-by-side stereo, anaglyph, lenticular, or holographic. The runtime needs a
 vendor-neutral way for applications to switch between these modes at runtime.
 
-### New Function: `xrRequestDisplayRenderingModeEXT`
+### New Function: `xrRequestDisplayRenderingModeDXR`
 
 ```c
-XrResult xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex);
+XrResult xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex);
 ```
 
 Switches the active display rendering mode. Mode indices are vendor-defined:
@@ -1959,24 +1959,24 @@ Switches the active display rendering mode. Mode indices are vendor-defined:
 | 1+ | Vendor-specific variations |
 
 A mode change is a **request**, not an immediate state change. The runtime fires
-`XrEventDataRenderingModeChangedEXT` when the active mode actually changes (and
-`XrEventDataHardwareDisplayStateChangedEXT` if the hardware-3D state flips). Applications
+`XrEventDataRenderingModeChangedDXR` when the active mode actually changes (and
+`XrEventDataHardwareDisplayStateChangedDXR` if the hardware-3D state flips). Applications
 **must** update their local mode state from that event, not optimistically at call time. When
 running under a workspace controller, app requests may be dropped — see `isRequestable` below.
 
-### Enumerating Rendering Modes (v8) — `XrDisplayRenderingModeInfoEXT` + `xrEnumerateDisplayRenderingModesEXT`
+### Enumerating Rendering Modes (v8) — `XrDisplayRenderingModeInfoDXR` + `xrEnumerateDisplayRenderingModesDXR`
 
 Before requesting a mode, the application enumerates the modes the runtime exposes. Each mode
 describes its view count, atlas tile layout, per-view scale, hardware-3D state, and (per session)
 whether it is currently active and whether this session is allowed to request it.
 
 ```c
-#define XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT ((XrStructureType)1000999008)
+#define XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR ((XrStructureType)1004999008)
 
-typedef struct XrDisplayRenderingModeInfoEXT {
-    XrStructureType    type;             // XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT
+typedef struct XrDisplayRenderingModeInfoDXR {
+    XrStructureType    type;             // XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR
     void*              next;
-    uint32_t           modeIndex;        // pass to xrRequestDisplayRenderingModeEXT
+    uint32_t           modeIndex;        // pass to xrRequestDisplayRenderingModeDXR
     char               modeName[XR_MAX_SYSTEM_NAME_SIZE]; // human-readable
     uint32_t           viewCount;        // 1 = mono, 2 = stereo, 4 = quad, ...
     float              viewScaleX;       // per-view horizontal scale (vendor-provided)
@@ -1988,27 +1988,27 @@ typedef struct XrDisplayRenderingModeInfoEXT {
     uint32_t           viewHeightPixels; // (v12) per-view height in pixels
     XrBool32           isActive;         // (v13) this mode is the session's active mode
     XrBool32           isRequestable;    // (v13) this session may request this mode
-} XrDisplayRenderingModeInfoEXT;
+} XrDisplayRenderingModeInfoDXR;
 ```
 
 | Member | Description |
 |---|---|
-| `modeIndex` | Vendor-defined index to pass to `xrRequestDisplayRenderingModeEXT`. |
+| `modeIndex` | Vendor-defined index to pass to `xrRequestDisplayRenderingModeDXR`. |
 | `modeName` | Human-readable label (e.g. `"2D"`, `"Stereo SBS"`, `"Quad"`). |
 | `viewCount` | Number of views this mode renders. Drives the `xrLocateViews` render/submit loop bound (1=mono … 4=quad). |
 | `viewScaleX/Y` | Per-view render-resolution scale. The app sizes each tile as `windowSize × viewScale` (see [Recommended View Scale](#recommended-view-scale) and the multiview tiling spec). |
-| `hardwareDisplay3D` | `XR_TRUE` if the display's light-field hardware is active in this mode. **This is the authoritative location** — `hardwareDisplay3D` is *not* a field on `XrDisplayInfoEXT` (removed in v12). |
+| `hardwareDisplay3D` | `XR_TRUE` if the display's light-field hardware is active in this mode. **This is the authoritative location** — `hardwareDisplay3D` is *not* a field on `XrDisplayInfoDXR` (removed in v12). |
 | `tileColumns`, `tileRows` | Atlas tile layout for the mode's views (e.g. `2×1` SBS, `2×2` quad). |
 | `viewWidthPixels`, `viewHeightPixels` | Per-view pixel dimensions for the mode. |
-| `isActive` (v13) | `XR_TRUE` for the mode currently active for this session. Read it on the **first** enumerate after `xrCreateSession` to learn the active mode without waiting for an `XrEventDataRenderingModeChangedEXT` — useful when starting under a workspace that already chose a mode. Re-enumerating after a change reflects the new active mode. |
+| `isActive` (v13) | `XR_TRUE` for the mode currently active for this session. Read it on the **first** enumerate after `xrCreateSession` to learn the active mode without waiting for an `XrEventDataRenderingModeChangedDXR` — useful when starting under a workspace that already chose a mode. Re-enumerating after a change reflects the new active mode. |
 | `isRequestable` (v13) | `XR_TRUE` iff this session may request this mode. **False for non-controller sessions running under a workspace** — there the workspace controller is the sole mode authority and app requests are dropped. Apps should gate their mode-toggle UI on this (e.g. disable the V toggle, show "mode locked by workspace"). Always `XR_TRUE` for standalone sessions and workspace-controller sessions. |
 
 ```c
-XrResult xrEnumerateDisplayRenderingModesEXT(
+XrResult xrEnumerateDisplayRenderingModesDXR(
     XrSession                       session,
     uint32_t                        modeCapacityInput,   // 0 to query count
     uint32_t*                       modeCountOutput,
-    XrDisplayRenderingModeInfoEXT*  modes);
+    XrDisplayRenderingModeInfoDXR*  modes);
 ```
 
 Standard OpenXR two-call enumerate: call with `modeCapacityInput = 0` to read
@@ -2018,11 +2018,11 @@ supplied capacity is too small.
 ```c
 // Two-call enumerate; struct type must be set on every element before the second call.
 uint32_t modeCount = 0;
-xrEnumerateDisplayRenderingModesEXT(session, 0, &modeCount, NULL);
-XrDisplayRenderingModeInfoEXT modes[8];
+xrEnumerateDisplayRenderingModesDXR(session, 0, &modeCount, NULL);
+XrDisplayRenderingModeInfoDXR modes[8];
 for (uint32_t i = 0; i < modeCount && i < 8; i++)
-    modes[i] = (XrDisplayRenderingModeInfoEXT){ .type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT };
-xrEnumerateDisplayRenderingModesEXT(session, modeCount, &modeCount, modes);
+    modes[i] = (XrDisplayRenderingModeInfoDXR){ .type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR };
+xrEnumerateDisplayRenderingModesDXR(session, modeCount, &modeCount, modes);
 
 // Learn the active mode at startup without waiting for an event:
 uint32_t activeIndex = 0;
@@ -2031,7 +2031,7 @@ for (uint32_t i = 0; i < modeCount; i++)
 
 // Request a different mode only if allowed, then wait for the event to update local state:
 if (modes[target].isRequestable)
-    xrRequestDisplayRenderingModeEXT(session, modes[target].modeIndex);
+    xrRequestDisplayRenderingModeDXR(session, modes[target].modeIndex);
 ```
 
 ### Internal Dispatch
@@ -2057,14 +2057,14 @@ the property) silently ignore the call — graceful degradation.
 ### Backward Compatibility
 
 - Apps compiled against v6 are unaffected: the new function is opt-in
-- The runtime never calls `xrRequestDisplayRenderingModeEXT` automatically
+- The runtime never calls `xrRequestDisplayRenderingModeDXR` automatically
 - Drivers that do not handle the property are unaffected
 
 ---
 
 ## 8. Version History
 
-### XR_EXT_win32_window_binding
+### XR_DXR_win32_window_binding
 
 | Revision | Date | Author | Description |
 |---|---|---|---|
@@ -2076,26 +2076,26 @@ the property) silently ignore the call — graceful degradation.
 |---|---|---|---|
 | 1 | 2026-02-13 | David Fattal | Initial version. Android `ANativeWindow` surface binding as platform counterpart to Win32 window binding. |
 
-### XR_EXT_display_info
+### XR_DXR_display_info
 
 | Revision | Date | Author | Description |
 |---|---|---|---|
 | 1 | 2025-01-15 | David Fattal | Initial version with absolute recommended view sizes. |
 | 2 | 2025-03-01 | David Fattal | Replaced absolute sizes with `recommendedViewScaleX/Y` scale factors. Added `XR_REFERENCE_SPACE_TYPE_DISPLAY_EXT`. Added nominal viewer pose. |
 | 3 | 2025-06-01 | David Fattal | Changed `nominalViewerPoseInDisplaySpace` from `XrPosef` to `XrVector3f nominalViewerPositionInDisplaySpace`. Orientation was always identity; position is now populated from the vendor SDK's default-viewing-position query. |
-| 4 | 2026-02-13 | David Fattal | Added `supportsDisplayModeSwitch` capability flag, `XrDisplayModeEXT` enum, and `xrRequestDisplayModeEXT` function for 2D/3D mode control. Added automatic lifecycle behavior (3D on session READY, 2D on session STOPPING). |
-| 5 | 2026-02-20 | David Fattal | Added `displayPixelWidth` / `displayPixelHeight` to `XrDisplayInfoEXT`. |
-| 6 | 2026-02-27 | David Fattal | Eye tracking mode control: `XrEyeTrackingModeEXT` enum, `XrEyeTrackingModeCapabilitiesEXT` (chained to `XrSystemProperties`), `XrViewEyeTrackingStateEXT` (chained to `XrViewState`), and `xrRequestEyeTrackingModeEXT` function. Allows apps to choose between managed (SDK-filtered) and manual eye tracking, with explicit `isTracking` flag. |
-| 7 | 2026-03-04 | David Fattal | Vendor-specific display rendering mode control: `xrRequestDisplayRenderingModeEXT(session, modeIndex)` for switching between vendor-defined rendering variations (e.g., SBS stereo, anaglyph, lenticular). Mode 0 = standard (always available), mode 1+ = vendor-defined. Dispatches through `xrt_device_set_property`; no-op if driver doesn't support it. |
+| 4 | 2026-02-13 | David Fattal | Added `supportsDisplayModeSwitch` capability flag, `XrDisplayModeDXR` enum, and `xrRequestDisplayModeDXR` function for 2D/3D mode control. Added automatic lifecycle behavior (3D on session READY, 2D on session STOPPING). |
+| 5 | 2026-02-20 | David Fattal | Added `displayPixelWidth` / `displayPixelHeight` to `XrDisplayInfoDXR`. |
+| 6 | 2026-02-27 | David Fattal | Eye tracking mode control: `XrEyeTrackingModeDXR` enum, `XrEyeTrackingModeCapabilitiesDXR` (chained to `XrSystemProperties`), `XrViewEyeTrackingStateDXR` (chained to `XrViewState`), and `xrRequestEyeTrackingModeDXR` function. Allows apps to choose between managed (SDK-filtered) and manual eye tracking, with explicit `isTracking` flag. |
+| 7 | 2026-03-04 | David Fattal | Vendor-specific display rendering mode control: `xrRequestDisplayRenderingModeDXR(session, modeIndex)` for switching between vendor-defined rendering variations (e.g., SBS stereo, anaglyph, lenticular). Mode 0 = standard (always available), mode 1+ = vendor-defined. Dispatches through `xrt_device_set_property`; no-op if driver doesn't support it. |
 | 8 | 2026-03-06 | David Fattal | Removed `XR_REFERENCE_SPACE_TYPE_DISPLAY_EXT`. In RAW mode, `xrLocateViews` returns screen-centered eye positions regardless of the reference space parameter — a dedicated DISPLAY space is unnecessary. Applications use LOCAL space for both view location and layer submission. |
-| 10 | 2026-03-12 | David Fattal | Removed `supportsDisplayModeSwitch` (derivable from mode enumeration), renamed `display3D` to `hardwareDisplay3D`, deprecated `xrRequestDisplayModeEXT` in favor of unified `xrRequestDisplayRenderingModeEXT`, added rendering mode and hardware display state change events (`XrEventDataRenderingModeChangedEXT`, `XrEventDataHardwareDisplayStateChangedEXT`). |
-| 11 | 2026-03-20 | David Fattal | Added per-mode tile layout fields to `XrDisplayRenderingModeInfoEXT`: `tileColumns`, `tileRows`, `viewWidthPixels`, `viewHeightPixels`. Enables runtime to describe atlas layout for multi-view rendering modes (e.g., 2x2 quad). |
-| 12 | 2026-03-28 | David Fattal | Removed `hardwareDisplay3D` from `XrDisplayInfoEXT`. It remains available **per-mode** on `XrDisplayRenderingModeInfoEXT` (via `xrEnumerateDisplayRenderingModesEXT`) and is also reported by the `XrEventDataHardwareDisplayStateChangedEXT` event. Also moved `xrSetSharedTextureOutputRectEXT` to the window-binding extension headers. |
-| 13 | 2026-05-18 | David Fattal | Added per-session `isActive` and `isRequestable` fields to `XrDisplayRenderingModeInfoEXT` (#234). `isActive` lets an app learn the current mode from the first enumerate without waiting for an event; `isRequestable` tells a session whether it may request a mode (false for non-controller sessions under a workspace). |
-| 15 | 2026-06-11 | David Fattal | **Repurposed `xrRequestDisplayModeEXT`** (#542): no longer a deprecated mode-switching wrapper — it now sets the HARDWARE display state alone for the current mode (the mode's layout/content and the DP's atlas processing are untouched; the DP weaves or flat-blits per the atlas it is handed). Override holds until the next mode request. Reported via `XrEventDataHardwareDisplayStateChangedEXT`. No struct/ABI change. |
-| 16 | 2026-07-07 | David Fattal | Added `XrDisplayDesktopPositionEXT` (`1000999210`, new chained struct — additive, no ABI change to existing structs): the 3D panel's top-left in virtual-desktop pixels, chained to `XrSystemProperties`, so handle/texture-class apps can create their window on the panel on multi-monitor systems (#715). **Current header version (`XR_EXT_display_info_SPEC_VERSION == 16`).** |
+| 10 | 2026-03-12 | David Fattal | Removed `supportsDisplayModeSwitch` (derivable from mode enumeration), renamed `display3D` to `hardwareDisplay3D`, deprecated `xrRequestDisplayModeDXR` in favor of unified `xrRequestDisplayRenderingModeDXR`, added rendering mode and hardware display state change events (`XrEventDataRenderingModeChangedDXR`, `XrEventDataHardwareDisplayStateChangedDXR`). |
+| 11 | 2026-03-20 | David Fattal | Added per-mode tile layout fields to `XrDisplayRenderingModeInfoDXR`: `tileColumns`, `tileRows`, `viewWidthPixels`, `viewHeightPixels`. Enables runtime to describe atlas layout for multi-view rendering modes (e.g., 2x2 quad). |
+| 12 | 2026-03-28 | David Fattal | Removed `hardwareDisplay3D` from `XrDisplayInfoDXR`. It remains available **per-mode** on `XrDisplayRenderingModeInfoDXR` (via `xrEnumerateDisplayRenderingModesDXR`) and is also reported by the `XrEventDataHardwareDisplayStateChangedDXR` event. Also moved `xrSetSharedTextureOutputRectDXR` to the window-binding extension headers. |
+| 13 | 2026-05-18 | David Fattal | Added per-session `isActive` and `isRequestable` fields to `XrDisplayRenderingModeInfoDXR` (#234). `isActive` lets an app learn the current mode from the first enumerate without waiting for an event; `isRequestable` tells a session whether it may request a mode (false for non-controller sessions under a workspace). |
+| 15 | 2026-06-11 | David Fattal | **Repurposed `xrRequestDisplayModeDXR`** (#542): no longer a deprecated mode-switching wrapper — it now sets the HARDWARE display state alone for the current mode (the mode's layout/content and the DP's atlas processing are untouched; the DP weaves or flat-blits per the atlas it is handed). Override holds until the next mode request. Reported via `XrEventDataHardwareDisplayStateChangedDXR`. No struct/ABI change. |
+| 16 | 2026-07-07 | David Fattal | Added `XrDisplayDesktopPositionDXR` (`1004999210`, new chained struct — additive, no ABI change to existing structs): the 3D panel's top-left in virtual-desktop pixels, chained to `XrSystemProperties`, so handle/texture-class apps can create their window on the panel on multi-monitor systems (#715). **Current header version (`XR_DXR_display_info_SPEC_VERSION == 16`).** |
 
-> The `XR_EXT_display_info_SPEC_VERSION` define in the header is the authoritative current
+> The `XR_DXR_display_info_SPEC_VERSION` define in the header is the authoritative current
 > revision. Earlier revision numbers in this table reflect the proposal's editing history and do
 > not all map one-to-one onto the header's inline `// ---- vN ----` section comments.
 
@@ -2107,9 +2107,9 @@ A complete reference implementation is available in the [DisplayXR runtime](http
 
 | Component | Location |
 |---|---|
-| Extension headers | `src/external/openxr_includes/openxr/XR_EXT_display_info.h` |
-| | `src/external/openxr_includes/openxr/XR_EXT_win32_window_binding.h` |
-| | `src/external/openxr_includes/openxr/XR_EXT_cocoa_window_binding.h` |
+| Extension headers | `src/external/openxr_includes/openxr/XR_DXR_display_info.h` |
+| | `src/external/openxr_includes/openxr/XR_DXR_win32_window_binding.h` |
+| | `src/external/openxr_includes/openxr/XR_DXR_cocoa_window_binding.h` |
 | Runtime: display info query | `src/xrt/state_trackers/oxr/oxr_system.c` |
 | Runtime: session + view locate | `src/xrt/state_trackers/oxr/oxr_session.c` |
 | Runtime: events | `src/xrt/state_trackers/oxr/oxr_event.c` |
@@ -2133,10 +2133,10 @@ The runtime is based on Monado (open-source OpenXR runtime) with native composit
 | **Canonical display pyramid** | The geometric frustum defined by the display rectangle (base) and nominal viewer position (apex). Anchors zero-parallax and stereo comfort. |
 | **RAW mode** | View mode where the runtime returns raw tracked eye positions and identity orientation, leaving camera model construction to the application. |
 | **RENDER_READY mode** | View mode where the runtime returns view poses and FOV angles with convergence and comfort adjustments applied. The application still builds its own projection matrix from the FOV angles. |
-| **Window-space coordinates** | Fractional coordinates in `[0, 1]` relative to the target window/surface dimensions. Used by `XrCompositionLayerWindowSpaceEXT`. |
+| **Window-space coordinates** | Fractional coordinates in `[0, 1]` relative to the target window/surface dimensions. Used by `XrCompositionLayerWindowSpaceDXR`. |
 | **Screen-centered coordinates** | The coordinate frame used by RAW mode eye positions: origin at the physical display center, +X right, +Y up, +Z toward the viewer. Implicit in the returned `XrView.pose.position` — no dedicated reference space needed. |
 | **Nominal viewer position** | A static, design-time expectation of the viewer's position relative to the display. Not tracked; defines the apex of the canonical display pyramid. |
 | **Disparity** | Horizontal shift between left and right eye images, measured as a fraction of window width. Controls perceived depth of window-space layers. |
-| **Display mode** | The physical 2D/3D state of a tracked 3D display's switchable element (e.g. lenticular lens). Follows the active rendering mode's default automatically; `xrRequestDisplayModeEXT` (v15) overrides it alone for the current mode, leaving content and DP processing untouched. |
-| **Display rendering mode** | A vendor-specific rendering variation within 3D mode (e.g., SBS stereo, anaglyph, lenticular). Controlled via `xrRequestDisplayRenderingModeEXT`. Mode 0 is standard; higher indices are vendor-defined. |
+| **Display mode** | The physical 2D/3D state of a tracked 3D display's switchable element (e.g. lenticular lens). Follows the active rendering mode's default automatically; `xrRequestDisplayModeDXR` (v15) overrides it alone for the current mode, leaving content and DP processing untouched. |
+| **Display rendering mode** | A vendor-specific rendering variation within 3D mode (e.g., SBS stereo, anaglyph, lenticular). Controlled via `xrRequestDisplayRenderingModeDXR`. Mode 0 is standard; higher indices are vendor-defined. |
 | **Surface binding** | A platform-specific mechanism for the application to provide its own rendering surface to the runtime (`HWND` on Win32; `ANativeWindow*` + Java `Surface` + screen position on Android). |

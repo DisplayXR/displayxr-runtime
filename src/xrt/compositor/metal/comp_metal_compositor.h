@@ -47,7 +47,7 @@ extern "C" {
  *                        output. Per-pixel alpha flows through sim_display's
  *                        alpha-native output stage; no chroma-key trick on
  *                        macOS. (Sourced from
- *                        XR_EXT_cocoa_window_binding.transparentBackgroundEnabled.)
+ *                        XR_DXR_cocoa_window_binding.transparentBackgroundEnabled.)
  * @param[out] out_xc     Created compositor on success.
  * @return XRT_SUCCESS on success.
  *
@@ -89,7 +89,7 @@ comp_metal_compositor_get_window_metrics(struct xrt_compositor *xc,
                                          struct xrt_window_metrics *out_metrics);
 
 /*
- * XR_EXT_local_3d_zone — authored 2D/3D mask consumer (#439 Phase 3; mirrors
+ * XR_DXR_local_3d_zone — authored 2D/3D mask consumer (#439 Phase 3; mirrors
  * the D3D11 entry points from Phase 1, comp_d3d11_compositor.h).
  *
  * The oxr handlers forward here. Tier 1 (whole window) and Tier 2 (rect
@@ -139,7 +139,7 @@ comp_metal_compositor_zone_mask_set_rects(struct xrt_compositor *xc,
 
 /*!
  * Tier 3 — not available on Metal (no Metal render-target binding in
- * XR_EXT_local_3d_zone v3); always returns XRT_ERROR_NOT_IMPLEMENTED.
+ * XR_DXR_local_3d_zone v3); always returns XRT_ERROR_NOT_IMPLEMENTED.
  *
  * @ingroup comp_metal
  */
@@ -168,9 +168,9 @@ void
 comp_metal_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask);
 
 /*!
- * XR_EXT_display_zones (ADR-027): set the frame's explicit wish for the next
+ * XR_DXR_display_zones (ADR-027): set the frame's explicit wish for the next
  * layer_commit — @p mask is the compositor-side mask state of the
- * XrLocal3DZoneMaskEXT referenced via XrDisplayZonesFrameEndInfoEXT.wishMask
+ * XrLocal3DZoneMaskDXR referenced via XrDisplayZonesFrameEndInfoDXR.wishMask
  * (oxr_local_3d_zone_ext::comp_mask), or NULL to auto-derive the wish from
  * the frame's zone rects. Called by oxr on every zones frame before
  * xrt_comp_layer_commit; consumed by that commit. No-op outside zones frames.
@@ -194,7 +194,7 @@ comp_metal_compositor_zone_get_hw_caps(struct xrt_compositor *xc,
 /*!
  * Current recommended per-view render size (client-window-derived when a
  * mask is active, canvas-derived otherwise). Polled by oxr at frame end to
- * fire XrEventDataLocal3DZoneViewSizeChangedEXT on change (#439 Phase 3 Q4).
+ * fire XrEventDataLocal3DZoneViewSizeChangedDXR on change (#439 Phase 3 Q4).
  *
  * @ingroup comp_metal
  */

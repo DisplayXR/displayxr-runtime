@@ -26,7 +26,7 @@ Physical displays are **spatial entities** -- they have position, orientation, a
 | Inter-display transform | N/A | `locate_space(display_A, display_B)` via space DAG |
 | Display to compositor binding | 1:1, hardcoded | M:N -- multiple displays, each with own compositor pipeline |
 | Registration fidelity | N/A | Enum: static-config to co-observation to external-tracking |
-| Enumeration API | None | `XR_EXT_display_info` or similar extension |
+| Enumeration API | None | `XR_DXR_display_info` or similar extension |
 
 ### Codebase Anchors
 
@@ -124,7 +124,7 @@ struct xrt_display
 - Multi-display: `xrt_system_compositor_info` holds an array: `struct xrt_display displays[XRT_MAX_DISPLAYS]; uint32_t display_count;`
 - `locate_space(display_A->space, display_B->space)` returns the inter-display transform.
 - Static config loaded from JSON/TOML (display positions, orientations).
-- New OpenXR extension `XR_EXT_display_info` to enumerate displays and query their spatial properties.
+- New OpenXR extension `XR_DXR_display_info` to enumerate displays and query their spatial properties.
 
 ### Stage 3 -- Registration Fidelity Levels
 
@@ -186,7 +186,7 @@ When the Spatial OS multi-compositor (#43) lands:
 - [ ] **S2-2** Create per-display offset spaces in target builders via `create_offset_space`
 - [ ] **S2-3** Multi-display array on `xrt_system_compositor_info` (`displays[]`, `display_count`)
 - [ ] **S2-4** Static multi-display config file format (JSON or TOML)
-- [ ] **S2-5** `XR_EXT_display_info` extension for app-side enumeration
+- [ ] **S2-5** `XR_DXR_display_info` extension for app-side enumeration
 - [ ] **S3-1** Define `xrt_display_registration_fidelity` enum
 - [ ] **S3-2** Plumb fidelity into compositor rendering decisions
 

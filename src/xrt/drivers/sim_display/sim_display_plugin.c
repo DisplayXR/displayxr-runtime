@@ -127,7 +127,7 @@ sim_display_plugin_get_display_info(struct xrt_plugin_instance *inst,
 	 * eye-tracking capability. The dev-only SIM_DISPLAY_FAKE_TRACKING
 	 * toggle re-enables MANUAL_BIT (paired with HAS_TRACKING on the 3D
 	 * rendering modes in sim_display_device.c) so the MANUAL path and
-	 * XrEventDataEyeTrackingStateChangedEXT are testable without
+	 * XrEventDataEyeTrackingStateChangedDXR are testable without
 	 * hardware. */
 	if (sim_display_fake_tracking_enabled()) {
 		out_info->supported_eye_tracking_modes = 2u; /* MANUAL_BIT */

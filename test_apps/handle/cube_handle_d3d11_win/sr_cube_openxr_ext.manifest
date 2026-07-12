@@ -6,7 +6,7 @@
     name="Leia.SR.CubeOpenXRExt"
     type="win32"
   />
-  <description>Leia SR Cube OpenXR Ext Test Application (XR_EXT_win32_window_binding)</description>
+  <description>Leia SR Cube OpenXR Ext Test Application (XR_DXR_win32_window_binding)</description>
 
   <!-- Windows 10/11 compatibility -->
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">

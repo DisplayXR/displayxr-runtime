@@ -183,7 +183,7 @@ if(XRT_HAVE_LINUX AND NOT ANDROID)
 	# VK native compositor on desktop Linux (in-process, XCB present path;
 	# comp_vk_native only exists when XRT_HAVE_XCB). Phase 1 landed the
 	# compositor library; this arm makes oxr actually select it in-process
-	# (hosted self-created window, or app window via XR_EXT_xlib_window_binding).
+	# (hosted self-created window, or app window via XR_DXR_xlib_window_binding).
 	if(XRT_HAVE_VULKAN AND TARGET comp_vk_native)
 		target_sources(st_oxr PRIVATE oxr_session_gfx_vk_native.c)
 		target_link_libraries(st_oxr PRIVATE comp_vk_native)

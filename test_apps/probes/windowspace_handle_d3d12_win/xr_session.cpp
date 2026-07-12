@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  OpenXR session management for D3D12 with XR_EXT_win32_window_binding
+ * @brief  OpenXR session management for D3D12 with XR_DXR_win32_window_binding
  */
 
 #include "xr_session.h"
@@ -72,17 +72,17 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_KHR_D3D12_ENABLE_EXTENSION_NAME) == 0) {
             hasD3D12 = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME) == 0) {
             xr.hasWin32WindowBindingExt = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) {
             xr.hasDisplayInfoExt = true;
         }
     }
 
     LOG_INFO("XR_KHR_D3D12_enable: %s", hasD3D12 ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_EXT_win32_window_binding: %s", xr.hasWin32WindowBindingExt ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_EXT_display_info: %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_win32_window_binding: %s", xr.hasWin32WindowBindingExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_display_info: %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasD3D12) {
         LOG_ERROR("XR_KHR_D3D12_enable extension not available - cannot continue");
@@ -92,10 +92,10 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     std::vector<const char*> enabledExtensions;
     enabledExtensions.push_back(XR_KHR_D3D12_ENABLE_EXTENSION_NAME);
     if (xr.hasWin32WindowBindingExt) {
-        enabledExtensions.push_back(XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME);
     }
     if (xr.hasDisplayInfoExt) {
-        enabledExtensions.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
     }
 
     LOG_INFO("Enabling %zu extensions", enabledExtensions.size());
@@ -131,11 +131,11 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         }
     }
 
-    // Query display info via XR_EXT_display_info
+    // Query display info via XR_DXR_display_info
     if (xr.hasDisplayInfoExt) {
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
-        XrDisplayInfoEXT displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
-        XrEyeTrackingModeCapabilitiesEXT eyeCaps = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT};
+        XrDisplayInfoDXR displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
+        XrEyeTrackingModeCapabilitiesDXR eyeCaps = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR};
         displayInfo.next = &eyeCaps;
         sysProps.next = &displayInfo;
         XrResult diResult = xrGetSystemProperties(xr.instance, xr.systemId, &sysProps);
@@ -160,20 +160,20 @@ bool InitializeOpenXR(XrSessionManager& xr) {
                 xr.supportedEyeTrackingModes, xr.defaultEyeTrackingMode);
         }
 
-        // Load xrRequestDisplayModeEXT function pointer
-        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeEXT",
+        // Load xrRequestDisplayModeDXR function pointer
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeDXR",
             (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
 
-        // Load xrRequestEyeTrackingModeEXT function pointer
+        // Load xrRequestEyeTrackingModeDXR function pointer
         if (xr.supportedEyeTrackingModes != 0) {
-            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeEXT",
+            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeDXR",
                 (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingModeEXT);
         }
 
-        // Load xrRequestDisplayRenderingModeEXT function pointer (v7)
-        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeEXT",
+        // Load xrRequestDisplayRenderingModeDXR function pointer (v7)
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR",
             (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
-        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesDXR",
             (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
         LOG_INFO("Display rendering mode: %s",
             xr.pfnRequestDisplayRenderingModeEXT ? "available" : "not available");
@@ -200,7 +200,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
 }
 
 bool CreateSession(XrSessionManager& xr, ID3D12Device* device, ID3D12CommandQueue* queue, HWND hwnd) {
-    LOG_INFO("Creating OpenXR session with D3D12 + XR_EXT_win32_window_binding...");
+    LOG_INFO("Creating OpenXR session with D3D12 + XR_DXR_win32_window_binding...");
     LOG_INFO("  D3D12 Device: 0x%p", device);
     LOG_INFO("  Command Queue: 0x%p", queue);
     LOG_INFO("  Window handle (HWND): 0x%p", hwnd);
@@ -211,7 +211,7 @@ bool CreateSession(XrSessionManager& xr, ID3D12Device* device, ID3D12CommandQueu
     d3d12Binding.device = device;
     d3d12Binding.queue = queue;
 
-    XrWin32WindowBindingCreateInfoEXT sessionTarget = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT};
+    XrWin32WindowBindingCreateInfoDXR sessionTarget = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR};
     sessionTarget.windowHandle = hwnd;
 
     // Opt-in transparency. Pair with WS_EX_NOREDIRECTIONBITMAP + null brush
@@ -228,9 +228,9 @@ bool CreateSession(XrSessionManager& xr, ID3D12Device* device, ID3D12CommandQueu
 
     if (xr.hasWin32WindowBindingExt && hwnd) {
         d3d12Binding.next = &sessionTarget;
-        LOG_INFO("Using XR_EXT_win32_window_binding with window handle");
+        LOG_INFO("Using XR_DXR_win32_window_binding with window handle");
     } else {
-        LOG_WARN("NOT using XR_EXT_win32_window_binding (hasExt=%d, hwnd=%p)",
+        LOG_WARN("NOT using XR_DXR_win32_window_binding (hasExt=%d, hwnd=%p)",
             xr.hasWin32WindowBindingExt, hwnd);
     }
 
@@ -247,9 +247,9 @@ bool CreateSession(XrSessionManager& xr, ID3D12Device* device, ID3D12CommandQueu
         uint32_t modeCount = 0;
         XrResult enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, 0, &modeCount, nullptr);
         if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
-            std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
+            std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
             for (uint32_t i = 0; i < modeCount; i++) {
-                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
                 modes[i].next = nullptr;
             }
             enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, modeCount, &modeCount, modes.data());

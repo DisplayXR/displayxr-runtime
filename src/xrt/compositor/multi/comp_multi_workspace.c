@@ -27,7 +27,7 @@ struct chrome_entry
 	bool hidden; //!< Client minimized by the workspace controller (#61): render black canvas + overlays.
 
 	//! @name Tier-2 window placement (#59)
-	//! The pose the controller set via xrSetWorkspaceClientWindowPoseEXT plus the
+	//! The pose the controller set via xrSetWorkspaceClientWindowPoseDXR plus the
 	//! derived top-left-origin display-pixel rect of the NSWindow. Until the first
 	//! set_window_pose arrives @ref win_pose_valid is false and the client fills the
 	//! whole display (Tier-1 default).

@@ -69,7 +69,7 @@ The project's design rationale is captured in **31 Architecture Decision Records
 
 **"Who owns the display surface?"** (the deepest departure from stock OpenXR, which assumes a private headset)
 - [ADR-008](adr/ADR-008-display-as-spatial-entity.md) — the display is a spatial entity in the world, not a headset.
-- [XR_EXT_win32_window_binding](specs/extensions/XR_EXT_win32_window_binding.md) / [XR_EXT_cocoa_window_binding](specs/extensions/XR_EXT_cocoa_window_binding.md) — the app hands the runtime its own window; the runtime tracks that window's rectangle on the panel so perspective stays correct even windowed.
+- [XR_DXR_win32_window_binding](specs/extensions/XR_DXR_win32_window_binding.md) / [XR_DXR_cocoa_window_binding](specs/extensions/XR_DXR_cocoa_window_binding.md) — the app hands the runtime its own window; the runtime tracks that window's rectangle on the panel so perspective stays correct even windowed.
 - [app-classes](getting-started/app-classes.md) — the four ways an app can connect (handle / texture / hosted / IPC) and when to use each.
 
 **"Why is eye tracking visible to the app at all?"**
@@ -83,7 +83,7 @@ The project's design rationale is captured in **31 Architecture Decision Records
 - [ADR-025](adr/ADR-025-android-vendor-dp-out-of-process.md) — on Android the DP runs out-of-process.
 
 **"How does mixed 2D/3D content and multi-display work?"**
-- [ADR-027](adr/ADR-027-display-zones.md) + [XR_EXT_display_zones](specs/extensions/XR_EXT_display_zones.md) — the current model for laying out N 3D zones + 2D zones on one panel; [ADR-031](adr/ADR-031-remove-surround-output-rect-zones-sole-region-model.md) made zones the sole region paradigm.
+- [ADR-027](adr/ADR-027-display-zones.md) + [XR_DXR_display_zones](specs/extensions/XR_DXR_display_zones.md) — the current model for laying out N 3D zones + 2D zones on one panel; [ADR-031](adr/ADR-031-remove-surround-output-rect-zones-sole-region-model.md) made zones the sole region paradigm.
 - [ADR-028](adr/ADR-028-display-mode-recipe-vs-hardware-state.md) — 2D⇄3D is two independent signals (panel hardware state vs. content mode).
 - [ADR-015](adr/ADR-015-displayxr-owns-multi-display-vendor-routing.md) — how multiple display vendors coexist on one machine.
 - [ADR-021](adr/ADR-021-color-management-encoding-state-invariant.md) — the color/encoding-state invariant that keeps pixels faithful end-to-end.

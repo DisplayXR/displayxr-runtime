@@ -61,7 +61,7 @@ struct comp_multi_content_pc
 	float corner_aspect;   //!< win_w_m / win_h_m (aspect-correct corners + feather).
 	float edge_feather;    //!< Feather width as a fraction of window HEIGHT (0 = off).
 	float glow_intensity;  //!< Focus tint strength; 0 = no tint (unfocused / disabled).
-	float glow_color[4];   //!< Focus tint RGB + A multiplier (controller XrWorkspaceClientStyleEXT).
+	float glow_color[4];   //!< Focus tint RGB + A multiplier (controller XrWorkspaceClientStyleDXR).
 	// HUD compose (XR_EXT_window_space_layer), sampled from binding 1 OVER the
 	// content in window-local UV, BEFORE corner/feather/glow. std430 float[4]
 	// has scalar stride 4 so these match the C arrays byte-for-byte.

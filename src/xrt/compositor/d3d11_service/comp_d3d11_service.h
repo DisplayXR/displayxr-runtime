@@ -125,7 +125,7 @@ comp_d3d11_service_get_display_dimensions(struct xrt_system_compositor *xsysc,
 /*!
  * Check if the compositor owns its window (not using session_target).
  *
- * When using XR_EXT_win32_window_binding, the app provides its own window and
+ * When using XR_DXR_win32_window_binding, the app provides its own window and
  * the compositor doesn't create one. This affects head position handling:
  * - Session target (app window): App controls head position, no offset applied
  * - Own window (Monado window): Apply standing height offset for VR apps
@@ -197,9 +197,9 @@ comp_d3d11_service_get_client_window_metrics(struct xrt_system_compositor *xsysc
                                               struct xrt_window_metrics *out_metrics);
 
 /*!
- * Window metrics from the client's REAL HWND (XR_EXT_win32_window_binding,
+ * Window metrics from the client's REAL HWND (XR_DXR_win32_window_binding,
  * carried in xrt_session_info) — for non-workspace IPC clients, which have
- * no virtual-window slot. Used by the XR_EXT_view_rig IPC path (#396 W7) so
+ * no virtual-window slot. Used by the XR_DXR_view_rig IPC path (#396 W7) so
  * rig math runs window-scoped like the in-process path; same math as
  * comp_d3d11_compositor_get_window_metrics.
  *
@@ -240,7 +240,7 @@ comp_d3d11_service_set_client_visibility(struct xrt_system_compositor *xsysc,
 
 /*!
  * Set per-client xrWaitFrame return-rate cap in Hz (spec_version 14,
- * xrSetWorkspaceClientFrameRateCapEXT). 0.0f = uncapped (native refresh).
+ * xrSetWorkspaceClientFrameRateCapDXR). 0.0f = uncapped (native refresh).
  * Pure mechanism — the workspace controller decides which clients get
  * which cadence. Applied by compositor_predict_frame via the IPC client's
  * client-side u_wait_until; in-process callers (bridge/WebXR) are not
@@ -359,7 +359,7 @@ comp_d3d11_service_set_capture_client_visibility(struct xrt_system_compositor *x
                                                   bool visible);
 
 /*!
- * Introspect a CAPTURE client slot for xrGetWorkspaceClientInfoEXT.
+ * Introspect a CAPTURE client slot for xrGetWorkspaceClientInfoDXR.
  *
  * Capture clients have no IPC client_state to read, but enumerate hands out
  * their 1000+slot ids, so the controller must be able to introspect them.
@@ -403,11 +403,11 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc);
 
 /*!
  * Grab or release all user input for the workspace controller (modal input
- * grab — XR_EXT_spatial_workspace spec_version 18). While grabbed, the
+ * grab — XR_DXR_spatial_workspace spec_version 18). While grabbed, the
  * compositor window stops forwarding keyboard / mouse-button / scroll input to
  * the focused app and routes it all to the controller via the public event
  * ring. Called by ipc_handle_workspace_set_input_grab() in response to
- * xrSetWorkspaceInputGrabEXT — the controller grabs while a modal UI it owns
+ * xrSetWorkspaceInputGrabDXR — the controller grabs while a modal UI it owns
  * (e.g. the launcher band) is up and releases on dismiss.
  *
  * No-op if the workspace is not currently active.
@@ -458,7 +458,7 @@ comp_d3d11_service_poll_mcp_capture(struct xrt_system_compositor *xsysc);
 
 /*!
  * Per-frame cursor depth, pushed by the workspace controller
- * (XR_EXT_spatial_workspace spec_version 22).
+ * (XR_DXR_spatial_workspace spec_version 22).
  *
  * As of spec_version 22 the runtime no longer raycasts to find the depth of
  * the window under the cursor; the controller owns the eye→cursor hit-test and
@@ -466,7 +466,7 @@ comp_d3d11_service_poll_mcp_capture(struct xrt_system_compositor *xsysc);
  * feeds @p hit_z_m into the cursor sprite's per-eye disparity, and uses
  * @p over_window to dim the cursor over windows. Cursor screen position stays
  * runtime-owned (OS cursor). Called by ipc_handle_workspace_set_cursor_depth()
- * in response to xrSetWorkspaceCursorDepthEXT.
+ * in response to xrSetWorkspaceCursorDepthDXR.
  *
  * No-op if the workspace is not currently active.
  *
@@ -569,7 +569,7 @@ comp_d3d11_service_workspace_find_slot_by_xc(struct xrt_system_compositor *xsysc
  * out_visible is !minimized (the compositor's workspace-minimize flag), NOT
  * the IPC session-visible state. out_focused is (slot == focused_slot). Used
  * by ipc_handle_workspace_get_client_info so the controller's
- * XrWorkspaceClientInfoEXT.isVisible / isFocused reflect workspace state — the
+ * XrWorkspaceClientInfoDXR.isVisible / isFocused reflect workspace state — the
  * shell's auto-focus must skip minimized windows, which session_visible does
  * not capture. Returns false on miss (unknown xc); outputs untouched then.
  */
@@ -716,7 +716,7 @@ comp_d3d11_service_set_client_style_by_slot(struct xrt_system_compositor *xsysc,
 /*!
  * Phase 2.C spec_version 9: mark slot @p slot as focused (for focus-glow
  * gating at blit time). Mirrors the IPC layer's active_client_index for
- * the compositor's separate `focused_slot` view, so xrSetWorkspaceFocusedClientEXT
+ * the compositor's separate `focused_slot` view, so xrSetWorkspaceFocusedClientDXR
  * driven focus changes update the visual state too. @p slot = -1 clears.
  */
 void
@@ -726,7 +726,7 @@ comp_d3d11_service_set_focused_slot(struct xrt_system_compositor *xsysc, int slo
  * Read the compositor's `focused_slot` (-1 = none / workspace not active).
  * This is the workspace focus source of truth — every focus mutation path
  * updates it (both set_focused id forms incl. capture clients, the clear
- * path, click-to-focus, visibility-hide) — so xrGetWorkspaceFocusedClientEXT
+ * path, click-to-focus, visibility-hide) — so xrGetWorkspaceFocusedClientDXR
  * derives its answer from here rather than from the IPC active_client_index
  * (which capture clients never touch).
  */
@@ -748,8 +748,8 @@ void
 comp_d3d11_service_set_client_modal_state(struct xrt_system_compositor *xsysc, int slot, bool is_open);
 
 /*!
- * XR_EXT_workspace_file_dialog (Tier 1): app-side
- * `xrRequestFilePickerEXT` arrived as `session_request_file_picker`.
+ * XR_DXR_workspace_file_dialog (Tier 1): app-side
+ * `xrRequestFilePickerDXR` arrived as `session_request_file_picker`.
  * The compositor allocates a monotonic request_id, stores a record
  * keyed by (request_id → slot, info), and emits an
  * IPC_WORKSPACE_INPUT_EVENT_FILE_PICKER_REQUEST event for the controller
@@ -788,7 +788,7 @@ comp_d3d11_service_workspace_get_file_picker_request(struct xrt_system_composito
  * for a slot that no longer exists (requester crashed / session
  * destroyed) are logged once and discarded.
  *
- * `result_code` is an `XrFilePickerResultEXT` value; `path` is
+ * `result_code` is an `XrFilePickerResultDXR` value; `path` is
  * NUL-terminated UTF-8 (empty for non-SUCCESS outcomes).
  */
 xrt_result_t
@@ -812,7 +812,7 @@ comp_d3d11_service_workspace_request_mode_flip(struct xrt_system_compositor *xsy
                                                uint32_t mode_index);
 
 /*!
- * XR_EXT_view_rig (#396 W7): store / clear the workspace controller's imposed
+ * XR_DXR_view_rig (#396 W7): store / clear the workspace controller's imposed
  * view rig. In workspace mode the workspace owns view geometry — a client's own
  * chained rig is gated inert, and this override (applied in
  * ipc_try_get_sr_view_poses) governs the app clients' locates. Pass a rig with
@@ -822,7 +822,7 @@ bool
 comp_d3d11_service_set_workspace_view_rig(struct xrt_system_compositor *xsysc, const struct xrt_view_rig *rig);
 
 /*!
- * XR_EXT_view_rig (#396 W7): read the current workspace view-rig override into
+ * XR_DXR_view_rig (#396 W7): read the current workspace view-rig override into
  * @p out_rig (type == XRT_VIEW_RIG_NONE when none). Returns true on success.
  */
 bool
@@ -914,7 +914,7 @@ comp_d3d11_service_compositor_export_transparent_output_fence(struct xrt_composi
                                                               xrt_graphics_sync_handle_t *out_handle);
 
 /*!
- * XR_EXT_weave (#625) — window-bound synchronous weave service. An ADDITIVE
+ * XR_DXR_weave (#625) — window-bound synchronous weave service. An ADDITIVE
  * path, distinct from the steady swapchain frame loop: the caller (a
  * present-owner) hands a pre-weave SBS texture + a window-relative rect, the DP
  * weaves the sub-rect into a server-allocated output texture, and the caller

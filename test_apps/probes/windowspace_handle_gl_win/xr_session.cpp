@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  OpenXR session management for OpenGL with XR_EXT_win32_window_binding
+ * @brief  OpenXR session management for OpenGL with XR_DXR_win32_window_binding
  */
 
 #include "xr_session.h"
@@ -75,17 +75,17 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_KHR_OPENGL_ENABLE_EXTENSION_NAME) == 0) {
             hasOpenGL = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME) == 0) {
             xr.hasWin32WindowBindingExt = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) {
             xr.hasDisplayInfoExt = true;
         }
     }
 
     LOG_INFO("XR_KHR_opengl_enable: %s", hasOpenGL ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_EXT_win32_window_binding: %s", xr.hasWin32WindowBindingExt ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_EXT_display_info: %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_win32_window_binding: %s", xr.hasWin32WindowBindingExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_display_info: %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasOpenGL) {
         LOG_ERROR("XR_KHR_opengl_enable extension not available");
@@ -95,10 +95,10 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     std::vector<const char*> enabledExtensions;
     enabledExtensions.push_back(XR_KHR_OPENGL_ENABLE_EXTENSION_NAME);
     if (xr.hasWin32WindowBindingExt) {
-        enabledExtensions.push_back(XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME);
     }
     if (xr.hasDisplayInfoExt) {
-        enabledExtensions.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -127,11 +127,11 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         }
     }
 
-    // Query display info via XR_EXT_display_info
+    // Query display info via XR_DXR_display_info
     if (xr.hasDisplayInfoExt) {
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
-        XrDisplayInfoEXT displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
-        XrEyeTrackingModeCapabilitiesEXT eyeCaps = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT};
+        XrDisplayInfoDXR displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
+        XrEyeTrackingModeCapabilitiesDXR eyeCaps = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR};
         displayInfo.next = &eyeCaps;
         sysProps.next = &displayInfo;
         XrResult diResult = xrGetSystemProperties(xr.instance, xr.systemId, &sysProps);
@@ -156,27 +156,27 @@ bool InitializeOpenXR(XrSessionManager& xr) {
                 xr.supportedEyeTrackingModes, xr.defaultEyeTrackingMode);
         }
 
-        // Load xrRequestDisplayModeEXT function pointer
+        // Load xrRequestDisplayModeDXR function pointer
         {
             XrResult procResult = xrGetInstanceProcAddr(
-                xr.instance, "xrRequestDisplayModeEXT",
+                xr.instance, "xrRequestDisplayModeDXR",
                 (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
             if (XR_FAILED(procResult)) {
-                LOG_WARN("Failed to load xrRequestDisplayModeEXT");
+                LOG_WARN("Failed to load xrRequestDisplayModeDXR");
                 xr.pfnRequestDisplayModeEXT = nullptr;
             }
         }
 
-        // Load xrRequestEyeTrackingModeEXT function pointer
+        // Load xrRequestEyeTrackingModeDXR function pointer
         if (xr.supportedEyeTrackingModes != 0) {
-            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeEXT",
+            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeDXR",
                 (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingModeEXT);
         }
 
-        // Load xrRequestDisplayRenderingModeEXT function pointer (v7)
-        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeEXT",
+        // Load xrRequestDisplayRenderingModeDXR function pointer (v7)
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR",
             (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
-        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesDXR",
             (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
         LOG_INFO("Display rendering mode: %s",
             xr.pfnRequestDisplayRenderingModeEXT ? "available" : "not available");
@@ -197,7 +197,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
 }
 
 bool CreateSession(XrSessionManager& xr, HDC hDC, HGLRC hGLRC, HWND hwnd) {
-    LOG_INFO("Creating OpenXR session with OpenGL + XR_EXT_win32_window_binding...");
+    LOG_INFO("Creating OpenXR session with OpenGL + XR_DXR_win32_window_binding...");
 
     xr.windowHandle = hwnd;
 
@@ -205,12 +205,12 @@ bool CreateSession(XrSessionManager& xr, HDC hDC, HGLRC hGLRC, HWND hwnd) {
     glBinding.hDC = hDC;
     glBinding.hGLRC = hGLRC;
 
-    XrWin32WindowBindingCreateInfoEXT sessionTarget = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT};
+    XrWin32WindowBindingCreateInfoDXR sessionTarget = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR};
     sessionTarget.windowHandle = hwnd;
 
     if (xr.hasWin32WindowBindingExt && hwnd) {
         glBinding.next = &sessionTarget;
-        LOG_INFO("Using XR_EXT_win32_window_binding with window handle");
+        LOG_INFO("Using XR_DXR_win32_window_binding with window handle");
     }
 
     XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
@@ -225,9 +225,9 @@ bool CreateSession(XrSessionManager& xr, HDC hDC, HGLRC hGLRC, HWND hwnd) {
         uint32_t modeCount = 0;
         XrResult enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, 0, &modeCount, nullptr);
         if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
-            std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
+            std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
             for (uint32_t i = 0; i < modeCount; i++) {
-                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
                 modes[i].next = nullptr;
             }
             enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, modeCount, &modeCount, modes.data());

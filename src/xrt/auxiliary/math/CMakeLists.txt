@@ -10,7 +10,7 @@ xrt_optimized_math_flags()
 # headers, no displayxr-extensions fetch) — the runtime provides only its own
 # xrt headers via DISPLAYXR_XRT_INCLUDE_DIR. Because apps/engines link the
 # same core through the OpenXR-typed wrapper, runtime render-ready views and
-# app-from-raw views are the same function by construction (XR_EXT_view_rig
+# app-from-raw views are the same function by construction (XR_DXR_view_rig
 # equivalence guarantee, docs/adr/ADR-024-raw-vs-render-ready-views.md).
 include(FetchContent)
 set(DISPLAYXR_BUILD_MATH_OPENXR OFF CACHE BOOL "" FORCE)

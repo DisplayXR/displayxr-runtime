@@ -26,8 +26,8 @@
 - [ADR-020](ADR-020-plugin-abi-compatibility-policy.md) — Plug-in ABI Compatibility Policy (versioning, `struct_size` negotiation, drift guards)
 - [ADR-021](ADR-021-color-management-encoding-state-invariant.md) — Color Management & the Encoding-State Invariant
 - [ADR-022](ADR-022-per-mode-capability-flags-frozen-enum-structs.md) — Per-Mode Capability Flags + Frozen Enumerated App Structs
-- [ADR-023](ADR-023-unified-atlas-capture.md) — Unified Atlas Capture (XR_EXT_atlas_capture)
-- [ADR-024](ADR-024-raw-vs-render-ready-views.md) — Raw vs Render-Ready Views (XR_EXT_view_rig)
+- [ADR-023](ADR-023-unified-atlas-capture.md) — Unified Atlas Capture (XR_DXR_atlas_capture)
+- [ADR-024](ADR-024-raw-vs-render-ready-views.md) — Raw vs Render-Ready Views (XR_DXR_view_rig)
 - [ADR-025](ADR-025-android-vendor-dp-out-of-process.md) — Android Vendor Display Processors Run Out-of-Process
 - [ADR-026](ADR-026-orientation-aware-view-scaling.md) — Orientation-Independent Rendering Modes, Config-Derived View Scale, Rotation-Aware Worst-Case Atlas
 - [ADR-027](ADR-027-display-zones.md) — Display Zones — decoupled mixed 2D/3D layout, per-zone rig, wish mask

@@ -461,8 +461,8 @@ oxr_instance_create(struct oxr_logger *log,
 #ifdef OXR_HAVE_EXT_win32_appcontainer_compatible
 	    .ext_win32_appcontainer_compatible_enabled = extensions->EXT_win32_appcontainer_compatible,
 #endif
-#ifdef OXR_HAVE_EXT_spatial_workspace
-	    .ext_spatial_workspace_enabled = extensions->EXT_spatial_workspace,
+#ifdef OXR_HAVE_DXR_spatial_workspace
+	    .ext_spatial_workspace_enabled = extensions->DXR_spatial_workspace,
 #endif
 	};
 	snprintf(i_info.app_info.application_name, sizeof(i_info.app_info.application_name), "%s",

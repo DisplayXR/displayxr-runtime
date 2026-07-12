@@ -48,7 +48,7 @@ endfunction()
 # The build scripts generate one run_<app>.{bat,sh} per built app applying this:
 #
 #   * name contains "zones"  → set DISPLAYXR_ZONES=1 so the dev runtime
-#                              advertises XR_EXT_display_zones (#613/#673).
+#                              advertises XR_DXR_display_zones (#613/#673).
 #   * name contains "_vk"    → the app owns its own VkInstance, so DON'T disable
 #                              Vulkan implicit layers. Every other app disables
 #                              them (VK_LOADER_LAYERS_DISABLE=*) to dodge buggy

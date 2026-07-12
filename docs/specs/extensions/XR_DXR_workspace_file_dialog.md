@@ -1,14 +1,14 @@
-# XR_EXT_workspace_file_dialog
+# XR_DXR_workspace_file_dialog
 
 | Field | Value |
 |---|---|
-| **Extension Name** | `XR_EXT_workspace_file_dialog` |
+| **Extension Name** | `XR_DXR_workspace_file_dialog` |
 | **Spec Version** | 1 |
 | **Authors** | David Fattal (DisplayXR / Leia Inc.) |
 | **Status** | Provisional — published with the DisplayXR runtime; subject to revision before Khronos registry submission. Spec is expected to bump once before first release tag as the picker UI lands in `displayxr-shell-pvt`. |
-| **Header** | `src/external/openxr_includes/openxr/XR_EXT_workspace_file_dialog.h` |
+| **Header** | `src/external/openxr_includes/openxr/XR_DXR_workspace_file_dialog.h` |
 | **OpenXR Version** | 1.0 |
-| **Dependencies** | OpenXR 1.0 core. The session must be running under a workspace controller (`DISPLAYXR_WORKSPACE_SESSION=1`); `XR_EXT_spatial_workspace` is the parent contract that establishes that role on the controller side. |
+| **Dependencies** | OpenXR 1.0 core. The session must be running under a workspace controller (`DISPLAYXR_WORKSPACE_SESSION=1`); `XR_DXR_spatial_workspace` is the parent contract that establishes that role on the controller side. |
 | **Platforms** | Windows only (Tier 1 spatial picker). The Tier 0 flat-OS fallback path is also Windows-only — macOS workspace mode does not exist yet. |
 
 ---
@@ -19,7 +19,7 @@ When an OpenXR app runs under a DisplayXR workspace controller, the runtime hide
 
 What Tier 0 cannot do is preserve the 3D presentation: a flat Win32 dialog pops over a workspace window that has just transitioned to 2D. For specific moments worth polishing — file open, save-as, folder pick — we want a spatial-native picker rendered as its own 3D workspace window, adjacent to the requester, with consistent chrome and focus styling.
 
-`XR_EXT_workspace_file_dialog` is that surface. The picker is a peer workspace participant (its own OpenXR handle app), **not** a layer inside the requester's window. Window-space layers (`XRT_LAYER_WINDOW_SPACE`, `xrt_compositor.h:86`) are per-window HUD sized as window-fraction — the wrong substrate for an OS-level picker.
+`XR_DXR_workspace_file_dialog` is that surface. The picker is a peer workspace participant (its own OpenXR handle app), **not** a layer inside the requester's window. Window-space layers (`XRT_LAYER_WINDOW_SPACE`, `xrt_compositor.h:86`) are per-window HUD sized as window-fraction — the wrong substrate for an OS-level picker.
 
 ---
 
@@ -27,28 +27,28 @@ What Tier 0 cannot do is preserve the 3D presentation: a flat Win32 dialog pops 
 
 ### Lifecycle
 
-- `xrRequestFilePickerEXT(session, &info, &requestId)` — begin an async pick. Returns immediately. The runtime allocates a monotonic 64-bit request ID, forwards the request to the active workspace controller over IPC, and the controller spawns its picker binary (`displayxr-file-picker.exe` in the DisplayXR Shell case). The picker runs as a normal OpenXR workspace participant inheriting the requester's display mode.
+- `xrRequestFilePickerDXR(session, &info, &requestId)` — begin an async pick. Returns immediately. The runtime allocates a monotonic 64-bit request ID, forwards the request to the active workspace controller over IPC, and the controller spawns its picker binary (`displayxr-file-picker.exe` in the DisplayXR Shell case). The picker runs as a normal OpenXR workspace participant inheriting the requester's display mode.
 
 ### Completion
 
-The app polls `xrPollEvent` for `XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_EXT`. The event carries the matching `requestId`, an `XrFilePickerResultEXT` outcome, and (on success) the picked path as NUL-terminated UTF-8.
+The app polls `xrPollEvent` for `XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_DXR`. The event carries the matching `requestId`, an `XrFilePickerResultDXR` outcome, and (on success) the picked path as NUL-terminated UTF-8.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `requestId` | `XrAsyncRequestIdEXT` | Correlates with the `xrRequestFilePickerEXT` out-param. |
-| `result` | `XrFilePickerResultEXT` | `SUCCESS_EXT` (path valid), `CANCELLED_EXT`, `PICKER_FAILED_EXT` (process crashed / synthesised by the workspace controller on child-exit without completion), `INVALID_PATH_EXT` (selection did not fit in the path buffer). |
+| `requestId` | `XrAsyncRequestIdDXR` | Correlates with the `xrRequestFilePickerDXR` out-param. |
+| `result` | `XrFilePickerResultDXR` | `SUCCESS_EXT` (path valid), `CANCELLED_EXT`, `PICKER_FAILED_EXT` (process crashed / synthesised by the workspace controller on child-exit without completion), `INVALID_PATH_EXT` (selection did not fit in the path buffer). |
 | `path` | `char[256]` | UTF-8. Empty unless `result == SUCCESS_EXT`. Sized to fit Windows `MAX_PATH` (260) inside the runtime's per-message IPC budget; long-path picks (`\\?\…` style) return `INVALID_PATH_EXT` and the app should fall back to Tier 0. |
 
 Async / event-based on purpose: a blocking entrypoint would deadlock single-threaded render loops and stall `xrWaitFrame`.
 
 ### Request parameters
 
-`XrFilePickerInfoEXT` is a flat copyable value — the OpenXR `next` pointer chain is reserved for future use (must be `NULL` in spec_version 1). The IPC codegen does not follow pointer chains across the process boundary.
+`XrFilePickerInfoDXR` is a flat copyable value — the OpenXR `next` pointer chain is reserved for future use (must be `NULL` in spec_version 1). The IPC codegen does not follow pointer chains across the process boundary.
 
 | Field | Notes |
 |---|---|
 | `mode` | `OPEN_EXT` / `SAVE_EXT` / `FOLDER_EXT`. |
-| `flags` | `XR_FILE_PICKER_FLAG_MULTI_SELECT_BIT_EXT` is reserved for spec_version 2. spec_version 1 implementations may return `XR_ERROR_FEATURE_UNSUPPORTED` if the bit is set. |
+| `flags` | `XR_FILE_PICKER_FLAG_MULTI_SELECT_BIT_DXR` is reserved for spec_version 2. spec_version 1 implementations may return `XR_ERROR_FEATURE_UNSUPPORTED` if the bit is set. |
 | `title` | Window title; empty = picker chooses. |
 | `defaultPath` | Starting directory; empty = picker chooses. |
 | `filterCount` / `filters[]` | Up to 4 filter rows. Each row carries a user-visible `description` (`char[64]`) and a semicolon-delimited extension list (e.g. `"*.png;*.jpg;*.jpeg"`, `char[64]`). Tightening these vs. the proposal in #228 keeps the IPC payload inside the runtime's 1024-byte RPC budget — bumping it is a future change, not v1. |
@@ -57,7 +57,7 @@ Async / event-based on purpose: a blocking entrypoint would deadlock single-thre
 
 Not every workspace controller will ship a picker. The controller publishes its capability via the registry value `SupportsFileDialog = REG_DWORD 1` under its `HKLM\Software\DisplayXR\WorkspaceControllers\<id>` key (see `docs/specs/runtime/workspace-controller-registration.md`).
 
-- **No controller registered, or controller present but capability bit absent.** `xrRequestFilePickerEXT` returns `XR_FILE_PICKER_FALLBACK_TIER0_EXT` (success-class) and writes `XR_NULL_ASYNC_REQUEST_ID_EXT` into `*requestId`. No completion event will be posted. The app is expected to fall back to a flat OS dialog (`GetOpenFileName` / `IFileOpenDialog`); the Tier 0 CBT hook (always installed under workspace mode — see ADR-017) handles z-order and focus restoration onto a visible offscreen owner HWND.
+- **No controller registered, or controller present but capability bit absent.** `xrRequestFilePickerDXR` returns `XR_FILE_PICKER_FALLBACK_TIER0_DXR` (success-class) and writes `XR_NULL_ASYNC_REQUEST_ID_DXR` into `*requestId`. No completion event will be posted. The app is expected to fall back to a flat OS dialog (`GetOpenFileName` / `IFileOpenDialog`); the Tier 0 CBT hook (always installed under workspace mode — see ADR-017) handles z-order and focus restoration onto a visible offscreen owner HWND.
 - **Session not under a workspace.** Returns `XR_ERROR_FEATURE_UNSUPPORTED`. Standalone sessions should call `GetOpenFileName` directly with no DisplayXR involvement.
 
 This split keeps the extension surface decisive: a successful path means a completion event is guaranteed (modulo session destruction); the fallback code is the one signal the app needs to switch strategies. No fake events, no sentinel paths.
@@ -68,7 +68,7 @@ This split keeps the extension surface decisive: a successful path means a compl
 
 ```
 App                          Runtime                        Controller                       Picker exe
- |  xrRequestFilePickerEXT       |                              |                                 |
+ |  xrRequestFilePickerDXR       |                              |                                 |
  |----------------------------->  |  IPC: file_picker_request    |                                 |
  |  (returns immediately)        |---------------------------->  |  CreateProcess + CLI args       |
  |                               |                              |--------------------------------> |
@@ -82,7 +82,7 @@ App                          Runtime                        Controller          
  |                               |                              |  IPC: file_picker_result        |
  |                               |   <-------------------------- |  (controller is sole authority) |
  |                               |                              |                                 |
- |                               |  pushes XrEventDataFilePickerCompleteEXT to requesting session  |
+ |                               |  pushes XrEventDataFilePickerCompleteDXR to requesting session  |
  |                               |                              |                                 |
  |  <- xrPollEvent receives -    |                              |                                 |
  |   completion event            |                              |                                 |
@@ -92,9 +92,9 @@ The controller is the sole authority for `file_picker_result` — the runtime re
 
 Crash handling:
 
-- **Picker exit without result.** Controller observes the child PID exit, synthesises `result = XR_FILE_PICKER_RESULT_PICKER_FAILED_EXT`, sends the IPC.
+- **Picker exit without result.** Controller observes the child PID exit, synthesises `result = XR_FILE_PICKER_RESULT_PICKER_FAILED_DXR`, sends the IPC.
 - **Requester exit while picker open.** Controller monitors client liveness (M6 graceful-exit), issues `WM_CLOSE` then `TerminateProcess` on the picker child. The runtime drops the outstanding request on session destroy; the late picker result becomes a no-op (logged once).
-- **Recursion guard.** The runtime rejects `xrRequestFilePickerEXT` calls from sessions launched by the picker spawn path (the controller sets `DISPLAYXR_WORKSPACE_CLIENT_IS_PICKER=1` on the picker's environment; the runtime gates the entrypoint on its absence).
+- **Recursion guard.** The runtime rejects `xrRequestFilePickerDXR` calls from sessions launched by the picker spawn path (the controller sets `DISPLAYXR_WORKSPACE_CLIENT_IS_PICKER=1` on the picker's environment; the runtime gates the entrypoint on its absence).
 
 ---
 
@@ -102,13 +102,13 @@ Crash handling:
 
 | Version | Change |
 |---|---|
-| 1 | Initial provisional surface: `xrRequestFilePickerEXT`, `XrEventDataFilePickerCompleteEXT`, fallback result code. Multi-select reserved but unimplemented. |
+| 1 | Initial provisional surface: `xrRequestFilePickerDXR`, `XrEventDataFilePickerCompleteDXR`, fallback result code. Multi-select reserved but unimplemented. |
 
 Expected near-term revisions before any spec-freeze attempt:
 
 - Multi-select (`MULTI_SELECT_BIT_EXT` → variable-length result transport).
 - Optional `next`-chain extension struct for picker-side hints (initial focus on a particular tile, recent-files surfacing).
-- Spec-version bump once the picker UI lands in `displayxr-shell-pvt` and exercises edge cases of `XrFilePickerInfoEXT` (filter parsing, default-path normalisation).
+- Spec-version bump once the picker UI lands in `displayxr-shell-pvt` and exercises edge cases of `XrFilePickerInfoDXR` (filter parsing, default-path normalisation).
 
 The struct ABI is intentionally narrow in v1 to leave room.
 

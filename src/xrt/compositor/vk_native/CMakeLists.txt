@@ -6,7 +6,7 @@
 #
 
 if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE_VULKAN)
-	# XR_EXT_display_zones alpha-over draw path (ADR-027): zone layers draw
+	# XR_DXR_display_zones alpha-over draw path (ADR-027): zone layers draw
 	# through a blend pipeline instead of vkCmdBlitImage.
 	spirv_shaders(
 		VK_NATIVE_SHADER_HEADERS

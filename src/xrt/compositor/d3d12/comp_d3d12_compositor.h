@@ -29,8 +29,8 @@ extern "C" {
  * This compositor renders directly using D3D12 without any Vulkan involvement.
  *
  * @param xdev The device we are displaying to.
- * @param hwnd The window handle from XR_EXT_win32_window_binding (or NULL for fullscreen).
- * @param shared_texture_handle Shared texture handle from XR_EXT_win32_window_binding (or NULL).
+ * @param hwnd The window handle from XR_DXR_win32_window_binding (or NULL for fullscreen).
+ * @param shared_texture_handle Shared texture handle from XR_DXR_win32_window_binding (or NULL).
  * @param d3d12_device The D3D12 device from the application's graphics binding (ID3D12Device*).
  * @param d3d12_command_queue The D3D12 command queue from the graphics binding (ID3D12CommandQueue*).
  * @param dp_factory_d3d12 Display processor factory (xrt_dp_factory_d3d12_fn_t), or NULL.
@@ -162,7 +162,7 @@ comp_d3d12_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc,
                                                    uint32_t view_h);
 
 /*
- * XR_EXT_local_3d_zone — authored 2D/3D mask consumer, D3D12 leg (#439).
+ * XR_DXR_local_3d_zone — authored 2D/3D mask consumer, D3D12 leg (#439).
  * Contracts + the D3D11 porting reference:
  * docs/roadmap/unified-2d-3d-crossapi-impl.md §3.
  */
@@ -230,9 +230,9 @@ void
 comp_d3d12_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask);
 
 /*!
- * XR_EXT_display_zones (ADR-027): set the frame's explicit wish for the next
+ * XR_DXR_display_zones (ADR-027): set the frame's explicit wish for the next
  * layer_commit — @p mask is the compositor-side mask state of the
- * XrLocal3DZoneMaskEXT referenced via XrDisplayZonesFrameEndInfoEXT.wishMask
+ * XrLocal3DZoneMaskDXR referenced via XrDisplayZonesFrameEndInfoDXR.wishMask
  * (oxr_local_3d_zone_ext::comp_mask), or NULL to auto-derive the wish from
  * the frame's zone rects. Called by oxr on every zones frame before
  * xrt_comp_layer_commit; consumed by that commit. No-op outside zones frames.
@@ -244,7 +244,7 @@ comp_d3d12_compositor_zones_set_frame_wish(struct xrt_compositor *xc, void *mask
 
 /*!
  * Current recommended per-view render size (#439 Phase 3 Q4). Polled at frame
- * end so oxr can fire XrEventDataLocal3DZoneViewSizeChangedEXT when a mask /
+ * end so oxr can fire XrEventDataLocal3DZoneViewSizeChangedDXR when a mask /
  * Local2D activation or window resize changes it. Returns false if unavailable.
  *
  * @ingroup comp_d3d12

@@ -30,8 +30,8 @@ extern "C" {
  * For _rt apps: canvas = window (runtime-owned).
  *
  * Derived from the window/zone geometry. (The legacy app-facing setter
- * xrSetSharedTextureOutputRectEXT was removed in ADR-031 — a sub-rect is now
- * expressed as one 3D zone via XR_EXT_display_zones.)
+ * xrSetSharedTextureOutputRectDXR was removed in ADR-031 — a sub-rect is now
+ * expressed as one 3D zone via XR_DXR_display_zones.)
  */
 struct u_canvas_rect
 {

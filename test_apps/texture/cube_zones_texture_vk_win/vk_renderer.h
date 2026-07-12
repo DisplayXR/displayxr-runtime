@@ -5,7 +5,7 @@
  * @brief  Vulkan rendering for cube and grid
  *
  * Cloned from cube_handle_vk_win's vk_renderer and extended for
- * XR_EXT_display_zones: the base single-swapchain path (framebuffers[2]) is
+ * XR_DXR_display_zones: the base single-swapchain path (framebuffers[2]) is
  * unchanged; a generalized ZoneFramebuffers set + RenderSceneToZone() let each
  * display zone render the same cube+grid scene into its OWN OpenXR Vulkan
  * swapchain with a per-zone clear color and spin-phase offset (mirrors the
@@ -126,7 +126,7 @@ void RenderScene(
 void CleanupVkRenderer(VkRenderer& renderer);
 
 // ---------------------------------------------------------------------------
-// XR_EXT_display_zones: generalized per-zone framebuffer set
+// XR_DXR_display_zones: generalized per-zone framebuffer set
 // ---------------------------------------------------------------------------
 //
 // The base RenderScene() above is hardwired to renderer.framebuffers[0] (the

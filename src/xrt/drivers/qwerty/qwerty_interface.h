@@ -24,7 +24,7 @@ struct xrt_pose;
 
 /*!
  * Snapshot of the qwerty controller's SINGLE active view rig (unified shape,
- * matching the XR_EXT_view_rig tunables). `camera_mode` selects which rig is
+ * matching the XR_DXR_view_rig tunables). `camera_mode` selects which rig is
  * active and therefore which type-specific fields the consumer reads:
  * camera → inv_convergence_distance, half_tan_vfov, m2v; display →
  * virtual_display_height, perspective_factor. ipd_factor / parallax_factor are

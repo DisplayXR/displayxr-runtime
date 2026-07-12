@@ -55,7 +55,7 @@ HCBT_DESTROYWND:
 The expected shell-side response (implemented in `displayxr-shell-pvt`):
 
 1. Drop the workspace compositor swap chain from topmost / fullscreen-borderless to windowed for the duration. **This is the actual z-order fix** — cross-process `WS_EX_TOPMOST` on the in-app owner doesn't beat another process's fullscreen swap chain reliably.
-2. Trigger `xrRequestDisplayModeEXT(XR_DISPLAY_MODE_2D_EXT)` for the focused client (`oxr_api_session.c:1301`) so the 3D window flips to flat presentation while the dialog is up.
+2. Trigger `xrRequestDisplayModeDXR(XR_DISPLAY_MODE_2D_DXR)` for the focused client (`oxr_api_session.c:1301`) so the 3D window flips to flat presentation while the dialog is up.
 3. Dim the focus glow via `workspace_set_client_style`.
 4. Suspend cursor raycast hit-tests against the requesting client so clicks can't steal focus from the dialog.
 5. On `MODAL_CLOSE`, restore swap chain style, focus mode, glow, and raycasting.
@@ -72,7 +72,7 @@ Controllers that ignore the events get reduced UX (flat dialog over still-3D wor
 | `MessageBox(NULL, …)` (parentless) | **None** | Re-parent rule requires `hwndParent == hidden_app_hwnd`; a parentless top-level isn't matched. Same standalone behavior. |
 | Custom Qt / wx / Imgui pickers | **N/A** | Render in-app already; no Win32 modal popup involved. |
 
-For the partial / none rows, use Tier 1 (`XR_EXT_workspace_file_dialog`, GH #228) when polished spatial UX matters.
+For the partial / none rows, use Tier 1 (`XR_DXR_workspace_file_dialog`, GH #228) when polished spatial UX matters.
 
 ## Frame starvation
 

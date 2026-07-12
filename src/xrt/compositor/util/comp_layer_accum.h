@@ -182,7 +182,7 @@ comp_layer_accum_window_space(struct comp_layer_accum *cla, struct xrt_swapchain
 
 /*!
  * Accumulate swapchain and data for a local-2D layer for a frame
- * (XR_EXT_local_3d_zone v3, #439 Phase 3).
+ * (XR_DXR_local_3d_zone v3, #439 Phase 3).
  *
  * @public @memberof comp_layer_accum
  */
@@ -192,7 +192,7 @@ comp_layer_accum_local_2d(struct comp_layer_accum *cla, struct xrt_swapchain *xs
 
 /*!
  * Accumulate swapchains and data for a 3D display zone layer for a frame
- * (XR_EXT_display_zones, ADR-027). Multi-swapchain like projection.
+ * (XR_DXR_display_zones, ADR-027). Multi-swapchain like projection.
  *
  * @public @memberof comp_layer_accum
  */

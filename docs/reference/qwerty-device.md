@@ -18,7 +18,7 @@ The qwerty driver provides simulated HMD and controller devices that are control
 The driver has three input backends:
 
 - **SDL backend** (`qwerty_sdl.c`) — Uses the Monado debug GUI window. Cross-platform.
-- **Win32 backend** (`qwerty_win32.c`) — Uses the D3D11 compositor window directly. Windows only. Active when Monado creates its own window (no HWND provided via `XR_EXT_win32_window_binding`).
+- **Win32 backend** (`qwerty_win32.c`) — Uses the D3D11 compositor window directly. Windows only. Active when Monado creates its own window (no HWND provided via `XR_DXR_win32_window_binding`).
 - **macOS backend** (`qwerty_macos.m`) — Uses the Vulkan compositor NSWindow directly. macOS only.
 
 ---

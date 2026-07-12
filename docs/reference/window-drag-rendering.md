@@ -6,7 +6,7 @@ This document covers **window drag handling** for the D3D11 native compositor. T
 
 | Scenario | Window Owner | Extension | Example App | Section |
 |----------|-------------|-----------|-------------|---------|
-| **App-owned window** | Application creates HWND, passes to runtime | `XR_EXT_win32_window_binding` | `cube_handle_d3d11` | [WM_PAINT Trick](#solution-the-wm_paint-trick) |
+| **App-owned window** | Application creates HWND, passes to runtime | `XR_DXR_win32_window_binding` | `cube_handle_d3d11` | [WM_PAINT Trick](#solution-the-wm_paint-trick) |
 | **Runtime-owned window** | Monado creates HWND on dedicated thread | None (standard OpenXR) | `cube_d3d11`, Blender | [Cross-Thread Sync](#monados-dedicated-window-thread-cross-thread-paint-synchronization) |
 
 **Key difference:**
@@ -64,7 +64,7 @@ The application's game loop is **blocked** at `DefWindowProc()`, waiting for it 
 
 ## App-Owned Window: The WM_PAINT Trick
 
-> **Applies to:** Apps using `XR_EXT_win32_window_binding` that create their own HWND and pass it to the runtime (e.g., `cube_handle_d3d11`).
+> **Applies to:** Apps using `XR_DXR_win32_window_binding` that create their own HWND and pass it to the runtime (e.g., `cube_handle_d3d11`).
 
 Even though Windows hijacked the message loop, it still **dispatches `WM_PAINT` messages** to the application's `WndProc`. The trick exploits this to sneak render frames into the modal loop:
 
@@ -170,9 +170,9 @@ The WM_PAINT trick is the correct approach: one thread, one D3D11 context, no ra
 
 ## Runtime-Owned Window: Cross-Thread Paint Synchronization
 
-> **Applies to:** Apps that do NOT use `XR_EXT_win32_window_binding`. Monado creates and owns the window (e.g., `cube_d3d11`, Blender).
+> **Applies to:** Apps that do NOT use `XR_DXR_win32_window_binding`. Monado creates and owns the window (e.g., `cube_d3d11`, Blender).
 
-When apps use Monado without `XR_EXT_win32_window_binding` (no app-provided HWND), Monado creates its own window on a **dedicated thread**. This separates the window thread from the compositor thread, which introduces a different challenge.
+When apps use Monado without `XR_DXR_win32_window_binding` (no app-provided HWND), Monado creates its own window on a **dedicated thread**. This separates the window thread from the compositor thread, which introduces a different challenge.
 
 ### The Architecture
 
@@ -292,7 +292,7 @@ Attempts to reduce jitter with `DwmFlush()`, `ValidateRect` cycling, and longer 
 
 | Scenario | Architecture | Technique |
 |----------|-------------|-----------|
-| App owns window (XR_EXT_win32_window_binding) | Single thread | WM_PAINT trick — render inline |
+| App owns window (XR_DXR_win32_window_binding) | Single thread | WM_PAINT trick — render inline |
 | Monado owns window (no extension) | Cross-thread | WM_PAINT sync via events |
 
 Both achieve the same goal: **stable window position during weave + Present**. The cross-thread version uses synchronization primitives to achieve what the single-thread version gets for free.
@@ -304,5 +304,5 @@ Both achieve the same goal: **stable window position during weave + Present**. T
 - Test app implementation: `test_apps/handle/cube_handle_d3d11_win/` (D3D11 with WM_PAINT handling)
 - Monado window management: `src/xrt/compositor/d3d11/comp_d3d11_window.cpp`
 - Monado compositor integration: `src/xrt/compositor/d3d11/comp_d3d11_compositor.cpp`
-- Extension spec: `docs/specs/extensions/XR_EXT_win32_window_binding.md` (Section 4.3)
+- Extension spec: `docs/specs/extensions/XR_DXR_win32_window_binding.md` (Section 4.3)
 - D3D11 renderer: `src/xrt/compositor/d3d11/comp_d3d11_renderer.cpp`

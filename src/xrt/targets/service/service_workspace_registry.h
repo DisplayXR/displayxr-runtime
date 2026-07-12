@@ -67,12 +67,12 @@ enum workspace_controller_capability
 {
 	/*!
 	 * Controller hosts a spatial file picker
-	 * (XR_EXT_workspace_file_dialog Tier 1).
+	 * (XR_DXR_workspace_file_dialog Tier 1).
 	 *
 	 * Registry value: `SupportsFileDialog = REG_DWORD 1`.
 	 *
-	 * Without this bit set, `xrRequestFilePickerEXT` returns
-	 * `XR_FILE_PICKER_FALLBACK_TIER0_EXT` and the app is expected to
+	 * Without this bit set, `xrRequestFilePickerDXR` returns
+	 * `XR_FILE_PICKER_FALLBACK_TIER0_DXR` and the app is expected to
 	 * fall back to a flat OS dialog (Tier 0 handles z-order / focus).
 	 */
 	WORKSPACE_CAPABILITY_FILE_DIALOG = 1u << 0,

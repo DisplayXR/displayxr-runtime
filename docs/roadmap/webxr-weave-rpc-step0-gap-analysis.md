@@ -104,7 +104,7 @@ existing `DP → app` direction above. `weave()` **returns** the DP's current tr
 via `get_predicted_eye_positions`) so the present-owner drives its **own** off-axis (Kooima)
 projection for the next pre-weave frame — virtual-camera motion / look-around. Phase 1 carried a
 vestigial caller→weave `eyes` input (unused); **Phase 2 removed it and added the eye *return*** to
-the handback (`XrWeaveOutputEXT` / `weave_submit` out). For an OpenXR-session present-owner the
+the handback (`XrWeaveOutputDXR` / `weave_submit` out). For an OpenXR-session present-owner the
 same eyes are already available via `xrLocateViews`; the return value is what makes a
 *session-less* caller (CEF) work.
 

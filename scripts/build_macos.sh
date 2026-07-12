@@ -369,7 +369,7 @@ export XR_RUNTIME_JSON="$DIR/openxr_displayxr.json"
 export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
 export XRT_PLUGIN_SEARCH_PATH="$DIR/lib/displayxr/plugins"
 export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-sbs}"
-echo "Starting cube_zones_metal_macos (Metal, XR_EXT_display_zones) with $SIM_DISPLAY_OUTPUT output..."
+echo "Starting cube_zones_metal_macos (Metal, XR_DXR_display_zones) with $SIM_DISPLAY_OUTPUT output..."
 exec "$DIR/bin/cube_zones_metal_macos" "$@"
 SCRIPT
 chmod +x "$PKG_DIR/run_cube_zones_metal.sh"
@@ -384,7 +384,7 @@ export XRT_PLUGIN_SEARCH_PATH="$DIR/lib/displayxr/plugins"
 export VK_ICD_FILENAMES="$DIR/share/vulkan/icd.d/MoltenVK_icd.json"
 export VK_DRIVER_FILES="$DIR/share/vulkan/icd.d/MoltenVK_icd.json"
 export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-sbs}"
-echo "Starting cube_zones_vk_macos (Vulkan, XR_EXT_display_zones) with $SIM_DISPLAY_OUTPUT output..."
+echo "Starting cube_zones_vk_macos (Vulkan, XR_DXR_display_zones) with $SIM_DISPLAY_OUTPUT output..."
 exec "$DIR/bin/cube_zones_vk_macos" "$@"
 SCRIPT
 chmod +x "$PKG_DIR/run_cube_zones_vk.sh"
@@ -404,7 +404,7 @@ chmod +x "$PKG_DIR/run_cube_handle_gl.sh"
 
 cat > "$PKG_DIR/run_cube_zones_texture_metal.sh" <<'SCRIPT'
 #!/bin/bash
-# Texture-class XR_EXT_display_zones parity test: a texture app (shared IOSurface)
+# Texture-class XR_DXR_display_zones parity test: a texture app (shared IOSurface)
 # must receive the full multi-zone super-atlas + Local2D composite in its read-back.
 # DXR_TEXDUMP=<path> (or =1 → /tmp/zones_texture_readback.png) dumps the IOSurface
 # read-back at frame ~150 so you can confirm the zones composite landed in the

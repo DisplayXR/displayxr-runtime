@@ -12,7 +12,7 @@ This document is the contract between the DisplayXR runtime and any
 **workspace app** that wants to drive the multi-window spatial shell
 experience — the DisplayXR Shell, third-party verticals (cockpits,
 kiosks, branded shells), or experimental controllers built against
-`XR_EXT_spatial_workspace`.
+`XR_DXR_spatial_workspace`.
 
 The runtime owns no specific workspace app. There is no
 `displayxr-shell.exe` literal in any runtime binary. Workspace apps
@@ -45,7 +45,7 @@ A workspace app's installer:
    | `Version` | REG_SZ | no | Free-form version string (logged at spawn). |
    | `IconPath` | REG_SZ | no | Tray submenu icon (reserved). |
    | `UninstallString` | REG_SZ | yes | Used by the runtime uninstaller for cascade uninstall. **Must honor `/S` (silent).** |
-   | `SupportsFileDialog` | REG_DWORD | no | Optional capability bit. `1` means this controller hosts `XR_EXT_workspace_file_dialog` Tier 1 (spawns a spatial picker exe on `xrRequestFilePickerEXT`). Missing or `0` means the runtime returns `XR_FILE_PICKER_FALLBACK_TIER0_EXT` and the app falls back to a flat OS dialog. |
+   | `SupportsFileDialog` | REG_DWORD | no | Optional capability bit. `1` means this controller hosts `XR_DXR_workspace_file_dialog` Tier 1 (spawns a spatial picker exe on `xrRequestFilePickerDXR`). Missing or `0` means the runtime returns `XR_FILE_PICKER_FALLBACK_TIER0_DXR` and the app falls back to a flat OS dialog. |
 
    Capability flags are forward-compatible: future bits (`SupportsColorDialog`, …) are added as additional `REG_DWORD` values under this same subkey. Unknown values are ignored. Controllers never need to declare bits they don't implement.
 
@@ -286,7 +286,7 @@ its structure:
 
 `Version` is informational. The compatibility contract between
 runtime and workspace app is enforced by the OpenXR extension layer:
-each workspace app declares the minimum runtime `XR_EXT_spatial_workspace`
+each workspace app declares the minimum runtime `XR_DXR_spatial_workspace`
 spec_version it requires (typically in its README — the same
 "Requires the DisplayXR runtime ≥ vX.Y.Z" covenant the standalone
 demo repos state in theirs). When
@@ -306,7 +306,7 @@ event types were added with the GH #227 modal-dialog work:
   Win32 modal popup (file dialog, MessageBox, …). The recommended
   controller response is to drop the workspace swap chain from
   topmost / fullscreen to windowed, trigger
-  `xrRequestDisplayModeEXT(XR_DISPLAY_MODE_2D_EXT)` for the focused
+  `xrRequestDisplayModeDXR(XR_DISPLAY_MODE_2D_DXR)` for the focused
   client, dim its focus glow, and suspend cursor raycast hit-tests
   against it. Without these the dialog still works but z-order /
   focus-stealing UX is degraded.
@@ -347,7 +347,7 @@ The workspace's **final atlas to the display processor is opaque** —
 the workspace itself cannot present a transparent window to the
 desktop. Standalone apps that want a transparent output window must
 run outside workspace mode (using the in-process D3D11 compositor
-with `XR_EXT_win32_window_binding::transparentBackgroundEnabled`).
+with `XR_DXR_win32_window_binding::transparentBackgroundEnabled`).
 
 This is not a temporary limitation; it is a deliberate consequence of
 the multi-compositor pipeline. A transparent workspace output would
@@ -366,14 +366,14 @@ to change mode from a workspace client are silently no-opped.
 **Enforcement (single point):** `oxr_api_session.c::oxr_xrRequestDisplayRenderingModeEXT`
 returns `XR_SUCCESS` without state change when the calling session is a
 workspace client (`sys->xsysc->info.is_service_mode && sess->compositor != NULL`).
-`xrRequestDisplayModeEXT` is a thin wrapper and inherits the gate.
+`xrRequestDisplayModeDXR` is a thin wrapper and inherits the gate.
 Headless bridge-relay sessions are exempt and may drive mode (they act
 as mode controller on behalf of an out-of-process WebXR page).
 
-**Non-enforcement (deliberate):** `xrEnumerateDisplayRenderingModesEXT`
+**Non-enforcement (deliberate):** `xrEnumerateDisplayRenderingModesDXR`
 continues to return the FULL mode list to workspace clients. Apps index
 their local rendering-mode arrays by VENDOR-ASSIGNED `mode_index`
-delivered via `XrEventDataRenderingModeChangedEXT` — filtering the
+delivered via `XrEventDataRenderingModeChangedDXR` — filtering the
 enumerator to `count=1` causes apps to read `renderingModeViewCounts[active_idx]=0`
 and submit `view[1]` with zero orientation, triggering `XR_ERROR_POSE_INVALID`
 at `xrEndFrame`. Authority is enforced by REQUEST-gating, not enumeration-filtering.
@@ -381,7 +381,7 @@ at `xrEndFrame`. Authority is enforced by REQUEST-gating, not enumeration-filter
 **Transition protocol (#234):** When the workspace decides to flip mode
 (focus-adaptive, modal-open, qwerty V-toggle, vendor-initiated), the
 workspace D3D11 compositor (`comp_d3d11_service.cpp::multi_compositor_request_mode_flip`)
-broadcasts `XrEventDataRenderingModeChangedEXT` immediately and enters a
+broadcasts `XrEventDataRenderingModeChangedDXR` immediately and enters a
 WAITING_ACK phase with a "curtain" that flattens the per-tile blit pass
 to a uniform mono frame. Per-slot ack is detected at `compositor_layer_commit`
 when a slot submits a projection layer whose extent matches the target

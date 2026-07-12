@@ -311,5 +311,5 @@ See [`docs/roadmap/webxr-bridge-v2-plan.md`](../docs/roadmap/webxr-bridge-v2-pla
 | [`extension/src/main-world.js`](extension/src/main-world.js) | The shim that exposes `session.displayXR`. |
 | [`../test_apps/common/display3d_view.c`](../test_apps/common/display3d_view.c) | Canonical Kooima math (C). The JS ports mirror this. |
 | [`../test_apps/handle/cube_handle_d3d11_win/main.cpp`](../test_apps/handle/cube_handle_d3d11_win/main.cpp) | Native equivalent of the WebXR sample. Same conventions. |
-| [`../docs/specs/extensions/XR_EXT_display_info.md`](../docs/specs/extensions/XR_EXT_display_info.md) | Underlying OpenXR extension that the bridge surfaces over WS. |
+| [`../docs/specs/extensions/XR_DXR_display_info.md`](../docs/specs/extensions/XR_DXR_display_info.md) | Underlying OpenXR extension that the bridge surfaces over WS. |
 | [`../docs/roadmap/webxr-bridge-v2-plan.md`](../docs/roadmap/webxr-bridge-v2-plan.md) | Architecture rationale: why the bridge exists. |

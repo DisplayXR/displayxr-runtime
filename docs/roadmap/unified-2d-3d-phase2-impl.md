@@ -2,7 +2,7 @@
 
 **Branch suggestion:** `feature/unified-2d-3d-phase2`, off `main` post-Phase-1.
 **Spec:** [`unified-2d-3d-compositing.md`](unified-2d-3d-compositing.md) §6 (Phase 2), §9 Q5 (full-window first, bbox under profiling). Epic #439.
-**Builds on:** Phase 1 (`XR_EXT_local_3d_zone` oxr layer + D3D11 consumer, merged in PR #469; window-clamped per #464).
+**Builds on:** Phase 1 (`XR_DXR_local_3d_zone` oxr layer + D3D11 consumer, merged in PR #469; window-clamped per #464).
 
 > **STATUS: implemented + hardware-validated (2026-06-06).** `d3d11_effective_canvas()` applied at all 8 sites; §5 matrix green on Leia hardware — no-mask leg statistically identical to a Phase-1 `main` build (DP weave geometry byte-identical, pixel diff within the same-runtime noise envelope, beyond-window region diff 0), mask-active weave flips to `canvas=(0,0,win)` with window-derived view dims, Tier-2 islands beyond the old canvas show real weave on-glass (Phase 1 showed stale 2D there), destroy snaps geometry back, drag-resize tracks the client rect per frame, `selftest` passes. Note: the window-spanning 3D is upscaled from the app's canvas-sized swapchain (app didn't re-render; expected — view dims are the runtime side only). Windows-only — D3D11 compositor + Leia validation; no oxr, no DP-interface, no macOS-verifiable code.
 
@@ -16,12 +16,12 @@ Phase 1 lerps the authored mask over whatever is in the target — but the DP on
 
 Everywhere in the D3D11 frame path, `canvas.valid == false` already means "full window" — the fallbacks all exist and are correct. So Phase 2 is **not** new geometry plumbing; it is one rule applied uniformly:
 
-> **While `c->active_zone_mask != nullptr`, the effective canvas is the client-window rect `{0, 0, win_w, win_h}` (top-left anchored, per the #464 window clamp), regardless of any `xrSetSharedTextureOutputRectEXT` call.**
+> **While `c->active_zone_mask != nullptr`, the effective canvas is the client-window rect `{0, 0, win_w, win_h}` (top-left anchored, per the #464 window clamp), regardless of any `xrSetSharedTextureOutputRectDXR` call.**
 
 Consequences (all intended, per spec §6/§7):
 
 - **The 3D layer becomes window-spanning** while a mask is active: view dims re-sync to window-derived dims through the existing per-frame mode-sync, and the Kooima/FOV metrics follow. The mask is a window-space *region selector* over a window-spanning 3D scene — region selection moves entirely to the mask, exactly the §7 migration story ("today's output-rect + surround becomes the Tier-2 single-rect path").
-- **Output rect is ignored, not an error**, while a mask is active; it snaps back when the mask is destroyed (`active_zone_mask` cleared → next frame's sync restores canvas-derived dims). Document this in the extension header comment for `xrSubmitLocal3DZoneEXT`.
+- **Output rect is ignored, not an error**, while a mask is active; it snaps back when the mask is destroyed (`active_zone_mask` cleared → next frame's sync restores canvas-derived dims). Document this in the extension header comment for `xrSubmitLocal3DZoneDXR`.
 - **Visual re-baseline for `texture` apps that set both** (e.g. `cube_texture_d3d11_win`'s 'Z' cycle): the Phase-1 "Tier-2 single rect == canvas rect == Phase-0 output" equivalence **changes meaning** — the rect now crops a window-spanning weave instead of framing a canvas-fit scene. That is the correct end-state semantics; the §6 validation matrix below re-baselines it. The **no-mask** path must remain byte-identical (zero regression — same bar as Phases 0/1).
 
 Why supersede rather than union/honor both: the spec feeds the weave bbox *as* `canvas_offset/size` (§6), and a mask user has no second region mechanism to coordinate with — two live region authorities (rect + mask) would need a precedence rule anyway; "mask wins totally" is the only one that doesn't create hybrid states impossible to validate.

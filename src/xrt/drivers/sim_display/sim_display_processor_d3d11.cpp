@@ -659,7 +659,7 @@ sim_dp_d3d11_publish_local_zone_mask(struct xrt_display_processor_d3d11 *xdp,
 		td.Height = mask_height;
 		td.MipLevels = 1;
 		td.ArraySize = 1;
-		td.Format = DXGI_FORMAT_R8_UNORM; // the XR_EXT_local_3d_zone mask format
+		td.Format = DXGI_FORMAT_R8_UNORM; // the XR_DXR_local_3d_zone mask format
 		td.SampleDesc.Count = 1;
 		td.Usage = D3D11_USAGE_STAGING;
 		td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;

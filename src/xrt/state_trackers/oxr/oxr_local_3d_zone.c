@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  XR_EXT_local_3d_zone entrypoints — authored 2D/3D mask (#439,
+ * @brief  XR_DXR_local_3d_zone entrypoints — authored 2D/3D mask (#439,
  *         unified 2D/3D compositing).
  * @author David Fattal
  * @ingroup oxr_api
@@ -52,7 +52,7 @@
 #include "gl/comp_gl_compositor.h"
 #endif
 
-#ifdef OXR_HAVE_EXT_local_3d_zone
+#ifdef OXR_HAVE_DXR_local_3d_zone
 
 //! D3D11/D3D12/VK/GL max texture dimension — bounds the authored mask size.
 #define OXR_LOCAL_3D_ZONE_MAX_MASK_DIM 16384
@@ -140,14 +140,14 @@ oxr_local_3d_zone_destroy_cb(struct oxr_logger *log, struct oxr_handle_base *hb)
  */
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrGetLocal3DZoneCapabilitiesEXT(XrSession session, XrLocal3DZoneCapabilitiesEXT *capabilities)
+oxr_xrGetLocal3DZoneCapabilitiesEXT(XrSession session, XrLocal3DZoneCapabilitiesDXR *capabilities)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetLocal3DZoneCapabilitiesEXT");
-	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, capabilities, XR_TYPE_LOCAL_3D_ZONE_CAPABILITIES_EXT);
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetLocal3DZoneCapabilitiesDXR");
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, capabilities, XR_TYPE_LOCAL_3D_ZONE_CAPABILITIES_DXR);
 
 	// Never errors on an unsupported compositor — reports supported = false.
 	// VK sessions also report false until that consumer leg lands
@@ -229,15 +229,15 @@ oxr_xrGetLocal3DZoneCapabilitiesEXT(XrSession session, XrLocal3DZoneCapabilities
 
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrCreateLocal3DZoneMaskEXT(XrSession session,
-                               const XrLocal3DZoneMaskCreateInfoEXT *createInfo,
-                               XrLocal3DZoneMaskEXT *mask)
+                               const XrLocal3DZoneMaskCreateInfoDXR *createInfo,
+                               XrLocal3DZoneMaskDXR *mask)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrCreateLocal3DZoneMaskEXT");
-	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, createInfo, XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_EXT);
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrCreateLocal3DZoneMaskDXR");
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, createInfo, XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_DXR);
 	OXR_VERIFY_ARG_NOT_NULL(&log, mask);
 
 	if (createInfo->maskWidth > OXR_LOCAL_3D_ZONE_MAX_MASK_DIM ||
@@ -308,7 +308,7 @@ oxr_xrCreateLocal3DZoneMaskEXT(XrSession session,
 		}
 #endif
 		if (xret != XRT_SUCCESS) {
-			XrResult ret = zone_mask_xret_to_xr(&log, xret, "xrCreateLocal3DZoneMaskEXT");
+			XrResult ret = zone_mask_xret_to_xr(&log, xret, "xrCreateLocal3DZoneMaskDXR");
 			oxr_handle_destroy(&log, &zone->handle);
 			return ret;
 		}
@@ -323,13 +323,13 @@ oxr_xrCreateLocal3DZoneMaskEXT(XrSession session,
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetLocal3DZoneWholeWindowEXT(XrLocal3DZoneMaskEXT mask, XrBool32 enable3D)
+oxr_xrSetLocal3DZoneWholeWindowEXT(XrLocal3DZoneMaskDXR mask, XrBool32 enable3D)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_local_3d_zone_ext *zone;
 	struct oxr_logger log;
-	OXR_VERIFY_LOCAL_3D_ZONE_AND_INIT_LOG(&log, mask, zone, "xrSetLocal3DZoneWholeWindowEXT");
+	OXR_VERIFY_LOCAL_3D_ZONE_AND_INIT_LOG(&log, mask, zone, "xrSetLocal3DZoneWholeWindowDXR");
 
 #ifdef OXR_LOCAL_3D_ZONE_HAVE_ANY_COMPOSITOR
 	struct oxr_session *sess = zone->sess;
@@ -339,7 +339,7 @@ oxr_xrSetLocal3DZoneWholeWindowEXT(XrLocal3DZoneMaskEXT mask, XrBool32 enable3D)
 			return zone_mask_xret_to_xr(&log,
 			                            comp_d3d11_compositor_zone_mask_set_whole(
 			                                &sess->xcn->base, zone->comp_mask, enable3D == XR_TRUE),
-			                            "xrSetLocal3DZoneWholeWindowEXT");
+			                            "xrSetLocal3DZoneWholeWindowDXR");
 		}
 #endif
 #ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
@@ -347,7 +347,7 @@ oxr_xrSetLocal3DZoneWholeWindowEXT(XrLocal3DZoneMaskEXT mask, XrBool32 enable3D)
 			return zone_mask_xret_to_xr(&log,
 			                            comp_d3d12_compositor_zone_mask_set_whole(
 			                                &sess->xcn->base, zone->comp_mask, enable3D == XR_TRUE),
-			                            "xrSetLocal3DZoneWholeWindowEXT");
+			                            "xrSetLocal3DZoneWholeWindowDXR");
 		}
 #endif
 #ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
@@ -355,7 +355,7 @@ oxr_xrSetLocal3DZoneWholeWindowEXT(XrLocal3DZoneMaskEXT mask, XrBool32 enable3D)
 			return zone_mask_xret_to_xr(&log,
 			                            comp_vk_native_compositor_zone_mask_set_whole(
 			                                &sess->xcn->base, zone->comp_mask, enable3D == XR_TRUE),
-			                            "xrSetLocal3DZoneWholeWindowEXT");
+			                            "xrSetLocal3DZoneWholeWindowDXR");
 		}
 #endif
 #ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
@@ -363,7 +363,7 @@ oxr_xrSetLocal3DZoneWholeWindowEXT(XrLocal3DZoneMaskEXT mask, XrBool32 enable3D)
 			return zone_mask_xret_to_xr(&log,
 			                            comp_metal_compositor_zone_mask_set_whole(
 			                                &sess->xcn->base, zone->comp_mask, enable3D == XR_TRUE),
-			                            "xrSetLocal3DZoneWholeWindowEXT");
+			                            "xrSetLocal3DZoneWholeWindowDXR");
 		}
 #endif
 #ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
@@ -371,7 +371,7 @@ oxr_xrSetLocal3DZoneWholeWindowEXT(XrLocal3DZoneMaskEXT mask, XrBool32 enable3D)
 			return zone_mask_xret_to_xr(&log,
 			                            comp_gl_compositor_zone_mask_set_whole(
 			                                &sess->xcn->base, zone->comp_mask, enable3D == XR_TRUE),
-			                            "xrSetLocal3DZoneWholeWindowEXT");
+			                            "xrSetLocal3DZoneWholeWindowDXR");
 		}
 #endif
 	}
@@ -384,13 +384,13 @@ oxr_xrSetLocal3DZoneWholeWindowEXT(XrLocal3DZoneMaskEXT mask, XrBool32 enable3D)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetLocal3DZoneFromRectsEXT(XrLocal3DZoneMaskEXT mask, uint32_t rectCount, const XrRect2Di *rects)
+oxr_xrSetLocal3DZoneFromRectsEXT(XrLocal3DZoneMaskDXR mask, uint32_t rectCount, const XrRect2Di *rects)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_local_3d_zone_ext *zone;
 	struct oxr_logger log;
-	OXR_VERIFY_LOCAL_3D_ZONE_AND_INIT_LOG(&log, mask, zone, "xrSetLocal3DZoneFromRectsEXT");
+	OXR_VERIFY_LOCAL_3D_ZONE_AND_INIT_LOG(&log, mask, zone, "xrSetLocal3DZoneFromRectsDXR");
 	OXR_VERIFY_ARG_NOT_NULL(&log, rects);
 
 	if (rectCount == 0) {
@@ -450,7 +450,7 @@ oxr_xrSetLocal3DZoneFromRectsEXT(XrLocal3DZoneMaskEXT mask, uint32_t rectCount, 
 #endif
 		free(xrects);
 		if (api_matched) {
-			return zone_mask_xret_to_xr(&log, xret, "xrSetLocal3DZoneFromRectsEXT");
+			return zone_mask_xret_to_xr(&log, xret, "xrSetLocal3DZoneFromRectsDXR");
 		}
 	}
 #endif // OXR_LOCAL_3D_ZONE_HAVE_ANY_COMPOSITOR
@@ -460,13 +460,13 @@ oxr_xrSetLocal3DZoneFromRectsEXT(XrLocal3DZoneMaskEXT mask, uint32_t rectCount, 
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrAcquireLocal3DZoneRenderTargetEXT(XrLocal3DZoneMaskEXT mask, void *binding)
+oxr_xrAcquireLocal3DZoneRenderTargetEXT(XrLocal3DZoneMaskDXR mask, void *binding)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_local_3d_zone_ext *zone;
 	struct oxr_logger log;
-	OXR_VERIFY_LOCAL_3D_ZONE_AND_INIT_LOG(&log, mask, zone, "xrAcquireLocal3DZoneRenderTargetEXT");
+	OXR_VERIFY_LOCAL_3D_ZONE_AND_INIT_LOG(&log, mask, zone, "xrAcquireLocal3DZoneRenderTargetDXR");
 	OXR_VERIFY_ARG_NOT_NULL(&log, binding);
 
 #ifdef OXR_LOCAL_3D_ZONE_HAVE_ANY_COMPOSITOR
@@ -479,10 +479,10 @@ oxr_xrAcquireLocal3DZoneRenderTargetEXT(XrLocal3DZoneMaskEXT mask, void *binding
 
 #ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 	if (sess->is_d3d11_native_compositor) {
-		XrLocal3DZoneRenderTargetD3D11EXT *d3d11_binding = (XrLocal3DZoneRenderTargetD3D11EXT *)binding;
-		if (d3d11_binding->type != XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D11_EXT) {
+		XrLocal3DZoneRenderTargetD3D11DXR *d3d11_binding = (XrLocal3DZoneRenderTargetD3D11DXR *)binding;
+		if (d3d11_binding->type != XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D11_DXR) {
 			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-			                 "(binding->type) expected XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D11_EXT");
+			                 "(binding->type) expected XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D11_DXR");
 		}
 
 		void *rtv = NULL;
@@ -490,7 +490,7 @@ oxr_xrAcquireLocal3DZoneRenderTargetEXT(XrLocal3DZoneMaskEXT mask, void *binding
 		xrt_result_t xret =
 		    comp_d3d11_compositor_zone_mask_acquire_rt(&sess->xcn->base, zone->comp_mask, &rtv, &w, &h);
 		if (xret != XRT_SUCCESS) {
-			return zone_mask_xret_to_xr(&log, xret, "xrAcquireLocal3DZoneRenderTargetEXT");
+			return zone_mask_xret_to_xr(&log, xret, "xrAcquireLocal3DZoneRenderTargetDXR");
 		}
 
 		d3d11_binding->renderTargetView = rtv;
@@ -502,10 +502,10 @@ oxr_xrAcquireLocal3DZoneRenderTargetEXT(XrLocal3DZoneMaskEXT mask, void *binding
 
 #ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
 	if (sess->is_d3d12_native_compositor) {
-		XrLocal3DZoneRenderTargetD3D12EXT *d3d12_binding = (XrLocal3DZoneRenderTargetD3D12EXT *)binding;
-		if (d3d12_binding->type != XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D12_EXT) {
+		XrLocal3DZoneRenderTargetD3D12DXR *d3d12_binding = (XrLocal3DZoneRenderTargetD3D12DXR *)binding;
+		if (d3d12_binding->type != XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D12_DXR) {
 			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-			                 "(binding->type) expected XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D12_EXT");
+			                 "(binding->type) expected XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D12_DXR");
 		}
 
 		void *resource = NULL;
@@ -513,7 +513,7 @@ oxr_xrAcquireLocal3DZoneRenderTargetEXT(XrLocal3DZoneMaskEXT mask, void *binding
 		xrt_result_t xret =
 		    comp_d3d12_compositor_zone_mask_acquire_rt(&sess->xcn->base, zone->comp_mask, &resource, &w, &h);
 		if (xret != XRT_SUCCESS) {
-			return zone_mask_xret_to_xr(&log, xret, "xrAcquireLocal3DZoneRenderTargetEXT");
+			return zone_mask_xret_to_xr(&log, xret, "xrAcquireLocal3DZoneRenderTargetDXR");
 		}
 
 		d3d12_binding->resource = resource;
@@ -533,10 +533,10 @@ oxr_xrAcquireLocal3DZoneRenderTargetEXT(XrLocal3DZoneMaskEXT mask, void *binding
 
 #ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
 	if (sess->is_vk_native_compositor) {
-		XrLocal3DZoneRenderTargetVulkanEXT *vk_binding = (XrLocal3DZoneRenderTargetVulkanEXT *)binding;
-		if (vk_binding->type != XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_VULKAN_EXT) {
+		XrLocal3DZoneRenderTargetVulkanDXR *vk_binding = (XrLocal3DZoneRenderTargetVulkanDXR *)binding;
+		if (vk_binding->type != XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_VULKAN_DXR) {
 			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-			                 "(binding->type) expected XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_VULKAN_EXT");
+			                 "(binding->type) expected XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_VULKAN_DXR");
 		}
 
 		void *image = NULL;
@@ -545,7 +545,7 @@ oxr_xrAcquireLocal3DZoneRenderTargetEXT(XrLocal3DZoneMaskEXT mask, void *binding
 		xrt_result_t xret = comp_vk_native_compositor_zone_mask_acquire_rt(&sess->xcn->base, zone->comp_mask,
 		                                                                   &image, &image_view, &w, &h);
 		if (xret != XRT_SUCCESS) {
-			return zone_mask_xret_to_xr(&log, xret, "xrAcquireLocal3DZoneRenderTargetEXT");
+			return zone_mask_xret_to_xr(&log, xret, "xrAcquireLocal3DZoneRenderTargetDXR");
 		}
 
 		vk_binding->image = image;
@@ -569,13 +569,13 @@ oxr_xrAcquireLocal3DZoneRenderTargetEXT(XrLocal3DZoneMaskEXT mask, void *binding
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSubmitLocal3DZoneEXT(XrLocal3DZoneMaskEXT mask)
+oxr_xrSubmitLocal3DZoneEXT(XrLocal3DZoneMaskDXR mask)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_local_3d_zone_ext *zone;
 	struct oxr_logger log;
-	OXR_VERIFY_LOCAL_3D_ZONE_AND_INIT_LOG(&log, mask, zone, "xrSubmitLocal3DZoneEXT");
+	OXR_VERIFY_LOCAL_3D_ZONE_AND_INIT_LOG(&log, mask, zone, "xrSubmitLocal3DZoneDXR");
 
 #ifdef OXR_LOCAL_3D_ZONE_HAVE_ANY_COMPOSITOR
 	struct oxr_session *sess = zone->sess;
@@ -584,35 +584,35 @@ oxr_xrSubmitLocal3DZoneEXT(XrLocal3DZoneMaskEXT mask)
 		if (sess->is_d3d11_native_compositor) {
 			return zone_mask_xret_to_xr(
 			    &log, comp_d3d11_compositor_zone_mask_submit(&sess->xcn->base, zone->comp_mask),
-			    "xrSubmitLocal3DZoneEXT");
+			    "xrSubmitLocal3DZoneDXR");
 		}
 #endif
 #ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
 		if (sess->is_d3d12_native_compositor) {
 			return zone_mask_xret_to_xr(
 			    &log, comp_d3d12_compositor_zone_mask_submit(&sess->xcn->base, zone->comp_mask),
-			    "xrSubmitLocal3DZoneEXT");
+			    "xrSubmitLocal3DZoneDXR");
 		}
 #endif
 #ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
 		if (sess->is_vk_native_compositor) {
 			return zone_mask_xret_to_xr(
 			    &log, comp_vk_native_compositor_zone_mask_submit(&sess->xcn->base, zone->comp_mask),
-			    "xrSubmitLocal3DZoneEXT");
+			    "xrSubmitLocal3DZoneDXR");
 		}
 #endif
 #ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
 		if (sess->is_metal_native_compositor) {
 			return zone_mask_xret_to_xr(
 			    &log, comp_metal_compositor_zone_mask_submit(&sess->xcn->base, zone->comp_mask),
-			    "xrSubmitLocal3DZoneEXT");
+			    "xrSubmitLocal3DZoneDXR");
 		}
 #endif
 #ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
 		if (sess->is_gl_native_compositor) {
 			return zone_mask_xret_to_xr(
 			    &log, comp_gl_compositor_zone_mask_submit(&sess->xcn->base, zone->comp_mask),
-			    "xrSubmitLocal3DZoneEXT");
+			    "xrSubmitLocal3DZoneDXR");
 		}
 #endif
 	}
@@ -623,15 +623,15 @@ oxr_xrSubmitLocal3DZoneEXT(XrLocal3DZoneMaskEXT mask)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrDestroyLocal3DZoneMaskEXT(XrLocal3DZoneMaskEXT mask)
+oxr_xrDestroyLocal3DZoneMaskEXT(XrLocal3DZoneMaskDXR mask)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_local_3d_zone_ext *zone;
 	struct oxr_logger log;
-	OXR_VERIFY_LOCAL_3D_ZONE_AND_INIT_LOG(&log, mask, zone, "xrDestroyLocal3DZoneMaskEXT");
+	OXR_VERIFY_LOCAL_3D_ZONE_AND_INIT_LOG(&log, mask, zone, "xrDestroyLocal3DZoneMaskDXR");
 
 	return oxr_handle_destroy(&log, &zone->handle);
 }
 
-#endif // OXR_HAVE_EXT_local_3d_zone
+#endif // OXR_HAVE_DXR_local_3d_zone

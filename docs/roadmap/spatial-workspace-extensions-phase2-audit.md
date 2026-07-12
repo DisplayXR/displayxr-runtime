@@ -23,7 +23,7 @@ This doc walks the file cluster by cluster, labels each, and proposes a migratio
 | `shell_input_event` struct + ring buffer | 3558, 3587 | Mechanism — rename to `workspace_input_event` | Phase 2.D (input routing) |
 | Multi-comp first-layer-commit init | 4271-4278 | Mechanism — rename | Phase 2 final cleanup |
 | `comp_d3d11_window_set_shell_dp` call | 4558 | Mechanism — rename when callee renames | Phase 2.E |
-| **Spatial raycast hit-test** (`shell_hit_result`, `shell_raycast_hit_test`) + callers | 4660-4904, 6003, 6046, 6154, 6497 | Mechanism — rename + promote to `xrWorkspaceHitTestEXT` | Phase 2.F (hit-test promotion) |
+| **Spatial raycast hit-test** (`shell_hit_result`, `shell_raycast_hit_test`) + callers | 4660-4904, 6003, 6046, 6154, 6497 | Mechanism — rename + promote to `xrWorkspaceHitTestDXR` | Phase 2.F (hit-test promotion) |
 | **Title-bar height math** (`has_shell_title_bar`) | 5010-5037, 7473 | **Policy — gone** when chrome migrates | Phase 2.C (chrome) |
 | `compositor_layer_commit` workspace-mode branches | 5616-5732 | Mechanism — rename; some branches simplify when policy migrates | Phase 2 final cleanup |
 | File-dialog foreground-permission grants | 5789, 6140 | Mechanism — rename | Phase 2 final cleanup |
@@ -47,7 +47,7 @@ This doc walks the file cluster by cluster, labels each, and proposes a migratio
 | Category | Approximate line count | What happens |
 |---|---|---|
 | Mechanism (stays + gets renamed) | ~115 mentions across ~25 clusters | Renamed in a final cleanup pass after policy migrations land. Most are doc comments and log-string prefixes; the actual code keeps doing the same thing. |
-| Policy (moves to workspace process) | ~30 mentions across 4 clusters (launcher registry+rendering, chrome title-bar math, layout-preset semantics) | Function bodies + state move to the workspace controller. The runtime exposes neutral primitives via `XR_EXT_spatial_workspace` / `XR_EXT_app_launcher`. |
+| Policy (moves to workspace process) | ~30 mentions across 4 clusters (launcher registry+rendering, chrome title-bar math, layout-preset semantics) | Function bodies + state move to the workspace controller. The runtime exposes neutral primitives via `XR_DXR_spatial_workspace` / `XR_EXT_app_launcher`. |
 | Gone (delete when policy moves) | ~17 mentions in chrome + launcher rendering | Deleted as a side effect of policy migration — no equivalent in the workspace process, no equivalent in the runtime. |
 
 After Phase 2: the file shrinks meaningfully. The launcher cluster (4660 lines worth of state + UI) and the chrome math (~30 lines of title-bar geometry) leave the runtime entirely; everything else gets renamed in place.
@@ -69,7 +69,7 @@ Below: the original 8 sub-steps, lowest-blast-radius first.
 
 ### Phase 2.A — Capture client lifecycle
 
-**Touches:** 11620-11641, plus the public `xrAddWorkspaceCaptureClientEXT` / `xrRemoveWorkspaceCaptureClientEXT` extension surface.
+**Touches:** 11620-11641, plus the public `xrAddWorkspaceCaptureClientDXR` / `xrRemoveWorkspaceCaptureClientDXR` extension surface.
 
 **Why first:** Already nearly neutral — the bulk of the work is renaming log prefixes and wiring the existing `comp_d3d11_service_add_capture_client` to its extension entry point. Lowest blast radius. Validates the basic extension dispatch plumbing before any policy migration.
 
@@ -85,7 +85,7 @@ Below: the original 8 sub-steps, lowest-blast-radius first.
 
 ### Phase 2.C — Controller-owned chrome ✅ shipped (spec_version 6 → 8)
 
-**Touched:** Public surface bumped 6 → 8. Spec_version 7 added controller-owned chrome (3 new function PFNs, 3 new structs, 1 new enum value, 1 new event field, 1 reserved-→-emitted event); spec_version 8 closed the controller loop with `xrAcquireWorkspaceWakeupEventEXT`, the `anchorToWindowTopEdge` / `widthAsFractionOfWindow` flags on `XrWorkspaceChromeLayoutEXT`, and the `XR_WORKSPACE_INPUT_EVENT_WINDOW_POSE_CHANGED_EXT` event. Runtime composite path extended with chrome-quad blit + keyed-mutex acquire on the read side. Hit-test extended to ray-cast chrome quads and stamp `chromeRegionId` on POINTER events. POINTER_HOVER emission added so controllers can detect cursor enter/leave on hovered slots regardless of pointer-capture state. Shell ports the floating-pill design (rounded SDF shader, grip dots, 3 buttons, hover-fade ease-out cubic, click → exit/fullscreen RPC dispatch); follow-up sub-phases C3.C-3a (per-app icon — registered_app sidecar lookup + .ico extraction fallback) and C3.C-3b (DirectWrite + D2D title text with adaptive-width skip + resize-burst flicker gate) close the visual deliverable. Final commit C5 deletes the entire in-runtime chrome render block + focus-rim glow + fade machinery — ~700 lines net deletion in `comp_d3d11_service.cpp`. Runtime ships with **zero default chrome**.
+**Touched:** Public surface bumped 6 → 8. Spec_version 7 added controller-owned chrome (3 new function PFNs, 3 new structs, 1 new enum value, 1 new event field, 1 reserved-→-emitted event); spec_version 8 closed the controller loop with `xrAcquireWorkspaceWakeupEventDXR`, the `anchorToWindowTopEdge` / `widthAsFractionOfWindow` flags on `XrWorkspaceChromeLayoutDXR`, and the `XR_WORKSPACE_INPUT_EVENT_WINDOW_POSE_CHANGED_DXR` event. Runtime composite path extended with chrome-quad blit + keyed-mutex acquire on the read side. Hit-test extended to ray-cast chrome quads and stamp `chromeRegionId` on POINTER events. POINTER_HOVER emission added so controllers can detect cursor enter/leave on hovered slots regardless of pointer-capture state. Shell ports the floating-pill design (rounded SDF shader, grip dots, 3 buttons, hover-fade ease-out cubic, click → exit/fullscreen RPC dispatch); follow-up sub-phases C3.C-3a (per-app icon — registered_app sidecar lookup + .ico extraction fallback) and C3.C-3b (DirectWrite + D2D title text with adaptive-width skip + resize-burst flicker gate) close the visual deliverable. Final commit C5 deletes the entire in-runtime chrome render block + focus-rim glow + fade machinery — ~700 lines net deletion in `comp_d3d11_service.cpp`. Runtime ships with **zero default chrome**.
 
 **Decisions made during the migration:**
 - Chrome image is just a regular `XrSwapchain`. `xrAcquireSwapchainImage` / `xrWaitSwapchainImage` / `xrReleaseSwapchainImage` work as standard. The chrome swapchain is a SHARED_NTHANDLE + KEYEDMUTEX texture — controller writes via shell's D3D11 device, runtime reads via service's D3D11 device.
@@ -102,7 +102,7 @@ Below: the original 8 sub-steps, lowest-blast-radius first.
 
 ### Phase 2.D — Input routing (focus + raw event forwarding)
 
-**Touches:** 3558, 3587 (`shell_input_event`), plus all input-handling paths. Plus the new `xrSetWorkspaceFocusedClientEXT` extension function.
+**Touches:** 3558, 3587 (`shell_input_event`), plus all input-handling paths. Plus the new `xrSetWorkspaceFocusedClientDXR` extension function.
 
 **Why fourth:** Largely independent design work. Today the runtime forwards mouse/keyboard from the workspace's window to the focused client's HWND, with the runtime making the focus call. Phase 2 has the workspace controller decide focus and the runtime forward raw events to whoever the controller designated. The extension surface for this isn't yet in the header sketch — needs design first.
 
@@ -118,9 +118,9 @@ Below: the original 8 sub-steps, lowest-blast-radius first.
 
 ### Phase 2.F — Hit-test extension promotion
 
-> **Outcome (spec_version 22, issue #370):** the opposite of "promote and keep in the runtime" was chosen. `xrWorkspaceHitTestEXT` was implemented (spec_version 4) and later **deleted** along with `workspace_raycast_hit_test`; hit-testing moved entirely to the controller, which already duplicated the geometry for click policy (shell #40 Phase 1) and now also runs it per-frame off the OS cursor position the runtime delivers on FRAME_TICK. The runtime keeps only cursor-sprite compositing at the controller-pushed depth (`xrSetWorkspaceCursorDepthEXT`). See ADR-018's superseded note.
+> **Outcome (spec_version 22, issue #370):** the opposite of "promote and keep in the runtime" was chosen. `xrWorkspaceHitTestDXR` was implemented (spec_version 4) and later **deleted** along with `workspace_raycast_hit_test`; hit-testing moved entirely to the controller, which already duplicated the geometry for click policy (shell #40 Phase 1) and now also runs it per-frame off the OS cursor position the runtime delivers on FRAME_TICK. The runtime keeps only cursor-sprite compositing at the controller-pushed depth (`xrSetWorkspaceCursorDepthDXR`). See ADR-018's superseded note.
 
-**Touches:** 4660-4904 (function definition), 6003, 6046, 6154, 6497 (callers). Plus `xrWorkspaceHitTestEXT` entry point in the extension dispatch.
+**Touches:** 4660-4904 (function definition), 6003, 6046, 6154, 6497 (callers). Plus `xrWorkspaceHitTestDXR` entry point in the extension dispatch.
 
 **Why sixth:** The function and its callers stay in the runtime — they're mechanism. The work is exposing `shell_raycast_hit_test()` as a public extension function so the workspace controller can call it directly instead of duplicating the geometry. Independent of the chrome migration; could move earlier if needed.
 
@@ -132,29 +132,29 @@ Below: the original 8 sub-steps, lowest-blast-radius first.
 
 **Decisions made during the migration:**
 - Layout-preset semantics moved to the controller (Option A — pure controller). The shell now ports the grid + immersive + carousel-snap math.
-- Carousel ships as a static snap on the controller side. The original interactive carousel (drag-to-rotate, scroll-radius, TAB-snap-to-front, momentum auto-rotation) was deleted from the runtime; restoring it controller-side requires per-frame motion events that Phase 2.D deliberately excluded from the public input drain. Tracked as **Phase 2.K — controller-owned interactive layouts**, which extends `xrEnumerateWorkspaceInputEventsEXT` to deliver per-frame `WM_MOUSEMOVE` (revising the Phase 2.D decision).
+- Carousel ships as a static snap on the controller side. The original interactive carousel (drag-to-rotate, scroll-radius, TAB-snap-to-front, momentum auto-rotation) was deleted from the runtime; restoring it controller-side requires per-frame motion events that Phase 2.D deliberately excluded from the public input drain. Tracked as **Phase 2.K — controller-owned interactive layouts**, which extends `xrEnumerateWorkspaceInputEventsDXR` to deliver per-frame `WM_MOUSEMOVE` (revising the Phase 2.D decision).
 - The shell auto-tiles new clients via `apply_preset("grid")` on connect when no per-app `--pose` was specified. Replaces the runtime's old debounced re-grid.
 - ESC carve-out kept as a safety net (annotated in `comp_d3d11_window.cpp`). The empty-workspace launcher hint and reentry state machine stay — they're rendering hygiene, not policy.
 - `compute_grid_layout` stays in the runtime; auto-placement on client connect still uses it (initial spawn slot before the shell re-tiles).
 - Three MCP tests removed (`tests/mcp/test_focus_preset.{sh,bat}` + `_focus_preset_helper.py`) — the tool they exercised is gone.
-- Shell instance now enables `XR_EXT_display_info` and reads `displaySizeMeters` for layout math; without it the shell would use the LP-3D fallback (0.700 × 0.394 m) which is wrong on the actual LP-3D unit (0.344 × 0.194 m).
+- Shell instance now enables `XR_DXR_display_info` and reads `displaySizeMeters` for layout math; without it the shell would use the LP-3D fallback (0.700 × 0.394 m) which is wrong on the actual LP-3D unit (0.344 × 0.194 m).
 
 **Risk realized:** Lower than predicted. The ESC / dismiss / restore flow needed only a comment annotation; the workspace state machine simplification was deferred to Phase 2.C (chrome rendering migration) where it'll get a proper redesign.
 
 ### Phase 2.K — Controller-owned interactive layouts ✅ shipped
 
-**Touched:** `XR_EXT_spatial_workspace.h` (spec_version 5 → 6, three new event variants, two new request PFNs), `proto.json` + `ipc_protocol.h` (wire format for new variants and RPCs), `oxr_workspace.c` + `oxr_api_negotiate.c` + `oxr_api_funcs.h` (dispatch wrappers), `comp_d3d11_window.cpp` (drop `WM_MOUSEMOVE` skip under pointer capture; add Win32 `SetCapture` / `ReleaseCapture` so drags survive cursor exits; pointer-capture-state getter), `comp_d3d11_service.cpp` (FRAME_TICK counter bumped per displayed frame, FOCUS_CHANGED on focused-slot transition, MOTION drain enrichment, request-by-slot helpers reused by both the keyboard shortcut and the IPC handler, runtime drag/resize/RMB suppressed under controller pointer capture, **3D depth pipeline + D32_FLOAT depth target sibling to combined atlas**), `ipc_server_handler.c` (client_id → slot resolution mirroring `set_window_pose`), `src/xrt/targets/shell/shell_openxr.{h,cpp}` (resolve five new PFNs: `get_pose`, `enable/disable_pointer_capture`, `request_client_exit`, `request_client_fullscreen` — total 21 PFNs), `src/xrt/targets/shell/main.c` (per-client animation framework with 300 ms ease-out cubic, smooth preset transitions, carousel state machine with auto-rotation / drag / scroll-radius / TAB-snap / momentum, variable poll cadence 16 ms / 500 ms, connect-time race retry via bool seed return), `test_apps/probes/workspace_minimal_d3d11_win/main.cpp` (24 PFN smoke + 30° yaw orientation test + drain-count window + lifecycle requests), `d3d11_service_shaders.h` (`corner_depth_ndc[4]` in `BlitConstants`; blit VS outputs `SV_Position.z = corner_depth_ndc[vid] * w`).
+**Touched:** `XR_DXR_spatial_workspace.h` (spec_version 5 → 6, three new event variants, two new request PFNs), `proto.json` + `ipc_protocol.h` (wire format for new variants and RPCs), `oxr_workspace.c` + `oxr_api_negotiate.c` + `oxr_api_funcs.h` (dispatch wrappers), `comp_d3d11_window.cpp` (drop `WM_MOUSEMOVE` skip under pointer capture; add Win32 `SetCapture` / `ReleaseCapture` so drags survive cursor exits; pointer-capture-state getter), `comp_d3d11_service.cpp` (FRAME_TICK counter bumped per displayed frame, FOCUS_CHANGED on focused-slot transition, MOTION drain enrichment, request-by-slot helpers reused by both the keyboard shortcut and the IPC handler, runtime drag/resize/RMB suppressed under controller pointer capture, **3D depth pipeline + D32_FLOAT depth target sibling to combined atlas**), `ipc_server_handler.c` (client_id → slot resolution mirroring `set_window_pose`), `src/xrt/targets/shell/shell_openxr.{h,cpp}` (resolve five new PFNs: `get_pose`, `enable/disable_pointer_capture`, `request_client_exit`, `request_client_fullscreen` — total 21 PFNs), `src/xrt/targets/shell/main.c` (per-client animation framework with 300 ms ease-out cubic, smooth preset transitions, carousel state machine with auto-rotation / drag / scroll-radius / TAB-snap / momentum, variable poll cadence 16 ms / 500 ms, connect-time race retry via bool seed return), `test_apps/probes/workspace_minimal_d3d11_win/main.cpp` (24 PFN smoke + 30° yaw orientation test + drain-count window + lifecycle requests), `d3d11_service_shaders.h` (`corner_depth_ndc[4]` in `BlitConstants`; blit VS outputs `SV_Position.z = corner_depth_ndc[vid] * w`).
 
 **Decisions made during the migration:**
-- Picked option (a) for the motion gate: capture-gated emission via existing `xrEnableWorkspacePointerCaptureEXT`. Idle hover still bypasses the public ring; controllers that want hover for chrome highlighting opt in by enabling capture.
-- New `XR_WORKSPACE_INPUT_EVENT_POINTER_MOTION_EXT` variant rather than overloading the existing POINTER variant — cleaner discrimination on the controller side and leaves room for hit-test enrichment to differ from button events later.
+- Picked option (a) for the motion gate: capture-gated emission via existing `xrEnableWorkspacePointerCaptureDXR`. Idle hover still bypasses the public ring; controllers that want hover for chrome highlighting opt in by enabling capture.
+- New `XR_WORKSPACE_INPUT_EVENT_POINTER_MOTION_DXR` variant rather than overloading the existing POINTER variant — cleaner discrimination on the controller side and leaves room for hit-test enrichment to differ from button events later.
 - Carousel angle interpolation lives in shell main.c as `shell_carousel_state` (separate from the per-client `slot_anim` framework). The slot_anim ticks during the *entry transition* into carousel; once those settle the carousel state machine takes over per-frame poses. Both share `shell_now_ns()` and `shell_ease_out_cubic()`.
 - N=2 special-case dropped — auto-rotation makes both windows visible naturally on the ring.
 - Keyboard DELETE / F11 shortcuts now route through the same `request_*_by_slot` helpers as the IPC path, so behaviour is identical and there's exactly one implementation.
 - **Commit 7 (post-test polish + 3D depth pipeline):** painter's-algorithm Z sort + force-focused-on-top override replaced with hardware LESS depth test. `BlitConstants.corner_depth_ndc[4]` carries per-corner depth from `project_local_rect_for_eye()`'s pre-computed eye-relative W values. Per-corner depth means intersecting tilted quads occlude per-pixel — the natural endpoint of "windows are real 3D objects". Chrome biases by `WORKSPACE_CHROME_DEPTH_BIAS = 0.001` toward the eye so a window's title bar / buttons / glyphs win over its own content but still depth-test against other windows. Painter's sort kept for transparent-edge alpha blending only; opaque occlusion comes from the depth buffer. Glow halo, launcher panel, taskbar, font indicators all stay on `depth_disabled` (overlays meant to sit above the 3D content stack).
 
 **Risk realized:** Low. Per-frame IPC drain is well below the 1% CPU budget on the dev machine. The two real surprises were:
-- The *connect-time race* lasted longer than the 300 ms animation duration in some runs — `xrGetWorkspaceClientWindowPoseEXT` returns `XR_ERROR_VALIDATION_FAILURE` while the IPC client thread has its `client_state.id` set but `target_ics->xc` is still NULL. Fixed by making `shell_slot_anim_seed` return `bool` and `shell_apply_preset` return `false` on partial seed; `s_auto_tile_pending` retries each tick until every slot is bound.
+- The *connect-time race* lasted longer than the 300 ms animation duration in some runs — `xrGetWorkspaceClientWindowPoseDXR` returns `XR_ERROR_VALIDATION_FAILURE` while the IPC client thread has its `client_state.id` set but `target_ics->xc` is still NULL. Fixed by making `shell_slot_anim_seed` return `bool` and `shell_apply_preset` return `false` on partial seed; `s_auto_tile_pending` retries each tick until every slot is bound.
 - The *runtime's built-in title_drag / resize / RMB rotation* fought the controller's per-tick `set_pose` in carousel mode (the dragged window flew off-orbit). Fixed by gating those starts on `comp_d3d11_window_is_workspace_pointer_capture_enabled()` — when the controller has captured the pointer it owns drag policy too.
 
 See `spatial-workspace-extensions-phase2K-plan.md` for the full design and `spatial-workspace-extensions-phase2K-agent-prompt.md` for the per-commit hand-off.
@@ -166,7 +166,7 @@ See `spatial-workspace-extensions-phase2K-plan.md` for the full design and `spat
 > repo extraction. The visual-style work is additive (a new EXT, not a
 > migration step), so a non-sequential letter is fine.
 
-**Touched:** Public surface bumped 8 → 9. New struct `XrWorkspaceClientStyleEXT` (cornerRadius, edgeFeatherMeters, focusGlowColor, focusGlowIntensity, focusGlowFalloffMeters) + new function `xrSetWorkspaceClientStyleEXT`. Wire form `ipc_workspace_client_style` in `ipc_protocol.h`. New RPC `workspace_set_client_style` in `proto.json`. State-tracker dispatch in `oxr_workspace.c` validates the struct and forwards. Compositor: per-slot `style_*` fields on `d3d11_multi_client_slot`, `comp_d3d11_service_set_client_style_by_slot` + `_set_capture_client_style` setters, `_set_focused_slot` helper so the IPC `xrSetWorkspaceFocusedClientEXT` path mirrors focus into the compositor's `mc->focused_slot` (so the focus glow tracks controller-set focus, not just click-driven). Workspace client content blit at `comp_d3d11_service.cpp:7340` reads slot style, applies cornerRadius + edge feather every frame, and emits an axis-aligned focus-glow pre-pass (existing `convert_srgb=3.0` glow shader path) for the focused slot. Reference shell pushes a default style on chrome lazy-create — 5 % rounded corners, 3 mm edge feather, 12 mm cyan-blue focus halo (matches the existing launcher-hover glow color).
+**Touched:** Public surface bumped 8 → 9. New struct `XrWorkspaceClientStyleDXR` (cornerRadius, edgeFeatherMeters, focusGlowColor, focusGlowIntensity, focusGlowFalloffMeters) + new function `xrSetWorkspaceClientStyleDXR`. Wire form `ipc_workspace_client_style` in `ipc_protocol.h`. New RPC `workspace_set_client_style` in `proto.json`. State-tracker dispatch in `oxr_workspace.c` validates the struct and forwards. Compositor: per-slot `style_*` fields on `d3d11_multi_client_slot`, `comp_d3d11_service_set_client_style_by_slot` + `_set_capture_client_style` setters, `_set_focused_slot` helper so the IPC `xrSetWorkspaceFocusedClientDXR` path mirrors focus into the compositor's `mc->focused_slot` (so the focus glow tracks controller-set focus, not just click-driven). Workspace client content blit at `comp_d3d11_service.cpp:7340` reads slot style, applies cornerRadius + edge feather every frame, and emits an axis-aligned focus-glow pre-pass (existing `convert_srgb=3.0` glow shader path) for the focused slot. Reference shell pushes a default style on chrome lazy-create — 5 % rounded corners, 3 mm edge feather, 12 mm cyan-blue focus halo (matches the existing launcher-hover glow color).
 
 **Decisions made during the migration:**
 - The runtime owns the compositor → only the runtime can soften content edges or paint a focus glow over content. Tried positioning the style on the controller side (halo chrome quad) but rejected: an overlay can't fade an opaque content edge to transparent, and duplicating the runtime's rounded-square SDF in the controller would mean re-implementing the shader. The runtime exposes the shader knobs; the controller drives them.
@@ -174,7 +174,7 @@ See `spatial-workspace-extensions-phase2K-plan.md` for the full design and `spat
 - Focus glow is an axis-aligned pre-pass (oversized quad with the existing glow-shader path). Perspective / tilted windows skip the halo for now and rely on the chrome pill's own focus indication. Future work can extend the glow path to follow tilted quads if needed.
 - Edge feather is universal (always applied, all windows) and lives on the standard content blit. Idle-CPU cost is zero — the existing per-slot blit already runs every frame; we just write different cbuffer values.
 
-**Risk realized:** Low. The IPC ↔ compositor focus-state mismatch (compositor's `mc->focused_slot` only updated on click/fullscreen, not on `xrSetWorkspaceFocusedClientEXT`) was a pre-existing latent issue surfaced by the focus-glow gating. Fixed by adding `comp_d3d11_service_set_focused_slot` and calling it from `ipc_handle_workspace_set_focused_client`.
+**Risk realized:** Low. The IPC ↔ compositor focus-state mismatch (compositor's `mc->focused_slot` only updated on click/fullscreen, not on `xrSetWorkspaceFocusedClientDXR`) was a pre-existing latent issue surfaced by the focus-glow gating. Fixed by adding `comp_d3d11_service_set_focused_slot` and calling it from `ipc_handle_workspace_set_focused_client`.
 
 ### Phase 2.H — Final cleanup pass ✅ shipped
 
@@ -186,7 +186,7 @@ See `spatial-workspace-extensions-phase2K-plan.md` for the full design and `spat
 
 **Outstanding** — see `spatial-workspace-extensions-followups.md` items #3, #5, #6 for the full punch list. High-level:
 
-- **Prerequisite (followup #4) ✅ shipped:** `xrt_application_info` gained an `ext_spatial_workspace_enabled` flag (populated in `oxr_instance.c` from the parsed enabled-extensions list); `target.c::xrt_instance_create` checks it and forces IPC at the top of its dispatch. The shell dropped its `SetEnvironmentVariableA("XRT_FORCE_MODE", "ipc")` hack and is now runtime-agnostic — any OpenXR runtime exposing `XR_EXT_spatial_workspace` will see the same enable signal.
+- **Prerequisite (followup #4) ✅ shipped:** `xrt_application_info` gained an `ext_spatial_workspace_enabled` flag (populated in `oxr_instance.c` from the parsed enabled-extensions list); `target.c::xrt_instance_create` checks it and forces IPC at the top of its dispatch. The shell dropped its `SetEnvironmentVariableA("XRT_FORCE_MODE", "ipc")` hack and is now runtime-agnostic — any OpenXR runtime exposing `XR_DXR_spatial_workspace` will see the same enable signal.
 - **The extraction itself:** create new repo `DisplayXR/displayxr-shell-pvt` (mirroring the runtime's pvt/public split, since shell currently has private and public pieces); move `src/xrt/targets/shell/` to its own repo; mirror the build via `scripts/build_windows.bat`-style scripts; add a publish-public workflow (the shell can stay private until proven; public consumers depend on the API surface, not the implementation).
 - **Runtime-side cleanup:** drop `add_subdirectory(shell)` from `src/xrt/targets/CMakeLists.txt`; update `service_config.c`'s default binary literal from `"displayxr-shell.exe"` to either a config-only value or NULL (orchestrator no longer auto-spawns); delete the residual transitional `"shell"` JSON-key comments (`service_config.{c,h}`).
 - **UX regression to fix in the same window (followup #3):** post-2.I the shell can no longer auto-reconnect on service crash because the runtime DLL holds the IPC connection. Once the shell is in its own repo, wrap the `xrCreateInstance` activate-failure path with `xrDestroyInstance` + `xrCreateInstance` retry so service-crash recovery returns.
@@ -199,7 +199,7 @@ These are gotchas that won't be obvious until you start the migration. Capturing
 
 ### Launcher's chicken-and-egg startup
 
-The runtime today renders the launcher tile grid *before* any app client connects. This is possible because the workspace controller has already pushed its registry via IPC. Phase 2.B preserves this by having the controller push on every `xrActivateSpatialWorkspaceEXT`, before any client work happens. Don't try to "lazy-load" tiles — keeps the empty-workspace UX broken.
+The runtime today renders the launcher tile grid *before* any app client connects. This is possible because the workspace controller has already pushed its registry via IPC. Phase 2.B preserves this by having the controller push on every `xrActivateSpatialWorkspaceDXR`, before any client work happens. Don't try to "lazy-load" tiles — keeps the empty-workspace UX broken.
 
 ### `pending_shell_reentry` is two lifecycle features in one field
 
@@ -211,11 +211,11 @@ When the lifecycle simplifies in Phase 2.G, separate these into two flags or two
 
 ### Title-bar height affects the hit-test, not just the renderer
 
-Lines 5010-5037 wire `has_shell_title_bar` into the hit-test geometry — they expand the window's effective "ext_top" by the title-bar height so a click in the title-bar area registers. When chrome migrates to a workspace-rendered layer (Phase 2.C), the hit-test geometry needs to know about that layer too — *or* the workspace-rendered chrome is its own workspace client (with its own pose), so the hit-test naturally handles it. Recommend the latter: the workspace controller renders chrome into a per-app companion swapchain, positions it just above the app via `xrSetWorkspaceClientWindowPoseEXT`, and the existing hit-test machinery treats it as a regular client.
+Lines 5010-5037 wire `has_shell_title_bar` into the hit-test geometry — they expand the window's effective "ext_top" by the title-bar height so a click in the title-bar area registers. When chrome migrates to a workspace-rendered layer (Phase 2.C), the hit-test geometry needs to know about that layer too — *or* the workspace-rendered chrome is its own workspace client (with its own pose), so the hit-test naturally handles it. Recommend the latter: the workspace controller renders chrome into a per-app companion swapchain, positions it just above the app via `xrSetWorkspaceClientWindowPoseDXR`, and the existing hit-test machinery treats it as a regular client.
 
 ### File-trigger screenshot is a dev-tool fallback
 
-The `shell_screenshot_trigger` file-poll mechanism at 8831-8840 was added for ad-hoc debugging when the IPC path wasn't available. The `xrCaptureWorkspaceFrameEXT` extension function will be the proper path. The file-trigger fallback can stay (with renamed paths) for emergency debug; not worth deleting.
+The `shell_screenshot_trigger` file-poll mechanism at 8831-8840 was added for ad-hoc debugging when the IPC path wasn't available. The `xrCaptureWorkspaceFrameDXR` extension function will be the proper path. The file-trigger fallback can stay (with renamed paths) for emergency debug; not worth deleting.
 
 ## Estimated post-Phase-2 file size
 
@@ -227,7 +227,7 @@ Rough math:
 - Lifecycle simplification (ESC carve-out, reentry state): ~30 lines
 - ~300 lines of saved code
 
-That's ~2.5% smaller. Most of the value is *not* size reduction — it's that the runtime's behavior is now explained by extension semantics, not by reading the file. After Phase 2, anyone wanting to understand "what happens when an app connects in workspace mode" reads `XR_EXT_spatial_workspace.h`, not 12K lines of compositor code.
+That's ~2.5% smaller. Most of the value is *not* size reduction — it's that the runtime's behavior is now explained by extension semantics, not by reading the file. After Phase 2, anyone wanting to understand "what happens when an app connects in workspace mode" reads `XR_DXR_spatial_workspace.h`, not 12K lines of compositor code.
 
 ## What this audit doesn't cover
 

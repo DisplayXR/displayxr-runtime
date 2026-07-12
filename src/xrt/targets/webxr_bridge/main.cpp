@@ -5,7 +5,7 @@
  * @brief  DisplayXR WebXR Bridge v2 — metadata sideband host (Phase 2).
  *
  * Headless OpenXR client coexisting with Chrome's WebXR session against the
- * same displayxr-service. Enables XR_EXT_display_info + XR_MND_headless,
+ * same displayxr-service. Enables XR_DXR_display_info + XR_MND_headless,
  * enumerates display info and rendering modes, polls events and eye poses,
  * and exposes everything via a loopback WebSocket on 127.0.0.1:9014.
  *
@@ -34,8 +34,8 @@
 #include <condition_variable>
 
 #include <openxr/openxr.h>
-#include <openxr/XR_EXT_display_info.h>
-#include <openxr/XR_EXT_view_rig.h>
+#include <openxr/XR_DXR_display_info.h>
+#include <openxr/XR_DXR_view_rig.h>
 #include "../../auxiliary/util/u_bridge_hud_shared.h"
 
 // IPC client — opened as a parallel query-only channel so the bridge can
@@ -435,24 +435,24 @@ struct Bridge {
 	bool has_display_info_ext = false;
 	bool has_headless_ext = false;
 	bool has_view_rig_ext = false;
-	PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModes = nullptr;
-	PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingMode = nullptr;
-	PFN_xrRequestEyeTrackingModeEXT pfnRequestEyeTrackingMode = nullptr;
+	PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateDisplayRenderingModes = nullptr;
+	PFN_xrRequestDisplayRenderingModeDXR pfnRequestDisplayRenderingMode = nullptr;
+	PFN_xrRequestEyeTrackingModeDXR pfnRequestEyeTrackingMode = nullptr;
 
 	// Cached display info for JSON serialization.
-	XrDisplayInfoEXT display_info{};
-	XrEyeTrackingModeCapabilitiesEXT eye_tracking_caps{};
-	std::vector<XrDisplayRenderingModeInfoEXT> modes;
+	XrDisplayInfoDXR display_info{};
+	XrEyeTrackingModeCapabilitiesDXR eye_tracking_caps{};
+	std::vector<XrDisplayRenderingModeInfoDXR> modes;
 	// Per-mode tracking capability (#441 v14), parallel to `modes`. Filled by
 	// the chained-struct opt-in at enumerate time; hasTracking == XR_FALSE for
 	// modes that never consume live eye tracking (e.g. every sim_display mode).
-	std::vector<XrDisplayRenderingModeTrackingInfoEXT> mode_tracking;
+	std::vector<XrDisplayRenderingModeTrackingInfoDXR> mode_tracking;
 	uint32_t current_mode_index = 0;
 	std::vector<XrViewConfigurationView> config_views;
 
 	// Last-known derived isTracking (#441 v14): -1 = unknown (no locate yet),
-	// 0/1 otherwise. Seeded from the XrViewEyeTrackingStateEXT chain on
-	// xrLocateViews and kept current by XrEventDataEyeTrackingStateChangedEXT
+	// 0/1 otherwise. Seeded from the XrViewEyeTrackingStateDXR chain on
+	// xrLocateViews and kept current by XrEventDataEyeTrackingStateChangedDXR
 	// edges. Serialized into display-info so late-joining WS clients get the
 	// current state (the event itself is edge-triggered only).
 	int eye_tracking_state = -1;
@@ -938,7 +938,7 @@ static std::string build_display_info_json(const Bridge &b) {
 	if (has_managed) { s += "\"MANAGED\""; first = false; }
 	if (has_manual)  { if (!first) s += ","; s += "\"MANUAL\""; }
 	s += "],\"defaultMode\":\"";
-	s += (b.eye_tracking_caps.defaultMode == XR_EYE_TRACKING_MODE_MANUAL_EXT) ? "MANUAL" : "MANAGED";
+	s += (b.eye_tracking_caps.defaultMode == XR_EYE_TRACKING_MODE_MANUAL_DXR) ? "MANUAL" : "MANAGED";
 	s += "\"";
 	// Last-known derived isTracking (#449). Omitted while unknown (no
 	// xrLocateViews yet) — pages treat absence as "state not yet known".
@@ -970,11 +970,11 @@ static std::string build_hardware_state_json(bool hw3d) {
 	       + std::string(hw3d ? "true" : "false") + "}";
 }
 
-static std::string build_eye_tracking_state_json(bool is_tracking, XrEyeTrackingModeEXT mode) {
+static std::string build_eye_tracking_state_json(bool is_tracking, XrEyeTrackingModeDXR mode) {
 	std::string s = "{\"type\":\"eye-tracking-state-changed\",\"version\":1,\"isTracking\":";
 	s += (is_tracking ? "true" : "false");
 	s += ",\"activeMode\":\"";
-	s += (mode == XR_EYE_TRACKING_MODE_MANUAL_EXT) ? "MANUAL" : "MANAGED";
+	s += (mode == XR_EYE_TRACKING_MODE_MANUAL_DXR) ? "MANUAL" : "MANAGED";
 	s += "\"}";
 	return s;
 }
@@ -1015,7 +1015,7 @@ static std::string build_input_event_json(const InputEvent &e) {
 }
 
 // Build the eye-poses message. When `raw` is non-NULL the per-view positions
-// come from the formal XR_EXT_view_rig raw channel (XrViewDisplayRawEXT), the
+// come from the formal XR_DXR_view_rig raw channel (XrViewDisplayRawDXR), the
 // same display-space inputs a native aware app consumes — replacing the
 // implicit headless-fast-path contract that smuggled raw eyes through
 // XrView.pose. Values are identical by construction (the runtime's raw channel
@@ -1029,7 +1029,7 @@ static std::string build_input_event_json(const InputEvent &e) {
 // entries. When the raw channel later exposes synthesized surplus eyes, this
 // loop picks them up automatically (the bound is eyeCountOutput).
 static std::string build_eye_poses_json(const XrView *views, uint32_t count,
-                                        const XrViewDisplayRawEXT *raw) {
+                                        const XrViewDisplayRawDXR *raw) {
 	std::string s = "{\"type\":\"eye-poses\",\"version\":1,\"format\":\"raw\"";
 	if (raw != nullptr) {
 		// int64 ns can exceed JS Number's safe range — serialize as a string.
@@ -1269,7 +1269,7 @@ static void handle_ws_message(Bridge &b, const std::string &msg) {
 		// Reject mode requests the DP doesn't advertise. Without this guard
 		// a sample bound to a MANAGED-only device (like Leia today) would
 		// still flip into the "MANUAL" UI state even though the runtime
-		// rejects the underlying xrRequestEyeTrackingModeEXT call.
+		// rejects the underlying xrRequestEyeTrackingModeDXR call.
 		const uint32_t mask = (uint32_t)b.eye_tracking_caps.supportedModes;
 		const uint32_t want_bit = (mode == 1) ? 0x2 /* MANUAL_BIT */
 		                                      : 0x1 /* MANAGED_BIT */;
@@ -1277,8 +1277,8 @@ static void handle_ws_message(Bridge &b, const std::string &msg) {
 			LOG_W("WS request-eye-tracking-mode %d: DP doesn't advertise that mode (supportedModes=0x%x), ignored",
 			      mode, mask);
 		} else if (b.pfnRequestEyeTrackingMode && b.session != XR_NULL_HANDLE) {
-			XrEyeTrackingModeEXT xr_mode = (mode == 1)
-			    ? XR_EYE_TRACKING_MODE_MANUAL_EXT : XR_EYE_TRACKING_MODE_MANAGED_EXT;
+			XrEyeTrackingModeDXR xr_mode = (mode == 1)
+			    ? XR_EYE_TRACKING_MODE_MANUAL_DXR : XR_EYE_TRACKING_MODE_MANAGED_DXR;
 			XrResult r = b.pfnRequestEyeTrackingMode(b.session, xr_mode);
 			LOG_I("WS request-eye-tracking-mode %d: %s", mode, xr_result_str(b.instance, r));
 		}
@@ -1582,22 +1582,22 @@ static bool create_instance(Bridge &b) {
 
 	LOG_I("Runtime exposes %u extensions", ext_count);
 	for (const auto &e : exts) {
-		if (std::strcmp(e.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) {
+		if (std::strcmp(e.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) {
 			b.has_display_info_ext = true;
 		}
 		if (std::strcmp(e.extensionName, XR_MND_HEADLESS_EXTENSION_NAME) == 0) {
 			b.has_headless_ext = true;
 		}
-		if (std::strcmp(e.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
+		if (std::strcmp(e.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
 			b.has_view_rig_ext = true;
 		}
 	}
-	LOG_I("XR_EXT_display_info: %s", b.has_display_info_ext ? "yes" : "NO");
+	LOG_I("XR_DXR_display_info: %s", b.has_display_info_ext ? "yes" : "NO");
 	LOG_I("XR_MND_headless:     %s", b.has_headless_ext ? "yes" : "NO");
-	LOG_I("XR_EXT_view_rig:     %s", b.has_view_rig_ext ? "yes" : "NO (raw eyes via XrView fallback)");
+	LOG_I("XR_DXR_view_rig:     %s", b.has_view_rig_ext ? "yes" : "NO (raw eyes via XrView fallback)");
 
 	if (!b.has_display_info_ext) {
-		LOG_E("XR_EXT_display_info is required by this bridge; aborting");
+		LOG_E("XR_DXR_display_info is required by this bridge; aborting");
 		return false;
 	}
 	if (!b.has_headless_ext) {
@@ -1606,15 +1606,15 @@ static bool create_instance(Bridge &b) {
 	}
 
 	std::vector<const char *> enabled_exts;
-	enabled_exts.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+	enabled_exts.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
 	enabled_exts.push_back(XR_MND_HEADLESS_EXTENSION_NAME);
 	// Optional: the formal raw-inputs channel. When present the bridge sources
-	// its per-view eyes from XrViewDisplayRawEXT instead of the implicit
+	// its per-view eyes from XrViewDisplayRawDXR instead of the implicit
 	// headless-fast-path XrView.pose contract. Absent (older runtime) → the
 	// bridge falls back to the XrView pose, byte-identical to its prior
 	// behavior.
 	if (b.has_view_rig_ext) {
-		enabled_exts.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
+		enabled_exts.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
 	}
 
 	XrInstanceCreateInfo ici{XR_TYPE_INSTANCE_CREATE_INFO};
@@ -1649,8 +1649,8 @@ static bool get_system_and_display_info(Bridge &b) {
 	LOG_I("xrGetSystem OK, systemId=%llu", (unsigned long long)b.system_id);
 
 	XrSystemProperties sp{XR_TYPE_SYSTEM_PROPERTIES};
-	b.display_info = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
-	b.eye_tracking_caps = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT};
+	b.display_info = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
+	b.eye_tracking_caps = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR};
 	// Chain both output structs onto xrGetSystemProperties.
 	b.display_info.next = &b.eye_tracking_caps;
 	sp.next = &b.display_info;
@@ -1711,23 +1711,23 @@ static bool create_session_and_enumerate_modes(Bridge &b) {
 
 	// Rendering mode enumeration.
 	XrResult r = xrGetInstanceProcAddr(
-	    b.instance, "xrEnumerateDisplayRenderingModesEXT",
+	    b.instance, "xrEnumerateDisplayRenderingModesDXR",
 	    (PFN_xrVoidFunction *)&b.pfnEnumerateDisplayRenderingModes);
 	if (XR_FAILED(r) || b.pfnEnumerateDisplayRenderingModes == nullptr) {
-		LOG_W("xrEnumerateDisplayRenderingModesEXT not resolved: %s",
+		LOG_W("xrEnumerateDisplayRenderingModesDXR not resolved: %s",
 		      xr_result_str(b.instance, r));
 		return true;
 	}
 
-	xrGetInstanceProcAddr(b.instance, "xrRequestDisplayRenderingModeEXT",
+	xrGetInstanceProcAddr(b.instance, "xrRequestDisplayRenderingModeDXR",
 	                      (PFN_xrVoidFunction *)&b.pfnRequestDisplayRenderingMode);
-	xrGetInstanceProcAddr(b.instance, "xrRequestEyeTrackingModeEXT",
+	xrGetInstanceProcAddr(b.instance, "xrRequestEyeTrackingModeDXR",
 	                      (PFN_xrVoidFunction *)&b.pfnRequestEyeTrackingMode);
 
 	uint32_t mode_count = 0;
 	r = b.pfnEnumerateDisplayRenderingModes(b.session, 0, &mode_count, nullptr);
 	if (XR_FAILED(r) || mode_count == 0) {
-		LOG_W("xrEnumerateDisplayRenderingModesEXT(count) returned %s, count=%u",
+		LOG_W("xrEnumerateDisplayRenderingModesDXR(count) returned %s, count=%u",
 		      xr_result_str(b.instance, r), mode_count);
 		return true;
 	}
@@ -1739,15 +1739,15 @@ static bool create_session_and_enumerate_modes(Bridge &b) {
 	// Mirrors the reference adoption in cube_handle_d3d11_win/xr_session.cpp.
 	b.mode_tracking.resize(mode_count);
 	for (uint32_t i = 0; i < mode_count; i++) {
-		b.mode_tracking[i].type = (XrStructureType)XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_EXT;
+		b.mode_tracking[i].type = (XrStructureType)XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_DXR;
 		b.mode_tracking[i].next = nullptr;
 		b.mode_tracking[i].hasTracking = XR_FALSE;
-		b.modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+		b.modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
 		b.modes[i].next = &b.mode_tracking[i];
 	}
 	r = b.pfnEnumerateDisplayRenderingModes(b.session, mode_count, &mode_count, b.modes.data());
 	if (XR_FAILED(r)) {
-		LOG_W("xrEnumerateDisplayRenderingModesEXT(data) returned %s",
+		LOG_W("xrEnumerateDisplayRenderingModesDXR(data) returned %s",
 		      xr_result_str(b.instance, r));
 		return true;
 	}
@@ -1762,7 +1762,7 @@ static bool create_session_and_enumerate_modes(Bridge &b) {
 	}
 
 	// Default current_mode_index to the first 3D mode (Leia device starts in 3D).
-	// XrDisplayInfoEXT doesn't expose the active mode, so infer from hardware3D.
+	// XrDisplayInfoDXR doesn't expose the active mode, so infer from hardware3D.
 	for (uint32_t i = 0; i < mode_count; i++) {
 		if (b.modes[i].hardwareDisplay3D) {
 			b.current_mode_index = i;
@@ -1830,8 +1830,8 @@ static void handle_event(Bridge &b, const XrEventDataBuffer &evt) {
 		}
 	} break;
 
-	case XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT: {
-		auto *e = reinterpret_cast<const XrEventDataRenderingModeChangedEXT *>(&evt);
+	case XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
+		auto *e = reinterpret_cast<const XrEventDataRenderingModeChangedDXR *>(&evt);
 		uint32_t prev = b.current_mode_index;
 		b.current_mode_index = e->currentModeIndex;
 		LOG_I("RENDERING_MODE_CHANGED previous=%u current=%u", e->previousModeIndex,
@@ -1855,13 +1855,13 @@ static void handle_event(Bridge &b, const XrEventDataBuffer &evt) {
 		}
 	} break;
 
-	case XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT: {
+	case XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR: {
 		// Edge-triggered tracking loss/recovery (#441 v14, #449). The runtime
 		// derives isTracking as activeMode.hasTracking && dp.is_tracking and
 		// fires this on every edge — DP tracking loss/recovery AND mode
 		// switches into/out of untracked modes. Forwarded to the page so web
 		// content gets event-driven loss/recovery instead of polling.
-		auto *e = reinterpret_cast<const XrEventDataEyeTrackingStateChangedEXT *>(&evt);
+		auto *e = reinterpret_cast<const XrEventDataEyeTrackingStateChangedDXR *>(&evt);
 		LOG_I("EYE_TRACKING_STATE_CHANGED isTracking=%s activeMode=%d",
 		      e->isTracking == XR_TRUE ? "YES" : "NO", (int)e->activeMode);
 		b.eye_tracking_state = (e->isTracking == XR_TRUE) ? 1 : 0;
@@ -1871,7 +1871,7 @@ static void handle_event(Bridge &b, const XrEventDataBuffer &evt) {
 		}
 	} break;
 
-	case XR_TYPE_EVENT_DATA_HARDWARE_DISPLAY_STATE_CHANGED_EXT: {
+	case XR_TYPE_EVENT_DATA_HARDWARE_DISPLAY_STATE_CHANGED_DXR: {
 		LOG_I("HARDWARE_DISPLAY_STATE_CHANGED_EXT (physical 3D state flipped)");
 		if (b.ws_client_connected.load()) {
 			bool hw3d = false;
@@ -1907,7 +1907,7 @@ static void poll_eye_poses(Bridge &b) {
 		// Not streaming — still locate at a low rate (~4 Hz vs the 10 ms
 		// loop). The runtime's isTracking edge detection runs in its
 		// xrLocateViews path (#441 v14): a session that never locates views
-		// receives no XrEventDataEyeTrackingStateChangedEXT events. This
+		// receives no XrEventDataEyeTrackingStateChangedDXR events. This
 		// keeps tracking-loss edges flowing when the page configured
 		// eyePoseFormat "none" (and keeps b.eye_tracking_state seeded
 		// before any WS client connects).
@@ -1926,19 +1926,19 @@ static void poll_eye_poses(Bridge &b) {
 	// Chain per-frame eye-tracking state (#446 truthful isTracking) so the
 	// cached value is seeded before the first edge event — display-info
 	// serializes it for late-joining WS clients.
-	XrViewEyeTrackingStateEXT et_state{(XrStructureType)XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT};
+	XrViewEyeTrackingStateDXR et_state{(XrStructureType)XR_TYPE_VIEW_EYE_TRACKING_STATE_DXR};
 	XrViewState vs{XR_TYPE_VIEW_STATE};
 	vs.next = &et_state;
 	uint32_t view_count = 8;
 	XrView views[8];
 	for (uint32_t i = 0; i < 8; i++) views[i] = {XR_TYPE_VIEW};
 
-	// XR_EXT_view_rig (#396 W7 bridge-raw tail): chain the formal raw-inputs
+	// XR_DXR_view_rig (#396 W7 bridge-raw tail): chain the formal raw-inputs
 	// struct so the runtime fills display-space eyes + display plane + sample
 	// time + tracking lock — the same inputs a native aware app consumes.
 	// Chain it AFTER et_state (et_state.next) so BOTH output structs ride the
 	// XrViewState::next chain — don't clobber the #446 eye-tracking-state.
-	XrViewDisplayRawEXT raw{XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+	XrViewDisplayRawDXR raw{XR_TYPE_VIEW_DISPLAY_RAW_DXR};
 	if (b.has_view_rig_ext) {
 		et_state.next = &raw;
 	}
@@ -1951,7 +1951,7 @@ static void poll_eye_poses(Bridge &b) {
 	// Use the formal channel only when the runtime actually populated it
 	// (eyeCountOutput > 0). On failure/older runtimes the serializer falls
 	// back to XrView poses — byte-identical to the prior behavior.
-	const XrViewDisplayRawEXT *rawp =
+	const XrViewDisplayRawDXR *rawp =
 	    (b.has_view_rig_ext && raw.eyeCountOutput > 0) ? &raw : nullptr;
 
 	// One-shot-per-tracking-state proof that the formal channel is live, plus a

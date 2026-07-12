@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  OpenXR session management for Vulkan with XR_EXT_win32_window_binding
+ * @brief  OpenXR session management for Vulkan with XR_DXR_win32_window_binding
  */
 
 #pragma once

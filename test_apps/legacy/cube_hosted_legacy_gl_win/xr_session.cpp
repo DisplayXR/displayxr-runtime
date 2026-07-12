@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  OpenXR session management (legacy mode — no XR_EXT_display_info, OpenGL)
+ * @brief  OpenXR session management (legacy mode — no XR_DXR_display_info, OpenGL)
  *
- * This is the legacy variant: does NOT enable XR_EXT_display_info.
+ * This is the legacy variant: does NOT enable XR_DXR_display_info.
  * Swapchain uses recommendedImageRectWidth * 2 (compromise scaling).
  * Only V toggle (2D/3D) works — no 1/2/3 mode switching.
  */
@@ -85,7 +85,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
 
     LOG_INFO("XR_KHR_opengl_enable: %s", hasOpenGL ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("Legacy mode: NOT enabling XR_EXT_display_info");
+    LOG_INFO("Legacy mode: NOT enabling XR_DXR_display_info");
 
     if (!hasOpenGL) {
         LOG_ERROR("XR_KHR_opengl_enable extension not available - cannot continue");

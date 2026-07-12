@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  XR_EXT_workspace_file_dialog API entry points (Tier 1 spatial picker).
+ * @brief  XR_DXR_workspace_file_dialog API entry points (Tier 1 spatial picker).
  * @author DisplayXR
  * @ingroup oxr_api
  *
- * Async request shape: the app calls xrRequestFilePickerEXT and later
- * receives an XrEventDataFilePickerCompleteEXT via xrPollEvent. This TU
+ * Async request shape: the app calls xrRequestFilePickerDXR and later
+ * receives an XrEventDataFilePickerCompleteDXR via xrPollEvent. This TU
  * owns input validation and the runtime-side fallback decision; the IPC
  * dispatch + completion event push are wired in a separate PR alongside
  * the new workspace_request_file_dialog / workspace_file_dialog_result
@@ -28,13 +28,13 @@
 
 #include "shared/ipc_protocol.h"
 
-#include <openxr/XR_EXT_workspace_file_dialog.h>
+#include <openxr/XR_DXR_workspace_file_dialog.h>
 
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 
-#ifdef OXR_HAVE_EXT_workspace_file_dialog
+#ifdef OXR_HAVE_DXR_workspace_file_dialog
 
 // Forward declarations of the IPC client bridges — implementations live in
 // ipc/client/ipc_client_compositor.c; we forward-declare here so the state
@@ -72,7 +72,7 @@ session_is_ipc_client(struct oxr_session *sess)
 }
 
 /*!
- * Translate the public XrFilePickerInfoEXT to the wire-format
+ * Translate the public XrFilePickerInfoDXR to the wire-format
  * ipc_file_picker_info. The wire format is intentionally tighter than the
  * public ABI so the IPC payload fits inside IPC_BUF_SIZE — caller-supplied
  * strings longer than the wire budget are rejected with
@@ -80,14 +80,14 @@ session_is_ipc_client(struct oxr_session *sess)
  */
 static XrResult
 translate_info(struct oxr_logger *log,
-               const XrFilePickerInfoEXT *in,
+               const XrFilePickerInfoDXR *in,
                struct ipc_file_picker_info *out)
 {
 	memset(out, 0, sizeof(*out));
 	out->mode = (uint32_t)in->mode;
 	out->flags = (uint64_t)in->flags;
 
-	size_t title_len = strnlen(in->title, XR_MAX_FILE_PICKER_TITLE_LENGTH_EXT);
+	size_t title_len = strnlen(in->title, XR_MAX_FILE_PICKER_TITLE_LENGTH_DXR);
 	if (title_len >= sizeof(out->title)) {
 		return oxr_error(log, XR_ERROR_PATH_FORMAT_INVALID,
 		                 "(info->title) length %zu exceeds wire budget %zu",
@@ -95,7 +95,7 @@ translate_info(struct oxr_logger *log,
 	}
 	memcpy(out->title, in->title, title_len);
 
-	size_t path_len = strnlen(in->defaultPath, XR_MAX_FILE_PICKER_PATH_LENGTH_EXT);
+	size_t path_len = strnlen(in->defaultPath, XR_MAX_FILE_PICKER_PATH_LENGTH_DXR);
 	if (path_len >= sizeof(out->default_path)) {
 		return oxr_error(log, XR_ERROR_PATH_FORMAT_INVALID,
 		                 "(info->defaultPath) length %zu exceeds wire budget %zu",
@@ -110,8 +110,8 @@ translate_info(struct oxr_logger *log,
 	}
 	out->filter_count = in->filterCount;
 	for (uint32_t i = 0; i < in->filterCount; i++) {
-		size_t d = strnlen(in->filters[i].description, XR_MAX_FILE_PICKER_FILTER_LENGTH_EXT);
-		size_t e = strnlen(in->filters[i].extensions, XR_MAX_FILE_PICKER_FILTER_LENGTH_EXT);
+		size_t d = strnlen(in->filters[i].description, XR_MAX_FILE_PICKER_FILTER_LENGTH_DXR);
+		size_t e = strnlen(in->filters[i].extensions, XR_MAX_FILE_PICKER_FILTER_LENGTH_DXR);
 		if (d >= sizeof(out->filters[i].description) ||
 		    e >= sizeof(out->filters[i].extensions)) {
 			return oxr_error(log, XR_ERROR_PATH_FORMAT_INVALID,
@@ -125,23 +125,23 @@ translate_info(struct oxr_logger *log,
 
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrRequestFilePickerEXT(XrSession session,
-                           const XrFilePickerInfoEXT *info,
-                           XrAsyncRequestIdEXT *requestId)
+                           const XrFilePickerInfoDXR *info,
+                           XrAsyncRequestIdDXR *requestId)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRequestFilePickerEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRequestFilePickerDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_workspace_file_dialog);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_workspace_file_dialog);
 
 	if (info == NULL) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "(info == NULL)");
 	}
-	if (info->type != XR_TYPE_FILE_PICKER_INFO_EXT) {
+	if (info->type != XR_TYPE_FILE_PICKER_INFO_DXR) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "(info->type) must be XR_TYPE_FILE_PICKER_INFO_EXT, got %d",
+		                 "(info->type) must be XR_TYPE_FILE_PICKER_INFO_DXR, got %d",
 		                 (int)info->type);
 	}
 	if (info->next != NULL) {
@@ -153,34 +153,34 @@ oxr_xrRequestFilePickerEXT(XrSession session,
 	}
 
 	switch (info->mode) {
-	case XR_FILE_PICKER_MODE_OPEN_EXT:
-	case XR_FILE_PICKER_MODE_SAVE_EXT:
-	case XR_FILE_PICKER_MODE_FOLDER_EXT: break;
+	case XR_FILE_PICKER_MODE_OPEN_DXR:
+	case XR_FILE_PICKER_MODE_SAVE_DXR:
+	case XR_FILE_PICKER_MODE_FOLDER_DXR: break;
 	default:
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
 		                 "(info->mode) invalid: %d", (int)info->mode);
 	}
 
-	if (info->filterCount > XR_MAX_FILE_PICKER_FILTERS_EXT) {
+	if (info->filterCount > XR_MAX_FILE_PICKER_FILTERS_DXR) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "(info->filterCount) %u > XR_MAX_FILE_PICKER_FILTERS_EXT (%u)",
-		                 info->filterCount, XR_MAX_FILE_PICKER_FILTERS_EXT);
+		                 "(info->filterCount) %u > XR_MAX_FILE_PICKER_FILTERS_DXR (%u)",
+		                 info->filterCount, XR_MAX_FILE_PICKER_FILTERS_DXR);
 	}
 
-	if ((info->flags & XR_FILE_PICKER_FLAG_MULTI_SELECT_BIT_EXT) != 0) {
+	if ((info->flags & XR_FILE_PICKER_FLAG_MULTI_SELECT_BIT_DXR) != 0) {
 		// Reserved bit; spec_version 1 picker UIs do not support multi-select.
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
 		                 "MULTI_SELECT_BIT_EXT reserved for spec_version 2");
 	}
 
-	*requestId = XR_NULL_ASYNC_REQUEST_ID_EXT;
+	*requestId = XR_NULL_ASYNC_REQUEST_ID_DXR;
 
 	// Standalone (non-workspace) session: the extension is workspace-scoped.
 	// Apps in this state should call GetOpenFileName themselves; there's no
 	// Tier 0 hook installed either, so we don't promise fallback semantics.
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrRequestFilePickerEXT requires a workspace (IPC-mode) session");
+		                 "xrRequestFilePickerDXR requires a workspace (IPC-mode) session");
 	}
 
 	// Workspace controller calling its own picker would be a recursion
@@ -188,7 +188,7 @@ oxr_xrRequestFilePickerEXT(XrSession session,
 	// from within the picker process or the shell itself.
 	if (sess->is_active_workspace_controller) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrRequestFilePickerEXT is not callable from a workspace controller session");
+		                 "xrRequestFilePickerDXR is not callable from a workspace controller session");
 	}
 
 	// Translate to the wire format. Length-validation rejects user paths
@@ -204,19 +204,19 @@ oxr_xrRequestFilePickerEXT(XrSession session,
 	// request_id, queues a FILE_PICKER_REQUEST event for the controller's
 	// drain channel, and returns. If the bridge fails (no workspace
 	// controller online, controller has not advertised file-dialog
-	// support, table full, …) we surface XR_FILE_PICKER_FALLBACK_TIER0_EXT
+	// support, table full, …) we surface XR_FILE_PICKER_FALLBACK_TIER0_DXR
 	// so the app falls through to a flat OS dialog — Tier 0's CBT hook
 	// will handle z-order / focus on its own.
 	uint64_t allocated_id = 0;
 	xrt_result_t xret = comp_ipc_client_compositor_session_request_file_picker(
 	    &sess->xcn->base, &ipc_info, &allocated_id);
 	if (xret != XRT_SUCCESS || allocated_id == 0) {
-		U_LOG_I("xrRequestFilePickerEXT: bridge=%d, allocated_id=%llu — falling back to Tier 0",
+		U_LOG_I("xrRequestFilePickerDXR: bridge=%d, allocated_id=%llu — falling back to Tier 0",
 		        (int)xret, (unsigned long long)allocated_id);
-		return XR_FILE_PICKER_FALLBACK_TIER0_EXT;
+		return XR_FILE_PICKER_FALLBACK_TIER0_DXR;
 	}
 
-	*requestId = (XrAsyncRequestIdEXT)allocated_id;
+	*requestId = (XrAsyncRequestIdDXR)allocated_id;
 	return XR_SUCCESS;
 }
 
@@ -229,22 +229,22 @@ oxr_xrRequestFilePickerEXT(XrSession session,
 
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrGetFilePickerRequestEXT(XrSession session,
-                              XrAsyncRequestIdEXT requestId,
+                              XrAsyncRequestIdDXR requestId,
                               uint32_t *outClientId,
-                              XrFilePickerInfoEXT *outInfo)
+                              XrFilePickerInfoDXR *outInfo)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetFilePickerRequestEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetFilePickerRequestDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_workspace_file_dialog);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_workspace_file_dialog);
 
 	if (outClientId == NULL || outInfo == NULL) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "(outClientId / outInfo NULL)");
 	}
-	if (requestId == XR_NULL_ASYNC_REQUEST_ID_EXT) {
+	if (requestId == XR_NULL_ASYNC_REQUEST_ID_DXR) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "(requestId == 0)");
 	}
 	*outClientId = 0;
@@ -252,11 +252,11 @@ oxr_xrGetFilePickerRequestEXT(XrSession session,
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrGetFilePickerRequestEXT requires an IPC-mode session");
+		                 "xrGetFilePickerRequestDXR requires an IPC-mode session");
 	}
 	if (!sess->is_active_workspace_controller) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrGetFilePickerRequestEXT requires the active workspace controller session");
+		                 "xrGetFilePickerRequestDXR requires the active workspace controller session");
 	}
 
 	uint32_t found = 0;
@@ -271,15 +271,15 @@ oxr_xrGetFilePickerRequestEXT(XrSession session,
 	}
 	if (!found) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrGetFilePickerRequestEXT: no pending request for requestId=%llu",
+		                 "xrGetFilePickerRequestDXR: no pending request for requestId=%llu",
 		                 (unsigned long long)requestId);
 	}
 
 	*outClientId = client_id;
-	outInfo->type = XR_TYPE_FILE_PICKER_INFO_EXT;
+	outInfo->type = XR_TYPE_FILE_PICKER_INFO_DXR;
 	outInfo->next = NULL;
-	outInfo->mode = (XrFilePickerModeEXT)ipc_info.mode;
-	outInfo->flags = (XrFilePickerFlagsEXT)ipc_info.flags;
+	outInfo->mode = (XrFilePickerModeDXR)ipc_info.mode;
+	outInfo->flags = (XrFilePickerFlagsDXR)ipc_info.flags;
 	// All char fields fit by construction — wire budgets ≤ public budgets.
 	memcpy(outInfo->title, ipc_info.title,
 	       sizeof(ipc_info.title) < sizeof(outInfo->title) ? sizeof(ipc_info.title) : sizeof(outInfo->title) - 1);
@@ -287,7 +287,7 @@ oxr_xrGetFilePickerRequestEXT(XrSession session,
 	       sizeof(ipc_info.default_path) < sizeof(outInfo->defaultPath) ? sizeof(ipc_info.default_path)
 	                                                                    : sizeof(outInfo->defaultPath) - 1);
 	outInfo->filterCount = ipc_info.filter_count;
-	for (uint32_t i = 0; i < ipc_info.filter_count && i < XR_MAX_FILE_PICKER_FILTERS_EXT; i++) {
+	for (uint32_t i = 0; i < ipc_info.filter_count && i < XR_MAX_FILE_PICKER_FILTERS_DXR; i++) {
 		memcpy(outInfo->filters[i].description, ipc_info.filters[i].description,
 		       sizeof(ipc_info.filters[i].description));
 		memcpy(outInfo->filters[i].extensions, ipc_info.filters[i].extensions,
@@ -298,34 +298,34 @@ oxr_xrGetFilePickerRequestEXT(XrSession session,
 
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrCompleteFilePickerEXT(XrSession session,
-                            XrAsyncRequestIdEXT requestId,
-                            XrFilePickerResultEXT result,
+                            XrAsyncRequestIdDXR requestId,
+                            XrFilePickerResultDXR result,
                             const char *path)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrCompleteFilePickerEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrCompleteFilePickerDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_workspace_file_dialog);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_workspace_file_dialog);
 
-	if (requestId == XR_NULL_ASYNC_REQUEST_ID_EXT) {
+	if (requestId == XR_NULL_ASYNC_REQUEST_ID_DXR) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "(requestId == 0)");
 	}
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrCompleteFilePickerEXT requires an IPC-mode session");
+		                 "xrCompleteFilePickerDXR requires an IPC-mode session");
 	}
 	if (!sess->is_active_workspace_controller) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrCompleteFilePickerEXT requires the active workspace controller session");
+		                 "xrCompleteFilePickerDXR requires the active workspace controller session");
 	}
 
 	struct ipc_file_picker_result_path wire_path;
 	memset(&wire_path, 0, sizeof(wire_path));
-	if (result == XR_FILE_PICKER_RESULT_SUCCESS_EXT && path != NULL && path[0] != '\0') {
-		size_t len = strnlen(path, XR_MAX_FILE_PICKER_PATH_LENGTH_EXT);
+	if (result == XR_FILE_PICKER_RESULT_SUCCESS_DXR && path != NULL && path[0] != '\0') {
+		size_t len = strnlen(path, XR_MAX_FILE_PICKER_PATH_LENGTH_DXR);
 		if (len >= sizeof(wire_path.path)) {
 			return oxr_error(&log, XR_ERROR_PATH_FORMAT_INVALID,
 			                 "(path) length %zu exceeds wire budget %zu", len,
@@ -343,4 +343,4 @@ oxr_xrCompleteFilePickerEXT(XrSession session,
 	return XR_SUCCESS;
 }
 
-#endif // OXR_HAVE_EXT_workspace_file_dialog
+#endif // OXR_HAVE_DXR_workspace_file_dialog

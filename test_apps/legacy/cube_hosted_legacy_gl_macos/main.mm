@@ -7,13 +7,13 @@
  * Self-contained single-file app that renders a spinning cube + grid floor
  * via OpenGL + OpenXR. Mirrors cube_metal_macos but uses OpenGL natively.
  *
- * Legacy variant: does NOT enable XR_EXT_display_info. Relies on runtime
+ * Legacy variant: does NOT enable XR_DXR_display_info. Relies on runtime
  * defaults and recommendedImageRectWidth for swapchain sizing.
  *
  * No windowing code — the runtime's compositor creates its own window.
  * No input handling — static camera with continuous cube rotation.
  *
- * Uses XR_EXT_macos_gl_binding to provide a CGL context to the runtime.
+ * Uses XR_DXR_macos_gl_binding to provide a CGL context to the runtime.
  * Swapchain textures are IOSurface-backed GL_TEXTURE_RECTANGLE.
  */
 
@@ -24,7 +24,7 @@
 #define XR_USE_GRAPHICS_API_OPENGL
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-#include <openxr/XR_EXT_macos_gl_binding.h>
+#include <openxr/XR_DXR_macos_gl_binding.h>
 // Legacy app: NO DisplayXR extension types needed.
 // This app uses only standard OpenXR APIs.
 
@@ -717,17 +717,17 @@ static bool InitializeOpenXR(AppXrSession &app)
     LOG_INFO("Available OpenXR extensions:");
     for (auto &e : exts) {
         LOG_INFO("  %s v%u", e.extensionName, e.extensionVersion);
-        if (strcmp(e.extensionName, XR_EXT_MACOS_GL_BINDING_EXTENSION_NAME) == 0)
+        if (strcmp(e.extensionName, XR_DXR_MACOS_GL_BINDING_EXTENSION_NAME) == 0)
             hasMacosGlBinding = true;
     }
 
     if (!hasMacosGlBinding) {
-        LOG_ERROR("Runtime does not support XR_EXT_macos_gl_binding");
+        LOG_ERROR("Runtime does not support XR_DXR_macos_gl_binding");
         return false;
     }
 
-    // Legacy: NOT enabling XR_EXT_display_info
-    std::vector<const char*> enabledExts = {XR_EXT_MACOS_GL_BINDING_EXTENSION_NAME};
+    // Legacy: NOT enabling XR_DXR_display_info
+    std::vector<const char*> enabledExts = {XR_DXR_MACOS_GL_BINDING_EXTENSION_NAME};
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(createInfo.applicationInfo.applicationName, "GLCubeOpenXR",
             XR_MAX_APPLICATION_NAME_SIZE);
@@ -772,8 +772,8 @@ static bool InitializeOpenXR(AppXrSession &app)
 
 static bool CreateSession(AppXrSession &app, CGLContextObj cglContext, CGLPixelFormatObj cglPixelFormat)
 {
-    XrGraphicsBindingOpenGLMacOSEXT binding = {};
-    binding.type = XR_TYPE_GRAPHICS_BINDING_OPENGL_MACOS_EXT;
+    XrGraphicsBindingOpenGLMacOSDXR binding = {};
+    binding.type = XR_TYPE_GRAPHICS_BINDING_OPENGL_MACOS_DXR;
     binding.cglContext = cglContext;
     binding.cglPixelFormat = cglPixelFormat;
 
@@ -893,7 +893,7 @@ static void PollEvents(AppXrSession &app)
             }
             break;
         }
-        // Legacy app: no rendering mode events (XR_EXT_display_info not enabled)
+        // Legacy app: no rendering mode events (XR_DXR_display_info not enabled)
         default: break;
         }
         event = {XR_TYPE_EVENT_DATA_BUFFER};

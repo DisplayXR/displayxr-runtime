@@ -40,7 +40,7 @@ xrt_instance_create(struct xrt_instance_info *ii, struct xrt_instance **out_xins
 
 	XRT_TRACE_MARKER();
 
-	// Workspace controllers (sessions with XR_EXT_spatial_workspace enabled)
+	// Workspace controllers (sessions with XR_DXR_spatial_workspace enabled)
 	// always go IPC — the controller talks to the service over IPC by
 	// design, and the in-process native compositor doesn't host the
 	// workspace state. This auto-detection lets the shell drop the

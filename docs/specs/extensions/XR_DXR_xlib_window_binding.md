@@ -1,10 +1,10 @@
-# XR_EXT_xlib_window_binding
+# XR_DXR_xlib_window_binding
 
 | Property | Value |
 |----------|-------|
-| Extension Name | `XR_EXT_xlib_window_binding` |
+| Extension Name | `XR_DXR_xlib_window_binding` |
 | Spec Version | 1 |
-| Type Values | `XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_EXT` (1000999200) |
+| Type Values | `XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR` (1004999200) |
 | Author | The DisplayXR Project |
 | Platform | Desktop Linux (X11/Xlib). Wayland out of scope (see §6). |
 
@@ -12,9 +12,9 @@
 
 ## 1. Overview
 
-`XR_EXT_xlib_window_binding` allows an OpenXR application to provide its own X11 window (`Display*` + `Window`) to the runtime when creating a session on desktop Linux. When present, the runtime renders into the application's window instead of creating its own, and the application retains control of input, lifecycle, and the X event loop.
+`XR_DXR_xlib_window_binding` allows an OpenXR application to provide its own X11 window (`Display*` + `Window`) to the runtime when creating a session on desktop Linux. When present, the runtime renders into the application's window instead of creating its own, and the application retains control of input, lifecycle, and the X event loop.
 
-It is the desktop-Linux sibling of [`XR_EXT_win32_window_binding`](XR_EXT_win32_window_binding.md) (HWND) and [`XR_EXT_cocoa_window_binding`](XR_EXT_cocoa_window_binding.md) (NSView). The motivation — the window-focus problem, the two-pose problem, and the phase-alignment problem on lenticular 3D displays — is identical and documented in depth in the win32 spec (§2); it is not repeated here.
+It is the desktop-Linux sibling of [`XR_DXR_win32_window_binding`](XR_DXR_win32_window_binding.md) (HWND) and [`XR_DXR_cocoa_window_binding`](XR_DXR_cocoa_window_binding.md) (NSView). The motivation — the window-focus problem, the two-pose problem, and the phase-alignment problem on lenticular 3D displays — is identical and documented in depth in the win32 spec (§2); it is not repeated here.
 
 This extension is what makes the **handle class** (`_handle` apps) possible on Linux. The **hosted class** needs no extension — the runtime self-creates an XCB window (Linux Phase 1, `comp_vk_native_window_xcb.c`).
 
@@ -23,22 +23,22 @@ This extension is what makes the **handle class** (`_handle` apps) possible on L
 ### 2.1 Extension name and constants
 
 ```c
-#define XR_EXT_xlib_window_binding 1
-#define XR_EXT_xlib_window_binding_SPEC_VERSION 1
-#define XR_EXT_XLIB_WINDOW_BINDING_EXTENSION_NAME "XR_EXT_xlib_window_binding"
+#define XR_DXR_xlib_window_binding 1
+#define XR_DXR_xlib_window_binding_SPEC_VERSION 1
+#define XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME "XR_DXR_xlib_window_binding"
 
-#define XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_EXT ((XrStructureType)1000999200)
+#define XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR ((XrStructureType)1004999200)
 ```
 
-### 2.2 XrXlibWindowBindingCreateInfoEXT
+### 2.2 XrXlibWindowBindingCreateInfoDXR
 
 ```c
-typedef struct XrXlibWindowBindingCreateInfoEXT {
-    XrStructureType             type;      // XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_EXT
+typedef struct XrXlibWindowBindingCreateInfoDXR {
+    XrStructureType             type;      // XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR
     const void* XR_MAY_ALIAS    next;
     Display*                    xDisplay;  // Xlib display connection (XOpenDisplay)
     Window                      window;    // X11 Window (XID) owned by the app
-} XrXlibWindowBindingCreateInfoEXT;
+} XrXlibWindowBindingCreateInfoDXR;
 ```
 
 Chained into `XrSessionCreateInfo::next` at `xrCreateSession`, alongside the graphics binding:
@@ -47,7 +47,7 @@ Chained into `XrSessionCreateInfo::next` at `xrCreateSession`, alongside the gra
 XrGraphicsBindingVulkanKHR vkBinding = {XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
 // ... fill instance / physicalDevice / device / queue ...
 
-XrXlibWindowBindingCreateInfoEXT xlibBinding = {XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_EXT};
+XrXlibWindowBindingCreateInfoDXR xlibBinding = {XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR};
 xlibBinding.next     = &vkBinding;
 xlibBinding.xDisplay = dpy;      // the app's Display*
 xlibBinding.window   = win;      // the app's mapped window
@@ -80,7 +80,7 @@ xrCreateSession(instance, &sessionInfo, &session);
 
 ## 5. Reference Implementation
 
-- Extension header: `src/external/openxr_includes/openxr/XR_EXT_xlib_window_binding.h`
+- Extension header: `src/external/openxr_includes/openxr/XR_DXR_xlib_window_binding.h`
 - oxr consumption: `oxr_session.c` (Vulkan branch, packs `Display*`/`Window` into `comp_vk_native_xlib_handle`)
 - Compositor: `comp_vk_native_compositor.c` (`XRT_OS_LINUX_DESKTOP` window block), `comp_vk_native_window_xcb.c` (`..._wrap_app_window`, `..._query_geometry`)
 - Validation vehicle: `test_apps/cube_handle_vk_linux` (app-owned Xlib window + this binding; built by `scripts/build_linux.sh --apps`)
@@ -89,7 +89,7 @@ xrCreateSession(instance, &sessionInfo, &session);
 
 - **Texture class** (shared-texture content handoff, the `sharedTextureHandle` / readback fields of the win32/cocoa siblings) — deliberately absent from spec v1; add as a follow-up revision when a Linux `_texture` producer exists (#696 is the class taxonomy reference).
 - **Transparent background** (`transparentBackgroundEnabled` sibling field) — X11 ARGB-visual transparency is not wired in the Linux compositor yet.
-- **Window-space composition layers** (`XrCompositionLayerWindowSpaceEXT`) — not declared by this extension yet; the shared type value (1000999002) makes a later `#ifndef`-guarded adoption possible, mirroring the cocoa header.
+- **Window-space composition layers** (`XrCompositionLayerWindowSpaceDXR`) — not declared by this extension yet; the shared type value (1004999002) makes a later `#ifndef`-guarded adoption possible, mirroring the cocoa header.
 - **Wayland** — no stable absolute window position (needed for interlacing phase); X11/XCB first by design (`docs/roadmap/linux-support.md` § Decisions).
 
 ## 7. Revision History

@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  SR Cube OpenXR D3D12 - Legacy hosted mode (no XR_EXT_display_info)
+ * @brief  SR Cube OpenXR D3D12 - Legacy hosted mode (no XR_DXR_display_info)
  *
- * This application demonstrates OpenXR with D3D12 without the XR_EXT_win32_window_binding extension.
+ * This application demonstrates OpenXR with D3D12 without the XR_DXR_win32_window_binding extension.
  * DisplayXR will create its own window for rendering.
  *
  * Input is handled by DisplayXR's qwerty driver:

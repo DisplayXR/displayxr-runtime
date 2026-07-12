@@ -31,7 +31,7 @@
 
 // Fully native GL compositor — handles both windowed and shared IOSurface modes
 #include "gl/comp_gl_compositor.h"
-#include "openxr/XR_EXT_macos_gl_binding.h"
+#include "openxr/XR_DXR_macos_gl_binding.h"
 
 XrResult
 oxr_session_populate_gl_macos(struct oxr_logger *log,
@@ -42,12 +42,12 @@ oxr_session_populate_gl_macos(struct oxr_logger *log,
                                bool transparent_background,
                                struct oxr_session *sess)
 {
-	const XrGraphicsBindingOpenGLMacOSEXT *next = (const XrGraphicsBindingOpenGLMacOSEXT *)next_ptr;
+	const XrGraphicsBindingOpenGLMacOSDXR *next = (const XrGraphicsBindingOpenGLMacOSDXR *)next_ptr;
 
 	// TODO: plumb transparent_background through comp_gl_compositor_create.
 	// The GL native macOS compositor uses NSOpenGLView, which would need
 	// setOpaque:NO + clear pixel-format alpha to match the Metal path. Not
-	// implemented in PR #4 — request via XR_EXT_cocoa_window_binding will
+	// implemented in PR #4 — request via XR_DXR_cocoa_window_binding will
 	// be a no-op on the GL native path until then.
 	if (transparent_background) {
 		U_LOG_W("oxr_session_populate_gl_macos: transparentBackgroundEnabled requested but "
@@ -102,7 +102,7 @@ oxr_session_populate_gl_macos(struct oxr_logger *log,
 // Metal-only fallback (no GL native compositor available)
 
 #include "metal/comp_metal_compositor.h"
-#include "openxr/XR_EXT_macos_gl_binding.h"
+#include "openxr/XR_DXR_macos_gl_binding.h"
 
 static int64_t
 metal_format_to_vk(int64_t metal_fmt)
@@ -126,7 +126,7 @@ oxr_session_populate_gl_macos(struct oxr_logger *log,
                                void *shared_iosurface,
                                struct oxr_session *sess)
 {
-	const XrGraphicsBindingOpenGLMacOSEXT *next = (const XrGraphicsBindingOpenGLMacOSEXT *)next_ptr;
+	const XrGraphicsBindingOpenGLMacOSDXR *next = (const XrGraphicsBindingOpenGLMacOSDXR *)next_ptr;
 	struct xrt_device *xdev = get_role_head(sess->sys);
 	struct xrt_compositor_native *xcn = NULL;
 

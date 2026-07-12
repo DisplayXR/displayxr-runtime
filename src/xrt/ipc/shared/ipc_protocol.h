@@ -305,8 +305,8 @@ struct ipc_client_list
 };
 
 /*!
- * XR_EXT_workspace_file_dialog wire format. Flat IPC translation of
- * XrFilePickerInfoEXT — no OpenXR-type dependency in IPC headers, no
+ * XR_DXR_workspace_file_dialog wire format. Flat IPC translation of
+ * XrFilePickerInfoDXR — no OpenXR-type dependency in IPC headers, no
  * pointer chasing (the proto generator copies by value).
  *
  * Wire-side budgets are tighter than the public XR_MAX_FILE_PICKER_*_EXT
@@ -317,11 +317,11 @@ struct ipc_client_list
  * support fall back to Tier 0.
  *
  * Field meanings match the public extension; see
- * `docs/specs/extensions/XR_EXT_workspace_file_dialog.md`.
+ * `docs/specs/extensions/XR_DXR_workspace_file_dialog.md`.
  *
  * @ingroup ipc
  */
-#define IPC_FILE_PICKER_PATH_MAX     256   //!< Matches XR_MAX_FILE_PICKER_PATH_LENGTH_EXT. Sized so the encompassing IPC msg fits IPC_BUF_SIZE.
+#define IPC_FILE_PICKER_PATH_MAX     256   //!< Matches XR_MAX_FILE_PICKER_PATH_LENGTH_DXR. Sized so the encompassing IPC msg fits IPC_BUF_SIZE.
 #define IPC_FILE_PICKER_TITLE_MAX    128   //!< Wire-format title size.
 #define IPC_FILE_PICKER_FILTER_MAX   64    //!< Wire-format filter description / extensions size.
 #define IPC_FILE_PICKER_FILTERS_MAX  4     //!< Wire-format filter rows.
@@ -334,9 +334,9 @@ struct ipc_file_picker_filter
 
 struct ipc_file_picker_info
 {
-	uint32_t mode;                                            //!< XrFilePickerModeEXT cast to uint32_t
+	uint32_t mode;                                            //!< XrFilePickerModeDXR cast to uint32_t
 	uint32_t filter_count;
-	uint64_t flags;                                           //!< XrFilePickerFlagsEXT
+	uint64_t flags;                                           //!< XrFilePickerFlagsDXR
 	char     title[IPC_FILE_PICKER_TITLE_MAX];
 	char     default_path[IPC_FILE_PICKER_PATH_MAX];
 	struct ipc_file_picker_filter filters[IPC_FILE_PICKER_FILTERS_MAX];
@@ -356,7 +356,7 @@ struct ipc_file_picker_result_path
 
 /*!
  * Phase 2.D: workspace input event wire format. Tagged union with
- * event_type as the discriminator. Mirrors the public XrWorkspaceInputEventEXT
+ * event_type as the discriminator. Mirrors the public XrWorkspaceInputEventDXR
  * but uses plain C types (no XR enum dependency in IPC headers). The state
  * tracker translates between this wire form and the public form so the
  * extension surface stays decoupled from IPC.
@@ -383,7 +383,7 @@ enum ipc_workspace_input_event_type
 	IPC_WORKSPACE_INPUT_EVENT_WINDOW_POSE_CHANGED = 7, //!< spec_version 8: runtime-driven pose/size change
 	IPC_WORKSPACE_INPUT_EVENT_MODAL_OPEN          = 8, //!< spec_version 10: client opened a Win32 modal popup
 	IPC_WORKSPACE_INPUT_EVENT_MODAL_CLOSE         = 9, //!< spec_version 10: client's Win32 modal popup closed
-	IPC_WORKSPACE_INPUT_EVENT_FILE_PICKER_REQUEST = 10, //!< spec_version 11: client called xrRequestFilePickerEXT
+	IPC_WORKSPACE_INPUT_EVENT_FILE_PICKER_REQUEST = 10, //!< spec_version 11: client called xrRequestFilePickerDXR
 	IPC_WORKSPACE_INPUT_EVENT_FULLSCREEN_TOGGLED  = 11, //!< spec_version 15: client's fullscreen/maximize state transitioned
 	IPC_WORKSPACE_INPUT_EVENT_CLIENT_CONNECTED    = 12, //!< spec_version 16: client connected (slot bound); controller owns per-client setup
 };
@@ -397,7 +397,7 @@ struct ipc_workspace_input_event
 		struct
 		{
 			uint32_t hit_client_id;
-			uint32_t hit_region;     //!< XrWorkspaceHitRegionEXT cast to uint32_t
+			uint32_t hit_region;     //!< XrWorkspaceHitRegionDXR cast to uint32_t
 			float    local_u;
 			float    local_v;
 			int64_t  cursor_x;
@@ -482,7 +482,7 @@ struct ipc_workspace_input_event
 		{
 			// Payload is intentionally minimal so the event batch stays
 			// under IPC_BUF_SIZE. The controller fetches the full
-			// XrFilePickerInfoEXT-equivalent via
+			// XrFilePickerInfoDXR-equivalent via
 			// `workspace_get_file_picker_request(request_id)`.
 			uint32_t client_id;
 			uint32_t _pad;
@@ -561,7 +561,7 @@ struct ipc_capture_result
 
 /*!
  * Phase 2.C: maximum chrome hit regions per layout. Mirrors
- * XR_WORKSPACE_CHROME_MAX_HIT_REGIONS_EXT — kept fixed-size so the wire form
+ * XR_WORKSPACE_CHROME_MAX_HIT_REGIONS_DXR — kept fixed-size so the wire form
  * stays POD.
  *
  * @ingroup ipc
@@ -570,7 +570,7 @@ struct ipc_capture_result
 
 /*!
  * Phase 2.C: one controller-defined hit region inside a chrome quad. POD
- * mirror of XrWorkspaceChromeHitRegionEXT.
+ * mirror of XrWorkspaceChromeHitRegionDXR.
  *
  * @ingroup ipc
  */
@@ -585,7 +585,7 @@ struct ipc_workspace_chrome_hit_region
 
 /*!
  * Phase 2.C: layout for a controller-submitted chrome quad. POD mirror of
- * XrWorkspaceChromeLayoutEXT, with the variable-length region array inlined
+ * XrWorkspaceChromeLayoutDXR, with the variable-length region array inlined
  * as a fixed-size array so the wire stays POD.
  *
  * @ingroup ipc
@@ -605,7 +605,7 @@ struct ipc_workspace_chrome_layout
 
 /*!
  * spec_version 24: maximum controller-reserved key chords per registration.
- * Mirrors XR_WORKSPACE_MAX_RESERVED_KEYS_EXT — kept fixed-size so the wire
+ * Mirrors XR_WORKSPACE_MAX_RESERVED_KEYS_DXR — kept fixed-size so the wire
  * form stays POD.
  *
  * @ingroup ipc
@@ -614,7 +614,7 @@ struct ipc_workspace_chrome_layout
 
 /*!
  * spec_version 24: the controller's reserved-key table. POD mirror of the
- * XrWorkspaceReservedKeyEXT[] passed to xrSetWorkspaceReservedKeysEXT, inlined
+ * XrWorkspaceReservedKeyDXR[] passed to xrSetWorkspaceReservedKeysDXR, inlined
  * as a fixed-size array so the wire stays POD. count == 0 restores the
  * runtime's built-in default reserved set.
  *
@@ -635,8 +635,8 @@ struct ipc_workspace_reserved_keys
 /*!
  * spec_version 13: session-global cursor source. The controller renders
  * its cursor sprite into a swapchain (allocated via
- * xrCreateWorkspaceCursorSwapchainEXT) and points the runtime at it via
- * xrSetWorkspaceCursorEXT. The runtime samples that swapchain's latest
+ * xrCreateWorkspaceCursorSwapchainDXR) and points the runtime at it via
+ * xrSetWorkspaceCursorDXR. The runtime samples that swapchain's latest
  * released image in its per-frame cursor render pass.
  *
  * @ingroup ipc
@@ -653,7 +653,7 @@ struct ipc_workspace_cursor_info
 /*!
  * spec_version 17: session-global overlay source. The controller renders a
  * display-spanning UI (e.g. taskbar) into a swapchain (allocated via
- * xrCreateWorkspaceOverlaySwapchainEXT) and docks it via xrSetWorkspaceOverlayEXT.
+ * xrCreateWorkspaceOverlaySwapchainDXR) and docks it via xrSetWorkspaceOverlayDXR.
  * The runtime composites that swapchain's latest released image at z = 0 (zero
  * disparity) at the controller's anchor/pivot — no raycast, no per-eye disparity.
  *
@@ -675,8 +675,8 @@ struct ipc_workspace_overlay_info
 
 /*!
  * Phase 2.C spec_version 9: per-client visual style applied at workspace
- * content blit time. POD mirror of XrWorkspaceClientStyleEXT — the wire
- * form for xrSetWorkspaceClientStyleEXT.
+ * content blit time. POD mirror of XrWorkspaceClientStyleDXR — the wire
+ * form for xrSetWorkspaceClientStyleDXR.
  *
  * @ingroup ipc
  */
@@ -735,7 +735,7 @@ struct ipc_arg_swapchain_from_native
 };
 
 /*!
- * XR_EXT_weave over IPC (#625): per-frame weave_submit arguments. The pre-weave
+ * XR_DXR_weave over IPC (#625): per-frame weave_submit arguments. The pre-weave
  * input texture rides as an in_handle (xrt_graphics_buffer_handle_t); this POD
  * carries the window-relative output sub-rect. The interlace is DP-internal
  * (reads the vendor's own eye tracker), so nothing eye-related travels in;
@@ -763,14 +763,14 @@ struct ipc_info_get_view_poses_2
 };
 
 /*!
- * XR_EXT_view_rig over IPC (#396 W7): rig kinds on the wire.
+ * XR_DXR_view_rig over IPC (#396 W7): rig kinds on the wire.
  */
 #define IPC_VIEW_RIG_NONE 0
 #define IPC_VIEW_RIG_DISPLAY 1
 #define IPC_VIEW_RIG_CAMERA 2
 
 /*!
- * XR_EXT_view_rig over IPC (#396 W7): a chained rig descriptor crossing the
+ * XR_DXR_view_rig over IPC (#396 W7): a chained rig descriptor crossing the
  * boundary (oxr client -> service) for ONE xrLocateViews call. POD mirror of
  * the client's already-clamped oxr_view_rig_state. Strictly per-locate —
  * never latched on either side: a non-chained locate takes the legacy
@@ -799,11 +799,11 @@ struct ipc_view_rig_info
 	uint32_t render_view_count;
 
 	/*
-	 * XR_EXT_display_zones P5 (ADR-027) — append-only past this point.
+	 * XR_DXR_display_zones P5 (ADR-027) — append-only past this point.
 	 */
 
-	//! Zone-scoped locate (XR_EXT_display_zones P5): nonzero when the
-	//! client's locate chained an XrDisplayZoneEXT. The server rebases its
+	//! Zone-scoped locate (XR_DXR_display_zones P5): nonzero when the
+	//! client's locate chained an XrDisplayZoneDXR. The server rebases its
 	//! resolved window metrics to the zone rect (u_canvas_apply_to_metrics)
 	//! exactly like the in-process oxr_session.c zone block, so the Kooima
 	//! meters, eye offsets, and the raw canvas rect all describe the zone.
@@ -816,7 +816,7 @@ struct ipc_view_rig_info
 };
 
 /*!
- * XR_EXT_view_rig over IPC (#396 W7): the XrViewDisplayRawEXT payload,
+ * XR_DXR_view_rig over IPC (#396 W7): the XrViewDisplayRawDXR payload,
  * gathered service-side from the same inputs the server rig math consumes —
  * the DP's full per-view eye set VERBATIM (one eye per active view; the DP
  * owns multi-view fill, the runtime never synthesizes), pre window/canvas
@@ -843,7 +843,7 @@ struct ipc_view_raw_info
 };
 
 /*!
- * XR_EXT_view_rig over IPC (#396 W7): reply for session_locate_views_rig.
+ * XR_DXR_view_rig over IPC (#396 W7): reply for session_locate_views_rig.
  * head_relation/fovs/poses are the SAME outputs the legacy
  * device_get_view_poses handler produces (same server code path, with the
  * rig overrides applied when one is chained); eye_world carries the

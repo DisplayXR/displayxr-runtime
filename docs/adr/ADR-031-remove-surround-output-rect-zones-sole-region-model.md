@@ -10,13 +10,13 @@ supersedes-mechanism-of: [ADR-027]
 
 The runtime carried **two** mechanisms for expressing 2D-vs-3D regions in a window:
 
-1. **Legacy "2D surround / output rect"** — `xrSetSharedTextureOutputRectEXT` (confine
+1. **Legacy "2D surround / output rect"** — `xrSetSharedTextureOutputRectDXR` (confine
    weaved 3D to one canvas sub-rect) + `xrSetSharedTextureSurround2DEXT` /
    `…Surround2DFenceEXT` (fill the complement with a monolithic full-window 2D shared
    texture, via a bespoke per-API strip blit + keyed-mutex/fence sync).
-2. **Canonical `XR_EXT_display_zones` (ADR-027)** — N 3D zones (`XrDisplayZoneEXT`, each
-   rect + rig + swapchain) + M 2D zones (`XrCompositionLayerLocal2DEXT`) + a per-pixel
-   wish mask (`XrDisplayZonesFrameEndInfoEXT`).
+2. **Canonical `XR_DXR_display_zones` (ADR-027)** — N 3D zones (`XrDisplayZoneDXR`, each
+   rect + rig + swapchain) + M 2D zones (`XrCompositionLayerLocal2DDXR`) + a per-pixel
+   wish mask (`XrDisplayZonesFrameEndInfoDXR`).
 
 (1) is a strict, less-capable special case of (2): an output rect ≡ one 3D zone; a 2D
 surround ≡ one Local2D zone covering the complement (spec §6 degenerate mapping). Keeping
@@ -32,12 +32,12 @@ Leia SR hardware (D3D11 + D3D12) and on macOS/Metal. Full history:
 
 ## Decision
 
-**`XR_EXT_display_zones` is the single canonical model for all 2D/3D region expression, for
+**`XR_DXR_display_zones` is the single canonical model for all 2D/3D region expression, for
 every app class.** The 2D-surround / output-rect mechanism is removed:
 
-- The three entry points (`xrSetSharedTextureOutputRectEXT`,
+- The three entry points (`xrSetSharedTextureOutputRectDXR`,
   `xrSetSharedTextureSurround2DEXT`, `xrSetSharedTextureSurround2DFenceEXT`) are deleted from
-  `XR_EXT_win32_window_binding` / `XR_EXT_cocoa_window_binding` (spec version bumped) and from
+  `XR_DXR_win32_window_binding` / `XR_DXR_cocoa_window_binding` (spec version bumped) and from
   the oxr dispatch.
 - The bespoke surround compositor code (strip blit, surround shader, keyed-mutex/fence
   surround sync, `u_surround_2d_handle`) is deleted from all five native compositors.
@@ -49,8 +49,8 @@ every app class.** The 2D-surround / output-rect mechanism is removed:
 **App class (handle / texture / hosted) is orthogonal to region expression.** It governs only
 who owns the output surface (app window / shared texture / runtime window). Zones is how *all*
 of them express regions. A plain full-window app is the degenerate one-zone case: an unchained
-`xrLocateViews` + `XrDisplayRigEXT` frames the full window (so single-canvas apps need no
-explicit zone chain); `XR_EXT_view_rig` v2 + `XR_EXT_local_3d_zone` v3 remain that documented
+`xrLocateViews` + `XrDisplayRigDXR` frames the full window (so single-canvas apps need no
+explicit zone chain); `XR_DXR_view_rig` v2 + `XR_DXR_local_3d_zone` v3 remain that documented
 path.
 
 ## Consequences

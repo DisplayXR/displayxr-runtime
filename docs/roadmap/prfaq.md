@@ -20,8 +20,8 @@ A reference workspace controller, **DisplayXR Shell**, ships alongside the runti
 
 The platform is built on three commitments:
 
-- **Open at the runtime layer.** OpenXR + WebXR. Standard extension headers for display-specific capabilities (`XR_EXT_display_info`, `XR_EXT_win32_window_binding`, `XR_EXT_cocoa_window_binding`). Display-vendor integration through a documented display-processor vtable.
-- **Open at the workspace layer.** `XR_EXT_spatial_workspace` and `XR_EXT_app_launcher` define how any controller process drives multi-app composition, hit-test, capture, and tile launching. The reference shell uses these surfaces; so does anyone else.
+- **Open at the runtime layer.** OpenXR + WebXR. Standard extension headers for display-specific capabilities (`XR_DXR_display_info`, `XR_DXR_win32_window_binding`, `XR_DXR_cocoa_window_binding`). Display-vendor integration through a documented display-processor vtable.
+- **Open at the workspace layer.** `XR_DXR_spatial_workspace` and `XR_EXT_app_launcher` define how any controller process drives multi-app composition, hit-test, capture, and tile launching. The reference shell uses these surfaces; so does anyone else.
 - **Swappable, not coupled.** Workspace activation is gated by orchestrator-PID match — the runtime trusts the binary it was configured to spawn, not a brand string. OEMs, vertical integrators, and developers can replace the controller without runtime modifications.
 
 DisplayXR runs on Windows today, with macOS and Android in active development. The runtime ships under the Boost Software License. Extension headers are mirrored to `github.com/DisplayXR/displayxr-extensions` and version-tagged for stability. The reference shell is distributed separately from the runtime; a bare runtime install is the supported configuration for OEM and third-party deployments.
@@ -45,7 +45,7 @@ Get started at `github.com/DisplayXR/displayxr-runtime`.
 Nothing. Write standard OpenXR. The DisplayXR runtime registers as an OpenXR runtime via the standard loader — set `XR_RUNTIME_JSON` and your app finds it. Native compositors for D3D11, D3D12, Metal, Vulkan, and OpenGL mean your graphics API works without interop layers.
 
 **Q: How do I make my app aware of the 3D display's capabilities?**
-Opt into `XR_EXT_display_info` for display dimensions, eye-tracking modes, and the data needed for asymmetric (Kooima) projection. The header is published at `github.com/DisplayXR/displayxr-extensions` and frozen at v12. For window binding (passing your HWND or NSView to the runtime so it can composit into your window), use `XR_EXT_win32_window_binding` or `XR_EXT_cocoa_window_binding`.
+Opt into `XR_DXR_display_info` for display dimensions, eye-tracking modes, and the data needed for asymmetric (Kooima) projection. The header is published at `github.com/DisplayXR/displayxr-extensions` and frozen at v12. For window binding (passing your HWND or NSView to the runtime so it can composit into your window), use `XR_DXR_win32_window_binding` or `XR_DXR_cocoa_window_binding`.
 
 **Q: Does my app need to know whether a workspace controller is installed?**
 No. The runtime serves apps the same way whether the user is running the bare runtime, the DisplayXR Shell, or a third-party controller. Apps in a workspace get composited as one of N tiles; apps without a workspace render full-screen. From the app's perspective, OpenXR's session-state machine drives both cases identically.
@@ -71,7 +71,7 @@ Three reasonable configurations:
 
 - **Bare runtime.** Ship the DisplayXR runtime plus the relevant display-vendor DP. End users get OpenXR + WebXR support out of the box; no spatial desktop. Lightest install. Best for products where the 3D display is one feature among many and you don't want to define a new desktop UX.
 - **Runtime + reference shell.** Bundle the DisplayXR Shell from the DisplayXR project as your spatial-desktop layer. Brand the tray label via a sidecar manifest. Quickest path to a polished spatial-desktop experience without writing UX code.
-- **Runtime + custom controller.** Write your own workspace controller against `XR_EXT_spatial_workspace` and `XR_EXT_app_launcher`. Differentiate your product line with a branded launcher, layout presets tailored to your form factor, custom chrome. Your controller gets the same first-class authentication as the reference shell.
+- **Runtime + custom controller.** Write your own workspace controller against `XR_DXR_spatial_workspace` and `XR_EXT_app_launcher`. Differentiate your product line with a branded launcher, layout presets tailored to your form factor, custom chrome. Your controller gets the same first-class authentication as the reference shell.
 
 **Q: Can I bundle the DisplayXR Shell with my product?**
 Yes. The shell is distributed as a separate, redistributable binary. Bundle it with your installer or offer it as an optional download. Branding via the sidecar manifest (`display_name`, `vendor`, `icon_path`) means the tray UI carries your product name without any runtime modification.
@@ -91,7 +91,7 @@ The runtime authenticates workspace activation by **orchestrator-PID match**: th
 Yes. Run the bare runtime + your application. The runtime gives you OpenXR session management, native compositing, and display calibration. You skip the multi-app, windowing, and launcher complexity. This is the "kiosk" configuration.
 
 **Q: I want a focused experience but with multi-app composition for my vertical (e.g., a medical imaging suite that runs imaging + chart + reference apps side-by-side). Can I write a controller for just that?**
-Yes. A workspace controller is just a process that implements `XR_EXT_spatial_workspace` to define how it tiles and composites apps. Write a controller that hardcodes the layout your vertical needs. You keep full control of the UX without having to also implement a runtime.
+Yes. A workspace controller is just a process that implements `XR_DXR_spatial_workspace` to define how it tiles and composites apps. Write a controller that hardcodes the layout your vertical needs. You keep full control of the UX without having to also implement a runtime.
 
 **Q: Can I distribute my controller as a closed binary?**
 Yes. The runtime ships under BSL-1.0; the extension headers are open. Your controller can be any license, any distribution model. The DisplayXR Shell is itself a closed-source proprietary product — it's the first proof point that the runtime supports closed controllers as first-class citizens.
@@ -111,7 +111,7 @@ The conformance / state-tracker / extension-dispatch infrastructure in Monado re
 Runtime + bridge + extension headers: BSL-1.0 (permissive, similar to MIT). Reference DisplayXR Shell: proprietary, distributed separately. Third-party workspace controllers: any license the author chooses. The platform is permissively licensed by design — companies need to be able to ship runtime + bridge as part of their hardware product without legal review on every build.
 
 **Q: What's on the near-term roadmap?**
-- **Phase 2.A–2.H** (in progress): migrate launcher / chrome / capture / hit-test policy out of the runtime's compositor and into the workspace controller process, behind the as-yet-finalizing `XR_EXT_spatial_workspace.h` / `XR_EXT_app_launcher.h` headers.
+- **Phase 2.A–2.H** (in progress): migrate launcher / chrome / capture / hit-test policy out of the runtime's compositor and into the workspace controller process, behind the as-yet-finalizing `XR_DXR_spatial_workspace.h` / `XR_EXT_app_launcher.h` headers.
 - **Phase 3**: separate the shell repo from the runtime repo entirely. After Phase 3, the shell is just one of N possible controllers from a code-locality standpoint, not just from a runtime-policy standpoint.
 - **macOS workspace controller**: Phase 6's spatial shell is Windows-only today. macOS port is on the M6 milestone.
 

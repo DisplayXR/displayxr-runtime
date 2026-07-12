@@ -242,7 +242,7 @@ struct multi_compositor
 	float current_refresh_rate_hz;
 
 	/*!
-	 * Per-session rendering resources for XR_EXT_win32_window_binding.
+	 * Per-session rendering resources for XR_DXR_win32_window_binding.
 	 * When external_window_handle is set, this session renders to its own window.
 	 */
 	struct
@@ -412,7 +412,7 @@ struct multi_compositor
 		bool window_close_exit_sent;
 
 		//! @name Tier-2 deferred window placement (macOS, #59)
-		//! xrSetWorkspaceClientWindowPoseEXT stores the target pixel rect + a
+		//! xrSetWorkspaceClientWindowPoseDXR stores the target pixel rect + a
 		//! request timestamp here; the per-session render thread applies it
 		//! (reposition + drawable resize + swapchain recreate) only once the size
 		//! has settled (~150 ms with no newer pose). A layout glide fires set_pose

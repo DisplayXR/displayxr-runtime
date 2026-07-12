@@ -201,14 +201,14 @@ struct xrt_display_processor_d3d11
 	 * wish semantics per ADR-027 Decision 5).
 	 *
 	 * Stateless in-process contract: the runtime owns the mask texture (the
-	 * staged XR_EXT_local_3d_zone snapshot or the XR_EXT_display_zones wish
+	 * staged XR_DXR_local_3d_zone snapshot or the XR_DXR_display_zones wish
 	 * — R8_UNORM, client-window pixels) and passes an SRV on the session's
 	 * own D3D11 device; the DP samples or copies it DURING this call (the
 	 * immediate context serializes against the runtime's writes), and must
 	 * not hold the SRV past return. @p screen_x/y/w/h anchor the mask's
 	 * pixel space on the panel in physical screen pixels (post-DPI client
 	 * rect). @p seq is the mask CONTENT generation — monotonic, bumped only
-	 * when the published content changes (xrSubmitLocal3DZoneEXT, a wish
+	 * when the published content changes (xrSubmitLocal3DZoneDXR, a wish
 	 * re-raster, an explicit-wish change); publishes carrying the same seq
 	 * differ only in the screen anchor, so a vendor evaluates content
 	 * (downsample, any-nonzero check) once per generation, not per frame.
@@ -353,7 +353,7 @@ struct xrt_display_processor_d3d11
 
 	/*!
 	 * Snap a proposed window rect to the nearest interlace-phase-aligned
-	 * screen position (window-drag phase lock, #625 / XR_EXT_weave). A
+	 * screen position (window-drag phase lock, #625 / XR_DXR_weave). A
 	 * present-owner that moves its own window must keep the woven interlace
 	 * locked to the panel phase as the window travels, or the lenticular
 	 * subpixels shift under the lenses and the 3D collapses into crosstalk

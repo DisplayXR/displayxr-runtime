@@ -123,7 +123,7 @@ Each factory's signature is owned by `xrt_display_processor_<api>.h` and is unch
 
 **Optional DP-vtable extensions a vendor can implement** (appended slots, gated by the DP `struct_size` per ADR-020 — an older plug-in simply doesn't have them):
 - `get_handoff_color_capability` / `set_atlas_encoding` — ADR-021 color contract.
-- `get_local_zone_caps` / `publish_local_zone_mask` / `clear_local_zone_mask` (D3D11, slots 12–14) — the local 2D/3D-zone hardware leg (#224, `docs/roadmap/local-3d-zones.md`): the runtime publishes the authored `XR_EXT_local_3d_zone` mask (R8 SRV + physical-pixel screen anchor, per frame while active) so switchable-lens panels can track per-window 3D. Report `zone_grid = 1×1` to OR-collapse to a global on/off panel — bit-compatible with today's `request_display_mode` arbitration. Caps struct: `xrt_display_zones.h`.
+- `get_local_zone_caps` / `publish_local_zone_mask` / `clear_local_zone_mask` (D3D11, slots 12–14) — the local 2D/3D-zone hardware leg (#224, `docs/roadmap/local-3d-zones.md`): the runtime publishes the authored `XR_DXR_local_3d_zone` mask (R8 SRV + physical-pixel screen anchor, per frame while active) so switchable-lens panels can track per-window 3D. Report `zone_grid = 1×1` to OR-collapse to a global on/off panel — bit-compatible with today's `request_display_mode` arbitration. Caps struct: `xrt_display_zones.h`.
 
 ### `destroy`
 

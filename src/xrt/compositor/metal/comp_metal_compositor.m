@@ -89,7 +89,7 @@ struct comp_metal_swapchain
 
 /*
  *
- * Zone-mask state (XR_EXT_local_3d_zone, #439 Phase 3)
+ * Zone-mask state (XR_DXR_local_3d_zone, #439 Phase 3)
  *
  */
 
@@ -135,7 +135,7 @@ struct comp_metal_compositor
 	//! Render pipeline for atlas layer compositing.
 	id<MTLRenderPipelineState> projection_pipeline;
 
-	//! XR_EXT_display_zones (ADR-027): projection-shader variants with
+	//! XR_DXR_display_zones (ADR-027): projection-shader variants with
 	//! alpha-over blending for zone draws into the atlas, so overlapping
 	//! zones composite in layer-list order instead of overwriting. Mirrors
 	//! D3D11's blend_premul / blend_alpha pair on the same draw site.
@@ -197,7 +197,7 @@ struct comp_metal_compositor
 	//! True if running in offscreen mode (hidden window, no visible UI).
 	bool offscreen;
 
-	//! True if XR_EXT_cocoa_window_binding requested transparent background.
+	//! True if XR_DXR_cocoa_window_binding requested transparent background.
 	//! Drives atlas clear color (alpha=0 vs alpha=1) so per-pixel alpha from
 	//! projection layers reaches the CAMetalLayer + desktop composite.
 	bool transparent_background;
@@ -225,7 +225,7 @@ struct comp_metal_compositor
 	//! Last 3D mode index (for V-key toggle restore).
 	uint32_t last_3d_mode_index;
 
-	//! True if app is legacy (no XR_EXT_display_info) — gates 1/2/3 key mode selection.
+	//! True if app is legacy (no XR_DXR_display_info) — gates 1/2/3 key mode selection.
 	bool legacy_app_tile_scaling;
 
 	//! System devices (for qwerty driver keyboard input).
@@ -259,7 +259,7 @@ struct comp_metal_compositor
 	const struct xrt_system_compositor_info *sys_info;
 
 	/*
-	 * XR_EXT_local_3d_zone consumer state (#439 Phase 3).
+	 * XR_DXR_local_3d_zone consumer state (#439 Phase 3).
 	 */
 
 	//! The active (submitted) explicit zone mask, or NULL. Owned by the
@@ -303,7 +303,7 @@ struct comp_metal_compositor
 	//! visible to out-of-frame readers like get_window_metrics).
 	bool local_2d_last_frame;
 
-	//! XR_EXT_display_zones (ADR-027): true when the current frame's
+	//! XR_DXR_display_zones (ADR-027): true when the current frame's
 	//! accumulator carries XRT_LAYER_ZONE_3D layers (a "zones frame"). In a
 	//! zones frame the canvas output rect, the sticky submitted mask, and
 	//! the implicit-mask-from-Local2D rule are all inert; the effective
@@ -311,7 +311,7 @@ struct comp_metal_compositor
 	//! for metal_effective_canvas); the wish drives the post-weave lerp.
 	bool zones_frame;
 
-	//! Explicit per-frame wish (XrDisplayZonesFrameEndInfoEXT.wishMask) set
+	//! Explicit per-frame wish (XrDisplayZonesFrameEndInfoDXR.wishMask) set
 	//! via comp_metal_compositor_zones_set_frame_wish before commit; NULL =
 	//! auto-derive from the zone rects. Not owned — zone_mask_destroy
 	//! clears any dangling reference.
@@ -348,7 +348,7 @@ struct comp_metal_compositor
 	//! auto raster's dirty-cache lives in wish_rects above).
 	struct comp_metal_zone_mask *zone_frame_wish_last;
 
-	//! XR_EXT_display_zones AUTO wish raster (union of the frame's zone
+	//! XR_DXR_display_zones AUTO wish raster (union of the frame's zone
 	//! rects with a feathered edge), CPU-rasterized like the implicit mask
 	//! but kept separate so the two dirty-caches can never cross-hit.
 	id<MTLTexture> wish_mask_tex;
@@ -388,7 +388,7 @@ metal_swapchain(struct xrt_swapchain *xsc)
 
 //! #439: any active mask — explicit submitted, or implicit from the last
 //! committed frame's Local2D layers — supersedes the canvas output rect.
-//! XR_EXT_display_zones: a zones frame supersedes it the same way (the
+//! XR_DXR_display_zones: a zones frame supersedes it the same way (the
 //! output rect is inert; each zone rect is its own canvas).
 static inline bool
 metal_mask_is_active(struct comp_metal_compositor *c)
@@ -666,7 +666,7 @@ compile_shaders(struct comp_metal_compositor *c)
 		}
 	}
 
-	// Zone alpha-over pipelines (XR_EXT_display_zones, ADR-027): the same
+	// Zone alpha-over pipelines (XR_DXR_display_zones, ADR-027): the same
 	// projection shaders + depth attachment, but with "over" blending so
 	// overlapping zones composite in layer-list order (the no-blend rationale
 	// above protects full-canvas projection alpha passthrough; zone draws are
@@ -1448,7 +1448,7 @@ metal_compositor_layer_quad(struct xrt_compositor *xc,
 }
 
 /*!
- * Window-space layer (XR_EXT_win32_window_binding). Positioned in fractional
+ * Window-space layer (XR_DXR_win32_window_binding). Positioned in fractional
  * window coordinates with per-eye horizontal disparity shift. Mirrors
  * d3d11_compositor_layer_window_space — here we just accumulate; rendering
  * happens later in the per-tile pass (search for `XRT_LAYER_WINDOW_SPACE`
@@ -1466,7 +1466,7 @@ metal_compositor_layer_window_space(struct xrt_compositor *xc,
 }
 
 /*!
- * Local-2D layer (XR_EXT_local_3d_zone v3, #439 Phase 3). Post-weave 2D
+ * Local-2D layer (XR_DXR_local_3d_zone v3, #439 Phase 3). Post-weave 2D
  * content at a client-window pixel rect, mask-gated. Here we just
  * accumulate; the Metal consumer (flatten + masked composite) runs in
  * layer_commit — search for `XRT_LAYER_LOCAL_2D` in this file.
@@ -1483,7 +1483,7 @@ metal_compositor_layer_local_2d(struct xrt_compositor *xc,
 }
 
 /*!
- * 3D display zone layer (XR_EXT_display_zones, ADR-027) — multi-swapchain
+ * 3D display zone layer (XR_DXR_display_zones, ADR-027) — multi-swapchain
  * accumulate like projection; consumed by the zones-frame branch of
  * layer_commit (zone rect scaled into the window-spanning atlas tile).
  */
@@ -1817,7 +1817,7 @@ metal_window_backing_dims(struct comp_metal_compositor *c,
 /*!
  * #439 Phase 2 rule, uniform across explicit and implicit masks: while a
  * mask is active the effective canvas is the client-window rect (top-left
- * anchored), regardless of any xrSetSharedTextureOutputRectEXT call.
+ * anchored), regardless of any xrSetSharedTextureOutputRectDXR call.
  * Mirrors d3d11_effective_canvas.
  */
 static struct u_canvas_rect
@@ -1925,7 +1925,7 @@ metal_update_implicit_mask(struct comp_metal_compositor *c,
 }
 
 /*!
- * XR_EXT_display_zones (ADR-027) — (re)rasterize the AUTO wish: union of the
+ * XR_DXR_display_zones (ADR-027) — (re)rasterize the AUTO wish: union of the
  * frame's zone rects with an INWARD feathered edge: M=0 outside the zones;
  * inside each zone M ramps 0->1 over the first 16 px from the edge, so the
  * visual lerp fades zone content toward TRANSPARENT at the edge (never
@@ -2366,7 +2366,7 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 		}
 	}
 
-	// XR_EXT_display_zones: a zones frame ALWAYS runs the composite (the
+	// XR_DXR_display_zones: a zones frame ALWAYS runs the composite (the
 	// feathered wish edge lerps the weave toward the 2D flatten even with
 	// zero Local2D layers); the sticky mask + implicit-mask rules are inert.
 	const bool zones_frame = c->zones_frame;
@@ -2374,7 +2374,7 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 	// Step 2 — resolve the frame's mask. Zones frame: the WISH — the
 	// explicit frame wish (referenced-at-frame-end: re-upload the CURRENT
 	// authored bytes, mirroring zone_mask_submit's replaceRegion body, so
-	// no xrSubmitLocal3DZoneEXT is required) or the auto feathered raster
+	// no xrSubmitLocal3DZoneDXR is required) or the auto feathered raster
 	// from the zone rects.
 	id<MTLTexture> mask_tex = nil;
 	if (zones_frame && c->frame_wish != NULL && c->frame_wish->tex != nil &&
@@ -2456,7 +2456,7 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 
 		// Flatten the OVER Local2D layers in layer-list (accumulation) order.
 		// #491 part 3: under-layers (before the projection) are the DP backdrop
-		// and are skipped here. XR_EXT_display_zones: zones frames have no
+		// and are skipped here. XR_DXR_display_zones: zones frames have no
 		// under/over split (2D-under reserved in v1) — every Local2D layer
 		// flattens as 2D-over.
 		for (uint32_t i = 0; have_local_2d && i < c->layer_accum.layer_count; i++) {
@@ -2514,7 +2514,7 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 		// #491: the implicit (auto) Local2D mask composites the 2D over the
 		// weave by its own premultiplied alpha (translucent 2D reveals the 3D
 		// scene). The explicit authored mask keeps the hard M-lerp.
-		// XR_EXT_display_zones: zones frames are ALWAYS the hard M-lerp
+		// XR_DXR_display_zones: zones frames are ALWAYS the hard M-lerp
 		// (final = M·weave + (1−M)·flatten(2D-over)) — composition follows
 		// zone geometry + the wish, never the #491 alpha-over rule.
 		const bool have_explicit =
@@ -2731,7 +2731,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// rect, Q3), supersedes the canvas output rect: the weave spans the
 	// client window and the mask is the sole 2D/3D selector (Phase-2 rule,
 	// uniform — no third state).
-	// XR_EXT_display_zones: the zones-frame flag is resolved in the same
+	// XR_DXR_display_zones: the zones-frame flag is resolved in the same
 	// scan (one coherent per-frame decision); zones frames count as
 	// mask_active so metal_effective_canvas returns the full client window
 	// (the output rect is inert).
@@ -2749,7 +2749,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	c->local_2d_last_frame = have_local_2d;
 	c->zones_frame = zones_frame;
 
-	// XR_EXT_display_zones hardware leg (P4). Zone-capable DP: the per-frame
+	// XR_DXR_display_zones hardware leg (P4). Zone-capable DP: the per-frame
 	// wish publish at the end of this commit drives the per-region switch —
 	// skip the global fallback. Legacy DP (no zone slots): tier-1 fallback —
 	// "any zone active => request 3D" once on the rising edge, no forced 2D
@@ -2882,7 +2882,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// projection-layer alpha=0 regions propagate through sim_display
 		// alpha-native to the CAMetalLayer (isOpaque=NO) → desktop composite.
 		// Otherwise clear to opaque black.
-		// XR_EXT_display_zones (ADR-027): a zones frame composes N placed
+		// XR_DXR_display_zones (ADR-027): a zones frame composes N placed
 		// zone layers into the window-spanning atlas — the unzoned area
 		// must weave to nothing (transparent) so the feathered wish edge
 		// blends toward the desktop.
@@ -2896,7 +2896,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 		id<MTLRenderCommandEncoder> encoder = [cmd_buf renderCommandEncoderWithDescriptor:pass];
 
-		// XR_EXT_display_zones: zone rects are client-window px and the
+		// XR_DXR_display_zones: zone rects are client-window px and the
 		// tile spans the full window in zones frames, so the zone scale
 		// target is the effective canvas (= the window; mask_active
 		// includes zones frames), falling back to the output dims.
@@ -2912,7 +2912,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			}
 		}
 
-		// Render each projection / zone layer (XR_EXT_display_zones: zone
+		// Render each projection / zone layer (XR_DXR_display_zones: zone
 		// layers blit through the same pass at a sub-tile viewport).
 		for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 			struct comp_layer *layer = &c->layer_accum.layers[i];
@@ -3059,7 +3059,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					vp.height = atlas_view_h;
 				}
 				if (is_zone) {
-					// XR_EXT_display_zones: scale the zone rect
+					// XR_DXR_display_zones: scale the zone rect
 					// (client-window px, top-left — same orientation
 					// as Metal textures) into the tile box; in zones
 					// frames the tile spans the full window, so
@@ -3176,7 +3176,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			encoder = [cmd_buf renderCommandEncoderWithDescriptor:ws_pass];
 		}
 
-		// Window-space layers (XR_EXT_win32_window_binding) — drawn into
+		// Window-space layers (XR_DXR_win32_window_binding) — drawn into
 		// each per-eye tile of the atlas with horizontal disparity shift,
 		// so the display processor weaves them in stereo just like projection
 		// content. Mirrors d3d11_compositor_layer_window_space + the renderer
@@ -3597,7 +3597,7 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	// zone_mask_destroy before the session compositor goes away) — only
 	// drop the borrow here.
 	c->zone_mask_active = NULL;
-	// XR_EXT_display_zones: drop the frame-wish borrow + auto-wish raster
+	// XR_DXR_display_zones: drop the frame-wish borrow + auto-wish raster
 	// (+ the P4 publish-source borrow).
 	c->frame_wish = NULL;
 	c->zone_frame_wish_last = NULL;
@@ -3729,7 +3729,7 @@ comp_metal_swapchain_get_texture(struct xrt_swapchain *xsc, uint32_t index)
 
 /*
  *
- * XR_EXT_local_3d_zone — zone-mask entry points (#439 Phase 3)
+ * XR_DXR_local_3d_zone — zone-mask entry points (#439 Phase 3)
  *
  * Tier 1/2 author into the CPU-canonical buffer; submit uploads to the
  * R8Unorm texture (sticky, last-submit-wins). All entry points take the
@@ -3850,7 +3850,7 @@ xrt_result_t
 comp_metal_compositor_zone_mask_acquire_rt(
     struct xrt_compositor *xc, void *mask_ptr, void **out_rt, uint32_t *out_w, uint32_t *out_h)
 {
-	// No Metal Tier-3 binding type in XR_EXT_local_3d_zone v3 — oxr maps
+	// No Metal Tier-3 binding type in XR_DXR_local_3d_zone v3 — oxr maps
 	// this to XR_ERROR_FEATURE_UNSUPPORTED.
 	(void)xc;
 	(void)mask_ptr;
@@ -3897,7 +3897,7 @@ comp_metal_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_pt
 		// Reverts to the rect-derived behavior on the next frame.
 		c->zone_mask_active = NULL;
 	}
-	// XR_EXT_display_zones: never leave a dangling frame-wish reference.
+	// XR_DXR_display_zones: never leave a dangling frame-wish reference.
 	if (c->frame_wish == mask) {
 		c->frame_wish = NULL;
 	}
@@ -3921,7 +3921,7 @@ comp_metal_compositor_zones_set_frame_wish(struct xrt_compositor *xc, void *mask
 {
 	struct comp_metal_compositor *c = metal_comp(xc);
 
-	// Per-frame reference (XR_EXT_display_zones): oxr sets this on every
+	// Per-frame reference (XR_DXR_display_zones): oxr sets this on every
 	// zones frame before layer_commit, NULL meaning auto-derive. Consumed
 	// by the commit's composite; harmlessly stale on zero-zone frames (the
 	// zones branch never reads it there).

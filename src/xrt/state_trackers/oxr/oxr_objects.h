@@ -136,7 +136,7 @@ struct oxr_local_3d_zone_ext;
 #define XRT_MAX_HANDLE_CHILDREN 256
 #define OXR_MAX_BINDINGS_PER_ACTION 32
 
-//! XR_EXT_display_zones: max zone-chained projection layers per frame
+//! XR_DXR_display_zones: max zone-chained projection layers per frame
 //! (ADR-027 — plugin-independent, compositor-side assembly).
 #define OXR_DISPLAY_ZONES_MAX_ZONES_3D 8
 
@@ -414,18 +414,18 @@ oxr_plane_detector_to_openxr(struct oxr_plane_detector_ext *plane_detector)
 }
 #endif // OXR_HAVE_EXT_plane_detection
 
-#ifdef OXR_HAVE_EXT_local_3d_zone
+#ifdef OXR_HAVE_DXR_local_3d_zone
 /*!
  * To go back to a OpenXR object.
  *
  * @relates oxr_local_3d_zone_ext
  */
-static inline XrLocal3DZoneMaskEXT
+static inline XrLocal3DZoneMaskDXR
 oxr_local_3d_zone_to_openxr(struct oxr_local_3d_zone_ext *zone)
 {
-	return XRT_CAST_PTR_TO_OXR_HANDLE(XrLocal3DZoneMaskEXT, zone);
+	return XRT_CAST_PTR_TO_OXR_HANDLE(XrLocal3DZoneMaskDXR, zone);
 }
-#endif // OXR_HAVE_EXT_local_3d_zone
+#endif // OXR_HAVE_DXR_local_3d_zone
 
 /*!
  * To go back to a OpenXR object.
@@ -929,7 +929,7 @@ oxr_session_end(struct oxr_logger *log, struct oxr_session *sess);
 XrResult
 oxr_session_request_exit(struct oxr_logger *log, struct oxr_session *sess);
 
-#ifdef OXR_HAVE_EXT_display_info
+#ifdef OXR_HAVE_DXR_display_info
 /*!
  * Request display mode switch (2D/3D).
  */
@@ -956,9 +956,9 @@ void
 oxr_session_set_eye_tracking_mode(struct oxr_session *sess, uint32_t mode);
 #endif
 
-#ifdef OXR_HAVE_EXT_view_rig
+#ifdef OXR_HAVE_DXR_view_rig
 /*!
- * XR_EXT_view_rig (#396 W7): parse + clamp a workspace-controller rig override
+ * XR_DXR_view_rig (#396 W7): parse + clamp a workspace-controller rig override
  * (NULL clears) and push it to the system compositor. Caller must already have
  * verified the session is the active workspace controller.
  */
@@ -1287,11 +1287,11 @@ XrResult
 oxr_event_push_XrEventDataEyeTrackingStateChanged(struct oxr_logger *log,
                                                   struct oxr_session *sess,
                                                   XrBool32 isTracking,
-                                                  XrEyeTrackingModeEXT activeMode);
+                                                  XrEyeTrackingModeDXR activeMode);
 
-#ifdef OXR_HAVE_EXT_local_3d_zone
+#ifdef OXR_HAVE_DXR_local_3d_zone
 /*!
- * Push an `XrEventDataLocal3DZoneViewSizeChangedEXT` onto the instance event
+ * Push an `XrEventDataLocal3DZoneViewSizeChangedDXR` onto the instance event
  * queue (#439 Phase 3 Q4). Fired from the frame-end poll when the
  * compositor's recommended per-view render size changes (mask activation /
  * deactivation / window resize); the app should recreate its projection
@@ -1303,15 +1303,15 @@ oxr_event_push_XrEventDataLocal3DZoneViewSizeChanged(struct oxr_logger *log,
                                                      struct oxr_session *sess,
                                                      uint32_t recommendedImageRectWidth,
                                                      uint32_t recommendedImageRectHeight);
-#endif // OXR_HAVE_EXT_local_3d_zone
+#endif // OXR_HAVE_DXR_local_3d_zone
 
-#ifdef OXR_HAVE_EXT_workspace_file_dialog
+#ifdef OXR_HAVE_DXR_workspace_file_dialog
 /*!
- * Push an `XrEventDataFilePickerCompleteEXT` onto the instance event queue.
+ * Push an `XrEventDataFilePickerCompleteDXR` onto the instance event queue.
  *
  * Caller passes the originating session (used by `is_session_link_to_event`
  * to route the event back to the requester on xrPollEvent), the
- * monotonic request ID the runtime returned from `xrRequestFilePickerEXT`,
+ * monotonic request ID the runtime returned from `xrRequestFilePickerDXR`,
  * the completion outcome, and the picked path (UTF-8, NUL-terminated).
  *
  * `path` may be NULL or empty for non-SUCCESS outcomes; in those cases
@@ -1320,19 +1320,19 @@ oxr_event_push_XrEventDataLocal3DZoneViewSizeChanged(struct oxr_logger *log,
 XrResult
 oxr_event_push_XrEventDataFilePickerComplete(struct oxr_logger *log,
                                               struct oxr_session *sess,
-                                              XrAsyncRequestIdEXT requestId,
-                                              XrFilePickerResultEXT result,
+                                              XrAsyncRequestIdDXR requestId,
+                                              XrFilePickerResultDXR result,
                                               const char *path);
-#endif // OXR_HAVE_EXT_workspace_file_dialog
+#endif // OXR_HAVE_DXR_workspace_file_dialog
 
-#ifdef OXR_HAVE_EXT_mcp_tools
+#ifdef OXR_HAVE_DXR_mcp_tools
 /*!
- * Push an `XrEventDataMCPToolCallEXT` onto the instance event queue.
+ * Push an `XrEventDataMCPToolCallDXR` onto the instance event queue.
  *
  * Called by the MCP app-tool trampoline (oxr_mcp_app_tools.c) when an
  * agent invokes an app-registered tool; the app fetches the args via
- * `xrGetMCPToolCallArgsEXT(callId)` and answers with
- * `xrSubmitMCPToolResultEXT`.
+ * `xrGetMCPToolCallArgsDXR(callId)` and answers with
+ * `xrSubmitMCPToolResultDXR`.
  */
 XrResult
 oxr_event_push_XrEventDataMCPToolCall(struct oxr_logger *log,
@@ -1343,12 +1343,12 @@ oxr_event_push_XrEventDataMCPToolCall(struct oxr_logger *log,
 
 /*!
  * Unregister every app tool the session registered via
- * `xrRegisterMCPToolEXT` and fail its pending tool calls. Called from
+ * `xrRegisterMCPToolDXR` and fail its pending tool calls. Called from
  * session destroy. Implemented in oxr_mcp_app_tools.c.
  */
 void
 oxr_mcp_app_tools_session_destroy(struct oxr_session *sess);
-#endif // OXR_HAVE_EXT_mcp_tools
+#endif // OXR_HAVE_DXR_mcp_tools
 
 #ifdef OXR_HAVE_FB_display_refresh_rate
 XrResult
@@ -2161,7 +2161,7 @@ struct oxr_instance
 	bool debug_bindings;
 
 	//! True while some session is the active workspace controller (shell). The
-	//! "workspace owns the display mode" gate in xrRequestDisplayRenderingModeEXT /
+	//! "workspace owns the display mode" gate in xrRequestDisplayRenderingModeDXR /
 	//! the isRequestable enumeration only applies when a workspace is actually
 	//! managing — single-app out-of-process (no controller) lets the lone app
 	//! request modes itself. Set/cleared in xrActivate/DeactivateSpatialWorkspaceEXT.
@@ -2177,17 +2177,17 @@ struct oxr_instance
 };
 
 /*!
- * Which rig descriptor a session chained via XR_EXT_view_rig (#396 W7).
+ * Which rig descriptor a session chained via XR_DXR_view_rig (#396 W7).
  */
 enum oxr_view_rig_type
 {
 	OXR_VIEW_RIG_NONE = 0,    //!< nothing chained — default behavior (qwerty/forcing)
-	OXR_VIEW_RIG_DISPLAY = 1, //!< XrDisplayRigEXT
-	OXR_VIEW_RIG_CAMERA = 2,  //!< XrCameraRigEXT
+	OXR_VIEW_RIG_DISPLAY = 1, //!< XrDisplayRigDXR
+	OXR_VIEW_RIG_CAMERA = 2,  //!< XrCameraRigDXR
 };
 
 /*!
- * Per-session view-rig state for XR_EXT_view_rig (#396 W7).
+ * Per-session view-rig state for XR_DXR_view_rig (#396 W7).
  *
  * The rig drives the view math only on locates that chain a descriptor
  * (per-locate, not sticky — non-chained locates keep the default behavior,
@@ -2209,7 +2209,7 @@ struct oxr_view_rig_state
 	// Camera-rig tunables.
 	float inv_convergence_distance;
 	float half_tan_vfov;
-	float m2v; //!< meters→world scale on the eye (XrCameraRigEXT::metersToVirtual; 0/unset → 1.0)
+	float m2v; //!< meters→world scale on the eye (XrCameraRigDXR::metersToVirtual; 0/unset → 1.0)
 
 	// Shared tunables.
 	float ipd_factor;
@@ -2316,23 +2316,23 @@ struct oxr_session
 	//! True if using GL native compositor (not multi_compositor).
 	bool is_gl_native_compositor;
 
-	//! True if session was created with an external window handle (XR_EXT_win32_window_binding).
+	//! True if session was created with an external window handle (XR_DXR_win32_window_binding).
 	bool has_external_window;
 
-	//! True if this is a headless bridge-relay session (XR_EXT_display_info +
+	//! True if this is a headless bridge-relay session (XR_DXR_display_info +
 	//! XR_MND_headless). The bridge forwards raw DP-tracked eye positions to
 	//! a browser-side app, which renders via a separate Chrome session; treat
 	//! view poses like a handle app (display-local, no world_head_pos offset).
 	bool is_bridge_relay;
 
-	//! XR_EXT_view_rig (#396 W7): per-session rig parse state. A rig chained
+	//! XR_DXR_view_rig (#396 W7): per-session rig parse state. A rig chained
 	//! on a locate drives the view math for that locate (lifting the
 	//! external-window display-centric forcing); locates that chain nothing
 	//! keep the default behavior exactly.
 	struct oxr_view_rig_state view_rig;
 
-#ifdef OXR_HAVE_EXT_display_zones
-	//! XR_EXT_display_zones (ADR-027): per-session zone bookkeeping. The
+#ifdef OXR_HAVE_DXR_display_zones
+	//! XR_DXR_display_zones (ADR-027): per-session zone bookkeeping. The
 	//! located[] ring records recent zone-scoped locates for the
 	//! VALIDATE_BIT locate<->submit cross-checks (approximate, one-shot
 	//! WARNs only); the warned_* latches keep every diagnostic one-shot
@@ -2355,11 +2355,11 @@ struct oxr_session
 	} display_zones;
 #endif
 
-#ifdef OXR_HAVE_EXT_weave
-	//! XR_EXT_weave (#625): per-session weave-service bookkeeping. The weaved
+#ifdef OXR_HAVE_DXR_weave
+	//! XR_DXR_weave (#625): per-session weave-service bookkeeping. The weaved
 	//! output texture + fence are runtime-allocated and persistent (re-used
 	//! across frames), so their shared HANDLEs are handed to the caller ONCE —
-	//! on the first xrWeaveSubmitEXT and again whenever the output is
+	//! on the first xrWeaveSubmitDXR and again whenever the output is
 	//! re-allocated (window resize → dims change). @c exported latches the
 	//! one-shot; @c last_w/last_h detect the resize re-export.
 	struct
@@ -2370,11 +2370,11 @@ struct oxr_session
 	} weave;
 #endif
 
-	//! True if this session has successfully called xrActivateSpatialWorkspaceEXT
+	//! True if this session has successfully called xrActivateSpatialWorkspaceDXR
 	//! and is currently the active workspace controller (#234).
 	//! Workspace controllers are graphics-bound IPC sessions (typically the
 	//! shell process rendering its own chrome), so `compositor != NULL`.
-	//! The original `xrRequestDisplayRenderingModeEXT` gate exempts headless
+	//! The original `xrRequestDisplayRenderingModeDXR` gate exempts headless
 	//! sessions via `compositor == NULL` — that misses graphics-bound
 	//! controllers like the shell. This flag distinguishes them so they keep
 	//! their legitimate mode authority. Set in oxr_xrActivateSpatialWorkspaceEXT;
@@ -2389,7 +2389,7 @@ struct oxr_session
 
 	//! Last derived isTracking value (#441): -1 = no sample yet, else 0/1.
 	//! Edge detection in the xrLocateViews path pushes
-	//! XrEventDataEyeTrackingStateChangedEXT on change.
+	//! XrEventDataEyeTrackingStateChangedDXR on change.
 	int32_t last_is_tracking;
 
 	//! Cached rendering mode index for detecting compositor-driven mode changes.
@@ -2397,7 +2397,7 @@ struct oxr_session
 
 	//! Last recommended per-view render size polled at frame end (#439
 	//! Phase 3 Q4): 0 = no sample yet (baseline set without firing), else
-	//! edge detection pushes XrEventDataLocal3DZoneViewSizeChangedEXT.
+	//! edge detection pushes XrEventDataLocal3DZoneViewSizeChangedDXR.
 	uint32_t last_local2d_view_w;
 	uint32_t last_local2d_view_h;
 
@@ -3591,7 +3591,7 @@ struct oxr_plane_detector_ext
 };
 #endif // OXR_HAVE_EXT_plane_detection
 
-#ifdef OXR_HAVE_EXT_local_3d_zone
+#ifdef OXR_HAVE_DXR_local_3d_zone
 /*!
  * A local-3D-zone mask: a per-pixel scalar "3D-ness" channel the app authors
  * (whole window / rect list / freeform RT) and the compositor consumes for
@@ -3599,7 +3599,7 @@ struct oxr_plane_detector_ext
  *
  * Parent type/handle is @ref oxr_session
  *
- * @obj{XrLocal3DZoneMaskEXT}
+ * @obj{XrLocal3DZoneMaskDXR}
  * @extends oxr_handle_base
  */
 struct oxr_local_3d_zone_ext
@@ -3618,7 +3618,7 @@ struct oxr_local_3d_zone_ext
 	//! + views); created/destroyed via comp_*_zone_mask_create/_destroy.
 	void *comp_mask;
 };
-#endif // OXR_HAVE_EXT_local_3d_zone
+#endif // OXR_HAVE_DXR_local_3d_zone
 
 
 #ifdef OXR_HAVE_EXT_user_presence

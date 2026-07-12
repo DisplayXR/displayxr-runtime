@@ -5,7 +5,7 @@
  * @brief  Holds D3D11 native compositor specific session functions.
  *
  * This file provides session integration for the D3D11 native compositor
- * that bypasses Vulkan entirely. This is used when XR_EXT_win32_window_binding
+ * that bypasses Vulkan entirely. This is used when XR_DXR_win32_window_binding
  * provides a window handle and the system supports D3D11 native composition.
  *
  * @author David Fattal
@@ -47,7 +47,7 @@ DEBUG_GET_ONCE_BOOL_OPTION(enable_d3d11_native_compositor, "OXR_ENABLE_D3D11_NAT
  * - The OXR_ENABLE_D3D11_NATIVE_COMPOSITOR environment variable is set
  *
  * Window handle is OPTIONAL:
- * - If provided via XR_EXT_win32_window_binding, compositor uses app's window
+ * - If provided via XR_DXR_win32_window_binding, compositor uses app's window
  * - If NULL, compositor creates its own window (for apps like Blender)
  *
  * This bypasses Vulkan entirely and solves interop issues on Intel GPUs.

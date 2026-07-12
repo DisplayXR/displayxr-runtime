@@ -6,7 +6,7 @@ source: "#79"
 # ADR-006: Legacy App Compromise View Scale
 
 ## Context
-Legacy OpenXR apps (no `XR_EXT_display_info`) don't know about rendering modes. They create swapchains once at session start. Need a compromise resolution that works for both 2D (1 view, full res) and 3D (2+ views, scaled).
+Legacy OpenXR apps (no `XR_DXR_display_info`) don't know about rendering modes. They create swapchains once at session start. Need a compromise resolution that works for both 2D (1 view, full res) and 3D (2+ views, scaled).
 
 ## Decision
 For SBS displays (view_count==2, scaleX<=0.5, scaleY<=0.5), report `recommendedViewScale = 0.5x1.0`. App renders half-width tiles. Compositor handles scaling differences between modes. For other configurations, use the 3D mode's actual scale.

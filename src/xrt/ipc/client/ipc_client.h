@@ -199,7 +199,7 @@ comp_ipc_client_compositor_get_transparent_output_fence(struct xrt_compositor *x
                                                         xrt_graphics_sync_handle_t *out_handle);
 
 /*!
- * XR_EXT_weave bridges (#625) — the window-bound synchronous weave service.
+ * XR_DXR_weave bridges (#625) — the window-bound synchronous weave service.
  * The OpenXR state tracker (oxr_weave.c) forward-declares these and the runtime
  * DLL links them; only valid when `xc` is an ipc_client_compositor (service
  * path). The DP weaves server-side (ADR-007 / ADR-019).
@@ -240,7 +240,7 @@ comp_ipc_client_compositor_weave_get_fence(struct xrt_compositor *xc,
                                            xrt_graphics_sync_handle_t *out_handle);
 
 /*!
- * Workspace controller bridges (XR_EXT_spatial_workspace).
+ * Workspace controller bridges (XR_DXR_spatial_workspace).
  *
  * Thin accessors used by the OpenXR state tracker to dispatch workspace
  * extension calls over IPC. Each extracts the underlying ipc_connection from
@@ -267,7 +267,7 @@ xrt_result_t
 comp_ipc_client_compositor_session_set_modal_state(struct xrt_compositor *xc, bool is_open);
 
 /*!
- * XR_EXT_workspace_file_dialog Tier 1: app-side `xrRequestFilePickerEXT`
+ * XR_DXR_workspace_file_dialog Tier 1: app-side `xrRequestFilePickerDXR`
  * dispatches here. The runtime forwards the (info) struct to the active
  * workspace controller and returns a monotonic 64-bit request_id; the
  * eventual completion is delivered through the session event channel as
@@ -282,7 +282,7 @@ comp_ipc_client_compositor_session_request_file_picker(struct xrt_compositor *xc
 
 /*!
  * Controller-only: read the picker info for a pending request by id.
- * Backs xrGetFilePickerRequestEXT.
+ * Backs xrGetFilePickerRequestDXR.
  */
 xrt_result_t
 comp_ipc_client_compositor_workspace_get_file_picker_request(struct xrt_compositor *xc,
@@ -292,7 +292,7 @@ comp_ipc_client_compositor_workspace_get_file_picker_request(struct xrt_composit
                                                              struct ipc_file_picker_info *out_info);
 
 /*!
- * Controller-only: deliver a picker result. Backs xrCompleteFilePickerEXT.
+ * Controller-only: deliver a picker result. Backs xrCompleteFilePickerDXR.
  */
 xrt_result_t
 comp_ipc_client_compositor_workspace_file_dialog_result(struct xrt_compositor *xc,
@@ -374,7 +374,7 @@ comp_ipc_client_compositor_workspace_pointer_capture_set(struct xrt_compositor *
  *
  * Bridge accepts raw fields (matching the wire-format struct ipc_capture_request
  * input + ipc_capture_result output) so st_oxr does not see IPC types. The state
- * tracker translates between public XrWorkspaceCaptureRequestEXT/ResultEXT and
+ * tracker translates between public XrWorkspaceCaptureRequestDXR/ResultEXT and
  * these primitives.
  */
 xrt_result_t
@@ -395,7 +395,7 @@ comp_ipc_client_compositor_workspace_capture_frame(struct xrt_compositor *xc,
                                                    float out_eye_right_m[3]);
 
 /*!
- * XR_EXT_view_rig over IPC (#396 W7): per-locate rig-driven view computation
+ * XR_DXR_view_rig over IPC (#396 W7): per-locate rig-driven view computation
  * + raw-inputs fetch for one xrLocateViews call on an IPC session. The
  * caller (oxr_session.c) includes shared/ipc_protocol.h for the wire structs
  * (precedent: oxr_capture.c / oxr_workspace.c). Strictly per-locate — the
@@ -409,10 +409,10 @@ comp_ipc_client_compositor_locate_views_rig(struct xrt_compositor *xc,
                                             struct ipc_info_locate_views_rig *out_info);
 
 /*!
- * XR_EXT_view_rig over IPC (#396 W7), bridge-relay variant: same per-locate
+ * XR_DXR_view_rig over IPC (#396 W7), bridge-relay variant: same per-locate
  * rig/raw fetch as comp_ipc_client_compositor_locate_views_rig, but keyed off
  * the system compositor instead of a per-session native compositor. Headless
- * bridge-relay sessions (XR_MND_headless + XR_EXT_display_info) have no xcn,
+ * bridge-relay sessions (XR_MND_headless + XR_DXR_display_info) have no xcn,
  * yet still hold sess->sys->xsysc — the conduit to the IPC connection. Only
  * valid when xsysc->info.is_service_mode (the IPC client variant); returns
  * XRT_ERROR_IPC_FAILURE otherwise.
@@ -437,7 +437,7 @@ comp_ipc_client_compositor_workspace_enumerate_clients(struct xrt_compositor *xc
 /*!
  * Phase 2.I-prequel: per-client metadata. Bridge unpacks struct ipc_app_state
  * into raw out-params so st_oxr stays free of IPC types. The state tracker
- * projects these into XrWorkspaceClientInfoEXT.
+ * projects these into XrWorkspaceClientInfoDXR.
  */
 xrt_result_t
 comp_ipc_client_compositor_workspace_get_client_info(struct xrt_compositor *xc,
@@ -450,7 +450,7 @@ comp_ipc_client_compositor_workspace_get_client_info(struct xrt_compositor *xc,
                                                      bool *out_is_visible);
 
 /*!
- * Modal input grab bridge (XR_EXT_spatial_workspace, spec_version 18).
+ * Modal input grab bridge (XR_DXR_spatial_workspace, spec_version 18).
  *
  * Same gating contract as the workspace_* family — only valid when `xc` is
  * an ipc_client_compositor. The state tracker forward-declares this and
@@ -460,7 +460,7 @@ xrt_result_t
 comp_ipc_client_compositor_workspace_set_input_grab(struct xrt_compositor *xc, bool grab);
 
 /*!
- * Per-frame cursor depth bridge (XR_EXT_spatial_workspace, spec_version 22;
+ * Per-frame cursor depth bridge (XR_DXR_spatial_workspace, spec_version 22;
  * dim_factor added in spec_version 23).
  *
  * Same gating contract as the workspace_* family. The controller owns the

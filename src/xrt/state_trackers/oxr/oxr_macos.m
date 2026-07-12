@@ -154,7 +154,7 @@ oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count, struct xrt
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 		// Poll for direct rendering mode change (1/2/3 keys via qwerty driver).
-		// Legacy apps (no XR_EXT_display_info) only support V toggle between
+		// Legacy apps (no XR_DXR_display_info) only support V toggle between
 		// mode 0 (2D) and mode 1 (default 3D) — skip direct mode selection.
 		if (!legacy_app && xdevs != NULL && xdev_count > 0 && head != NULL) {
 			int render_mode = -1;

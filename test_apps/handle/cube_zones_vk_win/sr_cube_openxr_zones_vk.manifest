@@ -6,7 +6,7 @@
     name="DisplayXR.CubeZonesVK"
     type="win32"
   />
-  <description>DisplayXR Cube Zones Vulkan Test Application (XR_EXT_display_zones, array/SPI layout)</description>
+  <description>DisplayXR Cube Zones Vulkan Test Application (XR_DXR_display_zones, array/SPI layout)</description>
 
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
     <application>

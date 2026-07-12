@@ -51,7 +51,7 @@ A third option — `application_name` allowlist — is rejected. It re-creates t
 ### Combined decision tree
 
 ```
-xrActivateSpatialWorkspaceEXT called
+xrActivateSpatialWorkspaceDXR called
         │
         ├── Another workspace already active? ──── yes ──► XR_ERROR_LIMIT_REACHED
         │                                          no
@@ -159,7 +159,7 @@ This finally removes the literal `"displayxr-shell"` string from the runtime —
 
 ### 5. Tell the workspace controller it was authorized
 
-Adds nothing on the controller side — `xrActivateSpatialWorkspaceEXT` returning `XR_SUCCESS` is the only signal needed. The controller doesn't need to know whether the runtime checked PID or application_name.
+Adds nothing on the controller side — `xrActivateSpatialWorkspaceDXR` returning `XR_SUCCESS` is the only signal needed. The controller doesn't need to know whether the runtime checked PID or application_name.
 
 ## Error code
 
@@ -182,7 +182,7 @@ Recommend the new vendor error code, defined alongside the extension. Maps inter
 
 **PID reuse.** PIDs are recycled by the OS. An attacker who can predict reuse could in theory connect with a forged PID. Mitigation: the orchestrator holds the spawned process's HANDLE (`s_workspace_pi.hProcess`) for its lifetime, which prevents the OS from immediately reusing the PID. As long as the watchdog is alive and holds the handle, the PID is uniquely ours. (This is a Win32-specific guarantee; macOS port uses an analogous mechanism via process handle.)
 
-**Service-restart race.** If the service restarts but the workspace controller doesn't, the new service has no `s_workspace_pi.dwProcessId`. The still-alive controller calls `xrActivateSpatialWorkspaceEXT` from a previous session, gets PID-mismatch (or zero-expected-PID = manual mode = first-claim wins). Whether the controller is allowed depends on which mode the service started in. Acceptable: workspace controller crashes were already a recovery scenario; workspace will need to be redirected anyway.
+**Service-restart race.** If the service restarts but the workspace controller doesn't, the new service has no `s_workspace_pi.dwProcessId`. The still-alive controller calls `xrActivateSpatialWorkspaceDXR` from a previous session, gets PID-mismatch (or zero-expected-PID = manual mode = first-claim wins). Whether the controller is allowed depends on which mode the service started in. Acceptable: workspace controller crashes were already a recovery scenario; workspace will need to be redirected anyway.
 
 **Multi-user.** Out of scope. The service is single-user-per-session. If multiple users on the same machine each run their own service, each gets their own orchestrator + workspace controller pair, each authoritative within its session.
 

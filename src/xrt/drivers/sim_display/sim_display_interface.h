@@ -98,7 +98,7 @@ sim_display_get_view_count(void);
  * `supported_eye_tracking_modes = 0`, leaves every rendering mode untracked
  * (`mode_flags = 0`), and its DPs report `is_tracking = false`. This toggle
  * re-enables MANUAL_BIT + tracked 3D modes so the MANUAL code path and
- * XrEventDataEyeTrackingStateChangedEXT can be exercised without hardware.
+ * XrEventDataEyeTrackingStateChangedDXR can be exercised without hardware.
  *
  * @return True iff the env toggle is set (cached on first call).
  * @ingroup drv_sim_display

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSL-1.0
 #
 # workspace_minimal_d3d11_win — minimal OpenXR client that exercises
-# XR_EXT_spatial_workspace end-to-end. No rendering; the test creates an
+# XR_DXR_spatial_workspace end-to-end. No rendering; the test creates an
 # instance, resolves the five extension PFNs, and calls activate /
 # add-capture / remove-capture / deactivate. Success path requires the test
 # to be launched under an authorized workspace orchestrator; standalone

@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  XR_EXT_atlas_capture API entry point.
+ * @brief  XR_DXR_atlas_capture API entry point.
  * @author David Fattal
  * @ingroup oxr_api
  *
- * xrCaptureAtlasEXT lets any session snapshot the multi-view atlas the runtime
+ * xrCaptureAtlasDXR lets any session snapshot the multi-view atlas the runtime
  * composes for it, at a caller-selected stage, without the app doing its own
  * GPU readback.
  *
@@ -48,9 +48,9 @@
 // include path (state_trackers/oxr/../../ipc) lets us write "shared/...".
 #include "shared/ipc_protocol.h"
 
-#include <openxr/XR_EXT_atlas_capture.h>
+#include <openxr/XR_DXR_atlas_capture.h>
 
-// enum mcp_capture_mode values; XrAtlasCaptureStageEXT is defined to match.
+// enum mcp_capture_mode values; XrAtlasCaptureStageDXR is defined to match.
 #include <displayxr_mcp/mcp_capture.h>
 
 #include <stdbool.h>
@@ -59,7 +59,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#ifdef OXR_HAVE_EXT_atlas_capture
+#ifdef OXR_HAVE_DXR_atlas_capture
 
 // Forward decl of the IPC-bridge wrapper (defined in ipc_client_compositor.c).
 // st_oxr does not pull the ipc_client include path; the runtime DLL links it so
@@ -106,8 +106,8 @@ session_is_ipc(struct oxr_session *sess)
 static XrResult
 capture_inprocess(struct oxr_logger *log,
                   struct oxr_session *sess,
-                  const XrAtlasCaptureInfoEXT *info,
-                  XrAtlasCaptureResultEXT *result)
+                  const XrAtlasCaptureInfoDXR *info,
+                  XrAtlasCaptureResultDXR *result)
 {
 	// Resolve the active rendering mode's tile layout so the suffix can encode
 	// the atlas geometry (issue #425). This also surfaces tileColumns/tileRows
@@ -132,26 +132,26 @@ capture_inprocess(struct oxr_logger *log,
 	// The runtime appends "_atlas_<viewCount>_<cols>x<rows>.png" so consumers
 	// don't re-derive the multi-view atlas geometry — same suffix the workspace
 	// (IPC) capture path emits.
-	char path[XR_ATLAS_CAPTURE_PATH_MAX_EXT + 32];
+	char path[XR_ATLAS_CAPTURE_PATH_MAX_DXR + 32];
 	int n = snprintf(path, sizeof(path), "%.*s_atlas_%u_%ux%u.png",
-	                 (int)(XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1), info->pathPrefix, view_count, cols, rows);
+	                 (int)(XR_ATLAS_CAPTURE_PATH_MAX_DXR - 1), info->pathPrefix, view_count, cols, rows);
 	if (n <= 0 || (size_t)n >= sizeof(path)) {
-		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "xrCaptureAtlasEXT: path prefix too long");
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "xrCaptureAtlasDXR: path prefix too long");
 	}
 
 	// Stage values are defined to match enum mcp_capture_mode (no translation).
-	uint32_t mode = (info->stage == XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT)
+	uint32_t mode = (info->stage == XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_DXR)
 	                    ? (uint32_t)MCP_CAPTURE_MODE_PROJECTION_ONLY
 	                    : (uint32_t)MCP_CAPTURE_MODE_POST_COMPOSE;
 
 	if (!oxr_mcp_tools_submit_capture(path, mode)) {
 		return oxr_error(log, XR_ERROR_RUNTIME_FAILURE,
-		                 "xrCaptureAtlasEXT: no in-process compositor capture handler is installed");
+		                 "xrCaptureAtlasDXR: no in-process compositor capture handler is installed");
 	}
 
 	if (result != NULL) {
 		const struct xrt_system_compositor_info *sci = &sess->sys->xsysc->info;
-		result->type = XR_TYPE_ATLAS_CAPTURE_RESULT_EXT;
+		result->type = XR_TYPE_ATLAS_CAPTURE_RESULT_DXR;
 		result->next = NULL;
 		result->timestampNs = (uint64_t)os_monotonic_get_ns();
 
@@ -198,12 +198,12 @@ capture_inprocess(struct oxr_logger *log,
 static XrResult
 capture_ipc(struct oxr_logger *log,
             struct oxr_session *sess,
-            const XrAtlasCaptureInfoEXT *info,
-            XrAtlasCaptureResultEXT *result)
+            const XrAtlasCaptureInfoDXR *info,
+            XrAtlasCaptureResultDXR *result)
 {
 	// Map the stage to the IPC stage-selector flag. The service writes the
 	// matching bit into views_written iff it actually captured that stage.
-	uint32_t want_flag = (info->stage == XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT)
+	uint32_t want_flag = (info->stage == XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_DXR)
 	                         ? IPC_CAPTURE_FLAG_PROJECTION_ONLY
 	                         : IPC_CAPTURE_FLAG_ATLAS;
 
@@ -216,7 +216,7 @@ capture_ipc(struct oxr_logger *log,
 	    &dh_m, eye_l, eye_r);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_RUNTIME_FAILURE,
-		                 "xrCaptureAtlasEXT: IPC capture failed (xrt_result=%d)", (int)xret);
+		                 "xrCaptureAtlasDXR: IPC capture failed (xrt_result=%d)", (int)xret);
 	}
 
 	// The service reports which stage it actually wrote. If the requested stage
@@ -225,12 +225,12 @@ capture_ipc(struct oxr_logger *log,
 	// non-workspace IPC client.
 	if ((vw & want_flag) == 0) {
 		return oxr_error(log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrCaptureAtlasEXT: the requested capture stage is not available for this "
+		                 "xrCaptureAtlasDXR: the requested capture stage is not available for this "
 		                 "IPC session (post-compose requires workspace mode)");
 	}
 
 	if (result != NULL) {
-		result->type = XR_TYPE_ATLAS_CAPTURE_RESULT_EXT;
+		result->type = XR_TYPE_ATLAS_CAPTURE_RESULT_DXR;
 		result->next = NULL;
 		result->timestampNs = ts_ns;
 		result->atlasWidth = aw;
@@ -252,27 +252,27 @@ capture_ipc(struct oxr_logger *log,
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrCaptureAtlasEXT(XrSession session, const XrAtlasCaptureInfoEXT *info, XrAtlasCaptureResultEXT *result)
+oxr_xrCaptureAtlasEXT(XrSession session, const XrAtlasCaptureInfoDXR *info, XrAtlasCaptureResultDXR *result)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrCaptureAtlasEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrCaptureAtlasDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_atlas_capture);
-	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, info, XR_TYPE_ATLAS_CAPTURE_INFO_EXT);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_atlas_capture);
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, info, XR_TYPE_ATLAS_CAPTURE_INFO_DXR);
 	// result is optional: NULL captures the PNG only.
 
-	if (info->stage != XR_ATLAS_CAPTURE_STAGE_POST_COMPOSE_EXT &&
-	    info->stage != XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT) {
+	if (info->stage != XR_ATLAS_CAPTURE_STAGE_POST_COMPOSE_DXR &&
+	    info->stage != XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_DXR) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrCaptureAtlasEXT: info->stage %d is not a valid XrAtlasCaptureStageEXT",
+		                 "xrCaptureAtlasDXR: info->stage %d is not a valid XrAtlasCaptureStageDXR",
 		                 (int)info->stage);
 	}
 
 	if (info->pathPrefix[0] == '\0') {
-		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "xrCaptureAtlasEXT: info->pathPrefix is empty");
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "xrCaptureAtlasDXR: info->pathPrefix is empty");
 	}
 
 	if (session_is_inprocess_native(sess)) {
@@ -283,7 +283,7 @@ oxr_xrCaptureAtlasEXT(XrSession session, const XrAtlasCaptureInfoEXT *info, XrAt
 	}
 
 	return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-	                 "xrCaptureAtlasEXT: session has no capture-capable compositor");
+	                 "xrCaptureAtlasDXR: session has no capture-capable compositor");
 }
 
-#endif // OXR_HAVE_EXT_atlas_capture
+#endif // OXR_HAVE_DXR_atlas_capture

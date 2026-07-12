@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Cube Zones TEXTURE Metal — XR_EXT_display_zones parity test (ADR-027), macOS leg
+ * @brief  Cube Zones TEXTURE Metal — XR_DXR_display_zones parity test (ADR-027), macOS leg
  *
  * PARITY TEST. This is cube_zones_metal_macos (the HANDLE-class display-zones
  * exerciser) converted to TEXTURE class. It proves that a texture app — one
  * that provides a shared IOSurface and presents that surface itself — receives
- * the FULL XR_EXT_display_zones multi-zone composite written back into its
+ * the FULL XR_DXR_display_zones multi-zone composite written back into its
  * shared IOSurface, byte-identical to what a handle app gets composited into
  * its window. The display-zones submission logic (the thing under test) is
  * unchanged from cube_zones_metal_macos.
@@ -15,14 +15,14 @@
  * Texture-mode deltas from the handle app:
  *  - Creates a shared IOSurface sized to the worst-case atlas (same sizing as
  *    cube_texture_metal_macos) and chains it as
- *    XrCocoaWindowBindingCreateInfoEXT.sharedIOSurface on xrCreateSession.
+ *    XrCocoaWindowBindingCreateInfoDXR.sharedIOSurface on xrCreateSession.
  *  - The APP owns presentation: each frame it blits the IOSurface into its own
  *    CAMetalLayer drawable and presents (lifted from cube_texture_metal_macos).
  *    The runtime does NOT present.
  *  - When a zones frame is active the Metal compositor composites the full-
  *    window multi-zone super-atlas DIRECTLY into the shared IOSurface (the
  *    declared output rect is superseded by zones → full window), so NO
- *    xrSetSharedTextureOutputRectEXT / 2D-surround is needed for the zones
+ *    xrSetSharedTextureOutputRectDXR / 2D-surround is needed for the zones
  *    path. The app simply binds the IOSurface, submits zones, presents.
  *  - Autonomous verification: it reads the IOSurface back to a PNG via
  *    stbi_write_png after a warmup gate (~frame 150) so the captured surface
@@ -45,9 +45,9 @@
  *
  * Rects are computed from the live window backing size at activation (the
  * D3D11 source app uses the same proportions of its fixed 1280x720 window).
- * Each zone owns ONE swapchain sized per xrGetDisplayZoneRecommendedViewSizeEXT,
+ * Each zone owns ONE swapchain sized per xrGetDisplayZoneRecommendedViewSizeDXR,
  * horizontally tiled per view; each frame runs a zone-scoped locate
- * (XrDisplayZoneEXT + XrDisplayRigEXT chained on XrViewLocateInfo) and submits
+ * (XrDisplayZoneDXR + XrDisplayRigDXR chained on XrViewLocateInfo) and submits
  * [projA, projB, strip] with the SAME zone structs chained on the projections.
  *
  * Keys (zones mode):
@@ -56,10 +56,10 @@
  *        XrLocal3DZoneRenderTarget*EXT exists for D3D11/D3D12/VK only.)
  *  - O : toggle zone B between its home rect and a rect overlapping zone A
  *        (locate + submit always share the one rect variable).
- *  - DXR_ZONES_VALIDATE=1 : chain XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_EXT
+ *  - DXR_ZONES_VALIDATE=1 : chain XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_DXR
  *        on the frame-end info in every mode (one-shot runtime WARNs).
  *
- * When the runtime doesn't advertise XR_EXT_display_zones the app logs an
+ * When the runtime doesn't advertise XR_DXR_display_zones the app logs an
  * error once and keeps running as the plain single-projection cube
  * (graceful degrade — the whole base-app path is intact below).
  */
@@ -72,7 +72,7 @@
 #define XR_USE_GRAPHICS_API_METAL
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-#include <openxr/XR_EXT_cocoa_window_binding.h>
+#include <openxr/XR_DXR_cocoa_window_binding.h>
 
 #include <cmath>
 #include <csignal>
@@ -98,12 +98,12 @@ extern "C" int stbi_write_png(const char *filename, int w, int h, int comp,
 #include "atlas_capture.h"
 #include "xr_window_space_hud.h"
 #include "hud_renderer_macos.h"
-#include <openxr/XR_EXT_display_info.h>
-#include <openxr/XR_EXT_local_3d_zone.h>
-#include <openxr/XR_EXT_display_zones.h>
-#include <openxr/XR_EXT_atlas_capture.h>
-#include <openxr/XR_EXT_mcp_tools.h>
-#include <openxr/XR_EXT_view_rig.h>
+#include <openxr/XR_DXR_display_info.h>
+#include <openxr/XR_DXR_local_3d_zone.h>
+#include <openxr/XR_DXR_display_zones.h>
+#include <openxr/XR_DXR_atlas_capture.h>
+#include <openxr/XR_DXR_mcp_tools.h>
+#include <openxr/XR_DXR_view_rig.h>
 
 // ============================================================================
 // Logging
@@ -123,22 +123,22 @@ extern "C" int stbi_write_png(const char *filename, int w, int h, int comp,
     } while (0)
 
 // ============================================================================
-// XR_EXT_mcp_tools — reference adoption (#447)
+// XR_DXR_mcp_tools — reference adoption (#447)
 //
 // This is the canonical in-tree example of an app exposing its own MCP
 // tools to agents: declare an appId matching the manifest `id` (the
 // agent-visible tool prefix, e.g. cube-metal__set_spin through the
 // workspace aggregator), register tools after session create, and
-// answer XrEventDataMCPToolCallEXT from the normal event pump. Inert
+// answer XrEventDataMCPToolCallDXR from the normal event pump. Inert
 // when the MCP capability is disabled. Spec:
-// docs/specs/extensions/XR_EXT_mcp_tools.md.
+// docs/specs/extensions/XR_DXR_mcp_tools.md.
 // ============================================================================
 
 static bool g_hasMcpToolsExt = false;
-static PFN_xrSetMCPAppInfoEXT g_pfnSetMCPAppInfo = nullptr;
-static PFN_xrRegisterMCPToolEXT g_pfnRegisterMCPTool = nullptr;
-static PFN_xrGetMCPToolCallArgsEXT g_pfnGetMCPToolCallArgs = nullptr;
-static PFN_xrSubmitMCPToolResultEXT g_pfnSubmitMCPToolResult = nullptr;
+static PFN_xrSetMCPAppInfoDXR g_pfnSetMCPAppInfo = nullptr;
+static PFN_xrRegisterMCPToolDXR g_pfnRegisterMCPTool = nullptr;
+static PFN_xrGetMCPToolCallArgsDXR g_pfnGetMCPToolCallArgs = nullptr;
+static PFN_xrSubmitMCPToolResultDXR g_pfnSubmitMCPToolResult = nullptr;
 
 //! Cube spin speed in rad/s — historically hardcoded 0.5; now agent-settable.
 static float g_spinSpeed = 0.5f;
@@ -856,7 +856,7 @@ static void RenderScene(MetalRenderer &r, id<MTLTexture> target,
     rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
     // Transparent-background mode (DISPLAYXR_TRANSPARENT_BG=1) clears RGBA(0,0,0,0)
     // so the desktop shows through everywhere the cube isn't drawn. Pairs with
-    // XrCocoaWindowBindingCreateInfoEXT.transparentBackgroundEnabled = XR_TRUE.
+    // XrCocoaWindowBindingCreateInfoDXR.transparentBackgroundEnabled = XR_TRUE.
     static const bool transparent_bg = []() {
         const char *e = getenv("DISPLAYXR_TRANSPARENT_BG");
         return e != nullptr && *e != '\0' && *e != '0';
@@ -954,7 +954,7 @@ static void RenderScene(MetalRenderer &r, id<MTLTexture> target,
 // ============================================================================
 //
 // The app provides a shared IOSurface as the runtime's render/composite
-// target (chained as XrCocoaWindowBindingCreateInfoEXT.sharedIOSurface). For
+// target (chained as XrCocoaWindowBindingCreateInfoDXR.sharedIOSurface). For
 // the zones path the runtime composites the full-window multi-zone super-atlas
 // DIRECTLY into this surface (the declared output rect is superseded by zones),
 // so the app just presents the whole surface region. No 2D surround needed.
@@ -997,7 +997,7 @@ struct InputState {
     bool hudVisible = true;
     // Rendering mode REQUESTS — single source of truth lives on the runtime
     // side (read back as app.currentModeIndex after the runtime's
-    // XrEventDataRenderingModeChangedEXT lands). Keys emit transient requests;
+    // XrEventDataRenderingModeChangedDXR lands). Keys emit transient requests;
     // the actual current mode is never mirrored here.
     uint32_t renderingModeCount = 0;             // mirror of app.renderingModeCount for keypress bounds
     bool cycleRenderingModeRequested = false;    // V key
@@ -1056,7 +1056,7 @@ static const int g_l2dActivationFrame = 10;
 static uint32_t g_renderW = 0, g_renderH = 0;
 
 // ============================================================================
-// XR_EXT_display_zones state (ADR-027)
+// XR_DXR_display_zones state (ADR-027)
 // ============================================================================
 
 static const uint32_t kNumZones = 2;
@@ -1112,10 +1112,10 @@ static int g_wishMode = 0;
 static bool g_wishModeCycleRequested = false;
 static bool g_overlapToggleRequested = false;
 
-// XR_EXT_display_zones harness.
+// XR_DXR_display_zones harness.
 static bool g_hasDisplayZonesExt = false;
-static PFN_xrGetDisplayZoneCapabilitiesEXT g_pfnGetZoneCaps = nullptr;
-static PFN_xrGetDisplayZoneRecommendedViewSizeEXT g_pfnGetZoneViewSize = nullptr;
+static PFN_xrGetDisplayZoneCapabilitiesDXR g_pfnGetZoneCaps = nullptr;
+static PFN_xrGetDisplayZoneRecommendedViewSizeDXR g_pfnGetZoneViewSize = nullptr;
 
 // DXR_ZONES_VALIDATE=1 — chain the validate bit on every frame-end info.
 static bool ZonesValidateEnabled() {
@@ -1190,7 +1190,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLef
 
         // INV-1.3: open on the 3D panel (#715). (screenLeft, screenTop) is the
         // panel top-left in top-down global coordinates (origin = primary
-        // top-left, XrDisplayDesktopPositionEXT); flip into AppKit's bottom-up
+        // top-left, XrDisplayDesktopPositionDXR); flip into AppKit's bottom-up
         // space. (0,0) = primary — the titled window is auto-constrained below
         // the menu bar, so it is always a safe create position.
         NSRect frame = NSMakeRect(100, 100, width, height);
@@ -1207,7 +1207,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLef
                                                  backing:NSBackingStoreBuffered
                                                    defer:NO];
 
-        [g_window setTitle:@"Metal Cube Zones TEXTURE — XR_EXT_display_zones parity"];
+        [g_window setTitle:@"Metal Cube Zones TEXTURE — XR_DXR_display_zones parity"];
         [g_window setAcceptsMouseMovedEvents:YES];
         [g_window setReleasedWhenClosed:NO];
 
@@ -1629,32 +1629,32 @@ struct AppXrSession {
     bool exitRequested;
     bool hasCocoaWindowBinding;
 
-    // XR_EXT_display_info
+    // XR_DXR_display_info
     bool hasDisplayInfoExt;
     float displayWidthM;
     float displayHeightM;
     float nominalViewerX, nominalViewerY, nominalViewerZ;
     uint32_t displayPixelWidth, displayPixelHeight;
     float recommendedViewScaleX, recommendedViewScaleY;
-    // v16 XrDisplayDesktopPositionEXT — 3D panel top-left in virtual-desktop
+    // v16 XrDisplayDesktopPositionDXR — 3D panel top-left in virtual-desktop
     // pixels (top-down, origin = primary top-left); (0,0) = primary/unknown.
     int32_t displayScreenLeft, displayScreenTop;
-    PFN_xrRequestDisplayModeEXT pfnRequestDisplayModeEXT;
-    PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingModeEXT;
-    PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT;
+    PFN_xrRequestDisplayModeDXR pfnRequestDisplayModeEXT;
+    PFN_xrRequestDisplayRenderingModeDXR pfnRequestDisplayRenderingModeEXT;
+    PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateDisplayRenderingModesEXT;
 
-    // XR_EXT_atlas_capture (W6 of #396): runtime-owned 'I'-key atlas capture.
+    // XR_DXR_atlas_capture (W6 of #396): runtime-owned 'I'-key atlas capture.
     bool hasAtlasCaptureExt = false;
-    bool hasViewRigExt = false;  // XR_EXT_view_rig (#396 W7)
-    PFN_xrCaptureAtlasEXT pfnCaptureAtlasEXT = nullptr;
+    bool hasViewRigExt = false;  // XR_DXR_view_rig (#396 W7)
+    PFN_xrCaptureAtlasDXR pfnCaptureAtlasEXT = nullptr;
 
-    // XR_EXT_local_3d_zone (#439 Phase 3, cases 2/3/4)
+    // XR_DXR_local_3d_zone (#439 Phase 3, cases 2/3/4)
     bool hasLocal3DZoneExt = false;
-    PFN_xrCreateLocal3DZoneMaskEXT pfnCreateLocal3DZoneMaskEXT = nullptr;
-    PFN_xrSetLocal3DZoneFromRectsEXT pfnSetLocal3DZoneFromRectsEXT = nullptr;
-    PFN_xrSubmitLocal3DZoneEXT pfnSubmitLocal3DZoneEXT = nullptr;
-    PFN_xrDestroyLocal3DZoneMaskEXT pfnDestroyLocal3DZoneMaskEXT = nullptr;
-    XrLocal3DZoneMaskEXT local3DZoneMask = XR_NULL_HANDLE;
+    PFN_xrCreateLocal3DZoneMaskDXR pfnCreateLocal3DZoneMaskEXT = nullptr;
+    PFN_xrSetLocal3DZoneFromRectsDXR pfnSetLocal3DZoneFromRectsEXT = nullptr;
+    PFN_xrSubmitLocal3DZoneDXR pfnSubmitLocal3DZoneEXT = nullptr;
+    PFN_xrDestroyLocal3DZoneMaskDXR pfnDestroyLocal3DZoneMaskEXT = nullptr;
+    XrLocal3DZoneMaskDXR local3DZoneMask = XR_NULL_HANDLE;
 
     // Enumerated rendering mode info. currentModeIndex is initialized to mode 1
     // as a fallback for runtimes that don't expose isActive; v13+ runtimes
@@ -1698,32 +1698,32 @@ static bool InitializeOpenXR(AppXrSession &app)
         LOG_INFO("  %s v%u", e.extensionName, e.extensionVersion);
         if (strcmp(e.extensionName, XR_KHR_METAL_ENABLE_EXTENSION_NAME) == 0)
             hasMetalEnable = true;
-        if (strcmp(e.extensionName, XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME) == 0)
+        if (strcmp(e.extensionName, XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME) == 0)
             app.hasCocoaWindowBinding = true;
-        if (strcmp(e.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0)
+        if (strcmp(e.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0)
             app.hasDisplayInfoExt = true;
-        if (strcmp(e.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0)
+        if (strcmp(e.extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0)
             app.hasAtlasCaptureExt = true;
-        if (strcmp(e.extensionName, XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME) == 0)
+        if (strcmp(e.extensionName, XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME) == 0)
             app.hasLocal3DZoneExt = true;
-        if (strcmp(e.extensionName, XR_EXT_MCP_TOOLS_EXTENSION_NAME) == 0)
+        if (strcmp(e.extensionName, XR_DXR_MCP_TOOLS_EXTENSION_NAME) == 0)
             g_hasMcpToolsExt = true;
-        if (strcmp(e.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0)
+        if (strcmp(e.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0)
             app.hasViewRigExt = true;
-        if (strcmp(e.extensionName, XR_EXT_DISPLAY_ZONES_EXTENSION_NAME) == 0)
+        if (strcmp(e.extensionName, XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) == 0)
             g_hasDisplayZonesExt = true;
     }
 
-    // XR_EXT_display_zones composes XR_EXT_local_3d_zone + XR_EXT_view_rig —
+    // XR_DXR_display_zones composes XR_DXR_local_3d_zone + XR_DXR_view_rig —
     // it is only usable when both prerequisites are also available.
     if (g_hasDisplayZonesExt && (!app.hasLocal3DZoneExt || !app.hasViewRigExt)) {
-        LOG_ERROR("XR_EXT_display_zones advertised without its prerequisites "
+        LOG_ERROR("XR_DXR_display_zones advertised without its prerequisites "
                   "(local_3d_zone=%d view_rig=%d) — zones path disabled",
                   (int)app.hasLocal3DZoneExt, (int)app.hasViewRigExt);
         g_hasDisplayZonesExt = false;
     }
     if (!g_hasDisplayZonesExt) {
-        LOG_ERROR("XR_EXT_display_zones NOT available — running as plain single-projection cube");
+        LOG_ERROR("XR_DXR_display_zones NOT available — running as plain single-projection cube");
     }
 
     if (!hasMetalEnable) {
@@ -1731,34 +1731,34 @@ static bool InitializeOpenXR(AppXrSession &app)
         return false;
     }
     if (!app.hasCocoaWindowBinding) {
-        LOG_WARN("Runtime does not support XR_EXT_cocoa_window_binding — will create own window");
+        LOG_WARN("Runtime does not support XR_DXR_cocoa_window_binding — will create own window");
     }
-    LOG_INFO("XR_EXT_display_info: %s", app.hasDisplayInfoExt ? "available" : "not available");
-    LOG_INFO("XR_EXT_atlas_capture: %s", app.hasAtlasCaptureExt ? "available" : "not available");
-    LOG_INFO("XR_EXT_view_rig: %s", app.hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_display_info: %s", app.hasDisplayInfoExt ? "available" : "not available");
+    LOG_INFO("XR_DXR_atlas_capture: %s", app.hasAtlasCaptureExt ? "available" : "not available");
+    LOG_INFO("XR_DXR_view_rig: %s", app.hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
 
     // Enable extensions
     std::vector<const char *> enabledExts = {XR_KHR_METAL_ENABLE_EXTENSION_NAME};
     if (app.hasCocoaWindowBinding) {
-        enabledExts.push_back(XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME);
+        enabledExts.push_back(XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME);
     }
     if (app.hasDisplayInfoExt) {
-        enabledExts.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+        enabledExts.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
     }
     if (app.hasAtlasCaptureExt) {
-        enabledExts.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
+        enabledExts.push_back(XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME);
     }
     if (app.hasLocal3DZoneExt) {
-        enabledExts.push_back(XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME);
+        enabledExts.push_back(XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME);
     }
     if (g_hasMcpToolsExt) {
-        enabledExts.push_back(XR_EXT_MCP_TOOLS_EXTENSION_NAME);
+        enabledExts.push_back(XR_DXR_MCP_TOOLS_EXTENSION_NAME);
     }
     if (app.hasViewRigExt) {
-        enabledExts.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
+        enabledExts.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
     }
     if (g_hasDisplayZonesExt) {
-        enabledExts.push_back(XR_EXT_DISPLAY_ZONES_EXTENSION_NAME);
+        enabledExts.push_back(XR_DXR_DISPLAY_ZONES_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -1771,7 +1771,7 @@ static bool InitializeOpenXR(AppXrSession &app)
 
     XR_CHECK(xrCreateInstance(&createInfo, &app.instance));
     LOG_INFO("OpenXR instance created");
-    LOG_INFO("XR_EXT_cocoa_window_binding: %s", app.hasCocoaWindowBinding ? "enabled" : "not available");
+    LOG_INFO("XR_DXR_cocoa_window_binding: %s", app.hasCocoaWindowBinding ? "enabled" : "not available");
 
     // Get system
     XrSystemGetInfo sysInfo = {XR_TYPE_SYSTEM_GET_INFO};
@@ -1782,12 +1782,12 @@ static bool InitializeOpenXR(AppXrSession &app)
     // Get system name and display info
     {
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
-        XrDisplayInfoEXT displayInfo = {};
-        displayInfo.type = XR_TYPE_DISPLAY_INFO_EXT;
+        XrDisplayInfoDXR displayInfo = {};
+        displayInfo.type = XR_TYPE_DISPLAY_INFO_DXR;
         // INV-1.3: panel desktop position, so the window below opens on the
         // 3D panel instead of the primary monitor (spec v16, #715).
-        XrDisplayDesktopPositionEXT desktopPos = {};
-        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT;
+        XrDisplayDesktopPositionDXR desktopPos = {};
+        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
         if (app.hasDisplayInfoExt) {
             sysProps.next = &displayInfo;
             displayInfo.next = &desktopPos;
@@ -1817,35 +1817,35 @@ static bool InitializeOpenXR(AppXrSession &app)
         }
         // Load display extension function pointers
         if (app.hasDisplayInfoExt) {
-            xrGetInstanceProcAddr(app.instance, "xrRequestDisplayModeEXT",
+            xrGetInstanceProcAddr(app.instance, "xrRequestDisplayModeDXR",
                 (PFN_xrVoidFunction*)&app.pfnRequestDisplayModeEXT);
-            xrGetInstanceProcAddr(app.instance, "xrRequestDisplayRenderingModeEXT",
+            xrGetInstanceProcAddr(app.instance, "xrRequestDisplayRenderingModeDXR",
                 (PFN_xrVoidFunction*)&app.pfnRequestDisplayRenderingModeEXT);
-            xrGetInstanceProcAddr(app.instance, "xrEnumerateDisplayRenderingModesEXT",
+            xrGetInstanceProcAddr(app.instance, "xrEnumerateDisplayRenderingModesDXR",
                 (PFN_xrVoidFunction*)&app.pfnEnumerateDisplayRenderingModesEXT);
         }
         if (app.hasAtlasCaptureExt) {
-            xrGetInstanceProcAddr(app.instance, "xrCaptureAtlasEXT",
+            xrGetInstanceProcAddr(app.instance, "xrCaptureAtlasDXR",
                 (PFN_xrVoidFunction*)&app.pfnCaptureAtlasEXT);
-            LOG_INFO("xrCaptureAtlasEXT: %s", app.pfnCaptureAtlasEXT ? "resolved" : "NULL");
+            LOG_INFO("xrCaptureAtlasDXR: %s", app.pfnCaptureAtlasEXT ? "resolved" : "NULL");
         }
         if (app.hasLocal3DZoneExt) {
-            xrGetInstanceProcAddr(app.instance, "xrCreateLocal3DZoneMaskEXT",
+            xrGetInstanceProcAddr(app.instance, "xrCreateLocal3DZoneMaskDXR",
                 (PFN_xrVoidFunction*)&app.pfnCreateLocal3DZoneMaskEXT);
-            xrGetInstanceProcAddr(app.instance, "xrSetLocal3DZoneFromRectsEXT",
+            xrGetInstanceProcAddr(app.instance, "xrSetLocal3DZoneFromRectsDXR",
                 (PFN_xrVoidFunction*)&app.pfnSetLocal3DZoneFromRectsEXT);
-            xrGetInstanceProcAddr(app.instance, "xrSubmitLocal3DZoneEXT",
+            xrGetInstanceProcAddr(app.instance, "xrSubmitLocal3DZoneDXR",
                 (PFN_xrVoidFunction*)&app.pfnSubmitLocal3DZoneEXT);
-            xrGetInstanceProcAddr(app.instance, "xrDestroyLocal3DZoneMaskEXT",
+            xrGetInstanceProcAddr(app.instance, "xrDestroyLocal3DZoneMaskDXR",
                 (PFN_xrVoidFunction*)&app.pfnDestroyLocal3DZoneMaskEXT);
         }
         if (g_hasDisplayZonesExt) {
-            xrGetInstanceProcAddr(app.instance, "xrGetDisplayZoneCapabilitiesEXT",
+            xrGetInstanceProcAddr(app.instance, "xrGetDisplayZoneCapabilitiesDXR",
                 (PFN_xrVoidFunction*)&g_pfnGetZoneCaps);
-            xrGetInstanceProcAddr(app.instance, "xrGetDisplayZoneRecommendedViewSizeEXT",
+            xrGetInstanceProcAddr(app.instance, "xrGetDisplayZoneRecommendedViewSizeDXR",
                 (PFN_xrVoidFunction*)&g_pfnGetZoneViewSize);
             if (g_pfnGetZoneCaps == nullptr || g_pfnGetZoneViewSize == nullptr) {
-                LOG_ERROR("XR_EXT_display_zones entry points unresolved — zones path disabled");
+                LOG_ERROR("XR_DXR_display_zones entry points unresolved — zones path disabled");
                 g_hasDisplayZonesExt = false;
             }
         }
@@ -1893,8 +1893,8 @@ static bool CreateSession(AppXrSession &app, MetalRenderer &r)
     metalBinding.commandQueue = (__bridge void *)r.commandQueue;
 
     // Chain the cocoa window binding extension — pass our NSView to the runtime
-    XrCocoaWindowBindingCreateInfoEXT cocoaBinding = {};
-    cocoaBinding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT;
+    XrCocoaWindowBindingCreateInfoDXR cocoaBinding = {};
+    cocoaBinding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR;
     cocoaBinding.next = nullptr;
     cocoaBinding.viewHandle = (__bridge void *)g_metalView;
     // TEXTURE-MODE MARKER: hand the runtime our shared IOSurface so it
@@ -1927,7 +1927,7 @@ static bool CreateSession(AppXrSession &app, MetalRenderer &r)
 
     if (app.hasCocoaWindowBinding) {
         metalBinding.next = &cocoaBinding;
-        LOG_INFO("Chaining XR_EXT_cocoa_window_binding with NSView %p", cocoaBinding.viewHandle);
+        LOG_INFO("Chaining XR_DXR_cocoa_window_binding with NSView %p", cocoaBinding.viewHandle);
     }
 
     XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
@@ -1937,25 +1937,25 @@ static bool CreateSession(AppXrSession &app, MetalRenderer &r)
     XR_CHECK(xrCreateSession(app.instance, &sessionInfo, &app.session));
     LOG_INFO("Session created%s", app.hasCocoaWindowBinding ? " (with external window)" : "");
 
-    // XR_EXT_mcp_tools: declare identity + register agent tools. The appId
+    // XR_DXR_mcp_tools: declare identity + register agent tools. The appId
     // MUST match `id` in displayxr/cube_zones_texture_metal_macos.displayxr.json
     // (INV-10.1). Failure is non-fatal by design — the MCP capability gate
     // may simply be off on this machine.
     if (g_hasMcpToolsExt) {
-        xrGetInstanceProcAddr(app.instance, "xrSetMCPAppInfoEXT",
+        xrGetInstanceProcAddr(app.instance, "xrSetMCPAppInfoDXR",
                               (PFN_xrVoidFunction *)&g_pfnSetMCPAppInfo);
-        xrGetInstanceProcAddr(app.instance, "xrRegisterMCPToolEXT",
+        xrGetInstanceProcAddr(app.instance, "xrRegisterMCPToolDXR",
                               (PFN_xrVoidFunction *)&g_pfnRegisterMCPTool);
-        xrGetInstanceProcAddr(app.instance, "xrGetMCPToolCallArgsEXT",
+        xrGetInstanceProcAddr(app.instance, "xrGetMCPToolCallArgsDXR",
                               (PFN_xrVoidFunction *)&g_pfnGetMCPToolCallArgs);
-        xrGetInstanceProcAddr(app.instance, "xrSubmitMCPToolResultEXT",
+        xrGetInstanceProcAddr(app.instance, "xrSubmitMCPToolResultDXR",
                               (PFN_xrVoidFunction *)&g_pfnSubmitMCPToolResult);
         if (g_pfnSetMCPAppInfo && g_pfnRegisterMCPTool && g_pfnSubmitMCPToolResult) {
-            XrMCPAppInfoEXT mcpAppInfo = {XR_TYPE_MCP_APP_INFO_EXT};
+            XrMCPAppInfoDXR mcpAppInfo = {XR_TYPE_MCP_APP_INFO_DXR};
             strncpy(mcpAppInfo.appId, "cube-zones-texture-metal", sizeof(mcpAppInfo.appId) - 1);
             XrResult ar = g_pfnSetMCPAppInfo(app.session, &mcpAppInfo);
 
-            XrMCPToolInfoEXT setSpin = {XR_TYPE_MCP_TOOL_INFO_EXT};
+            XrMCPToolInfoDXR setSpin = {XR_TYPE_MCP_TOOL_INFO_DXR};
             setSpin.name = "set_spin";
             setSpin.description =
                 "Set the cube's spin speed. Takes effect immediately; the change is "
@@ -1967,7 +1967,7 @@ static bool CreateSession(AppXrSession &app, MetalRenderer &r)
                 "\"required\":[\"speed_rad_per_sec\"]}";
             XrResult tr1 = g_pfnRegisterMCPTool(app.session, &setSpin);
 
-            XrMCPToolInfoEXT getStatus = {XR_TYPE_MCP_TOOL_INFO_EXT};
+            XrMCPToolInfoDXR getStatus = {XR_TYPE_MCP_TOOL_INFO_DXR};
             getStatus.name = "get_status";
             getStatus.description =
                 "Read the cube app's live state: spin speed (rad/s), whether the XR "
@@ -1975,7 +1975,7 @@ static bool CreateSession(AppXrSession &app, MetalRenderer &r)
             getStatus.inputSchemaJson = "{\"type\":\"object\"}";
             XrResult tr2 = g_pfnRegisterMCPTool(app.session, &getStatus);
 
-            LOG_INFO("XR_EXT_mcp_tools: appId=%d set_spin=%d get_status=%d", ar, tr1, tr2);
+            LOG_INFO("XR_DXR_mcp_tools: appId=%d set_spin=%d get_status=%d", ar, tr1, tr2);
         }
     }
 
@@ -1985,9 +1985,9 @@ static bool CreateSession(AppXrSession &app, MetalRenderer &r)
         uint32_t modeCount = 0;
         XrResult enumRes = app.pfnEnumerateDisplayRenderingModesEXT(app.session, 0, &modeCount, nullptr);
         if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
-            std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
+            std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
             for (uint32_t i = 0; i < modeCount; i++) {
-                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
                 modes[i].next = nullptr;
             }
             enumRes = app.pfnEnumerateDisplayRenderingModesEXT(app.session, modeCount, &modeCount, modes.data());
@@ -2222,7 +2222,7 @@ static bool CreateAndFillL2DPanel(AppXrSession &app, uint32_t w, uint32_t h, int
 }
 
 // ============================================================================
-// XR_EXT_display_zones helpers (ADR-027) — port of cube_zones_d3d11_win
+// XR_DXR_display_zones helpers (ADR-027) — port of cube_zones_d3d11_win
 // ============================================================================
 
 static const float kZoneEdgeFadePx = 16.0f;
@@ -2308,7 +2308,7 @@ static bool CreateAndFillStrip(AppXrSession &app)
     return true;
 }
 
-// Create one zone's swapchain, sized per xrGetDisplayZoneRecommendedViewSizeEXT,
+// Create one zone's swapchain, sized per xrGetDisplayZoneRecommendedViewSizeDXR,
 // horizontally tiled per view. The per-zone depth texture is created lazily by
 // the render (zone sizes differ, so the shared renderer depth would ping-pong).
 static bool CreateZoneResources(AppXrSession &app, DisplayZone &z, uint32_t viewCount)
@@ -2316,7 +2316,7 @@ static bool CreateZoneResources(AppXrSession &app, DisplayZone &z, uint32_t view
     XrExtent2Di rec = {};
     XrResult r = g_pfnGetZoneViewSize(app.session, &z.rect, &rec);
     if (XR_FAILED(r) || rec.width <= 0 || rec.height <= 0) {
-        LOG_ERROR("[zones] zone %u: xrGetDisplayZoneRecommendedViewSizeEXT failed (0x%x, %dx%d)",
+        LOG_ERROR("[zones] zone %u: xrGetDisplayZoneRecommendedViewSizeDXR failed (0x%x, %dx%d)",
                   z.zoneId, (unsigned)r, rec.width, rec.height);
         return false;
     }
@@ -2374,10 +2374,10 @@ static void TryActivateZones(AppXrSession &app)
     }
     g_zonesAttempted = true;
 
-    XrDisplayZoneCapabilitiesEXT caps = {XR_TYPE_DISPLAY_ZONE_CAPABILITIES_EXT};
+    XrDisplayZoneCapabilitiesDXR caps = {XR_TYPE_DISPLAY_ZONE_CAPABILITIES_DXR};
     XrResult r = g_pfnGetZoneCaps(app.session, &caps);
     if (XR_FAILED(r) || !caps.supported) {
-        LOG_ERROR("[zones] xrGetDisplayZoneCapabilitiesEXT: rc=0x%x supported=%d — zones path disabled",
+        LOG_ERROR("[zones] xrGetDisplayZoneCapabilitiesDXR: rc=0x%x supported=%d — zones path disabled",
                   (unsigned)r, (int)caps.supported);
         g_hasDisplayZonesExt = false;
         return;
@@ -2466,12 +2466,12 @@ static bool EnsureWishMask(AppXrSession &app)
 {
     if (app.local3DZoneMask != XR_NULL_HANDLE) return true;
     if (app.pfnCreateLocal3DZoneMaskEXT == nullptr) return false;
-    XrLocal3DZoneMaskCreateInfoEXT mci = {(XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_EXT};
+    XrLocal3DZoneMaskCreateInfoDXR mci = {(XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_DXR};
     mci.maskWidth = 0; // runtime picks the window backing size
     mci.maskHeight = 0;
     XrResult r = app.pfnCreateLocal3DZoneMaskEXT(app.session, &mci, &app.local3DZoneMask);
     if (XR_FAILED(r)) {
-        LOG_ERROR("[zones] xrCreateLocal3DZoneMaskEXT failed (0x%x)", (unsigned)r);
+        LOG_ERROR("[zones] xrCreateLocal3DZoneMaskDXR failed (0x%x)", (unsigned)r);
         app.local3DZoneMask = XR_NULL_HANDLE;
         return false;
     }
@@ -2489,7 +2489,7 @@ static void ApplyWishAuthoring(AppXrSession &app)
         for (uint32_t zi = 0; zi < kNumZones; zi++) rects[zi] = g_zonesArr[zi].rect;
         XrResult r = app.pfnSetLocal3DZoneFromRectsEXT(app.local3DZoneMask, kNumZones, rects);
         if (XR_FAILED(r)) {
-            LOG_ERROR("[zones] xrSetLocal3DZoneFromRectsEXT failed (0x%x)", (unsigned)r);
+            LOG_ERROR("[zones] xrSetLocal3DZoneFromRectsDXR failed (0x%x)", (unsigned)r);
         }
     }
 }
@@ -2680,22 +2680,22 @@ static void RenderZonesFrame(AppXrSession &app, MetalRenderer &renderer, const X
 {
     // Per-zone locate + submit data. The zone structs are chained at BOTH
     // points (locate and xrEndFrame) — same instances within the frame.
-    XrDisplayZoneEXT zoneStructs[kNumZones];
-    XrDisplayRigEXT rigStructs[kNumZones];
+    XrDisplayZoneDXR zoneStructs[kNumZones];
+    XrDisplayRigDXR rigStructs[kNumZones];
     std::vector<XrCompositionLayerProjectionView> projViews[kNumZones];
     uint32_t submitViewCounts[kNumZones] = {};
 
     for (uint32_t zi = 0; zi < kNumZones; zi++) {
         DisplayZone &z = g_zonesArr[zi];
 
-        rigStructs[zi] = {XR_TYPE_DISPLAY_RIG_EXT};
+        rigStructs[zi] = {XR_TYPE_DISPLAY_RIG_DXR};
         rigStructs[zi].pose = {{0, 0, 0, 1}, {0, 0, 0}};
         rigStructs[zi].virtualDisplayHeight = kZoneVirtualDisplayHeight;
         rigStructs[zi].ipdFactor = z.ipdFactor;
         rigStructs[zi].parallaxFactor = 1.0f;
         rigStructs[zi].perspectiveFactor = z.perspectiveFactor;
 
-        zoneStructs[zi] = {XR_TYPE_DISPLAY_ZONE_EXT};
+        zoneStructs[zi] = {XR_TYPE_DISPLAY_ZONE_DXR};
         zoneStructs[zi].next = &rigStructs[zi];
         zoneStructs[zi].zoneId = z.zoneId;
         zoneStructs[zi].rect = z.rect;
@@ -2770,7 +2770,7 @@ static void RenderZonesFrame(AppXrSession &app, MetalRenderer &renderer, const X
 
     // Layer list: [projA (zone A chained), projB (zone B chained), strip].
     XrCompositionLayerProjection projLayers[kNumZones];
-    XrCompositionLayerLocal2DEXT stripLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+    XrCompositionLayerLocal2DDXR stripLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR};
     const XrCompositionLayerBaseHeader *layers[kNumZones + 1] = {};
     uint32_t layerCount = 0;
 
@@ -2833,7 +2833,7 @@ static void RenderZonesFrame(AppXrSession &app, MetalRenderer &renderer, const X
     // Per-frame wish reference: absent in AUTO (mode 0) unless validation is
     // requested; in mode 1 the mask is the frame's wish, atomic with the
     // layer set.
-    XrDisplayZonesFrameEndInfoEXT zonesEnd = {(XrStructureType)XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_EXT};
+    XrDisplayZonesFrameEndInfoDXR zonesEnd = {(XrStructureType)XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_DXR};
     zonesEnd.flags = 0;
     zonesEnd.wishMask = XR_NULL_HANDLE;
     bool chainZonesEnd = false;
@@ -2842,7 +2842,7 @@ static void RenderZonesFrame(AppXrSession &app, MetalRenderer &renderer, const X
         chainZonesEnd = true;
     }
     if (ZonesValidateEnabled()) {
-        zonesEnd.flags |= XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_EXT;
+        zonesEnd.flags |= XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_DXR;
         chainZonesEnd = true;
     }
     if (chainZonesEnd) {
@@ -2861,19 +2861,19 @@ static void PollEvents(AppXrSession &app)
     XrEventDataBuffer event = {XR_TYPE_EVENT_DATA_BUFFER};
     while (xrPollEvent(app.instance, &event) == XR_SUCCESS) {
         switch (event.type) {
-        case (XrStructureType)XR_TYPE_EVENT_DATA_DISPLAY_ZONE_METRICS_CHANGED_EXT: {
+        case (XrStructureType)XR_TYPE_EVENT_DATA_DISPLAY_ZONE_METRICS_CHANGED_DXR: {
             // ADR-027 advisory: per-zone recommended view sizes may have
             // changed. Stale sizes stay correct, just soft (the runtime
             // scaled-blits view tiles to rects) — log-only here.
             LOG_INFO("[zones] display-zone metrics changed (advisory) — zone view sizes may be stale");
             break;
         }
-        case (XrStructureType)XR_TYPE_EVENT_DATA_LOCAL_3D_ZONE_VIEW_SIZE_CHANGED_EXT: {
+        case (XrStructureType)XR_TYPE_EVENT_DATA_LOCAL_3D_ZONE_VIEW_SIZE_CHANGED_DXR: {
             // #439 Q4 — for a handle app the view dims are window-derived
             // already, so this should stay silent when the mask activates;
             // it fires on window resize. Log-only: our swapchain is
             // worst-case sized and render dims follow g_windowW/H per frame.
-            auto *vsEvent = (XrEventDataLocal3DZoneViewSizeChangedEXT *)&event;
+            auto *vsEvent = (XrEventDataLocal3DZoneViewSizeChangedDXR *)&event;
             LOG_INFO("Local-3D-zone view size changed: %ux%u",
                 vsEvent->recommendedImageRectWidth, vsEvent->recommendedImageRectHeight);
             break;
@@ -2900,29 +2900,29 @@ static void PollEvents(AppXrSession &app)
             }
             break;
         }
-        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT: {
-            auto* modeEvent = (XrEventDataRenderingModeChangedEXT*)&event;
+        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
+            auto* modeEvent = (XrEventDataRenderingModeChangedDXR*)&event;
             LOG_INFO("Rendering mode changed: %u -> %u",
                 modeEvent->previousModeIndex, modeEvent->currentModeIndex);
             app.currentModeIndex = modeEvent->currentModeIndex;
             break;
         }
-        case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT: {
+        case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR: {
             // Edge-triggered tracking loss/recovery (#441 v14); HUD state
-            // also refreshes per-frame from the XrViewEyeTrackingStateEXT chain.
-            auto* etEvent = (XrEventDataEyeTrackingStateChangedEXT*)&event;
+            // also refreshes per-frame from the XrViewEyeTrackingStateDXR chain.
+            auto* etEvent = (XrEventDataEyeTrackingStateChangedDXR*)&event;
             LOG_INFO("Eye tracking state changed: isTracking=%s mode=%u",
                 etEvent->isTracking == XR_TRUE ? "YES" : "NO",
                 (uint32_t)etEvent->activeMode);
             app.isEyeTracking = (etEvent->isTracking == XR_TRUE);
             break;
         }
-        case (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_EXT: {
-            // An agent invoked one of our XR_EXT_mcp_tools tools. Fetch the
+        case (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_DXR: {
+            // An agent invoked one of our XR_DXR_mcp_tools tools. Fetch the
             // JSON args (two-call idiom; argsSize is the required capacity),
             // act on app state — we're on the main loop, so no locking —
             // and answer. An unanswered call fails to the agent after ~5 s.
-            auto *call = (XrEventDataMCPToolCallEXT *)&event;
+            auto *call = (XrEventDataMCPToolCallDXR *)&event;
             char args[512] = {0};
             uint32_t needed = 0;
             if (g_pfnGetMCPToolCallArgs != nullptr) {
@@ -2975,7 +2975,7 @@ int main(int argc, char **argv)
     signal(SIGINT, SignalHandler);
     signal(SIGTERM, SignalHandler);
 
-    LOG_INFO("=== Metal Cube Zones TEXTURE OpenXR (XR_EXT_display_zones parity test, ADR-027) ===");
+    LOG_INFO("=== Metal Cube Zones TEXTURE OpenXR (XR_DXR_display_zones parity test, ADR-027) ===");
 
     // Autonomous-verification dump (DXR_TEXDUMP): reads the shared IOSurface
     // back to a PNG at the warmup frame gate. "1" or empty-but-present →
@@ -3132,7 +3132,7 @@ int main(int argc, char **argv)
     }
 
     // Initial rendering mode is sourced from the runtime via v13 `isActive`
-    // (set during xrEnumerateDisplayRenderingModesEXT above). Fallback is
+    // (set during xrEnumerateDisplayRenderingModesDXR above). Fallback is
     // mode 1 (default of app.currentModeIndex). No env-var override here —
     // SIM_DISPLAY_OUTPUT is a runtime-side construct.
 
@@ -3156,8 +3156,8 @@ int main(int argc, char **argv)
 
         // Handle rendering mode requests (V=cycle next, 0-8=jump absolute).
         // Single source of truth: the runtime owns the current mode. Keypresses
-        // are REQUESTS — we call xrRequestDisplayRenderingModeEXT and let the
-        // XrEventDataRenderingModeChangedEXT event update app.currentModeIndex.
+        // are REQUESTS — we call xrRequestDisplayRenderingModeDXR and let the
+        // XrEventDataRenderingModeChangedDXR event update app.currentModeIndex.
         // Render paths and HUD read app.currentModeIndex directly.
         if (g_input.cycleRenderingModeRequested) {
             g_input.cycleRenderingModeRequested = false;
@@ -3224,8 +3224,8 @@ int main(int argc, char **argv)
                     app.pfnCreateLocal3DZoneMaskEXT != nullptr &&
                     app.pfnSetLocal3DZoneFromRectsEXT != nullptr &&
                     app.pfnSubmitLocal3DZoneEXT != nullptr) {
-                    XrLocal3DZoneMaskCreateInfoEXT mci = {
-                        (XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_EXT};
+                    XrLocal3DZoneMaskCreateInfoDXR mci = {
+                        (XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_DXR};
                     mci.maskWidth = 0; // runtime picks the window backing size
                     mci.maskHeight = 0;
                     ok = XR_SUCCEEDED(app.pfnCreateLocal3DZoneMaskEXT(app.session, &mci,
@@ -3270,7 +3270,7 @@ int main(int argc, char **argv)
             continue;
         }
 
-        // ---- zones path (XR_EXT_display_zones, ADR-027) --------------------
+        // ---- zones path (XR_DXR_display_zones, ADR-027) --------------------
         if (g_hasDisplayZonesExt && !g_zonesActive && !g_zonesAttempted &&
             g_frameCounter >= kZonesActivationFrame) {
             TryActivateZones(app);
@@ -3305,7 +3305,7 @@ int main(int argc, char **argv)
         locateInfo.displayTime = frameState.predictedDisplayTime;
         locateInfo.space = app.localSpace;
 
-        // XR_EXT_view_rig (#396 W7): drive the runtime rig matching the app's
+        // XR_DXR_view_rig (#396 W7): drive the runtime rig matching the app's
         // current mode (C selects the rig) with the app's tunables — the
         // runtime owns the window resolve and the Kooima math, and returns
         // render-ready XrView{pose, fov}. Per-locate semantics: chain the rig
@@ -3315,9 +3315,9 @@ int main(int argc, char **argv)
         const bool useRig =
             app.hasViewRigExt && app.displayWidthM > 0 && app.displayHeightM > 0;
         const bool rigCamera = useRig && g_input.cameraMode;
-        XrCameraRigEXT cameraRig = {XR_TYPE_CAMERA_RIG_EXT};
-        XrDisplayRigEXT displayRig = {XR_TYPE_DISPLAY_RIG_EXT};
-        XrViewDisplayRawEXT viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+        XrCameraRigDXR cameraRig = {XR_TYPE_CAMERA_RIG_DXR};
+        XrDisplayRigDXR displayRig = {XR_TYPE_DISPLAY_RIG_DXR};
+        XrViewDisplayRawDXR viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
         XrPosef rigPose = {{0, 0, 0, 1}, {0, 0, 0}};
         if (useRig) {
             quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &rigPose.orientation);
@@ -3357,7 +3357,7 @@ int main(int argc, char **argv)
             g_input.canvasHeightM = viewRigRaw.canvasSizeMeters.height;
         }
 
-        // XR_EXT_view_rig raw-channel verification (#396 W7): one-shot proof
+        // XR_DXR_view_rig raw-channel verification (#396 W7): one-shot proof
         // the raw channel reports the DP's full per-view set.
         if (useRig) {
             static int rawLogged = 0;
@@ -3408,7 +3408,7 @@ int main(int argc, char **argv)
         if (frameState.shouldRender && viewCount >= 1) {
             // Save display-space eye positions for the HUD. Under the rig,
             // views[] carries render-ready world eyes — the raw channel
-            // (XrViewDisplayRawEXT) keeps the HUD readout in display space.
+            // (XrViewDisplayRawDXR) keeps the HUD readout in display space.
             app.eyeCount = modeViewCount;
             if (useRig && viewRigRaw.eyeCountOutput > 0) {
                 for (uint32_t v = 0; v < viewRigRaw.eyeCountOutput && v < 8; v++) {
@@ -3493,7 +3493,7 @@ int main(int argc, char **argv)
             RenderScene(renderer, app.swapchain.images[imageIndex], eyeParams.data(), eyeCount);
 
             // 'I' key: snapshot the multi-view atlas via the runtime-owned
-            // XR_EXT_atlas_capture (W6 of #396) — the runtime does the readback
+            // XR_DXR_atlas_capture (W6 of #396) — the runtime does the readback
             // from its own atlas image, so the app keeps no staging texture.
             // PROJECTION_ONLY = the app's own projection atlas, pre-compose.
             // Skipped for mono (1×1) layouts; the runtime appends
@@ -3504,25 +3504,25 @@ int main(int argc, char **argv)
                     if (display3D && (tileColumns > 1 || tileRows > 1)) {
                         std::string prefix = dxr_capture::MakeCaptureAtlasPrefix(
                             "cube_zones_texture_metal_macos", tileColumns, tileRows);
-                        XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
+                        XrAtlasCaptureInfoDXR info = {XR_TYPE_ATLAS_CAPTURE_INFO_DXR};
                         info.next = nullptr;
-                        info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT;
+                        info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_DXR;
                         strncpy(info.pathPrefix, prefix.c_str(),
-                                XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1);
-                        info.pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1] = '\0';
+                                XR_ATLAS_CAPTURE_PATH_MAX_DXR - 1);
+                        info.pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_DXR - 1] = '\0';
                         XrResult cr = app.pfnCaptureAtlasEXT(app.session, &info, nullptr);
                         if (XR_SUCCEEDED(cr)) {
                             LOG_INFO("Atlas capture requested -> %s_atlas_%u_%ux%u.png",
                                      prefix.c_str(), tileColumns * tileRows, tileColumns, tileRows);
                             dxr_capture::TriggerCaptureFlash((__bridge void*)g_metalView);
                         } else {
-                            LOG_WARN("xrCaptureAtlasEXT failed: 0x%x", (unsigned)cr);
+                            LOG_WARN("xrCaptureAtlasDXR failed: 0x%x", (unsigned)cr);
                         }
                     } else {
                         LOG_WARN("Capture skipped: need 3D mode with cols/rows > 1");
                     }
                 } else {
-                    LOG_WARN("Atlas capture unavailable: XR_EXT_atlas_capture not active");
+                    LOG_WARN("Atlas capture unavailable: XR_DXR_atlas_capture not active");
                 }
             }
         }
@@ -3574,10 +3574,10 @@ int main(int argc, char **argv)
 
             // #439 cases 2/3/4: Local2D panel layers ride the normal layer
             // list after the projection layer (list order = stacking order).
-            XrCompositionLayerLocal2DEXT panel1Layer = {
-                (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
-            XrCompositionLayerLocal2DEXT panel2Layer = {
-                (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+            XrCompositionLayerLocal2DDXR panel1Layer = {
+                (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR};
+            XrCompositionLayerLocal2DDXR panel2Layer = {
+                (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR};
             const XrCompositionLayerBaseHeader *layers[3] = {
                 (XrCompositionLayerBaseHeader *)&projLayer, nullptr, nullptr};
             uint32_t layerCount = (rendered && frameState.shouldRender) ? 1 : 0;
@@ -3655,7 +3655,7 @@ int main(int argc, char **argv)
             const char* kooimaMode = g_input.cameraMode
                 ? "Camera-Centric [C=Toggle]" : "Display-Centric [C=Toggle]";
             snprintf(buf, sizeof(buf),
-                "XR_EXT_cocoa_window_binding: %s (Metal)\nMode: %s (%s)%s\nKooima: %s",
+                "XR_DXR_cocoa_window_binding: %s (Metal)\nMode: %s (%s)%s\nKooima: %s",
                 app.hasCocoaWindowBinding ? "ACTIVE" : "NOT AVAILABLE",
                 outputModeName, display3D ? "3D" : "2D", lockSuffix, kooimaMode);
             g_hudModeText = utf8ToW(buf);

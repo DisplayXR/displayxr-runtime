@@ -296,7 +296,7 @@ struct comp_d3d12_renderer
 	ID3D12PipelineState *blit_pso;
 
 	//! Blit PSO blend variants for 3D display zone layers
-	//! (XR_EXT_display_zones, ADR-027): same shaders/root signature as
+	//! (XR_DXR_display_zones, ADR-027): same shaders/root signature as
 	//! blit_pso, alpha-over blend baked into the PSO (D3D12's analog of the
 	//! D3D11 renderer's blend_premul/blend_alpha OM states). Premul:
 	//! SrcBlend = ONE; straight: SrcBlend = SRC_ALPHA.
@@ -877,7 +877,7 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 	hr = device->CreateGraphicsPipelineState(&pso_desc, __uuidof(ID3D12PipelineState),
 	                                          reinterpret_cast<void **>(&r->blit_pso));
 
-	// XR_EXT_display_zones (ADR-027): alpha-over blend variants of the blit
+	// XR_DXR_display_zones (ADR-027): alpha-over blend variants of the blit
 	// PSO for zone-layer draws (zone rect scaled into the tile box; later
 	// zones composite over earlier ones in layer-list order). Alpha channel
 	// composes Porter-Duff over so stacked zones accumulate coverage.
@@ -1409,7 +1409,7 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 	// Reset per-frame SRV slot allocator (slot 0 = atlas, slots 1+ for layers)
 	renderer->next_srv_slot = 1;
 
-	// XR_EXT_display_zones (ADR-027): a zones frame composes N placed zone
+	// XR_DXR_display_zones (ADR-027): a zones frame composes N placed zone
 	// layers into the window-spanning atlas — the unzoned area must weave
 	// to nothing (transparent), not opaque black, so the feathered wish
 	// edge blends toward the desktop.
@@ -1449,7 +1449,7 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 
 	// For each projection / zone layer, stretch-blit swapchain images into
 	// atlas tiles (zone layers land at the zone rect scaled into the tile
-	// box — XR_EXT_display_zones; alpha-over in layer-list order falls out
+	// box — XR_DXR_display_zones; alpha-over in layer-list order falls out
 	// of the layers-outer loop running in submission order per tile).
 	for (uint32_t li = 0; li < layers->layer_count; li++) {
 		struct comp_layer *layer = &layers->layers[li];
@@ -1604,7 +1604,7 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 			vp.MinDepth = 0.0f;
 			vp.MaxDepth = 1.0f;
 
-			// XR_EXT_display_zones: scale the zone rect (client-window
+			// XR_DXR_display_zones: scale the zone rect (client-window
 			// px) into the view tile box — in zones frames the tile
 			// spans the full window, so scale = tile/window. Premul vs
 			// straight alpha-over per the UNPREMULTIPLIED flag (the
@@ -1671,7 +1671,7 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 			// effective grid), so there is no second tile to fill. The DP
 			// weaves or flattens whatever arrives per its own mode_3d.
 
-			// XR_EXT_display_zones: restore the REPLACE blit PSO for the
+			// XR_DXR_display_zones: restore the REPLACE blit PSO for the
 			// next (projection) draw.
 			if (is_zone) {
 				cmd_list->SetPipelineState(renderer->blit_pso);

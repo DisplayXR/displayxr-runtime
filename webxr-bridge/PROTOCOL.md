@@ -31,7 +31,7 @@ Bridge validates the origin header. Allowed origins: `http://localhost*`, `http:
 { "type": "request-mode", "version": 1, "modeIndex": 0 }
 ```
 
-Bridge calls `xrRequestDisplayRenderingModeEXT(session, modeIndex)`. Runtime processes the mode switch; both sessions receive `RENDERING_MODE_CHANGED` events. A `mode-changed` message follows asynchronously.
+Bridge calls `xrRequestDisplayRenderingModeDXR(session, modeIndex)`. Runtime processes the mode switch; both sessions receive `RENDERING_MODE_CHANGED` events. A `mode-changed` message follows asynchronously.
 
 ## Bridge → Extension
 
@@ -127,7 +127,7 @@ The extension dispatches a `displayxrinput` event on the session with `event.det
 }
 ```
 
-Sent on every `XrEventDataRenderingModeChangedEXT`. The `views` array contains refreshed view configuration dims for the new mode.
+Sent on every `XrEventDataRenderingModeChangedDXR`. The `views` array contains refreshed view configuration dims for the new mode.
 
 ### `hardware-state-changed`
 
@@ -139,7 +139,7 @@ Sent on every `XrEventDataRenderingModeChangedEXT`. The `views` array contains r
 }
 ```
 
-Sent on `XrEventDataHardwareDisplayStateChangedEXT` (physical display's 3D backlight state changed).
+Sent on `XrEventDataHardwareDisplayStateChangedDXR` (physical display's 3D backlight state changed).
 
 ### `eye-tracking-state-changed`
 
@@ -152,7 +152,7 @@ Sent on `XrEventDataHardwareDisplayStateChangedEXT` (physical display's 3D backl
 }
 ```
 
-Sent on `XrEventDataEyeTrackingStateChangedEXT` (#441 v14) — edge-triggered on every flip of the derived `isTracking` value (`activeMode.hasTracking && tracker lock`). Fires on DP tracking loss/recovery **and** on rendering-mode switches into/out of untracked modes. The extension dispatches an `eyetrackingstatechange` event on the session with `event.detail = { isTracking, activeMode }` and keeps `displayXR.eyeTracking.isTracking` current. Pages should use this instead of polling — e.g. pause head-coupled rendering on loss, or request a 2D mode after their own transition.
+Sent on `XrEventDataEyeTrackingStateChangedDXR` (#441 v14) — edge-triggered on every flip of the derived `isTracking` value (`activeMode.hasTracking && tracker lock`). Fires on DP tracking loss/recovery **and** on rendering-mode switches into/out of untracked modes. The extension dispatches an `eyetrackingstatechange` event on the session with `event.detail = { isTracking, activeMode }` and keeps `displayXR.eyeTracking.isTracking` current. Pages should use this instead of polling — e.g. pause head-coupled rendering on loss, or request a 2D mode after their own transition.
 
 ### `eye-poses`
 
@@ -182,13 +182,13 @@ Sent on `XrEventDataEyeTrackingStateChangedEXT` (#441 v14) — edge-triggered on
 
 Streamed at ~100 Hz when `eyePoseFormat` is `"raw"`. Contains per-view position, orientation (quaternion xyzw), and asymmetric FOV angles (radians) from `xrLocateViews` in RAW mode (no qwerty transform).
 
-**Per-view position sourcing.** When the runtime supports `XR_EXT_view_rig`, the bridge chains `XrViewDisplayRawEXT` on `xrLocateViews` and sources each view's `position` from the formal raw channel (`rawEyes[]`) — the same display-space inputs a native aware app consumes. The values are identical by construction to the legacy `XrView.pose` transport (both are the pre-rebase display-processor eyes); this is an input-plumbing formalization, not a behavior change. Views beyond the tracked-eye count (`eyeCountOutput`) — e.g. the surplus views of a quad rendering mode — fall back to the `XrView` pose, exactly as before.
+**Per-view position sourcing.** When the runtime supports `XR_DXR_view_rig`, the bridge chains `XrViewDisplayRawDXR` on `xrLocateViews` and sources each view's `position` from the formal raw channel (`rawEyes[]`) — the same display-space inputs a native aware app consumes. The values are identical by construction to the legacy `XrView.pose` transport (both are the pre-rebase display-processor eyes); this is an input-plumbing formalization, not a behavior change. Views beyond the tracked-eye count (`eyeCountOutput`) — e.g. the surplus views of a quad rendering mode — fall back to the `XrView` pose, exactly as before.
 
 **Additive fields (present only when the formal raw channel is live):**
 
 | Field | Type | Meaning |
 |---|---|---|
-| `source` | string | `"view-rig"` — positions came from the formal `XrViewDisplayRawEXT` channel. Absent on older runtimes (positions then come from `XrView.pose`). |
+| `source` | string | `"view-rig"` — positions came from the formal `XrViewDisplayRawDXR` channel. Absent on older runtimes (positions then come from `XrView.pose`). |
 | `isTracking` | bool | Physical eye-tracker lock (vs nominal-viewer fallback). |
 | `sampleTimeNs` | string | Monotonic timestamp (ns) when the eyes were sampled, as a **decimal string** (int64 exceeds JS `Number` precision). |
 | `displayPlane` | object | Physical display-plane pose in the locate space (`position` [x,y,z], `orientation` quaternion xyzw). Identity for the headless relay. |

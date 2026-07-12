@@ -105,7 +105,7 @@ struct xrt_plugin_display_info
 	int32_t display_screen_top;
 
 	/*! Eye-tracking mode bits supported by this display, as
-	 *  understood by `XR_EXT_display_info`. Bit 0 = MANAGED, bit 1 =
+	 *  understood by `XR_DXR_display_info`. Bit 0 = MANAGED, bit 1 =
 	 *  MANUAL; 0 = no eye tracking at all. A typical hardware DP is
 	 *  MANAGED-only (bit 0); sim_display declares 0 — its positions
 	 *  are nominal, not tracked (`SIM_DISPLAY_FAKE_TRACKING=1`
@@ -281,7 +281,7 @@ struct xrt_display_claim
  * + d3d11/d3d12/gl/metal), shifting every slot after it — a layout break. The
  * D3D12 and GL DP vtables gain `set_transparent_background` (the chroma-key-free
  * transparency enable the other variants already had), and the extension struct
- * drops `chromaKeyColor` (XR_EXT_win32_window_binding SPEC_VERSION 7→8). True
+ * drops `chromaKeyColor` (XR_DXR_win32_window_binding SPEC_VERSION 7→8). True
  * transparency (alpha-capable swapchain + transparent present) is the sole path.
  */
 #define XRT_PLUGIN_API_VERSION_1 1

@@ -1,11 +1,11 @@
 # Deprecating the 2D-surround / output-rect path in favour of display-zones
 
 **Status:** DONE — the output-rect/surround entry points + bespoke surround code are removed;
-display-zones is the sole region paradigm. Runtime spec bumps: `XR_EXT_win32_window_binding` v8,
-`XR_EXT_cocoa_window_binding` v7. Decision recorded as **ADR-031**.
+display-zones is the sole region paradigm. Runtime spec bumps: `XR_DXR_win32_window_binding` v8,
+`XR_DXR_cocoa_window_binding` v7. Decision recorded as **ADR-031**.
 **Owner:** runtime.
-**Refs:** ADR-031 (removal decision), ADR-027 (display zones), `XR_EXT_display_zones`,
-`XR_EXT_win32_window_binding`, `XR_EXT_cocoa_window_binding`.
+**Refs:** ADR-031 (removal decision), ADR-027 (display zones), `XR_DXR_display_zones`,
+`XR_DXR_win32_window_binding`, `XR_DXR_cocoa_window_binding`.
 
 > This doc now serves as **ADR-031's background** — the decision to remove the surround /
 > output-rect mechanism in favour of display-zones is recorded there. ADR-027 was left intact
@@ -17,8 +17,8 @@ There are two mechanisms in the runtime for expressing 2D vs 3D regions in a win
 
 | Mechanism | Expressiveness |
 |---|---|
-| `xrSetSharedTextureOutputRectEXT` + `xrSetSharedTextureSurround2DEXT`/`…FenceEXT` (the "2D surround") | **Exactly one** 3D rect + a monolithic full-window 2D fill, blitted 1:1, with per-API keyed-mutex / fence sync. |
-| `XR_EXT_display_zones` (ADR-027) | **N** 3D zones (each rect + rig + swapchain) + **M** 2D zones (`XrCompositionLayerLocal2DEXT`) + a per-pixel wish mask fed to the DP/hardware. |
+| `xrSetSharedTextureOutputRectDXR` + `xrSetSharedTextureSurround2DEXT`/`…FenceEXT` (the "2D surround") | **Exactly one** 3D rect + a monolithic full-window 2D fill, blitted 1:1, with per-API keyed-mutex / fence sync. |
+| `XR_DXR_display_zones` (ADR-027) | **N** 3D zones (each rect + rig + swapchain) + **M** 2D zones (`XrCompositionLayerLocal2DDXR`) + a per-pixel wish mask fed to the DP/hardware. |
 
 The surround is a strict, less-capable special case of display-zones:
 
@@ -38,7 +38,7 @@ its shared-texture read-back, identical to a handle app — locked in by
 
 ## 2. End state
 
-`XR_EXT_display_zones` is the single canonical model for all 2D/3D region expression. The
+`XR_DXR_display_zones` is the single canonical model for all 2D/3D region expression. The
 output-rect + surround entry points are removed; the bespoke surround compositor code
 (strip blit, surround shader, keyed-mutex/fence surround handling) is deleted. The
 handle / texture / hosted **app-class** distinction is orthogonal and unaffected — it is
@@ -46,7 +46,7 @@ about window/texture ownership, not region expression.
 
 ## 3. Transition plan
 
-1. **Deprecation markers** (done): banner on `XR_EXT_win32_window_binding` §3.5–3.7; this
+1. **Deprecation markers** (done): banner on `XR_DXR_win32_window_binding` §3.5–3.7; this
    doc; header annotations on the three entry points; CLAUDE.md texture-app-layout note.
 2. **Translation shim** (in progress): the runtime rewrites a legacy
    surround + output-rect frame into the synthetic *one 3D zone (the canvas) + surround as
@@ -81,9 +81,9 @@ about window/texture ownership, not region expression.
    the legacy `cube_texture_*` surround apps were retired.
 5. **Delete** (done — Step 5, branch `feat/634-step5-delete-surround`): the bespoke surround code
    (strip blit, surround shader, keyed-mutex/fence surround handling, the `DISPLAYXR_SURROUND_SHIM`
-   translation shim) and the three entry points (`xrSetSharedTextureOutputRectEXT`,
+   translation shim) and the three entry points (`xrSetSharedTextureOutputRectDXR`,
    `xrSetSharedTextureSurround2DEXT`, `xrSetSharedTextureSurround2DFenceEXT`) are removed; the
-   extension spec versions are bumped (`XR_EXT_win32_window_binding` v8, `XR_EXT_cocoa_window_binding`
+   extension spec versions are bumped (`XR_DXR_win32_window_binding` v8, `XR_DXR_cocoa_window_binding`
    v7). The decision is recorded as **ADR-031**, with a forward pointer added from ADR-027.
 
 ## 4. Backend coverage — which backends the shim touches (and why)
@@ -103,7 +103,7 @@ backends the shim covers (Metal verified; D3D11/D3D12 pending Windows validation
   service path), and there is no Android texture app or Android surround code (only
   `cube_handle_vk_android`). Covered by "VK = stub".
 - **Future GL/VK surround → canonical, not a shim.** If a GL or VK texture app ever needs a 2D
-  region, implement it **directly through `XR_EXT_display_zones` / the existing unified
+  region, implement it **directly through `XR_DXR_display_zones` / the existing unified
   composite from day one** — skip the bespoke-strip-blit-then-shim cycle entirely. New backends
   never grow a bespoke surround path to deprecate; that is the point of converging on zones.
 
@@ -142,5 +142,5 @@ backends the shim covers (Metal verified; D3D11/D3D12 pending Windows validation
   the composite; the shim harmlessly falls back to the bespoke strips for those. Surround is
   a texture-app feature in practice, so this is not a regression.
 - **External apps.** The entry points are now removed (Step 5); the spec-version bump
-  (`XR_EXT_win32_window_binding` v8, `XR_EXT_cocoa_window_binding` v7) signals it. Any
+  (`XR_DXR_win32_window_binding` v8, `XR_DXR_cocoa_window_binding` v7) signals it. Any
   unmigrated external app must move to display-zones.

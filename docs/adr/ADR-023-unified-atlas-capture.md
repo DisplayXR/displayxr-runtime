@@ -3,7 +3,7 @@ status: Accepted
 date: 2026-06-08
 issues: [396, 425]
 ---
-# ADR-023: Unified Atlas Capture (XR_EXT_atlas_capture)
+# ADR-023: Unified Atlas Capture (XR_DXR_atlas_capture)
 
 ## Context
 
@@ -28,7 +28,7 @@ Meanwhile the runtime already owns everything needed to do this centrally:
   distinction `POST_COMPOSE` (DP-bound atlas) vs `PROJECTION_ONLY`, driven by
   dev trigger files + the MCP `capture_frame` tool, with per-API readback in
   each compositor's `*_capture_atlas_to_png`.
-- **`xrCaptureWorkspaceFrameEXT`** (`XR_EXT_spatial_workspace`) — a real OpenXR
+- **`xrCaptureWorkspaceFrameDXR`** (`XR_DXR_spatial_workspace`) — a real OpenXR
   function, but privileged (workspace controller only), IPC + D3D11 only, and
   post-compose only.
 
@@ -37,8 +37,8 @@ mode-flagged entry point on top of the existing readback core.
 
 ## Decision
 
-Add a vendor-neutral extension **`XR_EXT_atlas_capture`** with one function
-`xrCaptureAtlasEXT(session, info, result)`. It captures the atlas the runtime
+Add a vendor-neutral extension **`XR_DXR_atlas_capture`** with one function
+`xrCaptureAtlasDXR(session, info, result)`. It captures the atlas the runtime
 composes **for the calling session** at a caller-selected stage
 (`PROJECTION_ONLY` / `POST_COMPOSE`) and returns the same metadata block
 (atlas/eye dims, tile layout, eye poses) the workspace capture returns.
@@ -50,10 +50,10 @@ composes **for the calling session** at a caller-selected stage
 - **All graphics APIs** are covered — the runtime does the readback with the
   compositor's own `*_capture_atlas_to_png`; the app never touches a staging
   texture.
-- **`xrCaptureWorkspaceFrameEXT` stays** as the privileged *cross-client*
+- **`xrCaptureWorkspaceFrameDXR` stays** as the privileged *cross-client*
   capture (the whole workspace composite — inherently a workspace concern),
   reimplemented on the shared readback core and gaining the `PROJECTION_ONLY`
-  flag. Apps move to `xrCaptureAtlasEXT`; the shell keeps the workspace call.
+  flag. Apps move to `xrCaptureAtlasDXR`; the shell keeps the workspace call.
 
 A **new** extension rather than ungating the workspace one: a universal
 all-apps capture must not live behind a "workspace controller" privilege or
@@ -93,8 +93,8 @@ unification is at the shared runtime readback layer, which both extensions use.
 
 ## References
 
-- Header `src/external/openxr_includes/openxr/XR_EXT_atlas_capture.h`; impl
+- Header `src/external/openxr_includes/openxr/XR_DXR_atlas_capture.h`; impl
   `src/xrt/state_trackers/oxr/oxr_capture.c`.
-- `XR_EXT_spatial_workspace` (`xrCaptureWorkspaceFrameEXT` + `PROJECTION_ONLY`).
+- `XR_DXR_spatial_workspace` (`xrCaptureWorkspaceFrameDXR` + `PROJECTION_ONLY`).
 - Shipped in runtime v1.10.0. Epic #396 (W6); filename/alpha contract #425.
 - Related: `docs/roadmap/3d-capture.md` (the user-facing L/R capture feature).

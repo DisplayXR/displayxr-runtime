@@ -4,7 +4,7 @@
 **Scope**: regular Windows desktop, no shell, single or multiple 3D apps in normal windows. Shell-mode generalization is a superset of this and not covered here.
 **Audience**: DisplayXR runtime contributors; vendors implementing the display processor (DP) vtable.
 
-> **Relationship to compositor 2D/3D compositing.** This note covers the **hardware-consumer leg** of a shared mask: publishing a screen-space 3D-zone mask to the vendor DP → panel firmware so the *physical switchable-lens cells* track which window regions are 3D. The complementary **compositor-consumer leg** — the runtime software-compositing flat 2D over weaved 3D inside an app's surface, driven by the *same* authored alpha mask — is specified in [unified-2d-3d-compositing.md](unified-2d-3d-compositing.md). The two are one artifact with two readers and **must agree** (a weaved pixel needs a 3D lens cell over it; a flat pixel needs a flat cell). The `XR_EXT_local_3d_zone` authoring API below is shared by both legs; the unifying spec adds the second consumer behind it rather than inventing a second mask.
+> **Relationship to compositor 2D/3D compositing.** This note covers the **hardware-consumer leg** of a shared mask: publishing a screen-space 3D-zone mask to the vendor DP → panel firmware so the *physical switchable-lens cells* track which window regions are 3D. The complementary **compositor-consumer leg** — the runtime software-compositing flat 2D over weaved 3D inside an app's surface, driven by the *same* authored alpha mask — is specified in [unified-2d-3d-compositing.md](unified-2d-3d-compositing.md). The two are one artifact with two readers and **must agree** (a weaved pixel needs a 3D lens cell over it; a flat pixel needs a flat cell). The `XR_DXR_local_3d_zone` authoring API below is shared by both legs; the unifying spec adds the second consumer behind it rather than inventing a second mask.
 
 ## Problem
 
@@ -65,7 +65,7 @@ Two channels per app: (1) the swap chain DWM sees (interlaced inside 3D rects, m
 
 This is the only surface between runtime and vendor. Three methods appended to `xrt_display_processor_d3d11` (`src/xrt/include/xrt/xrt_display_processor_d3d11.h`, slots 12–14; shared caps struct in `xrt_display_zones.h`), append-only within the ABI major per ADR-020 — older plug-ins report a smaller `struct_size` and the runtime treats the slots as absent (legacy DP).
 
-> **Design revision vs. the original draft.** The draft had the DP allocate a shared mask texture behind a create/publish/clear/destroy handle lifecycle — a shape motivated by cross-process sharing. The shipped `XR_EXT_local_3d_zone` compositor consumer (#439) already owns a window-sized R8_UNORM staged mask on the session's own in-process D3D11 device, so the in-process contract is **stateless publish**: the runtime passes the mask SRV per publish and the DP samples/copies it during the call (the immediate context serializes against the runtime's writes; the DP must not hold the SRV past return). DP-side lifecycle methods can be appended later when a cross-process leg (IPC/service zone masks) needs real sharing primitives.
+> **Design revision vs. the original draft.** The draft had the DP allocate a shared mask texture behind a create/publish/clear/destroy handle lifecycle — a shape motivated by cross-process sharing. The shipped `XR_DXR_local_3d_zone` compositor consumer (#439) already owns a window-sized R8_UNORM staged mask on the session's own in-process D3D11 device, so the in-process contract is **stateless publish**: the runtime passes the mask SRV per publish and the DP samples/copies it during the call (the immediate context serializes against the runtime's writes; the DP must not hold the SRV past return). DP-side lifecycle methods can be appended later when a cross-process leg (IPC/service zone masks) needs real sharing primitives.
 
 ### Capability query
 
@@ -86,7 +86,7 @@ bool (*get_local_zone_caps)(struct xrt_display_processor_d3d11 *xdp,
 
 Three meaningful return shapes:
 
-- slot absent / NULL / `supported = 0`: legacy DP. Runtime keeps the existing global `request_display_mode` path and never calls the publish methods. `xrGetLocal3DZoneCapabilitiesEXT` reports `hardwareZoneGrid = 0×0` (the compositor consumer still works — the mask composites, it just can't drive the panel).
+- slot absent / NULL / `supported = 0`: legacy DP. Runtime keeps the existing global `request_display_mode` path and never calls the publish methods. `xrGetLocal3DZoneCapabilitiesDXR` reports `hardwareZoneGrid = 0×0` (the compositor consumer still works — the mask composites, it just can't drive the panel).
 - `supported = 1, zone_grid = 1×1`: vendor implements the new API but the hardware is single-zone. OR-union of all client masks collapses to "any client requesting any 3D anywhere → screen is 3D" — identical to today's bool arbitration.
 - `supported = 1, zone_grid > 1×1`: real local zones. Same runtime path; vendor does the heavy lifting.
 
@@ -94,11 +94,11 @@ Three meaningful return shapes:
 
 ```c
 // Per-frame publish. The runtime owns the mask texture (the staged
-// XR_EXT_local_3d_zone snapshot — R8_UNORM, client-window pixels, non-zero =
+// XR_DXR_local_3d_zone snapshot — R8_UNORM, client-window pixels, non-zero =
 // 3D) and passes an SRV on the session's own D3D11 device. screen_x/y/w/h
 // anchor the mask's pixel space on the panel (physical pixels, post-DPI
 // client rect). seq is the mask CONTENT generation — bumped only on
-// xrSubmitLocal3DZoneEXT; same-seq publishes differ only in the screen
+// xrSubmitLocal3DZoneDXR; same-seq publishes differ only in the screen
 // anchor, so a vendor evaluates content once per generation, not per
 // frame. The DP samples or copies DURING the call.
 bool (*publish_local_zone_mask)(struct xrt_display_processor_d3d11 *xdp,
@@ -145,46 +145,46 @@ The vendor is free to do anything that produces the right user-visible result.
 
 Everything above the DP vtable that we own in this repo.
 
-### New OpenXR extension: `XR_EXT_local_3d_zone`
+### New OpenXR extension: `XR_DXR_local_3d_zone`
 
 Thin shim over the DP vtable. Lets OpenXR apps express "this region of my window is 3D" without touching vendor APIs directly.
 
 ```c
 // Capability query.
-XrResult xrGetLocal3DZoneCapabilitiesEXT(
+XrResult xrGetLocal3DZoneCapabilitiesDXR(
     XrSession session,
-    XrLocal3DZoneCapabilitiesEXT* caps);
+    XrLocal3DZoneCapabilitiesDXR* caps);
 
-// Create a mask bound to the session's window (HWND known via XR_EXT_win32_window_binding).
-XrResult xrCreateLocal3DZoneMaskEXT(
+// Create a mask bound to the session's window (HWND known via XR_DXR_win32_window_binding).
+XrResult xrCreateLocal3DZoneMaskDXR(
     XrSession session,
-    const XrLocal3DZoneMaskCreateInfoEXT* info,
-    XrLocal3DZoneMaskEXT* outMask);
+    const XrLocal3DZoneMaskCreateInfoDXR* info,
+    XrLocal3DZoneMaskDXR* outMask);
 
 // Tier 1 — whole-window convenience.
-XrResult xrSetLocal3DZoneWholeWindowEXT(
-    XrLocal3DZoneMaskEXT mask,
+XrResult xrSetLocal3DZoneWholeWindowDXR(
+    XrLocal3DZoneMaskDXR mask,
     XrBool32 enable3D);
 
 // Tier 2 — rect list. Runtime rasterizes into the mask texture for the app.
-XrResult xrSetLocal3DZoneFromRectsEXT(
-    XrLocal3DZoneMaskEXT mask,
+XrResult xrSetLocal3DZoneFromRectsDXR(
+    XrLocal3DZoneMaskDXR mask,
     uint32_t rectCount,
     const XrRect2Di* rects);                      // in client-window pixels
 
 // Tier 3 — render-target access for dynamic / freeform masks.
 // Returned binding is graphics-API-typed via sibling extensions
-// (XR_EXT_local_3d_zone_d3d11, _d3d12, _vulkan, _opengl, _metal).
-XrResult xrAcquireLocal3DZoneRenderTargetEXT(
-    XrLocal3DZoneMaskEXT mask,
+// (XR_DXR_local_3d_zone_d3d11, _d3d12, _vulkan, _opengl, _metal).
+XrResult xrAcquireLocal3DZoneRenderTargetDXR(
+    XrLocal3DZoneMaskDXR mask,
     void* outBinding);
 
 // Submit current state. Runtime applies occlusion, computes screen rect,
 // signals fence, calls DP vtable publish.
-XrResult xrSubmitLocal3DZoneEXT(
-    XrLocal3DZoneMaskEXT mask);
+XrResult xrSubmitLocal3DZoneDXR(
+    XrLocal3DZoneMaskDXR mask);
 
-XrResult xrDestroyLocal3DZoneMaskEXT(XrLocal3DZoneMaskEXT mask);
+XrResult xrDestroyLocal3DZoneMaskDXR(XrLocal3DZoneMaskDXR mask);
 ```
 
 Tiered API ergonomics:
@@ -216,8 +216,8 @@ Whether the vendor's arbitration runs in-process per app or in a centralized ven
 
 If `xrt_dp_get_local_zone_caps(dp).supported == false`:
 
-- `xrGetLocal3DZoneCapabilitiesEXT` reports unsupported. Most apps will then either fall back to today's global request flow (existing `xrRequestDisplayRenderingModeEXT` path on legacy `XR_EXT_display_info`) or stay 2D.
-- A convenience compatibility shim: `xrSetLocal3DZoneWholeWindowEXT(true)` on a legacy DP transparently calls the legacy global-3D path. `false` calls the legacy global-2D path. Apps that only need whole-window 3D need no version-specific code.
+- `xrGetLocal3DZoneCapabilitiesDXR` reports unsupported. Most apps will then either fall back to today's global request flow (existing `xrRequestDisplayRenderingModeDXR` path on legacy `XR_DXR_display_info`) or stay 2D.
+- A convenience compatibility shim: `xrSetLocal3DZoneWholeWindowDXR(true)` on a legacy DP transparently calls the legacy global-3D path. `false` calls the legacy global-2D path. Apps that only need whole-window 3D need no version-specific code.
 
 ### What the runtime does NOT do
 
@@ -232,10 +232,10 @@ If `xrt_dp_get_local_zone_caps(dp).supported == false`:
 
 **Whole-window 3D app** (e.g. today's `cube_handle_d3d11_win`):
 ```c
-XrLocal3DZoneMaskEXT mask;
-xrCreateLocal3DZoneMaskEXT(session, &createInfo, &mask);
-xrSetLocal3DZoneWholeWindowEXT(mask, XR_TRUE);
-xrSubmitLocal3DZoneEXT(mask);                  // once at startup
+XrLocal3DZoneMaskDXR mask;
+xrCreateLocal3DZoneMaskDXR(session, &createInfo, &mask);
+xrSetLocal3DZoneWholeWindowDXR(mask, XR_TRUE);
+xrSubmitLocal3DZoneDXR(mask);                  // once at startup
 // ... no per-frame mask work; runtime republishes each frame.
 ```
 
@@ -243,17 +243,17 @@ xrSubmitLocal3DZoneEXT(mask);                  // once at startup
 ```c
 // On window resize / viewport move:
 XrRect2Di rect = { {viewport_x, viewport_y}, {viewport_w, viewport_h} };
-xrSetLocal3DZoneFromRectsEXT(mask, 1, &rect);
-xrSubmitLocal3DZoneEXT(mask);
+xrSetLocal3DZoneFromRectsDXR(mask, 1, &rect);
+xrSubmitLocal3DZoneDXR(mask);
 ```
 
 **Animated / freeform mask** (Tier 3):
 ```c
 // Per-frame, inside the app's render loop:
-XrLocal3DZoneRenderTargetD3D11EXT rt;
-xrAcquireLocal3DZoneRenderTargetEXT(mask, &rt);
+XrLocal3DZoneRenderTargetD3D11DXR rt;
+xrAcquireLocal3DZoneRenderTargetDXR(mask, &rt);
 // Draw shapes into rt.renderTargetView using app's normal renderer.
-xrSubmitLocal3DZoneEXT(mask);
+xrSubmitLocal3DZoneDXR(mask);
 ```
 
 ---
@@ -273,7 +273,7 @@ xrSubmitLocal3DZoneEXT(mask);
 **Phase 0 — DP vtable additions land in the runtime, on top of existing hardware.**
 *Runtime side DONE (June 2026): D3D11 vtable slots 12–14, compositor per-frame publish/clear, hwGrid caps wiring, sim_display test double (`SIM_DISPLAY_ZONE_GRID=WxH` simulated grid + `SIM_DISPLAY_ZONE_DUMP=1` OR-downsampled per-cell readback logging — the hardware-free end-to-end check).* Remaining: first-vendor (Leia) DP implements `get_local_zone_caps` reporting `supported = 1, zone_grid = 1×1` and OR-collapses publishes to today's global on/off path. Existing apps unaffected. Validates the API surface before any per-zone hardware exists.
 
-**Phase 1 — runtime ships `XR_EXT_local_3d_zone`.**
+**Phase 1 — runtime ships `XR_DXR_local_3d_zone`.**
 *Authoring API + compositor consumer SHIPPED via #439 Phases 1–2 (ahead of this leg).* Remaining here: occlusion subtraction (deferred from Phase 0) in preparation for Phase 2. Any vendor wanting to participate implements the DP vtable additions; the bar is low (1×1 grid + the new vtable methods is enough).
 
 **Phase 2 — per-zone hardware lands** (from any vendor).
@@ -290,4 +290,4 @@ Shell becomes one more client publishing a mask; multi-app per-window 3D in shel
 - Vendor integration guide: `docs/guides/vendor-plugin-onboarding.md` — to be extended with the local-zone vtable methods once this spec lands.
 - Vendor-initiated state change events (today): `comp_d3d11_service.cpp:10180–10230`, `oxr_session.c:968` — the polling/event pattern that the new local-zone path coexists with, not replaces.
 - ADR-014 (shell owns rendering mode): generalizes in the zone world — the shell becomes one mask publisher among many rather than the sole policy holder.
-- `docs/specs/extensions/XR_EXT_display_info.md`: candidate place for `localZoneCapable` + grid dimensions to surface to apps that don't take the full `XR_EXT_local_3d_zone` extension.
+- `docs/specs/extensions/XR_DXR_display_info.md`: candidate place for `localZoneCapable` + grid dimensions to surface to apps that don't take the full `XR_DXR_local_3d_zone` extension.

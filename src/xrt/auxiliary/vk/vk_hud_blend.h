@@ -32,7 +32,7 @@ extern "C" {
 // the bound must cover (max concurrent window-space layers) × (images/swapchain),
 // not just the 1-2 layers an undersized cache happened to allow. 64 ≈ 21 layers ×
 // 3 images — generous headroom for realistic per-depth-plane 2D UI (see issue #389
-// and the layering guidance in docs/specs/extensions/XR_EXT_win32_window_binding.md).
+// and the layering guidance in docs/specs/extensions/XR_DXR_win32_window_binding.md).
 #define VK_HUD_BLEND_MAX_FBS    64 //!< Cached framebuffers (per swapchain image).
 #define VK_HUD_BLEND_MAX_IMAGES 64 //!< Cached HUD source images (descriptor sets).
 

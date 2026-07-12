@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  XR_EXT_mcp_tools — app-defined MCP tools on the per-process server.
+ * @brief  XR_DXR_mcp_tools — app-defined MCP tools on the per-process server.
  * @ingroup oxr_main
  *
  * The runtime already hosts an MCP server inside every app process
@@ -14,8 +14,8 @@
  * Dispatch contract (design doc per-app-mcp-tools.md §4.2): the MCP
  * transport thread never calls app code. The trampoline registered as
  * each tool's handler parks the JSON-RPC request in a pending-call
- * slot, pushes an XrEventDataMCPToolCallEXT, and blocks on a condvar
- * until the app answers via xrSubmitMCPToolResultEXT — or until the
+ * slot, pushes an XrEventDataMCPToolCallDXR, and blocks on a condvar
+ * until the app answers via xrSubmitMCPToolResultDXR — or until the
  * 5 s timeout, after which the agent gets a tool error and a late
  * result is silently dropped.
  *
@@ -32,7 +32,7 @@
 #include "oxr_api_verify.h"
 #include "oxr_mcp_tools.h"
 
-#ifdef OXR_HAVE_EXT_mcp_tools
+#ifdef OXR_HAVE_DXR_mcp_tools
 
 #include "displayxr_mcp/mcp_server.h"
 
@@ -54,7 +54,7 @@ struct app_tool
 {
 	bool used;
 	struct oxr_session *sess;
-	char name[XR_MAX_MCP_TOOL_NAME_SIZE_EXT];
+	char name[XR_MAX_MCP_TOOL_NAME_SIZE_DXR];
 	char *description;      //!< strdup'd; freed on unregister.
 	char *schema;           //!< strdup'd or NULL.
 	struct mcp_tool tool;   //!< Registered with the framework; stable storage.
@@ -67,8 +67,8 @@ struct pending_call
 	bool abandoned; //!< Timed out or tool/session torn down; awaiting reap.
 	uint64_t call_id;
 	struct oxr_session *sess;
-	char *args_json;   //!< Owned. Exposed via xrGetMCPToolCallArgsEXT.
-	char *result_json; //!< Owned. Set by xrSubmitMCPToolResultEXT.
+	char *args_json;   //!< Owned. Exposed via xrGetMCPToolCallArgsDXR.
+	char *result_json; //!< Owned. Set by xrSubmitMCPToolResultDXR.
 	bool success;
 	time_t abandoned_at; //!< For the reaper.
 };
@@ -105,7 +105,7 @@ tool_name_valid(const char *name)
 		return false;
 	}
 	size_t len = strlen(name);
-	if (len >= XR_MAX_MCP_TOOL_NAME_SIZE_EXT) {
+	if (len >= XR_MAX_MCP_TOOL_NAME_SIZE_DXR) {
 		return false;
 	}
 	for (size_t i = 0; i < len; i++) {
@@ -129,7 +129,7 @@ app_id_valid(const char *id)
 		return false;
 	}
 	size_t len = strlen(id);
-	if (len >= XR_MAX_MCP_APP_ID_SIZE_EXT) {
+	if (len >= XR_MAX_MCP_APP_ID_SIZE_DXR) {
 		return false;
 	}
 	for (size_t i = 0; i < len; i++) {
@@ -266,7 +266,7 @@ oxr_mcp_app_tools_session_destroy(struct oxr_session *sess)
 	// Collect names first; mcp_server_unregister_tool broadcasts a
 	// list_changed per call and must not run under g_lock (it takes the
 	// framework's own locks).
-	char names[MAX_APP_TOOLS][XR_MAX_MCP_TOOL_NAME_SIZE_EXT];
+	char names[MAX_APP_TOOLS][XR_MAX_MCP_TOOL_NAME_SIZE_DXR];
 	size_t name_count = 0;
 
 	pthread_mutex_lock(&g_lock);
@@ -319,12 +319,12 @@ oxr_mcp_app_tools_session_destroy(struct oxr_session *sess)
  */
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetMCPAppInfoEXT(XrSession session, const XrMCPAppInfoEXT *info)
+oxr_xrSetMCPAppInfoEXT(XrSession session, const XrMCPAppInfoDXR *info)
 {
 	struct oxr_session *sess;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetMCPAppInfoEXT");
-	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, info, XR_TYPE_MCP_APP_INFO_EXT);
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetMCPAppInfoDXR");
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, info, XR_TYPE_MCP_APP_INFO_DXR);
 
 	if (!mcp_active()) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
@@ -340,12 +340,12 @@ oxr_xrSetMCPAppInfoEXT(XrSession session, const XrMCPAppInfoEXT *info)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrRegisterMCPToolEXT(XrSession session, const XrMCPToolInfoEXT *tool)
+oxr_xrRegisterMCPToolEXT(XrSession session, const XrMCPToolInfoDXR *tool)
 {
 	struct oxr_session *sess;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRegisterMCPToolEXT");
-	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, tool, XR_TYPE_MCP_TOOL_INFO_EXT);
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRegisterMCPToolDXR");
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, tool, XR_TYPE_MCP_TOOL_INFO_DXR);
 
 	if (!mcp_active()) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
@@ -405,7 +405,7 @@ oxr_xrUnregisterMCPToolEXT(XrSession session, const char *name)
 {
 	struct oxr_session *sess;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrUnregisterMCPToolEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrUnregisterMCPToolDXR");
 
 	if (!mcp_active()) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
@@ -455,7 +455,7 @@ oxr_xrGetMCPToolCallArgsEXT(
 {
 	struct oxr_session *sess;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetMCPToolCallArgsEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetMCPToolCallArgsDXR");
 	OXR_VERIFY_ARG_NOT_NULL(&log, countOutput);
 
 	pthread_mutex_lock(&g_lock);
@@ -491,7 +491,7 @@ oxr_xrSubmitMCPToolResultEXT(XrSession session, uint64_t callId, XrBool32 succes
 {
 	struct oxr_session *sess;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSubmitMCPToolResultEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSubmitMCPToolResultDXR");
 
 	pthread_mutex_lock(&g_lock);
 	struct pending_call *pc = NULL;
@@ -520,4 +520,4 @@ oxr_xrSubmitMCPToolResultEXT(XrSession session, uint64_t callId, XrBool32 succes
 	return XR_SUCCESS;
 }
 
-#endif // OXR_HAVE_EXT_mcp_tools
+#endif // OXR_HAVE_DXR_mcp_tools

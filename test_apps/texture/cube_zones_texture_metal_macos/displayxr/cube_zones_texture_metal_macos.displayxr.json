@@ -5,7 +5,7 @@
   "type": "3d",
   "category": "test",
   "display_mode": "auto",
-  "description": "XR_EXT_display_zones PARITY TEST (ADR-027), macOS Metal texture-class leg: same two-3D-zone + Local2D-strip + wish-mask submission as cube_zones_metal_macos, but the app provides a shared IOSurface and presents it itself — proving a texture app receives the full multi-zone composite written back into its shared surface (M=wish mode, O=overlap toggle).",
+  "description": "XR_DXR_display_zones PARITY TEST (ADR-027), macOS Metal texture-class leg: same two-3D-zone + Local2D-strip + wish-mask submission as cube_zones_metal_macos, but the app provides a shared IOSurface and presents it itself — proving a texture app receives the full multi-zone composite written back into its shared surface (M=wish mode, O=overlap toggle).",
   "icon": "icon.png",
   "icon_3d": "icon_sbs.png",
   "icon_3d_layout": "sbs-lr"
