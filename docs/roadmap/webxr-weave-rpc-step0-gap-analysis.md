@@ -27,7 +27,7 @@ the result itself. The caller never weaves (ADR-007 / ADR-019).
 
 **No. In-process only.**
 
-- `oxr_xrSetSharedTextureOutputRectEXT` and `oxr_xrSetSharedTextureSurround2DEXT` dispatch
+- `oxr_xrSetSharedTextureOutputRectDXR` and `oxr_xrSetSharedTextureSurround2DEXT` dispatch
   **only** to `sess->is_*_native_compositor && sess->xcn != NULL` branches (D3D11 / Metal / GL /
   VK / D3D12) and otherwise return `XR_ERROR_FEATURE_UNSUPPORTED` —
   `src/xrt/state_trackers/oxr/oxr_api_session.c:1643-1678`. There is **no** `is_service_mode` /

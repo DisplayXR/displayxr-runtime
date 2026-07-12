@@ -319,7 +319,7 @@ oxr_mcp_app_tools_session_destroy(struct oxr_session *sess)
  */
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetMCPAppInfoEXT(XrSession session, const XrMCPAppInfoDXR *info)
+oxr_xrSetMCPAppInfoDXR(XrSession session, const XrMCPAppInfoDXR *info)
 {
 	struct oxr_session *sess;
 	struct oxr_logger log;
@@ -340,7 +340,7 @@ oxr_xrSetMCPAppInfoEXT(XrSession session, const XrMCPAppInfoDXR *info)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrRegisterMCPToolEXT(XrSession session, const XrMCPToolInfoDXR *tool)
+oxr_xrRegisterMCPToolDXR(XrSession session, const XrMCPToolInfoDXR *tool)
 {
 	struct oxr_session *sess;
 	struct oxr_logger log;
@@ -401,7 +401,7 @@ oxr_xrRegisterMCPToolEXT(XrSession session, const XrMCPToolInfoDXR *tool)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrUnregisterMCPToolEXT(XrSession session, const char *name)
+oxr_xrUnregisterMCPToolDXR(XrSession session, const char *name)
 {
 	struct oxr_session *sess;
 	struct oxr_logger log;
@@ -450,7 +450,7 @@ oxr_xrUnregisterMCPToolEXT(XrSession session, const char *name)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrGetMCPToolCallArgsEXT(
+oxr_xrGetMCPToolCallArgsDXR(
     XrSession session, uint64_t callId, uint32_t capacity, uint32_t *countOutput, char *buffer)
 {
 	struct oxr_session *sess;
@@ -487,7 +487,7 @@ oxr_xrGetMCPToolCallArgsEXT(
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSubmitMCPToolResultEXT(XrSession session, uint64_t callId, XrBool32 success, const char *resultJson)
+oxr_xrSubmitMCPToolResultDXR(XrSession session, uint64_t callId, XrBool32 success, const char *resultJson)
 {
 	struct oxr_session *sess;
 	struct oxr_logger log;

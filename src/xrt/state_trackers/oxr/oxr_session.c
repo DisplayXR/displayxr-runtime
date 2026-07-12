@@ -1446,7 +1446,7 @@ view_rig_update_from_chain(struct oxr_session *sess, const XrViewLocateInfo *vie
  * descriptor (NULL clears) into the xrt-boundary shape and push it to the
  * system compositor, which applies it to the workspace's app-client locates
  * server-side. Same clamp policy + boundary conversions as the per-locate
- * chain parser above. Caller (oxr_xrSetWorkspaceViewRigEXT) has already
+ * chain parser above. Caller (oxr_xrSetWorkspaceViewRigDXR) has already
  * verified the session is the active workspace controller.
  */
 XrResult

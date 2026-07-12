@@ -2377,8 +2377,8 @@ struct oxr_session
 	//! The original `xrRequestDisplayRenderingModeDXR` gate exempts headless
 	//! sessions via `compositor == NULL` — that misses graphics-bound
 	//! controllers like the shell. This flag distinguishes them so they keep
-	//! their legitimate mode authority. Set in oxr_xrActivateSpatialWorkspaceEXT;
-	//! cleared in oxr_xrDeactivateSpatialWorkspaceEXT.
+	//! their legitimate mode authority. Set in oxr_xrActivateSpatialWorkspaceDXR;
+	//! cleared in oxr_xrDeactivateSpatialWorkspaceDXR.
 	bool is_active_workspace_controller;
 
 	//! True if display hardware is currently in 3D mode.

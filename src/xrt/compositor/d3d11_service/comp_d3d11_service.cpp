@@ -12115,7 +12115,7 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 }
 
 /*!
- * Hook for oxr_xrRequestDisplayRenderingModeEXT when called by a workspace
+ * Hook for oxr_xrRequestDisplayRenderingModeDXR when called by a workspace
  * controller session (#234). Routes through the acked-flip + curtain path
  * on the multi-compositor; the OXR layer then SKIPS the legacy immediate
  * device-mode-update path, avoiding the raw-atlas glitch that's otherwise
@@ -12131,7 +12131,7 @@ system_request_workspace_mode_flip(struct xrt_system_compositor *xsysc, uint32_t
 }
 
 /*!
- * Hook for oxr_xrSetWorkspaceViewRigEXT (#396 W7). Stores the controller's
+ * Hook for oxr_xrSetWorkspaceViewRigDXR (#396 W7). Stores the controller's
  * imposed view rig; ipc_try_get_sr_view_poses applies it to app-client locates.
  */
 static bool

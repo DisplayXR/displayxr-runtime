@@ -99,7 +99,7 @@ session_is_ipc(struct oxr_session *sess)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrWeaveBindWindowEXT(XrSession session, void *windowHandle)
+oxr_xrWeaveBindWindowDXR(XrSession session, void *windowHandle)
 {
 	OXR_TRACE_MARKER();
 
@@ -125,7 +125,7 @@ oxr_xrWeaveBindWindowEXT(XrSession session, void *windowHandle)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrWeaveSubmitEXT(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, XrWeaveOutputDXR *output)
+oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, XrWeaveOutputDXR *output)
 {
 	OXR_TRACE_MARKER();
 
@@ -209,7 +209,7 @@ oxr_xrWeaveSubmitEXT(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrWeaveSnapWindowRectEXT(XrSession session,
+oxr_xrWeaveSnapWindowRectDXR(XrSession session,
                              const XrRect2Di *originRect,
                              const XrRect2Di *targetRect,
                              XrRect2Di *snappedRect)

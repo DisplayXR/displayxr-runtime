@@ -229,7 +229,7 @@ typedef XrResult (XRAPI_PTR *PFN_xrRemoveWorkspaceCaptureClientDXR)(
  * what the hit means (focus, drag, right-click forward, title-bar grab,
  * resize-edge etc.). The runtime does NOT classify hits — that is policy.
  */
-typedef XrResult (XRAPI_PTR *PFN_xrWorkspaceHitTestEXT)(
+typedef XrResult (XRAPI_PTR *PFN_xrWorkspaceHitTestDXR)(
     XrSession            session,
     int32_t              cursorX,
     int32_t              cursorY,

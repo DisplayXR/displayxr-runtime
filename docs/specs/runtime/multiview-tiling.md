@@ -145,7 +145,7 @@ uint32_t atlas_width_pixels, atlas_height_pixels;
 
 ### Phase E: Extension struct update
 
-`XrDisplayRenderingModeInfoDXR` includes `tileColumns`, `tileRows`, `viewWidthPixels`, `viewHeightPixels`. Populated by `oxr_xrEnumerateDisplayRenderingModesEXT`.
+`XrDisplayRenderingModeInfoDXR` includes `tileColumns`, `tileRows`, `viewWidthPixels`, `viewHeightPixels`. Populated by `oxr_xrEnumerateDisplayRenderingModesDXR`.
 
 ### Phase F: Runtime init computation
 
