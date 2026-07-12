@@ -6,7 +6,8 @@
 // Khronos OpenXR registry: extension numbers and XrStructureType values sit
 // in a provisional experimental block (1004999xxx) pending official
 // assignment. Extension names are expected to be stable; numeric values are
-// not. SPEC_VERSION restarted at 1 on the XR_EXT_* -> XR_DXR_* rename.
+// not. SPEC_VERSION continues the pre-rename XR_EXT_* numbering (the
+// interface history did not restart with the name).
 // See GOVERNANCE.md.
 //
 /*!
@@ -39,7 +40,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_win32_window_binding 1
-#define XR_DXR_win32_window_binding_SPEC_VERSION 1
+#define XR_DXR_win32_window_binding_SPEC_VERSION 8
 #define XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME "XR_DXR_win32_window_binding"
 
 // Use a value in the vendor extension range (1000000000+)

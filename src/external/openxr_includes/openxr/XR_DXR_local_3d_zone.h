@@ -6,7 +6,8 @@
 // Khronos OpenXR registry: extension numbers and XrStructureType values sit
 // in a provisional experimental block (1004999xxx) pending official
 // assignment. Extension names are expected to be stable; numeric values are
-// not. SPEC_VERSION restarted at 1 on the XR_EXT_* -> XR_DXR_* rename.
+// not. SPEC_VERSION continues the pre-rename XR_EXT_* numbering (the
+// interface history did not restart with the name).
 // See GOVERNANCE.md.
 //
 /*!
@@ -54,7 +55,7 @@ extern "C" {
 // reserved it first). No struct/field/entry-point changes; consumers only
 // need a header re-sync + rebuild. See README.md (allocation registry) in
 // this directory.
-#define XR_DXR_local_3d_zone_SPEC_VERSION 1
+#define XR_DXR_local_3d_zone_SPEC_VERSION 4
 #define XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME "XR_DXR_local_3d_zone"
 
 // Extension type-value range (1004999xxx); replace with a Khronos-assigned

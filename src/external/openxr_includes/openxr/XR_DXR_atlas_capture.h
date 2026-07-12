@@ -6,7 +6,8 @@
 // Khronos OpenXR registry: extension numbers and XrStructureType values sit
 // in a provisional experimental block (1004999xxx) pending official
 // assignment. Extension names are expected to be stable; numeric values are
-// not. SPEC_VERSION restarted at 1 on the XR_EXT_* -> XR_DXR_* rename.
+// not. SPEC_VERSION continues the pre-rename XR_EXT_* numbering (the
+// interface history did not restart with the name).
 // See GOVERNANCE.md.
 //
 /*!
@@ -43,7 +44,7 @@ extern "C" {
 // SPEC_VERSION 2: the runtime appends "_atlas_<viewCount>_<cols>x<rows>.png"
 // (was a flat "_atlas.png" in v1), and the encoded PNG is always opaque
 // (alpha forced to 255). See issue #425.
-#define XR_DXR_atlas_capture_SPEC_VERSION 1
+#define XR_DXR_atlas_capture_SPEC_VERSION 3
 #define XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME "XR_DXR_atlas_capture"
 
 // Reserved 1004999170..171. Final values reconcile with the Khronos registry
