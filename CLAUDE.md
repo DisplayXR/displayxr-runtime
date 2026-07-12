@@ -2,6 +2,8 @@
 
 Guidance for Claude Code (claude.ai/code) when working in this repository.
 
+> **TRANSITION NOTE (delete once every dev box is migrated).** The bespoke extensions were renamed `XR_EXT_*` → `XR_DXR_*` and shipped 2026-07-12 as the **v2.0.0 train** (#734/#735; no aliasing — old-name apps get `XR_ERROR_EXTENSION_NOT_PRESENT`). If **this machine's Claude memories** still use the old names, migrate once: `python scripts/dxr_rename.py apply <memory-dir>` + `verify` (idempotent; never touches Khronos `EXT` names). Old memories saying the rename is "deferred/pending" are stale — it shipped; only the Khronos author-ID registration (OpenXR-Docs#199) is still in flight. Per-box instructions: #735.
+
 ## Overview
 
 DisplayXR is a lightweight standalone OpenXR runtime purpose-built for 3D displays (originally forked from **Monado**). It implements the Khronos OpenXR API on Windows, macOS, Linux, and Android. The runtime is vendor-agnostic — any 3D display vendor integrates via a plug-in DLL; **Leia SR** is the first integration.
