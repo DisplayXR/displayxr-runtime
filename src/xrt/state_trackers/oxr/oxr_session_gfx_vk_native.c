@@ -270,7 +270,7 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	}
 
 #ifdef XRT_OS_ANDROID
-	// POC plumbing for XR_EXT_android_surface_binding. Apps don't pass an
+	// POC plumbing for XR_DXR_android_surface_binding. Apps don't pass an
 	// ANativeWindow* yet, so spawn a SurfaceView on the activity via
 	// android_custom_surface (existing Monado machinery) and block briefly
 	// for its ANativeWindow. Leaks the handle for now — process scope,

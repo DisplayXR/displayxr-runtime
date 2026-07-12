@@ -255,7 +255,7 @@ The runtime APK registers as an OpenXR runtime service via `org.khronos.openxr.O
 
 - [#125](https://github.com/DisplayXR/displayxr-runtime/issues/125) — CNSDK Vulkan display processor
 - [#127](https://github.com/DisplayXR/displayxr-runtime/issues/127) — Vulkan compositor Android support
-- [#130](https://github.com/DisplayXR/displayxr-runtime/issues/130) — `XR_EXT_android_surface_binding`
+- [#130](https://github.com/DisplayXR/displayxr-runtime/issues/130) — `XR_DXR_android_surface_binding`
 - [#131](https://github.com/DisplayXR/displayxr-runtime/issues/131) — Android CI workflow
 - [#133](https://github.com/DisplayXR/displayxr-runtime/issues/133) — Gradle build integration
 - [#134](https://github.com/DisplayXR/displayxr-runtime/issues/134) — Android test app (`cube_handle_vk_android`)
