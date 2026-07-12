@@ -125,9 +125,7 @@ find_package(cJSON MODULE)
 include(FetchContent)
 FetchContent_Declare(displayxr_mcp
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-mcp.git
-    # TEMPORARY (#734): dxr-rename branch SHA — swap to the released tag
-    # (v0.5.0) before merging this PR.
-    GIT_TAG 77cb6c5d66738e60b186fef0ef8d62cb7eb478e2)
+    GIT_TAG v0.5.0)
 # Build the stdio↔socket adapter alongside the lib so the Phase A test
 # scripts under tests/mcp/ can find a binary at a known path during dev
 # (build/_deps/displayxr_mcp-build/displayxr-mcp). Production
