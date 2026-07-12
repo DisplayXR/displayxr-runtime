@@ -73,13 +73,13 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_KHR_D3D11_ENABLE_EXTENSION_NAME) == 0) {
             hasD3D11 = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) {
             xr.hasDisplayInfoExt = true;
         }
     }
 
     LOG_INFO("XR_KHR_D3D11_enable: %s", hasD3D11 ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_EXT_display_info: %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_display_info: %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasD3D11) {
         LOG_ERROR("XR_KHR_D3D11_enable extension not available - cannot continue");
@@ -90,7 +90,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     std::vector<const char*> enabledExtensions;
     enabledExtensions.push_back(XR_KHR_D3D11_ENABLE_EXTENSION_NAME);
     if (xr.hasDisplayInfoExt) {
-        enabledExtensions.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
     }
 
     LOG_INFO("Enabling %zu extensions:", enabledExtensions.size());
@@ -126,10 +126,10 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         }
     }
 
-    // Query display info via XR_EXT_display_info
+    // Query display info via XR_DXR_display_info
     if (xr.hasDisplayInfoExt) {
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
-        XrDisplayInfoEXT displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
+        XrDisplayInfoDXR displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
         sysProps.next = &displayInfo;
         XrResult diResult = xrGetSystemProperties(xr.instance, xr.systemId, &sysProps);
         if (XR_SUCCEEDED(diResult)) {
@@ -152,7 +152,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
 
     // Get rendering mode enumeration function pointer
     if (xr.hasDisplayInfoExt) {
-        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesDXR",
             (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
     }
 
@@ -196,9 +196,9 @@ bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device) {
         uint32_t modeCount = 0;
         XrResult enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, 0, &modeCount, nullptr);
         if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
-            std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
+            std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
             for (uint32_t i = 0; i < modeCount; i++) {
-                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
                 modes[i].next = nullptr;
             }
             enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, modeCount, &modeCount, modes.data());

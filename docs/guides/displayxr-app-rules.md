@@ -21,7 +21,7 @@
 ## 0. The mental model (read this first)
 
 There is **one** window-binding extension per platform
-(`XR_EXT_win32_window_binding` / `XR_EXT_cocoa_window_binding`) with **one knob**: whether
+(`XR_DXR_win32_window_binding` / `XR_DXR_cocoa_window_binding`) with **one knob**: whether
 you hand the runtime a *window* or a *shared GPU surface*. That knob defines the three app
 classes:
 
@@ -90,17 +90,17 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   graphics binding (`XrGraphicsBinding*`) into `XrSessionCreateInfo.next` at `xrCreateSession`.
 - **F-4 — Reference space.** Create one `LOCAL` reference space
   (`xrCreateReferenceSpace`, `XR_REFERENCE_SPACE_TYPE_LOCAL`) and use it for **both** `xrLocateViews`
-  and layer submission. In RAW mode (`XR_EXT_display_info` enabled) the runtime returns
+  and layer submission. In RAW mode (`XR_DXR_display_info` enabled) the runtime returns
   screen-centered positions regardless of the space, but LOCAL is the correct, portable choice
   (see [INV-6.1](#6-kooima-projection)).
 - **F-5 — Enable the extensions you use.** Check availability with
   `xrEnumerateInstanceExtensionProperties`, then list each in
   `XrInstanceCreateInfo.enabledExtensionNames` at `xrCreateInstance`, and resolve its functions via
-  `xrGetInstanceProcAddr` (e.g. `xrCaptureAtlasEXT`, the window-binding setters). Header set:
+  `xrGetInstanceProcAddr` (e.g. `xrCaptureAtlasDXR`, the window-binding setters). Header set:
   [INV-8.3](#8-app-folder-layout--what-to-include).
 - **F-6 — Optional: window-space HUD overlay.** To draw a flat 2D overlay (HUD, labels) on top of
-  the weaved 3D, submit an `XrCompositionLayerWindowSpaceEXT` layer (window-relative `[0,1]`
-  coordinates) after your projection layer — see `XR_EXT_win32_window_binding` §3 and
+  the weaved 3D, submit an `XrCompositionLayerWindowSpaceDXR` layer (window-relative `[0,1]`
+  coordinates) after your projection layer — see `XR_DXR_win32_window_binding` §3 and
   `xr_session_common.cpp` (`EndFrameWithWindowSpaceHud`). Not required for a basic app.
 
 ---
@@ -109,7 +109,7 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
 
 - **INV-1.1 — Pass a real window for handle/texture; NULL for hosted.** Create your window
   *before* OpenXR init and pass it at session creation via the binding struct
-  (`XrWin32WindowBindingCreateInfoEXT` / `XrCocoaWindowBindingCreateInfoEXT`). Hosted apps pass
+  (`XrWin32WindowBindingCreateInfoDXR` / `XrCocoaWindowBindingCreateInfoDXR`). Hosted apps pass
   NULL and the runtime self-creates a native-resolution window.
   Ref: `test_apps/handle/cube_handle_d3d11_win/main.cpp:675`, `xr_session.cpp:193-194`.
 
@@ -121,7 +121,7 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
 - **INV-1.3 (advisory) — Create your window ON the 3D panel, not wherever the OS defaults.**
   On multi-monitor systems (laptop + external 3D panel — the deployment shape) a
   `CW_USEDEFAULT` window opens on the primary monitor, where the weave cannot produce 3D.
-  Chain `XrDisplayDesktopPositionEXT` (spec v16) onto `XrSystemProperties` and create your
+  Chain `XrDisplayDesktopPositionDXR` (spec v16) onto `XrSystemProperties` and create your
   window at the returned `left/top` (virtual-desktop pixels, top-down; `(0,0)` = primary or
   unknown — either way a safe create position). This refines the INV-1.1 ordering: create
   instance → get system → `xrGetSystemProperties` → **create window at the reported
@@ -130,30 +130,30 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
 
 ---
 
-## 2. Display info & rendering modes (`XR_EXT_display_info`)
+## 2. Display info & rendering modes (`XR_DXR_display_info`)
 
 - **INV-2.1 — Query display info once, by chaining to `XrSystemProperties`.** Chain
-  `XrDisplayInfoEXT` onto `XrSystemProperties` at `xrGetSystemProperties` time (before session
+  `XrDisplayInfoDXR` onto `XrSystemProperties` at `xrGetSystemProperties` time (before session
   creation). It returns static properties: `displaySizeMeters`,
   `nominalViewerPositionInDisplaySpace` (~`{0,0,0.65}`), `recommendedViewScaleX/Y`,
   `displayPixelWidth/Height`. These are **static** — do **not** re-query or change them on
   resize. Ref: `test_apps/handle/cube_handle_d3d11_win/xr_session.cpp:173-185`; header
-  `src/external/openxr_includes/openxr/XR_EXT_display_info.h:46-55` (SPEC_VERSION 13).
+  `src/external/openxr_includes/openxr/XR_DXR_display_info.h:46-55` (SPEC_VERSION 13).
 
-- **INV-2.2 — `hardwareDisplay3D` is per-mode, not on `XrDisplayInfoEXT`.** It moved to
-  `XrDisplayRenderingModeInfoEXT` (`XR_EXT_display_info.h:237`). Reading it off the display-info
+- **INV-2.2 — `hardwareDisplay3D` is per-mode, not on `XrDisplayInfoDXR`.** It moved to
+  `XrDisplayRenderingModeInfoDXR` (`XR_DXR_display_info.h:237`). Reading it off the display-info
   struct (as an older spec example shows) won't compile against current headers.
 
 - **INV-2.3 — Enumerate rendering modes with the two-call idiom.** Use
-  `xrEnumerateDisplayRenderingModesEXT`. Each `XrDisplayRenderingModeInfoEXT` carries
+  `xrEnumerateDisplayRenderingModesDXR`. Each `XrDisplayRenderingModeInfoDXR` carries
   `modeIndex`, `viewCount`, `viewScaleX/Y`, `tileColumns`, `tileRows`, `viewWidthPixels`,
   `viewHeightPixels`, `hardwareDisplay3D`, and (v13) `isActive` + `isRequestable`. Read
   `isActive` at startup to learn the runtime's current mode without waiting for an event.
   Ref: `test_apps/handle/cube_handle_d3d11_win/xr_session.cpp:324-327`.
 
 - **INV-2.4 — The runtime owns the active mode; you *request*, never *set*.** Key presses are
-  requests via `xrRequestDisplayRenderingModeEXT`. Update your local `currentModeIndex` **only**
-  when `XrEventDataRenderingModeChangedEXT` arrives. Optimistically mutating local state
+  requests via `xrRequestDisplayRenderingModeDXR`. Update your local `currentModeIndex` **only**
+  when `XrEventDataRenderingModeChangedDXR` arrives. Optimistically mutating local state
   desyncs you from the runtime.
   - Wrong: `xr.currentModeIndex = next;` then render with assumed view count.
   - Right: request, then react. Ref: request `main.cpp:300-319`; event handler
@@ -168,22 +168,22 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   `recommendedViewScaleX/Y` from the **active** mode. Ref: `main.cpp:404-415`.
 
 - **INV-2.7 — Eye tracking: `xrLocateViews` always returns populated views.** Query
-  `XrEyeTrackingModeCapabilitiesEXT` (chained to `XrSystemProperties`) for supported modes
-  (MANAGED=1, MANUAL=2, 0=none). Per-frame, chain `XrViewEyeTrackingStateEXT` to `XrViewState`;
+  `XrEyeTrackingModeCapabilitiesDXR` (chained to `XrSystemProperties`) for supported modes
+  (MANAGED=1, MANUAL=2, 0=none). Per-frame, chain `XrViewEyeTrackingStateDXR` to `XrViewState`;
   `isTracking` tells you whether poses are live or a vendor fallback — it does **not** mean the
-  views are unpopulated. Ref: `XR_EXT_display_info.h:141-165`.
+  views are unpopulated. Ref: `XR_DXR_display_info.h:141-165`.
 
 - **INV-2.8 (advisory) — MANUAL mode: handle the tracking-state event.** If you request
-  `XR_EYE_TRACKING_MODE_MANUAL_EXT` you've told the vendor *not* to run its grace
+  `XR_EYE_TRACKING_MODE_MANUAL_DXR` you've told the vendor *not* to run its grace
   period / collapse animation / auto 2D fallback — tracking loss is **your** problem. React to
-  `XrEventDataEyeTrackingStateChangedEXT` (v14, edge-triggered on every `isTracking` flip;
+  `XrEventDataEyeTrackingStateChangedDXR` (v14, edge-triggered on every `isTracking` flip;
   also fires on mode switches into/out of untracked modes) instead of polling
-  `XrViewEyeTrackingStateEXT.isTracking` per frame: run your own transition, then
-  `xrRequestDisplayRenderingModeEXT` a 2D mode when ready. MANAGED apps may ignore the event
+  `XrViewEyeTrackingStateDXR.isTracking` per frame: run your own transition, then
+  `xrRequestDisplayRenderingModeDXR` a 2D mode when ready. MANAGED apps may ignore the event
   (the vendor handles the lifecycle). Per-mode tracking capability is queryable by chaining
-  `XrDisplayRenderingModeTrackingInfoEXT` at enumerate time (opt-in handshake — pre-set each
+  `XrDisplayRenderingModeTrackingInfoDXR` at enumerate time (opt-in handshake — pre-set each
   element's `type` and `next`; reference: `cube_handle_d3d11_win/xr_session.cpp`). Ref:
-  `XR_EXT_display_info.h` v14 block, `docs/specs/vendor/eye-tracking-modes.md`.
+  `XR_DXR_display_info.h` v14 block, `docs/specs/vendor/eye-tracking-modes.md`.
 
 ---
 
@@ -317,7 +317,7 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   - Alternatively, **shrink `imageRect` to cover only the pixels you wrote** — then the unwritten
     area is outside the declared rect and never blitted. (Prefer the clear when the layer's
     placement/aspect must stay fixed.)
-  - This bites hardest with transparent backgrounds + flat-2D zones (`XR_EXT_local_3d_zone`
+  - This bites hardest with transparent backgrounds + flat-2D zones (`XR_DXR_local_3d_zone`
     Local2D): a transparent 2D pixel reveals whatever is woven beneath it, so an unwritten
     projection band shows through as garbage instead of the desktop. (Runtime hardening for the
     macOS alpha-native path landed in #568, but clearing the full rect is the portable fix and the
@@ -345,22 +345,22 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
 A `_texture`-class app hands the runtime a shared GPU surface (shared texture / IOSurface) and a
 real HWND/NSView. The runtime composites its **multi-zone result** into that surface and the app
 blits the full composite to its window. Where the 3D content lives, and what 2D content surrounds
-it, is expressed entirely through [`XR_EXT_display_zones`](../specs/extensions/XR_EXT_display_zones.md)
+it, is expressed entirely through [`XR_DXR_display_zones`](../specs/extensions/XR_DXR_display_zones.md)
 — **not** the legacy output-rect/surround entry points, which were **removed** (ADR-031; see
 [`docs/roadmap/surround-zones-deprecation.md`](../roadmap/surround-zones-deprecation.md)).
 
-Authoring pattern: one `XrDisplayZoneEXT` per 3D region (chained onto the projection layer for
-that zone), one `XrCompositionLayerLocal2DEXT` per 2D region, and an optional per-pixel `wishMask`.
+Authoring pattern: one `XrDisplayZoneDXR` per 3D region (chained onto the projection layer for
+that zone), one `XrCompositionLayerLocal2DDXR` per 2D region, and an optional per-pixel `wishMask`.
 Both 3D-zone projection layers and Local2D layers are submitted **transparent** — a zone confines
 its own content by definition, so there is no full-window backer. Reference apps:
 `cube_zones_texture_d3d11_win`, `cube_zones_texture_d3d12_win`, `cube_zones_texture_metal_macos`.
 
 - **INV-5.1 — Express the 3D region as a zone, not an output rect.** Declare the canvas sub-rect
-  where weaved 3D appears with an `XrDisplayZoneEXT` (client-area pixels), one per 3D zone. The
+  where weaved 3D appears with an `XrDisplayZoneDXR` (client-area pixels), one per 3D zone. The
   zone's offset/size flow to the DP as `canvas_offset_x/y` + `canvas_width/height`; vendor weavers
   compute lenticular phase from that screen-space position, so the offset is load-bearing. A
   single full-window 3D zone is the degenerate handle-app geometry. Ref:
-  [`XR_EXT_display_zones.md`](../specs/extensions/XR_EXT_display_zones.md); reference app
+  [`XR_DXR_display_zones.md`](../specs/extensions/XR_DXR_display_zones.md); reference app
   `cube_zones_texture_d3d11_win`.
 
 - **INV-5.2 — The shared surface is worst-case-sized (ADR-010); present the full composite.**
@@ -370,11 +370,11 @@ its own content by definition, so there is no full-window backer. Reference apps
   it to its window. The zone rects (not the surface) are what change on resize. Ref: `ADR-010`.
 
 - **INV-5.3 — Express 2D regions as Local2D zones, submitted transparent.** Each 2D region
-  outside (or beside) a 3D zone is one `XrCompositionLayerLocal2DEXT`, written with correct alpha
+  outside (or beside) a 3D zone is one `XrCompositionLayerLocal2DDXR`, written with correct alpha
   so it composites over/under weaved content per the zone-layer rules. There is no separate
   "surround" surface and no strip-blit — the runtime composites Local2D and 3D zones together.
   Ref: `cube_zones_texture_d3d11_win`; zone-layer composition rules in
-  [`XR_EXT_display_zones.md`](../specs/extensions/XR_EXT_display_zones.md).
+  [`XR_DXR_display_zones.md`](../specs/extensions/XR_DXR_display_zones.md).
 
 - **INV-5.4 — Whole `imageRect` written, esp. for transparent Local2D.** As in INV-4.7, clear the
   full declared rect (or shrink the rect) so no undefined pixels reach a transparent 2D zone and
@@ -388,11 +388,11 @@ its own content by definition, so there is no full-window backer. Reference apps
 
 ## 6. Kooima projection
 
-- **INV-6.1 — With `XR_EXT_display_info` enabled, `xrLocateViews` is RAW mode and YOU own the
+- **INV-6.1 — With `XR_DXR_display_info` enabled, `xrLocateViews` is RAW mode and YOU own the
   camera.** It returns screen-centered eye positions (meters), identity orientation, advisory
   FOV — regardless of the reference space (pass LOCAL). The runtime applies no
   convergence/comfort; you build your own asymmetric off-axis frustum. Ref:
-  `XR_EXT_display_info.md:976-989`.
+  `XR_DXR_display_info.md:976-989`.
 
 - **INV-6.2 — Without the extension (legacy/RENDER_READY), the runtime returns converged poses +
   FOV; you still build the matrix from `XrFovf`** (the runtime never returns a matrix).
@@ -409,26 +409,26 @@ its own content by definition, so there is no full-window backer. Reference apps
 
 ---
 
-## 7. Frame capture — `XR_EXT_atlas_capture` (`xrCaptureAtlasEXT`)
+## 7. Frame capture — `XR_DXR_atlas_capture` (`xrCaptureAtlasDXR`)
 
 > This replaced the old per-API app-side readback (`CaptureAtlasRegion{D3D11,D3D12,GL,VK,Metal}`),
 > deleted in the #396 W6 refactor. **Do not reintroduce app-side staging-texture readback.**
 
-- **INV-7.1 — Capture is runtime-owned and fire-and-forget.** Call `xrCaptureAtlasEXT` from your
+- **INV-7.1 — Capture is runtime-owned and fire-and-forget.** Call `xrCaptureAtlasDXR` from your
   render loop on a user trigger; it *latches* the request and the readback runs at your next
   `xrEndFrame`. `XR_SUCCESS` means "accepted," not "file on disk yet." It must be non-blocking
   (in-process it shares the compositor thread).
   ```c
-  XrResult xrCaptureAtlasEXT(XrSession, const XrAtlasCaptureInfoEXT*, XrAtlasCaptureResultEXT* /*may be NULL*/);
+  XrResult xrCaptureAtlasDXR(XrSession, const XrAtlasCaptureInfoDXR*, XrAtlasCaptureResultDXR* /*may be NULL*/);
   ```
-  Header `src/external/openxr_includes/openxr/XR_EXT_atlas_capture.h`; impl
+  Header `src/external/openxr_includes/openxr/XR_DXR_atlas_capture.h`; impl
   `src/xrt/state_trackers/oxr/oxr_capture.c`; design `docs/adr/ADR-023-unified-atlas-capture.md`.
 
 - **INV-7.2 — `pathPrefix` is an in-struct char[256] with NO extension.** The runtime appends
   `_atlas.png`. Pass a path prefix only.
   ```c
-  XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
-  info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT;   // app content, no chrome
+  XrAtlasCaptureInfoDXR info = {XR_TYPE_ATLAS_CAPTURE_INFO_DXR};
+  info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_DXR;   // app content, no chrome
   strncpy_s(info.pathPrefix, prefix.c_str(), _TRUNCATE);     // no ".png"
   xr.pfnCaptureAtlasEXT(xr.session, &info, nullptr);
   ```
@@ -497,10 +497,10 @@ runtime-internal source," and `scripts/dev_register.bat`.
   `IMPORTED_LOCATION`, which Khronos CONFIG leaves NOTFOUND).
 
 - **INV-8.3 — Extension-header include set.** Always: `openxr/openxr.h`,
-  `openxr/openxr_platform.h`, `openxr/XR_EXT_display_info.h`. Platform window binding:
-  `XR_EXT_win32_window_binding.h` (Win) / `XR_EXT_cocoa_window_binding.h` (mac). Optional:
-  `XR_EXT_atlas_capture.h`, `XR_EXT_workspace_file_dialog.h`, `XR_EXT_spatial_workspace.h`,
-  `XR_EXT_macos_gl_binding.h`. Vendor a pinned copy from `src/external/openxr_includes/` (or the
+  `openxr/openxr_platform.h`, `openxr/XR_DXR_display_info.h`. Platform window binding:
+  `XR_DXR_win32_window_binding.h` (Win) / `XR_DXR_cocoa_window_binding.h` (mac). Optional:
+  `XR_DXR_atlas_capture.h`, `XR_DXR_workspace_file_dialog.h`, `XR_DXR_spatial_workspace.h`,
+  `XR_DXR_macos_gl_binding.h`. Vendor a pinned copy from `src/external/openxr_includes/` (or the
   `displayxr-extensions` repo), record the source commit, never edit in place.
 
 - **INV-8.4 — Run wrappers set two env knobs.** `XR_RUNTIME_JSON` (which runtime DLL the loader
@@ -566,15 +566,15 @@ launcher. The bare runtime ignores manifests — discovery is the workspace laye
 ## 10. Being a good workspace citizen
 
 - **INV-10.1 — Under a workspace, the controller owns the display mode.** When
-  `DISPLAYXR_WORKSPACE_SESSION=1`, your `xrRequestDisplayRenderingModeEXT` calls are silently
+  `DISPLAYXR_WORKSPACE_SESSION=1`, your `xrRequestDisplayRenderingModeDXR` calls are silently
   no-opped and `isRequestable` is false. Don't fight it; gate your mode UI (INV-2.5).
 
-- **INV-10.2 — File picking goes through `XR_EXT_workspace_file_dialog` when available.** Call
-  `xrRequestFilePickerEXT`. `XR_FILE_PICKER_FALLBACK_TIER0_EXT` → fall back to a flat OS dialog
+- **INV-10.2 — File picking goes through `XR_DXR_workspace_file_dialog` when available.** Call
+  `xrRequestFilePickerDXR`. `XR_FILE_PICKER_FALLBACK_TIER0_DXR` → fall back to a flat OS dialog
   (the controller handles z-order). `XR_ERROR_FEATURE_UNSUPPORTED` → not under a workspace, call
   the OS dialog directly. The *app* declares nothing in its manifest for this; the controller
   advertises `SupportsFileDialog=1`. Windows-only today. Spec:
-  `docs/specs/extensions/XR_EXT_workspace_file_dialog.md`.
+  `docs/specs/extensions/XR_DXR_workspace_file_dialog.md`.
 
 - **INV-10.3 — Know which compositor you're talking to.** In-process (`_handle`/`_texture`/
   `_hosted`) you drive a **native per-API compositor** in your own process. Under a workspace or
@@ -591,7 +591,7 @@ launcher. The bare runtime ignores manifests — discovery is the workspace laye
 - [ ] Window passed for handle/texture, NULL for hosted (INV-1.1); HWND kept even in texture mode (INV-1.2)
 - [ ] Display info queried once via `XrSystemProperties`, treated as static (INV-2.1)
 - [ ] Modes enumerated; active mode tracked via the *event*, not set locally (INV-2.4); per-mode state re-derived each frame (INV-2.6)
-- [ ] (MANUAL eye tracking) `XrEventDataEyeTrackingStateChangedEXT` handled — own transition + 2D mode request on loss (INV-2.8)
+- [ ] (MANUAL eye tracking) `XrEventDataEyeTrackingStateChangedDXR` handled — own transition + 2D mode request on loss (INV-2.8)
 - [ ] `xrLocateViews` into an 8-wide buffer; render/submit `eyeCount` from the active mode, not 2 (INV-3.1)
 - [ ] App swapchain sized once to worst-case atlas (INV-4.2); per-tile = window/canvas × scaleXY, never display (INV-4.3)
 - [ ] Color space: request an **sRGB swapchain** and write a correctly-encoded image (linear render + GPU sRGB-write, or display-referred bytes — not both); linear/UNORM swapchain is not color-managed; data textures always linear (INV-4.6)
@@ -599,7 +599,7 @@ launcher. The bare runtime ignores manifests — discovery is the workspace laye
 - [ ] (texture) regions declared via display-zones — 3D zones + Local2D zones, not output-rect/surround (INV-5.1/5.3)
 - [ ] (texture) shared surface sized once to worst-case; full composite presented (INV-5.2)
 - [ ] Window-relative Kooima; matrices transposed for DirectX (INV-6.3/6.4)
-- [ ] Capture via `xrCaptureAtlasEXT`, prefix without extension, mono-guarded; no app-side readback (INV-7.1/7.2/7.3)
+- [ ] Capture via `xrCaptureAtlasDXR`, prefix without extension, mono-guarded; no app-side readback (INV-7.1/7.2/7.3)
 - [ ] Full mip chain + trilinear on every backend (INV-7.5)
 - [ ] Loader DLL shipped next to exe; no compiled-in runtime path (INV-8.2)
 - [ ] `.displayxr.json` (schema 1) + `icon.png` (512×512) + `icon_sbs.png` (1024×512, sbs-lr) shipped (INV-9.1/9.2)
@@ -615,19 +615,19 @@ surround→display-zones removal):
    discrepancies.** Earlier research had surfaced two surround-specific discrepancies (Windows
    surround-texture sizing vs. the spec, and the macOS `cube_texture_metal_macos` window-clamped
    fill divergence under [#464](https://github.com/DisplayXR/displayxr-runtime/issues/464)). Both
-   are moot: the entire output-rect/surround API (`xrSetSharedTextureOutputRectEXT`,
+   are moot: the entire output-rect/surround API (`xrSetSharedTextureOutputRectDXR`,
    `xrSetSharedTextureSurround2DEXT`, `xrSetSharedTextureSurround2DFenceEXT`) was **removed** in
-   favour of [`XR_EXT_display_zones`](../specs/extensions/XR_EXT_display_zones.md) — see §5,
+   favour of [`XR_DXR_display_zones`](../specs/extensions/XR_DXR_display_zones.md) — see §5,
    ADR-031, and [`docs/roadmap/surround-zones-deprecation.md`](../roadmap/surround-zones-deprecation.md).
    The canonical texture-class parity apps are now `cube_zones_texture_{d3d11_win,d3d12_win,metal_macos}`.
 
-2. **Stale `XR_EXT_display_info.md` examples — RESOLVED, plus a full v13 spec refresh.** The
+2. **Stale `XR_DXR_display_info.md` examples — RESOLVED, plus a full v13 spec refresh.** The
    view-count hardcoding (`XrView views[2]` / `for (eye<2)`) was fixed to the `XRT_MAX_VIEWS`(8)-wide
    / active-mode-count pattern across all example blocks, with banners pointing here + to the test
    apps as authoritative. Beyond the examples, the spec was brought up to the v13 header: bumped
    "Spec version: 6" → 13; **formally documented the previously-undocumented v8 enumeration API**
-   (`XrDisplayRenderingModeInfoEXT` + `xrEnumerateDisplayRenderingModesEXT`, incl. the v13 `isActive`
-   / `isRequestable` fields); corrected every `hardwareDisplay3D`-on-`XrDisplayInfoEXT` reference
+   (`XrDisplayRenderingModeInfoDXR` + `xrEnumerateDisplayRenderingModesDXR`, incl. the v13 `isActive`
+   / `isRequestable` fields); corrected every `hardwareDisplay3D`-on-`XrDisplayInfoDXR` reference
    (it's per-mode + event now); fixed the version history (corrected the misleading v12 "event-only"
    entry, removed the wrong "header frozen at v12" claim, added the v13 row dated from #234). The
    eye-tracking (v6) section already matched the header.

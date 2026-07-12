@@ -252,7 +252,7 @@ static const struct mcp_tool TOOL_GET_DISPLAY_INFO = {
     .name = "get_display_info",
     .description =
         "Return the DisplayXR display dimensions, panel size, atlas size, nominal viewer position, "
-        "and per-view recommended/max image rects. Wraps XR_EXT_display_info.",
+        "and per-view recommended/max image rects. Wraps XR_DXR_display_info.",
     .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
     .fn = tool_get_display_info,
 };

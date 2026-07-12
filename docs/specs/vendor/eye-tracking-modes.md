@@ -3,7 +3,7 @@ status: Active
 owner: David Fattal
 updated: 2026-06-05
 issues: [81, 441]
-code-paths: [src/external/openxr_includes/openxr/XR_EXT_display_info.h, src/xrt/state_trackers/oxr/]
+code-paths: [src/external/openxr_includes/openxr/XR_DXR_display_info.h, src/xrt/state_trackers/oxr/]
 ---
 
 # MANAGED vs MANUAL Eye Tracking Contract for Vendor-Controlled Display Transitions
@@ -13,23 +13,23 @@ code-paths: [src/external/openxr_includes/openxr/XR_EXT_display_info.h, src/xrt/
 Formalize the contract between MANAGED and MANUAL eye tracking modes with respect to vendor-controlled 2D/3D display transitions on tracking loss. Strategy: **MANAGED = vendor SDK controls grace period, animations, auto 2D/3D switching; MANUAL = developer controls everything, SDK just reports isTracking immediately**.
 
 Extended (#441, header v14) with **per-rendering-mode tracking capability** (`has_tracking`) and an
-edge-triggered **`XrEventDataEyeTrackingStateChangedEXT`** event. Implementation plan:
+edge-triggered **`XrEventDataEyeTrackingStateChangedDXR`** event. Implementation plan:
 `docs/roadmap/per-mode-tracking-capability-plan.md`.
 
 ## Background
 
 3D displays need to handle a critical transition: **what happens when eye tracking is lost while the display is in 3D mode?** The user may have walked away, looked away, or the tracker lost lock. The display should gracefully degrade to 2D rather than show broken stereo.
 
-Today, `XR_EXT_display_info` v6 provides two eye tracking modes:
+Today, `XR_DXR_display_info` v6 provides two eye tracking modes:
 
-- **MANAGED** (`XR_EYE_TRACKING_MODE_MANAGED_EXT = 0`): Vendor SDK controls grace period, animations, and auto 2D/3D switching. App sees filtered positions and an `isTracking` flag.
-- **MANUAL** (`XR_EYE_TRACKING_MODE_MANUAL_EXT = 1`): Developer controls everything. SDK just reports `isTracking` immediately with no grace period, no animations, and no auto-switching. App handles tracking loss itself.
+- **MANAGED** (`XR_EYE_TRACKING_MODE_MANAGED_DXR = 0`): Vendor SDK controls grace period, animations, and auto 2D/3D switching. App sees filtered positions and an `isTracking` flag.
+- **MANUAL** (`XR_EYE_TRACKING_MODE_MANUAL_DXR = 1`): Developer controls everything. SDK just reports `isTracking` immediately with no grace period, no animations, and no auto-switching. App handles tracking loss itself.
 
 And the rendering mode API (v7/v8) provides:
 
-- `xrRequestDisplayRenderingModeEXT(modeIndex)` -- switch rendering modes (which may flip hardware 2D/3D)
-- `XrEventDataRenderingModeChangedEXT` -- notifies app of mode changes
-- `XrEventDataHardwareDisplayStateChangedEXT` -- notifies app of hardware 3D state changes
+- `xrRequestDisplayRenderingModeDXR(modeIndex)` -- switch rendering modes (which may flip hardware 2D/3D)
+- `XrEventDataRenderingModeChangedDXR` -- notifies app of mode changes
+- `XrEventDataHardwareDisplayStateChangedDXR` -- notifies app of hardware 3D state changes
 
 **The gap:** There is no specification of how these two systems interact during tracking loss/recovery transitions.
 
@@ -41,7 +41,7 @@ Tracking capability is expressed at **two layers**, which answer different quest
 
 1. **Per rendering mode — `has_tracking`** (`xrt_rendering_mode.mode_flags` bit
    `XRT_RENDERING_MODE_FLAG_HAS_TRACKING`; surfaced to apps via the chained
-   `XrDisplayRenderingModeTrackingInfoEXT`): *does this rendering mode consume live eye
+   `XrDisplayRenderingModeTrackingInfoDXR`): *does this rendering mode consume live eye
    tracking?* A vendor can expose e.g. a "2D tracked" mode (content presented 2D, viewer
    still eye-tracked) alongside the default tracked 3D mode and untracked export modes
    (SBS, anaglyph). sim_display sets `has_tracking = false` on **all** modes — it reports
@@ -59,23 +59,23 @@ Tracking capability is expressed at **two layers**, which answer different quest
 isTracking = active_mode.has_tracking && eye_positions.valid && eye_positions.is_tracking
 ```
 
-so `XrViewEyeTrackingStateEXT.isTracking` is forcibly `XR_FALSE` whenever the active
+so `XrViewEyeTrackingStateDXR.isTracking` is forcibly `XR_FALSE` whenever the active
 rendering mode is untracked, regardless of what the DP reports.
 
-**`xrRequestEyeTrackingModeEXT` is a session preference**, validated against the
+**`xrRequestEyeTrackingModeDXR` is a session preference**, validated against the
 system-level `supported_eye_tracking_modes` only. It does NOT error based on the current
 rendering mode; the preference is simply latent while an untracked mode is active. This
-avoids ordering races with workspace-driven mode switches. `XrViewEyeTrackingStateEXT.activeMode`
+avoids ordering races with workspace-driven mode switches. `XrViewEyeTrackingStateDXR.activeMode`
 keeps reporting the session's MANAGED/MANUAL preference even while `isTracking == XR_FALSE`
 in an untracked mode — there is no "NONE" enum value.
 
 ### Tracking-state change event (v14, #441)
 
-`XrEventDataEyeTrackingStateChangedEXT { isTracking, activeMode }` is queued on every edge
+`XrEventDataEyeTrackingStateChangedDXR { isTracking, activeMode }` is queued on every edge
 of the derived `isTracking` value — including edges caused by rendering-mode switches into
 or out of untracked modes, not just DP-reported tracking loss/recovery. This is the primary
 notification primitive for MANUAL mode (replaces per-frame polling of
-`XrViewEyeTrackingStateEXT`); it fires in MANAGED mode too, where apps may use it to drive
+`XrViewEyeTrackingStateDXR`); it fires in MANAGED mode too, where apps may use it to drive
 optional UI. Edge detection happens in the runtime's `xrLocateViews` path, so an app that
 never locates views receives no events (it also has no use for them).
 
@@ -102,9 +102,9 @@ When the app is in MANAGED mode (default), the vendor SDK owns the full tracking
 The app receives:
 - **Animated eye positions** throughout the grace period — these are vendor-generated values (e.g., collapsing toward nominal viewpoint), **not** the raw tracked or last-known positions. This is the key difference from MANUAL mode.
 - `isTracking` remains vendor-determined (may stay `true` during grace period, goes `false` after)
-- `XrEventDataRenderingModeChangedEXT` + `XrEventDataHardwareDisplayStateChangedEXT` when vendor auto-switches 2D<->3D
+- `XrEventDataRenderingModeChangedDXR` + `XrEventDataHardwareDisplayStateChangedDXR` when vendor auto-switches 2D<->3D
 
-The app is passive -- it does not need to call `xrRequestDisplayRenderingModeEXT` during these transitions.
+The app is passive -- it does not need to call `xrRequestDisplayRenderingModeDXR` during these transitions.
 
 **Recommendation (SHOULD):** In MANAGED mode, vendors SHOULD keep `isTracking = true` throughout the grace period (while the collapse animation plays) and set `isTracking = false` only when the grace period expires and the vendor switches the display to 2D. This gives apps a consistent signal: `isTracking == false` means the vendor has fully transitioned to fallback. Vendors MAY deviate if their SDK uses a different heuristic, but the timing SHOULD align with the actual 2D switch.
 
@@ -121,13 +121,13 @@ When the app requests MANUAL mode, the vendor SDK must:
 The app is responsible for its own strategy:
 - Detect `isTracking` transition to `false`
 - Use the still-valid eye positions to design its own 3D-to-2D transition (e.g., animate convergence down while the 3D effect tracks the viewer's actual movement)
-- Call `xrRequestDisplayRenderingModeEXT(2D_mode)` when ready
+- Call `xrRequestDisplayRenderingModeDXR(2D_mode)` when ready
 - Detect `isTracking` transition to `true`
-- Call `xrRequestDisplayRenderingModeEXT(3D_mode)` to resume
+- Call `xrRequestDisplayRenderingModeDXR(3D_mode)` to resume
 - Animate convergence/IPD back to tracked values
 
 **Recommended transition shape (ADR-028, #542):** the hardware-state override
-`xrRequestDisplayModeEXT(XR_DISPLAY_MODE_2D_EXT)` lets the app drop the panel
+`xrRequestDisplayModeDXR(XR_DISPLAY_MODE_2D_DXR)` lets the app drop the panel
 flat **immediately** on loss — for viewer comfort — without changing the
 rendering mode or its own content. The DP keeps weaving the still-stereo
 atlas (the panel shows it flat/blurry), and as the app fades its parallax to
@@ -144,7 +144,7 @@ parallax up, then release the override (or simply re-request the mode).
 | `isTracking` timing | Delayed — stays `true` during grace period | Immediate — flips as soon as out-of-zone |
 | Eye positions during transition | **Animated** by vendor (collapsing toward nominal) | **Unmodified** — actual tracked position or last known |
 | Shader effects | Vendor MAY animate weaved output | None — vendor passes frames through unchanged |
-| 2D/3D hardware switch | Automatic at end of grace period | Never — app calls `xrRequestDisplayRenderingModeEXT` |
+| 2D/3D hardware switch | Automatic at end of grace period | Never — app calls `xrRequestDisplayRenderingModeDXR` |
 | App responsibility | Passive | Full control over transition strategy |
 
 ## Vendor Integration Requirements
@@ -169,7 +169,7 @@ bool vendor_sdk_set_managed_mode(struct vendor_sdk *sdk, bool enable);
 The display processor must:
 
 1. **Store the active eye tracking mode** (like it now stores `view_count`)
-2. **On mode change** (`xrRequestEyeTrackingModeEXT`): call vendor SDK to enable/disable managed behavior
+2. **On mode change** (`xrRequestEyeTrackingModeDXR`): call vendor SDK to enable/disable managed behavior
 3. **In `get_predicted_eye_positions()`**: vendor SDK already behaves differently based on the mode setting -- no display processor post-processing needed for MANAGED vs MANUAL (the SDK does it)
 
 ### Event propagation for vendor-initiated transitions (MANAGED mode)
@@ -187,7 +187,7 @@ bool vendor_sdk_set_display_mode_callback(struct vendor_sdk *sdk,
 bool vendor_sdk_get_current_hardware_3d_state(struct vendor_sdk *sdk, bool *out_is_3d);
 ```
 
-The compositor (or display processor) checks for state changes each frame and pushes `XrEventDataHardwareDisplayStateChangedEXT` + `XrEventDataRenderingModeChangedEXT` when the hardware state flips.
+The compositor (or display processor) checks for state changes each frame and pushes `XrEventDataHardwareDisplayStateChangedDXR` + `XrEventDataRenderingModeChangedDXR` when the hardware state flips.
 
 **Workspace authority (#233/#234 interaction):** vendor-initiated MANAGED transitions are
 **hardware display state** changes, NOT rendering-mode requests. They flow through the
@@ -216,15 +216,15 @@ mode carries the flag.
 
 Ideally vendors support **both** modes (bits = 3), giving developers the choice.
 
-**Supporting one mode is valid.** Vendors are not required to implement both MANAGED and MANUAL. If a vendor's SDK only supports managed filtering (as a typical hardware DP does), they advertise `supported_eye_tracking_modes = 1` (MANAGED_BIT only). The runtime returns `XR_ERROR_FEATURE_UNSUPPORTED` if an app requests MANUAL on a device that only supports MANAGED. Apps should query `XrEyeTrackingModeCapabilitiesEXT.supportedModes` and adapt accordingly — for example, if only MANAGED is available, the app knows the SDK handles grace periods and should not add its own redundant animations.
+**Supporting one mode is valid.** Vendors are not required to implement both MANAGED and MANUAL. If a vendor's SDK only supports managed filtering (as a typical hardware DP does), they advertise `supported_eye_tracking_modes = 1` (MANAGED_BIT only). The runtime returns `XR_ERROR_FEATURE_UNSUPPORTED` if an app requests MANUAL on a device that only supports MANAGED. Apps should query `XrEyeTrackingModeCapabilitiesDXR.supportedModes` and adapt accordingly — for example, if only MANAGED is available, the app knows the SDK handles grace periods and should not add its own redundant animations.
 
 ## Non-goals
 
 - No per-rendering-mode MANAGED/MANUAL capability — the control contract stays system-level
-- No "NONE" value added to `XrEyeTrackingModeEXT`
-- No layout change to `XrDisplayRenderingModeInfoEXT` — it is **frozen at its v13 layout**;
+- No "NONE" value added to `XrEyeTrackingModeDXR`
+- No layout change to `XrDisplayRenderingModeInfoDXR` — it is **frozen at its v13 layout**;
   per-mode tracking capability (and all future per-mode fields) chain via `next`
-  (see `docs/specs/extensions/XR_EXT_display_info.md`)
+  (see `docs/specs/extensions/XR_DXR_display_info.md`)
 
 > Historical note: this spec originally declared per-rendering-mode tracking behavior a
 > non-goal ("can be added as a separate feature"). #441 / header v14 is that feature.
@@ -232,10 +232,10 @@ Ideally vendors support **both** modes (bits = 3), giving developers the choice.
 ## Acceptance Criteria
 
 - [x] Vendor integration guide updated with MANAGED/MANUAL transition contract (`docs/guides/vendor-plugin-onboarding.md`)
-- [x] `XR_EXT_display_info.h` comments updated to document auto-switch behavior per mode (v6 + v14 doc blocks)
-- [ ] Vendor display processors pass eye tracking mode to the SDK wrapper when `xrRequestEyeTrackingModeEXT` is called (vendor-side; tracked per plug-in repo)
-- [ ] Event propagation path exists for vendor-initiated 2D/3D switches (MANAGED mode auto-transitions fire `XrEventDataRenderingModeChangedEXT` + `XrEventDataHardwareDisplayStateChangedEXT`)
+- [x] `XR_DXR_display_info.h` comments updated to document auto-switch behavior per mode (v6 + v14 doc blocks)
+- [ ] Vendor display processors pass eye tracking mode to the SDK wrapper when `xrRequestEyeTrackingModeDXR` is called (vendor-side; tracked per plug-in repo)
+- [ ] Event propagation path exists for vendor-initiated 2D/3D switches (MANAGED mode auto-transitions fire `XrEventDataRenderingModeChangedDXR` + `XrEventDataHardwareDisplayStateChangedDXR`)
 - [x] sim_display honest: `supported_eye_tracking_modes = 0`, all modes untracked; `SIM_DISPLAY_FAKE_TRACKING=1` dev toggle re-enables MANUAL_BIT + tracked modes (+ `SIM_DISPLAY_FAKE_TRACKING_PERIOD_MS` square wave) for hardware-free testing (#441, runtime v1.13.0)
-- [x] Per-mode `has_tracking` plumbed plugin → `xrt_rendering_mode.mode_flags` → chained `XrDisplayRenderingModeTrackingInfoEXT` (#441, ABI v3 / header v14 — see ADR-022)
-- [x] `XrEventDataEyeTrackingStateChangedEXT` queued on every derived-isTracking edge (#441; validated against real view-zone edges on 3D-display hardware)
+- [x] Per-mode `has_tracking` plumbed plugin → `xrt_rendering_mode.mode_flags` → chained `XrDisplayRenderingModeTrackingInfoDXR` (#441, ABI v3 / header v14 — see ADR-022)
+- [x] `XrEventDataEyeTrackingStateChangedDXR` queued on every derived-isTracking edge (#441; validated against real view-zone edges on 3D-display hardware)
 - [x] `is_tracking` transported over IPC; fake-TRUE fallback removed (#441 Phase 2, PR #446)

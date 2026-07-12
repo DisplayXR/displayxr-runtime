@@ -20,9 +20,9 @@ We initially sized the IOSurface to match the canvas (the sub-rect of the window
 The canvas rect (which the compositor uses for Kooima FOV calculation and view sizing) is derived from the window/zone geometry. The IOSurface itself never needs to be resized.
 
 > **Update (ADR-031):** this ADR originally communicated the canvas rect via the app-facing
-> `xrSetSharedTextureOutputRectEXT` setter. That entry point (and the 2D-surround calls) were
+> `xrSetSharedTextureOutputRectDXR` setter. That entry point (and the 2D-surround calls) were
 > **removed** when display-zones became the sole region paradigm — a sub-rect is now expressed
-> as one 3D zone (`XR_EXT_display_zones`), and the canvas defaults to the full window. **The
+> as one 3D zone (`XR_DXR_display_zones`), and the canvas defaults to the full window. **The
 > decision here is unchanged** (the shared surface is still worst-case-sized and never resized);
 > only the output-rect-centric mechanism prose below is historical. See ADR-031.
 
@@ -42,7 +42,7 @@ The canvas rect (which the compositor uses for Kooima FOV calculation and view s
 
 ## Read-Back Contract
 
-The compositor writes interlaced/composited output at offset **`(canvasX, canvasY)`** inside the IOSurface, sized `canvasW × canvasH` — matching the rect the app passed to `xrSetSharedTextureOutputRectEXT`. The remainder of the surface is undefined.
+The compositor writes interlaced/composited output at offset **`(canvasX, canvasY)`** inside the IOSurface, sized `canvasW × canvasH` — matching the rect the app passed to `xrSetSharedTextureOutputRectDXR`. The remainder of the surface is undefined.
 
 ```
 IOSurface (swapchain-sized, e.g. 3024×1964)
@@ -70,7 +70,7 @@ sampled  = texture.sample(uvOffset + uv * uvScale)
 
 Letterbox using the **canvas** aspect ratio, not the IOSurface aspect ratio.
 
-**The app already knows the canvas rect** — it set it via `xrSetSharedTextureOutputRectEXT`. No runtime-to-app query API is needed. The contract is symmetric: the app sends `(x, y, w, h)`; the runtime writes `(w × h)` at `(x, y)`; the app reads `(w × h)` from `(x, y)`.
+**The app already knows the canvas rect** — it set it via `xrSetSharedTextureOutputRectDXR`. No runtime-to-app query API is needed. The contract is symmetric: the app sends `(x, y, w, h)`; the runtime writes `(w × h)` at `(x, y)`; the app reads `(w × h)` from `(x, y)`.
 
 **Why `(canvasX, canvasY)` and not origin:** Vendor weavers rely on the viewport position inside the backbuffer matching the eventual screen-space position within the window to compute correct interlacing phase. Writing at `(canvasX, canvasY)` keeps the on-display pixel position of the weaved output stable across backbuffer-vs-HWND size differences, and the symmetric read-back means the app's blit re-aligns the content to the same HWND client coords it passed in. This eliminates the need for an HWND-sized intermediate texture on Windows and lets drag-resize be driven purely by changing `canvas.x/y/w/h` per frame while the shared texture stays fixed.
 
@@ -78,5 +78,5 @@ Letterbox using the **canvas** aspect ratio, not the IOSurface aspect ratio.
 
 - IOSurface is created once at worst-case swapchain dimensions (`max(tileColumns * viewWidth)` × `max(tileRows * viewHeight)` across all rendering modes, assuming canvas = full window = full display).
 - `xrUpdateSharedSurfaceEXT` and `comp_metal_compositor_update_shared_iosurface` are removed from the codebase.
-- `xrSetSharedTextureOutputRectEXT` remains and must be called per-frame when the canvas moves or resizes.
+- `xrSetSharedTextureOutputRectDXR` remains and must be called per-frame when the canvas moves or resizes.
 - Future `_texture` apps on other platforms (Windows shared texture) should follow the same pattern: allocate at display size, communicate canvas rect separately.

@@ -12,17 +12,17 @@ Five test applications that demonstrate the **window-handle binding** and **disp
 
 ## OpenXR Extensions Demonstrated
 
-### XR_EXT_win32_window_binding / XR_EXT_cocoa_window_binding
+### XR_DXR_win32_window_binding / XR_DXR_cocoa_window_binding
 
-The app creates its own window and passes the handle to the runtime at session creation. On Windows, an `XrWin32WindowBindingCreateInfoEXT` struct carrying the HWND is chained into `XrSessionCreateInfo.next`. On macOS, `XrCocoaWindowBindingCreateInfoEXT` carries the NSView (a CAMetalLayer-backed view). The runtime renders into the app's window instead of creating its own, enabling windowed mode, multi-app scenarios, and app-controlled input.
+The app creates its own window and passes the handle to the runtime at session creation. On Windows, an `XrWin32WindowBindingCreateInfoDXR` struct carrying the HWND is chained into `XrSessionCreateInfo.next`. On macOS, `XrCocoaWindowBindingCreateInfoDXR` carries the NSView (a CAMetalLayer-backed view). The runtime renders into the app's window instead of creating its own, enabling windowed mode, multi-app scenarios, and app-controlled input.
 
 Both extensions also support **offscreen modes** (no window required):
 - **Readback callback** (`readbackCallback`): CPU fallback — composited RGBA pixels delivered per frame via callback (GPU→CPU round-trip).
 - **Shared GPU texture** (`sharedTextureHandle` on Win32, `sharedIOSurface` on macOS): zero-copy GPU→GPU texture sharing via platform-native shared handles (D3D11/D3D12 HANDLE or IOSurface).
 
-### XR_EXT_display_info
+### XR_DXR_display_info
 
-Queries physical display properties by chaining `XrDisplayInfoEXT` into `xrGetSystemProperties`:
+Queries physical display properties by chaining `XrDisplayInfoDXR` into `xrGetSystemProperties`:
 
 - **Display size** (meters) -- used for Kooima projection
 - **Nominal viewer position** -- default eye position in display space
@@ -30,9 +30,9 @@ Queries physical display properties by chaining `XrDisplayInfoEXT` into `xrGetSy
 - **Native display pixel dimensions** -- panel resolution in pixels, used for swapchain sizing
 - **Display mode switch support** -- whether the runtime can toggle 2D/3D
 
-### xrRequestDisplayModeEXT
+### xrRequestDisplayModeDXR
 
-Runtime-side 2D/3D mode switching. The V key calls `xrRequestDisplayModeEXT(session, XR_DISPLAY_MODE_3D_EXT | XR_DISPLAY_MODE_2D_EXT)` to toggle the display processor between stereo interlacing and mono passthrough.
+Runtime-side 2D/3D mode switching. The V key calls `xrRequestDisplayModeDXR(session, XR_DISPLAY_MODE_3D_DXR | XR_DISPLAY_MODE_2D_DXR)` to toggle the display processor between stereo interlacing and mono passthrough.
 
 ## Controls
 
@@ -65,7 +65,7 @@ Toggled with Tab. Updated every 0.5s (macOS) or every frame (Windows).
 
 ```
 Session: FOCUSED
-XR_EXT_win32_window_binding: ACTIVE (D3D11)
+XR_DXR_win32_window_binding: ACTIVE (D3D11)
 Display Mode: 3D Stereo [V=Toggle]
 FPS: 60.0
 Frame: 16.7ms
@@ -99,9 +99,9 @@ Space=Reset  V=Mode  Tab=HUD  ESC=Quit
 
 **Key fields:**
 - **FPS + frame time** -- render performance
-- **Display mode** -- "3D (Stereo)" or "2D (Mono)", plus "[no switch]" if `xrRequestDisplayModeEXT` is unsupported
+- **Display mode** -- "3D (Stereo)" or "2D (Mono)", plus "[no switch]" if `xrRequestDisplayModeDXR` is unsupported
 - **Render vs window resolution** -- per-eye render size vs window size
-- **Display size** -- physical display dimensions from `XR_EXT_display_info`
+- **Display size** -- physical display dimensions from `XR_DXR_display_info`
 - **Recommended view scale** -- X, Y scale factors (macOS HUD only)
 - **Nominal viewer position** -- default viewer distance from display center
 - **Eye positions** -- raw display-space L/R eye positions (pre-player-transform, in mm on Windows or meters on macOS)
@@ -147,7 +147,7 @@ locateInfo.space = xr.localSpace;
 xrLocateViews(session, &locateInfo, &viewState, 2, &viewCount, views);
 ```
 
-In RAW mode (XR_EXT_display_info enabled), returns screen-relative eye positions from the eye tracker.
+In RAW mode (XR_DXR_display_info enabled), returns screen-relative eye positions from the eye tracker.
 
 ### Step 2: Save raw positions
 
@@ -195,16 +195,16 @@ View matrix from player-transformed pose, projection matrix from Kooima. The com
 ## 2D/3D Display Mode Toggle
 
 - **V key** toggles `displayMode3D` flag
-- Calls `xrRequestDisplayModeEXT(session, XR_DISPLAY_MODE_3D_EXT)` or `XR_DISPLAY_MODE_2D_EXT`
+- Calls `xrRequestDisplayModeDXR(session, XR_DISPLAY_MODE_3D_DXR)` or `XR_DISPLAY_MODE_2D_DXR`
 - Runtime switches the display processor between stereo interlacing and mono passthrough
 - App renders 1 eye (center, averaged) in 2D, 2 eyes in 3D
 - Submit count: `viewCount = displayMode3D ? 2 : 1`
-- HUD shows "[no switch]" if runtime doesn't support `xrRequestDisplayModeEXT`
+- HUD shows "[no switch]" if runtime doesn't support `xrRequestDisplayModeDXR`
 
 ## Display Rendering Mode Switching
 
 Keys **1/2/3** switch between vendor-defined rendering modes via the OpenXR API
-`xrRequestDisplayRenderingModeEXT(session, modeIndex)` (added in `XR_EXT_display_info` v7):
+`xrRequestDisplayRenderingModeDXR(session, modeIndex)` (added in `XR_DXR_display_info` v7):
 
 | Key | Mode Index | sim_display Behavior |
 |-----|-----------|---------------------|
@@ -236,7 +236,7 @@ variable (`sbs`, `anaglyph`, or `blend`) before launching.
 |--------|-----------------|-------|
 | Window API | Win32 HWND | NSWindow + CAMetalLayer NSView |
 | Graphics binding | D3D11 / Vulkan / OpenGL / D3D12 | Vulkan |
-| Window extension | `XR_EXT_win32_window_binding` | `XR_EXT_cocoa_window_binding` |
+| Window extension | `XR_DXR_win32_window_binding` | `XR_DXR_cocoa_window_binding` |
 | Fullscreen shortcut | F11 | Cmd+Ctrl+F |
 | Fullscreen style | `WS_POPUP` borderless | `NSWindowStyleMaskBorderless` |
 | HUD rendering | DirectWrite/D2D (shared `hud_renderer.cpp`) | Core Text NSView overlay (Menlo 11pt) |

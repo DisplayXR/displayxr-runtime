@@ -46,9 +46,9 @@ DisplayXR extends OpenXR with custom extensions for 3D display support:
 
 | Extension | Purpose |
 |-----------|---------|
-| `XR_EXT_display_info` | Display geometry, eye tracking, rendering mode enumeration and switching |
-| `XR_EXT_win32_window_binding` | App provides its own Win32 HWND for rendering |
-| `XR_EXT_cocoa_window_binding` | App provides a Cocoa NSView for rendering (macOS) |
+| `XR_DXR_display_info` | Display geometry, eye tracking, rendering mode enumeration and switching |
+| `XR_DXR_win32_window_binding` | App provides its own Win32 HWND for rendering |
+| `XR_DXR_cocoa_window_binding` | App provides a Cocoa NSView for rendering (macOS) |
 | `XR_EXT_android_surface_binding` | App provides an Android Surface for rendering |
 
 See the [formal extension specifications](../specs/) for full details.

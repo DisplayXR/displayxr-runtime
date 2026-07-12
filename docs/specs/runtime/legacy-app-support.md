@@ -10,19 +10,19 @@ code-paths: [src/xrt/state_trackers/oxr/oxr_system.c]
 
 ## Background: Legacy vs Display-Info-Aware Apps
 
-OpenXR apps that target DisplayXR fall into two categories based on whether they enable the `XR_EXT_display_info` extension:
+OpenXR apps that target DisplayXR fall into two categories based on whether they enable the `XR_DXR_display_info` extension:
 
-### Display-Info-Aware Apps (`XR_EXT_display_info` enabled)
+### Display-Info-Aware Apps (`XR_DXR_display_info` enabled)
 
 These apps can:
-- Enumerate rendering modes via `xrEnumerateDisplayRenderingModesEXT()` to discover available modes with their `viewCount`, `tileColumns`, `tileRows`, `viewScaleX`, `viewScaleY`
-- Request mode changes via `xrRequestDisplayRenderingModeEXT()`
-- Receive `XrEventDataRenderingModeChangedEXT` events when the mode changes (e.g., via qwerty device keyboard shortcut)
+- Enumerate rendering modes via `xrEnumerateDisplayRenderingModesDXR()` to discover available modes with their `viewCount`, `tileColumns`, `tileRows`, `viewScaleX`, `viewScaleY`
+- Request mode changes via `xrRequestDisplayRenderingModeDXR()`
+- Receive `XrEventDataRenderingModeChangedDXR` events when the mode changes (e.g., via qwerty device keyboard shortcut)
 - Adapt rendering parameters (viewport layout, tile dimensions, view count) dynamically per mode
 
 These apps can render optimally for every mode because they know the exact tile layout and per-view scale at all times.
 
-### Legacy Apps (no `XR_EXT_display_info`)
+### Legacy Apps (no `XR_DXR_display_info`)
 
 These are standard OpenXR apps (including WebXR apps on Windows) that:
 - Don't know about display rendering modes
@@ -40,7 +40,7 @@ The problem: `recommendedImageRectWidth/Height` is computed once at `xrGetSystem
 
 ### 1. Detect legacy apps
 
-The runtime already tracks enabled extensions via `inst->extensions.EXT_display_info`. This boolean distinguishes legacy from aware apps.
+The runtime already tracks enabled extensions via `inst->extensions.DXR_display_info`. This boolean distinguishes legacy from aware apps.
 
 ### 2. Restrict legacy apps to 2 modes
 
@@ -70,7 +70,7 @@ The compositor adds a transform step between the app's submitted atlas and the d
 
 ### Implementation locations
 
-- **View scale logic**: `oxr_system_fill_in()` in `src/xrt/state_trackers/oxr/oxr_system.c` -- check `inst->extensions.EXT_display_info` to decide which scale to communicate
+- **View scale logic**: `oxr_system_fill_in()` in `src/xrt/state_trackers/oxr/oxr_system.c` -- check `inst->extensions.DXR_display_info` to decide which scale to communicate
 - **Mode restriction**: When qwerty device triggers mode change for a legacy app session, clamp to mode 0/1 only
 - **Tile processing**: In each native compositor's `process_atlas` path (or in the display processor), compare submitted tile dimensions to expected tile dimensions and blit/scale as needed
 

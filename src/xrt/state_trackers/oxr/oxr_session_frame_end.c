@@ -34,7 +34,7 @@
 #include "oxr_chain.h"
 #include "oxr_xret.h"
 
-#include <openxr/XR_EXT_win32_window_binding.h>
+#include <openxr/XR_DXR_win32_window_binding.h>
 
 #ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 #include "d3d11/comp_d3d11_compositor.h"
@@ -1210,7 +1210,7 @@ verify_window_space_layer(struct oxr_session *sess,
                           struct xrt_compositor *xc,
                           struct oxr_logger *log,
                           uint32_t layer_index,
-                          const XrCompositionLayerWindowSpaceEXT *ws,
+                          const XrCompositionLayerWindowSpaceDXR *ws,
                           struct xrt_device *head,
                           uint64_t timestamp)
 {
@@ -1279,21 +1279,21 @@ verify_window_space_layer(struct oxr_session *sess,
 	return XR_SUCCESS;
 }
 
-#ifdef OXR_HAVE_EXT_local_3d_zone
+#ifdef OXR_HAVE_DXR_local_3d_zone
 static XrResult
 verify_local_2d_layer(struct oxr_session *sess,
                       struct xrt_compositor *xc,
                       struct oxr_logger *log,
                       uint32_t layer_index,
-                      const XrCompositionLayerLocal2DEXT *l2d,
+                      const XrCompositionLayerLocal2DDXR *l2d,
                       struct xrt_device *head,
                       uint64_t timestamp)
 {
 	// Valid to submit without ever creating a mask object (the implicit
 	// mask is compositor-side), but the extension itself must be enabled.
-	if (!sess->sys->inst->extensions.EXT_local_3d_zone) {
+	if (!sess->sys->inst->extensions.DXR_local_3d_zone) {
 		return oxr_error(log, XR_ERROR_LAYER_INVALID,
-		                 "(frameEndInfo->layers[%u]) local-2D layer requires XR_EXT_local_3d_zone to be "
+		                 "(frameEndInfo->layers[%u]) local-2D layer requires XR_DXR_local_3d_zone to be "
 		                 "enabled",
 		                 layer_index);
 	}
@@ -1357,14 +1357,14 @@ verify_local_2d_layer(struct oxr_session *sess,
 
 	return XR_SUCCESS;
 }
-#endif // OXR_HAVE_EXT_local_3d_zone
+#endif // OXR_HAVE_DXR_local_3d_zone
 
-#ifdef OXR_HAVE_EXT_display_zones
+#ifdef OXR_HAVE_DXR_display_zones
 /*!
- * Zones-frame pre-pass (XR_EXT_display_zones, ADR-027): detect whether this
+ * Zones-frame pre-pass (XR_DXR_display_zones, ADR-027): detect whether this
  * frame is a zones frame (>= 1 zone-chained projection layer), enforce the
  * all-or-none rule + per-frame zone constraints, and consume the optional
- * XrDisplayZonesFrameEndInfoEXT on the frame-end chain. Zero-zone frames
+ * XrDisplayZonesFrameEndInfoDXR on the frame-end chain. Zero-zone frames
  * return with *out_zones_frame == false and zero behavioral delta.
  */
 static XrResult
@@ -1391,8 +1391,8 @@ verify_zones_frame(struct oxr_session *sess,
 		}
 		projection_count++;
 
-		const XrDisplayZoneEXT *zone =
-		    OXR_GET_INPUT_FROM_CHAIN(layer, XR_TYPE_DISPLAY_ZONE_EXT, XrDisplayZoneEXT);
+		const XrDisplayZoneDXR *zone =
+		    OXR_GET_INPUT_FROM_CHAIN(layer, XR_TYPE_DISPLAY_ZONE_DXR, XrDisplayZoneDXR);
 		if (zone == NULL) {
 			if (!have_unchained) {
 				have_unchained = true;
@@ -1425,15 +1425,15 @@ verify_zones_frame(struct oxr_session *sess,
 		zone_count++;
 	}
 
-	const XrDisplayZonesFrameEndInfoEXT *fei = OXR_GET_INPUT_FROM_CHAIN(
-	    frameEndInfo, XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_EXT, XrDisplayZonesFrameEndInfoEXT);
+	const XrDisplayZonesFrameEndInfoDXR *fei = OXR_GET_INPUT_FROM_CHAIN(
+	    frameEndInfo, XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_DXR, XrDisplayZonesFrameEndInfoDXR);
 
 	if (zone_count == 0) {
 		// Zero-zone frame: bit-identical legacy behavior. A frame-end
 		// info chained outside a zones frame is inert, not an error.
 		if (fei != NULL && !sess->display_zones.warned_frame_end_info_legacy) {
 			sess->display_zones.warned_frame_end_info_legacy = true;
-			U_LOG_W("XrDisplayZonesFrameEndInfoEXT chained on a zero-zone frame — inert "
+			U_LOG_W("XrDisplayZonesFrameEndInfoDXR chained on a zero-zone frame — inert "
 			        "(one-time warning)");
 		}
 		return XR_SUCCESS;
@@ -1444,7 +1444,7 @@ verify_zones_frame(struct oxr_session *sess,
 	if (zone_count != projection_count) {
 		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
 		                 "(frameEndInfo->layers[%u]) zones frame (%u zone-chained projection layers) but "
-		                 "this projection layer carries no XrDisplayZoneEXT chain (all-or-none)",
+		                 "this projection layer carries no XrDisplayZoneDXR chain (all-or-none)",
 		                 first_unchained, zone_count);
 	}
 
@@ -1479,7 +1479,7 @@ verify_zones_frame(struct oxr_session *sess,
 
 	// VALIDATE_BIT: locate<->submit cross-checks, one-shot WARN per
 	// violation class per session — never a per-frame error (ADR-024).
-	if (fei != NULL && (fei->flags & XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_EXT) != 0) {
+	if (fei != NULL && (fei->flags & XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_DXR) != 0) {
 		for (uint32_t z = 0; z < zone_count; z++) {
 			bool found = false;
 			for (uint32_t li = 0; li < sess->display_zones.located_count; li++) {
@@ -1515,7 +1515,7 @@ verify_zones_frame(struct oxr_session *sess,
 	*out_zones_frame = true;
 	return XR_SUCCESS;
 }
-#endif // OXR_HAVE_EXT_display_zones
+#endif // OXR_HAVE_DXR_display_zones
 
 /*
  *
@@ -1748,13 +1748,13 @@ submit_projection_layer(struct oxr_session *sess,
 	return XR_SUCCESS;
 }
 
-#ifdef OXR_HAVE_EXT_display_zones
+#ifdef OXR_HAVE_DXR_display_zones
 /*!
  * Submit a zone-chained projection layer as XRT_LAYER_ZONE_3D
- * (XR_EXT_display_zones, ADR-027). Clone of submit_projection_layer with the
+ * (XR_DXR_display_zones, ADR-027). Clone of submit_projection_layer with the
  * zone tagging: same per-view fov/pose/sub fill (zone_3d.proj is
  * layout-identical to proj at union offset 0), plus the zone rect + id from
- * the chained XrDisplayZoneEXT. No depth variant in v1 — chained depth info
+ * the chained XrDisplayZoneDXR. No depth variant in v1 — chained depth info
  * is ignored with a one-shot WARN.
  */
 static XrResult
@@ -1774,7 +1774,7 @@ submit_zone_3d_layer(struct oxr_session *sess,
 	struct xrt_swapchain *swapchains[XRT_MAX_VIEWS] = {0};
 
 	// Presence + validity guaranteed by verify_zones_frame.
-	const XrDisplayZoneEXT *zone = OXR_GET_INPUT_FROM_CHAIN(proj, XR_TYPE_DISPLAY_ZONE_EXT, XrDisplayZoneEXT);
+	const XrDisplayZoneDXR *zone = OXR_GET_INPUT_FROM_CHAIN(proj, XR_TYPE_DISPLAY_ZONE_DXR, XrDisplayZoneDXR);
 	assert(zone != NULL);
 
 	enum xrt_layer_composition_flags flags = convert_layer_flags(proj->layerFlags);
@@ -1854,7 +1854,7 @@ submit_zone_3d_layer(struct oxr_session *sess,
 
 	return XR_SUCCESS;
 }
-#endif // OXR_HAVE_EXT_display_zones
+#endif // OXR_HAVE_DXR_display_zones
 
 static XrResult
 submit_cube_layer(struct oxr_session *sess,
@@ -2092,7 +2092,7 @@ static XrResult
 submit_window_space_layer(struct oxr_session *sess,
                           struct xrt_compositor *xc,
                           struct oxr_logger *log,
-                          const XrCompositionLayerWindowSpaceEXT *ws,
+                          const XrCompositionLayerWindowSpaceDXR *ws,
                           struct xrt_device *head,
                           struct xrt_pose *inv_offset,
                           uint64_t oxr_timestamp,
@@ -2124,12 +2124,12 @@ submit_window_space_layer(struct oxr_session *sess,
 	return XR_SUCCESS;
 }
 
-#ifdef OXR_HAVE_EXT_local_3d_zone
+#ifdef OXR_HAVE_DXR_local_3d_zone
 static XrResult
 submit_local_2d_layer(struct oxr_session *sess,
                       struct xrt_compositor *xc,
                       struct oxr_logger *log,
-                      const XrCompositionLayerLocal2DEXT *l2d,
+                      const XrCompositionLayerLocal2DDXR *l2d,
                       struct xrt_device *head,
                       struct xrt_pose *inv_offset,
                       uint64_t oxr_timestamp,
@@ -2159,7 +2159,7 @@ submit_local_2d_layer(struct oxr_session *sess,
 
 	return XR_SUCCESS;
 }
-#endif // OXR_HAVE_EXT_local_3d_zone
+#endif // OXR_HAVE_DXR_local_3d_zone
 
 static XrResult
 submit_passthrough_layer(struct oxr_session *sess,
@@ -2284,14 +2284,14 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 		return oxr_error(log, XR_ERROR_LAYER_INVALID, "(frameEndInfo->layers == NULL)");
 	}
 
-#ifdef OXR_HAVE_EXT_display_zones
-	// XR_EXT_display_zones (ADR-027): zones-frame detection + gating. Only
+#ifdef OXR_HAVE_DXR_display_zones
+	// XR_DXR_display_zones (ADR-027): zones-frame detection + gating. Only
 	// runs with the extension enabled — zero-zone bit-identity is
 	// structural. In a zones frame the legacy canvas output rect, the
 	// sticky submitted mask, and the implicit-mask-from-Local2D rule are
 	// all inert (compositor-side, P2).
 	bool zones_frame = false;
-	if (sess->sys->inst->extensions.EXT_display_zones) {
+	if (sess->sys->inst->extensions.DXR_display_zones) {
 		void *zones_wish_comp_mask = NULL;
 		XrResult zres = verify_zones_frame(sess, log, frameEndInfo, &zones_frame, &zones_wish_comp_mask);
 		if (zres != XR_SUCCESS) {
@@ -2374,17 +2374,17 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 			res = verify_passthrough_layer(xc, log, i, (XrCompositionLayerPassthroughFB *)layer, xdev,
 			                               frameEndInfo->displayTime);
 			break;
-		case XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT:
+		case XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR:
 			res = verify_window_space_layer(sess, xc, log, i,
-			                                (XrCompositionLayerWindowSpaceEXT *)layer, xdev,
+			                                (XrCompositionLayerWindowSpaceDXR *)layer, xdev,
 			                                frameEndInfo->displayTime);
 			break;
-#ifdef OXR_HAVE_EXT_local_3d_zone
-		case XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT:
-			res = verify_local_2d_layer(sess, xc, log, i, (XrCompositionLayerLocal2DEXT *)layer, xdev,
+#ifdef OXR_HAVE_DXR_local_3d_zone
+		case XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR:
+			res = verify_local_2d_layer(sess, xc, log, i, (XrCompositionLayerLocal2DDXR *)layer, xdev,
 			                            frameEndInfo->displayTime);
 			break;
-#endif // OXR_HAVE_EXT_local_3d_zone
+#endif // OXR_HAVE_DXR_local_3d_zone
 		default:
 			return oxr_error(log, XR_ERROR_LAYER_INVALID,
 			                 "(frameEndInfo->layers[%u]->type) layer type not supported (%u)", i,
@@ -2423,7 +2423,7 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 
 		switch (layer->type) {
 		case XR_TYPE_COMPOSITION_LAYER_PROJECTION:
-#ifdef OXR_HAVE_EXT_display_zones
+#ifdef OXR_HAVE_DXR_display_zones
 			if (zones_frame) {
 				// All-or-none verified: every projection layer in a
 				// zones frame carries a zone chain.
@@ -2459,16 +2459,16 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 			submit_passthrough_layer(sess, xc, log, (XrCompositionLayerPassthroughFB *)layer, xdev,
 			                         &inv_offset, frameEndInfo->displayTime, xrt_display_time_ns);
 			break;
-		case XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT:
-			submit_window_space_layer(sess, xc, log, (XrCompositionLayerWindowSpaceEXT *)layer, xdev,
+		case XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR:
+			submit_window_space_layer(sess, xc, log, (XrCompositionLayerWindowSpaceDXR *)layer, xdev,
 			                          &inv_offset, frameEndInfo->displayTime, xrt_display_time_ns);
 			break;
-#ifdef OXR_HAVE_EXT_local_3d_zone
-		case XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT:
-			submit_local_2d_layer(sess, xc, log, (XrCompositionLayerLocal2DEXT *)layer, xdev, &inv_offset,
+#ifdef OXR_HAVE_DXR_local_3d_zone
+		case XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR:
+			submit_local_2d_layer(sess, xc, log, (XrCompositionLayerLocal2DDXR *)layer, xdev, &inv_offset,
 			                      frameEndInfo->displayTime, xrt_display_time_ns);
 			break;
-#endif // OXR_HAVE_EXT_local_3d_zone
+#endif // OXR_HAVE_DXR_local_3d_zone
 		default: assert(false && "invalid layer type");
 		}
 	}
@@ -2476,16 +2476,16 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	xret = xrt_comp_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
 	OXR_CHECK_XRET(log, sess, xret, xrt_comp_layer_commit);
 
-#ifdef OXR_HAVE_EXT_local_3d_zone
+#ifdef OXR_HAVE_DXR_local_3d_zone
 	// #439 Phase 3 Q4 — view-size renegotiation poll. The just-committed
 	// frame resolved the compositor's recommended per-view render size
 	// (mask activation/deactivation supersedes the canvas; window resize
 	// changes the window). Baseline on the first sample without firing,
-	// push XrEventDataLocal3DZoneViewSizeChangedEXT on subsequent change
+	// push XrEventDataLocal3DZoneViewSizeChangedDXR on subsequent change
 	// (#441 edge-detection pattern; the event is advisory). Per-compositor
 	// getter dispatch — the D3D11/VK/GL consumer legs add their branches
 	// beside the Metal one.
-	if (sess->sys->inst->extensions.EXT_local_3d_zone && sess->xcn != NULL) {
+	if (sess->sys->inst->extensions.DXR_local_3d_zone && sess->xcn != NULL) {
 		uint32_t view_w = 0;
 		uint32_t view_h = 0;
 		bool have_dims = false;
@@ -2528,7 +2528,7 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 			sess->last_local2d_view_h = view_h;
 		}
 	}
-#endif // OXR_HAVE_EXT_local_3d_zone
+#endif // OXR_HAVE_DXR_local_3d_zone
 
 	sess->frame_id.begun = -1;
 	sess->frame_started = false;

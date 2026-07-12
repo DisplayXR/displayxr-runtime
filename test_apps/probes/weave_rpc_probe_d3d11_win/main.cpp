@@ -2,18 +2,18 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  XR_EXT_weave probe (#625) — native, browser-free Step-0 harness.
+ * @brief  XR_DXR_weave probe (#625) — native, browser-free Step-0 harness.
  *
  * A present-owner that exercises the window-bound synchronous weave service end
  * to end with zero browser:
  *
  *   1. Creates its own OS window + a transparent DirectComposition swap chain.
  *   2. Brings up a forced-IPC OpenXR session bound to that window
- *      (XR_EXT_win32_window_binding, transparent, no shared texture).
- *   3. xrWeaveBindWindowEXT(window) once for DP phase-snap.
+ *      (XR_DXR_win32_window_binding, transparent, no shared texture).
+ *   3. xrWeaveBindWindowDXR(window) once for DP phase-snap.
  *   4. Builds a known pre-weave SBS test texture (left half red, right half blue)
  *      as a keyed-mutex shared texture.
- *   5. Per frame: xrWeaveSubmitEXT(sbs, windowRelativeRect) → weaved shared
+ *   5. Per frame: xrWeaveSubmitDXR(sbs, windowRelativeRect) → weaved shared
  *      texture + fence; GPU-waits the fence; presents the weaved handback via its
  *      own DComp swap chain. Logs the per-frame round-trip latency.
  *
@@ -72,7 +72,7 @@ static ComPtr<IDXGISwapChain1> g_swapChain;
 static ComPtr<ID3D11Texture2D> g_sbsTex;
 static ComPtr<ID3D11RenderTargetView> g_sbsRtv;
 static ComPtr<IDXGIKeyedMutex> g_sbsMutex;
-static HANDLE g_sbsHandle = nullptr; //!< NT handle passed to xrWeaveSubmitEXT
+static HANDLE g_sbsHandle = nullptr; //!< NT handle passed to xrWeaveSubmitDXR
 // Latest tracked per-eye horizontal position (metres, display space) returned by
 // the previous weave_submit; drives this frame's off-axis parallax. [0]=L [1]=R.
 static float g_lastEyeX[2] = {0.0f, 0.0f};
@@ -295,7 +295,7 @@ RenderSbsLookAround(float eyeLx, float eyeRx)
 
 // ---- Open the runtime's exported weaved texture + fence ----------------------
 static bool
-OpenWeavedHandback(const XrWeaveOutputEXT &out)
+OpenWeavedHandback(const XrWeaveOutputDXR &out)
 {
 	g_weavedTex.Reset();
 	g_weaveFence.Reset();
@@ -407,7 +407,7 @@ int WINAPI
 wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 {
 	InitializeLogging("weave_rpc_probe_d3d11_win");
-	LOG_INFO("=== XR_EXT_weave probe (#625) starting ===");
+	LOG_INFO("=== XR_DXR_weave probe (#625) starting ===");
 
 	XrSessionManager xr;
 	if (!InitializeOpenXR(xr)) {
@@ -452,7 +452,7 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 
 	// Bind the present-owner window for DP phase-snap.
 	XrResult br = g_pfnWeaveBindWindow(xr.session, (void *)g_hwnd);
-	LogXrResult("xrWeaveBindWindowEXT", br);
+	LogXrResult("xrWeaveBindWindowDXR", br);
 	if (XR_FAILED(br)) {
 		return 1;
 	}
@@ -498,7 +498,7 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		// runtime returned LAST frame (look-around / virtual-camera motion).
 		RenderSbsLookAround(g_lastEyeX[0], g_lastEyeX[1]);
 
-		XrWeaveSubmitInfoEXT in = {XR_TYPE_WEAVE_SUBMIT_INFO_EXT};
+		XrWeaveSubmitInfoDXR in = {XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
 		in.inputTexture = (void *)g_sbsHandle;
 		in.inputIsDxgi = XR_FALSE;
 		in.rect.offset.x = rx;
@@ -506,7 +506,7 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		in.rect.extent.width = (int32_t)rw;
 		in.rect.extent.height = (int32_t)rh;
 
-		XrWeaveOutputEXT out = {XR_TYPE_WEAVE_OUTPUT_EXT};
+		XrWeaveOutputDXR out = {XR_TYPE_WEAVE_OUTPUT_DXR};
 
 		LARGE_INTEGER t0, t1;
 		QueryPerformanceCounter(&t0);
@@ -514,7 +514,7 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		QueryPerformanceCounter(&t1);
 
 		if (XR_FAILED(sr)) {
-			LogXrResult("xrWeaveSubmitEXT", sr);
+			LogXrResult("xrWeaveSubmitDXR", sr);
 			Sleep(100);
 			continue;
 		}

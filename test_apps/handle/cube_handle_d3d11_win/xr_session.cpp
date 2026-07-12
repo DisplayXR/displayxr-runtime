@@ -2,22 +2,22 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  OpenXR session management with XR_EXT_win32_window_binding extension
+ * @brief  OpenXR session management with XR_DXR_win32_window_binding extension
  */
 
 #include "xr_session.h"
 #include "logging.h"
 #include <cstring>
 
-// XR_EXT_view_rig (#396 W7): app-local availability flag (see xr_session.h).
+// XR_DXR_view_rig (#396 W7): app-local availability flag (see xr_session.h).
 bool g_hasViewRigExt = false;
 
-// #439 Phase 3 — XR_EXT_local_3d_zone harness (see xr_session.h).
+// #439 Phase 3 — XR_DXR_local_3d_zone harness (see xr_session.h).
 ZoneMaskHarness g_zone;
 
 // INV-1.3 (#715): 3D panel top-left in virtual-desktop pixels (top-down,
 // origin = primary top-left); (0,0) = primary/unknown. Filled from the
-// XrDisplayDesktopPositionEXT chain in InitializeOpenXR; app-local because the
+// XrDisplayDesktopPositionDXR chain in InitializeOpenXR; app-local because the
 // shared XrSessionManager (displayxr-common) doesn't carry this field yet.
 int32_t g_displayScreenLeft = 0;
 int32_t g_displayScreenTop = 0;
@@ -88,37 +88,37 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_KHR_D3D11_ENABLE_EXTENSION_NAME) == 0) {
             hasD3D11 = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME) == 0) {
             xr.hasWin32WindowBindingExt = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) {
             xr.hasDisplayInfoExt = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_WORKSPACE_FILE_DIALOG_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_WORKSPACE_FILE_DIALOG_EXTENSION_NAME) == 0) {
             xr.hasFileDialogExt = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0) {
             xr.hasAtlasCaptureExt = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_MCP_TOOLS_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_MCP_TOOLS_EXTENSION_NAME) == 0) {
             xr.hasMcpToolsExt = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
             g_hasViewRigExt = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) {
             g_zone.available = true;
         }
     }
 
     LOG_INFO("XR_KHR_D3D11_enable: %s", hasD3D11 ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_EXT_win32_window_binding: %s", xr.hasWin32WindowBindingExt ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_EXT_display_info: %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_EXT_workspace_file_dialog: %s", xr.hasFileDialogExt ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_EXT_atlas_capture: %s", xr.hasAtlasCaptureExt ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_EXT_mcp_tools: %s", xr.hasMcpToolsExt ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_EXT_view_rig: %s", g_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_EXT_local_3d_zone: %s", g_zone.available ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_win32_window_binding: %s", xr.hasWin32WindowBindingExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_display_info: %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_workspace_file_dialog: %s", xr.hasFileDialogExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_atlas_capture: %s", xr.hasAtlasCaptureExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_mcp_tools: %s", xr.hasMcpToolsExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_view_rig: %s", g_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_local_3d_zone: %s", g_zone.available ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasD3D11) {
         LOG_ERROR("XR_KHR_D3D11_enable extension not available - cannot continue");
@@ -126,7 +126,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
 
     if (!xr.hasWin32WindowBindingExt) {
-        LOG_WARN("XR_EXT_win32_window_binding extension not available - window targeting disabled");
+        LOG_WARN("XR_DXR_win32_window_binding extension not available - window targeting disabled");
         LOG_WARN("The runtime will create its own window instead of using the app window");
     }
 
@@ -134,25 +134,25 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     std::vector<const char*> enabledExtensions;
     enabledExtensions.push_back(XR_KHR_D3D11_ENABLE_EXTENSION_NAME);
     if (xr.hasWin32WindowBindingExt) {
-        enabledExtensions.push_back(XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME);
     }
     if (xr.hasDisplayInfoExt) {
-        enabledExtensions.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
     }
     if (xr.hasFileDialogExt) {
-        enabledExtensions.push_back(XR_EXT_WORKSPACE_FILE_DIALOG_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_WORKSPACE_FILE_DIALOG_EXTENSION_NAME);
     }
     if (xr.hasAtlasCaptureExt) {
-        enabledExtensions.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME);
     }
     if (xr.hasMcpToolsExt) {
-        enabledExtensions.push_back(XR_EXT_MCP_TOOLS_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_MCP_TOOLS_EXTENSION_NAME);
     }
     if (g_hasViewRigExt) {
-        enabledExtensions.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
     }
     if (g_zone.available) {
-        enabledExtensions.push_back(XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME);
     }
 
     LOG_INFO("Enabling %zu extensions", enabledExtensions.size());
@@ -195,16 +195,16 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         }
     }
 
-    // Query display info via XR_EXT_display_info
+    // Query display info via XR_DXR_display_info
     if (xr.hasDisplayInfoExt) {
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
-        XrDisplayInfoEXT displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
-        XrEyeTrackingModeCapabilitiesEXT eyeCaps = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT};
+        XrDisplayInfoDXR displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
+        XrEyeTrackingModeCapabilitiesDXR eyeCaps = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR};
         // INV-1.3: panel desktop position, so the app window can be moved onto
         // the 3D panel instead of the primary monitor (spec v16, #715).
         // Chained at the tail of the existing chain.
-        XrDisplayDesktopPositionEXT desktopPos = {};
-        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT;
+        XrDisplayDesktopPositionDXR desktopPos = {};
+        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
         displayInfo.next = &eyeCaps;
         eyeCaps.next = &desktopPos;
         sysProps.next = &displayInfo;
@@ -233,57 +233,57 @@ bool InitializeOpenXR(XrSessionManager& xr) {
                 xr.supportedEyeTrackingModes, xr.defaultEyeTrackingMode);
         }
 
-        // Load xrRequestDisplayModeEXT function pointer
+        // Load xrRequestDisplayModeDXR function pointer
         {
             XrResult procResult = xrGetInstanceProcAddr(
-                xr.instance, "xrRequestDisplayModeEXT",
+                xr.instance, "xrRequestDisplayModeDXR",
                 (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
             if (XR_FAILED(procResult)) {
-                LOG_WARN("Failed to load xrRequestDisplayModeEXT");
+                LOG_WARN("Failed to load xrRequestDisplayModeDXR");
                 xr.pfnRequestDisplayModeEXT = nullptr;
             }
         }
 
-        // Load xrRequestEyeTrackingModeEXT function pointer
+        // Load xrRequestEyeTrackingModeDXR function pointer
         if (xr.supportedEyeTrackingModes != 0) {
-            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeEXT",
+            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeDXR",
                 (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingModeEXT);
         }
 
-        // Load xrRequestDisplayRenderingModeEXT function pointer (v7)
-        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeEXT",
+        // Load xrRequestDisplayRenderingModeDXR function pointer (v7)
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR",
             (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
-        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesDXR",
             (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
     }
 
     // #228 Tier 1 spatial file picker — resolve the app-side entrypoint.
     if (xr.hasFileDialogExt) {
-        xrGetInstanceProcAddr(xr.instance, "xrRequestFilePickerEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrRequestFilePickerDXR",
             (PFN_xrVoidFunction*)&xr.pfnRequestFilePickerEXT);
-        LOG_INFO("xrRequestFilePickerEXT: %s", xr.pfnRequestFilePickerEXT ? "resolved" : "NULL");
+        LOG_INFO("xrRequestFilePickerDXR: %s", xr.pfnRequestFilePickerEXT ? "resolved" : "NULL");
     }
 
-    // XR_EXT_atlas_capture (W6 of #396): resolve the runtime-owned capture entry.
+    // XR_DXR_atlas_capture (W6 of #396): resolve the runtime-owned capture entry.
     if (xr.hasAtlasCaptureExt) {
-        xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasDXR",
             (PFN_xrVoidFunction*)&xr.pfnCaptureAtlasEXT);
-        LOG_INFO("xrCaptureAtlasEXT: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
+        LOG_INFO("xrCaptureAtlasDXR: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
     }
 
-    // #439 Phase 3 — XR_EXT_local_3d_zone entry points (app-local harness; the
+    // #439 Phase 3 — XR_DXR_local_3d_zone entry points (app-local harness; the
     // handle-app panel modes use the explicit Tier-2 island mask for case 2).
     if (g_zone.available) {
-        xrGetInstanceProcAddr(xr.instance, "xrCreateLocal3DZoneMaskEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrCreateLocal3DZoneMaskDXR",
             (PFN_xrVoidFunction*)&g_zone.pfnCreate);
-        xrGetInstanceProcAddr(xr.instance, "xrSetLocal3DZoneFromRectsEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrSetLocal3DZoneFromRectsDXR",
             (PFN_xrVoidFunction*)&g_zone.pfnSetRects);
-        xrGetInstanceProcAddr(xr.instance, "xrSubmitLocal3DZoneEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrSubmitLocal3DZoneDXR",
             (PFN_xrVoidFunction*)&g_zone.pfnSubmit);
-        xrGetInstanceProcAddr(xr.instance, "xrDestroyLocal3DZoneMaskEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrDestroyLocal3DZoneMaskDXR",
             (PFN_xrVoidFunction*)&g_zone.pfnDestroy);
         if (!g_zone.pfnCreate || !g_zone.pfnSetRects || !g_zone.pfnSubmit || !g_zone.pfnDestroy) {
-            LOG_WARN("XR_EXT_local_3d_zone advertised but entry points missing — harness disabled");
+            LOG_WARN("XR_DXR_local_3d_zone advertised but entry points missing — harness disabled");
             g_zone.available = false;
         }
     }
@@ -310,7 +310,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
 }
 
 bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd) {
-    LOG_INFO("Creating OpenXR session with XR_EXT_win32_window_binding...");
+    LOG_INFO("Creating OpenXR session with XR_DXR_win32_window_binding...");
     LOG_INFO("  D3D11 Device: 0x%p", d3d11Device);
     LOG_INFO("  Window handle (HWND): 0x%p", hwnd);
 
@@ -321,7 +321,7 @@ bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd) {
     d3d11Binding.device = d3d11Device;
 
     // Session target extension - chain it to the D3D11 binding
-    XrWin32WindowBindingCreateInfoEXT sessionTarget = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT};
+    XrWin32WindowBindingCreateInfoDXR sessionTarget = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR};
     sessionTarget.windowHandle = hwnd;
 
     // Opt-in transparency. Pair with WS_EX_NOREDIRECTIONBITMAP + null brush
@@ -339,10 +339,10 @@ bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd) {
     if (xr.hasWin32WindowBindingExt && hwnd) {
         // Chain: sessionInfo -> d3d11Binding -> sessionTarget
         d3d11Binding.next = &sessionTarget;
-        LOG_INFO("Using XR_EXT_win32_window_binding with window handle");
-        LOG_INFO("  Chain: XrSessionCreateInfo -> XrGraphicsBindingD3D11KHR -> XrWin32WindowBindingCreateInfoEXT");
+        LOG_INFO("Using XR_DXR_win32_window_binding with window handle");
+        LOG_INFO("  Chain: XrSessionCreateInfo -> XrGraphicsBindingD3D11KHR -> XrWin32WindowBindingCreateInfoDXR");
     } else {
-        LOG_WARN("NOT using XR_EXT_win32_window_binding (hasExt=%d, hwnd=%p)",
+        LOG_WARN("NOT using XR_DXR_win32_window_binding (hasExt=%d, hwnd=%p)",
             xr.hasWin32WindowBindingExt, hwnd);
         LOG_WARN("Runtime will create its own window for rendering");
     }
@@ -355,25 +355,25 @@ bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd) {
     XR_CHECK_LOG(xrCreateSession(xr.instance, &sessionInfo, &xr.session));
     LOG_INFO("Session created: 0x%p", (void*)xr.session);
 
-    // XR_EXT_mcp_tools (#457): declare identity + register agent tools. The
+    // XR_DXR_mcp_tools (#457): declare identity + register agent tools. The
     // appId MUST match `id` in displayxr/cube_handle_d3d11_win.displayxr.json
     // (INV-10.1). Failure is non-fatal by design — the MCP capability gate
     // may simply be off on this machine.
     if (xr.hasMcpToolsExt) {
-        xrGetInstanceProcAddr(xr.instance, "xrSetMCPAppInfoEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrSetMCPAppInfoDXR",
             (PFN_xrVoidFunction*)&xr.pfnSetMCPAppInfoEXT);
-        xrGetInstanceProcAddr(xr.instance, "xrRegisterMCPToolEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrRegisterMCPToolDXR",
             (PFN_xrVoidFunction*)&xr.pfnRegisterMCPToolEXT);
-        xrGetInstanceProcAddr(xr.instance, "xrGetMCPToolCallArgsEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrGetMCPToolCallArgsDXR",
             (PFN_xrVoidFunction*)&xr.pfnGetMCPToolCallArgsEXT);
-        xrGetInstanceProcAddr(xr.instance, "xrSubmitMCPToolResultEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrSubmitMCPToolResultDXR",
             (PFN_xrVoidFunction*)&xr.pfnSubmitMCPToolResultEXT);
         if (xr.pfnSetMCPAppInfoEXT && xr.pfnRegisterMCPToolEXT && xr.pfnSubmitMCPToolResultEXT) {
-            XrMCPAppInfoEXT mcpAppInfo = {XR_TYPE_MCP_APP_INFO_EXT};
+            XrMCPAppInfoDXR mcpAppInfo = {XR_TYPE_MCP_APP_INFO_DXR};
             strncpy(mcpAppInfo.appId, "cube-d3d11", sizeof(mcpAppInfo.appId) - 1);
             XrResult ar = xr.pfnSetMCPAppInfoEXT(xr.session, &mcpAppInfo);
 
-            XrMCPToolInfoEXT setSpin = {XR_TYPE_MCP_TOOL_INFO_EXT};
+            XrMCPToolInfoDXR setSpin = {XR_TYPE_MCP_TOOL_INFO_DXR};
             setSpin.name = "set_spin";
             setSpin.description =
                 "Set the cube's spin speed. Takes effect immediately; the change is "
@@ -385,7 +385,7 @@ bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd) {
                 "\"required\":[\"speed_rad_per_sec\"]}";
             XrResult tr1 = xr.pfnRegisterMCPToolEXT(xr.session, &setSpin);
 
-            XrMCPToolInfoEXT getStatus = {XR_TYPE_MCP_TOOL_INFO_EXT};
+            XrMCPToolInfoDXR getStatus = {XR_TYPE_MCP_TOOL_INFO_DXR};
             getStatus.name = "get_status";
             getStatus.description =
                 "Read the cube app's live state: spin speed (rad/s), whether the XR "
@@ -393,7 +393,7 @@ bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd) {
             getStatus.inputSchemaJson = "{\"type\":\"object\"}";
             XrResult tr2 = xr.pfnRegisterMCPToolEXT(xr.session, &getStatus);
 
-            LOG_INFO("XR_EXT_mcp_tools: appId=%d set_spin=%d get_status=%d", ar, tr1, tr2);
+            LOG_INFO("XR_DXR_mcp_tools: appId=%d set_spin=%d get_status=%d", ar, tr1, tr2);
         }
     }
 
@@ -402,18 +402,18 @@ bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd) {
         uint32_t modeCount = 0;
         XrResult enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, 0, &modeCount, nullptr);
         if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
-            std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
+            std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
             // Per-mode tracking capability (#441 v14) — reference adoption of
             // the chained-struct opt-in: pre-set each element's type AND chain
             // the tracking struct on next BEFORE the fill call. The runtime
             // only walks elements carrying the pre-set type, so v13 binaries
             // (uninitialized type/next) are untouched.
-            std::vector<XrDisplayRenderingModeTrackingInfoEXT> trackingInfos(modeCount);
+            std::vector<XrDisplayRenderingModeTrackingInfoDXR> trackingInfos(modeCount);
             for (uint32_t i = 0; i < modeCount; i++) {
-                trackingInfos[i].type = (XrStructureType)XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_EXT;
+                trackingInfos[i].type = (XrStructureType)XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_DXR;
                 trackingInfos[i].next = nullptr;
                 trackingInfos[i].hasTracking = XR_FALSE;
-                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
                 modes[i].next = &trackingInfos[i];
             }
             enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, modeCount, &modeCount, modes.data());

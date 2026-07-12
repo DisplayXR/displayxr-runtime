@@ -1,27 +1,27 @@
 ---
 status: Superseded
-superseded_by: "issue #370 (XR_EXT_spatial_workspace spec_version 22)"
+superseded_by: "issue #370 (XR_DXR_spatial_workspace spec_version 22)"
 date: 2026-05-20
 ---
 # ADR-018: Workspace Hit-Test Is Plumbing; Drag/Resize/Cursor Policy Is the Controller's
 
 > **SUPERSEDED (2026-05-31, issue #370 / spec_version 22).** This ADR's core decision —
 > "hit-test computation stays in the runtime as plumbing" — has been **reversed**. The
-> runtime's `workspace_raycast_hit_test`, the public `xrWorkspaceHitTestEXT` API, the
+> runtime's `workspace_raycast_hit_test`, the public `xrWorkspaceHitTestDXR` API, the
 > POINTER/POINTER_MOTION hit enrichment, and runtime-side POINTER_HOVER emission were all
 > **deleted**. The workspace controller now owns hit-testing end to end: it runs the
 > eye→cursor raycast itself (it already has the window poses it pushed, eye positions via
 > its session, and now receives the OS cursor position each frame on FRAME_TICK), generates
 > its own hover transitions, and feeds the runtime only the cursor **depth** via the new
-> `xrSetWorkspaceCursorDepthEXT` so the runtime can composite the cursor sprite at the right
+> `xrSetWorkspaceCursorDepthDXR` so the runtime can composite the cursor sprite at the right
 > per-eye disparity. The drag / resize / rotation state machines named below as the "real
 > layering violation" have also migrated to the controller (driven via
-> `xrSetWorkspaceClientWindowPoseEXT`); the `mc->title_drag` / `mc->resize` /
+> `xrSetWorkspaceClientWindowPoseDXR`); the `mc->title_drag` / `mc->resize` /
 > `mc->title_rmb_drag` machines no longer exist in the runtime. The follow-up in
 > "Consequences → Once the policy migrates, revisit whether the public
-> `xrWorkspaceHitTestEXT` API is still useful" was resolved by removing it. The original
+> `xrWorkspaceHitTestDXR` API is still useful" was resolved by removing it. The original
 > reasoning is retained below as the historical record. Current contract:
-> `docs/architecture/separation-of-concerns.md` + `docs/specs/extensions/XR_EXT_spatial_workspace.md`.
+> `docs/architecture/separation-of-concerns.md` + `docs/specs/extensions/XR_DXR_spatial_workspace.md`.
 
 ## Context
 
@@ -32,9 +32,9 @@ The workspace runtime currently does spatial raycasting in `workspace_raycast_hi
 3. **RMB-pressed handler** (line ~7605) — runtime starts a title-bar rotation drag (`mc->title_rmb_drag`).
 4. **POINTER event publish** (line ~14200) — runtime enriches a `WORKSPACE_PUBLIC_EVENT_POINTER` event with `hit_region`, `hit_client_id`, `local_uv`, `chrome_region_id` before delivering it to the controller.
 5. **MOTION event publish** (line ~14240) — same enrichment on per-frame mouse-motion events.
-6. **Public extension API `xrWorkspaceHitTestEXT`** (line ~15240) — controller queries hit-test directly.
+6. **Public extension API `xrWorkspaceHitTestDXR`** (line ~15240) — controller queries hit-test directly.
 
-The DisplayXR Shell (and any future workspace controller) **consumes** the runtime's hit-test output via `XR_WORKSPACE_INPUT_EVENT_POINTER_HOVER_EXT` (`currentClientId`, `currentChromeRegionId`) to drive chrome button hover state. It does not currently do its own raycast.
+The DisplayXR Shell (and any future workspace controller) **consumes** the runtime's hit-test output via `XR_WORKSPACE_INPUT_EVENT_POINTER_HOVER_DXR` (`currentClientId`, `currentChromeRegionId`) to drive chrome button hover state. It does not currently do its own raycast.
 
 The [Controllers own motion](../../) memory and the broader separation-of-concerns rule say "runtime is plumbing only; controllers own interactive policy." Read literally, the runtime computing hit-test on every cursor motion looks like a policy violation. This ADR clarifies why it isn't, and identifies what *is* the actual layering violation in this area.
 
@@ -43,8 +43,8 @@ The [Controllers own motion](../../) memory and the broader separation-of-concer
 **Hit-test computation stays in the runtime as plumbing**, exposed to the controller via:
 
 - `WORKSPACE_PUBLIC_EVENT_POINTER` / `_MOTION` event enrichment (passive — controller reads it if useful).
-- `XR_WORKSPACE_INPUT_EVENT_POINTER_HOVER_EXT` notification on transitions.
-- `xrWorkspaceHitTestEXT` synchronous query API.
+- `XR_WORKSPACE_INPUT_EVENT_POINTER_HOVER_DXR` notification on transitions.
+- `xrWorkspaceHitTestDXR` synchronous query API.
 
 Rationale:
 
@@ -72,7 +72,7 @@ These are *policy* — they decide what the user's input *does*. Per ADR-016 the
 
 - **Drag/resize/rotation state machines → controller.** Requires controller-side per-frame tick that consumes raw button events + hit results, emits window-pose updates via existing `set_pose` IPC. Runtime stops owning `mc->resize`, `mc->title_drag`, `mc->title_rmb_drag`. Probably several PRs.
 - **Cursor sprite render policy → controller.** Either (a) controller submits cursor as an additional chrome layer the runtime composites, or (b) runtime exposes "render cursor at this pose with this shape" via an extension API and the controller drives it. (a) reuses existing chrome plumbing and is preferred.
-- **Once the policy migrates**, revisit whether the public `xrWorkspaceHitTestEXT` API is still useful or if all controller raycast can be controller-local.
+- **Once the policy migrates**, revisit whether the public `xrWorkspaceHitTestDXR` API is still useful or if all controller raycast can be controller-local.
 
 ### Constraints we are NOT relaxing
 

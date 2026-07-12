@@ -75,7 +75,7 @@ The manifest sits in a system-known discovery directory and points at any execut
   "icon_3d_layout": "sbs-lr",
   "category": "test",
   "display_mode": "auto",
-  "description": "Reference cube demonstrating XR_EXT_win32_window_binding on D3D11."
+  "description": "Reference cube demonstrating XR_DXR_win32_window_binding on D3D11."
 }
 ```
 
@@ -91,7 +91,7 @@ The manifest sits in a system-known discovery directory and points at any execut
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `id` | string | *none* | Stable machine identifier (slug) for the app — see §3.4. Matches `^[a-z0-9][a-z0-9-]{0,31}$`. Strongly recommended for all apps; **required for apps that register MCP tools** via `XR_EXT_mcp_tools` (the runtime-declared `appId` must match this field). |
+| `id` | string | *none* | Stable machine identifier (slug) for the app — see §3.4. Matches `^[a-z0-9][a-z0-9-]{0,31}$`. Strongly recommended for all apps; **required for apps that register MCP tools** via `XR_DXR_mcp_tools` (the runtime-declared `appId` must match this field). |
 | `exe_path` | string | *none* | Absolute path to the executable. **Required in registered mode (§2.2), MUST be absent in sidecar mode (§2.1).** Forward or back slashes accepted; the scanner normalizes to backslashes. The referenced file must exist at scan time or the entry is skipped. |
 | `icon` | string | *none* | Relative path to a 2D icon image. PNG or JPEG. Recommended 512×512. When absent, the tile is rendered with the app name as a text label on a category-colored background. |
 | `icon_3d` | string | *none* | Relative path to a stereoscopic icon image. When present, the workspace controller renders the tile stereoscopically. Resolution matches `icon` aspect but doubled along the layout axis (e.g. 1024×512 for `sbs-lr`). Requires `icon` to also be set (as the 2D fallback). |
@@ -117,7 +117,7 @@ Rules:
 - **Charset:** `^[a-z0-9][a-z0-9-]{0,31}$` — lowercase ASCII letters, digits, hyphens; 1–32 chars; must start alphanumeric. Underscores are deliberately excluded: `__` is the reserved MCP namespace separator.
 - **Stability:** treat `id` as immutable once shipped. Changing it renames every MCP tool the app exposes and orphans any per-app state keyed on it.
 - **Uniqueness:** ids should be unique across the ecosystem by convention (pick something specific: `mediaplayer`, `gaussiansplat` — not `viewer`). There is no central registry; collisions between *different* apps are a scanner **warning** (both entries survive — dedup remains by `exe_path`), and consumers such as the MCP workspace aggregator disambiguate at runtime with sticky suffixes (`-2`, `-3`).
-- **Cross-check:** an app that registers MCP tools declares the same id at runtime via `xrSetMCPAppInfoEXT`. The runtime-declared value is authoritative; `scripts/check_displayxr_app.py` lints that manifest and code agree.
+- **Cross-check:** an app that registers MCP tools declares the same id at runtime via `xrSetMCPAppInfoDXR`. The runtime-declared value is authoritative; `scripts/check_displayxr_app.py` lints that manifest and code agree.
 - **Fallback:** when `id` is absent (and the app declares none at runtime), consumers derive a fallback from the sanitized exe basename. Fine for Browse-for-app entries; apps shipping manifests should set it explicitly.
 
 ## 4. 3D icons

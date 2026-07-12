@@ -774,262 +774,262 @@ oxr_xrSuggestBodyTrackingCalibrationOverrideMETA(XrBodyTrackerFB bodyTracker,
                                                  const XrBodyTrackingCalibrationInfoMETA *calibrationInfo);
 #endif
 
-#ifdef OXR_HAVE_EXT_display_info
-//! OpenXR API function @ep{xrRequestDisplayModeEXT}
+#ifdef OXR_HAVE_DXR_display_info
+//! OpenXR API function @ep{xrRequestDisplayModeDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrRequestDisplayModeEXT(XrSession session, XrDisplayModeEXT displayMode);
-//! OpenXR API function @ep{xrRequestEyeTrackingModeEXT}
+oxr_xrRequestDisplayModeEXT(XrSession session, XrDisplayModeDXR displayMode);
+//! OpenXR API function @ep{xrRequestEyeTrackingModeDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeEXT mode);
-//! OpenXR API function @ep{xrRequestDisplayRenderingModeEXT}
+oxr_xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeDXR mode);
+//! OpenXR API function @ep{xrRequestDisplayRenderingModeDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex);
-//! OpenXR API function @ep{xrEnumerateDisplayRenderingModesEXT}
+//! OpenXR API function @ep{xrEnumerateDisplayRenderingModesDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrEnumerateDisplayRenderingModesEXT(XrSession session,
                                         uint32_t modeCapacityInput,
                                         uint32_t *modeCountOutput,
-                                        XrDisplayRenderingModeInfoEXT *modes);
-//! OpenXR API function @ep{xrSetWorkspaceViewRigEXT}
+                                        XrDisplayRenderingModeInfoDXR *modes);
+//! OpenXR API function @ep{xrSetWorkspaceViewRigDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceViewRigEXT(XrSession session, const void *rig);
 
 #endif
 
-#ifdef OXR_HAVE_EXT_spatial_workspace
-//! OpenXR API function @ep{xrActivateSpatialWorkspaceEXT}
+#ifdef OXR_HAVE_DXR_spatial_workspace
+//! OpenXR API function @ep{xrActivateSpatialWorkspaceDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrActivateSpatialWorkspaceEXT(XrSession session);
-//! OpenXR API function @ep{xrDeactivateSpatialWorkspaceEXT}
+//! OpenXR API function @ep{xrDeactivateSpatialWorkspaceDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrDeactivateSpatialWorkspaceEXT(XrSession session);
-//! OpenXR API function @ep{xrGetSpatialWorkspaceStateEXT}
+//! OpenXR API function @ep{xrGetSpatialWorkspaceStateDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrGetSpatialWorkspaceStateEXT(XrSession session, XrBool32 *out_active);
-//! OpenXR API function @ep{xrAddWorkspaceCaptureClientEXT}
+//! OpenXR API function @ep{xrAddWorkspaceCaptureClientDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrAddWorkspaceCaptureClientEXT(XrSession session,
                                    uint64_t nativeWindow,
                                    const char *nameOptional,
                                    XrWorkspaceClientId *outClientId);
-//! OpenXR API function @ep{xrRemoveWorkspaceCaptureClientEXT}
+//! OpenXR API function @ep{xrRemoveWorkspaceCaptureClientDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrRemoveWorkspaceCaptureClientEXT(XrSession session, XrWorkspaceClientId clientId);
-//! OpenXR API function @ep{xrSetWorkspaceClientWindowPoseEXT}
+//! OpenXR API function @ep{xrSetWorkspaceClientWindowPoseDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceClientWindowPoseEXT(XrSession session,
                                       XrWorkspaceClientId clientId,
                                       const XrPosef *pose,
                                       float widthMeters,
                                       float heightMeters);
-//! OpenXR API function @ep{xrGetWorkspaceClientWindowPoseEXT}
+//! OpenXR API function @ep{xrGetWorkspaceClientWindowPoseDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrGetWorkspaceClientWindowPoseEXT(XrSession session,
                                       XrWorkspaceClientId clientId,
                                       XrPosef *outPose,
                                       float *outWidthMeters,
                                       float *outHeightMeters);
-//! OpenXR API function @ep{xrSetWorkspaceClientVisibilityEXT}
+//! OpenXR API function @ep{xrSetWorkspaceClientVisibilityDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceClientVisibilityEXT(XrSession session, XrWorkspaceClientId clientId, XrBool32 visible);
-//! OpenXR API function @ep{xrSetWorkspaceFocusedClientEXT}
+//! OpenXR API function @ep{xrSetWorkspaceFocusedClientDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceFocusedClientEXT(XrSession session, XrWorkspaceClientId clientId);
-//! OpenXR API function @ep{xrSetWorkspaceReservedKeysEXT}
+//! OpenXR API function @ep{xrSetWorkspaceReservedKeysDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceReservedKeysEXT(XrSession session,
                                  uint32_t keyCount,
-                                 const XrWorkspaceReservedKeyEXT *keys);
-//! OpenXR API function @ep{xrGetWorkspaceFocusedClientEXT}
+                                 const XrWorkspaceReservedKeyDXR *keys);
+//! OpenXR API function @ep{xrGetWorkspaceFocusedClientDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrGetWorkspaceFocusedClientEXT(XrSession session, XrWorkspaceClientId *outClientId);
-//! OpenXR API function @ep{xrSetWorkspaceClientFrameRateCapEXT}
+//! OpenXR API function @ep{xrSetWorkspaceClientFrameRateCapDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceClientFrameRateCapEXT(XrSession session, XrWorkspaceClientId clientId, float maxFps);
-//! OpenXR API function @ep{xrEnumerateWorkspaceInputEventsEXT}
+//! OpenXR API function @ep{xrEnumerateWorkspaceInputEventsDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrEnumerateWorkspaceInputEventsEXT(XrSession session,
                                        uint32_t capacityInput,
                                        uint32_t *countOutput,
-                                       XrWorkspaceInputEventEXT *events);
-//! OpenXR API function @ep{xrEnableWorkspacePointerCaptureEXT}
+                                       XrWorkspaceInputEventDXR *events);
+//! OpenXR API function @ep{xrEnableWorkspacePointerCaptureDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrEnableWorkspacePointerCaptureEXT(XrSession session, uint32_t button);
-//! OpenXR API function @ep{xrDisableWorkspacePointerCaptureEXT}
+//! OpenXR API function @ep{xrDisableWorkspacePointerCaptureDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrDisableWorkspacePointerCaptureEXT(XrSession session);
-//! OpenXR API function @ep{xrCaptureWorkspaceFrameEXT}
+//! OpenXR API function @ep{xrCaptureWorkspaceFrameDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrCaptureWorkspaceFrameEXT(XrSession session,
-                               const XrWorkspaceCaptureRequestEXT *request,
-                               XrWorkspaceCaptureResultEXT *result);
-//! OpenXR API function @ep{xrEnumerateWorkspaceClientsEXT}
+                               const XrWorkspaceCaptureRequestDXR *request,
+                               XrWorkspaceCaptureResultDXR *result);
+//! OpenXR API function @ep{xrEnumerateWorkspaceClientsDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrEnumerateWorkspaceClientsEXT(XrSession session,
                                    uint32_t capacityInput,
                                    uint32_t *countOutput,
                                    XrWorkspaceClientId *clientIds);
-//! OpenXR API function @ep{xrGetWorkspaceClientInfoEXT}
+//! OpenXR API function @ep{xrGetWorkspaceClientInfoDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrGetWorkspaceClientInfoEXT(XrSession session,
                                 XrWorkspaceClientId clientId,
-                                XrWorkspaceClientInfoEXT *info);
-//! OpenXR API function @ep{xrRequestWorkspaceClientExitEXT}
+                                XrWorkspaceClientInfoDXR *info);
+//! OpenXR API function @ep{xrRequestWorkspaceClientExitDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrRequestWorkspaceClientExitEXT(XrSession session, XrWorkspaceClientId clientId);
-//! OpenXR API function @ep{xrRequestWorkspaceClientFullscreenEXT}
+//! OpenXR API function @ep{xrRequestWorkspaceClientFullscreenDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrRequestWorkspaceClientFullscreenEXT(XrSession session, XrWorkspaceClientId clientId, XrBool32 fullscreen);
-//! OpenXR API function @ep{xrCreateWorkspaceClientChromeSwapchainEXT}
+//! OpenXR API function @ep{xrCreateWorkspaceClientChromeSwapchainDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrCreateWorkspaceClientChromeSwapchainEXT(XrSession session,
                                               XrWorkspaceClientId clientId,
-                                              const XrWorkspaceChromeSwapchainCreateInfoEXT *createInfo,
+                                              const XrWorkspaceChromeSwapchainCreateInfoDXR *createInfo,
                                               XrSwapchain *swapchain);
-//! OpenXR API function @ep{xrDestroyWorkspaceClientChromeSwapchainEXT}
+//! OpenXR API function @ep{xrDestroyWorkspaceClientChromeSwapchainDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrDestroyWorkspaceClientChromeSwapchainEXT(XrSwapchain swapchain);
-//! OpenXR API function @ep{xrSetWorkspaceClientChromeLayoutEXT}
+//! OpenXR API function @ep{xrSetWorkspaceClientChromeLayoutDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceClientChromeLayoutEXT(XrSession session,
                                         XrWorkspaceClientId clientId,
-                                        const XrWorkspaceChromeLayoutEXT *layout);
-//! OpenXR API function @ep{xrUpdateWorkspaceClientChromeLayerPoseEXT} (spec_version 12)
+                                        const XrWorkspaceChromeLayoutDXR *layout);
+//! OpenXR API function @ep{xrUpdateWorkspaceClientChromeLayerPoseDXR} (spec_version 12)
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrUpdateWorkspaceClientChromeLayerPoseEXT(XrSession session,
                                               XrWorkspaceClientId clientId,
                                               const XrPosef *poseInClient);
-//! OpenXR API function @ep{xrCreateWorkspaceCursorSwapchainEXT} (spec_version 13)
+//! OpenXR API function @ep{xrCreateWorkspaceCursorSwapchainDXR} (spec_version 13)
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrCreateWorkspaceCursorSwapchainEXT(XrSession session,
-                                         const XrWorkspaceCursorSwapchainCreateInfoEXT *createInfo,
+                                         const XrWorkspaceCursorSwapchainCreateInfoDXR *createInfo,
                                          XrSwapchain *swapchain);
-//! OpenXR API function @ep{xrSetWorkspaceCursorEXT} (spec_version 13)
+//! OpenXR API function @ep{xrSetWorkspaceCursorDXR} (spec_version 13)
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetWorkspaceCursorEXT(XrSession session, const XrWorkspaceCursorInfoEXT *info);
-//! OpenXR API function @ep{xrSetWorkspaceCursorDepthEXT} (spec_version 22)
+oxr_xrSetWorkspaceCursorEXT(XrSession session, const XrWorkspaceCursorInfoDXR *info);
+//! OpenXR API function @ep{xrSetWorkspaceCursorDepthDXR} (spec_version 22)
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetWorkspaceCursorDepthEXT(XrSession session, const XrWorkspaceCursorDepthEXT *info);
-//! OpenXR API function @ep{xrCreateWorkspaceOverlaySwapchainEXT} (spec_version 17)
+oxr_xrSetWorkspaceCursorDepthEXT(XrSession session, const XrWorkspaceCursorDepthDXR *info);
+//! OpenXR API function @ep{xrCreateWorkspaceOverlaySwapchainDXR} (spec_version 17)
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrCreateWorkspaceOverlaySwapchainEXT(XrSession session,
-                                          const XrWorkspaceOverlaySwapchainCreateInfoEXT *createInfo,
+                                          const XrWorkspaceOverlaySwapchainCreateInfoDXR *createInfo,
                                           XrSwapchain *swapchain);
-//! OpenXR API function @ep{xrSetWorkspaceOverlayEXT} (spec_version 17)
+//! OpenXR API function @ep{xrSetWorkspaceOverlayDXR} (spec_version 17)
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetWorkspaceOverlayEXT(XrSession session, const XrWorkspaceOverlayInfoEXT *info);
-//! OpenXR API function @ep{xrSetWorkspaceInputGrabEXT} (spec_version 18)
+oxr_xrSetWorkspaceOverlayEXT(XrSession session, const XrWorkspaceOverlayInfoDXR *info);
+//! OpenXR API function @ep{xrSetWorkspaceInputGrabDXR} (spec_version 18)
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceInputGrabEXT(XrSession session, XrBool32 grab);
-//! OpenXR API function @ep{xrAcquireWorkspaceWakeupEventEXT}
+//! OpenXR API function @ep{xrAcquireWorkspaceWakeupEventDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrAcquireWorkspaceWakeupEventEXT(XrSession session, uint64_t *outNativeHandle);
-//! OpenXR API function @ep{xrSetWorkspaceClientStyleEXT}
+//! OpenXR API function @ep{xrSetWorkspaceClientStyleDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceClientStyleEXT(XrSession session,
                                  XrWorkspaceClientId clientId,
-                                 const XrWorkspaceClientStyleEXT *style);
+                                 const XrWorkspaceClientStyleDXR *style);
 #endif
 
-#ifdef OXR_HAVE_EXT_atlas_capture
-//! OpenXR API function @ep{xrCaptureAtlasEXT}
+#ifdef OXR_HAVE_DXR_atlas_capture
+//! OpenXR API function @ep{xrCaptureAtlasDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrCaptureAtlasEXT(XrSession session, const XrAtlasCaptureInfoEXT *info, XrAtlasCaptureResultEXT *result);
+oxr_xrCaptureAtlasEXT(XrSession session, const XrAtlasCaptureInfoDXR *info, XrAtlasCaptureResultDXR *result);
 #endif
 
-#ifdef OXR_HAVE_EXT_workspace_file_dialog
-//! OpenXR API function @ep{xrRequestFilePickerEXT}
+#ifdef OXR_HAVE_DXR_workspace_file_dialog
+//! OpenXR API function @ep{xrRequestFilePickerDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrRequestFilePickerEXT(XrSession session,
-                           const XrFilePickerInfoEXT *info,
-                           XrAsyncRequestIdEXT *requestId);
-//! OpenXR API function @ep{xrGetFilePickerRequestEXT}
+                           const XrFilePickerInfoDXR *info,
+                           XrAsyncRequestIdDXR *requestId);
+//! OpenXR API function @ep{xrGetFilePickerRequestDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrGetFilePickerRequestEXT(XrSession session,
-                              XrAsyncRequestIdEXT requestId,
+                              XrAsyncRequestIdDXR requestId,
                               uint32_t *outClientId,
-                              XrFilePickerInfoEXT *outInfo);
-//! OpenXR API function @ep{xrCompleteFilePickerEXT}
+                              XrFilePickerInfoDXR *outInfo);
+//! OpenXR API function @ep{xrCompleteFilePickerDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrCompleteFilePickerEXT(XrSession session,
-                            XrAsyncRequestIdEXT requestId,
-                            XrFilePickerResultEXT result,
+                            XrAsyncRequestIdDXR requestId,
+                            XrFilePickerResultDXR result,
                             const char *path);
 #endif
 
-#ifdef OXR_HAVE_EXT_mcp_tools
-//! OpenXR API function @ep{xrSetMCPAppInfoEXT}
+#ifdef OXR_HAVE_DXR_mcp_tools
+//! OpenXR API function @ep{xrSetMCPAppInfoDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetMCPAppInfoEXT(XrSession session, const XrMCPAppInfoEXT *info);
-//! OpenXR API function @ep{xrRegisterMCPToolEXT}
+oxr_xrSetMCPAppInfoEXT(XrSession session, const XrMCPAppInfoDXR *info);
+//! OpenXR API function @ep{xrRegisterMCPToolDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrRegisterMCPToolEXT(XrSession session, const XrMCPToolInfoEXT *tool);
-//! OpenXR API function @ep{xrUnregisterMCPToolEXT}
+oxr_xrRegisterMCPToolEXT(XrSession session, const XrMCPToolInfoDXR *tool);
+//! OpenXR API function @ep{xrUnregisterMCPToolDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrUnregisterMCPToolEXT(XrSession session, const char *name);
-//! OpenXR API function @ep{xrGetMCPToolCallArgsEXT}
+//! OpenXR API function @ep{xrGetMCPToolCallArgsDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrGetMCPToolCallArgsEXT(
     XrSession session, uint64_t callId, uint32_t capacity, uint32_t *countOutput, char *buffer);
-//! OpenXR API function @ep{xrSubmitMCPToolResultEXT}
+//! OpenXR API function @ep{xrSubmitMCPToolResultDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSubmitMCPToolResultEXT(XrSession session, uint64_t callId, XrBool32 success, const char *resultJson);
 #endif
 
-#ifdef OXR_HAVE_EXT_local_3d_zone
-//! OpenXR API function @ep{xrGetLocal3DZoneCapabilitiesEXT}
+#ifdef OXR_HAVE_DXR_local_3d_zone
+//! OpenXR API function @ep{xrGetLocal3DZoneCapabilitiesDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrGetLocal3DZoneCapabilitiesEXT(XrSession session, XrLocal3DZoneCapabilitiesEXT *capabilities);
+oxr_xrGetLocal3DZoneCapabilitiesEXT(XrSession session, XrLocal3DZoneCapabilitiesDXR *capabilities);
 
-//! OpenXR API function @ep{xrCreateLocal3DZoneMaskEXT}
+//! OpenXR API function @ep{xrCreateLocal3DZoneMaskDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrCreateLocal3DZoneMaskEXT(XrSession session,
-                               const XrLocal3DZoneMaskCreateInfoEXT *createInfo,
-                               XrLocal3DZoneMaskEXT *mask);
+                               const XrLocal3DZoneMaskCreateInfoDXR *createInfo,
+                               XrLocal3DZoneMaskDXR *mask);
 
-//! OpenXR API function @ep{xrSetLocal3DZoneWholeWindowEXT}
+//! OpenXR API function @ep{xrSetLocal3DZoneWholeWindowDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetLocal3DZoneWholeWindowEXT(XrLocal3DZoneMaskEXT mask, XrBool32 enable3D);
+oxr_xrSetLocal3DZoneWholeWindowEXT(XrLocal3DZoneMaskDXR mask, XrBool32 enable3D);
 
-//! OpenXR API function @ep{xrSetLocal3DZoneFromRectsEXT}
+//! OpenXR API function @ep{xrSetLocal3DZoneFromRectsDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetLocal3DZoneFromRectsEXT(XrLocal3DZoneMaskEXT mask, uint32_t rectCount, const XrRect2Di *rects);
+oxr_xrSetLocal3DZoneFromRectsEXT(XrLocal3DZoneMaskDXR mask, uint32_t rectCount, const XrRect2Di *rects);
 
-//! OpenXR API function @ep{xrAcquireLocal3DZoneRenderTargetEXT}
+//! OpenXR API function @ep{xrAcquireLocal3DZoneRenderTargetDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrAcquireLocal3DZoneRenderTargetEXT(XrLocal3DZoneMaskEXT mask, void *binding);
+oxr_xrAcquireLocal3DZoneRenderTargetEXT(XrLocal3DZoneMaskDXR mask, void *binding);
 
-//! OpenXR API function @ep{xrSubmitLocal3DZoneEXT}
+//! OpenXR API function @ep{xrSubmitLocal3DZoneDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSubmitLocal3DZoneEXT(XrLocal3DZoneMaskEXT mask);
+oxr_xrSubmitLocal3DZoneEXT(XrLocal3DZoneMaskDXR mask);
 
-//! OpenXR API function @ep{xrDestroyLocal3DZoneMaskEXT}
+//! OpenXR API function @ep{xrDestroyLocal3DZoneMaskDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrDestroyLocal3DZoneMaskEXT(XrLocal3DZoneMaskEXT mask);
+oxr_xrDestroyLocal3DZoneMaskEXT(XrLocal3DZoneMaskDXR mask);
 #endif
 
-#ifdef OXR_HAVE_EXT_display_zones
-//! OpenXR API function @ep{xrGetDisplayZoneCapabilitiesEXT}
+#ifdef OXR_HAVE_DXR_display_zones
+//! OpenXR API function @ep{xrGetDisplayZoneCapabilitiesDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrGetDisplayZoneCapabilitiesEXT(XrSession session, XrDisplayZoneCapabilitiesEXT *capabilities);
+oxr_xrGetDisplayZoneCapabilitiesEXT(XrSession session, XrDisplayZoneCapabilitiesDXR *capabilities);
 
-//! OpenXR API function @ep{xrGetDisplayZoneRecommendedViewSizeEXT}
+//! OpenXR API function @ep{xrGetDisplayZoneRecommendedViewSizeDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrGetDisplayZoneRecommendedViewSizeEXT(XrSession session,
                                            const XrRect2Di *zoneRect,
                                            XrExtent2Di *recommendedViewSize);
 #endif
 
-#ifdef OXR_HAVE_EXT_weave
-//! OpenXR API function @ep{xrWeaveBindWindowEXT}
+#ifdef OXR_HAVE_DXR_weave
+//! OpenXR API function @ep{xrWeaveBindWindowDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrWeaveBindWindowEXT(XrSession session, void *windowHandle);
 
-//! OpenXR API function @ep{xrWeaveSubmitEXT}
+//! OpenXR API function @ep{xrWeaveSubmitDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrWeaveSubmitEXT(XrSession session, const XrWeaveSubmitInfoEXT *submitInfo, XrWeaveOutputEXT *output);
+oxr_xrWeaveSubmitEXT(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, XrWeaveOutputDXR *output);
 
-//! OpenXR API function @ep{xrWeaveSnapWindowRectEXT}
+//! OpenXR API function @ep{xrWeaveSnapWindowRectDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrWeaveSnapWindowRectEXT(XrSession session,
                             const XrRect2Di *originRect,

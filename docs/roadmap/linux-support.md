@@ -1,7 +1,7 @@
 # Linux Support
 
 Status: **Preview — code-complete + hardware-validated, not yet GA.** Phases 0/1a/2a/3a
-are code-complete on `main`; hosted + handle (`XR_EXT_xlib_window_binding`) sessions
+are code-complete on `main`; hosted + handle (`XR_DXR_xlib_window_binding`) sessions
 bring up the native Vulkan/XCB compositor and render the stereo cube on real Vulkan+X11
 hardware (Ubuntu 22.04, RTX 3080 + Acer SpatialLabs DS1; #708 / #706), and the **Track B
 real srSDK Vulkan weave is HW-validated on the DS1** (lens enables). Runtime **v1.28.0**
@@ -54,8 +54,8 @@ path (Phase 2), then a window-binding extension for app-owned windows (Phase 3).
      unaffected.
 2. **No self-created window for the `_hosted` class.** Only `comp_window_macos`
    and `comp_window_android` survive — no `comp_window_xcb/wayland/direct`.
-3. **No Linux window-binding extension.** Only `XR_EXT_win32_window_binding` and
-   `XR_EXT_cocoa_window_binding` exist; the `_handle`/`_texture` classes have no
+3. **No Linux window-binding extension.** Only `XR_DXR_win32_window_binding` and
+   `XR_DXR_cocoa_window_binding` exist; the `_handle`/`_texture` classes have no
    way to pass a Linux window to the runtime.
 4. **No build tooling.** No `build_linux.sh`, no Linux OpenXR-loader
    provisioning, no install rule that drops sim_display manifests into the
@@ -154,7 +154,7 @@ Likely follow-ups surfaced only at runtime: confirm the VK-native compositor pat
 is selected (`OXR_ENABLE_VK_NATIVE_COMPOSITOR`), swapchain format/extent on real
 drivers, and resize. A non-legacy (extension) `cube_hosted_vk_linux` follows once
 first-light is confirmed. The handle-class app now exists —
-`cube_handle_vk_linux` (`XR_EXT_xlib_window_binding`, Phase 3a below).
+`cube_handle_vk_linux` (`XR_DXR_xlib_window_binding`, Phase 3a below).
 
 **Done when:** a hosted cube renders into a runtime-created XCB window with
 sim_display weaving.
@@ -227,15 +227,15 @@ gaps to wire when a display exists, all mirroring the macOS arms:
 **Done when:** a handle/hosted app runs out-of-process against
 `displayxr-service` on Linux.
 
-### Phase 3 — `XR_EXT_xlib_window_binding`
+### Phase 3 — `XR_DXR_xlib_window_binding`
 
 **Phase 3a — extension + app-window path, build-green on CI ✅ (done, #660).**
 `_handle` apps can bring their own X11 window. Delivered:
 
-- **Extension** — `XR_EXT_xlib_window_binding.h` (spec:
-  `docs/specs/extensions/XR_EXT_xlib_window_binding.md`).
-  `XrXlibWindowBindingCreateInfoEXT { type, next, Display* xDisplay, Window
-  window }`, type value 1000999200 (decade 200–209 claimed in the openxr_includes
+- **Extension** — `XR_DXR_xlib_window_binding.h` (spec:
+  `docs/specs/extensions/XR_DXR_xlib_window_binding.md`).
+  `XrXlibWindowBindingCreateInfoDXR { type, next, Display* xDisplay, Window
+  window }`, type value 1004999200 (decade 200–209 claimed in the openxr_includes
   README registry). Xlib API in, XCB inside: the runtime converts via
   `XGetXCBConnection()` (libX11-xcb) and reuses the Phase 1
   `comp_vk_native_xcb_handle` + XCB surface arm unchanged. Texture-class

@@ -45,13 +45,13 @@ recurs — it also produced the Android 2D regression #533 fixed):
 A **rendering mode is a complete recipe**: tile layout, view count, scales,
 **and a default hardware state**.
 
-1. **`xrRequestDisplayRenderingModeEXT(modeIndex)`** requests a mode; the
+1. **`xrRequestDisplayRenderingModeDXR(modeIndex)`** requests a mode; the
    hardware state follows its default automatically (unchanged behavior).
-2. **`xrRequestDisplayModeEXT(2D/3D)`** (repurposed, `XR_EXT_display_info`
+2. **`xrRequestDisplayModeDXR(2D/3D)`** (repurposed, `XR_DXR_display_info`
    v15) overrides the **hardware state alone** for the current mode. The
    active mode, the app's content, and the DP's processing are untouched —
    only the physical element changes. The override holds until the next mode
-   request; it is reported via `XrEventDataHardwareDisplayStateChangedEXT`
+   request; it is reported via `XrEventDataHardwareDisplayStateChangedDXR`
    (no mode-changed event — the mode did not change).
 3. **The atlas content recipe is the ACTIVE MODE's.** Per-frame, the
    compositors clamp the submission to it: `views = min(submitted, mode

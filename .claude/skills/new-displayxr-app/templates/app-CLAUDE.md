@@ -17,8 +17,8 @@ They are binding. The traps agents hit most:
 - **INV-4.6** — request an **sRGB swapchain** and store a correctly-encoded image (render linear
   with GPU sRGB-write, *or* write display-referred bytes — not both). Data textures stay linear.
 - **INV-2.4** — the runtime owns the active mode; you *request* via
-  `xrRequestDisplayRenderingModeEXT` and update local state only on the change **event**.
-- **INV-7.1/7.2** — capture via `xrCaptureAtlasEXT` (prefix with **no** extension); never
+  `xrRequestDisplayRenderingModeDXR` and update local state only on the change **event**.
+- **INV-7.1/7.2** — capture via `xrCaptureAtlasDXR` (prefix with **no** extension); never
   reintroduce an app-side `CaptureAtlasRegion*` readback.
 - **INV-9.1/9.2** — ship `<exe>.displayxr.json` (schema 1; `name`; `type`) + `icon.png` (512×512) +
   `icon_sbs.png` (1024×512, `sbs-lr`) or the app won't appear in the workspace launcher.

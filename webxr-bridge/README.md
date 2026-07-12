@@ -1,6 +1,6 @@
 # DisplayXR WebXR Bridge v2
 
-Metadata and control sideband for DisplayXR-aware WebXR pages. Gives browser-based WebXR apps access to display info, rendering modes, eye poses, and mode-change events — the same capabilities that native handle apps get via `XR_EXT_display_info`.
+Metadata and control sideband for DisplayXR-aware WebXR pages. Gives browser-based WebXR apps access to display info, rendering modes, eye poses, and mode-change events — the same capabilities that native handle apps get via `XR_DXR_display_info`.
 
 > **App developers, start here:** [`DEVELOPER.md`](DEVELOPER.md) — integration guide.
 > **Want to copy-paste a starter?** [`examples/minimal.html`](examples/minimal.html) — single-file runnable.
@@ -31,7 +31,7 @@ Start-Process "C:\Program Files\DisplayXR\Runtime\displayxr-service.exe"
 Start-Process "C:\Program Files\DisplayXR\Runtime\displayxr-webxr-bridge.exe"
 ```
 
-The bridge connects to the service via IPC, enables `XR_EXT_display_info` + `XR_MND_headless`, and starts a WebSocket server on `127.0.0.1:9014`.
+The bridge connects to the service via IPC, enables `XR_DXR_display_info` + `XR_MND_headless`, and starts a WebSocket server on `127.0.0.1:9014`.
 
 ### 5. Load the Chrome extension
 
@@ -73,7 +73,7 @@ Chrome WebXR session ─── OpenXR loader ─── IPC ──── displayx
 
 Two OpenXR sessions against the same service:
 - **Chrome's session** drives frames via the standard WebXR path. Does not see `session.displayXR` at the OpenXR level — the extension wraps it client-side.
-- **Bridge's session** holds `XR_EXT_display_info`, polls events and eye poses, relays to WebSocket.
+- **Bridge's session** holds `XR_DXR_display_info`, polls events and eye poses, relays to WebSocket.
 
 ## Protocol
 

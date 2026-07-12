@@ -171,10 +171,10 @@ struct comp_d3d11_window
 	volatile LONG input_forward_rect_w;
 	volatile LONG input_forward_rect_h;
 
-	//! Modal input grab (XR_EXT_spatial_workspace spec_version 18): when set, the
+	//! Modal input grab (XR_DXR_spatial_workspace spec_version 18): when set, the
 	//! WndProc stops forwarding keyboard / mouse-button / scroll input to the
 	//! focused app and routes everything to the controller via the public event
-	//! ring. Set by the compositor thread (driven by xrSetWorkspaceInputGrabEXT)
+	//! ring. Set by the compositor thread (driven by xrSetWorkspaceInputGrabDXR)
 	//! and by the controller-owned drag/resize gestures; read by the WndProc
 	//! thread.
 	volatile LONG input_suppress;
@@ -200,7 +200,7 @@ struct comp_d3d11_window
 	//! The HWND the most recent button-DOWN was forwarded to, or NULL if it
 	//! was not forwarded (cursor outside the focused window's rect — i.e. a
 	//! click on an unfocused window). Captured at WndProc time, BEFORE the
-	//! workspace controller's async xrSetWorkspaceFocusedClientEXT can update
+	//! workspace controller's async xrSetWorkspaceFocusedClientDXR can update
 	//! the forward target. The render-loop click handler reads this to decide
 	//! whether to synthesize a DOWN to the hit window for drag-in-one-click:
 	//! it must NOT rely on focused_slot, which the controller mutates async.
@@ -215,7 +215,7 @@ struct comp_d3d11_window
 	volatile LONG input_ring_write; //!< Next write index (WndProc thread)
 	volatile LONG input_ring_read;  //!< Next read index (compositor thread)
 
-	//! Phase 2.D: parallel ring for the public xrEnumerateWorkspaceInputEventsEXT
+	//! Phase 2.D: parallel ring for the public xrEnumerateWorkspaceInputEventsDXR
 	//! path. SPSC; producer is WndProc, consumer is the service-side drain that
 	//! enriches each pointer event with hit-test info before exposing on IPC.
 	struct workspace_public_event_raw workspace_public_ring[WORKSPACE_PUBLIC_RING_SIZE];
@@ -231,7 +231,7 @@ struct comp_d3d11_window
 	//! the controller's MsgWaitForMultipleObjects returns promptly. NULL
 	//! until the IPC handler calls comp_d3d11_window_set_workspace_wakeup_event
 	//! with the runtime's source-of-truth handle (lazy-created on the first
-	//! xrAcquireWorkspaceWakeupEventEXT call). Read with InterlockedCompare
+	//! xrAcquireWorkspaceWakeupEventDXR call). Read with InterlockedCompare
 	//! ExchangePointer because the handle is set from the IPC thread and
 	//! read from the WndProc thread.
 	volatile HANDLE workspace_wakeup_event;
@@ -243,9 +243,9 @@ struct comp_d3d11_window
 	//! Signaled by window thread after SetForegroundWindow completes.
 	volatile LONG foreground_done;
 
-	//! Controller-supplied reserved-key table (XR_EXT_spatial_workspace spec_version
+	//! Controller-supplied reserved-key table (XR_DXR_spatial_workspace spec_version
 	//! 24). The controller declares which (vkCode, modifiers) chords it owns via
-	//! xrSetWorkspaceReservedKeysEXT; reserved chords are still emitted on the public
+	//! xrSetWorkspaceReservedKeysDXR; reserved chords are still emitted on the public
 	//! ring but never forwarded to the focused app. reserved_key_count is the publish
 	//! barrier: the service thread fills reserved_keys[] then InterlockedExchanges the
 	//! count LAST, so the WndProc thread never reads a half-written table. -1 means the
@@ -403,7 +403,7 @@ workspace_compute_modifiers(void)
 
 /*!
  * The built-in default reserved-key policy, used until a controller registers
- * its own table via xrSetWorkspaceReservedKeysEXT. These keys are NOT forwarded
+ * its own table via xrSetWorkspaceReservedKeysDXR. These keys are NOT forwarded
  * to the focused app in workspace mode.
  *
  * SHIFT+TAB is forwarded (apps use it as a HUD toggle); only bare TAB is
@@ -415,7 +415,7 @@ is_default_reserved_key(WPARAM vk, bool shift)
 	// Only true workspace-management keys are reserved.
 	// V, P, 0-9 are forwarded to the app (it may use them for its own purposes).
 	// The qwerty handler processes them server-side regardless; if the app also
-	// tries to change rendering mode via xrRequestDisplayRenderingModeEXT,
+	// tries to change rendering mode via xrRequestDisplayRenderingModeDXR,
 	// that call is blocked in workspace/IPC mode.
 	switch (vk) {
 	case VK_TAB:    return !shift;  // bare TAB cycles focus; Shift+TAB → app
@@ -597,7 +597,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		// The runtime renders its own 3D cursor sprite into the atlas at
 		// the per-frame raycast hit's z-depth with per-eye disparity
 		// (spec_version 13: sprite content is controller-pushed via
-		// xrSetWorkspaceCursorEXT). Win32 keeps tracking the cursor
+		// xrSetWorkspaceCursorDXR). Win32 keeps tracking the cursor
 		// position for hit-test, drag operations, and event delivery —
 		// only the visual is suppressed.
 		if (LOWORD(lParam) == HTCLIENT) {
@@ -694,7 +694,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_SYSCHAR: {
 		// Phase 2.D: emit KEY events to the public-event ring before any
 		// suppression / forwarding logic so a workspace controller draining
-		// xrEnumerateWorkspaceInputEventsEXT sees the key regardless of
+		// xrEnumerateWorkspaceInputEventsDXR sees the key regardless of
 		// whether the runtime forwards it. WM_CHAR/WM_SYSCHAR are post-
 		// translation duplicates of the original VK_* — skip them so the
 		// public surface reports physical keys only.
@@ -1530,7 +1530,7 @@ comp_d3d11_window_create(uint32_t width,
 	w->xsysd = NULL;
 	w->qwerty_enabled = true;  // Always enabled for DisplayXR-owned windows
 	// -1 = controller has not registered a reserved-key set yet; the WndProc
-	// gate falls back to the built-in default until xrSetWorkspaceReservedKeysEXT
+	// gate falls back to the built-in default until xrSetWorkspaceReservedKeysDXR
 	// arrives (U_TYPED_CALLOC would otherwise leave this 0 = "empty set").
 	w->reserved_key_count = -1;
 
@@ -1843,7 +1843,7 @@ comp_d3d11_window_set_workspace_wakeup_event(struct comp_d3d11_window *window, v
 
 // Returns true if input forwarding should currently be suppressed — i.e. the
 // controller has grabbed input (modal UI like the launcher band, via
-// xrSetWorkspaceInputGrabEXT) or a workspace drag/resize gesture is active.
+// xrSetWorkspaceInputGrabDXR) or a workspace drag/resize gesture is active.
 static bool
 input_is_suppressed(struct comp_d3d11_window *w)
 {

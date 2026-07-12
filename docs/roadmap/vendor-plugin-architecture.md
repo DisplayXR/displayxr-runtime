@@ -223,7 +223,7 @@ Recommended order. Each step lands as its own PR.
 
 ## 6. Backward compatibility
 
-- The `XR_EXT_display_info`, `XR_EXT_win32_window_binding`, etc. extension headers don't change. App-facing ABI is unaffected.
+- The `XR_DXR_display_info`, `XR_DXR_win32_window_binding`, etc. extension headers don't change. App-facing ABI is unaffected.
 - The DP vtable (`xrt_display_processor*`) doesn't change. The plug-in restructure adds plumbing around it, not changes to it. Existing vendor integration docs stay accurate at the vtable layer.
 - The CMake option `XRT_HAVE_LEIA_SR` was retained in v1 to control whether the Leia *plug-in* gets built (not whether the runtime hard-links SR). The companion `XRT_PLUGIN_BUILD_INPROC_FALLBACK` option let developers produce a statically-linked runtime for debugging; both options are gone post-#263/#287 — `XRT_HAVE_LEIA_SR` moved to the Leia plug-in repo with the rest of `drv_leia/`, and the in-proc fallback is no longer a buildable path.
 - The `FORCE_SIM_DISPLAY=1` runtime override stays. After the restructure it manifests as "skip leia-sr plug-in probe, fall through to sim-display."

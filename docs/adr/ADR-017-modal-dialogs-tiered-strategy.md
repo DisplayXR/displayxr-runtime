@@ -28,7 +28,7 @@ Right after `ShowWindow(SW_HIDE)`, the runtime creates an offscreen `WS_VISIBLE 
 The hook also notifies the workspace controller via a new IPC notification (`session_set_modal_state(is_open)`, ref-counted across nested popups, surfaces as `IPC_WORKSPACE_INPUT_EVENT_MODAL_OPEN / _CLOSE` in the existing `workspace_enumerate_input_events` channel). The shell side responds by:
 
 - dropping its compositor swap chain from topmost / fullscreen-borderless to windowed for the duration (the actual z-order fix — cross-process `WS_EX_TOPMOST` doesn't beat another process's fullscreen swap chain reliably);
-- triggering the existing `xrRequestDisplayModeEXT(XR_DISPLAY_MODE_2D_EXT)` path for the focused client so the 3D window flips to flat presentation;
+- triggering the existing `xrRequestDisplayModeDXR(XR_DISPLAY_MODE_2D_DXR)` path for the focused client so the 3D window flips to flat presentation;
 - dimming the focus glow and suspending cursor raycast hit-tests against the requesting client so clicks can't steal focus from the dialog.
 
 Coverage matrix: full for legacy `comdlg32` (`GetOpenFileName`, `MessageBox`); partial for COM `IFileOpenDialog` (visible HWND may live in `explorer.exe`, cross-process portions fall back to flat-OS behavior); none for UWP `FileOpenPicker` (sandboxed). See `docs/specs/runtime/modal-dialog-handling.md` for the full coverage table.
@@ -37,7 +37,7 @@ Frame starvation: existing infrastructure handles it. The compositor's per-view 
 
 ### T1 — Spatial-native picker as a peer workspace window (opt-in)
 
-For specific moments worth polishing — file open, color, settings — we provide an `XR_EXT_workspace_file_dialog` extension. The picker is a **separate OpenXR handle app** (`displayxr-file-picker.exe`, shipped from `displayxr-shell-pvt`) that participates in the workspace exactly like any other app. Async / event-based API: `xrRequestFilePickerEXT` returns immediately with an `XrAsyncRequestIdEXT`; the app polls `xrPollEvent` for `XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_EXT`. Blocking inside the runtime would deadlock single-threaded render loops.
+For specific moments worth polishing — file open, color, settings — we provide an `XR_DXR_workspace_file_dialog` extension. The picker is a **separate OpenXR handle app** (`displayxr-file-picker.exe`, shipped from `displayxr-shell-pvt`) that participates in the workspace exactly like any other app. Async / event-based API: `xrRequestFilePickerDXR` returns immediately with an `XrAsyncRequestIdDXR`; the app polls `xrPollEvent` for `XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_DXR`. Blocking inside the runtime would deadlock single-threaded render loops.
 
 Window-space layers (`XRT_LAYER_WINDOW_SPACE`, `xrt_compositor.h:86`) are per-window HUD sized as window-fraction — the wrong substrate for a picker. The picker is a peer window, not a layer. Tier 1 reuses Tier 0's modal mechanism for dim / input-gate / 3D→2D against the requester, so a polished picker still feels like a focused operation.
 
@@ -58,6 +58,6 @@ This rejection is durable, not a "wait and see." The honest framing is: **the wo
 
 - The runtime grows a small Win32-only TU (`oxr_workspace_modal_win32.c`) and one new IPC RPC (`session_set_modal_state`) plus two new event types in the existing workspace event channel.
 - Workspace controllers must handle `IPC_WORKSPACE_INPUT_EVENT_MODAL_OPEN / _CLOSE` to provide a coherent visual response (dim, drop topmost, 3D→2D). Controllers that ignore them get reduced UX (flat dialog over still-3D workspace) but apps still function.
-- T1 is additive — apps without `XR_EXT_workspace_file_dialog` get T0 fallback; no breakage.
+- T1 is additive — apps without `XR_DXR_workspace_file_dialog` get T0 fallback; no breakage.
 - T0 is best-effort across the COM / UWP boundary. `displayxr-demo-gaussiansplat` and similar legacy `comdlg32` apps get full coverage; modern shell-hosted dialogs and sandboxed pickers fall back to flat-OS behavior.
 - We do not ship a Windows-replacement shim layer. Apps that need OS-level desktop integration should expect it to look like flat OS, not 3D.

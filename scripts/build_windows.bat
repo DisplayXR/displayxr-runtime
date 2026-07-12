@@ -280,7 +280,7 @@ set "PKG=%REPO%_package"
 
 :: Generate one run_<app>.bat per built exe. Env is DERIVED from the app name,
 :: matching the rule documented in test_apps\apps.cmake (single source of truth):
-::   * name contains "zones" -> set DISPLAYXR_ZONES=1 (advertise XR_EXT_display_zones)
+::   * name contains "zones" -> set DISPLAYXR_ZONES=1 (advertise XR_DXR_display_zones)
 ::   * name contains "_vk"   -> Vulkan app owns its VkInstance; keep implicit layers.
 ::                              Every other app disables them (#105).
 :: All scripts prepend _package\bin to PATH so the runtime DLL's delay-loaded SR

@@ -394,7 +394,7 @@ out:
 				// per-platform mask. See @ref fill_dp_factories_from_plugin.
 				fill_dp_factories_from_plugin(&xsysc->info, plugin);
 
-				U_LOG_W("XR_EXT_display_info (iface=%s): display=%.4f x %.4f m, "
+				U_LOG_W("XR_DXR_display_info (iface=%s): display=%.4f x %.4f m, "
 				        "nominal=(%.4f, %.4f, %.4f) m, scale=%.4f x %.4f, "
 				        "pixels=%ux%u, atlas=%ux%u",
 				        plugin->id ? plugin->id : "?",

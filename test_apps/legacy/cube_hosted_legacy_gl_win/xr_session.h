@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  OpenXR session management (legacy mode, no XR_EXT_display_info, OpenGL)
+ * @brief  OpenXR session management (legacy mode, no XR_DXR_display_info, OpenGL)
  *
- * This version does NOT use the XR_EXT_win32_window_binding extension.
+ * This version does NOT use the XR_DXR_win32_window_binding extension.
  * OpenXR/DisplayXR will create its own window for rendering.
  */
 

@@ -24,8 +24,8 @@ Your App                          DisplayXR Runtime
 
 Three extensions make this work:
 - `XR_KHR_D3D11_enable` — standard OpenXR D3D11 binding
-- `XR_EXT_win32_window_binding` — pass your HWND to the runtime
-- `XR_EXT_display_info` — query physical display properties, enumerate rendering modes
+- `XR_DXR_win32_window_binding` — pass your HWND to the runtime
+- `XR_DXR_display_info` — query physical display properties, enumerate rendering modes
 
 ---
 
@@ -53,10 +53,10 @@ Enable all three extensions when creating the instance.
 std::vector<const char*> enabledExtensions;
 enabledExtensions.push_back(XR_KHR_D3D11_ENABLE_EXTENSION_NAME);
 if (xr.hasWin32WindowBindingExt) {
-    enabledExtensions.push_back(XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME);
+    enabledExtensions.push_back(XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME);
 }
 if (xr.hasDisplayInfoExt) {
-    enabledExtensions.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+    enabledExtensions.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
 }
 
 // xr_session.cpp:117-131 — create instance
@@ -83,14 +83,14 @@ xrGetSystem(xr.instance, &systemInfo, &xr.systemId);
 
 ## Step 3: Query Display Info
 
-With `XR_EXT_display_info` enabled, chain `XrDisplayInfoEXT` into `xrGetSystemProperties` to get physical display dimensions, pixel resolution, and eye tracking capabilities.
+With `XR_DXR_display_info` enabled, chain `XrDisplayInfoDXR` into `xrGetSystemProperties` to get physical display dimensions, pixel resolution, and eye tracking capabilities.
 
 ```cpp
 // xr_session.cpp:150-177
 XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
-XrDisplayInfoEXT displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
-XrEyeTrackingModeCapabilitiesEXT eyeCaps = {
-    (XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT};
+XrDisplayInfoDXR displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
+XrEyeTrackingModeCapabilitiesDXR eyeCaps = {
+    (XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR};
 displayInfo.next = &eyeCaps;
 sysProps.next = &displayInfo;
 
@@ -110,9 +110,9 @@ Also load the extension function pointers for mode control:
 
 ```cpp
 // xr_session.cpp:196-200
-xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeEXT",
+xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR",
     (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
-xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesEXT",
+xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesDXR",
     (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
 ```
 
@@ -144,8 +144,8 @@ XrGraphicsBindingD3D11KHR d3d11Binding = {XR_TYPE_GRAPHICS_BINDING_D3D11_KHR};
 d3d11Binding.device = d3d11Device;
 
 // 2. Window binding (DisplayXR extension) — THIS IS THE KEY PART
-XrWin32WindowBindingCreateInfoEXT windowBinding = {
-    XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT};
+XrWin32WindowBindingCreateInfoDXR windowBinding = {
+    XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR};
 windowBinding.windowHandle = hwnd;
 
 // 3. Chain them: sessionInfo → d3d11Binding → windowBinding
@@ -164,7 +164,7 @@ After session creation, enumerate available rendering modes:
 // xr_session.cpp:259-282
 uint32_t modeCount = 0;
 xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, 0, &modeCount, nullptr);
-std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
+std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
 xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, modeCount, &modeCount, modes.data());
 
 // Each mode provides:
@@ -304,8 +304,8 @@ if (modeChangeRequested) {
 
 ```cpp
 // xr_session_common.cpp:311-316 (inside PollEvents)
-case XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT: {
-    auto* modeEvent = (XrEventDataRenderingModeChangedEXT*)&eventBuffer;
+case XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
+    auto* modeEvent = (XrEventDataRenderingModeChangedDXR*)&eventBuffer;
     xr.currentModeIndex = modeEvent->currentModeIndex;
     // Next frame automatically adapts: new viewCount, tileLayout, scaling
     break;
@@ -345,11 +345,11 @@ The OpenXR integration is identical across APIs — only the graphics binding an
 
 | Platform | Window binding | Graphics binding | Swapchain image type |
 |----------|---------------|-----------------|---------------------|
-| **D3D11 / Windows** | `XrWin32WindowBindingCreateInfoEXT` | `XrGraphicsBindingD3D11KHR` | `XrSwapchainImageD3D11KHR` |
-| **D3D12 / Windows** | `XrWin32WindowBindingCreateInfoEXT` | `XrGraphicsBindingD3D12KHR` | `XrSwapchainImageD3D12KHR` |
-| **Metal / macOS** | `XrCocoaWindowBindingCreateInfoEXT` | `XrGraphicsBindingMetalEXT` | `XrSwapchainImageMetalEXT` |
-| **Vulkan / any** | `XrWin32WindowBindingCreateInfoEXT` or `XrCocoaWindowBindingCreateInfoEXT` | `XrGraphicsBindingVulkanKHR` | `XrSwapchainImageVulkanKHR` |
-| **OpenGL / any** | `XrWin32WindowBindingCreateInfoEXT` or `XrCocoaWindowBindingCreateInfoEXT` | `XrGraphicsBindingOpenGLWin32KHR` | `XrSwapchainImageOpenGLKHR` |
+| **D3D11 / Windows** | `XrWin32WindowBindingCreateInfoDXR` | `XrGraphicsBindingD3D11KHR` | `XrSwapchainImageD3D11KHR` |
+| **D3D12 / Windows** | `XrWin32WindowBindingCreateInfoDXR` | `XrGraphicsBindingD3D12KHR` | `XrSwapchainImageD3D12KHR` |
+| **Metal / macOS** | `XrCocoaWindowBindingCreateInfoDXR` | `XrGraphicsBindingMetalEXT` | `XrSwapchainImageMetalEXT` |
+| **Vulkan / any** | `XrWin32WindowBindingCreateInfoDXR` or `XrCocoaWindowBindingCreateInfoDXR` | `XrGraphicsBindingVulkanKHR` | `XrSwapchainImageVulkanKHR` |
+| **OpenGL / any** | `XrWin32WindowBindingCreateInfoDXR` or `XrCocoaWindowBindingCreateInfoDXR` | `XrGraphicsBindingOpenGLWin32KHR` | `XrSwapchainImageOpenGLKHR` |
 
 See the corresponding test apps for each API: `cube_handle_metal_macos`, `cube_handle_vk_win`, `cube_handle_gl_win`, etc.
 
@@ -359,5 +359,5 @@ See the corresponding test apps for each API: `cube_handle_metal_macos`, `cube_h
 - [Swapchain Model](../specs/runtime/swapchain-model.md) — two-swapchain architecture and canvas concept
 - [Multiview Tiling](../specs/runtime/multiview-tiling.md) — atlas layout algorithm
 - [Kooima Projection](../architecture/kooima-projection.md) — stereo math for display-centric rendering
-- [XR_EXT_display_info](../specs/extensions/XR_EXT_display_info.md) — full extension specification
-- [XR_EXT_win32_window_binding](../specs/extensions/XR_EXT_win32_window_binding.md) — window binding specification
+- [XR_DXR_display_info](../specs/extensions/XR_DXR_display_info.md) — full extension specification
+- [XR_DXR_win32_window_binding](../specs/extensions/XR_DXR_win32_window_binding.md) — window binding specification

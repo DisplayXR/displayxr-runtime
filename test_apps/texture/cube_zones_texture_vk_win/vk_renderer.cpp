@@ -1726,7 +1726,7 @@ void CleanupVkRenderer(VkRenderer& renderer) {
 }
 
 // ---------------------------------------------------------------------------
-// XR_EXT_display_zones: generalized per-zone framebuffer set + render
+// XR_DXR_display_zones: generalized per-zone framebuffer set + render
 // ---------------------------------------------------------------------------
 
 bool CreateZoneFramebuffers(VkRenderer& renderer, ZoneFramebuffers& fb,

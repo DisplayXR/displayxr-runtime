@@ -151,7 +151,7 @@ struct comp_vk_native_compositor
 
 #ifdef XRT_OS_LINUX_DESKTOP
 	//! XCB window helper (self-owned, hosted class). NULL when the app
-	//! supplied its own window via XR_EXT_xlib_window_binding (handle class).
+	//! supplied its own window via XR_DXR_xlib_window_binding (handle class).
 	struct comp_vk_native_window_xcb *xcb_window;
 
 	//! Connection + window id handed to the target as the type-erased hwnd.
@@ -202,7 +202,7 @@ struct comp_vk_native_compositor
 	//! Last known 3D rendering mode index (for V-key toggle restore).
 	uint32_t last_3d_mode_index;
 
-	//! True if app is legacy (no XR_EXT_display_info) — gates 1/2/3 key mode selection.
+	//! True if app is legacy (no XR_DXR_display_info) — gates 1/2/3 key mode selection.
 	bool legacy_app_tile_scaling;
 
 	//! System devices (for qwerty driver).
@@ -317,7 +317,7 @@ struct comp_vk_native_compositor
 	VkImageView composite_target_fb_view;
 	uint32_t composite_fb_w, composite_fb_h;
 
-	//! Active authored zone mask (#439 Phase 1, XR_EXT_local_3d_zone). Sticky
+	//! Active authored zone mask (#439 Phase 1, XR_DXR_local_3d_zone). Sticky
 	//! last-submit-wins; cleared on destroy. NOT owned (the oxr handle owns it).
 	struct comp_vk_native_zone_mask *active_zone_mask;
 
@@ -326,7 +326,7 @@ struct comp_vk_native_compositor
 	//! under the frame path at the top of layer_commit.
 	bool local_2d_last_frame;
 
-	//! XR_EXT_display_zones (ADR-027): true when the current frame's
+	//! XR_DXR_display_zones (ADR-027): true when the current frame's
 	//! accumulator carries XRT_LAYER_ZONE_3D layers (a "zones frame"). The
 	//! effective canvas is the full client window; the wish drives the
 	//! post-weave lerp (the implicit-mask + sticky-mask rules are inert).
@@ -334,7 +334,7 @@ struct comp_vk_native_compositor
 	//! zone-capable DPs; legacy DPs keep the tier-1 global fallback.
 	bool zones_frame;
 
-	//! Explicit per-frame wish (XrDisplayZonesFrameEndInfoEXT.wishMask) set
+	//! Explicit per-frame wish (XrDisplayZonesFrameEndInfoDXR.wishMask) set
 	//! via comp_vk_native_compositor_zones_set_frame_wish before commit;
 	//! NULL = auto-derive from the zone rects. Not owned.
 	struct comp_vk_native_zone_mask *frame_wish;
@@ -1051,7 +1051,7 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 		if (c->xcb_window != NULL) {
 			comp_vk_native_window_xcb_get_dimensions(c->xcb_window, &new_width, &new_height);
 		} else if (!c->owns_window && c->xcb_handle.connection != NULL) {
-			// App-provided window (XR_EXT_xlib_window_binding): poll the live
+			// App-provided window (XR_DXR_xlib_window_binding): poll the live
 			// geometry — no helper tracking ConfigureNotify for this window.
 			comp_vk_native_window_xcb_query_geometry(&c->xcb_handle, &new_width, &new_height);
 		}
@@ -1210,7 +1210,7 @@ vk_compositor_layer_window_space(struct xrt_compositor *xc,
 }
 
 /*!
- * Local-2D layer (XR_EXT_local_3d_zone v3, #439 Phase 3) — accumulate only;
+ * Local-2D layer (XR_DXR_local_3d_zone v3, #439 Phase 3) — accumulate only;
  * the VK consumer is Windows leg 2 of
  * docs/roadmap/unified-2d-3d-phase3-impl.md §7 (un-parks the crossapi
  * §4 decision).
@@ -1227,7 +1227,7 @@ vk_compositor_layer_local_2d(struct xrt_compositor *xc,
 }
 
 /*!
- * 3D display zone layer (XR_EXT_display_zones, ADR-027) — multi-swapchain
+ * 3D display zone layer (XR_DXR_display_zones, ADR-027) — multi-swapchain
  * accumulate like projection; consumed by the zones-frame branch of
  * layer_commit (scaled blit into the window-spanning atlas at the zone rect).
  */
@@ -2251,7 +2251,7 @@ vk_sync_zone_mask_to_dp(struct comp_vk_native_compositor *c);
 // to it (always-stereo apps submit identical views in a mono mode; zone
 // layers carry zone-sized imageRects). The hardware weave-state never clamps
 // content — divergence is the hardware-state override
-// (xrRequestDisplayModeEXT), under which this layout keeps following the
+// (xrRequestDisplayModeDXR), under which this layout keeps following the
 // mode and the DP keeps weaving.
 static void
 vk_compute_effective_layout(struct comp_vk_native_compositor *c)
@@ -2310,7 +2310,7 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 	// #439 Phase 3 — per-frame Local2D accumulator flag (read by
 	// vk_effective_canvas + vk_composite_local_2d). Set once here so it reflects
-	// this frame's committed layers. XR_EXT_display_zones: the zones-frame
+	// this frame's committed layers. XR_DXR_display_zones: the zones-frame
 	// flag is resolved in the same scan (one coherent per-frame decision).
 	c->local_2d_last_frame = false;
 	c->zones_frame = false;
@@ -2322,7 +2322,7 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		}
 	}
 
-	// XR_EXT_display_zones hardware leg (P4). Zone-capable DP: the per-frame
+	// XR_DXR_display_zones hardware leg (P4). Zone-capable DP: the per-frame
 	// wish publish at the end of this commit drives the per-region switch —
 	// skip the global fallback. Legacy DP (no zone slots): tier-1 fallback —
 	// "any zone active => request 3D" once on the rising edge, no forced 2D
@@ -3441,7 +3441,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 
 #ifdef XRT_OS_LINUX_DESKTOP
 	// hwnd is a struct comp_vk_native_xlib_handle* when the app supplied its
-	// own X11 window via XR_EXT_xlib_window_binding (handle class, Phase 3);
+	// own X11 window via XR_DXR_xlib_window_binding (handle class, Phase 3);
 	// NULL for hosted (runtime self-creates an XCB window, Phase 1).
 	if (hwnd != NULL) {
 		const struct comp_vk_native_xlib_handle *xlib =
@@ -3459,7 +3459,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		c->xcb_window = NULL;
 		c->owns_window = false;
 		hwnd = &c->xcb_handle;
-		U_LOG_I("Using app-provided X11 window 0x%lx (XR_EXT_xlib_window_binding)",
+		U_LOG_I("Using app-provided X11 window 0x%lx (XR_DXR_xlib_window_binding)",
 		        xlib->window);
 	} else if (shared_texture_handle != NULL) {
 		c->xcb_window = NULL;
@@ -3544,7 +3544,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			c->settings.preferred.height = xh;
 		}
 	} else if (!c->owns_window && c->xcb_handle.connection != NULL) {
-		// App-provided window (XR_EXT_xlib_window_binding) — no helper
+		// App-provided window (XR_DXR_xlib_window_binding) — no helper
 		// tracking ConfigureNotify, so query the live size directly.
 		uint32_t xw = 0, xh = 0;
 		if (comp_vk_native_window_xcb_query_geometry(&c->xcb_handle, &xw, &xh) &&
@@ -4219,7 +4219,7 @@ comp_vk_native_compositor_get_queue_family(struct comp_vk_native_compositor *c)
 
 /*
  *
- * XR_EXT_local_3d_zone — VK consumer leg (#439 Phase 3).
+ * XR_DXR_local_3d_zone — VK consumer leg (#439 Phase 3).
  *
  * Builds the masked-composite mechanism net-new in Vulkan (the D3D11 leg in
  * comp_d3d11_compositor.cpp is the line-by-line algorithm reference). The
@@ -4230,7 +4230,7 @@ comp_vk_native_compositor_get_queue_family(struct comp_vk_native_compositor *c)
  *
  */
 
-//! Authored zone-mask handle (XR_EXT_local_3d_zone). `tex` is the R8 raster
+//! Authored zone-mask handle (XR_DXR_local_3d_zone). `tex` is the R8 raster
 //! target (COLOR_ATTACHMENT, also app-drawable for Tier-3); `staged` is the
 //! SAMPLED snapshot the composite reads, decoupled so in-progress authoring
 //! can't tear into a frame.
@@ -4395,7 +4395,7 @@ vk_destroy_rt(struct comp_vk_native_compositor *c,
 static struct u_canvas_rect
 vk_effective_canvas(struct comp_vk_native_compositor *c)
 {
-	// XR_EXT_display_zones: a zones frame spans the full client window by
+	// XR_DXR_display_zones: a zones frame spans the full client window by
 	// definition (each zone rect is its own canvas; the output rect is
 	// inert) — same supersede geometry as the mask/Local2D rules.
 	if (!c->zones_frame && c->active_zone_mask == NULL && !c->local_2d_last_frame) {
@@ -4645,7 +4645,7 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 {
 	struct vk_bundle *vk = &c->vk;
 
-	// XR_EXT_display_zones: a zones frame ALWAYS runs the composite (the
+	// XR_DXR_display_zones: a zones frame ALWAYS runs the composite (the
 	// feathered wish edge lerps the weave toward the 2D flatten even with
 	// zero Local2D layers); the implicit-mask + sticky-mask rules are inert.
 	const bool zones_frame = c->zones_frame;
@@ -4696,7 +4696,7 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 		return false; // only under-layers (or stale flag) — nothing to overlay
 	}
 
-	// XR_EXT_display_zones: the auto wish rasterizes from the ZONE rects.
+	// XR_DXR_display_zones: the auto wish rasterizes from the ZONE rects.
 	struct xrt_rect zone_rects[XRT_MAX_LAYERS];
 	uint32_t zone_rect_count = 0;
 	if (zones_frame) {
@@ -4760,7 +4760,7 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 	                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
 
-	// --- mask. Zones frame (XR_EXT_display_zones): the WISH — the explicit
+	// --- mask. Zones frame (XR_DXR_display_zones): the WISH — the explicit
 	// frame wish (staged in-cmd; referenced-at-frame-end = consume current
 	// authored state, no submit required) or the auto ring-feathered raster
 	// from the zone rects (reusing the implicit-mask image — the implicit
@@ -4954,7 +4954,7 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 	// #491: the implicit (auto) mask composites the 2D over the weave by its own
 	// premultiplied alpha — translucent 2D reveals the 3D scene, not the desktop.
 	// An explicit authored mask keeps the hard M-lerp (designer cutout/portal).
-	// XR_EXT_display_zones: zones frames are ALWAYS the hard M-lerp
+	// XR_DXR_display_zones: zones frames are ALWAYS the hard M-lerp
 	// (final = M·weave + (1−M)·flatten(2D-over)).
 	const bool have_explicit = (emask != NULL && emask->submitted && emask->staged_view != VK_NULL_HANDLE);
 	bool alpha_over = !zones_frame && !have_explicit;
@@ -5342,7 +5342,7 @@ comp_vk_native_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mas
 	if (c->active_zone_mask == mask) {
 		c->active_zone_mask = NULL; // revert to implicit / legacy behavior
 	}
-	// XR_EXT_display_zones: never leave a dangling frame-wish reference.
+	// XR_DXR_display_zones: never leave a dangling frame-wish reference.
 	if (c->frame_wish == mask) {
 		c->frame_wish = NULL;
 	}
@@ -5364,7 +5364,7 @@ comp_vk_native_compositor_zones_set_frame_wish(struct xrt_compositor *xc, void *
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
 
-	// Per-frame reference (XR_EXT_display_zones): oxr sets this on every
+	// Per-frame reference (XR_DXR_display_zones): oxr sets this on every
 	// zones frame before layer_commit, NULL meaning auto-derive. Consumed
 	// by the commit's composite; harmlessly stale on zero-zone frames (the
 	// zones branch never reads it there).
@@ -5373,7 +5373,7 @@ comp_vk_native_compositor_zones_set_frame_wish(struct xrt_compositor *xc, void *
 
 // #439 Phase 3 Q4 — current recommended per-view render size (the renderer's
 // view dims, recomputed each frame from the effective canvas). oxr fires
-// XrEventDataLocal3DZoneViewSizeChangedEXT when this changes.
+// XrEventDataLocal3DZoneViewSizeChangedDXR when this changes.
 bool
 comp_vk_native_compositor_get_recommended_view_size(struct xrt_compositor *xc, uint32_t *out_w, uint32_t *out_h)
 {

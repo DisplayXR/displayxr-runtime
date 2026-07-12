@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSL-1.0
 #
 # Linux handle-class Vulkan cube — the Phase 3 validation vehicle for
-# XR_EXT_xlib_window_binding (docs/roadmap/linux-support.md, #660). The app
+# XR_DXR_xlib_window_binding (docs/roadmap/linux-support.md, #660). The app
 # creates and owns its X11 window (Xlib) and passes it to the runtime at
 # xrCreateSession; the runtime presents into it via XGetXCBConnection +
 # VK_KHR_xcb_surface. Adapted from cube_hosted_legacy_vk_linux (same render

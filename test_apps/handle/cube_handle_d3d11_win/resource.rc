@@ -17,7 +17,7 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "CompanyName",      "Leia Inc."
-            VALUE "FileDescription",  "SR Cube OpenXR Ext Test Application (XR_EXT_win32_window_binding)"
+            VALUE "FileDescription",  "SR Cube OpenXR Ext Test Application (XR_DXR_win32_window_binding)"
             VALUE "FileVersion",      "1.0.0.0"
             VALUE "InternalName",     "cube_handle_d3d11_win"
             VALUE "LegalCopyright",   "Copyright 2025 Leia Inc."

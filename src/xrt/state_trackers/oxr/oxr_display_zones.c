@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  XR_EXT_display_zones entrypoints — N 3D zones + wish mask
- *         (ADR-027, docs/specs/extensions/XR_EXT_display_zones.md).
+ * @brief  XR_DXR_display_zones entrypoints — N 3D zones + wish mask
+ *         (ADR-027, docs/specs/extensions/XR_DXR_display_zones.md).
  * @author David Fattal
  * @ingroup oxr_api
  *
@@ -23,17 +23,17 @@
 #include "oxr_api_funcs.h"
 #include "oxr_api_verify.h"
 
-#ifdef OXR_HAVE_EXT_display_zones
+#ifdef OXR_HAVE_DXR_display_zones
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrGetDisplayZoneCapabilitiesEXT(XrSession session, XrDisplayZoneCapabilitiesEXT *capabilities)
+oxr_xrGetDisplayZoneCapabilitiesEXT(XrSession session, XrDisplayZoneCapabilitiesDXR *capabilities)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetDisplayZoneCapabilitiesEXT");
-	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, capabilities, XR_TYPE_DISPLAY_ZONE_CAPABILITIES_EXT);
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetDisplayZoneCapabilitiesDXR");
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, capabilities, XR_TYPE_DISPLAY_ZONE_CAPABILITIES_DXR);
 
 	// Never errors on an unsupported session — reports supported = false.
 	// Zones need a window-bound native compositor (the same session class
@@ -63,7 +63,7 @@ oxr_xrGetDisplayZoneRecommendedViewSizeEXT(XrSession session,
 
 	struct oxr_session *sess;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetDisplayZoneRecommendedViewSizeEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetDisplayZoneRecommendedViewSizeDXR");
 	OXR_VERIFY_ARG_NOT_NULL(&log, zoneRect);
 	OXR_VERIFY_ARG_NOT_NULL(&log, recommendedViewSize);
 
@@ -84,4 +84,4 @@ oxr_xrGetDisplayZoneRecommendedViewSizeEXT(XrSession session,
 	return XR_SUCCESS;
 }
 
-#endif // OXR_HAVE_EXT_display_zones
+#endif // OXR_HAVE_DXR_display_zones

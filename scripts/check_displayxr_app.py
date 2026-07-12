@@ -45,19 +45,19 @@ SOURCE_EXTS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".m", ".mm"}
 # ---- rule catalog (kept in sync with docs/guides/displayxr-app-rules.md) ----
 RULES = {
     "F-1": "Run the frame loop from READY, gated on a 'session running' flag (not SYNCHRONIZED+); a compliant runtime only leaves READY on your first xrBeginFrame, so a SYNCHRONIZED+ gate deadlocks (black screen).",
-    "INV-2.8": "Apps requesting MANUAL eye tracking SHOULD handle XrEventDataEyeTrackingStateChangedEXT (tracking loss is the app's problem in MANUAL).",
+    "INV-2.8": "Apps requesting MANUAL eye tracking SHOULD handle XrEventDataEyeTrackingStateChangedDXR (tracking loss is the app's problem in MANUAL).",
     "INV-3.1": "Locate into an XRT_MAX_VIEWS (8)-wide buffer; render/submit the active mode's viewCount, never a hardcoded 2.",
     "INV-4.3": "Per-tile render size = window/canvas x scaleXY, never display size.",
     "INV-4.6": "Request an sRGB swapchain (and store a correctly-encoded image); don't double-encode.",
     "INV-4.7": "Write every pixel of the imageRect you declare — clear partial-tile renders to (0,0,0,0) first (or shrink the rect); undefined pixels read as opaque magenta on MoltenVK and break transparent-bg.",
-    "INV-7.x": "Capture via xrCaptureAtlasEXT — never reintroduce an app-side CaptureAtlasRegion* readback.",
-    "INV-7.2": "xrCaptureAtlasEXT pathPrefix takes NO extension; the runtime appends _atlas.png.",
+    "INV-7.x": "Capture via xrCaptureAtlasDXR — never reintroduce an app-side CaptureAtlasRegion* readback.",
+    "INV-7.2": "xrCaptureAtlasDXR pathPrefix takes NO extension; the runtime appends _atlas.png.",
     "INV-9.1": "Ship a <exe>.displayxr.json (schema_version=1, name 1-64, type 2d|3d) or the app won't appear in the workspace launcher.",
     "INV-9.2": "2D icon is 512x512 (`icon`); 3D icon is 1024x512 (`icon_3d`, requires `icon`); layout in {sbs-lr,sbs-rl,tb,bt}.",
-    "INV-10.1": "Apps registering MCP tools (XR_EXT_mcp_tools) declare a manifest `id` (^[a-z0-9][a-z0-9-]{0,31}$) matching the xrSetMCPAppInfoEXT appId.",
+    "INV-10.1": "Apps registering MCP tools (XR_DXR_mcp_tools) declare a manifest `id` (^[a-z0-9][a-z0-9-]{0,31}$) matching the xrSetMCPAppInfoDXR appId.",
 }
 
-# Manifest `id` / XrMCPAppInfoEXT appId slug (manifest spec §3.4).
+# Manifest `id` / XrMCPAppInfoDXR appId slug (manifest spec §3.4).
 APP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 
 ERROR, WARN, INFO = "ERROR", "WARN", "INFO"
@@ -94,10 +94,10 @@ SRC_PATTERNS = [
     (re.compile(r"\bCaptureAtlasRegion(?:D3D11|D3D12|GL|VK|Metal)?\b"),
      ERROR, "INV-7.x",
      "Deprecated app-side atlas readback (CaptureAtlasRegion*) — removed in the #396 W6 refactor.",
-     "Use xrCaptureAtlasEXT (Windows: dxr_capture::RequestRuntimeAtlasCapture; elsewhere call it inline).", False),
+     "Use xrCaptureAtlasDXR (Windows: dxr_capture::RequestRuntimeAtlasCapture; elsewhere call it inline).", False),
     (re.compile(r"\bpathPrefix\b[^;\n]*\"[^\"]*\.png\""),
      WARN, "INV-7.2",
-     "xrCaptureAtlasEXT pathPrefix contains a .png extension.",
+     "xrCaptureAtlasDXR pathPrefix contains a .png extension.",
      "Pass a prefix with NO extension — the runtime appends _atlas.png.", False),
     (re.compile(r"for\s*\([^;]*;[^;]*\b(?:eye|view|v|i)\s*<\s*2\b"),
      WARN, "INV-3.1",
@@ -122,7 +122,7 @@ CREATES_SWAPCHAIN = re.compile(r"\bxrCreateSwapchain\b")
 # An N-view extension app drives the rendering-mode enumeration; a legacy / fixed-2-view
 # app does not. Used to gate the multiview-only checks (so legacy apps aren't false-flagged).
 N_VIEW_MARKER = re.compile(
-    r"xrEnumerateDisplayRenderingModesEXT|renderingModeCount|XrDisplayRenderingModeInfoEXT"
+    r"xrEnumerateDisplayRenderingModesDXR|renderingModeCount|XrDisplayRenderingModeInfoDXR"
 )
 ICON_LAYOUTS = {"sbs-lr", "sbs-rl", "tb", "bt"}
 
@@ -183,7 +183,7 @@ def scan_sources(root: Path, findings: list):
             "Treated as a legacy / non-extension app (no rendering-mode enumeration) — "
             "multiview view-count checks (INV-3.1) skipped; fixed 2-view is valid here.",
             "If this is meant to be an N-view extension app, enumerate modes "
-            "(xrEnumerateDisplayRenderingModesEXT, INV-2.3) and size view arrays to XRT_MAX_VIEWS.",
+            "(xrEnumerateDisplayRenderingModesDXR, INV-2.3) and size view arrays to XRT_MAX_VIEWS.",
         ))
 
     swapchain_loc = None
@@ -259,7 +259,7 @@ def validate_manifest(mpath: Path, root: Path, findings: list):
 
 
 def check_mcp_pairing(root: Path, findings: list):
-    """INV-10.1 — XR_EXT_mcp_tools <-> manifest `id` pairing.
+    """INV-10.1 — XR_DXR_mcp_tools <-> manifest `id` pairing.
 
     If any source registers MCP tools, a manifest must declare a valid
     `id`; when the appId literal is extractable from the source, it must
@@ -299,7 +299,7 @@ def check_mcp_pairing(root: Path, findings: list):
             text = p.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        if "xrRegisterMCPToolEXT" in text or "xrSetMCPAppInfoEXT" in text:
+        if "xrRegisterMCPToolDXR" in text or "xrSetMCPAppInfoDXR" in text:
             uses_mcp_tools = True
         for i, line in enumerate(text.splitlines(), 1):
             m = appid_re.search(line)
@@ -310,13 +310,13 @@ def check_mcp_pairing(root: Path, findings: list):
         return
     if not manifest_ids:
         findings.append(Finding(ERROR, "INV-10.1", str(root), 1,
-                                "Source registers MCP tools (XR_EXT_mcp_tools) but no manifest declares an `id`.",
+                                "Source registers MCP tools (XR_DXR_mcp_tools) but no manifest declares an `id`.",
                                 'Add "id": "<slug>" to the .displayxr.json — it is the agent-visible tool prefix.'))
         return
     for path, line, lit in declared:
         if lit and lit not in manifest_ids.values():
             findings.append(Finding(ERROR, "INV-10.1", path, line,
-                                    f"xrSetMCPAppInfoEXT appId {lit!r} does not match any manifest id "
+                                    f"xrSetMCPAppInfoDXR appId {lit!r} does not match any manifest id "
                                     f"({', '.join(sorted(set(manifest_ids.values())))}).",
                                     "Make the code and manifest agree — agents key tool names on this slug."))
 
@@ -326,10 +326,10 @@ def check_manual_tracking_event(root: Path, findings: list):
 
     An app that REQUESTS MANUAL mode has opted out of the vendor's grace
     period / collapse animation / auto 2D fallback — tracking loss becomes the
-    app's problem, and the edge-triggered XrEventDataEyeTrackingStateChangedEXT
+    app's problem, and the edge-triggered XrEventDataEyeTrackingStateChangedDXR
     (#441 v14) is the intended primitive for reacting to it. Conservative
-    trigger: only fires when BOTH xrRequestEyeTrackingModeEXT is called AND the
-    XR_EYE_TRACKING_MODE_MANUAL_EXT enum appears (merely printing "MANUAL" in a
+    trigger: only fires when BOTH xrRequestEyeTrackingModeDXR is called AND the
+    XR_EYE_TRACKING_MODE_MANUAL_DXR enum appears (merely printing "MANUAL" in a
     HUD doesn't flag), and no source references the event type.
     """
     requests_manual = None  # (path, line) of the first MANUAL enum use
@@ -344,13 +344,13 @@ def check_manual_tracking_event(root: Path, findings: list):
             text = strip_comments(p.read_text(encoding="utf-8", errors="replace"))
         except OSError:
             continue
-        if "xrRequestEyeTrackingModeEXT" in text:
+        if "xrRequestEyeTrackingModeDXR" in text:
             calls_request = True
         m = re.search(r"\bXR_EYE_TRACKING_MODE_MANUAL_EXT\b", text)
         if m and requests_manual is None:
             requests_manual = (rel(p, root), text.count("\n", 0, m.start()) + 1)
-        if ("XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT" in text or
-                "XrEventDataEyeTrackingStateChangedEXT" in text):
+        if ("XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR" in text or
+                "XrEventDataEyeTrackingStateChangedDXR" in text):
             handles_event = True
         # Apps built on test_apps/common delegate event polling to the shared
         # PollEvents(XrSessionManager&), which handles the event (common/ is
@@ -362,7 +362,7 @@ def check_manual_tracking_event(root: Path, findings: list):
         path, line = requests_manual
         findings.append(Finding(
             WARN, "INV-2.8", path, line,
-            "App requests MANUAL eye tracking but never handles XrEventDataEyeTrackingStateChangedEXT.",
+            "App requests MANUAL eye tracking but never handles XrEventDataEyeTrackingStateChangedDXR.",
             "Handle the event in your xrPollEvent loop (run your own loss transition, request a 2D "
             "mode when ready) — in MANUAL mode the vendor does no grace period or auto-fallback for you.",
         ))

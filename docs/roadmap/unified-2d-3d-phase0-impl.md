@@ -19,7 +19,7 @@ This means "re-express the surround strip-copy as a shader sample" is **not free
 | Option | What | Cost | Spec impact |
 |---|---|---|---|
 | **A. Scratch copy** ✅ **CHOSEN** | `CopyResource` surround → an internal SRV-capable scratch texture (runtime-allocated, `BIND_SHADER_RESOURCE`), then the shader samples the scratch | +1 copy/frame (removed once the 2D side is a runtime-allocated layer in Phase 3) | none |
-| **B. Require SRV on surround** | `XR_EXT_win32_window_binding` §3.6 mandates the app create the surround with `D3D11_BIND_SHADER_RESOURCE` | zero extra copy | spec bump + breaks existing surround apps until they add the flag |
+| **B. Require SRV on surround** | `XR_DXR_win32_window_binding` §3.6 mandates the app create the surround with `D3D11_BIND_SHADER_RESOURCE` | zero extra copy | spec bump + breaks existing surround apps until they add the flag |
 | **C. Defer** | leave `d3d11_blit_surround_strips` untouched; only exercise the shader pass against a runtime-allocated 2D layer (Phase 1), never against the app surround | zero | none, but Phase 0 no longer "re-expresses surround" — it validates the shader against a synthetic source |
 
 **Recommendation: A.** Keeps the existing surround contract intact, proves the shader pass against the *real* surround bytes (scratch holds an exact copy → 1:1 sample → pixel-identical), and the extra copy naturally evaporates in Phase 3 when the 2D layer is runtime-owned and SRV-capable from birth. The spec's Phase 0 wording ("re-express ... pixel-identical") holds with A; note the transient extra copy in §6 of the spec.
@@ -98,4 +98,4 @@ Use `cube_texture_d3d11_win` (a `_texture` app with a canvas sub-rect + surround
 
 ## 8. Hand-off to Phase 1
 
-The shader already carries the Phase-1 path (`use_rect_mask=0` → sample `mask_tex` (t1), lerp against `weave_tex` (t2)). Phase 1 wires `XR_EXT_local_3d_zone`'s authored mask into t1 and the weave SRV into t2, and the gate flips from a rect to the real mask. The renderer entry point's signature gains the mask SRV + weave SRV then.
+The shader already carries the Phase-1 path (`use_rect_mask=0` → sample `mask_tex` (t1), lerp against `weave_tex` (t2)). Phase 1 wires `XR_DXR_local_3d_zone`'s authored mask into t1 and the weave SRV into t2, and the gate flips from a rect to the real mask. The renderer entry point's signature gains the mask SRV + weave SRV then.

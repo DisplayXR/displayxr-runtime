@@ -5,7 +5,7 @@
 **Audience:** DisplayXR runtime contributors; extension authors; engine-plugin and demo owners (the D3D12 + VK consumers — see §8).
 **Supersedes (conceptually):** the app-class taxonomy in [app-classes.md](../getting-started/app-classes.md) and the former rect-only 2D-surround model, without breaking either.
 
-> **SUPERSEDED (ADR-031).** The 2D-surround path this doc describes as co-existing with the unified mask was **removed** ([ADR-031](../adr/), issue #634); [display-zones](../adr/ADR-027-display-zones.md) (`XR_EXT_display_zones`) is now the canonical and sole region paradigm. This document is retained as the design rationale for the unified mask / Local2D model that display-zones builds on — read it for the *why*, not as a current spec of the surround mechanism. Migration history: [surround-zones-deprecation.md](surround-zones-deprecation.md).
+> **SUPERSEDED (ADR-031).** The 2D-surround path this doc describes as co-existing with the unified mask was **removed** ([ADR-031](../adr/), issue #634); [display-zones](../adr/ADR-027-display-zones.md) (`XR_DXR_display_zones`) is now the canonical and sole region paradigm. This document is retained as the design rationale for the unified mask / Local2D model that display-zones builds on — read it for the *why*, not as a current spec of the surround mechanism. Migration history: [surround-zones-deprecation.md](surround-zones-deprecation.md).
 
 ---
 
@@ -116,7 +116,7 @@ Use **premultiplied** alpha for the 2D layer to avoid edge fringing along the 2D
 
 **#491 resolves this with two paths, chosen by whether the mask is implicit or authored:**
 
-- **Implicit mask (auto, for a `XrCompositionLayerLocal2DEXT` with no authored zone mask) → premultiplied alpha-over.** The 2D layer's own (premultiplied) alpha **is** the blend:
+- **Implicit mask (auto, for a `XrCompositionLayerLocal2DDXR` with no authored zone mask) → premultiplied alpha-over.** The 2D layer's own (premultiplied) alpha **is** the blend:
   ```
   final = twod + (1 − twod.a) · weave        // premultiplied "over" of 2D atop the weave
   ```
@@ -136,17 +136,17 @@ The composite generalizes from "2D over 3D" to a **back-to-front stack**: `deskt
 
 ---
 
-## 5. Mask-authoring API — adopt `XR_EXT_local_3d_zone`, add a second consumer
+## 5. Mask-authoring API — adopt `XR_DXR_local_3d_zone`, add a second consumer
 
-**Do not invent a second mask API.** The tiered authoring surface designed in [local-3d-zones.md](local-3d-zones.md) (`XR_EXT_local_3d_zone`) is exactly what the compositor consumer needs:
+**Do not invent a second mask API.** The tiered authoring surface designed in [local-3d-zones.md](local-3d-zones.md) (`XR_DXR_local_3d_zone`) is exactly what the compositor consumer needs:
 
-- **Tier 1 — whole-window.** `xrSetLocal3DZoneWholeWindowEXT(mask, enable)`. The degenerate all-3D / all-2D case; one call at startup, zero per-frame work.
-- **Tier 2 — rect list.** `xrSetLocal3DZoneFromRectsEXT(mask, count, rects)`. Runtime rasterizes rects into the mask texture. **This is the strict generalization of today's canvas sub-rect + surround** — a single rect reproduces current `texture` behavior.
-- **Tier 3 — freeform render target.** `xrAcquireLocal3DZoneRenderTargetEXT(mask, &binding)`. App draws arbitrary alpha into the mask each frame via the API-typed sibling binding.
+- **Tier 1 — whole-window.** `xrSetLocal3DZoneWholeWindowDXR(mask, enable)`. The degenerate all-3D / all-2D case; one call at startup, zero per-frame work.
+- **Tier 2 — rect list.** `xrSetLocal3DZoneFromRectsDXR(mask, count, rects)`. Runtime rasterizes rects into the mask texture. **This is the strict generalization of today's canvas sub-rect + surround** — a single rect reproduces current `texture` behavior.
+- **Tier 3 — freeform render target.** `xrAcquireLocal3DZoneRenderTargetDXR(mask, &binding)`. App draws arbitrary alpha into the mask each frame via the API-typed sibling binding.
 
 The wire primitive in all tiers is one shared GPU **scalar mask** texture in **client-window pixel space** — *separate from* the 2D content layer. (The 2D RGBA carries its own alpha; the mask only selects regions — §4.0.) The only delta this spec adds: that same mask now also routes to the **compositor composite** (§4), not only to the DP hardware publish (local-3d-zones §"DP vtable contract"), where the **vendor owns its interpretation** (§2). The mask object grows from "one consumer (DP)" to "fan-out to up-to-two runtime-side consumers (composite + DP) from one authored source."
 
-> Migration note for `texture` apps: today's `xrSetSharedTextureOutputRectEXT` + `xrSetSharedTextureSurround2DEXT[Fence]` becomes the **Tier-2 single-rect** path. Both surfaces are kept working in parallel during Phases 0–2 (§6); the surround entry points are not removed until the layer path (Phase 3) lands and apps migrate.
+> Migration note for `texture` apps: today's `xrSetSharedTextureOutputRectDXR` + `xrSetSharedTextureSurround2DEXT[Fence]` becomes the **Tier-2 single-rect** path. Both surfaces are kept working in parallel during Phases 0–2 (§6); the surround entry points are not removed until the layer path (Phase 3) lands and apps migrate.
 
 ### 5.1 Coordinate-space contract (pin in Phase 0)
 
@@ -165,14 +165,14 @@ Re-express `d3d11_blit_surround_strips` internals as the in-place premultiplied-
 - **Option A scratch copy**: the app's surround texture is copy-only (no `BIND_SHADER_RESOURCE` guarantee), so the pass `CopyResource`s it into a runtime-owned SRV-capable scratch each frame — one transient extra copy that evaporates in Phase 3 when the 2D layer is runtime-allocated.
 - **Validation capture**: `MCP_CAPTURE_MODE_POST_COMPOSE` reads the renderer **atlas**, which the surround pass never touches — the A/B diff instead uses the dedicated `DISPLAYXR_SURROUND_CAPTURE` probe, which dumps the composited DP target. Validated on Leia hardware 2026-06-05: outside-canvas max diff **0** across 8.06 M pixels (`DISPLAYXR_SURROUND_SHADER=1` vs strip copy, surround animation frozen via `DXR_SURROUND_FREEZE`).
 
-### Phase 1 — Add the opt-in alpha mask behind `XR_EXT_local_3d_zone` (Tiers 1–3). *D3D11.*
+### Phase 1 — Add the opt-in alpha mask behind `XR_DXR_local_3d_zone` (Tiers 1–3). *D3D11.*
 Wire the mask object's compositor-consumer leg: when an app supplies a mask, the composite uses it; when it doesn't, fall back to the Phase-0 rect-derived mask. Regression surface = zero (new path only reachable on explicit opt-in). This already unlocks arbitrary 2D/3D regions on `handle` apps (`handle + mask`).
 
 ### Phase 2 — Generalize the weave region. *D3D11.*
 Today weave region = canvas rect. With a mask present, weave the **bounding box of the mask's 3D pixels** (start simply: full window when a mask is present — correct, mildly wasteful; tighten to the mask bbox under profiling). Feed that bbox as `canvas_offset/size` to `process_atlas` (§3). Disconnected 3D islands fall out for free. Impl plan: [`unified-2d-3d-phase2-impl.md`](unified-2d-3d-phase2-impl.md) (an active mask **supersedes** the canvas output rect — weave region, view dims, and Kooima metrics all follow the client-window rect).
 
 ### Phase 3 — 2D as a first-class composition layer (the real "one mechanism with options"). *D3D11, then cross-API.*
-Replace the shared-texture surround side-channel with the app submitting a **post-weave 2D screen-space layer (+ its alpha)** through the normal `xrEndFrame` layer list, alongside its stereo/projection layers. The compositor's `layer_accum` gains a third routing bucket — *post-weave masked 2D* — beside the existing projection-pass and window-space-pass buckets. This is the cross-cutting lift: it touches the oxr state tracker (layer validation/handling), the IPC proto (new layer type serialization — see [proto codegen](../../) cascade), and every API's compositor. Do it last, behind the proven Phases 0–2. **Design + leg split: [`unified-2d-3d-phase3-impl.md`](unified-2d-3d-phase3-impl.md)** (`XrCompositionLayerLocal2DEXT` sub-rect quad in `XR_EXT_local_3d_zone` v3; implicit mask from layer coverage; view-size renegotiation event; the masked composite is reused — only the `twod` source changes).
+Replace the shared-texture surround side-channel with the app submitting a **post-weave 2D screen-space layer (+ its alpha)** through the normal `xrEndFrame` layer list, alongside its stereo/projection layers. The compositor's `layer_accum` gains a third routing bucket — *post-weave masked 2D* — beside the existing projection-pass and window-space-pass buckets. This is the cross-cutting lift: it touches the oxr state tracker (layer validation/handling), the IPC proto (new layer type serialization — see [proto codegen](../../) cascade), and every API's compositor. Do it last, behind the proven Phases 0–2. **Design + leg split: [`unified-2d-3d-phase3-impl.md`](unified-2d-3d-phase3-impl.md)** (`XrCompositionLayerLocal2DDXR` sub-rect quad in `XR_DXR_local_3d_zone` v3; implicit mask from layer coverage; view-size renegotiation event; the masked composite is reused — only the `twod` source changes).
 
 > Note: today's **window-space layers** (composited *pre*-weave, into the atlas, at zero disparity → flat at the screen plane) are a *different* mechanism and stay as-is. The new bucket is *post*-weave, full-resolution, mask-gated. Three buckets total: pre-weave projection, pre-weave window-space (zero-disparity flat), post-weave masked 2D.
 
@@ -216,7 +216,7 @@ Per-API sync primitive for the shared 2D source (when app-presented): D3D11 keye
 
 ## 10. Cross-references
 
-- [local-3d-zones.md](local-3d-zones.md) — the hardware-consumer leg of the shared mask; `XR_EXT_local_3d_zone` authoring API (#224).
+- [local-3d-zones.md](local-3d-zones.md) — the hardware-consumer leg of the shared mask; `XR_DXR_local_3d_zone` authoring API (#224).
 - [surround-zones-deprecation.md](surround-zones-deprecation.md) — the now-removed rectangular 2D-surround this generalized (ADR-031, #634); retains the per-API sync-primitive precedent and migration history.
 - [app-classes.md](../getting-started/app-classes.md) — the taxonomy this reframes as present-ownership × region.
 - `comp_d3d11_compositor.cpp` — weave-target-as-parameter: offscreen shared-texture path (`:1521`), windowed path (`:1581`), rect surround (`d3d11_blit_surround_strips`), DP-crop (#431, `903cfffa5`).

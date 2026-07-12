@@ -154,7 +154,7 @@ comp_multi_workspace_get_client_window_dims(struct xrt_compositor *xc,
  * Tier-2 window placement (#59). Set the per-client window pose: reposition and
  * resize the client's runtime-owned NSWindow into a display sub-rect so multiple
  * apps tile instead of stacking full-screen. Backs the macOS
- * xrSetWorkspaceClientWindowPoseEXT handler. Computes the pixel rect from @p pose
+ * xrSetWorkspaceClientWindowPoseDXR handler. Computes the pixel rect from @p pose
  * (display-center origin, meters, +y up) using the display's pixel density,
  * stores it (so get_window_dims echoes it back to the controller and the cursor
  * composite can map global cursor px into the window), repositions the NSWindow
@@ -185,7 +185,7 @@ comp_multi_workspace_store_window_pose(struct xrt_compositor *target_xc,
                                        int32_t px_h);
 
 /*!
- * Per-client style pushed by the workspace controller via xrSetWorkspaceClientStyleEXT
+ * Per-client style pushed by the workspace controller via xrSetWorkspaceClientStyleDXR
  * (#59 Task 10). The compositor applies the focus tint to the focused client's
  * content edge — the macOS analogue of the D3D11 service's per-slot style. The
  * controller toggles @ref focus_glow_intensity by focus state (0 = unfocused).
@@ -289,7 +289,7 @@ comp_multi_workspace_get_focused_client(void);
  */
 
 /*!
- * Session-global cursor sprite, set by the controller via xrSetWorkspaceCursorEXT.
+ * Session-global cursor sprite, set by the controller via xrSetWorkspaceCursorDXR.
  * Composited topmost over the content. v1 is flat at the screen plane (the depth
  * fields are stored for the deferred per-eye-disparity Tier-2 work; only @ref
  * over_window dimming is applied in v1).
@@ -310,7 +310,7 @@ struct comp_multi_cursor_state
 void
 comp_multi_workspace_set_cursor(struct xrt_swapchain *xsc, float hot_x, float hot_y, float size_meters, bool visible);
 
-//! Update the cursor's hit depth + over-window state (xrSetWorkspaceCursorDepthEXT).
+//! Update the cursor's hit depth + over-window state (xrSetWorkspaceCursorDepthDXR).
 void
 comp_multi_workspace_set_cursor_depth(float hit_z_m, bool over_window);
 

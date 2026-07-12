@@ -1,7 +1,7 @@
 # Display Zones — migration note + phased implementation plan
 
 > Design: [ADR-027](../adr/ADR-027-display-zones.md) +
-> [`XR_EXT_display_zones` spec sketch](../specs/extensions/XR_EXT_display_zones.md).
+> [`XR_DXR_display_zones` spec sketch](../specs/extensions/XR_DXR_display_zones.md).
 > This doc carries the two living parts: the reference-consumer migration and
 > the implementation phasing. Status: **runtime phases P1–P4 SHIPPED**
 > (extension advertised; D3D11 capture- + Leia-validated, D3D12/GL
@@ -23,11 +23,11 @@ consumer change is this one, after the runtime phases land.
 
 ### Setup (once, after session create)
 
-- Enable `XR_EXT_display_zones` + `XR_EXT_local_3d_zone` + `XR_EXT_view_rig`;
-  `xrGetDisplayZoneCapabilitiesEXT` → `supported`.
+- Enable `XR_DXR_display_zones` + `XR_DXR_local_3d_zone` + `XR_DXR_view_rig`;
+  `xrGetDisplayZoneCapabilitiesDXR` → `supported`.
 - Tiger zone rect = bottom 75% of the W×H client window:
   `{{0, H/4}, {W, 3H/4}}` (client px, y-down).
-- `xrGetDisplayZoneRecommendedViewSizeEXT(session, &tigerRect, &viewSize)` →
+- `xrGetDisplayZoneRecommendedViewSizeDXR(session, &tigerRect, &viewSize)` →
   create the multiview projection swapchains at `viewSize`.
 - Flat swapchain for the bubble (top-25% rect).
 - **No mask object** — the auto wish (feathered bottom-75%) is exactly the
@@ -37,13 +37,13 @@ consumer change is this one, after the runtime phases land.
 
 ```c
 while (running) {
-    poll_events();  // XrEventDataDisplayZoneMetricsChangedEXT -> re-query + recreate swapchains
+    poll_events();  // XrEventDataDisplayZoneMetricsChangedDXR -> re-query + recreate swapchains
 
     xrWaitFrame(); xrBeginFrame();
 
-    XrDisplayZoneEXT tigerZone = {XR_TYPE_DISPLAY_ZONE_EXT, NULL, /*zoneId*/ 1,
+    XrDisplayZoneDXR tigerZone = {XR_TYPE_DISPLAY_ZONE_DXR, NULL, /*zoneId*/ 1,
                                   {{0, H/4}, {W, 3*H/4}}};
-    XrDisplayRigEXT  rig = {XR_TYPE_DISPLAY_RIG_EXT, NULL,
+    XrDisplayRigDXR  rig = {XR_TYPE_DISPLAY_RIG_DXR, NULL,
                             displayPlanePose, virtualDisplayHeight,   // ex-app-side tunables
                             ipdFactor, parallaxFactor, perspectiveFactor};
 
@@ -62,7 +62,7 @@ while (running) {
     XrCompositionLayerProjection tiger3D = {XR_TYPE_COMPOSITION_LAYER_PROJECTION,
         &tigerZone, XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
         space, viewCount, projViews /* XrView pose/fov copied in, as core requires */};
-    XrCompositionLayerLocal2DEXT bubble2D = {XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT,
+    XrCompositionLayerLocal2DDXR bubble2D = {XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR,
         NULL, layerFlags, bubbleSubImage, /*rect*/ {{0, 0}, {W, H/4}}};
     const XrCompositionLayerBaseHeader* layers[] = {(void*)&tiger3D, (void*)&bubble2D};
 
@@ -100,11 +100,11 @@ against the app-side `displayxr-common` oracle — equivalence by construction
 held literally (same math core).
 
 
-- Locate-chained `XrDisplayZoneEXT` → per-zone Kooima: apply
+- Locate-chained `XrDisplayZoneDXR` → per-zone Kooima: apply
   `u_canvas_apply_to_metrics` with the *chained* rect (it already does exactly
   the right metrics rewrite) before the existing
   `dxr_xrt_display3d_compute_views` / `camera3d` fill in `oxr_session.c`
-  (~L1640–1900). The raw channel (`XrViewDisplayRawEXT.canvasRectPx /
+  (~L1640–1900). The raw channel (`XrViewDisplayRawDXR.canvasRectPx /
   canvasSizeMeters`) reports the zone rect for free (it reads the rewritten
   metrics).
 - New `XRT_LAYER_ZONE_3D` in `xrt_layer_type` +

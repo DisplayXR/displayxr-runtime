@@ -8,7 +8,7 @@ issues: [551]
 ## Context
 
 A transparent DisplayXR app (`transparentBackgroundEnabled = XR_TRUE`, see
-`XR_EXT_win32_window_binding`) wants `alpha = 0` regions of its content to show
+`XR_DXR_win32_window_binding`) wants `alpha = 0` regions of its content to show
 the **live desktop** behind its window. In-process this is settled (ADR-007's DP
 weaves; the native compositor configures the app HWND for `DirectComposition` +
 `DXGI_ALPHA_MODE_PREMULTIPLIED`). The **IPC/service path** —
@@ -105,11 +105,11 @@ it works with no WGC capture ever created.
   `transparentBackgroundEnabled` parse in `oxr_session`. The DP (out-of-process)
   only reads affinity and tolerates a cross-process `ERROR_ACCESS_DENIED`.
 - **App-side HWND requirements are unchanged** (`WS_EX_NOREDIRECTIONBITMAP` +
-  null background brush; see `XR_EXT_win32_window_binding` §3.2). They apply
+  null background brush; see `XR_DXR_win32_window_binding` §3.2). They apply
   identically whether the runtime or the client owns the present.
 
 ## Related
 
 - ADR-007 (compositor never weaves), ADR-020 (plugin ABI append-only),
   ADR-027 (display zones — the motivating client).
-- `XR_EXT_win32_window_binding` §3.2 (transparent-window contract, per-API matrix).
+- `XR_DXR_win32_window_binding` §3.2 (transparent-window contract, per-API matrix).

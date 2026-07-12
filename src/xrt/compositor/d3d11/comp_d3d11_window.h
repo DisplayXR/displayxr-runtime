@@ -5,7 +5,7 @@
  * @brief  D3D11 compositor self-created window management.
  *
  * This module provides window creation for the D3D11 native compositor
- * when XR_EXT_win32_window_binding is NOT used. This allows apps like Blender
+ * when XR_DXR_win32_window_binding is NOT used. This allows apps like Blender
  * that don't provide a window handle to still use the D3D11 native compositor.
  *
  * @author David Fattal
@@ -44,13 +44,13 @@ struct workspace_input_event
 #define WORKSPACE_INPUT_RING_SIZE 64
 
 //! Max controller-supplied reserved-key chords (spec_version 24). Must match
-//! XR_WORKSPACE_MAX_RESERVED_KEYS_EXT in the OpenXR extension header — kept as a
+//! XR_WORKSPACE_MAX_RESERVED_KEYS_DXR in the OpenXR extension header — kept as a
 //! local define so this compositor header doesn't pull in the OpenXR headers.
 #define WORKSPACE_RESERVED_KEYS_MAX 32
 
 /*!
  * Phase 2.D: raw event captured by WndProc for the public-API event drain
- * (xrEnumerateWorkspaceInputEventsEXT). The service-side drain enriches each
+ * (xrEnumerateWorkspaceInputEventsDXR). The service-side drain enriches each
  * raw POINTER event with the workspace hit-test (clientId, region, UV) before
  * exposing it on the public surface; KEY and SCROLL events pass through with
  * no extra geometry.
@@ -262,7 +262,7 @@ comp_d3d11_window_set_input_forward(struct comp_d3d11_window *window,
                                      bool is_capture);
 
 /*!
- * Install the controller's reserved-key table (XR_EXT_spatial_workspace
+ * Install the controller's reserved-key table (XR_DXR_spatial_workspace
  * spec_version 24). Each (vks[i], mods[i]) is a chord the controller owns:
  * matching key events are still emitted on the public ring but NOT forwarded
  * to the focused app. mods uses the 3-bit KEY-event mask (bit0=SHIFT,
@@ -313,7 +313,7 @@ comp_d3d11_window_set_workspace_wakeup_event(struct comp_d3d11_window *window, v
  * forward mouse or keyboard events to the focused app — the events still reach
  * the workspace controller via the public event ring. Driven by controller-
  * owned drag/resize gestures and by the modal input grab
- * (xrSetWorkspaceInputGrabEXT, spec_version 18).
+ * (xrSetWorkspaceInputGrabDXR, spec_version 18).
  */
 void
 comp_d3d11_window_set_input_suppress(struct comp_d3d11_window *window, bool suppress);
@@ -349,7 +349,7 @@ comp_d3d11_window_consume_input_events(struct comp_d3d11_window *window,
 
 /*!
  * Phase 2.D: drain the public-event ring populated by WndProc for the
- * xrEnumerateWorkspaceInputEventsEXT path. SPSC; the service-side drain is
+ * xrEnumerateWorkspaceInputEventsDXR path. SPSC; the service-side drain is
  * the sole consumer.
  *
  * @param window     The window object.

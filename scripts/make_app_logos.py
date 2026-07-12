@@ -46,7 +46,7 @@ ICON_3D = (1024, 512)
 TILE_PX = 512  # each view in the 3D logo
 
 # Geometry tokens the runtime appends, newest first:
-#   <stem>-<N>_atlas_<viewCount>_<cols>x<rows>.png   (XR_EXT_atlas_capture v2)
+#   <stem>-<N>_atlas_<viewCount>_<cols>x<rows>.png   (XR_DXR_atlas_capture v2)
 #   <stem>-<N>_<cols>x<rows>.png                     (legacy readback)
 #   displayxr_atlas.projection.png                   (file-trigger; no tokens)
 _GRID_RE = re.compile(r"_(?:atlas_\d+_)?(\d+)x(\d+)\.png$", re.IGNORECASE)

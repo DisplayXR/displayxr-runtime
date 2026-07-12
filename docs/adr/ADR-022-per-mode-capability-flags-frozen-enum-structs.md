@@ -19,8 +19,8 @@ answers will outlive it:
    (low-latency, HDR-weave, requires-canvas, …). Does every one cost an ABI
    break?
 
-2. **App side** — `xrEnumerateDisplayRenderingModesEXT` fills an app-allocated
-   array of `XrDisplayRenderingModeInfoEXT` using the **runtime's compiled
+2. **App side** — `xrEnumerateDisplayRenderingModesDXR` fills an app-allocated
+   array of `XrDisplayRenderingModeInfoDXR` using the **runtime's compiled
    struct stride**. The v12 (tile fields) and v13 (`isActive`/`isRequestable`)
    revisions plain-appended fields — which only worked because every consumer
    in the org rebuilt in lockstep. An app binary compiled against an older
@@ -48,11 +48,11 @@ draw from `reserved[]`. Zero-init = all capabilities off = the safe default,
 so older-style drivers that calloc and don't know a new bit are automatically
 conservative. No further stride changes — no ABI v4 for per-mode capabilities.
 
-**2. App side: `XrDisplayRenderingModeInfoEXT` is frozen at its v13 layout.
+**2. App side: `XrDisplayRenderingModeInfoDXR` is frozen at its v13 layout.
 All future per-mode fields chain.**
 
 New per-mode data reaches apps via structs chained to each array element's
-`next` — starting with `XrDisplayRenderingModeTrackingInfoEXT { hasTracking }`
+`next` — starting with `XrDisplayRenderingModeTrackingInfoDXR { hasTracking }`
 (header v14). The app opts in per the standard OpenXR input convention by
 pre-setting each element's `type` (and chaining); the runtime **only walks the
 chain of elements carrying the correct input type**, because v13-and-earlier
@@ -61,7 +61,7 @@ crash them. Non-opted-in callers get the exact v13 fill (`next = NULL`'d).
 
 This is the canonical Khronos pattern for extending enumerated output structs
 (cf. `XrViewConfigurationView` + chained per-view extension structs, and our
-own `XrEyeTrackingModeCapabilitiesEXT` chaining to `XrSystemProperties`).
+own `XrEyeTrackingModeCapabilitiesDXR` chaining to `XrSystemProperties`).
 
 ## Consequences
 
@@ -69,7 +69,7 @@ own `XrEyeTrackingModeCapabilitiesEXT` chaining to `XrSystemProperties`).
   chained struct or extend an existing one (app side) + header minor bump.
   No plug-in ABI break, no app-binary risk, no coordinated release.
 - The v12/v13-style plain append is **prohibited** on
-  `XrDisplayRenderingModeInfoEXT`. Reviewers should treat any field added to
+  `XrDisplayRenderingModeInfoDXR`. Reviewers should treat any field added to
   that struct as a correctness bug, not a style preference — the failure mode
   is silent memory corruption in binaries we don't control.
 - The opt-in type handshake means chained data is invisible to apps that don't
@@ -83,6 +83,6 @@ own `XrEyeTrackingModeCapabilitiesEXT` chaining to `XrSystemProperties`).
 - #441 (umbrella), runtime PRs #443 / #446 / #451; vendor rebuilds tracked in
   the respective plug-in repos
 - `docs/roadmap/per-mode-tracking-capability-plan.md` (implementation plan)
-- `docs/specs/extensions/XR_EXT_display_info.md` §7c (v14 API surface)
+- `docs/specs/extensions/XR_DXR_display_info.md` §7c (v14 API surface)
 - `docs/specs/vendor/eye-tracking-modes.md` (capability layering + contract)
 - ADR-020 (plug-in ABI policy this builds on)

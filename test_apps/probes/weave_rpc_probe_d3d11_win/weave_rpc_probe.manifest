@@ -6,7 +6,7 @@
     name="DisplayXR.WeaveRpcProbeD3D11"
     type="win32"
   />
-  <description>DisplayXR XR_EXT_weave probe (#625)</description>
+  <description>DisplayXR XR_DXR_weave probe (#625)</description>
 
   <!-- Windows 10/11 compatibility -->
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">

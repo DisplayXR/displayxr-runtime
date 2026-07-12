@@ -17,7 +17,7 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "CompanyName",      "DisplayXR"
-            VALUE "FileDescription",  "Cube Zones TEXTURE OpenGL Test Application (XR_EXT_display_zones parity)"
+            VALUE "FileDescription",  "Cube Zones TEXTURE OpenGL Test Application (XR_DXR_display_zones parity)"
             VALUE "FileVersion",      "1.0.0.0"
             VALUE "InternalName",     "cube_zones_texture_gl_win"
             VALUE "LegalCopyright",   "Copyright 2026 DisplayXR"

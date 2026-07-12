@@ -18,18 +18,18 @@ It is *not* a frozen specification. SPEC_VERSION 1 freezes when the first non-sh
 
 ## Naming and scope
 
-Two extensions, both prefixed `XR_EXT_` to match the existing DisplayXR extensions (`XR_EXT_display_info`, `XR_EXT_win32_window_binding`, etc.). The `EXT_` prefix signals "any DisplayXR-compatible runtime should implement", same as the others — not single-vendor `XR_DISPLAYXR_`.
+Two extensions, both prefixed `XR_EXT_` to match the existing DisplayXR extensions (`XR_DXR_display_info`, `XR_DXR_win32_window_binding`, etc.). The `EXT_` prefix signals "any DisplayXR-compatible runtime should implement", same as the others — not single-vendor `XR_DISPLAYXR_`.
 
 | Extension | Purpose |
 |---|---|
-| `XR_EXT_spatial_workspace` | Privileged client opts into workspace mode; manages window poses, visibility, hit-test, 2D capture clients, frame capture, client enumeration, lifecycle events. |
+| `XR_DXR_spatial_workspace` | Privileged client opts into workspace mode; manages window poses, visibility, hit-test, 2D capture clients, frame capture, client enumeration, lifecycle events. |
 | `XR_EXT_app_launcher` | Tile registry rendered by the runtime over the atlas. Workspace pushes tiles, polls click events, sets the running-tile mask. Optional second extension — see "Why two extensions" below. |
 
 ### Why two extensions
 
 Could be one. Keeping them separate buys two things:
 
-1. **Independent versioning.** Launcher UX is most likely to evolve (we may want richer tile metadata, glow states, drag-to-reorder, group tabs). The workspace surface should stabilize first; the launcher can iterate without bumping `XR_EXT_spatial_workspace_SPEC_VERSION`.
+1. **Independent versioning.** Launcher UX is most likely to evolve (we may want richer tile metadata, glow states, drag-to-reorder, group tabs). The workspace surface should stabilize first; the launcher can iterate without bumping `XR_DXR_spatial_workspace_SPEC_VERSION`.
 2. **A non-launcher controller is a real use case.** A medical cockpit, a kiosk, or a test harness wants `spatial_workspace` but doesn't need a launcher. Two extensions = the controller declares only what it uses; the runtime can run a workspace without instantiating launcher state.
 
 Counter-argument: more surface area to keep coherent. Mitigated by the fact that a workspace controller almost always uses both, and they share the lifecycle (launcher commands no-op when no workspace is active).
@@ -41,27 +41,27 @@ We start with two and merge if the boundary feels artificial after Phase 2 is in
 The workspace controller is a regular OpenXR client that opts into privileged mode. Bootstrap:
 
 1. Process launches; binary path is whatever `service.json::workspace_binary` points at (defaults to `displayxr-shell.exe`, configurable per Phase 1). Detection of whether *any* controller is installed happens at service startup — see [spatial-workspace-controller-detection.md](spatial-workspace-controller-detection.md).
-2. Process calls `xrCreateInstance` with `XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME` in `enabledExtensionNames` (and optionally `XR_EXT_APP_LAUNCHER_EXTENSION_NAME`).
+2. Process calls `xrCreateInstance` with `XR_DXR_SPATIAL_WORKSPACE_EXTENSION_NAME` in `enabledExtensionNames` (and optionally `XR_EXT_APP_LAUNCHER_EXTENSION_NAME`).
 3. Process creates a session normally (graphics binding can be `XR_NULL_HANDLE` — workspace controllers don't render swapchains; they only instruct).
-4. Process calls `xrActivateSpatialWorkspaceEXT(session)`. The runtime checks:
+4. Process calls `xrActivateSpatialWorkspaceDXR(session)`. The runtime checks:
    - At most one workspace is active per system. Returns `XR_ERROR_LIMIT_REACHED` if another controller already holds the role.
    - Caller authorization: orchestrator-PID match (with manual-mode fallback). Full design in [spatial-workspace-auth-handshake.md](spatial-workspace-auth-handshake.md).
 5. On success the session is *the* workspace session. All subsequent extension calls go through this `XrSession` handle.
 
 Lifecycle:
-- `xrDeactivateSpatialWorkspaceEXT(session)` — voluntarily release the role. Other clients keep running; per-client compositors resume direct rendering.
+- `xrDeactivateSpatialWorkspaceDXR(session)` — voluntarily release the role. Other clients keep running; per-client compositors resume direct rendering.
 - `xrDestroySession` on the workspace session — implicit deactivate.
 - Workspace process crash — service detects via IPC pipe close and treats as deactivate.
 
 A non-workspace OpenXR session has *no access* to any of the functions below; calling them returns `XR_ERROR_FEATURE_UNSUPPORTED` (extension not enabled) or `XR_ERROR_VALIDATION_FAILURE` (extension enabled but session is not the active workspace).
 
-## Header sketch — `XR_EXT_spatial_workspace.h`
+## Header sketch — `XR_DXR_spatial_workspace.h`
 
 ```c
 // Copyright 2026, DisplayXR
 // SPDX-License-Identifier: BSL-1.0
-#ifndef XR_EXT_SPATIAL_WORKSPACE_H
-#define XR_EXT_SPATIAL_WORKSPACE_H 1
+#ifndef XR_DXR_SPATIAL_WORKSPACE_H
+#define XR_DXR_SPATIAL_WORKSPACE_H 1
 
 #include <openxr/openxr.h>
 
@@ -69,16 +69,16 @@ A non-workspace OpenXR session has *no access* to any of the functions below; ca
 extern "C" {
 #endif
 
-#define XR_EXT_spatial_workspace 1
-#define XR_EXT_spatial_workspace_SPEC_VERSION 1
-#define XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_EXT_spatial_workspace"
+#define XR_DXR_spatial_workspace 1
+#define XR_DXR_spatial_workspace_SPEC_VERSION 1
+#define XR_DXR_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_DXR_spatial_workspace"
 
 // ---- Type values (provisional — coordinate with extension registry) ----
-#define XR_TYPE_WORKSPACE_CLIENT_INFO_EXT          ((XrStructureType)1000999100)
-#define XR_TYPE_WORKSPACE_CAPTURE_REQUEST_EXT      ((XrStructureType)1000999101)
-#define XR_TYPE_WORKSPACE_CAPTURE_RESULT_EXT       ((XrStructureType)1000999102)
-#define XR_TYPE_EVENT_DATA_WORKSPACE_CLIENT_CONNECTED_EXT    ((XrStructureType)1000999103)
-#define XR_TYPE_EVENT_DATA_WORKSPACE_CLIENT_DISCONNECTED_EXT ((XrStructureType)1000999104)
+#define XR_TYPE_WORKSPACE_CLIENT_INFO_DXR          ((XrStructureType)1004999100)
+#define XR_TYPE_WORKSPACE_CAPTURE_REQUEST_DXR      ((XrStructureType)1004999101)
+#define XR_TYPE_WORKSPACE_CAPTURE_RESULT_DXR       ((XrStructureType)1004999102)
+#define XR_TYPE_EVENT_DATA_WORKSPACE_CLIENT_CONNECTED_EXT    ((XrStructureType)1004999103)
+#define XR_TYPE_EVENT_DATA_WORKSPACE_CLIENT_DISCONNECTED_EXT ((XrStructureType)1004999104)
 
 // Workspace-local identifier for a client. Stable for the lifetime of the
 // connection; reused after disconnect. 0 is reserved (invalid).
@@ -99,53 +99,53 @@ typedef uint32_t XrWorkspaceClientId;
  *                                 controller (see "Activation handshake").
  *   XR_ERROR_FUNCTION_UNSUPPORTED Extension was not enabled at instance create.
  */
-typedef XrResult (XRAPI_PTR *PFN_xrActivateSpatialWorkspaceEXT)(XrSession session);
+typedef XrResult (XRAPI_PTR *PFN_xrActivateSpatialWorkspaceDXR)(XrSession session);
 
 /*!
  * Voluntarily release workspace role. Other clients keep running.
  */
-typedef XrResult (XRAPI_PTR *PFN_xrDeactivateSpatialWorkspaceEXT)(XrSession session);
+typedef XrResult (XRAPI_PTR *PFN_xrDeactivateSpatialWorkspaceDXR)(XrSession session);
 
 /*!
  * Query whether this session is currently the active workspace controller.
  */
-typedef XrResult (XRAPI_PTR *PFN_xrGetSpatialWorkspaceStateEXT)(
+typedef XrResult (XRAPI_PTR *PFN_xrGetSpatialWorkspaceStateDXR)(
     XrSession session, XrBool32 *out_active);
 
 
 // ---- Client enumeration ----
 
-typedef enum XrWorkspaceClientTypeEXT {
-    XR_WORKSPACE_CLIENT_TYPE_OPENXR_3D_EXT  = 0,  // a regular OpenXR app session
-    XR_WORKSPACE_CLIENT_TYPE_CAPTURED_2D_EXT = 1, // a 2D OS window adopted via xrAddWorkspaceCaptureClientEXT
-    XR_WORKSPACE_CLIENT_TYPE_MAX_ENUM_EXT   = 0x7FFFFFFF
-} XrWorkspaceClientTypeEXT;
+typedef enum XrWorkspaceClientTypeDXR {
+    XR_WORKSPACE_CLIENT_TYPE_OPENXR_3D_DXR  = 0,  // a regular OpenXR app session
+    XR_WORKSPACE_CLIENT_TYPE_CAPTURED_2D_DXR = 1, // a 2D OS window adopted via xrAddWorkspaceCaptureClientDXR
+    XR_WORKSPACE_CLIENT_TYPE_MAX_ENUM_DXR   = 0x7FFFFFFF
+} XrWorkspaceClientTypeDXR;
 
 /*!
- * Per-client metadata. Returned by xrEnumerateWorkspaceClientsEXT.
+ * Per-client metadata. Returned by xrEnumerateWorkspaceClientsDXR.
  */
-typedef struct XrWorkspaceClientInfoEXT {
-    XrStructureType             type;        //!< XR_TYPE_WORKSPACE_CLIENT_INFO_EXT
+typedef struct XrWorkspaceClientInfoDXR {
+    XrStructureType             type;        //!< XR_TYPE_WORKSPACE_CLIENT_INFO_DXR
     void* XR_MAY_ALIAS          next;
     XrWorkspaceClientId         clientId;
-    XrWorkspaceClientTypeEXT    clientType;
+    XrWorkspaceClientTypeDXR    clientType;
     char                        applicationName[XR_MAX_APPLICATION_NAME_SIZE];
     char                        processName[XR_MAX_SYSTEM_NAME_SIZE]; //!< OS process name (best-effort)
     XrPosef                     pose;        //!< Current window pose in display space
     XrExtent2Df                 sizeMeters;  //!< Current width/height in meters
     XrBool32                    visible;     //!< True if not minimized
     XrBool32                    focused;     //!< True if input is currently routed to this client
-} XrWorkspaceClientInfoEXT;
+} XrWorkspaceClientInfoDXR;
 
 /*!
  * Standard two-call enumerate. First call with capacityInput=0 gets count;
  * second call with allocated array gets details.
  */
-typedef XrResult (XRAPI_PTR *PFN_xrEnumerateWorkspaceClientsEXT)(
+typedef XrResult (XRAPI_PTR *PFN_xrEnumerateWorkspaceClientsDXR)(
     XrSession                   session,
     uint32_t                    clientCapacityInput,
     uint32_t                   *clientCountOutput,
-    XrWorkspaceClientInfoEXT   *clients);
+    XrWorkspaceClientInfoDXR   *clients);
 
 
 // ---- Window pose ----
@@ -162,14 +162,14 @@ typedef XrResult (XRAPI_PTR *PFN_xrEnumerateWorkspaceClientsEXT)(
  * Returns XR_ERROR_VALIDATION_FAILURE if clientId is unknown or not a
  * positionable client (some platform-internal clients may be excluded).
  */
-typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceClientWindowPoseEXT)(
+typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceClientWindowPoseDXR)(
     XrSession           session,
     XrWorkspaceClientId clientId,
     const XrPosef      *pose,
     float               widthMeters,
     float               heightMeters);
 
-typedef XrResult (XRAPI_PTR *PFN_xrGetWorkspaceClientWindowPoseEXT)(
+typedef XrResult (XRAPI_PTR *PFN_xrGetWorkspaceClientWindowPoseDXR)(
     XrSession           session,
     XrWorkspaceClientId clientId,
     XrPosef            *outPose,
@@ -180,7 +180,7 @@ typedef XrResult (XRAPI_PTR *PFN_xrGetWorkspaceClientWindowPoseEXT)(
  * Show or hide a client's window without destroying it. A hidden client keeps
  * running but does not contribute to the composite (minimize semantics).
  */
-typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceClientVisibilityEXT)(
+typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceClientVisibilityDXR)(
     XrSession           session,
     XrWorkspaceClientId clientId,
     XrBool32            visible);
@@ -195,21 +195,21 @@ typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceClientVisibilityEXT)(
  * swapchain — the workspace can position/hide it like any other client.
  *
  * nativeWindow is platform-defined: HWND on Windows passed as uint64_t, NSView*
- * on macOS via chained struct (see XR_EXT_cocoa_window_binding for the chain
+ * on macOS via chained struct (see XR_DXR_cocoa_window_binding for the chain
  * pattern). For now we ship Windows-only and pass HWND as uint64_t directly;
- * macOS support adds a chained XrWorkspaceCocoaCaptureBindingEXT struct.
+ * macOS support adds a chained XrWorkspaceCocoaCaptureBindingDXR struct.
  *
  * The returned clientId enters the same numbering space as OpenXR clients —
  * the workspace controller cannot tell them apart from xrEnumerate's result
- * except via XrWorkspaceClientTypeEXT.
+ * except via XrWorkspaceClientTypeDXR.
  */
-typedef XrResult (XRAPI_PTR *PFN_xrAddWorkspaceCaptureClientEXT)(
+typedef XrResult (XRAPI_PTR *PFN_xrAddWorkspaceCaptureClientDXR)(
     XrSession            session,
     uint64_t             nativeWindow,    // Windows: HWND. macOS: 0 + chained binding.
     const char          *nameOptional,    // user-visible label, may be NULL
     XrWorkspaceClientId *outClientId);
 
-typedef XrResult (XRAPI_PTR *PFN_xrRemoveWorkspaceCaptureClientEXT)(
+typedef XrResult (XRAPI_PTR *PFN_xrRemoveWorkspaceCaptureClientDXR)(
     XrSession           session,
     XrWorkspaceClientId clientId);
 
@@ -241,36 +241,36 @@ typedef XrResult (XRAPI_PTR *PFN_xrWorkspaceHitTestEXT)(
 
 #define XR_WORKSPACE_CAPTURE_FLAG_LEFT_VIEW_BIT_EXT   0x00000001
 #define XR_WORKSPACE_CAPTURE_FLAG_RIGHT_VIEW_BIT_EXT  0x00000002
-#define XR_WORKSPACE_CAPTURE_FLAG_ATLAS_BIT_EXT       0x00000004
+#define XR_WORKSPACE_CAPTURE_FLAG_ATLAS_BIT_DXR       0x00000004
 #define XR_WORKSPACE_CAPTURE_FLAG_INCLUDE_METADATA_BIT_EXT  0x00000008
-typedef XrFlags64 XrWorkspaceCaptureFlagsEXT;
+typedef XrFlags64 XrWorkspaceCaptureFlagsDXR;
 
-typedef struct XrWorkspaceCaptureRequestEXT {
-    XrStructureType                type;        //!< XR_TYPE_WORKSPACE_CAPTURE_REQUEST_EXT
+typedef struct XrWorkspaceCaptureRequestDXR {
+    XrStructureType                type;        //!< XR_TYPE_WORKSPACE_CAPTURE_REQUEST_DXR
     const void* XR_MAY_ALIAS       next;
     char                           pathPrefix[XR_MAX_PATH_LENGTH]; //!< filename prefix without extension
-    XrWorkspaceCaptureFlagsEXT     flags;
-} XrWorkspaceCaptureRequestEXT;
+    XrWorkspaceCaptureFlagsDXR     flags;
+} XrWorkspaceCaptureRequestDXR;
 
-typedef struct XrWorkspaceCaptureResultEXT {
-    XrStructureType                type;        //!< XR_TYPE_WORKSPACE_CAPTURE_RESULT_EXT
+typedef struct XrWorkspaceCaptureResultDXR {
+    XrStructureType                type;        //!< XR_TYPE_WORKSPACE_CAPTURE_RESULT_DXR
     void* XR_MAY_ALIAS             next;
     uint32_t                       viewsWritten;
     uint32_t                       atlasWidthPixels;
     uint32_t                       atlasHeightPixels;
     char                           atlasPath[XR_MAX_PATH_LENGTH];
     char                           metadataJsonPath[XR_MAX_PATH_LENGTH]; //!< empty if not requested
-} XrWorkspaceCaptureResultEXT;
+} XrWorkspaceCaptureResultDXR;
 
 /*!
  * Capture the current pre-weave atlas to disk. The runtime writes one or more
  * PNGs and an optional JSON sidecar with per-client window bounding boxes.
  * Synchronous within the workspace render thread.
  */
-typedef XrResult (XRAPI_PTR *PFN_xrCaptureWorkspaceFrameEXT)(
+typedef XrResult (XRAPI_PTR *PFN_xrCaptureWorkspaceFrameDXR)(
     XrSession                            session,
-    const XrWorkspaceCaptureRequestEXT  *request,
-    XrWorkspaceCaptureResultEXT         *outResult);
+    const XrWorkspaceCaptureRequestDXR  *request,
+    XrWorkspaceCaptureResultDXR         *outResult);
 
 
 // ---- Events ----
@@ -280,7 +280,7 @@ typedef struct XrEventDataWorkspaceClientConnectedEXT {
     const void* XR_MAY_ALIAS    next;
     XrSession                   session;    //!< the workspace session
     XrWorkspaceClientId         clientId;
-    XrWorkspaceClientTypeEXT    clientType;
+    XrWorkspaceClientTypeDXR    clientType;
 } XrEventDataWorkspaceClientConnectedEXT;
 
 typedef struct XrEventDataWorkspaceClientDisconnectedEXT {
@@ -292,32 +292,32 @@ typedef struct XrEventDataWorkspaceClientDisconnectedEXT {
 
 
 #ifndef XR_NO_PROTOTYPES
-XRAPI_ATTR XrResult XRAPI_CALL xrActivateSpatialWorkspaceEXT(XrSession);
-XRAPI_ATTR XrResult XRAPI_CALL xrDeactivateSpatialWorkspaceEXT(XrSession);
-XRAPI_ATTR XrResult XRAPI_CALL xrGetSpatialWorkspaceStateEXT(XrSession, XrBool32*);
-XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateWorkspaceClientsEXT(
-    XrSession, uint32_t, uint32_t*, XrWorkspaceClientInfoEXT*);
-XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceClientWindowPoseEXT(
+XRAPI_ATTR XrResult XRAPI_CALL xrActivateSpatialWorkspaceDXR(XrSession);
+XRAPI_ATTR XrResult XRAPI_CALL xrDeactivateSpatialWorkspaceDXR(XrSession);
+XRAPI_ATTR XrResult XRAPI_CALL xrGetSpatialWorkspaceStateDXR(XrSession, XrBool32*);
+XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateWorkspaceClientsDXR(
+    XrSession, uint32_t, uint32_t*, XrWorkspaceClientInfoDXR*);
+XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceClientWindowPoseDXR(
     XrSession, XrWorkspaceClientId, const XrPosef*, float, float);
-XRAPI_ATTR XrResult XRAPI_CALL xrGetWorkspaceClientWindowPoseEXT(
+XRAPI_ATTR XrResult XRAPI_CALL xrGetWorkspaceClientWindowPoseDXR(
     XrSession, XrWorkspaceClientId, XrPosef*, float*, float*);
-XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceClientVisibilityEXT(
+XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceClientVisibilityDXR(
     XrSession, XrWorkspaceClientId, XrBool32);
-XRAPI_ATTR XrResult XRAPI_CALL xrAddWorkspaceCaptureClientEXT(
+XRAPI_ATTR XrResult XRAPI_CALL xrAddWorkspaceCaptureClientDXR(
     XrSession, uint64_t, const char*, XrWorkspaceClientId*);
-XRAPI_ATTR XrResult XRAPI_CALL xrRemoveWorkspaceCaptureClientEXT(
+XRAPI_ATTR XrResult XRAPI_CALL xrRemoveWorkspaceCaptureClientDXR(
     XrSession, XrWorkspaceClientId);
-XRAPI_ATTR XrResult XRAPI_CALL xrWorkspaceHitTestEXT(
+XRAPI_ATTR XrResult XRAPI_CALL xrWorkspaceHitTestDXR(
     XrSession, int32_t, int32_t, XrWorkspaceClientId*, XrVector2f*);
-XRAPI_ATTR XrResult XRAPI_CALL xrCaptureWorkspaceFrameEXT(
-    XrSession, const XrWorkspaceCaptureRequestEXT*, XrWorkspaceCaptureResultEXT*);
+XRAPI_ATTR XrResult XRAPI_CALL xrCaptureWorkspaceFrameDXR(
+    XrSession, const XrWorkspaceCaptureRequestDXR*, XrWorkspaceCaptureResultDXR*);
 #endif
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // XR_EXT_SPATIAL_WORKSPACE_H
+#endif // XR_DXR_SPATIAL_WORKSPACE_H
 ```
 
 ## Header sketch — `XR_EXT_app_launcher.h`
@@ -329,7 +329,7 @@ XRAPI_ATTR XrResult XRAPI_CALL xrCaptureWorkspaceFrameEXT(
 #define XR_EXT_APP_LAUNCHER_H 1
 
 #include <openxr/openxr.h>
-#include <openxr/XR_EXT_spatial_workspace.h>  // for XrWorkspaceClientId — not strictly required, but launcher state is workspace-scoped
+#include <openxr/XR_DXR_spatial_workspace.h>  // for XrWorkspaceClientId — not strictly required, but launcher state is workspace-scoped
 
 #ifdef __cplusplus
 extern "C" {
@@ -339,8 +339,8 @@ extern "C" {
 #define XR_EXT_app_launcher_SPEC_VERSION 1
 #define XR_EXT_APP_LAUNCHER_EXTENSION_NAME "XR_EXT_app_launcher"
 
-#define XR_TYPE_LAUNCHER_APP_INFO_EXT       ((XrStructureType)1000999110)
-#define XR_TYPE_EVENT_DATA_LAUNCHER_CLICK_EXT ((XrStructureType)1000999111)
+#define XR_TYPE_LAUNCHER_APP_INFO_EXT       ((XrStructureType)1004999110)
+#define XR_TYPE_EVENT_DATA_LAUNCHER_CLICK_EXT ((XrStructureType)1004999111)
 
 #define XR_LAUNCHER_MAX_APPS_EXT 64
 #define XR_LAUNCHER_INVALID_TILE_INDEX_EXT ((int32_t)-1)
@@ -442,17 +442,17 @@ The Phase 1 boundary rename produced these IPC RPCs. Phase 2 wraps them in exten
 
 | Phase 1 IPC RPC | Extension function | Notes |
 |---|---|---|
-| `workspace_activate` | `xrActivateSpatialWorkspaceEXT` | Adds caller-authorization check |
-| `workspace_deactivate` | `xrDeactivateSpatialWorkspaceEXT` | |
-| `workspace_get_state` | `xrGetSpatialWorkspaceStateEXT` | |
-| *(new)* | `xrEnumerateWorkspaceClientsEXT` | Phase 2 unifies what's currently fragmented across `system_get_clients` + per-client info pulls |
-| `workspace_set_window_pose` | `xrSetWorkspaceClientWindowPoseEXT` | `client_id` → `clientId` |
-| `workspace_get_window_pose` | `xrGetWorkspaceClientWindowPoseEXT` | |
-| `workspace_set_window_visibility` | `xrSetWorkspaceClientVisibilityEXT` | |
-| `workspace_add_capture_client` | `xrAddWorkspaceCaptureClientEXT` | |
-| `workspace_remove_capture_client` | `xrRemoveWorkspaceCaptureClientEXT` | |
-| `workspace_capture_frame` | `xrCaptureWorkspaceFrameEXT` | Wraps the flag bitfield as `XrWorkspaceCaptureFlagsEXT` |
-| *(new)* | `xrWorkspaceHitTestEXT` | Promotes today's internal `workspace_raycast_hit_test` (still C++ inside the compositor) to a public extension; lets the workspace controller use the runtime's geometry instead of duplicating it |
+| `workspace_activate` | `xrActivateSpatialWorkspaceDXR` | Adds caller-authorization check |
+| `workspace_deactivate` | `xrDeactivateSpatialWorkspaceDXR` | |
+| `workspace_get_state` | `xrGetSpatialWorkspaceStateDXR` | |
+| *(new)* | `xrEnumerateWorkspaceClientsDXR` | Phase 2 unifies what's currently fragmented across `system_get_clients` + per-client info pulls |
+| `workspace_set_window_pose` | `xrSetWorkspaceClientWindowPoseDXR` | `client_id` → `clientId` |
+| `workspace_get_window_pose` | `xrGetWorkspaceClientWindowPoseDXR` | |
+| `workspace_set_window_visibility` | `xrSetWorkspaceClientVisibilityDXR` | |
+| `workspace_add_capture_client` | `xrAddWorkspaceCaptureClientDXR` | |
+| `workspace_remove_capture_client` | `xrRemoveWorkspaceCaptureClientDXR` | |
+| `workspace_capture_frame` | `xrCaptureWorkspaceFrameDXR` | Wraps the flag bitfield as `XrWorkspaceCaptureFlagsDXR` |
+| *(new)* | `xrWorkspaceHitTestDXR` | Promotes today's internal `workspace_raycast_hit_test` (still C++ inside the compositor) to a public extension; lets the workspace controller use the runtime's geometry instead of duplicating it |
 | `launcher_set_visible` | `xrSetLauncherVisibleEXT` | |
 | `launcher_clear_apps` | `xrClearLauncherAppsEXT` | |
 | `launcher_add_app` | `xrAddLauncherAppEXT` | `ipc_launcher_app` → `XrLauncherAppInfoEXT` |
@@ -467,7 +467,7 @@ These survive in the runtime under non-extension-exposed neutral C names — the
 
 - Per-client virtual-window-pose → atlas-region computation
 - Deferred HWND resize on next frame after a pose change
-- Spatial cursor → display-plane intersection math (the *implementation* of hit-test; `xrWorkspaceHitTestEXT` is the entry point)
+- Spatial cursor → display-plane intersection math (the *implementation* of hit-test; `xrWorkspaceHitTestDXR` is the entry point)
 - The 2D Windows.Graphics.Capture pumping thread
 - The capture client's offscreen render pass
 - Multi-compositor scheduling
@@ -483,10 +483,10 @@ These are all currently in `comp_d3d11_service.cpp`. They keep their internal `s
 Counterpart list — these stop being runtime concerns once Phase 2 lands:
 
 - Launcher tile registry storage (today: `comp_d3d11_service.cpp` `registered_apps`). Becomes: workspace process owns the array, pushes via `xrAddLauncherAppEXT` whenever its registry changes.
-- Layout-preset semantics (`grid` / `immersive` / `carousel`). Becomes: workspace process computes per-window poses for a chosen preset and pushes them via `xrSetWorkspaceClientWindowPoseEXT` for each client.
+- Layout-preset semantics (`grid` / `immersive` / `carousel`). Becomes: workspace process computes per-window poses for a chosen preset and pushes them via `xrSetWorkspaceClientWindowPoseDXR` for each client.
 - Right-click context menu, double-click maximize/restore, edge-drag resize, title-bar drag. Becomes: workspace process receives input events (or hit-test results), interprets them, and pushes the resulting pose changes.
 - Title-bar chrome rendering (close/minimize buttons, app name). Becomes: workspace process renders chrome into its own client window which the runtime composites alongside the app window via the workspace pose API. The runtime stops drawing chrome.
-- Eye-tracking-mode focus policy (when to switch MANAGED ↔ MANUAL based on which client is focused). Becomes: workspace process tracks focus, the runtime exposes mode-set per session. The integration is via `XR_EXT_display_info`'s eye-tracking-mode functions, called by the workspace on the focused client's behalf — design TBD in the migration that touches it.
+- Eye-tracking-mode focus policy (when to switch MANAGED ↔ MANUAL based on which client is focused). Becomes: workspace process tracks focus, the runtime exposes mode-set per session. The integration is via `XR_DXR_display_info`'s eye-tracking-mode functions, called by the workspace on the focused client's behalf — design TBD in the migration that touches it.
 - "Empty workspace" ESC-handling carve-out, `pending_shell_reentry` state, deactivate-and-restore-2D-windows lifecycle. Becomes: deleted. The runtime's "no clients connected → idle composite path" is generic.
 
 ## Lifecycle and threading
@@ -515,14 +515,14 @@ The shell repo, once severed (Phase 3), pins a minimum SPEC_VERSION in its CMake
    - Promote to event (`XrEventDataLauncherClickEXT` queued on `xrPollEvent`). More consistent with OpenXR conventions and naturally handles multiple-click-before-poll.
    Recommend: promote to event in SPEC_VERSION 1. The poll-and-clear shape was shaped by the IPC's bidirectional pipe constraint, not by user-facing requirements.
 
-3. **Should `xrEnumerateWorkspaceClientsEXT` be in the workspace extension or its own?** A vertical that uses workspace primitives but doesn't want enumeration is unusual; keep it in `XR_EXT_spatial_workspace`.
+3. **Should `xrEnumerateWorkspaceClientsDXR` be in the workspace extension or its own?** A vertical that uses workspace primitives but doesn't want enumeration is unusual; keep it in `XR_DXR_spatial_workspace`.
 
 4. **Capture API surface.** The flags-and-paths shape mirrors the existing IPC. An alternative is exposing a `XrSwapchain`-shaped capture target the workspace can read directly; deferred — file-based capture covers the current MCP and ad-hoc-screenshot use cases.
 
-5. **macOS native window for capture clients.** Phase 2's first cut is Windows-only because the current capture pipeline is Windows-only. When macOS lands, `xrAddWorkspaceCaptureClientEXT` grows a chained `XrWorkspaceCocoaCaptureBindingEXT` struct (NSView*) the same way `XR_EXT_cocoa_window_binding` chains.
+5. **macOS native window for capture clients.** Phase 2's first cut is Windows-only because the current capture pipeline is Windows-only. When macOS lands, `xrAddWorkspaceCaptureClientDXR` grows a chained `XrWorkspaceCocoaCaptureBindingDXR` struct (NSView*) the same way `XR_DXR_cocoa_window_binding` chains.
 
 6. **Focus / input routing.** Not yet in the extension. The current implementation has the runtime forward mouse/keyboard from the workspace window to the focused client's HWND. In Phase 2, the workspace likely needs to:
-   - Tell the runtime which client is focused (`xrSetWorkspaceFocusedClientEXT`?).
+   - Tell the runtime which client is focused (`xrSetWorkspaceFocusedClientDXR`?).
    - Get raw input events from the runtime (currently consumed by the runtime's window proc).
    This is significant policy migration work — the workspace currently has no choice over input routing; the runtime makes the call. Design deferred to its own Phase 2 sub-step.
 
@@ -532,10 +532,10 @@ The shell repo, once severed (Phase 3), pins a minimum SPEC_VERSION in its CMake
 
 Re-reading the plan doc's recommended Phase 2 order against the header sketch:
 
-1. **Layout presets** — pure policy, no new extension surface needed (workspace just calls `xrSetWorkspaceClientWindowPoseEXT` per client). Easiest first migration.
+1. **Layout presets** — pure policy, no new extension surface needed (workspace just calls `xrSetWorkspaceClientWindowPoseDXR` per client). Easiest first migration.
 2. **Launcher tile registry + click polling** — exercises `XR_EXT_app_launcher` end-to-end. Small and well-bounded; good second step to validate the launcher extension's shape.
-3. **Title-bar chrome rendering** — the most invasive. Requires the workspace controller to render chrome as its own client window, positioned via `xrSetWorkspaceClientWindowPoseEXT`. Probably the migration that exposes the most surface gaps in the spec.
-4. **Capture client lifecycle** — `xrAddWorkspaceCaptureClientEXT` / `xrRemoveWorkspaceCaptureClientEXT`; mostly already neutral, light cleanup.
+3. **Title-bar chrome rendering** — the most invasive. Requires the workspace controller to render chrome as its own client window, positioned via `xrSetWorkspaceClientWindowPoseDXR`. Probably the migration that exposes the most surface gaps in the spec.
+4. **Capture client lifecycle** — `xrAddWorkspaceCaptureClientDXR` / `xrRemoveWorkspaceCaptureClientDXR`; mostly already neutral, light cleanup.
 5. **Focus / input routing** — open question above; design before migrating.
 6. **ESC / empty-workspace cleanup** — dies naturally as the rest moves; no explicit migration needed.
 

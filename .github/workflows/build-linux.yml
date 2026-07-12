@@ -96,7 +96,7 @@ jobs:
         # --apps also builds the OpenXR loader (from source) + the test apps:
         # cube_hosted_legacy_vk_linux (Phase 1b hosted bring-up vehicle) and
         # cube_handle_vk_linux (Phase 3 handle class — app-owned X11 window via
-        # XR_EXT_xlib_window_binding). CI has no display, so the apps aren't
+        # XR_DXR_xlib_window_binding). CI has no display, so the apps aren't
         # run here; compile+link green is the gate.
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./scripts/build_linux.sh --apps

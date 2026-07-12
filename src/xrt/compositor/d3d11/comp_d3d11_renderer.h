@@ -30,7 +30,7 @@ extern "C" {
  * submissions are clamped to it (always-stereo apps legitimately submit
  * identical views in a mono mode; zone layers carry zone-sized imageRects).
  * The hardware weave-state never clamps content: a divergence is expressed
- * via the hardware-state override (xrRequestDisplayModeEXT), under which this
+ * via the hardware-state override (xrRequestDisplayModeDXR), under which this
  * layout keeps following the mode and the DP keeps weaving.
  */
 struct comp_d3d11_eff_layout

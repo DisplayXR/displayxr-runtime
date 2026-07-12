@@ -265,7 +265,7 @@ static const char *FS_MASKED_COMPOSITE =
  *
  */
 
-// #439 Phase 3 — authored zone mask (XR_EXT_local_3d_zone), GL R8 texture.
+// #439 Phase 3 — authored zone mask (XR_DXR_local_3d_zone), GL R8 texture.
 // In-process handle apps author it on the same GL context the composite
 // samples from, frame-serialized, so a single texture (no staged copy) is
 // coherent. Tier-3 acquire_rt is unimplemented on GL (chroma-key-only DP).
@@ -399,21 +399,21 @@ struct comp_gl_compositor
 	bool legacy_app_tile_scaling;      //!< True if app is legacy (gates 1/2/3 key mode selection)
 
 	// --- #439 Phase 3 — Local2D / zone-mask consumer (full net-new GL leg) ---
-	//! Active authored zone mask (XR_EXT_local_3d_zone). Set by zone_mask_submit
+	//! Active authored zone mask (XR_DXR_local_3d_zone). Set by zone_mask_submit
 	//! (sticky, last-submit-wins), cleared on that mask's destroy. NOT owned.
 	struct comp_gl_zone_mask *active_zone_mask;
 	//! True if this frame's accumulator carried any XRT_LAYER_LOCAL_2D layer
 	//! (set once at the top of layer_commit). Drives the effective-canvas
 	//! supersede + the composite's have_local_2d branch.
 	bool local_2d_last_frame;
-	//! XR_EXT_display_zones (ADR-027): true when the current frame's
+	//! XR_DXR_display_zones (ADR-027): true when the current frame's
 	//! accumulator carries XRT_LAYER_ZONE_3D layers (a "zones frame"). In a
 	//! zones frame the canvas output rect, the sticky submitted mask, and
 	//! the implicit-mask-from-Local2D rule are all inert; the effective
 	//! canvas is the full client window; the wish drives the post-weave
 	//! visual lerp. Set in the same per-frame scan as local_2d_last_frame.
 	bool zones_frame;
-	//! Explicit per-frame wish (XrDisplayZonesFrameEndInfoEXT.wishMask) set
+	//! Explicit per-frame wish (XrDisplayZonesFrameEndInfoDXR.wishMask) set
 	//! via comp_gl_compositor_zones_set_frame_wish before commit; NULL =
 	//! auto-derive from the zone rects. Not owned — zone_mask_destroy
 	//! clears any dangling reference.
@@ -1465,7 +1465,7 @@ gl_compositor_layer_window_space(struct xrt_compositor *xc,
 }
 
 /*!
- * Local-2D layer (XR_EXT_local_3d_zone v3, #439 Phase 3) — accumulate only;
+ * Local-2D layer (XR_DXR_local_3d_zone v3, #439 Phase 3) — accumulate only;
  * the GL consumer is a Windows follow-up leg
  * (docs/roadmap/unified-2d-3d-phase3-impl.md §7).
  */
@@ -1481,7 +1481,7 @@ gl_compositor_layer_local_2d(struct xrt_compositor *xc,
 }
 
 /*!
- * 3D display zone layer (XR_EXT_display_zones, ADR-027) — multi-swapchain
+ * 3D display zone layer (XR_DXR_display_zones, ADR-027) — multi-swapchain
  * accumulate like projection; consumed by the zones-frame branch of
  * layer_commit (zone rect scaled into the window-spanning atlas tile).
  */
@@ -1986,7 +1986,7 @@ gl_update_implicit_mask(struct comp_gl_compositor *c,
 	return c->implicit_mask_tex;
 }
 
-// XR_EXT_display_zones (ADR-027) — (re)rasterize the AUTO wish: union of the
+// XR_DXR_display_zones (ADR-027) — (re)rasterize the AUTO wish: union of the
 // frame's zone rects with an INWARD stepped ring feather. M=0 outside the
 // zones; inside each zone M ramps 0->1 over the first 16 px from the edge
 // (ascending-value insets — max semantics: overlapping feathers can never
@@ -2364,7 +2364,7 @@ static bool
 gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint target_fbo, uint32_t output_w,
                       uint32_t output_h)
 {
-	// XR_EXT_display_zones: a zones frame ALWAYS runs the composite (the
+	// XR_DXR_display_zones: a zones frame ALWAYS runs the composite (the
 	// feathered wish edge lerps the weave toward the 2D flatten even with
 	// zero Local2D layers); the sticky mask + implicit-mask rules are inert.
 	struct comp_gl_zone_mask *mask = c->active_zone_mask;
@@ -2404,7 +2404,7 @@ gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint tar
 		c->composite_scratch_h = output_h;
 	}
 
-	// Resolve the mask texture. Zones frame (XR_EXT_display_zones): the
+	// Resolve the mask texture. Zones frame (XR_DXR_display_zones): the
 	// WISH — the explicit frame wish (same-context GL authoring texture,
 	// referenced-at-frame-end = consume current authored state, no submit
 	// required — mirroring zone_mask_submit's no-staging contract) or the
@@ -2530,7 +2530,7 @@ gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint tar
 	// #491: the implicit (auto) Local2D mask composites the 2D over the weave by
 	// its own premultiplied alpha (translucent 2D reveals the 3D scene). The
 	// explicit authored mask keeps the hard M-lerp.
-	// XR_EXT_display_zones: zones frames are ALWAYS the hard M-lerp
+	// XR_DXR_display_zones: zones frames are ALWAYS the hard M-lerp
 	// (final = M·weave + (1−M)·flatten(2D-over)) — composition follows zone
 	// geometry + the wish, never the #491 alpha-over rule.
 	const bool alpha_over = !zones_frame && have_local_2d && !have_explicit;
@@ -2745,7 +2745,7 @@ gl_compositor_dispatch_capture(struct comp_gl_compositor *c, uint32_t mode_filte
 // it (always-stereo apps submit identical views in a mono mode; zone layers
 // carry zone-sized imageRects). The hardware weave-state never clamps
 // content — divergence is the hardware-state override
-// (xrRequestDisplayModeEXT), under which this layout keeps following the
+// (xrRequestDisplayModeDXR), under which this layout keeps following the
 // mode and the DP keeps weaving.
 static void
 gl_compute_effective_layout(struct comp_gl_compositor *c)
@@ -2808,7 +2808,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 	// #439 Phase 3 — detect Local2D layers once per frame; drives the
 	// post-weave masked composite (the GL leg's consumer path).
-	// XR_EXT_display_zones: the zones-frame flag is resolved in the same
+	// XR_DXR_display_zones: the zones-frame flag is resolved in the same
 	// scan (one coherent per-frame decision).
 	c->local_2d_last_frame = false;
 	c->zones_frame = false;
@@ -2876,7 +2876,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	}
 #endif
 
-	// XR_EXT_display_zones hardware leg (P4). Zone-capable DP: the per-frame
+	// XR_DXR_display_zones hardware leg (P4). Zone-capable DP: the per-frame
 	// wish publish at the end of this commit drives the per-region switch —
 	// skip the global fallback. Legacy DP (no zone slots): tier-1 fallback —
 	// "any zone active => request 3D" once on the rising edge, no forced 2D
@@ -3018,14 +3018,14 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	// apps keep the alpha=1 clear (unchanged). The per-eye blit below must be a
 	// REPLACE (blend off) so the app's alpha is written verbatim rather than
 	// blended over this clear.
-	// XR_EXT_display_zones (ADR-027): a zones frame composes N placed zone
+	// XR_DXR_display_zones (ADR-027): a zones frame composes N placed zone
 	// layers into the window-spanning atlas — the unzoned area must weave to
 	// nothing (transparent) so the feathered wish edge blends toward the
 	// desktop.
 	glClearColor(0.0f, 0.0f, 0.0f, (c->transparent_background || c->zones_frame) ? 0.0f : 1.0f);
 	glClear(GL_COLOR_BUFFER_BIT);
 
-	// XR_EXT_display_zones: zone rects are client-window px and the tile
+	// XR_DXR_display_zones: zone rects are client-window px and the tile
 	// spans the full window in zones frames, so the zone scale target is
 	// the window client area (content dims as the headless fallback).
 	uint32_t zones_target_w = 0;
@@ -3066,7 +3066,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
 
-		// XR_EXT_display_zones: zone layers blit through the same pass at
+		// XR_DXR_display_zones: zone layers blit through the same pass at
 		// a sub-tile viewport (alpha-over in layer-list order).
 		const bool is_zone = layer->data.type == XRT_LAYER_ZONE_3D;
 		if (layer->data.type != XRT_LAYER_PROJECTION &&
@@ -3116,7 +3116,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				tbh = c->eff_tile_h;
 			}
 			if (is_zone) {
-				// XR_EXT_display_zones: scale the zone rect (client-
+				// XR_DXR_display_zones: scale the zone rect (client-
 				// window px, top-left origin) into the tile box — in
 				// zones frames the tile spans the full window, so
 				// scale = tile/window. The atlas is a GL bottom-left
@@ -3190,7 +3190,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			// Draw fullscreen quad (3 vertices, generated in vertex shader)
 			glDrawArrays(GL_TRIANGLES, 0, 3);
 
-			// XR_EXT_display_zones: restore the REPLACE blit state for
+			// XR_DXR_display_zones: restore the REPLACE blit state for
 			// the next (projection) draw.
 			if (is_zone) {
 				glDisable(GL_BLEND);
@@ -3349,7 +3349,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			uint32_t dp_w = c->shared_width;
 			uint32_t dp_h = c->shared_height;
 			if (c->zones_frame) {
-				// XR_EXT_display_zones: the zone PLACEMENT (layer_commit)
+				// XR_DXR_display_zones: the zone PLACEMENT (layer_commit)
 				// scales zone rects into the atlas tile by tile/window, so
 				// the weave OUTPUT must be the window client dims too — NOT
 				// the full shared surface. Mirrors the VK leg (dp_target =
@@ -3432,7 +3432,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			uint32_t dp_w = c->iosurface_width;
 			uint32_t dp_h = c->iosurface_height;
 			if (c->zones_frame) {
-				// XR_EXT_display_zones: the zone PLACEMENT (layer_commit)
+				// XR_DXR_display_zones: the zone PLACEMENT (layer_commit)
 				// scales zone rects into the atlas tile by tile/window, so
 				// the weave OUTPUT must be the window client dims too — NOT
 				// the full IOSurface. Parity with the Windows shared path.
@@ -4043,7 +4043,7 @@ comp_gl_compositor_set_sys_info(struct xrt_compositor *xc, const struct xrt_syst
 
 /*
  *
- * #439 Phase 3 — XR_EXT_local_3d_zone authored-mask API (GL leg).
+ * #439 Phase 3 — XR_DXR_local_3d_zone authored-mask API (GL leg).
  *
  * GL R8 mask textures authored in-process on the compositor's GL context,
  * frame-serialized with the composite. Tier 1 (set_whole), Tier 2 (set_rects);
@@ -4243,7 +4243,7 @@ comp_gl_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_ptr)
 	if (c->active_zone_mask == m) {
 		c->active_zone_mask = NULL;
 	}
-	// XR_EXT_display_zones: never leave a dangling frame-wish reference.
+	// XR_DXR_display_zones: never leave a dangling frame-wish reference.
 	if (c->frame_wish == m) {
 		c->frame_wish = NULL;
 	}
@@ -4269,7 +4269,7 @@ comp_gl_compositor_zones_set_frame_wish(struct xrt_compositor *xc, void *mask)
 {
 	struct comp_gl_compositor *c = gl_comp(xc);
 
-	// Per-frame reference (XR_EXT_display_zones): oxr sets this on every
+	// Per-frame reference (XR_DXR_display_zones): oxr sets this on every
 	// zones frame before layer_commit, NULL meaning auto-derive. Consumed
 	// by the commit's composite; harmlessly stale on zero-zone frames (the
 	// zones branch never reads it there).

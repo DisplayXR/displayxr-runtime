@@ -432,89 +432,89 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrStructureTypeToString2KHR, KHR_extended_struct_name_lengths);
 #endif // OXR_HAVE_KHR_extended_struct_name_lengths
 
-#ifdef OXR_HAVE_EXT_display_info
-	ENTRY_IF_EXT(xrRequestDisplayModeEXT, EXT_display_info);
-	ENTRY_IF_EXT(xrRequestEyeTrackingModeEXT, EXT_display_info);
-	ENTRY_IF_EXT(xrRequestDisplayRenderingModeEXT, EXT_display_info);
-	ENTRY_IF_EXT(xrEnumerateDisplayRenderingModesEXT, EXT_display_info);
+#ifdef OXR_HAVE_DXR_display_info
+	ENTRY_IF_EXT(xrRequestDisplayModeDXR, DXR_display_info);
+	ENTRY_IF_EXT(xrRequestEyeTrackingModeDXR, DXR_display_info);
+	ENTRY_IF_EXT(xrRequestDisplayRenderingModeDXR, DXR_display_info);
+	ENTRY_IF_EXT(xrEnumerateDisplayRenderingModesDXR, DXR_display_info);
 #endif
 
-#ifdef OXR_HAVE_EXT_view_rig
-	ENTRY_IF_EXT(xrSetWorkspaceViewRigEXT, EXT_view_rig);
+#ifdef OXR_HAVE_DXR_view_rig
+	ENTRY_IF_EXT(xrSetWorkspaceViewRigDXR, DXR_view_rig);
 #endif
 
-#ifdef OXR_HAVE_EXT_spatial_workspace
-	ENTRY_IF_EXT(xrActivateSpatialWorkspaceEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrDeactivateSpatialWorkspaceEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrGetSpatialWorkspaceStateEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrAddWorkspaceCaptureClientEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrRemoveWorkspaceCaptureClientEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrSetWorkspaceClientWindowPoseEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrGetWorkspaceClientWindowPoseEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrSetWorkspaceClientVisibilityEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrSetWorkspaceFocusedClientEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrSetWorkspaceReservedKeysEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrGetWorkspaceFocusedClientEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrSetWorkspaceClientFrameRateCapEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrEnumerateWorkspaceInputEventsEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrEnableWorkspacePointerCaptureEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrDisableWorkspacePointerCaptureEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrCaptureWorkspaceFrameEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrEnumerateWorkspaceClientsEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrGetWorkspaceClientInfoEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrRequestWorkspaceClientExitEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrRequestWorkspaceClientFullscreenEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrCreateWorkspaceClientChromeSwapchainEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrDestroyWorkspaceClientChromeSwapchainEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrSetWorkspaceClientChromeLayoutEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrUpdateWorkspaceClientChromeLayerPoseEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrCreateWorkspaceCursorSwapchainEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrSetWorkspaceCursorEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrSetWorkspaceCursorDepthEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrCreateWorkspaceOverlaySwapchainEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrSetWorkspaceOverlayEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrAcquireWorkspaceWakeupEventEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrSetWorkspaceClientStyleEXT, EXT_spatial_workspace);
-	ENTRY_IF_EXT(xrSetWorkspaceInputGrabEXT, EXT_spatial_workspace);
+#ifdef OXR_HAVE_DXR_spatial_workspace
+	ENTRY_IF_EXT(xrActivateSpatialWorkspaceDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrDeactivateSpatialWorkspaceDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrGetSpatialWorkspaceStateDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrAddWorkspaceCaptureClientDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrRemoveWorkspaceCaptureClientDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrSetWorkspaceClientWindowPoseDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrGetWorkspaceClientWindowPoseDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrSetWorkspaceClientVisibilityDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrSetWorkspaceFocusedClientDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrSetWorkspaceReservedKeysDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrGetWorkspaceFocusedClientDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrSetWorkspaceClientFrameRateCapDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrEnumerateWorkspaceInputEventsDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrEnableWorkspacePointerCaptureDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrDisableWorkspacePointerCaptureDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrCaptureWorkspaceFrameDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrEnumerateWorkspaceClientsDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrGetWorkspaceClientInfoDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrRequestWorkspaceClientExitDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrRequestWorkspaceClientFullscreenDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrCreateWorkspaceClientChromeSwapchainDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrDestroyWorkspaceClientChromeSwapchainDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrSetWorkspaceClientChromeLayoutDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrUpdateWorkspaceClientChromeLayerPoseDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrCreateWorkspaceCursorSwapchainDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrSetWorkspaceCursorDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrSetWorkspaceCursorDepthDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrCreateWorkspaceOverlaySwapchainDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrSetWorkspaceOverlayDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrAcquireWorkspaceWakeupEventDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrSetWorkspaceClientStyleDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrSetWorkspaceInputGrabDXR, DXR_spatial_workspace);
 #endif
 
-#ifdef OXR_HAVE_EXT_atlas_capture
-	ENTRY_IF_EXT(xrCaptureAtlasEXT, EXT_atlas_capture);
+#ifdef OXR_HAVE_DXR_atlas_capture
+	ENTRY_IF_EXT(xrCaptureAtlasDXR, DXR_atlas_capture);
 #endif
 
-#ifdef OXR_HAVE_EXT_local_3d_zone
-	ENTRY_IF_EXT(xrGetLocal3DZoneCapabilitiesEXT, EXT_local_3d_zone);
-	ENTRY_IF_EXT(xrCreateLocal3DZoneMaskEXT, EXT_local_3d_zone);
-	ENTRY_IF_EXT(xrSetLocal3DZoneWholeWindowEXT, EXT_local_3d_zone);
-	ENTRY_IF_EXT(xrSetLocal3DZoneFromRectsEXT, EXT_local_3d_zone);
-	ENTRY_IF_EXT(xrAcquireLocal3DZoneRenderTargetEXT, EXT_local_3d_zone);
-	ENTRY_IF_EXT(xrSubmitLocal3DZoneEXT, EXT_local_3d_zone);
-	ENTRY_IF_EXT(xrDestroyLocal3DZoneMaskEXT, EXT_local_3d_zone);
+#ifdef OXR_HAVE_DXR_local_3d_zone
+	ENTRY_IF_EXT(xrGetLocal3DZoneCapabilitiesDXR, DXR_local_3d_zone);
+	ENTRY_IF_EXT(xrCreateLocal3DZoneMaskDXR, DXR_local_3d_zone);
+	ENTRY_IF_EXT(xrSetLocal3DZoneWholeWindowDXR, DXR_local_3d_zone);
+	ENTRY_IF_EXT(xrSetLocal3DZoneFromRectsDXR, DXR_local_3d_zone);
+	ENTRY_IF_EXT(xrAcquireLocal3DZoneRenderTargetDXR, DXR_local_3d_zone);
+	ENTRY_IF_EXT(xrSubmitLocal3DZoneDXR, DXR_local_3d_zone);
+	ENTRY_IF_EXT(xrDestroyLocal3DZoneMaskDXR, DXR_local_3d_zone);
 #endif
 
-#ifdef OXR_HAVE_EXT_display_zones
-	ENTRY_IF_EXT(xrGetDisplayZoneCapabilitiesEXT, EXT_display_zones);
-	ENTRY_IF_EXT(xrGetDisplayZoneRecommendedViewSizeEXT, EXT_display_zones);
+#ifdef OXR_HAVE_DXR_display_zones
+	ENTRY_IF_EXT(xrGetDisplayZoneCapabilitiesDXR, DXR_display_zones);
+	ENTRY_IF_EXT(xrGetDisplayZoneRecommendedViewSizeDXR, DXR_display_zones);
 #endif
 
-#ifdef OXR_HAVE_EXT_weave
-	ENTRY_IF_EXT(xrWeaveBindWindowEXT, EXT_weave);
-	ENTRY_IF_EXT(xrWeaveSubmitEXT, EXT_weave);
-	ENTRY_IF_EXT(xrWeaveSnapWindowRectEXT, EXT_weave);
+#ifdef OXR_HAVE_DXR_weave
+	ENTRY_IF_EXT(xrWeaveBindWindowDXR, DXR_weave);
+	ENTRY_IF_EXT(xrWeaveSubmitDXR, DXR_weave);
+	ENTRY_IF_EXT(xrWeaveSnapWindowRectDXR, DXR_weave);
 #endif
 
-#ifdef OXR_HAVE_EXT_workspace_file_dialog
-	ENTRY_IF_EXT(xrRequestFilePickerEXT, EXT_workspace_file_dialog);
-	ENTRY_IF_EXT(xrGetFilePickerRequestEXT, EXT_workspace_file_dialog);
-	ENTRY_IF_EXT(xrCompleteFilePickerEXT, EXT_workspace_file_dialog);
+#ifdef OXR_HAVE_DXR_workspace_file_dialog
+	ENTRY_IF_EXT(xrRequestFilePickerDXR, DXR_workspace_file_dialog);
+	ENTRY_IF_EXT(xrGetFilePickerRequestDXR, DXR_workspace_file_dialog);
+	ENTRY_IF_EXT(xrCompleteFilePickerDXR, DXR_workspace_file_dialog);
 #endif
 
-#ifdef OXR_HAVE_EXT_mcp_tools
-	ENTRY_IF_EXT(xrSetMCPAppInfoEXT, EXT_mcp_tools);
-	ENTRY_IF_EXT(xrRegisterMCPToolEXT, EXT_mcp_tools);
-	ENTRY_IF_EXT(xrUnregisterMCPToolEXT, EXT_mcp_tools);
-	ENTRY_IF_EXT(xrGetMCPToolCallArgsEXT, EXT_mcp_tools);
-	ENTRY_IF_EXT(xrSubmitMCPToolResultEXT, EXT_mcp_tools);
+#ifdef OXR_HAVE_DXR_mcp_tools
+	ENTRY_IF_EXT(xrSetMCPAppInfoDXR, DXR_mcp_tools);
+	ENTRY_IF_EXT(xrRegisterMCPToolDXR, DXR_mcp_tools);
+	ENTRY_IF_EXT(xrUnregisterMCPToolDXR, DXR_mcp_tools);
+	ENTRY_IF_EXT(xrGetMCPToolCallArgsDXR, DXR_mcp_tools);
+	ENTRY_IF_EXT(xrSubmitMCPToolResultDXR, DXR_mcp_tools);
 #endif
 
 #ifdef OXR_HAVE_EXT_conformance_automation

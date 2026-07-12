@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  OpenXR session management for D3D12 (legacy mode — no XR_EXT_display_info)
+ * @brief  OpenXR session management for D3D12 (legacy mode — no XR_DXR_display_info)
  *
- * This is the legacy variant: does NOT enable XR_EXT_display_info.
+ * This is the legacy variant: does NOT enable XR_DXR_display_info.
  * Swapchain uses recommendedImageRectWidth * 2 (compromise scaling).
  * Only V toggle (2D/3D) works — no 1/2/3 mode switching.
  */
@@ -79,7 +79,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
 
     LOG_INFO("XR_KHR_D3D12_enable: %s", hasD3D12 ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("Legacy mode: NOT enabling XR_EXT_display_info");
+    LOG_INFO("Legacy mode: NOT enabling XR_DXR_display_info");
 
     if (!hasD3D12) {
         LOG_ERROR("XR_KHR_D3D12_enable extension not available - cannot continue");

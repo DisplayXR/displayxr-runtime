@@ -5,7 +5,7 @@
   "type": "3d",
   "category": "test",
   "display_mode": "auto",
-  "description": "XR_EXT_display_zones exerciser (ADR-027), native Vulkan handle leg with the ARRAY / single-pass-instanced (SPI) stereo layout: two 3D zones each submit an arraySize=2 swapchain (view 0/1 as array layers, imageArrayIndex per view). Closes the last per-API zones gap for issue #673 (VK).",
+  "description": "XR_DXR_display_zones exerciser (ADR-027), native Vulkan handle leg with the ARRAY / single-pass-instanced (SPI) stereo layout: two 3D zones each submit an arraySize=2 swapchain (view 0/1 as array layers, imageArrayIndex per view). Closes the last per-API zones gap for issue #673 (VK).",
   "icon": "icon.png",
   "icon_3d": "icon_sbs.png",
   "icon_3d_layout": "sbs-lr"

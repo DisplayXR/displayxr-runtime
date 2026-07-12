@@ -8,7 +8,7 @@
  * qwerty devices without requiring the SDL debug GUI window.
  *
  * NOTE: This is only used when Monado creates its own window (no HWND
- * provided via XR_EXT_win32_window_binding). When an app provides its own window,
+ * provided via XR_DXR_win32_window_binding). When an app provides its own window,
  * the app handles input directly and this code is never called.
  *
  * @author David Fattal

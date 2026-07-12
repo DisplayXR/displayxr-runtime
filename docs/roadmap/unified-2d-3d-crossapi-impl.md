@@ -20,26 +20,26 @@
 
 ## 2. Base leg (macOS, this session)
 
-### 2.1 Header v2 — `XR_EXT_local_3d_zone.h`, SPEC_VERSION 2
+### 2.1 Header v2 — `XR_DXR_local_3d_zone.h`, SPEC_VERSION 2
 
 Two new Tier-3 binding structs (model: the D3D11 one at type `...162`):
 
 ```c
-#define XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D12_EXT  ((XrStructureType)1000999163)
-#define XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_VULKAN_EXT ((XrStructureType)1000999164)
+#define XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D12_DXR  ((XrStructureType)1004999163)
+#define XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_VULKAN_DXR ((XrStructureType)1004999164)
 
 // D3D12: the runtime returns the ID3D12Resource* (R8_UNORM, w×h client px);
 // the app creates its OWN RTV on it (descriptor heaps are app-owned in D3D12).
 // Sync: the in-process D3D12 compositor runs on the APP'S device AND queue
 // (comp_d3d12_compositor.cpp:86–89), so same-queue submission order is the
-// sync contract — draw the mask, then xrSubmitLocal3DZoneEXT; no fence needed.
-typedef struct XrLocal3DZoneRenderTargetD3D12EXT { type; next;
+// sync contract — draw the mask, then xrSubmitLocal3DZoneDXR; no fence needed.
+typedef struct XrLocal3DZoneRenderTargetD3D12DXR { type; next;
     void *resource; uint32_t width, height; } ...;
 
 // Vulkan: VkImage + VkImageView (R8_UNORM). The vk_native compositor shares
 // the APP'S VkDevice (vk_init_from_given, comp_vk_native_compositor.c:2747),
 // so the handles are app-usable directly; same-queue ordering applies.
-typedef struct XrLocal3DZoneRenderTargetVulkanEXT { type; next;
+typedef struct XrLocal3DZoneRenderTargetVulkanDXR { type; next;
     void *image; void *imageView; uint32_t width, height; } ...;
 ```
 

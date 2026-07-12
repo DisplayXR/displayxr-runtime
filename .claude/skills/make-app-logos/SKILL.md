@@ -29,7 +29,7 @@ wiring around it. The output is gated by **`scripts/check_displayxr_app.py`** (I
 ## Why the file-trigger projection path
 The runtime exposes a file-triggered, projection-only atlas capture that works for **any**
 running 3D DisplayXR app with no app cooperation and no synthetic key injection (which the
-`I`-key `xrCaptureAtlasEXT` path would need, and which Unity-style apps reject). Output lands
+`I`-key `xrCaptureAtlasDXR` path would need, and which Unity-style apps reject). Output lands
 at a fixed, deterministic path. Mechanism (see `test_apps/common/atlas_capture.h` header doc
 and `u_capture_intent.h`):
 - **Trigger:** create empty `%TEMP%\displayxr_atlas_trigger.projection`.

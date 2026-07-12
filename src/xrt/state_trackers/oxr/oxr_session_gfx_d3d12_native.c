@@ -5,7 +5,7 @@
  * @brief  Holds D3D12 native compositor specific session functions.
  *
  * This file provides session integration for the D3D12 native compositor
- * that bypasses Vulkan entirely. This is used when XR_EXT_win32_window_binding
+ * that bypasses Vulkan entirely. This is used when XR_DXR_win32_window_binding
  * provides a window handle and the system supports D3D12 native composition.
  *
  * @author David Fattal

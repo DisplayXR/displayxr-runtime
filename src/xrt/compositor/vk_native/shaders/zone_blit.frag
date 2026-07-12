@@ -1,7 +1,7 @@
 // Copyright 2026, DisplayXR
 // SPDX-License-Identifier: BSL-1.0
 //
-// XR_EXT_display_zones (ADR-027): sample the zone's source view tile.
+// XR_DXR_display_zones (ADR-027): sample the zone's source view tile.
 // Alpha-over compositing (premultiplied or straight) is pipeline blend
 // state — two pipeline variants share this shader pair.
 

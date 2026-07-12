@@ -29,7 +29,7 @@ extern "C" {
  * paints and the DP receives. The content recipe is the ACTIVE MODE's —
  * submissions are clamped to it. The hardware weave-state never clamps
  * content: a divergence is expressed via the hardware-state override
- * (xrRequestDisplayModeEXT), under which this layout keeps following the
+ * (xrRequestDisplayModeDXR), under which this layout keeps following the
  * mode and the DP keeps weaving. Mirrors comp_d3d11_eff_layout.
  */
 struct comp_d3d12_eff_layout
@@ -237,7 +237,7 @@ void *
 comp_d3d12_renderer_get_atlas_resource(struct comp_d3d12_renderer *renderer);
 
 /*!
- * Masked 2D-over-3D composite (#439, XR_EXT_local_3d_zone): records a
+ * Masked 2D-over-3D composite (#439, XR_DXR_local_3d_zone): records a
  * fullscreen-triangle draw into @p cmd_list that writes every pixel of the
  * window region as `M*weave + (1-M)*twod` (per-channel, preserving each
  * layer's own alpha — spec §4.2).

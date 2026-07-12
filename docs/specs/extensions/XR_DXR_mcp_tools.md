@@ -1,11 +1,11 @@
-# XR_EXT_mcp_tools
+# XR_DXR_mcp_tools
 
 | Field | Value |
 |---|---|
-| **Name** | `XR_EXT_mcp_tools` |
+| **Name** | `XR_DXR_mcp_tools` |
 | **Spec version** | 1 |
 | **Status** | Implemented (runtime ≥ v1.13, framework ≥ displayxr-mcp v0.4.0) |
-| **Header** | [`XR_EXT_mcp_tools.h`](../../../src/external/openxr_includes/openxr/XR_EXT_mcp_tools.h) (auto-synced to `displayxr-extensions`) |
+| **Header** | [`XR_DXR_mcp_tools.h`](../../../src/external/openxr_includes/openxr/XR_DXR_mcp_tools.h) (auto-synced to `displayxr-extensions`) |
 | **Design** | [Per-app MCP tools & workspace aggregator](../../roadmap/per-app-mcp-tools.md) |
 | **Depends on** | Nothing at the API level. Functionally inert unless the MCP capability is enabled (`HKLM\Software\DisplayXR\Capabilities\MCP\Enabled` / `DISPLAYXR_MCP`). |
 
@@ -21,13 +21,13 @@ its window:
 
 ```
 agent → displayxr-mcp adapter → per-PID MCP server → [trampoline]
-      → XrEventDataMCPToolCallEXT → app's xrPollEvent loop
-      → xrSubmitMCPToolResultEXT → JSON-RPC response → agent
+      → XrEventDataMCPToolCallDXR → app's xrPollEvent loop
+      → xrSubmitMCPToolResultDXR → JSON-RPC response → agent
 ```
 
 Through the workspace aggregator (`displayxr-mcp --target workspace`)
 the tools appear namespaced as `<app-id>__<tool>`, where `<app-id>` is
-the manifest `id` declared via `xrSetMCPAppInfoEXT`.
+the manifest `id` declared via `xrSetMCPAppInfoDXR`.
 
 Apps never link the MCP framework; the coupling is wire-protocol-only
 (same contract as every other DisplayXR extension, so the Unity/Unreal
@@ -40,13 +40,13 @@ header; semantics summary:
 
 | Function | Semantics |
 |---|---|
-| `xrSetMCPAppInfoEXT(session, info)` | Declare the app's stable id (`^[a-z0-9][a-z0-9-]{0,31}$`, = manifest `id` §3.4). Becomes the aggregator's tool-name prefix. Call before registering tools; changing it later notifies agents but churns their tool names — treat as immutable. |
-| `xrRegisterMCPToolEXT(session, tool)` | Register `{name, description, inputSchemaJson}`. Strings are copied. Bare name: `^[a-z0-9][a-z0-9_-]{0,62}$`, no `__`. Duplicate → `XR_ERROR_NAME_DUPLICATED`; budget (32/process) → `XR_ERROR_LIMIT_REACHED`. Late registration is first-class: connected agents get `tools/list_changed`. |
-| `xrUnregisterMCPToolEXT(session, name)` | Remove a tool; in-flight calls on it fail to the agent. |
-| `xrGetMCPToolCallArgsEXT(session, callId, cap, count, buf)` | Two-call idiom fetch of a pending call's JSON arguments (`argsSize` in the event is the required capacity). |
-| `xrSubmitMCPToolResultEXT(session, callId, success, resultJson)` | Answer a call. `success=XR_FALSE` → agent receives a tool error. Late submits on a timed-out call return `XR_SUCCESS` and are dropped. |
+| `xrSetMCPAppInfoDXR(session, info)` | Declare the app's stable id (`^[a-z0-9][a-z0-9-]{0,31}$`, = manifest `id` §3.4). Becomes the aggregator's tool-name prefix. Call before registering tools; changing it later notifies agents but churns their tool names — treat as immutable. |
+| `xrRegisterMCPToolDXR(session, tool)` | Register `{name, description, inputSchemaJson}`. Strings are copied. Bare name: `^[a-z0-9][a-z0-9_-]{0,62}$`, no `__`. Duplicate → `XR_ERROR_NAME_DUPLICATED`; budget (32/process) → `XR_ERROR_LIMIT_REACHED`. Late registration is first-class: connected agents get `tools/list_changed`. |
+| `xrUnregisterMCPToolDXR(session, name)` | Remove a tool; in-flight calls on it fail to the agent. |
+| `xrGetMCPToolCallArgsDXR(session, callId, cap, count, buf)` | Two-call idiom fetch of a pending call's JSON arguments (`argsSize` in the event is the required capacity). |
+| `xrSubmitMCPToolResultDXR(session, callId, success, resultJson)` | Answer a call. `success=XR_FALSE` → agent receives a tool error. Late submits on a timed-out call return `XR_SUCCESS` and are dropped. |
 
-**Event** `XrEventDataMCPToolCallEXT` `{session, callId, toolName[64],
+**Event** `XrEventDataMCPToolCallDXR` `{session, callId, toolName[64],
 argsSize}` — delivered through the session's normal `xrPollEvent`
 stream when an agent invokes a registered tool.
 
@@ -84,7 +84,7 @@ with and without the MCP Tools package installed.
 An app that registers MCP tools MUST declare the same id in its
 `.displayxr.json` manifest (`id` field, [manifest spec §3.4]
 (../runtime/displayxr-app-manifest.md)) that it passes to
-`xrSetMCPAppInfoEXT` — agents discover the id pre-launch from the
+`xrSetMCPAppInfoDXR` — agents discover the id pre-launch from the
 manifest and at runtime from the MCP `_meta`. `scripts/check_displayxr_app.py`
 lints the pairing (manifest `id` present + charset; code/manifest match
 is checked when the source registers tools).
@@ -102,24 +102,24 @@ first").
 
 ```c
 // Once, after session create:
-XrMCPAppInfoEXT app_info = {.type = XR_TYPE_MCP_APP_INFO_EXT, .appId = "mediaplayer"};
-xrSetMCPAppInfoEXT(session, &app_info);
+XrMCPAppInfoDXR app_info = {.type = XR_TYPE_MCP_APP_INFO_DXR, .appId = "mediaplayer"};
+xrSetMCPAppInfoDXR(session, &app_info);
 
-XrMCPToolInfoEXT tool = {
-    .type = XR_TYPE_MCP_TOOL_INFO_EXT,
+XrMCPToolInfoDXR tool = {
+    .type = XR_TYPE_MCP_TOOL_INFO_DXR,
     .name = "play_pause",
     .description = "Toggle playback of the currently open media file. "
                    "No-op (success=false) when no file is open.",
     .inputSchemaJson = "{\"type\":\"object\"}",
 };
-xrRegisterMCPToolEXT(session, &tool);
+xrRegisterMCPToolDXR(session, &tool);
 
 // In the frame loop's event pump:
-case XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_EXT: {
-    const XrEventDataMCPToolCallEXT *call = (const XrEventDataMCPToolCallEXT *)&event;
+case XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_DXR: {
+    const XrEventDataMCPToolCallDXR *call = (const XrEventDataMCPToolCallDXR *)&event;
     if (strcmp(call->toolName, "play_pause") == 0) {
         bool ok = media_toggle_play();
-        xrSubmitMCPToolResultEXT(session, call->callId, ok ? XR_TRUE : XR_FALSE,
+        xrSubmitMCPToolResultDXR(session, call->callId, ok ? XR_TRUE : XR_FALSE,
                                  ok ? "{\"playing\":true}" : "{\"error\":\"no file open\"}");
     }
     break;

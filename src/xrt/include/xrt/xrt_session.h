@@ -73,13 +73,13 @@ enum xrt_session_event_type
 	//! the app can call xrEndSession and continue running.
 	XRT_SESSION_EVENT_EXIT_REQUEST = 11,
 
-	//! The active rendering mode index has changed (XR_EXT_display_info).
+	//! The active rendering mode index has changed (XR_DXR_display_info).
 	XRT_SESSION_EVENT_RENDERING_MODE_CHANGE = 12,
 
-	//! The hardware display 3D state has changed (XR_EXT_display_info).
+	//! The hardware display 3D state has changed (XR_DXR_display_info).
 	XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE = 13,
 
-	//! XR_EXT_workspace_file_dialog: pending xrRequestFilePickerEXT
+	//! XR_DXR_workspace_file_dialog: pending xrRequestFilePickerDXR
 	//! completed (success / cancel / picker-failed).
 	XRT_SESSION_EVENT_FILE_PICKER_COMPLETE = 14,
 };
@@ -228,15 +228,15 @@ struct xrt_session_event_hardware_display_state_change
  *
  * `path` is plain UTF-8, NUL-terminated within
  * `XRT_FILE_PICKER_PATH_MAX_BYTES`. The OXR state tracker copies it
- * into `XrEventDataFilePickerCompleteEXT.path` on
+ * into `XrEventDataFilePickerCompleteDXR.path` on
  * receipt and pushes the OpenXR event to the requesting session.
  */
 #define XRT_FILE_PICKER_PATH_MAX_BYTES 256  // Matches IPC_FILE_PICKER_PATH_MAX.
 struct xrt_session_event_file_picker_complete
 {
 	enum xrt_session_event_type type;
-	uint32_t result;                          //!< XrFilePickerResultEXT
-	XRT_ALIGNAS(8) uint64_t request_id;       //!< xrRequestFilePickerEXT out-param
+	uint32_t result;                          //!< XrFilePickerResultDXR
+	XRT_ALIGNAS(8) uint64_t request_id;       //!< xrRequestFilePickerDXR out-param
 	char path[XRT_FILE_PICKER_PATH_MAX_BYTES];
 };
 

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  OpenXR session management with XR_EXT_win32_window_binding extension
+ * @brief  OpenXR session management with XR_DXR_win32_window_binding extension
  */
 
 #include "xr_session.h"
@@ -75,21 +75,21 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_KHR_D3D11_ENABLE_EXTENSION_NAME) == 0) {
             hasD3D11 = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME) == 0) {
             xr.hasWin32WindowBindingExt = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) {
             xr.hasDisplayInfoExt = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_WORKSPACE_FILE_DIALOG_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_WORKSPACE_FILE_DIALOG_EXTENSION_NAME) == 0) {
             xr.hasFileDialogExt = true;
         }
     }
 
     LOG_INFO("XR_KHR_D3D11_enable: %s", hasD3D11 ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_EXT_win32_window_binding: %s", xr.hasWin32WindowBindingExt ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_EXT_display_info: %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_EXT_workspace_file_dialog: %s", xr.hasFileDialogExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_win32_window_binding: %s", xr.hasWin32WindowBindingExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_display_info: %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_workspace_file_dialog: %s", xr.hasFileDialogExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasD3D11) {
         LOG_ERROR("XR_KHR_D3D11_enable extension not available - cannot continue");
@@ -97,7 +97,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
 
     if (!xr.hasWin32WindowBindingExt) {
-        LOG_WARN("XR_EXT_win32_window_binding extension not available - window targeting disabled");
+        LOG_WARN("XR_DXR_win32_window_binding extension not available - window targeting disabled");
         LOG_WARN("The runtime will create its own window instead of using the app window");
     }
 
@@ -105,13 +105,13 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     std::vector<const char*> enabledExtensions;
     enabledExtensions.push_back(XR_KHR_D3D11_ENABLE_EXTENSION_NAME);
     if (xr.hasWin32WindowBindingExt) {
-        enabledExtensions.push_back(XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME);
     }
     if (xr.hasDisplayInfoExt) {
-        enabledExtensions.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
     }
     if (xr.hasFileDialogExt) {
-        enabledExtensions.push_back(XR_EXT_WORKSPACE_FILE_DIALOG_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_WORKSPACE_FILE_DIALOG_EXTENSION_NAME);
     }
 
     LOG_INFO("Enabling %zu extensions", enabledExtensions.size());
@@ -154,11 +154,11 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         }
     }
 
-    // Query display info via XR_EXT_display_info
+    // Query display info via XR_DXR_display_info
     if (xr.hasDisplayInfoExt) {
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
-        XrDisplayInfoEXT displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
-        XrEyeTrackingModeCapabilitiesEXT eyeCaps = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT};
+        XrDisplayInfoDXR displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
+        XrEyeTrackingModeCapabilitiesDXR eyeCaps = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR};
         displayInfo.next = &eyeCaps;
         sysProps.next = &displayInfo;
         XrResult diResult = xrGetSystemProperties(xr.instance, xr.systemId, &sysProps);
@@ -183,35 +183,35 @@ bool InitializeOpenXR(XrSessionManager& xr) {
                 xr.supportedEyeTrackingModes, xr.defaultEyeTrackingMode);
         }
 
-        // Load xrRequestDisplayModeEXT function pointer
+        // Load xrRequestDisplayModeDXR function pointer
         {
             XrResult procResult = xrGetInstanceProcAddr(
-                xr.instance, "xrRequestDisplayModeEXT",
+                xr.instance, "xrRequestDisplayModeDXR",
                 (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
             if (XR_FAILED(procResult)) {
-                LOG_WARN("Failed to load xrRequestDisplayModeEXT");
+                LOG_WARN("Failed to load xrRequestDisplayModeDXR");
                 xr.pfnRequestDisplayModeEXT = nullptr;
             }
         }
 
-        // Load xrRequestEyeTrackingModeEXT function pointer
+        // Load xrRequestEyeTrackingModeDXR function pointer
         if (xr.supportedEyeTrackingModes != 0) {
-            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeEXT",
+            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeDXR",
                 (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingModeEXT);
         }
 
-        // Load xrRequestDisplayRenderingModeEXT function pointer (v7)
-        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeEXT",
+        // Load xrRequestDisplayRenderingModeDXR function pointer (v7)
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR",
             (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
-        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesDXR",
             (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
     }
 
     // #228 Tier 1 spatial file picker — resolve the app-side entrypoint.
     if (xr.hasFileDialogExt) {
-        xrGetInstanceProcAddr(xr.instance, "xrRequestFilePickerEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrRequestFilePickerDXR",
             (PFN_xrVoidFunction*)&xr.pfnRequestFilePickerEXT);
-        LOG_INFO("xrRequestFilePickerEXT: %s", xr.pfnRequestFilePickerEXT ? "resolved" : "NULL");
+        LOG_INFO("xrRequestFilePickerDXR: %s", xr.pfnRequestFilePickerEXT ? "resolved" : "NULL");
     }
 
     // Get view configuration views
@@ -236,7 +236,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
 }
 
 bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd) {
-    LOG_INFO("Creating OpenXR session with XR_EXT_win32_window_binding...");
+    LOG_INFO("Creating OpenXR session with XR_DXR_win32_window_binding...");
     LOG_INFO("  D3D11 Device: 0x%p", d3d11Device);
     LOG_INFO("  Window handle (HWND): 0x%p", hwnd);
 
@@ -247,7 +247,7 @@ bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd) {
     d3d11Binding.device = d3d11Device;
 
     // Session target extension - chain it to the D3D11 binding
-    XrWin32WindowBindingCreateInfoEXT sessionTarget = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT};
+    XrWin32WindowBindingCreateInfoDXR sessionTarget = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR};
     sessionTarget.windowHandle = hwnd;
 
     // Opt-in transparency. Pair with WS_EX_NOREDIRECTIONBITMAP + null brush
@@ -265,10 +265,10 @@ bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd) {
     if (xr.hasWin32WindowBindingExt && hwnd) {
         // Chain: sessionInfo -> d3d11Binding -> sessionTarget
         d3d11Binding.next = &sessionTarget;
-        LOG_INFO("Using XR_EXT_win32_window_binding with window handle");
-        LOG_INFO("  Chain: XrSessionCreateInfo -> XrGraphicsBindingD3D11KHR -> XrWin32WindowBindingCreateInfoEXT");
+        LOG_INFO("Using XR_DXR_win32_window_binding with window handle");
+        LOG_INFO("  Chain: XrSessionCreateInfo -> XrGraphicsBindingD3D11KHR -> XrWin32WindowBindingCreateInfoDXR");
     } else {
-        LOG_WARN("NOT using XR_EXT_win32_window_binding (hasExt=%d, hwnd=%p)",
+        LOG_WARN("NOT using XR_DXR_win32_window_binding (hasExt=%d, hwnd=%p)",
             xr.hasWin32WindowBindingExt, hwnd);
         LOG_WARN("Runtime will create its own window for rendering");
     }
@@ -286,9 +286,9 @@ bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd) {
         uint32_t modeCount = 0;
         XrResult enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, 0, &modeCount, nullptr);
         if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
-            std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
+            std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
             for (uint32_t i = 0; i < modeCount; i++) {
-                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
                 modes[i].next = nullptr;
             }
             enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, modeCount, &modeCount, modes.data());

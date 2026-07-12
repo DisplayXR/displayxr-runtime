@@ -138,7 +138,7 @@ struct comp_d3d11_compositor
 	bool has_shared_texture;
 
 
-	//! Active authored zone mask (#439 Phase 1, XR_EXT_local_3d_zone). Set by
+	//! Active authored zone mask (#439 Phase 1, XR_DXR_local_3d_zone). Set by
 	//! comp_d3d11_compositor_zone_mask_submit (sticky, last-submit-wins),
 	//! cleared when that mask is destroyed. NOT owned — the oxr handle owns
 	//! the mask; lifetime is guaranteed by the destroy hook clearing this.
@@ -153,7 +153,7 @@ struct comp_d3d11_compositor
 
 	//! #439 Phase 3 — runtime-owned flatten target (RT+SRV) the masked
 	//! composite reads as `twod` when the frame carries
-	//! XrCompositionLayerLocal2DEXT layers. The RT bind + RTV must not dangle
+	//! XrCompositionLayerLocal2DDXR layers. The RT bind + RTV must not dangle
 	//! across a 2D-model switch.
 	//! Allocated as a trio by d3d11_ensure_rt_srv_scratch.
 	ID3D11Texture2D *local2d_scratch;
@@ -196,7 +196,7 @@ struct comp_d3d11_compositor
 	//! (slot absent / caps unsupported — never publish).
 	int zone_dp_state;
 	//! DP zone caps when zone_dp_state == 1 (grid dims surface through
-	//! comp_d3d11_compositor_zone_get_hw_caps → xrGetLocal3DZoneCapabilitiesEXT).
+	//! comp_d3d11_compositor_zone_get_hw_caps → xrGetLocal3DZoneCapabilitiesDXR).
 	struct xrt_dp_local_zone_caps zone_dp_caps;
 	//! Zone-mask content generation: bumped on every zone_mask_submit (the
 	//! only point the staged content can change). Per-frame publishes carry
@@ -207,7 +207,7 @@ struct comp_d3d11_compositor
 	//! clear-on-deactivate edge (mask destroyed / compositor teardown).
 	bool zone_published;
 
-	//! XR_EXT_display_zones (ADR-027): true when the current frame's
+	//! XR_DXR_display_zones (ADR-027): true when the current frame's
 	//! accumulator carries XRT_LAYER_ZONE_3D layers (a "zones frame"). In a
 	//! zones frame the canvas output rect, the sticky submitted mask, and
 	//! the implicit-mask-from-Local2D rule are all inert; the effective
@@ -217,7 +217,7 @@ struct comp_d3d11_compositor
 	//! layer_commit, beside local_2d_last_frame.
 	bool zones_frame;
 
-	//! Explicit per-frame wish (XrDisplayZonesFrameEndInfoEXT.wishMask),
+	//! Explicit per-frame wish (XrDisplayZonesFrameEndInfoDXR.wishMask),
 	//! handed in via comp_d3d11_compositor_zones_set_frame_wish before
 	//! layer_commit and consumed by that commit (cleared at its end).
 	//! NULL = auto-derive. Not owned — the mask handle owns the resources;
@@ -334,7 +334,7 @@ d3d11_comp(struct xrt_compositor *xc)
 	return reinterpret_cast<struct comp_d3d11_compositor *>(xc);
 }
 
-// #439 Phase 1 authored zone-mask helpers (XR_EXT_local_3d_zone). Defined
+// #439 Phase 1 authored zone-mask helpers (XR_DXR_local_3d_zone). Defined
 // near the bottom of the file alongside the comp_d3d11_compositor_zone_mask_*
 // entry points, called from the layer-commit paths + destroy above them.
 static bool
@@ -355,7 +355,7 @@ d3d11_release_zone_state(struct comp_d3d11_compositor *c);
 // other zone helpers near the bottom.
 static void
 d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c);
-// XR_EXT_display_zones (ADR-027): resolve the zones frame's wish source —
+// XR_DXR_display_zones (ADR-027): resolve the zones frame's wish source —
 // stage the explicit frame wish, or (re)rasterize the auto wish from the
 // frame's zone rects. Defined with the other zone helpers near the bottom.
 static void
@@ -378,7 +378,7 @@ d3d11_update_zone_wish_state(struct comp_d3d11_compositor *c);
 static struct u_canvas_rect
 d3d11_effective_canvas(struct comp_d3d11_compositor *c)
 {
-	// XR_EXT_display_zones: a zones frame spans the full client window by
+	// XR_DXR_display_zones: a zones frame spans the full client window by
 	// definition (each zone rect is its own canvas; the output rect is
 	// inert) — same supersede geometry as the mask/Local2D rules below.
 	if (!c->zones_frame && c->active_zone_mask == nullptr && !c->local_2d_last_frame) {
@@ -789,7 +789,7 @@ d3d11_compositor_layer_window_space(struct xrt_compositor *xc,
 }
 
 /*!
- * Local-2D layer (XR_EXT_local_3d_zone v3, #439 Phase 3) — accumulate only;
+ * Local-2D layer (XR_DXR_local_3d_zone v3, #439 Phase 3) — accumulate only;
  * the D3D11 consumer (flatten + masked composite) is the Windows leg 1 of
  * docs/roadmap/unified-2d-3d-phase3-impl.md §7.
  */
@@ -809,7 +809,7 @@ d3d11_compositor_layer_local_2d(struct xrt_compositor *xc,
 }
 
 /*!
- * 3D display zone layer (XR_EXT_display_zones, ADR-027) — multi-swapchain
+ * 3D display zone layer (XR_DXR_display_zones, ADR-027) — multi-swapchain
  * accumulate like projection; consumed by the zones-frame branch of
  * layer_commit (sub-tile viewport scaled-blit into the window-spanning atlas).
  */
@@ -1233,7 +1233,7 @@ d3d11_compositor_content_dims(struct comp_d3d11_compositor *c, uint32_t *out_w, 
 }
 
 // u_capture_dims provider: report the renderer's CURRENT window-scaled per-view
-// dims + tile layout so xrCaptureAtlasEXT can fill XrAtlasCaptureResultEXT with
+// dims + tile layout so xrCaptureAtlasDXR can fill XrAtlasCaptureResultDXR with
 // what the capture actually writes, not the nominal system info (#431).
 static bool
 d3d11_compositor_capture_dims_provider(void *userdata,
@@ -1470,7 +1470,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 
 		// Rendering mode change from qwerty 1/2/3 keys.
-		// Legacy apps (no XR_EXT_display_info) only support V toggle between
+		// Legacy apps (no XR_DXR_display_info) only support V toggle between
 		// mode 0 (2D) and mode 1 (default 3D) — skip direct mode selection.
 		if (!c->legacy_app_tile_scaling) {
 			int render_mode = -1;
@@ -1484,7 +1484,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	}
 #endif
 
-	// #439 Phase 3: frame mask state. Any XrCompositionLayerLocal2DEXT layer
+	// #439 Phase 3: frame mask state. Any XrCompositionLayerLocal2DDXR layer
 	// this frame raises an implicit mask (Q3) which, like an explicit one,
 	// supersedes the canvas (uniform Phase-2 rule). Compute once under
 	// c->mutex (held here) so d3d11_effective_canvas below and the composite
@@ -1499,7 +1499,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 	c->local_2d_last_frame = have_local_2d;
-	// XR_EXT_display_zones (ADR-027): one coherent per-frame decision —
+	// XR_DXR_display_zones (ADR-027): one coherent per-frame decision —
 	// effective canvas, the wish raster/publish, and the visual composite
 	// all read this under the same c->mutex hold.
 	c->zones_frame = zones_frame;
@@ -1513,7 +1513,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// race the frame.
 	const struct u_canvas_rect eff_canvas = d3d11_effective_canvas(c);
 
-	// XR_EXT_display_zones: resolve the frame's wish source BEFORE the DP
+	// XR_DXR_display_zones: resolve the frame's wish source BEFORE the DP
 	// sideband sync and the post-weave lerp — both consume the same staged
 	// SRV (the ADR's no-drift property).
 	if (c->zones_frame) {
@@ -1824,7 +1824,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			    eff_canvas.valid ? eff_canvas.w : 0,
 			    eff_canvas.valid ? eff_canvas.h : 0);
 
-			// #439 Phase 1: an authored zone mask (XR_EXT_local_3d_zone) or
+			// #439 Phase 1: an authored zone mask (XR_DXR_local_3d_zone) or
 			// a Local2D layer composites the 2D/3D regions of the shared
 			// texture. No-op when the frame carries neither.
 			d3d11_composite_zone_mask(c, c->shared_texture, dp_target_w, dp_target_h, &eff_canvas);
@@ -1901,7 +1901,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		    eff_canvas.valid ? eff_canvas.w : 0,
 		    eff_canvas.valid ? eff_canvas.h : 0);
 
-		// #439 Phase 1: an authored zone mask (XR_EXT_local_3d_zone) or a
+		// #439 Phase 1: an authored zone mask (XR_DXR_local_3d_zone) or a
 		// Local2D layer composites the 2D/3D regions of the DXGI back buffer.
 		// The downstream CopyResource/CopySubresourceRegion (line ~1500)
 		// propagates the composite into c->shared_texture for _texture-mode
@@ -2108,7 +2108,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			U_LOG_I("Shared texture mode (offscreen) — no window");
 		}
 	} else if (hwnd != nullptr) {
-		// App provided window via XR_EXT_win32_window_binding (ext mode)
+		// App provided window via XR_DXR_win32_window_binding (ext mode)
 		c->hwnd = static_cast<HWND>(hwnd);
 		U_LOG_I("Using app-provided window handle: %p", hwnd);
 	} else {
@@ -2381,7 +2381,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		return xret;
 	}
 
-	// Expose current window-scaled capture dims to xrCaptureAtlasEXT (#431).
+	// Expose current window-scaled capture dims to xrCaptureAtlasDXR (#431).
 	u_capture_dims_set_provider(d3d11_compositor_capture_dims_provider, c);
 
 #ifdef XRT_FEATURE_DEBUG_GUI
@@ -2483,7 +2483,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 
 /*
  *
- * XR_EXT_local_3d_zone — authored 2D/3D mask consumer (#439 Phase 1).
+ * XR_DXR_local_3d_zone — authored 2D/3D mask consumer (#439 Phase 1).
  *
  * The oxr handlers (oxr_local_3d_zone.c) forward here. The mask expresses an
  * arbitrary scalar 2D/3D region:
@@ -2494,7 +2494,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
  * also makes submit atomic against an in-flight frame (spec §9 Q3).
  *
  * #464: the mask + 2D layer are window-sized (client-window pixels, matching
- * XrLocal3DZoneMaskCreateInfoEXT); the composite operates on the window rect
+ * XrLocal3DZoneMaskCreateInfoDXR); the composite operates on the window rect
  * at the top-left anchor of the worst-case surface, never beyond it.
  *
  */
@@ -2520,7 +2520,7 @@ struct comp_d3d11_zone_mask
 	bool submitted;
 	//! Author generation: bumped on every authoring call (Tier 1/2 fills,
 	//! Tier-3 acquire, submit). The zones frame-wish publish dedups on this
-	//! (XR_EXT_display_zones — referenced per-frame, no submit required).
+	//! (XR_DXR_display_zones — referenced per-frame, no submit required).
 	uint64_t author_seq;
 };
 
@@ -2536,7 +2536,7 @@ d3d11_release_zone_state(struct comp_d3d11_compositor *c)
 	c->zones_frame = false;
 	d3d11_sync_zone_mask_to_dp(c); // withdraw this client's DP zone contribution (#224)
 
-	// XR_EXT_display_zones — auto-wish raster set.
+	// XR_DXR_display_zones — auto-wish raster set.
 	if (c->wish_mask_staged_srv != nullptr) {
 		c->wish_mask_staged_srv->Release();
 		c->wish_mask_staged_srv = nullptr;
@@ -2658,7 +2658,7 @@ d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
 	}
 
 	// Resolve this frame's published content. Zones frame
-	// (XR_EXT_display_zones): the WISH — explicit frame wish or the auto
+	// (XR_DXR_display_zones): the WISH — explicit frame wish or the auto
 	// raster — and the sticky legacy mask is inert. Legacy frame: the
 	// sticky submitted mask, unchanged.
 	ID3D11ShaderResourceView *srv = nullptr;
@@ -2982,7 +2982,7 @@ d3d11_update_implicit_mask(struct comp_d3d11_compositor *c,
 	return c->implicit_mask_staged_srv;
 }
 
-// XR_EXT_display_zones (ADR-027) — (re)rasterize the AUTO wish: union of the
+// XR_DXR_display_zones (ADR-027) — (re)rasterize the AUTO wish: union of the
 // frame's zone rects with an INWARD stepped ring feather. M=0 outside the
 // zones; inside each zone M ramps 0->1 over the first 16 px from the edge
 // (ascending-value insets, ClearView per step on EVERY zone — max semantics
@@ -3146,7 +3146,7 @@ d3d11_update_zone_wish_mask(struct comp_d3d11_compositor *c,
 // Resolve the zones frame's wish source (called from layer_commit before the
 // DP sync + composite; caller holds c->mutex). Explicit frame wish: stage the
 // authoring texture (referenced-at-frame-end = consume current state — no
-// xrSubmitLocal3DZoneEXT required) and dedup the publish generation on the
+// xrSubmitLocal3DZoneDXR required) and dedup the publish generation on the
 // mask's author_seq. Auto: rasterize the union of the frame's zone rects.
 static void
 d3d11_update_zone_wish_state(struct comp_d3d11_compositor *c)
@@ -3412,7 +3412,7 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	// #439 Phase 3: run when EITHER an explicit submitted mask exists OR this
 	// frame carries Local2D layers (the layers supply the 2D pixels + an
 	// implicit mask).
-	// XR_EXT_display_zones: a zones frame ALWAYS runs the composite (the
+	// XR_DXR_display_zones: a zones frame ALWAYS runs the composite (the
 	// feathered wish edge lerps the weave toward the 2D flatten even with
 	// zero Local2D layers); the sticky mask + implicit-mask rules are inert.
 	struct comp_d3d11_zone_mask *mask = c->active_zone_mask;
@@ -3538,7 +3538,7 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	// #491: the implicit (auto) Local2D mask composites the 2D over the weave by
 	// its own premultiplied alpha (translucent 2D reveals the 3D scene). The
 	// explicit authored mask keeps the hard M-lerp.
-	// XR_EXT_display_zones: zones frames are ALWAYS the hard M-lerp
+	// XR_DXR_display_zones: zones frames are ALWAYS the hard M-lerp
 	// (final = M·weave + (1−M)·flatten(2D-over)) — composition follows zone
 	// geometry + the wish, never the #491 alpha-over rule.
 	const bool alpha_over = !zones_frame && have_local_2d && !have_explicit;
@@ -3768,7 +3768,7 @@ comp_d3d11_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_pt
 	if (mask == nullptr) {
 		return;
 	}
-	// XR_EXT_display_zones: never leave a dangling frame-wish reference.
+	// XR_DXR_display_zones: never leave a dangling frame-wish reference.
 	if (c->frame_wish == mask) {
 		c->frame_wish = nullptr;
 	}
@@ -3803,7 +3803,7 @@ comp_d3d11_compositor_zones_set_frame_wish(struct xrt_compositor *xc, void *mask
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
 	std::lock_guard<std::mutex> lock(c->mutex);
 
-	// Per-frame reference (XR_EXT_display_zones): oxr sets this on every
+	// Per-frame reference (XR_DXR_display_zones): oxr sets this on every
 	// zones frame before layer_commit, NULL meaning auto-derive. Consumed
 	// by the commit's wish-state resolve; harmlessly stale on zero-zone
 	// frames (the zones branch never reads it there).
@@ -3840,7 +3840,7 @@ comp_d3d11_compositor_zone_get_hw_caps(struct xrt_compositor *xc,
 // view dims are recomputed each frame from the effective canvas (window rect
 // while a mask/Local2D is active, canvas otherwise — see layer_commit's
 // u_tiling_compute_canvas_view + resize), so this reflects the renegotiated
-// size and oxr fires XrEventDataLocal3DZoneViewSizeChangedEXT when it changes.
+// size and oxr fires XrEventDataLocal3DZoneViewSizeChangedDXR when it changes.
 extern "C" bool
 comp_d3d11_compositor_get_recommended_view_size(struct xrt_compositor *xc, uint32_t *out_w, uint32_t *out_h)
 {

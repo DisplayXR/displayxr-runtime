@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  XR_EXT_weave API entry points (issue #625).
+ * @brief  XR_DXR_weave API entry points (issue #625).
  * @author David Fattal
  * @ingroup oxr_api
  *
  * A window-bound, synchronous weave service for present-owners (see
- * XR_EXT_weave.h and docs/roadmap/webxr-support.md §2.4 "Step 0"). The caller
+ * XR_DXR_weave.h and docs/roadmap/webxr-support.md §2.4 "Step 0"). The caller
  * owns its OS window and presents itself; the runtime's display processor
  * weaves a window sub-rect from a caller-supplied pre-weave SBS texture and
  * hands back a weaved shared texture + fence. The caller NEVER weaves
@@ -33,14 +33,14 @@
 #include "xrt/xrt_handles.h"
 #include "xrt/xrt_display_metrics.h"
 
-#include <openxr/XR_EXT_weave.h>
+#include <openxr/XR_DXR_weave.h>
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
-#ifdef OXR_HAVE_EXT_weave
+#ifdef OXR_HAVE_DXR_weave
 
 // Forward decls of the IPC-bridge wrappers (defined in ipc_client_compositor.c).
 struct xrt_compositor;
@@ -105,13 +105,13 @@ oxr_xrWeaveBindWindowEXT(XrSession session, void *windowHandle)
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrWeaveBindWindowEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrWeaveBindWindowDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_weave);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_weave);
 
 	if (!session_is_ipc(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrWeaveBindWindowEXT: the weave service is only available on the "
+		                 "xrWeaveBindWindowDXR: the weave service is only available on the "
 		                 "out-of-process (service) path");
 	}
 
@@ -119,27 +119,27 @@ oxr_xrWeaveBindWindowEXT(XrSession session, void *windowHandle)
 	    &sess->xcn->base, (uint64_t)(uintptr_t)windowHandle);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
-		                 "xrWeaveBindWindowEXT: bind failed (xrt_result=%d)", (int)xret);
+		                 "xrWeaveBindWindowDXR: bind failed (xrt_result=%d)", (int)xret);
 	}
 	return XR_SUCCESS;
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrWeaveSubmitEXT(XrSession session, const XrWeaveSubmitInfoEXT *submitInfo, XrWeaveOutputEXT *output)
+oxr_xrWeaveSubmitEXT(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, XrWeaveOutputDXR *output)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrWeaveSubmitEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrWeaveSubmitDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_weave);
-	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, submitInfo, XR_TYPE_WEAVE_SUBMIT_INFO_EXT);
-	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, output, XR_TYPE_WEAVE_OUTPUT_EXT);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_weave);
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, submitInfo, XR_TYPE_WEAVE_SUBMIT_INFO_DXR);
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, output, XR_TYPE_WEAVE_OUTPUT_DXR);
 
 	if (!session_is_ipc(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrWeaveSubmitEXT: the weave service is only available on the "
+		                 "xrWeaveSubmitDXR: the weave service is only available on the "
 		                 "out-of-process (service) path");
 	}
 
@@ -154,7 +154,7 @@ oxr_xrWeaveSubmitEXT(XrSession session, const XrWeaveSubmitInfoEXT *submitInfo, 
 	    &fence_value, &eyes);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
-		                 "xrWeaveSubmitEXT: weave failed (xrt_result=%d)", (int)xret);
+		                 "xrWeaveSubmitDXR: weave failed (xrt_result=%d)", (int)xret);
 	}
 
 	// Per-frame scalars are always valid; the shared HANDLEs are handed back
@@ -169,8 +169,8 @@ oxr_xrWeaveSubmitEXT(XrSession session, const XrWeaveSubmitInfoEXT *submitInfo, 
 	// projection from these tracked positions (look-around). The interlace
 	// itself is DP-internal.
 	uint32_t ec = eyes.count;
-	if (ec > XR_WEAVE_MAX_EYES_EXT) {
-		ec = XR_WEAVE_MAX_EYES_EXT;
+	if (ec > XR_WEAVE_MAX_EYES_DXR) {
+		ec = XR_WEAVE_MAX_EYES_DXR;
 	}
 	output->eyeCount = ec;
 	for (uint32_t i = 0; i < ec; i++) {
@@ -218,16 +218,16 @@ oxr_xrWeaveSnapWindowRectEXT(XrSession session,
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrWeaveSnapWindowRectEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrWeaveSnapWindowRectDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_weave);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_weave);
 	OXR_VERIFY_ARG_NOT_NULL(&log, originRect);
 	OXR_VERIFY_ARG_NOT_NULL(&log, targetRect);
 	OXR_VERIFY_ARG_NOT_NULL(&log, snappedRect);
 
 	if (!session_is_ipc(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrWeaveSnapWindowRectEXT: the weave service is only available on the "
+		                 "xrWeaveSnapWindowRectDXR: the weave service is only available on the "
 		                 "out-of-process (service) path");
 	}
 
@@ -241,7 +241,7 @@ oxr_xrWeaveSnapWindowRectEXT(XrSession session,
 	    &snapped, &sx, &sy);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
-		                 "xrWeaveSnapWindowRectEXT: snap failed (xrt_result=%d)", (int)xret);
+		                 "xrWeaveSnapWindowRectDXR: snap failed (xrt_result=%d)", (int)xret);
 	}
 
 	snappedRect->offset.x = sx;
@@ -250,4 +250,4 @@ oxr_xrWeaveSnapWindowRectEXT(XrSession session,
 	return XR_SUCCESS;
 }
 
-#endif // OXR_HAVE_EXT_weave
+#endif // OXR_HAVE_DXR_weave

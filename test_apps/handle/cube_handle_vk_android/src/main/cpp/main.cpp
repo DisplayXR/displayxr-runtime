@@ -19,14 +19,14 @@
 #include <vulkan/vulkan.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-// XR_EXT_display_info: display dimensions + the rendering-mode enumeration /
+// XR_DXR_display_info: display dimensions + the rendering-mode enumeration /
 // switching entry points. Drives the adaptive tiled-atlas multiview port (#499).
-#include <openxr/XR_EXT_display_info.h>
-// XR_EXT_view_rig: the runtime owns the Kooima/off-axis projection. The app
-// chains a display-centric XrDisplayRigEXT on xrLocateViews and consumes the
+#include <openxr/XR_DXR_display_info.h>
+// XR_DXR_view_rig: the runtime owns the Kooima/off-axis projection. The app
+// chains a display-centric XrDisplayRigDXR on xrLocateViews and consumes the
 // render-ready XrView{pose, fov} — no app-side projection or per-orientation
 // compensation (device rotation is the weaver/DP's job, per the CNSDK model).
-#include <openxr/XR_EXT_view_rig.h>
+#include <openxr/XR_DXR_view_rig.h>
 
 #include <atomic>
 #include <cmath>
@@ -140,7 +140,7 @@ XrSpace g_app_space = XR_NULL_HANDLE;
 // That was the Android black screen. This file now mirrors cube_handle_vk_win.
 constexpr uint32_t kMaxViews = 8;
 
-// One advertised rendering mode (mirror of XrDisplayRenderingModeInfoEXT).
+// One advertised rendering mode (mirror of XrDisplayRenderingModeInfoDXR).
 struct RenderingModeInfo
 {
 	uint32_t view_count{2};
@@ -153,13 +153,13 @@ struct RenderingModeInfo
 	char name[64]{"Stereo"};
 };
 RenderingModeInfo g_modes[kMaxViews] = {};
-uint32_t g_mode_count = 0;            // 0 → no XR_EXT_display_info; default stereo
+uint32_t g_mode_count = 0;            // 0 → no XR_DXR_display_info; default stereo
 std::atomic<uint32_t> g_current_mode{0};
 uint32_t g_max_view_count = 2;        // xrEnumerateViewConfigurationViews → locate capacity
-uint32_t g_display_px_w = 0;          // native panel pixels (XR_EXT_display_info)
+uint32_t g_display_px_w = 0;          // native panel pixels (XR_DXR_display_info)
 uint32_t g_display_px_h = 0;
 bool g_has_display_info = false;
-bool g_has_view_rig = false;          // XR_EXT_view_rig: runtime-owned Kooima projection
+bool g_has_view_rig = false;          // XR_DXR_view_rig: runtime-owned Kooima projection
 
 // Display-centric rig defaults (match cube_handle_vk_win). virtualDisplayHeight
 // in app units — 0.24 = 4x the 0.06 m cube; all factors at their neutral 1.0.
@@ -188,11 +188,11 @@ CrateScene g_scene;
 HudFont g_hud_font;
 AAssetManager *g_asset_manager = nullptr;
 
-// XR_EXT_display_info entry points (resolved after the session exists).
-PFN_xrEnumerateDisplayRenderingModesEXT g_pfnEnumModes = nullptr;
-PFN_xrRequestDisplayRenderingModeEXT g_pfnRequestMode = nullptr;
+// XR_DXR_display_info entry points (resolved after the session exists).
+PFN_xrEnumerateDisplayRenderingModesDXR g_pfnEnumModes = nullptr;
+PFN_xrRequestDisplayRenderingModeDXR g_pfnRequestMode = nullptr;
 // #522 test hook: select MANAGED/MANUAL via `setprop debug.dxr.eyemode N`.
-PFN_xrRequestEyeTrackingModeEXT g_pfnRequestEyeMode = nullptr;
+PFN_xrRequestEyeTrackingModeDXR g_pfnRequestEyeMode = nullptr;
 
 // Single tiled-atlas swapchain shared by all views. Each view writes into its
 // tile via a viewport/scissor offset inside one render pass; xrEndFrame submits
@@ -309,7 +309,7 @@ create_instance(struct android_app *app)
 	// after the runtime was already started).
 	g_runtime_unavailable.store(false, std::memory_order_relaxed);
 
-	// XR_EXT_display_info is what turns this into a real DisplayXR *extension*
+	// XR_DXR_display_info is what turns this into a real DisplayXR *extension*
 	// app: it unlocks the display-pixel dimensions + the rendering-mode
 	// enumeration / switching entry points the tiled-atlas multiview port
 	// needs (#499). Enable it only when the runtime advertises it so a runtime
@@ -331,16 +331,16 @@ create_instance(struct android_app *app)
 			    XR_SUCCESS) {
 				for (uint32_t i = 0; i < ext_count; ++i) {
 					if (std::strcmp(props_buf[i].extensionName,
-					                XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) {
+					                XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) {
 						g_has_display_info = true;
 					} else if (std::strcmp(props_buf[i].extensionName,
-					                       XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
+					                       XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
 						g_has_view_rig = true;
 					}
 				}
 			}
 		}
-		LOGI("XR_EXT_display_info advertised: %s; XR_EXT_view_rig advertised: %s",
+		LOGI("XR_DXR_display_info advertised: %s; XR_DXR_view_rig advertised: %s",
 		     g_has_display_info ? "yes" : "no", g_has_view_rig ? "yes" : "no");
 	}
 
@@ -352,10 +352,10 @@ create_instance(struct android_app *app)
 	};
 	uint32_t extension_count = 2;
 	if (g_has_display_info) {
-		extensions[extension_count++] = XR_EXT_DISPLAY_INFO_EXTENSION_NAME;
+		extensions[extension_count++] = XR_DXR_DISPLAY_INFO_EXTENSION_NAME;
 	}
 	if (g_has_view_rig) {
-		extensions[extension_count++] = XR_EXT_VIEW_RIG_EXTENSION_NAME;
+		extensions[extension_count++] = XR_DXR_VIEW_RIG_EXTENSION_NAME;
 	}
 
 	XrInstanceCreateInfoAndroidKHR android_info = {};
@@ -678,7 +678,7 @@ create_session()
 }
 
 // ── Active rendering-mode accessors ───────────────────────────────────────
-// active_mode() returns the live mode; with no XR_EXT_display_info it returns
+// active_mode() returns the live mode; with no XR_DXR_display_info it returns
 // a sane default-stereo (2 views, 2×1 tiles, 0.5×1.0 scale) so the atlas path
 // still works against a runtime that doesn't advertise rendering modes.
 const RenderingModeInfo &
@@ -755,7 +755,7 @@ active_tile_dims(uint32_t *render_w, uint32_t *render_h, uint32_t *cols, uint32_
 	*rows = r;
 }
 
-// Query display pixel dimensions (XR_EXT_display_info) + the runtime's
+// Query display pixel dimensions (XR_DXR_display_info) + the runtime's
 // rendering modes, and the max view count the runtime advertises. Must run
 // AFTER create_session() (mode enumeration is session-scoped) and BEFORE
 // create_swapchains() (atlas sizing needs the display dims + mode tile layout).
@@ -774,10 +774,10 @@ query_display_info_and_modes()
 	}
 	LOGI("Runtime advertises %u views (max across modes)", g_max_view_count);
 
-	// Native panel pixels — chain XrDisplayInfoEXT onto the system-properties
+	// Native panel pixels — chain XrDisplayInfoDXR onto the system-properties
 	// query (there is no standalone xrGetDisplayInfoEXT).
 	if (g_has_display_info) {
-		XrDisplayInfoEXT di = {XR_TYPE_DISPLAY_INFO_EXT};
+		XrDisplayInfoDXR di = {XR_TYPE_DISPLAY_INFO_DXR};
 		XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
 		sp.next = &di;
 		if (xrGetSystemProperties(g_instance, g_system_id, &sp) == XR_SUCCESS) {
@@ -787,11 +787,11 @@ query_display_info_and_modes()
 			     di.displaySizeMeters.width, di.displaySizeMeters.height);
 		}
 
-		xrGetInstanceProcAddr(g_instance, "xrEnumerateDisplayRenderingModesEXT",
+		xrGetInstanceProcAddr(g_instance, "xrEnumerateDisplayRenderingModesDXR",
 		                      reinterpret_cast<PFN_xrVoidFunction *>(&g_pfnEnumModes));
-		xrGetInstanceProcAddr(g_instance, "xrRequestDisplayRenderingModeEXT",
+		xrGetInstanceProcAddr(g_instance, "xrRequestDisplayRenderingModeDXR",
 		                      reinterpret_cast<PFN_xrVoidFunction *>(&g_pfnRequestMode));
-		xrGetInstanceProcAddr(g_instance, "xrRequestEyeTrackingModeEXT",
+		xrGetInstanceProcAddr(g_instance, "xrRequestEyeTrackingModeDXR",
 		                      reinterpret_cast<PFN_xrVoidFunction *>(&g_pfnRequestEyeMode));
 	}
 
@@ -803,9 +803,9 @@ query_display_info_and_modes()
 			if (mc > kMaxViews) {
 				mc = kMaxViews;
 			}
-			XrDisplayRenderingModeInfoEXT modes[kMaxViews] = {};
+			XrDisplayRenderingModeInfoDXR modes[kMaxViews] = {};
 			for (uint32_t i = 0; i < mc; ++i) {
-				modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+				modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
 			}
 			if (g_pfnEnumModes(g_session, mc, &mc, modes) == XR_SUCCESS) {
 				g_mode_count = mc;
@@ -1940,7 +1940,7 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 	// rotation is the weaver/DP's job (the Leia interlacer rotates the weave
 	// pattern; the DisplayXR vk_native compositor + DP do the same). The old
 	// app-side aspect_mult / yscale / HUD-rotation knobs were the wrong layer
-	// and are gone. Projection comes from the runtime via XR_EXT_view_rig.
+	// and are gone. Projection comes from the runtime via XR_DXR_view_rig.
 	const float rig_vh = kRigVirtualDisplayHeight;  // scaleFactor = 1.0
 
 	// Scene model matrices (tile-independent — only view/proj vary per tile).
@@ -2147,11 +2147,11 @@ poll_xr_events()
 				LOGI("session state -> %d", (int)e->state);
 				handle_session_state(e->state);
 			}
-		} else if (ev.type == XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT) {
+		} else if (ev.type == XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR) {
 			// The runtime's authoritative confirmation that the active mode
-			// changed (via xrRequestDisplayRenderingModeEXT or a vendor-side
+			// changed (via xrRequestDisplayRenderingModeDXR or a vendor-side
 			// switch). Adopt it: drives the per-frame view count + tile layout.
-			const auto *e = reinterpret_cast<const XrEventDataRenderingModeChangedEXT *>(&ev);
+			const auto *e = reinterpret_cast<const XrEventDataRenderingModeChangedDXR *>(&ev);
 			if (e->session == g_session && e->currentModeIndex < g_mode_count) {
 				g_current_mode.store(e->currentModeIndex, std::memory_order_relaxed);
 				LOGI("rendering mode -> %u (%s): %u views, tiles %ux%u", e->currentModeIndex,
@@ -2167,7 +2167,7 @@ poll_xr_events()
 }
 
 // Request an absolute rendering-mode switch. The runtime confirms via
-// XrEventDataRenderingModeChangedEXT (handled in poll_xr_events), which updates
+// XrEventDataRenderingModeChangedDXR (handled in poll_xr_events), which updates
 // g_current_mode — so we don't pre-set it here.
 void
 request_mode(uint32_t idx)
@@ -2181,7 +2181,7 @@ request_mode(uint32_t idx)
 	}
 	LOGI("requesting rendering mode %u (%s)", idx, g_modes[idx].name);
 	XrResult res = g_pfnRequestMode(g_session, idx);
-	log_xr_result("xrRequestDisplayRenderingModeEXT", res);
+	log_xr_result("xrRequestDisplayRenderingModeDXR", res);
 }
 
 // Advance to the next requestable mode (double-tap on device).
@@ -2223,8 +2223,8 @@ render_frame()
 		int want = (int)get_prop_float("debug.dxr.eyemode", -1.0f);
 		if (want >= 0 && want != last_eyemode && g_pfnRequestEyeMode != nullptr) {
 			last_eyemode = want;
-			XrResult r = g_pfnRequestEyeMode(g_session, (XrEyeTrackingModeEXT)want);
-			log_xr_result("xrRequestEyeTrackingModeEXT", r);
+			XrResult r = g_pfnRequestEyeMode(g_session, (XrEyeTrackingModeDXR)want);
+			log_xr_result("xrRequestEyeTrackingModeDXR", r);
 		}
 	}
 
@@ -2277,7 +2277,7 @@ render_frame()
 		// meters, +X right +Y up, already orientation-rotated). This is the
 		// face-tracking position — the dot you'd draw mirroring the user's head —
 		// independent of the orbit camera (unlike the world-space view poses).
-		XrViewDisplayRawEXT view_raw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+		XrViewDisplayRawDXR view_raw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
 		if (g_has_view_rig) {
 			view_state.next = &view_raw;
 		}
@@ -2287,12 +2287,12 @@ render_frame()
 		locate_info.displayTime = frame_state.predictedDisplayTime;
 		locate_info.space = g_app_space;
 
-		// XR_EXT_view_rig: drive the runtime's display-centric rig so it returns
+		// XR_DXR_view_rig: drive the runtime's display-centric rig so it returns
 		// render-ready off-axis XrView{pose, fov} (the Kooima math is the
 		// runtime's job now). The rig pose is the orbit camera; virtualDisplay-
 		// Height = 0.24 app units; ipd/parallax/perspective at neutral 1.0.
 		const XrPosef rig_pose = build_rig_pose();
-		XrDisplayRigEXT display_rig = {XR_TYPE_DISPLAY_RIG_EXT};
+		XrDisplayRigDXR display_rig = {XR_TYPE_DISPLAY_RIG_DXR};
 		display_rig.pose = rig_pose;
 		display_rig.virtualDisplayHeight = kRigVirtualDisplayHeight;
 		display_rig.ipdFactor = 1.0f;

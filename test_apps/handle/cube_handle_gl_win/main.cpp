@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  SR Cube OpenXR Ext GL - OpenXR with XR_EXT_win32_window_binding (OpenGL)
+ * @brief  SR Cube OpenXR Ext GL - OpenXR with XR_DXR_win32_window_binding (OpenGL)
  *
  * OpenGL port of cube_handle_d3d11. Projection layer + window-space HUD overlay.
  */
@@ -47,7 +47,7 @@ static std::atomic<bool> g_running{true};
 static XrSessionManager* g_xr = nullptr;
 
 // #542 'H' (validation affordance): toggle the HARDWARE display state alone
-// for the current mode via xrRequestDisplayModeEXT — the mode, the app's
+// for the current mode via xrRequestDisplayModeDXR — the mode, the app's
 // content, and the DP's weave/blit processing are untouched. In 3D the panel
 // shows the woven atlas flat (blurry); fading parallax to zero converges
 // back to sharp — the MANUAL tracking-loss transition shape (#522). The
@@ -113,7 +113,7 @@ static bool g_fullscreen = false;
 static RECT g_savedWindowRect = {};
 static DWORD g_savedWindowStyle = 0;
 
-// XR_EXT_view_rig (#396 W7 dogfood): the app chains XrDisplayRigEXT on every
+// XR_DXR_view_rig (#396 W7 dogfood): the app chains XrDisplayRigDXR on every
 // xrLocateViews and consumes the runtime's render-ready XrView{pose, fov}
 // directly — the per-frame Kooima generation is deleted; only clip policy
 // stays app-side. Per-view staging container (matrices column-major):
@@ -257,7 +257,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         // #542: 'H' toggles the HARDWARE display state alone for the current
-        // mode (xrRequestDisplayModeEXT) — handled on the render thread.
+        // mode (xrRequestDisplayModeDXR) — handled on the render thread.
         if (wParam == 'H') {
             g_hwToggleRequested.store(true);
             return 0;
@@ -579,7 +579,7 @@ static void RenderThreadFunc(
 
         // Rendering mode requests (V=cycle, 0-8=absolute) through the shared
         // ModeSwitch sequencer: eases viewParams.ipdFactor around the switch and
-        // fires xrRequestDisplayRenderingModeEXT on the right frame. The ramped
+        // fires xrRequestDisplayRenderingModeDXR on the right frame. The ramped
         // ipd lands on inputSnapshot.viewParams.ipdFactor, which the render path
         // reads. The runtime owns current mode via xr->currentModeIndex.
         XrSessionUpdateModeSwitch(*xr, inputSnapshot, perfStats.deltaTime);
@@ -601,11 +601,11 @@ static void RenderThreadFunc(
         // Handle eye tracking mode toggle (T key)
         if (inputSnapshot.eyeTrackingModeToggleRequested) {
             if (xr->pfnRequestEyeTrackingModeEXT && xr->session != XR_NULL_HANDLE) {
-                XrEyeTrackingModeEXT newMode = (xr->activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_EXT)
-                    ? XR_EYE_TRACKING_MODE_MANUAL_EXT : XR_EYE_TRACKING_MODE_MANAGED_EXT;
+                XrEyeTrackingModeDXR newMode = (xr->activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_DXR)
+                    ? XR_EYE_TRACKING_MODE_MANUAL_DXR : XR_EYE_TRACKING_MODE_MANAGED_DXR;
                 XrResult etResult = xr->pfnRequestEyeTrackingModeEXT(xr->session, newMode);
                 LOG_INFO("Eye tracking mode -> %s (%s)",
-                    newMode == XR_EYE_TRACKING_MODE_MANUAL_EXT ? "MANUAL" : "MANAGED",
+                    newMode == XR_EYE_TRACKING_MODE_MANUAL_DXR ? "MANUAL" : "MANAGED",
                     XR_SUCCEEDED(etResult) ? "OK" : "unsupported");
             }
         }
@@ -628,7 +628,7 @@ static void RenderThreadFunc(
                     bool cur_3d = g_hwOverrideActive ? g_hwOverride3D : mode_default_3d;
                     bool want_3d = !cur_3d;
                     XrResult hres = xr->pfnRequestDisplayModeEXT(xr->session,
-                        want_3d ? XR_DISPLAY_MODE_3D_EXT : XR_DISPLAY_MODE_2D_EXT);
+                        want_3d ? XR_DISPLAY_MODE_3D_DXR : XR_DISPLAY_MODE_2D_DXR);
                     if (XR_SUCCEEDED(hres)) {
                         g_hwOverrideActive = (want_3d != mode_default_3d);
                         g_hwOverride3D = want_3d;
@@ -637,7 +637,7 @@ static void RenderThreadFunc(
                     LOG_INFO("[#542] H: hardware-only -> %s (mode %u unchanged, rc=0x%x)",
                         want_3d ? "3D" : "2D", xr->currentModeIndex, (unsigned)hres);
                 } else {
-                    LOG_INFO("[#542] H: xrRequestDisplayModeEXT unavailable");
+                    LOG_INFO("[#542] H: xrRequestDisplayModeDXR unavailable");
                 }
             }
         }
@@ -686,25 +686,25 @@ static void RenderThreadFunc(
                         XrView rawViews[8];
                         for (uint32_t vi = 0; vi < 8; vi++) rawViews[vi] = {XR_TYPE_VIEW};
 
-                        // XR_EXT_view_rig raw-channel verification (#396 W7):
-                        // chain XrViewDisplayRawEXT so the runtime reports the
+                        // XR_DXR_view_rig raw-channel verification (#396 W7):
+                        // chain XrViewDisplayRawDXR so the runtime reports the
                         // DP's full per-view eye set. Logged once below to
                         // confirm eyeCountOutput == viewCount with sane
                         // positions (esp. in >2-view modes, where the DP — not
                         // the runtime — fills N).
-                        XrViewDisplayRawEXT rawProbe = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+                        XrViewDisplayRawDXR rawProbe = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
                         if (g_hasViewRigExt) {
                             viewState.next = &rawProbe;
                         }
 
-                        // XR_EXT_view_rig (#396 W7): drive the runtime display
+                        // XR_DXR_view_rig (#396 W7): drive the runtime display
                         // rig with the app's tunables — the runtime owns the
                         // window resolve and the Kooima math, and returns
                         // render-ready XrView{pose, fov}. Per-locate semantics:
                         // chain the rig on every consume locate.
                         const bool useAppProjection =
                             xr->hasDisplayInfoExt && xr->displayWidthM > 0.0f && g_hasViewRigExt;
-                        XrDisplayRigEXT displayRig = {XR_TYPE_DISPLAY_RIG_EXT};
+                        XrDisplayRigDXR displayRig = {XR_TYPE_DISPLAY_RIG_DXR};
                         XrPosef rigPose = {{0, 0, 0, 1}, {0, 0, 0}};
                         if (useAppProjection) {
                             XMVECTOR rigOri = XMQuaternionRotationRollPitchYaw(
@@ -724,7 +724,7 @@ static void RenderThreadFunc(
                         }
                         xrLocateViews(xr->session, &locateInfo, &viewState, 8, &viewCount, rawViews);
 
-                        // XR_EXT_view_rig raw-channel verification (#396 W7):
+                        // XR_DXR_view_rig raw-channel verification (#396 W7):
                         // one-shot proof the raw channel reports the DP's full
                         // per-view set.
                         if (g_hasViewRigExt) {
@@ -904,8 +904,8 @@ static void RenderThreadFunc(
                                 sessionText += L"\nSession: ";
                                 sessionText += FormatSessionState((int)xr->sessionState);
                                 std::wstring modeText = xr->hasWin32WindowBindingExt ?
-                                    L"XR_EXT_win32_window_binding: ACTIVE (OpenGL)" :
-                                    L"XR_EXT_win32_window_binding: NOT AVAILABLE (OpenGL)";
+                                    L"XR_DXR_win32_window_binding: ACTIVE (OpenGL)" :
+                                    L"XR_DXR_win32_window_binding: NOT AVAILABLE (OpenGL)";
                                 uint32_t dispMaxTileW = tileColumns > 0 ? xr->swapchain.width / tileColumns : xr->swapchain.width;
                                 uint32_t dispMaxTileH = tileRows > 0 ? xr->swapchain.height / tileRows : xr->swapchain.height;
                                 uint32_t dispRenderW, dispRenderH;
@@ -1055,8 +1055,8 @@ static void RenderThreadFunc(
 
                         if (ok && g_l2dMask && g_zone.available && g_zone.pfnCreate && g_zone.pfnSetRects &&
                             g_zone.pfnSubmit) {
-                            XrLocal3DZoneMaskCreateInfoEXT mci = {
-                                (XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_EXT};
+                            XrLocal3DZoneMaskCreateInfoDXR mci = {
+                                (XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_DXR};
                             mci.maskWidth = 0;
                             mci.maskHeight = 0;
                             ok = XR_SUCCEEDED(g_zone.pfnCreate(xr->session, &mci, &g_zone.mask));
@@ -1093,12 +1093,12 @@ static void RenderThreadFunc(
                     projLayer.viewCount = (uint32_t)eyeCount;
                     projLayer.views = projectionViews.data();
 
-                    XrCompositionLayerLocal2DEXT panel1Layer = {
-                        (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
-                    XrCompositionLayerLocal2DEXT panel2Layer = {
-                        (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
-                    XrCompositionLayerLocal2DEXT backdropLayer = {
-                        (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+                    XrCompositionLayerLocal2DDXR panel1Layer = {
+                        (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR};
+                    XrCompositionLayerLocal2DDXR panel2Layer = {
+                        (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR};
+                    XrCompositionLayerLocal2DDXR backdropLayer = {
+                        (XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR};
                     const XrCompositionLayerBaseHeader* layers[4] = {nullptr, nullptr, nullptr, nullptr};
                     uint32_t layerCount = 0;
 

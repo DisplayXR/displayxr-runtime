@@ -578,7 +578,7 @@ ipc_server_set_workspace_pid_provider(ipc_server_workspace_pid_provider_fn fn);
  * value `SupportsFileDialog = REG_DWORD 1` under its registration).
  * Returns false if no orchestrator-managed workspace is running or
  * the controller did not opt in. Drives the early fallback in
- * `xrRequestFilePickerEXT` — without it, requests would queue for a
+ * `xrRequestFilePickerDXR` — without it, requests would queue for a
  * controller that has no handler.
  */
 typedef bool (*ipc_server_workspace_supports_file_dialog_fn)(void);

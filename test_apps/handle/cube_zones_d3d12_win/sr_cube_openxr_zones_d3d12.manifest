@@ -6,7 +6,7 @@
     name="DisplayXR.CubeZonesD3D12"
     type="win32"
   />
-  <description>DisplayXR Cube Zones D3D12 Test Application (XR_EXT_display_zones, array/SPI layout)</description>
+  <description>DisplayXR Cube Zones D3D12 Test Application (XR_DXR_display_zones, array/SPI layout)</description>
 
   <!-- Windows 10/11 compatibility -->
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">

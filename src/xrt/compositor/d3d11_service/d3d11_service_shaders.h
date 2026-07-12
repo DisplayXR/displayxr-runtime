@@ -890,7 +890,7 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
 
     // Phase 2.C spec_version 9: focus tint. When this content blit is for the
     // focused workspace client AND a glow color/intensity is supplied (set by
-    // the workspace controller via XrWorkspaceClientStyleEXT, gated on focus
+    // the workspace controller via XrWorkspaceClientStyleDXR, gated on focus
     // by the runtime), blend color.rgb toward glow_color.rgb across the same
     // feather band that softens unfocused windows. The shape of the falloff
     // is identical (same edge_feather metric, same alpha falloff); only the

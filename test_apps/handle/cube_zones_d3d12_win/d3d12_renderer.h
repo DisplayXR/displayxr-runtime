@@ -96,7 +96,7 @@ void UpdateScene(D3D12Renderer& renderer, float deltaTime, float spinSpeed = 0.5
 // Render the scene to a swapchain image.
 //
 // rtvOverride: when non-null, the scene is rendered into this exact RTV instead
-//   of renderer.rtvHeap[rtvIndex]. The XR_EXT_display_zones ARRAY leg passes an
+//   of renderer.rtvHeap[rtvIndex]. The XR_DXR_display_zones ARRAY leg passes an
 //   RTV built with D3D12_RTV_DIMENSION_TEXTURE2DARRAY (one array slice per view)
 //   from a zone-owned heap; rtvIndex is then ignored.
 // dsvOverride: when non-null, use this DSV instead of the renderer's shared

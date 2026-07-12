@@ -429,10 +429,10 @@ oxr_verify_extensions(struct oxr_logger *log, const struct oxr_extension_status 
 		                 "XR_EXT_dpad_binding requires XR_KHR_binding_modification");
 	}
 
-#ifdef OXR_HAVE_EXT_display_zones
-	if (extensions->EXT_display_zones && (!extensions->EXT_local_3d_zone || !extensions->EXT_view_rig)) {
+#ifdef OXR_HAVE_DXR_display_zones
+	if (extensions->DXR_display_zones && (!extensions->DXR_local_3d_zone || !extensions->DXR_view_rig)) {
 		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
-		                 "XR_EXT_display_zones requires XR_EXT_local_3d_zone and XR_EXT_view_rig");
+		                 "XR_DXR_display_zones requires XR_DXR_local_3d_zone and XR_DXR_view_rig");
 	}
 #endif
 
@@ -557,13 +557,13 @@ oxr_verify_XrSessionCreateInfo(struct oxr_logger *log,
 
 #if defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR) && defined(XRT_HAVE_OPENGL)
 	{
-		const XrGraphicsBindingOpenGLMacOSEXT *opengl_macos = OXR_GET_INPUT_FROM_CHAIN(
-		    createInfo, XR_TYPE_GRAPHICS_BINDING_OPENGL_MACOS_EXT, XrGraphicsBindingOpenGLMacOSEXT);
+		const XrGraphicsBindingOpenGLMacOSDXR *opengl_macos = OXR_GET_INPUT_FROM_CHAIN(
+		    createInfo, XR_TYPE_GRAPHICS_BINDING_OPENGL_MACOS_DXR, XrGraphicsBindingOpenGLMacOSDXR);
 		if (opengl_macos != NULL) {
-			OXR_VERIFY_EXTENSION(log, inst, EXT_macos_gl_binding);
+			OXR_VERIFY_EXTENSION(log, inst, DXR_macos_gl_binding);
 			if (opengl_macos->cglContext == NULL) {
 				return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
-				                 "(XrGraphicsBindingOpenGLMacOSEXT) cglContext is NULL");
+				                 "(XrGraphicsBindingOpenGLMacOSDXR) cglContext is NULL");
 			}
 			return XR_SUCCESS;
 		}
@@ -587,12 +587,12 @@ oxr_verify_XrSessionCreateInfo(struct oxr_logger *log,
 	}
 #endif // OXR_HAVE_MND_headless
 
-#ifdef OXR_HAVE_EXT_spatial_workspace
+#ifdef OXR_HAVE_DXR_spatial_workspace
 	// Phase 2.I-followup: workspace controllers may xrCreateSession with
 	// no graphics binding — they only dispatch workspace + launcher
 	// extension functions. The runtime allocates the IPC client
 	// compositor for transport without a swapchain wrapper.
-	if (inst->extensions.EXT_spatial_workspace) {
+	if (inst->extensions.DXR_spatial_workspace) {
 		return XR_SUCCESS;
 	}
 #endif

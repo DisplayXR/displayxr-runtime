@@ -1142,7 +1142,7 @@ multi_compositor_layer_window_space(struct xrt_compositor *xc,
 }
 
 /*!
- * Local-2D layer (XR_EXT_local_3d_zone v3, #439 Phase 3). The
+ * Local-2D layer (XR_DXR_local_3d_zone v3, #439 Phase 3). The
  * service/multi-compositor consumer is out of scope for v1 (in-process
  * native compositors first — docs/roadmap/unified-2d-3d-phase3-impl.md §2),
  * so drop with a one-time WARN; never an error (layers are advisory
@@ -1169,7 +1169,7 @@ multi_compositor_layer_local_2d(struct xrt_compositor *xc,
 }
 
 /*!
- * 3D display zone layer (XR_EXT_display_zones P5, ADR-027). Enqueued into
+ * 3D display zone layer (XR_DXR_display_zones P5, ADR-027). Enqueued into
  * the progress slot projection-style (one swapchain reference per view);
  * comp_multi_system's transfer switch hands it to the target compositor,
  * which drops with its own one-shot WARN if it has no zone consumer.

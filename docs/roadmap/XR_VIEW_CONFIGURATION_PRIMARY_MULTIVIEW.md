@@ -12,13 +12,13 @@ code-paths: [src/xrt/state_trackers/oxr/]
 
 ## Context
 
-Our `XR_EXT_display_info` extension supports N-view rendering modes (1, 2, or 4 views) under `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO`. This works today because we control the runtime validation -- we dynamically check the active rendering mode's `view_count` instead of hardcoding "must be 1 or 2".
+Our `XR_DXR_display_info` extension supports N-view rendering modes (1, 2, or 4 views) under `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO`. This works today because we control the runtime validation -- we dynamically check the active rendering mode's `view_count` instead of hardcoding "must be 1 or 2".
 
 However, `PRIMARY_STEREO` semantically implies exactly 2 views. Submitting 4 views under a "stereo" view configuration type is a spec stretch that other runtimes or validation layers would reject.
 
 ## Proposal
 
-When submitting the `XR_EXT_display_info` extension spec to Khronos, propose a new view configuration type:
+When submitting the `XR_DXR_display_info` extension spec to Khronos, propose a new view configuration type:
 
 ```c
 XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW
@@ -26,7 +26,7 @@ XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW
 
 This type would:
 - Accept a variable number of views (1, 2, 4, or more) as specified by the active rendering mode
-- Be returned by `xrEnumerateViewConfigurations` when `XR_EXT_display_info` is supported
+- Be returned by `xrEnumerateViewConfigurations` when `XR_DXR_display_info` is supported
 - Allow `xrLocateViews` to return N views and `xrEndFrame` to accept N projection views
 - Coexist with `PRIMARY_STEREO` (runtime can support both)
 

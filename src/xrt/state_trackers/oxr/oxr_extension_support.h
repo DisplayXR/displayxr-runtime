@@ -527,169 +527,169 @@
 
 
 /*
- * XR_EXT_win32_window_binding
+ * XR_DXR_win32_window_binding
  */
-#if defined(XR_EXT_win32_window_binding) && defined(XR_USE_PLATFORM_WIN32)
-#define OXR_HAVE_EXT_win32_window_binding
-#define OXR_EXTENSION_SUPPORT_EXT_win32_window_binding(_) \
-    _(EXT_win32_window_binding, EXT_WIN32_WINDOW_BINDING)
+#if defined(XR_DXR_win32_window_binding) && defined(XR_USE_PLATFORM_WIN32)
+#define OXR_HAVE_DXR_win32_window_binding
+#define OXR_EXTENSION_SUPPORT_DXR_win32_window_binding(_) \
+    _(DXR_win32_window_binding, DXR_WIN32_WINDOW_BINDING)
 #else
-#define OXR_EXTENSION_SUPPORT_EXT_win32_window_binding(_)
+#define OXR_EXTENSION_SUPPORT_DXR_win32_window_binding(_)
 #endif
 
 
 /*
- * XR_EXT_cocoa_window_binding
+ * XR_DXR_cocoa_window_binding
  */
-#if defined(XR_EXT_cocoa_window_binding) && defined(XR_USE_PLATFORM_MACOS)
-#define OXR_HAVE_EXT_cocoa_window_binding
-#define OXR_EXTENSION_SUPPORT_EXT_cocoa_window_binding(_) \
-    _(EXT_cocoa_window_binding, EXT_COCOA_WINDOW_BINDING)
+#if defined(XR_DXR_cocoa_window_binding) && defined(XR_USE_PLATFORM_MACOS)
+#define OXR_HAVE_DXR_cocoa_window_binding
+#define OXR_EXTENSION_SUPPORT_DXR_cocoa_window_binding(_) \
+    _(DXR_cocoa_window_binding, DXR_COCOA_WINDOW_BINDING)
 #else
-#define OXR_EXTENSION_SUPPORT_EXT_cocoa_window_binding(_)
+#define OXR_EXTENSION_SUPPORT_DXR_cocoa_window_binding(_)
 #endif
 
 
 /*
- * XR_EXT_xlib_window_binding
+ * XR_DXR_xlib_window_binding
  *
  * Desktop Linux only — Android also defines XRT_OS_LINUX but has no X11, so
  * gate on "Linux AND NOT Android" (the XRT_OS_LINUX_DESKTOP pattern). Not
  * gated on XR_USE_PLATFORM_XLIB, which tracks GLX (removed from this runtime).
  */
-#if defined(XR_EXT_xlib_window_binding) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
-#define OXR_HAVE_EXT_xlib_window_binding
-#define OXR_EXTENSION_SUPPORT_EXT_xlib_window_binding(_) \
-    _(EXT_xlib_window_binding, EXT_XLIB_WINDOW_BINDING)
+#if defined(XR_DXR_xlib_window_binding) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+#define OXR_HAVE_DXR_xlib_window_binding
+#define OXR_EXTENSION_SUPPORT_DXR_xlib_window_binding(_) \
+    _(DXR_xlib_window_binding, DXR_XLIB_WINDOW_BINDING)
 #else
-#define OXR_EXTENSION_SUPPORT_EXT_xlib_window_binding(_)
+#define OXR_EXTENSION_SUPPORT_DXR_xlib_window_binding(_)
 #endif
 
 
 /*
- * XR_EXT_macos_gl_binding
+ * XR_DXR_macos_gl_binding
  */
-#if defined(XR_EXT_macos_gl_binding) && defined(XR_USE_PLATFORM_MACOS)
-#define OXR_HAVE_EXT_macos_gl_binding
-#define OXR_EXTENSION_SUPPORT_EXT_macos_gl_binding(_) \
-    _(EXT_macos_gl_binding, EXT_MACOS_GL_BINDING)
+#if defined(XR_DXR_macos_gl_binding) && defined(XR_USE_PLATFORM_MACOS)
+#define OXR_HAVE_DXR_macos_gl_binding
+#define OXR_EXTENSION_SUPPORT_DXR_macos_gl_binding(_) \
+    _(DXR_macos_gl_binding, DXR_MACOS_GL_BINDING)
 #else
-#define OXR_EXTENSION_SUPPORT_EXT_macos_gl_binding(_)
+#define OXR_EXTENSION_SUPPORT_DXR_macos_gl_binding(_)
 #endif
 
 
 /*
- * XR_EXT_display_info
+ * XR_DXR_display_info
  */
-#if defined(XR_EXT_display_info)
-#define OXR_HAVE_EXT_display_info
-#define OXR_EXTENSION_SUPPORT_EXT_display_info(_) \
-    _(EXT_display_info, EXT_DISPLAY_INFO)
+#if defined(XR_DXR_display_info)
+#define OXR_HAVE_DXR_display_info
+#define OXR_EXTENSION_SUPPORT_DXR_display_info(_) \
+    _(DXR_display_info, DXR_DISPLAY_INFO)
 #else
-#define OXR_EXTENSION_SUPPORT_EXT_display_info(_)
+#define OXR_EXTENSION_SUPPORT_DXR_display_info(_)
 #endif
 
 
 /*
- * XR_EXT_spatial_workspace
+ * XR_DXR_spatial_workspace
  */
-#if defined(XR_EXT_spatial_workspace)
-#define OXR_HAVE_EXT_spatial_workspace
-#define OXR_EXTENSION_SUPPORT_EXT_spatial_workspace(_) \
-    _(EXT_spatial_workspace, EXT_SPATIAL_WORKSPACE)
+#if defined(XR_DXR_spatial_workspace)
+#define OXR_HAVE_DXR_spatial_workspace
+#define OXR_EXTENSION_SUPPORT_DXR_spatial_workspace(_) \
+    _(DXR_spatial_workspace, DXR_SPATIAL_WORKSPACE)
 #else
-#define OXR_EXTENSION_SUPPORT_EXT_spatial_workspace(_)
+#define OXR_EXTENSION_SUPPORT_DXR_spatial_workspace(_)
 #endif
 
 
 /*
- * XR_EXT_atlas_capture
+ * XR_DXR_atlas_capture
  */
-#if defined(XR_EXT_atlas_capture)
-#define OXR_HAVE_EXT_atlas_capture
-#define OXR_EXTENSION_SUPPORT_EXT_atlas_capture(_) \
-    _(EXT_atlas_capture, EXT_ATLAS_CAPTURE)
+#if defined(XR_DXR_atlas_capture)
+#define OXR_HAVE_DXR_atlas_capture
+#define OXR_EXTENSION_SUPPORT_DXR_atlas_capture(_) \
+    _(DXR_atlas_capture, DXR_ATLAS_CAPTURE)
 #else
-#define OXR_EXTENSION_SUPPORT_EXT_atlas_capture(_)
+#define OXR_EXTENSION_SUPPORT_DXR_atlas_capture(_)
 #endif
 
 
 /*
- * XR_EXT_local_3d_zone
+ * XR_DXR_local_3d_zone
  */
-#if defined(XR_EXT_local_3d_zone)
-#define OXR_HAVE_EXT_local_3d_zone
-#define OXR_EXTENSION_SUPPORT_EXT_local_3d_zone(_) \
-    _(EXT_local_3d_zone, EXT_LOCAL_3D_ZONE)
+#if defined(XR_DXR_local_3d_zone)
+#define OXR_HAVE_DXR_local_3d_zone
+#define OXR_EXTENSION_SUPPORT_DXR_local_3d_zone(_) \
+    _(DXR_local_3d_zone, DXR_LOCAL_3D_ZONE)
 #else
-#define OXR_EXTENSION_SUPPORT_EXT_local_3d_zone(_)
+#define OXR_EXTENSION_SUPPORT_DXR_local_3d_zone(_)
 #endif
 
 
 /*
- * XR_EXT_view_rig
+ * XR_DXR_view_rig
  */
-#if defined(XR_EXT_view_rig)
-#define OXR_HAVE_EXT_view_rig
-#define OXR_EXTENSION_SUPPORT_EXT_view_rig(_) \
-    _(EXT_view_rig, EXT_VIEW_RIG)
+#if defined(XR_DXR_view_rig)
+#define OXR_HAVE_DXR_view_rig
+#define OXR_EXTENSION_SUPPORT_DXR_view_rig(_) \
+    _(DXR_view_rig, DXR_VIEW_RIG)
 #else
-#define OXR_EXTENSION_SUPPORT_EXT_view_rig(_)
+#define OXR_EXTENSION_SUPPORT_DXR_view_rig(_)
 #endif
 
 
 /*
- * XR_EXT_display_zones
+ * XR_DXR_display_zones
  *
  * Hand-added DisplayXR extension (generate_oxr_ext_support.py knows nothing
  * of the DisplayXR blocks — keep them when regenerating).
  */
-#if defined(XR_EXT_display_zones)
-#define OXR_HAVE_EXT_display_zones
-#define OXR_EXTENSION_SUPPORT_EXT_display_zones(_) \
-    _(EXT_display_zones, EXT_DISPLAY_ZONES)
+#if defined(XR_DXR_display_zones)
+#define OXR_HAVE_DXR_display_zones
+#define OXR_EXTENSION_SUPPORT_DXR_display_zones(_) \
+    _(DXR_display_zones, DXR_DISPLAY_ZONES)
 #else
-#define OXR_EXTENSION_SUPPORT_EXT_display_zones(_)
+#define OXR_EXTENSION_SUPPORT_DXR_display_zones(_)
 #endif
 
 
 /*
- * XR_EXT_weave
+ * XR_DXR_weave
  *
  * Hand-added DisplayXR extension (generate_oxr_ext_support.py knows nothing of
  * the DisplayXR blocks — keep them when regenerating). Win32-only: the weave
  * service is implemented on the D3D11 service compositor (#625).
  */
-#if defined(XR_EXT_weave) && defined(XR_USE_PLATFORM_WIN32)
-#define OXR_HAVE_EXT_weave
-#define OXR_EXTENSION_SUPPORT_EXT_weave(_) \
-    _(EXT_weave, EXT_WEAVE)
+#if defined(XR_DXR_weave) && defined(XR_USE_PLATFORM_WIN32)
+#define OXR_HAVE_DXR_weave
+#define OXR_EXTENSION_SUPPORT_DXR_weave(_) \
+    _(DXR_weave, DXR_WEAVE)
 #else
-#define OXR_EXTENSION_SUPPORT_EXT_weave(_)
+#define OXR_EXTENSION_SUPPORT_DXR_weave(_)
 #endif
 
 
 /*
- * XR_EXT_workspace_file_dialog
+ * XR_DXR_workspace_file_dialog
  */
-#if defined(XR_EXT_workspace_file_dialog) && defined(XR_USE_PLATFORM_WIN32)
-#define OXR_HAVE_EXT_workspace_file_dialog
-#define OXR_EXTENSION_SUPPORT_EXT_workspace_file_dialog(_) \
-    _(EXT_workspace_file_dialog, EXT_WORKSPACE_FILE_DIALOG)
+#if defined(XR_DXR_workspace_file_dialog) && defined(XR_USE_PLATFORM_WIN32)
+#define OXR_HAVE_DXR_workspace_file_dialog
+#define OXR_EXTENSION_SUPPORT_DXR_workspace_file_dialog(_) \
+    _(DXR_workspace_file_dialog, DXR_WORKSPACE_FILE_DIALOG)
 #else
-#define OXR_EXTENSION_SUPPORT_EXT_workspace_file_dialog(_)
+#define OXR_EXTENSION_SUPPORT_DXR_workspace_file_dialog(_)
 #endif
 
 
 /*
- * XR_EXT_mcp_tools
+ * XR_DXR_mcp_tools
  */
-#if defined(XR_EXT_mcp_tools)
-#define OXR_HAVE_EXT_mcp_tools
-#define OXR_EXTENSION_SUPPORT_EXT_mcp_tools(_) \
-    _(EXT_mcp_tools, EXT_MCP_TOOLS)
+#if defined(XR_DXR_mcp_tools)
+#define OXR_HAVE_DXR_mcp_tools
+#define OXR_EXTENSION_SUPPORT_DXR_mcp_tools(_) \
+    _(DXR_mcp_tools, DXR_MCP_TOOLS)
 #else
-#define OXR_EXTENSION_SUPPORT_EXT_mcp_tools(_)
+#define OXR_EXTENSION_SUPPORT_DXR_mcp_tools(_)
 #endif
 
 
@@ -1166,19 +1166,19 @@
     OXR_EXTENSION_SUPPORT_EXT_samsung_odyssey_controller(_) \
     OXR_EXTENSION_SUPPORT_EXT_user_presence(_) \
     OXR_EXTENSION_SUPPORT_EXT_win32_appcontainer_compatible(_) \
-    OXR_EXTENSION_SUPPORT_EXT_win32_window_binding(_) \
-    OXR_EXTENSION_SUPPORT_EXT_cocoa_window_binding(_) \
-    OXR_EXTENSION_SUPPORT_EXT_xlib_window_binding(_) \
-    OXR_EXTENSION_SUPPORT_EXT_macos_gl_binding(_) \
-    OXR_EXTENSION_SUPPORT_EXT_display_info(_) \
-    OXR_EXTENSION_SUPPORT_EXT_spatial_workspace(_) \
-    OXR_EXTENSION_SUPPORT_EXT_atlas_capture(_) \
-    OXR_EXTENSION_SUPPORT_EXT_local_3d_zone(_) \
-    OXR_EXTENSION_SUPPORT_EXT_view_rig(_) \
-    OXR_EXTENSION_SUPPORT_EXT_display_zones(_) \
-    OXR_EXTENSION_SUPPORT_EXT_weave(_) \
-    OXR_EXTENSION_SUPPORT_EXT_workspace_file_dialog(_) \
-    OXR_EXTENSION_SUPPORT_EXT_mcp_tools(_) \
+    OXR_EXTENSION_SUPPORT_DXR_win32_window_binding(_) \
+    OXR_EXTENSION_SUPPORT_DXR_cocoa_window_binding(_) \
+    OXR_EXTENSION_SUPPORT_DXR_xlib_window_binding(_) \
+    OXR_EXTENSION_SUPPORT_DXR_macos_gl_binding(_) \
+    OXR_EXTENSION_SUPPORT_DXR_display_info(_) \
+    OXR_EXTENSION_SUPPORT_DXR_spatial_workspace(_) \
+    OXR_EXTENSION_SUPPORT_DXR_atlas_capture(_) \
+    OXR_EXTENSION_SUPPORT_DXR_local_3d_zone(_) \
+    OXR_EXTENSION_SUPPORT_DXR_view_rig(_) \
+    OXR_EXTENSION_SUPPORT_DXR_display_zones(_) \
+    OXR_EXTENSION_SUPPORT_DXR_weave(_) \
+    OXR_EXTENSION_SUPPORT_DXR_workspace_file_dialog(_) \
+    OXR_EXTENSION_SUPPORT_DXR_mcp_tools(_) \
     OXR_EXTENSION_SUPPORT_BD_controller_interaction(_) \
     OXR_EXTENSION_SUPPORT_FB_body_tracking(_) \
     OXR_EXTENSION_SUPPORT_FB_composition_layer_alpha_blend(_) \

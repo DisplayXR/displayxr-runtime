@@ -96,7 +96,7 @@ if(WIN32)
 endif()
 target_link_libraries(ipc_client PRIVATE aux_util ipc_shared)
 # Phase 2.D: ipc_client_compositor.c translates wire workspace_input_event
-# wire records into the public XrWorkspaceInputEventEXT struct. Pulling the
+# wire records into the public XrWorkspaceInputEventDXR struct. Pulling the
 # vendor-API openxr headers here is acceptable — the public surface is part
 # of the runtime ABI and the IPC bridge is already a thin translator.
 target_link_libraries(ipc_client PRIVATE xrt-external-openxr)

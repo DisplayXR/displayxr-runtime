@@ -2,9 +2,9 @@
 # Copyright 2026, DisplayXR / Leia Inc.
 # SPDX-License-Identifier: BSL-1.0
 #
-# XR_EXT_mcp_tools e2e (#447) — the full app-defined-tool round-trip.
+# XR_DXR_mcp_tools e2e (#447) — the full app-defined-tool round-trip.
 #
-# Launches cube_handle_metal_macos (the reference XR_EXT_mcp_tools
+# Launches cube_handle_metal_macos (the reference XR_DXR_mcp_tools
 # adopter) with DISPLAYXR_MCP=1 and verifies, via the displayxr-mcp
 # stdio adapter on the per-PID endpoint:
 #
@@ -12,8 +12,8 @@
 #      _meta {"displayxr/group":"app"} and the result-level
 #      _meta {"displayxr/appId":"cube-metal"}.
 #   2. tools/call set_spin round-trips through the OpenXR event queue
-#      (trampoline -> XrEventDataMCPToolCallEXT -> app frame loop ->
-#      xrSubmitMCPToolResultEXT) and the new value reads back through
+#      (trampoline -> XrEventDataMCPToolCallDXR -> app frame loop ->
+#      xrSubmitMCPToolResultDXR) and the new value reads back through
 #      get_status.
 #   3. A bad call (missing required arg) surfaces as a JSON-RPC error,
 #      not a hang.
@@ -72,7 +72,7 @@ if [[ ! -S "$SOCK" ]]; then
 	exit 1
 fi
 for _ in $(seq 1 50); do
-	grep -q "XR_EXT_mcp_tools: appId=0" /tmp/mcp_app_tools_app.log && break
+	grep -q "XR_DXR_mcp_tools: appId=0" /tmp/mcp_app_tools_app.log && break
 	sleep 0.1
 done
 # get_status asserts session_running — wait for the session to begin.

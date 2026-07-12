@@ -4,13 +4,13 @@
  * @file
  * @brief  OpenGL OpenXR spinning cube with external window (macos_gl_binding)
  *
- * Demonstrates XR_EXT_macos_gl_binding with OpenGL: the app creates its own
+ * Demonstrates XR_DXR_macos_gl_binding with OpenGL: the app creates its own
  * NSWindow + NSOpenGLView and passes the CGL context to the runtime.
  * The runtime routes GL rendering through the Metal native compositor
  * using IOSurface-backed GL_TEXTURE_RECTANGLE textures.
  *
  * Features:
- * - App creates and owns the NSWindow (XR_EXT_cocoa_window_binding)
+ * - App creates and owns the NSWindow (XR_DXR_cocoa_window_binding)
  * - Mouse drag camera rotation, scroll zoom, WASD movement
  * - OpenGL rendering (macOS legacy GL 4.1, no Metal/Vulkan)
  * - ESC to quit, Space to reset view
@@ -23,8 +23,8 @@
 #define XR_USE_GRAPHICS_API_OPENGL
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-#include <openxr/XR_EXT_cocoa_window_binding.h>
-#include <openxr/XR_EXT_macos_gl_binding.h>
+#include <openxr/XR_DXR_cocoa_window_binding.h>
+#include <openxr/XR_DXR_macos_gl_binding.h>
 
 #include <cmath>
 #include <csignal>
@@ -45,9 +45,9 @@
 #include "atlas_capture.h"
 #include "xr_window_space_hud.h"
 #include "hud_renderer_macos.h"
-#include <openxr/XR_EXT_display_info.h>
-#include <openxr/XR_EXT_atlas_capture.h>
-#include <openxr/XR_EXT_view_rig.h>
+#include <openxr/XR_DXR_display_info.h>
+#include <openxr/XR_DXR_atlas_capture.h>
+#include <openxr/XR_DXR_view_rig.h>
 
 // ============================================================================
 // Logging
@@ -735,7 +735,7 @@ struct InputState {
     bool hudVisible = true;
     // Rendering mode REQUESTS — single source of truth lives on the runtime
     // side (read back as app.currentModeIndex after the runtime's
-    // XrEventDataRenderingModeChangedEXT lands). Keys emit transient requests;
+    // XrEventDataRenderingModeChangedDXR lands). Keys emit transient requests;
     // the actual current mode is never mirrored here.
     uint32_t renderingModeCount = 0;             // mirror of app.renderingModeCount for keypress bounds
     bool cycleRenderingModeRequested = false;    // V key
@@ -830,7 +830,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLef
 
         // INV-1.3: open on the 3D panel (#715). (screenLeft, screenTop) is the
         // panel top-left in top-down global coordinates (origin = primary
-        // top-left, XrDisplayDesktopPositionEXT); flip into AppKit's bottom-up
+        // top-left, XrDisplayDesktopPositionDXR); flip into AppKit's bottom-up
         // space. (0,0) = primary — the titled window is auto-constrained below
         // the menu bar, so it is always a safe create position.
         NSRect frame = NSMakeRect(100, 100, width, height);
@@ -1117,24 +1117,24 @@ struct AppXrSession {
     bool hasCocoaWindowBinding;
     bool hasMacosGlBinding;
 
-    // XR_EXT_display_info
+    // XR_DXR_display_info
     bool hasDisplayInfoExt;
     float displayWidthM;
     float displayHeightM;
     float nominalViewerX, nominalViewerY, nominalViewerZ;
     uint32_t displayPixelWidth, displayPixelHeight;
     float recommendedViewScaleX, recommendedViewScaleY;
-    // v16 XrDisplayDesktopPositionEXT — 3D panel top-left in virtual-desktop
+    // v16 XrDisplayDesktopPositionDXR — 3D panel top-left in virtual-desktop
     // pixels (top-down, origin = primary top-left); (0,0) = primary/unknown.
     int32_t displayScreenLeft, displayScreenTop;
-    PFN_xrRequestDisplayModeEXT pfnRequestDisplayModeEXT;
-    PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingModeEXT;
-    PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT;
+    PFN_xrRequestDisplayModeDXR pfnRequestDisplayModeEXT;
+    PFN_xrRequestDisplayRenderingModeDXR pfnRequestDisplayRenderingModeEXT;
+    PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateDisplayRenderingModesEXT;
 
-    // XR_EXT_atlas_capture (W6 of #396): runtime-owned 'I'-key atlas capture.
+    // XR_DXR_atlas_capture (W6 of #396): runtime-owned 'I'-key atlas capture.
     bool hasAtlasCaptureExt = false;
-    bool hasViewRigExt = false;  // XR_EXT_view_rig (#396 W7)
-    PFN_xrCaptureAtlasEXT pfnCaptureAtlasEXT = nullptr;
+    bool hasViewRigExt = false;  // XR_DXR_view_rig (#396 W7)
+    PFN_xrCaptureAtlasDXR pfnCaptureAtlasEXT = nullptr;
     // Enumerated rendering mode info. currentModeIndex is initialized to mode 1
     // as a fallback for runtimes that don't expose isActive; v13+ runtimes
     // replace it via the enumerate step (initial-mode-sync, #234/#239).
@@ -1178,45 +1178,45 @@ static bool InitializeOpenXR(AppXrSession &app)
         LOG_INFO("  %s v%u", e.extensionName, e.extensionVersion);
         if (strcmp(e.extensionName, XR_KHR_OPENGL_ENABLE_EXTENSION_NAME) == 0)
             hasOpenGLEnable = true;
-        if (strcmp(e.extensionName, XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME) == 0)
+        if (strcmp(e.extensionName, XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME) == 0)
             app.hasCocoaWindowBinding = true;
-        if (strcmp(e.extensionName, XR_EXT_MACOS_GL_BINDING_EXTENSION_NAME) == 0)
+        if (strcmp(e.extensionName, XR_DXR_MACOS_GL_BINDING_EXTENSION_NAME) == 0)
             app.hasMacosGlBinding = true;
-        if (strcmp(e.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0)
+        if (strcmp(e.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0)
             app.hasDisplayInfoExt = true;
-        if (strcmp(e.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0)
+        if (strcmp(e.extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0)
             app.hasAtlasCaptureExt = true;
-        if (strcmp(e.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0)
+        if (strcmp(e.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0)
             app.hasViewRigExt = true;
     }
 
     if (!app.hasMacosGlBinding) {
-        LOG_ERROR("Runtime does not support XR_EXT_macos_gl_binding");
+        LOG_ERROR("Runtime does not support XR_DXR_macos_gl_binding");
         return false;
     }
     if (!app.hasCocoaWindowBinding) {
-        LOG_WARN("Runtime does not support XR_EXT_cocoa_window_binding — will create own window");
+        LOG_WARN("Runtime does not support XR_DXR_cocoa_window_binding — will create own window");
     }
-    LOG_INFO("XR_EXT_display_info: %s", app.hasDisplayInfoExt ? "available" : "not available");
-    LOG_INFO("XR_EXT_atlas_capture: %s", app.hasAtlasCaptureExt ? "available" : "not available");
-    LOG_INFO("XR_EXT_view_rig: %s", app.hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_display_info: %s", app.hasDisplayInfoExt ? "available" : "not available");
+    LOG_INFO("XR_DXR_atlas_capture: %s", app.hasAtlasCaptureExt ? "available" : "not available");
+    LOG_INFO("XR_DXR_view_rig: %s", app.hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
 
     // Enable extensions
-    std::vector<const char *> enabledExts = {XR_EXT_MACOS_GL_BINDING_EXTENSION_NAME};
+    std::vector<const char *> enabledExts = {XR_DXR_MACOS_GL_BINDING_EXTENSION_NAME};
     if (hasOpenGLEnable) {
         enabledExts.push_back(XR_KHR_OPENGL_ENABLE_EXTENSION_NAME);
     }
     if (app.hasCocoaWindowBinding) {
-        enabledExts.push_back(XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME);
+        enabledExts.push_back(XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME);
     }
     if (app.hasDisplayInfoExt) {
-        enabledExts.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+        enabledExts.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
     }
     if (app.hasAtlasCaptureExt) {
-        enabledExts.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
+        enabledExts.push_back(XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME);
     }
     if (app.hasViewRigExt) {
-        enabledExts.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
+        enabledExts.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -1229,8 +1229,8 @@ static bool InitializeOpenXR(AppXrSession &app)
 
     XR_CHECK(xrCreateInstance(&createInfo, &app.instance));
     LOG_INFO("OpenXR instance created");
-    LOG_INFO("XR_EXT_macos_gl_binding: enabled");
-    LOG_INFO("XR_EXT_cocoa_window_binding: %s", app.hasCocoaWindowBinding ? "enabled" : "not available");
+    LOG_INFO("XR_DXR_macos_gl_binding: enabled");
+    LOG_INFO("XR_DXR_cocoa_window_binding: %s", app.hasCocoaWindowBinding ? "enabled" : "not available");
 
     // Get system
     XrSystemGetInfo sysInfo = {XR_TYPE_SYSTEM_GET_INFO};
@@ -1241,12 +1241,12 @@ static bool InitializeOpenXR(AppXrSession &app)
     // Get system name and display info
     {
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
-        XrDisplayInfoEXT displayInfo = {};
-        displayInfo.type = XR_TYPE_DISPLAY_INFO_EXT;
+        XrDisplayInfoDXR displayInfo = {};
+        displayInfo.type = XR_TYPE_DISPLAY_INFO_DXR;
         // INV-1.3: panel desktop position, so the window below opens on the
         // 3D panel instead of the primary monitor (spec v16, #715).
-        XrDisplayDesktopPositionEXT desktopPos = {};
-        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT;
+        XrDisplayDesktopPositionDXR desktopPos = {};
+        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
         if (app.hasDisplayInfoExt) {
             sysProps.next = &displayInfo;
             displayInfo.next = &desktopPos;
@@ -1275,17 +1275,17 @@ static bool InitializeOpenXR(AppXrSession &app)
             }
         }
         if (app.hasDisplayInfoExt) {
-            xrGetInstanceProcAddr(app.instance, "xrRequestDisplayModeEXT",
+            xrGetInstanceProcAddr(app.instance, "xrRequestDisplayModeDXR",
                 (PFN_xrVoidFunction*)&app.pfnRequestDisplayModeEXT);
-            xrGetInstanceProcAddr(app.instance, "xrRequestDisplayRenderingModeEXT",
+            xrGetInstanceProcAddr(app.instance, "xrRequestDisplayRenderingModeDXR",
                 (PFN_xrVoidFunction*)&app.pfnRequestDisplayRenderingModeEXT);
-            xrGetInstanceProcAddr(app.instance, "xrEnumerateDisplayRenderingModesEXT",
+            xrGetInstanceProcAddr(app.instance, "xrEnumerateDisplayRenderingModesDXR",
                 (PFN_xrVoidFunction*)&app.pfnEnumerateDisplayRenderingModesEXT);
         }
         if (app.hasAtlasCaptureExt) {
-            xrGetInstanceProcAddr(app.instance, "xrCaptureAtlasEXT",
+            xrGetInstanceProcAddr(app.instance, "xrCaptureAtlasDXR",
                 (PFN_xrVoidFunction*)&app.pfnCaptureAtlasEXT);
-            LOG_INFO("xrCaptureAtlasEXT: %s", app.pfnCaptureAtlasEXT ? "resolved" : "NULL");
+            LOG_INFO("xrCaptureAtlasDXR: %s", app.pfnCaptureAtlasEXT ? "resolved" : "NULL");
         }
     }
 
@@ -1340,20 +1340,20 @@ static bool CreateSession(AppXrSession &app)
     // Get CGL context from our NSOpenGLContext
     CGLContextObj cglCtx = (CGLContextObj)[g_glContext CGLContextObj];
 
-    XrGraphicsBindingOpenGLMacOSEXT glBinding = {};
-    glBinding.type = XR_TYPE_GRAPHICS_BINDING_OPENGL_MACOS_EXT;
+    XrGraphicsBindingOpenGLMacOSDXR glBinding = {};
+    glBinding.type = XR_TYPE_GRAPHICS_BINDING_OPENGL_MACOS_DXR;
     glBinding.cglContext = (void *)cglCtx;
     glBinding.cglPixelFormat = nullptr;
 
     // Chain the cocoa window binding — pass our NSView to the runtime
-    XrCocoaWindowBindingCreateInfoEXT cocoaBinding = {};
-    cocoaBinding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT;
+    XrCocoaWindowBindingCreateInfoDXR cocoaBinding = {};
+    cocoaBinding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR;
     cocoaBinding.next = nullptr;
     cocoaBinding.viewHandle = (__bridge void *)g_glView;
 
     if (app.hasCocoaWindowBinding) {
         glBinding.next = &cocoaBinding;
-        LOG_INFO("Chaining XR_EXT_cocoa_window_binding with NSView %p", cocoaBinding.viewHandle);
+        LOG_INFO("Chaining XR_DXR_cocoa_window_binding with NSView %p", cocoaBinding.viewHandle);
     }
 
     XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
@@ -1369,9 +1369,9 @@ static bool CreateSession(AppXrSession &app)
         uint32_t modeCount = 0;
         XrResult enumRes = app.pfnEnumerateDisplayRenderingModesEXT(app.session, 0, &modeCount, nullptr);
         if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
-            std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
+            std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
             for (uint32_t i = 0; i < modeCount; i++) {
-                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
                 modes[i].next = nullptr;
             }
             enumRes = app.pfnEnumerateDisplayRenderingModesEXT(app.session, modeCount, &modeCount, modes.data());
@@ -1520,17 +1520,17 @@ static void PollEvents(AppXrSession &app)
             }
             break;
         }
-        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT: {
-            auto* modeEvent = (XrEventDataRenderingModeChangedEXT*)&event;
+        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
+            auto* modeEvent = (XrEventDataRenderingModeChangedDXR*)&event;
             LOG_INFO("Rendering mode changed: %u -> %u",
                 modeEvent->previousModeIndex, modeEvent->currentModeIndex);
             app.currentModeIndex = modeEvent->currentModeIndex;
             break;
         }
-        case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT: {
+        case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR: {
             // Edge-triggered tracking loss/recovery (#441 v14); HUD state
-            // also refreshes per-frame from the XrViewEyeTrackingStateEXT chain.
-            auto* etEvent = (XrEventDataEyeTrackingStateChangedEXT*)&event;
+            // also refreshes per-frame from the XrViewEyeTrackingStateDXR chain.
+            auto* etEvent = (XrEventDataEyeTrackingStateChangedDXR*)&event;
             LOG_INFO("Eye tracking state changed: isTracking=%s mode=%u",
                 etEvent->isTracking == XR_TRUE ? "YES" : "NO",
                 (uint32_t)etEvent->activeMode);
@@ -1650,7 +1650,7 @@ int main(int argc, char **argv)
     }
 
     // Initial rendering mode is sourced from the runtime via v13 `isActive`
-    // (set during xrEnumerateDisplayRenderingModesEXT above). Fallback is
+    // (set during xrEnumerateDisplayRenderingModesDXR above). Fallback is
     // mode 1 (default of app.currentModeIndex).
 
     g_input.viewParams.virtualDisplayHeight = 0.24f;
@@ -1672,8 +1672,8 @@ int main(int argc, char **argv)
 
         // Rendering mode requests (V=cycle next, 0-8=jump absolute) through the
         // dxr::ModeSwitch sequencer: it eases g_input.viewParams.ipdFactor around
-        // the switch and fires xrRequestDisplayRenderingModeEXT on the right frame.
-        // The runtime owns the current mode; the XrEventDataRenderingModeChangedEXT
+        // the switch and fires xrRequestDisplayRenderingModeDXR on the right frame.
+        // The runtime owns the current mode; the XrEventDataRenderingModeChangedDXR
         // event updates app.currentModeIndex (render paths + HUD read it directly).
         if (!g_modeSwitchConfigured) {
             g_modeSwitch.configure(0.18f, dxr::ModeSwitchEasing::SmoothStep);
@@ -1747,7 +1747,7 @@ int main(int argc, char **argv)
         locateInfo.displayTime = frameState.predictedDisplayTime;
         locateInfo.space = app.localSpace;
 
-        // XR_EXT_view_rig (#396 W7): drive the runtime rig matching the app's
+        // XR_DXR_view_rig (#396 W7): drive the runtime rig matching the app's
         // current mode (C selects the rig) with the app's tunables — the
         // runtime owns the window resolve and the Kooima math, and returns
         // render-ready XrView{pose, fov}. Per-locate semantics: chain the rig
@@ -1757,9 +1757,9 @@ int main(int argc, char **argv)
         const bool useRig =
             app.hasViewRigExt && app.displayWidthM > 0 && app.displayHeightM > 0;
         const bool rigCamera = useRig && g_input.cameraMode;
-        XrCameraRigEXT cameraRig = {XR_TYPE_CAMERA_RIG_EXT};
-        XrDisplayRigEXT displayRig = {XR_TYPE_DISPLAY_RIG_EXT};
-        XrViewDisplayRawEXT viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+        XrCameraRigDXR cameraRig = {XR_TYPE_CAMERA_RIG_DXR};
+        XrDisplayRigDXR displayRig = {XR_TYPE_DISPLAY_RIG_DXR};
+        XrViewDisplayRawDXR viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
         XrPosef rigPose = {{0, 0, 0, 1}, {0, 0, 0}};
         if (useRig) {
             quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &rigPose.orientation);
@@ -1835,7 +1835,7 @@ int main(int argc, char **argv)
         if (frameState.shouldRender && viewCount >= 1) {
             // Save display-space eye positions for the HUD. Under the rig,
             // views[] carries render-ready world eyes — the raw channel
-            // (XrViewDisplayRawEXT) keeps the HUD readout in display space.
+            // (XrViewDisplayRawDXR) keeps the HUD readout in display space.
             app.eyeCount = modeViewCount;
             if (useRig && viewRigRaw.eyeCountOutput > 0) {
                 for (uint32_t v = 0; v < viewRigRaw.eyeCountOutput && v < 8; v++) {
@@ -1921,7 +1921,7 @@ int main(int argc, char **argv)
                         eyeParams.data(), eyeCount);
 
             // 'I' key: snapshot the multi-view atlas via the runtime-owned
-            // XR_EXT_atlas_capture (W6 of #396) — the runtime does the readback
+            // XR_DXR_atlas_capture (W6 of #396) — the runtime does the readback
             // from its own atlas image, so the app keeps no staging texture.
             // PROJECTION_ONLY = the app's own projection atlas, pre-compose.
             // Skipped for mono (1×1) layouts; the runtime appends
@@ -1932,25 +1932,25 @@ int main(int argc, char **argv)
                     if (display3D && (tileColumns > 1 || tileRows > 1)) {
                         std::string prefix = dxr_capture::MakeCaptureAtlasPrefix(
                             "cube_handle_gl_macos", tileColumns, tileRows);
-                        XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
+                        XrAtlasCaptureInfoDXR info = {XR_TYPE_ATLAS_CAPTURE_INFO_DXR};
                         info.next = nullptr;
-                        info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT;
+                        info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_DXR;
                         strncpy(info.pathPrefix, prefix.c_str(),
-                                XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1);
-                        info.pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1] = '\0';
+                                XR_ATLAS_CAPTURE_PATH_MAX_DXR - 1);
+                        info.pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_DXR - 1] = '\0';
                         XrResult cr = app.pfnCaptureAtlasEXT(app.session, &info, nullptr);
                         if (XR_SUCCEEDED(cr)) {
                             LOG_INFO("Atlas capture requested -> %s_atlas_%u_%ux%u.png",
                                      prefix.c_str(), tileColumns * tileRows, tileColumns, tileRows);
                             dxr_capture::TriggerCaptureFlash((__bridge void*)g_glView);
                         } else {
-                            LOG_WARN("xrCaptureAtlasEXT failed: 0x%x", (unsigned)cr);
+                            LOG_WARN("xrCaptureAtlasDXR failed: 0x%x", (unsigned)cr);
                         }
                     } else {
                         LOG_WARN("Capture skipped: need 3D mode with cols/rows > 1");
                     }
                 } else {
-                    LOG_WARN("Atlas capture unavailable: XR_EXT_atlas_capture not active");
+                    LOG_WARN("Atlas capture unavailable: XR_DXR_atlas_capture not active");
                 }
             }
         }
@@ -2057,7 +2057,7 @@ int main(int argc, char **argv)
             const char* kooimaMode = g_input.cameraMode
                 ? "Camera-Centric [C=Toggle]" : "Display-Centric [C=Toggle]";
             snprintf(buf, sizeof(buf),
-                "XR_EXT_cocoa_window_binding: %s (OpenGL)\nMode: %s (%s)%s\nKooima: %s",
+                "XR_DXR_cocoa_window_binding: %s (OpenGL)\nMode: %s (%s)%s\nKooima: %s",
                 app.hasCocoaWindowBinding ? "ACTIVE" : "NOT AVAILABLE",
                 outputModeName, display3D ? "3D" : "2D", lockSuffix, kooimaMode);
             g_hudModeText = utf8ToW(buf);

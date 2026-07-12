@@ -1,7 +1,7 @@
 // Copyright 2026, DisplayXR
 // SPDX-License-Identifier: BSL-1.0
 //
-// XR_EXT_display_zones (ADR-027): fullscreen-triangle vertex shader for the
+// XR_DXR_display_zones (ADR-027): fullscreen-triangle vertex shader for the
 // zone alpha-over draw path. The viewport is set to the zone's destination
 // rect inside the atlas tile; the push-constant src_rect maps the triangle's
 // 0..1 uv onto the zone's view-tile sub-rect of the source swapchain.

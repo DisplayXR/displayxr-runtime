@@ -24,7 +24,7 @@
 #   # Linux with the VK_KHR_xcb_surface present path (Phase 1). Without it the
 #   # runtime still builds headless (Phase 0) but has no on-screen compositor.
 #   # libx11-dev + libx11-xcb-dev supply Xlib + XGetXCBConnection — the runtime
-#   # converts an app-provided Xlib window (XR_EXT_xlib_window_binding, Phase 3)
+#   # converts an app-provided Xlib window (XR_DXR_xlib_window_binding, Phase 3)
 #   # to its XCB connection, and the handle-class test app opens an X11 window.
 #   # optional (enables the legacy udev VR prober — NOT needed for selftest):
 #   sudo apt-get install -y libudev-dev
@@ -36,7 +36,7 @@
 #   ./scripts/build_linux.sh --apps      # also build the OpenXR loader + the
 #                                        # test apps: cube_hosted_legacy_vk_linux
 #                                        # (hosted, Phase 1b) and cube_handle_vk_linux
-#                                        # (handle, XR_EXT_xlib_window_binding,
+#                                        # (handle, XR_DXR_xlib_window_binding,
 #                                        # Phase 3); running them needs a GPU + X
 #                                        # server
 
@@ -187,7 +187,7 @@ if [ "$BUILD_APPS" = "ON" ]; then
   # Step 5b: build the Vulkan cube test apps + per-app run scripts.
   #   cube_hosted_legacy_vk_linux — hosted: runtime self-creates the XCB window.
   #   cube_handle_vk_linux        — handle: app creates its own X11 window and
-  #                                 passes it via XR_EXT_xlib_window_binding.
+  #                                 passes it via XR_DXR_xlib_window_binding.
   for APP in cube_hosted_legacy_vk_linux cube_handle_vk_linux; do
     APP_DIR="$ROOT/test_apps/$APP"
     # CANDIDATE PATCH (#706 Linux validation): the apps aren't all flat under

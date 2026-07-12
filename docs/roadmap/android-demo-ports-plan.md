@@ -33,7 +33,7 @@ JNI touch, AMediaCodec, the Adreno sort) is device-verified and kept; only the
 **All three** copied the desktop Kooima view-math files (`display3d_view.c` /
 `camera3d_view.c` / `view_params.h`) but left them **dead/unwired** — the Android
 `main.cpp` consumes raw `xrLocateViews` `views[i].fov`. They neither chain
-`XR_EXT_view_rig` (the `cube_handle_vk_*` runtime-side-Kooima path) nor run the
+`XR_DXR_view_rig` (the `cube_handle_vk_*` runtime-side-Kooima path) nor run the
 desktop app-side `display3d_view`. Per runtime#510 `15ee44e94`, the **OOP server
 computes server-side Kooima** and returns it via `views[i].fov` regardless — so
 the apps already render correctly; the rig is a *display-centric framing
@@ -88,7 +88,7 @@ upside* — runs on parts with weak/absent int64). **No runtime impact.**
 > alone does NOT bring the OOP service up on this device — launch the runtime's
 > launcher activity once.)
 
-> **Rig follow-up status (2026-06-10): PAUSED.** Wiring `XR_EXT_view_rig` into the
+> **Rig follow-up status (2026-06-10): PAUSED.** Wiring `XR_DXR_view_rig` into the
 > android leg got it rendering 3D (`VIEW-RIG IPC … eyes=2`; the rig is what makes
 > the OOP runtime return valid view poses — the plain locate path returns
 > `got_eyes=0` → black). But the *depth/focus* came out wrong and couldn't be
@@ -99,7 +99,7 @@ upside* — runs on parts with weak/absent int64). **No runtime impact.**
 > (~½ the desktop's) the parallax ≈ doubles → "comes off screen a lot." vHeight
 > alone can't satisfy both correct size and comfortable depth for a deep model;
 > the lever is depth placement / nominal viewing distance, which is a
-> runtime-side rig question. **Decision: establish the `XR_EXT_view_rig` path on
+> runtime-side rig question. **Decision: establish the `XR_DXR_view_rig` path on
 > the Windows + macOS legs first (where it's verifiable), then redo the android
 > rig to match.** The android rig experiments were reverted; PR #26 stays at the
 > raw-`xrLocateViews` v1 (renders only once the rig path is settled). The
@@ -110,7 +110,7 @@ upside* — runs on parts with weak/absent int64). **No runtime impact.**
   `MainActivity.kt`, `main.cpp`, JNI touch). CMake → shared `model_common/`.
 - Gate OBJ/STL/FBX/USD in `model_common/model_loader.cpp` (`#if !defined(__ANDROID__)`).
 - v1 ships on OOP server-side Kooima (suki's path, 60–76 fps on device).
-- **Follow-up:** wire `XR_EXT_view_rig` (header vendored into `openxr_includes/`)
+- **Follow-up:** wire `XR_DXR_view_rig` (header vendored into `openxr_includes/`)
   for display-centric framing parity with desktop; delete dead `display3d_view`.
 - Bundled model: the demo's existing `sample.glb` (multi-model + license
   attribution later).
@@ -127,7 +127,7 @@ upside* — runs on parts with weak/absent int64). **No runtime impact.**
   video (NV12 → GPU BT.709) plays ~20 fps, transport works, rotation re-adapts.
 - **Rig finding:** the plain `xrLocateViews` path now returns VALID views on
   this device (`rig=0`) — the runtime#510 server-side view-pose path works, so
-  the minimal `XrDisplayRigEXT` contingency (auto-enables after 10 invalid
+  the minimal `XrDisplayRigDXR` contingency (auto-enables after 10 invalid
   locates; identity pose, factors=1) stayed dormant. The modelviewer rig pause
   is therefore about *framing*, not validity.
 - **New environment issue (runtime#523):** the nubia's vendor CPU freezer

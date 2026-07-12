@@ -14,7 +14,7 @@
 #include "util/u_pretty_print.h"
 #include "util/u_visibility_mask.h"
 #include "util/u_trace_marker.h"
-#include "util/u_canvas.h" // XR_EXT_display_zones P5: zone-scoped locate rebase
+#include "util/u_canvas.h" // XR_DXR_display_zones P5: zone-scoped locate rebase
 
 #include "server/ipc_server.h"
 #include "ipc_server_generated.h"
@@ -114,7 +114,7 @@ get_orchestrator_workspace_pid(void)
 // fall back to the orchestrator's. On Windows both agree (the orchestrator spawns
 // the shell, which then activates), so this is a no-op there; on macOS it closes
 // the otherwise-open input gate so the controller — not a content app polling
-// xrEnumerateWorkspaceInputEventsEXT — owns the forwarded input stream.
+// xrEnumerateWorkspaceInputEventsDXR — owns the forwarded input stream.
 static unsigned long
 effective_workspace_controller_pid(struct ipc_server *s)
 {
@@ -234,13 +234,13 @@ fill_surplus_view_poses(struct xrt_device *xdev,
  * Try to get SR-aware view poses for IPC clients.
  * Returns true if SR view poses were computed, false to fall back to device poses.
  */
-// rig / rig_reply (#396 W7, XR_EXT_view_rig over IPC): when `rig` carries a
+// rig / rig_reply (#396 W7, XR_DXR_view_rig over IPC): when `rig` carries a
 // chained descriptor it drives the two-rig branch below exactly like the
 // in-process oxr_session.c path — rig tunables replace the qwerty stereo
 // state, the rig pose replaces the qwerty/zero display pose, and the
 // use_qwerty_head forcing is lifted (the explicit descriptor is the knowledge
 // that forcing substituted for). `rig_reply` (optional) receives the raw
-// input set (XrViewDisplayRawEXT payload) + the world-space rig eyes. Both
+// input set (XrViewDisplayRawDXR payload) + the world-space rig eyes. Both
 // NULL on the legacy device_get_view_poses path — zero behavior change.
 static bool
 ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
@@ -310,7 +310,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		if (eye_count > 1) raw_eyes[1] = right_eye;
 	}
 
-	// XR_EXT_view_rig raw channel (#396 W7): report the DP's eyes VERBATIM —
+	// XR_DXR_view_rig raw channel (#396 W7): report the DP's eyes VERBATIM —
 	// the FULL per-view set the DP provides (sim_display fills N for >2-view
 	// modes; Leia is 2-view), not the 2-eye render pair above. The runtime
 	// never synthesizes eyes; multi-view fill is the DP's responsibility, so
@@ -364,7 +364,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 			have_wm = comp_d3d11_service_get_client_window_metrics(s->xsysc, xc, &wm) &&
 			          wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f;
 		}
-		// XR_EXT_view_rig locates (#396 W7): non-workspace IPC clients have
+		// XR_DXR_view_rig locates (#396 W7): non-workspace IPC clients have
 		// no virtual-window slot, so the per-client lookup above fails and
 		// the math would run against the GLOBAL service window (native-res,
 		// effectively display-scoped) — but the in-process path is always
@@ -392,7 +392,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 			          wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f;
 		}
 
-		// XR_EXT_display_zones P5 — zone-scoped locate over IPC: rebase
+		// XR_DXR_display_zones P5 — zone-scoped locate over IPC: rebase
 		// the resolved window metrics to the client's forwarded zone rect,
 		// exactly like the in-process oxr_session.c zone block. The rect
 		// IS the canvas: everything below (Kooima meters, eye offsets,
@@ -434,7 +434,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 			                      fabsf(win_orient.y) > 0.0001f ||
 			                      fabsf(win_orient.z) > 0.0001f ||
 			                      fabsf(win_orient.w - 1.0f) > 0.0001f);
-			// XR_EXT_view_rig raw channel: the effective canvas on the
+			// XR_DXR_view_rig raw channel: the effective canvas on the
 			// panel — wm already describes the canvas sub-rect when one
 			// is set (u_canvas_apply_to_metrics), the client area
 			// otherwise. Same gate as the screen dims above so rect and
@@ -631,7 +631,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		}
 		fill_surplus_view_poses(xdev, eye_count, view_count, out_fovs, out_poses);
 
-		// XR_EXT_view_rig raw channel (#396 W7 bridge-raw tail): complete the
+		// XR_DXR_view_rig raw channel (#396 W7 bridge-raw tail): complete the
 		// raw block for headless relays. Eyes/count/sampleTime/isTracking were
 		// captured above (verbatim, pre-rebase — and the rebase is a no-op for
 		// headless clients, so raw eyes == out_poses positions by
@@ -654,7 +654,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 
 	// Workspace rig override (#396 W7): in workspace mode an app's own rig is
 	// honored by default (app visual policy within its canvas), but the
-	// controller can take over via xrSetWorkspaceViewRigEXT. When an override
+	// controller can take over via xrSetWorkspaceViewRigDXR. When an override
 	// is set, substitute it for the forwarded rig on NON-controller locates —
 	// this is the sole enforcement point ("workspace can own view geometry"),
 	// no client-side gate. The controller's own chrome locates (caller PID ==
@@ -717,7 +717,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		rig = &rig_synth;
 	}
 
-	// XR_EXT_view_rig (#396 W7): a chained rig drives the math below in
+	// XR_DXR_view_rig (#396 W7): a chained rig drives the math below in
 	// place of the qwerty debug state — its pose replaces the qwerty/zero
 	// display pose, its tunables take the corresponding branch regardless
 	// of use_qwerty_head (lifting the identity-m2v forcing, mirroring the
@@ -774,7 +774,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 
 	if (rig_camera) {
 		// CAMERA-CENTRIC PATH (canonical camera3d math, shared core)
-		// rig_camera is set either by a chained XrCameraRigEXT or by the qwerty
+		// rig_camera is set either by a chained XrCameraRigDXR or by the qwerty
 		// synthesis above (#595) — both feed `rig`, one tunable source. In
 		// workspace mode, app sessions take this path with the qwerty pose as
 		// the camera position. qwerty_toggle_camera_mode preserves the
@@ -826,7 +826,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 
 		dxr_display3d_tunables dt = dxr_display3d_default_tunables();
 		if (rig_display) {
-			// Chained XrDisplayRigEXT or the qwerty synthesis above (#595) —
+			// Chained XrDisplayRigDXR or the qwerty synthesis above (#595) —
 			// both feed `rig`. Lifts the identity-m2v forcing for non-qwerty
 			// clients too, exactly like in-process. For the qwerty case this
 			// carries disp_vHeight (the user-tuned virtual display size) so the
@@ -1048,7 +1048,7 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 	                                ? (int32_t)wm.window_pixel_height
 	                                : (int32_t)s->xsysc->info.display_pixel_height;
 
-	// XR_EXT_display_zones P5 (#570) — zone-scoped locate on Android OOP.
+	// XR_DXR_display_zones P5 (#570) — zone-scoped locate on Android OOP.
 	// Reframe the Kooima to the zone rect exactly like the in-process
 	// oxr_session.c zone block and the D3D11 server's ipc_try_get_sr_view_poses:
 	// screen = zone meters, render eyes re-expressed relative to the zone centre.
@@ -1243,7 +1243,7 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 	}
 #endif
 
-	// A chained XR_EXT_view_rig descriptor supplies the world-space rig pose +
+	// A chained XR_DXR_view_rig descriptor supplies the world-space rig pose +
 	// tunables. DISPLAY rigs (the cube's orbit camera) run display-centric math;
 	// CAMERA rigs (EarthView's fly camera) run the camera-centric math so the
 	// convergence (zero-parallax) plane sits at 1/convergenceDiopters, NOT pinned
@@ -1333,7 +1333,7 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 		}
 	}
 
-	// XR_EXT_view_rig raw channel: the head's actual display-space eyes (the
+	// XR_DXR_view_rig raw channel: the head's actual display-space eyes (the
 	// face-dot the app HUD reads), plus the display plane + canvas. Reported
 	// independent of the 2D render collapse above.
 	if (rig_reply != NULL) {
@@ -1718,7 +1718,7 @@ ipc_handle_session_create(volatile struct ipc_client_state *ics,
 	//
 	// Populate application_name on the session info from the IPC client's
 	// instance-describe record so the compositor can surface meaningful
-	// slot titles for clients that don't set XR_EXT_win32_window_binding
+	// slot titles for clients that don't set XR_DXR_win32_window_binding
 	// (notably Chrome WebXR, which connects without an HWND and would
 	// otherwise show as "App N"). Local copy so we can modify the const
 	// input without touching the caller's struct.
@@ -1845,7 +1845,7 @@ ipc_handle_session_request_file_picker(volatile struct ipc_client_state *ics,
 		*out_request_id = 0;
 	}
 
-	// XR_EXT_workspace_file_dialog Tier 1: app-side xrRequestFilePickerEXT.
+	// XR_DXR_workspace_file_dialog Tier 1: app-side xrRequestFilePickerDXR.
 	// The runtime allocates a monotonic request_id, stores (request_id ->
 	// requesting slot, info) on the multi-compositor, and emits a
 	// FILE_PICKER_REQUEST event into the workspace input drain so the
@@ -1871,7 +1871,7 @@ ipc_handle_session_request_file_picker(volatile struct ipc_client_state *ics,
 		// `SupportsFileDialog = 1`. Queuing the event would
 		// strand it on the drain channel forever; surface as
 		// failure so the OXR layer returns
-		// XR_FILE_PICKER_FALLBACK_TIER0_EXT and the app falls
+		// XR_FILE_PICKER_FALLBACK_TIER0_DXR and the app falls
 		// back to a flat OS dialog (Tier 0 hook handles z/focus).
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -2431,7 +2431,7 @@ ipc_handle_compositor_get_predicted_eye_positions(volatile struct ipc_client_sta
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	// Full DP eye-position struct incl. is_tracking (#441 Phase 2). The
 	// client's OpenXR state tracker consumes this ONLY for the derived
-	// XrViewEyeTrackingStateEXT.isTracking value + the tracking-state
+	// XrViewEyeTrackingStateDXR.isTracking value + the tracking-state
 	// event — view poses stay server-computed (ipc_try_get_sr_view_poses),
 	// so these positions never feed the client-side Kooima path.
 	if (ics->server != NULL && ics->server->xsysc != NULL &&
@@ -2945,7 +2945,7 @@ _update_zone_3d_layer(struct xrt_compositor *xc,
                       volatile struct ipc_layer_entry *layer,
                       uint32_t i)
 {
-	// Zone-3D layers (XR_EXT_display_zones P5) are silently skipped if
+	// Zone-3D layers (XR_DXR_display_zones P5) are silently skipped if
 	// the compositor doesn't implement them — the consumers own their
 	// one-shot drop WARNs (matches the local_2d precedent).
 	if (xc->layer_zone_3d == NULL) {
@@ -3799,7 +3799,7 @@ ipc_handle_workspace_set_window_pose(volatile struct ipc_client_state *_ics,
 	// Tier-2 (#59): reposition + resize the client's runtime-owned NSWindow into a
 	// display sub-rect so multiple apps tile instead of stacking full-screen. The
 	// shell's grid/drag/resize layout primitives all funnel here through the same
-	// xrSetWorkspaceClientWindowPoseEXT path the Windows monolith uses.
+	// xrSetWorkspaceClientWindowPoseDXR path the Windows monolith uses.
 	IPC_INFO(s, "Workspace: set_window_pose client_id=%u pos=(%.3f,%.3f,%.3f) size=%.3fx%.3f (macOS)",
 	         client_id, pose->position.x, pose->position.y, pose->position.z, width_m, height_m);
 	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
@@ -4046,7 +4046,7 @@ ipc_handle_workspace_set_focused_client(volatile struct ipc_client_state *_ics, 
 	}
 
 	// The workspace controller may pass EITHER form of client id:
-	//   - the canonical IPC client id (xrEnumerateWorkspaceClientsEXT form,
+	//   - the canonical IPC client id (xrEnumerateWorkspaceClientsDXR form,
 	//     always < 1000 for OpenXR clients), or
 	//   - the legacy "1000 + slot" form that POINTER / POINTER_MOTION /
 	//     HOVER / FOCUS_CHANGED events report as hit_client_id.
@@ -4083,7 +4083,7 @@ ipc_handle_workspace_set_focused_client(volatile struct ipc_client_state *_ics, 
 	}
 #endif
 
-	// Canonical IPC client id path (xrEnumerateWorkspaceClientsEXT form).
+	// Canonical IPC client id path (xrEnumerateWorkspaceClientsDXR form).
 	xrt_result_t xret = ipc_server_set_active_client(s, client_id);
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
@@ -4190,7 +4190,7 @@ ipc_handle_workspace_set_client_frame_rate_cap(volatile struct ipc_client_state 
 	os_mutex_lock(&s->global_state.lock);
 
 	// Accept both client-id forms (see ipc_handle_workspace_set_focused_client):
-	// the canonical IPC id (< 1000) from xrEnumerateWorkspaceClientsEXT, and the
+	// the canonical IPC id (< 1000) from xrEnumerateWorkspaceClientsDXR, and the
 	// "1000 + slot" form the controller carries from POINTER / FOCUS_CHANGED
 	// events. The shell's focus-policy caps the previously/newly focused client
 	// using whatever id form it last saw, so both must resolve to the same xc.
@@ -5556,7 +5556,7 @@ ipc_handle_compositor_get_transparent_output_fence(volatile struct ipc_client_st
 }
 
 /*
- * XR_EXT_weave (#625) — window-bound synchronous weave service. The DP weaves
+ * XR_DXR_weave (#625) — window-bound synchronous weave service. The DP weaves
  * server-side (ADR-007 / ADR-019); these handlers only marshal the wire to the
  * D3D11 service compositor's additive weave entry points. D3D11-service-only,
  * exactly as the transparent-output path above.

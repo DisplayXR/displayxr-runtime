@@ -13,7 +13,7 @@
  *
  * Phase 1 covers the hosted class only (runtime self-creates the window). The
  * handle/texture classes — where the app supplies its own X11 window — need the
- * still-to-be-defined XR_EXT_xlib_window_binding extension (Phase 3).
+ * still-to-be-defined XR_DXR_xlib_window_binding extension (Phase 3).
  *
  * @ingroup comp_vk_native
  */
@@ -44,7 +44,7 @@ struct comp_vk_native_xcb_handle
 };
 
 /*!
- * App-provided Xlib window (XR_EXT_xlib_window_binding, Phase 3), passed
+ * App-provided Xlib window (XR_DXR_xlib_window_binding, Phase 3), passed
  * type-erased as the `hwnd` param of comp_vk_native_compositor_create. The
  * compositor copies the fields synchronously during create, so the caller may
  * stack-allocate this.
@@ -61,7 +61,7 @@ struct comp_vk_native_xlib_handle
 struct comp_vk_native_window_xcb;
 
 /*!
- * Wrap an app-provided Xlib window (XR_EXT_xlib_window_binding) into the XCB
+ * Wrap an app-provided Xlib window (XR_DXR_xlib_window_binding) into the XCB
  * surface handle the target consumes. Derives the XCB connection from the Xlib
  * display via XGetXCBConnection() (libX11-xcb) — the connection is borrowed
  * from (and owned by) the app's Display, so nothing is destroyed on teardown.

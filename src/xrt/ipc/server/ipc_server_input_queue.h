@@ -70,7 +70,7 @@ void
 ipc_server_input_queue_drop(void *target);
 
 /*!
- * Input-grab state (workspace launcher band open, via xrSetWorkspaceInputGrabEXT).
+ * Input-grab state (workspace launcher band open, via xrSetWorkspaceInputGrabDXR).
  * While grabbed, the router sends every event to the controller queue only — no
  * content forwarding — so the band owns all input. The macOS analogue of the
  * Windows SetForegroundWindow grab.
@@ -82,7 +82,7 @@ ipc_server_input_queue_input_grabbed(void);
 
 /*!
  * Pointer-capture state (a controller drag/resize/rotate gesture is active, via
- * xrEnableWorkspacePointerCaptureEXT). While captured, the router sends all
+ * xrEnableWorkspacePointerCaptureDXR). While captured, the router sends all
  * pointer/scroll/motion to the controller only, so a gesture started on chrome
  * keeps receiving motion even when the cursor passes over content.
  */

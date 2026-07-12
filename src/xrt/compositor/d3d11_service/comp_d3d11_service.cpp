@@ -256,7 +256,7 @@ struct d3d11_client_render_resources
 	uint32_t                              transparent_output_w;
 	uint32_t                              transparent_output_h;
 
-	//! XR_EXT_weave (#625) — ADDITIVE window-bound synchronous weave service.
+	//! XR_DXR_weave (#625) — ADDITIVE window-bound synchronous weave service.
 	//! Distinct from the steady swap-chain path above: a present-owner hands a
 	//! pre-weave SBS texture + a window-relative rect and the DP weaves the
 	//! sub-rect into weave_output_texture (its RTV bound as the process_atlas
@@ -310,14 +310,14 @@ struct d3d11_service_compositor
 	bool state_focused;
 
 	//! True if this client was created as a headless bridge-relay session
-	//! (XR_EXT_display_info + XR_MND_headless). Tracked on the compositor so
+	//! (XR_DXR_display_info + XR_MND_headless). Tracked on the compositor so
 	//! compositor_destroy can clear the global g_bridge_relay_active gate
 	//! when the bridge disconnects — otherwise qwerty input and a handful
 	//! of bridge-specific code paths stay disabled even after the bridge is
 	//! gone, breaking subsequent legacy/non-bridge WebXR sessions.
 	bool is_bridge_relay;
 
-	//! App's HWND from XR_EXT_win32_window_binding (for lazy standalone init)
+	//! App's HWND from XR_DXR_win32_window_binding (for lazy standalone init)
 	HWND app_hwnd;
 
 	//! Set when workspace re-activates — next layer_commit tears down standalone resources
@@ -383,7 +383,7 @@ struct d3d11_service_compositor
 	int64_t last_commit_ns;
 
 	//! App-initiated rendering-mode request (#575). The client's
-	//! xrRequestDisplayRenderingModeEXT crosses IPC into the
+	//! xrRequestDisplayRenderingModeDXR crosses IPC into the
 	//! request_rendering_mode / request_display_mode vtable methods, which run
 	//! on the IPC thread and only RECORD the request here. compositor_layer_commit
 	//! (render thread) applies it on the standalone path — driving the per-client
@@ -420,7 +420,7 @@ struct d3d11_service_compositor
 	uint32_t fence_waits_queued_in_window;
 	uint32_t fence_stale_views_in_window;
 
-	//! XR_EXT_display_zones (#551) — standalone wish-over-IPC publish state.
+	//! XR_DXR_display_zones (#551) — standalone wish-over-IPC publish state.
 	//! Mirrors the in-process auto-wish raster (comp_d3d11_compositor's
 	//! d3d11_update_zone_wish_mask): an R8_UNORM union-of-zone-rects mask
 	//! with a feathered ring, rasterized at commit on the shared immediate
@@ -490,9 +490,9 @@ struct d3d11_service_system
 	struct xrt_system_compositor base;
 
 	//! spec_version 13: controller-pushed cursor sprite source. The controller
-	//! creates a session-global swapchain (xrCreateWorkspaceCursorSwapchainEXT),
+	//! creates a session-global swapchain (xrCreateWorkspaceCursorSwapchainDXR),
 	//! renders its sprite into it, and points the runtime at it via
-	//! xrSetWorkspaceCursorEXT. The runtime samples the swapchain's latest
+	//! xrSetWorkspaceCursorDXR. The runtime samples the swapchain's latest
 	//! released image in the cursor render pass. NULL = cursor hidden.
 	//!
 	//! cursor_xsc is a borrowed ref (the controller owns the lifetime via the
@@ -508,8 +508,8 @@ struct d3d11_service_system
 	//! spec_version 17/21: controller-pushed overlay sources (display-spanning UI,
 	//! e.g. taskbar + launcher + toast). Same borrowed-ref model as cursor_xsc, but
 	//! docked at z = 0 (zero disparity) — no raycast, no per-eye disparity. The
-	//! controller creates session-global swapchains (xrCreateWorkspaceOverlaySwapchainEXT),
-	//! renders UI into them, and docks each via xrSetWorkspaceOverlayEXT with an
+	//! controller creates session-global swapchains (xrCreateWorkspaceOverlaySwapchainDXR),
+	//! renders UI into them, and docks each via xrSetWorkspaceOverlayDXR with an
 	//! overlayId. The map is keyed by that id; std::map iterates ascending so the
 	//! composite draws low ids behind high ids (z-order). An entry's presence == it
 	//! is visible — !visible / NULL swapchain erases its id. Guarded by render_mutex.
@@ -651,7 +651,7 @@ struct d3d11_service_system
 	//! Read from base.info.workspace_mode on first client connect.
 	bool workspace_mode;
 
-	//! XR_EXT_view_rig (#396 W7): the workspace controller's imposed view rig,
+	//! XR_DXR_view_rig (#396 W7): the workspace controller's imposed view rig,
 	//! applied to app-client locates server-side (ipc_try_get_sr_view_poses).
 	//! type == XRT_VIEW_RIG_NONE when no override is set. Guarded by its own
 	//! lightweight mutex (NOT render_mutex) so the per-locate read never
@@ -895,7 +895,7 @@ struct d3d11_multi_client_slot
 	//! Client type: IPC (OpenXR app) or capture (2D window).
 	enum d3d11_client_type client_type;
 
-	//! App's HWND (from XR_EXT_win32_window_binding). Workspace can resize via SetWindowPos.
+	//! App's HWND (from XR_DXR_win32_window_binding). Workspace can resize via SetWindowPos.
 	HWND app_hwnd;
 
 	//! Actual rendered content dimensions per view (from last layer_commit).
@@ -918,7 +918,7 @@ struct d3d11_multi_client_slot
 	//! multi_compositor_request_mode_flip from the current last_commit
 	//! values; the ack fires when a subsequent commit's extent differs from
 	//! the pre_flip snapshot (meaning the app re-rendered after consuming
-	//! XrEventDataRenderingModeChangedEXT).
+	//! XrEventDataRenderingModeChangedDXR).
 	uint32_t last_commit_view_w;
 	uint32_t last_commit_view_h;
 	uint32_t pre_flip_view_w;
@@ -999,7 +999,7 @@ struct d3d11_multi_client_slot
 	//! True when minimized (hidden from rendering but still connected).
 	bool minimized;
 
-	//! Per-client xrWaitFrame cap in Hz set by xrSetWorkspaceClientFrameRateCapEXT
+	//! Per-client xrWaitFrame cap in Hz set by xrSetWorkspaceClientFrameRateCapDXR
 	//! (spec_version 14). 0.0f = uncapped (native refresh). Resets to 0.0f on
 	//! slot register/unregister; controllers re-apply on reconnect. Read
 	//! lock-free from compositor_predict_frame — single float, torn read at
@@ -1009,7 +1009,7 @@ struct d3d11_multi_client_slot
 	//! spec_version 16 (#304): one-shot, set at register (slot-bind). The
 	//! drain emits one CLIENT_CONNECTED event per slot with this set, then
 	//! clears it; the controller responds with per-client setup (place via
-	//! xrSetWorkspaceClientWindowPoseEXT, chrome, style, focus). Race-free —
+	//! xrSetWorkspaceClientWindowPoseDXR, chrome, style, focus). Race-free —
 	//! the slot is bound before the event fires.
 	bool announce_connected;
 
@@ -1047,7 +1047,7 @@ struct d3d11_multi_client_slot
 	//! the swapchain image at the controller-specified pose every render, with
 	//! controller-defined hit regions and depth bias.
 	//!
-	//! NULL until xrCreateWorkspaceClientChromeSwapchainEXT is called for this
+	//! NULL until xrCreateWorkspaceClientChromeSwapchainDXR is called for this
 	//! client. C5: with the in-runtime chrome render block deleted, chrome is
 	//! only ever visible when the controller has submitted its own.
 	//!
@@ -1067,7 +1067,7 @@ struct d3d11_multi_client_slot
 	bool                  chrome_anchor_top_edge; //!< spec_version 8: pose_y is offset above window top
 	float                 chrome_width_fraction;  //!< spec_version 8: 0 = absolute, > 0 = win_w * fraction
 	//! Phase 2.C C5 follow-up: OpenXR client_id (the workspace-side ID
-	//! returned by xrEnumerateWorkspaceClientsEXT) for the client that
+	//! returned by xrEnumerateWorkspaceClientsDXR) for the client that
 	//! owns this slot's chrome. Set by the IPC register_chrome_swapchain
 	//! handler when chrome is bound to a slot. Used by POINTER_HOVER
 	//! emission so controllers can look up their per-client chrome by
@@ -1108,7 +1108,7 @@ struct d3d11_multi_client_slot
 	//! @}
 
 	//! Phase 2.C spec_version 9: per-client visual style pushed by the
-	//! workspace controller via xrSetWorkspaceClientStyleEXT. Cached
+	//! workspace controller via xrSetWorkspaceClientStyleDXR. Cached
 	//! per-slot and applied at content blit time. Zero-init = runtime
 	//! defaults (no rounding, no feather, no glow). The focus glow
 	//! fields are only consulted when this slot equals mc->focused_slot.
@@ -1210,7 +1210,7 @@ struct d3d11_multi_compositor
 	//! cursor_panel_x/y is the OS cursor position sampled per frame in
 	//! render_pass (runtime-owned). cursor_hit_z_m + cursor_over_window +
 	//! cursor_dim_factor are pushed per frame by the workspace controller via
-	//! xrSetWorkspaceCursorDepthEXT (spec_version 22; dim factor added in 23) —
+	//! xrSetWorkspaceCursorDepthDXR (spec_version 22; dim factor added in 23) —
 	//! the controller owns the hit-test and the cursor look-and-feel. The cursor
 	//! render pass uses cursor_hit_z_m for per-eye disparity, cursor_over_window
 	//! for whether to dim, and cursor_dim_factor as the over-window body alpha.
@@ -1278,7 +1278,7 @@ struct d3d11_multi_compositor
 		bool curtain_active;          //!< Per-tile blit pass collapses to eye-0 / tile-(0,0) when true.
 	} mode_flip;
 
-	//! XR_EXT_workspace_file_dialog: pending Tier 1 picker requests. Bounded
+	//! XR_DXR_workspace_file_dialog: pending Tier 1 picker requests. Bounded
 	//! buffer keyed by request_id. Allocated in
 	//! comp_d3d11_service_workspace_post_file_picker_request and consumed by
 	//! comp_d3d11_service_workspace_file_picker_result. The drain loop emits
@@ -1496,7 +1496,7 @@ broadcast_rendering_mode_change(struct d3d11_service_system *sys,
  *
  * Caller is responsible for any pre-flip bookkeeping (e.g. saving
  * sys->last_3d_mode_index before transitioning to 2D). This helper:
- *   1. Broadcasts XrEventDataRenderingModeChangedEXT immediately so clients
+ *   1. Broadcasts XrEventDataRenderingModeChangedDXR immediately so clients
  *      can begin re-submitting at the new layout.
  *   2. Marks the multi-comp as MFP_WAITING_ACK with the curtain ON.
  *   3. Does NOT touch active_rendering_mode_index / sync_tile_layout / DP.
@@ -1556,7 +1556,7 @@ multi_compositor_request_mode_flip(struct d3d11_service_system *sys,
 	// per-slot atlas layout does not change across rendering modes, so they
 	// would never produce a "new layout" frame for the quorum. Snapshot the
 	// pre-flip per-view extent for IPC slots so the ack detector can detect
-	// "app has re-rendered after consuming XrEventDataRenderingModeChangedEXT"
+	// "app has re-rendered after consuming XrEventDataRenderingModeChangedDXR"
 	// by extent change, not by absolute match against view_width_pixels
 	// (workspace apps submit window-scaled extents, not canonical mode dims).
 	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
@@ -1639,7 +1639,7 @@ multi_compositor_apply_pending_mode_flip(struct d3d11_service_system *sys)
 		}
 
 		// Land the flip: device state, DP, tile layout all in lockstep.
-		// Mirror the legacy xrRequestDisplayRenderingModeEXT path's
+		// Mirror the legacy xrRequestDisplayRenderingModeDXR path's
 		// xrt_device_set_property() call so apps that poll the device
 		// OUTPUT_MODE property (instead of consuming the event) also see
 		// the change. Apps that DO consume the event still get it via the
@@ -1707,7 +1707,7 @@ multi_compositor_apply_pending_mode_flip(struct d3d11_service_system *sys)
  * scale from the active rendering mode — for stereo on 4K this is 1920×1080
  * per view. Legacy sessions fall back to the system's compromise dims
  * (display / tile count), preserving existing behavior for apps that aren't
- * XR_EXT_display_info aware. Issue #158.
+ * XR_DXR_display_info aware. Issue #158.
  */
 static inline void
 resolve_active_view_dims(const struct d3d11_service_system *sys,
@@ -2727,7 +2727,7 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
  * Initialize per-client render resources.
  *
  * @param sys The system compositor (provides device, dimensions)
- * @param external_hwnd External window handle from XR_EXT_win32_window_binding, or NULL
+ * @param external_hwnd External window handle from XR_DXR_win32_window_binding, or NULL
  * @param xsysd System devices for qwerty input (may be NULL)
  * @param res Output render resources struct
  * @return XRT_SUCCESS on success
@@ -2816,7 +2816,7 @@ init_client_render_resources(struct d3d11_service_system *sys,
 
 	// Get or create window
 	if (external_hwnd != nullptr) {
-		// Use app-provided window (XR_EXT_win32_window_binding)
+		// Use app-provided window (XR_DXR_win32_window_binding)
 		res->hwnd = (HWND)external_hwnd;
 		res->owns_window = false;
 		res->window = nullptr;
@@ -3136,7 +3136,7 @@ init_client_render_resources(struct d3d11_service_system *sys,
 			// Phase 6.1 (#140): don't call request_display_mode(true)
 			// here — the SR SDK's recalibration cycle causes a multi-
 			// second stretched-left-eye artifact. Let the DP come up in
-			// the current mode; V key and xrRequestDisplayRenderingModeEXT
+			// the current mode; V key and xrRequestDisplayRenderingModeDXR
 			// remain the authoritative mode-switch triggers.
 
 			// Query display pixel info from the real (windowed) display processor.
@@ -3825,12 +3825,12 @@ compositor_end_session(struct xrt_compositor *xc)
 	return XRT_SUCCESS;
 }
 
-// Per-client frame-rate cap (spec_version 14, xrSetWorkspaceClientFrameRateCapEXT).
+// Per-client frame-rate cap (spec_version 14, xrSetWorkspaceClientFrameRateCapDXR).
 //
 // Reads the controller-supplied cap for this compositor's slot and converts it
 // to a period multiplier. Pure mechanism — the runtime makes no decision about
 // which clients get throttled; the workspace controller sets the cap per
-// xrSetWorkspaceClientFrameRateCapEXT and the runtime applies it.
+// xrSetWorkspaceClientFrameRateCapDXR and the runtime applies it.
 //
 // Standalone (non-workspace) clients always return 1. Unprotected read of
 // mc->clients[*] is intentional: worst-case torn read applies the previous
@@ -4118,7 +4118,7 @@ compositor_layer_window_space(struct xrt_compositor *xc,
 }
 
 /*!
- * Local-2D layer (XR_EXT_local_3d_zone v3, #439 Phase 3 / #549). Accumulated
+ * Local-2D layer (XR_DXR_local_3d_zone v3, #439 Phase 3 / #549). Accumulated
  * like every other layer type; layer_commit's zones composite replicates the
  * 2D content into every view tile of the per-client atlas (identical position
  * per view ⟹ zero disparity ⟹ reads flat after the weave).
@@ -4138,7 +4138,7 @@ compositor_layer_local_2d(struct xrt_compositor *xc,
 }
 
 /*!
- * Zone-3D layer (XR_EXT_display_zones, ADR-027 / #549). Accumulated here;
+ * Zone-3D layer (XR_DXR_display_zones, ADR-027 / #549). Accumulated here;
  * layer_commit detects the zones frame and scale-blits each zone's view
  * tiles to the zone rect inside the per-client atlas slot, alpha-over in
  * layer-list order (see comp_d3d11_renderer's XRT_LAYER_ZONE_3D case for
@@ -4906,7 +4906,7 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			// layout (compute_grid_layout is gone). Register at a sentinel
 			// pose, mark the slot unplaced, and announce CLIENT_CONNECTED so
 			// the controller owns placement (grid / cascade / PIP / restored
-			// last-known) via xrSetWorkspaceClientWindowPoseEXT. The slot is
+			// last-known) via xrSetWorkspaceClientWindowPoseDXR. The slot is
 			// NOT composited until placed && first-frame-committed, so the
 			// sentinel is never shown. The grow-in entry animation moves to
 			// the controller (#306).
@@ -4937,8 +4937,8 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			mc->client_count++;
 			// ADR-018: the runtime no longer auto-focuses the first
 			// client. The workspace controller owns focus — it sees the
-			// new client in xrEnumerateWorkspaceClientsEXT and calls
-			// xrSetWorkspaceFocusedClientEXT (shell auto-focus-first path).
+			// new client in xrEnumerateWorkspaceClientsDXR and calls
+			// xrSetWorkspaceFocusedClientDXR (shell auto-focus-first path).
 			U_LOG_W("Multi-comp: registered client in slot %d (total=%u)", i, mc->client_count);
 			U_LOG_W("  window: pose=(%.3f,%.3f,%.3f) size=%.3fx%.3fm rect=(%d,%d %dx%d px)",
 			        mc->clients[i].window_pose.position.x,
@@ -5846,7 +5846,7 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 			// 3D if eye tracking is running). The user can toggle via V
 			// key, and sync_tile_layout will track the actual mode each
 			// frame. The qwerty V-key handler and the
-			// xrRequestDisplayRenderingModeEXT path remain the
+			// xrRequestDisplayRenderingModeDXR path remain the
 			// authoritative mode-switch triggers.
 		} else {
 			U_LOG_W("Multi-comp: no display processor (factory returned %d)", dp_ret);
@@ -5907,7 +5907,7 @@ quat_is_identity(const struct xrt_quat *q)
 // #307: the maximize/fullscreen state machine (toggle_fullscreen) and its
 // ease helpers (ease_out_cubic / slot_animate_to / slot_animate_tick) moved to
 // the workspace controller (ADR-018). The controller drives maximize via
-// xrSetWorkspaceClientWindowPoseEXT (with its own ease) + xrSetWorkspaceClient-
+// xrSetWorkspaceClientWindowPoseDXR (with its own ease) + xrSetWorkspaceClient-
 // VisibilityEXT (hide the backdrop windows). The runtime keeps only the
 // mechanism.
 
@@ -6108,7 +6108,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// Window-close is controller policy (ADR-018); DELETE flows to the
 	// controller as a workspace KEY event (pushed by comp_d3d11_window before
 	// any forwarding) and the controller drives the close via the public
-	// xrRequestWorkspaceClientExitEXT path.
+	// xrRequestWorkspaceClientExitDXR path.
 
 	// #307: F11 (maximize toggle) and ESC (restore) are no longer intercepted
 	// here. Both flow to the controller as workspace KEY events (pushed by
@@ -6124,15 +6124,15 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 	// Phase 2.G: Ctrl+1..3 layout presets are owned by the workspace
 	// controller now; the runtime no longer intercepts them. Keys flow
-	// through xrEnumerateWorkspaceInputEventsEXT and the controller
-	// pushes per-client poses via xrSetWorkspaceClientWindowPoseEXT.
+	// through xrEnumerateWorkspaceInputEventsDXR and the controller
+	// pushes per-client poses via xrSetWorkspaceClientWindowPoseDXR.
 
 	// Per-frame: sample the OS cursor position for the cursor render pass and
 	// signal the controller's event-driven wakeup on focus / window-pose
 	// transitions. spec_version 13: cursor SHAPE / SPRITE / VISIBILITY are the
-	// workspace controller's job (xrSetWorkspaceCursorEXT). spec_version 22:
+	// workspace controller's job (xrSetWorkspaceCursorDXR). spec_version 22:
 	// cursor DEPTH (hit_z) + over-window dimming are also controller-owned —
-	// pushed via xrSetWorkspaceCursorDepthEXT — because they depend on the
+	// pushed via xrSetWorkspaceCursorDepthDXR — because they depend on the
 	// hit-test the controller now owns. The runtime keeps only POSITION here
 	// (it owns the HWND / OS cursor).
 	if (mc->window != nullptr) {
@@ -6199,16 +6199,16 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		// controller's job (ADR-018 / PR 4 of the runtime→controller
 		// migration). Controllers see POINTER(R,*) events with hit_region
 		// + chrome_region_id and decide what to do: rotation drag on
-		// grip-hit (capture + per-frame xrSetWorkspaceClientWindowPoseEXT
+		// grip-hit (capture + per-frame xrSetWorkspaceClientWindowPoseDXR
 		// with quaternion from yaw/pitch), focus via
-		// xrSetWorkspaceFocusedClientEXT on RMB-on-tile, or context menu.
+		// xrSetWorkspaceFocusedClientDXR on RMB-on-tile, or context menu.
 		(void)rmb_just_pressed;
 	}
 
 	// #305: scroll-to-resize, Shift+Scroll Z-depth, and [ / ] Z-step are now
 	// owned by the workspace controller (ADR-018 — controller owns interactive
 	// policy). The runtime emits SCROLL_EXT / KEY_EXT on the public event
-	// surface; the controller drives size/Z via xrSetWorkspaceClientWindowPoseEXT.
+	// surface; the controller drives size/Z via xrSetWorkspaceClientWindowPoseDXR.
 
 	// Handle swap chain resize
 	if (mc->hwnd != nullptr && mc->swap_chain) {
@@ -6262,7 +6262,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// #307: the per-slot animation tick is gone. The only remaining animation
 	// was the maximize/restore ease, which moved to the controller (the entry
 	// grow-in moved in #306, layout presets in Phase 2.G). The controller now
-	// drives all window motion via per-frame xrSetWorkspaceClientWindowPoseEXT,
+	// drives all window motion via per-frame xrSetWorkspaceClientWindowPoseDXR,
 	// which already refreshes the input-forward rect (set_client_window_pose).
 
 	// Per-frame tick for the workspace mode-flip state machine (#234). Owns
@@ -7600,11 +7600,11 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 	// #307 slice B: the taskbar moved to the workspace controller (ADR-018).
 	// The controller renders the user-minimize taskbar onto a display-spanning
-	// overlay swapchain (xrCreateWorkspaceOverlaySwapchainEXT +
-	// xrSetWorkspaceOverlayEXT) — composited by the overlay render pass above at
+	// overlay swapchain (xrCreateWorkspaceOverlaySwapchainDXR +
+	// xrSetWorkspaceOverlayDXR) — composited by the overlay render pass above at
 	// z = 0. The runtime no longer draws a taskbar or tracks which windows are
 	// minimized for UI purposes; `minimized` is now purely the composite gate,
-	// set by the controller via xrSetWorkspaceClientVisibilityEXT.
+	// set by the controller via xrSetWorkspaceClientVisibilityDXR.
 
 	// #307: the "Press F11 or Esc to restore" toast was dropped. Maximize is
 	// controller-owned now (ADR-018); restore is discoverable via the MAX chrome
@@ -7619,7 +7619,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// sprite is drawn at the same docked position in every atlas tile. Rendered
 	// AFTER windows + chrome and BEFORE the cursor, so the cursor stays on top.
 	// Controller owns all content + layout (overlay_slot anchor/pivot/size) via
-	// xrCreateWorkspaceOverlaySwapchainEXT + xrSetWorkspaceOverlayEXT. The map is
+	// xrCreateWorkspaceOverlaySwapchainDXR + xrSetWorkspaceOverlayDXR. The map is
 	// keyed by overlayId; std::map iterates ascending so lower ids composite
 	// behind higher ids (the shell picks ids to control z-order).
 	for (const auto &ov_kv : sys->overlays) {
@@ -7774,7 +7774,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// style swapchain on sys->cursor_xsc). Runtime keeps the per-tile per-
 	// eye-disparity rendering with hit-Z math + over-window dimming;
 	// controller owns the sprite content (shape, color, animation,
-	// branding) via xrCreateWorkspaceCursorSwapchainEXT + xrSetWorkspaceCursorEXT.
+	// branding) via xrCreateWorkspaceCursorSwapchainDXR + xrSetWorkspaceCursorDXR.
 	if (sys->cursor_visible && sys->cursor_xsc != nullptr) {
 		uint32_t ca_w = sys->base.info.display_pixel_width;
 		uint32_t ca_h = sys->base.info.display_pixel_height;
@@ -7876,14 +7876,14 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// it doesn't fight content behind it (reduces lenticular
 			// crosstalk on the cursor's bright pixels). spec_version 22:
 			// the flag is pushed by the controller (which owns the
-			// hit-test) via xrSetWorkspaceCursorDepthEXT, rather than
+			// hit-test) via xrSetWorkspaceCursorDepthDXR, rather than
 			// derived from a runtime raycast. An explicit flag is needed
 			// because hit_z alone wouldn't work for windows at z = 0
 			// (panel plane), where hit_z is 0 even though the cursor IS
 			// over a workspace client.
 			const bool over_window = mc->cursor_over_window;
 			// #376: the over-window body alpha is controller-owned (look-and-feel)
-			// — pushed via xrSetWorkspaceCursorDepthEXT (spec 23). Defaults to the
+			// — pushed via xrSetWorkspaceCursorDepthDXR (spec 23). Defaults to the
 			// previous hardcoded 0.30 until the first controller push.
 			const float body_tint[4]  = {1.00f, 1.00f, 1.00f, mc->cursor_dim_factor};
 
@@ -8316,7 +8316,7 @@ zones_resolve_src_srv(struct d3d11_service_system *sys,
 }
 
 /*!
- * XR_EXT_display_zones (#549): zones-frame composite for the service path.
+ * XR_DXR_display_zones (#549): zones-frame composite for the service path.
  * Reconstructs the client window inside the per-client atlas slot: clears the
  * atlas to premultiplied transparent (transparent-slot semantics — un-placed
  * canvas alpha-overs the workspace backdrop), then walks the layer list in
@@ -8630,7 +8630,7 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 	return true;
 }
 
-// XR_EXT_display_zones (#551) — standalone wish-over-IPC publish. Mirrors the
+// XR_DXR_display_zones (#551) — standalone wish-over-IPC publish. Mirrors the
 // in-process auto-wish (comp_d3d11_compositor.cpp): same feather geometry, so
 // a zone weaves identically on both paths.
 #define SVC_ZONE_WISH_FEATHER_STEPS 8
@@ -9175,7 +9175,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	}
 
 	// App-initiated rendering-mode request over IPC (#575). A standalone
-	// forced-IPC client's xrRequestDisplayRenderingModeEXT crosses IPC into the
+	// forced-IPC client's xrRequestDisplayRenderingModeDXR crosses IPC into the
 	// request_rendering_mode / request_display_mode vtable methods, which recorded
 	// the request on the IPC thread (pending_content_mode / pending_hw_3d). Apply
 	// it here on the render thread. Without this the per-client DP was never driven
@@ -9240,7 +9240,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// active, routes through the acked-flip path (#234); otherwise preserves
 	// the immediate-flip behavior on the per-client DP.
 	// #303: also disabled under workspace mode — the workspace controller
-	// owns these keys and drives mode via xrRequestDisplayRenderingModeEXT
+	// owns these keys and drives mode via xrRequestDisplayRenderingModeDXR
 	// (ADR-018 "controller owns input"). qwerty is already suppressed at the
 	// window WM_KEYDOWN gate under workspace mode, but gate the apply site too
 	// so an activation/deactivation race can't sneak a flip through here.
@@ -9413,7 +9413,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			// because it re-asserts the controller's desired state here; do the
 			// same for standalone. Gate on sys->hardware_display_3d — the app's
 			// intended hardware mode, set only by its explicit
-			// xrRequestDisplayRenderingModeEXT — so a genuine user V→2D (which
+			// xrRequestDisplayRenderingModeDXR — so a genuine user V→2D (which
 			// leaves it false) is NOT overridden. Re-assert 3D + skip the follow
 			// so the intent is never corrupted; persisting the request across
 			// polls means the panel returns to 3D the instant the SR can weave
@@ -9516,7 +9516,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// Pre-compute whether there are UI overlay layers (quad/cylinder/equirect/cube)
 	// or window-space layers. Either disables zero-copy because we must blit on
 	// top of the projection content. Zone-3D / Local-2D layers
-	// (XR_EXT_display_zones, #549) likewise force the atlas path — the
+	// (XR_DXR_display_zones, #549) likewise force the atlas path — the
 	// placed-layer composite has no zero-copy equivalent.
 	bool has_ui_layers = false;
 	bool has_window_space_layers = false;
@@ -9545,8 +9545,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 	}
 
-	// XR_EXT_display_zones tier-1 wish fallback (#549): zones clients never
-	// call xrRequestDisplayRenderingModeEXT — in-process the published zone
+	// XR_DXR_display_zones tier-1 wish fallback (#549): zones clients never
+	// call xrRequestDisplayRenderingModeDXR — in-process the published zone
 	// wish drives the panel, and the wish publish leg is not wired on the
 	// service path yet (scope-split follow-up). Until then, a zones frame
 	// on the STANDALONE path globally requests the 3D mode (the tier-1
@@ -9619,7 +9619,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// the SR up; and (2) the vendor-3D-state poll *follows* the 2D SR and
 	// DEMOTES this client's active rendering mode to 2D at startup — it never
 	// drives the panel up. A zones client escapes via the tier-1 fallback
-	// above; an explicit xrRequestDisplayRenderingModeEXT app and the V-key
+	// above; an explicit xrRequestDisplayRenderingModeDXR app and the V-key
 	// path issue their own requests; a plain handle app does none, so it stays
 	// 2D. The in-process native compositor sidesteps all this (its weaver
 	// auto-3Ds for any 3D-capable mode). Mirror that here: once past the SR
@@ -10438,7 +10438,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 	profile_s2 = os_monotonic_get_ns(); // Phase 5a — end of projection-layer loop.
 
-	// XR_EXT_display_zones (#549): placed-layer composite into the
+	// XR_DXR_display_zones (#549): placed-layer composite into the
 	// per-client atlas slot. A pure zones frame (no projection layer) also
 	// drives the content dims + slot readiness bookkeeping from here — the
 	// projection loop never ran, and without this the workspace slot never
@@ -10465,7 +10465,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 	}
 
-	// XR_EXT_display_zones (#551): standalone wish-over-IPC publish — the
+	// XR_DXR_display_zones (#551): standalone wish-over-IPC publish — the
 	// per-zone Tier-2 leg the tier-1 block above is the fallback for. Runs
 	// on EVERY standalone commit (a non-zones frame withdraws a previously
 	// published mask). Workspace clients stay inert per ADR-027 v1.
@@ -10658,7 +10658,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					// so an absolute match doesn't work — but the
 					// extent does change when the app re-renders at
 					// the new tile_columns after consuming
-					// XrEventDataRenderingModeChangedEXT.
+					// XrEventDataRenderingModeChangedDXR.
 					uint32_t got_w = l->data.proj.v[0].sub.rect.extent.w;
 					uint32_t got_h = l->data.proj.v[0].sub.rect.extent.h;
 					slot_snap->last_commit_view_w = got_w;
@@ -10673,7 +10673,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 						}
 					}
 				}
-				// XR_EXT_display_zones (#549): a pure zones frame has no
+				// XR_DXR_display_zones (#549): a pure zones frame has no
 				// projection layer — source the slot's blend flags + the
 				// acked-flip extents from the first zone layer instead (a
 				// later projection layer still overwrites the flags). The
@@ -11346,7 +11346,7 @@ comp_d3d11_service_compositor_export_transparent_output_fence(struct xrt_composi
 
 
 /*
- * XR_EXT_weave (#625) — window-bound synchronous weave service. ADDITIVE: these
+ * XR_DXR_weave (#625) — window-bound synchronous weave service. ADDITIVE: these
  * never run inside multi_compositor_render or the per-client commit and never
  * Present. They reuse the per-client display processor (created bound to the
  * caller's window in init_client_render_resources, so its phase reference is
@@ -11423,7 +11423,7 @@ weave_ensure_output(struct d3d11_service_compositor *c, uint32_t w, uint32_t h)
 	return true;
 }
 
-//! XR_EXT_weave (#625): a present-owner drives only weave_submit — it never runs
+//! XR_DXR_weave (#625): a present-owner drives only weave_submit — it never runs
 //! the per-client commit, so it misses the no-zones-standalone deferred force-3D
 //! (the vendor poll otherwise follows the SR's 2D state and the panel never goes
 //! 3D → the SR eye tracker collapses the eye pair, no look-around). Mirror that
@@ -11543,7 +11543,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// texture, so the result is correct regardless of which DP instance drives it.
 	// (The shared DP's interlace phase references the workspace window; that is
 	// phase-independent for a uniform-colour test pattern and the caller phase-
-	// snaps real content via xrWeaveSnapWindowRectEXT.) The render thread and this
+	// snaps real content via xrWeaveSnapWindowRectDXR.) The render thread and this
 	// path both run process_atlas under sys->render_mutex, so sharing the DP is
 	// serialized — no concurrent immediate-context / DP use.
 	struct xrt_display_processor_d3d11 *dp = c->render.display_processor;
@@ -11847,7 +11847,7 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	// Initialize layer accumulator
 	std::memset(&c->layer_accum, 0, sizeof(c->layer_accum));
 
-	// Bridge relay sessions (headless + XR_EXT_display_info) only need event
+	// Bridge relay sessions (headless + XR_DXR_display_info) only need event
 	// registration — skip window, swap chain, and display processor creation.
 	bool is_headless_relay = (xsi != nullptr && xsi->is_bridge_relay);
 	if (is_headless_relay) {
@@ -11874,7 +11874,7 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	}
 
 	// Initialize per-client render resources (window, swap chain, display processor)
-	// Get external window handle if app provided one via XR_EXT_win32_window_binding
+	// Get external window handle if app provided one via XR_DXR_win32_window_binding
 	void *external_hwnd = nullptr;
 	bool transparent_hwnd = false;
 	if (xsi != nullptr) {
@@ -11995,7 +11995,7 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 		// Fallback chain:
 		//   1. Window text (handle apps that expose their HWND).
 		//   2. xsi->application_name (clients that don't set
-		//      XR_EXT_win32_window_binding, like Chrome WebXR through the
+		//      XR_DXR_win32_window_binding, like Chrome WebXR through the
 		//      bridge — ipc_handle_session_create populates this from the
 		//      IPC client's xrInstance applicationInfo).
 		//   3. "App <slot>" as last resort.
@@ -12442,7 +12442,7 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	sys->base.info.supported_blend_modes[1] = XRT_BLEND_MODE_ALPHA_BLEND;
 	sys->base.info.supported_blend_mode_count = 2;
 
-	// Populate display info for XR_EXT_display_info
+	// Populate display info for XR_DXR_display_info
 	// (display_width_m and display_height_m are already set above from the temporary display processor query)
 	if (sys->output_width > 0 && sys->output_height > 0) {
 		sys->base.info.recommended_view_scale_x = (float)sys->view_width / (float)sys->output_width;
@@ -12453,7 +12453,7 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 
 	// These dims are the pre-DP placeholder defaults (set at struct init,
 	// search "output_width = 1920"). The real panel resolution is reported
-	// later by the active display processor — see the "XR_EXT_display_info"
+	// later by the active display processor — see the "XR_DXR_display_info"
 	// line (display_pixel_*) and the combined-atlas size, which are the
 	// authoritative values. Labelled here so this early line isn't mistaken
 	// for the actual display resolution.
@@ -12615,7 +12615,7 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 	//     (render.atlas_texture). Window-space/HUD is composited only into
 	//     combined_atlas, so this buffer is projection-only by construction, and
 	//     it exists for a single (non-workspace) IPC client where combined_atlas
-	//     does not. This is what makes xrCaptureAtlasEXT work over IPC. (Captures
+	//     does not. This is what makes xrCaptureAtlasDXR work over IPC. (Captures
 	//     the active client; under multi-client workspace that is the focused
 	//     client, not necessarily an arbitrary caller — a known limitation.)
 	//   ATLAS (post-compose) -> the multi-compositor's combined atlas (the
@@ -13505,8 +13505,8 @@ comp_d3d11_service_get_client_app_window_metrics(struct xrt_system_compositor *x
                                                   struct xrt_compositor *xc,
                                                   struct xrt_window_metrics *out_metrics)
 {
-	// XR_EXT_view_rig over IPC (#396 W7): window metrics from the client's
-	// REAL HWND (XR_EXT_win32_window_binding, transported in
+	// XR_DXR_view_rig over IPC (#396 W7): window metrics from the client's
+	// REAL HWND (XR_DXR_win32_window_binding, transported in
 	// xrt_session_info at session_create). Non-workspace IPC clients have
 	// no virtual-window slot, so the per-client lookup above fails for
 	// them and the rig math would run display-scoped — diverging from the
@@ -13921,7 +13921,7 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 
 	// spec_version 16 (#304): CLIENT_CONNECTED, one-shot per slot set at
 	// register (slot-bind). The runtime no longer owns per-client policy —
-	// the controller responds with placement (xrSetWorkspaceClientWindowPoseEXT)
+	// the controller responds with placement (xrSetWorkspaceClientWindowPoseDXR)
 	// and, per its design, chrome / style / focus. client_id is the unified
 	// "1000 + slot" workspace id every event + API uses. Includes captures.
 	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS &&
@@ -13972,10 +13972,10 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 		mc->frame_tick_last_ns = now_ns;
 	}
 
-	// XR_EXT_workspace_file_dialog: drain pending picker requests one at a
+	// XR_DXR_workspace_file_dialog: drain pending picker requests one at a
 	// time. Payload is tiny (client_id + request_id) so it fits comfortably
 	// in IPC_WORKSPACE_INPUT_EVENT_BATCH_MAX; the controller fetches the
-	// full XrFilePickerInfoEXT-equivalent via
+	// full XrFilePickerInfoDXR-equivalent via
 	// workspace_get_file_picker_request once it sees the event.
 	for (size_t i = 0; i < sizeof(mc->file_picker) / sizeof(mc->file_picker[0]) &&
 	     out_batch->count < IPC_WORKSPACE_INPUT_EVENT_BATCH_MAX; i++) {
@@ -14082,7 +14082,7 @@ comp_d3d11_service_workspace_request_fullscreen_by_slot(struct xrt_system_compos
 	}
 
 	// #307: maximize is owned by the workspace controller now (ADR-018), the
-	// same way display-mode is workspace-owned. xrRequestWorkspaceClientFullscreenEXT
+	// same way display-mode is workspace-owned. xrRequestWorkspaceClientFullscreenDXR
 	// is a no-op for workspace clients — an app cannot self-maximize; the
 	// controller decides (MAX button / F11 / double-click) and drives it via
 	// set_pose + set_visibility. Kept as a successful no-op to preserve the API.
@@ -14548,7 +14548,7 @@ extern "C" void
 comp_d3d11_service_set_focused_slot(struct xrt_system_compositor *xsysc, int slot)
 {
 	// Phase 2.C spec_version 9: explicit setter so the IPC layer's
-	// xrSetWorkspaceFocusedClientEXT path can update the compositor's
+	// xrSetWorkspaceFocusedClientDXR path can update the compositor's
 	// focused_slot (used by the per-client focus-glow gate at blit
 	// time). Validates range — out-of-range slots clamp to -1 (no
 	// focus). Holding render_mutex matches the existing register /
@@ -14594,7 +14594,7 @@ comp_d3d11_service_get_focused_slot(struct xrt_system_compositor *xsysc)
 {
 	// Read-side counterpart of the setter above. The compositor's
 	// focused_slot is the workspace focus source of truth — every focus
-	// mutation path updates it (both xrSetWorkspaceFocusedClientEXT id
+	// mutation path updates it (both xrSetWorkspaceFocusedClientDXR id
 	// forms incl. capture clients, the clear path, click-to-focus, and
 	// visibility-hide of the focused slot) — so the IPC layer's
 	// get_focused_client derives its answer from here rather than from
@@ -14743,7 +14743,7 @@ comp_d3d11_service_workspace_post_file_picker_request(struct xrt_system_composit
 		if (mc->file_picker[i].in_use) continue;
 		mc->next_file_picker_request_id++;
 		if (mc->next_file_picker_request_id == 0) {
-			mc->next_file_picker_request_id = 1; // never hand out 0 (XR_NULL_ASYNC_REQUEST_ID_EXT).
+			mc->next_file_picker_request_id = 1; // never hand out 0 (XR_NULL_ASYNC_REQUEST_ID_DXR).
 		}
 		mc->file_picker[i].in_use = true;
 		mc->file_picker[i].needs_emit = true;
@@ -15466,7 +15466,7 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 	        "IPC clients will lazy-switch to standalone on next frame");
 }
 
-// Modal input grab (XR_EXT_spatial_workspace spec_version 18). Drives the
+// Modal input grab (XR_DXR_spatial_workspace spec_version 18). Drives the
 // window's input-suppress flag: while grabbed the WndProc stops forwarding
 // keyboard / mouse-button / scroll input to the focused app and routes it all
 // to the controller via the public event ring. The controller sets this while

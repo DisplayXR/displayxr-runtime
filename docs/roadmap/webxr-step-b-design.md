@@ -5,7 +5,7 @@ Chromium seam to `file:line` against the pinned source and proposes the
 smallest-diff architecture. It must be agreed before B2 (the first real weave
 through `content_shell`). Scope + red lines: [`webxr-step-b-scope.md`](webxr-step-b-scope.md).
 Background: [`webxr-support.md`](webxr-support.md) §2.4. RPC contract:
-`src/external/openxr_includes/openxr/XR_EXT_weave.h`.
+`src/external/openxr_includes/openxr/XR_DXR_weave.h`.
 
 **Pinned Chromium:** Latest Stable **M150, tag `150.0.7871.24`**, checkout
 `C:\src\chromium\src` (`out/Default`, component build, `use_remoteexec=false`).
@@ -17,16 +17,16 @@ All `file:line` below are at this tag. B0 (build standup) is complete:
 ## 1. The proven reference flow (what we are re-creating)
 
 Step A's `displayxr-cef-host` (local at `displayxr-cef-host/src/`) drives the
-shipped `XR_EXT_weave` RPC end-to-end on Leia. Per element per frame
+shipped `XR_DXR_weave` RPC end-to-end on Leia. Per element per frame
 (`weave_compositor.cpp`, `xr_session.cpp`):
 
-1. **bindWindow once** — `xrWeaveBindWindowEXT(session, hwnd)` so the DP phase-snaps the
+1. **bindWindow once** — `xrWeaveBindWindowDXR(session, hwnd)` so the DP phase-snaps the
    interlace to the window's panel position.
 2. **Extract the element sub-rect** into a **keyed-mutex shared input texture**
    the host *allocates and owns* (`EnsureSbsInput`) — the host does **not** export
    the page's own texture handle; it copies the SBS region into its own shared
    texture.
-3. **Weave** — `xrWeaveSubmitEXT(SBS handle, windowRelativeRect)` → woven shared
+3. **Weave** — `xrWeaveSubmitDXR(SBS handle, windowRelativeRect)` → woven shared
    texture HANDLE + fence + tracked eyes. *The caller never weaves* (ADR-007/019).
 4. **GPU-wait the fence**, composite the woven sub-rect over the page base, present.
 5. **Feed eyes back** to the page for the next frame's off-axis (Kooima) projection.
@@ -187,7 +187,7 @@ one-frame stale, and one device pixel of drift collapses the lattice.
                                                               (Seam A, no canvas-SI export)
                                        ▲   {input DXGIHandle, windowRelRect}  │
                           bindWindow(HWND) once  ◄───── new Mojo iface ────────┘
-                          xrWeaveSubmitEXT ──────────────────────────────────────► weave (DP)
+                          xrWeaveSubmitDXR ──────────────────────────────────────► weave (DP)
                           {woven DXGIHandle, fence, eyes} ◄───────────────────────
                                        │ woven handle + fence ─► import as SharedImage,
                                        │                          bind at DrawTextureQuad,
@@ -233,7 +233,7 @@ one-frame stale, and one device pixel of drift collapses the lattice.
 
 Hardcode "weave the first canvas on the page" with **no JS**: at the Seam-B
 injection point, copy the canvas texture into an owned shared input, drive
-`xrWeaveSubmitEXT` from the browser-process client, import the woven handle, and
+`xrWeaveSubmitDXR` from the browser-process client, import the woven handle, and
 substitute it at `DrawTextureQuad` — a known SBS canvas shows real glasses-free 3D
 through `content_shell` on Leia. This validates Seam A (owned-input copy) + the RPC
 + the browser↔GPU bridge + Seam B composite end-to-end — the riskiest milestone.
@@ -292,7 +292,7 @@ SharedImage textures, the DComp device, and the `D3DImageBackingFactory` all sha
 **mojom extension (B2c):** `WeaveSubmit(gfx.mojom.DXGIHandle texture,
 gfx.mojom.Rect rect) => (DisplayXRWeaveResult? result)` with `{DXGIHandle woven,
 DXGIHandle fence, uint64 fence_value, uint32 w/h, array eyes, bool eyes_valid}`.
-Browser `DisplayXRWeaverImpl::WeaveSubmit` drives the real `xrWeaveSubmitEXT` on the
+Browser `DisplayXRWeaverImpl::WeaveSubmit` drives the real `xrWeaveSubmitDXR` on the
 B2a session and returns the result. (`gfx.mojom.DXGIHandle`:
 `ui/gfx/mojom/native_handle_types.mojom`, `[EnableIf=is_win]`, typemap
 `ui/gfx/mojom/BUILD.gn` — add `//ui/gfx/mojom` to the mojom deps.)
@@ -300,7 +300,7 @@ B2a session and returns the result. (`gfx.mojom.DXGIHandle`:
 **Slicing (validate incrementally, not big-bang):**
 - **B2c.1** — prove the full GPU-thread pipe with a **synthetic** input: GPU thread
   creates an owned keyed-mutex input (test pattern), drives the real
-  `xrWeaveSubmitEXT` via the bridge, imports the woven result, fence-waits,
+  `xrWeaveSubmitDXR` via the bridge, imports the woven result, fence-waits,
   substitutes for the canvas quad. If the canvas region shows the woven synthetic
   content in 3D, the hard pipe (handle marshalling both ways + real weave + fence +
   import + substitute) is proven.
@@ -323,7 +323,7 @@ B2c.1 is **code-complete** on the Chromium patch branch `displayxr-inline-3d`
 Leia box, with one **runtime-side** blocker remaining (not a patch bug).
 
 **Wired exactly per §7:** `WeaveSubmit(DXGIHandle,Rect)=>(result)` `[Sync]` mojom;
-browser `DisplayXRWeaverImpl` → real `xrWeaveSubmitEXT` on the B2a session;
+browser `DisplayXRWeaverImpl` → real `xrWeaveSubmitDXR` on the B2a session;
 GPU-side `DisplayXRWeaveGpu` (impl of new `viz::DisplayXRWeaveProvider`, registered
 in `ShellContentGpuClient::PostCompositorThreadCreated`) owns the Mojo remote + a
 keyed-mutex synthetic SBS input; `SkiaRenderer::DrawTextureQuad` tags the canvas
@@ -344,11 +344,11 @@ paths) imports the woven handle + fence-waits + redirects the tagged
   inject the canvas via CDP (`--remote-debugging-port` + `document.write`).
 
 **Proven (logs):** DrawTextureQuad tags the canvas → provider found → synthetic
-SBS input created → Mojo `[Sync]` → browser → `xrWeaveSubmitEXT` called with a
+SBS input created → Mojo `[Sync]` → browser → `xrWeaveSubmitDXR` called with a
 valid non-null NT handle + window-relative rect (content_shell and the service
 both High integrity, so handle duplication is fine).
 
-**Blocker (runtime, not Chromium):** `xrWeaveSubmitEXT` returns **-2
+**Blocker (runtime, not Chromium):** `xrWeaveSubmitDXR` returns **-2
 (`XR_ERROR_RUNTIME_FAILURE`)** every call. `comp_d3d11_service_weave_submit`
 silent-returns `false` **before** any of its `U_LOG_E` points (no
 `OpenSharedResource` / "server output" in the service log) — i.e. either the IPC
@@ -369,7 +369,7 @@ The -2 is a **runtime DP-availability bug, gated on workspace mode** — *not* t
 IPC handle transport. Diagnosed by instrumenting every silent early-return in
 `comp_d3d11_service_weave_submit` and reproducing the weave with two **browser-
 free** present-owners (the `weave_rpc_probe_d3d11_win` test app and the Step-A CEF
-host), which fire the same `xrWeaveSubmitEXT` RPC deterministically (no dependence
+host), which fire the same `xrWeaveSubmitDXR` RPC deterministically (no dependence
 on a browser compositor producing frames — content_shell would not composite under
 the headless automation harness, so it was a poor diagnosis vehicle).
 
@@ -397,7 +397,7 @@ both run `process_atlas` under `sys->render_mutex`, so the shared DP is serializ
 (no concurrent immediate-context use). Lowest-risk option — **creates no new DP**,
 so zero SR-recalibration risk to the active workspace. (Phase caveat: the shared
 DP's interlace phase references the workspace window. Phase-independent for the
-synthetic SBS test pattern; real content phase-snaps via `xrWeaveSnapWindowRectEXT`
+synthetic SBS test pattern; real content phase-snaps via `xrWeaveSnapWindowRectDXR`
 — a B2c.2 follow-up if a window-bound phase is needed.)
 
 **Validated** (deterministic, both modes) with `weave_rpc_probe_d3d11_win`: in
@@ -442,7 +442,7 @@ left-GREEN / right-MAGENTA SBS (deliberately ≠ the synthetic red/blue) so a
 successful eyeball proves canvas provenance.
 
 **Live Leia eyeball: ✅ PASSED (2026-07-04).** The full pipe came up live
-(`xrWeaveBindWindowEXT -> 0 — B2a PASSED`, `B2c GPU weave provider registered`,
+(`xrWeaveBindWindowDXR -> 0 — B2a PASSED`, `B2c GPU weave provider registered`,
 `B2c.2 weave target found; driving canvas weave`, `B2c.2 canvas weave input ready`),
 the service wove every frame (`leia_dp_d3d11_process_atlas weave: target=2058x1745
 view=1029x1745`), and the user confirmed the real green/magenta SBS canvas rendered
@@ -713,7 +713,7 @@ off-axis frusta built from the runtime's tracked eyes.
   animation frame (async, one-frame-lagged cache) and builds the projections from it.
 - **Browser cache + geometry.** `DisplayXRWeaveClient` caches the latest eyes +
   committed weave rect (written from `DisplayXRWeaverImpl::WeaveSubmit`), queries the
-  physical display dimensions once via `XR_EXT_display_info`
+  physical display dimensions once via `XR_DXR_display_info`
   (`xrGetSystemProperties`), and converts the window-relative weave rect to a
   **display-space element rect** (bound-window client origin + committed rect) so the
   renderer's window-relative Kooima is exact. (Multi-monitor origin mapping is a B4
@@ -766,8 +766,8 @@ impls, `gpu` provider), consumed by *both* `content_shell` and `chrome`. The thr
 - `ChromeContentGpuClient::PostCompositorThreadCreated` → GPU weave provider.
 
 **Validated live on Leia (`--enable-inline-3d --enable-blink-features=DisplayXRInline3D`):**
-weave-client init, `xrWeaveBindWindowEXT -> 0`, GPU provider registered,
-`XR_EXT_display_info` query, `isSessionSupported('inline-3d')` → `true` (full
+weave-client init, `xrWeaveBindWindowDXR -> 0`, GPU provider registered,
+`XR_DXR_display_info` query, `isSessionSupported('inline-3d')` → `true` (full
 DisplayXRService mojom round-trip), `XRDisplayLayer` constructs + tags the canvas
 (`layer:true, targetOk:true`). No `IPC_IGNORE_VERSION`, no integrity mismatch
 (Medium chrome via explorer-handoff matched the Medium service).
@@ -842,7 +842,7 @@ sidesteps the compositing-mode fight entirely):
    composited page with the flat SBS canvas is now in the output target) and
    **before** `SwapBuffers`, for each `inline_3d_rects` entry:
    `CopySubresourceRegion` the output-target sub-rect → owned keyed-mutex SBS input
-   → `xrWeaveSubmitEXT` (via the unchanged Mojo bridge) → fence-wait → draw the
+   → `xrWeaveSubmitDXR` (via the unchanged Mojo bridge) → fence-wait → draw the
    woven texture back over the output at that rect. This mirrors
    `weave_compositor.cpp` step-for-step (page base already present in the target;
    overlay each woven sub-rect). Replaces the per-quad tag + `MaybeWeaveSubstitute`

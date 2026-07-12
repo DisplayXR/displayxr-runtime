@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  XR_EXT_spatial_workspace API entry points.
+ * @brief  XR_DXR_spatial_workspace API entry points.
  * @author DisplayXR
  * @ingroup oxr_api
  *
@@ -33,7 +33,7 @@
 // (state_trackers/oxr/../../ipc) lets us write this as "shared/...".
 #include "shared/ipc_protocol.h"
 
-#include <openxr/XR_EXT_spatial_workspace.h>
+#include <openxr/XR_DXR_spatial_workspace.h>
 
 #include <math.h>
 #include <stdbool.h>
@@ -41,7 +41,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#ifdef OXR_HAVE_EXT_spatial_workspace
+#ifdef OXR_HAVE_DXR_spatial_workspace
 
 // Forward declarations of the IPC-bridge wrappers. Defined in
 // src/xrt/ipc/client/ipc_client_compositor.c. See header comment above.
@@ -280,19 +280,19 @@ oxr_xrActivateSpatialWorkspaceEXT(XrSession session)
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrActivateSpatialWorkspaceEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrActivateSpatialWorkspaceDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrActivateSpatialWorkspaceEXT requires an IPC-mode session");
+		                 "xrActivateSpatialWorkspaceDXR requires an IPC-mode session");
 	}
 
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_activate(&sess->xcn->base);
 	if (xret == XRT_SUCCESS) {
 		// Mark this session as the active workspace controller (#234) so
-		// xrRequestDisplayRenderingModeEXT exempts it from the workspace-
+		// xrRequestDisplayRenderingModeDXR exempts it from the workspace-
 		// client gate. Graphics-bound controllers (like the shell rendering
 		// its own chrome) have `compositor != NULL` and would otherwise be
 		// gated alongside actual workspace apps.
@@ -311,13 +311,13 @@ oxr_xrDeactivateSpatialWorkspaceEXT(XrSession session)
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrDeactivateSpatialWorkspaceEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrDeactivateSpatialWorkspaceDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrDeactivateSpatialWorkspaceEXT requires an IPC-mode session");
+		                 "xrDeactivateSpatialWorkspaceDXR requires an IPC-mode session");
 	}
 
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_deactivate(&sess->xcn->base);
@@ -335,14 +335,14 @@ oxr_xrGetSpatialWorkspaceStateEXT(XrSession session, XrBool32 *out_active)
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetSpatialWorkspaceStateEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetSpatialWorkspaceStateDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 	OXR_VERIFY_ARG_NOT_NULL(&log, out_active);
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrGetSpatialWorkspaceStateEXT requires an IPC-mode session");
+		                 "xrGetSpatialWorkspaceStateDXR requires an IPC-mode session");
 	}
 
 	bool active = false;
@@ -369,26 +369,26 @@ oxr_xrAddWorkspaceCaptureClientEXT(XrSession session,
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrAddWorkspaceCaptureClientEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrAddWorkspaceCaptureClientDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 	OXR_VERIFY_ARG_NOT_NULL(&log, outClientId);
 
 	if (nativeWindow == 0) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrAddWorkspaceCaptureClientEXT: nativeWindow must be a valid HWND");
+		                 "xrAddWorkspaceCaptureClientDXR: nativeWindow must be a valid HWND");
 	}
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrAddWorkspaceCaptureClientEXT requires an IPC-mode session");
+		                 "xrAddWorkspaceCaptureClientDXR requires an IPC-mode session");
 	}
 
 	// nameOptional is part of the public API but proto.json does not yet carry
 	// the field. Phase 2.A logs the label and drops it; a follow-up sub-phase
 	// extends the IPC wire format and threads it through the handler.
 	if (nameOptional != NULL) {
-		U_LOG_I("xrAddWorkspaceCaptureClientEXT: name=\"%s\" (advisory; not yet propagated through IPC)",
+		U_LOG_I("xrAddWorkspaceCaptureClientDXR: name=\"%s\" (advisory; not yet propagated through IPC)",
 		        nameOptional);
 	}
 
@@ -409,18 +409,18 @@ oxr_xrRemoveWorkspaceCaptureClientEXT(XrSession session, XrWorkspaceClientId cli
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRemoveWorkspaceCaptureClientEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRemoveWorkspaceCaptureClientDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 
 	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrRemoveWorkspaceCaptureClientEXT: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
+		                 "xrRemoveWorkspaceCaptureClientDXR: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
 	}
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrRemoveWorkspaceCaptureClientEXT requires an IPC-mode session");
+		                 "xrRemoveWorkspaceCaptureClientDXR requires an IPC-mode session");
 	}
 
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_remove_capture_client(&sess->xcn->base,
@@ -473,23 +473,23 @@ oxr_xrSetWorkspaceClientWindowPoseEXT(XrSession session,
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceClientWindowPoseEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceClientWindowPoseDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 	OXR_VERIFY_ARG_NOT_NULL(&log, pose);
 
 	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrSetWorkspaceClientWindowPoseEXT: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
+		                 "xrSetWorkspaceClientWindowPoseDXR: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
 	}
 	if (!(widthMeters > 0.0f) || !(heightMeters > 0.0f)) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrSetWorkspaceClientWindowPoseEXT: widthMeters and heightMeters must be > 0");
+		                 "xrSetWorkspaceClientWindowPoseDXR: widthMeters and heightMeters must be > 0");
 	}
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrSetWorkspaceClientWindowPoseEXT requires an IPC-mode session");
+		                 "xrSetWorkspaceClientWindowPoseDXR requires an IPC-mode session");
 	}
 
 	struct xrt_pose xpose;
@@ -511,21 +511,21 @@ oxr_xrGetWorkspaceClientWindowPoseEXT(XrSession session,
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetWorkspaceClientWindowPoseEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetWorkspaceClientWindowPoseDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 	OXR_VERIFY_ARG_NOT_NULL(&log, outPose);
 	OXR_VERIFY_ARG_NOT_NULL(&log, outWidthMeters);
 	OXR_VERIFY_ARG_NOT_NULL(&log, outHeightMeters);
 
 	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrGetWorkspaceClientWindowPoseEXT: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
+		                 "xrGetWorkspaceClientWindowPoseDXR: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
 	}
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrGetWorkspaceClientWindowPoseEXT requires an IPC-mode session");
+		                 "xrGetWorkspaceClientWindowPoseDXR requires an IPC-mode session");
 	}
 
 	struct xrt_pose xpose = {0};
@@ -548,18 +548,18 @@ oxr_xrSetWorkspaceClientVisibilityEXT(XrSession session, XrWorkspaceClientId cli
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceClientVisibilityEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceClientVisibilityDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 
 	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrSetWorkspaceClientVisibilityEXT: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
+		                 "xrSetWorkspaceClientVisibilityDXR: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
 	}
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrSetWorkspaceClientVisibilityEXT requires an IPC-mode session");
+		                 "xrSetWorkspaceClientVisibilityDXR requires an IPC-mode session");
 	}
 
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_window_visibility(
@@ -579,15 +579,15 @@ oxr_xrSetWorkspaceFocusedClientEXT(XrSession session, XrWorkspaceClientId client
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceFocusedClientEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceFocusedClientDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 
 	// XR_NULL_WORKSPACE_CLIENT_ID is valid here — clears focus.
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrSetWorkspaceFocusedClientEXT requires an IPC-mode session");
+		                 "xrSetWorkspaceFocusedClientDXR requires an IPC-mode session");
 	}
 
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_focused_client(&sess->xcn->base,
@@ -602,29 +602,29 @@ oxr_xrSetWorkspaceFocusedClientEXT(XrSession session, XrWorkspaceClientId client
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceReservedKeysEXT(XrSession session,
                                   uint32_t keyCount,
-                                  const XrWorkspaceReservedKeyEXT *keys)
+                                  const XrWorkspaceReservedKeyDXR *keys)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceReservedKeysEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceReservedKeysDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 
-	if (keyCount > XR_WORKSPACE_MAX_RESERVED_KEYS_EXT) {
+	if (keyCount > XR_WORKSPACE_MAX_RESERVED_KEYS_DXR) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrSetWorkspaceReservedKeysEXT: keyCount %u exceeds max %u",
-		                 keyCount, XR_WORKSPACE_MAX_RESERVED_KEYS_EXT);
+		                 "xrSetWorkspaceReservedKeysDXR: keyCount %u exceeds max %u",
+		                 keyCount, XR_WORKSPACE_MAX_RESERVED_KEYS_DXR);
 	}
 	if (keyCount > 0 && keys == NULL) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrSetWorkspaceReservedKeysEXT: keys must not be NULL when keyCount > 0");
+		                 "xrSetWorkspaceReservedKeysDXR: keys must not be NULL when keyCount > 0");
 	}
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrSetWorkspaceReservedKeysEXT requires an IPC-mode session");
+		                 "xrSetWorkspaceReservedKeysDXR requires an IPC-mode session");
 	}
 
 	struct ipc_workspace_reserved_keys table;
@@ -651,13 +651,13 @@ oxr_xrSetWorkspaceInputGrabEXT(XrSession session, XrBool32 grab)
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceInputGrabEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceInputGrabDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrSetWorkspaceInputGrabEXT requires an IPC-mode session");
+		                 "xrSetWorkspaceInputGrabDXR requires an IPC-mode session");
 	}
 
 	xrt_result_t xret =
@@ -672,14 +672,14 @@ oxr_xrGetWorkspaceFocusedClientEXT(XrSession session, XrWorkspaceClientId *outCl
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetWorkspaceFocusedClientEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetWorkspaceFocusedClientDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 	OXR_VERIFY_ARG_NOT_NULL(&log, outClientId);
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrGetWorkspaceFocusedClientEXT requires an IPC-mode session");
+		                 "xrGetWorkspaceFocusedClientDXR requires an IPC-mode session");
 	}
 
 	uint32_t client_id = 0;
@@ -703,23 +703,23 @@ oxr_xrSetWorkspaceClientFrameRateCapEXT(XrSession session, XrWorkspaceClientId c
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceClientFrameRateCapEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceClientFrameRateCapDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 
 	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrSetWorkspaceClientFrameRateCapEXT: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
+		                 "xrSetWorkspaceClientFrameRateCapDXR: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
 	}
 
 	if (maxFps < 0.0f) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrSetWorkspaceClientFrameRateCapEXT: maxFps must be >= 0.0f (0 = uncapped)");
+		                 "xrSetWorkspaceClientFrameRateCapDXR: maxFps must be >= 0.0f (0 = uncapped)");
 	}
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrSetWorkspaceClientFrameRateCapEXT requires an IPC-mode session");
+		                 "xrSetWorkspaceClientFrameRateCapDXR requires an IPC-mode session");
 	}
 
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_client_frame_rate_cap(
@@ -736,33 +736,33 @@ XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrEnumerateWorkspaceInputEventsEXT(XrSession session,
                                        uint32_t capacityInput,
                                        uint32_t *countOutput,
-                                       XrWorkspaceInputEventEXT *events)
+                                       XrWorkspaceInputEventDXR *events)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrEnumerateWorkspaceInputEventsEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrEnumerateWorkspaceInputEventsDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 	OXR_VERIFY_ARG_NOT_NULL(&log, countOutput);
 
 	if (capacityInput > 0 && events == NULL) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrEnumerateWorkspaceInputEventsEXT: events must not be NULL when capacityInput > 0");
+		                 "xrEnumerateWorkspaceInputEventsDXR: events must not be NULL when capacityInput > 0");
 	}
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrEnumerateWorkspaceInputEventsEXT requires an IPC-mode session");
+		                 "xrEnumerateWorkspaceInputEventsDXR requires an IPC-mode session");
 	}
 
 	uint32_t count = 0;
-	// Bridge translates wire events → XrWorkspaceInputEventEXT records and
+	// Bridge translates wire events → XrWorkspaceInputEventDXR records and
 	// writes them into the caller-supplied array. Pass the array through
 	// as an opaque buffer so st_oxr does not need to peek inside.
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_enumerate_input_events(
-	    &sess->xcn->base, capacityInput, &count, events, sizeof(XrWorkspaceInputEventEXT),
+	    &sess->xcn->base, capacityInput, &count, events, sizeof(XrWorkspaceInputEventDXR),
 	    (size_t)capacityInput);
 	if (xret != XRT_SUCCESS) {
 		return xret_to_xr_result(&log, xret, "workspace_enumerate_input_events");
@@ -778,13 +778,13 @@ oxr_xrEnableWorkspacePointerCaptureEXT(XrSession session, uint32_t button)
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrEnableWorkspacePointerCaptureEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrEnableWorkspacePointerCaptureDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrEnableWorkspacePointerCaptureEXT requires an IPC-mode session");
+		                 "xrEnableWorkspacePointerCaptureDXR requires an IPC-mode session");
 	}
 
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_pointer_capture_set(&sess->xcn->base, true, button);
@@ -798,13 +798,13 @@ oxr_xrDisableWorkspacePointerCaptureEXT(XrSession session)
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrDisableWorkspacePointerCaptureEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrDisableWorkspacePointerCaptureDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrDisableWorkspacePointerCaptureEXT requires an IPC-mode session");
+		                 "xrDisableWorkspacePointerCaptureDXR requires an IPC-mode session");
 	}
 
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_pointer_capture_set(&sess->xcn->base, false, 0);
@@ -818,28 +818,28 @@ oxr_xrDisableWorkspacePointerCaptureEXT(XrSession session)
 
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrCaptureWorkspaceFrameEXT(XrSession session,
-                               const XrWorkspaceCaptureRequestEXT *request,
-                               XrWorkspaceCaptureResultEXT *result)
+                               const XrWorkspaceCaptureRequestDXR *request,
+                               XrWorkspaceCaptureResultDXR *result)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrCaptureWorkspaceFrameEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrCaptureWorkspaceFrameDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 	OXR_VERIFY_ARG_NOT_NULL(&log, request);
 	OXR_VERIFY_ARG_NOT_NULL(&log, result);
 
-	if (request->type != XR_TYPE_WORKSPACE_CAPTURE_REQUEST_EXT) {
+	if (request->type != XR_TYPE_WORKSPACE_CAPTURE_REQUEST_DXR) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrCaptureWorkspaceFrameEXT: request->type must be "
-		                 "XR_TYPE_WORKSPACE_CAPTURE_REQUEST_EXT");
+		                 "xrCaptureWorkspaceFrameDXR: request->type must be "
+		                 "XR_TYPE_WORKSPACE_CAPTURE_REQUEST_DXR");
 	}
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrCaptureWorkspaceFrameEXT requires an IPC-mode session");
+		                 "xrCaptureWorkspaceFrameDXR requires an IPC-mode session");
 	}
 
 	uint64_t ts_ns = 0;
@@ -853,14 +853,14 @@ oxr_xrCaptureWorkspaceFrameEXT(XrSession session,
 		return xret_to_xr_result(&log, xret, "workspace_capture_frame");
 	}
 
-	result->type = XR_TYPE_WORKSPACE_CAPTURE_RESULT_EXT;
+	result->type = XR_TYPE_WORKSPACE_CAPTURE_RESULT_DXR;
 	result->next = NULL;
 	result->timestampNs = ts_ns;
 	result->atlasWidth = aw;
 	result->atlasHeight = ah;
 	result->eyeWidth = ew;
 	result->eyeHeight = eh;
-	result->viewsWritten = (XrWorkspaceCaptureFlagsEXT)vw;
+	result->viewsWritten = (XrWorkspaceCaptureFlagsDXR)vw;
 	result->tileColumns = tc;
 	result->tileRows = tr;
 	result->displayWidthM = dw_m;
@@ -889,19 +889,19 @@ oxr_xrEnumerateWorkspaceClientsEXT(XrSession session,
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrEnumerateWorkspaceClientsEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrEnumerateWorkspaceClientsDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 	OXR_VERIFY_ARG_NOT_NULL(&log, countOutput);
 
 	if (capacityInput > 0 && clientIds == NULL) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrEnumerateWorkspaceClientsEXT: clientIds must not be NULL when capacityInput > 0");
+		                 "xrEnumerateWorkspaceClientsDXR: clientIds must not be NULL when capacityInput > 0");
 	}
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrEnumerateWorkspaceClientsEXT requires an IPC-mode session");
+		                 "xrEnumerateWorkspaceClientsDXR requires an IPC-mode session");
 	}
 
 	uint32_t count = 0;
@@ -918,31 +918,31 @@ oxr_xrEnumerateWorkspaceClientsEXT(XrSession session,
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrGetWorkspaceClientInfoEXT(XrSession session,
                                 XrWorkspaceClientId clientId,
-                                XrWorkspaceClientInfoEXT *info)
+                                XrWorkspaceClientInfoDXR *info)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetWorkspaceClientInfoEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetWorkspaceClientInfoDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 	OXR_VERIFY_ARG_NOT_NULL(&log, info);
 
-	if (info->type != XR_TYPE_WORKSPACE_CLIENT_INFO_EXT) {
+	if (info->type != XR_TYPE_WORKSPACE_CLIENT_INFO_DXR) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrGetWorkspaceClientInfoEXT: info->type must be "
-		                 "XR_TYPE_WORKSPACE_CLIENT_INFO_EXT");
+		                 "xrGetWorkspaceClientInfoDXR: info->type must be "
+		                 "XR_TYPE_WORKSPACE_CLIENT_INFO_DXR");
 	}
 
 	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrGetWorkspaceClientInfoEXT: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
+		                 "xrGetWorkspaceClientInfoDXR: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
 	}
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrGetWorkspaceClientInfoEXT requires an IPC-mode session");
+		                 "xrGetWorkspaceClientInfoDXR requires an IPC-mode session");
 	}
 
 	uint64_t pid = 0;
@@ -962,7 +962,7 @@ oxr_xrGetWorkspaceClientInfoEXT(XrSession session,
 	// only returns OpenXR clients today, so we report OPENXR_3D here. A
 	// future workspace_get_client_info that also resolves capture-client
 	// ids would distinguish via the slot+1000 range.
-	info->clientType = XR_WORKSPACE_CLIENT_TYPE_OPENXR_3D_EXT;
+	info->clientType = XR_WORKSPACE_CLIENT_TYPE_OPENXR_3D_DXR;
 	memcpy(info->name, name, sizeof(info->name));
 	info->name[sizeof(info->name) - 1] = '\0';
 	info->pid = pid;
@@ -984,18 +984,18 @@ oxr_xrRequestWorkspaceClientExitEXT(XrSession session, XrWorkspaceClientId clien
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRequestWorkspaceClientExitEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRequestWorkspaceClientExitDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 
 	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrRequestWorkspaceClientExitEXT: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
+		                 "xrRequestWorkspaceClientExitDXR: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
 	}
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrRequestWorkspaceClientExitEXT requires an IPC-mode session");
+		                 "xrRequestWorkspaceClientExitDXR requires an IPC-mode session");
 	}
 
 	xrt_result_t xret =
@@ -1010,19 +1010,19 @@ oxr_xrRequestWorkspaceClientFullscreenEXT(XrSession session, XrWorkspaceClientId
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRequestWorkspaceClientFullscreenEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRequestWorkspaceClientFullscreenDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 
 	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
 		return oxr_error(
 		    &log, XR_ERROR_VALIDATION_FAILURE,
-		    "xrRequestWorkspaceClientFullscreenEXT: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
+		    "xrRequestWorkspaceClientFullscreenDXR: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
 	}
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrRequestWorkspaceClientFullscreenEXT requires an IPC-mode session");
+		                 "xrRequestWorkspaceClientFullscreenDXR requires an IPC-mode session");
 	}
 
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_request_client_fullscreen(
@@ -1042,42 +1042,42 @@ oxr_xrRequestWorkspaceClientFullscreenEXT(XrSession session, XrWorkspaceClientId
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrCreateWorkspaceClientChromeSwapchainEXT(XrSession session,
                                               XrWorkspaceClientId clientId,
-                                              const XrWorkspaceChromeSwapchainCreateInfoEXT *createInfo,
+                                              const XrWorkspaceChromeSwapchainCreateInfoDXR *createInfo,
                                               XrSwapchain *swapchain)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrCreateWorkspaceClientChromeSwapchainEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrCreateWorkspaceClientChromeSwapchainDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 	OXR_VERIFY_ARG_NOT_NULL(&log, createInfo);
 	OXR_VERIFY_ARG_NOT_NULL(&log, swapchain);
 
-	if (createInfo->type != XR_TYPE_WORKSPACE_CHROME_SWAPCHAIN_CREATE_INFO_EXT) {
+	if (createInfo->type != XR_TYPE_WORKSPACE_CHROME_SWAPCHAIN_CREATE_INFO_DXR) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrCreateWorkspaceClientChromeSwapchainEXT: createInfo->type must be "
-		                 "XR_TYPE_WORKSPACE_CHROME_SWAPCHAIN_CREATE_INFO_EXT");
+		                 "xrCreateWorkspaceClientChromeSwapchainDXR: createInfo->type must be "
+		                 "XR_TYPE_WORKSPACE_CHROME_SWAPCHAIN_CREATE_INFO_DXR");
 	}
 	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrCreateWorkspaceClientChromeSwapchainEXT: clientId must not be "
+		                 "xrCreateWorkspaceClientChromeSwapchainDXR: clientId must not be "
 		                 "XR_NULL_WORKSPACE_CLIENT_ID");
 	}
 	if (createInfo->width == 0 || createInfo->height == 0) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrCreateWorkspaceClientChromeSwapchainEXT: width and height must be > 0");
+		                 "xrCreateWorkspaceClientChromeSwapchainDXR: width and height must be > 0");
 	}
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrCreateWorkspaceClientChromeSwapchainEXT requires an IPC-mode session");
+		                 "xrCreateWorkspaceClientChromeSwapchainDXR requires an IPC-mode session");
 	}
 
 	if (sess->compositor == NULL) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrCreateWorkspaceClientChromeSwapchainEXT: session has no compositor");
+		                 "xrCreateWorkspaceClientChromeSwapchainDXR: session has no compositor");
 	}
 
 	// Mint a regular OpenXR swapchain. Chrome is just a single-image color
@@ -1133,8 +1133,8 @@ oxr_xrDestroyWorkspaceClientChromeSwapchainEXT(XrSwapchain swapchain)
 
 	struct oxr_swapchain *sc = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SWAPCHAIN_AND_INIT_LOG(&log, swapchain, sc, "xrDestroyWorkspaceClientChromeSwapchainEXT");
-	OXR_VERIFY_EXTENSION(&log, sc->sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_SWAPCHAIN_AND_INIT_LOG(&log, swapchain, sc, "xrDestroyWorkspaceClientChromeSwapchainDXR");
+	OXR_VERIFY_EXTENSION(&log, sc->sess->sys->inst, DXR_spatial_workspace);
 
 	// Drop the runtime-side chrome registration before destroying the
 	// swapchain. The runtime is tolerant of a missing entry — if the swapchain
@@ -1151,7 +1151,7 @@ oxr_xrDestroyWorkspaceClientChromeSwapchainEXT(XrSwapchain swapchain)
 }
 
 static void
-chrome_layout_xr_to_ipc(const XrWorkspaceChromeLayoutEXT *in,
+chrome_layout_xr_to_ipc(const XrWorkspaceChromeLayoutDXR *in,
                         struct ipc_workspace_chrome_layout *out)
 {
 	memset(out, 0, sizeof(*out));
@@ -1175,45 +1175,45 @@ chrome_layout_xr_to_ipc(const XrWorkspaceChromeLayoutEXT *in,
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceClientChromeLayoutEXT(XrSession session,
                                         XrWorkspaceClientId clientId,
-                                        const XrWorkspaceChromeLayoutEXT *layout)
+                                        const XrWorkspaceChromeLayoutDXR *layout)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceClientChromeLayoutEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceClientChromeLayoutDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 	OXR_VERIFY_ARG_NOT_NULL(&log, layout);
 
-	if (layout->type != XR_TYPE_WORKSPACE_CHROME_LAYOUT_EXT) {
+	if (layout->type != XR_TYPE_WORKSPACE_CHROME_LAYOUT_DXR) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrSetWorkspaceClientChromeLayoutEXT: layout->type must be "
-		                 "XR_TYPE_WORKSPACE_CHROME_LAYOUT_EXT");
+		                 "xrSetWorkspaceClientChromeLayoutDXR: layout->type must be "
+		                 "XR_TYPE_WORKSPACE_CHROME_LAYOUT_DXR");
 	}
 	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrSetWorkspaceClientChromeLayoutEXT: clientId must not be "
+		                 "xrSetWorkspaceClientChromeLayoutDXR: clientId must not be "
 		                 "XR_NULL_WORKSPACE_CLIENT_ID");
 	}
-	if (layout->hitRegionCount > XR_WORKSPACE_CHROME_MAX_HIT_REGIONS_EXT) {
+	if (layout->hitRegionCount > XR_WORKSPACE_CHROME_MAX_HIT_REGIONS_DXR) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrSetWorkspaceClientChromeLayoutEXT: hitRegionCount %u exceeds max %u",
-		                 layout->hitRegionCount, XR_WORKSPACE_CHROME_MAX_HIT_REGIONS_EXT);
+		                 "xrSetWorkspaceClientChromeLayoutDXR: hitRegionCount %u exceeds max %u",
+		                 layout->hitRegionCount, XR_WORKSPACE_CHROME_MAX_HIT_REGIONS_DXR);
 	}
 	if (layout->hitRegionCount > 0 && layout->hitRegions == NULL) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrSetWorkspaceClientChromeLayoutEXT: hitRegions must not be NULL when "
+		                 "xrSetWorkspaceClientChromeLayoutDXR: hitRegions must not be NULL when "
 		                 "hitRegionCount > 0");
 	}
 	if (!(layout->sizeMeters.width > 0.0f) || !(layout->sizeMeters.height > 0.0f)) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrSetWorkspaceClientChromeLayoutEXT: sizeMeters width/height must be > 0");
+		                 "xrSetWorkspaceClientChromeLayoutDXR: sizeMeters width/height must be > 0");
 	}
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrSetWorkspaceClientChromeLayoutEXT requires an IPC-mode session");
+		                 "xrSetWorkspaceClientChromeLayoutDXR requires an IPC-mode session");
 	}
 
 	struct ipc_workspace_chrome_layout ipc_layout;
@@ -1233,20 +1233,20 @@ oxr_xrUpdateWorkspaceClientChromeLayerPoseEXT(XrSession session,
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrUpdateWorkspaceClientChromeLayerPoseEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrUpdateWorkspaceClientChromeLayerPoseDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 	OXR_VERIFY_ARG_NOT_NULL(&log, poseInClient);
 
 	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrUpdateWorkspaceClientChromeLayerPoseEXT: clientId must not be "
+		                 "xrUpdateWorkspaceClientChromeLayerPoseDXR: clientId must not be "
 		                 "XR_NULL_WORKSPACE_CLIENT_ID");
 	}
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrUpdateWorkspaceClientChromeLayerPoseEXT requires an IPC-mode session");
+		                 "xrUpdateWorkspaceClientChromeLayerPoseDXR requires an IPC-mode session");
 	}
 
 	struct xrt_pose xpose;
@@ -1259,41 +1259,41 @@ oxr_xrUpdateWorkspaceClientChromeLayerPoseEXT(XrSession session,
 
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrCreateWorkspaceCursorSwapchainEXT(XrSession session,
-                                         const XrWorkspaceCursorSwapchainCreateInfoEXT *createInfo,
+                                         const XrWorkspaceCursorSwapchainCreateInfoDXR *createInfo,
                                          XrSwapchain *swapchain)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrCreateWorkspaceCursorSwapchainEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrCreateWorkspaceCursorSwapchainDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 	OXR_VERIFY_ARG_NOT_NULL(&log, createInfo);
 	OXR_VERIFY_ARG_NOT_NULL(&log, swapchain);
 
-	if (createInfo->type != XR_TYPE_WORKSPACE_CURSOR_SWAPCHAIN_CREATE_INFO_EXT) {
+	if (createInfo->type != XR_TYPE_WORKSPACE_CURSOR_SWAPCHAIN_CREATE_INFO_DXR) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrCreateWorkspaceCursorSwapchainEXT: createInfo->type must be "
-		                 "XR_TYPE_WORKSPACE_CURSOR_SWAPCHAIN_CREATE_INFO_EXT");
+		                 "xrCreateWorkspaceCursorSwapchainDXR: createInfo->type must be "
+		                 "XR_TYPE_WORKSPACE_CURSOR_SWAPCHAIN_CREATE_INFO_DXR");
 	}
 	if (createInfo->width == 0 || createInfo->height == 0) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrCreateWorkspaceCursorSwapchainEXT: width and height must be > 0");
+		                 "xrCreateWorkspaceCursorSwapchainDXR: width and height must be > 0");
 	}
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrCreateWorkspaceCursorSwapchainEXT requires an IPC-mode session");
+		                 "xrCreateWorkspaceCursorSwapchainDXR requires an IPC-mode session");
 	}
 	if (sess->compositor == NULL) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrCreateWorkspaceCursorSwapchainEXT: session has no compositor");
+		                 "xrCreateWorkspaceCursorSwapchainDXR: session has no compositor");
 	}
 
 	// Mint a regular OpenXR swapchain — same flags as chrome (single-image
 	// color, controller-rendered, cross-process shareable). The runtime
-	// uses xrSetWorkspaceCursorEXT to associate it with the cursor render
+	// uses xrSetWorkspaceCursorDXR to associate it with the cursor render
 	// pass; the create itself doesn't bind to any role.
 	XrSwapchainCreateInfo sci = {0};
 	sci.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
@@ -1318,24 +1318,24 @@ oxr_xrCreateWorkspaceCursorSwapchainEXT(XrSession session,
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetWorkspaceCursorEXT(XrSession session, const XrWorkspaceCursorInfoEXT *info)
+oxr_xrSetWorkspaceCursorEXT(XrSession session, const XrWorkspaceCursorInfoDXR *info)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceCursorEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceCursorDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 	OXR_VERIFY_ARG_NOT_NULL(&log, info);
 
-	if (info->type != XR_TYPE_WORKSPACE_CURSOR_INFO_EXT) {
+	if (info->type != XR_TYPE_WORKSPACE_CURSOR_INFO_DXR) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrSetWorkspaceCursorEXT: info->type must be XR_TYPE_WORKSPACE_CURSOR_INFO_EXT");
+		                 "xrSetWorkspaceCursorDXR: info->type must be XR_TYPE_WORKSPACE_CURSOR_INFO_DXR");
 	}
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrSetWorkspaceCursorEXT requires an IPC-mode session");
+		                 "xrSetWorkspaceCursorDXR requires an IPC-mode session");
 	}
 
 	// Resolve swapchain handle (if any) to the IPC swapchain id.
@@ -1349,7 +1349,7 @@ oxr_xrSetWorkspaceCursorEXT(XrSession session, const XrWorkspaceCursorInfoEXT *i
 
 	if (info->swapchain != XR_NULL_HANDLE) {
 		struct oxr_swapchain *sc = NULL;
-		OXR_VERIFY_SWAPCHAIN_AND_INIT_LOG(&log, info->swapchain, sc, "xrSetWorkspaceCursorEXT");
+		OXR_VERIFY_SWAPCHAIN_AND_INIT_LOG(&log, info->swapchain, sc, "xrSetWorkspaceCursorDXR");
 		struct xrt_swapchain *inner = workspace_unwrap_client_swapchain(sc->sess, sc->swapchain);
 		ipc_info.swapchain_id = comp_ipc_client_compositor_get_swapchain_id(inner);
 	}
@@ -1366,24 +1366,24 @@ oxr_xrSetWorkspaceCursorEXT(XrSession session, const XrWorkspaceCursorInfoEXT *i
  * per-eye disparity. Cursor screen position stays runtime-owned.
  */
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetWorkspaceCursorDepthEXT(XrSession session, const XrWorkspaceCursorDepthEXT *info)
+oxr_xrSetWorkspaceCursorDepthEXT(XrSession session, const XrWorkspaceCursorDepthDXR *info)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceCursorDepthEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceCursorDepthDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 	OXR_VERIFY_ARG_NOT_NULL(&log, info);
 
-	if (info->type != XR_TYPE_WORKSPACE_CURSOR_DEPTH_EXT) {
+	if (info->type != XR_TYPE_WORKSPACE_CURSOR_DEPTH_DXR) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrSetWorkspaceCursorDepthEXT: info->type must be XR_TYPE_WORKSPACE_CURSOR_DEPTH_EXT");
+		                 "xrSetWorkspaceCursorDepthDXR: info->type must be XR_TYPE_WORKSPACE_CURSOR_DEPTH_DXR");
 	}
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrSetWorkspaceCursorDepthEXT requires an IPC-mode session");
+		                 "xrSetWorkspaceCursorDepthDXR requires an IPC-mode session");
 	}
 
 	// spec_version 23: clamp the controller-pushed over-window dim alpha to a
@@ -1402,41 +1402,41 @@ oxr_xrSetWorkspaceCursorDepthEXT(XrSession session, const XrWorkspaceCursorDepth
 
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrCreateWorkspaceOverlaySwapchainEXT(XrSession session,
-                                          const XrWorkspaceOverlaySwapchainCreateInfoEXT *createInfo,
+                                          const XrWorkspaceOverlaySwapchainCreateInfoDXR *createInfo,
                                           XrSwapchain *swapchain)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrCreateWorkspaceOverlaySwapchainEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrCreateWorkspaceOverlaySwapchainDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 	OXR_VERIFY_ARG_NOT_NULL(&log, createInfo);
 	OXR_VERIFY_ARG_NOT_NULL(&log, swapchain);
 
-	if (createInfo->type != XR_TYPE_WORKSPACE_OVERLAY_SWAPCHAIN_CREATE_INFO_EXT) {
+	if (createInfo->type != XR_TYPE_WORKSPACE_OVERLAY_SWAPCHAIN_CREATE_INFO_DXR) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrCreateWorkspaceOverlaySwapchainEXT: createInfo->type must be "
-		                 "XR_TYPE_WORKSPACE_OVERLAY_SWAPCHAIN_CREATE_INFO_EXT");
+		                 "xrCreateWorkspaceOverlaySwapchainDXR: createInfo->type must be "
+		                 "XR_TYPE_WORKSPACE_OVERLAY_SWAPCHAIN_CREATE_INFO_DXR");
 	}
 	if (createInfo->width == 0 || createInfo->height == 0) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrCreateWorkspaceOverlaySwapchainEXT: width and height must be > 0");
+		                 "xrCreateWorkspaceOverlaySwapchainDXR: width and height must be > 0");
 	}
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrCreateWorkspaceOverlaySwapchainEXT requires an IPC-mode session");
+		                 "xrCreateWorkspaceOverlaySwapchainDXR requires an IPC-mode session");
 	}
 	if (sess->compositor == NULL) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrCreateWorkspaceOverlaySwapchainEXT: session has no compositor");
+		                 "xrCreateWorkspaceOverlaySwapchainDXR: session has no compositor");
 	}
 
 	// Mint a regular OpenXR swapchain — same flags as the cursor (single-image
 	// color, controller-rendered, cross-process shareable). The runtime uses
-	// xrSetWorkspaceOverlayEXT to associate it with the overlay render pass; the
+	// xrSetWorkspaceOverlayDXR to associate it with the overlay render pass; the
 	// create itself doesn't bind to any role.
 	XrSwapchainCreateInfo sci = {0};
 	sci.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
@@ -1461,24 +1461,24 @@ oxr_xrCreateWorkspaceOverlaySwapchainEXT(XrSession session,
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrSetWorkspaceOverlayEXT(XrSession session, const XrWorkspaceOverlayInfoEXT *info)
+oxr_xrSetWorkspaceOverlayEXT(XrSession session, const XrWorkspaceOverlayInfoDXR *info)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceOverlayEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceOverlayDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 	OXR_VERIFY_ARG_NOT_NULL(&log, info);
 
-	if (info->type != XR_TYPE_WORKSPACE_OVERLAY_INFO_EXT) {
+	if (info->type != XR_TYPE_WORKSPACE_OVERLAY_INFO_DXR) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrSetWorkspaceOverlayEXT: info->type must be XR_TYPE_WORKSPACE_OVERLAY_INFO_EXT");
+		                 "xrSetWorkspaceOverlayDXR: info->type must be XR_TYPE_WORKSPACE_OVERLAY_INFO_DXR");
 	}
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrSetWorkspaceOverlayEXT requires an IPC-mode session");
+		                 "xrSetWorkspaceOverlayDXR requires an IPC-mode session");
 	}
 
 	// Resolve swapchain handle (if any) to the IPC swapchain id.
@@ -1497,7 +1497,7 @@ oxr_xrSetWorkspaceOverlayEXT(XrSession session, const XrWorkspaceOverlayInfoEXT 
 
 	if (info->swapchain != XR_NULL_HANDLE) {
 		struct oxr_swapchain *sc = NULL;
-		OXR_VERIFY_SWAPCHAIN_AND_INIT_LOG(&log, info->swapchain, sc, "xrSetWorkspaceOverlayEXT");
+		OXR_VERIFY_SWAPCHAIN_AND_INIT_LOG(&log, info->swapchain, sc, "xrSetWorkspaceOverlayDXR");
 		struct xrt_swapchain *inner = workspace_unwrap_client_swapchain(sc->sess, sc->swapchain);
 		ipc_info.swapchain_id = comp_ipc_client_compositor_get_swapchain_id(inner);
 	}
@@ -1513,16 +1513,16 @@ oxr_xrAcquireWorkspaceWakeupEventEXT(XrSession session, uint64_t *outNativeHandl
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrAcquireWorkspaceWakeupEventEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrAcquireWorkspaceWakeupEventDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 	OXR_VERIFY_ARG_NOT_NULL(&log, outNativeHandle);
 
 	*outNativeHandle = 0;
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrAcquireWorkspaceWakeupEventEXT requires an IPC-mode session");
+		                 "xrAcquireWorkspaceWakeupEventDXR requires an IPC-mode session");
 	}
 
 	xrt_graphics_sync_handle_t handle = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
@@ -1543,11 +1543,11 @@ oxr_xrAcquireWorkspaceWakeupEventEXT(XrSession session, uint64_t *outNativeHandl
 	return XR_SUCCESS;
 }
 
-// Phase 2.C spec_version 9: copy XrWorkspaceClientStyleEXT into the IPC POD
+// Phase 2.C spec_version 9: copy XrWorkspaceClientStyleDXR into the IPC POD
 // form. Validates basic numeric sanity (no NaN, no negatives where the field
 // requires non-negative); leaves the runtime to clamp / interpret further.
 static bool
-client_style_xr_to_ipc(const XrWorkspaceClientStyleEXT *xr, struct ipc_workspace_client_style *ipc)
+client_style_xr_to_ipc(const XrWorkspaceClientStyleDXR *xr, struct ipc_workspace_client_style *ipc)
 {
 	if (xr == NULL || ipc == NULL) {
 		return false;
@@ -1573,31 +1573,31 @@ client_style_xr_to_ipc(const XrWorkspaceClientStyleEXT *xr, struct ipc_workspace
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceClientStyleEXT(XrSession session,
                                  XrWorkspaceClientId clientId,
-                                 const XrWorkspaceClientStyleEXT *style)
+                                 const XrWorkspaceClientStyleDXR *style)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess = NULL;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceClientStyleEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceClientStyleDXR");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
-	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_spatial_workspace);
 
 	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrSetWorkspaceClientStyleEXT: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
+		                 "xrSetWorkspaceClientStyleDXR: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
 	}
 
 	struct ipc_workspace_client_style ipc_style;
 	if (style != NULL) {
-		if (style->type != XR_TYPE_WORKSPACE_CLIENT_STYLE_EXT) {
+		if (style->type != XR_TYPE_WORKSPACE_CLIENT_STYLE_DXR) {
 			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-			                 "xrSetWorkspaceClientStyleEXT: style->type must be "
-			                 "XR_TYPE_WORKSPACE_CLIENT_STYLE_EXT");
+			                 "xrSetWorkspaceClientStyleDXR: style->type must be "
+			                 "XR_TYPE_WORKSPACE_CLIENT_STYLE_DXR");
 		}
 		if (!client_style_xr_to_ipc(style, &ipc_style)) {
 			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-			                 "xrSetWorkspaceClientStyleEXT: style fields must be finite and "
+			                 "xrSetWorkspaceClientStyleDXR: style fields must be finite and "
 			                 "non-negative where required");
 		}
 	} else {
@@ -1608,7 +1608,7 @@ oxr_xrSetWorkspaceClientStyleEXT(XrSession session,
 
 	if (!session_is_ipc_client(sess)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-		                 "xrSetWorkspaceClientStyleEXT requires an IPC-mode session");
+		                 "xrSetWorkspaceClientStyleDXR requires an IPC-mode session");
 	}
 
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_client_style(
@@ -1616,4 +1616,4 @@ oxr_xrSetWorkspaceClientStyleEXT(XrSession session,
 	return xret_to_xr_result(&log, xret, "workspace_set_client_style");
 }
 
-#endif // OXR_HAVE_EXT_spatial_workspace
+#endif // OXR_HAVE_DXR_spatial_workspace

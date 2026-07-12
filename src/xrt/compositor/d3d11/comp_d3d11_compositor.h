@@ -31,7 +31,7 @@ extern "C" {
  * into Vulkan fails with VK_ERROR_FORMAT_NOT_SUPPORTED.
  *
  * @param xdev The device we are displaying to.
- * @param hwnd The window handle from XR_EXT_win32_window_binding (or NULL for fullscreen).
+ * @param hwnd The window handle from XR_DXR_win32_window_binding (or NULL for fullscreen).
  * @param d3d11_device The D3D11 device from the application's graphics binding.
  * @param dp_factory_d3d11 Display processor factory (xrt_dp_factory_d3d11_fn_t), or NULL.
  * @param transparent_background When true (and hwnd != NULL), bind the swapchain via
@@ -58,7 +58,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
                              struct xrt_compositor_native **out_xc);
 
 /*
- * XR_EXT_local_3d_zone — authored 2D/3D mask consumer (Phase 1 of unified
+ * XR_DXR_local_3d_zone — authored 2D/3D mask consumer (Phase 1 of unified
  * 2D/3D compositing, docs/roadmap/unified-2d-3d-phase1-impl.md §3–§5).
  *
  * The oxr handlers forward here; the mask expresses an arbitrary scalar 2D/3D
@@ -144,7 +144,7 @@ comp_d3d11_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask);
 /*!
  * Query the display processor's hardware zone grid (#224 hardware-DP leg).
  * Returns false on a legacy DP (no zone support) with grids zeroed; on true
- * the grid dims feed XrLocal3DZoneCapabilitiesEXT.hardwareZoneGridWidth/Height
+ * the grid dims feed XrLocal3DZoneCapabilitiesDXR.hardwareZoneGridWidth/Height
  * (1×1 = global on/off panel).
  *
  * @ingroup comp_d3d11
@@ -155,9 +155,9 @@ comp_d3d11_compositor_zone_get_hw_caps(struct xrt_compositor *xc,
                                        uint32_t *out_grid_h);
 
 /*!
- * XR_EXT_display_zones (ADR-027): set the frame's explicit wish for the next
+ * XR_DXR_display_zones (ADR-027): set the frame's explicit wish for the next
  * layer_commit — @p mask is the compositor-side mask state of the
- * XrLocal3DZoneMaskEXT referenced via XrDisplayZonesFrameEndInfoEXT.wishMask
+ * XrLocal3DZoneMaskDXR referenced via XrDisplayZonesFrameEndInfoDXR.wishMask
  * (oxr_local_3d_zone_ext::comp_mask), or NULL to auto-derive the wish from
  * the frame's zone rects. Called by oxr on every zones frame before
  * xrt_comp_layer_commit; consumed by that commit. No-op outside zones frames.
@@ -170,7 +170,7 @@ comp_d3d11_compositor_zones_set_frame_wish(struct xrt_compositor *xc, void *mask
 /*!
  * Current recommended per-view render size (client-window-derived when a
  * mask/Local2D is active, canvas-derived otherwise). Polled by oxr at frame
- * end to fire XrEventDataLocal3DZoneViewSizeChangedEXT on change (#439
+ * end to fire XrEventDataLocal3DZoneViewSizeChangedDXR on change (#439
  * Phase 3 Q4).
  *
  * @ingroup comp_d3d11

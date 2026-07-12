@@ -1303,7 +1303,7 @@ oxr_xrGetPlanePolygonBufferEXT(XrPlaneDetectorEXT planeDetector,
 
 #endif // OXR_HAVE_EXT_plane_detection
 
-#ifdef OXR_HAVE_EXT_display_info
+#ifdef OXR_HAVE_DXR_display_info
 
 /*!
  * "A workspace controller currently owns display policy" — the ADR-014 authority
@@ -1314,8 +1314,8 @@ oxr_xrGetPlanePolygonBufferEXT(XrPlaneDetectorEXT planeDetector,
  * exclusively in the workspace controller's (shell's) own process. A separate-
  * process IPC app (a cube launched by the shell) has its own instance where that
  * flag is forever false, so the app-side mode-authority gate never fired and the
- * app's V key (xrRequestDisplayRenderingModeEXT) fell through to the legacy path,
- * pushing itself a local XrEventDataRenderingModeChangedEXT and corrupting its own
+ * app's V key (xrRequestDisplayRenderingModeDXR) fell through to the legacy path,
+ * pushing itself a local XrEventDataRenderingModeChangedDXR and corrupting its own
  * content under the shell. The fix: also honor the server-synced
  * `info.workspace_mode` (fetched at IPC compositor creation — the shell activates
  * the workspace BEFORE launching apps, so it is already true when the app connects),
@@ -1332,28 +1332,28 @@ oxr_workspace_owns_display_policy(const struct oxr_session *sess)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrRequestDisplayModeEXT(XrSession session, XrDisplayModeEXT displayMode)
+oxr_xrRequestDisplayModeEXT(XrSession session, XrDisplayModeDXR displayMode)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRequestDisplayModeEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRequestDisplayModeDXR");
 
-	if (displayMode != XR_DISPLAY_MODE_2D_EXT && displayMode != XR_DISPLAY_MODE_3D_EXT) {
+	if (displayMode != XR_DISPLAY_MODE_2D_DXR && displayMode != XR_DISPLAY_MODE_3D_DXR) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "Invalid displayMode %d", (int)displayMode);
 	}
 
 	// #542: HARDWARE-only override for the current mode. A rendering mode is
 	// a complete recipe (layout, view count, scales, default hardware state);
-	// xrRequestDisplayRenderingModeEXT requests one and the hardware follows.
+	// xrRequestDisplayRenderingModeDXR requests one and the hardware follows.
 	// THIS entry point sets the hardware state ALONE — the active mode, the
 	// app's content, and the DP's processing (it weaves or flat-blits per the
 	// atlas it is handed) are untouched. E.g. hardware-2D over an active 3D
 	// mode keeps the weave running with the lens off: the panel shows the
 	// woven atlas flat (blurry), and an app fading its parallax to zero
 	// converges back to a sharp image — the MANUAL tracking-loss transition.
-	bool want_3d = (displayMode == XR_DISPLAY_MODE_3D_EXT);
+	bool want_3d = (displayMode == XR_DISPLAY_MODE_3D_DXR);
 	bool changed = (sess->hardware_display_3d != want_3d);
 
 	XrResult res = oxr_session_request_display_mode(&log, sess, want_3d);
@@ -1371,16 +1371,16 @@ oxr_xrRequestDisplayModeEXT(XrSession session, XrDisplayModeEXT displayMode)
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
-oxr_xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeEXT mode)
+oxr_xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeDXR mode)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRequestEyeTrackingModeEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRequestEyeTrackingModeDXR");
 
 	// Validate mode enum
-	if (mode != XR_EYE_TRACKING_MODE_MANAGED_EXT && mode != XR_EYE_TRACKING_MODE_MANUAL_EXT) {
+	if (mode != XR_EYE_TRACKING_MODE_MANAGED_DXR && mode != XR_EYE_TRACKING_MODE_MANUAL_DXR) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "Invalid mode %d", (int)mode);
 	}
 
@@ -1388,14 +1388,14 @@ oxr_xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeEXT mode)
 	const struct xrt_system_compositor_info *info =
 	    sess->sys->xsysc ? &sess->sys->xsysc->info : NULL;
 	uint32_t supported = info ? info->supported_eye_tracking_modes : 0;
-	uint32_t bit = (mode == XR_EYE_TRACKING_MODE_MANUAL_EXT) ? 2 : 1;
+	uint32_t bit = (mode == XR_EYE_TRACKING_MODE_MANUAL_DXR) ? 2 : 1;
 	if (!(supported & bit)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
 		                 "Eye tracking mode %d not supported by this system", (int)mode);
 	}
 
 	// Store the session preference unconditionally (spec: it stays latent until
-	// honored — XrViewEyeTrackingStateEXT.activeMode keeps reporting it).
+	// honored — XrViewEyeTrackingStateDXR.activeMode keeps reporting it).
 	sess->eye_tracking_mode = (uint32_t)mode;
 
 	// Push the selection to the display processor, but only when this session
@@ -1417,7 +1417,7 @@ oxr_xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex)
 
 	struct oxr_session *sess;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRequestDisplayRenderingModeEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRequestDisplayRenderingModeDXR");
 
 	// Workspace/IPC mode: the workspace controller drives rendering mode changes, not the app.
 	// The app receives mode changes via XrEventDataRenderingModeChanged events
@@ -1425,17 +1425,17 @@ oxr_xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex)
 	// Exception: headless sessions (bridge relay) ARE allowed to change modes —
 	// the bridge acts as the mode controller on behalf of the WebXR page.
 	// Exception: graphics-bound workspace controllers (the shell, after
-	// xrActivateSpatialWorkspaceEXT) also retain mode authority. They have
+	// xrActivateSpatialWorkspaceDXR) also retain mode authority. They have
 	// `compositor != NULL` because they render chrome, so the original
 	// headless-only exemption misses them (#234).
 	//
 	// This is THE enforcement point for the "workspace owns display mode" rule
-	// (#233). DO NOT enforce by filtering xrEnumerateDisplayRenderingModesEXT
+	// (#233). DO NOT enforce by filtering xrEnumerateDisplayRenderingModesDXR
 	// to count=1 — apps index local rendering-mode arrays by VENDOR-ASSIGNED
 	// `mode_index` (not array index). Filtering causes
 	// `renderingModeViewCounts[active_idx]=0` reads and `XR_ERROR_POSE_INVALID`
 	// at xrEndFrame across cube/gauss/others. Apps need the full enumerator
-	// to interpret indices that arrive via XrEventDataRenderingModeChangedEXT.
+	// to interpret indices that arrive via XrEventDataRenderingModeChangedDXR.
 	// #518: only gate when a workspace controller is ACTUALLY active. In
 	// single-app out-of-process (no shell), no controller exists, so the lone app
 	// owns its display mode — otherwise nobody could ever switch 2D<->3D in OOP.
@@ -1523,21 +1523,21 @@ oxr_xrSetWorkspaceViewRigEXT(XrSession session, const void *rig)
 
 	struct oxr_session *sess;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceViewRigEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceViewRigDXR");
 
-#ifdef OXR_HAVE_EXT_view_rig
+#ifdef OXR_HAVE_DXR_view_rig
 	// Workspace controller only: this imposes view geometry on the workspace's
 	// app clients (the "workspace owns view geometry" contract). A non-
 	// controller caller has no authority here. The server also PID-gates the
 	// IPC RPC, so an app cannot forge the call.
 	if (!sess->is_active_workspace_controller) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
-		                 "xrSetWorkspaceViewRigEXT: caller is not the active workspace controller");
+		                 "xrSetWorkspaceViewRigDXR: caller is not the active workspace controller");
 	}
 	return oxr_session_set_workspace_view_rig(&log, sess, rig);
 #else
 	(void)rig;
-	return oxr_error(&log, XR_ERROR_FUNCTION_UNSUPPORTED, "XR_EXT_view_rig not supported");
+	return oxr_error(&log, XR_ERROR_FUNCTION_UNSUPPORTED, "XR_DXR_view_rig not supported");
 #endif
 }
 
@@ -1545,13 +1545,13 @@ XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrEnumerateDisplayRenderingModesEXT(XrSession session,
                                         uint32_t modeCapacityInput,
                                         uint32_t *modeCountOutput,
-                                        XrDisplayRenderingModeInfoEXT *modes)
+                                        XrDisplayRenderingModeInfoDXR *modes)
 {
 	OXR_TRACE_MARKER();
 
 	struct oxr_session *sess;
 	struct oxr_logger log;
-	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrEnumerateDisplayRenderingModesEXT");
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrEnumerateDisplayRenderingModesDXR");
 
 	struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
 	if (head == NULL) {
@@ -1591,12 +1591,12 @@ oxr_xrEnumerateDisplayRenderingModesEXT(XrSession session,
 		// handshake matters: v13-and-earlier binaries leave type/next
 		// uninitialized (the runtime always overwrote them), so the
 		// chain must never be walked without it.
-		bool app_chained = (modes[i].type == XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT);
-		XrDisplayRenderingModeTrackingInfoEXT *tracking = NULL;
+		bool app_chained = (modes[i].type == XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR);
+		XrDisplayRenderingModeTrackingInfoDXR *tracking = NULL;
 		if (app_chained) {
 			tracking = OXR_GET_OUTPUT_FROM_CHAIN(&modes[i],
-			                                     XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_EXT,
-			                                     XrDisplayRenderingModeTrackingInfoEXT);
+			                                     XR_TYPE_DISPLAY_RENDERING_MODE_TRACKING_INFO_DXR,
+			                                     XrDisplayRenderingModeTrackingInfoDXR);
 		}
 		if (tracking != NULL) {
 			tracking->hasTracking =
@@ -1605,7 +1605,7 @@ oxr_xrEnumerateDisplayRenderingModesEXT(XrSession session,
 			        : XR_FALSE;
 		}
 
-		modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+		modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
 		if (!app_chained) {
 			modes[i].next = NULL; // v13 behavior for non-opted-in callers.
 		}
@@ -1628,4 +1628,4 @@ oxr_xrEnumerateDisplayRenderingModesEXT(XrSession session,
 	return XR_SUCCESS;
 }
 
-#endif // OXR_HAVE_EXT_display_info
+#endif // OXR_HAVE_DXR_display_info

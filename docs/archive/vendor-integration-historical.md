@@ -36,7 +36,7 @@ OpenXR extensions, and build system registration.
 ```
  ┌──────────────────────────────────────────────────────────────┐
  │  APPLICATION          OpenXR Application                     │
- │  xrLocateViews  xrEndFrame  xrRequestDisplayModeEXT         │
+ │  xrLocateViews  xrEndFrame  xrRequestDisplayModeDXR         │
  └──────────┬──────────┬─────────────────┬──────────────────────┘
  ═══════════╪══════════╪═════════════════╪═══  boundary: OpenXR API
  ┌──────────▼──────────▼─────────────────▼──────────────────────┐
@@ -83,9 +83,9 @@ SDK types.
 │                      LAYER 1: APPLICATION                           │
 │                                                                     │
 │  Types used:  OpenXR API types only                                 │
-│  - XrView, XrFovf, XrPosef, XrDisplayInfoEXT                       │
+│  - XrView, XrFovf, XrPosef, XrDisplayInfoDXR                       │
 │  - LOCAL space (RAW mode returns screen-centered eye positions)     │
-│  - XrWin32WindowBindingCreateInfoEXT / XrCocoaWindowBindingCreateInfoEXT │
+│  - XrWin32WindowBindingCreateInfoDXR / XrCocoaWindowBindingCreateInfoDXR │
 │                                                                     │
 │  The app never sees runtime or vendor internals.                    │
 ├─────────────────────────────────────────────────────────────────────┤
@@ -254,16 +254,16 @@ The runtime exposes three custom extensions that surface vendor data to
 applications.  The vendor provides the underlying data; the runtime maps it
 onto the OpenXR API.
 
-### 3.1 `XR_EXT_display_info` (v12 — header frozen)
+### 3.1 `XR_DXR_display_info` (v12 — header frozen)
 
-**Header:** `src/external/openxr_includes/openxr/XR_EXT_display_info.h`
+**Header:** `src/external/openxr_includes/openxr/XR_DXR_display_info.h`
 
 Exposes physical display properties and recommended render scale via
 `xrGetSystemProperties`:
 
 ```c
-typedef struct XrDisplayInfoEXT {
-    XrStructureType type;                       // XR_TYPE_DISPLAY_INFO_EXT
+typedef struct XrDisplayInfoDXR {
+    XrStructureType type;                       // XR_TYPE_DISPLAY_INFO_DXR
     void* XR_MAY_ALIAS next;
     XrExtent2Df     displaySizeMeters;          // Physical display size (m)
     XrVector3f      nominalViewerPositionInDisplaySpace; // Default eye position
@@ -271,11 +271,11 @@ typedef struct XrDisplayInfoEXT {
     float           recommendedViewScaleY;      // sr_recommended_h / display_pixel_h
     uint32_t        displayPixelWidth;           // Native display panel width in pixels (0 if unknown)
     uint32_t        displayPixelHeight;          // Native display panel height in pixels (0 if unknown)
-} XrDisplayInfoEXT;
+} XrDisplayInfoDXR;
 ```
 
-> **Note:** `hardwareDisplay3D` was removed from `XrDisplayInfoEXT` in v12.
-> Hardware 3D state is now event-driven via `XrEventDataHardwareDisplayStateChangedEXT`.
+> **Note:** `hardwareDisplay3D` was removed from `XrDisplayInfoDXR` in v12.
+> Hardware 3D state is now event-driven via `XrEventDataHardwareDisplayStateChangedDXR`.
 
 **How vendor data reaches this extension:**  The vendor's device driver populates
 `xrt_system_compositor_info` fields at init time:
@@ -290,42 +290,42 @@ creation and stores the results; sim_display uses env vars and OS display querie
 **Rendering mode control (v7+):**
 
 ```c
-XrResult xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex);
-XrResult xrEnumerateDisplayRenderingModesEXT(XrSession session, ...);
+XrResult xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex);
+XrResult xrEnumerateDisplayRenderingModesDXR(XrSession session, ...);
 ```
 
 Vendor-defined rendering modes (2D, SBS stereo, lenticular, quad, etc.) are
 enumerated at runtime. Mode 0 = 2D (always available). Each mode specifies
 `viewCount`, `tileColumns`, `tileRows`, `viewWidthPixels`, `viewHeightPixels`
-for atlas layout. Events (`XrEventDataRenderingModeChangedEXT`,
-`XrEventDataHardwareDisplayStateChangedEXT`) notify apps of mode changes.
+for atlas layout. Events (`XrEventDataRenderingModeChangedDXR`,
+`XrEventDataHardwareDisplayStateChangedDXR`) notify apps of mode changes.
 
-> **Note:** `xrRequestDisplayModeEXT` (2D/3D only) is deprecated in v10. Use
-> `xrRequestDisplayRenderingModeEXT` for unified mode control.
+> **Note:** `xrRequestDisplayModeDXR` (2D/3D only) is deprecated in v10. Use
+> `xrRequestDisplayRenderingModeDXR` for unified mode control.
 
-**RAW mode eye positions**: In RAW mode (`XR_EXT_display_info` enabled),
+**RAW mode eye positions**: In RAW mode (`XR_DXR_display_info` enabled),
 `xrLocateViews` returns eye positions in screen-centered coordinates (origin at
 display center, +X right, +Y up, +Z toward viewer). Applications use LOCAL space
 for both view location and layer submission.
 
-### 3.2 `XR_EXT_win32_window_binding` (Windows)
+### 3.2 `XR_DXR_win32_window_binding` (Windows)
 
-**Header:** `src/external/openxr_includes/openxr/XR_EXT_win32_window_binding.h`
+**Header:** `src/external/openxr_includes/openxr/XR_DXR_win32_window_binding.h`
 
 Allows the app to pass an HWND for windowed rendering:
 
 ```c
-typedef struct XrWin32WindowBindingCreateInfoEXT {
-    XrStructureType type;                  // XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT
+typedef struct XrWin32WindowBindingCreateInfoDXR {
+    XrStructureType type;                  // XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR
     const void*     next;
     void*           windowHandle;          // HWND (or NULL for offscreen)
     PFN_xrReadbackCallback readbackCallback; // CPU readback (offscreen), or NULL
     void*           readbackUserdata;
     void*           sharedTextureHandle;   // Shared D3D11/D3D12 HANDLE (zero-copy), or NULL
-} XrWin32WindowBindingCreateInfoEXT;
+} XrWin32WindowBindingCreateInfoDXR;
 ```
 
-Also defines `XrCompositionLayerWindowSpaceEXT` for layers positioned in
+Also defines `XrCompositionLayerWindowSpaceDXR` for layers positioned in
 fractional window coordinates with per-eye disparity shift.
 
 **Offscreen modes** (spec version 2): Set `windowHandle=NULL` and provide
@@ -335,21 +335,21 @@ GPU texture sharing via D3D11/D3D12 shared HANDLE).
 **Vendor impact:** The vendor's SDK wrapper receives the window handle at init
 time and must create the weaver/interlacer targeting that window.
 
-### 3.3 `XR_EXT_cocoa_window_binding` (macOS)
+### 3.3 `XR_DXR_cocoa_window_binding` (macOS)
 
-**Header:** `src/external/openxr_includes/openxr/XR_EXT_cocoa_window_binding.h`
+**Header:** `src/external/openxr_includes/openxr/XR_DXR_cocoa_window_binding.h`
 
 macOS equivalent — app passes an `NSView*` with `CAMetalLayer` backing:
 
 ```c
-typedef struct XrCocoaWindowBindingCreateInfoEXT {
-    XrStructureType type;                  // XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT
+typedef struct XrCocoaWindowBindingCreateInfoDXR {
+    XrStructureType type;                  // XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR
     const void*     next;
     void*           viewHandle;            // NSView* with CAMetalLayer backing (or NULL)
     PFN_xrReadbackCallback readbackCallback; // CPU readback (offscreen), or NULL
     void*           readbackUserdata;
     void*           sharedIOSurface;       // IOSurfaceRef (zero-copy), or NULL
-} XrCocoaWindowBindingCreateInfoEXT;
+} XrCocoaWindowBindingCreateInfoDXR;
 ```
 
 **Offscreen modes** (spec version 3): Set `viewHandle=NULL` and provide
@@ -360,12 +360,12 @@ GPU texture sharing via IOSurface).
 
 The runtime supports two modes for returning eye tracking data to apps.
 The mode is determined automatically based on whether the app uses the
-`XR_EXT_display_info` extension.
+`XR_DXR_display_info` extension.
 
 #### RAW Mode (extension-aware apps)
 
-When the app enables `XR_EXT_display_info` and creates a session with an
-external window (`XR_EXT_win32_window_binding` / `XR_EXT_cocoa_window_binding`),
+When the app enables `XR_DXR_display_info` and creates a session with an
+external window (`XR_DXR_win32_window_binding` / `XR_DXR_cocoa_window_binding`),
 `xrLocateViews()` returns views in **RAW mode**:
 
 - `XrView.pose.position` — the physical eye center in screen-centered coordinates, directly
@@ -390,7 +390,7 @@ views[i].pose.orientation = (XrQuaternionf){0.0f, 0.0f, 0.0f, 1.0f};
 
 #### RENDER_READY Mode (legacy OpenXR / WebXR apps)
 
-When `XR_EXT_display_info` is **not** enabled (or no external window is
+When `XR_DXR_display_info` is **not** enabled (or no external window is
 provided), the runtime returns views in **RENDER_READY mode**:
 
 - `XrView.pose` — view pose with the qwerty/debug controller transform applied,
@@ -506,7 +506,7 @@ Key design points:
   where the 3D canvas sits within the window, enabling correct phase alignment for
   lenticular interlacing. For `_handle` and `_hosted` apps these are (0, 0, 0, 0)
   meaning "full window". For `_texture` apps the values come from
-  `xrSetSharedTextureOutputRectEXT`. The app's real window handle (HWND / NSView)
+  `xrSetSharedTextureOutputRectDXR`. The app's real window handle (HWND / NSView)
   is passed directly to the display processor at init time — no hidden window is
   involved.
 - **Command buffer recording**: Implementation records Vulkan commands into the
@@ -1068,7 +1068,7 @@ as seen from the eye position.
 **Who computes it depends on the mode:**
 
 - **RAW mode:** The **application** computes Kooima from the raw eye positions
-  and `displaySizeMeters` returned by `XR_EXT_display_info`.  The runtime's
+  and `displaySizeMeters` returned by `XR_DXR_display_info`.  The runtime's
   `XrView.fov` values are advisory only.  This is the primary use case for
   apps designed for tracked 3D displays.
 
@@ -1165,7 +1165,7 @@ handles weaving and eye tracking.
 
 ### 6.6 Eye Tracking Mode Control (v6)
 
-Version 6 of `XR_EXT_display_info` adds eye tracking mode control, allowing apps
+Version 6 of `XR_DXR_display_info` adds eye tracking mode control, allowing apps
 to choose between managed (SDK-filtered) and manual eye tracking.
 
 #### Required Internal Fields
@@ -1223,7 +1223,7 @@ tracking loss with its own animations/UI.
 
 Set `supported_eye_tracking_modes = 0`. Runtime reports `supportedModes = NONE`,
 `isTracking = XR_FALSE` always. `xrLocateViews` still returns fully populated views
-(vendor SDK populates positions, e.g., nominal viewer). `xrRequestEyeTrackingModeEXT`
+(vendor SDK populates positions, e.g., nominal viewer). `xrRequestEyeTrackingModeDXR`
 returns `XR_ERROR_FEATURE_UNSUPPORTED` for any mode.
 
 #### Reference Implementations
@@ -1236,8 +1236,8 @@ returns `XR_ERROR_FEATURE_UNSUPPORTED` for any mode.
 
 ### 6.7 Display Rendering Mode Control (v7)
 
-Version 7 of `XR_EXT_display_info` adds vendor-specific rendering mode switching
-via `xrRequestDisplayRenderingModeEXT(session, modeIndex)`.
+Version 7 of `XR_DXR_display_info` adds vendor-specific rendering mode switching
+via `xrRequestDisplayRenderingModeDXR(session, modeIndex)`.
 
 Different 3D display vendors may support multiple rendering variations (e.g.,
 side-by-side stereo, lenticular, anaglyph). This function lets apps switch
@@ -1334,7 +1334,7 @@ no lenticular optics).
 
 ### Reference
 
-- [XR_EXT_win32_window_binding §2.4](../specs/extensions/XR_EXT_win32_window_binding.md) — Phase alignment motivation for app developers
+- [XR_DXR_win32_window_binding §2.4](../specs/extensions/XR_DXR_win32_window_binding.md) — Phase alignment motivation for app developers
 - [ADR-003](../adr/ADR-003-vendor-abstraction-via-display-processor-vtable.md) — Vendor code isolation
 - [Issue #85](https://github.com/DisplayXR/displayxr-runtime/issues/85) — Canvas sub-rect support for Leia SR weaver
 
@@ -2044,7 +2044,7 @@ src/xrt/drivers/leia/
 | **Eye tracking** | SR SDK LookaroundFilter | CNSDK face tracking | Vendor SDK | Vendor SDK |
 | **SDK wrapper (Vulkan)** | `leia_sr.cpp` | `leia_cnsdk.cpp` | — | — |
 | **SDK wrapper (D3D11)** | `leia_sr_d3d11.cpp` | N/A | N/A | N/A |
-| **Window binding** | `XR_EXT_win32_window_binding` | N/A | — | `XR_EXT_cocoa_window_binding` |
+| **Window binding** | `XR_DXR_win32_window_binding` | N/A | — | `XR_DXR_cocoa_window_binding` |
 | **2D/3D mode switch** | SwitchableLensHint | Backlight API | Vendor-specific | Vendor-specific |
 
 ### Platform-Specific Notes
@@ -2053,7 +2053,7 @@ src/xrt/drivers/leia/
 - Both Vulkan and D3D11 display processors recommended
 - D3D11 path is preferred for Intel GPUs (Vulkan interop issues)
 - SR SDK provides eye tracking via LookaroundFilter
-- `XR_EXT_win32_window_binding` for app-provided HWND
+- `XR_DXR_win32_window_binding` for app-provided HWND
 
 **Android:**
 - Vulkan display processor required
@@ -2234,7 +2234,7 @@ float nominal_viewer_y_m;         // Default viewer Y
 float nominal_viewer_z_m;         // Default viewer Z (distance from display)
 ```
 
-The runtime reads these at runtime for Kooima FOV, `XR_EXT_display_info`,
+The runtime reads these at runtime for Kooima FOV, `XR_DXR_display_info`,
 and nominal eye positions when tracking is unavailable.
 
 ### `VkFormat_XDP`

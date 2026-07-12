@@ -135,7 +135,7 @@ enum oxr_session_graphics_ext
 	OXR_SESSION_GRAPHICS_EXT_METAL,
 	OXR_SESSION_GRAPHICS_EXT_MACOS_GL,
 	// Phase 2.I-followup: workspace controllers do not render swapchains;
-	// they only call XR_EXT_spatial_workspace dispatch
+	// they only call XR_DXR_spatial_workspace dispatch
 	// functions. The runtime allocates the IPC client compositor
 	// (so the extensions have transport) but skips graphics-API-specific
 	// wrapping, which avoids creating a redundant client window.

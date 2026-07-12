@@ -32,7 +32,7 @@
 // the public extension struct so the state tracker can pass its public-API
 // array through without seeing IPC types. Pulling the public header here
 // is fine — it lives outside the IPC layer's coupling concerns.
-#include <openxr/XR_EXT_spatial_workspace.h>
+#include <openxr/XR_DXR_spatial_workspace.h>
 
 #include <string.h>
 #include <stdio.h>
@@ -467,7 +467,7 @@ comp_ipc_client_compositor_get_transparent_output_fence(struct xrt_compositor *x
 
 
 /*
- * XR_EXT_weave bridges (#625) — the window-bound synchronous weave service.
+ * XR_DXR_weave bridges (#625) — the window-bound synchronous weave service.
  * Thin accessors the OpenXR state tracker (oxr_weave.c) forward-declares and
  * the runtime DLL links at runtime; same pattern as the transparent-output
  * bridges above. The DP weaves server-side (ADR-007 / ADR-019); these only
@@ -651,7 +651,7 @@ comp_ipc_client_compositor_weave_snap_window_rect(struct xrt_compositor *xc,
 
 /*
  * Workspace controller bridges — thin accessors used by the OpenXR state
- * tracker's XR_EXT_spatial_workspace implementation. The state tracker does
+ * tracker's XR_DXR_spatial_workspace implementation. The state tracker does
  * not pull ipc_client headers; it forward-declares these wrappers and the
  * runtime DLL resolves the symbols at link time. Each one extracts the
  * underlying ipc_connection and dispatches the matching generated RPC.
@@ -935,7 +935,7 @@ comp_ipc_client_compositor_workspace_enumerate_input_events(struct xrt_composito
 		return XRT_SUCCESS;
 	}
 
-	// Translate wire events → public XrWorkspaceInputEventEXT records.
+	// Translate wire events → public XrWorkspaceInputEventDXR records.
 	// The caller's stride lets the bridge stay agnostic to the public
 	// struct's exact layout — but we know what fields it carries because
 	// the public header is part of the runtime ABI we own.
@@ -946,15 +946,15 @@ comp_ipc_client_compositor_workspace_enumerate_input_events(struct xrt_composito
 	uint8_t *dst = (uint8_t *)out_events_buf;
 	for (uint32_t i = 0; i < copy; i++) {
 		const struct ipc_workspace_input_event *src = &batch.events[i];
-		XrWorkspaceInputEventEXT *out =
-		    (XrWorkspaceInputEventEXT *)(dst + (size_t)i * event_stride);
+		XrWorkspaceInputEventDXR *out =
+		    (XrWorkspaceInputEventDXR *)(dst + (size_t)i * event_stride);
 		memset(out, 0, sizeof(*out));
-		out->eventType = (XrWorkspaceInputEventTypeEXT)src->event_type;
+		out->eventType = (XrWorkspaceInputEventTypeDXR)src->event_type;
 		out->timestampMs = src->timestamp_ms;
 		switch (src->event_type) {
 		case IPC_WORKSPACE_INPUT_EVENT_POINTER:
 			out->pointer.hitClientId = (XrWorkspaceClientId)src->u.pointer.hit_client_id;
-			out->pointer.hitRegion = (XrWorkspaceHitRegionEXT)src->u.pointer.hit_region;
+			out->pointer.hitRegion = (XrWorkspaceHitRegionDXR)src->u.pointer.hit_region;
 			out->pointer.localUV.x = src->u.pointer.local_u;
 			out->pointer.localUV.y = src->u.pointer.local_v;
 			out->pointer.cursorX = (int32_t)src->u.pointer.cursor_x;
@@ -962,21 +962,21 @@ comp_ipc_client_compositor_workspace_enumerate_input_events(struct xrt_composito
 			out->pointer.button = src->u.pointer.button;
 			out->pointer.isDown = src->u.pointer.is_down ? XR_TRUE : XR_FALSE;
 			out->pointer.modifiers = src->u.pointer.modifiers;
-			out->pointer.chromeRegionId = (XrWorkspaceChromeRegionIdEXT)src->u.pointer.chrome_region_id;
+			out->pointer.chromeRegionId = (XrWorkspaceChromeRegionIdDXR)src->u.pointer.chrome_region_id;
 			break;
 		case IPC_WORKSPACE_INPUT_EVENT_POINTER_HOVER:
 			out->pointerHover.prevClientId =
 			    (XrWorkspaceClientId)src->u.pointer_hover.prev_client_id;
 			out->pointerHover.prevRegion =
-			    (XrWorkspaceHitRegionEXT)src->u.pointer_hover.prev_region;
+			    (XrWorkspaceHitRegionDXR)src->u.pointer_hover.prev_region;
 			out->pointerHover.currentClientId =
 			    (XrWorkspaceClientId)src->u.pointer_hover.curr_client_id;
 			out->pointerHover.currentRegion =
-			    (XrWorkspaceHitRegionEXT)src->u.pointer_hover.curr_region;
+			    (XrWorkspaceHitRegionDXR)src->u.pointer_hover.curr_region;
 			out->pointerHover.prevChromeRegionId =
-			    (XrWorkspaceChromeRegionIdEXT)src->u.pointer_hover.prev_chrome_region_id;
+			    (XrWorkspaceChromeRegionIdDXR)src->u.pointer_hover.prev_chrome_region_id;
 			out->pointerHover.currentChromeRegionId =
-			    (XrWorkspaceChromeRegionIdEXT)src->u.pointer_hover.curr_chrome_region_id;
+			    (XrWorkspaceChromeRegionIdDXR)src->u.pointer_hover.curr_chrome_region_id;
 			break;
 		case IPC_WORKSPACE_INPUT_EVENT_KEY:
 			out->key.vkCode = src->u.key.vk_code;
@@ -993,14 +993,14 @@ comp_ipc_client_compositor_workspace_enumerate_input_events(struct xrt_composito
 			out->pointerMotion.hitClientId =
 			    (XrWorkspaceClientId)src->u.pointer_motion.hit_client_id;
 			out->pointerMotion.hitRegion =
-			    (XrWorkspaceHitRegionEXT)src->u.pointer_motion.hit_region;
+			    (XrWorkspaceHitRegionDXR)src->u.pointer_motion.hit_region;
 			out->pointerMotion.localUV.x = src->u.pointer_motion.local_u;
 			out->pointerMotion.localUV.y = src->u.pointer_motion.local_v;
 			out->pointerMotion.cursorX = (int32_t)src->u.pointer_motion.cursor_x;
 			out->pointerMotion.cursorY = (int32_t)src->u.pointer_motion.cursor_y;
 			out->pointerMotion.buttonMask = src->u.pointer_motion.button_mask;
 			out->pointerMotion.modifiers = src->u.pointer_motion.modifiers;
-			out->pointerMotion.chromeRegionId = (XrWorkspaceChromeRegionIdEXT)src->u.pointer_motion.chrome_region_id;
+			out->pointerMotion.chromeRegionId = (XrWorkspaceChromeRegionIdDXR)src->u.pointer_motion.chrome_region_id;
 			break;
 		case IPC_WORKSPACE_INPUT_EVENT_FRAME_TICK:
 			out->frameTick.timestampNs = src->u.frame_tick.timestamp_ns;
@@ -1422,7 +1422,7 @@ comp_ipc_client_compositor_workspace_set_client_style(struct xrt_compositor *xc,
 }
 
 /*
- * Modal input grab bridge (XR_EXT_spatial_workspace, spec_version 18).
+ * Modal input grab bridge (XR_DXR_spatial_workspace, spec_version 18).
  *
  * Same gating contract as the workspace_* family: only valid when `xc` is
  * an ipc_client_compositor. The OpenXR state tracker forward-declares this
@@ -2049,7 +2049,7 @@ ipc_compositor_layer_local_2d(struct xrt_compositor *xc,
 }
 
 /*!
- * Zone-3D layers (XR_EXT_display_zones P5) carry view_count swapchains —
+ * Zone-3D layers (XR_DXR_display_zones P5) carry view_count swapchains —
  * serialized projection-style: one swapchain id per view; the rest of the
  * layer (per-view proj data + zone rect + zone id) rides the xrt_layer_data
  * union verbatim in the shared-memory slot.
@@ -2404,7 +2404,7 @@ ipc_syscomp_create_native_compositor(struct xrt_system_compositor *xsc,
  * Workspace controller mode-flip hook (#234). Marshals to the server-side
  * comp_d3d11_service_workspace_request_mode_flip via the workspace_request_
  * display_mode IPC RPC. Returns true on success so the OXR layer's
- * xrRequestDisplayRenderingModeEXT skips its legacy immediate-flip path.
+ * xrRequestDisplayRenderingModeDXR skips its legacy immediate-flip path.
  */
 static bool
 ipc_syscomp_request_workspace_mode_flip(struct xrt_system_compositor *xsc, uint32_t mode_index)
@@ -2530,7 +2530,7 @@ ipc_client_create_system_compositor(struct ipc_connection *ipc_c,
 
 	c->system.create_native_compositor = ipc_syscomp_create_native_compositor;
 	c->system.destroy = ipc_syscomp_destroy;
-	// #234: workspace controllers' xrRequestDisplayRenderingModeEXT hook.
+	// #234: workspace controllers' xrRequestDisplayRenderingModeDXR hook.
 	// IPC clients (including the shell, which IS a workspace controller)
 	// marshal the request to the server-side comp_d3d11_service hook so
 	// it routes through the acked-flip + curtain path.

@@ -1,4 +1,4 @@
-# Phase 3 — 2D as a first-class composition layer (`XrCompositionLayerLocal2DEXT`)
+# Phase 3 — 2D as a first-class composition layer (`XrCompositionLayerLocal2DDXR`)
 
 **Spec:** [`unified-2d-3d-compositing.md`](unified-2d-3d-compositing.md) §6 (Phase 3), §4 (composite + output-alpha), §5.1 (coordinate contract). Epic #439.
 **Builds on:** D3D11 Phases 0–2 + D3D12 consumer + cross-API base (all on `main`); the `XRT_LAYER_WINDOW_SPACE` machinery as the structural sibling.
@@ -17,10 +17,10 @@ This is the unlock for: **`handle + mask`** (every demo + engine plugin finally 
 
 | # | Decision | Consequence |
 |---|---|---|
-| Q1 | **API home: `XR_EXT_local_3d_zone` v3** — `XrCompositionLayerLocal2DEXT` | One extension = one feature story; header v3 auto-syncs to `displayxr-extensions` |
+| Q1 | **API home: `XR_DXR_local_3d_zone` v3** — `XrCompositionLayerLocal2DDXR` | One extension = one feature story; header v3 auto-syncs to `displayxr-extensions` |
 | Q2 | **Sub-rect quad** — layer places its swapchain at a client-window pixel rect; outside = transparent 2D contribution | Where M=0 and no 2D coverage, `final.a → 0` → the compose-under-bg transparency path shows desktop. Consistent with §4.2 by construction; full-window is the degenerate rect |
 | Q3 | **Implicit mask from coverage** — no active mask ⇒ the union of Local2D layer rects implies M=0 there, M=1 elsewhere | The common case (one 2D panel over 3D) needs zero mask-API calls. An explicit mask, when submitted, takes **total** authority. The implicit mask behaves exactly like an explicit Tier-2 mask built from the layer rects — including **superseding the canvas** (uniform rule: *any* active mask supersedes; no third state) |
-| Q4 | **Resolution renegotiation in scope** — `XrEventDataLocal3DZoneViewSizeChangedEXT` | When mask activation / deactivation / window resize changes the runtime's view dims, the app gets an event with the new recommended view size and recreates its projection swapchains. Closes the Phase-2 upscale caveat |
+| Q4 | **Resolution renegotiation in scope** — `XrEventDataLocal3DZoneViewSizeChangedDXR` | When mask activation / deactivation / window resize changes the runtime's view dims, the app gets an event with the new recommended view size and recreates its projection swapchains. Closes the Phase-2 upscale caveat |
 
 Decisions made by precedent (no open question):
 - **Layer ↔ surround precedence:** Local2D layers **supersede** a registered surround texture for that frame (the established "newer authority wins totally" rule, as mask-supersedes-canvas). Surround entry points stay working for non-layer apps; deprecate after migration (spec §6 migration note).
@@ -31,31 +31,31 @@ Decisions made by precedent (no open question):
 ## 3. API (header v3)
 
 ```c
-#define XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT            ((XrStructureType)1000999165)
-#define XR_TYPE_EVENT_DATA_LOCAL_3D_ZONE_VIEW_SIZE_CHANGED_EXT ((XrStructureType)1000999166)
+#define XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR            ((XrStructureType)1004999165)
+#define XR_TYPE_EVENT_DATA_LOCAL_3D_ZONE_VIEW_SIZE_CHANGED_DXR ((XrStructureType)1004999166)
 
 // Post-weave 2D content at a client-window pixel rect, mask-gated:
 // final = M·weave + (1−M)·flatten(local2D layers). Premultiplied alpha unless
 // XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT.
-typedef struct XrCompositionLayerLocal2DEXT {
-    XrStructureType             type;       // XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT
+typedef struct XrCompositionLayerLocal2DDXR {
+    XrStructureType             type;       // XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR
     const void* XR_MAY_ALIAS    next;
     XrCompositionLayerFlags     layerFlags; // alpha bits honored
     XrSwapchainSubImage         subImage;   // source texture + sub-rect
     XrRect2Di                   rect;       // client-window pixels, dest
-} XrCompositionLayerLocal2DEXT;
+} XrCompositionLayerLocal2DDXR;
 
 // Queued when the runtime's recommended view size changes (mask activation /
 // deactivation / window resize): recreate projection swapchains at the new size.
-typedef struct XrEventDataLocal3DZoneViewSizeChangedEXT {
+typedef struct XrEventDataLocal3DZoneViewSizeChangedDXR {
     XrStructureType          type;
     const void* XR_MAY_ALIAS next;
     uint32_t                 recommendedImageRectWidth;
     uint32_t                 recommendedImageRectHeight;
-} XrEventDataLocal3DZoneViewSizeChangedEXT;
+} XrEventDataLocal3DZoneViewSizeChangedDXR;
 ```
 
-`XR_EXT_local_3d_zone_SPEC_VERSION` → 3. It is valid to submit Local2D layers **without** ever creating a mask object (Q3); the extension still must be enabled.
+`XR_DXR_local_3d_zone_SPEC_VERSION` → 3. It is valid to submit Local2D layers **without** ever creating a mask object (Q3); the extension still must be enabled.
 
 ## 4. Runtime architecture — the elegant part
 
@@ -70,7 +70,7 @@ Per-frame (D3D11 reference; each consumer leg mirrors):
 
 ## 5. View-size renegotiation (Q4)
 
-The runtime already resizes its **internal** view dims per-frame (Phase 2's mode-sync). New: when the recommended app-facing view size changes, queue `XrEventDataLocal3DZoneViewSizeChangedEXT` (oxr event queue, model: `XrEventDataEyeTrackingStateChangedEXT` from #441). The app recreates projection swapchains; the projection pass already scales arbitrary submitted sizes, so a laggy app stays correct (just soft) — **no hard protocol step**, purely advisory. Debounce: only fire when dims actually change (resize storms → coalesce by emitting on change, the queue naturally drops dupes per the #441 pattern).
+The runtime already resizes its **internal** view dims per-frame (Phase 2's mode-sync). New: when the recommended app-facing view size changes, queue `XrEventDataLocal3DZoneViewSizeChangedDXR` (oxr event queue, model: `XrEventDataEyeTrackingStateChangedDXR` from #441). The app recreates projection swapchains; the projection pass already scales arbitrary submitted sizes, so a laggy app stays correct (just soft) — **no hard protocol step**, purely advisory. Debounce: only fire when dims actually change (resize storms → coalesce by emitting on change, the queue naturally drops dupes per the #441 pattern).
 
 ## 6. The xrt/oxr surface (anchors on `main` @ `fe7eb2ea1`)
 
@@ -82,7 +82,7 @@ The runtime already resizes its **internal** view dims per-frame (Phase 2's mode
 | oxr verify + submit | `oxr_session_frame_end.c` (`verify_window_space_layer` :1189, `submit_window_space_layer` :1716) | same pair |
 | Event queue plumbing | `oxr_event.c` + push helper in `oxr_objects.h` | `oxr_event_push_XrEventDataEyeTrackingStateChangedEXT` (#441) |
 | Vtable wiring in all native compositors + multi/client | accumulate (or ignore+WARN once for not-yet-consumer APIs) | window-space entries |
-| Header v3 | `XR_EXT_local_3d_zone.h` | v2 pattern |
+| Header v3 | `XR_DXR_local_3d_zone.h` | v2 pattern |
 
 IPC: nothing — the union rides `ipc_layer_entry` as-is (out-of-process *consumer* deferred per §2).
 
@@ -108,4 +108,4 @@ IPC: nothing — the union rides `ipc_layer_entry` as-is (out-of-process *consum
 - [x] D3D11 consumer Leia-validated (§8 full matrix); surround path zero-regression. *(2026-06-08: **all §8 cases pass on Leia hardware.** Cases 2/3/4 pixel-correct — implicit mask (case 3), explicit Tier-2 island mask (case 2, the first `handle+mask+layer`), unpremultiplied-alpha stacking (case 4), incl. desktop-show-through under `ALPHA_BLEND`. Case-1 surround region byte-equivalent (capture mean-abs-diff 2.16). Case-5 resize/renegotiation: 3D re-renders crisp at the new size. **The §9 macOS-predicted "canvas-region 3D scale residual" did NOT materialize** — a control experiment (two captures of the *identical* surround baseline) showed the cube size varies **±11%** between runs **purely from eye-tracking parallax** (head-distance changes the Kooima off-axis frustum); the B (Local2D) cube falls *inside* that baseline envelope, and B-vs-A canvas diff (9.1) equals A-vs-A canvas diff (7.4). So the app-side world-scale (`virtualDisplayHeight *= window/canvas` = 2.0) is **correct**; the earlier apparent offset was a measurement artifact of comparing tracked captures across separate launches. A pixel-deterministic 3D A/B would need eye-tracking pinned (sim/fixed-eye) — a test-harness nicety, **not** a runtime gap. Two app bugs found + fixed during validation: the manual `xrEndFrame` path hardcoded `OPAQUE` (→ honor `runtimeSupportsAlphaBlend` so desktop shows under alpha); the B-mode window blit + Local2D-image RTV used a `nullptr`/`g_surroundRegistered`-gated path that left the surround black (→ explicit UNORM RTV desc + blit the full window when `g_canvasIsWindow`). Runtime consumer mechanism is correct throughout.)*
 - [ ] VK consumer landed → epic "VK — all demos" ticked; demos can adopt.
 - [ ] D3D12 delta landed; GL tracked or ticked.
-- [ ] Epic #439 Phase-3 box ticked; surround deprecation note added to `XR_EXT_win32_window_binding` spec (§3.6/3.7) pointing at Local2D.
+- [ ] Epic #439 Phase-3 box ticked; surround deprecation note added to `XR_DXR_win32_window_binding` spec (§3.6/3.7) pointing at Local2D.

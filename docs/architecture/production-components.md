@@ -88,7 +88,7 @@ Chrome extension ──── WebSocket (127.0.0.1:9014) ──── WebXR Brid
 Two separate connections to the service:
 
 - **Frame path:** Chrome's built-in WebXR → OpenXR loader → `DisplayXRClient.dll` (IPC mode, AppContainer detected) → service compositor. This carries frames. Zero-copy on DXGI shared handles.
-- **Metadata path:** Chrome extension → WebSocket → bridge process → its own OpenXR session with `XR_EXT_display_info` enabled. This carries display geometry, rendering modes, eye poses, and input — things Chrome's native WebXR path doesn't expose.
+- **Metadata path:** Chrome extension → WebSocket → bridge process → its own OpenXR session with `XR_DXR_display_info` enabled. This carries display geometry, rendering modes, eye poses, and input — things Chrome's native WebXR path doesn't expose.
 
 The bridge is a separate binary because Chrome's WebXR implementation doesn't support vendor extensions. The extension injects a `session.displayXR` API surface into the page's WebXR session via a navigator.xr Proxy in the MAIN content script world.
 

@@ -385,7 +385,7 @@ struct xrt_display_processor
 	 *     passive and reads filtered positions + `isTracking`.
 	 *   - mode 1 (MANUAL): the vendor stands down (no animation, no auto-switch,
 	 *     reports `isTracking` immediately); the app drives 2D⇄3D itself via
-	 *     @ref request_display_mode / xrRequestDisplayRenderingModeEXT.
+	 *     @ref request_display_mode / xrRequestDisplayRenderingModeDXR.
 	 *
 	 * The runtime only ever passes a mode the DP's plug-in advertised in
 	 * `xrt_plugin_display_info.supported_eye_tracking_modes`, and pushes the
@@ -434,7 +434,7 @@ struct xrt_display_processor
 	 * @p screen_x/y/w/h anchor the mask's pixel space on the panel in
 	 * physical screen pixels (post-DPI client rect). @p seq is the mask
 	 * CONTENT generation — monotonic, bumped only when the published
-	 * content changes (xrSubmitLocal3DZoneEXT, a wish re-raster, an
+	 * content changes (xrSubmitLocal3DZoneDXR, a wish re-raster, an
 	 * explicit-wish change); same-seq publishes differ only in the screen
 	 * anchor, so a vendor evaluates content once per generation.
 	 *

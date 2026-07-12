@@ -136,33 +136,33 @@ is_session_link_to_event(struct oxr_event *event, XrSession session)
 		XrEventDataReferenceSpaceChangePending *pending = (XrEventDataReferenceSpaceChangePending *)type;
 		return pending->session == session;
 	}
-	case XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT: {
-		XrEventDataRenderingModeChangedEXT *changed = (XrEventDataRenderingModeChangedEXT *)type;
+	case XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
+		XrEventDataRenderingModeChangedDXR *changed = (XrEventDataRenderingModeChangedDXR *)type;
 		return changed->session == session;
 	}
-	case XR_TYPE_EVENT_DATA_HARDWARE_DISPLAY_STATE_CHANGED_EXT: {
-		XrEventDataHardwareDisplayStateChangedEXT *changed = (XrEventDataHardwareDisplayStateChangedEXT *)type;
+	case XR_TYPE_EVENT_DATA_HARDWARE_DISPLAY_STATE_CHANGED_DXR: {
+		XrEventDataHardwareDisplayStateChangedDXR *changed = (XrEventDataHardwareDisplayStateChangedDXR *)type;
 		return changed->session == session;
 	}
-	case XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT: {
-		XrEventDataEyeTrackingStateChangedEXT *changed = (XrEventDataEyeTrackingStateChangedEXT *)type;
+	case XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR: {
+		XrEventDataEyeTrackingStateChangedDXR *changed = (XrEventDataEyeTrackingStateChangedDXR *)type;
 		return changed->session == session;
 	}
-#ifdef OXR_HAVE_EXT_local_3d_zone
-	case XR_TYPE_EVENT_DATA_LOCAL_3D_ZONE_VIEW_SIZE_CHANGED_EXT: {
-		XrEventDataLocal3DZoneViewSizeChangedEXT *changed = (XrEventDataLocal3DZoneViewSizeChangedEXT *)type;
+#ifdef OXR_HAVE_DXR_local_3d_zone
+	case XR_TYPE_EVENT_DATA_LOCAL_3D_ZONE_VIEW_SIZE_CHANGED_DXR: {
+		XrEventDataLocal3DZoneViewSizeChangedDXR *changed = (XrEventDataLocal3DZoneViewSizeChangedDXR *)type;
 		return changed->session == session;
 	}
 #endif
-#ifdef OXR_HAVE_EXT_workspace_file_dialog
-	case XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_EXT: {
-		XrEventDataFilePickerCompleteEXT *complete = (XrEventDataFilePickerCompleteEXT *)type;
+#ifdef OXR_HAVE_DXR_workspace_file_dialog
+	case XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_DXR: {
+		XrEventDataFilePickerCompleteDXR *complete = (XrEventDataFilePickerCompleteDXR *)type;
 		return complete->session == session;
 	}
 #endif
-#ifdef OXR_HAVE_EXT_mcp_tools
-	case XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_EXT: {
-		XrEventDataMCPToolCallEXT *call = (XrEventDataMCPToolCallEXT *)type;
+#ifdef OXR_HAVE_DXR_mcp_tools
+	case XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_DXR: {
+		XrEventDataMCPToolCallDXR *call = (XrEventDataMCPToolCallDXR *)type;
 		return call->session == session;
 	}
 #endif
@@ -406,12 +406,12 @@ oxr_event_push_XrEventDataRenderingModeChanged(struct oxr_logger *log,
                                                 uint32_t currentModeIndex)
 {
 	struct oxr_instance *inst = sess->sys->inst;
-	XrEventDataRenderingModeChangedEXT *changed;
+	XrEventDataRenderingModeChangedDXR *changed;
 	struct oxr_event *event = NULL;
 
 	ALLOC(log, inst, &event, &changed);
 
-	changed->type = XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT;
+	changed->type = XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR;
 	changed->next = NULL;
 	changed->session = oxr_session_to_openxr(sess);
 	changed->previousModeIndex = previousModeIndex;
@@ -433,15 +433,15 @@ XrResult
 oxr_event_push_XrEventDataEyeTrackingStateChanged(struct oxr_logger *log,
                                                   struct oxr_session *sess,
                                                   XrBool32 isTracking,
-                                                  XrEyeTrackingModeEXT activeMode)
+                                                  XrEyeTrackingModeDXR activeMode)
 {
 	struct oxr_instance *inst = sess->sys->inst;
-	XrEventDataEyeTrackingStateChangedEXT *changed;
+	XrEventDataEyeTrackingStateChangedDXR *changed;
 	struct oxr_event *event = NULL;
 
 	ALLOC(log, inst, &event, &changed);
 
-	changed->type = XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT;
+	changed->type = XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR;
 	changed->next = NULL;
 	changed->session = oxr_session_to_openxr(sess);
 	changed->isTracking = isTracking;
@@ -458,7 +458,7 @@ oxr_event_push_XrEventDataEyeTrackingStateChanged(struct oxr_logger *log,
 	return XR_SUCCESS;
 }
 
-#ifdef OXR_HAVE_EXT_local_3d_zone
+#ifdef OXR_HAVE_DXR_local_3d_zone
 XrResult
 oxr_event_push_XrEventDataLocal3DZoneViewSizeChanged(struct oxr_logger *log,
                                                      struct oxr_session *sess,
@@ -466,12 +466,12 @@ oxr_event_push_XrEventDataLocal3DZoneViewSizeChanged(struct oxr_logger *log,
                                                      uint32_t recommendedImageRectHeight)
 {
 	struct oxr_instance *inst = sess->sys->inst;
-	XrEventDataLocal3DZoneViewSizeChangedEXT *changed;
+	XrEventDataLocal3DZoneViewSizeChangedDXR *changed;
 	struct oxr_event *event = NULL;
 
 	ALLOC(log, inst, &event, &changed);
 
-	changed->type = XR_TYPE_EVENT_DATA_LOCAL_3D_ZONE_VIEW_SIZE_CHANGED_EXT;
+	changed->type = XR_TYPE_EVENT_DATA_LOCAL_3D_ZONE_VIEW_SIZE_CHANGED_DXR;
 	changed->next = NULL;
 	changed->session = oxr_session_to_openxr(sess);
 	changed->recommendedImageRectWidth = recommendedImageRectWidth;
@@ -499,7 +499,7 @@ oxr_event_push_XrEventDataLocal3DZoneViewSizeChanged(struct oxr_logger *log,
 
 	return XR_SUCCESS;
 }
-#endif // OXR_HAVE_EXT_local_3d_zone
+#endif // OXR_HAVE_DXR_local_3d_zone
 
 XrResult
 oxr_event_push_XrEventDataHardwareDisplayStateChanged(struct oxr_logger *log,
@@ -507,12 +507,12 @@ oxr_event_push_XrEventDataHardwareDisplayStateChanged(struct oxr_logger *log,
                                                        XrBool32 hardwareDisplay3D)
 {
 	struct oxr_instance *inst = sess->sys->inst;
-	XrEventDataHardwareDisplayStateChangedEXT *changed;
+	XrEventDataHardwareDisplayStateChangedDXR *changed;
 	struct oxr_event *event = NULL;
 
 	ALLOC(log, inst, &event, &changed);
 
-	changed->type = XR_TYPE_EVENT_DATA_HARDWARE_DISPLAY_STATE_CHANGED_EXT;
+	changed->type = XR_TYPE_EVENT_DATA_HARDWARE_DISPLAY_STATE_CHANGED_DXR;
 	changed->next = NULL;
 	changed->session = oxr_session_to_openxr(sess);
 	changed->hardwareDisplay3D = hardwareDisplay3D;
@@ -527,28 +527,28 @@ oxr_event_push_XrEventDataHardwareDisplayStateChanged(struct oxr_logger *log,
 	return XR_SUCCESS;
 }
 
-#ifdef OXR_HAVE_EXT_workspace_file_dialog
+#ifdef OXR_HAVE_DXR_workspace_file_dialog
 XrResult
 oxr_event_push_XrEventDataFilePickerComplete(struct oxr_logger *log,
                                               struct oxr_session *sess,
-                                              XrAsyncRequestIdEXT requestId,
-                                              XrFilePickerResultEXT result,
+                                              XrAsyncRequestIdDXR requestId,
+                                              XrFilePickerResultDXR result,
                                               const char *path)
 {
 	struct oxr_instance *inst = sess->sys->inst;
-	XrEventDataFilePickerCompleteEXT *complete;
+	XrEventDataFilePickerCompleteDXR *complete;
 	struct oxr_event *event = NULL;
 
 	ALLOC(log, inst, &event, &complete);
 
-	complete->type = XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_EXT;
+	complete->type = XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_DXR;
 	complete->next = NULL;
 	complete->session = oxr_session_to_openxr(sess);
 	complete->requestId = requestId;
 	complete->result = result;
 	// path[] was already zero-initialised by ALLOC (U_CALLOC_WITH_CAST).
-	if (result == XR_FILE_PICKER_RESULT_SUCCESS_EXT && path != NULL && path[0] != '\0') {
-		size_t len = strnlen(path, XR_MAX_FILE_PICKER_PATH_LENGTH_EXT - 1);
+	if (result == XR_FILE_PICKER_RESULT_SUCCESS_DXR && path != NULL && path[0] != '\0') {
+		size_t len = strnlen(path, XR_MAX_FILE_PICKER_PATH_LENGTH_DXR - 1);
 		memcpy(complete->path, path, len);
 		complete->path[len] = '\0';
 	}
@@ -563,9 +563,9 @@ oxr_event_push_XrEventDataFilePickerComplete(struct oxr_logger *log,
 
 	return XR_SUCCESS;
 }
-#endif // OXR_HAVE_EXT_workspace_file_dialog
+#endif // OXR_HAVE_DXR_workspace_file_dialog
 
-#ifdef OXR_HAVE_EXT_mcp_tools
+#ifdef OXR_HAVE_DXR_mcp_tools
 XrResult
 oxr_event_push_XrEventDataMCPToolCall(struct oxr_logger *log,
                                       struct oxr_session *sess,
@@ -574,18 +574,18 @@ oxr_event_push_XrEventDataMCPToolCall(struct oxr_logger *log,
                                       uint32_t args_size)
 {
 	struct oxr_instance *inst = sess->sys->inst;
-	XrEventDataMCPToolCallEXT *call;
+	XrEventDataMCPToolCallDXR *call;
 	struct oxr_event *event = NULL;
 
 	ALLOC(log, inst, &event, &call);
 
-	call->type = XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_EXT;
+	call->type = XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_DXR;
 	call->next = NULL;
 	call->session = oxr_session_to_openxr(sess);
 	call->callId = call_id;
 	// toolName[] was already zero-initialised by ALLOC.
 	if (tool_name != NULL) {
-		size_t len = strnlen(tool_name, XR_MAX_MCP_TOOL_NAME_SIZE_EXT - 1);
+		size_t len = strnlen(tool_name, XR_MAX_MCP_TOOL_NAME_SIZE_DXR - 1);
 		memcpy(call->toolName, tool_name, len);
 		call->toolName[len] = '\0';
 	}
@@ -601,7 +601,7 @@ oxr_event_push_XrEventDataMCPToolCall(struct oxr_logger *log,
 
 	return XR_SUCCESS;
 }
-#endif // OXR_HAVE_EXT_mcp_tools
+#endif // OXR_HAVE_DXR_mcp_tools
 
 XrResult
 oxr_event_remove_session_events(struct oxr_logger *log, struct oxr_session *sess)

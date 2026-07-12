@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Cube Zones VK — XR_EXT_display_zones exerciser (ADR-027), macOS VK leg
+ * @brief  Cube Zones VK — XR_DXR_display_zones exerciser (ADR-027), macOS VK leg
  *
  * Port of cube_zones_d3d11_win / cube_zones_metal_macos onto the
  * cube_handle_vk_macos scaffold. Each zone renders the full cube + grid
@@ -26,7 +26,7 @@
  * Keys / env: M = wish mode (AUTO / explicit Tier-2 rects), O = zone B
  * overlap toggle; DXR_ZONES_WISH_MODE=1 / DXR_ZONES_OVERLAP=1 preselect
  * those states headlessly; DXR_ZONES_VALIDATE=1 chains the validate bit.
- * Without XR_EXT_display_zones the app runs as the plain cube (the whole
+ * Without XR_DXR_display_zones the app runs as the plain cube (the whole
  * base-app path below is intact).
  */
 
@@ -38,12 +38,12 @@
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-#include <openxr/XR_EXT_cocoa_window_binding.h>
-#include <openxr/XR_EXT_display_info.h>
-#include <openxr/XR_EXT_atlas_capture.h>
-#include <openxr/XR_EXT_view_rig.h>
-#include <openxr/XR_EXT_local_3d_zone.h>
-#include <openxr/XR_EXT_display_zones.h>
+#include <openxr/XR_DXR_cocoa_window_binding.h>
+#include <openxr/XR_DXR_display_info.h>
+#include <openxr/XR_DXR_atlas_capture.h>
+#include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_local_3d_zone.h>
+#include <openxr/XR_DXR_display_zones.h>
 
 #include <cmath>
 #include <csignal>
@@ -93,7 +93,7 @@
     } while (0)
 
 // ============================================================================
-// XR_EXT_display_zones state (ADR-027) — clear-based zones, see file header
+// XR_DXR_display_zones state (ADR-027) — clear-based zones, see file header
 // ============================================================================
 
 static const uint32_t kNumZones = 2;
@@ -138,12 +138,12 @@ static bool g_overlapToggleRequested = false;
 
 static bool g_hasLocal3DZoneExt = false;
 static bool g_hasDisplayZonesExt = false;
-static PFN_xrGetDisplayZoneCapabilitiesEXT g_pfnGetZoneCaps = nullptr;
-static PFN_xrGetDisplayZoneRecommendedViewSizeEXT g_pfnGetZoneViewSize = nullptr;
-static PFN_xrCreateLocal3DZoneMaskEXT g_pfnCreateZoneMask = nullptr;
-static PFN_xrSetLocal3DZoneFromRectsEXT g_pfnSetZoneRects = nullptr;
-static PFN_xrDestroyLocal3DZoneMaskEXT g_pfnDestroyZoneMask = nullptr;
-static XrLocal3DZoneMaskEXT g_zoneMask = XR_NULL_HANDLE;
+static PFN_xrGetDisplayZoneCapabilitiesDXR g_pfnGetZoneCaps = nullptr;
+static PFN_xrGetDisplayZoneRecommendedViewSizeDXR g_pfnGetZoneViewSize = nullptr;
+static PFN_xrCreateLocal3DZoneMaskDXR g_pfnCreateZoneMask = nullptr;
+static PFN_xrSetLocal3DZoneFromRectsDXR g_pfnSetZoneRects = nullptr;
+static PFN_xrDestroyLocal3DZoneMaskDXR g_pfnDestroyZoneMask = nullptr;
+static XrLocal3DZoneMaskDXR g_zoneMask = XR_NULL_HANDLE;
 
 static bool ZonesValidateEnabled() {
     static const bool e = []() {
@@ -180,7 +180,7 @@ struct InputState {
 
     // Rendering mode REQUESTS — single source of truth lives on the runtime
     // side (read back as xr.currentModeIndex after the runtime's
-    // XrEventDataRenderingModeChangedEXT lands). Keys emit transient requests;
+    // XrEventDataRenderingModeChangedDXR lands). Keys emit transient requests;
     // the actual current mode is never mirrored here.
     uint32_t renderingModeCount = 0;             // mirror of xr.renderingModeCount for keypress bounds
     bool cycleRenderingModeRequested = false;    // V key
@@ -765,7 +765,7 @@ struct VkRenderer {
     bool texturesLoaded = false;
 };
 
-//! XR_EXT_display_zones: per-zone framebuffer sets over the zone swapchains
+//! XR_DXR_display_zones: per-zone framebuffer sets over the zone swapchains
 //! (the zones render the same cube + grid scene as the main path).
 static SwapchainFramebuffers g_zoneFbs[kNumZones];
 
@@ -1541,7 +1541,7 @@ struct EyeRenderParams {
 };
 
 // Generalized scene render: cube + grid into any framebuffer set with an
-// explicit clear color and a per-call rotation offset (XR_EXT_display_zones:
+// explicit clear color and a per-call rotation offset (XR_DXR_display_zones:
 // each zone renders into its own swapchain with its own spin phase and
 // premultiplied background).
 static void RenderSceneToFramebuffer(VkRenderer& renderer, SwapchainFramebuffers& fb,
@@ -1762,7 +1762,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLef
 
         // INV-1.3: open on the 3D panel (#715). (screenLeft, screenTop) is the
         // panel top-left in top-down global coordinates (origin = primary
-        // top-left, XrDisplayDesktopPositionEXT); flip into AppKit's bottom-up
+        // top-left, XrDisplayDesktopPositionDXR); flip into AppKit's bottom-up
         // space. (0,0) = primary — the titled window is auto-constrained below
         // the menu bar, so it is always a safe create position.
         NSRect frame = NSMakeRect(100, 100, width, height);
@@ -2054,11 +2054,11 @@ struct AppXrSession {
     bool exitRequested = false;
     bool hasCocoaWindowBinding = false;
 
-    // XR_EXT_display_info
+    // XR_DXR_display_info
     bool hasDisplayInfoExt = false;
     float recommendedViewScaleX = 1.0f;
     float recommendedViewScaleY = 1.0f;
-    // v16 XrDisplayDesktopPositionEXT — 3D panel top-left in virtual-desktop
+    // v16 XrDisplayDesktopPositionDXR — 3D panel top-left in virtual-desktop
     // pixels (top-down, origin = primary top-left); (0,0) = primary/unknown.
     int32_t displayScreenLeft = 0;
     int32_t displayScreenTop = 0;
@@ -2067,14 +2067,14 @@ struct AppXrSession {
     float nominalViewerX = 0.0f;
     float nominalViewerY = 0.0f;
     float nominalViewerZ = 0.5f;
-    PFN_xrRequestDisplayModeEXT pfnRequestDisplayModeEXT = nullptr;
-    PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingModeEXT = nullptr;
-    PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT = nullptr;
+    PFN_xrRequestDisplayModeDXR pfnRequestDisplayModeEXT = nullptr;
+    PFN_xrRequestDisplayRenderingModeDXR pfnRequestDisplayRenderingModeEXT = nullptr;
+    PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateDisplayRenderingModesEXT = nullptr;
 
-    // XR_EXT_atlas_capture (W6 of #396): runtime-owned 'I'-key atlas capture.
+    // XR_DXR_atlas_capture (W6 of #396): runtime-owned 'I'-key atlas capture.
     bool hasAtlasCaptureExt = false;
-    bool hasViewRigExt = false;  // XR_EXT_view_rig (#396 W7)
-    PFN_xrCaptureAtlasEXT pfnCaptureAtlasEXT = nullptr;
+    bool hasViewRigExt = false;  // XR_DXR_view_rig (#396 W7)
+    PFN_xrCaptureAtlasDXR pfnCaptureAtlasEXT = nullptr;
     // Enumerated rendering mode info. currentModeIndex is initialized to mode 1
     // as a fallback for runtimes that don't expose isActive; v13+ runtimes
     // replace it via the enumerate step (initial-mode-sync, #234/#239).
@@ -2089,12 +2089,12 @@ struct AppXrSession {
     bool renderingModeDisplay3D[8] = {};
     bool renderingModeIsRequestable[8] = {};  // v13: false when workspace-locked
 
-    // Eye tracking mode control (XR_EXT_display_info v6)
+    // Eye tracking mode control (XR_DXR_display_info v6)
     uint32_t supportedEyeTrackingModes = 0;
     uint32_t defaultEyeTrackingMode = 0;
     bool isEyeTracking = false;
     uint32_t activeEyeTrackingMode = 0;
-    PFN_xrRequestEyeTrackingModeEXT pfnRequestEyeTrackingModeEXT = nullptr;
+    PFN_xrRequestEyeTrackingModeDXR pfnRequestEyeTrackingModeEXT = nullptr;
 
     // Eye tracking data for HUD
     uint32_t eyeCount = 2;
@@ -2117,22 +2117,22 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     bool hasVulkan = false;
     for (const auto& ext : extensions) {
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
-        if (strcmp(ext.extensionName, XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME) == 0) {
             xr.hasCocoaWindowBinding = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) {
             xr.hasDisplayInfoExt = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0) {
             xr.hasAtlasCaptureExt = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
             xr.hasViewRigExt = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) {
             g_hasLocal3DZoneExt = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_DISPLAY_ZONES_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) == 0) {
             g_hasDisplayZonesExt = true;
         }
     }
@@ -2142,40 +2142,40 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         return false;
     }
 
-    // XR_EXT_display_zones composes XR_EXT_local_3d_zone + XR_EXT_view_rig.
+    // XR_DXR_display_zones composes XR_DXR_local_3d_zone + XR_DXR_view_rig.
     if (g_hasDisplayZonesExt && (!g_hasLocal3DZoneExt || !xr.hasViewRigExt)) {
-        LOG_ERROR("XR_EXT_display_zones advertised without its prerequisites — zones path disabled");
+        LOG_ERROR("XR_DXR_display_zones advertised without its prerequisites — zones path disabled");
         g_hasDisplayZonesExt = false;
     }
     if (!g_hasDisplayZonesExt) {
-        LOG_ERROR("XR_EXT_display_zones NOT available — running as plain single-projection cube");
+        LOG_ERROR("XR_DXR_display_zones NOT available — running as plain single-projection cube");
     }
 
-    LOG_INFO("XR_EXT_cocoa_window_binding: %s", xr.hasCocoaWindowBinding ? "available" : "not available");
-    LOG_INFO("XR_EXT_display_info: %s", xr.hasDisplayInfoExt ? "available" : "not available");
-    LOG_INFO("XR_EXT_atlas_capture: %s", xr.hasAtlasCaptureExt ? "available" : "not available");
-    LOG_INFO("XR_EXT_view_rig: %s", xr.hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_cocoa_window_binding: %s", xr.hasCocoaWindowBinding ? "available" : "not available");
+    LOG_INFO("XR_DXR_display_info: %s", xr.hasDisplayInfoExt ? "available" : "not available");
+    LOG_INFO("XR_DXR_atlas_capture: %s", xr.hasAtlasCaptureExt ? "available" : "not available");
+    LOG_INFO("XR_DXR_view_rig: %s", xr.hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
 
     // Build extension list
     std::vector<const char*> enabledExtensions;
     enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
     if (xr.hasCocoaWindowBinding) {
-        enabledExtensions.push_back(XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME);
     }
     if (xr.hasDisplayInfoExt) {
-        enabledExtensions.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
     }
     if (xr.hasAtlasCaptureExt) {
-        enabledExtensions.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME);
     }
     if (xr.hasViewRigExt) {
-        enabledExtensions.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
     }
     if (g_hasLocal3DZoneExt) {
-        enabledExtensions.push_back(XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME);
     }
     if (g_hasDisplayZonesExt) {
-        enabledExtensions.push_back(XR_EXT_DISPLAY_ZONES_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_DISPLAY_ZONES_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -2202,17 +2202,17 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         }
     }
 
-    // Query display info via XR_EXT_display_info
+    // Query display info via XR_DXR_display_info
     if (xr.hasDisplayInfoExt) {
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
-        XrDisplayInfoEXT displayInfo = {};
-        displayInfo.type = XR_TYPE_DISPLAY_INFO_EXT;
-        XrEyeTrackingModeCapabilitiesEXT eyeCaps = {};
-        eyeCaps.type = (XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT;
+        XrDisplayInfoDXR displayInfo = {};
+        displayInfo.type = XR_TYPE_DISPLAY_INFO_DXR;
+        XrEyeTrackingModeCapabilitiesDXR eyeCaps = {};
+        eyeCaps.type = (XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR;
         // INV-1.3: panel desktop position, so the window opens on the 3D panel
         // instead of the primary monitor (spec v16, #715). Chained at the tail.
-        XrDisplayDesktopPositionEXT desktopPos = {};
-        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT;
+        XrDisplayDesktopPositionDXR desktopPos = {};
+        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
         displayInfo.next = &eyeCaps;
         eyeCaps.next = &desktopPos;
         sysProps.next = &displayInfo;
@@ -2241,41 +2241,41 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         }
 
         // Load display extension function pointers
-        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeDXR",
             (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
-        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR",
             (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
-        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesDXR",
             (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
 
-        // XR_EXT_atlas_capture (W6 of #396): resolve the runtime-owned capture entry.
+        // XR_DXR_atlas_capture (W6 of #396): resolve the runtime-owned capture entry.
         if (xr.hasAtlasCaptureExt) {
-            xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasEXT",
+            xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasDXR",
                 (PFN_xrVoidFunction*)&xr.pfnCaptureAtlasEXT);
-            LOG_INFO("xrCaptureAtlasEXT: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
+            LOG_INFO("xrCaptureAtlasDXR: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
         }
 
         // Load eye tracking mode request function pointer
         if (xr.supportedEyeTrackingModes != 0) {
-            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeEXT",
+            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeDXR",
                 (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingModeEXT);
         }
     }
 
-    // XR_EXT_display_zones + XR_EXT_local_3d_zone entry points.
+    // XR_DXR_display_zones + XR_DXR_local_3d_zone entry points.
     if (g_hasDisplayZonesExt) {
-        xrGetInstanceProcAddr(xr.instance, "xrGetDisplayZoneCapabilitiesEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrGetDisplayZoneCapabilitiesDXR",
             (PFN_xrVoidFunction*)&g_pfnGetZoneCaps);
-        xrGetInstanceProcAddr(xr.instance, "xrGetDisplayZoneRecommendedViewSizeEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrGetDisplayZoneRecommendedViewSizeDXR",
             (PFN_xrVoidFunction*)&g_pfnGetZoneViewSize);
-        xrGetInstanceProcAddr(xr.instance, "xrCreateLocal3DZoneMaskEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrCreateLocal3DZoneMaskDXR",
             (PFN_xrVoidFunction*)&g_pfnCreateZoneMask);
-        xrGetInstanceProcAddr(xr.instance, "xrSetLocal3DZoneFromRectsEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrSetLocal3DZoneFromRectsDXR",
             (PFN_xrVoidFunction*)&g_pfnSetZoneRects);
-        xrGetInstanceProcAddr(xr.instance, "xrDestroyLocal3DZoneMaskEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrDestroyLocal3DZoneMaskDXR",
             (PFN_xrVoidFunction*)&g_pfnDestroyZoneMask);
         if (g_pfnGetZoneCaps == nullptr || g_pfnGetZoneViewSize == nullptr) {
-            LOG_ERROR("XR_EXT_display_zones entry points unresolved — zones path disabled");
+            LOG_ERROR("XR_DXR_display_zones entry points unresolved — zones path disabled");
             g_hasDisplayZonesExt = false;
         }
     }
@@ -2480,7 +2480,7 @@ static bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamily
 
 /*!
  * Create OpenXR session WITH the cocoa_window_binding extension.
- * Chains XrCocoaWindowBindingCreateInfoEXT into session create info.
+ * Chains XrCocoaWindowBindingCreateInfoDXR into session create info.
  */
 static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDevice physDevice,
     VkDevice device, uint32_t queueFamilyIndex)
@@ -2495,8 +2495,8 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     vkBinding.queueIndex = 0;
 
     // Chain the macOS window binding extension — pass our NSView to the runtime
-    XrCocoaWindowBindingCreateInfoEXT macosBinding = {};
-    macosBinding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT;
+    XrCocoaWindowBindingCreateInfoDXR macosBinding = {};
+    macosBinding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR;
     macosBinding.next = nullptr;
     macosBinding.viewHandle = (__bridge void *)g_metalView;
 
@@ -2521,7 +2521,7 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     // Chain: sessionInfo -> vkBinding -> macosBinding
     if (xr.hasCocoaWindowBinding) {
         vkBinding.next = &macosBinding;
-        LOG_INFO("Chaining XR_EXT_cocoa_window_binding with NSView %p", macosBinding.viewHandle);
+        LOG_INFO("Chaining XR_DXR_cocoa_window_binding with NSView %p", macosBinding.viewHandle);
     }
 
     XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
@@ -2536,9 +2536,9 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
         uint32_t modeCount = 0;
         XrResult enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, 0, &modeCount, nullptr);
         if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
-            std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
+            std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
             for (uint32_t i = 0; i < modeCount; i++) {
-                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
                 modes[i].next = nullptr;
             }
             enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, modeCount, &modeCount, modes.data());
@@ -2664,17 +2664,17 @@ static bool PollEvents(AppXrSession& xr) {
             }
             break;
         }
-        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT: {
-            auto* modeEvent = (XrEventDataRenderingModeChangedEXT*)&event;
+        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
+            auto* modeEvent = (XrEventDataRenderingModeChangedDXR*)&event;
             LOG_INFO("Rendering mode changed: %u -> %u",
                 modeEvent->previousModeIndex, modeEvent->currentModeIndex);
             xr.currentModeIndex = modeEvent->currentModeIndex;
             break;
         }
-        case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT: {
+        case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR: {
             // Edge-triggered tracking loss/recovery (#441 v14); HUD state
-            // also refreshes per-frame from the XrViewEyeTrackingStateEXT chain.
-            auto* etEvent = (XrEventDataEyeTrackingStateChangedEXT*)&event;
+            // also refreshes per-frame from the XrViewEyeTrackingStateDXR chain.
+            auto* etEvent = (XrEventDataEyeTrackingStateChangedDXR*)&event;
             LOG_INFO("Eye tracking state changed: isTracking=%s mode=%u",
                 etEvent->isTracking == XR_TRUE ? "YES" : "NO",
                 (uint32_t)etEvent->activeMode);
@@ -2903,7 +2903,7 @@ static void SignalHandler(int sig) {
 }
 
 // ============================================================================
-// XR_EXT_display_zones helpers (ADR-027) — clear-based zones
+// XR_DXR_display_zones helpers (ADR-027) — clear-based zones
 // ============================================================================
 
 // One-shot graphics-queue submit clearing a whole VK image to `color` and
@@ -2962,7 +2962,7 @@ static void ClearImageToColor(VkDevice device, VkCommandPool pool, VkQueue queue
     vkFreeCommandBuffers(device, pool, 1, &cmd);
 }
 
-// Create one zone's swapchain, sized per xrGetDisplayZoneRecommendedViewSizeEXT,
+// Create one zone's swapchain, sized per xrGetDisplayZoneRecommendedViewSizeDXR,
 // horizontally tiled per view; enumerate its VK images and build the zone's
 // framebuffer set (the zone renders the cube + grid scene).
 static bool CreateZoneResources(AppXrSession& xr, VkRenderer& renderer, uint32_t zoneIndex,
@@ -2971,7 +2971,7 @@ static bool CreateZoneResources(AppXrSession& xr, VkRenderer& renderer, uint32_t
     XrExtent2Di rec = {};
     XrResult r = g_pfnGetZoneViewSize(xr.session, &z.rect, &rec);
     if (XR_FAILED(r) || rec.width <= 0 || rec.height <= 0) {
-        LOG_ERROR("[zones] zone %u: xrGetDisplayZoneRecommendedViewSizeEXT failed (0x%x, %dx%d)",
+        LOG_ERROR("[zones] zone %u: xrGetDisplayZoneRecommendedViewSizeDXR failed (0x%x, %dx%d)",
                   z.zoneId, (unsigned)r, rec.width, rec.height);
         return false;
     }
@@ -3075,12 +3075,12 @@ static bool EnsureWishMask(AppXrSession& xr)
 {
     if (g_zoneMask != XR_NULL_HANDLE) return true;
     if (g_pfnCreateZoneMask == nullptr) return false;
-    XrLocal3DZoneMaskCreateInfoEXT mci = {(XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_EXT};
+    XrLocal3DZoneMaskCreateInfoDXR mci = {(XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_DXR};
     mci.maskWidth = 0; // runtime picks the window backing size
     mci.maskHeight = 0;
     XrResult r = g_pfnCreateZoneMask(xr.session, &mci, &g_zoneMask);
     if (XR_FAILED(r)) {
-        LOG_ERROR("[zones] xrCreateLocal3DZoneMaskEXT failed (0x%x)", (unsigned)r);
+        LOG_ERROR("[zones] xrCreateLocal3DZoneMaskDXR failed (0x%x)", (unsigned)r);
         g_zoneMask = XR_NULL_HANDLE;
         return false;
     }
@@ -3096,7 +3096,7 @@ static void ApplyWishAuthoring(AppXrSession& xr)
         for (uint32_t zi = 0; zi < kNumZones; zi++) rects[zi] = g_zonesArr[zi].rect;
         XrResult r = g_pfnSetZoneRects(g_zoneMask, kNumZones, rects);
         if (XR_FAILED(r)) {
-            LOG_ERROR("[zones] xrSetLocal3DZoneFromRectsEXT failed (0x%x)", (unsigned)r);
+            LOG_ERROR("[zones] xrSetLocal3DZoneFromRectsDXR failed (0x%x)", (unsigned)r);
         }
     }
 }
@@ -3138,10 +3138,10 @@ static void TryActivateZones(AppXrSession& xr, VkRenderer& renderer,
     }
     g_zonesAttempted = true;
 
-    XrDisplayZoneCapabilitiesEXT caps = {XR_TYPE_DISPLAY_ZONE_CAPABILITIES_EXT};
+    XrDisplayZoneCapabilitiesDXR caps = {XR_TYPE_DISPLAY_ZONE_CAPABILITIES_DXR};
     XrResult r = g_pfnGetZoneCaps(xr.session, &caps);
     if (XR_FAILED(r) || !caps.supported) {
-        LOG_ERROR("[zones] xrGetDisplayZoneCapabilitiesEXT: rc=0x%x supported=%d — zones path disabled",
+        LOG_ERROR("[zones] xrGetDisplayZoneCapabilitiesDXR: rc=0x%x supported=%d — zones path disabled",
                   (unsigned)r, (int)caps.supported);
         g_hasDisplayZonesExt = false;
         return;
@@ -3219,22 +3219,22 @@ static void TryActivateZones(AppXrSession& xr, VkRenderer& renderer,
 // [projA, projB, strip] with the zone structs chained on the projections.
 static void RenderZonesFrame(AppXrSession& xr, VkRenderer& renderer, const XrFrameState& frameState)
 {
-    XrDisplayZoneEXT zoneStructs[kNumZones];
-    XrDisplayRigEXT rigStructs[kNumZones];
+    XrDisplayZoneDXR zoneStructs[kNumZones];
+    XrDisplayRigDXR rigStructs[kNumZones];
     std::vector<XrCompositionLayerProjectionView> projViews[kNumZones];
     uint32_t submitViewCounts[kNumZones] = {};
 
     for (uint32_t zi = 0; zi < kNumZones; zi++) {
         DisplayZone& z = g_zonesArr[zi];
 
-        rigStructs[zi] = {XR_TYPE_DISPLAY_RIG_EXT};
+        rigStructs[zi] = {XR_TYPE_DISPLAY_RIG_DXR};
         rigStructs[zi].pose = {{0, 0, 0, 1}, {0, 0, 0}};
         rigStructs[zi].virtualDisplayHeight = kZoneVirtualDisplayHeight;
         rigStructs[zi].ipdFactor = z.ipdFactor;
         rigStructs[zi].parallaxFactor = 1.0f;
         rigStructs[zi].perspectiveFactor = z.perspectiveFactor;
 
-        zoneStructs[zi] = {XR_TYPE_DISPLAY_ZONE_EXT};
+        zoneStructs[zi] = {XR_TYPE_DISPLAY_ZONE_DXR};
         zoneStructs[zi].next = &rigStructs[zi];
         zoneStructs[zi].zoneId = z.zoneId;
         zoneStructs[zi].rect = z.rect;
@@ -3310,7 +3310,7 @@ static void RenderZonesFrame(AppXrSession& xr, VkRenderer& renderer, const XrFra
 
     // Layer list: [projA (zone A chained), projB (zone B chained), strip].
     XrCompositionLayerProjection projLayers[kNumZones];
-    XrCompositionLayerLocal2DEXT stripLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+    XrCompositionLayerLocal2DDXR stripLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR};
     const XrCompositionLayerBaseHeader* layers[kNumZones + 1] = {};
     uint32_t layerCount = 0;
 
@@ -3362,7 +3362,7 @@ static void RenderZonesFrame(AppXrSession& xr, VkRenderer& renderer, const XrFra
     endInfo.layerCount = layerCount;
     endInfo.layers = layers;
 
-    XrDisplayZonesFrameEndInfoEXT zonesEnd = {(XrStructureType)XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_EXT};
+    XrDisplayZonesFrameEndInfoDXR zonesEnd = {(XrStructureType)XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_DXR};
     zonesEnd.flags = 0;
     zonesEnd.wishMask = XR_NULL_HANDLE;
     bool chainZonesEnd = false;
@@ -3371,7 +3371,7 @@ static void RenderZonesFrame(AppXrSession& xr, VkRenderer& renderer, const XrFra
         chainZonesEnd = true;
     }
     if (ZonesValidateEnabled()) {
-        zonesEnd.flags |= XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_EXT;
+        zonesEnd.flags |= XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_DXR;
         chainZonesEnd = true;
     }
     if (chainZonesEnd) {
@@ -3389,7 +3389,7 @@ int main() {
     signal(SIGINT, SignalHandler);
     signal(SIGTERM, SignalHandler);
 
-    LOG_INFO("=== VK Cube Zones OpenXR (XR_EXT_display_zones, ADR-027) ===");
+    LOG_INFO("=== VK Cube Zones OpenXR (XR_DXR_display_zones, ADR-027) ===");
 
     // Headless validation knobs: preselect the M / O key states.
     {
@@ -3406,7 +3406,7 @@ int main() {
     }
 
     // Initial rendering mode is sourced from the runtime via v13 `isActive`
-    // (set during xrEnumerateDisplayRenderingModesEXT). Fallback is mode 1
+    // (set during xrEnumerateDisplayRenderingModesDXR). Fallback is mode 1
     // (default of xr.currentModeIndex).
 
     // Step 1: Initialize OpenXR FIRST — xrGetSystemProperties needs only
@@ -3609,8 +3609,8 @@ int main() {
 
         // Handle rendering mode requests (V=cycle next, 0-8=jump absolute).
         // Single source of truth: the runtime owns the current mode. Keypresses
-        // are REQUESTS — we call xrRequestDisplayRenderingModeEXT and let the
-        // XrEventDataRenderingModeChangedEXT event update xr.currentModeIndex.
+        // are REQUESTS — we call xrRequestDisplayRenderingModeDXR and let the
+        // XrEventDataRenderingModeChangedDXR event update xr.currentModeIndex.
         // Render paths and HUD read xr.currentModeIndex directly.
         if (g_input.cycleRenderingModeRequested) {
             g_input.cycleRenderingModeRequested = false;
@@ -3633,11 +3633,11 @@ int main() {
         if (g_input.eyeTrackingModeToggleRequested) {
             g_input.eyeTrackingModeToggleRequested = false;
             if (xr.pfnRequestEyeTrackingModeEXT && xr.session != XR_NULL_HANDLE) {
-                XrEyeTrackingModeEXT newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_EXT)
-                    ? XR_EYE_TRACKING_MODE_MANUAL_EXT : XR_EYE_TRACKING_MODE_MANAGED_EXT;
+                XrEyeTrackingModeDXR newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_DXR)
+                    ? XR_EYE_TRACKING_MODE_MANUAL_DXR : XR_EYE_TRACKING_MODE_MANAGED_DXR;
                 XrResult etResult = xr.pfnRequestEyeTrackingModeEXT(xr.session, newMode);
                 LOG_INFO("Eye tracking mode -> %s (%s)",
-                    newMode == XR_EYE_TRACKING_MODE_MANUAL_EXT ? "MANUAL" : "MANAGED",
+                    newMode == XR_EYE_TRACKING_MODE_MANUAL_DXR ? "MANUAL" : "MANAGED",
                     XR_SUCCEEDED(etResult) ? "OK" : "unsupported");
             }
         }
@@ -3647,7 +3647,7 @@ int main() {
         if (xr.sessionRunning) {
             XrFrameState frameState;
             if (BeginFrame(xr, frameState)) {
-                // ---- zones path (XR_EXT_display_zones, ADR-027) -------------
+                // ---- zones path (XR_DXR_display_zones, ADR-027) -------------
                 g_zonesFrameCounter++;
                 if (g_hasDisplayZonesExt && !g_zonesActive && !g_zonesAttempted &&
                     g_zonesFrameCounter >= kZonesActivationFrame) {
@@ -3667,11 +3667,11 @@ int main() {
                             g_zonesFrameCounter >= kZonesActivationFrame + 30 &&
                             xr.pfnCaptureAtlasEXT != nullptr) {
                             captured = true;
-                            XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
+                            XrAtlasCaptureInfoDXR info = {XR_TYPE_ATLAS_CAPTURE_INFO_DXR};
                             info.next = nullptr;
-                            info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT;
-                            strncpy(info.pathPrefix, capturePrefix, XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1);
-                            info.pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1] = '\0';
+                            info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_DXR;
+                            strncpy(info.pathPrefix, capturePrefix, XR_ATLAS_CAPTURE_PATH_MAX_DXR - 1);
+                            info.pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_DXR - 1] = '\0';
                             XrResult cr = xr.pfnCaptureAtlasEXT(xr.session, &info, nullptr);
                             LOG_INFO("[zones] atlas capture (%s): 0x%x", capturePrefix, (unsigned)cr);
                         }
@@ -3712,11 +3712,11 @@ int main() {
                     XrViewState viewState = {XR_TYPE_VIEW_STATE};
 
                     // Chain eye tracking state (v6)
-                    XrViewEyeTrackingStateEXT eyeTrackingState = {};
-                    eyeTrackingState.type = (XrStructureType)XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT;
+                    XrViewEyeTrackingStateDXR eyeTrackingState = {};
+                    eyeTrackingState.type = (XrStructureType)XR_TYPE_VIEW_EYE_TRACKING_STATE_DXR;
                     viewState.next = &eyeTrackingState;
 
-                    // XR_EXT_view_rig (#396 W7): drive the runtime rig matching
+                    // XR_DXR_view_rig (#396 W7): drive the runtime rig matching
                     // the app's current mode (C selects the rig) with the app's
                     // tunables — the runtime owns the window resolve and the
                     // Kooima math, and returns render-ready XrView{pose, fov}.
@@ -3726,9 +3726,9 @@ int main() {
                     const bool useRig =
                         xr.hasViewRigExt && xr.displayWidthM > 0 && xr.displayHeightM > 0;
                     const bool rigCamera = useRig && g_input.cameraMode;
-                    XrCameraRigEXT cameraRig = {XR_TYPE_CAMERA_RIG_EXT};
-                    XrDisplayRigEXT displayRig = {XR_TYPE_DISPLAY_RIG_EXT};
-                    XrViewDisplayRawEXT viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+                    XrCameraRigDXR cameraRig = {XR_TYPE_CAMERA_RIG_DXR};
+                    XrDisplayRigDXR displayRig = {XR_TYPE_DISPLAY_RIG_DXR};
+                    XrViewDisplayRawDXR viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
                     XrPosef rigPose = {{0, 0, 0, 1}, {0, 0, 0}};
                     if (useRig) {
                         quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &rigPose.orientation);
@@ -3773,7 +3773,7 @@ int main() {
 
                         // Save display-space eye positions for the HUD. Under
                         // the rig, views[] carries render-ready world eyes —
-                        // the raw channel (XrViewDisplayRawEXT) keeps the HUD
+                        // the raw channel (XrViewDisplayRawDXR) keeps the HUD
                         // readout in display space.
                         xr.eyeCount = modeViewCount;
                         if (useRig && viewRigRaw.eyeCountOutput > 0) {
@@ -3875,7 +3875,7 @@ int main() {
                             RenderScene(vkRenderer, imageIndex, eyeParams.data(), eyeCount);
 
                             // 'I' key: snapshot the multi-view atlas via the
-                            // runtime-owned XR_EXT_atlas_capture (W6 of #396) —
+                            // runtime-owned XR_DXR_atlas_capture (W6 of #396) —
                             // the runtime does the readback from its own atlas
                             // image, so the app keeps no staging texture.
                             // PROJECTION_ONLY = the app's own projection atlas,
@@ -3887,25 +3887,25 @@ int main() {
                                     if (display3D && (tileColumns > 1 || tileRows > 1)) {
                                         std::string prefix = dxr_capture::MakeCaptureAtlasPrefix(
                                             "cube_handle_vk_macos", tileColumns, tileRows);
-                                        XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
+                                        XrAtlasCaptureInfoDXR info = {XR_TYPE_ATLAS_CAPTURE_INFO_DXR};
                                         info.next = nullptr;
-                                        info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT;
+                                        info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_DXR;
                                         strncpy(info.pathPrefix, prefix.c_str(),
-                                                XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1);
-                                        info.pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1] = '\0';
+                                                XR_ATLAS_CAPTURE_PATH_MAX_DXR - 1);
+                                        info.pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_DXR - 1] = '\0';
                                         XrResult cr = xr.pfnCaptureAtlasEXT(xr.session, &info, nullptr);
                                         if (XR_SUCCEEDED(cr)) {
                                             LOG_INFO("Atlas capture requested -> %s_atlas_%u_%ux%u.png",
                                                      prefix.c_str(), tileColumns * tileRows, tileColumns, tileRows);
                                             dxr_capture::TriggerCaptureFlash((__bridge void*)g_metalView);
                                         } else {
-                                            LOG_WARN("xrCaptureAtlasEXT failed: 0x%x", (unsigned)cr);
+                                            LOG_WARN("xrCaptureAtlasDXR failed: 0x%x", (unsigned)cr);
                                         }
                                     } else {
                                         LOG_WARN("Capture skipped: need 3D mode with cols/rows > 1");
                                     }
                                 } else {
-                                    LOG_WARN("Atlas capture unavailable: XR_EXT_atlas_capture not active");
+                                    LOG_WARN("Atlas capture unavailable: XR_DXR_atlas_capture not active");
                                 }
                             }
                             ReleaseSwapchainImage(xr);
@@ -3997,7 +3997,7 @@ int main() {
             const char *kooimaMode = g_input.cameraMode
                 ? "Camera-Centric [C=Toggle]" : "Display-Centric [C=Toggle]";
             snprintf(buf, sizeof(buf),
-                "XR_EXT_cocoa_window_binding: %s (Vulkan)\nMode: %s (%s)%s\nKooima: %s",
+                "XR_DXR_cocoa_window_binding: %s (Vulkan)\nMode: %s (%s)%s\nKooima: %s",
                 xr.hasCocoaWindowBinding ? "ACTIVE" : "NOT AVAILABLE",
                 outputModeName, display3D ? "3D" : "2D", lockSuffix, kooimaMode);
             g_hudModeText = utf8ToW(buf);

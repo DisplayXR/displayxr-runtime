@@ -192,7 +192,7 @@ do_projection_layer_depth(struct xrt_compositor *xc,
 static void
 do_zone_3d_layer(struct xrt_compositor *xc, struct multi_compositor *mc, struct multi_layer_entry *layer, uint32_t i)
 {
-	// XR_EXT_display_zones P5: the target compositor may not consume zone
+	// XR_DXR_display_zones P5: the target compositor may not consume zone
 	// layers (e.g. the null compositor) — drop with a one-shot WARN,
 	// never an error (layers are advisory compositing).
 	if (xc->layer_zone_3d == NULL) {
@@ -395,7 +395,7 @@ find_active_blend_mode(struct multi_compositor **overlay_sorted_clients, size_t 
 // which composites every client into the one shared surface instead.
 #ifndef XRT_OS_MACOS
 /*!
- * Composite LOCAL_2D layers (XR_EXT_local_3d_zone, e.g. the avatar speech
+ * Composite LOCAL_2D layers (XR_DXR_local_3d_zone, e.g. the avatar speech
  * bubble, #568) into the final per-session target, post-weave, by scale-blitting
  * each layer image into its destination rect. The target's 2D regions (outside
  * any 3D zone) were cleared transparent by the DP, and the layer carries its own
@@ -528,7 +528,7 @@ get_session_layer_view(struct multi_layer_entry *layer,
 {
 	const struct xrt_layer_data *layer_data = &layer->data;
 
-	// Projection layers for SR weaving, plus zone-3D layers (XR_EXT_display_zones,
+	// Projection layers for SR weaving, plus zone-3D layers (XR_DXR_display_zones,
 	// #568): xrt_layer_zone_3d_data embeds xrt_layer_projection_data as its first
 	// member, and data.proj / data.zone_3d.proj alias the union's first member —
 	// so the per-view proj/sub reads below are byte-identical for ZONE_3D.
@@ -1152,7 +1152,7 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
                                  VkImageView *out_right_view)
 {
 	// Find the projection (or zone-3D) layer first. Zone-3D carries an
-	// embedded projection (XR_EXT_display_zones, #568) and composites the
+	// embedded projection (XR_DXR_display_zones, #568) and composites the
 	// same way; only the window-space layer path reaches here today.
 	struct multi_layer_entry *proj_layer = NULL;
 	for (uint32_t i = 0; i < mc->delivered.layer_count; i++) {
@@ -2766,7 +2766,7 @@ render_session_to_own_target(struct multi_compositor *mc,
 	}
 
 	// Get the first projection (or zone-3D) layer. A zone-3D layer
-	// (XR_EXT_display_zones, #568) carries an embedded projection plus a
+	// (XR_DXR_display_zones, #568) carries an embedded projection plus a
 	// placement rect; it renders exactly like a projection here, then the
 	// rect is handed to the DP as the canvas sub-rect (see process_atlas below).
 	struct multi_layer_entry *layer = NULL;
@@ -2780,7 +2780,7 @@ render_session_to_own_target(struct multi_compositor *mc,
 	}
 
 	// One-shot WARN (per layer-type change) naming what the per-session path
-	// selected and, for a zone (XR_EXT_display_zones / #568), its placement
+	// selected and, for a zone (XR_DXR_display_zones / #568), its placement
 	// rect — a lifecycle breadcrumb at the same level as the atlas/DP WARNs
 	// below, so zone-on-OOP framing is greppable without the INFO hot path.
 	{
@@ -2805,7 +2805,7 @@ render_session_to_own_target(struct multi_compositor *mc,
 	}
 
 	// HARDWARE 2D/3D (the weave-state) is set by multi_compositor_request_display_mode
-	// — the app's xrRequestDisplayRenderingModeEXT, which now crosses IPC out-of-process
+	// — the app's xrRequestDisplayRenderingModeDXR, which now crosses IPC out-of-process
 	// (#533). It is DECOUPLED from the per-frame CONTENT (how many tiles the app
 	// submitted): content drives the atlas, mc->hardware_display_3d drives the DP weave.
 	// In-process the device's active rendering mode is the same authority, so sync from
@@ -3320,7 +3320,7 @@ black_canvas:; // force_black (minimized) jumps here, skipping all content/view 
 			xrt_display_processor_set_target_color_view(mc->session_render.display_processor,
 			                                            ct->images[buffer_index].view);
 
-			// Canvas sub-rect: a zone-3D layer (XR_EXT_display_zones, #568)
+			// Canvas sub-rect: a zone-3D layer (XR_DXR_display_zones, #568)
 			// confines its woven output to a placement rect (e.g. the avatar's
 			// bottom-75% tiger zone); the DP weaves into that band and clears
 			// outside it transparent. A plain projection layer passes 0,0,0,0

@@ -3,7 +3,7 @@
 #
 # displayxr-webxr-bridge — tiny OpenXR client that coexists with Chrome's
 # built-in WebXR session as a metadata/control sideband. Enables
-# XR_EXT_display_info and XR_MND_headless, logs display info and
+# XR_DXR_display_info and XR_MND_headless, logs display info and
 # rendering-mode events. Phase 1 of docs/roadmap/webxr-bridge-v2-plan.md.
 
 if(NOT WIN32)

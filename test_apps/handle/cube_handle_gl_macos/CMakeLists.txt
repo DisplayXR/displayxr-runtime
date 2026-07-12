@@ -70,7 +70,7 @@ add_executable(cube_handle_gl_macos
     # hud_renderer_macos / xr_window_space_hud / atlas_capture_macos come
     # from displayxr::common (#396 W4).
     # 'I' key atlas capture: filename + flash helpers (runtime-owned readback
-    # via XR_EXT_atlas_capture / xrCaptureAtlasEXT — no app-side GL readback)
+    # via XR_DXR_atlas_capture / xrCaptureAtlasDXR — no app-side GL readback)
 )
 
 target_compile_definitions(cube_handle_gl_macos PRIVATE

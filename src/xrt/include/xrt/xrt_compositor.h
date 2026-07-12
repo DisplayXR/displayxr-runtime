@@ -407,7 +407,7 @@ struct xrt_layer_window_space_data
 
 /*!
  * All the pure data values associated with a local-2D layer
- * (XR_EXT_local_3d_zone v3, #439 Phase 3).
+ * (XR_DXR_local_3d_zone v3, #439 Phase 3).
  *
  * Post-weave 2D content placed at @p rect in client-window pixels (post-DPI;
  * the same coordinate space as the zone-mask tiers — NOT window-space's
@@ -424,7 +424,7 @@ struct xrt_layer_local_2d_data
 
 /*!
  * All the pure data values associated with a 3D display zone layer
- * (XR_EXT_display_zones, ADR-027).
+ * (XR_DXR_display_zones, ADR-027).
  *
  * A zone-chained projection layer: per-view fov/pose/sub exactly as
  * @ref xrt_layer_projection_data (view_count in the parent struct), plus the
@@ -1002,7 +1002,7 @@ struct xrt_session_info
 	//! When external_window_handle != NULL, request a swapchain config eligible
 	//! for WS_EX_LAYERED + LWA_COLORKEY desktop composition (BitBlt swap effect
 	//! on Windows D3D11). Standalone-only; ignored in workspace/shell mode and
-	//! on other graphics APIs. Set via XrWin32WindowBindingCreateInfoEXT::transparentBackgroundEnabled.
+	//! on other graphics APIs. Set via XrWin32WindowBindingCreateInfoDXR::transparentBackgroundEnabled.
 	bool transparent_background_enabled;
 
 	//! Readback callback for offscreen compositing (called with composited RGBA pixels)
@@ -1015,13 +1015,13 @@ struct xrt_session_info
 	void *shared_texture_handle;
 
 	//! True when this session is a WebXR bridge relay (XR_MND_headless +
-	//! XR_EXT_display_info). The compositor uses this to detect that a
+	//! XR_DXR_display_info). The compositor uses this to detect that a
 	//! concurrent legacy session is bridge-aware and should use mode-native
 	//! tile rects instead of legacy compromise scaling.
 	bool is_bridge_relay;
 
 	//! Phase 2.I-followup: True when this session is a workspace controller
-	//! (XR_EXT_spatial_workspace enabled, no graphics binding). The
+	//! (XR_DXR_spatial_workspace enabled, no graphics binding). The
 	//! compositor skips multi-compositor slot registration so the
 	//! controller does not appear as a renderable tile in its own
 	//! workspace.
@@ -1031,7 +1031,7 @@ struct xrt_session_info
 	//! Populated server-side in ipc_handle_session_create from
 	//! ics->client_state.info.application_name; empty for in-process
 	//! sessions. The compositor uses this as a fallback for slot titles
-	//! when XR_EXT_win32_window_binding wasn't set (e.g. Chrome WebXR
+	//! when XR_DXR_win32_window_binding wasn't set (e.g. Chrome WebXR
 	//! running through the bridge) — without it those slots show as
 	//! "App N" instead of something meaningful like "Google Chrome 147".
 	char application_name[128];
@@ -1466,7 +1466,7 @@ struct xrt_compositor
 	                                   const struct xrt_layer_data *data);
 
 	/*!
-	 * Adds a local-2D layer for submission (XR_EXT_local_3d_zone v3,
+	 * Adds a local-2D layer for submission (XR_DXR_local_3d_zone v3,
 	 * #439 Phase 3). Post-weave 2D content at a client-window pixel rect,
 	 * gated by the zone mask (explicit, or implicit from layer coverage).
 	 *
@@ -1483,7 +1483,7 @@ struct xrt_compositor
 	                               const struct xrt_layer_data *data);
 
 	/*!
-	 * Adds a 3D display zone layer for submission (XR_EXT_display_zones,
+	 * Adds a 3D display zone layer for submission (XR_DXR_display_zones,
 	 * ADR-027). A projection layer bound to a client-window pixel rect:
 	 * the compositor scaled-blits each view tile into the window-spanning
 	 * atlas at the zone rect, alpha-over in layer-list order.
@@ -1552,7 +1552,7 @@ struct xrt_compositor
 	 * weave-state signal. DECOUPLED from the content/atlas mode below (ADR-028):
 	 * the two channels are orthogonal. Implemented by the server-side per-client
 	 * compositors (multi_compositor, comp_d3d11_service) so an out-of-process
-	 * (IPC) client's xrRequestDisplayRenderingModeEXT drives the DP. May be NULL
+	 * (IPC) client's xrRequestDisplayRenderingModeDXR drives the DP. May be NULL
 	 * (in-process native compositors drive their DP directly; null compositor).
 	 *
 	 * @param xc         Self pointer
@@ -2726,7 +2726,7 @@ struct xrt_system_compositor_info
 	//! Worst-case atlas height across all rendering modes. 0 if unknown.
 	uint32_t atlas_height_pixels;
 
-	//! True when a legacy app (no XR_EXT_display_info) is using a compromise
+	//! True when a legacy app (no XR_DXR_display_info) is using a compromise
 	//! view scale that doesn't match the 3D mode's native scale. The compositor
 	//! must scale tiles before passing to the display processor.
 	bool legacy_app_tile_scaling;
@@ -2814,7 +2814,7 @@ struct xrt_system_compositor_info
 struct xrt_system_compositor;
 
 /*!
- * XR_EXT_view_rig (#396 W7): kind of view rig, for the workspace controller
+ * XR_DXR_view_rig (#396 W7): kind of view rig, for the workspace controller
  * override carried over the @ref xrt_system_compositor vtable. Mirrors the
  * oxr-side `enum oxr_view_rig_type` and the IPC `IPC_VIEW_RIG_*` wire enum.
  */
@@ -2826,7 +2826,7 @@ enum xrt_view_rig_type
 };
 
 /*!
- * XR_EXT_view_rig (#396 W7): a view-rig descriptor at the xrt boundary —
+ * XR_DXR_view_rig (#396 W7): a view-rig descriptor at the xrt boundary —
  * post-clamp, post-boundary-conversion (convergenceDiopters →
  * inv_convergence_distance, verticalFov → half_tan_vfov), i.e. exactly the
  * shape the shared view math consumes. Used by the workspace controller to
@@ -2974,7 +2974,7 @@ struct xrt_system_compositor
 	bool (*request_workspace_mode_flip)(struct xrt_system_compositor *xsc, uint32_t mode_index);
 
 	/*!
-	 * Optional. XR_EXT_view_rig (#396 W7): workspace controller's request to
+	 * Optional. XR_DXR_view_rig (#396 W7): workspace controller's request to
 	 * impose a view rig on its app clients. By default an app's own rig is
 	 * honored within its canvas; this hook lets the controller take over view
 	 * geometry server-side (the override substitutes for the app's forwarded

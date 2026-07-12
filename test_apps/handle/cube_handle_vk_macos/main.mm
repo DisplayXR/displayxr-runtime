@@ -4,17 +4,17 @@
  * @file
  * @brief  macOS Vulkan OpenXR spinning cube with external window binding
  *
- * Demonstrates XR_EXT_cocoa_window_binding: the app creates its own
+ * Demonstrates XR_DXR_cocoa_window_binding: the app creates its own
  * NSWindow + MetalView (with CAMetalLayer) and passes the NSView to
  * the runtime via the extension. The runtime renders into the app's
  * window instead of creating its own.
  *
  * Features:
- * - App creates and owns the NSWindow (XR_EXT_cocoa_window_binding)
+ * - App creates and owns the NSWindow (XR_DXR_cocoa_window_binding)
  * - Mouse drag camera, WASD/QE movement, scroll zoom
- * - XR_EXT_display_info: Kooima projection, display metrics
- * - 2D/3D toggle (V key) via xrRequestDisplayModeEXT
- * - 1/2/3 keys for rendering modes (SBS/anaglyph/blend) via xrRequestDisplayRenderingModeEXT
+ * - XR_DXR_display_info: Kooima projection, display metrics
+ * - 2D/3D toggle (V key) via xrRequestDisplayModeDXR
+ * - 1/2/3 keys for rendering modes (SBS/anaglyph/blend) via xrRequestDisplayRenderingModeDXR
  * - Tab: toggle HUD overlay, Space: reset camera, ESC: quit
  */
 
@@ -26,11 +26,11 @@
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-#include <openxr/XR_EXT_cocoa_window_binding.h>
-#include <openxr/XR_EXT_display_info.h>
-#include <openxr/XR_EXT_atlas_capture.h>
-#include <openxr/XR_EXT_view_rig.h>
-#include <openxr/XR_EXT_spatial_workspace.h>
+#include <openxr/XR_DXR_cocoa_window_binding.h>
+#include <openxr/XR_DXR_display_info.h>
+#include <openxr/XR_DXR_atlas_capture.h>
+#include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_spatial_workspace.h>
 
 #include <cmath>
 #include <csignal>
@@ -107,7 +107,7 @@ struct InputState {
 
     // Rendering mode REQUESTS — single source of truth lives on the runtime
     // side (read back as xr.currentModeIndex after the runtime's
-    // XrEventDataRenderingModeChangedEXT lands). Keys emit transient requests;
+    // XrEventDataRenderingModeChangedDXR lands). Keys emit transient requests;
     // the actual current mode is never mirrored here.
     uint32_t renderingModeCount = 0;             // mirror of xr.renderingModeCount for keypress bounds
     bool cycleRenderingModeRequested = false;    // V key
@@ -1462,7 +1462,7 @@ static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
 
     // Transparent-background mode (DISPLAYXR_TRANSPARENT_BG=1) clears RGBA(0,0,0,0)
     // so the desktop shows through everywhere the cube isn't drawn. Pairs with
-    // XrCocoaWindowBindingCreateInfoEXT.transparentBackgroundEnabled = XR_TRUE.
+    // XrCocoaWindowBindingCreateInfoDXR.transparentBackgroundEnabled = XR_TRUE.
     static const bool transparent_bg = []() {
         const char *e = getenv("DISPLAYXR_TRANSPARENT_BG");
         return e != nullptr && *e != '\0' && *e != '0';
@@ -1723,7 +1723,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLef
 
         // INV-1.3: open on the 3D panel (#715). (screenLeft, screenTop) is the
         // panel top-left in top-down global coordinates (origin = primary
-        // top-left, XrDisplayDesktopPositionEXT); flip into AppKit's bottom-up
+        // top-left, XrDisplayDesktopPositionDXR); flip into AppKit's bottom-up
         // space. (0,0) = primary — the titled window is auto-constrained below
         // the menu bar, so it is always a safe create position.
         NSRect frame = NSMakeRect(100, 100, width, height);
@@ -1784,7 +1784,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLef
 
 // Apply a scroll-wheel tick to the view params. Shared by the in-process NSEvent
 // path and the OOP forwarded-input path (#48). mods bits: 0=SHIFT, 1=CTRL, 2=ALT
-// (the XR_EXT_spatial_workspace wire convention).
+// (the XR_DXR_spatial_workspace wire convention).
 static void ApplyScrollFactor(float dy, uint32_t mods) {
     float factor = (dy > 0) ? 1.1f : (1.0f / 1.1f);
     bool shift = (mods & (1u << 0)) != 0;
@@ -2028,11 +2028,11 @@ struct AppXrSession {
     bool exitRequested = false;
     bool hasCocoaWindowBinding = false;
 
-    // XR_EXT_display_info
+    // XR_DXR_display_info
     bool hasDisplayInfoExt = false;
     float recommendedViewScaleX = 1.0f;
     float recommendedViewScaleY = 1.0f;
-    // v16 XrDisplayDesktopPositionEXT — 3D panel top-left in virtual-desktop
+    // v16 XrDisplayDesktopPositionDXR — 3D panel top-left in virtual-desktop
     // pixels (top-down, origin = primary top-left); (0,0) = primary/unknown.
     int32_t displayScreenLeft = 0;
     int32_t displayScreenTop = 0;
@@ -2041,20 +2041,20 @@ struct AppXrSession {
     float nominalViewerX = 0.0f;
     float nominalViewerY = 0.0f;
     float nominalViewerZ = 0.5f;
-    PFN_xrRequestDisplayModeEXT pfnRequestDisplayModeEXT = nullptr;
-    PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingModeEXT = nullptr;
-    PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT = nullptr;
+    PFN_xrRequestDisplayModeDXR pfnRequestDisplayModeEXT = nullptr;
+    PFN_xrRequestDisplayRenderingModeDXR pfnRequestDisplayRenderingModeEXT = nullptr;
+    PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateDisplayRenderingModesEXT = nullptr;
 
-    // XR_EXT_atlas_capture (W6 of #396): runtime-owned 'I'-key atlas capture.
+    // XR_DXR_atlas_capture (W6 of #396): runtime-owned 'I'-key atlas capture.
     bool hasAtlasCaptureExt = false;
-    bool hasViewRigExt = false;  // XR_EXT_view_rig (#396 W7)
-    PFN_xrCaptureAtlasEXT pfnCaptureAtlasEXT = nullptr;
+    bool hasViewRigExt = false;  // XR_DXR_view_rig (#396 W7)
+    PFN_xrCaptureAtlasDXR pfnCaptureAtlasEXT = nullptr;
 
-    // XR_EXT_spatial_workspace (#48): when running OOP via the service, the
+    // XR_DXR_spatial_workspace (#48): when running OOP via the service, the
     // service window owns keyboard/mouse focus, so the app polls forwarded input
     // events here instead of its own (unfocused) NSWindow.
     bool hasSpatialWorkspaceExt = false;
-    PFN_xrEnumerateWorkspaceInputEventsEXT pfnEnumerateWorkspaceInputEventsEXT = nullptr;
+    PFN_xrEnumerateWorkspaceInputEventsDXR pfnEnumerateWorkspaceInputEventsEXT = nullptr;
     // Enumerated rendering mode info. currentModeIndex is initialized to mode 1
     // as a fallback for runtimes that don't expose isActive; v13+ runtimes
     // replace it via the enumerate step (initial-mode-sync, #234/#239).
@@ -2069,12 +2069,12 @@ struct AppXrSession {
     bool renderingModeDisplay3D[8] = {};
     bool renderingModeIsRequestable[8] = {};  // v13: false when workspace-locked
 
-    // Eye tracking mode control (XR_EXT_display_info v6)
+    // Eye tracking mode control (XR_DXR_display_info v6)
     uint32_t supportedEyeTrackingModes = 0;
     uint32_t defaultEyeTrackingMode = 0;
     bool isEyeTracking = false;
     uint32_t activeEyeTrackingMode = 0;
-    PFN_xrRequestEyeTrackingModeEXT pfnRequestEyeTrackingModeEXT = nullptr;
+    PFN_xrRequestEyeTrackingModeDXR pfnRequestEyeTrackingModeEXT = nullptr;
 
     // Eye tracking data for HUD
     uint32_t eyeCount = 2;
@@ -2097,19 +2097,19 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     bool hasVulkan = false;
     for (const auto& ext : extensions) {
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
-        if (strcmp(ext.extensionName, XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME) == 0) {
             xr.hasCocoaWindowBinding = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) {
             xr.hasDisplayInfoExt = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0) {
             xr.hasAtlasCaptureExt = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
             xr.hasViewRigExt = true;
         }
-        if (strcmp(ext.extensionName, XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_DXR_SPATIAL_WORKSPACE_EXTENSION_NAME) == 0) {
             xr.hasSpatialWorkspaceExt = true;
         }
     }
@@ -2119,30 +2119,30 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         return false;
     }
 
-    LOG_INFO("XR_EXT_cocoa_window_binding: %s", xr.hasCocoaWindowBinding ? "available" : "not available");
-    LOG_INFO("XR_EXT_display_info: %s", xr.hasDisplayInfoExt ? "available" : "not available");
-    LOG_INFO("XR_EXT_atlas_capture: %s", xr.hasAtlasCaptureExt ? "available" : "not available");
-    LOG_INFO("XR_EXT_view_rig: %s", xr.hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_cocoa_window_binding: %s", xr.hasCocoaWindowBinding ? "available" : "not available");
+    LOG_INFO("XR_DXR_display_info: %s", xr.hasDisplayInfoExt ? "available" : "not available");
+    LOG_INFO("XR_DXR_atlas_capture: %s", xr.hasAtlasCaptureExt ? "available" : "not available");
+    LOG_INFO("XR_DXR_view_rig: %s", xr.hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
 
     // Build extension list
     std::vector<const char*> enabledExtensions;
     enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
     if (xr.hasCocoaWindowBinding) {
-        enabledExtensions.push_back(XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME);
     }
     if (xr.hasDisplayInfoExt) {
-        enabledExtensions.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
     }
     if (xr.hasAtlasCaptureExt) {
-        enabledExtensions.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME);
     }
     if (xr.hasViewRigExt) {
-        enabledExtensions.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
     }
     if (xr.hasSpatialWorkspaceExt) {
-        enabledExtensions.push_back(XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME);
+        enabledExtensions.push_back(XR_DXR_SPATIAL_WORKSPACE_EXTENSION_NAME);
     }
-    LOG_INFO("XR_EXT_spatial_workspace: %s", xr.hasSpatialWorkspaceExt ? "available" : "not available");
+    LOG_INFO("XR_DXR_spatial_workspace: %s", xr.hasSpatialWorkspaceExt ? "available" : "not available");
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(createInfo.applicationInfo.applicationName, "SimCubeExtMacOS", XR_MAX_APPLICATION_NAME_SIZE);
@@ -2168,17 +2168,17 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         }
     }
 
-    // Query display info via XR_EXT_display_info
+    // Query display info via XR_DXR_display_info
     if (xr.hasDisplayInfoExt) {
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
-        XrDisplayInfoEXT displayInfo = {};
-        displayInfo.type = XR_TYPE_DISPLAY_INFO_EXT;
-        XrEyeTrackingModeCapabilitiesEXT eyeCaps = {};
-        eyeCaps.type = (XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT;
+        XrDisplayInfoDXR displayInfo = {};
+        displayInfo.type = XR_TYPE_DISPLAY_INFO_DXR;
+        XrEyeTrackingModeCapabilitiesDXR eyeCaps = {};
+        eyeCaps.type = (XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR;
         // INV-1.3: panel desktop position, so the window opens on the 3D panel
         // instead of the primary monitor (spec v16, #715). Chained at the tail.
-        XrDisplayDesktopPositionEXT desktopPos = {};
-        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT;
+        XrDisplayDesktopPositionDXR desktopPos = {};
+        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
         displayInfo.next = &eyeCaps;
         eyeCaps.next = &desktopPos;
         sysProps.next = &displayInfo;
@@ -2207,31 +2207,31 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         }
 
         // Load display extension function pointers
-        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeDXR",
             (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
-        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR",
             (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
-        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesDXR",
             (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
 
-        // XR_EXT_atlas_capture (W6 of #396): resolve the runtime-owned capture entry.
+        // XR_DXR_atlas_capture (W6 of #396): resolve the runtime-owned capture entry.
         if (xr.hasAtlasCaptureExt) {
-            xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasEXT",
+            xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasDXR",
                 (PFN_xrVoidFunction*)&xr.pfnCaptureAtlasEXT);
-            LOG_INFO("xrCaptureAtlasEXT: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
+            LOG_INFO("xrCaptureAtlasDXR: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
         }
 
-        // XR_EXT_spatial_workspace (#48): forwarded keyboard/mouse for the OOP route.
+        // XR_DXR_spatial_workspace (#48): forwarded keyboard/mouse for the OOP route.
         if (xr.hasSpatialWorkspaceExt) {
-            xrGetInstanceProcAddr(xr.instance, "xrEnumerateWorkspaceInputEventsEXT",
+            xrGetInstanceProcAddr(xr.instance, "xrEnumerateWorkspaceInputEventsDXR",
                 (PFN_xrVoidFunction*)&xr.pfnEnumerateWorkspaceInputEventsEXT);
-            LOG_INFO("xrEnumerateWorkspaceInputEventsEXT: %s",
+            LOG_INFO("xrEnumerateWorkspaceInputEventsDXR: %s",
                 xr.pfnEnumerateWorkspaceInputEventsEXT ? "resolved" : "NULL");
         }
 
         // Load eye tracking mode request function pointer
         if (xr.supportedEyeTrackingModes != 0) {
-            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeEXT",
+            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeDXR",
                 (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingModeEXT);
         }
     }
@@ -2436,7 +2436,7 @@ static bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamily
 
 /*!
  * Create OpenXR session WITH the cocoa_window_binding extension.
- * Chains XrCocoaWindowBindingCreateInfoEXT into session create info.
+ * Chains XrCocoaWindowBindingCreateInfoDXR into session create info.
  */
 static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDevice physDevice,
     VkDevice device, uint32_t queueFamilyIndex)
@@ -2451,8 +2451,8 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     vkBinding.queueIndex = 0;
 
     // Chain the macOS window binding extension — pass our NSView to the runtime
-    XrCocoaWindowBindingCreateInfoEXT macosBinding = {};
-    macosBinding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT;
+    XrCocoaWindowBindingCreateInfoDXR macosBinding = {};
+    macosBinding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR;
     macosBinding.next = nullptr;
     macosBinding.viewHandle = (__bridge void *)g_metalView;
 
@@ -2475,7 +2475,7 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     // Chain: sessionInfo -> vkBinding -> macosBinding
     if (xr.hasCocoaWindowBinding) {
         vkBinding.next = &macosBinding;
-        LOG_INFO("Chaining XR_EXT_cocoa_window_binding with NSView %p", macosBinding.viewHandle);
+        LOG_INFO("Chaining XR_DXR_cocoa_window_binding with NSView %p", macosBinding.viewHandle);
     }
 
     XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
@@ -2490,9 +2490,9 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
         uint32_t modeCount = 0;
         XrResult enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, 0, &modeCount, nullptr);
         if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
-            std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
+            std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
             for (uint32_t i = 0; i < modeCount; i++) {
-                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
                 modes[i].next = nullptr;
             }
             enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, modeCount, &modeCount, modes.data());
@@ -2618,17 +2618,17 @@ static bool PollEvents(AppXrSession& xr) {
             }
             break;
         }
-        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT: {
-            auto* modeEvent = (XrEventDataRenderingModeChangedEXT*)&event;
+        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
+            auto* modeEvent = (XrEventDataRenderingModeChangedDXR*)&event;
             LOG_INFO("Rendering mode changed: %u -> %u",
                 modeEvent->previousModeIndex, modeEvent->currentModeIndex);
             xr.currentModeIndex = modeEvent->currentModeIndex;
             break;
         }
-        case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT: {
+        case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR: {
             // Edge-triggered tracking loss/recovery (#441 v14); HUD state
-            // also refreshes per-frame from the XrViewEyeTrackingStateEXT chain.
-            auto* etEvent = (XrEventDataEyeTrackingStateChangedEXT*)&event;
+            // also refreshes per-frame from the XrViewEyeTrackingStateDXR chain.
+            auto* etEvent = (XrEventDataEyeTrackingStateChangedDXR*)&event;
             LOG_INFO("Eye tracking state changed: isTracking=%s mode=%u",
                 etEvent->isTracking == XR_TRUE ? "YES" : "NO",
                 (uint32_t)etEvent->activeMode);
@@ -2858,7 +2858,7 @@ static void SignalHandler(int sig) {
 
 // Poll keyboard/mouse forwarded by the service over IPC (#48). When the app runs
 // OOP, the service window owns input focus, so the app's own NSWindow gets no
-// events — these arrive via XR_EXT_spatial_workspace instead and drive the SAME
+// events — these arrive via XR_DXR_spatial_workspace instead and drive the SAME
 // g_input state the in-process NSEvent path does. No-op in-process (the enumerate
 // call requires an IPC-mode session and returns an error otherwise).
 static void PollForwardedInput(AppXrSession& xr) {
@@ -2868,7 +2868,7 @@ static void PollForwardedInput(AppXrSession& xr) {
     // Drag origin for left-button camera rotation; INT32_MIN = not dragging.
     static int32_t lastDragX = INT32_MIN, lastDragY = INT32_MIN;
 
-    XrWorkspaceInputEventEXT events[16];
+    XrWorkspaceInputEventDXR events[16];
     uint32_t count = 0;
     XrResult r = xr.pfnEnumerateWorkspaceInputEventsEXT(xr.session, 16, &count, events);
     if (XR_FAILED(r)) {
@@ -2890,13 +2890,13 @@ static void PollForwardedInput(AppXrSession& xr) {
         }
     }
     for (uint32_t i = 0; i < count; i++) {
-        const XrWorkspaceInputEventEXT& e = events[i];
+        const XrWorkspaceInputEventDXR& e = events[i];
         switch (e.eventType) {
-        case XR_WORKSPACE_INPUT_EVENT_KEY_EXT:
+        case XR_WORKSPACE_INPUT_EVENT_KEY_DXR:
             // Producer encodes the lowercased Unicode character in vkCode.
             ApplyCharKey((unichar)e.key.vkCode, e.key.isDown != 0, false);
             break;
-        case XR_WORKSPACE_INPUT_EVENT_POINTER_MOTION_EXT: {
+        case XR_WORKSPACE_INPUT_EVENT_POINTER_MOTION_DXR: {
             bool leftHeld = (e.pointerMotion.buttonMask & 1u) != 0;
             int32_t cx = e.pointerMotion.cursorX, cy = e.pointerMotion.cursorY;
             if (leftHeld) {
@@ -2918,12 +2918,12 @@ static void PollForwardedInput(AppXrSession& xr) {
             }
             break;
         }
-        case XR_WORKSPACE_INPUT_EVENT_POINTER_EXT:
+        case XR_WORKSPACE_INPUT_EVENT_POINTER_DXR:
             if (e.pointer.button == 1 && e.pointer.isDown == 0) {
                 lastDragX = INT32_MIN; // left mouse up ends the drag
             }
             break;
-        case XR_WORKSPACE_INPUT_EVENT_SCROLL_EXT:
+        case XR_WORKSPACE_INPUT_EVENT_SCROLL_DXR:
             ApplyScrollFactor(e.scroll.deltaY, e.scroll.modifiers);
             break;
         default: break;
@@ -2942,7 +2942,7 @@ int main() {
     LOG_INFO("=== Sim Cube OpenXR + External macOS Window ===");
 
     // Initial rendering mode is sourced from the runtime via v13 `isActive`
-    // (set during xrEnumerateDisplayRenderingModesEXT). Fallback is mode 1
+    // (set during xrEnumerateDisplayRenderingModesDXR). Fallback is mode 1
     // (default of xr.currentModeIndex).
 
     // Step 1: Initialize OpenXR FIRST — xrGetSystemProperties needs only
@@ -3108,15 +3108,15 @@ int main() {
     // controller; this is the runtime-side verification vehicle.
     XrSwapchain chromeSwapchain = XR_NULL_HANDLE;
     if (xr.hasSpatialWorkspaceExt && getenv("DXR_WORKSPACE_CHROME") != nullptr) {
-        PFN_xrActivateSpatialWorkspaceEXT pfnActivate = nullptr;
-        PFN_xrEnumerateWorkspaceClientsEXT pfnEnumClients = nullptr;
-        PFN_xrCreateWorkspaceClientChromeSwapchainEXT pfnCreateChrome = nullptr;
-        PFN_xrSetWorkspaceClientChromeLayoutEXT pfnSetLayout = nullptr;
-        xrGetInstanceProcAddr(xr.instance, "xrActivateSpatialWorkspaceEXT", (PFN_xrVoidFunction*)&pfnActivate);
-        xrGetInstanceProcAddr(xr.instance, "xrEnumerateWorkspaceClientsEXT", (PFN_xrVoidFunction*)&pfnEnumClients);
-        xrGetInstanceProcAddr(xr.instance, "xrCreateWorkspaceClientChromeSwapchainEXT",
+        PFN_xrActivateSpatialWorkspaceDXR pfnActivate = nullptr;
+        PFN_xrEnumerateWorkspaceClientsDXR pfnEnumClients = nullptr;
+        PFN_xrCreateWorkspaceClientChromeSwapchainDXR pfnCreateChrome = nullptr;
+        PFN_xrSetWorkspaceClientChromeLayoutDXR pfnSetLayout = nullptr;
+        xrGetInstanceProcAddr(xr.instance, "xrActivateSpatialWorkspaceDXR", (PFN_xrVoidFunction*)&pfnActivate);
+        xrGetInstanceProcAddr(xr.instance, "xrEnumerateWorkspaceClientsDXR", (PFN_xrVoidFunction*)&pfnEnumClients);
+        xrGetInstanceProcAddr(xr.instance, "xrCreateWorkspaceClientChromeSwapchainDXR",
             (PFN_xrVoidFunction*)&pfnCreateChrome);
-        xrGetInstanceProcAddr(xr.instance, "xrSetWorkspaceClientChromeLayoutEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrSetWorkspaceClientChromeLayoutDXR",
             (PFN_xrVoidFunction*)&pfnSetLayout);
 
         if (pfnActivate && pfnEnumClients && pfnCreateChrome && pfnSetLayout) {
@@ -3136,7 +3136,7 @@ int main() {
             LOG_INFO("[chrome-test] self client id=%llu (count=%u)", (unsigned long long)selfId, cc);
 
             const uint32_t CW = 512, CH = 64;
-            XrWorkspaceChromeSwapchainCreateInfoEXT cci = {XR_TYPE_WORKSPACE_CHROME_SWAPCHAIN_CREATE_INFO_EXT};
+            XrWorkspaceChromeSwapchainCreateInfoDXR cci = {XR_TYPE_WORKSPACE_CHROME_SWAPCHAIN_CREATE_INFO_DXR};
             cci.format = (int64_t)VK_FORMAT_R8G8B8A8_UNORM;
             cci.width = CW;
             cci.height = CH;
@@ -3165,7 +3165,7 @@ int main() {
                 }
 
                 // A title bar glued to the window's top edge, 80% width.
-                XrWorkspaceChromeLayoutEXT lay = {XR_TYPE_WORKSPACE_CHROME_LAYOUT_EXT};
+                XrWorkspaceChromeLayoutDXR lay = {XR_TYPE_WORKSPACE_CHROME_LAYOUT_DXR};
                 lay.poseInClient.orientation.w = 1.0f;
                 lay.poseInClient.position.x = 0.0f;
                 lay.poseInClient.position.y = -0.02f; // 2 cm below the top edge
@@ -3180,19 +3180,19 @@ int main() {
             }
 
             // --- Phase 2: session-global overlay (green bar, bottom-center) + cursor (magenta) ---
-            PFN_xrCreateWorkspaceOverlaySwapchainEXT pfnCreateOverlay = nullptr;
-            PFN_xrSetWorkspaceOverlayEXT pfnSetOverlay = nullptr;
-            PFN_xrCreateWorkspaceCursorSwapchainEXT pfnCreateCursor = nullptr;
-            PFN_xrSetWorkspaceCursorEXT pfnSetCursor = nullptr;
-            xrGetInstanceProcAddr(xr.instance, "xrCreateWorkspaceOverlaySwapchainEXT",
+            PFN_xrCreateWorkspaceOverlaySwapchainDXR pfnCreateOverlay = nullptr;
+            PFN_xrSetWorkspaceOverlayDXR pfnSetOverlay = nullptr;
+            PFN_xrCreateWorkspaceCursorSwapchainDXR pfnCreateCursor = nullptr;
+            PFN_xrSetWorkspaceCursorDXR pfnSetCursor = nullptr;
+            xrGetInstanceProcAddr(xr.instance, "xrCreateWorkspaceOverlaySwapchainDXR",
                 (PFN_xrVoidFunction*)&pfnCreateOverlay);
-            xrGetInstanceProcAddr(xr.instance, "xrSetWorkspaceOverlayEXT", (PFN_xrVoidFunction*)&pfnSetOverlay);
-            xrGetInstanceProcAddr(xr.instance, "xrCreateWorkspaceCursorSwapchainEXT",
+            xrGetInstanceProcAddr(xr.instance, "xrSetWorkspaceOverlayDXR", (PFN_xrVoidFunction*)&pfnSetOverlay);
+            xrGetInstanceProcAddr(xr.instance, "xrCreateWorkspaceCursorSwapchainDXR",
                 (PFN_xrVoidFunction*)&pfnCreateCursor);
-            xrGetInstanceProcAddr(xr.instance, "xrSetWorkspaceCursorEXT", (PFN_xrVoidFunction*)&pfnSetCursor);
+            xrGetInstanceProcAddr(xr.instance, "xrSetWorkspaceCursorDXR", (PFN_xrVoidFunction*)&pfnSetCursor);
 
             if (pfnCreateOverlay && pfnSetOverlay) {
-                XrWorkspaceOverlaySwapchainCreateInfoEXT oci = {XR_TYPE_WORKSPACE_OVERLAY_SWAPCHAIN_CREATE_INFO_EXT};
+                XrWorkspaceOverlaySwapchainCreateInfoDXR oci = {XR_TYPE_WORKSPACE_OVERLAY_SWAPCHAIN_CREATE_INFO_DXR};
                 oci.format = (int64_t)VK_FORMAT_R8G8B8A8_UNORM;
                 oci.width = 256; oci.height = 48; oci.sampleCount = 1; oci.mipCount = 1;
                 XrSwapchain ovSc = XR_NULL_HANDLE;
@@ -3201,7 +3201,7 @@ int main() {
                 if (XR_SUCCEEDED(ocr) && ovSc != XR_NULL_HANDLE) {
                     FillWorkspaceSwapchain(ovSc, vkDevice, graphicsQueue, vkRenderer.commandPool,
                         0.10f, 0.80f, 0.30f, 0.90f); // green
-                    XrWorkspaceOverlayInfoEXT oin = {XR_TYPE_WORKSPACE_OVERLAY_INFO_EXT};
+                    XrWorkspaceOverlayInfoDXR oin = {XR_TYPE_WORKSPACE_OVERLAY_INFO_DXR};
                     oin.swapchain = ovSc;
                     oin.anchor = {0.5f, 0.95f};   // bottom-center of display
                     oin.pivot = {0.5f, 1.0f};     // sprite bottom-center on the anchor
@@ -3212,7 +3212,7 @@ int main() {
                 }
             }
             if (pfnCreateCursor && pfnSetCursor) {
-                XrWorkspaceCursorSwapchainCreateInfoEXT cci2 = {XR_TYPE_WORKSPACE_CURSOR_SWAPCHAIN_CREATE_INFO_EXT};
+                XrWorkspaceCursorSwapchainCreateInfoDXR cci2 = {XR_TYPE_WORKSPACE_CURSOR_SWAPCHAIN_CREATE_INFO_DXR};
                 cci2.format = (int64_t)VK_FORMAT_R8G8B8A8_UNORM;
                 cci2.width = 32; cci2.height = 32; cci2.sampleCount = 1; cci2.mipCount = 1;
                 XrSwapchain curSc = XR_NULL_HANDLE;
@@ -3221,7 +3221,7 @@ int main() {
                 if (XR_SUCCEEDED(ccr) && curSc != XR_NULL_HANDLE) {
                     FillWorkspaceSwapchain(curSc, vkDevice, graphicsQueue, vkRenderer.commandPool,
                         0.95f, 0.10f, 0.85f, 0.95f); // magenta
-                    XrWorkspaceCursorInfoEXT cin = {XR_TYPE_WORKSPACE_CURSOR_INFO_EXT};
+                    XrWorkspaceCursorInfoDXR cin = {XR_TYPE_WORKSPACE_CURSOR_INFO_DXR};
                     cin.swapchain = curSc;
                     cin.hotSpot = {0.0f, 0.0f}; // top-left hot point
                     cin.sizeMeters = 0.012f;
@@ -3280,8 +3280,8 @@ int main() {
 
         // Rendering mode requests (V=cycle next, 0-8=jump absolute) through the
         // dxr::ModeSwitch sequencer: it eases g_input.viewParams.ipdFactor around
-        // the switch and fires xrRequestDisplayRenderingModeEXT on the right frame.
-        // The runtime owns the current mode; the XrEventDataRenderingModeChangedEXT
+        // the switch and fires xrRequestDisplayRenderingModeDXR on the right frame.
+        // The runtime owns the current mode; the XrEventDataRenderingModeChangedDXR
         // event updates xr.currentModeIndex (render paths + HUD read it directly).
         if (!g_modeSwitchConfigured) {
             g_modeSwitch.configure(0.18f, dxr::ModeSwitchEasing::SmoothStep);
@@ -3326,11 +3326,11 @@ int main() {
         if (g_input.eyeTrackingModeToggleRequested) {
             g_input.eyeTrackingModeToggleRequested = false;
             if (xr.pfnRequestEyeTrackingModeEXT && xr.session != XR_NULL_HANDLE) {
-                XrEyeTrackingModeEXT newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_EXT)
-                    ? XR_EYE_TRACKING_MODE_MANUAL_EXT : XR_EYE_TRACKING_MODE_MANAGED_EXT;
+                XrEyeTrackingModeDXR newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_DXR)
+                    ? XR_EYE_TRACKING_MODE_MANUAL_DXR : XR_EYE_TRACKING_MODE_MANAGED_DXR;
                 XrResult etResult = xr.pfnRequestEyeTrackingModeEXT(xr.session, newMode);
                 LOG_INFO("Eye tracking mode -> %s (%s)",
-                    newMode == XR_EYE_TRACKING_MODE_MANUAL_EXT ? "MANUAL" : "MANAGED",
+                    newMode == XR_EYE_TRACKING_MODE_MANUAL_DXR ? "MANUAL" : "MANAGED",
                     XR_SUCCEEDED(etResult) ? "OK" : "unsupported");
             }
         }
@@ -3365,11 +3365,11 @@ int main() {
                     XrViewState viewState = {XR_TYPE_VIEW_STATE};
 
                     // Chain eye tracking state (v6)
-                    XrViewEyeTrackingStateEXT eyeTrackingState = {};
-                    eyeTrackingState.type = (XrStructureType)XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT;
+                    XrViewEyeTrackingStateDXR eyeTrackingState = {};
+                    eyeTrackingState.type = (XrStructureType)XR_TYPE_VIEW_EYE_TRACKING_STATE_DXR;
                     viewState.next = &eyeTrackingState;
 
-                    // XR_EXT_view_rig (#396 W7): drive the runtime rig matching
+                    // XR_DXR_view_rig (#396 W7): drive the runtime rig matching
                     // the app's current mode (C selects the rig) with the app's
                     // tunables — the runtime owns the window resolve and the
                     // Kooima math, and returns render-ready XrView{pose, fov}.
@@ -3379,9 +3379,9 @@ int main() {
                     const bool useRig =
                         xr.hasViewRigExt && xr.displayWidthM > 0 && xr.displayHeightM > 0;
                     const bool rigCamera = useRig && g_input.cameraMode;
-                    XrCameraRigEXT cameraRig = {XR_TYPE_CAMERA_RIG_EXT};
-                    XrDisplayRigEXT displayRig = {XR_TYPE_DISPLAY_RIG_EXT};
-                    XrViewDisplayRawEXT viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+                    XrCameraRigDXR cameraRig = {XR_TYPE_CAMERA_RIG_DXR};
+                    XrDisplayRigDXR displayRig = {XR_TYPE_DISPLAY_RIG_DXR};
+                    XrViewDisplayRawDXR viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
                     XrPosef rigPose = {{0, 0, 0, 1}, {0, 0, 0}};
                     if (useRig) {
                         quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &rigPose.orientation);
@@ -3430,7 +3430,7 @@ int main() {
                     {
                         // Save display-space eye positions for the HUD. Under
                         // the rig, views[] carries render-ready world eyes —
-                        // the raw channel (XrViewDisplayRawEXT) keeps the HUD
+                        // the raw channel (XrViewDisplayRawDXR) keeps the HUD
                         // readout in display space.
                         xr.eyeCount = modeViewCount;
                         if (useRig && viewRigRaw.eyeCountOutput > 0) {
@@ -3532,7 +3532,7 @@ int main() {
                             RenderScene(vkRenderer, imageIndex, eyeParams.data(), eyeCount);
 
                             // 'I' key: snapshot the multi-view atlas via the
-                            // runtime-owned XR_EXT_atlas_capture (W6 of #396) —
+                            // runtime-owned XR_DXR_atlas_capture (W6 of #396) —
                             // the runtime does the readback from its own atlas
                             // image, so the app keeps no staging texture.
                             // PROJECTION_ONLY = the app's own projection atlas,
@@ -3544,25 +3544,25 @@ int main() {
                                     if (display3D && (tileColumns > 1 || tileRows > 1)) {
                                         std::string prefix = dxr_capture::MakeCaptureAtlasPrefix(
                                             "cube_handle_vk_macos", tileColumns, tileRows);
-                                        XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
+                                        XrAtlasCaptureInfoDXR info = {XR_TYPE_ATLAS_CAPTURE_INFO_DXR};
                                         info.next = nullptr;
-                                        info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT;
+                                        info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_DXR;
                                         strncpy(info.pathPrefix, prefix.c_str(),
-                                                XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1);
-                                        info.pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1] = '\0';
+                                                XR_ATLAS_CAPTURE_PATH_MAX_DXR - 1);
+                                        info.pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_DXR - 1] = '\0';
                                         XrResult cr = xr.pfnCaptureAtlasEXT(xr.session, &info, nullptr);
                                         if (XR_SUCCEEDED(cr)) {
                                             LOG_INFO("Atlas capture requested -> %s_atlas_%u_%ux%u.png",
                                                      prefix.c_str(), tileColumns * tileRows, tileColumns, tileRows);
                                             dxr_capture::TriggerCaptureFlash((__bridge void*)g_metalView);
                                         } else {
-                                            LOG_WARN("xrCaptureAtlasEXT failed: 0x%x", (unsigned)cr);
+                                            LOG_WARN("xrCaptureAtlasDXR failed: 0x%x", (unsigned)cr);
                                         }
                                     } else {
                                         LOG_WARN("Capture skipped: need 3D mode with cols/rows > 1");
                                     }
                                 } else {
-                                    LOG_WARN("Atlas capture unavailable: XR_EXT_atlas_capture not active");
+                                    LOG_WARN("Atlas capture unavailable: XR_DXR_atlas_capture not active");
                                 }
                             }
                             ReleaseSwapchainImage(xr);
@@ -3654,7 +3654,7 @@ int main() {
             const char *kooimaMode = g_input.cameraMode
                 ? "Camera-Centric [C=Toggle]" : "Display-Centric [C=Toggle]";
             snprintf(buf, sizeof(buf),
-                "XR_EXT_cocoa_window_binding: %s (Vulkan)\nMode: %s (%s)%s\nKooima: %s",
+                "XR_DXR_cocoa_window_binding: %s (Vulkan)\nMode: %s (%s)%s\nKooima: %s",
                 xr.hasCocoaWindowBinding ? "ACTIVE" : "NOT AVAILABLE",
                 outputModeName, display3D ? "3D" : "2D", lockSuffix, kooimaMode);
             g_hudModeText = utf8ToW(buf);

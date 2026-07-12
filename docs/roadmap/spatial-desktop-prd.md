@@ -152,7 +152,7 @@ The platform is designed so that **no SDK is required for basic spatial app supp
 
 | Level | What the developer does | What they get | SDK required? |
 |-------|------------------------|---------------|---------------|
-| **0 — Universal app** | Write a normal OpenXR handle app (`XR_EXT_win32_window_binding` + `XR_EXT_display_info`, own Kooima projection). No shell awareness. | App works standalone AND in the shell with zero code changes. Same binary, same rendering code. The shell launches it with an env var; the runtime handles routing. | **No** |
+| **0 — Universal app** | Write a normal OpenXR handle app (`XR_DXR_win32_window_binding` + `XR_DXR_display_info`, own Kooima projection). No shell awareness. | App works standalone AND in the shell with zero code changes. Same binary, same rendering code. The shell launches it with an env var; the runtime handles routing. | **No** |
 | **1 — Shell-aware app** | Adopt optional OpenXR extensions (e.g. `XR_EXT_spatial_window`) to request a specific window size/position, declare capabilities ("resizable", "supports depth"), respond to spatial input (3D pointer, gaze). | Deeper shell integration — app can negotiate its placement, receive 3D input events, advertise features to the shell. | **Small extension library** on top of OpenXR |
 | **2 — Spatial UI app** | Use a spatial UI toolkit for 3D widgets, floating panels, and world-anchored UI elements. | Full spatial-native experience with 3D UI primitives, shared world anchors, spatial audio hooks. | **Spatial UI SDK** (future) |
 

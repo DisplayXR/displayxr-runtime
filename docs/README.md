@@ -28,12 +28,12 @@ Build apps for 3D displays using the OpenXR standard.
 
 ### Extension Specs
 
-- [XR_EXT_display_info](specs/extensions/XR_EXT_display_info.md) — display properties, eye tracking, rendering modes
-- [XR_EXT_win32_window_binding](specs/extensions/XR_EXT_win32_window_binding.md) — app-provided Win32 HWND
-- [XR_EXT_cocoa_window_binding](specs/extensions/XR_EXT_cocoa_window_binding.md) — app-provided Cocoa NSView
-- [XR_EXT_xlib_window_binding](specs/extensions/XR_EXT_xlib_window_binding.md) — app-provided X11 window (desktop Linux)
-- [XR_EXT_spatial_workspace](specs/extensions/XR_EXT_spatial_workspace.md) — workspace controller surface (shell-style apps)
-- [XR_EXT_display_zones](specs/extensions/XR_EXT_display_zones.md) — N 3D zones + 2D zones + wish mask (design sketch, ADR-027)
+- [XR_DXR_display_info](specs/extensions/XR_DXR_display_info.md) — display properties, eye tracking, rendering modes
+- [XR_DXR_win32_window_binding](specs/extensions/XR_DXR_win32_window_binding.md) — app-provided Win32 HWND
+- [XR_DXR_cocoa_window_binding](specs/extensions/XR_DXR_cocoa_window_binding.md) — app-provided Cocoa NSView
+- [XR_DXR_xlib_window_binding](specs/extensions/XR_DXR_xlib_window_binding.md) — app-provided X11 window (desktop Linux)
+- [XR_DXR_spatial_workspace](specs/extensions/XR_DXR_spatial_workspace.md) — workspace controller surface (shell-style apps)
+- [XR_DXR_display_zones](specs/extensions/XR_DXR_display_zones.md) — N 3D zones + 2D zones + wish mask (design sketch, ADR-027)
 - [Kooima Projection](architecture/kooima-projection.md) — N-view Kooima math and projection pipelines
 
 ---
@@ -70,7 +70,7 @@ Integrate your 3D display hardware into DisplayXR.
 - **[`xrt_plugin_iface` reference](reference/xrt_plugin_iface.md)** — per-method contract for the plug-in vtable
 - **[Plug-in discovery spec](specs/runtime/plugin-discovery.md)** — registry / JSON manifest formats, env-var overrides
 - **[ADR-019: Vendor Plug-in / Aux Boundary](adr/ADR-019-vendor-plugin-aux-boundary.md)** — why the runtime DLL holds zero vendor identifiers
-- **[ADR-022: Per-Mode Capability Flags + Frozen Enumerated App Structs](adr/ADR-022-per-mode-capability-flags-frozen-enum-structs.md)** — `mode_flags` bits (no more rendering-mode ABI breaks) + `XrDisplayRenderingModeInfoEXT` frozen at v13 (all future per-mode fields chain)
+- **[ADR-022: Per-Mode Capability Flags + Frozen Enumerated App Structs](adr/ADR-022-per-mode-capability-flags-frozen-enum-structs.md)** — `mode_flags` bits (no more rendering-mode ABI breaks) + `XrDisplayRenderingModeInfoDXR` frozen at v13 (all future per-mode fields chain)
 - **[Display Processor Interface](specs/vendor/display-processor-interface.md)** — the DP vtable you'll implement
 - **[Eye Tracking Modes](specs/vendor/eye-tracking-modes.md)** — MANAGED vs MANUAL contract
 - **[ADR-003: Vendor Abstraction](adr/ADR-003-vendor-abstraction-via-display-processor-vtable.md)** — why vendor code is isolated
@@ -115,8 +115,8 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-020](adr/ADR-020-plugin-abi-compatibility-policy.md) — Plug-in ABI Compatibility Policy (versioning, `struct_size` negotiation, drift guards)
 - [ADR-021](adr/ADR-021-color-management-encoding-state-invariant.md) — Color Management & the Encoding-State Invariant
 - [ADR-022](adr/ADR-022-per-mode-capability-flags-frozen-enum-structs.md) — Per-Mode Capability Flags + Frozen Enumerated App Structs
-- [ADR-023](adr/ADR-023-unified-atlas-capture.md) — Unified Atlas Capture (XR_EXT_atlas_capture)
-- [ADR-024](adr/ADR-024-raw-vs-render-ready-views.md) — Raw vs Render-Ready Views (XR_EXT_view_rig)
+- [ADR-023](adr/ADR-023-unified-atlas-capture.md) — Unified Atlas Capture (XR_DXR_atlas_capture)
+- [ADR-024](adr/ADR-024-raw-vs-render-ready-views.md) — Raw vs Render-Ready Views (XR_DXR_view_rig)
 - [ADR-025](adr/ADR-025-android-vendor-dp-out-of-process.md) — Android Vendor Display Processors Run Out-of-Process
 - [ADR-026](adr/ADR-026-orientation-aware-view-scaling.md) — Orientation-Independent Rendering Modes, Config-Derived View Scale, Rotation-Aware Worst-Case Atlas
 - [ADR-027](adr/ADR-027-display-zones.md) — Display Zones — decoupled mixed 2D/3D layout, per-zone rig, wish mask
@@ -146,11 +146,11 @@ Design docs, status trackers, and plans — some shipped, some in progress. Afte
 - [Spatial Desktop PRD](roadmap/spatial-desktop-prd.md) — product vision
 - [PR FAQ](roadmap/prfaq.md) — press-release-style framing
 - [Spatial Workspace Extensions Plan](roadmap/spatial-workspace-extensions-plan.md) — three-phase plan to decouple the shell from the runtime: boundary rename (Phase 1, done), policy migration behind extensions (Phase 2), repo severance (Phase 3)
-- [Workspace Extensions Header Sketch](roadmap/spatial-workspace-extensions-headers-draft.md) — `XR_EXT_spatial_workspace.h` + `XR_EXT_app_launcher.h` C-level API draft
+- [Workspace Extensions Header Sketch](roadmap/spatial-workspace-extensions-headers-draft.md) — `XR_DXR_spatial_workspace.h` + `XR_EXT_app_launcher.h` C-level API draft
 - [Workspace Controller Detection](roadmap/spatial-workspace-controller-detection.md) — Phase 2.0 prep: orchestrator detects installed controller via sidecar `.controller.json` manifest
 - [Workspace Activation Auth Handshake](roadmap/spatial-workspace-auth-handshake.md) — Phase 2.0 prep: orchestrator-PID match replaces the brand-coupled `application_name == "displayxr-shell"` check
 - [Phase 2 Audit](roadmap/spatial-workspace-extensions-phase2-audit.md) — line-by-line classification of the remaining `shell` mentions in `comp_d3d11_service.cpp`
-- [Per-App MCP Tools & Workspace Aggregator](roadmap/per-app-mcp-tools.md) — apps register their own MCP tools via `XR_EXT_mcp_tools`; one-connection `--target workspace` aggregator with `<app-id>__<tool>` namespacing
+- [Per-App MCP Tools & Workspace Aggregator](roadmap/per-app-mcp-tools.md) — apps register their own MCP tools via `XR_DXR_mcp_tools`; one-connection `--target workspace` aggregator with `<app-id>__<tool>` namespacing
 - [WebXR Support — Status & Roadmap](roadmap/webxr-support.md) — shipped Bridge v2 metadata sideband + the inline-3D (`session.displayXR.weave()`) roadmap via Chromium patches
 - [Display Zones](roadmap/display-zones.md) — N 3D zones + 2D zones + wish mask: avatar migration + phased plan (ADR-027)
 - [Display Spatial Model](roadmap/display-spatial-model.md) — displays in the spatial graph (#46)

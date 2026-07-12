@@ -14,7 +14,7 @@
  *
  * Uses vkCmdBlitImage for simplicity — no render pass or pipeline needed.
  *
- * Exception: XR_EXT_display_zones frames (ADR-027) draw zone layers through
+ * Exception: XR_DXR_display_zones frames (ADR-027) draw zone layers through
  * a small blend pipeline (zone_blit.vert/.frag) so overlapping zones
  * composite alpha-over in layer-list order — blits cannot blend. Zones
  * frames are all-or-none at the oxr layer, so normal frames never touch the
@@ -90,7 +90,7 @@ struct comp_vk_native_renderer
 	//! opaque black, so app alpha<1 regions survive to the present (issue #392).
 	bool transparent_background;
 
-	//! XR_EXT_display_zones alpha-over draw path (ADR-027). Lazily created
+	//! XR_DXR_display_zones alpha-over draw path (ADR-027). Lazily created
 	//! on the first zones frame; the framebuffer alone is dropped on atlas
 	//! resize (it wraps atlas_view) and re-created on demand.
 	struct
@@ -380,7 +380,7 @@ cmd_image_barrier(struct vk_bundle *vk,
 
 /*
  *
- * XR_EXT_display_zones alpha-over draw path (ADR-027).
+ * XR_DXR_display_zones alpha-over draw path (ADR-027).
  *
  */
 
@@ -1059,7 +1059,7 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	(void)left_eye;
 	(void)right_eye;
 
-	// XR_EXT_display_zones (ADR-027): a zones frame composes N placed zone
+	// XR_DXR_display_zones (ADR-027): a zones frame composes N placed zone
 	// layers into the window-spanning atlas — the unzoned area must stay
 	// transparent so the feathered wish edge blends toward the desktop.
 	bool zones_frame = false;
@@ -1192,7 +1192,7 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 				dy1 = dy0 + (int32_t)layout->tile_h;
 			}
 
-			// XR_EXT_display_zones: scale the zone rect (client-window
+			// XR_DXR_display_zones: scale the zone rect (client-window
 			// px) into the tile box — in zones frames the tile spans
 			// the full window. FALLBACK ONLY: zones frames normally
 			// take draw_zones_pass (alpha-over); this blit leg runs

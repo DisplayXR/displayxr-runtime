@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  OpenXR session management for the XR_EXT_weave probe (#625).
+ * @brief  OpenXR session management for the XR_DXR_weave probe (#625).
  */
 
 #include "xr_session.h"
@@ -11,8 +11,8 @@
 #include <vector>
 
 bool g_hasWeaveExt = false;
-PFN_xrWeaveBindWindowEXT g_pfnWeaveBindWindow = nullptr;
-PFN_xrWeaveSubmitEXT g_pfnWeaveSubmit = nullptr;
+PFN_xrWeaveBindWindowDXR g_pfnWeaveBindWindow = nullptr;
+PFN_xrWeaveSubmitDXR g_pfnWeaveSubmit = nullptr;
 
 #define XR_CHECK(call)                                                                                                  \
 	do {                                                                                                               \
@@ -69,42 +69,42 @@ InitializeOpenXR(XrSessionManager &xr)
 		if (strcmp(ext.extensionName, XR_KHR_D3D11_ENABLE_EXTENSION_NAME) == 0) {
 			hasD3D11 = true;
 		}
-		if (strcmp(ext.extensionName, XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME) == 0) {
+		if (strcmp(ext.extensionName, XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME) == 0) {
 			xr.hasWin32WindowBindingExt = true;
 		}
-		if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) {
+		if (strcmp(ext.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) {
 			xr.hasDisplayInfoExt = true;
 		}
-		if (strcmp(ext.extensionName, XR_EXT_WEAVE_EXTENSION_NAME) == 0) {
+		if (strcmp(ext.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0) {
 			g_hasWeaveExt = true;
 		}
 	}
 
 	LOG_INFO("XR_KHR_D3D11_enable:         %s", hasD3D11 ? "AVAILABLE" : "NOT FOUND");
-	LOG_INFO("XR_EXT_win32_window_binding: %s", xr.hasWin32WindowBindingExt ? "AVAILABLE" : "NOT FOUND");
-	LOG_INFO("XR_EXT_display_info:         %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
-	LOG_INFO("XR_EXT_weave:                %s", g_hasWeaveExt ? "AVAILABLE" : "NOT FOUND");
+	LOG_INFO("XR_DXR_win32_window_binding: %s", xr.hasWin32WindowBindingExt ? "AVAILABLE" : "NOT FOUND");
+	LOG_INFO("XR_DXR_display_info:         %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
+	LOG_INFO("XR_DXR_weave:                %s", g_hasWeaveExt ? "AVAILABLE" : "NOT FOUND");
 
 	if (!hasD3D11) {
 		LOG_ERROR("XR_KHR_D3D11_enable not available - cannot continue");
 		return false;
 	}
 	if (!xr.hasWin32WindowBindingExt) {
-		LOG_ERROR("XR_EXT_win32_window_binding not available - cannot bind the present-owner window");
+		LOG_ERROR("XR_DXR_win32_window_binding not available - cannot bind the present-owner window");
 		return false;
 	}
 	if (!g_hasWeaveExt) {
-		LOG_ERROR("XR_EXT_weave not advertised - the weave service is unavailable on this runtime");
+		LOG_ERROR("XR_DXR_weave not advertised - the weave service is unavailable on this runtime");
 		return false;
 	}
 
 	std::vector<const char *> enabled;
 	enabled.push_back(XR_KHR_D3D11_ENABLE_EXTENSION_NAME);
-	enabled.push_back(XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME);
+	enabled.push_back(XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME);
 	if (xr.hasDisplayInfoExt) {
-		enabled.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+		enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
 	}
-	enabled.push_back(XR_EXT_WEAVE_EXTENSION_NAME);
+	enabled.push_back(XR_DXR_WEAVE_EXTENSION_NAME);
 
 	XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
 	strcpy_s(createInfo.applicationInfo.applicationName, "DXRWeaveRpcProbe");
@@ -128,7 +128,7 @@ InitializeOpenXR(XrSessionManager &xr)
 	}
 	if (xr.hasDisplayInfoExt) {
 		XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
-		XrDisplayInfoEXT di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
+		XrDisplayInfoDXR di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
 		sysProps.next = &di;
 		if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sysProps))) {
 			xr.displayPixelWidth = di.displayPixelWidth;
@@ -161,8 +161,8 @@ CreateSession(XrSessionManager &xr, ID3D11Device *d3d11Device, HWND appHwnd)
 	// texture. The non-null HWND makes the per-client DP bind to this window
 	// (correct phase reference); transparent avoids the cross-process swap-chain
 	// path (the service can't present our window). We never submit projection
-	// layers — the weave service is driven directly via xrWeaveSubmitEXT.
-	XrWin32WindowBindingCreateInfoEXT bind = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT};
+	// layers — the weave service is driven directly via xrWeaveSubmitDXR.
+	XrWin32WindowBindingCreateInfoDXR bind = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR};
 	bind.windowHandle = (void *)appHwnd;
 	bind.sharedTextureHandle = nullptr;
 	bind.transparentBackgroundEnabled = XR_TRUE;
@@ -175,9 +175,9 @@ CreateSession(XrSessionManager &xr, ID3D11Device *d3d11Device, HWND appHwnd)
 	LOG_INFO("Session created: %p", (void *)xr.session);
 
 	// Resolve the weave entry points.
-	xrGetInstanceProcAddr(xr.instance, "xrWeaveBindWindowEXT", (PFN_xrVoidFunction *)&g_pfnWeaveBindWindow);
-	xrGetInstanceProcAddr(xr.instance, "xrWeaveSubmitEXT", (PFN_xrVoidFunction *)&g_pfnWeaveSubmit);
-	LOG_INFO("xrWeaveBindWindowEXT: %s, xrWeaveSubmitEXT: %s", g_pfnWeaveBindWindow ? "resolved" : "NULL",
+	xrGetInstanceProcAddr(xr.instance, "xrWeaveBindWindowDXR", (PFN_xrVoidFunction *)&g_pfnWeaveBindWindow);
+	xrGetInstanceProcAddr(xr.instance, "xrWeaveSubmitDXR", (PFN_xrVoidFunction *)&g_pfnWeaveSubmit);
+	LOG_INFO("xrWeaveBindWindowDXR: %s, xrWeaveSubmitDXR: %s", g_pfnWeaveBindWindow ? "resolved" : "NULL",
 	         g_pfnWeaveSubmit ? "resolved" : "NULL");
 	if (!g_pfnWeaveBindWindow || !g_pfnWeaveSubmit) {
 		LOG_ERROR("Failed to resolve weave entry points");

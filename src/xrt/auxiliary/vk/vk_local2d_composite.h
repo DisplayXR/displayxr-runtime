@@ -130,7 +130,7 @@ vk_local2d_composite_raster_mask(struct vk_local2d_composite *lc,
 
 /*!
  * Rasterize an R8 wish mask with an INWARD stepped ring feather
- * (XR_EXT_display_zones, ADR-027): LOAD_OP_CLEAR to 0, then for each feather
+ * (XR_DXR_display_zones, ADR-027): LOAD_OP_CLEAR to 0, then for each feather
  * step (ascending value to 1.0 at the core) clear the INSET rect of EVERY
  * zone — M ramps 0->1 over the first steps*px pixels inside each zone edge.
  * Max-semantics without a shader; overlapping feathers can never dim a zone

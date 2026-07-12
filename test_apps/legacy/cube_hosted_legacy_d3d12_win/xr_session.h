@@ -4,7 +4,7 @@
  * @file
  * @brief  OpenXR session management for D3D12 (standard mode, no win32_window_binding)
  *
- * This version does NOT use the XR_EXT_win32_window_binding extension.
+ * This version does NOT use the XR_DXR_win32_window_binding extension.
  * OpenXR/DisplayXR will create its own window for rendering.
  */
 

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Cube Zones TEXTURE VK — XR_EXT_display_zones parity test (ADR-027), Windows VK leg
+ * @brief  Cube Zones TEXTURE VK — XR_DXR_display_zones parity test (ADR-027), Windows VK leg
  *
  * VULKAN analog of cube_zones_texture_d3d11_win (issue #613 Phase 1). It is a
  * HYBRID, because the runtime's VK native compositor imports the app's shared
@@ -25,7 +25,7 @@
  *
  * The display-zones submission logic (the thing under test) is unchanged from
  * the D3D11 leg: two 3D zones + a Local2D strip + a per-frame wish mask, each
- * zone owning its own swapchain sized per xrGetDisplayZoneRecommendedViewSizeEXT.
+ * zone owning its own swapchain sized per xrGetDisplayZoneRecommendedViewSizeDXR.
  *
  * NOTE (no edge-fade pass): the D3D11 leg runs a content-alpha edge feather as a
  * D3D11 fullscreen pass on the zone RTV; the VK leg omits it (the SPIR-V
@@ -74,7 +74,7 @@ static const char* APP_NAME = "cube_zones_texture_vk_win";
 
 // Window settings
 static const wchar_t* WINDOW_CLASS = L"DXRCubeZonesTextureVKClass";
-static const wchar_t* WINDOW_TITLE = L"VK Cube Zones TEXTURE — XR_EXT_display_zones parity test";
+static const wchar_t* WINDOW_TITLE = L"VK Cube Zones TEXTURE — XR_DXR_display_zones parity test";
 
 // Global state (single-threaded — all accessed from the main thread only)
 static InputState g_inputState;
@@ -129,7 +129,7 @@ static long g_texFrameCounter = 0;
 static const long kTexDumpFrame = 150;
 
 // ---------------------------------------------------------------------------
-// XR_EXT_display_zones state
+// XR_DXR_display_zones state
 // ---------------------------------------------------------------------------
 
 static const uint32_t kNumZones = 2;
@@ -882,13 +882,13 @@ static bool CreateAndFillStrip(XrSessionManager& xr, VkRenderer& vk) {
 }
 
 // Create one zone's VK swapchain + framebuffer set, sized per
-// xrGetDisplayZoneRecommendedViewSizeEXT, horizontally tiled per view.
+// xrGetDisplayZoneRecommendedViewSizeDXR, horizontally tiled per view.
 static bool CreateZoneResources(XrSessionManager& xr, VkRenderer& vk,
                                 DisplayZone& z, uint32_t viewCount) {
     XrExtent2Di rec = {};
     XrResult r = g_zones.pfnGetViewSize(xr.session, &z.rect, &rec);
     if (XR_FAILED(r) || rec.width <= 0 || rec.height <= 0) {
-        LOG_ERROR("[zones] zone %u: xrGetDisplayZoneRecommendedViewSizeEXT failed (0x%x, %dx%d)",
+        LOG_ERROR("[zones] zone %u: xrGetDisplayZoneRecommendedViewSizeDXR failed (0x%x, %dx%d)",
                   z.zoneId, (unsigned)r, rec.width, rec.height);
         return false;
     }
@@ -940,10 +940,10 @@ static bool CreateZoneResources(XrSessionManager& xr, VkRenderer& vk,
 static void TryActivateZones(XrSessionManager& xr, VkRenderer& vk) {
     g_zonesAttempted = true;
 
-    XrDisplayZoneCapabilitiesEXT caps = {XR_TYPE_DISPLAY_ZONE_CAPABILITIES_EXT};
+    XrDisplayZoneCapabilitiesDXR caps = {XR_TYPE_DISPLAY_ZONE_CAPABILITIES_DXR};
     XrResult r = g_zones.pfnGetCaps(xr.session, &caps);
     if (XR_FAILED(r) || !caps.supported) {
-        LOG_ERROR("[zones] xrGetDisplayZoneCapabilitiesEXT: rc=0x%x supported=%d — zones path disabled",
+        LOG_ERROR("[zones] xrGetDisplayZoneCapabilitiesDXR: rc=0x%x supported=%d — zones path disabled",
                   (unsigned)r, (int)caps.supported);
         g_hasDisplayZonesExt = false;
         return;
@@ -1018,12 +1018,12 @@ static void TryActivateZones(XrSessionManager& xr, VkRenderer& vk) {
 static bool EnsureWishMask(XrSessionManager& xr) {
     if (g_zone.mask != XR_NULL_HANDLE) return true;
     if (!g_zone.pfnCreate) return false;
-    XrLocal3DZoneMaskCreateInfoEXT mci = {(XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_EXT};
+    XrLocal3DZoneMaskCreateInfoDXR mci = {(XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_DXR};
     mci.maskWidth = 0; // runtime picks the window backing size
     mci.maskHeight = 0;
     XrResult r = g_zone.pfnCreate(xr.session, &mci, &g_zone.mask);
     if (XR_FAILED(r)) {
-        LOG_ERROR("[zones] xrCreateLocal3DZoneMaskEXT failed (0x%x)", (unsigned)r);
+        LOG_ERROR("[zones] xrCreateLocal3DZoneMaskDXR failed (0x%x)", (unsigned)r);
         g_zone.mask = XR_NULL_HANDLE;
         return false;
     }
@@ -1044,7 +1044,7 @@ static void ApplyWishAuthoring(XrSessionManager& xr) {
         for (uint32_t zi = 0; zi < kNumZones; zi++) rects[zi] = g_zonesArr[zi].rect;
         XrResult r = g_zone.pfnSetRects(g_zone.mask, kNumZones, rects);
         if (XR_FAILED(r)) {
-            LOG_ERROR("[zones] xrSetLocal3DZoneFromRectsEXT failed (0x%x)", (unsigned)r);
+            LOG_ERROR("[zones] xrSetLocal3DZoneFromRectsDXR failed (0x%x)", (unsigned)r);
         }
     }
 }
@@ -1088,22 +1088,22 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
     XrSessionManager& xr = *rs.xr;
     VkRenderer& vk = *rs.vk;
 
-    XrDisplayZoneEXT zoneStructs[kNumZones];
-    XrDisplayRigEXT rigStructs[kNumZones];
+    XrDisplayZoneDXR zoneStructs[kNumZones];
+    XrDisplayRigDXR rigStructs[kNumZones];
     std::vector<XrCompositionLayerProjectionView> projViews[kNumZones];
     uint32_t submitViewCounts[kNumZones] = {};
 
     for (uint32_t zi = 0; zi < kNumZones; zi++) {
         DisplayZone& z = g_zonesArr[zi];
 
-        rigStructs[zi] = {XR_TYPE_DISPLAY_RIG_EXT};
+        rigStructs[zi] = {XR_TYPE_DISPLAY_RIG_DXR};
         rigStructs[zi].pose = {{0, 0, 0, 1}, {0, 0, 0}};
         rigStructs[zi].virtualDisplayHeight = kZoneVirtualDisplayHeight;
         rigStructs[zi].ipdFactor = z.ipdFactor;
         rigStructs[zi].parallaxFactor = 1.0f;
         rigStructs[zi].perspectiveFactor = z.perspectiveFactor;
 
-        zoneStructs[zi] = {XR_TYPE_DISPLAY_ZONE_EXT};
+        zoneStructs[zi] = {XR_TYPE_DISPLAY_ZONE_DXR};
         zoneStructs[zi].next = &rigStructs[zi];
         zoneStructs[zi].zoneId = z.zoneId;
         zoneStructs[zi].rect = z.rect;
@@ -1208,7 +1208,7 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
 
     // Layer list: [projA (zone A chained), projB (zone B chained), strip].
     XrCompositionLayerProjection projLayers[kNumZones];
-    XrCompositionLayerLocal2DEXT stripLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT};
+    XrCompositionLayerLocal2DDXR stripLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR};
     const XrCompositionLayerBaseHeader* layers[kNumZones + 1] = {};
     uint32_t layerCount = 0;
 
@@ -1264,7 +1264,7 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
 
     // Per-frame wish reference: absent in AUTO (mode 0) unless validation is
     // requested; in modes 1/2 the mask is the frame's wish.
-    XrDisplayZonesFrameEndInfoEXT zonesEnd = {(XrStructureType)XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_EXT};
+    XrDisplayZonesFrameEndInfoDXR zonesEnd = {(XrStructureType)XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_DXR};
     zonesEnd.flags = 0;
     zonesEnd.wishMask = XR_NULL_HANDLE;
     bool chainZonesEnd = false;
@@ -1273,7 +1273,7 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
         chainZonesEnd = true;
     }
     if (ZonesValidateEnabled()) {
-        zonesEnd.flags |= XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_EXT;
+        zonesEnd.flags |= XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_DXR;
         chainZonesEnd = true;
     }
     if (chainZonesEnd) {
@@ -1322,11 +1322,11 @@ static void RenderOneFrame(RenderState& rs) {
     if (g_inputState.eyeTrackingModeToggleRequested) {
         g_inputState.eyeTrackingModeToggleRequested = false;
         if (xr.pfnRequestEyeTrackingModeEXT && xr.session != XR_NULL_HANDLE) {
-            XrEyeTrackingModeEXT newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_EXT)
-                ? XR_EYE_TRACKING_MODE_MANUAL_EXT : XR_EYE_TRACKING_MODE_MANAGED_EXT;
+            XrEyeTrackingModeDXR newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_DXR)
+                ? XR_EYE_TRACKING_MODE_MANUAL_DXR : XR_EYE_TRACKING_MODE_MANAGED_DXR;
             XrResult etResult = xr.pfnRequestEyeTrackingModeEXT(xr.session, newMode);
             LOG_INFO("Eye tracking mode -> %s (%s)",
-                newMode == XR_EYE_TRACKING_MODE_MANUAL_EXT ? "MANUAL" : "MANAGED",
+                newMode == XR_EYE_TRACKING_MODE_MANUAL_DXR ? "MANUAL" : "MANAGED",
                 XR_SUCCEEDED(etResult) ? "OK" : "unsupported");
         }
     }
@@ -1400,7 +1400,7 @@ static void RenderOneFrame(RenderState& rs) {
         for (uint32_t vi = 0; vi < 8; vi++) rawViews[vi] = {XR_TYPE_VIEW};
 
         // Drive the runtime rig (display-centric) for a render-ready view set.
-        XrDisplayRigEXT displayRig = {XR_TYPE_DISPLAY_RIG_EXT};
+        XrDisplayRigDXR displayRig = {XR_TYPE_DISPLAY_RIG_DXR};
         XrPosef rigPose = {{0, 0, 0, 1}, {0, 0, 0}};
         const bool useAppProjection =
             xr.hasDisplayInfoExt && xr.displayWidthM > 0.0f && g_hasViewRigExt;
@@ -1533,7 +1533,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         MessageBox(nullptr, L"Failed to initialize logging", L"Warning", MB_OK | MB_ICONWARNING);
     }
 
-    LOG_INFO("=== Cube Zones TEXTURE VK (XR_EXT_display_zones parity test) ===");
+    LOG_INFO("=== Cube Zones TEXTURE VK (XR_DXR_display_zones parity test) ===");
     LOG_INFO("Hybrid: VK renders the zones; the shared composite target is a D3D11 KMT texture (BGRA)");
     LOG_INFO("Runtime dev gate: DISPLAYXR_ZONES=1 must be set for the runtime to advertise the extension");
 
@@ -1555,7 +1555,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
-    // Create window FIRST (needed for XR_EXT_win32_window_binding)
+    // Create window FIRST (needed for XR_DXR_win32_window_binding)
     HWND hwnd = CreateAppWindow(hInstance, g_windowWidth, g_windowHeight);
     if (!hwnd) {
         LOG_ERROR("Failed to create window");
@@ -1583,8 +1583,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     SetWindowPos(hwnd, nullptr, g_displayScreenLeft, g_displayScreenTop, 0, 0,
                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     if (!xr.hasWin32WindowBindingExt) {
-        LOG_ERROR("XR_EXT_win32_window_binding not available — required for shared texture mode");
-        MessageBox(hwnd, L"XR_EXT_win32_window_binding extension not available.\nRequired for shared texture mode.",
+        LOG_ERROR("XR_DXR_win32_window_binding not available — required for shared texture mode");
+        MessageBox(hwnd, L"XR_DXR_win32_window_binding extension not available.\nRequired for shared texture mode.",
             L"Error", MB_OK | MB_ICONERROR);
         g_xr = nullptr;
         CleanupOpenXR(xr);

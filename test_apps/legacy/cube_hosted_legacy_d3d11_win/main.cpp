@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  SR Cube OpenXR - Legacy hosted mode (no XR_EXT_display_info)
+ * @brief  SR Cube OpenXR - Legacy hosted mode (no XR_DXR_display_info)
  *
- * Legacy variant: does NOT enable XR_EXT_display_info.
+ * Legacy variant: does NOT enable XR_DXR_display_info.
  * Uses recommendedImageRectWidth * 2 (compromise scaling).
  * Only V toggle (2D/3D) works — no 1/2/3 mode switching.
  *

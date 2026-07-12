@@ -6,7 +6,7 @@ For the design and API of the shipped feature, see [Transparent HWND Overlay (Po
 
 ## Shipped
 
-- **Runtime path** (#191, commit `d2729977b`): opt-in transparent presentation via `XR_EXT_win32_window_binding` spec_version 5. DComp + premultiplied-alpha swapchain + post-weave chroma-key shader pass. D3D11 in-process, D3D11 service, D3D12 in-process all share the same shader and lifecycle.
+- **Runtime path** (#191, commit `d2729977b`): opt-in transparent presentation via `XR_DXR_win32_window_binding` spec_version 5. DComp + premultiplied-alpha swapchain + post-weave chroma-key shader pass. D3D11 in-process, D3D11 service, D3D12 in-process all share the same shader and lifecycle.
 - **Unity plugin** (`displayxr-unity#57`): `DisplayXRTransparentOverlay` MonoBehaviour wraps the runtime opt-in. Sets the camera clear to the chroma color, requests `transparentBackgroundEnabled = XR_TRUE` in the binding chain, forwards a screen-space bounding box for `WM_NCHITTEST`.
 
 ## Open work
@@ -49,7 +49,7 @@ No additional runtime work is expected — the existing opt-in API already cover
 
 ### macOS port
 
-`XR_EXT_cocoa_window_binding` is the macOS analogue of the Win32 binding extension. A transparent-overlay path on macOS would use:
+`XR_DXR_cocoa_window_binding` is the macOS analogue of the Win32 binding extension. A transparent-overlay path on macOS would use:
 
 - `NSWindow.isOpaque = NO` and `NSWindow.backgroundColor = NSColor.clearColor` on the bound window.
 - Metal compositor's drawable in BGRA8 with premultiplied alpha; CALayer composes against the desktop natively.
@@ -70,7 +70,7 @@ Plugin / app concern, not a runtime concern. Tracked here for completeness.
 
 - [Transparent HWND Overlay (Post-Weave Chroma-Key)](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/docs/chroma-key-overlay.md)
 - [Leia SR Weaver](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/docs/weaver.md)
-- `XR_EXT_win32_window_binding` — `src/external/openxr_includes/openxr/XR_EXT_win32_window_binding.h`
+- `XR_DXR_win32_window_binding` — `src/external/openxr_includes/openxr/XR_DXR_win32_window_binding.h`
 - Issue #190 — alpha-respecting weaver vendor request
 - Issue #191 — runtime-side transparent HWND fix (closed)
 - `displayxr-unity#57` — Unity plugin transparent overlay mode
