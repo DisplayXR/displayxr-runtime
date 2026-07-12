@@ -208,7 +208,7 @@ xrCreateSession(instance, &sessionInfo, &session);
 | Extension | Relationship |
 |---|---|
 | `XR_DXR_win32_window_binding` | Windows counterpart — mutually exclusive (one per platform). Shares `XrCompositionLayerWindowSpaceDXR`. |
-| `XR_EXT_android_surface_binding` | Android counterpart (planned, not yet implemented). |
+| `XR_DXR_android_surface_binding` | Android counterpart (planned, not yet implemented). |
 | `XR_DXR_display_info` | Independent. Can be used alone (runtime-managed window) or together (app-owned view + display geometry + mode control). |
 
 ---

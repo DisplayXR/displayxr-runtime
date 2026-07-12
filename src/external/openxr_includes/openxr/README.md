@@ -42,5 +42,5 @@ Rules:
 | 1004999210–219 | `XR_DXR_display_info` (v16+ additions) | 210 = `XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR` (#715); fresh decade rather than reusing the 005/009 gaps in the original block |
 | 1004999220+ | **next free** | |
 
-`XR_EXT_android_surface_binding` defines no `1004999xxx` values in this
+`XR_DXR_android_surface_binding` defines no `1004999xxx` values in this
 directory as of this writing; if it gains any, claim a decade here first.

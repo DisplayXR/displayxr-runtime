@@ -1,6 +1,6 @@
 # OpenXR Extensions for Tracked 3D Displays
 
-## Formal Proposal for XR_DXR_win32_window_binding, XR_EXT_android_surface_binding, XR_DXR_cocoa_window_binding, and XR_DXR_display_info
+## Formal Proposal for XR_DXR_win32_window_binding, XR_DXR_android_surface_binding, XR_DXR_cocoa_window_binding, and XR_DXR_display_info
 
 | Field | Value |
 |---|---|
@@ -9,7 +9,7 @@
 | **Date** | 2026-02-13 |
 | **Revision** | 0.2 |
 | **Status** | Draft — proposed for Khronos OpenXR Working Group review |
-| **Extension Names** | `XR_DXR_win32_window_binding`, `XR_EXT_android_surface_binding`, `XR_DXR_cocoa_window_binding`, `XR_DXR_display_info` |
+| **Extension Names** | `XR_DXR_win32_window_binding`, `XR_DXR_android_surface_binding`, `XR_DXR_cocoa_window_binding`, `XR_DXR_display_info` |
 | **OpenXR Version** | 1.0 |
 | **Extension Type** | Instance extensions |
 | **Dependencies** | OpenXR 1.0 core |
@@ -76,7 +76,7 @@ This proposal introduces four independent but complementary extensions:
 | Extension | Purpose |
 |---|---|
 | `XR_DXR_win32_window_binding` | App provides a Win32 HWND for runtime rendering; enables windowed mode, multi-app, app-controlled input, and window-space overlay layers. |
-| `XR_EXT_android_surface_binding` | App provides an Android `ANativeWindow` for runtime rendering; the Android counterpart to the Win32 window binding. |
+| `XR_DXR_android_surface_binding` | App provides an Android `ANativeWindow` for runtime rendering; the Android counterpart to the Win32 window binding. |
 | `XR_DXR_cocoa_window_binding` | App provides a Cocoa `NSView*` (with `CAMetalLayer` backing) for runtime rendering on macOS. |
 | `XR_DXR_display_info` | Runtime exposes physical display geometry, nominal viewer position, recommended render scale, and display mode switching capability. Provides `xrRequestDisplayModeDXR` for 2D/3D mode control, `xrRequestEyeTrackingModeDXR` for managed/manual eye tracking selection, and `xrRequestDisplayRenderingModeDXR` for vendor-specific rendering mode switching. In RAW mode, `xrLocateViews` returns screen-centered eye positions regardless of the reference space parameter. |
 
@@ -99,7 +99,7 @@ displays. See [OPEN 4](#open-issues) in the Issues section.
         │
         ├── xrCreateInstance()
         │       enable "XR_DXR_win32_window_binding"   (Win32)
-        │         — or "XR_EXT_android_surface_binding" (Android)
+        │         — or "XR_DXR_android_surface_binding" (Android)
         │         — or "XR_DXR_cocoa_window_binding"   (macOS)
         │       enable "XR_DXR_display_info"
         │
@@ -116,7 +116,7 @@ displays. See [OPEN 4](#open-issues) in the Issues section.
         │        │            └── next: XrWin32WindowBindingCreateInfoDXR
         │        │                       • windowHandle = app HWND
         │        └── next: XrGraphicsBindingVulkanKHR          (Android)
-        │        │            └── next: XrAndroidSurfaceBindingCreateInfoEXT
+        │        │            └── next: XrAndroidSurfaceBindingCreateInfoDXR
         │        │                       • nativeWindow = app ANativeWindow*
         │        │                       • surface = Java Surface jobject
         │        │                       • screenOffsetX/Y = position on display
@@ -191,7 +191,7 @@ The three extensions are **independent**:
   positions, and display mode control while letting the runtime manage the display surface.
 - Using a window/surface binding together with `XR_DXR_display_info` gives full control:
   app-owned rendering surface + app-owned camera model + display mode switching.
-- `XR_DXR_win32_window_binding` and `XR_EXT_android_surface_binding` are **mutually
+- `XR_DXR_win32_window_binding` and `XR_DXR_android_surface_binding` are **mutually
   exclusive** platform variants — an application uses one or the other, never both.
 
 ---
@@ -434,7 +434,7 @@ xrEndFrame(session, &endInfo);
 
 ---
 
-## 4. Extension 2: XR_EXT_android_surface_binding
+## 4. Extension 2: XR_DXR_android_surface_binding
 
 > **Status: Planned — not yet implemented.** The extension header exists but no
 > compositor or platform code implements Android surface binding yet.
@@ -445,9 +445,9 @@ No known IP claims.
 
 ### Name Strings
 
-- Extension name: `XR_EXT_android_surface_binding`
+- Extension name: `XR_DXR_android_surface_binding`
 - Spec version: 1
-- Extension name define: `XR_EXT_ANDROID_SURFACE_BINDING_EXTENSION_NAME`
+- Extension name define: `XR_DXR_ANDROID_SURFACE_BINDING_EXTENSION_NAME`
 
 ### Overview
 
@@ -480,7 +480,7 @@ correct light field interlacing.
 ### New Enum Constants
 
 ```c
-#define XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_EXT  ((XrStructureType)1004999005)
+#define XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR  ((XrStructureType)1004999005)
 ```
 
 > **Note**: This value uses the vendor extension range. It would be replaced with an
@@ -488,14 +488,14 @@ correct light field interlacing.
 
 ### New Structures
 
-#### XrAndroidSurfaceBindingCreateInfoEXT
+#### XrAndroidSurfaceBindingCreateInfoDXR
 
 Chained to `XrSessionCreateInfo` (via the graphics binding's `next` pointer) to provide
 an external native window for session rendering.
 
 | Member | Type | Description |
 |---|---|---|
-| `type` | `XrStructureType` | Must be `XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_EXT`. |
+| `type` | `XrStructureType` | Must be `XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR`. |
 | `next` | `const void*` | Pointer to next structure in the chain, or `NULL`. |
 | `nativeWindow` | `ANativeWindow*` | The Android native window to render into. Must be a valid, active native window. |
 | `surface` | `jobject` | The Java `android.view.Surface` associated with the native window. The runtime may need this for platform SDK initialization (e.g., a vendor's interlacer). May be `NULL` if the runtime does not require it. |
@@ -503,18 +503,18 @@ an external native window for session rendering.
 | `screenOffsetY` | `int32_t` | Vertical offset of the surface's top edge on the physical display, in display pixels. |
 
 ```c
-typedef struct XrAndroidSurfaceBindingCreateInfoEXT {
+typedef struct XrAndroidSurfaceBindingCreateInfoDXR {
     XrStructureType             type;
     const void* XR_MAY_ALIAS    next;
     ANativeWindow*              nativeWindow;
     jobject                     surface;
     int32_t                     screenOffsetX;
     int32_t                     screenOffsetY;
-} XrAndroidSurfaceBindingCreateInfoEXT;
+} XrAndroidSurfaceBindingCreateInfoDXR;
 ```
 
 **Valid Usage:**
-- `type` **must** be `XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_EXT`.
+- `type` **must** be `XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR`.
 - `nativeWindow` **must** be a valid `ANativeWindow*` obtained via
   `ANativeWindow_fromSurface()` or `ASurfaceHolder_getNativeWindow()`.
 - `surface` **should** be a valid global reference to the Java `android.view.Surface`
@@ -536,7 +536,7 @@ typedef struct XrAndroidSurfaceBindingCreateInfoEXT {
 ### New Functions
 
 None. This extension operates entirely through structure chaining:
-- `XrAndroidSurfaceBindingCreateInfoEXT` chains to `XrSessionCreateInfo`.
+- `XrAndroidSurfaceBindingCreateInfoDXR` chains to `XrSessionCreateInfo`.
 - `XrCompositionLayerWindowSpaceDXR` (defined in `XR_DXR_win32_window_binding`) is
   platform-independent and works with Android surface bindings as well.
 
@@ -556,7 +556,7 @@ None. This extension operates entirely through structure chaining:
 // 1. Enable the extension at instance creation
 std::vector<const char*> extensions = {
     XR_KHR_VULKAN_ENABLE_EXTENSION_NAME,
-    XR_EXT_ANDROID_SURFACE_BINDING_EXTENSION_NAME,
+    XR_DXR_ANDROID_SURFACE_BINDING_EXTENSION_NAME,
 };
 
 XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -583,8 +583,8 @@ vkBinding.device = vkDevice;
 vkBinding.queueFamilyIndex = graphicsQueueFamily;
 vkBinding.queueIndex = 0;
 
-XrAndroidSurfaceBindingCreateInfoEXT surfaceBinding = {
-    (XrStructureType)XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_EXT};
+XrAndroidSurfaceBindingCreateInfoDXR surfaceBinding = {
+    (XrStructureType)XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR};
 surfaceBinding.nativeWindow = nativeWindow;
 surfaceBinding.surface = javaSurface;       // Java Surface jobject
 surfaceBinding.screenOffsetX = screenX;     // position on physical display
@@ -609,8 +609,8 @@ glesBinding.display = eglDisplay;
 glesBinding.config = eglConfig;
 glesBinding.context = eglContext;
 
-XrAndroidSurfaceBindingCreateInfoEXT surfaceBinding = {
-    (XrStructureType)XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_EXT};
+XrAndroidSurfaceBindingCreateInfoDXR surfaceBinding = {
+    (XrStructureType)XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR};
 surfaceBinding.nativeWindow = nativeWindow;
 surfaceBinding.surface = javaSurface;
 surfaceBinding.screenOffsetX = screenX;
@@ -1375,7 +1375,7 @@ All extensions require OpenXR 1.0 and depend on core concepts: `XrInstance`, `Xr
 | Extension | Platform Requirement |
 |---|---|
 | `XR_DXR_win32_window_binding` | **Win32 only**. Requires a Win32 platform graphics binding (`XR_KHR_D3D11_enable` or `XR_KHR_opengl_enable`). |
-| `XR_EXT_android_surface_binding` | **Android only**. Requires an Android-compatible graphics binding (`XR_KHR_vulkan_enable` or `XR_KHR_opengl_es_enable`). |
+| `XR_DXR_android_surface_binding` | **Android only**. Requires an Android-compatible graphics binding (`XR_KHR_vulkan_enable` or `XR_KHR_opengl_es_enable`). |
 | `XR_DXR_display_info` | **Platform-independent**. Works on any platform with a tracked 3D display. |
 
 ### Graphics API Interactions
@@ -1389,10 +1389,10 @@ All extensions require OpenXR 1.0 and depend on core concepts: `XrInstance`, `Xr
   context and the window's device context.
 
 **Android:**
-- **`XR_KHR_vulkan_enable`**: `XrAndroidSurfaceBindingCreateInfoEXT` chains to
+- **`XR_KHR_vulkan_enable`**: `XrAndroidSurfaceBindingCreateInfoDXR` chains to
   `XrGraphicsBindingVulkanKHR.next`. The runtime creates a Vulkan swap chain on the
   provided `ANativeWindow`.
-- **`XR_KHR_opengl_es_enable`**: `XrAndroidSurfaceBindingCreateInfoEXT` chains to
+- **`XR_KHR_opengl_es_enable`**: `XrAndroidSurfaceBindingCreateInfoDXR` chains to
   `XrGraphicsBindingOpenGLESAndroidKHR.next`. The runtime renders using the provided
   EGL context and the native window.
 
@@ -1408,7 +1408,7 @@ The window/surface binding extensions and `XR_DXR_display_info` are **independen
   runtime-owned stereo views (RENDER_READY).
 - Enabling only `XR_DXR_display_info` allows display geometry queries, RAW eye
   positions, and display mode control while the runtime manages the display surface.
-- `XR_DXR_win32_window_binding` and `XR_EXT_android_surface_binding` are **mutually
+- `XR_DXR_win32_window_binding` and `XR_DXR_android_surface_binding` are **mutually
   exclusive** platform variants.
 
 ### Interaction with XR_KHR_composition_layer_quad
@@ -1578,7 +1578,7 @@ graphics binding at session creation. The `XrCompositionLayerWindowSpaceDXR` lay
 is platform-independent and works with all surface binding variants.
 
 Implemented:
-- `XR_EXT_android_surface_binding` (with `ANativeWindow*` + Java `Surface`)
+- `XR_DXR_android_surface_binding` (with `ANativeWindow*` + Java `Surface`)
 - `XR_DXR_cocoa_window_binding` (with `NSView*` backed by `CAMetalLayer`)
 
 Future platforms would follow the same pattern:
@@ -2070,7 +2070,7 @@ the property) silently ignore the call — graceful degradation.
 |---|---|---|---|
 | 1 | 2025-01-15 | David Fattal | Initial version. Window handle binding and window-space composition layer. |
 
-### XR_EXT_android_surface_binding
+### XR_DXR_android_surface_binding
 
 | Revision | Date | Author | Description |
 |---|---|---|---|

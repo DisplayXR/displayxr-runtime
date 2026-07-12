@@ -67,7 +67,7 @@
 #include <sys/system_properties.h>
 
 //! #568: transparency is requested via the debug.dxr.transparent sysprop for now
-//! (Layer A will carry a per-session XR_EXT_android_surface_binding flag over IPC).
+//! (Layer A will carry a per-session XR_DXR_android_surface_binding flag over IPC).
 //! This is the transparent-texture / alpha-gate path (NOT chroma-key, which is
 //! deprecated): the compositor tells the vendor DP to reconstruct alpha post-weave,
 //! exactly as the Windows transparent-present path does.
