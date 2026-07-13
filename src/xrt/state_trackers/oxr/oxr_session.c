@@ -2481,9 +2481,23 @@ oxr_session_locate_views(struct oxr_logger *log,
 		// yet still get display-relative server poses, so key on service mode too.
 		// (#48: macOS hosted OOP — Android has no qwerty so T_base_head was already
 		// identity there; this is a no-op for it.)
-		bool server_display_relative =
-		    sess->has_external_window || sess->is_bridge_relay ||
-		    (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode);
+		//
+		// #739: the service-mode leg of the skip is scoped to NON-Windows. On
+		// Windows the wire head_relation (T_xdev_head) IS the server's qwerty
+		// rig pose (ipc_try_get_sr_view_poses), and hosted legacy sessions
+		// (Chrome WebXR) need it composed for the fly-camera: the per-view
+		// poses are head-local by construction, so skipping T_base_head
+		// cancels the qwerty motion out of XrView.pose entirely — inputs then
+		// visibly move only the qwerty controllers (children of the qwerty
+		// HMD). The LOCAL reference-space origin absorbs the 1.6 m standing
+		// height (it is the initial head pose), so composing adds only the
+		// motion delta — the pre-#48 behavior. Workspace sessions return an
+		// identity head relation (use_qwerty=0), so this is a no-op there.
+		bool server_display_relative = sess->has_external_window || sess->is_bridge_relay;
+#ifndef XRT_OS_WINDOWS
+		server_display_relative = server_display_relative ||
+		                          (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode);
+#endif
 		if (server_display_relative && !have_eyes && !have_eye_override) {
 			// Use server poses directly (display-relative)
 			result.pose = view_pose;
