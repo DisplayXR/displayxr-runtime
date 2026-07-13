@@ -347,6 +347,9 @@ static void d3d12_release_zone_state(struct comp_d3d12_compositor *c);
 // near the bottom; called after each path's fence wait in layer_commit.
 static bool d3d12_zone_dp_supported(struct comp_d3d12_compositor *c);
 static void d3d12_sync_zone_mask_to_dp(struct comp_d3d12_compositor *c);
+// #740 diagnostic (DXR_PHASE_DEBUG=1): dump the geometry that seeds the weave
+// interlace phase, to localize the position/size-dependent phase offset.
+static void d3d12_phase_debug_dump(struct comp_d3d12_compositor *c, const char *where);
 
 // #439 Phase 2: an active zone mask supersedes the canvas output rect —
 // the weave region, view dims, Kooima metrics, and composite region all
@@ -381,6 +384,78 @@ d3d12_effective_canvas(struct comp_d3d12_compositor *c)
 		return win;
 	}
 	return win; // invalid → existing full-target fallbacks
+}
+
+// #740 diagnostic. For each active zone rect, log the panel-pixel CORNER seed
+// (window client origin + zone offset — size-INVARIANT at a fixed placement)
+// vs the CENTER seed (corner + zone extent/2 — drifts with zone SIZE). If the
+// vendor weaver phases the interlace from the CENTER, the center-seed's
+// (mod lens-pitch) residual is the observed global phase error; the corner
+// seed is what a size-independent phase would use. One-shot per geometry
+// change so there is no per-frame spam. Gated by DXR_PHASE_DEBUG=1. Remove
+// once #740 is resolved.
+static void
+d3d12_phase_debug_dump(struct comp_d3d12_compositor *c, const char *where)
+{
+	static bool phase_dbg = getenv("DXR_PHASE_DEBUG") != nullptr;
+	if (!phase_dbg || c->display_processor == nullptr) {
+		return;
+	}
+	HWND wnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
+	POINT origin = {0, 0};
+	if (wnd == nullptr || !ClientToScreen(wnd, &origin)) {
+		return;
+	}
+	uint32_t dpx_w = 0, dpx_h = 0;
+	int32_t disp_left = 0, disp_top = 0;
+	xrt_display_processor_d3d12_get_display_pixel_info(c->display_processor, &dpx_w, &dpx_h,
+	                                                   &disp_left, &disp_top);
+	// Window client-area corner in panel pixels (absolute, size-invariant).
+	const int32_t win_cx = (int32_t)origin.x - disp_left;
+	const int32_t win_cy = (int32_t)origin.y - disp_top;
+	if (c->zone_wish_rect_count == 0) {
+		// No zone rects staged this frame (e.g. glued-window case where the
+		// whole client rect is the canvas): log the window rect itself.
+		RECT r;
+		if (GetClientRect(wnd, &r) && r.right > 0 && r.bottom > 0) {
+			const int32_t zcx = win_cx + (int32_t)r.right / 2;
+			const int32_t zcy = win_cy + (int32_t)r.bottom / 2;
+			static int64_t s_last_win = -1;
+			const int64_t sig = ((int64_t)win_cx << 40) ^ ((int64_t)win_cy << 20) ^
+			                    ((int64_t)r.right << 10) ^ (int64_t)r.bottom;
+			if (s_last_win != sig) {
+				s_last_win = sig;
+				U_LOG_W("#740 PHASE(%s) window: corner_panelpx=(%d,%d) client=%ldx%ld => "
+				        "CENTER_seed_panelpx=(%d,%d) [disp %ux%u @ (%d,%d)]",
+				        where, win_cx, win_cy, r.right, r.bottom, zcx, zcy,
+				        dpx_w, dpx_h, disp_left, disp_top);
+			}
+		}
+		return;
+	}
+	for (uint32_t i = 0; i < c->zone_wish_rect_count && i < XRT_MAX_LAYERS; i++) {
+		const struct xrt_rect zr = c->zone_wish_rects[i];
+		const int32_t zcorner_x = win_cx + zr.offset.w;
+		const int32_t zcorner_y = win_cy + zr.offset.h;
+		const int32_t zcenter_x = zcorner_x + zr.extent.w / 2;
+		const int32_t zcenter_y = zcorner_y + zr.extent.h / 2;
+		// Signature: log only on a genuine geometry change (no per-frame spam).
+		const int64_t sig = ((int64_t)zcorner_x << 40) ^ ((int64_t)zcorner_y << 20) ^
+		                    ((int64_t)zr.extent.w << 10) ^ (int64_t)zr.extent.h;
+		static int64_t s_last_sig[XRT_MAX_LAYERS] = {};
+		if (s_last_sig[i] == sig) {
+			continue;
+		}
+		s_last_sig[i] = sig;
+		U_LOG_W("#740 PHASE(%s) zone[%u]: win_corner_panelpx=(%d,%d) "
+		        "zone_rect_clientpx=(off %d,%d ext %dx%d) => "
+		        "CORNER_seed_panelpx=(%d,%d) CENTER_seed_panelpx=(%d,%d) "
+		        "[disp %ux%u @ (%d,%d)]",
+		        where, i, win_cx, win_cy,
+		        zr.offset.w, zr.offset.h, zr.extent.w, zr.extent.h,
+		        zcorner_x, zcorner_y, zcenter_x, zcenter_y,
+		        dpx_w, dpx_h, disp_left, disp_top);
+	}
 }
 
 /*!
@@ -1865,6 +1940,8 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			ID3D12Resource *bd_res = d3d12_flatten_backdrop_2d(c, dp_target_w, dp_target_h, &bd_w, &bd_h);
 			xrt_display_processor_d3d12_set_background_2d(c->display_processor, bd_res, bd_w, bd_h);
 
+			d3d12_phase_debug_dump(c, "process_atlas_shared_tex");
+
 			xrt_display_processor_d3d12_process_atlas(
 			    c->display_processor,
 			    c->cmd_list,
@@ -3133,6 +3210,8 @@ d3d12_sync_zone_mask_to_dp(struct comp_d3d12_compositor *c)
 	if (ok) {
 		c->zone_published = true;
 	}
+
+	d3d12_phase_debug_dump(c, "publish_zone_mask");
 }
 
 // Release the compositor-owned zone consumables (scratches) and detach any

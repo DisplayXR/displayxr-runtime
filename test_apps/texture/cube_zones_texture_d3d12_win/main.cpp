@@ -2671,6 +2671,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
+    // #740 repro: DXR_WIN_SIZE=WxH sets an exact client size. With
+    // DXR_ZONES_FULLWIN=1 the single zone == the client rect, mirroring the
+    // Unity glued-window case at a precise size so the phase residual (mod the
+    // ~5px lens pitch) can be dialed to the issue's 1695x930 / 2959x1654 rows.
+    if (const char* ws = getenv("DXR_WIN_SIZE")) {
+        int w = 0, h = 0;
+        if (sscanf(ws, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+            g_windowWidth = (UINT)w;
+            g_windowHeight = (UINT)h;
+            LOG_INFO("DXR_WIN_SIZE -> client %ux%u", g_windowWidth, g_windowHeight);
+        }
+    }
+
     // Create window FIRST (needed for XR_DXR_win32_window_binding)
     HWND hwnd = CreateAppWindow(hInstance, g_windowWidth, g_windowHeight);
     if (!hwnd) {
