@@ -930,6 +930,19 @@ bool
 comp_d3d11_service_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd);
 
 /*!
+ * XR_DXR_canvas_rect (#697): set/clear the per-client explicit on-panel canvas
+ * rect (display-relative device px). When @p valid, get_client_app_window_metrics
+ * derives the canvas from this rect instead of cross-process GetClientRect on the
+ * client's HWND — the windowless position/phase anchor. Seeded from xsi at
+ * session_create, live-updated by the set_canvas_rect IPC call.
+ *
+ * @return XRT_SUCCESS on a D3D11 service compositor, XRT_ERROR_IPC_FAILURE otherwise.
+ */
+xrt_result_t
+comp_d3d11_service_set_canvas_rect(
+    struct xrt_compositor *xc, bool valid, int32_t x, int32_t y, uint32_t w, uint32_t h);
+
+/*!
  * Import the caller's pre-weave SBS texture, run the DP weave into the
  * (server-allocated, bound-window-sized) output texture confined to @p rect_*
  * via canvas_offset/size, signal the output fence, and return the output dims +

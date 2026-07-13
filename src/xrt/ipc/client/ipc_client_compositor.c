@@ -486,6 +486,25 @@ comp_ipc_client_compositor_weave_bind_window(struct xrt_compositor *xc, uint64_t
 	return ipc_call_weave_bind_window(icc->ipc_c, hwnd);
 }
 
+/*!
+ * XR_DXR_canvas_rect (#697): forward the windowless producer's explicit on-panel
+ * canvas rect to the server. Same thin-bridge pattern as the weave accessors —
+ * oxr_canvas_rect.c forward-declares this and the runtime DLL links it.
+ */
+xrt_result_t
+comp_ipc_client_compositor_set_canvas_rect(
+    struct xrt_compositor *xc, bool valid, int32_t x, int32_t y, uint32_t w, uint32_t h)
+{
+	if (xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_set_canvas_rect(icc->ipc_c, valid, x, y, w, h);
+}
+
 xrt_result_t
 comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         xrt_graphics_buffer_handle_t in_handle,

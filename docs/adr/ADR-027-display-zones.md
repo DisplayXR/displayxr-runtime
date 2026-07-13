@@ -25,8 +25,11 @@ issues: [439, 396]
 > swapchain and never presents (`comp_d3d11_compositor.cpp:2103,2251-2333`); the
 > NULL-HWND path exists but degrades to display-scoped Kooima + no phase-snap.
 > Decoupling that position channel from the HWND (an on-screen target-rect binding
-> for genuinely windowless producers) is designed separately in **#697**. See
-> `docs/getting-started/app-classes.md` for the app-facing framing.
+> for genuinely windowless producers) shipped as
+> [`XR_DXR_canvas_rect`](../specs/extensions/XR_DXR_canvas_rect.md) (**#697**): the
+> producer declares its on-panel rect in display-relative device px instead of
+> binding a window. See `docs/getting-started/app-classes.md` for the app-facing
+> framing.
 
 ## Context
 

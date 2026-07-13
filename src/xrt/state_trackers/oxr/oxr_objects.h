@@ -1692,6 +1692,7 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
                                    void *window_handle,
                                    void *shared_texture_handle,
                                    bool transparent_background,
+                                   const struct xrt_session_info *xsi,
                                    struct oxr_session *sess);
 #endif
 

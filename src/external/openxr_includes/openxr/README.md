@@ -40,7 +40,8 @@ Rules:
 | 1004999190–191 | `XR_DXR_weave` | 190 = `XR_TYPE_WEAVE_SUBMIT_INFO_DXR`, 191 = `XR_TYPE_WEAVE_OUTPUT_DXR` (#625) |
 | 1004999200–209 | `XR_DXR_xlib_window_binding` | 200 = `XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR` (#660 Phase 3) |
 | 1004999210–219 | `XR_DXR_display_info` (v16+ additions) | 210 = `XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR` (#715); fresh decade rather than reusing the 005/009 gaps in the original block |
-| 1004999220+ | **next free** | |
+| 1004999220–229 | `XR_DXR_canvas_rect` | 220 = `XR_TYPE_CANVAS_RECT_BINDING_DXR` (#697 windowless canvas rect) |
+| 1004999230+ | **next free** | |
 
 `XR_DXR_android_surface_binding` defines no `1004999xxx` values in this
 directory as of this writing; if it gains any, claim a decade here first.

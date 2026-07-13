@@ -712,6 +712,16 @@
 		]
 	},
 
+	"set_canvas_rect": {
+		"in": [
+			{"name": "valid", "type": "bool"},
+			{"name": "x", "type": "int32_t"},
+			{"name": "y", "type": "int32_t"},
+			{"name": "w", "type": "uint32_t"},
+			{"name": "h", "type": "uint32_t"}
+		]
+	},
+
 	"weave_submit": {
 		"in": [
 			{"name": "args", "type": "struct ipc_arg_weave_submit"}

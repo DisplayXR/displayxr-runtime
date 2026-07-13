@@ -1014,6 +1014,17 @@ struct xrt_session_info
 	//! Platform-specific: HANDLE on Windows (D3D11/D3D12), IOSurfaceRef on macOS.
 	void *shared_texture_handle;
 
+	//! XR_DXR_canvas_rect (#697) create-time seed: when set, the on-panel
+	//! canvas rect is declared explicitly (display-relative device px, origin =
+	//! panel top-left) instead of derived from external_window_handle. The
+	//! compositor uses it as the position/phase anchor in get_window_metrics.
+	//! Live-updatable via xrSetCanvasRectDXR. Set from XrCanvasRectBindingDXR.
+	bool canvas_rect_valid;
+	int32_t canvas_rect_x;
+	int32_t canvas_rect_y;
+	uint32_t canvas_rect_w;
+	uint32_t canvas_rect_h;
+
 	//! True when this session is a WebXR bridge relay (XR_MND_headless +
 	//! XR_DXR_display_info). The compositor uses this to detect that a
 	//! concurrent legacy session is bridge-aware and should use mode-native

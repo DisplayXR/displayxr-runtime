@@ -670,6 +670,24 @@
 
 
 /*
+ * XR_DXR_canvas_rect
+ *
+ * Hand-added DisplayXR extension (generate_oxr_ext_support.py knows nothing of
+ * the DisplayXR blocks — keep them when regenerating). Windowless canvas-rect
+ * binding (#697): a present-owner declares its on-panel rect instead of a
+ * bound OS window. Platform-neutral surface; only the D3D11 compositors honor
+ * the override today (others return XR_ERROR_FUNCTION_UNSUPPORTED).
+ */
+#if defined(XR_DXR_canvas_rect)
+#define OXR_HAVE_DXR_canvas_rect
+#define OXR_EXTENSION_SUPPORT_DXR_canvas_rect(_) \
+    _(DXR_canvas_rect, DXR_CANVAS_RECT)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_canvas_rect(_)
+#endif
+
+
+/*
  * XR_DXR_workspace_file_dialog
  */
 #if defined(XR_DXR_workspace_file_dialog) && defined(XR_USE_PLATFORM_WIN32)
@@ -1177,6 +1195,7 @@
     OXR_EXTENSION_SUPPORT_DXR_view_rig(_) \
     OXR_EXTENSION_SUPPORT_DXR_display_zones(_) \
     OXR_EXTENSION_SUPPORT_DXR_weave(_) \
+    OXR_EXTENSION_SUPPORT_DXR_canvas_rect(_) \
     OXR_EXTENSION_SUPPORT_DXR_workspace_file_dialog(_) \
     OXR_EXTENSION_SUPPORT_DXR_mcp_tools(_) \
     OXR_EXTENSION_SUPPORT_BD_controller_interaction(_) \

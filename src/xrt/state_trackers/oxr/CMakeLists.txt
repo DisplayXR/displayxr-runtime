@@ -54,6 +54,7 @@ add_library(
 	oxr_two_call.h
 	oxr_verify.c
 	oxr_weave.c
+	oxr_canvas_rect.c
 	oxr_workspace.c
 	oxr_workspace_modal_win32.c
 	oxr_workspace_file_dialog.c

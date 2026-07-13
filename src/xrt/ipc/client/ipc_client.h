@@ -240,6 +240,15 @@ comp_ipc_client_compositor_weave_get_fence(struct xrt_compositor *xc,
                                            xrt_graphics_sync_handle_t *out_handle);
 
 /*!
+ * XR_DXR_canvas_rect (#697): forward a windowless producer's explicit on-panel
+ * canvas rect (display-relative device px) to the server. oxr_canvas_rect.c
+ * forward-declares this; only valid on the ipc_client_compositor (service) path.
+ */
+xrt_result_t
+comp_ipc_client_compositor_set_canvas_rect(
+    struct xrt_compositor *xc, bool valid, int32_t x, int32_t y, uint32_t w, uint32_t h);
+
+/*!
  * Workspace controller bridges (XR_DXR_spatial_workspace).
  *
  * Thin accessors used by the OpenXR state tracker to dispatch workspace

@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "name": "Cube CanvasRect Texture D3D11",
+  "id": "cube-canvasrect-d3d11",
+  "type": "3d",
+  "category": "test",
+  "display_mode": "auto",
+  "description": "XR_DXR_canvas_rect (#697) windowless-producer test: a shared-texture app that passes NO HWND and instead declares its on-panel canvas rect (display-relative px) via XrCanvasRectBindingDXR + xrSetCanvasRectDXR. Proves canvas-scoped Kooima + weave phase come from the declared rect, not a bound window.",
+  "icon": "icon.png",
+  "icon_3d": "icon_sbs.png",
+  "icon_3d_layout": "sbs-lr"
+}

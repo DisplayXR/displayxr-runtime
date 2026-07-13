@@ -128,6 +128,7 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
                                    void *window_handle,
                                    void *shared_texture_handle,
                                    bool transparent_background,
+                                   const struct xrt_session_info *xsi,
                                    struct oxr_session *sess)
 {
 	struct xrt_device *xdev = get_role_head(sess->sys);
@@ -150,6 +151,15 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
 		                 "Failed to create D3D11 native compositor: %d", xret);
+	}
+
+	// XR_DXR_canvas_rect (#697): seed the explicit on-panel canvas rect for a
+	// windowless producer (display-relative device px). The app updates it live
+	// via xrSetCanvasRectDXR; here we apply the create-time seed from xsi so the
+	// first locate/weave is framed correctly.
+	if (xsi != NULL && xsi->canvas_rect_valid) {
+		comp_d3d11_compositor_set_canvas_rect(&xcn->base, true, xsi->canvas_rect_x, xsi->canvas_rect_y,
+		                                      xsi->canvas_rect_w, xsi->canvas_rect_h);
 	}
 
 	// Set system devices for debug GUI qwerty driver support

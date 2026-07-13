@@ -320,6 +320,18 @@ struct d3d11_service_compositor
 	//! App's HWND from XR_DXR_win32_window_binding (for lazy standalone init)
 	HWND app_hwnd;
 
+	//! XR_DXR_canvas_rect (#697): explicit on-panel canvas rect declared by a
+	//! windowless IPC producer, display-relative device px (origin = panel
+	//! top-left). When valid, get_client_app_window_metrics synthesizes the
+	//! window group from this rect instead of cross-process GetClientRect on the
+	//! client's HWND. Seeded from xsi at session_create, live-updated via the
+	//! set_canvas_rect IPC call.
+	bool canvas_rect_valid;
+	int32_t canvas_rect_x;
+	int32_t canvas_rect_y;
+	uint32_t canvas_rect_w;
+	uint32_t canvas_rect_h;
+
 	//! Set when workspace re-activates — next layer_commit tears down standalone resources
 	bool pending_workspace_reentry;
 
@@ -11494,6 +11506,24 @@ comp_d3d11_service_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd)
 	return true;
 }
 
+extern "C" xrt_result_t
+comp_d3d11_service_set_canvas_rect(
+    struct xrt_compositor *xc, bool valid, int32_t x, int32_t y, uint32_t w, uint32_t h)
+{
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	c->canvas_rect_valid = valid && w > 0 && h > 0;
+	c->canvas_rect_x = x;
+	c->canvas_rect_y = y;
+	c->canvas_rect_w = w;
+	c->canvas_rect_h = h;
+	U_LOG_W("XR_DXR_canvas_rect: override %s (%d,%d %ux%u, display-relative px)",
+	        c->canvas_rect_valid ? "SET" : "CLEARED", x, y, w, h);
+	return XRT_SUCCESS;
+}
+
 extern "C" bool
 comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                xrt_graphics_buffer_handle_t in_handle,
@@ -11880,6 +11910,17 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	if (xsi != nullptr) {
 		external_hwnd = xsi->external_window_handle;
 		transparent_hwnd = xsi->transparent_background_enabled;
+
+		// XR_DXR_canvas_rect (#697): create-time seed of the explicit on-panel
+		// canvas rect for a windowless IPC producer. Live-updated via the
+		// set_canvas_rect IPC call; consumed in get_client_app_window_metrics.
+		if (xsi->canvas_rect_valid && xsi->canvas_rect_w > 0 && xsi->canvas_rect_h > 0) {
+			c->canvas_rect_valid = true;
+			c->canvas_rect_x = xsi->canvas_rect_x;
+			c->canvas_rect_y = xsi->canvas_rect_y;
+			c->canvas_rect_w = xsi->canvas_rect_w;
+			c->canvas_rect_h = xsi->canvas_rect_h;
+		}
 	}
 
 	if (!is_headless_relay && !is_workspace_controller) {
@@ -13528,11 +13569,15 @@ comp_d3d11_service_get_client_app_window_metrics(struct xrt_system_compositor *x
 	// app_hwnd is only populated in workspace mode; outside it the client's
 	// external HWND lives on the per-client render resources (set by
 	// init_client_render_resources from xsi->external_window_handle).
+	//
+	// XR_DXR_canvas_rect (#697): a windowless producer declares its on-panel
+	// rect explicitly — no HWND to read cross-process. When that override is
+	// present we synthesize the window group from it and skip the HWND path.
 	HWND hwnd = c->app_hwnd;
 	if (hwnd == nullptr || !IsWindow(hwnd)) {
 		hwnd = c->render.hwnd;
 	}
-	if (hwnd == nullptr || !IsWindow(hwnd)) {
+	if ((hwnd == nullptr || !IsWindow(hwnd)) && !c->canvas_rect_valid) {
 		return false;
 	}
 
@@ -13546,18 +13591,25 @@ comp_d3d11_service_get_client_app_window_metrics(struct xrt_system_compositor *x
 		return false;
 	}
 
-	RECT rect;
-	if (!GetClientRect(hwnd, &rect)) {
-		return false;
+	uint32_t win_px_w = 0, win_px_h = 0;
+	POINT client_origin = {0, 0};
+	if (c->canvas_rect_valid) {
+		win_px_w = c->canvas_rect_w;
+		win_px_h = c->canvas_rect_h;
+		client_origin.x = disp_left + c->canvas_rect_x;
+		client_origin.y = disp_top + c->canvas_rect_y;
+	} else {
+		RECT rect;
+		if (!GetClientRect(hwnd, &rect)) {
+			return false;
+		}
+		win_px_w = static_cast<uint32_t>(rect.right - rect.left);
+		win_px_h = static_cast<uint32_t>(rect.bottom - rect.top);
+		ClientToScreen(hwnd, &client_origin);
 	}
-	uint32_t win_px_w = static_cast<uint32_t>(rect.right - rect.left);
-	uint32_t win_px_h = static_cast<uint32_t>(rect.bottom - rect.top);
 	if (win_px_w == 0 || win_px_h == 0) {
 		return false;
 	}
-
-	POINT client_origin = {0, 0};
-	ClientToScreen(hwnd, &client_origin);
 
 	float pixel_size_x = disp_w_m / (float)disp_px_w;
 	float pixel_size_y = disp_h_m / (float)disp_px_h;

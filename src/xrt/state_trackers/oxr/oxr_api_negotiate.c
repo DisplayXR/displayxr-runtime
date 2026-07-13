@@ -503,6 +503,10 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrWeaveSnapWindowRectDXR, DXR_weave);
 #endif
 
+#ifdef OXR_HAVE_DXR_canvas_rect
+	ENTRY_IF_EXT(xrSetCanvasRectDXR, DXR_canvas_rect);
+#endif
+
 #ifdef OXR_HAVE_DXR_workspace_file_dialog
 	ENTRY_IF_EXT(xrRequestFilePickerDXR, DXR_workspace_file_dialog);
 	ENTRY_IF_EXT(xrGetFilePickerRequestDXR, DXR_workspace_file_dialog);

@@ -3446,7 +3446,7 @@ oxr_session_create_impl(struct oxr_logger *log,
 			// Use D3D11 native compositor - no Vulkan involvement
 			return oxr_session_populate_d3d11_native(log, sys, d3d11, xsi->external_window_handle,
 			                                          xsi->shared_texture_handle,
-			                                          xsi->transparent_background_enabled,
+			                                          xsi->transparent_background_enabled, xsi,
 			                                          *out_session);
 		}
 #else
@@ -3650,6 +3650,24 @@ oxr_session_create(struct oxr_logger *log,
 		xsi.flags = overlay_info->createFlags;
 		xsi.z_order = overlay_info->sessionLayersPlacement;
 	}
+
+#ifdef OXR_HAVE_DXR_canvas_rect
+	// XR_DXR_canvas_rect (#697): platform-neutral create-time seed for the
+	// on-panel canvas rect (display-relative device px). A windowless producer
+	// declares its rect here instead of binding an OS window; the compositor
+	// uses it as the position/phase anchor in get_window_metrics, and the app
+	// updates it live via xrSetCanvasRectDXR. Honored on the D3D11 compositors.
+	const XrCanvasRectBindingDXR *canvas_binding = OXR_GET_INPUT_FROM_CHAIN(
+	    createInfo, XR_TYPE_CANVAS_RECT_BINDING_DXR, XrCanvasRectBindingDXR);
+	if (canvas_binding != NULL && canvas_binding->rectPx.extent.width > 0 &&
+	    canvas_binding->rectPx.extent.height > 0) {
+		xsi.canvas_rect_valid = true;
+		xsi.canvas_rect_x = canvas_binding->rectPx.offset.x;
+		xsi.canvas_rect_y = canvas_binding->rectPx.offset.y;
+		xsi.canvas_rect_w = (uint32_t)canvas_binding->rectPx.extent.width;
+		xsi.canvas_rect_h = (uint32_t)canvas_binding->rectPx.extent.height;
+	}
+#endif
 
 #ifdef XRT_OS_WINDOWS
 	// Parse XR_DXR_win32_window_binding extension - allows app to provide its own window,

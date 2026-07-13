@@ -226,6 +226,25 @@ comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc,
                                           struct xrt_window_metrics *out_metrics);
 
 /*!
+ * XR_DXR_canvas_rect (#697): set/clear the explicit on-panel canvas rect for a
+ * windowless producer. When @p valid, get_window_metrics derives the canvas from
+ * this rect (display-relative device px, origin = panel top-left) instead of the
+ * bound HWND; @p valid == false reverts to the HWND / display-scoped path. Seeded
+ * from xsi at create, live-updated by xrSetCanvasRectDXR.
+ *
+ * @return XRT_SUCCESS always (state store).
+ *
+ * @ingroup comp_d3d11
+ */
+xrt_result_t
+comp_d3d11_compositor_set_canvas_rect(struct xrt_compositor *xc,
+                                      bool valid,
+                                      int32_t x,
+                                      int32_t y,
+                                      uint32_t w,
+                                      uint32_t h);
+
+/*!
  * Request display mode switch (2D/3D) via display processor.
  *
  * @param xc The compositor.

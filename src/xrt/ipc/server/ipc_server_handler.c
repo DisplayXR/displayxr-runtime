@@ -5582,6 +5582,34 @@ ipc_handle_weave_bind_window(volatile struct ipc_client_state *ics, uint64_t hwn
 }
 
 xrt_result_t
+ipc_handle_set_canvas_rect(volatile struct ipc_client_state *ics,
+                           bool valid,
+                           int32_t x,
+                           int32_t y,
+                           uint32_t w,
+                           uint32_t h)
+{
+	IPC_TRACE_MARKER();
+
+	if (ics->xc == NULL) {
+		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// XR_DXR_canvas_rect (#697): the client's per-compositor override. Consumed
+	// in comp_d3d11_service_get_client_app_window_metrics.
+	return comp_d3d11_service_set_canvas_rect(ics->xc, valid, x, y, w, h);
+#else
+	(void)valid;
+	(void)x;
+	(void)y;
+	(void)w;
+	(void)h;
+	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+#endif
+}
+
+xrt_result_t
 ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
                         const struct ipc_arg_weave_submit *args,
                         bool *out_have_output,

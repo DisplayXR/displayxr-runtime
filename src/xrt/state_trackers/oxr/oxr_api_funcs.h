@@ -1037,6 +1037,12 @@ oxr_xrWeaveSnapWindowRectDXR(XrSession session,
                             XrRect2Di *snappedRect);
 #endif
 
+#ifdef OXR_HAVE_DXR_canvas_rect
+//! OpenXR API function @ep{xrSetCanvasRectDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetCanvasRectDXR(XrSession session, const XrRect2Di *rectPx);
+#endif
+
 #ifdef OXR_HAVE_EXT_conformance_automation
 //! OpenXR API function @ep{xrSetInputDeviceActiveEXT}
 XRAPI_ATTR XrResult XRAPI_CALL

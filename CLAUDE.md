@@ -75,6 +75,7 @@ Vendor display drivers ship as **plug-in DLLs** from their own repos (ADR-019). 
 - `XR_DXR_xlib_window_binding` — app passes X11 Display*/Window to runtime (desktop Linux)
 - `XR_DXR_display_info` — display dimensions, eye-tracking modes
 - `XR_DXR_android_surface_binding` — Android surface binding
+- `XR_DXR_canvas_rect` — windowless producer declares its on-panel canvas rect (display-relative px) instead of binding an HWND; decouples the position/phase anchor from the window (#697). `XrCanvasRectBindingDXR` seed + `xrSetCanvasRectDXR` live update. D3D11 in-proc + service; exerciser `cube_canvasrect_d3d11_win`.
 - `XR_DXR_mcp_tools` — app registers its own MCP tools (agent control surface); event-queue dispatch via `XrEventDataMCPToolCallDXR`
 
 Specs: `docs/specs/extensions/`. Eye-tracking MANAGED vs MANUAL contract: `docs/specs/vendor/eye-tracking-modes.md`.

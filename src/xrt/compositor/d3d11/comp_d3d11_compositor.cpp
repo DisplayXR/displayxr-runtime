@@ -122,6 +122,17 @@ struct comp_d3d11_compositor
 	//! to match this window's client rect on screen.
 	HWND app_hwnd;
 
+	//! XR_DXR_canvas_rect (#697): explicit on-panel canvas rect declared by a
+	//! windowless producer, display-relative device px (origin = panel top-left).
+	//! When valid, get_window_metrics synthesizes the window group from this rect
+	//! instead of reading app_hwnd's client rect — the position/phase anchor with
+	//! no HWND. Seeded from xsi at create, live-updated via set_canvas_rect.
+	bool canvas_rect_valid;
+	int32_t canvas_rect_x;
+	int32_t canvas_rect_y;
+	uint32_t canvas_rect_w;
+	uint32_t canvas_rect_h;
+
 	//! Self-created window (NULL if app provided window).
 	struct comp_d3d11_window *own_window;
 
@@ -378,6 +389,22 @@ d3d11_update_zone_wish_state(struct comp_d3d11_compositor *c);
 static struct u_canvas_rect
 d3d11_effective_canvas(struct comp_d3d11_compositor *c)
 {
+	// XR_DXR_canvas_rect (#697): a windowless producer declares its on-panel
+	// rect. There is no HWND, so the DP was created "fullscreen" (panel-origin
+	// phase base). Hand it the DISPLAY-relative rect as the canvas — the DP
+	// combines panel-origin + this offset to reach the correct absolute weave
+	// phase, and crops the weave to the rect. This is the phase channel the
+	// get_window_metrics override (Kooima) does NOT cover.
+	if (c->canvas_rect_valid) {
+		struct u_canvas_rect cr = {};
+		cr.valid = true;
+		cr.x = c->canvas_rect_x;
+		cr.y = c->canvas_rect_y;
+		cr.w = c->canvas_rect_w;
+		cr.h = c->canvas_rect_h;
+		return cr;
+	}
+
 	// XR_DXR_display_zones: a zones frame spans the full client window by
 	// definition (each zone rect is its own canvas; the output rect is
 	// inert) — same supersede geometry as the mask/Local2D rules below.
@@ -2092,6 +2119,11 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	c->own_window = nullptr;
 	c->owns_window = false;
 	c->app_hwnd = nullptr;
+	c->canvas_rect_valid = false;
+	c->canvas_rect_x = 0;
+	c->canvas_rect_y = 0;
+	c->canvas_rect_w = 0;
+	c->canvas_rect_h = 0;
 	c->hardware_display_3d = true;
 	c->last_3d_mode_index = 1;
 
@@ -3917,8 +3949,12 @@ comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc,
 	// Without this, texture sessions had NO window metrics at all and the
 	// runtime-side Kooima (rig path, raw channel, legacy-2D fovs) ran
 	// display-scoped (#396 W7).
+	//
+	// XR_DXR_canvas_rect (#697): a windowless producer may instead DECLARE its
+	// on-panel rect explicitly. When that override is present we synthesize the
+	// window group from it and never touch an HWND — same downstream math.
 	HWND metrics_hwnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
-	if (c->display_processor == nullptr || metrics_hwnd == nullptr) {
+	if (c->display_processor == nullptr || (metrics_hwnd == nullptr && !c->canvas_rect_valid)) {
 		return false;
 	}
 
@@ -3942,20 +3978,28 @@ comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc,
 		return false;
 	}
 
-	// Get window client rect
-	RECT rect;
-	if (!GetClientRect(metrics_hwnd, &rect)) {
-		return false;
+	// Resolve the canvas: either the declared rect (#697 override, display-
+	// relative → absolute screen by adding the panel origin) or the bound
+	// window's client rect projected to screen.
+	uint32_t win_px_w = 0, win_px_h = 0;
+	POINT client_origin = {0, 0};
+	if (c->canvas_rect_valid) {
+		win_px_w = c->canvas_rect_w;
+		win_px_h = c->canvas_rect_h;
+		client_origin.x = disp_left + c->canvas_rect_x;
+		client_origin.y = disp_top + c->canvas_rect_y;
+	} else {
+		RECT rect;
+		if (!GetClientRect(metrics_hwnd, &rect)) {
+			return false;
+		}
+		win_px_w = static_cast<uint32_t>(rect.right - rect.left);
+		win_px_h = static_cast<uint32_t>(rect.bottom - rect.top);
+		ClientToScreen(metrics_hwnd, &client_origin);
 	}
-	uint32_t win_px_w = static_cast<uint32_t>(rect.right - rect.left);
-	uint32_t win_px_h = static_cast<uint32_t>(rect.bottom - rect.top);
 	if (win_px_w == 0 || win_px_h == 0) {
 		return false;
 	}
-
-	// Get window screen position
-	POINT client_origin = {0, 0};
-	ClientToScreen(metrics_hwnd, &client_origin);
 
 	// Compute pixel size (meters per pixel)
 	float pixel_size_x = disp_w_m / (float)disp_px_w;
@@ -4000,6 +4044,26 @@ comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc,
 	out_metrics->valid = true;
 
 	return true;
+}
+
+extern "C" xrt_result_t
+comp_d3d11_compositor_set_canvas_rect(
+    struct xrt_compositor *xc, bool valid, int32_t x, int32_t y, uint32_t w, uint32_t h)
+{
+	if (xc == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+	c->canvas_rect_valid = valid && w > 0 && h > 0;
+	c->canvas_rect_x = x;
+	c->canvas_rect_y = y;
+	c->canvas_rect_w = w;
+	c->canvas_rect_h = h;
+	// One-shot (not per-frame) — WARN so it lands in the DisplayXR log for
+	// diagnostics without a console (#697 exerciser).
+	U_LOG_W("XR_DXR_canvas_rect: override %s (%d,%d %ux%u, display-relative px)",
+	        c->canvas_rect_valid ? "SET" : "CLEARED", x, y, w, h);
+	return XRT_SUCCESS;
 }
 
 extern "C" bool

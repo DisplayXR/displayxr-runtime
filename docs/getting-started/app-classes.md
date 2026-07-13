@@ -103,10 +103,18 @@ degrades two position-only jobs, not just one:
 
 So a genuinely windowless / out-of-process producer (WebXR, CEF, engine offscreen)
 can already hand off a texture, but loses window-relative projection and phase
-alignment because both are sourced from an HWND. The clean fix — an on-screen
-target-rect channel replacing the HWND for both position jobs — is designed in
-**[#697](https://github.com/DisplayXR/displayxr-runtime/issues/697)**
-(windowless target-rect binding).
+alignment when both are sourced from an HWND. The clean fix — an on-screen
+target-rect channel replacing the HWND for both position jobs — shipped as
+[`XR_DXR_canvas_rect`](../specs/extensions/XR_DXR_canvas_rect.md) (**#697**): the
+producer declares its on-panel rect (display-relative device px) via
+`XrCanvasRectBindingDXR` at create + `xrSetCanvasRectDXR` on move/resize, and the
+runtime feeds it through the same `get_window_metrics` producer the HWND path uses
+(so canvas-scoped Kooima + weave phase come from the rect, with no window). Both
+phase jobs are recovered — drag phase-snap is app-driven via
+`xrWeaveSnapWindowRectDXR` (already absolute-screen-coords); the only thing lost
+vs. a bound window is OS self-tracking (the app now owns rect updates). Exerciser:
+`test_apps/texture/cube_canvasrect_d3d11_win` (passes a shared texture + a rect,
+no HWND).
 
 ## Which Class Should I Use?
 
