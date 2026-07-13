@@ -158,11 +158,28 @@ ipc_send_handles(
 		return ipc_send(imc, nullptr, 0);
 	}
 
-	HANDLE target_process = open_target_process_dup_handle(imc);
-	if (!target_process) {
-		DWORD err = GetLastError();
-		IPC_ERROR(imc, "open_target_process_dup_handle failed: %d %s", err, ipc_winerror(err));
-		return XRT_ERROR_IPC_FAILURE;
+	// #625: low-bit-tagged handles (legacy DXGI shared handles) are process-
+	// independent identifiers that cross the wire raw — they are never
+	// DuplicateHandle'd into the peer. Only open the peer process when some
+	// handle actually needs duplication: a sandboxed low-integrity sender (the
+	// inline-3D browser's GPU process) cannot OpenProcess(PROCESS_DUP_HANDLE)
+	// the medium-integrity service, and it doesn't need to for tagged handles.
+	bool needs_dup = false;
+	for (uint32_t i = 0; i < handle_count; i++) {
+		if (((size_t)handles[i] & 1) == 0) {
+			needs_dup = true;
+			break;
+		}
+	}
+
+	HANDLE target_process = NULL;
+	if (needs_dup) {
+		target_process = open_target_process_dup_handle(imc);
+		if (!target_process) {
+			DWORD err = GetLastError();
+			IPC_ERROR(imc, "open_target_process_dup_handle failed: %d %s", err, ipc_winerror(err));
+			return XRT_ERROR_IPC_FAILURE;
+		}
 	}
 
 	HANDLE current_process = GetCurrentProcess();
@@ -182,7 +199,9 @@ ipc_send_handles(
 		}
 		v.push_back(handle);
 	}
-	CloseHandle(target_process);
+	if (target_process != NULL) {
+		CloseHandle(target_process);
+	}
 	return ipc_send(imc, v.data(), v.size() * sizeof(*v.data()));
 }
 
