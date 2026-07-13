@@ -107,13 +107,26 @@ create_pipe_instance(struct ipc_server_mainloop *ml, bool first)
 	 * https://learn.microsoft.com/en-us/windows/win32/secbp/creating-a-dacl
 	 * https://learn.microsoft.com/en-us/windows/win32/secauthz/sid-strings
 	 */
+	// #625: the DisplayXR Browser's inline-3D weave session runs inside Chromium's
+	// GPU process, which is LOW integrity with a restricted token even before the
+	// sandbox lowers it. A named pipe has no mandatory label by default (implicit
+	// Medium), so the no-write-up policy blocks a Low client from opening it for
+	// GENERIC_WRITE → CreateFile fails ERROR_ACCESS_DENIED. Add a Low integrity
+	// label (SACL) so Low-integrity clients can connect, and grant the RESTRICTED
+	// SID so a restricted token's restricting-SID access pass also succeeds. This
+	// is local-only (PIPE_REJECT_REMOTE_CLIENTS) and only widens integrity, not
+	// identity (Guest/Anonymous stay denied). Same intent as the AppContainer
+	// (AC) grant already here for the WebXR bridge.
 	const TCHAR *str =               //
 	    TEXT("D:")                   // Discretionary ACL
 	    TEXT("(D;OICI;GA;;;BG)")     // Guest: deny
 	    TEXT("(D;OICI;GA;;;AN)")     // Anonymous: deny
 	    TEXT("(A;OICI;GRGWGX;;;AC)") // UWP/AppContainer packages: read/write/execute
 	    TEXT("(A;OICI;GRGWGX;;;AU)") // Authenticated user: read/write/execute
-	    TEXT("(A;OICI;GA;;;BA)");    // Administrator: full control
+	    TEXT("(A;OICI;GRGWGX;;;RC)") // Restricted code (sandboxed GPU proc): r/w/x
+	    TEXT("(A;OICI;GA;;;BA)")     // Administrator: full control
+	    TEXT("S:")                   // System ACL (mandatory label)
+	    TEXT("(ML;;NW;;;LW)");       // Low integrity object, no-write-up
 
 	BOOL bret = ConvertStringSecurityDescriptorToSecurityDescriptor( //
 	    str,                                                         // StringSecurityDescriptor
@@ -280,6 +293,20 @@ ipc_server_mainloop_poll(struct ipc_server *vs, struct ipc_server_mainloop *ml)
 	switch (DWORD err = GetLastError()) {
 	case ERROR_PIPE_LISTENING: return;
 	case ERROR_PIPE_CONNECTED: handle_connected_client(vs, ml); return;
+	case ERROR_NO_DATA:      // 232: client opened the pipe then closed it before
+	case ERROR_BROKEN_PIPE:  // 109: we accepted — it aborted mid-connect.
+		// A client aborted before the handshake completed (e.g. #625: the
+		// DisplayXR Browser's GPU-process weave client connecting pre-sandbox
+		// may open-and-drop on a retry, or a port scanner probes the pipe).
+		// The current instance is now in a closing state, but that must NOT take
+		// the whole service down — recycle this instance and re-arm the listener
+		// so other clients keep working.
+		U_LOG_W("ConnectNamedPipe: client aborted before handshake (%d %s); re-arming listener", err,
+		        ipc_winerror(err));
+		CloseHandle(ml->pipe_handle);
+		ml->pipe_handle = INVALID_HANDLE_VALUE;
+		create_another_pipe_instance(vs, ml);
+		return;
 	default:
 		U_LOG_E("ConnectNamedPipe failed: %d %s", err, ipc_winerror(err));
 		ipc_server_handle_failure(vs);
