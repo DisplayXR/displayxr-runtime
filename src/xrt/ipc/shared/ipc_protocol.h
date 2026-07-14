@@ -735,21 +735,50 @@ struct ipc_arg_swapchain_from_native
 };
 
 /*!
+ * Max rects one weave_submit batch carries (spec v3). Mirrors
+ * XR_WEAVE_SUBMIT_MAX_RECTS_DXR; sized so the encompassing IPC message stays
+ * well within IPC_BUF_SIZE (16 B/rect -> 512 B of rects).
+ */
+#define IPC_WEAVE_SUBMIT_RECTS_MAX 32
+
+/*!
+ * One window-relative weave sub-rect on the wire (bound-window client pixels,
+ * y-down).
+ *
+ * @ingroup ipc
+ */
+struct ipc_weave_rect
+{
+	int32_t x;  //!< Sub-rect left
+	int32_t y;  //!< Sub-rect top
+	uint32_t w; //!< Sub-rect width in pixels
+	uint32_t h; //!< Sub-rect height in pixels
+};
+
+/*!
  * XR_DXR_weave over IPC (#625): per-frame weave_submit arguments. The pre-weave
  * input texture rides as an in_handle (xrt_graphics_buffer_handle_t); this POD
- * carries the window-relative output sub-rect. The interlace is DP-internal
+ * carries the window-relative output sub-rect(s). The interlace is DP-internal
  * (reads the vendor's own eye tracker), so nothing eye-related travels in;
  * weave_submit RETURNS the tracked eyes (struct xrt_eye_positions) for the
  * caller's off-axis rendering.
+ *
+ * rect_count discriminates the two input-layout contracts (spec v3):
+ * 0 = legacy single-rect — the input texture is an element-sized 2x1 SBS atlas
+ * for rect_x/y/w/h (byte-equivalent to spec v2; rects[] unused). >= 1 = batch —
+ * the input texture is window-sized with each rect's SBS content at that
+ * rect's own window position; rect_x/y/w/h unused.
  *
  * @ingroup ipc
  */
 struct ipc_arg_weave_submit
 {
-	int32_t rect_x;  //!< Sub-rect left, bound-window client pixels (y-down)
-	int32_t rect_y;  //!< Sub-rect top, bound-window client pixels (y-down)
-	uint32_t rect_w; //!< Sub-rect width in pixels
-	uint32_t rect_h; //!< Sub-rect height in pixels
+	int32_t rect_x;  //!< Legacy sub-rect left, bound-window client pixels (y-down)
+	int32_t rect_y;  //!< Legacy sub-rect top, bound-window client pixels (y-down)
+	uint32_t rect_w; //!< Legacy sub-rect width in pixels
+	uint32_t rect_h; //!< Legacy sub-rect height in pixels
+	uint32_t rect_count; //!< 0 = legacy layout (rect_x/y/w/h); 1..MAX = batch layout (rects[])
+	struct ipc_weave_rect rects[IPC_WEAVE_SUBMIT_RECTS_MAX]; //!< Batch rects (first rect_count valid)
 };
 
 /*!
