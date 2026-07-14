@@ -1128,3 +1128,45 @@ upstream already ships the map through TreesInViz in the same `LayerTreeUpdate` 
 per-canvas layers each project a full-size scroll-current rect; aggregator log
 `weave rects from tracked elements: n=5`; **fast-scroll trailing GONE — user: "it's PERFECT
 now"**. Closes displayxr-browser#13.
+
+### 13.9 Batched weave submit — N rects, one `xrWeaveSubmitDXR` per frame (2026-07-14)
+
+**The scaling wall:** the §13.6 sync weave does one synchronous `xrWeaveSubmitDXR` per visible
+inline-3d element per frame, serialized on Viz's present thread, ~1 ms each (measured ~965 µs).
+The per-rect DP weave cost is bounded by window pixels (every submit accumulates into the ONE
+shared window-sized output — §13.4's multi-element finding), so the N× overhead is entirely
+per-submit *fixed* cost: runtime IPC round-trip + `OpenSharedResource` + keyed-mutex
+acquire/release + fence signal. 5 elements ≈ 5 ms of the 16.6 ms budget; a scrolling wall of 3D
+pictures capped out at ~8-12 visible elements.
+
+**Fix (runtime PR #744 = `XR_DXR_weave` SPEC_VERSION 3 + fork commit tag+27):** ONE submit per
+frame carrying N rects.
+
+- **Extension:** a chained `XrWeaveSubmitRectsDXR` (`rectCount` ≤ `XR_WEAVE_SUBMIT_MAX_RECTS_DXR`
+  = 32, callers chunk past it) on `XrWeaveSubmitInfoDXR::next`. The chain *switches the input
+  layout contract*: absent = the legacy element-sized 2×1 SBS atlas (byte-equivalent to v2, so
+  webxr_bridge / the CEF host / pre-batch browser builds run unchanged — `sizeof` of the base
+  struct is stable); present = a **window-sized input with each rect's SBS content at that rect's
+  own window position** (identity mapping: sample position == weave position). Spec:
+  `docs/specs/extensions/XR_DXR_weave.md`.
+- **Service:** the DP's `process_atlas` samples its whole SRV as the atlas (no input-offset
+  param), so the batch loop first copies each rect out of the shared input into a cached
+  exact-size scratch tile (`CopySubresourceRegion`, released the input keyed-mutex right after
+  the copies), then runs the *existing* per-rect `process_atlas` into the shared output and
+  signals the fence **once** after the loop. No DP/vendor-plugin change → no plugin-ABI gate.
+  Wire: `ipc_arg_weave_submit` gains `rect_count` (0 = legacy discriminator) + a fixed
+  `ipc_weave_rect[32]`.
+- **Browser GPU side:** `DisplayXRWeaveGpu` grows a batch mode (`SyncMode()` **and** the runtime
+  reporting weave spec ≥ 3 — the client now captures `XrExtensionProperties::extensionVersion`,
+  previously unread). The per-target keyed-mutex input pool collapses into ONE window-sized
+  legacy-DXGI shared input; `WeaveCanvas`/`WeavePixels` become copy-only (same copy count as
+  before, dest = the element's own window position), and Viz's Phase A brackets its existing
+  per-target loop with `BeginBatchSync(window_size)` … `SubmitBatchSync()`. Phase B is unchanged
+  — it already imported the shared window-sized woven output once and drew each rect's region.
+  Fresh woven/fence handles ride the first result entry; the rest carry 0 = reuse. The per-target
+  v2 path is kept intact as the fallback for older runtimes.
+- **Memory:** one window-sized input (~20 MB @ 2593×1974 BGRA) replaces N element-sized inputs.
+- **Validation sample:** `displayxr-web` `samples/wall-3d/` — a 60-tile scrolling wall where an
+  `IntersectionObserver` lazily creates/`close()`s one `XRDisplayLayer` per picture on viewport
+  enter/leave; both the stress test and the lazy-load pattern image-heavy pages should copy.
+  Throttled `VLOG(1) batch weave: n=… in …us` reports the one-submit cost.
