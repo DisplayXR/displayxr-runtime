@@ -205,8 +205,13 @@ comp_ipc_client_compositor_get_transparent_output_fence(struct xrt_compositor *x
  * path). The DP weaves server-side (ADR-007 / ADR-019).
  *
  * @c weave_bind_window registers the present-owner's HWND for DP phase-snap.
- * @c weave_submit hands a pre-weave SBS texture (in_handle) + a window-relative
- *   rect across per frame and returns the weaved dims + the fence wait value.
+ * @c weave_submit hands a pre-weave SBS texture (in_handle) + window-relative
+ *   rect(s) across per frame and returns the weaved dims + the fence wait
+ *   value. @p rect_count == 0 selects the legacy single-rect layout
+ *   (@p rect_x/y/w/h, element-sized SBS-atlas input, spec v2 wire bytes);
+ *   @p rect_count 1..IPC_WEAVE_SUBMIT_RECTS_MAX selects the spec-v3 batch
+ *   layout (window-sized input, each rect's content at its own window
+ *   position, @p rects used, @p rect_x/y/w/h ignored).
  * @c weave_get_output / @c weave_get_fence fetch the persistent server-allocated
  *   weaved-texture handle + fence handle ONCE (the caller caches them).
  */
@@ -221,6 +226,8 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         int32_t rect_y,
                                         uint32_t rect_w,
                                         uint32_t rect_h,
+                                        uint32_t rect_count,
+                                        const struct xrt_rect *rects,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,

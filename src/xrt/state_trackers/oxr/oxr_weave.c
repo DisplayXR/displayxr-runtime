@@ -28,6 +28,7 @@
 
 #include "oxr_api_funcs.h"
 #include "oxr_api_verify.h"
+#include "oxr_chain.h"
 
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_handles.h"
@@ -56,6 +57,8 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         int32_t rect_y,
                                         uint32_t rect_w,
                                         uint32_t rect_h,
+                                        uint32_t rect_count,
+                                        const struct xrt_rect *rects,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
@@ -143,6 +146,33 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		                 "out-of-process (service) path");
 	}
 
+	// Spec v3 batched submit: a chained XrWeaveSubmitRectsDXR switches the
+	// input-layout contract (window-sized input, content at each rect's own
+	// window position; base rect ignored). Absent chain = legacy single-rect,
+	// byte-equivalent to spec v2.
+	uint32_t rect_count = 0;
+	struct xrt_rect rects[XR_WEAVE_SUBMIT_MAX_RECTS_DXR];
+	const XrWeaveSubmitRectsDXR *batch =
+	    OXR_GET_INPUT_FROM_CHAIN(submitInfo, XR_TYPE_WEAVE_SUBMIT_RECTS_DXR, XrWeaveSubmitRectsDXR);
+	if (batch != NULL) {
+		if (batch->rectCount < 1 || batch->rectCount > XR_WEAVE_SUBMIT_MAX_RECTS_DXR) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrWeaveSubmitRectsDXR::rectCount (%u) must be "
+			                 "1..XR_WEAVE_SUBMIT_MAX_RECTS_DXR (%u)",
+			                 batch->rectCount, (uint32_t)XR_WEAVE_SUBMIT_MAX_RECTS_DXR);
+		}
+		OXR_VERIFY_ARG_NOT_NULL(&log, batch->rects);
+		rect_count = batch->rectCount;
+		for (uint32_t i = 0; i < rect_count; i++) {
+			// xrt_offset names its fields w/h (see the @todo in xrt_defines.h);
+			// they are x/y here.
+			rects[i].offset.w = batch->rects[i].offset.x;
+			rects[i].offset.h = batch->rects[i].offset.y;
+			rects[i].extent.w = (int)batch->rects[i].extent.width;
+			rects[i].extent.h = (int)batch->rects[i].extent.height;
+		}
+	}
+
 	bool have_out = false;
 	uint32_t w = 0, h = 0;
 	uint64_t fence_value = 0;
@@ -150,8 +180,8 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	xrt_result_t xret = comp_ipc_client_compositor_weave_submit(
 	    &sess->xcn->base, (xrt_graphics_buffer_handle_t)submitInfo->inputTexture,
 	    submitInfo->inputIsDxgi == XR_TRUE, submitInfo->rect.offset.x, submitInfo->rect.offset.y,
-	    (uint32_t)submitInfo->rect.extent.width, (uint32_t)submitInfo->rect.extent.height, &have_out, &w, &h,
-	    &fence_value, &eyes);
+	    (uint32_t)submitInfo->rect.extent.width, (uint32_t)submitInfo->rect.extent.height, rect_count,
+	    rect_count > 0 ? rects : NULL, &have_out, &w, &h, &fence_value, &eyes);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
 		                 "xrWeaveSubmitDXR: weave failed (xrt_result=%d)", (int)xret);

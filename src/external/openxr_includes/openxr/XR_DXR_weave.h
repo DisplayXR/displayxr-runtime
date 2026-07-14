@@ -76,6 +76,31 @@
  *
  * Only the rect's offset (top-left) is snapped; the extent passes through
  * unchanged. This is a synchronous, GPU-free query — no texture, no fence.
+ *
+ * Batched submit (SPEC_VERSION 3, issue #625). Per-element submits serialize
+ * the per-call fixed cost (IPC round-trip + shared-texture open + keyed-mutex
+ * + fence) N times per frame, which caps a page at ~8-12 visible weaved
+ * elements. Version 3 amortizes that to ONE submit per frame: chain an
+ * XrWeaveSubmitRectsDXR onto XrWeaveSubmitInfoDXR::next carrying up to
+ * XR_WEAVE_SUBMIT_MAX_RECTS_DXR rects. The chained struct SWITCHES the input
+ * layout contract:
+ *
+ *  - Chain absent (v2 behavior, unchanged): @c inputTexture is an
+ *    element-sized 2x1 SBS atlas for the single @c rect; the whole texture is
+ *    the atlas (left view = left half).
+ *  - Chain present (batch): @c inputTexture is sized to the bound window's
+ *    client area, and each rect's pre-weave SBS content sits in it AT THAT
+ *    RECT'S OWN WINDOW POSITION (identity mapping: sample position == weave
+ *    position; each rect region itself holds squeezed SBS, left view in the
+ *    left half of the rect). The base @c rect field is ignored.
+ *
+ * All rects weave into the same window-sized output with ONE fence signal at
+ * the end; eyes are returned once per call. A batch is NOT equivalent to N
+ * single-rect submits of the same texture — the layouts differ (see above).
+ *
+ * Version history: 1 = initial (pre-rename numbering carried over); 2 =
+ * inputIsDxgi legacy-DXGI handle tagging; 3 = XrWeaveSubmitRectsDXR batched
+ * submit.
  */
 #ifndef XR_DXR_WEAVE_H
 #define XR_DXR_WEAVE_H 1
@@ -88,17 +113,23 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 2
+#define XR_DXR_weave_SPEC_VERSION 3
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
-// Reserved 1004999190..191. Final values reconcile with the Khronos registry
+// Reserved 1004999190..192. Final values reconcile with the Khronos registry
 // before spec freeze. Allocation registry: README.md in this directory.
-#define XR_TYPE_WEAVE_SUBMIT_INFO_DXR ((XrStructureType)1004999190)
-#define XR_TYPE_WEAVE_OUTPUT_DXR      ((XrStructureType)1004999191)
+#define XR_TYPE_WEAVE_SUBMIT_INFO_DXR  ((XrStructureType)1004999190)
+#define XR_TYPE_WEAVE_OUTPUT_DXR       ((XrStructureType)1004999191)
+#define XR_TYPE_WEAVE_SUBMIT_RECTS_DXR ((XrStructureType)1004999192)
 
 //! Upper bound on eye positions carried by XrWeaveSubmitInfoDXR (mirrors the
 //! runtime's XRT_MAX_VIEWS). Phase 1: carried but unused.
 #define XR_WEAVE_MAX_EYES_DXR 8
+
+//! Upper bound on rects carried by one XrWeaveSubmitRectsDXR (sized so the
+//! runtime's IPC message stays within its fixed buffer). Callers with more
+//! visible elements split into multiple batched submits.
+#define XR_WEAVE_SUBMIT_MAX_RECTS_DXR 32
 
 /*!
  * @brief Per-frame weave submission for one window sub-rect.
@@ -121,6 +152,28 @@ typedef struct XrWeaveSubmitInfoDXR {
     XrBool32                 inputIsDxgi;  //!< XR_TRUE for a legacy global DXGI handle (else NT handle)
     XrRect2Di                rect;         //!< window-relative sub-rect, device px (y-down)
 } XrWeaveSubmitInfoDXR;
+
+/*!
+ * @brief Batched weave submission — N window sub-rects in ONE call (spec v3).
+ *
+ * Chain onto XrWeaveSubmitInfoDXR::next. When present it switches the input
+ * layout contract (see the file header): @c inputTexture must be sized to the
+ * bound window's client area with each rect's pre-weave SBS content placed at
+ * that rect's own window position; the base struct's @c rect is ignored. Each
+ * rect region holds squeezed SBS (left view in the rect's left half). The
+ * runtime weaves every rect into the shared window-sized output and signals
+ * the fence ONCE after the last rect.
+ *
+ * @c rectCount must be 1..XR_WEAVE_SUBMIT_MAX_RECTS_DXR; callers with more
+ * visible elements split into multiple batched submits (each with its own
+ * fence value; waiting the last covers all).
+ */
+typedef struct XrWeaveSubmitRectsDXR {
+    XrStructureType          type;      //!< XR_TYPE_WEAVE_SUBMIT_RECTS_DXR
+    const void* XR_MAY_ALIAS next;
+    uint32_t                 rectCount; //!< 1..XR_WEAVE_SUBMIT_MAX_RECTS_DXR
+    const XrRect2Di*         rects;     //!< window-relative sub-rects, device px (y-down)
+} XrWeaveSubmitRectsDXR;
 
 /*!
  * @brief Weaved output handed back to the present-owner.

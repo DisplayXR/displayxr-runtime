@@ -494,6 +494,8 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         int32_t rect_y,
                                         uint32_t rect_w,
                                         uint32_t rect_h,
+                                        uint32_t rect_count,
+                                        const struct xrt_rect *rects,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
@@ -502,6 +504,9 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 {
 	if (xc == NULL || out_have_output == NULL || out_width == NULL || out_height == NULL ||
 	    out_fence_value == NULL || out_eyes == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (rect_count > IPC_WEAVE_SUBMIT_RECTS_MAX || (rect_count > 0 && rects == NULL)) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	*out_have_output = false;
@@ -520,6 +525,15 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	args.rect_y = rect_y;
 	args.rect_w = rect_w;
 	args.rect_h = rect_h;
+	// rect_count == 0 keeps the legacy single-rect layout (spec v2 wire
+	// bytes); >= 1 selects the batch layout (window-sized input, rects[]).
+	args.rect_count = rect_count;
+	for (uint32_t i = 0; i < rect_count; i++) {
+		args.rects[i].x = rects[i].offset.w; // xrt_offset fields are named w/h
+		args.rects[i].y = rects[i].offset.h;
+		args.rects[i].w = (uint32_t)rects[i].extent.w;
+		args.rects[i].h = (uint32_t)rects[i].extent.h;
+	}
 
 	xrt_graphics_buffer_handle_t handle = in_handle;
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)

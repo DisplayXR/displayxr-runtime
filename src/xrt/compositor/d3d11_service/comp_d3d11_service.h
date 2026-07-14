@@ -937,6 +937,14 @@ comp_d3d11_service_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd);
  * current tracked eye positions in @p out_eyes — the interlace is DP-internal
  * (reads the vendor tracker), so eyes flow OUT for the caller's off-axis
  * (look-around) rendering, not in.
+ *
+ * Two input-layout contracts, discriminated by @p rect_count (spec v3 batch):
+ * - @p rect_count == 0 (legacy): the input is an element-sized 2x1 SBS atlas
+ *   for @p rect_x/y/w/h; @p rects is ignored. Byte-equivalent to spec v2.
+ * - @p rect_count >= 1 (batch): the input is bound-window-client-sized with
+ *   each rect's SBS content at that rect's own window position; every rect is
+ *   woven into the shared output and the fence is signaled ONCE after the
+ *   last rect. @p rect_x/y/w/h are ignored.
  */
 bool
 comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
@@ -946,6 +954,8 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                int32_t rect_y,
                                uint32_t rect_w,
                                uint32_t rect_h,
+                               uint32_t rect_count,
+                               const struct xrt_rect *rects,
                                uint32_t *out_width,
                                uint32_t *out_height,
                                uint64_t *out_fence_value,

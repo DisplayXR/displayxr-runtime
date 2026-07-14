@@ -5615,12 +5615,28 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	}
 #endif
 
+	// rect_count == 0 = legacy single-rect layout; >= 1 = batch layout
+	// (window-sized input, rects[]). See ipc_arg_weave_submit. Converted to
+	// xrt_rect here — the service compositor API stays IPC-type-free.
+	if (args->rect_count > IPC_WEAVE_SUBMIT_RECTS_MAX) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct xrt_rect rects[IPC_WEAVE_SUBMIT_RECTS_MAX];
+	for (uint32_t i = 0; i < args->rect_count; i++) {
+		rects[i].offset.w = args->rects[i].x; // xrt_offset fields are named w/h
+		rects[i].offset.h = args->rects[i].y;
+		rects[i].extent.w = (int)args->rects[i].w;
+		rects[i].extent.h = (int)args->rects[i].h;
+	}
+
 	uint32_t w = 0, h = 0;
 	uint64_t fv = 0;
 	struct xrt_eye_positions eyes = {0};
-	bool ok = comp_d3d11_service_weave_submit( //
-	    ics->xc, in_handle, in_is_dxgi,        //
-	    args->rect_x, args->rect_y, args->rect_w, args->rect_h, &w, &h, &fv, &eyes);
+	bool ok = comp_d3d11_service_weave_submit(                  //
+	    ics->xc, in_handle, in_is_dxgi,                         //
+	    args->rect_x, args->rect_y, args->rect_w, args->rect_h, //
+	    args->rect_count, args->rect_count > 0 ? rects : NULL,  //
+	    &w, &h, &fv, &eyes);
 	if (!ok) {
 		return XRT_ERROR_IPC_FAILURE;
 	}

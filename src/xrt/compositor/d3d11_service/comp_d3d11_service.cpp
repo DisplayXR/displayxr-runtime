@@ -73,6 +73,7 @@
 #include <cmath>
 #include <mutex>
 #include <map>
+#include <vector>
 #include <sddl.h>
 
 
@@ -275,6 +276,21 @@ struct d3d11_client_render_resources
 	uint64_t                              weave_fence_value;   //!< signaled once per submit
 	uint32_t                              weave_output_w;
 	uint32_t                              weave_output_h;
+
+	//! Spec-v3 batched weave (#625): process_atlas samples its whole SRV as
+	//! the atlas (no input-offset param), so each batch rect is first copied
+	//! out of the shared window-sized input into an exact-size scratch tile.
+	//! Cached per rect index; a tile is recreated only when that rect's
+	//! size/format changes (a scrolling wall of uniform tiles allocates once).
+	struct weave_scratch_tile
+	{
+		wil::com_ptr<ID3D11Texture2D> tex;
+		wil::com_ptr<ID3D11ShaderResourceView> srv;
+		uint32_t w = 0;
+		uint32_t h = 0;
+		DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+	};
+	std::vector<weave_scratch_tile> weave_scratch;
 
 	//! Deferred auto-3D for no-zones standalone clients (#140 / no-zones-2D).
 	//! A non-workspace IPC handle app with no zone mask never triggers a 3D
@@ -2712,6 +2728,7 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->weave_output_rtv.reset();
 	res->weave_output_texture.reset();
 	res->weave_fence.reset();
+	res->weave_scratch.clear();
 
 	res->swap_chain.reset();
 
@@ -11502,6 +11519,8 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                int32_t rect_y,
                                uint32_t rect_w,
                                uint32_t rect_h,
+                               uint32_t rect_count,
+                               const struct xrt_rect *rects,
                                uint32_t *out_width,
                                uint32_t *out_height,
                                uint64_t *out_fence_value,
@@ -11520,6 +11539,9 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		*out_eyes = {};
 	}
 	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return false;
+	}
+	if (rect_count > 0 && rects == nullptr) {
 		return false;
 	}
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
@@ -11594,8 +11616,20 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		}
 	}
 	if (win_w == 0 || win_h == 0) {
-		win_w = (rect_x > 0 ? (uint32_t)rect_x : 0) + rect_w;
-		win_h = (rect_y > 0 ? (uint32_t)rect_y : 0) + rect_h;
+		if (rect_count > 0) {
+			// Batch: derive the output extent from the union of the rects.
+			for (uint32_t i = 0; i < rect_count; i++) {
+				uint32_t rr = (rects[i].offset.w > 0 ? (uint32_t)rects[i].offset.w : 0) +
+				              (uint32_t)rects[i].extent.w;
+				uint32_t rb = (rects[i].offset.h > 0 ? (uint32_t)rects[i].offset.h : 0) +
+				              (uint32_t)rects[i].extent.h;
+				win_w = rr > win_w ? rr : win_w;
+				win_h = rb > win_h ? rb : win_h;
+			}
+		} else {
+			win_w = (rect_x > 0 ? (uint32_t)rect_x : 0) + rect_w;
+			win_h = (rect_y > 0 ? (uint32_t)rect_y : 0) + rect_h;
+		}
 	}
 	if (win_w == 0 || win_h == 0) {
 		return false;
@@ -11647,21 +11681,122 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		acquired = true;
 	}
 
-	// Pre-weave content is side-by-side stereo: 2 columns × 1 row, per-view dims
-	// = half width × full height. The DP weaves into the bound RTV, confined to
-	// the sub-rect via canvas_offset/size at the correct absolute phase.
-	uint32_t view_w = idesc.Width / 2;
-	uint32_t view_h = idesc.Height;
-
 	ID3D11RenderTargetView *rtvs[] = {c->render.weave_output_rtv.get()};
-	sys->context->OMSetRenderTargets(1, rtvs, nullptr);
-	xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), in_srv.get(),
-	                                          view_w, view_h, /*tile_columns*/ 2, /*tile_rows*/ 1,
-	                                          DXGI_FORMAT_R8G8B8A8_UNORM, win_w, win_h, rect_x, rect_y, rect_w,
-	                                          rect_h);
+	if (rect_count == 0) {
+		// Legacy single-rect (spec v2): the whole input IS the element's 2x1
+		// SBS atlas — per-view dims = half width × full height. The DP weaves
+		// into the bound RTV, confined to the sub-rect via canvas_offset/size
+		// at the correct absolute phase.
+		uint32_t view_w = idesc.Width / 2;
+		uint32_t view_h = idesc.Height;
 
-	if (acquired && in_km) {
-		in_km->ReleaseSync(0);
+		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
+		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), in_srv.get(),
+		                                          view_w, view_h, /*tile_columns*/ 2, /*tile_rows*/ 1,
+		                                          DXGI_FORMAT_R8G8B8A8_UNORM, win_w, win_h, rect_x, rect_y,
+		                                          rect_w, rect_h);
+
+		if (acquired && in_km) {
+			in_km->ReleaseSync(0);
+		}
+	} else {
+		// Spec-v3 batch: the input is window-sized with each rect's SBS
+		// content at that rect's own window position. process_atlas samples
+		// its whole SRV as the atlas (no input-offset param), so first copy
+		// every rect out of the shared input into an exact-size scratch tile
+		// — then the keyed mutex can be released BEFORE the weave loop, so
+		// the caller can start writing the next frame while the DP weaves.
+		if (c->render.weave_scratch.size() < rect_count) {
+			c->render.weave_scratch.resize(rect_count);
+		}
+		bool copies_ok = true;
+		for (uint32_t i = 0; i < rect_count; i++) {
+			uint32_t rw = (uint32_t)rects[i].extent.w;
+			uint32_t rh = (uint32_t)rects[i].extent.h;
+			int32_t rx = rects[i].offset.w; // xrt_offset fields are named w/h
+			int32_t ry = rects[i].offset.h;
+			if (rw == 0 || rh == 0) {
+				copies_ok = false;
+				break;
+			}
+			auto &tile = c->render.weave_scratch[i];
+			if (!tile.tex || tile.w != rw || tile.h != rh || tile.format != idesc.Format) {
+				tile.srv.reset();
+				tile.tex.reset();
+				D3D11_TEXTURE2D_DESC td = {};
+				td.Width = rw;
+				td.Height = rh;
+				td.MipLevels = 1;
+				td.ArraySize = 1;
+				td.Format = idesc.Format;
+				td.SampleDesc.Count = 1;
+				td.Usage = D3D11_USAGE_DEFAULT;
+				td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+				hr = sys->device->CreateTexture2D(&td, nullptr, tile.tex.put());
+				if (SUCCEEDED(hr)) {
+					D3D11_SHADER_RESOURCE_VIEW_DESC tsd = {};
+					tsd.Format = idesc.Format;
+					tsd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+					tsd.Texture2D.MipLevels = 1;
+					hr = sys->device->CreateShaderResourceView(tile.tex.get(), &tsd,
+					                                           tile.srv.put());
+				}
+				if (FAILED(hr)) {
+					U_LOG_E("#625 weave batch: scratch tile %u (%ux%u) create failed: 0x%08lx",
+					        i, rw, rh, hr);
+					tile.srv.reset();
+					tile.tex.reset();
+					copies_ok = false;
+					break;
+				}
+				tile.w = rw;
+				tile.h = rh;
+				tile.format = idesc.Format;
+			}
+			// Defensive clamp to the input extent (a partially off-window
+			// rect must not fail the whole batch's copy).
+			D3D11_BOX box = {};
+			box.left = rx > 0 ? (UINT)rx : 0;
+			box.top = ry > 0 ? (UINT)ry : 0;
+			box.right = box.left + rw;
+			box.bottom = box.top + rh;
+			box.back = 1;
+			if (box.right > idesc.Width) {
+				box.right = idesc.Width;
+			}
+			if (box.bottom > idesc.Height) {
+				box.bottom = idesc.Height;
+			}
+			if (box.right <= box.left || box.bottom <= box.top) {
+				continue; // fully outside — nothing to weave for this rect
+			}
+			sys->context->CopySubresourceRegion(tile.tex.get(), 0, 0, 0, 0, in_tex.get(), 0, &box);
+		}
+
+		if (acquired && in_km) {
+			in_km->ReleaseSync(0);
+		}
+		if (!copies_ok) {
+			return false;
+		}
+
+		// Weave every rect into the shared window-sized output; ONE fence
+		// signal after the loop (below). Each scratch tile is a 2x1 SBS atlas
+		// exactly like a legacy input.
+		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
+		for (uint32_t i = 0; i < rect_count; i++) {
+			auto &tile = c->render.weave_scratch[i];
+			if (!tile.srv) {
+				continue;
+			}
+			uint32_t rw = (uint32_t)rects[i].extent.w;
+			uint32_t rh = (uint32_t)rects[i].extent.h;
+			xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), tile.srv.get(),
+			                                          /*view_w*/ rw / 2, /*view_h*/ rh,
+			                                          /*tile_columns*/ 2, /*tile_rows*/ 1,
+			                                          DXGI_FORMAT_R8G8B8A8_UNORM, win_w, win_h,
+			                                          rects[i].offset.w, rects[i].offset.h, rw, rh);
+		}
 	}
 
 	// Signal the fence and flush so the GPU work + signal are submitted (there is
