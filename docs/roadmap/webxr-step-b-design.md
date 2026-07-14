@@ -1040,3 +1040,91 @@ prefers the high-performance adapter, so forcing high-performance matches it by 
 2D`) at that moment — 2D↔3D is tracking-driven, so it interlaces to real 3D only when a
 face is tracked. Interlacing is the DP's job; the Chromium patch delivers the correct SBS
 and composites the woven result regardless.
+
+### 13.6 GPU-process SYNCHRONOUS weave — zero-lag, browser-owned (2026-07-13)
+
+The async submit (§13.5's model: mojo `WeaveSubmit` GPU→browser with a callback, woven result
+drawn one frame later) was the deadlock-safe fix for the **GPU-process sync-mojo ban** (the
+`sync_call_restrictions.cc` FATAL that crashed static/official builds), but its 1-frame floor was
+user-rejected ("cannot afford ANY lag"). The replacement — gated `--inline-3d-sync-weave`, async
+path untouched as the default-flag fallback — moves the **OpenXR present-owner weave session into
+the GPU process itself**:
+
+- **Session creation pre-sandbox:** `content/gpu/gpu_main.cc` `PreSandboxStartup` (before
+  `LowerToken()`) creates the D3D11 device + weave session and connects the runtime IPC pipe. The
+  sandbox blocks *opening* the pipe, not I/O on an already-open handle (same pattern as
+  MediaFoundation warming up pre-sandbox).
+- **Per-frame submit is a plain synchronous call on Viz's present thread**
+  (`DisplayXRWeaveGpu::SubmitSync` → `DisplayXRWeaveClient::Submit` → `xrWeaveSubmitDXR`,
+  ~1 ms) — no mojo, no browser hop, no deadlock class at all. `WeaveCompositedSurface`'s 2-phase
+  submit-then-take structure is unchanged and becomes automatically zero-lag once the submit
+  stores its woven result synchronously in the same frame.
+- **Runtime-side prerequisites (merged, PR #743 / v2.0.2):** the IPC pipe needed a Low
+  mandatory-integrity label + RESTRICTED SID (Chromium's GPU process is **Low even
+  pre-sandbox**), `ConnectNamedPipe` mid-connect-abort hardening, and a tagged-DXGI handle-send
+  path that skips `OpenProcess` (a Low sender cannot open the Medium service). The sync input is
+  a legacy DXGI keyed-mutex handle (`inputIsDxgi`), so steady-state weave transfers no NT handles.
+- **Component-build gotcha:** the weave client holds the session in a process-global; as a GN
+  `source_set` linked into two DLLs each got its own copy (GPU-created session invisible to the
+  per-frame weave). It is now a GN `component()` with `COMPONENT_EXPORT`.
+
+**Verified 2026-07-13** (fork commit `2ff0cda`): `GPU-process SYNC weave live … eyes_valid=1`,
+zero submit failures, user-eyeballed. This also **removes the static/official crash root cause**
+— the StaticDbg no-FATAL proof and official P0 re-verify are the remaining checkboxes on
+displayxr-browser#12.
+
+### 13.7 Drag phase-snap — window constrained to the DP phase grid (2026-07-13)
+
+The interlace lattice is fixed to the physical panel, so a woven window is only phase-correct at
+the positions it was woven for. Two complementary pieces (CEF-host parity, fork commits
+`c188758` + `be01cb3`):
+
+- **Per-frame phase-ref sync:** `SubmitSync` calls `SnapWindowIfMoved` →
+  `xrWeaveSnapWindowRectDXR`, keeping the DP's phase reference locked to the browser window's
+  current screen position.
+- **Drag constraint:** a `SetWindowSubclass` on the browser's own frame window intercepts
+  `WM_ENTERSIZEMOVE`/`WM_WINDOWPOSCHANGING` and **overrides `pos->x/y`** so the client-area
+  origin only lands on phase-aligned positions during a drag. The DP grid is a **non-uniform 2D
+  lattice** (the slanted lenticular couples X and Y), so each step queries the DP snap rather
+  than replicating the grid locally. A second, snap-capable browser-process session provides the
+  snap PFN; it coexists with the GPU weave session (verified — no SR recalibration break).
+
+### 13.8 Compositor-thread weave rects — the scroll-trail fix (2026-07-13)
+
+**Symptom:** with sync weave live, woven content still *trailed* the page on a fast scroll
+(trail, not shimmer → rect lag, not lattice quantization). The rects were measured by Blink
+`getBoundingClientRect`×dsf on the **main thread** and corrected on the impl thread by the
+viewport `SyncedScrollOffset::Delta()`×dsf (§13.4's Phase 2) — a commit-time snapshot plus an
+approximate patch that could not track the exact pixels presented.
+
+**Fix (fork commit `228f3ec8`):** source the weave rect from cc's native **tracked-element-rects**
+infrastructure, which projects a layer-relative rect through the layer's `ScreenSpaceTransform()`
+**at draw time** — live property trees, current impl scroll — so the rect matches the presented
+pixels exactly, every frame, nested scrollers included. It operates at the **paint-chunk** level,
+which crosses the canvas squash (§13.2's finding — the canvas has no distinct cc layer/quad), and
+upstream already ships the map through TreesInViz in the same `LayerTreeUpdate` as the scroll.
+
+- **Registration:** `XRDisplayLayer` ctor/close registers/clears a `TrackedElementSubRect` on the
+  canvas element under a new `viz::TrackedElementFeature::kInline3dWeave`
+  (`should_add_to_compositor_frame_metadata=true`). No mojom changes anywhere — the feature enum
+  travels as int32.
+- **Paint gate:** an undecorated canvas never painted the background chunk that carries
+  tracked-element data (`ReplacedPainter::Paint`'s canvas carve-out); extended the else-chain
+  with `GetTrackedElementSubRects()`, exactly as region capture did.
+- **cc quirk (cost one diagnostic build):** the tracked chunk lands on a layer with **no drawable
+  content**, whose `visible_layer_rect` is empty — upstream's intersection zeroed the rect
+  (`… 0x0` arriving in Viz). For the weave feature cc now skips that intersection and projects
+  the raw element rect (matches the legacy unclipped `getBoundingClientRect` semantics; the weave
+  path clips to the window itself).
+- **Consumer seam:** `SurfaceAggregator::CollectTrackedElementRects` prefers the tracked rects
+  (transformed by the same `TransformRectToDestRootTargetSpace`, excluded from the generic map so
+  they don't leak into CopyOutput geometry); the legacy `metadata.inline_3d_rects` loop runs only
+  when no non-empty tracked rect is present — a live fallback, with empty rects filtered so they
+  can never suppress the weave. Rects are sorted (y, x, w, h) at handoff because the weave
+  consumer keys per-target state by vector index. Phase 2's shift stays but only touches the
+  legacy path.
+
+**Verified 2026-07-13** (Leia, 5-element gallery, AWS box build at tag+26): five distinct
+per-canvas layers each project a full-size scroll-current rect; aggregator log
+`weave rects from tracked elements: n=5`; **fast-scroll trailing GONE — user: "it's PERFECT
+now"**. Closes displayxr-browser#13.
