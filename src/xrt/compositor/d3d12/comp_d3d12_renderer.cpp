@@ -490,6 +490,9 @@ create_atlas_texture(struct comp_d3d12_renderer *r, ID3D12Device *device, uint32
 		return XRT_ERROR_D3D;
 	}
 
+	// #747: name it so the debug layer can attribute barrier complaints.
+	r->atlas_texture->SetName(L"DXR.atlas_texture");
+
 	// Create RTV for atlas texture
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = r->rtv_heap->GetCPUDescriptorHandleForHeapStart();
 	device->CreateRenderTargetView(r->atlas_texture, nullptr, rtv_handle);

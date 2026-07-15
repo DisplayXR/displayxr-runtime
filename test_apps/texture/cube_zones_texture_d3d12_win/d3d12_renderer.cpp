@@ -10,6 +10,8 @@
 #include "mip_chain.h"
 #include <d3d12sdklayers.h>
 #include <cmath>
+#include <map>
+#include <vector>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -639,6 +641,7 @@ bool InitializeD3D12WithLUID(D3D12Renderer& renderer, LUID adapterLuid) {
     hr = renderer.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
         renderer.commandAllocator.Get(), nullptr, IID_PPV_ARGS(&renderer.commandList));
     if (FAILED(hr)) return false;
+    renderer.commandList->SetName(L"APP.renderer_cmd_list"); // #747 attribution
     renderer.commandList->Close(); // Start closed; Reset before use
 
     // Create resources
@@ -821,6 +824,65 @@ void UpdateScene(D3D12Renderer& renderer, float deltaTime) {
     renderer.cubeRotation += deltaTime * 0.5f;
     if (renderer.cubeRotation > XM_2PI) {
         renderer.cubeRotation -= XM_2PI;
+    }
+}
+
+// #747 diagnostic — see the call site in RenderScene for why this exists.
+// DXR_D3D12_DEBUG=1 to enable.
+static void DrainD3D12DebugMessages(D3D12Renderer& renderer) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* v = getenv("DXR_D3D12_DEBUG");
+        enabled = (v != nullptr && v[0] != '\0' && v[0] != '0') ? 1 : 0;
+        if (enabled) {
+            LOG_WARN("#747 DXR_D3D12_DEBUG=1 — draining the D3D12 debug layer info queue "
+                     "every frame (this device is shared with the in-process compositor, "
+                     "so runtime barriers are validated too)");
+        }
+    }
+    if (!enabled || renderer.device == nullptr) {
+        return;
+    }
+
+    ComPtr<ID3D12InfoQueue> q;
+    if (FAILED(renderer.device->QueryInterface(IID_PPV_ARGS(&q)))) {
+        return;
+    }
+
+    static std::map<int, uint64_t> seen;  // message ID -> occurrences
+    const UINT64 n = q->GetNumStoredMessages();
+    for (UINT64 i = 0; i < n; i++) {
+        SIZE_T len = 0;
+        q->GetMessage(i, nullptr, &len);
+        if (len == 0) {
+            continue;
+        }
+        std::vector<char> buf(len);
+        auto* m = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+        if (FAILED(q->GetMessage(i, m, &len))) {
+            continue;
+        }
+        auto it = seen.find((int)m->ID);
+        if (it == seen.end()) {
+            seen.emplace((int)m->ID, 1);
+            // First sighting of each ID prints in full — that is the actionable line.
+            LOG_WARN("#747 D3D12 debug FIRST id=%d sev=%d: %s", (int)m->ID, (int)m->Severity,
+                     m->pDescription != nullptr ? m->pDescription : "(no description)");
+        } else {
+            it->second++;
+        }
+    }
+    q->ClearStoredMessages();
+
+    // Periodic totals — the RATE is the tell (#747 reports ~5/frame).
+    static uint32_t frames = 0;
+    frames++;
+    if (frames % 300 == 0 && !seen.empty()) {
+        for (const auto& kv : seen) {
+            LOG_WARN("#747 D3D12 debug TOTAL id=%d count=%llu over %u frames (%.2f/frame)",
+                     kv.first, (unsigned long long)kv.second, frames,
+                     (double)kv.second / (double)frames);
+        }
     }
 }
 
@@ -1034,6 +1096,23 @@ void RenderScene(
         renderer.fence->SetEventOnCompletion(renderer.fenceValue, renderer.fenceEvent);
         WaitForSingleObject(renderer.fenceEvent, INFINITE);
     }
+
+    // #747: drain the debug layer's info queue for the WHOLE session, not just
+    // the warmup.
+    //
+    // The debug layer is enabled unconditionally in InitializeD3D12WithLUID, and
+    // the in-process compositor REUSES this app's device
+    // (comp_d3d12_compositor.cpp: `c->device = static_cast<ID3D12Device*>(
+    // d3d12_device)`), so validation already covers the RUNTIME's barriers —
+    // which is exactly how #747's id-527 ResourceBarrier before-state spam
+    // surfaced under Unity's -force-d3d12-debug. Nothing needed enabling; the
+    // messages were simply never read. The 3-frame drain below can't see them:
+    // the compositor barriers on xrEndFrame, after this function, and the DP
+    // path isn't live during warmup.
+    //
+    // Env-gated (draining every frame costs) and deduped by message ID, so
+    // per-frame spam logs once with a periodic total instead of flooding.
+    DrainD3D12DebugMessages(renderer);
 
     // Drain D3D12 debug messages (first 3 frames only)
     if (renderDiag) {
