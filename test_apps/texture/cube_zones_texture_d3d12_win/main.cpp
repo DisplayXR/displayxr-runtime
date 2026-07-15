@@ -1531,21 +1531,24 @@ static void ClearZoneImage(D3D12Renderer& renderer, DisplayZone& z,
     g_zoneCmdAlloc->Reset();
     g_zoneCmdList->Reset(g_zoneCmdAlloc.Get(), nullptr);
 
-    D3D12_RESOURCE_BARRIER barrier = {};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = rt;
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    g_zoneCmdList->ResourceBarrier(1, &barrier);
-
+    // #747: clear directly in RENDER_TARGET — no barriers.
+    //
+    // An acquired XR swapchain image is ALREADY in RENDER_TARGET and must be
+    // released in RENDER_TARGET: XR_KHR_D3D12_enable specifies that on
+    // xrWaitSwapchainImage success the color image "has a resource state match
+    // with D3D12_RESOURCE_STATE_RENDER_TARGET", and that on
+    // xrReleaseSwapchainImage the runtime "must interpret the image as ...
+    // having a resource state match with D3D12_RESOURCE_STATE_RENDER_TARGET".
+    //
+    // The old COMMON -> RENDER_TARGET -> COMMON pair here was wrong at BOTH
+    // ends: it claimed a before-state the image was never in, and then handed
+    // it back in COMMON, breaking the contract for the runtime's next ingest.
+    // That is precisely the app-side half of #747 — same bug the Unity plugin
+    // had (displayxr-unity@bf4c7ac), and the source of the TRANSFER_DST /
+    // COMMON trace on this app.
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = renderer.rtvHeap->GetCPUDescriptorHandleForHeapStart();
     rtvHandle.ptr += (SIZE_T)rtvIndex * renderer.rtvDescriptorSize;
     g_zoneCmdList->ClearRenderTargetView(rtvHandle, z.clearColor, 0, nullptr);
-
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-    g_zoneCmdList->ResourceBarrier(1, &barrier);
 
     ZoneCmdSubmitAndWait(renderer);
 }
@@ -1561,22 +1564,14 @@ static void PaintViewColor(D3D12Renderer& renderer, ID3D12Resource* rt, int rtvI
     g_zoneCmdAlloc->Reset();
     g_zoneCmdList->Reset(g_zoneCmdAlloc.Get(), nullptr);
 
-    D3D12_RESOURCE_BARRIER barrier = {};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = rt;
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    g_zoneCmdList->ResourceBarrier(1, &barrier);
-
+    // #747: clear directly in RENDER_TARGET — no barriers. `rt` is an acquired
+    // XR swapchain image: XR_KHR_D3D12_enable guarantees it arrives in
+    // RENDER_TARGET and requires it be released in RENDER_TARGET. The old
+    // COMMON -> RENDER_TARGET -> COMMON pair was wrong at both ends.
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = renderer.rtvHeap->GetCPUDescriptorHandleForHeapStart();
     rtvHandle.ptr += (SIZE_T)rtvIndex * renderer.rtvDescriptorSize;
     D3D12_RECT rect = {(LONG)vpX, 0, (LONG)(vpX + tileW), (LONG)tileH};
     g_zoneCmdList->ClearRenderTargetView(rtvHandle, color, 1, &rect);
-
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-    g_zoneCmdList->ResourceBarrier(1, &barrier);
 
     ZoneCmdSubmitAndWait(renderer);
 }
@@ -2486,10 +2481,18 @@ static void RenderOneFrame(RenderState& rs) {
                         rs.hudCmdAllocator->Reset();
                         rs.hudCmdList->Reset(rs.hudCmdAllocator, nullptr);
 
+                        // #747: RENDER_TARGET -> COPY_DEST -> RENDER_TARGET.
+                        // hudTex is an ACQUIRED XR swapchain image, so per
+                        // XR_KHR_D3D12_enable it arrives in RENDER_TARGET and
+                        // must be released in RENDER_TARGET. The old
+                        // COMMON->COPY_DEST->COMMON pair was wrong at both ends
+                        // (it relied on the implicit COMMON->COPY_DEST promotion
+                        // that only holds if the image were in COMMON, and then
+                        // handed it back in COMMON).
                         D3D12_RESOURCE_BARRIER barrier = {};
                         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                         barrier.Transition.pResource = hudTex;
-                        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
                         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
                         barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
                         rs.hudCmdList->ResourceBarrier(1, &barrier);
@@ -2512,7 +2515,7 @@ static void RenderOneFrame(RenderState& rs) {
                         rs.hudCmdList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
 
                         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-                        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+                        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
                         rs.hudCmdList->ResourceBarrier(1, &barrier);
 
                         rs.hudCmdList->Close();

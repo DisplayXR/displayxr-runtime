@@ -952,14 +952,15 @@ void RenderScene(
 
     auto cmdList = renderer.commandList.Get();
 
-    // Transition render target to RENDER_TARGET state
-    D3D12_RESOURCE_BARRIER barrier = {};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = renderTarget;
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    cmdList->ResourceBarrier(1, &barrier);
+    // #747: no entry barrier — the image is ALREADY in RENDER_TARGET.
+    //
+    // renderTarget is an acquired XR swapchain image, and XR_KHR_D3D12_enable
+    // guarantees a color image "has a resource state match with
+    // D3D12_RESOURCE_STATE_RENDER_TARGET" once xrWaitSwapchainImage succeeds.
+    // The old COMMON -> RENDER_TARGET barrier claimed a before-state the image
+    // was never in. (There is no exit barrier, which was already correct: the
+    // image must be RELEASED in RENDER_TARGET, and leaving it untouched does
+    // exactly that.)
 
     // Get RTV and DSV handles
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = renderer.rtvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -1079,10 +1080,14 @@ void RenderScene(
         cmdList->DrawInstanced(renderer.gridVertexCount, 1, 0, 0);
     }
 
-    // Transition render target back
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-    cmdList->ResourceBarrier(1, &barrier);
+    // #747: no exit barrier — the image must be RELEASED in RENDER_TARGET.
+    //
+    // The old RENDER_TARGET -> COMMON here is what handed the runtime an image
+    // in COMMON, which is exactly what the compositor's (now spec-correct)
+    // RENDER_TARGET ingest complains about. XR_KHR_D3D12_enable: on
+    // xrReleaseSwapchainImage the runtime "must interpret the image as ...
+    // having a resource state match with D3D12_RESOURCE_STATE_RENDER_TARGET".
+    // We rendered into it as a render target, so leaving it alone is correct.
 
     // Execute
     hr = cmdList->Close();
