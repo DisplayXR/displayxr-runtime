@@ -571,6 +571,17 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
 // a weave surface and a position anchor, never a render target (the DP weaves
 // into the shared texture; the container presents). DefWindowProc is all it
 // needs, so it deliberately does NOT share WINDOW_CLASS/WindowProc.
+//
+// DXR_PANE_EXSTYLE=layered reproduces the Unity plugin's overlay ex-styles
+// (WS_EX_NOACTIVATE|WS_EX_LAYERED|WS_EX_TRANSPARENT, alpha 0) on the pane. The
+// editor's overlay is click-through and invisible; a plain WS_CHILD is neither.
+// If the SR SDK resolves its weaving window by any hit-test-like walk
+// (WindowFromPoint / ChildWindowFromPointEx honour LAYERED+TRANSPARENT by
+// skipping the window), a click-through child is invisible to that walk and the
+// resolver lands on the container instead — which would put the container's
+// origin into the phase while the DP still reports the child's rect correctly.
+// That is the only remaining delta between this harness (which weaves
+// correctly) and the editor (which does not). See #740.
 static HWND CreatePaneWindow(HINSTANCE hInstance, HWND container, int x, int y, int w, int h) {
     WNDCLASSEX wc = {};
     wc.cbSize = sizeof(WNDCLASSEX);
@@ -587,14 +598,32 @@ static HWND CreatePaneWindow(HINSTANCE hInstance, HWND container, int x, int y, 
         }
     }
 
-    HWND pane = CreateWindowEx(0, PANE_CLASS, L"", WS_CHILD | WS_VISIBLE,
+    DWORD ex = 0;
+    bool layered = false;
+    if (const char* es = getenv("DXR_PANE_EXSTYLE")) {
+        if (_stricmp(es, "layered") == 0) {
+            ex = WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT;
+            layered = true;
+        }
+    }
+
+    HWND pane = CreateWindowEx(ex, PANE_CLASS, L"", WS_CHILD | WS_VISIBLE,
                                x, y, w, h, container, nullptr, hInstance, nullptr);
     if (!pane) {
         LOG_ERROR("Failed to create pane window, error: %lu", GetLastError());
         return nullptr;
     }
-    LOG_INFO("#740 harness: pane 0x%p is WS_CHILD of container 0x%p at in-container (%d,%d) %dx%d",
-             pane, container, x, y, w, h);
+    if (layered) {
+        // alpha 0 — the editor's overlay is fully transparent; it is a position
+        // anchor, not something the user ever sees.
+        if (!SetLayeredWindowAttributes(pane, 0, 0, LWA_ALPHA)) {
+            LOG_ERROR("SetLayeredWindowAttributes failed: %lu", GetLastError());
+        }
+    }
+    LOG_WARN("#740 harness: pane 0x%p is WS_CHILD of container 0x%p at in-container (%d,%d) %dx%d "
+             "exStyle=0x%08lX%s",
+             pane, container, x, y, w, h, ex,
+             layered ? " (LAYERED|TRANSPARENT|NOACTIVATE, alpha 0 — Unity overlay parity)" : "");
     return pane;
 }
 
