@@ -3529,6 +3529,7 @@ d3d12_update_implicit_mask(struct comp_d3d12_compositor *c,
 		HRESULT hr = c->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
 		                                                D3D12_RESOURCE_STATE_RENDER_TARGET, &clear,
 		                                                IID_PPV_ARGS(&c->implicit_mask_tex));
+	if (c->implicit_mask_tex != nullptr) c->implicit_mask_tex->SetName(L"DXR.implicit_mask_tex"); // #747 attribution
 		if (SUCCEEDED(hr) && c->implicit_mask_tex != nullptr) {
 			D3D12_DESCRIPTOR_HEAP_DESC rtv_desc = {};
 			rtv_desc.NumDescriptors = 1;
@@ -3542,6 +3543,7 @@ d3d12_update_implicit_mask(struct comp_d3d12_compositor *c,
 			hr = c->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
 			                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
 			                                        IID_PPV_ARGS(&c->implicit_mask_staged));
+	if (c->implicit_mask_staged != nullptr) c->implicit_mask_staged->SetName(L"DXR.implicit_mask_staged"); // #747 attribution
 		}
 		if (FAILED(hr) || c->implicit_mask_staged == nullptr) {
 			U_LOG_E("implicit zone mask: D3D12 resource creation failed: 0x%08x", hr);
@@ -3696,6 +3698,7 @@ d3d12_update_zone_wish_mask(struct comp_d3d12_compositor *c,
 		HRESULT hr = c->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
 		                                                D3D12_RESOURCE_STATE_RENDER_TARGET, &clear,
 		                                                IID_PPV_ARGS(&c->implicit_mask_tex));
+	if (c->implicit_mask_tex != nullptr) c->implicit_mask_tex->SetName(L"DXR.implicit_mask_tex"); // #747 attribution
 		if (SUCCEEDED(hr) && c->implicit_mask_tex != nullptr) {
 			D3D12_DESCRIPTOR_HEAP_DESC rtv_desc = {};
 			rtv_desc.NumDescriptors = 1;
@@ -3709,6 +3712,7 @@ d3d12_update_zone_wish_mask(struct comp_d3d12_compositor *c,
 			hr = c->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
 			                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
 			                                        IID_PPV_ARGS(&c->implicit_mask_staged));
+	if (c->implicit_mask_staged != nullptr) c->implicit_mask_staged->SetName(L"DXR.implicit_mask_staged"); // #747 attribution
 		}
 		if (FAILED(hr) || c->implicit_mask_staged == nullptr) {
 			U_LOG_E("zone wish mask: D3D12 resource creation failed: 0x%08x", hr);
@@ -4038,6 +4042,7 @@ d3d12_ensure_backdrop_scratch(struct comp_d3d12_compositor *c, uint32_t w, uint3
 	HRESULT hr = c->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
 	                                                D3D12_RESOURCE_STATE_COMMON, &clear,
 	                                                IID_PPV_ARGS(&c->backdrop_scratch));
+	if (c->backdrop_scratch != nullptr) c->backdrop_scratch->SetName(L"DXR.backdrop_scratch"); // #747 attribution
 	if (FAILED(hr) || c->backdrop_scratch == nullptr) {
 		U_LOG_W("backdrop scratch alloc (%ux%u) failed: 0x%08x", w, h, hr);
 		c->backdrop_scratch = nullptr;
@@ -4506,6 +4511,7 @@ comp_d3d12_compositor_zone_mask_create(struct xrt_compositor *xc, uint32_t w, ui
 	    &heap, D3D12_HEAP_FLAG_NONE, &td,
 	    D3D12_RESOURCE_STATE_RENDER_TARGET, &clear,
 	    IID_PPV_ARGS(&mask->tex));
+	if (mask->tex != nullptr) mask->tex->SetName(L"DXR.zone_mask_tex"); // #747 attribution
 
 	if (SUCCEEDED(hr) && mask->tex != nullptr) {
 		D3D12_DESCRIPTOR_HEAP_DESC rtv_desc = {};
@@ -4522,6 +4528,7 @@ comp_d3d12_compositor_zone_mask_create(struct xrt_compositor *xc, uint32_t w, ui
 		    &heap, D3D12_HEAP_FLAG_NONE, &td,
 		    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
 		    IID_PPV_ARGS(&mask->staged));
+	if (mask->staged != nullptr) mask->staged->SetName(L"DXR.zone_mask_staged"); // #747 attribution
 	}
 	if (FAILED(hr) || mask->staged == nullptr) {
 		U_LOG_E("zone_mask_create: D3D12 resource creation failed: 0x%08x", hr);
