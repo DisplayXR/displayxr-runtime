@@ -490,10 +490,32 @@ fi
 
 if [ "$SIGNED" = yes ]; then
   # The runner already fail-closed-verified Status=Valid AND signer=Leia.
+  #
+  # The delete is LOAD-BEARING: --clobber cannot replace the CI asset, because the runner
+  # rebuilds with build number 0 (Setup-2.0.4.0.exe) while CI stamps the run number
+  # (Setup-2.0.4.1883.exe) — the names never collide. Skip it and the release ships a signed
+  # AND an unsigned installer side by side.
+  #
+  # startswith/endswith, NOT test("...\\.exe$"): that regex needs a \\ that survives only in
+  # single quotes; one extra layer of double-quoting makes it \. , jq rejects it as an invalid
+  # escape, $( ) yields empty, and the old `[ -n "$CI_EXE" ] &&` guard swallowed it silently.
+  # (Hit for real on runtime v2.0.4.) Need a regex? Write [.] — no escaping required.
   CI_EXE=$(gh release view "$NEW_TAG" -R "$REPO" --json assets \
-             --jq '.assets[].name | select(test("Setup-.*\\.exe$"))')
-  [ -n "$CI_EXE" ] && gh release delete-asset "$NEW_TAG" "$CI_EXE" --yes -R "$REPO"
+             --jq '.assets[].name | select(contains("Setup-") and endswith(".exe"))' \
+           | grep -v -F "$(basename "$SIGNED_EXE")" || true)
+  if [ -n "$CI_EXE" ]; then
+    echo "$CI_EXE" | while read -r a; do
+      gh release delete-asset "$NEW_TAG" "$a" --yes -R "$REPO"
+    done
+  else
+    echo "NOTE: no CI installer asset found to delete — verify the release has exactly one .exe"
+  fi
   gh release upload "$NEW_TAG" "$SIGNED_EXE" --clobber -R "$REPO"
+
+  # Never ship signed + unsigned together.
+  N=$(gh release view "$NEW_TAG" -R "$REPO" --json assets \
+        --jq '[.assets[].name | select(contains("Setup-") and endswith(".exe"))] | length')
+  [ "$N" = 1 ] || echo "WARNING: $N installer .exe assets on $NEW_TAG — expected exactly 1 (signed)."
 fi
 ```
 

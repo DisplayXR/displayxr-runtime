@@ -375,14 +375,38 @@ The runner already fail-closed-verifies `Status=Valid` AND signer contains
 elsewhere trust the runner's gate.)
 
 ### Step 4.5.3: Replace the CI asset on the release
+**The delete is load-bearing, not tidy-up.** `--clobber` cannot replace the CI asset:
+the signing runner rebuilds with build number `0` (`DisplayXRSetup-2.0.4.0.exe`) while CI
+stamps the run number (`DisplayXRSetup-2.0.4.1883.exe`), so the names never collide. Skip
+the delete and the release ships a signed **and** an unsigned installer side by side —
+exactly the outcome this phase exists to prevent.
+
+Note the jq filter uses `startswith`/`endswith`, NOT `test("...\\.exe$")`. The regex form
+needs a `\\` that survives intact only in single quotes; one extra layer of double-quoting
+turns it into `\.`, jq rejects it as an invalid escape, and the `$( )` yields empty — which
+the old `[ -n "$CI_EXE" ] &&` guard then swallowed silently. (Hit for real on v2.0.4.) If you
+do need a regex here, write `[.]` rather than `\\.` — it needs no escaping at all.
+
 ```bash
 if [ "$SIGNED" = yes ]; then
   CI_EXE=$(gh release view [FULL_TAG] --repo DisplayXR/displayxr-runtime \
-             --json assets --jq '.assets[].name | select(test("^DisplayXRSetup-.*\\.exe$"))')
-  [ -n "$CI_EXE" ] && gh release delete-asset [FULL_TAG] "$CI_EXE" --yes \
-    --repo DisplayXR/displayxr-runtime
+             --json assets \
+             --jq '.assets[].name | select(startswith("DisplayXRSetup-") and endswith(".exe"))' \
+           | grep -v -F "$(basename "$SIGNED_EXE")" || true)
+  if [ -n "$CI_EXE" ]; then
+    echo "$CI_EXE" | while read -r a; do
+      gh release delete-asset [FULL_TAG] "$a" --yes --repo DisplayXR/displayxr-runtime
+    done
+  else
+    echo "NOTE: no CI installer asset found to delete — verify the release has exactly one .exe"
+  fi
   gh release upload [FULL_TAG] "$SIGNED_EXE" --clobber \
     --repo DisplayXR/displayxr-runtime
+
+  # Fail loudly if more than one installer survived — never ship signed + unsigned together.
+  N=$(gh release view [FULL_TAG] --repo DisplayXR/displayxr-runtime --json assets \
+        --jq '[.assets[].name | select(startswith("DisplayXRSetup-") and endswith(".exe"))] | length')
+  [ "$N" = 1 ] || echo "WARNING: $N installer .exe assets on the release — expected exactly 1 (signed)."
 fi
 ```
 No local checkout to restore — nothing was built or checked out on this box.

@@ -68,8 +68,10 @@ Get the latest bundle tag from the remote (no local checkout):
 ```bash
 case "$ARG" in
   v[0-9]*.[0-9]*.[0-9]*)  TAG="$ARG" ;;
+  # [.] not \\. — the escaped form only survives single quotes; re-quote it once and jq
+  # rejects "\." as an invalid escape, silently yielding an empty LATEST.
   patch|minor|major)      LATEST=$(gh api repos/DisplayXR/displayxr-installer/tags \
-                                     --jq '[.[].name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))] | .[0]')
+                                     --jq '[.[].name | select(test("^v[0-9]+[.][0-9]+[.][0-9]+$"))] | .[0]')
                           TAG=$(bump "$LATEST" "$ARG") ;;   # patch/minor/major bump of $LATEST
   *)                      echo "Bad version spec"; exit 1 ;;
 esac
@@ -226,8 +228,13 @@ fi
 ```bash
 if [ "$SIGNED" = yes ]; then
   D=$(mktemp -d)
+  # startswith/endswith, NOT test("...\\.exe$"): that regex needs a \\ that survives only in
+  # single quotes; one extra layer of double-quoting makes it \. , jq rejects it as an invalid
+  # escape, and $( ) silently yields empty. (Hit for real on runtime v2.0.4.) Need a regex
+  # here? Write [.] instead of \\. — it needs no escaping.
   EXE=$(gh release view "$TAG" -R DisplayXR/displayxr-installer --json assets \
-         --jq '.assets[].name | select(test("DisplayXRBundle-.*\\.exe$"))')
+         --jq '.assets[].name | select(startswith("DisplayXRBundle-") and endswith(".exe"))')
+  [ -n "$EXE" ] || { echo "No DisplayXRBundle-*.exe on $TAG — cannot sign"; exit 1; }
   gh release download "$TAG" -R DisplayXR/displayxr-installer -p "$EXE" -D "$D/in"
 
   # Zip the finished .exe and hand it to the provider's folder-sign workflow.
