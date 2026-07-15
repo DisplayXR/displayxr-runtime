@@ -207,6 +207,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	find_package(udev)
 	if(PKGCONFIG_FOUND)
 		pkg_check_modules(XCB xcb xcb-randr x11-xcb)
+		# Xlib + Xrandr: only needed for the direct-scanout present path
+		# (VK_EXT_acquire_xlib_display steals a RandR output as a VkDisplayKHR,
+		# bypassing Xorg/compositor — ST-5539). Optional; absence just leaves
+		# the compositor on the XCB present path.
+		pkg_check_modules(XLIB_XRANDR x11 xrandr)
 	endif()
 endif()
 
@@ -241,6 +246,10 @@ option_with_deps(XRT_HAVE_METAL "Enable Metal Graphics API support" DEPENDS APPL
 option_with_deps(XRT_HAVE_D3D11 "Enable Direct3D 11 Graphics API support" DEPENDS D3D11_LIBRARY XRT_HAVE_VULKAN XRT_HAVE_DXGI XRT_HAVE_WIL)
 option_with_deps(XRT_HAVE_D3D12 "Enable Direct3D 12 Graphics API support" DEPENDS D3D12_LIBRARY XRT_HAVE_D3D11 XRT_HAVE_VULKAN XRT_HAVE_DXGI XRT_HAVE_WIL)
 option_with_deps(XRT_HAVE_XCB "Enable xcb support" DEPENDS XCB_FOUND)
+# Direct-scanout present path (Linux): Xlib+Xrandr to acquire a RandR output as a
+# VkDisplayKHR (VK_EXT_acquire_xlib_display / VK_KHR_display). Optional — the
+# compositor falls back to the XCB window path when absent. ST-5539.
+option_with_deps(XRT_HAVE_XLIB_XRANDR "Enable Xlib/Xrandr direct-scanout present (Linux)" DEPENDS XLIB_XRANDR_FOUND XRT_HAVE_XCB)
 
 # System deps to use (sorted)
 option_with_deps(XRT_HAVE_LIBUDEV "Enable libudev (used for device probing on Linux)" DEPENDS UDEV_FOUND)
@@ -430,6 +439,13 @@ endif()
 if(XRT_HAVE_XCB)
 	set(VK_USE_PLATFORM_XCB_KHR TRUE)
 endif()
+# Activates the aux-layer VkDisplayKHR helpers + acquire-xlib function pointers
+# (dormant otherwise) and the direct-scanout window backend. Drives the
+# #cmakedefine of both macros in xrt_config_vulkan.h.
+if(XRT_HAVE_XLIB_XRANDR)
+	set(VK_USE_PLATFORM_DISPLAY_KHR TRUE)
+	set(VK_USE_PLATFORM_XLIB_XRANDR_EXT TRUE)
+endif()
 if(ANDROID)
 	set(VK_USE_PLATFORM_ANDROID_KHR TRUE)
 endif()
@@ -577,6 +593,7 @@ message(STATUS "#    SYSTEMD:         ${XRT_HAVE_SYSTEMD}")
 message(STATUS "#    TRACY:           ${XRT_HAVE_TRACY}")
 message(STATUS "#    VULKAN:          ${XRT_HAVE_VULKAN}")
 message(STATUS "#    XCB:             ${XRT_HAVE_XCB}")
+message(STATUS "#    XLIB_XRANDR:     ${XRT_HAVE_XLIB_XRANDR}  (direct-scanout present)")
 message(STATUS "#")
 message(STATUS "#    MODULE_COMPOSITOR:           ${XRT_MODULE_COMPOSITOR}")
 message(STATUS "#    MODULE_COMPOSITOR_MAIN:      ${XRT_MODULE_COMPOSITOR_MAIN}")

@@ -46,6 +46,10 @@ endif()
 if(XRT_HAVE_XCB)
 	target_include_directories(aux_vk PRIVATE ${XCB_INCLUDE_DIR})
 endif()
-if(XRT_HAVE_XRANDR)
-	target_include_directories(aux_vk PRIVATE ${XRANDR_INCLUDE_DIR} ${X11_INCLUDE_DIR})
+if(XRT_HAVE_XLIB_XRANDR)
+	# With VK_USE_PLATFORM_XLIB_XRANDR_EXT defined, vulkan.h pulls in
+	# vulkan_xlib_xrandr.h (-> X11/Xlib.h, X11/extensions/Xrandr.h), so the aux
+	# VK display helpers need the X11/Xrandr headers on the include path. These
+	# are usually system-global; the dirs are belt-and-suspenders. ST-5539.
+	target_include_directories(aux_vk PRIVATE ${XLIB_XRANDR_INCLUDE_DIRS})
 endif()

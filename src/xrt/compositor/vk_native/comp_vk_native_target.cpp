@@ -113,6 +113,12 @@ struct comp_vk_native_target
 	//! Window handle.
 	void *hwnd;
 
+	//! True when @ref surface was created and is owned by an external backend
+	//! (the direct-scanout window backend builds the display-plane surface
+	//! itself). Teardown then skips vkDestroySurfaceKHR — the backend releases
+	//! it, after the display, on its own destroy. ST-5539.
+	bool external_surface;
+
 #ifdef XRT_OS_ANDROID
 	//! The ANativeWindow the current VkSurfaceKHR was built from (owns one
 	//! reference, released when the surface is torn down). Distinct from @ref
@@ -991,6 +997,79 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 	return XRT_SUCCESS;
 }
 
+xrt_result_t
+comp_vk_native_target_create_from_surface(struct comp_vk_native_compositor *c,
+                                          VkSurfaceKHR surface,
+                                          uint32_t width,
+                                          uint32_t height,
+                                          struct comp_vk_native_target **out_target)
+{
+	// Direct-scanout path (ST-5539): the window backend already built the
+	// display-plane surface (only it has the display/mode/plane context), so we
+	// skip per-platform surface creation entirely and reuse the shared
+	// semaphore + swapchain tail. The surface is borrowed, not owned — the
+	// backend destroys it on its own teardown (external_surface = true).
+	struct vk_bundle *vk = comp_vk_native_compositor_get_vk(c);
+	uint32_t queue_family_index = comp_vk_native_compositor_get_queue_family(c);
+
+	if (surface == VK_NULL_HANDLE) {
+		U_LOG_E("VK native target: NULL surface handed to create_from_surface");
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	struct comp_vk_native_target *target = U_TYPED_CALLOC(struct comp_vk_native_target);
+	if (target == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+
+	target->vk = vk;
+	target->hwnd = NULL;
+	target->width = width;
+	target->height = height;
+	target->queue_family_index = queue_family_index;
+	target->surface = surface;
+	target->external_surface = true;
+
+	VkBool32 present_support = VK_FALSE;
+	vk->vkGetPhysicalDeviceSurfaceSupportKHR(vk->physical_device, queue_family_index, target->surface,
+	                                          &present_support);
+	if (!present_support) {
+		U_LOG_E("Queue family does not support presentation to the direct-scanout surface");
+		free(target);
+		return XRT_ERROR_VULKAN;
+	}
+
+	VkSemaphoreCreateInfo sem_ci = {
+	    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+	};
+	VkResult vk_res = vk->vkCreateSemaphore(vk->device, &sem_ci, NULL, &target->image_available);
+	if (vk_res != VK_SUCCESS) {
+		U_LOG_E("Failed to create image_available semaphore");
+		free(target);
+		return XRT_ERROR_VULKAN;
+	}
+	vk_res = vk->vkCreateSemaphore(vk->device, &sem_ci, NULL, &target->render_finished);
+	if (vk_res != VK_SUCCESS) {
+		U_LOG_E("Failed to create render_finished semaphore");
+		vk->vkDestroySemaphore(vk->device, target->image_available, NULL);
+		free(target);
+		return XRT_ERROR_VULKAN;
+	}
+
+	xrt_result_t xret = create_swapchain(target);
+	if (xret != XRT_SUCCESS) {
+		vk->vkDestroySemaphore(vk->device, target->render_finished, NULL);
+		vk->vkDestroySemaphore(vk->device, target->image_available, NULL);
+		free(target);
+		return xret;
+	}
+
+	*out_target = target;
+	U_LOG_I("Created VK native direct-scanout target: %ux%u, %u images, format %d", target->width,
+	        target->height, target->image_count, target->format);
+	return XRT_SUCCESS;
+}
+
 void
 comp_vk_native_target_destroy(struct comp_vk_native_target **target_ptr)
 {
@@ -1024,7 +1103,7 @@ comp_vk_native_target_destroy(struct comp_vk_native_target **target_ptr)
 	if (target->image_available != VK_NULL_HANDLE) {
 		vk->vkDestroySemaphore(vk->device, target->image_available, NULL);
 	}
-	if (target->surface != VK_NULL_HANDLE) {
+	if (target->surface != VK_NULL_HANDLE && !target->external_surface) {
 		vk->vkDestroySurfaceKHR(vk->instance, target->surface, NULL);
 	}
 
