@@ -17,7 +17,7 @@
 #   sudo apt-get install -y build-essential cmake ninja-build pkg-config \
 #       libvulkan-dev vulkan-validationlayers glslang-tools \
 #       libeigen3-dev libcjson-dev \
-#       libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev
+#       libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libxrandr-dev
 #   # glslang-tools provides glslangValidator, required at configure time to
 #   # compile the null compositor's SPIR-V (cmake/SPIR-V.cmake).
 #   # libxcb*-dev enables XRT_HAVE_XCB → the native Vulkan compositor builds on
@@ -26,6 +26,9 @@
 #   # libx11-dev + libx11-xcb-dev supply Xlib + XGetXCBConnection — the runtime
 #   # converts an app-provided Xlib window (XR_DXR_xlib_window_binding, Phase 3)
 #   # to its XCB connection, and the handle-class test app opens an X11 window.
+#   # libx11-dev + libxrandr-dev also enable XRT_HAVE_XLIB_XRANDR → the optional
+#   # direct-scanout present path (DXR_LINUX_DIRECT_SCANOUT=1) that acquires the
+#   # 3D-panel connector as a VkDisplayKHR and bypasses Xorg/compositor (ST-5539).
 #   # optional (enables the legacy udev VR prober — NOT needed for selftest):
 #   sudo apt-get install -y libudev-dev
 #
