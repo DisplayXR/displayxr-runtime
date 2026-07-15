@@ -92,8 +92,8 @@ typedef struct XrWin32WindowBindingCreateInfoDXR {
     void*                       sharedTextureHandle;   //!< Shared D3D11/D3D12 texture HANDLE for zero-copy, or NULL
     //! When XR_TRUE, the runtime configures the bound HWND for transparent desktop
     //! composition: pixels written by the app with full opacity appear opaque on screen,
-    //! and pixels written transparent (alpha = 0, or matching a chroma key set by the
-    //! app via SetLayeredWindowAttributes) compose through to the desktop underneath.
+    //! and pixels written transparent (alpha = 0) compose through to the desktop
+    //! underneath.
     //! The runtime picks the appropriate DXGI / Windows mechanism per graphics API;
     //! apps should not depend on which one. Only honored when windowHandle is non-NULL
     //! and the session is standalone — ignored in workspace/shell mode.

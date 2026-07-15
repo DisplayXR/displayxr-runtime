@@ -138,7 +138,7 @@ The two concepts are inseparable: window-space layers only make sense when there
 | 5 | `chromaKeyColor` — optional app-supplied chroma-key override. `0` = runtime DP picks its own default. |
 | 6 | `xrSetSharedTextureSurround2DEXT` — register a full-window 2D shared texture for the non-canvas region. Enables apps with a fixed 3D zone (sub-rect canvas) to deliver full-resolution 2D content for the surrounding area. See [§3.6](#36-xrsetsharedtexturesurround2dext). |
 | 7 | `xrSetSharedTextureSurround2DFenceEXT` — D3D12 variant of §3.6 that uses `ID3D12Fence` for producer→consumer sync. D3D12-native shared resources do not reliably expose `IDXGIKeyedMutex`, so the spec-v6 API does not work for D3D12 apps. *(Removed in v8.)* |
-| 8 | Removed `xrSetSharedTextureOutputRectDXR` + `xrSetSharedTextureSurround2DEXT` + `xrSetSharedTextureSurround2DFenceEXT` — superseded by [`XR_DXR_display_zones`](XR_DXR_display_zones.md) (ADR-031). See [`docs/roadmap/surround-zones-deprecation.md`](../../roadmap/surround-zones-deprecation.md). |
+| 8 | Removed `xrSetSharedTextureOutputRectDXR` + `xrSetSharedTextureSurround2DEXT` + `xrSetSharedTextureSurround2DFenceEXT` — superseded by [`XR_DXR_display_zones`](XR_DXR_display_zones.md) (ADR-031). See [`docs/roadmap/surround-zones-deprecation.md`](../../roadmap/surround-zones-deprecation.md). **Also removed `chromaKeyColor`** (#573) — transparency is carried end-to-end by per-pixel alpha and a transparent present; the `set_chroma_key` slot is gone from all five display-processor vtables. |
 
 ### 3.2 XrWin32WindowBindingCreateInfoDXR
 
@@ -151,7 +151,6 @@ typedef struct XrWin32WindowBindingCreateInfoDXR {
     void*                       readbackUserdata;              // Passed to readbackCallback
     void*                       sharedTextureHandle;           // Shared D3D11/D3D12 texture HANDLE, or NULL
     XrBool32                    transparentBackgroundEnabled;  // SPEC v4: transparent desktop composition opt-in
-    uint32_t                    chromaKeyColor;                // SPEC v5: optional chroma-key override (0x00BBGGRR), 0 = DP picks
 } XrWin32WindowBindingCreateInfoDXR;
 ```
 
@@ -168,7 +167,6 @@ typedef struct XrWin32WindowBindingCreateInfoDXR {
 | `readbackUserdata` | Opaque pointer passed to `readbackCallback`. |
 | `sharedTextureHandle` | Shared D3D11/D3D12 texture `HANDLE` for zero-copy GPU texture sharing. If non-NULL, the runtime composites into this shared texture instead of rendering to a window. |
 | `transparentBackgroundEnabled` | (SPEC v4) When `XR_TRUE`, the runtime configures the bound HWND for per-pixel desktop transparency: app pixels written with `alpha = 1` appear opaque, `alpha = 0` regions composite through to the desktop. Per graphics API, the runtime picks the correct DXGI/DComp mechanism (apps shouldn't depend on which one). Only honored when `windowHandle` is non-NULL and the session is standalone (ignored in workspace/shell mode). **App-side HWND requirements** apply — see "Transparent-window contract" below. |
-| `chromaKeyColor` | (SPEC v5) Optional 0x00BBGGRR chroma-key override for the runtime's post-weave alpha-conversion pass. Only meaningful when `transparentBackgroundEnabled = XR_TRUE`. **`0` = the runtime's display processor picks its own default** (currently magenta `0x00FF00FF`). Non-zero overrides the default — useful for apps that need a content-safe key (e.g. v1.2.9 Unity plugin used gray to minimize fringing on dark scenes). The app should clear transparent regions of the swapchain to either `RGBA(0,0,0,0)` (preferred — DP fills with the key color internally) or `RGB = chromaKeyColor` with `alpha = 1` (legacy app-pre-fill flow, also supported). |
 
 **Three Modes:**
 
@@ -208,7 +206,7 @@ HWND hwnd = CreateWindowEx(
 
 Apps that already use a separate top-level overlay window for transparency (e.g. the displayxr-unity plugin's `displayxr_get_app_main_view`) just need to ensure that overlay HWND has `WS_EX_NOREDIRECTIONBITMAP` and a null background brush. Apps with a single-HWND design should add both flags to that HWND when transparent backgrounds are requested.
 
-**This is not optional.** The runtime cannot work around a redirection-surface-backed HWND because DWM compositing happens above the runtime's swapchain — the runtime's chroma-key strip writes correct alpha=0 pixels to the swapchain, but DWM blends them with the redirection surface before reaching the screen.
+**This is not optional.** The runtime cannot work around a redirection-surface-backed HWND because DWM compositing happens above the runtime's swapchain — the runtime writes correct alpha=0 pixels to the swapchain, but DWM blends them with the redirection surface before reaching the screen.
 
 The `_handle` and `_texture` modes both apply (any time `windowHandle` is non-NULL with transparency enabled). The `_offscreen` mode is unaffected — there's no HWND.
 
@@ -244,11 +242,11 @@ present from the topology.
 
 | Graphics API | Mechanism | Status |
 |---|---|---|
-| D3D11 (in-process) | `CreateSwapChainForComposition` + `DXGI_ALPHA_MODE_PREMULTIPLIED` + `IDCompositionTarget` bound to the app HWND. The vendor D3D11 DP reconstructs see-through via compose-under-bg (WGC), with chroma-key fill+strip as the fallback. | Shipping (PR #213). |
+| D3D11 (in-process) | `CreateSwapChainForComposition` + `DXGI_ALPHA_MODE_PREMULTIPLIED` + `IDCompositionTarget` bound to the app HWND. The vendor D3D11 DP reconstructs see-through via compose-under-bg (WGC). | Shipping (PR #213). |
 | D3D11 (IPC/service) | The **client** owns the DComp present over a shared NT-handle texture + service→client fence; the DP runs `client_presents` mode — post-weave **alpha-gate only**, no captured-background compose, so the live desktop blends with zero lag. See "IPC / service path" above + ADR-029. | Shipping (#551). |
 | D3D12 | Same as D3D11, plus the runtime explicitly passes the back-buffer RTV through to the strip pass (D3D12 has no `OMGetRenderTargets`). | Shipping (PR #213, PR #3a). |
-| Vulkan | Swapchain `compositeAlpha` runtime-selects `VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR` → `INHERIT` → `OPAQUE` based on `caps.supportedCompositeAlpha`. Most Win32 ICDs only expose `OPAQUE`, in which case alpha is dropped at the WSI present and a one-time warning is logged (the chroma-key strip still runs but its alpha output is invisible — the vendor weaver's RGB on a black background is what reaches the screen). The vendor VK DP runs chroma-key fill+strip via SPIR-V shaders compiled offline. | Shipping (PR #3c). |
-| OpenGL | `CreateSwapChainForComposition` + `DXGI_ALPHA_MODE_PREMULTIPLIED` + `IDCompositionTarget`, bridged from GL via `WGL_NV_DX_interop2`. The GL native compositor weaves into an **off-screen interop transit texture** (the proven `_texture`-app interop path), then a **D3D11 fullscreen-triangle shader blit** copies it into the flip-model DComp back buffer (an RTV write) → `Present` + `Commit`. This sidesteps the PR #3b failure, where the DP wove directly into the flip-model back buffer via interop and produced no visible content (the known `WGL_NV_DX_interop2`-into-flip-model incompatibility — `CopyResource` into that back buffer failed too, but RTV writes work). The vendor GL DP runs chroma-key fill+strip around its weaving stage (driven by `set_chroma_key`). Gated on an app-provided HWND with `WS_EX_NOREDIRECTIONBITMAP`; runtime-hosted GL windows are not yet covered. Falls back to opaque `SwapBuffers` if `WGL_NV_DX_interop2`/DComp are unavailable. | Shipping. |
+| Vulkan | Swapchain `compositeAlpha` runtime-selects `VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR` → `INHERIT` → `OPAQUE` based on `caps.supportedCompositeAlpha`. Most Win32 ICDs only expose `OPAQUE`, in which case alpha is dropped at the WSI present and a one-time warning is logged — the vendor weaver's RGB on a black background is what reaches the screen. | Shipping (PR #3c). |
+| OpenGL | `CreateSwapChainForComposition` + `DXGI_ALPHA_MODE_PREMULTIPLIED` + `IDCompositionTarget`, bridged from GL via `WGL_NV_DX_interop2`. The GL native compositor weaves into an **off-screen interop transit texture** (the proven `_texture`-app interop path), then a **D3D11 fullscreen-triangle shader blit** copies it into the flip-model DComp back buffer (an RTV write) → `Present` + `Commit`. This sidesteps the PR #3b failure, where the DP wove directly into the flip-model back buffer via interop and produced no visible content (the known `WGL_NV_DX_interop2`-into-flip-model incompatibility — `CopyResource` into that back buffer failed too, but RTV writes work). Gated on an app-provided HWND with `WS_EX_NOREDIRECTIONBITMAP`; runtime-hosted GL windows are not yet covered. Falls back to opaque `SwapBuffers` if `WGL_NV_DX_interop2`/DComp are unavailable. | Shipping. |
 | Metal (macOS) | `CAMetalLayer.isOpaque = NO` + `NSWindow` non-opaque. App is responsible for the `NSWindow.opaque` flag. | Shipping (PR #4). |
 
 ### 3.3 XrCompositionLayerWindowSpaceDXR
