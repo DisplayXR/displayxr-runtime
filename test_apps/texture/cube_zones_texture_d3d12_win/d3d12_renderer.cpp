@@ -849,7 +849,17 @@ static void DrainD3D12DebugMessages(D3D12Renderer& renderer) {
         return;
     }
 
-    static std::map<int, uint64_t> seen;  // message ID -> occurrences
+    // Dedup by the message TEXT, not the ID.
+    //
+    // Deduping by ID alone hides the thing you are hunting: several DIFFERENT
+    // barriers (different command lists, different resources) share id=527, so
+    // only the FIRST would ever print and every later one — including the one
+    // you care about — is silently swallowed into a counter. Cost a wrong
+    // conclusion once already.
+    //
+    // Pointer values are stripped so the same logical complaint collapses across
+    // frames instead of printing once per resource address.
+    static std::map<std::string, uint64_t> seen;  // normalized text -> occurrences
     const UINT64 n = q->GetNumStoredMessages();
     for (UINT64 i = 0; i < n; i++) {
         SIZE_T len = 0;
@@ -862,12 +872,21 @@ static void DrainD3D12DebugMessages(D3D12Renderer& renderer) {
         if (FAILED(q->GetMessage(i, m, &len))) {
             continue;
         }
-        auto it = seen.find((int)m->ID);
+        const char* desc = m->pDescription != nullptr ? m->pDescription : "(no description)";
+        // Normalize: drop 0x... addresses so identical complaints collapse.
+        std::string key;
+        key.reserve(256);
+        for (const char* s = desc; *s != '\0'; s++) {
+            if (s[0] == '0' && s[1] == 'x') {
+                while (*s != '\0' && *s != ':' && *s != ')' && *s != ' ') s++;
+                if (*s == '\0') break;
+            }
+            key.push_back(*s);
+        }
+        auto it = seen.find(key);
         if (it == seen.end()) {
-            seen.emplace((int)m->ID, 1);
-            // First sighting of each ID prints in full — that is the actionable line.
-            LOG_WARN("#747 D3D12 debug FIRST id=%d sev=%d: %s", (int)m->ID, (int)m->Severity,
-                     m->pDescription != nullptr ? m->pDescription : "(no description)");
+            seen.emplace(key, 1);
+            LOG_WARN("#747 D3D12 debug FIRST id=%d sev=%d: %s", (int)m->ID, (int)m->Severity, desc);
         } else {
             it->second++;
         }
@@ -879,9 +898,9 @@ static void DrainD3D12DebugMessages(D3D12Renderer& renderer) {
     frames++;
     if (frames % 300 == 0 && !seen.empty()) {
         for (const auto& kv : seen) {
-            LOG_WARN("#747 D3D12 debug TOTAL id=%d count=%llu over %u frames (%.2f/frame)",
-                     kv.first, (unsigned long long)kv.second, frames,
-                     (double)kv.second / (double)frames);
+            LOG_WARN("#747 D3D12 debug TOTAL count=%llu over %u frames (%.2f/frame): %.110s",
+                     (unsigned long long)kv.second, frames,
+                     (double)kv.second / (double)frames, kv.first.c_str());
         }
     }
 }

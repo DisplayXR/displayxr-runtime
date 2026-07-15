@@ -1154,6 +1154,32 @@ d3d12_crop_atlas_for_dp(struct comp_d3d12_compositor *c,
 	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 	c->cmd_list->ResourceBarrier(1, &barrier);
 
+	// #747: transition the ATLAS explicitly for the copy read, and put it back.
+	//
+	// The copy below READS the atlas. Without this the atlas (COMMON on entry)
+	// is IMPLICITLY PROMOTED to COPY_SOURCE, and it does not decay back until
+	// ExecuteCommandLists — so the caller's closing barrier, which declares
+	// `StateBefore = COMMON` on the way to PIXEL_SHADER_RESOURCE, lies:
+	//
+	//   D3D12 ERROR id=527: Before state (COMMON|PRESENT) ... does not match
+	//   with the current resource state (COPY_SOURCE) (promoted from COMMON)
+	//
+	// Wrong before-states are undefined behaviour. Making the transition
+	// explicit here (rather than fixing up the caller's StateBefore) keeps the
+	// invariant the callers already assume: **this function returns with the
+	// atlas in COMMON on BOTH paths** — the early-out above never touches it,
+	// and the copy path restores it. That symmetry is why the bug hid: the
+	// early-out fires whenever content == atlas dims, so it only bites once the
+	// atlas outgrows the content, which the high-water allocation in
+	// create_atlas_texture() makes permanent after any shrink.
+	D3D12_RESOURCE_BARRIER atlas_rb = {};
+	atlas_rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	atlas_rb.Transition.pResource = atlas_resource;
+	atlas_rb.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+	atlas_rb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	atlas_rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	c->cmd_list->ResourceBarrier(1, &atlas_rb);
+
 	// Copy content region from atlas to intermediate
 	D3D12_TEXTURE_COPY_LOCATION dst_loc = {};
 	dst_loc.pResource = c->dp_input_resource;
@@ -1167,6 +1193,11 @@ d3d12_crop_atlas_for_dp(struct comp_d3d12_compositor *c,
 
 	D3D12_BOX src_box = {0, 0, 0, content_w, content_h, 1};
 	c->cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &src_box);
+
+	// Atlas COPY_SOURCE → COMMON: restore the entry state the callers assume.
+	atlas_rb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	atlas_rb.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+	c->cmd_list->ResourceBarrier(1, &atlas_rb);
 
 	// Transition intermediate: COPY_DEST → COMMON (for DP)
 	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
