@@ -2242,12 +2242,25 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			// HUD overlay
 			d3d12_render_hud_overlay(c, c->cmd_list, back_buffer, tgt_width, tgt_height, &eye_pos);
 
-			// Transition back buffer COPY_DEST -> PRESENT. The chroma-key
-			// post-weave alpha conversion (when needed) runs inside the Leia
-			// D3D12 display processor's process_atlas, which leaves the back
-			// buffer in RENDER_TARGET. The D3D12 weaver however leaves the
-			// back buffer in RENDER_TARGET pre-HUD; the HUD path puts it in
-			// COPY_DEST here. So source state matches the HUD's exit state.
+			// Transition back buffer -> PRESENT, assuming the HUD overlay above
+			// left it in COPY_DEST.
+			//
+			// UNSOUND — tracked as #747. This StateBefore is an ASSUMPTION, not
+			// a tracked state: process_atlas hands the back buffer to the vendor
+			// display processor, which is a plug-in DLL (ADR-019) free to leave
+			// it in any state, and D3D12 offers no way to query it back. The
+			// assumption is unverifiable here and wrong states are undefined
+			// behaviour — a credible mechanism for the DEVICE_HUNG seen during
+			// interactive resize churn.
+			//
+			// The fix belongs in the plug-in contract (xrt_plugin_iface should
+			// SPECIFY the required entry state and the guaranteed exit state for
+			// the atlas and the target), not in more guessing here. Do not
+			// "improve" this by inferring what a particular vendor's DP does
+			// internally — that was the previous comment's mistake, and it
+			// justified this state by describing a chroma-key alpha pass that
+			// #573 deleted (set_chroma_key is gone from all five DP vtables;
+			// see xrt_plugin.h). The reasoning outlived the mechanism.
 			barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
 			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
 			c->cmd_list->ResourceBarrier(1, &barrier);

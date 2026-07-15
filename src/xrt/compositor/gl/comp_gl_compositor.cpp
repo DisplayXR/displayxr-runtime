@@ -268,7 +268,7 @@ static const char *FS_MASKED_COMPOSITE =
 // #439 Phase 3 — authored zone mask (XR_DXR_local_3d_zone), GL R8 texture.
 // In-process handle apps author it on the same GL context the composite
 // samples from, frame-serialized, so a single texture (no staged copy) is
-// coherent. Tier-3 acquire_rt is unimplemented on GL (chroma-key-only DP).
+// coherent. Tier-3 acquire_rt is unimplemented on GL.
 struct comp_gl_zone_mask
 {
 	GLuint tex;  //!< R8 mask, M in [0,1] (1 = 3D / keep weave).
