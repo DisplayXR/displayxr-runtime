@@ -727,6 +727,11 @@ static void CreateSharedTextureSRV(ID3D12Device* device) {
 static bool CreateAppSwapchainRTVs(ID3D12Device* device) {
     for (UINT i = 0; i < APP_BACK_BUFFER_COUNT; i++) {
         HRESULT hr = g_appSwapchain->GetBuffer(i, IID_PPV_ARGS(&g_appBackBuffers[i]));
+        if (SUCCEEDED(hr) && g_appBackBuffers[i]) {
+            wchar_t nm[64];
+            swprintf_s(nm, L"APP.backbuffer[%u]", i);   // #747 attribution
+            g_appBackBuffers[i]->SetName(nm);
+        }
         if (FAILED(hr)) return false;
 
         D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = g_appRtvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -1427,6 +1432,7 @@ static bool EnsureZoneCmdResources(D3D12Renderer& renderer) {
             IID_PPV_ARGS(&g_zoneCmdAlloc)))) return false;
     if (FAILED(renderer.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
             g_zoneCmdAlloc.Get(), nullptr, IID_PPV_ARGS(&g_zoneCmdList)))) return false;
+    g_zoneCmdList->SetName(L"APP.zone_cmd_list"); // #747 attribution
     g_zoneCmdList->Close();
     if (FAILED(renderer.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_zoneFence))))
         return false;
@@ -2909,6 +2915,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     {
         renderer.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_blitCmdAllocator));
         renderer.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_blitCmdAllocator.Get(), nullptr, IID_PPV_ARGS(&g_blitCmdList));
+        g_blitCmdList->SetName(L"APP.blit_cmd_list"); // #747 attribution
         g_blitCmdList->Close();
         renderer.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_blitFence));
         g_blitFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
@@ -3115,6 +3122,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         if (hudOk) {
             renderer.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&hudCmdAllocator));
             renderer.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, hudCmdAllocator.Get(), nullptr, IID_PPV_ARGS(&hudCmdList));
+            if (hudCmdList) hudCmdList->SetName(L"APP.hud_cmd_list"); // #747 attribution
             hudCmdList->Close();
             renderer.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&hudFence));
             hudFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);

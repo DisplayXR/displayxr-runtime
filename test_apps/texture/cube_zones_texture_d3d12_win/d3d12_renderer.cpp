@@ -641,6 +641,7 @@ bool InitializeD3D12WithLUID(D3D12Renderer& renderer, LUID adapterLuid) {
     hr = renderer.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
         renderer.commandAllocator.Get(), nullptr, IID_PPV_ARGS(&renderer.commandList));
     if (FAILED(hr)) return false;
+    renderer.commandList->SetName(L"APP.renderer_cmd_list"); // #747 attribution
     renderer.commandList->Close(); // Start closed; Reset before use
 
     // Create resources

@@ -1136,6 +1136,7 @@ d3d12_crop_atlas_for_dp(struct comp_d3d12_compositor *c,
 			        content_w, content_h, hr);
 			return atlas_resource;
 		}
+		c->dp_input_resource->SetName(L"DXR.dp_input_crop"); // #747: debug-layer attribution
 
 		c->dp_input_width = content_w;
 		c->dp_input_height = content_h;
@@ -2615,6 +2616,12 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 		d3d12_compositor_destroy(&c->base.base);
 		return XRT_ERROR_D3D;
 	}
+	// #747: name the list, not just the resources. The compositor SHARES the
+	// app's device, so the debug layer's complaints interleave ours with the
+	// app's — and with everything unnamed there is no way to tell whose barrier
+	// is at fault. The list name attributes the barrier; the resource name
+	// identifies the target. Debug-layer-only metadata.
+	c->cmd_list->SetName(L"DXR.compositor_cmd_list");
 	// Command list is created in recording state, close it
 	c->cmd_list->Close();
 
@@ -2648,6 +2655,12 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 			return XRT_ERROR_D3D;
 		}
 		c->has_shared_texture = true;
+
+		// #747: name it. The D3D12 debug layer identifies resources by name, and
+		// with none set every barrier complaint reads "Unnamed ID3D12Resource
+		// Object" — which is why the id-527 spam could be seen but not
+		// attributed. Names are debug-layer-only metadata (ignored without it).
+		c->shared_texture->SetName(L"DXR.app_shared_texture");
 
 		// Query shared texture dimensions
 		D3D12_RESOURCE_DESC st_desc = c->shared_texture->GetDesc();
@@ -3395,6 +3408,7 @@ d3d12_ensure_local2d_scratch(struct comp_d3d12_compositor *c, uint32_t w, uint32
 		c->local2d_scratch = nullptr;
 		return false;
 	}
+	c->local2d_scratch->SetName(L"DXR.local2d_scratch"); // #747: debug-layer attribution
 
 	if (c->local2d_scratch_rtv_heap == nullptr) {
 		D3D12_DESCRIPTOR_HEAP_DESC rtv_desc = {};
