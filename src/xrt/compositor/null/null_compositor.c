@@ -196,6 +196,16 @@ select_instances_extensions(struct null_compositor *c, struct u_string_list *req
 #ifdef VK_EXT_display_surface_counter
 	u_string_list_append(optional, VK_EXT_DISPLAY_SURFACE_COUNTER_EXTENSION_NAME);
 #endif
+#if defined(VK_USE_PLATFORM_XLIB_XRANDR_EXT) && defined(VK_USE_PLATFORM_DISPLAY_KHR)
+	// Direct-scanout present path (ST-5539). All optional: a box that lacks
+	// them (or has them but no leasable connector) stays on the XCB window
+	// path. Enabling them loads the aux-layer VkDisplayKHR helpers +
+	// acquire-xlib function pointers that comp_vk_native_window_direct needs.
+	// Order/deps: acquire_xlib -> direct_mode -> KHR_display.
+	u_string_list_append(optional, VK_KHR_DISPLAY_EXTENSION_NAME);
+	u_string_list_append(optional, VK_EXT_DIRECT_MODE_DISPLAY_EXTENSION_NAME);
+	u_string_list_append(optional, VK_EXT_ACQUIRE_XLIB_DISPLAY_EXTENSION_NAME);
+#endif
 
 	return VK_SUCCESS;
 }

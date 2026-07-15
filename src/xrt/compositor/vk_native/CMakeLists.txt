@@ -81,6 +81,19 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		target_link_libraries(comp_vk_native PRIVATE ${XCB_LIBRARIES})
 	endif()
 
+	if(XRT_HAVE_XLIB_XRANDR)
+		# Direct-scanout present path (ST-5539): steal a RandR output as a
+		# VkDisplayKHR and present to it directly, bypassing Xorg/compositor.
+		# Only this TU calls Xlib/Xrandr (XOpenDisplay, XRR*) — the aux VK
+		# display helpers are pure Vulkan. XLIB_XRANDR_{LIBRARIES,INCLUDE_DIRS}
+		# come from the top-level pkg_check_modules(XLIB_XRANDR x11 xrandr).
+		target_sources(comp_vk_native PRIVATE
+			comp_vk_native_window_direct.c
+			comp_vk_native_window_direct.h)
+		target_include_directories(comp_vk_native PRIVATE ${XLIB_XRANDR_INCLUDE_DIRS})
+		target_link_libraries(comp_vk_native PRIVATE ${XLIB_XRANDR_LIBRARIES})
+	endif()
+
 	# Qwerty include path for runtime-side 2D/3D toggle polling
 	if(XRT_BUILD_DRIVER_QWERTY)
 		target_link_libraries(comp_vk_native PRIVATE drv_qwerty_includes)
