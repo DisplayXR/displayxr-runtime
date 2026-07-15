@@ -310,6 +310,12 @@ comp_d3d12_swapchain_create(struct comp_d3d12_compositor *c,
 	if (is_depth) {
 		initial_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
 	}
+	U_LOG_W("#747 trace: swapchain create bits=0x%x flags=0x%x initial_state=0x%x (%s) %ux%u n=%u",
+	        (unsigned)info->bits, (unsigned)resource_flags, (unsigned)initial_state,
+	        initial_state == D3D12_RESOURCE_STATE_RENDER_TARGET ? "RENDER_TARGET"
+	        : initial_state == D3D12_RESOURCE_STATE_DEPTH_WRITE ? "DEPTH_WRITE"
+	                                                            : "?",
+	        (unsigned)info->width, (unsigned)info->height, (unsigned)image_count);
 
 	D3D12_CLEAR_VALUE clear_value = {};
 	clear_value.Format = dxgi_format;
@@ -341,9 +347,14 @@ comp_d3d12_swapchain_create(struct comp_d3d12_compositor *c,
 		// APP renders views into and the compositor samples, so they are the
 		// most likely subject of a cross-component barrier complaint — and the
 		// hardest to identify, since neither side "owns" them outright.
+		//
+		// The dims are part of the name on purpose: a session has SEVERAL
+		// swapchains (projection / HUD / Local2D), each with its own img[0], so
+		// an index alone is ambiguous and points at three different resources.
 		{
-			wchar_t nm[64];
-			swprintf_s(nm, L"DXR.xr_swapchain_img[%u]", i);
+			wchar_t nm[96];
+			swprintf_s(nm, L"DXR.xr_swapchain_img[%u] %ux%u%s", i, (unsigned)info->width,
+			           (unsigned)info->height, is_depth ? L" depth" : L"");
 			sc->images[i]->SetName(nm);
 		}
 
