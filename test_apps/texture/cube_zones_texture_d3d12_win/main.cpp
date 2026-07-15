@@ -108,6 +108,24 @@ static const char* APP_NAME = "cube_zones_texture_d3d12_win";
 // Window settings
 static const wchar_t* WINDOW_CLASS = L"DXRCubeZonesTextureD3D12Class";
 static const wchar_t* WINDOW_TITLE = L"D3D12 Cube Zones TEXTURE — XR_DXR_display_zones parity test";
+static const wchar_t* PANE_CLASS = L"DXRCubeZonesTextureD3D12PaneClass";
+
+// #740 phase-transfer harness (DXR_PANE_OFFSET=D). Reshapes the app into the
+// Unity-editor topology: a CONTAINER top-level that owns the app's DXGI
+// swapchain (the thing the SR SDK's device-level window association actually
+// resolves), with the bound weave surface as a WS_CHILD pane at in-container
+// offset D. The DP's #740 correction then computes phase_off_x == D.
+//
+// The pane is pinned to a FIXED SCREEN position — the container slides left as
+// D grows, and the container's non-client border cancels identically in both
+// arms, so the pane's client origin lands on the same panel pixels for every D
+// (and for the D-absent control). The correct weave phase is therefore
+// invariant in D *by construction*: any measured phase change vs D is pure
+// correction residual, with no modelling and no eye-tracking confound (measure
+// with no face in view — the SDK's nominal eye fallback is bit-exact stable).
+static int32_t g_paneOffsetX = -1;      // -1 = disabled -> plain top-level (control arm)
+static int32_t g_paneScreenX = 900;     // pane client X relative to the panel's left edge
+static HWND    g_paneHwnd = nullptr;    // bound weave surface when the harness is on
 
 // Global state (single-threaded — all accessed from the main thread only)
 static InputState g_inputState;
@@ -547,6 +565,37 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
 
     LOG_INFO("Window created: 0x%p", hwnd);
     return hwnd;
+}
+
+// #740 harness: the WS_CHILD pane inside the container. Inert by design — it is
+// a weave surface and a position anchor, never a render target (the DP weaves
+// into the shared texture; the container presents). DefWindowProc is all it
+// needs, so it deliberately does NOT share WINDOW_CLASS/WindowProc.
+static HWND CreatePaneWindow(HINSTANCE hInstance, HWND container, int x, int y, int w, int h) {
+    WNDCLASSEX wc = {};
+    wc.cbSize = sizeof(WNDCLASSEX);
+    wc.lpfnWndProc = DefWindowProc;
+    wc.hInstance = hInstance;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wc.lpszClassName = PANE_CLASS;
+    if (!RegisterClassEx(&wc)) {
+        DWORD err = GetLastError();
+        if (err != ERROR_CLASS_ALREADY_EXISTS) {
+            LOG_ERROR("Failed to register pane class, error: %lu", err);
+            return nullptr;
+        }
+    }
+
+    HWND pane = CreateWindowEx(0, PANE_CLASS, L"", WS_CHILD | WS_VISIBLE,
+                               x, y, w, h, container, nullptr, hInstance, nullptr);
+    if (!pane) {
+        LOG_ERROR("Failed to create pane window, error: %lu", GetLastError());
+        return nullptr;
+    }
+    LOG_INFO("#740 harness: pane 0x%p is WS_CHILD of container 0x%p at in-container (%d,%d) %dx%d",
+             pane, container, x, y, w, h);
+    return pane;
 }
 
 // ---------------------------------------------------------------------------
@@ -2684,12 +2733,39 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
-    // Create window FIRST (needed for XR_DXR_win32_window_binding)
-    HWND hwnd = CreateAppWindow(hInstance, g_windowWidth, g_windowHeight);
+    // #740 phase-transfer harness — see the g_paneOffsetX block at the top.
+    if (const char* po = getenv("DXR_PANE_OFFSET")) {
+        if (po[0] != '\0') {
+            g_paneOffsetX = (int32_t)atol(po);
+            if (g_paneOffsetX < 0) g_paneOffsetX = 0;
+        }
+    }
+    if (const char* px = getenv("DXR_PANE_SCREEN_X")) {
+        if (px[0] != '\0') g_paneScreenX = (int32_t)atol(px);
+    }
+
+    // Create window FIRST (needed for XR_DXR_win32_window_binding). With the
+    // harness on, this top-level is the CONTAINER: it owns the app swapchain
+    // and is sized to hold the pane at offset D, mirroring the editor shell.
+    const bool harness = (g_paneOffsetX >= 0);
+    // Latch the pane size before CreateAppWindow: the container's WM_SIZE
+    // overwrites g_windowWidth/Height with the CONTAINER's client size.
+    const UINT paneW = g_windowWidth, paneH = g_windowHeight;
+    const UINT containerW = harness ? (UINT)(g_paneOffsetX + (int32_t)paneW) : paneW;
+    HWND hwnd = CreateAppWindow(hInstance, containerW, paneH);
     if (!hwnd) {
         LOG_ERROR("Failed to create window");
         ShutdownLogging();
         return 1;
+    }
+    if (harness) {
+        g_paneHwnd = CreatePaneWindow(hInstance, hwnd, g_paneOffsetX, 0,
+                                      (int)paneW, (int)paneH);
+        if (!g_paneHwnd) {
+            LOG_ERROR("#740 harness: pane creation failed");
+            ShutdownLogging();
+            return 1;
+        }
     }
 
     // Initialize OpenXR
@@ -2709,7 +2785,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // coords, top-down; (0,0) = primary/unknown is safe), BEFORE
     // xrCreateSession so the display processor tracks the window on the
     // panel from the start.
-    SetWindowPos(hwnd, nullptr, g_displayScreenLeft, g_displayScreenTop, 0, 0,
+    //
+    // #740 harness: slide the CONTAINER left by D so the pane's client origin
+    // stays on a fixed panel pixel for every D. The container's non-client
+    // border offsets the client origin by the same amount in both arms, so it
+    // cancels in the differential and the control (harness off, D absent) lands
+    // the bound window's client on those same pixels.
+    SetWindowPos(hwnd, nullptr,
+                 g_displayScreenLeft + (harness ? (g_paneScreenX - g_paneOffsetX) : g_paneScreenX),
+                 g_displayScreenTop, 0, 0,
                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 
     // Check for session target extension (required for texture mode)
@@ -2898,8 +2982,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // (XR_DXR_win32_window_binding). The shared texture exists BEFORE this
     // call — the runtime opens it at session create. THIS is the texture-mode
     // marker (the handle app passes only the HWND).
-    LOG_INFO("Creating OpenXR session (shared texture handle 0x%p + HWND 0x%p)...", g_sharedHandle, hwnd);
-    if (!CreateSession(xr, renderer.device.Get(), renderer.commandQueue.Get(), g_sharedHandle, hwnd)) {
+    // #740 harness: bind the PANE, not the container. The container keeps the
+    // DXGI swapchain (what SR's device association resolves) — that split is
+    // exactly the docked-editor condition under test.
+    HWND bindHwnd = harness ? g_paneHwnd : hwnd;
+    LOG_INFO("Creating OpenXR session (shared texture handle 0x%p + HWND 0x%p)...", g_sharedHandle, bindHwnd);
+    if (!CreateSession(xr, renderer.device.Get(), renderer.commandQueue.Get(), g_sharedHandle, bindHwnd)) {
         LOG_ERROR("OpenXR session creation failed");
         MessageBox(hwnd, L"Failed to create OpenXR session", L"Error", MB_OK | MB_ICONERROR);
         if (hudOk) CleanupHudRenderer(hudRenderer);
@@ -3036,6 +3124,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Show window
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
+
+    // #740 harness: log the bound surface's ACTUAL client origin on the panel.
+    // The differential is only valid if this is byte-identical across arms, and
+    // the readback alone CANNOT prove it — the shared texture is window-local,
+    // so content lands at texture (0,0) no matter where the window sits. WARN
+    // level so it survives the INFO hot-path filter.
+    {
+        POINT o = {0, 0};
+        ClientToScreen(bindHwnd, &o);
+        RECT cr = {};
+        GetClientRect(bindHwnd, &cr);
+        POINT co = {0, 0};
+        ClientToScreen(hwnd, &co);
+        LOG_WARN("#740 harness: D=%d bound=0x%p client_origin=(%ld,%ld) client=%ldx%ld "
+                 "container_client_origin=(%ld,%ld)",
+                 g_paneOffsetX, bindHwnd, o.x, o.y, cr.right - cr.left, cr.bottom - cr.top,
+                 co.x, co.y);
+    }
 
     LOG_INFO("");
     LOG_INFO("=== Entering main loop ===");
