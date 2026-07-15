@@ -12705,9 +12705,68 @@ comp_d3d11_service_is_d3d11_service(struct xrt_system_compositor *xsysc)
 	return is_d3d11_service;
 }
 
+/*!
+ * Resolve the display processor that answers an eye query for @p xc — the
+ * CALLING client's compositor, or NULL for callers that own none (the headless
+ * WebXR bridge).
+ *
+ * The order deliberately mirrors comp_d3d11_service_weave_submit's own lookup:
+ * the caller's per-client DP first. Every client compositor is given its own DP
+ * in init_client_render_resources at session-CREATE time, bound to the client's
+ * HWND — so a client that never RENDERS still has a live, tracking DP (the
+ * weave proves that every frame on the inline-3D path).
+ *
+ * Resolving via sys->active_compositor alone was the bug (#625): that pointer is
+ * only assigned inside the per-frame render path, so a submit-only client (no
+ * xrBeginSession / no xrEndFrame — e.g. the browser's weave session, which stays
+ * frame-loop-free precisely so the compositor never presents over its window)
+ * never became "active". Its eye query then failed with "no active display
+ * processor available", ipc_try_get_sr_view_poses bailed, and the client
+ * silently got device-default view poses (rig_applied=0) instead of Kooima —
+ * a static, symmetric frustum with the rig and any zone rect ignored.
+ *
+ * Caller MUST hold sys->render_mutex: it guards the DP pointer read AND the
+ * subsequent call into the DP against compositor_destroy's teardown (#363
+ * use-after-free).
+ */
+static struct xrt_display_processor_d3d11 *
+resolve_eye_display_processor(struct d3d11_service_system *sys, struct xrt_compositor *xc)
+{
+	// Workspace mode: per-client compositors have no DP of their own — the
+	// multi-compositor owns the shared one.
+	if (sys->workspace_mode && sys->multi_comp != nullptr) {
+		return sys->multi_comp->display_processor;
+	}
+
+	// The caller's own DP. Correct regardless of whether this client renders.
+	if (xc != nullptr) {
+		struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+		if (c != nullptr && c->render.display_processor != nullptr) {
+			return c->render.display_processor;
+		}
+	}
+
+	// Shared DP for a client that has none of its own (weave_submit's fallback).
+	if (sys->multi_comp != nullptr && sys->multi_comp->display_processor != nullptr) {
+		return sys->multi_comp->display_processor;
+	}
+
+	// Last resort: whichever compositor rendered most recently. Preserves the
+	// pre-#625 behaviour exactly for callers that pass no xc.
+	{
+		std::lock_guard<std::mutex> lock(sys->active_compositor_mutex);
+		if (sys->active_compositor != nullptr) {
+			return sys->active_compositor->render.display_processor;
+		}
+	}
+
+	return nullptr;
+}
+
 bool
-comp_d3d11_service_get_predicted_eye_positions_full(struct xrt_system_compositor *xsysc,
-                                                     struct xrt_eye_positions *out_eyes)
+comp_d3d11_service_get_predicted_eye_positions_full_for_client(struct xrt_system_compositor *xsysc,
+                                                                struct xrt_compositor *xc,
+                                                                struct xrt_eye_positions *out_eyes)
 {
 	if (xsysc == NULL || out_eyes == NULL) {
 		return false;
@@ -12727,20 +12786,7 @@ comp_d3d11_service_get_predicted_eye_positions_full(struct xrt_system_compositor
 
 	// Caching now lives inside the DP itself (vendor-internal, populated
 	// by SR's EyePairStream listener). This is just a thin pass-through.
-	// Get display processor for eye position prediction.
-	// In workspace mode, use the multi-comp's DP (per-client compositors have no DP).
-	// In normal mode, use the active compositor's DP.
-	struct xrt_display_processor_d3d11 *dp = nullptr;
-	if (sys->workspace_mode && sys->multi_comp != nullptr) {
-		dp = sys->multi_comp->display_processor;
-	}
-	if (dp == nullptr) {
-		std::lock_guard<std::mutex> lock(sys->active_compositor_mutex);
-		if (sys->active_compositor != nullptr &&
-		    sys->active_compositor->render.display_processor != nullptr) {
-			dp = sys->active_compositor->render.display_processor;
-		}
-	}
+	struct xrt_display_processor_d3d11 *dp = resolve_eye_display_processor(sys, xc);
 
 	if (dp != nullptr) {
 		U_ZERO(out_eyes);
@@ -12749,27 +12795,40 @@ comp_d3d11_service_get_predicted_eye_positions_full(struct xrt_system_compositor
 		}
 	}
 
-	// Log if we have no active display processor
+	// Log if no DP could be resolved at all. Note this is now a genuinely
+	// exceptional case: a client's own DP is created at session-create, so
+	// reaching here means neither the caller, the multi-compositor, nor any
+	// rendering client has one.
 	static bool logged_no_dp = false;
 	if (!logged_no_dp) {
 		logged_no_dp = true;
-		U_LOG_W("comp_d3d11_service_get_predicted_eye_positions: no active display processor available");
+		U_LOG_W("comp_d3d11_service_get_predicted_eye_positions: no display processor available "
+		        "(caller_xc=%p)",
+		        (void *)xc);
 	}
 
 	return false;
 }
 
 bool
-comp_d3d11_service_get_predicted_eye_positions(struct xrt_system_compositor *xsysc,
-                                                struct xrt_vec3 *out_left,
-                                                struct xrt_vec3 *out_right)
+comp_d3d11_service_get_predicted_eye_positions_full(struct xrt_system_compositor *xsysc,
+                                                     struct xrt_eye_positions *out_eyes)
+{
+	return comp_d3d11_service_get_predicted_eye_positions_full_for_client(xsysc, /*xc=*/nullptr, out_eyes);
+}
+
+bool
+comp_d3d11_service_get_predicted_eye_positions_for_client(struct xrt_system_compositor *xsysc,
+                                                           struct xrt_compositor *xc,
+                                                           struct xrt_vec3 *out_left,
+                                                           struct xrt_vec3 *out_right)
 {
 	if (out_left == NULL || out_right == NULL) {
 		return false;
 	}
 
 	struct xrt_eye_positions eyes;
-	if (!comp_d3d11_service_get_predicted_eye_positions_full(xsysc, &eyes) || !eyes.valid) {
+	if (!comp_d3d11_service_get_predicted_eye_positions_full_for_client(xsysc, xc, &eyes) || !eyes.valid) {
 		return false;
 	}
 
@@ -12789,6 +12848,15 @@ comp_d3d11_service_get_predicted_eye_positions(struct xrt_system_compositor *xsy
 		        out_right->x, out_right->y, out_right->z);
 	}
 	return true;
+}
+
+bool
+comp_d3d11_service_get_predicted_eye_positions(struct xrt_system_compositor *xsysc,
+                                                struct xrt_vec3 *out_left,
+                                                struct xrt_vec3 *out_right)
+{
+	return comp_d3d11_service_get_predicted_eye_positions_for_client(xsysc, /*xc=*/nullptr, out_left,
+	                                                                 out_right);
 }
 
 bool
