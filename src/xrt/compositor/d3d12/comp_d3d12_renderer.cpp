@@ -1487,12 +1487,27 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 				        (void *)src_resource, img_index, (void *)xscn);
 			}
 
-			// Transition swapchain image: COMMON → PIXEL_SHADER_RESOURCE
-			// The app leaves the resource in COMMON after rendering.
+			// Transition swapchain image: RENDER_TARGET → PIXEL_SHADER_RESOURCE.
+			//
+			// #747: RENDER_TARGET, not COMMON. XR_KHR_D3D12_enable makes this a
+			// contract, not a guess — on xrReleaseSwapchainImage "the OpenXR
+			// runtime must interpret the image as ... having a resource state
+			// match with D3D12_RESOURCE_STATE_RENDER_TARGET if the image is a
+			// color rendering target" (DEPTH_WRITE for depth). So a released
+			// image IS in RENDER_TARGET, and the ingest must say so.
+			//
+			// The old comment here claimed "the app leaves the resource in
+			// COMMON after rendering". That was never the contract — it
+			// described what apps happened to do when they copied into an image
+			// and let the implicit COMMON->COPY_DEST promotion decay back to
+			// COMMON. Assuming it made this path COMMON-in/COMMON-out, which
+			// (a) contradicted the sibling ingest at the top of this file, which
+			// has always used RENDER_TARGET correctly, and (b) produced ~13k
+			// id-527s per session against a spec-conformant app.
 			D3D12_RESOURCE_BARRIER src_barrier = {};
 			src_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 			src_barrier.Transition.pResource = src_resource;
-			src_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+			src_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
 			src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 			src_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 			cmd_list->ResourceBarrier(1, &src_barrier);
@@ -1629,10 +1644,12 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 				vp.Height = static_cast<float>(zr->extent.h) * zsy;
 				if (vp.Width <= 0.0f || vp.Height <= 0.0f) {
 					// Degenerate / off-target zone: restore the
-					// swapchain state and skip the draw.
+					// swapchain state and skip the draw. #747: restore to
+					// RENDER_TARGET — the state the image arrived in and
+					// must be handed back in.
 					src_barrier.Transition.StateBefore =
 					    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-					src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+					src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
 					cmd_list->ResourceBarrier(1, &src_barrier);
 					continue;
 				}
@@ -1681,9 +1698,12 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 				cmd_list->SetPipelineState(renderer->blit_pso);
 			}
 
-			// Transition swapchain image back: PIXEL_SHADER_RESOURCE → COMMON
+			// Transition swapchain image back: PIXEL_SHADER_RESOURCE →
+			// RENDER_TARGET. #747: leave it as we found it, per the
+			// XR_KHR_D3D12_enable contract — the app is entitled to see
+			// RENDER_TARGET on its next acquire/wait.
 			src_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-			src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+			src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
 			cmd_list->ResourceBarrier(1, &src_barrier);
 		}
 	}
