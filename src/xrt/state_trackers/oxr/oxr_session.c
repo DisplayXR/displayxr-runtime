@@ -3723,6 +3723,19 @@ oxr_session_create(struct oxr_logger *log,
 	}
 #endif
 
+#if defined(OXR_HAVE_DXR_xlib_window_binding)
+	// Parse XR_DXR_xlib_window_binding extension (desktop Linux) — only the
+	// transparent-background opt-in is read here (upstream, where xsi is
+	// mutable). The Display/Window pair is resolved later, in the vk_native
+	// branch of oxr_session_populate_graphics, and packed into a
+	// comp_vk_native_xlib_handle. Sibling of the win32/cocoa flags above.
+	const XrXlibWindowBindingCreateInfoDXR *xlib_target_info = OXR_GET_INPUT_FROM_CHAIN(
+	    createInfo, XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR, XrXlibWindowBindingCreateInfoDXR);
+	if (xlib_target_info != NULL && xlib_target_info->transparentBackgroundEnabled) {
+		xsi.transparent_background_enabled = true;
+	}
+#endif
+
 	U_LOG_W("xsi after parsing: external_window=%p, readback=%p, shared_tex=%p",
 	        xsi.external_window_handle, (void *)xsi.readback_callback, xsi.shared_texture_handle);
 

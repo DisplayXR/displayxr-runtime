@@ -30,6 +30,10 @@ struct comp_vk_native_window_xcb
 	//! WM_DELETE_WINDOW atom, so a user close is a clean event not an X error.
 	xcb_atom_t atom_wm_delete_window;
 
+	//! Colormap allocated for a 32-bit ARGB visual in transparent-background
+	//! mode; XCB_NONE for the opaque root-visual path. Freed on destroy.
+	xcb_colormap_t colormap;
+
 	//! Live size, seeded at create and updated on ConfigureNotify.
 	uint32_t width;
 	uint32_t height;
@@ -110,6 +114,32 @@ resolve_monitor_index(xcb_connection_t *conn,
 	return chosen;
 }
 
+/*!
+ * Find a 32-bit-depth TrueColor (ARGB) visual on @p screen, for transparent
+ * desktop composition (XR_DXR_xlib_window_binding transparentBackgroundEnabled).
+ * Rendering into an ARGB visual lets the swapchain advertise a non-opaque
+ * compositeAlpha so a compositing window manager blends the surface over the
+ * desktop. Returns XCB_NONE if the screen exposes no depth-32 TrueColor visual
+ * (no ARGB support) — the caller then falls back to the opaque root visual.
+ */
+static xcb_visualid_t
+find_argb_visual(xcb_screen_t *screen)
+{
+	xcb_depth_iterator_t depth_it = xcb_screen_allowed_depths_iterator(screen);
+	for (; depth_it.rem; xcb_depth_next(&depth_it)) {
+		if (depth_it.data->depth != 32) {
+			continue;
+		}
+		xcb_visualtype_iterator_t vis_it = xcb_depth_visuals_iterator(depth_it.data);
+		for (; vis_it.rem; xcb_visualtype_next(&vis_it)) {
+			if (vis_it.data->_class == XCB_VISUAL_CLASS_TRUE_COLOR) {
+				return vis_it.data->visual_id;
+			}
+		}
+	}
+	return XCB_NONE;
+}
+
 xrt_result_t
 comp_vk_native_window_xcb_create(uint32_t width,
                                  uint32_t height,
@@ -118,8 +148,6 @@ comp_vk_native_window_xcb_create(uint32_t width,
                                  bool transparent_background,
                                  struct comp_vk_native_window_xcb **out_win)
 {
-	(void)transparent_background; // X11 ARGB-visual transparency not wired in Phase 1.
-
 	if (width == 0) {
 		width = 1280;
 	}
@@ -159,11 +187,41 @@ comp_vk_native_window_xcb_create(uint32_t width,
 
 	win->window = xcb_generate_id(conn);
 
-	uint32_t value_mask = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK;
-	uint32_t value_list[] = {
-	    screen->black_pixel,
-	    XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_KEY_PRESS,
-	};
+	// Transparent-background mode (XR_DXR_xlib_window_binding
+	// transparentBackgroundEnabled): render into a 32-bit ARGB visual so the
+	// swapchain can advertise a non-opaque compositeAlpha and a compositing WM
+	// (GNOME/Mutter, KWin, picom) blends the surface over the desktop. A window
+	// whose depth differs from its parent's must carry its own colormap and an
+	// explicit border-pixel or X raises BadMatch, so both go in the value list.
+	uint8_t depth = XCB_COPY_FROM_PARENT;
+	xcb_visualid_t visual = screen->root_visual;
+	uint32_t value_mask;
+	uint32_t value_list[4];
+
+	xcb_visualid_t argb_visual = transparent_background ? find_argb_visual(screen) : XCB_NONE;
+	if (argb_visual != XCB_NONE) {
+		win->colormap = xcb_generate_id(conn);
+		xcb_create_colormap(conn, XCB_COLORMAP_ALLOC_NONE, win->colormap, screen->root, argb_visual);
+
+		depth = 32;
+		visual = argb_visual;
+		// Values must follow the canonical mask-bit order:
+		// BACK_PIXEL, BORDER_PIXEL, EVENT_MASK, COLORMAP.
+		value_mask = XCB_CW_BACK_PIXEL | XCB_CW_BORDER_PIXEL | XCB_CW_EVENT_MASK | XCB_CW_COLORMAP;
+		value_list[0] = 0; // fully-transparent background fill
+		value_list[1] = 0; // border pixel (required with a non-parent colormap)
+		value_list[2] = XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_KEY_PRESS;
+		value_list[3] = win->colormap;
+		U_LOG_I("XCB: transparent-background mode — 32-bit ARGB visual 0x%x", (unsigned)argb_visual);
+	} else {
+		if (transparent_background) {
+			U_LOG_W("XCB: transparentBackgroundEnabled requested but no 32-bit ARGB visual is "
+			        "available — falling back to an opaque window (is a compositing WM running?)");
+		}
+		value_mask = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK;
+		value_list[0] = screen->black_pixel;
+		value_list[1] = XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_KEY_PRESS;
+	}
 
 	// Position on the 3D display. The vendor plug-in publishes the panel's
 	// top-left in root-window coordinates through
@@ -171,12 +229,12 @@ comp_vk_native_window_xcb_create(uint32_t width,
 	// (Windows reference: comp_d3d11_window.cpp). (0, 0) means primary
 	// monitor (sim_display default or unknown panel). #715.
 	xcb_create_window(conn,
-	                  XCB_COPY_FROM_PARENT, // depth
+	                  depth,
 	                  win->window, screen->root,
 	                  (int16_t)screen_left, (int16_t)screen_top, (uint16_t)width, (uint16_t)height,
 	                  0,                                 // border
 	                  XCB_WINDOW_CLASS_INPUT_OUTPUT,
-	                  screen->root_visual,
+	                  visual,
 	                  value_mask, value_list);
 
 	// WM_NORMAL_HINTS with USPosition|PPosition, so the window manager treats
@@ -453,6 +511,11 @@ comp_vk_native_window_xcb_destroy(struct comp_vk_native_window_xcb **win_ptr)
 	if (win->connection != NULL) {
 		if (win->window != XCB_NONE) {
 			xcb_destroy_window(win->connection, win->window);
+		}
+		if (win->colormap != XCB_NONE) {
+			xcb_free_colormap(win->connection, win->colormap);
+		}
+		if (win->window != XCB_NONE || win->colormap != XCB_NONE) {
 			xcb_flush(win->connection);
 		}
 		xcb_disconnect(win->connection);
