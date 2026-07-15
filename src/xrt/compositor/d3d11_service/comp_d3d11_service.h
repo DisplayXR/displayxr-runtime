@@ -108,6 +108,41 @@ comp_d3d11_service_get_predicted_eye_positions_full(struct xrt_system_compositor
                                                      struct xrt_eye_positions *out_eyes);
 
 /*!
+ * Eye positions for a SPECIFIC client — resolves the DP from @p xc's own
+ * compositor before falling back to the shared / last-rendering one.
+ *
+ * Prefer these over the xc-less variants above whenever the caller knows which
+ * client is asking (e.g. ipc_try_get_sr_view_poses). Every client gets its own
+ * DP at session-create, so this answers correctly for a client that never
+ * renders a frame — a submit-only weave session, say. The xc-less variants can
+ * only consult the compositor that rendered most recently, which for such a
+ * client is some OTHER app or nothing at all (#625).
+ *
+ * @param xsysc The system compositor (must be D3D11 service compositor).
+ * @param xc    The calling client's compositor; NULL to use the shared /
+ *              last-rendering DP (identical to the variants above).
+ * @param[out] out_eyes / out_left / out_right As the variants above.
+ * @return true if a DP produced positions, false if none was available.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_get_predicted_eye_positions_full_for_client(struct xrt_system_compositor *xsysc,
+                                                                struct xrt_compositor *xc,
+                                                                struct xrt_eye_positions *out_eyes);
+
+/*!
+ * @copydoc comp_d3d11_service_get_predicted_eye_positions_full_for_client
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_get_predicted_eye_positions_for_client(struct xrt_system_compositor *xsysc,
+                                                           struct xrt_compositor *xc,
+                                                           struct xrt_vec3 *out_left,
+                                                           struct xrt_vec3 *out_right);
+
+/*!
  * Get display dimensions from the D3D11 service compositor's SR weaver.
  *
  * @param xsysc The system compositor (must be D3D11 service compositor).

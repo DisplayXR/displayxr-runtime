@@ -298,7 +298,15 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 	uint32_t eye_count = (view_count < 2) ? view_count : 2; // DP currently reports max 2
 	{
 		struct xrt_vec3 left_eye, right_eye;
-		if (!comp_d3d11_service_get_predicted_eye_positions(s->xsysc, &left_eye, &right_eye)) {
+		// Ask THIS client's DP (#625). Each client gets its own DP at
+		// session-create, so a client that never renders a frame — the
+		// browser's submit-only weave session, say — still has a live,
+		// tracking DP. The xc-less query could only see the compositor that
+		// rendered most recently, so such a client failed here and silently
+		// fell through to device-default view poses (rig_applied=0): a
+		// static, symmetric frustum with the rig and zone rect ignored.
+		// xc == NULL (headless relay) keeps the previous behaviour.
+		if (!comp_d3d11_service_get_predicted_eye_positions_for_client(s->xsysc, xc, &left_eye, &right_eye)) {
 			static bool logged_no_eye_pos = false;
 			if (!logged_no_eye_pos) {
 				logged_no_eye_pos = true;
@@ -320,7 +328,8 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 	// Timestamp + tracking lock come from the same full DP eye query.
 	if (rig_reply != NULL) {
 		struct xrt_eye_positions full_eyes = {0};
-		if (comp_d3d11_service_get_predicted_eye_positions_full(s->xsysc, &full_eyes) && full_eyes.valid) {
+		if (comp_d3d11_service_get_predicted_eye_positions_full_for_client(s->xsysc, xc, &full_eyes) &&
+		    full_eyes.valid) {
 			uint32_t raw_n = full_eyes.count;
 			if (raw_n > XRT_MAX_VIEWS) {
 				raw_n = XRT_MAX_VIEWS;
@@ -2436,7 +2445,12 @@ ipc_handle_compositor_get_predicted_eye_positions(volatile struct ipc_client_sta
 	// so these positions never feed the client-side Kooima path.
 	if (ics->server != NULL && ics->server->xsysc != NULL &&
 	    comp_d3d11_service_is_d3d11_service(ics->server->xsysc)) {
-		(void)comp_d3d11_service_get_predicted_eye_positions_full(ics->server->xsysc, &eyes);
+		// Scope to THIS client's DP (#625) — same reason as the locate path:
+		// a client that never renders still owns a live DP, and the xc-less
+		// query would report isTracking=false for it (or another app's state)
+		// even while its own located views are tracked.
+		(void)comp_d3d11_service_get_predicted_eye_positions_full_for_client(
+		    ics->server->xsysc, (struct xrt_compositor *)ics->xc, &eyes);
 	}
 #else
 	(void)ics;
