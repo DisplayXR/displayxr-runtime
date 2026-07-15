@@ -471,6 +471,34 @@ gpu_wait_idle(struct comp_d3d12_compositor *c)
 		c->fence->SetEventOnCompletion(c->fence_value, c->fence_event);
 		WaitForSingleObject(c->fence_event, INFINITE);
 	}
+
+	// #747: report a device reset the moment WE can see it, and dump DRED.
+	//
+	// This is the earliest point the runtime observes an adapter reset: on
+	// removal the fence jumps to UINT64_MAX, so the compare above passes, the
+	// wait is skipped, and we return as if nothing happened — silently. The
+	// host then hits DXGI_ERROR_DEVICE_REMOVED in ITS present and aborts.
+	//
+	// That ordering is why DRED has produced nothing in the field: the
+	// breadcrumbs live in the faulted process and die with it, and an
+	// aborting host (Unity aborts inside its own Present) never reads them.
+	// If the runtime does not read them here, nobody does.
+	//
+	// Once-only: after a reset every subsequent call fails, and a per-frame
+	// dump would bury the one interesting readout.
+	{
+		static bool s_reported = false;
+		if (!s_reported && c->device != nullptr) {
+			HRESULT rr = c->device->GetDeviceRemovedReason();
+			if (rr != S_OK) {
+				s_reported = true;
+				U_LOG_E("#747 DEVICE REMOVED observed by the compositor at gpu_wait_idle: "
+				        "GetDeviceRemovedReason=0x%08x",
+				        (unsigned)rr);
+				comp_d3d12_log_dred_state(c->device, "gpu_wait_idle/device-removed");
+			}
+		}
+	}
 }
 
 /*

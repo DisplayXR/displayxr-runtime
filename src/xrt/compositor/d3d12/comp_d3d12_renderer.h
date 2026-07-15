@@ -336,6 +336,26 @@ comp_d3d12_renderer_resize(struct comp_d3d12_renderer *renderer,
                            uint32_t new_view_height,
                            uint32_t new_target_height);
 
+
+/*!
+ * #747: dump DRED auto-breadcrumbs + page-fault info for @p device.
+ *
+ * Exported so the compositor can call it the moment IT observes a device reset.
+ * DRED data lives in the faulted process and dies with it, so a host that aborts
+ * without reading it (Unity aborts inside its own Present) produces nothing —
+ * the readout has to happen on OUR first sighting.
+ *
+ * Requires DRED to have been enabled BEFORE device creation; see the comment at
+ * the definition for the per-app registry route.
+ *
+ * @param device D3D12 device (void* = ID3D12Device*).
+ * @param context Short label for the log line.
+ *
+ * @ingroup comp_d3d12
+ */
+void
+comp_d3d12_log_dred_state(void *device, const char *context);
+
 #ifdef __cplusplus
 }
 #endif

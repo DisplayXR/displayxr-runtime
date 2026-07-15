@@ -401,9 +401,10 @@ compile_shader(const char *source, const char *entry, const char *target, ID3DBl
 //
 // When DRED isn't enabled, QueryInterface returns DXGI_ERROR_NOT_FOUND and we
 // log that fact (so users know how to turn it on) but don't error.
-static void
-log_dred_state(ID3D12Device *device, const char *context)
+void
+comp_d3d12_log_dred_state(void *device_ptr, const char *context)
 {
+	ID3D12Device *device = static_cast<ID3D12Device *>(device_ptr);
 	if (device == nullptr) return;
 	ID3D12DeviceRemovedExtendedData *dred = nullptr;
 	HRESULT qr = device->QueryInterface(__uuidof(ID3D12DeviceRemovedExtendedData), (void**)&dred);
@@ -485,7 +486,7 @@ create_atlas_texture(struct comp_d3d12_renderer *r, ID3D12Device *device, uint32
 		if (hr == DXGI_ERROR_DEVICE_REMOVED) {
 			HRESULT dr_hr = device->GetDeviceRemovedReason();
 			U_LOG_E("  GetDeviceRemovedReason: 0x%08x", (unsigned)dr_hr);
-			log_dred_state(device, "create_atlas_texture");
+			comp_d3d12_log_dred_state(device, "create_atlas_texture");
 		}
 		return XRT_ERROR_D3D;
 	}
