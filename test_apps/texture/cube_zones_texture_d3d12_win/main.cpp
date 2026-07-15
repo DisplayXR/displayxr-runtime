@@ -3129,8 +3129,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // The differential is only valid if this is byte-identical across arms, and
     // the readback alone CANNOT prove it — the shared texture is window-local,
     // so content lands at texture (0,0) no matter where the window sits. WARN
-    // level so it survives the INFO hot-path filter.
-    {
+    // level so it survives the INFO hot-path filter. Harness-only: a plain run
+    // has no container to report and should stay quiet.
+    if (harness) {
         POINT o = {0, 0};
         ClientToScreen(bindHwnd, &o);
         RECT cr = {};
