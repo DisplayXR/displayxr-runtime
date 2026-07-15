@@ -337,6 +337,15 @@ comp_d3d12_swapchain_create(struct comp_d3d12_compositor *c,
 			d3d12_swapchain_destroy(&sc->base.base);
 			return XRT_ERROR_D3D;
 		}
+		// #747: name it for debug-layer attribution. These are the images the
+		// APP renders views into and the compositor samples, so they are the
+		// most likely subject of a cross-component barrier complaint — and the
+		// hardest to identify, since neither side "owns" them outright.
+		{
+			wchar_t nm[64];
+			swprintf_s(nm, L"DXR.xr_swapchain_img[%u]", i);
+			sc->images[i]->SetName(nm);
+		}
 
 		// Store resource pointer as native image handle
 		sc->base.images[i].handle = reinterpret_cast<xrt_graphics_buffer_handle_t>(sc->images[i]);
