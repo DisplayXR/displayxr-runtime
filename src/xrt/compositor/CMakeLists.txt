@@ -300,6 +300,10 @@ endif()
 # fails to link with an undefined comp_window_macos_set_visible.
 if(APPLE)
 	target_link_libraries(comp_multi PRIVATE comp_macos_window)
+	# XR_DXR_weave present-owner service (#759): IOSurface in/out + the
+	# Vulkan weave engine.
+	target_sources(comp_multi PRIVATE multi/comp_multi_weave_macos.c)
+	target_link_libraries(comp_multi PRIVATE "-framework IOSurface" "-framework CoreFoundation")
 endif()
 
 ###
