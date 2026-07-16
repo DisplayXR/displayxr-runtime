@@ -1596,6 +1596,7 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
                                 struct oxr_system *sys,
                                 XrGraphicsBindingVulkanKHR const *next,
                                 void *window_handle,
+                                bool window_is_wayland,
                                 void *shared_texture_handle,
                                 bool transparent_background,
                                 struct oxr_session *sess);

@@ -81,6 +81,16 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		target_link_libraries(comp_vk_native PRIVATE ${XCB_LIBRARIES})
 	endif()
 
+	if(XRT_HAVE_LINUX AND XRT_HAVE_WAYLAND)
+		# Linux Wayland present path (runtime#757 WS3b): app-provided wl_surface +
+		# VK_KHR_wayland_surface. No self-created window / xdg-shell — the app owns
+		# the surface lifecycle. WAYLAND_{LIBRARIES,INCLUDE_DIRS} come from the
+		# top-level pkg_check_modules(WAYLAND wayland-client).
+		target_compile_definitions(comp_vk_native PRIVATE VK_USE_PLATFORM_WAYLAND_KHR XRT_HAVE_WAYLAND)
+		target_include_directories(comp_vk_native PRIVATE ${WAYLAND_INCLUDE_DIRS})
+		target_link_libraries(comp_vk_native PRIVATE ${WAYLAND_LIBRARIES})
+	endif()
+
 	# Qwerty include path for runtime-side 2D/3D toggle polling
 	if(XRT_BUILD_DRIVER_QWERTY)
 		target_link_libraries(comp_vk_native PRIVATE drv_qwerty_includes)

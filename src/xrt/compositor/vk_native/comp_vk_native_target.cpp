@@ -746,11 +746,13 @@ dcomp_present(struct comp_vk_native_target *target)
 xrt_result_t
 comp_vk_native_target_create(struct comp_vk_native_compositor *c,
                               void *hwnd,
+                              bool is_wayland,
                               uint32_t width,
                               uint32_t height,
                               bool transparent_background,
                               struct comp_vk_native_target **out_target)
 {
+	(void)is_wayland; // used only in the XRT_HAVE_WAYLAND Linux branch below
 	struct vk_bundle *vk = comp_vk_native_compositor_get_vk(c);
 	uint32_t queue_family_index = comp_vk_native_compositor_get_queue_family(c);
 
@@ -900,6 +902,49 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 		return XRT_ERROR_VULKAN;
 	}
 #elif defined(XRT_OS_LINUX_DESKTOP)
+#ifdef XRT_HAVE_WAYLAND
+	if (is_wayland) {
+		// App-provided Wayland surface (XR_DXR_wayland_surface_binding, WS3b):
+		// build a VkWaylandSurfaceKHR from the wl_display* + wl_surface* pair.
+		if (hwnd == NULL) {
+			U_LOG_E("VK native target: Wayland handle is NULL");
+			free(target);
+			return XRT_ERROR_DEVICE_CREATION_FAILED;
+		}
+		const struct comp_vk_native_wayland_handle *wl_handle =
+		    (const struct comp_vk_native_wayland_handle *)hwnd;
+		PFN_vkCreateWaylandSurfaceKHR pfnCreateWaylandSurface =
+		    (PFN_vkCreateWaylandSurfaceKHR)vk->vkGetInstanceProcAddr(vk->instance, "vkCreateWaylandSurfaceKHR");
+		if (pfnCreateWaylandSurface == NULL) {
+			U_LOG_E("vkCreateWaylandSurfaceKHR not available — VK_KHR_wayland_surface must be enabled");
+			free(target);
+			return XRT_ERROR_VULKAN;
+		}
+		VkWaylandSurfaceCreateInfoKHR wl_surface_ci = {
+		    .sType = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR,
+		    .pNext = NULL,
+		    .flags = 0,
+		    .display = (struct wl_display *)wl_handle->display,
+		    .surface = (struct wl_surface *)wl_handle->surface,
+		};
+		VkResult wl_res = pfnCreateWaylandSurface(vk->instance, &wl_surface_ci, NULL, &target->surface);
+		if (wl_res != VK_SUCCESS) {
+			U_LOG_E("Failed to create Wayland surface: %d", wl_res);
+			free(target);
+			return XRT_ERROR_VULKAN;
+		}
+		VkBool32 wl_present_support = VK_FALSE;
+		vk->vkGetPhysicalDeviceSurfaceSupportKHR(vk->physical_device, queue_family_index, target->surface,
+		                                         &wl_present_support);
+		if (!wl_present_support) {
+			U_LOG_E("Queue family does not support presentation to Wayland surface");
+			vk->vkDestroySurfaceKHR(vk->instance, target->surface, NULL);
+			free(target);
+			return XRT_ERROR_VULKAN;
+		}
+	} else
+#endif
+	{
 	// hwnd is a struct comp_vk_native_xcb_handle* carrying both the
 	// xcb_connection_t* and the xcb_window_t (a single void* can't hold both).
 	if (hwnd == NULL) {
@@ -946,6 +991,7 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 		free(target);
 		return XRT_ERROR_VULKAN;
 	}
+	} // end XCB (non-Wayland) branch
 #else
 	U_LOG_E("VK native target: no supported surface type on this platform");
 	free(target);

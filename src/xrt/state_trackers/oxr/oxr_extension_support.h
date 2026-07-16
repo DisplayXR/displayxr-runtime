@@ -18,6 +18,7 @@
 
 #include "xrt/xrt_config_build.h"
 #include "xrt/xrt_config_os.h"
+#include "xrt/xrt_config_have.h" // XRT_HAVE_WAYLAND — gates XR_DXR_wayland_surface_binding
 #include "xrt/xrt_openxr_includes.h"
 
 // beginning of GENERATED defines - do not modify - used by scripts
@@ -563,6 +564,23 @@
     _(DXR_xlib_window_binding, DXR_XLIB_WINDOW_BINDING)
 #else
 #define OXR_EXTENSION_SUPPORT_DXR_xlib_window_binding(_)
+#endif
+
+
+/*
+ * XR_DXR_wayland_surface_binding
+ *
+ * Desktop Linux only (same "Linux AND NOT Android" gate as the xlib sibling),
+ * and additionally gated on XRT_HAVE_WAYLAND — the runtime only advertises it
+ * when the vk_native compositor was built with the Wayland surface path.
+ */
+#if defined(XR_DXR_wayland_surface_binding) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID) &&                     \
+    defined(XRT_HAVE_WAYLAND)
+#define OXR_HAVE_DXR_wayland_surface_binding
+#define OXR_EXTENSION_SUPPORT_DXR_wayland_surface_binding(_) \
+    _(DXR_wayland_surface_binding, DXR_WAYLAND_SURFACE_BINDING)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_wayland_surface_binding(_)
 #endif
 
 
@@ -1169,6 +1187,7 @@
     OXR_EXTENSION_SUPPORT_DXR_win32_window_binding(_) \
     OXR_EXTENSION_SUPPORT_DXR_cocoa_window_binding(_) \
     OXR_EXTENSION_SUPPORT_DXR_xlib_window_binding(_) \
+    OXR_EXTENSION_SUPPORT_DXR_wayland_surface_binding(_) \
     OXR_EXTENSION_SUPPORT_DXR_macos_gl_binding(_) \
     OXR_EXTENSION_SUPPORT_DXR_display_info(_) \
     OXR_EXTENSION_SUPPORT_DXR_spatial_workspace(_) \

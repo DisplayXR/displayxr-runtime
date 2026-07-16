@@ -161,6 +161,14 @@ struct comp_vk_native_compositor
 
 	//! True if we created the window ourselves.
 	bool owns_window;
+
+#ifdef XRT_HAVE_WAYLAND
+	//! True when the app supplied a Wayland surface (XR_DXR_wayland_surface_binding)
+	//! instead of an X11 window — the target builds a VkWaylandSurfaceKHR.
+	bool use_wayland;
+	//! wl_display* + wl_surface* handed to the target as the type-erased hwnd.
+	struct comp_vk_native_wayland_handle wayland_handle;
+#endif
 #endif
 
 	//! Shared texture VkImage (imported from HANDLE).
@@ -3295,6 +3303,7 @@ apply_window_pos_override(int32_t *left, int32_t *top)
 xrt_result_t
 comp_vk_native_compositor_create(struct xrt_device *xdev,
                                  void *hwnd,
+                                 bool window_is_wayland,
                                  void *vk_instance,
                                  void *vk_physical_device,
                                  void *vk_device,
@@ -3311,6 +3320,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		U_LOG_E("VkDevice is null");
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
+	(void)window_is_wayland; // consumed only in the XRT_HAVE_WAYLAND Linux path
 
 	U_LOG_I("Creating VK native compositor");
 
@@ -3443,7 +3453,21 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	// hwnd is a struct comp_vk_native_xlib_handle* when the app supplied its
 	// own X11 window via XR_DXR_xlib_window_binding (handle class, Phase 3);
 	// NULL for hosted (runtime self-creates an XCB window, Phase 1).
-	if (hwnd != NULL) {
+#ifdef XRT_HAVE_WAYLAND
+	if (window_is_wayland && hwnd != NULL) {
+		// App-provided Wayland surface (XR_DXR_wayland_surface_binding, WS3b):
+		// the target builds a VkWaylandSurfaceKHR from the pair directly — no
+		// XCB window, no xdg-shell (the app owns the surface lifecycle).
+		const struct comp_vk_native_wayland_handle *wl =
+		    (const struct comp_vk_native_wayland_handle *)hwnd;
+		c->wayland_handle = *wl;
+		c->use_wayland = true;
+		c->xcb_window = NULL;
+		c->owns_window = false;
+		U_LOG_I("Using app-provided Wayland surface (XR_DXR_wayland_surface_binding)");
+	} else
+#endif
+	    if (hwnd != NULL) {
 		const struct comp_vk_native_xlib_handle *xlib =
 		    (const struct comp_vk_native_xlib_handle *)hwnd;
 		// Convert the Xlib display to its XCB connection (libX11-xcb) and
@@ -3631,13 +3655,20 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 #endif
 	) {
 		void *target_hwnd = hwnd;
+		bool target_is_wayland = false;
 #ifdef XRT_OS_WINDOWS
 		if (target_hwnd == NULL) target_hwnd = c->hwnd;
 #endif
 #ifdef XRT_OS_LINUX_DESKTOP
 		if (target_hwnd == NULL && c->xcb_window != NULL) target_hwnd = &c->xcb_handle;
 #endif
-		xrt_result_t xret = comp_vk_native_target_create(c, target_hwnd,
+#ifdef XRT_HAVE_WAYLAND
+		if (c->use_wayland) {
+			target_hwnd = &c->wayland_handle;
+			target_is_wayland = true;
+		}
+#endif
+		xrt_result_t xret = comp_vk_native_target_create(c, target_hwnd, target_is_wayland,
 		                                                  c->settings.preferred.width,
 		                                                  c->settings.preferred.height,
 		                                                  transparent_background,
