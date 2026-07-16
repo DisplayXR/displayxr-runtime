@@ -52,6 +52,7 @@ extern "C" {
 xrt_result_t
 comp_vk_native_compositor_create(struct xrt_device *xdev,
                                  void *hwnd,
+                                 bool window_is_wayland,
                                  void *vk_instance,
                                  void *vk_physical_device,
                                  void *vk_device,

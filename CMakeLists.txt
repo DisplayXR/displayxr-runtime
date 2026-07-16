@@ -212,6 +212,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 		# bypassing Xorg/compositor — ST-5539). Optional; absence just leaves
 		# the compositor on the XCB present path.
 		pkg_check_modules(XLIB_XRANDR x11 xrandr)
+		# Wayland client for the app-provided-surface present path (runtime#757
+		# WS3b, XR_DXR_wayland_surface_binding). Optional — X11/XCB is the
+		# primary desktop path.
+		pkg_check_modules(WAYLAND wayland-client)
 	endif()
 endif()
 
@@ -250,6 +254,7 @@ option_with_deps(XRT_HAVE_XCB "Enable xcb support" DEPENDS XCB_FOUND)
 # VkDisplayKHR (VK_EXT_acquire_xlib_display / VK_KHR_display). Optional — the
 # compositor falls back to the XCB window path when absent. ST-5539.
 option_with_deps(XRT_HAVE_XLIB_XRANDR "Enable Xlib/Xrandr direct-scanout present (Linux)" DEPENDS XLIB_XRANDR_FOUND XRT_HAVE_XCB)
+option_with_deps(XRT_HAVE_WAYLAND "Enable Wayland app-surface present path (XR_DXR_wayland_surface_binding)" DEPENDS WAYLAND_FOUND XRT_HAVE_VULKAN)
 
 # System deps to use (sorted)
 option_with_deps(XRT_HAVE_LIBUDEV "Enable libudev (used for device probing on Linux)" DEPENDS UDEV_FOUND)

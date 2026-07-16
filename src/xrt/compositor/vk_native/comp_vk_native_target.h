@@ -42,6 +42,7 @@ extern "C" {
 xrt_result_t
 comp_vk_native_target_create(struct comp_vk_native_compositor *c,
                               void *hwnd,
+                              bool is_wayland,
                               uint32_t width,
                               uint32_t height,
                               bool transparent_background,

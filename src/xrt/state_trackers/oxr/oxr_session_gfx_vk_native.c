@@ -252,6 +252,7 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
                                 struct oxr_system *sys,
                                 XrGraphicsBindingVulkanKHR const *next,
                                 void *window_handle,
+                                bool window_is_wayland,
                                 void *shared_texture_handle,
                                 bool transparent_background,
                                 struct oxr_session *sess)
@@ -312,7 +313,7 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 
 	// Create the VK native compositor
 	xrt_result_t xret = comp_vk_native_compositor_create(
-	    xdev, window_handle,
+	    xdev, window_handle, window_is_wayland,
 	    (void *)next->instance,
 	    (void *)next->physicalDevice,
 	    (void *)next->device,
