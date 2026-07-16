@@ -14,7 +14,9 @@
  * (ADR-007 / ADR-019).
  *
  * Availability: implemented only on the out-of-process (service / IPC) path —
- * the weave runs in the D3D11 service compositor. An in-process session reports
+ * the weave runs in the D3D11 service compositor on Windows and in the
+ * comp_multi Vulkan weave engine on macOS (#759: IOSurface in/out, synchronous
+ * completion, no fence handle). An in-process session reports
  * XR_ERROR_FEATURE_UNSUPPORTED. The entry points forward to thin IPC-client
  * bridges (defined in ipc_client_compositor.c); st_oxr does not pull the
  * ipc_client include path, so the symbols resolve at link time — same pattern
@@ -227,7 +229,10 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		if (comp_ipc_client_compositor_weave_get_fence(&sess->xcn->base, &have_fence, &fence_h) ==
 		        XRT_SUCCESS &&
 		    have_fence && fence_h != XRT_GRAPHICS_SYNC_HANDLE_INVALID) {
-			output->fence = (void *)fence_h;
+			// (intptr_t hop: the handle is an fd int on POSIX — macOS never
+			// exports a fence (#759, completion is synchronous), so this
+			// branch fires on Windows HANDLEs only.)
+			output->fence = (void *)(intptr_t)fence_h;
 		}
 
 		sess->weave.exported = true;

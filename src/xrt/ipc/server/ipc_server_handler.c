@@ -5572,8 +5572,8 @@ ipc_handle_compositor_get_transparent_output_fence(volatile struct ipc_client_st
 /*
  * XR_DXR_weave (#625) — window-bound synchronous weave service. The DP weaves
  * server-side (ADR-007 / ADR-019); these handlers only marshal the wire to the
- * D3D11 service compositor's additive weave entry points. D3D11-service-only,
- * exactly as the transparent-output path above.
+ * service compositor's additive weave entry points: the D3D11 service on
+ * Windows, the comp_multi Vulkan weave engine on macOS (#759).
  */
 xrt_result_t
 ipc_handle_weave_bind_window(volatile struct ipc_client_state *ics, uint64_t hwnd)
@@ -5586,6 +5586,11 @@ ipc_handle_weave_bind_window(volatile struct ipc_client_state *ics, uint64_t hwn
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	if (!comp_d3d11_service_weave_bind_window(ics->xc, hwnd)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return XRT_SUCCESS;
+#elif defined(XRT_OS_MACOS)
+	if (!comp_multi_weave_bind_window(ics->xc, hwnd)) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	return XRT_SUCCESS;
@@ -5660,6 +5665,40 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	*out_fence_value = fv;
 	*out_eyes = eyes;
 	return XRT_SUCCESS;
+#elif defined(XRT_OS_MACOS)
+	// handles[0] is the retained IOSurfaceRef the IPC receive looked up; the
+	// weave engine takes ownership (adopts it into its import cache or
+	// releases it). No DXGI low-bit tag exists on POSIX handles.
+	if (args->rect_count > IPC_WEAVE_SUBMIT_RECTS_MAX) {
+		xrt_graphics_buffer_handle_t reject = handles[0];
+		u_graphics_buffer_unref(&reject); // don't leak the retained IOSurfaceRef
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct xrt_rect rects[IPC_WEAVE_SUBMIT_RECTS_MAX];
+	for (uint32_t i = 0; i < args->rect_count; i++) {
+		rects[i].offset.w = args->rects[i].x; // xrt_offset fields are named w/h
+		rects[i].offset.h = args->rects[i].y;
+		rects[i].extent.w = (int)args->rects[i].w;
+		rects[i].extent.h = (int)args->rects[i].h;
+	}
+
+	uint32_t w = 0, h = 0;
+	uint64_t fv = 0;
+	struct xrt_eye_positions eyes = {0};
+	bool ok = comp_multi_weave_submit(                          //
+	    ics->xc, handles[0],                                    //
+	    args->rect_x, args->rect_y, args->rect_w, args->rect_h, //
+	    args->rect_count, args->rect_count > 0 ? rects : NULL,  //
+	    &w, &h, &fv, &eyes);
+	if (!ok) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_have_output = true;
+	*out_width = w;
+	*out_height = h;
+	*out_fence_value = fv;
+	*out_eyes = eyes;
+	return XRT_SUCCESS;
 #else
 	(void)args;
 	(void)handles;
@@ -5691,6 +5730,16 @@ ipc_handle_weave_get_output(volatile struct ipc_client_state *ics,
 	xrt_graphics_buffer_handle_t h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
 	uint32_t w = 0, ht = 0;
 	if (comp_d3d11_service_weave_export_output(ics->xc, &h, &w, &ht)) {
+		out_handles[0] = h;
+		*out_handle_count = 1;
+		*out_have_output = true;
+		*out_width = w;
+		*out_height = ht;
+	}
+#elif defined(XRT_OS_MACOS)
+	xrt_graphics_buffer_handle_t h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	uint32_t w = 0, ht = 0;
+	if (comp_multi_weave_export_output(ics->xc, &h, &w, &ht)) {
 		out_handles[0] = h;
 		*out_handle_count = 1;
 		*out_have_output = true;
@@ -5758,6 +5807,16 @@ ipc_handle_weave_snap_window_rect(volatile struct ipc_client_state *ics,
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	int32_t sx = target_x, sy = target_y;
 	if (comp_d3d11_service_weave_snap_window_rect(ics->xc, origin_x, origin_y, target_x, target_y, &sx, &sy)) {
+		*out_snapped = true;
+		*out_snapped_x = sx;
+		*out_snapped_y = sy;
+	}
+	return XRT_SUCCESS;
+#elif defined(XRT_OS_MACOS)
+	// Identity today (sim_display has no interlace lattice); routes to a
+	// future VK DP snap slot in one place (#759).
+	int32_t sx = target_x, sy = target_y;
+	if (comp_multi_weave_snap_window_rect(ics->xc, origin_x, origin_y, target_x, target_y, &sx, &sy)) {
 		*out_snapped = true;
 		*out_snapped_x = sx;
 		*out_snapped_y = sy;

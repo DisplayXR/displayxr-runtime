@@ -1305,6 +1305,11 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 	// compositor pointer never inherits a stale entry / dangling swapchain ref.
 	comp_multi_workspace_chrome_clear(xc);
 
+#ifdef XRT_OS_MACOS
+	// XR_DXR_weave present-owner resources (#759) — no-op if never used.
+	comp_multi_weave_fini(mc);
+#endif
+
 	if (mc->state.session_active) {
 		multi_system_compositor_update_session_status(mc->msc, false);
 		mc->state.session_active = false;

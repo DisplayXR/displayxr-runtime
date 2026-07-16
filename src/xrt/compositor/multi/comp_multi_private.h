@@ -428,6 +428,63 @@ struct multi_compositor
 		//! True if per-session resources are initialized
 		bool initialized;
 	} session_render;
+
+#ifdef XRT_OS_MACOS
+	/*!
+	 * XR_DXR_weave present-owner state (#759) — the macOS analogue of the
+	 * per-client weave block in d3d11_client_render_resources
+	 * (comp_d3d11_service.cpp, #625). The caller owns its NSWindow and
+	 * presents itself; we import its IOSurface, blit every submitted rect
+	 * into a window-sized 2x1 SBS scratch atlas, run ONE DP process_atlas
+	 * into an IOSurface-backed output, and wait completion before the IPC
+	 * reply (synchronous contract — no cross-process fence on macOS).
+	 * Implemented in comp_multi_weave_macos.c.
+	 */
+	struct
+	{
+		bool mutex_initialized;
+		struct os_mutex mutex; //!< Serializes submits + teardown for this client.
+
+		bool engine_initialized;
+		VkCommandPool cmd_pool;
+		VkCommandBuffer cmd;
+		VkFence fence;
+		VkRenderPass render_pass; //!< Output fb's pass (DP-compatible, BGRA8).
+		struct xrt_display_processor *dp;
+
+		uint64_t window_id;   //!< Present-owner window id from bind (future phase use).
+		uint64_t fence_value; //!< Monotonic; completion is synchronous on macOS.
+
+		//! @name Cached input import (rebuilt when the IOSurfaceID changes)
+		//! @{
+		void *in_iosurface; //!< Retained IOSurfaceRef (adopted from the IPC receive).
+		uint32_t in_iosurface_id;
+		VkImage in_image;
+		VkDeviceMemory in_memory;
+		uint32_t in_w, in_h;
+		bool in_first_use; //!< First barrier transitions from UNDEFINED.
+		//! @}
+
+		//! @name Window-sized 2x1 SBS scratch atlas (2*out_w x out_h)
+		//! @{
+		VkImage sbs_image;
+		VkDeviceMemory sbs_memory;
+		VkImageView sbs_view;
+		uint32_t sbs_w, sbs_h;
+		bool sbs_first_use;
+		//! @}
+
+		//! @name IOSurface-backed weaved output (exported to the caller)
+		//! @{
+		VkImage out_image;
+		VkDeviceMemory out_memory;
+		VkImageView out_view;
+		VkFramebuffer out_fb;
+		void *out_iosurface; //!< Retained exported IOSurfaceRef.
+		uint32_t out_w, out_h;
+		//! @}
+	} weave;
+#endif
 };
 
 /*!
@@ -731,6 +788,56 @@ multi_system_compositor_update_session_status(struct multi_system_compositor *ms
  */
 bool
 multi_compositor_init_session_render(struct multi_compositor *mc);
+
+#ifdef XRT_OS_MACOS
+/*!
+ * @name XR_DXR_weave on the macOS service path (#759)
+ * Present-owner weave entry points, called from ipc_server_handler.c exactly
+ * where the Windows build calls comp_d3d11_service_weave_* (#625). All are
+ * implemented in comp_multi_weave_macos.c; see that file for the platform
+ * contract (IOSurface transport, synchronous completion, no fence).
+ * @{
+ */
+bool
+comp_multi_weave_bind_window(struct xrt_compositor *xc, uint64_t window_id);
+
+bool
+comp_multi_weave_submit(struct xrt_compositor *xc,
+                        xrt_graphics_buffer_handle_t in_handle,
+                        int32_t rect_x,
+                        int32_t rect_y,
+                        uint32_t rect_w,
+                        uint32_t rect_h,
+                        uint32_t rect_count,
+                        const struct xrt_rect *rects,
+                        uint32_t *out_width,
+                        uint32_t *out_height,
+                        uint64_t *out_fence_value,
+                        struct xrt_eye_positions *out_eyes);
+
+bool
+comp_multi_weave_export_output(struct xrt_compositor *xc,
+                               xrt_graphics_buffer_handle_t *out_handle,
+                               uint32_t *out_width,
+                               uint32_t *out_height);
+
+bool
+comp_multi_weave_export_fence(struct xrt_compositor *xc, xrt_graphics_sync_handle_t *out_handle);
+
+bool
+comp_multi_weave_snap_window_rect(struct xrt_compositor *xc,
+                                  int32_t origin_x,
+                                  int32_t origin_y,
+                                  int32_t target_x,
+                                  int32_t target_y,
+                                  int32_t *out_snapped_x,
+                                  int32_t *out_snapped_y);
+
+//! Teardown (multi_compositor_destroy). Safe to call when never used.
+void
+comp_multi_weave_fini(struct multi_compositor *mc);
+/*! @} */
+#endif // XRT_OS_MACOS
 
 /*!
  * Check if a multi_compositor has per-session rendering enabled.

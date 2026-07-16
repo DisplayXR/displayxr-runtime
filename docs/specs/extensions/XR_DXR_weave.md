@@ -4,7 +4,7 @@
 |---|---|
 | **Extension Name** | `XR_DXR_weave` |
 | **Spec Version** | 3 |
-| **Extension Type** | Instance extension (Windows / D3D11 service path only) |
+| **Extension Type** | Instance extension (service path only — Windows/D3D11 + macOS/comp_multi-Vulkan, #759) |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_weave.h` (canonical; auto-syncs to `displayxr-extensions`) |
 | **Status** | Provisional (`1004999190–192` type block, pending Khronos registry) |
 | **Design history** | `docs/roadmap/webxr-step-b-design.md` §13.6–13.9, issue #625 |
@@ -89,7 +89,27 @@ window-sized output), so ONE submit carrying N rects makes 50 visible tiles cost
   low-bit-tagged with no `OpenProcess` — required for Low-integrity sandboxed callers
   (Chromium's GPU process; see #743). NT handles remain supported for Medium callers.
 
-## 5. Version history
+## 5. macOS platform mapping (#759)
+
+The macOS service (comp_multi + null compositor, Vulkan/MoltenVK) implements the same three entry
+points with these platform substitutions (`comp_multi_weave_macos.c`):
+
+| Contract point | Windows (D3D11 service) | macOS (comp_multi Vulkan) |
+|---|---|---|
+| `windowHandle` | HWND (DP phase snap + `GetClientRect` sizing) | opaque id, stored only (sim/anaglyph has no lattice) |
+| `inputTexture` | D3D11 NT / legacy-DXGI shared HANDLE | **IOSurfaceRef** (crosses IPC as a global IOSurfaceID) |
+| `inputIsDxgi` | selects legacy-DXGI open path | ignored |
+| Input-ready sync | keyed mutex `AcquireSync(0)` | caller completes GPU writes **before** `xrWeaveSubmitDXR` |
+| Output sizing | bound window client rect | batch: **input IOSurface dims** (the v3 input is window-client-sized by contract); legacy: rect offset+extent |
+| `weavedTexture` | shared NT HANDLE (caller `CloseHandle`s) | retained IOSurfaceRef (caller `CFRelease`s) |
+| `fence` / `fenceValue` | shared D3D fence, GPU-wait | **no fence — completion is SYNCHRONOUS**: `xrWeaveSubmitDXR` returns after the weave finished on the GPU. `fence` stays NULL; `fenceValue` is a plain monotonic counter |
+| `xrWeaveSnapWindowRectDXR` | vendor DP lattice snap | identity (no VK DP snap slot yet) |
+
+The batch algorithm is identical (all rects blitted into ONE window-sized 2×1 SBS scratch, ONE
+`process_atlas` per submit). Verification harness: `test_apps/probes/weave_probe_vk_macos`
+(headless; CPU-checks the sim anaglyph weave — left-eye-white → red, right-eye-white → cyan).
+
+## 6. Version history
 
 | Version | Change |
 |---|---|
@@ -97,7 +117,7 @@ window-sized output), so ONE submit carrying N rects makes 50 visible tiles cost
 | 2 | `inputIsDxgi` legacy-DXGI handle tagging (Low-integrity GPU-process callers, #743). |
 | 3 | `XrWeaveSubmitRectsDXR` batched submit — N rects, one call, one fence (#744). |
 
-## 6. Consumers
+## 7. Consumers
 
 | Consumer | Path | Layout used |
 |---|---|---|
