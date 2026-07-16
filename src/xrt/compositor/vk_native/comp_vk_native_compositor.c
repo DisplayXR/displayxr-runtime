@@ -4052,8 +4052,12 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	// info from the DP (pixel info + dims) when available, else from sys_info;
 	// window size + screen position from XCB (X11 exposes absolute window pos,
 	// so window-relative 3D tracks window moves — the reason XCB precedes
-	// Wayland in the Linux plan).
-	if (c->xcb_window == NULL) {
+	// Wayland in the Linux plan). Use c->xcb_handle (populated for BOTH the
+	// self-created window AND the app-provided window via wrap_app_window) so
+	// window-scoped Kooima works for app-owned windows too — c->xcb_window is
+	// NULL on the app-provided path, which used to fall back to display-scoped
+	// and skew the aspect ratio when the window != display.
+	if (c->xcb_handle.connection == NULL) {
 		return false;
 	}
 
@@ -4087,8 +4091,10 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	}
 
 	uint32_t win_px_w = 0, win_px_h = 0;
-	comp_vk_native_window_xcb_get_dimensions(c->xcb_window, &win_px_w, &win_px_h);
-	if (win_px_w == 0 || win_px_h == 0) return false;
+	if (!comp_vk_native_window_xcb_query_geometry(&c->xcb_handle, &win_px_w, &win_px_h) ||
+	    win_px_w == 0 || win_px_h == 0) {
+		return false;
+	}
 
 	float pixel_size_x = disp_w_m / (float)disp_px_w;
 	float pixel_size_y = disp_h_m / (float)disp_px_h;
@@ -4111,7 +4117,7 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	float win_center_px_x = disp_center_px_x;
 	float win_center_px_y = disp_center_px_y;
 	int32_t win_left = 0, win_top = 0;
-	if (comp_vk_native_window_xcb_get_screen_position(c->xcb_window, &win_left, &win_top)) {
+	if (comp_vk_native_window_xcb_query_screen_position(&c->xcb_handle, &win_left, &win_top)) {
 		win_center_px_x = (float)(win_left - disp_left) + (float)win_px_w / 2.0f;
 		win_center_px_y = (float)(win_top - disp_top) + (float)win_px_h / 2.0f;
 	}

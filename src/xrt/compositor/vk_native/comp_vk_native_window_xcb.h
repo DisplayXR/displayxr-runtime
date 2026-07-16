@@ -105,6 +105,19 @@ comp_vk_native_window_xcb_query_geometry(const struct comp_vk_native_xcb_handle 
                                          uint32_t *out_height);
 
 /*!
+ * Query the window's top-left in root (screen) coordinates via any window
+ * reachable through @p handle (works for app-provided windows, which have no
+ * comp_vk_native_window_xcb helper). Handle-based sibling of
+ * comp_vk_native_window_xcb_get_screen_position.
+ *
+ * @return true if the position could be queried.
+ */
+bool
+comp_vk_native_window_xcb_query_screen_position(const struct comp_vk_native_xcb_handle *handle,
+                                                int32_t *out_left_px,
+                                                int32_t *out_top_px);
+
+/*!
  * Create a self-owned X11 window (hosted class).
  *
  * @param width                  Requested window width in pixels.
