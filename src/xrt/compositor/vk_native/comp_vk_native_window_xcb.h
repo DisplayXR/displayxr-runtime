@@ -58,6 +58,21 @@ struct comp_vk_native_xlib_handle
 	unsigned long window;
 };
 
+/*!
+ * App-provided Wayland surface (XR_DXR_wayland_surface_binding, runtime#757
+ * WS3b), passed type-erased as the `hwnd` param of comp_vk_native_compositor_create
+ * when `window_is_wayland` is true. The compositor copies the fields
+ * synchronously during create, so the caller may stack-allocate this.
+ *
+ * `display` is a `struct wl_display *` and `surface` a `struct wl_surface *`;
+ * kept as void pointers so includers don't need the Wayland headers.
+ */
+struct comp_vk_native_wayland_handle
+{
+	void *display;
+	void *surface;
+};
+
 struct comp_vk_native_window_xcb;
 
 /*!
