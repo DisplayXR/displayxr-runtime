@@ -69,6 +69,10 @@ endif()
 add_executable(displayxr-webxr-bridge main.cpp)
 add_sanitizers(displayxr-webxr-bridge)
 
+# Embedded Explorer icon (shared across DisplayXR executables).
+# This file is only reached on WIN32 (early return above).
+target_sources(displayxr-webxr-bridge PRIVATE ../common/app_icon.rc)
+
 target_include_directories(displayxr-webxr-bridge PRIVATE
 	${CMAKE_SOURCE_DIR}/src/external/openxr_includes
 )

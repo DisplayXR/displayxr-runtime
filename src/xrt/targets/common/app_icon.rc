@@ -1,0 +1,13 @@
+// Copyright 2026, The DisplayXR Project
+// SPDX-License-Identifier: BSL-1.0
+//
+// Shared Explorer-facing application icon for DisplayXR executables.
+//
+// ID 1 is the lowest icon resource ID in the module, so Explorer / the
+// shell pick it as the file icon. The asset is the white DisplayXR mark
+// composited on a dark rounded tile, so it stays legible on both light
+// and dark Explorer themes (a bare black or white mark disappears on one
+// of the two). Theme-aware contexts (e.g. the service tray) instead load
+// their white/black flat variants by explicit resource ID.
+
+1 ICON "../../../../assets/displayxr_app.ico"

@@ -26,6 +26,8 @@ target_link_libraries(
 	)
 
 if(WIN32)
+	# Embedded Explorer icon (shared across DisplayXR executables).
+	target_sources(control_panel PRIVATE ../common/app_icon.rc)
 	# cimgui/SDL sources are UTF-8; MSVC defaults to the active code page.
 	target_compile_options(control_panel PRIVATE "$<$<C_COMPILER_ID:MSVC>:/utf-8>")
 	# SDL2 supplies the WinMain entry point via SDL2main.
