@@ -1223,6 +1223,11 @@ struct d3d11_multi_compositor
 	//! a torn read just yields a 1-frame-stale viewer, which is harmless.
 	float frame_tick_viewer_x, frame_tick_viewer_y, frame_tick_viewer_z;
 	volatile LONG frame_tick_viewer_valid;
+	//! Consecutive eye-position query failures on the render thread. Once it
+	//! reaches the drop threshold, frame_tick_viewer_valid falls back to 0 so
+	//! a dead/removed DP reads as "tracking lost" instead of freezing the
+	//! last-known head position forever. Render-thread only.
+	LONG frame_tick_viewer_fail_count;
 
 	//! Window dismissed by user (ESC).
 	bool window_dismissed;
@@ -1605,6 +1610,37 @@ multi_compositor_request_mode_flip(struct d3d11_service_system *sys,
 }
 
 /*!
+ * Call the DP's request_display_mode slot and surface failure.
+ *
+ * The slot returns false both when the vendor DP rejects the request and when
+ * the plug-in's ABI predates the slot entirely (XRT_DP_HAS_SLOT miss). Either
+ * way the panel did NOT change state while the runtime's mode bookkeeping
+ * marches on — previously invisible, since no call site inspected the return.
+ * Logging is rate-limited to one line per second so a persistently failing DP
+ * on a per-commit path cannot flood the log.
+ */
+static bool
+dp_request_display_mode_checked(struct xrt_display_processor_d3d11 *xdp, bool enable_3d, const char *func, int line)
+{
+	bool ok = xrt_display_processor_d3d11_request_display_mode(xdp, enable_3d);
+	if (!ok) {
+		static std::atomic<int64_t> last_fail_log_ns{0};
+		int64_t now_ns = (int64_t)os_monotonic_get_ns();
+		int64_t last_ns = last_fail_log_ns.load(std::memory_order_relaxed);
+		if (now_ns - last_ns >= 1000000000 &&
+		    last_fail_log_ns.compare_exchange_strong(last_ns, now_ns, std::memory_order_relaxed)) {
+			U_LOG_W("DP request_display_mode(%s) FAILED at %s:%d — vendor rejected or ABI slot missing; "
+			        "panel state unchanged",
+			        enable_3d ? "3D" : "2D", func, line);
+		}
+	}
+	return ok;
+}
+
+//! Wrapper stamping the call site into the failure log line.
+#define DP_REQUEST_DISPLAY_MODE(xdp, enable_3d) dp_request_display_mode_checked((xdp), (enable_3d), __func__, __LINE__)
+
+/*!
  * Per-frame tick for the workspace mode-flip state machine (#234).
  *
  * Called once near the top of multi_compositor_render, before the per-tile
@@ -1675,7 +1711,7 @@ multi_compositor_apply_pending_mode_flip(struct d3d11_service_system *sys)
 		head->hmd->active_rendering_mode_index = mc->mode_flip.target_mode_index;
 		xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE,
 		                        (int32_t)mc->mode_flip.target_mode_index);
-		xrt_display_processor_d3d11_request_display_mode(
+		DP_REQUEST_DISPLAY_MODE(
 		    mc->display_processor, mc->mode_flip.target_is_3d);
 		sync_tile_layout(sys);
 		sys->hardware_display_3d = mc->mode_flip.target_is_3d;
@@ -2703,7 +2739,7 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 
 	// Auto-switch to 2D mode before destroying display processor
 	if (res->display_processor != nullptr) {
-		xrt_display_processor_d3d11_request_display_mode(
+		DP_REQUEST_DISPLAY_MODE(
 		    res->display_processor, false);
 	}
 	xrt_display_processor_d3d11_destroy(&res->display_processor);
@@ -5165,13 +5201,26 @@ try {
 	// uncaught C++ exception escaping this function triggers
 	// std::terminate() and silently kills the whole service (no log
 	// shutdown line, no WER dump). Catching here downgrades a process
-	// kill to a logged graceful thread stop — the service stays up,
-	// render thread exits, and we get a diagnostic. Same pattern is
-	// worth adding to any other long-running std::thread entry in the
+	// kill to a logged thread stop — the service stays up, render
+	// thread exits, and we get a diagnostic. Same pattern is worth
+	// adding to any other long-running std::thread entry in the
 	// service.
-	U_LOG_E("capture_render_thread_func: uncaught std::exception: %s — render thread dying gracefully", e.what());
+	//
+	// Clearing capture_render_running is what makes the stop
+	// RECOVERABLE: every restart site gates on it, so leaving it true
+	// turned one escaped exception (e.g. a vendor-weaver throw inside
+	// process_atlas) into a permanent workspace-rendering wedge with no
+	// possible restart. capture_render_thread_start() joins our carcass
+	// before spinning up a replacement.
+	U_LOG_E("capture_render_thread_func: uncaught std::exception: %s — render thread stopped (restartable)", e.what());
+	if (sys->multi_comp != nullptr) {
+		sys->multi_comp->capture_render_running.store(false);
+	}
 } catch (...) {
-	U_LOG_E("capture_render_thread_func: uncaught non-std exception — render thread dying gracefully");
+	U_LOG_E("capture_render_thread_func: uncaught non-std exception — render thread stopped (restartable)");
+	if (sys->multi_comp != nullptr) {
+		sys->multi_comp->capture_render_running.store(false);
+	}
 }
 
 /*!
@@ -5184,7 +5233,15 @@ capture_render_thread_start(struct d3d11_service_system *sys)
 	if (mc == nullptr || mc->capture_render_running.load()) {
 		return;
 	}
-	mc->render_wakeup_event = CreateEvent(nullptr, FALSE, FALSE, nullptr); // auto-reset
+	// Reap a thread that died via the exception handlers (they clear
+	// capture_render_running but cannot join their own thread) — assigning
+	// over a joinable std::thread calls std::terminate().
+	if (mc->capture_render_thread.joinable()) {
+		mc->capture_render_thread.join();
+	}
+	if (mc->render_wakeup_event == nullptr) {
+		mc->render_wakeup_event = CreateEvent(nullptr, FALSE, FALSE, nullptr); // auto-reset
+	}
 	mc->capture_render_running.store(true);
 	mc->capture_render_thread = std::thread(capture_render_thread_func, sys);
 	U_LOG_W("Multi-comp: capture render timer started");
@@ -5455,7 +5512,7 @@ multi_compositor_destroy(struct d3d11_multi_compositor *mc)
 	}
 
 	if (mc->display_processor != nullptr) {
-		xrt_display_processor_d3d11_request_display_mode(mc->display_processor, false);
+		DP_REQUEST_DISPLAY_MODE(mc->display_processor, false);
 		xrt_display_processor_d3d11_destroy(&mc->display_processor);
 	}
 
@@ -5509,6 +5566,31 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 
 	// Already initialized?
 	if (mc->hwnd != nullptr && mc->swap_chain) {
+		// Repair arm: a live window whose DP creation failed earlier (e.g.
+		// the vendor SDK still held the panel during a rapid deactivate/
+		// activate cycle) was previously unrecoverable — the suspend/resume
+		// path only recreates the DP while suspended, and this early-out
+		// skipped the factory below. Retry here so the next activation
+		// self-heals instead of flipping mode bookkeeping against a dead
+		// panel. Gated so a deliberate deactivate (suspended) or a
+		// dismissed window stays torn down.
+		if (mc->display_processor == nullptr && !mc->suspended && !mc->window_dismissed) {
+			void *dp_fac = comp_dp_factory_for_window(&sys->base.info, COMP_DP_PRIMARY_MONITOR,
+			                                          COMP_DP_API_D3D11);
+			if (dp_fac != NULL) {
+				auto factory = (xrt_dp_factory_d3d11_fn_t)dp_fac;
+				xrt_result_t dp_ret = factory(
+				    sys->device.get(), sys->context.get(), mc->hwnd, &mc->display_processor);
+				if (dp_ret == XRT_SUCCESS && mc->display_processor != nullptr) {
+					U_LOG_W("Multi-comp: display processor recreated on live window");
+					if (mc->window != nullptr) {
+						comp_d3d11_window_set_workspace_dp(mc->window, mc->display_processor);
+					}
+				} else {
+					U_LOG_E("Multi-comp: DP recreate on live window failed (%d)", dp_ret);
+				}
+			}
+		}
 		return XRT_SUCCESS;
 	}
 
@@ -6137,7 +6219,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		mc->window_dismissed = true;
 		// Switch display back to 2D (lens off)
 		if (mc->display_processor != nullptr) {
-			xrt_display_processor_d3d11_request_display_mode(mc->display_processor, false);
+			DP_REQUEST_DISPLAY_MODE(mc->display_processor, false);
 		}
 		return;
 	}
@@ -8201,7 +8283,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// spec_version 20: cache the live viewer eye-midpoint for the FRAME_TICK
 	// event (head-tracked billboarding in the controller). On the render thread
 	// here, so the display processor is stable — same call the cursor path makes
-	// above. Falls back silently (valid stays as last) if no DP is available.
+	// above. Transient misses keep the last-known viewer (harmless 1-frame
+	// staleness); a sustained failure (dead/removed DP) drops viewer_valid to
+	// 0 so the controller sees "tracking lost" instead of a viewer frozen at
+	// the last-known position forever.
 	{
 		struct xrt_vec3 vl, vr;
 		if (comp_d3d11_service_get_predicted_eye_positions(&sys->base, &vl, &vr)) {
@@ -8209,6 +8294,12 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			mc->frame_tick_viewer_y = 0.5f * (vl.y + vr.y);
 			mc->frame_tick_viewer_z = 0.5f * (vl.z + vr.z);
 			mc->frame_tick_viewer_valid = 1;
+			mc->frame_tick_viewer_fail_count = 0;
+		} else if (mc->frame_tick_viewer_valid != 0 &&
+		           ++mc->frame_tick_viewer_fail_count >= 30) { // ~0.5 s at the 14 ms render cadence
+			mc->frame_tick_viewer_valid = 0;
+			U_LOG_W("FRAME_TICK viewer: eye-position source lost for %ld consecutive frames — reporting untracked",
+			        mc->frame_tick_viewer_fail_count);
 		}
 	}
 
@@ -8905,7 +8996,7 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 		U_LOG_W(
 		    "ZONES SVC: DP rejected the wish mask publish — falling back to the "
 		    "tier-1 global 3D request");
-		xrt_display_processor_d3d11_request_display_mode(dp, true);
+		DP_REQUEST_DISPLAY_MODE(dp, true);
 	}
 }
 
@@ -9205,7 +9296,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 					bool want_3d = head->rendering_modes[modeIdx].hardware_display_3d;
 					if (c->render.display_processor != nullptr) {
-						xrt_display_processor_d3d11_request_display_mode(
+						DP_REQUEST_DISPLAY_MODE(
 						    c->render.display_processor, want_3d);
 					}
 
@@ -9261,7 +9352,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				want_3d = (req_hw != 0);
 			}
 
-			xrt_display_processor_d3d11_request_display_mode(c->render.display_processor, want_3d);
+			DP_REQUEST_DISPLAY_MODE(c->render.display_processor, want_3d);
 			sync_tile_layout(sys);
 			sys->hardware_display_3d = want_3d;
 			// Stamp the post-flip cooldown so the 100 ms vendor 3D-state poll
@@ -9315,7 +9406,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					head->hmd->active_rendering_mode_index = target_idx;
 					broadcast_rendering_mode_change(sys, head, prev_idx, target_idx);
 					if (c->render.display_processor != nullptr) {
-						xrt_display_processor_d3d11_request_display_mode(
+						DP_REQUEST_DISPLAY_MODE(
 						    c->render.display_processor, !force_2d);
 					}
 					sync_tile_layout(sys);
@@ -9438,7 +9529,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					U_LOG_W("[force_3d] vendor drifted (vendor=%s runtime=%s) — re-asserting DP to runtime state",
 					        vendor_is_3d ? "3D" : "2D",
 					        sys->hardware_display_3d ? "3D" : "2D");
-					xrt_display_processor_d3d11_request_display_mode(
+					DP_REQUEST_DISPLAY_MODE(
 					    sys->multi_comp->display_processor,
 					    sys->hardware_display_3d);
 					// Refresh cooldown so we don't hammer the DP on every poll
@@ -9466,7 +9557,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			    c->render.display_processor != nullptr && sys->hardware_display_3d &&
 			    !vendor_is_3d && !pending_flip && !in_cooldown) {
 				U_LOG_W("[force_3d] standalone vendor drifted to 2D (app wants 3D) — re-asserting 3D");
-				xrt_display_processor_d3d11_request_display_mode(c->render.display_processor, true);
+				DP_REQUEST_DISPLAY_MODE(c->render.display_processor, true);
 				// If the content rendering mode also drifted to 2D (e.g. a prior
 				// demote before this re-assert was reached), restore the app's
 				// last 3D mode so it re-submits a 3D atlas.
@@ -9628,7 +9719,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				bool mask_capable = service_dp_accepts_zone_mask(c->render.display_processor) &&
 				                    !c->zone_mask_dp_rejected;
 				if (c->render.display_processor != nullptr && !mask_capable) {
-					xrt_display_processor_d3d11_request_display_mode(
+					DP_REQUEST_DISPLAY_MODE(
 					    c->render.display_processor, true);
 				}
 				sync_tile_layout(sys);
@@ -9701,7 +9792,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					uint32_t prev_idx = head->hmd->active_rendering_mode_index;
 					head->hmd->active_rendering_mode_index = mode_idx;
 					broadcast_rendering_mode_change(sys, head, prev_idx, mode_idx);
-					xrt_display_processor_d3d11_request_display_mode(
+					DP_REQUEST_DISPLAY_MODE(
 					    c->render.display_processor, true);
 					sync_tile_layout(sys);
 					sys->hardware_display_3d = true;
@@ -10794,7 +10885,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				xrt_display_processor_d3d11_clear_local_zone_mask(c->render.display_processor);
 				c->zone_published = false;
 			}
-			xrt_display_processor_d3d11_request_display_mode(c->render.display_processor, false);
+			DP_REQUEST_DISPLAY_MODE(c->render.display_processor, false);
 			xrt_display_processor_d3d11_destroy(&c->render.display_processor);
 		}
 		c->render.back_buffer_rtv.reset();
@@ -11510,7 +11601,7 @@ weave_force_3d_if_needed(struct d3d11_service_system *sys, struct d3d11_service_
 	uint32_t prev_idx = head->hmd->active_rendering_mode_index;
 	head->hmd->active_rendering_mode_index = mode_idx;
 	broadcast_rendering_mode_change(sys, head, prev_idx, mode_idx);
-	xrt_display_processor_d3d11_request_display_mode(c->render.display_processor, true);
+	DP_REQUEST_DISPLAY_MODE(c->render.display_processor, true);
 	sync_tile_layout(sys);
 	sys->hardware_display_3d = true;
 	// Stamp the post-flip cooldown so the 100 ms vendor 3D-state poll doesn't see
@@ -15264,7 +15355,7 @@ comp_d3d11_service_force_display_3d(struct xrt_system_compositor *xsysc)
 	}
 
 	xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)target_idx);
-	xrt_display_processor_d3d11_request_display_mode(mc->display_processor, /*hardware_display_3d=*/true);
+	DP_REQUEST_DISPLAY_MODE(mc->display_processor, /*hardware_display_3d=*/true);
 	sync_tile_layout(sys);
 	sys->hardware_display_3d = true;
 
@@ -15724,7 +15815,7 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 		std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
 
 		if (mc->display_processor != nullptr) {
-			xrt_display_processor_d3d11_request_display_mode(mc->display_processor, false);
+			DP_REQUEST_DISPLAY_MODE(mc->display_processor, false);
 			xrt_display_processor_d3d11_destroy(&mc->display_processor);
 		}
 
