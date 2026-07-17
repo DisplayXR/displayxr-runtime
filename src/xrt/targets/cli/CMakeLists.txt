@@ -36,6 +36,11 @@ add_executable(
 	)
 add_sanitizers(cli)
 
+if(WIN32)
+	# Embedded Explorer icon (shared across DisplayXR executables).
+	target_sources(cli PRIVATE ../common/app_icon.rc)
+endif()
+
 set_target_properties(cli PROPERTIES OUTPUT_NAME displayxr-cli PREFIX "")
 
 target_link_libraries(

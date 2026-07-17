@@ -5,8 +5,12 @@
 
 #include <windows.h>
 
-// Application icons (used for system tray)
+// Application icons
+// 1   = Explorer/file icon (white mark on dark tile — legible on both themes;
+//       Explorer picks the lowest icon resource ID, so this must stay < 101)
 // 101 = white on transparent (default — visible in dark Explorer and dark taskbar)
 // 102 = black on transparent (for light taskbar, loaded at runtime by theme detection)
+// The tray loads 101/102 by explicit ID (service_tray_win.c), never ID 1.
+1 ICON "../../../../assets/displayxr_app.ico"
 101 ICON "../../../../assets/displayxr_white.ico"
 102 ICON "../../../../assets/displayxr.ico"
