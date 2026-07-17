@@ -61,6 +61,10 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         uint32_t rect_h,
                                         uint32_t rect_count,
                                         const struct xrt_rect *rects,
+                                        xrt_graphics_buffer_handle_t overlay_handle,
+                                        bool overlay_is_dxgi,
+                                        uint32_t overlay_rect_count,
+                                        const struct xrt_rect *overlay_rects,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
@@ -175,6 +179,36 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		}
 	}
 
+	// Spec v4 (browser#18): a chained XrWeaveSubmitOverlaysDXR carries a
+	// window-sized premul-RGBA overlay atlas (a second shared texture) the DP
+	// composites over the woven output; overlayCount 0 = whole atlas.
+	xrt_graphics_buffer_handle_t overlay_handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	bool overlay_is_dxgi = false;
+	uint32_t overlay_rect_count = 0;
+	struct xrt_rect overlay_rects[XR_WEAVE_SUBMIT_MAX_RECTS_DXR];
+	const XrWeaveSubmitOverlaysDXR *ov =
+	    OXR_GET_INPUT_FROM_CHAIN(submitInfo, XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR, XrWeaveSubmitOverlaysDXR);
+	if (ov != NULL && ov->overlayTexture != NULL) {
+		if (ov->rectCount > XR_WEAVE_SUBMIT_MAX_RECTS_DXR) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrWeaveSubmitOverlaysDXR::rectCount (%u) must be "
+			                 "0..XR_WEAVE_SUBMIT_MAX_RECTS_DXR (%u)",
+			                 ov->rectCount, (uint32_t)XR_WEAVE_SUBMIT_MAX_RECTS_DXR);
+		}
+		if (ov->rectCount > 0) {
+			OXR_VERIFY_ARG_NOT_NULL(&log, ov->rects);
+		}
+		overlay_handle = (xrt_graphics_buffer_handle_t)ov->overlayTexture;
+		overlay_is_dxgi = ov->overlayIsDxgi == XR_TRUE;
+		overlay_rect_count = ov->rectCount;
+		for (uint32_t i = 0; i < overlay_rect_count; i++) {
+			overlay_rects[i].offset.w = ov->rects[i].offset.x;
+			overlay_rects[i].offset.h = ov->rects[i].offset.y;
+			overlay_rects[i].extent.w = (int)ov->rects[i].extent.width;
+			overlay_rects[i].extent.h = (int)ov->rects[i].extent.height;
+		}
+	}
+
 	bool have_out = false;
 	uint32_t w = 0, h = 0;
 	uint64_t fence_value = 0;
@@ -183,7 +217,8 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	    &sess->xcn->base, (xrt_graphics_buffer_handle_t)submitInfo->inputTexture,
 	    submitInfo->inputIsDxgi == XR_TRUE, submitInfo->rect.offset.x, submitInfo->rect.offset.y,
 	    (uint32_t)submitInfo->rect.extent.width, (uint32_t)submitInfo->rect.extent.height, rect_count,
-	    rect_count > 0 ? rects : NULL, &have_out, &w, &h, &fence_value, &eyes);
+	    rect_count > 0 ? rects : NULL, overlay_handle, overlay_is_dxgi, overlay_rect_count,
+	    overlay_rect_count > 0 ? overlay_rects : NULL, &have_out, &w, &h, &fence_value, &eyes);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
 		                 "xrWeaveSubmitDXR: weave failed (xrt_result=%d)", (int)xret);

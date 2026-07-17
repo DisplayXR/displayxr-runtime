@@ -496,6 +496,10 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         uint32_t rect_h,
                                         uint32_t rect_count,
                                         const struct xrt_rect *rects,
+                                        xrt_graphics_buffer_handle_t overlay_handle,
+                                        bool overlay_is_dxgi,
+                                        uint32_t overlay_rect_count,
+                                        const struct xrt_rect *overlay_rects,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
@@ -507,6 +511,9 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	if (rect_count > IPC_WEAVE_SUBMIT_RECTS_MAX || (rect_count > 0 && rects == NULL)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (overlay_rect_count > IPC_WEAVE_SUBMIT_RECTS_MAX || (overlay_rect_count > 0 && overlay_rects == NULL)) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	*out_have_output = false;
@@ -535,15 +542,30 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 		args.rects[i].h = (uint32_t)rects[i].extent.h;
 	}
 
-	xrt_graphics_buffer_handle_t handle = in_handle;
+	// v4 overlay atlas (browser#18): a valid overlay_handle rides as a SECOND
+	// in_handle (index 1); have_overlay signals its presence to the server. The
+	// whole atlas is composited (premul alpha authoritative), so per-overlay
+	// rects are NOT marshalled — only the hint count crosses (keeps the message
+	// within IPC_BUF_SIZE; a second rects[] array would overflow it).
+	const bool have_overlay = (overlay_handle != XRT_GRAPHICS_BUFFER_HANDLE_INVALID);
+	args.have_overlay = have_overlay ? 1u : 0u;
+	args.overlay_rect_count = overlay_rect_count;
+	(void)overlay_rects;
+
+	xrt_graphics_buffer_handle_t handles[2] = {in_handle, overlay_handle};
+	uint32_t handle_count = have_overlay ? 2u : 1u;
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
 	// DXGI handles are identified by setting their lower bit to 1 during
 	// transfer (same convention as swapchain_import).
-	if (in_is_dxgi && handle != XRT_GRAPHICS_BUFFER_HANDLE_INVALID) {
-		handle = (void *)((size_t)handle | 1);
+	if (in_is_dxgi && handles[0] != XRT_GRAPHICS_BUFFER_HANDLE_INVALID) {
+		handles[0] = (void *)((size_t)handles[0] | 1);
+	}
+	if (have_overlay && overlay_is_dxgi && handles[1] != XRT_GRAPHICS_BUFFER_HANDLE_INVALID) {
+		handles[1] = (void *)((size_t)handles[1] | 1);
 	}
 #else
 	(void)in_is_dxgi;
+	(void)overlay_is_dxgi;
 #endif
 
 	bool have = false;
@@ -551,8 +573,9 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	uint64_t fv = 0;
 	struct xrt_eye_positions eyes = {0};
 	// Generated arg order: in args, then in_handles (handles, count), then out
-	// args. This copies the handle, it does not consume it.
-	xrt_result_t xret = ipc_call_weave_submit(icc->ipc_c, &args, &handle, 1, &have, &w, &h, &fv, &eyes);
+	// args. This copies the handles, it does not consume them.
+	xrt_result_t xret =
+	    ipc_call_weave_submit(icc->ipc_c, &args, handles, handle_count, &have, &w, &h, &fv, &eyes);
 	if (xret != XRT_SUCCESS) {
 		return xret;
 	}

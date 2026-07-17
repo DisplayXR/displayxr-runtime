@@ -304,6 +304,18 @@ struct d3d11_client_render_resources
 	wil::com_ptr<ID3D11ShaderResourceView> weave_input_srv;
 	wil::com_ptr<IDXGIKeyedMutex>          weave_input_km;
 
+	//! Cached import of the caller's v4 overlay atlas (browser#18), keyed by the
+	//! shared-handle value exactly like weave_input_* above. A window-sized
+	//! premultiplied-alpha RGBA atlas the runtime composites OVER the woven
+	//! output (premul "over") after process_atlas, before the fence signal. The
+	//! caller reuses one shared overlay across frames, so OpenSharedResource +
+	//! SRV run only when the handle value changes (overlay re-created on resize).
+	HANDLE                                 weave_overlay_handle_cached;
+	bool                                   weave_overlay_cached_is_dxgi;
+	wil::com_ptr<ID3D11Texture2D>          weave_overlay_tex;
+	wil::com_ptr<ID3D11ShaderResourceView> weave_overlay_srv;
+	wil::com_ptr<IDXGIKeyedMutex>          weave_overlay_km;
+
 	//! Deferred auto-3D for no-zones standalone clients (#140 / no-zones-2D).
 	//! A non-workspace IPC handle app with no zone mask never triggers a 3D
 	//! request (the per-client DP is created mode-neutral to dodge the #140
@@ -2792,6 +2804,10 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->weave_input_km.reset();
 	res->weave_input_srv.reset();
 	res->weave_input_tex.reset();
+	res->weave_overlay_handle_cached = nullptr;
+	res->weave_overlay_km.reset();
+	res->weave_overlay_srv.reset();
+	res->weave_overlay_tex.reset();
 
 	res->swap_chain.reset();
 
@@ -11639,11 +11655,18 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                uint32_t rect_h,
                                uint32_t rect_count,
                                const struct xrt_rect *rects,
+                               xrt_graphics_buffer_handle_t overlay_handle,
+                               bool overlay_is_dxgi,
+                               uint32_t overlay_rect_count,
+                               const struct xrt_rect *overlay_rects,
                                uint32_t *out_width,
                                uint32_t *out_height,
                                uint64_t *out_fence_value,
                                struct xrt_eye_positions *out_eyes)
 {
+	// v4 Phase 1 composites the whole premul atlas; per-rect scoping is a future hint.
+	(void)overlay_rect_count;
+	(void)overlay_rects;
 	if (out_width != nullptr) {
 		*out_width = 0;
 	}
@@ -11939,6 +11962,83 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 				U_LOG_W("#625 weave split: n=%u blits=%.2fms weave1=%.2fms", rect_count,
 				        (double)(t_post_copies_ns - t_post_acquire_ns) / 1e6,
 				        (double)(t_weave_end_ns - t_post_copies_ns) / 1e6);
+			}
+		}
+	}
+
+	// v4 overlay atlas (browser#18): composite the caller's window-sized
+	// premultiplied-alpha 2D atlas OVER the woven output (premul "over":
+	// out = overlay + (1 - overlay.a)*out), so crisp 2D lands on top of the
+	// interlaced 3D at screen depth. The overlay is NOT woven — it is drawn
+	// after process_atlas onto the same output RTV. Reuses the runtime's blit
+	// pipeline + premul blend; no DP call. Cached by handle like the SBS input.
+	HANDLE ov = (HANDLE)overlay_handle;
+	if (ov != nullptr && ov != INVALID_HANDLE_VALUE) {
+		if (c->render.weave_overlay_handle_cached != ov ||
+		    c->render.weave_overlay_cached_is_dxgi != overlay_is_dxgi || !c->render.weave_overlay_tex ||
+		    !c->render.weave_overlay_srv) {
+			c->render.weave_overlay_handle_cached = nullptr;
+			c->render.weave_overlay_km.reset();
+			c->render.weave_overlay_srv.reset();
+			c->render.weave_overlay_tex.reset();
+
+			if (overlay_is_dxgi) {
+				hr = sys->device->OpenSharedResource(ov, IID_PPV_ARGS(c->render.weave_overlay_tex.put()));
+			} else {
+				hr = sys->device->OpenSharedResource1(ov, IID_PPV_ARGS(c->render.weave_overlay_tex.put()));
+			}
+			if (SUCCEEDED(hr) && c->render.weave_overlay_tex) {
+				D3D11_TEXTURE2D_DESC odesc = {};
+				c->render.weave_overlay_tex->GetDesc(&odesc);
+				D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+				sd.Format = odesc.Format;
+				sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+				sd.Texture2D.MipLevels = 1;
+				hr = sys->device->CreateShaderResourceView(c->render.weave_overlay_tex.get(), &sd,
+				                                           c->render.weave_overlay_srv.put());
+				if (SUCCEEDED(hr)) {
+					(void)c->render.weave_overlay_tex->QueryInterface(
+					    IID_PPV_ARGS(c->render.weave_overlay_km.put()));
+					c->render.weave_overlay_handle_cached = ov;
+					c->render.weave_overlay_cached_is_dxgi = overlay_is_dxgi;
+					U_LOG_W("#625 weave v4: overlay import cached (handle=%p %s, %ux%u)", ov,
+					        overlay_is_dxgi ? "DXGI" : "NT", odesc.Width, odesc.Height);
+				} else {
+					c->render.weave_overlay_srv.reset();
+					c->render.weave_overlay_tex.reset();
+				}
+			} else {
+				U_LOG_E("#625 weave v4: overlay OpenSharedResource(%s) failed: 0x%08lx",
+				        overlay_is_dxgi ? "DXGI" : "NT", hr);
+				c->render.weave_overlay_tex.reset();
+			}
+		}
+
+		if (c->render.weave_overlay_srv && c->render.weave_output_rtv) {
+			D3D11_TEXTURE2D_DESC odesc = {};
+			c->render.weave_overlay_tex->GetDesc(&odesc);
+			IDXGIKeyedMutex *ov_km = c->render.weave_overlay_km.get();
+			bool ov_acquired = false;
+			if (ov_km) {
+				HRESULT ah = ov_km->AcquireSync(0, 1000);
+				if (SUCCEEDED(ah) && ah != static_cast<HRESULT>(WAIT_TIMEOUT)) {
+					ov_acquired = true;
+				}
+			}
+			if (!ov_km || ov_acquired) {
+				// One full-window premultiplied "over" blit: the atlas is
+				// transparent (alpha 0) everywhere except the 2D regions, so a
+				// single whole-window composite is correct regardless of
+				// overlay_rect_count (a future scope hint, not a correctness input).
+				blit_to_atlas_texture(sys, &c->render, c->render.weave_overlay_srv.get(),
+				                      0.0f, 0.0f, (float)odesc.Width, (float)odesc.Height,
+				                      (float)odesc.Width, (float)odesc.Height, 0.0f, 0.0f,
+				                      (float)win_w, (float)win_h, /*is_srgb*/ false,
+				                      sys->blend_premul.get(), c->render.weave_output_rtv.get(),
+				                      (float)win_w, (float)win_h);
+			}
+			if (ov_acquired && ov_km) {
+				ov_km->ReleaseSync(0);
 			}
 		}
 	}

@@ -77,6 +77,17 @@ static HANDLE g_sbsHandle = nullptr; //!< NT handle passed to xrWeaveSubmitDXR
 // the previous weave_submit; drives this frame's off-axis parallax. [0]=L [1]=R.
 static float g_lastEyeX[2] = {0.0f, 0.0f};
 
+// v4 overlay atlas (browser#18): a window-sized premultiplied-alpha 2D layer the
+// DP composites OVER the woven output. Painted ONCE (a static crisp 2D badge that
+// must stay put / show no parallax while the woven squares look around), submitted
+// each frame via a chained XrWeaveSubmitOverlaysDXR. Validates the runtime v4 path
+// end-to-end on real Leia hardware before the browser drives it.
+static ComPtr<ID3D11Texture2D> g_overlayTex;
+static ComPtr<ID3D11RenderTargetView> g_overlayRtv;
+static ComPtr<IDXGIKeyedMutex> g_overlayMutex;
+static HANDLE g_overlayHandle = nullptr; //!< NT handle chained on XrWeaveSubmitOverlaysDXR
+static uint32_t g_overlayW = 0, g_overlayH = 0;
+
 // Weaved output handback (opened from the runtime's exported handles).
 static ComPtr<ID3D11Texture2D> g_weavedTex;
 static ComPtr<ID3D11Fence> g_weaveFence;
@@ -244,6 +255,78 @@ CreateSbsTexture()
 		return false;
 	}
 	LOG_INFO("Pre-weave SBS render target ready (%ux%u, NT handle=%p)", w, h, g_sbsHandle);
+	return true;
+}
+
+// ---- v4 overlay atlas (premul-RGBA, window-sized, keyed-mutex shared) ---------
+// (Re)create the overlay atlas at the window client size and paint a static 2D
+// badge (opaque magenta bar near the top) on a transparent field. The service
+// composites it "over" the woven output, so the bar should read as crisp 2D at
+// screen depth — no interlace, and NO parallax when the head moves (unlike the
+// woven squares). Painted once per (re)size; the service re-composites each frame.
+static bool
+EnsureOverlayTexture(uint32_t w, uint32_t h)
+{
+	if (w == 0 || h == 0) {
+		return false;
+	}
+	if (g_overlayTex && g_overlayW == w && g_overlayH == h) {
+		return true; // still valid — the service caches the import by handle
+	}
+	g_overlayRtv.Reset();
+	g_overlayMutex.Reset();
+	g_overlayTex.Reset();
+	if (g_overlayHandle != nullptr) {
+		CloseHandle(g_overlayHandle);
+		g_overlayHandle = nullptr;
+	}
+
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w;
+	td.Height = h;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // premultiplied alpha
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+	td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+	if (FAILED(g_device->CreateTexture2D(&td, nullptr, &g_overlayTex))) {
+		LOG_ERROR("overlay CreateTexture2D failed");
+		return false;
+	}
+	if (FAILED(g_device->CreateRenderTargetView(g_overlayTex.Get(), nullptr, &g_overlayRtv))) {
+		LOG_ERROR("overlay CreateRenderTargetView failed");
+		return false;
+	}
+	if (FAILED(g_overlayTex.As(&g_overlayMutex))) {
+		LOG_ERROR("overlay texture has no keyed mutex");
+		return false;
+	}
+	ComPtr<IDXGIResource1> res1;
+	if (FAILED(g_overlayTex.As(&res1)) ||
+	    FAILED(res1->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr,
+	                                    &g_overlayHandle))) {
+		LOG_ERROR("overlay CreateSharedHandle failed");
+		return false;
+	}
+
+	// Paint once: transparent everywhere, one opaque magenta bar near the top.
+	if (g_overlayMutex->AcquireSync(0, 1000) != S_OK) {
+		LOG_ERROR("overlay AcquireSync failed");
+		return false;
+	}
+	const float transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	const float magenta[4] = {0.90f, 0.05f, 0.90f, 1.0f}; // opaque; premul == straight when a=1
+	g_context->ClearRenderTargetView(g_overlayRtv.Get(), transparent);
+	D3D11_RECT barR = {(LONG)(w / 8), (LONG)(h / 12), (LONG)(w - w / 8), (LONG)(h / 12 + h / 12)};
+	g_context->ClearView(g_overlayRtv.Get(), magenta, &barR, 1);
+	g_context->Flush();
+	g_overlayMutex->ReleaseSync(0);
+
+	g_overlayW = w;
+	g_overlayH = h;
+	LOG_INFO("v4 overlay atlas ready (%ux%u, NT handle=%p) — magenta 2D bar", w, h, g_overlayHandle);
 	return true;
 }
 
@@ -498,6 +581,10 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		// runtime returned LAST frame (look-around / virtual-camera motion).
 		RenderSbsLookAround(g_lastEyeX[0], g_lastEyeX[1]);
 
+		// v4: keep the overlay atlas sized to the window client area so the DP
+		// composites the 2D badge 1:1 over the woven output.
+		bool haveOverlay = EnsureOverlayTexture((uint32_t)cw, (uint32_t)ch);
+
 		XrWeaveSubmitInfoDXR in = {XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
 		in.inputTexture = (void *)g_sbsHandle;
 		in.inputIsDxgi = XR_FALSE;
@@ -505,6 +592,17 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		in.rect.offset.y = ry;
 		in.rect.extent.width = (int32_t)rw;
 		in.rect.extent.height = (int32_t)rh;
+
+		// Chain the 2D overlay atlas (browser#18 v4) so the DP composites it over
+		// the woven 3D. rectCount 0 = composite the whole (mostly-transparent) atlas.
+		XrWeaveSubmitOverlaysDXR ov = {XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR};
+		if (haveOverlay) {
+			ov.overlayTexture = (void *)g_overlayHandle;
+			ov.overlayIsDxgi = XR_FALSE;
+			ov.rectCount = 0;
+			ov.rects = nullptr;
+			in.next = &ov;
+		}
 
 		XrWeaveOutputDXR out = {XR_TYPE_WEAVE_OUTPUT_DXR};
 
