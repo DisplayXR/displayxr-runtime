@@ -109,6 +109,26 @@ struct cli_query_result
 	bool zone_caps_malformed;
 	char zone_probe_note[128];
 	struct xrt_dp_local_zone_caps zone_caps;
+
+	/* DP-factory selection divergence probe. Two render paths choose the
+	 * display processor differently: the in-process handle/texture path reads
+	 * the scalar dp_factory (== the active plug-in, `plugin_id` above), while
+	 * the D3D11 service / shell path reads the per-monitor DP registry's
+	 * PRIMARY entry (`comp_dp_factory_for_window` with COMP_DP_PRIMARY_MONITOR
+	 * → entries[0]). On a single display they MUST agree; a mismatch means
+	 * standalone apps and the shell weave with different DPs — e.g. Leia
+	 * in-process but sim_display in the shell, which silently drops shell
+	 * head-tracking. Reproduced headlessly here: the CLI runs in-process, so
+	 * it computes BOTH selections with no service running.
+	 * probed   — the probe ran (registry resolution executed).
+	 * mismatch — in-process plug-in id != service (registry primary) plug-in id. */
+	bool dp_sel_probed;
+	bool dp_sel_mismatch;
+	uint32_t dp_sel_monitor_count;  //!< EDID monitors enumerated.
+	uint32_t dp_sel_claim_count;    //!< registry entries (monitors a plug-in claimed).
+	char dp_sel_inproc_id[64];      //!< in-process path plug-in id (mirrors plugin_id).
+	char dp_sel_service_id[64];     //!< service path plug-in id (registry primary; == in-proc on empty registry).
+	char dp_sel_service_conf[24];   //!< service claim confidence label (FALLBACK/EDID/VERIFIED/scalar-fallback).
 };
 
 /*!

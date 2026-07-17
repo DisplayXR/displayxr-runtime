@@ -13,8 +13,10 @@
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_instance.h"
 #include "xrt/xrt_plugin.h"
+#include "xrt/xrt_compositor.h" // xrt_dp_factory_registry + XRT_DP_REGISTRY_MAX_ENTRIES
 #include "xrt/xrt_config_os.h"
 
+#include "os/os_display_edid.h"
 #include "util/u_git_tag.h"
 
 #include "target_plugin_loader.h"
@@ -176,6 +178,66 @@ read_plugin_version_from_registry(const char *id, char *out, size_t cap)
 }
 #endif
 
+//! Human label for an xrt_display_claim_confidence value.
+static const char *
+dp_confidence_label(uint32_t c)
+{
+	switch (c) {
+	case (uint32_t)XRT_DISPLAY_CLAIM_FALLBACK: return "FALLBACK";
+	case (uint32_t)XRT_DISPLAY_CLAIM_EDID: return "EDID";
+	case (uint32_t)XRT_DISPLAY_CLAIM_VERIFIED: return "VERIFIED";
+	default: return "?";
+	}
+}
+
+/*!
+ * Compute what DP each render path would pick and flag divergence. The
+ * in-process path uses the active plug-in (scalar dp_factory). The service /
+ * shell path uses the registry's primary entry — reproduced here with the same
+ * `os_display_edid_enumerate` → `target_plugin_build_descriptors` →
+ * `target_plugin_resolve_displays` sequence the compositor builds it from, then
+ * reading entries[0] exactly as `comp_dp_factory_for_window(COMP_DP_PRIMARY_
+ * MONITOR)` does. Runs after the active plug-in is known; safe headless (no
+ * service, no GPU). Off-Windows the EDID enumerator yields no monitors, so the
+ * registry is empty and the service path falls back to the scalar — reported as
+ * agreement, never a false mismatch.
+ */
+static void
+probe_dp_selection(struct cli_query_result *r, const struct xrt_plugin_iface *active)
+{
+	r->dp_sel_probed = true;
+	snprintf(r->dp_sel_inproc_id, sizeof(r->dp_sel_inproc_id), "%s",
+	         (active != NULL && active->id != NULL) ? active->id : "");
+
+	struct os_display_edid_list list = {0};
+	os_display_edid_enumerate(&list);
+
+	struct xrt_display_descriptor descs[XRT_DP_REGISTRY_MAX_ENTRIES];
+	uint32_t dn = target_plugin_build_descriptors(&list, descs, XRT_DP_REGISTRY_MAX_ENTRIES);
+	r->dp_sel_monitor_count = dn;
+
+	struct xrt_dp_factory_registry reg = {0};
+	target_plugin_resolve_displays(descs, dn, &reg);
+	r->dp_sel_claim_count = reg.entry_count;
+
+	if (reg.entry_count > 0) {
+		// The compositor passes COMP_DP_PRIMARY_MONITOR, which selects
+		// entries[0]; mirror that exactly.
+		const struct xrt_dp_registry_entry *e = &reg.entries[0];
+		snprintf(r->dp_sel_service_id, sizeof(r->dp_sel_service_id), "%s", e->plugin_id);
+		snprintf(r->dp_sel_service_conf, sizeof(r->dp_sel_service_conf), "%s",
+		         dp_confidence_label(e->confidence));
+		r->dp_sel_mismatch =
+		    r->dp_sel_service_id[0] != '\0' && strcmp(r->dp_sel_service_id, r->dp_sel_inproc_id) != 0;
+	} else {
+		// Empty registry → comp_dp_factory_for_window returns the scalar,
+		// i.e. the same plug-in the in-process path uses. No divergence.
+		snprintf(r->dp_sel_service_id, sizeof(r->dp_sel_service_id), "%s", r->dp_sel_inproc_id);
+		snprintf(r->dp_sel_service_conf, sizeof(r->dp_sel_service_conf), "%s", "scalar-fallback");
+		r->dp_sel_mismatch = false;
+	}
+}
+
 void
 cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const struct xrt_instance_info *ii)
 {
@@ -239,6 +301,11 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 		read_plugin_version_from_registry(r->plugin_id, r->plugin_version, sizeof(r->plugin_version));
 	}
 #endif
+
+	// Which DP does each render path pick? Flags the in-process-vs-service
+	// divergence that silently kills shell head-tracking (EDID-invisible
+	// vendor panels). Independent of the display-info checks below.
+	probe_dp_selection(r, iface);
 
 	if (iface->get_display_info == NULL) {
 		r->result_code = CLI_SELFTEST_BAD_INFO;
@@ -412,6 +479,26 @@ cli_query_print_info_text(const struct cli_query_result *r)
 		   (double)rm->view_scale_y);
 	}
 
+	P(" :: DP selection (which plug-in each render path picks)\n");
+	if (!r->dp_sel_probed) {
+		PT("not evaluated\n");
+	} else {
+		PT("in-process (handle/texture apps): '%s'\n", or_q(r->dp_sel_inproc_id));
+		PT("service / shell:                  '%s' (%s)\n", or_q(r->dp_sel_service_id),
+		   r->dp_sel_service_conf);
+		PT("monitors=%u  claimed=%u\n", r->dp_sel_monitor_count, r->dp_sel_claim_count);
+		if (r->dp_sel_mismatch) {
+			PT("** MISMATCH: the shell will weave with '%s' while standalone apps use '%s'.\n",
+			   r->dp_sel_service_id, r->dp_sel_inproc_id);
+			PT("   If '%s' is a non-tracking DP (e.g. sim_display), shell head-tracking is broken\n",
+			   r->dp_sel_service_id);
+			PT("   even though standalone apps track fine — the registry lost the display to a\n");
+			PT("   fallback claim (EDID table stale vs the vendor runtime).\n");
+		} else {
+			PT("paths agree.\n");
+		}
+	}
+
 	P(" :: Local zone caps (#224/ADR-027, headless D3D11 WARP probe)\n");
 	if (r->zone_caps_probed) {
 		const struct xrt_dp_local_zone_caps *z = &r->zone_caps;
@@ -508,6 +595,18 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		cJSON_AddStringToObject(et, "default_label", eye_default_label(i->default_eye_tracking_mode));
 	} else {
 		cJSON_AddNullToObject(root, "display");
+	}
+
+	// DP-selection divergence probe (in-process vs service/shell).
+	{
+		cJSON *ds = cJSON_AddObjectToObject(root, "dp_selection");
+		cJSON_AddBoolToObject(ds, "probed", r->dp_sel_probed);
+		cJSON_AddBoolToObject(ds, "mismatch", r->dp_sel_mismatch);
+		cJSON_AddStringToObject(ds, "in_process_plugin_id", r->dp_sel_inproc_id);
+		cJSON_AddStringToObject(ds, "service_plugin_id", r->dp_sel_service_id);
+		cJSON_AddStringToObject(ds, "service_confidence", r->dp_sel_service_conf);
+		cJSON_AddNumberToObject(ds, "monitor_count", (double)r->dp_sel_monitor_count);
+		cJSON_AddNumberToObject(ds, "claim_count", (double)r->dp_sel_claim_count);
 	}
 
 	// #224 / ADR-027 P4 zone-caps probe.
