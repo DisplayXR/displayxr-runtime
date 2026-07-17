@@ -98,13 +98,14 @@ The manifest sits in a system-known discovery directory and points at any execut
 | `icon_3d_layout` | string | `"sbs-lr"` | How the stereo pair is packed in `icon_3d`. One of `"sbs-lr"` (left-right), `"sbs-rl"` (right-left), `"tb"` (top-bottom, left eye on top), `"bt"` (bottom-top). Ignored if `icon_3d` is absent. |
 | `category` | string | `"app"` | Free-form tag used for grouping. Reserved values: `"test"`, `"demo"`, `"app"`, `"tool"`. Unknown values are accepted and displayed as-is. |
 | `display_mode` | string | `"auto"` | Preferred display mode at launch. `"auto"` lets the runtime choose. Other values are forwarded to the runtime's mode selection. |
+| `min_runtime` | string | *none* | Minimum DisplayXR **runtime** version the app requires, as `MAJOR.MINOR.PATCH` — see §3.5. When set and the installed runtime is older, a workspace controller marks the tile **incompatible** (greyed, launch blocked with an explanatory tooltip) rather than dropping it, so the user sees *why*. Additive; controllers predating this field ignore it. |
 | `description` | string | `""` | One-line description shown in tooltips. Max 256 characters. |
 
 ### 3.3 Reserved for future versions
 
 Names a workspace controller may consume in later schema versions — do not use for custom data:
 
-`version`, `publisher`, `homepage`, `min_runtime`, `required_extensions`, `screenshots`, `trailer`, `pose`, `window_size`, `args`, `working_dir`, `mcp`.
+`version`, `publisher`, `homepage`, `required_extensions`, `screenshots`, `trailer`, `pose`, `window_size`, `args`, `working_dir`, `mcp`.
 
 (`mcp` is reserved for the planned declarative tool-discovery block — see [per-app MCP tools](../../roadmap/per-app-mcp-tools.md) §9 P3.)
 
@@ -119,6 +120,18 @@ Rules:
 - **Uniqueness:** ids should be unique across the ecosystem by convention (pick something specific: `mediaplayer`, `gaussiansplat` — not `viewer`). There is no central registry; collisions between *different* apps are a scanner **warning** (both entries survive — dedup remains by `exe_path`), and consumers such as the MCP workspace aggregator disambiguate at runtime with sticky suffixes (`-2`, `-3`).
 - **Cross-check:** an app that registers MCP tools declares the same id at runtime via `xrSetMCPAppInfoDXR`. The runtime-declared value is authoritative; `scripts/check_displayxr_app.py` lints that manifest and code agree.
 - **Fallback:** when `id` is absent (and the app declares none at runtime), consumers derive a fallback from the sanitized exe basename. Fine for Browse-for-app entries; apps shipping manifests should set it explicitly.
+
+### 3.5 Runtime-version floor (`min_runtime`)
+
+`min_runtime` declares the minimum DisplayXR **runtime** version the app needs to run correctly (e.g. an engine plugin that only composites into the workspace on a runtime that ships a given capability). It is a shell-side **compatibility gate**, distinct from installer-time prerequisite checks — an installer may already refuse to install below a floor, but `min_runtime` also protects against the runtime being downgraded or the app being side-loaded after install.
+
+Rules:
+
+- **Format:** `MAJOR.MINOR.PATCH` (e.g. `"2.0.6"`). A malformed value is a **soft failure** (§6): warn and ignore the field — a bad floor must not knock an otherwise-valid app out of the launcher.
+- **Comparison:** the workspace controller reads the installed runtime version and compares numerically, component-by-component. On Windows the reference source is `HKLM\Software\DisplayXR\Runtime` value `Version` (the same key the runtime installer writes and engine installers read). Controllers on other platforms read the equivalent installed-runtime version.
+- **Incompatible behavior:** when installed `< min_runtime`, the controller keeps the tile **visible but disabled** — greyed, launch blocked, with a tooltip naming the required vs. installed version. The manifest is *not* dropped from discovery (contrast a hard validation rejection in §6): the user should see the app exists and learn why it can't launch, then update the runtime.
+- **Absent:** no gate — the controller launches regardless of runtime version (status quo).
+- **Additive:** controllers predating this field simply ignore the key and launch unconditionally, exactly as before.
 
 ## 4. 3D icons
 
@@ -190,6 +203,9 @@ Rejected manifests are logged as warnings. The scanner does not attempt to recov
 
 - `id` is specified but does not match `^[a-z0-9][a-z0-9-]{0,31}$` — the entry behaves as if `id` were absent (fallback per §3.4). A malformed slug must not knock an otherwise-valid app out of the launcher.
 - `id` duplicates another discovered manifest's `id` (different `exe_path`) — both entries survive; consumers disambiguate per §3.4.
+- `min_runtime` is specified but is not a `MAJOR.MINOR.PATCH` string — the field is ignored (no gate), per §3.5. A malformed floor must not drop the app.
+
+Note that `min_runtime` being *satisfiable-but-unmet* (installed runtime older than the floor) is **not** a manifest rejection — the entry is accepted and surfaced as a disabled/incompatible tile per §3.5, not dropped.
 
 ## 7. Example: minimal manifest
 
@@ -234,7 +250,7 @@ A workspace controller does NOT extract icons from the PE for sidecar/registered
 
 ## 10. Versioning
 
-Breaking changes bump `schema_version`. A workspace controller will refuse to parse manifests with a `schema_version` it does not understand, and log the unsupported version. Additive changes (new optional fields) keep `schema_version: 1`. The `exe_path` field added in this revision is additive — older controllers that read a registered manifest will fall back to sidecar resolution (look for sibling exe, fail, skip the entry); they will never crash. Registered-mode manifests therefore require a workspace controller ≥ the version that introduced this field. The `id` field (§3.4) is likewise additive — controllers that predate it simply ignore the key, and every `id`-consuming behavior has a defined fallback.
+Breaking changes bump `schema_version`. A workspace controller will refuse to parse manifests with a `schema_version` it does not understand, and log the unsupported version. Additive changes (new optional fields) keep `schema_version: 1`. The `exe_path` field added in this revision is additive — older controllers that read a registered manifest will fall back to sidecar resolution (look for sibling exe, fail, skip the entry); they will never crash. Registered-mode manifests therefore require a workspace controller ≥ the version that introduced this field. The `id` field (§3.4) and the `min_runtime` field (§3.5) are likewise additive — controllers that predate either simply ignore the key (for `min_runtime`, that means launching unconditionally, exactly as before), and every consuming behavior has a defined fallback.
 
 ## 11. Browse-for-app and registered-apps state cache (DisplayXR Shell reference implementation)
 

@@ -60,6 +60,9 @@ RULES = {
 # Manifest `id` / XrMCPAppInfoDXR appId slug (manifest spec §3.4).
 APP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 
+# Optional runtime-version floor (manifest spec §3.5) — MAJOR.MINOR.PATCH.
+MIN_RUNTIME_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
 ERROR, WARN, INFO = "ERROR", "WARN", "INFO"
 
 
@@ -256,6 +259,13 @@ def validate_manifest(mpath: Path, root: Path, findings: list):
             findings.append(Finding(WARN, "INV-9.2", rel(ipath, root), 1,
                                     f"{key} is {dims[0]}x{dims[1]}; convention is {want[0]}x{want[1]}.",
                                     f"Re-export {key} at {want[0]}x{want[1]} (PNG)."))
+
+    # Optional runtime-version floor (spec §3.5). Soft failure: warn + ignore if malformed.
+    min_rt = data.get("min_runtime")
+    if min_rt is not None and not (isinstance(min_rt, str) and MIN_RUNTIME_RE.match(min_rt)):
+        findings.append(Finding(WARN, "INV-9.1", rp, 1,
+                                f"min_runtime {min_rt!r} is not a MAJOR.MINOR.PATCH string; it will be ignored.",
+                                'Set "min_runtime": "2.0.6" (or remove it) — a malformed floor is dropped, not gated.'))
 
 
 def check_mcp_pairing(root: Path, findings: list):
