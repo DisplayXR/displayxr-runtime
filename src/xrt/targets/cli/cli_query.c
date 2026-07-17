@@ -6,6 +6,15 @@
  * @author David Fattal
  */
 
+// COBJMACROS must be defined before ANY include: xrt_plugin.h / xrt_compositor.h
+// transitively pull in <d3d11.h>, so defining it later (at the WIN32 block below)
+// is too late — the guard has already skipped the C COM-macro definitions, and
+// ID3D11Device_Release/ID3D11DeviceContext_Release link as unresolved externals.
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define COBJMACROS
+#endif
+
 #include "cli_query.h"
 
 #include "xrt/xrt_space.h"
@@ -28,10 +37,8 @@
 #include <string.h>
 
 #ifdef XRT_OS_WINDOWS
-#define WIN32_LEAN_AND_MEAN
-#define COBJMACROS
-#include <windows.h>
-#include <d3d11.h> // WARP device for the headless zone-caps probe (#224 / ADR-027 P4)
+#include <windows.h> // WIN32_LEAN_AND_MEAN + COBJMACROS are set at the top of the file
+#include <d3d11.h>   // WARP device for the headless zone-caps probe (#224 / ADR-027 P4)
 #include "xrt/xrt_display_processor_d3d11.h"
 #endif
 
