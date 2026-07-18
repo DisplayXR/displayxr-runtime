@@ -5673,6 +5673,7 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	    args->rect_count, args->rect_count > 0 ? rects : NULL,  //
 	    overlay_handle, overlay_is_dxgi,                        //
 	    args->overlay_rect_count, NULL,                         //
+	    args->weave_frame_first != 0,                           //
 	    &w, &h, &fv, &eyes);
 	if (!ok) {
 		return XRT_ERROR_IPC_FAILURE;

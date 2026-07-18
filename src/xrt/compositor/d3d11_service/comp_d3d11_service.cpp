@@ -11659,6 +11659,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                bool overlay_is_dxgi,
                                uint32_t overlay_rect_count,
                                const struct xrt_rect *overlay_rects,
+                               bool weave_frame_first,
                                uint32_t *out_width,
                                uint32_t *out_height,
                                uint64_t *out_fence_value,
@@ -11914,6 +11915,24 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			c->render.weave_sbs_w = win_w;
 			c->render.weave_sbs_h = win_h;
 			U_LOG_W("#625 weave batch: SBS atlas ready %ux%u (one weave per frame)", win_w * 2, win_h);
+		}
+
+		// v5 firstChunk (browser#22): clear the SBS atlas to premultiplied
+		// transparent on the first submit of a frame so regions BETWEEN the
+		// tiles are alpha 0. process_atlas draws a fullscreen quad from this
+		// atlas (canvas_offset is a no-op today, #85), and the display processor
+		// is alpha-native (passes the atlas alpha through the weave), so cleared
+		// gaps come out transparent while the blitted tile regions keep the
+		// page's opaque alpha. That lets the present-owner draw the woven output
+		// back WHOLE-WINDOW (opaque tiles replace the page, transparent gaps show
+		// it through), single-sourcing 2D chrome that spans tile gaps. The clear
+		// is opt-in (weave_frame_first): legacy present-owners draw back only
+		// their own tiles and never read the gaps, so they skip it and keep the
+		// accumulate-across-submits behavior (a >MAX-rect frame clears on its
+		// first submit only; later submits blit into the same atlas).
+		if (weave_frame_first && c->render.weave_sbs_rtv) {
+			const float sbs_transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+			sys->context->ClearRenderTargetView(c->render.weave_sbs_rtv.get(), sbs_transparent);
 		}
 
 		const float src_tw = (float)idesc.Width;

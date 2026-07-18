@@ -73,6 +73,7 @@ static ComPtr<ID3D11Texture2D> g_sbsTex;
 static ComPtr<ID3D11RenderTargetView> g_sbsRtv;
 static ComPtr<IDXGIKeyedMutex> g_sbsMutex;
 static HANDLE g_sbsHandle = nullptr; //!< NT handle passed to xrWeaveSubmitDXR
+static uint32_t g_sbsW = 0, g_sbsH = 0; //!< window-sized SBS input (batch layout)
 // Latest tracked per-eye horizontal position (metres, display space) returned by
 // the previous weave_submit; drives this frame's off-axis parallax. [0]=L [1]=R.
 static float g_lastEyeX[2] = {0.0f, 0.0f};
@@ -219,11 +220,26 @@ CreateCompositionSwapChain(uint32_t w, uint32_t h)
 }
 
 // ---- Pre-weave SBS texture (keyed-mutex shared, render-target) ---------------
+// v5 batch layout (browser#22): the input is WINDOW-sized with each element's
+// squeezed SBS at its own window position (not an element-sized 2x1 atlas), so
+// the runtime exercises the batch weave path + the firstChunk transparent clear.
+// (Re)created at the client size on resize, like the overlay atlas.
 static bool
-CreateSbsTexture()
+EnsureSbsTexture(uint32_t w, uint32_t h)
 {
-	const uint32_t w = kRectW * 2; // two views side by side
-	const uint32_t h = kRectH;
+	if (w == 0 || h == 0) {
+		return false;
+	}
+	if (g_sbsTex && g_sbsW == w && g_sbsH == h) {
+		return true; // still valid — the service caches the import by handle
+	}
+	g_sbsRtv.Reset();
+	g_sbsMutex.Reset();
+	g_sbsTex.Reset();
+	if (g_sbsHandle != nullptr) {
+		CloseHandle(g_sbsHandle);
+		g_sbsHandle = nullptr;
+	}
 
 	D3D11_TEXTURE2D_DESC td = {};
 	td.Width = w;
@@ -254,7 +270,9 @@ CreateSbsTexture()
 		LOG_ERROR("SBS CreateSharedHandle failed");
 		return false;
 	}
-	LOG_INFO("Pre-weave SBS render target ready (%ux%u, NT handle=%p)", w, h, g_sbsHandle);
+	g_sbsW = w;
+	g_sbsH = h;
+	LOG_INFO("Pre-weave SBS render target ready (%ux%u window-sized, NT handle=%p)", w, h, g_sbsHandle);
 	return true;
 }
 
@@ -334,9 +352,15 @@ EnsureOverlayTexture(uint32_t w, uint32_t h)
 // ClearView). Each view shows a near (red) + far (green) square on a gray bg;
 // each square shifts horizontally by -k*eye.x, with the near square's k larger,
 // so head motion produces depth-ordered parallax (look-around) and the L/R eye
-// difference produces stereo disparity. The whole SBS is what the DP weaves.
+// difference produces stereo disparity.
+//
+// v5 batch layout: render the element's squeezed SBS into the window-sized
+// input at the element's own window position [rx,ry,rw,rh] — left view in the
+// rect's left half [rx, rx+rw/2], right view in the right half. The rest of the
+// window-sized input is a GAP: cleared to transparent (alpha 0), mirroring the
+// browser (opaque element on transparency).
 static void
-RenderSbsLookAround(float eyeLx, float eyeRx)
+RenderSbsLookAround(float eyeLx, float eyeRx, int32_t rx, int32_t ry, int32_t rw, int32_t rh)
 {
 	if (!g_sbsRtv || !g_sbsMutex) {
 		return;
@@ -347,28 +371,31 @@ RenderSbsLookAround(float eyeLx, float eyeRx)
 	if (g_sbsMutex->AcquireSync(0, 1000) != S_OK) {
 		return;
 	}
-	const float bg[4] = {0.10f, 0.10f, 0.12f, 1.0f};
+	const float gap[4] = {0.0f, 0.0f, 0.0f, 0.0f};       // transparent GAP (outside the element)
+	const float bg[4] = {0.10f, 0.10f, 0.12f, 1.0f};     // opaque element background
 	const float farCol[4] = {0.15f, 0.80f, 0.20f, 1.0f}; // green, "far"
 	const float nearCol[4] = {0.90f, 0.20f, 0.15f, 1.0f}; // red, "near"
 	const float kFar = 200.0f;  // px shift per metre of eye x  (small parallax)
 	const float kNear = 900.0f; // larger parallax → reads as nearer
-	const int32_t vw = (int32_t)kRectW, vh = (int32_t)kRectH;
+	const int32_t hw = rw / 2;  // per-view (squeezed) width within the rect
 	const float eyeX[2] = {eyeLx, eyeRx};
 
-	// Background: clear the whole SBS.
-	g_context->ClearView(g_sbsRtv.Get(), bg, nullptr, 0);
+	// Whole window transparent, then the opaque element rect on top.
+	g_context->ClearView(g_sbsRtv.Get(), gap, nullptr, 0);
+	D3D11_RECT elemR = {rx, ry, rx + rw, ry + rh};
+	g_context->ClearView(g_sbsRtv.Get(), bg, &elemR, 1);
 
 	for (int v = 0; v < 2; v++) {
-		const int32_t ox = v * vw; // this view's left edge in the SBS
-		// Far square (240x180), centred, parallax -kFar*eye.x.
-		int32_t fcx = ox + vw / 2 + (int32_t)(-kFar * eyeX[v]);
-		int32_t fcy = vh / 2;
-		D3D11_RECT farR = {fcx - 120, fcy - 90, fcx + 120, fcy + 90};
+		const int32_t ox = rx + v * hw; // this view's left edge within the rect
+		// Far square, centred in the view half, parallax -kFar*eye.x.
+		int32_t fcx = ox + hw / 2 + (int32_t)(-kFar * eyeX[v]);
+		int32_t fcy = ry + rh / 2;
+		D3D11_RECT farR = {fcx - 60, fcy - 90, fcx + 60, fcy + 90};
 		g_context->ClearView(g_sbsRtv.Get(), farCol, &farR, 1);
-		// Near square (120x120), centred, parallax -kNear*eye.x (moves more).
-		int32_t ncx = ox + vw / 2 + (int32_t)(-kNear * eyeX[v]);
-		int32_t ncy = vh / 2;
-		D3D11_RECT nearR = {ncx - 60, ncy - 60, ncx + 60, ncy + 60};
+		// Near square, centred, parallax -kNear*eye.x (moves more).
+		int32_t ncx = ox + hw / 2 + (int32_t)(-kNear * eyeX[v]);
+		int32_t ncy = ry + rh / 2;
+		D3D11_RECT nearR = {ncx - 40, ncy - 60, ncx + 40, ncy + 60};
 		g_context->ClearView(g_sbsRtv.Get(), nearCol, &nearR, 1);
 	}
 
@@ -439,6 +466,21 @@ MaybeDumpWeaved()
 		return;
 	}
 	const uint32_t w = td.Width, h = td.Height;
+
+	// v5 firstChunk assertion (browser#22): with the batch clear the woven output
+	// must be OPAQUE (alpha≈255) inside the element tile and TRANSPARENT (alpha≈0)
+	// in the gap outside it — the property that lets the browser present the woven
+	// output whole-window over the page. The BMP below drops alpha (24-bit), so
+	// sample it here: a gap pixel near the top-left corner vs the window centre
+	// (the centred element). This validates MY clear + the DP alpha-native
+	// passthrough on sim (Leia's own alpha is confirmed by David's eyeball).
+	if (w > 20 && h > 20) {
+		const uint8_t *pGap = (const uint8_t *)m.pData + (size_t)10 * m.RowPitch + (size_t)10 * 4;
+		const uint8_t *pTile = (const uint8_t *)m.pData + (size_t)(h / 2) * m.RowPitch + (size_t)(w / 2) * 4;
+		LOG_INFO("v5 alpha check: gap(10,10).a=%u (want ~0)  tile(%u,%u).a=%u (want ~255)", pGap[3], w / 2,
+		         h / 2, pTile[3]);
+	}
+
 	const uint32_t rowBytes = w * 3;
 	const uint32_t padded = (rowBytes + 3) & ~3u;
 	const uint32_t imgSize = padded * h;
@@ -509,9 +551,7 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 	if (!CreateCompositionSwapChain(kWinW, kWinH)) {
 		return 1;
 	}
-	if (!CreateSbsTexture()) {
-		return 1;
-	}
+	// SBS input is (re)created window-sized in the frame loop via EnsureSbsTexture.
 	if (!CreateSession(xr, g_device.Get(), g_hwnd)) {
 		return 1;
 	}
@@ -577,9 +617,17 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		int32_t rx = (cw - (int32_t)rw) / 2;
 		int32_t ry = (ch - (int32_t)rh) / 2;
 
+		// v5 batch: the SBS input is window-sized with the element at its window
+		// position, so the runtime takes the batch weave path + firstChunk clear.
+		if (!EnsureSbsTexture((uint32_t)cw, (uint32_t)ch)) {
+			Sleep(100);
+			continue;
+		}
+
 		// Render this frame's pre-weave SBS pair off-axis from the eyes the
-		// runtime returned LAST frame (look-around / virtual-camera motion).
-		RenderSbsLookAround(g_lastEyeX[0], g_lastEyeX[1]);
+		// runtime returned LAST frame (look-around / virtual-camera motion), into
+		// the element's window-relative rect (rest of the window = transparent gap).
+		RenderSbsLookAround(g_lastEyeX[0], g_lastEyeX[1], rx, ry, (int32_t)rw, (int32_t)rh);
 
 		// v4: keep the overlay atlas sized to the window client area so the DP
 		// composites the 2D badge 1:1 over the woven output.
@@ -588,10 +636,19 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		XrWeaveSubmitInfoDXR in = {XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
 		in.inputTexture = (void *)g_sbsHandle;
 		in.inputIsDxgi = XR_FALSE;
-		in.rect.offset.x = rx;
+		in.rect.offset.x = rx; // ignored on the batch path, kept for completeness
 		in.rect.offset.y = ry;
 		in.rect.extent.width = (int32_t)rw;
 		in.rect.extent.height = (int32_t)rh;
+		in.firstChunk = XR_TRUE; // single submit per frame → also the first: clears the woven output
+
+		// v3 batch: one window-relative rect (element position). Switches the
+		// runtime to the window-sized-input batch layout + the firstChunk clear.
+		XrRect2Di batchRect = {{rx, ry}, {(int32_t)rw, (int32_t)rh}};
+		XrWeaveSubmitRectsDXR rects = {XR_TYPE_WEAVE_SUBMIT_RECTS_DXR};
+		rects.rectCount = 1;
+		rects.rects = &batchRect;
+		in.next = &rects;
 
 		// Chain the 2D overlay atlas (browser#18 v4) so the DP composites it over
 		// the woven 3D. rectCount 0 = composite the whole (mostly-transparent) atlas.
@@ -601,7 +658,7 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 			ov.overlayIsDxgi = XR_FALSE;
 			ov.rectCount = 0;
 			ov.rects = nullptr;
-			in.next = &ov;
+			rects.next = &ov; // chain overlays after rects
 		}
 
 		XrWeaveOutputDXR out = {XR_TYPE_WEAVE_OUTPUT_DXR};

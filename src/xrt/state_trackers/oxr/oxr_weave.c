@@ -65,6 +65,7 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         bool overlay_is_dxgi,
                                         uint32_t overlay_rect_count,
                                         const struct xrt_rect *overlay_rects,
+                                        bool weave_frame_first,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
@@ -218,7 +219,8 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	    submitInfo->inputIsDxgi == XR_TRUE, submitInfo->rect.offset.x, submitInfo->rect.offset.y,
 	    (uint32_t)submitInfo->rect.extent.width, (uint32_t)submitInfo->rect.extent.height, rect_count,
 	    rect_count > 0 ? rects : NULL, overlay_handle, overlay_is_dxgi, overlay_rect_count,
-	    overlay_rect_count > 0 ? overlay_rects : NULL, &have_out, &w, &h, &fence_value, &eyes);
+	    overlay_rect_count > 0 ? overlay_rects : NULL, submitInfo->firstChunk == XR_TRUE, &have_out, &w, &h,
+	    &fence_value, &eyes);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
 		                 "xrWeaveSubmitDXR: weave failed (xrt_result=%d)", (int)xret);

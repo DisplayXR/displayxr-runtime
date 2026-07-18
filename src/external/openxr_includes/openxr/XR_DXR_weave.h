@@ -120,7 +120,8 @@
  *
  * Version history: 1 = initial (pre-rename numbering carried over); 2 =
  * inputIsDxgi legacy-DXGI handle tagging; 3 = XrWeaveSubmitRectsDXR batched
- * submit; 4 = XrWeaveSubmitOverlaysDXR DP-composited 2D overlay atlas.
+ * submit; 4 = XrWeaveSubmitOverlaysDXR DP-composited 2D overlay atlas; 5 =
+ * XrWeaveSubmitInfoDXR::firstChunk (coherent whole-window output, browser#22).
  */
 #ifndef XR_DXR_WEAVE_H
 #define XR_DXR_WEAVE_H 1
@@ -133,7 +134,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 4
+#define XR_DXR_weave_SPEC_VERSION 5
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
 // Reserved 1004999190..193. Final values reconcile with the Khronos registry
@@ -165,6 +166,18 @@ extern "C" {
  * @c rect is the element's device-pixel rect WITHIN the bound window's client
  * area (y-down). The runtime combines it with the tracked window position to
  * derive the absolute-screen weave phase.
+ *
+ * @c firstChunk (spec v5, browser#22) marks the FIRST submit of a frame. When
+ * XR_TRUE the runtime clears its window-sized woven output to premultiplied
+ * transparent (0,0,0,0) before weaving this submit's rects, so regions between
+ * the woven tiles become transparent instead of stale — the caller can then
+ * present the woven output WHOLE-WINDOW (one "over" composite: opaque tiles
+ * replace the page, transparent gaps show it through) instead of per-tile,
+ * single-sourcing any 2D chrome that spans tile gaps. A caller that splits a
+ * frame across multiple submits (> XR_WEAVE_SUBMIT_MAX_RECTS_DXR elements) sets
+ * it XR_TRUE only on the first; later submits accumulate into the same output.
+ * Default XR_FALSE preserves the legacy behavior (no clear) for present-owners
+ * that draw back only their own tiles.
  */
 typedef struct XrWeaveSubmitInfoDXR {
     XrStructureType          type;         //!< XR_TYPE_WEAVE_SUBMIT_INFO_DXR
@@ -172,6 +185,7 @@ typedef struct XrWeaveSubmitInfoDXR {
     void*                    inputTexture; //!< pre-weave SBS shared texture HANDLE (keyed-mutex)
     XrBool32                 inputIsDxgi;  //!< XR_TRUE for a legacy global DXGI handle (else NT handle)
     XrRect2Di                rect;         //!< window-relative sub-rect, device px (y-down)
+    XrBool32                 firstChunk;   //!< XR_TRUE = first submit of the frame; clears the woven output to transparent (v5)
 } XrWeaveSubmitInfoDXR;
 
 /*!

@@ -791,6 +791,13 @@ struct ipc_arg_weave_submit
 	//! transport if scoping is ever needed.
 	uint32_t have_overlay;       //!< 0 = no overlay (one in_handle); 1 = overlay atlas is handles[1]
 	uint32_t overlay_rect_count; //!< forward-compat hint; rects not carried on the wire (whole-atlas composite)
+
+	//! XR_DXR_weave v5 (browser#22): 1 = first submit of the frame — the runtime
+	//! clears its window-sized woven output to premultiplied transparent (0,0,0,0)
+	//! before weaving this submit's rects, so gaps between tiles are transparent
+	//! (not stale) and the caller can draw the woven output back WHOLE-WINDOW.
+	//! 0 (default) = legacy: no clear, later submits of a >MAX-rect frame accumulate.
+	uint32_t weave_frame_first;
 };
 
 /*!

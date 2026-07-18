@@ -500,6 +500,7 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         bool overlay_is_dxgi,
                                         uint32_t overlay_rect_count,
                                         const struct xrt_rect *overlay_rects,
+                                        bool weave_frame_first,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
@@ -551,6 +552,11 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	args.have_overlay = have_overlay ? 1u : 0u;
 	args.overlay_rect_count = overlay_rect_count;
 	(void)overlay_rects;
+
+	// v5 (browser#22): the first submit of a frame clears the runtime's woven
+	// output to transparent so gaps between tiles are transparent (not stale),
+	// letting a present-owner draw the woven output back WHOLE-WINDOW.
+	args.weave_frame_first = weave_frame_first ? 1u : 0u;
 
 	xrt_graphics_buffer_handle_t handles[2] = {in_handle, overlay_handle};
 	uint32_t handle_count = have_overlay ? 2u : 1u;
