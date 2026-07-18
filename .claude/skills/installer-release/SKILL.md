@@ -279,6 +279,49 @@ cert + notarization (separate track). Carry `SIGNED` into the report.
 
 ---
 
+## PHASE 4.6: MIRROR THE SIGNED BUNDLE TO ONEDRIVE
+
+`publish-bundle.yml` no longer uploads to OneDrive — it ran BEFORE this
+skill's signing, so it always mirrored the UNSIGNED bundle (the very gap that
+shipped an unsigned v2.0.5 to OneDrive). The upload now lives in
+`upload-bundle-onedrive.yml` (workflow_dispatch), which downloads the release's
+`DisplayXRBundle-*.exe` — signed by Phase 4.5 above — and pushes it. Fire it
+here so OneDrive matches the signed GitHub release.
+
+Only run this when `SIGNED = yes` (never mirror an unsigned bundle). The
+workflow itself also fail-closes: it re-verifies the downloaded `.exe` carries
+a signature and errors out if not, so a mis-fire can't push an unsigned bundle.
+
+```bash
+if [ "$SIGNED" = yes ]; then
+  gh workflow run upload-bundle-onedrive.yml -R DisplayXR/displayxr-installer -f tag="$TAG"
+  # Locate + watch the dispatched run so the report reflects the real outcome.
+  SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  OD_RUN=""
+  for _ in $(seq 1 20); do
+    OD_RUN=$(gh run list -R DisplayXR/displayxr-installer --workflow upload-bundle-onedrive.yml \
+              --event workflow_dispatch --limit 8 --json databaseId,createdAt \
+              --jq "[.[]|select(.createdAt>=\"$SINCE\")]|sort_by(.createdAt)|last|.databaseId // empty")
+    [ -n "$OD_RUN" ] && break; sleep 5
+  done
+  if [ -n "$OD_RUN" ] && gh run watch "$OD_RUN" -R DisplayXR/displayxr-installer --interval 20 --exit-status; then
+    ONEDRIVE=synced
+  else
+    ONEDRIVE=failed   # token expiry / secret unset / dispatch miss — flag in report, release still good
+    echo "⚠ OneDrive mirror did not complete — the SIGNED GitHub release is authoritative."
+    echo "  Retry: gh workflow run upload-bundle-onedrive.yml -R DisplayXR/displayxr-installer -f tag=$TAG"
+  fi
+else
+  ONEDRIVE=skipped     # bundle unsigned → never mirror
+fi
+```
+
+If the mirror fails on `invalid_grant`, the OneDrive token expired — refresh the
+`RCLONE_CONFIG` secret (see the comment in `upload-bundle-onedrive.yml`) and
+re-run the one-liner above; no need to re-cut the bundle.
+
+---
+
 ## PHASE 5: REPORT
 
 ```
@@ -297,6 +340,7 @@ Assets:     DisplayXRBundle-X.Y.Z.pkg (~N MB)
             DisplayXRBundle-X.Y.Z.exe (~N MB)
 Prerelease: true/false
 Signing:    [signed → "bundle .exe signed on the provider runner (run $RID) and re-uploaded"] | [none → "⚠ bundle UNSIGNED — provider unreachable; set DXR_SIGN_REPO or ship unsigned"]  (macOS .pkg: unsigned, TODO)
+OneDrive:   [synced → "signed bundle mirrored to OneDrive (upload-bundle-onedrive.yml run $OD_RUN)"] | [failed → "⚠ OneDrive mirror failed — signed GitHub release is authoritative; retry the dispatch"] | [skipped → "not mirrored (bundle unsigned)"]
 
 Source of truth verification:
   installer/versions.json == runtime/versions.json    ✓
