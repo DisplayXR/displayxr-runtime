@@ -529,7 +529,14 @@ struct BlitConstants
 	float hud_src_rect[4];
 	float hud_present;
 	float hud_premul;
-	float _hud_pad[2];
+	// ADR-032: source array slice for LAYERED (arraySize>1) swapchains. The
+	// blit_ps_array pixel shader samples src_tex as a Texture2DArray at
+	// float3(uv, array_slice). Occupies the first of the two former HUD pad
+	// floats — the float4 `hud_flags` cbuffer register (x=present, y=premul,
+	// z=array_slice, w=pad) is byte-identical, so single-layer blits (which
+	// leave this 0 and bind the plain Texture2D blit_ps) are unaffected.
+	float array_slice;
+	float _hud_pad[1];
 };
 
 //! Vertex shader for projection blit - draws a quad at specified destination
@@ -908,6 +915,188 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
         // contrast (light-gray tint) and pick up a slight blue tone over
         // workspace clients — preserves internal cursor detail (black
         // outline vs white fill) by multiplying instead of replacing.
+        color = color * glow_color;
+    }
+
+    return float4(oetf_out(color.rgb), color.a * alpha * a_mul);
+}
+)";
+
+//! ADR-032: LAYERED (array) source variant of blit_ps_hlsl. A D3D12 IPC client
+//! that submits a single arraySize=2 SPI/array swapchain places its two eyes as
+//! array slices (subImage.imageArrayIndex 0/1) rather than side-by-side tiles.
+//! Sampling that shared texture through a plain Texture2D SRV silently views
+//! slice 0 only, so both eyes get the LEFT image. This variant binds a whole-
+//! array Texture2DArray SRV and selects the requested slice via `array_slice`
+//! (the `hud_flags.z` cbuffer slot — byte-identical BlitCB layout to blit_ps).
+//! Bound by blit_to_atlas_texture(is_array=true); single-layer blits keep the
+//! Texture2D blit_ps path. Body is otherwise identical to blit_ps_hlsl.
+static const char *blit_ps_array_hlsl = R"(
+cbuffer BlitCB : register(b0)
+{
+    float4 src_rect;
+    float2 dst_offset;
+    float2 src_size;
+    float2 dst_size;
+    float convert_srgb;
+    float quad_mode;
+    float2 dst_rect_wh;
+    float corner_radius;
+    float corner_aspect;
+    float4 quad_corners_01;
+    float4 quad_corners_23;
+    float4 quad_w;
+    float edge_feather;
+    float glow_intensity;
+    float glow_extent;
+    float glow_falloff;
+    float4 glow_color;
+    float4 corner_depth_ndc;
+    float4 chrome_alpha;
+    float4 hud_dst_rect;
+    float4 hud_src_rect;
+    float2 hud_flags;        // x = present, y = premul
+    float array_slice;       // z: source array slice for layered swapchains
+    float _hud_pad;          // w
+};
+
+cbuffer ColorCB : register(b1)
+{
+    float g_linearize_output;
+    float3 _color_pad;
+};
+
+// Layered source: eyes are array slices, sampled at float3(uv, array_slice).
+Texture2DArray src_tex : register(t0);
+Texture2D hud_tex : register(t1);
+SamplerState src_samp : register(s0);
+
+struct VS_OUTPUT
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+    float2 quad_uv : TEXCOORD1;
+};
+
+float3 srgb_to_linear(float3 c)
+{
+    return (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4);
+}
+float3 oetf_out(float3 c)
+{
+    return (g_linearize_output > 0.5) ? srgb_to_linear(c) : c;
+}
+
+float4 PSMain(VS_OUTPUT input) : SV_Target
+{
+    float2 uv01 = input.quad_uv;
+
+    if (convert_srgb > 3.5) {
+        float ext_x = glow_extent;
+        float ext_y = (edge_feather > 0.001) ? edge_feather : ext_x;
+        if (ext_x < 0.001) discard;
+        float dx = min(uv01.x, 1.0 - uv01.x);
+        float dy = min(uv01.y, 1.0 - uv01.y);
+        float ndx = dx / ext_x;
+        float ndy = dy / ext_y;
+        if (ndx > 1.0 && ndy > 1.0) discard;
+        float dist = min(min(ndx, ndy), 1.0);
+        float falloff = exp(-glow_falloff * dist * dist);
+        float a = glow_intensity * falloff;
+        return float4(oetf_out(glow_color.rgb) * a, a);
+    }
+
+    if (convert_srgb > 2.5) {
+        float ext_x = glow_extent;
+        float ext_y = (edge_feather > 0.001) ? edge_feather : ext_x;
+        if (ext_x < 0.001) discard;
+        float dx = max(ext_x - uv01.x, uv01.x - (1.0 - ext_x));
+        float dy = max(ext_y - uv01.y, uv01.y - (1.0 - ext_y));
+        float ndx = dx / ext_x;
+        float ndy = dy / ext_y;
+        float dist;
+        if (ndx > 0 && ndy > 0)
+            dist = length(float2(ndx, ndy));
+        else
+            dist = max(max(ndx, ndy), 0.0);
+        if (dist <= 0.0) discard;
+        float falloff = exp(-glow_falloff * dist * dist);
+        float a = glow_intensity * falloff;
+        return float4(oetf_out(glow_color.rgb) * a, a);
+    }
+
+    float corner_alpha = 1.0;
+    bool in_corner = false;
+    if (corner_radius != 0) {
+        float ry = abs(corner_radius);
+        float aspect = abs(corner_aspect);
+        if (aspect < 0.001) aspect = 10.0;
+        float rx = ry / aspect;
+        bool all_corners = (corner_radius < 0 && corner_aspect < 0);
+        bool do_top = (corner_radius > 0 || all_corners);
+        bool do_top_left = do_top && (corner_aspect > 0 || all_corners);
+        bool do_top_right = do_top;
+        bool do_bottom_left = (corner_radius < 0);
+        bool do_bottom_right = (corner_radius < 0);
+        float corner_dist = -1.0;
+        if (do_top_left && uv01.x < rx && uv01.y < ry)
+            corner_dist = length(float2((rx - uv01.x) / rx, (ry - uv01.y) / ry));
+        if (do_top_right && uv01.x > 1.0 - rx && uv01.y < ry)
+            corner_dist = length(float2((uv01.x - (1.0 - rx)) / rx, (ry - uv01.y) / ry));
+        if (do_bottom_left && uv01.x < rx && uv01.y > 1.0 - ry)
+            corner_dist = length(float2((rx - uv01.x) / rx, (uv01.y - (1.0 - ry)) / ry));
+        if (do_bottom_right && uv01.x > 1.0 - rx && uv01.y > 1.0 - ry)
+            corner_dist = length(float2((uv01.x - (1.0 - rx)) / rx, (uv01.y - (1.0 - ry)) / ry));
+        if (corner_dist >= 0.0) {
+            in_corner = true;
+            if (corner_dist > 1.0) discard;
+            float feather_band = (edge_feather > 0.0) ? edge_feather / ry : 0.02;
+            corner_alpha = saturate((1.0 - corner_dist) / feather_band);
+        }
+    }
+
+    float feather_alpha = 1.0;
+    if (!in_corner && edge_feather > 0.0) {
+        float aspect_for_feather = abs(corner_aspect);
+        if (aspect_for_feather < 0.001) aspect_for_feather = 1.0;
+        float dx = min(uv01.x, 1.0 - uv01.x) * aspect_for_feather;
+        float dy = min(uv01.y, 1.0 - uv01.y);
+        float d = min(dx, dy);
+        feather_alpha = saturate(d / edge_feather);
+    }
+    float coverage = corner_alpha * feather_alpha;
+    float alpha = coverage;
+
+    float fade = saturate(chrome_alpha.x);
+    float a_mul = 1.0 - fade;
+
+    if (convert_srgb > 1.5)
+        return float4(oetf_out(src_rect.xyz), alpha * a_mul);
+
+    float4 color = src_tex.Sample(src_samp, float3(input.uv, array_slice));
+
+    if (hud_flags.x > 0.5)
+    {
+        float2 hud_q = (input.quad_uv - hud_dst_rect.xy) / max(hud_dst_rect.zw, float2(1e-6, 1e-6));
+        if (hud_q.x >= 0.0 && hud_q.x <= 1.0 && hud_q.y >= 0.0 && hud_q.y <= 1.0)
+        {
+            float2 hud_uv = hud_src_rect.xy + hud_q * hud_src_rect.zw;
+            float4 hud_color = hud_tex.Sample(src_samp, hud_uv);
+            float a = saturate(hud_color.a);
+            float3 hud_rgb_premul = (hud_flags.y > 0.5) ? hud_color.rgb : hud_color.rgb * a;
+            color.rgb = color.rgb * (1.0 - a) + hud_rgb_premul;
+            color.a = saturate(color.a + a * (1.0 - color.a));
+        }
+    }
+
+    if (chrome_alpha.y > 0.5) {
+        return float4(oetf_out(glow_color.rgb), color.a * glow_color.a * alpha * a_mul);
+    }
+
+    if (edge_feather > 0.0 && glow_intensity > 0.0) {
+        float tint_amount = (1.0 - coverage) * glow_intensity * glow_color.a;
+        color.rgb = lerp(color.rgb, glow_color.rgb, saturate(tint_amount));
+    } else if (glow_intensity > 0.0) {
         color = color * glow_color;
     }
 

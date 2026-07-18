@@ -593,6 +593,11 @@ struct d3d11_service_system
 	//! Blit shaders for projection layer copy with SRGB conversion
 	wil::com_ptr<ID3D11VertexShader> blit_vs;
 	wil::com_ptr<ID3D11PixelShader> blit_ps;
+	//! ADR-032: Texture2DArray source variant of blit_ps. Bound by
+	//! blit_to_atlas_texture(is_array=true) when a client submits a LAYERED
+	//! (arraySize>1) swapchain — samples the requested eye's array slice.
+	//! Non-fatal if compilation fails (layered clients fall back to slice 0).
+	wil::com_ptr<ID3D11PixelShader> blit_ps_array;
 	//! #308: premultiplied box-blur variant of blit_ps. Used only for the
 	//! empty-state splash logo while it's pushed behind the launcher band, to
 	//! give it depth-of-field. Blur radius (UV) comes from glow_falloff.
@@ -2007,6 +2012,20 @@ create_layer_shaders(struct d3d11_service_system *sys)
 		return false;
 	}
 
+	// ADR-032: Texture2DArray blit variant for LAYERED (arraySize>1) clients
+	// (non-fatal — a layered client falls back to slice 0 if this is missing).
+	hr = compile_shader(blit_ps_array_hlsl, "PSMain", "ps_5_0", &blob);
+	if (SUCCEEDED(hr)) {
+		hr = sys->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+		                                     nullptr, sys->blit_ps_array.put());
+		blob->Release();
+		if (FAILED(hr)) {
+			U_LOG_W("Failed to create layered blit pixel shader: 0x%08lx (layered clients degrade)", hr);
+		}
+	} else {
+		U_LOG_W("Failed to compile layered blit pixel shader (layered clients degrade)");
+	}
+
 	// #308: blur variant for the pushed-back empty-state splash (non-fatal).
 	hr = compile_shader(blit_blur_ps_hlsl, "PSMain", "ps_5_0", &blob);
 	if (SUCCEEDED(hr)) {
@@ -2224,7 +2243,14 @@ blit_to_atlas_texture(struct d3d11_service_system *sys,
                        ID3D11BlendState *blend = nullptr,
                        ID3D11RenderTargetView *rtv_override = nullptr,
                        float dst_tex_w = 0.0f,
-                       float dst_tex_h = 0.0f)
+                       float dst_tex_h = 0.0f,
+                       // ADR-032: when true, `src_srv` is a whole-array
+                       // Texture2DArray SRV and the blit samples slice
+                       // `array_slice`. Defaults keep the single-layer
+                       // (Texture2D) path byte-identical for all existing
+                       // callers.
+                       bool is_array = false,
+                       uint32_t array_slice = 0)
 {
 	// Update blit constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
@@ -2272,12 +2298,19 @@ blit_to_atlas_texture(struct d3d11_service_system *sys,
 	cb->corner_aspect = 0.0f;
 	cb->edge_feather = 0.0f;
 	cb->glow_intensity = 0.0f;
+	// ADR-032: source array slice for the Texture2DArray blit variant. Written
+	// unconditionally (WRITE_DISCARD map) — harmless for the Texture2D path,
+	// which never reads it. `hud_flags.z` in the shared BlitCB layout.
+	cb->array_slice = static_cast<float>(array_slice);
 
 	sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 
-	// Set up pipeline for blit
+	// Set up pipeline for blit. ADR-032: bind the Texture2DArray variant for
+	// LAYERED sources (falls back to the plain blit_ps if the array shader
+	// failed to compile — degrades to slice 0 rather than crashing).
+	bool use_array_ps = is_array && sys->blit_ps_array;
 	sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
-	sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
+	sys->context->PSSetShader(use_array_ps ? sys->blit_ps_array.get() : sys->blit_ps.get(), nullptr, 0);
 	sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 	sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 	sys->context->PSSetShaderResources(0, 1, &src_srv);
@@ -3682,11 +3715,22 @@ compositor_create_swapchain(struct xrt_compositor *xc,
 
 		U_LOG_W("Created shared texture [%u]: handle=%p (NT handle)", i, shared_handle);
 
-		// Create SRV for compositor
+		// Create SRV for compositor. ADR-032: a LAYERED (arraySize>1) swapchain
+		// packs its eyes as array slices; a plain Texture2D SRV silently views
+		// slice 0, so create a whole-array Texture2DArray SRV instead (the
+		// blit reads the requested slice via blit_ps_array).
 		D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
 		srv_desc.Format = dxgi_format;
-		srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-		srv_desc.Texture2D.MipLevels = tex_desc.MipLevels;
+		if (tex_desc.ArraySize > 1) {
+			srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+			srv_desc.Texture2DArray.MostDetailedMip = 0;
+			srv_desc.Texture2DArray.MipLevels = tex_desc.MipLevels;
+			srv_desc.Texture2DArray.FirstArraySlice = 0;
+			srv_desc.Texture2DArray.ArraySize = tex_desc.ArraySize;
+		} else {
+			srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+			srv_desc.Texture2D.MipLevels = tex_desc.MipLevels;
+		}
 
 		hr = sys->device->CreateShaderResourceView(
 		    sc->images[i].texture.get(), &srv_desc, sc->images[i].srv.put());
@@ -3806,10 +3850,22 @@ compositor_import_swapchain(struct xrt_compositor *xc,
 		D3D11_TEXTURE2D_DESC desc;
 		sc->images[i].texture->GetDesc(&desc);
 
+		// ADR-032: a LAYERED (arraySize>1) swapchain — e.g. a D3D12 IPC client
+		// submitting an SPI/array swapchain with its two eyes as slices 0/1 —
+		// needs a whole-array Texture2DArray SRV. A plain Texture2D SRV views
+		// only slice 0, so both eyes would sample the LEFT image.
 		D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
 		srv_desc.Format = desc.Format;
-		srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-		srv_desc.Texture2D.MipLevels = 1;
+		if (desc.ArraySize > 1) {
+			srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+			srv_desc.Texture2DArray.MostDetailedMip = 0;
+			srv_desc.Texture2DArray.MipLevels = 1;
+			srv_desc.Texture2DArray.FirstArraySlice = 0;
+			srv_desc.Texture2DArray.ArraySize = desc.ArraySize;
+		} else {
+			srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+			srv_desc.Texture2D.MipLevels = 1;
+		}
 
 		hr = sys->device->CreateShaderResourceView(
 		    sc->images[i].texture.get(), &srv_desc, sc->images[i].srv.put());
@@ -10382,6 +10438,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			}
 		}
 
+
 		for (uint32_t eye = 0; eye < proj_view_count; eye++) {
 			// Phase 1 Task 1.2 — mutex acquire timed out earlier;
 			// the source texture is unsafe to read. Leave the per-
@@ -10461,6 +10518,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			bool use_srgb_shader = can_shader_blit && view_is_srgb[eye] && !sys->workspace_mode;
 			bool use_scale_shader = can_shader_blit && needs_scale && sys->workspace_mode;
 
+			// ADR-032: a LAYERED (arraySize>1) source packs its eyes as array
+			// slices. Every array-aware path samples slice `sub.array_index`;
+			// single-layer sources (ArraySize==1) keep the byte-identical
+			// Texture2D path. The raw-copy fallback already selects the source
+			// subresource via `sub.array_index`, so it needs no change.
+			bool is_layered = view_descs[eye].ArraySize > 1;
+			uint32_t src_slice = static_cast<uint32_t>(layer->data.proj.v[eye].sub.array_index);
+
 			if (use_srgb_shader) {
 				// Non-workspace SRGB: shader blit with SRGB SRV for linearization.
 				// The GPU auto-linearizes when sampling through an SRGB SRV.
@@ -10468,9 +10533,18 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				wil::com_ptr<ID3D11ShaderResourceView> srgb_srv;
 				D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
 				srv_desc.Format = get_srgb_format(view_descs[eye].Format);
-				srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-				srv_desc.Texture2D.MipLevels = 1;
-				srv_desc.Texture2D.MostDetailedMip = 0;
+				if (is_layered) {
+					// Whole-array SRGB SRV so the array PS can select the slice.
+					srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+					srv_desc.Texture2DArray.MostDetailedMip = 0;
+					srv_desc.Texture2DArray.MipLevels = 1;
+					srv_desc.Texture2DArray.FirstArraySlice = 0;
+					srv_desc.Texture2DArray.ArraySize = view_descs[eye].ArraySize;
+				} else {
+					srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+					srv_desc.Texture2D.MipLevels = 1;
+					srv_desc.Texture2D.MostDetailedMip = 0;
+				}
 				HRESULT blit_hr = sys->device->CreateShaderResourceView(
 				    view_textures[eye], &srv_desc, srgb_srv.put());
 				if (SUCCEEDED(blit_hr)) {
@@ -10478,7 +10552,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					    src_x, src_y, src_w, src_h,
 					    (float)view_descs[eye].Width, (float)view_descs[eye].Height,
 					    (float)tile_x, (float)tile_y,
-					    dst_w, dst_h, true);
+					    dst_w, dst_h, true,
+					    /*blend=*/nullptr, /*rtv_override=*/nullptr,
+					    /*dst_tex_w=*/0.0f, /*dst_tex_h=*/0.0f,
+					    /*is_array=*/is_layered, /*array_slice=*/src_slice);
 				} else {
 					// Fallback to raw copy
 					D3D11_BOX box = {};
@@ -10494,13 +10571,17 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				// shader using the default (non-SRGB) SRV so sampling reads
 				// raw bytes and writes them unmodified — keeps the per-client
 				// atlas in gamma space, matching the raw-copy path that
-				// multi_compositor_render expects.
+				// multi_compositor_render expects. The per-image SRV is already
+				// a Texture2DArray for layered sources (ADR-032, create/import).
 				blit_to_atlas_texture(sys, &c->render,
 				    view_scs[eye]->images[view_img_indices[eye]].srv.get(),
 				    src_x, src_y, src_w, src_h,
 				    (float)view_descs[eye].Width, (float)view_descs[eye].Height,
 				    (float)tile_x, (float)tile_y,
-				    dst_w, dst_h, false);
+				    dst_w, dst_h, false,
+				    /*blend=*/nullptr, /*rtv_override=*/nullptr,
+				    /*dst_tex_w=*/0.0f, /*dst_tex_h=*/0.0f,
+				    /*is_array=*/is_layered, /*array_slice=*/src_slice);
 			} else {
 				// Non-SRGB, or workspace mode with content already fitting the
 				// tile, or shader unavailable: raw byte copy. Multi-comp
@@ -10521,6 +10602,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				    layer->data.proj.v[eye].sub.array_index,  // src subresource
 				    &box);
 			}
+
 		}
 		} // !zero_copy
 
