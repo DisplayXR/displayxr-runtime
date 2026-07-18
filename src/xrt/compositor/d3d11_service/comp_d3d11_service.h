@@ -980,6 +980,21 @@ comp_d3d11_service_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd);
  *   each rect's SBS content at that rect's own window position; every rect is
  *   woven into the shared output and the fence is signaled ONCE after the
  *   last rect. @p rect_x/y/w/h are ignored.
+ *
+ * v4 overlay atlas (browser#18): when @p overlay_handle is valid it is a
+ * window-sized premultiplied-alpha RGBA atlas composited OVER the woven output
+ * (final = woven*(1 - a) + overlay) before the fence is signaled — reusing the
+ * DP's Local2D/masked-composite leg. @p overlay_rect_count 0 = whole atlas.
+ * Pass XRT_GRAPHICS_BUFFER_HANDLE_INVALID for no overlay.
+ *
+ * v5 firstChunk (browser#22): when @p weave_frame_first is true the woven
+ * output is cleared to premultiplied transparent (0,0,0,0) BEFORE process_atlas,
+ * so regions between the woven tiles are transparent (not stale from a prior
+ * frame). A present-owner sets it on the first submit of a frame so it can draw
+ * the woven output back WHOLE-WINDOW (opaque tiles replace the page, transparent
+ * gaps show it). false (the legacy default) keeps the accumulate-and-draw-back-
+ * only-your-own-tiles behavior; a frame split across multiple submits sets it on
+ * the first submit alone.
  */
 bool
 comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
@@ -991,6 +1006,11 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                uint32_t rect_h,
                                uint32_t rect_count,
                                const struct xrt_rect *rects,
+                               xrt_graphics_buffer_handle_t overlay_handle,
+                               bool overlay_is_dxgi,
+                               uint32_t overlay_rect_count,
+                               const struct xrt_rect *overlay_rects,
+                               bool weave_frame_first,
                                uint32_t *out_width,
                                uint32_t *out_height,
                                uint64_t *out_fence_value,

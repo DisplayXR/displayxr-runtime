@@ -779,6 +779,25 @@ struct ipc_arg_weave_submit
 	uint32_t rect_h; //!< Legacy sub-rect height in pixels
 	uint32_t rect_count; //!< 0 = legacy layout (rect_x/y/w/h); 1..MAX = batch layout (rects[])
 	struct ipc_weave_rect rects[IPC_WEAVE_SUBMIT_RECTS_MAX]; //!< Batch rects (first rect_count valid)
+
+	//! XR_DXR_weave v4 (browser#18): DP-composited 2D overlay atlas. When
+	//! @c have_overlay is non-zero a SECOND in_handle (index 1) rides the call:
+	//! a window-sized premultiplied-alpha RGBA atlas the runtime composites OVER
+	//! the woven output (final = woven*(1 - a) + overlay). The whole atlas is
+	//! composited (premul alpha is authoritative), so per-overlay scope rects are
+	//! NOT carried on the wire — the message must stay within IPC_BUF_SIZE (a
+	//! second rects[] array would overflow it). @c overlay_rect_count is retained
+	//! as a forward-compat hint count only; the rects themselves ride a future
+	//! transport if scoping is ever needed.
+	uint32_t have_overlay;       //!< 0 = no overlay (one in_handle); 1 = overlay atlas is handles[1]
+	uint32_t overlay_rect_count; //!< forward-compat hint; rects not carried on the wire (whole-atlas composite)
+
+	//! XR_DXR_weave v5 (browser#22): 1 = first submit of the frame — the runtime
+	//! clears its window-sized woven output to premultiplied transparent (0,0,0,0)
+	//! before weaving this submit's rects, so gaps between tiles are transparent
+	//! (not stale) and the caller can draw the woven output back WHOLE-WINDOW.
+	//! 0 (default) = legacy: no clear, later submits of a >MAX-rect frame accumulate.
+	uint32_t weave_frame_first;
 };
 
 /*!

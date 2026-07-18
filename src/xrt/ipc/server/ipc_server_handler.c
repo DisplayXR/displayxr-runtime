@@ -5648,6 +5648,22 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 		rects[i].extent.h = (int)args->rects[i].h;
 	}
 
+	// v4 overlay atlas (browser#18): when have_overlay is set the second
+	// in_handle is a window-sized premul-RGBA atlas the runtime composites over
+	// the weave. Decode its DXGI-vs-NT tag like the input handle. Per-overlay
+	// scope rects are not carried on the wire (whole-atlas composite).
+	xrt_graphics_buffer_handle_t overlay_handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	bool overlay_is_dxgi = false;
+	if (args->have_overlay && handle_count >= 2) {
+		overlay_handle = handles[1];
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+		if ((size_t)overlay_handle & 1) {
+			overlay_handle = (HANDLE)((size_t)overlay_handle - 1);
+			overlay_is_dxgi = true;
+		}
+#endif
+	}
+
 	uint32_t w = 0, h = 0;
 	uint64_t fv = 0;
 	struct xrt_eye_positions eyes = {0};
@@ -5655,6 +5671,9 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	    ics->xc, in_handle, in_is_dxgi,                         //
 	    args->rect_x, args->rect_y, args->rect_w, args->rect_h, //
 	    args->rect_count, args->rect_count > 0 ? rects : NULL,  //
+	    overlay_handle, overlay_is_dxgi,                        //
+	    args->overlay_rect_count, NULL,                         //
+	    args->weave_frame_first != 0,                           //
 	    &w, &h, &fv, &eyes);
 	if (!ok) {
 		return XRT_ERROR_IPC_FAILURE;
@@ -5669,6 +5688,12 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	// handles[0] is the retained IOSurfaceRef the IPC receive looked up; the
 	// weave engine takes ownership (adopts it into its import cache or
 	// releases it). No DXGI low-bit tag exists on POSIX handles.
+	// v4 overlay atlas is Windows-only for now: the macOS weave engine ignores
+	// it, so release any second retained handle here to avoid leaking it.
+	if (args->have_overlay && handle_count >= 2) {
+		xrt_graphics_buffer_handle_t overlay = handles[1];
+		u_graphics_buffer_unref(&overlay);
+	}
 	if (args->rect_count > IPC_WEAVE_SUBMIT_RECTS_MAX) {
 		xrt_graphics_buffer_handle_t reject = handles[0];
 		u_graphics_buffer_unref(&reject); // don't leak the retained IOSurfaceRef
