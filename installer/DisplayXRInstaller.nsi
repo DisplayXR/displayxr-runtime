@@ -95,8 +95,8 @@ ShowUninstDetails show
 
 !define MUI_ABORTWARNING
 ; White icon so the installer .exe is visible in dark mode Explorer/taskbar
-!define MUI_ICON "${SOURCE_DIR}\assets\displayxr_white.ico"
-!define MUI_UNICON "${SOURCE_DIR}\assets\displayxr_white.ico"
+!define MUI_ICON "${SOURCE_DIR}\assets\displayxr_app.ico"
+!define MUI_UNICON "${SOURCE_DIR}\assets\displayxr_app.ico"
 
 ;--------------------------------
 ; Pages
@@ -791,7 +791,7 @@ Section "DisplayXR Runtime" SecRuntime
 	WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXR" \
 		"InstallLocation" "$INSTDIR"
 	WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXR" \
-		"DisplayIcon" "$INSTDIR\DisplayXRClient.dll"
+		"DisplayIcon" "$INSTDIR\displayxr-service.exe"
 	WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXR" \
 		"Publisher" "DisplayXR"
 	WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXR" \
