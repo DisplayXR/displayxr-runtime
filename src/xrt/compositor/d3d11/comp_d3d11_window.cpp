@@ -1202,15 +1202,30 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 						    w->last_click_target == fwd &&
 						    (now - w->last_click_time_ms) <= GetDoubleClickTime() &&
 						    dx >= -cxd && dx <= cxd && dy >= -cyd && dy <= cyd;
+						// Only promote if the target class opted into
+						// double-clicks. Win32 replaces the second DOWN with
+						// WM_*BUTTONDBLCLK for CS_DBLCLKS windows *only*;
+						// everything else legitimately expects a plain second
+						// DOWN and derives its own click count from the DOWN
+						// stream (SDL, and any app with a click-timing
+						// heuristic). Promoting unconditionally made that
+						// second click vanish into DefWindowProc.
+						bool target_wants_dbl =
+						    (GetClassLongPtrW(fwd, GCL_STYLE) & CS_DBLCLKS) != 0;
 						if (is_dbl) {
-							switch (evt_button) {
-							case 1: post_msg = WM_LBUTTONDBLCLK; break;
-							case 2: post_msg = WM_RBUTTONDBLCLK; break;
-							case 3: post_msg = WM_MBUTTONDBLCLK; break;
-							default: break;
+							if (target_wants_dbl) {
+								switch (evt_button) {
+								case 1: post_msg = WM_LBUTTONDBLCLK; break;
+								case 2: post_msg = WM_RBUTTONDBLCLK; break;
+								case 3: post_msg = WM_MBUTTONDBLCLK; break;
+								default: break;
+								}
 							}
 							// Consume the pair so a triple-click's third press
 							// starts a fresh single click (standard behavior).
+							// Done for both targets: a non-CS_DBLCLKS window
+							// still gets a plain DOWN here, it just isn't
+							// promoted.
 							w->last_click_button = 0;
 							w->last_click_target = NULL;
 						} else {
