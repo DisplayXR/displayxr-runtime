@@ -107,6 +107,17 @@ transparency between elements is carried by the caller's own atlas alpha.
 
 Omitting the chain keeps v3/v4/v5 behaviour byte-for-byte.
 
+**Compatibility — gate on `extensionVersion >= 6`, and gate the ASSEMBLY, not just the
+chain.** v6 is additive, so it is *invisible* to an older runtime: a v5 runtime silently
+skips the unknown `XrWeaveSubmitLayoutDXR`, then takes the batch path and interprets
+`inputTexture` as **window-sized with each rect's content squeezed SBS at its own window
+position**. Handing that runtime a display-worst-case-sized N-view atlas is a silent
+misinterpretation — different dimensions *and* a different content model — not a graceful
+fallback. The chain therefore cannot self-negotiate; `XrExtensionProperties::extensionVersion`
+is the only signal that the runtime will honour the layout. A caller supporting both must
+assemble the **v3/v4/v5 per-rect SBS input** when the runtime reports `< 6`, and the N-view
+atlas only when it reports `>= 6`.
+
 ## 3. Why batch (the scaling wall)
 
 Each submit carries a fixed cost independent of the rect area: the runtime IPC round-trip,
