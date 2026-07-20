@@ -37,7 +37,7 @@ Rules:
 | 1004999160–166 | `XR_DXR_local_3d_zone` | relocated from 130–136 (collided with mcp_tools) — spec v4 |
 | 1004999170–171 | `XR_DXR_atlas_capture` | relocated from 120–121 (collided with workspace_file_dialog) — spec v3 |
 | 1004999180 | `XR_DXR_macos_gl_binding` | relocated from 1004999010 (collided with display_info) — spec v2 |
-| 1004999190–193 | `XR_DXR_weave` | 190 = `XR_TYPE_WEAVE_SUBMIT_INFO_DXR`, 191 = `XR_TYPE_WEAVE_OUTPUT_DXR` (#625), 192 = `XR_TYPE_WEAVE_SUBMIT_RECTS_DXR` (batch, spec v3), 193 = `XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR` (2D overlay atlas, spec v4, browser#18) |
+| 1004999190–194 | `XR_DXR_weave` | 190 = `XR_TYPE_WEAVE_SUBMIT_INFO_DXR`, 191 = `XR_TYPE_WEAVE_OUTPUT_DXR` (#625), 192 = `XR_TYPE_WEAVE_SUBMIT_RECTS_DXR` (batch, spec v3), 193 = `XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR` (2D overlay atlas, spec v4, browser#18), 194 = `XR_TYPE_WEAVE_SUBMIT_LAYOUT_DXR` (N-view worst-case atlas, spec v6, #774) |
 | 1004999200–209 | `XR_DXR_xlib_window_binding` | 200 = `XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR` (#660 Phase 3) |
 | 1004999210–219 | `XR_DXR_display_info` (v16+ additions) | 210 = `XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR` (#715); fresh decade rather than reusing the 005/009 gaps in the original block |
 | 1004999220+ | **next free** | |

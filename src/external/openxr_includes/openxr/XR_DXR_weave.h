@@ -134,7 +134,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 5
+#define XR_DXR_weave_SPEC_VERSION 6
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
 // Reserved 1004999190..193. Final values reconcile with the Khronos registry
@@ -143,6 +143,7 @@ extern "C" {
 #define XR_TYPE_WEAVE_OUTPUT_DXR          ((XrStructureType)1004999191)
 #define XR_TYPE_WEAVE_SUBMIT_RECTS_DXR    ((XrStructureType)1004999192)
 #define XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR ((XrStructureType)1004999193)
+#define XR_TYPE_WEAVE_SUBMIT_LAYOUT_DXR   ((XrStructureType)1004999194)
 
 //! Upper bound on eye positions carried by XrWeaveSubmitInfoDXR (mirrors the
 //! runtime's XRT_MAX_VIEWS). Phase 1: carried but unused.
@@ -209,6 +210,49 @@ typedef struct XrWeaveSubmitRectsDXR {
     uint32_t                 rectCount; //!< 1..XR_WEAVE_SUBMIT_MAX_RECTS_DXR
     const XrRect2Di*         rects;     //!< window-relative sub-rects, device px (y-down)
 } XrWeaveSubmitRectsDXR;
+
+/*!
+ * @brief N-view worst-case atlas input layout (spec v6, #774).
+ *
+ * Chain onto XrWeaveSubmitInfoDXR::next. When present it REPLACES the squeezed
+ * per-rect SBS contract of XrWeaveSubmitRectsDXR with the same atlas layout every
+ * other DisplayXR app already uses (ADR-010 worst-case swapchain + ADR-030
+ * crop-before-DP), so the caller becomes an ordinary N-view client:
+ *
+ *  - @c inputTexture is a WORST-CASE-sized atlas — max over every rendering mode
+ *    of (tileColumns * viewScaleX * displayWidth) x (tileRows * viewScaleY *
+ *    displayHeight), spanning both orientations for modes that can rotate. Size it
+ *    from the DISPLAY, not the current window, so window resize / fullscreen never
+ *    reallocates. NOTE: this max is NOT bounded by the display size — a mode with
+ *    viewScaleX 1.0 and tileColumns 2 yields a 2*W x H atlas.
+ *  - Tiles are packed CONTIGUOUSLY from the top-left at (@c contentViewWidth,
+ *    @c contentViewHeight) — tile v sits at ((v % tileColumns) * contentViewWidth,
+ *    (v / tileColumns) * contentViewHeight). The stride is the CONTENT size, not
+ *    atlasWidth / tileColumns. Everything right of / below the packed region is
+ *    dead space the runtime never reads.
+ *  - @c contentViewWidth / @c contentViewHeight are the bound window's client size
+ *    scaled by the ACTIVE mode's viewScaleX / viewScaleY. Each visible element is
+ *    drawn inside tile v at its own window position scaled by the same factors.
+ *
+ * With this chained, XrWeaveSubmitRectsDXR::rects become a scope hint (zone /
+ * wish-mask publication and the caller's own draw-back region) rather than a
+ * layout input, so XR_WEAVE_SUBMIT_MAX_RECTS_DXR no longer bounds how many
+ * elements a frame may contain.
+ *
+ * The runtime hands the atlas to the display processor as-is when it exactly
+ * fills the active mode's atlas (zero-copy), otherwise it crops the packed
+ * region first. Callers that omit this struct keep the spec v3/v4/v5 behaviour
+ * byte-for-byte.
+ */
+typedef struct XrWeaveSubmitLayoutDXR {
+    XrStructureType          type;              //!< XR_TYPE_WEAVE_SUBMIT_LAYOUT_DXR
+    const void* XR_MAY_ALIAS next;
+    uint32_t                 viewCount;         //!< active mode view count; must equal tileColumns * tileRows
+    uint32_t                 tileColumns;       //!< active mode atlas grid columns
+    uint32_t                 tileRows;          //!< active mode atlas grid rows
+    uint32_t                 contentViewWidth;  //!< per-tile content width  = windowWidth  * mode viewScaleX
+    uint32_t                 contentViewHeight; //!< per-tile content height = windowHeight * mode viewScaleY
+} XrWeaveSubmitLayoutDXR;
 
 /*!
  * @brief DP-composited 2D overlay atlas — crisp 2D painted OVER the weave (spec v4).

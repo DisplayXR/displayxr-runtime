@@ -995,6 +995,17 @@ comp_d3d11_service_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd);
  * gaps show it). false (the legacy default) keeps the accumulate-and-draw-back-
  * only-your-own-tiles behavior; a frame split across multiple submits sets it on
  * the first submit alone.
+ *
+ * v6 N-view atlas (#774): a non-NULL @p layout with view_count > 0 REPLACES the
+ * batch path's per-rect squeezed-SBS contract with the layout every other
+ * DisplayXR app uses. @p in_handle is then a worst-case-sized multiview atlas
+ * (ADR-010) with tiles packed contiguously from the top-left at
+ * layout->content_view_w/h, so the runtime skips the per-rect unpack blits
+ * entirely and either hands the atlas to the DP as-is (zero-copy, when it
+ * exactly fills the active mode's atlas per ADR-030) or crops the packed region
+ * first. @p rects then carry only a scope hint (zone mask / caller draw-back),
+ * so XR_WEAVE_SUBMIT_MAX_RECTS_DXR stops bounding elements per frame. NULL (or
+ * view_count 0) keeps the v3/v4/v5 behavior byte-for-byte.
  */
 bool
 comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
@@ -1011,6 +1022,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                uint32_t overlay_rect_count,
                                const struct xrt_rect *overlay_rects,
                                bool weave_frame_first,
+                               const struct xrt_weave_atlas_layout *layout,
                                uint32_t *out_width,
                                uint32_t *out_height,
                                uint64_t *out_fence_value,

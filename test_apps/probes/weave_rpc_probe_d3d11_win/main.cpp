@@ -77,6 +77,18 @@ static uint32_t g_sbsW = 0, g_sbsH = 0; //!< window-sized SBS input (batch layou
 // Latest tracked per-eye horizontal position (metres, display space) returned by
 // the previous weave_submit; drives this frame's off-axis parallax. [0]=L [1]=R.
 static float g_lastEyeX[2] = {0.0f, 0.0f};
+// DXR_WEAVE_V6=1 switches the input to the v6 N-view worst-case atlas layout
+// (#774) instead of the v3/v4/v5 per-rect squeezed SBS. Opt-in so the default
+// run still regression-covers the shipped path.
+static bool g_useV6 = false;
+// v6 layout, operator-supplied so the harness can drive ANY vendor grid without
+// re-plumbing: DXR_WEAVE_V6_GRID=CxR (default 2x1) and DXR_WEAVE_V6_SCALE=SXxSY
+// (default 0.5x1.0). E.g. sim_display Quad = GRID=2x2 SCALE=0.5x0.5.
+// A real client reads these from the ACTIVE XrDisplayRenderingModeInfoDXR
+// instead; this is a runtime harness, not a model app.
+static uint32_t g_v6Cols = 2, g_v6Rows = 1;
+static bool g_v6Exact = false; //!< DXR_WEAVE_V6_EXACT=1 -> atlas == packed region (zero-copy branch)
+static float g_v6ScaleX = 0.5f, g_v6ScaleY = 1.0f;
 
 // v4 overlay atlas (browser#18): a window-sized premultiplied-alpha 2D layer the
 // DP composites OVER the woven output. Painted ONCE (a static crisp 2D badge that
@@ -403,6 +415,90 @@ RenderSbsLookAround(float eyeLx, float eyeRx, int32_t rx, int32_t ry, int32_t rw
 	g_sbsMutex->ReleaseSync(0);
 }
 
+// v6 N-view atlas layout (#774): render the SAME scene into a worst-case-sized
+// multiview atlas instead of per-rect squeezed SBS — the layout every native
+// handle app uses (ADR-010 / ADR-030).
+//
+// The atlas is deliberately allocated LARGER than this mode's packed region
+// (2*cw wide vs the cw the 2x1 grid at scaleX 0.5 actually fills) so the
+// runtime's crop-before-DP branch is the one under test; a caller whose
+// worst-case mode happens to fill the atlas exactly gets the zero-copy branch
+// instead. Tiles are packed CONTIGUOUSLY from the top-left at
+// (content_w, content_h) — NOT at atlas_w/tile_columns.
+//
+// Per-view content is (rw*scaleX, rh*scaleY) at (rx*scaleX, ry*scaleY) inside
+// its tile, so at scale (0.5, 1.0) this carries exactly the same pixel budget
+// as the v5 path above — the woven result should be indistinguishable, which is
+// the regression assertion for N=2.
+static void
+RenderNViewLookAround(float eyeLx,
+                      float eyeRx,
+                      int32_t rx,
+                      int32_t ry,
+                      int32_t rw,
+                      int32_t rh,
+                      uint32_t contentW,
+                      uint32_t contentH)
+{
+	if (!g_sbsRtv || !g_sbsMutex) {
+		return;
+	}
+	if (g_sbsMutex->AcquireSync(0, 1000) != S_OK) {
+		return;
+	}
+	const float gap[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	const float bg[4] = {0.10f, 0.10f, 0.12f, 1.0f};
+	const float farCol[4] = {0.15f, 0.80f, 0.20f, 1.0f};
+	const float nearCol[4] = {0.90f, 0.20f, 0.15f, 1.0f};
+	const float kFar = 200.0f;
+	const float kNear = 900.0f;
+	const float eyeX[2] = {eyeLx, eyeRx};
+
+	const float sx = g_v6ScaleX;
+	const float sy = g_v6ScaleY;
+	const uint32_t nviews = g_v6Cols * g_v6Rows;
+
+	// Whole atlas transparent — including the dead space beyond the packed
+	// region, which the runtime never reads but which must not be stale.
+	g_context->ClearView(g_sbsRtv.Get(), gap, nullptr, 0);
+
+	for (uint32_t v = 0; v < nviews; v++) {
+		// Tile origin at CONTENT stride, contiguous from the top-left.
+		const int32_t tx = (int32_t)((v % g_v6Cols) * contentW);
+		const int32_t ty = (int32_t)((v / g_v6Cols) * contentH);
+		// The element at its own window position, scaled into the tile.
+		const int32_t ex = tx + (int32_t)(rx * sx);
+		const int32_t ey = ty + (int32_t)(ry * sy);
+		const int32_t ew = (int32_t)(rw * sx);
+		const int32_t eh = (int32_t)(rh * sy);
+
+		D3D11_RECT elemR = {ex, ey, ex + ew, ey + eh};
+		g_context->ClearView(g_sbsRtv.Get(), bg, &elemR, 1);
+
+		// Per-view eye x: interpolate across the L..R span so an N>2 grid gets a
+		// visibly distinct parallax per tile. For nviews==2 this is exactly
+		// {eyeLx, eyeRx}, so the 2-view result is unchanged. A real client uses
+		// the N viewer poses the runtime returns instead of interpolating.
+		const float t = (nviews > 1) ? (float)v / (float)(nviews - 1) : 0.5f;
+		const float ev = eyeX[0] + (eyeX[1] - eyeX[0]) * t;
+
+		int32_t fcx = ex + ew / 2 + (int32_t)(-kFar * ev * sx);
+		int32_t fcy = ey + eh / 2;
+		D3D11_RECT farR = {fcx - (int32_t)(60 * sx), fcy - (int32_t)(90 * sy), fcx + (int32_t)(60 * sx),
+		                   fcy + (int32_t)(90 * sy)};
+		g_context->ClearView(g_sbsRtv.Get(), farCol, &farR, 1);
+
+		int32_t ncx = ex + ew / 2 + (int32_t)(-kNear * ev * sx);
+		int32_t ncy = ey + eh / 2;
+		D3D11_RECT nearR = {ncx - (int32_t)(40 * sx), ncy - (int32_t)(60 * sy), ncx + (int32_t)(40 * sx),
+		                    ncy + (int32_t)(60 * sy)};
+		g_context->ClearView(g_sbsRtv.Get(), nearCol, &nearR, 1);
+	}
+
+	g_context->Flush();
+	g_sbsMutex->ReleaseSync(0);
+}
+
 // ---- Open the runtime's exported weaved texture + fence ----------------------
 static bool
 OpenWeavedHandback(const XrWeaveOutputDXR &out)
@@ -534,6 +630,37 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 	InitializeLogging("weave_rpc_probe_d3d11_win");
 	LOG_INFO("=== XR_DXR_weave probe (#625) starting ===");
 
+	{
+		char buf[8] = {0};
+		DWORD n = GetEnvironmentVariableA("DXR_WEAVE_V6", buf, (DWORD)sizeof(buf));
+		g_useV6 = (n > 0 && n < sizeof(buf) && buf[0] == '1');
+	}
+	if (g_useV6) {
+		char buf[32] = {0};
+		DWORD n = GetEnvironmentVariableA("DXR_WEAVE_V6_GRID", buf, (DWORD)sizeof(buf));
+		unsigned c = 0, r = 0;
+		if (n > 0 && n < sizeof(buf) && sscanf_s(buf, "%ux%u", &c, &r) == 2 && c > 0 && r > 0) {
+			g_v6Cols = c;
+			g_v6Rows = r;
+		}
+		buf[0] = '\0';
+		n = GetEnvironmentVariableA("DXR_WEAVE_V6_EXACT", buf, (DWORD)sizeof(buf));
+		g_v6Exact = (n > 0 && n < sizeof(buf) && buf[0] == '1');
+		buf[0] = '\0';
+		n = GetEnvironmentVariableA("DXR_WEAVE_V6_SCALE", buf, (DWORD)sizeof(buf));
+		float sx = 0.0f, sy = 0.0f;
+		if (n > 0 && n < sizeof(buf) && sscanf_s(buf, "%fx%f", &sx, &sy) == 2 && sx > 0.0f && sy > 0.0f) {
+			g_v6ScaleX = sx;
+			g_v6ScaleY = sy;
+		}
+	}
+	LOG_INFO("Input layout: %s", g_useV6 ? "v6 N-view worst-case atlas (#774)"
+	                                      : "v3/v4/v5 per-rect squeezed SBS");
+	if (g_useV6) {
+		LOG_INFO("  v6 grid=%ux%u views=%u scale=%.3fx%.3f atlas=%s", g_v6Cols, g_v6Rows,
+		         g_v6Cols * g_v6Rows, g_v6ScaleX, g_v6ScaleY, g_v6Exact ? "exact (zero-copy)" : "oversized (crop)");
+	}
+
 	XrSessionManager xr;
 	if (!InitializeOpenXR(xr)) {
 		return 1;
@@ -617,17 +744,41 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		int32_t rx = (cw - (int32_t)rw) / 2;
 		int32_t ry = (ch - (int32_t)rh) / 2;
 
-		// v5 batch: the SBS input is window-sized with the element at its window
-		// position, so the runtime takes the batch weave path + firstChunk clear.
-		if (!EnsureSbsTexture((uint32_t)cw, (uint32_t)ch)) {
-			Sleep(100);
-			continue;
-		}
+		// v6 (#774) is opt-in via DXR_WEAVE_V6=1 so the default run keeps
+		// exercising the shipped v3/v4/v5 batch path unchanged.
+		const uint32_t v6ContentW = (uint32_t)(cw * g_v6ScaleX);
+		const uint32_t v6ContentH = (uint32_t)(ch * g_v6ScaleY);
 
-		// Render this frame's pre-weave SBS pair off-axis from the eyes the
-		// runtime returned LAST frame (look-around / virtual-camera motion), into
-		// the element's window-relative rect (rest of the window = transparent gap).
-		RenderSbsLookAround(g_lastEyeX[0], g_lastEyeX[1], rx, ry, (int32_t)rw, (int32_t)rh);
+		if (g_useV6) {
+			// Atlas sizing selects which runtime branch is under test:
+			//   default            — deliberately LARGER than the packed region
+			//                        (cols*contentW x rows*contentH) => CROP branch.
+			//   DXR_WEAVE_V6_EXACT=1 — exactly the packed region => ZERO-COPY branch.
+			// A real client sizes worst-case over ALL modes from the display (#774),
+			// which lands on crop for every mode but the worst-case-achieving one.
+			const uint32_t packedW = g_v6Cols * v6ContentW;
+			const uint32_t packedH = g_v6Rows * v6ContentH;
+			const uint32_t atlasW = g_v6Exact ? packedW : (uint32_t)cw * 2;
+			const uint32_t atlasH = g_v6Exact ? packedH : (uint32_t)ch * 2;
+			if (!EnsureSbsTexture(atlasW, atlasH)) {
+				Sleep(100);
+				continue;
+			}
+			RenderNViewLookAround(g_lastEyeX[0], g_lastEyeX[1], rx, ry, (int32_t)rw, (int32_t)rh,
+			                      v6ContentW, v6ContentH);
+		} else {
+			// v5 batch: the SBS input is window-sized with the element at its window
+			// position, so the runtime takes the batch weave path + firstChunk clear.
+			if (!EnsureSbsTexture((uint32_t)cw, (uint32_t)ch)) {
+				Sleep(100);
+				continue;
+			}
+
+			// Render this frame's pre-weave SBS pair off-axis from the eyes the
+			// runtime returned LAST frame (look-around / virtual-camera motion), into
+			// the element's window-relative rect (rest of the window = transparent gap).
+			RenderSbsLookAround(g_lastEyeX[0], g_lastEyeX[1], rx, ry, (int32_t)rw, (int32_t)rh);
+		}
 
 		// v4: keep the overlay atlas sized to the window client area so the DP
 		// composites the 2D badge 1:1 over the woven output.
@@ -650,6 +801,19 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		rects.rects = &batchRect;
 		in.next = &rects;
 
+		// v6 (#774): declare the N-view atlas layout. With this chained the rect
+		// above degrades to a scope hint and the runtime skips the per-rect
+		// unpack blits entirely.
+		XrWeaveSubmitLayoutDXR lay = {XR_TYPE_WEAVE_SUBMIT_LAYOUT_DXR};
+		if (g_useV6) {
+			lay.viewCount = g_v6Cols * g_v6Rows;
+			lay.tileColumns = g_v6Cols;
+			lay.tileRows = g_v6Rows;
+			lay.contentViewWidth = v6ContentW;
+			lay.contentViewHeight = v6ContentH;
+			rects.next = &lay;
+		}
+
 		// Chain the 2D overlay atlas (browser#18 v4) so the DP composites it over
 		// the woven 3D. rectCount 0 = composite the whole (mostly-transparent) atlas.
 		XrWeaveSubmitOverlaysDXR ov = {XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR};
@@ -658,7 +822,13 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 			ov.overlayIsDxgi = XR_FALSE;
 			ov.rectCount = 0;
 			ov.rects = nullptr;
-			rects.next = &ov; // chain overlays after rects
+			// Append, don't overwrite — the v6 layout may already sit at
+			// rects.next (chain is rects -> layout -> overlays).
+			if (g_useV6) {
+				lay.next = &ov;
+			} else {
+				rects.next = &ov;
+			}
 		}
 
 		XrWeaveOutputDXR out = {XR_TYPE_WEAVE_OUTPUT_DXR};

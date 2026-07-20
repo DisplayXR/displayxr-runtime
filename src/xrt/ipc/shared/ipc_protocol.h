@@ -798,6 +798,21 @@ struct ipc_arg_weave_submit
 	//! (not stale) and the caller can draw the woven output back WHOLE-WINDOW.
 	//! 0 (default) = legacy: no clear, later submits of a >MAX-rect frame accumulate.
 	uint32_t weave_frame_first;
+
+	//! XR_DXR_weave v6 (#774): N-view worst-case atlas layout. When @c view_count
+	//! is non-zero the input texture is NOT per-rect squeezed SBS — it is a
+	//! worst-case-sized N-view atlas with tiles packed contiguously from the
+	//! top-left at (@c content_view_w, @c content_view_h), exactly like a native
+	//! handle app's swapchain (ADR-010 / ADR-030). The runtime hands it to the DP
+	//! as-is when it exactly fills the active mode's atlas, else crops the packed
+	//! region first; the per-rect unpack blits are skipped entirely. @c rects then
+	//! carry only a scope hint (zone mask / caller draw-back), not layout.
+	//! view_count 0 = spec v3/v4/v5 behaviour, byte-for-byte unchanged.
+	uint32_t view_count;      //!< 0 = legacy SBS layout; else active mode view count (== tile_columns * tile_rows)
+	uint32_t tile_columns;    //!< Active mode atlas grid columns
+	uint32_t tile_rows;       //!< Active mode atlas grid rows
+	uint32_t content_view_w;  //!< Per-tile content width  = window width  * mode view_scale_x
+	uint32_t content_view_h;  //!< Per-tile content height = window height * mode view_scale_y
 };
 
 /*!
