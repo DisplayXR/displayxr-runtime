@@ -77,6 +77,10 @@ static uint32_t g_sbsW = 0, g_sbsH = 0; //!< window-sized SBS input (batch layou
 // Latest tracked per-eye horizontal position (metres, display space) returned by
 // the previous weave_submit; drives this frame's off-axis parallax. [0]=L [1]=R.
 static float g_lastEyeX[2] = {0.0f, 0.0f};
+// DXR_WEAVE_V6=1 switches the input to the v6 N-view worst-case atlas layout
+// (#774) instead of the v3/v4/v5 per-rect squeezed SBS. Opt-in so the default
+// run still regression-covers the shipped path.
+static bool g_useV6 = false;
 
 // v4 overlay atlas (browser#18): a window-sized premultiplied-alpha 2D layer the
 // DP composites OVER the woven output. Painted ONCE (a static crisp 2D badge that
@@ -403,6 +407,83 @@ RenderSbsLookAround(float eyeLx, float eyeRx, int32_t rx, int32_t ry, int32_t rw
 	g_sbsMutex->ReleaseSync(0);
 }
 
+// v6 N-view atlas layout (#774): render the SAME scene into a worst-case-sized
+// multiview atlas instead of per-rect squeezed SBS — the layout every native
+// handle app uses (ADR-010 / ADR-030).
+//
+// The atlas is deliberately allocated LARGER than this mode's packed region
+// (2*cw wide vs the cw the 2x1 grid at scaleX 0.5 actually fills) so the
+// runtime's crop-before-DP branch is the one under test; a caller whose
+// worst-case mode happens to fill the atlas exactly gets the zero-copy branch
+// instead. Tiles are packed CONTIGUOUSLY from the top-left at
+// (content_w, content_h) — NOT at atlas_w/tile_columns.
+//
+// Per-view content is (rw*scaleX, rh*scaleY) at (rx*scaleX, ry*scaleY) inside
+// its tile, so at scale (0.5, 1.0) this carries exactly the same pixel budget
+// as the v5 path above — the woven result should be indistinguishable, which is
+// the regression assertion for N=2.
+static void
+RenderNViewLookAround(float eyeLx,
+                      float eyeRx,
+                      int32_t rx,
+                      int32_t ry,
+                      int32_t rw,
+                      int32_t rh,
+                      uint32_t contentW,
+                      uint32_t contentH)
+{
+	if (!g_sbsRtv || !g_sbsMutex) {
+		return;
+	}
+	if (g_sbsMutex->AcquireSync(0, 1000) != S_OK) {
+		return;
+	}
+	const float gap[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	const float bg[4] = {0.10f, 0.10f, 0.12f, 1.0f};
+	const float farCol[4] = {0.15f, 0.80f, 0.20f, 1.0f};
+	const float nearCol[4] = {0.90f, 0.20f, 0.15f, 1.0f};
+	const float kFar = 200.0f;
+	const float kNear = 900.0f;
+	const float eyeX[2] = {eyeLx, eyeRx};
+
+	// Window -> tile scale. Height is unscaled here (scaleY 1.0), width halves.
+	const float sx = (float)contentW / (float)(g_sbsW / 2); // contentW / window width
+	const float sy = (float)contentH / (float)g_sbsH;
+
+	// Whole atlas transparent — including the dead space beyond the packed
+	// region, which the runtime never reads but which must not be stale.
+	g_context->ClearView(g_sbsRtv.Get(), gap, nullptr, 0);
+
+	for (int v = 0; v < 2; v++) {
+		// Tile origin at CONTENT stride, contiguous from the top-left.
+		const int32_t tx = v * (int32_t)contentW;
+		const int32_t ty = 0;
+		// The element at its own window position, scaled into the tile.
+		const int32_t ex = tx + (int32_t)(rx * sx);
+		const int32_t ey = ty + (int32_t)(ry * sy);
+		const int32_t ew = (int32_t)(rw * sx);
+		const int32_t eh = (int32_t)(rh * sy);
+
+		D3D11_RECT elemR = {ex, ey, ex + ew, ey + eh};
+		g_context->ClearView(g_sbsRtv.Get(), bg, &elemR, 1);
+
+		int32_t fcx = ex + ew / 2 + (int32_t)(-kFar * eyeX[v] * sx);
+		int32_t fcy = ey + eh / 2;
+		D3D11_RECT farR = {fcx - (int32_t)(60 * sx), fcy - (int32_t)(90 * sy), fcx + (int32_t)(60 * sx),
+		                   fcy + (int32_t)(90 * sy)};
+		g_context->ClearView(g_sbsRtv.Get(), farCol, &farR, 1);
+
+		int32_t ncx = ex + ew / 2 + (int32_t)(-kNear * eyeX[v] * sx);
+		int32_t ncy = ey + eh / 2;
+		D3D11_RECT nearR = {ncx - (int32_t)(40 * sx), ncy - (int32_t)(60 * sy), ncx + (int32_t)(40 * sx),
+		                    ncy + (int32_t)(60 * sy)};
+		g_context->ClearView(g_sbsRtv.Get(), nearCol, &nearR, 1);
+	}
+
+	g_context->Flush();
+	g_sbsMutex->ReleaseSync(0);
+}
+
 // ---- Open the runtime's exported weaved texture + fence ----------------------
 static bool
 OpenWeavedHandback(const XrWeaveOutputDXR &out)
@@ -534,6 +615,14 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 	InitializeLogging("weave_rpc_probe_d3d11_win");
 	LOG_INFO("=== XR_DXR_weave probe (#625) starting ===");
 
+	{
+		char buf[8] = {0};
+		DWORD n = GetEnvironmentVariableA("DXR_WEAVE_V6", buf, (DWORD)sizeof(buf));
+		g_useV6 = (n > 0 && n < sizeof(buf) && buf[0] == '1');
+	}
+	LOG_INFO("Input layout: %s", g_useV6 ? "v6 N-view worst-case atlas (#774)"
+	                                      : "v3/v4/v5 per-rect squeezed SBS");
+
 	XrSessionManager xr;
 	if (!InitializeOpenXR(xr)) {
 		return 1;
@@ -617,17 +706,33 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		int32_t rx = (cw - (int32_t)rw) / 2;
 		int32_t ry = (ch - (int32_t)rh) / 2;
 
-		// v5 batch: the SBS input is window-sized with the element at its window
-		// position, so the runtime takes the batch weave path + firstChunk clear.
-		if (!EnsureSbsTexture((uint32_t)cw, (uint32_t)ch)) {
-			Sleep(100);
-			continue;
-		}
+		// v6 (#774) is opt-in via DXR_WEAVE_V6=1 so the default run keeps
+		// exercising the shipped v3/v4/v5 batch path unchanged.
+		const uint32_t v6ContentW = (uint32_t)(cw / 2); // window * scaleX (0.5)
+		const uint32_t v6ContentH = (uint32_t)ch;       // window * scaleY (1.0)
 
-		// Render this frame's pre-weave SBS pair off-axis from the eyes the
-		// runtime returned LAST frame (look-around / virtual-camera motion), into
-		// the element's window-relative rect (rest of the window = transparent gap).
-		RenderSbsLookAround(g_lastEyeX[0], g_lastEyeX[1], rx, ry, (int32_t)rw, (int32_t)rh);
+		if (g_useV6) {
+			// Worst-case-sized atlas: deliberately wider than this mode's packed
+			// region (2*cw vs cw) so the runtime's crop branch is under test.
+			if (!EnsureSbsTexture((uint32_t)cw * 2, (uint32_t)ch)) {
+				Sleep(100);
+				continue;
+			}
+			RenderNViewLookAround(g_lastEyeX[0], g_lastEyeX[1], rx, ry, (int32_t)rw, (int32_t)rh,
+			                      v6ContentW, v6ContentH);
+		} else {
+			// v5 batch: the SBS input is window-sized with the element at its window
+			// position, so the runtime takes the batch weave path + firstChunk clear.
+			if (!EnsureSbsTexture((uint32_t)cw, (uint32_t)ch)) {
+				Sleep(100);
+				continue;
+			}
+
+			// Render this frame's pre-weave SBS pair off-axis from the eyes the
+			// runtime returned LAST frame (look-around / virtual-camera motion), into
+			// the element's window-relative rect (rest of the window = transparent gap).
+			RenderSbsLookAround(g_lastEyeX[0], g_lastEyeX[1], rx, ry, (int32_t)rw, (int32_t)rh);
+		}
 
 		// v4: keep the overlay atlas sized to the window client area so the DP
 		// composites the 2D badge 1:1 over the woven output.
@@ -650,6 +755,19 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		rects.rects = &batchRect;
 		in.next = &rects;
 
+		// v6 (#774): declare the N-view atlas layout. With this chained the rect
+		// above degrades to a scope hint and the runtime skips the per-rect
+		// unpack blits entirely.
+		XrWeaveSubmitLayoutDXR lay = {XR_TYPE_WEAVE_SUBMIT_LAYOUT_DXR};
+		if (g_useV6) {
+			lay.viewCount = 2;
+			lay.tileColumns = 2;
+			lay.tileRows = 1;
+			lay.contentViewWidth = v6ContentW;
+			lay.contentViewHeight = v6ContentH;
+			rects.next = &lay;
+		}
+
 		// Chain the 2D overlay atlas (browser#18 v4) so the DP composites it over
 		// the woven 3D. rectCount 0 = composite the whole (mostly-transparent) atlas.
 		XrWeaveSubmitOverlaysDXR ov = {XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR};
@@ -658,7 +776,13 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 			ov.overlayIsDxgi = XR_FALSE;
 			ov.rectCount = 0;
 			ov.rects = nullptr;
-			rects.next = &ov; // chain overlays after rects
+			// Append, don't overwrite — the v6 layout may already sit at
+			// rects.next (chain is rects -> layout -> overlays).
+			if (g_useV6) {
+				lay.next = &ov;
+			} else {
+				rects.next = &ov;
+			}
 		}
 
 		XrWeaveOutputDXR out = {XR_TYPE_WEAVE_OUTPUT_DXR};
