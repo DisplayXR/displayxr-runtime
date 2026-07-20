@@ -60,6 +60,32 @@ struct xrt_eye_positions
 };
 
 /*!
+ * N-view atlas layout for an XR_DXR_weave submission (spec v6, #774).
+ *
+ * Describes a worst-case-sized multiview atlas the same way a native handle
+ * app's swapchain is laid out (ADR-010 sizing, ADR-030 crop-before-DP): tiles
+ * packed CONTIGUOUSLY from the top-left at (content_view_w, content_view_h),
+ * so tile v sits at ((v % tile_columns) * content_view_w,
+ * (v / tile_columns) * content_view_h). The stride is the CONTENT size, not
+ * atlas_width / tile_columns — everything right of / below the packed region is
+ * dead space the runtime never reads.
+ *
+ * @c view_count 0 means "no layout declared": the caller is using the legacy
+ * per-rect squeezed-SBS contract (weave spec v3/v4/v5) and the runtime keeps
+ * its previous behaviour byte-for-byte.
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_weave_atlas_layout
+{
+	uint32_t view_count;     //!< 0 = legacy SBS layout; else active mode view count (== tile_columns * tile_rows)
+	uint32_t tile_columns;   //!< Active mode atlas grid columns
+	uint32_t tile_rows;      //!< Active mode atlas grid rows
+	uint32_t content_view_w; //!< Per-tile content width  = window width  * mode view_scale_x
+	uint32_t content_view_h; //!< Per-tile content height = window height * mode view_scale_y
+};
+
+/*!
  * Window metrics for adaptive FOV calculation and eye position adjustment.
  *
  * Contains display and window geometry needed to compute window-adaptive

@@ -3,11 +3,11 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_weave` |
-| **Spec Version** | 3 |
+| **Spec Version** | 6 |
 | **Extension Type** | Instance extension (service path only — Windows/D3D11 + macOS/comp_multi-Vulkan, #759) |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_weave.h` (canonical; auto-syncs to `displayxr-extensions`) |
-| **Status** | Provisional (`1004999190–192` type block, pending Khronos registry) |
-| **Design history** | `docs/roadmap/webxr-step-b-design.md` §13.6–13.9, issue #625 |
+| **Status** | Provisional (`1004999190–194` type block, pending Khronos registry) |
+| **Design history** | `docs/roadmap/webxr-step-b-design.md` §13.6–13.9, issues #625, #774 |
 
 ## 1. What it is
 
@@ -63,6 +63,49 @@ typedef struct XrWeaveSubmitRectsDXR {
 `rectCount` outside `1..32` (or `rects == NULL`) is `XR_ERROR_VALIDATION_FAILURE`. Callers
 with more visible elements split into multiple batched submits; the weave fence is one
 monotonic timeline, so waiting the last chunk's fence value covers all chunks.
+
+## 2b. The N-view atlas layout (v6, #774)
+
+A chained `XrWeaveSubmitLayoutDXR` supersedes both layouts above with the one every
+other DisplayXR app already uses, making a present-owner an ordinary N-view client.
+
+```c
+typedef struct XrWeaveSubmitLayoutDXR {
+    XrStructureType    type;              // XR_TYPE_WEAVE_SUBMIT_LAYOUT_DXR (1004999194)
+    const void*        next;
+    uint32_t           viewCount;         // == tileColumns * tileRows
+    uint32_t           tileColumns;
+    uint32_t           tileRows;
+    uint32_t           contentViewWidth;  // windowWidth  * activeMode.viewScaleX
+    uint32_t           contentViewHeight; // windowHeight * activeMode.viewScaleY
+} XrWeaveSubmitLayoutDXR;
+```
+
+**Sizing (once, from the display).** `inputTexture` is worst-case-sized across every
+rendering mode — `max(tileColumns · viewScaleX · displayWidth) × max(tileRows · viewScaleY
+· displayHeight)`, spanning both orientations for modes flagged `CAN_ROTATE`. Sizing from
+the **display** rather than the current window is what lets the caller resize and go
+fullscreen without reallocating (ADR-010). This max is **not** bounded by the display
+size: a mode with `viewScaleX = 1.0, tileColumns = 2` yields a `2W × H` atlas.
+
+**Filling (per frame, from the window).** Tiles are packed **contiguously from the
+top-left** at `(contentViewWidth, contentViewHeight)` — tile *v* at
+`((v % tileColumns)·contentViewWidth, (v / tileColumns)·contentViewHeight)`. The stride is
+the **content** size, not `atlasWidth / tileColumns` (that is the shell/multi-compositor
+invariant, see `multiview-tiling.md`). Each visible element is drawn inside tile *v* at its
+own window position scaled by `viewScaleX/Y`. Everything right of / below the packed region
+is dead space the runtime never reads.
+
+**Runtime behaviour.** No SBS scratch and no per-rect unpack blits. The packed region is
+handed to the display processor directly when it exactly fills the active mode's atlas
+(zero-copy per ADR-030 — rare: only the worst-case-achieving mode, at fullscreen),
+otherwise **one** box copy crops it first (contiguous packing means a single rectangle, not
+the per-tile gather the `xrEndFrame` path needs). `rects` degrade to a scope hint (zone /
+wish-mask publication, caller draw-back), so `XR_WEAVE_SUBMIT_MAX_RECTS_DXR` no longer
+bounds elements per frame, and `firstChunk` has nothing to clear on this path —
+transparency between elements is carried by the caller's own atlas alpha.
+
+Omitting the chain keeps v3/v4/v5 behaviour byte-for-byte.
 
 ## 3. Why batch (the scaling wall)
 

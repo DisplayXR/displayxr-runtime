@@ -501,6 +501,7 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         uint32_t overlay_rect_count,
                                         const struct xrt_rect *overlay_rects,
                                         bool weave_frame_first,
+                                        const struct xrt_weave_atlas_layout *layout,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
@@ -557,6 +558,18 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	// output to transparent so gaps between tiles are transparent (not stale),
 	// letting a present-owner draw the woven output back WHOLE-WINDOW.
 	args.weave_frame_first = weave_frame_first ? 1u : 0u;
+
+	// v6 (#774): a declared N-view layout switches the input contract from
+	// per-rect squeezed SBS to a worst-case-sized multiview atlas (tiles packed
+	// contiguously top-left at content_view_w/h). view_count 0 — including a
+	// NULL layout from a pre-v6 caller — keeps the legacy behaviour.
+	if (layout != NULL && layout->view_count > 0) {
+		args.view_count = layout->view_count;
+		args.tile_columns = layout->tile_columns;
+		args.tile_rows = layout->tile_rows;
+		args.content_view_w = layout->content_view_w;
+		args.content_view_h = layout->content_view_h;
+	}
 
 	xrt_graphics_buffer_handle_t handles[2] = {in_handle, overlay_handle};
 	uint32_t handle_count = have_overlay ? 2u : 1u;

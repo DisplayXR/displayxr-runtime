@@ -291,6 +291,19 @@ struct d3d11_client_render_resources
 	uint32_t                               weave_sbs_w; //!< one view's width (== win_w)
 	uint32_t                               weave_sbs_h;
 
+	//! Spec-v6 N-view crop staging (#774). When the caller's worst-case-sized
+	//! atlas is LARGER than the active mode's atlas, the packed region (tiles
+	//! contiguous from the top-left) is copied here at exactly
+	//! tile_columns*content_view_w x tile_rows*content_view_h before the DP
+	//! handoff — ADR-030 crop-before-DP. Because the packing is contiguous the
+	//! crop is ONE box copy, not the per-tile gather the xrEndFrame path needs.
+	//! Unused when the atlas already fills the mode exactly (zero-copy).
+	wil::com_ptr<ID3D11Texture2D>          weave_crop_tex;
+	wil::com_ptr<ID3D11ShaderResourceView> weave_crop_srv;
+	uint32_t                               weave_crop_w;
+	uint32_t                               weave_crop_h;
+	DXGI_FORMAT                            weave_crop_format;
+
 	//! Cached import of the caller's pre-weave input texture, keyed by the
 	//! shared-handle value. The caller reuses one shared input across frames,
 	//! so re-running OpenSharedResource + CreateShaderResourceView every
@@ -11742,6 +11755,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                uint32_t overlay_rect_count,
                                const struct xrt_rect *overlay_rects,
                                bool weave_frame_first,
+                               const struct xrt_weave_atlas_layout *layout,
                                uint32_t *out_width,
                                uint32_t *out_height,
                                uint64_t *out_fence_value,
@@ -11931,7 +11945,118 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	int64_t t_post_acquire_ns = os_monotonic_get_ns();
 
 	ID3D11RenderTargetView *rtvs[] = {c->render.weave_output_rtv.get()};
-	if (rect_count == 0) {
+	const bool nview = (layout != nullptr && layout->view_count > 0);
+	if (nview) {
+		// Spec-v6 N-view atlas (#774): the caller already packed the atlas the
+		// way every other DisplayXR app does — tiles contiguous from the
+		// top-left at (content_view_w, content_view_h) inside a worst-case-sized
+		// texture (ADR-010). There is nothing to unpack: no SBS scratch, no
+		// per-rect stretch blits. Just crop to the active mode's atlas if the
+		// worst case is bigger (ADR-030 crop-before-DP) and weave once.
+		//
+		// No weave_frame_first clear here: the v5 clear existed to zero the
+		// runtime's SBS scratch between tiles, and there is no scratch on this
+		// path. Transparency between elements is carried by the caller's own
+		// atlas alpha, which reaches the DP untouched.
+		const uint32_t cvw = layout->content_view_w;
+		const uint32_t cvh = layout->content_view_h;
+		const uint32_t packed_w = layout->tile_columns * cvw;
+		const uint32_t packed_h = layout->tile_rows * cvh;
+
+		if (packed_w > idesc.Width || packed_h > idesc.Height) {
+			U_LOG_E("#625 weave v6: packed region %ux%u exceeds input atlas %ux%u "
+			        "(views=%u grid=%ux%u content=%ux%u)",
+			        packed_w, packed_h, idesc.Width, idesc.Height, layout->view_count,
+			        layout->tile_columns, layout->tile_rows, cvw, cvh);
+			if (acquired && in_km) {
+				in_km->ReleaseSync(0);
+			}
+			return false;
+		}
+
+		ID3D11ShaderResourceView *dp_srv = in_srv;
+
+		// Zero-copy is the RARE case, not the norm: it needs the submitted
+		// atlas to fill the ACTIVE mode's atlas exactly. With a swapchain sized
+		// at the max over all modes, only the worst-case-achieving mode
+		// qualifies, and only at fullscreen (ADR-030).
+		const bool zero_copy = (packed_w == idesc.Width && packed_h == idesc.Height);
+		if (!zero_copy) {
+			if (!c->render.weave_crop_tex || c->render.weave_crop_w != packed_w ||
+			    c->render.weave_crop_h != packed_h || c->render.weave_crop_format != idesc.Format) {
+				c->render.weave_crop_srv.reset();
+				c->render.weave_crop_tex.reset();
+
+				D3D11_TEXTURE2D_DESC cd = {};
+				cd.Width = packed_w;
+				cd.Height = packed_h;
+				cd.MipLevels = 1;
+				cd.ArraySize = 1;
+				cd.Format = idesc.Format;
+				cd.SampleDesc.Count = 1;
+				cd.Usage = D3D11_USAGE_DEFAULT;
+				cd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+				hr = sys->device->CreateTexture2D(&cd, nullptr, c->render.weave_crop_tex.put());
+				if (SUCCEEDED(hr)) {
+					hr = sys->device->CreateShaderResourceView(c->render.weave_crop_tex.get(),
+					                                           nullptr,
+					                                           c->render.weave_crop_srv.put());
+				}
+				if (FAILED(hr)) {
+					U_LOG_E("#625 weave v6: crop texture %ux%u create failed: 0x%08lx", packed_w,
+					        packed_h, hr);
+					c->render.weave_crop_srv.reset();
+					c->render.weave_crop_tex.reset();
+					if (acquired && in_km) {
+						in_km->ReleaseSync(0);
+					}
+					return false;
+				}
+				c->render.weave_crop_w = packed_w;
+				c->render.weave_crop_h = packed_h;
+				c->render.weave_crop_format = idesc.Format;
+				U_LOG_W("#625 weave v6: crop staging %ux%u (atlas %ux%u, %u view(s) %ux%u grid %ux%u)",
+				        packed_w, packed_h, idesc.Width, idesc.Height, layout->view_count, cvw, cvh,
+				        layout->tile_columns, layout->tile_rows);
+			}
+
+			// ONE box copy — the tiles are contiguous from the origin, so the
+			// packed region is a single top-left rectangle. (The xrEndFrame
+			// path needs a per-tile gather because the runtime writes ITS
+			// atlas at the atlas/tile_columns slot stride; this one does not.)
+			D3D11_BOX box = {0, 0, 0, packed_w, packed_h, 1};
+			sys->context->CopySubresourceRegion(c->render.weave_crop_tex.get(), 0, 0, 0, 0, in_tex, 0,
+			                                    &box);
+			dp_srv = c->render.weave_crop_srv.get();
+		}
+
+		if (acquired && in_km) {
+			in_km->ReleaseSync(0);
+		}
+
+		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
+		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), dp_srv,
+		                                          /*view_w*/ cvw, /*view_h*/ cvh,
+		                                          layout->tile_columns, layout->tile_rows,
+		                                          DXGI_FORMAT_R8G8B8A8_UNORM, win_w, win_h,
+		                                          /*canvas_offset*/ 0, 0, win_w, win_h);
+
+		{
+			static uint32_t s_logged_views = 0;
+			static uint32_t s_logged_cvw = 0, s_logged_cvh = 0;
+			static int s_logged_zc = -1;
+			if (s_logged_views != layout->view_count || s_logged_cvw != cvw || s_logged_cvh != cvh ||
+			    s_logged_zc != (int)zero_copy) {
+				s_logged_views = layout->view_count;
+				s_logged_cvw = cvw;
+				s_logged_cvh = cvh;
+				s_logged_zc = (int)zero_copy;
+				U_LOG_W("#625 weave v6: views=%u grid=%ux%u content=%ux%u atlas=%ux%u win=%ux%u zc=%d",
+				        layout->view_count, layout->tile_columns, layout->tile_rows, cvw, cvh,
+				        idesc.Width, idesc.Height, win_w, win_h, (int)zero_copy);
+			}
+		}
+	} else if (rect_count == 0) {
 		// Legacy single-rect (spec v2): the whole input IS the element's 2x1
 		// SBS atlas — per-view dims = half width × full height. The DP weaves
 		// into the bound RTV, confined to the sub-rect via canvas_offset/size

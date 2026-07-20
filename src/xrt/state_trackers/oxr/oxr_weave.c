@@ -66,6 +66,7 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         uint32_t overlay_rect_count,
                                         const struct xrt_rect *overlay_rects,
                                         bool weave_frame_first,
+                                        const struct xrt_weave_atlas_layout *layout,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
@@ -210,6 +211,45 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		}
 	}
 
+	// Spec v6 (#774): a chained XrWeaveSubmitLayoutDXR declares that the input
+	// is a worst-case-sized N-view atlas (tiles packed contiguously from the
+	// top-left at contentViewWidth/Height) instead of per-rect squeezed SBS.
+	// Absent chain = legacy layout, byte-for-byte unchanged.
+	struct xrt_weave_atlas_layout layout = {0};
+	const XrWeaveSubmitLayoutDXR *lay =
+	    OXR_GET_INPUT_FROM_CHAIN(submitInfo, XR_TYPE_WEAVE_SUBMIT_LAYOUT_DXR, XrWeaveSubmitLayoutDXR);
+	if (lay != NULL) {
+		if (lay->tileColumns == 0 || lay->tileRows == 0) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrWeaveSubmitLayoutDXR::tileColumns (%u) and "
+			                 "tileRows (%u) must both be non-zero",
+			                 lay->tileColumns, lay->tileRows);
+		}
+		if (lay->viewCount == 0 || lay->viewCount > XR_WEAVE_MAX_EYES_DXR) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrWeaveSubmitLayoutDXR::viewCount (%u) must be "
+			                 "1..%u",
+			                 lay->viewCount, (uint32_t)XR_WEAVE_MAX_EYES_DXR);
+		}
+		if (lay->viewCount != lay->tileColumns * lay->tileRows) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrWeaveSubmitLayoutDXR::viewCount (%u) must equal "
+			                 "tileColumns * tileRows (%u * %u)",
+			                 lay->viewCount, lay->tileColumns, lay->tileRows);
+		}
+		if (lay->contentViewWidth == 0 || lay->contentViewHeight == 0) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrWeaveSubmitLayoutDXR content view dims "
+			                 "(%ux%u) must both be non-zero",
+			                 lay->contentViewWidth, lay->contentViewHeight);
+		}
+		layout.view_count = lay->viewCount;
+		layout.tile_columns = lay->tileColumns;
+		layout.tile_rows = lay->tileRows;
+		layout.content_view_w = lay->contentViewWidth;
+		layout.content_view_h = lay->contentViewHeight;
+	}
+
 	bool have_out = false;
 	uint32_t w = 0, h = 0;
 	uint64_t fence_value = 0;
@@ -219,8 +259,8 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	    submitInfo->inputIsDxgi == XR_TRUE, submitInfo->rect.offset.x, submitInfo->rect.offset.y,
 	    (uint32_t)submitInfo->rect.extent.width, (uint32_t)submitInfo->rect.extent.height, rect_count,
 	    rect_count > 0 ? rects : NULL, overlay_handle, overlay_is_dxgi, overlay_rect_count,
-	    overlay_rect_count > 0 ? overlay_rects : NULL, submitInfo->firstChunk == XR_TRUE, &have_out, &w, &h,
-	    &fence_value, &eyes);
+	    overlay_rect_count > 0 ? overlay_rects : NULL, submitInfo->firstChunk == XR_TRUE,
+	    layout.view_count > 0 ? &layout : NULL, &have_out, &w, &h, &fence_value, &eyes);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
 		                 "xrWeaveSubmitDXR: weave failed (xrt_result=%d)", (int)xret);
