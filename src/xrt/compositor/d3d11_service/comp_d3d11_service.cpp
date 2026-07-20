@@ -477,6 +477,8 @@ struct d3d11_service_compositor
 	uint64_t zone_publish_seq;  //!< mask content generation (bumped per re-raster)
 	bool zone_published;        //!< a mask is live at the DP (clear on non-zones frames / teardown)
 	bool zone_mask_dp_rejected; //!< DP rejected the publish — tier-1 hardware request owns the panel
+	//! B2a weave-path wish mask: 0 = unqueried, 1 = multi-zone panel (publish), 2 = single-zone (skip).
+	uint32_t weave_zone_grid_state;
 };
 
 /*!
@@ -12140,6 +12142,56 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			}
 			if (ov_acquired && ov_km) {
 				ov_km->ReleaseSync(0);
+			}
+		}
+	}
+
+	// B2a (browser#22): publish the hardware WISH MASK so the panel shows the
+	// woven TILE regions as 3D (weave, M=1) and everything else — the gaps
+	// between tiles and any 2D chrome painted there — as crisp TRUE-2D (M=0, no
+	// lens crosstalk), instead of the whole panel weaving. The batch tile rects
+	// ARE the M=1 zones; the display-zones wish path already rasterizes an R8
+	// feathered mask from a rect list and publishes it screen-anchored, so reuse
+	// it verbatim. Only for a per-client DP that accepts zone masks — NEVER push
+	// a per-client mask onto the shared workspace DP (dp_is_shared), which the
+	// spatial shell owns. Batch path only (rect_count > 0); the legacy single-
+	// rect path carries no tile-rect list. The mask lives on this client's own
+	// per-client DP, so it is torn down with the client — no explicit withdraw.
+	// Capability gate: only a MULTI-ZONE panel can act on per-region geometry. A
+	// single-zone panel (Leia today: zone_grid_width/height == 1) OR-collapses any
+	// non-zero mask pixel to "whole panel 3D", so publishing a tile mask buys
+	// nothing and costs a full-window raster + DP re-evaluate every submit. Skip
+	// it there; the code below lights up automatically on local-2D/3D panels with
+	// a real zone grid, which is exactly where crisp per-region 2D becomes critical.
+	if (c->weave_zone_grid_state == 0 && service_dp_accepts_zone_mask(dp)) {
+		struct xrt_dp_local_zone_caps caps = {};
+		caps.struct_size = sizeof(caps);
+		bool ok = xrt_display_processor_d3d11_get_local_zone_caps(dp, &caps);
+		bool multi_zone = ok && caps.supported != 0 && (caps.zone_grid_width > 1 || caps.zone_grid_height > 1);
+		c->weave_zone_grid_state = multi_zone ? 1 : 2;
+		U_LOG_W("#625 weave B2a: zone grid %ux%u (supported=%u) — per-tile wish mask %s",
+		        caps.zone_grid_width, caps.zone_grid_height, caps.supported,
+		        multi_zone ? "ENABLED" : "skipped (single-zone panel OR-collapses to whole-panel 3D)");
+	}
+	if (c->weave_zone_grid_state == 1 && rect_count > 0 && !dp_is_shared) {
+		HWND mask_wnd = c->render.weave_hwnd != nullptr ? c->render.weave_hwnd : c->render.hwnd;
+		POINT mask_origin = {0, 0};
+		if (mask_wnd != nullptr && IsWindow(mask_wnd) && ClientToScreen(mask_wnd, &mask_origin)) {
+			ID3D11ShaderResourceView *mask_srv =
+			    service_update_zone_wish_mask(sys, c, rects, rect_count, win_w, win_h);
+			if (mask_srv != nullptr) {
+				bool published = xrt_display_processor_d3d11_publish_local_zone_mask(
+				    dp, sys->context.get(), mask_srv, win_w, win_h, (int32_t)mask_origin.x,
+				    (int32_t)mask_origin.y, win_w, win_h, c->zone_publish_seq);
+				static std::atomic_flag s_b2a_pub_logged = ATOMIC_FLAG_INIT;
+				if (!s_b2a_pub_logged.test_and_set()) {
+					U_LOG_W("#625 weave B2a: wish mask published (%ux%u @ screen %ld,%ld, "
+					        "%u tile rect(s))",
+					        win_w, win_h, mask_origin.x, mask_origin.y, rect_count);
+				}
+				if (published) {
+					c->zone_published = true;
+				}
 			}
 		}
 	}
