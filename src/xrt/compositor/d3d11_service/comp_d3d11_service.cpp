@@ -12030,8 +12030,17 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			dp_srv = c->render.weave_crop_srv.get();
 		}
 
-		if (acquired && in_km) {
+		// Keyed-mutex release must straddle the DP read, NOT precede it. On the
+		// crop path the DP reads our staging copy, so key 0 can go back to the
+		// caller as soon as the copy is issued. On the ZERO-COPY path the DP
+		// reads the caller's texture ITSELF — releasing first hands ownership
+		// back while the DP is still sampling, and the weave comes out EMPTY
+		// (found by forcing this branch with DXR_WEAVE_V6_EXACT=1; the overlay
+		// still composited, which is what made it look like a content bug rather
+		// than a sync bug).
+		if (acquired && in_km && !zero_copy) {
 			in_km->ReleaseSync(0);
+			acquired = false;
 		}
 
 		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
@@ -12040,6 +12049,11 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		                                          layout->tile_columns, layout->tile_rows,
 		                                          DXGI_FORMAT_R8G8B8A8_UNORM, win_w, win_h,
 		                                          /*canvas_offset*/ 0, 0, win_w, win_h);
+
+		if (acquired && in_km) {
+			in_km->ReleaseSync(0);
+			acquired = false;
+		}
 
 		{
 			static uint32_t s_logged_views = 0;

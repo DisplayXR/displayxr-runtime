@@ -81,6 +81,14 @@ static float g_lastEyeX[2] = {0.0f, 0.0f};
 // (#774) instead of the v3/v4/v5 per-rect squeezed SBS. Opt-in so the default
 // run still regression-covers the shipped path.
 static bool g_useV6 = false;
+// v6 layout, operator-supplied so the harness can drive ANY vendor grid without
+// re-plumbing: DXR_WEAVE_V6_GRID=CxR (default 2x1) and DXR_WEAVE_V6_SCALE=SXxSY
+// (default 0.5x1.0). E.g. sim_display Quad = GRID=2x2 SCALE=0.5x0.5.
+// A real client reads these from the ACTIVE XrDisplayRenderingModeInfoDXR
+// instead; this is a runtime harness, not a model app.
+static uint32_t g_v6Cols = 2, g_v6Rows = 1;
+static bool g_v6Exact = false; //!< DXR_WEAVE_V6_EXACT=1 -> atlas == packed region (zero-copy branch)
+static float g_v6ScaleX = 0.5f, g_v6ScaleY = 1.0f;
 
 // v4 overlay atlas (browser#18): a window-sized premultiplied-alpha 2D layer the
 // DP composites OVER the woven output. Painted ONCE (a static crisp 2D badge that
@@ -446,18 +454,18 @@ RenderNViewLookAround(float eyeLx,
 	const float kNear = 900.0f;
 	const float eyeX[2] = {eyeLx, eyeRx};
 
-	// Window -> tile scale. Height is unscaled here (scaleY 1.0), width halves.
-	const float sx = (float)contentW / (float)(g_sbsW / 2); // contentW / window width
-	const float sy = (float)contentH / (float)g_sbsH;
+	const float sx = g_v6ScaleX;
+	const float sy = g_v6ScaleY;
+	const uint32_t nviews = g_v6Cols * g_v6Rows;
 
 	// Whole atlas transparent — including the dead space beyond the packed
 	// region, which the runtime never reads but which must not be stale.
 	g_context->ClearView(g_sbsRtv.Get(), gap, nullptr, 0);
 
-	for (int v = 0; v < 2; v++) {
+	for (uint32_t v = 0; v < nviews; v++) {
 		// Tile origin at CONTENT stride, contiguous from the top-left.
-		const int32_t tx = v * (int32_t)contentW;
-		const int32_t ty = 0;
+		const int32_t tx = (int32_t)((v % g_v6Cols) * contentW);
+		const int32_t ty = (int32_t)((v / g_v6Cols) * contentH);
 		// The element at its own window position, scaled into the tile.
 		const int32_t ex = tx + (int32_t)(rx * sx);
 		const int32_t ey = ty + (int32_t)(ry * sy);
@@ -467,13 +475,20 @@ RenderNViewLookAround(float eyeLx,
 		D3D11_RECT elemR = {ex, ey, ex + ew, ey + eh};
 		g_context->ClearView(g_sbsRtv.Get(), bg, &elemR, 1);
 
-		int32_t fcx = ex + ew / 2 + (int32_t)(-kFar * eyeX[v] * sx);
+		// Per-view eye x: interpolate across the L..R span so an N>2 grid gets a
+		// visibly distinct parallax per tile. For nviews==2 this is exactly
+		// {eyeLx, eyeRx}, so the 2-view result is unchanged. A real client uses
+		// the N viewer poses the runtime returns instead of interpolating.
+		const float t = (nviews > 1) ? (float)v / (float)(nviews - 1) : 0.5f;
+		const float ev = eyeX[0] + (eyeX[1] - eyeX[0]) * t;
+
+		int32_t fcx = ex + ew / 2 + (int32_t)(-kFar * ev * sx);
 		int32_t fcy = ey + eh / 2;
 		D3D11_RECT farR = {fcx - (int32_t)(60 * sx), fcy - (int32_t)(90 * sy), fcx + (int32_t)(60 * sx),
 		                   fcy + (int32_t)(90 * sy)};
 		g_context->ClearView(g_sbsRtv.Get(), farCol, &farR, 1);
 
-		int32_t ncx = ex + ew / 2 + (int32_t)(-kNear * eyeX[v] * sx);
+		int32_t ncx = ex + ew / 2 + (int32_t)(-kNear * ev * sx);
 		int32_t ncy = ey + eh / 2;
 		D3D11_RECT nearR = {ncx - (int32_t)(40 * sx), ncy - (int32_t)(60 * sy), ncx + (int32_t)(40 * sx),
 		                    ncy + (int32_t)(60 * sy)};
@@ -620,8 +635,31 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		DWORD n = GetEnvironmentVariableA("DXR_WEAVE_V6", buf, (DWORD)sizeof(buf));
 		g_useV6 = (n > 0 && n < sizeof(buf) && buf[0] == '1');
 	}
+	if (g_useV6) {
+		char buf[32] = {0};
+		DWORD n = GetEnvironmentVariableA("DXR_WEAVE_V6_GRID", buf, (DWORD)sizeof(buf));
+		unsigned c = 0, r = 0;
+		if (n > 0 && n < sizeof(buf) && sscanf_s(buf, "%ux%u", &c, &r) == 2 && c > 0 && r > 0) {
+			g_v6Cols = c;
+			g_v6Rows = r;
+		}
+		buf[0] = '\0';
+		n = GetEnvironmentVariableA("DXR_WEAVE_V6_EXACT", buf, (DWORD)sizeof(buf));
+		g_v6Exact = (n > 0 && n < sizeof(buf) && buf[0] == '1');
+		buf[0] = '\0';
+		n = GetEnvironmentVariableA("DXR_WEAVE_V6_SCALE", buf, (DWORD)sizeof(buf));
+		float sx = 0.0f, sy = 0.0f;
+		if (n > 0 && n < sizeof(buf) && sscanf_s(buf, "%fx%f", &sx, &sy) == 2 && sx > 0.0f && sy > 0.0f) {
+			g_v6ScaleX = sx;
+			g_v6ScaleY = sy;
+		}
+	}
 	LOG_INFO("Input layout: %s", g_useV6 ? "v6 N-view worst-case atlas (#774)"
 	                                      : "v3/v4/v5 per-rect squeezed SBS");
+	if (g_useV6) {
+		LOG_INFO("  v6 grid=%ux%u views=%u scale=%.3fx%.3f atlas=%s", g_v6Cols, g_v6Rows,
+		         g_v6Cols * g_v6Rows, g_v6ScaleX, g_v6ScaleY, g_v6Exact ? "exact (zero-copy)" : "oversized (crop)");
+	}
 
 	XrSessionManager xr;
 	if (!InitializeOpenXR(xr)) {
@@ -708,13 +746,21 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 
 		// v6 (#774) is opt-in via DXR_WEAVE_V6=1 so the default run keeps
 		// exercising the shipped v3/v4/v5 batch path unchanged.
-		const uint32_t v6ContentW = (uint32_t)(cw / 2); // window * scaleX (0.5)
-		const uint32_t v6ContentH = (uint32_t)ch;       // window * scaleY (1.0)
+		const uint32_t v6ContentW = (uint32_t)(cw * g_v6ScaleX);
+		const uint32_t v6ContentH = (uint32_t)(ch * g_v6ScaleY);
 
 		if (g_useV6) {
-			// Worst-case-sized atlas: deliberately wider than this mode's packed
-			// region (2*cw vs cw) so the runtime's crop branch is under test.
-			if (!EnsureSbsTexture((uint32_t)cw * 2, (uint32_t)ch)) {
+			// Atlas sizing selects which runtime branch is under test:
+			//   default            — deliberately LARGER than the packed region
+			//                        (cols*contentW x rows*contentH) => CROP branch.
+			//   DXR_WEAVE_V6_EXACT=1 — exactly the packed region => ZERO-COPY branch.
+			// A real client sizes worst-case over ALL modes from the display (#774),
+			// which lands on crop for every mode but the worst-case-achieving one.
+			const uint32_t packedW = g_v6Cols * v6ContentW;
+			const uint32_t packedH = g_v6Rows * v6ContentH;
+			const uint32_t atlasW = g_v6Exact ? packedW : (uint32_t)cw * 2;
+			const uint32_t atlasH = g_v6Exact ? packedH : (uint32_t)ch * 2;
+			if (!EnsureSbsTexture(atlasW, atlasH)) {
 				Sleep(100);
 				continue;
 			}
@@ -760,9 +806,9 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		// unpack blits entirely.
 		XrWeaveSubmitLayoutDXR lay = {XR_TYPE_WEAVE_SUBMIT_LAYOUT_DXR};
 		if (g_useV6) {
-			lay.viewCount = 2;
-			lay.tileColumns = 2;
-			lay.tileRows = 1;
+			lay.viewCount = g_v6Cols * g_v6Rows;
+			lay.tileColumns = g_v6Cols;
+			lay.tileRows = g_v6Rows;
 			lay.contentViewWidth = v6ContentW;
 			lay.contentViewHeight = v6ContentH;
 			rects.next = &lay;
