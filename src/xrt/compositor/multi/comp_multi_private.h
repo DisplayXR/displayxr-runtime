@@ -37,6 +37,7 @@
 // (comp_multi always links aux_vk, so Vulkan is always available)
 #include "xrt/xrt_vulkan_includes.h"
 #include "vk/vk_hud_blend.h"
+#include "vk/vk_local2d_composite.h"
 #include "multi/comp_multi_content_blend.h"
 
 #include "render/render_interface.h"
@@ -483,6 +484,24 @@ struct multi_compositor
 		void *out_iosurface; //!< Retained exported IOSurfaceRef.
 		uint32_t out_w, out_h;
 		//! @}
+
+		//! @name v4 DP-composited 2D overlay atlas (browser#18)
+		//! A caller-supplied window-sized PREMULTIPLIED-alpha BGRA atlas composited
+		//! OVER the woven output with a premul "over" blend (out = overlay +
+		//! (1-overlay.a)*out) AFTER process_atlas. Imported like the SBS input
+		//! (VK_EXT_metal_objects) and cached by IOSurfaceID. The premul-over pass
+		//! reuses aux_vk's vk_local2d_composite flatten_premul pipeline.
+		//! @{
+		void *overlay_iosurface; //!< Retained IOSurfaceRef (adopted from the IPC receive).
+		uint32_t overlay_iosurface_id;
+		VkImage overlay_image;
+		VkDeviceMemory overlay_memory;
+		VkImageView overlay_view; //!< Sampled by the premul-over blend.
+		uint32_t overlay_w, overlay_h;
+		bool overlay_first_use; //!< First barrier transitions from UNDEFINED.
+		struct vk_local2d_composite overlay_blend; //!< premul-over flatten pipeline.
+		bool overlay_blend_initialized;
+		//! @}
 	} weave;
 #endif
 };
@@ -810,6 +829,8 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
                         uint32_t rect_h,
                         uint32_t rect_count,
                         const struct xrt_rect *rects,
+                        xrt_graphics_buffer_handle_t overlay_handle,
+                        bool weave_frame_first,
                         uint32_t *out_width,
                         uint32_t *out_height,
                         uint64_t *out_fence_value,

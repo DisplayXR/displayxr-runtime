@@ -263,6 +263,192 @@ weave_release_input(struct vk_bundle *vk, struct multi_compositor *mc)
 	mc->weave.in_h = 0;
 }
 
+/*!
+ * Import a caller IOSurface as a sampler-source VkImage (+ view) for the v4
+ * overlay atlas — the same VK_EXT_metal_objects dance as weave_import_input but
+ * into the SEPARATE overlay cache (so it never clobbers the SBS input) and with
+ * a view the premul-over blend samples. The atlas is premultiplied BGRA8.
+ */
+static bool
+weave_import_overlay(struct vk_bundle *vk, struct multi_compositor *mc, IOSurfaceRef surface)
+{
+#if defined(VK_EXT_metal_objects) && defined(VK_EXT_external_memory_metal)
+	if (!vk->has_EXT_metal_objects || !vk->has_EXT_external_memory_metal) {
+		U_LOG_E("weave(#759) v4: VK_EXT_metal_objects / VK_EXT_external_memory_metal unavailable");
+		return false;
+	}
+
+	uint32_t width = (uint32_t)IOSurfaceGetWidth(surface);
+	uint32_t height = (uint32_t)IOSurfaceGetHeight(surface);
+	if (width == 0 || height == 0) {
+		U_LOG_E("weave(#759) v4: overlay IOSurface has zero dimensions");
+		return false;
+	}
+
+	VkExportMetalObjectCreateInfoEXT export_metal_tex_info = {
+	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
+	    .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT,
+	};
+	VkImportMetalIOSurfaceInfoEXT import_iosurface_info = {
+	    .sType = VK_STRUCTURE_TYPE_IMPORT_METAL_IO_SURFACE_INFO_EXT,
+	    .pNext = &export_metal_tex_info,
+	    .ioSurface = surface,
+	};
+	VkImageCreateInfo image_ci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+	    .pNext = &import_iosurface_info,
+	    .imageType = VK_IMAGE_TYPE_2D,
+	    .format = WEAVE_VK_FORMAT,
+	    .extent = {width, height, 1},
+	    .mipLevels = 1,
+	    .arrayLayers = 1,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .tiling = VK_IMAGE_TILING_OPTIMAL,
+	    .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
+	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+
+	VkImage image = VK_NULL_HANDLE;
+	VkResult ret = vk->vkCreateImage(vk->device, &image_ci, NULL, &image);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("weave(#759) v4: vkCreateImage(overlay IOSurface) failed: %d", ret);
+		return false;
+	}
+
+	VkExportMetalTextureInfoEXT export_tex_info = {
+	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT,
+	    .image = image,
+	    .plane = VK_IMAGE_ASPECT_COLOR_BIT,
+	};
+	VkExportMetalObjectsInfoEXT export_objects_info = {
+	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
+	    .pNext = &export_tex_info,
+	};
+	vk->vkExportMetalObjectsEXT(vk->device, &export_objects_info);
+	if (export_tex_info.mtlTexture == NULL) {
+		U_LOG_E("weave(#759) v4: failed to export MTLTexture from overlay VkImage");
+		vk->vkDestroyImage(vk->device, image, NULL);
+		return false;
+	}
+
+	VkMemoryRequirements requirements = {0};
+	vk->vkGetImageMemoryRequirements(vk->device, image, &requirements);
+
+	VkMemoryMetalHandlePropertiesEXT metal_props = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_METAL_HANDLE_PROPERTIES_EXT,
+	};
+	ret = vk->vkGetMemoryMetalHandlePropertiesEXT(vk->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
+	                                              export_tex_info.mtlTexture, &metal_props);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("weave(#759) v4: vkGetMemoryMetalHandlePropertiesEXT failed: %d", ret);
+		vk->vkDestroyImage(vk->device, image, NULL);
+		return false;
+	}
+	requirements.memoryTypeBits = metal_props.memoryTypeBits;
+
+	VkImportMemoryMetalHandleInfoEXT import_memory_info = {
+	    .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT,
+	    .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
+	    .handle = export_tex_info.mtlTexture,
+	};
+	VkMemoryDedicatedAllocateInfoKHR dedicated_info = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO_KHR,
+	    .pNext = &import_memory_info,
+	    .image = image,
+	};
+
+	uint32_t memory_type_index = UINT32_MAX;
+	VkPhysicalDeviceMemoryProperties mem_props;
+	vk->vkGetPhysicalDeviceMemoryProperties(vk->physical_device, &mem_props);
+	for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+		if ((requirements.memoryTypeBits & (1u << i)) != 0) {
+			memory_type_index = i;
+			break;
+		}
+	}
+	if (memory_type_index == UINT32_MAX) {
+		U_LOG_E("weave(#759) v4: no valid memory type for overlay IOSurface");
+		vk->vkDestroyImage(vk->device, image, NULL);
+		return false;
+	}
+
+	VkMemoryAllocateInfo alloc_info = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .pNext = &dedicated_info,
+	    .allocationSize = requirements.size,
+	    .memoryTypeIndex = memory_type_index,
+	};
+	VkDeviceMemory memory = VK_NULL_HANDLE;
+	ret = vk->vkAllocateMemory(vk->device, &alloc_info, NULL, &memory);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("weave(#759) v4: vkAllocateMemory(overlay IOSurface) failed: %d", ret);
+		vk->vkDestroyImage(vk->device, image, NULL);
+		return false;
+	}
+	ret = vk->vkBindImageMemory(vk->device, image, memory, 0);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("weave(#759) v4: vkBindImageMemory(overlay IOSurface) failed: %d", ret);
+		vk->vkFreeMemory(vk->device, memory, NULL);
+		vk->vkDestroyImage(vk->device, image, NULL);
+		return false;
+	}
+
+	VkImageViewCreateInfo view_ci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+	    .image = image,
+	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+	    .format = WEAVE_VK_FORMAT,
+	    .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1},
+	};
+	VkImageView view = VK_NULL_HANDLE;
+	ret = vk->vkCreateImageView(vk->device, &view_ci, NULL, &view);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("weave(#759) v4: vkCreateImageView(overlay) failed: %d", ret);
+		vk->vkFreeMemory(vk->device, memory, NULL);
+		vk->vkDestroyImage(vk->device, image, NULL);
+		return false;
+	}
+
+	mc->weave.overlay_image = image;
+	mc->weave.overlay_memory = memory;
+	mc->weave.overlay_view = view;
+	mc->weave.overlay_w = width;
+	mc->weave.overlay_h = height;
+	mc->weave.overlay_first_use = true;
+	return true;
+#else
+	(void)vk;
+	(void)mc;
+	(void)surface;
+	return false;
+#endif
+}
+
+static void
+weave_release_overlay(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	if (mc->weave.overlay_view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, mc->weave.overlay_view, NULL);
+		mc->weave.overlay_view = VK_NULL_HANDLE;
+	}
+	if (mc->weave.overlay_image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, mc->weave.overlay_image, NULL);
+		mc->weave.overlay_image = VK_NULL_HANDLE;
+	}
+	if (mc->weave.overlay_memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, mc->weave.overlay_memory, NULL);
+		mc->weave.overlay_memory = VK_NULL_HANDLE;
+	}
+	if (mc->weave.overlay_iosurface != NULL) {
+		CFRelease((IOSurfaceRef)mc->weave.overlay_iosurface);
+		mc->weave.overlay_iosurface = NULL;
+	}
+	mc->weave.overlay_iosurface_id = 0;
+	mc->weave.overlay_w = 0;
+	mc->weave.overlay_h = 0;
+}
+
 //! Plain device-local image + view (the SBS scratch atlas).
 static bool
 weave_create_scratch(struct vk_bundle *vk, struct multi_compositor *mc, uint32_t w, uint32_t h)
@@ -617,6 +803,8 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
                         uint32_t rect_h,
                         uint32_t rect_count,
                         const struct xrt_rect *rects,
+                        xrt_graphics_buffer_handle_t overlay_handle,
+                        bool weave_frame_first,
                         uint32_t *out_width,
                         uint32_t *out_height,
                         uint64_t *out_fence_value,
@@ -636,6 +824,12 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 	IOSurfaceRef surface = (IOSurfaceRef)in_handle;
 	uint32_t surface_id = (uint32_t)IOSurfaceGetID(surface);
 
+	// v4 overlay atlas (browser#18): the handler passes a second retained
+	// IOSurfaceRef when the caller chained XrWeaveSubmitOverlaysDXR. We own it —
+	// adopt into the overlay cache (keyed by IOSurfaceID) or release it below.
+	IOSurfaceRef overlay = (IOSurfaceRef)overlay_handle; // may be NULL
+	uint32_t overlay_id = overlay != NULL ? (uint32_t)IOSurfaceGetID(overlay) : 0;
+
 	weave_ensure_mutex(mc);
 	os_mutex_lock(&mc->weave.mutex);
 
@@ -654,6 +848,20 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			mc->weave.in_iosurface = (void *)surface; // adopt the retained ref
 			mc->weave.in_iosurface_id = surface_id;
 			surface = NULL; // ownership transferred
+		}
+
+		// v4 overlay: (re)import on identity change. On a matching id we keep the
+		// cached import and release the (redundant) per-call ref at the epilogue.
+		if (overlay != NULL &&
+		    (mc->weave.overlay_image == VK_NULL_HANDLE || mc->weave.overlay_iosurface_id != overlay_id)) {
+			weave_release_overlay(vk, mc);
+			if (weave_import_overlay(vk, mc, overlay)) {
+				mc->weave.overlay_iosurface = (void *)overlay; // adopt the retained ref
+				mc->weave.overlay_iosurface_id = overlay_id;
+				overlay = NULL; // ownership transferred
+				U_LOG_W("weave(#759) v4: overlay import cached (%ux%u)", mc->weave.overlay_w,
+				        mc->weave.overlay_h);
+			}
 		}
 
 		// Output dims: batch = the (window-client-sized) input; legacy =
@@ -729,6 +937,33 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		mc->weave.sbs_first_use = false;
 		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
 		                         0, NULL, 0, NULL, 1, &sbs_to_dst);
+
+		// v5 firstChunk (browser#22): clear the SBS scratch to premultiplied
+		// transparent (0,0,0,0) on the first submit of a frame, so regions BETWEEN
+		// the woven tiles come out alpha 0 instead of stale — the present-owner can
+		// then draw the woven output back WHOLE-WINDOW (opaque tiles replace the
+		// page, transparent gaps show it through). The DP is alpha-native (passes
+		// the atlas alpha through the weave), so cleared gaps stay transparent while
+		// blitted tiles keep the page's opaque alpha. Opt-in: legacy present-owners
+		// draw back only their own tiles and skip it (accumulate-across-submits).
+		if (weave_frame_first) {
+			VkClearColorValue sbs_transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
+			vk->vkCmdClearColorImage(cmd, mc->weave.sbs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			                         &sbs_transparent, 1, &range);
+			// Order the whole-image clear before the per-rect blits (both TRANSFER
+			// writes to overlapping regions — no implicit ordering within a stage).
+			VkImageMemoryBarrier clear_to_blit = {
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+			    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+			    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			    .image = mc->weave.sbs_image,
+			    .subresourceRange = range,
+			};
+			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+			                         0, NULL, 0, NULL, 1, &clear_to_blit);
+		}
 
 		// Blit each rect's squeezed-SBS halves into the two atlas tiles:
 		// left half -> left tile at the rect's window position (stretched to
@@ -821,6 +1056,73 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		                                    (VkFormat_XDP)WEAVE_VK_FORMAT,                 //
 		                                    0, 0, 0, 0);
 
+		// v4 overlay atlas (browser#18): composite the caller's window-sized
+		// premultiplied-alpha 2D atlas OVER the woven output with a premul "over"
+		// blend (out = overlay + (1-overlay.a)*out), so crisp 2D lands on top of
+		// the interlaced 3D at screen depth. The overlay is NOT woven — it is drawn
+		// after process_atlas onto the same output attachment. Reuses aux_vk's
+		// vk_local2d_composite flatten_premul pipeline (One / OneMinusSrcAlpha, all
+		// RGBA). process_atlas leaves out_image in COLOR_ATTACHMENT_OPTIMAL.
+		if (mc->weave.overlay_image != VK_NULL_HANDLE) {
+			bool blend_ready = mc->weave.overlay_blend_initialized;
+			if (!blend_ready) {
+				blend_ready = vk_local2d_composite_init(&mc->weave.overlay_blend, vk,
+				                                        WEAVE_VK_FORMAT, WEAVE_VK_FORMAT);
+				mc->weave.overlay_blend_initialized = blend_ready;
+				if (blend_ready) {
+					U_LOG_W("weave(#759) v4: premul-over blend pipeline ready");
+				} else {
+					U_LOG_E("weave(#759) v4: premul-over blend init failed");
+				}
+			}
+			if (blend_ready) {
+				// Overlay -> SHADER_READ (make the caller's external write visible).
+				VkImageMemoryBarrier ov_to_read = {
+				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+				    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+				    .oldLayout = mc->weave.overlay_first_use
+				                     ? VK_IMAGE_LAYOUT_UNDEFINED
+				                     : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				    .image = mc->weave.overlay_image,
+				    .subresourceRange = range,
+				};
+				mc->weave.overlay_first_use = false;
+				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+				                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1,
+				                         &ov_to_read);
+
+				// Make the weave's color writes available to the blend pass's
+				// LOAD_OP_LOAD + "over" (out stays COLOR_ATTACHMENT_OPTIMAL).
+				VkImageMemoryBarrier out_weave_to_blend = {
+				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+				    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+				                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+				    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+				    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+				    .image = mc->weave.out_image,
+				    .subresourceRange = range,
+				};
+				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+				                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0,
+				                         NULL, 1, &out_weave_to_blend);
+
+				// One whole-window premul "over": the atlas is transparent
+				// (alpha 0) everywhere except the 2D regions, so a single
+				// full-window composite is correct. out_fb is render-pass
+				// compatible with the flatten pass (same BGRA8 single attachment).
+				vk_local2d_composite_begin_frame(&mc->weave.overlay_blend, vk);
+				vk_local2d_composite_flatten_draw(&mc->weave.overlay_blend, vk, cmd, mc->weave.out_fb,
+				                                  mc->weave.out_w, mc->weave.out_h,
+				                                  mc->weave.overlay_view,       //
+				                                  0, 0, mc->weave.out_w, mc->weave.out_h, // dst = full window
+				                                  0.0f, 0.0f, 1.0f, 1.0f,       // src = whole atlas, no flip
+				                                  /*unpremultiplied*/ false);
+			}
+		}
+
 		// Output -> GENERAL for the caller's cross-API (Metal) read.
 		VkImageMemoryBarrier out_to_general = {
 		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -872,9 +1174,12 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 
 	os_mutex_unlock(&mc->weave.mutex);
 
-	// Release the per-call ref if it wasn't adopted into the cache.
+	// Release the per-call refs that weren't adopted into a cache.
 	if (surface != NULL) {
 		CFRelease(surface);
+	}
+	if (overlay != NULL) {
+		CFRelease(overlay);
 	}
 	return ok;
 }
@@ -950,8 +1255,13 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 			vk->vkQueueWaitIdle(vk->main_queue->queue);
 		}
 		weave_release_input(vk, mc);
+		weave_release_overlay(vk, mc);
 		weave_release_scratch(vk, mc);
 		weave_release_output(vk, mc);
+		if (mc->weave.overlay_blend_initialized) {
+			vk_local2d_composite_fini(&mc->weave.overlay_blend, vk);
+			mc->weave.overlay_blend_initialized = false;
+		}
 		if (mc->weave.dp != NULL) {
 			xrt_display_processor_destroy(&mc->weave.dp);
 		}
