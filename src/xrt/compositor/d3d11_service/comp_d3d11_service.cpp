@@ -8523,9 +8523,21 @@ zones_resolve_src_srv(struct d3d11_service_system *sys,
 	if (!sys->workspace_mode && is_srgb_format(desc->Format)) {
 		D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
 		srv_desc.Format = get_srgb_format(desc->Format);
-		srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-		srv_desc.Texture2D.MipLevels = 1;
-		srv_desc.Texture2D.MostDetailedMip = 0;
+		// ADR-032 (#225): a LAYERED (arraySize>1) source needs a whole-array
+		// SRGB SRV so the array PS can select the slice — matching the plain
+		// per-image SRV, which create/import already builds as a Texture2DArray
+		// for layered sources. Tiled (arraySize==1) sources keep Texture2D.
+		if (desc->ArraySize > 1) {
+			srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+			srv_desc.Texture2DArray.MostDetailedMip = 0;
+			srv_desc.Texture2DArray.MipLevels = 1;
+			srv_desc.Texture2DArray.FirstArraySlice = 0;
+			srv_desc.Texture2DArray.ArraySize = desc->ArraySize;
+		} else {
+			srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+			srv_desc.Texture2D.MipLevels = 1;
+			srv_desc.Texture2D.MostDetailedMip = 0;
+		}
 		if (SUCCEEDED(sys->device->CreateShaderResourceView(
 		        sc->images[img].texture.get(), &srv_desc, srgb_srv_out.put()))) {
 			*out_is_srgb_blit = true;
@@ -8753,6 +8765,16 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 					src_format_recorded = true;
 					c->atlas_holds_srgb_bytes = is_srgb_format(sd.Format);
 				}
+				// ADR-032 (#225): a LAYERED (arraySize>1) zone source packs
+				// its eyes as array slices — the SPI render path the Unity
+				// provider uses — so each view must sample slice
+				// `sub.array_index`. Tiled sources (arraySize==1, per-view
+				// imageRect, e.g. the native VK avatar demo) keep the
+				// byte-identical Texture2D path. Mirrors the primary
+				// projection blit.
+				bool is_layered = sd.ArraySize > 1;
+				uint32_t src_slice =
+				    static_cast<uint32_t>(layer->data.zone_3d.proj.v[v].sub.array_index);
 				wil::com_ptr<ID3D11ShaderResourceView> srgb_srv;
 				bool srgb_blit = false;
 				ID3D11ShaderResourceView *src_srv =
@@ -8767,7 +8789,9 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 				    (float)tile_x + (float)zr->offset.w * scale,
 				    (float)tile_y + (float)zr->offset.h * scale,
 				    dst_w, dst_h,
-				    srgb_blit, blend);
+				    srgb_blit, blend,
+				    /*rtv_override=*/nullptr, /*dst_tex_w=*/0.0f, /*dst_tex_h=*/0.0f,
+				    /*is_array=*/is_layered, /*array_slice=*/src_slice);
 				blits_done++;
 			}
 			if (layer->data.flip_y) {
@@ -8797,6 +8821,12 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 			}
 			D3D11_TEXTURE2D_DESC sd = {};
 			sc->images[img].texture->GetDesc(&sd);
+			// ADR-032 (#225): Local-2D is normally a single 2D image
+			// (arraySize==1) replicated per view, but honor a layered source's
+			// slice for robustness — no-op for the common tiled case.
+			bool is_layered = sd.ArraySize > 1;
+			uint32_t src_slice =
+			    static_cast<uint32_t>(layer->data.local_2d.sub.array_index);
 			wil::com_ptr<ID3D11ShaderResourceView> srgb_srv;
 			bool srgb_blit = false;
 			ID3D11ShaderResourceView *src_srv =
@@ -8816,7 +8846,9 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 				    (float)tile_x + (float)lr->offset.w * scale,
 				    (float)tile_y + (float)lr->offset.h * scale,
 				    dst_w, dst_h,
-				    srgb_blit, blend);
+				    srgb_blit, blend,
+				    /*rtv_override=*/nullptr, /*dst_tex_w=*/0.0f, /*dst_tex_h=*/0.0f,
+				    /*is_array=*/is_layered, /*array_slice=*/src_slice);
 				blits_done++;
 			}
 			if (layer->data.flip_y) {
