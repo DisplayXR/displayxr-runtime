@@ -5192,8 +5192,19 @@ vk_sync_zone_mask_to_dp(struct comp_vk_native_compositor *c)
 		c->zone_published = true;
 	}
 #else
-	// No screen-anchor helper on the macOS/Android VK paths yet — skip the
-	// publish (Windows-first; the clear edge above still runs).
+	// No screen-anchor helper on the macOS/Android/Linux VK paths yet — skip the
+	// hardware per-zone publish (Windows-first; the clear edge above still runs).
+	// This gates ONLY hardware per-zone lens switching; the software composite
+	// (vk_composite_local_2d) is platform-agnostic and already renders 2D-in-3D
+	// zones on every backend, so a mixed 2D/3D frame is correct without this.
+	//
+	// Desktop-Linux (#778): bringing the hardware leg to parity needs BOTH (a) an
+	// XCB client-area screen-anchor helper (window origin in physical screen px,
+	// the get_window_metrics source used for windowed-weaving present-origin), AND
+	// (b) srSDK Linux per-zone interlacing phase — which srSDK 1.0.0 does NOT
+	// expose (no per-zone weave, no decoupled phase-origin; the LeiaSR#85 gap). So
+	// the Leia Linux DP intentionally reports no zone caps and this publish is a
+	// no-op there. See docs/roadmap/linux-support.md.
 	(void)mask_w;
 	(void)mask_h;
 #endif

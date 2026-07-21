@@ -10,8 +10,10 @@ is the first tag with complete Linux support. Distribution = user-level **tarbal
 tri-LTS matrix (Ubuntu 22.04/24.04/26.04) is a required check on the runtime and all 5
 demos (#714/#722); all 5 demos are build-green on real 22.04/24.04/26.04 desktops.
 **Still open:** Phase 2b service-side render (**#710**), windowed-3D phase origin
-(**#729/#730**, twin of Windows #85), the deployment target (Ubuntu 26.04 + Intel Arc,
-blocked on hardware), and the Track B shippable re-pin onto a merged `sr-sdk-v*` tag.
+(**#729/#730**, twin of Windows #85), mixed 2D/3D display-zones — software 2D-in-3D
+works, hardware per-zone lens switching SDK-blocked (**#778**, Phase 3c below), the
+deployment target (Ubuntu 26.04 + Intel Arc, blocked on hardware), and the Track B
+shippable re-pin onto a merged `sr-sdk-v*` tag.
 Windows, macOS, and Android ship today.
 
 ## TL;DR
@@ -266,6 +268,28 @@ and the window-position channel for interlacing phase (window metrics currently
 take the display-scoped fallback for app windows). The per-frame
 window-position contract is the conceptual hard part on Wayland; X11/XCB
 supplies it cleanly.
+
+**Phase 3c — mixed 2D/3D display-zones (ADR-027, #778).** The region paradigm
+(a flat 2D region — e.g. an avatar's speech bubble — inside a 3D scene) works on
+Linux **through the runtime's software composite**: `vk_composite_local_2d`
+(`comp_vk_native_compositor.c`) is platform-agnostic and already flattens
+`XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR` layers over the weave on the `vk_native`
+path — no platform guard, at parity with Metal/D3D11. The zone extensions
+(`XR_DXR_local_3d_zone` / `XR_DXR_display_zones` / `XR_DXR_view_rig`) are
+advertised on Linux, so an app just has to submit the Local2D layer. Test vehicle:
+`cube_zones_vk_linux` (two 3D cube zones + an always-on amber Local2D strip). The
+earlier avatar-on-Linux symptom ("only the projection layer renders, the speech
+bubble is missing") was **app-side** — the Linux avatar deferred the Local2D
+bubble to Phase 3; it is not a runtime gap.
+
+**Hardware per-zone lens switching is SDK-blocked, not wired.** Real
+`zone_grid > 1×1` hardware zones need (a) an XCB client-area screen-anchor helper
+in `vk_sync_zone_mask_to_dp` (today `#ifdef XRT_OS_WINDOWS`-only) AND (b) srSDK
+Linux per-zone interlacing phase — which srSDK 1.0.0 does not expose (no per-zone
+weave, no decoupled phase-origin; the LeiaSR#85 gap). So the Leia Linux DP
+intentionally reports no zone caps (`get_local_zone_caps` unwired, `TODO(Track
+B)`) and the software composite is the sole 2D-in-3D path on Linux until the SDK
+gains a per-zone phase surface.
 
 ### Testing on a Linux box (on-screen / Phase 1b–3b)
 
