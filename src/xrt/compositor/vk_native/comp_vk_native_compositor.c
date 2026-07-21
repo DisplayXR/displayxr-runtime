@@ -2246,6 +2246,10 @@ vk_flatten_backdrop_2d(struct comp_vk_native_compositor *c,
                        uint32_t *out_h);
 static void
 vk_release_local2d_state(struct comp_vk_native_compositor *c);
+// runtime#757 / LeiaSR#85 — push the app window's panel-relative origin to the DP
+// (windowed-weaving phase anchor). Defined below, next to get_window_metrics.
+static void
+vk_update_present_origin(struct comp_vk_native_compositor *c);
 // #224 / ADR-027 hardware-DP zone leg (P4): one-time caps probe + per-frame
 // sideband publish of the wish / sticky mask. Defined with the other zone
 // helpers near the bottom.
@@ -2700,6 +2704,10 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			// background). Must precede process_atlas.
 			xrt_display_processor_set_background_2d(c->display_processor, bd_view, bd_w, bd_h);
 
+			// Windowed weaving (runtime#757 / LeiaSR#85): anchor the lens phase to
+			// the window's panel position. Must precede process_atlas.
+			vk_update_present_origin(c);
+
 			xrt_display_processor_process_atlas(
 			    c->display_processor,
 			    dp_self_submits ? VK_NULL_HANDLE : cmd,
@@ -2961,6 +2969,10 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				// #491 part 3 — hand the DP this frame's backdrop (NULL ⟹ clears
 				// it → desktop-only background). Must precede process_atlas.
 				xrt_display_processor_set_background_2d(c->display_processor, bd_view, bd_w, bd_h);
+
+				// Windowed weaving (runtime#757 / LeiaSR#85): anchor the lens phase
+				// to the window's panel position. Must precede process_atlas.
+				vk_update_present_origin(c);
 
 				// Call display processor with atlas (or zero-copy swapchain) texture
 				xrt_display_processor_process_atlas(
@@ -4157,6 +4169,36 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	out_metrics->valid = true;
 	return true;
 #endif
+}
+
+/*!
+ * Windowed weaving (runtime#757 / LeiaSR#85): tell the DP where the app window's
+ * client area sits on the 3D panel so it can anchor the interlacing phase there,
+ * instead of assuming the window covers the panel from its top-left. The panel
+ * origin is the window's client top-left minus the display's screen origin — both
+ * already computed by @ref comp_vk_native_compositor_get_window_metrics (the same
+ * source the Kooima window metrics use, so the framing and the weave phase agree).
+ *
+ * No-op unless the DP exposes the (ADR-020) `set_present_origin` slot; a
+ * full-panel window (hosted, Android) yields origin (0,0) = display-scoped =
+ * today's behavior. Sticky on the DP side, but we refresh it every weave (cheap)
+ * so a dragged/moved window keeps a correct phase.
+ */
+static void
+vk_update_present_origin(struct comp_vk_native_compositor *c)
+{
+	if (c->display_processor == NULL) {
+		return;
+	}
+	struct xrt_window_metrics m;
+	if (!comp_vk_native_compositor_get_window_metrics(&c->base.base, &m) || !m.valid) {
+		// No live window metrics (headless / no window) — leave the DP
+		// display-scoped (its present origin defaults to (0,0)).
+		return;
+	}
+	xrt_display_processor_vk_set_present_origin((struct xrt_display_processor_vk *)c->display_processor,
+	                                            m.window_screen_left - m.display_screen_left,
+	                                            m.window_screen_top - m.display_screen_top);
 }
 
 bool

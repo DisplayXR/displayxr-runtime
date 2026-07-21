@@ -139,7 +139,49 @@ struct xrt_display_processor_vk
 	 * @param enabled  true ⟹ the app self-presents a shared texture (canvas-only).
 	 */
 	void (*set_shared_texture_present)(struct xrt_display_processor_vk *xdp, bool enabled);
+
+	/*!
+	 * Set the app window's client-area top-left in **panel-relative pixels**
+	 * (origin = the SR display's top-left), so the DP can anchor its interlacing
+	 * phase to where the woven window physically sits on the 3D panel — the
+	 * enabling signal for **windowed weaving** (runtime#757 / LeiaSR#85).
+	 *
+	 * Background: the interlacing phase must align to the drawn region's absolute
+	 * position on the panel. A vendor weaver derives that from the OS window
+	 * position on Windows, but on desktop Linux the window's absolute position is
+	 * not available to the weaver (the SR SDK's screen-rect query returns (0,0),
+	 * and under Wayland a client cannot know its position at all). The compositor
+	 * — which owns window placement and already queries the window's on-screen
+	 * rect for the Kooima window metrics — is the single source of truth, so it
+	 * supplies the origin here. The DP combines it with the per-atlas canvas
+	 * (viewport) offset: phase = present_origin + canvas_offset.
+	 *
+	 * Sticky: applies to every subsequent @ref xrt_display_processor::process_atlas
+	 * until changed. Set (0,0) — or never call — for display-scoped weaving (a
+	 * full-panel window anchored at the panel top-left), which is the default and
+	 * exactly today's behavior. The compositor should call this per frame (cheap)
+	 * or whenever the window moves.
+	 *
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL ⟹ the DP
+	 * has no windowed-phase support and weaves display-scoped. Appended after
+	 * @ref set_shared_texture_present per ADR-020 (append-only within a major; no
+	 * version bump — gated by the variant's `base.struct_size`).
+	 *
+	 * @param xdp      Pointer to self.
+	 * @param panel_x  Window client-area left edge, panel-relative pixels.
+	 * @param panel_y  Window client-area top edge, panel-relative pixels.
+	 */
+	void (*set_present_origin)(struct xrt_display_processor_vk *xdp, int32_t panel_x, int32_t panel_y);
 };
+
+/*!
+ * Defined when this header carries the @ref xrt_display_processor_vk::set_present_origin
+ * slot, so a plug-in built against an older runtime (which lacks the slot) can
+ * `#ifdef`-guard its implementation and still compile — the coupled-ABI-addition
+ * pattern for a pre-GA feature that lands across the runtime + a vendor plug-in
+ * (runtime#757 / LeiaSR#85).
+ */
+#define XRT_DP_VK_HAS_PRESENT_ORIGIN 1
 
 /*
  * ── Plug-in ABI tripwire (ADR-020) ─────────────────────────────────────────
@@ -166,7 +208,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, base) == 0, XRT_DP_A
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_transparent_background) == sizeof(struct xrt_display_processor) + 0 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, notify_target_recreated)    == sizeof(struct xrt_display_processor) + 1 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_shared_texture_present) == sizeof(struct xrt_display_processor) + 2 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 3 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_present_origin)          == sizeof(struct xrt_display_processor) + 3 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 4 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -243,6 +286,30 @@ xrt_display_processor_vk_set_shared_texture_present(struct xrt_display_processor
 		return false;
 	}
 	xdp->set_shared_texture_present(xdp, enabled);
+	return true;
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::set_present_origin
+ *
+ * Returns false if not supported (the plug-in's `base.struct_size` doesn't cover
+ * the slot, or the pointer is NULL) — the caller then leaves the DP weaving
+ * display-scoped (today's behavior). Like the wrappers above, the presence check
+ * reads `xdp->base.struct_size` because the variant embeds the base — see ADR-020.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_set_present_origin(struct xrt_display_processor_vk *xdp, int32_t panel_x, int32_t panel_y)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&xdp->set_present_origin + sizeof(xdp->set_present_origin);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size || xdp->set_present_origin == NULL) {
+		return false;
+	}
+	xdp->set_present_origin(xdp, panel_x, panel_y);
 	return true;
 }
 
