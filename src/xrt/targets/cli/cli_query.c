@@ -398,6 +398,15 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	PT("view scale:   (%.3f, %.3f) (baseline hint; see per-mode scale)\n", (double)i->recommended_view_scale_x,
 	   (double)i->recommended_view_scale_y);
 	PT("screen pos:   (%d, %d)\n", i->display_screen_left, i->display_screen_top);
+	// Refresh completes the display identity — on a multi-output box this + the
+	// physical size + screen pos are how you confirm the bound panel is the
+	// intended 3D display (#778: a wrong "primary display" bind explains a weave
+	// that steers for the wrong lens). 0 = unknown.
+	if (i->refresh_mhz != 0) {
+		PT("refresh:      %u.%03u Hz\n", i->refresh_mhz / 1000, i->refresh_mhz % 1000);
+	} else {
+		PT("refresh:      unknown\n");
+	}
 	char et_buf[64];
 	PT("eye-tracking: supported=%s (0x%x) default=%s\n",
 	   eye_modes_label(i->supported_eye_tracking_modes, et_buf, sizeof(et_buf)),
