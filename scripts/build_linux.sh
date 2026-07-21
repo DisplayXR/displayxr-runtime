@@ -188,7 +188,9 @@ if [ "$BUILD_APPS" = "ON" ]; then
   #   cube_hosted_legacy_vk_linux — hosted: runtime self-creates the XCB window.
   #   cube_handle_vk_linux        — handle: app creates its own X11 window and
   #                                 passes it via XR_DXR_xlib_window_binding.
-  for APP in cube_hosted_legacy_vk_linux cube_handle_vk_linux; do
+  #   cube_zones_vk_linux         — handle + XR_DXR_display_zones exerciser
+  #                                 (nested under test_apps/handle/, #778).
+  for APP in cube_hosted_legacy_vk_linux cube_handle_vk_linux cube_zones_vk_linux; do
     APP_DIR="$ROOT/test_apps/$APP"
     # CANDIDATE PATCH (#706 Linux validation): the apps aren't all flat under
     # test_apps/ — cube_hosted_legacy_vk_linux lives in test_apps/legacy/. Fall
