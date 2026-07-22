@@ -3613,12 +3613,28 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			return XRT_ERROR_VULKAN;
 		}
 
-		xrt_result_t dp_ret = factory(&c->vk, (void *)(uintptr_t)c->cmd_pool,
+		// Window handed to the DP → the SR weaver. It is NOT for swapchain
+		// creation (the Linux/Vulkan weaver makes none — it renders into our
+		// framebuffer); it is the weaver's window-GEOMETRY input for
+		// getDrawRegions() — the per-view interlacing draw-regions AND the
+		// window-anchored eye-tracked steering. Passing NULL selects the srSDK's
+		// windowless/display-scoped path (constructedWithoutWindow=true), which
+		// weaves for the DEFAULT viewpoint with no window geometry (#778: view
+		// swap on Linux). The working srSDK vulkan_weaving_linux example passes
+		// the real X11 window here, which is why it tracks. So on desktop-Linux
+		// pass the XCB window XID (populated for BOTH the self-created/hosted and
+		// the app-provided/handle window via c->xcb_handle above). macOS keeps
+		// NULL — its weave is the IOSurface shared-surface path, no window.
+		void *dp_window_handle = NULL;
 #ifdef XRT_OS_WINDOWS
-		                               c->hwnd,
-#else
-		                               NULL,
+		dp_window_handle = c->hwnd;
+#elif defined(XRT_OS_LINUX_DESKTOP)
+		dp_window_handle = (void *)(uintptr_t)c->xcb_handle.window;
+		U_LOG_W("VK DP factory: passing X11 window XID 0x%lx to the weaver (0 = windowless/display-scoped)",
+		        (unsigned long)c->xcb_handle.window);
 #endif
+		xrt_result_t dp_ret = factory(&c->vk, (void *)(uintptr_t)c->cmd_pool,
+		                               dp_window_handle,
 		                               (int32_t)VK_FORMAT_B8G8R8A8_UNORM,
 		                               &c->display_processor);
 		if (dp_ret != XRT_SUCCESS) {
