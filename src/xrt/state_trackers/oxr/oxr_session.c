@@ -1731,19 +1731,23 @@ oxr_session_locate_views(struct oxr_logger *log,
 	// eye tracking via ipc_try_get_sr_view_poses.
 	bool got_eye_positions = oxr_session_get_predicted_eye_positions(sess, &eye_pos);
 
-	// One-shot diagnostic: log stereo gate values for first frames
+	// Throttled diagnostic (#778): log the 3D gate + raw eye pair at startup AND
+	// every ~2s (60fps) so LIVE eye tracking is observable. This was a 3-frame
+	// one-shot, which only ever showed the *startup default* (before tracking
+	// warms up) — it read as "eyes pinned/frozen" and actively misled diagnosis.
+	// Throttled WARN (not per-frame) mirrors the log_counter %120 pattern above.
 	{
 		static int view_3d_gate_log = 0;
-		if (view_3d_gate_log < 3) {
+		int n = view_3d_gate_log++;
+		if (n < 3 || (n % 120) == 0) {
 			U_LOG_W("3D-GATE[%d]: got_eyes=%d valid=%d count=%d "
 			        "have_view_state=%d is_gl=%d has_ext_win=%d "
 			        "eye0=(%.4f,%.4f,%.4f) eye1=(%.4f,%.4f,%.4f)",
-			        view_3d_gate_log, got_eye_positions, eye_pos.valid, eye_pos.count,
+			        n, got_eye_positions, eye_pos.valid, eye_pos.count,
 			        have_view_state, sess->is_gl_native_compositor,
 			        sess->has_external_window,
 			        eye_pos.eyes[0].x, eye_pos.eyes[0].y, eye_pos.eyes[0].z,
 			        eye_pos.eyes[1].x, eye_pos.eyes[1].y, eye_pos.eyes[1].z);
-			view_3d_gate_log++;
 		}
 	}
 
