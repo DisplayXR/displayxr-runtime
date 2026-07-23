@@ -26,6 +26,7 @@ Build apps for 3D displays using the OpenXR standard.
 - **[Your First Handle App](getting-started/first-handle-app.md)** — tutorial walkthrough
 - **[Ship a Manifest](getting-started/ship-a-manifest.md)** — make your app discoverable on every workspace controller, OEM shell, and showcase in the ecosystem with a 30-second JSON file + optional 3D logo
 - **[Troubleshooting](getting-started/troubleshooting.md)** — symptom → cause → fix for the field-confirmed pitfalls (app hangs at startup / VPN Winsock LSP, "Failed to initialize OpenXR", Vulkan crashes, eye-tracking/camera, wrong runtime loads); start with `displayxr-cli selftest`
+- **[FAQ](getting-started/faq.md)** — conceptual questions: what DisplayXR is, supported displays/OSes/graphics APIs, do I need hardware to develop, multiview vs stereo, engines, license, relation to Monado
 
 ### Extension Specs
 

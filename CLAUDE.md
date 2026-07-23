@@ -392,6 +392,8 @@ See `docs/README.md` for the full index. By task:
 | Extension API (display_info, window bindings) | `docs/specs/extensions/XR_DXR_display_info.md` |
 | Why an architectural decision was made | `docs/adr/` |
 | Write / scaffold / lint a DisplayXR app | `docs/guides/displayxr-app-rules.md` (+ `/new-displayxr-app`, `scripts/check_displayxr_app.py`) |
+| Diagnose a runtime/hardware/environment failure (app hangs at startup, VPN Winsock LSP deadlock, "Failed to initialize OpenXR", Vulkan crash, eye-tracking/camera, wrong runtime loads) | `docs/getting-started/troubleshooting.md` (triage with `displayxr-cli selftest`) |
+| Conceptual "what is DisplayXR" questions (supported displays/OSes/APIs, multiview vs stereo, hardware-free dev, license, Monado lineage) | `docs/getting-started/faq.md` |
 | Legacy vs extension app differences | `docs/architecture/extension-vs-legacy.md` |
 | How Unity / engine D3D12 apps reach the runtime (hooked window-binding injection + overlay) | `docs/architecture/unity-d3d12-app-path.md` |
 | How Unreal D3D12 apps reach the runtime (first-class HMD plugin, direct runtime load + zero-copy atlas handoff, adaptive N-view) | `docs/architecture/unreal-d3d12-app-path.md` |
