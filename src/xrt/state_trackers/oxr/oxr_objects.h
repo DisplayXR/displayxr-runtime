@@ -929,6 +929,16 @@ oxr_session_end(struct oxr_logger *log, struct oxr_session *sess);
 XrResult
 oxr_session_request_exit(struct oxr_logger *log, struct oxr_session *sess);
 
+struct xrt_window_metrics;
+/*!
+ * Fill @p out_metrics with this session's live display/window geometry
+ * (per-client; window_pixel_* is the shell-driven tile pixel rect, updated on
+ * resize). Backs xrGetWorkspaceTileSizeDXR (#225). Returns false and leaves
+ * out_metrics->valid = false when unavailable.
+ */
+bool
+oxr_session_get_window_metrics(struct oxr_session *sess, struct xrt_window_metrics *out_metrics);
+
 #ifdef OXR_HAVE_DXR_display_info
 /*!
  * Request display mode switch (2D/3D).

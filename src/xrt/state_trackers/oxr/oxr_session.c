@@ -345,7 +345,7 @@ oxr_session_get_display_dimensions(struct oxr_session *sess, float *out_width_m,
  * Vendor-neutral: works with both SR SDK (via per-session weaver) and
  * sim_display (via generic Win32 APIs in multi compositor).
  */
-static bool
+bool
 oxr_session_get_window_metrics(struct oxr_session *sess,
                                 struct xrt_window_metrics *out_metrics)
 {

@@ -495,6 +495,7 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 #ifdef OXR_HAVE_DXR_display_zones
 	ENTRY_IF_EXT(xrGetDisplayZoneCapabilitiesDXR, DXR_display_zones);
 	ENTRY_IF_EXT(xrGetDisplayZoneRecommendedViewSizeDXR, DXR_display_zones);
+	ENTRY_IF_EXT(xrGetWorkspaceTileSizeDXR, DXR_display_zones);
 #endif
 
 #ifdef OXR_HAVE_DXR_weave
