@@ -13,6 +13,7 @@
  */
 
 #include "xrt/xrt_compiler.h"
+#include "xrt/xrt_display_metrics.h" // struct xrt_window_metrics (tile size, #225)
 
 #include "util/u_misc.h"
 #include "util/u_trace_marker.h"
@@ -81,6 +82,34 @@ oxr_xrGetDisplayZoneRecommendedViewSizeDXR(XrSession session,
 	recommendedViewSize->width = zoneRect->extent.width;
 	recommendedViewSize->height = zoneRect->extent.height;
 
+	return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetWorkspaceTileSizeDXR(XrSession session, XrExtent2Di *tileSize)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetWorkspaceTileSizeDXR");
+	OXR_VERIFY_ARG_NOT_NULL(&log, tileSize);
+
+	// The client's live target canvas = the shell-driven per-client window rect
+	// (#225). window_pixel_* is recomputed from the tile pose on every resize
+	// (slot_pose_to_pixel_rect), so this tracks the 3D-window size — which a
+	// minimized engine tile's own backbuffer cannot. 0x0 before the slot binds
+	// → the app keeps its current authoring size and re-queries next frame.
+	struct xrt_window_metrics wm = {0};
+	if (oxr_session_get_window_metrics(sess, &wm) && wm.valid &&
+	    wm.window_pixel_width > 0 && wm.window_pixel_height > 0) {
+		tileSize->width = (int32_t)wm.window_pixel_width;
+		tileSize->height = (int32_t)wm.window_pixel_height;
+		return XR_SUCCESS;
+	}
+
+	tileSize->width = 0;
+	tileSize->height = 0;
 	return XR_SUCCESS;
 }
 

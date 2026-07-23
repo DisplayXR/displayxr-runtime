@@ -58,7 +58,11 @@ extern "C" {
 #endif
 
 #define XR_DXR_display_zones 1
-#define XR_DXR_display_zones_SPEC_VERSION 1
+// SPEC_VERSION 2 (#225): + xrGetWorkspaceTileSizeDXR — the client's live target
+// canvas size in pixels (the shell-driven workspace tile this session composites
+// into; follows tile resize). A minimized engine tile (whose OS window/backbuffer
+// can't track the resize) queries this to re-author to the current tile.
+#define XR_DXR_display_zones_SPEC_VERSION 2
 #define XR_DXR_DISPLAY_ZONES_EXTENSION_NAME "XR_DXR_display_zones"
 
 // Extension type-value range (1004999xxx); replace with a Khronos-assigned
@@ -171,6 +175,16 @@ typedef XrResult (XRAPI_PTR *PFN_xrGetDisplayZoneCapabilitiesDXR)(
 typedef XrResult (XRAPI_PTR *PFN_xrGetDisplayZoneRecommendedViewSizeDXR)(
     XrSession session, const XrRect2Di* zoneRect, XrExtent2Di* recommendedViewSize);
 
+//! (spec v2, #225) Live target canvas (workspace-tile) pixel size for this
+//! session — the shell-driven per-client window rect, updated on resize. Zone /
+//! Local2D rects (client-window pixels) should be authored against this so a
+//! minimized engine tile (whose backbuffer can't track the OS resize) can
+//! re-fit each frame. Standalone: the client's own window client-area size.
+//! 0x0 before the slot binds. Re-query per frame (cheap) or on
+//! XrEventDataDisplayZoneMetricsChangedDXR.
+typedef XrResult (XRAPI_PTR *PFN_xrGetWorkspaceTileSizeDXR)(
+    XrSession session, XrExtent2Di* tileSize);
+
 #ifndef XR_NO_PROTOTYPES
 
 //! Query whether the session can consume zone-chained projection layers.
@@ -183,6 +197,11 @@ XRAPI_ATTR XrResult XRAPI_CALL xrGetDisplayZoneCapabilitiesDXR(
 //! (display modes are session-global); only per-view dimensions vary by rect.
 XRAPI_ATTR XrResult XRAPI_CALL xrGetDisplayZoneRecommendedViewSizeDXR(
     XrSession session, const XrRect2Di* zoneRect, XrExtent2Di* recommendedViewSize);
+
+//! (spec v2, #225) Live workspace-tile pixel size for this session.
+//! See PFN_xrGetWorkspaceTileSizeDXR.
+XRAPI_ATTR XrResult XRAPI_CALL xrGetWorkspaceTileSizeDXR(
+    XrSession session, XrExtent2Di* tileSize);
 
 #endif /* !XR_NO_PROTOTYPES */
 

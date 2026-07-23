@@ -1018,6 +1018,10 @@ XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrGetDisplayZoneRecommendedViewSizeDXR(XrSession session,
                                            const XrRect2Di *zoneRect,
                                            XrExtent2Di *recommendedViewSize);
+
+//! OpenXR API function @ep{xrGetWorkspaceTileSizeDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetWorkspaceTileSizeDXR(XrSession session, XrExtent2Di *tileSize);
 #endif
 
 #ifdef OXR_HAVE_DXR_weave
