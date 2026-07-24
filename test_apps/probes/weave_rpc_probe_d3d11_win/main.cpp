@@ -88,6 +88,10 @@ static bool g_useV6 = false;
 // instead; this is a runtime harness, not a model app.
 static uint32_t g_v6Cols = 2, g_v6Rows = 1;
 static bool g_v6Exact = false; //!< DXR_WEAVE_V6_EXACT=1 -> atlas == packed region (zero-copy branch)
+// DXR_REQUEST_MODE=N asks the runtime for rendering mode N via
+// xrRequestDisplayRenderingModeDXR (#776). A present-owner could not do this
+// before — the request was stored and never applied. -1 = don't request.
+static int g_requestMode = -1;
 static float g_v6ScaleX = 0.5f, g_v6ScaleY = 1.0f;
 
 // v4 overlay atlas (browser#18): a window-sized premultiplied-alpha 2D layer the
@@ -654,6 +658,13 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 			g_v6ScaleY = sy;
 		}
 	}
+	{
+		char mb[16] = {0};
+		DWORD mn = GetEnvironmentVariableA("DXR_REQUEST_MODE", mb, (DWORD)sizeof(mb));
+		if (mn > 0 && mn < sizeof(mb)) {
+			g_requestMode = atoi(mb);
+		}
+	}
 	LOG_INFO("Input layout: %s", g_useV6 ? "v6 N-view worst-case atlas (#774)"
 	                                      : "v3/v4/v5 per-rect squeezed SBS");
 	if (g_useV6) {
@@ -705,6 +716,22 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 	LogXrResult("xrWeaveBindWindowDXR", br);
 	if (XR_FAILED(br)) {
 		return 1;
+	}
+
+	// #776: ask for a specific rendering mode. Before the #776 fix a
+	// present-owner's request was stored and never applied (the only consumer
+	// was the per-client commit, which a weave caller never runs), and the
+	// force-3D kick then pinned it to the first 3D-capable mode.
+	if (g_requestMode >= 0) {
+		PFN_xrRequestDisplayRenderingModeDXR pfnReqMode = nullptr;
+		xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR",
+		                      (PFN_xrVoidFunction *)&pfnReqMode);
+		if (pfnReqMode == nullptr) {
+			LOG_ERROR("xrRequestDisplayRenderingModeDXR: NOT RESOLVED");
+		} else {
+			XrResult mr = pfnReqMode(xr.session, (uint32_t)g_requestMode);
+			LOG_INFO("xrRequestDisplayRenderingModeDXR(%d) -> %d", g_requestMode, (int)mr);
+		}
 	}
 
 	LARGE_INTEGER freq;
