@@ -59,15 +59,22 @@ command -v dpkg-deb >/dev/null 2>&1 || {
 
 find_runtime() { find "$BUILD_DIR/src/xrt/targets/openxr" -maxdepth 1 -name "openxr_displayxr.so" -type f 2>/dev/null | head -1; }
 
-if [ -z "$(find_runtime)" ]; then
-    if [ "$NO_BUILD" = 1 ]; then
-        echo "error: no build found under $BUILD_DIR (run scripts/build_linux.sh --no-test first)" >&2
+if [ "$NO_BUILD" = 1 ]; then
+    # Reuse an existing build — the caller guarantees it matches the current
+    # checkout (e.g. a CI step that built immediately before). Fail if none.
+    [ -n "$(find_runtime)" ] || {
+        echo "error: --no-build set but no build under $BUILD_DIR (run scripts/build_linux.sh --no-test first)" >&2
         exit 1
-    fi
-    # Phase 1: IN-PROCESS runtime, no service (#710). --no-test because the dev
-    # selftest wires XRT_PLUGIN_SEARCH_PATH; we validate the packaged, env-free
-    # path separately via scripts/test_deb_linux.sh.
-    echo "==> No existing build — running build_linux.sh --no-test (in-process, no service)"
+    }
+    echo "==> --no-build: reusing existing build under $BUILD_DIR (caller-guaranteed current)"
+else
+    # ALWAYS a clean build so the .deb bits match HEAD. Reusing a stale build/
+    # from an earlier checkout would ship wrong code under a fresh `git describe`
+    # version string — the silent correctness bug from the Suzhou Odyssey Track B
+    # run (cube-hw finding A: 58039d4 bits shipped as 6afba6a → zero-config
+    # discovery broke). Phase 1: IN-PROCESS runtime, no service (#710).
+    echo "==> Clean build via build_linux.sh --no-test (in-process, no service)"
+    rm -rf "$BUILD_DIR"
     "$ROOT/scripts/build_linux.sh" --no-test
 fi
 
@@ -144,8 +151,14 @@ compute_depends() {
         # (which had dropped libcjson1/libvulkan1). Keep only the line whose file
         # basename is EXACTLY the soname (so libfoo.so.1.2.3 / dev symlinks don't
         # match), then strip dpkg's ':arch' qualifier off the package name.
+        # Only accept a match whose file lives in a SYSTEM linker dir (/lib,
+        # /usr/lib, /lib64, ...), and never the vendor SR runtime. The Leia SR
+        # runtime bundles copies of common .so's under /opt/leiasr/lib, so a bare
+        # `dpkg -S <soname>` can otherwise attribute a system lib to
+        # `leiasr-runtime` — the runtime .deb must NEVER Depend on the commercial
+        # SR package (cube-hw finding B).
         pkg="$(dpkg -S "$so" 2>/dev/null \
-               | awk -F': ' -v s="$so" '{n=split($2,a,"/"); if (a[n]==s){p=$1; sub(/:.*/,"",p); print p; exit}}')"
+               | awk -F': ' -v s="$so" '$2 ~ /^\/(usr\/)?lib(32|64)?\// {n=split($2,a,"/"); if (a[n]==s){p=$1; sub(/:.*/,"",p); if (p!="leiasr-runtime"){print p; exit}}}')"
         [ -n "$pkg" ] && pkgs="$pkgs $pkg"
     done
     # Always include libc6; dedupe; comma-join.
