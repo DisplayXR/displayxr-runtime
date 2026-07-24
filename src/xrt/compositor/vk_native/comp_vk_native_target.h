@@ -48,6 +48,30 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
                               struct comp_vk_native_target **out_target);
 
 /*!
+ * Create a target from an already-built VkSurfaceKHR (direct-scanout path,
+ * ST-5539). The window backend owns the surface — the target borrows it and
+ * never destroys it. Skips per-platform surface creation; reuses the shared
+ * semaphore + swapchain setup. Dimensions are the connector's fixed scanout
+ * mode (no resize).
+ *
+ * @param c          The Vulkan native compositor.
+ * @param surface    A valid display-plane VkSurfaceKHR owned by the caller.
+ * @param width      Scanout width in pixels.
+ * @param height     Scanout height in pixels.
+ * @param out_target Pointer to receive the created target.
+ *
+ * @return XRT_SUCCESS on success, error code otherwise.
+ *
+ * @ingroup comp_vk_native
+ */
+xrt_result_t
+comp_vk_native_target_create_from_surface(struct comp_vk_native_compositor *c,
+                                          VkSurfaceKHR surface,
+                                          uint32_t width,
+                                          uint32_t height,
+                                          struct comp_vk_native_target **out_target);
+
+/*!
  * Destroy a Vulkan presentation target.
  *
  * @ingroup comp_vk_native

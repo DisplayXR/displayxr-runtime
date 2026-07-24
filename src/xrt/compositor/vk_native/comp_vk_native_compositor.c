@@ -75,6 +75,14 @@
 #include "vk_native/comp_vk_native_window_xcb.h"
 #endif
 
+// Direct-scanout present path (ST-5539). Only compiled when the bundle carries
+// the display + acquire-xlib platform (CMake: XRT_HAVE_XLIB_XRANDR); the whole
+// direct branch below is gated on the same macro so its symbols exist.
+#if defined(VK_USE_PLATFORM_XLIB_XRANDR_EXT) && defined(VK_USE_PLATFORM_DISPLAY_KHR)
+#define DXR_HAVE_DIRECT_SCANOUT
+#include "vk_native/comp_vk_native_window_direct.h"
+#endif
+
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
@@ -161,6 +169,13 @@ struct comp_vk_native_compositor
 
 	//! True if we created the window ourselves.
 	bool owns_window;
+
+#ifdef DXR_HAVE_DIRECT_SCANOUT
+	//! Direct-scanout backend (owns the acquired connector + display-plane
+	//! surface). Non-NULL only when DXR_LINUX_DIRECT_SCANOUT opted in AND the
+	//! acquire succeeded; NULL means we stayed on the XCB path. ST-5539.
+	struct comp_vk_native_window_direct *direct_window;
+#endif
 #endif
 
 	//! Shared texture VkImage (imported from HANDLE).
@@ -3200,6 +3215,13 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	if (c->xcb_window != NULL) {
 		comp_vk_native_window_xcb_destroy(&c->xcb_window);
 	}
+#ifdef DXR_HAVE_DIRECT_SCANOUT
+	// After the target (swapchain) is gone — the backend owns the surface it
+	// borrowed to it — release the display back to the X server.
+	if (c->direct_window != NULL) {
+		comp_vk_native_window_direct_destroy(&c->direct_window);
+	}
+#endif
 #endif
 
 	// Destroy command pool (we created it for the display processor factory)
@@ -3472,25 +3494,52 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			win_w = 1920;
 			win_h = 1080;
 		}
-		// Open on the 3D panel at the plug-in-reported position (as the
-		// Windows arm does), with the DXR_WINDOW_POS env override winning. #715.
-		int32_t win_left = display_screen_left;
-		int32_t win_top = display_screen_top;
-		apply_window_pos_override(&win_left, &win_top);
-		U_LOG_I("Creating self-owned XCB window (%ux%u at %d,%d)", win_w, win_h, win_left, win_top);
-		xrt_result_t xret = comp_vk_native_window_xcb_create(
-		    win_w, win_h, win_left, win_top, transparent_background, &c->xcb_window);
-		if (xret != XRT_SUCCESS) {
-			U_LOG_E("Failed to create self-owned XCB window");
-			free(c);
-			return xret;
+
+#ifdef DXR_HAVE_DIRECT_SCANOUT
+		// Opt-in direct scanout (ST-5539): fullscreen-only, reclaims the ~44%
+		// Xorg+compositor presentation cost. Acquire the 3D-panel connector and
+		// scan out to it directly. Any failure (exts absent, no leasable
+		// connector) leaves direct_window NULL → fall through to XCB below, so
+		// the default path is untouched.
+		const char *ds_env = getenv("DXR_LINUX_DIRECT_SCANOUT");
+		if (ds_env != NULL && ds_env[0] == '1') {
+			xrt_result_t dret = comp_vk_native_window_direct_create(
+			    &c->vk, display_screen_left, display_screen_top, &c->direct_window);
+			if (dret == XRT_SUCCESS) {
+				c->owns_window = true;
+				// hwnd stays NULL; the target is built from the backend's
+				// display-plane surface after settings init.
+				U_LOG_W("Direct-scanout present path active (bypassing Xorg/compositor)");
+			} else {
+				U_LOG_W("DXR_LINUX_DIRECT_SCANOUT set but direct scanout "
+				        "unavailable (%d) — falling back to XCB present",
+				        (int)dret);
+			}
 		}
-		c->owns_window = true;
-		// Hand the connection + window id to the target via the type-erased
-		// hwnd. c->xcb_handle lives in the compositor, so the connection the
-		// surface borrows stays valid for the target's lifetime.
-		comp_vk_native_window_xcb_get_handle(c->xcb_window, &c->xcb_handle);
-		hwnd = &c->xcb_handle;
+		if (c->direct_window == NULL)
+#endif
+		{
+			// Open on the 3D panel at the plug-in-reported position (as the
+			// Windows arm does), with the DXR_WINDOW_POS env override winning. #715.
+			int32_t win_left = display_screen_left;
+			int32_t win_top = display_screen_top;
+			apply_window_pos_override(&win_left, &win_top);
+			U_LOG_I("Creating self-owned XCB window (%ux%u at %d,%d)", win_w, win_h, win_left,
+			        win_top);
+			xrt_result_t xret = comp_vk_native_window_xcb_create(
+			    win_w, win_h, win_left, win_top, transparent_background, &c->xcb_window);
+			if (xret != XRT_SUCCESS) {
+				U_LOG_E("Failed to create self-owned XCB window");
+				free(c);
+				return xret;
+			}
+			c->owns_window = true;
+			// Hand the connection + window id to the target via the type-erased
+			// hwnd. c->xcb_handle lives in the compositor, so the connection the
+			// surface borrows stays valid for the target's lifetime.
+			comp_vk_native_window_xcb_get_handle(c->xcb_window, &c->xcb_handle);
+			hwnd = &c->xcb_handle;
+		}
 	}
 #endif
 
@@ -3536,7 +3585,18 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 #endif
 
 #ifdef XRT_OS_LINUX_DESKTOP
-	if (c->xcb_window != NULL) {
+#ifdef DXR_HAVE_DIRECT_SCANOUT
+	if (c->direct_window != NULL) {
+		// Direct scanout: dimensions are the connector's fixed native mode.
+		uint32_t dw = 0, dh = 0;
+		comp_vk_native_window_direct_get_dimensions(c->direct_window, &dw, &dh);
+		if (dw > 0 && dh > 0) {
+			c->settings.preferred.width = dw;
+			c->settings.preferred.height = dh;
+		}
+	} else
+#endif
+	    if (c->xcb_window != NULL) {
 		uint32_t xw = 0, xh = 0;
 		comp_vk_native_window_xcb_get_dimensions(c->xcb_window, &xw, &xh);
 		if (xw > 0 && xh > 0) {
@@ -3630,18 +3690,28 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	    || c->owns_window
 #endif
 	) {
-		void *target_hwnd = hwnd;
+		xrt_result_t xret;
+#ifdef DXR_HAVE_DIRECT_SCANOUT
+		if (c->direct_window != NULL) {
+			// Direct scanout: the backend already built the display-plane
+			// surface — hand it straight to the target (no hwnd).
+			xret = comp_vk_native_target_create_from_surface(
+			    c, comp_vk_native_window_direct_get_surface(c->direct_window),
+			    c->settings.preferred.width, c->settings.preferred.height, &c->target);
+		} else
+#endif
+		{
+			void *target_hwnd = hwnd;
 #ifdef XRT_OS_WINDOWS
-		if (target_hwnd == NULL) target_hwnd = c->hwnd;
+			if (target_hwnd == NULL) target_hwnd = c->hwnd;
 #endif
 #ifdef XRT_OS_LINUX_DESKTOP
-		if (target_hwnd == NULL && c->xcb_window != NULL) target_hwnd = &c->xcb_handle;
+			if (target_hwnd == NULL && c->xcb_window != NULL) target_hwnd = &c->xcb_handle;
 #endif
-		xrt_result_t xret = comp_vk_native_target_create(c, target_hwnd,
-		                                                  c->settings.preferred.width,
-		                                                  c->settings.preferred.height,
-		                                                  transparent_background,
-		                                                  &c->target);
+			xret = comp_vk_native_target_create(c, target_hwnd, c->settings.preferred.width,
+			                                    c->settings.preferred.height,
+			                                    transparent_background, &c->target);
+		}
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to create VK target");
 			vk_compositor_destroy(&c->base.base);
