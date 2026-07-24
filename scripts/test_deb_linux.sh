@@ -53,14 +53,18 @@ fi
 # --- 2. Build the .deb (repo bind-mounted; artifacts land in dist/) --------
 if [ "$VERIFY_ONLY" = 0 ]; then
     echo "==> Building .deb inside $IMAGE"
-    docker run --rm -v "$ROOT":/src -w /src "$IMAGE" bash -c '
+    # BUILD_DIR points at a container-local dir (NOT under the /src bind mount),
+    # so a stale host build/ cache can't collide with the container's /src path
+    # and the build runs on the fast container fs. DIST_DIR defaults to /src/dist
+    # (mounted) so the .deb lands back on the host.
+    docker run --rm -v "$ROOT":/src -w /src -e BUILD_DIR=/root/dxr-build "$IMAGE" bash -c '
         set -e
         git config --global --add safe.directory /src
         ./scripts/package_deb_linux.sh'
 fi
 
-DEB="$(ls -t "$ROOT"/dist/displayxr-runtime_*_amd64.deb 2>/dev/null | head -1 || true)"
-[ -n "$DEB" ] || { echo "error: no dist/displayxr-runtime_*_amd64.deb found" >&2; exit 1; }
+DEB="$(ls -t "$ROOT"/dist/displayxr-runtime_*_*.deb 2>/dev/null | head -1 || true)"
+[ -n "$DEB" ] || { echo "error: no dist/displayxr-runtime_*_*.deb found" >&2; exit 1; }
 echo "==> Testing $(basename "$DEB")"
 
 # --- 3. Clean-install + env-free acceptance run ----------------------------
