@@ -30,6 +30,13 @@
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_DXR_xlib_window_binding.h>
 #include <openxr/XR_DXR_display_info.h>
+#include <openxr/XR_DXR_view_rig.h>
+
+// displayxr-common: remap GL-convention clip-depth ([-1,1]) to Vulkan's [0,1].
+// mat4_from_xr_fov (== the Windows ProjectionFromXrFov) emits GL depth; without
+// this remap, geometry nearer than the mid-range crossover is near-clipped in
+// Vulkan (invisible windowed, where the ZDP near sits close to the content).
+#include "projection_depth.h"
 
 #include <cmath>
 #include <csignal>
@@ -77,6 +84,12 @@
             return false; \
         } \
     } while (0)
+
+// Virtual-display height in app units fed to the runtime's display rig
+// (XR_DXR_view_rig). m2v = kVirtualDisplayHeight / physical panel height. The
+// scene is authored so the panel is this tall at Z=0; the cube is 1/4 of it.
+// Same constant + semantics as cube_handle_vk_win (main.cpp virtualDisplayHeight).
+static const float kVirtualDisplayHeight = 0.24f;
 
 // ============================================================================
 // App-owned X11 window (handle class — XR_DXR_xlib_window_binding)
@@ -1591,18 +1604,20 @@ static void RenderScene(
 
         // Draw textured cube
         {
-            const float cubeSize = 0.3f;
-            // Display-centered: the 3D-display camera sits at the nominal viewer
-            // (eye Y=0 in front of the screen), so content lives near Y=0, not at
-            // VR standing height. cubeSize/2 rests it on the Y=0 grid floor, like
-            // the cube_handle_* apps. (The old 1.6 put it ~38° above an 18.5°
-            // vertical frame → off-screen in service mode.)
-            const float cubeHeight = cubeSize / 2.0f;
+            // Virtual-display scene model (identical to cube_handle_vk_win):
+            // the virtual display plane is kVirtualDisplayHeight (0.24) tall and
+            // lives at Z=0 (the runtime's display rig makes Z=0 the zero-disparity
+            // / convergence plane). A cube of 1/4 that height, centered ON the
+            // plane, therefore converges (sharp, zero parallax) and fills 1/4 of
+            // the panel. The old 0.3 cube pushed to Z=-2 rendered 5x too big and
+            // 2m behind convergence — huge disparity, out of focus.
+            const float cubeSize = kVirtualDisplayHeight / 4.0f;  // 0.06
+            const float cubeHeight = cubeSize / 2.0f;             // rests base on Y=0 grid
 
             float rot[16], scl[16], trans[16], model[16], tmp[16];
             mat4_rotation_y(rot, renderer.cubeRotation);
             mat4_scaling(scl, cubeSize, cubeSize, cubeSize);
-            mat4_translation(trans, 0.0f, cubeHeight, -2.0f);
+            mat4_translation(trans, 0.0f, cubeHeight, 0.0f);  // ON the display plane (Z=0)
             mat4_multiply(tmp, scl, rot);
             mat4_multiply(model, trans, tmp);
             float mvp[16];
@@ -1808,6 +1823,32 @@ struct AppXrSession {
     // pixels (top-down, origin = primary top-left); (0,0) = primary/unknown.
     int32_t displayScreenLeft = 0;
     int32_t displayScreenTop = 0;
+
+    // Physical panel dims (meters) from XR_DXR_display_info — the m2v anchor for
+    // the display rig (m2v = virtualDisplayHeight / displayHeightM). 0 = unknown.
+    float displayWidthM = 0.0f;
+    float displayHeightM = 0.0f;
+
+    // Panel resolution (pixels) from XR_DXR_display_info — used to open the app
+    // window fullscreen on the panel (window == display → zero eye offset → the
+    // cube renders on-axis, matching the Windows fullscreen demo). 0 = unknown.
+    uint32_t displayPixelWidth = 0;
+    uint32_t displayPixelHeight = 0;
+
+    // Per-view scale — the fraction of the display each view occupies. This is
+    // NOT a constant: it comes from XR_DXR_display_info (recommendedViewScaleX/Y;
+    // 0.5x0.5 for a 2-view SBS mode, 1.0 for 2D). Per the swapchain model
+    // (docs/specs/runtime/multiview-tiling.md §"Swapchain images are worst-case
+    // sized" + ADR-010/030): the swapchain is worst-case `display × scale`, but
+    // a WINDOWED app renders `view = window × scale` and the compositor crops.
+    // Init to identity so the value is only ever the extension's — never assumed.
+    float viewScaleX = 1.0f;
+    float viewScaleY = 1.0f;
+
+    // XR_DXR_view_rig available+enabled: the app chains XrDisplayRigDXR on
+    // xrLocateViews and the RUNTIME does the window-relative Kooima (it has the
+    // window handle + display info + view poses), returning render-ready views.
+    bool hasViewRig = false;
 };
 
 static bool InitializeOpenXR(AppXrSession& xr) {
@@ -1822,6 +1863,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     bool hasVulkan = false;
     bool hasXlibBinding = false;
     bool hasDisplayInfo = false;
+    bool hasViewRig = false;
     for (const auto& ext : extensions) {
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) {
             hasVulkan = true;
@@ -1831,6 +1873,9 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         }
         if (strcmp(ext.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) {
             hasDisplayInfo = true;
+        }
+        if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
+            hasViewRig = true;
         }
     }
 
@@ -1860,7 +1905,19 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         // fixed 2-view SBS at whatever dimensions xrEnumerateViewConfigurationViews
         // reports at init, and does not adapt to later mode changes.
         enabledExtensions.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
-        LOG_INFO("XR_DXR_display_info: AVAILABLE (enabled for panel position)");
+        LOG_INFO("XR_DXR_display_info: AVAILABLE (enabled for panel position + dims)");
+    }
+    // XR_DXR_view_rig (#396 W7): the app chains XrDisplayRigDXR on every
+    // xrLocateViews and the runtime does the window-relative Kooima (window
+    // handle + display info + view poses → render-ready XrView{pose,fov}).
+    // This is what makes convergence + scale correct — same as the Windows app.
+    if (hasViewRig && hasDisplayInfo) {
+        enabledExtensions.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+        xr.hasViewRig = true;
+        LOG_INFO("XR_DXR_view_rig: AVAILABLE (enabled — runtime-driven display rig)");
+    } else {
+        LOG_INFO("XR_DXR_view_rig: %s — falling back to raw xrLocateViews fov",
+                 hasViewRig ? "needs display_info" : "NOT FOUND");
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -1887,14 +1944,26 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     // (0,0) = primary is the safe fallback either way.
     if (hasDisplayInfo) {
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
+        // Chain: sysProps -> XrDisplayInfoDXR (physical dims) -> desktop position.
+        XrDisplayInfoDXR displayInfo = {XR_TYPE_DISPLAY_INFO_DXR};
         XrDisplayDesktopPositionDXR desktopPos = {};
         desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
-        sysProps.next = &desktopPos;
+        displayInfo.next = &desktopPos;
+        sysProps.next = &displayInfo;
         if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sysProps))) {
             xr.displayScreenLeft = desktopPos.left;
             xr.displayScreenTop = desktopPos.top;
-            LOG_INFO("Display desktop position: (%d, %d)",
-                     xr.displayScreenLeft, xr.displayScreenTop);
+            xr.displayWidthM = displayInfo.displaySizeMeters.width;
+            xr.displayHeightM = displayInfo.displaySizeMeters.height;
+            xr.displayPixelWidth = displayInfo.displayPixelWidth;
+            xr.displayPixelHeight = displayInfo.displayPixelHeight;
+            if (displayInfo.recommendedViewScaleX > 0.0f) xr.viewScaleX = displayInfo.recommendedViewScaleX;
+            if (displayInfo.recommendedViewScaleY > 0.0f) xr.viewScaleY = displayInfo.recommendedViewScaleY;
+            LOG_INFO("Display desktop position: (%d, %d), physical size: %.4f x %.4f m, %ux%u px, scale %.3fx%.3f",
+                     xr.displayScreenLeft, xr.displayScreenTop,
+                     xr.displayWidthM, xr.displayHeightM,
+                     xr.displayPixelWidth, xr.displayPixelHeight,
+                     xr.viewScaleX, xr.viewScaleY);
         }
     }
 
@@ -2374,8 +2443,28 @@ int main() {
     }
 
     // Create the app-owned X11 window on the 3D panel — it is passed to the
-    // runtime at xrCreateSession via XR_DXR_xlib_window_binding.
-    if (!CreateAppWindow(1600, 900, xr.displayScreenLeft, xr.displayScreenTop)) {
+    // runtime at xrCreateSession via XR_DXR_xlib_window_binding. Open it at the
+    // FULL panel size (window == display) so the window-relative Kooima has zero
+    // eye offset and the cube renders on-axis — the real fullscreen demo mode,
+    // matching cube_handle_vk_win. Falls back to a windowed size if the panel
+    // pixel dims are unknown.
+    uint32_t winW = xr.displayPixelWidth  > 0 ? xr.displayPixelWidth  : 1600;
+    uint32_t winH = xr.displayPixelHeight > 0 ? xr.displayPixelHeight : 900;
+    int32_t winLeft = xr.displayScreenLeft;
+    int32_t winTop  = xr.displayScreenTop;
+    // DXR_CUBE_WINDOW="WxH+X+Y" (offset relative to the panel) forces a windowed
+    // size/position — for exercising the window-relative Kooima off-center.
+    // Absent → fullscreen on the panel (window == display).
+    if (const char* wenv = getenv("DXR_CUBE_WINDOW")) {
+        unsigned w = 0, h = 0; int ox = 0, oy = 0;
+        if (sscanf(wenv, "%ux%u+%d+%d", &w, &h, &ox, &oy) >= 2 && w > 0 && h > 0) {
+            winW = w; winH = h;
+            winLeft = xr.displayScreenLeft + ox;
+            winTop  = xr.displayScreenTop  + oy;
+            LOG_INFO("DXR_CUBE_WINDOW override: %ux%u at panel-relative (%d,%d)", w, h, ox, oy);
+        }
+    }
+    if (!CreateAppWindow(winW, winH, winLeft, winTop)) {
         LOG_ERROR("X11 window creation failed");
         CleanupOpenXR(xr);
         return 1;
@@ -2535,6 +2624,23 @@ int main() {
                     xrLocateViews(xr.session, &locateInfo, &viewState, 0, &viewCount, nullptr);
                     if (viewCount == 0) viewCount = 2; // fallback
 
+                    // XR_DXR_view_rig: chain the display rig so the runtime does
+                    // the window-relative Kooima and returns render-ready
+                    // XrView{pose,fov}. Identity rig pose (no fly-cam here); the
+                    // virtual display is kVirtualDisplayHeight tall on the panel,
+                    // so a cube of 1/4 that height at Z=0 converges + fills 1/4
+                    // of the panel — identical to cube_handle_vk_win.
+                    const bool useDisplayRig = xr.hasViewRig && xr.displayWidthM > 0.0f;
+                    XrDisplayRigDXR displayRig = {XR_TYPE_DISPLAY_RIG_DXR};
+                    if (useDisplayRig) {
+                        displayRig.pose = XrPosef{{0, 0, 0, 1}, {0, 0, 0}};
+                        displayRig.virtualDisplayHeight = kVirtualDisplayHeight;
+                        displayRig.ipdFactor = 1.0f;
+                        displayRig.parallaxFactor = 1.0f;
+                        displayRig.perspectiveFactor = 1.0f;
+                        locateInfo.next = &displayRig;
+                    }
+
                     std::vector<XrView> views(viewCount, {XR_TYPE_VIEW});
                     XrResult locResult = xrLocateViews(xr.session, &locateInfo, &viewState, viewCount, &viewCount, views.data());
                     if (XR_SUCCEEDED(locResult) &&
@@ -2545,12 +2651,40 @@ int main() {
                         if (AcquireSwapchainImage(xr, imageIndex)) {
                             rendered = true;
 
-                            // Legacy app: always render 2 stereo views in SBS layout.
-                            // View dimensions come from recommendedImageRectWidth/Height (set at init).
-                            // The runtime handles 2D/3D mode switching — we just render the same SBS atlas.
+                            // 2-view SBS. Per-eye RENDER TILE = window × view_scale
+                            // (docs/specs/runtime/multiview-tiling.md §"Swapchain
+                            // images are worst-case sized" + ADR-010/030): the
+                            // swapchain is the worst-case `display × scale` envelope,
+                            // but a WINDOWED app renders `view = window × scale` and
+                            // the compositor crops. Using the frozen recommended tile
+                            // (= display × scale) made the window-relative Kooima fov
+                            // render into a panel-sized tile → oversized + off-center
+                            // when windowed. Query the LIVE window each frame; clamp
+                            // to the swapchain envelope.
                             uint32_t eyeCount = 2;
-                            uint32_t eyeW = xr.viewWidth;
-                            uint32_t eyeH = xr.viewHeight;
+                            uint32_t winW = 0, winH = 0;
+                            {
+                                XWindowAttributes wa = {};
+                                if (g_xDisplay != nullptr && g_xWindow != 0 &&
+                                    XGetWindowAttributes(g_xDisplay, g_xWindow, &wa) &&
+                                    wa.width > 0 && wa.height > 0) {
+                                    winW = (uint32_t)wa.width;
+                                    winH = (uint32_t)wa.height;
+                                }
+                            }
+                            uint32_t eyeW, eyeH;
+                            if (winW > 0 && winH > 0) {
+                                eyeW = (uint32_t)(winW * xr.viewScaleX);
+                                eyeH = (uint32_t)(winH * xr.viewScaleY);
+                            } else {
+                                eyeW = xr.viewWidth;   // fallback: recommended (fullscreen envelope)
+                                eyeH = xr.viewHeight;
+                            }
+                            // Clamp to the worst-case swapchain (SBS packs 2 tiles wide).
+                            if (eyeW == 0) eyeW = 1;
+                            if (eyeH == 0) eyeH = 1;
+                            if (eyeW > xr.swapchain.width / eyeCount) eyeW = xr.swapchain.width / eyeCount;
+                            if (eyeH > xr.swapchain.height) eyeH = xr.swapchain.height;
 
                             EyeRenderParams eyeParams[2];
                             projectionViews.resize(eyeCount, {});
@@ -2560,7 +2694,25 @@ int main() {
                                 eyeParams[i].width = eyeW;
                                 eyeParams[i].height = eyeH;
                                 mat4_view_from_xr_pose(eyeParams[i].viewMat, views[i].pose);
-                                mat4_from_xr_fov(eyeParams[i].projMat, views[i].fov, 0.01f, 100.0f);
+                                // Clip policy stays app-side (fov is clip-independent).
+                                // Display rig: ZDP-anchored near/far so depth precision
+                                // brackets the convergence plane — near = ez - vH,
+                                // far = ez + 1000·vH, ez = rig-local eye Z (= pose Z at
+                                // identity rig). Matches cube_handle_vk_win.
+                                float nearZ = 0.01f, farZ = 100.0f;
+                                if (useDisplayRig) {
+                                    float ez = views[i].pose.position.z;
+                                    nearZ = (ez - kVirtualDisplayHeight > 0.001f)
+                                                ? (ez - kVirtualDisplayHeight) : 0.001f;
+                                    farZ = ez + 1000.0f * kVirtualDisplayHeight;
+                                }
+                                mat4_from_xr_fov(eyeParams[i].projMat, views[i].fov, nearZ, farZ);
+                                // mat4_from_xr_fov emits GL [-1,1] clip-depth; Vulkan
+                                // clips [0,1], so remap or the cube is near-clipped
+                                // whenever the ZDP near sits close to the content
+                                // (invisible windowed). displayxr-common shared fn,
+                                // exactly like cube_handle_vk_win.
+                                convert_projection_gl_to_zero_to_one(eyeParams[i].projMat);
 
                                 projectionViews[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                                 projectionViews[i].subImage.swapchain = xr.swapchain.swapchain;
