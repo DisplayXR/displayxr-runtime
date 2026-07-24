@@ -1570,6 +1570,14 @@ build_discovery_roots(char roots[][PATH_MAX], int max_roots)
 		snprintf(user_root, sizeof(user_root), "%s/.local/share/DisplayXR/DisplayProcessors", home);
 		append_roots(roots, max_roots, &n_roots, user_root);
 	}
+	/* Built-in default packaged plug-in dir — the Linux `.deb` drops the
+	 * sim-display .so + its `200-sim-display.json` manifest here, so an
+	 * installed box needs NO XRT_PLUGIN_SEARCH_PATH (#781). The env override
+	 * above is appended first, so a dev build still wins when it is set; when
+	 * it is unset this is the discovery root that makes an installed runtime
+	 * self-sufficient. This is the POSIX analogue of the Windows
+	 * DisplayProcessors registry root. */
+	append_roots(roots, max_roots, &n_roots, "/usr/lib/displayxr/plugins");
 	append_roots(roots, max_roots, &n_roots, "/usr/local/share/displayxr/DisplayProcessors");
 	append_roots(roots, max_roots, &n_roots, "/usr/share/displayxr/DisplayProcessors");
 #endif

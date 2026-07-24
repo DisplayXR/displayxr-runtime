@@ -232,9 +232,21 @@ Fields mirror the Windows registry schema:
 | `plugin.uninstall_command` | `UninstallString` | see §5 | Command-line invocation for cascade-uninstall. Required for vendor plug-ins.          |
 
 Discovery roots are searched in priority order — the per-user root
-above first, then any system roots a platform packager adds (e.g.
-`/usr/share/displayxr/DisplayProcessors/` on Linux distributions). Per-user
-entries with the same `<id>` shadow system entries.
+above first, then the packaged system roots below. Per-user entries with
+the same `<id>` shadow system entries.
+
+**System roots (Linux), searched after the per-user root:**
+
+| Root                                       | Who writes it                                                                 |
+| ------------------------------------------ | ----------------------------------------------------------------------------- |
+| `/usr/lib/displayxr/plugins/`              | The **built-in default** for packaged installs. The runtime `.deb` drops the sim-display `.so` + `200-sim-display.json` here; vendor plug-in `.deb`s drop their `.so` + `050-*.json` alongside. This is the POSIX analogue of the Windows `DisplayProcessors` registry root, and it is what makes an installed box need **no `XRT_PLUGIN_SEARCH_PATH`** (#781). |
+| `/usr/local/share/displayxr/DisplayProcessors/` | A distro/local packager convention.                                      |
+| `/usr/share/displayxr/DisplayProcessors/`  | A distro packager convention.                                                 |
+
+When `XRT_PLUGIN_SEARCH_PATH` is set it is prepended (highest priority), so
+a dev build still overrides an installed one; when it is unset, discovery
+falls through to `/usr/lib/displayxr/plugins/` and the install is
+self-sufficient.
 
 ### 3.2 Android: convention-driven discovery
 
