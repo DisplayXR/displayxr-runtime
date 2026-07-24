@@ -352,6 +352,43 @@ comp_vk_native_window_xcb_query_geometry(const struct comp_vk_native_xcb_handle 
 	return true;
 }
 
+bool
+comp_vk_native_window_xcb_query_screen_position(const struct comp_vk_native_xcb_handle *handle,
+                                                int32_t *out_left_px,
+                                                int32_t *out_top_px)
+{
+	if (handle == NULL || handle->connection == NULL || handle->window == 0) {
+		return false;
+	}
+
+	xcb_connection_t *conn = (xcb_connection_t *)handle->connection;
+	const xcb_setup_t *setup = xcb_get_setup(conn);
+	if (setup == NULL) {
+		return false;
+	}
+	xcb_screen_t *screen = xcb_setup_roots_iterator(setup).data;
+	if (screen == NULL) {
+		return false;
+	}
+
+	// App window origin (0,0) translated into root (screen) coordinates.
+	xcb_translate_coordinates_cookie_t cookie =
+	    xcb_translate_coordinates(conn, (xcb_window_t)handle->window, screen->root, 0, 0);
+	xcb_translate_coordinates_reply_t *reply =
+	    xcb_translate_coordinates_reply(conn, cookie, NULL);
+	if (reply == NULL) {
+		return false;
+	}
+	if (out_left_px != NULL) {
+		*out_left_px = reply->dst_x;
+	}
+	if (out_top_px != NULL) {
+		*out_top_px = reply->dst_y;
+	}
+	free(reply);
+	return true;
+}
+
 void
 comp_vk_native_window_xcb_pump(struct comp_vk_native_window_xcb *win)
 {

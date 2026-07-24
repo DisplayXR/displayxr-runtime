@@ -4022,7 +4022,16 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	// window size + screen position from XCB (X11 exposes absolute window pos,
 	// so window-relative 3D tracks window moves — the reason XCB precedes
 	// Wayland in the Linux plan).
-	if (c->xcb_window == NULL) {
+	//
+	// Two window sources: the self-owned helper (hosted class, c->xcb_window)
+	// and the app-provided window (handle class via XR_DXR_xlib_window_binding,
+	// c->xcb_handle — no helper struct). WITHOUT this handle branch a handle app
+	// returned no metrics, so the runtime fell back to DISPLAY-scoped Kooima
+	// (#396 W7): a 0.6 m-panel-sized rig drawn into a small window ⟹ oversized
+	// cube + oversized disparity. Mirror the live-resize path (which already
+	// polls c->xcb_handle geometry).
+	const bool have_app_window = (c->xcb_window == NULL && c->xcb_handle.connection != NULL);
+	if (c->xcb_window == NULL && !have_app_window) {
 		return false;
 	}
 
@@ -4056,7 +4065,11 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	}
 
 	uint32_t win_px_w = 0, win_px_h = 0;
-	comp_vk_native_window_xcb_get_dimensions(c->xcb_window, &win_px_w, &win_px_h);
+	if (have_app_window) {
+		comp_vk_native_window_xcb_query_geometry(&c->xcb_handle, &win_px_w, &win_px_h);
+	} else {
+		comp_vk_native_window_xcb_get_dimensions(c->xcb_window, &win_px_w, &win_px_h);
+	}
 	if (win_px_w == 0 || win_px_h == 0) return false;
 
 	float pixel_size_x = disp_w_m / (float)disp_px_w;
@@ -4080,7 +4093,10 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	float win_center_px_x = disp_center_px_x;
 	float win_center_px_y = disp_center_px_y;
 	int32_t win_left = 0, win_top = 0;
-	if (comp_vk_native_window_xcb_get_screen_position(c->xcb_window, &win_left, &win_top)) {
+	bool have_pos = have_app_window
+	                    ? comp_vk_native_window_xcb_query_screen_position(&c->xcb_handle, &win_left, &win_top)
+	                    : comp_vk_native_window_xcb_get_screen_position(c->xcb_window, &win_left, &win_top);
+	if (have_pos) {
 		win_center_px_x = (float)(win_left - disp_left) + (float)win_px_w / 2.0f;
 		win_center_px_y = (float)(win_top - disp_top) + (float)win_px_h / 2.0f;
 	}

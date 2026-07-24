@@ -90,6 +90,21 @@ comp_vk_native_window_xcb_query_geometry(const struct comp_vk_native_xcb_handle 
                                          uint32_t *out_height);
 
 /*!
+ * Query the absolute (root/screen) position of any window reachable through
+ * @p handle via xcb_translate_coordinates. The root is derived from the
+ * connection's first screen. Handle-based sibling of
+ * comp_vk_native_window_xcb_get_screen_position (which needs the self-owned
+ * helper) — for app-provided windows (XR_DXR_xlib_window_binding, handle class)
+ * so window-relative Kooima/FOV tracks the app window's on-screen position.
+ *
+ * @return true if the position could be translated.
+ */
+bool
+comp_vk_native_window_xcb_query_screen_position(const struct comp_vk_native_xcb_handle *handle,
+                                                int32_t *out_left_px,
+                                                int32_t *out_top_px);
+
+/*!
  * Create a self-owned X11 window (hosted class).
  *
  * @param width                  Requested window width in pixels.
