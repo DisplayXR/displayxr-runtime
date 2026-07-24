@@ -41,7 +41,11 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # lands back on the host.
 BUILD_DIR="${BUILD_DIR:-$ROOT/build}"
 DIST_DIR="${DIST_DIR:-$ROOT/dist}"
-export BUILD_DIR   # so the build_linux.sh child below uses the same tree
+# Ship a RELEASE runtime: matches the Release-built Leia plug-in (avoids a
+# Debug/Release struct-layout skew across the plug-in↔runtime boundary — cube-hw
+# finding C) and is the correct optimized artifact (Debug was 36 MB). Overridable.
+export CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
+export BUILD_DIR   # so the build_linux.sh child below uses the same tree + type
 
 NO_BUILD=0
 for arg in "$@"; do

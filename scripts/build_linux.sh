@@ -68,9 +68,15 @@ OPENXR_VERSION="1.1.51"
 # displayxr-cli links the no-compositor instance directly (target_instance_no_comp),
 # so Phase 0 needs neither a native compositor nor the OpenXR loader — only the
 # runtime libs, the CLI, and the discoverable sim_display plug-in .so.
-echo "=== Configuring DisplayXR runtime (Linux, SERVICE=$SERVICE_MODE) ==="
+# CMAKE_BUILD_TYPE is overridable (default Debug for dev). The .deb packager
+# sets it to Release so the shipped runtime matches the Release-built Leia
+# plug-in — a Debug/Release skew across the plug-in↔runtime struct boundary
+# (NDEBUG-conditional layout) is a candidate cause of the VK-DP-factory
+# null-dispatch crash seen with a Debug .deb runtime (cube-hw finding C), and a
+# Debug runtime is the wrong (36 MB, unoptimized) release artifact regardless.
+echo "=== Configuring DisplayXR runtime (Linux, SERVICE=$SERVICE_MODE, TYPE=${CMAKE_BUILD_TYPE:-Debug}) ==="
 cmake -B "$BUILD_DIR" -S "$ROOT" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Debug}" \
   -DXRT_FEATURE_SERVICE=$SERVICE_MODE \
   -DXRT_MODULE_CLI=ON \
   -DXRT_BUILD_DRIVER_QWERTY=OFF \
