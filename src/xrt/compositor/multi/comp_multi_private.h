@@ -37,6 +37,7 @@
 // (comp_multi always links aux_vk, so Vulkan is always available)
 #include "xrt/xrt_vulkan_includes.h"
 #include "vk/vk_hud_blend.h"
+#include "vk/vk_local2d_composite.h"
 #include "multi/comp_multi_content_blend.h"
 
 #include "render/render_interface.h"
@@ -44,6 +45,7 @@
 // Forward declarations for per-session rendering
 struct comp_target;
 struct xrt_eye_positions;
+struct xrt_weave_atlas_layout;
 struct xrt_window_metrics;
 struct xrt_system_devices;
 
@@ -461,8 +463,22 @@ struct multi_compositor
 		uint32_t in_iosurface_id;
 		VkImage in_image;
 		VkDeviceMemory in_memory;
+		VkImageView in_view; //!< Full-image view (v6 zero-copy DP sample source).
 		uint32_t in_w, in_h;
 		bool in_first_use; //!< First barrier transitions from UNDEFINED.
+		//! @}
+
+		//! @name v6 N-view crop staging (#774)
+		//! When the worst-case-sized input atlas is LARGER than the active
+		//! mode's packed tiles, ONE box copy lands the top-left packed region
+		//! (tiles are contiguous, so it is a single rectangle) into this image,
+		//! which the DP then samples. Zero-copy (packed == input) skips it.
+		//! @{
+		VkImage crop_image;
+		VkDeviceMemory crop_memory;
+		VkImageView crop_view;
+		uint32_t crop_w, crop_h;
+		bool crop_first_use;
 		//! @}
 
 		//! @name Window-sized 2x1 SBS scratch atlas (2*out_w x out_h)
@@ -482,6 +498,24 @@ struct multi_compositor
 		VkFramebuffer out_fb;
 		void *out_iosurface; //!< Retained exported IOSurfaceRef.
 		uint32_t out_w, out_h;
+		//! @}
+
+		//! @name v4 DP-composited 2D overlay atlas (browser#18)
+		//! A caller-supplied window-sized PREMULTIPLIED-alpha BGRA atlas composited
+		//! OVER the woven output with a premul "over" blend (out = overlay +
+		//! (1-overlay.a)*out) AFTER process_atlas. Imported like the SBS input
+		//! (VK_EXT_metal_objects) and cached by IOSurfaceID. The premul-over pass
+		//! reuses aux_vk's vk_local2d_composite flatten_premul pipeline.
+		//! @{
+		void *overlay_iosurface; //!< Retained IOSurfaceRef (adopted from the IPC receive).
+		uint32_t overlay_iosurface_id;
+		VkImage overlay_image;
+		VkDeviceMemory overlay_memory;
+		VkImageView overlay_view; //!< Sampled by the premul-over blend.
+		uint32_t overlay_w, overlay_h;
+		bool overlay_first_use; //!< First barrier transitions from UNDEFINED.
+		struct vk_local2d_composite overlay_blend; //!< premul-over flatten pipeline.
+		bool overlay_blend_initialized;
 		//! @}
 	} weave;
 #endif
@@ -810,6 +844,9 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
                         uint32_t rect_h,
                         uint32_t rect_count,
                         const struct xrt_rect *rects,
+                        xrt_graphics_buffer_handle_t overlay_handle,
+                        bool weave_frame_first,
+                        const struct xrt_weave_atlas_layout *layout,
                         uint32_t *out_width,
                         uint32_t *out_height,
                         uint64_t *out_fence_value,

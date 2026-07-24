@@ -73,6 +73,10 @@ static const uint32_t kWinW = 1280;
 static const uint32_t kWinH = 720;
 static const XrRect2Di kRectA = {{100, 100}, {320, 180}};
 static const XrRect2Di kRectB = {{700, 400}, {400, 200}};
+// v4 overlay atlas: an opaque magenta bar near the top, in a gap that overlaps
+// neither weaved rect (so the base rects still verify red/cyan) and a background
+// gap (so firstChunk transparency is verifiable outside it).
+static const XrRect2Di kOverlayBar = {{200, 30}, {800, 40}};
 
 //! BGRA pixel write helper.
 static inline void
@@ -114,6 +118,24 @@ sample_px(IOSurfaceRef surf, int x, int y, uint8_t *out_r, uint8_t *out_g, uint8
 	*out_b = p[0];
 	*out_g = p[1];
 	*out_r = p[2];
+	IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+	return true;
+}
+
+//! BGRA sample including alpha (for the v5 firstChunk transparency assertion).
+static bool
+sample_px4(IOSurfaceRef surf, int x, int y, uint8_t *out_r, uint8_t *out_g, uint8_t *out_b, uint8_t *out_a)
+{
+	if (IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) {
+		return false;
+	}
+	const uint8_t *base = (const uint8_t *)IOSurfaceGetBaseAddress(surf);
+	size_t stride = IOSurfaceGetBytesPerRow(surf);
+	const uint8_t *p = base + (size_t)y * stride + (size_t)x * 4;
+	*out_b = p[0];
+	*out_g = p[1];
+	*out_r = p[2];
+	*out_a = p[3];
 	IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
 	return true;
 }
@@ -167,6 +189,107 @@ create_input_surface(void)
 	for (int i = 0; i < 4; i++) {
 		CFRelease(vals[i]);
 	}
+	return surf;
+}
+
+/*!
+ * v4 overlay atlas (browser#18): a window-sized PREMULTIPLIED-alpha BGRA surface,
+ * transparent (0,0,0,0) everywhere except one opaque magenta bar. Opaque premul ==
+ * straight, so the bar is a plain magenta with alpha 255. Global so the service's
+ * IOSurfaceLookup(id) finds it (the IPC transports the bare IOSurfaceID).
+ */
+static IOSurfaceRef
+create_overlay_surface(void)
+{
+	int32_t w = (int32_t)kWinW, h = (int32_t)kWinH, bpe = 4;
+	uint32_t fmt = 'BGRA';
+	CFStringRef keys[5] = {CFSTR("IOSurfaceWidth"), CFSTR("IOSurfaceHeight"), CFSTR("IOSurfaceBytesPerElement"),
+	                       CFSTR("IOSurfacePixelFormat"), CFSTR("IOSurfaceIsGlobal")};
+	CFNumberRef vals[4] = {
+	    CFNumberCreate(NULL, kCFNumberSInt32Type, &w),
+	    CFNumberCreate(NULL, kCFNumberSInt32Type, &h),
+	    CFNumberCreate(NULL, kCFNumberSInt32Type, &bpe),
+	    CFNumberCreate(NULL, kCFNumberSInt32Type, &fmt),
+	};
+	CFTypeRef values[5] = {vals[0], vals[1], vals[2], vals[3], kCFBooleanTrue};
+	CFDictionaryRef props = CFDictionaryCreate(NULL, (const void **)keys, (const void **)values, 5,
+	                                           &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	IOSurfaceRef surf = IOSurfaceCreate(props);
+	CFRelease(props);
+	for (int i = 0; i < 4; i++) {
+		CFRelease(vals[i]);
+	}
+	if (surf == NULL) {
+		return NULL;
+	}
+	IOSurfaceLock(surf, 0, NULL);
+	uint8_t *base = (uint8_t *)IOSurfaceGetBaseAddress(surf);
+	size_t stride = IOSurfaceGetBytesPerRow(surf);
+	// Transparent premultiplied field everywhere (all four channels 0).
+	for (uint32_t y = 0; y < kWinH; y++) {
+		memset(base + (size_t)y * stride, 0, (size_t)kWinW * 4);
+	}
+	// Opaque magenta bar (premul == straight when a=255): B=230, G=13, R=230, A=255.
+	for (int y = kOverlayBar.offset.y; y < kOverlayBar.offset.y + kOverlayBar.extent.height; y++) {
+		for (int x = kOverlayBar.offset.x; x < kOverlayBar.offset.x + kOverlayBar.extent.width; x++) {
+			uint8_t *p = base + (size_t)y * stride + (size_t)x * 4;
+			p[0] = 230; // B
+			p[1] = 13;  // G
+			p[2] = 230; // R
+			p[3] = 255; // A (opaque)
+		}
+	}
+	IOSurfaceUnlock(surf, 0, NULL);
+	return surf;
+}
+
+//! Generic global BGRA IOSurface (kIOSurfaceIsGlobal so the service-side
+//! IOSurfaceLookup(id) finds it — the IPC transports the bare IOSurfaceID).
+static IOSurfaceRef
+create_bgra_surface(int32_t w, int32_t h)
+{
+	int32_t bpe = 4;
+	uint32_t fmt = 'BGRA';
+	CFStringRef keys[5] = {CFSTR("IOSurfaceWidth"), CFSTR("IOSurfaceHeight"), CFSTR("IOSurfaceBytesPerElement"),
+	                       CFSTR("IOSurfacePixelFormat"), CFSTR("IOSurfaceIsGlobal")};
+	CFNumberRef vals[4] = {
+	    CFNumberCreate(NULL, kCFNumberSInt32Type, &w),
+	    CFNumberCreate(NULL, kCFNumberSInt32Type, &h),
+	    CFNumberCreate(NULL, kCFNumberSInt32Type, &bpe),
+	    CFNumberCreate(NULL, kCFNumberSInt32Type, &fmt),
+	};
+	CFTypeRef values[5] = {vals[0], vals[1], vals[2], vals[3], kCFBooleanTrue};
+	CFDictionaryRef props = CFDictionaryCreate(NULL, (const void **)keys, (const void **)values, 5,
+	                                           &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	IOSurfaceRef surf = IOSurfaceCreate(props);
+	CFRelease(props);
+	for (int i = 0; i < 4; i++) {
+		CFRelease(vals[i]);
+	}
+	return surf;
+}
+
+//! Spec-v6 N-view atlas (#774): build a 2-view (2x1) atlas of size 2*cvw x cvh,
+//! tile 0 (left eye) solid RED, tile 1 (right eye) solid CYAN. The anaglyph DP
+//! (out = left.r, right.g, right.b) then weaves this to WHITE. Tiles are packed
+//! CONTIGUOUSLY at content-view stride cvw, so 2*cvw == atlas width (zero-copy).
+static IOSurfaceRef
+create_nview_atlas(uint32_t cvw, uint32_t cvh)
+{
+	IOSurfaceRef surf = create_bgra_surface((int32_t)(2 * cvw), (int32_t)cvh);
+	if (surf == NULL) {
+		return NULL;
+	}
+	IOSurfaceLock(surf, 0, NULL);
+	uint8_t *base = (uint8_t *)IOSurfaceGetBaseAddress(surf);
+	size_t stride = IOSurfaceGetBytesPerRow(surf);
+	for (uint32_t y = 0; y < cvh; y++) {
+		for (uint32_t x = 0; x < cvw; x++) {
+			put_px(base, stride, (int)x, (int)y, 0xFF, 0x00, 0x00);       // tile0 left = RED
+			put_px(base, stride, (int)(cvw + x), (int)y, 0x00, 0xFF, 0xFF); // tile1 right = CYAN
+		}
+	}
+	IOSurfaceUnlock(surf, 0, NULL);
 	return surf;
 }
 
@@ -385,15 +508,29 @@ main(int argc, char **argv)
 	fill_sbs_rect(base, stride, kRectB, /*left*/ 0x00, /*right*/ 0xFF); // -> CYAN after anaglyph
 	IOSurfaceUnlock(input, 0, NULL);
 
-	// ---- Batched submits (spec v3).
+	// ---- v4 overlay atlas (premul-RGBA magenta bar), chained on the submit.
+	IOSurfaceRef overlay = create_overlay_surface();
+	if (overlay == NULL) {
+		LOG("overlay IOSurfaceCreate failed");
+		return 1;
+	}
+
+	// ---- Batched submits (spec v3) + v5 firstChunk + v4 overlay (spec v4).
 	XrRect2Di rects[2] = {kRectA, kRectB};
+	XrWeaveSubmitOverlaysDXR ov = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR};
+	ov.overlayTexture = (void *)overlay;
+	ov.overlayIsDxgi = XR_FALSE;
+	ov.rectCount = 0; // whole-atlas composite (premul alpha authoritative)
+	ov.rects = NULL;
 	XrWeaveSubmitRectsDXR batch = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_RECTS_DXR};
+	batch.next = &ov; // chain overlays after rects
 	batch.rectCount = 2;
 	batch.rects = rects;
 	XrWeaveSubmitInfoDXR submit = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
 	submit.next = &batch;
 	submit.inputTexture = (void *)input;
 	submit.inputIsDxgi = XR_FALSE;
+	submit.firstChunk = XR_TRUE; // single submit per frame → first → clears woven output transparent (v5)
 
 	IOSurfaceRef output = NULL;
 	uint32_t out_w = 0, out_h = 0;
@@ -450,9 +587,120 @@ main(int argc, char **argv)
 		pass = pass && ok;
 	}
 
+	// ---- v4 overlay: the magenta bar must be composited over the woven output.
+	{
+		int bx = kOverlayBar.offset.x + kOverlayBar.extent.width / 2;
+		int by = kOverlayBar.offset.y + kOverlayBar.extent.height / 2;
+		uint8_t r = 0, g = 0, b = 0, a = 0;
+		if (sample_px4(output, bx, by, &r, &g, &b, &a)) {
+			bool ok = (r > 150 && b > 150 && g < 80 && a > 200);
+			LOG("v4 overlay bar @(%d,%d) = (%u,%u,%u,a=%u) want magenta+opaque -> %s", bx, by, r, g, b, a,
+			    ok ? "OK" : "WRONG");
+			pass = pass && ok;
+		} else {
+			LOG("FAIL: could not sample overlay bar");
+			pass = false;
+		}
+	}
+
+	// ---- v5 firstChunk: a background gap (no rect, no overlay) must be
+	// transparent (alpha ~0); a woven tile centre must be opaque (alpha ~255).
+	{
+		uint8_t r = 0, g = 0, b = 0, a = 0;
+		if (sample_px4(output, 10, 10, &r, &g, &b, &a)) {
+			bool ok = (a < 40);
+			LOG("v5 firstChunk gap @(10,10) alpha=%u want ~0 -> %s", a, ok ? "OK" : "WRONG");
+			pass = pass && ok;
+		} else {
+			LOG("FAIL: could not sample firstChunk gap");
+			pass = false;
+		}
+		int tx = kRectA.offset.x + kRectA.extent.width / 2;
+		int ty = kRectA.offset.y + kRectA.extent.height / 2;
+		if (sample_px4(output, tx, ty, &r, &g, &b, &a)) {
+			bool ok = (a > 200);
+			LOG("v5 firstChunk tile @(%d,%d) alpha=%u want ~255 -> %s", tx, ty, a, ok ? "OK" : "WRONG");
+			pass = pass && ok;
+		}
+	}
+
+	// ---- Spec-v6 N-view atlas (#774): additive path. A submit that chains
+	// XrWeaveSubmitLayoutDXR carries a worst-case-sized packed atlas (tiles
+	// contiguous top-left at content-view size), NOT per-rect squeezed SBS. The
+	// runtime crops the packed region (here it exactly fills the input →
+	// zero-copy) and weaves once; the output is ONE content view (cvw x cvh).
+	{
+		const uint32_t cvw = 640, cvh = 360;
+		IOSurfaceRef nv_input = create_nview_atlas(cvw, cvh); // 2*cvw x cvh, red|cyan
+		if (nv_input == NULL) {
+			LOG("v6 FAIL: N-view atlas IOSurfaceCreate failed");
+			pass = false;
+		} else {
+			XrWeaveSubmitLayoutDXR lay = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_LAYOUT_DXR};
+			lay.viewCount = 2;
+			lay.tileColumns = 2;
+			lay.tileRows = 1;
+			lay.contentViewWidth = cvw;
+			lay.contentViewHeight = cvh;
+			XrWeaveSubmitInfoDXR v6submit = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
+			v6submit.next = &lay; // ONLY the layout chained — no rects, no overlay
+			v6submit.inputTexture = (void *)nv_input;
+			v6submit.inputIsDxgi = XR_FALSE;
+			v6submit.firstChunk = XR_TRUE;
+
+			IOSurfaceRef v6out = NULL;
+			uint32_t v6w = 0, v6h = 0;
+			bool v6ok = true;
+			for (int frame = 0; frame < 3; frame++) {
+				XrWeaveOutputDXR out = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_DXR};
+				XrResult r = pfn_submit(session, &v6submit, &out);
+				if (XR_FAILED(r)) {
+					LOG("v6 FAIL: xrWeaveSubmitDXR frame %d -> %d", frame, (int)r);
+					v6ok = false;
+					break;
+				}
+				if (out.weavedTexture != NULL && v6out == NULL) {
+					v6out = (IOSurfaceRef)out.weavedTexture;
+				}
+				v6w = out.width;
+				v6h = out.height;
+			}
+			if (v6ok && v6out == NULL) {
+				LOG("v6 FAIL: no weaved output handed back");
+				v6ok = false;
+			}
+			if (v6ok && (v6w != cvw || v6h != cvh)) {
+				LOG("v6 FAIL: output dims %ux%u != content view %ux%u", v6w, v6h, cvw, cvh);
+				v6ok = false;
+			}
+			if (v6ok) {
+				dump_ppm(v6out, "/tmp/weave_probe_macos_v6_output.ppm");
+				// anaglyph(red-left | cyan-right) = (left.r, right.g, right.b) = WHITE.
+				uint8_t r = 0, g = 0, b = 0;
+				if (sample_px(v6out, (int)cvw / 2, (int)cvh / 2, &r, &g, &b)) {
+					bool white = (r > 150 && g > 150 && b > 150);
+					bool nonblack = (r + g + b) > 90;
+					LOG("v6 centre @(%u,%u) = (%u,%u,%u) want white/non-black -> %s", cvw / 2,
+					    cvh / 2, r, g, b, white ? "OK(white)" : (nonblack ? "OK(non-black)" : "WRONG"));
+					v6ok = v6ok && nonblack;
+				} else {
+					LOG("v6 FAIL: could not sample output centre");
+					v6ok = false;
+				}
+			}
+			LOG("v6 N-view atlas: %s", v6ok ? "PASS" : "FAIL");
+			pass = pass && v6ok;
+			if (v6out != NULL) {
+				CFRelease(v6out);
+			}
+			CFRelease(nv_input);
+		}
+	}
+
 	xrDestroySession(session);
 	xrDestroyInstance(instance);
 	CFRelease(input);
+	CFRelease(overlay);
 	CFRelease(output);
 	vkDestroyDevice(device, NULL);
 	vkDestroyInstance(vk_instance, NULL);
