@@ -5707,15 +5707,20 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	// handles[0] is the retained IOSurfaceRef the IPC receive looked up; the
 	// weave engine takes ownership (adopts it into its import cache or
 	// releases it). No DXGI low-bit tag exists on POSIX handles.
-	// v4 overlay atlas is Windows-only for now: the macOS weave engine ignores
-	// it, so release any second retained handle here to avoid leaking it.
+	// v4 overlay atlas (browser#18): handles[1] is a second retained IOSurfaceRef
+	// (a window-sized premul-RGBA atlas) when the caller chained
+	// XrWeaveSubmitOverlaysDXR. Pass ownership to the engine (do NOT unref) — it
+	// adopts it into its overlay cache or releases it.
+	xrt_graphics_buffer_handle_t overlay_handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
 	if (args->have_overlay && handle_count >= 2) {
-		xrt_graphics_buffer_handle_t overlay = handles[1];
-		u_graphics_buffer_unref(&overlay);
+		overlay_handle = handles[1];
 	}
 	if (args->rect_count > IPC_WEAVE_SUBMIT_RECTS_MAX) {
 		xrt_graphics_buffer_handle_t reject = handles[0];
 		u_graphics_buffer_unref(&reject); // don't leak the retained IOSurfaceRef
+		if (overlay_handle != XRT_GRAPHICS_BUFFER_HANDLE_INVALID) {
+			u_graphics_buffer_unref(&overlay_handle); // nor the overlay ref
+		}
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	struct xrt_rect rects[IPC_WEAVE_SUBMIT_RECTS_MAX];
@@ -5726,6 +5731,29 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 		rects[i].extent.h = (int)args->rects[i].h;
 	}
 
+	// v6 (#774): a non-zero view_count means the input is a worst-case-sized
+	// N-view atlas (tiles packed contiguously top-left at content_view_w/h)
+	// rather than per-rect squeezed SBS. Validated client-side in oxr_weave.c;
+	// re-checked here because the wire is not trusted.
+	struct xrt_weave_atlas_layout layout = {0};
+	if (args->view_count > 0) {
+		if (args->tile_columns == 0 || args->tile_rows == 0 || args->content_view_w == 0 ||
+		    args->content_view_h == 0 || args->view_count > XRT_MAX_VIEWS ||
+		    args->view_count != args->tile_columns * args->tile_rows) {
+			xrt_graphics_buffer_handle_t reject = handles[0];
+			u_graphics_buffer_unref(&reject); // don't leak the retained IOSurfaceRef
+			if (overlay_handle != XRT_GRAPHICS_BUFFER_HANDLE_INVALID) {
+				u_graphics_buffer_unref(&overlay_handle); // nor the overlay ref
+			}
+			return XRT_ERROR_IPC_FAILURE;
+		}
+		layout.view_count = args->view_count;
+		layout.tile_columns = args->tile_columns;
+		layout.tile_rows = args->tile_rows;
+		layout.content_view_w = args->content_view_w;
+		layout.content_view_h = args->content_view_h;
+	}
+
 	uint32_t w = 0, h = 0;
 	uint64_t fv = 0;
 	struct xrt_eye_positions eyes = {0};
@@ -5733,6 +5761,8 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	    ics->xc, handles[0],                                    //
 	    args->rect_x, args->rect_y, args->rect_w, args->rect_h, //
 	    args->rect_count, args->rect_count > 0 ? rects : NULL,  //
+	    overlay_handle, args->weave_frame_first != 0,           //
+	    layout.view_count > 0 ? &layout : NULL,                 //
 	    &w, &h, &fv, &eyes);
 	if (!ok) {
 		return XRT_ERROR_IPC_FAILURE;
