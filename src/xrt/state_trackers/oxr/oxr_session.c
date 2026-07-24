@@ -58,6 +58,17 @@
 // views ≡ app-from-raw views by construction (XR_DXR_view_rig guarantee).
 #include "displayxr_math_xrt.h"
 
+// MUST precede oxr_objects.h → oxr_extension_support.h: that header defines
+// OXR_HAVE_DXR_xlib_window_binding only when XR_DXR_xlib_window_binding is
+// already defined. Including the ext header here (desktop Linux) makes the
+// handle-class app-window extraction block in xrCreateSession compile + fire,
+// so has_external_window/EXT_APP_MODE are set and the runtime does
+// window-scoped (not display-scoped) Kooima. Order bug otherwise → the block
+// silently compiles out and every Linux handle app fell back to display-scoped.
+#if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+#include "openxr/XR_DXR_xlib_window_binding.h"
+#endif
+
 #include "oxr_objects.h"
 #include "oxr_mcp_tools.h"
 #include "oxr_logger.h"
@@ -2157,6 +2168,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 				}
 				have_eye_override = true;
 			}
+
 		}
 	}
 
