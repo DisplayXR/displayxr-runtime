@@ -19,10 +19,25 @@ name: Build Linux
 # Package job (#705): build in the ubuntu:26.04 container, produce the
 # tarball, install from it, and gate on selftest resolving everything from
 # the installed XDG paths.
+#
+# Deb job (#781 Phase 3): build the runtime .deb (scripts/package_deb_linux.sh)
+# on every PR, and on a v* tag attach displayxr-runtime_<ver>_amd64.deb to the
+# GitHub Release — the asset the Linux meta-bundle (displayxr-installer) fetches.
+# Not a required context (release-asset + extra build validation, not a gate).
 
 on:
   workflow_dispatch: {}
   pull_request: {}
+  # Release tags: the Deb job attaches displayxr-runtime_<ver>_amd64.deb to the
+  # GitHub Release (the Linux meta-bundle fetches this asset — #781 Phase 3).
+  # Tags only, never plain pushes to main (repo policy: CI on PR + tags).
+  push:
+    tags:
+      - "v*"
+
+# The Deb job needs write access to create/attach release assets on tags.
+permissions:
+  contents: write
 
 # Cancel any in-progress run for the same PR (or branch) when a new
 # push comes in. Only the latest commit's CI completes.
@@ -197,3 +212,58 @@ jobs:
         # independent of service mode). Build-green only — no display on CI.
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./scripts/build_linux.sh --service
+
+  # Build the runtime .deb and, on a v* tag, attach it to the GitHub Release —
+  # the CI-published asset the Linux meta-bundle fetches (#781 Phase 3). Runs on
+  # every PR too (build-only) so a broken package_deb_linux.sh is caught before
+  # release. NB: deliberately does NOT install the GL/EGL dev libs — the .deb is
+  # the in-process, Vulkan-only runtime, and finding GL would flip XRT_HAVE_OPENGL
+  # on and trip the comp_gl-has-no-Linux-branch gate (#709). The vendor Leia
+  # plug-in .deb is NOT built here: Track B needs the commercial SR SDK, so it is
+  # produced on an SR-equipped box, not public CI.
+  Deb:
+    needs: DetectChanges
+    runs-on: ubuntu-latest
+    steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — skipping .deb build."
+
+      - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          submodules: recursive
+          fetch-depth: 0 # git describe needs tags for the .deb version
+
+      - name: Install dependencies
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libvulkan-dev vulkan-validationlayers glslang-tools \
+            libeigen3-dev libcjson-dev libudev-dev \
+            libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev \
+            dpkg-dev fakeroot
+
+      - name: Build runtime .deb (clean Release build)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          ./scripts/package_deb_linux.sh
+          echo "built:"; ls -lh dist/displayxr-runtime_*_amd64.deb
+
+      - name: Upload .deb artifact
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: displayxr-runtime-deb
+          path: dist/displayxr-runtime_*_amd64.deb
+          if-no-files-found: error
+
+      - name: Attach .deb to the GitHub Release (tags only)
+        if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/displayxr-runtime_*_amd64.deb
+          fail_on_unmatched_files: true
