@@ -58,6 +58,21 @@ struct comp_vk_native_xlib_handle
 	unsigned long window;
 };
 
+/*!
+ * App-provided Wayland surface (XR_DXR_wayland_surface_binding, runtime#757
+ * WS3b), passed type-erased as the `hwnd` param of comp_vk_native_compositor_create
+ * when `window_is_wayland` is true. The compositor copies the fields
+ * synchronously during create, so the caller may stack-allocate this.
+ *
+ * `display` is a `struct wl_display *` and `surface` a `struct wl_surface *`;
+ * kept as void pointers so includers don't need the Wayland headers.
+ */
+struct comp_vk_native_wayland_handle
+{
+	void *display;
+	void *surface;
+};
+
 struct comp_vk_native_window_xcb;
 
 /*!
@@ -88,6 +103,19 @@ bool
 comp_vk_native_window_xcb_query_geometry(const struct comp_vk_native_xcb_handle *handle,
                                          uint32_t *out_width,
                                          uint32_t *out_height);
+
+/*!
+ * Query the window's top-left in root (screen) coordinates via any window
+ * reachable through @p handle (works for app-provided windows, which have no
+ * comp_vk_native_window_xcb helper). Handle-based sibling of
+ * comp_vk_native_window_xcb_get_screen_position.
+ *
+ * @return true if the position could be queried.
+ */
+bool
+comp_vk_native_window_xcb_query_screen_position(const struct comp_vk_native_xcb_handle *handle,
+                                                int32_t *out_left_px,
+                                                int32_t *out_top_px);
 
 /*!
  * Create a self-owned X11 window (hosted class).

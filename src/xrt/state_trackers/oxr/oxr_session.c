@@ -1731,19 +1731,23 @@ oxr_session_locate_views(struct oxr_logger *log,
 	// eye tracking via ipc_try_get_sr_view_poses.
 	bool got_eye_positions = oxr_session_get_predicted_eye_positions(sess, &eye_pos);
 
-	// One-shot diagnostic: log stereo gate values for first frames
+	// Throttled diagnostic (#778): log the 3D gate + raw eye pair at startup AND
+	// every ~2s (60fps) so LIVE eye tracking is observable. This was a 3-frame
+	// one-shot, which only ever showed the *startup default* (before tracking
+	// warms up) — it read as "eyes pinned/frozen" and actively misled diagnosis.
+	// Throttled WARN (not per-frame) mirrors the log_counter %120 pattern above.
 	{
 		static int view_3d_gate_log = 0;
-		if (view_3d_gate_log < 3) {
+		int n = view_3d_gate_log++;
+		if (n < 3 || (n % 120) == 0) {
 			U_LOG_W("3D-GATE[%d]: got_eyes=%d valid=%d count=%d "
 			        "have_view_state=%d is_gl=%d has_ext_win=%d "
 			        "eye0=(%.4f,%.4f,%.4f) eye1=(%.4f,%.4f,%.4f)",
-			        view_3d_gate_log, got_eye_positions, eye_pos.valid, eye_pos.count,
+			        n, got_eye_positions, eye_pos.valid, eye_pos.count,
 			        have_view_state, sess->is_gl_native_compositor,
 			        sess->has_external_window,
 			        eye_pos.eyes[0].x, eye_pos.eyes[0].y, eye_pos.eyes[0].z,
 			        eye_pos.eyes[1].x, eye_pos.eyes[1].y, eye_pos.eyes[1].z);
-			view_3d_gate_log++;
 		}
 	}
 
@@ -3317,6 +3321,7 @@ oxr_session_create_impl(struct oxr_logger *log,
 			// via VK_EXT_metal_objects import.
 #endif
 
+			bool window_is_wayland = false;
 #if defined(OXR_HAVE_DXR_xlib_window_binding)
 			// On desktop Linux, extract from xlib_window_binding.
 			// vkCreateXcbSurfaceKHR needs both the Display-derived connection
@@ -3333,6 +3338,22 @@ oxr_session_create_impl(struct oxr_logger *log,
 			}
 #endif
 
+#if defined(OXR_HAVE_DXR_wayland_surface_binding)
+			// App-provided Wayland surface (WS3b). Packs the wl_display*/wl_surface*
+			// pair; the target builds a VkWaylandSurfaceKHR. Takes precedence over
+			// the xlib binding if (implausibly) both are chained.
+			struct comp_vk_native_wayland_handle wayland_handle = {0};
+			const XrWaylandSurfaceBindingCreateInfoDXR *wayland_binding = OXR_GET_INPUT_FROM_CHAIN(
+			    createInfo, XR_TYPE_WAYLAND_SURFACE_BINDING_CREATE_INFO_DXR, XrWaylandSurfaceBindingCreateInfoDXR);
+			if (wayland_binding != NULL && wayland_binding->wlDisplay != NULL &&
+			    wayland_binding->wlSurface != NULL) {
+				wayland_handle.display = (void *)wayland_binding->wlDisplay;
+				wayland_handle.surface = (void *)wayland_binding->wlSurface;
+				window_handle = &wayland_handle;
+				window_is_wayland = true;
+			}
+#endif
+
 			xrt_result_t xret = xrt_system_create_session(
 			    sys->xsys, xsi, &(*out_session)->xs, NULL);
 			if (xret == XRT_ERROR_MULTI_SESSION_NOT_IMPLEMENTED) {
@@ -3344,7 +3365,7 @@ oxr_session_create_impl(struct oxr_logger *log,
 				                 "Failed to create xrt_session! '%i'", xret);
 			}
 			return oxr_session_populate_vk_native(
-			    log, sys, vulkan, window_handle, shared_texture_handle,
+			    log, sys, vulkan, window_handle, window_is_wayland, shared_texture_handle,
 			    xsi->transparent_background_enabled, *out_session);
 		}
 #endif
@@ -3720,6 +3741,28 @@ oxr_session_create(struct oxr_logger *log,
 		}
 	} else {
 		U_LOG_W("No cocoa window binding found in session create chain");
+	}
+#endif
+
+#if defined(OXR_HAVE_DXR_xlib_window_binding)
+	// Parse XR_DXR_xlib_window_binding extension (desktop Linux) — only the
+	// transparent-background opt-in is read here (upstream, where xsi is
+	// mutable). The Display/Window pair is resolved later, in the vk_native
+	// branch of oxr_session_populate_graphics, and packed into a
+	// comp_vk_native_xlib_handle. Sibling of the win32/cocoa flags above.
+	const XrXlibWindowBindingCreateInfoDXR *xlib_target_info = OXR_GET_INPUT_FROM_CHAIN(
+	    createInfo, XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR, XrXlibWindowBindingCreateInfoDXR);
+	if (xlib_target_info != NULL && xlib_target_info->transparentBackgroundEnabled) {
+		xsi.transparent_background_enabled = true;
+	}
+#endif
+
+#if defined(OXR_HAVE_DXR_wayland_surface_binding)
+	// Wayland transparency opt-in (WS3b) — sibling of the xlib block above.
+	const XrWaylandSurfaceBindingCreateInfoDXR *wayland_target_info = OXR_GET_INPUT_FROM_CHAIN(
+	    createInfo, XR_TYPE_WAYLAND_SURFACE_BINDING_CREATE_INFO_DXR, XrWaylandSurfaceBindingCreateInfoDXR);
+	if (wayland_target_info != NULL && wayland_target_info->transparentBackgroundEnabled) {
+		xsi.transparent_background_enabled = true;
 	}
 #endif
 

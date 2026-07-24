@@ -207,6 +207,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	find_package(udev)
 	if(PKGCONFIG_FOUND)
 		pkg_check_modules(XCB xcb xcb-randr x11-xcb)
+		# Wayland client for the app-provided-surface present path (runtime#757
+		# WS3b, XR_DXR_wayland_surface_binding). Optional — X11/XCB is the
+		# primary desktop path.
+		pkg_check_modules(WAYLAND wayland-client)
 	endif()
 endif()
 
@@ -241,6 +245,7 @@ option_with_deps(XRT_HAVE_METAL "Enable Metal Graphics API support" DEPENDS APPL
 option_with_deps(XRT_HAVE_D3D11 "Enable Direct3D 11 Graphics API support" DEPENDS D3D11_LIBRARY XRT_HAVE_VULKAN XRT_HAVE_DXGI XRT_HAVE_WIL)
 option_with_deps(XRT_HAVE_D3D12 "Enable Direct3D 12 Graphics API support" DEPENDS D3D12_LIBRARY XRT_HAVE_D3D11 XRT_HAVE_VULKAN XRT_HAVE_DXGI XRT_HAVE_WIL)
 option_with_deps(XRT_HAVE_XCB "Enable xcb support" DEPENDS XCB_FOUND)
+option_with_deps(XRT_HAVE_WAYLAND "Enable Wayland app-surface present path (XR_DXR_wayland_surface_binding)" DEPENDS WAYLAND_FOUND XRT_HAVE_VULKAN)
 
 # System deps to use (sorted)
 option_with_deps(XRT_HAVE_LIBUDEV "Enable libudev (used for device probing on Linux)" DEPENDS UDEV_FOUND)

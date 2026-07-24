@@ -161,6 +161,14 @@ struct comp_vk_native_compositor
 
 	//! True if we created the window ourselves.
 	bool owns_window;
+
+#ifdef XRT_HAVE_WAYLAND
+	//! True when the app supplied a Wayland surface (XR_DXR_wayland_surface_binding)
+	//! instead of an X11 window — the target builds a VkWaylandSurfaceKHR.
+	bool use_wayland;
+	//! wl_display* + wl_surface* handed to the target as the type-erased hwnd.
+	struct comp_vk_native_wayland_handle wayland_handle;
+#endif
 #endif
 
 	//! Shared texture VkImage (imported from HANDLE).
@@ -2238,6 +2246,10 @@ vk_flatten_backdrop_2d(struct comp_vk_native_compositor *c,
                        uint32_t *out_h);
 static void
 vk_release_local2d_state(struct comp_vk_native_compositor *c);
+// runtime#757 / LeiaSR#85 — push the app window's panel-relative origin to the DP
+// (windowed-weaving phase anchor). Defined below, next to get_window_metrics.
+static void
+vk_update_present_origin(struct comp_vk_native_compositor *c);
 // #224 / ADR-027 hardware-DP zone leg (P4): one-time caps probe + per-frame
 // sideband publish of the wish / sticky mask. Defined with the other zone
 // helpers near the bottom.
@@ -2692,6 +2704,10 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			// background). Must precede process_atlas.
 			xrt_display_processor_set_background_2d(c->display_processor, bd_view, bd_w, bd_h);
 
+			// Windowed weaving (runtime#757 / LeiaSR#85): anchor the lens phase to
+			// the window's panel position. Must precede process_atlas.
+			vk_update_present_origin(c);
+
 			xrt_display_processor_process_atlas(
 			    c->display_processor,
 			    dp_self_submits ? VK_NULL_HANDLE : cmd,
@@ -2953,6 +2969,10 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				// #491 part 3 — hand the DP this frame's backdrop (NULL ⟹ clears
 				// it → desktop-only background). Must precede process_atlas.
 				xrt_display_processor_set_background_2d(c->display_processor, bd_view, bd_w, bd_h);
+
+				// Windowed weaving (runtime#757 / LeiaSR#85): anchor the lens phase
+				// to the window's panel position. Must precede process_atlas.
+				vk_update_present_origin(c);
 
 				// Call display processor with atlas (or zero-copy swapchain) texture
 				xrt_display_processor_process_atlas(
@@ -3295,6 +3315,7 @@ apply_window_pos_override(int32_t *left, int32_t *top)
 xrt_result_t
 comp_vk_native_compositor_create(struct xrt_device *xdev,
                                  void *hwnd,
+                                 bool window_is_wayland,
                                  void *vk_instance,
                                  void *vk_physical_device,
                                  void *vk_device,
@@ -3311,6 +3332,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		U_LOG_E("VkDevice is null");
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
+	(void)window_is_wayland; // consumed only in the XRT_HAVE_WAYLAND Linux path
 
 	U_LOG_I("Creating VK native compositor");
 
@@ -3443,7 +3465,21 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	// hwnd is a struct comp_vk_native_xlib_handle* when the app supplied its
 	// own X11 window via XR_DXR_xlib_window_binding (handle class, Phase 3);
 	// NULL for hosted (runtime self-creates an XCB window, Phase 1).
-	if (hwnd != NULL) {
+#ifdef XRT_HAVE_WAYLAND
+	if (window_is_wayland && hwnd != NULL) {
+		// App-provided Wayland surface (XR_DXR_wayland_surface_binding, WS3b):
+		// the target builds a VkWaylandSurfaceKHR from the pair directly — no
+		// XCB window, no xdg-shell (the app owns the surface lifecycle).
+		const struct comp_vk_native_wayland_handle *wl =
+		    (const struct comp_vk_native_wayland_handle *)hwnd;
+		c->wayland_handle = *wl;
+		c->use_wayland = true;
+		c->xcb_window = NULL;
+		c->owns_window = false;
+		U_LOG_I("Using app-provided Wayland surface (XR_DXR_wayland_surface_binding)");
+	} else
+#endif
+	    if (hwnd != NULL) {
 		const struct comp_vk_native_xlib_handle *xlib =
 		    (const struct comp_vk_native_xlib_handle *)hwnd;
 		// Convert the Xlib display to its XCB connection (libX11-xcb) and
@@ -3577,12 +3613,28 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			return XRT_ERROR_VULKAN;
 		}
 
-		xrt_result_t dp_ret = factory(&c->vk, (void *)(uintptr_t)c->cmd_pool,
+		// Window handed to the DP → the SR weaver. It is NOT for swapchain
+		// creation (the Linux/Vulkan weaver makes none — it renders into our
+		// framebuffer); it is the weaver's window-GEOMETRY input for
+		// getDrawRegions() — the per-view interlacing draw-regions AND the
+		// window-anchored eye-tracked steering. Passing NULL selects the srSDK's
+		// windowless/display-scoped path (constructedWithoutWindow=true), which
+		// weaves for the DEFAULT viewpoint with no window geometry (#778: view
+		// swap on Linux). The working srSDK vulkan_weaving_linux example passes
+		// the real X11 window here, which is why it tracks. So on desktop-Linux
+		// pass the XCB window XID (populated for BOTH the self-created/hosted and
+		// the app-provided/handle window via c->xcb_handle above). macOS keeps
+		// NULL — its weave is the IOSurface shared-surface path, no window.
+		void *dp_window_handle = NULL;
 #ifdef XRT_OS_WINDOWS
-		                               c->hwnd,
-#else
-		                               NULL,
+		dp_window_handle = c->hwnd;
+#elif defined(XRT_OS_LINUX_DESKTOP)
+		dp_window_handle = (void *)(uintptr_t)c->xcb_handle.window;
+		U_LOG_W("VK DP factory: passing X11 window XID 0x%lx to the weaver (0 = windowless/display-scoped)",
+		        (unsigned long)c->xcb_handle.window);
 #endif
+		xrt_result_t dp_ret = factory(&c->vk, (void *)(uintptr_t)c->cmd_pool,
+		                               dp_window_handle,
 		                               (int32_t)VK_FORMAT_B8G8R8A8_UNORM,
 		                               &c->display_processor);
 		if (dp_ret != XRT_SUCCESS) {
@@ -3631,13 +3683,20 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 #endif
 	) {
 		void *target_hwnd = hwnd;
+		bool target_is_wayland = false;
 #ifdef XRT_OS_WINDOWS
 		if (target_hwnd == NULL) target_hwnd = c->hwnd;
 #endif
 #ifdef XRT_OS_LINUX_DESKTOP
 		if (target_hwnd == NULL && c->xcb_window != NULL) target_hwnd = &c->xcb_handle;
 #endif
-		xrt_result_t xret = comp_vk_native_target_create(c, target_hwnd,
+#ifdef XRT_HAVE_WAYLAND
+		if (c->use_wayland) {
+			target_hwnd = &c->wayland_handle;
+			target_is_wayland = true;
+		}
+#endif
+		xrt_result_t xret = comp_vk_native_target_create(c, target_hwnd, target_is_wayland,
 		                                                  c->settings.preferred.width,
 		                                                  c->settings.preferred.height,
 		                                                  transparent_background,
@@ -4021,8 +4080,12 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	// info from the DP (pixel info + dims) when available, else from sys_info;
 	// window size + screen position from XCB (X11 exposes absolute window pos,
 	// so window-relative 3D tracks window moves — the reason XCB precedes
-	// Wayland in the Linux plan).
-	if (c->xcb_window == NULL) {
+	// Wayland in the Linux plan). Use c->xcb_handle (populated for BOTH the
+	// self-created window AND the app-provided window via wrap_app_window) so
+	// window-scoped Kooima works for app-owned windows too — c->xcb_window is
+	// NULL on the app-provided path, which used to fall back to display-scoped
+	// and skew the aspect ratio when the window != display.
+	if (c->xcb_handle.connection == NULL) {
 		return false;
 	}
 
@@ -4056,8 +4119,10 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	}
 
 	uint32_t win_px_w = 0, win_px_h = 0;
-	comp_vk_native_window_xcb_get_dimensions(c->xcb_window, &win_px_w, &win_px_h);
-	if (win_px_w == 0 || win_px_h == 0) return false;
+	if (!comp_vk_native_window_xcb_query_geometry(&c->xcb_handle, &win_px_w, &win_px_h) ||
+	    win_px_w == 0 || win_px_h == 0) {
+		return false;
+	}
 
 	float pixel_size_x = disp_w_m / (float)disp_px_w;
 	float pixel_size_y = disp_h_m / (float)disp_px_h;
@@ -4080,7 +4145,7 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	float win_center_px_x = disp_center_px_x;
 	float win_center_px_y = disp_center_px_y;
 	int32_t win_left = 0, win_top = 0;
-	if (comp_vk_native_window_xcb_get_screen_position(c->xcb_window, &win_left, &win_top)) {
+	if (comp_vk_native_window_xcb_query_screen_position(&c->xcb_handle, &win_left, &win_top)) {
 		win_center_px_x = (float)(win_left - disp_left) + (float)win_px_w / 2.0f;
 		win_center_px_y = (float)(win_top - disp_top) + (float)win_px_h / 2.0f;
 	}
@@ -4120,6 +4185,36 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	out_metrics->valid = true;
 	return true;
 #endif
+}
+
+/*!
+ * Windowed weaving (runtime#757 / LeiaSR#85): tell the DP where the app window's
+ * client area sits on the 3D panel so it can anchor the interlacing phase there,
+ * instead of assuming the window covers the panel from its top-left. The panel
+ * origin is the window's client top-left minus the display's screen origin — both
+ * already computed by @ref comp_vk_native_compositor_get_window_metrics (the same
+ * source the Kooima window metrics use, so the framing and the weave phase agree).
+ *
+ * No-op unless the DP exposes the (ADR-020) `set_present_origin` slot; a
+ * full-panel window (hosted, Android) yields origin (0,0) = display-scoped =
+ * today's behavior. Sticky on the DP side, but we refresh it every weave (cheap)
+ * so a dragged/moved window keeps a correct phase.
+ */
+static void
+vk_update_present_origin(struct comp_vk_native_compositor *c)
+{
+	if (c->display_processor == NULL) {
+		return;
+	}
+	struct xrt_window_metrics m;
+	if (!comp_vk_native_compositor_get_window_metrics(&c->base.base, &m) || !m.valid) {
+		// No live window metrics (headless / no window) — leave the DP
+		// display-scoped (its present origin defaults to (0,0)).
+		return;
+	}
+	xrt_display_processor_vk_set_present_origin((struct xrt_display_processor_vk *)c->display_processor,
+	                                            m.window_screen_left - m.display_screen_left,
+	                                            m.window_screen_top - m.display_screen_top);
 }
 
 bool
@@ -5113,8 +5208,19 @@ vk_sync_zone_mask_to_dp(struct comp_vk_native_compositor *c)
 		c->zone_published = true;
 	}
 #else
-	// No screen-anchor helper on the macOS/Android VK paths yet — skip the
-	// publish (Windows-first; the clear edge above still runs).
+	// No screen-anchor helper on the macOS/Android/Linux VK paths yet — skip the
+	// hardware per-zone publish (Windows-first; the clear edge above still runs).
+	// This gates ONLY hardware per-zone lens switching; the software composite
+	// (vk_composite_local_2d) is platform-agnostic and already renders 2D-in-3D
+	// zones on every backend, so a mixed 2D/3D frame is correct without this.
+	//
+	// Desktop-Linux (#778): bringing the hardware leg to parity needs BOTH (a) an
+	// XCB client-area screen-anchor helper (window origin in physical screen px,
+	// the get_window_metrics source used for windowed-weaving present-origin), AND
+	// (b) srSDK Linux per-zone interlacing phase — which srSDK 1.0.0 does NOT
+	// expose (no per-zone weave, no decoupled phase-origin; the LeiaSR#85 gap). So
+	// the Leia Linux DP intentionally reports no zone caps and this publish is a
+	// no-op there. See docs/roadmap/linux-support.md.
 	(void)mask_w;
 	(void)mask_h;
 #endif
