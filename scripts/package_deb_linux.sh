@@ -35,8 +35,13 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BUILD_DIR="$ROOT/build"
-DIST_DIR="$ROOT/dist"
+# Both overridable (inherited by the build_linux.sh call below): the .deb Docker
+# test points BUILD_DIR at a container-local dir to avoid a stale host build/
+# cache on the bind-mounted repo, while DIST_DIR stays on the mount so the .deb
+# lands back on the host.
+BUILD_DIR="${BUILD_DIR:-$ROOT/build}"
+DIST_DIR="${DIST_DIR:-$ROOT/dist}"
+export BUILD_DIR   # so the build_linux.sh child below uses the same tree
 
 NO_BUILD=0
 for arg in "$@"; do
@@ -83,7 +88,10 @@ case "$VERSION" in
     [0-9]*) : ;;
     *) VERSION="0.0.0+g$VERSION" ;;
 esac
-ARCH="amd64"
+# Derive the Debian arch from the build host so the label matches the binaries:
+# x86 CI / release boxes -> amd64; an arm64 dev box (e.g. Apple-silicon colima)
+# -> arm64. The runtime .deb targets whatever the build produced.
+ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 PKG="displayxr-runtime"
 
 STAGE="$DIST_DIR/${PKG}_${VERSION}_${ARCH}"
@@ -124,15 +132,21 @@ chmod 0644 "$STAGE/usr/lib/displayxr/plugins/200-sim-display.json"
 # ubuntu:24.04 base the .deb is installed into). Falls back to a conservative
 # hardcoded set if objdump/dpkg aren't available.
 compute_depends() {
-    local sonames pkgs="" so path
+    local sonames pkgs="" so pkg
     sonames="$(objdump -p "$RUNTIME_SO" "$CLI_BIN" "$PLUGIN_SO" 2>/dev/null \
                 | awk '/NEEDED/{print $2}' | sort -u)"
     [ -n "$sonames" ] || { echo "libc6, libcjson1, libvulkan1, libx11-6, libx11-xcb1, libxcb1, libxcb-randr0"; return; }
     for so in $sonames; do
-        path="$(ldconfig -p 2>/dev/null | awk -v s="$so" '$1==s {print $NF; exit}')"
-        [ -n "$path" ] || continue
-        p="$(dpkg -S "$path" 2>/dev/null | head -1 | cut -d: -f1)"
-        [ -n "$p" ] && pkgs="$pkgs $p"
+        # Resolve the soname to its owning package via dpkg's file DB. Search by
+        # BARE soname (no leading '/': a leading slash makes dpkg-query treat it
+        # as an absolute path and miss) — a substring match that is immune to the
+        # /lib-vs-/usr/lib usr-merge split that broke `dpkg -S <ldconfig-path>`
+        # (which had dropped libcjson1/libvulkan1). Keep only the line whose file
+        # basename is EXACTLY the soname (so libfoo.so.1.2.3 / dev symlinks don't
+        # match), then strip dpkg's ':arch' qualifier off the package name.
+        pkg="$(dpkg -S "$so" 2>/dev/null \
+               | awk -F': ' -v s="$so" '{n=split($2,a,"/"); if (a[n]==s){p=$1; sub(/:.*/,"",p); print p; exit}}')"
+        [ -n "$pkg" ] && pkgs="$pkgs $pkg"
     done
     # Always include libc6; dedupe; comma-join.
     echo "libc6 $pkgs" | tr ' ' '\n' | sed '/^$/d' | sort -u | paste -sd, - | sed 's/,/, /g'

@@ -43,7 +43,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BUILD_DIR="$ROOT/build"
+# BUILD_DIR is overridable so the tree can be built out-of-source — e.g. the
+# .deb Docker test (scripts/test_deb_linux.sh) builds into a container-local
+# dir to avoid colliding with a host build/ cache on the bind-mounted repo.
+BUILD_DIR="${BUILD_DIR:-$ROOT/build}"
 
 SERVICE_MODE=OFF
 RUN_TEST=ON
