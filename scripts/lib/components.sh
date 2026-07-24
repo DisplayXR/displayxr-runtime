@@ -10,10 +10,15 @@
 #   COMPONENT_REPO_<name>                     GitHub repo (owner/name)
 #   COMPONENT_PKG_MACOS_<name>                macOS asset glob, or "" if no macOS asset today
 #   COMPONENT_EXE_WINDOWS_<name>              Windows asset glob, or "" if no Windows asset today
+#   COMPONENT_DEB_LINUX_<name>                Linux (Debian/Ubuntu amd64) .deb asset glob, or
+#                                             "" if no Linux .deb today. Consumed by the Linux
+#                                             meta-bundle (displayxr-installer #781 Phase 3).
 #   COMPONENT_INSTALL_MARKER_MACOS_<name>     Absolute file path that must exist after a
 #                                             successful install on macOS. Empty = skip check.
 #   COMPONENT_INSTALL_MARKER_WINDOWS_<name>   Registry key whose existence proves a
 #                                             successful install on Windows. Empty = skip check.
+#   COMPONENT_INSTALL_MARKER_LINUX_<name>     Absolute file path that must exist after a
+#                                             successful install on Linux. Empty = skip check.
 #   COMPONENT_PIN_KEY_<name>                  versions.json key holding this component's tag,
 #                                             when it differs from <name> (e.g. nested under
 #                                             "demos"). Empty = the pin key equals <name>.
@@ -39,8 +44,10 @@
 COMPONENT_REPO_runtime="DisplayXR/displayxr-runtime"
 COMPONENT_PKG_MACOS_runtime="DisplayXR-Installer-*.pkg"
 COMPONENT_EXE_WINDOWS_runtime="DisplayXRSetup-*.exe"
+COMPONENT_DEB_LINUX_runtime="displayxr-runtime_*_amd64.deb"
 COMPONENT_INSTALL_MARKER_MACOS_runtime="/Library/Application Support/DisplayXR/DisplayProcessors/200-sim-display.json"
 COMPONENT_INSTALL_MARKER_WINDOWS_runtime="HKLM\\Software\\DisplayXR\\Runtime"
+COMPONENT_INSTALL_MARKER_LINUX_runtime="/usr/lib/displayxr/plugins/200-sim-display.json"
 
 # --- shell ---
 # macOS shell port deferred per CLAUDE.md M6. Empty macOS glob → warn+skip.
@@ -51,13 +58,18 @@ COMPONENT_INSTALL_MARKER_MACOS_shell=""
 COMPONENT_INSTALL_MARKER_WINDOWS_shell="HKLM\\Software\\DisplayXR\\WorkspaceControllers\\shell"
 
 # --- leia_plugin ---
-# Leia SR display processor is Windows-only by design (vendor SDK is
-# Windows-only). Empty macOS glob → warn+skip.
+# Leia SR display processor. Windows: DisplayXRLeiaSRSetup-*.exe. Linux: the
+# displayxr-leia-sr_*_amd64.deb (runtime #781 Phase 2 / leia-plugin #100) —
+# drops the DP into /usr/lib/displayxr/plugins at probe_order 50; the real
+# (Track B) build is produced on an SR-SDK box. No macOS build (vendor SR SDK
+# has no macOS Linux-desktop arm). Empty macOS glob → warn+skip.
 COMPONENT_REPO_leia_plugin="DisplayXR/displayxr-leia-plugin"
 COMPONENT_PKG_MACOS_leia_plugin=""
 COMPONENT_EXE_WINDOWS_leia_plugin="DisplayXRLeiaSRSetup-*.exe"
+COMPONENT_DEB_LINUX_leia_plugin="displayxr-leia-sr_*_amd64.deb"
 COMPONENT_INSTALL_MARKER_MACOS_leia_plugin=""
 COMPONENT_INSTALL_MARKER_WINDOWS_leia_plugin="HKLM\\Software\\DisplayXR\\DisplayProcessors\\leia-sr"
+COMPONENT_INSTALL_MARKER_LINUX_leia_plugin="/usr/lib/displayxr/plugins/050-leia-sr.json"
 
 # --- mcp_tools ---
 # displayxr-mcp ships a Windows installer (NSIS) and a macOS .pkg
