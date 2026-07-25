@@ -91,8 +91,10 @@ COMPONENT_INSTALL_MARKER_WINDOWS_mcp_tools="HKLM\\Software\\DisplayXR\\Capabilit
 COMPONENT_REPO_gauss_demo="DisplayXR/displayxr-demo-gaussiansplat"
 COMPONENT_PKG_MACOS_gauss_demo="DisplayXRGaussianSplat-*.pkg"
 COMPONENT_EXE_WINDOWS_gauss_demo="DisplayXRGaussianSplatSetup-*.exe"
+COMPONENT_DEB_LINUX_gauss_demo="displayxr-gaussiansplat_*_amd64.deb"
 COMPONENT_INSTALL_MARKER_MACOS_gauss_demo="/Applications/Gaussian Splat Viewer.app"
 COMPONENT_INSTALL_MARKER_WINDOWS_gauss_demo="HKLM\\Software\\DisplayXR\\Demos\\GaussianSplat"
+COMPONENT_INSTALL_MARKER_LINUX_gauss_demo="/usr/bin/displayxr-gaussiansplat"
 # Pin key defaults to the component name (top-level "gauss_demo" in
 # versions.json) — no COMPONENT_PIN_KEY override needed for the flat schema.
 
@@ -109,8 +111,10 @@ DEMO_COMPONENTS="gauss_demo modelviewer_demo mediaplayer_demo avatar_demo earthv
 COMPONENT_REPO_modelviewer_demo="DisplayXR/displayxr-demo-modelviewer"
 COMPONENT_PKG_MACOS_modelviewer_demo="DisplayXRModelViewer-*.pkg"
 COMPONENT_EXE_WINDOWS_modelviewer_demo="DisplayXRModelViewerSetup-*.exe"
+COMPONENT_DEB_LINUX_modelviewer_demo="displayxr-modelviewer_*_amd64.deb"
 COMPONENT_INSTALL_MARKER_MACOS_modelviewer_demo="/Applications/3D Model Viewer.app"
 COMPONENT_INSTALL_MARKER_WINDOWS_modelviewer_demo="HKLM\\Software\\DisplayXR\\Demos\\ModelViewer"
+COMPONENT_INSTALL_MARKER_LINUX_modelviewer_demo="/usr/bin/displayxr-modelviewer"
 
 # --- mediaplayer_demo ---
 # Stereo media player demo (displayxr-demo-mediaplayer). Plays SBS image/video
@@ -121,8 +125,10 @@ COMPONENT_INSTALL_MARKER_WINDOWS_modelviewer_demo="HKLM\\Software\\DisplayXR\\De
 COMPONENT_REPO_mediaplayer_demo="DisplayXR/displayxr-demo-mediaplayer"
 COMPONENT_PKG_MACOS_mediaplayer_demo="DisplayXRMediaPlayer-*.pkg"
 COMPONENT_EXE_WINDOWS_mediaplayer_demo="DisplayXRMediaPlayerSetup-*.exe"
+COMPONENT_DEB_LINUX_mediaplayer_demo="displayxr-mediaplayer_*_amd64.deb"
 COMPONENT_INSTALL_MARKER_MACOS_mediaplayer_demo="/Applications/Stereo Media Player.app"
 COMPONENT_INSTALL_MARKER_WINDOWS_mediaplayer_demo="HKLM\\Software\\DisplayXR\\Demos\\MediaPlayer"
+COMPONENT_INSTALL_MARKER_LINUX_mediaplayer_demo="/usr/bin/displayxr-mediaplayer"
 
 # --- avatar_demo ---
 # 3D Avatar demo (displayxr-demo-avatar). See-through avatar over the live
@@ -133,8 +139,10 @@ COMPONENT_INSTALL_MARKER_WINDOWS_mediaplayer_demo="HKLM\\Software\\DisplayXR\\De
 COMPONENT_REPO_avatar_demo="DisplayXR/displayxr-demo-avatar"
 COMPONENT_PKG_MACOS_avatar_demo="DisplayXRAvatar-*.pkg"
 COMPONENT_EXE_WINDOWS_avatar_demo="DisplayXRAvatarSetup-*.exe"
+COMPONENT_DEB_LINUX_avatar_demo="displayxr-avatar_*_amd64.deb"
 COMPONENT_INSTALL_MARKER_MACOS_avatar_demo="/Applications/3D Avatar.app"
 COMPONENT_INSTALL_MARKER_WINDOWS_avatar_demo="HKLM\\Software\\DisplayXR\\Demos\\Avatar"
+COMPONENT_INSTALL_MARKER_LINUX_avatar_demo="/usr/bin/displayxr-avatar"
 
 # --- earthview_demo ---
 # Streaming 3D city viewer on Google Photorealistic 3D Tiles (displayxr-demo-
@@ -145,8 +153,10 @@ COMPONENT_INSTALL_MARKER_WINDOWS_avatar_demo="HKLM\\Software\\DisplayXR\\Demos\\
 COMPONENT_REPO_earthview_demo="DisplayXR/displayxr-demo-earthview"
 COMPONENT_PKG_MACOS_earthview_demo="DisplayXREarthView-*.pkg"
 COMPONENT_EXE_WINDOWS_earthview_demo="DisplayXREarthViewSetup-*.exe"
+COMPONENT_DEB_LINUX_earthview_demo="displayxr-earthview_*_amd64.deb"
 COMPONENT_INSTALL_MARKER_MACOS_earthview_demo="/Applications/EarthView.app"
 COMPONENT_INSTALL_MARKER_WINDOWS_earthview_demo="HKLM\\Software\\DisplayXR\\Demos\\EarthView"
+COMPONENT_INSTALL_MARKER_LINUX_earthview_demo="/usr/bin/displayxr-earthview"
 
 # Helper: look up a per-component field for the current platform.
 #   $1 = component name (runtime, shell, leia_plugin, mcp_tools, gauss_demo)
