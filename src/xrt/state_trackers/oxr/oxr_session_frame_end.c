@@ -1304,8 +1304,8 @@ verify_local_2d_layer(struct oxr_session *sess,
 	// bound external window. Must match the window-space + zones gates.
 	const bool is_ipc_service = sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode;
 	if (!sess->is_d3d11_native_compositor && !sess->is_d3d12_native_compositor &&
-	    !sess->is_metal_native_compositor && !sess->is_gl_native_compositor && !is_ipc_service &&
-	    !sess->has_external_window) {
+	    !sess->is_metal_native_compositor && !sess->is_gl_native_compositor && !sess->is_vk_native_compositor &&
+	    !is_ipc_service && !sess->has_external_window) {
 		return oxr_error(log, XR_ERROR_LAYER_INVALID,
 		                 "(frameEndInfo->layers[%u]) local-2D layer requires a session created with a "
 		                 "window binding extension",
@@ -1455,7 +1455,8 @@ verify_zones_frame(struct oxr_session *sess,
 	// zones (caps) then has every zones frame rejected here.
 	const bool zones_window_bound =
 	    sess->is_d3d11_native_compositor || sess->is_d3d12_native_compositor ||
-	    sess->is_metal_native_compositor || sess->is_gl_native_compositor || sess->has_external_window ||
+	    sess->is_metal_native_compositor || sess->is_gl_native_compositor ||
+	    sess->is_vk_native_compositor || sess->has_external_window ||
 	    (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode);
 	if (!zones_window_bound) {
 		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
