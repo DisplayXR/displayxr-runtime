@@ -45,7 +45,7 @@ oxr_xrGetDisplayZoneCapabilitiesDXR(XrSession session, XrDisplayZoneCapabilities
 	// is_service_mode flag covers that class (sess->xcn is the IPC proxy).
 	const bool window_bound = (sess->is_d3d11_native_compositor || sess->is_d3d12_native_compositor ||
 	                           sess->is_metal_native_compositor || sess->is_gl_native_compositor ||
-	                           sess->has_external_window ||
+	                           sess->is_vk_native_compositor || sess->has_external_window ||
 	                           (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode)) &&
 	                          sess->xcn != NULL;
 
