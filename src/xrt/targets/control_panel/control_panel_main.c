@@ -178,6 +178,17 @@ struct disp_row
 	bool primary;
 };
 
+//! One resolved monitor→DP binding (from `displays --claims --json`, #793).
+struct claim_row
+{
+	char monitor_id[24]; // "0x0123456789abcdef"
+	char plugin_id[64];
+	char confidence[16]; // FALLBACK / EDID / VERIFIED
+	char apis[64];       // "vk|d3d11|d3d12"
+	char serial[32];
+	int pw, ph, left, top;
+};
+
 struct panel_state
 {
 	// info
@@ -213,6 +224,11 @@ struct panel_state
 	// connected displays (EDID)
 	int n_displays;
 	struct disp_row displays[MAX_DPS];
+
+	// resolved per-display DP binding (display → DP the compositor weaves with)
+	int n_claims;
+	int claims_monitor_count; // total monitors enumerated (claimed or not)
+	struct claim_row claims[MAX_DPS];
 
 	// last dp use/reset feedback
 	char last_action[512];
@@ -416,12 +432,53 @@ refresh_displays(struct panel_state *s)
 	cJSON_Delete(root);
 }
 
+//! Resolved monitor→DP registry (#793): which DP the compositor binds to each
+//! display. Same `target_plugin_resolve_displays` data the CLI prints; the panel
+//! stays a dumb JSON client (ADR-019) by shelling `displays --claims --json`.
+static void
+refresh_claims(struct panel_state *s)
+{
+	s->n_claims = 0;
+	s->claims_monitor_count = 0;
+	char out[16384];
+	if (!run_cli("displays --claims --json", out, sizeof(out)) || out[0] == '\0') {
+		return;
+	}
+	cJSON *root = cJSON_Parse(out);
+	if (root == NULL) {
+		return;
+	}
+	s->claims_monitor_count = (int)get_num(root, "monitor_count");
+	const cJSON *arr = cJSON_GetObjectItemCaseSensitive(root, "claims");
+	if (cJSON_IsArray(arr)) {
+		const cJSON *c = NULL;
+		cJSON_ArrayForEach(c, arr)
+		{
+			if (s->n_claims >= MAX_DPS) {
+				break;
+			}
+			struct claim_row *r = &s->claims[s->n_claims++];
+			cpy_str(r->monitor_id, sizeof(r->monitor_id), c, "monitor_id");
+			cpy_str(r->plugin_id, sizeof(r->plugin_id), c, "plugin_id");
+			cpy_str(r->confidence, sizeof(r->confidence), c, "confidence");
+			cpy_str(r->apis, sizeof(r->apis), c, "supported_apis");
+			cpy_str(r->serial, sizeof(r->serial), c, "serial");
+			r->pw = (int)get_num(c, "pixel_width");
+			r->ph = (int)get_num(c, "pixel_height");
+			r->left = (int)get_num(c, "screen_left");
+			r->top = (int)get_num(c, "screen_top");
+		}
+	}
+	cJSON_Delete(root);
+}
+
 static void
 refresh_all(struct panel_state *s)
 {
 	refresh_info(s);
 	refresh_dp(s);
 	refresh_displays(s);
+	refresh_claims(s);
 }
 
 static void
@@ -439,6 +496,7 @@ dp_action(struct panel_state *s, const char *args)
 		snprintf(s->last_action, sizeof(s->last_action), "Failed to run: displayxr-cli %s", args);
 	}
 	refresh_dp(s);
+	refresh_claims(s); // the override changed which DP binds each display (#793)
 }
 
 
@@ -450,6 +508,7 @@ dp_action(struct panel_state *s, const char *args)
 
 static const ImVec4 COL_GREEN = {0.30f, 0.85f, 0.40f, 1.0f};
 static const ImVec4 COL_RED = {0.95f, 0.35f, 0.35f, 1.0f};
+static const ImVec4 COL_AMBER = {0.98f, 0.75f, 0.25f, 1.0f}; // override-forced binding (#793)
 
 static void
 draw_panel(struct panel_state *s)
@@ -552,6 +611,27 @@ draw_panel(struct panel_state *s)
 		struct disp_row *d = &s->displays[i];
 		igText("[%d] %s %s  %dx%d @ %dHz  pos (%d,%d)%s", i, d->mfr, d->product, d->pw, d->ph, d->hz,
 		       d->left, d->top, d->primary ? "  [primary]" : "");
+	}
+
+	// ---- Resolved display → DP binding (#793) ----
+	igSeparatorText("Display -> DP binding (resolved)");
+	if (igIsItemHovered(0)) {
+		igSetTooltip("Which display processor the runtime bound to each monitor, from the per-monitor "
+		             "registry — by EDID claim confidence, or forced by the PreferredPlugin override "
+		             "below. This is the DP the compositor actually weaves with.");
+	}
+	if (s->n_claims == 0) {
+		igTextDisabled("(no monitor claimed by any plug-in%s)",
+		               s->claims_monitor_count > 0 ? "" : " — Windows-only");
+	}
+	for (int i = 0; i < s->n_claims; i++) {
+		struct claim_row *r = &s->claims[i];
+		bool forced = s->have_preferred && strcmp(r->plugin_id, s->preferred) == 0;
+		igText("%s  %dx%d @ (%d,%d)", r->monitor_id, r->pw, r->ph, r->left, r->top);
+		igTextColored(forced ? COL_AMBER : COL_GREEN, "    -> %s", r->plugin_id);
+		igSameLine(0.0f, -1.0f);
+		igTextDisabled("[%s]  apis=%s%s%s%s", r->confidence, r->apis, r->serial[0] ? "  serial=" : "",
+		               r->serial, forced ? "   (forced by override)" : "");
 	}
 
 	// ---- Self-test ----
