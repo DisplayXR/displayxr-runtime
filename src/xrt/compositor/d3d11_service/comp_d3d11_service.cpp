@@ -9168,6 +9168,18 @@ service_apply_pending_mode(struct d3d11_service_system *sys, struct d3d11_servic
 			head->hmd->active_rendering_mode_index = req_mode;
 			broadcast_rendering_mode_change(sys, head, prev_idx, req_mode);
 		}
+		// #776 blocker 4: drive the head device's OUTPUT_MODE so the DP actually
+		// switches its per-view composition — the CONTENT-mode counterpart to the
+		// hardware 2D/3D DP_REQUEST_DISPLAY_MODE below. The Windows service is
+		// single-process, so this reaches the real head device (mirrors the macOS
+		// bridge in ipc_handle_compositor_request_rendering_mode). For sim_display
+		// this is the ONLY runtime lever that switches its weave view count
+		// (SBS/anaglyph/quad); without it a present-owner requesting mode 4 "Quad"
+		// held the index but the DP kept weaving 2 views unless SIM_DISPLAY_OUTPUT
+		// was set at service start. A real vendor DP that drives its own mode
+		// leaves set_property(OUTPUT_MODE) unimplemented — a harmless no-op, same
+		// as the macOS path assumes.
+		xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)req_mode);
 	}
 	if (req_hw >= 0) {
 		want_3d = (req_hw != 0);
