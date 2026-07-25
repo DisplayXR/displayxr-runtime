@@ -156,13 +156,17 @@ compute_depends() {
         # basename is EXACTLY the soname (so libfoo.so.1.2.3 / dev symlinks don't
         # match), then strip dpkg's ':arch' qualifier off the package name.
         # Only accept a match whose file lives in a SYSTEM linker dir (/lib,
-        # /usr/lib, /lib64, ...), and never the vendor SR runtime. The Leia SR
-        # runtime bundles copies of common .so's under /opt/leiasr/lib, so a bare
-        # `dpkg -S <soname>` can otherwise attribute a system lib to
-        # `leiasr-runtime` — the runtime .deb must NEVER Depend on the commercial
-        # SR package (cube-hw finding B).
+        # /usr/lib, /lib64, ...), EXCLUDING the wrong-arch 32-bit multiarch trees
+        # (i386/lib32/libx32), and never the vendor SR runtime:
+        #   - the Leia SR runtime bundles copies of common .so's under
+        #     /opt/leiasr/lib, so a bare `dpkg -S <soname>` can attribute a system
+        #     lib to `leiasr-runtime` — the runtime .deb must NEVER Depend on the
+        #     commercial SR package (cube-hw finding B);
+        #   - amd64 runners carry i386 multiarch, so `dpkg -S libc.so.6` also
+        #     matches /usr/lib/i386-linux-gnu/libc.so.6 (libc6-i386); picking that
+        #     added a bogus 32-bit Depend to the amd64 .deb (seen on v2.1.1).
         pkg="$(dpkg -S "$so" 2>/dev/null \
-               | awk -F': ' -v s="$so" '$2 ~ /^\/(usr\/)?lib(32|64)?\// {n=split($2,a,"/"); if (a[n]==s){p=$1; sub(/:.*/,"",p); if (p!="leiasr-runtime"){print p; exit}}}')"
+               | awk -F': ' -v s="$so" '$2 ~ /^\/(usr\/)?lib(32|64)?\// && $2 !~ /(i386-linux-gnu|\/lib32\/|\/libx32\/)/ {n=split($2,a,"/"); if (a[n]==s){p=$1; sub(/:.*/,"",p); if (p!="leiasr-runtime"){print p; exit}}}')"
         [ -n "$pkg" ] && pkgs="$pkgs $pkg"
     done
     # Always include libc6; dedupe; comma-join.
