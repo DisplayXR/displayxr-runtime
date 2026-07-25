@@ -9117,6 +9117,77 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 	}
 }
 
+/*!
+ * Apply a standalone client's pending rendering-mode request (#776).
+ *
+ * xrRequestDisplayRenderingModeDXR lands on the IPC thread and only stores
+ * pending_content_mode / pending_hw_3d; this is where the request is actually
+ * applied, on the render thread.
+ *
+ * Factored out of compositor_layer_commit so the XR_DXR_weave path can call it
+ * too. A weave present-owner never runs xrBeginFrame/xrEndFrame, so it never
+ * reached the per-client commit and its mode requests were silently dropped —
+ * which is what pinned every weave client to whatever mode
+ * weave_force_3d_if_needed happened to pick (#776 blocker 1).
+ *
+ * Gated to standalone: workspace uses the controller's acked flip, the bridge
+ * uses the HWND relay.
+ *
+ * @return true if a request was found and applied.
+ */
+static bool
+service_apply_pending_mode(struct d3d11_service_system *sys, struct d3d11_service_compositor *c, bool bridge_live)
+{
+	if (sys->workspace_mode || bridge_live || c->render.display_processor == nullptr || sys->xsysd == NULL) {
+		return false;
+	}
+	uint32_t req_mode = c->pending_content_mode.exchange(0xFFFFFFFFu, std::memory_order_acq_rel);
+	int req_hw = c->pending_hw_3d.exchange(-1, std::memory_order_acq_rel);
+	struct xrt_device *head = sys->xsysd->static_roles.head;
+	if ((req_mode == 0xFFFFFFFFu && req_hw < 0) || head == nullptr || head->hmd == NULL) {
+		return false;
+	}
+
+	// The app has taken explicit control of the mode — suppress the one-shot
+	// deferred-3D warmup kick so it can't fight the request.
+	c->render.deferred_3d_kicked = true;
+
+	uint32_t prev_idx = head->hmd->active_rendering_mode_index;
+	// Resolve the target hardware state: an explicit hardware request wins;
+	// otherwise follow the requested content mode's hardware_display_3d (the
+	// common no-divergence case).
+	bool want_3d = sys->hardware_display_3d;
+	if (req_mode != 0xFFFFFFFFu && req_mode < head->rendering_mode_count) {
+		want_3d = head->rendering_modes[req_mode].hardware_display_3d;
+		if (prev_idx != req_mode) {
+			// Remember the last 3D mode for later restores (vendor poll, etc.).
+			if (prev_idx < head->rendering_mode_count &&
+			    head->rendering_modes[prev_idx].hardware_display_3d) {
+				sys->last_3d_mode_index = prev_idx;
+			}
+			head->hmd->active_rendering_mode_index = req_mode;
+			broadcast_rendering_mode_change(sys, head, prev_idx, req_mode);
+		}
+	}
+	if (req_hw >= 0) {
+		want_3d = (req_hw != 0);
+	}
+
+	DP_REQUEST_DISPLAY_MODE(c->render.display_processor, want_3d);
+	sync_tile_layout(sys);
+	sys->hardware_display_3d = want_3d;
+	// Stamp the post-flip cooldown so the 100 ms vendor 3D-state poll doesn't see
+	// the panel mid-transition and counter-correct (same refresh the deferred-3D
+	// kick / zones fallback do).
+	int64_t flip_ns = os_monotonic_get_ns();
+	sys->cached_3d_state.store(want_3d, std::memory_order_relaxed);
+	sys->last_3d_state_poll_ns.store(flip_ns, std::memory_order_release);
+	sys->last_flip_landed_ns.store(flip_ns, std::memory_order_release);
+	U_LOG_W("[app_mode] standalone IPC client requested mode (content=%u hw_req=%d) -> active=%u 3D=%d",
+	        req_mode, req_hw, head->hmd->active_rendering_mode_index, (int)want_3d);
+	return true;
+}
+
 
 static xrt_result_t
 compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
@@ -9437,53 +9508,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// relay above does, and what the Android multi_compositor path does via its own
 	// request_display_mode. Gated to standalone: workspace uses the controller's
 	// acked-flip; bridge uses the HWND relay above.
-	if (!sys->workspace_mode && !bridge_live && c->render.display_processor != nullptr &&
-	    sys->xsysd != NULL) {
-		uint32_t req_mode = c->pending_content_mode.exchange(0xFFFFFFFFu, std::memory_order_acq_rel);
-		int req_hw = c->pending_hw_3d.exchange(-1, std::memory_order_acq_rel);
-		struct xrt_device *head = sys->xsysd->static_roles.head;
-
-		if ((req_mode != 0xFFFFFFFFu || req_hw >= 0) && head != nullptr && head->hmd != NULL) {
-			// The app has taken explicit control of the mode — suppress the
-			// one-shot deferred-3D warmup kick so it can't fight the request.
-			c->render.deferred_3d_kicked = true;
-
-			uint32_t prev_idx = head->hmd->active_rendering_mode_index;
-			// Resolve the target hardware state: an explicit hardware request
-			// wins; otherwise follow the requested content mode's hardware_display_3d
-			// (the common no-divergence case).
-			bool want_3d = sys->hardware_display_3d;
-			if (req_mode != 0xFFFFFFFFu && req_mode < head->rendering_mode_count) {
-				want_3d = head->rendering_modes[req_mode].hardware_display_3d;
-				if (prev_idx != req_mode) {
-					// Remember the last 3D mode for later restores (vendor poll, etc.).
-					if (prev_idx < head->rendering_mode_count &&
-					    head->rendering_modes[prev_idx].hardware_display_3d) {
-						sys->last_3d_mode_index = prev_idx;
-					}
-					head->hmd->active_rendering_mode_index = req_mode;
-					broadcast_rendering_mode_change(sys, head, prev_idx, req_mode);
-				}
-			}
-			if (req_hw >= 0) {
-				want_3d = (req_hw != 0);
-			}
-
-			DP_REQUEST_DISPLAY_MODE(c->render.display_processor, want_3d);
-			sync_tile_layout(sys);
-			sys->hardware_display_3d = want_3d;
-			// Stamp the post-flip cooldown so the 100 ms vendor 3D-state poll
-			// doesn't see the panel mid-transition and counter-correct (same
-			// refresh the deferred-3D kick / zones fallback do).
-			int64_t flip_ns = os_monotonic_get_ns();
-			sys->cached_3d_state.store(want_3d, std::memory_order_relaxed);
-			sys->last_3d_state_poll_ns.store(flip_ns, std::memory_order_release);
-			sys->last_flip_landed_ns.store(flip_ns, std::memory_order_release);
-			U_LOG_W("[app_mode] standalone IPC client requested mode (content=%u hw_req=%d) "
-			        "-> active=%u 3D=%d",
-			        req_mode, req_hw, head->hmd->active_rendering_mode_index, (int)want_3d);
-		}
-	}
+	(void)service_apply_pending_mode(sys, c, bridge_live);
 
 	// Runtime-side 2D/3D toggle (V key) + 1/2/3 mode-select — polls qwerty
 	// driver each frame.
@@ -11725,10 +11750,21 @@ weave_force_3d_if_needed(struct d3d11_service_system *sys, struct d3d11_service_
 	if (head == nullptr || head->hmd == NULL) {
 		return;
 	}
-	// Prefer the last 3D mode; else the first 3D-capable mode.
+	// Prefer whatever mode is ALREADY active when it is 3D-capable (#776
+	// blocker 2). A present-owner that asked for a specific mode via
+	// xrRequestDisplayRenderingModeDXR has had it applied by
+	// service_apply_pending_mode() just above; without this branch the
+	// last-3D/first-3D fallback below would immediately overwrite it — and
+	// because this helper is self-healing (re-fires every submit while the SR
+	// reads 2D) it would fight the request every frame. On sim_display the
+	// first-3D fallback is mode 1 "Anaglyph" (2 views), so an app asking for
+	// mode 4 "Quad" (4 views) could never hold it.
 	uint32_t mode_idx = head->rendering_mode_count;
-	if (sys->last_3d_mode_index < head->rendering_mode_count &&
-	    head->rendering_modes[sys->last_3d_mode_index].hardware_display_3d) {
+	uint32_t active_idx = head->hmd->active_rendering_mode_index;
+	if (active_idx < head->rendering_mode_count && head->rendering_modes[active_idx].hardware_display_3d) {
+		mode_idx = active_idx;
+	} else if (sys->last_3d_mode_index < head->rendering_mode_count &&
+	           head->rendering_modes[sys->last_3d_mode_index].hardware_display_3d) {
 		mode_idx = sys->last_3d_mode_index;
 	} else {
 		for (uint32_t m = 0; m < head->rendering_mode_count; m++) {
@@ -11868,6 +11904,18 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// Serialize with the render thread — sys->context is the (non-thread-safe)
 	// immediate context shared with multi_compositor_render.
 	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+
+	// #776 blocker 1: apply any pending xrRequestDisplayRenderingModeDXR. A
+	// present-owner never runs the per-client commit, which used to be the only
+	// site that consumed pending_content_mode / pending_hw_3d — so a weave
+	// client's mode requests were stored and silently dropped. bridge_live is
+	// false here by construction: a weave caller IS the present-owner, so the
+	// bridge's HWND relay does not apply to it.
+	//
+	// Order matters: apply BEFORE the force-3D kick, so the kick sees the
+	// requested mode already active and keeps it (see weave_force_3d_if_needed,
+	// which now prefers the active mode over its first-3D fallback).
+	(void)service_apply_pending_mode(sys, c, /*bridge_live*/ false);
 
 	// Keep the panel in 3D so the vendor eye tracker locks (look-around). A
 	// present-owner never runs the per-client commit that normally does this.
