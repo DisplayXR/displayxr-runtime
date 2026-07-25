@@ -2206,6 +2206,21 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 		    query_source_claims(&g_display_sources[s], descriptors, dn, src_claims[s], XRT_DP_REGISTRY_MAX_ENTRIES);
 	}
 
+	// #791: an explicit PreferredPlugin override (`displayxr-cli dp use <id>`,
+	// or XRT_PREFERRED_PLUGIN_ID off-Windows) must force the WEAVING DP too, not
+	// just the active head-device plug-in. Without this, the per-monitor winner
+	// below is purely EDID confidence / ProbeOrder, so on real vendor hardware
+	// the vendor DP wins the registry even when the user pinned sim_display for
+	// testing — and the compositor then weaves with the vendor DP (exactly how
+	// the #776 "byte-identical sim-vs-Leia" run happened, and why sim N>2 weaving
+	// could not be visually validated on a vendor-hardware box). When the
+	// preferred source claims a monitor, it wins that monitor outright. sim's
+	// probe_displays claims every monitor at FALLBACK confidence, so `dp use
+	// sim-display` forces sim across the board; a pinned vendor that does NOT
+	// claim a given monitor still falls through to confidence for it.
+	char preferred_id[64] = {0};
+	bool have_preferred = target_plugin_get_preferred(preferred_id, sizeof(preferred_id));
+
 	// Resolve per monitor: highest confidence wins; ties → lower ProbeOrder.
 	// Sources are already in ascending ProbeOrder, so a strict `>` keeps the
 	// first (lowest-order) source at any given confidence.
@@ -2213,15 +2228,43 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 		const struct xrt_display_descriptor *desc = &descriptors[d];
 		const struct plugin_display_source *best_src = NULL;
 		const struct xrt_display_claim *best_claim = NULL;
-		for (int s = 0; s < g_display_source_count; s++) {
-			for (uint32_t c = 0; c < src_claim_count[s]; c++) {
-				const struct xrt_display_claim *cl = &src_claims[s][c];
-				if (cl->monitor_id != desc->monitor_id) {
+
+		// Preferred-plugin override (#791): if the pinned source claims this
+		// monitor, it wins regardless of confidence / ProbeOrder.
+		if (have_preferred) {
+			for (int s = 0; s < g_display_source_count && best_claim == NULL; s++) {
+				const struct xrt_plugin_iface *sif = g_display_sources[s].iface;
+				const char *sid = (sif != NULL && sif->id != NULL) ? sif->id : NULL;
+				if (sid == NULL || strcmp(sid, preferred_id) != 0) {
 					continue;
 				}
-				if (best_claim == NULL || cl->confidence > best_claim->confidence) {
-					best_claim = cl;
-					best_src = &g_display_sources[s];
+				for (uint32_t c = 0; c < src_claim_count[s]; c++) {
+					if (src_claims[s][c].monitor_id == desc->monitor_id) {
+						best_src = &g_display_sources[s];
+						best_claim = &src_claims[s][c];
+						break;
+					}
+				}
+			}
+			if (best_claim != NULL) {
+				U_LOG_W("plugin loader: monitor 0x%016llx → PreferredPlugin override '%s' "
+				        "(forced over EDID confidence)",
+				        (unsigned long long)desc->monitor_id, preferred_id);
+			}
+		}
+
+		// No preferred claim for this monitor → highest confidence wins.
+		if (best_claim == NULL) {
+			for (int s = 0; s < g_display_source_count; s++) {
+				for (uint32_t c = 0; c < src_claim_count[s]; c++) {
+					const struct xrt_display_claim *cl = &src_claims[s][c];
+					if (cl->monitor_id != desc->monitor_id) {
+						continue;
+					}
+					if (best_claim == NULL || cl->confidence > best_claim->confidence) {
+						best_claim = cl;
+						best_src = &g_display_sources[s];
+					}
 				}
 			}
 		}
