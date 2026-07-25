@@ -912,6 +912,39 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 			         ms, latSum / latCount, latCount, out.width, out.height, rx, ry, rw, rh,
 			         out.eyesValid, out.eyesTracking, out.eyeCount, g_lastEyeX[0], g_lastEyeX[1]);
 		}
+
+		// #776 blocker 3: once the requested-mode change event has had time to
+		// arrive (pumped by PollEvents above), read back which mode the runtime
+		// reports as active. Before the blocker-3 fix a submit-only present-owner
+		// like this probe never called xrWaitFrame/update_inputs, so its head
+		// proxy's active_rendering_mode_index stayed stale and every mode read
+		// back isActive=FALSE (or pinned to the init value) — it could not answer
+		// "what mode am I in?" to size its content views. One-shot at frame 90.
+		if (frame == 90) {
+			PFN_xrEnumerateDisplayRenderingModesDXR pfnEnum = nullptr;
+			xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesDXR",
+			                      (PFN_xrVoidFunction *)&pfnEnum);
+			if (pfnEnum != nullptr) {
+				uint32_t n = 0;
+				if (XR_SUCCEEDED(pfnEnum(xr.session, 0, &n, nullptr)) && n > 0 && n <= 16) {
+					XrDisplayRenderingModeInfoDXR ms16[16] = {};
+					for (uint32_t i = 0; i < n; i++) {
+						ms16[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
+					}
+					if (XR_SUCCEEDED(pfnEnum(xr.session, n, &n, ms16))) {
+						for (uint32_t i = 0; i < n; i++) {
+							LOG_INFO("[mode-readback] idx=%u name=\"%s\" views=%u grid=%ux%u "
+							         "active=%d",
+							         ms16[i].modeIndex, ms16[i].modeName, ms16[i].viewCount,
+							         ms16[i].tileColumns, ms16[i].tileRows,
+							         (int)ms16[i].isActive);
+						}
+					}
+				}
+			} else {
+				LOG_ERROR("xrEnumerateDisplayRenderingModesDXR: NOT RESOLVED");
+			}
+		}
 		frame++;
 	}
 

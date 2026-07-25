@@ -1217,6 +1217,18 @@ skip_macos_pump:
 			if (head != NULL && head->hmd != NULL && cur < head->rendering_mode_count) {
 				const struct xrt_rendering_mode *mode = &head->rendering_modes[cur];
 				sess->hardware_display_3d = mode->hardware_display_3d;
+				// #776 blocker 3: refresh the head's active-mode index from the
+				// authoritative event so xrEnumerateDisplayRenderingModesDXR
+				// reports a fresh `isActive`. Over IPC `head` is the client
+				// proxy whose active_rendering_mode_index is otherwise synced
+				// only by ipc_client_hmd_update_inputs — which a submit-only
+				// weave present-owner (browser/CEF/WebXR bridge) never calls,
+				// since it runs no xrWaitFrame. It DOES pump this event via
+				// xrPollEvent, so this keeps its "what mode am I in?" answer
+				// current (needed to size contentViewWidth/Height, #774). Writes
+				// the same value the device already holds in-process, so it is a
+				// harmless idempotent store on the non-IPC path.
+				head->hmd->active_rendering_mode_index = cur;
 				struct xrt_system_compositor *xsysc = sess->sys->xsysc;
 				if (xsysc != NULL) {
 					xsysc->info.recommended_view_scale_x = mode->view_scale_x;
