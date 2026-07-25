@@ -82,7 +82,7 @@ typedef struct XrDisplayZoneCapabilitiesDXR {
     XrStructureType    type;          // XR_TYPE_DISPLAY_ZONE_CAPABILITIES_DXR
     void* XR_MAY_ALIAS next;
     XrBool32           supported;     // XR_FALSE => only the legacy single-canvas path
-    uint32_t           maxZones3D;    // max zone-chained projection layers per frame (8)
+    uint32_t           maxZones3D;    // max zone-chained projection layers per frame (32)
 } XrDisplayZoneCapabilitiesDXR;
 
 XRAPI_ATTR XrResult XRAPI_CALL xrGetDisplayZoneCapabilitiesDXR(

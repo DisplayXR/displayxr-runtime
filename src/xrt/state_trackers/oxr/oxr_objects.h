@@ -138,7 +138,13 @@ struct oxr_local_3d_zone_ext;
 
 //! XR_DXR_display_zones: max zone-chained projection layers per frame
 //! (ADR-027 — plugin-independent, compositor-side assembly).
-#define OXR_DISPLAY_ZONES_MAX_ZONES_3D 8
+//!
+//! Zones do NOT each get their own atlas: every zone alpha-overs into the one
+//! mode-sized atlas (draw_zones_pass), so this cap costs draw calls, not
+//! surface area. It is therefore a deliberate API-level ceiling, not a pipeline
+//! limit — the compositor's own budget (VK_ZONE_MAX_DRAWS) is kept at
+//! this value x XRT_MAX_VIEWS so it can never bind first.
+#define OXR_DISPLAY_ZONES_MAX_ZONES_3D 32
 
 struct time_state;
 
