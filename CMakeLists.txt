@@ -441,6 +441,15 @@ if(XRT_HAVE_SDL2)
 endif()
 
 # Vulkan flags for the shared Vulkan code.
+#
+# These MUST be set here (globally, flowing into xrt_config_vulkan.h) and never
+# as per-target compile definitions: struct vk_bundle (vk_helpers.h) has
+# members conditionally compiled under VK_USE_PLATFORM_*, so a target-local
+# define gives that target a DIFFERENT struct layout than aux_vk, which fills
+# the bundle — every member after the conditional one shifts by a pointer, and
+# the first dispatch call through the skewed bundle lands in the wrong
+# entry point (#757: vkCreateCommandPool slot invoking vkAllocateCommandBuffers
+# with reinterpreted args → SIGSEGV in the ICD on every session-create).
 if(XRT_HAVE_XCB)
 	set(VK_USE_PLATFORM_XCB_KHR TRUE)
 endif()
@@ -450,6 +459,9 @@ endif()
 if(XRT_HAVE_XLIB_XRANDR)
 	set(VK_USE_PLATFORM_DISPLAY_KHR TRUE)
 	set(VK_USE_PLATFORM_XLIB_XRANDR_EXT TRUE)
+endif()
+if(XRT_HAVE_WAYLAND)
+	set(VK_USE_PLATFORM_WAYLAND_KHR TRUE)
 endif()
 if(ANDROID)
 	set(VK_USE_PLATFORM_ANDROID_KHR TRUE)
