@@ -195,8 +195,16 @@ Type values 1004999150–153. Header-level sketch:
 
 Scope rules: extension-app classes only (like `local_3d_zone`); view count per
 zone = the session's view count (display modes are session-global — zones vary
-in rect/rig/size, never in view count); `maxZones3D` advertised as 8
+in rect/rig/size, never in view count); `maxZones3D` advertised as 32
 (compositor-side assembly makes the budget plugin-independent).
+
+Why 32 and not "unlimited": every zone alpha-overs into the ONE mode-sized
+atlas (§Composition rules), so zone count costs draw calls, never surface
+area — the cap is an API-level ceiling, not a pipeline limit. It is held at or
+below the compositor's own per-frame draw budget (`VK_ZONE_MAX_DRAWS`, sized
+`maxZones3D × XRT_MAX_VIEWS`) so the advertised number is always the one that
+binds first; raising either without the other is a bug. Originally 8, raised
+once the fixed-atlas assembly made a larger number nearly free.
 
 ### Composition rules — overlap and ordering
 

@@ -41,8 +41,12 @@
 #include "shaders/zone_blit.frag.h"
 
 //! Upper bound on zone draws (and so descriptor sets) per frame:
-//! layers (16) × views (8).
-#define VK_ZONE_MAX_DRAWS 128
+//! zones (OXR_DISPLAY_ZONES_MAX_ZONES_3D = 32) × views (XRT_MAX_VIEWS = 8).
+//! Deliberately >= the advertised maxZones3D at the worst-case view count, so
+//! this budget can never be the binding constraint before the API-level cap the
+//! app was told about (xrGetDisplayZoneCapabilitiesDXR). If the zone cap is
+//! raised, raise this with it.
+#define VK_ZONE_MAX_DRAWS 256
 
 /*!
  * Vulkan renderer structure.
@@ -832,7 +836,23 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 					break;
 				}
 			}
-			if (seen || transitioned_count >= VK_ZONE_MAX_DRAWS) {
+			if (transitioned_count >= VK_ZONE_MAX_DRAWS && !seen) {
+				// Budget exhausted: this image never gets its layout
+				// transition, so its zone silently disappears. One-shot
+				// (never per-frame) so an overflowing app is diagnosable
+				// without flooding the log.
+				static bool s_warned_transitions = false;
+				if (!s_warned_transitions) {
+					s_warned_transitions = true;
+					U_LOG_W(
+					    "VK zones: image-transition budget (%d) exhausted — zones beyond it "
+					    "will not render. Raise VK_ZONE_MAX_DRAWS alongside "
+					    "OXR_DISPLAY_ZONES_MAX_ZONES_3D.",
+					    VK_ZONE_MAX_DRAWS);
+				}
+				continue;
+			}
+			if (seen) {
 				continue;
 			}
 			transitioned[transitioned_count++] = img;
@@ -877,7 +897,21 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 
 		for (uint32_t eye = 0; eye < view_count; eye++) {
 			struct xrt_swapchain *xsc = layer->sc_array[eye];
-			if (xsc == NULL || draw_count >= VK_ZONE_MAX_DRAWS) {
+			if (draw_count >= VK_ZONE_MAX_DRAWS) {
+				// Same silent-drop hazard as the transition loop above:
+				// warn once rather than quietly losing a zone.
+				static bool s_warned_draws = false;
+				if (!s_warned_draws) {
+					s_warned_draws = true;
+					U_LOG_W(
+					    "VK zones: draw budget (%d) exhausted — zones beyond it will not "
+					    "render. Raise VK_ZONE_MAX_DRAWS alongside "
+					    "OXR_DISPLAY_ZONES_MAX_ZONES_3D.",
+					    VK_ZONE_MAX_DRAWS);
+				}
+				continue;
+			}
+			if (xsc == NULL) {
 				continue;
 			}
 			uint32_t sc_index = layer->data.proj.v[eye].sub.image_index;
