@@ -196,14 +196,19 @@ vk_local2d_composite_flatten_draw(struct vk_local2d_composite *lc,
  *
  * @param region_w,region_h  Window region (uv [0,1] spans this).
  * @param cx,cy,cw,ch        Canvas rect (only used by the rect path).
- * @param alpha_over         #491: when true (and not the rect path), composite
- *                           the 2D over the weave by its own premultiplied alpha
- *                           (final = twod + (1-twod.a)*weave) instead of the
- *                           hard M-lerp — translucent 2D reveals the 3D scene.
- *                           Use for the IMPLICIT mask; false for an explicit
- *                           authored mask (designer cutout/portal).
+ * @param composite_mode     VK_LOCAL2D_COMPOSITE_MODE_*: LERP = the hard M-lerp
+ *                           (explicit authored mask — designer cutout/portal);
+ *                           ALPHA_OVER = #491 premul over (implicit legacy
+ *                           mask: final = twod + (1-twod.a)*weave); ZONES =
+ *                           ADR-027 (final = twod + (1-twod.a)*(M*weave) — M
+ *                           gates only the weave by zone geometry, the 2D
+ *                           composites on top by its own alpha). Ignored on
+ *                           the rect path.
  * @ingroup aux_vk
  */
+#define VK_LOCAL2D_COMPOSITE_MODE_LERP 0u
+#define VK_LOCAL2D_COMPOSITE_MODE_ALPHA_OVER 1u
+#define VK_LOCAL2D_COMPOSITE_MODE_ZONES 2u
 void
 vk_local2d_composite_draw(struct vk_local2d_composite *lc,
                           struct vk_bundle *vk,
@@ -220,7 +225,7 @@ vk_local2d_composite_draw(struct vk_local2d_composite *lc,
                           int32_t cy,
                           uint32_t cw,
                           uint32_t ch,
-                          bool alpha_over);
+                          uint32_t composite_mode);
 
 /*!
  * Destroy composite resources.

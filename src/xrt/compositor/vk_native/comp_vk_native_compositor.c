@@ -4943,6 +4943,44 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 	// else rasterize the implicit one.
 	VkImageView mask_view = VK_NULL_HANDLE;
 	struct comp_vk_native_zone_mask *emask = c->active_zone_mask;
+
+	// XR_DXR_display_zones: the COMPOSITE mask is always the BINARY zone
+	// raster — per ADR-027 the wish is HARDWARE-only and composition follows
+	// zone geometry + alpha, so an explicit frame wish never gates blending
+	// (it publishes below, verbatim). Binary, not ring-feathered: feathering
+	// is a cosmetic opt-in (runtime#800) and never belonged in either the
+	// composite default or the published wish. The zones composite draw runs
+	// MODE_ZONES (twod + (1-a)·(M·weave)), so M only gates the weave and
+	// Local2D overlays composite on top by their own alpha — a full-window
+	// zone no longer multiplies its toast away, and the window-edge feather
+	// ring artifact is gone.
+	if (zones_frame) {
+		if (zone_rect_count == 0) {
+			return false; // defensive — a zones frame always has zones
+		}
+		if (!vk_ensure_rt(c, &c->implicit_mask_tex, &c->implicit_mask_mem, &c->implicit_mask_view,
+		                  &c->implicit_mask_fb, &c->implicit_mask_w, &c->implicit_mask_h, region_w,
+		                  region_h, mask_fmt,
+		                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+		                  c->local2d.mask_rp, "zone mask")) {
+			return false;
+		}
+		vk_cmd_image_barrier_locked(vk, cmd, c->implicit_mask_tex, 0,
+		                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+		                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
+		vk_local2d_composite_raster_mask(&c->local2d, vk, cmd, c->implicit_mask_fb, region_w, region_h,
+		                                 0.0f, zone_rects, zone_rect_count, 1.0f);
+		vk_cmd_image_barrier_locked(vk, cmd, c->implicit_mask_tex, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		                            VK_ACCESS_SHADER_READ_BIT,
+		                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+		mask_view = c->implicit_mask_view;
+	}
+
 	if (zones_frame && c->frame_wish != NULL && c->frame_wish->staged != VK_NULL_HANDLE &&
 	    c->frame_wish->tex != VK_NULL_HANDLE) {
 		struct comp_vk_native_zone_mask *fw = c->frame_wish;
@@ -4977,7 +5015,9 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 		                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
 		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
 		fw->tex_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-		mask_view = fw->staged_view;
+		// NOTE: mask_view stays the binary zone raster from above — the
+		// explicit wish is PUBLISH-ONLY (ADR-027: hardware-only, never a
+		// compositor blend gate).
 
 		// P4 publish source + seq: the staged explicit wish. Bump the
 		// generation on a source change (pointer flip; VK masks carry no
@@ -4991,30 +5031,11 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 			c->zone_publish_seq++;
 		}
 	} else if (zones_frame) {
-		if (zone_rect_count == 0) {
-			return false; // defensive — a zones frame always has zones
-		}
-		if (!vk_ensure_rt(c, &c->implicit_mask_tex, &c->implicit_mask_mem, &c->implicit_mask_view,
-		                  &c->implicit_mask_fb, &c->implicit_mask_w, &c->implicit_mask_h, region_w,
-		                  region_h, mask_fmt,
-		                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-		                  c->local2d.mask_rp, "zone wish mask")) {
-			return false;
-		}
-		vk_cmd_image_barrier_locked(vk, cmd, c->implicit_mask_tex, 0,
-		                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
-		                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
-		vk_local2d_composite_raster_mask_rings(&c->local2d, vk, cmd, c->implicit_mask_fb, region_w,
-		                                       region_h, zone_rects, zone_rect_count, 8, 2);
-		vk_cmd_image_barrier_locked(vk, cmd, c->implicit_mask_tex, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-		                            VK_ACCESS_SHADER_READ_BIT,
-		                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
-		mask_view = c->implicit_mask_view;
+		// Composite mask already rastered (binary) above; this branch is now
+		// PUBLISH-ONLY — the auto wish publishes that same binary raster.
+		// Feathering removed from the published wish (runtime#800: the wish
+		// is the app's to author and defaults binary; feather is a cosmetic
+		// composite opt-in, not a hardware signal).
 
 		// P4 publish source + seq: the auto raster. It re-records every
 		// zones frame, but identical rect set + dims = identical content —
@@ -5129,10 +5150,20 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 	// #491: the implicit (auto) mask composites the 2D over the weave by its own
 	// premultiplied alpha — translucent 2D reveals the 3D scene, not the desktop.
 	// An explicit authored mask keeps the hard M-lerp (designer cutout/portal).
-	// XR_DXR_display_zones: zones frames are ALWAYS the hard M-lerp
-	// (final = M·weave + (1−M)·flatten(2D-over)).
+	// XR_DXR_display_zones: MODE_ZONES (twod + (1−a)·(M·weave)) — the binary
+	// zone raster gates only the WEAVE; Local2D content composites on top by
+	// its own alpha (ADR-027: the wish is hardware-only; composition follows
+	// zone geometry + alpha). Formerly the hard M-lerp, which multiplied
+	// overlays away inside zones and dimmed the feathered edge.
 	const bool have_explicit = (emask != NULL && emask->submitted && emask->staged_view != VK_NULL_HANDLE);
-	bool alpha_over = !zones_frame && !have_explicit;
+	uint32_t composite_mode;
+	if (zones_frame) {
+		composite_mode = VK_LOCAL2D_COMPOSITE_MODE_ZONES;
+	} else if (have_explicit) {
+		composite_mode = VK_LOCAL2D_COMPOSITE_MODE_LERP;
+	} else {
+		composite_mode = VK_LOCAL2D_COMPOSITE_MODE_ALPHA_OVER;
+	}
 #if defined(XRT_OS_MACOS)
 	// #568 macOS flat-2D-over-desktop: on the alpha-native transparent path the
 	// desktop shows through wherever the final alpha is 0 (the non-opaque
@@ -5151,14 +5182,14 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 	// opaque presents and chroma-key DPs are untouched; explicit/zones masks
 	// already use the hard lerp. Windows keeps alpha_over (its 2D-under path
 	// supplies the captured desktop), so no cross-platform regression.
-	if (alpha_over && c->transparent_background && c->display_processor != NULL &&
-	    xrt_display_processor_is_alpha_native(c->display_processor)) {
-		alpha_over = false;
+	if (composite_mode == VK_LOCAL2D_COMPOSITE_MODE_ALPHA_OVER && c->transparent_background &&
+	    c->display_processor != NULL && xrt_display_processor_is_alpha_native(c->display_processor)) {
+		composite_mode = VK_LOCAL2D_COMPOSITE_MODE_LERP;
 	}
 #endif
 	vk_local2d_composite_draw(&c->local2d, vk, cmd, c->composite_target_fb, dst_w, dst_h,
 	                          c->local2d_scratch_view, mask_view, c->weave_scratch_view, region_w,
-	                          region_h, cx, cy, cw, ch, alpha_over);
+	                          region_h, cx, cy, cw, ch, composite_mode);
 
 	// One-shot lifecycle log (NOT per-frame): proves the masked composite ran +
 	// which mask source resolved. WARN so it survives the hot-path INFO filter.
@@ -5166,9 +5197,9 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 		static bool logged = false;
 		if (!logged) {
 			logged = true;
-			U_LOG_W("VK Local2D composite: %ux%u region, %u layer(s), %s mask (#491 alpha_over=%d)",
+			U_LOG_W("VK Local2D composite: %ux%u region, %u layer(s), %s mask (mode=%u)",
 			        region_w, region_h, rect_count, have_explicit ? "explicit" : "implicit",
-			        alpha_over);
+			        composite_mode);
 		}
 	}
 
