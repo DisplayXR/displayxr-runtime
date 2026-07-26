@@ -283,11 +283,24 @@ struct xrt_display_claim
  * transparency enable the other variants already had), and the extension struct
  * drops `chromaKeyColor` (XR_DXR_win32_window_binding SPEC_VERSION 7→8). True
  * transparency (alpha-capable swapchain + transparent present) is the sole path.
+ *
+ * v4 → v5 history (#757): `struct vk_bundle` — whose raw pointer crosses the
+ * runtime → plug-in boundary via the VK DP factory — gained ABI-parity #else
+ * placeholder members for every `VK_USE_PLATFORM_*`-conditional PFN slot, so
+ * its layout no longer varies with feature *detection* at configure time
+ * (pkg-config finding wayland-client etc.). For any config that previously
+ * compiled without one of those platform macros this inserts members — a
+ * layout break versus v4 binaries — but it is the LAST such break: the layout
+ * is now identical across configs by construction. The Linux VK DP contract
+ * also newly guarantees the dma-buf import extension set on the app device
+ * (VK_EXT_external_memory_dma_buf + VK_EXT_image_drm_format_modifier,
+ * desktop-background capture).
  */
 #define XRT_PLUGIN_API_VERSION_1 1
 #define XRT_PLUGIN_API_VERSION_2 2
 #define XRT_PLUGIN_API_VERSION_3 3
 #define XRT_PLUGIN_API_VERSION_4 4
+#define XRT_PLUGIN_API_VERSION_5 5
 
 /*!
  * The version the runtime / plug-in is built against at compile time.
@@ -295,7 +308,7 @@ struct xrt_display_claim
  * `*out_plugin_api_version` are rejected by the runtime (ADR-020 rule 3) with a
  * logged error, and the loader falls back to the next plug-in / sim_display.
  */
-#define XRT_PLUGIN_API_VERSION_CURRENT XRT_PLUGIN_API_VERSION_4
+#define XRT_PLUGIN_API_VERSION_CURRENT XRT_PLUGIN_API_VERSION_5
 
 /*!
  * The single exported symbol every plug-in DLL must provide. C linkage,
