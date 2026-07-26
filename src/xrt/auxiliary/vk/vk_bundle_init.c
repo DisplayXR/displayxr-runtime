@@ -19,6 +19,8 @@
  * @ingroup aux_vk
  */
 
+#include "xrt/xrt_config_os.h"
+
 #include "util/u_pretty_print.h"
 #include "vk/vk_helpers.h"
 
@@ -1814,6 +1816,45 @@ vk_init_from_given(struct vk_bundle *vk,
 		vk->has_EXT_external_memory_metal = true;
 	}
 #endif
+
+#if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+	/*
+	 * Desktop-background capture (runtime#757): the display processor imports
+	 * PipeWire dma-bufs on this externally-created device, gated on
+	 * has_KHR_external_memory / has_EXT_external_memory_dma_buf /
+	 * has_EXT_image_drm_format_modifier. Vulkan does not let us read what
+	 * extensions the app enabled, and VK_EXT_external_memory_dma_buf carries
+	 * no entry points to probe — but the runtime's
+	 * xrGetVulkanDeviceExtensionsKHR / xrCreateVulkanDeviceKHR contract lists
+	 * the dma-buf import set on desktop Linux, so a conforming app has enabled
+	 * them. Gate on physical-device support so we never claim what the driver
+	 * lacks.
+	 */
+	{
+		uint32_t prop_count = 0;
+		ret = vk->vkEnumerateDeviceExtensionProperties(vk->physical_device, NULL, &prop_count, NULL);
+		if (ret == VK_SUCCESS && prop_count > 0) {
+			VkExtensionProperties *props = U_TYPED_ARRAY_CALLOC(VkExtensionProperties, prop_count);
+			if (props != NULL &&
+			    vk->vkEnumerateDeviceExtensionProperties(vk->physical_device, NULL, &prop_count,
+			                                             props) == VK_SUCCESS) {
+				for (uint32_t i = 0; i < prop_count; i++) {
+					const char *name = props[i].extensionName;
+					if (strcmp(name, VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME) == 0) {
+						vk->has_KHR_external_memory = true;
+					}
+					if (strcmp(name, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME) == 0) {
+						vk->has_EXT_external_memory_dma_buf = true;
+					}
+					if (strcmp(name, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME) == 0) {
+						vk->has_EXT_image_drm_format_modifier = true;
+					}
+				}
+			}
+			free(props);
+		}
+	}
+#endif // XRT_OS_LINUX && !XRT_OS_ANDROID
 
 	return VK_SUCCESS;
 

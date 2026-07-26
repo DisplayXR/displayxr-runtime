@@ -56,6 +56,13 @@ const char *xrt_gfx_vk_device_extensions = VK_KHR_DEDICATED_ALLOCATION_EXTENSION
     // VK native compositor on desktop Linux presents on the app's VkDevice via a
     // swapchain over the XCB surface (comp_vk_native_target)
     " " VK_KHR_SWAPCHAIN_EXTENSION_NAME
+    // Desktop-background capture (runtime#757): the display processor imports
+    // PipeWire dma-bufs on the app's VkDevice (the same vk_bundle the DP
+    // weaves with), so the device needs the dma-buf import set. Universally
+    // supported by Mesa and the NVIDIA driver on the desktop-Linux targets we
+    // ship (Preview).
+    " " VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME
+    " " VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME
 #endif
 
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_AHARDWAREBUFFER)
