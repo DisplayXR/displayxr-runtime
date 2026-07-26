@@ -273,6 +273,17 @@ struct vk_bundle
 
 #endif // defined(VK_EXT_calibrated_timestamps)
 
+	// ABI NOTE (config-skew guard): every VK_USE_PLATFORM_*-conditional member
+	// below keeps an identically-named PFN_vkVoidFunction placeholder in the
+	// #else branch, so sizeof(struct vk_bundle) and all member offsets are
+	// IDENTICAL no matter which platform macros a given translation unit (or a
+	// separately-configured consumer, e.g. a display-processor plug-in built
+	// against these headers) was compiled with. A raw vk_bundle * crosses the
+	// runtime -> plug-in DP-factory boundary, so a layout that varies with
+	// feature *detection* (pkg-config finding wayland-client, etc.) is an ABI
+	// landmine: one missing -dev package skews every member after the gap and
+	// the first vk-> call dereferences the wrong slot (SIGSEGV with PC=0).
+	// Do NOT add a conditional member here without the parity #else.
 #if defined(VK_USE_PLATFORM_DISPLAY_KHR)
 	PFN_vkCreateDisplayPlaneSurfaceKHR vkCreateDisplayPlaneSurfaceKHR;
 	PFN_vkGetDisplayPlaneCapabilitiesKHR vkGetDisplayPlaneCapabilitiesKHR;
@@ -280,44 +291,59 @@ struct vk_bundle
 	PFN_vkGetPhysicalDeviceDisplayPlanePropertiesKHR vkGetPhysicalDeviceDisplayPlanePropertiesKHR;
 	PFN_vkGetDisplayModePropertiesKHR vkGetDisplayModePropertiesKHR;
 	PFN_vkReleaseDisplayEXT vkReleaseDisplayEXT;
-
+#else
+	PFN_vkVoidFunction vkCreateDisplayPlaneSurfaceKHR;
+	PFN_vkVoidFunction vkGetDisplayPlaneCapabilitiesKHR;
+	PFN_vkVoidFunction vkGetPhysicalDeviceDisplayPropertiesKHR;
+	PFN_vkVoidFunction vkGetPhysicalDeviceDisplayPlanePropertiesKHR;
+	PFN_vkVoidFunction vkGetDisplayModePropertiesKHR;
+	PFN_vkVoidFunction vkReleaseDisplayEXT;
 #endif // defined(VK_USE_PLATFORM_DISPLAY_KHR)
 
 #if defined(VK_USE_PLATFORM_XCB_KHR)
 	PFN_vkCreateXcbSurfaceKHR vkCreateXcbSurfaceKHR;
-
+#else
+	PFN_vkVoidFunction vkCreateXcbSurfaceKHR;
 #endif // defined(VK_USE_PLATFORM_XCB_KHR)
 
 #if defined(VK_USE_PLATFORM_WAYLAND_KHR)
 	PFN_vkCreateWaylandSurfaceKHR vkCreateWaylandSurfaceKHR;
-
+#else
+	PFN_vkVoidFunction vkCreateWaylandSurfaceKHR;
 #endif // defined(VK_USE_PLATFORM_WAYLAND_KHR)
 
 #if defined(VK_USE_PLATFORM_WAYLAND_KHR) && defined(VK_EXT_acquire_drm_display)
 	PFN_vkAcquireDrmDisplayEXT vkAcquireDrmDisplayEXT;
 	PFN_vkGetDrmDisplayEXT vkGetDrmDisplayEXT;
-
+#else
+	PFN_vkVoidFunction vkAcquireDrmDisplayEXT;
+	PFN_vkVoidFunction vkGetDrmDisplayEXT;
 #endif // defined(VK_USE_PLATFORM_WAYLAND_KHR) && defined(VK_EXT_acquire_drm_display)
 
 #if defined(VK_USE_PLATFORM_XLIB_XRANDR_EXT)
 	PFN_vkGetRandROutputDisplayEXT vkGetRandROutputDisplayEXT;
 	PFN_vkAcquireXlibDisplayEXT vkAcquireXlibDisplayEXT;
-
+#else
+	PFN_vkVoidFunction vkGetRandROutputDisplayEXT;
+	PFN_vkVoidFunction vkAcquireXlibDisplayEXT;
 #endif // defined(VK_USE_PLATFORM_XLIB_XRANDR_EXT)
 
 #if defined(VK_USE_PLATFORM_ANDROID_KHR)
 	PFN_vkCreateAndroidSurfaceKHR vkCreateAndroidSurfaceKHR;
-
+#else
+	PFN_vkVoidFunction vkCreateAndroidSurfaceKHR;
 #endif // defined(VK_USE_PLATFORM_ANDROID_KHR)
 
 #if defined(VK_USE_PLATFORM_WIN32_KHR)
 	PFN_vkCreateWin32SurfaceKHR vkCreateWin32SurfaceKHR;
-
+#else
+	PFN_vkVoidFunction vkCreateWin32SurfaceKHR;
 #endif // defined(VK_USE_PLATFORM_WIN32_KHR)
 
 #if defined(VK_USE_PLATFORM_METAL_EXT)
 	PFN_vkCreateMetalSurfaceEXT vkCreateMetalSurfaceEXT;
-
+#else
+	PFN_vkVoidFunction vkCreateMetalSurfaceEXT;
 #endif // defined(VK_USE_PLATFORM_METAL_EXT)
 
 #if defined(VK_EXT_display_surface_counter)
@@ -454,13 +480,19 @@ struct vk_bundle
 	PFN_vkAcquireNextImageKHR vkAcquireNextImageKHR;
 	PFN_vkQueuePresentKHR vkQueuePresentKHR;
 
+	// ABI parity #else branches — see the config-skew guard note above.
 #if defined(VK_USE_PLATFORM_WIN32_KHR)
 	PFN_vkGetMemoryWin32HandleKHR vkGetMemoryWin32HandleKHR;
 	PFN_vkGetFenceWin32HandleKHR vkGetFenceWin32HandleKHR;
 	PFN_vkGetSemaphoreWin32HandleKHR vkGetSemaphoreWin32HandleKHR;
 	PFN_vkImportFenceWin32HandleKHR vkImportFenceWin32HandleKHR;
 	PFN_vkImportSemaphoreWin32HandleKHR vkImportSemaphoreWin32HandleKHR;
-
+#else
+	PFN_vkVoidFunction vkGetMemoryWin32HandleKHR;
+	PFN_vkVoidFunction vkGetFenceWin32HandleKHR;
+	PFN_vkVoidFunction vkGetSemaphoreWin32HandleKHR;
+	PFN_vkVoidFunction vkImportFenceWin32HandleKHR;
+	PFN_vkVoidFunction vkImportSemaphoreWin32HandleKHR;
 #endif // defined(VK_USE_PLATFORM_WIN32_KHR)
 
 #if !defined(VK_USE_PLATFORM_WIN32_KHR)
@@ -469,13 +501,20 @@ struct vk_bundle
 	PFN_vkGetSemaphoreFdKHR vkGetSemaphoreFdKHR;
 	PFN_vkImportFenceFdKHR vkImportFenceFdKHR;
 	PFN_vkImportSemaphoreFdKHR vkImportSemaphoreFdKHR;
-
+#else
+	PFN_vkVoidFunction vkGetMemoryFdKHR;
+	PFN_vkVoidFunction vkGetFenceFdKHR;
+	PFN_vkVoidFunction vkGetSemaphoreFdKHR;
+	PFN_vkVoidFunction vkImportFenceFdKHR;
+	PFN_vkVoidFunction vkImportSemaphoreFdKHR;
 #endif // !defined(VK_USE_PLATFORM_WIN32_KHR)
 
 #if defined(VK_USE_PLATFORM_ANDROID_KHR)
 	PFN_vkGetMemoryAndroidHardwareBufferANDROID vkGetMemoryAndroidHardwareBufferANDROID;
 	PFN_vkGetAndroidHardwareBufferPropertiesANDROID vkGetAndroidHardwareBufferPropertiesANDROID;
-
+#else
+	PFN_vkVoidFunction vkGetMemoryAndroidHardwareBufferANDROID;
+	PFN_vkVoidFunction vkGetAndroidHardwareBufferPropertiesANDROID;
 #endif // defined(VK_USE_PLATFORM_ANDROID_KHR)
 
 #if defined(VK_EXT_external_memory_host)

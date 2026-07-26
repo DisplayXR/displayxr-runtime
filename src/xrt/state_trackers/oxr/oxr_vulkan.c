@@ -210,6 +210,15 @@ static const char *optional_device_extensions[] = {
 #else
     NULL, // avoid zero sized array with UB
 #endif
+
+#if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID) && defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
+    // Desktop-background capture (runtime#757): dma-buf import on the app's
+    // VkDevice so the display processor can consume PipeWire screencast
+    // buffers. Optional here (checked against the physical device); the
+    // enable1 string in comp_vk_glue.c lists them unconditionally.
+    VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+    VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
+#endif
 };
 
 static bool
