@@ -384,6 +384,21 @@ its own content by definition, so there is no full-window backer. Reference apps
   full window/display size into Kooima for a zoned `_texture` app gives wrong perspective/aspect.
   Ref: `multiview-tiling.md`; `swapchain-model.md`.
 
+- **INV-5.6 — Zones-by-default: NEW apps should submit zones frames even with a single full-window
+  canvas** (the degenerate single-zone case, `XR_DXR_display_zones` §6 / ADR-027). Chain one
+  full-window `XrDisplayZoneDXR` on locate + projection every frame. Why: on a *legacy* frame the
+  #439 supersede rule keys canvas authority on Local2D presence, so a transient Local2D overlay
+  (toast, chip) flips frame classification each time it appears, and the implicit mask can flick a
+  physical panel region 2D/3D for a 2-second toast; window-space overlays are stamped into the atlas
+  and get silhouette-clipped in transparent mode. A zones frame makes overlay presence and canvas
+  authority orthogonal — Local2D composites post-weave. Apps consuming `displayxr-common` get this
+  via `dxr::FullWindowZone` (`zone_default.h`, ≥ v2.4.0): `FullWindowZoneInit` once, then
+  `FullWindowZoneLocateChain` / `FullWindowZoneSubmitChain`; both return NULL on unsupported
+  sessions (headless), degrading to plain frames with no branching. Known trade: zones frames
+  forfeit zero-copy (only ever bites full-screen 2D on Windows Leia). **Existing `cube_handle_*`
+  test apps stay on the legacy path deliberately** — it can never be deleted (third-party apps),
+  so it keeps regression coverage. Ref: `displayxr-common#23`.
+
 ---
 
 ## 6. Kooima projection

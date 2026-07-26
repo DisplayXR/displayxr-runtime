@@ -99,7 +99,20 @@ Pick the exact match; if none exists, pick the same **class+platform** (swap API
 - **Reuse, don't reinvent** the session/frame loop — it lives in `test_apps/common/` (Windows) or
   the reference `main.mm` (macOS). Re-implementing it from scratch is how the `F-*` mistakes creep in.
 - **Don't change the compositor or runtime** to make an app work — isolate app-side issues (this is
-  a standing project rule). The app talks to the runtime only through the OpenXR + `XR_EXT_*` wire.
+  a standing project rule). The app talks to the runtime only through the OpenXR + `XR_DXR_*` wire.
+- **Zones-by-default (INV-5.6).** New apps should submit **zones frames** even when the whole window
+  is one 3D canvas — the degenerate full-window zone (ADR-027 §6) makes transient Local2D overlays
+  (toasts) orthogonal to canvas authority and immune to transparent-mode silhouette clipping.
+  - App being scaffolded in a **demo repo** (consumes `displayxr-common`): wire `dxr::FullWindowZone`
+    (`zone_default.h`, common ≥ v2.4.0) — `FullWindowZoneInit` after session create, then chain
+    `FullWindowZoneLocateChain(...)` on the locate and `FullWindowZoneSubmitChain()` as the
+    `projectionNext` argument of the common submit helpers. Enable `XR_DXR_display_zones` +
+    `XR_DXR_local_3d_zone` in the instance-extension list. Both chain calls return NULL on
+    unsupported sessions, so no fallback branching is needed.
+  - App being scaffolded **in this repo** (`test_apps/`): the cloned reference's path stands. The
+    `cube_handle_*` references stay on the legacy frame path **deliberately** (regression coverage
+    for a path that can never be deleted); the `cube_zones_*` references are the zones-path
+    exemplars. Pick per the reference-app map and say which path the new app is on.
 - **Color (INV-4.6):** the scaffold inherits the reference app's swapchain choice; if you change it,
   request an sRGB swapchain and store a correctly-encoded image — never double-encode.
 - The linter is advisory on WARNs but **blocking on ERRORs**; treat a clean linter run as the
