@@ -635,7 +635,7 @@ vk_local2d_composite_draw(struct vk_local2d_composite *lc,
                           int32_t cy,
                           uint32_t cw,
                           uint32_t ch,
-                          bool alpha_over)
+                          uint32_t composite_mode)
 {
 	if (!lc->initialized || target_fb == VK_NULL_HANDLE || twod_view == VK_NULL_HANDLE || region_w == 0 ||
 	    region_h == 0) {
@@ -684,7 +684,10 @@ vk_local2d_composite_draw(struct vk_local2d_composite *lc,
 	    .canvas_origin = {(float)cx, (float)cy},
 	    .canvas_size = {(float)cw, (float)ch},
 	    .use_rect_mask = use_rect_mask ? 1u : 0u,
-	    .alpha_over = (!use_rect_mask && alpha_over) ? 1u : 0u,
+	    // Mode rides the alpha_over push-constant slot: 0 = hard M-lerp,
+	    // 1 = #491 premul over, 2 = zones (twod + (1-a)·(M·weave)). The rect
+	    // path never samples mask/weave, so mode is forced to the lerp there.
+	    .alpha_over = use_rect_mask ? 0u : composite_mode,
 	};
 	vk->vkCmdPushConstants(cmd, lc->composite_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
 

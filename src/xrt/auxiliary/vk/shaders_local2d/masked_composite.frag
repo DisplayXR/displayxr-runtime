@@ -4,6 +4,15 @@
 //       (final = twod + (1-twod.a)*weave) — translucent 2D reveals the 3D
 //       scene, not the desktop. Used for the IMPLICIT (auto) Local2D mask;
 //       the explicit authored mask keeps the hard M-lerp (designer portal).
+// XR_DXR_display_zones (mode 2): final = twod + (1-twod.a)*(M*weave).
+//       ADR-027 — the wish is HARDWARE-only; composition follows zone
+//       geometry (M gates only the WEAVE, binary zone raster) + alpha (the
+//       2D composites by its own premultiplied alpha ON TOP). Zone interior
+//       with no 2D → weave; a Local2D overlay inside a zone → glass over the
+//       weave; a 2D band outside every zone → the 2D with its own alpha
+//       (alpha 0 where uncovered, so a transparent present still reaches the
+//       desktop). Replaces the zones frames' former hard M-lerp, which
+//       multiplied overlays away in the M=1 interior.
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 frag;
 layout(binding = 0) uniform sampler2D twod_tex;
@@ -27,7 +36,7 @@ void main() {
     }
     vec4 twod = texture(twod_tex, uv);
     vec4 weave = texture(weave_tex, uv);
-    if (pc.alpha_over != 0u) {
+    if (pc.alpha_over == 1u) {
         // #491: the 2D layer's own (premultiplied) alpha IS the blend.
         // opaque 2D (a=1) → crisp panel; translucent (a=0.5) → glass over 3D;
         // uncovered (a=0) → full weave.
@@ -35,5 +44,11 @@ void main() {
         return;
     }
     float M = clamp(texture(mask_tex, uv).r, 0.0, 1.0);
+    if (pc.alpha_over == 2u) {
+        // Zones mode (ADR-027): M gates the WEAVE (zone geometry); the 2D
+        // composites on top by its own premultiplied alpha.
+        frag = twod + (1.0 - twod.a) * (M * weave);
+        return;
+    }
     frag = M * weave + (1.0 - M) * twod;
 }
