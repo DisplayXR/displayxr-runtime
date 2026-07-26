@@ -132,6 +132,30 @@ logs/captures, and as the stable referent for the reserved effective-mask
 readback. There is **no zone handle** — zones are stateless per-frame data,
 like layers; only the mask owns GPU resources and already has a handle.
 
+### 3.3.1 XrDisplayZoneFeatherDXR — per-zone opt-in cosmetic feather (spec v3)
+
+```c
+/*!
+ * OPT-IN cosmetic edge feather for one zone (runtime#800). Chained on
+ * XrDisplayZoneDXR::next at the xrEndFrame chain point; read at submit (a
+ * feather on the locate instance is ignored). Absent = HARD edge — feathering
+ * is a purely cosmetic feature the app must request, never a runtime default.
+ *
+ * radiusPx: inward ramp width in client-window pixels — the zone's weave
+ * fades toward transparent over the first radiusPx inside each zone edge.
+ * 0 / negative / NaN = hard edge. The runtime clamps to half the zone's
+ * shorter side.
+ *
+ * COMPOSITE-only: the published hardware wish stays binary regardless — the
+ * wish is the app's hardware signal and a cosmetic fade never enters it.
+ */
+typedef struct XrDisplayZoneFeatherDXR {
+    XrStructureType          type;     // XR_TYPE_DISPLAY_ZONE_FEATHER_DXR (1004999154)
+    const void* XR_MAY_ALIAS next;
+    float                    radiusPx;
+} XrDisplayZoneFeatherDXR;
+```
+
 ### 3.4 XrDisplayZonesFrameEndInfoDXR — per-frame wish reference
 
 ```c
@@ -139,7 +163,8 @@ like layers; only the mask owns GPU resources and already has a handle.
  * Optional, chained on XrFrameEndInfo::next in a zones frame.
  *
  * Absent, or wishMask == XR_NULL_HANDLE: the wish AUTO-DERIVES as the union
- * of the frame's 3D-zone rects with an implementation-defined feather.
+ * of the frame's 3D-zone rects, BINARY (hard-edged) — cosmetic feathering is
+ * per-zone opt-in via XrDisplayZoneFeatherDXR and never enters the wish.
  *
  * Present with a mask: that mask is the frame's wish verbatim — atomic with
  * the layer set. In zones mode the wish is HARDWARE-ONLY: it does not gate

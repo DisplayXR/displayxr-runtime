@@ -565,6 +565,104 @@ vk_local2d_composite_raster_mask_rings(struct vk_local2d_composite *lc,
 }
 
 void
+vk_local2d_composite_raster_mask_zones(struct vk_local2d_composite *lc,
+                                       struct vk_bundle *vk,
+                                       VkCommandBuffer cmd,
+                                       VkFramebuffer mask_fb,
+                                       uint32_t w,
+                                       uint32_t h,
+                                       const struct xrt_rect *rects,
+                                       const float *feather_px,
+                                       uint32_t rect_count)
+{
+	if (!lc->initialized || mask_fb == VK_NULL_HANDLE || w == 0 || h == 0 || rects == NULL ||
+	    rect_count == 0) {
+		return;
+	}
+
+	// LOAD_OP_CLEAR fills the whole attachment with 0 (outside every zone).
+	VkClearValue clear = {.color = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}}};
+	VkRenderPassBeginInfo rp_bi = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+	    .renderPass = lc->mask_rp,
+	    .framebuffer = mask_fb,
+	    .renderArea = {{0, 0}, {w, h}},
+	    .clearValueCount = 1,
+	    .pClearValues = &clear,
+	};
+	vk->vkCmdBeginRenderPass(cmd, &rp_bi, VK_SUBPASS_CONTENTS_INLINE);
+
+	// Per-zone: a hard zone is one full-rect clear at 1.0 (inset 0); a
+	// feathered zone ramps 0->1 over its OWN radius via the rings idiom —
+	// ascending value WITH ascending inset, later (deeper, higher-value)
+	// clears overwriting the inner part of earlier ones so the edge keeps
+	// the low values and the core reaches 1. Per zone so radii can differ.
+	for (uint32_t i = 0; i < rect_count; i++) {
+		const float radius = feather_px != NULL ? feather_px[i] : 0.0f;
+		const bool feathered = radius > 0.0f;
+		int32_t steps = 1;
+		int32_t step_px = 0;
+		if (feathered) {
+			step_px = 2;
+			steps = (int32_t)(radius / (float)step_px + 0.5f);
+			if (steps < 1) {
+				steps = 1;
+			}
+			if (steps > 32) { // beyond a 64px ramp, widen the step instead
+				step_px = (int32_t)(radius / 32.0f + 0.5f);
+				steps = 32;
+			}
+		}
+		for (int32_t s = 1; s <= steps; s++) {
+			const float v = (float)s / (float)steps; // 1.0 for the hard single step
+			// Small zones clamp the inset so the center still reaches 1.
+			int32_t min_ext =
+			    rects[i].extent.w < rects[i].extent.h ? rects[i].extent.w : rects[i].extent.h;
+			int32_t max_inset = (min_ext - 1) / 2;
+			if (max_inset < 0) {
+				max_inset = 0;
+			}
+			int32_t inset = feathered ? s * step_px : 0;
+			if (inset > max_inset) {
+				inset = max_inset;
+			}
+			int32_t left = rects[i].offset.w + inset;
+			int32_t top = rects[i].offset.h + inset;
+			int32_t right = rects[i].offset.w + rects[i].extent.w - inset;
+			int32_t bottom = rects[i].offset.h + rects[i].extent.h - inset;
+			if (left < 0) {
+				left = 0;
+			}
+			if (top < 0) {
+				top = 0;
+			}
+			if (right > (int32_t)w) {
+				right = (int32_t)w;
+			}
+			if (bottom > (int32_t)h) {
+				bottom = (int32_t)h;
+			}
+			if (right <= left || bottom <= top) {
+				continue;
+			}
+			VkClearAttachment ca = {
+			    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			    .colorAttachment = 0,
+			    .clearValue = {.color = {.float32 = {v, 0.0f, 0.0f, 0.0f}}},
+			};
+			VkClearRect cr = {
+			    .rect = {{left, top}, {(uint32_t)(right - left), (uint32_t)(bottom - top)}},
+			    .baseArrayLayer = 0,
+			    .layerCount = 1,
+			};
+			vk->vkCmdClearAttachments(cmd, 1, &ca, 1, &cr);
+		}
+	}
+
+	vk->vkCmdEndRenderPass(cmd);
+}
+
+void
 vk_local2d_composite_flatten_draw(struct vk_local2d_composite *lc,
                                   struct vk_bundle *vk,
                                   VkCommandBuffer cmd,

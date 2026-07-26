@@ -439,6 +439,11 @@ struct xrt_layer_zone_3d_data
 
 	struct xrt_rect rect; //!< Zone placement, client-window pixels
 	uint32_t zone_id;     //!< App-chosen; unique among this frame's zones
+
+	//! Opt-in cosmetic edge feather (XrDisplayZoneFeatherDXR, runtime#800):
+	//! inward ramp width in client-window pixels. 0 = hard edge (the
+	//! default). COMPOSITE-only — the published hardware wish stays binary.
+	float feather_px;
 };
 
 /*!

@@ -333,6 +333,16 @@ struct comp_vk_native_compositor
 	VkFramebuffer implicit_mask_fb;
 	uint32_t implicit_mask_w, implicit_mask_h;
 
+	//! Zones COMPOSITE mask with per-zone opt-in feather (runtime#800).
+	//! Allocated only when a frame's zones request feather — the published
+	//! wish must stay binary (implicit_mask above), so a feathered composite
+	//! needs its own image. All-hard frames reuse implicit_mask for both.
+	VkImage feather_mask_tex;
+	VkDeviceMemory feather_mask_mem;
+	VkImageView feather_mask_view;
+	VkFramebuffer feather_mask_fb;
+	uint32_t feather_mask_w, feather_mask_h;
+
 	//! Composite-target framebuffer cache (over the rotating swapchain/shared
 	//! image view, keyed by view — the DP target image rotates per frame).
 	VkFramebuffer composite_target_fb;
@@ -4873,11 +4883,17 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 
 	// XR_DXR_display_zones: the auto wish rasterizes from the ZONE rects.
 	struct xrt_rect zone_rects[XRT_MAX_LAYERS];
+	float zone_feathers[XRT_MAX_LAYERS]; // per-zone opt-in feather (runtime#800)
+	bool any_feather = false;
 	uint32_t zone_rect_count = 0;
 	if (zones_frame) {
 		for (uint32_t i = 0; i < c->layer_accum.layer_count && zone_rect_count < XRT_MAX_LAYERS; i++) {
 			if (c->layer_accum.layers[i].data.type != XRT_LAYER_ZONE_3D) {
 				continue;
+			}
+			zone_feathers[zone_rect_count] = c->layer_accum.layers[i].data.zone_3d.feather_px;
+			if (zone_feathers[zone_rect_count] > 0.0f) {
+				any_feather = true;
 			}
 			zone_rects[zone_rect_count++] = c->layer_accum.layers[i].data.zone_3d.rect;
 		}
@@ -4979,6 +4995,34 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 		                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
 		mask_view = c->implicit_mask_view;
+
+		// Per-zone opt-in feather (XrDisplayZoneFeatherDXR, runtime#800):
+		// the COMPOSITE samples a separately-rastered mask with each zone's
+		// requested inward ramp; the binary raster above still publishes as
+		// the hardware wish (cosmetics never enter the wish).
+		if (any_feather) {
+			if (vk_ensure_rt(c, &c->feather_mask_tex, &c->feather_mask_mem, &c->feather_mask_view,
+			                 &c->feather_mask_fb, &c->feather_mask_w, &c->feather_mask_h, region_w,
+			                 region_h, mask_fmt,
+			                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+			                 c->local2d.mask_rp, "zone feather mask")) {
+				vk_cmd_image_barrier_locked(
+				    vk, cmd, c->feather_mask_tex, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+				    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+				    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+				    k_color_sub);
+				vk_local2d_composite_raster_mask_zones(&c->local2d, vk, cmd, c->feather_mask_fb,
+				                                       region_w, region_h, zone_rects, zone_feathers,
+				                                       zone_rect_count);
+				vk_cmd_image_barrier_locked(
+				    vk, cmd, c->feather_mask_tex, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+				    VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+				    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+				    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+				mask_view = c->feather_mask_view;
+			} // ensure failure: fall back to the binary mask — hard edges, never a lost frame
+		}
 	}
 
 	if (zones_frame && c->frame_wish != NULL && c->frame_wish->staged != VK_NULL_HANDLE &&
@@ -5228,6 +5272,8 @@ vk_release_local2d_state(struct comp_vk_native_compositor *c)
 	vk_destroy_rt(c, &c->weave_scratch, &c->weave_scratch_mem, &c->weave_scratch_view, NULL);
 	vk_destroy_rt(c, &c->implicit_mask_tex, &c->implicit_mask_mem, &c->implicit_mask_view,
 	              &c->implicit_mask_fb);
+	vk_destroy_rt(c, &c->feather_mask_tex, &c->feather_mask_mem, &c->feather_mask_view,
+	              &c->feather_mask_fb);
 	if (c->local2d_initialized) {
 		vk_local2d_composite_fini(&c->local2d, vk);
 		c->local2d_initialized = false;

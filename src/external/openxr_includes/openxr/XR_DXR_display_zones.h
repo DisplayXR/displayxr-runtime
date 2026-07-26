@@ -62,7 +62,11 @@ extern "C" {
 // canvas size in pixels (the shell-driven workspace tile this session composites
 // into; follows tile resize). A minimized engine tile (whose OS window/backbuffer
 // can't track the resize) queries this to re-author to the current tile.
-#define XR_DXR_display_zones_SPEC_VERSION 2
+// SPEC_VERSION 3 (runtime#800): + XrDisplayZoneFeatherDXR — per-zone cosmetic
+// edge feather, OPT-IN. Zone edges are HARD by default (and the published
+// hardware wish is always binary/un-feathered regardless of this struct);
+// chain a feather on the zone at xrEndFrame to soften the COMPOSITE only.
+#define XR_DXR_display_zones_SPEC_VERSION 3
 #define XR_DXR_DISPLAY_ZONES_EXTENSION_NAME "XR_DXR_display_zones"
 
 // Extension type-value range (1004999xxx); replace with a Khronos-assigned
@@ -71,6 +75,7 @@ extern "C" {
 #define XR_TYPE_DISPLAY_ZONE_DXR                            ((XrStructureType)1004999151)
 #define XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_DXR            ((XrStructureType)1004999152)
 #define XR_TYPE_EVENT_DATA_DISPLAY_ZONE_METRICS_CHANGED_DXR ((XrStructureType)1004999153)
+#define XR_TYPE_DISPLAY_ZONE_FEATHER_DXR                    ((XrStructureType)1004999154)
 
 typedef XrFlags64 XrDisplayZonesFrameEndFlagsDXR;
 //! Cross-check zone/locate/mask consistency this frame: zone rects vs wish
@@ -129,11 +134,33 @@ typedef struct XrDisplayZoneDXR {
 } XrDisplayZoneDXR;
 
 /*!
+ * @brief OPT-IN cosmetic edge feather for one zone (spec v3, runtime#800).
+ *
+ * Chained on XrDisplayZoneDXR::next at the xrEndFrame chain point. Absent (the
+ * default), the zone's composite edge is HARD — feathering is a purely
+ * cosmetic feature the app must request, never an implementation default.
+ *
+ * @c radiusPx is the inward ramp width in client-window pixels: the zone's
+ * weave fades toward transparent over the first radiusPx inside each zone
+ * edge. 0 (or a negative/NaN value) = hard edge, identical to not chaining.
+ *
+ * COMPOSITE-only: the published hardware wish stays binary regardless — the
+ * wish is the app's hardware signal and a cosmetic fade never belongs in it.
+ * Read at submit; a feather chained on the locate instance is ignored.
+ */
+typedef struct XrDisplayZoneFeatherDXR {
+    XrStructureType          type;     //!< XR_TYPE_DISPLAY_ZONE_FEATHER_DXR
+    const void* XR_MAY_ALIAS next;
+    float                    radiusPx; //!< inward ramp width, client-window px; 0 = hard
+} XrDisplayZoneFeatherDXR;
+
+/*!
  * @brief Per-frame wish reference. Optional, chained on XrFrameEndInfo::next
  *        in a zones frame.
  *
  * Absent, or wishMask == XR_NULL_HANDLE: the wish AUTO-DERIVES as the union
- * of the frame's 3D-zone rects with an implementation-defined feather.
+ * of the frame's 3D-zone rects, BINARY (hard-edged) — cosmetic feathering is
+ * per-zone opt-in via XrDisplayZoneFeatherDXR and never enters the wish.
  *
  * Present with a mask: that mask is the frame's wish verbatim — atomic with
  * the layer set. In zones mode the wish is HARDWARE-ONLY: it does not gate
