@@ -80,6 +80,25 @@ an in-process self-weaving app never connects to the service and cannot be a til
 - The plugin does **not** compute Kooima — it chains an `XR_DXR_view_rig` descriptor onto
   `xrLocateViews` and consumes the runtime's render-ready views.
 
+## Display zones (multi-zone) — Unity is a zones app now
+
+The provider supports **`XR_DXR_display_zones` + `XR_DXR_local_3d_zone`** (plugin epic #166
+Phase B/B2): up to **4 zones** (Unity render passes; SPI = one pass per zone), each with its
+own zone-sized swapchain, a primary zone on the validated single-zone fields, **live tile
+realloc** when a zone rect changes (the swapchain is recreated and Unity re-wraps the
+texture), and caps queries (`xrGetDisplayZoneCapabilitiesDXR` /
+`…RecommendedViewSizeDXR`). This mirrors the runtime's `cube_zones` handle exercisers.
+
+Reference app: the **`desktop-avatar` sample** (`displayxr-unity-samples`) — a 3D zone +
+Local2D bubble + alpha-native transparency + per-eye foreground clip; the Unity analog of
+the VK avatar demo. Two consequences worth knowing on the runtime side:
+
+- **In-proc D3D12 zones frames have a real engine consumer.** Compositor changes to the
+  D3D12 zones path (e.g. the #801 `MODE_ZONES` composite + #803 opt-in feather parity port,
+  runtime #804) change this sample's pixels and need a hardware eyeball on it.
+- The zones path softens the old "fixed-resolution" caveat: per-**zone** resolution follows
+  the zone rect via live realloc, even though per-**eye** stereo topology stays fixed at 2.
+
 ## How this differs from a native D3D12 app (`cube_handle_d3d12_win`)
 
 | | `cube_handle_d3d12_win` | Unity D3D12 (provider) |
