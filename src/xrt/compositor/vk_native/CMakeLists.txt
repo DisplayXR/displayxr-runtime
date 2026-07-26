@@ -99,7 +99,13 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		# VK_KHR_wayland_surface. No self-created window / xdg-shell — the app owns
 		# the surface lifecycle. WAYLAND_{LIBRARIES,INCLUDE_DIRS} come from the
 		# top-level pkg_check_modules(WAYLAND wayland-client).
-		target_compile_definitions(comp_vk_native PRIVATE VK_USE_PLATFORM_WAYLAND_KHR XRT_HAVE_WAYLAND)
+		#
+		# NOTE: VK_USE_PLATFORM_WAYLAND_KHR and XRT_HAVE_WAYLAND deliberately do
+		# NOT appear as target defines here — they flow globally from
+		# xrt_config_vulkan.h / xrt_config_have.h. A target-local
+		# VK_USE_PLATFORM_* skews the struct vk_bundle layout against aux_vk
+		# (conditional members) — see the platform-flags block in the top
+		# CMakeLists.txt for the full failure mode.
 		target_include_directories(comp_vk_native PRIVATE ${WAYLAND_INCLUDE_DIRS})
 		target_link_libraries(comp_vk_native PRIVATE ${WAYLAND_LIBRARIES})
 	endif()
