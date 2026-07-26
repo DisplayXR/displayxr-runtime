@@ -1827,6 +1827,21 @@ submit_zone_3d_layer(struct oxr_session *sess,
 	data.zone_3d.rect.extent.w = zone->rect.extent.width;
 	data.zone_3d.rect.extent.h = zone->rect.extent.height;
 	data.zone_3d.zone_id = zone->zoneId;
+	// Opt-in cosmetic feather (spec v3, runtime#800): chained on the zone at
+	// the SUBMIT chain point. Absent / non-positive / NaN = hard edge. Clamp
+	// the ramp to half the zone's shorter side — a wider request would invert.
+	data.zone_3d.feather_px = 0.0f;
+	{
+		const XrDisplayZoneFeatherDXR *feather =
+		    OXR_GET_INPUT_FROM_CHAIN(zone, XR_TYPE_DISPLAY_ZONE_FEATHER_DXR, XrDisplayZoneFeatherDXR);
+		if (feather != NULL && feather->radiusPx > 0.0f && feather->radiusPx == feather->radiusPx) {
+			float max_ramp = (float)(zone->rect.extent.width < zone->rect.extent.height
+			                             ? zone->rect.extent.width
+			                             : zone->rect.extent.height) *
+			                 0.5f;
+			data.zone_3d.feather_px = feather->radiusPx < max_ramp ? feather->radiusPx : max_ramp;
+		}
+	}
 	fill_in_color_scale_bias(sess, (XrCompositionLayerBaseHeader *)proj, &data);
 	fill_in_y_flip(sess, (XrCompositionLayerBaseHeader *)proj, &data);
 	fill_in_blend_factors(sess, (XrCompositionLayerBaseHeader *)proj, &data);

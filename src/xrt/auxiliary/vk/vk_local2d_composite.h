@@ -155,6 +155,27 @@ vk_local2d_composite_raster_mask_rings(struct vk_local2d_composite *lc,
                                        uint32_t feather_step_px);
 
 /*!
+ * Rasterize the zones COMPOSITE mask with PER-ZONE opt-in feather
+ * (XrDisplayZoneFeatherDXR, runtime#800): LOAD_OP_CLEAR to 0, then each zone
+ * draws hard (one full-rect clear at 1.0, @p feather_px[i] <= 0 — the default)
+ * or with its own inward 0->1 ramp over feather_px[i] window pixels (the rings
+ * idiom, per zone so radii can differ). @p feather_px may be NULL = all hard.
+ * Layout contract identical to vk_local2d_composite_raster_mask.
+ *
+ * @ingroup aux_vk
+ */
+void
+vk_local2d_composite_raster_mask_zones(struct vk_local2d_composite *lc,
+                                       struct vk_bundle *vk,
+                                       VkCommandBuffer cmd,
+                                       VkFramebuffer mask_fb,
+                                       uint32_t w,
+                                       uint32_t h,
+                                       const struct xrt_rect *rects,
+                                       const float *feather_px,
+                                       uint32_t rect_count);
+
+/*!
  * Flatten one Local2D layer into the `twod` scratch (caller clears the scratch
  * transparent once before the first layer, and manages its layout).
  *
