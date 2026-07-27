@@ -179,7 +179,7 @@ cbuffer CompositeParams : register(b0)
     float2 canvas_origin;
     float2 canvas_size;
     uint   use_rect_mask;
-    uint   alpha_over;   // #491: premul "over" of the 2D atop the weave
+    uint   composite_mode; // 0 = hard M-lerp, 1 = #491 premul over, 2 = zones (ADR-027)
 };
 
 struct VS_OUTPUT
@@ -214,13 +214,24 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
 
     float4 twod  = twod_tex.Sample(samp, input.uv);
     float4 weave = weave_tex.Sample(samp, input.uv);
-    if (alpha_over != 0)
+    if (composite_mode == 1)
     {
         // #491: the 2D layer's own (premultiplied) alpha IS the blend —
         // translucent 2D reveals the 3D scene, not the desktop.
         return twod + (1.0 - twod.a) * weave;
     }
     float M = saturate(mask_tex.Sample(samp, input.uv).r);
+    if (composite_mode == 2)
+    {
+        // XR_DXR_display_zones (ADR-027, #801): M gates only the WEAVE by
+        // zone geometry (binary zone raster, or the #803 opt-in feather
+        // ramp); the 2D composites on top by its own premultiplied alpha.
+        // Zone interior with no 2D -> weave; a Local2D overlay inside a
+        // zone -> glass over the weave; a 2D band outside every zone ->
+        // the 2D with its own alpha (alpha 0 where uncovered, so a
+        // transparent present still reaches the desktop).
+        return twod + (1.0 - twod.a) * (M * weave);
+    }
     return M * weave + (1.0 - M) * twod;
 }
 )";
@@ -235,7 +246,7 @@ struct CompositeParams
 	float canvas_origin[2];
 	float canvas_size[2];
 	uint32_t use_rect_mask;
-	uint32_t alpha_over; // #491
+	uint32_t composite_mode; // COMP_D3D12_COMPOSITE_MODE_*: 0 hard M-lerp, 1 #491 over, 2 zones
 };
 
 // #439 Phase 3 — Local2D flatten. Reuses the masked_composite fullscreen-triangle
@@ -1415,8 +1426,8 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 
 	// XR_DXR_display_zones (ADR-027): a zones frame composes N placed zone
 	// layers into the window-spanning atlas — the unzoned area must weave
-	// to nothing (transparent), not opaque black, so the feathered wish
-	// edge blends toward the desktop.
+	// to nothing (transparent), not opaque black, so the MODE_ZONES
+	// composite (and any #803 feather ramp) blends toward the desktop.
 	bool zones_frame = false;
 	for (uint32_t i = 0; i < layers->layer_count; i++) {
 		if (layers->layers[i].data.type == XRT_LAYER_ZONE_3D) {
@@ -1979,7 +1990,7 @@ comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
                                         int32_t cy,
                                         uint32_t cw,
                                         uint32_t ch,
-                                        bool alpha_over)
+                                        uint32_t composite_mode)
 {
 	if (renderer == nullptr || cmd_list_ptr == nullptr || dst_rtv_handle == 0 || twod_resource == nullptr ||
 	    mask_resource == nullptr || weave_resource == nullptr) {
@@ -2044,7 +2055,7 @@ comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
 	// The D3D12 leg always composites an authored mask; the analytic rect
 	// path (use_rect_mask=1) exists for shader parity with D3D11 only.
 	params.use_rect_mask = 0;
-	params.alpha_over = alpha_over ? 1u : 0u; // #491: implicit Local2D = premul over
+	params.composite_mode = composite_mode; // LERP / ALPHA_OVER (#491) / ZONES (ADR-027)
 
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv = {};
 	rtv.ptr = static_cast<SIZE_T>(dst_rtv_handle);
