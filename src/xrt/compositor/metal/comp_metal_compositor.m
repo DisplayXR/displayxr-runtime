@@ -308,7 +308,10 @@ struct comp_metal_compositor
 	//! zones frame the canvas output rect, the sticky submitted mask, and
 	//! the implicit-mask-from-Local2D rule are all inert; the effective
 	//! canvas is the full client window (zones frames count as mask_active
-	//! for metal_effective_canvas); the wish drives the post-weave lerp.
+	//! for metal_effective_canvas); the wish drives the DP publish ONLY —
+	//! the post-weave composite gates the weave by the BINARY zone raster
+	//! (or the #803 opt-in feather raster), never by an explicit wish
+	//! (#801: the wish is hardware-only).
 	bool zones_frame;
 
 	//! Explicit per-frame wish (XrDisplayZonesFrameEndInfoDXR.wishMask) set
@@ -349,14 +352,30 @@ struct comp_metal_compositor
 	struct comp_metal_zone_mask *zone_frame_wish_last;
 
 	//! XR_DXR_display_zones AUTO wish raster (union of the frame's zone
-	//! rects with a feathered edge), CPU-rasterized like the implicit mask
-	//! but kept separate so the two dirty-caches can never cross-hit.
+	//! rects, BINARY — #800/#801: the wish is hardware-only and hard-edged
+	//! by default), CPU-rasterized like the implicit mask but kept separate
+	//! so the two dirty-caches can never cross-hit. The same texture is the
+	//! MODE_ZONES composite's weave gate and the published wish when no
+	//! explicit wish is staged.
 	id<MTLTexture> wish_mask_tex;
 	uint8_t *wish_mask_bytes;                   //!< CPU raster buffer (w*h)
 	uint32_t wish_mask_w;                       //!< Current wish mask width (0 = none)
 	uint32_t wish_mask_h;
 	struct xrt_rect wish_rects[XRT_MAX_LAYERS]; //!< Rect cache for change detection
 	uint32_t wish_rect_count;
+
+	//! Zones COMPOSITE mask with per-zone opt-in feather
+	//! (XrDisplayZoneFeatherDXR, #800/#803). Allocated only when a frame's
+	//! zones request feather — the published wish must stay binary
+	//! (wish_mask above), so a feathered composite needs its own raster.
+	//! All-hard frames sample the binary wish raster for the composite.
+	id<MTLTexture> feather_mask_tex;
+	uint8_t *feather_mask_bytes;                   //!< CPU raster buffer (w*h)
+	uint32_t feather_mask_w;                       //!< 0 = none
+	uint32_t feather_mask_h;
+	struct xrt_rect feather_rects[XRT_MAX_LAYERS]; //!< dirty-check cache
+	float feather_radii[XRT_MAX_LAYERS];           //!< dirty-check cache
+	uint32_t feather_rect_count;
 
 	//! Thread safety.
 	struct os_mutex mutex;
@@ -458,26 +477,35 @@ static NSString *const metal_shader_source = @
     "}\n"
     "\n"
     "// #439 Phase 3 — masked 2D/3D composite (MSL port of the D3D11\n"
-    "// masked_composite.hlsl sampled-mask path). M=1 keeps the weave, M=0\n"
-    "// shows the flattened 2D layer; BOTH rgb and alpha are lerped so each\n"
-    "// layer's own transparency survives to the compose-under-bg pass\n"
-    "// (spec 4.2 output-alpha rule).\n"
-    "// #491 alpha_over path: premultiplied 'over' of the 2D atop the weave\n"
-    "// (twod + (1-twod.a)*weave) — translucent 2D reveals the 3D scene, not\n"
-    "// the desktop. Used for the IMPLICIT Local2D mask; explicit masks keep\n"
-    "// the hard M-lerp.\n"
+    "// masked_composite.hlsl sampled-mask path), by composite_mode:\n"
+    "// 0 (LERP): hard M-lerp — M=1 keeps the weave, M=0 shows the flattened\n"
+    "//   2D layer; BOTH rgb and alpha are lerped so each layer's own\n"
+    "//   transparency survives to the compose-under-bg pass (spec 4.2\n"
+    "//   output-alpha rule). Explicit authored masks.\n"
+    "// 1 (ALPHA_OVER, #491): premultiplied 'over' of the 2D atop the weave\n"
+    "//   (twod + (1-twod.a)*weave) — translucent 2D reveals the 3D scene,\n"
+    "//   not the desktop. The IMPLICIT Local2D mask (mask unused).\n"
+    "// 2 (ZONES, ADR-027/#801): twod + (1-twod.a)*(M*weave) — M gates only\n"
+    "//   the WEAVE by zone geometry (binary zone raster, or the #803 opt-in\n"
+    "//   feather ramp); the 2D composites on top by its own alpha. Zone\n"
+    "//   interior with no 2D -> weave; overlay in a zone -> glass over the\n"
+    "//   weave; a 2D band -> the 2D with its own alpha (alpha 0 where\n"
+    "//   uncovered, so a transparent present still reaches the desktop).\n"
     "fragment float4 masked_composite_fragment(VertexOut in [[stage_in]],\n"
     "                                          texture2d<float> twod_tex [[texture(0)]],\n"
     "                                          texture2d<float> mask_tex [[texture(1)]],\n"
     "                                          texture2d<float> weave_tex [[texture(2)]],\n"
-    "                                          constant uint &alpha_over [[buffer(0)]],\n"
+    "                                          constant uint &composite_mode [[buffer(0)]],\n"
     "                                          sampler smp [[sampler(0)]]) {\n"
     "    float4 twod = twod_tex.sample(smp, in.texCoord);\n"
     "    float4 weave = weave_tex.sample(smp, in.texCoord);\n"
-    "    if (alpha_over != 0u) {\n"
+    "    if (composite_mode == 1u) {\n"
     "        return twod + (1.0 - twod.a) * weave;\n"
     "    }\n"
     "    float M = saturate(mask_tex.sample(smp, in.texCoord).r);\n"
+    "    if (composite_mode == 2u) {\n"
+    "        return twod + (1.0 - twod.a) * (M * weave);\n"
+    "    }\n"
     "    return M * weave + (1.0 - M) * twod;\n"
     "}\n";
 
@@ -1926,21 +1954,17 @@ metal_update_implicit_mask(struct comp_metal_compositor *c,
 
 /*!
  * XR_DXR_display_zones (ADR-027) — (re)rasterize the AUTO wish: union of the
- * frame's zone rects with an INWARD feathered edge: M=0 outside the zones;
- * inside each zone M ramps 0->1 over the first 16 px from the edge, so the
- * visual lerp fades zone content toward TRANSPARENT at the edge (never
- * toward the weave of empty atlas, which DPs may report opaque black). CPU
- * fill + replaceRegion like the implicit mask, with max-semantics across
- * zones (overlapping feathers never dim a zone core; small zones still
- * reach M=1 at the center because the inside-distance peaks there). NOTE:
- * the Metal CPU raster does a TRUE per-pixel distance feather —
- * clamp(dist_inside/16px) — rather than the GPU legs' stepped 8×2px inset
- * rings (D3D11 ClearView / D3D12 rect clears / VK vkCmdClearAttachments);
- * same 16-px footprint, smoother profile.
+ * frame's zone rects, BINARY (#800/#801 — the wish is HARDWARE-only and
+ * hard-edged by default; the old implicit 16px distance feather leaked
+ * cosmetic fractional M into the published wish and vignetted the composite
+ * at window edges). M=255 inside every zone rect, 0 outside. CPU fill +
+ * replaceRegion like the implicit mask. The same texture is the MODE_ZONES
+ * composite's weave gate and the published wish when no explicit wish is
+ * staged; cosmetic feather (XrDisplayZoneFeatherDXR, #803) rasters into its
+ * own texture and never enters this one.
  * Re-rasterized only when the rect set or dims change. Returns the wish
  * texture or nil on failure.
  */
-#define METAL_ZONE_WISH_FEATHER_PX 16
 static id<MTLTexture>
 metal_update_zone_wish_mask(struct comp_metal_compositor *c,
                             const struct xrt_rect *rects,
@@ -1990,10 +2014,9 @@ metal_update_zone_wish_mask(struct comp_metal_compositor *c,
 		c->wish_mask_h = h;
 	}
 
-	// M=0 everywhere (no 3D wish), then per zone: an inside-distance feather
-	// ramp from the rect edge to M=1 at >=16 px inside, folded in with max().
+	// M=0 everywhere (no 3D wish), then M=255 across every zone rect —
+	// binary, no rings/ramps (#800/#801).
 	memset(c->wish_mask_bytes, 0x00, (size_t)w * h);
-	const float feather = (float)METAL_ZONE_WISH_FEATHER_PX;
 	for (uint32_t i = 0; i < rect_count; i++) {
 		int32_t rx0 = rects[i].offset.w;
 		int32_t ry0 = rects[i].offset.h;
@@ -2007,21 +2030,8 @@ metal_update_zone_wish_mask(struct comp_metal_compositor *c,
 		int32_t ex1 = rx1 > (int32_t)w ? (int32_t)w : rx1;
 		int32_t ey1 = ry1 > (int32_t)h ? (int32_t)h : ry1;
 		for (int32_t y = ey0; y < ey1; y++) {
-			// Distance from this row to the nearest horizontal edge,
-			// measured INSIDE the rect (>= 1 on the innermost row).
-			int32_t dy_in = (y - ry0 + 1) < (ry1 - y) ? (y - ry0 + 1) : (ry1 - y);
-			uint8_t *row = c->wish_mask_bytes + (size_t)y * w;
-			for (int32_t x = ex0; x < ex1; x++) {
-				int32_t dx_in = (x - rx0 + 1) < (rx1 - x) ? (x - rx0 + 1) : (rx1 - x);
-				int32_t d_in = dx_in < dy_in ? dx_in : dy_in;
-				float fv = (float)d_in / feather;
-				if (fv > 1.0f) {
-					fv = 1.0f;
-				}
-				uint8_t v = (uint8_t)(fv * 255.0f + 0.5f);
-				if (v > row[x]) {
-					row[x] = v; // max across overlapping zones
-				}
+			if (ex1 > ex0) {
+				memset(c->wish_mask_bytes + (size_t)y * w + ex0, 0xFF, (size_t)(ex1 - ex0));
 			}
 		}
 	}
@@ -2035,9 +2045,130 @@ metal_update_zone_wish_mask(struct comp_metal_compositor *c,
 	c->wish_rect_count = rect_count;
 	c->zone_publish_seq++; // #224 P4: new wish content generation for the DP publish
 
-	U_LOG_W("Metal zone wish mask (auto): %ux%u, %u zone rect(s), %u-px feather", w, h, rect_count,
-	        METAL_ZONE_WISH_FEATHER_PX);
+	U_LOG_W("Metal zone wish mask (auto): %ux%u, %u zone rect(s), binary", w, h, rect_count);
 	return c->wish_mask_tex;
+}
+
+/*!
+ * XR_DXR_display_zones (#800/#803) — (re)rasterize the zones COMPOSITE mask
+ * with PER-ZONE opt-in feather (XrDisplayZoneFeatherDXR) into its own CPU
+ * buffer + texture. M=0 outside every zone; each zone draws hard (M=255,
+ * feather_px[i] <= 0 — the default) or with its own TRUE per-pixel inward
+ * distance ramp clamp(dist_inside/radius) (the Metal CPU idiom — smoother
+ * than the GPU legs' stepped rings, same footprint), folded in with max()
+ * across overlapping zones. Only called when a frame's zones request
+ * feather — all-hard frames sample the binary wish raster instead, and the
+ * published wish stays binary regardless (cosmetics never enter the wish).
+ * No zone_publish_seq bump: composite-only, never published. Dirty-checked
+ * on the rect set + radii + dims. Returns the feather texture or nil on
+ * failure (caller falls back to the binary mask — hard edges, never a lost
+ * frame).
+ */
+static id<MTLTexture>
+metal_update_zone_feather_mask(struct comp_metal_compositor *c,
+                               const struct xrt_rect *rects,
+                               const float *feather_px,
+                               uint32_t rect_count,
+                               uint32_t w,
+                               uint32_t h)
+{
+	if (w == 0 || h == 0 || rect_count == 0) {
+		return nil;
+	}
+
+	bool dirty = (c->feather_mask_tex == nil) || c->feather_mask_w != w || c->feather_mask_h != h ||
+	             c->feather_rect_count != rect_count;
+	for (uint32_t i = 0; !dirty && i < rect_count; i++) {
+		if (memcmp(&c->feather_rects[i], &rects[i], sizeof(rects[i])) != 0 ||
+		    c->feather_radii[i] != feather_px[i]) {
+			dirty = true;
+		}
+	}
+	if (!dirty) {
+		return c->feather_mask_tex;
+	}
+
+	if (c->feather_mask_tex == nil || c->feather_mask_w != w || c->feather_mask_h != h) {
+		[c->feather_mask_tex release];
+		c->feather_mask_tex = nil;
+		free(c->feather_mask_bytes);
+		c->feather_mask_bytes = NULL;
+
+		MTLTextureDescriptor *desc =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+		                                                       width:w
+		                                                      height:h
+		                                                   mipmapped:NO];
+		desc.usage = MTLTextureUsageShaderRead;
+		desc.storageMode = MTLStorageModeShared;
+		c->feather_mask_tex = [c->device newTextureWithDescriptor:desc];
+		c->feather_mask_bytes = (uint8_t *)malloc((size_t)w * h);
+		if (c->feather_mask_tex == nil || c->feather_mask_bytes == NULL) {
+			U_LOG_E("Failed to allocate zone feather mask (%ux%u)", w, h);
+			[c->feather_mask_tex release];
+			c->feather_mask_tex = nil;
+			free(c->feather_mask_bytes);
+			c->feather_mask_bytes = NULL;
+			return nil;
+		}
+		c->feather_mask_w = w;
+		c->feather_mask_h = h;
+	}
+
+	memset(c->feather_mask_bytes, 0x00, (size_t)w * h);
+	for (uint32_t i = 0; i < rect_count; i++) {
+		const float radius = feather_px[i];
+		const bool feathered = radius > 0.0f;
+		int32_t rx0 = rects[i].offset.w;
+		int32_t ry0 = rects[i].offset.h;
+		int32_t rx1 = rx0 + rects[i].extent.w;
+		int32_t ry1 = ry0 + rects[i].extent.h;
+		if (rx1 <= rx0 || ry1 <= ry0) {
+			continue;
+		}
+		int32_t ex0 = rx0 < 0 ? 0 : rx0;
+		int32_t ey0 = ry0 < 0 ? 0 : ry0;
+		int32_t ex1 = rx1 > (int32_t)w ? (int32_t)w : rx1;
+		int32_t ey1 = ry1 > (int32_t)h ? (int32_t)h : ry1;
+		for (int32_t y = ey0; y < ey1; y++) {
+			uint8_t *row = c->feather_mask_bytes + (size_t)y * w;
+			if (!feathered) {
+				if (ex1 > ex0) {
+					// Hard zone: solid 255 — max() with a full row fill.
+					memset(row + ex0, 0xFF, (size_t)(ex1 - ex0));
+				}
+				continue;
+			}
+			// Distance from this row to the nearest horizontal edge,
+			// measured INSIDE the rect (>= 1 on the innermost row).
+			int32_t dy_in = (y - ry0 + 1) < (ry1 - y) ? (y - ry0 + 1) : (ry1 - y);
+			for (int32_t x = ex0; x < ex1; x++) {
+				int32_t dx_in = (x - rx0 + 1) < (rx1 - x) ? (x - rx0 + 1) : (rx1 - x);
+				int32_t d_in = dx_in < dy_in ? dx_in : dy_in;
+				float fv = (float)d_in / radius;
+				if (fv > 1.0f) {
+					fv = 1.0f;
+				}
+				uint8_t v = (uint8_t)(fv * 255.0f + 0.5f);
+				if (v > row[x]) {
+					row[x] = v; // max across overlapping zones
+				}
+			}
+		}
+	}
+
+	[c->feather_mask_tex replaceRegion:MTLRegionMake2D(0, 0, w, h)
+	                       mipmapLevel:0
+	                         withBytes:c->feather_mask_bytes
+	                       bytesPerRow:w];
+
+	memcpy(c->feather_rects, rects, sizeof(rects[0]) * rect_count);
+	memcpy(c->feather_radii, feather_px, sizeof(feather_px[0]) * rect_count);
+	c->feather_rect_count = rect_count;
+
+	U_LOG_W("Metal zone feather mask: %ux%u, %u zone rect(s) (composite-only, wish stays binary)", w, h,
+	        rect_count);
+	return c->feather_mask_tex;
 }
 
 /*!
@@ -2367,47 +2498,58 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 	}
 
 	// XR_DXR_display_zones: a zones frame ALWAYS runs the composite (the
-	// feathered wish edge lerps the weave toward the 2D flatten even with
-	// zero Local2D layers); the sticky mask + implicit-mask rules are inert.
+	// MODE_ZONES pass gates the weave by the binary zone raster — pixels
+	// outside every zone go to the 2D flatten / transparent even with zero
+	// Local2D layers); the sticky mask + implicit-mask rules are inert.
 	const bool zones_frame = c->zones_frame;
 
-	// Step 2 — resolve the frame's mask. Zones frame: the WISH — the
-	// explicit frame wish (referenced-at-frame-end: re-upload the CURRENT
-	// authored bytes, mirroring zone_mask_submit's replaceRegion body, so
-	// no xrSubmitLocal3DZoneDXR is required) or the auto feathered raster
-	// from the zone rects.
+	// Step 2 — resolve the frame's mask. Zones frame (#801): ALWAYS the
+	// BINARY zone raster — per ADR-027 the wish is HARDWARE-only and
+	// composition follows zone geometry + alpha, so an explicit frame wish
+	// never gates blending; it stages (referenced-at-frame-end: re-upload
+	// the CURRENT authored bytes, mirroring zone_mask_submit's
+	// replaceRegion body, so no xrSubmitLocal3DZoneDXR is required) and
+	// routes to the DP publish only. #803: when any zone requests feather,
+	// the composite samples a separately-rastered per-zone feather mask
+	// instead; the published wish stays binary regardless (cosmetics never
+	// enter the wish).
 	id<MTLTexture> mask_tex = nil;
-	if (zones_frame && c->frame_wish != NULL && c->frame_wish->tex != nil &&
-	    c->frame_wish->author_bytes != NULL) {
-		struct comp_metal_zone_mask *fw = c->frame_wish;
-		[fw->tex replaceRegion:MTLRegionMake2D(0, 0, fw->w, fw->h)
-		           mipmapLevel:0
-		             withBytes:fw->author_bytes
-		           bytesPerRow:fw->w];
-		mask_tex = fw->tex;
-
-		// P4 publish source + seq: the explicit wish. Bump the generation
-		// on a source change (pointer flip; Metal masks carry no author
-		// generation, so a same-pointer re-author keeps its seq — vendors
-		// treat same-seq as anchor-only updates).
-		c->zone_publish_tex = fw->tex;
-		c->zone_publish_w = fw->w;
-		c->zone_publish_h = fw->h;
-		if (c->zone_frame_wish_last != fw) {
-			c->zone_frame_wish_last = fw;
-			c->zone_publish_seq++;
-		}
-	} else if (zones_frame) {
+	if (zones_frame) {
 		struct xrt_rect zone_rects[XRT_MAX_LAYERS];
+		float zone_feathers[XRT_MAX_LAYERS];
+		bool any_feather = false;
 		uint32_t zone_rect_count = 0;
 		for (uint32_t i = 0; i < c->layer_accum.layer_count && zone_rect_count < XRT_MAX_LAYERS; i++) {
 			if (c->layer_accum.layers[i].data.type != XRT_LAYER_ZONE_3D) {
 				continue;
 			}
+			zone_feathers[zone_rect_count] = c->layer_accum.layers[i].data.zone_3d.feather_px;
+			if (zone_feathers[zone_rect_count] > 0.0f) {
+				any_feather = true;
+			}
 			zone_rects[zone_rect_count++] = c->layer_accum.layers[i].data.zone_3d.rect;
 		}
 		mask_tex = metal_update_zone_wish_mask(c, zone_rects, zone_rect_count, w, h);
-		if (mask_tex != nil) {
+
+		if (c->frame_wish != NULL && c->frame_wish->tex != nil && c->frame_wish->author_bytes != NULL) {
+			struct comp_metal_zone_mask *fw = c->frame_wish;
+			[fw->tex replaceRegion:MTLRegionMake2D(0, 0, fw->w, fw->h)
+			           mipmapLevel:0
+			             withBytes:fw->author_bytes
+			           bytesPerRow:fw->w];
+			// P4 publish source + seq: the explicit wish — PUBLISH-ONLY
+			// (#801), never the composite mask. Bump the generation on a
+			// source change (pointer flip; Metal masks carry no author
+			// generation, so a same-pointer re-author keeps its seq —
+			// vendors treat same-seq as anchor-only updates).
+			c->zone_publish_tex = fw->tex;
+			c->zone_publish_w = fw->w;
+			c->zone_publish_h = fw->h;
+			if (c->zone_frame_wish_last != fw) {
+				c->zone_frame_wish_last = fw;
+				c->zone_publish_seq++;
+			}
+		} else if (mask_tex != nil) {
 			// P4 publish source + seq: the auto raster (its dirty
 			// re-raster path bumps the generation itself); a source
 			// flip explicit -> auto is new content even when the rect
@@ -2419,6 +2561,16 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 			c->zone_publish_tex = mask_tex;
 			c->zone_publish_w = w;
 			c->zone_publish_h = h;
+		}
+
+		// #803 — feather is a composite-only cosmetic; raster failure
+		// falls back to the binary mask (hard edges, never a lost frame).
+		if (any_feather) {
+			id<MTLTexture> ftex =
+			    metal_update_zone_feather_mask(c, zone_rects, zone_feathers, zone_rect_count, w, h);
+			if (ftex != nil) {
+				mask_tex = ftex;
+			}
 		}
 	} else if (c->zone_mask_active != NULL && c->zone_mask_active->submitted) {
 		mask_tex = c->zone_mask_active->tex;
@@ -2514,22 +2666,43 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 		// #491: the implicit (auto) Local2D mask composites the 2D over the
 		// weave by its own premultiplied alpha (translucent 2D reveals the 3D
 		// scene). The explicit authored mask keeps the hard M-lerp.
-		// XR_DXR_display_zones: zones frames are ALWAYS the hard M-lerp
-		// (final = M·weave + (1−M)·flatten(2D-over)) — composition follows
-		// zone geometry + the wish, never the #491 alpha-over rule.
+		// XR_DXR_display_zones: MODE_ZONES (twod + (1−a)·(M·weave)) — the
+		// binary zone raster (or the #803 feather ramp) gates only the
+		// WEAVE; Local2D content composites on top by its own alpha
+		// (ADR-027/#801: the wish is hardware-only; composition follows
+		// zone geometry + alpha). Formerly the hard M-lerp, which
+		// multiplied overlays away inside zones and dimmed the feathered
+		// edge.
 		const bool have_explicit =
 		    !zones_frame && (c->zone_mask_active != NULL && c->zone_mask_active->submitted);
-		uint alpha_over = (!zones_frame && have_local_2d && !have_explicit) ? 1u : 0u;
+		uint composite_mode; // 0 = hard M-lerp, 1 = #491 premul over, 2 = zones
+		if (zones_frame) {
+			composite_mode = 2u;
+		} else if (have_explicit) {
+			composite_mode = 0u;
+		} else {
+			composite_mode = 1u;
+		}
 
 		[enc setRenderPipelineState:c->masked_composite_pipeline];
 		[enc setFragmentTexture:c->local2d_scratch atIndex:0];
 		[enc setFragmentTexture:mask_tex atIndex:1];
 		[enc setFragmentTexture:c->weave_scratch atIndex:2];
-		[enc setFragmentBytes:&alpha_over length:sizeof(alpha_over) atIndex:0];
+		[enc setFragmentBytes:&composite_mode length:sizeof(composite_mode) atIndex:0];
 		[enc setFragmentSamplerState:c->sampler_nearest atIndex:0];
 		[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 
 		[enc endEncoding];
+
+		// One-shot lifecycle log (NOT per-frame): proves the masked
+		// composite ran + which mask source and mode resolved. WARN so it
+		// survives the hot-path INFO filter.
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			U_LOG_W("Metal Local2D composite: %ux%u region, %s mask (mode=%u)", w, h,
+			        zones_frame ? "zone" : (have_explicit ? "explicit" : "implicit"), composite_mode);
+		}
 	}
 
 	return true;
@@ -2884,8 +3057,8 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// Otherwise clear to opaque black.
 		// XR_DXR_display_zones (ADR-027): a zones frame composes N placed
 		// zone layers into the window-spanning atlas — the unzoned area
-		// must weave to nothing (transparent) so the feathered wish edge
-		// blends toward the desktop.
+		// must weave to nothing (transparent) so the MODE_ZONES composite
+		// (and any #803 feather ramp) blends toward the desktop.
 		pass.colorAttachments[0].clearColor = (c->transparent_background || zones_frame)
 		    ? MTLClearColorMake(0.0, 0.0, 0.0, 0.0)
 		    : MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
@@ -3607,6 +3780,14 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	c->wish_mask_tex = nil;
 	free(c->wish_mask_bytes);
 	c->wish_mask_bytes = NULL;
+	// #800/#803 — per-zone opt-in feather composite mask.
+	[c->feather_mask_tex release];
+	c->feather_mask_tex = nil;
+	free(c->feather_mask_bytes);
+	c->feather_mask_bytes = NULL;
+	c->feather_mask_w = 0;
+	c->feather_mask_h = 0;
+	c->feather_rect_count = 0;
 	[c->implicit_mask_tex release];
 	c->implicit_mask_tex = nil;
 	free(c->implicit_mask_bytes);
