@@ -46,8 +46,8 @@ struct CompositeParams
 	float dst_dims[2];      // destination width,height in px
 	float canvas_origin[2]; // 3D canvas sub-rect top-left (px)
 	float canvas_size[2];   // 3D canvas sub-rect size (px)
-	uint32_t use_rect_mask; // 1 = Phase 0 analytic rect mask
-	uint32_t alpha_over;    // #491: 1 = premul "over" of the 2D atop the weave
+	uint32_t use_rect_mask;  // 1 = Phase 0 analytic rect mask
+	uint32_t composite_mode; // COMP_D3D11_COMPOSITE_MODE_*: 0 hard M-lerp, 1 #491 over, 2 zones
 };
 
 /*!
@@ -400,7 +400,7 @@ cbuffer CompositeParams : register(b0)
     float2 canvas_origin;
     float2 canvas_size;
     uint   use_rect_mask;
-    uint   alpha_over;   // #491: premul "over" of the 2D atop the weave
+    uint   composite_mode; // 0 = hard M-lerp, 1 = #491 premul over, 2 = zones (ADR-027)
 };
 
 struct VS_OUTPUT
@@ -435,13 +435,24 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
 
     float4 twod  = twod_tex.Sample(samp, input.uv);
     float4 weave = weave_tex.Sample(samp, input.uv);
-    if (alpha_over != 0)
+    if (composite_mode == 1)
     {
         // #491: the 2D layer's own (premultiplied) alpha IS the blend —
         // translucent 2D reveals the 3D scene, not the desktop.
         return twod + (1.0 - twod.a) * weave;
     }
     float M = saturate(mask_tex.Sample(samp, input.uv).r);
+    if (composite_mode == 2)
+    {
+        // XR_DXR_display_zones (ADR-027, #801): M gates only the WEAVE by
+        // zone geometry (binary zone raster, or the #803 opt-in feather
+        // ramp); the 2D composites on top by its own premultiplied alpha.
+        // Zone interior with no 2D -> weave; a Local2D overlay inside a
+        // zone -> glass over the weave; a 2D band outside every zone ->
+        // the 2D with its own alpha (alpha 0 where uncovered, so a
+        // transparent present still reaches the desktop).
+        return twod + (1.0 - twod.a) * (M * weave);
+    }
     return M * weave + (1.0 - M) * twod;
 }
 )";
@@ -1976,7 +1987,7 @@ comp_d3d11_renderer_composite_2d_masked(struct comp_d3d11_renderer *renderer,
                                         int32_t cy,
                                         uint32_t cw,
                                         uint32_t ch,
-                                        bool alpha_over)
+                                        uint32_t composite_mode)
 {
 	if (renderer == nullptr || dst_texture == nullptr || twod_srv == nullptr) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
@@ -2043,7 +2054,7 @@ comp_d3d11_renderer_composite_2d_masked(struct comp_d3d11_renderer *renderer,
 	// Phase 0: hard rect mask derived from the canvas. Phase 1: sample the
 	// authored mask and run the lerp.
 	params.use_rect_mask = (mask_srv == nullptr) ? 1 : 0;
-	params.alpha_over = alpha_over ? 1u : 0u; // #491: implicit Local2D = premul over
+	params.composite_mode = composite_mode; // LERP / ALPHA_OVER (#491) / ZONES (ADR-027)
 
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	hr = internals->context->Map(renderer->composite_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);

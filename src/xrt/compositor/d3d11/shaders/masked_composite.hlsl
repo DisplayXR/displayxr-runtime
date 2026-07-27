@@ -18,10 +18,17 @@
  *
  * AUTHORED-MASK PATH: `use_rect_mask` goes false; `mask_tex` (a separate scalar
  * R8 channel, NOT the 2D layer's alpha — see §4.0 of the spec) supplies M in
- * [0,1], and the discard becomes the mask-lerp
- *     final = M·weave + (1-M)·twod        (both rgb and a)
- * which requires the weave bound as an SRV (weave_tex). The fields for that
- * path are present below but unused in Phase 0.
+ * [0,1], and the blend follows `composite_mode`:
+ *     0 (LERP)       final = M·weave + (1-M)·twod         (explicit authored
+ *                    mask — designer cutout/portal; both rgb and a)
+ *     1 (ALPHA_OVER) final = twod + (1-twod.a)·weave      (#491 implicit
+ *                    legacy mask: the 2D's own premultiplied alpha IS the
+ *                    blend; mask unused)
+ *     2 (ZONES)      final = twod + (1-twod.a)·(M·weave)  (ADR-027/#801: M
+ *                    gates only the WEAVE by zone geometry — binary zone
+ *                    raster, or the #803 opt-in feather ramp — and the 2D
+ *                    composites on top by its own alpha)
+ * which requires the weave bound as an SRV (weave_tex).
  */
 
 Texture2D twod_tex   : register(t0);   // the 2D layer (RGBA, premultiplied)
@@ -35,7 +42,7 @@ cbuffer CompositeParams : register(b0)
     float2 canvas_origin;  // canvas sub-rect top-left (px) — the 3D region
     float2 canvas_size;    // canvas sub-rect size (px)
     uint   use_rect_mask;  // 1 = Phase 0 analytic rect mask; 0 = sample mask_tex
-    uint   _pad;
+    uint   composite_mode; // 0 = hard M-lerp, 1 = #491 premul over, 2 = zones (ADR-027)
 };
 
 struct VS_OUTPUT
@@ -95,10 +102,21 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
         return twod_tex.Sample(samp, input.uv);
     }
 
-    // Phase 1+ general path: mask-lerp, preserving each layer's own alpha.
-    // (final.a = M·weave.a + (1-M)·twod.a — honors the #225 compose-under-bg
-    // contract by carrying whichever layer wins the pixel.)
+    // Phase 1+ general path, by composite_mode (see the header comment).
     float4 twod  = twod_tex.Sample(samp, input.uv);
     float4 weave = weave_tex.Sample(samp, input.uv);
+    if (composite_mode == 1)
+    {
+        // #491: the 2D layer's own (premultiplied) alpha IS the blend.
+        return twod + (1.0 - twod.a) * weave;
+    }
+    if (composite_mode == 2)
+    {
+        // XR_DXR_display_zones (ADR-027, #801): M gates only the weave.
+        return twod + (1.0 - twod.a) * (M * weave);
+    }
+    // Hard M-lerp, preserving each layer's own alpha. (final.a = M·weave.a +
+    // (1-M)·twod.a — honors the #225 compose-under-bg contract by carrying
+    // whichever layer wins the pixel.)
     return M * weave + (1.0 - M) * twod;
 }
