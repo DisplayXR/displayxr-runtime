@@ -103,23 +103,28 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	struct service_config cfg;
 	service_config_load(&cfg);
 
-	// If user disabled "Start on login" via the tray menu, exit immediately.
-	// The HKLM Run key still launches us, but we honor the config and bow out
-	// before creating any windows or tray icons. The service can still be
-	// started manually or via IPC auto-launch from an OpenXR app.
-	if (!cfg.start_on_login) {
-		ExitProcess(0);
-	}
-
-	// Parse --workspace for the manual multi-terminal workflow. The
+	// Parse flags. --workspace is the manual multi-terminal workflow (the
 	// orchestrator will also enable workspace mode when it spawns the
-	// workspace controller.
+	// workspace controller). --autostart is appended by the HKLM Run key
+	// registration so we can tell a logon auto-start from a manual launch.
 	bool workspace_mode = false;
+	bool autostart = false;
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--workspace") == 0) {
 			workspace_mode = true;
-			break;
+		} else if (strcmp(argv[i], "--autostart") == 0) {
+			autostart = true;
 		}
+	}
+
+	// If user disabled "Start on login" via the tray menu, bow out of logon
+	// auto-starts only. Manual launches and IPC auto-launch from an OpenXR
+	// app (neither passes --autostart) always start (#806 — the old
+	// unconditional gate silently killed every launch on any machine where
+	// the toggle had ever been unchecked).
+	if (autostart && !cfg.start_on_login) {
+		U_LOG_W("Start-on-login is disabled in service.json; exiting (logon auto-start).");
+		ExitProcess(0);
 	}
 
 	// Start the system tray icon with orchestrator menu
