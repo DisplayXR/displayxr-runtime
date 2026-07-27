@@ -824,8 +824,11 @@ Section "DisplayXR Runtime" SecRuntime
 		; Register in HKLM Run key (starts in user session with GPU/tray access).
 		; This section runs in the 64-bit view (SetRegView 64 at section start).
 		DetailPrint "Registering DisplayXR Service for auto-start..."
+		; --autostart lets the service distinguish this logon auto-start from a
+		; manual launch, so the "Start on login" tray toggle only gates the
+		; former (#806).
 		WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Run" \
-			"DisplayXR Service" "$\"$INSTDIR\displayxr-service.exe$\""
+			"DisplayXR Service" "$\"$INSTDIR\displayxr-service.exe$\" --autostart"
 		; Drop any stale 32-bit (WOW6432Node) Run entry from an interim installer
 		; that wrote it before this section used SetRegView 64. Windows fires both
 		; views at logon, so a leftover 32-bit copy double-launches the service.
