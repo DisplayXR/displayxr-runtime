@@ -282,8 +282,13 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
  * sampler + opaque output this is a hard-edged 1:1 fill of the non-canvas region.
  *
  * Phase 1 (authored-mask path, @p mask_srv != NULL): samples the scalar mask
- * M and lerps M·weave + (1−M)·twod per pixel — soft edges work, so the weave
- * must be readable: pass an SRV snapshot of dst as @p weave_srv.
+ * M and blends per @p composite_mode — soft edges work, so the weave must be
+ * readable: pass an SRV snapshot of dst as @p weave_srv. Modes: LERP = the
+ * hard M-lerp (M·weave + (1−M)·twod, explicit authored mask — designer
+ * cutout/portal); ALPHA_OVER = #491 premul over (implicit legacy mask:
+ * twod + (1−twod.a)·weave, mask unused); ZONES = ADR-027/#801
+ * (twod + (1−twod.a)·(M·weave) — M gates only the weave by zone geometry,
+ * the 2D composites on top by its own alpha). Ignored on the rect path.
  *
  * The pass writes only the @p region_w × @p region_h viewport at the top-left
  * of dst (#464: the 2D layer + mask are window-sized; the window content is
@@ -308,6 +313,9 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
  *
  * @ingroup comp_d3d11
  */
+#define COMP_D3D11_COMPOSITE_MODE_LERP 0u
+#define COMP_D3D11_COMPOSITE_MODE_ALPHA_OVER 1u
+#define COMP_D3D11_COMPOSITE_MODE_ZONES 2u
 xrt_result_t
 comp_d3d11_renderer_composite_2d_masked(struct comp_d3d11_renderer *renderer,
                                         void *dst_texture,
@@ -320,7 +328,7 @@ comp_d3d11_renderer_composite_2d_masked(struct comp_d3d11_renderer *renderer,
                                         int32_t cy,
                                         uint32_t cw,
                                         uint32_t ch,
-                                        bool alpha_over);
+                                        uint32_t composite_mode);
 
 /*!
  * Flatten one app Local2D layer image into the runtime 2D scratch (#439
