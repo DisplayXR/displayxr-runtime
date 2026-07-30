@@ -234,12 +234,17 @@ static const char *FS_TEXTURED =
     "    fragColor = texture(u_texture, uv);\n"
     "}\n";
 
-//! Fragment shader: masked 2D-over-3D composite (#439 Phase 3 GL leg).
-//! Hard-mask path: final = M*weave + (1-M)*twod (explicit authored mask).
-//! #491 alpha-over path (u_alpha_over): final = twod + (1-twod.a)*weave —
-//! premultiplied "over" of the 2D atop the weave, so translucent 2D reveals the
-//! 3D scene (used for the IMPLICIT Local2D mask). All three sources are
-//! window-resolution textures in the same GL framebuffer orientation, 1:1.
+//! Fragment shader: masked 2D-over-3D composite (#439 Phase 3 GL leg), by
+//! u_composite_mode:
+//! 0 (LERP): final = M*weave + (1-M)*twod (explicit authored mask).
+//! 1 (ALPHA_OVER, #491): final = twod + (1-twod.a)*weave — premultiplied
+//!   "over" of the 2D atop the weave, so translucent 2D reveals the 3D scene
+//!   (the IMPLICIT Local2D mask; mask unused).
+//! 2 (ZONES, ADR-027/#801): final = twod + (1-twod.a)*(M*weave) — M gates
+//!   only the WEAVE by zone geometry (binary zone raster, or the #803 opt-in
+//!   feather ramp); the 2D composites on top by its own premultiplied alpha.
+//! All three sources are window-resolution textures in the same GL
+//! framebuffer orientation, 1:1.
 static const char *FS_MASKED_COMPOSITE =
     "#version 330 core\n"
     "in vec2 v_uv;\n"
@@ -247,15 +252,19 @@ static const char *FS_MASKED_COMPOSITE =
     "uniform sampler2D u_twod;\n"
     "uniform sampler2D u_mask;\n"
     "uniform sampler2D u_weave;\n"
-    "uniform int u_alpha_over;\n"
+    "uniform int u_composite_mode;\n"
     "void main() {\n"
     "    vec4 twod  = texture(u_twod,  v_uv);\n"
     "    vec4 weave = texture(u_weave, v_uv);\n"
-    "    if (u_alpha_over != 0) {\n"
+    "    if (u_composite_mode == 1) {\n"
     "        fragColor = twod + (1.0 - twod.a) * weave;\n"
     "        return;\n"
     "    }\n"
     "    float M = clamp(texture(u_mask, v_uv).r, 0.0, 1.0);\n"
+    "    if (u_composite_mode == 2) {\n"
+    "        fragColor = twod + (1.0 - twod.a) * (M * weave);\n"
+    "        return;\n"
+    "    }\n"
     "    fragColor = M * weave + (1.0 - M) * twod;\n"
     "}\n";
 
@@ -410,8 +419,11 @@ struct comp_gl_compositor
 	//! accumulator carries XRT_LAYER_ZONE_3D layers (a "zones frame"). In a
 	//! zones frame the canvas output rect, the sticky submitted mask, and
 	//! the implicit-mask-from-Local2D rule are all inert; the effective
-	//! canvas is the full client window; the wish drives the post-weave
-	//! visual lerp. Set in the same per-frame scan as local_2d_last_frame.
+	//! canvas is the full client window; the wish drives the DP publish
+	//! ONLY — the post-weave composite gates the weave by the BINARY zone
+	//! raster (or the #803 opt-in feather raster), never by an explicit
+	//! wish (#801: the wish is hardware-only). Set in the same per-frame
+	//! scan as local_2d_last_frame.
 	bool zones_frame;
 	//! Explicit per-frame wish (XrDisplayZonesFrameEndInfoDXR.wishMask) set
 	//! via comp_gl_compositor_zones_set_frame_wish before commit; NULL =
@@ -459,6 +471,14 @@ struct comp_gl_compositor
 	GLuint local2d_scratch_tex, local2d_scratch_fbo;
 	GLuint implicit_mask_tex, implicit_mask_fbo;
 	uint32_t composite_scratch_w, composite_scratch_h; // weave + local2d dims
+	//! Zones COMPOSITE mask with per-zone opt-in feather
+	//! (XrDisplayZoneFeatherDXR, #800/#803). Allocated only when a frame's
+	//! zones request feather — the published wish must stay binary (the
+	//! implicit_mask raster above), so a feathered composite needs its own
+	//! texture. All-hard frames sample the binary raster for the composite.
+	//! Re-rastered every feathered zones frame (VK-style).
+	GLuint feather_mask_tex, feather_mask_fbo;
+	uint32_t feather_mask_w, feather_mask_h;
 	//! #491 part 3 — the flattened 2D-UNDER backdrop (Local2D layers before the
 	//! projection in list order), handed to the DP via set_background_2d so it
 	//! composites `backdrop over captured-desktop` under the 3D weave. Own FBO.
@@ -1987,20 +2007,18 @@ gl_update_implicit_mask(struct comp_gl_compositor *c,
 }
 
 // XR_DXR_display_zones (ADR-027) — (re)rasterize the AUTO wish: union of the
-// frame's zone rects with an INWARD stepped ring feather. M=0 outside the
-// zones; inside each zone M ramps 0->1 over the first 16 px from the edge
-// (ascending-value insets — max semantics: overlapping feathers can never
-// dim a core; small zones clamp the inset so the center still reaches 1).
-// Feathering inward keeps the visual lerp fading zone content toward
-// TRANSPARENT at the edge (never toward the weave of empty atlas, which DPs
-// may report opaque black).
+// frame's zone rects, BINARY (#800/#801 — the wish is HARDWARE-only and
+// hard-edged by default; the old implicit 16px ring feather leaked cosmetic
+// fractional M into the published wish and vignetted the composite at window
+// edges). M=1 inside every zone rect, 0 outside. The same texture is the
+// MODE_ZONES composite's weave gate and the published wish when no explicit
+// wish is staged; cosmetic feather (XrDisplayZoneFeatherDXR, #803) rasters
+// into its own texture and never enters this one.
 // Reuses the implicit-mask R8 texture (the implicit rule is inert in zones
 // frames) and re-rasters every zones frame, VK-style — a handful of scissored
 // clears — while invalidating the implicit rect cache so a later legacy frame
 // re-rasters. Rects are window px (top-left); flip Y for the bottom-left GL
 // framebuffer. Returns the mask texture, or 0 on failure.
-#define ZONE_WISH_FEATHER_STEPS 8
-#define ZONE_WISH_FEATHER_STEP_PX 2
 static GLuint
 gl_update_zone_wish_mask(struct comp_gl_compositor *c,
                          const struct xrt_rect *rects,
@@ -2046,18 +2064,131 @@ gl_update_zone_wish_mask(struct comp_gl_compositor *c,
 	glClear(GL_COLOR_BUFFER_BIT);
 
 	glEnable(GL_SCISSOR_TEST);
-	for (int32_t s = 1; s <= ZONE_WISH_FEATHER_STEPS; s++) {
-		const float v = (float)s / (float)ZONE_WISH_FEATHER_STEPS;
-		glClearColor(v, 0.0f, 0.0f, 0.0f);
-		for (uint32_t i = 0; i < rect_count; i++) {
-			// Small zones clamp the inset so the center still reaches 1.
+	glClearColor(1.0f, 0.0f, 0.0f, 0.0f); // binary: M=1 across each zone rect
+	for (uint32_t i = 0; i < rect_count; i++) {
+		int32_t left = rects[i].offset.w;
+		int32_t top = rects[i].offset.h;
+		int32_t right = rects[i].offset.w + rects[i].extent.w;
+		int32_t bottom = rects[i].offset.h + rects[i].extent.h;
+		if (left < 0) {
+			left = 0;
+		}
+		if (top < 0) {
+			top = 0;
+		}
+		if (right > (int32_t)w) {
+			right = (int32_t)w;
+		}
+		if (bottom > (int32_t)h) {
+			bottom = (int32_t)h;
+		}
+		if (right <= left || bottom <= top) {
+			continue;
+		}
+		// Flip Y: window top-left → GL bottom-left framebuffer.
+		int32_t gl_y = (int32_t)h - bottom;
+		glScissor(left, gl_y, right - left, bottom - top);
+		glClear(GL_COLOR_BUFFER_BIT);
+	}
+	glDisable(GL_SCISSOR_TEST);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+	static bool wish_logged = false;
+	if (!wish_logged) {
+		wish_logged = true;
+		U_LOG_W("GL zone wish mask (auto): %ux%u, %u zone rect(s), binary", w, h, rect_count);
+	}
+	return c->implicit_mask_tex;
+}
+
+// XR_DXR_display_zones (#800/#803) — (re)rasterize the zones COMPOSITE mask
+// with PER-ZONE opt-in feather (XrDisplayZoneFeatherDXR) into its own R8
+// texture. Clear M=0, then each zone draws hard (one scissored clear at 1.0,
+// feather_px[i] <= 0 — the default) or with its own inward 0->1 ramp over
+// feather_px[i] window pixels (the rings idiom: ascending value WITH
+// ascending inset, 2px steps, ramp-width cap 64px then wider steps; small
+// zones clamp the inset so the center still reaches 1). Per zone so radii
+// can differ. Only called when a frame's zones request feather — all-hard
+// frames sample the binary wish raster instead, and the published wish stays
+// binary regardless (cosmetics never enter the wish). Re-rasters every
+// feathered zones frame (VK-style). No zone_publish_seq interaction:
+// composite-only, never published. Rects are window px (top-left); flip Y
+// for the bottom-left GL framebuffer. Returns the feather texture, or 0 on
+// failure (caller falls back to the binary mask — hard edges, never a lost
+// frame).
+static GLuint
+gl_update_zone_feather_mask(struct comp_gl_compositor *c,
+                            const struct xrt_rect *rects,
+                            const float *feather_px,
+                            uint32_t rect_count,
+                            uint32_t w,
+                            uint32_t h)
+{
+	if (w == 0 || h == 0 || rect_count == 0) {
+		return 0;
+	}
+
+	// (Re)allocate — same R8 texture + FBO block as the wish raster.
+	if (c->feather_mask_tex == 0 || c->feather_mask_w != w || c->feather_mask_h != h) {
+		if (c->feather_mask_tex != 0) {
+			glDeleteTextures(1, &c->feather_mask_tex);
+			c->feather_mask_tex = 0;
+		}
+		if (c->feather_mask_fbo == 0) {
+			glGenFramebuffers(1, &c->feather_mask_fbo);
+		}
+		glGenTextures(1, &c->feather_mask_tex);
+		glBindTexture(GL_TEXTURE_2D, c->feather_mask_tex);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, w, h, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glBindTexture(GL_TEXTURE_2D, 0);
+		glBindFramebuffer(GL_FRAMEBUFFER, c->feather_mask_fbo);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, c->feather_mask_tex, 0);
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		c->feather_mask_w = w;
+		c->feather_mask_h = h;
+	}
+
+	glBindFramebuffer(GL_FRAMEBUFFER, c->feather_mask_fbo);
+	glViewport(0, 0, w, h);
+	glDisable(GL_SCISSOR_TEST);
+	glClearColor(0.0f, 0.0f, 0.0f, 0.0f); // M=0 outside every zone
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	// Per-zone: a hard zone is one full-rect clear at 1.0 (inset 0); a
+	// feathered zone ramps 0->1 over its OWN radius via the rings idiom —
+	// ascending value WITH ascending inset, later (deeper, higher-value)
+	// clears overwriting the inner part of earlier ones so the edge keeps
+	// the low values and the core reaches 1.
+	glEnable(GL_SCISSOR_TEST);
+	for (uint32_t i = 0; i < rect_count; i++) {
+		const float radius = feather_px[i];
+		const bool feathered = radius > 0.0f;
+		int32_t steps = 1;
+		int32_t step_px = 0;
+		if (feathered) {
+			step_px = 2;
+			steps = (int32_t)(radius / (float)step_px + 0.5f);
+			if (steps < 1) {
+				steps = 1;
+			}
+			if (steps > 32) { // beyond a 64px ramp, widen the step instead
+				step_px = (int32_t)(radius / 32.0f + 0.5f);
+				steps = 32;
+			}
+		}
+		for (int32_t s = 1; s <= steps; s++) {
+			const float v = (float)s / (float)steps; // 1.0 for the hard single step
 			int32_t min_ext = rects[i].extent.w < rects[i].extent.h ? rects[i].extent.w
 			                                                        : rects[i].extent.h;
 			int32_t max_inset = (min_ext - 1) / 2;
 			if (max_inset < 0) {
 				max_inset = 0;
 			}
-			int32_t inset = s * ZONE_WISH_FEATHER_STEP_PX;
+			int32_t inset = feathered ? s * step_px : 0;
 			if (inset > max_inset) {
 				inset = max_inset;
 			}
@@ -2080,6 +2211,7 @@ gl_update_zone_wish_mask(struct comp_gl_compositor *c,
 			if (right <= left || bottom <= top) {
 				continue;
 			}
+			glClearColor(v, 0.0f, 0.0f, 0.0f);
 			// Flip Y: window top-left → GL bottom-left framebuffer.
 			int32_t gl_y = (int32_t)h - bottom;
 			glScissor(left, gl_y, right - left, bottom - top);
@@ -2089,13 +2221,13 @@ gl_update_zone_wish_mask(struct comp_gl_compositor *c,
 	glDisable(GL_SCISSOR_TEST);
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-	static bool wish_logged = false;
-	if (!wish_logged) {
-		wish_logged = true;
-		U_LOG_W("GL zone wish mask (auto): %ux%u, %u zone rect(s), %u-px feather", w, h, rect_count,
-		        ZONE_WISH_FEATHER_STEPS * ZONE_WISH_FEATHER_STEP_PX);
+	static bool feather_logged = false;
+	if (!feather_logged) {
+		feather_logged = true;
+		U_LOG_W("GL zone feather mask: %ux%u, %u zone rect(s) (composite-only, wish stays binary)", w, h,
+		        rect_count);
 	}
-	return c->implicit_mask_tex;
+	return c->feather_mask_tex;
 }
 
 // #439 Phase 3 — draw one Local2D layer into the currently-bound flatten FBO
@@ -2365,8 +2497,9 @@ gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint tar
                       uint32_t output_h)
 {
 	// XR_DXR_display_zones: a zones frame ALWAYS runs the composite (the
-	// feathered wish edge lerps the weave toward the 2D flatten even with
-	// zero Local2D layers); the sticky mask + implicit-mask rules are inert.
+	// MODE_ZONES pass gates the weave by the binary zone raster — pixels
+	// outside every zone go to the 2D flatten / transparent even with zero
+	// Local2D layers); the sticky mask + implicit-mask rules are inert.
 	struct comp_gl_zone_mask *mask = c->active_zone_mask;
 	const bool zones_frame = c->zones_frame;
 	const bool have_explicit = !zones_frame && (mask != NULL && mask->submitted && mask->tex != 0);
@@ -2404,63 +2537,79 @@ gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint tar
 		c->composite_scratch_h = output_h;
 	}
 
-	// Resolve the mask texture. Zones frame (XR_DXR_display_zones): the
-	// WISH — the explicit frame wish (same-context GL authoring texture,
-	// referenced-at-frame-end = consume current authored state, no submit
-	// required — mirroring zone_mask_submit's no-staging contract) or the
-	// auto ring-feathered raster from the zone rects. Legacy: explicit
+	// Resolve the mask texture. Zones frame (XR_DXR_display_zones, #801):
+	// ALWAYS the BINARY zone raster — per ADR-027 the wish is HARDWARE-only
+	// and composition follows zone geometry + alpha, so an explicit frame
+	// wish never gates blending; it routes to the DP publish only (the
+	// live same-context authoring texture, referenced-at-frame-end =
+	// consume current authored state, no submit required — mirroring
+	// zone_mask_submit's no-staging contract). #803: when any zone
+	// requests feather, the composite samples a separately-rastered
+	// per-zone feather mask instead; the published wish stays binary
+	// regardless (cosmetics never enter the wish). Legacy: explicit
 	// submitted mask wins; else implicit.
 	GLuint mask_tex = 0;
 	if (zones_frame) {
-		if (c->frame_wish != NULL && c->frame_wish->tex != 0) {
-			mask_tex = c->frame_wish->tex;
+		struct xrt_rect zone_rects[XRT_MAX_LAYERS];
+		float zone_feathers[XRT_MAX_LAYERS];
+		bool any_feather = false;
+		uint32_t zone_rect_count = 0;
+		for (uint32_t i = 0; i < c->layer_accum.layer_count && zone_rect_count < XRT_MAX_LAYERS; i++) {
+			if (c->layer_accum.layers[i].data.type != XRT_LAYER_ZONE_3D) {
+				continue;
+			}
+			zone_feathers[zone_rect_count] = c->layer_accum.layers[i].data.zone_3d.feather_px;
+			if (zone_feathers[zone_rect_count] > 0.0f) {
+				any_feather = true;
+			}
+			zone_rects[zone_rect_count++] = c->layer_accum.layers[i].data.zone_3d.rect;
+		}
+		mask_tex = gl_update_zone_wish_mask(c, zone_rects, zone_rect_count, output_w, output_h);
 
+		if (c->frame_wish != NULL && c->frame_wish->tex != 0) {
 			// P4 publish source + seq: the explicit wish (the live
 			// authoring texture — same-context, matching the GL
-			// no-staging contract). Bump the generation on a source
-			// change (pointer flip; GL masks carry no author
-			// generation, so a same-pointer re-author keeps its seq).
-			c->zone_publish_tex = mask_tex;
+			// no-staging contract) — PUBLISH-ONLY (#801), never the
+			// composite mask. Bump the generation on a source change
+			// (pointer flip; GL masks carry no author generation, so a
+			// same-pointer re-author keeps its seq).
+			c->zone_publish_tex = c->frame_wish->tex;
 			c->zone_publish_w = c->frame_wish->w;
 			c->zone_publish_h = c->frame_wish->h;
 			if (c->zone_frame_wish_last != c->frame_wish) {
 				c->zone_frame_wish_last = c->frame_wish;
 				c->zone_publish_seq++;
 			}
-		} else {
-			struct xrt_rect zone_rects[XRT_MAX_LAYERS];
-			uint32_t zone_rect_count = 0;
-			for (uint32_t i = 0; i < c->layer_accum.layer_count && zone_rect_count < XRT_MAX_LAYERS;
-			     i++) {
-				if (c->layer_accum.layers[i].data.type != XRT_LAYER_ZONE_3D) {
-					continue;
+		} else if (mask_tex != 0) {
+			// P4 publish source + seq: the auto raster — bump the
+			// generation only when the rect set / dims actually
+			// changed (or the source flipped explicit -> auto).
+			bool wish_dirty = c->zone_frame_wish_last != NULL ||
+			                  c->zone_wish_rect_count != zone_rect_count ||
+			                  c->zone_publish_w != output_w || c->zone_publish_h != output_h;
+			for (uint32_t i = 0; !wish_dirty && i < zone_rect_count; i++) {
+				if (memcmp(&c->zone_wish_rects[i], &zone_rects[i], sizeof(zone_rects[i])) != 0) {
+					wish_dirty = true;
 				}
-				zone_rects[zone_rect_count++] = c->layer_accum.layers[i].data.zone_3d.rect;
 			}
-			mask_tex = gl_update_zone_wish_mask(c, zone_rects, zone_rect_count, output_w, output_h);
-			if (mask_tex != 0) {
-				// P4 publish source + seq: the auto raster — bump the
-				// generation only when the rect set / dims actually
-				// changed (or the source flipped explicit -> auto).
-				bool wish_dirty = c->zone_frame_wish_last != NULL ||
-				                  c->zone_wish_rect_count != zone_rect_count ||
-				                  c->zone_publish_w != output_w || c->zone_publish_h != output_h;
-				for (uint32_t i = 0; !wish_dirty && i < zone_rect_count; i++) {
-					if (memcmp(&c->zone_wish_rects[i], &zone_rects[i], sizeof(zone_rects[i])) !=
-					    0) {
-						wish_dirty = true;
-					}
-				}
-				if (wish_dirty) {
-					c->zone_frame_wish_last = NULL;
-					memcpy(c->zone_wish_rects, zone_rects,
-					       sizeof(zone_rects[0]) * zone_rect_count);
-					c->zone_wish_rect_count = zone_rect_count;
-					c->zone_publish_seq++;
-				}
-				c->zone_publish_tex = mask_tex;
-				c->zone_publish_w = output_w;
-				c->zone_publish_h = output_h;
+			if (wish_dirty) {
+				c->zone_frame_wish_last = NULL;
+				memcpy(c->zone_wish_rects, zone_rects, sizeof(zone_rects[0]) * zone_rect_count);
+				c->zone_wish_rect_count = zone_rect_count;
+				c->zone_publish_seq++;
+			}
+			c->zone_publish_tex = mask_tex;
+			c->zone_publish_w = output_w;
+			c->zone_publish_h = output_h;
+		}
+
+		// #803 — feather is a composite-only cosmetic; raster failure
+		// falls back to the binary mask (hard edges, never a lost frame).
+		if (any_feather) {
+			GLuint ftex = gl_update_zone_feather_mask(c, zone_rects, zone_feathers, zone_rect_count,
+			                                          output_w, output_h);
+			if (ftex != 0) {
+				mask_tex = ftex;
 			}
 		}
 	} else if (have_explicit) {
@@ -2488,7 +2637,8 @@ gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint tar
 	// region shows the desktop, matching the VK leg.
 	// Zones frame: flatten ALL Local2D layers (no under/over split — 2D-under
 	// is reserved in v1); with zero Local2D layers the clear-only scratch
-	// fades the feather to transparent.
+	// means MODE_ZONES writes M·weave over transparent — pixels outside
+	// every zone present alpha 0.
 	if (have_local_2d) {
 		gl_flatten_local_2d_layers(c, output_w, output_h, zones_frame ? -1 : proj_idx);
 	} else {
@@ -2530,19 +2680,29 @@ gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint tar
 	// #491: the implicit (auto) Local2D mask composites the 2D over the weave by
 	// its own premultiplied alpha (translucent 2D reveals the 3D scene). The
 	// explicit authored mask keeps the hard M-lerp.
-	// XR_DXR_display_zones: zones frames are ALWAYS the hard M-lerp
-	// (final = M·weave + (1−M)·flatten(2D-over)) — composition follows zone
-	// geometry + the wish, never the #491 alpha-over rule.
-	const bool alpha_over = !zones_frame && have_local_2d && !have_explicit;
-	glUniform1i(glGetUniformLocation(c->program_masked_composite, "u_alpha_over"), alpha_over ? 1 : 0);
+	// XR_DXR_display_zones: MODE_ZONES (twod + (1−a)·(M·weave)) — the binary
+	// zone raster (or the #803 feather ramp) gates only the WEAVE; Local2D
+	// content composites on top by its own alpha (ADR-027/#801: the wish is
+	// hardware-only; composition follows zone geometry + alpha). Formerly
+	// the hard M-lerp, which multiplied overlays away inside zones and
+	// dimmed the feathered edge.
+	int composite_mode; // 0 = hard M-lerp, 1 = #491 premul over, 2 = zones
+	if (zones_frame) {
+		composite_mode = 2;
+	} else if (have_explicit) {
+		composite_mode = 0;
+	} else {
+		composite_mode = 1;
+	}
+	glUniform1i(glGetUniformLocation(c->program_masked_composite, "u_composite_mode"), composite_mode);
 	glDrawArrays(GL_TRIANGLES, 0, 3);
 	glActiveTexture(GL_TEXTURE0);
 
 	static bool composite_logged = false;
 	if (!composite_logged) {
-		U_LOG_W("GL Local2D composite: %ux%u region, %s mask, twod=%s (#491 alpha_over=%d)", output_w,
-		        output_h, zones_frame ? "zone wish" : (have_explicit ? "explicit" : "implicit"),
-		        have_local_2d ? "local2d layers" : "(empty)", alpha_over);
+		U_LOG_W("GL Local2D composite: %ux%u region, %s mask, twod=%s (mode=%d)", output_w, output_h,
+		        zones_frame ? "zone" : (have_explicit ? "explicit" : "implicit"),
+		        have_local_2d ? "local2d layers" : "(empty)", composite_mode);
 		composite_logged = true;
 	}
 	return true;
@@ -3020,8 +3180,8 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	// blended over this clear.
 	// XR_DXR_display_zones (ADR-027): a zones frame composes N placed zone
 	// layers into the window-spanning atlas — the unzoned area must weave to
-	// nothing (transparent) so the feathered wish edge blends toward the
-	// desktop.
+	// nothing (transparent) so the MODE_ZONES composite (and any #803
+	// feather ramp) blends toward the desktop.
 	glClearColor(0.0f, 0.0f, 0.0f, (c->transparent_background || c->zones_frame) ? 0.0f : 1.0f);
 	glClear(GL_COLOR_BUFFER_BIT);
 
@@ -3724,6 +3884,8 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	if (c->local2d_scratch_fbo) glDeleteFramebuffers(1, &c->local2d_scratch_fbo);
 	if (c->implicit_mask_tex) glDeleteTextures(1, &c->implicit_mask_tex);
 	if (c->implicit_mask_fbo) glDeleteFramebuffers(1, &c->implicit_mask_fbo);
+	if (c->feather_mask_tex) glDeleteTextures(1, &c->feather_mask_tex);
+	if (c->feather_mask_fbo) glDeleteFramebuffers(1, &c->feather_mask_fbo);
 	// #491 part 3 — 2D-under backdrop scratch.
 	if (c->backdrop_scratch_tex) glDeleteTextures(1, &c->backdrop_scratch_tex);
 	if (c->backdrop_scratch_fbo) glDeleteFramebuffers(1, &c->backdrop_scratch_fbo);
