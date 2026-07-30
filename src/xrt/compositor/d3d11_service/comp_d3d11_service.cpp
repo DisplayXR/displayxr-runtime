@@ -475,8 +475,9 @@ struct d3d11_service_compositor
 
 	//! XR_DXR_display_zones (#551) — standalone wish-over-IPC publish state.
 	//! Mirrors the in-process auto-wish raster (comp_d3d11_compositor's
-	//! d3d11_update_zone_wish_mask): an R8_UNORM union-of-zone-rects mask
-	//! with a feathered ring, rasterized at commit on the shared immediate
+	//! d3d11_update_zone_wish_mask): an R8_UNORM union-of-zone-rects mask,
+	//! BINARY (#800/#801 — the wish is hardware-only, no cosmetic feather),
+	//! rasterized at commit on the shared immediate
 	//! context (under sys->render_mutex) and published to this client's DP.
 	//! Workspace mode never touches any of this (wish INERT, ADR-027 v1).
 	wil::com_ptr<ID3D11Texture2D> wish_mask_tex; //!< RENDER_TARGET raster target
@@ -8883,10 +8884,10 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 }
 
 // XR_DXR_display_zones (#551) — standalone wish-over-IPC publish. Mirrors the
-// in-process auto-wish (comp_d3d11_compositor.cpp): same feather geometry, so
-// a zone weaves identically on both paths.
-#define SVC_ZONE_WISH_FEATHER_STEPS 8
-#define SVC_ZONE_WISH_FEATHER_STEP_PX 2
+// in-process auto-wish (comp_d3d11_compositor.cpp): same BINARY raster, so a
+// zone weaves identically on both paths (#801/#800: the wish is HARDWARE-only
+// and defaults hard-edged; feathering is a cosmetic composite opt-in that
+// never enters the published wish).
 
 /*!
  * Whether this client's DP exposes the local-zone-mask entry (vtable slot
@@ -8901,7 +8902,7 @@ service_dp_accepts_zone_mask(struct xrt_display_processor_d3d11 *xdp)
 
 /*!
  * (Re)rasterize the union of @p rects into the per-client R8_UNORM wish mask
- * with an inward feathered ring (M ramps 0→1 over STEPS×STEP_PX), then copy
+ * (BINARY: M=1 inside every zone rect, 0 outside — #800/#801), then copy
  * to the SRV-only staged texture the DP samples. Dirty-tracked: an unchanged
  * rect set returns the existing staged SRV without GPU work. Port of the
  * in-process d3d11_update_zone_wish_mask.
@@ -8985,44 +8986,33 @@ service_update_zone_wish_mask(struct d3d11_service_system *sys,
 		U_LOG_E("ZONES SVC: wish mask: ID3D11DeviceContext1 unavailable (hr=0x%08lx)", hr);
 		return nullptr;
 	}
-	for (int32_t s = 1; s <= SVC_ZONE_WISH_FEATHER_STEPS; s++) {
-		const float v = (float)s / (float)SVC_ZONE_WISH_FEATHER_STEPS;
-		const float val[4] = {v, 0.0f, 0.0f, 0.0f};
-		for (uint32_t i = 0; i < rect_count; i++) {
-			// Per-zone inset clamp: zones smaller than the feather
-			// collapse the deeper rings onto one core so the center
-			// still reaches M=1.
-			int32_t min_ext = rects[i].extent.w < rects[i].extent.h ? rects[i].extent.w : rects[i].extent.h;
-			int32_t max_inset = (min_ext - 1) / 2;
-			if (max_inset < 0) {
-				max_inset = 0;
-			}
-			int32_t inset = s * SVC_ZONE_WISH_FEATHER_STEP_PX;
-			if (inset > max_inset) {
-				inset = max_inset;
-			}
-			int32_t left = rects[i].offset.w + inset;
-			int32_t top = rects[i].offset.h + inset;
-			int32_t right = rects[i].offset.w + rects[i].extent.w - inset;
-			int32_t bottom = rects[i].offset.h + rects[i].extent.h - inset;
-			if (left < 0) {
-				left = 0;
-			}
-			if (top < 0) {
-				top = 0;
-			}
-			if (right > (int32_t)w) {
-				right = (int32_t)w;
-			}
-			if (bottom > (int32_t)h) {
-				bottom = (int32_t)h;
-			}
-			if (right <= left || bottom <= top) {
-				continue;
-			}
-			D3D11_RECT dr = {left, top, right, bottom};
-			ctx1->ClearView(c->wish_mask_rtv.get(), val, &dr, 1);
+	// BINARY raster (#800/#801): M=1 over each zone rect, no rings — the
+	// published wish is hardware-only and defaults hard-edged. Cosmetic
+	// feather (XrDisplayZoneFeatherDXR) is a compositor-composite concern
+	// and never enters the wish.
+	const float all_on[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+	for (uint32_t i = 0; i < rect_count; i++) {
+		int32_t left = rects[i].offset.w;
+		int32_t top = rects[i].offset.h;
+		int32_t right = rects[i].offset.w + rects[i].extent.w;
+		int32_t bottom = rects[i].offset.h + rects[i].extent.h;
+		if (left < 0) {
+			left = 0;
 		}
+		if (top < 0) {
+			top = 0;
+		}
+		if (right > (int32_t)w) {
+			right = (int32_t)w;
+		}
+		if (bottom > (int32_t)h) {
+			bottom = (int32_t)h;
+		}
+		if (right <= left || bottom <= top) {
+			continue;
+		}
+		D3D11_RECT dr = {left, top, right, bottom};
+		ctx1->ClearView(c->wish_mask_rtv.get(), all_on, &dr, 1);
 	}
 
 	sys->context->CopyResource(c->wish_mask_staged.get(), c->wish_mask_tex.get());
@@ -9031,8 +9021,8 @@ service_update_zone_wish_mask(struct d3d11_service_system *sys,
 	c->wish_rect_count = rect_count;
 	c->zone_publish_seq++; // new wish content generation
 
-	U_LOG_W("ZONES SVC: wish mask (auto): %ux%u, %u zone rect(s), %u-px feather", w, h, rect_count,
-	        SVC_ZONE_WISH_FEATHER_STEPS * SVC_ZONE_WISH_FEATHER_STEP_PX);
+	U_LOG_W("ZONES SVC: wish mask (auto): %ux%u, %u zone rect(s), binary (mode=zones-binary-wish)", w, h,
+	        rect_count);
 	return c->wish_mask_staged_srv.get();
 }
 
