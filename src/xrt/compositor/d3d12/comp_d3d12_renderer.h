@@ -239,8 +239,12 @@ comp_d3d12_renderer_get_atlas_resource(struct comp_d3d12_renderer *renderer);
 /*!
  * Masked 2D-over-3D composite (#439, XR_DXR_local_3d_zone): records a
  * fullscreen-triangle draw into @p cmd_list that writes every pixel of the
- * window region as `M*weave + (1-M)*twod` (per-channel, preserving each
- * layer's own alpha — spec §4.2).
+ * window region per @p composite_mode: LERP = `M*weave + (1-M)*twod`
+ * (per-channel, preserving each layer's own alpha — spec §4.2; explicit
+ * authored mask); ALPHA_OVER = #491 premul over (`twod + (1-twod.a)*weave`,
+ * mask unused); ZONES = ADR-027/#801 (`twod + (1-twod.a)*(M*weave)` — M
+ * gates only the weave by zone geometry, the 2D composites on top by its
+ * own alpha).
  *
  * The caller owns all resource states: the three sources must be in
  * PIXEL_SHADER_RESOURCE and the destination in RENDER_TARGET when the draw
@@ -259,6 +263,9 @@ comp_d3d12_renderer_get_atlas_resource(struct comp_d3d12_renderer *renderer);
  *
  * @ingroup comp_d3d12
  */
+#define COMP_D3D12_COMPOSITE_MODE_LERP 0u
+#define COMP_D3D12_COMPOSITE_MODE_ALPHA_OVER 1u
+#define COMP_D3D12_COMPOSITE_MODE_ZONES 2u
 xrt_result_t
 comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
                                         void *cmd_list,
@@ -273,7 +280,7 @@ comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
                                         int32_t cy,
                                         uint32_t cw,
                                         uint32_t ch,
-                                        bool alpha_over);
+                                        uint32_t composite_mode);
 
 /*!
  * Flatten one Local2D layer into the scratch RTV (#439 Phase 3, the `twod`
