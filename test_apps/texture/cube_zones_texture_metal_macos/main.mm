@@ -56,8 +56,15 @@
  *        XrLocal3DZoneRenderTarget*EXT exists for D3D11/D3D12/VK only.)
  *  - O : toggle zone B between its home rect and a rect overlapping zone A
  *        (locate + submit always share the one rect variable).
+ *  - F : cycle the runtime feather radius 0 / 16 / 32 px, chained as
+ *        XrDisplayZoneFeatherDXR on ZONE A ONLY (#803) — zone B stays the
+ *        hard-edged control so the per-zone opt-in is visible in one frame.
+ *        While active, the app's own content-alpha edge fade is skipped so
+ *        the on-screen ramp is purely the runtime's.
  *  - DXR_ZONES_VALIDATE=1 : chain XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_DXR
  *        on the frame-end info in every mode (one-shot runtime WARNs).
+ *  - DXR_ZONES_FEATHER=<px> : preselect the F-key feather radius (headless
+ *        launch — macOS key injection needs TCC permissions).
  *
  * When the runtime doesn't advertise XR_DXR_display_zones the app logs an
  * error once and keeps running as the plain single-projection cube
@@ -1111,6 +1118,11 @@ static int g_wishMode = 0;
 // Edge-triggered key requests (set in PumpMacOSEvents, consumed in the loop).
 static bool g_wishModeCycleRequested = false;
 static bool g_overlapToggleRequested = false;
+static bool g_featherCycleRequested = false;
+
+// Runtime feather radius (F key / DXR_ZONES_FEATHER), applied to zone A only
+// (#803 per-zone opt-in; zone B is the hard-edged control). 0 = off.
+static float g_featherPx = 0.0f;
 
 // XR_DXR_display_zones harness.
 static bool g_hasDisplayZonesExt = false;
@@ -1504,6 +1516,9 @@ static void PumpMacOSEvents()
                     }
                     else if (ch == 'o' && !isRepeat) {
                         g_overlapToggleRequested = true;
+                    }
+                    else if (ch == 'f' && !isRepeat) {
+                        g_featherCycleRequested = true;
                     }
                     else if ((ch == 'i' || ch == 'I') && !isRepeat) {
                         g_input.captureAtlasRequested = true;
@@ -2515,6 +2530,13 @@ static void HandleZoneKeys(AppXrSession &app)
         ApplyWishAuthoring(app);
     }
 
+    if (g_featherCycleRequested) {
+        g_featherCycleRequested = false;
+        g_featherPx = g_featherPx == 0.0f ? 16.0f : (g_featherPx == 16.0f ? 32.0f : 0.0f);
+        LOG_INFO("[zones] feather radius -> %.0f px on zone A (%s; zone B stays hard)", g_featherPx,
+                 g_featherPx > 0.0f ? "XrDisplayZoneFeatherDXR chained" : "off — hard edge");
+    }
+
     if (g_overlapToggleRequested) {
         g_overlapToggleRequested = false;
         g_zoneBOverlap = !g_zoneBOverlap;
@@ -2645,7 +2667,10 @@ static void RenderZoneScene(MetalRenderer &r, id<MTLTexture> target, DisplayZone
     // to the exact rect edge, and weave output carries no alpha — content
     // faded inside a hard-M=1 band weaves to opaque black (dark halo), not
     // to the desktop. Tier-2 content must fill its rect to the hard edge.
-    if (g_wishMode != 1) {
+    // Also skipped while the runtime feather is active (F key, #803) so the
+    // on-screen ramp on zone A is purely the runtime's — and zone B goes
+    // hard as the control.
+    if (g_wishMode != 1 && g_featherPx <= 0.0f) {
         FadeUniforms fu = {};
         fu.tile_px[0] = (float)z.tileW;
         fu.tile_px[1] = (float)z.tileH;
@@ -2682,6 +2707,7 @@ static void RenderZonesFrame(AppXrSession &app, MetalRenderer &renderer, const X
     // points (locate and xrEndFrame) — same instances within the frame.
     XrDisplayZoneDXR zoneStructs[kNumZones];
     XrDisplayRigDXR rigStructs[kNumZones];
+    XrDisplayZoneFeatherDXR featherStructs[kNumZones];
     std::vector<XrCompositionLayerProjectionView> projViews[kNumZones];
     uint32_t submitViewCounts[kNumZones] = {};
 
@@ -2699,6 +2725,15 @@ static void RenderZonesFrame(AppXrSession &app, MetalRenderer &renderer, const X
         zoneStructs[zi].next = &rigStructs[zi];
         zoneStructs[zi].zoneId = z.zoneId;
         zoneStructs[zi].rect = z.rect;
+
+        // #803 opt-in feather on zone A only (zone B = hard-edged control).
+        // Read at the SUBMIT chain point; harmless on the shared locate chain.
+        if (zi == 0 && g_featherPx > 0.0f) {
+            featherStructs[zi] = {(XrStructureType)XR_TYPE_DISPLAY_ZONE_FEATHER_DXR};
+            featherStructs[zi].next = &rigStructs[zi];
+            featherStructs[zi].radiusPx = g_featherPx;
+            zoneStructs[zi].next = &featherStructs[zi];
+        }
 
         XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
         locateInfo.next = &zoneStructs[zi];
@@ -3006,6 +3041,11 @@ int main(int argc, char **argv)
             g_zoneBOverlap = true;
             LOG_INFO("DXR_ZONES_OVERLAP=1 — zone B starts on the overlap rect");
         }
+        e = getenv("DXR_ZONES_FEATHER");
+        if (e != NULL && atof(e) > 0.0) {
+            g_featherPx = (float)atof(e);
+            LOG_INFO("DXR_ZONES_FEATHER=%.0f — zone A starts with the runtime feather chained", g_featherPx);
+        }
     }
 
     // #439 Phase 3 cases 2/3/4 (see the g_l2dPanel globals block).
@@ -3142,7 +3182,8 @@ int main(int argc, char **argv)
 
     LOG_INFO("Entering main loop... (ESC to quit, drag to rotate, WASD to move, Space to reset)");
     LOG_INFO("Controls: WASD/QE=Move, Drag=Look, Scroll=Scale, Space=Reset, V=Mode, Shift+Tab=HUD, ESC=Quit");
-    LOG_INFO("Zones:    M=wish mode (AUTO/Tier-2 rects), O=zone B overlap toggle, DXR_ZONES_VALIDATE=1");
+    LOG_INFO("Zones:    M=wish mode (AUTO/Tier-2 rects), O=zone B overlap toggle, "
+             "F=zone A feather 0/16/32px, DXR_ZONES_VALIDATE=1, DXR_ZONES_FEATHER=<px>");
 
     auto lastTime = std::chrono::high_resolution_clock::now();
 
