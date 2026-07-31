@@ -2,7 +2,7 @@
 
 Guidance for Claude Code (claude.ai/code) when working in this repository.
 
-> **TRANSITION NOTE (delete once every dev box is migrated).** The bespoke extensions were renamed `XR_EXT_*` → `XR_DXR_*` and shipped 2026-07-12 as the **v2.0.0 train** (#734/#735; no aliasing — old-name apps get `XR_ERROR_EXTENSION_NOT_PRESENT`). If **this machine's Claude memories** still use the old names, migrate once: `python scripts/dxr_rename.py apply <memory-dir>` + `verify` (idempotent; never touches Khronos `EXT` names). Old memories saying the rename is "deferred/pending" are stale — it shipped; only the Khronos author-ID registration (OpenXR-Docs#199) is still in flight. Per-box instructions: #735.
+> **TRANSITION NOTE (delete once every dev box is migrated).** The bespoke extensions were renamed `XR_EXT_*` → `XR_DXR_*` and shipped 2026-07-12 as the **v2.0.0 train** (#734/#735; no aliasing — old-name apps get `XR_ERROR_EXTENSION_NOT_PRESENT`). If **this machine's Claude memories** still use the old names, migrate once: `python scripts/dxr_rename.py apply <memory-dir>` + `verify` (idempotent; never touches Khronos `EXT` names). Old memories saying the rename is "deferred/pending" are stale — it shipped, and the Khronos `DXR` author-ID registration is complete (OpenXR-Docs#199 merged 2026-07-31). Per-box instructions: #735.
 
 ## Overview
 
