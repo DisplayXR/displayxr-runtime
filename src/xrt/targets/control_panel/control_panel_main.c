@@ -540,9 +540,46 @@ draw_panel(struct panel_state *s)
 		}
 	}
 
+	// ---- Persistent-override banner (#793 Phase 2) ----
+	// `dp use` writes HKLM PreferredPlugin and PERSISTS across reboots — a known
+	// footgun: a box left pinned (e.g. to sim_display for a test) keeps using that
+	// DP for every app and every reboot until someone notices. Surface it loudly,
+	// above everything else, whenever an override is active, with one-click reset.
+	// Shown before the have_info early-return so a mis-pinned DP that breaks the
+	// runtime is still self-evidently the cause.
+	if (s->have_preferred) {
+		igSpacing();
+		igTextColored(COL_AMBER,
+		              "[!] DP OVERRIDE ACTIVE - '%s' is forced for every app and persists across "
+		              "reboots until reset.",
+		              s->preferred);
+		const ImVec4 red = {0.60f, 0.12f, 0.12f, 1.0f};
+		const ImVec4 red_hi = {0.78f, 0.18f, 0.18f, 1.0f};
+		igPushStyleColor_Vec4(ImGuiCol_Button, red);
+		igPushStyleColor_Vec4(ImGuiCol_ButtonHovered, red_hi);
+		igPushStyleColor_Vec4(ImGuiCol_ButtonActive, red_hi);
+		if (igButton("Reset DP override now", (ImVec2){0, 0})) {
+			dp_action(s, "dp reset");
+		}
+		igPopStyleColor(3);
+		igSpacing();
+		igSeparator();
+	}
+
 	if (!s->have_info) {
 		igSpacing();
 		igTextColored(COL_RED, "%s", s->info_err[0] ? s->info_err : "No runtime info.");
+		// The banner's reset button is reachable on this path, but the usual
+		// last_action readout below is not — it lives past this early-return.
+		// Without this the button reports nothing when it fails (e.g. `dp reset`
+		// deletes an HKLM value, so a non-elevated panel is denied): the banner
+		// just stays put and the click looks ignored. This IS the mis-pinned-DP
+		// case the banner exists for, so it is the one place feedback matters most.
+		if (s->last_action[0] != '\0') {
+			igSpacing();
+			igSeparator();
+			igTextWrapped("%s", s->last_action);
+		}
 		igPopTextWrapPos();
 		igEnd();
 		return;
