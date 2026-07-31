@@ -449,6 +449,20 @@ struct d3d11_service_compositor
 	std::atomic<uint32_t> pending_content_mode{0xFFFFFFFFu};
 	std::atomic<int>      pending_hw_3d{-1};
 
+	//! #815: the app's standing HARDWARE override, latched from the last
+	//! xrRequestDisplayModeDXR this client made. -1 = none / 0 = 2D / 1 = 3D.
+	//!
+	//! Exists so `weave_force_3d_if_needed` can tell "the SR drifted to 2D,
+	//! put it back" apart from "the app ASKED for 2D". That helper is
+	//! self-healing by design — it re-fires every submit while the SR reads
+	//! 2D — so without this latch a present-owner could never hold hardware
+	//! 2D: the request landed and was reverted on the very next frame.
+	//!
+	//! Cleared by a rendering-mode request, per the extension contract: the
+	//! override "holds until the next mode request (whose default hardware
+	//! state then applies) or the next call to this function".
+	std::atomic<int>      hw_override{-1};
+
 	//! Phase 2 — per-IPC-client shared `ID3D11Fence` that replaces the
 	//! per-view `IDXGIKeyedMutex::AcquireSync` CPU wait with a GPU-side
 	//! `ID3D11DeviceContext4::Wait`. Created at session-create on the
@@ -9173,6 +9187,17 @@ service_apply_pending_mode(struct d3d11_service_system *sys, struct d3d11_servic
 	}
 	if (req_hw >= 0) {
 		want_3d = (req_hw != 0);
+		// #815: latch it so weave_force_3d_if_needed leaves it alone. Without
+		// this a present-owner's hardware-2D request survived exactly one
+		// frame — the force-3D helper below re-asserted 3D on the next submit,
+		// every submit, because from its point of view the SR "drifted".
+		c->hw_override.store(req_hw, std::memory_order_release);
+	} else if (req_mode != 0xFFFFFFFFu) {
+		// A rendering-mode request ends the standing hardware override: that
+		// mode's own default hardware state applies from here. Matches the
+		// XR_DXR_display_info contract for xrRequestDisplayModeDXR ("holds
+		// until the next mode request ... or the next call to this function").
+		c->hw_override.store(-1, std::memory_order_release);
 	}
 
 	DP_REQUEST_DISPLAY_MODE(c->render.display_processor, want_3d);
@@ -11434,6 +11459,33 @@ compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3d)
 {
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	c->pending_hw_3d.store(enable_3d ? 1 : 0, std::memory_order_release);
+
+	// #815: also drain it here, not only on the client's next frame.
+	//
+	// The deferred-apply above assumes the requester keeps rendering — the two
+	// drain sites are compositor_layer_commit and the xrWeaveSubmitDXR path. A
+	// weave present-owner asking for hardware 2D has, by definition, STOPPED
+	// submitting (that is what "no 3D content on screen" means for it), so it
+	// reaches neither and its request sat in pending_hw_3d forever. browser#55
+	// is exactly that: leave an inline-3D page, the weave goes quiet, and the
+	// panel stayed lensed over flat content because the request never landed.
+	//
+	// This stays faithful to the "keep the per-client DP off the IPC thread"
+	// rationale in the field comment: sys->render_mutex is the same lock the
+	// render thread holds around multi_compositor_render and around the weave
+	// path's own call to this helper, so the DP work is serialised against the
+	// render thread exactly as before — it is only the THREAD that differs, and
+	// the work itself is one lens-hint call plus bookkeeping, not a frame.
+	//
+	// Idempotent with the frame-path drains: pending_hw_3d is an exchange, so
+	// whichever runs first consumes it and the other sees "nothing pending".
+	// bridge_live is re-evaluated rather than assumed — unlike the weave path,
+	// an arbitrary IPC client may well be behind a live bridge.
+	struct d3d11_service_system *sys = c->sys;
+	if (sys != nullptr) {
+		std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+		(void)service_apply_pending_mode(sys, c, bridge_client_is_live(sys, c->render.hwnd));
+	}
 	return XRT_SUCCESS;
 }
 
@@ -11747,6 +11799,14 @@ weave_force_3d_if_needed(struct d3d11_service_system *sys, struct d3d11_service_
 	}
 	if (sys->hardware_display_3d) {
 		return; // already 3D — nothing to do
+	}
+	// #815: the app explicitly asked for hardware 2D. That is not SR drift, so
+	// don't "heal" it — this helper's whole purpose is to undo drift, and a
+	// present-owner has no other way to hold the panel flat (browser#55: an
+	// inline-3D page followed by an ordinary page must go crisp, not stay
+	// woven-and-lensed). Cleared by the next rendering-mode request.
+	if (c->hw_override.load(std::memory_order_acquire) == 0) {
+		return;
 	}
 	struct xrt_device *head = sys->xsysd->static_roles.head;
 	if (head == nullptr || head->hmd == NULL) {
