@@ -569,6 +569,17 @@ draw_panel(struct panel_state *s)
 	if (!s->have_info) {
 		igSpacing();
 		igTextColored(COL_RED, "%s", s->info_err[0] ? s->info_err : "No runtime info.");
+		// The banner's reset button is reachable on this path, but the usual
+		// last_action readout below is not — it lives past this early-return.
+		// Without this the button reports nothing when it fails (e.g. `dp reset`
+		// deletes an HKLM value, so a non-elevated panel is denied): the banner
+		// just stays put and the click looks ignored. This IS the mis-pinned-DP
+		// case the banner exists for, so it is the one place feedback matters most.
+		if (s->last_action[0] != '\0') {
+			igSpacing();
+			igSeparator();
+			igTextWrapped("%s", s->last_action);
+		}
 		igPopTextWrapPos();
 		igEnd();
 		return;
