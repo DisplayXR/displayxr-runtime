@@ -94,9 +94,16 @@ oxr_xrGetDisplayZoneRecommendedViewSizeDXR(XrSession session,
 	//
 	// This trades quality, so it is opt-in and clamped: the floor is the active
 	// mode's own view scale, i.e. we never advertise FEWER pixels than the weave
-	// actually resolves, and never more than the rect. Measure before enabling —
-	// on a bandwidth-bound iGPU the win is real, but the weave runs at panel
-	// resolution regardless, so this only reaches the app's own fill cost.
+	// actually resolves, and never more than the rect.
+	//
+	// Measure before enabling, and expect a SMALL win. On the Meteor Lake iGPU +
+	// Leia DS1_156 reference box, a 0.5 trim halves the demo-avatar renderer's own
+	// GPU cost (1.9 -> 1.0 % of the device) but moves total app GPU by only ~3 %
+	// (~0.5 points of ~15) — the app's fill is a small share of a `_handle` app's
+	// cost, most of which is present + weave at panel resolution and untouched by
+	// this. An earlier -15.7 % figure did not replicate; it came from spot-sampled
+	// GPU% with too few samples. So this is a fill knob for fill-bound apps, not a
+	// general throughput win.
 	{
 		static float s_scale = -1.0f; // <0 = not yet read
 		if (s_scale < 0.0f) {
