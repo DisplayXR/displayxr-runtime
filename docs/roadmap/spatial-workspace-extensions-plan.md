@@ -2,6 +2,8 @@
 
 **Status:** Draft, 2026-04-27. Branch `feature/shell-brand-separation`.
 
+> **Outcome (2026-08-01, #736):** `XR_DXR_spatial_workspace` shipped. The separate app-launcher extension planned below was **dropped** — launcher tiles ship as `*.displayxr.json` app manifests instead. Kept as a historical design record.
+
 ## Goal
 
 Decouple the DisplayXR runtime from the proprietary shell so that:

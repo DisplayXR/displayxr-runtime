@@ -2,6 +2,8 @@
 
 **Status:** Draft v0, 2026-04-27. Branch `feature/shell-brand-separation`. Not frozen.
 
+> **Outcome (2026-08-01, #736):** `XR_DXR_spatial_workspace` shipped (renamed from the `XR_EXT_`/`XR_DISPLAYXR_` working names). The separate app-launcher extension sketched below was **dropped** — launcher tiles ship as `*.displayxr.json` app manifests instead. Kept as a historical design record.
+
 Companion to [spatial-workspace-extensions-plan.md](spatial-workspace-extensions-plan.md). That doc explains *why* the runtime needs neutral workspace primitives; this doc proposes *what* the C-level API surface looks like — full enough that the next implementer (or reviewer) can argue with specifics rather than prose.
 
 ## What this draft is for
