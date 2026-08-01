@@ -3,6 +3,7 @@
 - **Issue:** #817
 - **Status:** Prototype — pending on-hardware validation
 - **Scope:** desktop Linux, Wayland sessions, apps using `XR_DXR_wayland_surface_binding`
+- **Governing boundary rule:** [ADR-033](../../adr/ADR-033-placement-reports-geometry-weaver-owns-phase.md) — geometry crosses the runtime↔vendor boundary; phase math (incl. snapping) never does
 
 ## 1. Problem
 
