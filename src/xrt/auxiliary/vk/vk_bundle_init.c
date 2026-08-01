@@ -25,6 +25,8 @@
 #include "vk/vk_helpers.h"
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 
 /*
@@ -550,6 +552,56 @@ device_debug_print(struct vk_bundle *vk, const VkPhysicalDeviceProperties *pdp, 
 	vk_print_device_info(vk, U_LOGGING_DEBUG, pdp, index, title);
 }
 
+/*
+ * DXR_VK_FORCE_GPU: external override for the physical-device choice, needed
+ * because device_type_priority() ranks DISCRETE above INTEGRATED
+ * unconditionally and the OS GpuPreference hint only reorders enumeration —
+ * without this there is no way to put the runtime (and thus the app, via
+ * xrGetVulkanGraphicsDevice) on an iGPU on an Optimus machine.
+ *
+ * Accepted values: a device index ("0", "1", …) or a device-type keyword
+ * ("igpu"/"integrated", "dgpu"/"discrete"). Returns -1 when unset/invalid
+ * (normal selection applies); a keyword that matches no present device also
+ * returns -1 so a copied-around env var cannot brick an app.
+ */
+static int
+env_forced_gpu_index(struct vk_bundle *vk, VkPhysicalDevice *devices, uint32_t device_count)
+{
+	const char *val = getenv("DXR_VK_FORCE_GPU");
+	if (val == NULL || val[0] == '\0') {
+		return -1;
+	}
+
+	VkPhysicalDeviceType want_type = VK_PHYSICAL_DEVICE_TYPE_OTHER;
+	if (strcmp(val, "igpu") == 0 || strcmp(val, "integrated") == 0) {
+		want_type = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+	} else if (strcmp(val, "dgpu") == 0 || strcmp(val, "discrete") == 0) {
+		want_type = VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+	} else if (val[0] >= '0' && val[0] <= '9') {
+		int idx = atoi(val);
+		if ((uint32_t)idx < device_count) {
+			VK_WARN(vk, "DXR_VK_FORCE_GPU=%s: forcing device index %d", val, idx);
+			return idx;
+		}
+		VK_WARN(vk, "DXR_VK_FORCE_GPU=%s: only %u devices present — ignoring", val, device_count);
+		return -1;
+	} else {
+		VK_WARN(vk, "DXR_VK_FORCE_GPU=%s: unrecognized value — ignoring", val);
+		return -1;
+	}
+
+	for (uint32_t i = 0; i < device_count; i++) {
+		VkPhysicalDeviceProperties pdp;
+		vk->vkGetPhysicalDeviceProperties(devices[i], &pdp);
+		if (pdp.deviceType == want_type) {
+			VK_WARN(vk, "DXR_VK_FORCE_GPU=%s: selecting device %u (%s)", val, i, pdp.deviceName);
+			return (int)i;
+		}
+	}
+	VK_WARN(vk, "DXR_VK_FORCE_GPU=%s: no such device type present — using normal selection", val);
+	return -1;
+}
+
 static uint32_t
 select_preferred_device(struct vk_bundle *vk, VkPhysicalDevice *devices, uint32_t device_count)
 {
@@ -602,6 +654,11 @@ select_physical_device(struct vk_bundle *vk, int forced_index)
 
 	VK_DEBUG(vk, "Choosing Vulkan device index");
 	uint32_t gpu_index = 0;
+	// An explicit caller-supplied index wins; the env override comes next,
+	// ahead of the type-priority ranking it exists to escape.
+	if (forced_index < 0) {
+		forced_index = env_forced_gpu_index(vk, physical_devices, gpu_count);
+	}
 	if (forced_index >= 0) {
 		uint32_t uint_index = (uint32_t)forced_index;
 		if (uint_index + 1 > gpu_count) {
