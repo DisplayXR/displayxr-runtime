@@ -16,6 +16,8 @@
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 
+#include <cstring>
+
 #ifdef XRT_OS_WINDOWS
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan_win32.h>
@@ -436,12 +438,12 @@ dcomp_destroy(struct comp_vk_native_target *target)
 	target->dcomp_active = false;
 }
 
-// Import a single D3D11 KMT-shared texture as a VkImage in the ring.
+// Import a single D3D11 NT-handle-shared texture as a VkImage in the ring.
 static bool
 dcomp_import_one(struct comp_vk_native_target *target,
                  uint32_t i,
                  ID3D11Texture2D *dx_tex,
-                 HANDLE shared_kmt,
+                 HANDLE shared_nt,
                  uint32_t w,
                  uint32_t h,
                  VkFormat vk_format)
@@ -451,7 +453,7 @@ dcomp_import_one(struct comp_vk_native_target *target,
 	VkExternalMemoryImageCreateInfo external_ci = {
 	    .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
 	    .pNext = NULL,
-	    .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT,
+	    .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT,
 	};
 
 	VkImageCreateInfo image_ci = {
@@ -485,8 +487,8 @@ dcomp_import_one(struct comp_vk_native_target *target,
 	VkImportMemoryWin32HandleInfoKHR import_info = {
 	    .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
 	    .pNext = NULL,
-	    .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT,
-	    .handle = shared_kmt,
+	    .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT,
+	    .handle = shared_nt,
 	};
 	VkMemoryDedicatedAllocateInfoKHR dedicated_info = {
 	    .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO_KHR,
@@ -556,15 +558,79 @@ dcomp_import_one(struct comp_vk_native_target *target,
 // and the ring of KMT-shared textures imported as VkImages. Returns false
 // (with a U_LOG_W) if any prerequisite is missing — caller falls back to
 // opaque WSI.
+// Packed LUID (HighPart<<32 | LowPart) of the VkPhysicalDevice, 0 if unknown.
+static uint64_t
+vk_device_packed_luid(struct vk_bundle *vk)
+{
+	if (vk->vkGetPhysicalDeviceProperties2 == NULL) {
+		return 0;
+	}
+	VkPhysicalDeviceIDProperties id_props = {};
+	id_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+	VkPhysicalDeviceProperties2 props2 = {};
+	props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+	props2.pNext = &id_props;
+	vk->vkGetPhysicalDeviceProperties2(vk->physical_device, &props2);
+	if (!id_props.deviceLUIDValid) {
+		return 0;
+	}
+	uint64_t luid = 0;
+	memcpy(&luid, id_props.deviceLUID, sizeof(luid));
+	return luid;
+}
+
 static bool
 dcomp_setup(struct comp_vk_native_target *target, HWND hwnd, uint32_t w, uint32_t h)
 {
 	struct vk_bundle *vk = target->vk;
 
+	// The bridge's D3D11 device MUST live on the same adapter as the
+	// VkDevice: the ring textures are KMT-shared between the two, and a
+	// shared surface does not carry pixels across adapters — on an Optimus
+	// box with the VkDevice forced to the iGPU, a default-adapter bridge
+	// device silently presents a never-written (fully transparent) surface.
+	// Match by LUID; fall back to opaque WSI rather than to a mismatched
+	// default device.
+	const uint64_t want_luid = vk_device_packed_luid(vk);
+	IDXGIAdapter1 *create_adapter = NULL;
+	if (want_luid != 0) {
+		IDXGIFactory1 *enum_factory = NULL;
+		if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&enum_factory))) {
+			for (UINT i = 0; enum_factory->EnumAdapters1(i, &create_adapter) != DXGI_ERROR_NOT_FOUND;
+			     i++) {
+				DXGI_ADAPTER_DESC1 ad = {};
+				uint64_t luid = 0;
+				if (SUCCEEDED(create_adapter->GetDesc1(&ad))) {
+					luid = ((uint64_t)(uint32_t)ad.AdapterLuid.HighPart << 32) |
+					       (uint64_t)(uint32_t)ad.AdapterLuid.LowPart;
+				}
+				if (luid == want_luid) {
+					U_LOG_W("DComp bridge: matching VkDevice adapter LUID 0x%016llx (%ls)",
+					        (unsigned long long)luid, ad.Description);
+					break;
+				}
+				create_adapter->Release();
+				create_adapter = NULL;
+			}
+			enum_factory->Release();
+		}
+		if (create_adapter == NULL) {
+			U_LOG_W("DComp bridge: no DXGI adapter matches VkDevice LUID 0x%016llx — "
+			        "falling back to opaque WSI",
+			        (unsigned long long)want_luid);
+			return false;
+		}
+	} else {
+		U_LOG_W("DComp bridge: VkDevice LUID unavailable — using default D3D11 adapter");
+	}
+
 	HRESULT hr = D3D11CreateDevice(
-	    NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+	    create_adapter, create_adapter != NULL ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, NULL,
 	    D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0, D3D11_SDK_VERSION,
 	    &target->dcomp_dx_device, NULL, &target->dcomp_dx_context);
+	if (create_adapter != NULL) {
+		create_adapter->Release();
+	}
 	if (FAILED(hr) || target->dcomp_dx_device == NULL) {
 		U_LOG_W("DComp bridge: D3D11CreateDevice failed: 0x%08x — falling back to opaque WSI", hr);
 		return false;
@@ -645,16 +711,14 @@ dcomp_setup(struct comp_vk_native_target *target, HWND hwnd, uint32_t w, uint32_
 		tdesc.SampleDesc.Count = 1;
 		tdesc.Usage = D3D11_USAGE_DEFAULT;
 		tdesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-		// Use the legacy KMT path (NOT NTHANDLE) so we can call
-		// IDXGIResource::GetSharedHandle and import on the VK side via
-		// VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT — matching
-		// the existing import_shared_d3d11_texture pattern. NTHANDLE
-		// would require IDXGIResource1::CreateSharedHandle (returns
-		// E_INVALIDARG from the legacy GetSharedHandle path).
-		// SHARED_KEYEDMUTEX implies legacy SHARED — they're mutually
-		// exclusive at the D3D11 API surface (combining with NTHANDLE is
-		// also possible but requires CreateSharedHandle).
-		tdesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+		// NT-handle sharing (CreateSharedHandle + VK import via the NT
+		// D3D11_TEXTURE bit). The legacy KMT path silently yields a
+		// never-updated — hence fully transparent — surface on Intel UHD
+		// 30.0.100.x, while the NT path is the one proven to share pixels
+		// with that driver (it is what the WGC bg-capture import uses).
+		// The keyed mutex is kept: the reader's AcquireSync(0,0) is the
+		// cross-API cache barrier (see present()).
+		tdesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
 
 		hr = target->dcomp_dx_device->CreateTexture2D(&tdesc, NULL, &target->dcomp_shared_dx[i]);
 		if (FAILED(hr)) {
@@ -662,24 +726,28 @@ dcomp_setup(struct comp_vk_native_target *target, HWND hwnd, uint32_t w, uint32_
 			return false;
 		}
 
-		// Get the KMT-style legacy shared HANDLE for VK import.
-		IDXGIResource *dxgi_res = NULL;
-		hr = target->dcomp_shared_dx[i]->QueryInterface(__uuidof(IDXGIResource),
+		// NT shared handle for the VK import. Ownership stays here — Vulkan
+		// does not adopt NT handles, so it is closed right after the import.
+		IDXGIResource1 *dxgi_res = NULL;
+		hr = target->dcomp_shared_dx[i]->QueryInterface(__uuidof(IDXGIResource1),
 		                                                 (void **)&dxgi_res);
 		if (FAILED(hr) || dxgi_res == NULL) {
-			U_LOG_W("DComp bridge: QueryInterface(IDXGIResource)[%u] failed: 0x%08x", i, hr);
+			U_LOG_W("DComp bridge: QueryInterface(IDXGIResource1)[%u] failed: 0x%08x", i, hr);
 			return false;
 		}
-		HANDLE shared_kmt = NULL;
-		hr = dxgi_res->GetSharedHandle(&shared_kmt);
+		HANDLE shared_nt = NULL;
+		hr = dxgi_res->CreateSharedHandle(NULL, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+		                                  NULL, &shared_nt);
 		dxgi_res->Release();
-		if (FAILED(hr) || shared_kmt == NULL) {
-			U_LOG_W("DComp bridge: GetSharedHandle[%u] failed: 0x%08x", i, hr);
+		if (FAILED(hr) || shared_nt == NULL) {
+			U_LOG_W("DComp bridge: CreateSharedHandle[%u] failed: 0x%08x", i, hr);
 			return false;
 		}
 
-		if (!dcomp_import_one(target, i, target->dcomp_shared_dx[i], shared_kmt,
-		                       w, h, VK_FORMAT_B8G8R8A8_UNORM)) {
+		bool imported = dcomp_import_one(target, i, target->dcomp_shared_dx[i], shared_nt,
+		                                  w, h, VK_FORMAT_B8G8R8A8_UNORM);
+		CloseHandle(shared_nt);
+		if (!imported) {
 			return false;
 		}
 	}
@@ -698,7 +766,7 @@ dcomp_setup(struct comp_vk_native_target *target, HWND hwnd, uint32_t w, uint32_
 	target->current_index = 0;
 	target->dcomp_active = true;
 
-	U_LOG_W("DComp bridge active: %ux%u, %u-deep ring, KMT shared, "
+	U_LOG_W("DComp bridge active: %ux%u, %u-deep ring, NT shared, "
 	        "PRE_MULTIPLIED + DComp -> HWND",
 	        w, h, (unsigned)DCOMP_RING);
 	return true;
@@ -1483,7 +1551,9 @@ comp_vk_native_target_resize(struct comp_vk_native_target *target,
 			return XRT_ERROR_VULKAN;
 		}
 
-		// 3. Rebuild the ring of KMT-shared textures + VkImage imports at the new size.
+		// 3. Rebuild the ring of NT-handle-shared textures + VkImage imports at
+		// the new size (same sharing mode as dcomp_setup — see the comment
+		// there for why NT and not legacy KMT).
 		for (uint32_t i = 0; i < DCOMP_RING; i++) {
 			D3D11_TEXTURE2D_DESC tdesc = {};
 			tdesc.Width = width;
@@ -1494,27 +1564,30 @@ comp_vk_native_target_resize(struct comp_vk_native_target *target,
 			tdesc.SampleDesc.Count = 1;
 			tdesc.Usage = D3D11_USAGE_DEFAULT;
 			tdesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-			tdesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+			tdesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
 			hr = target->dcomp_dx_device->CreateTexture2D(&tdesc, NULL, &target->dcomp_shared_dx[i]);
 			if (FAILED(hr)) {
 				U_LOG_E("DComp bridge resize: CreateTexture2D[%u] failed: 0x%08x", i, hr);
 				return XRT_ERROR_VULKAN;
 			}
-			IDXGIResource *dxgi_res = NULL;
-			hr = target->dcomp_shared_dx[i]->QueryInterface(__uuidof(IDXGIResource), (void **)&dxgi_res);
+			IDXGIResource1 *dxgi_res = NULL;
+			hr = target->dcomp_shared_dx[i]->QueryInterface(__uuidof(IDXGIResource1), (void **)&dxgi_res);
 			if (FAILED(hr) || dxgi_res == NULL) {
-				U_LOG_E("DComp bridge resize: QueryInterface(IDXGIResource)[%u] failed: 0x%08x", i, hr);
+				U_LOG_E("DComp bridge resize: QueryInterface(IDXGIResource1)[%u] failed: 0x%08x", i, hr);
 				return XRT_ERROR_VULKAN;
 			}
-			HANDLE shared_kmt = NULL;
-			hr = dxgi_res->GetSharedHandle(&shared_kmt);
+			HANDLE shared_nt = NULL;
+			hr = dxgi_res->CreateSharedHandle(NULL, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+			                                  NULL, &shared_nt);
 			dxgi_res->Release();
-			if (FAILED(hr) || shared_kmt == NULL) {
-				U_LOG_E("DComp bridge resize: GetSharedHandle[%u] failed: 0x%08x", i, hr);
+			if (FAILED(hr) || shared_nt == NULL) {
+				U_LOG_E("DComp bridge resize: CreateSharedHandle[%u] failed: 0x%08x", i, hr);
 				return XRT_ERROR_VULKAN;
 			}
-			if (!dcomp_import_one(target, i, target->dcomp_shared_dx[i], shared_kmt,
-			                       width, height, VK_FORMAT_B8G8R8A8_UNORM)) {
+			bool imported = dcomp_import_one(target, i, target->dcomp_shared_dx[i], shared_nt,
+			                                  width, height, VK_FORMAT_B8G8R8A8_UNORM);
+			CloseHandle(shared_nt);
+			if (!imported) {
 				U_LOG_E("DComp bridge resize: import ring[%u] failed", i);
 				return XRT_ERROR_VULKAN;
 			}
