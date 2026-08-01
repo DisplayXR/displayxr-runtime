@@ -90,7 +90,7 @@ xrCreateSession(instance, &sessionInfo, &session);
 - **Texture class** (shared-texture content handoff, the `sharedTextureHandle` / readback fields of the win32/cocoa siblings) — deliberately absent from spec v1; add as a follow-up revision when a Linux `_texture` producer exists (#696 is the class taxonomy reference).
 - **Transparent background** (`transparentBackgroundEnabled` sibling field) — X11 ARGB-visual transparency is not wired in the Linux compositor yet.
 - **Window-space composition layers** (`XrCompositionLayerWindowSpaceDXR`) — not declared by this extension yet; the shared type value (1004999002) makes a later `#ifndef`-guarded adoption possible, mirroring the cocoa header.
-- **Wayland** — no stable absolute window position (needed for interlacing phase); X11/XCB first by design (`docs/roadmap/linux-support.md` § Decisions).
+- **Wayland** — no stable absolute window position (needed for interlacing phase); X11/XCB first by design (`docs/roadmap/linux-support.md` § Decisions). Since then: `XR_DXR_wayland_surface_binding` ships the present path, and #817 adds windowed weaving under Wayland via a compositor-published geometry service (`docs/specs/runtime/wayland-window-geometry.md`).
 
 ## 7. Revision History
 

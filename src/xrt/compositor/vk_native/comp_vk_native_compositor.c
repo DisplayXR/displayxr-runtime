@@ -83,6 +83,15 @@
 #include "vk_native/comp_vk_native_window_direct.h"
 #endif
 
+// Wayland windowed weaving (#817): the window's absolute position comes from
+// the compositor-published session-bus geometry service, since Wayland never
+// tells a client where its surface sits. D-Bus is optional; without it the
+// Wayland path weaves display-scoped as before.
+#if defined(XRT_HAVE_WAYLAND) && defined(XRT_HAVE_DBUS)
+#define DXR_HAVE_WL_GEOM
+#include "vk_native/comp_vk_native_wl_geom.h"
+#endif
+
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
@@ -182,6 +191,12 @@ struct comp_vk_native_compositor
 	bool use_wayland;
 	//! wl_display* + wl_surface* handed to the target as the type-erased hwnd.
 	struct comp_vk_native_wayland_handle wayland_handle;
+#endif
+#ifdef DXR_HAVE_WL_GEOM
+	//! Compositor-side window-geometry provider (#817). NULL when the session
+	//! bus is unreachable; the provider itself degrades to "no data" when the
+	//! GNOME Shell extension is absent.
+	struct comp_vk_native_wl_geom *wl_geom;
 #endif
 #endif
 
@@ -3244,6 +3259,11 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	if (c->xcb_window != NULL) {
 		comp_vk_native_window_xcb_destroy(&c->xcb_window);
 	}
+#ifdef DXR_HAVE_WL_GEOM
+	if (c->wl_geom != NULL) {
+		comp_vk_native_wl_geom_destroy(&c->wl_geom);
+	}
+#endif
 #ifdef DXR_HAVE_DIRECT_SCANOUT
 	// After the target (swapchain) is gone — the backend owns the surface it
 	// borrowed to it — release the display back to the X server.
@@ -3508,6 +3528,11 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		c->xcb_window = NULL;
 		c->owns_window = false;
 		U_LOG_I("Using app-provided Wayland surface (XR_DXR_wayland_surface_binding)");
+#ifdef DXR_HAVE_WL_GEOM
+		// Windowed weaving (#817): absolute window position via the
+		// compositor's geometry service. NULL / no-data → display-scoped.
+		c->wl_geom = comp_vk_native_wl_geom_create();
+#endif
 	} else
 #endif
 	    if (hwnd != NULL) {
@@ -4170,7 +4195,15 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	// cube + oversized disparity. Mirror the live-resize path (which already
 	// polls c->xcb_handle geometry).
 	const bool have_app_window = (c->xcb_window == NULL && c->xcb_handle.connection != NULL);
-	if (c->xcb_window == NULL && !have_app_window) {
+	// Third window source (#817): app-provided Wayland surface. Wayland gives
+	// us no window to query, so size + position come from the compositor's
+	// geometry service instead of XCB.
+#ifdef DXR_HAVE_WL_GEOM
+	const bool have_wayland_geom = c->use_wayland && c->wl_geom != NULL;
+#else
+	const bool have_wayland_geom = false;
+#endif
+	if (c->xcb_window == NULL && !have_app_window && !have_wayland_geom) {
 		return false;
 	}
 
@@ -4204,7 +4237,22 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	}
 
 	uint32_t win_px_w = 0, win_px_h = 0;
-	if (have_app_window) {
+#ifdef DXR_HAVE_WL_GEOM
+	int32_t wlg_left = 0, wlg_top = 0;
+	bool have_wlg_rect = false;
+	if (have_wayland_geom) {
+		float wlg_scale = 1.0f;
+		have_wlg_rect = comp_vk_native_wl_geom_get_window_rect(c->wl_geom, &wlg_left, &wlg_top, &win_px_w,
+		                                                       &win_px_h, &wlg_scale);
+		if (!have_wlg_rect) {
+			// Geometry service has no window for this process yet
+			// (extension absent / window unmapped) — no metrics, the
+			// caller stays display-scoped.
+			return false;
+		}
+	} else
+#endif
+	    if (have_app_window) {
 		comp_vk_native_window_xcb_query_geometry(&c->xcb_handle, &win_px_w, &win_px_h);
 	} else {
 		comp_vk_native_window_xcb_get_dimensions(c->xcb_window, &win_px_w, &win_px_h);
@@ -4232,9 +4280,21 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	float win_center_px_x = disp_center_px_x;
 	float win_center_px_y = disp_center_px_y;
 	int32_t win_left = 0, win_top = 0;
-	bool have_pos = have_app_window
-	                    ? comp_vk_native_window_xcb_query_screen_position(&c->xcb_handle, &win_left, &win_top)
-	                    : comp_vk_native_window_xcb_get_screen_position(c->xcb_window, &win_left, &win_top);
+	bool have_pos;
+#ifdef DXR_HAVE_WL_GEOM
+	if (have_wayland_geom) {
+		// Mutter global coordinates == X11 root coordinates at scale 1.0,
+		// so the display-origin subtraction below applies unchanged.
+		win_left = wlg_left;
+		win_top = wlg_top;
+		have_pos = have_wlg_rect;
+	} else
+#endif
+	{
+		have_pos = have_app_window
+		               ? comp_vk_native_window_xcb_query_screen_position(&c->xcb_handle, &win_left, &win_top)
+		               : comp_vk_native_window_xcb_get_screen_position(c->xcb_window, &win_left, &win_top);
+	}
 	if (have_pos) {
 		win_center_px_x = (float)(win_left - disp_left) + (float)win_px_w / 2.0f;
 		win_center_px_y = (float)(win_top - disp_top) + (float)win_px_h / 2.0f;

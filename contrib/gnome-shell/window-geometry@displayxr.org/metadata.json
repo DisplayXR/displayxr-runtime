@@ -1,0 +1,7 @@
+{
+  "uuid": "window-geometry@displayxr.org",
+  "name": "DisplayXR Window Geometry",
+  "description": "Publishes per-window global geometry over the session D-Bus so the DisplayXR runtime can anchor the lenticular interlacing phase to a window's panel position under Wayland (windowed weaving). Wayland clients cannot know their own absolute position; the compositor can. See displayxr-runtime#817.",
+  "shell-version": ["45", "46", "47", "48", "49"],
+  "url": "https://github.com/DisplayXR/displayxr-runtime"
+}
