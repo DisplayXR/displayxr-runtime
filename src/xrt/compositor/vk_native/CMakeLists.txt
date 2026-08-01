@@ -108,6 +108,19 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		# CMakeLists.txt for the full failure mode.
 		target_include_directories(comp_vk_native PRIVATE ${WAYLAND_INCLUDE_DIRS})
 		target_link_libraries(comp_vk_native PRIVATE ${WAYLAND_LIBRARIES})
+
+		if(XRT_HAVE_DBUS)
+			# Wayland window-geometry provider (#817): Wayland never exposes a
+			# surface's absolute position, so windowed weaving reads it from
+			# the compositor-published session-bus service (GNOME Shell
+			# extension in contrib/gnome-shell/). Optional — without it the
+			# Wayland path stays display-scoped, exactly as before.
+			target_sources(comp_vk_native PRIVATE
+				comp_vk_native_wl_geom.c
+				comp_vk_native_wl_geom.h)
+			target_include_directories(comp_vk_native SYSTEM PRIVATE ${DBUS_INCLUDE_DIRS})
+			target_link_libraries(comp_vk_native PRIVATE ${DBUS_LIBRARIES})
+		endif()
 	endif()
 
 	# Qwerty include path for runtime-side 2D/3D toggle polling

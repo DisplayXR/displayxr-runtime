@@ -216,6 +216,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 		# WS3b, XR_DXR_wayland_surface_binding). Optional — X11/XCB is the
 		# primary desktop path.
 		pkg_check_modules(WAYLAND wayland-client)
+		# libdbus for the Wayland window-geometry provider (#817): consumes
+		# the per-window global geometry the compositor publishes on the
+		# session bus (GNOME Shell extension window-geometry@displayxr.org),
+		# since Wayland never exposes a surface's absolute position to its
+		# client. Optional — absence just keeps Wayland weaving display-scoped.
+		pkg_check_modules(DBUS dbus-1)
 	endif()
 endif()
 
@@ -255,6 +261,9 @@ option_with_deps(XRT_HAVE_XCB "Enable xcb support" DEPENDS XCB_FOUND)
 # compositor falls back to the XCB window path when absent. ST-5539.
 option_with_deps(XRT_HAVE_XLIB_XRANDR "Enable Xlib/Xrandr direct-scanout present (Linux)" DEPENDS XLIB_XRANDR_FOUND XRT_HAVE_XCB)
 option_with_deps(XRT_HAVE_WAYLAND "Enable Wayland app-surface present path (XR_DXR_wayland_surface_binding)" DEPENDS WAYLAND_FOUND XRT_HAVE_VULKAN)
+# Wayland windowed weaving (#817): D-Bus client of the compositor-side
+# window-geometry service. Without it Wayland apps weave display-scoped.
+option_with_deps(XRT_HAVE_DBUS "Enable D-Bus (Wayland window-geometry provider)" DEPENDS DBUS_FOUND)
 
 # System deps to use (sorted)
 option_with_deps(XRT_HAVE_LIBUDEV "Enable libudev (used for device probing on Linux)" DEPENDS UDEV_FOUND)

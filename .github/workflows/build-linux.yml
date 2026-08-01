@@ -105,6 +105,7 @@ jobs:
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libeigen3-dev libcjson-dev libudev-dev \
             libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libwayland-dev \
+            libdbus-1-dev \
             libgl1-mesa-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
 
       - name: Build + headless selftest + test app
@@ -140,6 +141,7 @@ jobs:
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libeigen3-dev libcjson-dev libudev-dev \
             libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libwayland-dev \
+            libdbus-1-dev \
             libgl1-mesa-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
 
       - uses: actions/checkout@v5
@@ -203,6 +205,7 @@ jobs:
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libeigen3-dev libcjson-dev libudev-dev \
             libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libwayland-dev \
+            libdbus-1-dev \
             libgl1-mesa-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
 
       - name: Build service + IPC-client runtime (headless selftest)

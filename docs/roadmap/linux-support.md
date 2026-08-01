@@ -303,7 +303,11 @@ AppImages.
 
 ## Decisions
 
-- **XCB first, Wayland later** — window-position queryability (above).
+- **XCB first, Wayland later** — window-position queryability (above). The
+  Wayland answer now exists (#817): the compositor publishes per-window global
+  geometry over the session bus (GNOME Shell extension in
+  `contrib/gnome-shell/`) and `comp_vk_native_wl_geom` feeds it into the same
+  present-origin chain — `docs/specs/runtime/wayland-window-geometry.md`.
 - **sim_display is the bring-up display processor** for all phases — the plug-in
   ABI is platform-neutral so no ABI work was required. The vendor plug-in now
   has a **Linux arm scaffold** (leia-plugin#82, Track A of leia-plugin#81):
