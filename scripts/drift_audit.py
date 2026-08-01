@@ -60,12 +60,36 @@ CMAKE_CANDIDATES = [
     "src/CMakeLists.txt",
     "cmake/dependencies.cmake",
     "cmake/deps.cmake",
+    # Every displayxr-demo-* repo declares its FetchContent pins here, NOT in the
+    # root CMakeLists.txt. Omitting this path is why the 2026-08 common-pin drift
+    # (demos sitting on v2.0.0/v2.1.0/v2.3.1 while common was v2.5.0) went
+    # unreported for weeks despite the weekly audit running green.
+    "common/CMakeLists.txt",
 ]
 PIN_CONSUMERS = [
     "displayxr-runtime",
     "displayxr-shell-pvt",
     "displayxr-leia-plugin",
     "displayxr-cef-host",
+    # Demos consume displayxr-common too — they were absent from this list, so
+    # their pins were never audited at all.
+    "displayxr-demo-gaussiansplat",
+    "displayxr-demo-modelviewer",
+    "displayxr-demo-mediaplayer",
+    "displayxr-demo-avatar",
+    "displayxr-demo-earthview",
+]
+# Repos that may pin a dep as a git SUBMODULE rather than via FetchContent. A
+# FetchContent-only scan is blind to these: displayxr-unreal sat on the v2.0.0
+# commit with nothing to notice it.
+#
+# Deliberately a bare repo LIST, not a {repo: {path: dep}} map — the check reads
+# `.gitmodules` and self-discovers paths. A hardcoded path would rot the moment a
+# repo restructures or drops the submodule (displayxr-unreal is doing exactly
+# that in unreal#37, which moves the view math behind XR_DXR_view_rig). Absent
+# `.gitmodules` is a silent skip, never a finding.
+SUBMODULE_CONSUMERS = [
+    "displayxr-unreal",
 ]
 # dep repo name -> substring that identifies its GIT_REPOSITORY url
 PIN_DEPS = {
@@ -140,6 +164,7 @@ VXYZ_RE = re.compile(r"\bv(\d+\.\d+\.\d+)\b")
 
 _raw_cache: dict[tuple[str, str], str | None] = {}
 _tag_cache: dict[str, list[str]] = {}
+_tag_sha_cache: dict[str, dict[str, str]] = {}  # repo -> {commit sha: semver tag}
 
 
 def _gh(args: list[str]) -> str | None:
@@ -181,6 +206,68 @@ def list_tags(repo: str) -> list[str]:
     tags = out.split() if out else []
     _tag_cache[repo] = tags
     return tags
+
+
+def submodule_sha(repo: str, path: str) -> str | None:
+    """The commit a submodule is pinned at on the default branch, or None.
+
+    A submodule shows up in the git tree as a `commit`-type entry, so a normal
+    contents fetch can't read it.
+    """
+    out = _gh(
+        [
+            "api",
+            f"repos/{ORG}/{repo}/git/trees/HEAD?recursive=1",
+            "--jq",
+            f'.tree[] | select(.type=="commit" and .path=="{path}") | .sha',
+        ]
+    )
+    return out.strip() if out and out.strip() else None
+
+
+def tag_for_sha(repo: str, sha: str) -> str | None:
+    """Map a commit sha back to a vX.Y.Z tag on that repo, or None.
+
+    None is meaningful, not merely unknown: it means the pinned commit is not a
+    released tag — either an unreleased commit or (the dangerous case) an object
+    reachable from no branch at all.
+
+    Uses ``repos/:repo/tags`` because it reports the DEREFERENCED ``commit.sha``.
+    Release tags here are annotated (``git tag -a``), so ``git/ref/tags/:tag``
+    would yield the tag-object sha instead, which never equals the commit sha a
+    submodule pins — every lookup would miss and report a bogus non-tag-pin.
+    """
+    if repo not in _tag_sha_cache:
+        out = _gh(
+            [
+                "api",
+                "--paginate",
+                f"repos/{ORG}/{repo}/tags",
+                "--jq",
+                ".[] | .commit.sha + \" \" + .name",
+            ]
+        )
+        mapping: dict[str, str] = {}
+        for line in (out or "").splitlines():
+            parts = line.split()
+            if len(parts) == 2 and SEMVER_TAG.match(parts[1]):
+                mapping.setdefault(parts[0], parts[1])
+        _tag_sha_cache[repo] = mapping
+    return _tag_sha_cache[repo].get(sha)
+
+
+def parse_gitmodules(text: str) -> dict[str, str]:
+    """Map submodule path -> url from a .gitmodules file."""
+    mods: dict[str, str] = {}
+    path = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("path"):
+            path = line.split("=", 1)[1].strip() if "=" in line else None
+        elif line.startswith("url") and path and "=" in line:
+            mods[path] = line.split("=", 1)[1].strip()
+            path = None
+    return mods
 
 
 def latest_semver_tag(repo: str) -> str | None:
@@ -293,12 +380,60 @@ def check_fetchcontent_pins(report: Report) -> None:
                     continue
                 latest = latest_semver_tag(dep)
                 pk, lk = semver_key(tag), semver_key(latest or "")
-                if latest and pk and lk and pk < lk:
+                # A pin that isn't a vX.Y.Z tag (raw SHA, branch name) can never
+                # compare against `latest`, so the stale-pin check below silently
+                # skips it. That is how displayxr-cef-host came to pin a commit
+                # reachable from NO branch in displayxr-common — it resolved only
+                # because GitHub still serves unreachable objects, and a GC would
+                # have broken the build with no warning. Flag it explicitly: an
+                # unrankable pin is a worse problem than a merely stale one.
+                if pk is None:
+                    report.add(
+                        consumer,
+                        "non-tag-pin",
+                        f"pins {dep} @ {tag!r}, which is not a vX.Y.Z tag — "
+                        f"cannot be drift-checked, and if it is a raw SHA it may "
+                        f"be unreachable (latest tag is {latest or 'unknown'})",
+                    )
+                    continue
+                if latest and lk and pk < lk:
                     report.add(
                         consumer,
                         "stale-pin",
                         f"pins {dep} @ {tag} but latest tag is {latest}",
                     )
+    # Submodule-pinned consumers (invisible to the FetchContent scan above).
+    for consumer in SUBMODULE_CONSUMERS:
+        gitmodules = gh_raw(consumer, ".gitmodules")
+        if not gitmodules:
+            continue  # no submodules (or repo dropped them) — nothing to check
+        for path, url in parse_gitmodules(gitmodules).items():
+            dep = next((d for d, needle in PIN_DEPS.items() if needle in url), None)
+            if dep is None or (consumer, dep) in INTENTIONAL_LAG:
+                continue
+            sha = submodule_sha(consumer, path)
+            if not sha:
+                report.note(f"submodule: {consumer}:{path} — could not read pinned sha; skipped")
+                continue
+            tag = tag_for_sha(dep, sha)
+            if tag is None:
+                report.add(
+                    consumer,
+                    "non-tag-pin",
+                    f"submodule {path} pins {dep} @ {sha[:8]}, which matches no "
+                    f"vX.Y.Z tag — unrankable, and possibly unreachable",
+                )
+                continue
+            common_pins.setdefault(consumer, tag)
+            latest = latest_semver_tag(dep)
+            pk, lk = semver_key(tag), semver_key(latest or "")
+            if latest and pk and lk and pk < lk:
+                report.add(
+                    consumer,
+                    "stale-pin",
+                    f"submodule {path} pins {dep} @ {tag} but latest tag is {latest}",
+                )
+
     # common pin spread
     distinct = set(common_pins.values())
     if len(distinct) > 1:
