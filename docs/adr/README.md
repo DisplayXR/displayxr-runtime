@@ -36,3 +36,4 @@
 - [ADR-030](ADR-030-crop-before-dp-zero-copy-only-when-swapchain-equals-atlas.md) — Compositor Crops to Content; Zero-Copy Only When the Swapchain Equals the Mode Atlas
 - [ADR-031](ADR-031-remove-surround-output-rect-zones-sole-region-model.md) — Remove the 2D-surround / output-rect mechanism — display-zones is the sole region paradigm
 - [ADR-032](ADR-032-array-layered-swapchains-first-class.md) — Array (Layered) Swapchains Are First-Class Alongside the Tiled Atlas
+- [ADR-033](ADR-033-placement-reports-geometry-weaver-owns-phase.md) — The Party That Owns Placement Reports Geometry; the Weaver Owns Everything Phase
