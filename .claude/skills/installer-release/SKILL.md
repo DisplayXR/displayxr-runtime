@@ -241,11 +241,18 @@ if [ "$SIGNED" = yes ]; then
   # portable zip: git-bash on Windows has no `zip` — fall back to PowerShell.
   if command -v zip >/dev/null; then ( cd "$D/in" && zip -qr "$D/unsigned.zip" . )
   else powershell -NoProfile -Command "Compress-Archive -Path '$(cygpath -w "$D/in")\*' -DestinationPath '$(cygpath -w "$D/unsigned.zip")' -Force"; fi
-  TMP="sign-bundle-$(date +%s)-$$"
-  gh release create "$TMP" -R "$SIGN_REPO" --prerelease --title "$TMP" \
+  # NOTE: name this SIGN_TAG, never TMP. `TMP` is an exported env var on
+  # git-bash/Windows (Go's os.TempDir() reads %TMP%), so assigning to it
+  # repoints every child process's temp dir at a relative path — and the
+  # `gh run download` below then dies with "error initializing temporary file:
+  # open <cwd>\sign-bundle-...\gh-artifact.zip: The system cannot find the path
+  # specified", silently leaving the UNSIGNED CI bundle published. Windows-only:
+  # macOS/Linux Go reads TMPDIR, so this never repros on the mac box.
+  SIGN_TAG="sign-bundle-$(date +%s)-$$"
+  gh release create "$SIGN_TAG" -R "$SIGN_REPO" --prerelease --title "$SIGN_TAG" \
      --notes "temp bundle-signing payload (auto-deleted)" "$D/unsigned.zip"
   SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  gh workflow run sign-artifact -R "$SIGN_REPO" -f release_tag="$TMP"
+  gh workflow run sign-artifact -R "$SIGN_REPO" -f release_tag="$SIGN_TAG"
 
   RID=""
   for _ in $(seq 1 20); do
@@ -270,7 +277,7 @@ if [ "$SIGNED" = yes ]; then
     echo "⚠ sign-artifact run failed/absent — leaving the unsigned CI bundle."; SIGNED=no
   fi
   # Always clean up the temp signing release/tag on the provider.
-  gh release delete "$TMP" -R "$SIGN_REPO" --yes --cleanup-tag >/dev/null 2>&1 || true
+  gh release delete "$SIGN_TAG" -R "$SIGN_REPO" --yes --cleanup-tag >/dev/null 2>&1 || true
 fi
 ```
 
