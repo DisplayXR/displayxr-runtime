@@ -60,11 +60,11 @@ env_forced_d3d_adapter()
 		return nullptr;
 	}
 
-	DXGI_GPU_PREFERENCE pref;
+	bool want_igpu;
 	if (strcmp(val, "igpu") == 0 || strcmp(val, "integrated") == 0) {
-		pref = DXGI_GPU_PREFERENCE_MINIMUM_POWER;
+		want_igpu = true;
 	} else if (strcmp(val, "dgpu") == 0 || strcmp(val, "discrete") == 0) {
-		pref = DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE;
+		want_igpu = false;
 	} else if (val[0] >= '0' && val[0] <= '9') {
 		auto adapter = getAdapterByIndex((uint16_t)atoi(val), U_LOGGING_INFO);
 		if (adapter == nullptr) {
@@ -76,27 +76,43 @@ env_forced_d3d_adapter()
 		return nullptr;
 	}
 
-	wil::com_ptr<IDXGIFactory6> factory6;
-	if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory6), factory6.put_void())) || factory6 == nullptr) {
-		U_LOG_W("DXR_D3D_FORCE_GPU=%s: IDXGIFactory6 unavailable — ignoring", val);
+	// NOT EnumAdapterByGpuPreference: a per-app UserGpuPreferences registry
+	// entry overrides the preference ARGUMENT, so with GpuPreference=2 set
+	// MINIMUM_POWER still returns the discrete GPU first (observed on HW).
+	// Classify by dedicated VRAM instead — the integrated GPU is the
+	// hardware adapter with the least of it, the discrete the one with the
+	// most — which no registry state can reorder.
+	wil::com_ptr<IDXGIFactory1> factory;
+	if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), factory.put_void())) || factory == nullptr) {
+		U_LOG_W("DXR_D3D_FORCE_GPU=%s: DXGI factory unavailable — ignoring", val);
 		return nullptr;
 	}
+	wil::com_ptr<IDXGIAdapter1> best;
+	DXGI_ADAPTER_DESC1 best_desc{};
 	for (UINT i = 0;; i++) {
 		wil::com_ptr<IDXGIAdapter1> adapter;
-		if (FAILED(factory6->EnumAdapterByGpuPreference(i, pref, __uuidof(IDXGIAdapter1),
-		                                                adapter.put_void())) ||
-		    adapter == nullptr) {
+		if (FAILED(factory->EnumAdapters1(i, adapter.put())) || adapter == nullptr) {
 			break;
 		}
 		DXGI_ADAPTER_DESC1 desc{};
 		if (FAILED(adapter->GetDesc1(&desc)) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) {
 			continue; // skip WARP / Basic Render Driver
 		}
-		U_LOG_W("DXR_D3D_FORCE_GPU=%s: suggesting adapter %u (%ls)", val, i, desc.Description);
-		return adapter.query<IDXGIAdapter>();
+		bool better = (best == nullptr) ||
+		              (want_igpu ? desc.DedicatedVideoMemory < best_desc.DedicatedVideoMemory
+		                         : desc.DedicatedVideoMemory > best_desc.DedicatedVideoMemory);
+		if (better) {
+			best = adapter;
+			best_desc = desc;
+		}
 	}
-	U_LOG_W("DXR_D3D_FORCE_GPU=%s: no matching hardware adapter — ignoring", val);
-	return nullptr;
+	if (best == nullptr) {
+		U_LOG_W("DXR_D3D_FORCE_GPU=%s: no hardware adapter found — ignoring", val);
+		return nullptr;
+	}
+	U_LOG_W("DXR_D3D_FORCE_GPU=%s: suggesting adapter %ls (dedicated VRAM %llu MB)", val, best_desc.Description,
+	        (unsigned long long)(best_desc.DedicatedVideoMemory / (1024 * 1024)));
+	return best.query<IDXGIAdapter>();
 }
 
 XrResult
