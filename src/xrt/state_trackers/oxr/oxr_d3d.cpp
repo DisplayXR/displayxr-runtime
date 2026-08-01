@@ -9,6 +9,7 @@
 
 #include "util/u_misc.h"
 #include "util/u_debug.h"
+#include "util/u_logging.h"
 #include "d3d/d3d_dxgi_helpers.hpp"
 
 #include "oxr_objects.h"
@@ -38,6 +39,66 @@
 
 using namespace xrt::auxiliary::d3d;
 
+/*
+ * DXR_D3D_FORCE_GPU: external override for the adapter the runtime suggests
+ * via xrGetD3D11/12GraphicsRequirementsKHR (which well-behaved clients — and
+ * the Unity provider's own-device path — then create their device on). The
+ * default suggestion is EnumAdapterByGpuPreference(0, HIGH_PERFORMANCE),
+ * i.e. always the discrete GPU on an Optimus box, with no external way to
+ * redirect it; a client rendering on the iGPU then diverges from the
+ * session device and the cross-adapter eye bridge presents black (#240).
+ *
+ * Accepted: "igpu"/"integrated", "dgpu"/"discrete", or an adapter index.
+ * Returns an adapter or nullptr when unset/invalid (normal selection).
+ * D3D sibling of the Vulkan-side DXR_VK_FORCE_GPU.
+ */
+static wil::com_ptr<IDXGIAdapter>
+env_forced_d3d_adapter()
+{
+	const char *val = getenv("DXR_D3D_FORCE_GPU");
+	if (val == NULL || val[0] == '\0') {
+		return nullptr;
+	}
+
+	DXGI_GPU_PREFERENCE pref;
+	if (strcmp(val, "igpu") == 0 || strcmp(val, "integrated") == 0) {
+		pref = DXGI_GPU_PREFERENCE_MINIMUM_POWER;
+	} else if (strcmp(val, "dgpu") == 0 || strcmp(val, "discrete") == 0) {
+		pref = DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE;
+	} else if (val[0] >= '0' && val[0] <= '9') {
+		auto adapter = getAdapterByIndex((uint16_t)atoi(val), U_LOGGING_INFO);
+		if (adapter == nullptr) {
+			U_LOG_W("DXR_D3D_FORCE_GPU=%s: no adapter at that index — ignoring", val);
+		}
+		return adapter;
+	} else {
+		U_LOG_W("DXR_D3D_FORCE_GPU=%s: unrecognized value — ignoring", val);
+		return nullptr;
+	}
+
+	wil::com_ptr<IDXGIFactory6> factory6;
+	if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory6), factory6.put_void())) || factory6 == nullptr) {
+		U_LOG_W("DXR_D3D_FORCE_GPU=%s: IDXGIFactory6 unavailable — ignoring", val);
+		return nullptr;
+	}
+	for (UINT i = 0;; i++) {
+		wil::com_ptr<IDXGIAdapter1> adapter;
+		if (FAILED(factory6->EnumAdapterByGpuPreference(i, pref, __uuidof(IDXGIAdapter1),
+		                                                adapter.put_void())) ||
+		    adapter == nullptr) {
+			break;
+		}
+		DXGI_ADAPTER_DESC1 desc{};
+		if (FAILED(adapter->GetDesc1(&desc)) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) {
+			continue; // skip WARP / Basic Render Driver
+		}
+		U_LOG_W("DXR_D3D_FORCE_GPU=%s: suggesting adapter %u (%ls)", val, i, desc.Description);
+		return adapter.query<IDXGIAdapter>();
+	}
+	U_LOG_W("DXR_D3D_FORCE_GPU=%s: no matching hardware adapter — ignoring", val);
+	return nullptr;
+}
+
 XrResult
 oxr_d3d_get_requirements(struct oxr_logger *log,
                          struct oxr_system *sys,
@@ -50,7 +111,12 @@ oxr_d3d_get_requirements(struct oxr_logger *log,
 
 	try {
 
-		if (sys->xsysc->info.client_d3d_deviceLUID_valid) {
+		wil::com_ptr<IDXGIAdapter> forced = env_forced_d3d_adapter();
+		if (forced != nullptr) {
+			DXGI_ADAPTER_DESC desc{};
+			THROW_IF_FAILED(forced->GetDesc(&desc));
+			sys->suggested_d3d_luid = desc.AdapterLuid;
+		} else if (sys->xsysc->info.client_d3d_deviceLUID_valid) {
 			sys->suggested_d3d_luid =
 			    reinterpret_cast<const LUID &>(sys->xsysc->info.client_d3d_deviceLUID);
 			if (nullptr == getAdapterByLUID(sys->xsysc->info.client_d3d_deviceLUID, U_LOGGING_INFO)) {
