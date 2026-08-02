@@ -90,6 +90,18 @@ def state_packet(hand: int, t: float) -> bytes:
     )
 
 
+def recv_exact(sock: socket.socket, n: int) -> bytes:
+    """Read exactly n bytes. MSG_WAITALL is unusable here: Windows raises
+    WinError 10045 when the socket has a timeout set (create_connection)."""
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("connection closed during handshake")
+        buf += chunk
+    return buf
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -104,7 +116,7 @@ def main() -> int:
 
     # Handshake: send ours, read+validate theirs.
     sock.sendall(HELLO.pack(MAGIC, VERSION))
-    theirs = sock.recv(HELLO.size, socket.MSG_WAITALL)
+    theirs = recv_exact(sock, HELLO.size)
     magic, version = HELLO.unpack(theirs)
     if magic != MAGIC or version != VERSION:
         print(f"handshake mismatch: magic=0x{magic:08x} version={version}", file=sys.stderr)
