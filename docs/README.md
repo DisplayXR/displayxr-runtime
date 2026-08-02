@@ -81,6 +81,8 @@ Integrate your 3D display hardware into DisplayXR.
 - **[Separation of Concerns](architecture/separation-of-concerns.md)** — what goes where
 - [Legacy: in-tree integration model](archive/vendor-integration-historical.md) — historical reference for pre-#263 vendors who forked the runtime
 - [Writing a Driver](guides/writing-driver.md) — driver framework basics
+- **[ADR-034: Input-Provider Plug-ins](adr/ADR-034-input-provider-plugins.md)** — the second plug-in type: tracked motion controllers from an external DLL ([discovery contract](specs/runtime/input-provider-discovery.md) · [iface reference](reference/xrt_input_plugin_iface.md))
+- [OpenVR titles via OpenComposite](guides/openvr-titles-via-opencomposite.md) — how SteamVR-era titles reach the runtime + its motion controllers
 
 ### Integrated vendors (`vendors/`)
 
