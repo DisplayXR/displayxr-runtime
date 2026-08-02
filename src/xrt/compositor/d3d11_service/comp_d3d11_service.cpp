@@ -169,6 +169,25 @@ struct weave_latency_log
 static weave_latency_log g_weave_latency_workspace;
 static weave_latency_log g_weave_latency_standalone;
 
+/*
+ * Late-weave phase 1 (DXR_LATE_WEAVE=1). Flattens the present queue
+ * (waitable swap chain + SetMaximumFrameLatency(1)) and paces the workspace
+ * render thread off the frame-latency waitable instead of the 14 ms tick, so
+ * process_atlas runs vsync-locked ~1 refresh before scanout instead of ~3
+ * (baseline R: mean 46.4 ms on this path). Env-gated so baseline vs
+ * late-weave A/B runs on one binary; default off = behavior unchanged.
+ */
+static bool
+dxr_late_weave_enabled()
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		const char *e = getenv("DXR_LATE_WEAVE");
+		enabled = (e != nullptr && e[0] == '1') ? 1 : 0;
+	}
+	return enabled == 1;
+}
+
 // Helper to create security attributes for AppContainer sharing
 static bool
 create_appcontainer_sa(SECURITY_ATTRIBUTES &sa, PSECURITY_DESCRIPTOR &sd)
@@ -1411,6 +1430,12 @@ struct d3d11_multi_compositor
 	//! Wakeup event for the render thread: signaled on shutdown or when an
 	//! interaction (drag, rotation) needs a render sooner than the 14ms timeout.
 	HANDLE render_wakeup_event{nullptr};
+	//! Late-weave (DXR_LATE_WEAVE=1): frame-latency waitable from the workspace
+	//! swap chain (created with FRAME_LATENCY_WAITABLE_OBJECT, max latency 1).
+	//! The render thread paces on this instead of the 14 ms tick, so the
+	//! weave+present runs vsync-locked right after the previous flip — the eye
+	//! prediction is pulled ~1 refresh before scanout instead of ~3.
+	HANDLE frame_latency_waitable{nullptr};
 	//! @}
 
 	//! True when display is in 2D mode due to capture client focus.
@@ -3247,6 +3272,24 @@ init_client_render_resources(struct d3d11_service_system *sys,
 		}
 		fini_client_render_resources(res);
 		return XRT_ERROR_D3D11;
+	}
+
+	// Late-weave: flatten the per-client present queue. This swap chain is not
+	// waitable (the standalone commit is synchronous inside the IPC RPC, so
+	// there is no pacing thread to arm) — instead cap the DXGI device queue at
+	// 1, which makes Present(1) block until the previous frame flips. The
+	// weave then runs ~1-2 refreshes before scanout instead of ~3 (baseline R
+	// mean 46.4 ms), and the blocked RPC self-paces the client to vsync.
+	if (dxr_late_weave_enabled()) {
+		static bool device_latency_set = false;
+		if (!device_latency_set) {
+			wil::com_ptr<IDXGIDevice1> dxgi_dev1;
+			if (SUCCEEDED(sys->device->QueryInterface(IID_PPV_ARGS(dxgi_dev1.put())))) {
+				dxgi_dev1->SetMaximumFrameLatency(1);
+				device_latency_set = true;
+				U_LOG_W("Late-weave: DXGI device max frame latency 1 (standalone path)");
+			}
+		}
 	}
 
 	// Transparent path: bind composition swapchain to HWND through DComp.
@@ -5341,7 +5384,19 @@ try {
 	while (mc && mc->capture_render_running.load()) {
 		// Wait up to 14ms (~70fps). render_wakeup_event can be signaled
 		// early for instant shutdown or future drag-responsive repaints.
-		if (mc->render_wakeup_event) {
+		//
+		// Late-weave: pace on the swap chain's frame-latency waitable
+		// instead. With max latency 1 it signals right after the previous
+		// flip, so the whole render+weave+present runs vsync-locked at the
+		// top of the refresh interval and the weave's eye prediction is
+		// ~1 refresh old at scanout instead of ~3. The wakeup event stays
+		// in the wait set so shutdown still interrupts instantly; the
+		// timeout covers occluded/DWM-throttled windows where the waitable
+		// stops signaling.
+		if (mc->frame_latency_waitable) {
+			HANDLE waits[2] = {mc->frame_latency_waitable, mc->render_wakeup_event};
+			WaitForMultipleObjects(mc->render_wakeup_event ? 2 : 1, waits, FALSE, 100);
+		} else if (mc->render_wakeup_event) {
 			WaitForSingleObject(mc->render_wakeup_event, 14);
 		} else {
 			Sleep(14);
@@ -5451,6 +5506,10 @@ capture_render_thread_stop(struct d3d11_service_system *sys)
 	if (mc->render_wakeup_event) {
 		CloseHandle(mc->render_wakeup_event);
 		mc->render_wakeup_event = nullptr;
+	}
+	if (mc->frame_latency_waitable) {
+		CloseHandle(mc->frame_latency_waitable);
+		mc->frame_latency_waitable = nullptr;
 	}
 	U_LOG_W("Multi-comp: capture render timer stopped");
 }
@@ -5837,6 +5896,9 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 	sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 	// IGNORE so DWM doesn't composite the desktop through the bound HWND (#163).
 	sc_desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+	if (dxr_late_weave_enabled()) {
+		sc_desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+	}
 
 	HRESULT hr = sys->dxgi_factory->CreateSwapChainForHwnd(
 	    sys->device.get(), mc->hwnd, &sc_desc, nullptr, nullptr,
@@ -5844,6 +5906,18 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 	if (FAILED(hr)) {
 		U_LOG_E("Multi-comp: failed to create swap chain (hr=0x%08X)", hr);
 		return XRT_ERROR_D3D11;
+	}
+
+	if (dxr_late_weave_enabled()) {
+		wil::com_ptr<IDXGISwapChain2> sc2;
+		if (SUCCEEDED(mc->swap_chain->QueryInterface(IID_PPV_ARGS(sc2.put())))) {
+			sc2->SetMaximumFrameLatency(1);
+			mc->frame_latency_waitable = sc2->GetFrameLatencyWaitableObject();
+			U_LOG_W("Late-weave: workspace swap chain waitable, max latency 1 (waitable=%p)",
+			        mc->frame_latency_waitable);
+		} else {
+			U_LOG_E("Late-weave: IDXGISwapChain2 unavailable; falling back to tick pacing");
+		}
 	}
 
 	// Back buffer RTV
