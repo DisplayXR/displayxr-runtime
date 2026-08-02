@@ -45,17 +45,35 @@ phase.**
   every phase-derived behavior including snapping, quantization, and
   settle-on-drag heuristics, stays inside the vendor weaver, computed with
   lens parameters that never leave it.
-- **Who reports is platform-dependent; the contract is not.** On Windows the
-  OS lets the weaver self-serve placement from the window handle — that
-  remains the default (it serves every non-DisplayXR SDK consumer with zero
-  integration work, and the shipped API surface is frozen anyway). On
-  Wayland the display server is the only party that knows placement, so
-  caller-supplied origin is simply the only mode. Same contract, different
-  default.
-- **The caller-supplied origin is an override for whoever knows better, not a
-  Linux-ism.** The runtime uses it on any platform where it is the source of
-  truth: Wayland windows, offscreen/texture targets, display-zone origins,
-  service-mode composition.
+- **The placement authority varies by scenario; geometry must always come from
+  whoever it currently is.** Not from whoever finds it convenient, and never
+  from inference downstream. Three authorities in practice:
+
+  | Scenario | Placement authority | How geometry reaches the weaver |
+  |---|---|---|
+  | Plain app window on Windows | Window manager | It publishes to any process (`GetClientRect`/`ClientToScreen`), so the weaver reads Win32 directly |
+  | Wayland window | Compositor | It declines to publish, so we construct the channel (#817) and the runtime relays the origin |
+  | Display-zone, offscreen/texture target, service-composited surface | The **DisplayXR compositor** — *it* decides where those pixels land | The runtime supplies the origin; the OS window rect would be actively wrong |
+
+- **Win32 satisfies this rule — it is not exempt from it.** The weaver reading
+  the window rect is not *deriving* placement; it is consuming the placement
+  owner's own public report, through the channel that owner provides. A window
+  handle is a pointer to the authority's record ("ask the OS about this
+  window"), not an assertion of position, and a window rect is public
+  information any process may query. Wayland has the identical contract and a
+  missing transport: the compositor-published geometry service is a **polyfill
+  for a reporting channel Win32 provides natively**, not a different model.
+  Windows therefore keeps the handle-derived path as its default — it also
+  serves every non-DisplayXR SDK consumer with zero integration work, and the
+  shipped API surface is frozen regardless.
+- **Push vs pull is transport, not boundary.** The invariant is *who is
+  authoritative* and *what crosses the vendor boundary* — not the direction of
+  the call. The shipped X11 path pulls (`xcb_translate_coordinates` is a query,
+  not a subscription); Wayland pushes. Both comply.
+- **The caller-supplied origin is therefore not a Linux-ism.** The runtime uses
+  it on any platform where it has become the placement authority — including
+  Windows, where in zones/offscreen/composited modes a weaver reading the HWND
+  would compute a *wrong* phase.
 
 ## Consequences
 
@@ -70,6 +88,25 @@ phase.**
 - New geometry sources (a KDE publisher, a compositor-native protocol, an OEM
   display server) plug in by feeding the same `set_present_origin` chain; no
   vendor SDK change is implied by adding one.
+- **Platform geometry sourcing is the runtime's burden, never a vendor's.** A
+  vendor plug-in's entire windowed-weaving surface is the optional
+  `set_present_origin(xdp, panel_x, panel_y)` slot (two integers; absent slot ⟹
+  display-scoped, per ADR-020 append-only negotiation). Vendors write no
+  Wayland, D-Bus, or compositor-extension code. This is deliberate: the work is
+  byte-identical for every vendor and touches nothing about lenses, so
+  duplicating it per vendor would multiply identical code, fracture the
+  compositor-coverage matrix per vendor (incoherent product behavior for what
+  users perceive as a platform capability), and — where a shared side channel is
+  involved — have several publishers contend for one channel. See
+  `docs/guides/vendor-plugin-onboarding.md`.
+- **A geometry side channel has one publisher and many consumers.** Where a
+  platform needs a constructed channel (D-Bus service, compositor extension),
+  exactly one component ships the publisher; every interested runtime subscribes
+  independently. A second publisher for the same channel is a defect, not
+  redundancy — on D-Bus a well-known name is singly owned, so a duplicate binds
+  nothing and silently serves a possibly-skewed schema. Consumers are
+  unconstrained: a vendor-SDK runtime serving its own non-DisplayXR apps may
+  subscribe to the same publisher, and should, rather than shipping a rival one.
 - Display-info position (`screen_left/top`) and window geometry stay in the
   same desktop coordinate space on every platform, so `panel origin =
   window − display` is the whole runtime-side computation.
