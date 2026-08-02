@@ -718,6 +718,12 @@ oxr_session_change_state(struct oxr_logger *log, struct oxr_session *sess, XrSes
 		return;
 	}
 
+	// Most callers pass 0 for "now", but XrEventDataSessionStateChanged::time
+	// must be a valid XrTime (the CTS conformance layer rejects 0).
+	if (time == 0) {
+		time = time_state_monotonic_to_ts_ns(sess->sys->inst->timekeeping, os_monotonic_get_ns());
+	}
+
 	oxr_event_push_XrEventDataSessionStateChanged(log, sess, state, time);
 	sess->state = state;
 }
