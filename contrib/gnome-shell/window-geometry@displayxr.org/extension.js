@@ -15,6 +15,14 @@
 //   Method  GetWindows() -> (s)   JSON snapshot (schema below)
 //   Signal  WindowsChanged(s)     same JSON, emitted on any geometry change
 //
+// This extension is a SHARED asset — a vendor SDK runtime package may ship it
+// to serve its own non-DisplayXR apps (one publisher, many consumers; ADR-033).
+// Keep the UUID/bus/interface identifiers and the schema rules below intact:
+// fields may be ADDED freely within a version, but changing the meaning of an
+// existing field (e.g. logical -> physical pixels) MUST bump "version", since
+// consumers refuse a version they don't understand rather than weave at a
+// silently wrong phase. See docs/specs/runtime/wayland-window-geometry.md §4.
+//
 // JSON schema (version 1):
 // {
 //   "version": 1,

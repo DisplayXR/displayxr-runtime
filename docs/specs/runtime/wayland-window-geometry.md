@@ -70,7 +70,59 @@ GNOME Shell (Mutter)                        DisplayXR runtime process
 | No window matches our PID | `get_window_metrics` invalid; display-scoped |
 | Monitor scale ≠ 1.0 | Rect returned, one WARN — weave phase will be wrong until the display is set to 100 % scale (same constraint as X11 windowed weaving) |
 
-## 4. Known limitations / follow-ups (#817)
+## 4. Packaging contract — the publisher is a shared asset
+
+The publisher is deliberately **not** a DisplayXR-coupled component: it is a
+compositor-side shim that reports window rectangles and knows nothing about
+weaving, lenses, or any runtime. A **vendor runtime package may ship it** (a
+vendor SDK runtime needs the same geometry to serve its own non-DisplayXR
+apps — one publisher, many consumers, per
+[ADR-033](../../adr/ADR-033-placement-reports-geometry-weaver-owns-phase.md)).
+The following is what any shipping package must honor.
+
+**Canonical identity — never fork these.** Extension UUID
+`window-geometry@displayxr.org`; bus name `org.displayxr.WindowGeometry`;
+object `/org/displayxr/WindowGeometry`; interface
+`org.displayxr.WindowGeometry1`. The `displayxr` prefix names *who defines the
+schema*, not who ships the bits — the `org.freedesktop.*` / `org.gnome.*`
+convention. A vendor package shipping the publisher keeps these identifiers
+unchanged; renaming forks the ecosystem and strands consumers.
+
+**Exactly one installed owner.** A D-Bus well-known name is singly owned: a
+second publisher binds nothing, queues silently, and leaves consumers on
+whichever copy won the race — possibly an older schema. So multiple packages
+may *be able* to ship it, but only one may be installed at a time. The Debian
+idiom for that is a virtual package — every package that ships the extension
+declares all three of:
+
+```
+Provides:  displayxr-window-geometry-publisher
+Conflicts: displayxr-window-geometry-publisher
+Replaces:  displayxr-window-geometry-publisher
+```
+
+so a vendor runtime .deb and a DisplayXR .deb can each satisfy the dependency,
+dpkg refuses to install both, and consumers depend on the virtual name rather
+than on any particular vendor. Files install system-wide to
+`/usr/share/gnome-shell/extensions/window-geometry@displayxr.org/` (not the
+per-user `~/.local/share/...` path used for manual dev installs). Note the
+extension still has to be *enabled* per user session — a package can seed this
+via a dconf default for `org.gnome.shell enabled-extensions`, but it cannot be
+force-enabled for users who have opted out.
+
+**Schema evolution is additive within a version.** Publishers may add fields
+freely; consumers look up only what they know and ignore the rest. Anything
+that changes the *meaning* of an existing field — logical → physical pixels,
+a different coordinate origin — is a breaking change and MUST bump `version`.
+Consumers refuse a payload whose `version` exceeds what they understand
+(`WLG_SCHEMA_VERSION_MAX`) and fall back to display-scoped rather than weave at
+a silently wrong phase; a payload with no `version` is treated as v1.
+
+**No reverse dependency.** The extension must remain pure GNOME Shell JS with
+no import from, or runtime dependency on, DisplayXR or any vendor stack — that
+is what lets any package ship it and any runtime consume it.
+
+## 5. Known limitations / follow-ups (#817)
 
 - **Frame vs buffer rect** — the phase needs the rect where the *surface
   pixels* land. For CSD toolkits the buffer rect includes shadow margins;

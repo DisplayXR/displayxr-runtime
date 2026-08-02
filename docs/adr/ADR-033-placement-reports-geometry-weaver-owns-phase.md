@@ -107,6 +107,12 @@ phase.**
   nothing and silently serves a possibly-skewed schema. Consumers are
   unconstrained: a vendor-SDK runtime serving its own non-DisplayXR apps may
   subscribe to the same publisher, and should, rather than shipping a rival one.
+  **Which package ships the publisher is open — including a vendor runtime
+  package** (it is platform plumbing with no runtime coupling, and on a vendor
+  box that package is the layer guaranteed to be present). What is *not* open is
+  forking its identity or having two owners installed; the packaging contract
+  that keeps "any package may ship it, exactly one may own it" true is in
+  `docs/specs/runtime/wayland-window-geometry.md` §4.
 - Display-info position (`screen_left/top`) and window geometry stay in the
   same desktop coordinate space on every platform, so `panel origin =
   window − display` is the whole runtime-side computation.
