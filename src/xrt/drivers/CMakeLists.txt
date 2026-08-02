@@ -458,6 +458,90 @@ else()
 		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
 		)
 endif()
+####
+# DisplayXR-Ultraleap input-provider plug-in DLL (#825 Tier 1).
+#
+# Hand-as-motion-controller provider on the ADR-034 channel: LeapC palm
+# poses → grip/aim, pinch → select, grab → menu; the 26-joint sets are
+# also filled for the Tier-2 XR_EXT_hand_tracking wiring. SDK-GATED:
+# builds only where the Ultraleap Gemini SDK (LeapC) is found — point
+# LEAPSDK_DIR at an install if it isn't in a default location. CI does
+# not carry the SDK, so treat a local Leap-SDK build as part of touching
+# this target (Monado gated its ultraleap drivers the same way).
+find_path(LEAPC_INCLUDE_DIR LeapC.h
+	HINTS ENV LEAPSDK_DIR
+	PATH_SUFFIXES include LeapSDK/include
+	PATHS "C:/Program Files/Ultraleap/LeapSDK" /usr/include /usr/local/include /opt/ultraleap-hand-tracking/LeapSDK
+	)
+find_library(LEAPC_LIBRARY NAMES LeapC
+	HINTS ENV LEAPSDK_DIR
+	PATH_SUFFIXES lib lib/x64 LeapSDK/lib LeapSDK/lib/x64
+	PATHS "C:/Program Files/Ultraleap/LeapSDK" /usr/lib /usr/local/lib /opt/ultraleap-hand-tracking/LeapSDK
+	)
+if(LEAPC_INCLUDE_DIR AND LEAPC_LIBRARY)
+add_library(drv_ultraleap_plugin SHARED
+	ultraleap/ultraleap_interface.h
+	ultraleap/ultraleap_plugin.c
+	ultraleap/ultraleap_provider.cpp
+	)
+if(XRT_HAVE_LINUX)
+	target_link_libraries(drv_ultraleap_plugin PRIVATE
+		xrt-interfaces aux_util aux_os aux_math drv_includes)
+else()
+	target_compile_definitions(drv_ultraleap_plugin PRIVATE XRT_USING_RUNTIME_DLL)
+	target_link_libraries(
+		drv_ultraleap_plugin
+		PRIVATE
+			$<TARGET_LINKER_FILE:${RUNTIME_TARGET}>
+			xrt-interfaces
+			aux_util
+			aux_os
+			aux_math
+			drv_includes
+		)
+	add_dependencies(drv_ultraleap_plugin ${RUNTIME_TARGET})
+endif()
+target_include_directories(drv_ultraleap_plugin PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR}/ultraleap
+	${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
+	${LEAPC_INCLUDE_DIR}
+	)
+target_link_libraries(drv_ultraleap_plugin PRIVATE ${LEAPC_LIBRARY})
+
+set_target_properties(drv_ultraleap_plugin PROPERTIES
+	OUTPUT_NAME "DisplayXR-Ultraleap"
+	PREFIX ""
+	LINKER_LANGUAGE CXX
+	C_VISIBILITY_PRESET hidden
+	CXX_VISIBILITY_PRESET hidden
+	VISIBILITY_INLINES_HIDDEN ON
+	)
+
+if(APPLE)
+	target_link_options(drv_ultraleap_plugin PRIVATE
+		"LINKER:-exported_symbol,_xrtInputPluginNegotiate")
+elseif(NOT WIN32)
+	target_link_options(drv_ultraleap_plugin PRIVATE
+		"LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/input_plugin_exports.version")
+endif()
+
+if(WIN32)
+	install(
+		TARGETS drv_ultraleap_plugin
+		RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		)
+else()
+	install(
+		TARGETS drv_ultraleap_plugin
+		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
+		)
+endif()
+message(STATUS "Ultraleap input provider: ENABLED (LeapC at ${LEAPC_LIBRARY})")
+else()
+	message(STATUS "Ultraleap input provider: skipped (LeapC SDK not found — set LEAPSDK_DIR to enable)")
+endif() # LeapC SDK found
+
 endif() # XRT_FEATURE_OPENXR AND NOT ANDROID — input-provider plug-in blocks
 
 set(ENABLED_DRIVERS ${ENABLED_HEADSET_DRIVERS} ${ENABLED_DRIVERS})

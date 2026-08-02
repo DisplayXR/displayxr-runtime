@@ -135,6 +135,7 @@ In `target_builder_sim_display.c`:
 |---|---|---|
 | `sim_input` | **Shipped** (`src/xrt/drivers/sim_input/`, plug-in DLL `DisplayXR-SimInput`) | Deterministic synthetic motion controllers (circular motion, scripted button presses; `khr/simple_controller`) — hardware-free CI gate, adapted from Monado's `simulated_controller.c`. ProbeOrder 200. Dev builds stage it automatically (`build_macos.sh` / `build_linux.sh`); Windows registers via `register_dev_plugin.bat input`. |
 | `net_input` | **Shipped** (`src/xrt/drivers/net_input/`, plug-in DLL `DisplayXR-NetInput`) | Loopback-TCP-fed devices — an external tracking process feeds timestamped poses + button state and receives haptic events back (wire protocol below). Opt-in: never registered by default. |
+| `ultraleap` | **Shipped, SDK-gated** (`src/xrt/drivers/ultraleap/`, plug-in DLL `DisplayXR-Ultraleap`; builds only where the Ultraleap Gemini SDK / LeapC is found — `LEAPSDK_DIR`) | Hand-as-motion-controller provider (#825 Tier 1, adapted from Monado's removed `ultraleap_v5`): palm pose → grip/aim, pinch → select, grab → menu; 26-joint sets filled for the Tier-2 `XR_EXT_hand_tracking` wiring. Opt-in: never registered by default. |
 
 ### 5.1 net_input wire protocol (v1)
 
