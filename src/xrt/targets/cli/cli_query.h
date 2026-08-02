@@ -50,6 +50,12 @@ enum cli_selftest_result
 	//! factory, probe device failure, non-Windows) never fails — only a
 	//! present-but-invalid answer does.
 	CLI_SELFTEST_BAD_ZONE_CAPS = 4,
+	//! An input provider is registered (and not ForceQwerty-overridden)
+	//! but did not yield left+right motion-controller role devices with a
+	//! valid interaction profile (ADR-034 / #823). NOTE: provider
+	//! *absence* never fails — qwerty keeping the hand roles is the
+	//! normal no-provider configuration.
+	CLI_SELFTEST_BAD_INPUT = 5,
 };
 
 /*!
@@ -109,6 +115,24 @@ struct cli_query_result
 	bool zone_caps_malformed;
 	char zone_probe_note[128];
 	struct xrt_dp_local_zone_caps zone_caps;
+
+	/* Input-provider checks (ADR-034 / #823). Absence never fails: with
+	 * no provider registered — or the ForceQwerty override set — the
+	 * fields stay "not evaluated" and the verdict is untouched. Only a
+	 * registered, non-overridden provider that fails to produce
+	 * left+right motion-controller role devices (claimed by the
+	 * provider, valid `xrt_device_name` interaction profile) flips the
+	 * verdict to BAD_INPUT. */
+	int input_provider_count;   //!< registered providers (enumerated, unloaded)
+	bool input_force_qwerty;    //!< ForceQwerty override set
+	bool input_provider_active; //!< a provider claimed the system
+	bool input_evaluated;       //!< checks ran (provider registered, no override)
+	bool input_left_ok;
+	bool input_right_ok;
+	char input_provider_id[64];
+	char input_left_str[256];
+	char input_right_str[256];
+	char input_note[160];
 
 	/* DP-factory selection divergence probe. Two render paths choose the
 	 * display processor differently: the in-process handle/texture path reads

@@ -27,6 +27,7 @@ add_executable(
 	cli_cmd_info.c
 	cli_cmd_selftest.c
 	cli_cmd_dp.c
+	cli_cmd_input.c
 	cli_cmd_runtime.c
 	cli_cmd_displays.c
 	cli_cmd_probe.c
