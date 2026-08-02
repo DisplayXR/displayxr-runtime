@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "name": "CTS Input Smoke (Direct3D 11, Handle)",
+  "type": "3d",
+  "category": "test",
+  "display_mode": "auto",
+  "description": "XR_EXT_conformance_automation input smoke: injects select/pose on khr/simple_controller and asserts xrSyncActions surfaces them (docs/roadmap/cts-windows-handoff.md Phase 2).",
+  "icon": "icon.png",
+  "icon_3d": "icon_sbs.png",
+  "icon_3d_layout": "sbs-lr"
+}
