@@ -10,7 +10,14 @@ setlocal enabledelayedexpansion
 :: a developer/CI harness, not a runtime artifact.
 ::
 :: Usage: scripts\fetch_build_cts.bat
-::   Pin via CTS_TAG below. Tracks the shipped loader (1.1.51, #724).
+::   Pin via CTS_TAG below. Loader ships at 1.1.51 (#724); the CTS pin
+::   runs ahead at 1.1.54 because CTS 1.1.51-1.1.53 has a test-side
+::   stack-buffer overflow: test_XR_KHR_extended_struct_name_lengths
+::   passes a 64-byte XR_MAX_RESULT_STRING_SIZE buffer to
+::   xrStructureTypeToString2KHR (a 256-byte API), so any runtime
+::   returning a >63-char struct name (we do) fail-fasts the CTS
+::   process with 0xC0000409 mid-suite — truncated result XML, dead
+::   nightly (#830). Fixed upstream in openxr-cts-1.1.54.0.
 ::   NOTE: openxr-cts-1.1.44+ renamed the CLI arg --apiVersion ->
 ::   --minApiVersion (Khronos MR 3576); run_cts.ps1 was updated to
 ::   match (#726). The earlier "1.1.51 crashes the runtime mid-run"
@@ -20,7 +27,7 @@ setlocal enabledelayedexpansion
 :: ============================================================
 
 set REPO=%~dp0..\
-set CTS_TAG=openxr-cts-1.1.51.0
+set CTS_TAG=openxr-cts-1.1.54.0
 set CTS_ROOT=%REPO%build-cts
 set CTS_SRC=%CTS_ROOT%\OpenXR-CTS
 set CTS_BUILD=%CTS_ROOT%\build

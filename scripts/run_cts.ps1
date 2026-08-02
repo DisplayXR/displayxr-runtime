@@ -147,6 +147,7 @@ try {
   Write-Output "CWD: $base"
 
   $proc = Start-Process -FilePath $exe -ArgumentList $cliArgs -WorkingDirectory $base -PassThru -NoNewWindow
+  $null = $proc.Handle   # cache the handle NOW or .ExitCode reads back empty after exit (PS quirk)
   if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
     Write-Output "TIMEOUT after ${TimeoutSec}s - killing."
     try { $proc.Kill() } catch {}
