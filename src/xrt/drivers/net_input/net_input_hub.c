@@ -600,6 +600,12 @@ create_device(struct net_input_hub *hub, uint8_t hand)
 	dev->base.name = XRT_DEVICE_SIMPLE_CONTROLLER;
 	dev->base.device_type = is_left ? XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER : XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER;
 
+	// 6DOF feed — origin type must not stay TRACKING_TYPE_NONE, or the
+	// legacy builder injects per-hand arm-model offsets into every pose
+	// (see the matching comment in sim_input_device.c).
+	dev->base.tracking_origin->type = XRT_TRACKING_TYPE_OTHER;
+	snprintf(dev->base.tracking_origin->name, XRT_TRACKING_NAME_LEN, "%s", "Network Input Feed");
+
 	snprintf(dev->base.str, sizeof(dev->base.str), "Network %s Motion Controller", is_left ? "Left" : "Right");
 	snprintf(dev->base.serial, sizeof(dev->base.serial), "NET-INPUT-%s", is_left ? "L" : "R");
 
