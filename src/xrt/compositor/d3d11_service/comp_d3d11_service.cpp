@@ -11507,6 +11507,93 @@ compositor_request_rendering_mode(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
+/*!
+ * #814 — fail safe to hardware 2D when the client that was holding the panel in
+ * hardware 3D goes away.
+ *
+ * The two automatic hardware transitions hang off the *session-running*
+ * lifecycle: `oxr_session_begin` → 3D and `oxr_session_end` → 2D. `xrEndSession`
+ * requires a running session, and a weave present-owner never calls
+ * `xrBeginSession` at all (the browser's inline-3D session is "no
+ * xrBeginSession/xrEndFrame" by design), so a crash or force-kill left the lens
+ * on with no client remaining to turn it off and no self-recovery.
+ *
+ * This is the teardown-side counterpart: the one point where the runtime knows
+ * both "this client is gone" and "nobody else wants 3D". Covers the crash and
+ * the orderly exit identically — on an orderly exit `oxr_session_end` has
+ * already flattened the panel, so `sys->hardware_display_3d` is false and this
+ * is a no-op.
+ *
+ * Hardware only (ADR-028): it drives the same channel `xrRequestDisplayModeDXR`
+ * does and deliberately does NOT touch the active rendering-mode index or the
+ * atlas recipe.
+ *
+ * Caller must hold `sys->render_mutex`, must have already unregistered `c` from
+ * the multi-compositor (so the survivor scan below cannot see the dying client),
+ * and must not yet have run `fini_client_render_resources` (the DP has to still
+ * be alive to take the request).
+ */
+static void
+service_failsafe_hardware_2d_on_teardown(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	if (sys == nullptr || c->render.display_processor == nullptr) {
+		return;
+	}
+	// Workspace: the controller owns the display mode (a client leaving is
+	// routine there). Bridge: the relay owns it via the HWND path. Use the
+	// authoritative process-global bridge gate, not the per-client one — the
+	// question here is "is a bridge driving the panel", not "was this client
+	// the bridge client".
+	if (sys->workspace_mode || bridge_relay_is_live_authoritative(sys)) {
+		return;
+	}
+	if (!sys->hardware_display_3d) {
+		return; // already flat — nothing stranded
+	}
+
+	// Does anything left standing still want the lens? A weave present-owner
+	// holds the panel in 3D merely by existing (weave_force_3d_if_needed is
+	// self-healing), so a surviving one would just re-assert 3D on its next
+	// submit; flattening here would only produce a visible flicker.
+	bool this_client_is_weave_owner = c->render.weave_hwnd != nullptr;
+	uint32_t survivors = 0;
+	bool survivor_wants_3d = false;
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc != nullptr) {
+		for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+			struct d3d11_service_compositor *other = mc->clients[i].compositor;
+			if (!mc->clients[i].active || other == nullptr || other == c) {
+				continue;
+			}
+			survivors++;
+			if (other->render.weave_hwnd != nullptr) {
+				survivor_wants_3d = true;
+			}
+		}
+	}
+	if (survivor_wants_3d) {
+		return;
+	}
+	// An ordinary client leaving while others are still connected is not
+	// evidence that the panel should go flat — one of those survivors may be
+	// the one that asked for 3D. Only the departure of the weave present-owner
+	// itself, or of the last client on the box, releases the lens.
+	if (!this_client_is_weave_owner && survivors > 0) {
+		return;
+	}
+
+	// Route through the normal apply path so the DP request, tile-layout sync,
+	// `sys->hardware_display_3d`, and the post-flip cooldown stamps (which stop
+	// the 100 ms vendor 3D-state poll counter-correcting) all stay in one place.
+	// Clear any pending CONTENT request first — a half-applied mode switch from
+	// a dying client must not ride along.
+	c->pending_content_mode.store(0xFFFFFFFFu, std::memory_order_release);
+	c->pending_hw_3d.store(0, std::memory_order_release);
+	U_LOG_W("#814 failsafe: %s client leaving with the panel in 3D (%u survivor(s)) — requesting hardware 2D",
+	        this_client_is_weave_owner ? "weave present-owner" : "last", survivors);
+	(void)service_apply_pending_mode(sys, c, /* bridge_live */ false);
+}
+
 static void
 compositor_destroy(struct xrt_compositor *xc)
 {
@@ -11568,6 +11655,10 @@ compositor_destroy(struct xrt_compositor *xc)
 			c->zone_published = false;
 		}
 
+		// #814: turn the lens off before the DP goes away, now that the
+		// unregister above has made the survivor scan accurate.
+		service_failsafe_hardware_2d_on_teardown(sys, c);
+
 		// Tear down per-client render resources (window, swap chain, DP,
 		// atlas textures / SRVs / RTVs) while still holding render_mutex.
 		fini_client_render_resources(&c->render);
@@ -11593,6 +11684,12 @@ compositor_destroy(struct xrt_compositor *xc)
 		if (c->zone_published && c->render.display_processor != nullptr) {
 			xrt_display_processor_d3d11_clear_local_zone_mask(c->render.display_processor);
 			c->zone_published = false;
+		}
+		// #814: same fail-safe on the legacy single-client path — there are
+		// no other clients by construction, so this is the "last client" case.
+		{
+			std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+			service_failsafe_hardware_2d_on_teardown(sys, c);
 		}
 		fini_client_render_resources(&c->render);
 		if (c->workspace_sync_fence_handle != nullptr) {
