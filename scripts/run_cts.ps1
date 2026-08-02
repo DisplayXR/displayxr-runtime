@@ -146,7 +146,11 @@ try {
   Write-Output "RUN: conformance_cli $($cliArgs -join ' ')"
   Write-Output "CWD: $base"
 
-  $proc = Start-Process -FilePath $exe -ArgumentList $cliArgs -WorkingDirectory $base -PassThru -NoNewWindow
+  # CWD must be the exe's own dir: the CTS loads its data assets (brdf_lut.png,
+  # *.glb, ...) relative to the working directory, and the D3D11 plugin's
+  # InitializeDevice swallows the failed read into `return false` -> every
+  # session-creating test errors with XR_ERROR_RUNTIME_FAILURE (#830).
+  $proc = Start-Process -FilePath $exe -ArgumentList $cliArgs -WorkingDirectory (Split-Path $exe) -PassThru -NoNewWindow
   $null = $proc.Handle   # cache the handle NOW or .ExitCode reads back empty after exit (PS quirk)
   if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
     Write-Output "TIMEOUT after ${TimeoutSec}s - killing."
