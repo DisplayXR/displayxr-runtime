@@ -40,7 +40,9 @@ static const wchar_t* WINDOW_CLASS = L"SRCubeOpenXRExtClass";
 static const wchar_t* WINDOW_TITLE = L"D3D11 Cube \u2014 D3D11 Native Compositor (External Window)";
 
 // Global state (single-threaded — all accessed from the main thread only)
-static InputState g_inputState;
+// Cube test apps start with the WSUI HUD hidden — it skews perf comparisons
+// against HUD-less apps (avatar, Unity). Shift+Tab shows it when wanted.
+static InputState g_inputState = [] { InputState s; s.hudVisible = false; return s; }();
 static bool g_running = true;
 static XrSessionManager* g_xr = nullptr;
 

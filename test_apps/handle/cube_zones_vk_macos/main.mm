@@ -209,7 +209,9 @@ struct InputState {
 static volatile bool g_running = true;
 static NSWindow *g_window = nil;
 static NSView *g_metalView = nil;
-static InputState g_input;
+// Cube test apps start with the WSUI HUD hidden — it skews perf comparisons
+// against HUD-less apps (avatar, Unity). Shift+Tab shows it when wanted.
+static InputState g_input = [] { InputState s; s.hudVisible = false; return s; }();
 static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18°) → 36° vFOV
 
 // Borderless fullscreen state

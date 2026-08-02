@@ -70,7 +70,9 @@ static const wchar_t* WINDOW_CLASS = L"DXRCubeZonesClass";
 static const wchar_t* WINDOW_TITLE = L"D3D11 Cube Zones — XR_DXR_display_zones";
 
 // Global state (single-threaded — all accessed from the main thread only)
-static InputState g_inputState;
+// Cube test apps start with the WSUI HUD hidden — it skews perf comparisons
+// against HUD-less apps (avatar, Unity). Shift+Tab shows it when wanted.
+static InputState g_inputState = [] { InputState s; s.hudVisible = false; return s; }();
 static bool g_running = true;
 static XrSessionManager* g_xr = nullptr;
 static UINT g_windowWidth = 1280;
