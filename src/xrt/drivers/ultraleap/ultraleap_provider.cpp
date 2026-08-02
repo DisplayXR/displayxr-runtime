@@ -493,7 +493,7 @@ ul_device_get_tracked_pose(struct xrt_device *xdev,
 	struct xrt_space_relation rel = {};
 	enum m_relation_history_result res = m_relation_history_get(dev->history, at_timestamp_ns, &rel);
 	if (res == M_RELATION_HISTORY_RESULT_INVALID) {
-		out_relation->pose = (struct xrt_pose)XRT_POSE_IDENTITY;
+		out_relation->pose = XRT_POSE_IDENTITY;
 		out_relation->relation_flags = (enum xrt_space_relation_flags)0;
 		return XRT_SUCCESS;
 	}
