@@ -260,6 +260,12 @@ comp_d3d12_renderer_get_atlas_resource(struct comp_d3d12_renderer *renderer);
  * @param weave_resource Weave snapshot scratch (ID3D12Resource*, region-sized).
  * @param region_w,region_h Window region (viewport) in pixels (#464 top-left anchor).
  * @param cx,cy,cw,ch Canvas rect for the analytic-rect shader path (parity only).
+ * @param opaque_present #833/#116 opaque present (DXR_PRESENT_OPAQUE on a
+ *        transparent session): DWM completes no blends, so the composite
+ *        flattens against the weave (which the DP's flattened gate already
+ *        completed against the captured desktop) and emits α=1 — ZONES /
+ *        ALPHA_OVER collapse to a premul-over of the 2D onto the weave; LERP
+ *        completes its 2D side the same way.
  *
  * @ingroup comp_d3d12
  */
@@ -280,7 +286,8 @@ comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
                                         int32_t cy,
                                         uint32_t cw,
                                         uint32_t ch,
-                                        uint32_t composite_mode);
+                                        uint32_t composite_mode,
+                                        bool opaque_present);
 
 /*!
  * Flatten one Local2D layer into the scratch RTV (#439 Phase 3, the `twod`

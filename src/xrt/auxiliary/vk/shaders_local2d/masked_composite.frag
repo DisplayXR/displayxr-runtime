@@ -24,6 +24,7 @@ layout(push_constant) uniform Push {
     vec2 canvas_size;
     uint use_rect_mask;
     uint alpha_over;
+    uint opaque_present; // #833/#116: 1 = flatten (DWM completes no blends)
 } pc;
 void main() {
     if (pc.use_rect_mask != 0u) {
@@ -36,6 +37,25 @@ void main() {
     }
     vec4 twod = texture(twod_tex, uv);
     vec4 weave = texture(weave_tex, uv);
+    if (pc.opaque_present == 1u) {
+        // Opaque present (runtime #833 / plugin #116): DWM completes no
+        // blends, so never emit alpha < 1. The DP's flattened gate already
+        // baked the captured desktop into the weave wherever the atlas was
+        // transparent (2D bands, outside every zone), so the weave IS the
+        // background here: ZONES and ALPHA_OVER collapse to a premul-over of
+        // the 2D onto the flattened weave (the M weave-gate would discard
+        // that baked desktop); LERP keeps M but completes the 2D side the
+        // same way. Zone-edge feather becomes a no-op (both mix ends hold
+        // woven content inside the ramp) — a documented semantic of the mode.
+        vec3 over = twod.rgb + (1.0 - twod.a) * weave.rgb;
+        if (pc.alpha_over == 0u) {
+            float M = clamp(texture(mask_tex, uv).r, 0.0, 1.0);
+            frag = vec4(M * weave.rgb + (1.0 - M) * over, 1.0);
+        } else {
+            frag = vec4(over, 1.0);
+        }
+        return;
+    }
     if (pc.alpha_over == 1u) {
         // #491: the 2D layer's own (premultiplied) alpha IS the blend.
         // opaque 2D (a=1) → crisp panel; translucent (a=0.5) → glass over 3D;

@@ -21,6 +21,7 @@
 #include "xrt/xrt_display_metrics.h"
 
 #include "util/u_logging.h"
+#include "util/u_debug.h"
 #include "util/u_misc.h"
 #include "util/u_time.h"
 #include "os/os_time.h"
@@ -85,6 +86,12 @@ struct comp_settings
 /*!
  * The D3D11 native compositor structure.
  */
+// Decoupled presentation (#833): same env the target reads. On a transparent
+// session the DP's alpha-gate flattens against the captured desktop (plugin
+// #116), so the post-weave Local2D composite must flatten too instead of
+// emitting DWM-dependent alpha.
+DEBUG_GET_ONCE_BOOL_OPTION(present_opaque_comp, "DXR_PRESENT_OPAQUE", false)
+
 struct comp_d3d11_compositor
 {
 	//! Base type - must be first!
@@ -136,6 +143,11 @@ struct comp_d3d11_compositor
 
 	//! True if shared texture mode is active.
 	bool has_shared_texture;
+
+	//! Transparent session (#573): the DP composes-under-bg. With
+	//! DXR_PRESENT_OPAQUE (#833) this also flips the Local2D composite into
+	//! its flatten mode (plugin #116 flattens the gate).
+	bool transparent_background;
 
 
 	//! Active authored zone mask (#439 Phase 1, XR_DXR_local_3d_zone). Set by
@@ -2111,6 +2123,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	c->app_hwnd = nullptr;
 	c->hardware_display_3d = true;
 	c->last_3d_mode_index = 1;
+	c->transparent_background = transparent_background;
 
 	// Handle window: use provided HWND, create our own, or go offscreen (shared texture)
 	if (shared_texture_handle != nullptr) {
@@ -3771,9 +3784,14 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		composite_mode = COMP_D3D11_COMPOSITE_MODE_ALPHA_OVER;
 	}
 
+	// #833/#116 — opaque present on a transparent session: DWM completes no
+	// blends, so the composite flattens against the weave (which the DP's
+	// flattened gate already completed against the captured desktop) and
+	// emits α=1. Opaque sessions keep today's behavior even with the env set.
+	const bool opaque_present = c->transparent_background && debug_get_bool_option_present_opaque_comp();
 	xrt_result_t xret = comp_d3d11_renderer_composite_2d_masked(
 	    c->renderer, dst, twod_srv, mask_srv, c->weave_scratch_srv, region_w, region_h, (int32_t)cx_u,
-	    (int32_t)cy_u, cright - cx_u, cbottom - cy_u, composite_mode);
+	    (int32_t)cy_u, cright - cx_u, cbottom - cy_u, composite_mode, opaque_present);
 
 	// One-shot lifecycle log (NOT per-frame): proves the masked composite ran +
 	// which mask source and mode resolved. WARN so it survives the hot-path

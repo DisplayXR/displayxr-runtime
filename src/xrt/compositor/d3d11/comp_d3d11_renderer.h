@@ -308,6 +308,12 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
  * @param region_w Composite region width in pixels (window dims, #464).
  * @param region_h Composite region height in pixels.
  * @param cx,cy,cw,ch The 3D canvas sub-rect (region px) → the Phase 0 mask.
+ * @param opaque_present #833/#116 opaque present (DXR_PRESENT_OPAQUE on a
+ *        transparent session): DWM completes no blends, so the composite
+ *        flattens against the weave (which the DP's flattened gate already
+ *        completed against the captured desktop) and emits α=1 — ZONES /
+ *        ALPHA_OVER collapse to a premul-over of the 2D onto the weave; LERP
+ *        completes its 2D side the same way. Ignored on the rect path.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
  *
@@ -328,7 +334,8 @@ comp_d3d11_renderer_composite_2d_masked(struct comp_d3d11_renderer *renderer,
                                         int32_t cy,
                                         uint32_t cw,
                                         uint32_t ch,
-                                        uint32_t composite_mode);
+                                        uint32_t composite_mode,
+                                        bool opaque_present);
 
 /*!
  * Flatten one app Local2D layer image into the runtime 2D scratch (#439

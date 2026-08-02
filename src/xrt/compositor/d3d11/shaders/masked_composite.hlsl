@@ -29,6 +29,13 @@
  *                    raster, or the #803 opt-in feather ramp — and the 2D
  *                    composites on top by its own alpha)
  * which requires the weave bound as an SRV (weave_tex).
+ *
+ * OPAQUE PRESENT (`opaque_present`, runtime #833 / plugin #116): DWM completes
+ * no blends, so the composite never emits alpha < 1. The DP's flattened gate
+ * already baked the captured desktop into the weave wherever the atlas was
+ * transparent, so the weave IS the background: ZONES and ALPHA_OVER collapse
+ * to a premul-over of the 2D onto the weave; LERP keeps M but completes its
+ * 2D side the same way. α=1 everywhere; ignored on the rect path.
  */
 
 Texture2D twod_tex   : register(t0);   // the 2D layer (RGBA, premultiplied)
@@ -43,6 +50,7 @@ cbuffer CompositeParams : register(b0)
     float2 canvas_size;    // canvas sub-rect size (px)
     uint   use_rect_mask;  // 1 = Phase 0 analytic rect mask; 0 = sample mask_tex
     uint   composite_mode; // 0 = hard M-lerp, 1 = #491 premul over, 2 = zones (ADR-027)
+    uint   opaque_present; // #833/#116: 1 = flatten (DWM completes no blends)
 };
 
 struct VS_OUTPUT
@@ -105,6 +113,14 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
     // Phase 1+ general path, by composite_mode (see the header comment).
     float4 twod  = twod_tex.Sample(samp, input.uv);
     float4 weave = weave_tex.Sample(samp, input.uv);
+    if (opaque_present == 1)
+    {
+        // #833/#116 flatten (see the header comment).
+        float3 over = twod.rgb + (1.0 - twod.a) * weave.rgb;
+        if (composite_mode == 0)
+            return float4(M * weave.rgb + (1.0 - M) * over, 1.0);
+        return float4(over, 1.0);
+    }
     if (composite_mode == 1)
     {
         // #491: the 2D layer's own (premultiplied) alpha IS the blend.

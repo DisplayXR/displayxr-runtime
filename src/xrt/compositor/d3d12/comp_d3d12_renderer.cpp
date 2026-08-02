@@ -180,6 +180,7 @@ cbuffer CompositeParams : register(b0)
     float2 canvas_size;
     uint   use_rect_mask;
     uint   composite_mode; // 0 = hard M-lerp, 1 = #491 premul over, 2 = zones (ADR-027)
+    uint   opaque_present; // #833/#116: 1 = flatten (DWM completes no blends)
 };
 
 struct VS_OUTPUT
@@ -214,6 +215,26 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
 
     float4 twod  = twod_tex.Sample(samp, input.uv);
     float4 weave = weave_tex.Sample(samp, input.uv);
+    if (opaque_present == 1)
+    {
+        // Opaque present (runtime #833 / plugin #116): DWM completes no
+        // blends, so never emit alpha < 1. The DP's flattened gate already
+        // baked the captured desktop into the weave wherever the atlas was
+        // transparent (2D bands, outside every zone), so the weave IS the
+        // background here: ZONES and ALPHA_OVER collapse to a premul-over
+        // of the 2D onto the flattened weave (the M weave-gate would
+        // discard that baked desktop); LERP keeps M but completes the 2D
+        // side the same way. Zone-edge feather becomes a no-op (both mix
+        // ends hold woven content inside the ramp) — a documented semantic
+        // of the mode.
+        float3 over = twod.rgb + (1.0 - twod.a) * weave.rgb;
+        if (composite_mode == 0)
+        {
+            float M = saturate(mask_tex.Sample(samp, input.uv).r);
+            return float4(M * weave.rgb + (1.0 - M) * over, 1.0);
+        }
+        return float4(over, 1.0);
+    }
     if (composite_mode == 1)
     {
         // #491: the 2D layer's own (premultiplied) alpha IS the blend —
@@ -237,8 +258,10 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
 )";
 
 /*!
- * Composite shader constants — 8 DWORDs, passed as root constants (b0).
- * Layout matches the D3D11 CompositeParams CB (HLSL packing: two float4 rows).
+ * Composite shader constants — 9 DWORDs, passed as root constants (b0).
+ * Layout matches the D3D11 CompositeParams CB (HLSL packing: dst_dims.xy |
+ * canvas_origin.xy, canvas_size.xy | mask | mode, opaque_present — root
+ * constants fill registers sequentially, so no CPU-side padding).
  */
 struct CompositeParams
 {
@@ -247,6 +270,7 @@ struct CompositeParams
 	float canvas_size[2];
 	uint32_t use_rect_mask;
 	uint32_t composite_mode; // COMP_D3D12_COMPOSITE_MODE_*: 0 hard M-lerp, 1 #491 over, 2 zones
+	uint32_t opaque_present; // #833/#116: 1 = flatten (DWM completes no blends)
 };
 
 // #439 Phase 3 — Local2D flatten. Reuses the masked_composite fullscreen-triangle
@@ -1069,11 +1093,11 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 	comp_root_params[0].DescriptorTable.pDescriptorRanges = &comp_srv_range;
 	comp_root_params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-	// Param 1: 8 root constants (CompositeParams — 2x float2 + float2 + 2x uint)
+	// Param 1: 9 root constants (CompositeParams — 3x float2 + 3x uint)
 	comp_root_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 	comp_root_params[1].Constants.ShaderRegister = 0;
 	comp_root_params[1].Constants.RegisterSpace = 0;
-	comp_root_params[1].Constants.Num32BitValues = 8;
+	comp_root_params[1].Constants.Num32BitValues = 9;
 	comp_root_params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
 	D3D12_STATIC_SAMPLER_DESC comp_sampler = {};
@@ -1990,7 +2014,8 @@ comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
                                         int32_t cy,
                                         uint32_t cw,
                                         uint32_t ch,
-                                        uint32_t composite_mode)
+                                        uint32_t composite_mode,
+                                        bool opaque_present)
 {
 	if (renderer == nullptr || cmd_list_ptr == nullptr || dst_rtv_handle == 0 || twod_resource == nullptr ||
 	    mask_resource == nullptr || weave_resource == nullptr) {
@@ -2056,6 +2081,7 @@ comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
 	// path (use_rect_mask=1) exists for shader parity with D3D11 only.
 	params.use_rect_mask = 0;
 	params.composite_mode = composite_mode; // LERP / ALPHA_OVER (#491) / ZONES (ADR-027)
+	params.opaque_present = opaque_present ? 1 : 0; // #833/#116 flatten
 
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv = {};
 	rtv.ptr = static_cast<SIZE_T>(dst_rtv_handle);
@@ -2071,7 +2097,7 @@ comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
 	cmd_list->RSSetScissorRects(1, &scissor);
 	cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 	cmd_list->SetGraphicsRootDescriptorTable(0, renderer->composite_srv_heap->GetGPUDescriptorHandleForHeapStart());
-	cmd_list->SetGraphicsRoot32BitConstants(1, 8, &params, 0);
+	cmd_list->SetGraphicsRoot32BitConstants(1, 9, &params, 0);
 	cmd_list->DrawInstanced(3, 1, 0, 0);
 
 	return XRT_SUCCESS;

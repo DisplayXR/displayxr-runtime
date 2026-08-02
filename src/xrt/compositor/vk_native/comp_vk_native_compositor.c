@@ -30,6 +30,7 @@
 #include "vk/vk_local2d_composite.h"
 
 #include "util/u_logging.h"
+#include "util/u_debug.h"
 #include "util/u_misc.h"
 #include "util/u_time.h"
 #include "util/u_hud.h"
@@ -103,6 +104,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
+
+// Decoupled presentation (#833): same env the targets read. On a transparent
+// session the DP's alpha-gate flattens against the captured desktop (plugin
+// #116), so the post-weave Local2D composite must flatten too instead of
+// emitting DWM-dependent alpha.
+DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
 
 /*!
  * Minimal settings struct for Vulkan compositor.
@@ -5291,9 +5298,14 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 		composite_mode = VK_LOCAL2D_COMPOSITE_MODE_LERP;
 	}
 #endif
+	// #833/#116 — opaque present on a transparent session: DWM completes no
+	// blends, so the composite flattens against the weave (which the DP's
+	// flattened gate already completed against the captured desktop) and
+	// emits α=1. Opaque sessions keep today's behavior even with the env set.
+	const bool opaque_present = c->transparent_background && debug_get_bool_option_present_opaque();
 	vk_local2d_composite_draw(&c->local2d, vk, cmd, c->composite_target_fb, dst_w, dst_h,
 	                          c->local2d_scratch_view, mask_view, c->weave_scratch_view, region_w,
-	                          region_h, cx, cy, cw, ch, composite_mode);
+	                          region_h, cx, cy, cw, ch, composite_mode, opaque_present);
 
 	// One-shot lifecycle log (NOT per-frame): proves the masked composite ran +
 	// which mask source resolved. WARN so it survives the hot-path INFO filter.
