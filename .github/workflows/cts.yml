@@ -21,6 +21,13 @@ on:
       - 'src/xrt/compositor/**'
       - 'src/xrt/auxiliary/**'
       - 'src/xrt/drivers/sim_display/**'
+      # Input path (#823/#830): providers + the qwerty fallback + the loaders/
+      # builders in targets/common all feed the action system CTS exercises.
+      - 'src/xrt/drivers/sim_input/**'
+      - 'src/xrt/drivers/net_input/**'
+      - 'src/xrt/drivers/ultraleap/**'
+      - 'src/xrt/drivers/qwerty/**'
+      - 'src/xrt/targets/common/**'
       - 'src/xrt/include/**'
       - 'scripts/run_cts.ps1'
       - 'scripts/fetch_build_cts.bat'
@@ -81,12 +88,17 @@ jobs:
           }
           # Smoke = a fast, representative slice; full = the whole non-interactive
           # subset. Interactive (HMD/controller) categories are out of scope.
+          # The smoke slice includes the non-interactive [actions] tests
+          # (create/destroy sets+actions, suggest bindings, attach,
+          # StateQueryFunctionsAndHaptics, action-space creation) — the action
+          # system became a first-class regression surface with the
+          # input-provider channel (#823).
           if ($scope -eq "full") {
             $spec = "exclude:[interactive]"
             $timeout = "900"
           } else {
-            $spec = "Swapchains,SessionState,ValidateEnvironment,validApiLayer,XR_KHR_visibility_mask,XR_KHR_composition_layer_cylinder"
-            $timeout = "300"
+            $spec = "Swapchains,SessionState,ValidateEnvironment,validApiLayer,XR_KHR_visibility_mask,XR_KHR_composition_layer_cylinder,[actions]~[interactive]"
+            $timeout = "420"
           }
           "graphics=$graphics" >> $env:GITHUB_OUTPUT
           "scope=$scope"       >> $env:GITHUB_OUTPUT
@@ -172,7 +184,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: build-cts
-          key: cts-${{ runner.os }}-${{ hashFiles('scripts/fetch_build_cts.bat') }}-1.1.51
+          key: cts-${{ runner.os }}-${{ hashFiles('scripts/fetch_build_cts.bat') }}-1.1.54
 
       - name: Build CTS
         if: steps.cts-cache.outputs.cache-hit != 'true'
@@ -210,6 +222,21 @@ jobs:
         run: |
           $xml = "$env:TEMP\cts_ci.xml"
           if (-not (Test-Path $xml)) { throw "CTS produced no result XML — the run likely crashed before writing results." }
+          # Check completeness BEFORE parsing: a crashed run leaves a truncated
+          # XML, and the [xml] cast on it dies with an opaque MetadataError
+          # (masked the real story for weeks — #830). Surface the last test the
+          # console log reached instead.
+          if (-not (Select-String -Path $xml -Pattern '</testsuites>' -Quiet)) {
+            $log = "$env:TEMP\cts_ci_console.log"
+            $lastTest = "(no console log)"
+            if (Test-Path $log) {
+              $m = Select-String -Path $log -Pattern '^-{10,}$' -Context 0,1 | Select-Object -Last 1
+              if ($m -and $m.Context.PostContext) { $lastTest = $m.Context.PostContext[0].Trim() }
+              Write-Host "--- console log tail ---"
+              Get-Content $log -Tail 15 | Write-Host
+            }
+            throw "CTS crashed before writing complete results (XML truncated). Last test reached: $lastTest"
+          }
           [xml]$doc = Get-Content $xml
           $suite = $doc.testsuites.testsuite
           if (-not $suite) { $suite = $doc.testsuite }
@@ -217,9 +244,6 @@ jobs:
           $tests = [int]$suite.tests
           $skipped = [int]$suite.skipped
           Write-Host "CTS: $tests assertions, $failures failures, $skipped skipped"
-          if (-not (Select-String -Path $xml -Pattern '</testsuites>' -Quiet)) {
-            throw "CTS result XML is truncated — the run crashed mid-suite."
-          }
           if ($failures -gt 0) {
             Write-Host "::error::CTS reported $failures failing assertions"
             $doc.SelectNodes('//testcase[failure]') | ForEach-Object { Write-Host "  FAIL: $($_.name)" }
