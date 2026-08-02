@@ -240,13 +240,19 @@ jobs:
           [xml]$doc = Get-Content $xml
           $suite = $doc.testsuites.testsuite
           if (-not $suite) { $suite = $doc.testsuite }
+          # Count BOTH schema buckets: assertion failures land in failures=,
+          # but a test that dies on an exception (e.g. XrResult throw) lands in
+          # errors= — the gate only read failures for weeks, so 8/14 smoke
+          # tests were red while the job stayed green (#830).
           $failures = [int]$suite.failures
+          $errors = [int]$suite.errors
           $tests = [int]$suite.tests
           $skipped = [int]$suite.skipped
-          Write-Host "CTS: $tests assertions, $failures failures, $skipped skipped"
-          if ($failures -gt 0) {
-            Write-Host "::error::CTS reported $failures failing assertions"
-            $doc.SelectNodes('//testcase[failure]') | ForEach-Object { Write-Host "  FAIL: $($_.name)" }
+          Write-Host "CTS: $tests assertions, $failures failures, $errors errors, $skipped skipped"
+          if (($failures + $errors) -gt 0) {
+            Write-Host "::error::CTS reported $failures failing assertions + $errors errored test cases"
+            $doc.SelectNodes('//testcase[failure]') | ForEach-Object { Write-Host "  FAIL:  $($_.name)" }
+            $doc.SelectNodes('//testcase[error]')   | ForEach-Object { Write-Host "  ERROR: $($_.name)" }
             exit 1
           }
           Write-Host "CTS passed."
@@ -281,12 +287,25 @@ jobs:
             }
           }
 
+      # run_cts.ps1 writes to the pwsh process's $env:TEMP
+      # (C:\Users\runneradmin\...), which is NOT ${{ runner.temp }} (D:\a\_temp)
+      # on hosted Windows runners — the old direct upload silently found
+      # nothing every run (#830). Stage into the workspace instead.
+      - name: Stage CTS results
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force cts-results | Out-Null
+          foreach ($f in @("cts_ci.xml", "cts_ci_console.log")) {
+            $src = Join-Path $env:TEMP $f
+            if (Test-Path $src) { Copy-Item $src cts-results\ }
+          }
+          Get-ChildItem cts-results | ForEach-Object { Write-Host "staged: $($_.Name) ($($_.Length) bytes)" }
+
       - name: Upload CTS results
         if: always()
         uses: actions/upload-artifact@v6
         with:
           name: cts-${{ steps.params.outputs.scope }}-${{ steps.params.outputs.graphics }}
-          path: |
-            ${{ runner.temp }}/cts_ci.xml
-            ${{ runner.temp }}/cts_ci_console.log
+          path: cts-results/
           if-no-files-found: warn
