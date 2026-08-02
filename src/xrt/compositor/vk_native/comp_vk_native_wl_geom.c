@@ -30,6 +30,11 @@
 #define WLG_IFACE "org.displayxr.WindowGeometry1"
 #define WLG_MATCH_RULE "type='signal',interface='" WLG_IFACE "',member='WindowsChanged'"
 
+//! Highest payload schema version this consumer understands. Additive changes
+//! keep the version; anything that changes the MEANING of an existing field
+//! bumps it (and older consumers then refuse the payload rather than misread it).
+#define WLG_SCHEMA_VERSION_MAX 1
+
 // One entry per published window we care about (own-PID filter is applied at
 // query time, not parse time, so the cache mirrors the full snapshot).
 struct wlg_window
@@ -52,6 +57,7 @@ struct comp_vk_native_wl_geom
 	bool have_snapshot;      //!< at least one successfully parsed payload
 	bool warned_unavailable; //!< one-shot WARN guard (extension missing)
 	bool warned_scale;       //!< one-shot WARN guard (monitor scale != 1.0)
+	bool warned_schema;      //!< one-shot WARN guard (publisher schema too new)
 	int64_t next_retry_ns;   //!< earliest monotonic time for the next blocking GetWindows retry
 };
 
@@ -67,6 +73,29 @@ wlg_parse_snapshot(struct comp_vk_native_wl_geom *g, const char *json)
 {
 	cJSON *root = cJSON_Parse(json);
 	if (root == NULL) {
+		return;
+	}
+
+	// Schema gate. The publisher is a SHARED asset that a vendor runtime
+	// package may ship (see the packaging contract in
+	// docs/specs/runtime/wayland-window-geometry.md), so the publisher on a
+	// given box is NOT necessarily the one this runtime shipped with. Within a
+	// version the schema is additive-only, so a newer minor publisher is safe
+	// to read (unknown fields are simply not looked up); a MAJOR bump means
+	// changed semantics — e.g. physical instead of logical pixels — which would
+	// weave at a silently wrong phase. Refuse it and stay display-scoped.
+	int version = 0;
+	if (!u_json_get_int(u_json_get(root, "version"), &version)) {
+		version = 1; // pre-versioning publisher — treat as v1
+	}
+	if (version > WLG_SCHEMA_VERSION_MAX) {
+		if (!g->warned_schema) {
+			U_LOG_W("wl_geom: geometry service speaks schema v%d, this runtime understands up to v%d "
+			        "— ignoring it and weaving display-scoped. Update the runtime.",
+			        version, WLG_SCHEMA_VERSION_MAX);
+			g->warned_schema = true;
+		}
+		cJSON_Delete(root);
 		return;
 	}
 

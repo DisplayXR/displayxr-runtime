@@ -40,6 +40,35 @@ gdbus call --session --dest org.displayxr.WindowGeometry \
 Schema and coordinate-space notes are documented at the top of
 `extension.js` and in `docs/specs/runtime/wayland-window-geometry.md`.
 
+## Packaging (for distributors — including vendor runtime packages)
+
+This extension is a **shared asset, not a DisplayXR-private component**: it
+reports window rectangles and knows nothing about weaving, lenses, or any
+runtime, so a **vendor SDK runtime package may ship it** (that runtime needs
+the same geometry to serve its own non-DisplayXR apps). The full contract is in
+[`docs/specs/runtime/wayland-window-geometry.md`](../../../docs/specs/runtime/wayland-window-geometry.md)
+§4; the short version:
+
+- **Keep the identifiers.** UUID `window-geometry@displayxr.org`, bus name
+  `org.displayxr.WindowGeometry`, interface `org.displayxr.WindowGeometry1`.
+  The prefix names who defines the schema, not who ships it. Renaming forks
+  the ecosystem.
+- **Exactly one installed owner** — a D-Bus well-known name is singly owned, so
+  a second publisher binds nothing and silently strands consumers. Any package
+  shipping it declares `Provides:` + `Conflicts:` + `Replaces:` on the virtual
+  package `displayxr-window-geometry-publisher`, and consumers depend on that
+  virtual name rather than on any vendor's package.
+- **Install system-wide** to
+  `/usr/share/gnome-shell/extensions/window-geometry@displayxr.org/` (the
+  per-user path above is for manual dev installs). Enabling is still per user
+  session; seed it via a dconf default for `org.gnome.shell enabled-extensions`.
+- **Schema is additive within a version.** Add fields freely; bump `version` in
+  the payload only when the *meaning* of an existing field changes (e.g.
+  logical → physical pixels). Consumers refuse a version they don't understand
+  and fall back to display-scoped rather than weave at a wrong phase.
+- **No reverse dependency** — keep it pure GNOME Shell JS, with no import from
+  or dependency on DisplayXR or any vendor stack.
+
 ## Constraints
 
 - Coordinates are logical pixels; windowed weaving requires monitor scale 1.0
