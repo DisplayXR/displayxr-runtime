@@ -561,6 +561,16 @@ preload_runtime_core_dll(void)
 	}
 }
 
+void
+target_plugin_preload_runtime_core_dll(void)
+{
+	/* Shared with the input-provider loader: input-provider DLLs import
+	 * DisplayXRClient.dll exactly like DP plug-ins do, so the #328
+	 * cwd-independent pinning must run before either loader's first
+	 * LoadLibrary. Idempotent (one-shot inside). */
+	preload_runtime_core_dll();
+}
+
 static const struct xrt_plugin_iface *
 discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe_order)
 {
@@ -1482,6 +1492,18 @@ enumerate_dir(const char *root, struct plugin_entry *entries, int start, int max
 		if (n < 6 || strcmp(name + n - 5, ".json") != 0) {
 			continue;
 		}
+		/* Input-provider manifests share the discovery roots but belong
+		 * to the second plug-in type (ADR-034) — the input loader owns
+		 * them (target_input_plugin_loader.c). Skipping here keeps the
+		 * DP path from load-attempting a DLL that exports
+		 * xrtInputPluginNegotiate instead of xrtPluginNegotiate. */
+		{
+			static const char ip_suffix[] = "-input-provider.json";
+			const size_t ip_len = sizeof(ip_suffix) - 1;
+			if (n >= ip_len && strcmp(name + n - ip_len, ip_suffix) == 0) {
+				continue;
+			}
+		}
 
 		struct plugin_entry e;
 		memset(&e, 0, sizeof(e));
@@ -1521,10 +1543,13 @@ append_roots(char roots[][PATH_MAX], int max_roots, int *n_roots, const char *pa
  * Assemble the platform's plug-in discovery roots into @p roots (each a
  * PATH_MAX buffer), in priority order, and return the count. Factored out
  * so both discover_active_plugin() and target_plugin_enumerate() search
- * exactly the same set. See docs/specs/runtime/plugin-discovery.md §3.
+ * exactly the same set — and shared (non-static) with the input-provider
+ * loader, which scans the SAME roots for `*-input-provider.json`
+ * manifests (ADR-034 / input-provider-discovery.md §3). See
+ * docs/specs/runtime/plugin-discovery.md §3.
  */
-static int
-build_discovery_roots(char roots[][PATH_MAX], int max_roots)
+int
+target_plugin_build_discovery_roots(char roots[][PATH_MAX], int max_roots)
 {
 	int n_roots = 0;
 
@@ -1704,7 +1729,7 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 	*out_inst = NULL;
 
 	char roots[8][PATH_MAX];
-	int n_roots = build_discovery_roots(roots, (int)(sizeof(roots) / sizeof(roots[0])));
+	int n_roots = target_plugin_build_discovery_roots(roots, (int)(sizeof(roots) / sizeof(roots[0])));
 
 	if (n_roots == 0) {
 		U_LOG_I("plugin loader: no discovery roots present — no plug-ins to try.");
@@ -1781,7 +1806,7 @@ target_plugin_enumerate(struct target_plugin_desc *out, int max)
 	}
 
 	char roots[8][PATH_MAX];
-	int n_roots = build_discovery_roots(roots, (int)(sizeof(roots) / sizeof(roots[0])));
+	int n_roots = target_plugin_build_discovery_roots(roots, (int)(sizeof(roots) / sizeof(roots[0])));
 	if (n_roots == 0) {
 		return 0;
 	}

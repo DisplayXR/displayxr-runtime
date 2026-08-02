@@ -38,13 +38,21 @@ t_builder_add_qwerty_input(struct xrt_system_devices *xsysd,
 	if (qwerty_head != NULL) {
 		xsysd->xdevs[xsysd->xdev_count++] = qwerty_head;
 	}
+	// Hand-role arbitration (ADR-034): an input-provider plug-in loaded
+	// before this call may already have claimed left/right. Qwerty still
+	// registers its devices (debug value — visible in `test`, u_var, and
+	// as extra xdevs) but only claims a role the provider left empty.
 	if (left != NULL) {
 		xsysd->xdevs[xsysd->xdev_count++] = left;
-		ubrh->left = left;
+		if (ubrh->left == NULL) {
+			ubrh->left = left;
+		}
 	}
 	if (right != NULL) {
 		xsysd->xdevs[xsysd->xdev_count++] = right;
-		ubrh->right = right;
+		if (ubrh->right == NULL) {
+			ubrh->right = right;
+		}
 	}
 
 	if (out_qwerty_hmd != NULL) {
