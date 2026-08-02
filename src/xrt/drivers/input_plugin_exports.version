@@ -1,0 +1,15 @@
+/*
+ * Single-symbol export filter for input-provider plug-in dylibs on
+ * Linux/BSD. Mirrors `plugin_exports.version` (the display-processor
+ * filter) for the second plug-in type (ADR-034): every input-provider
+ * dylib exports exactly one symbol, `xrtInputPluginNegotiate`, resolved
+ * by the runtime's discovery loader via dlsym; all other symbols
+ * (including aux helpers pulled in from static archives) stay local so
+ * they can never interpose the runtime's copies (#496).
+ */
+{
+	global:
+		xrtInputPluginNegotiate;
+	local:
+		*;
+};

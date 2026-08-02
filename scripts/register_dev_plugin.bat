@@ -14,10 +14,13 @@ REM
 REM Run from an ELEVATED prompt (writes HKLM).
 REM
 REM Usage:
-REM   scripts\register_dev_plugin.bat                 :: register dev sim-display (fallback, no hardware)
-REM   scripts\register_dev_plugin.bat leia <dll>      :: register a dev-built Leia plug-in (ProbeOrder 50)
-REM   scripts\register_dev_plugin.bat unregister-sim  :: remove the dev sim-display entry
-REM   scripts\register_dev_plugin.bat list            :: show registered DPs (displayxr-cli dp list)
+REM   scripts\register_dev_plugin.bat                  :: register dev sim-display (fallback, no hardware)
+REM   scripts\register_dev_plugin.bat leia <dll>       :: register a dev-built Leia plug-in (ProbeOrder 50)
+REM   scripts\register_dev_plugin.bat unregister-sim   :: remove the dev sim-display entry
+REM   scripts\register_dev_plugin.bat input [dll]      :: register an INPUT provider (ADR-034); default =
+REM                                                       dev sim-input (ProbeOrder 200, no hardware)
+REM   scripts\register_dev_plugin.bat unregister-input :: remove the dev sim-input entry
+REM   scripts\register_dev_plugin.bat list             :: show registered DPs + input providers
 REM ============================================================
 
 set "REPO=%~dp0.."
@@ -36,6 +39,8 @@ if %ERRORLEVEL% NEQ 0 (
 if /I "%MODE%"=="list" goto :list
 if /I "%MODE%"=="unregister-sim" goto :unregister_sim
 if /I "%MODE%"=="leia" goto :leia
+if /I "%MODE%"=="input" goto :input
+if /I "%MODE%"=="unregister-input" goto :unregister_input
 goto :sim
 
 :sim
@@ -77,13 +82,46 @@ reg delete "HKLM\Software\DisplayXR\DisplayProcessors\sim-display" /f >nul 2>&1
 echo Removed sim-display dev registration.
 goto :list
 
+:input
+REM Register an input-provider plug-in (ADR-034 / #823). Default is the
+REM freshly-built sim-input; pass a DLL path to register a vendor provider
+REM (uses the DLL basename minus extension as the id, ProbeOrder 50).
+set "DLL=%~2"
+if "%DLL%"=="" (
+    set "DLL=%REPO%\_package\bin\plugins\DisplayXR-SimInput.dll"
+    set "IPKEY=HKLM\Software\DisplayXR\InputProviders\sim-input"
+    set "IPNAME=DisplayXR Sim Input"
+    set "IPORDER=200"
+) else (
+    for %%F in ("%DLL%") do set "IPID=%%~nF"
+    call set "IPKEY=HKLM\Software\DisplayXR\InputProviders\%%IPID%%"
+    set "IPNAME=Input Provider (dev)"
+    set "IPORDER=50"
+)
+if not exist "%DLL%" (
+    echo ERROR: %DLL% not found. Build first: scripts\build_windows.bat build
+    exit /b 1
+)
+reg add "%IPKEY%" /v Binary      /t REG_SZ    /d "%DLL%"      /f >nul || goto :regfail
+reg add "%IPKEY%" /v ProbeOrder  /t REG_DWORD /d %IPORDER%    /f >nul || goto :regfail
+reg add "%IPKEY%" /v DisplayName /t REG_SZ    /d "%IPNAME%"   /f >nul || goto :regfail
+echo Registered input provider (ProbeOrder %IPORDER%):
+echo   %DLL%
+goto :list
+
+:unregister_input
+reg delete "HKLM\Software\DisplayXR\InputProviders\sim-input" /f >nul 2>&1
+echo Removed sim-input dev registration.
+goto :list
+
 :list
 echo.
 set "CLI=%REPO%\_package\bin\displayxr-cli.exe"
 if exist "%CLI%" (
     "%CLI%" dp list
+    "%CLI%" input list
 ) else (
-    echo (displayxr-cli not built yet; skipping dp list)
+    echo (displayxr-cli not built yet; skipping dp/input list)
 )
 exit /b 0
 

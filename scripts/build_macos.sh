@@ -181,6 +181,30 @@ else
   echo "Warning: DisplayXR-SimDisplay.dylib not found in build tree — runtime will have no display processor!"
 fi
 
+# Input-provider plug-in (ADR-034 / #823): the simulated motion
+# controllers. Same discovery dir; the `-input-provider.json` suffix
+# routes the manifest to the input loader instead of the DP loader.
+SIMINPUT_PLUGIN=$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimInput.dylib" -type f | head -1)
+if [ -n "$SIMINPUT_PLUGIN" ] && [ -f "$SIMINPUT_PLUGIN" ]; then
+  cp "$SIMINPUT_PLUGIN" "$PKG_DIR/lib/displayxr/plugins/"
+  cat > "$PKG_DIR/lib/displayxr/plugins/200-sim-input-input-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "sim-input",
+        "display_name": "DisplayXR Sim Input",
+        "vendor":       "DisplayXR",
+        "version":      "dev",
+        "binary_path":  "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimInput.dylib",
+        "probe_order":  200
+    }
+}
+EOF
+  install_name_tool -add_rpath @loader_path/../.. "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimInput.dylib" 2>/dev/null || true
+else
+  echo "Note: DisplayXR-SimInput.dylib not found — no input provider in dev tree (qwerty keeps the hand roles)."
+fi
+
 # Copy test app binaries
 # Stage every built app binary (executables land directly in test_apps/build/bin).
 for _b in "$TA_BIN"/*; do

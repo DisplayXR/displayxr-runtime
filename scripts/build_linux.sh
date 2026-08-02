@@ -155,6 +155,29 @@ cat > "$PLUGIN_DIR/200-sim-display.json" <<EOF
 }
 EOF
 
+# Input-provider plug-in (ADR-034 / #823): the simulated motion
+# controllers. Same search dir; the `-input-provider.json` suffix routes
+# the manifest to the input loader instead of the DP loader.
+SIMINPUT_PLUGIN="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimInput.so" -type f | head -1)"
+if [ -n "$SIMINPUT_PLUGIN" ]; then
+  cp "$SIMINPUT_PLUGIN" "$PLUGIN_DIR/"
+  cat > "$PLUGIN_DIR/200-sim-input-input-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "sim-input",
+        "display_name": "DisplayXR Sim Input",
+        "vendor":       "DisplayXR",
+        "version":      "dev",
+        "binary_path":  "$PLUGIN_DIR/DisplayXR-SimInput.so",
+        "probe_order":  200
+    }
+}
+EOF
+else
+  echo "Note: DisplayXR-SimInput.so not found — no input provider staged (qwerty keeps the hand roles)."
+fi
+
 export XRT_PLUGIN_SEARCH_PATH="$PLUGIN_DIR"
 
 echo ""
