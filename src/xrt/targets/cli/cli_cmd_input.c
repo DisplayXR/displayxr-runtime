@@ -16,12 +16,19 @@
  */
 
 #include "cli_common.h"
+#include "cli_query.h"
+
+#include "xrt/xrt_device.h"
+#include "xrt/xrt_system.h"
+
+#include "os/os_time.h"
 
 #include "target_input_plugin_loader.h"
 
 #include <cjson/cJSON.h>
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define MAX_PROVIDERS 16
@@ -101,11 +108,86 @@ cmd_list(int argc, const char **argv)
 	return 0;
 }
 
+/*!
+ * `input haptic-test [seconds]` — headless haptics driver for the
+ * net_input round-trip (#823 Phase 2). Builds the runtime system
+ * in-process (which hosts the active input provider, e.g. the net_input
+ * hub), then fires a vibration on the left/right role devices twice a
+ * second for the window. Pair with
+ * `scripts/net_input_feeder.py --assert-haptic`: the feeder streams
+ * poses in and must see the HAPTIC events come back. Exits 0 iff both
+ * hand roles existed to fire at.
+ */
+static int
+cmd_haptic_test(int argc, const char **argv)
+{
+	int seconds = 5;
+	if (argc >= 4) {
+		int v = atoi(argv[3]);
+		if (v > 0 && v <= 300) {
+			seconds = v;
+		}
+	}
+
+	struct cli_query_result r;
+	struct cli_query_handles h;
+	cli_query_fill(&r, &h, NULL);
+	if (!r.system_ok) {
+		P("FAIL: system creation failed — cannot run haptic test.\n");
+		cli_query_teardown(&h);
+		return 1;
+	}
+
+	struct xrt_system_roles roles = XRT_SYSTEM_ROLES_INIT;
+	xrt_system_devices_get_roles(h.xsysd, &roles);
+	struct xrt_device *left =
+	    (roles.left >= 0 && (uint32_t)roles.left < h.xsysd->xdev_count) ? h.xsysd->xdevs[roles.left] : NULL;
+	struct xrt_device *right =
+	    (roles.right >= 0 && (uint32_t)roles.right < h.xsysd->xdev_count) ? h.xsysd->xdevs[roles.right] : NULL;
+	if (left == NULL || right == NULL) {
+		P("FAIL: no left/right hand-role devices (left=%p right=%p).\n", (void *)left, (void *)right);
+		cli_query_teardown(&h);
+		return 1;
+	}
+
+	P("Firing haptics on '%s' + '%s' for %d s (2 Hz)...\n", left->str, right->str, seconds);
+
+	struct xrt_output_value value = {0};
+	uint32_t tracked_samples = 0;
+	for (int i = 0; i < seconds * 2; i++) {
+		value.vibration.amplitude = 0.25f + 0.75f * (float)(i % 4) / 3.0f;
+		value.vibration.frequency = 160.0f;
+		value.vibration.duration_ns = 100 * 1000 * 1000;
+		xrt_device_set_output(left, XRT_OUTPUT_NAME_SIMPLE_VIBRATION, &value);
+		xrt_device_set_output(right, XRT_OUTPUT_NAME_SIMPLE_VIBRATION, &value);
+
+		// Exercise the pose path too: predict the left grip slightly
+		// into the future, exactly like a frame loop would.
+		xrt_device_update_inputs(left);
+		struct xrt_space_relation rel = {0};
+		int64_t at = (int64_t)os_monotonic_get_ns() + 10 * 1000 * 1000;
+		if (xrt_device_get_tracked_pose(left, XRT_INPUT_SIMPLE_GRIP_POSE, at, &rel) == XRT_SUCCESS &&
+		    (rel.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0) {
+			tracked_samples++;
+			P("left grip @+10ms: (%.3f, %.3f, %.3f)\n", (double)rel.pose.position.x,
+			  (double)rel.pose.position.y, (double)rel.pose.position.z);
+		}
+
+		os_nanosleep(500 * 1000 * 1000);
+	}
+
+	P("Done — fired %d haptic event(s) per hand; %u tracked pose sample(s).\n", seconds * 2, tracked_samples);
+	cli_query_teardown(&h);
+	return 0;
+}
+
 static int
 print_usage(void)
 {
-	P("Usage: displayxr-cli input <list>\n");
-	P("  list [--json]   Enumerate registered input providers + predicted active one.\n");
+	P("Usage: displayxr-cli input <list|haptic-test>\n");
+	P("  list [--json]          Enumerate registered input providers + predicted active one.\n");
+	P("  haptic-test [seconds]  Headless: fire vibrations on the hand-role devices (default 5 s).\n");
+	P("                         Pair with scripts/net_input_feeder.py --assert-haptic.\n");
 	return 1;
 }
 
@@ -117,6 +199,9 @@ cli_cmd_input(int argc, const char **argv)
 	}
 	if (strcmp(argv[2], "list") == 0) {
 		return cmd_list(argc, argv);
+	}
+	if (strcmp(argv[2], "haptic-test") == 0) {
+		return cmd_haptic_test(argc, argv);
 	}
 	P("error: unknown 'input' subcommand '%s'.\n\n", argv[2]);
 	return print_usage();

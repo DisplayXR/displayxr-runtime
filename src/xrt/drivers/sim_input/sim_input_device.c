@@ -163,7 +163,12 @@ sim_input_get_tracked_pose(struct xrt_device *xdev,
 	case XRT_INPUT_SIMPLE_GRIP_POSE:
 	case XRT_INPUT_SIMPLE_AIM_POSE: break;
 	default:
-		U_LOG_XDEV_UNSUPPORTED_INPUT(&sd->base, u_log_get_global_level(), name);
+		// Plain message, not U_LOG_XDEV_UNSUPPORTED_INPUT: the u_pp
+		// helpers it uses aren't on the runtime DLL's aux export
+		// surface, and pulling them statically drags u_logging.c into
+		// the plug-in link where it collides with the exported
+		// logging symbols (LNK2005). Same style as sim_display.
+		U_LOG_E("sim_input: unsupported input name: 0x%08x", name);
 		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
 

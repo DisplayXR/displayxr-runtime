@@ -389,7 +389,76 @@ else()
 		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
 		)
 endif()
-endif() # XRT_FEATURE_OPENXR AND NOT ANDROID — DisplayXR-SimInput plug-in block
+####
+# DisplayXR-NetInput input-provider plug-in DLL (ADR-034 / #823 Phase 2).
+#
+# Loopback-TCP-fed motion controllers — the integration seam for external
+# tracking processes (wire protocol: net_input/net_input_proto.h; feeder:
+# scripts/net_input_feeder.py). Same build model as sim-input above.
+# Opt-in: never registered by default.
+add_library(drv_net_input_plugin SHARED
+	net_input/net_input_hub.c
+	net_input/net_input_interface.h
+	net_input/net_input_plugin.c
+	net_input/net_input_proto.h
+	)
+if(XRT_HAVE_LINUX)
+	target_link_libraries(drv_net_input_plugin PRIVATE
+		xrt-interfaces aux_util aux_os aux_math drv_includes)
+else()
+	target_compile_definitions(drv_net_input_plugin PRIVATE XRT_USING_RUNTIME_DLL)
+	target_link_libraries(
+		drv_net_input_plugin
+		PRIVATE
+			$<TARGET_LINKER_FILE:${RUNTIME_TARGET}>
+			xrt-interfaces
+			aux_util
+			aux_os
+			aux_math
+			drv_includes
+		)
+	add_dependencies(drv_net_input_plugin ${RUNTIME_TARGET})
+endif()
+if(WIN32)
+	target_link_libraries(drv_net_input_plugin PRIVATE ws2_32)
+endif()
+target_include_directories(drv_net_input_plugin PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR}/net_input
+	${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
+	)
+
+# LINKER_LANGUAGE CXX: the sources are C but m_relation_history (aux_math)
+# is C++, so the static-link paths need the C++ runtime at link time.
+set_target_properties(drv_net_input_plugin PROPERTIES
+	OUTPUT_NAME "DisplayXR-NetInput"
+	PREFIX ""
+	LINKER_LANGUAGE CXX
+	C_VISIBILITY_PRESET hidden
+	CXX_VISIBILITY_PRESET hidden
+	VISIBILITY_INLINES_HIDDEN ON
+	)
+
+if(APPLE)
+	target_link_options(drv_net_input_plugin PRIVATE
+		"LINKER:-exported_symbol,_xrtInputPluginNegotiate")
+elseif(NOT WIN32)
+	target_link_options(drv_net_input_plugin PRIVATE
+		"LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/input_plugin_exports.version")
+endif()
+
+if(WIN32)
+	install(
+		TARGETS drv_net_input_plugin
+		RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		)
+else()
+	install(
+		TARGETS drv_net_input_plugin
+		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
+		)
+endif()
+endif() # XRT_FEATURE_OPENXR AND NOT ANDROID — input-provider plug-in blocks
 
 set(ENABLED_DRIVERS ${ENABLED_HEADSET_DRIVERS} ${ENABLED_DRIVERS})
 if(ENABLED_DRIVERS)

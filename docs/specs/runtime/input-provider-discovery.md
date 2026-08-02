@@ -134,7 +134,36 @@ In `target_builder_sim_display.c`:
 | Provider | Status | Purpose |
 |---|---|---|
 | `sim_input` | **Shipped** (`src/xrt/drivers/sim_input/`, plug-in DLL `DisplayXR-SimInput`) | Deterministic synthetic motion controllers (circular motion, scripted button presses; `khr/simple_controller`) — hardware-free CI gate, adapted from Monado's `simulated_controller.c`. ProbeOrder 200. Dev builds stage it automatically (`build_macos.sh` / `build_linux.sh`); Windows registers via `register_dev_plugin.bat input`. |
-| `net_input` | Planned (Phase 2 of #823) | Loopback-TCP-fed devices — a versioned, documented wire protocol (derived from Monado's `remote` driver) so an external tracking process can feed timestamped poses + button state and receive haptic events. The wire protocol will be specified in this document when implemented. |
+| `net_input` | **Shipped** (`src/xrt/drivers/net_input/`, plug-in DLL `DisplayXR-NetInput`) | Loopback-TCP-fed devices — an external tracking process feeds timestamped poses + button state and receives haptic events back (wire protocol below). Opt-in: never registered by default. |
+
+### 5.1 net_input wire protocol (v1)
+
+Normative definition: `src/xrt/drivers/net_input/net_input_proto.h`
+(struct layouts are static-asserted); executable reference:
+`scripts/net_input_feeder.py`. Summary:
+
+- **Transport:** TCP on `127.0.0.1` ONLY (the provider binds loopback,
+  never a routable interface), default port **9427**, one feeder at a
+  time. All fields little-endian.
+- **Handshake:** each side sends `{u32 magic = "DXRI" (0x49525844),
+  u32 version = 1}` immediately after connect and validates the peer's;
+  mismatch → close.
+- **STATE** (feeder → provider, 72 bytes): `type=1`, hand (0=L/1=R),
+  active, button mask (bit0 select, bit1 menu), battery %, feeder
+  monotonic `timestamp_ns` (0 = stamp on receipt), position[3],
+  orientation quat[4] (x,y,z,w), linear + angular velocity[3].
+- **HAPTIC** (provider → feeder, 24 bytes): `type=2`, hand, amplitude,
+  frequency (0 = unspecified), duration_ns — emitted whenever the
+  runtime applies haptic feedback to the device.
+- **Clock mapping:** non-zero feeder timestamps are translated into the
+  provider's monotonic domain with a latency-floor offset estimate
+  (running minimum with slow drift decay) and pushed into
+  `m_relation_history`; `get_tracked_pose(at_time_ns)` then
+  interpolates/predicts at the requested timestamp.
+- **Headless round-trip test:** `displayxr-cli input haptic-test
+  [seconds]` fires vibrations on the hand-role devices while
+  `scripts/net_input_feeder.py --assert-haptic` streams poses in and
+  asserts the haptic events arrive back.
 
 ## 6. Diagnostics
 

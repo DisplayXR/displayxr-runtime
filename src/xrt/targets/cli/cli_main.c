@@ -32,8 +32,8 @@ cli_print_help(int argc, const char **argv)
 	P("                      its display info. Exits 0 on success, non-zero on failure.\n");
 	P("  dp <...>          - List display processors / set the PreferredPlugin override.\n");
 	P("                      'dp list [--json]', 'dp use <id>', 'dp reset'.\n");
-	P("  input <...>       - List input providers (motion controllers, ADR-034).\n");
-	P("                      'input list [--json]'.\n");
+	P("  input <...>       - Input providers (motion controllers, ADR-034).\n");
+	P("                      'input list [--json]', 'input haptic-test [seconds]'.\n");
 	P("  runtime <...>     - Show / set DisplayXR as the active OpenXR runtime.\n");
 	P("                      'runtime status', 'runtime activate'.\n");
 	P("  displays [--json] - Enumerate connected displays via EDID (vendor-neutral).\n");
