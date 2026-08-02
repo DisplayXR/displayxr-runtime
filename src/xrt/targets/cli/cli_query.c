@@ -29,6 +29,8 @@
 #include "util/u_git_tag.h"
 
 #include "target_plugin_loader.h"
+#include "target_input_plugin_loader.h"
+#include "target_builder_input_provider.h"
 
 #include <cjson/cJSON.h>
 
@@ -245,6 +247,77 @@ probe_dp_selection(struct cli_query_result *r, const struct xrt_plugin_iface *ac
 	}
 }
 
+/*!
+ * ADR-034 / #823 — input-provider checks. ABSENCE NEVER FAILS: with no
+ * provider registered, or the ForceQwerty override set, the checks are
+ * skipped with an informational note (qwerty keeping the hand roles is
+ * the normal configuration). Only a registered, non-overridden provider
+ * that failed to produce provider-claimed left+right motion-controller
+ * role devices with a valid interaction profile flips the verdict —
+ * applied at the end of cli_query_fill so display failures keep their
+ * more fundamental result codes.
+ */
+static void
+probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
+{
+	struct target_input_plugin_desc descs[16];
+	r->input_provider_count = target_input_plugin_enumerate(descs, 16);
+	r->input_force_qwerty = target_input_plugin_get_force_qwerty();
+
+	if (r->input_provider_count == 0) {
+		snprintf(r->input_note, sizeof(r->input_note),
+		         "not evaluated: no input provider registered (OK — qwerty keeps the hand roles)");
+		return;
+	}
+	if (r->input_force_qwerty) {
+		snprintf(r->input_note, sizeof(r->input_note),
+		         "not evaluated: ForceQwerty override set (OK — qwerty keeps the hand roles)");
+		return;
+	}
+	r->input_evaluated = true;
+
+	const struct xrt_input_plugin_iface *iface = target_input_plugin_get_active();
+	r->input_provider_active = iface != NULL;
+	if (iface != NULL) {
+		snprintf(r->input_provider_id, sizeof(r->input_provider_id), "%s", iface->id ? iface->id : "");
+	}
+
+	bool claimed_left = false;
+	bool claimed_right = false;
+	t_builder_input_provider_get_claims(&claimed_left, &claimed_right);
+
+	struct xrt_system_roles roles = XRT_SYSTEM_ROLES_INIT;
+	xrt_system_devices_get_roles(h->xsysd, &roles);
+
+	if (claimed_left && roles.left >= 0 && (uint32_t)roles.left < h->xsysd->xdev_count) {
+		struct xrt_device *xdev = h->xsysd->xdevs[roles.left];
+		bool type_ok = xdev->device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER ||
+		               xdev->device_type == XRT_DEVICE_TYPE_ANY_HAND_CONTROLLER;
+		r->input_left_ok = type_ok && xdev->name != 0;
+		snprintf(r->input_left_str, sizeof(r->input_left_str), "%s", xdev->str);
+	}
+	if (claimed_right && roles.right >= 0 && (uint32_t)roles.right < h->xsysd->xdev_count) {
+		struct xrt_device *xdev = h->xsysd->xdevs[roles.right];
+		bool type_ok = xdev->device_type == XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER ||
+		               xdev->device_type == XRT_DEVICE_TYPE_ANY_HAND_CONTROLLER;
+		r->input_right_ok = type_ok && xdev->name != 0;
+		snprintf(r->input_right_str, sizeof(r->input_right_str), "%s", xdev->str);
+	}
+
+	if (!r->input_provider_active) {
+		snprintf(r->input_note, sizeof(r->input_note),
+		         "FAIL: %d provider(s) registered but none claimed the system", r->input_provider_count);
+	} else if (!r->input_left_ok || !r->input_right_ok) {
+		snprintf(r->input_note, sizeof(r->input_note),
+		         "FAIL: provider '%s' active but roles incomplete (left=%s right=%s)",
+		         r->input_provider_id, r->input_left_ok ? "ok" : "missing",
+		         r->input_right_ok ? "ok" : "missing");
+	} else {
+		snprintf(r->input_note, sizeof(r->input_note), "provider '%s': left='%s' right='%s'",
+		         r->input_provider_id, r->input_left_str, r->input_right_str);
+	}
+}
+
 void
 cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const struct xrt_instance_info *ii)
 {
@@ -271,6 +344,10 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 		return;
 	}
 	r->system_ok = true;
+
+	// ADR-034 / #823 — input-provider checks (fields only; the verdict
+	// is applied at the end so display failures keep their codes).
+	probe_input_providers(r, h);
 
 	// The head role is the display-processor-backed device the active
 	// plug-in created through the builder. No head = no display.
@@ -346,6 +423,14 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 #else
 	snprintf(r->zone_probe_note, sizeof(r->zone_probe_note), "not probed: zone-caps probe is Windows-only (OK)");
 #endif
+
+	// ADR-034 / #823 — a registered, non-overridden input provider must
+	// have produced left+right motion-controller role devices. Applied
+	// last so display failures keep their more fundamental codes.
+	if (r->result_code == CLI_SELFTEST_PASS && r->input_evaluated &&
+	    !(r->input_provider_active && r->input_left_ok && r->input_right_ok)) {
+		r->result_code = CLI_SELFTEST_BAD_INPUT;
+	}
 }
 
 void
@@ -506,6 +591,16 @@ cli_query_print_info_text(const struct cli_query_result *r)
 		}
 	}
 
+	P(" :: Input providers (ADR-034)\n");
+	PT("registered:   %d%s\n", r->input_provider_count, r->input_force_qwerty ? "  (ForceQwerty override SET)" : "");
+	if (r->input_evaluated) {
+		PT("active:       %s\n", r->input_provider_active ? r->input_provider_id : "<none claimed>");
+		PT("left:         %s\n", r->input_left_ok ? r->input_left_str : "<missing>");
+		PT("right:        %s\n", r->input_right_ok ? r->input_right_str : "<missing>");
+	} else {
+		PT("%s\n", r->input_note[0] != '\0' ? r->input_note : "not evaluated");
+	}
+
 	P(" :: Local zone caps (#224/ADR-027, headless D3D11 WARP probe)\n");
 	if (r->zone_caps_probed) {
 		const struct xrt_dp_local_zone_caps *z = &r->zone_caps;
@@ -614,6 +709,23 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		cJSON_AddStringToObject(ds, "service_confidence", r->dp_sel_service_conf);
 		cJSON_AddNumberToObject(ds, "monitor_count", (double)r->dp_sel_monitor_count);
 		cJSON_AddNumberToObject(ds, "claim_count", (double)r->dp_sel_claim_count);
+	}
+
+	// ADR-034 / #823 input-provider checks.
+	{
+		cJSON *ip = cJSON_AddObjectToObject(root, "input_providers");
+		cJSON_AddNumberToObject(ip, "registered", (double)r->input_provider_count);
+		cJSON_AddBoolToObject(ip, "force_qwerty", r->input_force_qwerty);
+		cJSON_AddBoolToObject(ip, "evaluated", r->input_evaluated);
+		cJSON_AddStringToObject(ip, "note", r->input_note[0] != '\0' ? r->input_note : "not evaluated");
+		if (r->input_evaluated) {
+			cJSON_AddBoolToObject(ip, "active", r->input_provider_active);
+			cJSON_AddStringToObject(ip, "active_id", r->input_provider_id);
+			cJSON_AddBoolToObject(ip, "left_ok", r->input_left_ok);
+			cJSON_AddStringToObject(ip, "left", r->input_left_str);
+			cJSON_AddBoolToObject(ip, "right_ok", r->input_right_ok);
+			cJSON_AddStringToObject(ip, "right", r->input_right_str);
+		}
 	}
 
 	// #224 / ADR-027 P4 zone-caps probe.
@@ -732,6 +844,15 @@ build_checks(const struct cli_query_result *r, struct check *out)
 	snprintf(c->detail, sizeof(c->detail), "%s",
 	         r->zone_probe_note[0] != '\0' ? r->zone_probe_note : "not evaluated");
 
+	// ADR-034 / #823 — input-provider check. ABSENCE NEVER FAILS: ok
+	// stays true with no provider registered or ForceQwerty set; a
+	// registered provider must yield left+right role devices.
+	c = &out[n++];
+	c->name = "input_providers";
+	c->ok = !r->input_evaluated || (r->input_provider_active && r->input_left_ok && r->input_right_ok);
+	snprintf(c->detail, sizeof(c->detail), "%s",
+	         r->input_note[0] != '\0' ? r->input_note : "not evaluated");
+
 	return n;
 }
 
@@ -740,7 +861,7 @@ cli_query_print_selftest_text(const struct cli_query_result *r)
 {
 	P(" :: DisplayXR CLI self-test (headless, no compositor)\n");
 
-	struct check checks[8];
+	struct check checks[10];
 	int n = build_checks(r, checks);
 	for (int i = 0; i < n; i++) {
 		P("%s: %s — %s\n", checks[i].ok ? "PASS" : "FAIL", checks[i].name, checks[i].detail);
@@ -758,7 +879,7 @@ cli_query_selftest_to_cjson(const struct cli_query_result *r)
 {
 	cJSON *root = cJSON_CreateObject();
 
-	struct check checks[8];
+	struct check checks[10];
 	int n = build_checks(r, checks);
 	cJSON *arr = cJSON_AddArrayToObject(root, "checks");
 	for (int i = 0; i < n; i++) {

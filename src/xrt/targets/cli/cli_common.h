@@ -27,6 +27,9 @@ int
 cli_cmd_dp(int argc, const char **argv);
 
 int
+cli_cmd_input(int argc, const char **argv);
+
+int
 cli_cmd_runtime(int argc, const char **argv);
 
 int
