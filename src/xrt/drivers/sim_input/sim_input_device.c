@@ -59,7 +59,7 @@
 #define SIM_INPUT_GRIP 2
 #define SIM_INPUT_AIM 3
 
-#define SIM_INPUT_CIRCLE_RADIUS_M 0.08f
+#define SIM_INPUT_CIRCLE_RADIUS_M 0.04f
 #define SIM_INPUT_CIRCLE_PERIOD_S 4.0
 
 struct sim_input_device
@@ -285,6 +285,13 @@ sim_input_create_controller(enum xrt_device_type type)
 	sd->base.name = XRT_DEVICE_SIMPLE_CONTROLLER;
 	sd->base.device_type = type;
 
+	// 6DOF-tracked, so the origin type must NOT stay TRACKING_TYPE_NONE:
+	// u_builder_setup_tracking_origins injects per-hand "arm model"
+	// offsets (±0.2, 1.3, −0.5) into NONE-typed origins, silently
+	// shifting every reported pose. Same rule as qwerty.
+	sd->base.tracking_origin->type = XRT_TRACKING_TYPE_OTHER;
+	snprintf(sd->base.tracking_origin->name, XRT_TRACKING_NAME_LEN, "%s", "Sim Input Tracker");
+
 	snprintf(sd->base.str, sizeof(sd->base.str), "Simulated %s Motion Controller", is_left ? "Left" : "Right");
 	snprintf(sd->base.serial, sizeof(sd->base.serial), "SIM-INPUT-%s", is_left ? "L" : "R");
 
@@ -296,11 +303,14 @@ sim_input_create_controller(enum xrt_device_type type)
 		sd->base.outputs[i].name = sim_input_outputs_array[i];
 	}
 
-	// Circle centers mirror qwerty's initial controller placement:
-	// ±0.2 m lateral, chest height in front of the display.
+	// Circle centers land in the tabletop-scale scene a 3D display
+	// actually shows: LOCAL space sits at stage height 1.6 m
+	// (T_stage_local), and test apps put their cube at the local origin
+	// — so stage-space y ≈ 1.65 maps to just above the cube. Chest-height
+	// VR placement (y 1.3) would render below the visible frustum.
 	sd->center = (struct xrt_pose){
 	    .orientation = {0.0f, 0.0f, 0.0f, 1.0f},
-	    .position = {is_left ? -0.2f : 0.2f, 1.3f, -0.5f},
+	    .position = {is_left ? -0.10f : 0.10f, 1.65f, -0.05f},
 	};
 	// Half a revolution apart, so the hands interleave visibly (and the
 	// button scripts alternate).

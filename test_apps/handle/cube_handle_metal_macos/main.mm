@@ -171,6 +171,220 @@ static void mat4_view_from_xr_pose(float m[16], const XrPosef &pose)
     m[14] = -(r20*px + r21*py + r22*pz);
 }
 
+// Model matrix (R | t) from an XrPosef — the forward transform, unlike
+// mat4_view_from_xr_pose's inverse. Used for controller markers (#823).
+static void mat4_model_from_xr_pose(float m[16], const XrPosef &pose)
+{
+    float x = pose.orientation.x, y = pose.orientation.y;
+    float z = pose.orientation.z, w = pose.orientation.w;
+
+    mat4_identity(m);
+    m[0] = 1 - 2*(y*y + z*z); m[1] = 2*(x*y + w*z);     m[2]  = 2*(x*z - w*y);
+    m[4] = 2*(x*y - w*z);     m[5] = 1 - 2*(x*x + z*z); m[6]  = 2*(y*z + w*x);
+    m[8] = 2*(x*z + w*y);     m[9] = 2*(y*z - w*x);     m[10] = 1 - 2*(x*x + y*y);
+    m[12] = pose.position.x;
+    m[13] = pose.position.y;
+    m[14] = pose.position.z;
+}
+
+// ============================================================================
+// Actions mode (#823 Phase 3) — optional, `--actions` / DXR_ACTIONS=1.
+//
+// First in-repo consumer of the OpenXR action system: an action set with a
+// pose + select + haptic action on khr/simple_controller, synced every
+// frame; tracked controllers render as small marker cubes (bigger while
+// select is pressed), and a select press fires xrApplyHapticFeedback.
+// Drive the controllers with the sim_input provider (deterministic
+// circles) or net_input + scripts/net_input_feeder.py.
+// ============================================================================
+
+static bool g_actionsMode = false;
+
+struct ActionsState {
+    XrActionSet actionSet = XR_NULL_HANDLE;
+    XrAction poseAction = XR_NULL_HANDLE;
+    XrAction selectAction = XR_NULL_HANDLE;
+    XrAction hapticAction = XR_NULL_HANDLE;
+    XrPath handPaths[2] = {XR_NULL_PATH, XR_NULL_PATH}; // 0 = left, 1 = right
+    XrSpace gripSpaces[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
+
+    // Per-frame results consumed by the renderer.
+    bool poseValid[2] = {false, false};
+    XrPosef pose[2];
+    bool selectPressed[2] = {false, false};
+    bool prevSelectPressed[2] = {false, false};
+    uint64_t syncCount = 0;
+    uint64_t hapticsFired = 0;
+};
+static ActionsState g_actions;
+
+static bool SetupActions(XrInstance instance, XrSession session)
+{
+    XrActionSetCreateInfo setInfo = {XR_TYPE_ACTION_SET_CREATE_INFO};
+    strncpy(setInfo.actionSetName, "cube_actions", sizeof(setInfo.actionSetName) - 1);
+    strncpy(setInfo.localizedActionSetName, "Cube Actions", sizeof(setInfo.localizedActionSetName) - 1);
+    if (XR_FAILED(xrCreateActionSet(instance, &setInfo, &g_actions.actionSet))) {
+        LOG_ERROR("actions: xrCreateActionSet failed");
+        return false;
+    }
+
+    xrStringToPath(instance, "/user/hand/left", &g_actions.handPaths[0]);
+    xrStringToPath(instance, "/user/hand/right", &g_actions.handPaths[1]);
+
+    XrActionCreateInfo ai = {XR_TYPE_ACTION_CREATE_INFO};
+    ai.countSubactionPaths = 2;
+    ai.subactionPaths = g_actions.handPaths;
+
+    ai.actionType = XR_ACTION_TYPE_POSE_INPUT;
+    strncpy(ai.actionName, "hand_pose", sizeof(ai.actionName) - 1);
+    strncpy(ai.localizedActionName, "Hand Pose", sizeof(ai.localizedActionName) - 1);
+    if (XR_FAILED(xrCreateAction(g_actions.actionSet, &ai, &g_actions.poseAction))) {
+        LOG_ERROR("actions: create pose action failed");
+        return false;
+    }
+
+    ai.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
+    strncpy(ai.actionName, "select", sizeof(ai.actionName) - 1);
+    strncpy(ai.localizedActionName, "Select", sizeof(ai.localizedActionName) - 1);
+    if (XR_FAILED(xrCreateAction(g_actions.actionSet, &ai, &g_actions.selectAction))) {
+        LOG_ERROR("actions: create select action failed");
+        return false;
+    }
+
+    ai.actionType = XR_ACTION_TYPE_VIBRATION_OUTPUT;
+    strncpy(ai.actionName, "haptic", sizeof(ai.actionName) - 1);
+    strncpy(ai.localizedActionName, "Haptic", sizeof(ai.localizedActionName) - 1);
+    if (XR_FAILED(xrCreateAction(g_actions.actionSet, &ai, &g_actions.hapticAction))) {
+        LOG_ERROR("actions: create haptic action failed");
+        return false;
+    }
+
+    // khr/simple_controller bindings for both hands.
+    XrPath profile;
+    xrStringToPath(instance, "/interaction_profiles/khr/simple_controller", &profile);
+    XrPath gripL, gripR, selectL, selectR, hapticL, hapticR;
+    xrStringToPath(instance, "/user/hand/left/input/grip/pose", &gripL);
+    xrStringToPath(instance, "/user/hand/right/input/grip/pose", &gripR);
+    xrStringToPath(instance, "/user/hand/left/input/select/click", &selectL);
+    xrStringToPath(instance, "/user/hand/right/input/select/click", &selectR);
+    xrStringToPath(instance, "/user/hand/left/output/haptic", &hapticL);
+    xrStringToPath(instance, "/user/hand/right/output/haptic", &hapticR);
+
+    XrActionSuggestedBinding bindings[6] = {
+        {g_actions.poseAction, gripL},   {g_actions.poseAction, gripR},
+        {g_actions.selectAction, selectL}, {g_actions.selectAction, selectR},
+        {g_actions.hapticAction, hapticL}, {g_actions.hapticAction, hapticR},
+    };
+    XrInteractionProfileSuggestedBinding suggest = {XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+    suggest.interactionProfile = profile;
+    suggest.suggestedBindings = bindings;
+    suggest.countSuggestedBindings = 6;
+    if (XR_FAILED(xrSuggestInteractionProfileBindings(instance, &suggest))) {
+        LOG_ERROR("actions: suggest bindings failed");
+        return false;
+    }
+
+    XrSessionActionSetsAttachInfo attach = {XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+    attach.countActionSets = 1;
+    attach.actionSets = &g_actions.actionSet;
+    if (XR_FAILED(xrAttachSessionActionSets(session, &attach))) {
+        LOG_ERROR("actions: xrAttachSessionActionSets failed");
+        return false;
+    }
+
+    for (int hand = 0; hand < 2; hand++) {
+        XrActionSpaceCreateInfo si = {XR_TYPE_ACTION_SPACE_CREATE_INFO};
+        si.action = g_actions.poseAction;
+        si.subactionPath = g_actions.handPaths[hand];
+        si.poseInActionSpace.orientation.w = 1.0f;
+        if (XR_FAILED(xrCreateActionSpace(session, &si, &g_actions.gripSpaces[hand]))) {
+            LOG_ERROR("actions: create action space (hand %d) failed", hand);
+            return false;
+        }
+    }
+
+    LOG_INFO("actions: action set attached (khr/simple_controller, pose + select + haptic)");
+    return true;
+}
+
+//! Per-frame: sync + read state + locate the grip spaces at display time.
+static void UpdateActions(XrSession session, XrSpace baseSpace, XrTime displayTime)
+{
+    XrActiveActionSet active = {g_actions.actionSet, XR_NULL_PATH};
+    XrActionsSyncInfo syncInfo = {XR_TYPE_ACTIONS_SYNC_INFO};
+    syncInfo.countActiveActionSets = 1;
+    syncInfo.activeActionSets = &active;
+    XrResult sr = xrSyncActions(session, &syncInfo);
+    if (sr == XR_SESSION_NOT_FOCUSED) {
+        // Normal until the session reaches FOCUSED; markers stay hidden.
+        g_actions.poseValid[0] = g_actions.poseValid[1] = false;
+        return;
+    }
+    if (XR_FAILED(sr)) {
+        return;
+    }
+    g_actions.syncCount++;
+
+    for (int hand = 0; hand < 2; hand++) {
+        g_actions.prevSelectPressed[hand] = g_actions.selectPressed[hand];
+        g_actions.poseValid[hand] = false;
+        g_actions.selectPressed[hand] = false;
+
+        XrActionStateGetInfo gi = {XR_TYPE_ACTION_STATE_GET_INFO};
+        gi.subactionPath = g_actions.handPaths[hand];
+
+        gi.action = g_actions.poseAction;
+        XrActionStatePose poseState = {XR_TYPE_ACTION_STATE_POSE};
+        if (XR_FAILED(xrGetActionStatePose(session, &gi, &poseState)) || !poseState.isActive) {
+            continue;
+        }
+
+        XrSpaceLocation loc = {XR_TYPE_SPACE_LOCATION};
+        if (XR_FAILED(xrLocateSpace(g_actions.gripSpaces[hand], baseSpace, displayTime, &loc))) {
+            continue;
+        }
+        const XrSpaceLocationFlags needed =
+            XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+        if ((loc.locationFlags & needed) != needed) {
+            continue;
+        }
+        g_actions.poseValid[hand] = true;
+        g_actions.pose[hand] = loc.pose;
+
+        gi.action = g_actions.selectAction;
+        XrActionStateBoolean sel = {XR_TYPE_ACTION_STATE_BOOLEAN};
+        if (XR_SUCCEEDED(xrGetActionStateBoolean(session, &gi, &sel)) && sel.isActive) {
+            g_actions.selectPressed[hand] = sel.currentState == XR_TRUE;
+        }
+
+        // Rising edge → haptic pulse on that hand (full round-trip:
+        // xrApplyHapticFeedback → set_output → provider).
+        if (g_actions.selectPressed[hand] && !g_actions.prevSelectPressed[hand]) {
+            XrHapticVibration vib = {XR_TYPE_HAPTIC_VIBRATION};
+            vib.amplitude = 0.8f;
+            vib.frequency = XR_FREQUENCY_UNSPECIFIED;
+            vib.duration = 100 * 1000 * 1000; // 100 ms
+            XrHapticActionInfo hi = {XR_TYPE_HAPTIC_ACTION_INFO};
+            hi.action = g_actions.hapticAction;
+            hi.subactionPath = g_actions.handPaths[hand];
+            if (XR_SUCCEEDED(xrApplyHapticFeedback(session, &hi, (const XrHapticBaseHeader *)&vib))) {
+                g_actions.hapticsFired++;
+            }
+        }
+    }
+
+    // Throttled progress line (~every 2 s at 60 FPS) for headless-log runs.
+    if (g_actions.syncCount % 120 == 1) {
+        LOG_INFO("actions: sync #%llu L(valid=%d sel=%d %.2f,%.2f,%.2f) R(valid=%d sel=%d %.2f,%.2f,%.2f) haptics=%llu",
+                 (unsigned long long)g_actions.syncCount,
+                 g_actions.poseValid[0], g_actions.selectPressed[0],
+                 g_actions.pose[0].position.x, g_actions.pose[0].position.y, g_actions.pose[0].position.z,
+                 g_actions.poseValid[1], g_actions.selectPressed[1],
+                 g_actions.pose[1].position.x, g_actions.pose[1].position.y, g_actions.pose[1].position.z,
+                 (unsigned long long)g_actions.hapticsFired);
+    }
+}
+
 // ============================================================================
 // Quaternion helpers (same as cube_handle_vk_macos)
 // ============================================================================
@@ -741,6 +955,38 @@ static void RenderScene(MetalRenderer &r, id<MTLTexture> target,
                              indexType:MTLIndexTypeUInt16
                            indexBuffer:r.cubeIndexBuffer
                      indexBufferOffset:0];
+        }
+
+        // --- Draw controller markers (#823 actions mode) ---
+        if (g_actionsMode) {
+            for (int hand = 0; hand < 2; hand++) {
+                if (!g_actions.poseValid[hand]) {
+                    continue;
+                }
+                // Small cube at the grip pose; grows while select is held.
+                const float scl = g_actions.selectPressed[hand] ? 0.035f : 0.02f;
+                float model[16], poseMat[16], scale[16];
+                mat4_scaling(scale, scl);
+                mat4_model_from_xr_pose(poseMat, g_actions.pose[hand]);
+                mat4_multiply(model, poseMat, scale);
+
+                CubeUniforms uniforms;
+                mat4_multiply(uniforms.mvp, vp_mat, model);
+                memcpy(uniforms.model, model, sizeof(model));
+
+                [enc setRenderPipelineState:r.cubePipeline];
+                [enc setVertexBuffer:r.cubeVertexBuffer offset:0 atIndex:0];
+                [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                [enc setFragmentTexture:r.textures[0] atIndex:0];
+                [enc setFragmentTexture:r.textures[1] atIndex:1];
+                [enc setFragmentTexture:r.textures[2] atIndex:2];
+                [enc setFragmentSamplerState:r.sampler atIndex:0];
+                [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                indexCount:36
+                                 indexType:MTLIndexTypeUInt16
+                               indexBuffer:r.cubeIndexBuffer
+                         indexBufferOffset:0];
+            }
         }
 
         // --- Draw grid ---
@@ -1458,6 +1704,14 @@ static bool CreateSession(AppXrSession &app, MetalRenderer &r)
     XR_CHECK(xrCreateSession(app.instance, &sessionInfo, &app.session));
     LOG_INFO("Session created%s", app.hasCocoaWindowBinding ? " (with external window)" : "");
 
+    // #823 actions mode: set up the action set + bindings right after
+    // session creation (must precede xrAttachSessionActionSets-dependent
+    // sync in the frame loop). Failure downgrades to the plain cube.
+    if (g_actionsMode && !SetupActions(app.instance, app.session)) {
+        LOG_ERROR("actions: setup failed — continuing without actions mode");
+        g_actionsMode = false;
+    }
+
     // XR_DXR_mcp_tools: declare identity + register agent tools. The appId
     // MUST match `id` in displayxr/cube_handle_metal_macos.displayxr.json
     // (INV-10.1). Failure is non-fatal by design — the MCP capability gate
@@ -1854,11 +2108,27 @@ static void PollEvents(AppXrSession &app)
 
 int main(int argc, char **argv)
 {
-    (void)argc; (void)argv;
     signal(SIGINT, SignalHandler);
     signal(SIGTERM, SignalHandler);
 
     LOG_INFO("=== Metal Cube OpenXR (External Window) ===");
+
+    // #823 actions mode: `--actions` flag or DXR_ACTIONS=1.
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--actions") == 0) {
+            g_actionsMode = true;
+        }
+    }
+    {
+        const char *e = getenv("DXR_ACTIONS");
+        if (e != NULL && e[0] != '\0' && e[0] != '0') {
+            g_actionsMode = true;
+        }
+    }
+    if (g_actionsMode) {
+        LOG_INFO("Actions mode ENABLED (--actions): khr/simple_controller pose+select+haptic; "
+                 "controller markers render as small cubes");
+    }
 
     // #439 Phase 3 cases 2/3/4 (see the g_l2dPanel globals block).
     {
@@ -2114,6 +2384,12 @@ int main(int argc, char **argv)
         XrFrameBeginInfo beginInfo = {XR_TYPE_FRAME_BEGIN_INFO};
         if (XR_FAILED(xrBeginFrame(app.session, &beginInfo))) {
             continue;
+        }
+
+        // #823 actions mode: sync + locate the controllers for this frame's
+        // display time; the renderer picks the results up from g_actions.
+        if (g_actionsMode) {
+            UpdateActions(app.session, app.localSpace, frameState.predictedDisplayTime);
         }
 
         std::vector<XrView> views(app.configViews.size(), {XR_TYPE_VIEW});

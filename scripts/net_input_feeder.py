@@ -60,10 +60,11 @@ def state_packet(hand: int, t: float) -> bytes:
     side = -1.0 if hand == 0 else 1.0
     phase = math.pi if hand == 0 else 0.0
 
-    # Lissajous-ish sweep in front of the display, chest height.
-    x = side * 0.2 + 0.05 * math.sin(2.0 * math.pi * t / 3.0 + phase)
-    y = 1.3 + 0.05 * math.sin(2.0 * math.pi * t / 2.0 + phase)
-    z = -0.5
+    # Lissajous-ish sweep in the tabletop-scale scene: LOCAL space sits at
+    # stage height 1.6 m, so y ≈ 1.65 lands just above a test app's cube.
+    x = side * 0.12 + 0.05 * math.sin(2.0 * math.pi * t / 3.0 + phase)
+    y = 1.65 + 0.05 * math.sin(2.0 * math.pi * t / 2.0 + phase)
+    z = -0.05
     # Gentle yaw wobble.
     half = 0.5 * 0.3 * math.sin(2.0 * math.pi * t / 4.0)
     quat = (0.0, math.sin(half), 0.0, math.cos(half))
