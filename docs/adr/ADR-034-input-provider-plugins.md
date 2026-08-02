@@ -1,6 +1,6 @@
 # ADR-034: Input Providers Are a Second Plug-in Type, Not a Display-Processor Extension
 
-**Status:** Proposed (design accepted; implementation pending)
+**Status:** Accepted (Phase 1 implemented — #823)
 **Date:** 2026-08-02
 
 ## Context
