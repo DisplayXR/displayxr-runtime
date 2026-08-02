@@ -11,12 +11,22 @@
 #include "comp_d3d11_compositor.h"
 
 #include "util/u_logging.h"
+#include "util/u_debug.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11_4.h>
 #include <dxgi1_6.h>
 #include <dcomp.h>
+
+// Decoupled presentation (#833): with DXR_PRESENT_OPAQUE=1 a transparent
+// session presents through the opaque HWND flip-model path while the DP
+// keeps compose-under-bg - the baked desktop makes the output opaque by
+// construction, and the HWND flip swapchain is eligible for Hardware
+// Independent Flip (DComp visuals stay at full Composed: Flip cost
+// regardless of their alpha mode). See the use_transparent gate below.
+DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
+
 
 /*!
  * D3D11 target structure.
@@ -133,7 +143,20 @@ comp_d3d11_target_create(struct comp_d3d11_compositor *c,
 	// HWND through DirectComposition (IDCompositionTarget::SetRoot(visual)).
 	// DComp gives us per-pixel alpha — no chroma-key, no disocclusion fringes, no
 	// LWA_COLORKEY on the plugin side.
-	const bool use_transparent = transparent && hwnd != nullptr;
+	// Decoupled presentation (#833): DXR_PRESENT_OPAQUE=1 keeps the DP's
+	// compose-under-bg (the compositor still passes transparent=true to the
+	// DP) but presents through the opaque HWND flip-model path — the baked
+	// desktop makes the output opaque by construction, and an HWND flip
+	// swapchain on the app's WS_EX_NOREDIRECTIONBITMAP window is eligible for
+	// Hardware Independent Flip (dwm ~1 % instead of ~32 % measured on Intel
+	// iGPUs; DComp visuals stay at full Composed: Flip cost regardless of
+	// their alpha mode).
+	const bool present_opaque = debug_get_bool_option_present_opaque();
+	const bool use_transparent = transparent && hwnd != nullptr && !present_opaque;
+	if (transparent && hwnd != nullptr && present_opaque) {
+		U_LOG_W("DXR_PRESENT_OPAQUE: HWND flip-model opaque present; DP compose-under-bg keeps "
+		        "the transparent look (#833)");
+	}
 
 	DXGI_SWAP_CHAIN_DESC1 desc = {};
 	desc.Width = width;
