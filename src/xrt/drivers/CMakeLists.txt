@@ -321,6 +321,76 @@ elseif(NOT ANDROID)
 endif()
 endif() # XRT_FEATURE_OPENXR — DisplayXR-SimDisplay plug-in block
 
+####
+# DisplayXR-SimInput input-provider plug-in DLL (ADR-034 / #823).
+#
+# The in-tree reference INPUT provider — deterministic synthetic motion
+# controllers for the hardware-free CI gate. Same build model as the
+# sim-display plug-in above (XRT_USING_RUNTIME_DLL + runtime import lib on
+# Windows/macOS; self-contained static-aux + version script on ELF), but a
+# much smaller dependency set: no DP factories, no graphics APIs. Android
+# ships no input providers in v1 (loader stubs), so the target is desktop-only.
+if(XRT_FEATURE_OPENXR AND NOT ANDROID)
+add_library(drv_sim_input_plugin SHARED
+	sim_input/sim_input_device.c
+	sim_input/sim_input_interface.h
+	sim_input/sim_input_plugin.c
+	)
+if(XRT_HAVE_LINUX)
+	# ELF self-contained model: static aux, single-symbol version script —
+	# see the sim-display plug-in block for the full rationale (#496).
+	target_link_libraries(drv_sim_input_plugin PRIVATE
+		xrt-interfaces aux_util aux_os drv_includes)
+else()
+	target_compile_definitions(drv_sim_input_plugin PRIVATE XRT_USING_RUNTIME_DLL)
+	target_link_libraries(
+		drv_sim_input_plugin
+		PRIVATE
+			$<TARGET_LINKER_FILE:${RUNTIME_TARGET}>
+			xrt-interfaces
+			aux_util
+			aux_os
+			drv_includes
+		)
+	add_dependencies(drv_sim_input_plugin ${RUNTIME_TARGET})
+endif()
+target_include_directories(drv_sim_input_plugin PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR}/sim_input
+	${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
+	)
+
+set_target_properties(drv_sim_input_plugin PROPERTIES
+	OUTPUT_NAME "DisplayXR-SimInput"
+	PREFIX ""
+	C_VISIBILITY_PRESET hidden
+	CXX_VISIBILITY_PRESET hidden
+	VISIBILITY_INLINES_HIDDEN ON
+	)
+
+# Single-symbol export filter: xrtInputPluginNegotiate only.
+if(APPLE)
+	target_link_options(drv_sim_input_plugin PRIVATE
+		"LINKER:-exported_symbol,_xrtInputPluginNegotiate")
+elseif(NOT WIN32)
+	target_link_options(drv_sim_input_plugin PRIVATE
+		"LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/input_plugin_exports.version")
+endif()
+
+# Install next to the sim-display plug-in.
+if(WIN32)
+	install(
+		TARGETS drv_sim_input_plugin
+		RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		)
+else()
+	install(
+		TARGETS drv_sim_input_plugin
+		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
+		)
+endif()
+endif() # XRT_FEATURE_OPENXR AND NOT ANDROID — DisplayXR-SimInput plug-in block
+
 set(ENABLED_DRIVERS ${ENABLED_HEADSET_DRIVERS} ${ENABLED_DRIVERS})
 if(ENABLED_DRIVERS)
 	list(SORT ENABLED_DRIVERS)
