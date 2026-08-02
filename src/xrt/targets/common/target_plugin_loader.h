@@ -169,6 +169,31 @@ target_plugin_get_active_instance(void);
 const struct xrt_plugin_iface *
 target_plugin_refresh_active(void);
 
+#if defined(_WIN32)
+/*!
+ * Pin the runtime core DLL (DisplayXRClient.dll) into the process by
+ * absolute path so plug-in DLL imports of it resolve independent of
+ * cwd/PATH (issue #328). Idempotent, one-shot. Shared with the
+ * input-provider loader (`target_input_plugin_loader.c`), whose DLLs
+ * carry the same import.
+ */
+void
+target_plugin_preload_runtime_core_dll(void);
+#endif
+
+#if !defined(_WIN32) && !defined(__ANDROID__)
+#include <limits.h>
+/*!
+ * Assemble the POSIX plug-in discovery roots (env override + per-user +
+ * system dirs) in priority order; returns the count. Each root is a
+ * PATH_MAX-sized buffer. Shared with the input-provider loader, which
+ * scans the SAME roots for `*-input-provider.json` manifests
+ * (docs/specs/runtime/input-provider-discovery.md §3).
+ */
+int
+target_plugin_build_discovery_roots(char roots[][PATH_MAX], int max_roots);
+#endif
+
 /* Forward declarations — full defs in xrt/xrt_compositor.h and
  * os/os_display_edid.h; the .c includes those, the header stays lean. */
 struct xrt_dp_factory_registry;

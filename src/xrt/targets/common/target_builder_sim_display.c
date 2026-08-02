@@ -17,6 +17,7 @@
 #include "util/u_system_helpers.h"
 
 #include "target_builder_interface.h"
+#include "target_builder_input_provider.h"
 #include "target_builder_qwerty_input.h"
 #include "target_plugin_loader.h"
 
@@ -97,6 +98,12 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 
 	// Assign to role(s).
 	ubrh->head = head;
+
+	// Input-provider plug-ins run BEFORE qwerty (ADR-034 arbitration):
+	// a provider's left/right motion controllers claim the hand roles;
+	// qwerty below then only fills the roles left empty. The head-pose
+	// path (set_pose_source) is untouched — providers never supply a head.
+	t_builder_add_input_provider_devices(xsysd, ubrh, U_LOGGING_INFO);
 
 	// Add qwerty keyboard/mouse input devices (controllers + HMD for pose).
 	struct xrt_device *qwerty_hmd = NULL;
