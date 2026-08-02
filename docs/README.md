@@ -128,6 +128,7 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-031](adr/ADR-031-remove-surround-output-rect-zones-sole-region-model.md) — Remove the 2D-surround / output-rect mechanism — display-zones is the sole region paradigm
 - [ADR-032](adr/ADR-032-array-layered-swapchains-first-class.md) — Array (Layered) Swapchains Are First-Class Alongside the Tiled Atlas
 - [ADR-033](adr/ADR-033-placement-reports-geometry-weaver-owns-phase.md) — The Party That Owns Placement Reports Geometry; the Weaver Owns Everything Phase
+- [ADR-034](adr/ADR-034-input-provider-plugins.md) — Input Providers Are a Second Plug-in Type, Not a Display-Processor Extension
 <!-- END ADR INDEX -->
 
 ---
