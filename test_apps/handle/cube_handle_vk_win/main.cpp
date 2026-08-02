@@ -44,7 +44,9 @@ static const float HUD_HEIGHT_FRACTION = 0.50f;
 static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18°) → 36° vFOV
 
 // Global state (shared between main thread and render thread)
-static InputState g_inputState;
+// Cube test apps start with the WSUI HUD hidden — it skews perf comparisons
+// against HUD-less apps (avatar, Unity). Shift+Tab shows it when wanted.
+static InputState g_inputState = [] { InputState s; s.hudVisible = false; return s; }();
 static std::mutex g_inputMutex;
 static std::atomic<bool> g_running{true};
 static XrSessionManager* g_xr = nullptr;

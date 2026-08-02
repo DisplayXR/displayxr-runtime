@@ -758,7 +758,9 @@ struct InputState {
     // $TMPDIR/displayxr_atlas_trigger (see issue #210).
     bool captureAtlasRequested = false;
 };
-static InputState g_input;
+// Cube test apps start with the WSUI HUD hidden — it skews perf comparisons
+// against HUD-less apps (avatar, Unity). Shift+Tab shows it when wanted.
+static InputState g_input = [] { InputState s; s.hudVisible = false; return s; }();
 // Smooth 2D<->3D disparity ramp, driven inline (macOS has its own AppXrSession/
 // InputState, not the Windows-only XrSessionManager helper).
 static dxr::ModeSwitch g_modeSwitch;

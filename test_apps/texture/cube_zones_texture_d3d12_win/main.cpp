@@ -128,7 +128,9 @@ static int32_t g_paneScreenX = 900;     // pane client X relative to the panel's
 static HWND    g_paneHwnd = nullptr;    // bound weave surface when the harness is on
 
 // Global state (single-threaded — all accessed from the main thread only)
-static InputState g_inputState;
+// Cube test apps start with the WSUI HUD hidden — it skews perf comparisons
+// against HUD-less apps (avatar, Unity). Shift+Tab shows it when wanted.
+static InputState g_inputState = [] { InputState s; s.hudVisible = false; return s; }();
 static bool g_running = true;
 static XrSessionManager* g_xr = nullptr;
 static UINT g_windowWidth = 1280;
