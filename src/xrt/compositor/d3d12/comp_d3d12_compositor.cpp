@@ -2289,6 +2289,13 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			// no-ops otherwise).
 			comp_d3d12_target_weave_mark(c->target);
 
+			// Timing feedback: hand the DP last frame's MEASURED
+			// weave→scanout residual so the vendor eye predictor runs
+			// with an exact horizon (0 = unknown ⟹ DP heuristic).
+			xrt_display_processor_d3d12_set_frame_timing(
+			    c->display_processor, comp_d3d12_target_get_measured_weave_ns(c->target),
+			    (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+
 			// Pass actual backbuffer dimensions to the DP.
 			// Canvas offset and size are passed separately — the DP uses
 			// them to set a viewport sub-rect for correct interlacing phase.

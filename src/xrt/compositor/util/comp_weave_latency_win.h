@@ -33,9 +33,35 @@
 struct weave_latency_log
 {
 	FILE *f = nullptr;
-	int enabled = -1; // -1 = unprobed
+	int enabled = -1; // -1 = unprobed (CSV only; R-tracking is always on)
 	uint64_t seq = 0;
 	uint64_t qpc_weave = 0; // armed by mark_weave, consumed by after_present
+	uint64_t qpc_freq = 0;
+
+	// Always-on weave→scanout tracking for the DP timing feedback loop
+	// (set_frame_timing): small ring correlating each present's
+	// PresentCount with its weave-record QPC; resolved against
+	// GetFrameStatistics once per frame in after_present.
+	struct pending
+	{
+		UINT present_count;
+		uint64_t qpc;
+	};
+	pending ring[8] = {};
+	int ring_head = 0;
+	int ring_count = 0;
+	uint64_t measured_r_ns = 0; // last completed frame's weave→scanout; 0 = unknown
+
+	uint64_t
+	freq()
+	{
+		if (qpc_freq == 0) {
+			LARGE_INTEGER f2;
+			QueryPerformanceFrequency(&f2);
+			qpc_freq = (uint64_t)f2.QuadPart;
+		}
+		return qpc_freq;
+	}
 
 	bool
 	on(const char *site)
@@ -48,9 +74,7 @@ struct weave_latency_log
 				snprintf(path, sizeof(path), "%s.%s.csv", prefix, site);
 				f = fopen(path, "a");
 				if (f != nullptr) {
-					LARGE_INTEGER freq;
-					QueryPerformanceFrequency(&freq);
-					fprintf(f, "H,%lld\n", (long long)freq.QuadPart);
+					fprintf(f, "H,%lld\n", (long long)freq());
 					enabled = 1;
 				}
 			}
@@ -61,9 +85,7 @@ struct weave_latency_log
 	void
 	mark_weave(const char *site)
 	{
-		if (!on(site)) {
-			return;
-		}
+		(void)on(site);
 		LARGE_INTEGER now;
 		QueryPerformanceCounter(&now);
 		qpc_weave = (uint64_t)now.QuadPart;
@@ -72,25 +94,54 @@ struct weave_latency_log
 	void
 	after_present(const char *site, IDXGISwapChain *sc)
 	{
-		if (!on(site) || sc == nullptr) {
+		if (sc == nullptr) {
 			return;
 		}
+		const bool csv = on(site);
 		LARGE_INTEGER now;
 		QueryPerformanceCounter(&now);
+
+		UINT present_count = 0;
+		sc->GetLastPresentCount(&present_count);
+
 		if (qpc_weave != 0) {
-			UINT present_count = 0;
-			sc->GetLastPresentCount(&present_count);
-			fprintf(f, "F,%llu,%llu,%llu,%u\n", (unsigned long long)seq++,
-			        (unsigned long long)qpc_weave, (unsigned long long)now.QuadPart, present_count);
+			// Track for the timing loop.
+			ring[ring_head] = {present_count, qpc_weave};
+			ring_head = (ring_head + 1) % 8;
+			if (ring_count < 8) {
+				ring_count++;
+			}
+			if (csv) {
+				fprintf(f, "F,%llu,%llu,%llu,%u\n", (unsigned long long)seq++,
+				        (unsigned long long)qpc_weave, (unsigned long long)now.QuadPart,
+				        present_count);
+			}
 			qpc_weave = 0;
 		}
+
 		DXGI_FRAME_STATISTICS stats = {};
 		if (SUCCEEDED(sc->GetFrameStatistics(&stats))) {
-			fprintf(f, "S,%u,%u,%u,%llu,%llu\n", stats.PresentCount, stats.PresentRefreshCount,
-			        stats.SyncRefreshCount, (unsigned long long)stats.SyncQPCTime.QuadPart,
-			        (unsigned long long)now.QuadPart);
+			// Resolve the newest ring entry whose present has flipped.
+			for (int i = 0; i < ring_count; i++) {
+				int idx = (ring_head - 1 - i + 16) % 8;
+				if (ring[idx].present_count != 0 && ring[idx].present_count <= stats.PresentCount &&
+				    (uint64_t)stats.SyncQPCTime.QuadPart > ring[idx].qpc) {
+					measured_r_ns = (uint64_t)(
+					    (double)((uint64_t)stats.SyncQPCTime.QuadPart - ring[idx].qpc) *
+					    1000000000.0 / (double)freq());
+					break;
+				}
+			}
+			if (csv) {
+				fprintf(f, "S,%u,%u,%u,%llu,%llu\n", stats.PresentCount,
+				        stats.PresentRefreshCount, stats.SyncRefreshCount,
+				        (unsigned long long)stats.SyncQPCTime.QuadPart,
+				        (unsigned long long)now.QuadPart);
+			}
 		}
-		fflush(f);
+		if (csv) {
+			fflush(f);
+		}
 	}
 };
 

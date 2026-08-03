@@ -1925,6 +1925,23 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// Late-weave pacing + weave-latency harness mark (env-gated no-ops).
 		comp_d3d11_target_weave_mark(c->target);
 
+		// Timing feedback: hand the DP last frame's MEASURED weave→scanout
+		// residual so the vendor eye predictor runs with an exact horizon
+		// (0 = unknown ⟹ DP falls back to its heuristic).
+		{
+			const uint64_t wl_measured = comp_d3d11_target_get_measured_weave_ns(c->target);
+			static bool wl_logged = false;
+			if (!wl_logged && wl_measured > 0) {
+				wl_logged = true;
+				U_LOG_W("Weave timing feedback engaged: measured=%llu us, period=%llu us",
+				        (unsigned long long)(wl_measured / 1000),
+				        (unsigned long long)((uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate) / 1000));
+			}
+			xrt_display_processor_d3d11_set_frame_timing(
+			    c->display_processor, wl_measured,
+			    (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+		}
+
 		xrt_display_processor_d3d11_process_atlas(
 		    c->display_processor, c->context, atlas_srv, view_width, view_height,
 		    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height,

@@ -78,6 +78,14 @@ void
 comp_d3d12_target_weave_mark(struct comp_d3d12_target *target);
 
 /*!
+ * Measured weave→scanout residual of the last completed frame in ns (0 =
+ * unknown), from DXGI frame statistics. Feeds the DP's set_frame_timing
+ * control loop.
+ */
+uint64_t
+comp_d3d12_target_get_measured_weave_ns(struct comp_d3d12_target *target);
+
+/*!
  * Get target dimensions.
  *
  * @ingroup comp_d3d12
