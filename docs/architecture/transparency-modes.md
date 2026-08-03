@@ -61,6 +61,13 @@ gated iGPU A/B from that work (dxr-perf-study `BENCH-FINDINGS.md`,
    composition** (leia-plugin#121, open): present in the DP's input atlas,
    missing from its gated output. Local2D chrome (post-weave composite) is
    the proven path if chrome must show while transparent.
+7. **Late-weave latency-1 pacing halves a saturated pipeline** (#850, open):
+   the opaque flip chain enables the late-weave waitable (maxFrameLatency=1),
+   which removes all frame overlap — measured on a GPU-saturated Unity app:
+   ~4 ms better weave R p50 for **−63 % fps** (20 vs 54.5 fps), with the WGC
+   bake exonerated by decomposition. Until the latency knob/auto-backoff
+   lands, a saturated baked app should run `DXR_LATE_WEAVE=0`; the R metric
+   alone hides this trade — always record fps beside it.
 
 ## What each app uses
 
