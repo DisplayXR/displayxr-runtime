@@ -95,6 +95,12 @@ extern "C" bool g_bridge_relay_active;
 static weave_latency_log g_weave_latency_workspace;
 static weave_latency_log g_weave_latency_standalone;
 
+// Latency governor (#850) for the workspace waitable chain:
+// DXR_LATE_WEAVE_MAX_LATENCY knob + saturation auto-backoff. The standalone
+// path honors the knob only (its pacing is the device queue cap inside a
+// synchronous RPC — no per-frame pacer to govern).
+static late_weave_governor g_lw_gov_workspace;
+
 /*
  * Late-weave phase 1 (DXR_LATE_WEAVE=1). Flattens the present queue
  * (waitable swap chain + SetMaximumFrameLatency(1)) and paces the workspace
@@ -3214,9 +3220,10 @@ init_client_render_resources(struct d3d11_service_system *sys,
 		if (!device_latency_set) {
 			wil::com_ptr<IDXGIDevice1> dxgi_dev1;
 			if (SUCCEEDED(sys->device->QueryInterface(IID_PPV_ARGS(dxgi_dev1.put())))) {
-				dxgi_dev1->SetMaximumFrameLatency(1);
+				const int lat = g_lw_gov_workspace.base_latency();
+				dxgi_dev1->SetMaximumFrameLatency(lat);
 				device_latency_set = true;
-				U_LOG_W("Late-weave: DXGI device max frame latency 1 (standalone path)");
+				U_LOG_W("Late-weave: DXGI device max frame latency %d (standalone path)", lat);
 			}
 		}
 	}
@@ -5329,6 +5336,30 @@ try {
 		if (mc->frame_latency_waitable) {
 			HANDLE waits[2] = {mc->frame_latency_waitable, mc->render_wakeup_event};
 			WaitForMultipleObjects(mc->render_wakeup_event ? 2 : 1, waits, FALSE, 100);
+
+			// Latency governor (#850): back the queue depth off to 2 when
+			// the workspace pipeline can't hold refresh rate at depth 1
+			// (depth 1 removes all frame overlap — measured −63% fps on a
+			// saturated pipeline for ~4 ms of R), probe a return later.
+			const int tr = g_lw_gov_workspace.on_mark(g_weave_latency_workspace.freq());
+			if (tr != 0) {
+				wil::com_ptr<IDXGISwapChain2> sc2;
+				if (mc->swap_chain &&
+				    SUCCEEDED(mc->swap_chain->QueryInterface(IID_PPV_ARGS(sc2.put())))) {
+					sc2->SetMaximumFrameLatency((UINT)g_lw_gov_workspace.effective);
+				}
+				static bool logged_backoff = false, logged_return = false;
+				bool &logged = (tr > 0) ? logged_backoff : logged_return;
+				if (!logged) {
+					logged = true;
+					U_LOG_W("Late-weave: saturation %s -> max latency %d "
+					        "(frame interval %.1f ms vs display period %.1f ms)",
+					        tr > 0 ? "backoff engaged" : "cleared, probing return",
+					        g_lw_gov_workspace.effective,
+					        g_lw_gov_workspace.interval_ema_ns / 1e6,
+					        g_lw_gov_workspace.period_ns / 1e6);
+				}
+			}
 		} else if (mc->render_wakeup_event) {
 			WaitForSingleObject(mc->render_wakeup_event, 14);
 		} else {
@@ -5844,9 +5875,14 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 	if (dxr_late_weave_enabled()) {
 		wil::com_ptr<IDXGISwapChain2> sc2;
 		if (SUCCEEDED(mc->swap_chain->QueryInterface(IID_PPV_ARGS(sc2.put())))) {
-			sc2->SetMaximumFrameLatency(1);
+			const int lat = g_lw_gov_workspace.base_latency();
+			sc2->SetMaximumFrameLatency(lat);
 			mc->frame_latency_waitable = sc2->GetFrameLatencyWaitableObject();
-			U_LOG_W("Late-weave: workspace swap chain waitable, max latency 1 (waitable=%p)",
+			U_LOG_W("Late-weave: workspace swap chain waitable, max latency %d%s (waitable=%p)",
+			        lat,
+			        (lat == 1 && g_lw_gov_workspace.auto_backoff == 1)
+			            ? " + saturation auto-backoff"
+			            : "",
 			        mc->frame_latency_waitable);
 		} else {
 			U_LOG_E("Late-weave: IDXGISwapChain2 unavailable; falling back to tick pacing");
@@ -8471,7 +8507,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// Present
 	if (mc->swap_chain) {
 		mc->swap_chain->Present(1, 0);
-		g_weave_latency_workspace.after_present("workspace", mc->swap_chain.get());
+		g_weave_latency_workspace.after_present("workspace", mc->swap_chain.get(),
+		                                        &g_lw_gov_workspace);
 	}
 
 	// Signal WM_PAINT done

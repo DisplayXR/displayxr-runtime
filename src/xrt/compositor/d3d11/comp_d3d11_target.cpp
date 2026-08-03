@@ -52,6 +52,10 @@ dxr_late_weave_enabled(void)
 static HANDLE g_frame_latency_waitable = nullptr;
 static UINT g_last_present_count = 0;
 
+// Latency governor (#850): DXR_LATE_WEAVE_MAX_LATENCY knob + saturation
+// auto-backoff (mirrors comp_d3d12_target.cpp).
+static late_weave_governor g_lw_gov_d3d11;
+
 
 /*!
  * D3D11 target structure.
@@ -231,10 +235,14 @@ comp_d3d11_target_create(struct comp_d3d11_compositor *c,
 		IDXGISwapChain2 *sc2 = nullptr;
 		if (SUCCEEDED(target->swapchain->QueryInterface(__uuidof(IDXGISwapChain2),
 		                                                reinterpret_cast<void **>(&sc2)))) {
-			sc2->SetMaximumFrameLatency(1);
+			const int lat = g_lw_gov_d3d11.base_latency();
+			sc2->SetMaximumFrameLatency(lat);
 			g_frame_latency_waitable = sc2->GetFrameLatencyWaitableObject();
 			sc2->Release();
-			U_LOG_W("Late-weave: D3D11 in-process swapchain waitable, max latency 1 (waitable=%p)",
+			U_LOG_W("Late-weave: D3D11 in-process swapchain waitable, max latency %d%s (waitable=%p)",
+			        lat,
+			        (lat == 1 && g_lw_gov_d3d11.auto_backoff == 1) ? " + saturation auto-backoff"
+			                                                       : "",
 			        g_frame_latency_waitable);
 		}
 	}
@@ -413,11 +421,15 @@ comp_d3d11_target_weave_mark(struct comp_d3d11_target *target)
 	// comp_d3d12_target.cpp). Bounded so occluded windows never wedge.
 	if (g_frame_latency_waitable != nullptr) {
 		WaitForSingleObject(g_frame_latency_waitable, 100);
-		if (g_last_present_count != 0) {
+		// At effective depth L>1 (#850) the pacer targets the present L-1
+		// back instead, restoring L-1 frames of CPU/GPU overlap.
+		const UINT relax = (UINT)(g_lw_gov_d3d11.effective - 1);
+		if (g_last_present_count > relax) {
+			const UINT pace_target = g_last_present_count - relax;
 			for (int i = 0; i < 50; i++) {
 				DXGI_FRAME_STATISTICS stats = {};
 				HRESULT shr = target->swapchain->GetFrameStatistics(&stats);
-				if (FAILED(shr) || stats.PresentCount >= g_last_present_count) {
+				if (FAILED(shr) || stats.PresentCount >= pace_target) {
 					break;
 				}
 				Sleep(1);
@@ -425,6 +437,27 @@ comp_d3d11_target_weave_mark(struct comp_d3d11_target *target)
 		}
 	}
 	g_weave_latency_d3d11.mark_weave("d3d11");
+	if (g_frame_latency_waitable != nullptr) {
+		const int tr = g_lw_gov_d3d11.on_mark(g_weave_latency_d3d11.freq());
+		if (tr != 0) {
+			IDXGISwapChain2 *sc2 = nullptr;
+			if (SUCCEEDED(target->swapchain->QueryInterface(
+			        __uuidof(IDXGISwapChain2), reinterpret_cast<void **>(&sc2)))) {
+				sc2->SetMaximumFrameLatency((UINT)g_lw_gov_d3d11.effective);
+				sc2->Release();
+			}
+			static bool logged_backoff = false, logged_return = false;
+			bool &logged = (tr > 0) ? logged_backoff : logged_return;
+			if (!logged) {
+				logged = true;
+				U_LOG_W("Late-weave: saturation %s -> max latency %d "
+				        "(frame interval %.1f ms vs display period %.1f ms)",
+				        tr > 0 ? "backoff engaged" : "cleared, probing return",
+				        g_lw_gov_d3d11.effective, g_lw_gov_d3d11.interval_ema_ns / 1e6,
+				        g_lw_gov_d3d11.period_ns / 1e6);
+			}
+		}
+	}
 }
 
 extern "C" uint64_t
@@ -438,7 +471,7 @@ extern "C" xrt_result_t
 comp_d3d11_target_present(struct comp_d3d11_target *target, uint32_t sync_interval)
 {
 	HRESULT hr = target->swapchain->Present(sync_interval, 0);
-	g_weave_latency_d3d11.after_present("d3d11", target->swapchain);
+	g_weave_latency_d3d11.after_present("d3d11", target->swapchain, &g_lw_gov_d3d11);
 	if (SUCCEEDED(hr) && g_frame_latency_waitable != nullptr) {
 		target->swapchain->GetLastPresentCount(&g_last_present_count);
 	}
