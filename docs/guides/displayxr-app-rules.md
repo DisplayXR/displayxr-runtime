@@ -399,18 +399,24 @@ its own content by definition, so there is no full-window backer. Reference apps
   test apps stay on the legacy path deliberately** — it can never be deleted (third-party apps),
   so it keeps regression coverage. Ref: `displayxr-common#23`.
 
-- **INV-5.9 — VK apps enable `VK_KHR_present_id` + `VK_KHR_present_wait` at `vkCreateDevice` when
-  the device supports them.** The runtime's late-weave pacing (default-on) vsync-locks the weave by
-  waiting on the previous present hitting glass via `vkWaitForPresentKHR` — measured 95.8 → 16.6 ms
-  of weave→scanout eye staleness on this path. The features must be enabled by whoever creates the
-  `VkDevice`, which on the `XR_KHR_vulkan_enable` (v1) path is the app: query
-  `VkPhysicalDevicePresentIdFeaturesKHR` + `PresentWaitFeaturesKHR` via
-  `vkGetPhysicalDeviceFeatures2`, and when both report supported, chain them into
-  `VkDeviceCreateInfo` and append both extension names. Without them the runtime silently falls
-  back to stock pacing (no error — just ~6 refreshes of extra weave latency). Reference:
-  `cube_handle_vk_win/xr_session.cpp` (`CreateVulkanDevice`); a shared helper is planned in
-  `displayxr-common` (`EnablePresentWaitIfSupported`). Lint: WARN when a `vkCreateDevice` call is
-  present with no `PresentWaitFeatures` token anywhere in the app.
+- **INV-5.9 — VK apps use `XR_KHR_vulkan_enable2` (preferred), or enable
+  `VK_KHR_present_id`/`present_wait` themselves under enable1.** The runtime's late-weave pacing
+  (default-on) vsync-locks the weave by waiting on the previous present hitting glass via
+  `vkWaitForPresentKHR` — measured 95.8 → 16.6 ms of weave→scanout eye staleness on this path.
+  The features must be enabled by whoever creates the `VkDevice`:
+  - **enable2 (preferred)**: the app calls `xrCreateVulkanInstanceKHR` /
+    `xrGetVulkanGraphicsDevice2KHR` / `xrCreateVulkanDeviceKHR` and the **runtime** enables the
+    features (and appends its extensions) automatically — zero app-side feature code, and less
+    boilerplate than enable1. Note the v2 proc names throughout: the v1 names
+    (`xrGetVulkanGraphicsRequirementsKHR` etc.) are not dispatchable under enable2-only.
+    Reference: `cube_handle_vk_win/xr_session.cpp`.
+  - **enable1 (legacy)**: the app queries `VkPhysicalDevicePresentIdFeaturesKHR` +
+    `PresentWaitFeaturesKHR` via `vkGetPhysicalDeviceFeatures2` and, when supported, chains them
+    into `VkDeviceCreateInfo` and appends both extension names.
+  Without either, the runtime silently falls back to stock pacing (no error — just ~6 refreshes of
+  extra weave latency). Lint: WARN when a `vkCreateDevice` call is present with no
+  `PresentWaitFeatures` token anywhere in the app (enable2 apps have no `vkCreateDevice` call, so
+  they pass by construction).
 
 ---
 

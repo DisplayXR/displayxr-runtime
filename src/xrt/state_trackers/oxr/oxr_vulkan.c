@@ -211,6 +211,16 @@ static const char *optional_device_extensions[] = {
     NULL, // avoid zero sized array with UB
 #endif
 
+#if defined(VK_KHR_present_id) && defined(VK_KHR_present_wait)
+    // Late-weave presentation pacing (default-on): the VK native compositor
+    // vsync-locks the weave by waiting on the previous present hitting glass
+    // (vkWaitForPresentKHR). The features are chained below when supported —
+    // enable2 apps get this with zero app-side code (enable1 apps must chain
+    // the features themselves; INV-5.9).
+    VK_KHR_PRESENT_ID_EXTENSION_NAME,
+    VK_KHR_PRESENT_WAIT_EXTENSION_NAME,
+#endif
+
 #if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID) && defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
     // Desktop-background capture (runtime#757): dma-buf import on the app's
     // VkDevice so the display processor can consume PipeWire screencast
@@ -475,6 +485,10 @@ oxr_vk_create_vulkan_device(struct oxr_logger *log,
 	bool external_semaphore_fd_enabled = false;
 #endif
 	bool image_format_list_enabled = false;
+#if defined(VK_KHR_present_id) && defined(VK_KHR_present_wait)
+	bool present_id_in_list = false;
+	bool present_wait_in_list = false;
+#endif
 
 	for (uint32_t i = 0; i < ARRAY_SIZE(optional_device_extensions); i++) {
 		// Empty list or a not supported extension.
@@ -497,6 +511,15 @@ oxr_vk_create_vulkan_device(struct oxr_logger *log,
 		if (strcmp(optional_device_extensions[i], VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME) == 0) {
 			image_format_list_enabled = true;
 		}
+
+#if defined(VK_KHR_present_id) && defined(VK_KHR_present_wait)
+		if (strcmp(optional_device_extensions[i], VK_KHR_PRESENT_ID_EXTENSION_NAME) == 0) {
+			present_id_in_list = true;
+		}
+		if (strcmp(optional_device_extensions[i], VK_KHR_PRESENT_WAIT_EXTENSION_NAME) == 0) {
+			present_wait_in_list = true;
+		}
+#endif
 	}
 
 	free(props);
@@ -516,6 +539,25 @@ oxr_vk_create_vulkan_device(struct oxr_logger *log,
 
 	if (u_string_list_contains(device_extension_list, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME)) {
 		physical_device_features.pNext = &timeline_semaphore_info;
+	}
+#endif
+
+#if defined(VK_KHR_present_id) && defined(VK_KHR_present_wait)
+	VkPhysicalDevicePresentIdFeaturesKHR present_id_info = {
+	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
+	    .pNext = NULL,
+	    .presentId = VK_FALSE,
+	};
+	VkPhysicalDevicePresentWaitFeaturesKHR present_wait_info = {
+	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
+	    .pNext = NULL,
+	    .presentWait = VK_FALSE,
+	};
+
+	if (present_id_in_list && present_wait_in_list) {
+		present_id_info.pNext = physical_device_features.pNext;
+		present_wait_info.pNext = &present_id_info;
+		physical_device_features.pNext = &present_wait_info;
 	}
 #endif
 
@@ -558,6 +600,37 @@ oxr_vk_create_vulkan_device(struct oxr_logger *log,
 	}
 #endif
 
+#if defined(VK_KHR_present_id) && defined(VK_KHR_present_wait)
+	// Enable present_id + present_wait when the device supports them, so the
+	// VK native compositor's late-weave pacing (default-on) works with zero
+	// app-side code on the enable2 path. Skip either struct if the app
+	// already chained its own (its choice wins, matching the timeline-
+	// semaphore precedent above).
+	VkPhysicalDevicePresentIdFeaturesKHR present_id_enable = {
+	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
+	    .pNext = NULL,
+	    .presentId = present_id_info.presentId,
+	};
+	VkPhysicalDevicePresentWaitFeaturesKHR present_wait_enable = {
+	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
+	    .pNext = NULL,
+	    .presentWait = present_wait_info.presentWait,
+	};
+
+	if (present_id_info.presentId && present_wait_info.presentWait) {
+		if (vk_find_struct_in_chain((VkBaseInStructure *)&modified_info,
+		                            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR) == NULL) {
+			present_id_enable.pNext = (void *)modified_info.pNext;
+			modified_info.pNext = &present_id_enable;
+		}
+		if (vk_find_struct_in_chain((VkBaseInStructure *)&modified_info,
+		                            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR) == NULL) {
+			present_wait_enable.pNext = (void *)modified_info.pNext;
+			modified_info.pNext = &present_wait_enable;
+		}
+	}
+#endif
+
 	*vulkanResult = CreateDevice(physical_device, &modified_info, createInfo->vulkanAllocator, vulkanDevice);
 
 
@@ -576,6 +649,10 @@ oxr_vk_create_vulkan_device(struct oxr_logger *log,
 #ifdef VK_KHR_timeline_semaphore
 		oxr_slog(&slog, "\n\ttimelineSemaphore: %s",
 		         timeline_semaphore_info.timelineSemaphore ? "true" : "false");
+#endif
+#if defined(VK_KHR_present_id) && defined(VK_KHR_present_wait)
+		oxr_slog(&slog, "\n\tpresentId/presentWait: %s (late-weave pacing)",
+		         (present_id_info.presentId && present_wait_info.presentWait) ? "true" : "false");
 #endif
 		oxr_slog(&slog, "\n\textensions:");
 		for (uint32_t i = 0; i < modified_info.enabledExtensionCount; i++) {

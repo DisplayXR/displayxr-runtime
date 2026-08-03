@@ -53,7 +53,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
 
     for (const auto& ext : extensions) {
         LOG_DEBUG("  %s (v%u)", ext.extensionName, ext.extensionVersion);
-        if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME) == 0) {
             hasVulkan = true;
         }
         if (strcmp(ext.extensionName, XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME) == 0) {
@@ -76,7 +76,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         }
     }
 
-    LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_KHR_vulkan_enable2: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_win32_window_binding: %s", xr.hasWin32WindowBindingExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_display_info: %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_mcp_tools: %s", xr.hasMcpToolsExt ? "AVAILABLE" : "NOT FOUND");
@@ -84,12 +84,17 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_DXR_local_3d_zone: %s", g_zone.available ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasVulkan) {
-        LOG_ERROR("XR_KHR_vulkan_enable extension not available");
+        LOG_ERROR("XR_KHR_vulkan_enable2 extension not available");
         return false;
     }
 
+    // vulkan_enable2: the RUNTIME creates the VkInstance/VkDevice on our
+    // behalf (xrCreateVulkanInstanceKHR / xrCreateVulkanDeviceKHR), letting it
+    // append the instance/device extensions AND enable the device features it
+    // needs — notably VK_KHR_present_id/present_wait for late-weave pacing
+    // (INV-5.9), with zero app-side feature code.
     std::vector<const char*> enabledExtensions;
-    enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
+    enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME);
     if (xr.hasWin32WindowBindingExt) {
         enabledExtensions.push_back(XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME);
     }
@@ -214,18 +219,20 @@ bool InitializeOpenXR(XrSessionManager& xr) {
 bool GetVulkanGraphicsRequirements(XrSessionManager& xr) {
     LOG_INFO("Getting Vulkan graphics requirements...");
 
-    PFN_xrGetVulkanGraphicsRequirementsKHR xrGetVulkanGraphicsRequirementsKHR = nullptr;
-    XrResult result = xrGetInstanceProcAddr(xr.instance, "xrGetVulkanGraphicsRequirementsKHR",
-        (PFN_xrVoidFunction*)&xrGetVulkanGraphicsRequirementsKHR);
-    if (XR_FAILED(result) || !xrGetVulkanGraphicsRequirementsKHR) {
-        LOG_ERROR("Failed to get xrGetVulkanGraphicsRequirementsKHR function pointer");
+    // vulkan_enable2: the v2 proc name — the v1 name is only dispatchable when
+    // XR_KHR_vulkan_enable (v1) is the enabled extension.
+    PFN_xrGetVulkanGraphicsRequirements2KHR xrGetVulkanGraphicsRequirements2KHR = nullptr;
+    XrResult result = xrGetInstanceProcAddr(xr.instance, "xrGetVulkanGraphicsRequirements2KHR",
+        (PFN_xrVoidFunction*)&xrGetVulkanGraphicsRequirements2KHR);
+    if (XR_FAILED(result) || !xrGetVulkanGraphicsRequirements2KHR) {
+        LOG_ERROR("Failed to get xrGetVulkanGraphicsRequirements2KHR function pointer");
         return false;
     }
 
     XrGraphicsRequirementsVulkanKHR graphicsReq = {XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
-    result = xrGetVulkanGraphicsRequirementsKHR(xr.instance, xr.systemId, &graphicsReq);
+    result = xrGetVulkanGraphicsRequirements2KHR(xr.instance, xr.systemId, &graphicsReq);
     if (XR_FAILED(result)) {
-        LogXrResult("xrGetVulkanGraphicsRequirementsKHR", result);
+        LogXrResult("xrGetVulkanGraphicsRequirements2KHR", result);
         return false;
     }
 
@@ -243,41 +250,14 @@ bool GetVulkanGraphicsRequirements(XrSessionManager& xr) {
 }
 
 bool CreateVulkanInstance(XrSessionManager& xr, VkInstance& vkInstance) {
-    LOG_INFO("Creating Vulkan instance with OpenXR required extensions...");
+    LOG_INFO("Creating Vulkan instance via xrCreateVulkanInstanceKHR (vulkan_enable2)...");
 
-    // Get required Vulkan instance extensions from the runtime
-    PFN_xrGetVulkanInstanceExtensionsKHR xrGetVulkanInstanceExtensionsKHR = nullptr;
-    XrResult result = xrGetInstanceProcAddr(xr.instance, "xrGetVulkanInstanceExtensionsKHR",
-        (PFN_xrVoidFunction*)&xrGetVulkanInstanceExtensionsKHR);
-    if (XR_FAILED(result) || !xrGetVulkanInstanceExtensionsKHR) {
-        LOG_ERROR("Failed to get xrGetVulkanInstanceExtensionsKHR");
+    PFN_xrCreateVulkanInstanceKHR xrCreateVulkanInstanceKHR = nullptr;
+    XrResult result = xrGetInstanceProcAddr(xr.instance, "xrCreateVulkanInstanceKHR",
+        (PFN_xrVoidFunction*)&xrCreateVulkanInstanceKHR);
+    if (XR_FAILED(result) || !xrCreateVulkanInstanceKHR) {
+        LOG_ERROR("Failed to get xrCreateVulkanInstanceKHR");
         return false;
-    }
-
-    uint32_t bufferSize = 0;
-    xrGetVulkanInstanceExtensionsKHR(xr.instance, xr.systemId, 0, &bufferSize, nullptr);
-    std::string extensionsStr(bufferSize, '\0');
-    xrGetVulkanInstanceExtensionsKHR(xr.instance, xr.systemId, bufferSize, &bufferSize, extensionsStr.data());
-
-    // Parse space-separated extension names
-    std::vector<const char*> extensionPtrs;
-    // Store parsed strings so pointers remain valid
-    std::vector<std::string> extensionNames;
-    {
-        size_t start = 0;
-        while (start < extensionsStr.size()) {
-            size_t end = extensionsStr.find(' ', start);
-            if (end == std::string::npos) end = extensionsStr.size();
-            std::string name = extensionsStr.substr(start, end - start);
-            if (!name.empty() && name[0] != '\0') {
-                extensionNames.push_back(name);
-            }
-            start = end + 1;
-        }
-    }
-    for (auto& name : extensionNames) {
-        extensionPtrs.push_back(name.c_str());
-        LOG_INFO("  Required VkInstance extension: %s", name.c_str());
     }
 
     VkApplicationInfo appInfo = {};
@@ -288,36 +268,45 @@ bool CreateVulkanInstance(XrSessionManager& xr, VkInstance& vkInstance) {
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.apiVersion = VK_API_VERSION_1_1;
 
+    // The runtime appends whatever instance extensions it needs.
     VkInstanceCreateInfo createInfo = {};
     createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     createInfo.pApplicationInfo = &appInfo;
-    createInfo.enabledExtensionCount = (uint32_t)extensionPtrs.size();
-    createInfo.ppEnabledExtensionNames = extensionPtrs.data();
 
-    VkResult vkResult = vkCreateInstance(&createInfo, nullptr, &vkInstance);
-    if (vkResult != VK_SUCCESS) {
-        LOG_ERROR("vkCreateInstance failed: %d", vkResult);
+    XrVulkanInstanceCreateInfoKHR xrCreateInfo = {XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR};
+    xrCreateInfo.systemId = xr.systemId;
+    xrCreateInfo.pfnGetInstanceProcAddr = vkGetInstanceProcAddr;
+    xrCreateInfo.vulkanCreateInfo = &createInfo;
+
+    VkResult vkResult = VK_SUCCESS;
+    result = xrCreateVulkanInstanceKHR(xr.instance, &xrCreateInfo, &vkInstance, &vkResult);
+    if (XR_FAILED(result) || vkResult != VK_SUCCESS) {
+        LOG_ERROR("xrCreateVulkanInstanceKHR failed: xr=%d vk=%d", result, vkResult);
         return false;
     }
 
-    LOG_INFO("Vulkan instance created");
+    LOG_INFO("Vulkan instance created (runtime-managed extensions)");
     return true;
 }
 
 bool GetVulkanPhysicalDevice(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice& physDevice) {
-    LOG_INFO("Getting Vulkan physical device from OpenXR runtime...");
+    LOG_INFO("Getting Vulkan physical device via xrGetVulkanGraphicsDevice2KHR...");
 
-    PFN_xrGetVulkanGraphicsDeviceKHR xrGetVulkanGraphicsDeviceKHR = nullptr;
-    XrResult result = xrGetInstanceProcAddr(xr.instance, "xrGetVulkanGraphicsDeviceKHR",
-        (PFN_xrVoidFunction*)&xrGetVulkanGraphicsDeviceKHR);
-    if (XR_FAILED(result) || !xrGetVulkanGraphicsDeviceKHR) {
-        LOG_ERROR("Failed to get xrGetVulkanGraphicsDeviceKHR");
+    PFN_xrGetVulkanGraphicsDevice2KHR xrGetVulkanGraphicsDevice2KHR = nullptr;
+    XrResult result = xrGetInstanceProcAddr(xr.instance, "xrGetVulkanGraphicsDevice2KHR",
+        (PFN_xrVoidFunction*)&xrGetVulkanGraphicsDevice2KHR);
+    if (XR_FAILED(result) || !xrGetVulkanGraphicsDevice2KHR) {
+        LOG_ERROR("Failed to get xrGetVulkanGraphicsDevice2KHR");
         return false;
     }
 
-    result = xrGetVulkanGraphicsDeviceKHR(xr.instance, xr.systemId, vkInstance, &physDevice);
+    XrVulkanGraphicsDeviceGetInfoKHR getInfo = {XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR};
+    getInfo.systemId = xr.systemId;
+    getInfo.vulkanInstance = vkInstance;
+
+    result = xrGetVulkanGraphicsDevice2KHR(xr.instance, &getInfo, &physDevice);
     if (XR_FAILED(result)) {
-        LogXrResult("xrGetVulkanGraphicsDeviceKHR", result);
+        LogXrResult("xrGetVulkanGraphicsDevice2KHR", result);
         return false;
     }
 
@@ -328,67 +317,6 @@ bool GetVulkanPhysicalDevice(XrSessionManager& xr, VkInstance vkInstance, VkPhys
         VK_VERSION_MAJOR(props.apiVersion),
         VK_VERSION_MINOR(props.apiVersion),
         VK_VERSION_PATCH(props.apiVersion));
-
-    return true;
-}
-
-bool GetVulkanDeviceExtensions(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice physDevice,
-    std::vector<const char*>& deviceExtensions, std::vector<std::string>& extensionStorage)
-{
-    PFN_xrGetVulkanDeviceExtensionsKHR xrGetVulkanDeviceExtensionsKHR = nullptr;
-    XrResult result = xrGetInstanceProcAddr(xr.instance, "xrGetVulkanDeviceExtensionsKHR",
-        (PFN_xrVoidFunction*)&xrGetVulkanDeviceExtensionsKHR);
-    if (XR_FAILED(result) || !xrGetVulkanDeviceExtensionsKHR) {
-        LOG_ERROR("Failed to get xrGetVulkanDeviceExtensionsKHR");
-        return false;
-    }
-
-    uint32_t bufferSize = 0;
-    xrGetVulkanDeviceExtensionsKHR(xr.instance, xr.systemId, 0, &bufferSize, nullptr);
-
-    std::string extensionsStr(bufferSize, '\0');
-    xrGetVulkanDeviceExtensionsKHR(xr.instance, xr.systemId, bufferSize, &bufferSize, extensionsStr.data());
-
-    // Parse space-separated extension names
-    std::vector<std::string> requested;
-    {
-        size_t start = 0;
-        while (start < extensionsStr.size()) {
-            size_t end = extensionsStr.find(' ', start);
-            if (end == std::string::npos) end = extensionsStr.size();
-            std::string name = extensionsStr.substr(start, end - start);
-            if (!name.empty() && name[0] != '\0') {
-                requested.push_back(name);
-            }
-            start = end + 1;
-        }
-    }
-
-    // Query which extensions the device actually supports
-    uint32_t availCount = 0;
-    vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &availCount, nullptr);
-    std::vector<VkExtensionProperties> availExts(availCount);
-    vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &availCount, availExts.data());
-
-    // Filter: only request extensions the device actually exposes
-    // (extensions promoted to Vulkan core may not be listed)
-    extensionStorage.clear();
-    deviceExtensions.clear();
-    for (auto& name : requested) {
-        bool available = false;
-        for (auto& ext : availExts) {
-            if (name == ext.extensionName) { available = true; break; }
-        }
-        if (available) {
-            extensionStorage.push_back(name);
-            LOG_INFO("  Required VkDevice extension: %s", name.c_str());
-        } else {
-            LOG_INFO("  Skipping promoted-to-core extension: %s", name.c_str());
-        }
-    }
-    for (auto& name : extensionStorage) {
-        deviceExtensions.push_back(name.c_str());
-    }
 
     return true;
 }
@@ -412,10 +340,19 @@ bool FindGraphicsQueueFamily(VkPhysicalDevice physDevice, uint32_t& queueFamilyI
     return false;
 }
 
-bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamilyIndex,
-    const std::vector<const char*>& deviceExtensions,
+bool CreateVulkanDevice(XrSessionManager& xr, VkPhysicalDevice physDevice, uint32_t queueFamilyIndex,
     VkDevice& device, VkQueue& graphicsQueue)
 {
+    LOG_INFO("Creating Vulkan device via xrCreateVulkanDeviceKHR (vulkan_enable2)...");
+
+    PFN_xrCreateVulkanDeviceKHR xrCreateVulkanDeviceKHR = nullptr;
+    XrResult result = xrGetInstanceProcAddr(xr.instance, "xrCreateVulkanDeviceKHR",
+        (PFN_xrVoidFunction*)&xrCreateVulkanDeviceKHR);
+    if (XR_FAILED(result) || !xrCreateVulkanDeviceKHR) {
+        LOG_ERROR("Failed to get xrCreateVulkanDeviceKHR");
+        return false;
+    }
+
     float queuePriority = 1.0f;
     VkDeviceQueueCreateInfo queueInfo = {};
     queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -423,42 +360,24 @@ bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamilyIndex,
     queueInfo.queueCount = 1;
     queueInfo.pQueuePriorities = &queuePriority;
 
+    // The runtime appends its required device extensions AND enables the
+    // features it needs — including present_id/present_wait for late-weave
+    // pacing (INV-5.9). No app-side extension/feature ceremony.
     VkDeviceCreateInfo createInfo = {};
     createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     createInfo.queueCreateInfoCount = 1;
     createInfo.pQueueCreateInfos = &queueInfo;
-    createInfo.enabledExtensionCount = (uint32_t)deviceExtensions.size();
-    createInfo.ppEnabledExtensionNames = deviceExtensions.data();
 
-    // Enable VK_KHR_present_id + VK_KHR_present_wait when the device supports
-    // them, so the runtime's weave-latency harness (DXR_WEAVE_LATENCY_CSV) can
-    // timestamp true scanout via vkWaitForPresentKHR. Harmless when the
-    // harness is off; skipped entirely on devices without the extensions.
-    std::vector<const char*> extsWithPresentWait(deviceExtensions);
-    VkPhysicalDevicePresentIdFeaturesKHR presentIdFeat = {};
-    presentIdFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
-    VkPhysicalDevicePresentWaitFeaturesKHR presentWaitFeat = {};
-    presentWaitFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR;
-    presentWaitFeat.pNext = &presentIdFeat;
-    {
-        VkPhysicalDeviceFeatures2 feat2 = {};
-        feat2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-        feat2.pNext = &presentWaitFeat;
-        vkGetPhysicalDeviceFeatures2(physDevice, &feat2);
-        if (presentIdFeat.presentId && presentWaitFeat.presentWait) {
-            extsWithPresentWait.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
-            extsWithPresentWait.push_back(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
-            presentIdFeat.pNext = const_cast<void*>(createInfo.pNext);
-            createInfo.pNext = &presentWaitFeat;
-            createInfo.enabledExtensionCount = (uint32_t)extsWithPresentWait.size();
-            createInfo.ppEnabledExtensionNames = extsWithPresentWait.data();
-            LOG_INFO("Enabling VK_KHR_present_id + VK_KHR_present_wait (weave-latency harness support)");
-        }
-    }
+    XrVulkanDeviceCreateInfoKHR xrCreateInfo = {XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR};
+    xrCreateInfo.systemId = xr.systemId;
+    xrCreateInfo.pfnGetInstanceProcAddr = vkGetInstanceProcAddr;
+    xrCreateInfo.vulkanPhysicalDevice = physDevice;
+    xrCreateInfo.vulkanCreateInfo = &createInfo;
 
-    VkResult vkResult = vkCreateDevice(physDevice, &createInfo, nullptr, &device);
-    if (vkResult != VK_SUCCESS) {
-        LOG_ERROR("vkCreateDevice failed: %d", vkResult);
+    VkResult vkResult = VK_SUCCESS;
+    result = xrCreateVulkanDeviceKHR(xr.instance, &xrCreateInfo, &device, &vkResult);
+    if (XR_FAILED(result) || vkResult != VK_SUCCESS) {
+        LOG_ERROR("xrCreateVulkanDeviceKHR failed: xr=%d vk=%d", result, vkResult);
         return false;
     }
 
