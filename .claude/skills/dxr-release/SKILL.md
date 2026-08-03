@@ -373,7 +373,9 @@ if [ "$COMPONENT" = unity ]; then
         # portable unzip (git-bash on Windows has no `unzip`).
         if command -v unzip >/dev/null; then ( cd "$D/out" && unzip -qo signed.zip -d "$D/signed" 2>/dev/null || true )
         else powershell -NoProfile -Command "Expand-Archive -Path '$(cygpath -w "$D/out/signed.zip")' -DestinationPath '$(cygpath -w "$D/signed")' -Force"; fi
-        SIGNED_DLL=$(ls "$D/signed/displayxr_unity.dll" 2>/dev/null | head -1)
+        # Never parse `ls` (an -F alias appends `*` and the suffixed path silently fails
+        # downstream — bit installer-release on bundle v2.0.15). Test the path directly.
+        SIGNED_DLL="$D/signed/displayxr_unity.dll"; [ -f "$SIGNED_DLL" ] || SIGNED_DLL=""
       fi
       gh release delete "$SIGN_TAG" -R "$SIGN_REPO" --yes --cleanup-tag >/dev/null 2>&1 || true
 

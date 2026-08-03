@@ -266,7 +266,10 @@ if [ "$SIGNED" = yes ]; then
     # portable unzip (git-bash on Windows has no `unzip`).
     if command -v unzip >/dev/null; then ( cd "$D/out" && unzip -qo signed.zip -d "$D/signed" 2>/dev/null || true )
     else powershell -NoProfile -Command "Expand-Archive -Path '$(cygpath -w "$D/out/signed.zip")' -DestinationPath '$(cygpath -w "$D/signed")' -Force"; fi
-    SIGNED_EXE=$(ls "$D/signed/$EXE" 2>/dev/null || ls "$D/out"/**/"$EXE" 2>/dev/null | head -1)
+    # Never parse `ls` here: an `ls -F` alias appends a classify suffix (`*` on the .exe),
+    # the suffixed path fails the upload guard, and the UNSIGNED CI bundle silently stays
+    # published (bit v2.0.15 for real). Test the path / use find instead.
+    SIGNED_EXE="$D/signed/$EXE"; [ -f "$SIGNED_EXE" ] || SIGNED_EXE=$(find "$D/out" -type f -name "$EXE" 2>/dev/null | head -1)
     if [ -n "$SIGNED_EXE" ]; then
       gh release upload "$TAG" "$SIGNED_EXE" --clobber -R DisplayXR/displayxr-installer
       echo "Bundle .exe signed on the provider runner and re-uploaded."
