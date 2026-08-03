@@ -111,6 +111,57 @@
 // emitting DWM-dependent alpha.
 DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
 
+// Frame pipelining (#837): per-stage CPU timing of the windowed layer_commit
+// path — where does the non-GPU-busy frame time go? Accumulates per stage and
+// logs a one-line summary ~1/sec (WARN so it survives the hot-path filter).
+DEBUG_GET_ONCE_BOOL_OPTION(frame_stage_timing, "DXR_FRAME_STAGE_TIMING", false)
+
+enum vk_frame_stage
+{
+	VK_FSTAGE_PRE = 0,      // commit entry → pre-DP cmd recorded (renderer, accum, crops)
+	VK_FSTAGE_PREFLUSH,     // pre-DP submit + queue drain (self-submitting DP flush)
+	VK_FSTAGE_WEAVE,        // xrt_display_processor_process_atlas (SDK-internal submit+wait)
+	VK_FSTAGE_POSTWAIT,     // post-weave vkDeviceWaitIdle (audit B7)
+	VK_FSTAGE_COMPOSITE,    // Local2D composite + HUD record + submit + drain
+	VK_FSTAGE_PRESENT,      // comp_vk_native_target_present (bridge copy + DXGI Present)
+	VK_FSTAGE_COUNT
+};
+
+struct vk_frame_timing
+{
+	uint64_t stage_ns[VK_FSTAGE_COUNT];
+	uint32_t frames;
+	uint64_t last_log_ns;
+};
+
+static void
+vk_frame_timing_add(struct vk_frame_timing *t, enum vk_frame_stage s, uint64_t t0, uint64_t t1)
+{
+	t->stage_ns[s] += t1 - t0;
+}
+
+static void
+vk_frame_timing_flush(struct vk_frame_timing *t, uint64_t now)
+{
+	t->frames++;
+	if (t->last_log_ns == 0) {
+		t->last_log_ns = now;
+		return;
+	}
+	if (now - t->last_log_ns < 1000000000ull || t->frames == 0) {
+		return;
+	}
+	const double per = 1.0e-6 / (double)t->frames; // ns → ms per frame
+	U_LOG_W("[FRAME_STAGES] n=%u pre=%.2f preflush=%.2f weave=%.2f postwait=%.2f composite=%.2f "
+	        "present=%.2f (ms/frame)",
+	        t->frames, t->stage_ns[VK_FSTAGE_PRE] * per, t->stage_ns[VK_FSTAGE_PREFLUSH] * per,
+	        t->stage_ns[VK_FSTAGE_WEAVE] * per, t->stage_ns[VK_FSTAGE_POSTWAIT] * per,
+	        t->stage_ns[VK_FSTAGE_COMPOSITE] * per, t->stage_ns[VK_FSTAGE_PRESENT] * per);
+	memset(t->stage_ns, 0, sizeof(t->stage_ns));
+	t->frames = 0;
+	t->last_log_ns = now;
+}
+
 /*!
  * Minimal settings struct for Vulkan compositor.
  */
@@ -2555,6 +2606,15 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	struct comp_vk_native_compositor *c = vk_comp(xc);
 	struct vk_bundle *vk = &c->vk;
 
+	// #837 frame-stage timing (env-gated) — see vk_frame_timing above. fp[]
+	// marks are taken at the windowed-DP path's stage boundaries.
+	const bool ftime = debug_get_bool_option_frame_stage_timing();
+	static struct vk_frame_timing s_ftiming = {0};
+	uint64_t fp[7] = {0};
+	if (ftime) {
+		fp[0] = os_monotonic_get_ns();
+	}
+
 	// Capture-intent poll — checks MCP request + trigger files once per
 	// frame; consumed at the projection-done boundary or end of frame
 	// depending on requested mode. See u_capture_intent.h.
@@ -3185,6 +3245,9 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 				    0, 0, NULL, 0, NULL, 1, &pre_weave);
 
+				if (ftime) {
+					fp[1] = os_monotonic_get_ns();
+				}
 				if (dp_self_submits) {
 					// Flush pre-DP work (WS-layer composite, atlas crop,
 					// target-image layout transition) so the DP's
@@ -3201,6 +3264,9 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 					}
 				}
 
+				if (ftime) {
+					fp[2] = os_monotonic_get_ns();
+				}
 				// Hand the DP our lifecycle-managed view for this target
 				// image. A self-submitting DP with no render pass (Leia
 				// CNSDK) builds its own destination framebuffer and would
@@ -3236,6 +3302,9 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				    0,
 				    0);
 
+				if (ftime) {
+					fp[3] = os_monotonic_get_ns();
+				}
 				if (dp_self_submits) {
 					// DP owned the post-weave submit. The vendor weave's
 					// queue submit may still be in flight writing to
@@ -3264,6 +3333,9 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 					    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
 					};
 					vk->vkBeginCommandBuffer(cmd, &post_bi);
+				}
+				if (ftime) {
+					fp[4] = os_monotonic_get_ns();
 				}
 
 				// Render pass finalLayout handles transition to PRESENT_SRC_KHR
@@ -3337,8 +3409,23 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			vk->vkDestroyFramebuffer(vk->device, target_fb, NULL);
 		}
 
+		if (ftime) {
+			fp[5] = os_monotonic_get_ns();
+		}
+
 		// Present
 		xret = comp_vk_native_target_present(c->target);
+
+		if (ftime && fp[1] != 0) {
+			fp[6] = os_monotonic_get_ns();
+			vk_frame_timing_add(&s_ftiming, VK_FSTAGE_PRE, fp[0], fp[1]);
+			vk_frame_timing_add(&s_ftiming, VK_FSTAGE_PREFLUSH, fp[1], fp[2]);
+			vk_frame_timing_add(&s_ftiming, VK_FSTAGE_WEAVE, fp[2], fp[3]);
+			vk_frame_timing_add(&s_ftiming, VK_FSTAGE_POSTWAIT, fp[3], fp[4]);
+			vk_frame_timing_add(&s_ftiming, VK_FSTAGE_COMPOSITE, fp[4], fp[5]);
+			vk_frame_timing_add(&s_ftiming, VK_FSTAGE_PRESENT, fp[5], fp[6]);
+			vk_frame_timing_flush(&s_ftiming, fp[6]);
+		}
 
 #ifdef XRT_OS_WINDOWS
 		if (c->owns_window && c->own_window != NULL) {
