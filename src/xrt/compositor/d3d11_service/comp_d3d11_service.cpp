@@ -3404,10 +3404,14 @@ init_client_render_resources(struct d3d11_service_system *sys,
 						uint32_t cw = (uint32_t)(client_rect.right - client_rect.left);
 						uint32_t ch = (uint32_t)(client_rect.bottom - client_rect.top);
 						if (cw != dp_px_w || ch != dp_px_h) {
-							// Resize swap chain to match
+							// Resize swap chain to match. Preserve the
+							// creation flags (#848 — DXGI E_INVALIDARGs
+							// a flag mismatch).
 							res->back_buffer_rtv.reset();
+							DXGI_SWAP_CHAIN_DESC1 res_desc = {};
+							res->swap_chain->GetDesc1(&res_desc);
 							HRESULT rhr = res->swap_chain->ResizeBuffers(
-							    0, dp_px_w, dp_px_h, DXGI_FORMAT_UNKNOWN, 0);
+							    0, dp_px_w, dp_px_h, DXGI_FORMAT_UNKNOWN, res_desc.Flags);
 							if (SUCCEEDED(rhr)) {
 								wil::com_ptr<ID3D11Texture2D> bb;
 								res->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
@@ -6533,7 +6537,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 			if (cw > 0 && ch > 0 && (sc_desc.Width != cw || sc_desc.Height != ch)) {
 				mc->back_buffer_rtv.reset();
-				HRESULT hr = mc->swap_chain->ResizeBuffers(0, cw, ch, DXGI_FORMAT_UNKNOWN, 0);
+				// Pass the creation flags — DXGI E_INVALIDARGs a flag
+				// mismatch (#848; this chain is waitable under late-weave).
+				HRESULT hr = mc->swap_chain->ResizeBuffers(0, cw, ch, DXGI_FORMAT_UNKNOWN, sc_desc.Flags);
 				if (SUCCEEDED(hr)) {
 					wil::com_ptr<ID3D11Texture2D> bb;
 					mc->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
@@ -9451,13 +9457,15 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				// Release back buffer RTV before resize
 				c->render.back_buffer_rtv.reset();
 
-				// Resize swap chain buffers - always do this immediately (DXGI requirement)
+				// Resize swap chain buffers - always do this immediately (DXGI
+				// requirement). Preserve the creation flags — DXGI
+				// E_INVALIDARGs a flag mismatch (#848).
 				HRESULT hr = c->render.swap_chain->ResizeBuffers(
 				    0,  // Keep buffer count
 				    client_width,
 				    client_height,
 				    DXGI_FORMAT_UNKNOWN,  // Keep format
-				    0);
+				    sc_desc.Flags);
 
 				if (SUCCEEDED(hr)) {
 					// Recreate back buffer RTV

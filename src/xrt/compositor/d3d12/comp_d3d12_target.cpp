@@ -98,6 +98,11 @@ struct comp_d3d12_target
 	uint32_t width;
 	uint32_t height;
 
+	//! Swapchain creation flags — DXGI requires ResizeBuffers to pass the
+	//! exact same flags or it fails with E_INVALIDARG (#848; hit whenever
+	//! the late-weave FRAME_LATENCY_WAITABLE_OBJECT chain is resized).
+	UINT swapchain_flags;
+
 	//! DirectComposition resources (transparent path only — null on default path).
 	//! D3D12 forbids DXGI_SWAP_EFFECT_DISCARD, so the transparent path uses
 	//! CreateSwapChainForComposition + flip-model + DXGI_ALPHA_MODE_PREMULTIPLIED
@@ -409,6 +414,7 @@ comp_d3d12_target_create(struct comp_d3d12_compositor *c,
 	if (dxr_late_weave_enabled() && !use_transparent) {
 		desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 	}
+	target->swapchain_flags = desc.Flags;
 
 	DXGI_SWAP_CHAIN_FULLSCREEN_DESC fs_desc = {};
 	fs_desc.Windowed = TRUE;
@@ -716,9 +722,10 @@ comp_d3d12_target_resize(struct comp_d3d12_target *target,
 	// Release current back buffers
 	release_back_buffers(target);
 
-	// Resize swapchain
+	// Resize swapchain. Must pass the creation flags — DXGI returns
+	// E_INVALIDARG if they differ (#848, waitable late-weave chains).
 	HRESULT hr = target->swapchain->ResizeBuffers(BACK_BUFFER_COUNT, width, height,
-	                                               DXGI_FORMAT_UNKNOWN, 0);
+	                                               DXGI_FORMAT_UNKNOWN, target->swapchain_flags);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to resize swapchain: 0x%08x", hr);
 		return XRT_ERROR_D3D;
