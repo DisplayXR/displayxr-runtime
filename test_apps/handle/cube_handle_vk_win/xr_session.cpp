@@ -430,6 +430,32 @@ bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamilyIndex,
     createInfo.enabledExtensionCount = (uint32_t)deviceExtensions.size();
     createInfo.ppEnabledExtensionNames = deviceExtensions.data();
 
+    // Enable VK_KHR_present_id + VK_KHR_present_wait when the device supports
+    // them, so the runtime's weave-latency harness (DXR_WEAVE_LATENCY_CSV) can
+    // timestamp true scanout via vkWaitForPresentKHR. Harmless when the
+    // harness is off; skipped entirely on devices without the extensions.
+    std::vector<const char*> extsWithPresentWait(deviceExtensions);
+    VkPhysicalDevicePresentIdFeaturesKHR presentIdFeat = {};
+    presentIdFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
+    VkPhysicalDevicePresentWaitFeaturesKHR presentWaitFeat = {};
+    presentWaitFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR;
+    presentWaitFeat.pNext = &presentIdFeat;
+    {
+        VkPhysicalDeviceFeatures2 feat2 = {};
+        feat2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        feat2.pNext = &presentWaitFeat;
+        vkGetPhysicalDeviceFeatures2(physDevice, &feat2);
+        if (presentIdFeat.presentId && presentWaitFeat.presentWait) {
+            extsWithPresentWait.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+            extsWithPresentWait.push_back(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+            presentIdFeat.pNext = const_cast<void*>(createInfo.pNext);
+            createInfo.pNext = &presentWaitFeat;
+            createInfo.enabledExtensionCount = (uint32_t)extsWithPresentWait.size();
+            createInfo.ppEnabledExtensionNames = extsWithPresentWait.data();
+            LOG_INFO("Enabling VK_KHR_present_id + VK_KHR_present_wait (weave-latency harness support)");
+        }
+    }
+
     VkResult vkResult = vkCreateDevice(physDevice, &createInfo, nullptr, &device);
     if (vkResult != VK_SUCCESS) {
         LOG_ERROR("vkCreateDevice failed: %d", vkResult);
